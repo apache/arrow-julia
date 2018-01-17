@@ -1,4 +1,3 @@
-include("../src/arrow/Arrow.jl")
 using Arrow
 
 

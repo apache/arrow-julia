@@ -13,68 +13,68 @@ import Base: getindex
 import Base.isnull # this will be removed in 0.7
 
 
-abstract type AbstractPrimitiveArray{J} end
-export AbstractPrimitiveArray
+abstract type AbstractPrimitive{J} end
+export AbstractPrimitive
 
 
-struct PrimitiveArray{J} <: AbstractPrimitiveArray{J}
+struct Primitive{J} <: AbstractPrimitive{J}
     length::Int32
     data::Ptr{UInt8}
 end
-export PrimitiveArray
+export Primitive
 
-function PrimitiveArray{J}(b::Buffer, i::Integer, length::Integer) where J
+function Primitive{J}(b::Buffer, i::Integer, length::Integer) where J
     data_ptr = pointer(b.data, i)
-    PrimitiveArray{J}(length, data_ptr)
+    Primitive{J}(length, data_ptr)
 end
 
 
-struct NullablePrimitiveArray{J} <: AbstractPrimitiveArray{J}
+struct NullablePrimitive{J} <: AbstractPrimitive{J}
     length::Int32
     null_count::Int32
     validity::Ptr{UInt8}
     data::Ptr{UInt8}
 end
-export NullablePrimitiveArray
+export NullablePrimitive
 
-function NullablePrimitiveArray{J}(b::Buffer, bitmask_loc::Integer, data_loc::Integer,
+function NullablePrimitive{J}(b::Buffer, bitmask_loc::Integer, data_loc::Integer,
                                    length::Integer, null_count::Integer) where J
     val_ptr = pointer(b.data, bitmask_loc)
     data_ptr = pointer(b.data, data_loc)
-    NullablePrimitiveArray{J}(length, null_count, val_ptr, data_ptr)
+    NullablePrimitive{J}(length, null_count, val_ptr, data_ptr)
 end
 
 
 #================================================================================================
     common interface
 ================================================================================================#
-nullcount(A::PrimitiveArray) = 0
-nullcount(A::NullablePrimitiveArray) = Int(A.null_count)
+nullcount(A::Primitive) = 0
+nullcount(A::NullablePrimitive) = Int(A.null_count)
 
-checkbounds(A::AbstractPrimitiveArray, i::Integer) = (1 ≤ i ≤ A.length) || throw(BoundsError(A, i))
+checkbounds(A::AbstractPrimitive, i::Integer) = (1 ≤ i ≤ A.length) || throw(BoundsError(A, i))
 
-unsafe_isnull(A::PrimitiveArray, i::Integer) = false
+unsafe_isnull(A::Primitive, i::Integer) = false
 # TODO is this too slow?
-function unsafe_isnull(A::NullablePrimitiveArray, i::Integer)
+function unsafe_isnull(A::NullablePrimitive, i::Integer)
     a, b = divrem(i, 8)
     !getbit(unsafe_load(A.validity + a), b)
 end
 
-isnull(A::AbstractPrimitiveArray, i::Integer) = (checkbounds(A,i); unsafe_isnull(A,i))
+isnull(A::AbstractPrimitive, i::Integer) = (checkbounds(A,i); unsafe_isnull(A,i))
 export isnull
 
 
-function unsafe_getvalue(A::AbstractPrimitiveArray{J}, i::Integer)::J where J
+function unsafe_getvalue(A::AbstractPrimitive{J}, i::Integer)::J where J
     unsafe_load(convert(Ptr{J}, A.data), i)
 end
 
 #================================================================================================
     array interface
 ================================================================================================#
-length(A::AbstractPrimitiveArray) = A.length
+length(A::AbstractPrimitive) = A.length
 
-size(A::PrimitiveArray) = (A.length,)
-function size(A::PrimitiveArray, i::Integer)
+size(A::Primitive) = (A.length,)
+function size(A::Primitive, i::Integer)
     if i == 1
         return A.length
     else
@@ -83,16 +83,16 @@ function size(A::PrimitiveArray, i::Integer)
     throw(ArgumentError("arraysize: dimension $i out of range"))
 end
 
-eltype(A::PrimitiveArray{J}) where J = J
-eltype(A::NullablePrimitiveArray{J}) where J = Union{J,Missing}
+eltype(A::Primitive{J}) where J = J
+eltype(A::NullablePrimitive{J}) where J = Union{J,Missing}
 
 
-function getindex(A::PrimitiveArray{J}, i::Integer)::J where J
+function getindex(A::Primitive{J}, i::Integer)::J where J
     @boundscheck checkbounds(A, i)
     unsafe_getvalue(A, i)
 end
 
-function getindex(A::NullablePrimitiveArray{J}, i::Integer)::Union{J,Missing} where J
+function getindex(A::NullablePrimitive{J}, i::Integer)::Union{J,Missing} where J
     @boundscheck checkbounds(A, i)
     unsafe_isnull(A, i) ? missing : unsafe_getvalue(A, i)
 end
