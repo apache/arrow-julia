@@ -1,9 +1,6 @@
 
 bytes_for_bits(n::Integer) = div(((n + 7) & ~7), 8)
-paddedlength(n::Integer) = div((n + ALIGNMENT - 1), ALIGNMENT)*ALIGNMENT
 getbit(byte::UInt8, i::Integer) = (byte & BITMASK[i] > 0x00) ? true : false
-# temporary
-export bytes_for_bits, paddedlength, getbit
 
 
 # nbits must be ≤ 8

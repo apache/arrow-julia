@@ -1,14 +1,12 @@
 using Arrow
+using Missings
 
 
-v = zeros(UInt8, 64)
-v[1] = UInt8(1*1 + 0*2 + 1*4 + 1*8)
+mask = bitpack([true, true, true, false, true])
+vals = reinterpret(UInt8, [2, 3, 5, 7, 11])
 
-m = reinterpret(UInt8, [2, 3, 5, 7])
-m = vcat(v, m)
 
-b = Buffer(m)
+b = Buffer(vcat(mask, vals))
 
-# A = PrimitiveArray{Int64}(b, 1, 4)
-A = NullablePrimitiveArray{Int64}(b, 1, 65, 4, 1)
+A = NullablePrimitive{Int64}(b, 1, length(mask)+1, 5, 1)
 
