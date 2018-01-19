@@ -2,14 +2,14 @@ __precompile__(true)
 
 module Arrow
 
-using Missings
+using Missings, WeakRefStrings
 
 import Base: getindex, setindex!
 
 const BITMASK = UInt8[1, 2, 4, 8, 16, 32, 64, 128]
 
 
-import Base: convert, show
+import Base: convert, show, unsafe_string
 import Base: length, endof, size, eltype, start, next, done, getindex, isassigned
 import Base.isnull # this will be removed in 0.7
 
@@ -31,6 +31,7 @@ include("arrowvectors.jl")
 
 #=~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 TODO
+    -support nested lists
     -bounds checking in constructors
     -bounds checking in accessing null bitmap
     -getindex for ranges

@@ -26,6 +26,35 @@ isnull(A::ArrowVector) = (checkbounds(A, i); unsafe_isnull(A, i))
 export isnull
 
 
+function fillmissings!(v::AbstractVector{Union{J,Missing}}, A::ArrowVector{Union{J,Missing}},
+                       idx::AbstractVector{<:Integer}) where J
+    for (i, j) ∈ enumerate(idx)
+        unsafe_isnull(A, j) && (v[i] = missing)
+    end
+end
+function fillmissings!(v::AbstractVector{Union{J,Missing}}, A::ArrowVector{Union{J,Missing}},
+                       idx::AbstractVector{Bool}) where J
+    j = 1
+    for i ∈ 1:length(A)
+        if idx[i]
+            unsafe_isnull(A, i) && (v[j] = missing)
+            j += 1
+        end
+    end
+end
+function fillmissings!(v::AbstractVector{Union{J,Missing}}, A::ArrowVector{Union{J,Missing}}) where J
+    fillmissings!(v, A, 1:length(A))
+end
+
+
+# TODO this is really inefficient and also NullExceptions are uninformative
+function nullexcept_inrange(A::ArrowVector{Union{T,Missing}}, i::Integer, j::Integer) where T
+    for k ∈ i:j
+        unsafe_isnull(A, i) && throw(NullException())
+    end
+end
+
+
 length(A::ArrowVector) = A.length
 size(A::ArrowVector) = (length(A),)
 function size(A::ArrowVector, i::Integer)
