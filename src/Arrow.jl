@@ -34,7 +34,6 @@ TODO
     -support nested lists
     -bounds checking in constructors
     -bounds checking in accessing null bitmap
-    -getindex for ranges
     -be sure null checking isn't too slow as it is
     -implement show functions
 
