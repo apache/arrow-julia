@@ -1,6 +1,7 @@
 
-bytes_for_bits(n::Integer) = div(((n + 7) & ~7), 8)
+bytesforbits(n::Integer) = div(((n + 7) & ~7), 8)
 getbit(byte::UInt8, i::Integer) = (byte & BITMASK[i] > 0x00) ? true : false
+export bytesforbits
 
 
 # nbits must be ≤ 8
