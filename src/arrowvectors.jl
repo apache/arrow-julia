@@ -101,3 +101,4 @@ function getindex(l::ArrowVector{Union{J,Missing}}, idx::AbstractVector{Bool}) w
     fillmissings!(v, l, idx)
     v
 end
+getindex(l::ArrowVector, ::Colon) = l[1:end]
