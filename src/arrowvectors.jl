@@ -78,3 +78,26 @@ done(A::ArrowVector, i::Integer) = i > length(A)
 
 convert(::Type{Array{T}}, A::ArrowVector{T}) where T = A[1:end]
 convert(::Type{Vector{T}}, A::ArrowVector{T}) where T = A[1:end]
+
+
+function getindex(l::ArrowVector{J}, i::Union{Integer,AbstractVector{<:Integer}}) where J
+    @boundscheck checkbounds(l, i)
+    unsafe_getvalue(l, i)
+end
+
+function getindex(l::ArrowVector{Union{J,Missing}}, i::Integer)::Union{J,Missing} where J
+    @boundscheck checkbounds(l, i)
+    unsafe_isnull(l, i) ? missing : unsafe_getvalue(l, i)
+end
+function getindex(l::ArrowVector{Union{J,Missing}}, idx::AbstractVector{<:Integer}) where J
+    @boundscheck checkbounds(l, idx)
+    v = Vector{Union{J,Missing}}(unsafe_getvalue(l, idx))
+    fillmissings!(v, l, idx)
+    v
+end
+function getindex(l::ArrowVector{Union{J,Missing}}, idx::AbstractVector{Bool}) where J
+    @boundscheck checkbounds(l, idx)
+    v = Union{J,Missing}[unsafe_getvalue(l, i) for i ∈ 1:length(l) if idx[i]]
+    fillmissings!(v, l, idx)
+    v
+end

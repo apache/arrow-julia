@@ -11,6 +11,9 @@ struct List{P<:AbstractPrimitive,J} <: AbstractList{J}
 end
 export List
 
+function List{P,J}(ptr::Ptr, offset_loc::Integer, len::Integer, vals::P) where {P,J}
+    List{P,J}(len, ptr+offset_loc-1, vals)
+end
 function List{P,J}(b::Buffer, offset_loc::Integer, len::Integer, vals::P) where {P,J}
     offset_ptr = pointer(b.data, offset_loc)
     List{P,J}(len, offset_ptr, vals)
@@ -26,6 +29,10 @@ struct NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
 end
 export NullableList
 
+function NullableList{P,J}(ptr::Ptr, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
+                           null_count::Integer, vals::P) where {P,J}
+    NullableList{P,J}(len, null_count, ptr+bitmask_loc-1, ptr+offset_loc-1, vals)
+end
 function NullableList{P,J}(b::Buffer, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
                            null_count::Integer, vals::P) where {P,J}
     bitmask_ptr = pointer(b.data, bitmask_loc)
@@ -62,27 +69,3 @@ function unsafe_getvalue(l::List{P,K}, idx::AbstractVector{Bool}) where {P,K}
 end
 
 
-#====================================================================================================
-    array interface
-====================================================================================================#
-function getindex(l::List{P,J}, i::Union{Integer,AbstractVector{<:Integer}}) where {P,J}
-    @boundscheck checkbounds(l, i)
-    unsafe_getvalue(l, i)
-end
-
-function getindex(l::NullableList{P,J}, i::Integer)::Union{J,Missing} where {P,J}
-    @boundscheck checkbounds(l, i)
-    unsafe_isnull(l, i) ? missing : unsafe_getvalue(l, i)
-end
-function getindex(l::NullableList{P,J}, idx::AbstractVector{<:Integer}) where {P,J}
-    @boundscheck checkbounds(l, idx)
-    v = Vector{Union{J,Missing}}(unsafe_getvalue(l, idx))
-    fillmissings!(v, l, idx)
-    v
-end
-function getindex(l::NullableList{P,J}, idx::AbstractVector{Bool}) where {P,J}
-    @boundscheck checkbounds(l, idx)
-    v = Union{J,Missing}[unsafe_getvalue(l, i) for i ∈ 1:length(l) if idx[i]]
-    fillmissings!(v, l, idx)
-    v
-end

@@ -10,9 +10,12 @@ struct Primitive{J} <: AbstractPrimitive{J}
 end
 export Primitive
 
-function Primitive{J}(b::Buffer, i::Integer, length::Integer) where J
+function Primitive{J}(ptr::Ptr, i::Integer, len::Integer) where J
+    Primitive{J}(len, ptr + (i-1))
+end
+function Primitive{J}(b::Buffer, i::Integer, len::Integer) where J
     data_ptr = pointer(b.data, i)
-    Primitive{J}(length, data_ptr)
+    Primitive{J}(len, data_ptr)
 end
 
 
@@ -24,11 +27,15 @@ struct NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
 end
 export NullablePrimitive
 
+function NullablePrimitive{J}(ptr::Ptr, bitmask_loc::Integer, data_loc::Integer,
+                              len::Integer, null_count::Integer) where J
+    NullablePrimitive{J}(len, null_count, ptr+bitmask_loc-1, ptr+data_loc-1)
+end
 function NullablePrimitive{J}(b::Buffer, bitmask_loc::Integer, data_loc::Integer,
-                              length::Integer, null_count::Integer) where J
+                              len::Integer, null_count::Integer) where J
     val_ptr = pointer(b.data, bitmask_loc)
     data_ptr = pointer(b.data, data_loc)
-    NullablePrimitive{J}(length, null_count, val_ptr, data_ptr)
+    NullablePrimitive{J}(len, null_count, val_ptr, data_ptr)
 end
 
 
@@ -61,30 +68,5 @@ function unsafe_construct(::Type{T}, A::NullablePrimitive{J}, i::Integer, len::I
     unsafe_construct(T, A, i, len)
 end
 
-
-#================================================================================================
-    array interface
-================================================================================================#
-function getindex(A::Primitive{J}, idx::Union{Integer,AbstractVector{<:Integer}}) where J
-    @boundscheck checkbounds(A, idx)
-    unsafe_getvalue(A, idx)
-end
-
-function getindex(A::NullablePrimitive{J}, i::Integer)::Union{J,Missing} where J
-    @boundscheck checkbounds(A, i)
-    unsafe_isnull(A, i) ? missing : unsafe_getvalue(A, i)
-end
-function getindex(A::NullablePrimitive{J}, idx::AbstractVector{<:Integer}) where J
-    @boundscheck checkbounds(A, idx)
-    v = Vector{Union{J,Missing}}(unsafe_getvalue(A, idx))
-    fillmissings!(v, A, idx)
-    v
-end
-function getindex(A::NullablePrimitive{J}, idx::AbstractVector{Bool}) where J
-    @boundscheck checkbounds(A, idx)
-    v = Union{J,Missing}[unsafe_getvalue(A, i) for i ∈ 1:length(A) if idx[i]]
-    fillmissings!(v, A, idx)
-    v
-end
 
 
