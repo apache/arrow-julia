@@ -55,7 +55,7 @@ function nullexcept_inrange(A::ArrowVector{Union{T,Missing}}, i::Integer, j::Int
 end
 
 
-length(A::ArrowVector) = A.length
+length(A::ArrowVector) = Int(A.length)
 size(A::ArrowVector) = (length(A),)
 function size(A::ArrowVector, i::Integer)
     if i == 1
