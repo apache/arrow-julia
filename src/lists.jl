@@ -4,6 +4,18 @@ abstract type AbstractList{J} <: ArrowVector{J} end
 export AbstractList
 
 
+"""
+    List{P<:AbstractPrimitive,J} <: AbstractList{J}
+
+    List{P,J}(ptr::Ptr, offset_loc::Integer, len::Integer, vals::P)
+    List{P,J}(b::Buffer, offset_loc::Integer, len::Integer, vals::P)
+
+An Arrow list of variable length objects such as strings, none of which are
+null.  `vals` is the primitive array in which the underlying data is stored.
+The `List` itself contains a pointer to the offsets, a buffer containing 32-bit
+integers describing the offsets of each value.  The location should be given
+relative to `ptr` using 1-based indexing.
+"""
 struct List{P<:AbstractPrimitive,J} <: AbstractList{J}
     length::Int32
     offsets::Ptr{UInt8}
@@ -20,6 +32,19 @@ function List{P,J}(b::Buffer, offset_loc::Integer, len::Integer, vals::P) where 
 end
 
 
+"""
+    NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
+
+    NullableList{P,J}(ptr::Ptr, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
+                      null_count::Integer, vals::P)
+    NullableList{P,J}(b::Buffer, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
+                      null_count::Integer, vals::P)
+
+An arrow list of variable length objects such as strings, some of which may be null.  `vals`
+is the primitive array in which the underlying data is stored.  The `NullableList` itself contains
+pointers to the offsets and null bit mask which the locations of which should be specified relative
+to `ptr` using 1-based indexing.
+"""
 struct NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
     length::Int32
     null_count::Int32
@@ -45,8 +70,18 @@ end
     common interface
 ====================================================================================================#
 # note that there are always n+1 offsets
+"""
+    unsafe_offset(l::AbstractList, i::Integer)
+
+Get the offset for element `i`.  Contains a call to `unsafe_load`.
+"""
 unsafe_offset(l::AbstractList, i::Integer) = unsafe_load(convert(Ptr{Int32}, l.offsets), i)
 
+"""
+    unsafe_ellength(l::AbstractList, i::Integer)
+
+Get the length of element `i`. Involves calls to `unsafe_load`.
+"""
 unsafe_ellength(l::AbstractList, i::Integer) = unsafe_offset(l, i+1) - unsafe_offset(l, i)
 
 # returns offset, length

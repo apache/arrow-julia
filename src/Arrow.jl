@@ -14,7 +14,12 @@ import Base: length, endof, size, eltype, start, next, done, getindex, isassigne
 import Base.isnull # this will be removed in 0.7
 
 
-# TODO maybe make one version with just a pointer and one with actual vector
+"""
+    Buffer
+
+A data structure containing a `Vector{UInt8}` that can act as a buffer containing Arrow format data.
+Use of this is optional and pointers can be used to construct objects directly instead.
+"""
 mutable struct Buffer
     data::Vector{UInt8}
 end
@@ -31,11 +36,10 @@ include("arrowvectors.jl")
 
 #=~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 TODO
-    -support nested lists
+    -support nested lists (think should work but haven't tested)
     -bounds checking in constructors
     -bounds checking in accessing null bitmap
     -be sure null checking isn't too slow as it is
-    -implement show functions
 
     -ensure that convert(Array{Union{T,Missing}}, A) is efficient in 0.7
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~=#
