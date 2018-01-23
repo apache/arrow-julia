@@ -32,6 +32,7 @@ include("utils.jl")
 include("primitives.jl")
 include("lists.jl")
 include("arrowvectors.jl")
+include("datetime.jl")
 
 
 #=~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
