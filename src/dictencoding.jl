@@ -14,6 +14,12 @@ function DictEncoding{P,J}(b::Buffer, ref_loc::Integer, len::Integer,
 end
 
 
-# TODO mark bounds checking
-getindex(d::DictEncoding, i) = d.pool[d.refs[i]]
+length(d::DictEncoding) = length(d.refs)
+
+
+# TODO mark bounds checking (also, these throw errors from d.refs)
+# note that we define all of these methods to avoid method ambiguity
+getindex(d::DictEncoding, i::Integer) = d.pool[d.refs[i]+1]
+getindex(d::DictEncoding, i::AbstractVector{<:Integer}) = d.pool[d.refs[i].+1]
+getindex(d::DictEncoding, i::AbstractVector{Bool}) = d.pool[d.refs[i].+1]
 

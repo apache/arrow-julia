@@ -78,7 +78,7 @@ function unsafe_getvalue(A::Union{Primitive{J},NullablePrimitive{J}},
     unsafe_wrap(Array, ptr, length(idx))
 end
 function unsafe_getvalue(A::Primitive{J}, idx::AbstractVector{Bool}) where J
-    J[unsafe_getvalue(A, i) for i ∈ 1:length(A) if idx[1]]
+    J[unsafe_getvalue(A, i) for i ∈ 1:length(A) if idx[i]]
 end
 
 
