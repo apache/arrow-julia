@@ -82,6 +82,16 @@ function unsafe_getvalue(A::Primitive{J}, idx::AbstractVector{Bool}) where J
 end
 
 
+# TODO note that nulls are set elsewhere
+function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, x::J, i::Integer) where J
+    unsafe_store!(convert(Ptr{J}, A.data), x, i)
+end
+function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, v::AbstractVector{J},
+                          idx::AbstractVector{<:Integer}) where J
+    unsafe_copy!(convert(Ptr{J}, A.data), pointer(v), length(v))
+end
+
+
 """
     unsafe_construct(::Type{T}, A::Primitive, i::Integer, len::Integer)
 
