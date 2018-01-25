@@ -146,6 +146,7 @@ function setindex!(A::Primitive{J}, x::AbstractVector, idx::AbstractVector{<:Int
     unsafe_setvalue!(A, convert(AbstractVector{J}, x), idx)
 end
 
+# TODO this is fucked up, fix!!
 function setindex!(A::NullablePrimitive{J}, x, i::Integer) where J
     @boundscheck checkbounds(A, i)
     o = unsafe_setvalue!(A, convert(J, x), i)
@@ -160,14 +161,16 @@ end
 # TODO this is horribly inefficient but really hard to do right for non-consecutive
 function setindex!(A::NullablePrimitive, x::AbstractVector, idx::AbstractVector{<:Integer})
     @boundscheck (checkbounds(A, idx); checkinputsize(x, idx))
-    @inbounds setindex!.(A, x, idx)
+    for (ξ,i) ∈ zip(x, idx)
+        @inbounds setindex!(A, ξ, i)
+    end
 end
 function setindex!(A::NullablePrimitive, x::AbstractVector, idx::AbstractVector{Bool})
     @boundscheck (checkbounds(A, idx); checkinputsize(x, idx))
     j = 1
-    for (ξ,i) ∈ zip(x, idx)
+    for i ∈ idx
         if idx[i]
-            @inbounds setindex!(A, ξ, i)
+            @inbounds setindex!(A, x[j], i)
             j += 1
         end
     end
