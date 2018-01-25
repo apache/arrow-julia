@@ -33,7 +33,7 @@ end
         vraw = rand(dtype, len)
         data = vcat(mask, reinterpret(UInt8, vraw))
         b = Arrow.Buffer(data)
-        A = NullablePrimitive{dtype}(b, 1, length(mask)+1, len, sum(.!pres))
+        A = NullablePrimitive{dtype}(b, 1, length(mask)+1, len)
         for j ∈ 1:8
             k = rand(1:len)
             # strict equality should work even for floats in this case

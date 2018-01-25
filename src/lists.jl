@@ -36,9 +36,9 @@ end
     NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
 
     NullableList{P,J}(ptr::Ptr, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
-                      null_count::Integer, vals::P)
+                      vals::P)
     NullableList{P,J}(b::Buffer, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
-                      null_count::Integer, vals::P)
+                      vals::P)
 
 An arrow list of variable length objects such as strings, some of which may be null.  `vals`
 is the primitive array in which the underlying data is stored.  The `NullableList` itself contains
@@ -47,7 +47,6 @@ to `ptr` using 1-based indexing.
 """
 struct NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
     length::Int32
-    null_count::Int32
     validity::Ptr{UInt8}
     offsets::Ptr{UInt8}
     values::P
@@ -55,14 +54,14 @@ end
 export NullableList
 
 function NullableList{P,J}(ptr::Ptr, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
-                           null_count::Integer, vals::P) where {P,J}
-    NullableList{P,J}(len, null_count, ptr+bitmask_loc-1, ptr+offset_loc-1, vals)
+                           vals::P) where {P,J}
+    NullableList{P,J}(len, ptr+bitmask_loc-1, ptr+offset_loc-1, vals)
 end
 function NullableList{P,J}(b::Buffer, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
-                           null_count::Integer, vals::P) where {P,J}
+                           vals::P) where {P,J}
     bitmask_ptr = pointer(b.data, bitmask_loc)
     offset_ptr = pointer(b.data, offset_loc)
-    NullableList{P,J}(len, null_count, bitmask_ptr, offset_ptr, vals)
+    NullableList{P,J}(len, bitmask_ptr, offset_ptr, vals)
 end
 
 

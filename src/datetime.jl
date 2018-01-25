@@ -6,6 +6,9 @@ const UNIXEPOCH_DT = Dates.value(Dates.Date(1970))
 value(x) = x
 
 
+abstract type ArrowTime <: Dates.AbstractTime end
+
+
 """
     Timestamp{P<:Dates.TimePeriod}
 
@@ -13,7 +16,7 @@ Timestamp in which time is stored in units `P` as `Int64` for Arrow formatted da
 
 **TODO** Timezones not implemented.
 """
-struct Timestamp{P<:Dates.TimePeriod}
+struct Timestamp{P<:Dates.TimePeriod} <: ArrowTime
     value::Int64
 end
 export Timestamp
@@ -48,7 +51,7 @@ show(io::IO, t::Timestamp) = show(io, convert(DateTime, t))
 
 Stores a date as an `Int32` for Arrow formatted data.
 """
-struct Datestamp
+struct Datestamp <: ArrowTime
     value::Int32
 end
 export Datestamp

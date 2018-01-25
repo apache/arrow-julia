@@ -3,7 +3,10 @@
     functions common to both lists and primitives
 ================================================================================================#
 nullcount(A::ArrowVector) = 0
-nullcount(A::ArrowVector{Union{T,Missing}}) where T = Int(A.null_count)
+function nullcount(A::ArrowVector{Union{T,Missing}}) where T
+    sum(count_ones(unsafe_load(A.validity, i)) for i ∈ 1:bytesforbits(length(A)))
+end
+export nullcount
 
 checkbounds(A::ArrowVector, i::Integer) = (1 ≤ i ≤ A.length) || throw(BoundsError(A, i))
 # this is probably crazy in the general case, but should work well for unit ranges
@@ -16,14 +19,53 @@ function checkbounds(A::ArrowVector, idx::AbstractVector{Bool})
 end
 
 
+"""
+    unsafe_isnull(A::ArrowVector, i::Integer)
+
+Check whether element `i` of `A` is null. This involves no bounds checking and a call to
+`unsafe_load`.
+"""
 unsafe_isnull(A::ArrowVector, i::Integer) = false
 function unsafe_isnull(A::ArrowVector{Union{T,Missing}}, i::Integer) where T
     a, b = divrem(i, 8)
     !getbit(unsafe_load(A.validity + a), b)
 end
 
-isnull(A::ArrowVector) = (checkbounds(A, i); unsafe_isnull(A, i))
+"""
+    isnull(A::ArrowVector, i)
+
+Safely check whether element(s) `i` of `A` are null.
+"""
+isnull(A::ArrowVector, i::Integer) = (checkbounds(A, i); unsafe_isnull(A, i))
+isnull(A::ArrowVector, i::AbstractVector{<:Integer}) = (checkbounds(A,i); unsafe_isnull.(A,i))
 export isnull
+
+
+"""
+    unsafe_setnull!(A::ArrowVector{Union{J,Missing}}, x::Bool, i::Integer)
+
+Set element `i` of `A` to be null. This involves no bounds checking and a call to `unsafe_store!`.
+"""
+function unsafe_setnull!(A::ArrowVector{Union{J,Missing}}, x::Bool, i::Integer) where J
+    a, b = divrem(i, 8)
+    ptr = A.validity + a
+    byte = setbit(unsafe_load(ptr), !x, b)
+    unsafe_store!(ptr, byte, b)
+end
+
+
+"""
+    unsafe_setnulls!(A::ArrowVector, nulls::AbstractVector{Bool})
+
+Set *all* the nulls for the `ArrowVector`. This does not check bounds and contains a call to
+`unsafe_copy!` (but does not copy directly from `nulls`).
+"""
+function unsafe_setnulls!(A::ArrowVector{Union{J,Missing}}, bytes::Vector{UInt8}) where J
+    unsafe_copy!(A.validity, pointer(bytes), length(bytes))
+end
+function unsafe_setnulls!(A::ArrowVector{Union{J,Missing}}, nulls::AbstractVector{Bool}) where J
+    unsafe_setnulls!(A, bitpack(.!nulls))
+end
 
 
 function fillmissings!(v::AbstractVector{Union{J,Missing}}, A::ArrowVector{Union{J,Missing}},

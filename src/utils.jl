@@ -1,7 +1,15 @@
 
 bytesforbits(n::Integer) = div(((n + 7) & ~7), 8)
-getbit(byte::UInt8, i::Integer) = (byte & BITMASK[i] > 0x00) ? true : false
 export bytesforbits
+
+getbit(byte::UInt8, i::Integer) = (byte & BITMASK[i] > 0x00) ? true : false
+function setbit(byte::UInt8, x::Bool, i::Integer)
+    if x
+        byte | BITMASK[i]
+    else
+        byte & (~BITMASK[i])
+    end
+end
 
 
 # nbits must be ≤ 8
@@ -51,3 +59,20 @@ function unbitpack(A::AbstractVector{UInt8})
     v
 end
 export unbitpack
+
+
+function checkinputsize(v::AbstractVector, idx::AbstractVector{<:Integer})
+    if length(v) ≠ length(idx)
+        throw(DimensionMismatch("tried to assign $(length(v)) elements to $(length(idx)) destinations"))
+    end
+end
+function checkinputsize(v::AbstractVector, idx::AbstractVector{Bool})
+    if length(v) ≠ sum(idx)
+        throw(DimensionMismatch("tried to assign $(length(v)) elements to $(sum(idx)) destinations"))
+    end
+end
+function checkinputsize(v::AbstractVector, A::ArrowVector)
+    if length(v) ≠ length(A)
+        throw(DimensionMismatch("tried to assign $(length(v)) elements to $(length(A)) destinations"))
+    end
+end

@@ -31,10 +31,8 @@ end
 """
     NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
 
-    NullablePrimitive{J}(ptr::Ptr, bitmask_loc::Integer, data_loc::Integer, len::Integer,
-                         null_count::Integer)
-    NullablePrimitive{J}(b::Buffer, bitmask_loc::Integer, data_loc::Integer, len::Integer,
-                         null_count::Integer)
+    NullablePrimitive{J}(ptr::Ptr, bitmask_loc::Integer, data_loc::Integer, len::Integer)
+    NullablePrimitive{J}(b::Buffer, bitmask_loc::Integer, data_loc::Integer, len::Integer)
 
 An arrow primitive array possibly containing null values.  This is essentially a pair of wrapped
 pointers: one to the data and one to the bitmask specifying whether each value is null.
@@ -42,21 +40,20 @@ The bitmask and data locations should be given relative to `ptr` using 1-based i
 """
 struct NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
     length::Int32
-    null_count::Int32
     validity::Ptr{UInt8}
     data::Ptr{UInt8}
 end
 export NullablePrimitive
 
 function NullablePrimitive{J}(ptr::Ptr, bitmask_loc::Integer, data_loc::Integer,
-                              len::Integer, null_count::Integer) where J
-    NullablePrimitive{J}(len, null_count, ptr+bitmask_loc-1, ptr+data_loc-1)
+                              len::Integer) where J
+    NullablePrimitive{J}(len, ptr+bitmask_loc-1, ptr+data_loc-1)
 end
 function NullablePrimitive{J}(b::Buffer, bitmask_loc::Integer, data_loc::Integer,
-                              len::Integer, null_count::Integer) where J
+                              len::Integer) where J
     val_ptr = pointer(b.data, bitmask_loc)
     data_ptr = pointer(b.data, data_loc)
-    NullablePrimitive{J}(len, null_count, val_ptr, data_ptr)
+    NullablePrimitive{J}(len, val_ptr, data_ptr)
 end
 
 
@@ -64,10 +61,12 @@ end
     common interface
 ================================================================================================#
 """
-    unsafe_getvalue(A::ArrowVector, i::Integer)
+    unsafe_getvalue(A::ArrowVector, i)
 
-Retrive the value from memory location `i` using Julia 1-based indexing.  This typically
-involves a call to `unsafe_load` or `unsafe_wrap`.
+Retrieve the value from memory location `i` using Julia 1-based indexing. `i` can be a single integer
+index, an `AbstractVector` of integer indices, or an `AbstractVector{Bool}` mask.
+
+This typically involves a call to `unsafe_load` or `unsafe_wrap`.
 """
 function unsafe_getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, i::Integer)::J where J
     unsafe_load(convert(Ptr{J}, A.data), i)
@@ -82,12 +81,35 @@ function unsafe_getvalue(A::Primitive{J}, idx::AbstractVector{Bool}) where J
 end
 
 
-# TODO note that nulls are set elsewhere
+"""
+    unsafe_setvalue!(A::ArrowVector{J}, x, i)
+
+Set the value at location `i` to `x`.  If `i` is a single integer, `x` should be an element of type
+`J`.  Otherwise `i` can be an `AbstractVector{<:Integer}` or `AbstractVector{Bool}` in which case
+`x` should be an appropriately sized `AbstractVector{J}`.
+"""
 function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, x::J, i::Integer) where J
     unsafe_store!(convert(Ptr{J}, A.data), x, i)
 end
 function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, v::AbstractVector{J},
                           idx::AbstractVector{<:Integer}) where J
+    ptr = convert(Ptr{J}, A.data)
+    for (x, i) ∈ zip(v, idx)
+        unsafe_store!(ptr, x, i)
+    end
+end
+function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, v::AbstractVector{J},
+                          idx::AbstractVector{Bool}) where J
+    ptr = convert(Ptr{J}, A.data)
+    j = 1
+    for i ∈ 1:length(A)
+        if idx[i]
+            unsafe_store!(ptr, v[j], i)
+            j += 1
+        end
+    end
+end
+function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, v::Vector{J}, ::Colon) where J
     unsafe_copy!(convert(Ptr{J}, A.data), pointer(v), length(v))
 end
 
@@ -114,4 +136,50 @@ function unsafe_construct(::Type{T}, A::NullablePrimitive{J}, i::Integer, len::I
 end
 
 
+# TODO these are only here temporarily for testing, will move to arrowvectors.jl
+function setindex!(A::Primitive{J}, x, i::Integer) where J
+    @boundscheck checkbounds(A, i)
+    unsafe_setvalue!(A, convert(J, x), i)
+end
+function setindex!(A::Primitive{J}, x::AbstractVector, idx::AbstractVector{<:Integer}) where J
+    @boundscheck (checkbounds(A, idx); checkinputsize(x, idx))
+    unsafe_setvalue!(A, convert(AbstractVector{J}, x), idx)
+end
 
+function setindex!(A::NullablePrimitive{J}, x, i::Integer) where J
+    @boundscheck checkbounds(A, i)
+    o = unsafe_setvalue!(A, convert(J, x), i)
+    unsafe_setnull!(A, false, i)  # important that this is last in case above fails
+    o
+end
+function setindex!(A::NullablePrimitive{J}, x::Missing, i::Integer) where J
+    @boundscheck checkbounds(A, i)
+    unsafe_setnull!(A, true, i)
+    missing
+end
+# TODO this is horribly inefficient but really hard to do right for non-consecutive
+function setindex!(A::NullablePrimitive, x::AbstractVector, idx::AbstractVector{<:Integer})
+    @boundscheck (checkbounds(A, idx); checkinputsize(x, idx))
+    @inbounds setindex!.(A, x, idx)
+end
+function setindex!(A::NullablePrimitive, x::AbstractVector, idx::AbstractVector{Bool})
+    @boundscheck (checkbounds(A, idx); checkinputsize(x, idx))
+    j = 1
+    for (ξ,i) ∈ zip(x, idx)
+        if idx[i]
+            @inbounds setindex!(A, ξ, i)
+            j += 1
+        end
+    end
+    x
+end
+
+# TODO this probably isn't really much more efficient, should test
+function setindex!(A::NullablePrimitive{J}, x::AbstractVector, ::Colon) where J
+    @boundscheck checkinputsize(x, A)
+    unsafe_setnulls!(A, ismissing.(x))
+    for i ∈ 1:length(A)
+        !ismissing(x[i]) && unsafe_setvalue!(A, convert(J, x[i]), i)
+    end
+    x
+end
