@@ -28,7 +28,13 @@ function List{P,J}(ptr::Ptr, offset_loc::Integer, len::Integer, vals::P) where {
 end
 function List{P,J}(b::Buffer, offset_loc::Integer, len::Integer, vals::P) where {P,J}
     offset_ptr = pointer(b.data, offset_loc)
-    List{P,J}(len, offset_ptr, vals)
+    p = List{P,J}(len, offset_ptr, vals)
+    @boundscheck check_buffer_overrun(b, offset_loc, offsetsbytes(p), :offsets)
+    p
+end
+
+function List(b::Buffer, offset_loc::Integer, x::AbstractVector{J}) where J
+
 end
 
 
@@ -78,6 +84,21 @@ offsetsbytes(A::AbstractList) = (length(A)+1)*sizeof(Int32)
 minbytes(A::AbstractList) = valuesbytes(A) + minbitmaskbytes(A) + offsetsbytes(A)
 
 
+"""
+    offsets(v::AbstractVector)
+
+Construct a `Vector{Int32}` of offsets appropriate for data appearing in `v`.
+"""
+function offsets(v::AbstractVector) where U
+    off = Vector{Int32}(length(v)+1)
+    off[1] = 0
+    for i ∈ 2:length(off)
+        off[i] = sizeof(v[i-1]) - off[i-1]
+    end
+    off
+end
+
+
 # note that there are always n+1 offsets
 """
     unsafe_offset(l::AbstractList, i::Integer)
@@ -85,6 +106,28 @@ minbytes(A::AbstractList) = valuesbytes(A) + minbitmaskbytes(A) + offsetsbytes(A
 Get the offset for element `i`.  Contains a call to `unsafe_load`.
 """
 unsafe_offset(l::AbstractList, i::Integer) = unsafe_load(convert(Ptr{Int32}, l.offsets), i)
+
+
+"""
+    unsafe_setoffset!(l::AbstractList, off::Int32, i::Integer)
+
+Set offset `i` to `off`.  Contains a call to `unsafe_store!`.
+"""
+function unsafe_setoffset!(l::AbstractList, off::Int32, i::Integer)
+    unsafe_store!(convert(Ptr{Int32}, l.offsets), off, i)
+end
+
+
+"""
+    unsafe_setoffsets!(l::AbstractList, off::Vector{Int32})
+
+Set all offsets to the `Vector{Int32}` `off`.  Contains a call to `unsafe_copy!` which copies the
+entirety of `off`.
+"""
+function unsafe_setoffsets!(l::AbstractList, off::Vector{Int32})
+    unsafe_copy!(convert(Ptr{Int32}, l.offsets), pointer(off), length(off))
+end
+
 
 """
     unsafe_ellength(l::AbstractList, i::Integer)
