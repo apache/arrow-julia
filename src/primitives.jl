@@ -19,12 +19,18 @@ struct Primitive{J} <: AbstractPrimitive{J}
 end
 export Primitive
 
-function Primitive{J}(ptr::Ptr, i::Integer, len::Integer) where J
-    Primitive{J}(len, ptr + (i-1))
-end
+Primitive{J}(ptr::Ptr, i::Integer, len::Integer) where J = Primitive{J}(len, ptr + (i-1))
 function Primitive{J}(b::Buffer, i::Integer, len::Integer) where J
     data_ptr = pointer(b.data, i)
-    Primitive{J}(len, data_ptr)
+    p = Primitive{J}(len, data_ptr)
+    @boundscheck check_buffer_overrun(b, i, p, :values)
+    p
+end
+
+function Primitive(ptr::Union{Ptr,Buffer}, i::Integer, x::AbstractVector{J}) where J
+    p = Primitive{J}(ptr, i, length(x))
+    p[:] = x
+    p
 end
 
 
@@ -53,13 +59,37 @@ function NullablePrimitive{J}(b::Buffer, bitmask_loc::Integer, data_loc::Integer
                               len::Integer) where J
     val_ptr = pointer(b.data, bitmask_loc)
     data_ptr = pointer(b.data, data_loc)
-    NullablePrimitive{J}(len, val_ptr, data_ptr)
+    p = NullablePrimitive{J}(len, val_ptr, data_ptr)
+    @boundscheck begin
+        check_buffer_overrun(b, bitmask_loc, minbitmaskbytes(p), :bitmask)
+        check_buffer_overrun(b, data_loc, valuesbytes(p), :values)
+    end
+    p
 end
 
+function NullablePrimitive(ptr::Union{Ptr,Buffer}, bitmask_loc::Integer, data_loc::Integer,
+                           x::AbstractVector{T}) where {J,T<:Union{Union{J,Missing},J}}
+    p = NullablePrimitive{J}(ptr, bitmask_loc, data_loc, length(x))
+    p[:] = x
+    p
+end
 
 #================================================================================================
     common interface
 ================================================================================================#
+valuesbytes(A::Union{Primitive{J},NullablePrimitive{J}}) where J = length(A)*sizeof(J)
+export valuesbytes
+
+minbitmaskbytes(A::Primitive) = 0
+minbitmaskbytes(A::NullablePrimitive) = bytesforbits(length(A))
+export minbitmaskbytes
+
+minbytes(A::Primitive) = valuesbytes(A)
+minbytes(A::NullablePrimitive) = minbitmaskbytes(A) + valuesbytes(A)
+export minbytes
+
+
+
 """
     unsafe_getvalue(A::ArrowVector, i)
 
@@ -136,17 +166,17 @@ function unsafe_construct(::Type{T}, A::NullablePrimitive{J}, i::Integer, len::I
 end
 
 
-# TODO these are only here temporarily for testing, will move to arrowvectors.jl
 function setindex!(A::Primitive{J}, x, i::Integer) where J
     @boundscheck checkbounds(A, i)
     unsafe_setvalue!(A, convert(J, x), i)
 end
+# TODO inefficient in some cases because of conversion to Vector{J}
 function setindex!(A::Primitive{J}, x::AbstractVector, idx::AbstractVector{<:Integer}) where J
     @boundscheck (checkbounds(A, idx); checkinputsize(x, idx))
-    unsafe_setvalue!(A, convert(AbstractVector{J}, x), idx)
+    unsafe_setvalue!(A, convert(Vector{J}, x), idx)
 end
+setindex!(A::Primitive, x::AbstractVector, ::Colon) = (A[1:end] = x)
 
-# TODO this is fucked up, fix!!
 function setindex!(A::NullablePrimitive{J}, x, i::Integer) where J
     @boundscheck checkbounds(A, i)
     o = unsafe_setvalue!(A, convert(J, x), i)
@@ -168,7 +198,7 @@ end
 function setindex!(A::NullablePrimitive, x::AbstractVector, idx::AbstractVector{Bool})
     @boundscheck (checkbounds(A, idx); checkinputsize(x, idx))
     j = 1
-    for i ∈ idx
+    for i ∈ 1:length(A)
         if idx[i]
             @inbounds setindex!(A, x[j], i)
             j += 1
@@ -176,7 +206,6 @@ function setindex!(A::NullablePrimitive, x::AbstractVector, idx::AbstractVector{
     end
     x
 end
-
 # TODO this probably isn't really much more efficient, should test
 function setindex!(A::NullablePrimitive{J}, x::AbstractVector, ::Colon) where J
     @boundscheck checkinputsize(x, A)

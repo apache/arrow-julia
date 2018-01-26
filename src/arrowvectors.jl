@@ -49,11 +49,8 @@ Set element `i` of `A` to be null. This involves no bounds checking and a call t
 function unsafe_setnull!(A::ArrowVector{Union{J,Missing}}, x::Bool, i::Integer) where J
     a, b = divrem(i, 8)
     ptr = A.validity + a
-    println("pointer: $ptr")
-    println("byte: $(unsafe_load(ptr))")
     byte = setbit(unsafe_load(ptr), !x, b)
-    println("byte: $byte")
-    unsafe_store!(ptr, byte, b)
+    unsafe_store!(ptr, byte)
 end
 
 

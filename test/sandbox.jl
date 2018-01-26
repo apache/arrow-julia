@@ -14,7 +14,6 @@ using WeakRefStrings
 # l = NullableList{Primitive{UInt8},WeakRefString{UInt8}}(b, length(data)+1, length(data)+length(mask)+1,
 #                                           5, 1, A)
 
-b = Buffer(zeros(UInt8, 4*sizeof(Int32)+1))
+b = Buffer(zeros(UInt8, 32))
 
-p = NullablePrimitive{Int32}(b, 1, 2, 4)
 

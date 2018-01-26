@@ -68,6 +68,16 @@ end
 #====================================================================================================
     common interface
 ====================================================================================================#
+valuesbytes(A::Union{List{P,J},NullableList{P,J}}) where {P,J} = valuesbytes(A.values)
+
+minbitmaskbytes(A::List) = 0
+minbitmaskbytes(A::NullableList) = bytesforbits(length(A))
+
+offsetsbytes(A::AbstractList) = (length(A)+1)*sizeof(Int32)
+
+minbytes(A::AbstractList) = valuesbytes(A) + minbitmaskbytes(A) + offsetsbytes(A)
+
+
 # note that there are always n+1 offsets
 """
     unsafe_offset(l::AbstractList, i::Integer)

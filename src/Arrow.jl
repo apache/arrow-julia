@@ -25,6 +25,11 @@ mutable struct Buffer
 end
 export Buffer
 
+length(b::Buffer) = length(b.data)
+datapointer(b::Buffer) = pointer(b.data)
+export datapointer
+
+
 abstract type ArrowVector{T} <: AbstractVector{T} end
 
 

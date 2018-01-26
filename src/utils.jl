@@ -76,3 +76,13 @@ function checkinputsize(v::AbstractVector, A::ArrowVector)
         throw(DimensionMismatch("tried to assign $(length(v)) elements to $(length(A)) destinations"))
     end
 end
+
+
+function check_buffer_overrun(b::Buffer, i::Integer, l::Integer, obj::Symbol)
+    if length(b) - i + 1 < l
+        throw(ErrorException("$obj of size $l bytes can't fit in buffer at location $i"))
+    end
+end
+function check_buffer_overrun(b::Buffer, i::Integer, A::ArrowVector, obj::Symbol)
+    check_buffer_overrun(b, i, minbytes(A), obj)
+end
