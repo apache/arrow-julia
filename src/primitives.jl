@@ -4,6 +4,7 @@ abstract type AbstractPrimitive{J} <: ArrowVector{J} end
 export AbstractPrimitive
 
 
+# TODO add new constructor docs
 """
     Primitive{J} <: AbstractPrimitive{J}
 
@@ -77,15 +78,41 @@ end
 #================================================================================================
     common interface
 ================================================================================================#
-valuesbytes(A::Union{Primitive{J},NullablePrimitive{J}}) where J = length(A)*sizeof(J)
+"""
+    valuesbytes(A::AbstractVector)
+    valuesbytes(::Type{C}, A::AbstractVector{<:AbstractString})
+
+Computes the number of bytes needed to store the *values* of `A` (without converting the underlying
+binary type). This does not include the number of bytes needed to store metadata such as a null
+bitmask or offsets.
+
+To obtain the number of values bytes needed to string data, one must input `C` the character encoding
+type the string will be converted to (e.g. `UInt8`).
+"""
+valuesbytes(A::AbstractVector{J}) where J = length(A)*sizeof(J)
+valuesbytes(A::AbstractVector{Union{J,Missing}}) where J = length(A)*sizeof(J)
 export valuesbytes
 
-minbitmaskbytes(A::Primitive) = 0
-minbitmaskbytes(A::NullablePrimitive) = bytesforbits(length(A))
+"""
+    minbitmaskbytes(A::AbstractVector{J})
+
+Compute the minimum number of bytes needed to store a null bitmask for the data in `A`.  This is 0
+unless `J <: Union{K,Missing}`. Note that this does not take into account scheme-dependent padding.
+"""
+minbitmaskbytes(A::AbstractVector) = 0
+minbitmaskbytes(A::AbstractVector{Union{J,Missing}}) where J = bytesforbits(length(A))
 export minbitmaskbytes
 
-minbytes(A::Primitive) = valuesbytes(A)
-minbytes(A::NullablePrimitive) = minbitmaskbytes(A) + valuesbytes(A)
+"""
+    minbytes(A::AbstractVector)
+    minbytes(::Type{C}, A::AbstractVector{<:AbstractString})
+
+Computes the minimum number of bytes needed to store `A` as an Arrow formatted primitive array or list.
+
+To obtain the minimum bytes to store string data, one must input `C` the character encoding type the
+string will be converted to (e.g. `UInt8`).
+"""
+minbytes(A::AbstractVector) = minbitmaskbytes(A) + valuesbytes(A)
 export minbytes
 
 

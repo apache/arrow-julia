@@ -1,9 +1,9 @@
 
-
 abstract type AbstractList{J} <: ArrowVector{J} end
 export AbstractList
 
 
+# TODO add new constructors docs
 """
     List{P<:AbstractPrimitive,J} <: AbstractList{J}
 
@@ -33,8 +33,14 @@ function List{P,J}(b::Buffer, offset_loc::Integer, len::Integer, vals::P) where 
     p
 end
 
-function List(b::Buffer, offset_loc::Integer, x::AbstractVector{J}) where J
-
+function List(ptr::Union{Ptr,Buffer}, offset_loc::Integer, data_loc::Integer, ::Type{U},
+              x::AbstractVector{J}) where {U,J}
+    conv_data = [convert(Vector{U}, ξ) for ξ ∈ x]
+    offs = offsets(conv_data)
+    p = Primitive(ptr, data_loc, vcat(conv_data...))  # TODO this use of vcat is inefficient
+    l = List{typeof(p),J}(ptr, offset_loc, length(x), p)
+    unsafe_setoffsets!(l, offs)
+    l
 end
 
 
@@ -70,33 +76,59 @@ function NullableList{P,J}(b::Buffer, bitmask_loc::Integer, offset_loc::Integer,
     NullableList{P,J}(len, bitmask_ptr, offset_ptr, vals)
 end
 
+# TODO these are really inefficient but difficult to do right, rethink what needs to be here
+function NullableList(ptr::Union{Ptr,Buffer}, bitmask_loc::Integer, offset_loc::Integer,
+                      data_loc::Integer, ::Type{U}, x::AbstractVector{T}
+                     ) where {U,J,T<:Union{Union{J,Missing},J}}
+    bmask = bitpack(.!ismissing.(x))
+    conv_data = Union{Vector{U},Missing}[ismissing(ξ) ? missing : convert(Vector{U}, ξ) for ξ ∈ x]
+    offs = offsets(conv_data)
+    conv_data = filter(ξ -> !ismissing(ξ), conv_data)
+    p = Primitive(ptr, data_loc, vcat(conv_data...))
+    l = NullableList{typeof(p),J}(ptr, bitmask_loc, offset_loc, length(x), p)
+    unsafe_setnulls!(l, bmask)
+    unsafe_setoffsets!(l, offs)
+    l
+end
+
 
 #====================================================================================================
     common interface
 ====================================================================================================#
+function valuesbytes(::Type{C}, A::AbstractVector{T}
+                    ) where {C,K<:AbstractString,T<:Union{Union{K,Missing},K}}
+    sum(ismissing(a) ? 0 : length(a)*sizeof(C) for a ∈ A)
+end
 valuesbytes(A::Union{List{P,J},NullableList{P,J}}) where {P,J} = valuesbytes(A.values)
 
 minbitmaskbytes(A::List) = 0
 minbitmaskbytes(A::NullableList) = bytesforbits(length(A))
 
-offsetsbytes(A::AbstractList) = (length(A)+1)*sizeof(Int32)
+offsetsbytes(A::AbstractVector) = (length(A)+1)*sizeof(Int32)
+export offsetsbytes
 
+function minbytes(::Type{C}, A::AbstractVector{T}
+                 ) where {C,K<:AbstractString,T<:Union{Union{K,Missing},K}}
+    valuesbytes(C, A) + minbitmaskbytes(A) + offsetsbytes(A)
+end
 minbytes(A::AbstractList) = valuesbytes(A) + minbitmaskbytes(A) + offsetsbytes(A)
 
 
+# TODO how to deal with sizeof of Arrow objects such as lists?
 """
     offsets(v::AbstractVector)
 
 Construct a `Vector{Int32}` of offsets appropriate for data appearing in `v`.
 """
-function offsets(v::AbstractVector) where U
+function offsets(v::AbstractVector)
     off = Vector{Int32}(length(v)+1)
     off[1] = 0
     for i ∈ 2:length(off)
-        off[i] = sizeof(v[i-1]) - off[i-1]
+        off[i] = sizeof(v[i-1]) + off[i-1]
     end
     off
 end
+export offsets
 
 
 # note that there are always n+1 offsets
