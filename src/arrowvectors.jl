@@ -49,6 +49,20 @@ export isnull
 
 
 """
+    rawbitmask(p::ArrowVector{Union{J,Missing}}, padding::Function=identity)
+
+Retrieve the raw value of the null bit mask for `p`.
+
+The function `padding` should take as its sole argument the number of bytes of the raw bit mask
+data and retrun the total number of bytes appropriate for the padding scheme.  Note that the argument
+taken is the *minimum* number of bytes of the bitmask (i.e. `ceil(length(p)/8)`).
+"""
+function rawbitmask(p::ArrowVector{Union{J,Missing}}, padding::Function=identity) where J
+    rawpadded(p.validity, minbitmaskbytes(p), padding)
+end
+
+
+"""
     unsafe_setnull!(A::ArrowVector{Union{J,Missing}}, x::Bool, i::Integer)
 
 Set element `i` of `A` to be null. This involves no bounds checking and a call to `unsafe_store!`.

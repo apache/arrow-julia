@@ -164,6 +164,9 @@ function check_offset_bounds(l::AbstractList, i::Integer)
 end
 
 
+rawvalues(p::AbstractList, padding::Function=identity) = rawvalues(p.values, padding)
+
+
 # note that there are always n+1 offsets
 """
     unsafe_getoffset(l::AbstractList, i::Integer)
@@ -171,6 +174,17 @@ end
 Get the offset for element `i`.  Contains a call to `unsafe_load`.
 """
 unsafe_getoffset(l::AbstractList, i::Integer) = unsafe_load(convert(Ptr{Int32}, l.offsets), i)
+
+
+"""
+    rawoffsets(p::AbstractList, padding::Function=identity)
+
+Retreive the raw offstets for `p` as a `Vector{UInt8}`.
+
+The function `padding` should take as its sole argument the number of bytes of the raw values
+and return teh total number of bytes appropriate for the padding scheme.
+"""
+rawoffsets(p::AbstractList, padding::Function=identity) = rawpadded(p.offsets, offsetsbytes(p), padding)
 
 
 """

@@ -86,3 +86,14 @@ end
 function check_buffer_overrun(b::Buffer, i::Integer, A::ArrowVector, obj::Symbol)
     check_buffer_overrun(b, i, minbytes(A), obj)
 end
+
+
+"""
+    rawpadded(ptr::Ptr, len::Integer, padding::Function=identity)
+
+Return a `Vector{UInt8}` padded to appropriate size specified by `padding`.
+"""
+function rawpadded(ptr::Ptr{UInt8}, len::Integer, padding::Function=identity)
+    npad = padding(len) - len
+    vcat(unsafe_wrap(Array, ptr, len), zeros(UInt8, npad))
+end

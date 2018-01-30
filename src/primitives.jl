@@ -160,6 +160,18 @@ end
 
 
 """
+    rawvalues(p::ArrowVector, padding::Function=identity)
+
+Retreive raw value data for `p` as a `Vector{UInt8}`.
+
+The function `padding` should take as its sole argument the number of bytes of the raw values
+and return the total number of bytes appropriate for the padding scheme.
+"""
+rawvalues(p::AbstractPrimitive, padding::Function=identity) = rawpadded(p.data, valuesbytes(p), padding)
+export rawvalues
+
+
+"""
     unsafe_setvalue!(A::ArrowVector{J}, x, i)
 
 Set the value at location `i` to `x`.  If `i` is a single integer, `x` should be an element of type
