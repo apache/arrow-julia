@@ -2,6 +2,11 @@
 #================================================================================================
     functions common to both lists and primitives
 ================================================================================================#
+"""
+    nullcount(A::ArrowVector)
+
+Return the number of nulls (`missing`s) in `A`.
+"""
 nullcount(A::ArrowVector) = 0
 function nullcount(A::ArrowVector{Union{T,Missing}}) where T
     sum(count_ones(unsafe_load(A.validity, i)) for i ∈ 1:bytesforbits(length(A)))
@@ -34,7 +39,9 @@ end
 """
     isnull(A::ArrowVector, i)
 
-Safely check whether element(s) `i` of `A` are null.
+Check whether element(s) `i` of `A` are null with bounds checking.
+
+**WARNING** Bounds checking is not useful if pointers are misaligned!
 """
 isnull(A::ArrowVector, i::Integer) = (checkbounds(A, i); unsafe_isnull(A, i))
 isnull(A::ArrowVector, i::AbstractVector{<:Integer}) = (checkbounds(A,i); unsafe_isnull.(A,i))
@@ -68,6 +75,12 @@ function unsafe_setnulls!(A::ArrowVector{Union{J,Missing}}, nulls::AbstractVecto
 end
 
 
+"""
+    fillmissings!(v::AbstractVector, A::ArrowVector, idx::AbstractVector{<:Integer})
+
+Sets whether the elements of `A` specified by `idx` are missing based on whether the elements
+of `v` are missing.
+"""
 function fillmissings!(v::AbstractVector{Union{J,Missing}}, A::ArrowVector{Union{J,Missing}},
                        idx::AbstractVector{<:Integer}) where J
     for (i, j) ∈ enumerate(idx)

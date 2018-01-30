@@ -3,18 +3,31 @@ abstract type AbstractList{J} <: ArrowVector{J} end
 export AbstractList
 
 
-# TODO add new constructors docs
 """
     List{P<:AbstractPrimitive,J} <: AbstractList{J}
-
-    List{P,J}(ptr::Ptr, offset_loc::Integer, len::Integer, vals::P)
-    List{P,J}(b::Buffer, offset_loc::Integer, len::Integer, vals::P)
 
 An Arrow list of variable length objects such as strings, none of which are
 null.  `vals` is the primitive array in which the underlying data is stored.
 The `List` itself contains a pointer to the offsets, a buffer containing 32-bit
 integers describing the offsets of each value.  The location should be given
 relative to `ptr` using 1-based indexing.
+
+**WARNING** Because the Arrow format is very general, Arrow.jl cannot provide much help in organizing
+your data buffer. It is up to *you* to ensure that your pointers are correct and don't overlap!
+
+## Constructors
+
+    List{P,J}(ptr, offset_loc::Integer, len::Integer, vals::P)
+    List{P,J}(ptr, offset_loc::Integer, data_loc::Integer, ::Type{U}, x::AbstractVector{J})
+
+### Arguments
+- `ptr` an array pointer or Arrow `Buffer` object
+- `offset_loc` the location of the offsets using 1-based indexing
+- `data_loc` the location of the underlying values data using 1-based indexing
+- `len` the number of elements in the list
+- `vals` an `ArrowVector` containing the underlying data values
+- `U` the encoding type of the underlying data. for instance, for UTF8 strings use `UInt8`
+- `x` a vector that can be represented as an Arrow `List`
 """
 struct List{P<:AbstractPrimitive,J} <: AbstractList{J}
     length::Int32
@@ -47,15 +60,28 @@ end
 """
     NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
 
-    NullableList{P,J}(ptr::Ptr, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
-                      vals::P)
-    NullableList{P,J}(b::Buffer, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
-                      vals::P)
-
 An arrow list of variable length objects such as strings, some of which may be null.  `vals`
 is the primitive array in which the underlying data is stored.  The `NullableList` itself contains
 pointers to the offsets and null bit mask which the locations of which should be specified relative
 to `ptr` using 1-based indexing.
+
+**WARNING** Because the Arrow format is very general, Arrow.jl cannot provide much help in organizing
+your data buffer. It is up to *you* to ensure that your pointers are correct and don't overlap!
+
+## Constructors
+
+    NullableList{P,J}(ptr, bitmask_loc::Integer, offset_loc::Integer, len::Integer, vals::P)
+    NullableList{P,J}(ptr, bitmask_loc::Integer, offset_loc::Integer, data_loc::Integer,
+                      ::Type{U}, x::AbstractVector)
+
+### Arguments
+- `ptr` an array pointer or Arrow `Buffer` object
+- `bitmask_loc` the location of the null bit mask using 1-based indexing
+- `offset_loc` the location of the offsets using 1-based indexing
+- `len` the length of the list
+- `vals` an `ArrowVector` containing the underlying values data
+- `U` the data type of the underlying values, for example, for UTF8 strings use `UInt8`
+- `x` a vector that can be represented as an Arrow `NullableList`
 """
 struct NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
     length::Int32
@@ -131,13 +157,34 @@ end
 export offsets
 
 
+function check_offset_bounds(l::AbstractList, i::Integer)
+    if !(1 ≤ i ≤ length(l)+1)
+        throw(ArgumentError("tried to access offset $i from list of length $(length(l))"))
+    end
+end
+
+
 # note that there are always n+1 offsets
 """
-    unsafe_offset(l::AbstractList, i::Integer)
+    unsafe_getoffset(l::AbstractList, i::Integer)
 
 Get the offset for element `i`.  Contains a call to `unsafe_load`.
 """
-unsafe_offset(l::AbstractList, i::Integer) = unsafe_load(convert(Ptr{Int32}, l.offsets), i)
+unsafe_getoffset(l::AbstractList, i::Integer) = unsafe_load(convert(Ptr{Int32}, l.offsets), i)
+
+
+"""
+    getoffset(l::AbstractList, i::Integer)
+
+Retrieve offset `i` for list `l`.  Includes bounds checking.
+
+**WARNING** Bounds checking is not useful if pointers are misaligned!
+"""
+function getoffset(l::AbstractList, i::Integer)
+    @boundscheck check_offset_bounds(l, i)
+    unsafe_getoffset(l, i)
+end
+export getoffset
 
 
 """
@@ -166,12 +213,12 @@ end
 
 Get the length of element `i`. Involves calls to `unsafe_load`.
 """
-unsafe_ellength(l::AbstractList, i::Integer) = unsafe_offset(l, i+1) - unsafe_offset(l, i)
+unsafe_ellength(l::AbstractList, i::Integer) = unsafe_getoffset(l, i+1) - unsafe_getoffset(l, i)
 
 # returns offset, length
 function unsafe_elparams(l::AbstractList, i::Integer)
-    off = unsafe_offset(l, i)
-    off, unsafe_offset(l, i+1) - off
+    off = unsafe_getoffset(l, i)
+    off, unsafe_getoffset(l, i+1) - off
 end
 
 

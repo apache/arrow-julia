@@ -4,15 +4,24 @@ abstract type AbstractPrimitive{J} <: ArrowVector{J} end
 export AbstractPrimitive
 
 
-# TODO add new constructor docs
 """
     Primitive{J} <: AbstractPrimitive{J}
 
-    Primitive{J}(ptr::Ptr, i::Integer, len::Integer)
-    Primitive{J}(b::Buffer, i::Integer, len::Integer)
-
 An arrow primitive array containing no null values.  This is essentially just a wrapped pointer
 to the data.  The index `i` should give the start of the array relative to `ptr` using 1-based indexing.
+
+**WARNING** Because the Arrow format is very general, Arrow.jl cannot provide much help in organizing
+your data buffer. It is up to *you* to ensure that your pointers are correct and don't overlap!
+
+## Constructors
+
+    Primitive{J}(ptr, i::Integer, len::Integer)
+    Primitive{J}(ptr, i::Integer, x::AbstractVector{J})
+
+### Arguments
+- `ptr` an array pointer or Arrow `Buffer` object
+- `i` the location the data should be stored using 1-based indexing
+- `x` a vector that can be represented as an Arrow `Primitive`
 """
 struct Primitive{J} <: AbstractPrimitive{J}
     length::Int32
@@ -38,12 +47,24 @@ end
 """
     NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
 
-    NullablePrimitive{J}(ptr::Ptr, bitmask_loc::Integer, data_loc::Integer, len::Integer)
-    NullablePrimitive{J}(b::Buffer, bitmask_loc::Integer, data_loc::Integer, len::Integer)
-
 An arrow primitive array possibly containing null values.  This is essentially a pair of wrapped
 pointers: one to the data and one to the bitmask specifying whether each value is null.
 The bitmask and data locations should be given relative to `ptr` using 1-based indexing.
+
+**WARNING** Because the Arrow format is very general, Arrow.jl cannot provide much help in organizing
+your data buffer. It is up to *you* to ensure that your pointers are correct and don't overlap!
+
+## Constructors
+
+    NullablePrimitive{J}(ptr, bitmask_loc::Integer, data_loc::Integer, len::Integer)
+    NullablePrimitive{J}(ptr, bitmask_loc::Integer, data_loc::Integer, x::AbstractVector)
+
+### Arguments
+- `ptr` an array pointer or Arrow `Buffer` object
+- `bitmask_loc` the location of the null bit mask using 1-based indexing
+- `data_loc` the location of the data using 1-based indexing
+- `len` the length of the `NullablePrimitive`
+- `x` a vector that can be represented as an Arrow `NullablePrimitive`
 """
 struct NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
     length::Int32

@@ -13,8 +13,6 @@ abstract type ArrowTime <: Dates.AbstractTime end
     Timestamp{P<:Dates.TimePeriod}
 
 Timestamp in which time is stored in units `P` as `Int64` for Arrow formatted data.
-
-**TODO** Timezones not implemented.
 """
 struct Timestamp{P<:Dates.TimePeriod} <: ArrowTime
     value::Int64
@@ -38,9 +36,13 @@ invscale(::Type{Dates.Nanosecond}, t) = 1e6*value(t)
 
 
 convert(::Type{DateTime}, t::Timestamp{P}) where P = DateTime(Dates.UTM(UNIXEPOCH_TS + scale(P, t)))
+convert(::Type{Dates.TimeType}, t::Timestamp) = convert(DateTime, t)
+
 function convert(::Type{Timestamp{P}}, t::DateTime) where P
     Timestamp{P}(invscale(P, Dates.value(t) - UNIXEPOCH_TS))
 end
+convert(::Type{Timestamp}, t::DateTime) = convert(Timestamp{Dates.Millisecond}, t)
+convert(::Type{ArrowTime}, t::DateTime) = convert(Timestamp, t)
 
 show(io::IO, t::Timestamp) = show(io, convert(DateTime, t))
 
@@ -60,6 +62,9 @@ value(t::Datestamp) = t.value
 
 
 convert(::Type{Date}, t::Datestamp) = Date(Dates.UTD(UNIXEPOCH_DT + value(t)))
+convert(::Dates.TimeType, t::Datestamp) = convert(Date, t)
+
 convert(::Type{Datestamp}, t::Date) = Datestamp(Dates.value(t) - UNIXEPOCH_DT)
+convert(::Type{ArrowTime}, t::Date) = convert(Datestamp, t)
 
 show(io::IO, t::Datestamp) = show(io, convert(Date, t))
