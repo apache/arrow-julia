@@ -185,6 +185,7 @@ The function `padding` should take as its sole argument the number of bytes of t
 and return teh total number of bytes appropriate for the padding scheme.
 """
 rawoffsets(p::AbstractList, padding::Function=identity) = rawpadded(p.offsets, offsetsbytes(p), padding)
+export rawoffsets
 
 
 """

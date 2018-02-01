@@ -60,6 +60,7 @@ taken is the *minimum* number of bytes of the bitmask (i.e. `ceil(length(p)/8)`)
 function rawbitmask(p::ArrowVector{Union{J,Missing}}, padding::Function=identity) where J
     rawpadded(p.validity, minbitmaskbytes(p), padding)
 end
+export rawbitmask
 
 
 """
