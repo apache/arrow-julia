@@ -1,4 +1,6 @@
 
+# TODO bounds checking for all indices
+
 abstract type AbstractList{J} <: ArrowVector{J} end
 export AbstractList
 

@@ -3,17 +3,55 @@
     functions common to both lists and primitives
 ================================================================================================#
 """
+    datapointer(A::ArrowVector)
+
+Returns a pointer to the very start of the data buffer for `A` (i.e. does not depend on indices).
+"""
+datapointer(A::ArrowVector) = pointer(A.data)
+export datapointer
+
+
+"""
+    valuespointer(A::ArrowVector)
+
+Returns a pointer to the start of the values buffer for `A`.
+"""
+valuespointer(A::ArrowVector{J}) where J = datapointer(A) + A.values_idx - 1
+export valuespointer
+
+
+"""
+    bitmaskpointer(A::ArrowVector)
+
+Returns a pointer to the start of the bitmask buffer for `A`.
+"""
+function bitmaskpointer(A::ArrowVector{Union{J,Missing}}) where J
+    datapointer(A) + A.bitmask_idx - 1
+end
+export bitmaskpointer
+
+
+valuesindex(A::ArrowVector, i) = A.values_idx + i - 1
+bitmaskindex(A::ArrowVector, i) = A.bitmask_idx + i - 1
+
+
+# TODO this actually gets fucked up if bitmask has trailing ones (that's also why this is backwards)
+"""
     nullcount(A::ArrowVector)
 
 Return the number of nulls (`missing`s) in `A`.
 """
 nullcount(A::ArrowVector) = 0
 function nullcount(A::ArrowVector{Union{T,Missing}}) where T
-    sum(count_ones(unsafe_load(A.validity, i)) for i ∈ 1:bytesforbits(length(A)))
+    s = 0
+    for i ∈ 0:(minbitmaskbytes(A)-1)
+        @inbounds s += count_ones(A.data[A.bitmask_idx+i])
+    end
+    length(A) - s
 end
 export nullcount
 
-checkbounds(A::ArrowVector, i::Integer) = (1 ≤ i ≤ A.length) || throw(BoundsError(A, i))
+checkbounds(A::ArrowVector, i::Integer) = (1 ≤ i ≤ length(A)) || throw(BoundsError(A, i))
 # this is probably crazy in the general case, but should work well for unit ranges
 function checkbounds(A::ArrowVector, idx::AbstractVector{<:Integer})
     a, b = extrema(idx)
@@ -33,7 +71,7 @@ Check whether element `i` of `A` is null. This involves no bounds checking and a
 unsafe_isnull(A::ArrowVector, i::Integer) = false
 function unsafe_isnull(A::ArrowVector{Union{T,Missing}}, i::Integer) where T
     a, b = divrem(i, 8)
-    !getbit(unsafe_load(A.validity + a), b)
+    !getbit(unsafe_load(bitmaskpointer(A) + a), b)
 end
 
 """
@@ -58,7 +96,7 @@ data and retrun the total number of bytes appropriate for the padding scheme.  N
 taken is the *minimum* number of bytes of the bitmask (i.e. `ceil(length(p)/8)`).
 """
 function rawbitmask(p::ArrowVector{Union{J,Missing}}, padding::Function=identity) where J
-    rawpadded(p.validity, minbitmaskbytes(p), padding)
+    rawpadded(bitmaskpointer(A), minbitmaskbytes(p), padding)
 end
 export rawbitmask
 
@@ -70,7 +108,7 @@ Set element `i` of `A` to be null. This involves no bounds checking and a call t
 """
 function unsafe_setnull!(A::ArrowVector{Union{J,Missing}}, x::Bool, i::Integer) where J
     a, b = divrem(i, 8)
-    ptr = A.validity + a
+    ptr = bitmaskpointer(A) + a
     byte = setbit(unsafe_load(ptr), !x, b)
     unsafe_store!(ptr, byte)
 end
@@ -83,7 +121,7 @@ Set *all* the nulls for the `ArrowVector`. This does not check bounds and contai
 `unsafe_copy!` (but does not copy directly from `nulls`).
 """
 function unsafe_setnulls!(A::ArrowVector{Union{J,Missing}}, bytes::Vector{UInt8}) where J
-    unsafe_copy!(A.validity, pointer(bytes), length(bytes))
+    unsafe_copy!(bitmaskpointer(A), pointer(bytes), length(bytes))
 end
 function unsafe_setnulls!(A::ArrowVector{Union{J,Missing}}, nulls::AbstractVector{Bool}) where J
     unsafe_setnulls!(A, bitpack(.!nulls))
@@ -146,11 +184,24 @@ next(A::ArrowVector, i::Integer) = (A[i], i+1)
 done(A::ArrowVector, i::Integer) = i > length(A)
 
 
-convert(::Type{Array{T}}, A::ArrowVector{T}) where T = A[1:end]
-convert(::Type{Vector{T}}, A::ArrowVector{T}) where T = A[1:end]
+convert(::Type{Array{T}}, A::ArrowVector{T}) where T = A[:]
+convert(::Type{Vector{T}}, A::ArrowVector{T}) where T = A[:]
 
 
-function getindex(l::ArrowVector{J}, i::Union{Integer,AbstractVector{<:Integer}}) where J
+function view(l::ArrowVector{J}, i::Union{Integer,AbstractVector{<:Integer}}) where J
+    @boundscheck checkbounds(l, i)
+    SubArray(unsafe_getvalue(l, i), (i,))
+end
+
+function getindex(l::ArrowVector{J}, i::Integer) where J
+    @boundscheck checkbounds(l, i)
+    unsafe_getvalue(l, i)
+end
+function getindex(l::ArrowVector{J}, idx::AbstractVector{<:Integer}) where J
+    @boundscheck checkbounds(l, i)
+    copy(unsafe_getvalue(l, i))
+end
+function getindex(l::ArrowVector{J}, idx::AbstractVector{Bool}) where J
     @boundscheck checkbounds(l, i)
     unsafe_getvalue(l, i)
 end

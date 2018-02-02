@@ -1,4 +1,5 @@
 
+# TODO bounds checking in constructors for all indices
 
 abstract type AbstractPrimitive{J} <: ArrowVector{J} end
 export AbstractPrimitive
@@ -25,22 +26,25 @@ your data buffer. It is up to *you* to ensure that your pointers are correct and
 """
 struct Primitive{J} <: AbstractPrimitive{J}
     length::Int32
-    data::Ptr{UInt8}
+    values_idx::Int64
+    data::Vector{UInt8}
 end
 export Primitive
 
-Primitive{J}(ptr::Ptr, i::Integer, len::Integer) where J = Primitive{J}(len, ptr + (i-1))
-function Primitive{J}(b::Buffer, i::Integer, len::Integer) where J
-    data_ptr = pointer(b.data, i)
-    p = Primitive{J}(len, data_ptr)
-    @boundscheck check_buffer_overrun(b, i, p, :values)
+function Primitive{J}(data::Vector{UInt8}, i::Integer, len::Integer) where J
+    @boundscheck check_buffer_bounds(J, data, i, len)
+    Primitive{J}(len, i, data)
+end
+function Primitive(data::Vector{UInt8}, i::Integer, x::AbstractVector{J}) where J
+    p = Primitive{J}(data, i, length(x))
+    p[:] = x
     p
 end
 
-function Primitive(ptr::Union{Ptr,Buffer}, i::Integer, x::AbstractVector{J}) where J
-    p = Primitive{J}(ptr, i, length(x))
-    p[:] = x
-    p
+# constructor for own buffer
+function Primitive(v::AbstractVector{J}) where J
+    b = Vector{UInt8}(minbytes(v))
+    Primitive(b, 1, v)
 end
 
 
@@ -68,32 +72,31 @@ your data buffer. It is up to *you* to ensure that your pointers are correct and
 """
 struct NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
     length::Int32
-    validity::Ptr{UInt8}
-    data::Ptr{UInt8}
+    bitmask_idx::Int64
+    values_idx::Int64
+    data::Vector{UInt8}
 end
 export NullablePrimitive
 
-function NullablePrimitive{J}(ptr::Ptr, bitmask_loc::Integer, data_loc::Integer,
+function NullablePrimitive{J}(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
                               len::Integer) where J
-    NullablePrimitive{J}(len, ptr+bitmask_loc-1, ptr+data_loc-1)
+    @boundscheck check_buffer_bounds(J, data, values_idx, len)
+    NullablePrimitive{J}(len, bitmask_idx, values_idx, data)
 end
-function NullablePrimitive{J}(b::Buffer, bitmask_loc::Integer, data_loc::Integer,
-                              len::Integer) where J
-    val_ptr = pointer(b.data, bitmask_loc)
-    data_ptr = pointer(b.data, data_loc)
-    p = NullablePrimitive{J}(len, val_ptr, data_ptr)
-    @boundscheck begin
-        check_buffer_overrun(b, bitmask_loc, minbitmaskbytes(p), :bitmask)
-        check_buffer_overrun(b, data_loc, valuesbytes(p), :values)
-    end
+
+function NullablePrimitive(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
+                           x::AbstractVector{T}) where {J,T<:Union{Union{J,Missing},J}}
+    p = NullablePrimitive{J}(data, bitmask_idx, values_idx, length(x))
+    p[:] = x
     p
 end
 
-function NullablePrimitive(ptr::Union{Ptr,Buffer}, bitmask_loc::Integer, data_loc::Integer,
-                           x::AbstractVector{T}) where {J,T<:Union{Union{J,Missing},J}}
-    p = NullablePrimitive{J}(ptr, bitmask_loc, data_loc, length(x))
-    p[:] = x
-    p
+function NullablePrimitive(v::AbstractVector{Union{J,Missing}}) where J
+    b = Vector{UInt8}(minbytes(v))
+    NullablePrimitive(b, 1, 1+minbitmaskbytes(v), v)
+end
+function NullablePrimitive(v::AbstractVector{J}) where J
+    NullablePrimitive(convert(AbstractVector{Union{J,Missing}}, v))
 end
 
 #================================================================================================
@@ -147,15 +150,33 @@ index, an `AbstractVector` of integer indices, or an `AbstractVector{Bool}` mask
 This typically involves a call to `unsafe_load` or `unsafe_wrap`.
 """
 function unsafe_getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, i::Integer)::J where J
-    unsafe_load(convert(Ptr{J}, A.data), i)
+    unsafe_load(convert(Ptr{J}, valuespointer(A)), i)
 end
 function unsafe_getvalue(A::Union{Primitive{J},NullablePrimitive{J}},
                          idx::AbstractVector{<:Integer}) where J
-    ptr = convert(Ptr{J}, A.data) + (idx[1]-1)*sizeof(J)
+    ptr = convert(Ptr{J}, valuespointer(A)) + (idx[1]-1)*sizeof(J)
     unsafe_wrap(Array, ptr, length(idx))
 end
 function unsafe_getvalue(A::Primitive{J}, idx::AbstractVector{Bool}) where J
     J[unsafe_getvalue(A, i) for i ∈ 1:length(A) if idx[i]]
+end
+
+
+# TODO these are broken for stepranges, it's really annoying
+function getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, i::Integer)::J where J
+    a = A.values_idx + (i-1)*sizeof(J)
+    b = a + sizeof(J) - 1
+    @inbounds o = getindex(A.data, a:b)
+    reinterpret(J, o)[1]
+end
+function getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, idx::AbstractVector{<:Integer}) where J
+    a = A.values_idx + (idx-1)*sizeof(J)
+    b = a + sizeof(J) - 1
+    @inbounds o = getindex(A.data, a:b)
+    reinterpret(J, o)
+end
+function getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, idx::AbstractVector{Bool}) where J
+    J[getvalue(A, i) for i ∈ 1:length(A) if idx[i]]
 end
 
 
@@ -167,7 +188,9 @@ Retreive raw value data for `p` as a `Vector{UInt8}`.
 The function `padding` should take as its sole argument the number of bytes of the raw values
 and return the total number of bytes appropriate for the padding scheme.
 """
-rawvalues(p::AbstractPrimitive, padding::Function=identity) = rawpadded(p.data, valuesbytes(p), padding)
+function rawvalues(p::AbstractPrimitive, padding::Function=identity)
+    rawpadded(valuespointer(p), valuesbytes(p), padding)
+end
 export rawvalues
 
 
@@ -179,18 +202,18 @@ Set the value at location `i` to `x`.  If `i` is a single integer, `x` should be
 `x` should be an appropriately sized `AbstractVector{J}`.
 """
 function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, x::J, i::Integer) where J
-    unsafe_store!(convert(Ptr{J}, A.data), x, i)
+    unsafe_store!(convert(Ptr{J}, valuespointer(A)), x, i)
 end
 function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, v::AbstractVector{J},
                           idx::AbstractVector{<:Integer}) where J
-    ptr = convert(Ptr{J}, A.data)
+    ptr = convert(Ptr{J}, valuespointer(A))
     for (x, i) ∈ zip(v, idx)
         unsafe_store!(ptr, x, i)
     end
 end
 function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, v::AbstractVector{J},
                           idx::AbstractVector{Bool}) where J
-    ptr = convert(Ptr{J}, A.data)
+    ptr = convert(Ptr{J}, valuespointer(A))
     j = 1
     for i ∈ 1:length(A)
         if idx[i]
@@ -200,7 +223,7 @@ function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, v::Abstra
     end
 end
 function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, v::Vector{J}, ::Colon) where J
-    unsafe_copy!(convert(Ptr{J}, A.data), pointer(v), length(v))
+    unsafe_copy!(convert(Ptr{J}, valuespointer(A)), pointer(v), length(v))
 end
 
 
@@ -214,10 +237,10 @@ from primitive arrays.
 Users must define new methods for new types `T`.
 """
 function unsafe_construct(::Type{String}, A::Primitive{UInt8}, i::Integer, len::Integer)
-    unsafe_string(convert(Ptr{UInt8}, A.data + (i-1)), len)
+    unsafe_string(convert(Ptr{UInt8}, valuespointer(A) + (i-1)), len)
 end
 function unsafe_construct(::Type{WeakRefString{J}}, A::Primitive{J}, i::Integer, len::Integer) where J
-    WeakRefString{J}(convert(Ptr{J}, A.data + (i-1)), len)
+    WeakRefString{J}(convert(Ptr{J}, valuespointer(A) + (i-1)), len)
 end
 
 function unsafe_construct(::Type{T}, A::NullablePrimitive{J}, i::Integer, len::Integer) where {T,J}
