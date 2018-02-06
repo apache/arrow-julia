@@ -31,10 +31,6 @@ end
 export bitmaskpointer
 
 
-valuesindex(A::ArrowVector, i) = A.values_idx + i - 1
-bitmaskindex(A::ArrowVector, i) = A.bitmask_idx + i - 1
-
-
 # TODO this actually gets fucked up if bitmask has trailing ones (that's also why this is backwards)
 """
     nullcount(A::ArrowVector)
@@ -63,26 +59,32 @@ end
 
 
 """
-    unsafe_isnull(A::ArrowVector, i::Integer)
+    unsafe_isnull(A::ArrowVector, idx)
 
-Check whether element `i` of `A` is null. This involves no bounds checking and a call to
-`unsafe_load`.
+Check whether element(s) `idx` of `A` are null.
 """
 unsafe_isnull(A::ArrowVector, i::Integer) = false
 function unsafe_isnull(A::ArrowVector{Union{T,Missing}}, i::Integer) where T
     a, b = divrem(i, 8)
     !getbit(unsafe_load(bitmaskpointer(A) + a), b)
 end
+unsafe_isnull(A::ArrowVector, idx::AbstractVector{<:Integer}) = Bool[unsafe_isnull(A, i) for i ∈ idx]
+
 
 """
-    isnull(A::ArrowVector, i)
+    isnull(A::ArrowVector, idx)
 
-Check whether element(s) `i` of `A` are null with bounds checking.
-
-**WARNING** Bounds checking is not useful if pointers are misaligned!
+Check whether element(s) `idx` of `A` are null.
 """
-isnull(A::ArrowVector, i::Integer) = (checkbounds(A, i); unsafe_isnull(A, i))
-isnull(A::ArrowVector, i::AbstractVector{<:Integer}) = (checkbounds(A,i); unsafe_isnull.(A,i))
+isnull(A::ArrowVector, i) = false
+function isnull(A::ArrowVector{Union{J,Missing}}, i::Integer) where J
+    a, b = divrem(i, 8)
+    idx = A.bitmask_idx + a
+    @boundscheck checkbounds(A.data, idx)
+    @inbounds o = !getbit(A.data[idx], b)  # TODO delete extra line in 0.7
+    o
+end
+isnull(A::ArrowVector, idx::AbstractVector{<:Integer}) = Bool[isnull(A, i) for i ∈ idx]
 export isnull
 
 
@@ -128,37 +130,38 @@ function unsafe_setnulls!(A::ArrowVector{Union{J,Missing}}, nulls::AbstractVecto
 end
 
 
-"""
-    fillmissings!(v::AbstractVector, A::ArrowVector, idx::AbstractVector{<:Integer})
-
-Sets whether the elements of `A` specified by `idx` are missing based on whether the elements
-of `v` are missing.
-"""
-function fillmissings!(v::AbstractVector{Union{J,Missing}}, A::ArrowVector{Union{J,Missing}},
-                       idx::AbstractVector{<:Integer}) where J
-    for (i, j) ∈ enumerate(idx)
-        unsafe_isnull(A, j) && (v[i] = missing)
-    end
-end
-function fillmissings!(v::AbstractVector{Union{J,Missing}}, A::ArrowVector{Union{J,Missing}},
-                       idx::AbstractVector{Bool}) where J
-    j = 1
-    for i ∈ 1:length(A)
-        if idx[i]
-            unsafe_isnull(A, i) && (v[j] = missing)
-            j += 1
+macro _make_fillmissings_funcs(name::Symbol, func::Symbol)
+esc(quote
+    function $name(v::AbstractVector{Union{J,Missing}}, A::ArrowVector{Union{J,Missing}},
+                   idx::AbstractVector{<:Integer}) where J
+        for (i, j) ∈ enumerate(idx)
+            $func(A, j) && (v[i] = missing)
         end
     end
+    function $name(v::AbstractVector{Union{J,Missing}}, A::ArrowVector{Union{J,Missing}},
+                   idx::AbstractVector{Bool}) where J
+        j = 1
+        for i ∈ 1:length(A)
+            if idx[i]
+                $func(A, i) && (v[j] = missing)
+                j += 1
+            end
+        end
+    end
+    function $name(v::AbstractVector{Union{J,Missing}}, A::ArrowVector{Union{J,Missing}}) where J
+        $name(v, A, 1:length(A))
+    end
+end)
 end
-function fillmissings!(v::AbstractVector{Union{J,Missing}}, A::ArrowVector{Union{J,Missing}}) where J
-    fillmissings!(v, A, 1:length(A))
-end
+@_make_fillmissings_funcs(unsafe_fillmissings!, unsafe_isnull)
+@_make_fillmissings_funcs(fillmissings!, isnull)
+
 
 
 # TODO this is really inefficient and also NullExceptions are uninformative
 function nullexcept_inrange(A::ArrowVector{Union{T,Missing}}, i::Integer, j::Integer) where T
     for k ∈ i:j
-        unsafe_isnull(A, i) && throw(NullException())
+        isnull(A, i) && throw(NullException())
     end
 end
 
@@ -188,37 +191,23 @@ convert(::Type{Array{T}}, A::ArrowVector{T}) where T = A[:]
 convert(::Type{Vector{T}}, A::ArrowVector{T}) where T = A[:]
 
 
-function view(l::ArrowVector{J}, i::Union{Integer,AbstractVector{<:Integer}}) where J
+# TODO in 0.6, views have to use unsafe methods
+function unsafe_view(l::ArrowVector{J}, i::Union{Integer,AbstractVector{<:Integer}}) where J
     @boundscheck checkbounds(l, i)
     SubArray(unsafe_getvalue(l, i), (i,))
 end
 
 function getindex(l::ArrowVector{J}, i::Integer) where J
     @boundscheck checkbounds(l, i)
-    unsafe_getvalue(l, i)
+    getvalue(l, i)
 end
-function getindex(l::ArrowVector{J}, idx::AbstractVector{<:Integer}) where J
-    @boundscheck checkbounds(l, i)
-    copy(unsafe_getvalue(l, i))
-end
-function getindex(l::ArrowVector{J}, idx::AbstractVector{Bool}) where J
-    @boundscheck checkbounds(l, i)
-    unsafe_getvalue(l, i)
-end
-
 function getindex(l::ArrowVector{Union{J,Missing}}, i::Integer)::Union{J,Missing} where J
     @boundscheck checkbounds(l, i)
-    unsafe_isnull(l, i) ? missing : unsafe_getvalue(l, i)
+    isnull(l, i) ? missing : getvalue(l, i)
 end
 function getindex(l::ArrowVector{Union{J,Missing}}, idx::AbstractVector{<:Integer}) where J
     @boundscheck checkbounds(l, idx)
-    v = Vector{Union{J,Missing}}(unsafe_getvalue(l, idx))
-    fillmissings!(v, l, idx)
-    v
-end
-function getindex(l::ArrowVector{Union{J,Missing}}, idx::AbstractVector{Bool}) where J
-    @boundscheck checkbounds(l, idx)
-    v = Union{J,Missing}[unsafe_getvalue(l, i) for i ∈ 1:length(l) if idx[i]]
+    v = convert(Vector{Union{J,Missing}}, getvalue(l, idx))
     fillmissings!(v, l, idx)
     v
 end

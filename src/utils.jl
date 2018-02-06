@@ -90,7 +90,7 @@ end
 
 Return a `Vector{UInt8}` padded to appropriate size specified by `padding`.
 """
-function rawpadded(ptr::Ptr{UInt8}, len::Integer, padding::Function=identity)
+function unsafe_rawpadded(ptr::Ptr{UInt8}, len::Integer, padding::Function=identity)
     npad = padding(len) - len
     vcat(unsafe_wrap(Array, ptr, len), zeros(UInt8, npad))
 end

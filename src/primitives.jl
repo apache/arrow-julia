@@ -70,18 +70,18 @@ your data buffer. It is up to *you* to ensure that your pointers are correct and
 - `len` the length of the `NullablePrimitive`
 - `x` a vector that can be represented as an Arrow `NullablePrimitive`
 """
+# TODO finish this
 struct NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
-    length::Int32
-    bitmask_idx::Int64
-    values_idx::Int64
-    data::Vector{UInt8}
+    bitmask::Primitive{UInt8}
+    values::Primitive{J}
 end
 export NullablePrimitive
 
 function NullablePrimitive{J}(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
                               len::Integer) where J
-    @boundscheck check_buffer_bounds(J, data, values_idx, len)
-    NullablePrimitive{J}(len, bitmask_idx, values_idx, data)
+    bmask = Primitive{UInt8}(data, bitmask_idx, length(data))  # this length is a default
+    vals = Primitive{J}(data, values_idx, len)
+    NullablePrimitive{J}(bmask, vals)
 end
 
 function NullablePrimitive(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
@@ -162,24 +162,68 @@ function unsafe_getvalue(A::Primitive{J}, idx::AbstractVector{Bool}) where J
 end
 
 
-# TODO these are broken for stepranges, it's really annoying
-function getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, i::Integer)::J where J
-    a = A.values_idx + (i-1)*sizeof(J)
-    b = a + sizeof(J) - 1
-    @inbounds o = getindex(A.data, a:b)
-    reinterpret(J, o)[1]
+function _valueindex_start(A::AbstractPrimitive{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
+    A.values_idx + (i-1)*sizeof(J)
 end
-function getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, idx::AbstractVector{<:Integer}) where J
-    a = A.values_idx + (idx-1)*sizeof(J)
-    b = a + sizeof(J) - 1
-    @inbounds o = getindex(A.data, a:b)
-    reinterpret(J, o)
+function _valueindex_stop(A::AbstractPrimitive{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
+    A.values_idx + i*sizeof(J) - 1
 end
-function getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, idx::AbstractVector{Bool}) where J
-    J[getvalue(A, i) for i ∈ 1:length(A) if idx[i]]
+
+function valueindex_contiguous(A::AbstractPrimitive{T}, idx::AbstractVector{<:Integer}
+                              ) where {J,T<:Union{J,Union{J,Missing}}}
+    a = _valueindex_start(A, first(idx))
+    b = _valueindex_stop(A, last(idx))
+    a:b
 end
 
 
+function valueindex(A::AbstractPrimitive{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
+    a = _valueindex_start(A, i)
+    b = _valueindex_stop(A, i)
+    a:b
+end
+function valueindex(A::AbstractPrimitive{T}, idx::AbstractVector{<:Integer}
+                   ) where {J,T<:Union{J,Union{J,Missing}}}
+    vcat((valueindex(A, i) for i ∈ idx)...)  # TODO inefficient use of vcat
+end
+function valueindex(A::AbstractPrimitive{T}, idx::UnitRange{<:Integer}
+                   ) where {J,T<:Union{J,Union{J,Missing}}}
+    valueindex_contiguous(A, idx)
+end
+
+
+"""
+    rawvalues(A::ArrowVector, idx)
+
+Gets a `Vector{UInt8}` of the raw values associated with the indices `idx`.
+"""
+function rawvalues(A::AbstractPrimitive, i::Union{<:Integer,AbstractVector{<:Integer}})
+    rawidx = valueindex(A, i)
+    @inbounds o = A.data[rawidx]  # TODO get rid of extra line in 0.7, can be view
+    o
+end
+function rawvalues(A::AbstractPrimitive, idx::AbstractVector{Bool})
+    rawidx = valueindex(A, [i for i ∈ 1:length(A) if idx[i]])
+    @inbounds o = A.data[rawidx]  # TODO get rid of extra line in 0.7, can be view
+    o
+end
+
+
+"""
+    getvalue(A::ArrowVector, idx)
+
+Get the values for indices `idx` from `A`.
+"""
+function getvalue(A::AbstractPrimitive{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
+    reinterpret(J, rawvalues(A, i))[1]
+end
+function getvalue(A::AbstractPrimitive{T}, i::AbstractVector{<:Integer}
+                 ) where {J,T<:Union{J,Union{J,Missing}}}
+    reinterpret(J, rawvalues(A, i))
+end
+
+
+# TODO this should probably be renamed
 """
     rawvalues(p::ArrowVector, padding::Function=identity)
 
@@ -188,10 +232,10 @@ Retreive raw value data for `p` as a `Vector{UInt8}`.
 The function `padding` should take as its sole argument the number of bytes of the raw values
 and return the total number of bytes appropriate for the padding scheme.
 """
-function rawvalues(p::AbstractPrimitive, padding::Function=identity)
-    rawpadded(valuespointer(p), valuesbytes(p), padding)
+function unsafe_rawvalues(p::AbstractPrimitive, padding::Function=identity)
+    unsafe_rawpadded(valuespointer(p), valuesbytes(p), padding)
 end
-export rawvalues
+export unsafe_rawvalues
 
 
 """

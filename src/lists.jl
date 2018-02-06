@@ -31,9 +31,10 @@ your data buffer. It is up to *you* to ensure that your pointers are correct and
 - `U` the encoding type of the underlying data. for instance, for UTF8 strings use `UInt8`
 - `x` a vector that can be represented as an Arrow `List`
 """
+# TODO come back to this
 struct List{P<:AbstractPrimitive,J} <: AbstractList{J}
     length::Int32
-    offsets::Ptr{UInt8}
+    offsets::Primitive{Int32}
     values::P
 end
 export List

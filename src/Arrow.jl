@@ -33,9 +33,8 @@ include("vectorbuffer.jl")
 
 #=~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 TODO
+    -clean up bounds checking. right now it's all fucked up
     -support nested lists (think should work but haven't tested)
-    -bounds checking in constructors
-    -bounds checking in accessing null bitmap
     -be sure null checking isn't too slow as it is
 
     -ensure that convert(Array{Union{T,Missing}}, A) is efficient in 0.7
