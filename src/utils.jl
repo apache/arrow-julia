@@ -2,13 +2,21 @@
 bytesforbits(n::Integer) = div(((n + 7) & ~7), 8)
 export bytesforbits
 
-getbit(byte::UInt8, i::Integer) = (byte & BITMASK[i] > 0x00) ? true : false
+getbit(byte::UInt8, i::Integer) = (byte & BITMASK[i] > 0x00)
 function setbit(byte::UInt8, x::Bool, i::Integer)
     if x
         byte | BITMASK[i]
     else
         byte & (~BITMASK[i])
     end
+end
+
+
+encode(::Type{C}, v::AbstractVector{J}) where {C,J} = mapreduce(x -> convert(Vector{C}, x), vcat, v)
+
+
+function replace_missing_vals(A::AbstractVector{Union{J,Missing}}) where J
+    J[ismissing(x) ? first(A) : x for x ∈ A]  # using first ensures existence
 end
 
 
@@ -42,6 +50,9 @@ function bitpack(A::AbstractVector{Bool})
     v
 end
 export bitpack
+
+
+bitmask(A::AbstractVector) = bitpack(map(x -> !ismissing(x), A))
 
 
 """

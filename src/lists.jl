@@ -31,7 +31,6 @@ your data buffer. It is up to *you* to ensure that your pointers are correct and
 - `U` the encoding type of the underlying data. for instance, for UTF8 strings use `UInt8`
 - `x` a vector that can be represented as an Arrow `List`
 """
-# TODO come back to this
 struct List{P<:AbstractPrimitive,J} <: AbstractList{J}
     length::Int32
     offsets::Primitive{Int32}
@@ -39,25 +38,36 @@ struct List{P<:AbstractPrimitive,J} <: AbstractList{J}
 end
 export List
 
-function List{P,J}(ptr::Ptr, offset_loc::Integer, len::Integer, vals::P) where {P,J}
-    List{P,J}(len, ptr+offset_loc-1, vals)
+function List{J}(len::Integer, offs::Primitive{Int32}, vals::P) where {J,P<:AbstractPrimitive}
+    List{P,J}(len, offs, vals)
 end
-function List{P,J}(b::Buffer, offset_loc::Integer, len::Integer, vals::P) where {P,J}
-    offset_ptr = pointer(b.data, offset_loc)
-    p = List{P,J}(len, offset_ptr, vals)
-    @boundscheck check_buffer_overrun(b, offset_loc, offsetsbytes(p), :offsets)
-    p
+function List{J}(offs::Primitive{Int32}, vals::P) where {J,P<:AbstractPrimitive}
+    List{P,J}(length(offs)-1, offs, vals)
 end
 
-function List(ptr::Union{Ptr,Buffer}, offset_loc::Integer, data_loc::Integer, ::Type{U},
-              x::AbstractVector{J}) where {U,J}
-    conv_data = [convert(Vector{U}, ξ) for ξ ∈ x]
-    offs = offsets(conv_data)
-    p = Primitive(ptr, data_loc, vcat(conv_data...))  # TODO this use of vcat is inefficient
-    l = List{typeof(p),J}(ptr, offset_loc, length(x), p)
-    unsafe_setoffsets!(l, offs)
-    l
+function List{P,J}(data::Vector{UInt8}, offset_idx::Integer, len::Integer, vals::P
+                  ) where {P<:AbstractPrimitive,J}
+    offs = Primitive{Int32}(data, offset_idx, len+1)
+    List{P,J}(len, offs, vals)
 end
+function List{J}(data::Vector{UInt8}, offset_idx::Integer, len::Integer, vals::P
+                ) where {P<:AbstractPrimitive,J}
+    List{P,J}(data, offs, len, vals)
+end
+
+function List(data::Vector{UInt8}, offset_idx::Integer, values_idx::Integer, ::Type{C},
+              x::AbstractVector{J}) where {C,J}
+    offs = Primitive{Int32}(data, offset_idx, offsets(C, x))
+    p = Primitive(data, values_idx, encode(conv_data))
+    List{J}(offs, p)
+end
+
+function List(::Type{C}, v::AbstractVector{J}) where {J,C}
+    offs = Primitive{Int32}(offsets(C, v))
+    p = Primitive(encode(C, v))
+    List{J}(offs, p)
+end
+List(v::AbstractVector{<:AbstractString}) = List{String}(UInt8, v)
 
 
 """
@@ -88,36 +98,21 @@ your data buffer. It is up to *you* to ensure that your pointers are correct and
 """
 struct NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
     length::Int32
-    validity::Ptr{UInt8}
-    offsets::Ptr{UInt8}
+    offsets::Primitive{Int32}
+    bitmask::Primitive{UInt8}
     values::P
 end
 export NullableList
 
-function NullableList{P,J}(ptr::Ptr, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
-                           vals::P) where {P,J}
-    NullableList{P,J}(len, ptr+bitmask_loc-1, ptr+offset_loc-1, vals)
+function NullableList{J}(len::Integer, offs::Primitive{Int32}, bmask::Primitive{UInt8},
+                         vals::P) where {J,P}
+    NullableList{P,J}(len, offs, bmask, vals)
 end
-function NullableList{P,J}(b::Buffer, bitmask_loc::Integer, offset_loc::Integer, len::Integer,
-                           vals::P) where {P,J}
-    bitmask_ptr = pointer(b.data, bitmask_loc)
-    offset_ptr = pointer(b.data, offset_loc)
-    NullableList{P,J}(len, bitmask_ptr, offset_ptr, vals)
+function NullableList{P,J}(offs::Primitive{Int32}, bmask::Primitive{UInt8}, vals::P) where {J,P}
+    NullableList{P,J}(length(offs)-1, offs, bmask, vals)
 end
-
-# TODO these are really inefficient but difficult to do right, rethink what needs to be here
-function NullableList(ptr::Union{Ptr,Buffer}, bitmask_loc::Integer, offset_loc::Integer,
-                      data_loc::Integer, ::Type{U}, x::AbstractVector{T}
-                     ) where {U,J,T<:Union{Union{J,Missing},J}}
-    bmask = bitpack(.!ismissing.(x))
-    conv_data = Union{Vector{U},Missing}[ismissing(ξ) ? missing : convert(Vector{U}, ξ) for ξ ∈ x]
-    offs = offsets(conv_data)
-    conv_data = filter(ξ -> !ismissing(ξ), conv_data)
-    p = Primitive(ptr, data_loc, vcat(conv_data...))
-    l = NullableList{typeof(p),J}(ptr, bitmask_loc, offset_loc, length(x), p)
-    unsafe_setnulls!(l, bmask)
-    unsafe_setoffsets!(l, offs)
-    l
+function NullableList{J}(offs::Primitive{Int32}, bmask::Primitive{UInt8}, vals::P) where {J,P}
+    NullableList{P,J}(offs, bmask, vals)
 end
 
 
@@ -140,8 +135,18 @@ function minbytes(::Type{C}, A::AbstractVector{T}
                  ) where {C,K<:AbstractString,T<:Union{Union{K,Missing},K}}
     valuesbytes(C, A) + minbitmaskbytes(A) + offsetsbytes(A)
 end
+function minbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector{J}) where {C,J}
+    valuesbytes(C, A) + minbitmaskbytes(Union{J,Missing}, A) + offsetsbytes(A)
+end
+function minbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector{Union{J,Missing}}) where {C,J}
+    valuesbytes(C, A) + minbitmaskbytes(Union{J,Missing}, A) + offsetsbytes(A)
+end
 minbytes(A::AbstractList) = valuesbytes(A) + minbitmaskbytes(A) + offsetsbytes(A)
 
+
+# helper function for offsets
+_offsize(::Type{C}, x) where C = sizeof(x)
+_offsize(::Type{C}, x::AbstractString) where C = sizeof(C)*length(x)
 
 # TODO how to deal with sizeof of Arrow objects such as lists?
 """
@@ -149,13 +154,17 @@ minbytes(A::AbstractList) = valuesbytes(A) + minbitmaskbytes(A) + offsetsbytes(A
 
 Construct a `Vector{Int32}` of offsets appropriate for data appearing in `v`.
 """
-function offsets(v::AbstractVector)
+function offsets(::Type{C}, v::AbstractVector) where C
     off = Vector{Int32}(length(v)+1)
     off[1] = 0
     for i ∈ 2:length(off)
-        off[i] = sizeof(v[i-1]) + off[i-1]
+        off[i] = _offsize(C, v[i-1]) + off[i-1]
     end
     off
+end
+offsets(v::AbstractVector{K}) where K = offsets(K, v)
+function offsets(v::AbstractVector{<:AbstractString})
+    throw(ArgumentError("must specify encoding type for computing string offsets"))
 end
 export offsets
 

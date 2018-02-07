@@ -2,21 +2,13 @@
 #================================================================================================
     functions common to both lists and primitives
 ================================================================================================#
-"""
-    datapointer(A::ArrowVector)
-
-Returns a pointer to the very start of the data buffer for `A` (i.e. does not depend on indices).
-"""
-datapointer(A::ArrowVector) = pointer(A.data)
-export datapointer
-
 
 """
     valuespointer(A::ArrowVector)
 
 Returns a pointer to the start of the values buffer for `A`.
 """
-valuespointer(A::ArrowVector{J}) where J = datapointer(A) + A.values_idx - 1
+valuespointer(A::ArrowVector) = valuespointer(A.values)
 export valuespointer
 
 
@@ -25,10 +17,16 @@ export valuespointer
 
 Returns a pointer to the start of the bitmask buffer for `A`.
 """
-function bitmaskpointer(A::ArrowVector{Union{J,Missing}}) where J
-    datapointer(A) + A.bitmask_idx - 1
-end
+bitmaskpointer(A::ArrowVector{Union{J,Missing}}) where J = valuespointer(A.bitmask)
 export bitmaskpointer
+
+
+"""
+    rawvalues(A::ArrowVector, idx)
+
+Gets a `Vector{UInt8}` of the raw values associated with the indices `idx`.
+"""
+rawvalues(A::ArrowVector, i) = rawvalues(A.values, i)
 
 
 # TODO this actually gets fucked up if bitmask has trailing ones (that's also why this is backwards)
@@ -40,8 +38,8 @@ Return the number of nulls (`missing`s) in `A`.
 nullcount(A::ArrowVector) = 0
 function nullcount(A::ArrowVector{Union{T,Missing}}) where T
     s = 0
-    for i ∈ 0:(minbitmaskbytes(A)-1)
-        @inbounds s += count_ones(A.data[A.bitmask_idx+i])
+    for i ∈ 1:minbitmaskbytes(A)
+        s += count_ones(A.bitmask[i])
     end
     length(A) - s
 end
@@ -79,17 +77,15 @@ Check whether element(s) `idx` of `A` are null.
 isnull(A::ArrowVector, i) = false
 function isnull(A::ArrowVector{Union{J,Missing}}, i::Integer) where J
     a, b = divrem(i, 8)
-    idx = A.bitmask_idx + a
-    @boundscheck checkbounds(A.data, idx)
-    @inbounds o = !getbit(A.data[idx], b)  # TODO delete extra line in 0.7
-    o
+    !getbit(A.bitmask[a+1], b)
 end
 isnull(A::ArrowVector, idx::AbstractVector{<:Integer}) = Bool[isnull(A, i) for i ∈ idx]
+isnull(A::ArrowVector, idx::AbstractVector{Bool}) = Bool[isnull(A, i) for i ∈ 1:length(A) if idx[i]]
 export isnull
 
 
 """
-    rawbitmask(p::ArrowVector{Union{J,Missing}}, padding::Function=identity)
+    unsafe_rawbitmask(p::ArrowVector{Union{J,Missing}}, padding::Function=identity)
 
 Retrieve the raw value of the null bit mask for `p`.
 
@@ -97,10 +93,9 @@ The function `padding` should take as its sole argument the number of bytes of t
 data and retrun the total number of bytes appropriate for the padding scheme.  Note that the argument
 taken is the *minimum* number of bytes of the bitmask (i.e. `ceil(length(p)/8)`).
 """
-function rawbitmask(p::ArrowVector{Union{J,Missing}}, padding::Function=identity) where J
-    rawpadded(bitmaskpointer(A), minbitmaskbytes(p), padding)
+function unsafe_rawbitmask(p::ArrowVector{Union{J,Missing}}, padding::Function=identity) where J
+    unsafe_rawpadded(bitmaskpointer(A), minbitmaskbytes(p), padding)
 end
-export rawbitmask
 
 
 """
@@ -163,6 +158,15 @@ function nullexcept_inrange(A::ArrowVector{Union{T,Missing}}, i::Integer, j::Int
     for k ∈ i:j
         isnull(A, i) && throw(NullException())
     end
+end
+
+
+function setnonmissing!(A::ArrowVector{J}, v::AbstractVector{T}) where {J,T<:Union{J,Union{J,Missing}}}
+    @boundscheck length(A) == length(v) || throw(ArgumentError("trying to set from wrong sized array"))
+    for i ∈ 1:length(A)
+        !ismissing(v[i]) && (A[i] = v[i])
+    end
+    A
 end
 
 

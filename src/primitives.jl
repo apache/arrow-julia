@@ -40,14 +40,32 @@ function Primitive(data::Vector{UInt8}, i::Integer, x::AbstractVector{J}) where 
     p[:] = x
     p
 end
+function Primitive{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{K}) where {J,K}
+    Primitive(data, i, convert(AbstractVector{J}, x))
+end
 
 # constructor for own buffer
 function Primitive(v::AbstractVector{J}) where J
     b = Vector{UInt8}(minbytes(v))
     Primitive(b, 1, v)
 end
+Primitive{J}(v::AbstractVector{K}) where {J,K} = Primitive(convert(AbstractVector{J}, v))
 
 
+"""
+    datapointer(A::Primitive)
+
+Returns a pointer to the very start of the data buffer for `A` (i.e. does not depend on indices).
+"""
+datapointer(A::Primitive) = pointer(A.data)
+export datapointer
+
+valuespointer(A::Primitive) = datapointer(A) + A.values_idx - 1
+
+
+#==================================================================================================
+    NullablePrimitive
+==================================================================================================#
 """
     NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
 
@@ -70,37 +88,74 @@ your data buffer. It is up to *you* to ensure that your pointers are correct and
 - `len` the length of the `NullablePrimitive`
 - `x` a vector that can be represented as an Arrow `NullablePrimitive`
 """
-# TODO finish this
 struct NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
+    length::Int32
     bitmask::Primitive{UInt8}
     values::Primitive{J}
 end
 export NullablePrimitive
 
-function NullablePrimitive{J}(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
-                              len::Integer) where J
-    bmask = Primitive{UInt8}(data, bitmask_idx, length(data))  # this length is a default
-    vals = Primitive{J}(data, values_idx, len)
+# Primitive constructors
+function NullablePrimitive{J}(bmask::Primitive{UInt8}, vals::Primitive{J}) where J
+    NullablePrimitive{J}(length(vals), bmask, vals)
+end
+function NullablePrimitive(bmask::Primitive{UInt8}, vals::Primitive{J}) where J
     NullablePrimitive{J}(bmask, vals)
 end
 
+# buffer with location constructors
+function NullablePrimitive{J}(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
+                              len::Integer) where J
+    bmask = Primitive{UInt8}(data, bitmask_idx, bytesforbits(len))
+    vals = Primitive{J}(data, values_idx, len)
+    NullablePrimitive{J}(bmask, vals)
+end
 function NullablePrimitive(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
                            x::AbstractVector{T}) where {J,T<:Union{Union{J,Missing},J}}
-    p = NullablePrimitive{J}(data, bitmask_idx, values_idx, length(x))
-    p[:] = x
-    p
+    bmask = Primitive{UInt8}(data, bitmask_idx, bitmask(x))
+    vals = Primitive{J}(data, values_idx, length(x))
+    setnonmissing!(vals, x)
+    NullablePrimitive{J}(bmask, vals)
+end
+function NullablePrimitive(data::Vector{UInt8}, i::Integer, v::AbstractVector{T};
+                           padding::Function=identity) where {J,T<:Union{J,Union{J,Missing}}}
+    NullablePrimitive(data, i, i+padding(minbitmaskbytes(v)), v)
+end
+function NullablePrimitive{J}(data::Vector{UInt8}, i::Integer, v::AbstractVector{T};
+                              padding::Function=identity) where {J,T}
+    NullablePrimitive(data, i, convert(AbstractVector{J}, v), padding=padding)
 end
 
-function NullablePrimitive(v::AbstractVector{Union{J,Missing}}) where J
+# contiguous new buffer constructors
+function NullablePrimitive(::Type{<:Array}, v::AbstractVector{Union{J,Missing}}) where J
     b = Vector{UInt8}(minbytes(v))
-    NullablePrimitive(b, 1, 1+minbitmaskbytes(v), v)
+    NullablePrimitive(b, 1, v)
+end
+function NullablePrimitive{J}(::Type{K}, v::AbstractVector{T}) where {J,K<:Array,T}
+    NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v))
+end
+function NullablePrimitive(::Type{K}, v::AbstractVector{J}) where {K<:Array,J}
+    NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v))
+end
+
+# new buffer constructors
+function NullablePrimitive(v::AbstractVector{Union{J,Missing}}) where J
+    bmask = Primitive(bitmask(v))
+    vals = Primitive(replace_missing_vals(v))  # using first ensures exists
+    NullablePrimitive(bmask, vals)
 end
 function NullablePrimitive(v::AbstractVector{J}) where J
     NullablePrimitive(convert(AbstractVector{Union{J,Missing}}, v))
 end
+function NullablePrimitive{J}(v::AbstractVector{K}) where {J,K}
+    NullablePrimitive(convert(AbstractVector{Union{J,Missing}}, v))
+end
+
 
 #================================================================================================
+
     common interface
+
 ================================================================================================#
 """
     valuesbytes(A::AbstractVector)
@@ -118,18 +173,25 @@ valuesbytes(A::AbstractVector{Union{J,Missing}}) where J = length(A)*sizeof(J)
 export valuesbytes
 
 """
-    minbitmaskbytes(A::AbstractVector{J})
+    minbitmaskbytes(A::AbstractVector)
+    minbitmaskbytes(::Type{Union{J,Missing}}, A::AbstractVector)
 
 Compute the minimum number of bytes needed to store a null bitmask for the data in `A`.  This is 0
 unless `J <: Union{K,Missing}`. Note that this does not take into account scheme-dependent padding.
 """
 minbitmaskbytes(A::AbstractVector) = 0
+minbitmaskbytes(::Type{Union{J,Missing}}, A::AbstractVector{J}) where J = bytesforbits(length(A))
+function minbitmaskbytes(::Type{Union{J,Missing}}, A::AbstractVector{Union{J,Missing}}) where J
+    bytesforbits(length(A))
+end
 minbitmaskbytes(A::AbstractVector{Union{J,Missing}}) where J = bytesforbits(length(A))
 export minbitmaskbytes
 
 """
     minbytes(A::AbstractVector)
-    minbytes(::Type{C}, A::AbstractVector{<:AbstractString})
+    minbytes(::Type{Union{J,Missing}}, A::AbstractVector)
+    minbytes(::Type{C}, A::AbstractVector)
+    minbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector)
 
 Computes the minimum number of bytes needed to store `A` as an Arrow formatted primitive array or list.
 
@@ -137,6 +199,12 @@ To obtain the minimum bytes to store string data, one must input `C` the charact
 string will be converted to (e.g. `UInt8`).
 """
 minbytes(A::AbstractVector) = minbitmaskbytes(A) + valuesbytes(A)
+function minbytes(::Type{Union{J,Missing}}, A::AbstractVector{J}) where J
+    minbitmaskbytes(Union{J,Missing}, A) + valuesbytes(A)
+end
+function minbytes(::Type{Union{J,Missing}}, A::AbstractVector{Union{J,Missing}}) where J
+    minbitmaskbytes(Union{J,Missing}, A) + valuesbytes(A)
+end
 export minbytes
 
 
@@ -162,51 +230,29 @@ function unsafe_getvalue(A::Primitive{J}, idx::AbstractVector{Bool}) where J
 end
 
 
-function _valueindex_start(A::AbstractPrimitive{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
-    A.values_idx + (i-1)*sizeof(J)
-end
-function _valueindex_stop(A::AbstractPrimitive{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
-    A.values_idx + i*sizeof(J) - 1
-end
+_rawvalueindex_start(A::Primitive{J}, i::Integer) where J = A.values_idx + (i-1)*sizeof(J)
+_rawvalueindex_stop(A::Primitive{J}, i::Integer) where J = A.values_idx + i*sizeof(J) - 1
 
-function valueindex_contiguous(A::AbstractPrimitive{T}, idx::AbstractVector{<:Integer}
-                              ) where {J,T<:Union{J,Union{J,Missing}}}
-    a = _valueindex_start(A, first(idx))
-    b = _valueindex_stop(A, last(idx))
+function rawvalueindex_contiguous(A::Primitive{J}, idx::AbstractVector{<:Integer}) where J
+    a = _rawvalueindex_start(A, first(idx))
+    b = _rawvalueindex_stop(A, last(idx))
     a:b
 end
 
 
-function valueindex(A::AbstractPrimitive{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
-    a = _valueindex_start(A, i)
-    b = _valueindex_stop(A, i)
+function rawvalueindex(A::Primitive{J}, i::Integer) where J
+    a = _rawvalueindex_start(A, i)
+    b = _rawvalueindex_stop(A, i)
     a:b
 end
-function valueindex(A::AbstractPrimitive{T}, idx::AbstractVector{<:Integer}
-                   ) where {J,T<:Union{J,Union{J,Missing}}}
-    vcat((valueindex(A, i) for i ∈ idx)...)  # TODO inefficient use of vcat
+function rawvalueindex(A::Primitive, idx::AbstractVector{<:Integer})
+    vcat((rawvalueindex(A, i) for i ∈ idx)...)  # TODO inefficient use of vcat
 end
-function valueindex(A::AbstractPrimitive{T}, idx::UnitRange{<:Integer}
-                   ) where {J,T<:Union{J,Union{J,Missing}}}
-    valueindex_contiguous(A, idx)
-end
+rawvalueindex(A::Primitive, idx::UnitRange{<:Integer}) = rawvalueindex_contiguous(A, idx)
+valueindex(A::Primitive, idx::AbstractVector{Bool}) = rawvalueindex(A, [i for i ∈ 1:length(A) if idx[i]])
 
 
-"""
-    rawvalues(A::ArrowVector, idx)
-
-Gets a `Vector{UInt8}` of the raw values associated with the indices `idx`.
-"""
-function rawvalues(A::AbstractPrimitive, i::Union{<:Integer,AbstractVector{<:Integer}})
-    rawidx = valueindex(A, i)
-    @inbounds o = A.data[rawidx]  # TODO get rid of extra line in 0.7, can be view
-    o
-end
-function rawvalues(A::AbstractPrimitive, idx::AbstractVector{Bool})
-    rawidx = valueindex(A, [i for i ∈ 1:length(A) if idx[i]])
-    @inbounds o = A.data[rawidx]  # TODO get rid of extra line in 0.7, can be view
-    o
-end
+rawvalues(A::Primitive, i::Union{<:Integer,AbstractVector{<:Integer}}) = A.data[rawvalueindex(A, i)]
 
 
 """
