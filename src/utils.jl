@@ -13,8 +13,16 @@ end
 
 
 encode(::Type{C}, v::AbstractVector{J}) where {C,J} = mapreduce(x -> convert(Vector{C}, x), vcat, v)
+function encode(::Type{C}, v::AbstractVector{Union{J,Missing}}) where {C,J}
+    mapreduce(vcat, v) do x
+        ismissing(x) ? Vector{C}(0) : convert(Vector{C}, x)
+    end
+end
 
 
+function replace_missing_vals(A::AbstractVector{Union{J,Missing}}) where J<:Number
+    J[ismissing(x) ? zero(J) : x for x ∈ A]
+end
 function replace_missing_vals(A::AbstractVector{Union{J,Missing}}) where J
     J[ismissing(x) ? first(A) : x for x ∈ A]  # using first ensures existence
 end

@@ -98,6 +98,21 @@ function unsafe_rawbitmask(p::ArrowVector{Union{J,Missing}}, padding::Function=i
 end
 
 
+function setnull!(A::ArrowVector{Union{J,Missing}}, x::Bool, i::Integer) where J
+    a, b = divrem(i, 8) .+ (1,0)
+    byte = setbit(getvalue(A.bitmask, a), !x, b)
+    setvalue!(A.bitmask, byte, a)
+end
+
+# TODO these are flipped relative to each other which is super confusing
+function setnulls!(A::ArrowVector{Union{J,Missing}}, bytes::Vector{UInt8}) where J
+    setvalue!(A.bitmask, bytes, 1:length(bytes))
+end
+function setnulls!(A::ArrowVector{Union{J,Missing}}, nulls::AbstractVector{Bool}) where J
+    setnulls!(A, bitpack(.!nulls))
+end
+
+
 """
     unsafe_setnull!(A::ArrowVector{Union{J,Missing}}, x::Bool, i::Integer)
 

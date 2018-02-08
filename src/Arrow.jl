@@ -33,10 +33,10 @@ include("vectorbuffer.jl")
 
 #=~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 TODO
-    -clean up bounds checking. right now it's all fucked up
+    -clean up bounds checking so it's not redundant! right now it's all fucked up
     -support nested lists (think should work but haven't tested)
     -be sure null checking isn't too slow as it is
-    -bounds checking stuff got to be to big a pain in the ass. ignoring for now, go back and do a pass!
+    -allow users to specify ordering of sub-buffers
 
     -ensure that convert(Array{Union{T,Missing}}, A) is efficient in 0.7
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~=#

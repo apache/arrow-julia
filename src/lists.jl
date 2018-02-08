@@ -31,42 +31,73 @@ your data buffer. It is up to *you* to ensure that your pointers are correct and
 - `U` the encoding type of the underlying data. for instance, for UTF8 strings use `UInt8`
 - `x` a vector that can be represented as an Arrow `List`
 """
-struct List{P<:AbstractPrimitive,J} <: AbstractList{J}
+struct List{J,P<:AbstractPrimitive} <: AbstractList{J}
     length::Int32
     offsets::Primitive{Int32}
     values::P
 end
 export List
 
+# Primitive constructors
 function List{J}(len::Integer, offs::Primitive{Int32}, vals::P) where {J,P<:AbstractPrimitive}
-    List{P,J}(len, offs, vals)
+    List{J,P}(len, offs, vals)
 end
 function List{J}(offs::Primitive{Int32}, vals::P) where {J,P<:AbstractPrimitive}
-    List{P,J}(length(offs)-1, offs, vals)
+    List{J,P}(length(offs)-1, offs, vals)
 end
 
-function List{P,J}(data::Vector{UInt8}, offset_idx::Integer, len::Integer, vals::P
-                  ) where {P<:AbstractPrimitive,J}
+# all index constructor
+function List{J}(data::Vector{UInt8}, offset_idx::Integer, values_idx::Integer, len::Integer, ::Type{C},
+                 values_len::Integer) where {J,C}
     offs = Primitive{Int32}(data, offset_idx, len+1)
-    List{P,J}(len, offs, vals)
+    vals = Primitive{C}(data, values_idx, values_len)
+    List{J}(offs, vals)
 end
+
+# buffer with location constructors, with values arg
 function List{J}(data::Vector{UInt8}, offset_idx::Integer, len::Integer, vals::P
                 ) where {P<:AbstractPrimitive,J}
-    List{P,J}(data, offs, len, vals)
+    offs = Primitive{Int32}(data, offset_idx, len+1)
+    List{J,P}(len, offs, vals)
 end
 
-function List(data::Vector{UInt8}, offset_idx::Integer, values_idx::Integer, ::Type{C},
-              x::AbstractVector{J}) where {C,J}
+# buffer with location constructors
+function List{J}(data::Vector{UInt8}, offset_idx::Integer, values_idx::Integer, ::Type{C},
+                 x::AbstractVector) where {C,J}
     offs = Primitive{Int32}(data, offset_idx, offsets(C, x))
-    p = Primitive(data, values_idx, encode(conv_data))
+    p = Primitive(data, values_idx, encode(C, x))
     List{J}(offs, p)
 end
+function List(data::Vector{UInt8}, offset_idx::Integer, values_idx::Integer, ::Type{C},
+              x::AbstractVector{J}) where {C,J}
+    List{J}(data, offset_idx, values_idx, C, x)
+end
+# this puts offsets first
+function List{J}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector;
+                 padding::Function=identity) where {C,J}
+    offs = Primitive{Int32}(data, i, offsets(C, x))
+    p = Primitive(data, i+padding(offsetsbytes(x)), encode(C, x))
+    List{J}(offs, p)
+end
+function List(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector{J};
+              padding::Function=identity) where {C,J}
+    List{J}(data, i, C, x, padding=padding)
+end
 
-function List(::Type{C}, v::AbstractVector{J}) where {J,C}
+function List{J}(::Type{<:Array}, ::Type{C}, x::AbstractVector; padding::Function=identity) where {C,J}
+    b = Vector{UInt8}(minbytes(C, x))
+    List{J}(b, 1, C, x, padding=padding)
+end
+function List(::Type{<:Array}, ::Type{C}, x::AbstractVector{J}; padding::Function=identity) where {C,J}
+    List{J}(Array, C, x, padding=padding)
+end
+
+function List{J}(::Type{C}, v::AbstractVector) where {J,C}
     offs = Primitive{Int32}(offsets(C, v))
     p = Primitive(encode(C, v))
     List{J}(offs, p)
 end
+List(::Type{C}, v::AbstractVector{J}) where {J,C} = List{J}(C, v)
 List(v::AbstractVector{<:AbstractString}) = List{String}(UInt8, v)
 
 
@@ -96,23 +127,94 @@ your data buffer. It is up to *you* to ensure that your pointers are correct and
 - `U` the data type of the underlying values, for example, for UTF8 strings use `UInt8`
 - `x` a vector that can be represented as an Arrow `NullableList`
 """
-struct NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
+struct NullableList{J,P<:AbstractPrimitive} <: AbstractList{Union{Missing,J}}
     length::Int32
-    offsets::Primitive{Int32}
     bitmask::Primitive{UInt8}
+    offsets::Primitive{Int32}
     values::P
 end
 export NullableList
 
-function NullableList{J}(len::Integer, offs::Primitive{Int32}, bmask::Primitive{UInt8},
+# Primitive constructors
+function NullableList{J}(len::Integer, bmask::Primitive{UInt8}, offs::Primitive{Int32},
                          vals::P) where {J,P}
-    NullableList{P,J}(len, offs, bmask, vals)
+    NullableList{J,P}(len, bmask, offs, vals)
 end
-function NullableList{P,J}(offs::Primitive{Int32}, bmask::Primitive{UInt8}, vals::P) where {J,P}
-    NullableList{P,J}(length(offs)-1, offs, bmask, vals)
+function NullableList{J}(bmask::Primitive{UInt8}, offs::Primitive{Int32}, vals::P) where {J,P}
+    NullableList{J,P}(length(offs)-1, bmask, offs, vals)
 end
-function NullableList{J}(offs::Primitive{Int32}, bmask::Primitive{UInt8}, vals::P) where {J,P}
-    NullableList{P,J}(offs, bmask, vals)
+
+# all index constructor
+function NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer,
+                         values_idx::Integer, len::Integer, ::Type{C}, values_len::Integer) where {J,C}
+    bmask = Primitive{UInt8}(data, bitmask_idx, bytesforbits(len))
+    offs = Primitive{Int32}(data, offset_idx, len+1)
+    vals = Primitive{C}(data, values_idx, values_len)
+    NullableList{J}(bmask, offs, vals)
+end
+
+# buffer with location constructors, with values arg
+function NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer,
+                         values_idx::Integer, len::Integer, vals::P) where {J,P<:AbstractPrimitive}
+    bmask = Primitive{UInt8}(data, bitmask_idx, bytesforbits(len))
+    offs = Primitive{Int32}(data, offset_idx, len+1)
+    NullableList{J,P}(bmask, offs, vals)
+end
+
+# buffer with location constructors
+function NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer,
+                         values_idx::Integer, ::Type{C}, x::AbstractVector) where {C,J}
+    bmask = Primitive{UInt8}(data, bitmask_idx, bitmask(x))
+    offs = Primitive{Int32}(data, offset_idx, offsets(x))
+    vals = Primitive(data, values_idx, encode(C, x))
+    NullableList{J}(bmask, offs, vals)
+end
+function NullableList(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer,
+                      values_idx::Integer, ::Type{C}, x::AbstractVector{J}) where {C,J}
+    NullableList{J}(data, bitmask_idx, offset_idx, values_idx, C, x)
+end
+# bitmask, offsets, values
+function NullableList{J}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector;
+                         padding::Function=identity) where {C,J}
+    bmask = Primitive{UInt8}(data, i, bitmask(x))
+    offs = Primitive{Int32}(data, i+padding(minbitmaskbytes(x)), offsets(C, x))
+    vals = Primitive(data, i+padding(minbitmaskbytes(x))+padding(offsetsbytes(x)), encode(C, x))
+    NullableList{J}(bmask, offs, vals)
+end
+function NullableList(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector{Union{J,Missing}};
+                      padding::Function=identity) where {C,J}
+    NullableList{J}(data, i, C, x, padding=padding)
+end
+function NullableList(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector{J};
+                      padding::Function=identity) where {C,J}
+    NullableList{J}(data, i, C, x, padding=padding)
+end
+
+function NullableList{J}(::Type{<:Array}, ::Type{C}, x::AbstractVector;
+                         padding::Function=identity) where {C,J}
+    b = Vector{UInt8}(minbytes(C, x))
+    NullableList{J}(b, 1, C, x, padding=padding)
+end
+function NullableList(::Type{<:Array}, ::Type{C}, x::AbstractVector{Union{J,Missing}};
+                      padding::Function=identity) where {C,J}
+    NullableList{J}(Array, C, x, padding=padding)
+end
+function NullableList(::Type{<:Array}, ::Type{C}, x::AbstractVector{J};
+                      padding::Function=identity) where {C,J}
+    NullableList{J}(Array, C, x, padding=padding)
+end
+
+function NullableList{J}(::Type{C}, v::AbstractVector) where {J,C}
+    bmask = Primitive{UInt8}(bitmask(v))
+    offs = Primitive{Int32}(offsets(C, v))
+    vals = Primitive(encode(C, v))
+    NullableList{J}(bmask, offs, vals)
+end
+function NullableList(::Type{C}, v::AbstractVector{T}) where {C,J,T<:Union{J,Union{J,Missing}}}
+    NullableList{J}(C, v)
+end
+function NullableList(v::AbstractVector{T}) where {K<:AbstractString,T<:Union{K,Union{K,Missing}}}
+    NullableList{String}(UInt8, v)
 end
 
 
@@ -149,6 +251,7 @@ _offsize(::Type{C}, x) where C = sizeof(x)
 _offsize(::Type{C}, x::AbstractString) where C = sizeof(C)*length(x)
 
 # TODO how to deal with sizeof of Arrow objects such as lists?
+# note that this works fine with missings because sizeof(missing) == 0
 """
     offsets(v::AbstractVector)
 

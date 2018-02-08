@@ -127,15 +127,18 @@ function NullablePrimitive{J}(data::Vector{UInt8}, i::Integer, v::AbstractVector
 end
 
 # contiguous new buffer constructors
-function NullablePrimitive(::Type{<:Array}, v::AbstractVector{Union{J,Missing}}) where J
+function NullablePrimitive(::Type{<:Array}, v::AbstractVector{Union{J,Missing}};
+                           padding::Function=identity) where J
     b = Vector{UInt8}(minbytes(v))
-    NullablePrimitive(b, 1, v)
+    NullablePrimitive(b, 1, v, padding=padding)
 end
-function NullablePrimitive{J}(::Type{K}, v::AbstractVector{T}) where {J,K<:Array,T}
-    NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v))
+function NullablePrimitive{J}(::Type{K}, v::AbstractVector{T};
+                              padding::Function=identity) where {J,K<:Array,T}
+    NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v), padding=padding)
 end
-function NullablePrimitive(::Type{K}, v::AbstractVector{J}) where {K<:Array,J}
-    NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v))
+function NullablePrimitive(::Type{K}, v::AbstractVector{J};
+                           padding::Function=identity) where {K<:Array,J}
+    NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v), padding=padding)
 end
 
 # new buffer constructors
@@ -249,7 +252,9 @@ function rawvalueindex(A::Primitive, idx::AbstractVector{<:Integer})
     vcat((rawvalueindex(A, i) for i ∈ idx)...)  # TODO inefficient use of vcat
 end
 rawvalueindex(A::Primitive, idx::UnitRange{<:Integer}) = rawvalueindex_contiguous(A, idx)
-valueindex(A::Primitive, idx::AbstractVector{Bool}) = rawvalueindex(A, [i for i ∈ 1:length(A) if idx[i]])
+function rawvalueindex(A::Primitive, idx::AbstractVector{Bool})
+    rawvalueindex(A, [i for i ∈ 1:length(A) if idx[i]])
+end
 
 
 rawvalues(A::Primitive, i::Union{<:Integer,AbstractVector{<:Integer}}) = A.data[rawvalueindex(A, i)]
@@ -282,6 +287,20 @@ function unsafe_rawvalues(p::AbstractPrimitive, padding::Function=identity)
     unsafe_rawpadded(valuespointer(p), valuesbytes(p), padding)
 end
 export unsafe_rawvalues
+
+
+function setvalue!(A::Primitive{J}, x::J, i::Integer) where J
+    A.data[rawvalueindex(A, i)] = reinterpret(UInt8, [x])
+end
+function setvalue!(A::Primitive{J}, x::Vector{J}, idx::AbstractVector{<:Integer}) where J
+    A.data[rawvalueindex(A, idx)] = reinterpret(UInt8, x)
+end
+function setvalue!(A::NullablePrimitive{J}, x::J, i::Integer) where J
+    setvalue!(A.values, x, i)
+end
+function setvalue!(A::NullablePrimitive{J}, x::Vector{J}, idx::AbstractVector{<:Integer}) where J
+    setvalue!(A.values, x, idx)
+end
 
 
 """
@@ -341,24 +360,24 @@ end
 
 function setindex!(A::Primitive{J}, x, i::Integer) where J
     @boundscheck checkbounds(A, i)
-    unsafe_setvalue!(A, convert(J, x), i)
+    setvalue!(A, convert(J, x), i)  # should this conversion really be here?
 end
 # TODO inefficient in some cases because of conversion to Vector{J}
 function setindex!(A::Primitive{J}, x::AbstractVector, idx::AbstractVector{<:Integer}) where J
     @boundscheck (checkbounds(A, idx); checkinputsize(x, idx))
-    unsafe_setvalue!(A, convert(Vector{J}, x), idx)
+    setvalue!(A, convert(Vector{J}, x), idx)
 end
 setindex!(A::Primitive, x::AbstractVector, ::Colon) = (A[1:end] = x)
 
 function setindex!(A::NullablePrimitive{J}, x, i::Integer) where J
     @boundscheck checkbounds(A, i)
-    o = unsafe_setvalue!(A, convert(J, x), i)
-    unsafe_setnull!(A, false, i)  # important that this is last in case above fails
+    o = setvalue!(A, convert(J, x), i)
+    setnull!(A, false, i)  # important that this is last in case above fails
     o
 end
 function setindex!(A::NullablePrimitive{J}, x::Missing, i::Integer) where J
     @boundscheck checkbounds(A, i)
-    unsafe_setnull!(A, true, i)
+    setnull!(A, true, i)
     missing
 end
 # TODO this is horribly inefficient but really hard to do right for non-consecutive
@@ -382,9 +401,9 @@ end
 # TODO this probably isn't really much more efficient, should test
 function setindex!(A::NullablePrimitive{J}, x::AbstractVector, ::Colon) where J
     @boundscheck checkinputsize(x, A)
-    unsafe_setnulls!(A, ismissing.(x))
+    setnulls!(A, ismissing.(x))
     for i ∈ 1:length(A)
-        !ismissing(x[i]) && unsafe_setvalue!(A, convert(J, x[i]), i)
+        !ismissing(x[i]) && setvalue!(A, convert(J, x[i]), i)
     end
     x
 end
