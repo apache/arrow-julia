@@ -29,13 +29,15 @@ include("vectorbuffer.jl")
 
 #=~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 TODO
+    -make primitives with args re-interpreted views (to what extent possible)
     -get views working properly (only available in 0.7!)
     -clean up bounds checking so it's not redundant! right now it's all fucked up
     -support nested lists (think should work but haven't tested)
-    -be sure null checking isn't too slow as it is
     -allow users to specify ordering of sub-buffers
 
+    -are there any ways to get views of strings???
     -ensure that convert(Array{Union{T,Missing}}, A) is efficient in 0.7
+    -investigate breaking due to new reinterpret in 0.7
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~=#
 
 

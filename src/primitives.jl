@@ -44,19 +44,19 @@ function Primitive{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{K}) whe
     Primitive(data, i, convert(AbstractVector{J}, x))
 end
 
-# constructor for own buffer
-function Primitive(v::AbstractVector{J}; padding::Function=identity) where J
-    b = Vector{UInt8}(padding(minbytes(v)))
-    Primitive(b, 1, v)
-end
-function Primitive{J}(v::AbstractVector{K}; padding::Function=identity) where {J,K}
-    Primitive(convert(AbstractVector{J}, v), padding=padding)
+# view of reinterpreted
+function Primitive(v::AbstractVector{J}) where J
+    b = reinterpret(UInt8, v)
+    Primitive(b, 1, length(v))
 end
 
-# this is just to maintain consistency with other constructors
-Primitive(::Type{<:Array}, v::AbstractVector; padding::Function=identity) = Primitive(v, padding=padding)
+# create own buffer
 function Primitive{J}(::Type{<:Array}, v::AbstractVector; padding::Function=identity) where J
-    Primitive{J}(v, padding=padding)
+    b = Vector{UInt8}(padding(minbytes(v)))
+    Primitive{J}(b, 1, v)
+end
+function Primitive(::Type{<:Array}, v::AbstractVector; padding::Function=identity)
+    Primitive(v, padding=padding)
 end
 
 
