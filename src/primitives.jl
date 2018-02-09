@@ -45,11 +45,19 @@ function Primitive{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{K}) whe
 end
 
 # constructor for own buffer
-function Primitive(v::AbstractVector{J}) where J
-    b = Vector{UInt8}(minbytes(v))
+function Primitive(v::AbstractVector{J}; padding::Function=identity) where J
+    b = Vector{UInt8}(padding(minbytes(v)))
     Primitive(b, 1, v)
 end
-Primitive{J}(v::AbstractVector{K}) where {J,K} = Primitive(convert(AbstractVector{J}, v))
+function Primitive{J}(v::AbstractVector{K}; padding::Function=identity) where {J,K}
+    Primitive(convert(AbstractVector{J}, v), padding=padding)
+end
+
+# this is just to maintain consistency with other constructors
+Primitive(::Type{<:Array}, v::AbstractVector; padding::Function=identity) = Primitive(v, padding=padding)
+function Primitive{J}(::Type{<:Array}, v::AbstractVector; padding::Function=identity) where J
+    Primitive{J}(v, padding=padding)
+end
 
 
 """
@@ -258,6 +266,8 @@ end
 
 
 rawvalues(A::Primitive, i::Union{<:Integer,AbstractVector{<:Integer}}) = A.data[rawvalueindex(A, i)]
+rawvalues(A::Primitive, ::Colon) = rawvalues(A, 1:length(A))
+rawvalues(A::Primitive) = rawvalues(A, :)
 
 
 """
@@ -355,6 +365,17 @@ end
 function unsafe_construct(::Type{T}, A::NullablePrimitive{J}, i::Integer, len::Integer) where {T,J}
     nullexcept_inrange(A, i, i+len-1)
     unsafe_construct(T, A, i, len)
+end
+
+
+"""
+    construct(::Type{T}, A::AbstractPrimitive{J}, i::Integer, len::Integer)
+
+Construct an object of type `T` from `len` values in `A` starting at index `i`.
+For this to work requires the existence of a constructor of the form `T(Vector{J})`.
+"""
+function construct(::Type{T}, A::AbstractPrimitive, i::Integer, len::Integer) where T
+    T(A[i:(i+len-1)])  # obviously this depends on the existence of this constructor
 end
 
 

@@ -27,6 +27,8 @@ export bitmaskpointer
 Gets a `Vector{UInt8}` of the raw values associated with the indices `idx`.
 """
 rawvalues(A::ArrowVector, i) = rawvalues(A.values, i)
+rawvalues(A::ArrowVector) = rawvalues(A.values)
+export rawvalues
 
 
 # TODO this actually gets fucked up if bitmask has trailing ones (that's also why this is backwards)
@@ -48,8 +50,9 @@ export nullcount
 checkbounds(A::ArrowVector, i::Integer) = (1 ≤ i ≤ length(A)) || throw(BoundsError(A, i))
 # this is probably crazy in the general case, but should work well for unit ranges
 function checkbounds(A::ArrowVector, idx::AbstractVector{<:Integer})
-    a, b = extrema(idx)
-    checkbounds(A, a) && checkbounds(A, b)
+    for i ∈ idx
+        checkbounds(A, i)
+    end
 end
 function checkbounds(A::ArrowVector, idx::AbstractVector{Bool})
     (length(A) ≠ length(idx)) && throw(ArgumentError("incorrect sized boolean indexer"))
@@ -210,6 +213,40 @@ convert(::Type{Array{T}}, A::ArrowVector{T}) where T = A[:]
 convert(::Type{Vector{T}}, A::ArrowVector{T}) where T = A[:]
 
 
+# macro for creating arrowformat functions
+macro _formats(constructor, argtype, w...)
+esc(quote
+    arrowformat(x::$argtype) where {$(w...)} = $constructor(x)
+    function arrowformat(::Type{<:Array}, x::$argtype; padding::Function=identity) where {$(w...)}
+        $constructor(Array, x, padding=padding)
+    end
+    function arrowformat(data::Vector{UInt8}, i::Integer, x::$argtype;
+                         padding::Function=identity) where {$(w...)}
+        $constructor(data, i, x, padding=padding)
+    end
+end)
+end
+
+"""
+    arrowformat(v::AbstractVector)
+    arrowformat(Array, v::AbstractVector)
+
+Convert a vector to the appropriate arrowformat.  If `Array` is passed, a contiguous array will
+be used for the data buffer.
+"""
+function arrowformat end
+@_formats Primitive AbstractVector{J} J
+@_formats NullablePrimitive AbstractVector{Union{J,Missing}} J
+@_formats List AbstractVector{J} J<:AbstractString
+@_formats NullableList AbstractVector{Union{J,Missing}} J<:AbstractString
+@_formats Primitive{Datestamp} AbstractVector{T} T<:Date
+@_formats Primitive{Timestamp} AbstractVector{T} T<:DateTime
+@_formats NullablePrimitive{Datestamp} AbstractVector{Union{T,Missing}} T<:Date
+@_formats NullablePrimitive{Timestamp} AbstractVector{Union{T,Missing}} T<:DateTime
+@_formats DictEncoding CategoricalArray{T,1,U} T<:Any U
+export arrowformat
+
+
 # TODO in 0.6, views have to use unsafe methods
 function unsafe_view(l::ArrowVector{J}, i::Union{Integer,AbstractVector{<:Integer}}) where J
     @boundscheck checkbounds(l, i)
@@ -217,15 +254,15 @@ function unsafe_view(l::ArrowVector{J}, i::Union{Integer,AbstractVector{<:Intege
 end
 
 function getindex(l::ArrowVector{J}, i::Integer) where J
-    @boundscheck checkbounds(l, i)
+    # @boundscheck checkbounds(l, i)
     getvalue(l, i)
 end
 function getindex(l::ArrowVector{Union{J,Missing}}, i::Integer)::Union{J,Missing} where J
-    @boundscheck checkbounds(l, i)
+    # @boundscheck checkbounds(l, i)
     isnull(l, i) ? missing : getvalue(l, i)
 end
 function getindex(l::ArrowVector{Union{J,Missing}}, idx::AbstractVector{<:Integer}) where J
-    @boundscheck checkbounds(l, idx)
+    # @boundscheck checkbounds(l, idx)
     v = convert(Vector{Union{J,Missing}}, getvalue(l, idx))
     fillmissings!(v, l, idx)
     v

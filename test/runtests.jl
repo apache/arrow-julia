@@ -13,7 +13,7 @@ srand(SEED)
         dtype = rand(PRIMITIVE_ELTYPES)
         len = rand(32:256)
         v = rand(dtype, len)
-        b = Arrow.Buffer(reinterpret(UInt8, v))
+        b = convert(Vector{UInt8}, reinterpret(UInt8, v))
         A = Primitive{dtype}(b, 1, len)
         for j ∈ 1:8
             k = rand(1:len)
@@ -32,7 +32,7 @@ end
         mask = bitpack(pres)
         vraw = rand(dtype, len)
         data = vcat(mask, reinterpret(UInt8, vraw))
-        b = Arrow.Buffer(data)
+        b = convert(Vector{UInt8}, data)
         A = NullablePrimitive{dtype}(b, 1, length(mask)+1, len)
         for j ∈ 1:8
             k = rand(1:len)

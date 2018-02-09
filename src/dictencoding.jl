@@ -34,10 +34,14 @@ function DictEncoding(refs::Primitive{Int32}, pool::P) where {J,P<:ArrowVector{J
     DictEncoding{J}(refs, pool)
 end
 
-function DictEncoding(data::Vector{UInt8}, refs_idx::Integer, len::Integer, pool::P
-                     ) where {J,P<:ArrowVector{J}}
+function DictEncoding{J}(data::Vector{UInt8}, refs_idx::Integer, len::Integer, pool::P
+                        ) where {J,P<:ArrowVector{J}}
     refs = Primitive{Int32}(data, refs_idx, len)
     DictEncoding{J}(refs, pool)
+end
+function DictEncoding(data::Vector{UInt8}, refs_idx::Integer, len::Integer, pool::P
+                     ) where {J,P<:ArrowVector{J}}
+    DictEncoding{J}(data, refs_idx, len, pool)
 end
 
 # TODO this primitive constructor for pool should be more general

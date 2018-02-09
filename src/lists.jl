@@ -46,12 +46,15 @@ function List{J}(offs::Primitive{Int32}, vals::P) where {J,P<:AbstractPrimitive}
     List{J,P}(length(offs)-1, offs, vals)
 end
 
+function List{J}(data::Vector{UInt8}, offset_idx::Integer, len::Integer, vals::P) where {J,P}
+    List{J,P}(offs, vals)
+end
+
 # all index constructor
 function List{J}(data::Vector{UInt8}, offset_idx::Integer, values_idx::Integer, len::Integer, ::Type{C},
                  values_len::Integer) where {J,C}
-    offs = Primitive{Int32}(data, offset_idx, len+1)
     vals = Primitive{C}(data, values_idx, values_len)
-    List{J}(offs, vals)
+    List{J}(data, offset_idx, len, vals)
 end
 
 # buffer with location constructors, with values arg
@@ -84,12 +87,29 @@ function List(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector{J};
     List{J}(data, i, C, x, padding=padding)
 end
 
+function List{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{<:AbstractString};
+                 padding::Function=identity) where J
+    List{J}(data, i, UInt8, x, padding=padding)
+end
+function List(data::Vector{UInt8}, i::Integer, x::AbstractVector{<:AbstractString};
+              padding::Function=identity)
+    List(data, i, UInt8, x, padding=padding)
+end
+
 function List{J}(::Type{<:Array}, ::Type{C}, x::AbstractVector; padding::Function=identity) where {C,J}
     b = Vector{UInt8}(minbytes(C, x))
     List{J}(b, 1, C, x, padding=padding)
 end
 function List(::Type{<:Array}, ::Type{C}, x::AbstractVector{J}; padding::Function=identity) where {C,J}
     List{J}(Array, C, x, padding=padding)
+end
+
+function List{J}(::Type{<:Array}, x::AbstractVector{<:AbstractString}; padding::Function=identity
+                ) where J
+    List{J}(Array, UInt8, x, padding=padding)
+end
+function List(::Type{<:Array}, x::AbstractVector{<:AbstractString}; padding::Function=identity)
+    List(Array, UInt8, x, padding=padding)
 end
 
 function List{J}(::Type{C}, v::AbstractVector) where {J,C}
@@ -144,13 +164,18 @@ function NullableList{J}(bmask::Primitive{UInt8}, offs::Primitive{Int32}, vals::
     NullableList{J,P}(length(offs)-1, bmask, offs, vals)
 end
 
+function NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer,
+                         len::Integer, vals::P) where {J,P}
+    bmask = Primitive{UInt8}(data, bitmask_idx, bytesforbits(len))
+    offs = Primitive{Int32}(data, offset_idx, len+1)
+    NullableList{J}(bmask, offs, vals)
+end
+
 # all index constructor
 function NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer,
                          values_idx::Integer, len::Integer, ::Type{C}, values_len::Integer) where {J,C}
-    bmask = Primitive{UInt8}(data, bitmask_idx, bytesforbits(len))
-    offs = Primitive{Int32}(data, offset_idx, len+1)
     vals = Primitive{C}(data, values_idx, values_len)
-    NullableList{J}(bmask, offs, vals)
+    NullableList{J}(data, bitmask_idx, offset_idx, len, vals)
 end
 
 # buffer with location constructors, with values arg
@@ -190,6 +215,17 @@ function NullableList(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVec
     NullableList{J}(data, i, C, x, padding=padding)
 end
 
+function NullableList{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{T};
+                         padding::Function=identity
+                        ) where {J,K<:AbstractString,T<:Union{K,Union{K,Missing}}}
+    NullableList{J}(data, i, UInt8, x, padding=padding)
+end
+function NullableList(data::Vector{UInt8}, i::Integer, x::AbstractVector{T};
+                      padding::Function=identity
+                     ) where {K<:AbstractString,T<:Union{K,Union{K,Missing}}}
+    NullableList(data, i, UInt8, x, padding=padding)
+end
+
 function NullableList{J}(::Type{<:Array}, ::Type{C}, x::AbstractVector;
                          padding::Function=identity) where {C,J}
     b = Vector{UInt8}(minbytes(C, x))
@@ -202,6 +238,15 @@ end
 function NullableList(::Type{<:Array}, ::Type{C}, x::AbstractVector{J};
                       padding::Function=identity) where {C,J}
     NullableList{J}(Array, C, x, padding=padding)
+end
+
+function NullableList{J}(::Type{<:Array}, x::AbstractVector{T}; padding::Function=identity
+                        ) where {J,K<:AbstractString,T<:Union{K,Union{K,Missing}}}
+    NullableList{J}(Array, UInt8, x, padding=padding)
+end
+function NullableList(::Type{<:Array}, x::AbstractVector{T}; padding::Function=identity
+                     ) where {K<:AbstractString,T<:Union{K,Union{K,Missing}}}
+    NullableList(Array, UInt8, x, padding=padding)
 end
 
 function NullableList{J}(::Type{C}, v::AbstractVector) where {J,C}
@@ -292,28 +337,26 @@ unsafe_getoffset(l::AbstractList, i::Integer) = unsafe_load(convert(Ptr{Int32}, 
 
 
 """
-    rawoffsets(p::AbstractList, padding::Function=identity)
+    unsafe_rawoffsets(p::AbstractList, padding::Function=identity)
 
 Retreive the raw offstets for `p` as a `Vector{UInt8}`.
 
 The function `padding` should take as its sole argument the number of bytes of the raw values
 and return teh total number of bytes appropriate for the padding scheme.
 """
-rawoffsets(p::AbstractList, padding::Function=identity) = rawpadded(p.offsets, offsetsbytes(p), padding)
+function unsafe_rawoffsets(p::AbstractList, padding::Function=identity)
+    unsafe_rawpadded(p.offsets, offsetsbytes(p), padding)
+end
 export rawoffsets
 
 
 """
     getoffset(l::AbstractList, i::Integer)
 
-Retrieve offset `i` for list `l`.  Includes bounds checking.
-
-**WARNING** Bounds checking is not useful if pointers are misaligned!
+Retrieve offset `i` for list `l`.  Note that this retrieves the Arrow formated 0-based indexed raw
+numbers!
 """
-function getoffset(l::AbstractList, i::Integer)
-    @boundscheck check_offset_bounds(l, i)
-    unsafe_getoffset(l, i)
-end
+getoffset(l::AbstractList, i) = l.offsets[i]
 export getoffset
 
 
@@ -327,6 +370,9 @@ function unsafe_setoffset!(l::AbstractList, off::Int32, i::Integer)
 end
 
 
+setoffset!(l::AbstractList, off::Int32, i::Integer) = setindex!(l.offsets, off, i)
+
+
 """
     unsafe_setoffsets!(l::AbstractList, off::Vector{Int32})
 
@@ -338,6 +384,9 @@ function unsafe_setoffsets!(l::AbstractList, off::Vector{Int32})
 end
 
 
+setoffsets!(l::AbstractList, off::AbstractVector{Int32}) = (l.offsets[:] = off)
+
+
 """
     unsafe_ellength(l::AbstractList, i::Integer)
 
@@ -345,10 +394,24 @@ Get the length of element `i`. Involves calls to `unsafe_load`.
 """
 unsafe_ellength(l::AbstractList, i::Integer) = unsafe_getoffset(l, i+1) - unsafe_getoffset(l, i)
 
+
+"""
+    ellength(l::AbstractList, i::Integer)
+
+Get the length of element `i`.
+"""
+ellength(l::AbstractList, i::Integer) = getoffset(l, i+1) - getoffset(l, i)
+
+
 # returns offset, length
 function unsafe_elparams(l::AbstractList, i::Integer)
     off = unsafe_getoffset(l, i)
     off, unsafe_getoffset(l, i+1) - off
+end
+
+function elparams(l::AbstractList, i::Integer)
+    off = getoffset(l, i)
+    off, getoffset(l, i+1) - off
 end
 
 
@@ -364,4 +427,23 @@ function unsafe_getvalue(l::List{P,K}, idx::AbstractVector{Bool}) where {P,K}
     String[unsafe_getvalue(l, i) for i ∈ 1:length(l) if idx[i]]
 end
 
+
+function getvalue(l::AbstractList{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
+    off, len = elparams(l, i)
+    construct(J, l.values, off+1, len)
+end
+# NOTE! we break our "unsafe" rules here because WeakRefString is inherently unsafe
+function getvalue(l::AbstractList{T}, i::Integer) where {J<:WeakRefString,T<:Union{J,Union{J,Missing}}}
+    off, len = elparams(l, i)
+    unsafe_construct(J, l.values, off+1, len)
+end
+
+function getvalue(l::AbstractList{T}, idx::AbstractVector{<:Integer}
+                 ) where {J,T<:Union{J,Union{J,Missing}}}
+    J[getvalue(l, i) for i ∈ idx]
+end
+function getvalue(l::AbstractList{T}, idx::AbstractVector{Bool}
+                 ) where {J,T<:Union{J,Union{J,Missing}}}
+    J[getvalue(l, i) for i ∈ 1:length(l) if idx[i]]
+end
 

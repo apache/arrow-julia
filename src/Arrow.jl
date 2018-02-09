@@ -14,12 +14,8 @@ import Base: length, endof, size, eltype, start, next, done, getindex, isassigne
 import Base.isnull # this will be removed in 0.7
 
 
-# TODO: in getting rid of pointers we've lost ability to refer to multiple distinct data buffers
-#       how to deal with this???
-struct Buffer end  # TODO delete
-
-
 abstract type ArrowVector{T} <: AbstractVector{T} end
+export ArrowVector
 
 
 include("utils.jl")
@@ -33,6 +29,7 @@ include("vectorbuffer.jl")
 
 #=~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 TODO
+    -get views working properly (only available in 0.7!)
     -clean up bounds checking so it's not redundant! right now it's all fucked up
     -support nested lists (think should work but haven't tested)
     -be sure null checking isn't too slow as it is
