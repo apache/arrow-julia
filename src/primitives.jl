@@ -8,21 +8,24 @@ export AbstractPrimitive
 """
     Primitive{J} <: AbstractPrimitive{J}
 
-An arrow primitive array containing no null values.  This is essentially just a wrapped pointer
-to the data.  The index `i` should give the start of the array relative to `ptr` using 1-based indexing.
-
-**WARNING** Because the Arrow format is very general, Arrow.jl cannot provide much help in organizing
-your data buffer. It is up to *you* to ensure that your pointers are correct and don't overlap!
+A set of values which are stored contiguously in memory.  All other `ArrowVector` objects are built
+from `Primitive`s.
 
 ## Constructors
+    Primitive{J}(data::Vector{UInt8}, i::Integer, len::Integer)
+    Primitive(data::Vector{UInt8}, i::Integer, x::AbstractVector)
+    Primitive(v::AbstractVector)
+    Primitive(Array, x::Abstractvector; padding=identity)
 
-    Primitive{J}(ptr, i::Integer, len::Integer)
-    Primitive{J}(ptr, i::Integer, x::AbstractVector{J})
+If `Array` is provided as the virst argument, the data will be allocated contiguously in a new buffer.
 
 ### Arguments
-- `ptr` an array pointer or Arrow `Buffer` object
-- `i` the location the data should be stored using 1-based indexing
-- `x` a vector that can be represented as an Arrow `Primitive`
+- `data`: a data buffer which the `Primitive` will refer to for accessing and storing values
+- `i`: the index of the location (1-based) in `data` where the beginning of the value data is stored
+- `x`: a vector which will be written into `data[i]` on construction
+` `v`: existing reference data. constructors with will reference the original `v` as `data`
+- `padding`: when allocating the values in a new array, extra space will be added to the end of the
+    array such that if `n` bytes are required, instead `padding(n)` bytes will be provided
 """
 struct Primitive{J} <: AbstractPrimitive{J}
     length::Int32
@@ -47,7 +50,10 @@ end
 # view of reinterpreted
 function Primitive(v::AbstractVector{J}) where J
     b = reinterpret(UInt8, v)
-    Primitive(b, 1, length(v))
+    Primitive{J}(b, 1, length(v))
+end
+function Primitive{J}(v::AbstractVector{T}) where {J,T}
+    Primitive(convert(AbstractVector{J}, v))
 end
 
 # create own buffer
@@ -77,24 +83,26 @@ valuespointer(A::Primitive) = datapointer(A) + A.values_idx - 1
 """
     NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
 
-An arrow primitive array possibly containing null values.  This is essentially a pair of wrapped
-pointers: one to the data and one to the bitmask specifying whether each value is null.
-The bitmask and data locations should be given relative to `ptr` using 1-based indexing.
-
-**WARNING** Because the Arrow format is very general, Arrow.jl cannot provide much help in organizing
-your data buffer. It is up to *you* to ensure that your pointers are correct and don't overlap!
+A set of values stored contiguously in data with a bit mask specifying which values should be considered
+null.  The bit mask and data needn't necessarily coexist within the same array.
 
 ## Constructors
+    NullablePrimitive(bmask::Primitive{UInt8}, vals::Primitive{J})
+    NullablePrimitive(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer, x::AbstractVector)
+    NullablePrimitive(data::Vector{UInt8}, i::Integer, x::AbstractVector)
+    NullablePrimitive(v::AbstractVector)
+    NullablePrimitive(Array, x::AbstractVector; padding=identity)
 
-    NullablePrimitive{J}(ptr, bitmask_loc::Integer, data_loc::Integer, len::Integer)
-    NullablePrimitive{J}(ptr, bitmask_loc::Integer, data_loc::Integer, x::AbstractVector)
+If `Array` is passed to a constructor, the bit mask and values for the `NullablePrimitive` will be
+contiguously allocated within a single array (bit mask first, then values).
 
 ### Arguments
-- `ptr` an array pointer or Arrow `Buffer` object
-- `bitmask_loc` the location of the null bit mask using 1-based indexing
-- `data_loc` the location of the data using 1-based indexing
-- `len` the length of the `NullablePrimitive`
-- `x` a vector that can be represented as an Arrow `NullablePrimitive`
+- `bmask`: a `Primitive{UInt8}` containing the null bitmask for the `NullablePrimitive`
+- `vals`: a `Primitive` containing the underlying data values for the `NullablePrimitive`
+- `data`: a buffer in which the data for the `NullablePrimitive` will be stored
+- `bitmask_idx`: the location within `data` where the null bit mask will be stored
+- `values_idx`: the location within `data` where the values will be stored
+- `x`, `v`: values to be stored in data
 """
 struct NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
     length::Int32
@@ -149,6 +157,7 @@ function NullablePrimitive(::Type{K}, v::AbstractVector{J};
     NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v), padding=padding)
 end
 
+# TODO change to reinterpreted views in 0.7 if possible
 # new buffer constructors
 function NullablePrimitive(v::AbstractVector{Union{J,Missing}}) where J
     bmask = Primitive(bitmask(v))
@@ -265,6 +274,12 @@ function rawvalueindex(A::Primitive, idx::AbstractVector{Bool})
 end
 
 
+"""
+    rawvalues(A::Primitive, i)
+    rawvalues(A::Primitive)
+
+Gets the raw values for elements at locations `i` in the form of a `Vector{UInt8}`.
+"""
 rawvalues(A::Primitive, i::Union{<:Integer,AbstractVector{<:Integer}}) = A.data[rawvalueindex(A, i)]
 rawvalues(A::Primitive, ::Colon) = rawvalues(A, 1:length(A))
 rawvalues(A::Primitive) = rawvalues(A, :)
@@ -284,9 +299,8 @@ function getvalue(A::AbstractPrimitive{T}, i::AbstractVector{<:Integer}
 end
 
 
-# TODO this should probably be renamed
 """
-    rawvalues(p::ArrowVector, padding::Function=identity)
+    unsafe_rawvalues(p::ArrowVector, padding::Function=identity)
 
 Retreive raw value data for `p` as a `Vector{UInt8}`.
 
@@ -372,7 +386,7 @@ end
     construct(::Type{T}, A::AbstractPrimitive{J}, i::Integer, len::Integer)
 
 Construct an object of type `T` from `len` values in `A` starting at index `i`.
-For this to work requires the existence of a constructor of the form `T(Vector{J})`.
+For this to work requires the existence of a constructor of the form `T(::Vector{J})`.
 """
 function construct(::Type{T}, A::AbstractPrimitive, i::Integer, len::Integer) where T
     T(A[i:(i+len-1)])  # obviously this depends on the existence of this constructor

@@ -9,7 +9,7 @@ import Base: getindex, setindex!
 const BITMASK = UInt8[1, 2, 4, 8, 16, 32, 64, 128]
 
 
-import Base: convert, show, unsafe_string, checkbounds
+import Base: convert, show, unsafe_string, checkbounds, write, values
 import Base: length, endof, size, eltype, start, next, done, getindex, isassigned, view
 import Base.isnull # this will be removed in 0.7
 
@@ -24,7 +24,6 @@ include("lists.jl")
 include("arrowvectors.jl")
 include("datetime.jl")
 include("dictencoding.jl")
-include("vectorbuffer.jl")
 
 
 #=~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

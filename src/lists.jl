@@ -8,28 +8,38 @@ export AbstractList
 """
     List{P<:AbstractPrimitive,J} <: AbstractList{J}
 
-An Arrow list of variable length objects such as strings, none of which are
-null.  `vals` is the primitive array in which the underlying data is stored.
-The `List` itself contains a pointer to the offsets, a buffer containing 32-bit
-integers describing the offsets of each value.  The location should be given
-relative to `ptr` using 1-based indexing.
-
-**WARNING** Because the Arrow format is very general, Arrow.jl cannot provide much help in organizing
-your data buffer. It is up to *you* to ensure that your pointers are correct and don't overlap!
+An Arrow formatted array of variable length objects such as strings. The `List` contains "value" data
+as well as "offsets" which describe from which elements of the values data an element of `List`
+should be constructed.  The offsets are necessarily a `Primitive{Int32}` while the values can
+be any `ArrowVector` type (but in most circumstances should be `Primitive`).
 
 ## Constructors
+    List{J}(len::Integer, offs::Primitive{Int32}, vals::AbstractPrimitive)
+    List{J}(offs::Primitive{Int32}, vals::AbstractPrimitive)
+    List{J}(data::Vector{UInt8}, offset_idx::Integer, len::Integer, vals::AbstractPrimitive)
+    List{J}(data::Vector{UInt8}, offset_idx::Integer, values_idx::Integer, ::Type{C}, x::AbstractVector)
+    List{J}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector; padding=identity)
+    List(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector; padding=identity)
+    List{J}(Array, ::Type{C}, x::AbstractVector; padding=identity)
+    List(Array, ::Type{C}, x::AbstractVector; padding=identity)
+    List(::Type{C}, v::AbstractVector)
+    List(v::AbstractVector{<:AbstractString})
 
-    List{P,J}(ptr, offset_loc::Integer, len::Integer, vals::P)
-    List{P,J}(ptr, offset_loc::Integer, data_loc::Integer, ::Type{U}, x::AbstractVector{J})
+Note that by default, `List`s of strings will be encoded in UTF-8.
 
 ### Arguments
-- `ptr` an array pointer or Arrow `Buffer` object
-- `offset_loc` the location of the offsets using 1-based indexing
-- `data_loc` the location of the underlying values data using 1-based indexing
-- `len` the number of elements in the list
-- `vals` an `ArrowVector` containing the underlying data values
-- `U` the encoding type of the underlying data. for instance, for UTF8 strings use `UInt8`
-- `x` a vector that can be represented as an Arrow `List`
+- `len`: the length of the `List`
+- `offs`: a `Primitive{Int32}` containing the offsets data
+- `vals`: a `Primitive` containing the values data
+- `data`: the data buffer in which the underlying data is stored
+- `offset_idx`: location within `data` where the offset data is stored
+- `values_idx`: location within `data` where the values data is stored
+- `C`: the encoding type (type of values), e.g. for UTF-8 strings this is `UInt8`. defaults to `UInt8`
+    if not given explicitly
+- `i`: the location in `data` where all data should be stored (offsets, then values)
+- `x`, `v`: array to be stored or converted
+- `padding`: for each sub-buffer (i.e. offsets, values) if `n` bytes are required instead `padding(n)`
+    bytes will be allocated.
 """
 struct List{J,P<:AbstractPrimitive} <: AbstractList{J}
     length::Int32
@@ -124,28 +134,42 @@ List(v::AbstractVector{<:AbstractString}) = List{String}(UInt8, v)
 """
     NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
 
-An arrow list of variable length objects such as strings, some of which may be null.  `vals`
-is the primitive array in which the underlying data is stored.  The `NullableList` itself contains
-pointers to the offsets and null bit mask which the locations of which should be specified relative
-to `ptr` using 1-based indexing.
-
-**WARNING** Because the Arrow format is very general, Arrow.jl cannot provide much help in organizing
-your data buffer. It is up to *you* to ensure that your pointers are correct and don't overlap!
+An Arrow formatted array of variable length objects such as strings which may be null. The `NullableList`
+contains a bit mask specifying which values are null and "offsets" which describe from which elements of
+the values data an element of the `NullableList` should be constructed.  The bitmask is contained in a
+`Primitive{UInt8}` while the offsets data in a `Primitive{Int32}`. The values can be contained in any
+`ArrowVector` type, but in most cases should be `Primitive`.
 
 ## Constructors
+    NullableList{J}(len::Integer, bmask::Primitive, offs::Primitive, vals::AbstractPrimitive)
+    NullableList{J}(bmask::Primitive, offs::Primitive, vals::AbstractPrimitive)
+    NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer, len::Integer,
+                    vals::AbstractPrimitive)
+    NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer, values_idx::Integer,
+                    len::Integer, ::Type{C}, values_len::Integer)
+    NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer, values_idx::Integer,
+                    ::Type{C}, x::AbstractVector)
+    NullableList(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector; padding=identity)
+    NullableList(Array, ::Type{C}, x::AbstractVector; padding=identity)
+    NullableList(Array, x::AbstracVector; padding=identity)
+    NullableList(::Type{C}, v::AbstractVector)
+    NullableList(v::AbstractVector)
 
-    NullableList{P,J}(ptr, bitmask_loc::Integer, offset_loc::Integer, len::Integer, vals::P)
-    NullableList{P,J}(ptr, bitmask_loc::Integer, offset_loc::Integer, data_loc::Integer,
-                      ::Type{U}, x::AbstractVector)
+If `Array` is given as an argument, a contiguous array will be allocated to store the data.
 
 ### Arguments
-- `ptr` an array pointer or Arrow `Buffer` object
-- `bitmask_loc` the location of the null bit mask using 1-based indexing
-- `offset_loc` the location of the offsets using 1-based indexing
-- `len` the length of the list
-- `vals` an `ArrowVector` containing the underlying values data
-- `U` the data type of the underlying values, for example, for UTF8 strings use `UInt8`
-- `x` a vector that can be represented as an Arrow `NullableList`
+- `len`: the length of the `NullableList`
+- `bmask`: the `Primitive` providing the bit mask
+- `offs`: the `Primitive` providing the offsets
+- `vals`: the `AbstractPrimitive` providing the values
+- `data`: a buffer for storing the data
+- `bitmask_idx`: the location in `data` of the bit mask
+- `offsets_idx`: the location in `data` of the offsets
+- `values_idx`: the location in `data` of the values
+- `values_len`: the total length of the values data (i.e. number of elements in the values array)
+- `C`: the data type of the values data. defaults to `UInt8` when not provided
+- `x`, `v`: array to be stored by the `NullableList`
+- `padding`: if `n` bytes are required for a sub-buffer, `padding(n)` bytes will be allocated instead
 """
 struct NullableList{J,P<:AbstractPrimitive} <: AbstractList{Union{Missing,J}}
     length::Int32

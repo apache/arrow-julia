@@ -7,19 +7,24 @@ of unique values with a primitive array of `Int32` specifying the values.  The s
 Julia `CategoricalArray`s.
 
 ## Constructors
-
-    DictEncoding{P,J}(ptr, ref_loc::Integer, len::Integer, pool::P)
-    DictEncoding(ptr, ref_loc::Integer, pool_loc::Integer, x::CategoricalArray)
-    DictEncoding(ptr, ref_loc::Integer, pool_loc::Integer, pool_bitmask_loc::Integer,
+    DictEncoding(refs::Primitive{Int32}, pool::ArrowVector)
+    DictEncoding(data::Vector{UInt8}, refs_idx::Integer, len::Integer, pool::ArrowVector)
+    DictEncoding(data::Vector{UInt8}, refs_idx::Integer, pool_idx::Integer, x::CategoricalArray)
+    DictEncoding(data::Vector{UInt8}, refs_idx::Integer, pool_bmask_idx::Integer, pool_vals_idx::Integer,
                  x::CategoricalArray)
+    DictEncoding(data::Vector{UInt8}, i::Integer, x::CategoricalArray)
+    DictEncoding(Array, x::CategoricalArray; padding=identity)
+    DictEncoding(x::CategoricalArray)
+
+If `Array` is passed a contiguous array will be allocated.
 
 ### Arguments
-- `ptr` an array pointer or Arrow `Buffer` object
-- `ref_loc` the location of the reference values using 1-based indexing
-- `pool` an `ArrowVector` containing the underlying data to which the references refer
-- `pool_loc` the location of the pool values using 1-based indexing
-- `pool_bitmask_loc` the location of the pool null bit mask using 1-based indexing
-- `x` a `CategoricalArray` that can be represented as a `DictEncoding`
+- `refs`: a `Primitive` providing references to values in `pool`
+- `data`: a buffer for storing the data
+- `refs_idx`: the location in `data` of the references
+- `pool_idx`: the location in `data` of the value pool
+- `x`: a `CategoricalArray` to be stored as a `DictEncoding`
+- `padding`: whenever `n` bytes must be allocated, `padding(n)` bytes will be allocated instead.
 """
 struct DictEncoding{J,P<:ArrowVector} <: ArrowVector{J}
     refs::Primitive{Int32}

@@ -2,6 +2,11 @@
 #================================================================================================
     functions common to both lists and primitives
 ================================================================================================#
+values(A::Primitive) = A
+values(A::ArrowVector) = A.values
+bitmask(A::ArrowVector) = A.bitmask
+offsets(A::ArrowVector) = A.offsets
+export values, bitmask, offsets
 
 """
     valuespointer(A::ArrowVector)
@@ -268,3 +273,14 @@ function getindex(l::ArrowVector{Union{J,Missing}}, idx::AbstractVector{<:Intege
     v
 end
 getindex(l::ArrowVector, ::Colon) = l[1:end]
+
+
+function write(io::IO, A::Primitive, idx::Union{<:Integer,AbstractVector{<:Integer}};
+               padding::Function=identity)
+    vals = rawvalues(A, idx)
+    write(io, vals)
+    pad = zeros(UInt8, padding(length(vals)) - length(vals))
+    write(io, zeros)
+    padding(length(vals))
+end
+write(io::IO, A::Primitive; padding::Function=identity) = write(io, A, 1:length(A), padding=padding)

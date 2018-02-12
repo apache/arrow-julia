@@ -1,4 +1,9 @@
 
+"""
+    bytesforbits(n::Integer)
+
+Get the number of bytes required to store `n` bits.
+"""
 bytesforbits(n::Integer) = div(((n + 7) & ~7), 8)
 export bytesforbits
 
@@ -12,6 +17,12 @@ function setbit(byte::UInt8, x::Bool, i::Integer)
 end
 
 
+"""
+    encode(::Type{C}, v::AbstractVector{J})
+
+Attempt to encode the data in `v` as a `Vector{C}`. This requires that if `convert(Vector{C}, x)` is
+valid where `x ∈ v`.  Nothing is stored for cases where `x == missing`.
+"""
 encode(::Type{C}, v::AbstractVector{J}) where {C,J} = mapreduce(x -> convert(Vector{C}, x), vcat, v)
 function encode(::Type{C}, v::AbstractVector{Union{J,Missing}}) where {C,J}
     mapreduce(vcat, v) do x
@@ -113,3 +124,5 @@ function unsafe_rawpadded(ptr::Ptr{UInt8}, len::Integer, padding::Function=ident
     npad = padding(len) - len
     vcat(unsafe_wrap(Array, ptr, len), zeros(UInt8, npad))
 end
+
+
