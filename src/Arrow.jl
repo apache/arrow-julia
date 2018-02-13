@@ -7,6 +7,7 @@ using Missings, WeakRefStrings, CategoricalArrays
 import Base: getindex, setindex!
 
 const BITMASK = UInt8[1, 2, 4, 8, 16, 32, 64, 128]
+const ALIGNMENT = 8
 
 
 import Base: convert, show, unsafe_string, checkbounds, write, values

@@ -18,10 +18,10 @@ be any `ArrowVector` type (but in most circumstances should be `Primitive`).
     List{J}(offs::Primitive{Int32}, vals::AbstractPrimitive)
     List{J}(data::Vector{UInt8}, offset_idx::Integer, len::Integer, vals::AbstractPrimitive)
     List{J}(data::Vector{UInt8}, offset_idx::Integer, values_idx::Integer, ::Type{C}, x::AbstractVector)
-    List{J}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector; padding=identity)
-    List(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector; padding=identity)
-    List{J}(Array, ::Type{C}, x::AbstractVector; padding=identity)
-    List(Array, ::Type{C}, x::AbstractVector; padding=identity)
+    List{J}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector)
+    List(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector)
+    List{J}(Array, ::Type{C}, x::AbstractVector)
+    List(Array, ::Type{C}, x::AbstractVector)
     List(::Type{C}, v::AbstractVector)
     List(v::AbstractVector{<:AbstractString})
 
@@ -38,8 +38,6 @@ Note that by default, `List`s of strings will be encoded in UTF-8.
     if not given explicitly
 - `i`: the location in `data` where all data should be stored (offsets, then values)
 - `x`, `v`: array to be stored or converted
-- `padding`: for each sub-buffer (i.e. offsets, values) if `n` bytes are required instead `padding(n)`
-    bytes will be allocated.
 """
 struct List{J,P<:AbstractPrimitive} <: AbstractList{J}
     length::Int32
@@ -86,40 +84,33 @@ function List(data::Vector{UInt8}, offset_idx::Integer, values_idx::Integer, ::T
     List{J}(data, offset_idx, values_idx, C, x)
 end
 # this puts offsets first
-function List{J}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector;
-                 padding::Function=identity) where {C,J}
+function List{J}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector) where {C,J}
     offs = Primitive{Int32}(data, i, offsets(C, x))
-    p = Primitive(data, i+padding(offsetsbytes(x)), encode(C, x))
+    p = Primitive(data, i+offsetsbytes(x), encode(C, x))
     List{J}(offs, p)
 end
-function List(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector{J};
-              padding::Function=identity) where {C,J}
-    List{J}(data, i, C, x, padding=padding)
+function List(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector{J}) where {C,J}
+    List{J}(data, i, C, x)
 end
 
-function List{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{<:AbstractString};
-                 padding::Function=identity) where J
-    List{J}(data, i, UInt8, x, padding=padding)
+function List{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{<:AbstractString}) where J
+    List{J}(data, i, UInt8, x)
 end
-function List(data::Vector{UInt8}, i::Integer, x::AbstractVector{<:AbstractString};
-              padding::Function=identity)
-    List(data, i, UInt8, x, padding=padding)
+List(data::Vector{UInt8}, i::Integer, x::AbstractVector{<:AbstractString}) = List(data, i, UInt8, x)
+
+function List{J}(::Type{<:Array}, ::Type{C}, x::AbstractVector) where {C,J}
+    b = Vector{UInt8}(totalbytes(C, x))
+    List{J}(b, 1, C, x)
+end
+function List(::Type{<:Array}, ::Type{C}, x::AbstractVector{J}) where {C,J}
+    List{J}(Array, C, x)
 end
 
-function List{J}(::Type{<:Array}, ::Type{C}, x::AbstractVector; padding::Function=identity) where {C,J}
-    b = Vector{UInt8}(minbytes(C, x))
-    List{J}(b, 1, C, x, padding=padding)
+function List{J}(::Type{<:Array}, x::AbstractVector{<:AbstractString}) where J
+    List{J}(Array, UInt8, x)
 end
-function List(::Type{<:Array}, ::Type{C}, x::AbstractVector{J}; padding::Function=identity) where {C,J}
-    List{J}(Array, C, x, padding=padding)
-end
-
-function List{J}(::Type{<:Array}, x::AbstractVector{<:AbstractString}; padding::Function=identity
-                ) where J
-    List{J}(Array, UInt8, x, padding=padding)
-end
-function List(::Type{<:Array}, x::AbstractVector{<:AbstractString}; padding::Function=identity)
-    List(Array, UInt8, x, padding=padding)
+function List(::Type{<:Array}, x::AbstractVector{<:AbstractString})
+    List(Array, UInt8, x)
 end
 
 function List{J}(::Type{C}, v::AbstractVector) where {J,C}
@@ -149,9 +140,9 @@ the values data an element of the `NullableList` should be constructed.  The bit
                     len::Integer, ::Type{C}, values_len::Integer)
     NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer, values_idx::Integer,
                     ::Type{C}, x::AbstractVector)
-    NullableList(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector; padding=identity)
-    NullableList(Array, ::Type{C}, x::AbstractVector; padding=identity)
-    NullableList(Array, x::AbstracVector; padding=identity)
+    NullableList(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector)
+    NullableList(Array, ::Type{C}, x::AbstractVector)
+    NullableList(Array, x::AbstracVector)
     NullableList(::Type{C}, v::AbstractVector)
     NullableList(v::AbstractVector)
 
@@ -169,7 +160,6 @@ If `Array` is given as an argument, a contiguous array will be allocated to stor
 - `values_len`: the total length of the values data (i.e. number of elements in the values array)
 - `C`: the data type of the values data. defaults to `UInt8` when not provided
 - `x`, `v`: array to be stored by the `NullableList`
-- `padding`: if `n` bytes are required for a sub-buffer, `padding(n)` bytes will be allocated instead
 """
 struct NullableList{J,P<:AbstractPrimitive} <: AbstractList{Union{Missing,J}}
     length::Int32
@@ -205,7 +195,7 @@ end
 # buffer with location constructors, with values arg
 function NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer,
                          values_idx::Integer, len::Integer, vals::P) where {J,P<:AbstractPrimitive}
-    bmask = Primitive{UInt8}(data, bitmask_idx, bytesforbits(len))
+    bmask = Primitive{UInt8}(data, bitmask_idx, bitmaskbytes(len))
     offs = Primitive{Int32}(data, offset_idx, len+1)
     NullableList{J,P}(bmask, offs, vals)
 end
@@ -223,54 +213,47 @@ function NullableList(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Int
     NullableList{J}(data, bitmask_idx, offset_idx, values_idx, C, x)
 end
 # bitmask, offsets, values
-function NullableList{J}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector;
-                         padding::Function=identity) where {C,J}
+function NullableList{J}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector) where {C,J}
     bmask = Primitive{UInt8}(data, i, bitmask(x))
-    offs = Primitive{Int32}(data, i+padding(minbitmaskbytes(x)), offsets(C, x))
-    vals = Primitive(data, i+padding(minbitmaskbytes(x))+padding(offsetsbytes(x)), encode(C, x))
+    offs = Primitive{Int32}(data, i+bitmaskbytes(x), offsets(C, x))
+    vals = Primitive(data, i+bitmaskbytes(x)+offsetsbytes(x), encode(C, x))
     NullableList{J}(bmask, offs, vals)
 end
-function NullableList(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector{Union{J,Missing}};
-                      padding::Function=identity) where {C,J}
-    NullableList{J}(data, i, C, x, padding=padding)
+function NullableList(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector{Union{J,Missing}}
+                     ) where {C,J}
+    NullableList{J}(data, i, C, x)
 end
-function NullableList(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector{J};
-                      padding::Function=identity) where {C,J}
-    NullableList{J}(data, i, C, x, padding=padding)
+function NullableList(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector{J}) where {C,J}
+    NullableList{J}(data, i, C, x)
 end
 
 function NullableList{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{T};
-                         padding::Function=identity
                         ) where {J,K<:AbstractString,T<:Union{K,Union{K,Missing}}}
-    NullableList{J}(data, i, UInt8, x, padding=padding)
+    NullableList{J}(data, i, UInt8, x)
 end
 function NullableList(data::Vector{UInt8}, i::Integer, x::AbstractVector{T};
-                      padding::Function=identity
                      ) where {K<:AbstractString,T<:Union{K,Union{K,Missing}}}
-    NullableList(data, i, UInt8, x, padding=padding)
+    NullableList(data, i, UInt8, x)
 end
 
-function NullableList{J}(::Type{<:Array}, ::Type{C}, x::AbstractVector;
-                         padding::Function=identity) where {C,J}
+function NullableList{J}(::Type{<:Array}, ::Type{C}, x::AbstractVector) where {C,J}
     b = Vector{UInt8}(minbytes(C, x))
-    NullableList{J}(b, 1, C, x, padding=padding)
+    NullableList{J}(b, 1, C, x)
 end
-function NullableList(::Type{<:Array}, ::Type{C}, x::AbstractVector{Union{J,Missing}};
-                      padding::Function=identity) where {C,J}
-    NullableList{J}(Array, C, x, padding=padding)
+function NullableList(::Type{<:Array}, ::Type{C}, x::AbstractVector{Union{J,Missing}}) where {C,J}
+    NullableList{J}(Array, C, x)
 end
-function NullableList(::Type{<:Array}, ::Type{C}, x::AbstractVector{J};
-                      padding::Function=identity) where {C,J}
-    NullableList{J}(Array, C, x, padding=padding)
+function NullableList(::Type{<:Array}, ::Type{C}, x::AbstractVector{J}) where {C,J}
+    NullableList{J}(Array, C, x)
 end
 
-function NullableList{J}(::Type{<:Array}, x::AbstractVector{T}; padding::Function=identity
+function NullableList{J}(::Type{<:Array}, x::AbstractVector{T}
                         ) where {J,K<:AbstractString,T<:Union{K,Union{K,Missing}}}
-    NullableList{J}(Array, UInt8, x, padding=padding)
+    NullableList{J}(Array, UInt8, x)
 end
-function NullableList(::Type{<:Array}, x::AbstractVector{T}; padding::Function=identity
+function NullableList(::Type{<:Array}, x::AbstractVector{T}
                      ) where {K<:AbstractString,T<:Union{K,Union{K,Missing}}}
-    NullableList(Array, UInt8, x, padding=padding)
+    NullableList(Array, UInt8, x)
 end
 
 function NullableList{J}(::Type{C}, v::AbstractVector) where {J,C}
@@ -292,27 +275,28 @@ end
 ====================================================================================================#
 function valuesbytes(::Type{C}, A::AbstractVector{T}
                     ) where {C,K<:AbstractString,T<:Union{Union{K,Missing},K}}
-    sum(ismissing(a) ? 0 : length(a)*sizeof(C) for a ∈ A)
+    padding(sum(ismissing(a) ? 0 : length(a)*sizeof(C) for a ∈ A))
 end
 valuesbytes(A::Union{List{P,J},NullableList{P,J}}) where {P,J} = valuesbytes(A.values)
 
-minbitmaskbytes(A::List) = 0
-minbitmaskbytes(A::NullableList) = bytesforbits(length(A))
+bitmaskbytes(A::List) = 0
+bitmaskbytes(A::NullableList) = bytesforbits(length(A))
 
-offsetsbytes(A::AbstractVector) = (length(A)+1)*sizeof(Int32)
+offsetsbytes(len::Integer) = padding((len+1)*sizeof(Int32))
+offsetsbytes(A::AbstractVector) = offsetsbytes(length(A))
 export offsetsbytes
 
-function minbytes(::Type{C}, A::AbstractVector{T}
-                 ) where {C,K<:AbstractString,T<:Union{Union{K,Missing},K}}
-    valuesbytes(C, A) + minbitmaskbytes(A) + offsetsbytes(A)
+function totalbytes(::Type{C}, A::AbstractVector{T}
+                   ) where {C,K<:AbstractString,T<:Union{Union{K,Missing},K}}
+    valuesbytes(C, A) + bitmaskbytes(A) + offsetsbytes(A)
 end
-function minbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector{J}) where {C,J}
-    valuesbytes(C, A) + minbitmaskbytes(Union{J,Missing}, A) + offsetsbytes(A)
+function totalbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector{J}) where {C,J}
+    valuesbytes(C, A) + bitmaskbytes(Union{J,Missing}, A) + offsetsbytes(A)
 end
-function minbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector{Union{J,Missing}}) where {C,J}
-    valuesbytes(C, A) + minbitmaskbytes(Union{J,Missing}, A) + offsetsbytes(A)
+function totalbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector{Union{J,Missing}}) where {C,J}
+    valuesbytes(C, A) + bitmaskbytes(Union{J,Missing}, A) + offsetsbytes(A)
 end
-minbytes(A::AbstractList) = valuesbytes(A) + minbitmaskbytes(A) + offsetsbytes(A)
+totalbytes(A::AbstractList) = valuesbytes(A) + minbitmaskbytes(A) + offsetsbytes(A)
 
 
 # helper function for offsets
@@ -348,7 +332,8 @@ function check_offset_bounds(l::AbstractList, i::Integer)
 end
 
 
-rawvalues(p::AbstractList, padding::Function=identity) = rawvalues(p.values, padding)
+rawvalues(p::AbstractList, i) = rawvalues(p.values, i)
+rawvalues(p::AbstractList) = rawvalues(p.values)
 
 
 # note that there are always n+1 offsets
@@ -361,17 +346,11 @@ unsafe_getoffset(l::AbstractList, i::Integer) = unsafe_load(convert(Ptr{Int32}, 
 
 
 """
-    unsafe_rawoffsets(p::AbstractList, padding::Function=identity)
+    unsafe_rawoffsets(p::AbstractList)
 
 Retreive the raw offstets for `p` as a `Vector{UInt8}`.
-
-The function `padding` should take as its sole argument the number of bytes of the raw values
-and return teh total number of bytes appropriate for the padding scheme.
 """
-function unsafe_rawoffsets(p::AbstractList, padding::Function=identity)
-    unsafe_rawpadded(p.offsets, offsetsbytes(p), padding)
-end
-export rawoffsets
+unsafe_rawoffsets(p::AbstractList) = unsafe_rawpadded(p.offsets, offsetsbytes(p))
 
 
 """

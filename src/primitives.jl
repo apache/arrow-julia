@@ -15,7 +15,7 @@ from `Primitive`s.
     Primitive{J}(data::Vector{UInt8}, i::Integer, len::Integer)
     Primitive(data::Vector{UInt8}, i::Integer, x::AbstractVector)
     Primitive(v::AbstractVector)
-    Primitive(Array, x::Abstractvector; padding=identity)
+    Primitive(Array, x::Abstractvector)
 
 If `Array` is provided as the virst argument, the data will be allocated contiguously in a new buffer.
 
@@ -24,8 +24,6 @@ If `Array` is provided as the virst argument, the data will be allocated contigu
 - `i`: the index of the location (1-based) in `data` where the beginning of the value data is stored
 - `x`: a vector which will be written into `data[i]` on construction
 ` `v`: existing reference data. constructors with will reference the original `v` as `data`
-- `padding`: when allocating the values in a new array, extra space will be added to the end of the
-    array such that if `n` bytes are required, instead `padding(n)` bytes will be provided
 """
 struct Primitive{J} <: AbstractPrimitive{J}
     length::Int32
@@ -47,7 +45,7 @@ function Primitive{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{K}) whe
     Primitive(data, i, convert(AbstractVector{J}, x))
 end
 
-# view of reinterpreted
+# view of reinterpreted, will not include padding
 function Primitive(v::AbstractVector{J}) where J
     b = reinterpret(UInt8, v)
     Primitive{J}(b, 1, length(v))
@@ -57,13 +55,11 @@ function Primitive{J}(v::AbstractVector{T}) where {J,T}
 end
 
 # create own buffer
-function Primitive{J}(::Type{<:Array}, v::AbstractVector; padding::Function=identity) where J
-    b = Vector{UInt8}(padding(minbytes(v)))
+function Primitive{J}(::Type{<:Array}, v::AbstractVector) where J
+    b = Vector{UInt8}(totalbytes(v))
     Primitive{J}(b, 1, v)
 end
-function Primitive(::Type{<:Array}, v::AbstractVector; padding::Function=identity)
-    Primitive(v, padding=padding)
-end
+Primitive(::Type{<:Array}, v::AbstractVector) = Primitive(v)
 
 
 """
@@ -91,7 +87,7 @@ null.  The bit mask and data needn't necessarily coexist within the same array.
     NullablePrimitive(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer, x::AbstractVector)
     NullablePrimitive(data::Vector{UInt8}, i::Integer, x::AbstractVector)
     NullablePrimitive(v::AbstractVector)
-    NullablePrimitive(Array, x::AbstractVector; padding=identity)
+    NullablePrimitive(Array, x::AbstractVector)
 
 If `Array` is passed to a constructor, the bit mask and values for the `NullablePrimitive` will be
 contiguously allocated within a single array (bit mask first, then values).
@@ -122,7 +118,7 @@ end
 # buffer with location constructors
 function NullablePrimitive{J}(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
                               len::Integer) where J
-    bmask = Primitive{UInt8}(data, bitmask_idx, bytesforbits(len))
+    bmask = Primitive{UInt8}(data, bitmask_idx, bitmaskbytes(len))
     vals = Primitive{J}(data, values_idx, len)
     NullablePrimitive{J}(bmask, vals)
 end
@@ -133,28 +129,24 @@ function NullablePrimitive(data::Vector{UInt8}, bitmask_idx::Integer, values_idx
     setnonmissing!(vals, x)
     NullablePrimitive{J}(bmask, vals)
 end
-function NullablePrimitive(data::Vector{UInt8}, i::Integer, v::AbstractVector{T};
-                           padding::Function=identity) where {J,T<:Union{J,Union{J,Missing}}}
-    NullablePrimitive(data, i, i+padding(minbitmaskbytes(v)), v)
+function NullablePrimitive(data::Vector{UInt8}, i::Integer, v::AbstractVector{T}
+                          ) where {J,T<:Union{J,Union{J,Missing}}}
+    NullablePrimitive(data, i, i+bitmaskbytes(v), v)
 end
-function NullablePrimitive{J}(data::Vector{UInt8}, i::Integer, v::AbstractVector{T};
-                              padding::Function=identity) where {J,T}
-    NullablePrimitive(data, i, convert(AbstractVector{J}, v), padding=padding)
+function NullablePrimitive{J}(data::Vector{UInt8}, i::Integer, v::AbstractVector{T}) where {J,T}
+    NullablePrimitive(data, i, convert(AbstractVector{J}, v))
 end
 
 # contiguous new buffer constructors
-function NullablePrimitive(::Type{<:Array}, v::AbstractVector{Union{J,Missing}};
-                           padding::Function=identity) where J
-    b = Vector{UInt8}(minbytes(v))
-    NullablePrimitive(b, 1, v, padding=padding)
+function NullablePrimitive(::Type{<:Array}, v::AbstractVector{Union{J,Missing}}) where J
+    b = Vector{UInt8}(totalbytes(v))
+    NullablePrimitive(b, 1, v)
 end
-function NullablePrimitive{J}(::Type{K}, v::AbstractVector{T};
-                              padding::Function=identity) where {J,K<:Array,T}
-    NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v), padding=padding)
+function NullablePrimitive{J}(::Type{K}, v::AbstractVector{T}) where {J,K<:Array,T}
+    NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v))
 end
-function NullablePrimitive(::Type{K}, v::AbstractVector{J};
-                           padding::Function=identity) where {K<:Array,J}
-    NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v), padding=padding)
+function NullablePrimitive(::Type{K}, v::AbstractVector{J}) where {K<:Array,J}
+    NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v))
 end
 
 # TODO change to reinterpreted views in 0.7 if possible
@@ -188,44 +180,46 @@ bitmask or offsets.
 To obtain the number of values bytes needed to string data, one must input `C` the character encoding
 type the string will be converted to (e.g. `UInt8`).
 """
-valuesbytes(A::AbstractVector{J}) where J = length(A)*sizeof(J)
-valuesbytes(A::AbstractVector{Union{J,Missing}}) where J = length(A)*sizeof(J)
+valuesbytes(::Type{J}, len::Integer) where J = padding(sizeof(J)*len)
+valuesbytes(A::AbstractVector{J}) where J = valuesbytes(J, len)
+valuesbytes(A::AbstractVector{Union{J,Missing}}) where J = valuesbytes(J, len)
 export valuesbytes
 
 """
-    minbitmaskbytes(A::AbstractVector)
-    minbitmaskbytes(::Type{Union{J,Missing}}, A::AbstractVector)
+    bitmaskbytes(A::AbstractVector)
+    bitmaskbytes(::Type{Union{J,Missing}}, A::AbstractVector)
 
-Compute the minimum number of bytes needed to store a null bitmask for the data in `A`.  This is 0
+Compute the number of bytes needed to store a null bitmask for the data in `A`.  This is 0
 unless `J <: Union{K,Missing}`. Note that this does not take into account scheme-dependent padding.
 """
-minbitmaskbytes(A::AbstractVector) = 0
-minbitmaskbytes(::Type{Union{J,Missing}}, A::AbstractVector{J}) where J = bytesforbits(length(A))
+bitmaskbytes(len::Integer) = padding(bytesforbits(len))
+bitmaskbytes(A::AbstractVector) = 0
+bitmaskbytes(::Type{Union{J,Missing}}, A::AbstractVector{J}) where J = bitmaskbytes(length(A))
 function minbitmaskbytes(::Type{Union{J,Missing}}, A::AbstractVector{Union{J,Missing}}) where J
-    bytesforbits(length(A))
+    bitmaskbytes(length(A))
 end
-minbitmaskbytes(A::AbstractVector{Union{J,Missing}}) where J = bytesforbits(length(A))
-export minbitmaskbytes
+bitmaskbytes(A::AbstractVector{Union{J,Missing}}) where J = bitmaskbytes(length(A))
+export bitmaskbytes
 
 """
-    minbytes(A::AbstractVector)
-    minbytes(::Type{Union{J,Missing}}, A::AbstractVector)
-    minbytes(::Type{C}, A::AbstractVector)
-    minbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector)
+    totalbytes(A::AbstractVector)
+    totalbytes(::Type{Union{J,Missing}}, A::AbstractVector)
+    totalbytes(::Type{C}, A::AbstractVector)
+    totalbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector)
 
 Computes the minimum number of bytes needed to store `A` as an Arrow formatted primitive array or list.
 
 To obtain the minimum bytes to store string data, one must input `C` the character encoding type the
 string will be converted to (e.g. `UInt8`).
 """
-minbytes(A::AbstractVector) = minbitmaskbytes(A) + valuesbytes(A)
-function minbytes(::Type{Union{J,Missing}}, A::AbstractVector{J}) where J
-    minbitmaskbytes(Union{J,Missing}, A) + valuesbytes(A)
+totalbytes(A::AbstractVector) = bitmaskbytes(A) + valuesbytes(A)
+function totalbytes(::Type{Union{J,Missing}}, A::AbstractVector{J}) where J
+    bitmaskbytes(Union{J,Missing}, A) + valuesbytes(A)
 end
-function minbytes(::Type{Union{J,Missing}}, A::AbstractVector{Union{J,Missing}}) where J
-    minbitmaskbytes(Union{J,Missing}, A) + valuesbytes(A)
+function totalbytes(::Type{Union{J,Missing}}, A::AbstractVector{Union{J,Missing}}) where J
+    bitmaskbytes(Union{J,Missing}, A) + valuesbytes(A)
 end
-export minbytes
+export totalbytes
 
 
 
@@ -303,12 +297,9 @@ end
     unsafe_rawvalues(p::ArrowVector, padding::Function=identity)
 
 Retreive raw value data for `p` as a `Vector{UInt8}`.
-
-The function `padding` should take as its sole argument the number of bytes of the raw values
-and return the total number of bytes appropriate for the padding scheme.
 """
-function unsafe_rawvalues(p::AbstractPrimitive, padding::Function=identity)
-    unsafe_rawpadded(valuespointer(p), valuesbytes(p), padding)
+function unsafe_rawvalues(p::AbstractPrimitive)
+    unsafe_rawpadded(valuespointer(p), valuesbytes(p))
 end
 export unsafe_rawvalues
 

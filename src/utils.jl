@@ -1,5 +1,15 @@
 
 """
+    padding(n::Integer)
+
+Determines the total number of bytes needed to store `n` bytes with padding.
+Note that the Arrow standard requires buffers to be aligned to 8-byte boundaries.
+"""
+padding(n::Integer) = ((n + ALIGNMENT - 1) ÷ ALIGNMENT)*ALIGNMENT
+export padding
+
+
+"""
     bytesforbits(n::Integer)
 
 Get the number of bytes required to store `n` bits.
@@ -116,11 +126,11 @@ end
 
 
 """
-    rawpadded(ptr::Ptr, len::Integer, padding::Function=identity)
+    unsafe_rawpadded(ptr::Ptr, len::Integer, padding::Function=identity)
 
 Return a `Vector{UInt8}` padded to appropriate size specified by `padding`.
 """
-function unsafe_rawpadded(ptr::Ptr{UInt8}, len::Integer, padding::Function=identity)
+function unsafe_rawpadded(ptr::Ptr{UInt8}, len::Integer)
     npad = padding(len) - len
     vcat(unsafe_wrap(Array, ptr, len), zeros(UInt8, npad))
 end

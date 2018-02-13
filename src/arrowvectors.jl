@@ -93,16 +93,12 @@ export isnull
 
 
 """
-    unsafe_rawbitmask(p::ArrowVector{Union{J,Missing}}, padding::Function=identity)
+    unsafe_rawbitmask(p::ArrowVector{Union{J,Missing}})
 
 Retrieve the raw value of the null bit mask for `p`.
-
-The function `padding` should take as its sole argument the number of bytes of the raw bit mask
-data and retrun the total number of bytes appropriate for the padding scheme.  Note that the argument
-taken is the *minimum* number of bytes of the bitmask (i.e. `ceil(length(p)/8)`).
 """
-function unsafe_rawbitmask(p::ArrowVector{Union{J,Missing}}, padding::Function=identity) where J
-    unsafe_rawpadded(bitmaskpointer(A), minbitmaskbytes(p), padding)
+function unsafe_rawbitmask(p::ArrowVector{Union{J,Missing}}) where J
+    unsafe_rawpadded(bitmaskpointer(A), bitmaskbytes(p))
 end
 
 
@@ -222,12 +218,11 @@ convert(::Type{Vector{T}}, A::ArrowVector{T}) where T = A[:]
 macro _formats(constructor, argtype, w...)
 esc(quote
     arrowformat(x::$argtype) where {$(w...)} = $constructor(x)
-    function arrowformat(::Type{<:Array}, x::$argtype; padding::Function=identity) where {$(w...)}
-        $constructor(Array, x, padding=padding)
+    function arrowformat(::Type{<:Array}, x::$argtype) where {$(w...)}
+        $constructor(Array, x)
     end
-    function arrowformat(data::Vector{UInt8}, i::Integer, x::$argtype;
-                         padding::Function=identity) where {$(w...)}
-        $constructor(data, i, x, padding=padding)
+    function arrowformat(data::Vector{UInt8}, i::Integer, x::$argtype) where {$(w...)}
+        $constructor(data, i, x)
     end
 end)
 end
@@ -275,12 +270,11 @@ end
 getindex(l::ArrowVector, ::Colon) = l[1:end]
 
 
-function write(io::IO, A::Primitive, idx::Union{<:Integer,AbstractVector{<:Integer}};
-               padding::Function=identity)
+function write(io::IO, A::Primitive, idx::Union{<:Integer,AbstractVector{<:Integer}})
     vals = rawvalues(A, idx)
     write(io, vals)
     pad = zeros(UInt8, padding(length(vals)) - length(vals))
     write(io, zeros)
     padding(length(vals))
 end
-write(io::IO, A::Primitive; padding::Function=identity) = write(io, A, 1:length(A), padding=padding)
+write(io::IO, A::Primitive) = write(io, A, 1:length(A))
