@@ -201,6 +201,9 @@ end
 bitmaskbytes(A::AbstractVector{Union{J,Missing}}) where J = bitmaskbytes(length(A))
 export bitmaskbytes
 
+minbitmaskbytes(len::Integer) = bytesforbits(len)
+minbitmaskbytes(A::AbstractVector) = minbitmaskbytes(length(A))
+
 """
     totalbytes(A::AbstractVector)
     totalbytes(::Type{Union{J,Missing}}, A::AbstractVector)
@@ -294,14 +297,13 @@ end
 
 
 """
-    unsafe_rawvalues(p::ArrowVector, padding::Function=identity)
+    unsafe_rawpaddedvalues(p::ArrowVector)
 
 Retreive raw value data for `p` as a `Vector{UInt8}`.
 """
-function unsafe_rawvalues(p::AbstractPrimitive)
+function unsafe_rawpaddedvalues(p::AbstractPrimitive)
     unsafe_rawpadded(valuespointer(p), valuesbytes(p))
 end
-export unsafe_rawvalues
 
 
 function setvalue!(A::Primitive{J}, x::J, i::Integer) where J

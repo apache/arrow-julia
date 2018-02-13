@@ -240,9 +240,9 @@ function arrowformat end
 @_formats List AbstractVector{J} J<:AbstractString
 @_formats NullableList AbstractVector{Union{J,Missing}} J<:AbstractString
 @_formats Primitive{Datestamp} AbstractVector{T} T<:Date
-@_formats Primitive{Timestamp} AbstractVector{T} T<:DateTime
+@_formats Primitive{Timestamp{Dates.Millisecond}} AbstractVector{T} T<:DateTime
 @_formats NullablePrimitive{Datestamp} AbstractVector{Union{T,Missing}} T<:Date
-@_formats NullablePrimitive{Timestamp} AbstractVector{Union{T,Missing}} T<:DateTime
+@_formats NullablePrimitive{Timestamp{Dates.Millisecond}} AbstractVector{Union{T,Missing}} T<:DateTime
 @_formats DictEncoding CategoricalArray{T,1,U} T<:Any U
 export arrowformat
 
@@ -270,11 +270,19 @@ end
 getindex(l::ArrowVector, ::Colon) = l[1:end]
 
 
-function write(io::IO, A::Primitive, idx::Union{<:Integer,AbstractVector{<:Integer}})
+function writepadded(io::IO, A::Primitive, idx::Union{<:Integer,AbstractVector{<:Integer}})
     vals = rawvalues(A, idx)
     write(io, vals)
     pad = zeros(UInt8, padding(length(vals)) - length(vals))
-    write(io, zeros)
+    write(io, pad)
     padding(length(vals))
 end
-write(io::IO, A::Primitive) = write(io, A, 1:length(A))
+writepadded(io::IO, A::Primitive) = writepadded(io, A, 1:length(A))
+function writepadded(io::IO, A::ArrowVector, subbuffs::Function...)
+    s = 0
+    for sb ∈ subbuffs
+        s += writepadded(io, sb(A))
+    end
+    s
+end
+export writepadded
