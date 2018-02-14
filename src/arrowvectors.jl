@@ -241,8 +241,10 @@ function arrowformat end
 @_formats NullableList AbstractVector{Union{J,Missing}} J<:AbstractString
 @_formats Primitive{Datestamp} AbstractVector{T} T<:Date
 @_formats Primitive{Timestamp{Dates.Millisecond}} AbstractVector{T} T<:DateTime
+@_formats Primitive{TimeOfDay{Dates.Nanosecond}} AbstractVector{T} T<:Dates.Time
 @_formats NullablePrimitive{Datestamp} AbstractVector{Union{T,Missing}} T<:Date
 @_formats NullablePrimitive{Timestamp{Dates.Millisecond}} AbstractVector{Union{T,Missing}} T<:DateTime
+@_formats NullablePrimitive{TimeOfDay{Dates.Nanosecond}} AbstractVector{Union{T,Missing}} T<:Dates.Time
 @_formats DictEncoding CategoricalArray{T,1,U} T<:Any U
 export arrowformat
 

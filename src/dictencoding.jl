@@ -112,8 +112,8 @@ nullcount(d::DictEncoding{Union{J,Missing}}) where J = sum(x == Int32(0) for x â
 getrefs(x::CategoricalArray) = convert(Vector{Int32}, x.refs) .- 1
 getrefs(x::CategoricalArray{Union{J,Missing},1,U}) where {J,U} = convert(Vector{Int32}, x.refs)
 
-getlevels(x::CategoricalArray) = levels(x)
-getlevels(x::CategoricalArray{Union{J,Missing},1,U}) where {J,U} = vcat([missing], levels(x))
+getlevels(x::CategoricalArray) = x.pool.index
+getlevels(x::CategoricalArray{Union{J,Missing},1,U}) where {J,U} = vcat([missing], getlevels(x))
 
 refsbytes(len::Integer) = padding(sizeof(Int32)*len)
 refsbytes(x::AbstractVector) = refsbytes(length(x))
