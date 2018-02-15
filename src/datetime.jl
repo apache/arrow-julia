@@ -44,17 +44,22 @@ show(io::IO, t::Timestamp) = show(io, convert(DateTime, t))
 
 
 """
-    TimeOfDay{P<:Dates.TimePeriod} <: ArrowTime
+    TimeOfDay{P<:Dates.TimePeriod,T<:Union{Int32,Int64}} <: ArrowTime
 
 An arrow formatted object for representing the time of day.
+Underlying data is `Int32` for seconds and milliseconds, `Int64` for microsecond and nanosecond.
 """
-struct TimeOfDay{P<:Dates.TimePeriod} <: ArrowTime
-    value::Int64
+struct TimeOfDay{P<:Dates.TimePeriod,T<:Union{Int32,Int64}} <: ArrowTime
+    value::T
 end
 export TimeOfDay
 
-TimeOfDay(t::P) where P<:Dates.TimePeriod = TimeOfDay{P}(Dates.value(t))
-TimeOfDay{P}(t::Dates.Time) where P<:Dates.TimePeriod = convert(TimeOfDay{P}, t)
+function TimeOfDay{P,T}(t::P) where {P<:Dates.TimePeriod,T<:Union{Int32,Int64}}
+    TimeOfDay{P,T}(Dates.value(convert(P, t)))
+end
+TimeOfDay{P}(t::P) where P<:Union{Dates.Second,Dates.Millisecond} = TimeOfDay{P,Int32}(t)
+TimeOfDay{P}(t::P) where P<:Union{Dates.Microsecond,Dates.Nanosecond} = TimeOfDay{P,Int64}(t)
+TimeOfDay(t::P) where P<:Dates.TimePeriod = TimeOfDay{P}(t)
 TimeOfDay(t::Dates.Time) = convert(TimeOfDay, t)
 
 value(t::TimeOfDay) = t.value
@@ -67,7 +72,8 @@ function convert(::Type{Dates.Time}, t::TimeOfDay{P}) where P
 end
 convert(::Type{Dates.TimeType}, t::TimeOfDay) = convert(Dates.Time, t)
 
-convert(::Type{TimeOfDay{P}}, t::Dates.Time) where P = TimeOfDay{P}(Dates.value(convert(P, t.instant)))
+convert(::Type{TimeOfDay{P,T}}, t::Dates.Time) where {P,T} = TimeOfDay{P,T}(convert(P, t.instant))
+convert(::Type{TimeOfDay{P}}, t::Dates.Time) where P = TimeOfDay{P}(convert(P, t.instant))
 convert(::Type{TimeOfDay}, t::Dates.Time) = convert(TimeOfDay{Dates.Nanosecond}, t)
 convert(::Type{ArrowTime}, t::Dates.Time) = convert(TimeOfDay, t)
 
@@ -95,3 +101,11 @@ convert(::Type{Datestamp}, t::Date) = Datestamp(Dates.value(t) - UNIXEPOCH_DT)
 convert(::Type{ArrowTime}, t::Date) = convert(Datestamp, t)
 
 show(io::IO, t::Datestamp) = show(io, convert(Date, t))
+
+
+#======================================================================================================
+    some basic utilities for dates and datetimes...
+======================================================================================================#
+for symb ∈ [:(>), :(≥), :(<), :(≤), :(==)]
+    eval(:($symb(t1::T, t2::T) where T<:ArrowTime = $symb(value(t1), value(t2))))
+end

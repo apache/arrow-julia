@@ -71,7 +71,7 @@ Check whether element(s) `idx` of `A` are null.
 """
 unsafe_isnull(A::ArrowVector, i::Integer) = false
 function unsafe_isnull(A::ArrowVector{Union{T,Missing}}, i::Integer) where T
-    a, b = divrem(i, 8)
+    a, b = divrem(i-1, 8) .+ (0,1)
     !getbit(unsafe_load(bitmaskpointer(A) + a), b)
 end
 unsafe_isnull(A::ArrowVector, idx::AbstractVector{<:Integer}) = Bool[unsafe_isnull(A, i) for i ∈ idx]
@@ -84,8 +84,8 @@ Check whether element(s) `idx` of `A` are null.
 """
 isnull(A::ArrowVector, i) = false
 function isnull(A::ArrowVector{Union{J,Missing}}, i::Integer) where J
-    a, b = divrem(i, 8)
-    !getbit(A.bitmask[a+1], b)
+    a, b = divrem(i-1, 8) .+ (1,1)
+    !getbit(A.bitmask[a], b)
 end
 isnull(A::ArrowVector, idx::AbstractVector{<:Integer}) = Bool[isnull(A, i) for i ∈ idx]
 isnull(A::ArrowVector, idx::AbstractVector{Bool}) = Bool[isnull(A, i) for i ∈ 1:length(A) if idx[i]]
@@ -103,7 +103,7 @@ end
 
 
 function setnull!(A::ArrowVector{Union{J,Missing}}, x::Bool, i::Integer) where J
-    a, b = divrem(i, 8) .+ (1,0)
+    a, b = divrem(i-1, 8) .+ (1,1)
     byte = setbit(getvalue(A.bitmask, a), !x, b)
     setvalue!(A.bitmask, byte, a)
 end
@@ -123,7 +123,7 @@ end
 Set element `i` of `A` to be null. This involves no bounds checking and a call to `unsafe_store!`.
 """
 function unsafe_setnull!(A::ArrowVector{Union{J,Missing}}, x::Bool, i::Integer) where J
-    a, b = divrem(i, 8)
+    a, b = divrem(i-1, 8) .+ (0,1)
     ptr = bitmaskpointer(A) + a
     byte = setbit(unsafe_load(ptr), !x, b)
     unsafe_store!(ptr, byte)
@@ -241,32 +241,36 @@ function arrowformat end
 @_formats NullableList AbstractVector{Union{J,Missing}} J<:AbstractString
 @_formats Primitive{Datestamp} AbstractVector{T} T<:Date
 @_formats Primitive{Timestamp{Dates.Millisecond}} AbstractVector{T} T<:DateTime
-@_formats Primitive{TimeOfDay{Dates.Nanosecond}} AbstractVector{T} T<:Dates.Time
+@_formats Primitive{TimeOfDay{Dates.Nanosecond,Int64}} AbstractVector{T} T<:Dates.Time
 @_formats NullablePrimitive{Datestamp} AbstractVector{Union{T,Missing}} T<:Date
 @_formats NullablePrimitive{Timestamp{Dates.Millisecond}} AbstractVector{Union{T,Missing}} T<:DateTime
-@_formats NullablePrimitive{TimeOfDay{Dates.Nanosecond}} AbstractVector{Union{T,Missing}} T<:Dates.Time
+@_formats NullablePrimitive{TimeOfDay{Dates.Nanosecond,Int64}} AbstractVector{Union{T,Missing}} T<:Dates.Time
 @_formats DictEncoding CategoricalArray{T,1,U} T<:Any U
 export arrowformat
 
 
 # TODO in 0.6, views have to use unsafe methods
+# TODO bounds checking is a disaster right now, clean it up
 function unsafe_view(l::ArrowVector{J}, i::Union{Integer,AbstractVector{<:Integer}}) where J
     @boundscheck checkbounds(l, i)
     SubArray(unsafe_getvalue(l, i), (i,))
 end
 
+# TODO clean up bounds checking macros in 0.7
 function getindex(l::ArrowVector{J}, i::Integer) where J
-    # @boundscheck checkbounds(l, i)
-    getvalue(l, i)
+    @boundscheck checkbounds(l, i)
+    @inbounds o = getvalue(l, i)
+    o
 end
 function getindex(l::ArrowVector{Union{J,Missing}}, i::Integer)::Union{J,Missing} where J
-    # @boundscheck checkbounds(l, i)
-    isnull(l, i) ? missing : getvalue(l, i)
+    @boundscheck checkbounds(l, i)
+    @inbounds o = isnull(l, i) ? missing : getvalue(l, i)
+    o
 end
 function getindex(l::ArrowVector{Union{J,Missing}}, idx::AbstractVector{<:Integer}) where J
-    # @boundscheck checkbounds(l, idx)
-    v = convert(Vector{Union{J,Missing}}, getvalue(l, idx))
-    fillmissings!(v, l, idx)
+    @boundscheck checkbounds(l, idx)
+    @inbounds v = convert(Vector{Union{J,Missing}}, getvalue(l, idx))
+    @inbounds fillmissings!(v, l, idx)
     v
 end
 getindex(l::ArrowVector, ::Colon) = l[1:end]
