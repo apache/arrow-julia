@@ -276,6 +276,11 @@ end
 getindex(l::ArrowVector, ::Colon) = l[1:end]
 
 
+"""
+    writepadded(io::IO, A::Primitive)
+
+Write the values of `A` to `io` with Arrow padding (8 bytes).
+"""
 function writepadded(io::IO, A::Primitive, idx::Union{<:Integer,AbstractVector{<:Integer}})
     vals = rawvalues(A, idx)
     write(io, vals)
@@ -292,3 +297,17 @@ function writepadded(io::IO, A::ArrowVector, subbuffs::Function...)
     s
 end
 export writepadded
+
+
+"""
+    rawpadded(A::Primitive)
+
+Get a `Vector{UInt8}` describing the data of `A` with Arrow padding (8 bytes).
+"""
+function rawpadded(A::Primitive, idx::Union{<:Integer,AbstractVector{<:Integer}})
+    vals = rawvalues(A, idx)
+    vcat(vals, zeros(UInt8, padding(length(vals)) - length(vals)))
+end
+rawpadded(A::Primitive) = rawpadded(A, 1:length(A))
+rawpadded(A::ArrowVector, subbuffs::Function...) = reduce(vcat, (rawpadded(sb(A)) for sb ∈ subbuffs))
+export rawpadded
