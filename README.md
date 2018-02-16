@@ -3,6 +3,13 @@
 This is a pure Julia implementation of the [Apache Arrow](https://arrow.apache.org) data standard.  This package provides Julia `AbstractVector` objects for
 referencing data that conforms to the Arrow standard.  This allows users to seamlessly interface Arrow formatted data with a great deal of existing Julia code.
 
+## Installation
+For now this package is not registered, so do
+```julia
+Pkg.clone("https://github.com/ExpandingMan/Arrow.jl")
+```
+Arrow only has `Missings` and `CategoricalArrays` as dependencies.
+
 
 ## `ArrowVector` Objects
 The `Arrow` package exposes several `ArrowVector{J} <: AbstractVector{J}` objects.  These provide an interface to arrow formatted data as well as providing
@@ -95,6 +102,7 @@ Note that `List{J}` and `NullableList{J}` use the constructor `J(::AbstractVecto
 
 Enter `?List` in the REPL for a full list of constructors.
 
+
 ### The `NullableList` Type
 Next we have the `NullableList{J} <: AbstractVector{Union{J,Missing}}` type.  `NullableList` is to `List` as `NullablePrimitive` is to `Primitive`.  In addition
 to offsets and values, it also contains a bit mask describing which elements are null.  By now you can probably predict what the example will look like
@@ -132,6 +140,32 @@ m = arrowformat(["abc", missing, "fg"])
 Enter `?NullableList` in the REPL for a full list of constructors.
 
 
+### The `DictEncoding` Type
+The arrow format also supports dictionary encoding of arrays.  What this means is simply that instead of one array, there are two, a "short" array containing a
+view values, and a "long" array which contains pointers to those values (required by the Arrow standard to be `Int32`).  This provides a way of compressing
+arrays in which a relatively small number of values are repeated in large numbers.  Arrow.jl uses the Julia package
+[CategoricalArrays.jl](https://github.com/JuliaData/CategoricalArrays.jl) to support this functionality.  `CategoricalArray`s will be dictionary encoded by
+default when converted to Arrow array objects.  One aspect of this that may seem confusing is that references are required to be 0-based indices, which is
+contrary to the Julia 1-based approach we've used for everything else.  In practice this shouldn't matter much: references do not need to be constructed
+manually.  See the following
+```julia
+# in most real cases these would be constructed from data in one of the ways described above
+refs = Primitive{Int32}([0, 1, 2, 0, 1, 3])
+vals = List(["fire", "walk", "with", "me"])
+A = DictEncoding(refs, vals)
+
+A[1] # returns "fire"
+A[5] # return "walk"
+A[[1,2,3,6]] # returns ["fire", "walk", "with", "me"]
+
+
+# you can also create your own from Julia data
+B = DictEncoding(["fire", "walk", "with", "me"])  # in this case there is no benefit to DictEncoding over List
+# arrowformat will automatically convert any CategoricalArray object to an Arrow formatted DictEncoding
+B = arrowformat(categorical(["fire", "walk", "with", "me"]))
+```
+
+
 ## Recommended Usage Pattern
 Because the Arrow standard is so general it is difficult for this package to provide general utilities for retrieving data.  Typically users will have to define
 methods for creating `ArrowVector` objects from whatever underlying data that they are interested in.  The examples above demonstrate this, though of course in
@@ -149,4 +183,25 @@ the package developer.  As far as *reading* data goes, since `ArrowVector{J} <: 
 `ArrowVector`s into Julia `Vector`s.  This will cut down on the amount of copying that needs to be done.  Of course if very fast access is a priority, nothing
 will beat native Julia formats, so in these cases Julia `Vector`s should be constructed with `v[:]`.
 
-***INCOMPLETE: More README is on its way!***
+Writing is somewhat simpler as Arrow will figure out how to convert ordinary Julia data to Arrow formatted data for you.  In addition to `arrowformat` the other
+two most important functions for writing data will be `rawpadded` and `writepadded`.  `rawpadded` takes a `Primitive` as argument and returns a properly Arrow
+padded `Vector{UInt8}` appropriate for writing the data directly to an Arrow formatted buffer.  `writepadded` will write the properly padded array to an `IO`
+object.
+```julia
+A = NullableList(data)
+writepadded(io, A, bitmask, offsets, values)  # write bitmask, offsets then values of A, all contiguously, all properly padded
+
+B = DictEncoding(data)
+writepadded(io, B, references)  # writes references
+writepadded(io, levels(B), offsets, bitmask, values)  # writes the NullableList in a different order than above
+```
+
+## Working Example
+For a working (but as of this writing still in-development) example of a package built with Arrow.jl see [this](https://github.com/ExpandingMan/Feather.jl/tree/arrow1) fork of Feather.jl.
+
+## TODO
+A lot of work still to be done:
+- Currently do not support (Arrow formatted) `Bool`s. This will require a special `ArrowVector` type in order to achieve 1-bit addressability.
+- Performance pass: performance seems ok according to basic sanity checks but it that code has neither been optimized nor thoroughly benchmarked.  Note that currently Arrow.jl does *not* use pointers at all by default.  So far it seems that the penalty for this will be small, but it must be tested.
+- Extensive unit tests needed: hopefully I'll get to more of this soon.
+- This was developed using Julia 0.6 only, some changes will be needed in 0.7.  In particular, the behavior of `reinterpret` is quite different in 0.7.  Updates to 0.7 will probably include allowing `Primitive` to use any `AbstractVector{UInt8}` as reference.
