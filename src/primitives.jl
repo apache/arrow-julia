@@ -61,6 +61,10 @@ function Primitive{J}(::Type{<:Array}, v::AbstractVector) where J
 end
 Primitive(::Type{<:Array}, v::AbstractVector) = Primitive(v)
 
+Primitive{J}(p::Primitive{J}) where J = Primitive{J}(p.length, p.values_idx, p.data)
+Primitive{J}(p::Primitive{T}) where {J,T} = Primitive{J}(convert(AbstractVector{J}, p[:]))
+Primitive(p::Primitive{J}) where J = Primitive{J}(p)
+
 
 """
     datapointer(A::Primitive)
@@ -162,6 +166,16 @@ end
 function NullablePrimitive{J}(v::AbstractVector{K}) where {J,K}
     NullablePrimitive(convert(AbstractVector{Union{J,Missing}}, v))
 end
+
+
+function NullablePrimitive{J}(p::NullablePrimitive{J}) where J
+    NullablePrimitive{J}(p.length, p.bitmask, p.values)
+end
+function NullablePrimitive{J}(p::NullablePrimitive{T}) where {J,T}
+    NullablePrimitive{J}(convert(AbstractVector{J}, p[:]))
+end
+NullablePrimitive(p::NullablePrimitive{J}) where J = NullablePrimitive{J}(p)
+
 
 
 #================================================================================================

@@ -122,6 +122,11 @@ List(::Type{C}, v::AbstractVector{J}) where {J,C} = List{J}(C, v)
 List(v::AbstractVector{<:AbstractString}) = List{String}(UInt8, v)
 
 
+List{J}(l::List{J}) where J = List{J}(l.length, l.offsets, l.values)
+List{J}(l::List{T}) where {J,T} = List{J}(convert(AbstractVector{J}, l[:]))
+List(l::List{J}) where J = List{J}(l)
+
+
 """
     NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
 
@@ -268,6 +273,11 @@ end
 function NullableList(v::AbstractVector{T}) where {K<:AbstractString,T<:Union{K,Union{K,Missing}}}
     NullableList{String}(UInt8, v)
 end
+
+
+NullableList{J}(l::NullableList{J}) where J = NullableList{J}(p.length, p.bitmask, p.offsets, p.values)
+NullableList{J}(l::NullableList{T}) where {J,T} = NullableList{J}(convert(AbstractVector{J}, p[:]))
+NullableList(l::NullableList{J}) where J = NullableList{J}(l)
 
 
 #====================================================================================================

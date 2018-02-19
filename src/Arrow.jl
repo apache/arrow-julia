@@ -10,7 +10,7 @@ const BITMASK = UInt8[1, 2, 4, 8, 16, 32, 64, 128]
 const ALIGNMENT = 8
 
 
-import Base: convert, show, unsafe_string, checkbounds, write, values
+import Base: convert, show, unsafe_string, checkbounds, write, values, copy
 import Base: length, endof, size, eltype, start, next, done, getindex, isassigned, view
 import Base: >, ≥, <, ≤, ==
 import Base.isnull # this will be removed in 0.7

@@ -89,6 +89,11 @@ end
 DictEncoding(v::AbstractVector) = DictEncoding(CategoricalArray(v))
 
 
+DictEncoding{J}(d::DictEncoding{J}) where J = DictEncoding{J}(d.refs, d.pools)
+DictEncoding{J}(d::DictEncoding{T}) where {J,T} = DictEncoding{J}(convert(AbstractVector{J}, d[:]))
+DictEncoding(d::DictEncoding{J}) where J = DictEncoding{J}(d)
+
+
 length(d::DictEncoding) = length(d.refs)
 
 references(d::DictEncoding) = d.refs

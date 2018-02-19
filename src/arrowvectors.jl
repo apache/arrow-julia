@@ -8,6 +8,10 @@ bitmask(A::ArrowVector) = A.bitmask
 offsets(A::ArrowVector) = A.offsets
 export values, bitmask, offsets
 
+
+copy(A::T) where T<:ArrowVector = T(A)
+
+
 """
     valuespointer(A::ArrowVector)
 
@@ -280,6 +284,7 @@ function arrowformat end
 @_formats DictEncoding CategoricalArray{T,1,U} T<:Any U
 @_formats BitPrimitive AbstractVector{J} J<:Bool
 @_formats NullableBitPrimitive AbstractVector{J} J<:Union{Bool,Missing}
+arrowformat(A::ArrowVector) = copy(A)
 export arrowformat
 
 

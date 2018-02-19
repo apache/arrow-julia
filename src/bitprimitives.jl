@@ -33,6 +33,8 @@ function BitPrimitive(::Type{<:Array}, v::AbstractVector{UInt8}, len::Integer=si
     BitPrimitive(length(v), Primitive{UInt8}(Array, bitpack(v)))
 end
 
+BitPrimitive(b::BitPrimitive) = BitPrimitive(b.length, b.values)
+
 
 
 struct NullableBitPrimitive <: AbstractBitPrimitive{Union{Bool,Missing}}
@@ -72,6 +74,8 @@ function NullableBitPrimitive(::Type{<:Array}, v::AbstractVector{T}
     b = Vector{UInt8}(bitmaskbytes(v)+bytesforbits(v))
     NullableBitPrimitive(b, 1, v)
 end
+
+NullableBitPrimitive(b::NullableBitPrimitive) = NullableBitPrimitive(b.length, b.bitmask, b.values)
 
 
 
