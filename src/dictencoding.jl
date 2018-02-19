@@ -31,48 +31,28 @@ struct DictEncoding{J,P<:ArrowVector} <: ArrowVector{J}
 end
 export DictEncoding
 
-function DictEncoding{J}(refs::Primitive{Int32}, pool::P) where {J,P<:ArrowVector{J}}
+function DictEncoding{J}(refs::Primitive{Int32}, pool::P) where {J,P<:ArrowVector}
     DictEncoding{J,P}(refs, pool)
-end
-function DictEncoding(refs::Primitive{Int32}, pool::P) where {J,P<:ArrowVector{J}}
-    DictEncoding{J}(refs, pool)
 end
 
 function DictEncoding{J}(data::Vector{UInt8}, refs_idx::Integer, len::Integer, pool::P
-                        ) where {J,P<:ArrowVector{J}}
+                        ) where {J,P<:ArrowVector}
     refs = Primitive{Int32}(data, refs_idx, len)
     DictEncoding{J}(refs, pool)
 end
-function DictEncoding(data::Vector{UInt8}, refs_idx::Integer, len::Integer, pool::P
-                     ) where {J,P<:ArrowVector{J}}
-    DictEncoding{J}(data, refs_idx, len, pool)
-end
 
-# TODO this primitive constructor for pool should be more general
 function DictEncoding(data::Vector{UInt8}, refs_idx::Integer, pool_idx::Integer,
-                      x::CategoricalArray{J,1,U}) where {J,U}
+                      x::CategoricalArray{T,1,U}) where {J,U,T<:Union{J,Union{J,Missing}}}
     refs = Primitive{Int32}(data, refs_idx, getrefs(x))
     pool = Primitive{J}(data, pool_idx, getlevels(x))
-    DictEncoding{J}(refs, pool)
-end
-function DictEncoding(data::Vector{UInt8}, refs_idx::Integer, pool_bmask_idx::Integer,
-                      pool_vals_idx::Integer,
-                      x::CategoricalArray{Union{J,Missing},1,U}) where {J,U}
-    refs = Primitive{Int32}(data, refs_idx, getrefs(x))
-    pool = NullablePrimitive(data, pool_bmask_idx, pool_vals_idx, getlevels(x))
-    DictEncoding{J}(refs, pools)
+    DictEncoding{T}(refs, pool)
 end
 
-function DictEncoding(data::Vector{UInt8}, i::Integer, x::CategoricalArray{J,1,U}) where {J,U}
+function DictEncoding(data::Vector{UInt8}, i::Integer, x::CategoricalArray{T,1,U}
+                     ) where {J,U,T<:Union{J,Union{J,Missing}}}
     refs = Primitive{Int32}(data, i, getrefs(x))
     pool = Primitive{J}(data, i+refsbytes(x), getlevels(x))
-    DictEncoding{J}(refs, pool)
-end
-function DictEncoding(data::Vector{UInt8}, i::Integer, x::CategoricalArray{Union{J,Missing},1,U};
-                     ) where {J,U}
-    refs = Primitive{Int32}(data, i, getrefs(x))
-    pool = NullablePrimitive{J}(data, i+refsbytes(x), getlevels(x))
-    DictEncoding{J}(refs, pool)
+    DictEncoding{T}(refs, pool)
 end
 
 function DictEncoding(::Type{<:Array}, x::CategoricalArray)
@@ -108,17 +88,27 @@ getindex(d::DictEncoding, i::AbstractVector{<:Integer}) = d.pool[d.refs[i].+1]
 getindex(d::DictEncoding, i::AbstractVector{Bool}) = d.pool[d.refs[i].+1]
 
 
-nullcount(d::DictEncoding{Union{J,Missing}}) where J = sum(x == Int32(0) for x ∈ d.pool)
+function getindex(d::DictEncoding{Union{J,Missing}}, i::Integer)::Union{J,Missing} where J
+    r = d.refs[i] + 1
+    r == 0 ? missing : d.pool[r]
+end
+function getindex(d::DictEncoding{Union{J,Missing}}, idx::AbstractVector{<:Integer}) where J
+    Union{J,Missing}[getindex(d, i) for i ∈ idx]
+end
+function getindex(d::DictEncoding{Union{J,Missing}}, idx::AbstractVector{Bool}) where J
+    Union{J,Missing}[getindex(d, i) for i ∈ 1:length(d) if idx[i]]
+end
+
+
+nullcount(d::DictEncoding{Union{J,Missing}}) where J = sum(d.refs .< 0)
 
 
 #====================================================================================================
     utilities specific to DictEncoding
 ====================================================================================================#
-getrefs(x::CategoricalArray) = convert(Vector{Int32}, x.refs) .- 1
-getrefs(x::CategoricalArray{Union{J,Missing},1,U}) where {J,U} = convert(Vector{Int32}, x.refs)
+getrefs(x::CategoricalArray) = convert(Vector{Int32}, x.refs) .- Int32(1)
 
 getlevels(x::CategoricalArray) = x.pool.index
-getlevels(x::CategoricalArray{Union{J,Missing},1,U}) where {J,U} = vcat([missing], getlevels(x))
 
 refsbytes(len::Integer) = padding(sizeof(Int32)*len)
 refsbytes(x::AbstractVector) = refsbytes(length(x))
