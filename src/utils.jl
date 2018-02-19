@@ -101,6 +101,7 @@ function bitpack(A::AbstractVector{Bool})
     end
     v
 end
+bitpack(A::AbstractVector{Union{Bool,Missing}}) = bitpack(replace_missing_vals(A))
 export bitpack
 
 

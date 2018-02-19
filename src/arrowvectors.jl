@@ -78,15 +78,51 @@ unsafe_isnull(A::ArrowVector, idx::AbstractVector{<:Integer}) = Bool[unsafe_isnu
 
 
 """
+    getbit(A::Primitive, i)
+
+Get the `i`th bit of the primitive.  For example, for a `Primitive{UInt8]` the 10th bit is the second
+bit of the second value.
+"""
+function getbit(A::Primitive{J}, i::Integer) where J
+    a, b = divrem(i-1, 8sizeof(J)) .+ (1,1)
+    getbit(getvalue(A, a), b)
+end
+getbit(A::Primitive, idx::AbstractVector{<:Integer}) = Bool[getbit(A, i) for i ∈ idx]
+getbit(A::Primitive, idx::AbstractVector{Bool}) = Bool[getbit(A, i) for i ∈ 1:lenght(A) if idx[i]]
+
+
+function setbit!(A::Primitive{J}, x::Bool, i::Integer) where J
+    a, b = divrem(i-1, 8sizeof(J)) .+ (1,1)
+    byte = setbit(getvalue(A, a), x, b)
+    setvalue!(A, byte, a)
+end
+function setbit!(A::Primitive, x::AbstractVector{Bool}, idx::AbstractVector{<:Integer})
+    j = 1
+    for i ∈ idx
+        setbit!(A, x[j], i)
+        j += 1
+    end
+    x
+end
+function setbit!(A::Primitive, x::AbstractVector{Bool}, idx::AbstractVector{Bool})
+    j = 1
+    for i ∈ 1:length(A)
+        if idx[i]
+            setbit!(A, x[j], i)
+            j += 1
+        end
+    end
+    x
+end
+
+
+"""
     isnull(A::ArrowVector, idx)
 
 Check whether element(s) `idx` of `A` are null.
 """
 isnull(A::ArrowVector, i) = false
-function isnull(A::ArrowVector{Union{J,Missing}}, i::Integer) where J
-    a, b = divrem(i-1, 8) .+ (1,1)
-    !getbit(A.bitmask[a], b)
-end
+isnull(A::ArrowVector{Union{J,Missing}}, i::Integer) where J = !getbit(bitmask(A), i)
 isnull(A::ArrowVector, idx::AbstractVector{<:Integer}) = Bool[isnull(A, i) for i ∈ idx]
 isnull(A::ArrowVector, idx::AbstractVector{Bool}) = Bool[isnull(A, i) for i ∈ 1:length(A) if idx[i]]
 export isnull
@@ -102,11 +138,7 @@ function unsafe_rawbitmask(p::ArrowVector{Union{J,Missing}}) where J
 end
 
 
-function setnull!(A::ArrowVector{Union{J,Missing}}, x::Bool, i::Integer) where J
-    a, b = divrem(i-1, 8) .+ (1,1)
-    byte = setbit(getvalue(A.bitmask, a), !x, b)
-    setvalue!(A.bitmask, byte, a)
-end
+setnull!(A::ArrowVector{Union{J,Missing}}, x::Bool, i::Integer) where J = setbit!(bitmask(A), !x, i)
 
 # TODO these are flipped relative to each other which is super confusing
 function setnulls!(A::ArrowVector{Union{J,Missing}}, bytes::Vector{UInt8}) where J
@@ -246,6 +278,8 @@ function arrowformat end
 @_formats NullablePrimitive{Timestamp{Dates.Millisecond}} AbstractVector{Union{T,Missing}} T<:DateTime
 @_formats NullablePrimitive{TimeOfDay{Dates.Nanosecond,Int64}} AbstractVector{Union{T,Missing}} T<:Dates.Time
 @_formats DictEncoding CategoricalArray{T,1,U} T<:Any U
+@_formats BitPrimitive AbstractVector{J} J<:Bool
+@_formats NullableBitPrimitive AbstractVector{J} J<:Union{Bool,Missing}
 export arrowformat
 
 

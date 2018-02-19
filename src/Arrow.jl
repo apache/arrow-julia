@@ -27,6 +27,7 @@ include("lists.jl")
 include("arrowvectors.jl")
 include("datetime.jl")
 include("dictencoding.jl")
+include("bitprimitives.jl")
 
 
 #=~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
