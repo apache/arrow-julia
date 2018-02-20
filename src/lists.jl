@@ -445,11 +445,6 @@ function getvalue(l::AbstractList{T}, i::Integer) where {J,T<:Union{J,Union{J,Mi
     off, len = elparams(l, i)
     construct(J, l.values, off+1, len)
 end
-# NOTE! we break our "unsafe" rules here because WeakRefString is inherently unsafe
-function getvalue(l::AbstractList{T}, i::Integer) where {J<:WeakRefString,T<:Union{J,Union{J,Missing}}}
-    off, len = elparams(l, i)
-    unsafe_construct(J, l.values, off+1, len)
-end
 
 function getvalue(l::AbstractList{T}, idx::AbstractVector{<:Integer}
                  ) where {J,T<:Union{J,Union{J,Missing}}}

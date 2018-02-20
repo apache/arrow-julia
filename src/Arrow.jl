@@ -2,7 +2,7 @@ __precompile__(true)
 
 module Arrow
 
-using Missings, WeakRefStrings, CategoricalArrays
+using Missings, CategoricalArrays
 
 import Base: getindex, setindex!
 

@@ -379,9 +379,6 @@ Users must define new methods for new types `T`.
 function unsafe_construct(::Type{String}, A::Primitive{UInt8}, i::Integer, len::Integer)
     unsafe_string(convert(Ptr{UInt8}, valuespointer(A) + (i-1)), len)
 end
-function unsafe_construct(::Type{WeakRefString{J}}, A::Primitive{J}, i::Integer, len::Integer) where J
-    WeakRefString{J}(convert(Ptr{J}, valuespointer(A) + (i-1)), len)
-end
 
 function unsafe_construct(::Type{T}, A::NullablePrimitive{J}, i::Integer, len::Integer) where {T,J}
     nullexcept_inrange(A, i, i+len-1)
