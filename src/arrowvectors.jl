@@ -56,17 +56,6 @@ function nullcount(A::ArrowVector{Union{T,Missing}}) where T
 end
 export nullcount
 
-checkbounds(A::ArrowVector, i::Integer) = (1 ≤ i ≤ length(A)) || throw(BoundsError(A, i))
-# this is probably crazy in the general case, but should work well for unit ranges
-function checkbounds(A::ArrowVector, idx::AbstractVector{<:Integer})
-    for i ∈ idx
-        checkbounds(A, i)
-    end
-end
-function checkbounds(A::ArrowVector, idx::AbstractVector{Bool})
-    (length(A) ≠ length(idx)) && throw(ArgumentError("incorrect sized boolean indexer"))
-end
-
 
 """
     unsafe_isnull(A::ArrowVector, idx)
@@ -290,29 +279,29 @@ export arrowformat
 
 # TODO in 0.6, views have to use unsafe methods
 # TODO bounds checking is a disaster right now, clean it up
-function unsafe_view(l::ArrowVector{J}, i::Union{Integer,AbstractVector{<:Integer}}) where J
+@inline function unsafe_view(l::ArrowVector{J}, i::Union{<:Integer,AbstractVector{<:Integer}}) where J
     @boundscheck checkbounds(l, i)
     SubArray(unsafe_getvalue(l, i), (i,))
 end
 
 # TODO clean up bounds checking macros in 0.7
-function getindex(l::ArrowVector{J}, i::Integer) where J
+@inline function getindex(l::ArrowVector{J}, i::Union{<:Integer,AbstractVector{<:Integer}}) where J
     @boundscheck checkbounds(l, i)
     @inbounds o = getvalue(l, i)
     o
 end
-function getindex(l::ArrowVector{Union{J,Missing}}, i::Integer)::Union{J,Missing} where J
+@inline function getindex(l::ArrowVector{Union{J,Missing}}, i::Integer)::Union{J,Missing} where J
     @boundscheck checkbounds(l, i)
     @inbounds o = isnull(l, i) ? missing : getvalue(l, i)
     o
 end
-function getindex(l::ArrowVector{Union{J,Missing}}, idx::AbstractVector{<:Integer}) where J
+@inline function getindex(l::ArrowVector{Union{J,Missing}}, idx::AbstractVector{<:Integer}) where J
     @boundscheck checkbounds(l, idx)
     @inbounds v = convert(Vector{Union{J,Missing}}, getvalue(l, idx))
     @inbounds fillmissings!(v, l, idx)
     v
 end
-getindex(l::ArrowVector, ::Colon) = l[1:end]
+@inline getindex(l::ArrowVector, ::Colon) = l[1:end]
 
 
 """

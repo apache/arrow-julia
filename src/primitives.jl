@@ -259,6 +259,7 @@ end
 function unsafe_getvalue(A::Primitive{J}, idx::AbstractVector{Bool}) where J
     J[unsafe_getvalue(A, i) for i ∈ 1:length(A) if idx[i]]
 end
+unsafe_getvalue(A::Primitive, ::Colon) = unsafe_getvalue(A, 1:length(A))
 
 
 _rawvalueindex_start(A::Primitive{J}, i::Integer) where J = A.values_idx + (i-1)*sizeof(J)
