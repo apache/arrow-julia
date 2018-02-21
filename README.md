@@ -3,6 +3,8 @@
 This is a pure Julia implementation of the [Apache Arrow](https://arrow.apache.org) data standard.  This package provides Julia `AbstractVector` objects for
 referencing data that conforms to the Arrow standard.  This allows users to seamlessly interface Arrow formatted data with a great deal of existing Julia code.
 
+Please see this [document](https://arrow.apache.org/docs/memory_layout.html) for a description of the Arrow memory layout.
+
 ## Installation
 For now this package is not registered, so do
 ```julia
@@ -165,6 +167,20 @@ B = DictEncoding(["fire", "walk", "with", "me"])  # in this case there is no ben
 B = arrowformat(categorical(["fire", "walk", "with", "me"]))
 ```
 
+### The `BitPrimitive` and `NullableBitPrimitive` Types
+Because the Arrow format specifies that `Bool`s should be stored as single bits, a special type is required to store Arrow formatted `Bool` data.  These are
+analogous to the Julia `BitVector` object.  Note that there is nothing stopping you from serializing Julia `Bool` (which are 8-bit), but these will not in
+general be readable outside of Julia.  `arrowformat` will automatically convert `AbstractVector{Bool}` and `AbstractVector{Union{Bool,Missing}}` to
+`BitPrimitive` and `NullableBitPrimitive` respectively.  These types also provide the usual constructors as seen for the other types above.
+
+## Serializing Julia Data
+Nothing is stopping you from storing Julia bits-type data that is not necessarily specified by the Arrow format.  For example, a `Primitive{Complex128}` will
+work just as expected.  `ArrowVector` objects were deliberately designed so that the way they construct their output depends *only* on their type parameter.
+While `arrowformat` will pick the appropriate `ArrowVector` for Arrow formatting data, there are no "hidden conversions" happening under the hood: the type
+parameter of your `ArrowVector` object is what you get.  You can therefore serialize any type for which `isbits` is true.  In principle you can also serialize
+more complicated types using `List`s.  The only caveat is that any type not explicitly described in the Arrow standard will not in general be readable outside
+of Julia.
+
 
 ## Recommended Usage Pattern
 Because the Arrow standard is so general it is difficult for this package to provide general utilities for retrieving data.  Typically users will have to define
@@ -196,12 +212,20 @@ writepadded(io, B, references)  # writes references
 writepadded(io, levels(B), offsets, bitmask, values)  # writes the NullableList in a different order than above
 ```
 
+## DateTime
+Arrow.jl provides Arrow formatted date-time objects that have Julia equivalents.  These are `Arrow.Datestamp=>Dates.Date`, `Arrow.Timestamp=>Dates.DateTime` and
+`Arrow.TimeOfDay=>Dates.Time`.  The `arrowformat` function will automatically convert objects of the Julia `Dates` types to the appropriate Arrow format.  When
+constructing the various `ArrowVector` objects, this conversion must be specified explicitly, e.g. with `Primitive{TimeOfDay}(v)` where `v::Vector{Dates.Time}`.
+There is nothing stopping you from serializing the Julia `Dates` objects, but they are not in general readable outside of Julia.  The units in which `DateTime`
+and `TimeOfDay` are stored can be specified with `Dates.TimePeriod`s.  For example, to store a `DateTime` with resolution of seconds, one should do
+`convert(Timestamp{Dates.Second}, t)` where `t::DateTime`.
+
 ## Working Example
 For a working (but as of this writing still in-development) example of a package built with Arrow.jl see [this](https://github.com/ExpandingMan/Feather.jl/tree/arrow1) fork of Feather.jl.
 
 ## TODO
 A lot of work still to be done:
-- Currently do not support (Arrow formatted) `Bool`s. This will require a special `ArrowVector` type in order to achieve 1-bit addressability.
 - Performance pass: performance seems ok according to basic sanity checks but it that code has neither been optimized nor thoroughly benchmarked.  Note that currently Arrow.jl does *not* use pointers at all by default.  So far it seems that the penalty for this will be small, but it must be tested.
 - Extensive unit tests needed: hopefully I'll get to more of this soon.
 - This was developed using Julia 0.6 only, some changes will be needed in 0.7.  In particular, the behavior of `reinterpret` is quite different in 0.7.  Updates to 0.7 will probably include allowing `Primitive` to use any `AbstractVector{UInt8}` as reference.
+- Support Arrow Structs.
