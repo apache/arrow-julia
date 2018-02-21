@@ -18,7 +18,6 @@ copy(A::T) where T<:ArrowVector = T(A)
 Returns a pointer to the start of the values buffer for `A`.
 """
 valuespointer(A::ArrowVector) = valuespointer(A.values)
-export valuespointer
 
 
 """
@@ -27,7 +26,14 @@ export valuespointer
 Returns a pointer to the start of the bitmask buffer for `A`.
 """
 bitmaskpointer(A::ArrowVector{Union{J,Missing}}) where J = valuespointer(A.bitmask)
-export bitmaskpointer
+
+
+"""
+    offsetspointer(A::AbstractList)
+
+Returns a pointer to the start of the offsets buffer for `A`.
+"""
+offsetspointer(A::AbstractList) = valuespointer(A.offsets)
 
 
 """
@@ -57,17 +63,29 @@ end
 export nullcount
 
 
+function unsafe_getbit(A::Primitive{J}, i::Integer) where J
+    a, b = divrem(i-1, 8sizeof(J)) .+ (1,1)
+    getbit(unsafe_getvalue(A, a), b)
+end
+unsafe_getbit(A::Primitive, idx::AbstractVector{<:Integer}) = Bool[unsafe_getbit(A, i) for i ∈ idx]
+function unsafe_getbit(A::Primitive, idx::AbstractVector{Bool})
+    Bool[unsafe_getbit(A,i) for i ∈ 1:length(A) if idx[i]]
+end
+
+
 """
     unsafe_isnull(A::ArrowVector, idx)
 
 Check whether element(s) `idx` of `A` are null.
 """
 unsafe_isnull(A::ArrowVector, i::Integer) = false
-function unsafe_isnull(A::ArrowVector{Union{T,Missing}}, i::Integer) where T
-    a, b = divrem(i-1, 8) .+ (0,1)
-    !getbit(unsafe_load(bitmaskpointer(A) + a), b)
+unsafe_isnull(A::ArrowVector{Union{J,Missing}}, i::Integer) where J = !unsafe_getbit(bitmask(A), i)
+function unsafe_isnull(A::ArrowVector{Union{J,Missing}}, idx::AbstractVector{<:Integer}) where J
+    Bool[unsafe_isnull(A, i) for i ∈ idx]
 end
-unsafe_isnull(A::ArrowVector, idx::AbstractVector{<:Integer}) = Bool[unsafe_isnull(A, i) for i ∈ idx]
+function unsafe_isnull(A::AbstractVector{Union{J,Missing}}, idx::AbstractVector{Bool}) where J
+    Bool[unsafe_isnull(A, i) for i ∈ 1:length(A) if idx[i]]
+end
 
 
 """

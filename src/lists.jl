@@ -352,7 +352,7 @@ rawvalues(p::AbstractList) = rawvalues(p.values)
 
 Get the offset for element `i`.  Contains a call to `unsafe_load`.
 """
-unsafe_getoffset(l::AbstractList, i::Integer) = unsafe_load(convert(Ptr{Int32}, l.offsets), i)
+unsafe_getoffset(l::AbstractList, i::Integer) = unsafe_load(convert(Ptr{Int32}, offsetspointer(l)), i)
 
 
 """
@@ -428,15 +428,15 @@ function elparams(l::AbstractList, i::Integer)
 end
 
 
-function unsafe_getvalue(l::Union{List{P,K},NullableList{P,K}}, i::Integer) where {P,K}
+function unsafe_getvalue(l::Union{List{J,P},NullableList{J,P}}, i::Integer) where {J,P}
     off, len = unsafe_elparams(l, i)
-    unsafe_construct(K, l.values, off+1, len)
+    unsafe_construct(J, l.values, off+1, len)
 end
-function unsafe_getvalue(l::Union{List{P,K},NullableList{P,K}},
-                         idx::AbstractVector{<:Integer}) where {P,K}
+function unsafe_getvalue(l::Union{List{J,P},NullableList{J,P}},
+                         idx::AbstractVector{<:Integer}) where {J,P}
     String[unsafe_getvalue(l, i) for i ∈ idx]
 end
-function unsafe_getvalue(l::List{P,K}, idx::AbstractVector{Bool}) where {P,K}
+function unsafe_getvalue(l::List{J,P}, idx::AbstractVector{Bool}) where {J,P}
     String[unsafe_getvalue(l, i) for i ∈ 1:length(l) if idx[i]]
 end
 
