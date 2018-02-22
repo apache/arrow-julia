@@ -294,29 +294,27 @@ function arrowformat end
 arrowformat(A::ArrowVector) = copy(A)
 export arrowformat
 
+# TODO clean up bounds checking
 
-# TODO in 0.6, views have to use unsafe methods
-# TODO bounds checking is a disaster right now, clean it up
-@inline function unsafe_view(l::ArrowVector{J}, i::Union{<:Integer,AbstractVector{<:Integer}}) where J
+@inline function view(l::ArrowVector{J}, i::AbstractVector{<:Integer}) where J
     @boundscheck checkbounds(l, i)
     SubArray(unsafe_getvalue(l, i), (i,))
 end
 
-# TODO clean up bounds checking macros in 0.7
 @inline function getindex(l::ArrowVector{J}, i::Union{<:Integer,AbstractVector{<:Integer}}) where J
     @boundscheck checkbounds(l, i)
-    @inbounds o = getvalue(l, i)
+    @inbounds o = unsafe_getvalue(l, i)
     o
 end
 @inline function getindex(l::ArrowVector{Union{J,Missing}}, i::Integer)::Union{J,Missing} where J
     @boundscheck checkbounds(l, i)
-    @inbounds o = isnull(l, i) ? missing : getvalue(l, i)
+    @inbounds o = unsafe_isnull(l, i) ? missing : unsafe_getvalue(l, i)
     o
 end
 @inline function getindex(l::ArrowVector{Union{J,Missing}}, idx::AbstractVector{<:Integer}) where J
     @boundscheck checkbounds(l, idx)
-    @inbounds v = convert(Vector{Union{J,Missing}}, getvalue(l, idx))
-    @inbounds fillmissings!(v, l, idx)
+    @inbounds v = convert(Vector{Union{J,Missing}}, unsafe_getvalue(l, idx))
+    @inbounds unsafe_fillmissings!(v, l, idx)
     v
 end
 @inline getindex(l::ArrowVector, ::Colon) = l[1:end]

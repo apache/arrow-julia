@@ -352,7 +352,7 @@ rawvalues(p::AbstractList) = rawvalues(p.values)
 
 Get the offset for element `i`.  Contains a call to `unsafe_load`.
 """
-unsafe_getoffset(l::AbstractList, i::Integer) = unsafe_load(convert(Ptr{Int32}, offsetspointer(l)), i)
+unsafe_getoffset(l::AbstractList, i) = unsafe_getvalue(offsets(l), i)
 
 
 """
@@ -360,7 +360,7 @@ unsafe_getoffset(l::AbstractList, i::Integer) = unsafe_load(convert(Ptr{Int32}, 
 
 Retreive the raw offstets for `p` as a `Vector{UInt8}`.
 """
-unsafe_rawoffsets(p::AbstractList) = unsafe_rawpadded(p.offsets, offsetsbytes(p))
+unsafe_rawoffsets(p::AbstractList) = unsafe_rawpadded(offsetspointer(p), offsetsbytes(p))
 
 
 """
@@ -378,9 +378,7 @@ export getoffset
 
 Set offset `i` to `off`.  Contains a call to `unsafe_store!`.
 """
-function unsafe_setoffset!(l::AbstractList, off::Int32, i::Integer)
-    unsafe_store!(convert(Ptr{Int32}, l.offsets), off, i)
-end
+unsafe_setoffset!(l::AbstractList, off::Int32, i::Integer) = unsafe_setvalue!(offsets(l), off, i)
 
 
 setoffset!(l::AbstractList, off::Int32, i::Integer) = setindex!(l.offsets, off, i)
@@ -428,12 +426,12 @@ function elparams(l::AbstractList, i::Integer)
 end
 
 
-function unsafe_getvalue(l::Union{List{J,P},NullableList{J,P}}, i::Integer) where {J,P}
+function unsafe_getvalue(l::AbstractList{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
     off, len = unsafe_elparams(l, i)
-    unsafe_construct(J, l.values, off+1, len)
+    unsafe_construct(J, values(l), off+1, len)
 end
-function unsafe_getvalue(l::Union{List{J,P},NullableList{J,P}},
-                         idx::AbstractVector{<:Integer}) where {J,P}
+function unsafe_getvalue(l::AbstractList{T}, idx::AbstractVector{<:Integer}
+                        ) where {J,T<:Union{J,Union{J,Missing}}}
     String[unsafe_getvalue(l, i) for i ∈ idx]
 end
 function unsafe_getvalue(l::List{J,P}, idx::AbstractVector{Bool}) where {J,P}

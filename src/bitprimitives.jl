@@ -78,6 +78,7 @@ end
 NullableBitPrimitive(b::NullableBitPrimitive) = NullableBitPrimitive(b.length, b.bitmask, b.values)
 
 
+unsafe_getvalue(A::AbstractBitPrimitive, idx) = unsafe_getbit(values(A), idx)
 
 getvalue(A::AbstractBitPrimitive, idx) = getbit(values(A), idx)
 setvalue!(A::AbstractBitPrimitive, x::Bool, i::Integer) = setbit!(values(A), x, i)

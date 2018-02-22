@@ -1,7 +1,10 @@
 
 # TODO is this really a reasonable default way of doing nulls?
 
-const ReferenceType = AbstractPrimitive{T} where T<:Union{Int32,Union{Int32,Missing}}
+import CategoricalArrays.categorical
+
+
+const ReferenceType{J} = AbstractPrimitive{T} where {J<:Integer,T<:Union{J,Union{J,Missing}}}
 
 
 """
@@ -74,6 +77,10 @@ DictEncoding{J}(d::DictEncoding{T}) where {J,T} = DictEncoding{J}(convert(Abstra
 DictEncoding(d::DictEncoding{J}) where J = DictEncoding{J}(d)
 
 
+referencetype(d::DictEncoding{J,R,P}) where {J,K,R<:ReferenceType{K},P} = K
+export referencetype
+
+
 length(d::DictEncoding) = length(d.refs)
 
 references(d::DictEncoding) = d.refs
@@ -94,15 +101,48 @@ end
 isnull(d::DictEncoding, i::Integer) = isnull(d.refs, i)
 isnull(d::DictEncoding, idx::AbstractVector{<:Integer}) = isnull(d.refs, idx)
 
-function getindex(d::DictEncoding{J}, i::Integer)::J where J
-    isnull(d, i) ? missing : d.pool[d.refs[i]+1]
+unsafe_isnull(d::DictEncoding, i::Integer) = unsafe_isnull(d.refs, i)
+usnafe_isnull(d::DictEncoding, idx::AbstractVector{<:Integer}) = unsafe_isnull(d.refs, idx)
+
+
+# helper function for categorical
+function _getrefsvec(d::DictEncoding{J,R}, idx::AbstractVector{<:Integer}
+                    ) where {J,R<:ArrowVector}
+    d.refs[idx] .+ 1
+end
+function _getrefsvec(d::DictEncoding{J,R}, idx::AbstractVector{<:Integer}
+                    ) where {J,K,R<:ArrowVector{Union{K,Missing}}}
+    K[ismissing(x) ? zero(K) : x+1 for x ∈ d.refs]
+end
+
+# for now this always transfers the entire pool
+function categorical(d::DictEncoding{J,R}, idx::AbstractVector{<:Integer}
+                    ) where {L,J<:Union{L,Union{L,Missing}},K,R<:ReferenceType{K}}
+    p = CategoricalPool{L,K}(convert(Vector, d.pool))
+    refs = _getrefsvec(d, idx)
+    CategoricalArray{J,1}(refs, p)
+end
+categorical(d::DictEncoding) = categorical(d, 1:length(d))
+
+
+convert(::Type{CategoricalArray}, d::DictEncoding{J,R}) where {J,K,R<:ReferenceType{K}} = categorical(d)
+
+
+@inline function getindex(d::DictEncoding{J}, i::Integer)::J where J
+    @boundscheck checkbounds(d, i)
+    unsafe_isnull(d, i) ? missing : d.pool[d.refs[i]+1]
 end
 function getindex(d::DictEncoding{J}, idx::AbstractVector{<:Integer}) where J
-    J[getindex(d, i) for i ∈ idx]
+    @boundscheck checkbounds(d, idx)
+    @inbounds o = J[getindex(d, i) for i ∈ idx]
+    o
 end
 function getindex(d::DictEncoding{J}, idx::AbstractVector{Bool}) where J
-    J[getindex(d, i) for i ∈ 1:length(d) if idx[i]]
+    @boundscheck checkbounds(d, idx)
+    @inbounds o = J[getindex(d, i) for i ∈ 1:length(d) if idx[i]]
+    o
 end
+getindex(d::DictEncoding, ::Colon) = categorical(d)
 
 
 nullcount(d::DictEncoding{Union{J,Missing}}) where J = nullcount(d.refs)

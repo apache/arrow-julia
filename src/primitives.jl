@@ -239,6 +239,11 @@ end
 export totalbytes
 
 
+function unsafe_getvalue_contiguous(A::AbstractPrimitive{T}, idx::AbstractVector{<:Integer}
+                                   ) where {J,T<:Union{J,Union{J,Missing}}}
+    ptr = convert(Ptr{J}, valuespointer(A)) + (first(idx)-1)*sizeof(J)
+    unsafe_wrap(Array, ptr, length(idx))
+end
 
 """
     unsafe_getvalue(A::ArrowVector, i)
@@ -251,10 +256,13 @@ This typically involves a call to `unsafe_load` or `unsafe_wrap`.
 function unsafe_getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, i::Integer)::J where J
     unsafe_load(convert(Ptr{J}, valuespointer(A)), i)
 end
-function unsafe_getvalue(A::Union{Primitive{J},NullablePrimitive{J}},
-                         idx::AbstractVector{<:Integer}) where J
-    ptr = convert(Ptr{J}, valuespointer(A)) + (idx[1]-1)*sizeof(J)
-    unsafe_wrap(Array, ptr, length(idx))
+function unsafe_getvalue(A::AbstractPrimitive{T}, idx::UnitRange{<:Integer}
+                        ) where {J,T<:Union{J,Union{J,Missing}}}
+    unsafe_getvalue_contiguous(A, idx)
+end
+function unsafe_getvalue(A::AbstractPrimitive{T}, idx::AbstractVector{<:Integer}
+                        ) where {J,T<:Union{J,Union{J,Missing}}}
+    J[unsafe_getvalue(A, i) for i ∈ idx]
 end
 function unsafe_getvalue(A::Primitive{J}, idx::AbstractVector{Bool}) where J
     J[unsafe_getvalue(A, i) for i ∈ 1:length(A) if idx[i]]
@@ -380,10 +388,12 @@ Users must define new methods for new types `T`.
 function unsafe_construct(::Type{String}, A::Primitive{UInt8}, i::Integer, len::Integer)
     unsafe_string(convert(Ptr{UInt8}, valuespointer(A) + (i-1)), len)
 end
-
-function unsafe_construct(::Type{T}, A::NullablePrimitive{J}, i::Integer, len::Integer) where {T,J}
-    nullexcept_inrange(A, i, i+len-1)
-    unsafe_construct(T, A, i, len)
+# this is a fallback for other types and is safe
+function unsafe_construct(::Type{T}, A::AbstractPrimitive, i::Integer, len::Integer) where T
+    construct(T, A, i, len)
+end
+function unsafe_construct(::Type{T}, A::NullablePrimitive, i::Integer, len::Integer) where T
+    throw(ErrorException("Unsafely constructing objects from NullablePrimitves is not supported."))
 end
 
 
