@@ -18,7 +18,7 @@ end
 
 function benches1()
     A = reinterpret(UInt8, rand(Int64, L))
-    
+
     info("performing wrap benchmark...")
     global b_wrap = @benchmark wrap(Int64, $L, $A)
 
@@ -46,9 +46,15 @@ end
 
 
 function benches2()
-    A = randmissings(Int, 32)
+    A = String[randstring(rand(4:12)) for i ∈ 1:L]
+
+    l = NullableList(A)
+
+    info("performing Arrow benchmark...")
+    global b_arrow = @benchmark Arrow.getindex($l, 1:$L)
 end
 
 
-benches1()
+# benches1()
+benches2()
 

@@ -72,7 +72,6 @@ Primitive(p::Primitive{J}) where J = Primitive{J}(p)
 Returns a pointer to the very start of the data buffer for `A` (i.e. does not depend on indices).
 """
 datapointer(A::Primitive) = pointer(A.data)
-export datapointer
 
 valuespointer(A::Primitive) = datapointer(A) + A.values_idx - 1
 
