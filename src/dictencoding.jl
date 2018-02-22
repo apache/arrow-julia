@@ -107,8 +107,8 @@ usnafe_isnull(d::DictEncoding, idx::AbstractVector{<:Integer}) = unsafe_isnull(d
 
 # helper function for categorical
 function _getrefsvec(d::DictEncoding{J,R}, idx::AbstractVector{<:Integer}
-                    ) where {J,R<:ArrowVector}
-    d.refs[idx] .+ 1
+                    ) where {J,K,R<:ArrowVector{K}}
+    convert(Vector{K}, d.refs[idx] .+ one(K))
 end
 function _getrefsvec(d::DictEncoding{J,R}, idx::AbstractVector{<:Integer}
                     ) where {J,K,R<:ArrowVector{Union{K,Missing}}}
