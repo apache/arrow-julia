@@ -5,6 +5,12 @@ referencing data that conforms to the Arrow standard.  This allows users to seam
 
 Please see this [document](https://arrow.apache.org/docs/memory_layout.html) for a description of the Arrow memory layout.
 
+***WARNING*** As of right now this package uses Julia `Ptr` (pointer) objects and "unsafe" methods.  This is for performance reasons.  Hopefully this will
+change once this package is adapted for Julia 0.7 (should happen soon).  While Arrow.jl has been tested and should be safe with proper usage, it is up to the
+user to make sure that their Arrow.jl objects reference the appropriate locations in data.  If the user, for example, uses an Arrow.jl object to reference data
+past the end of an array, the resulting program will segfault!  Fortunately writing is safe, so you will not be able to write past the ends of a buffer.
+
+
 ## Installation
 For now this package is not registered, so do
 ```julia
@@ -166,6 +172,9 @@ B = DictEncoding(["fire", "walk", "with", "me"])  # in this case there is no ben
 # arrowformat will automatically convert any CategoricalArray object to an Arrow formatted DictEncoding
 B = arrowformat(categorical(["fire", "walk", "with", "me"]))
 ```
+Note that indexing a `DictEncoding{T}` object will return objects of type `T` or `Vector{T}`.  The only exception is when indexing with a `:`, `A[:]`, in which
+case a `CategoricalArray` will be returned (equivalently, this can be done with `categorical(A)`.  In order to retrieve slices as `CategoricalArray`, one should
+use the `categorical` function, e.g. `categorical(A, slice)`.
 
 ### The `BitPrimitive` and `NullableBitPrimitive` Types
 Because the Arrow format specifies that `Bool`s should be stored as single bits, a special type is required to store Arrow formatted `Bool` data.  These are
@@ -225,7 +234,7 @@ For a working (but as of this writing still in-development) example of a package
 
 ## TODO
 A lot of work still to be done:
-- Performance pass: performance seems ok according to basic sanity checks but it that code has neither been optimized nor thoroughly benchmarked.  Note that currently Arrow.jl does *not* use pointers at all by default.  So far it seems that the penalty for this will be small, but it must be tested.
+- Performance pass: performance seems ok according to basic sanity checks but it that code has neither been optimized nor thoroughly benchmarked.
 - Extensive unit tests needed: hopefully I'll get to more of this soon.
 - This was developed using Julia 0.6 only, some changes will be needed in 0.7.  In particular, the behavior of `reinterpret` is quite different in 0.7.  Updates to 0.7 will probably include allowing `Primitive` to use any `AbstractVector{UInt8}` as reference.
 - Support Arrow Structs.
