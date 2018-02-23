@@ -261,10 +261,11 @@ function unsafe_getvalue(A::AbstractPrimitive{T}, idx::UnitRange{<:Integer}
 end
 function unsafe_getvalue(A::AbstractPrimitive{T}, idx::AbstractVector{<:Integer}
                         ) where {J,T<:Union{J,Union{J,Missing}}}
-    J[unsafe_getvalue(A, i) for i ∈ idx]
+    T[unsafe_getvalue(A, i) for i ∈ idx]
 end
-function unsafe_getvalue(A::Primitive{J}, idx::AbstractVector{Bool}) where J
-    J[unsafe_getvalue(A, i) for i ∈ 1:length(A) if idx[i]]
+function unsafe_getvalue(A::AbstractPrimitive{T}, idx::AbstractVector{Bool}
+                        ) where {J,T<:Union{J,Union{J,Missing}}}
+    T[unsafe_getvalue(A, i) for i ∈ 1:length(A) if idx[i]]
 end
 unsafe_getvalue(A::Primitive, ::Colon) = unsafe_getvalue(A, 1:length(A))
 

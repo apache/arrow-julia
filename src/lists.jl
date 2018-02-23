@@ -432,10 +432,11 @@ function unsafe_getvalue(l::AbstractList{T}, i::Integer) where {J,T<:Union{J,Uni
 end
 function unsafe_getvalue(l::AbstractList{T}, idx::AbstractVector{<:Integer}
                         ) where {J,T<:Union{J,Union{J,Missing}}}
-    String[unsafe_getvalue(l, i) for i ∈ idx]
+    T[unsafe_getvalue(l, i) for i ∈ idx]
 end
-function unsafe_getvalue(l::List{J,P}, idx::AbstractVector{Bool}) where {J,P}
-    String[unsafe_getvalue(l, i) for i ∈ 1:length(l) if idx[i]]
+function unsafe_getvalue(l::AbstractList{T}, idx::AbstractVector{Bool}
+                        ) where {J,T<:Union{J,Union{J,Missing}}}
+    T[unsafe_getvalue(l, i) for i ∈ 1:length(l) if idx[i]]
 end
 
 
