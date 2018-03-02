@@ -32,6 +32,8 @@ struct Primitive{J} <: AbstractPrimitive{J}
 end
 export Primitive
 
+IndexStyle(::Type{<:Primitive}) = IndexLinear()
+
 function Primitive{J}(data::Vector{UInt8}, i::Integer, len::Integer) where J
     @boundscheck check_buffer_bounds(J, data, i, len)
     Primitive{J}(len, i, data)
