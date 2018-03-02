@@ -256,6 +256,7 @@ done(A::ArrowVector, i::Integer) = i > length(A)
 convert(::Type{Array{T}}, A::ArrowVector{T}) where T = A[:]
 convert(::Type{Vector{T}}, A::ArrowVector{T}) where T = A[:]
 
+IndexStyle(::Type{<:ArrowVector}) = IndexLinear()
 
 # macro for creating arrowformat functions
 macro _formats(constructor, argtype, w...)

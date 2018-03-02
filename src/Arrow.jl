@@ -12,6 +12,7 @@ const ALIGNMENT = 8
 
 import Base: convert, show, unsafe_string, checkbounds, write, values, copy
 import Base: length, endof, size, eltype, start, next, done, getindex, isassigned, view
+import Base: IndexStyle
 import Base: >, ≥, <, ≤, ==
 import Base.isnull # this will be removed in 0.7
 import CategoricalArrays.levels
