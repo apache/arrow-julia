@@ -6,42 +6,117 @@ if VERSION < v"0.7.0-"
 end
 
 const SEED = 999
-const PRIMITIVE_ELTYPES = [Float32, Float64, Int32, Int64, UInt16]
+
+# number of tests
+const N_OUTER = 4
+const N_IDX_CHECK = 32
+const MAX_IDX_LEN = 32
+const MAX_VECTOR_LENGTH = 256
 
 srand(SEED)
 
+include("testutils.jl")
 
-@testset "Primitive" begin
-    for i ∈ 1:3
+
+@testset "PrimitiveAccess" begin
+    for i ∈ 1:N_OUTER
+        len, dtype, lpad, b, v = rand_primitive_buffer()
+        p = Primitive{dtype}(b, lpad+1, len)
+        # integer indices
+        for j ∈ 1:N_IDX_CHECK
+            k = rand(1:len)
+            @test p[k] == v[k]
+        end
+        # AbstractVector{<:Integer} indices
+        for j ∈ 1:N_IDX_CHECK
+            idx = rand(1:len, rand(1:MAX_IDX_LEN))
+            @test p[idx] == v[idx]
+        end
+    end
+end
+
+
+@testset "PrimitiveConstruct" begin
+    for i ∈ 1:N_OUTER
         dtype = rand(PRIMITIVE_ELTYPES)
-        len = rand(32:256)
+        len = rand(1:MAX_VECTOR_LENGTH)
         v = rand(dtype, len)
-        b = convert(Vector{UInt8}, reinterpret(UInt8, v))
-        A = Primitive{dtype}(b, 1, len)
-        for j ∈ 1:8
+        p = Primitive(v)
+        # integer indices
+        for j ∈ 1:N_IDX_CHECK
             k = rand(1:len)
-            @test A[k] == v[k]
+            @test p[k] == v[k]
+        end
+        # AbstractVector{<:Integer} indices
+        for j ∈ 1:N_IDX_CHECK
+            idx = rand(1:len, rand(1:MAX_IDX_LEN))
+            @test p[idx] == v[idx]
         end
     end
 end
 
 
-# TODO finish setting up this test!
-@testset "NullablePrimitives" begin
-    for i ∈ 1:3
+@testset "NullablePrimitiveAccess" begin
+    for i ∈ 1:N_OUTER
+        len, dtype, bmask, lpad, b, v = rand_nullableprimitive_buffer()
+        p = NullablePrimitive{dtype}(b, 1+lpad, 1+bmask+lpad, len)
+        # integer indices
+        for j ∈ 1:N_IDX_CHECK
+            k = rand(1:len)
+            @test (ismissing(p[k]) && ismissing(v[k])) || (p[k] == v[k])
+        end
+        # AbstractVector{<:Integer} indices
+        for j ∈ 1:N_IDX_CHECK
+            idx = rand(1:len, rand(1:MAX_IDX_LEN))
+            sp = p[idx]
+            sv = v[idx]
+            ssp = collect(skipmissing(sp))
+            ssv = collect(skipmissing(sv))
+            @test length(sp) == length(sv) && ssp == ssv
+        end
+    end
+end
+
+
+@testset "NullablePrimitiveConstruct" begin
+    for i ∈ 1:N_OUTER
         dtype = rand(PRIMITIVE_ELTYPES)
-        len = rand(32:256)
-        pres = rand(Bool, len)
-        mask = bitpack(pres)
-        vraw = rand(dtype, len)
-        data = vcat(mask, reinterpret(UInt8, vraw))
-        b = convert(Vector{UInt8}, data)
-        A = NullablePrimitive{dtype}(b, 1, length(mask)+1, len)
-        for j ∈ 1:8
+        len = rand(1:MAX_VECTOR_LENGTH)
+        v = Union{dtype,Missing}[rand(Bool) ? missing : rand(dtype) for i ∈ 1:len]
+        p = NullablePrimitive(v)
+        # integer indices
+        for j ∈ 1:N_IDX_CHECK
             k = rand(1:len)
-            # strict equality should work even for floats in this case
-            @test pres[k] ? (A[k] == vraw[k]) : ismissing(A[k])
+            @test (ismissing(p[k]) && ismissing(v[k])) || (p[k] == v[k])
+        end
+        for j ∈ 1:N_IDX_CHECK
+            idx = rand(1:len, rand(1:MAX_IDX_LEN))
+            sp = p[idx]
+            sv = v[idx]
+            ssp = collect(skipmissing(sp))
+            ssv = collect(skipmissing(sv))
+            @test length(sp) == length(sv) && ssp == ssv
         end
     end
 end
 
+
+# @testset "ListAccess" begin
+#     len  = 5
+#     offs = Int32[0,4,7,8,12,14]
+#     vals = convert(Vector{UInt8}, codeunits("firewalkwithme"))
+#     lpad = randpad()
+#     rpad = randpad()
+#     b = vcat(lpad, convert(Vector{UInt8}, reinterpret(UInt8, offs)), vals, rpad)
+#     l = List{String}(b, 1+length(lpad), 1+length(lpad)+sizeof(Int32)*length(offs),
+#                      len, UInt8, length(vals))
+#     @test offsets(l)[:] == offs
+#     @test values(l)[:] == vals
+#     @test l[1] == "fire"
+#     @test l[2] == "wal"
+#     @test l[3] == "k"
+#     @test l[4] == "with"
+#     @test l[5] == "me"
+#     @test l[[1,3,5]] == ["fire", "k", "me"]
+#     @test l[[false,true,false,true,false]] = ["wal", "with"]
+# end

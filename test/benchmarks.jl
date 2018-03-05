@@ -1,5 +1,4 @@
 using Arrow
-using Missings
 using BenchmarkTools
 
 const L = 10^7
@@ -17,15 +16,15 @@ end
 
 
 function benches1()
-    A = reinterpret(UInt8, rand(Int64, L))
+    A = convert(Vector{UInt8}, reinterpret(UInt8, rand(Int64, L)))
 
-    info("performing wrap benchmark...")
+    @info("performing wrap benchmark...")
     global b_wrap = @benchmark wrap(Int64, $L, $A)
 
-    info("performing wrap benchmark with missings...")
+    @info("performing wrap benchmark with missings...")
     global b_wrap_missing = @benchmark convert(Vector{Union{Int,Missing}}, wrap(Int, $L, $A))
     
-    info("performing reinterpret benchmark...")
+    @info("performing reinterpret benchmark...")
     global b_reint = @benchmark reinterpret(Int64, $A)
     
 
@@ -33,12 +32,14 @@ function benches1()
 
     bmask = zeros(UInt8, Arrow.bitmaskbytes(L))
     A2 = vcat(bmask, A)
-    p2 = NullablePrimitive{Int64}(A2, 1, length(bmask+1), L)
+    println(pointer(A2))
+    p2 = NullablePrimitive{Int64}(A2, 1, length(bmask)+1, L)
+    println(Arrow.valuespointer(p2))
     
-    info("performing Arrow benchmark...")
+    @info("performing Arrow benchmark...")
     global b_arrow = @benchmark Arrow.getindex($p, 1:($L-1))
 
-    info("performing Arrow nullable benchmark...")
+    @info("performing Arrow nullable benchmark...")
     global b_arrow2 = @benchmark Arrow.getindex($p2, 1:($L-1))
 
     global b_idx = @benchmark Arrow.rawvalueindex($p, 1:length($p))
@@ -55,6 +56,6 @@ function benches2()
 end
 
 
-# benches1()
-benches2()
+benches1()
+# benches2()
 

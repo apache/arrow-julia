@@ -26,28 +26,29 @@ If `Array` is provided as the virst argument, the data will be allocated contigu
 ` `v`: existing reference data. constructors with will reference the original `v` as `data`
 """
 struct Primitive{J} <: AbstractPrimitive{J}
-    length::Int32
+    length::Int
     values_idx::Int64
     data::Vector{UInt8}
 end
 export Primitive
 
-function Primitive{J}(data::Vector{UInt8}, i::Integer, len::Integer) where J
+function Primitive{J}(data::AbstractVector{UInt8}, i::Integer, len::Integer) where J
     @boundscheck check_buffer_bounds(J, data, i, len)
-    Primitive{J}(len, i, data)
+    Primitive{J}(Int(len), Int(i), data)
 end
-function Primitive(data::Vector{UInt8}, i::Integer, x::AbstractVector{J}) where J
+function Primitive(data::AbstractVector{UInt8}, i::Integer, x::AbstractVector{J}) where J
     p = Primitive{J}(data, i, length(x))
     p[:] = x
     p
 end
-function Primitive{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{K}) where {J,K}
+function Primitive{J}(data::AbstractVector{UInt8}, i::Integer, x::AbstractVector{K}) where {J,K}
     Primitive(data, i, convert(AbstractVector{J}, x))
 end
 
 # view of reinterpreted, will not include padding
 function Primitive(v::AbstractVector{J}) where J
-    b = reinterpret(UInt8, v)
+    # TODO in a future version this conversion will not be needed
+    b = convert(Vector{UInt8}, reinterpret(UInt8, v))
     Primitive{J}(b, 1, length(v))
 end
 function Primitive{J}(v::AbstractVector{T}) where {J,T}
@@ -110,7 +111,7 @@ contiguously allocated within a single array (bit mask first, then values).
 - `x`, `v`: values to be stored in data
 """
 struct NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
-    length::Int32
+    length::Int
     bitmask::Primitive{UInt8}
     values::Primitive{J}
 end

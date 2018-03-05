@@ -49,17 +49,23 @@ function setbit(byte::UInt8, x::Bool, i::Integer)
     end
 end
 
+# helper function for encode
+_encodesingle(::Type{C}, x) where {C} = convert(Vector{C}, x)
+_encodesingle(::Type{C}, x::AbstractString) where {C} = convert(Vector{C}, codeunits(x))
 
+# TODO: make this more general so it can be used everywhere
 """
     encode(::Type{C}, v::AbstractVector{J})
 
 Attempt to encode the data in `v` as a `Vector{C}`. This requires that if `convert(Vector{C}, x)` is
 valid where `x ∈ v`.  Nothing is stored for cases where `x == missing`.
 """
-encode(::Type{C}, v::AbstractVector{J}) where {C,J} = mapreduce(x -> convert(Vector{C}, x), vcat, v)
+function encode(::Type{C}, v::AbstractVector{J}) where {C,J}
+    mapreduce(x -> _encodesingle(C, x), vcat, v)
+end
 function encode(::Type{C}, v::AbstractVector{Union{J,Missing}}) where {C,J}
     mapreduce(vcat, v) do x
-        ismissing(x) ? Vector{C}(0) : convert(Vector{C}, x)
+        ismissing(x) ? Vector{C}(uninitialized, 0) : _encodesingle(C, x)
     end
 end
 
@@ -105,7 +111,12 @@ bitpack(A::AbstractVector{Union{Bool,Missing}}) = bitpack(replace_missing_vals(A
 export bitpack
 
 
-bitmask(A::AbstractVector) = bitpack(map(x -> !ismissing(x), A))
+bitmask(A::AbstractVector) = bitpack(.!ismissing.(A))
+function bitmaskpadded(A::AbstractVector)
+    nbytes = bytesforbits(length(A))
+    npad = padding(nbytes) - nbytes
+    vcat(bitpack(.!ismissing.(A)), zeros(UInt8, npad))
+end
 
 
 """

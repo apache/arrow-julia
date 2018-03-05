@@ -40,7 +40,7 @@ Note that by default, `List`s of strings will be encoded in UTF-8.
 - `x`, `v`: array to be stored or converted
 """
 struct List{J,P<:AbstractPrimitive} <: AbstractList{J}
-    length::Int32
+    length::Int
     offsets::Primitive{Int32}
     values::P
 end
@@ -167,7 +167,7 @@ If `Array` is given as an argument, a contiguous array will be allocated to stor
 - `x`, `v`: array to be stored by the `NullableList`
 """
 struct NullableList{J,P<:AbstractPrimitive} <: AbstractList{Union{Missing,J}}
-    length::Int32
+    length::Int
     bitmask::Primitive{UInt8}
     offsets::Primitive{Int32}
     values::P
