@@ -90,7 +90,7 @@ function bitpack(A::AbstractVector{Bool})
     a, b = divrem(length(A), 8)
     trailing = b > 0
     nbytes = a + Int(trailing)
-    v = Vector{UInt8}(nbytes)
+    v = Vector{UInt8}(uninitialized, nbytes)
     for i ∈ 1:a
         k = (i-1)*8 + 1
         v[i] = _bitpack_byte(view(A, k:(k+7)), 8)

@@ -2,20 +2,26 @@ __precompile__(true)
 
 module Arrow
 
-using Missings, CategoricalArrays
+using CategoricalArrays, Compat, Compat.Dates
 
-import Base: getindex, setindex!
 
 const BITMASK = UInt8[1, 2, 4, 8, 16, 32, 64, 128]
 const ALIGNMENT = 8
 
 
+import Base: getindex, setindex!
 import Base: convert, show, unsafe_string, checkbounds, write, values, copy
 import Base: length, endof, size, eltype, start, next, done, getindex, isassigned, view
 import Base: IndexStyle
 import Base: >, ≥, <, ≤, ==
-import Base.isnull # this will be removed in 0.7
-import CategoricalArrays.levels
+import CategoricalArrays: levels
+
+
+if VERSION ≥ v"0.7.0-"
+else
+    using Missings
+    import Base: isnull
+end
 
 
 abstract type ArrowVector{T} <: AbstractVector{T} end

@@ -99,7 +99,7 @@ end
 List(data::Vector{UInt8}, i::Integer, x::AbstractVector{<:AbstractString}) = List(data, i, UInt8, x)
 
 function List{J}(::Type{<:Array}, ::Type{C}, x::AbstractVector) where {C,J}
-    b = Vector{UInt8}(totalbytes(C, x))
+    b = Vector{UInt8}(uninitialized, totalbytes(C, x))
     List{J}(b, 1, C, x)
 end
 function List(::Type{<:Array}, ::Type{C}, x::AbstractVector{J}) where {C,J}
@@ -242,7 +242,7 @@ function NullableList(data::Vector{UInt8}, i::Integer, x::AbstractVector{T};
 end
 
 function NullableList{J}(::Type{<:Array}, ::Type{C}, x::AbstractVector) where {C,J}
-    b = Vector{UInt8}(minbytes(C, x))
+    b = Vector{UInt8}(uninitialized, minbytes(C, x))
     NullableList{J}(b, 1, C, x)
 end
 function NullableList(::Type{<:Array}, ::Type{C}, x::AbstractVector{Union{J,Missing}}) where {C,J}
@@ -321,7 +321,7 @@ _offsize(::Type{C}, x::AbstractString) where C = sizeof(C)*length(x)
 Construct a `Vector{Int32}` of offsets appropriate for data appearing in `v`.
 """
 function offsets(::Type{C}, v::AbstractVector) where C
-    off = Vector{Int32}(length(v)+1)
+    off = Vector{Int32}(uninitialized, length(v)+1)
     off[1] = 0
     for i ∈ 2:length(off)
         off[i] = _offsize(C, v[i-1]) + off[i-1]

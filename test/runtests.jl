@@ -1,6 +1,9 @@
 using Arrow
-using Missings
-using Base.Test
+using Compat.Test, Compat.Random
+
+if VERSION < v"0.7.0-"
+    using Missings
+end
 
 const SEED = 999
 const PRIMITIVE_ELTYPES = [Float32, Float64, Int32, Int64, UInt16]
