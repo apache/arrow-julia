@@ -126,6 +126,8 @@ List{J}(l::List{J}) where J = List{J}(l.length, l.offsets, l.values)
 List{J}(l::List{T}) where {J,T} = List{J}(convert(AbstractVector{J}, l[:]))
 List(l::List{J}) where J = List{J}(l)
 
+copy(l::List) = List(l)
+
 
 """
     NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
@@ -279,6 +281,7 @@ NullableList{J}(l::NullableList{J}) where J = NullableList{J}(p.length, p.bitmas
 NullableList{J}(l::NullableList{T}) where {J,T} = NullableList{J}(convert(AbstractVector{J}, p[:]))
 NullableList(l::NullableList{J}) where J = NullableList{J}(l)
 
+copy(l::NullableList) = NullableList(l)
 
 #====================================================================================================
     common interface
