@@ -199,16 +199,16 @@ end
 
 # buffer with location constructors, with values arg
 function NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer,
-                         values_idx::Integer, len::Integer, vals::P) where {J,P<:AbstractPrimitive}
+                         len::Integer, vals::P) where {J,P<:AbstractPrimitive}
     bmask = Primitive{UInt8}(data, bitmask_idx, bitmaskbytes(len))
     offs = Primitive{Int32}(data, offset_idx, len+1)
-    NullableList{J,P}(bmask, offs, vals)
+    NullableList{J}(bmask, offs, vals)
 end
 
 # buffer with location constructors
 function NullableList{J}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Integer,
                          values_idx::Integer, ::Type{C}, x::AbstractVector) where {C,J}
-    bmask = Primitive{UInt8}(data, bitmask_idx, bitmask(x))
+    bmask = Primitive{UInt8}(data, bitmask_idx, bitmaskpadded(x))
     offs = Primitive{Int32}(data, offset_idx, offsets(x))
     vals = Primitive(data, values_idx, encode(C, x))
     NullableList{J}(bmask, offs, vals)
@@ -219,7 +219,7 @@ function NullableList(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx::Int
 end
 # bitmask, offsets, values
 function NullableList{J}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector) where {C,J}
-    bmask = Primitive{UInt8}(data, i, bitmask(x))
+    bmask = Primitive{UInt8}(data, i, bitmaskpadded(x))
     offs = Primitive{Int32}(data, i+bitmaskbytes(x), offsets(C, x))
     vals = Primitive(data, i+bitmaskbytes(x)+offsetsbytes(x), encode(C, x))
     NullableList{J}(bmask, offs, vals)
@@ -262,7 +262,7 @@ function NullableList(::Type{<:Array}, x::AbstractVector{T}
 end
 
 function NullableList{J}(::Type{C}, v::AbstractVector) where {J,C}
-    bmask = Primitive{UInt8}(bitmask(v))
+    bmask = Primitive{UInt8}(bitmaskpadded(v))
     offs = Primitive{Int32}(offsets(C, v))
     vals = Primitive(encode(C, v))
     NullableList{J}(bmask, offs, vals)

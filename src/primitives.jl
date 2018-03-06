@@ -162,7 +162,7 @@ end
 # TODO change to reinterpreted views in 0.7 if possible
 # new buffer constructors
 function NullablePrimitive(v::AbstractVector{Union{J,Missing}}) where J
-    bmask = Primitive(bitmask(v))
+    bmask = Primitive(bitmaskpadded(v))
     vals = Primitive(replace_missing_vals(v))  # using first ensures exists
     NullablePrimitive(bmask, vals)
 end

@@ -53,7 +53,7 @@ end
 
 function NullableBitPrimitive(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
                               x::AbstractVector{T}) where T<:Union{Bool,Union{Bool,Missing}}
-    bmask = Primitive{UInt8}(data, bitmask_idx, bitmask(x))
+    bmask = Primitive{UInt8}(data, bitmask_idx, bitmaskpadded(x))
     vals = Primitive{UInt8}(data, values_idx, bytesforbits(x))
     setnonmissing!(vals, bitpack(x))
     NullableBitPrimitive(length(x), bmask, vals)
@@ -64,7 +64,7 @@ function NullableBitPrimitive(data::Vector{UInt8}, i::Integer, x::AbstractVector
 end
 
 function NullableBitPrimitive(v::AbstractVector{T}) where T<:Union{Bool,Union{Bool,Missing}}
-    bmask = Primitive{UInt8}(bitmask(v))
+    bmask = Primitive{UInt8}(bitmaskpadded(v))
     vals = Primitive{UInt8}(bitpack(v))
     NullableBitPrimitive(length(v), bmask, vals)
 end

@@ -9,6 +9,9 @@ padding(n::Integer) = ((n + ALIGNMENT - 1) ÷ ALIGNMENT)*ALIGNMENT
 export padding
 
 
+paddinglength(n::Integer) = padding(n) - n
+
+
 """
     writepadded(io::IO, x)
     writepadded(io::IO, A::Primitive)
@@ -111,11 +114,17 @@ bitpack(A::AbstractVector{Union{Bool,Missing}}) = bitpack(replace_missing_vals(A
 export bitpack
 
 
-bitmask(A::AbstractVector) = bitpack(.!ismissing.(A))
+function bitpackpadded(A::AbstractVector{Bool})
+    v = bitpack(A)
+    npad = paddinglength(length(v))
+    vcat(v, zeros(UInt8, npad))
+end
+export bitpackpadded
+
+
 function bitmaskpadded(A::AbstractVector)
-    nbytes = bytesforbits(length(A))
-    npad = padding(nbytes) - nbytes
-    vcat(bitpack(.!ismissing.(A)), zeros(UInt8, npad))
+    v = .!ismissing.(A)
+    bitpackpadded(v)
 end
 
 
