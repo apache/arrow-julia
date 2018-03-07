@@ -234,12 +234,13 @@ function NullableList(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVec
     NullableList{J}(data, i, C, x)
 end
 
-function NullableList{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{T};
-                        ) where {J,K<:AbstractString,T<:Union{K,Union{K,Missing}}}
+function NullableList{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{J}) where J
     NullableList{J}(data, i, UInt8, x)
 end
-function NullableList(data::Vector{UInt8}, i::Integer, x::AbstractVector{T};
-                     ) where {K<:AbstractString,T<:Union{K,Union{K,Missing}}}
+function NullableList{J}(data::Vector{UInt8}, i::Integer, x::AbstractVector{Union{J,Missing}}) where J
+    NullableList{J}(data, i, UInt8, x)
+end
+function NullableList(data::Vector{UInt8}, i::Integer, x::AbstractVector)
     NullableList(data, i, UInt8, x)
 end
 
@@ -254,12 +255,13 @@ function NullableList(::Type{<:Array}, ::Type{C}, x::AbstractVector{J}) where {C
     NullableList{J}(Array, C, x)
 end
 
-function NullableList{J}(::Type{<:Array}, x::AbstractVector{T}
-                        ) where {J,K<:AbstractString,T<:Union{K,Union{K,Missing}}}
+function NullableList{J}(::Type{<:Array}, x::AbstractVector{J}) where J
     NullableList{J}(Array, UInt8, x)
 end
-function NullableList(::Type{<:Array}, x::AbstractVector{T}
-                     ) where {K<:AbstractString,T<:Union{K,Union{K,Missing}}}
+function NullableList{J}(::Type{<:Array}, x::AbstractVector{Union{J,Missing}}) where J
+    NullableList{J}(Array, UInt8, x)
+end
+function NullableList(::Type{<:Array}, x::AbstractVector)
     NullableList(Array, UInt8, x)
 end
 
@@ -269,13 +271,9 @@ function NullableList{J}(::Type{C}, v::AbstractVector) where {J,C}
     vals = Primitive(encode(C, v))
     NullableList{J}(bmask, offs, vals)
 end
-function NullableList(::Type{C}, v::AbstractVector{T}) where {C,J,T<:Union{J,Union{J,Missing}}}
-    NullableList{J}(C, v)
-end
-function NullableList(v::AbstractVector{T}) where {K<:AbstractString,T<:Union{K,Union{K,Missing}}}
-    NullableList{String}(UInt8, v)
-end
-
+NullableList(::Type{C}, v::AbstractVector{J}) where {C,J} = NullableList{J}(C, v)
+NullableList(::Type{C}, v::AbstractVector{Union{J,Missing}}) where {C,J} = NullableList{J}(C, v)
+NullableList(v::AbstractVector) = NullableList{String}(UInt8, v)
 
 NullableList{J}(l::NullableList{J}) where J = NullableList{J}(p.length, p.bitmask, p.offsets, p.values)
 NullableList{J}(l::NullableList{T}) where {J,T} = NullableList{J}(convert(AbstractVector{J}, p[:]))
@@ -286,8 +284,7 @@ copy(l::NullableList) = NullableList(l)
 #====================================================================================================
     common interface
 ====================================================================================================#
-function valuesbytes(::Type{C}, A::AbstractVector{T}
-                    ) where {C,K<:AbstractString,T<:Union{Union{K,Missing},K}}
+function valuesbytes(::Type{C}, A::AbstractVector) where C
     padding(sum(ismissing(a) ? 0 : length(a)*sizeof(C) for a ∈ A))
 end
 valuesbytes(A::Union{List{P,J},NullableList{P,J}}) where {P,J} = valuesbytes(A.values)
@@ -299,14 +296,10 @@ offsetsbytes(len::Integer) = padding((len+1)*sizeof(Int32))
 offsetsbytes(A::AbstractVector) = offsetsbytes(length(A))
 export offsetsbytes
 
-function totalbytes(::Type{C}, A::AbstractVector{T}
-                   ) where {C,K<:AbstractString,T<:Union{Union{K,Missing},K}}
+function totalbytes(::Type{C}, A::AbstractVector) where C
     valuesbytes(C, A) + bitmaskbytes(A) + offsetsbytes(A)
 end
-function totalbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector{J}) where {C,J}
-    valuesbytes(C, A) + bitmaskbytes(Union{J,Missing}, A) + offsetsbytes(A)
-end
-function totalbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector{Union{J,Missing}}) where {C,J}
+function totalbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector) where {J,C}
     valuesbytes(C, A) + bitmaskbytes(Union{J,Missing}, A) + offsetsbytes(A)
 end
 totalbytes(A::AbstractList) = valuesbytes(A) + minbitmaskbytes(A) + offsetsbytes(A)
@@ -429,31 +422,27 @@ function elparams(l::AbstractList, i::Integer)
 end
 
 
-function unsafe_getvalue(l::AbstractList{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
+function unsafe_getvalue(l::Union{List{J},NullableList{J}}, i::Integer) where J
     off, len = unsafe_elparams(l, i)
     unsafe_construct(J, values(l), off+1, len)
 end
-function unsafe_getvalue(l::AbstractList{T}, idx::AbstractVector{<:Integer}
-                        ) where {J,T<:Union{J,Union{J,Missing}}}
+function unsafe_getvalue(l::AbstractList{T}, idx::AbstractVector{<:Integer}) where T
     T[unsafe_getvalue(l, i) for i ∈ idx]
 end
-function unsafe_getvalue(l::AbstractList{T}, idx::AbstractVector{Bool}
-                        ) where {J,T<:Union{J,Union{J,Missing}}}
+function unsafe_getvalue(l::AbstractList{T}, idx::AbstractVector{Bool}) where T
     T[unsafe_getvalue(l, i) for i ∈ 1:length(l) if idx[i]]
 end
 
 
-function getvalue(l::AbstractList{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
+function getvalue(l::Union{List{J},NullableList{J}}, i::Integer) where J
     off, len = elparams(l, i)
     construct(J, l.values, off+1, len)
 end
 
-function getvalue(l::AbstractList{T}, idx::AbstractVector{<:Integer}
-                 ) where {J,T<:Union{J,Union{J,Missing}}}
-    J[getvalue(l, i) for i ∈ idx]
+function getvalue(l::AbstractList{T}, idx::AbstractVector{<:Integer}) where T
+    T[getvalue(l, i) for i ∈ idx]
 end
-function getvalue(l::AbstractList{T}, idx::AbstractVector{Bool}
-                 ) where {J,T<:Union{J,Union{J,Missing}}}
-    J[getvalue(l, i) for i ∈ 1:length(l) if idx[i]]
+function getvalue(l::AbstractList{T}, idx::AbstractVector{Bool}) where T
+    T[getvalue(l, i) for i ∈ 1:length(l) if idx[i]]
 end
 

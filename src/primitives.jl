@@ -132,12 +132,20 @@ function NullablePrimitive{J}(data::Vector{UInt8}, bitmask_idx::Integer, values_
     vals = Primitive{J}(data, values_idx, len)
     NullablePrimitive{J}(bmask, vals)
 end
-function NullablePrimitive(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
-                           x::AbstractVector{T}) where {J,T<:Union{Union{J,Missing},J}}
-    bmask = Primitive{UInt8}(data, bitmask_idx, bitmask(x))
+function NullablePrimitive{J}(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
+                              x::AbstractVector) where J
+    bmask = Primitive{UInt8}(data, bitmask_idx, bitmaskpadded(x))
     vals = Primitive{J}(data, values_idx, length(x))
     setnonmissing!(vals, x)
     NullablePrimitive{J}(bmask, vals)
+end
+function NullablePrimitive(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
+                           x::AbstractVector{J}) where J
+    NullablePrimitive{J}(data, bitmask_idx, values_idx, x)
+end
+function NullablePrimitive(data::Vector{UInt8}, bitmask_idx::Integer, values_idx::Integer,
+                           x::AbstractVector{Union{J,Missing}}) where J
+    NullablePrimitive{J}(data, bitmask_idx, values_idx, x)
 end
 function NullablePrimitive(data::Vector{UInt8}, i::Integer, v::AbstractVector{T}
                           ) where {J,T<:Union{J,Union{J,Missing}}}
@@ -159,7 +167,6 @@ function NullablePrimitive(::Type{K}, v::AbstractVector{J}) where {K<:Array,J}
     NullablePrimitive(K, convert(AbstractVector{Union{J,Missing}}, v))
 end
 
-# TODO change to reinterpreted views in 0.7 if possible
 # new buffer constructors
 function NullablePrimitive(v::AbstractVector{Union{J,Missing}}) where J
     bmask = Primitive(bitmaskpadded(v))
@@ -245,8 +252,8 @@ end
 export totalbytes
 
 
-function unsafe_getvalue_contiguous(A::AbstractPrimitive{T}, idx::AbstractVector{<:Integer}
-                                   ) where {J,T<:Union{J,Union{J,Missing}}}
+function unsafe_getvalue_contiguous(A::Union{Primitive{J},NullablePrimitive{J}},
+                                    idx::AbstractVector{<:Integer}) where J
     ptr = convert(Ptr{J}, valuespointer(A)) + (first(idx)-1)*sizeof(J)
     unsafe_wrap(Array, ptr, length(idx))
 end
@@ -259,19 +266,17 @@ index, an `AbstractVector` of integer indices, or an `AbstractVector{Bool}` mask
 
 This typically involves a call to `unsafe_load` or `unsafe_wrap`.
 """
-function unsafe_getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, i::Integer)::J where J
+function unsafe_getvalue(A::Union{Primitive{J},NullablePrimitive{J}},
+                         i::Integer)::J where J
     unsafe_load(convert(Ptr{J}, valuespointer(A)), i)
 end
-function unsafe_getvalue(A::AbstractPrimitive{T}, idx::UnitRange{<:Integer}
-                        ) where {J,T<:Union{J,Union{J,Missing}}}
+function unsafe_getvalue(A::AbstractPrimitive, idx::UnitRange{<:Integer})
     unsafe_getvalue_contiguous(A, idx)
 end
-function unsafe_getvalue(A::AbstractPrimitive{T}, idx::AbstractVector{<:Integer}
-                        ) where {J,T<:Union{J,Union{J,Missing}}}
+function unsafe_getvalue(A::AbstractPrimitive{T}, idx::AbstractVector{<:Integer}) where T
     T[unsafe_getvalue(A, i) for i ∈ idx]
 end
-function unsafe_getvalue(A::AbstractPrimitive{T}, idx::AbstractVector{Bool}
-                        ) where {J,T<:Union{J,Union{J,Missing}}}
+function unsafe_getvalue(A::AbstractPrimitive{T}, idx::AbstractVector{Bool}) where T
     T[unsafe_getvalue(A, i) for i ∈ 1:length(A) if idx[i]]
 end
 unsafe_getvalue(A::Primitive, ::Colon) = unsafe_getvalue(A, 1:length(A))
@@ -317,12 +322,14 @@ rawvalues(A::Primitive) = rawvalues(A, :)
 
 Get the values for indices `idx` from `A`.
 """
-function getvalue(A::AbstractPrimitive{T}, i::Integer) where {J,T<:Union{J,Union{J,Missing}}}
+function getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, i::Integer) where J
     reinterpret(J, rawvalues(A, i))[1]
 end
-function getvalue(A::AbstractPrimitive{T}, i::AbstractVector{<:Integer}
-                 ) where {J,T<:Union{J,Union{J,Missing}}}
+function getvalue(A::Primitive{J}, i::AbstractVector{<:Integer}) where J
     reinterpret(J, rawvalues(A, i))
+end
+function getvalue(A::NullablePrimitive{J}, i::AbstractVector{<:Integer}) where J
+    convert(Union{J,Missing}, reinterpret(J, rawvalues(A, i)))
 end
 
 

@@ -1,5 +1,5 @@
 using Arrow
-using Compat.Test, Compat.Random, Compat.Dates
+using Compat, Compat.Test, Compat.Random, Compat.Dates
 
 if VERSION < v"0.7.0-"
     using Missings
@@ -282,15 +282,15 @@ end
 
     mask = rand(Bool, len)
 
-    v = [mask[i] ? rand(Float32) : missing for i ∈ 1:len]
+    v = Union{Float32,Missing}[mask[i] ? rand(Float32) : missing for i ∈ 1:len]
     p = arrowformat(v)
     @test typeof(p) == NullablePrimitive{Float32}
 
-    v = [randstring_() for i ∈ 1:len]
+    v = String[randstring_() for i ∈ 1:len]
     p = arrowformat(v)
     @test typeof(p) == List{String,Primitive{UInt8}}
 
-    v = [mask[i] ? randstring_() : missing for i ∈ 1:len]
+    v = Union{String,Missing}[mask[i] ? randstring_() : missing for i ∈ 1:len]
     p = arrowformat(v)
     @test typeof(p) == NullableList{String,Primitive{UInt8}}
 
@@ -298,31 +298,31 @@ end
     p = arrowformat(v)
     @test typeof(p) == BitPrimitive
 
-    v = [mask[i] ? rand(Bool) : missing for i ∈ 1:len]
+    v = Union{Bool,Missing}[mask[i] ? rand(Bool) : missing for i ∈ 1:len]
     p = arrowformat(v)
     @test typeof(p) == NullableBitPrimitive
 
-    v = [Date(1), Date(2)]
+    v = Date[Date(1), Date(2)]
     p = arrowformat(v)
     @test typeof(p) == Primitive{Arrow.Datestamp}
 
-    v = [DateTime(0), DateTime(1)]
+    v = DateTime[DateTime(0), DateTime(1)]
     p = arrowformat(v)
     @test typeof(p) == Primitive{Arrow.Timestamp{Millisecond}}
 
-    v = [Time(0), Time(1)]
+    v = Time[Time(0), Time(1)]
     p = arrowformat(v)
     @test typeof(p) == Primitive{Arrow.TimeOfDay{Nanosecond,Int64}}
 
-    v = [Date(1), missing]
+    v = Union{Date,Missing}[Date(1), missing]
     p = arrowformat(v)
     @test typeof(p) == NullablePrimitive{Arrow.Datestamp}
 
-    v = [DateTime(0), missing]
+    v = Union{DateTime,Missing}[DateTime(0), missing]
     p = arrowformat(v)
     @test typeof(p) == NullablePrimitive{Arrow.Timestamp{Millisecond}}
 
-    v = [Time(0), missing]
+    v = Union{Time,Missing}[Time(0), missing]
     p = arrowformat(v)
     @test typeof(p) == NullablePrimitive{Arrow.TimeOfDay{Nanosecond,Int64}}
 end
