@@ -57,14 +57,14 @@ end
 
 # create own buffer
 function Primitive{J}(::Type{<:Array}, v::AbstractVector) where J
-    b = Vector{UInt8}(uninitialized, totalbytes(v))
+    b = Vector{UInt8}(undef, totalbytes(v))
     Primitive{J}(b, 1, v)
 end
 Primitive(::Type{<:Array}, v::AbstractVector) = Primitive(v)
 
-# use uninitialized buffer
-function Primitive{J}(::Uninitialized, i::Integer, len::Integer) where J
-    b = Vector{UInt8}(uninitialized, valuesbytes(J, len))
+# use undef buffer
+function Primitive{J}(::UndefInitializer, i::Integer, len::Integer) where J
+    b = Vector{UInt8}(undef, valuesbytes(J, len))
     Primitive{J}(b, i, len)
 end
 
@@ -157,7 +157,7 @@ end
 
 # contiguous new buffer constructors
 function NullablePrimitive(::Type{<:Array}, v::AbstractVector{Union{J,Missing}}) where J
-    b = Vector{UInt8}(uninitialized, totalbytes(v))
+    b = Vector{UInt8}(undef, totalbytes(v))
     NullablePrimitive(b, 1, v)
 end
 function NullablePrimitive{J}(::Type{K}, v::AbstractVector{T}) where {J,K<:Array,T}
