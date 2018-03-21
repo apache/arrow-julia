@@ -297,11 +297,6 @@ export arrowformat
 
 # TODO clean up bounds checking
 
-@inline function view(l::ArrowVector{J}, i::AbstractVector{<:Integer}) where J
-    @boundscheck checkbounds(l, i)
-    SubArray(unsafe_getvalue(l, i), (i,))
-end
-
 @inline function getindex(l::ArrowVector{J}, i::Union{<:Integer,AbstractVector{<:Integer}}) where J
     @boundscheck checkbounds(l, i)
     @inbounds o = unsafe_getvalue(l, i)
