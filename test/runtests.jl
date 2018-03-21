@@ -1,5 +1,6 @@
 using Arrow
 using Compat, Compat.Test, Compat.Random, Compat.Dates
+using CategoricalArrays
 
 if VERSION < v"0.7.0-"
     using Missings
@@ -76,9 +77,7 @@ end
             idx = rand(1:len, rand(1:MAX_IDX_LEN))
             sp = p[idx]
             sv = v[idx]
-            ssp = collect(skipmissing(sp))
-            ssv = collect(skipmissing(sv))
-            @test length(sp) == length(sv) && ssp == ssv
+            @test sp ≅ sv
         end
         @test p[:] ≅ v
     end
@@ -269,6 +268,42 @@ end
         end
         @test p[:] ≅ v
     end
+end
+
+
+@testset "DictEncoding_access" begin
+    len = 7
+    refs = Primitive(Int32[0,1,2,1,0,3,2])
+    data = List(["fire", "walk", "with", "me"])
+    d = DictEncoding(refs, data)
+    @test references(d) == refs
+    @test levels(d) == data
+    @test d[1] == "fire"
+    @test d[2] == "walk"
+    @test d[3] == "with"
+    @test d[4] == "walk"
+    @test d[5] == "fire"
+    @test d[6] == "me"
+    @test d[7] == "with"
+    @test d[[1,4,3,6]] == ["fire", "walk", "with", "me"]
+    @test d[[true,false,false,false,false,false,true]] == ["fire", "with"]
+    @test d[:] == ["fire", "walk", "with", "walk", "fire", "me", "with"]
+end
+
+
+@testset "DictEncoding_construct" begin
+    v = [-999, missing, 55, -999, 42]
+    d = DictEncoding(categorical(v))
+    @test typeof(d.refs) == NullablePrimitive{Int32}
+    @test typeof(d.pool) == Primitive{Int64}
+    @test d[1] == -999
+    @test ismissing(d[2])
+    @test d[3] == 55
+    @test d[4] == -999
+    @test d[5] == 42
+    @test d[[1,3,5]] ≅ v[[1,3,5]]
+    @test d[[false,true,false,true,false]] ≅ v[[false,true,false,true,false]]
+    @test d[:] ≅ v
 end
 
 

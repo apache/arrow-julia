@@ -19,6 +19,9 @@ export DictEncoding
 function DictEncoding{J}(refs::R, pool::P) where {J,R<:ReferenceType,P<:ArrowVector}
     DictEncoding{J,R,P}(refs, pool)
 end
+function DictEncoding(refs::R, pool::P) where {J,R<:ReferenceType,P<:ArrowVector{J}}
+    DictEncoding{J,R,P}(refs, pool)
+end
 
 function DictEncoding{J}(data::Vector{UInt8}, refs_idx::Integer, len::Integer, pool::P
                         ) where {J,P<:ArrowVector}
@@ -157,7 +160,7 @@ nullcount(d::DictEncoding{Union{J,Missing}}) where J = nullcount(d.refs)
 ====================================================================================================#
 getrefs(x::CategoricalArray) = convert(Vector{Int32}, x.refs) .- Int32(1)
 function getrefs(x::CategoricalArray{Union{J,Missing},1,U}) where {J,U}
-    refs = Vector{Union{Int32,Missing}}(length(x))
+    refs = Vector{Union{Int32,Missing}}(undef, length(x))
     for i ∈ 1:length(x)
         x.refs[i] == 0 ? (refs[i] = missing) : (refs[i] = x.refs[i] - 1)
     end
