@@ -214,15 +214,6 @@ end
 @_make_fillmissings_funcs(fillmissings!, isnull)
 
 
-
-# TODO this is really inefficient and also NullExceptions are uninformative
-function nullexcept_inrange(A::ArrowVector{Union{T,Missing}}, i::Integer, j::Integer) where T
-    for k ∈ i:j
-        isnull(A, i) && throw(NullException())
-    end
-end
-
-
 function setnonmissing!(A::ArrowVector{J}, v::AbstractVector{T}) where {J,T<:Union{J,Union{J,Missing}}}
     @boundscheck length(A) == length(v) || throw(ArgumentError("trying to set from wrong sized array"))
     for i ∈ 1:length(A)

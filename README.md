@@ -8,10 +8,10 @@ referencing data that conforms to the Arrow standard.  This allows users to seam
 
 Please see this [document](https://arrow.apache.org/docs/memory_layout.html) for a description of the Arrow memory layout.
 
-***WARNING*** As of right now this package uses Julia `Ptr` (pointer) objects and "unsafe" methods.  This is for performance reasons.  Hopefully this will
-change once this package is adapted for Julia 0.7 (should happen soon).  While Arrow.jl has been tested and should be safe with proper usage, it is up to the
-user to make sure that their Arrow.jl objects reference the appropriate locations in data.  If the user, for example, uses an Arrow.jl object to reference data
-past the end of an array, the resulting program will segfault!  Fortunately writing is safe, so you will not be able to write past the ends of a buffer.
+***WARNING*** As of right now this package uses Julia `Ptr` (pointer) objects and "unsafe" methods.  This is for performance reasons.  It should in principle be
+possible to make this package completely safe, but we are waiting on some performance improvements in `Base`.  While Arrow.jl has been tested and should be safe
+with proper usage, it is up to the user to make sure that their Arrow.jl objects reference the appropriate locations in data.  If the user, for example, uses an
+Arrow.jl object to reference data past the end of an array, the resulting program will segfault!
 
 
 ## Installation
@@ -19,7 +19,7 @@ For now this package is not registered, so do
 ```julia
 Pkg.clone("https://github.com/ExpandingMan/Arrow.jl")
 ```
-Arrow only has `Missings` and `CategoricalArrays` as dependencies.
+Arrow only has `CategoricalArrays` as a dependency (and `Missings` on 0.6).
 
 
 ## `ArrowVector` Objects
@@ -239,5 +239,4 @@ For a working (but as of this writing still in-development) example of a package
 A lot of work still to be done:
 - Performance pass: performance seems ok according to basic sanity checks but it that code has neither been optimized nor thoroughly benchmarked.
 - Extensive unit tests needed: hopefully I'll get to more of this soon.
-- This was developed using Julia 0.6 only, some changes will be needed in 0.7.  In particular, the behavior of `reinterpret` is quite different in 0.7.  Updates to 0.7 will probably include allowing `Primitive` to use any `AbstractVector{UInt8}` as reference.
 - Support Arrow Structs.
