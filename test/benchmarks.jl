@@ -4,6 +4,10 @@ using BenchmarkTools
 const L = 10^7
 
 
+# TODO obviously these are not real benchmarks
+# so far this is just a space to screw around and check basic performance
+
+
 function wrap(::Type{T}, len::Integer, v::Vector{UInt8}) where T
     ptr = convert(Ptr{T}, pointer(v))
     unsafe_wrap(Array, ptr, len)
@@ -55,7 +59,6 @@ function benches2()
     global b_arrow = @benchmark Arrow.getindex($l, 1:$L)
 end
 
-
-benches1()
-# benches2()
+v = ["a", "ab", "abc"]
+l = List(v)
 

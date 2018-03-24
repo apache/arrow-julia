@@ -122,12 +122,18 @@ function _getrefsvec(d::DictEncoding{J,R}, idx::AbstractVector{<:Integer}
     K[ismissing(x) ? zero(K) : x+1 for x ∈ d.refs]
 end
 
+function pool(d::DictEncoding{J,R}) where {J,K,R<:ReferenceType{K}}
+    CategoricalPool{J,K}(convert(Vector, d.pool))
+end
+function pool(d::DictEncoding{Union{J,Missing},R}) where {J,K,R<:ReferenceType{K}}
+    CategoricalPool{J,K}(convert(Vector, d.pool))
+end
+
+
 # for now this always transfers the entire pool
 function categorical(d::DictEncoding{J,R}, idx::AbstractVector{<:Integer}
-                    ) where {L,J<:Union{L,Union{L,Missing}},K,R<:ReferenceType{K}}
-    p = CategoricalPool{L,K}(convert(Vector, d.pool))
-    refs = _getrefsvec(d, idx)
-    CategoricalArray{J,1}(refs, p)
+                    ) where {J,K,R<:ReferenceType{K}}
+    CategoricalArray{J,1}(_getrefsvec(d, idx), pool(d))
 end
 categorical(d::DictEncoding) = categorical(d, 1:length(d))
 

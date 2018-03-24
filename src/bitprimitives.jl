@@ -6,7 +6,7 @@ export BitPrimitive
 
 
 struct BitPrimitive <: AbstractBitPrimitive{Bool}
-    length::Int
+    length::Int64
     values::Primitive{UInt8}  # in principle this can be anything, but don't see the need
 end
 export BitPrimitive
@@ -38,7 +38,7 @@ BitPrimitive(b::BitPrimitive) = BitPrimitive(b.length, b.values)
 
 
 struct NullableBitPrimitive <: AbstractBitPrimitive{Union{Bool,Missing}}
-    length::Int
+    length::Int64
     bitmask::Primitive{UInt8}
     values::Primitive{UInt8}
 end

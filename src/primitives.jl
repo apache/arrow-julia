@@ -26,7 +26,7 @@ If `Array` is provided as the virst argument, the data will be allocated contigu
 ` `v`: existing reference data. constructors with will reference the original `v` as `data`
 """
 struct Primitive{J} <: AbstractPrimitive{J}
-    length::Int
+    length::Int64
     values_idx::Int64
     data::Vector{UInt8}
 end
@@ -34,7 +34,7 @@ export Primitive
 
 function Primitive{J}(data::AbstractVector{UInt8}, i::Integer, len::Integer) where J
     @boundscheck check_buffer_bounds(J, data, i, len)
-    Primitive{J}(Int(len), Int(i), data)
+    Primitive{J}(Int64(len), Int64(i), data)
 end
 function Primitive(data::AbstractVector{UInt8}, i::Integer, x::AbstractVector{J}) where J
     p = Primitive{J}(data, i, length(x))
@@ -47,7 +47,6 @@ end
 
 # view of reinterpreted, will not include padding
 function Primitive(v::AbstractVector{J}) where J
-    # TODO in a future version this conversion will not be needed
     b = convert(Vector{UInt8}, reinterpret(UInt8, v))
     Primitive{J}(b, 1, length(v))
 end
@@ -111,7 +110,7 @@ contiguously allocated within a single array (bit mask first, then values).
 - `x`, `v`: values to be stored in data
 """
 struct NullablePrimitive{J} <: AbstractPrimitive{Union{J,Missing}}
-    length::Int
+    length::Int64
     bitmask::Primitive{UInt8}
     values::Primitive{J}
 end
@@ -252,11 +251,12 @@ end
 export totalbytes
 
 
-function unsafe_getvalue_contiguous(A::Union{Primitive{J},NullablePrimitive{J}},
-                                    idx::AbstractVector{<:Integer}) where J
+@inline function unsafe_contiguous(A::Union{Primitive{J},NullablePrimitive{J}},
+                                   idx::AbstractVector{<:Integer}) where J
     ptr = convert(Ptr{J}, valuespointer(A)) + (first(idx)-1)*sizeof(J)
     unsafe_wrap(Array, ptr, length(idx))
 end
+
 
 """
     unsafe_getvalue(A::ArrowVector, i)
@@ -270,8 +270,8 @@ function unsafe_getvalue(A::Union{Primitive{J},NullablePrimitive{J}},
                          i::Integer)::J where J
     unsafe_load(convert(Ptr{J}, valuespointer(A)), i)
 end
-function unsafe_getvalue(A::AbstractPrimitive, idx::UnitRange{<:Integer})
-    unsafe_getvalue_contiguous(A, idx)
+function unsafe_getvalue(A::AbstractPrimitive{T}, idx::UnitRange{<:Integer}) where T
+    copyto!(Vector{T}(undef, length(idx)), unsafe_contiguous(A, idx))
 end
 function unsafe_getvalue(A::AbstractPrimitive{T}, idx::AbstractVector{<:Integer}) where T
     T[unsafe_getvalue(A, i) for i ∈ idx]
@@ -306,6 +306,7 @@ function rawvalueindex(A::Primitive, idx::AbstractVector{Bool})
 end
 
 
+# TODO should these return views?
 """
     rawvalues(A::Primitive, i)
     rawvalues(A::Primitive)
@@ -326,10 +327,10 @@ function getvalue(A::Union{Primitive{J},NullablePrimitive{J}}, i::Integer) where
     reinterpret(J, rawvalues(A, i))[1]
 end
 function getvalue(A::Primitive{J}, i::AbstractVector{<:Integer}) where J
-    reinterpret(J, rawvalues(A, i))
+    copyto!(Vector{J}(undef, length(i)), reinterpret(J, rawvalues(A, i)))
 end
 function getvalue(A::NullablePrimitive{J}, i::AbstractVector{<:Integer}) where J
-    convert(Union{J,Missing}, reinterpret(J, rawvalues(A, i)))
+    copyto!(Vector{Union{J,Missing}}(undef, length(i)), reinterpret(J, rawvalues(A, i)))
 end
 
 
@@ -390,6 +391,7 @@ function unsafe_setvalue!(A::Union{Primitive{J},NullablePrimitive{J}}, v::Vector
 end
 
 
+# note that this use of unsafe_string is ok because it copies
 """
     unsafe_construct(::Type{T}, A::Primitive, i::Integer, len::Integer)
 

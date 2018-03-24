@@ -232,7 +232,7 @@ function setnonmissing!(A::ArrowVector{J}, v::AbstractVector{T}) where {J,T<:Uni
 end
 
 
-length(A::ArrowVector) = Int(A.length)
+length(A::ArrowVector) = A.length
 size(A::ArrowVector) = (length(A),)
 function size(A::ArrowVector, i::Integer)
     if i == 1
@@ -242,10 +242,6 @@ function size(A::ArrowVector, i::Integer)
     end
     throw(ArgumentError("arraysize: dimension $i out of range"))
 end
-endof(A::ArrowVector) = length(A)
-
-
-eltype(A::ArrowVector{T}) where T = T
 
 
 start(::ArrowVector) = 1

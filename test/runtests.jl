@@ -17,6 +17,7 @@ const MAX_VECTOR_LENGTH = 256
 const MAX_STRING_LENGTH = 32
 
 const PRIMITIVE_ELTYPES = [Float32, Float64, Int32, Int64, UInt16]
+const OFFSET_ELTYPES = [Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64]
 
 srand(SEED)
 
@@ -106,14 +107,15 @@ end
 
 @testset "List_access" begin
     len  = 5
-    offs = Int32[0,4,7,8,12,14]
+    offstype = rand(OFFSET_ELTYPES)
+    offs = convert(Vector{offstype}, [0,4,7,8,12,14])
     vals = convert(Vector{UInt8}, codeunits("firewalkwithme"))
     valspad = zeros(UInt8, Arrow.paddinglength(length(vals)))
     lpad = randpad()
     rpad = randpad()
     b = vcat(lpad, convert(Vector{UInt8}, reinterpret(UInt8, offs)), vals, valspad, rpad)
-    l = List{String}(b, 1+length(lpad), 1+length(lpad)+sizeof(Int32)*length(offs),
-                     len, UInt8, length(vals))
+    l = List{String,offstype}(b, 1+length(lpad), 1+length(lpad)+sizeof(offstype)*length(offs),
+                              len, UInt8, length(vals))
     @test offsets(l)[:] == offs
     @test values(l)[:] == vals
     @test l[1] == "fire"
@@ -147,7 +149,8 @@ end
 
 @testset "NullableList_access" begin
     len = 7
-    offs = Int32[0,4,9,9,14,14,17,21]
+    offstype = rand(OFFSET_ELTYPES)
+    offs = convert(Vector{offstype}, [0,4,9,9,14,14,17,21])
     vals = convert(Vector{UInt8}, codeunits("kirkspockbonesncc1701"))
     valspad = zeros(UInt8, Arrow.paddinglength(length(vals)))
     pres = Bool[true,true,false,true,false,true,true]
@@ -155,9 +158,9 @@ end
     lpad = randpad()
     rpad = randpad()
     b = vcat(lpad, mask, convert(Vector{UInt8}, reinterpret(UInt8, offs)), vals, valspad, rpad)
-    l = NullableList{String}(b, 1+length(lpad), 1+length(lpad)+length(mask),
-                             1+length(lpad)+length(mask)+sizeof(Int32)*length(offs),
-                             len, UInt8, length(vals))
+    l = NullableList{String,offstype}(b, 1+length(lpad), 1+length(lpad)+length(mask),
+                                      1+length(lpad)+length(mask)+sizeof(offstype)*length(offs),
+                                      len, UInt8, length(vals))
     @test offsets(l)[:] == offs
     @test values(l)[:] == vals
     @test l[1] == "kirk"
@@ -294,6 +297,8 @@ end
 @testset "DictEncoding_construct" begin
     v = [-999, missing, 55, -999, 42]
     d = DictEncoding(categorical(v))
+    pool = CategoricalPool{Int,Int32}([-999, 55, 42])
+    ref = CategoricalArray{Union{Int,Missing},1}(Int32[1,0,2,1,3], pool)
     @test typeof(d.refs) == NullablePrimitive{Int32}
     @test typeof(d.pool) == Primitive{Int64}
     @test d[1] == -999
@@ -303,7 +308,8 @@ end
     @test d[5] == 42
     @test d[[1,3,5]] ≅ v[[1,3,5]]
     @test d[[false,true,false,true,false]] ≅ v[[false,true,false,true,false]]
-    @test d[:] ≅ v
+    @test d[1:end] ≅ v
+    @test categorical(d) ≅ ref
 end
 
 
@@ -323,11 +329,11 @@ end
 
     v = String[randstring_() for i ∈ 1:len]
     p = arrowformat(v)
-    @test typeof(p) == List{String,Primitive{UInt8}}
+    @test typeof(p) == List{String,Int64,Primitive{UInt8}}
 
     v = Union{String,Missing}[mask[i] ? randstring_() : missing for i ∈ 1:len]
     p = arrowformat(v)
-    @test typeof(p) == NullableList{String,Primitive{UInt8}}
+    @test typeof(p) == NullableList{String,Int64,Primitive{UInt8}}
 
     v = rand(Bool, len)
     p = arrowformat(v)
@@ -360,4 +366,8 @@ end
     v = Union{Time,Missing}[Time(0), missing]
     p = arrowformat(v)
     @test typeof(p) == NullablePrimitive{Arrow.TimeOfDay{Nanosecond,Int64}}
+
+    v = categorical(["a", "b", "c"])
+    p = arrowformat(v)
+    @test typeof(p) == DictEncoding{String,Primitive{Int32},List{String,Int64,Primitive{UInt8}}}
 end
