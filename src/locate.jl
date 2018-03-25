@@ -6,6 +6,10 @@ module Locate
     import Arrow
     using Arrow: ALIGNMENT
 
+    if VERSION < v"0.7.0-"
+        using Missings
+    end
+
     abstract type Abstract end
 
     function checkalignment(loc::Integer)
