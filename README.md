@@ -52,6 +52,9 @@ built out of combinations of `Primitive`s.
 
 Enter `?Primitive` in the REPL for a full list of constructors.
 
+***Note:*** In what follows we show explicit methods for constructing each `ArrowVector` type from a raw data buffer.  This can become a bit confusing where
+there are many sub-buffer locations to keep track of, so it is strongly suggested that you make use of the `Locate` interface described in the next section.
+
 ### The `NullablePrimitive` Type
 The Arrow format also supports arrays with bits type elements that may be null.  For these we provide the `NullablePrimitive{J} <: AbstractVector{Union{J,Missing}}` type.  Under the hood the
 `NullablePrimitive` type is a pair of `Primitive`s: one references a `Primitive{UInt8}` bit mask describing which elements of the `NullablePrimitive` are null and the
@@ -79,21 +82,22 @@ Enter `?NullablePrimitive` in the REPL for a full list of constructors.
 ### The `List` Type
 The underlying dataformat for arbitrary length objects such as strings is more complicated, so these objects require a dedicated type.  For these we provide
 `List{J} <: AbstractVector{J}`.  As well as containing the values contained by strings, these objects contain "offsets" for describing how long each string
-should be.  The arrow format requires that these offsets are `Int32`s and that there are `length(l)+1` of them.  For example
+should be.  The arrow format suggests that these offsets are `Int32`s and that there are `length(l)+1` of them.  For example
 ```julia
 offs = reinterpret(UInt8, Int32[0,3,5,7])
 vals = convert(Vector{UInt8}, "abcdefg")
 buff = [offs; vals]
-l = List{String}(buff, 1, length(offs)+1, 3, UInt8, length(vals)) # arguments are: buffer, offsets location, values location, length of List, value type, values length
+# type parameters: List return type, offsets type (must be <:Integer)
+l = List{String,Int32}(buff, 1, length(offs)+1, 3, UInt8, length(vals)) # arguments are: buffer, offsets location, values location, length of List, value type, values length
 
 # alternatively we can construct the values separately
 v = Primitive{UInt8}(buff, length(offs)+1, length(vals))
-l = List{String}(buff, 1, 3, v) # arguments are: buffer, offset location, length, values primitive
+l = List{String,Int32}(buff, 1, 3, v) # arguments are: buffer, offset location, length, values primitive
 
 # or you can create each piece individually
 o = Primitive{Int32}(buff, 1, 4)  # note that the Int32 type is required for offsets by the arrow format
 v = Primitive{UInt8}(buff, length(offs)+1, length(vals))
-l = List{String}(o, v)
+l = List{String,Int32}(o, v)
 
 l[1] # returns "abc"
 l[2] # returns "de"
@@ -122,14 +126,14 @@ bmask = [0x05] # bits(0x05) == "00000101"
 offs = reinterpret(UInt8, Int32[0,3,5,7])
 vals = convert(Vector{UInt8}, "abcdefg")
 buff = [bmask; offs; vals]
-l = NullableList{String}(buff, 1, 2, length(offs)+2, 3, UInt8, length(vals))
+l = NullableList{String,Int32}(buff, 1, 2, length(offs)+2, 3, UInt8, length(vals))
 # arguments above are: buffer, bit mask location, offsets location, values location, list length, values type, values length
 
 # again you can also provide each piece separately
 b = Primitive{UInt8}(buff, 1, 1)  # required to have eltype UInt8
 o = Primitive{Int32}(buff, 2, 4)  # required to have eltype Int32
 v = Primitive{UInt8}(buff, length(offs)+2, length(vals))
-l = NullableList{String}(b, o, v)
+l = NullableList{String,Int32}(b, o, v)
 
 l[1] # returns "abc"
 l[2] # returns missing
@@ -139,7 +143,7 @@ l[2] = "de"  # ERROR assignments not currently supported for list types
 
 
 # you can also create lists of Primitives, though this may involve copying
-l = NullableList{Primitive{UInt8}}(b, o, v)
+l = NullableList{Primitive{UInt8},Int32}(b, o, v)
 
 
 # by now all the ways of creating this from our own data should be familiar
@@ -194,27 +198,71 @@ more complicated types using `List`s.  The only caveat is that any type not expl
 of Julia.
 
 
-## Recommended Usage Pattern
-Because the Arrow standard is so general it is difficult for this package to provide general utilities for retrieving data.  Typically users will have to define
-methods for creating `ArrowVector` objects from whatever underlying data that they are interested in.  The examples above demonstrate this, though of course in
-most real use cases `buff` will be provided from a source such as reading in a file.  It is up to package developers to decide how the data should be
-referenced.  Ideally, there should be some sort of metadata object which gives the locations of the various subbuffers.  For example, a package might define its
-own constructors
+## The `Locate` Interface
+Given a `Vector{UInt8}` locating your data objects can be rather pedantic, and the last thing you want to do is point your `ArrowVector` objects to the wrong
+memory locations, as this will lead to scary undefined behavior.  Arrow provides an interface that will make this significantly easier provided your metadata is
+sufficiently well organized (which it always should be).  This interface will also check to make sure the locations you specify have proper alignment (still
+does not guarantee correctness!!).  The idea here is to create Julia `struct`s which somehow represent the metadata of the various objects you want to access.
+In the following, assume you have defined
 ```julia
-function Arrow.NullablePrimitive(data::Vector{UInt8}, meta::ExamplePackage.ArrayMetadata{T}) where T
-    NullablePrimitive{T}(data, bitmaskloc(meta), valuesloc(meta), length(meta))
+struct ObjMetadata
+    # whatever is needed to locate objects and determine their types goes here. You can also use type parameters if you want
 end
 ```
-In the above example the package developer has some metadata object which describes the properties of an arrow formatted array and uses it to create a
-`NullablePrimitive`.  Presumably analogous methods would be defined for other `ArrowVector` types.  Of course the details of how this is done is entirely up to
-the package developer.  As far as *reading* data goes, since `ArrowVector{J} <: AbstractVector{J}`, in many cases it shouldn't be necessary to convert the
-`ArrowVector`s into Julia `Vector`s.  This will cut down on the amount of copying that needs to be done.  Of course if very fast access is a priority, nothing
-will beat native Julia formats, so in these cases Julia `Vector`s should be constructed with `v[:]`.
+You are not limited to only having one such object, you can have arbitrarily many.  Once you define the appropriate methods (described below), all you need to
+do is call
+```julia
+locate(data, T, obj)
+# data is the data buffer; T is the return type of the container being constructed; obj is the ObjMetadata
+```
+This will automatically create the `ArrowVector` object that represents your data.
+The type parameter you provide specifies the return type, for example you might construct a `List` with `locate(data, String, obj)` or a `NullableBitPrimitive`
+with `locate(data, Union{Bool,Missing}, obj)`.
 
-Writing is somewhat simpler as Arrow will figure out how to convert ordinary Julia data to Arrow formatted data for you.  In addition to `arrowformat` the other
-two most important functions for writing data will be `rawpadded` and `writepadded`.  `rawpadded` takes a `Primitive` as argument and returns a properly Arrow
-padded `Vector{UInt8}` appropriate for writing the data directly to an Arrow formatted buffer.  `writepadded` will write the properly padded array to an `IO`
-object.
+### Minimal Interface
+The minimal way of implementing the locate interface requires defining some of the following methods
+```julia
+Locate.length(obj::ObjMetadata) = # the length (in number of elements) of the ArrowVector
+Locate.values(obj::ObjMetadata) = # location of values (i.e. return value data; char data for Lists)
+Locate.valueslength(obj::ObjMetadata) = # the length of the values sub-buffer (in number of elements); not needed for Primitives, only Lists
+Locate.bitmask(obj::ObjMetadata) = # location of null bitmask
+Locate.offsets(obj::ObjMetadata) = # location of offsets buffer
+```
+Of course, you may only need to define a subset of these.  For example, if all you want are `Primitive`s, you need only define `Locate.length` and
+`Locate.values`.  If you never need lists, you needn't define `Locate.valueslength` or `Locate.offsets`.
+
+### Overriding Defaults
+The above interface may not be adequate for all purposes.  For example, if you only define the methods listed above, the offsets type will always default to
+`Int64`.  Furthermore, the type of `ArrowVector` will be determined by the desired return value (i.e. `Primitive` for bits-types, `List` for strings,
+`NullablePrimitive` for `Union{T,Missing}` where `T` is a bits-type, etc.)  To override these defaults you can use more detailed methods:
+```julia
+# value data can be specified by defining the Locate.Values methods
+# T is the value data type, but you may not need it because the overall container return type will override it
+Locate.Values{T}(obj::ObjMetadata) = Locate.Values{T}(Locate.values(obj), Locate.valueslength(obj))
+
+# you need a slightly different Values constructor for List values
+# here T is the List return type so you can use it if you need to, but you may not
+Locate.Values(::Type{T}, obj::ObjMetadata) where T = Locate.Values{UInt8}(Locate.values(obj), Locate.valueslength(obj))
+
+# there's not really a reason to define Locate.Bitmask if you defined Locate.bitmask, but it's there
+Locate.Bitmask(obj::ObjMetadata) = Locate.Bitmask(Locate.bitmask(obj))
+
+# you can use Locate.Offsets to override the default offset type of Int64
+Locate.Offsets(obj::ObjMetadata) = Locate.Offsets{Int32}(Locate.offsets(obj))
+
+# as we described, you can also override the default container types, but this is not recommended
+# it may be useful for custom types, but remember these won't in general be usable outside of Julia
+Locate.containertype(::Type{CustomType}, obj::ObjMetadata) = NullablePrimitive # returned value should have no type paramters
+```
+In the above we showed constructors receiving the arguments they *would* receive if you *only* defined the `Locate` methods listed in the previous section, but
+of course you can make these constructors do anything you want, as long as return the proper type as an output.
+
+
+## Writing Data
+Writing is somewhat simpler than reading as Arrow will figure out how to convert ordinary Julia data to Arrow formatted data for you.  In addition to
+`arrowformat` the other two most important functions for writing data will be `rawpadded` and `writepadded`.  `rawpadded` takes a `Primitive` as argument and
+returns a properly Arrow padded `Vector{UInt8}` appropriate for writing the data directly to an Arrow formatted buffer.  `writepadded` will write the properly
+padded array to an `IO` object.
 ```julia
 A = NullableList(data)
 writepadded(io, A, bitmask, offsets, values)  # write bitmask, offsets then values of A, all contiguously, all properly padded
@@ -223,6 +271,21 @@ B = DictEncoding(data)
 writepadded(io, B, references)  # writes references
 writepadded(io, levels(B), offsets, bitmask, values)  # writes the NullableList in a different order than above
 ```
+
+The following table show which sub-buffers are relevant for which `ArrowVector`s.  All sub-buffers can be accessed as `Primitive`s simply by doing, for example
+`bitmask(l)` where `l isa ArrowVector{Union{T,Missing}} where T` returns the primitive representing the null bit mask.
+
+|        | `values` | `bitmask` | `offsets` |
+| --- | --- | --- | --- |
+| `Primitive` | 1 | 0 | 0 |
+| `NullablePrimitive` | 1 | 1 | 0 |
+| `List` | 1 | 0 | 1 |
+| `NullableList` | 1 | 1 | 1 |
+| `BitPrimitive` | 1 | 0 | 0 |
+| `NullableBitPrimitive` | 1 | 1 | 0 |
+
+`DictEncoding` is a bit more complicated as it can contain any of the other types, but its references and data pool can be accessed with `references` and `pool`
+respectively.
 
 ## DateTime
 Arrow.jl provides Arrow formatted date-time objects that have Julia equivalents.  These are `Arrow.Datestamp=>Dates.Date`, `Arrow.Timestamp=>Dates.DateTime` and

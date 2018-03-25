@@ -27,7 +27,6 @@ module Locate
     function valueslength end
     function bitmask end
     function offsets end
-    function offsetstype end
 
     struct Values{J} <: Abstract
         loc::Int64
