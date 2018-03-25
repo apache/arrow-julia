@@ -36,21 +36,21 @@ module Locate
         loc::Int64
         len::Int64
         Values{J}(loc::Integer, len::Integer) where {J} = (checkalignment(loc); new{J}(loc, len))
-        Values{J}(x) where {J} = Values{J}(values(x), valueslength(x))
-        Values(::Type{String}, x) = Values{UInt8}(values(x), valueslength(x))
-        Values(::Type{Union{String,Missing}}, x) = Values{UInt8}(values(x), valueslength(x))
     end
+    Values{J}(x) where {J} = Values{J}(values(x), valueslength(x))
+    Values(::Type{String}, x) = Values{UInt8}(values(x), valueslength(x))
+    Values(::Type{Union{String,Missing}}, x) = Values{UInt8}(values(x), valueslength(x))
     struct Bitmask <: Abstract
         loc::Int64
         Bitmask(loc::Integer) = (checkalignment(loc); new(loc))
-        Bitmask(x) = Bitmask(bitmask(x))
     end
+    Bitmask(x) = Bitmask(bitmask(x))
     struct Offsets{J<:Integer} <: Abstract
         loc::Int64
         Offsets{J}(loc::Integer) where {J} = (checkalignment(loc); new{J}(loc))
-        Offsets{J}(x) where {J} = Offsets{J}(offsets(x))
-        Offsets(x) = Offsets{Int64}(offsets(x))
     end
+    Offsets{J}(x) where {J} = Offsets{J}(offsets(x))
+    Offsets(x) = Offsets{Int64}(offsets(x))
 end
 export Locate
 
@@ -91,12 +91,12 @@ function locate(::Type{NullableList}, data::Vector{UInt8}, ::Type{J}, vec::T) wh
     locate(data, J, Locate.Bitmask(vec), Locate.Offsets(vec), Locate.Values(J, vec), Locate.length(vec))
 end
 # these are a little inflexible and need more specific declarations
-function locate(::Type{BitPrimitive}, data::Vector{UInt8}, ::Type{Bool}, vec::T) where {J,T}
+function locate(::Type{BitPrimitive}, data::Vector{UInt8}, ::Type{Bool}, vec::T) where {T}
     vals = Locate.Values{Bool}(vec)
     BitPrimitive(data, vals.loc, Locate.length(vec))
 end
 function locate(::Type{NullableBitPrimitive}, data::Vector{UInt8}, ::Type{Union{Bool,Missing}},
-                vec::T) where {J,T}
+                vec::T) where {T}
     bmask = Locate.Bitmask(vec)
     vals = Locate.Values{Bool}(vec)
     NullableBitPrimitive(data, bmask.loc, values.loc, Locate.length(vec))
