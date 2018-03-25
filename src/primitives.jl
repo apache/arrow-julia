@@ -207,8 +207,8 @@ To obtain the number of values bytes needed to string data, one must input `C` t
 type the string will be converted to (e.g. `UInt8`).
 """
 valuesbytes(::Type{J}, len::Integer) where J = padding(sizeof(J)*len)
-valuesbytes(A::AbstractVector{J}) where J = valuesbytes(J, len)
-valuesbytes(A::AbstractVector{Union{J,Missing}}) where J = valuesbytes(J, len)
+valuesbytes(A::AbstractVector{J}) where J = valuesbytes(J, length(A))
+valuesbytes(A::AbstractVector{Union{J,Missing}}) where J = valuesbytes(J, length(A))
 export valuesbytes
 
 """

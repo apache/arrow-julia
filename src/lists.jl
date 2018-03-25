@@ -76,15 +76,15 @@ end
 # buffer with location constructors
 function List{J,K}(data::Vector{UInt8}, offset_idx::Integer, values_idx::Integer, ::Type{C},
                    x::AbstractVector) where {K<:Integer,C,J}
-    offs = Primitive{K}(data, offset_idx, offsets(C, x))
+    offs = Primitive{K}(data, offset_idx, offsets(K, C, x))
     p = Primitive(data, values_idx, encode(C, x))
     List{J}(offs, p)
 end
 # this puts offsets first
 function List{J,K}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector
                   ) where {K<:Integer,C,J}
-    offs = Primitive{K}(data, i, offsets(C, x))
-    p = Primitive(data, i+offsetsbytes(x), encode(C, x))
+    offs = Primitive{K}(data, i, offsets(K, C, x))
+    p = Primitive(data, i+totalbytes(offs), encode(C, x))
     List{J}(offs, p)
 end
 
@@ -94,7 +94,7 @@ function List{J,K}(data::Vector{UInt8}, i::Integer, x::AbstractVector{<:Abstract
 end
 
 function List{J,K}(::Type{<:Array}, ::Type{C}, x::AbstractVector) where {K<:Integer,C,J}
-    b = Vector{UInt8}(undef, totalbytes(C, x))
+    b = Vector{UInt8}(undef, totalbytes(K, C, x))
     List{J,K}(b, 1, C, x)
 end
 
@@ -106,7 +106,7 @@ function List(::Type{<:Array}, x::AbstractVector{S}) where S<:AbstractString
 end
 
 function List{J,K}(::Type{C}, v::AbstractVector) where {K<:Integer,J,C}
-    offs = Primitive{K}(offsets(C, v))
+    offs = Primitive{K}(offsets(K, C, v))
     p = Primitive(encode(C, v))
     List{J}(offs, p)
 end
@@ -204,7 +204,7 @@ function NullableList{J,K}(data::Vector{UInt8}, bitmask_idx::Integer, offset_idx
                            values_idx::Integer, ::Type{C}, x::AbstractVector
                           ) where {C,K<:Integer,J}
     bmask = Primitive{UInt8}(data, bitmask_idx, bitmaskpadded(x))
-    offs = Primitive{K}(data, offset_idx, offsets(x))
+    offs = Primitive{K}(data, offset_idx, offsets(K, x))
     vals = Primitive(data, values_idx, encode(C, x))
     NullableList{J}(bmask, offs, vals)
 end
@@ -212,8 +212,8 @@ end
 function NullableList{J,K}(data::Vector{UInt8}, i::Integer, ::Type{C}, x::AbstractVector
                           ) where {C,K<:Integer,J}
     bmask = Primitive{UInt8}(data, i, bitmaskpadded(x))
-    offs = Primitive{K}(data, i+bitmaskbytes(x), offsets(C, x))
-    vals = Primitive(data, i+bitmaskbytes(x)+offsetsbytes(x), encode(C, x))
+    offs = Primitive{K}(data, i+bitmaskbytes(x), offsets(K, C, x))
+    vals = Primitive(data, i+bitmaskbytes(x)+totalbytes(offs), encode(C, x))
     NullableList{J}(bmask, offs, vals)
 end
 
@@ -242,7 +242,7 @@ end
 
 function NullableList{J,K}(::Type{C}, v::AbstractVector) where {J,K<:Integer,C}
     bmask = Primitive{UInt8}(bitmaskpadded(v))
-    offs = Primitive{K}(offsets(C, v))
+    offs = Primitive{K}(offsets(K, C, v))
     vals = Primitive(encode(C, v))
     NullableList{J}(bmask, offs, vals)
 end
@@ -267,14 +267,16 @@ valuesbytes(A::Union{List{P,J},NullableList{P,J}}) where {P,J} = valuesbytes(A.v
 bitmaskbytes(A::List) = 0
 bitmaskbytes(A::NullableList) = bytesforbits(length(A))
 
-offsetsbytes(len::Integer) = padding((len+1)*sizeof(Int32))
-offsetsbytes(A::AbstractVector) = offsetsbytes(length(A))
+offsetsbytes(::Type{K}, len::Integer) where {K<:Integer} = padding((len+1)*sizeof(K))
+offsetsbytes(::Type{K}, A::AbstractVector) where {K<:Integer} = offsetsbytes(K, length(A))
+offsetsbytes(l::AbstractList) = totalbytes(l.offsets)
 export offsetsbytes
 
-function totalbytes(::Type{C}, A::AbstractVector) where C
-    valuesbytes(C, A) + bitmaskbytes(A) + offsetsbytes(A)
+function totalbytes(::Type{K}, ::Type{C}, A::AbstractVector) where {K<:Integer,C}
+    valuesbytes(C, A) + bitmaskbytes(A) + offsetsbytes(K, A)
 end
-function totalbytes(::Type{Union{J,Missing}}, ::Type{C}, A::AbstractVector) where {J,C}
+function totalbytes(::Type{Union{J,Missing}}, ::Type{K}, ::Type{C}, A::AbstractVector
+                   ) where {J,K<:Integer,C}
     valuesbytes(C, A) + bitmaskbytes(Union{J,Missing}, A) + offsetsbytes(A)
 end
 totalbytes(A::AbstractList) = valuesbytes(A) + minbitmaskbytes(A) + offsetsbytes(A)
@@ -291,15 +293,15 @@ _offsize(::Type{C}, x::AbstractString) where C = sizeof(C)*length(x)
 
 Construct a `Vector{Int32}` of offsets appropriate for data appearing in `v`.
 """
-function offsets(::Type{C}, v::AbstractVector) where C
-    off = Vector{Int32}(undef, length(v)+1)
+function offsets(::Type{K}, ::Type{C}, v::AbstractVector) where {K<:Integer,C}
+    off = Vector{K}(undef, length(v)+1)
     off[1] = 0
     for i ∈ 2:length(off)
         off[i] = _offsize(C, v[i-1]) + off[i-1]
     end
     off
 end
-offsets(v::AbstractVector{K}) where K = offsets(K, v)
+offsets(::Type{K}, v::AbstractVector{C}) where {K<:Integer,C} = offsets(K, C, v)
 function offsets(v::AbstractVector{<:AbstractString})
     throw(ArgumentError("must specify encoding type for computing string offsets"))
 end
