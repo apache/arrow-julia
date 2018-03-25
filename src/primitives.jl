@@ -424,6 +424,21 @@ function construct(::Type{T}, A::AbstractPrimitive, i::Integer, len::Integer) wh
 end
 
 
+function arrowview_contiguous(p::Primitive{J}, idx::AbstractVector{<:Integer}) where J
+    Primitive{J}(p.data, _rawvalueindex_start(p, first(idx)), length(idx))
+end
+
+"""
+    arrowview(p::ArrowVector, idx::UnitRange)
+
+Return another `ArrowVector` which is a view into `p` for the index range `idx`.
+
+This can only be done with contiguous indices.
+"""
+arrowview(p::Primitive, idx::UnitRange) = arrowview_contiguous(p, idx)
+export arrowview
+
+
 function setindex!(A::Primitive{J}, x, i::Integer) where J
     @boundscheck checkbounds(A, i)
     setvalue!(A, convert(J, x), i)  # should this conversion really be here?
