@@ -4,6 +4,9 @@
 abstract type AbstractList{J} <: ArrowVector{J} end
 export AbstractList
 
+# default offset type to use
+const DefaultOffset = Int32
+
 
 """
     List{P<:AbstractPrimitive,J} <: AbstractList{J}
@@ -102,7 +105,7 @@ function List{J,K}(::Type{<:Array}, x::AbstractVector{<:AbstractString}) where {
     List{J,K}(Array, UInt8, x)
 end
 function List(::Type{<:Array}, x::AbstractVector{S}) where S<:AbstractString
-    List{S,Int64}(Array, UInt8, x)
+    List{S,DefaultOffset}(Array, UInt8, x)
 end
 
 function List{J,K}(::Type{C}, v::AbstractVector) where {K<:Integer,J,C}
@@ -110,7 +113,7 @@ function List{J,K}(::Type{C}, v::AbstractVector) where {K<:Integer,J,C}
     p = Primitive(encode(C, v))
     List{J}(offs, p)
 end
-List(v::AbstractVector{<:AbstractString}) = List{String,Int64}(UInt8, v)
+List(v::AbstractVector{<:AbstractString}) = List{String,DefaultOffset}(UInt8, v)
 
 
 List{J}(l::List{J}) where J = List{J}(l.length, l.offsets, l.values)
@@ -237,7 +240,7 @@ function NullableList{J,K}(::Type{<:Array}, x::AbstractVector{Union{J,Missing}})
     NullableList{J,K}(Array, UInt8, x)
 end
 function NullableList(::Type{<:Array}, x::AbstractVector{J}) where {J<:AbstractString}
-    NullableList{J,Int64}(Array, UInt8, x)
+    NullableList{J,DefaultOffset}(Array, UInt8, x)
 end
 
 function NullableList{J,K}(::Type{C}, v::AbstractVector) where {J,K<:Integer,C}
@@ -246,9 +249,11 @@ function NullableList{J,K}(::Type{C}, v::AbstractVector) where {J,K<:Integer,C}
     vals = Primitive(encode(C, v))
     NullableList{J}(bmask, offs, vals)
 end
-NullableList(::Type{C}, v::AbstractVector{J}) where {C,J} = NullableList{J,Int64}(C, v)
-NullableList(::Type{C}, v::AbstractVector{Union{J,Missing}}) where {C,J} = NullableList{J,Int64}(C, v)
-NullableList(v::AbstractVector) = NullableList{String,Int64}(UInt8, v)
+NullableList(::Type{C}, v::AbstractVector{J}) where {C,J} = NullableList{J,DefaultOffset}(C, v)
+function NullableList(::Type{C}, v::AbstractVector{Union{J,Missing}}) where {C,J}
+    NullableList{J,DefaultOffset}(C, v)
+end
+NullableList(v::AbstractVector) = NullableList{String,DefaultOffset}(UInt8, v)
 
 NullableList{J}(l::NullableList{J}) where J = NullableList{J}(p.length, p.bitmask, p.offsets, p.values)
 NullableList{J}(l::NullableList{T}) where {J,T} = NullableList{J}(convert(AbstractVector{J}, p[:]))

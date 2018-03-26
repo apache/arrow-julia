@@ -70,13 +70,13 @@ struct LocateTest3 end
 
     Locate.length(::LocateTest3) = length(v)
     Locate.offsets(::LocateTest3) = 1
-    Locate.values(::LocateTest3) = (length(v)+1)*sizeof(Int64) + 1
+    Locate.values(::LocateTest3) = padding((length(v)+1)*sizeof(Arrow.DefaultOffset)) + 1
     Locate.valueslength(::LocateTest3) = 14
 
     data = rawpadded(p, offsets, values)
 
     pp = locate(data, String, LocateTest3())
-    @test typeof(pp) == List{String,Int64,Primitive{UInt8}}
+    @test typeof(pp) == List{String,Arrow.DefaultOffset,Primitive{UInt8}}
     @test p[:] == pp[:]
 end
 
@@ -114,11 +114,11 @@ end
 
     v = String[randstring_() for i ∈ 1:len]
     p = arrowformat(v)
-    @test typeof(p) == List{String,Int64,Primitive{UInt8}}
+    @test typeof(p) == List{String,Arrow.DefaultOffset,Primitive{UInt8}}
 
     v = Union{String,Missing}[mask[i] ? randstring_() : missing for i ∈ 1:len]
     p = arrowformat(v)
-    @test typeof(p) == NullableList{String,Int64,Primitive{UInt8}}
+    @test typeof(p) == NullableList{String,Arrow.DefaultOffset,Primitive{UInt8}}
 
     v = rand(Bool, len)
     p = arrowformat(v)
@@ -154,5 +154,5 @@ end
 
     v = categorical(["a", "b", "c"])
     p = arrowformat(v)
-    @test typeof(p) == DictEncoding{String,Primitive{Int32},List{String,Int64,Primitive{UInt8}}}
+    @test typeof(p) == DictEncoding{String,Primitive{Int32},List{String,Arrow.DefaultOffset,Primitive{UInt8}}}
 end

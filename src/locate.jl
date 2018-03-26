@@ -4,7 +4,7 @@ import Base: hcat, vcat
 
 module Locate
     import Arrow
-    using Arrow: ALIGNMENT
+    using Arrow: ALIGNMENT, DefaultOffset
 
     if VERSION < v"0.7.0-"
         using Missings
@@ -50,7 +50,7 @@ module Locate
         Offsets{J}(loc::Integer) where {J} = (checkalignment(loc); new{J}(loc))
     end
     Offsets{J}(x) where {J} = Offsets{J}(offsets(x))
-    Offsets(x) = Offsets{Int64}(offsets(x))
+    Offsets(x) = Offsets{DefaultOffset}(offsets(x))
 end
 export Locate
 
