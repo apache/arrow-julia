@@ -9,15 +9,15 @@ referencing data that conforms to the Arrow standard.  This allows users to seam
 Please see this [document](https://arrow.apache.org/docs/memory_layout.html) for a description of the Arrow memory layout.
 
 ***WARNING*** As of right now this package uses Julia `Ptr` (pointer) objects and "unsafe" methods.  This is for performance reasons.  It should in principle be
-possible to make this package completely safe, but we are waiting on some performance improvements in `Base`.  While Arrow.jl has been tested and should be safe
-with proper usage, it is up to the user to make sure that their Arrow.jl objects reference the appropriate locations in data.  If the user, for example, uses an
-Arrow.jl object to reference data past the end of an array, the resulting program will segfault!
+possible to make this package completely safe with little to no loss in performance, but we are waiting on some performance improvements in `Base`.  While
+Arrow.jl has been tested and should be safe with proper usage, it is up to the user to make sure that their Arrow.jl objects reference the appropriate locations
+in data.  If the user, for example, uses an Arrow.jl object to reference data past the end of an array, the resulting program will segfault!
 
 
 ## Installation
-For now this package is not registered, so do
+Just do
 ```julia
-Pkg.clone("https://github.com/ExpandingMan/Arrow.jl")
+import Pkg; Pkg.add("Arrow")
 ```
 Arrow only has `CategoricalArrays` as a dependency (and `Missings` on 0.6).
 
@@ -97,7 +97,7 @@ l = List{String,Int32}(buff, 1, 3, v) # arguments are: buffer, offset location, 
 # or you can create each piece individually
 o = Primitive{Int32}(buff, 1, 4)  # note that the Int32 type is required for offsets by the arrow format
 v = Primitive{UInt8}(buff, length(offs)+1, length(vals))
-l = List{String,Int32}(o, v)
+l = List{String}(o, v)
 
 l[1] # returns "abc"
 l[2] # returns "de"
@@ -114,6 +114,10 @@ rawvalues(offsets(m)) # returns reinterpret(UInt8, [0,3,5,7])
 rawvalues(values(m)) # returns convert(Vector{UInt8}, "abcdefg")
 ```
 Note that `List{J}` and `NullableList{J}` use the constructor `J(::AbstractVector{C})` where `C` is the values type (in the above example `UInt8`)
+
+***WARNING:*** Currently the values of the offsets themselves are not bounds-checked for performance reasons.  This means you have to be extra sure that your
+offsets are properly constructed.  It is recommended that you always use `arrowformat`, `List`, or `offsets` to construct offsets, this should not be done
+manually.
 
 Enter `?List` in the REPL for a full list of constructors.
 
@@ -233,8 +237,8 @@ Of course, you may only need to define a subset of these.  For example, if all y
 
 ### Overriding Defaults
 The above interface may not be adequate for all purposes.  For example, if you only define the methods listed above, the offsets type will always default to
-`Int64`.  Furthermore, the type of `ArrowVector` will be determined by the desired return value (i.e. `Primitive` for bits-types, `List` for strings,
-`NullablePrimitive` for `Union{T,Missing}` where `T` is a bits-type, etc.)  To override these defaults you can use more detailed methods:
+`Int32` (the Arrow format standard).  Furthermore, the type of `ArrowVector` will be determined by the desired return value (i.e. `Primitive` for bits-types,
+`List` for strings, `NullablePrimitive` for `Union{T,Missing}` where `T` is a bits-type, etc.)  To override these defaults you can use more detailed methods:
 ```julia
 # value data can be specified by defining the Locate.Values methods
 # T is the value data type, but you may not need it because the overall container return type will override it
@@ -247,8 +251,8 @@ Locate.Values(::Type{T}, obj::ObjMetadata) where T = Locate.Values{UInt8}(Locate
 # there's not really a reason to define Locate.Bitmask if you defined Locate.bitmask, but it's there
 Locate.Bitmask(obj::ObjMetadata) = Locate.Bitmask(Locate.bitmask(obj))
 
-# you can use Locate.Offsets to override the default offset type of Int64
-Locate.Offsets(obj::ObjMetadata) = Locate.Offsets{Int32}(Locate.offsets(obj))
+# you can use Locate.Offsets to override the default offset type of Int32
+Locate.Offsets(obj::ObjMetadata) = Locate.Offsets{Int64}(Locate.offsets(obj))
 
 # as we described, you can also override the default container types, but this is not recommended
 # it may be useful for custom types, but remember these won't in general be usable outside of Julia
