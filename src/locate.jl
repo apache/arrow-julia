@@ -99,7 +99,7 @@ function locate(::Type{NullableBitPrimitive}, data::Vector{UInt8}, ::Type{Union{
                 vec::T) where {T}
     bmask = Locate.Bitmask(vec)
     vals = Locate.Values{Bool}(vec)
-    NullableBitPrimitive(data, bmask.loc, values.loc, Locate.length(vec))
+    NullableBitPrimitive(data, bmask.loc, vals.loc, Locate.length(vec))
 end
 export locate
 
