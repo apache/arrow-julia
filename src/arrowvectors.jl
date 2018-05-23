@@ -235,11 +235,6 @@ function size(A::ArrowVector, i::Integer)
 end
 
 
-start(::ArrowVector) = 1
-next(A::ArrowVector, i::Integer) = (A[i], i+1)
-done(A::ArrowVector, i::Integer) = i > length(A)
-
-
 convert(::Type{Array{T}}, A::ArrowVector{T}) where T = A[:]
 convert(::Type{Vector{T}}, A::ArrowVector{T}) where T = A[:]
 
