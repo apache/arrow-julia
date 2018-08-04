@@ -1,5 +1,3 @@
-__precompile__(true)
-
 module Arrow
 
 using CategoricalArrays, Compat, Compat.Dates
