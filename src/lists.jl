@@ -2,7 +2,6 @@
 # TODO bounds checking for all indices
 
 abstract type AbstractList{J} <: ArrowVector{J} end
-export AbstractList
 
 # default offset type to use
 const DefaultOffset = Int32
@@ -47,7 +46,6 @@ struct List{J,K<:Integer,P<:AbstractPrimitive} <: AbstractList{J}
     offsets::Primitive{K}
     values::P
 end
-export List
 
 # Primitive constructors
 function List{J}(len::Integer, offs::Primitive{K}, vals::P) where {J,K<:Integer,P<:AbstractPrimitive}
@@ -120,8 +118,6 @@ List{J}(l::List{J}) where J = List{J}(l.length, l.offsets, l.values)
 List{J}(l::List{T}) where {J,T} = List{J}(convert(AbstractVector{J}, l[:]))
 List(l::List{J}) where J = List{J}(l)
 
-copy(l::List) = List(l)
-
 
 """
     NullableList{P<:AbstractPrimitive,J} <: AbstractList{Union{Missing,J}}
@@ -168,7 +164,6 @@ struct NullableList{J,K<:Integer,P<:AbstractPrimitive} <: AbstractList{Union{Mis
     offsets::Primitive{K}
     values::P
 end
-export NullableList
 
 # Primitive constructors
 function NullableList{J}(len::Integer, bmask::Primitive{UInt8}, offs::Primitive{K},
@@ -259,8 +254,6 @@ NullableList{J}(l::NullableList{J}) where J = NullableList{J}(p.length, p.bitmas
 NullableList{J}(l::NullableList{T}) where {J,T} = NullableList{J}(convert(AbstractVector{J}, p[:]))
 NullableList(l::NullableList{J}) where J = NullableList{J}(l)
 
-copy(l::NullableList) = NullableList(l)
-
 #====================================================================================================
     common interface
 ====================================================================================================#
@@ -275,7 +268,6 @@ bitmaskbytes(A::NullableList) = bytesforbits(length(A))
 offsetsbytes(::Type{K}, len::Integer) where {K<:Integer} = padding((len+1)*sizeof(K))
 offsetsbytes(::Type{K}, A::AbstractVector) where {K<:Integer} = offsetsbytes(K, length(A))
 offsetsbytes(l::AbstractList) = totalbytes(l.offsets)
-export offsetsbytes
 
 function totalbytes(::Type{K}, ::Type{C}, A::AbstractVector) where {K<:Integer,C}
     valuesbytes(C, A) + bitmaskbytes(A) + offsetsbytes(K, A)
@@ -313,7 +305,6 @@ end
 function offsets(v::AbstractVector{<:AbstractString})
     throw(ArgumentError("must specify encoding type for computing string offsets"))
 end
-export offsets
 
 
 function check_offset_bounds(l::AbstractList, i::Integer)
@@ -351,7 +342,6 @@ Retrieve offset `i` for list `l`.  Note that this retrieves the Arrow formated 0
 numbers!
 """
 getoffset(l::AbstractList, i) = l.offsets[i]
-export getoffset
 
 
 """
