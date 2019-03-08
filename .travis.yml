@@ -9,8 +9,6 @@ julia:
   - nightly
 notifications:
   email: false
-git:
-  depth: 99999999
 
 ## uncomment the following lines to allow failures on nightly julia
 ## (tests will run but not make your overall status red)
@@ -27,8 +25,8 @@ matrix:
 #  - if [ $TRAVIS_OS_NAME = osx ]; then brew install gcc; fi
 
 ## uncomment the following lines to override the default test script
-#script:
-#  - julia -e 'Pkg.clone(pwd()); Pkg.build("Arrow"); Pkg.test("Arrow"; coverage=true)'
+script:
+  - julia -e 'Pkg.clone(pwd()); Pkg.build("Arrow"); Pkg.test("Arrow"; coverage=true)'
 after_success:
   # push coverage results to Coveralls
   - julia --project -e 'using Pkg; Pkg.add("Coverage"); using Coverage; Coveralls.submit(Coveralls.process_folder())'
