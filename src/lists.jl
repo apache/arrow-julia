@@ -113,7 +113,7 @@ function List{J,K}(::Type{C}, v::AbstractVector) where {K<:Integer,J,C}
 end
 List(v::AbstractVector{<:AbstractString}) = List{String,DefaultOffset}(UInt8, v)
 
-
+List{J,K,P}(l::List{J,K,P}) where {J,K,P} = List{J,K,P}(l.length, l.offsets, l.values)
 List{J}(l::List{J}) where J = List{J}(l.length, l.offsets, l.values)
 List{J}(l::List{T}) where {J,T} = List{J}(convert(AbstractVector{J}, l[:]))
 List(l::List{J}) where J = List{J}(l)
@@ -250,7 +250,10 @@ function NullableList(::Type{C}, v::AbstractVector{Union{J,Missing}}) where {C,J
 end
 NullableList(v::AbstractVector) = NullableList{String,DefaultOffset}(UInt8, v)
 
-NullableList{J}(l::NullableList{J}) where J = NullableList{J}(p.length, p.bitmask, p.offsets, p.values)
+function NullableList{J,K,P}(l::NullableList{J,K,P}) where {J,K,P} 
+    NullableList{J,K,P}(l.length, l.bitmask, l.offsets, l.values)
+end
+NullableList{J}(l::NullableList{J}) where J = NullableList{J}(l.length, l.bitmask, l.offsets, l.values)
 NullableList{J}(l::NullableList{T}) where {J,T} = NullableList{J}(convert(AbstractVector{J}, p[:]))
 NullableList(l::NullableList{J}) where J = NullableList{J}(l)
 
