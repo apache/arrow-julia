@@ -96,10 +96,6 @@ function encode(::Type{C}, v::AbstractVector{Union{J, Missing}}) where {C, J <: 
 end
 
 
-
-function myencode(::Type{UInt8}, x::Vector{J}) where {J <: AbstractString}
-end
-
 function replace_missing_vals(A::AbstractVector{Union{J,Missing}}) where J<:Number
     J[ismissing(x) ? zero(J) : x for x ∈ A]
 end
