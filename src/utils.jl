@@ -69,6 +69,32 @@ function encode(::Type{C}, v::AbstractVector{Union{J,Missing}}) where {C,J}
     end
 end
 
+function encode(::Type{C}, v::AbstractVector{J}) where {C, J <: AbstractString}
+    N   = mapreduce(length ∘ codeunits, +, v)
+    enc = Vector{C}(undef, N)
+    i   = 0
+    for val in v, c in codeunits(val)
+       i += 1
+       enc[i] = convert(C, c)
+    end
+    return enc
+end
+
+function encode(::Type{C}, v::AbstractVector{Union{J, Missing}}) where {C, J <: AbstractString}
+    N   = mapreduce(x -> ismissing(x) ? 0 : length(codeunits(x)) , +, v)
+    enc = Vector{C}(undef, N)
+    i   = 0
+    for val in v
+        if !ismissing(val)
+            for c in codeunits(val)
+                i += 1
+                enc[i] = convert(C, c)
+            end
+        end
+    end
+    return enc
+end
+
 
 function replace_missing_vals(A::AbstractVector{Union{J,Missing}}) where J<:Number
     J[ismissing(x) ? zero(J) : x for x ∈ A]
