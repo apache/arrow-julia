@@ -1,3 +1,2 @@
-julia 0.7
+julia 1.0
 CategoricalArrays
-Compat 0.66.0

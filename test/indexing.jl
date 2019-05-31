@@ -70,6 +70,16 @@ end
 end
 
 
+@testset "indexing_Primitive_empty" begin
+    for i ∈ 1:N_OUTER
+        dtype = rand(PRIMITIVE_ELTYPES)
+        p = Primitive(dtype[])
+        @test isempty(p)
+        @test_throws BoundsError p[1]
+    end
+end
+
+
 @testset "indexing_NullablePrimitive_buffer" begin
     for i ∈ 1:N_OUTER
         len, dtype, bmask, lpad, b, v = rand_nullableprimitive_buffer()
@@ -141,11 +151,21 @@ end
 end
 
 
+@testset "indexing_NullablePrimitive_empty" begin
+    for i ∈ 1:N_OUTER
+        dtype = rand(PRIMITIVE_ELTYPES)
+        p = NullablePrimitive(dtype[])
+        @test isempty(p)
+        @test_throws BoundsError p[1]
+    end
+end
+
+
 @testset "indexing_List_buffer" begin
     len  = 5
     offstype = rand(OFFSET_ELTYPES)
-    offs = convert(Vector{offstype}, [0,4,7,8,12,14])
-    vals = convert(Vector{UInt8}, codeunits("firewalkwithme"))
+    offs = convert(Vector{offstype}, [0,7,15,18,24,30])
+    vals = convert(Vector{UInt8}, codeunits("fireα walk∀ with🐱 me🐟"))
     valspad = zeros(UInt8, Arrow.paddinglength(length(vals)))
     lpad = randpad()
     rpad = randpad()
@@ -154,14 +174,14 @@ end
                               len, UInt8, length(vals))
     @test offsets(l)[:] == offs
     @test values(l)[:] == vals
-    @test l[1] == "fire"
-    @test l[2] == "wal"
-    @test l[3] == "k"
-    @test l[4] == "with"
-    @test l[5] == "me"
-    @test l[[1,3,5]] == ["fire", "k", "me"]
-    @test l[[false,true,false,true,false]] == ["wal", "with"]
-    @test l[:] == ["fire", "wal", "k", "with", "me"]
+    @test l[1] == "fireα "
+    @test l[2] == "walk∀ "
+    @test l[3] == "wit"
+    @test l[4] == "h🐱 "
+    @test l[5] == "me🐟"
+    @test l[[1,3,5]] == ["fireα ", "wit", "me🐟"]
+    @test l[[false,true,false,true,false]] == ["walk∀ ", "h🐱 "]
+    @test l[:] == ["fireα ", "walk∀ ", "wit", "h🐱 ", "me🐟"]
 end
 
 
@@ -183,11 +203,20 @@ end
 end
 
 
+@testset "indexing_List_empty" begin
+    for i ∈ 1:N_OUTER
+        l = List(fill("", i))
+        @test l[rand(1:i)] == ""
+    end
+end
+
+
 @testset "indexing_NullableList_buffer" begin
     len = 7
     offstype = rand(OFFSET_ELTYPES)
     offs = convert(Vector{offstype}, [0,4,9,9,14,14,17,21])
-    vals = convert(Vector{UInt8}, codeunits("kirkspockbonesncc1701"))
+    offs = convert(Vector{offstype}, [0,9,17,17,28,28,31,35])
+    vals = convert(Vector{UInt8}, codeunits("kirk 🚀η spockbones, 💀ncc1701"))
     valspad = zeros(UInt8, Arrow.paddinglength(length(vals)))
     pres = Bool[true,true,false,true,false,true,true]
     mask = Arrow.bitpackpadded(pres)
@@ -199,16 +228,16 @@ end
                                       len, UInt8, length(vals))
     @test offsets(l)[:] == offs
     @test values(l)[:] == vals
-    @test l[1] == "kirk"
-    @test l[2] == "spock"
+    @test l[1] == "kirk 🚀"
+    @test l[2] == "η spock"
     @test ismissing(l[3])
-    @test l[4] == "bones"
+    @test l[4] == "bones, 💀"
     @test ismissing(l[5])
     @test l[6] == "ncc"
     @test l[7] == "1701"
-    @test l[[2,5,4]] ≅ ["spock", missing, "bones"]
-    @test l[[true,false,true,false,false,false,false]] ≅ ["kirk", missing]
-    @test l[:] ≅ ["kirk", "spock", missing, "bones", missing, "ncc", "1701"]
+    @test l[[2,5,4]] ≅ ["η spock", missing, "bones, 💀"]
+    @test l[[true,false,true,false,false,false,false]] ≅ ["kirk 🚀", missing]
+    @test l[:] ≅ ["kirk 🚀", "η spock", missing, "bones, 💀", missing, "ncc", "1701"]
 end
 
 
@@ -229,6 +258,14 @@ end
             @test l[idx] ≅ v[idx]
         end
         @test l[:] ≅ v
+    end
+end
+
+
+@testset "indexing_NullableList_empty" begin
+    for i ∈ 1:N_OUTER
+        l = NullableList(fill("", i))
+        @test l[rand(1:i)] == ""
     end
 end
 
