@@ -1,7 +1,7 @@
 name = "Arrow"
 uuid = "69666777-d1a9-59fb-9406-91d4454c9d45"
 authors = ["ExpandingMan <expandingman@protonmail.com"]
-version = "0.3.0"
+version = "0.2.4"
 
 [deps]
 CategoricalArrays = "324d7699-5711-5eae-9e2f-1d82baa6b597"
