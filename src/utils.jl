@@ -89,7 +89,7 @@ end
 
 # read a single element from a byte vector
 # copied from read(::IOBuffer, T) in Base
-function readbuffer(t::AbstractVector{UInt8}, pos::Int, ::Type{T}) where {T}
+function readbuffer(t::AbstractVector{UInt8}, pos::Integer, ::Type{T}) where {T}
     GC.@preserve t begin
         ptr::Ptr{T} = pointer(t, pos)
         x = unsafe_load(ptr)
