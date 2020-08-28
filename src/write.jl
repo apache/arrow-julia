@@ -28,7 +28,7 @@ end
 if isdefined(Tables, :partitions)
     parts = Tables.partitions
 else
-    parts = x -> (x,)
+    parts(x) = (x,)
     parts(x::Tuple) = x
 end
 
