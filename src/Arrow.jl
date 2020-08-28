@@ -1,6 +1,7 @@
 module Arrow
 
 using Mmap
+import Dates
 using Tables, SentinelArrays
 
 using Base: @propagate_inbounds

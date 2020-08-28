@@ -25,6 +25,13 @@ function write(io::IO, tbl; debug::Bool=false)
     return write(io, tbl, false, debug)
 end
 
+if isdefined(Tables, :partitions)
+    parts = Tables.partitions
+else
+    parts(x) = (x,)
+    parts(x::Tuple) = x
+end
+
 function write(io, source, writetofile, debug)
     if writetofile
         Base.write(io, "ARROW1\0\0")
@@ -35,10 +42,16 @@ function write(io, source, writetofile, debug)
     dictid = Ref(0)
     dictencodings = Dict{Int, Tuple{Int, Type, Any}}()
     # start message writing from channel
+@static if VERSION >= v"1.3-DEV"
     tsk = Threads.@spawn for msg in msgs
         Base.write(io, msg)
     end
-    @sync for (i, tbl) in enumerate(Tables.partitions(source))
+else
+    tsk = @async for msg in msgs
+        Base.write(io, msg)
+    end
+end
+    @sync for (i, tbl) in enumerate(parts(source))
         if i == 1
             cols = Tables.columns(tbl)
             sch[] = Tables.schema(cols)
@@ -59,6 +72,7 @@ function write(io, source, writetofile, debug)
             end
             put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, debug))
         else
+@static if VERSION >= v"1.3-DEV"
             Threads.@spawn begin
                 try
                     cols = Tables.columns(tbl)
@@ -79,6 +93,28 @@ function write(io, source, writetofile, debug)
                     rethrow(e)
                 end
             end
+else
+            @async begin
+                try
+                    cols = Tables.columns(tbl)
+                    if !isempty(dictencodings)
+                        for (colidx, (id, T, values)) in dictencodings
+                            dictsch = Tables.Schema((:col,), (eltype(values),))
+                            col = Tables.getcolumn(cols, colidx)
+                            # get new values we haven't seen before for delta update
+                            vals = setdiff(col, values)
+                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), id, true, debug))
+                            # add new values to existing set for future diffs
+                            union!(values, vals)
+                        end
+                    end
+                    put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, debug))
+                catch e
+                    showerror(stdout, e, catch_backtrace())
+                    rethrow(e)
+                end
+            end
+end
         end
     end
     close(msgs)
@@ -179,7 +215,7 @@ function fieldoffset(b, colidx, name, T, dictencodings)
         id, encodingtype, _ = dictencodings[colidx]
         _, inttype, _ = arrowtype(b, encodingtype)
         Meta.dictionaryEncodingStart(b)
-        Meta.dictionaryEncodingAddId(b, id)
+        Meta.dictionaryEncodingAddId(b, Int64(id))
         Meta.dictionaryEncodingAddIndexType(b, inttype)
         # TODO: support isOrdered?
         Meta.dictionaryEncodingAddIsOrdered(b, false)
@@ -187,7 +223,7 @@ function fieldoffset(b, colidx, name, T, dictencodings)
     else
         dict = FlatBuffers.UOffsetT(0)
     end
-    type, typeoff, children = arrowtype(b, T === Missing ? Missing : Base.nonmissingtype(T))
+    type, typeoff, children = arrowtype(b, maybemissing(T))
     if children !== nothing
         Meta.fieldStartChildrenVector(b, length(children))
         for off in Iterators.reverse(children)
@@ -255,7 +291,7 @@ function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, dictencod
 
     # write record batch object
     Meta.recordBatchStart(b)
-    Meta.recordBatchAddLength(b, nrows)
+    Meta.recordBatchAddLength(b, Int64(nrows))
     Meta.recordBatchAddNodes(b, nodes)
     Meta.recordBatchAddBuffers(b, buffers)
     return Meta.recordBatchEnd(b), bodylen
@@ -265,7 +301,7 @@ function makedictionarybatchmsg(sch::Tables.Schema{names, types}, columns, id, i
     b = FlatBuffers.Builder(1024)
     recordbatch, bodylen = makerecordbatch(b, sch, columns, nothing, debug)
     Meta.dictionaryBatchStart(b)
-    Meta.dictionaryBatchAddId(b, id)
+    Meta.dictionaryBatchAddId(b, Int64(id))
     Meta.dictionaryBatchAddData(b, recordbatch)
     Meta.dictionaryBatchAddIsDelta(b, isdelta)
     dictionarybatch = Meta.dictionaryBatchEnd(b)
@@ -291,7 +327,7 @@ function makenodesbuffers!(colidx, types, columns, dictencodings, fieldnodes, fi
         push!(fieldbuffers, Buffer(bufferoffset, blen))
         bufferoffset += padding(blen)
     else
-        bufferoffset = makenodesbuffers!(T === Missing ? Missing : Base.nonmissingtype(T), col, fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(maybemissing(T), col, fieldnodes, fieldbuffers, bufferoffset)
     end
     # make next column node/buffers
     return makenodesbuffers!(colidx + 1, types, columns, dictencodings, fieldnodes, fieldbuffers, bufferoffset)
@@ -321,6 +357,15 @@ function makenodesbuffers!(::Type{T}, col, fieldnodes, fieldbuffers, bufferoffse
     return bufferoffset + padding(blen)
 end
 
+makenodesbuffers!(::Type{Dates.Date}, col, fieldnodes, fieldbuffers, bufferoffset) =
+    makenodesbuffers!(Date{Meta.DateUnit.DAY, Int32}, converter(Date{Meta.DateUnit.DAY, Int32}, col), fieldnodes, fieldbuffers, bufferoffset)
+makenodesbuffers!(::Type{Dates.Time}, col, fieldnodes, fieldbuffers, bufferoffset) =
+    makenodesbuffers!(Time{Meta.TimeUnit.NANOSECOND, Int64}, converter(Time{Meta.TimeUnit.NANOSECOND, Int64}, col), fieldnodes, fieldbuffers, bufferoffset)
+makenodesbuffers!(::Type{Dates.DateTime}, col, fieldnodes, fieldbuffers, bufferoffset) =
+    makenodesbuffers!(Date{Meta.DateUnit.MILLISECOND, Int64}, converter(Date{Meta.DateUnit.MILLISECOND, Int64}, col), fieldnodes, fieldbuffers, bufferoffset)
+makenodesbuffers!(::Type{P}, col, fieldnodes, fieldbuffers, bufferoffset) where {P <: Dates.Period} =
+    makenodesbuffers!(Duration{arrowperiodtype(P)}, converter(Duration{arrowperiodtype(P)}, col), fieldnodes, fieldbuffers, bufferoffset)
+
 function writebitmap(io, col)
     nullcount(col) == 0 && return 0
     len = _length(col)
@@ -349,6 +394,11 @@ function writebuffer(io, ::Type{T}, col) where {T}
     return
 end
 
+writebuffer(io, ::Type{Dates.Date}, col) = writebuffer(io, Date{Meta.DateUnit.DAY, Int32}, converter(Date{Meta.DateUnit.DAY, Int32}, col))
+writebuffer(io, ::Type{Dates.Time}, col) = writebuffer(io, Time{Meta.TimeUnit.NANOSECOND, Int64}, converter(Time{Meta.TimeUnit.NANOSECOND, Int64}, col))
+writebuffer(io, ::Type{Dates.DateTime}, col) = writebuffer(io, Date{Meta.DateUnit.MILLISECOND, Int64}, converter(Date{Meta.DateUnit.MILLISECOND, Int64}, col))
+writebuffer(io, ::Type{P}, col) where {P <: Dates.Period} = writebuffer(io, Duration{arrowperiodtype(P)}, converter(Duration{arrowperiodtype(P)}, col))
+
 function makenodesbuffers!(::Type{T}, col, fieldnodes, fieldbuffers, bufferoffset) where {T <: Union{AbstractString, AbstractVector}}
     len = _length(col)
     nc = nullcount(col)
@@ -363,11 +413,14 @@ function makenodesbuffers!(::Type{T}, col, fieldnodes, fieldbuffers, bufferoffse
     push!(fieldbuffers, Buffer(bufferoffset, blen))
     bufferoffset += padding(blen)
     if T <: AbstractString || T <: AbstractVector{UInt8}
-        blen = datasizeof(col)
+        blen = 0
+        for x in col
+            blen += sizeof(x)
+        end
         push!(fieldbuffers, Buffer(bufferoffset, blen))
         bufferoffset += padding(blen)
     else
-        bufferoffset = makenodesbuffers!(Base.nonmissingtype(eltype(T)), flatten(skipmissing(col)), fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(maybemissing(eltype(T)), flatten(skipmissing(col)), fieldnodes, fieldbuffers, bufferoffset)
     end
     return bufferoffset
 end
@@ -396,7 +449,7 @@ function writebuffer(io, ::Type{T}, col) where {T <: Union{AbstractString, Abstr
         end
         writezeros(io, paddinglength(n))
     else
-        writebuffer(io, Base.nonmissingtype(eltype(T)), flatten(skipmissing(col)))
+        writebuffer(io, maybemissing(eltype(T)), flatten(skipmissing(col)))
     end
     return
 end
@@ -414,7 +467,7 @@ function makenodesbuffers!(::Type{NTuple{N, T}}, col, fieldnodes, fieldbuffers, 
         push!(fieldbuffers, Buffer(bufferoffset, blen))
         bufferoffset += padding(blen)
     else
-        bufferoffset = makenodesbuffers!(Base.nonmissingtype(T), flatten(coalesce(x, default(NTuple{N, T})) for x in col), fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(maybemissing(T), flatten(coalesce(x, default(NTuple{N, T})) for x in col), fieldnodes, fieldbuffers, bufferoffset)
     end
     return bufferoffset
 end
@@ -426,7 +479,7 @@ function writebuffer(io, ::Type{NTuple{N, T}}, col) where {N, T}
         n = writearray(io, NTuple{N, T}, col)
         writezeros(io, paddinglength(n))
     else
-        writebuffer(io, Base.nonmissingtype(T), flatten(coalesce(x, default(NTuple{N, T})) for x in col))
+        writebuffer(io, maybemissing(T), flatten(coalesce(x, default(NTuple{N, T})) for x in col))
     end
     return
 end
@@ -440,7 +493,7 @@ function makenodesbuffers!(::Type{Pair{K, V}}, col, fieldnodes, fieldbuffers, bu
     # Struct child node
     push!(fieldnodes, FieldNode(len, 0))
     for i = 1:length(names)
-        bufferoffset = makenodesbuffers!(Base.nonmissingtype(fieldtype(types, i)), (getfield(x, names[i]) for x in col), fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col), fieldnodes, fieldbuffers, bufferoffset)
     end
     return bufferoffset
 end
@@ -449,7 +502,7 @@ function writebuffer(io, ::Type{Pair{K, V}}, col) where {K, V}
     writebitmap(io, col)
     # write values arrays
     for i = 1:length(names)
-        writebuffer(io, Base.nonmissingtype(fieldtype(types, i)), (getfield(x, names[i]) for x in col))
+        writebuffer(io, maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col))
     end
     return
 end
@@ -463,7 +516,7 @@ function makenodesbuffers!(::Type{NamedTuple{names, types}}, col, fieldnodes, fi
     push!(fieldbuffers, Buffer(bufferoffset, blen))
     bufferoffset += blen
     for i = 1:length(names)
-        bufferoffset = makenodesbuffers!(Base.nonmissingtype(fieldtype(types, i)), (getfield(x, names[i]) for x in col), fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col), fieldnodes, fieldbuffers, bufferoffset)
     end
     return bufferoffset
 end
@@ -472,7 +525,7 @@ function writebuffer(io, ::Type{NamedTuple{names, types}}, col) where {names, ty
     writebitmap(io, col)
     # write values arrays
     for i = 1:length(names)
-        writebuffer(io, Base.nonmissingtype(fieldtype(types, i)), (getfield(x, names[i]) for x in col))
+        writebuffer(io, maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col))
     end
     return
 end
@@ -492,13 +545,13 @@ function makenodesbuffers!(::Type{UnionT{T, typeIds, U}}, col, fieldnodes, field
         # value arrays
         for i = 1:fieldcount(U)
             S = fieldtype(U, i)
-            bufferoffset = makenodesbuffers!(Base.nonmissingtype(S), filtered(i == 1 ? Union{S, Missing} : Base.nonmissingtype(S), col), fieldnodes, fieldbuffers, bufferoffset)
+            bufferoffset = makenodesbuffers!(maybemissing(S), filtered(i == 1 ? Union{S, Missing} : maybemissing(S), col), fieldnodes, fieldbuffers, bufferoffset)
         end
     else
         # value arrays
         for i = 1:fieldcount(U)
             S = fieldtype(U, i)
-            bufferoffset = makenodesbuffers!(Base.nonmissingtype(S), replaced(S, col), fieldnodes, fieldbuffers, bufferoffset)
+            bufferoffset = makenodesbuffers!(maybemissing(S), replaced(S, col), fieldnodes, fieldbuffers, bufferoffset)
         end
     end
     return bufferoffset
@@ -529,13 +582,13 @@ function writebuffer(io, ::Type{UnionT{T, typeIds, U}}, col) where {T, typeIds, 
         # write values arrays
         for i = 1:fieldcount(U)
             S = fieldtype(U, i)
-            writebuffer(io, Base.nonmissingtype(S), filtered(i == 1 ? Union{S, Missing} : Base.nonmissingtype(S), col))
+            writebuffer(io, maybemissing(S), filtered(i == 1 ? Union{S, Missing} : maybemissing(S), col))
         end
     else
         # value arrays
         for i = 1:fieldcount(U)
             S = fieldtype(U, i)
-            writebuffer(io, Base.nonmissingtype(S), replaced(S, col))
+            writebuffer(io, maybemissing(S), replaced(S, col))
         end
     end
     return

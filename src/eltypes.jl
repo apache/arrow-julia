@@ -20,6 +20,10 @@ function default end
 
 default(T) = zero(T)
 
+finaljuliatype(T) = T
+finaljuliatype(::Type{Missing}) = Missing
+finaljuliatype(::Type{Union{T, Missing}}) where {T} = Union{Missing, finaljuliatype(T)}
+
 function juliaeltype(f::Meta.Field)
     T = juliaeltype(f, f.type)
     return f.nullable ? Union{T, Missing} : T
@@ -150,7 +154,10 @@ function arrowtype(b, ::Type{Decimal{P, S}}) where {P, S}
     return Meta.Decimal, Meta.decimalEnd(b), nothing
 end
 
-struct Date{U, T}
+abstract type ArrowTimeType end
+Base.write(io::IO, x::ArrowTimeType) = Base.write(io, x.x)
+
+struct Date{U, T} <: ArrowTimeType
     x::T
 end
 
@@ -160,9 +167,11 @@ bitwidth(x::Meta.DateUnit) = x == Meta.DateUnit.DAY ? Int32 : Int64
 Date{Meta.DateUnit.DAY}(days) = Date{Meta.DateUnit.DAY, Int32}(Int32(days))
 Date{Meta.DateUnit.MILLISECOND}(ms) = Date{Meta.DateUnit.MILLISECOND, Int64}(Int64(ms))
 
-function juliaeltype(f::Meta.Field, x::Meta.Date)
-    return Date{x.unit, bitwidth(x.unit)}
-end
+juliaeltype(f::Meta.Field, x::Meta.Date) = Date{x.unit, bitwidth(x.unit)}
+finaljuliatype(::Type{Date{Meta.DateUnit.DAY, Int32}}) = Dates.Date
+Base.convert(::Type{Dates.Date}, x::Date{Meta.DateUnit.DAY, Int32}) = Dates.Date(Dates.UTD(Int64(x.x + UNIX_EPOCH_DATE)))
+finaljuliatype(::Type{Date{Meta.DateUnit.MILLISECOND, Int64}}) = Dates.DateTime
+Base.convert(::Type{Dates.DateTime}, x::Date{Meta.DateUnit.MILLISECOND, Int64}) = Dates.DateTime(Dates.UTM(Int64(x.x + UNIX_EPOCH_DATETIME)))
 
 function arrowtype(b, ::Type{Date{U, T}}) where {U, T}
     Meta.dateStart(b)
@@ -170,7 +179,15 @@ function arrowtype(b, ::Type{Date{U, T}}) where {U, T}
     return Meta.Date, Meta.dateEnd(b), nothing
 end
 
-struct Time{U, T}
+arrowtype(b, ::Type{Dates.Date}) = arrowtype(b, Date{Meta.DateUnit.DAY, Int32})
+const UNIX_EPOCH_DATE = Dates.value(Dates.Date(1970))
+Base.convert(::Type{Date{Meta.DateUnit.DAY, Int32}}, x::Dates.Date) = Date{Meta.DateUnit.DAY, Int32}(Int32(Dates.value(x) - UNIX_EPOCH_DATE))
+
+arrowtype(b, ::Type{Dates.DateTime}) = arrowtype(b, Date{Meta.DateUnit.MILLISECOND, Int64})
+const UNIX_EPOCH_DATETIME = Dates.value(Dates.DateTime(1970))
+Base.convert(::Type{Date{Meta.DateUnit.MILLISECOND, Int64}}, x::Dates.DateTime) = Date{Meta.DateUnit.MILLISECOND, Int64}(Int64(Dates.value(x) - UNIX_EPOCH_DATETIME))
+
+struct Time{U, T} <: ArrowTimeType
     x::T
 end
 
@@ -179,9 +196,12 @@ Base.zero(::Type{Time{U, T}}) where {U, T} = Time{U, T}(T(0))
 bitwidth(x::Meta.TimeUnit) = x == Meta.TimeUnit.SECOND || x == Meta.TimeUnit.MILLISECOND ? Int32 : Int64
 Time{U}(x) where {U <: Meta.TimeUnit} = Time{U, bitwidth(U)}(bitwidth(U)(x))
 
-function juliaeltype(f::Meta.Field, x::Meta.Time)
-    return Time{x.unit, bitwidth(x.unit)}
-end
+juliaeltype(f::Meta.Field, x::Meta.Time) = Time{x.unit, bitwidth(x.unit)}
+finaljuliatype(::Type{<:Time}) = Dates.Time
+periodtype(U::Meta.TimeUnit) = U === Meta.TimeUnit.SECOND ? Dates.Second :
+                               U === Meta.TimeUnit.MILLISECOND ? Dates.Millisecond :
+                               U === Meta.TimeUnit.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
+Base.convert(::Type{Dates.Time}, x::Time{U, T}) where {U, T} = Dates.Time(Dates.Nanosecond(Dates.tons(periodtype(U)(x.x))))
 
 function arrowtype(b, ::Type{Time{U, T}}) where {U, T}
     Meta.timeStart(b)
@@ -189,7 +209,10 @@ function arrowtype(b, ::Type{Time{U, T}}) where {U, T}
     return Meta.Time, Meta.timeEnd(b), nothing
 end
 
-struct Timestamp{U, TZ}
+arrowtype(b, ::Type{Dates.Time}) = arrowtype(b, Time{Meta.TimeUnit.NANOSECOND, Int64})
+Base.convert(::Type{Time{Meta.TimeUnit.NANOSECOND, Int64}}, x::Dates.Time) = Time{Meta.TimeUnit.NANOSECOND, Int64}(Dates.value(x))
+
+struct Timestamp{U, TZ} <: ArrowTimeType
     x::Int64
 end
 
@@ -199,6 +222,10 @@ function juliaeltype(f::Meta.Field, x::Meta.Timestamp)
     return Timestamp{x.unit, x.timezone === nothing ? nothing : Symbol(x.timezone)}
 end
 
+finaljuliatype(::Type{Timestamp{U, nothing}}) where {U} = Dates.DateTime
+Base.convert(::Type{Dates.DateTime}, x::Timestamp{U, nothing}) where {U} =
+    Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME)))
+
 function arrowtype(b, ::Type{Timestamp{U, TZ}}) where {U, TZ}
     tz = TZ !== nothing ? FlatBuffers.createstring!(b, String(TZ)) : FlatBuffers.UOffsetT(0)
     Meta.timestampStart(b)
@@ -207,7 +234,7 @@ function arrowtype(b, ::Type{Timestamp{U, TZ}}) where {U, TZ}
     return Meta.Timestamp, Meta.timestampEnd(b), nothing
 end
 
-struct Interval{U, T}
+struct Interval{U, T} <: ArrowTimeType
     x::T
 end
 
@@ -227,7 +254,7 @@ function arrowtype(b, ::Type{Interval{U, T}}) where {U, T}
     return Meta.Interval, Meta.intervalEnd(b), nothing
 end
 
-struct Duration{U}
+struct Duration{U} <: ArrowTimeType
     x::Int64
 end
 
@@ -237,11 +264,22 @@ function juliaeltype(f::Meta.Field, x::Meta.Duration)
     return Duration{x.unit}
 end
 
+finaljuliatype(::Type{Duration{U}}) where {U} = periodtype(U)
+Base.convert(::Type{P}, x::Duration{U}) where {P <: Dates.Period, U} = P(periodtype(U)(x.x))
+
 function arrowtype(b, ::Type{Duration{U}}) where {U}
     Meta.durationStart(b)
     Meta.durationAddUnit(b, U)
     return Meta.Duration, Meta.durationEnd(b), nothing
 end
+
+arrowperiodtype(P) = Meta.TimeUnit.SECOND
+arrowperiodtype(::Type{Dates.Millisecond}) = Meta.TimeUnit.MILLISECOND
+arrowperiodtype(::Type{Dates.Microsecond}) = Meta.TimeUnit.MICROSECOND
+arrowperiodtype(::Type{Dates.Nanosecond}) = Meta.TimeUnit.NANOSECOND
+
+arrowtype(b, ::Type{P}) where {P <: Dates.Period} = arrowtype(b, Duration{arrowperiodtype(P)})
+Base.convert(::Type{Duration{U}}, x::Dates.Period) where {U} = Duration{U}(Dates.value(periodtype(U)(x)))
 
 # nested types; call juliaeltype recursively on nested children
 function juliaeltype(f::Meta.Field, list::Union{Meta.List, Meta.LargeList})

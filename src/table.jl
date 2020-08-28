@@ -36,11 +36,11 @@ Tables.getcolumn(t::Table, i::Int) = columns(t)[i]
 Tables.getcolumn(t::Table, nm::Symbol) = lookup(t)[nm]
 
 # high-level user API functions
-Table(io::IO, pos::Integer=1, len=nothing; debug::Bool=false) = Table(Base.read(io), pos, len; debug=debug)
-Table(str::String, pos::Integer=1, len=nothing; debug::Bool=false) = Table(Mmap.mmap(str), pos, len; debug=debug)
+Table(io::IO, pos::Integer=1, len=nothing; debug::Bool=false, convert::Bool=true) = Table(Base.read(io), pos, len; debug=debug, convert=convert)
+Table(str::String, pos::Integer=1, len=nothing; debug::Bool=false, convert::Bool=true) = Table(Mmap.mmap(str), pos, len; debug=debug, convert=convert)
 
 # will detect whether we're reading a Table from a file or stream
-function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothing}=nothing; debug::Bool=false)
+function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothing}=nothing; debug::Bool=false, convert::Bool=true)
     len = something(tlen, length(bytes))
     if len > 24 &&
         _startswith(bytes, off, FILE_FORMAT_MAGIC_BYTES) &&
@@ -113,8 +113,16 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
         end
     end
     lu = lookup(t)
-    for (k, v) in zip(names(t), columns(t))
-        lu[k] = v
+    for (i, (k, T, col)) in enumerate(zip(names(t), types(t), columns(t)))
+        if convert
+            TT = finaljuliatype(T)
+            if TT !== T
+                types(t)[i] = TT
+                col = converter(TT, col)
+                columns(t)[i] = col
+            end
+        end
+        lu[k] = col
     end
     return t
 end
@@ -131,12 +139,24 @@ struct Batch
 end
 
 function Base.iterate(x::BatchIterator{debug}, pos=x.startpos) where {debug}
-    pos + 3 > length(x.bytes) && return nothing
-    readbuffer(x.bytes, pos, UInt32) == CONTINUATION_INDICATOR_BYTES || return nothing
+    if pos + 3 > length(x.bytes)
+        debug && println("not enough bytes left for another batch message")
+        return nothing
+    end
+    if readbuffer(x.bytes, pos, UInt32) != CONTINUATION_INDICATOR_BYTES
+        debug && println("didn't find continuation byte to keep parsing messages: $(readbuffer(x.bytes, pos, UInt32))")
+        return nothing
+    end
     pos += 4
-    pos + 3 > length(x.bytes) && return nothing
+    if pos + 3 > length(x.bytes)
+        debug && println("not enough bytes left to read length of another batch message")
+        return nothing
+    end
     msglen = readbuffer(x.bytes, pos, Int32)
-    msglen == 0 && return nothing
+    if msglen == 0
+        debug && println("message has 0 length; terminating message parsing")
+        return nothing
+    end
     pos += 4
     msg = FlatBuffers.getrootas(Meta.Message, x.bytes, pos-1)
     pos += msglen
@@ -189,7 +209,6 @@ end
 
 function build(T, f::Meta.Field, L::ListTypes, batch, rb, nodeidx, bufferidx, debug)
     validity = buildbitmap(batch, rb, bufferidx, debug)
-    debug && @show validity
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
     debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
@@ -214,7 +233,6 @@ end
 
 function build(T, f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeList}, batch, rb, nodeidx, bufferidx, debug)
     validity = buildbitmap(batch, rb, bufferidx, debug)
-    debug && @show validity
     bufferidx += 1
     len = rb.nodes[nodeidx].length
     nodeidx += 1
@@ -239,7 +257,6 @@ end
 
 function build(T, f::Meta.Field, L::Meta.Struct, batch, rb, nodeidx, bufferidx, debug)
     validity = buildbitmap(batch, rb, bufferidx, debug)
-    debug && @show validity
     bufferidx += 1
     len = rb.nodes[nodeidx].length
     NT = Base.nonmissingtype(T)
@@ -291,7 +308,6 @@ end
 # primitives
 function build(T, f::Meta.Field, ::L, batch, rb, nodeidx, bufferidx, debug) where {L}
     validity = buildbitmap(batch, rb, bufferidx, debug)
-    debug && @show validity
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
     debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
