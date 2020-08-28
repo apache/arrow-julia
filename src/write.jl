@@ -223,7 +223,7 @@ function fieldoffset(b, colidx, name, T, dictencodings)
     else
         dict = FlatBuffers.UOffsetT(0)
     end
-    type, typeoff, children = arrowtype(b, T === Missing ? Missing : Base.nonmissingtype(T))
+    type, typeoff, children = arrowtype(b, maybemissing(T))
     if children !== nothing
         Meta.fieldStartChildrenVector(b, length(children))
         for off in Iterators.reverse(children)
@@ -327,7 +327,7 @@ function makenodesbuffers!(colidx, types, columns, dictencodings, fieldnodes, fi
         push!(fieldbuffers, Buffer(bufferoffset, blen))
         bufferoffset += padding(blen)
     else
-        bufferoffset = makenodesbuffers!(T === Missing ? Missing : Base.nonmissingtype(T), col, fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(maybemissing(T), col, fieldnodes, fieldbuffers, bufferoffset)
     end
     # make next column node/buffers
     return makenodesbuffers!(colidx + 1, types, columns, dictencodings, fieldnodes, fieldbuffers, bufferoffset)
@@ -417,7 +417,7 @@ function makenodesbuffers!(::Type{T}, col, fieldnodes, fieldbuffers, bufferoffse
         push!(fieldbuffers, Buffer(bufferoffset, blen))
         bufferoffset += padding(blen)
     else
-        bufferoffset = makenodesbuffers!(Base.nonmissingtype(eltype(T)), flatten(skipmissing(col)), fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(maybemissing(eltype(T)), flatten(skipmissing(col)), fieldnodes, fieldbuffers, bufferoffset)
     end
     return bufferoffset
 end
@@ -446,7 +446,7 @@ function writebuffer(io, ::Type{T}, col) where {T <: Union{AbstractString, Abstr
         end
         writezeros(io, paddinglength(n))
     else
-        writebuffer(io, Base.nonmissingtype(eltype(T)), flatten(skipmissing(col)))
+        writebuffer(io, maybemissing(eltype(T)), flatten(skipmissing(col)))
     end
     return
 end
@@ -464,7 +464,7 @@ function makenodesbuffers!(::Type{NTuple{N, T}}, col, fieldnodes, fieldbuffers, 
         push!(fieldbuffers, Buffer(bufferoffset, blen))
         bufferoffset += padding(blen)
     else
-        bufferoffset = makenodesbuffers!(Base.nonmissingtype(T), flatten(coalesce(x, default(NTuple{N, T})) for x in col), fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(maybemissing(T), flatten(coalesce(x, default(NTuple{N, T})) for x in col), fieldnodes, fieldbuffers, bufferoffset)
     end
     return bufferoffset
 end
@@ -476,7 +476,7 @@ function writebuffer(io, ::Type{NTuple{N, T}}, col) where {N, T}
         n = writearray(io, NTuple{N, T}, col)
         writezeros(io, paddinglength(n))
     else
-        writebuffer(io, Base.nonmissingtype(T), flatten(coalesce(x, default(NTuple{N, T})) for x in col))
+        writebuffer(io, maybemissing(T), flatten(coalesce(x, default(NTuple{N, T})) for x in col))
     end
     return
 end
@@ -490,7 +490,7 @@ function makenodesbuffers!(::Type{Pair{K, V}}, col, fieldnodes, fieldbuffers, bu
     # Struct child node
     push!(fieldnodes, FieldNode(len, 0))
     for i = 1:length(names)
-        bufferoffset = makenodesbuffers!(Base.nonmissingtype(fieldtype(types, i)), (getfield(x, names[i]) for x in col), fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col), fieldnodes, fieldbuffers, bufferoffset)
     end
     return bufferoffset
 end
@@ -499,7 +499,7 @@ function writebuffer(io, ::Type{Pair{K, V}}, col) where {K, V}
     writebitmap(io, col)
     # write values arrays
     for i = 1:length(names)
-        writebuffer(io, Base.nonmissingtype(fieldtype(types, i)), (getfield(x, names[i]) for x in col))
+        writebuffer(io, maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col))
     end
     return
 end
@@ -513,7 +513,7 @@ function makenodesbuffers!(::Type{NamedTuple{names, types}}, col, fieldnodes, fi
     push!(fieldbuffers, Buffer(bufferoffset, blen))
     bufferoffset += blen
     for i = 1:length(names)
-        bufferoffset = makenodesbuffers!(Base.nonmissingtype(fieldtype(types, i)), (getfield(x, names[i]) for x in col), fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col), fieldnodes, fieldbuffers, bufferoffset)
     end
     return bufferoffset
 end
@@ -522,7 +522,7 @@ function writebuffer(io, ::Type{NamedTuple{names, types}}, col) where {names, ty
     writebitmap(io, col)
     # write values arrays
     for i = 1:length(names)
-        writebuffer(io, Base.nonmissingtype(fieldtype(types, i)), (getfield(x, names[i]) for x in col))
+        writebuffer(io, maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col))
     end
     return
 end
@@ -542,13 +542,13 @@ function makenodesbuffers!(::Type{UnionT{T, typeIds, U}}, col, fieldnodes, field
         # value arrays
         for i = 1:fieldcount(U)
             S = fieldtype(U, i)
-            bufferoffset = makenodesbuffers!(Base.nonmissingtype(S), filtered(i == 1 ? Union{S, Missing} : Base.nonmissingtype(S), col), fieldnodes, fieldbuffers, bufferoffset)
+            bufferoffset = makenodesbuffers!(maybemissing(S), filtered(i == 1 ? Union{S, Missing} : maybemissing(S), col), fieldnodes, fieldbuffers, bufferoffset)
         end
     else
         # value arrays
         for i = 1:fieldcount(U)
             S = fieldtype(U, i)
-            bufferoffset = makenodesbuffers!(Base.nonmissingtype(S), replaced(S, col), fieldnodes, fieldbuffers, bufferoffset)
+            bufferoffset = makenodesbuffers!(maybemissing(S), replaced(S, col), fieldnodes, fieldbuffers, bufferoffset)
         end
     end
     return bufferoffset
@@ -579,13 +579,13 @@ function writebuffer(io, ::Type{UnionT{T, typeIds, U}}, col) where {T, typeIds, 
         # write values arrays
         for i = 1:fieldcount(U)
             S = fieldtype(U, i)
-            writebuffer(io, Base.nonmissingtype(S), filtered(i == 1 ? Union{S, Missing} : Base.nonmissingtype(S), col))
+            writebuffer(io, maybemissing(S), filtered(i == 1 ? Union{S, Missing} : maybemissing(S), col))
         end
     else
         # value arrays
         for i = 1:fieldcount(U)
             S = fieldtype(U, i)
-            writebuffer(io, Base.nonmissingtype(S), replaced(S, col))
+            writebuffer(io, maybemissing(S), replaced(S, col))
         end
     end
     return
