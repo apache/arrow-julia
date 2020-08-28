@@ -127,6 +127,7 @@ struct DenseUnionVector{T, U} <: AbstractVector{UnionT{Meta.UnionMode.Dense, not
 end
 
 DenseUnionVector(x::T) where {T} = DenseUnionVector{T, Tuple{eachunion(eltype(x))...}}(x)
+Base.IndexStyle(::Type{<:DenseUnionVector}) = Base.IndexLinear()
 Base.size(x::DenseUnionVector) = (length(x.itr),)
 Base.eltype(x::DenseUnionVector{T, U}) where {T, U} = UnionT{Meta.UnionMode.Dense, nothing, U}
 Base.iterate(x::DenseUnionVector, st...) = iterate(x.itr, st...)
@@ -137,6 +138,7 @@ struct SparseUnionVector{T, U} <: AbstractVector{UnionT{Meta.UnionMode.Sparse, n
 end
 
 SparseUnionVector(x::T) where {T} = SparseUnionVector{T, Tuple{eachunion(eltype(x))...}}(x)
+Base.IndexStyle(::Type{<:SparseUnionVector}) = Base.IndexLinear()
 Base.size(x::SparseUnionVector) = (length(x.itr),)
 Base.eltype(x::SparseUnionVector{T, U}) where {T, U} = UnionT{Meta.UnionMode.Sparse, nothing, U}
 Base.iterate(x::SparseUnionVector, st...) = iterate(x.itr, st...)
@@ -211,7 +213,7 @@ function Base.iterate(r::Replaced{T}, st=()) where {T}
     return ifelse(x isa T, x, missing), (state,)
 end
 
-# convenienc wrapper to signal that an input column should be
+# convenience wrapper to signal that an input column should be
 # dict encoded when written to the arrow format
 # note that only top-level columns are supported for dict encoding
 # currently; (i.e. no nested dict encoding)
@@ -220,9 +222,21 @@ struct DictEncode{T, A <: AbstractVector} <: AbstractVector{T}
 end
 
 DictEncode(x::A) where {A} = DictEncode{eltype(A), A}(x)
+Base.IndexStyle(::Type{<:DictEncode}) = Base.IndexLinear()
 Base.size(x::DictEncode) = (length(x.data),)
 Base.eltype(x::DictEncode{T, A}) where {T, A} = T
 Base.iterate(x::DictEncode, st...) = iterate(x.data, st...)
 Base.getindex(x::DictEncode, i::Int) = getindex(x.data, i)
 
 encodingtype(n) = n < div(typemax(Int8), 2) ? Int8 : n < div(typemax(Int16), 2) ? Int16 : n < div(typemax(Int32), 2) ? Int32 : Int64
+
+struct Converter{T, A} <: AbstractVector{T}
+    data::A
+end
+
+converter(::Type{T}, x::A) where {T, A} = Converter{eltype(A) >: Missing ? Union{T, Missing} : T, A}(x)
+
+Base.IndexStyle(::Type{<:Converter}) = Base.IndexLinear()
+Base.size(x::Converter) = (length(x.data),)
+Base.eltype(x::Converter{T, A}) where {T, A} = T
+Base.getindex(x::Converter{T}, i::Int) where {T} = convert(T, getindex(x.data, i))
