@@ -11,6 +11,12 @@ julia:
   - 1.0
   - 1
   - nightly
+branches:
+  only:
+  - master
+  - gh-pages # For building documentation
+  - /^testing-.*$/ # testing branches
+  - /^v[0-9]+\.[0-9]+\.[0-9]+$/ # version tags
 matrix:
   allow_failures:
     - julia: nightly

@@ -21,6 +21,7 @@ function default end
 default(T) = zero(T)
 
 finaljuliatype(T) = T
+finaljuliatype(::Type{Missing}) = Missing
 finaljuliatype(::Type{Union{T, Missing}}) where {T} = Union{Missing, finaljuliatype(T)}
 
 function juliaeltype(f::Meta.Field)
