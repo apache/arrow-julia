@@ -1,4 +1,4 @@
-using Test, Arrow, Tables
+using Test, Arrow, Tables, Dates
 
 @testset "Arrow" begin
 
