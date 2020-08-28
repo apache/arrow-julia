@@ -24,14 +24,14 @@ matrix:
   exclude:
     - os: osx
       arch: x86
-  include:
-    - stage: "Documentation"
-      julia: 1
-      os: linux
-      script:
-        - julia --project=docs/ -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate(); Pkg.build("Arrow")'
-        - julia --project=docs/ docs/make.jl
-      after_success: skip
+  # include:
+  #   - stage: "Documentation"
+  #     julia: 1
+  #     os: linux
+  #     script:
+  #       - julia --project=docs/ -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate(); Pkg.build("Arrow")'
+  #       - julia --project=docs/ docs/make.jl
+  #     after_success: skip
 notifications:
   email: false
 after_success:
