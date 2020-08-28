@@ -100,7 +100,12 @@ tt = Arrow.Table(io; debug=true)
 @test all(isequal.(values(t), values(tt)))
 
 # multiple record batches
-t = Tables.partitioner(((col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],), (col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],)))
+if isdefined(Tables, :partitioner)
+    xx = Tables.partitioner
+else
+    xx = Tuple
+end
+t = xx(((col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],), (col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],)))
 io = IOBuffer()
 Arrow.write(io, t)
 seekstart(io)
