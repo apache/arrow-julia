@@ -116,7 +116,6 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     for (i, (k, T, col)) in enumerate(zip(names(t), types(t), columns(t)))
         if convert
             TT = finaljuliatype(T)
-            @show T, TT
             if TT !== T
                 types(t)[i] = TT
                 col = converter(TT, col)
