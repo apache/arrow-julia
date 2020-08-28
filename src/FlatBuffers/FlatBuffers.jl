@@ -105,7 +105,9 @@ macro scopedenum(T, syms...)
                 $(Base.Enums.membershiptest(:x, values)) || enum_argument_error($(Expr(:quote, typename)), x)
                 return Core.bitcast($(esc(typename)), convert($(basetype), x))
             end
-            Base.Enums.namemap(::Type{$(esc(typename))}) = $(esc(namemap))
+            if isdefined(Base.Enums, :namemap)
+                Base.Enums.namemap(::Type{$(esc(typename))}) = $(esc(namemap))
+            end
             Base.getproperty(::Type{$(esc(typename))}, sym::Symbol) = sym in $syms ? getfield($(esc(mod)), sym) : getfield($(esc(typename)), sym)
             Base.typemin(x::Type{$(esc(typename))}) = $(esc(typename))($lo)
             Base.typemax(x::Type{$(esc(typename))}) = $(esc(typename))($hi)
