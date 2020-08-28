@@ -215,7 +215,7 @@ function fieldoffset(b, colidx, name, T, dictencodings)
         id, encodingtype, _ = dictencodings[colidx]
         _, inttype, _ = arrowtype(b, encodingtype)
         Meta.dictionaryEncodingStart(b)
-        Meta.dictionaryEncodingAddId(b, id)
+        Meta.dictionaryEncodingAddId(b, Int64(id))
         Meta.dictionaryEncodingAddIndexType(b, inttype)
         # TODO: support isOrdered?
         Meta.dictionaryEncodingAddIsOrdered(b, false)
@@ -291,7 +291,7 @@ function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, dictencod
 
     # write record batch object
     Meta.recordBatchStart(b)
-    Meta.recordBatchAddLength(b, nrows)
+    Meta.recordBatchAddLength(b, Int64(nrows))
     Meta.recordBatchAddNodes(b, nodes)
     Meta.recordBatchAddBuffers(b, buffers)
     return Meta.recordBatchEnd(b), bodylen
@@ -301,7 +301,7 @@ function makedictionarybatchmsg(sch::Tables.Schema{names, types}, columns, id, i
     b = FlatBuffers.Builder(1024)
     recordbatch, bodylen = makerecordbatch(b, sch, columns, nothing, debug)
     Meta.dictionaryBatchStart(b)
-    Meta.dictionaryBatchAddId(b, id)
+    Meta.dictionaryBatchAddId(b, Int64(id))
     Meta.dictionaryBatchAddData(b, recordbatch)
     Meta.dictionaryBatchAddIsDelta(b, isdelta)
     dictionarybatch = Meta.dictionaryBatchEnd(b)
