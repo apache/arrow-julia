@@ -240,3 +240,5 @@ Base.IndexStyle(::Type{<:Converter}) = Base.IndexLinear()
 Base.size(x::Converter) = (length(x.data),)
 Base.eltype(x::Converter{T, A}) where {T, A} = T
 Base.getindex(x::Converter{T}, i::Int) where {T} = convert(T, getindex(x.data, i))
+
+maybemissing(::Type{T}) where {T} = T === Missing ? Missing : Base.nonmissingtype(T)
