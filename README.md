@@ -13,6 +13,7 @@ Please see this [document](https://arrow.apache.org/docs/memory_layout.html) for
 #### Installation
 
 ```julia
+] add Tables#master
 ] add https://github.com/JuliaData/Arrow.jl#master
 ```
 
