@@ -25,6 +25,12 @@ function write(io::IO, tbl; debug::Bool=false)
     return write(io, tbl, false, debug)
 end
 
+if isdefined(Tables, :partitions)
+    parts = Tables.partitions
+else
+    parts = x -> (x,)
+end
+
 function write(io, source, writetofile, debug)
     if writetofile
         Base.write(io, "ARROW1\0\0")
@@ -38,7 +44,7 @@ function write(io, source, writetofile, debug)
     tsk = Threads.@spawn for msg in msgs
         Base.write(io, msg)
     end
-    @sync for (i, tbl) in enumerate(Tables.partitions(source))
+    @sync for (i, tbl) in enumerate(parts(source))
         if i == 1
             cols = Tables.columns(tbl)
             sch[] = Tables.schema(cols)
