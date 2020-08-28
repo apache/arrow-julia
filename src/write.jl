@@ -413,7 +413,10 @@ function makenodesbuffers!(::Type{T}, col, fieldnodes, fieldbuffers, bufferoffse
     push!(fieldbuffers, Buffer(bufferoffset, blen))
     bufferoffset += padding(blen)
     if T <: AbstractString || T <: AbstractVector{UInt8}
-        blen = datasizeof(col)
+        blen = 0
+        for x in col
+            blen += sizeof(x)
+        end
         push!(fieldbuffers, Buffer(bufferoffset, blen))
         bufferoffset += padding(blen)
     else
