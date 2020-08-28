@@ -78,8 +78,8 @@ tt = Arrow.Table(io)
 
 # unions
 t = (
-    col1=Arrow.DenseUnionVector(Union{Int64, Float64, Missing}[1, 2.0, 3, 4.0, missing]),
-    col2=Arrow.SparseUnionVector(Union{Int64, Float64, Missing}[1, 2.0, 3, 4.0, missing]),
+    col1=Arrow.DenseUnionVector([1, 2.0, 3, 4.0, missing]),
+    col2=Arrow.SparseUnionVector([1, 2.0, 3, 4.0, missing]),
 )
 io = IOBuffer()
 Arrow.write(io, t)
