@@ -321,6 +321,15 @@ function makenodesbuffers!(::Type{T}, col, fieldnodes, fieldbuffers, bufferoffse
     return bufferoffset + padding(blen)
 end
 
+makenodesbuffers!(::Type{Dates.Date}, col, fieldnodes, fieldbuffers, bufferoffset) =
+    makenodesbuffers!(Date{Meta.DateUnit.DAY, Int32}, converter(Date{Meta.DateUnit.DAY, Int32}, col), fieldnodes, fieldbuffers, bufferoffset)
+makenodesbuffers!(::Type{Dates.Time}, col, fieldnodes, fieldbuffers, bufferoffset) =
+    makenodesbuffers!(Time{Meta.TimeUnit.NANOSECOND, Int64}, converter(Time{Meta.TimeUnit.NANOSECOND, Int64}, col), fieldnodes, fieldbuffers, bufferoffset)
+makenodesbuffers!(::Type{Dates.DateTime}, col, fieldnodes, fieldbuffers, bufferoffset) =
+    makenodesbuffers!(Date{Meta.DateUnit.MILLISECOND, Int64}, converter(Date{Meta.DateUnit.MILLISECOND, Int64}, col), fieldnodes, fieldbuffers, bufferoffset)
+makenodesbuffers!(::Type{P}, col, fieldnodes, fieldbuffers, bufferoffset) where {P <: Dates.Period} =
+    makenodesbuffers!(Duration{arrowperiodtype(P)}, converter(Duration{arrowperiodtype(P)}, col), fieldnodes, fieldbuffers, bufferoffset)
+
 function writebitmap(io, col)
     nullcount(col) == 0 && return 0
     len = _length(col)
@@ -348,6 +357,11 @@ function writebuffer(io, ::Type{T}, col) where {T}
     writezeros(io, paddinglength(n))
     return
 end
+
+writebuffer(io, ::Type{Dates.Date}, col) = writebuffer(io, Date{Meta.DateUnit.DAY, Int32}, converter(Date{Meta.DateUnit.DAY, Int32}, col))
+writebuffer(io, ::Type{Dates.Time}, col) = writebuffer(io, Time{Meta.TimeUnit.NANOSECOND, Int64}, converter(Time{Meta.TimeUnit.NANOSECOND, Int64}, col))
+writebuffer(io, ::Type{Dates.DateTime}, col) = writebuffer(io, Date{Meta.DateUnit.MILLISECOND, Int64}, converter(Date{Meta.DateUnit.MILLISECOND, Int64}, col))
+writebuffer(io, ::Type{P}, col) where {P <: Dates.Period} = writebuffer(io, Duration{arrowperiodtype(P)}, converter(Duration{arrowperiodtype(P)}, col))
 
 function makenodesbuffers!(::Type{T}, col, fieldnodes, fieldbuffers, bufferoffset) where {T <: Union{AbstractString, AbstractVector}}
     len = _length(col)

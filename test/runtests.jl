@@ -56,7 +56,7 @@ t = (
 io = IOBuffer()
 Arrow.write(io, t)
 seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(io; convert=false)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
@@ -109,9 +109,20 @@ tt = Arrow.Table(io)
 @test isequal(tt.col1, vcat([1,2,3,4,5,6,7,8,9,missing], [1,2,3,4,5,6,7,8,9,missing]))
 @test eltype(tt.col1) === Union{Int64, Missing}
 
+# auto-converting types
+t = (
+    col1=[Date(2001, 1, 2), Date(2010, 10, 10), Date(2020, 12, 1)],
+    col2=[Time(1, 1, 2), Time(13, 10, 10), Time(22, 12, 1)],
+    col3=[DateTime(2001, 1, 2), DateTime(2010, 10, 10), DateTime(2020, 12, 1)]
+)
+io = IOBuffer()
+Arrow.write(io, t; debug=true)
+seekstart(io)
+tt = Arrow.Table(io; debug=true)
+@test length(tt) == length(t)
+@test all(isequal.(values(t), values(tt)))
+
 #TODO:
 #  -test Map
-#  -figure out auto-converting to/from julia/arrow types
-
 
 end
