@@ -39,6 +39,8 @@ function write(io, source, writetofile, debug)
     msgs = Channel{Message}(Inf)
     # build messages
     sch = Ref{Tables.Schema}()
+    schoff = Ref{FlatBuffers.UOffsetT}(0)
+    blocks = (Block[], Block[])
     dictid = Ref(0)
     dictencodings = Dict{Int, Tuple{Int, Type, Any}}()
     # start message writing from channel
@@ -135,6 +137,12 @@ struct Message
     columns
     dictencodings
     bodylen
+end
+
+struct Block
+    offset::Int64
+    metaDataLength::Int64
+    bodyLength::Int64
 end
 
 struct DictEncoder{T, A, D} <: AbstractVector{T}

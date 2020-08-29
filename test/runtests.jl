@@ -144,10 +144,8 @@ io = IOBuffer()
 Arrow.write(io, t; debug=true)
 seekstart(io)
 tt = Arrow.Table(io; debug=true)
-@test length(tt) == length(t)
-@test all(isequal.(values(t), values(tt)))
-
-#TODO:
-#  -test Map
+for (k, v) in tt.col1
+    @test isequal(t.x.col1[k], v)
+end
 
 end
