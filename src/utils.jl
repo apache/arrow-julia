@@ -100,7 +100,8 @@ flatten(x) = Iterators.flatten(x)
 
 # we need to treat missing specially w/ length of flattened array
 _length(x) = length(x)
-_length(x::Iterators.Flatten) = sum(i -> i === missing ? 1 : length(i), x)
+_length(g::Base.Generator) = _length(g.iter)
+_length(x::Iterators.Flatten) = sum(i -> i === missing ? 1 : _length(i), x)
 
 # argh me mateys, don't nobody else go pirating this method
 # this here be me own booty!
@@ -203,7 +204,7 @@ end
 
 replaced(::Type{T}, itr::I) where {T, I} = Replaced{T, I}(itr)
 
-Base.length(r::Replaced) = length(r.itr)
+Base.length(r::Replaced) = _length(r.itr)
 Base.eltype(r::Replaced{T}) where {T} = Union{T, Missing}
 
 function Base.iterate(r::Replaced{T}, st=()) where {T}
@@ -242,3 +243,22 @@ Base.eltype(x::Converter{T, A}) where {T, A} = T
 Base.getindex(x::Converter{T}, i::Int) where {T} = convert(T, getindex(x.data, i))
 
 maybemissing(::Type{T}) where {T} = T === Missing ? Missing : Base.nonmissingtype(T)
+
+function getfooter(filebytes)
+    len = readbuffer(filebytes, length(filebytes) - 9, Int32)
+    FlatBuffers.getrootas(Meta.Footer, filebytes[end-(9 + len):end-10], 0)
+end
+
+function getrb(filebytes)
+    f = getfooter(filebytes)
+    rb = f.recordBatches[1]
+    return filebytes[rb.offset+1:(rb.offset+1+rb.metaDataLength)]
+    # FlatBuffers.getrootas(Meta.Message, filebytes, rb.offset)
+end
+
+function readmessage(filebytes, off=9)
+    @assert readbuffer(filebytes, off, UInt32) === 0xFFFFFFFF
+    len = readbuffer(filebytes, off + 4, Int32)
+    @show len
+    FlatBuffers.getrootas(Meta.Message, filebytes, off + 8)
+end

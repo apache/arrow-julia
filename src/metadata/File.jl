@@ -3,15 +3,18 @@ struct Footer <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::Footer) = (:version, :schema, :dictionaries, :recordBatches, :custom_metadata)
+
 function Base.getproperty(x::Footer, field::Symbol)
     if field === :version
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + x.pos, MetadataVersion)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), MetadataVersion)
+        return MetadataVersion.V1
     elseif field === :schema
         o = FlatBuffers.offset(x, 6)
         if o != 0
-            y = FlatBuffers.indirect(x, o + x.pos)
-            return FlatBuffers.init(Schema, x.bytes, y)
+            y = FlatBuffers.indirect(x, o + FlatBuffers.pos(x))
+            return FlatBuffers.init(Schema, FlatBuffers.bytes(x), y)
         end
     elseif field === :dictionaries
         o = FlatBuffers.offset(x, 8)
@@ -48,13 +51,15 @@ end
 
 FlatBuffers.structsizeof(::Base.Type{Block}) = 24
 
+Base.propertynames(x::Block) = (:offset, :metaDataLength, :bodyLength)
+
 function Base.getproperty(x::Block, field::Symbol)
     if field === :offset
-        return FlatBuffers.get(x, x.pos, Int64)
+        return FlatBuffers.get(x, FlatBuffers.pos(x), Int64)
     elseif field === :metaDataLength
-        return FlatBuffers.get(x, x.pos + 8, Int32)
+        return FlatBuffers.get(x, FlatBuffers.pos(x) + 8, Int32)
     elseif field === :bodyLength
-        return FlatBuffers.get(x, x.pos + 16, Int64)
+        return FlatBuffers.get(x, FlatBuffers.pos(x) + 16, Int64)
     end
     return nothing
 end

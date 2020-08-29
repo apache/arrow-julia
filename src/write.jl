@@ -17,12 +17,14 @@ each table must have the exact same `Tables.Schema`.
 function write end
 
 function write(file::String, tbl; debug::Bool=false)
-    write(open(file, "w"), tbl, true, debug)
+    open(file, "w") do io
+        write(io, tbl, true, debug)
+    end
     return file
 end
 
-function write(io::IO, tbl; debug::Bool=false)
-    return write(io, tbl, false, debug)
+function write(io::IO, tbl; debug::Bool=false, file::Bool=false)
+    return write(io, tbl, file, debug)
 end
 
 if isdefined(Tables, :partitions)
@@ -39,22 +41,25 @@ function write(io, source, writetofile, debug)
     msgs = Channel{Message}(Inf)
     # build messages
     sch = Ref{Tables.Schema}()
+    firstcols = Ref{Any}()
+    blocks = (Block[], Block[])
     dictid = Ref(0)
     dictencodings = Dict{Int, Tuple{Int, Type, Any}}()
     # start message writing from channel
 @static if VERSION >= v"1.3-DEV"
     tsk = Threads.@spawn for msg in msgs
-        Base.write(io, msg)
+        Base.write(io, msg, blocks)
     end
 else
     tsk = @async for msg in msgs
-        Base.write(io, msg)
+        Base.write(io, msg, blocks)
     end
 end
     @sync for (i, tbl) in enumerate(parts(source))
         if i == 1
             cols = Tables.columns(tbl)
             sch[] = Tables.schema(cols)
+            firstcols[] = cols
             for (i, col) in enumerate(Tables.Columns(cols))
                 if col isa DictEncode
                     id = dictid[]
@@ -120,13 +125,44 @@ end
     close(msgs)
     wait(tsk)
     # write empty message
-    Base.write(io, Message(UInt8[], nothing, nothing, 0))
+    if !writetofile
+        Base.write(io, Message(UInt8[], nothing, nothing, 0, true, false), blocks)
+    end
     if writetofile
-        # TODO: writefooter
-        # TODO: write footersize
+        b = FlatBuffers.Builder(1024)
+        schfoot = makeschema(b, sch[], firstcols[], dictencodings)
+        if !isempty(blocks[1])
+            N = length(blocks[1])
+            Meta.footerStartRecordBatchesVector(b, N)
+            for blk in Iterators.reverse(blocks[1])
+                Meta.createBlock(b, blk.offset, blk.metaDataLength, blk.bodyLength)
+            end
+            recordbatches = FlatBuffers.endvector!(b, N)
+        else
+            recordbatches = FlatBuffers.UOffsetT(0)
+        end
+        if !isempty(blocks[2])
+            N = length(blocks[2])
+            Meta.footerStartDictionariesVector(b, N)
+            for blk in Iterators.reverse(blocks[2])
+                Meta.createBlock(b, blk.offset, blk.metaDataLength, blk.bodyLength)
+            end
+            dicts = FlatBuffers.endvector!(b, N)
+        else
+            dicts = FlatBuffers.UOffsetT(0)
+        end
+        Meta.footerStart(b)
+        Meta.footerAddVersion(b, Meta.MetadataVersion.V4)
+        Meta.footerAddSchema(b, schfoot)
+        Meta.footerAddDictionaries(b, dicts)
+        Meta.footerAddRecordBatches(b, recordbatches)
+        foot = Meta.footerEnd(b)
+        FlatBuffers.finish!(b, foot)
+        footer = FlatBuffers.finishedbytes(b)
+        Base.write(io, footer)
+        Base.write(io, Int32(length(footer)))
         Base.write(io, "ARROW1")
     end
-    # close(io)
     return io
 end
 
@@ -135,6 +171,14 @@ struct Message
     columns
     dictencodings
     bodylen
+    isrecordbatch::Bool
+    blockmsg::Bool
+end
+
+struct Block
+    offset::Int64
+    metaDataLength::Int32
+    bodyLength::Int64
 end
 
 struct DictEncoder{T, A, D} <: AbstractVector{T}
@@ -150,12 +194,16 @@ Base.size(x::DictEncoder) = (length(x.values),)
 Base.eltype(x::DictEncoder{T, A}) where {T, A} = T
 Base.getindex(x::DictEncoder, i::Int) = x.pool[x.values[i]]
 
-function Base.write(io::IO, msg::Message)
+function Base.write(io::IO, msg::Message, blocks)
+    metalen = padding(length(msg.msgflatbuf))
+    if msg.blockmsg
+        push!(blocks[msg.isrecordbatch ? 1 : 2], Block(position(io), metalen + 8, msg.bodylen))
+    end
     # now write the final message spec out
     # continuation byte
     n = Base.write(io, 0xFFFFFFFF)
     # metadata length
-    n += Base.write(io, Int32(padding(length(msg.msgflatbuf))))
+    n += Base.write(io, Int32(metalen))
     # message flatbuffer
     n += Base.write(io, msg.msgflatbuf)
     n += writezeros(io, paddinglength(n))
@@ -185,11 +233,10 @@ function makemessage(b, headerType, header, columns=nothing, dictencodings=nothi
     # Meta.messageStartCustomMetadataVector(b, num_meta_elems)
     msg = Meta.messageEnd(b)
     FlatBuffers.finish!(b, msg)
-    return Message(FlatBuffers.finishedbytes(b), columns, dictencodings, bodylen)
+    return Message(FlatBuffers.finishedbytes(b), columns, dictencodings, bodylen, headerType == Meta.RecordBatch, headerType == Meta.RecordBatch || headerType == Meta.DictionaryBatch)
 end
 
-function makeschemamsg(sch::Tables.Schema{names, types}, columns, dictencodings) where {names, types}
-    b = FlatBuffers.Builder(1024)
+function makeschema(b, sch::Tables.Schema{names, types}, columns, dictencodings) where {names, types}
     # build Field objects
     N = length(names)
     fieldoffsets = [fieldoffset(b, i, names[i], fieldtype(types, i), dictencodings) for i = 1:N]
@@ -203,7 +250,12 @@ function makeschemamsg(sch::Tables.Schema{names, types}, columns, dictencodings)
     Meta.schemaAddEndianness(b, Meta.Endianness.Little)
     Meta.schemaAddFields(b, fields)
     # Meta.schemaAddCustomMetadata(b, meta)
-    schema = Meta.schemaEnd(b)
+    return Meta.schemaEnd(b)
+end
+
+function makeschemamsg(sch::Tables.Schema{names, types}, columns, dictencodings) where {names, types}
+    b = FlatBuffers.Builder(1024)
+    schema = makeschema(b, sch, columns, dictencodings)
     return makemessage(b, Meta.Schema, schema)
 end
 
@@ -231,7 +283,8 @@ function fieldoffset(b, colidx, name, T, dictencodings)
         end
         children = FlatBuffers.endvector!(b, length(children))
     else
-        children = FlatBuffers.UOffsetT(0)
+        Meta.fieldStartChildrenVector(b, 0)
+        children = FlatBuffers.endvector!(b, 0)
     end
     # build field object
     Meta.fieldStart(b)
@@ -485,25 +538,35 @@ function writebuffer(io, ::Type{NTuple{N, T}}, col) where {N, T}
 end
 
 function makenodesbuffers!(::Type{Pair{K, V}}, col, fieldnodes, fieldbuffers, bufferoffset) where {K, V}
-    len = _length(col)
-    # null_count must be 0
-    push!(fieldnodes, FieldNode(len, 0))
-    # validity bitmap, not relevant
-    push!(fieldbuffers, Buffer(bufferoffset, 0))
     # Struct child node
-    push!(fieldnodes, FieldNode(len, 0))
-    for i = 1:length(names)
-        bufferoffset = makenodesbuffers!(maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col), fieldnodes, fieldbuffers, bufferoffset)
-    end
+    bufferoffset = makenodesbuffers!(Vector{KeyValue{K, V}}, ( KeyValue(k, v) for (k, v) in pairs(col) ), fieldnodes, fieldbuffers, bufferoffset)
     return bufferoffset
 end
 
 function writebuffer(io, ::Type{Pair{K, V}}, col) where {K, V}
+    # write values array
+    writebuffer(io, Vector{KeyValue{K, V}}, ( KeyValue(k, v) for (k, v) in pairs(col) ))
+    return
+end
+
+function makenodesbuffers!(::Type{KeyValue{K, V}}, col, fieldnodes, fieldbuffers, bufferoffset) where {K, V}
+    len = _length(col)
+    push!(fieldnodes, FieldNode(len, 0))
+    # validity bitmap
+    push!(fieldbuffers, Buffer(bufferoffset, 0))
+    # keys
+    bufferoffset = makenodesbuffers!(maybemissing(K), (x.key for x in col), fieldnodes, fieldbuffers, bufferoffset)
+    # values
+    bufferoffset = makenodesbuffers!(maybemissing(V), (x.value for x in col), fieldnodes, fieldbuffers, bufferoffset)
+    return bufferoffset
+end
+
+function writebuffer(io, ::Type{KeyValue{K, V}}, col) where {K, V}
     writebitmap(io, col)
-    # write values arrays
-    for i = 1:length(names)
-        writebuffer(io, maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col))
-    end
+    # write keys
+    writebuffer(io, maybemissing(K),(x.key for x in col))
+    # write values
+    writebuffer(io, maybemissing(V),(x.value for x in col))
     return
 end
 

@@ -312,12 +312,26 @@ function juliaeltype(f::Meta.Field, map::Meta.Map)
 end
 
 function arrowtype(b, ::Type{Pair{K, V}}) where {K, V}
-    children = [[fieldoffset(b, -1, "", K, nothing), fieldoffset(b, -1, "", V, nothing)]]
+    children = [fieldoffset(b, -1, "entries", KeyValue{K, V}, nothing)]
     Meta.mapStart(b)
     return Meta.Map, Meta.mapEnd(b), children
 end
 
 default(::Type{Pair{K, V}}) where {K, V} = default(K) => default(V)
+
+struct KeyValue{K, V}
+    key::K
+    value::V
+end
+Base.length(kv::KeyValue) = 1
+Base.iterate(kv::KeyValue, st=1) = st === nothing ? nothing : (kv, nothing)
+default(::Type{KeyValue{K, V}}) where {K, V} = KeyValue(default(K), default(V))
+
+function arrowtype(b, ::Type{KeyValue{K, V}}) where {K, V}
+    children = [fieldoffset(b, -1, "key", K, nothing), fieldoffset(b, -1, "value", V, nothing)]
+    Meta.structStart(b)
+    return Meta.Struct, Meta.structEnd(b), children
+end
 
 function juliaeltype(f::Meta.Field, list::Meta.Struct)
     names = Tuple(Symbol(x.name) for x in f.children)
