@@ -118,6 +118,8 @@ _keytype(::Type{T}) where {T} = keytype(T)
 _valtype(::Type{T}) where {T} = valtype(T)
 _keytype(::Pair{K, V}) where {K, V} = K
 _valtype(::Pair{K, V}) where {K, V} = V
+_keytype(::Type{Pair{K, V}}) where {K, V} = K
+_valtype(::Type{Pair{K, V}}) where {K, V} = V
 
 @propagate_inbounds function Base.getindex(m::Map, i::Integer)
     @boundscheck checkbounds(m, i)

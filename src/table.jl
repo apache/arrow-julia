@@ -249,9 +249,12 @@ function build(T, f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeLi
 end
 
 function build(S, f::Meta.Field, L::Meta.Map, batch, rb, nodeidx, bufferidx, debug)
+    validity = buildbitmap(batch, rb, bufferidx, debug)
+    bufferidx += 1
     T = Base.nonmissingtype(S)
-    A, nodeidx, bufferidx = build(_keytype(T), f.children[1].children[1], batch, rb, nodeidx + 2, bufferidx, debug)
-    B, nodeidx, bufferidx = build(_valtype(T), f.children[1].children[2], batch, rb, nodeidx, bufferidx, debug)
+    C, nodeidx, bufferidx = build(NamedTuple{(:first, :second), Tuple{_keytype(T), _valtype(T)}}, f.children[1], batch, rb, nodeidx + 1, bufferidx, debug)
+    A = C.data[1]
+    B = C.data[2]
     return Map{_keytype(T), _valtype(T), typeof(A), typeof(B)}(A, B), nodeidx, bufferidx
 end
 

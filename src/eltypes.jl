@@ -312,7 +312,7 @@ function juliaeltype(f::Meta.Field, map::Meta.Map)
 end
 
 function arrowtype(b, ::Type{Pair{K, V}}) where {K, V}
-    children = [[fieldoffset(b, -1, "", K, nothing), fieldoffset(b, -1, "", V, nothing)]]
+    children = [fieldoffset(b, -1, "entries", NamedTuple{(:first, :second), Tuple{K, V}}, nothing)]
     Meta.mapStart(b)
     return Meta.Map, Meta.mapEnd(b), children
 end

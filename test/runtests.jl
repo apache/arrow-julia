@@ -127,6 +127,25 @@ tt = Arrow.Table(io; debug=true)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
+# Map
+struct MapTable
+    x
+end
+Tables.columnnames(x::MapTable) = propertynames(x.x)
+Tables.getcolumn(x::MapTable, i::Int) = getfield(x.x, i)
+Tables.getcolumn(x::MapTable, nm::Symbol) = getproperty(x.x, nm)
+Tables.schema(x::MapTable) = Tables.Schema(propertynames(x.x), eltype.(getproperty(x.x, nm) for nm in propertynames(x.x)))
+Tables.columns(x::MapTable) = x
+t = MapTable((
+    col1=Dict(1 => "hey", 2 => "ho", 3 => missing),
+))
+io = IOBuffer()
+Arrow.write(io, t; debug=true)
+seekstart(io)
+tt = Arrow.Table(io; debug=true)
+@test length(tt) == length(t)
+@test all(isequal.(values(t), values(tt)))
+
 #TODO:
 #  -test Map
 

@@ -491,19 +491,13 @@ function makenodesbuffers!(::Type{Pair{K, V}}, col, fieldnodes, fieldbuffers, bu
     # validity bitmap, not relevant
     push!(fieldbuffers, Buffer(bufferoffset, 0))
     # Struct child node
-    push!(fieldnodes, FieldNode(len, 0))
-    for i = 1:length(names)
-        bufferoffset = makenodesbuffers!(maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col), fieldnodes, fieldbuffers, bufferoffset)
-    end
+    bufferoffset = makenodesbuffers!(NamedTuple{(:first, :second), Tuple{K, V}}, pairs(col), fieldnodes, fieldbuffers, bufferoffset)
     return bufferoffset
 end
 
 function writebuffer(io, ::Type{Pair{K, V}}, col) where {K, V}
-    writebitmap(io, col)
-    # write values arrays
-    for i = 1:length(names)
-        writebuffer(io, maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col))
-    end
+    # write values array
+    writebuffer(io, NamedTuple{(:first, :second), Tuple{K, V}}, pairs(col))
     return
 end
 
