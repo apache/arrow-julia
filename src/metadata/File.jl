@@ -7,6 +7,7 @@ function Base.getproperty(x::Footer, field::Symbol)
     if field === :version
         o = FlatBuffers.offset(x, 4)
         o != 0 && return FlatBuffers.get(x, o + x.pos, MetadataVersion)
+        return MetadataVersion.V1
     elseif field === :schema
         o = FlatBuffers.offset(x, 6)
         if o != 0
