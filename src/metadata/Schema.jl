@@ -5,6 +5,8 @@ struct Null <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::Null) = ()
+
 nullStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
 nullEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
@@ -12,6 +14,8 @@ struct Struct <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::Struct) = ()
 
 structStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
 structEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
@@ -21,6 +25,8 @@ struct List <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::List) = ()
+
 listStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
 listEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
@@ -29,6 +35,8 @@ struct LargeList <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::LargeList) = ()
+
 largeListStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
 largeListEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
@@ -36,6 +44,8 @@ struct FixedSizeList <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::FixedSizeList) = (:listSize,)
 
 function Base.getproperty(x::FixedSizeList, field::Symbol)
     if field === :listSize
@@ -55,6 +65,8 @@ struct Map <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::Map) = (:keysSorted,)
+
 function Base.getproperty(x::Map, field::Symbol)
     if field === :keysSorted
         o = FlatBuffers.offset(x, 4)
@@ -73,6 +85,8 @@ struct Union <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::Union) = (:mode, typeIds)
 
 function Base.getproperty(x::Union, field::Symbol)
     if field === :mode
@@ -96,6 +110,8 @@ struct Int <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::Int) = (:bitWidth, :is_signed)
 
 function Base.getproperty(x::Int, field::Symbol)
     if field === :bitWidth
@@ -121,6 +137,8 @@ struct FloatingPoint <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::FloatingPoint) = (:precision,)
+
 function Base.getproperty(x::FloatingPoint, field::Symbol)
     if field === :precision
         o = FlatBuffers.offset(x, 4)
@@ -139,6 +157,8 @@ struct Utf8 <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::Utf8) = ()
+
 utf8Start(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
 utf8End(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
@@ -146,6 +166,8 @@ struct Binary <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::Binary) = ()
 
 binaryStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
 binaryEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
@@ -155,6 +177,8 @@ struct LargeUtf8 <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::LargeUtf8) = ()
+
 largUtf8Start(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
 largUtf8End(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
@@ -163,6 +187,8 @@ struct LargeBinary <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::LargeBinary) = ()
+
 largeBinaryStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
 largeBinaryEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
@@ -170,6 +196,8 @@ struct FixedSizeBinary <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::FixedSizeBinary) = (:byteWidth,)
 
 function Base.getproperty(x::FixedSizeBinary, field::Symbol)
     if field === :byteWidth
@@ -188,6 +216,8 @@ struct Bool <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::Bool) = ()
+
 boolStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
 boolEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
@@ -195,6 +225,8 @@ struct Decimal <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::Decimal) = (:precision, :scale)
 
 function Base.getproperty(x::Decimal, field::Symbol)
     if field === :precision
@@ -221,6 +253,8 @@ struct Date <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::Date) = (:unit,)
+
 function Base.getproperty(x::Date, field::Symbol)
     if field === :unit
         o = FlatBuffers.offset(x, 4)
@@ -240,6 +274,8 @@ struct Time <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::Time) = (:unit, :bitWidth)
 
 function Base.getproperty(x::Time, field::Symbol)
     if field === :unit
@@ -263,6 +299,8 @@ struct Timestamp <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::Timestamp) = (:unit, :timezone)
 
 function Base.getproperty(x::Timestamp, field::Symbol)
     if field === :unit
@@ -288,6 +326,8 @@ struct Interval <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::Interval) = (:unit,)
+
 function Base.getproperty(x::Interval, field::Symbol)
     if field === :unit
         o = FlatBuffers.offset(x, 4)
@@ -305,6 +345,8 @@ struct Duration <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::Duration) = (:unit,)
 
 function Base.getproperty(x::Duration, field::Symbol)
     if field === :unit
@@ -374,6 +416,8 @@ struct KeyValue <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::KeyValue) = (:key, :value)
+
 function Base.getproperty(x::KeyValue, field::Symbol)
     if field === :key
         o = FlatBuffers.offset(x, 4)
@@ -396,6 +440,8 @@ struct DictionaryEncoding <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::DictionaryEncoding) = (:id, :indexType, :isOrdered, :dictionaryKind)
 
 function Base.getproperty(x::DictionaryEncoding, field::Symbol)
     if field === :id
@@ -429,6 +475,8 @@ struct Field <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::Field) = (:name, :type, :dictionary, :children, :custom_metadata)
 
 function Base.getproperty(x::Field, field::Symbol)
     if field === :name
@@ -489,6 +537,8 @@ end
 
 FlatBuffers.structsizeof(::Base.Type{Buffer}) = 16
 
+Base.propertynames(x::Buffer) = (:offset, :length)
+
 function Base.getproperty(x::Buffer, field::Symbol)
     if field === :offset
         return FlatBuffers.get(x, FlatBuffers.pos(x), Int64)
@@ -509,6 +559,8 @@ struct Schema <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::Schema) = (:endianness, :fields, :custom_metadata)
 
 function Base.getproperty(x::Schema, field::Symbol)
     if field === :endianness

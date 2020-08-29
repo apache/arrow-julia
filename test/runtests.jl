@@ -1,5 +1,14 @@
 using Test, Arrow, Tables, Dates
 
+struct MapTable
+    x
+end
+Tables.columnnames(x::MapTable) = propertynames(x.x)
+Tables.getcolumn(x::MapTable, i::Int) = getfield(x.x, i)
+Tables.getcolumn(x::MapTable, nm::Symbol) = getproperty(x.x, nm)
+Tables.schema(x::MapTable) = Tables.Schema(propertynames(x.x), eltype.(getproperty(x.x, nm) for nm in propertynames(x.x)))
+Tables.columns(x::MapTable) = x
+
 @testset "Arrow" begin
 
 # basic
@@ -127,7 +136,39 @@ tt = Arrow.Table(io; debug=true)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
-#TODO:
-#  -test Map
+# Map
+t = MapTable((
+    col1=Dict(Int32(1) => Float32(3.14)),
+))
+io = IOBuffer()
+Arrow.write(io, t; debug=true)
+seekstart(io)
+tt = Arrow.Table(io; debug=true)
+for (k, v) in tt.col1
+    @test isequal(t.x.col1[k], v)
+end
+
+# file format
+t = (
+    col1=[missing, missing, missing, missing],
+    col2=Union{UInt8, Missing}[0, 1, 2, missing],
+    col3=Union{UInt16, Missing}[0, 1, 2, missing],
+    col4=Union{UInt32, Missing}[0, 1, 2, missing],
+    col5=Union{UInt64, Missing}[0, 1, 2, missing],
+    col6=Union{Int8, Missing}[0, 1, 2, missing],
+    col7=Union{Int16, Missing}[0, 1, 2, missing],
+    col8=Union{Int32, Missing}[0, 1, 2, missing],
+    col9=Union{Int64, Missing}[0, 1, 2, missing],
+    col10=Union{Float16, Missing}[0, 1, 2, missing],
+    col11=Union{Float32, Missing}[0, 1, 2, missing],
+    col12=Union{Float64, Missing}[0, 1, 2, missing],
+    col13=[true, false, true, missing],
+)
+io = IOBuffer()
+Arrow.write(io, t; file=true)
+seekstart(io)
+tt = Arrow.Table(io)
+@test length(tt) == length(t)
+@test all(isequal.(values(t), values(tt)))
 
 end

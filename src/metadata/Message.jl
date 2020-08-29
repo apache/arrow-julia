@@ -5,6 +5,8 @@ end
 
 FlatBuffers.structsizeof(::Base.Type{FieldNode}) = 16
 
+Base.propertynames(x::FieldNode) = (:length, :null_count)
+
 function Base.getproperty(x::FieldNode, field::Symbol)
     if field === :length
         return FlatBuffers.get(x, FlatBuffers.pos(x), Int64)
@@ -30,6 +32,8 @@ struct BodyCompression <: FlatBuffers.Table
     pos::Base.Int
 end
 
+Base.propertynames(x::BodyCompression) = (:codec, :method)
+
 function Base.getproperty(x::BodyCompression, field::Symbol)
     if field === :codec
         o = FlatBuffers.offset(x, 4)
@@ -51,6 +55,8 @@ struct RecordBatch <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::RecordBatch) = (:length, :nodes, :buffers, :compression)
 
 function Base.getproperty(x::RecordBatch, field::Symbol)
     if field === :length
@@ -88,6 +94,8 @@ struct DictionaryBatch <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::DictionaryBatch) = (:id, :data, :isDelta)
 
 function Base.getproperty(x::DictionaryBatch, field::Symbol)
     if field === :id
@@ -136,6 +144,8 @@ struct Message <: FlatBuffers.Table
     bytes::Vector{UInt8}
     pos::Base.Int
 end
+
+Base.propertynames(x::Message) = (:version, :header, :bodyLength, :custom_metadata)
 
 function Base.getproperty(x::Message, field::Symbol)
     if field === :version
