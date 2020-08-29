@@ -18,14 +18,16 @@ struct Table <: Tables.AbstractColumns
     types::Vector{Type}
     columns::Vector{AbstractVector}
     lookup::Dict{Symbol, AbstractVector}
+    schema::Ref{Any}
 end
 
-Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}())
+Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}())
 
 names(t::Table) = getfield(t, :names)
 types(t::Table) = getfield(t, :types)
 columns(t::Table) = getfield(t, :columns)
 lookup(t::Table) = getfield(t, :lookup)
+schema(t::Table) = getfield(t, :schema)
 
 Tables.istable(::Table) = true
 Tables.columnaccess(::Table) = true
@@ -48,7 +50,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
         off += 8 # skip past magic bytes + padding
     end
     t = Table()
-    schema = nothing
+    sch = nothing
     dictencodings = Dict{Int64, DictEncoding}()
     dictencoded = Dict{Int64, Tuple{Bool, Type, Meta.Field}}()
     for batch in BatchIterator{debug}(bytes, off)
@@ -69,7 +71,8 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
                 end
                 debug && println("parsed column from schema: name=$(names(t)[end]), type=$(types(t)[end])$(isencoded ? " dictencoded" : "")")
             end
-            schema = header
+            sch = header
+            schema(t)[] = sch
         elseif header isa Meta.DictionaryBatch
             debug && println("parsing dictionary batch message")
             id = header.id
@@ -91,19 +94,19 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
             debug && println("parsing record batch message")
             if isempty(columns(t))
                 # first RecordBatch
-                for vec in VectorIterator{debug}(types(t), schema, batch, dictencodings)
+                for vec in VectorIterator{debug}(types(t), sch, batch, dictencodings)
                     push!(columns(t), vec)
                 end
                 debug && println("parsed 1st record batch")
             elseif !(columns(t)[1] isa ChainedVector)
                 # second RecordBatch
-                for (i, vec) in enumerate(VectorIterator{debug}(types(t), schema, batch, dictencodings))
+                for (i, vec) in enumerate(VectorIterator{debug}(types(t), sch, batch, dictencodings))
                     columns(t)[i] = ChainedVector([columns(t)[i], vec])
                 end
                 debug && println("parsed 2nd record batch")
             else
                 # 2+ RecordBatch
-                for (i, vec) in enumerate(VectorIterator{debug}(types(t), schema, batch, dictencodings))
+                for (i, vec) in enumerate(VectorIterator{debug}(types(t), sch, batch, dictencodings))
                     append!(columns(t)[i], vec)
                 end
                 debug && println("parsed additional record batch")
@@ -249,12 +252,15 @@ function build(T, f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeLi
 end
 
 function build(S, f::Meta.Field, L::Meta.Map, batch, rb, nodeidx, bufferidx, debug)
-    validity = buildbitmap(batch, rb, bufferidx, debug)
-    bufferidx += 1
     T = Base.nonmissingtype(S)
-    C, nodeidx, bufferidx = build(NamedTuple{(:first, :second), Tuple{_keytype(T), _valtype(T)}}, f.children[1], batch, rb, nodeidx + 1, bufferidx, debug)
-    A = C.data[1]
-    B = C.data[2]
+    # Map is an alias for List<Struct<K, V>>, but the validity/offset buffers for
+    # the List/Struct are reduntant/irrelevant, so we skip them
+    # skip the entries list & struct nodes
+    nodeidx += 2
+    # skip the entries list validity + offsets & struct validity
+    bufferidx += 3
+    A, nodeidx, bufferidx = build(_keytype(T), f.children[1].children[1], batch, rb, nodeidx, bufferidx, debug)
+    B, nodeidx, bufferidx = build(_valtype(T), f.children[1].children[2], batch, rb, nodeidx, bufferidx, debug)
     return Map{_keytype(T), _valtype(T), typeof(A), typeof(B)}(A, B), nodeidx, bufferidx
 end
 
