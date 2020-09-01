@@ -26,7 +26,12 @@ finaljuliatype(::Type{Union{T, Missing}}) where {T} = Union{Missing, finaljuliat
 
 function juliaeltype(f::Meta.Field)
     T = juliaeltype(f, f.type)
-    return f.nullable ? Union{T, Missing} : T
+    if f.custom_metadata !== nothing
+        fm = Dict(kv.key => kv.value for kv in f.custom_metadata)
+    else
+        fm = nothing
+    end
+    return (f.nullable ? Union{T, Missing} : T), fm
 end
 
 juliaeltype(f::Meta.Field, ::Meta.Null) = Missing
@@ -179,11 +184,9 @@ function arrowtype(b, ::Type{Date{U, T}}) where {U, T}
     return Meta.Date, Meta.dateEnd(b), nothing
 end
 
-arrowtype(b, ::Type{Dates.Date}) = arrowtype(b, Date{Meta.DateUnit.DAY, Int32})
 const UNIX_EPOCH_DATE = Dates.value(Dates.Date(1970))
 Base.convert(::Type{Date{Meta.DateUnit.DAY, Int32}}, x::Dates.Date) = Date{Meta.DateUnit.DAY, Int32}(Int32(Dates.value(x) - UNIX_EPOCH_DATE))
 
-arrowtype(b, ::Type{Dates.DateTime}) = arrowtype(b, Date{Meta.DateUnit.MILLISECOND, Int64})
 const UNIX_EPOCH_DATETIME = Dates.value(Dates.DateTime(1970))
 Base.convert(::Type{Date{Meta.DateUnit.MILLISECOND, Int64}}, x::Dates.DateTime) = Date{Meta.DateUnit.MILLISECOND, Int64}(Int64(Dates.value(x) - UNIX_EPOCH_DATETIME))
 
@@ -209,7 +212,6 @@ function arrowtype(b, ::Type{Time{U, T}}) where {U, T}
     return Meta.Time, Meta.timeEnd(b), nothing
 end
 
-arrowtype(b, ::Type{Dates.Time}) = arrowtype(b, Time{Meta.TimeUnit.NANOSECOND, Int64})
 Base.convert(::Type{Time{Meta.TimeUnit.NANOSECOND, Int64}}, x::Dates.Time) = Time{Meta.TimeUnit.NANOSECOND, Int64}(Dates.value(x))
 
 struct Timestamp{U, TZ} <: ArrowTimeType
@@ -278,41 +280,41 @@ arrowperiodtype(::Type{Dates.Millisecond}) = Meta.TimeUnit.MILLISECOND
 arrowperiodtype(::Type{Dates.Microsecond}) = Meta.TimeUnit.MICROSECOND
 arrowperiodtype(::Type{Dates.Nanosecond}) = Meta.TimeUnit.NANOSECOND
 
-arrowtype(b, ::Type{P}) where {P <: Dates.Period} = arrowtype(b, Duration{arrowperiodtype(P)})
 Base.convert(::Type{Duration{U}}, x::Dates.Period) where {U} = Duration{U}(Dates.value(periodtype(U)(x)))
 
 # nested types; call juliaeltype recursively on nested children
 function juliaeltype(f::Meta.Field, list::Union{Meta.List, Meta.LargeList})
-    return Vector{juliaeltype(f.children[1])}
+    T, _ = juliaeltype(f.children[1])
+    return Vector{T}
 end
 
 # arrowtype will call fieldoffset recursively for children
 function arrowtype(b, ::Type{Vector{T}}) where {T}
-    children = [fieldoffset(b, -1, "", T, nothing)]
+    children = [fieldoffset(b, -1, "", T, nothing, nothing)]
     Meta.listStart(b)
     return Meta.List, Meta.listEnd(b), children
 end
 
 function juliaeltype(f::Meta.Field, list::Meta.FixedSizeList)
-    type = juliaeltype(f.children[1])
+    type, _ = juliaeltype(f.children[1])
     return NTuple{Int(list.listSize), type}
 end
 
 function arrowtype(b, ::Type{NTuple{N, T}}) where {N, T}
-    children = [fieldoffset(b, -1, "", T, nothing)]
+    children = [fieldoffset(b, -1, "", T, nothing, nothing)]
     Meta.fixedSizeListStart(b)
     Meta.fixedSizeListAddListSize(b, Int32(N))
     return Meta.FixedSizeList, Meta.fixedSizeListEnd(b), children
 end
 
 function juliaeltype(f::Meta.Field, map::Meta.Map)
-    K = juliaeltype(f.children[1].children[1])
-    V = juliaeltype(f.children[1].children[2])
+    K, _ = juliaeltype(f.children[1].children[1])
+    V, _ = juliaeltype(f.children[1].children[2])
     return Pair{K, V}
 end
 
 function arrowtype(b, ::Type{Pair{K, V}}) where {K, V}
-    children = [fieldoffset(b, -1, "entries", KeyValue{K, V}, nothing)]
+    children = [fieldoffset(b, -1, "entries", KeyValue{K, V}, nothing, nothing)]
     Meta.mapStart(b)
     return Meta.Map, Meta.mapEnd(b), children
 end
@@ -328,19 +330,19 @@ Base.iterate(kv::KeyValue, st=1) = st === nothing ? nothing : (kv, nothing)
 default(::Type{KeyValue{K, V}}) where {K, V} = KeyValue(default(K), default(V))
 
 function arrowtype(b, ::Type{KeyValue{K, V}}) where {K, V}
-    children = [fieldoffset(b, -1, "key", K, nothing), fieldoffset(b, -1, "value", V, nothing)]
+    children = [fieldoffset(b, -1, "key", K, nothing, nothing), fieldoffset(b, -1, "value", V, nothing, nothing)]
     Meta.structStart(b)
     return Meta.Struct, Meta.structEnd(b), children
 end
 
 function juliaeltype(f::Meta.Field, list::Meta.Struct)
     names = Tuple(Symbol(x.name) for x in f.children)
-    types = Tuple(juliaeltype(x) for x in f.children)
+    types = Tuple(juliaeltype(x)[1] for x in f.children)
     return NamedTuple{names, Tuple{types...}}
 end
 
 function arrowtype(b, ::Type{NamedTuple{names, types}}) where {names, types}
-    children = [fieldoffset(b, -1, names[i], fieldtype(types, i), nothing) for i = 1:length(names)]
+    children = [fieldoffset(b, -1, names[i], fieldtype(types, i), nothing, nothing) for i = 1:length(names)]
     Meta.structStart(b)
     return Meta.Struct, Meta.structEnd(b), children
 end
@@ -349,7 +351,7 @@ default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{name
 
 # Unions
 function juliaeltype(f::Meta.Field, u::Meta.Union)
-    return UnionT{u.mode, u.typeIds !== nothing ? Tuple(u.typeIds) : u.typeIds, Tuple{(juliaeltype(x) for x in f.children)...}}
+    return UnionT{u.mode, u.typeIds !== nothing ? Tuple(u.typeIds) : u.typeIds, Tuple{(juliaeltype(x)[1] for x in f.children)...}}
 end
 
 # Note: nested Union types can't be represented using julia's builtin Union{...}
@@ -363,7 +365,7 @@ function arrowtype(b, ::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U}
         end
         TI = FlatBuffers.endvector!(b, length(typeIds))
     end
-    children = [fieldoffset(b, -1, "", fieldtype(U, i), nothing) for i = 1:fieldcount(U)]
+    children = [fieldoffset(b, -1, "", fieldtype(U, i), nothing, nothing) for i = 1:fieldcount(U)]
     Meta.unionStart(b)
     Meta.unionAddMode(b, T)
     if typeIds !== nothing

@@ -236,11 +236,14 @@ struct Converter{T, A} <: AbstractVector{T}
 end
 
 converter(::Type{T}, x::A) where {T, A} = Converter{eltype(A) >: Missing ? Union{T, Missing} : T, A}(x)
+converter(::Type{T}, x::ChainedVector{A}) where {T, A} = ChainedVector(Vector{A}[converter(T, x) for x in x.arrays])
 
 Base.IndexStyle(::Type{<:Converter}) = Base.IndexLinear()
 Base.size(x::Converter) = (length(x.data),)
 Base.eltype(x::Converter{T, A}) where {T, A} = T
 Base.getindex(x::Converter{T}, i::Int) where {T} = convert(T, getindex(x.data, i))
+Base.getindex(x::Converter{Symbol, A}, i::Int) where {T, A <: AbstractVector{String}} = Symbol(getindex(x.data, i))
+Base.getindex(x::Converter{Char, A}, i::Int) where {T, A <: AbstractVector{String}} = getindex(x.data, i)[1]
 
 maybemissing(::Type{T}) where {T} = T === Missing ? Missing : Base.nonmissingtype(T)
 

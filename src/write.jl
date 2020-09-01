@@ -48,16 +48,16 @@ function write(io, source, writetofile, debug)
     # start message writing from channel
 @static if VERSION >= v"1.3-DEV"
     tsk = Threads.@spawn for msg in msgs
-        Base.write(io, msg, blocks)
+        Base.write(io, msg, blocks, sch)
     end
 else
     tsk = @async for msg in msgs
-        Base.write(io, msg, blocks)
+        Base.write(io, msg, blocks, sch)
     end
 end
     @sync for (i, tbl) in enumerate(parts(source))
         if i == 1
-            cols = Tables.columns(tbl)
+            cols = Tables.columns(toarrowtable(tbl))
             sch[] = Tables.schema(cols)
             firstcols[] = cols
             for (i, col) in enumerate(Tables.Columns(cols))
@@ -68,6 +68,7 @@ end
                     dictencodings[i] = (id, encodingtype(length(values)), values)
                 end
             end
+            @show sch[]
             put!(msgs, makeschemamsg(sch[], cols, dictencodings))
             if !isempty(dictencodings)
                 for (colidx, (id, T, values)) in dictencodings
@@ -126,7 +127,7 @@ end
     wait(tsk)
     # write empty message
     if !writetofile
-        Base.write(io, Message(UInt8[], nothing, nothing, 0, true, false), blocks)
+        Base.write(io, Message(UInt8[], nothing, nothing, 0, true, false), blocks, sch)
     end
     if writetofile
         b = FlatBuffers.Builder(1024)
@@ -166,6 +167,54 @@ end
     return io
 end
 
+struct ToArrowTable
+    sch::Tables.Schema
+    cols::Vector{Any}
+    fieldmetadata::Dict{Int, Dict{String, String}}
+end
+
+function toarrowtable(x)
+    cols = Tables.columns(x)
+    sch = Tables.schema(cols)
+    types = sch.types
+    N = length(types)
+    newcols = Vector{Any}(undef, N)
+    newtypes = Vector{Type}(undef, N)
+    fieldmetadata = Dict{Int, Dict{String, String}}()
+    Tables.eachcolumn(sch, cols) do col, i, nm
+        T, newcol = toarrow(types[i], i, col, fieldmetadata)
+        @inbounds newtypes[i] = T
+        @inbounds newcols[i] = newcol
+    end
+    return ToArrowTable(Tables.Schema(sch.names, newtypes), newcols, fieldmetadata)
+end
+
+toarrow(::Type{T}, i, col, fm) where {T} = T, col
+toarrow(::Type{Dates.Date}, i, col, fm) = Date{Meta.DateUnit.DAY, Int32}, converter(Date{Meta.DateUnit.DAY, Int32}, col)
+toarrow(::Type{Dates.Time}, i, col, fm) = Time{Meta.TimeUnit.NANOSECOND, Int64}, converter(Time{Meta.TimeUnit.NANOSECOND, Int64}, col)
+toarrow(::Type{Dates.DateTime}, i, col, fm) = Date{Meta.DateUnit.MILLISECOND, Int64}, converter(Date{Meta.DateUnit.MILLISECOND, Int64}, col)
+toarrow(::Type{P}, i, col, fm) where {P <: Dates.Period} = Duration{arrowperiodtype(P)}, converter(Duration{arrowperiodtype(P)}, col)
+
+function toarrow(::Type{Symbol}, i, col, fm)
+    meta = get!(() -> Dict{String, String}(), fm, i)
+    meta["ARROW:extension:name"] = "JuliaLang.Symbol"
+    meta["ARROW:extension:metadata"] = ""
+    return String, (String(x) for x in col)
+end
+
+function toarrow(::Type{Char}, i, col, fm)
+    meta = get!(() -> Dict{String, String}(), fm, i)
+    meta["ARROW:extension:name"] = "JuliaLang.Char"
+    meta["ARROW:extension:metadata"] = ""
+    return String, (string(x) for x in col)
+end
+
+Tables.columns(x::ToArrowTable) = x
+Tables.rowcount(x::ToArrowTable) = length(x.cols) == 0 ? 0 : length(x.cols[1])
+Tables.schema(x::ToArrowTable) = x.sch
+Tables.columnnames(x::ToArrowTable) = x.sch.names
+Tables.getcolumn(x::ToArrowTable, i::Int) = x.cols[i]
+
 struct Message
     msgflatbuf
     columns
@@ -194,7 +243,7 @@ Base.size(x::DictEncoder) = (length(x.values),)
 Base.eltype(x::DictEncoder{T, A}) where {T, A} = T
 Base.getindex(x::DictEncoder, i::Int) = x.pool[x.values[i]]
 
-function Base.write(io::IO, msg::Message, blocks)
+function Base.write(io::IO, msg::Message, blocks, sch)
     metalen = padding(length(msg.msgflatbuf))
     if msg.blockmsg
         push!(blocks[msg.isrecordbatch ? 1 : 2], Block(position(io), metalen + 8, msg.bodylen))
@@ -209,14 +258,16 @@ function Base.write(io::IO, msg::Message, blocks)
     n += writezeros(io, paddinglength(n))
     # message body
     if msg.columns !== nothing
+        types = sch[].types
         # write out buffers
         for i = 1:length(Tables.columnnames(msg.columns))
             col = Tables.getcolumn(msg.columns, i)
+            T = types[i]
             if msg.dictencodings !== nothing && haskey(msg.dictencodings, i)
                 _, T, vals = msg.dictencodings[i]
                 col = DictEncoder(col, vals, T)
             end
-            writebuffer(io, eltype(col) === Missing ? Missing : Base.nonmissingtype(eltype(col)), col)
+            writebuffer(io, T === Missing ? Missing : Base.nonmissingtype(T), col)
         end
     end
     return n
@@ -239,7 +290,7 @@ end
 function makeschema(b, sch::Tables.Schema{names, types}, columns, dictencodings) where {names, types}
     # build Field objects
     N = length(names)
-    fieldoffsets = [fieldoffset(b, i, names[i], fieldtype(types, i), dictencodings) for i = 1:N]
+    fieldoffsets = [fieldoffset(b, i, names[i], fieldtype(types, i), dictencodings, columns.fieldmetadata) for i = 1:N]
     Meta.schemaStartFieldsVector(b, N)
     for off in Iterators.reverse(fieldoffsets)
         FlatBuffers.prependoffset!(b, off)
@@ -259,9 +310,29 @@ function makeschemamsg(sch::Tables.Schema{names, types}, columns, dictencodings)
     return makemessage(b, Meta.Schema, schema)
 end
 
-function fieldoffset(b, colidx, name, T, dictencodings)
+function fieldoffset(b, colidx, name, T, dictencodings, metadata)
     nameoff = FlatBuffers.createstring!(b, String(name))
     nullable = T >: Missing
+    # check for custom metadata
+    if metadata !== nothing && haskey(metadata, colidx)
+        kvs = metadata[colidx]
+        kvoffs = Vector{FlatBuffers.UOffsetT}(undef, length(kvs))
+        for (i, (k, v)) in enumerate(kvs)
+            koff = FlatBuffers.createstring!(b, String(k))
+            voff = FlatBuffers.createstring!(b, String(v))
+            Meta.keyValueStart(b)
+            Meta.keyValueAddKey(b, koff)
+            Meta.keyValueAddValue(b, voff)
+            kvoffs[i] = Meta.keyValueEnd(b)
+        end
+        Meta.fieldStartCustomMetadataVector(b, length(kvs))
+        for off in Iterators.reverse(kvoffs)
+            FlatBuffers.prependoffset!(b, off)
+        end
+        meta = FlatBuffers.endvector!(b, length(kvs))
+    else
+        meta = FlatBuffers.UOffsetT(0)
+    end
     # build dictionary
     if dictencodings !== nothing && haskey(dictencodings, colidx)
         id, encodingtype, _ = dictencodings[colidx]
@@ -294,7 +365,7 @@ function fieldoffset(b, colidx, name, T, dictencodings)
     Meta.fieldAddType(b, typeoff)
     Meta.fieldAddDictionary(b, dict)
     Meta.fieldAddChildren(b, children)
-    # Meta.fieldAddCustomMetadata(b, meta)
+    Meta.fieldAddCustomMetadata(b, meta)
     return Meta.fieldEnd(b)
 end
 
@@ -410,15 +481,6 @@ function makenodesbuffers!(::Type{T}, col, fieldnodes, fieldbuffers, bufferoffse
     return bufferoffset + padding(blen)
 end
 
-makenodesbuffers!(::Type{Dates.Date}, col, fieldnodes, fieldbuffers, bufferoffset) =
-    makenodesbuffers!(Date{Meta.DateUnit.DAY, Int32}, converter(Date{Meta.DateUnit.DAY, Int32}, col), fieldnodes, fieldbuffers, bufferoffset)
-makenodesbuffers!(::Type{Dates.Time}, col, fieldnodes, fieldbuffers, bufferoffset) =
-    makenodesbuffers!(Time{Meta.TimeUnit.NANOSECOND, Int64}, converter(Time{Meta.TimeUnit.NANOSECOND, Int64}, col), fieldnodes, fieldbuffers, bufferoffset)
-makenodesbuffers!(::Type{Dates.DateTime}, col, fieldnodes, fieldbuffers, bufferoffset) =
-    makenodesbuffers!(Date{Meta.DateUnit.MILLISECOND, Int64}, converter(Date{Meta.DateUnit.MILLISECOND, Int64}, col), fieldnodes, fieldbuffers, bufferoffset)
-makenodesbuffers!(::Type{P}, col, fieldnodes, fieldbuffers, bufferoffset) where {P <: Dates.Period} =
-    makenodesbuffers!(Duration{arrowperiodtype(P)}, converter(Duration{arrowperiodtype(P)}, col), fieldnodes, fieldbuffers, bufferoffset)
-
 function writebitmap(io, col)
     nullcount(col) == 0 && return 0
     len = _length(col)
@@ -446,11 +508,6 @@ function writebuffer(io, ::Type{T}, col) where {T}
     writezeros(io, paddinglength(n))
     return
 end
-
-writebuffer(io, ::Type{Dates.Date}, col) = writebuffer(io, Date{Meta.DateUnit.DAY, Int32}, converter(Date{Meta.DateUnit.DAY, Int32}, col))
-writebuffer(io, ::Type{Dates.Time}, col) = writebuffer(io, Time{Meta.TimeUnit.NANOSECOND, Int64}, converter(Time{Meta.TimeUnit.NANOSECOND, Int64}, col))
-writebuffer(io, ::Type{Dates.DateTime}, col) = writebuffer(io, Date{Meta.DateUnit.MILLISECOND, Int64}, converter(Date{Meta.DateUnit.MILLISECOND, Int64}, col))
-writebuffer(io, ::Type{P}, col) where {P <: Dates.Period} = writebuffer(io, Duration{arrowperiodtype(P)}, converter(Duration{arrowperiodtype(P)}, col))
 
 function makenodesbuffers!(::Type{T}, col, fieldnodes, fieldbuffers, bufferoffset) where {T <: Union{AbstractString, AbstractVector}}
     len = _length(col)
