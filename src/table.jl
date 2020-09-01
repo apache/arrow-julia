@@ -53,6 +53,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     sch = nothing
     dictencodings = Dict{Int64, DictEncoding}()
     dictencoded = Dict{Int64, Tuple{Bool, Type, Meta.Field}}()
+    fieldmetadata = Dict{Int, Dict{String, String}}()
     for batch in BatchIterator{debug}(bytes, off)
         # store custom_metadata of batch.msg?
         header = batch.msg.header
@@ -60,9 +61,13 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
             debug && println("parsing schema message")
             # assert endianness?
             # store custom_metadata?
-            for field in header.fields
+            for (i, field) in enumerate(header.fields)
                 push!(names(t), Symbol(field.name))
-                push!(types(t), juliaeltype(field))
+                T, metadata = juliaeltype(field)
+                if metadata !== nothing
+                    fieldmetadata[i] = metadata
+                end
+                push!(types(t), T)
                 d = field.dictionary
                 isencoded = false
                 if d !== nothing
@@ -117,6 +122,19 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     end
     lu = lookup(t)
     for (i, (k, T, col)) in enumerate(zip(names(t), types(t), columns(t)))
+        if haskey(fieldmetadata, i) && haskey(fieldmetadata[i], "ARROW:extension:name")
+            if fieldmetadata[i]["ARROW:extension:name"] == "JuliaLang.Symbol"
+                TT = finaljuliatype(Symbol)
+                types(t)[i] = TT
+                col = converter(TT, col)
+                columns(t)[i] = col
+            elseif fieldmetadata[i]["ARROW:extension:name"] == "JuliaLang.Char"
+                TT = finaljuliatype(Char)
+                types(t)[i] = TT
+                col = converter(TT, col)
+                columns(t)[i] = col
+            end
+        end
         if convert
             TT = finaljuliatype(T)
             if TT !== T

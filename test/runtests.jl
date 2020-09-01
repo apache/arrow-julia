@@ -171,4 +171,17 @@ tt = Arrow.Table(io)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
+# non-standard types
+t = (
+    col1=[:hey, :there, :sailor],
+    col2=['a', 'b', 'c'],
+)
+io = IOBuffer()
+Arrow.write(io, t)
+seekstart(io)
+tt = Arrow.Table(io)
+@test length(tt) == length(t)
+@test all(isequal.(values(t), values(tt)))
+
+
 end
