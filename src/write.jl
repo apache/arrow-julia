@@ -262,11 +262,11 @@ function Base.write(io::IO, msg::Message, blocks, sch)
         # write out buffers
         for i = 1:length(Tables.columnnames(msg.columns))
             col = Tables.getcolumn(msg.columns, i)
+            T = types[i]
             if msg.dictencodings !== nothing && haskey(msg.dictencodings, i)
                 _, T, vals = msg.dictencodings[i]
                 col = DictEncoder(col, vals, T)
             end
-            T = types[i]
             writebuffer(io, T === Missing ? Missing : Base.nonmissingtype(T), col)
         end
     end
