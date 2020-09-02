@@ -244,6 +244,10 @@ Base.eltype(x::Converter{T, A}) where {T, A} = T
 Base.getindex(x::Converter{T}, i::Int) where {T} = convert(T, getindex(x.data, i))
 Base.getindex(x::Converter{Symbol, A}, i::Int) where {T, A <: AbstractVector{String}} = Symbol(getindex(x.data, i))
 Base.getindex(x::Converter{Char, A}, i::Int) where {T, A <: AbstractVector{String}} = getindex(x.data, i)[1]
+Base.getindex(x::Converter{String, A}, i::Int) where {T, A <: AbstractVector{Symbol}} = String(getindex(x.data, i))
+Base.getindex(x::Converter{String, A}, i::Int) where {T, A <: AbstractVector{Char}} = string(getindex(x.data, i))
+DataAPI.refarray(x::Converter) = DataAPI.refarray(x.data)
+DataAPI.refpool(x::Converter{T}) where {T} = converter(T, DataAPI.refpool(x.data))
 
 maybemissing(::Type{T}) where {T} = T === Missing ? Missing : Base.nonmissingtype(T)
 
