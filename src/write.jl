@@ -473,7 +473,7 @@ function makenodesbuffers!(colidx, types, columns, dictencodings, fieldnodes, fi
             T = eltype(refvals)
             col = (x - one(T) for x in refvals)
         else
-            _, T, vals = msg.dictencodings[colidx]
+            _, T, vals = dictencodings[colidx]
             col = DictEncoder(col, vals, T)
         end
         len = _length(col)
