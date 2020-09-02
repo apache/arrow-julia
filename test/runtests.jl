@@ -1,4 +1,4 @@
-using Test, Arrow, Tables, Dates
+using Test, Arrow, Tables, Dates, PooledArrays
 
 struct MapTable
     x
@@ -99,7 +99,28 @@ tt = Arrow.Table(io)
 
 # dict encodings
 t = (
+    col1=Arrow.DictEncode([4, 5, 6]),
+)
+io = IOBuffer()
+Arrow.write(io, t; debug=true)
+seekstart(io)
+tt = Arrow.Table(io; debug=true)
+@test length(tt) == length(t)
+@test all(isequal.(values(t), values(tt)))
+
+t = (
     col1=Arrow.DictEncode(NamedTuple{(:a, :b), Tuple{Int64, Union{String, Missing}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b="sailor"), (a=Int64(4), b="jo-bob")]),
+)
+io = IOBuffer()
+Arrow.write(io, t; debug=true)
+seekstart(io)
+tt = Arrow.Table(io; debug=true)
+@test length(tt) == length(t)
+@test all(isequal.(values(t), values(tt)))
+
+# PooledArrays
+t = (
+    col1=PooledArray([4,5,6,6]),
 )
 io = IOBuffer()
 Arrow.write(io, t; debug=true)
