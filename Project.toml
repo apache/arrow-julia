@@ -4,6 +4,7 @@ authors = ["quinnj <quinn.jacobd@gmail.com>", "ExpandingMan <expandingman@proton
 version = "1.0.0"
 
 [deps]
+DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 SentinelArrays = "91c51154-3ec4-41a3-a24f-3f23e20d615c"
@@ -11,12 +12,14 @@ Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 
 [compat]
 julia = "1"
+DataAPI = "1"
 Tables = "1" # should be 1.1 for Tables.partitions
 SentinelArrays = "1"
 
 [extras]
+PooledArrays = "2dfb63ee-cc39-5dd5-95bd-886bf059d720"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "Random"]
+test = ["Test", "Random", "PooledArrays"]

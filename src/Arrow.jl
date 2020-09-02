@@ -2,7 +2,7 @@ module Arrow
 
 using Mmap
 import Dates
-using Tables, SentinelArrays
+using DataAPI, Tables, SentinelArrays
 
 using Base: @propagate_inbounds
 import Base: ==

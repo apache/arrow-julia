@@ -64,11 +64,18 @@ end
                 if col isa DictEncode
                     id = dictid[]
                     dictid[] += 1
-                    values = unique(col)
-                    dictencodings[i] = (id, encodingtype(length(values)), values)
+                    refpool = DataAPI.refpool(col.data)
+                    if refpool !== nothing
+                        values = refpool
+                        IT = eltype(DataAPI.refarray(col.data))
+                    else
+                        values = unique(col)
+                        IT = encodingtype(length(values))
+                    end
+                    dictencodings[i] = (id, IT, values)
                 end
             end
-            @show sch[]
+            debug && @show sch[]
             put!(msgs, makeschemamsg(sch[], cols, dictencodings))
             if !isempty(dictencodings)
                 for (colidx, (id, T, values)) in dictencodings
@@ -86,8 +93,14 @@ end
                         for (colidx, (id, T, values)) in dictencodings
                             dictsch = Tables.Schema((:col,), (eltype(values),))
                             col = Tables.getcolumn(cols, colidx)
+                            refpool = DataAPI.refpool(col.data)
+                            if refpool !== nothing
+                                newvals = refpool
+                            else
+                                newvals = col
+                            end
                             # get new values we haven't seen before for delta update
-                            vals = setdiff(col, values)
+                            vals = setdiff(newvals, values)
                             put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), id, true, debug))
                             # add new values to existing set for future diffs
                             union!(values, vals)
@@ -107,8 +120,14 @@ else
                         for (colidx, (id, T, values)) in dictencodings
                             dictsch = Tables.Schema((:col,), (eltype(values),))
                             col = Tables.getcolumn(cols, colidx)
+                            refpool = DataAPI.refpool(col.data)
+                            if refpool !== nothing
+                                newvals = refpool
+                            else
+                                newvals = col
+                            end
                             # get new values we haven't seen before for delta update
-                            vals = setdiff(col, values)
+                            vals = setdiff(newvals, values)
                             put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), id, true, debug))
                             # add new values to existing set for future diffs
                             union!(values, vals)
@@ -176,15 +195,20 @@ end
 function toarrowtable(x)
     cols = Tables.columns(x)
     sch = Tables.schema(cols)
-    types = sch.types
+    types = collect(sch.types)
     N = length(types)
     newcols = Vector{Any}(undef, N)
     newtypes = Vector{Type}(undef, N)
     fieldmetadata = Dict{Int, Dict{String, String}}()
     Tables.eachcolumn(sch, cols) do col, i, nm
+        dictencode = false
+        if col isa AbstractArray && DataAPI.refarray(col) !== col
+            dictencode = true
+            types[i] = eltype(DataAPI.refpool(col))
+        end
         T, newcol = toarrow(types[i], i, col, fieldmetadata)
-        @inbounds newtypes[i] = T
-        @inbounds newcols[i] = newcol
+        newtypes[i] = T
+        newcols[i] = dictencode ? DictEncode(newcol) : newcol
     end
     return ToArrowTable(Tables.Schema(sch.names, newtypes), newcols, fieldmetadata)
 end
@@ -199,14 +223,14 @@ function toarrow(::Type{Symbol}, i, col, fm)
     meta = get!(() -> Dict{String, String}(), fm, i)
     meta["ARROW:extension:name"] = "JuliaLang.Symbol"
     meta["ARROW:extension:metadata"] = ""
-    return String, (String(x) for x in col)
+    return String, converter(String, col)
 end
 
 function toarrow(::Type{Char}, i, col, fm)
     meta = get!(() -> Dict{String, String}(), fm, i)
     meta["ARROW:extension:name"] = "JuliaLang.Char"
     meta["ARROW:extension:metadata"] = ""
-    return String, (string(x) for x in col)
+    return String, converter(String, col)
 end
 
 Tables.columns(x::ToArrowTable) = x
@@ -263,9 +287,16 @@ function Base.write(io::IO, msg::Message, blocks, sch)
         for i = 1:length(Tables.columnnames(msg.columns))
             col = Tables.getcolumn(msg.columns, i)
             T = types[i]
+            # @show typeof(col), col
             if msg.dictencodings !== nothing && haskey(msg.dictencodings, i)
-                _, T, vals = msg.dictencodings[i]
-                col = DictEncoder(col, vals, T)
+                refvals = DataAPI.refarray(col.data)
+                if refvals !== col.data
+                    T = eltype(refvals)
+                    col = (x - one(T) for x in refvals)
+                else
+                    _, T, vals = msg.dictencodings[i]
+                    col = DictEncoder(col, vals, T)
+                end
             end
             writebuffer(io, T === Missing ? Missing : Base.nonmissingtype(T), col)
         end
@@ -437,8 +468,14 @@ function makenodesbuffers!(colidx, types, columns, dictencodings, fieldnodes, fi
     T = fieldtype(types, colidx)
     col = Tables.getcolumn(columns, colidx)
     if dictencodings !== nothing && haskey(dictencodings, colidx)
-        _, T, vals = dictencodings[colidx]
-        col = DictEncoder(col, vals, T)
+        refvals = DataAPI.refarray(col.data)
+        if refvals !== col.data
+            T = eltype(refvals)
+            col = (x - one(T) for x in refvals)
+        else
+            _, T, vals = dictencodings[colidx]
+            col = DictEncoder(col, vals, T)
+        end
         len = _length(col)
         nc = nullcount(col)
         push!(fieldnodes, FieldNode(len, nc))
