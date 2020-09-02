@@ -290,7 +290,6 @@ function Base.write(io::IO, msg::Message, blocks, sch)
             # @show typeof(col), col
             if msg.dictencodings !== nothing && haskey(msg.dictencodings, i)
                 refvals = DataAPI.refarray(col.data)
-                @show typeof(refvals), typeof(col.data)
                 if refvals !== col.data
                     T = eltype(refvals)
                     col = (x - one(T) for x in refvals)
@@ -299,7 +298,6 @@ function Base.write(io::IO, msg::Message, blocks, sch)
                     col = DictEncoder(col, vals, T)
                 end
             end
-            @show col
             writebuffer(io, T === Missing ? Missing : Base.nonmissingtype(T), col)
         end
     end
