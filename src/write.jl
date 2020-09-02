@@ -202,7 +202,7 @@ function toarrowtable(x)
     fieldmetadata = Dict{Int, Dict{String, String}}()
     Tables.eachcolumn(sch, cols) do col, i, nm
         dictencode = false
-        if DataAPI.refarray(col) !== col
+        if col isa AbstractArray && DataAPI.refarray(col) !== col
             dictencode = true
             types[i] = eltype(DataAPI.refpool(col))
         end
