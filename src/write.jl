@@ -34,11 +34,46 @@ else
     parts(x::Tuple) = x
 end
 
+struct OrderedChannel{T}
+    chan::Channel{T}
+    cond::Threads.Condition
+    i::Ref{Int}
+end
+
+OrderedChannel{T}(sz) where {T} = OrderedChannel{T}(Channel{T}(sz), Threads.Condition(), Ref(1))
+Base.iterate(ch::OrderedChannel, st...) = iterate(ch.chan, st...)
+
+function Base.put!(ch::OrderedChannel{T}, x::T, i::Integer, incr::Bool=false) where {T}
+    lock(ch.cond)
+    try
+        while ch.i[] < i
+            wait(ch.cond)
+        end
+        put!(ch.chan, x)
+        if incr
+            ch.i[] += 1
+        end
+        notify(ch.cond)
+    finally
+        unlock(ch.cond)
+    end
+    return
+end
+
+function Base.close(ch::OrderedChannel)
+    lock(ch.cond)
+    while !isempty(ch.cond)
+        wait(ch.cond)
+    end
+    close(ch.chan)
+    return
+end
+
 function write(io, source, writetofile, debug)
     if writetofile
         Base.write(io, "ARROW1\0\0")
     end
-    msgs = Channel{Message}(Inf)
+    msgs = OrderedChannel{Message}(Inf)
     # build messages
     sch = Ref{Tables.Schema}()
     firstcols = Ref{Any}()
@@ -76,19 +111,19 @@ end
                 end
             end
             debug && @show sch[]
-            put!(msgs, makeschemamsg(sch[], cols, dictencodings))
+            put!(msgs, makeschemamsg(sch[], cols, dictencodings), i)
             if !isempty(dictencodings)
                 for (colidx, (id, T, values)) in dictencodings
                     dictsch = Tables.Schema((:col,), (eltype(values),))
-                    put!(msgs, makedictionarybatchmsg(dictsch, (col=values,), id, false, debug))
+                    put!(msgs, makedictionarybatchmsg(dictsch, (col=values,), id, false, debug), i)
                 end
             end
-            put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, debug))
+            put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, debug), i, true)
         else
 @static if VERSION >= v"1.3-DEV"
             Threads.@spawn begin
                 try
-                    cols = Tables.columns(tbl)
+                    cols = Tables.columns(toarrowtable(tbl))
                     if !isempty(dictencodings)
                         for (colidx, (id, T, values)) in dictencodings
                             dictsch = Tables.Schema((:col,), (eltype(values),))
@@ -101,12 +136,12 @@ end
                             end
                             # get new values we haven't seen before for delta update
                             vals = setdiff(newvals, values)
-                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), id, true, debug))
+                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), id, true, debug), i)
                             # add new values to existing set for future diffs
                             union!(values, vals)
                         end
                     end
-                    put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, debug))
+                    put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, debug), i, true)
                 catch e
                     showerror(stdout, e, catch_backtrace())
                     rethrow(e)
@@ -115,7 +150,7 @@ end
 else
             @async begin
                 try
-                    cols = Tables.columns(tbl)
+                    cols = Tables.columns(toarrowtable(tbl))
                     if !isempty(dictencodings)
                         for (colidx, (id, T, values)) in dictencodings
                             dictsch = Tables.Schema((:col,), (eltype(values),))
@@ -128,12 +163,12 @@ else
                             end
                             # get new values we haven't seen before for delta update
                             vals = setdiff(newvals, values)
-                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), id, true, debug))
+                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), id, true, debug), i)
                             # add new values to existing set for future diffs
                             union!(values, vals)
                         end
                     end
-                    put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, debug))
+                    put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, debug), i, true)
                 catch e
                     showerror(stdout, e, catch_backtrace())
                     rethrow(e)
@@ -146,7 +181,7 @@ end
     wait(tsk)
     # write empty message
     if !writetofile
-        Base.write(io, Message(UInt8[], nothing, nothing, 0, true, false), blocks, sch)
+        Base.write(io, Message(0, UInt8[], nothing, nothing, 0, true, false), blocks, sch)
     end
     if writetofile
         b = FlatBuffers.Builder(1024)
@@ -651,16 +686,16 @@ function makenodesbuffers!(::Type{KeyValue{K, V}}, col, fieldnodes, fieldbuffers
     # keys
     bufferoffset = makenodesbuffers!(maybemissing(K), (x.key for x in col), fieldnodes, fieldbuffers, bufferoffset)
     # values
-    bufferoffset = makenodesbuffers!(maybemissing(V), (x.value for x in col), fieldnodes, fieldbuffers, bufferoffset)
+    bufferoffset = makenodesbuffers!(maybemissing(V), (@miss_or(x, x.value) for x in col), fieldnodes, fieldbuffers, bufferoffset)
     return bufferoffset
 end
 
 function writebuffer(io, ::Type{KeyValue{K, V}}, col) where {K, V}
     writebitmap(io, col)
     # write keys
-    writebuffer(io, maybemissing(K),(x.key for x in col))
+    writebuffer(io, maybemissing(K), (x.key for x in col))
     # write values
-    writebuffer(io, maybemissing(V),(x.value for x in col))
+    writebuffer(io, maybemissing(V), (@miss_or(x, x.value) for x in col))
     return
 end
 
@@ -673,7 +708,7 @@ function makenodesbuffers!(::Type{NamedTuple{names, types}}, col, fieldnodes, fi
     push!(fieldbuffers, Buffer(bufferoffset, blen))
     bufferoffset += blen
     for i = 1:length(names)
-        bufferoffset = makenodesbuffers!(maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col), fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(maybemissing(fieldtype(types, i)), (@miss_or(x, getfield(x, names[i])) for x in col), fieldnodes, fieldbuffers, bufferoffset)
     end
     return bufferoffset
 end
@@ -682,7 +717,7 @@ function writebuffer(io, ::Type{NamedTuple{names, types}}, col) where {names, ty
     writebitmap(io, col)
     # write values arrays
     for i = 1:length(names)
-        writebuffer(io, maybemissing(fieldtype(types, i)), (getfield(x, names[i]) for x in col))
+        writebuffer(io, maybemissing(fieldtype(types, i)), (@miss_or(x, getfield(x, names[i])) for x in col))
     end
     return
 end
