@@ -133,6 +133,8 @@ function arrowtype(b, ::Type{NTuple{N, UInt8}}) where {N}
 end
 
 default(::Type{NTuple{N, T}}) where {N, T} = ntuple(i -> default(T), N)
+# arggh!
+Base.write(io::IO, x::NTuple{N, T}) where {N, T} = sum(y -> Base.write(io, y), x)
 default(::Type{T}) where {T <: Tuple} = Tuple(default(fieldtype(T, i)) for i = 1:fieldcount(T))
 
 juliaeltype(f::Meta.Field, x::Meta.Bool) = Bool
@@ -143,10 +145,12 @@ function arrowtype(b, ::Type{Bool})
 end
 
 struct Decimal{P, S}
-    bytes::NTuple{16, UInt8}
+    value::Int128
 end
 
-Base.zero(::Type{Decimal{P, S}}) where {P, S} = Decimal{P, S}(ntuple(i->0x00, 16))
+Base.zero(::Type{Decimal{P, S}}) where {P, S} = Decimal{P, S}(Int128(0))
+==(a::Decimal{P, S}, b::Decimal{P, S}) where {P, S} = ==(a.value, b.value)
+Base.isequal(a::Decimal{P, S}, b::Decimal{P, S}) where {P, S} = isequal(a.value, b.value)
 
 function juliaeltype(f::Meta.Field, x::Meta.Decimal)
     return Decimal{x.precision, x.scale}
@@ -159,6 +163,8 @@ function arrowtype(b, ::Type{Decimal{P, S}}) where {P, S}
     return Meta.Decimal, Meta.decimalEnd(b), nothing
 end
 
+Base.write(io::IO, x::Decimal) = Base.write(io, x.value)
+
 abstract type ArrowTimeType end
 Base.write(io::IO, x::ArrowTimeType) = Base.write(io, x.x)
 
@@ -167,7 +173,7 @@ struct Date{U, T} <: ArrowTimeType
 end
 
 Base.zero(::Type{Date{U, T}}) where {U, T} = Date{U, T}(T(0))
-
+storagetype(::Type{Date{U, T}}) where {U, T} = T
 bitwidth(x::Meta.DateUnit) = x == Meta.DateUnit.DAY ? Int32 : Int64
 Date{Meta.DateUnit.DAY}(days) = Date{Meta.DateUnit.DAY, Int32}(Int32(days))
 Date{Meta.DateUnit.MILLISECOND}(ms) = Date{Meta.DateUnit.MILLISECOND, Int64}(Int64(ms))
@@ -198,7 +204,7 @@ Base.zero(::Type{Time{U, T}}) where {U, T} = Time{U, T}(T(0))
 
 bitwidth(x::Meta.TimeUnit) = x == Meta.TimeUnit.SECOND || x == Meta.TimeUnit.MILLISECOND ? Int32 : Int64
 Time{U}(x) where {U <: Meta.TimeUnit} = Time{U, bitwidth(U)}(bitwidth(U)(x))
-
+storagetype(::Type{Time{U, T}}) where {U, T} = T
 juliaeltype(f::Meta.Field, x::Meta.Time) = Time{x.unit, bitwidth(x.unit)}
 finaljuliatype(::Type{<:Time}) = Dates.Time
 periodtype(U::Meta.TimeUnit) = U === Meta.TimeUnit.SECOND ? Dates.Second :
@@ -325,6 +331,8 @@ struct KeyValue{K, V}
     key::K
     value::V
 end
+keyvalueK(::Type{KeyValue{K, V}}) where {K, V} = K
+keyvalueV(::Type{KeyValue{K, V}}) where {K, V} = V
 Base.length(kv::KeyValue) = 1
 Base.iterate(kv::KeyValue, st=1) = st === nothing ? nothing : (kv, nothing)
 default(::Type{KeyValue{K, V}}) where {K, V} = KeyValue(default(K), default(V))
