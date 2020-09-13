@@ -34,18 +34,38 @@ else
     parts(x::Tuple) = x
 end
 
+@static if VERSION >= v"1.3"
+    const Cond = Threads.Condition
+else
+    const Cond = Condition
+end
+
 struct OrderedChannel{T}
     chan::Channel{T}
-    cond::Threads.Condition
+    cond::Cond
     i::Ref{Int}
 end
 
 OrderedChannel{T}(sz) where {T} = OrderedChannel{T}(Channel{T}(sz), Threads.Condition(), Ref(1))
 Base.iterate(ch::OrderedChannel, st...) = iterate(ch.chan, st...)
 
+macro lock(obj, expr)
+    esc(quote
+    @static if VERSION >= v"1.3"
+        lock($obj)
+    end
+        try
+            $expr
+        finally
+            @static if VERSION >= v"1.3"
+                unlock($obj)
+            end
+        end
+    end)
+end
+
 function Base.put!(ch::OrderedChannel{T}, x::T, i::Integer, incr::Bool=false) where {T}
-    lock(ch.cond)
-    try
+    @lock ch.cond begin
         while ch.i[] < i
             wait(ch.cond)
         end
@@ -54,18 +74,17 @@ function Base.put!(ch::OrderedChannel{T}, x::T, i::Integer, incr::Bool=false) wh
             ch.i[] += 1
         end
         notify(ch.cond)
-    finally
-        unlock(ch.cond)
     end
     return
 end
 
 function Base.close(ch::OrderedChannel)
-    lock(ch.cond)
-    while !isempty(ch.cond)
-        wait(ch.cond)
+    @lock ch.cond begin
+        while !isempty(ch.cond)
+            wait(ch.cond)
+        end
+        close(ch.chan)
     end
-    close(ch.chan)
     return
 end
 
@@ -181,7 +200,7 @@ end
     wait(tsk)
     # write empty message
     if !writetofile
-        Base.write(io, Message(0, UInt8[], nothing, nothing, 0, true, false), blocks, sch)
+        Base.write(io, Message(UInt8[], nothing, nothing, 0, true, false), blocks, sch)
     end
     if writetofile
         b = FlatBuffers.Builder(1024)
