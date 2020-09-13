@@ -80,7 +80,7 @@ end
 
 function Base.close(ch::OrderedChannel)
     @lock ch.cond begin
-        while !isempty(ch.cond)
+        while Base.n_waiters(ch.cond) > 0
             wait(ch.cond)
         end
         close(ch.chan)
