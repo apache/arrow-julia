@@ -24,6 +24,11 @@ function writearray(io::IO, ::Type{T}, col) where {T}
     elseif isbitstype(T) && (col isa Vector{Union{T, Missing}} || col isa SentinelVector{T, T, Missing, Vector{T}})
         # need to write the non-selector bytes of isbits Union Arrays
         n = Base.unsafe_write(io, pointer(col), sizeof(T) * length(col))
+    elseif col isa ChainedVector
+        n = 0
+        for A in col.arrays
+            n += writearray(io, T, A)
+        end
     else
         n = 0
         for x in col
@@ -108,6 +113,12 @@ _length(x::Iterators.Flatten) = sum(i -> i === missing ? 1 : _length(i), x)
 if !applicable(iterate, missing)
 Base.iterate(::Missing, st=1) = st === nothing ? nothing : (missing, nothing)
 end
+
+ntupleT(::Type{NTuple{N, T}}) where {N, T} = T
+ntnames(::Type{NamedTuple{names, T}}) where {names, T} = names
+ntT(::Type{NamedTuple{names, T}}) where {names, T} = T
+pairK(::Type{Pair{K, V}}) where {K, V} = K
+pairV(::Type{Pair{K, V}}) where {K, V} = V
 
 # need a custom representation of Union types since arrow unions
 # are ordered, and possibly indirected via separate typeIds array
@@ -236,7 +247,7 @@ struct Converter{T, A} <: AbstractVector{T}
 end
 
 converter(::Type{T}, x::A) where {T, A} = Converter{eltype(A) >: Missing ? Union{T, Missing} : T, A}(x)
-converter(::Type{T}, x::ChainedVector{A}) where {T, A} = ChainedVector(Vector{A}[converter(T, x) for x in x.arrays])
+converter(::Type{T}, x::ChainedVector{A}) where {T, A} = ChainedVector([converter(T, x) for x in x.arrays])
 
 Base.IndexStyle(::Type{<:Converter}) = Base.IndexLinear()
 Base.size(x::Converter) = (length(x.data),)
@@ -250,6 +261,10 @@ DataAPI.refarray(x::Converter) = DataAPI.refarray(x.data)
 DataAPI.refpool(x::Converter{T}) where {T} = converter(T, DataAPI.refpool(x.data))
 
 maybemissing(::Type{T}) where {T} = T === Missing ? Missing : Base.nonmissingtype(T)
+
+macro miss_or(x, ex)
+    esc(:($x === missing ? missing : $(ex)))
+end
 
 function getfooter(filebytes)
     len = readbuffer(filebytes, length(filebytes) - 9, Int32)
