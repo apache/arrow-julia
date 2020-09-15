@@ -20,6 +20,8 @@ tt = Arrow.Table(io)
 @test length(tt) == length(t)
 @test tt.col1 == t.col1
 @test eltype(tt.col1) === Int64
+col1 = copy(tt.col1)
+@test typeof(col1) == Vector{Int64}
 
 # missing values
 t = (col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],)
@@ -99,7 +101,7 @@ tt = Arrow.Table(io)
 
 # dict encodings
 t = (
-    col1=Arrow.DictEncode([4, 5, 6]),
+    col1=Arrow.DictEncode(Int64[4, 5, 6]),
 )
 io = IOBuffer()
 Arrow.write(io, t; debug=true)
@@ -107,6 +109,8 @@ seekstart(io)
 tt = Arrow.Table(io; debug=true)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
+col1 = copy(tt.col1)
+@test typeof(col1) == PooledVector{Int64, Int64, Vector{Int64}}
 
 t = (
     col1=Arrow.DictEncode(NamedTuple{(:a, :b), Tuple{Int64, Union{String, Missing}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b="sailor"), (a=Int64(4), b="jo-bob")]),
