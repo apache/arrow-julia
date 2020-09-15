@@ -1,3 +1,12 @@
+const OBJ_METADATA = IdDict{Any, Dict{String, String}}()
+
+function setmetadata!(x, meta::Dict{String, String})
+    OBJ_METADATA[x] = meta
+    return
+end
+
+getmetadata(x, default=nothing) = get(OBJ_METADATA, x, default)
+
 """
     Arrow.write(io::IO, tbl)
     Arrow.write(file::String, tbl)
@@ -11,7 +20,7 @@ Multiple record batches will be written based on the number of
 `Tables.partitions(tbl)` that are provided; by default, this is just
 one for a given table, but some table sources support automatic
 partitioning. Note you can turn multiple table objects into partitions
-by doing `Tables.partitioner([tbl1, tbl2, ...])`, but do remember that
+by doing `Tables.partitioner([tbl1, tbl2, ...])`, but note that
 each table must have the exact same `Tables.Schema`.
 """
 function write end
@@ -243,11 +252,13 @@ end
 struct ToArrowTable
     sch::Tables.Schema
     cols::Vector{Any}
+    metadata::Union{Nothing, Dict{String, String}}
     fieldmetadata::Dict{Int, Dict{String, String}}
 end
 
 function toarrowtable(x)
     cols = Tables.columns(x)
+    meta = getmetadata(cols)
     sch = Tables.schema(cols)
     types = collect(sch.types)
     N = length(types)
@@ -255,6 +266,10 @@ function toarrowtable(x)
     newtypes = Vector{Type}(undef, N)
     fieldmetadata = Dict{Int, Dict{String, String}}()
     Tables.eachcolumn(sch, cols) do col, i, nm
+        colmeta = getmetadata(col)
+        if colmeta !== nothing
+            fieldmetadata[i] = colmeta
+        end
         dictencode = false
         if col isa AbstractArray && DataAPI.refarray(col) !== col
             dictencode = true
@@ -264,7 +279,7 @@ function toarrowtable(x)
         newtypes[i] = T
         newcols[i] = dictencode ? DictEncode(newcol) : newcol
     end
-    return ToArrowTable(Tables.Schema(sch.names, newtypes), newcols, fieldmetadata)
+    return ToArrowTable(Tables.Schema(sch.names, newtypes), newcols, meta, fieldmetadata)
 end
 
 toarrow(::Type{T}, i, col, fm) where {T} = T, col
@@ -381,11 +396,30 @@ function makeschema(b, sch::Tables.Schema{names, types}, columns, dictencodings)
         FlatBuffers.prependoffset!(b, off)
     end
     fields = FlatBuffers.endvector!(b, N)
+    if columns.metadata !== nothing
+        kvs = columns.metadata
+        kvoffs = Vector{FlatBuffers.UOffsetT}(undef, length(kvs))
+        for (i, (k, v)) in enumerate(kvs)
+            koff = FlatBuffers.createstring!(b, String(k))
+            voff = FlatBuffers.createstring!(b, String(v))
+            Meta.keyValueStart(b)
+            Meta.keyValueAddKey(b, koff)
+            Meta.keyValueAddValue(b, voff)
+            kvoffs[i] = Meta.keyValueEnd(b)
+        end
+        Meta.schemaStartCustomMetadataVector(b, length(kvs))
+        for off in Iterators.reverse(kvoffs)
+            FlatBuffers.prependoffset!(b, off)
+        end
+        meta = FlatBuffers.endvector!(b, length(kvs))
+    else
+        meta = FlatBuffers.UOffsetT(0)
+    end
     # write schema object
     Meta.schemaStart(b)
     Meta.schemaAddEndianness(b, Meta.Endianness.Little)
     Meta.schemaAddFields(b, fields)
-    # Meta.schemaAddCustomMetadata(b, meta)
+    Meta.schemaAddCustomMetadata(b, meta)
     return Meta.schemaEnd(b)
 end
 

@@ -557,7 +557,6 @@ function Base.isequal(df::DataFile, tbl::Arrow.Table)
     i = 1
     for (col1, col2) in zip(Tables.Columns(df), Tables.Columns(tbl))
         if isequal(col1, col2)
-            @show i
             return false
         end
         i += 1
