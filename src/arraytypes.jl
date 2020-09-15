@@ -234,5 +234,5 @@ function Base.copy(x::DictEncoded{T, S}) where {T, S}
             refs[i] = refs[i] + 1
         end
     end
-    return PooledArray(PooledArrays.RefArray(refs), Dict(val => i for (i, val) in enumerate(pool)), pool)
+    return PooledArray(PooledArrays.RefArray(refs), Dict{T, S}(val => i for (i, val) in enumerate(pool)), pool)
 end
