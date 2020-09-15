@@ -110,7 +110,7 @@ tt = Arrow.Table(io; debug=true)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 col1 = copy(tt.col1)
-@test typeof(col1) == PooledVector{Int64, Int64, Vector{Int64}}
+@test typeof(col1) == PooledVector{Int64, Int8, Vector{Int8}}
 
 t = (
     col1=Arrow.DictEncode(NamedTuple{(:a, :b), Tuple{Int64, Union{String, Missing}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b="sailor"), (a=Int64(4), b="jo-bob")]),

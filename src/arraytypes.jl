@@ -224,14 +224,14 @@ function Base.copy(x::DictEncoded{T, S}) where {T, S}
     valid = x.validity
     inds = x.indices
     if T !== S
-        refs = Vector{T}(undef, length(inds))
+        refs = Vector{S}(undef, length(inds))
         @inbounds for i = 1:length(inds)
-            refs[i] = ifelse(valid[i], inds[i] + 1, missing)
+            refs[i] = ifelse(valid[i], inds[i] + one(S), missing)
         end
     else
         refs = copy(inds)
         @inbounds for i = 1:length(inds)
-            refs[i] = refs[i] + 1
+            refs[i] = refs[i] + one(S)
         end
     end
     return PooledArray(PooledArrays.RefArray(refs), Dict{T, S}(val => i for (i, val) in enumerate(pool)), pool)
