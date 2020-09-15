@@ -1,6 +1,7 @@
 abstract type ArrowVector{T} <: AbstractVector{T} end
 
 Base.IndexStyle(::Type{A}) where {A <: ArrowVector} = Base.IndexLinear()
+Base.similar(::Type{A}, dims::Dims) where {T, A <: ArrowVector{T}} = Vector{T}(undef, dims)
 
 struct ValidityBitmap <: ArrowVector{Bool}
     bytes::Vector{UInt8} # arrow memory blob
@@ -39,6 +40,19 @@ struct Primitive{T, S} <: ArrowVector{T}
 end
 
 Base.size(p::Primitive) = (p.ℓ,)
+
+function Base.copy(p::Primitive{T, S}) where {T, S}
+    if T !== S
+        A = Vector{T}(undef, p.ℓ)
+        valid = p.validity
+        data = p.data
+        @inbounds for i = 1:p.ℓ
+            A[i] = ifelse(valid[i], data[i], missing)
+        end
+    else
+        return copy(p.data)
+    end
+end
 
 @propagate_inbounds function Base.getindex(p::Primitive{T, S}, i::Integer) where {T, S}
     @boundscheck checkbounds(p, i)
@@ -203,4 +217,22 @@ Base.size(d::DictEncoded) = size(d.indices)
     !valid && return missing
     @inbounds idx = d.indices[i]
     return d.encoding[idx + 1]
+end
+
+function Base.copy(x::DictEncoded{T, S}) where {T, S}
+    pool = copy(x.encoding.data)
+    valid = x.validity
+    inds = x.indices
+    if T !== S
+        refs = Vector{S}(undef, length(inds))
+        @inbounds for i = 1:length(inds)
+            refs[i] = ifelse(valid[i], inds[i] + one(S), missing)
+        end
+    else
+        refs = copy(inds)
+        @inbounds for i = 1:length(inds)
+            refs[i] = refs[i] + one(S)
+        end
+    end
+    return PooledArray(PooledArrays.RefArray(refs), Dict{T, S}(val => i for (i, val) in enumerate(pool)), pool)
 end
