@@ -145,6 +145,10 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
         end
         lu[k] = col
     end
+    meta = sch.custom_metadata
+    if meta !== nothing
+        setmetadata!(t, Dict(String(kv.key) => String(kv.value) for kv in meta))
+    end
     return t
 end
 
@@ -211,6 +215,10 @@ function Base.iterate(x::VectorIterator{debug}, (columnidx, nodeidx, bufferidx)=
     else
         debug && println("parsing column=$columnidx, T=$(x.types[columnidx]), len=$(x.batch.msg.header.nodes[nodeidx].length)")
         A, nodeidx, bufferidx = build(x.types[columnidx], field, x.batch, x.batch.msg.header, nodeidx, bufferidx, debug)
+    end
+    meta = field.custom_metadata
+    if meta !== nothing
+        setmetadata!(A, Dict(String(kv.key) => String(kv.value) for kv in meta))
     end
     return A, (columnidx + 1, nodeidx, bufferidx)
 end
