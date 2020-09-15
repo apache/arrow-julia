@@ -204,5 +204,19 @@ tt = Arrow.Table(io)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
+t = (col1=Int64[1,2,3,4,5,6,7,8,9,10],)
+meta = Dict("key1" => "value1", "key2" => "value2")
+Arrow.setmetadata!(t, meta)
+meta2 = Dict("colkey1" => "colvalue1", "colkey2" => "colvalue2")
+Arrow.setmetadata!(t.col1, meta2)
+io = IOBuffer()
+Arrow.write(io, t)
+seekstart(io)
+tt = Arrow.Table(io)
+@test length(tt) == length(t)
+@test tt.col1 == t.col1
+@test eltype(tt.col1) === Int64
+@test Arrow.getmetadata(tt) == meta
+@test Arrow.getmetadata(tt.col1) == meta2
 
 end
