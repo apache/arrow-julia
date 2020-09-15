@@ -31,7 +31,7 @@ schema(t::Table) = getfield(t, :schema)
 
 Tables.istable(::Table) = true
 Tables.columnaccess(::Table) = true
-Tables.columns(t::Table) = t
+Tables.columns(t::Table) = Tables.CopiedColumns(t)
 Tables.schema(t::Table) = Tables.Schema(names(t), types(t))
 Tables.columnnames(t::Table) = names(t)
 Tables.getcolumn(t::Table, i::Int) = columns(t)[i]
