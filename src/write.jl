@@ -25,15 +25,15 @@ each table must have the exact same `Tables.Schema`.
 """
 function write end
 
-function write(file::String, tbl; debug::Bool=false)
+function write(file::String, tbl; largelists::Bool=false, compress::Bool=false, debug::Bool=false)
     open(file, "w") do io
-        write(io, tbl, true, debug)
+        write(io, tbl, true, largelists, compress, debug)
     end
     return file
 end
 
-function write(io::IO, tbl; debug::Bool=false, file::Bool=false)
-    return write(io, tbl, file, debug)
+function write(io::IO, tbl; largelists::Bool=false, compress::Bool=false, debug::Bool=false, file::Bool=false)
+    return write(io, tbl, file, largelists, compress, debug)
 end
 
 if isdefined(Tables, :partitions)
@@ -97,7 +97,7 @@ function Base.close(ch::OrderedChannel)
     return
 end
 
-function write(io, source, writetofile, debug)
+function write(io, source, writetofile, largelists, compress, debug)
     if writetofile
         Base.write(io, "ARROW1\0\0")
     end
@@ -111,16 +111,16 @@ function write(io, source, writetofile, debug)
     # start message writing from channel
 @static if VERSION >= v"1.3-DEV"
     tsk = Threads.@spawn for msg in msgs
-        Base.write(io, msg, blocks, sch)
+        Base.write(io, msg, blocks, sch, compress)
     end
 else
     tsk = @async for msg in msgs
-        Base.write(io, msg, blocks, sch)
+        Base.write(io, msg, blocks, sch, compress)
     end
 end
     @sync for (i, tbl) in enumerate(parts(source))
         if i == 1
-            cols = Tables.columns(toarrowtable(tbl))
+            cols = Tables.columns(toarrowtable(tbl, largelists))
             sch[] = Tables.schema(cols)
             firstcols[] = cols
             for (i, col) in enumerate(Tables.Columns(cols))
@@ -143,15 +143,15 @@ end
             if !isempty(dictencodings)
                 for (colidx, (id, T, values)) in dictencodings
                     dictsch = Tables.Schema((:col,), (eltype(values),))
-                    put!(msgs, makedictionarybatchmsg(dictsch, (col=values,), id, false, debug), i)
+                    put!(msgs, makedictionarybatchmsg(dictsch, (col=values,), id, false, compress, debug), i)
                 end
             end
-            put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, debug), i, true)
+            put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, compress, debug), i, true)
         else
 @static if VERSION >= v"1.3-DEV"
             Threads.@spawn begin
                 try
-                    cols = Tables.columns(toarrowtable(tbl))
+                    cols = Tables.columns(toarrowtable(tbl, largelists))
                     if !isempty(dictencodings)
                         for (colidx, (id, T, values)) in dictencodings
                             dictsch = Tables.Schema((:col,), (eltype(values),))
@@ -164,12 +164,12 @@ end
                             end
                             # get new values we haven't seen before for delta update
                             vals = setdiff(newvals, values)
-                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), id, true, debug), i)
+                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), id, true, compress, debug), i)
                             # add new values to existing set for future diffs
                             union!(values, vals)
                         end
                     end
-                    put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, debug), i, true)
+                    put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, compress, debug), i, true)
                 catch e
                     showerror(stdout, e, catch_backtrace())
                     rethrow(e)
@@ -178,7 +178,7 @@ end
 else
             @async begin
                 try
-                    cols = Tables.columns(toarrowtable(tbl))
+                    cols = Tables.columns(toarrowtable(tbl, largelists))
                     if !isempty(dictencodings)
                         for (colidx, (id, T, values)) in dictencodings
                             dictsch = Tables.Schema((:col,), (eltype(values),))
@@ -191,12 +191,12 @@ else
                             end
                             # get new values we haven't seen before for delta update
                             vals = setdiff(newvals, values)
-                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), id, true, debug), i)
+                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), id, true, compress, debug), i)
                             # add new values to existing set for future diffs
                             union!(values, vals)
                         end
                     end
-                    put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, debug), i, true)
+                    put!(msgs, makerecordbatchmsg(sch[], cols, dictencodings, compress, debug), i, true)
                 catch e
                     showerror(stdout, e, catch_backtrace())
                     rethrow(e)
@@ -209,7 +209,7 @@ end
     wait(tsk)
     # write empty message
     if !writetofile
-        Base.write(io, Message(UInt8[], nothing, nothing, 0, true, false), blocks, sch)
+        Base.write(io, Message(UInt8[], nothing, nothing, 0, true, false), blocks, sch, compress)
     end
     if writetofile
         b = FlatBuffers.Builder(1024)
@@ -256,7 +256,7 @@ struct ToArrowTable
     fieldmetadata::Dict{Int, Dict{String, String}}
 end
 
-function toarrowtable(x)
+function toarrowtable(x, largelists)
     cols = Tables.columns(x)
     meta = getmetadata(cols)
     sch = Tables.schema(cols)
@@ -275,27 +275,39 @@ function toarrowtable(x)
             dictencode = true
             types[i] = eltype(DataAPI.refpool(col))
         end
-        T, newcol = toarrow(types[i], i, col, fieldmetadata)
+        T, newcol = toarrow(types[i], i, col, fieldmetadata, largelists)
         newtypes[i] = T
         newcols[i] = dictencode ? DictEncode(newcol) : newcol
     end
     return ToArrowTable(Tables.Schema(sch.names, newtypes), newcols, meta, fieldmetadata)
 end
 
-toarrow(::Type{T}, i, col, fm) where {T} = T, col
-toarrow(::Type{Dates.Date}, i, col, fm) = Date{Meta.DateUnit.DAY, Int32}, converter(Date{Meta.DateUnit.DAY, Int32}, col)
-toarrow(::Type{Dates.Time}, i, col, fm) = Time{Meta.TimeUnit.NANOSECOND, Int64}, converter(Time{Meta.TimeUnit.NANOSECOND, Int64}, col)
-toarrow(::Type{Dates.DateTime}, i, col, fm) = Date{Meta.DateUnit.MILLISECOND, Int64}, converter(Date{Meta.DateUnit.MILLISECOND, Int64}, col)
-toarrow(::Type{P}, i, col, fm) where {P <: Dates.Period} = Duration{arrowperiodtype(P)}, converter(Duration{arrowperiodtype(P)}, col)
+toarrow(::Type{T}, i, col, fm, ll) where {T} = T, col
+toarrow(::Type{Dates.Date}, i, col, fm, ll) = Date{Meta.DateUnit.DAY, Int32}, converter(Date{Meta.DateUnit.DAY, Int32}, col)
+toarrow(::Type{Dates.Time}, i, col, fm, ll) = Time{Meta.TimeUnit.NANOSECOND, Int64}, converter(Time{Meta.TimeUnit.NANOSECOND, Int64}, col)
+toarrow(::Type{Dates.DateTime}, i, col, fm, ll) = Date{Meta.DateUnit.MILLISECOND, Int64}, converter(Date{Meta.DateUnit.MILLISECOND, Int64}, col)
+toarrow(::Type{P}, i, col, fm, ll) where {P <: Dates.Period} = Duration{arrowperiodtype(P)}, converter(Duration{arrowperiodtype(P)}, col)
 
-function toarrow(::Type{Symbol}, i, col, fm)
+function toarrow(::Type{T}, i, col, fm, ll) where {T <: Union{AbstractString, AbstractVector}}
+    len = T <: AbstractString ? sizeof : length
+    datalen = 0
+    for x in col
+        datalen += len(x)
+    end
+    if datalen > 2147483647 || ll
+        return LargeList{T}, col
+    end
+    return T, col
+end
+
+function toarrow(::Type{Symbol}, i, col, fm, ll)
     meta = get!(() -> Dict{String, String}(), fm, i)
     meta["ARROW:extension:name"] = "JuliaLang.Symbol"
     meta["ARROW:extension:metadata"] = ""
     return String, converter(String, col)
 end
 
-function toarrow(::Type{Char}, i, col, fm)
+function toarrow(::Type{Char}, i, col, fm, ll)
     meta = get!(() -> Dict{String, String}(), fm, i)
     meta["ARROW:extension:name"] = "JuliaLang.Char"
     meta["ARROW:extension:metadata"] = ""
@@ -336,7 +348,7 @@ Base.size(x::DictEncoder) = (length(x.values),)
 Base.eltype(x::DictEncoder{T, A}) where {T, A} = T
 Base.getindex(x::DictEncoder, i::Int) = x.pool[x.values[i]]
 
-function Base.write(io::IO, msg::Message, blocks, sch)
+function Base.write(io::IO, msg::Message, blocks, sch, compress)
     metalen = padding(length(msg.msgflatbuf))
     if msg.blockmsg
         push!(blocks[msg.isrecordbatch ? 1 : 2], Block(position(io), metalen + 8, msg.bodylen))
@@ -367,7 +379,7 @@ function Base.write(io::IO, msg::Message, blocks, sch)
                     col = DictEncoder(col, vals, T)
                 end
             end
-            writebuffer(io, T === Missing ? Missing : Base.nonmissingtype(T), col)
+            writebuffer(io, T === Missing ? Missing : Base.nonmissingtype(T), col, compress)
         end
     end
     return n
@@ -498,13 +510,13 @@ struct Buffer
     length::Int64
 end
 
-function makerecordbatchmsg(sch::Tables.Schema{names, types}, columns, dictencodings, debug) where {names, types}
+function makerecordbatchmsg(sch::Tables.Schema{names, types}, columns, dictencodings, compress, debug) where {names, types}
     b = FlatBuffers.Builder(1024)
-    recordbatch, bodylen = makerecordbatch(b, sch, columns, dictencodings, debug)
+    recordbatch, bodylen = makerecordbatch(b, sch, columns, dictencodings, compress, debug)
     return makemessage(b, Meta.RecordBatch, recordbatch, columns, dictencodings, bodylen)
 end
 
-function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, dictencodings, debug) where {names, types}
+function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, dictencodings, compress, debug) where {names, types}
     nrows = Tables.rowcount(columns)
     debug && println("building record batch message for $nrows rows")
 
@@ -540,9 +552,9 @@ function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, dictencod
     return Meta.recordBatchEnd(b), bodylen
 end
 
-function makedictionarybatchmsg(sch::Tables.Schema{names, types}, columns, id, isdelta, debug) where {names, types}
+function makedictionarybatchmsg(sch::Tables.Schema{names, types}, columns, id, isdelta, compress, debug) where {names, types}
     b = FlatBuffers.Builder(1024)
-    recordbatch, bodylen = makerecordbatch(b, sch, columns, nothing, debug)
+    recordbatch, bodylen = makerecordbatch(b, sch, columns, nothing, compress, debug)
     Meta.dictionaryBatchStart(b)
     Meta.dictionaryBatchAddId(b, Int64(id))
     Meta.dictionaryBatchAddData(b, recordbatch)
@@ -588,7 +600,7 @@ function makenodesbuffers!(::Type{Missing}, col, fieldnodes, fieldbuffers, buffe
     return bufferoffset
 end
 
-function writebuffer(io, ::Type{Missing}, col)
+function writebuffer(io, ::Type{Missing}, col, compress)
     return
 end
 
@@ -627,7 +639,7 @@ function writebitmap(io, col)
     return n
 end
 
-function writebuffer(io, ::Type{T}, col) where {T}
+function writebuffer(io, ::Type{T}, col, compress) where {T}
     writebitmap(io, col)
     n = writearray(io, T, col)
     writezeros(io, paddinglength(n))
@@ -643,8 +655,7 @@ function makenodesbuffers!(::Type{T}, col, fieldnodes, fieldbuffers, bufferoffse
     push!(fieldbuffers, Buffer(bufferoffset, blen))
     # adjust buffer offset, make array buffer
     bufferoffset += blen
-    # TODO: support Large lists
-    blen = sizeof(Int32) * (len + 1)
+    blen = sizeof(offsettype(T)) * (len + 1)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
     bufferoffset += padding(blen)
     if T <: AbstractString || T <: AbstractVector{UInt8}
@@ -660,16 +671,17 @@ function makenodesbuffers!(::Type{T}, col, fieldnodes, fieldbuffers, bufferoffse
     return bufferoffset
 end
 
-function writebuffer(io, ::Type{T}, col) where {T <: Union{AbstractString, AbstractVector}}
+function writebuffer(io, ::Type{T}, col, compress) where {T <: Union{AbstractString, AbstractVector}}
     writebitmap(io, col)
     # write offsets
-    off::Int32 = 0
+    OT = offsettype(T)
+    off::OT = 0
     len = T <: AbstractString ? sizeof : length
     n = 0
     for x in col
         n += Base.write(io, off)
         if x !== missing
-            off += len(x)
+            off += OT(len(x))
         end
     end
     n += Base.write(io, off)
@@ -684,7 +696,7 @@ function writebuffer(io, ::Type{T}, col) where {T <: Union{AbstractString, Abstr
         end
         writezeros(io, paddinglength(n))
     else
-        writebuffer(io, maybemissing(eltype(T)), flatten(skipmissing(col)))
+        writebuffer(io, maybemissing(eltype(T)), flatten(skipmissing(col)), compress)
     end
     return
 end
@@ -707,14 +719,14 @@ function makenodesbuffers!(::Type{NTuple{N, T}}, col, fieldnodes, fieldbuffers, 
     return bufferoffset
 end
 
-function writebuffer(io, ::Type{NTuple{N, T}}, col) where {N, T}
+function writebuffer(io, ::Type{NTuple{N, T}}, col, compress) where {N, T}
     writebitmap(io, col)
     # write values array
     if T === UInt8
         n = writearray(io, NTuple{N, T}, col)
         writezeros(io, paddinglength(n))
     else
-        writebuffer(io, maybemissing(T), flatten(coalesce(x, default(NTuple{N, T})) for x in col))
+        writebuffer(io, maybemissing(T), flatten(coalesce(x, default(NTuple{N, T})) for x in col), compress)
     end
     return
 end
@@ -725,9 +737,9 @@ function makenodesbuffers!(::Type{Pair{K, V}}, col, fieldnodes, fieldbuffers, bu
     return bufferoffset
 end
 
-function writebuffer(io, ::Type{Pair{K, V}}, col) where {K, V}
+function writebuffer(io, ::Type{Pair{K, V}}, col, compress) where {K, V}
     # write values array
-    writebuffer(io, Vector{KeyValue{K, V}}, ( KeyValue(k, v) for (k, v) in pairs(col) ))
+    writebuffer(io, Vector{KeyValue{K, V}}, ( KeyValue(k, v) for (k, v) in pairs(col) ), compress)
     return
 end
 
@@ -743,12 +755,12 @@ function makenodesbuffers!(::Type{KeyValue{K, V}}, col, fieldnodes, fieldbuffers
     return bufferoffset
 end
 
-function writebuffer(io, ::Type{KeyValue{K, V}}, col) where {K, V}
+function writebuffer(io, ::Type{KeyValue{K, V}}, col, compress) where {K, V}
     writebitmap(io, col)
     # write keys
-    writebuffer(io, maybemissing(K), (x.key for x in col))
+    writebuffer(io, maybemissing(K), (x.key for x in col), compress)
     # write values
-    writebuffer(io, maybemissing(V), (@miss_or(x, x.value) for x in col))
+    writebuffer(io, maybemissing(V), (@miss_or(x, x.value) for x in col), compress)
     return
 end
 
@@ -766,11 +778,11 @@ function makenodesbuffers!(::Type{NamedTuple{names, types}}, col, fieldnodes, fi
     return bufferoffset
 end
 
-function writebuffer(io, ::Type{NamedTuple{names, types}}, col) where {names, types}
+function writebuffer(io, ::Type{NamedTuple{names, types}}, col, compress) where {names, types}
     writebitmap(io, col)
     # write values arrays
     for i = 1:length(names)
-        writebuffer(io, maybemissing(fieldtype(types, i)), (@miss_or(x, getfield(x, names[i])) for x in col))
+        writebuffer(io, maybemissing(fieldtype(types, i)), (@miss_or(x, getfield(x, names[i])) for x in col), compress)
     end
     return
 end
@@ -805,7 +817,7 @@ end
 isatypeid(x::T, ::Type{types}) where {T, types} = isatypeid(x, fieldtype(types, 1), types, 1)
 isatypeid(x::T, ::Type{S}, ::Type{types}, i) where {T, S, types} = x isa S ? i : isatypeid(x, fieldtype(types, i + 1), types, i + 1)
 
-function writebuffer(io, ::Type{UnionT{T, typeIds, U}}, col) where {T, typeIds, U}
+function writebuffer(io, ::Type{UnionT{T, typeIds, U}}, col, compress) where {T, typeIds, U}
     # typeIds buffer
     typeids = typeIds === nothing ? (0:(fieldcount(U) - 1)) : typeIds
     n = 0
@@ -827,13 +839,13 @@ function writebuffer(io, ::Type{UnionT{T, typeIds, U}}, col) where {T, typeIds, 
         # write values arrays
         for i = 1:fieldcount(U)
             S = fieldtype(U, i)
-            writebuffer(io, maybemissing(S), filtered(i == 1 ? Union{S, Missing} : maybemissing(S), col))
+            writebuffer(io, maybemissing(S), filtered(i == 1 ? Union{S, Missing} : maybemissing(S), col), compress)
         end
     else
         # value arrays
         for i = 1:fieldcount(U)
             S = fieldtype(U, i)
-            writebuffer(io, maybemissing(S), replaced(S, col))
+            writebuffer(io, maybemissing(S), replaced(S, col), compress)
         end
     end
     return
