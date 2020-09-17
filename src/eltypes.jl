@@ -18,6 +18,11 @@ type. So each supported writing type needs to define `default`.
 """
 function default end
 
+struct LargeList{T} end
+
+offsettype(::Type{LargeList{T}}) where {T} = Int64
+offsettype(T) = Int32
+
 default(T) = zero(T)
 
 finaljuliatype(T) = T
@@ -100,11 +105,16 @@ end
 juliaeltype(f::Meta.Field, b::Union{Meta.Utf8, Meta.LargeUtf8}) = String
 
 function arrowtype(b, ::Type{String})
-    # To support LargeUtf8, we'd need a way to flag/pass a max length from user/actual data
     Meta.utf8Start(b)
     return Meta.Utf8, Meta.utf8End(b), nothing
 end
 
+function arrowtype(b, ::Type{LargeList{String}})
+    Meta.largUtf8Start(b)
+    return Meta.LargeUtf8, Meta.largUtf8End(b), nothing
+end
+
+default(::Type{LargeList{T}}) where {T} = default(T)
 default(::Type{String}) = ""
 
 datasizeof(x) = sizeof(x)
@@ -113,9 +123,13 @@ datasizeof(x::AbstractVector) = sum(datasizeof, x)
 juliaeltype(f::Meta.Field, b::Union{Meta.Binary, Meta.LargeBinary}) = Vector{UInt8}
 
 function arrowtype(b, ::Type{Vector{UInt8}})
-    # To support LargeBinary, we'd need a way to flag/pass a max length from user/actual data
     Meta.binaryStart(b)
     return Meta.Binary, Meta.binaryEnd(b), nothing
+end
+
+function arrowtype(b, ::Type{LargeList{Vector{UInt8}}})
+    Meta.largeBinaryStart(b)
+    return Meta.Binary, Meta.largeBinaryEnd(b), nothing
 end
 
 function default(::Type{A}) where {A <: AbstractVector{T}} where {T}
@@ -299,6 +313,12 @@ function arrowtype(b, ::Type{Vector{T}}) where {T}
     children = [fieldoffset(b, -1, "", T, nothing, nothing)]
     Meta.listStart(b)
     return Meta.List, Meta.listEnd(b), children
+end
+
+function arrowtype(b, ::Type{LargeList{Vector{T}}}) where {T}
+    children = [fieldoffset(b, -1, "", T, nothing, nothing)]
+    Meta.largeListStart(b)
+    return Meta.List, Meta.largeListEnd(b), children
 end
 
 function juliaeltype(f::Meta.Field, list::Meta.FixedSizeList)

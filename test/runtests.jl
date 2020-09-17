@@ -223,4 +223,31 @@ tt = Arrow.Table(io)
 @test Arrow.getmetadata(tt) == meta
 @test Arrow.getmetadata(tt.col1) == meta2
 
+t = (
+    col1=Arrow.DictEncode(NamedTuple{(:a, :b), Tuple{Int64, Union{String, Missing}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b="sailor"), (a=Int64(4), b="jo-bob")]),
+)
+io = IOBuffer()
+Arrow.write(io, t; debug=true)
+seekstart(io)
+tt = Arrow.Table(io; debug=true)
+@test length(tt) == length(t)
+@test all(isequal.(values(t), values(tt)))
+
+# large lists
+t = (
+    col1=Union{String, Missing}["hey", "there", "sailor", missing],
+    col2=Union{Vector{UInt8}, Missing}[b"hey", b"there", b"sailor", missing],
+    col3=Union{Vector{Int64}, Missing}[Int64[1], Int64[2], Int64[3], missing],
+    col4=Union{NTuple{2, Vector{Int64}},Missing}[(Int64[1], Int64[2]), missing, missing, (Int64[3], Int64[4])],
+    col5=Union{NTuple{2, UInt8}, Missing}[(0x01, 0x02), (0x03, 0x04), missing, (0x05, 0x06)],
+    col6=NamedTuple{(:a, :b), Tuple{Int64, String}}[(a=Int64(1), b="hey"), (a=Int64(2), b="there"), (a=Int64(3), b="sailor"), (a=Int64(4), b="jo-bob")],
+)
+io = IOBuffer()
+Arrow.write(io, t; largelists=true)
+seekstart(io)
+tt = Arrow.Table(io)
+@test length(tt) == length(t)
+@test all(isequal.(values(t), values(tt)))
+
+
 end
