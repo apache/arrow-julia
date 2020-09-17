@@ -151,7 +151,7 @@ end
 @static if VERSION >= v"1.3-DEV"
             Threads.@spawn begin
                 try
-                    cols = Tables.columns(toarrowtable(tbl))
+                    cols = Tables.columns(toarrowtable(tbl, largelists))
                     if !isempty(dictencodings)
                         for (colidx, (id, T, values)) in dictencodings
                             dictsch = Tables.Schema((:col,), (eltype(values),))
@@ -178,7 +178,7 @@ end
 else
             @async begin
                 try
-                    cols = Tables.columns(toarrowtable(tbl))
+                    cols = Tables.columns(toarrowtable(tbl, largelists))
                     if !isempty(dictencodings)
                         for (colidx, (id, T, values)) in dictencodings
                             dictsch = Tables.Schema((:col,), (eltype(values),))
