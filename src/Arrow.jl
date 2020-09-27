@@ -2,7 +2,7 @@ module Arrow
 
 using Mmap
 import Dates
-using DataAPI, Tables, SentinelArrays, PooledArrays
+using DataAPI, Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd
 
 using Base: @propagate_inbounds
 import Base: ==
@@ -18,9 +18,11 @@ using .FlatBuffers
 include("metadata/Flatbuf.jl")
 using .Flatbuf; const Meta = Flatbuf
 
+include("arrowtypes.jl")
+using .ArrowTypes
 include("utils.jl")
-include("eltypes.jl")
 include("arraytypes.jl")
+include("eltypes.jl")
 include("table.jl")
 include("write.jl")
 

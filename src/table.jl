@@ -93,8 +93,9 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
             # new dictencoding or replace
             isOrdered, T, field = dictencoded[id]
             values, _, _ = build(T, field, batch, recordbatch, 1, 1, debug)
-            dictencodings[id] = DictEncoding(id, ChainedVector([values]), isOrdered)
-            debug && println("parsed parsed dictionary batch message: id=$id, data=$values\n")
+            A = ChainedVector([values])
+            dictencodings[id] = DictEncoding{eltype(A), typeof(A)}(id, A, isOrdered)
+            debug && println("parsed dictionary batch message: id=$id, data=$values\n")
         elseif header isa Meta.RecordBatch
             debug && println("parsing record batch message")
             if isempty(columns(t))
@@ -181,11 +182,14 @@ function Base.iterate(x::BatchIterator{debug}, pos=x.startpos) where {debug}
     if msglen == 0
         debug && println("message has 0 length; terminating message parsing")
         return nothing
+    else
+        debug && println("parsing message with msglen = $msglen")
     end
     pos += 4
     msg = FlatBuffers.getrootas(Meta.Message, x.bytes, pos-1)
     pos += msglen
     # pos now points to message body
+    debug && @show msg.bodyLength
     return Batch(msg, x.bytes, pos), pos + msg.bodyLength
 end
 
@@ -196,29 +200,27 @@ struct VectorIterator{debug}
     dictencodings::Dict{Int64, DictEncoding}
 end
 
+buildmetadata(meta) = Dict(String(kv.key) => String(kv.value) for kv in meta)
+buildmetadata(::Nothing) = nothing
+
 function Base.iterate(x::VectorIterator{debug}, (columnidx, nodeidx, bufferidx)=(1, 1, 1)) where {debug}
     columnidx > length(x.schema.fields) && return nothing
     field = x.schema.fields[columnidx]
     d = field.dictionary
     if d !== nothing
-        validity = buildbitmap(x.batch, x.batch.msg.header, bufferidx, debug)
+        validity = buildbitmap(x.batch, x.batch.msg.header, nodeidx, bufferidx, debug)
         bufferidx += 1
         buffer = x.batch.msg.header.buffers[bufferidx]
         debug && @show columnidx, buffer.offset, buffer.length
         S = d.indexType === nothing ? Int32 : juliaeltype(field, d.indexType)
-        ptr = convert(Ptr{S}, pointer(x.batch.bytes, x.batch.pos + buffer.offset))
-        indices = unsafe_wrap(Array, ptr, div(buffer.length, sizeof(S)))
+        bytes, indices = reinterp(S, x.batch, buffer, x.batch.msg.header.compression)
         encoding = x.dictencodings[d.id]
-        A = DictEncoded{x.types[columnidx], eltype(indices)}(validity, indices, encoding)
+        A = DictEncoded{x.types[columnidx], eltype(indices), typeof(encoding.data)}(bytes, validity, indices, encoding, buildmetadata(field.custom_metadata))
         nodeidx += 1
         bufferidx += 1
     else
         debug && println("parsing column=$columnidx, T=$(x.types[columnidx]), len=$(x.batch.msg.header.nodes[nodeidx].length)")
         A, nodeidx, bufferidx = build(x.types[columnidx], field, x.batch, x.batch.msg.header, nodeidx, bufferidx, debug)
-    end
-    meta = field.custom_metadata
-    if meta !== nothing
-        setmetadata!(A, Dict(String(kv.key) => String(kv.value) for kv in meta))
     end
     return A, (columnidx + 1, nodeidx, bufferidx)
 end
@@ -229,73 +231,113 @@ const LargeLists = Union{Meta.LargeUtf8, Meta.LargeBinary, Meta.LargeList}
 build(T, f::Meta.Field, batch, rb, nodeidx, bufferidx, debug) =
     build(T, f, f.type, batch, rb, nodeidx, bufferidx, debug)
 
-function buildbitmap(batch, rb, bufferidx, debug)
+function buildbitmap(batch, rb, nodeidx, bufferidx, debug)
     buffer = rb.buffers[bufferidx]
     debug && @show :validity_bitmap, buffer.offset, buffer.length
     voff = batch.pos + buffer.offset
-    return ValidityBitmap(batch.bytes, voff, buffer.length)
+    node = rb.nodes[nodeidx]
+    if rb.compression === nothing
+        return ValidityBitmap(batch.bytes, voff, node.length, node.null_count)
+    else
+        # compressed
+        ptr = pointer(batch.bytes, voff)
+        _, decodedbytes = uncompress(ptr, buffer, rb.compression)
+        return ValidityBitmap(decodedbytes, 1, node.length, node.null_count)
+    end
+end
+
+function uncompress(ptr::Ptr{UInt8}, buffer, compression)
+    if buffer.length == 0
+        return 0, UInt8[]
+    end
+    len = unsafe_load(convert(Ptr{Int64}, ptr))
+    ptr += 8 # skip past uncompressed length as Int64
+    encodedbytes = unsafe_wrap(Array, ptr, buffer.length - 8)
+    if compression.codec === Meta.CompressionType.LZ4_FRAME
+        decodedbytes = transcode(LZ4FrameDecompressor, encodedbytes)
+    elseif compression.codec === Meta.CompressionType.ZSTD
+        decodedbytes = transcode(ZstdDecompressor, encodedbytes)
+    else
+        error("unsupported compression type when reading arrow buffers: $(typeof(compression.codec))")
+    end
+    return len, decodedbytes
+end
+
+function reinterp(::Type{T}, batch, buf, compression) where {T}
+    ptr = pointer(batch.bytes, batch.pos + buf.offset)
+    if compression === nothing
+        return batch.bytes, unsafe_wrap(Array, convert(Ptr{T}, ptr), div(buf.length, sizeof(T)))
+    else
+        # compressed
+        len, decodedbytes = uncompress(ptr, buf, compression)
+        return decodedbytes, unsafe_wrap(Array, convert(Ptr{T}, pointer(decodedbytes)), div(len, sizeof(T)))
+    end
 end
 
 function build(T, f::Meta.Field, L::ListTypes, batch, rb, nodeidx, bufferidx, debug)
-    validity = buildbitmap(batch, rb, bufferidx, debug)
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx, debug)
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
     debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
     ooff = batch.pos + buffer.offset
     OT = L isa LargeLists ? Int64 : Int32
-    ptr = convert(Ptr{OT}, pointer(batch.bytes, ooff))
-    offsets = Offsets(unsafe_wrap(Array, ptr, div(buffer.length, sizeof(OT))))
+    bytes, offs = reinterp(OT, batch, buffer, rb.compression)
+    offsets = Offsets(bytes, offs)
     bufferidx += 1
     len = rb.nodes[nodeidx].length
     nodeidx += 1
     if L isa Meta.Utf8 || L isa Meta.LargeUtf8 || L isa Meta.Binary || L isa Meta.LargeBinary
         buffer = rb.buffers[bufferidx]
         debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
-        bytesptr = pointer(batch.bytes, batch.pos + buffer.offset)
-        A = unsafe_wrap(Array, bytesptr, buffer.length)
+        bytes, A = reinterp(UInt8, batch, buffer, rb.compression)
         bufferidx += 1
     else
+        bytes = UInt8[]
         A, nodeidx, bufferidx = build(eltype(Base.nonmissingtype(T)), f.children[1], batch, rb, nodeidx, bufferidx, debug)
     end
-    return List{T, OT, typeof(A)}(validity, offsets, A, len), nodeidx, bufferidx
+    return List{T, OT, typeof(A)}(bytes, validity, offsets, A, len, buildmetadata(f.custom_metadata)), nodeidx, bufferidx
 end
 
 function build(T, f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeList}, batch, rb, nodeidx, bufferidx, debug)
-    validity = buildbitmap(batch, rb, bufferidx, debug)
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx, debug)
     bufferidx += 1
     len = rb.nodes[nodeidx].length
     nodeidx += 1
     if L isa Meta.FixedSizeBinary
         buffer = rb.buffers[bufferidx]
         debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
-        bytesptr = pointer(batch.bytes, batch.pos + buffer.offset)
-        A = unsafe_wrap(Array, bytesptr, buffer.length)
+        bytes, A = reinterp(UInt8, batch, buffer, rb.compression)
         bufferidx += 1
     else
+        bytes = UInt8[]
         A, nodeidx, bufferidx = build(eltype(Base.nonmissingtype(T)), f.children[1], batch, rb, nodeidx, bufferidx, debug)
     end
-    return FixedSizeList{T, typeof(A)}(validity, A, len), nodeidx, bufferidx
+    return FixedSizeList{T, typeof(A)}(bytes, validity, A, len, buildmetadata(f.custom_metadata)), nodeidx, bufferidx
 end
 
 function build(S, f::Meta.Field, L::Meta.Map, batch, rb, nodeidx, bufferidx, debug)
     T = Base.nonmissingtype(S)
-    # Map is an alias for List<Struct<K, V>>, but the validity/offset buffers for
-    # the List/Struct are reduntant/irrelevant, so we skip them
-    # skip the entries list & struct nodes
-    nodeidx += 2
-    # skip the entries list validity + offsets & struct validity
-    bufferidx += 3
-    A, nodeidx, bufferidx = build(_keytype(T), f.children[1].children[1], batch, rb, nodeidx, bufferidx, debug)
-    B, nodeidx, bufferidx = build(_valtype(T), f.children[1].children[2], batch, rb, nodeidx, bufferidx, debug)
-    return Map{_keytype(T), _valtype(T), typeof(A), typeof(B)}(A, B), nodeidx, bufferidx
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx, debug)
+    bufferidx += 1
+    buffer = rb.buffers[bufferidx]
+    debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
+    ooff = batch.pos + buffer.offset
+    OT = Int32
+    bytes, offs = reinterp(OT, batch, buffer, rb.compression)
+    offsets = Offsets(bytes, offs)
+    bufferidx += 1
+    len = rb.nodes[nodeidx].length
+    nodeidx += 1
+    A, nodeidx, bufferidx = build(KeyValue{keytype(T), valtype(T)}, f.children[1], batch, rb, nodeidx, bufferidx, debug)
+    return Map{S, OT, typeof(A)}(validity, offsets, A, len, buildmetadata(f.custom_metadata)), nodeidx, bufferidx
 end
 
 function build(T, f::Meta.Field, L::Meta.Struct, batch, rb, nodeidx, bufferidx, debug)
-    validity = buildbitmap(batch, rb, bufferidx, debug)
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx, debug)
     bufferidx += 1
     len = rb.nodes[nodeidx].length
     NT = Base.nonmissingtype(T)
-    N = getn(NT)
+    N = fieldcount(NT)
     vecs = []
     nodeidx += 1
     for i = 1:N
@@ -303,22 +345,19 @@ function build(T, f::Meta.Field, L::Meta.Struct, batch, rb, nodeidx, bufferidx, 
         push!(vecs, A)
     end
     data = Tuple(vecs)
-    return Struct{T, typeof(data)}(validity, data, len), nodeidx, bufferidx
+    return Struct{T, typeof(data)}(validity, data, len, buildmetadata(f.custom_metadata)), nodeidx, bufferidx
 end
 
 function build(T, f::Meta.Field, L::Meta.Union, batch, rb, nodeidx, bufferidx, debug)
     buffer = rb.buffers[bufferidx]
     debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
-    typeidsptr = pointer(batch.bytes, batch.pos + buffer.offset)
-    typeIds = unsafe_wrap(Array, typeidsptr, buffer.length)
+    bytes, typeIds = reinterp(UInt8, batch, buffer, rb.compression)
     debug && @show typeIds
     bufferidx += 1
     if L.mode == Meta.UnionMode.Dense
         buffer = rb.buffers[bufferidx]
         debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
-        ooff = batch.pos + buffer.offset
-        ptr = convert(Ptr{Int32}, pointer(batch.bytes, ooff))
-        offsets = unsafe_wrap(Array, ptr, div(buffer.length, 4))
+        bytes2, offsets = reinterp(Int32, batch, buffer, rb.compression)
         bufferidx += 1
     end
     vecs = []
@@ -330,9 +369,9 @@ function build(T, f::Meta.Field, L::Meta.Union, batch, rb, nodeidx, bufferidx, d
     end
     data = Tuple(vecs)
     if L.mode == Meta.UnionMode.Dense
-        return DenseUnion{T, typeof(data)}(typeIds, offsets, data), nodeidx, bufferidx
+        return DenseUnion{T, typeof(data)}(bytes, bytes2, typeIds, offsets, data, buildmetadata(f.custom_metadata)), nodeidx, bufferidx
     else
-        return SparseUnion{T, typeof(data)}(typeIds, data), nodeidx, bufferidx
+        return SparseUnion{T, typeof(data)}(bytes, typeIds, data, buildmetadata(f.custom_metadata)), nodeidx, bufferidx
     end
 end
 
@@ -342,13 +381,12 @@ end
 
 # primitives
 function build(T, f::Meta.Field, ::L, batch, rb, nodeidx, bufferidx, debug) where {L}
-    validity = buildbitmap(batch, rb, bufferidx, debug)
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx, debug)
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
     debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
     S = Base.nonmissingtype(T)
-    ptr = convert(Ptr{S}, pointer(batch.bytes, batch.pos + buffer.offset))
-    A = unsafe_wrap(Array, ptr, div(buffer.length, sizeof(S)))
+    bytes, A = reinterp(S, batch, buffer, rb.compression)
     len = rb.nodes[nodeidx].length
-    return Primitive{T, eltype(A)}(validity, A, len), nodeidx + 1, bufferidx + 1
+    return Primitive{T, S, typeof(A)}(bytes, validity, A, len, buildmetadata(f.custom_metadata)), nodeidx + 1, bufferidx + 1
 end

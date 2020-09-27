@@ -4,6 +4,8 @@ authors = ["quinnj <quinn.jacobd@gmail.com>", "ExpandingMan <expandingman@proton
 version = "1.0.0"
 
 [deps]
+CodecLz4 = "5ba52731-8f18-5e0d-9241-30f10d1ec561"
+CodecZstd = "6b39b394-51ab-5f42-8807-6242bab2b4c2"
 DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 Mmap = "a63ad114-7e13-5084-954f-fe012c677804"

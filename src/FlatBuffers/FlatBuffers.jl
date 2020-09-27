@@ -23,7 +23,12 @@ include("builder.jl")
 include("table.jl")
 
 function Base.show(io::IO, x::TableOrStruct)
-    show(io, NamedTuple{propertynames(x)}(Tuple(getproperty(x, y) for y in propertynames(x))))
+    print(io, "$(typeof(x))")
+    if isempty(propertynames(x))
+        print(io, "()")
+    else
+        show(io, NamedTuple{propertynames(x)}(Tuple(getproperty(x, y) for y in propertynames(x))))
+    end
 end
 
 abstract type ScopedEnum{T<:Integer} <: Enum{T} end
