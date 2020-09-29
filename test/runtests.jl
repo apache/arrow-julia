@@ -12,9 +12,8 @@ include("testtables.jl")
 
 @testset "table roundtrips" begin
 
-for (nm, tbl, writekw, readkw, extratests) in testtables
-    println(nm)
-    testtable(tbl, writekw, readkw, extratests)
+for case in testtables
+    testtable(case...)
 end
 
 end # @testset "table roundtrips"

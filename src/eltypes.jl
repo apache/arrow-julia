@@ -28,14 +28,45 @@ finaljuliatype(T) = T
 finaljuliatype(::Type{Missing}) = Missing
 finaljuliatype(::Type{Union{T, Missing}}) where {T} = Union{Missing, finaljuliatype(T)}
 
+const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Type, Tuple{String, Type}}(
+    Char => ("JuliaLang.Char", String),
+    Symbol => ("JuliaLang.Symbol", String),
+)
+
+const ARROW_TO_JULIA_TYPE_MAPPING = Dict{String, Tuple{Type, Type}}(
+    "JuliaLang.Char" => (Char, String),
+    "JuliaLang.Symbol" => (Symbol, String),
+)
+
+function registertype!(juliatype::Type, arrowtype::Type, arrowname::String=string("JuliaLang.", string(juliatype)))
+    # TODO: validate that juliatype isn't already default arrow type
+    JULIA_TO_ARROW_TYPE_MAPPING[juliatype] = (arrowname, arrowtype)
+    ARROW_TO_JULIA_TYPE_MAPPING[arrowname] = (juliatype, arrowtype)
+    return
+end
+
+function juliaeltype(f::Meta.Field, ::Nothing)
+    T = juliaeltype(f)
+    return T, finaljuliatype(T)
+end
+
+function juliaeltype(f::Meta.Field, meta::Dict{String, String})
+    T = juliaeltype(f)
+    if haskey(meta, "ARROW:extension:name")
+        typename = meta["ARROW:extension:name"]
+        if haskey(ARROW_TO_JULIA_TYPE_MAPPING, typename)
+            TT = ARROW_TO_JULIA_TYPE_MAPPING[typename][1]
+            return T, TT
+        else
+            @warn "unsupported ARROW:extension:name for buffer type: \"$typename\""
+        end
+    end
+    return T, finaljuliatype(T)
+end
+
 function juliaeltype(f::Meta.Field)
     T = juliaeltype(f, f.type)
-    if f.custom_metadata !== nothing
-        fm = Dict(kv.key => kv.value for kv in f.custom_metadata)
-    else
-        fm = nothing
-    end
-    return (f.nullable ? Union{T, Missing} : T), fm
+    return (f.nullable ? Union{T, Missing} : T)
 end
 
 juliaeltype(f::Meta.Field, ::Meta.Null) = Missing
@@ -282,8 +313,7 @@ Base.convert(::Type{Duration{U}}, x::Dates.Period) where {U} = Duration{U}(Dates
 
 # nested types; call juliaeltype recursively on nested children
 function juliaeltype(f::Meta.Field, list::Union{Meta.List, Meta.LargeList})
-    T, _ = juliaeltype(f.children[1])
-    return Vector{T}
+    return Vector{juliaeltype(f.children[1])}
 end
 
 # arrowtype will call fieldoffset recursively for children
@@ -319,7 +349,7 @@ function arrowtype(b, x::List{T, O, A}) where {T, O, A}
 end
 
 function juliaeltype(f::Meta.Field, list::Meta.FixedSizeList)
-    type, _ = juliaeltype(f.children[1])
+    type = juliaeltype(f.children[1])
     return NTuple{Int(list.listSize), type}
 end
 
@@ -338,8 +368,8 @@ function arrowtype(b, x::FixedSizeList{T, A}) where {T, A}
 end
 
 function juliaeltype(f::Meta.Field, map::Meta.Map)
-    K, _ = juliaeltype(f.children[1].children[1])
-    V, _ = juliaeltype(f.children[1].children[2])
+    K = juliaeltype(f.children[1].children[1])
+    V = juliaeltype(f.children[1].children[2])
     return Dict{K, V}
 end
 
@@ -369,7 +399,7 @@ end
 
 function juliaeltype(f::Meta.Field, list::Meta.Struct)
     names = Tuple(Symbol(x.name) for x in f.children)
-    types = Tuple(juliaeltype(x)[1] for x in f.children)
+    types = Tuple(juliaeltype(x) for x in f.children)
     return NamedTuple{names, Tuple{types...}}
 end
 
@@ -384,7 +414,7 @@ default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{name
 
 # Unions
 function juliaeltype(f::Meta.Field, u::Meta.Union)
-    return UnionT{u.mode, u.typeIds !== nothing ? Tuple(u.typeIds) : u.typeIds, Tuple{(juliaeltype(x)[1] for x in f.children)...}}
+    return UnionT{u.mode, u.typeIds !== nothing ? Tuple(u.typeIds) : u.typeIds, Tuple{(juliaeltype(x) for x in f.children)...}}
 end
 
 arrowtype(b, x::Union{DenseUnion{TT, S}, SparseUnion{TT, S}}) where {TT, S} = arrowtype(b, TT, x)

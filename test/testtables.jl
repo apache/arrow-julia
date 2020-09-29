@@ -164,7 +164,7 @@ testtables = [
       col2=Union{String, Missing}["hey", "there", "sailor", missing],
       col3=Arrow.DictEncode(NamedTuple{(:a, :b), Tuple{Int64, Union{String, Missing}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b="sailor"), (a=Int64(4), b="jo-bob")]),
     ),
-    (dictencodenested=true,),
+    (dictencode=true, dictencodenested=true,),
     NamedTuple(),
     nothing
   ),
@@ -180,7 +180,8 @@ testtables = [
   # ),
 ];
 
-function testtable(t, writekw, readkw, extratests)
+function testtable(nm, t, writekw, readkw, extratests)
+  println("testing: $nm")
   io = IOBuffer()
   Arrow.write(io, t; writekw...)
   seekstart(io)
@@ -190,7 +191,7 @@ function testtable(t, writekw, readkw, extratests)
   extratests !== nothing && extratests(tt)
   # compressed
   io = IOBuffer()
-  Arrow.write(io, t; compress=rand((:lz4, :zstd)), writekw...)
+  Arrow.write(io, t; compress=((:lz4, :zstd)[rand(1:2)]), writekw...)
   seekstart(io)
   tt = Arrow.Table(io; readkw...)
   @test length(tt) == length(t)

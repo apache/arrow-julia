@@ -38,11 +38,8 @@ validitybitmap(x::ArrowVector) = x.validity
 nullcount(x::ArrowVector) = validitybitmap(x).nc
 getmetadata(x::ArrowVector) = x.metadata
 
-function toarrowvector(x, de=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Symbol}=nothing, dictencode::Bool=false, kw...)
-    if !(x isa DictEncode) && (dictencode || (x isa AbstractArray && DataAPI.refarray(x) !== x))
-        x = DictEncode(x)
-    end
-    A = arrowvector(x, de, meta; kw...)
+function toarrowvector(x, de=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Symbol}=nothing, kw...)
+    A = arrowvector(x, de, meta; compression=compression, kw...)
     if compression === :lz4
         return compress(Meta.CompressionType.LZ4_FRAME, A)
     elseif compression === :zstd
@@ -51,7 +48,10 @@ function toarrowvector(x, de=DictEncoding[], meta=getmetadata(x); compression::U
     return A
 end
 
-function arrowvector(x, de, meta; kw...)
+function arrowvector(x, de, meta; dictencoding::Bool=false, dictencode::Bool=false, kw...)
+    if !(x isa DictEncode) && !dictencoding && (dictencode || (x isa AbstractArray && DataAPI.refarray(x) !== x))
+        x = DictEncode(x)
+    end
     T = eltype(x)
     S = maybemissing(T)
     return arrowvector(S, T, x, de, meta; kw...)
@@ -137,6 +137,9 @@ struct Primitive{T, S, A} <: ArrowVector{T}
     ℓ::Int
     metadata::Union{Nothing, Dict{String, String}}
 end
+
+Primitive(::Type{T}, b::Vector{UInt8}, v::ValidityBitmap, data::A, l::Int, meta) where {T, A} =
+    Primitive{T, eltype(A), A}(b, v, data, l, meta)
 
 Base.size(p::Primitive) = (p.ℓ,)
 
@@ -609,8 +612,8 @@ struct DictEncoded{T, S, A} <: ArrowVector{T}
     metadata::Union{Nothing, Dict{String, String}}
 end
 
-DictEncoded(b::Vector{UInt8}, v::ValidityBitmap, inds::Vector{S}, encoding::DictEncoding{T, A}) where {S, T, A} =
-    DictEncoded{T, S, A}(b, v, inds, encoding)
+DictEncoded(b::Vector{UInt8}, v::ValidityBitmap, inds::Vector{S}, encoding::DictEncoding{T, A}, meta) where {S, T, A} =
+    DictEncoded{T, S, A}(b, v, inds, encoding, meta)
 
 Base.size(d::DictEncoded) = size(d.indices)
 
@@ -643,7 +646,8 @@ function arrowvector(::DictEncodedType, ::Type{T}, ::Type{S}, x, de, meta; dicte
         for i = 1:length(inds)
             @inbounds inds[i] = inds[i] - 1
         end
-        data = arrowvector(DataAPI.refpool(x), de, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, kw...)
+        pool = DataAPI.refpool(x)
+        data = arrowvector(pool, de, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
         encoding = DictEncoding{S, typeof(data)}(0, data, false)
     else
         # need to encode ourselves
@@ -653,7 +657,7 @@ function arrowvector(::DictEncodedType, ::Type{T}, ::Type{S}, x, de, meta; dicte
         for i = 1:length(inds)
             @inbounds inds[i] = inds[i] - 1
         end
-        data = arrowvector(DataAPI.refpool(y), de, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, kw...)
+        data = arrowvector(DataAPI.refpool(y), de, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
         encoding = DictEncoding{S, typeof(data)}(0, data, false)
     end
     push!(de, encoding)

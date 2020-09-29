@@ -99,6 +99,7 @@ end
 
 function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, debug)
     if writetofile
+        debug && println("starting write of arrow formatted file")
         Base.write(io, "ARROW1\0\0")
     end
     msgs = OrderedChannel{Message}(Inf)
@@ -433,6 +434,7 @@ function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, compress,
     fieldbuffers = Buffer[]
     bufferoffset = 0
     for col in Tables.Columns(columns)
+        # @show typeof(col), col
         bufferoffset = makenodesbuffers!(col, fieldnodes, fieldbuffers, bufferoffset)
     end
     debug && @show fieldnodes, fieldbuffers
@@ -458,11 +460,13 @@ function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, compress,
 
     # compression
     if compress !== nothing
+        debug && println("record batch is compressed: $compress")
         Meta.bodyCompressionStart(b)
         Meta.bodyCompressionAddCodec(b, compress === :lz4 ? Meta.CompressionType.LZ4_FRAME : Meta.CompressionType.ZSTD)
         Meta.bodyCompressionAddMethod(b, Meta.BodyCompressionMethod.BUFFER)
         compression = Meta.bodyCompressionEnd(b)
     else
+        debug && println("no compression for record batch")
         compression = FlatBuffers.UOffsetT(0)
     end
 
@@ -476,6 +480,7 @@ function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, compress,
 end
 
 function makedictionarybatchmsg(sch, columns, id, isdelta, compress, debug)
+    debug && println("building dictionary message for id = $id")
     b = FlatBuffers.Builder(1024)
     recordbatch, bodylen = makerecordbatch(b, sch, columns, compress, debug)
     Meta.dictionaryBatchStart(b)
