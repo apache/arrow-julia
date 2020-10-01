@@ -24,6 +24,22 @@ tt = Arrow.Table(io)
 @test isequal(tt.col1, vcat([1,2,3,4,5,6,7,8,9,missing], [1,2,3,4,5,6,7,8,9,missing]))
 @test eltype(tt.col1) === Union{Int64, Missing}
 
+# Arrow.Stream
+seekstart(io)
+str = Arrow.Stream(io)
+state = iterate(str)
+@test state !== nothing
+tt, st = state
+@test length(tt) == 1
+@test isequal(tt.col1, [1,2,3,4,5,6,7,8,9,missing])
+
+state = iterate(str, st)
+@test state !== nothing
+tt, st = state
+@test length(tt) == 1
+@test isequal(tt.col1, [1,2,3,4,5,6,7,8,9,missing])
+
+@test iterate(str, st) === nothing
 
 t = (col1=Int64[1,2,3,4,5,6,7,8,9,10],)
 meta = Dict("key1" => "value1", "key2" => "value2")
