@@ -76,14 +76,14 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
             if haskey(dictencodings, id) && header.isDelta
                 # delta
                 field = dictencoded[id]
-                values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, 1, 1, convert)
+                values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
                 dictencoding = dictencodings[id]
                 append!(dictencoding.data, values)
                 continue
             end
             # new dictencoding or replace
             field = dictencoded[id]
-            values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, 1, 1, convert)
+            values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
             A = ChainedVector([values])
             dictencodings[id] = DictEncoding{eltype(A), typeof(A)}(id, A, field.dictionary.isOrdered)
             @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
@@ -185,7 +185,7 @@ buildmetadata(f::Meta.Field) = buildmetadata(f.custom_metadata)
 buildmetadata(meta) = Dict(String(kv.key) => String(kv.value) for kv in meta)
 buildmetadata(::Nothing) = nothing
 
-function Base.iterate(x::VectorIterator, (columnidx, nodeidx, bufferidx)=(1, 1, 1))
+function Base.iterate(x::VectorIterator, (columnidx, nodeidx, bufferidx)=(Int64(1), Int64(1), Int64(1)))
     columnidx > length(x.schema.fields) && return nothing
     field = x.schema.fields[columnidx]
     @debug 2 "building top-level column: field = $(field), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"

@@ -612,8 +612,13 @@ isdictencoded(d::DictEncoded) = true
 isdictencoded(x) = false
 isdictencoded(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = true
 
+signedtype(::Type{UInt8}) = Int8
+signedtype(::Type{UInt16}) = Int16
+signedtype(::Type{UInt32}) = Int32
+signedtype(::Type{UInt64}) = Int64
+
 indtype(d::D) where {D <: DictEncoded} = indtype(D)
-indtype(::Type{DictEncoded{T, S, A}}) where {T, S, A} = signed(S)
+indtype(::Type{DictEncoded{T, S, A}}) where {T, S, A} = signedtype(S)
 indtype(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = indtype(A)
 
 getid(d::DictEncoded) = d.encoding.id
