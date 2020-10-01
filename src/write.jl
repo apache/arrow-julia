@@ -111,7 +111,7 @@ else
         Base.write(io, msg, blocks, sch)
     end
 end
-    @sync for (i, tbl) in enumerate(parts(source))
+    @sync for (i, tbl) in enumerate(Tables.partitions(source))
         @debug 1 "processing table partition i = $i"
         if i == 1
             cols = toarrowtable(tbl, largelists, compress, denseunions, dictencode, dictencodenested)
