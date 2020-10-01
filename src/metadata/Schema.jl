@@ -86,7 +86,7 @@ struct Union <: FlatBuffers.Table
     pos::Base.Int
 end
 
-Base.propertynames(x::Union) = (:mode, typeIds)
+Base.propertynames(x::Union) = (:mode, :typeIds)
 
 function Base.getproperty(x::Union, field::Symbol)
     if field === :mode

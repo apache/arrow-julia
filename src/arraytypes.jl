@@ -14,6 +14,7 @@ end
 Base.length(c::Compressed) = c.len
 Base.eltype(c::Compressed{Z, A}) where {Z, A} = eltype(A)
 getmetadata(x::Compressed) = getmetadata(x.data)
+compressiontype(c::Compressed{Z}) where {Z} = Z
 
 function compress(Z::Meta.CompressionType, x::Array)
     GC.@preserve x begin
@@ -39,12 +40,16 @@ nullcount(x::ArrowVector) = validitybitmap(x).nc
 getmetadata(x::ArrowVector) = x.metadata
 
 function toarrowvector(x, de=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Symbol}=nothing, kw...)
+    @debug 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $kw"
+    @debug 3 x
     A = arrowvector(x, de, meta; compression=compression, kw...)
     if compression === :lz4
-        return compress(Meta.CompressionType.LZ4_FRAME, A)
+        A = compress(Meta.CompressionType.LZ4_FRAME, A)
     elseif compression === :zstd
-        return compress(Meta.CompressionType.ZSTD, A)
+        A = compress(Meta.CompressionType.ZSTD, A)
     end
+    @debug 2 "converted top-level column to arrow format: $(typeof(A))"
+    @debug 3 A
     return A
 end
 
@@ -57,8 +62,25 @@ function arrowvector(x, de, meta; dictencoding::Bool=false, dictencode::Bool=fal
     return arrowvector(S, T, x, de, meta; kw...)
 end
 
-arrowvector(::Type{S}, ::Type{T}, x, de, meta; kw...) where {S, T} =
-    arrowvector(ArrowType(S), S, T, x, de, meta; kw...)
+# conversions to arrow types
+arrowvector(::Type{Dates.Date}, ::Type{S}, x, de, meta; kw...) where {S} =
+    arrowvector(converter(DATE, x), de, meta; kw...)
+arrowvector(::Type{Dates.Time}, ::Type{S}, x, de, meta; kw...) where {S} =
+    arrowvector(converter(TIME, x), de, meta; kw...)
+arrowvector(::Type{Dates.DateTime}, ::Type{S}, x, de, meta; kw...) where {S} =
+    arrowvector(converter(DATETIME, x), de, meta; kw...)
+arrowvector(::Type{P}, ::Type{S}, x, de, meta; kw...) where {P <: Dates.Period, S} =
+    arrowvector(converter(Duration{arrowperiodtype(P)}, x), de, meta; kw...)
+
+# fallback that calls ArrowType
+function arrowvector(::Type{S}, ::Type{T}, x, de, meta; kw...) where {S, T}
+    if ArrowTypes.istyperegistered(S)
+        meta = meta === nothing ? Dict{String, String}() : meta
+        arrowtype = ArrowTypes.getarrowtype!(meta, S)
+        return arrowvector(converter(arrowtype, x), de, meta; kw...)
+    end
+    return arrowvector(ArrowType(S), S, T, x, de, meta; kw...)
+end
 
 arrowvector(::NullType, ::Type{Missing}, ::Type{Missing}, x, de, meta; kw...) = MissingVector(length(x))
 compress(Z::Meta.CompressionType, v::MissingVector) =
@@ -143,33 +165,6 @@ Primitive(::Type{T}, b::Vector{UInt8}, v::ValidityBitmap, data::A, l::Int, meta)
 
 Base.size(p::Primitive) = (p.ℓ,)
 
-# conversions to arrow types
-arrowvector(::Type{Dates.Date}, ::Type{S}, x, de, meta; kw...) where {S} =
-    arrowvector(converter(DATE, x), de, meta; kw...)
-arrowvector(::Type{Dates.Time}, ::Type{S}, x, de, meta; kw...) where {S} =
-    arrowvector(converter(TIME, x), de, meta; kw...)
-arrowvector(::Type{Dates.DateTime}, ::Type{S}, x, de, meta; kw...) where {S} =
-    arrowvector(converter(DATETIME, x), de, meta; kw...)
-arrowvector(::Type{P}, ::Type{S}, x, de, meta; kw...) where {P <: Dates.Period, S} =
-    arrowvector(converter(Duration{arrowperiodtype(P)}, x), de, meta; kw...)
-
-function arrowvector(::Type{Symbol}, ::Type{S}, x, de, meta; kw...) where {S}
-    meta = meta === nothing ? Dict{String, String}() : meta
-    meta["ARROW:extension:name"] = "JuliaLang.Symbol"
-    meta["ARROW:extension:metadata"] = ""
-    return arrowvector(converter(String, x), de, meta; kw...)
-end
-
-function arrowvector(::Type{Char}, ::Type{S}, x, de, meta; kw...) where {S}
-    meta = meta === nothing ? Dict{String, String}() : meta
-    meta["ARROW:extension:name"] = "JuliaLang.Char"
-    meta["ARROW:extension:metadata"] = ""
-    return arrowvector(converter(String, x), de, meta; kw...)
-end
-
-default(::Type{Symbol}) = Symbol()
-default(::Type{Char}) = '\0'
-
 function arrowvector(::PrimitiveType, ::Type{T}, ::Type{S}, x, de, meta; kw...) where {T, S}
     len = length(x)
     if T !== S
@@ -181,37 +176,32 @@ function arrowvector(::PrimitiveType, ::Type{T}, ::Type{S}, x, de, meta; kw...) 
 end
 
 function Base.copy(p::Primitive{T, S}) where {T, S}
-    if T !== S
-        A = Vector{T}(undef, p.ℓ)
-        valid = p.validity
-        data = p.data
-        @inbounds for i = 1:p.ℓ
-            A[i] = ifelse(valid[i], data[i], missing)
-        end
-    else
+    if T === S
         return copy(p.data)
+    else
+        return convert(Array, p)
     end
 end
 
 @propagate_inbounds function Base.getindex(p::Primitive{T, S}, i::Integer) where {T, S}
     @boundscheck checkbounds(p, i)
-    if T !== S
-        return @inbounds (p.validity[i] ? p.data[i] : missing)
+    if T >: Missing
+        return @inbounds (p.validity[i] ? ArrowTypes.arrowconvert(T, p.data[i]) : missing)
     else
-        return @inbounds p.data[i]
+        return @inbounds ArrowTypes.arrowconvert(T, p.data[i])
     end
 end
 
 @propagate_inbounds function Base.setindex!(p::Primitive{T, S}, v, i::Integer) where {T, S}
     @boundscheck checkbounds(p, i)
-    if T !== S
+    if T >: Missing
         if v === missing
             @inbounds p.validity[i] = false
         else
-            @inbounds p.data[i] = v
+            @inbounds p.data[i] = convert(S, v)
         end
     else
-        @inbounds p.data[i] = v
+        @inbounds p.data[i] = convert(S, v)
     end
     return v
 end
@@ -269,14 +259,16 @@ end
 @propagate_inbounds function Base.getindex(l::List{T}, i::Integer) where {T}
     @boundscheck checkbounds(l, i)
     @inbounds lo, hi = l.offsets[i]
-    if T === Union{String, Missing}
-        return l.validity[i] ? unsafe_string(pointer(l.data, lo), hi - lo + 1) : missing
-    elseif T === String
-        return unsafe_string(pointer(l.data, lo), hi - lo + 1)
+    if ArrowTypes.isstringtype(T)
+        if Base.nonmissingtype(T) !== T
+            return l.validity[i] ? ArrowTypes.arrowconvert(T, unsafe_string(pointer(l.data, lo), hi - lo + 1)) : missing
+        else
+            return ArrowTypes.arrowconvert(T, unsafe_string(pointer(l.data, lo), hi - lo + 1))
+        end
     elseif Base.nonmissingtype(T) !== T
-        return l.validity[i] ? view(l.data, lo:hi) : missing
+        return l.validity[i] ? ArrowTypes.arrowconvert(T, view(l.data, lo:hi)) : missing
     else
-        return view(l.data, lo:hi)
+        return ArrowTypes.arrowconvert(T, view(l.data, lo:hi))
     end
 end
 
@@ -327,12 +319,12 @@ end
 
 @propagate_inbounds function Base.getindex(l::FixedSizeList{T}, i::Integer) where {T}
     @boundscheck checkbounds(l, i)
-    N = getN(Base.nonmissingtype(T))
+    N = ArrowTypes.getsize(Base.nonmissingtype(T))
     off = (i - 1) * N
     if Base.nonmissingtype(T) !== T
-        return l.validity[i] ? ntuple(j->l.data[off + j], N) : missing
+        return l.validity[i] ? ArrowTypes.arrowconvert(T, ntuple(j->l.data[off + j], N)) : missing
     else
-        return ntuple(j->l.data[off + j], N)
+        return ArrowTypes.arrowconvert(T, ntuple(j->l.data[off + j], N))
     end
 end
 
@@ -341,7 +333,7 @@ end
     if v === missing
         @inbounds l.validity[i] = false
     else
-        N = getN(Base.nonmissingtype(T))
+        N = ArrowTypes.getsize(Base.nonmissingtype(T))
         off = (i - 1) * N
         foreach(1:N) do j
             @inbounds l.data[off + j] = v[j]
@@ -391,9 +383,9 @@ end
     @boundscheck checkbounds(l, i)
     @inbounds lo, hi = l.offsets[i]
     if Base.nonmissingtype(T) !== T
-        return l.validity[i] ? Dict(x.key => x.value for x in view(l.data, lo:hi)) : missing
+        return l.validity[i] ? ArrowTypes.arrowconvert(T, Dict(x.key => x.value for x in view(l.data, lo:hi))) : missing
     else
-        return Dict(x.key => x.value for x in view(l.data, lo:hi))
+        return ArrowTypes.arrowconvert(T, Dict(x.key => x.value for x in view(l.data, lo:hi)))
     end
 end
 
@@ -431,13 +423,13 @@ end
 @propagate_inbounds function Base.getindex(s::Struct{T}, i::Integer) where {T}
     @boundscheck checkbounds(s, i)
     NT = Base.nonmissingtype(T)
-    if NT <: NamedTuple
+    if ArrowTypes.structtype(NT) === ArrowTypes.NAMEDTUPLE
         if NT !== T
             return s.validity[i] ? NT(ntuple(j->s.data[j][i], fieldcount(NT))) : missing
         else
             return NT(ntuple(j->s.data[j][i], fieldcount(NT)))
         end
-    else
+    elseif ArrowTypes.structtype(NT) === ArrowTypes.STRUCT
         if NT !== T
             return s.validity[i] ? NT(ntuple(j->s.data[j][i], fieldcount(NT))...) : missing
         else
@@ -582,10 +574,9 @@ end
 
 Base.size(d::DictEncoding) = size(d.data)
 
-@propagate_inbounds function Base.getindex(d::DictEncoding, i::Integer)
+@propagate_inbounds function Base.getindex(d::DictEncoding{T}, i::Integer) where {T}
     @boundscheck checkbounds(d, i)
-    @inbounds x = d.data[i]
-    return x
+    return @inbounds ArrowTypes.arrowconvert(T, d.data[i])
 end
 
 # convenience wrapper to signal that an input column should be
@@ -644,7 +635,7 @@ function arrowvector(::DictEncodedType, ::Type{T}, ::Type{S}, x, de, meta; dicte
         inds = copy(DataAPI.refarray(x))
         # adjust to "offset" instead of index
         for i = 1:length(inds)
-            @inbounds inds[i] = inds[i] - 1
+            @inbounds inds[i] -= 1
         end
         pool = DataAPI.refpool(x)
         data = arrowvector(pool, de, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
@@ -661,7 +652,7 @@ function arrowvector(::DictEncodedType, ::Type{T}, ::Type{S}, x, de, meta; dicte
         encoding = DictEncoding{S, typeof(data)}(0, data, false)
     end
     push!(de, encoding)
-    return DictEncoded(UInt8[], validity, inds, encoding, meta)
+    return DictEncoded(UInt8[], validity, inds, encoding, data.metadata)
 end
 
 @propagate_inbounds function Base.getindex(d::DictEncoded, i::Integer)

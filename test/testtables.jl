@@ -127,6 +127,7 @@ testtables = [
     (
       col1=[:hey, :there, :sailor],
       col2=['a', 'b', 'c'],
+      col3=Arrow.DictEncode(['a', 'a', 'b'])
     ),
     NamedTuple(),
     NamedTuple(),
@@ -152,6 +153,8 @@ testtables = [
       col1=Int64[1,2,3,4,5,6,7,8,9,10],
       col2=Union{String, Missing}["hey", "there", "sailor", missing],
       col3=Arrow.DictEncode(NamedTuple{(:a, :b), Tuple{Int64, Union{String, Missing}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b="sailor"), (a=Int64(4), b="jo-bob")]),
+      col4=[:a, :b, :c, :d, :a, :b, :c, :d, :e, missing],
+      col5=[Date(2020, 1, 1) for x = 1:10]
     ),
     (dictencode=true,),
     NamedTuple(),
@@ -168,16 +171,16 @@ testtables = [
     NamedTuple(),
     nothing
   ),
-  # (
-  #   "Julia unions",
-  #   (
-  #     col1=Union{Int, String}[1, "hey", 2, "ho"],
-  #     col2=Union{Char, NamedTuple{(:a,), Tuple{Symbol}}}['a', (a=:hey,), 'b', (a=:ho,)],
-  #   ),
-  #   (denseunions=false,),
-  #   NamedTuple(),
-  #   nothing
-  # ),
+  (
+    "Julia unions",
+    (
+      col1=Union{Int, String}[1, "hey", 2, "ho"],
+      col2=Union{Char, NamedTuple{(:a,), Tuple{Symbol}}}['a', (a=:hey,), 'b', (a=:ho,)],
+    ),
+    (denseunions=false,),
+    NamedTuple(),
+    nothing
+  ),
 ];
 
 function testtable(nm, t, writekw, readkw, extratests)

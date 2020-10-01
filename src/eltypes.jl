@@ -4,6 +4,10 @@ translate to the appropriate Julia storage eltype
 """
 function juliaeltype end
 
+finaljuliatype(T) = T
+finaljuliatype(::Type{Missing}) = Missing
+finaljuliatype(::Type{Union{T, Missing}}) where {T} = Union{Missing, finaljuliatype(T)}
+
 """
 Given a FlatBuffers.Builder and a Julia column eltype,
 Write the field.type flatbuffer definition
@@ -14,69 +18,32 @@ arrowtype(b, col::AbstractVector{T}) where {T} = arrowtype(b, maybemissing(T))
 arrowtype(b, col::DictEncoded) = arrowtype(b, col.encoding.data)
 arrowtype(b, col::Compressed) = arrowtype(b, col.data)
 
-"""
-There are a couple places when writing arrow buffers where
-we need to write a "dummy" value; it doesn't really matter
-what we write, but we need to write something of a specific
-type. So each supported writing type needs to define `default`.
-"""
-function default end
-
-default(T) = zero(T)
-
-finaljuliatype(T) = T
-finaljuliatype(::Type{Missing}) = Missing
-finaljuliatype(::Type{Union{T, Missing}}) where {T} = Union{Missing, finaljuliatype(T)}
-
-const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Type, Tuple{String, Type}}(
-    Char => ("JuliaLang.Char", String),
-    Symbol => ("JuliaLang.Symbol", String),
-)
-
-const ARROW_TO_JULIA_TYPE_MAPPING = Dict{String, Tuple{Type, Type}}(
-    "JuliaLang.Char" => (Char, String),
-    "JuliaLang.Symbol" => (Symbol, String),
-)
-
-function registertype!(juliatype::Type, arrowtype::Type, arrowname::String=string("JuliaLang.", string(juliatype)))
-    # TODO: validate that juliatype isn't already default arrow type
-    JULIA_TO_ARROW_TYPE_MAPPING[juliatype] = (arrowname, arrowtype)
-    ARROW_TO_JULIA_TYPE_MAPPING[arrowname] = (juliatype, arrowtype)
-    return
+function juliaeltype(f::Meta.Field, ::Nothing, convert::Bool)
+    T = juliaeltype(f, convert)
+    return convert ? finaljuliatype(T) : T
 end
 
-function juliaeltype(f::Meta.Field, ::Nothing)
-    T = juliaeltype(f)
-    return T, finaljuliatype(T)
+function juliaeltype(f::Meta.Field, meta::Dict{String, String}, convert::Bool)
+    TT = juliaeltype(f, convert)
+    !convert && return TT
+    T = finaljuliatype(TT)
+    TTT = ArrowTypes.extensiontype(meta)
+    return something(TTT, T)
 end
 
-function juliaeltype(f::Meta.Field, meta::Dict{String, String})
-    T = juliaeltype(f)
-    if haskey(meta, "ARROW:extension:name")
-        typename = meta["ARROW:extension:name"]
-        if haskey(ARROW_TO_JULIA_TYPE_MAPPING, typename)
-            TT = ARROW_TO_JULIA_TYPE_MAPPING[typename][1]
-            return T, TT
-        else
-            @warn "unsupported ARROW:extension:name for buffer type: \"$typename\""
-        end
-    end
-    return T, finaljuliatype(T)
-end
-
-function juliaeltype(f::Meta.Field)
-    T = juliaeltype(f, f.type)
+function juliaeltype(f::Meta.Field, convert::Bool)
+    T = juliaeltype(f, f.type, convert)
     return (f.nullable ? Union{T, Missing} : T)
 end
 
-juliaeltype(f::Meta.Field, ::Meta.Null) = Missing
+juliaeltype(f::Meta.Field, ::Meta.Null, convert) = Missing
 
 function arrowtype(b, ::Type{Missing})
     Meta.nullStart(b)
     return Meta.Null, Meta.nullEnd(b), nothing
 end
 
-function juliaeltype(f::Meta.Field, int::Meta.Int)
+function juliaeltype(f::Meta.Field, int::Meta.Int, convert)
     if int.is_signed
         if int.bitWidth == 8
             Int8
@@ -116,7 +83,7 @@ function arrowtype(b, ::Type{T}) where {T <: Integer}
 end
 
 # primitive types
-function juliaeltype(f::Meta.Field, fp::Meta.FloatingPoint)
+function juliaeltype(f::Meta.Field, fp::Meta.FloatingPoint, convert)
     if fp.precision == Meta.Precision.HALF
         Float16
     elseif fp.precision == Meta.Precision.SINGLE
@@ -132,29 +99,19 @@ function arrowtype(b, ::Type{T}) where {T <: AbstractFloat}
     return Meta.FloatingPoint, Meta.floatingPointEnd(b), nothing
 end
 
-juliaeltype(f::Meta.Field, b::Union{Meta.Utf8, Meta.LargeUtf8}) = String
-
-default(::Type{String}) = ""
+juliaeltype(f::Meta.Field, b::Union{Meta.Utf8, Meta.LargeUtf8}, convert) = String
 
 datasizeof(x) = sizeof(x)
 datasizeof(x::AbstractVector) = sum(datasizeof, x)
 
-juliaeltype(f::Meta.Field, b::Union{Meta.Binary, Meta.LargeBinary}) = Vector{UInt8}
+juliaeltype(f::Meta.Field, b::Union{Meta.Binary, Meta.LargeBinary}, convert) = Vector{UInt8}
 
-function default(::Type{A}) where {A <: AbstractVector{T}} where {T}
-    a = similar(A, 1)
-    a[1] = default(T)
-    return a
-end
+juliaeltype(f::Meta.Field, x::Meta.FixedSizeBinary, convert) = NTuple{Int(x.byteWidth), UInt8}
 
-juliaeltype(f::Meta.Field, x::Meta.FixedSizeBinary) = NTuple{Int(x.byteWidth), UInt8}
-
-default(::Type{NTuple{N, T}}) where {N, T} = ntuple(i -> default(T), N)
 # arggh!
 Base.write(io::IO, x::NTuple{N, T}) where {N, T} = sum(y -> Base.write(io, y), x)
-default(::Type{T}) where {T <: Tuple} = Tuple(default(fieldtype(T, i)) for i = 1:fieldcount(T))
 
-juliaeltype(f::Meta.Field, x::Meta.Bool) = Bool
+juliaeltype(f::Meta.Field, x::Meta.Bool, convert) = Bool
 
 function arrowtype(b, ::Type{Bool})
     Meta.boolStart(b)
@@ -169,7 +126,7 @@ Base.zero(::Type{Decimal{P, S}}) where {P, S} = Decimal{P, S}(Int128(0))
 ==(a::Decimal{P, S}, b::Decimal{P, S}) where {P, S} = ==(a.value, b.value)
 Base.isequal(a::Decimal{P, S}, b::Decimal{P, S}) where {P, S} = isequal(a.value, b.value)
 
-function juliaeltype(f::Meta.Field, x::Meta.Decimal)
+function juliaeltype(f::Meta.Field, x::Meta.Decimal, convert)
     return Decimal{x.precision, x.scale}
 end
 
@@ -200,7 +157,7 @@ Date{Meta.DateUnit.MILLISECOND}(ms) = Date{Meta.DateUnit.MILLISECOND, Int64}(Int
 const DATE = Date{Meta.DateUnit.DAY, Int32}
 const DATETIME = Date{Meta.DateUnit.MILLISECOND, Int64}
 
-juliaeltype(f::Meta.Field, x::Meta.Date) = Date{x.unit, bitwidth(x.unit)}
+juliaeltype(f::Meta.Field, x::Meta.Date, convert) = Date{x.unit, bitwidth(x.unit)}
 finaljuliatype(::Type{Date{Meta.DateUnit.DAY, Int32}}) = Dates.Date
 Base.convert(::Type{Dates.Date}, x::Date{Meta.DateUnit.DAY, Int32}) = Dates.Date(Dates.UTD(Int64(x.x + UNIX_EPOCH_DATE)))
 finaljuliatype(::Type{Date{Meta.DateUnit.MILLISECOND, Int64}}) = Dates.DateTime
@@ -228,7 +185,7 @@ const TIME = Time{Meta.TimeUnit.NANOSECOND, Int64}
 bitwidth(x::Meta.TimeUnit) = x == Meta.TimeUnit.SECOND || x == Meta.TimeUnit.MILLISECOND ? Int32 : Int64
 Time{U}(x) where {U <: Meta.TimeUnit} = Time{U, bitwidth(U)}(bitwidth(U)(x))
 storagetype(::Type{Time{U, T}}) where {U, T} = T
-juliaeltype(f::Meta.Field, x::Meta.Time) = Time{x.unit, bitwidth(x.unit)}
+juliaeltype(f::Meta.Field, x::Meta.Time, convert) = Time{x.unit, bitwidth(x.unit)}
 finaljuliatype(::Type{<:Time}) = Dates.Time
 periodtype(U::Meta.TimeUnit) = U === Meta.TimeUnit.SECOND ? Dates.Second :
                                U === Meta.TimeUnit.MILLISECOND ? Dates.Millisecond :
@@ -249,7 +206,7 @@ end
 
 Base.zero(::Type{Timestamp{U, T}}) where {U, T} = Timestamp{U, T}(Int64(0))
 
-function juliaeltype(f::Meta.Field, x::Meta.Timestamp)
+function juliaeltype(f::Meta.Field, x::Meta.Timestamp, convert)
     return Timestamp{x.unit, x.timezone === nothing ? nothing : Symbol(x.timezone)}
 end
 
@@ -275,7 +232,7 @@ bitwidth(x::Meta.IntervalUnit) = x == Meta.IntervalUnit.YEAR_MONTH ? Int32 : Int
 Interval{Meta.IntervalUnit.YEAR_MONTH}(x) = Interval{Meta.IntervalUnit.YEAR_MONTH, Int32}(Int32(x))
 Interval{Meta.IntervalUnit.DAY_TIME}(x) = Interval{Meta.IntervalUnit.DAY_TIME, Int64}(Int64(x))
 
-function juliaeltype(f::Meta.Field, x::Meta.Interval)
+function juliaeltype(f::Meta.Field, x::Meta.Interval, convert)
     return Interval{x.unit, bitwidth(x.unit)}
 end
 
@@ -291,7 +248,7 @@ end
 
 Base.zero(::Type{Duration{U}}) where {U} = Duration{U}(Int64(0))
 
-function juliaeltype(f::Meta.Field, x::Meta.Duration)
+function juliaeltype(f::Meta.Field, x::Meta.Duration, convert)
     return Duration{x.unit}
 end
 
@@ -312,8 +269,8 @@ arrowperiodtype(::Type{Dates.Nanosecond}) = Meta.TimeUnit.NANOSECOND
 Base.convert(::Type{Duration{U}}, x::Dates.Period) where {U} = Duration{U}(Dates.value(periodtype(U)(x)))
 
 # nested types; call juliaeltype recursively on nested children
-function juliaeltype(f::Meta.Field, list::Union{Meta.List, Meta.LargeList})
-    return Vector{juliaeltype(f.children[1])}
+function juliaeltype(f::Meta.Field, list::Union{Meta.List, Meta.LargeList}, convert)
+    return Vector{juliaeltype(f.children[1], buildmetadata(f.children[1]), convert)}
 end
 
 # arrowtype will call fieldoffset recursively for children
@@ -348,8 +305,8 @@ function arrowtype(b, x::List{T, O, A}) where {T, O, A}
     end
 end
 
-function juliaeltype(f::Meta.Field, list::Meta.FixedSizeList)
-    type = juliaeltype(f.children[1])
+function juliaeltype(f::Meta.Field, list::Meta.FixedSizeList, convert)
+    type = juliaeltype(f.children[1], buildmetadata(f.children[1]), convert)
     return NTuple{Int(list.listSize), type}
 end
 
@@ -367,9 +324,9 @@ function arrowtype(b, x::FixedSizeList{T, A}) where {T, A}
     end
 end
 
-function juliaeltype(f::Meta.Field, map::Meta.Map)
-    K = juliaeltype(f.children[1].children[1])
-    V = juliaeltype(f.children[1].children[2])
+function juliaeltype(f::Meta.Field, map::Meta.Map, convert)
+    K = juliaeltype(f.children[1].children[1], buildmetadata(f.children[1].children[1]), convert)
+    V = juliaeltype(f.children[1].children[2], buildmetadata(f.children[1].children[2]), convert)
     return Dict{K, V}
 end
 
@@ -379,8 +336,6 @@ function arrowtype(b, ::Type{Dict{K, V}}) where {K, V}
     return Meta.Map, Meta.mapEnd(b), children
 end
 
-default(::Type{Dict{K, V}}) where {K, V} = Dict{K, V}()
-
 struct KeyValue{K, V}
     key::K
     value::V
@@ -389,7 +344,7 @@ keyvalueK(::Type{KeyValue{K, V}}) where {K, V} = K
 keyvalueV(::Type{KeyValue{K, V}}) where {K, V} = V
 Base.length(kv::KeyValue) = 1
 Base.iterate(kv::KeyValue, st=1) = st === nothing ? nothing : (kv, nothing)
-default(::Type{KeyValue{K, V}}) where {K, V} = KeyValue(default(K), default(V))
+ArrowTypes.default(::Type{KeyValue{K, V}}) where {K, V} = KeyValue(default(K), default(V))
 
 function arrowtype(b, ::Type{KeyValue{K, V}}) where {K, V}
     children = [fieldoffset(b, "key", K), fieldoffset(b, "value", V)]
@@ -397,9 +352,9 @@ function arrowtype(b, ::Type{KeyValue{K, V}}) where {K, V}
     return Meta.Struct, Meta.structEnd(b), children
 end
 
-function juliaeltype(f::Meta.Field, list::Meta.Struct)
+function juliaeltype(f::Meta.Field, list::Meta.Struct, convert)
     names = Tuple(Symbol(x.name) for x in f.children)
-    types = Tuple(juliaeltype(x) for x in f.children)
+    types = Tuple(juliaeltype(x, buildmetadata(x), convert) for x in f.children)
     return NamedTuple{names, Tuple{types...}}
 end
 
@@ -410,11 +365,9 @@ function arrowtype(b, x::Struct{T, S}) where {T, S}
     return Meta.Struct, Meta.structEnd(b), children
 end
 
-default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{names}(Tuple(default(fieldtype(types, i)) for i = 1:length(names)))
-
 # Unions
-function juliaeltype(f::Meta.Field, u::Meta.Union)
-    return UnionT{u.mode, u.typeIds !== nothing ? Tuple(u.typeIds) : u.typeIds, Tuple{(juliaeltype(x) for x in f.children)...}}
+function juliaeltype(f::Meta.Field, u::Meta.Union, convert)
+    return UnionT{u.mode, u.typeIds !== nothing ? Tuple(u.typeIds) : u.typeIds, Tuple{(juliaeltype(x, buildmetadata(x), convert) for x in f.children)...}}
 end
 
 arrowtype(b, x::Union{DenseUnion{TT, S}, SparseUnion{TT, S}}) where {TT, S} = arrowtype(b, TT, x)

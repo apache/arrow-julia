@@ -353,9 +353,9 @@ function FieldData(nm, ::Base.Type{T}, col, dictencodings) where {T}
             push!(children, FieldData("item", eltype(S), Arrow.flatten(skipmissing(col)), dictencodings))
         elseif S <: NTuple
             if Arrow.getT(S) == UInt8
-                DATA = [ismissing(x) ? Arrow.default(S) : String(collect(x)) for x in col]
+                DATA = [ismissing(x) ? Arrow.ArrowTypes.default(S) : String(collect(x)) for x in col]
             else
-                push!(children, FieldData("item", Arrow.getT(S), Arrow.flatten(coalesce(x, Arrow.default(S)) for x in col), dictencodings))
+                push!(children, FieldData("item", Arrow.getT(S), Arrow.flatten(coalesce(x, Arrow.ArrowTypes.default(S)) for x in col), dictencodings))
             end
         elseif S <: NamedTuple
             for (nm, typ) in zip(Arrow.getnames(S), Arrow.getT(S))

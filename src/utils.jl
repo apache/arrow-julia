@@ -34,7 +34,7 @@ function writearray(io::IO, ::Type{T}, col) where {T}
     else
         n = 0
         for x in col
-            n += Base.write(io, coalesce(x, default(T)))
+            n += Base.write(io, coalesce(x, ArrowTypes.default(T)))
         end
     end
     return n
@@ -127,11 +127,7 @@ converter(::Type{T}, x::ChainedVector{A}) where {T, A} = ChainedVector([converte
 Base.IndexStyle(::Type{<:Converter}) = Base.IndexLinear()
 Base.size(x::Converter) = (length(x.data),)
 Base.eltype(x::Converter{T, A}) where {T, A} = T
-Base.getindex(x::Converter{T}, i::Int) where {T} = convert(T, getindex(x.data, i))
-Base.getindex(x::Converter{Symbol, A}, i::Int) where {T, A <: AbstractVector{String}} = Symbol(getindex(x.data, i))
-Base.getindex(x::Converter{Char, A}, i::Int) where {T, A <: AbstractVector{String}} = getindex(x.data, i)[1]
-Base.getindex(x::Converter{String, A}, i::Int) where {T, A <: AbstractVector{Symbol}} = String(getindex(x.data, i))
-Base.getindex(x::Converter{String, A}, i::Int) where {T, A <: AbstractVector{Char}} = string(getindex(x.data, i))
+Base.getindex(x::Converter{T}, i::Int) where {T} = ArrowTypes.arrowconvert(T, getindex(x.data, i))
 
 maybemissing(::Type{T}) where {T} = T === Missing ? Missing : Base.nonmissingtype(T)
 
@@ -287,14 +283,14 @@ Base.@propagate_inbounds function Base.getindex(A::ToFixedSizeList{T, N}, i::Int
     @boundscheck checkbounds(A, i)
     a, b = fldmod1(i, N)
     @inbounds x = A.data[a]
-    return @inbounds x === missing ? default(T) : x[b]
+    return @inbounds x === missing ? ArrowTypes.default(T) : x[b]
 end
 
 # efficient iteration
 @inline function Base.iterate(A::ToFixedSizeList{T, N}, (i, chunk, chunk_i, len)=(1, 1, 1, length(A))) where {T, N}
     i > len && return nothing
     @inbounds y = A.data[chunk]
-    @inbounds x = y === missing ? default(T) : y[chunk_i]
+    @inbounds x = y === missing ? ArrowTypes.default(T) : y[chunk_i]
     if chunk_i == N
         chunk += 1
         chunk_i = 1
@@ -421,7 +417,7 @@ Base.size(x::ToSparseUnion) = (length(x.data),)
 Base.@propagate_inbounds function Base.getindex(A::ToSparseUnion{T}, i::Integer) where {T}
     @boundscheck checkbounds(A, i)
     @inbounds x = A.data[i]
-    return @inbounds x isa T ? x : default(T)
+    return @inbounds x isa T ? x : ArrowTypes.default(T)
 end
 
 # ToMap
