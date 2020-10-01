@@ -38,11 +38,11 @@ Tables.getcolumn(t::Table, i::Int) = columns(t)[i]
 Tables.getcolumn(t::Table, nm::Symbol) = lookup(t)[nm]
 
 # high-level user API functions
-Table(io::IO, pos::Integer=1, len=nothing; debug::Bool=false, convert::Bool=true) = Table(Base.read(io), pos, len; debug=debug, convert=convert)
-Table(str::String, pos::Integer=1, len=nothing; debug::Bool=false, convert::Bool=true) = Table(Mmap.mmap(str), pos, len; debug=debug, convert=convert)
+Table(io::IO, pos::Integer=1, len=nothing; convert::Bool=true) = Table(Base.read(io), pos, len; convert=convert)
+Table(str::String, pos::Integer=1, len=nothing; convert::Bool=true) = Table(Mmap.mmap(str), pos, len; convert=convert)
 
 # will detect whether we're reading a Table from a file or stream
-function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothing}=nothing; debug::Bool=false, convert::Bool=true)
+function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothing}=nothing; convert::Bool=true)
     len = something(tlen, length(bytes))
     if len > 24 &&
         _startswith(bytes, off, FILE_FORMAT_MAGIC_BYTES) &&
@@ -51,99 +51,72 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     end
     t = Table()
     sch = nothing
-    dictencodings = Dict{Int64, DictEncoding}()
-    dictencoded = Dict{Int64, Tuple{Bool, Type, Meta.Field}}()
+    dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
+    dictencoded = Dict{Int64, Meta.Field}() # dictionary id => field
     fieldmetadata = Dict{Int, Dict{String, String}}()
-    for batch in BatchIterator{debug}(bytes, off)
+    for batch in BatchIterator(bytes, off)
         # store custom_metadata of batch.msg?
         header = batch.msg.header
         if header isa Meta.Schema
-            debug && println("parsing schema message")
+            @debug 1 "parsing schema message"
             # assert endianness?
             # store custom_metadata?
             for (i, field) in enumerate(header.fields)
                 push!(names(t), Symbol(field.name))
-                T, metadata = juliaeltype(field)
-                if metadata !== nothing
-                    fieldmetadata[i] = metadata
-                end
-                push!(types(t), T)
-                d = field.dictionary
-                isencoded = false
-                if d !== nothing
-                    dictencoded[d.id] = (d.isOrdered, types(t)[end], field)
-                    isencoded = true
-                end
-                debug && println("parsed column from schema: name=$(names(t)[end]), type=$(types(t)[end])$(isencoded ? " dictencoded" : "")")
+                # recursively find any dictionaries for any fields
+                getdictionaries!(dictencoded, field)
+                @debug 1 "parsed column from schema: field = $field"
             end
             sch = header
             schema(t)[] = sch
         elseif header isa Meta.DictionaryBatch
-            debug && println("parsing dictionary batch message")
             id = header.id
             recordbatch = header.data
+            @debug 1 "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
             if haskey(dictencodings, id) && header.isDelta
                 # delta
-                isOrdered, T, field = dictencoded[id]
-                values, _, _ = build(T, field, batch, recordbatch, 1, 1, debug)
+                field = dictencoded[id]
+                values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
                 dictencoding = dictencodings[id]
                 append!(dictencoding.data, values)
                 continue
             end
             # new dictencoding or replace
-            isOrdered, T, field = dictencoded[id]
-            values, _, _ = build(T, field, batch, recordbatch, 1, 1, debug)
-            dictencodings[id] = DictEncoding(id, ChainedVector([values]), isOrdered)
-            debug && println("parsed parsed dictionary batch message: id=$id, data=$values\n")
+            field = dictencoded[id]
+            values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
+            A = ChainedVector([values])
+            dictencodings[id] = DictEncoding{eltype(A), typeof(A)}(id, A, field.dictionary.isOrdered)
+            @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
         elseif header isa Meta.RecordBatch
-            debug && println("parsing record batch message")
+            @debug 1 "parsing record batch message: compression = $(header.compression)"
             if isempty(columns(t))
                 # first RecordBatch
-                for vec in VectorIterator{debug}(types(t), sch, batch, dictencodings)
+                for vec in VectorIterator(sch, batch, dictencodings, convert)
                     push!(columns(t), vec)
                 end
-                debug && println("parsed 1st record batch")
+                @debug 1 "parsed 1st record batch"
             elseif !(columns(t)[1] isa ChainedVector)
                 # second RecordBatch
-                for (i, vec) in enumerate(VectorIterator{debug}(types(t), sch, batch, dictencodings))
+                for (i, vec) in enumerate(VectorIterator(sch, batch, dictencodings, convert))
                     columns(t)[i] = ChainedVector([columns(t)[i], vec])
                 end
-                debug && println("parsed 2nd record batch")
+                @debug 1 "parsed 2nd record batch"
             else
                 # 2+ RecordBatch
-                for (i, vec) in enumerate(VectorIterator{debug}(types(t), sch, batch, dictencodings))
+                for (i, vec) in enumerate(VectorIterator(sch, batch, dictencodings, convert))
                     append!(columns(t)[i], vec)
                 end
-                debug && println("parsed additional record batch")
+                @debug 1 "parsed additional record batch"
             end
         else
             throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
         end
     end
     lu = lookup(t)
-    for (i, (k, T, col)) in enumerate(zip(names(t), types(t), columns(t)))
-        if haskey(fieldmetadata, i) && haskey(fieldmetadata[i], "ARROW:extension:name")
-            if fieldmetadata[i]["ARROW:extension:name"] == "JuliaLang.Symbol"
-                TT = finaljuliatype(Symbol)
-                types(t)[i] = TT
-                col = converter(TT, col)
-                columns(t)[i] = col
-            elseif fieldmetadata[i]["ARROW:extension:name"] == "JuliaLang.Char"
-                TT = finaljuliatype(Char)
-                types(t)[i] = TT
-                col = converter(TT, col)
-                columns(t)[i] = col
-            end
-        end
-        if convert
-            TT = finaljuliatype(T)
-            if TT !== T
-                types(t)[i] = TT
-                col = converter(TT, col)
-                columns(t)[i] = col
-            end
-        end
-        lu[k] = col
+    ty = types(t)
+    for (nm, col) in zip(names(t), columns(t))
+        lu[nm] = col
+        push!(ty, eltype(col))
     end
     meta = sch.custom_metadata
     if meta !== nothing
@@ -152,7 +125,18 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     return t
 end
 
-struct BatchIterator{debug}
+function getdictionaries!(dictencoded, field)
+    d = field.dictionary
+    if d !== nothing
+        dictencoded[d.id] = field
+    end
+    for child in field.children
+        getdictionaries!(dictencoded, child)
+    end
+    return
+end
+
+struct BatchIterator
     bytes::Vector{UInt8}
     startpos::Int
 end
@@ -163,192 +147,241 @@ struct Batch
     pos::Int
 end
 
-function Base.iterate(x::BatchIterator{debug}, pos=x.startpos) where {debug}
+function Base.iterate(x::BatchIterator, pos=x.startpos)
     if pos + 3 > length(x.bytes)
-        debug && println("not enough bytes left for another batch message")
+        @debug 1 "not enough bytes left for another batch message"
         return nothing
     end
     if readbuffer(x.bytes, pos, UInt32) != CONTINUATION_INDICATOR_BYTES
-        debug && println("didn't find continuation byte to keep parsing messages: $(readbuffer(x.bytes, pos, UInt32))")
+        @debug 1 "didn't find continuation byte to keep parsing messages: $(readbuffer(x.bytes, pos, UInt32))"
         return nothing
     end
     pos += 4
     if pos + 3 > length(x.bytes)
-        debug && println("not enough bytes left to read length of another batch message")
+        @debug 1 "not enough bytes left to read length of another batch message"
         return nothing
     end
     msglen = readbuffer(x.bytes, pos, Int32)
     if msglen == 0
-        debug && println("message has 0 length; terminating message parsing")
+        @debug 1 "message has 0 length; terminating message parsing"
         return nothing
     end
     pos += 4
     msg = FlatBuffers.getrootas(Meta.Message, x.bytes, pos-1)
     pos += msglen
     # pos now points to message body
+    @debug 1 "parsing message: msglen = $msglen, version = $(msg.version), bodyLength = $(msg.bodyLength)"
     return Batch(msg, x.bytes, pos), pos + msg.bodyLength
 end
 
-struct VectorIterator{debug}
-    types::Vector{Type}
+struct VectorIterator
     schema::Meta.Schema
     batch::Batch # batch.msg.header MUST BE RecordBatch
     dictencodings::Dict{Int64, DictEncoding}
+    convert::Bool
 end
 
-function Base.iterate(x::VectorIterator{debug}, (columnidx, nodeidx, bufferidx)=(1, 1, 1)) where {debug}
+buildmetadata(f::Meta.Field) = buildmetadata(f.custom_metadata)
+buildmetadata(meta) = Dict(String(kv.key) => String(kv.value) for kv in meta)
+buildmetadata(::Nothing) = nothing
+
+function Base.iterate(x::VectorIterator, (columnidx, nodeidx, bufferidx)=(Int64(1), Int64(1), Int64(1)))
     columnidx > length(x.schema.fields) && return nothing
     field = x.schema.fields[columnidx]
-    d = field.dictionary
-    if d !== nothing
-        validity = buildbitmap(x.batch, x.batch.msg.header, bufferidx, debug)
-        bufferidx += 1
-        buffer = x.batch.msg.header.buffers[bufferidx]
-        debug && @show columnidx, buffer.offset, buffer.length
-        S = d.indexType === nothing ? Int32 : juliaeltype(field, d.indexType)
-        ptr = convert(Ptr{S}, pointer(x.batch.bytes, x.batch.pos + buffer.offset))
-        indices = unsafe_wrap(Array, ptr, div(buffer.length, sizeof(S)))
-        encoding = x.dictencodings[d.id]
-        A = DictEncoded{x.types[columnidx], eltype(indices)}(validity, indices, encoding)
-        nodeidx += 1
-        bufferidx += 1
-    else
-        debug && println("parsing column=$columnidx, T=$(x.types[columnidx]), len=$(x.batch.msg.header.nodes[nodeidx].length)")
-        A, nodeidx, bufferidx = build(x.types[columnidx], field, x.batch, x.batch.msg.header, nodeidx, bufferidx, debug)
-    end
-    meta = field.custom_metadata
-    if meta !== nothing
-        setmetadata!(A, Dict(String(kv.key) => String(kv.value) for kv in meta))
-    end
+    @debug 2 "building top-level column: field = $(field), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
+    A, nodeidx, bufferidx = build(field, x.batch, x.batch.msg.header, x.dictencodings, nodeidx, bufferidx, x.convert)
+    @debug 2 "built top-level column: A = $(typeof(A)), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
+    @debug 3 A
     return A, (columnidx + 1, nodeidx, bufferidx)
 end
 
 const ListTypes = Union{Meta.Utf8, Meta.LargeUtf8, Meta.Binary, Meta.LargeBinary, Meta.List, Meta.LargeList}
 const LargeLists = Union{Meta.LargeUtf8, Meta.LargeBinary, Meta.LargeList}
 
-build(T, f::Meta.Field, batch, rb, nodeidx, bufferidx, debug) =
-    build(T, f, f.type, batch, rb, nodeidx, bufferidx, debug)
-
-function buildbitmap(batch, rb, bufferidx, debug)
-    buffer = rb.buffers[bufferidx]
-    debug && @show :validity_bitmap, buffer.offset, buffer.length
-    voff = batch.pos + buffer.offset
-    return ValidityBitmap(batch.bytes, voff, buffer.length)
+function build(field::Meta.Field, batch, rb, de, nodeidx, bufferidx, convert)
+    d = field.dictionary
+    if d !== nothing
+        validity = buildbitmap(batch, rb, nodeidx, bufferidx)
+        bufferidx += 1
+        buffer = rb.buffers[bufferidx]
+        S = d.indexType === nothing ? Int32 : juliaeltype(field, d.indexType, false)
+        bytes, indices = reinterp(S, batch, buffer, rb.compression)
+        encoding = de[d.id]
+        A = DictEncoded(bytes, validity, indices, encoding, buildmetadata(field.custom_metadata))
+        nodeidx += 1
+        bufferidx += 1
+    else
+        A, nodeidx, bufferidx = build(field, field.type, batch, rb, de, nodeidx, bufferidx, convert)
+    end
+    return A, nodeidx, bufferidx
 end
 
-function build(T, f::Meta.Field, L::ListTypes, batch, rb, nodeidx, bufferidx, debug)
-    validity = buildbitmap(batch, rb, bufferidx, debug)
+function buildbitmap(batch, rb, nodeidx, bufferidx)
+    buffer = rb.buffers[bufferidx]
+    voff = batch.pos + buffer.offset
+    node = rb.nodes[nodeidx]
+    if rb.compression === nothing
+        return ValidityBitmap(batch.bytes, voff, node.length, node.null_count)
+    else
+        # compressed
+        ptr = pointer(batch.bytes, voff)
+        _, decodedbytes = uncompress(ptr, buffer, rb.compression)
+        return ValidityBitmap(decodedbytes, 1, node.length, node.null_count)
+    end
+end
+
+function uncompress(ptr::Ptr{UInt8}, buffer, compression)
+    if buffer.length == 0
+        return 0, UInt8[]
+    end
+    len = unsafe_load(convert(Ptr{Int64}, ptr))
+    ptr += 8 # skip past uncompressed length as Int64
+    encodedbytes = unsafe_wrap(Array, ptr, buffer.length - 8)
+    if compression.codec === Meta.CompressionType.LZ4_FRAME
+        decodedbytes = transcode(LZ4FrameDecompressor, encodedbytes)
+    elseif compression.codec === Meta.CompressionType.ZSTD
+        decodedbytes = transcode(ZstdDecompressor, encodedbytes)
+    else
+        error("unsupported compression type when reading arrow buffers: $(typeof(compression.codec))")
+    end
+    return len, decodedbytes
+end
+
+function reinterp(::Type{T}, batch, buf, compression) where {T}
+    ptr = pointer(batch.bytes, batch.pos + buf.offset)
+    if compression === nothing
+        return batch.bytes, unsafe_wrap(Array, convert(Ptr{T}, ptr), div(buf.length, sizeof(T)))
+    else
+        # compressed
+        len, decodedbytes = uncompress(ptr, buf, compression)
+        return decodedbytes, unsafe_wrap(Array, convert(Ptr{T}, pointer(decodedbytes)), div(len, sizeof(T)))
+    end
+end
+
+function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, convert)
+    @debug 2 "building array: L = $L"
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
-    debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
     ooff = batch.pos + buffer.offset
     OT = L isa LargeLists ? Int64 : Int32
-    ptr = convert(Ptr{OT}, pointer(batch.bytes, ooff))
-    offsets = Offsets(unsafe_wrap(Array, ptr, div(buffer.length, sizeof(OT))))
+    bytes, offs = reinterp(OT, batch, buffer, rb.compression)
+    offsets = Offsets(bytes, offs)
     bufferidx += 1
     len = rb.nodes[nodeidx].length
     nodeidx += 1
     if L isa Meta.Utf8 || L isa Meta.LargeUtf8 || L isa Meta.Binary || L isa Meta.LargeBinary
         buffer = rb.buffers[bufferidx]
-        debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
-        bytesptr = pointer(batch.bytes, batch.pos + buffer.offset)
-        A = unsafe_wrap(Array, bytesptr, buffer.length)
+        bytes, A = reinterp(UInt8, batch, buffer, rb.compression)
         bufferidx += 1
     else
-        A, nodeidx, bufferidx = build(eltype(Base.nonmissingtype(T)), f.children[1], batch, rb, nodeidx, bufferidx, debug)
+        bytes = UInt8[]
+        A, nodeidx, bufferidx = build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
     end
-    return List{T, OT, typeof(A)}(validity, offsets, A, len), nodeidx, bufferidx
+    meta = buildmetadata(f.custom_metadata)
+    T = juliaeltype(f, meta, convert)
+    return List{T, OT, typeof(A)}(bytes, validity, offsets, A, len, meta), nodeidx, bufferidx
 end
 
-function build(T, f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeList}, batch, rb, nodeidx, bufferidx, debug)
-    validity = buildbitmap(batch, rb, bufferidx, debug)
+function build(f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeList}, batch, rb, de, nodeidx, bufferidx, convert)
+    @debug 2 "building array: L = $L"
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
     len = rb.nodes[nodeidx].length
     nodeidx += 1
     if L isa Meta.FixedSizeBinary
         buffer = rb.buffers[bufferidx]
-        debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
-        bytesptr = pointer(batch.bytes, batch.pos + buffer.offset)
-        A = unsafe_wrap(Array, bytesptr, buffer.length)
+        bytes, A = reinterp(UInt8, batch, buffer, rb.compression)
         bufferidx += 1
     else
-        A, nodeidx, bufferidx = build(eltype(Base.nonmissingtype(T)), f.children[1], batch, rb, nodeidx, bufferidx, debug)
+        bytes = UInt8[]
+        A, nodeidx, bufferidx = build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
     end
-    return FixedSizeList{T, typeof(A)}(validity, A, len), nodeidx, bufferidx
+    meta = buildmetadata(f.custom_metadata)
+    T = juliaeltype(f, meta, convert)
+    return FixedSizeList{T, typeof(A)}(bytes, validity, A, len, meta), nodeidx, bufferidx
 end
 
-function build(S, f::Meta.Field, L::Meta.Map, batch, rb, nodeidx, bufferidx, debug)
-    T = Base.nonmissingtype(S)
-    # Map is an alias for List<Struct<K, V>>, but the validity/offset buffers for
-    # the List/Struct are reduntant/irrelevant, so we skip them
-    # skip the entries list & struct nodes
-    nodeidx += 2
-    # skip the entries list validity + offsets & struct validity
-    bufferidx += 3
-    A, nodeidx, bufferidx = build(_keytype(T), f.children[1].children[1], batch, rb, nodeidx, bufferidx, debug)
-    B, nodeidx, bufferidx = build(_valtype(T), f.children[1].children[2], batch, rb, nodeidx, bufferidx, debug)
-    return Map{_keytype(T), _valtype(T), typeof(A), typeof(B)}(A, B), nodeidx, bufferidx
-end
-
-function build(T, f::Meta.Field, L::Meta.Struct, batch, rb, nodeidx, bufferidx, debug)
-    validity = buildbitmap(batch, rb, bufferidx, debug)
+function build(f::Meta.Field, L::Meta.Map, batch, rb, de, nodeidx, bufferidx, convert)
+    @debug 2 "building array: L = $L"
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx)
+    bufferidx += 1
+    buffer = rb.buffers[bufferidx]
+    ooff = batch.pos + buffer.offset
+    OT = Int32
+    bytes, offs = reinterp(OT, batch, buffer, rb.compression)
+    offsets = Offsets(bytes, offs)
     bufferidx += 1
     len = rb.nodes[nodeidx].length
-    NT = Base.nonmissingtype(T)
-    N = getn(NT)
+    nodeidx += 1
+    A, nodeidx, bufferidx = build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
+    meta = buildmetadata(f.custom_metadata)
+    T = juliaeltype(f, meta, convert)
+    return Map{T, OT, typeof(A)}(validity, offsets, A, len, meta), nodeidx, bufferidx
+end
+
+function build(f::Meta.Field, L::Meta.Struct, batch, rb, de, nodeidx, bufferidx, convert)
+    @debug 2 "building array: L = $L"
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx)
+    bufferidx += 1
+    len = rb.nodes[nodeidx].length
     vecs = []
     nodeidx += 1
-    for i = 1:N
-        A, nodeidx, bufferidx = build(fieldtype(NT, i), f.children[i], batch, rb, nodeidx, bufferidx, debug)
+    for child in f.children
+        A, nodeidx, bufferidx = build(child, batch, rb, de, nodeidx, bufferidx, convert)
         push!(vecs, A)
     end
     data = Tuple(vecs)
-    return Struct{T, typeof(data)}(validity, data, len), nodeidx, bufferidx
+    meta = buildmetadata(f.custom_metadata)
+    T = juliaeltype(f, meta, convert)
+    return Struct{T, typeof(data)}(validity, data, len, meta), nodeidx, bufferidx
 end
 
-function build(T, f::Meta.Field, L::Meta.Union, batch, rb, nodeidx, bufferidx, debug)
+function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, convert)
+    @debug 2 "building array: L = $L"
     buffer = rb.buffers[bufferidx]
-    debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
-    typeidsptr = pointer(batch.bytes, batch.pos + buffer.offset)
-    typeIds = unsafe_wrap(Array, typeidsptr, buffer.length)
-    debug && @show typeIds
+    bytes, typeIds = reinterp(UInt8, batch, buffer, rb.compression)
     bufferidx += 1
     if L.mode == Meta.UnionMode.Dense
         buffer = rb.buffers[bufferidx]
-        debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
-        ooff = batch.pos + buffer.offset
-        ptr = convert(Ptr{Int32}, pointer(batch.bytes, ooff))
-        offsets = unsafe_wrap(Array, ptr, div(buffer.length, 4))
+        bytes2, offsets = reinterp(Int32, batch, buffer, rb.compression)
         bufferidx += 1
     end
     vecs = []
     nodeidx += 1
-    types = eltype(T)
-    for i = 1:fieldcount(types)
-        A, nodeidx, bufferidx = build(fieldtype(types, i), f.children[i], batch, rb, nodeidx, bufferidx, debug)
+    for child in f.children
+        A, nodeidx, bufferidx = build(child, batch, rb, de, nodeidx, bufferidx, convert)
         push!(vecs, A)
     end
     data = Tuple(vecs)
+    meta = buildmetadata(f.custom_metadata)
+    T = juliaeltype(f, meta, convert)
     if L.mode == Meta.UnionMode.Dense
-        return DenseUnion{T, typeof(data)}(typeIds, offsets, data), nodeidx, bufferidx
+        B = DenseUnion{T, typeof(data)}(bytes, bytes2, typeIds, offsets, data, meta)
     else
-        return SparseUnion{T, typeof(data)}(typeIds, data), nodeidx, bufferidx
+        B = SparseUnion{T, typeof(data)}(bytes, typeIds, data, meta)
     end
+    return B, nodeidx, bufferidx
 end
 
-function build(T, f::Meta.Field, L::Meta.Null, batch, rb, nodeidx, bufferidx, debug)
+function build(f::Meta.Field, L::Meta.Null, batch, rb, de, nodeidx, bufferidx, convert)
+    @debug 2 "building array: L = $L"
     return MissingVector(rb.nodes[nodeidx].length), nodeidx + 1, bufferidx
 end
 
 # primitives
-function build(T, f::Meta.Field, ::L, batch, rb, nodeidx, bufferidx, debug) where {L}
-    validity = buildbitmap(batch, rb, bufferidx, debug)
+function build(f::Meta.Field, ::L, batch, rb, de, nodeidx, bufferidx, convert) where {L}
+    @debug 2 "building array: L = $L"
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
-    debug && @show T, nodeidx, bufferidx, buffer.offset, buffer.length
-    S = Base.nonmissingtype(T)
-    ptr = convert(Ptr{S}, pointer(batch.bytes, batch.pos + buffer.offset))
-    A = unsafe_wrap(Array, ptr, div(buffer.length, sizeof(S)))
+    meta = buildmetadata(f.custom_metadata)
+    # get storage type (non-converted)
+    T = juliaeltype(f, nothing, false)
+    @debug 2 "storage type for primitive: T = $T"
+    bytes, A = reinterp(Base.nonmissingtype(T), batch, buffer, rb.compression)
     len = rb.nodes[nodeidx].length
-    return Primitive{T, eltype(A)}(validity, A, len), nodeidx + 1, bufferidx + 1
+    T = juliaeltype(f, meta, convert)
+    @debug 2 "final julia type for primitive: T = $T"
+    return Primitive(T, bytes, validity, A, len, meta), nodeidx + 1, bufferidx + 1
 end

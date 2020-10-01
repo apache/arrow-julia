@@ -38,17 +38,18 @@ function Base.getproperty(x::BodyCompression, field::Symbol)
     if field === :codec
         o = FlatBuffers.offset(x, 4)
         o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), CompressionType)
+        return CompressionType.LZ4_FRAME
     elseif field === :method
         o = FlatBuffers.offset(x, 6)
         o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), BodyCompressionMethod)
+        return BodyCompressionMethod.BUFFER
     end
     return nothing
 end
 
 bodyCompressionStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 2)
 bodyCompressionAddCodec(b::FlatBuffers.Builder, codec::CompressionType) = FlatBuffers.prependslot!(b, 0, codec, 0)
-#TODO: update offset
-bodyCompressionAddMethod(b::FlatBuffers.Builder, method::BodyCompressionMethod) = FlatBuffers.prependslot!(b, 0, method, 0)
+bodyCompressionAddMethod(b::FlatBuffers.Builder, method::BodyCompressionMethod) = FlatBuffers.prependslot!(b, 1, method, 0)
 bodyCompressionEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
 struct RecordBatch <: FlatBuffers.Table
@@ -82,12 +83,13 @@ function Base.getproperty(x::RecordBatch, field::Symbol)
     return nothing
 end
 
-recordBatchStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 3)
+recordBatchStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 4)
 recordBatchAddLength(b::FlatBuffers.Builder, length::Int64) = FlatBuffers.prependslot!(b, 0, length, 0)
 recordBatchAddNodes(b::FlatBuffers.Builder, nodes::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 1, nodes, 0)
 recordBatchStartNodesVector(b::FlatBuffers.Builder, numelems) = FlatBuffers.startvector!(b, 16, numelems, 8)
 recordBatchAddBuffers(b::FlatBuffers.Builder, buffers::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 2, buffers, 0)
 recordBatchStartBuffersVector(b::FlatBuffers.Builder, numelems) = FlatBuffers.startvector!(b, 16, numelems, 8)
+recordBatchAddCompression(b::FlatBuffers.Builder, c::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 3, c, 0)
 recordBatchEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
 struct DictionaryBatch <: FlatBuffers.Table
