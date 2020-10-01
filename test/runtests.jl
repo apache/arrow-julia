@@ -1,11 +1,5 @@
 using Test, Arrow, Tables, Dates, PooledArrays
 
-if isdefined(Tables, :partitioner)
-    partitioner = Tables.partitioner
-else
-    partitioner = Tuple
-end
-
 include("testtables.jl")
 
 @testset "Arrow" begin
@@ -21,7 +15,7 @@ end # @testset "table roundtrips"
 @testset "misc" begin
 
 # multiple record batches
-t = partitioner(((col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],), (col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],)))
+t = Tables.partitioner(((col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],), (col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],)))
 io = IOBuffer()
 Arrow.write(io, t)
 seekstart(io)

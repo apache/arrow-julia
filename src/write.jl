@@ -36,13 +36,6 @@ function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Sym
     return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested)
 end
 
-if isdefined(Tables, :partitions)
-    parts = Tables.partitions
-else
-    parts(x) = (x,)
-    parts(x::Tuple) = x
-end
-
 @static if VERSION >= v"1.3"
     const Cond = Threads.Condition
 else

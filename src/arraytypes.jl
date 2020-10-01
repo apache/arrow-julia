@@ -156,7 +156,7 @@ struct Primitive{T, S, A} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     validity::ValidityBitmap
     data::A
-    ℓ::Int
+    ℓ::Int64
     metadata::Union{Nothing, Dict{String, String}}
 end
 
