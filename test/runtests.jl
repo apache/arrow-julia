@@ -26,7 +26,7 @@ tt = Arrow.Table(io)
 
 # Arrow.Stream
 seekstart(io)
-str = Arrow.Stream(io; readkw...)
+str = Arrow.Stream(io)
 state = iterate(str)
 @test state !== nothing
 tt, st = state
