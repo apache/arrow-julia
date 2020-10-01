@@ -1,3 +1,95 @@
+struct BatchIterator
+    bytes::Vector{UInt8}
+    startpos::Int
+end
+
+struct Stream
+    batchiterator::BatchIterator
+    pos::Int
+    names::Vector{Symbol}
+    schema::Meta.Schema
+    dictencodings::Dict{Int64, DictEncoding} # dictionary id => DictEncoding
+    dictencoded::Dict{Int64, Meta.Field} # dictionary id => field
+    convert::Bool
+end
+
+Tables.partitions(x::Stream) = x
+
+Stream(io::IO, pos::Integer=1, len=nothing; convert::Bool=true) = Stream(Base.read(io), pos, len; convert=convert)
+Stream(str::String, pos::Integer=1, len=nothing; convert::Bool=true) = Stream(Mmap.mmap(str), pos, len; convert=convert)
+
+# will detect whether we're reading a Stream from a file or stream
+function Stream(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothing}=nothing; convert::Bool=true)
+    len = something(tlen, length(bytes))
+    if len > 24 &&
+        _startswith(bytes, off, FILE_FORMAT_MAGIC_BYTES) &&
+        _endswith(bytes, off + len - 1, FILE_FORMAT_MAGIC_BYTES)
+        off += 8 # skip past magic bytes + padding
+    end
+    dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
+    dictencoded = Dict{Int64, Meta.Field}() # dictionary id => field
+    batchiterator = BatchIterator(bytes, off)
+    state = iterate(batchiterator)
+    state === nothing && throw(ArgumentError("no arrow ipc messages found in provided input"))
+    batch, (pos, id) = state
+    schema = batch.msg.header
+    schema isa Meta.Schema || throw(ArgumentError("first arrow ipc message MUST be a schema message"))
+    # assert endianness?
+    # store custom_metadata?
+    names = Symbol[]
+    for (i, field) in enumerate(schema.fields)
+        push!(names, Symbol(field.name))
+        # recursively find any dictionaries for any fields
+        getdictionaries!(dictencoded, field)
+        @debug 1 "parsed column from schema: field = $field"
+    end
+    return Stream(batchiterator, pos, names, schema, dictencodings, dictencoded, convert)
+end
+
+function Base.iterate(x::Stream, (pos, id)=(x.pos, 1))
+    columns = AbstractVector[]
+    while true
+        state = iterate(x.batchiterator, (pos, id))
+        state === nothing && return nothing
+        batch, (pos, id) = state
+        header = batch.msg.header
+        if header isa Meta.DictionaryBatch
+            id = header.id
+            recordbatch = header.data
+            @debug 1 "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
+            if haskey(x.dictencodings, id) && header.isDelta
+                # delta
+                field = x.dictencoded[id]
+                values, _, _ = build(field, field.type, batch, recordbatch, x.dictencodings, Int64(1), Int64(1), x.convert)
+                dictencoding = x.dictencodings[id]
+                append!(dictencoding.data, values)
+                continue
+            end
+            # new dictencoding or replace
+            field = x.dictencoded[id]
+            values, _, _ = build(field, field.type, batch, recordbatch, x.dictencodings, Int64(1), Int64(1), x.convert)
+            A = ChainedVector([values])
+            x.dictencodings[id] = DictEncoding{eltype(A), typeof(A)}(id, A, field.dictionary.isOrdered)
+            @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
+        elseif header isa Meta.RecordBatch
+            @debug 1 "parsing record batch message: compression = $(header.compression)"
+            for vec in VectorIterator(x.schema, batch, x.dictencodings, x.convert)
+                push!(columns, vec)
+            end
+            break
+        else
+            throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
+        end
+    end
+    lookup = Dict{Symbol, AbstractVector}()
+    types = Type[]
+    for (nm, col) in zip(x.names, columns)
+        lookup[nm] = col
+        push!(types, eltype(col))
+    end
+    return Table(x.names, types, columns, lookup, Ref(x.schema)), (pos, id)
+end
+
 """
     Arrow.Table(io::IO)
     Arrow.Table(file::String)
@@ -18,7 +110,7 @@ struct Table <: Tables.AbstractColumns
     types::Vector{Type}
     columns::Vector{AbstractVector}
     lookup::Dict{Symbol, AbstractVector}
-    schema::Ref{Any}
+    schema::Ref{Meta.Schema}
 end
 
 Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}())
@@ -53,7 +145,6 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     sch = nothing
     dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
     dictencoded = Dict{Int64, Meta.Field}() # dictionary id => field
-    fieldmetadata = Dict{Int, Dict{String, String}}()
     for batch in BatchIterator(bytes, off)
         # store custom_metadata of batch.msg?
         header = batch.msg.header
@@ -136,18 +227,14 @@ function getdictionaries!(dictencoded, field)
     return
 end
 
-struct BatchIterator
-    bytes::Vector{UInt8}
-    startpos::Int
-end
-
 struct Batch
     msg::Meta.Message
     bytes::Vector{UInt8}
     pos::Int
+    id::Int
 end
 
-function Base.iterate(x::BatchIterator, pos=x.startpos)
+function Base.iterate(x::BatchIterator, (pos, id)=(x.startpos, 0))
     if pos + 3 > length(x.bytes)
         @debug 1 "not enough bytes left for another batch message"
         return nothing
@@ -171,7 +258,7 @@ function Base.iterate(x::BatchIterator, pos=x.startpos)
     pos += msglen
     # pos now points to message body
     @debug 1 "parsing message: msglen = $msglen, version = $(msg.version), bodyLength = $(msg.bodyLength)"
-    return Batch(msg, x.bytes, pos), pos + msg.bodyLength
+    return Batch(msg, x.bytes, pos, id), (pos + msg.bodyLength, id + 1)
 end
 
 struct VectorIterator
