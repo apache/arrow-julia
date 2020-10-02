@@ -31,9 +31,3 @@ function runcommand(jsonname, arrowname, mode, verbose)
     end
     return
 end
-
-
-df = ArrowJSON.parsefile(jsonname);
-Arrow.write(arrowname, df)
-tbl = Arrow.Table(arrowname; convert=false);
-@test isequal(df, tbl)
