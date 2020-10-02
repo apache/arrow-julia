@@ -1,6 +1,7 @@
 using Test, Arrow, Tables, Dates, PooledArrays
 
-include("testtables.jl")
+include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
+include(joinpath(dirname(pathof(Arrow)), "../test/integrationtest.jl"))
 
 @testset "Arrow" begin
 
@@ -11,6 +12,21 @@ for case in testtables
 end
 
 end # @testset "table roundtrips"
+
+@testset "arrow json integration tests" begin
+
+for file in readdir(joinpath(dirname(pathof(Arrow)), "../test/arrowjson"))
+    jsonfile = joinpath(joinpath(dirname(pathof(Arrow)), "../test/arrowjson"), file)
+    println("integration test for $jsonfile")
+    df = ArrowJSON.parsefile(jsonfile);
+    io = IOBuffer()
+    Arrow.write(io, df)
+    seekstart(io)
+    tbl = Arrow.Table(io; convert=false);
+    @test isequal(df, tbl)
+end
+
+end # @testset "arrow json integration tests"
 
 @testset "misc" begin
 

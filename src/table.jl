@@ -209,7 +209,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
         lu[nm] = col
         push!(ty, eltype(col))
     end
-    meta = sch.custom_metadata
+    meta = sch !== nothing ? sch.custom_metadata : nothing
     if meta !== nothing
         setmetadata!(t, Dict(String(kv.key) => String(kv.value) for kv in meta))
     end
