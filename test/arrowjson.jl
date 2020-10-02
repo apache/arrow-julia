@@ -162,10 +162,10 @@ struct Map <: Type
     keysSorted::Base.Bool
 end
 
-Type(::Base.Type{Pair{K, V}}) where {K, V} = Map("map", false)
-children(::Base.Type{Pair{K, V}}) where {K, V} = [Field("entries", Arrow.KeyValue{K, V}, nothing)]
+Type(::Base.Type{Dict{K, V}}) where {K, V} = Map("map", false)
+children(::Base.Type{Dict{K, V}}) where {K, V} = [Field("entries", Arrow.KeyValue{K, V}, nothing)]
 StructTypes.StructType(::Base.Type{Map}) = StructTypes.Struct()
-juliatype(f, x::Map) = Pair{juliatype(f.children[1].children[1]), juliatype(f.children[1].children[2])}
+juliatype(f, x::Map) = Dict{juliatype(f.children[1].children[1]), juliatype(f.children[1].children[2])}
 
 Type(::Base.Type{Arrow.KeyValue{K, V}}) where {K, V} = Struct("struct")
 children(::Base.Type{Arrow.KeyValue{K, V}}) where {K, V} = [Field("key", K, nothing), Field("value", V, nothing)]
@@ -407,10 +407,23 @@ end
 DictionaryBatch() = DictionaryBatch(0, RecordBatch())
 StructTypes.StructType(::Base.Type{DictionaryBatch}) = StructTypes.Mutable()
 
-mutable struct DataFile
+mutable struct DataFile <: Tables.AbstractColumns
     schema::Schema
     batches::Vector{RecordBatch}
     dictionaries::Vector{DictionaryBatch}
+end
+
+Base.propertynames(x::DataFile) = (:schema, :batches, :dictionaries)
+
+function Base.getproperty(df::DataFile, nm::Symbol)
+    if nm === :schema
+        return getfield(df, :schema)
+    elseif nm === :batches
+        return getfield(df, :batches)
+    elseif nm === :dictionaries
+        return getfield(df, :dictionaries)
+    end
+    return Tables.getcolumn(df, nm)
 end
 
 DataFile() = DataFile(Schema(), RecordBatch[], DictionaryBatch[])
@@ -419,7 +432,15 @@ StructTypes.StructType(::Base.Type{DataFile}) = StructTypes.Mutable()
 parsefile(file) = JSON3.read(Mmap.mmap(file), DataFile)
 
 # make DataFile satisfy Tables.jl interface
-Tables.partitions(x::DataFile) = (DataFile(x.schema, [x.batches[i]], x.dictionaries) for i = 1:length(x.batches))
+function Tables.partitions(x::DataFile)
+    if isempty(x.batches)
+        # special case empty batches by producing a single DataFile w/ schema
+        return (DataFile(x.schema, RecordBatch[], x.dictionaries),)
+    else
+        return (DataFile(x.schema, [x.batches[i]], x.dictionaries) for i = 1:length(x.batches))
+    end
+end
+
 Tables.columns(x::DataFile) = x
 
 function Tables.schema(x::DataFile)
@@ -428,10 +449,12 @@ function Tables.schema(x::DataFile)
     return Tables.Schema(names, types)
 end
 
+Tables.columnnames(x::DataFile) =  map(x -> Symbol(x.name), x.schema.fields)
+
 function Tables.getcolumn(x::DataFile, i::Base.Int)
     field = x.schema.fields[i]
     type = juliatype(field)
-    return ChainedVector([ArrowArray{type}(field, length(x.batches) > 0 ? x.batches[j].columns[i] : FieldData(), x.dictionaries) for j = 1:length(x.batches)])
+    return ChainedVector(ArrowArray{type}[ArrowArray{type}(field, length(x.batches) > 0 ? x.batches[j].columns[i] : FieldData(), x.dictionaries) for j = 1:length(x.batches)])
 end
 
 function Tables.getcolumn(x::DataFile, nm::Symbol)
@@ -459,8 +482,6 @@ function Base.getindex(x::ArrowArray{T}, i::Base.Int) where {T}
     end
     if T === Missing
         return missing
-    elseif S <: Pair
-        return ArrowArray(x.field.children[1], x.fielddata.children[1], x.dictionaries)[i]
     elseif S <: UnionT
         U = eltype(S)
         tids = Arrow.typeids(S) === nothing ? (0:fieldcount(U)) : Arrow.typeids(S)
@@ -473,16 +494,22 @@ function Base.getindex(x::ArrowArray{T}, i::Base.Int) where {T}
         end
     end
     x.fielddata.VALIDITY[i] == 0 && return missing
-    if S <: Vector{UInt8} || S <: String
+    if S <: Vector{UInt8}
+        return copy(codeunits(x.fielddata.DATA[i]))
+    elseif S <: String
         return x.fielddata.DATA[i]
     elseif S <: Vector
         offs = x.fielddata.OFFSET
         A = ArrowArray{eltype(S)}(x.field.children[1], x.fielddata.children[1], x.dictionaries)
         return A[(offs[i] + 1):offs[i + 1]]
+    elseif S <: Dict
+        offs = x.fielddata.OFFSET
+        A = ArrowArray(x.field.children[1], x.fielddata.children[1], x.dictionaries)
+        return Dict(y.key => y.value for y in A[(offs[i] + 1):offs[i + 1]])
     elseif S <: Tuple
         if Arrow.getT(S) == UInt8
             A = x.fielddata.DATA
-            return Tuple(map(UInt8, collect(A[i])))
+            return Tuple(map(UInt8, collect(A[i][1:x.field.type.byteWidth])))
         else
             sz = x.field.type.listSize
             A = ArrowArray{Arrow.getT(S)}(x.field.children[1], x.fielddata.children[1], x.dictionaries)
@@ -556,7 +583,8 @@ function Base.isequal(df::DataFile, tbl::Arrow.Table)
     Tables.schema(df) == Tables.schema(tbl) || return false
     i = 1
     for (col1, col2) in zip(Tables.Columns(df), Tables.Columns(tbl))
-        if isequal(col1, col2)
+        if !isequal(col1, col2)
+            @show i
             return false
         end
         i += 1

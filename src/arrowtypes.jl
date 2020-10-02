@@ -40,7 +40,7 @@ ArrowType(::Type{<:AbstractArray}) = ListType()
 
 struct FixedSizeListType <: ArrowType end
 
-ArrowType(::Type{<:NTuple}) = FixedSizeListType()
+ArrowType(::Type{NTuple{N, T}}) where {N, T} = FixedSizeListType()
 getsize(::Type{NTuple{N, T}}) where {N, T} = N
 
 struct MapType <: ArrowType end

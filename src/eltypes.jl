@@ -330,8 +330,8 @@ function juliaeltype(f::Meta.Field, map::Meta.Map, convert)
     return Dict{K, V}
 end
 
-function arrowtype(b, ::Type{Dict{K, V}}) where {K, V}
-    children = [fieldoffset(b, "entries", KeyValue{K, V})]
+function arrowtype(b, x::Map)
+    children = [fieldoffset(b, "entries", x.data)]
     Meta.mapStart(b)
     return Meta.Map, Meta.mapEnd(b), children
 end
@@ -345,6 +345,7 @@ keyvalueV(::Type{KeyValue{K, V}}) where {K, V} = V
 Base.length(kv::KeyValue) = 1
 Base.iterate(kv::KeyValue, st=1) = st === nothing ? nothing : (kv, nothing)
 ArrowTypes.default(::Type{KeyValue{K, V}}) where {K, V} = KeyValue(default(K), default(V))
+getnames(::Type{KeyValue{K, V}}) where {K, V} = (:key, :value)
 
 function arrowtype(b, ::Type{KeyValue{K, V}}) where {K, V}
     children = [fieldoffset(b, "key", K), fieldoffset(b, "value", V)]
