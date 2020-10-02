@@ -292,7 +292,7 @@ end
 function makemessage(b, headerType, header, columns=nothing, bodylen=0)
     # write the message flatbuffer object
     Meta.messageStart(b)
-    Meta.messageAddVersion(b, Meta.MetadataVersion.V4)
+    Meta.messageAddVersion(b, Meta.MetadataVersion.V5)
     Meta.messageAddHeaderType(b, headerType)
     Meta.messageAddHeader(b, header)
     Meta.messageAddBodyLength(b, Int64(bodylen))
