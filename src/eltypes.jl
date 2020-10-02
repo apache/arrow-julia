@@ -195,6 +195,7 @@ Base.convert(::Type{Dates.Time}, x::Time{U, T}) where {U, T} = Dates.Time(Dates.
 function arrowtype(b, ::Type{Time{U, T}}) where {U, T}
     Meta.timeStart(b)
     Meta.timeAddUnit(b, U)
+    Meta.timeAddBitWidth(b, Int32(8 * sizeof(T)))
     return Meta.Time, Meta.timeEnd(b), nothing
 end
 

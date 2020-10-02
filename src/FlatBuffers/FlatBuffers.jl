@@ -111,7 +111,7 @@ macro scopedenum(T, syms...)
             # enum definition
             primitive type $(esc(typename)) <: ScopedEnum{$(basetype)} $(sizeof(basetype) * 8) end
             function $(esc(typename))(x::Integer)
-                $(Base.Enums.membershiptest(:x, values)) || enum_argument_error($(Expr(:quote, typename)), x)
+                $(Base.Enums.membershiptest(:x, values)) || Base.Enums.enum_argument_error($(Expr(:quote, typename)), x)
                 return Core.bitcast($(esc(typename)), convert($(basetype), x))
             end
             if isdefined(Base.Enums, :namemap)

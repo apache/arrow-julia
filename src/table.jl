@@ -257,7 +257,7 @@ function Base.iterate(x::BatchIterator, (pos, id)=(x.startpos, 0))
     msg = FlatBuffers.getrootas(Meta.Message, x.bytes, pos-1)
     pos += msglen
     # pos now points to message body
-    @debug 1 "parsing message: msglen = $msglen, version = $(msg.version), bodyLength = $(msg.bodyLength)"
+    @debug 1 "parsing message: msglen = $msglen, bodyLength = $(msg.bodyLength)"
     return Batch(msg, x.bytes, pos, id), (pos + msg.bodyLength, id + 1)
 end
 

@@ -1,4 +1,4 @@
-FlatBuffers.@scopedenum MetadataVersion::Int16 V1 V2 V3 V4
+FlatBuffers.@scopedenum MetadataVersion::Int16 V1 V2 V3 V4 V5
 
 struct Null <: FlatBuffers.Table
     bytes::Vector{UInt8}

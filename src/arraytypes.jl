@@ -474,7 +474,7 @@ struct DenseUnion{T, S} <: ArrowVector{T}
 end
 
 Base.size(s::DenseUnion) = size(s.typeIds)
-nullcount(x::DenseUnion) = nullcount(x.data[1])
+nullcount(x::DenseUnion) = 0
 
 arrowvector(U::Union, ::Type{S}, x, de, meta; denseunions::Bool=true, kw...) where {S} =
     arrowvector(denseunions ? DenseUnionVector(x) : SparseUnionVector(x), de, meta; denseunions=denseunions, kw...)
@@ -536,7 +536,7 @@ struct SparseUnion{T, S} <: ArrowVector{T}
 end
 
 Base.size(s::SparseUnion) = size(s.typeIds)
-nullcount(x::SparseUnion) = nullcount(x.data[1])
+nullcount(x::SparseUnion) = 0
 
 @propagate_inbounds function Base.getindex(s::SparseUnion{T}, i::Integer) where {T}
     @boundscheck checkbounds(s, i)

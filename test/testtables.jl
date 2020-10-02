@@ -65,8 +65,8 @@ testtables = [
   (
     "unions",
     (
-      col1=Arrow.DenseUnionVector([1, 2.0, 3, 4.0, missing]),
-      col2=Arrow.SparseUnionVector([1, 2.0, 3, 4.0, missing]),
+      col1=Arrow.DenseUnionVector( Union{Int64, Float64, Missing}[1, 2.0, 3, 4.0, missing]),
+      col2=Arrow.SparseUnionVector(Union{Int64, Float64, Missing}[1, 2.0, 3, 4.0, missing]),
     ),
     NamedTuple(),
     NamedTuple(),
@@ -150,11 +150,11 @@ testtables = [
   (
     "dictencode keyword",
     (
-      col1=Int64[1,2,3,4,5,6,7,8,9,10],
+      col1=Int64[1,2,3,4],
       col2=Union{String, Missing}["hey", "there", "sailor", missing],
       col3=Arrow.DictEncode(NamedTuple{(:a, :b), Tuple{Int64, Union{String, Missing}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b="sailor"), (a=Int64(4), b="jo-bob")]),
-      col4=[:a, :b, :c, :d, :a, :b, :c, :d, :e, missing],
-      col5=[Date(2020, 1, 1) for x = 1:10]
+      col4=[:a, :b, :c, missing],
+      col5=[Date(2020, 1, 1) for x = 1:4]
     ),
     (dictencode=true,),
     NamedTuple(),
