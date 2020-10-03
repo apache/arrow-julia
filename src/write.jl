@@ -137,9 +137,11 @@ end
                             existing = dictencodingvalues[de.id]
                             # get new de.data we haven't seen before for delta update
                             vals = setdiff(de.data, existing)
-                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), de.id, true), i)
-                            # add new de.data to existing set for future diffs
-                            union!(existing, vals)
+                            if !isempty(vals)
+                                put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), de.id, true), i)
+                                # add new de.data to existing set for future diffs
+                                union!(existing, vals)
+                            end
                         end
                     end
                     put!(msgs, makerecordbatchmsg(sch[], cols), i, true)
