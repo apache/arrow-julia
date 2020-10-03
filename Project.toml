@@ -14,6 +14,8 @@ SentinelArrays = "91c51154-3ec4-41a3-a24f-3f23e20d615c"
 Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 
 [compat]
+CodecLz4 = "0.4"
+CodecZstd = "0.7"
 julia = "1.3"
 DataAPI = "1"
 PooledArrays = "0.5"
