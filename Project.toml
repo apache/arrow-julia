@@ -1,7 +1,7 @@
 name = "Arrow"
 uuid = "69666777-d1a9-59fb-9406-91d4454c9d45"
 authors = ["quinnj <quinn.jacobd@gmail.com>", "ExpandingMan <expandingman@protonmail.com"]
-version = "1.0.0"
+version = "0.3.0"
 
 [deps]
 CodecLz4 = "5ba52731-8f18-5e0d-9241-30f10d1ec561"
