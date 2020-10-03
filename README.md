@@ -46,7 +46,7 @@ Third-party data formats:
 Read an arrow formatted table, from:
  * `io`, bytes will be read all at once via `read(io)`
  * `file`, bytes will be read via `Mmap.mmap(file)`
- # `bytes`, a byte vector directly, optionally allowing specifying the starting byte position `pos` and `len`
+ * `bytes`, a byte vector directly, optionally allowing specifying the starting byte position `pos` and `len`
 
 Returns a `Arrow.Table` object that allows column access via `table.col1`, `table[:col1]`, or `table[1]`.
 
@@ -81,7 +81,7 @@ tbl = Arrow.Table(resp.body)
 Start reading an arrow formatted table, from:
  * `io`, bytes will be read all at once via `read(io)`
  * `file`, bytes will be read via `Mmap.mmap(file)`
- # `bytes`, a byte vector directly, optionally allowing specifying the starting byte position `pos` and `len`
+ * `bytes`, a byte vector directly, optionally allowing specifying the starting byte position `pos` and `len`
 
 Reads the initial schema message from the arrow stream/file, then returns an `Arrow.Stream` object
 which will iterate over record batch messages, producing an `Arrow.Table` on each iteration.
