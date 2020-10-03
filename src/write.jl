@@ -13,8 +13,8 @@ getmetadata(x, default=nothing) = get(OBJ_METADATA, x, default)
 
 Write any Tables.jl-compatible `tbl` out as arrow formatted data.
 Providing an `io::IO` argument will cause the data to be written to it
-in the "streaming" format, while providing a `file::String` argument
-will result in the "file" format being written.
+in the "streaming" format, unless `file=true` keyword argument is passed.
+Providing a `file::String` argument will result in the "file" format being written.
 
 Multiple record batches will be written based on the number of
 `Tables.partitions(tbl)` that are provided; by default, this is just
@@ -22,6 +22,17 @@ one for a given table, but some table sources support automatic
 partitioning. Note you can turn multiple table objects into partitions
 by doing `Tables.partitioner([tbl1, tbl2, ...])`, but note that
 each table must have the exact same `Tables.Schema`.
+
+By default, `Arrow.write` will use multiple threads to write multiple
+record batches simultaneously (e.g. if julia is started with `julia -t 8`).
+
+Supported keyword arguments to `Arrow.write` include:
+  * `compress::Symbol`: possible values include `:lz4` or `:zstd`; will cause all buffers in each record batch to use the respective compression encoding
+  * `dictencode::Bool=false`: whether all columns should use dictionary encoding when being written
+  * `dictencodenested::Bool=false`: whether nested data type columns should also dict encode nested arrays/buffers; many other implementations don't support this
+  * `denseunions::Bool=true`: whether Julia `Vector{<:Union}` arrays should be written using the dense union layout; passing `false` will result in the sparse union layout
+  * `largelists::Bool=false`: causes list column types to be written with Int64 offset arrays; mainly for testing purposes; by default, Int64 offsets will be used only if needed
+  * `file::Bool=false`: if a an `io` argument is being written to, passing `file=true` will cause the arrow file format to be written instead of just IPC streaming
 """
 function write end
 

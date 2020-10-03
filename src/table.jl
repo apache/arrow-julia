@@ -3,6 +3,27 @@ struct BatchIterator
     startpos::Int
 end
 
+"""
+    Arrow.Stream(io::IO; convert::Bool=true)
+    Arrow.Stream(file::String; convert::Bool=true)
+    Arrow.Stream(bytes::Vector{UInt8}, pos=1, len=nothing; convert::Bool=true)
+
+Start reading an arrow formatted table, from:
+ * `io`, bytes will be read all at once via `read(io)`
+ * `file`, bytes will be read via `Mmap.mmap(file)`
+ # `bytes`, a byte vector directly, optionally allowing specifying the starting byte position `pos` and `len`
+
+Reads the initial schema message from the arrow stream/file, then returns an `Arrow.Stream` object
+which will iterate over record batch messages, producing an `Arrow.Table` on each iteration.
+
+By iterating `Arrow.Table`, `Arrow.Stream` satisfies the `Tables.partitions` interface, and as such can
+be passed to Tables.jl-compatible sink functions.
+
+This allows iterating over extremely large "arrow tables" in chunks represented as record batches.
+
+Supports the `convert` keyword argument which controls whether certain arrow primitive types will be
+lazily converted to more friendly Julia defaults; by default, `convert=true`.
+"""
 struct Stream
     batchiterator::BatchIterator
     pos::Int
@@ -91,19 +112,22 @@ function Base.iterate(x::Stream, (pos, id)=(x.pos, 1))
 end
 
 """
-    Arrow.Table(io::IO)
-    Arrow.Table(file::String)
-    Arrow.Table(bytes::Vector{UInt8}, pos=1, len=nothing)
+    Arrow.Table(io::IO; convert::Bool=true)
+    Arrow.Table(file::String; convert::Bool=true)
+    Arrow.Table(bytes::Vector{UInt8}, pos=1, len=nothing; convert::Bool=true)
 
 Read an arrow formatted table, from:
- * `io`, bytes come from `read(io)`
- * `file`, bytes come from `Mmap.mmap(file)`
+ * `io`, bytes will be read all at once via `read(io)`
+ * `file`, bytes will be read via `Mmap.mmap(file)`
  # `bytes`, a byte vector directly, optionally allowing specifying the starting byte position `pos` and `len`
 
 Returns a `Arrow.Table` object that allows column access via `table.col1`, `table[:col1]`, or `table[1]`.
 
 `Arrow.Table` also satisfies the Tables.jl interface, and so can easily be materialied via any supporting
 sink function: e.g. `DataFrame(Arrow.Table(file))`, `SQLite.load!(db, "table", Arrow.Table(file))`, etc.
+
+Supports the `convert` keyword argument which controls whether certain arrow primitive types will be
+lazily converted to more friendly Julia defaults; by default, `convert=true`.
 """
 struct Table <: Tables.AbstractColumns
     names::Vector{Symbol}

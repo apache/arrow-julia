@@ -1,3 +1,27 @@
+"""
+    Arrow.jl
+
+A pure Julia implementation of the [apache arrow](https://arrow.apache.org/) memory format specification.
+
+This implementation supports the 1.0 version of the specification, including support for:
+  * All primitive data types
+  * All nested data types
+  * Dictionary encodings and messages
+  * Extension types
+  * Streaming, file, record batch, and replacement and isdelta dictionary messages
+
+It currently doesn't include support for:
+  * Tensors or sparse tensors
+  * Flight RPC
+  * C data interface
+
+Third-party data formats:
+  * csv and parquet support via the existing CSV.jl and Parquet.jl packages
+  * Other Tables.jl-compatible packages automatically supported (DataFrames.jl, JSONTables.jl, JuliaDB.jl, SQLite.jl, MySQL.jl, JDBC.jl, ODBC.jl, XLSX.jl, etc.)
+  * No current Julia packages support ORC or Avro data formats
+
+See docs for official Arrow.jl API with `Arrow.Table`, `Arrow.write`, and `Arrow.Stream`.
+"""
 module Arrow
 
 using Mmap
