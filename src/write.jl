@@ -28,6 +28,7 @@ record batches simultaneously (e.g. if julia is started with `julia -t 8`).
 
 Supported keyword arguments to `Arrow.write` include:
   * `compress`: possible values include `:lz4`, `:zstd`, or your own initialized `LZ4FrameCompressor` or `ZstdCompressor` objects; will cause all buffers in each record batch to use the respective compression encoding
+  * `alignment::Int=8`: specify the number of bytes to align buffers to when written in messages; strongly recommended to only use alignment values of 8 or 64 for modern memory cache line optimization
   * `dictencode::Bool=false`: whether all columns should use dictionary encoding when being written
   * `dictencodenested::Bool=false`: whether nested data type columns should also dict encode nested arrays/buffers; many other implementations don't support this
   * `denseunions::Bool=true`: whether Julia `Vector{<:Union}` arrays should be written using the dense union layout; passing `false` will result in the sparse union layout
@@ -298,7 +299,7 @@ function Base.write(io::IO, msg::Message, blocks, sch, alignment)
     n += Base.write(io, Int32(metalen))
     # message flatbuffer
     n += Base.write(io, msg.msgflatbuf)
-    n += writezeros(io, paddinglength(n, alignment))
+    n += writezeros(io, paddinglength(length(msg.msgflatbuf), alignment))
     # message body
     if msg.columns !== nothing
         # write out buffers

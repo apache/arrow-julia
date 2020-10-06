@@ -56,7 +56,6 @@ macro debug(level, msg)
     end)
 end
 
-const ALIGNMENT = 8
 const FILE_FORMAT_MAGIC_BYTES = b"ARROW1"
 const CONTINUATION_INDICATOR_BYTES = 0xffffffff
 

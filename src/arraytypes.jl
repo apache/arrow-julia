@@ -34,7 +34,7 @@ nullcount(x::ArrowVector) = validitybitmap(x).nc
 getmetadata(x::ArrowVector) = x.metadata
 
 function toarrowvector(x, de=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, LZ4FrameCompressor, ZstdCompressor}=nothing, kw...)
-    @debug 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $kw"
+    @debug 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(kw.data)"
     @debug 3 x
     A = arrowvector(x, de, meta; compression=compression, kw...)
     if compression isa LZ4FrameCompressor
