@@ -54,7 +54,7 @@ NOTE: the columns in an `Arrow.Table` are views into the original arrow memory, 
 modifiable (with e.g. `push!`, `append!`, etc.). To mutate arrow columns, call `copy(x)` to materialize
 the arrow data as a normal Julia array.
 
-`Arrow.Table` also satisfies the Tables.jl interface, and so can easily be materialied via any supporting
+`Arrow.Table` also satisfies the Tables.jl interface, and so can easily be materialized via any supporting
 sink function: e.g. `DataFrame(Arrow.Table(file))`, `SQLite.load!(db, "table", Arrow.Table(file))`, etc.
 
 Supports the `convert` keyword argument which controls whether certain arrow primitive types will be
