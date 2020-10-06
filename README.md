@@ -121,7 +121,7 @@ By default, `Arrow.write` will use multiple threads to write multiple
 record batches simultaneously (e.g. if julia is started with `julia -t 8`).
 
 Supported keyword arguments to `Arrow.write` include:
-  * `compress::Symbol`: possible values include `:lz4` or `:zstd`; will cause all buffers in each record batch to use the respective compression encoding
+  * `compress`: possible values include `:lz4`, `:zstd`, or your own initialized `LZ4FrameCompressor` or `ZstdCompressor` objects; will cause all buffers in each record batch to use the respective compression encoding
   * `dictencode::Bool=false`: whether all columns should use dictionary encoding when being written
   * `dictencodenested::Bool=false`: whether nested data type columns should also dict encode nested arrays/buffers; many other implementations don't support this
   * `denseunions::Bool=true`: whether Julia `Vector{<:Union}` arrays should be written using the dense union layout; passing `false` will result in the sparse union layout
