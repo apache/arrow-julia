@@ -263,6 +263,7 @@ struct Batch
 end
 
 function Base.iterate(x::BatchIterator, (pos, id)=(x.startpos, 0))
+    @debug 1 "checking for next arrow message: pos = $pos"
     if pos + 3 > length(x.bytes)
         @debug 1 "not enough bytes left for another batch message"
         return nothing
@@ -285,7 +286,7 @@ function Base.iterate(x::BatchIterator, (pos, id)=(x.startpos, 0))
     msg = FlatBuffers.getrootas(Meta.Message, x.bytes, pos-1)
     pos += msglen
     # pos now points to message body
-    @debug 1 "parsing message: msglen = $msglen, bodyLength = $(msg.bodyLength)"
+    @debug 1 "parsing message: pos = $pos, msglen = $msglen, bodyLength = $(msg.bodyLength)"
     return Batch(msg, x.bytes, pos, id), (pos + msg.bodyLength, id + 1)
 end
 
