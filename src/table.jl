@@ -123,6 +123,10 @@ Read an arrow formatted table, from:
 
 Returns a `Arrow.Table` object that allows column access via `table.col1`, `table[:col1]`, or `table[1]`.
 
+NOTE: the columns in an `Arrow.Table` are views into the original arrow memory, and hence are not easily
+modifiable (with e.g. `push!`, `append!`, etc.). To mutate arrow columns, call `copy(x)` to materialize
+the arrow data as a normal Julia array.
+
 `Arrow.Table` also satisfies the Tables.jl interface, and so can easily be materialied via any supporting
 sink function: e.g. `DataFrame(Arrow.Table(file))`, `SQLite.load!(db, "table", Arrow.Table(file))`, etc.
 

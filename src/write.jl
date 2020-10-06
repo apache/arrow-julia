@@ -36,14 +36,14 @@ Supported keyword arguments to `Arrow.write` include:
 """
 function write end
 
-function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false)
+function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false)
     open(file, "w") do io
         write(io, tbl, true, largelists, compress, denseunions, dictencode, dictencodenested)
     end
     return file
 end
 
-function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, file::Bool=false)
+function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, file::Bool=false)
     return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested)
 end
 
@@ -102,6 +102,13 @@ function Base.close(ch::OrderedChannel)
 end
 
 function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested)
+    if compress === :lz4
+        compress = LZ4_FRAME_COMPRESSOR[]
+    elseif compress === :zstd
+        compress = ZSTD_COMPRESSOR[]
+    elseif compress isa Symbol
+        throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
+    end
     if writetofile
         @debug 1 "starting write of arrow formatted file"
         Base.write(io, "ARROW1\0\0")
