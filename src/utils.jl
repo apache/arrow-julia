@@ -5,9 +5,9 @@
 Determines the total number of bytes needed to store `n` bytes with padding.
 Note that the Arrow standard requires buffers to be aligned to 8-byte boundaries.
 """
-padding(n::Integer) = ((n + ALIGNMENT - 1) ÷ ALIGNMENT) * ALIGNMENT
+padding(n::Integer, alignment) = ((n + alignment - 1) ÷ alignment) * alignment
 
-paddinglength(n::Integer) = padding(n) - n
+paddinglength(n::Integer, alignment) = padding(n, alignment) - n
 
 function writezeros(io::IO, n::Integer)
     s = 0
@@ -61,13 +61,13 @@ function setbit(v::UInt8, b::Bool, n::Integer)
 end
 
 """
-    bitpackedbytes(n[, pad=true])
+    bitpackedbytes(n)
 
 Determines the number of bytes used by `n` bits, optionally with padding.
 """
-function bitpackedbytes(n::Integer)
+function bitpackedbytes(n::Integer, alignment)
     ℓ = cld(n, 8)
-    return ℓ + paddinglength(ℓ)
+    return ℓ + paddinglength(ℓ, alignment)
 end
 
 # count # of missing elements in an iterable

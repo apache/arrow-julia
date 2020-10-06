@@ -36,15 +36,15 @@ Supported keyword arguments to `Arrow.write` include:
 """
 function write end
 
-function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false)
+function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8)
     open(file, "w") do io
-        write(io, tbl, true, largelists, compress, denseunions, dictencode, dictencodenested)
+        write(io, tbl, true, largelists, compress, denseunions, dictencode, dictencodenested, alignment)
     end
     return file
 end
 
-function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, file::Bool=false)
-    return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested)
+function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, file::Bool=false)
+    return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment)
 end
 
 @static if VERSION >= v"1.3"
@@ -101,7 +101,7 @@ function Base.close(ch::OrderedChannel)
     return
 end
 
-function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested)
+function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment)
     if compress === :lz4
         compress = LZ4_FRAME_COMPRESSOR[]
     elseif compress === :zstd
@@ -122,11 +122,11 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     # start message writing from channel
 @static if VERSION >= v"1.3-DEV"
     tsk = Threads.@spawn for msg in msgs
-        Base.write(io, msg, blocks, sch)
+        Base.write(io, msg, blocks, sch, alignment)
     end
 else
     tsk = @async for msg in msgs
-        Base.write(io, msg, blocks, sch)
+        Base.write(io, msg, blocks, sch, alignment)
     end
 end
     @sync for (i, tbl) in enumerate(Tables.partitions(source))
@@ -140,10 +140,10 @@ end
                 for de in cols.dictencodings
                     dictencodingvalues[de.id] = Set(z for z in de.data)
                     dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                    put!(msgs, makedictionarybatchmsg(dictsch, (col=de.data,), de.id, false), i)
+                    put!(msgs, makedictionarybatchmsg(dictsch, (col=de.data,), de.id, false, alignment), i)
                 end
             end
-            put!(msgs, makerecordbatchmsg(sch[], cols), i, true)
+            put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
         else
 @static if VERSION >= v"1.3-DEV"
             Threads.@spawn begin
@@ -156,13 +156,13 @@ end
                             # get new de.data we haven't seen before for delta update
                             vals = setdiff(de.data, existing)
                             if !isempty(vals)
-                                put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), de.id, true), i)
+                                put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), de.id, true, alignment), i)
                                 # add new de.data to existing set for future diffs
                                 union!(existing, vals)
                             end
                         end
                     end
-                    put!(msgs, makerecordbatchmsg(sch[], cols), i, true)
+                    put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
                 catch e
                     showerror(stdout, e, catch_backtrace())
                     rethrow(e)
@@ -178,12 +178,12 @@ else
                             existing = dictencodingvalues[de.id]
                             # get new de.data we haven't seen before for delta update
                             vals = setdiff(de.data, existing)
-                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), de.id, true), i)
+                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), de.id, true, alignment), i)
                             # add new de.data to existing set for future diffs
                             union!(existing, vals)
                         end
                     end
-                    put!(msgs, makerecordbatchmsg(sch[], cols), i, true)
+                    put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
                 catch e
                     showerror(stdout, e, catch_backtrace())
                     rethrow(e)
@@ -196,7 +196,7 @@ end
     wait(tsk)
     # write empty message
     if !writetofile
-        Base.write(io, Message(UInt8[], nothing, 0, true, false), blocks, sch)
+        Base.write(io, Message(UInt8[], nothing, 0, true, false), blocks, sch, alignment)
     end
     if writetofile
         b = FlatBuffers.Builder(1024)
@@ -285,8 +285,8 @@ struct Block
     bodyLength::Int64
 end
 
-function Base.write(io::IO, msg::Message, blocks, sch)
-    metalen = padding(length(msg.msgflatbuf))
+function Base.write(io::IO, msg::Message, blocks, sch, alignment)
+    metalen = padding(length(msg.msgflatbuf), alignment)
     @debug 1 "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch)"
     if msg.blockmsg
         push!(blocks[msg.isrecordbatch ? 1 : 2], Block(position(io), metalen + 8, msg.bodylen))
@@ -298,12 +298,12 @@ function Base.write(io::IO, msg::Message, blocks, sch)
     n += Base.write(io, Int32(metalen))
     # message flatbuffer
     n += Base.write(io, msg.msgflatbuf)
-    n += writezeros(io, paddinglength(n))
+    n += writezeros(io, paddinglength(n, alignment))
     # message body
     if msg.columns !== nothing
         # write out buffers
         for col in Tables.Columns(msg.columns)
-            writebuffer(io, col)
+            writebuffer(io, col, alignment)
         end
     end
     return n
@@ -441,13 +441,13 @@ struct Buffer
     length::Int64
 end
 
-function makerecordbatchmsg(sch::Tables.Schema{names, types}, columns) where {names, types}
+function makerecordbatchmsg(sch::Tables.Schema{names, types}, columns, alignment) where {names, types}
     b = FlatBuffers.Builder(1024)
-    recordbatch, bodylen = makerecordbatch(b, sch, columns)
+    recordbatch, bodylen = makerecordbatch(b, sch, columns, alignment)
     return makemessage(b, Meta.RecordBatch, recordbatch, columns, bodylen)
 end
 
-function makerecordbatch(b, sch::Tables.Schema{names, types}, columns) where {names, types}
+function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, alignment) where {names, types}
     nrows = Tables.rowcount(columns)
     
     compress = nothing
@@ -458,7 +458,7 @@ function makerecordbatch(b, sch::Tables.Schema{names, types}, columns) where {na
         if col isa Compressed
             compress = compressiontype(col)
         end
-        bufferoffset = makenodesbuffers!(col, fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(col, fieldnodes, fieldbuffers, bufferoffset, alignment)
     end
     @debug 1 "building record batch message: nrows = $nrows, sch = $sch, compress = $compress"
 
@@ -476,7 +476,7 @@ function makerecordbatch(b, sch::Tables.Schema{names, types}, columns) where {na
     Meta.recordBatchStartBuffersVector(b, BN)
     for buf in Iterators.reverse(fieldbuffers)
         Meta.createBuffer(b, buf.offset, buf.length)
-        bodylen += padding(buf.length)
+        bodylen += padding(buf.length, alignment)
     end
     buffers = FlatBuffers.endvector!(b, BN)
 
@@ -500,10 +500,10 @@ function makerecordbatch(b, sch::Tables.Schema{names, types}, columns) where {na
     return Meta.recordBatchEnd(b), bodylen
 end
 
-function makedictionarybatchmsg(sch, columns, id, isdelta)
+function makedictionarybatchmsg(sch, columns, id, isdelta, alignment)
     @debug 1 "building dictionary message: id = $id, sch = $sch, isdelta = $isdelta"
     b = FlatBuffers.Builder(1024)
-    recordbatch, bodylen = makerecordbatch(b, sch, columns)
+    recordbatch, bodylen = makerecordbatch(b, sch, columns, alignment)
     Meta.dictionaryBatchStart(b)
     Meta.dictionaryBatchAddId(b, Int64(id))
     Meta.dictionaryBatchAddData(b, recordbatch)
@@ -512,238 +512,239 @@ function makedictionarybatchmsg(sch, columns, id, isdelta)
     return makemessage(b, Meta.DictionaryBatch, dictionarybatch, columns, bodylen)
 end
 
-function makenodesbuffers!(col::MissingVector, fieldnodes, fieldbuffers, bufferoffset)
+function makenodesbuffers!(col::MissingVector, fieldnodes, fieldbuffers, bufferoffset, alignment)
     push!(fieldnodes, FieldNode(length(col), length(col)))
     @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     return bufferoffset
 end
 
-function writebuffer(io, col::MissingVector)
+function writebuffer(io, col::MissingVector, alignment)
     return
 end
 
-function makenodesbuffers!(col::Primitive{T, S}, fieldnodes, fieldbuffers, bufferoffset) where {T, S}
+function makenodesbuffers!(col::Primitive{T, S}, fieldnodes, fieldbuffers, bufferoffset, alignment) where {T, S}
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
     @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     # validity bitmap
-    blen = nc == 0 ? 0 : bitpackedbytes(len)
+    blen = nc == 0 ? 0 : bitpackedbytes(len, alignment)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
+    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     # adjust buffer offset, make primitive array buffer
     bufferoffset += blen
     blen = len * sizeof(T)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
-    return bufferoffset + padding(blen)
+    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+    return bufferoffset + padding(blen, alignment)
 end
 
-function writebitmap(io, col::ArrowVector)
+function writebitmap(io, col::ArrowVector, alignment)
     v = col.validity
-    @debug 1 "writing validity bitmap: nc = $(v.nc), n = $(bitpackedbytes(v.ℓ))"
+    @debug 1 "writing validity bitmap: nc = $(v.nc), n = $(cld(v.ℓ, 8))"
     v.nc == 0 && return 0
-    Base.write(io, view(v.bytes, v.pos:(v.pos + bitpackedbytes(v.ℓ) - 1)))
+    n = Base.write(io, view(v.bytes, v.pos:(v.pos + cld(v.ℓ, 8) - 1)))
+    return n + writezeros(io, paddinglength(n, alignment))
 end
 
-function writebuffer(io, col::Primitive{T, S}) where {T, S}
+function writebuffer(io, col::Primitive{T, S}, alignment) where {T, S}
     @debug 1 "writebuffer: col = $(typeof(col))"
     @debug 2 col
-    writebitmap(io, col)
+    writebitmap(io, col, alignment)
     n = writearray(io, S, col.data)
-    @debug 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n))"
-    writezeros(io, paddinglength(n))
+    @debug 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n, alignment))"
+    writezeros(io, paddinglength(n, alignment))
     return
 end
 
-function makenodesbuffers!(col::Union{Map{T, O, A}, List{T, O, A}}, fieldnodes, fieldbuffers, bufferoffset) where {T, O, A}
+function makenodesbuffers!(col::Union{Map{T, O, A}, List{T, O, A}}, fieldnodes, fieldbuffers, bufferoffset, alignment) where {T, O, A}
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
     @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     # validity bitmap
-    blen = nc == 0 ? 0 : bitpackedbytes(len)
+    blen = nc == 0 ? 0 : bitpackedbytes(len, alignment)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
+    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     # adjust buffer offset, make array buffer
     bufferoffset += blen
     blen = sizeof(O) * (len + 1)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
-    bufferoffset += padding(blen)
+    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+    bufferoffset += padding(blen, alignment)
     if eltype(A) == UInt8
         blen = length(col.data)
         push!(fieldbuffers, Buffer(bufferoffset, blen))
-        @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
-        bufferoffset += padding(blen)
+        @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+        bufferoffset += padding(blen, alignment)
     else
-        bufferoffset = makenodesbuffers!(col.data, fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(col.data, fieldnodes, fieldbuffers, bufferoffset, alignment)
     end
     return bufferoffset
 end
 
-function writebuffer(io, col::Union{Map{T, O, A}, List{T, O, A}}) where {T, O, A}
+function writebuffer(io, col::Union{Map{T, O, A}, List{T, O, A}}, alignment) where {T, O, A}
     @debug 1 "writebuffer: col = $(typeof(col))"
     @debug 2 col
-    writebitmap(io, col)
+    writebitmap(io, col, alignment)
     # write offsets
     n = writearray(io, O, col.offsets.offsets)
-    @debug 1 "writing array: col = $(typeof(col.offsets.offsets)), n = $n, padded = $(padding(n))"
-    writezeros(io, paddinglength(n))
+    @debug 1 "writing array: col = $(typeof(col.offsets.offsets)), n = $n, padded = $(padding(n, alignment))"
+    writezeros(io, paddinglength(n, alignment))
     # write values array
     if eltype(A) == UInt8
         n = writearray(io, UInt8, col.data)
-        @debug 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n))"
-        writezeros(io, paddinglength(n))
+        @debug 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n, alignment))"
+        writezeros(io, paddinglength(n, alignment))
     else
-        writebuffer(io, col.data)
+        writebuffer(io, col.data, alignment)
     end
     return
 end
 
-function makenodesbuffers!(col::FixedSizeList{T, A}, fieldnodes, fieldbuffers, bufferoffset) where {T, A}
+function makenodesbuffers!(col::FixedSizeList{T, A}, fieldnodes, fieldbuffers, bufferoffset, alignment) where {T, A}
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
     @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     # validity bitmap
-    blen = nc == 0 ? 0 : bitpackedbytes(len)
+    blen = nc == 0 ? 0 : bitpackedbytes(len, alignment)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
+    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += blen
     if eltype(A) === UInt8
         blen = getN(Base.nonmissingtype(T)) * len
         push!(fieldbuffers, Buffer(bufferoffset, blen))
-        @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
-        bufferoffset += padding(blen)
+        @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+        bufferoffset += padding(blen, alignment)
     else
-        bufferoffset = makenodesbuffers!(col.data, fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(col.data, fieldnodes, fieldbuffers, bufferoffset, alignment)
     end
     return bufferoffset
 end
 
-function writebuffer(io, col::FixedSizeList{T, A}) where {T, A}
+function writebuffer(io, col::FixedSizeList{T, A}, alignment) where {T, A}
     @debug 1 "writebuffer: col = $(typeof(col))"
     @debug 2 col
-    writebitmap(io, col)
+    writebitmap(io, col, alignment)
     # write values array
     if eltype(A) === UInt8
         n = writearray(io, UInt8, col.data)
-        @debug 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n))"
-        writezeros(io, paddinglength(n))
+        @debug 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n, alignment))"
+        writezeros(io, paddinglength(n, alignment))
     else
-        writebuffer(io, col.data)
+        writebuffer(io, col.data, alignment)
     end
     return
 end
 
-function makenodesbuffers!(col::Struct{T}, fieldnodes, fieldbuffers, bufferoffset) where {T}
+function makenodesbuffers!(col::Struct{T}, fieldnodes, fieldbuffers, bufferoffset, alignment) where {T}
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
     @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     # validity bitmap
-    blen = nc == 0 ? 0 : bitpackedbytes(len)
+    blen = nc == 0 ? 0 : bitpackedbytes(len, alignment)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
+    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += blen
     for child in col.data
-        bufferoffset = makenodesbuffers!(child, fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(child, fieldnodes, fieldbuffers, bufferoffset, alignment)
     end
     return bufferoffset
 end
 
-function writebuffer(io, col::Struct)
+function writebuffer(io, col::Struct, alignment)
     @debug 1 "writebuffer: col = $(typeof(col))"
     @debug 2 col
-    writebitmap(io, col)
+    writebitmap(io, col, alignment)
     # write values arrays
     for child in col.data
-        writebuffer(io, child)
+        writebuffer(io, child, alignment)
     end
     return
 end
 
-function makenodesbuffers!(col::Union{DenseUnion, SparseUnion}, fieldnodes, fieldbuffers, bufferoffset)
+function makenodesbuffers!(col::Union{DenseUnion, SparseUnion}, fieldnodes, fieldbuffers, bufferoffset, alignment)
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
     @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     # typeIds buffer
     push!(fieldbuffers, Buffer(bufferoffset, len))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
-    bufferoffset += padding(len)
+    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+    bufferoffset += padding(len, alignment)
     if col isa DenseUnion
         # offsets buffer
         blen = sizeof(Int32) * len
         push!(fieldbuffers, Buffer(bufferoffset, blen))
-        @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
-        bufferoffset += padding(blen)
+        @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+        bufferoffset += padding(blen, alignment)
     end
     for child in col.data
-        bufferoffset = makenodesbuffers!(child, fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(child, fieldnodes, fieldbuffers, bufferoffset, alignment)
     end
     return bufferoffset
 end
 
-function writebuffer(io, col::Union{DenseUnion, SparseUnion})
+function writebuffer(io, col::Union{DenseUnion, SparseUnion}, alignment)
     @debug 1 "writebuffer: col = $(typeof(col))"
     @debug 2 col
     # typeIds buffer
     n = writearray(io, UInt8, col.typeIds)
-    @debug 1 "writing array: col = $(typeof(col.typeIds)), n = $n, padded = $(padding(n))"
-    writezeros(io, paddinglength(n))
+    @debug 1 "writing array: col = $(typeof(col.typeIds)), n = $n, padded = $(padding(n, alignment))"
+    writezeros(io, paddinglength(n, alignment))
     if col isa DenseUnion
         n = writearray(io, Int32, col.offsets)
-        @debug 1 "writing array: col = $(typeof(col.offsets)), n = $n, padded = $(padding(n))"
-        writezeros(io, paddinglength(n))
+        @debug 1 "writing array: col = $(typeof(col.offsets)), n = $n, padded = $(padding(n, alignment))"
+        writezeros(io, paddinglength(n, alignment))
     end
     for child in col.data
-        writebuffer(io, child)
+        writebuffer(io, child, alignment)
     end
     return
 end
 
-function makenodesbuffers!(col::DictEncoded{T, S}, fieldnodes, fieldbuffers, bufferoffset) where {T, S}
+function makenodesbuffers!(col::DictEncoded{T, S}, fieldnodes, fieldbuffers, bufferoffset, alignment) where {T, S}
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
     @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     # validity bitmap
-    blen = nc == 0 ? 0 : bitpackedbytes(len)
+    blen = nc == 0 ? 0 : bitpackedbytes(len, alignment)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
+    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += blen
     # indices
     blen = sizeof(S) * len
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
-    bufferoffset += padding(blen)
+    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+    bufferoffset += padding(blen, alignment)
     return bufferoffset
 end
 
-function writebuffer(io, col::DictEncoded)
+function writebuffer(io, col::DictEncoded, alignment)
     @debug 1 "writebuffer: col = $(typeof(col))"
     @debug 2 col
-    writebitmap(io, col)
+    writebitmap(io, col, alignment)
     # write indices
     n = writearray(io, col.indices)
-    @debug 1 "writing array: col = $(typeof(col.indices)), n = $n, padded = $(padding(n))"
-    writezeros(io, paddinglength(n))
+    @debug 1 "writing array: col = $(typeof(col.indices)), n = $n, padded = $(padding(n, alignment))"
+    writezeros(io, paddinglength(n, alignment))
     return
 end
 
-function makenodesbuffers!(col::Compressed, fieldnodes, fieldbuffers, bufferoffset)
+function makenodesbuffers!(col::Compressed, fieldnodes, fieldbuffers, bufferoffset, alignment)
     push!(fieldnodes, FieldNode(col.len, col.nullcount))
     @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     for buffer in col.buffers
         blen = length(buffer.data) == 0 ? 0 : 8 + length(buffer.data)
         push!(fieldbuffers, Buffer(bufferoffset, blen))
-        @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length))"
-        bufferoffset += padding(blen)
+        @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+        bufferoffset += padding(blen, alignment)
     end
     for child in col.children
-        bufferoffset = makenodesbuffers!(child, fieldnodes, fieldbuffers, bufferoffset)
+        bufferoffset = makenodesbuffers!(child, fieldnodes, fieldbuffers, bufferoffset, alignment)
     end
     return bufferoffset
 end
@@ -758,15 +759,15 @@ function writearray(io, b::CompressedBuffer)
     return 0
 end
 
-function writebuffer(io, col::Compressed)
+function writebuffer(io, col::Compressed, alignment)
     @debug 1 "writebuffer: col = $(typeof(col))"
     @debug 2 col
     for buffer in col.buffers
         n = writearray(io, buffer)
-        writezeros(io, paddinglength(n))
+        writezeros(io, paddinglength(n, alignment))
     end
     for child in col.children
-        writebuffer(io, child)
+        writebuffer(io, child, alignment)
     end
     return
 end

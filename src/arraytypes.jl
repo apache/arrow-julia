@@ -88,7 +88,7 @@ struct ValidityBitmap <: ArrowVector{Bool}
 end
 
 compress(Z::Meta.CompressionType, comp, v::ValidityBitmap) =
-    v.nc == 0 ? CompressedBuffer(UInt8[], 0) : compress(Z, comp, view(v.bytes, v.pos:(v.pos + bitpackedbytes(v.ℓ) - 1)))
+    v.nc == 0 ? CompressedBuffer(UInt8[], 0) : compress(Z, comp, view(v.bytes, v.pos:(v.pos + cld(v.ℓ, 8) - 1)))
 
 Base.size(p::ValidityBitmap) = (p.ℓ,)
 nullcount(x::ValidityBitmap) = x.nc
@@ -99,7 +99,7 @@ end
 
 function ValidityBitmap(x)
     len = length(x)
-    blen = bitpackedbytes(len)
+    blen = cld(len, 8)
     bytes = Vector{UInt8}(undef, blen)
     st = iterate(x)
     i = 0
