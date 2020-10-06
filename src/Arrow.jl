@@ -75,4 +75,17 @@ include("eltypes.jl")
 include("table.jl")
 include("write.jl")
 
+const LZ4_FRAME_COMPRESSOR = Ref{LZ4FrameCompressor}()
+const ZSTD_COMPRESSOR = Ref{ZstdCompressor}()
+
+function __init__()
+    zstd = ZstdCompressor(; level=3)
+    CodecZstd.TranscodingStreams.initialize(zstd)
+    ZSTD_COMPRESSOR[] = zstd
+    lz4 = LZ4FrameCompressor(; compressionlevel=4)
+    CodecLz4.TranscodingStreams.initialize(lz4)
+    LZ4_FRAME_COMPRESSOR[] = lz4
+    return
+end
+
 end  # module Arrow

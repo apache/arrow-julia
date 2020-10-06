@@ -16,20 +16,14 @@ Base.eltype(c::Compressed{Z, A}) where {Z, A} = eltype(A)
 getmetadata(x::Compressed) = getmetadata(x.data)
 compressiontype(c::Compressed{Z}) where {Z} = Z
 
-function compress(Z::Meta.CompressionType, x::Array)
+function compress(Z::Meta.CompressionType, comp, x::Array)
     GC.@preserve x begin
         y = unsafe_wrap(Array, convert(Ptr{UInt8}, pointer(x)), sizeof(x))
-        if Z == Meta.CompressionType.LZ4_FRAME
-            return CompressedBuffer(transcode(LZ4FrameCompressor, y), length(y))
-        elseif Z == Meta.CompressionType.ZSTD
-            return CompressedBuffer(transcode(ZstdCompressor, y), length(y))
-        else
-            throw(ArgumentError("unsupported compression type: $Z"))
-        end
+        return CompressedBuffer(transcode(comp, y), length(y))
     end
 end
 
-compress(Z::Meta.CompressionType, x) = compress(Z, convert(Array, x))
+compress(Z::Meta.CompressionType, comp, x) = compress(Z, comp, convert(Array, x))
 
 abstract type ArrowVector{T} <: AbstractVector{T} end
 
@@ -39,14 +33,14 @@ validitybitmap(x::ArrowVector) = x.validity
 nullcount(x::ArrowVector) = validitybitmap(x).nc
 getmetadata(x::ArrowVector) = x.metadata
 
-function toarrowvector(x, de=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Symbol}=nothing, kw...)
+function toarrowvector(x, de=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, LZ4FrameCompressor, ZstdCompressor}=nothing, kw...)
     @debug 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $kw"
     @debug 3 x
     A = arrowvector(x, de, meta; compression=compression, kw...)
-    if compression === :lz4
-        A = compress(Meta.CompressionType.LZ4_FRAME, A)
-    elseif compression === :zstd
-        A = compress(Meta.CompressionType.ZSTD, A)
+    if compression isa LZ4FrameCompressor
+        A = compress(Meta.CompressionType.LZ4_FRAME, compression, A)
+    elseif compression isa ZstdCompressor
+        A = compress(Meta.CompressionType.ZSTD, compression, A)
     end
     @debug 2 "converted top-level column to arrow format: $(typeof(A))"
     @debug 3 A
@@ -83,7 +77,7 @@ function arrowvector(::Type{S}, ::Type{T}, x, de, meta; kw...) where {S, T}
 end
 
 arrowvector(::NullType, ::Type{Missing}, ::Type{Missing}, x, de, meta; kw...) = MissingVector(length(x))
-compress(Z::Meta.CompressionType, v::MissingVector) =
+compress(Z::Meta.CompressionType, comp, v::MissingVector) =
     Compressed{Z, MissingVector}(v, CompressedBuffer[], length(v), length(v), Compressed[])
 
 struct ValidityBitmap <: ArrowVector{Bool}
@@ -93,8 +87,8 @@ struct ValidityBitmap <: ArrowVector{Bool}
     nc::Int # null count
 end
 
-compress(Z::Meta.CompressionType, v::ValidityBitmap) =
-    v.nc == 0 ? CompressedBuffer(UInt8[], 0) : compress(Z, view(v.bytes, v.pos:(v.pos + bitpackedbytes(v.ℓ) - 1)))
+compress(Z::Meta.CompressionType, comp, v::ValidityBitmap) =
+    v.nc == 0 ? CompressedBuffer(UInt8[], 0) : compress(Z, comp, view(v.bytes, v.pos:(v.pos + bitpackedbytes(v.ℓ) - 1)))
 
 Base.size(p::ValidityBitmap) = (p.ℓ,)
 nullcount(x::ValidityBitmap) = x.nc
@@ -206,11 +200,11 @@ end
     return v
 end
 
-function compress(Z::Meta.CompressionType, p::P) where {P <: Primitive}
+function compress(Z::Meta.CompressionType, comp, p::P) where {P <: Primitive}
     len = length(p)
     nc = nullcount(p)
-    validity = compress(Z, p.validity)
-    data = compress(Z, p.data)
+    validity = compress(Z, comp, p.validity)
+    data = compress(Z, comp, p.data)
     return Compressed{Z, P}(p, [validity, data], len, nc, Compressed[])
 end
 
@@ -276,17 +270,17 @@ end
 
 # end
 
-function compress(Z::Meta.CompressionType, x::List{T, O, A}) where {T, O, A}
+function compress(Z::Meta.CompressionType, comp, x::List{T, O, A}) where {T, O, A}
     len = length(x)
     nc = nullcount(x)
-    validity = compress(Z, x.validity)
-    offsets = compress(Z, x.offsets.offsets)
+    validity = compress(Z, comp, x.validity)
+    offsets = compress(Z, comp, x.offsets.offsets)
     buffers = [validity, offsets]
     children = Compressed[]
     if eltype(A) == UInt8
-        push!(buffers, compress(Z, x.data))
+        push!(buffers, compress(Z, comp, x.data))
     else
-        push!(children, compress(Z, x.data))
+        push!(children, compress(Z, comp, x.data))
     end
     return Compressed{Z, typeof(x)}(x, buffers, len, nc, children)
 end
@@ -342,16 +336,16 @@ end
     return v
 end
 
-function compress(Z::Meta.CompressionType, x::FixedSizeList{T, A}) where {T, A}
+function compress(Z::Meta.CompressionType, comp, x::FixedSizeList{T, A}) where {T, A}
     len = length(x)
     nc = nullcount(x)
-    validity = compress(Z, x.validity)
+    validity = compress(Z, comp, x.validity)
     buffers = [validity]
     children = Compressed[]
     if eltype(A) == UInt8
-        push!(buffers, compress(Z, x.data))
+        push!(buffers, compress(Z, comp, x.data))
     else
-        push!(children, compress(Z, x.data))
+        push!(children, compress(Z, comp, x.data))
     end
     return Compressed{Z, typeof(x)}(x, buffers, len, nc, children)
 end
@@ -389,14 +383,14 @@ end
     end
 end
 
-function compress(Z::Meta.CompressionType, x::A) where {A <: Map}
+function compress(Z::Meta.CompressionType, comp, x::A) where {A <: Map}
     len = length(x)
     nc = nullcount(x)
-    validity = compress(Z, x.validity)
-    offsets = compress(Z, x.offsets.offsets)
+    validity = compress(Z, comp, x.validity)
+    offsets = compress(Z, comp, x.offsets.offsets)
     buffers = [validity, offsets]
     children = Compressed[]
-    push!(children, compress(Z, x.data))
+    push!(children, compress(Z, comp, x.data))
     return Compressed{Z, A}(x, buffers, len, nc, children)
 end
 
@@ -452,14 +446,14 @@ end
     return v
 end
 
-function compress(Z::Meta.CompressionType, x::A) where {A <: Struct}
+function compress(Z::Meta.CompressionType, comp, x::A) where {A <: Struct}
     len = length(x)
     nc = nullcount(x)
-    validity = compress(Z, x.validity)
+    validity = compress(Z, comp, x.validity)
     buffers = [validity]
     children = Compressed[]
     for y in x.data
-        push!(children, compress(Z, y))
+        push!(children, compress(Z, comp, y))
     end
     return Compressed{Z, A}(x, buffers, len, nc, children)
 end
@@ -515,15 +509,15 @@ end
     return v
 end
 
-function compress(Z::Meta.CompressionType, x::A) where {A <: DenseUnion}
+function compress(Z::Meta.CompressionType, comp, x::A) where {A <: DenseUnion}
     len = length(x)
     nc = nullcount(x)
-    typeIds = compress(Z, x.typeIds)
-    offsets = compress(Z, x.offsets)
+    typeIds = compress(Z, comp, x.typeIds)
+    offsets = compress(Z, comp, x.offsets)
     buffers = [typeIds, offsets]
     children = Compressed[]
     for y in x.data
-        push!(children, compress(Z, y))
+        push!(children, compress(Z, comp, y))
     end
     return Compressed{Z, A}(x, buffers, len, nc, children)
 end
@@ -554,14 +548,14 @@ end
     return v
 end
 
-function compress(Z::Meta.CompressionType, x::A) where {A <: SparseUnion}
+function compress(Z::Meta.CompressionType, comp, x::A) where {A <: SparseUnion}
     len = length(x)
     nc = nullcount(x)
-    typeIds = compress(Z, x.typeIds)
+    typeIds = compress(Z, comp, x.typeIds)
     buffers = [typeIds]
     children = Compressed[]
     for y in x.data
-        push!(children, compress(Z, y))
+        push!(children, compress(Z, comp, y))
     end
     return Compressed{Z, A}(x, buffers, len, nc, children)
 end
@@ -702,10 +696,10 @@ function Base.copy(x::DictEncoded{T, S}) where {T, S}
     return PooledArray(PooledArrays.RefArray(refs), Dict{T, S}(val => i for (i, val) in enumerate(pool)), pool)
 end
 
-function compress(Z::Meta.CompressionType, x::A) where {A <: DictEncoded}
+function compress(Z::Meta.CompressionType, comp, x::A) where {A <: DictEncoded}
     len = length(x)
     nc = nullcount(x)
-    validity = compress(Z, x.validity)
-    inds = compress(Z, x.indices)
+    validity = compress(Z, comp, x.validity)
+    inds = compress(Z, comp, x.indices)
     return Compressed{Z, A}(x, [validity, inds], len, nc, Compressed[])
 end

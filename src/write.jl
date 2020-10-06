@@ -27,7 +27,7 @@ By default, `Arrow.write` will use multiple threads to write multiple
 record batches simultaneously (e.g. if julia is started with `julia -t 8`).
 
 Supported keyword arguments to `Arrow.write` include:
-  * `compress::Symbol`: possible values include `:lz4` or `:zstd`; will cause all buffers in each record batch to use the respective compression encoding
+  * `compress`: possible values include `:lz4`, `:zstd`, or your own initialized `LZ4FrameCompressor` or `ZstdCompressor` objects; will cause all buffers in each record batch to use the respective compression encoding
   * `dictencode::Bool=false`: whether all columns should use dictionary encoding when being written
   * `dictencodenested::Bool=false`: whether nested data type columns should also dict encode nested arrays/buffers; many other implementations don't support this
   * `denseunions::Bool=true`: whether Julia `Vector{<:Union}` arrays should be written using the dense union layout; passing `false` will result in the sparse union layout
@@ -36,14 +36,14 @@ Supported keyword arguments to `Arrow.write` include:
 """
 function write end
 
-function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false)
+function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false)
     open(file, "w") do io
         write(io, tbl, true, largelists, compress, denseunions, dictencode, dictencodenested)
     end
     return file
 end
 
-function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, file::Bool=false)
+function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, file::Bool=false)
     return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested)
 end
 
@@ -102,6 +102,13 @@ function Base.close(ch::OrderedChannel)
 end
 
 function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested)
+    if compress === :lz4
+        compress = LZ4_FRAME_COMPRESSOR[]
+    elseif compress === :zstd
+        compress = ZSTD_COMPRESSOR[]
+    elseif compress isa Symbol
+        throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
+    end
     if writetofile
         @debug 1 "starting write of arrow formatted file"
         Base.write(io, "ARROW1\0\0")

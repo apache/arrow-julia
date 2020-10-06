@@ -50,6 +50,10 @@ Read an arrow formatted table, from:
 
 Returns a `Arrow.Table` object that allows column access via `table.col1`, `table[:col1]`, or `table[1]`.
 
+NOTE: the columns in an `Arrow.Table` are views into the original arrow memory, and hence are not easily
+modifiable (with e.g. `push!`, `append!`, etc.). To mutate arrow columns, call `copy(x)` to materialize
+the arrow data as a normal Julia array.
+
 `Arrow.Table` also satisfies the Tables.jl interface, and so can easily be materialized via any supporting
 sink function: e.g. `DataFrame(Arrow.Table(file))`, `SQLite.load!(db, "table", Arrow.Table(file))`, etc.
 
@@ -117,7 +121,7 @@ By default, `Arrow.write` will use multiple threads to write multiple
 record batches simultaneously (e.g. if julia is started with `julia -t 8`).
 
 Supported keyword arguments to `Arrow.write` include:
-  * `compress::Symbol`: possible values include `:lz4` or `:zstd`; will cause all buffers in each record batch to use the respective compression encoding
+  * `compress`: possible values include `:lz4`, `:zstd`, or your own initialized `LZ4FrameCompressor` or `ZstdCompressor` objects; will cause all buffers in each record batch to use the respective compression encoding
   * `dictencode::Bool=false`: whether all columns should use dictionary encoding when being written
   * `dictencodenested::Bool=false`: whether nested data type columns should also dict encode nested arrays/buffers; many other implementations don't support this
   * `denseunions::Bool=true`: whether Julia `Vector{<:Union}` arrays should be written using the dense union layout; passing `false` will result in the sparse union layout
