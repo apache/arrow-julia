@@ -41,6 +41,7 @@ ArrowType(::Type{Bool}) = PrimitiveType()
 
 struct ListType <: ArrowType end
 
+# isstringtype MUST BE UTF8 (other codeunit sizes not supported; arrow encoding for strings is specifically UTF8)
 isstringtype(T) = false
 isstringtype(::Type{Union{T, Missing}}) where {T} = isstringtype(T)
 
@@ -57,11 +58,8 @@ ArrowType(::Type{<:AbstractArray}) = ListType()
 struct FixedSizeListType <: ArrowType end
 
 ArrowType(::Type{NTuple{N, T}}) where {N, T} = FixedSizeListType()
+gettype(::Type{NTuple{N, T}}) where {N, T} = T
 getsize(::Type{NTuple{N, T}}) where {N, T} = N
-
-struct MapType <: ArrowType end
-
-ArrowType(::Type{<:Dict}) = MapType()
 
 struct StructType <: ArrowType end
 
@@ -71,6 +69,11 @@ ArrowType(::Type{<:NamedTuple}) = StructType()
 
 structtype(::Type{NamedTuple{N, T}}) where {N, T} = NAMEDTUPLE
 structtype(::Type{T}) where {T} = STRUCT
+
+# must implement keytype, valtype
+struct MapType <: ArrowType end
+
+ArrowType(::Type{<:AbstractDict}) = MapType()
 
 struct UnionType <: ArrowType end
 
