@@ -517,3 +517,31 @@ function build(f::Meta.Field, ::L, batch, rb, de, nodeidx, bufferidx, convert) w
     @debug 2 "final julia type for primitive: T = $T"
     return Primitive(T, bytes, validity, A, len, meta), nodeidx + 1, bufferidx + 1
 end
+
+function build(f::Meta.Field, L::Meta.Bool, batch, rb, de, nodeidx, bufferidx, convert)
+    @debug 2 "building array: L = $L"
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx)
+    bufferidx += 1
+    buffer = rb.buffers[bufferidx]
+    meta = buildmetadata(f.custom_metadata)
+    # get storage type (non-converted)
+    T = juliaeltype(f, nothing, false)
+    @debug 2 "storage type for primitive: T = $T"
+    buffer = rb.buffers[bufferidx]
+    voff = batch.pos + buffer.offset
+    node = rb.nodes[nodeidx]
+    if rb.compression === nothing
+        decodedbytes = batch.bytes
+        pos = voff
+        # return ValidityBitmap(batch.bytes, voff, node.length, node.null_count)
+    else
+        # compressed
+        ptr = pointer(batch.bytes, voff)
+        _, decodedbytes = uncompress(ptr, buffer, rb.compression)
+        pos = 1
+        # return ValidityBitmap(decodedbytes, 1, node.length, node.null_count)
+    end
+    len = rb.nodes[nodeidx].length
+    T = juliaeltype(f, meta, convert)
+    return BoolVector{T}(decodedbytes, pos, validity, len, meta), nodeidx + 1, bufferidx + 1
+end

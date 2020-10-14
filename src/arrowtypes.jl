@@ -16,7 +16,7 @@
 
 module ArrowTypes
 
-export ArrowType, NullType, PrimitiveType, ListType, FixedSizeListType, MapType, StructType, UnionType, DictEncodedType
+export ArrowType, NullType, PrimitiveType, BoolType, ListType, FixedSizeListType, MapType, StructType, UnionType, DictEncodedType
 
 abstract type ArrowType end
 
@@ -37,7 +37,9 @@ struct PrimitiveType <: ArrowType end
 
 ArrowType(::Type{<:Integer}) = PrimitiveType()
 ArrowType(::Type{<:AbstractFloat}) = PrimitiveType()
-ArrowType(::Type{Bool}) = PrimitiveType()
+
+struct BoolType <: ArrowType end
+ArrowType(::Type{Bool}) = BoolType()
 
 struct ListType <: ArrowType end
 

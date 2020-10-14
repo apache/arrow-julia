@@ -152,6 +152,7 @@ end
 
 include("compressed.jl")
 include("primitive.jl")
+include("bool.jl")
 include("list.jl")
 include("fixedsizelist.jl")
 include("map.jl")
