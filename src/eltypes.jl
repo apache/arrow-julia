@@ -328,7 +328,7 @@ function juliaeltype(f::Meta.Field, list::Meta.FixedSizeList, convert)
 end
 
 function arrowtype(b, x::FixedSizeList{T, A}) where {T, A}
-    N = getN(Base.nonmissingtype(T))
+    N = ArrowTypes.getsize(Base.nonmissingtype(T))
     if eltype(A) == UInt8
         Meta.fixedSizeBinaryStart(b)
         Meta.fixedSizeBinaryAddByteWidth(b, Int32(N))
@@ -362,7 +362,6 @@ keyvalueV(::Type{KeyValue{K, V}}) where {K, V} = V
 Base.length(kv::KeyValue) = 1
 Base.iterate(kv::KeyValue, st=1) = st === nothing ? nothing : (kv, nothing)
 ArrowTypes.default(::Type{KeyValue{K, V}}) where {K, V} = KeyValue(default(K), default(V))
-getnames(::Type{KeyValue{K, V}}) where {K, V} = (:key, :value)
 
 function arrowtype(b, ::Type{KeyValue{K, V}}) where {K, V}
     children = [fieldoffset(b, "key", K), fieldoffset(b, "value", V)]
@@ -377,7 +376,7 @@ function juliaeltype(f::Meta.Field, list::Meta.Struct, convert)
 end
 
 function arrowtype(b, x::Struct{T, S}) where {T, S}
-    names = getnames(Base.nonmissingtype(T))
+    names = fieldnames(Base.nonmissingtype(T))
     children = [fieldoffset(b, names[i], x.data[i]) for i = 1:length(names)]
     Meta.structStart(b)
     return Meta.Struct, Meta.structEnd(b), children

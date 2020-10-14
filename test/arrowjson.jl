@@ -368,13 +368,13 @@ function FieldData(nm, ::Base.Type{T}, col, dictencodings) where {T}
             OFFSET = Offsets(OFFSET)
             push!(children, FieldData("item", eltype(S), Arrow.flatten(skipmissing(col)), dictencodings))
         elseif S <: NTuple
-            if Arrow.getT(S) == UInt8
+            if Arrow.ArrowTypes.gettype(S) == UInt8
                 DATA = [ismissing(x) ? Arrow.ArrowTypes.default(S) : String(collect(x)) for x in col]
             else
-                push!(children, FieldData("item", Arrow.getT(S), Arrow.flatten(coalesce(x, Arrow.ArrowTypes.default(S)) for x in col), dictencodings))
+                push!(children, FieldData("item", Arrow.ArrowTypes.gettype(S), Arrow.flatten(coalesce(x, Arrow.ArrowTypes.default(S)) for x in col), dictencodings))
             end
         elseif S <: NamedTuple
-            for (nm, typ) in zip(Arrow.getnames(S), Arrow.getT(S))
+            for (nm, typ) in zip(fieldnames(S), fieldtypes(S))
                 push!(children, FieldData(String(nm), typ, (getfield(x, nm) for x in col), dictencodings))
             end
         elseif S <: Arrow.UnionT
@@ -523,18 +523,18 @@ function Base.getindex(x::ArrowArray{T}, i::Base.Int) where {T}
         A = ArrowArray(x.field.children[1], x.fielddata.children[1], x.dictionaries)
         return Dict(y.key => y.value for y in A[(offs[i] + 1):offs[i + 1]])
     elseif S <: Tuple
-        if Arrow.getT(S) == UInt8
+        if Arrow.ArrowTypes.gettype(S) == UInt8
             A = x.fielddata.DATA
             return Tuple(map(UInt8, collect(A[i][1:x.field.type.byteWidth])))
         else
             sz = x.field.type.listSize
-            A = ArrowArray{Arrow.getT(S)}(x.field.children[1], x.fielddata.children[1], x.dictionaries)
+            A = ArrowArray{Arrow.ArrowTypes.gettype(S)}(x.field.children[1], x.fielddata.children[1], x.dictionaries)
             off = (i - 1) * sz + 1
             return Tuple(A[off:(off + sz - 1)])
         end
     elseif S <: NamedTuple
         data = (ArrowArray(x.field.children[j], x.fielddata.children[j], x.dictionaries)[i] for j = 1:length(x.field.children))
-        return NamedTuple{Arrow.getnames(S)}(Tuple(data))
+        return NamedTuple{fieldnames(S)}(Tuple(data))
     elseif S == Int64 || S == UInt64
         return parse(S, x.fielddata.DATA[i])
     elseif S <: Arrow.Decimal
