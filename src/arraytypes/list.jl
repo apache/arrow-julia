@@ -72,7 +72,7 @@ function ToList(input; largelists::Bool=false)
     stringtype = ArrowTypes.isstringtype(ST)
     T = stringtype ? UInt8 : eltype(ST)
     len = stringtype ? ncodeunits : length
-    data = AT[]
+    data = stringtype ? (AT !== ST ? Union{Missing, String}[] : String[]) : AT[]
     I = largelists ? Int64 : Int32
     inds = I[0]
     sizehint!(data, length(input))
@@ -82,6 +82,9 @@ function ToList(input; largelists::Bool=false)
         if x === missing
             push!(data, missing)
         else
+            if stringtype
+              x = convert(String, x)
+            end
             push!(data, x)
             totalsize += len(x)
             if I === Int32 && totalsize > 2147483647
@@ -91,7 +94,7 @@ function ToList(input; largelists::Bool=false)
         end
         push!(inds, totalsize)
     end
-    return ToList{T, stringtype, AT, I}(data, inds)
+    return ToList{T, stringtype, eltype(data), I}(data, inds)
 end
 
 Base.IndexStyle(::Type{<:ToList}) = Base.IndexLinear()
@@ -183,7 +186,7 @@ function arrowvector(::ListType, x, de, meta; largelists::Bool=false, kw...)
     else
         data = arrowvector(flat, de, nothing; lareglists=largelists, kw...)
     end
-    return List{eltype(x), eltype(flat.inds), typeof(data)}(UInt8[], validity, offsets, data, len, meta)
+    return List{eltype(flat.data), eltype(flat.inds), typeof(data)}(UInt8[], validity, offsets, data, len, meta)
 end
 
 function compress(Z::Meta.CompressionType, comp, x::List{T, O, A}) where {T, O, A}
