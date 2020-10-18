@@ -51,7 +51,7 @@ Read an arrow formatted table, from:
 Returns a `Arrow.Table` object that allows column access via `table.col1`, `table[:col1]`, or `table[1]`.
 
 The Apache Arrow standard is foremost a "columnar" format and saves a variety of metadata with each column (such as column name, type, length, etc.).
-A data set which has tens of thousands of columns will most likely break `Arrow.Table` or cause dramatic file size increases when one saves to a `arrow` file.
+A data set which has tens of thousands of columns is probably not well suited for the arrow format and may cause dramatic file size increases when one saves to a `arrow` file.
 If it is possible to reshape the data such that there are not as many columns, `Arrow.Table` should not have as many problems. 
 A simple method Julia provides is to simply execute `transpose(data)` to switch the rows and columns of your data if that does not interfere with one's analysis.
 
