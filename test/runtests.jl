@@ -73,6 +73,26 @@ tt, st = state
 
 @test iterate(str, st) === nothing
 
+# dictionary batch isDelta
+t = (
+    col1=Int64[1,2,3,4],
+    col2=Union{String, Missing}["hey", "there", "sailor", missing],
+    col3=NamedTuple{(:a, :b), Tuple{Int64, Union{Missing, NamedTuple{(:c,), Tuple{String}}}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b=(c="sailor",)), (a=Int64(4), b=(c="jo-bob",))]
+)
+t2 = (
+    col1=Int64[1,2,5,6],
+    col2=Union{String, Missing}["hey", "there", "sailor2", missing],
+    col3=NamedTuple{(:a, :b), Tuple{Int64, Union{Missing, NamedTuple{(:c,), Tuple{String}}}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(5), b=(c="sailor2",)), (a=Int64(4), b=(c="jo-bob",))]
+)
+tt = Tables.partitioner((t, t2))
+io = IOBuffer()
+Arrow.write(io, tt; dictencode=true, dictencodenested=true)
+seekstart(io)
+tt = Arrow.Table(io)
+@test tt.col1 == [1,2,3,4,1,2,5,6]
+@test isequal(tt.col2, ["hey", "there", "sailor", missing, "hey", "there", "sailor2", missing])
+@test isequal(tt.col3, vcat(NamedTuple{(:a, :b), Tuple{Int64, Union{Missing, NamedTuple{(:c,), Tuple{String}}}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b=(c="sailor",)), (a=Int64(4), b=(c="jo-bob",))], NamedTuple{(:a, :b), Tuple{Int64, Union{Missing, NamedTuple{(:c,), Tuple{String}}}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(5), b=(c="sailor2",)), (a=Int64(4), b=(c="jo-bob",))]))
+
 t = (col1=Int64[1,2,3,4,5,6,7,8,9,10],)
 meta = Dict("key1" => "value1", "key2" => "value2")
 Arrow.setmetadata!(t, meta)

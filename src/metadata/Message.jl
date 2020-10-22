@@ -127,8 +127,8 @@ function Base.getproperty(x::DictionaryBatch, field::Symbol)
             return FlatBuffers.init(RecordBatch, FlatBuffers.bytes(x), y)
         end
     elseif field === :isDelta
-        o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), Bool)
+        o = FlatBuffers.offset(x, 8)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), Base.Bool)
         return false
     end
     return nothing

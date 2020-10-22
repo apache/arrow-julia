@@ -83,14 +83,14 @@ end
     return x, (i + 1, chunk, chunk_i, len)
 end
 
-function arrowvector(::FixedSizeListType, x, de, meta; kw...)
+function arrowvector(::FixedSizeListType, x, i, nl, fi, de, ded, meta; kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     flat = ToFixedSizeList(x)
     if eltype(flat) == UInt8
         data = flat
     else
-        data = arrowvector(flat, de, nothing; kw...)
+        data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; kw...)
     end
     return FixedSizeList{eltype(x), typeof(data)}(UInt8[], validity, data, len, meta)
 end

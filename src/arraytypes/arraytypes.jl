@@ -22,10 +22,10 @@ validitybitmap(x::ArrowVector) = x.validity
 nullcount(x::ArrowVector) = validitybitmap(x).nc
 getmetadata(x::ArrowVector) = x.metadata
 
-function toarrowvector(x, de=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, LZ4FrameCompressor, ZstdCompressor}=nothing, kw...)
+function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, LZ4FrameCompressor, ZstdCompressor}=nothing, kw...)
     @debug 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(kw.data)"
     @debug 3 x
-    A = arrowvector(x, de, meta; compression=compression, kw...)
+    A = arrowvector(x, i, 0, 0, de, ded, meta; compression=compression, kw...)
     if compression isa LZ4FrameCompressor
         A = compress(Meta.CompressionType.LZ4_FRAME, compression, A)
     elseif compression isa ZstdCompressor
@@ -36,36 +36,35 @@ function toarrowvector(x, de=DictEncoding[], meta=getmetadata(x); compression::U
     return A
 end
 
-function arrowvector(x, de, meta; dictencoding::Bool=false, dictencode::Bool=false, kw...)
+function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dictencode::Bool=false, kw...)
     if !(x isa DictEncode) && !dictencoding && (dictencode || (x isa AbstractArray && DataAPI.refarray(x) !== x))
-        x = DictEncode(x)
+        x = DictEncode(x, dictencodeid(i, nl, fi))
     end
-    T = eltype(x)
-    S = maybemissing(T)
-    return arrowvector(S, T, x, de, meta; kw...)
+    S = maybemissing(eltype(x))
+    return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)
 end
 
 # conversions to arrow types
-arrowvector(::Type{Dates.Date}, ::Type{S}, x, de, meta; kw...) where {S} =
-    arrowvector(converter(DATE, x), de, meta; kw...)
-arrowvector(::Type{Dates.Time}, ::Type{S}, x, de, meta; kw...) where {S} =
-    arrowvector(converter(TIME, x), de, meta; kw...)
-arrowvector(::Type{Dates.DateTime}, ::Type{S}, x, de, meta; kw...) where {S} =
-    arrowvector(converter(DATETIME, x), de, meta; kw...)
-arrowvector(::Type{P}, ::Type{S}, x, de, meta; kw...) where {P <: Dates.Period, S} =
-    arrowvector(converter(Duration{arrowperiodtype(P)}, x), de, meta; kw...)
+arrowvector(::Type{Dates.Date}, x, i, nl, fi, de, ded, meta; kw...) =
+    arrowvector(converter(DATE, x), i, nl, fi, de, ded, meta; kw...)
+arrowvector(::Type{Dates.Time}, x, i, nl, fi, de, ded, meta; kw...) =
+    arrowvector(converter(TIME, x), i, nl, fi, de, ded, meta; kw...)
+arrowvector(::Type{Dates.DateTime}, x, i, nl, fi, de, ded, meta; kw...) =
+    arrowvector(converter(DATETIME, x), i, nl, fi, de, ded, meta; kw...)
+arrowvector(::Type{P}, x, i, nl, fi, de, ded, meta; kw...) where {P <: Dates.Period} =
+    arrowvector(converter(Duration{arrowperiodtype(P)}, x), i, nl, fi, de, ded, meta; kw...)
 
 # fallback that calls ArrowType
-function arrowvector(::Type{S}, ::Type{T}, x, de, meta; kw...) where {S, T}
+function arrowvector(::Type{S}, x, i, nl, fi, de, ded, meta; kw...) where {S}
     if ArrowTypes.istyperegistered(S)
         meta = meta === nothing ? Dict{String, String}() : meta
         arrowtype = ArrowTypes.getarrowtype!(meta, S)
-        return arrowvector(converter(arrowtype, x), de, meta; kw...)
+        return arrowvector(converter(arrowtype, x), i, nl, fi, de, ded, meta; kw...)
     end
-    return arrowvector(ArrowType(S), x, de, meta; kw...)
+    return arrowvector(ArrowType(S), x, i, nl, fi, de, ded, meta; kw...)
 end
 
-arrowvector(::NullType, x, de, meta; kw...) = MissingVector(length(x))
+arrowvector(::NullType, x, i, nl, fi, de, ded, meta; kw...) = MissingVector(length(x))
 compress(Z::Meta.CompressionType, comp, v::MissingVector) =
     Compressed{Z, MissingVector}(v, CompressedBuffer[], length(v), length(v), Compressed[])
 

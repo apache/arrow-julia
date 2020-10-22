@@ -44,7 +44,7 @@ end
     return v
 end
 
-function arrowvector(::BoolType, x, de, meta; kw...)
+function arrowvector(::BoolType, x, i, nl, fi, de, ded, meta; kw...)
     validity = ValidityBitmap(x)
     len = length(x)
     blen = cld(len, 8)

@@ -151,20 +151,20 @@ Base.@propagate_inbounds function Base.getindex(A::ToSparseUnion{T}, i::Integer)
     return @inbounds x isa T ? x : ArrowTypes.default(T)
 end
 
-arrowvector(U::Union, ::Type{S}, x, de, meta; denseunions::Bool=true, kw...) where {S} =
-    arrowvector(denseunions ? DenseUnionVector(x) : SparseUnionVector(x), de, meta; denseunions=denseunions, kw...)
+arrowvector(U::Union, x, i, nl, fi, de, ded, meta; denseunions::Bool=true, kw...) =
+    arrowvector(denseunions ? DenseUnionVector(x) : SparseUnionVector(x), i, nl, fi, de, ded, meta; denseunions=denseunions, kw...)
 
-function arrowvector(::UnionType, x, de, meta; kw...)
+function arrowvector(::UnionType, x, i, nl, fi, de, ded, meta; kw...)
     UT = eltype(x)
     if unionmode(UT) == Meta.UnionMode.Dense
         x = x isa DenseUnionVector ? x.itr : x
         typeids, offsets, data = todense(UT, x)
-        data2 = map(y -> arrowvector(y, de, nothing; kw...), data)
+        data2 = map(y -> arrowvector(y[2], i, nl + 1, y[1], de, ded, nothing; kw...), enumerate(data))
         return DenseUnion{UT, typeof(data2)}(UInt8[], UInt8[], typeids, offsets, data2, meta)
     else
         x = x isa SparseUnionVector ? x.itr : x
         typeids = sparsetypeids(UT, x)
-        data3 = Tuple(arrowvector(ToSparseUnion(fieldtype(eltype(UT), i), x), de, nothing; kw...) for i = 1:fieldcount(eltype(UT)))
+        data3 = Tuple(arrowvector(ToSparseUnion(fieldtype(eltype(UT), j), x), i, nl + 1, j, de, ded, nothing; kw...) for j = 1:fieldcount(eltype(UT)))
         return SparseUnion{UT, typeof(data3)}(UInt8[], typeids, data3, meta)
     end
 end

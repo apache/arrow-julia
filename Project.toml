@@ -1,6 +1,6 @@
 name = "Arrow"
 uuid = "69666777-d1a9-59fb-9406-91d4454c9d45"
-authors = ["quinnj <quinn.jacobd@gmail.com>", "ExpandingMan <expandingman@protonmail.com"]
+authors = ["quinnj <quinn.jacobd@gmail.com>"]
 version = "0.3.0"
 
 [deps]
