@@ -179,9 +179,7 @@ testtables = [
   (
     "nesteddictencode keyword",
     (
-      col1=Int64[1,2,3,4],
-      col2=Union{String, Missing}["hey", "there", "sailor", missing],
-      col3=Arrow.DictEncode(NamedTuple{(:a, :b), Tuple{Int64, Union{String, Missing}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b="sailor"), (a=Int64(4), b="jo-bob")]),
+      col1=NamedTuple{(:a, :b), Tuple{Int64, Union{Missing, NamedTuple{(:c,), Tuple{String}}}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b=(c="sailor",)), (a=Int64(4), b=(c="jo-bob",))],
     ),
     (dictencode=true, dictencodenested=true,),
     NamedTuple(),

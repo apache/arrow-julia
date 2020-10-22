@@ -67,14 +67,14 @@ Base.size(x::ToStruct) = (length(x.data),)
 Base.@propagate_inbounds function Base.getindex(A::ToStruct{T, j}, i::Integer) where {T, j}
     @boundscheck checkbounds(A, i)
     @inbounds x = A.data[i]
-    return @miss_or(x, @inbounds getfield(x, j))
+    return x === missing ? ArrowTypes.default(T) : getfield(x, j)
 end
 
-function arrowvector(::StructType, x, de, meta; kw...)
+function arrowvector(::StructType, x, i, nl, fi, de, ded, meta; kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     T = Base.nonmissingtype(eltype(x))
-    data = Tuple(arrowvector(ToStruct(x, i), de, nothing; kw...) for i = 1:fieldcount(T))
+    data = Tuple(arrowvector(ToStruct(x, j), i, nl + 1, j, de, ded, nothing; kw...) for j = 1:fieldcount(T))
     return Struct{eltype(x), typeof(data)}(validity, data, len, meta)
 end
 

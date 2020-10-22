@@ -64,60 +64,6 @@ function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Sym
     return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment)
 end
 
-@static if VERSION >= v"1.3"
-    const Cond = Threads.Condition
-else
-    const Cond = Condition
-end
-
-struct OrderedChannel{T}
-    chan::Channel{T}
-    cond::Cond
-    i::Ref{Int}
-end
-
-OrderedChannel{T}(sz) where {T} = OrderedChannel{T}(Channel{T}(sz), Threads.Condition(), Ref(1))
-Base.iterate(ch::OrderedChannel, st...) = iterate(ch.chan, st...)
-
-macro lock(obj, expr)
-    esc(quote
-    @static if VERSION >= v"1.3"
-        lock($obj)
-    end
-        try
-            $expr
-        finally
-            @static if VERSION >= v"1.3"
-                unlock($obj)
-            end
-        end
-    end)
-end
-
-function Base.put!(ch::OrderedChannel{T}, x::T, i::Integer, incr::Bool=false) where {T}
-    @lock ch.cond begin
-        while ch.i[] < i
-            wait(ch.cond)
-        end
-        put!(ch.chan, x)
-        if incr
-            ch.i[] += 1
-        end
-        notify(ch.cond)
-    end
-    return
-end
-
-function Base.close(ch::OrderedChannel)
-    @lock ch.cond begin
-        while Base.n_waiters(ch.cond) > 0
-            wait(ch.cond)
-        end
-        close(ch.chan)
-    end
-    return
-end
-
 function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment)
     if compress === :lz4
         compress = LZ4_FRAME_COMPRESSOR[]
@@ -134,82 +80,45 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     # build messages
     sch = Ref{Tables.Schema}()
     firstcols = Ref{Any}()
-    dictencodingvalues = Dict{Int, Set}()
+    dictencodings = Dict{Int64, Any}() # Lockable{DictEncoding}
     blocks = (Block[], Block[])
     # start message writing from channel
-@static if VERSION >= v"1.3-DEV"
     tsk = Threads.@spawn for msg in msgs
         Base.write(io, msg, blocks, sch, alignment)
     end
-else
-    tsk = @async for msg in msgs
-        Base.write(io, msg, blocks, sch, alignment)
-    end
-end
     @sync for (i, tbl) in enumerate(Tables.partitions(source))
         @debug 1 "processing table partition i = $i"
         if i == 1
-            cols = toarrowtable(tbl, largelists, compress, denseunions, dictencode, dictencodenested)
+            cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested)
             sch[] = Tables.schema(cols)
             firstcols[] = cols
             put!(msgs, makeschemamsg(sch[], cols), i)
-            if !isempty(cols.dictencodings)
-                for de in cols.dictencodings
-                    dictencodingvalues[de.id] = Set(z for z in de.data)
+            if !isempty(dictencodings)
+                des = sort!(collect(dictencodings); by=x->x.first, rev=true)
+                for (id, delock) in des
+                    # assign dict encoding ids
+                    de = delock.x
                     dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                    put!(msgs, makedictionarybatchmsg(dictsch, (col=de.data,), de.id, false, alignment), i)
+                    put!(msgs, makedictionarybatchmsg(dictsch, (col=de.data,), id, false, alignment), i)
                 end
             end
             put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
         else
-@static if VERSION >= v"1.3-DEV"
             Threads.@spawn begin
-                try
-                    cols = toarrowtable(tbl, largelists, compress, denseunions, dictencode, dictencodenested)
-                    if !isempty(cols.dictencodings)
-                        for de in cols.dictencodings
-                            dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                            existing = dictencodingvalues[de.id]
-                            # get new de.data we haven't seen before for delta update
-                            vals = setdiff(de.data, existing)
-                            if !isempty(vals)
-                                put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), de.id, true, alignment), i)
-                                # add new de.data to existing set for future diffs
-                                union!(existing, vals)
-                            end
-                        end
+                cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested)
+                if !isempty(cols.dictencodingdeltas)
+                    for de in cols.dictencodingdeltas
+                        dictsch = Tables.Schema((:col,), (eltype(de.data),))
+                        put!(msgs, makedictionarybatchmsg(dictsch, (col=de.data,), de.id, true, alignment), i)
                     end
-                    put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
-                catch e
-                    showerror(stdout, e, catch_backtrace())
-                    rethrow(e)
                 end
+                put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
             end
-else
-            @async begin
-                try
-                    cols = toarrowtable(tbl, largelists, compress, denseunions, dictencode, dictencodenested)
-                    if !isempty(cols.dictencodings)
-                        for de in cols.dictencodings
-                            dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                            existing = dictencodingvalues[de.id]
-                            # get new de.data we haven't seen before for delta update
-                            vals = setdiff(de.data, existing)
-                            put!(msgs, makedictionarybatchmsg(dictsch, (col=vals,), de.id, true, alignment), i)
-                            # add new de.data to existing set for future diffs
-                            union!(existing, vals)
-                        end
-                    end
-                    put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
-                catch e
-                    showerror(stdout, e, catch_backtrace())
-                    rethrow(e)
-                end
-            end
-end
         end
     end
+    # close our message-writing channel, no further put!-ing is allowed
     close(msgs)
+    # now wait for our message-writing task to finish writing
     wait(tsk)
     # write empty message
     if !writetofile
@@ -257,10 +166,10 @@ struct ToArrowTable
     sch::Tables.Schema
     cols::Vector{Any}
     metadata::Union{Nothing, Dict{String, String}}
-    dictencodings::Vector{DictEncoding}
+    dictencodingdeltas::Vector{DictEncoding}
 end
 
-function toarrowtable(x, largelists, compress, denseunions, dictencode, dictencodenested)
+function toarrowtable(x, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested)
     @debug 1 "converting input table to arrow formatted columns"
     cols = Tables.columns(x)
     meta = getmetadata(cols)
@@ -269,17 +178,13 @@ function toarrowtable(x, largelists, compress, denseunions, dictencode, dictenco
     N = length(types)
     newcols = Vector{Any}(undef, N)
     newtypes = Vector{Type}(undef, N)
-    dictencodings = DictEncoding[]
+    dictencodingdeltas = DictEncoding[]
     Tables.eachcolumn(sch, cols) do col, i, nm
-        newcol = toarrowvector(col, dictencodings; compression=compress, largelists=largelists, denseunions=denseunions, dictencode=dictencode, dictencodenested=dictencodenested)
+        newcol = toarrowvector(col, i, dictencodings, dictencodingdeltas; compression=compress, largelists=largelists, denseunions=denseunions, dictencode=dictencode, dictencodenested=dictencodenested)
         newtypes[i] = eltype(newcol)
         newcols[i] = newcol
     end
-    # assign dict encoding ids
-    for (i, de) in enumerate(dictencodings)
-        de.id = i - 1
-    end
-    return ToArrowTable(Tables.Schema(sch.names, newtypes), newcols, meta, dictencodings)
+    return ToArrowTable(Tables.Schema(sch.names, newtypes), newcols, meta, dictencodingdeltas)
 end
 
 Tables.columns(x::ToArrowTable) = x

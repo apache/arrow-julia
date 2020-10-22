@@ -173,7 +173,7 @@ end
     return x, (i, chunk, chunk_i, chunk_len, len)
 end
 
-function arrowvector(::ListType, x, de, meta; largelists::Bool=false, kw...)
+function arrowvector(::ListType, x, i, nl, fi, de, ded, meta; largelists::Bool=false, kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     flat = ToList(x; largelists=largelists)
@@ -181,7 +181,7 @@ function arrowvector(::ListType, x, de, meta; largelists::Bool=false, kw...)
     if eltype(flat) == UInt8 # binary or utf8string
         data = flat
     else
-        data = arrowvector(flat, de, nothing; lareglists=largelists, kw...)
+        data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; lareglists=largelists, kw...)
     end
     return List{eltype(x), eltype(flat.inds), typeof(data)}(UInt8[], validity, offsets, data, len, meta)
 end

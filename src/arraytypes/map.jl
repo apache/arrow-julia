@@ -37,7 +37,7 @@ end
 keyvalues(KT, ::Missing) = missing
 keyvalues(KT, x::AbstractDict) = [KT(k, v) for (k, v) in pairs(x)]
 
-function arrowvector(::MapType, x, de, meta; largelists::Bool=false, kw...)
+function arrowvector(::MapType, x, i, nl, fi, de, ded, meta; largelists::Bool=false, kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     ET = eltype(x)
@@ -47,7 +47,7 @@ function arrowvector(::MapType, x, de, meta; largelists::Bool=false, kw...)
     T = DT !== ET ? Union{Missing, VT} : VT
     flat = ToList(T[keyvalues(KT, y) for y in x]; largelists=largelists)
     offsets = Offsets(UInt8[], flat.inds)
-    data = arrowvector(flat, de, nothing; lareglists=largelists, kw...)
+    data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; lareglists=largelists, kw...)
     return Map{ET, eltype(flat.inds), typeof(data)}(validity, offsets, data, len, meta)
 end
 

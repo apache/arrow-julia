@@ -33,10 +33,11 @@ struct DictEncodeType{T} end
 getT(::Type{DictEncodeType{T}}) where {T} = T
 
 struct DictEncode{T, A} <: AbstractVector{DictEncodeType{T}}
+    id::Int64
     data::A
 end
 
-DictEncode(x::A) where {A} = DictEncode{eltype(A), A}(x)
+DictEncode(x::A, id=-1) where {A} = DictEncode{eltype(A), A}(id, x)
 Base.IndexStyle(::Type{<:DictEncode}) = Base.IndexLinear()
 Base.size(x::DictEncode) = (length(x.data),)
 Base.iterate(x::DictEncode, st...) = iterate(x.data, st...)
@@ -69,36 +70,70 @@ indtype(d::D) where {D <: DictEncoded} = indtype(D)
 indtype(::Type{DictEncoded{T, S, A}}) where {T, S, A} = signedtype(S)
 indtype(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = indtype(A)
 
+dictencodeid(colidx, nestedlevel, fieldid) = (Int64(nestedlevel) << 48) | (Int64(fieldid) << 32) | Int64(colidx)
+
 getid(d::DictEncoded) = d.encoding.id
 getid(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = c.data.encoding.id
 
-function arrowvector(::DictEncodedType, x, de, meta; dictencode::Bool=false, dictencodenested::Bool=false, kw...)
+function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode::Bool=false, dictencodenested::Bool=false, kw...)
     @assert x isa DictEncode
+    id = x.id == -1 ? dictencodeid(i, nl, fi) : x.id
     x = x.data
     len = length(x)
     validity = ValidityBitmap(x)
-    if x isa AbstractArray && DataAPI.refarray(x) !== x
-        inds = copy(DataAPI.refarray(x))
+    if !haskey(de, id)
+        # dict encoding doesn't exist yet, so create for 1st time
+        if DataAPI.refarray(x) === x
+            # need to encode ourselves
+            x = PooledArray(x)
+            inds = DataAPI.refarray(x)
+        else
+            inds = copy(DataAPI.refarray(x))
+        end
         # adjust to "offset" instead of index
         for i = 1:length(inds)
             @inbounds inds[i] -= 1
         end
-        pool = DataAPI.refpool(x)
-        data = arrowvector(pool, de, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
-        encoding = DictEncoding{eltype(data), typeof(data)}(0, data, false)
+        data = arrowvector(DataAPI.refpool(x), i, nl, fi, de, ded, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
+        encoding = DictEncoding{eltype(data), typeof(data)}(id, data, false)
+        de[id] = Lockable(encoding)
     else
-        # need to encode ourselves
-        y = PooledArray(x)
-        inds = DataAPI.refarray(y)
-        # adjust to "offset" instead of index
-        for i = 1:length(inds)
-            @inbounds inds[i] = inds[i] - 1
+        # encoding already exists
+          # compute inds based on it
+          # if value doesn't exist in encoding, push! it
+          # also add to deltas updates
+        encodinglockable = de[id]
+        @lock encodinglockable begin
+            encoding = encodinglockable.x
+            pool = Dict(a => (b - 1) for (b, a) in enumerate(encoding))
+            deltas = eltype(x)[]
+            len = length(x)
+            inds = Vector{encodingtype(len)}(undef, len)
+            for (j, val) in enumerate(x)
+                @inbounds inds[j] = get!(pool, val) do
+                    push!(deltas, val)
+                    length(pool)
+                end
+            end
+            if !isempty(deltas)
+                data = arrowvector(deltas, i, nl, fi, de, ded, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
+                push!(ded, DictEncoding{eltype(data), typeof(data)}(id, data, false))
+                if typeof(encoding.data) <: ChainedVector
+                    append!(encoding.data, data)
+                else
+                    data2 = ChainedVector([encoding.data, data])
+                    encoding = DictEncoding{eltype(data2), typeof(data2)}(id, data2, false)
+                    de[id] = Lockable(encoding)
+                end
+            end
         end
-        data = arrowvector(DataAPI.refpool(y), de, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
-        encoding = DictEncoding{eltype(data), typeof(data)}(0, data, false)
     end
-    push!(de, encoding)
-    return DictEncoded(UInt8[], validity, inds, encoding, data.metadata)
+    if meta !== nothing && data.metadata !== nothing
+        merge!(meta, data.metadata)
+    elseif data.metadata !== nothing
+        meta = data.metadata
+    end
+    return DictEncoded(UInt8[], validity, inds, encoding, meta)
 end
 
 @propagate_inbounds function Base.getindex(d::DictEncoded, i::Integer)
