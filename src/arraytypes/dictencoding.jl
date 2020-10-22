@@ -94,7 +94,12 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
         for i = 1:length(inds)
             @inbounds inds[i] -= 1
         end
-        data = arrowvector(DataAPI.refpool(x), i, nl, fi, de, ded, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
+        pool = DataAPI.refpool(x)
+        # horrible hack? yes. better than taking CategoricalArrays dependency? also yes.
+        if typeof(pool).name.name == :CategoricalRefPool
+            pool = [get(pool[i]) for i = 1:length(pool)]
+        end
+        data = arrowvector(pool, i, nl, fi, de, ded, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
         encoding = DictEncoding{eltype(data), typeof(data)}(id, data, false)
         de[id] = Lockable(encoding)
     else
@@ -109,7 +114,11 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
             deltas = eltype(x)[]
             len = length(x)
             inds = Vector{encodingtype(len)}(undef, len)
+            categorical = typeof(x).name.name == :CategoricalArray
             for (j, val) in enumerate(x)
+                if categorical
+                    val = get(val)
+                end
                 @inbounds inds[j] = get!(pool, val) do
                     push!(deltas, val)
                     length(pool)
