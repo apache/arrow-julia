@@ -83,6 +83,8 @@ end
     return x, (i + 1, chunk, chunk_i, len)
 end
 
+arrowvector(::FixedSizeListType, x::FixedSizeList, i, nl, fi, de, ded, meta; kw...) = x
+
 function arrowvector(::FixedSizeListType, x, i, nl, fi, de, ded, meta; kw...)
     len = length(x)
     validity = ValidityBitmap(x)

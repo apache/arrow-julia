@@ -37,6 +37,8 @@ end
 keyvalues(KT, ::Missing) = missing
 keyvalues(KT, x::AbstractDict) = [KT(k, v) for (k, v) in pairs(x)]
 
+arrowvector(::MapType, x::Map, i, nl, fi, de, ded, meta; kw...) = x
+
 function arrowvector(::MapType, x, i, nl, fi, de, ded, meta; largelists::Bool=false, kw...)
     len = length(x)
     validity = ValidityBitmap(x)

@@ -151,24 +151,6 @@ Base.@propagate_inbounds function Base.getindex(A::ToSparseUnion{T}, i::Integer)
     return @inbounds x isa T ? x : ArrowTypes.default(T)
 end
 
-arrowvector(U::Union, x, i, nl, fi, de, ded, meta; denseunions::Bool=true, kw...) =
-    arrowvector(denseunions ? DenseUnionVector(x) : SparseUnionVector(x), i, nl, fi, de, ded, meta; denseunions=denseunions, kw...)
-
-function arrowvector(::UnionType, x, i, nl, fi, de, ded, meta; kw...)
-    UT = eltype(x)
-    if unionmode(UT) == Meta.UnionMode.Dense
-        x = x isa DenseUnionVector ? x.itr : x
-        typeids, offsets, data = todense(UT, x)
-        data2 = map(y -> arrowvector(y[2], i, nl + 1, y[1], de, ded, nothing; kw...), enumerate(data))
-        return DenseUnion{UT, typeof(data2)}(UInt8[], UInt8[], typeids, offsets, data2, meta)
-    else
-        x = x isa SparseUnionVector ? x.itr : x
-        typeids = sparsetypeids(UT, x)
-        data3 = Tuple(arrowvector(ToSparseUnion(fieldtype(eltype(UT), j), x), i, nl + 1, j, de, ded, nothing; kw...) for j = 1:fieldcount(eltype(UT)))
-        return SparseUnion{UT, typeof(data3)}(UInt8[], typeids, data3, meta)
-    end
-end
-
 function compress(Z::Meta.CompressionType, comp, x::A) where {A <: DenseUnion}
     len = length(x)
     nc = nullcount(x)
@@ -206,6 +188,26 @@ end
     @inbounds s.typeIds[i] = vtypeId
     @inbounds s.data[vtypeId + 1][i] = v
     return v
+end
+
+arrowvector(U::Union, x, i, nl, fi, de, ded, meta; denseunions::Bool=true, kw...) =
+    arrowvector(denseunions ? DenseUnionVector(x) : SparseUnionVector(x), i, nl, fi, de, ded, meta; denseunions=denseunions, kw...)
+
+arrowvector(::UnionType, x::Union{DenseUnion, SparseUnion}, i, nl, fi, de, ded, meta; kw...) = x
+
+function arrowvector(::UnionType, x, i, nl, fi, de, ded, meta; kw...)
+    UT = eltype(x)
+    if unionmode(UT) == Meta.UnionMode.Dense
+        x = x isa DenseUnionVector ? x.itr : x
+        typeids, offsets, data = todense(UT, x)
+        data2 = map(y -> arrowvector(y[2], i, nl + 1, y[1], de, ded, nothing; kw...), enumerate(data))
+        return DenseUnion{UT, typeof(data2)}(UInt8[], UInt8[], typeids, offsets, data2, meta)
+    else
+        x = x isa SparseUnionVector ? x.itr : x
+        typeids = sparsetypeids(UT, x)
+        data3 = Tuple(arrowvector(ToSparseUnion(fieldtype(eltype(UT), j), x), i, nl + 1, j, de, ded, nothing; kw...) for j = 1:fieldcount(eltype(UT)))
+        return SparseUnion{UT, typeof(data3)}(UInt8[], typeids, data3, meta)
+    end
 end
 
 function compress(Z::Meta.CompressionType, comp, x::A) where {A <: SparseUnion}

@@ -173,6 +173,8 @@ end
     return x, (i, chunk, chunk_i, chunk_len, len)
 end
 
+arrowvector(::ListType, x::List, i, nl, fi, de, ded, meta; kw...) = x
+
 function arrowvector(::ListType, x, i, nl, fi, de, ded, meta; largelists::Bool=false, kw...)
     len = length(x)
     validity = ValidityBitmap(x)
