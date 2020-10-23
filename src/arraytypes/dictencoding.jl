@@ -75,6 +75,8 @@ dictencodeid(colidx, nestedlevel, fieldid) = (Int64(nestedlevel) << 48) | (Int64
 getid(d::DictEncoded) = d.encoding.id
 getid(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = c.data.encoding.id
 
+arrowvector(::DictEncodedType, x::DictEncoded, i, nl, fi, de, ded, meta; kw...) = x
+
 function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode::Bool=false, dictencodenested::Bool=false, kw...)
     @assert x isa DictEncode
     id = x.id == -1 ? dictencodeid(i, nl, fi) : x.id

@@ -70,6 +70,8 @@ Base.@propagate_inbounds function Base.getindex(A::ToStruct{T, j}, i::Integer) w
     return x === missing ? ArrowTypes.default(T) : getfield(x, j)
 end
 
+arrowvector(::StructType, x::Struct, i, nl, fi, de, ded, meta; kw...) = x
+
 function arrowvector(::StructType, x, i, nl, fi, de, ded, meta; kw...)
     len = length(x)
     validity = ValidityBitmap(x)

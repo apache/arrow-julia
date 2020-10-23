@@ -44,6 +44,8 @@ end
     return v
 end
 
+arrowvector(::BoolType, x::BoolVector, i, nl, fi, de, ded, meta; kw...) = x
+
 function arrowvector(::BoolType, x, i, nl, fi, de, ded, meta; kw...)
     validity = ValidityBitmap(x)
     len = length(x)
