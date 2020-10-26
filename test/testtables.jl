@@ -123,7 +123,8 @@ testtables = [
     (
       col1=[Date(2001, 1, 2), Date(2010, 10, 10), Date(2020, 12, 1)],
       col2=[Time(1, 1, 2), Time(13, 10, 10), Time(22, 12, 1)],
-      col3=[DateTime(2001, 1, 2), DateTime(2010, 10, 10), DateTime(2020, 12, 1)]
+      col3=[DateTime(2001, 1, 2), DateTime(2010, 10, 10), DateTime(2020, 12, 1)],
+      col4=[ZonedDateTime(2001, 1, 2, TimeZone("America/Denver")), ZonedDateTime(2010, 10, 10, TimeZone("America/Denver")), ZonedDateTime(2020, 12, 1, TimeZone("America/Denver"))]
     ),
     NamedTuple(),
     NamedTuple(),

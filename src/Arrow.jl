@@ -42,7 +42,7 @@ module Arrow
 
 using Mmap
 import Dates
-using DataAPI, Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd
+using DataAPI, Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd, TimeZones
 
 using Base: @propagate_inbounds
 import Base: ==

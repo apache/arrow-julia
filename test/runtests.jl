@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-using Test, Arrow, Tables, Dates, PooledArrays
+using Test, Arrow, Tables, Dates, PooledArrays, TimeZones
 
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/integrationtest.jl"))

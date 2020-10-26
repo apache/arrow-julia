@@ -51,6 +51,8 @@ arrowvector(::Type{Dates.Time}, x, i, nl, fi, de, ded, meta; kw...) =
     arrowvector(converter(TIME, x), i, nl, fi, de, ded, meta; kw...)
 arrowvector(::Type{Dates.DateTime}, x, i, nl, fi, de, ded, meta; kw...) =
     arrowvector(converter(DATETIME, x), i, nl, fi, de, ded, meta; kw...)
+arrowvector(::Type{ZonedDateTime}, x, i, nl, fi, de, ded, meta; kw...) =
+    arrowvector(converter(Timestamp{Meta.TimeUnit.MILLISECOND, Symbol(x[1].timezone)}, x), i, nl, fi, de, ded, meta; kw...)
 arrowvector(::Type{P}, x, i, nl, fi, de, ded, meta; kw...) where {P <: Dates.Period} =
     arrowvector(converter(Duration{arrowperiodtype(P)}, x), i, nl, fi, de, ded, meta; kw...)
 
