@@ -138,6 +138,15 @@ tt = Arrow.Table(io)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
+# 53
+s = "a" ^ 100
+t = (a=[SubString(s, 1:10), SubString(s, 11:20)],)
+io = IOBuffer()
+Arrow.write(io, t)
+seekstart(io)
+tt = Arrow.Table(io)
+@test tt.a == ["aaaaaaaaaa", "aaaaaaaaaa"]
+
 end # @testset "misc"
 
 end

@@ -295,7 +295,7 @@ end
 # arrowtype will call fieldoffset recursively for children
 function arrowtype(b, x::List{T, O, A}) where {T, O, A}
     if eltype(A) == UInt8
-        if T == String || T == Union{String, Missing}
+        if T <: AbstractString || T <: Union{AbstractString, Missing}
             if O == Int32
                 Meta.utf8Start(b)
                 return Meta.Utf8, Meta.utf8End(b), nothing
