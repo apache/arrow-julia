@@ -17,24 +17,21 @@ branches:
   - gh-pages # For building documentation
   - /^testing-.*$/ # testing branches
   - /^v[0-9]+\.[0-9]+\.[0-9]+$/ # version tags
-matrix:
+jobs:
   allow_failures:
     - julia: nightly
   fast_finish: true
   exclude:
     - os: osx
       arch: x86
-    - os: linux
-      arch: x86
-      julia: 1.3
-  # include:
-  #   - stage: "Documentation"
-  #     julia: 1
-  #     os: linux
-  #     script:
-  #       - julia --project=docs/ -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate(); Pkg.build("Arrow")'
-  #       - julia --project=docs/ docs/make.jl
-  #     after_success: skip
+  include:
+    - stage: "Documentation"
+      julia: 1
+      os: linux
+      script:
+        - julia --project=docs/ -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate(); Pkg.build("Arrow")'
+        - julia --project=docs/ docs/make.jl
+      after_success: skip
 notifications:
   email: false
 after_success:
