@@ -18,12 +18,6 @@ branches:
   - /^testing-.*$/ # testing branches
   - /^v[0-9]+\.[0-9]+\.[0-9]+$/ # version tags
 jobs:
-  allow_failures:
-    - julia: nightly
-  fast_finish: true
-  exclude:
-    - os: osx
-      arch: x86
   include:
     - stage: "Documentation"
       julia: 1
@@ -32,6 +26,12 @@ jobs:
         - julia --project=docs/ -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate(); Pkg.build("Arrow")'
         - julia --project=docs/ docs/make.jl
       after_success: skip
+matrix:
+  exclude:
+    - os: osx
+      arch: x86
+  allow_failures:
+  - julia: nightly
 notifications:
   email: false
 after_success:
