@@ -19,6 +19,13 @@ struct CompressedBuffer
     uncompressedlength::Int64
 end
 
+"""
+    Arrow.Compressed
+
+Represents the compressed version of an [`ArrowVector`](@ref).
+Holds a reference to the original column. May have `Compressed`
+children for nested array types.
+"""
 struct Compressed{Z, A}
     data::A
     buffers::Vector{CompressedBuffer}

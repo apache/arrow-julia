@@ -14,6 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+The ArrowTypes module provides the [`ArrowTypes.Arrowtype`](@ref) interface trait that objects can define
+in order to signal how they should be serialized in the arrow format.
+"""
 module ArrowTypes
 
 export ArrowType, NullType, PrimitiveType, BoolType, ListType, FixedSizeListType, MapType, StructType, UnionType, DictEncodedType

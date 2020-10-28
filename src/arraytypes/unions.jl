@@ -48,6 +48,14 @@ end
 isatypeid(x::T, ::Type{types}) where {T, types} = isatypeid(x, fieldtype(types, 1), types, 1)
 isatypeid(x::T, ::Type{S}, ::Type{types}, i) where {T, S, types} = x isa S ? i : isatypeid(x, fieldtype(types, i + 1), types, i + 1)
 
+"""
+    Arrow.DenseUnion
+
+An `ArrowVector` where the type of each element is one of a fixed set of types, meaning its eltype is like a julia `Union{type1, type2, ...}`.
+An `Arrow.DenseUnion`, in comparison to `Arrow.SparseUnion`, stores elements in a set of arrays, one array per possible type, and an "offsets"
+array, where each offset element is the index into one of the typed arrays. This allows a sort of "compression", where no extra space is
+used/allocated to store all the elements.
+"""
 struct DenseUnion{T, S} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     arrow2::Vector{UInt8} # if arrow blob is compressed, need a 2nd reference for uncompressed offsets bytes
@@ -164,6 +172,14 @@ function compress(Z::Meta.CompressionType, comp, x::A) where {A <: DenseUnion}
     return Compressed{Z, A}(x, buffers, len, nc, children)
 end
 
+"""
+    Arrow.SparseUnion
+
+An `ArrowVector` where the type of each element is one of a fixed set of types, meaning its eltype is like a julia `Union{type1, type2, ...}`.
+An `Arrow.SparseUnion`, in comparison to `Arrow.DenseUnion`, stores elements in a set of arrays, one array per possible type, and each typed
+array has the same length as the full array. This ends up with "wasted" space, since only one slot among the typed arrays is valid per full
+array element, but can allow for certain optimizations when each typed array has the same length.
+"""
 struct SparseUnion{T, S} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     typeIds::Vector{UInt8}

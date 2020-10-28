@@ -14,6 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+    Arrow.ArrowVector
+
+An abstract type that subtypes `AbstractVector`. Each specific arrow array type
+subtypes `ArrowVector`. See [`BoolVector`](@ref), [`Primitive`](@ref), [`List`](@ref),
+[`Map`](@ref), [`FixedSizeList`](@ref), [`Struct`](@ref), [`DenseUnion`](@ref),
+[`SparseUnion`](@ref), and [`DictEncoded`](@ref) for more details.
+"""
 abstract type ArrowVector{T} <: AbstractVector{T} end
 
 Base.IndexStyle(::Type{A}) where {A <: ArrowVector} = Base.IndexLinear()
@@ -80,6 +88,16 @@ function writebuffer(io, col::MissingVector, alignment)
     return
 end
 
+"""
+    Arrow.ValidityBitmap
+
+A bit-packed array type where each bit corresponds to an element in an
+[`ArrowVector`](@ref), indicating whether that element is "valid" (bit == 1),
+or not (bit == 0). Used to indicate element missingness (whether it's null).
+
+If the null count of an array is zero, the `ValidityBitmap` will be "emtpy"
+and all elements are treated as "valid"/non-null.
+"""
 struct ValidityBitmap <: ArrowVector{Bool}
     bytes::Vector{UInt8} # arrow memory blob
     pos::Int # starting byte of validity bitmap

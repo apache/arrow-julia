@@ -16,21 +16,38 @@
 
 const OBJ_METADATA = IdDict{Any, Dict{String, String}}()
 
+"""
+    Arrow.setmetadata!(x, metadata::Dict{String, String})
+
+Set the metadata for any object, provided as a `Dict{String, String}`.
+Metadata attached to a table or column will be serialized when written
+as a stream or file.
+"""
 function setmetadata!(x, meta::Dict{String, String})
     OBJ_METADATA[x] = meta
     return
 end
 
+"""
+    Arrow.getmetadata(x) => Dict{String, String}
+
+Retrieve any metadata (as a `Dict{String, String}`) attached to an object.
+
+Metadata may be attached to any object via [`Arrow.setmetadata!`](@ref),
+or deserialized via the arrow format directly (the format allows attaching metadata
+to table, column, and other objects).
+"""
 getmetadata(x, default=nothing) = get(OBJ_METADATA, x, default)
 
 """
     Arrow.write(io::IO, tbl)
     Arrow.write(file::String, tbl)
+    tbl |> Arrow.write(io_or_file)
 
-Write any Tables.jl-compatible `tbl` out as arrow formatted data.
+Write any [Tables.jl](https://github.com/JuliaData/Tables.jl)-compatible `tbl` out as arrow formatted data.
 Providing an `io::IO` argument will cause the data to be written to it
-in the "streaming" format, unless `file=true` keyword argument is passed.
-Providing a `file::String` argument will result in the "file" format being written.
+in the ["streaming" format](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format), unless `file=true` keyword argument is passed.
+Providing a `file::String` argument will result in the ["file" format](https://arrow.apache.org/docs/format/Columnar.html#ipc-file-format) being written.
 
 Multiple record batches will be written based on the number of
 `Tables.partitions(tbl)` that are provided; by default, this is just
@@ -40,18 +57,20 @@ by doing `Tables.partitioner([tbl1, tbl2, ...])`, but note that
 each table must have the exact same `Tables.Schema`.
 
 By default, `Arrow.write` will use multiple threads to write multiple
-record batches simultaneously (e.g. if julia is started with `julia -t 8`).
+record batches simultaneously (e.g. if julia is started with `julia -t 8` or the `JULIA_NUM_THREADS` environment variable is set).
 
 Supported keyword arguments to `Arrow.write` include:
   * `compress`: possible values include `:lz4`, `:zstd`, or your own initialized `LZ4FrameCompressor` or `ZstdCompressor` objects; will cause all buffers in each record batch to use the respective compression encoding
   * `alignment::Int=8`: specify the number of bytes to align buffers to when written in messages; strongly recommended to only use alignment values of 8 or 64 for modern memory cache line optimization
-  * `dictencode::Bool=false`: whether all columns should use dictionary encoding when being written
-  * `dictencodenested::Bool=false`: whether nested data type columns should also dict encode nested arrays/buffers; many other implementations don't support this
+  * `dictencode::Bool=false`: whether all columns should use dictionary encoding when being written; to dict encode specific columns, wrap the column/array in `Arrow.DictEncode(col)`
+  * `dictencodenested::Bool=false`: whether nested data type columns should also dict encode nested arrays/buffers; other language implementations [may not support this](https://arrow.apache.org/docs/status.html)
   * `denseunions::Bool=true`: whether Julia `Vector{<:Union}` arrays should be written using the dense union layout; passing `false` will result in the sparse union layout
   * `largelists::Bool=false`: causes list column types to be written with Int64 offset arrays; mainly for testing purposes; by default, Int64 offsets will be used only if needed
   * `file::Bool=false`: if a an `io` argument is being written to, passing `file=true` will cause the arrow file format to be written instead of just IPC streaming
 """
 function write end
+
+write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
 
 function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8)
     open(file, "w") do io

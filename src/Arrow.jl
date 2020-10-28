@@ -22,9 +22,10 @@ A pure Julia implementation of the [apache arrow](https://arrow.apache.org/) mem
 This implementation supports the 1.0 version of the specification, including support for:
   * All primitive data types
   * All nested data types
-  * Dictionary encodings and messages
+  * Dictionary encodings, nested dictionary encodings, and messages
   * Extension types
   * Streaming, file, record batch, and replacement and isdelta dictionary messages
+  * Buffer compression/decompression via the standard LZ4 frame and Zstd formats
 
 It currently doesn't include support for:
   * Tensors or sparse tensors
@@ -32,11 +33,11 @@ It currently doesn't include support for:
   * C data interface
 
 Third-party data formats:
-  * csv and parquet support via the existing CSV.jl and Parquet.jl packages
-  * Other Tables.jl-compatible packages automatically supported (DataFrames.jl, JSONTables.jl, JuliaDB.jl, SQLite.jl, MySQL.jl, JDBC.jl, ODBC.jl, XLSX.jl, etc.)
+  * csv and parquet support via the existing [CSV.jl](https://github.com/JuliaData/CSV.jl) and [Parquet.jl](https://github.com/JuliaIO/Parquet.jl) packages
+  * Other [Tables.jl](https://github.com/JuliaData/Tables.jl)-compatible packages automatically supported ([DataFrames.jl](https://github.com/JuliaData/DataFrames.jl), [JSONTables.jl](https://github.com/JuliaData/JSONTables.jl), [JuliaDB.jl](https://github.com/JuliaData/JuliaDB.jl), [SQLite.jl](https://github.com/JuliaDatabases/SQLite.jl), [MySQL.jl](https://github.com/JuliaDatabases/MySQL.jl), [JDBC.jl](https://github.com/JuliaDatabases/JDBC.jl), [ODBC.jl](https://github.com/JuliaDatabases/ODBC.jl), [XLSX.jl](https://github.com/felipenoris/XLSX.jl), etc.)
   * No current Julia packages support ORC or Avro data formats
 
-See docs for official Arrow.jl API with `Arrow.Table`, `Arrow.write`, and `Arrow.Stream`.
+See docs for official Arrow.jl API with the [User Manual](@ref) and reference docs for [`Arrow.Table`](@ref), [`Arrow.write`](@ref), and [`Arrow.Stream`](@ref).
 """
 module Arrow
 
