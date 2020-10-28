@@ -150,6 +150,13 @@ tt = Arrow.Table(io)
 # 49
 @test_throws ArgumentError Arrow.Table("file_that_doesnt_exist")
 
+# 52
+t = (a=Arrow.DictEncode(string.(1:129)),)
+io = IOBuffer()
+Arrow.write(io, t)
+seekstart(io)
+tt = Arrow.Table(io)
+
 end # @testset "misc"
 
 end

@@ -93,9 +93,8 @@ signedtype(::Type{UInt16}) = Int16
 signedtype(::Type{UInt32}) = Int32
 signedtype(::Type{UInt64}) = Int64
 
-indtype(d::D) where {D <: DictEncoded} = indtype(D)
-indtype(::Type{DictEncoded{T, S, A}}) where {T, S, A} = signedtype(S)
-indtype(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = indtype(A)
+indtype(d::DictEncoded{T, S, A}) where {T, S, A} = S
+indtype(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = indtype(c.data)
 
 dictencodeid(colidx, nestedlevel, fieldid) = (Int64(nestedlevel) << 48) | (Int64(fieldid) << 32) | Int64(colidx)
 
@@ -114,7 +113,7 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
         # dict encoding doesn't exist yet, so create for 1st time
         if DataAPI.refarray(x) === x
             # need to encode ourselves
-            x = PooledArray(x)
+            x = PooledArray(x, encodingtype(length(x)))
             inds = DataAPI.refarray(x)
         else
             inds = copy(DataAPI.refarray(x))
