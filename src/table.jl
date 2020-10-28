@@ -30,9 +30,9 @@ Start reading an arrow formatted table, from:
  * `bytes`, a byte vector directly, optionally allowing specifying the starting byte position `pos` and `len`
 
 Reads the initial schema message from the arrow stream/file, then returns an `Arrow.Stream` object
-which will iterate over record batch messages, producing an `Arrow.Table` on each iteration.
+which will iterate over record batch messages, producing an [`Arrow.Table`](@ref) on each iteration.
 
-By iterating `Arrow.Table`, `Arrow.Stream` satisfies the `Tables.partitions` interface, and as such can
+By iterating [`Arrow.Table`](@ref), `Arrow.Stream` satisfies the `Tables.partitions` interface, and as such can
 be passed to Tables.jl-compatible sink functions.
 
 This allows iterating over extremely large "arrow tables" in chunks represented as record batches.
@@ -143,7 +143,7 @@ NOTE: the columns in an `Arrow.Table` are views into the original arrow memory, 
 modifiable (with e.g. `push!`, `append!`, etc.). To mutate arrow columns, call `copy(x)` to materialize
 the arrow data as a normal Julia array.
 
-`Arrow.Table` also satisfies the Tables.jl interface, and so can easily be materialied via any supporting
+`Arrow.Table` also satisfies the [Tables.jl](https://github.com/JuliaData/Tables.jl) interface, and so can easily be materialied via any supporting
 sink function: e.g. `DataFrame(Arrow.Table(file))`, `SQLite.load!(db, "table", Arrow.Table(file))`, etc.
 
 Supports the `convert` keyword argument which controls whether certain arrow primitive types will be

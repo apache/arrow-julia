@@ -14,12 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-    padding(n::Integer)
-
-Determines the total number of bytes needed to store `n` bytes with padding.
-Note that the Arrow standard requires buffers to be aligned to 8-byte boundaries.
-"""
+# Determines the total number of bytes needed to store `n` bytes with padding.
+# Note that the Arrow standard requires buffers to be aligned to 8-byte boundaries.
 padding(n::Integer, alignment) = ((n + alignment - 1) ÷ alignment) * alignment
 
 paddinglength(n::Integer, alignment) = padding(n, alignment) - n
@@ -55,18 +51,8 @@ function writearray(io::IO, ::Type{T}, col) where {T}
     return n
 end
 
-"""
-    getbit
-
-This deliberately elides bounds checking.
-"""
 getbit(v::UInt8, n::Integer) = Bool((v & 0x02^(n - 1)) >> (n - 1))
 
-"""
-    setbit
-
-This also deliberately elides bounds checking.
-"""
 function setbit(v::UInt8, b::Bool, n::Integer)
     if b
         v | 0x02^(n - 1)
@@ -75,11 +61,7 @@ function setbit(v::UInt8, b::Bool, n::Integer)
     end
 end
 
-"""
-    bitpackedbytes(n)
-
-Determines the number of bytes used by `n` bits, optionally with padding.
-"""
+# Determines the number of bytes used by `n` bits, optionally with padding.
 function bitpackedbytes(n::Integer, alignment)
     ℓ = cld(n, 8)
     return ℓ + paddinglength(ℓ, alignment)
@@ -133,10 +115,6 @@ Base.eltype(x::Converter{T, A}) where {T, A} = T
 Base.getindex(x::Converter{T}, i::Int) where {T} = ArrowTypes.arrowconvert(T, getindex(x.data, i))
 
 maybemissing(::Type{T}) where {T} = T === Missing ? Missing : Base.nonmissingtype(T)
-
-macro miss_or(x, ex)
-    esc(:($x === missing ? missing : $(ex)))
-end
 
 function getfooter(filebytes)
     len = readbuffer(filebytes, length(filebytes) - 9, Int32)

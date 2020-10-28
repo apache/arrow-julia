@@ -14,6 +14,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+    Arrow.DictEncoding
+
+Represents the "pool" of possible values for a [`DictEncoded`](@ref)
+array type. Whether the order of values is significant can be checked
+by looking at the `isOrdered` boolean field.
+"""
 mutable struct DictEncoding{T, A} <: ArrowVector{T}
     id::Int64
     data::A
@@ -32,6 +39,14 @@ end
 struct DictEncodeType{T} end
 getT(::Type{DictEncodeType{T}}) where {T} = T
 
+"""
+    Arrow.DictEncode(::AbstractVector, id::Integer=nothing)
+
+Signals that a column/array should be dictionary encoded when serialized
+to the arrow streaming/file format. An optional `id` number may be provided
+to signal that multiple columns should use the same pool when being
+dictionary encoded.
+"""
 struct DictEncode{T, A} <: AbstractVector{DictEncodeType{T}}
     id::Int64
     data::A
@@ -44,6 +59,18 @@ Base.iterate(x::DictEncode, st...) = iterate(x.data, st...)
 Base.getindex(x::DictEncode, i::Int) = getindex(x.data, i)
 ArrowTypes.ArrowType(::Type{<:DictEncodeType}) = DictEncodedType()
 
+"""
+    Arrow.DictEncoded
+
+A dictionary encoded array type (similar to a `PooledArray`). Behaves just
+like a normal array in most respects; internally, possible values are stored
+in the `encoding::DictEncoding` field, while the `indices::Vector{<:Integer}`
+field holds the "codes" of each element for indexing into the encoding pool.
+Any column/array can be dict encoding when serializing to the arrow format
+either by passing the `dictencode=true` keyword argument to [`Arrow.write`](@ref)
+(which causes _all_ columns to be dict encoded), or wrapping individual columns/
+arrays in [`Arrow.DictEncode(x)`](@ref).
+"""
 struct DictEncoded{T, S, A} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     validity::ValidityBitmap

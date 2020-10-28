@@ -14,6 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+    Arrow.FixedSizeList
+
+An `ArrowVector` where each element is a "fixed size" list of some kind, like a `NTuple{N, T}`.
+"""
 struct FixedSizeList{T, A <: AbstractVector} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     validity::ValidityBitmap

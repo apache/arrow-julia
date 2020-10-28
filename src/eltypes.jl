@@ -25,8 +25,8 @@ finaljuliatype(::Type{Missing}) = Missing
 finaljuliatype(::Type{Union{T, Missing}}) where {T} = Union{Missing, finaljuliatype(T)}
 
 """
-Given a FlatBuffers.Builder and a Julia column eltype,
-Write the field.type flatbuffer definition
+Given a FlatBuffers.Builder and a Julia column or column eltype,
+Write the field.type flatbuffer definition of the eltype
 """
 function arrowtype end
 
@@ -72,7 +72,7 @@ function juliaeltype(f::Meta.Field, int::Meta.Int, convert)
         elseif int.bitWidth == 128
             Int128
         else
-            throw(InvalidMetadataError("$int is not valid arrow type metadata"))
+            error("$int is not valid arrow type metadata")
         end
     else
         if int.bitWidth == 8
@@ -86,7 +86,7 @@ function juliaeltype(f::Meta.Field, int::Meta.Int, convert)
         elseif int.bitWidth == 128
             UInt128
         else
-            throw(InvalidMetadataError("$int is not valid arrow type metadata"))
+            error("$int is not valid arrow type metadata")
         end
     end
 end

@@ -14,6 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+    Arrow.Map
+
+An `ArrowVector` where each element is a "map" of some kind, like a `Dict`.
+"""
 struct Map{T, O, A} <: ArrowVector{T}
     validity::ValidityBitmap
     offsets::Offsets{O}

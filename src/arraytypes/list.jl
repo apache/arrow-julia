@@ -28,6 +28,11 @@ Base.size(o::Offsets) = (length(o.offsets) - 1,)
     return lo, hi
 end
 
+"""
+    Arrow.List
+
+An `ArrowVector` where each element is a variable sized list of some kind, like an `AbstractVector` or `AbstractString`.
+"""
 struct List{T, O, A} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     validity::ValidityBitmap

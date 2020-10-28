@@ -14,6 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+    Arrow.Primitive
+
+An `ArrowVector` where each element is a "fixed size" scalar of some kind, like an integer, float, decimal, or time type.
+"""
 struct Primitive{T, A} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     validity::ValidityBitmap

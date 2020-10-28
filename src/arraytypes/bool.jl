@@ -14,6 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+    Arrow.BoolVector
+
+A bit-packed array type, similar to [`ValidityBitmap`](@ref), but which
+holds boolean values, `true` or `false`.
+"""
 struct BoolVector{T} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     pos::Int

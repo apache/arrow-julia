@@ -14,6 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+    Arrow.Struct
+
+An `ArrowVector` where each element is a "struct" of some kind with ordered, named fields, like a `NamedTuple{names, types}` or regular julia `struct`.
+"""
 struct Struct{T, S} <: ArrowVector{T}
     validity::ValidityBitmap
     data::S # Tuple of ArrowVector
