@@ -53,7 +53,8 @@ end
 Tables.partitions(x::Stream) = x
 
 Stream(io::IO, pos::Integer=1, len=nothing; convert::Bool=true) = Stream(Base.read(io), pos, len; convert=convert)
-Stream(str::String, pos::Integer=1, len=nothing; convert::Bool=true) = Stream(Mmap.mmap(str), pos, len; convert=convert)
+Stream(str::String, pos::Integer=1, len=nothing; convert::Bool=true) = isfile(str) ? Stream(Mmap.mmap(str), pos, len; convert=convert) :
+    throw(ArgumentError("$str is not a valid arrow file"))
 
 # will detect whether we're reading a Stream from a file or stream
 function Stream(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothing}=nothing; convert::Bool=true)
@@ -175,7 +176,8 @@ Tables.getcolumn(t::Table, nm::Symbol) = lookup(t)[nm]
 
 # high-level user API functions
 Table(io::IO, pos::Integer=1, len=nothing; convert::Bool=true) = Table(Base.read(io), pos, len; convert=convert)
-Table(str::String, pos::Integer=1, len=nothing; convert::Bool=true) = Table(Mmap.mmap(str), pos, len; convert=convert)
+Table(str::String, pos::Integer=1, len=nothing; convert::Bool=true) = isfile(str) ? Table(Mmap.mmap(str), pos, len; convert=convert) :
+    throw(ArgumentError("$str is not a valid arrow file"))
 
 # will detect whether we're reading a Table from a file or stream
 function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothing}=nothing; convert::Bool=true)

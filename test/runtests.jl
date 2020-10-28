@@ -147,6 +147,9 @@ seekstart(io)
 tt = Arrow.Table(io)
 @test tt.a == ["aaaaaaaaaa", "aaaaaaaaaa"]
 
+# 49
+@test_throws ArgumentError Arrow.Table("file_that_doesnt_exist")
+
 end # @testset "misc"
 
 end
