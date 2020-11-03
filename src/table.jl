@@ -241,7 +241,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
             field = dictencoded[id]
             values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
             A = ChainedVector([values])
-            dictencodings[id] = DictEncoding{eltype(A), typeof(A)}(id, A, field.dictionary.isOrdered)
+            dictencodings[id] = DictEncoding{eltype(A), typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
             @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
         elseif header isa Meta.RecordBatch
             @debug 1 "parsing record batch message: compression = $(header.compression)"
