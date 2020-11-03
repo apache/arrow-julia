@@ -227,9 +227,12 @@ function juliaeltype(f::Meta.Field, x::Meta.Timestamp, convert)
     return Timestamp{x.unit, x.timezone === nothing ? nothing : Symbol(x.timezone)}
 end
 
-finaljuliatype(::Type{<:Timestamp}) = ZonedDateTime
+finaljuliatype(::Type{Timestamp{U, TZ}}) where {U, TZ} = ZonedDateTime
+finaljuliatype(::Type{Timestamp{U, nothing}}) where {U} = DateTime
 Base.convert(::Type{ZonedDateTime}, x::Timestamp{U, TZ}) where {U, TZ} =
     ZonedDateTime(Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME))), TimeZone(String(TZ)))
+Base.convert(::Type{DateTime}, x::Timestamp{U, nothing}) where {U} =
+    Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME)))
 Base.convert(::Type{Timestamp{Meta.TimeUnit.MILLISECOND, TZ}}, x::ZonedDateTime) where {TZ} =
     Timestamp{Meta.TimeUnit.MILLISECOND, TZ}(Int64(Dates.value(DateTime(x, Local)) - UNIX_EPOCH_DATETIME))
 

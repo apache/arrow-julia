@@ -107,7 +107,7 @@ function Base.iterate(x::Stream, (pos, id)=(x.pos, 1))
             field = x.dictencoded[id]
             values, _, _ = build(field, field.type, batch, recordbatch, x.dictencodings, Int64(1), Int64(1), x.convert)
             A = ChainedVector([values])
-            x.dictencodings[id] = DictEncoding{eltype(A), typeof(A)}(id, A, field.dictionary.isOrdered)
+            x.dictencodings[id] = DictEncoding{eltype(A), typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
             @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
         elseif header isa Meta.RecordBatch
             @debug 1 "parsing record batch message: compression = $(header.compression)"

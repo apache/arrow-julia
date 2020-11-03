@@ -57,21 +57,22 @@ function arrowvector(::BoolType, x, i, nl, fi, de, ded, meta; kw...)
     len = length(x)
     blen = cld(len, 8)
     bytes = Vector{UInt8}(undef, blen)
-    b = 0x00
+    b = 0xff
     j = k = 1
     for y in x
-        if y === missing || !y
+        if y === false
             b = setbit(b, false, j)
-        else
-            b = setbit(b, true, j)
         end
         j += 1
         if j == 9
             @inbounds bytes[k] = b
-            b = 0x00
+            b = 0xff
             j = 1
             k += 1
         end
+    end
+    if j > 1
+        bytes[k] = b
     end
     return BoolVector{eltype(x)}(bytes, 1, validity, len, meta)
 end
