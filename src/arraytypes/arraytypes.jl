@@ -117,24 +117,24 @@ function ValidityBitmap(x)
     blen = cld(len, 8)
     bytes = Vector{UInt8}(undef, blen)
     st = iterate(x)
-    i = 0
     nc = 0
-    for k = 1:blen
-        b = 0x00
-        for j = 1:8
-            if (i + j) <= len
-                y, state = st
-                if y === missing
-                    nc += 1
-                    b = setbit(b, false, j)
-                else
-                    b = setbit(b, true, j)
-                end
-                st = iterate(x, state)
-            end
+    b = 0xff
+    j = k = 1
+    for y in x
+        if y === missing
+            nc += 1
+            b = setbit(b, false, j)
         end
-        i += 8
-        @inbounds bytes[k] = b
+        j += 1
+        if j == 9
+            @inbounds bytes[k] = b
+            b = 0xff
+            j = 1
+            k += 1
+        end
+    end
+    if j > 1
+        bytes[k] = b
     end
     return ValidityBitmap(nc == 0 ? UInt8[] : bytes, 1, nc == 0 ? 0 : len, nc)
 end
