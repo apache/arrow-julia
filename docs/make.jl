@@ -5,7 +5,7 @@ using Arrow
 makedocs(;
     modules=[Arrow],
     repo="https://github.com/JuliaData/Arrow.jl/blob/{commit}{path}#L{line}",
-    sitename="Example1.jl",
+    sitename="Arrow.jl",
     format=Documenter.HTML(;
         prettyurls=get(ENV, "CI", "false") == "true",
         canonical="https://JuliaData.github.io/Arrow.jl",
