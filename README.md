@@ -1,6 +1,6 @@
 # Arrow
 
-[![docs](https://img.shields.io/badge/docs-latest-blue&logo=julia)](https://JuliaData.github.io/Arrow.jl/)
+[![docs](https://img.shields.io/badge/docs-latest-blue&logo=julia)](https://arrow.juliadata.org/dev/)
 [![Build Status](https://travis-ci.com/JuliaData/Arrow.jl.svg?branch=master)](https://travis-ci.com/JuliaData/Arrow.jl.svg?branch=master)
 [![codecov](https://codecov.io/gh/JuliaData/Arrow.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/JuliaData/Arrow.jl)
 
