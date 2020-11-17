@@ -63,6 +63,16 @@ the arrow data as a normal Julia array.
 `Arrow.Table` also satisfies the Tables.jl interface, and so can easily be materialized via any supporting
 sink function: e.g. `DataFrame(Arrow.Table(file))`, `SQLite.load!(db, "table", Arrow.Table(file))`, etc.
 
+In windows the current implementation can lead to issues with locked files (see https://github.com/JuliaData/Arrow.jl/issues/61). In these cases, the file handle needs to be closed. For example reading into a `DataFrame`: 
+
+```
+function read_arrow_file_to_dataframe(file::AbstractString)
+    return open(file, "r") do io
+        DataFrames.DataFrame(Arrow.Table(io))
+    end
+end
+```
+
 Supports the `convert` keyword argument which controls whether certain arrow primitive types will be
 lazily converted to more friendly Julia defaults; by default, `convert=true`.
 
