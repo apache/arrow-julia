@@ -131,11 +131,12 @@ const ARROW_TO_JULIA_TYPE_MAPPING = Dict{String, Tuple{Type, Type}}(
     "JuliaLang.Symbol" => (Symbol, String),
 )
 
-function extensiontype(meta)
+function extensiontype(f, meta)
     if haskey(meta, "ARROW:extension:name")
         typename = meta["ARROW:extension:name"]
         if haskey(ARROW_TO_JULIA_TYPE_MAPPING, typename)
-            return ARROW_TO_JULIA_TYPE_MAPPING[typename][1]
+            T = ARROW_TO_JULIA_TYPE_MAPPING[typename][1]
+            return f.nullable ? Union{T, Missing} : T
         else
             @warn "unsupported ARROW:extension:name type: \"$typename\""
         end
