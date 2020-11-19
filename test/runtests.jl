@@ -157,6 +157,10 @@ Arrow.write(io, t)
 seekstart(io)
 tt = Arrow.Table(io)
 
+# 60: unequal column lengths
+io = IOBuffer()
+@test_throws ArgumentError Arrow.write(io, (a = Int[], b = ["asd"], c=collect(1:100)))
+
 end # @testset "misc"
 
 end
