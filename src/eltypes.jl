@@ -171,7 +171,6 @@ bitwidth(x::Meta.DateUnit) = x == Meta.DateUnit.DAY ? Int32 : Int64
 Date{Meta.DateUnit.DAY}(days) = Date{Meta.DateUnit.DAY, Int32}(Int32(days))
 Date{Meta.DateUnit.MILLISECOND}(ms) = Date{Meta.DateUnit.MILLISECOND, Int64}(Int64(ms))
 const DATE = Date{Meta.DateUnit.DAY, Int32}
-const DATETIME = Date{Meta.DateUnit.MILLISECOND, Int64}
 
 juliaeltype(f::Meta.Field, x::Meta.Date, convert) = Date{x.unit, bitwidth(x.unit)}
 finaljuliatype(::Type{Date{Meta.DateUnit.DAY, Int32}}) = Dates.Date
@@ -227,6 +226,8 @@ function juliaeltype(f::Meta.Field, x::Meta.Timestamp, convert)
     return Timestamp{x.unit, x.timezone === nothing ? nothing : Symbol(x.timezone)}
 end
 
+const DATETIME = Timestamp{Meta.TimeUnit.MILLISECOND, nothing}
+
 finaljuliatype(::Type{Timestamp{U, TZ}}) where {U, TZ} = ZonedDateTime
 finaljuliatype(::Type{Timestamp{U, nothing}}) where {U} = DateTime
 Base.convert(::Type{ZonedDateTime}, x::Timestamp{U, TZ}) where {U, TZ} =
@@ -235,6 +236,8 @@ Base.convert(::Type{DateTime}, x::Timestamp{U, nothing}) where {U} =
     Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME)))
 Base.convert(::Type{Timestamp{Meta.TimeUnit.MILLISECOND, TZ}}, x::ZonedDateTime) where {TZ} =
     Timestamp{Meta.TimeUnit.MILLISECOND, TZ}(Int64(Dates.value(DateTime(x, Local)) - UNIX_EPOCH_DATETIME))
+Base.convert(::Type{Timestamp{Meta.TimeUnit.MILLISECOND, nothing}}, x::DateTime) =
+    Timestamp{Meta.TimeUnit.MILLISECOND, nothing}(Int64(Dates.value(x) - UNIX_EPOCH_DATETIME))
 
 function arrowtype(b, ::Type{Timestamp{U, TZ}}) where {U, TZ}
     tz = TZ !== nothing ? FlatBuffers.createstring!(b, String(TZ)) : FlatBuffers.UOffsetT(0)
