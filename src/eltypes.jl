@@ -43,7 +43,7 @@ function juliaeltype(f::Meta.Field, meta::Dict{String, String}, convert::Bool)
     TT = juliaeltype(f, convert)
     !convert && return TT
     T = finaljuliatype(TT)
-    TTT = ArrowTypes.extensiontype(meta)
+    TTT = ArrowTypes.extensiontype(f, meta)
     return something(TTT, T)
 end
 
