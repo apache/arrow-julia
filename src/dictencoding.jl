@@ -35,13 +35,13 @@ end
 function DictEncoding(data::Vector{UInt8}, refs_idx::Integer, pool_idx::Integer,
                       x::CategoricalArray{J,1,U}) where {J,U}
     refs = Primitive{Int32}(data, refs_idx, getrefs(x))
-    pool = Primitive{J}(data, pool_idx, getlevels(x))
+    pool = Primitive{J}(data, pool_idx, levels(x))
     DictEncoding{J}(refs, pool)
 end
 function DictEncoding(data::Vector{UInt8}, refs_bmask_idx::Integer, refs_values_idx::Integer,
                       pool_idx::Integer, x::CategoricalArray{Union{J,Missing},1,U}) where {J,U}
     refs = NullablePrimitive{Int32}(data, refs_bmask_idx, refs_values_idx, getrefs(x))
-    pool = Primitive{J}(data, pool_idx, getlevels(x))
+    pool = Primitive{J}(data, pool_idx, levels(x))
     DictEncoding{J}(refs, pool)
 end
 
@@ -65,7 +65,7 @@ end
 
 function DictEncoding(x::CategoricalArray{J,1,U}) where {J,U}
     refs = arrowformat(getrefs(x))
-    pool = arrowformat(getlevels(x))
+    pool = arrowformat(levels(x))
     DictEncoding{J}(refs, pool)
 end
 
@@ -87,11 +87,11 @@ CategoricalArrays.levels(d::DictEncoding) = d.pool
 
 
 function createpool(data::Vector{UInt8}, i::Integer, x::CategoricalArray{J,1,U}) where {J,U}
-    Primitive{J}(data, i, getlevels(x))
+    Primitive{J}(data, i, levels(x))
 end
 function createpool(data::Vector{UInt8}, i::Integer, x::CategoricalArray{T,1,U}
                    ) where {J<:AbstractString,U,T<:Union{J,Union{J,Missing}}}
-    List{J}(data, i, getlevels(x))
+    List{J}(data, i, levels(x))
 end
 
 
@@ -164,16 +164,14 @@ function getrefs(x::CategoricalArray{Union{J,Missing},1,U}) where {J,U}
     refs
 end
 
-getlevels(x::CategoricalArray) = x.pool.index
-
 refsbytes(len::Integer) = padding(sizeof(Int32)*len)
 refsbytes(::Type{Union{J,Missing}}, len::Integer) where J = bitmaskbytes(len) + refsbytes(len)
 refsbytes(x::AbstractVector) = refsbytes(length(x))
 refsbytes(::Type{Union{J,Missing}}, x::AbstractVector) where J = refsbytes(Union{J,Missing}, length(x))
 refsbytes(x::AbstractVector{Union{J,Missing}}) where J = refsbytes(Union{J,Missing}, length(x))
 
-totalbytes(x::CategoricalArray) = refsbytes(x) + totalbytes(getlevels(x))
+totalbytes(x::CategoricalArray) = refsbytes(x) + totalbytes(levels(x))
 function totalbytes(x::CategoricalArray{Union{J,Missing},1,U}) where {J,U}
-    refsbytes(Union{J,Missing}, x) + totalbytes(getlevels(x))
+    refsbytes(Union{J,Missing}, x) + totalbytes(levels(x))
 end
 
