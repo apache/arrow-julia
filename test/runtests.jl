@@ -161,6 +161,14 @@ tt = Arrow.Table(io)
 io = IOBuffer()
 @test_throws ArgumentError Arrow.write(io, (a = Int[], b = ["asd"], c=collect(1:100)))
 
+# nullability of custom extension types
+t = (a=['a', missing],)
+io = IOBuffer()
+Arrow.write(io, t)
+seekstart(io)
+tt = Arrow.Table(io)
+@test isequal(tt.a, ['a', missing])
+
 end # @testset "misc"
 
 end
