@@ -109,7 +109,6 @@ struct Converter{T, A} <: AbstractVector{T}
     data::A
 end
 
-converter(::Type{T}, x::AbstractArray{T}) where {T} = x
 converter(::Type{T}, x::A) where {T, A} = Converter{eltype(A) >: Missing ? Union{T, Missing} : T, A}(x)
 converter(::Type{T}, x::ChainedVector{A}) where {T, A} = ChainedVector([converter(T, x) for x in x.arrays])
 
