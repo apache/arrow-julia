@@ -19,6 +19,12 @@ using Test, Arrow, Tables, Dates, PooledArrays, TimeZones
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/integrationtest.jl"))
 
+struct CustomStruct
+    x::Int
+    y::Float64
+    z::String
+end
+
 @testset "Arrow" begin
 
 @testset "table roundtrips" begin
@@ -168,6 +174,15 @@ Arrow.write(io, t)
 seekstart(io)
 tt = Arrow.Table(io)
 @test isequal(tt.a, ['a', missing])
+
+# automatic custom struct serialization/deserialization
+t = (col1=[CustomStruct(1, 2.3, "hey"), CustomStruct(4, 5.6, "there")],)
+io = IOBuffer()
+Arrow.write(io, t)
+seekstart(io)
+tt = Arrow.Table(io)
+@test length(tt) == length(t)
+@test all(isequal.(values(t), values(tt)))
 
 end # @testset "misc"
 

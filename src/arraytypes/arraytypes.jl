@@ -69,7 +69,11 @@ function arrowvector(::Type{S}, x, i, nl, fi, de, ded, meta; kw...) where {S}
     if ArrowTypes.istyperegistered(S)
         meta = meta === nothing ? Dict{String, String}() : meta
         arrowtype = ArrowTypes.getarrowtype!(meta, S)
-        return arrowvector(converter(arrowtype, x), i, nl, fi, de, ded, meta; kw...)
+        if arrowtype === S
+            return arrowvector(ArrowType(S), x, i, nl, fi, de, ded, meta; kw...)
+        else
+            return arrowvector(converter(arrowtype, x), i, nl, fi, de, ded, meta; kw...)
+        end
     end
     return arrowvector(ArrowType(S), x, i, nl, fi, de, ded, meta; kw...)
 end
