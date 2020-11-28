@@ -59,6 +59,39 @@ In the arrow data format, specific logical types are supported, a list of which 
 
 Note that when `convert=false` is passed, data will be returned in Arrow.jl-defined types that exactly match the arrow definitions of those types; the authoritative source for how each type represents its data can be found in the arrow [`Schema.fbs`](https://github.com/apache/arrow/blob/master/format/Schema.fbs) file.
 
+#### Custom types
+
+To support writing your custom Julia struct, Arrow.jl utilizes the format's mechanism for "extension types" by storing
+the Julia type name in the field metadata. To "hook in" to this machinery, custom types can just call
+`Arrow.ArrowTypes.registertype!(T, T)`, where `T` is the custom struct type. For example:
+
+```julia
+using Arrow
+
+struct Person
+    id::Int
+    name::String
+end
+
+Arrow.ArrowTypes.registertype!(Person, Person)
+
+table = (col1=[Person(1, "Bob"), Person(2, "Jane")],)
+io = IOBuffer()
+Arrow.write(io, table)
+seekstart(io)
+table2 = Arrow.Table(io)
+```
+
+In this example, we're writing our `table`, which is a NamedTuple with one column named `col1`, which has two
+elements which are instances of our custom `Person` struct. We call `Arrow.Arrowtypes.registertype!` so that
+Arrow.jl knows how to serialize our `Person` struct. We then read the table back in using `Arrow.Table` and
+the table we get back will be an `Arrow.Table`, with a single `Arrow.Struct` column with element type `Person`.
+
+Note that without calling `Arrow.Arrowtypes.registertype!`, we may get into a weird limbo state where we've written
+our table with `Person` structs out as a table, but when reading back in, Arrow.jl doesn't know what a `Person` is;
+deserialization won't fail, but we'll just get a `Namedtuple{(:id, :name), Tuple{Int, String}}` back instead of `Person`.
+
+
 ### `Arrow.Stream`
 
 In addition to `Arrow.Table`, the Arrow.jl package also provides `Arrow.Stream` for processing arrow data. While `Arrow.Table` will iterate all record batches in an arrow file/stream, concatenating columns, `Arrow.Stream` provides a way to *iterate* through record batches, one at a time. Each iteration yields an `Arrow.Table` instance, with columns/data for a single record batch. This allows, if so desired, "batch processing" of arrow data, one record batch at a time, instead of creating a single long table via `Arrow.Table`.
