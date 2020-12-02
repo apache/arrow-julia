@@ -60,7 +60,6 @@ arrowconvert(::Type{Symbol}, x::String) = Symbol(x)
 arrowconvert(::Type{String}, x::Symbol) = String(x)
 
 ArrowType(::Type{<:AbstractArray}) = ListType()
-ArrowType(::Type{<:AbstractSet}) = ListType()
 
 struct FixedSizeListType <: ArrowType end
 
