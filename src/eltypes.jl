@@ -392,7 +392,7 @@ end
 
 # Unions
 function juliaeltype(f::Meta.Field, u::Meta.Union, convert)
-    return UnionT{u.mode, u.typeIds !== nothing ? Tuple(u.typeIds) : u.typeIds, Tuple{(juliaeltype(x, buildmetadata(x), convert) for x in f.children)...}}
+    return Union{(juliaeltype(x, buildmetadata(x), convert) for x in f.children)...}
 end
 
 arrowtype(b, x::Union{DenseUnion{TT, S}, SparseUnion{TT, S}}) where {TT, S} = arrowtype(b, TT, x)
