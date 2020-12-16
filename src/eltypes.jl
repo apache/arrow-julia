@@ -134,24 +134,25 @@ function arrowtype(b, ::Type{Bool})
     return Meta.Bool, Meta.boolEnd(b), nothing
 end
 
-struct Decimal{P, S}
-    value::Int128
+struct Decimal{P, S, T}
+    value::T # only Int128 or Int256
 end
 
-Base.zero(::Type{Decimal{P, S}}) where {P, S} = Decimal{P, S}(Int128(0))
-==(a::Decimal{P, S}, b::Decimal{P, S}) where {P, S} = ==(a.value, b.value)
-Base.isequal(a::Decimal{P, S}, b::Decimal{P, S}) where {P, S} = isequal(a.value, b.value)
+Base.zero(::Type{Decimal{P, S, T}}) where {P, S, T} = Decimal{P, S, T}(T(0))
+==(a::Decimal{P, S, T}, b::Decimal{P, S, T}) where {P, S, T} = ==(a.value, b.value)
+Base.isequal(a::Decimal{P, S, T}, b::Decimal{P, S, T}) where {P, S, T} = isequal(a.value, b.value)
 
 function juliaeltype(f::Meta.Field, x::Meta.Decimal, convert)
-    return Decimal{x.precision, x.scale}
+    return Decimal{x.precision, x.scale, x.bitWidth == 256 ? Int256 : Int128}
 end
 
 ArrowTypes.ArrowType(::Type{<:Decimal}) = PrimitiveType()
 
-function arrowtype(b, ::Type{Decimal{P, S}}) where {P, S}
+function arrowtype(b, ::Type{Decimal{P, S, T}}) where {P, S, T}
     Meta.decimalStart(b)
     Meta.decimalAddPrecision(b, Int32(P))
     Meta.decimalAddScale(b, Int32(S))
+    Meta.decimalAddBitWidth(b, Int32(T == Int256 ? 256 : 128))
     return Meta.Decimal, Meta.decimalEnd(b), nothing
 end
 
@@ -235,7 +236,7 @@ Base.convert(::Type{ZonedDateTime}, x::Timestamp{U, TZ}) where {U, TZ} =
 Base.convert(::Type{DateTime}, x::Timestamp{U, nothing}) where {U} =
     Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME)))
 Base.convert(::Type{Timestamp{Meta.TimeUnit.MILLISECOND, TZ}}, x::ZonedDateTime) where {TZ} =
-    Timestamp{Meta.TimeUnit.MILLISECOND, TZ}(Int64(Dates.value(DateTime(x, Local)) - UNIX_EPOCH_DATETIME))
+    Timestamp{Meta.TimeUnit.MILLISECOND, TZ}(Int64(Dates.value(DateTime(x)) - UNIX_EPOCH_DATETIME))
 Base.convert(::Type{Timestamp{Meta.TimeUnit.MILLISECOND, nothing}}, x::DateTime) =
     Timestamp{Meta.TimeUnit.MILLISECOND, nothing}(Int64(Dates.value(x) - UNIX_EPOCH_DATETIME))
 

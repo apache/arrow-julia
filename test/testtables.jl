@@ -53,7 +53,7 @@ testtables = [
   (
     "arrow date/time types",
     (
-      col14=[zero(Arrow.Decimal{Int32(2), Int32(2)}), zero(Arrow.Decimal{Int32(2), Int32(2)}), zero(Arrow.Decimal{Int32(2), Int32(2)}), missing],
+      col14=[zero(Arrow.Decimal{Int32(2), Int32(2), Int128}), zero(Arrow.Decimal{Int32(2), Int32(2), Int128}), zero(Arrow.Decimal{Int32(2), Int32(2), Int128}), missing],
       col15=[zero(Arrow.Date{Arrow.Meta.DateUnit.DAY, Int32}), zero(Arrow.Date{Arrow.Meta.DateUnit.DAY, Int32}), zero(Arrow.Date{Arrow.Meta.DateUnit.DAY, Int32}), missing],
       col16=[zero(Arrow.Time{Arrow.Meta.TimeUnit.SECOND, Int32}), zero(Arrow.Time{Arrow.Meta.TimeUnit.SECOND, Int32}), zero(Arrow.Time{Arrow.Meta.TimeUnit.SECOND, Int32}), missing],
       col17=[zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.SECOND, nothing}), zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.SECOND, nothing}), zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.SECOND, nothing}), missing],
@@ -194,6 +194,15 @@ testtables = [
     ),
     (denseunions=false,),
     NamedTuple(),
+    nothing
+  ),
+  (
+    "Decimal256",
+    (
+      col1=[zero(Arrow.Decimal{Int32(2), Int32(2), Arrow.Int256}), zero(Arrow.Decimal{Int32(2), Int32(2), Arrow.Int256}), zero(Arrow.Decimal{Int32(2), Int32(2), Arrow.Int256}), missing],
+    ),
+    NamedTuple(),
+    (convert=false,),
     nothing
   ),
 ];
