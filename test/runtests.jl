@@ -193,6 +193,9 @@ tt = Arrow.Table(io)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
+# support Decimal256
+
+
 end # @testset "misc"
 
 end
