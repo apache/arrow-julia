@@ -52,6 +52,12 @@ function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dict
     return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)
 end
 
+# defaults for Dates types
+ArrowTypes.default(::Type{Dates.Date}) = Dates.Date(1,1,1)
+ArrowTypes.default(::Type{Dates.Time}) = Dates.Time(1,1,1)
+ArrowTypes.default(::Type{Dates.DateTime}) = Dates.DateTime(1,1,1,1,1,1)
+ArrowTypes.default(::Type{TimeZones.ZonedDateTime}) = TimeZones.ZonedDateTime(1,1,1,1,1,1,TimeZones.tz"UTC")
+
 # conversions to arrow types
 arrowvector(::Type{Dates.Date}, x, i, nl, fi, de, ded, meta; kw...) =
     arrowvector(converter(DATE, x), i, nl, fi, de, ded, meta; kw...)
