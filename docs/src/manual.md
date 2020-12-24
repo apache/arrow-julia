@@ -53,7 +53,7 @@ Apart from letting other packages have all the fun, an `Arrow.Table` itself can 
 
 In the arrow data format, specific logical types are supported, a list of which can be found [here](https://arrow.apache.org/docs/status.html#data-types). These include booleans, integers of various bit widths, floats, decimals, time types, and binary/string. While most of these map naturally to types builtin to Julia itself, there are a few cases where the definitions are slightly different, and in these cases, by default, they are converted to more "friendly" Julia types (this auto conversion can be avoided by passing `convert=false` to `Arrow.Table`, like `Arrow.Table(file; convert=false)`). Examples of arrow to julia type mappings include:
 
-* `Date`, `Time`, `Timestamp`, and `Duration` all have natural Julia defintions in `Dates.Date`, `Dates.Time`, `TimeZones.ZonedDateTime`, and `Dates.Period` subtypes, respectively. 
+* `Date`, `Time`, `Timestamp`, and `Duration` all have natural Julia definitions in `Dates.Date`, `Dates.Time`, `TimeZones.ZonedDateTime`, and `Dates.Period` subtypes, respectively. 
 * `Char` and `Symbol` Julia types are mapped to arrow string types, with additional metadata of the original Julia type; this allows deserializing directly to `Char` and `Symbol` in Julia, while other language implementations will see these columns as just strings
 * `Decimal128` has no corresponding builtin Julia type, so it's deserialized using a compatible type definition in Arrow.jl itself: `Arrow.Decimal`
 
