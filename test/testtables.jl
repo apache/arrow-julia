@@ -144,7 +144,8 @@ testtables = [
     (
       col1=[:hey, :there, :sailor],
       col2=['a', 'b', 'c'],
-      col3=Arrow.DictEncode(['a', 'a', 'b'])
+      col3=Arrow.DictEncode(['a', 'a', 'b']),
+      col4=[UUID("48075322-8645-4ac6-b590-c9f46068565a"), UUID("99c7d976-ccfd-45b9-9793-51008607c638"), UUID("f96d9974-5a7b-47e3-bbc0-d680d11490d4")]
     ),
     NamedTuple(),
     NamedTuple(),
