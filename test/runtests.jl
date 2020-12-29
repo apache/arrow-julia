@@ -194,6 +194,10 @@ tt = Arrow.Table(io)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
+# 89 - test deprecation path for old UUID autoconversion
+u = 0x6036fcbd20664bd8a65cdfa25434513f
+@test Arrow.ArrowTypes.arrowconvert(UUID, (value=u,)) === UUID(u)
+
 end # @testset "misc"
 
 end
