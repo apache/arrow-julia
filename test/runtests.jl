@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-using Test, Arrow, Tables, Dates, PooledArrays, TimeZones
+using Test, Arrow, Tables, Dates, PooledArrays, TimeZones, UUIDs
 
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/integrationtest.jl"))
@@ -193,6 +193,10 @@ seekstart(io)
 tt = Arrow.Table(io)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
+
+# 89 - test deprecation path for old UUID autoconversion
+u = 0x6036fcbd20664bd8a65cdfa25434513f
+@test Arrow.ArrowTypes.arrowconvert(UUID, (value=u,)) === UUID(u)
 
 end # @testset "misc"
 
