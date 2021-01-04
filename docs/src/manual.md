@@ -91,6 +91,13 @@ Note that without calling `Arrow.Arrowtypes.registertype!`, we may get into a we
 our table with `Person` structs out as a table, but when reading back in, Arrow.jl doesn't know what a `Person` is;
 deserialization won't fail, but we'll just get a `Namedtuple{(:id, :name), Tuple{Int, String}}` back instead of `Person`.
 
+!!! warning
+
+    If `Arrow.ArrowTypes.registertype!` is called in a downstream package, e.g. to register a custom type defined in
+    that package, it must be called from the `__init__` function of the package's top-level module
+    (see the [Julia docs](https://docs.julialang.org/en/v1/manual/modules/#Module-initialization-and-precompilation)
+    for more on `__init__` functions). Otherwise, the type will only be registered during the precompilation phase,
+    but that state will be lost afterwards (and in particular, the type will not be registered when the package is loaded).
 
 ### `Arrow.Stream`
 
