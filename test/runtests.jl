@@ -198,6 +198,16 @@ tt = Arrow.Table(io)
 u = 0x6036fcbd20664bd8a65cdfa25434513f
 @test Arrow.ArrowTypes.arrowconvert(UUID, (value=u,)) === UUID(u)
 
+# 98
+t = (a = [Nanosecond(0), Nanosecond(1)], b = [uuid4(), uuid4()], c = [missing, Nanosecond(1)])
+io = IOBuffer()
+Arrow.write(io, t)
+seekstart(io)
+tt = Arrow.Table(io)
+@test copy(tt.a) isa Vector{Nanosecond}
+@test copy(tt.b) isa Vector{UUID}
+@test copy(tt.c) isa Vector{Union{Missing,Nanosecond}}
+
 end # @testset "misc"
 
 end
