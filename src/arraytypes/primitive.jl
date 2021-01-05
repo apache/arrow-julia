@@ -34,7 +34,7 @@ Base.size(p::Primitive) = (p.ℓ,)
 
 function Base.copy(p::Primitive{T, A}) where {T, A}
     if nullcount(p) == 0 && T === eltype(A)
-        return collect(p)
+        return copy(p.data)
     else
         return convert(Array, p)
     end
