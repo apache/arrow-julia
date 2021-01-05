@@ -208,6 +208,11 @@ tt = Arrow.Table(io)
 @test copy(tt.b) isa Vector{UUID}
 @test copy(tt.c) isa Vector{Union{Missing,Nanosecond}}
 
+# copy on DictEncoding w/ missing values
+x = PooledArray(["hey", missing])
+x2 = Arrow.toarrowvector(x)
+@test isequal(copy(x2), x)
+
 end # @testset "misc"
 
 end
