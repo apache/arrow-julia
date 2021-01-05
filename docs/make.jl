@@ -20,4 +20,5 @@ makedocs(;
 
 deploydocs(;
     repo="github.com/JuliaData/Arrow.jl",
+    devbranch = "main"
 )
