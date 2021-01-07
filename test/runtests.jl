@@ -197,6 +197,7 @@ tt = Arrow.Table(io)
 # 89 - test deprecation path for old UUID autoconversion
 u = 0x6036fcbd20664bd8a65cdfa25434513f
 @test Arrow.ArrowTypes.arrowconvert(UUID, (value=u,)) === UUID(u)
+@test Arrow.ArrowTypes.arrowconvert(UUID, u) === UUID(u)
 
 # 98
 t = (a = [Nanosecond(0), Nanosecond(1)], b = [uuid4(), uuid4()], c = [missing, Nanosecond(1)])

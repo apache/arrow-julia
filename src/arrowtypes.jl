@@ -44,13 +44,14 @@ struct PrimitiveType <: ArrowType end
 ArrowType(::Type{<:Integer}) = PrimitiveType()
 ArrowType(::Type{<:AbstractFloat}) = PrimitiveType()
 
-arrowconvert(::Type{UInt128}, u::UUID) = UInt128(u)
-arrowconvert(::Type{UUID}, u::UInt128) = UUID(u)
+arrowconvert(::Type{NTuple{16,UInt8}}, u::UUID) = reinterpret(NTuple{16,UInt8}, [u])[]
+arrowconvert(::Type{UUID}, u::NTuple{16,UInt8}) = UUID(reinterpret(UInt128, [u])[])
 
-# This method is included as a deprecation path to allow reading Arrow files that may have
-# been written before Arrow.jl defined its own UUID <-> UInt128 mapping (in which case
+# These methods are included as deprecation paths to allow reading Arrow files that may have
+# been written before Arrow.jl's current UUID <-> NTuple{16,UInt8} mapping existed (in which case
 # a struct-based fallback `JuliaLang.UUID` extension type may have been utilized)
 arrowconvert(::Type{UUID}, u::NamedTuple{(:value,),Tuple{UInt128}}) = UUID(u.value)
+arrowconvert(::Type{UUID}, u::UInt128) = UUID(u)
 
 struct BoolType <: ArrowType end
 ArrowType(::Type{Bool}) = BoolType()
@@ -125,7 +126,7 @@ default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{name
 const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Type, Tuple{String, Type}}(
     Char => ("JuliaLang.Char", UInt32),
     Symbol => ("JuliaLang.Symbol", String),
-    UUID => ("JuliaLang.UUID", UInt128),
+    UUID => ("JuliaLang.UUID", NTuple{16,UInt8}),
 )
 
 istyperegistered(::Type{T}) where {T} = haskey(JULIA_TO_ARROW_TYPE_MAPPING, T)
@@ -140,7 +141,7 @@ end
 const ARROW_TO_JULIA_TYPE_MAPPING = Dict{String, Tuple{Type, Type}}(
     "JuliaLang.Char" => (Char, UInt32),
     "JuliaLang.Symbol" => (Symbol, String),
-    "JuliaLang.UUID" => (UUID, UInt128),
+    "JuliaLang.UUID" => (UUID, NTuple{16,UInt8}),
 )
 
 function extensiontype(f, meta)
