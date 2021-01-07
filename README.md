@@ -1,7 +1,7 @@
 # Arrow
 
 [![docs](https://img.shields.io/badge/docs-latest-blue&logo=julia)](https://arrow.juliadata.org/dev/)
-[![Build Status](https://travis-ci.com/JuliaData/Arrow.jl.svg?branch=master)](https://travis-ci.com/JuliaData/Arrow.jl.svg?branch=master)
+[![CI](https://github.com/JuliaData/Arrow.jl/workflows/CI/badge.svg)](https://github.com/JuliaData/Arrow.jl/actions?query=workflow%3ACI)
 [![codecov](https://codecov.io/gh/JuliaData/Arrow.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/JuliaData/Arrow.jl)
 
 [![deps](https://juliahub.com/docs/Arrow/deps.svg)](https://juliahub.com/ui/Packages/Arrow/QnF3w?t=2)
@@ -12,6 +12,27 @@ This is a pure Julia implementation of the [Apache Arrow](https://arrow.apache.o
 referencing data that conforms to the Arrow standard.  This allows users to seamlessly interface Arrow formatted data with a great deal of existing Julia code.
 
 Please see this [document](https://arrow.apache.org/docs/format/Columnar.html#physical-memory-layout) for a description of the Arrow memory layout.
+
+## Installation
+
+The package can be installed by typing in the following in a Julia REPL:
+
+```julia
+julia> using Pkg; Pkg.add("Arrow")
+```
+
+or to use the official-apache code that follows the official apache release process, you can do:
+
+```julia
+julia> using Pkg; Pkg.add(url="https://github.com/apache/arrow", subdir="julia/Arrow.jl")
+```
+
+## Difference between this code and the apache/arrow/julia/Arrow repository
+
+The code in the apache/arrow repository is officially part of the apache/arrow project and as such follows the regulated release cadence of the entire project, following standard community
+voting protocols. The JuliaData/Arrow.jl repository can be viewed as a sort of "dev" or "latest" branch of this code that may release more frequently, but without following
+official apache release guidelines. The two repositories are synced, however, so any bugfix patches in JuliaData will be upstreamed to apache/arrow for each release.
+
 
 ## Format Support
 
