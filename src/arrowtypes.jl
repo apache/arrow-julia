@@ -44,15 +44,6 @@ struct PrimitiveType <: ArrowType end
 ArrowType(::Type{<:Integer}) = PrimitiveType()
 ArrowType(::Type{<:AbstractFloat}) = PrimitiveType()
 
-arrowconvert(::Type{NTuple{16,UInt8}}, u::UUID) = reinterpret(NTuple{16,UInt8}, [u])[]
-arrowconvert(::Type{UUID}, u::NTuple{16,UInt8}) = UUID(reinterpret(UInt128, [u])[])
-
-# These methods are included as deprecation paths to allow reading Arrow files that may have
-# been written before Arrow.jl's current UUID <-> NTuple{16,UInt8} mapping existed (in which case
-# a struct-based fallback `JuliaLang.UUID` extension type may have been utilized)
-arrowconvert(::Type{UUID}, u::NamedTuple{(:value,),Tuple{UInt128}}) = UUID(u.value)
-arrowconvert(::Type{UUID}, u::UInt128) = UUID(u)
-
 struct BoolType <: ArrowType end
 ArrowType(::Type{Bool}) = BoolType()
 
@@ -77,6 +68,19 @@ struct FixedSizeListType <: ArrowType end
 ArrowType(::Type{NTuple{N, T}}) where {N, T} = FixedSizeListType()
 gettype(::Type{NTuple{N, T}}) where {N, T} = T
 getsize(::Type{NTuple{N, T}}) where {N, T} = N
+
+ArrowType(::Type{UUID}) = FixedSizeListType()
+gettype(::Type{UUID}) = UInt8
+getsize(::Type{UUID}) = 16
+
+arrowconvert(::Type{NTuple{16,UInt8}}, u::UUID) = reinterpret(NTuple{16,UInt8}, [u])[]
+arrowconvert(::Type{UUID}, u::NTuple{16,UInt8}) = UUID(reinterpret(UInt128, [u])[])
+
+# These methods are included as deprecation paths to allow reading Arrow files that may have
+# been written before Arrow.jl's current UUID <-> NTuple{16,UInt8} mapping existed (in which case
+# a struct-based fallback `JuliaLang.UUID` extension type may have been utilized)
+arrowconvert(::Type{UUID}, u::NamedTuple{(:value,),Tuple{UInt128}}) = UUID(u.value)
+arrowconvert(::Type{UUID}, u::UInt128) = UUID(u)
 
 struct StructType <: ArrowType end
 
