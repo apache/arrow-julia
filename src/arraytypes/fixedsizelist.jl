@@ -39,12 +39,29 @@ Base.size(l::FixedSizeList) = (l.ℓ,)
     else
         off = (i - 1) * N
         if X === T && isbitstype(Y)
-            tup = reinterpret(NTuple{N, Y}, view(l.data, (off + 1):(off + N)))[]
+            tup = _unsafe_load_tuple(NTuple{N,Y}, l.data, off + 1)
         else
             tup = ntuple(j->l.data[off + j], N)
         end
         return ArrowTypes.arrowconvert(T, tup)
     end
+end
+
+function _unsafe_load_tuple(::Type{NTuple{N,T}}, bytes::Vector{UInt8}, i::Integer) where {N,T}
+    x = Ref(bytes, i)
+    y = Ref{NTuple{N,T}}()
+    _unsafe_cast!(y, x, N)
+    return y[]
+end
+
+function _unsafe_cast!(y::Ref{Y}, x::Ref, n::Integer) where {Y}
+    X = eltype(x)
+    GC.@preserve x y begin
+        ptr_x = Base.unsafe_convert(Ptr{X}, x)
+        ptr_y = Base.unsafe_convert(Ptr{Y}, y)
+        unsafe_copyto!(Ptr{X}(ptr_y), ptr_x, n)
+    end
+    return y
 end
 
 @propagate_inbounds function Base.setindex!(l::FixedSizeList{T}, v::T, i::Integer) where {T}
