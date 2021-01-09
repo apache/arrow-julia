@@ -73,8 +73,19 @@ ArrowType(::Type{UUID}) = FixedSizeListType()
 gettype(::Type{UUID}) = UInt8
 getsize(::Type{UUID}) = 16
 
-arrowconvert(::Type{NTuple{16,UInt8}}, u::UUID) = reinterpret(NTuple{16,UInt8}, [u])[]
-arrowconvert(::Type{UUID}, u::NTuple{16,UInt8}) = UUID(reinterpret(UInt128, [u])[])
+function _unsafe_cast(::Type{B}, a::A)::B where {B,A}
+    a = Ref(a)
+    b = Ref{B}()
+    GC.@preserve a b begin
+        ptra = Base.unsafe_convert(Ptr{A}, a)
+        ptrb = Base.unsafe_convert(Ptr{B}, b)
+        unsafe_copyto!(Ptr{A}(ptrb), ptra, 1)
+    end
+    return b[]
+end
+
+arrowconvert(::Type{NTuple{16,UInt8}}, u::UUID) = _unsafe_cast(NTuple{16,UInt8}, u.value)
+arrowconvert(::Type{UUID}, u::NTuple{16,UInt8}) = UUID(_unsafe_cast(UInt128, u))
 
 # These methods are included as deprecation paths to allow reading Arrow files that may have
 # been written before Arrow.jl's current UUID <-> NTuple{16,UInt8} mapping existed (in which case
