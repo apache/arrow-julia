@@ -194,9 +194,12 @@ tt = Arrow.Table(io)
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
-# 89 - test deprecation path for old UUID autoconversion
+# 89 etc. - test deprecation paths for old UUID autoconversion + UUID FixedSizeListType overloads
 u = 0x6036fcbd20664bd8a65cdfa25434513f
 @test Arrow.ArrowTypes.arrowconvert(UUID, (value=u,)) === UUID(u)
+@test Arrow.ArrowTypes.arrowconvert(UUID, u) === UUID(u)
+@test Arrow.ArrowTypes.gettype(UUID) == UInt8
+@test Arrow.ArrowTypes.getsize(UUID) == 16
 
 # 98
 t = (a = [Nanosecond(0), Nanosecond(1)], b = [uuid4(), uuid4()], c = [missing, Nanosecond(1)])
