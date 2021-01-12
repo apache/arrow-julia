@@ -72,18 +72,18 @@ function write end
 
 write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
 
-function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8)
+function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, ntasks=Inf)
     open(file, "w") do io
         write(io, tbl, true, largelists, compress, denseunions, dictencode, dictencodenested, alignment)
     end
     return file
 end
 
-function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, file::Bool=false)
+function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, ntasks=Inf, file::Bool=false)
     return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment)
 end
 
-function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment)
+function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment, ntasks)
     if compress === :lz4
         compress = LZ4_FRAME_COMPRESSOR[]
     elseif compress === :zstd
@@ -95,7 +95,7 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
         @debug 1 "starting write of arrow formatted file"
         Base.write(io, "ARROW1\0\0")
     end
-    msgs = OrderedChannel{Message}(Inf)
+    msgs = OrderedChannel{Message}(ntasks)
     # build messages
     sch = Ref{Tables.Schema}()
     firstcols = Ref{Any}()
