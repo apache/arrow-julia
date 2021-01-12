@@ -31,13 +31,27 @@ Base.size(l::FixedSizeList) = (l.ℓ,)
 
 @propagate_inbounds function Base.getindex(l::FixedSizeList{T}, i::Integer) where {T}
     @boundscheck checkbounds(l, i)
-    N = ArrowTypes.getsize(Base.nonmissingtype(T))
-    off = (i - 1) * N
-    if Base.nonmissingtype(T) !== T
-        return l.validity[i] ? ArrowTypes.arrowconvert(T, ntuple(j->l.data[off + j], N)) : missing
+    X = Base.nonmissingtype(T)
+    N = ArrowTypes.getsize(X)
+    Y = ArrowTypes.gettype(X)
+    if X !== T && !(l.validity[i])
+        return missing
     else
-        return ArrowTypes.arrowconvert(T, ntuple(j->l.data[off + j], N))
+        off = (i - 1) * N
+        if X === T && isbitstype(Y)
+            tup = _unsafe_load_tuple(NTuple{N,Y}, l.data, off + 1)
+        else
+            tup = ntuple(j->l.data[off + j], N)
+        end
+        return ArrowTypes.arrowconvert(T, tup)
     end
+end
+
+function _unsafe_load_tuple(::Type{NTuple{N,T}}, bytes::Vector{UInt8}, i::Integer) where {N,T}
+    x = Ref(bytes, i)
+    y = Ref{NTuple{N,T}}()
+    ArrowTypes._unsafe_cast!(y, x, N)
+    return y[]
 end
 
 @propagate_inbounds function Base.setindex!(l::FixedSizeList{T}, v::T, i::Integer) where {T}
