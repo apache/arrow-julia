@@ -50,18 +50,8 @@ end
 function _unsafe_load_tuple(::Type{NTuple{N,T}}, bytes::Vector{UInt8}, i::Integer) where {N,T}
     x = Ref(bytes, i)
     y = Ref{NTuple{N,T}}()
-    _unsafe_cast!(y, x, N)
+    ArrowTypes._unsafe_cast!(y, x, N)
     return y[]
-end
-
-function _unsafe_cast!(y::Ref{Y}, x::Ref, n::Integer) where {Y}
-    X = eltype(x)
-    GC.@preserve x y begin
-        ptr_x = Base.unsafe_convert(Ptr{X}, x)
-        ptr_y = Base.unsafe_convert(Ptr{Y}, y)
-        unsafe_copyto!(Ptr{X}(ptr_y), ptr_x, n)
-    end
-    return y
 end
 
 @propagate_inbounds function Base.setindex!(l::FixedSizeList{T}, v::T, i::Integer) where {T}
