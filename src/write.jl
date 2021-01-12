@@ -74,13 +74,13 @@ write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
 
 function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, ntasks=Inf)
     open(file, "w") do io
-        write(io, tbl, true, largelists, compress, denseunions, dictencode, dictencodenested, alignment)
+        write(io, tbl, true, largelists, compress, denseunions, dictencode, dictencodenested, alignment, ntasks)
     end
     return file
 end
 
 function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, ntasks=Inf, file::Bool=false)
-    return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment)
+    return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment, ntasks)
 end
 
 function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment, ntasks)
