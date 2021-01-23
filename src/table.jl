@@ -234,13 +234,18 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
                 field = dictencoded[id]
                 values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
                 dictencoding = dictencodings[id]
-                append!(dictencoding.data, values)
+                if typeof(dictencoding.data) <: ChainedVector
+                    append!(dictencoding.data, values)
+                else
+                    A = ChainedVector([dictencoding.data, values])
+                    dictencodings[id] = DictEncoding{eltype(A), typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)        
+                end
                 continue
             end
             # new dictencoding or replace
             field = dictencoded[id]
             values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
-            A = ChainedVector([values])
+            A = values
             dictencodings[id] = DictEncoding{eltype(A), typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
             @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
         elseif header isa Meta.RecordBatch
