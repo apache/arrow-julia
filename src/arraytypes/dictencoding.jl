@@ -59,6 +59,7 @@ Base.size(x::DictEncode) = (length(x.data),)
 Base.iterate(x::DictEncode, st...) = iterate(x.data, st...)
 Base.getindex(x::DictEncode, i::Int) = getindex(x.data, i)
 ArrowTypes.ArrowType(::Type{<:DictEncodeType}) = DictEncodedType()
+Base.copy(x::DictEncode) = DictEncode(x.data, x.id)
 
 """
     Arrow.DictEncoded
