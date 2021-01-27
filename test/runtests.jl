@@ -216,6 +216,10 @@ x = PooledArray(["hey", missing])
 x2 = Arrow.toarrowvector(x)
 @test isequal(copy(x2), x)
 
+# signed indices for DictEncodedType #112 #113 #114
+av = Arrow.toarrowvector(PooledArray(repeat(["a", "b"], inner = 5)))
+@test isa(first(av.indices), Signed)
+
 end # @testset "misc"
 
 end
