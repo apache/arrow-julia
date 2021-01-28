@@ -116,15 +116,16 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
         if DataAPI.refarray(x) === x
             # need to encode ourselves
             x = PooledArray(x, encodingtype(length(x)))
-            inds = DataAPI.refarray(x)
+            refa = DataAPI.refarray(x)
         else
-            inds = copy(DataAPI.refarray(x))
+            refa = copy(DataAPI.refarray(x))
         end
         # adjust to "offset" instead of index
-        for i = 1:length(inds)
-            @inbounds inds[i] -= 1
+        for i = eachindex(refa)
+            @inbounds refa[i] -= 1
         end
         pool = DataAPI.refpool(x)
+        inds = converter(encodingtype(length(pool)), refa)
         # horrible hack? yes. better than taking CategoricalArrays dependency? also yes.
         if typeof(pool).name.name == :CategoricalRefPool
             pool = [get(pool[i]) for i = 1:length(pool)]
