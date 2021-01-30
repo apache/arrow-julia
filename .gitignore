@@ -1,4 +1,5 @@
 Manifest.toml
+.DS_STORE
 *.jl.cov
 *.jl.*.cov
 *.jl.mem
