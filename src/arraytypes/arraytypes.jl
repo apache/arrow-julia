@@ -47,6 +47,8 @@ end
 function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dictencode::Bool=false, kw...)
     if !(x isa DictEncode) && !dictencoding && (dictencode || (x isa AbstractArray && DataAPI.refarray(x) !== x))
         x = DictEncode(x, dictencodeid(i, nl, fi))
+    elseif x isa DictEncoded
+        return arrowvector(DictEncodeType, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)    
     end
     S = maybemissing(eltype(x))
     return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)
