@@ -91,16 +91,18 @@ include("eltypes.jl")
 include("table.jl")
 include("write.jl")
 
-const LZ4_FRAME_COMPRESSOR = Ref{LZ4FrameCompressor}()
-const ZSTD_COMPRESSOR = Ref{ZstdCompressor}()
+const LZ4_FRAME_COMPRESSOR = LZ4FrameCompressor[]
+const ZSTD_COMPRESSOR = ZstdCompressor[]
 
 function __init__()
-    zstd = ZstdCompressor(; level=3)
-    CodecZstd.TranscodingStreams.initialize(zstd)
-    ZSTD_COMPRESSOR[] = zstd
-    lz4 = LZ4FrameCompressor(; compressionlevel=4)
-    CodecLz4.TranscodingStreams.initialize(lz4)
-    LZ4_FRAME_COMPRESSOR[] = lz4
+    for _ = 1:Threads.nthreads()
+        zstd = ZstdCompressor(; level=3)
+        CodecZstd.TranscodingStreams.initialize(zstd)
+        push!(ZSTD_COMPRESSOR, zstd)
+        lz4 = LZ4FrameCompressor(; compressionlevel=4)
+        CodecLz4.TranscodingStreams.initialize(lz4)
+        push!(LZ4_FRAME_COMPRESSOR, lz4)
+    end
     return
 end
 

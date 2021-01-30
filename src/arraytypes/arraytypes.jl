@@ -30,14 +30,18 @@ validitybitmap(x::ArrowVector) = x.validity
 nullcount(x::ArrowVector) = validitybitmap(x).nc
 getmetadata(x::ArrowVector) = x.metadata
 
-function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, LZ4FrameCompressor, ZstdCompressor}=nothing, kw...)
+function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Vector{LZ4FrameCompressor}, LZ4FrameCompressor, Vector{ZstdCompressor}, ZstdCompressor}=nothing, kw...)
     @debug 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(kw.data)"
     @debug 3 x
     A = arrowvector(x, i, 0, 0, de, ded, meta; compression=compression, kw...)
     if compression isa LZ4FrameCompressor
         A = compress(Meta.CompressionType.LZ4_FRAME, compression, A)
+    elseif compression isa Vector{LZ4FrameCompressor}
+        A = compress(Meta.CompressionType.LZ4_FRAME, compression[Threads.threadid()], A)
     elseif compression isa ZstdCompressor
         A = compress(Meta.CompressionType.ZSTD, compression, A)
+    elseif compression isa Vector{ZstdCompressor}
+        A = compress(Meta.CompressionType.ZSTD, compression[Threads.threadid()], A)
     end
     @debug 2 "converted top-level column to arrow format: $(typeof(A))"
     @debug 3 A

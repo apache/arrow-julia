@@ -85,9 +85,9 @@ end
 
 function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment)
     if compress === :lz4
-        compress = LZ4_FRAME_COMPRESSOR[]
+        compress = LZ4_FRAME_COMPRESSOR
     elseif compress === :zstd
-        compress = ZSTD_COMPRESSOR[]
+        compress = ZSTD_COMPRESSOR
     elseif compress isa Symbol
         throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
     end
