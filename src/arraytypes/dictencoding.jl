@@ -125,9 +125,9 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
         # horrible hack? yes. better than taking CategoricalArrays dependency? also yes.
         if typeof(pool).name.name == :CategoricalRefPool
             if eltype(x) >: Missing
-                pool = vcat(missing, pool.pool.levels)
+                pool = vcat(missing, DataAPI.levels(x))
             else
-                pool = pool.pool.levels
+                pool = DataAPI.levels(x)
                 for i = 1:length(inds)
                     @inbounds inds[i] -= 1
                 end
