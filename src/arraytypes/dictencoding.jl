@@ -112,7 +112,7 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
     validity = ValidityBitmap(x)
     if !haskey(de, id)
         # dict encoding doesn't exist yet, so create for 1st time
-        if DataAPI.refarray(x) === x
+        if DataAPI.refarray(x) === x || DataAPI.refpool(x) === nothing
             # need to encode ourselves
             x = PooledArray(x; signed=true, compress=true)
             inds = DataAPI.refarray(x)
