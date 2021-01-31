@@ -94,6 +94,7 @@ signedtype(::Type{UInt8}) = Int8
 signedtype(::Type{UInt16}) = Int16
 signedtype(::Type{UInt32}) = Int32
 signedtype(::Type{UInt64}) = Int64
+signedtype(::Type{T}) where {T <: Signed} = T
 
 indtype(d::DictEncoded{T, S, A}) where {T, S, A} = S
 indtype(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = indtype(c.data)
@@ -113,21 +114,31 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
     validity = ValidityBitmap(x)
     if !haskey(de, id)
         # dict encoding doesn't exist yet, so create for 1st time
-        if DataAPI.refarray(x) === x
+        if DataAPI.refarray(x) === x || DataAPI.refpool(x) === nothing
             # need to encode ourselves
-            x = PooledArray(x, encodingtype(length(x)))
+            x = PooledArray(x; signed=true, compress=true)
             inds = DataAPI.refarray(x)
+            pool = DataAPI.refpool(x)
         else
-            inds = copy(DataAPI.refarray(x))
+            pool = DataAPI.refpool(x)
+            refa = DataAPI.refarray(x)
+            inds = copyto!(similar(Vector{signedtype(eltype(refa))}, length(refa)), refa)
         end
-        # adjust to "offset" instead of index
-        for i = 1:length(inds)
-            @inbounds inds[i] -= 1
-        end
-        pool = DataAPI.refpool(x)
         # horrible hack? yes. better than taking CategoricalArrays dependency? also yes.
         if typeof(pool).name.name == :CategoricalRefPool
-            pool = [get(pool[i]) for i = 1:length(pool)]
+            if eltype(x) >: Missing
+                pool = vcat(missing, DataAPI.levels(x))
+            else
+                pool = DataAPI.levels(x)
+                for i = 1:length(inds)
+                    @inbounds inds[i] -= 1
+                end
+            end
+        else
+            # adjust to "offset" instead of index
+            for i = 1:length(inds)
+                @inbounds inds[i] -= 1
+            end
         end
         data = arrowvector(pool, i, nl, fi, de, ded, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
         encoding = DictEncoding{eltype(data), typeof(data)}(id, data, false, getmetadata(data))

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-using Test, Arrow, Tables, Dates, PooledArrays, TimeZones, UUIDs
+using Test, Arrow, Tables, Dates, PooledArrays, TimeZones, UUIDs, CategoricalArrays
 
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/integrationtest.jl"))
@@ -215,6 +215,25 @@ tt = Arrow.Table(io)
 x = PooledArray(["hey", missing])
 x2 = Arrow.toarrowvector(x)
 @test isequal(copy(x2), x)
+
+# some dict encoding coverage
+
+# signed indices for DictEncodedType #112 #113 #114
+av = Arrow.toarrowvector(PooledArray(repeat(["a", "b"], inner = 5)))
+@test isa(first(av.indices), Signed)
+
+av = Arrow.toarrowvector(CategoricalArray(repeat(["a", "b"], inner = 5)))
+@test isa(first(av.indices), Signed)
+
+av = Arrow.toarrowvector(CategoricalArray(["a", "bb", missing]))
+@test isa(first(av.indices), Signed)
+@test length(av) == 3
+@test eltype(av) == Union{String, Missing}
+
+av = Arrow.toarrowvector(CategoricalArray(["a", "bb", "ccc"]))
+@test isa(first(av.indices), Signed)
+@test length(av) == 3
+@test eltype(av) == String
 
 end # @testset "misc"
 
