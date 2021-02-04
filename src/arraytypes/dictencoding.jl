@@ -90,6 +90,11 @@ isdictencoded(d::DictEncoded) = true
 isdictencoded(x) = false
 isdictencoded(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = true
 
+function signedtype(n::Integer)
+    typs = (Int8, Int16, Int32, Int64)
+    typs[something(findfirst(n .≤ typemax.(typs)), 4)]
+end
+
 signedtype(::Type{UInt8}) = Int8
 signedtype(::Type{UInt16}) = Int16
 signedtype(::Type{UInt32}) = Int32
@@ -122,7 +127,7 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
         else
             pool = DataAPI.refpool(x)
             refa = DataAPI.refarray(x)
-            inds = copyto!(similar(Vector{signedtype(eltype(refa))}, length(refa)), refa)
+            inds = copyto!(similar(Vector{signedtype(length(pool))}, length(refa)), refa)
         end
         # horrible hack? yes. better than taking CategoricalArrays dependency? also yes.
         if typeof(pool).name.name == :CategoricalRefPool

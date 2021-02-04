@@ -235,6 +235,13 @@ av = Arrow.toarrowvector(CategoricalArray(["a", "bb", "ccc"]))
 @test length(av) == 3
 @test eltype(av) == String
 
+# 121
+
+a = PooledArray(repeat(string.('S', 1:130), inner=5), compress=true)
+@test eltype(a.refs) == UInt8
+av = Arrow.toarrowvector(a)
+@test eltype(av.indices) == Int16
+
 end # @testset "misc"
 
 end
