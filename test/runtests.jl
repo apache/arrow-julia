@@ -236,11 +236,18 @@ av = Arrow.toarrowvector(CategoricalArray(["a", "bb", "ccc"]))
 @test eltype(av) == String
 
 # 121
-
 a = PooledArray(repeat(string.('S', 1:130), inner=5), compress=true)
 @test eltype(a.refs) == UInt8
 av = Arrow.toarrowvector(a)
 @test eltype(av.indices) == Int16
+
+# 123
+t = (x = collect(zip(rand(10), rand(10))),)
+io = IOBuffer()
+Arrow.write(io, t)
+seekstart(io)
+t2 = Arrow.Table(io)
+@test t2.x == t.x
 
 end # @testset "misc"
 
