@@ -38,7 +38,7 @@ Base.size(l::FixedSizeList) = (l.ℓ,)
         return missing
     else
         off = (i - 1) * N
-        if X === T && isbitstype(Y)
+        if X === T && isbitstype(Y) && l.data isa Vector{UInt8}
             tup = _unsafe_load_tuple(NTuple{N,Y}, l.data, off + 1)
         else
             tup = ntuple(j->l.data[off + j], N)
