@@ -54,13 +54,13 @@ end # @testset "arrow json integration tests"
 @testset "misc" begin
 
 # multiple record batches
-t = Tables.partitioner(((col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],), (col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],)))
+t = Tables.partitioner(((col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],), (col1=Union{Int64, Missing}[missing,11],)))
 io = IOBuffer()
 Arrow.write(io, t)
 seekstart(io)
 tt = Arrow.Table(io)
 @test length(tt) == 1
-@test isequal(tt.col1, vcat([1,2,3,4,5,6,7,8,9,missing], [1,2,3,4,5,6,7,8,9,missing]))
+@test isequal(tt.col1, vcat([1,2,3,4,5,6,7,8,9,missing], [missing,11]))
 @test eltype(tt.col1) === Union{Int64, Missing}
 
 # Arrow.Stream
@@ -76,9 +76,12 @@ state = iterate(str, st)
 @test state !== nothing
 tt, st = state
 @test length(tt) == 1
-@test isequal(tt.col1, [1,2,3,4,5,6,7,8,9,missing])
+@test isequal(tt.col1, [missing,11])
 
 @test iterate(str, st) === nothing
+
+@test isequal(collect(str)[1].col1, [1,2,3,4,5,6,7,8,9,missing])
+@test isequal(collect(str)[2].col1, [missing,11])
 
 # dictionary batch isDelta
 t = (

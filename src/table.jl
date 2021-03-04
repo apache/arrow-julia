@@ -84,6 +84,8 @@ function Stream(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothi
     return Stream(batchiterator, pos, names, schema, dictencodings, dictencoded, convert)
 end
 
+Base.IteratorSize(::Type{Stream}) = Base.SizeUnknown()
+
 function Base.iterate(x::Stream, (pos, id)=(x.pos, 1))
     columns = AbstractVector[]
     while true
