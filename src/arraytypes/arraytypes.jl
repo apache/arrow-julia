@@ -33,6 +33,9 @@ getmetadata(x::ArrowVector) = x.metadata
 function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Vector{LZ4FrameCompressor}, LZ4FrameCompressor, Vector{ZstdCompressor}, ZstdCompressor}=nothing, kw...)
     @debug 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(kw.data)"
     @debug 3 x
+    if eltype(x).name.name === :CategoricalPool
+        error("CategoricalPool is a recursive data structure and not allowed for serializing; ensure data (`tbl`) passed to `Arrow.write(_, tbl)` is a valid Tables.jl table")
+    end
     A = arrowvector(x, i, 0, 0, de, ded, meta; compression=compression, kw...)
     if compression isa LZ4FrameCompressor
         A = compress(Meta.CompressionType.LZ4_FRAME, compression, A)

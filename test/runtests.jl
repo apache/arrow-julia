@@ -252,6 +252,9 @@ seekstart(io)
 t2 = Arrow.Table(io)
 @test t2.x == t.x
 
+# 143
+@test_throws ErrorException Arrow.write(IOBuffer(), CategoricalArray([1,2,3]))
+
 end # @testset "misc"
 
 end
