@@ -144,7 +144,7 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     wait(tsk)
     # write empty message
     if !writetofile
-        Base.write(io, Message(UInt8[], nothing, 0, true, false), blocks, sch, alignment)
+        Base.write(io, Message(UInt8[], nothing, 0, true, false, Meta.Schema), blocks, sch, alignment)
     end
     if writetofile
         b = FlatBuffers.Builder(1024)
@@ -223,6 +223,7 @@ struct Message
     bodylen
     isrecordbatch::Bool
     blockmsg::Bool
+    headerType
 end
 
 struct Block
@@ -233,7 +234,7 @@ end
 
 function Base.write(io::IO, msg::Message, blocks, sch, alignment)
     metalen = padding(length(msg.msgflatbuf), alignment)
-    @debug 1 "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch)"
+    @debug -1 "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch), headerType = $(msg.headerType)"
     if msg.blockmsg
         push!(blocks[msg.isrecordbatch ? 1 : 2], Block(position(io), metalen + 8, msg.bodylen))
     end
@@ -266,7 +267,7 @@ function makemessage(b, headerType, header, columns=nothing, bodylen=0)
     # Meta.messageStartCustomMetadataVector(b, num_meta_elems)
     msg = Meta.messageEnd(b)
     FlatBuffers.finish!(b, msg)
-    return Message(FlatBuffers.finishedbytes(b), columns, bodylen, headerType == Meta.RecordBatch, headerType == Meta.RecordBatch || headerType == Meta.DictionaryBatch)
+    return Message(FlatBuffers.finishedbytes(b), columns, bodylen, headerType == Meta.RecordBatch, headerType == Meta.RecordBatch || headerType == Meta.DictionaryBatch, headerType)
 end
 
 function makeschema(b, sch::Tables.Schema{names}, columns) where {names}
