@@ -252,6 +252,14 @@ seekstart(io)
 t2 = Arrow.Table(io)
 @test t2.x == t.x
 
+# 144
+t = Tables.partitioner(((a=Arrow.DictEncode([1,2,3]),), (a=Arrow.DictEncode(fill(1, 129)),)))
+io = IOBuffer()
+Arrow.write(io, t)
+seekstart(io)
+tt = Arrow.Table(io)
+@test length(tt.a) == 132
+
 end # @testset "misc"
 
 end
