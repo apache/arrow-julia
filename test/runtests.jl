@@ -260,6 +260,30 @@ seekstart(io)
 tt = Arrow.Table(io)
 @test length(tt.a) == 132
 
+# 126
+t = Tables.partitioner(
+    (
+        (a=Arrow.toarrowvector(PooledArray([1,2,3  ])),),
+        (a=Arrow.toarrowvector(PooledArray([1,2,3,4])),),
+        (a=Arrow.toarrowvector(PooledArray([1,2,3,4,5])),),
+    )
+)
+io = IOBuffer()
+Arrow.write(io, t)
+seekstart(io)
+tt = Arrow.Table(io)
+@test length(tt.a) == 12
+@test tt.a == [1, 2, 3, 1, 2, 3, 4, 1, 2, 3, 4, 5]
+
+t = Tables.partitioner(
+    (
+        (a=Arrow.toarrowvector(PooledArray([1,2,3  ], signed=true, compress=true)),),
+        (a=Arrow.toarrowvector(PooledArray(collect(1:129))),),
+    )
+)
+io = IOBuffer()
+@test_throws CompositeException Arrow.write(io, t)
+
 end # @testset "misc"
 
 end
