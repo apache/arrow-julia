@@ -20,13 +20,26 @@
 Represents the "pool" of possible values for a [`DictEncoded`](@ref)
 array type. Whether the order of values is significant can be checked
 by looking at the `isOrdered` boolean field.
+
+The `S` type parameter, while not tied directly to any field, is the
+signed integer "index type" of the parent DictEncoded. We keep track
+of this in the DictEncoding in order to validate the length of the pool
+doesn't exceed the index type limit. The general workflow of writing arrow
+data means the initial schema will typically be based off the data in the
+first record batch, and subsequent record batches need to match the same
+schema exactly. For example, if a non-first record batch dict encoded column
+were to cause a DictEncoding pool to overflow on unique values, a fatal error
+should be thrown.
 """
-mutable struct DictEncoding{T, A} <: ArrowVector{T}
+mutable struct DictEncoding{T, S, A} <: ArrowVector{T}
     id::Int64
     data::A
     isOrdered::Bool
     metadata::Union{Nothing, Dict{String, String}}
 end
+
+indextype(::Type{DictEncoding{T, S, A}}) where {T, S, A} = S
+indextype(::T) where {T <: DictEncoding} = indextype(T)
 
 Base.size(d::DictEncoding) = size(d.data)
 
@@ -77,11 +90,11 @@ struct DictEncoded{T, S, A} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     validity::ValidityBitmap
     indices::Vector{S}
-    encoding::DictEncoding{T, A}
+    encoding::DictEncoding{T, S, A}
     metadata::Union{Nothing, Dict{String, String}}
 end
 
-DictEncoded(b::Vector{UInt8}, v::ValidityBitmap, inds::Vector{S}, encoding::DictEncoding{T, A}, meta) where {S, T, A} =
+DictEncoded(b::Vector{UInt8}, v::ValidityBitmap, inds::Vector{S}, encoding::DictEncoding{T, S, A}, meta) where {S, T, A} =
     DictEncoded{T, S, A}(b, v, inds, encoding, meta)
 
 Base.size(d::DictEncoded) = size(d.indices)
@@ -146,7 +159,7 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
             end
         end
         data = arrowvector(pool, i, nl, fi, de, ded, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
-        encoding = DictEncoding{eltype(data), typeof(data)}(id, data, false, getmetadata(data))
+        encoding = DictEncoding{eltype(data), eltype(inds), typeof(data)}(id, data, false, getmetadata(data))
         de[id] = Lockable(encoding)
     else
         # encoding already exists
@@ -157,7 +170,7 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
         @lock encodinglockable begin
             encoding = encodinglockable.x
             len = length(x)
-            ET = encodingtype(len)
+            ET = indextype(encoding)
             pool = Dict{Union{eltype(encoding), eltype(x)}, ET}(a => (b - 1) for (b, a) in enumerate(encoding))
             deltas = eltype(x)[]
             inds = Vector{ET}(undef, len)
@@ -168,17 +181,20 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
                 end
                 @inbounds inds[j] = get!(pool, val) do
                     push!(deltas, val)
-                    length(pool)
+                    return length(pool)
                 end
             end
             if !isempty(deltas)
+                if length(deltas) + length(encoding) > typemax(ET)
+                    error("fatal error serializing dict encoded column with ref index type of $ET; subsequent record batch unique values resulted in $(length(deltas) + length(encoding)) unique values, which exceeds possible index values in $ET")
+                end
                 data = arrowvector(deltas, i, nl, fi, de, ded, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
-                push!(ded, DictEncoding{eltype(data), typeof(data)}(id, data, false, getmetadata(data)))
+                push!(ded, DictEncoding{eltype(data), ET, typeof(data)}(id, data, false, getmetadata(data)))
                 if typeof(encoding.data) <: ChainedVector
                     append!(encoding.data, data)
                 else
                     data2 = ChainedVector([encoding.data, data])
-                    encoding = DictEncoding{eltype(data2), typeof(data2)}(id, data2, false, getmetadata(encoding))
+                    encoding = DictEncoding{eltype(data2), ET, typeof(data2)}(id, data2, false, getmetadata(encoding))
                     de[id] = Lockable(encoding)
                 end
             end
