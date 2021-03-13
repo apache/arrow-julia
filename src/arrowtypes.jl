@@ -143,16 +143,16 @@ default(::Type{T}) where {T <: Tuple} = Tuple(default(fieldtype(T, i)) for i = 1
 default(::Type{Dict{K, V}}) where {K, V} = Dict{K, V}()
 default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{names}(Tuple(default(fieldtype(types, i)) for i = 1:length(names)))
 
-const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Type, Tuple{String, Type}}(
-    Char => ("JuliaLang.Char", UInt32),
-    Symbol => ("JuliaLang.Symbol", String),
-    UUID => ("JuliaLang.UUID", NTuple{16,UInt8}),
+const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Symbol, Tuple{String, Type}}(
+    :Char => ("JuliaLang.Char", UInt32),
+    :Symbol => ("JuliaLang.Symbol", String),
+    :UUID => ("JuliaLang.UUID", NTuple{16,UInt8}),
 )
 
-istyperegistered(::Type{T}) where {T} = haskey(JULIA_TO_ARROW_TYPE_MAPPING, T)
+istyperegistered(::Type{T}) where {T} = haskey(JULIA_TO_ARROW_TYPE_MAPPING, nameof(T))
 
 function getarrowtype!(meta, ::Type{T}) where {T}
-    arrowname, arrowtype = JULIA_TO_ARROW_TYPE_MAPPING[T]
+    arrowname, arrowtype = JULIA_TO_ARROW_TYPE_MAPPING[nameof(T)]
     meta["ARROW:extension:name"] = arrowname
     meta["ARROW:extension:metadata"] = ""
     return arrowtype
@@ -179,7 +179,7 @@ end
 
 function registertype!(juliatype::Type, arrowtype::Type, arrowname::String=string("JuliaLang.", string(juliatype)))
     # TODO: validate that juliatype isn't already default arrow type
-    JULIA_TO_ARROW_TYPE_MAPPING[juliatype] = (arrowname, arrowtype)
+    JULIA_TO_ARROW_TYPE_MAPPING[nameof(juliatype)] = (arrowname, arrowtype)
     ARROW_TO_JULIA_TYPE_MAPPING[arrowname] = (juliatype, arrowtype)
     return
 end
