@@ -234,7 +234,7 @@ end
 
 function Base.write(io::IO, msg::Message, blocks, sch, alignment)
     metalen = padding(length(msg.msgflatbuf), alignment)
-    @debug -1 "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch), headerType = $(msg.headerType)"
+    @debug 1 "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch), headerType = $(msg.headerType)"
     if msg.blockmsg
         push!(blocks[msg.isrecordbatch ? 1 : 2], Block(position(io), metalen + 8, msg.bodylen))
     end
@@ -396,7 +396,7 @@ end
 
 function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, alignment) where {names, types}
     nrows = Tables.rowcount(columns)
-    
+
     compress = nothing
     fieldnodes = FieldNode[]
     fieldbuffers = Buffer[]
