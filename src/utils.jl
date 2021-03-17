@@ -198,3 +198,10 @@ Lockable(x) = Lockable(x, ReentrantLock())
 
 Base.lock(x::Lockable) = lock(x.lock)
 Base.unlock(x::Lockable) = unlock(x.lock)
+
+function tobuffer(data; kwargs...)
+    io = IOBuffer()
+    write(io, data; kwargs...)
+    seekstart(io)
+    return io
+end

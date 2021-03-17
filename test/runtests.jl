@@ -55,9 +55,7 @@ end # @testset "arrow json integration tests"
 
 # multiple record batches
 t = Tables.partitioner(((col1=Union{Int64, Missing}[1,2,3,4,5,6,7,8,9,missing],), (col1=Union{Int64, Missing}[missing,11],)))
-io = IOBuffer()
-Arrow.write(io, t)
-seekstart(io)
+io = Arrow.tobuffer(t)
 tt = Arrow.Table(io)
 @test length(tt) == 1
 @test isequal(tt.col1, vcat([1,2,3,4,5,6,7,8,9,missing], [missing,11]))
@@ -95,10 +93,7 @@ t2 = (
     col3=NamedTuple{(:a, :b), Tuple{Int64, Union{Missing, NamedTuple{(:c,), Tuple{String}}}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(5), b=(c="sailor2",)), (a=Int64(4), b=(c="jo-bob",))]
 )
 tt = Tables.partitioner((t, t2))
-io = IOBuffer()
-Arrow.write(io, tt; dictencode=true, dictencodenested=true)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(tt; dictencode=true, dictencodenested=true))
 @test tt.col1 == [1,2,3,4,1,2,5,6]
 @test isequal(tt.col2, ["hey", "there", "sailor", missing, "hey", "there", "sailor2", missing])
 @test isequal(tt.col3, vcat(NamedTuple{(:a, :b), Tuple{Int64, Union{Missing, NamedTuple{(:c,), Tuple{String}}}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(3), b=(c="sailor",)), (a=Int64(4), b=(c="jo-bob",))], NamedTuple{(:a, :b), Tuple{Int64, Union{Missing, NamedTuple{(:c,), Tuple{String}}}}}[(a=Int64(1), b=missing), (a=Int64(1), b=missing), (a=Int64(5), b=(c="sailor2",)), (a=Int64(4), b=(c="jo-bob",))]))
@@ -108,10 +103,7 @@ meta = Dict("key1" => "value1", "key2" => "value2")
 Arrow.setmetadata!(t, meta)
 meta2 = Dict("colkey1" => "colvalue1", "colkey2" => "colvalue2")
 Arrow.setmetadata!(t.col1, meta2)
-io = IOBuffer()
-Arrow.write(io, t)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t))
 @test length(tt) == length(t)
 @test tt.col1 == t.col1
 @test eltype(tt.col1) === Int64
@@ -122,39 +114,27 @@ tt = Arrow.Table(io)
 lz4 = Arrow.CodecLz4.LZ4FrameCompressor(; compressionlevel=8)
 Arrow.CodecLz4.TranscodingStreams.initialize(lz4)
 t = (col1=Int64[1,2,3,4,5,6,7,8,9,10],)
-io = IOBuffer()
-Arrow.write(io, t; compress=lz4)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t; compress=lz4))
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
 zstd = Arrow.CodecZstd.ZstdCompressor(; level=8)
 Arrow.CodecZstd.TranscodingStreams.initialize(zstd)
 t = (col1=Int64[1,2,3,4,5,6,7,8,9,10],)
-io = IOBuffer()
-Arrow.write(io, t; compress=zstd)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t; compress=zstd))
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
 # custom alignment
 t = (col1=Int64[1,2,3,4,5,6,7,8,9,10],)
-io = IOBuffer()
-Arrow.write(io, t; alignment=64)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t; alignment=64))
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
 # 53
 s = "a" ^ 100
 t = (a=[SubString(s, 1:10), SubString(s, 11:20)],)
-io = IOBuffer()
-Arrow.write(io, t)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t))
 @test tt.a == ["aaaaaaaaaa", "aaaaaaaaaa"]
 
 # 49
@@ -162,10 +142,7 @@ tt = Arrow.Table(io)
 
 # 52
 t = (a=Arrow.DictEncode(string.(1:129)),)
-io = IOBuffer()
-Arrow.write(io, t)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t))
 
 # 60: unequal column lengths
 io = IOBuffer()
@@ -173,27 +150,18 @@ io = IOBuffer()
 
 # nullability of custom extension types
 t = (a=['a', missing],)
-io = IOBuffer()
-Arrow.write(io, t)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t))
 @test isequal(tt.a, ['a', missing])
 
 # automatic custom struct serialization/deserialization
 t = (col1=[CustomStruct(1, 2.3, "hey"), CustomStruct(4, 5.6, "there")],)
-io = IOBuffer()
-Arrow.write(io, t)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t))
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
 # 76
 t = (col1=NamedTuple{(:a,),Tuple{Union{Int,String}}}[(a=1,), (a="x",)],)
-io = IOBuffer()
-Arrow.write(io, t)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t))
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
@@ -206,10 +174,7 @@ u = 0x6036fcbd20664bd8a65cdfa25434513f
 
 # 98
 t = (a = [Nanosecond(0), Nanosecond(1)], b = [uuid4(), uuid4()], c = [missing, Nanosecond(1)])
-io = IOBuffer()
-Arrow.write(io, t)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t))
 @test copy(tt.a) isa Vector{Nanosecond}
 @test copy(tt.b) isa Vector{UUID}
 @test copy(tt.c) isa Vector{Union{Missing,Nanosecond}}
@@ -246,18 +211,12 @@ av = Arrow.toarrowvector(a)
 
 # 123
 t = (x = collect(zip(rand(10), rand(10))),)
-io = IOBuffer()
-Arrow.write(io, t)
-seekstart(io)
-t2 = Arrow.Table(io)
-@test t2.x == t.x
+tt = Arrow.Table(Arrow.tobuffer(t))
+@test tt.x == t.x
 
 # 144
 t = Tables.partitioner(((a=Arrow.DictEncode([1,2,3]),), (a=Arrow.DictEncode(fill(1, 129)),)))
-io = IOBuffer()
-Arrow.write(io, t)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t))
 @test length(tt.a) == 132
 
 # 126
@@ -268,10 +227,7 @@ t = Tables.partitioner(
         (a=Arrow.toarrowvector(PooledArray([1,2,3,4,5])),),
     )
 )
-io = IOBuffer()
-Arrow.write(io, t)
-seekstart(io)
-tt = Arrow.Table(io)
+tt = Arrow.Table(Arrow.tobuffer(t))
 @test length(tt.a) == 12
 @test tt.a == [1, 2, 3, 1, 2, 3, 4, 1, 2, 3, 4, 5]
 
