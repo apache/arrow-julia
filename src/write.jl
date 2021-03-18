@@ -146,6 +146,10 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
             end
         end
     end
+    if anyerror[]
+        @error "error writing arrow data on partition = $(errorref[][3])" exception=(errorref[][1], errorref[][2])
+        error("fatal error writing arrow data")
+    end
     # close our message-writing channel, no further put!-ing is allowed
     close(msgs)
     # now wait for our message-writing task to finish writing

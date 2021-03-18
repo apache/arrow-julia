@@ -133,7 +133,6 @@ function arrowvector(::DictEncodedType, x::DictEncoded, i, nl, fi, de, ded, meta
             # in this case, we just need to check if any values in our local pool need to be delta dicationary serialized
             deltas = setdiff(x.encoding, encoding)
             if !isempty(deltas)
-                @show deltas
                 ET = indextype(encoding)
                 if length(deltas) + length(encoding) > typemax(ET)
                     error("fatal error serializing dict encoded column with ref index type of $ET; subsequent record batch unique values resulted in $(length(deltas) + length(encoding)) unique values, which exceeds possible index values in $ET")
