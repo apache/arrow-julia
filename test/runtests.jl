@@ -238,7 +238,7 @@ t = Tables.partitioner(
     )
 )
 io = IOBuffer()
-@test_throws CompositeException Arrow.write(io, t)
+@test_throws ErrorException Arrow.write(io, t)
 
 end # @testset "misc"
 
