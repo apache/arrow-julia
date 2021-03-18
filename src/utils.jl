@@ -189,12 +189,19 @@ function Base.close(ch::OrderedChannel)
     return
 end
 
-struct Lockable{T}
-    x::T
+mutable struct Lockable
+    x
     lock::ReentrantLock
 end
 
-Lockable(x::T) where {T} = Lockable{T}(x, ReentrantLock())
+Lockable(x) = Lockable(x, ReentrantLock())
 
 Base.lock(x::Lockable) = lock(x.lock)
 Base.unlock(x::Lockable) = unlock(x.lock)
+
+function tobuffer(data; kwargs...)
+    io = IOBuffer()
+    write(io, data; kwargs...)
+    seekstart(io)
+    return io
+end

@@ -1,6 +1,8 @@
 Manifest.toml
+.DS_STORE
 *.jl.cov
 *.jl.*.cov
 *.jl.mem
 
 test/_scrap.jl
+.DS_STORE

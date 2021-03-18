@@ -44,14 +44,6 @@ struct PrimitiveType <: ArrowType end
 ArrowType(::Type{<:Integer}) = PrimitiveType()
 ArrowType(::Type{<:AbstractFloat}) = PrimitiveType()
 
-arrowconvert(::Type{UInt128}, u::UUID) = UInt128(u)
-arrowconvert(::Type{UUID}, u::UInt128) = UUID(u)
-
-# This method is included as a deprecation path to allow reading Arrow files that may have
-# been written before Arrow.jl defined its own UUID <-> UInt128 mapping (in which case
-# a struct-based fallback `JuliaLang.UUID` extension type may have been utilized)
-arrowconvert(::Type{UUID}, u::NamedTuple{(:value,),Tuple{UInt128}}) = UUID(u.value)
-
 struct BoolType <: ArrowType end
 ArrowType(::Type{Bool}) = BoolType()
 
@@ -76,6 +68,35 @@ struct FixedSizeListType <: ArrowType end
 ArrowType(::Type{NTuple{N, T}}) where {N, T} = FixedSizeListType()
 gettype(::Type{NTuple{N, T}}) where {N, T} = T
 getsize(::Type{NTuple{N, T}}) where {N, T} = N
+
+ArrowType(::Type{UUID}) = FixedSizeListType()
+gettype(::Type{UUID}) = UInt8
+getsize(::Type{UUID}) = 16
+
+function _cast(::Type{Y}, x)::Y where {Y}
+    y = Ref{Y}()
+    _unsafe_cast!(y, Ref(x), 1)
+    return y[]
+end
+
+function _unsafe_cast!(y::Ref{Y}, x::Ref, n::Integer) where {Y}
+    X = eltype(x)
+    GC.@preserve x y begin
+        ptr_x = Base.unsafe_convert(Ptr{X}, x)
+        ptr_y = Base.unsafe_convert(Ptr{Y}, y)
+        unsafe_copyto!(Ptr{X}(ptr_y), ptr_x, n)
+    end
+    return y
+end
+
+arrowconvert(::Type{NTuple{16,UInt8}}, u::UUID) = _cast(NTuple{16,UInt8}, u.value)
+arrowconvert(::Type{UUID}, u::NTuple{16,UInt8}) = UUID(_cast(UInt128, u))
+
+# These methods are included as deprecation paths to allow reading Arrow files that may have
+# been written before Arrow.jl's current UUID <-> NTuple{16,UInt8} mapping existed (in which case
+# a struct-based fallback `JuliaLang.UUID` extension type may have been utilized)
+arrowconvert(::Type{UUID}, u::NamedTuple{(:value,),Tuple{UInt128}}) = UUID(u.value)
+arrowconvert(::Type{UUID}, u::UInt128) = UUID(u)
 
 struct StructType <: ArrowType end
 
@@ -125,7 +146,7 @@ default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{name
 const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Type, Tuple{String, Type}}(
     Char => ("JuliaLang.Char", UInt32),
     Symbol => ("JuliaLang.Symbol", String),
-    UUID => ("JuliaLang.UUID", UInt128),
+    UUID => ("JuliaLang.UUID", NTuple{16,UInt8}),
 )
 
 istyperegistered(::Type{T}) where {T} = haskey(JULIA_TO_ARROW_TYPE_MAPPING, T)
@@ -140,7 +161,7 @@ end
 const ARROW_TO_JULIA_TYPE_MAPPING = Dict{String, Tuple{Type, Type}}(
     "JuliaLang.Char" => (Char, UInt32),
     "JuliaLang.Symbol" => (Symbol, String),
-    "JuliaLang.UUID" => (UUID, UInt128),
+    "JuliaLang.UUID" => (UUID, NTuple{16,UInt8}),
 )
 
 function extensiontype(f, meta)

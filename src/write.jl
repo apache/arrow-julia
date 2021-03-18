@@ -39,6 +39,8 @@ to table, column, and other objects).
 """
 getmetadata(x, default=nothing) = get(OBJ_METADATA, x, default)
 
+const DEFAULT_MAX_DEPTH = 6
+
 """
     Arrow.write(io::IO, tbl)
     Arrow.write(file::String, tbl)
@@ -66,28 +68,29 @@ Supported keyword arguments to `Arrow.write` include:
   * `dictencodenested::Bool=false`: whether nested data type columns should also dict encode nested arrays/buffers; other language implementations [may not support this](https://arrow.apache.org/docs/status.html)
   * `denseunions::Bool=true`: whether Julia `Vector{<:Union}` arrays should be written using the dense union layout; passing `false` will result in the sparse union layout
   * `largelists::Bool=false`: causes list column types to be written with Int64 offset arrays; mainly for testing purposes; by default, Int64 offsets will be used only if needed
+  * `maxdepth::Int=$DEFAULT_MAX_DEPTH`: deepest allowed nested serialization level; this is provided by default to prevent accidental infinite recursion with mutually recursive data structures
   * `file::Bool=false`: if a an `io` argument is being written to, passing `file=true` will cause the arrow file format to be written instead of just IPC streaming
 """
 function write end
 
 write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
 
-function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, ntasks=Inf)
+function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, maxdepth::Int=DEFAULT_MAX_DEPTH, ntasks=Inf)
     open(file, "w") do io
-        write(io, tbl, true, largelists, compress, denseunions, dictencode, dictencodenested, alignment, ntasks)
+        write(io, tbl, true, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
     end
     return file
 end
 
-function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, ntasks=Inf, file::Bool=false)
-    return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment, ntasks)
+function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, maxdepth::Int=DEFAULT_MAX_DEPTH, ntasks=Inf, file::Bool=false)
+    return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
 end
 
-function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment, ntasks)
+function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
     if compress === :lz4
-        compress = LZ4_FRAME_COMPRESSOR[]
+        compress = LZ4_FRAME_COMPRESSOR
     elseif compress === :zstd
-        compress = ZSTD_COMPRESSOR[]
+        compress = ZSTD_COMPRESSOR
     elseif compress isa Symbol
         throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
     end
@@ -108,7 +111,7 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     @sync for (i, tbl) in enumerate(Tables.partitions(source))
         @debug 1 "processing table partition i = $i"
         if i == 1
-            cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested)
+            cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
             sch[] = Tables.schema(cols)
             firstcols[] = cols
             put!(msgs, makeschemamsg(sch[], cols), i)
@@ -124,7 +127,7 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
             put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
         else
             Threads.@spawn begin
-                cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested)
+                cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
                 if !isempty(cols.dictencodingdeltas)
                     for de in cols.dictencodingdeltas
                         dictsch = Tables.Schema((:col,), (eltype(de.data),))
@@ -141,7 +144,7 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     wait(tsk)
     # write empty message
     if !writetofile
-        Base.write(io, Message(UInt8[], nothing, 0, true, false), blocks, sch, alignment)
+        Base.write(io, Message(UInt8[], nothing, 0, true, false, Meta.Schema), blocks, sch, alignment)
     end
     if writetofile
         b = FlatBuffers.Builder(1024)
@@ -188,7 +191,7 @@ struct ToArrowTable
     dictencodingdeltas::Vector{DictEncoding}
 end
 
-function toarrowtable(x, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested)
+function toarrowtable(x, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
     @debug 1 "converting input table to arrow formatted columns"
     cols = Tables.columns(x)
     meta = getmetadata(cols)
@@ -199,7 +202,7 @@ function toarrowtable(x, dictencodings, largelists, compress, denseunions, dicte
     newtypes = Vector{Type}(undef, N)
     dictencodingdeltas = DictEncoding[]
     Tables.eachcolumn(sch, cols) do col, i, nm
-        newcol = toarrowvector(col, i, dictencodings, dictencodingdeltas; compression=compress, largelists=largelists, denseunions=denseunions, dictencode=dictencode, dictencodenested=dictencodenested)
+        newcol = toarrowvector(col, i, dictencodings, dictencodingdeltas; compression=compress, largelists=largelists, denseunions=denseunions, dictencode=dictencode, dictencodenested=dictencodenested, maxdepth=maxdepth)
         newtypes[i] = eltype(newcol)
         newcols[i] = newcol
     end
@@ -220,6 +223,7 @@ struct Message
     bodylen
     isrecordbatch::Bool
     blockmsg::Bool
+    headerType
 end
 
 struct Block
@@ -230,7 +234,7 @@ end
 
 function Base.write(io::IO, msg::Message, blocks, sch, alignment)
     metalen = padding(length(msg.msgflatbuf), alignment)
-    @debug 1 "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch)"
+    @debug 1 "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch), headerType = $(msg.headerType)"
     if msg.blockmsg
         push!(blocks[msg.isrecordbatch ? 1 : 2], Block(position(io), metalen + 8, msg.bodylen))
     end
@@ -263,7 +267,7 @@ function makemessage(b, headerType, header, columns=nothing, bodylen=0)
     # Meta.messageStartCustomMetadataVector(b, num_meta_elems)
     msg = Meta.messageEnd(b)
     FlatBuffers.finish!(b, msg)
-    return Message(FlatBuffers.finishedbytes(b), columns, bodylen, headerType == Meta.RecordBatch, headerType == Meta.RecordBatch || headerType == Meta.DictionaryBatch)
+    return Message(FlatBuffers.finishedbytes(b), columns, bodylen, headerType == Meta.RecordBatch, headerType == Meta.RecordBatch || headerType == Meta.DictionaryBatch, headerType)
 end
 
 function makeschema(b, sch::Tables.Schema{names}, columns) where {names}
@@ -392,7 +396,7 @@ end
 
 function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, alignment) where {names, types}
     nrows = Tables.rowcount(columns)
-    
+
     compress = nothing
     fieldnodes = FieldNode[]
     fieldbuffers = Buffer[]

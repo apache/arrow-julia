@@ -30,23 +30,32 @@ validitybitmap(x::ArrowVector) = x.validity
 nullcount(x::ArrowVector) = validitybitmap(x).nc
 getmetadata(x::ArrowVector) = x.metadata
 
-function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, LZ4FrameCompressor, ZstdCompressor}=nothing, kw...)
+function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Vector{LZ4FrameCompressor}, LZ4FrameCompressor, Vector{ZstdCompressor}, ZstdCompressor}=nothing, kw...)
     @debug 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(kw.data)"
     @debug 3 x
     A = arrowvector(x, i, 0, 0, de, ded, meta; compression=compression, kw...)
     if compression isa LZ4FrameCompressor
         A = compress(Meta.CompressionType.LZ4_FRAME, compression, A)
+    elseif compression isa Vector{LZ4FrameCompressor}
+        A = compress(Meta.CompressionType.LZ4_FRAME, compression[Threads.threadid()], A)
     elseif compression isa ZstdCompressor
         A = compress(Meta.CompressionType.ZSTD, compression, A)
+    elseif compression isa Vector{ZstdCompressor}
+        A = compress(Meta.CompressionType.ZSTD, compression[Threads.threadid()], A)
     end
     @debug 2 "converted top-level column to arrow format: $(typeof(A))"
     @debug 3 A
     return A
 end
 
-function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dictencode::Bool=false, kw...)
+function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dictencode::Bool=false, maxdepth::Int=DEFAULT_MAX_DEPTH, kw...)
+    if nl > maxdepth
+        error("reached nested serialization level ($nl) deeper than provided max depth argument ($(maxdepth)); to increase allowed nesting level, pass `maxdepth=X`")
+    end
     if !(x isa DictEncode) && !dictencoding && (dictencode || (x isa AbstractArray && DataAPI.refarray(x) !== x))
         x = DictEncode(x, dictencodeid(i, nl, fi))
+    elseif x isa DictEncoded
+        return arrowvector(DictEncodeType, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)    
     end
     S = maybemissing(eltype(x))
     return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)

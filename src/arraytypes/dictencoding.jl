@@ -20,13 +20,26 @@
 Represents the "pool" of possible values for a [`DictEncoded`](@ref)
 array type. Whether the order of values is significant can be checked
 by looking at the `isOrdered` boolean field.
+
+The `S` type parameter, while not tied directly to any field, is the
+signed integer "index type" of the parent DictEncoded. We keep track
+of this in the DictEncoding in order to validate the length of the pool
+doesn't exceed the index type limit. The general workflow of writing arrow
+data means the initial schema will typically be based off the data in the
+first record batch, and subsequent record batches need to match the same
+schema exactly. For example, if a non-first record batch dict encoded column
+were to cause a DictEncoding pool to overflow on unique values, a fatal error
+should be thrown.
 """
-mutable struct DictEncoding{T, A} <: ArrowVector{T}
+mutable struct DictEncoding{T, S, A} <: ArrowVector{T}
     id::Int64
     data::A
     isOrdered::Bool
     metadata::Union{Nothing, Dict{String, String}}
 end
+
+indextype(::Type{DictEncoding{T, S, A}}) where {T, S, A} = S
+indextype(::T) where {T <: DictEncoding} = indextype(T)
 
 Base.size(d::DictEncoding) = size(d.data)
 
@@ -59,6 +72,7 @@ Base.size(x::DictEncode) = (length(x.data),)
 Base.iterate(x::DictEncode, st...) = iterate(x.data, st...)
 Base.getindex(x::DictEncode, i::Int) = getindex(x.data, i)
 ArrowTypes.ArrowType(::Type{<:DictEncodeType}) = DictEncodedType()
+Base.copy(x::DictEncode) = DictEncode(x.data, x.id)
 
 """
     Arrow.DictEncoded
@@ -76,11 +90,11 @@ struct DictEncoded{T, S, A} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     validity::ValidityBitmap
     indices::Vector{S}
-    encoding::DictEncoding{T, A}
+    encoding::DictEncoding{T, S, A}
     metadata::Union{Nothing, Dict{String, String}}
 end
 
-DictEncoded(b::Vector{UInt8}, v::ValidityBitmap, inds::Vector{S}, encoding::DictEncoding{T, A}, meta) where {S, T, A} =
+DictEncoded(b::Vector{UInt8}, v::ValidityBitmap, inds::Vector{S}, encoding::DictEncoding{T, S, A}, meta) where {S, T, A} =
     DictEncoded{T, S, A}(b, v, inds, encoding, meta)
 
 Base.size(d::DictEncoded) = size(d.indices)
@@ -89,10 +103,16 @@ isdictencoded(d::DictEncoded) = true
 isdictencoded(x) = false
 isdictencoded(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = true
 
+function signedtype(n::Integer)
+    typs = (Int8, Int16, Int32, Int64)
+    typs[something(findfirst(n .≤ typemax.(typs)), 4)]
+end
+
 signedtype(::Type{UInt8}) = Int8
 signedtype(::Type{UInt16}) = Int16
 signedtype(::Type{UInt32}) = Int32
 signedtype(::Type{UInt64}) = Int64
+signedtype(::Type{T}) where {T <: Signed} = T
 
 indtype(d::DictEncoded{T, S, A}) where {T, S, A} = S
 indtype(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = indtype(c.data)
@@ -102,7 +122,36 @@ dictencodeid(colidx, nestedlevel, fieldid) = (Int64(nestedlevel) << 48) | (Int64
 getid(d::DictEncoded) = d.encoding.id
 getid(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = c.data.encoding.id
 
-arrowvector(::DictEncodedType, x::DictEncoded, i, nl, fi, de, ded, meta; kw...) = x
+function arrowvector(::DictEncodedType, x::DictEncoded, i, nl, fi, de, ded, meta; dictencode::Bool=false, dictencodenested::Bool=false, kw...)
+    id = x.encoding.id
+    if !haskey(de, id)
+        de[id] = Lockable(x.encoding)
+    else
+        encodinglockable = de[id]
+        @lock encodinglockable begin
+            encoding = encodinglockable.x
+            # in this case, we just need to check if any values in our local pool need to be delta dicationary serialized
+            deltas = setdiff(x.encoding, encoding)
+            if !isempty(deltas)
+                @show deltas
+                ET = indextype(encoding)
+                if length(deltas) + length(encoding) > typemax(ET)
+                    error("fatal error serializing dict encoded column with ref index type of $ET; subsequent record batch unique values resulted in $(length(deltas) + length(encoding)) unique values, which exceeds possible index values in $ET")
+                end
+                data = arrowvector(deltas, i, nl, fi, de, ded, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
+                push!(ded, DictEncoding{eltype(data), ET, typeof(data)}(id, data, false, getmetadata(data)))
+                if typeof(encoding.data) <: ChainedVector
+                    append!(encoding.data, data)
+                else
+                    data2 = ChainedVector([encoding.data, data])
+                    encoding = DictEncoding{eltype(data2), ET, typeof(data2)}(id, data2, false, getmetadata(encoding))
+                    de[id].x = encoding
+                end
+            end
+        end
+    end
+    return x
+end
 
 function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode::Bool=false, dictencodenested::Bool=false, kw...)
     @assert x isa DictEncode
@@ -112,24 +161,34 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
     validity = ValidityBitmap(x)
     if !haskey(de, id)
         # dict encoding doesn't exist yet, so create for 1st time
-        if DataAPI.refarray(x) === x
+        if DataAPI.refarray(x) === x || DataAPI.refpool(x) === nothing
             # need to encode ourselves
-            x = PooledArray(x, encodingtype(length(x)))
+            x = PooledArray(x; signed=true, compress=true)
             inds = DataAPI.refarray(x)
+            pool = DataAPI.refpool(x)
         else
-            inds = copy(DataAPI.refarray(x))
+            pool = DataAPI.refpool(x)
+            refa = DataAPI.refarray(x)
+            inds = copyto!(similar(Vector{signedtype(length(pool))}, length(refa)), refa)
         end
-        # adjust to "offset" instead of index
-        for i = 1:length(inds)
-            @inbounds inds[i] -= 1
-        end
-        pool = DataAPI.refpool(x)
         # horrible hack? yes. better than taking CategoricalArrays dependency? also yes.
         if typeof(pool).name.name == :CategoricalRefPool
-            pool = [get(pool[i]) for i = 1:length(pool)]
+            if eltype(x) >: Missing
+                pool = vcat(missing, DataAPI.levels(x))
+            else
+                pool = DataAPI.levels(x)
+                for i = 1:length(inds)
+                    @inbounds inds[i] -= 1
+                end
+            end
+        else
+            # adjust to "offset" instead of index
+            for i = 1:length(inds)
+                @inbounds inds[i] -= 1
+            end
         end
         data = arrowvector(pool, i, nl, fi, de, ded, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
-        encoding = DictEncoding{eltype(data), typeof(data)}(id, data, false, getmetadata(data))
+        encoding = DictEncoding{eltype(data), eltype(inds), typeof(data)}(id, data, false, getmetadata(data))
         de[id] = Lockable(encoding)
     else
         # encoding already exists
@@ -140,7 +199,7 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
         @lock encodinglockable begin
             encoding = encodinglockable.x
             len = length(x)
-            ET = encodingtype(len)
+            ET = indextype(encoding)
             pool = Dict{Union{eltype(encoding), eltype(x)}, ET}(a => (b - 1) for (b, a) in enumerate(encoding))
             deltas = eltype(x)[]
             inds = Vector{ET}(undef, len)
@@ -151,18 +210,21 @@ function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode:
                 end
                 @inbounds inds[j] = get!(pool, val) do
                     push!(deltas, val)
-                    length(pool)
+                    return length(pool)
                 end
             end
             if !isempty(deltas)
+                if length(deltas) + length(encoding) > typemax(ET)
+                    error("fatal error serializing dict encoded column with ref index type of $ET; subsequent record batch unique values resulted in $(length(deltas) + length(encoding)) unique values, which exceeds possible index values in $ET")
+                end
                 data = arrowvector(deltas, i, nl, fi, de, ded, nothing; dictencode=dictencodenested, dictencodenested=dictencodenested, dictencoding=true, kw...)
-                push!(ded, DictEncoding{eltype(data), typeof(data)}(id, data, false, getmetadata(data)))
+                push!(ded, DictEncoding{eltype(data), ET, typeof(data)}(id, data, false, getmetadata(data)))
                 if typeof(encoding.data) <: ChainedVector
                     append!(encoding.data, data)
                 else
                     data2 = ChainedVector([encoding.data, data])
-                    encoding = DictEncoding{eltype(data2), typeof(data2)}(id, data2, false, getmetadata(encoding))
-                    de[id] = Lockable(encoding)
+                    encoding = DictEncoding{eltype(data2), ET, typeof(data2)}(id, data2, false, getmetadata(encoding))
+                    de[id].x = encoding
                 end
             end
         end
