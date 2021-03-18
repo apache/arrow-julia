@@ -69,6 +69,7 @@ Supported keyword arguments to `Arrow.write` include:
   * `denseunions::Bool=true`: whether Julia `Vector{<:Union}` arrays should be written using the dense union layout; passing `false` will result in the sparse union layout
   * `largelists::Bool=false`: causes list column types to be written with Int64 offset arrays; mainly for testing purposes; by default, Int64 offsets will be used only if needed
   * `maxdepth::Int=$DEFAULT_MAX_DEPTH`: deepest allowed nested serialization level; this is provided by default to prevent accidental infinite recursion with mutually recursive data structures
+  * `ntasks::Int`: number of concurrent threaded tasks to allow while writing input partitions out as arrow record batches; default is no limit; to disable multithreaded writing, pass `ntasks=1`
   * `file::Bool=false`: if a an `io` argument is being written to, passing `file=true` will cause the arrow file format to be written instead of just IPC streaming
 """
 function write end
@@ -94,6 +95,9 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     elseif compress isa Symbol
         throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
     end
+    if ntasks < 1
+        throw(ArgumentError("ntasks keyword argument must be > 0; pass `ntasks=1` to disable multithreaded writing"))
+    end
     if writetofile
         @debug 1 "starting write of arrow formatted file"
         Base.write(io, "ARROW1\0\0")
@@ -105,10 +109,19 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     dictencodings = Dict{Int64, Any}() # Lockable{DictEncoding}
     blocks = (Block[], Block[])
     # start message writing from channel
-    tsk = Threads.@spawn for msg in msgs
+    threaded = ntasks > 1
+    tsk = threaded ? (Threads.@spawn for msg in msgs
         Base.write(io, msg, blocks, sch, alignment)
-    end
+    end) : (@async for msg in msgs
+        Base.write(io, msg, blocks, sch, alignment)
+    end)
+    anyerror = Threads.Atomic{Bool}(false)
+    errorref = Ref{Any}()
     @sync for (i, tbl) in enumerate(Tables.partitions(source))
+        if anyerror[]
+            @error "error writing arrow data on partition = $(errorref[][3])" exception=(errorref[][1], errorref[][2])
+            error("fatal error writing arrow data")
+        end
         @debug 1 "processing table partition i = $i"
         if i == 1
             cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
@@ -126,15 +139,10 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
             end
             put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
         else
-            Threads.@spawn begin
-                cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
-                if !isempty(cols.dictencodingdeltas)
-                    for de in cols.dictencodingdeltas
-                        dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                        put!(msgs, makedictionarybatchmsg(dictsch, (col=de.data,), de.id, true, alignment), i)
-                    end
-                end
-                put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
+            if threaded
+                Threads.@spawn process_partition(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+            else
+                @async process_partition(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
             end
         end
     end
@@ -182,6 +190,23 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
         Base.write(io, "ARROW1")
     end
     return io
+end
+
+function process_partition(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+    try
+        cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
+        if !isempty(cols.dictencodingdeltas)
+            for de in cols.dictencodingdeltas
+                dictsch = Tables.Schema((:col,), (eltype(de.data),))
+                put!(msgs, makedictionarybatchmsg(dictsch, (col=de.data,), de.id, true, alignment), i)
+            end
+        end
+        put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
+    catch e
+        errorref[] = (e, catch_backtrace(), i)
+        anyerror[] = true
+    end
+    return
 end
 
 struct ToArrowTable
