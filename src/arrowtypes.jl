@@ -143,16 +143,19 @@ default(::Type{T}) where {T <: Tuple} = Tuple(default(fieldtype(T, i)) for i = 1
 default(::Type{Dict{K, V}}) where {K, V} = Dict{K, V}()
 default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{names}(Tuple(default(fieldtype(types, i)) for i = 1:length(names)))
 
-const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Symbol, Tuple{String, Type}}(
-    :Char => ("JuliaLang.Char", UInt32),
-    :Symbol => ("JuliaLang.Symbol", String),
-    :UUID => ("JuliaLang.UUID", NTuple{16,UInt8}),
+const JULIA_TO_ARROW_TYPE_MAPPING = Dict{String,Type}(
+    "JuliaLang.Char" => UInt32,
+    "JuliaLang.Symbol" => String,
+    "JuliaLang.UUID" => NTuple{16,UInt8},
 )
 
-istyperegistered(::Type{T}) where {T} = haskey(JULIA_TO_ARROW_TYPE_MAPPING, nameof(T))
+arrownameof(T) = string("JuliaLang.", T)
+
+istyperegistered(::Type{T}) where {T} = haskey(JULIA_TO_ARROW_TYPE_MAPPING, arrownameof(T))
 
 function getarrowtype!(meta, ::Type{T}) where {T}
-    arrowname, arrowtype = JULIA_TO_ARROW_TYPE_MAPPING[nameof(T)]
+    arrowname = arrownameof(T)
+    arrowtype = JULIA_TO_ARROW_TYPE_MAPPING[arrowname]
     meta["ARROW:extension:name"] = arrowname
     meta["ARROW:extension:metadata"] = ""
     return arrowtype
@@ -177,10 +180,11 @@ function extensiontype(f, meta)
     return nothing
 end
 
-function registertype!(juliatype::Type, arrowtype::Type, arrowname::String=string("JuliaLang.", string(juliatype)))
+function registertype!(juliatype::Type, arrowtype::Type)
     # TODO: validate that juliatype isn't already default arrow type
-    JULIA_TO_ARROW_TYPE_MAPPING[nameof(juliatype)] = (arrowname, arrowtype)
-    ARROW_TO_JULIA_TYPE_MAPPING[arrowname] = (juliatype, arrowtype)
+    name = arrownameof(juliatype)
+    JULIA_TO_ARROW_TYPE_MAPPING[name] = arrowtype
+    ARROW_TO_JULIA_TYPE_MAPPING[name] = (juliatype, arrowtype)
     return
 end
 
