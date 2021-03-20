@@ -240,6 +240,30 @@ t = Tables.partitioner(
 io = IOBuffer()
 @test_throws ErrorException Arrow.write(io, t)
 
+# 150
+
+struct Baz{T}
+    x::Type{T}
+end
+Arrow.ArrowTypes.registertype!(Baz, NamedTuple{(:x,),Tuple{String}})
+Arrow.ArrowTypes.arrowconvert(::Type{NamedTuple{(:x,),Tuple{String}}}, b::Baz) = (x=string(b.x),)
+Baz(s::String) = s === "Int64" ? Baz(Int64) : Baz(DataType)
+Arrow.ArrowTypes.arrownameof(::Type{<:Baz}) = "JuliaLang.Baz"
+t = Arrow.Table(Arrow.tobuffer((x=[Baz(Int64)],)))
+@test t.x[1] === Baz(Int64)
+
+struct Foo{T}
+    x::T
+end
+Arrow.ArrowTypes.registertype!(Foo, NamedTuple{(:x,),Tuple{String}})
+Arrow.ArrowTypes.arrowconvert(::Type{NamedTuple{(:x,),Tuple{String}}}, f::Foo) = (x=string(f.x),)
+t = Arrow.Table(Arrow.tobuffer((x=[Foo(1)],)))
+@test t.x[1] === Foo(1)
+
+Arrow.ArrowTypes.arrownameof(::Type{<:Foo}) = "JuliaLang.Foo"
+t = Arrow.Table(Arrow.tobuffer((x=[Foo(1)],)))
+@test t.x[1] === Foo("1")
+
 end # @testset "misc"
 
 end
