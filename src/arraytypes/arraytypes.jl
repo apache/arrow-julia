@@ -52,45 +52,19 @@ function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dict
     if nl > maxdepth
         error("reached nested serialization level ($nl) deeper than provided max depth argument ($(maxdepth)); to increase allowed nesting level, pass `maxdepth=X`")
     end
-    if !(x isa DictEncode) && !dictencoding && (dictencode || (x isa AbstractArray && DataAPI.refarray(x) !== x))
+    if !(x isa DictEncode) && !dictencoding && (dictencode || DataAPI.refarray(x) !== x)
         x = DictEncode(x, dictencodeid(i, nl, fi))
     elseif x isa DictEncoded
         return arrowvector(DictEncodeType, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)    
     end
+    x = ToArrow(x)
     S = maybemissing(eltype(x))
     return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)
 end
 
-# defaults for Dates types
-ArrowTypes.default(::Type{Dates.Date}) = Dates.Date(1,1,1)
-ArrowTypes.default(::Type{Dates.Time}) = Dates.Time(1,1,1)
-ArrowTypes.default(::Type{Dates.DateTime}) = Dates.DateTime(1,1,1,1,1,1)
-ArrowTypes.default(::Type{TimeZones.ZonedDateTime}) = TimeZones.ZonedDateTime(1,1,1,1,1,1,TimeZones.tz"UTC")
-
-# conversions to arrow types
-arrowvector(::Type{Dates.Date}, x, i, nl, fi, de, ded, meta; kw...) =
-    arrowvector(converter(DATE, x), i, nl, fi, de, ded, meta; kw...)
-arrowvector(::Type{Dates.Time}, x, i, nl, fi, de, ded, meta; kw...) =
-    arrowvector(converter(TIME, x), i, nl, fi, de, ded, meta; kw...)
-arrowvector(::Type{Dates.DateTime}, x, i, nl, fi, de, ded, meta; kw...) =
-    arrowvector(converter(DATETIME, x), i, nl, fi, de, ded, meta; kw...)
-arrowvector(::Type{ZonedDateTime}, x, i, nl, fi, de, ded, meta; kw...) =
-    arrowvector(converter(Timestamp{Meta.TimeUnit.MILLISECOND, Symbol(x[1].timezone)}, x), i, nl, fi, de, ded, meta; kw...)
-arrowvector(::Type{P}, x, i, nl, fi, de, ded, meta; kw...) where {P <: Dates.Period} =
-    arrowvector(converter(Duration{arrowperiodtype(P)}, x), i, nl, fi, de, ded, meta; kw...)
-
-# fallback that calls ArrowType
+# fallback that calls ArrowKind
 function arrowvector(::Type{S}, x, i, nl, fi, de, ded, meta; kw...) where {S}
-    if ArrowTypes.istyperegistered(S)
-        meta = meta === nothing ? Dict{String, String}() : meta
-        arrowtype = ArrowTypes.getarrowtype!(meta, S)
-        if arrowtype === S
-            return arrowvector(ArrowType(S), x, i, nl, fi, de, ded, meta; kw...)
-        else
-            return arrowvector(converter(arrowtype, x), i, nl, fi, de, ded, meta; kw...)
-        end
-    end
-    return arrowvector(ArrowType(S), x, i, nl, fi, de, ded, meta; kw...)
+    return arrowvector(ArrowKind(S), x, i, nl, fi, de, ded, meta; kw...)
 end
 
 arrowvector(::NullType, x, i, nl, fi, de, ded, meta; kw...) = MissingVector(length(x))
@@ -114,7 +88,7 @@ A bit-packed array type where each bit corresponds to an element in an
 [`ArrowVector`](@ref), indicating whether that element is "valid" (bit == 1),
 or not (bit == 0). Used to indicate element missingness (whether it's null).
 
-If the null count of an array is zero, the `ValidityBitmap` will be "emtpy"
+If the null count of an array is zero, the `ValidityBitmap` will be "empty"
 and all elements are treated as "valid"/non-null.
 """
 struct ValidityBitmap <: ArrowVector{Bool}

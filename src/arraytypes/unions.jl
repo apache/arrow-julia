@@ -27,7 +27,7 @@ unionmode(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = T
 typeids(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = typeIds
 Base.eltype(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = U
 
-ArrowTypes.ArrowType(::Type{<:UnionT}) = ArrowTypes.UnionType()
+ArrowTypes.ArrowKind(::Type{<:UnionT}) = ArrowTypes.UnionType()
 
 # iterate a Julia Union{...} type, producing an array of unioned types
 function eachunion(U::Union, elems=nothing)

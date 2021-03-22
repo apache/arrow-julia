@@ -146,7 +146,7 @@ function juliaeltype(f::Meta.Field, x::Meta.Decimal, convert)
     return Decimal{x.precision, x.scale, x.bitWidth == 256 ? Int256 : Int128}
 end
 
-ArrowTypes.ArrowType(::Type{<:Decimal}) = PrimitiveType()
+ArrowTypes.ArrowKind(::Type{<:Decimal}) = PrimitiveType()
 
 function arrowtype(b, ::Type{Decimal{P, S, T}}) where {P, S, T}
     Meta.decimalStart(b)
@@ -160,22 +160,22 @@ Base.write(io::IO, x::Decimal) = Base.write(io, x.value)
 
 abstract type ArrowTimeType end
 Base.write(io::IO, x::ArrowTimeType) = Base.write(io, x.x)
-ArrowTypes.ArrowType(::Type{<:ArrowTimeType}) = PrimitiveType()
+ArrowTypes.ArrowKind(::Type{<:ArrowTimeType}) = PrimitiveType()
 
 struct Date{U, T} <: ArrowTimeType
     x::T
 end
 
+const DATE = Date{Meta.DateUnit.DAY, Int32}
 Base.zero(::Type{Date{U, T}}) where {U, T} = Date{U, T}(T(0))
 storagetype(::Type{Date{U, T}}) where {U, T} = T
 bitwidth(x::Meta.DateUnit) = x == Meta.DateUnit.DAY ? Int32 : Int64
-Date{Meta.DateUnit.DAY}(days) = Date{Meta.DateUnit.DAY, Int32}(Int32(days))
+Date{Meta.DateUnit.DAY}(days) = DATE(Int32(days))
 Date{Meta.DateUnit.MILLISECOND}(ms) = Date{Meta.DateUnit.MILLISECOND, Int64}(Int64(ms))
-const DATE = Date{Meta.DateUnit.DAY, Int32}
 
 juliaeltype(f::Meta.Field, x::Meta.Date, convert) = Date{x.unit, bitwidth(x.unit)}
-finaljuliatype(::Type{Date{Meta.DateUnit.DAY, Int32}}) = Dates.Date
-Base.convert(::Type{Dates.Date}, x::Date{Meta.DateUnit.DAY, Int32}) = Dates.Date(Dates.UTD(Int64(x.x + UNIX_EPOCH_DATE)))
+finaljuliatype(::Type{DATE}) = Dates.Date
+Base.convert(::Type{Dates.Date}, x::DATE) = Dates.Date(Dates.UTD(Int64(x.x + UNIX_EPOCH_DATE)))
 finaljuliatype(::Type{Date{Meta.DateUnit.MILLISECOND, Int64}}) = Dates.DateTime
 Base.convert(::Type{Dates.DateTime}, x::Date{Meta.DateUnit.MILLISECOND, Int64}) = Dates.DateTime(Dates.UTM(Int64(x.x + UNIX_EPOCH_DATETIME)))
 
@@ -186,10 +186,16 @@ function arrowtype(b, ::Type{Date{U, T}}) where {U, T}
 end
 
 const UNIX_EPOCH_DATE = Dates.value(Dates.Date(1970))
-Base.convert(::Type{Date{Meta.DateUnit.DAY, Int32}}, x::Dates.Date) = Date{Meta.DateUnit.DAY, Int32}(Int32(Dates.value(x) - UNIX_EPOCH_DATE))
+Base.convert(::Type{DATE}, x::Dates.Date) = DATE(Int32(Dates.value(x) - UNIX_EPOCH_DATE))
 
 const UNIX_EPOCH_DATETIME = Dates.value(Dates.DateTime(1970))
 Base.convert(::Type{Date{Meta.DateUnit.MILLISECOND, Int64}}, x::Dates.DateTime) = Date{Meta.DateUnit.MILLISECOND, Int64}(Int64(Dates.value(x) - UNIX_EPOCH_DATETIME))
+
+ArrowTypes.ArrowKind(::Type{Dates.Date}) = ArrowTypes.PrimitiveType()
+ArrowTypes.toarrow(x::Dates.Date) = convert(DATE, x)
+const DATE_SYMBOL = Symbol("JuliaLang.Date")
+ArrowTypes.arrowname(::Type{Dates.Date}) = DATE_SYMBOL
+ArrowTypes.fromarrow(::Val{DATE_SYMBOL}, x::DATE) = convert(Dates.Date, x)
 
 struct Time{U, T} <: ArrowTimeType
     x::T
@@ -215,7 +221,13 @@ function arrowtype(b, ::Type{Time{U, T}}) where {U, T}
     return Meta.Time, Meta.timeEnd(b), nothing
 end
 
-Base.convert(::Type{Time{Meta.TimeUnit.NANOSECOND, Int64}}, x::Dates.Time) = Time{Meta.TimeUnit.NANOSECOND, Int64}(Dates.value(x))
+Base.convert(::Type{TIME}, x::Dates.Time) = TIME(Dates.value(x))
+
+ArrowTypes.ArrowKind(::Type{Dates.Time}) = ArrowTypes.PrimitiveType()
+ArrowTypes.toarrow(x::Dates.Time) = convert(TIME, x)
+const TIME_SYMBOL = Symbol("JuliaLang.Time")
+ArrowTypes.arrowname(::Type{Dates.Time}) = TIME_SYMBOL
+ArrowTypes.fromarrow(::Val{TIME_SYMBOL}, x::TIME) = convert(Dates.Time, x)
 
 struct Timestamp{U, TZ} <: ArrowTimeType
     x::Int64
@@ -247,6 +259,18 @@ function arrowtype(b, ::Type{Timestamp{U, TZ}}) where {U, TZ}
     Meta.timestampAddTimezone(b, tz)
     return Meta.Timestamp, Meta.timestampEnd(b), nothing
 end
+
+ArrowTypes.ArrowKind(::Type{Dates.DateTime}) = ArrowTypes.PrimitiveType()
+ArrowTypes.toarrow(x::Dates.DateTime) = convert(DATETIME, x)
+const DATETIME_SYMBOL = Symbol("JuliaLang.DateTime")
+ArrowTypes.arrowname(::Type{Dates.DateTime}) = DATETIME_SYMBOL
+ArrowTypes.fromarrow(::Val{DATETIME_SYMBOL}, x::DATETIME) = convert(Dates.DateTime, x)
+
+ArrowTypes.ArrowKind(::Type{ZonedDateTime}) = ArrowTypes.PrimitiveType()
+ArrowTypes.toarrow(x::ZonedDateTime) = convert(Timestamp{Meta.TimeUnit.MILLISECOND, Symbol(x[1].timezone), x)
+const ZONEDDATETIME_SYMBOL = Symbol("JuliaLang.ZonedDateTime")
+ArrowTypes.arrowname(::Type{ZonedDateTime}) = ZONEDDATETIME_SYMBOL
+ArrowTypes.fromarrow(::Val{ZONEDDATETIME_SYMBOL}, x::Timestamp) = convert(ZonedDateTime, x)
 
 struct Interval{U, T} <: ArrowTimeType
     x::T
@@ -293,6 +317,15 @@ arrowperiodtype(::Type{Dates.Microsecond}) = Meta.TimeUnit.MICROSECOND
 arrowperiodtype(::Type{Dates.Nanosecond}) = Meta.TimeUnit.NANOSECOND
 
 Base.convert(::Type{Duration{U}}, x::Dates.Period) where {U} = Duration{U}(Dates.value(periodtype(U)(x)))
+
+ArrowTypes.ArrowKind(::Type{<:Dates.Period}) = ArrowTypes.PrimitiveType()
+ArrowTypes.toarrow(x::P) where {P <: Dates.Period} = convert(Duration{arrowperiodtype(P)}, x)
+ArrowTypes.arrowname(::Type{P}) where {P <: Dates.Period} = Symbol("JuliaLang.", P)
+for P in (Dates.Year, Dates.Quarter, Dates.Month, Dates.Week, Dates.Day, Dates.Hour, Dates.Minute,
+          Dates.Second, Dates.Millisecond, Dates.Microsecond, Dates.Nanosecond)
+    sym = Symbol("JuliaLang.", P)
+    @eval ArrowTypes.fromarrow(::Val{$sym}, x::Duration) = convert($P, x)
+end
 
 # nested types; call juliaeltype recursively on nested children
 function juliaeltype(f::Meta.Field, list::Union{Meta.List, Meta.LargeList}, convert)

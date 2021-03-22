@@ -43,9 +43,9 @@ end
 @propagate_inbounds function Base.getindex(p::Primitive{T}, i::Integer) where {T}
     @boundscheck checkbounds(p, i)
     if T >: Missing
-        return @inbounds (p.validity[i] ? ArrowTypes.arrowconvert(T, p.data[i]) : missing)
+        return @inbounds (p.validity[i] ? ArrowTypes.fromarrow(T, p.data[i]) : missing)
     else
-        return @inbounds ArrowTypes.arrowconvert(T, p.data[i])
+        return @inbounds ArrowTypes.fromarrow(T, p.data[i])
     end
 end
 
