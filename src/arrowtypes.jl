@@ -66,6 +66,8 @@ see the docs for [`ArrowTypes.arrowname`](@ref), [`ArrowTypes.JuliaType`](@ref),
 """
 function ArrowType end
 ArrowType(::Type{T}) where {T} = T
+ArrowType(::Type{Union{Missing, T}}) where {T} = Union{Missing, ArrowType(T)}
+ArrowType(::Type{Missing}) = Missing
 
 """
     ArrowTypes.toarrow(x::T) => S
@@ -130,6 +132,9 @@ A few `ArrowKind`s allow slightly more custom overloads for their `fromarrow` me
 function fromarrow end
 fromarrow(::Type{T}, x::T) where {T} = x
 fromarrow(::Type{T}, x...) where {T} = T(x...)
+fromarrow(::Type{Union{Missing, T}}, ::Missing) where {T} = missing
+fromarrow(::Type{Union{Missing, T}}, x::T) where {T} = x
+fromarrow(::Type{Union{Missing, T}}, x) where {T} = fromarrow(T, x)
 
 "NullKind data is actually not physically stored since the data is constant; just the length is needed"
 struct NullKind <: ArrowKind end
@@ -157,6 +162,7 @@ ArrowKind(::Type{Bool}) = BoolKind()
 struct ListKind{stringtype} <: ArrowKind end
 
 ListKind() = ListKind{false}()
+isstringtype(::ListKind{stringtype}) where {stringtype} = stringtype
 isstringtype(::Type{ListKind{stringtype}}) where {stringtype} = stringtype
 
 ArrowKind(::Type{<:AbstractString}) = ListKind{true}()
@@ -180,8 +186,8 @@ getsize(::FixedSizeListKind{N, T}) where {N, T} = N
 
 ArrowKind(::Type{NTuple{N, T}}) where {N, T} = FixedSizeListKind{N, T}()
 
-ArrowType(::Type{UUID}) = NTuple{16, UINt8}
-toarrow(x::UUID) = _cast(NTuple{16, UInt8}, u.value)
+ArrowType(::Type{UUID}) = NTuple{16, UInt8}
+toarrow(x::UUID) = _cast(NTuple{16, UInt8}, x.value)
 const UUIDSYMBOL = Symbol("JuliaLang.UUID")
 arrowname(::Type{UUID}) = UUIDSYMBOL
 JuliaType(::Val{UUIDSYMBOL}, S) = UUID
@@ -257,20 +263,41 @@ default(::Type{T}) where {T <: Tuple} = Tuple(default(fieldtype(T, i)) for i = 1
 default(::Type{T}) where {T <: AbstractDict} = T()
 default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{names}(Tuple(default(fieldtype(types, i)) for i = 1:length(names)))
 
+function promoteunion(T, S)
+    new = promote_type(T, S)
+    return new === Any ? Union{T, S} : new
+end
+
 # lazily call toarrow(x) on getindex for each x in data
 struct ToArrow{T, A} <: AbstractVector{T}
     data::A
 end
 
 function ToArrow(x::A) where {A}
-    T = ArrowType(eltype(A))
+    S = eltype(A)
+    T = ArrowType(S)
+    if S === T
+        return x
+    elseif !isconcretetype(T)
+        # arrow needs concrete types, so try to find a concrete common type, preferring unions
+        if isempty(x)
+            return Missing[]
+        end
+        T = typeof(x[1])
+        for i = 2:length(x)
+            @inbounds T = promoteunion(T, typeof(toarrow(x[i])))
+        end
+        if !isconcretetype(T) && !(T isa Union)
+            error("can't serialize column with abstract type: $A")
+        end
+    end
     return ToArrow{T, A}(x)
 end
 
 Base.IndexStyle(::Type{<:ToArrow}) = Base.IndexLinear()
 Base.size(x::ToArrow) = (length(x.data),)
 Base.eltype(x::ToArrow{T, A}) where {T, A} = T
-Base.getindex(x::ToArrow{T}, i::Int) where {T} = toarrow(getindex(x.data, i))::T
+Base.getindex(x::ToArrow{T}, i::Int) where {T} = toarrow(getindex(x.data, i))
 
 #### DEPRECATED
 function arrowconvert end
@@ -305,8 +332,6 @@ function extensiontype(f, meta)
         if haskey(ARROW_TO_JULIA_TYPE_MAPPING, typename)
             T = ARROW_TO_JULIA_TYPE_MAPPING[typename][1]
             return f.nullable ? Union{T, Missing} : T
-        else
-            @warn "unsupported ARROW:extension:name type: \"$typename\""
         end
     end
     return nothing

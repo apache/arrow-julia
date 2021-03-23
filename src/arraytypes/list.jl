@@ -48,7 +48,7 @@ Base.size(l::List) = (l.ℓ,)
     @boundscheck checkbounds(l, i)
     @inbounds lo, hi = l.offsets[i]
     S = Base.nonmissingtype(T)
-    K = ArrowTypes.ArrowKind(S)
+    K = ArrowTypes.ArrowKind(ArrowTypes.ArrowType(S))
     if ArrowTypes.isstringtype(K)
         if S !== T
             return l.validity[i] ? ArrowTypes.fromarrow(T, pointer(l.data, lo), hi - lo + 1) : missing

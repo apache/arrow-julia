@@ -46,9 +46,7 @@ Arrow.ArrowTypes.registertype!(WrappedZonedDateTime, WrappedZonedDateTime)
             time = T(Dates.now())
         end
         table = (; x = [missing, missing, time, missing, time])
-        io = IOBuffer()
-        Arrow.write(io, table)
-        seekstart(io)
+        io = Arrow.tobuffer(table)
         tbl = Arrow.Table(io)
         @test isequal(collect(tbl.x), table.x)
     end

@@ -52,13 +52,14 @@ function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dict
     if nl > maxdepth
         error("reached nested serialization level ($nl) deeper than provided max depth argument ($(maxdepth)); to increase allowed nesting level, pass `maxdepth=X`")
     end
+    T = maybemissing(eltype(x))
     if !(x isa DictEncode) && !dictencoding && (dictencode || DataAPI.refarray(x) !== x)
         x = DictEncode(x, dictencodeid(i, nl, fi))
     elseif x isa DictEncoded
         return arrowvector(DictEncodeType, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)    
+    elseif !(x isa DictEncode)
+        x = ToArrow(x)
     end
-    T = eltype(x)
-    x = ToArrow(x)
     S = maybemissing(eltype(x))
     if ArrowTypes.hasarrowname(T)
         meta = meta === nothing ? Dict{String, String}() : meta

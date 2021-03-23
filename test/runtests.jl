@@ -42,9 +42,7 @@ for file in readdir(joinpath(dirname(pathof(Arrow)), "../test/arrowjson"))
     jsonfile = joinpath(joinpath(dirname(pathof(Arrow)), "../test/arrowjson"), file)
     println("integration test for $jsonfile")
     df = ArrowJSON.parsefile(jsonfile);
-    io = IOBuffer()
-    Arrow.write(io, df)
-    seekstart(io)
+    io = Arrow.tobuffer(df)
     tbl = Arrow.Table(io; convert=false);
     @test isequal(df, tbl)
 end

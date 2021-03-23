@@ -533,9 +533,6 @@ function build(f::Meta.Field, ::L, batch, rb, de, nodeidx, bufferidx, convert) w
     bytes, A = reinterp(Base.nonmissingtype(T), batch, buffer, rb.compression)
     len = rb.nodes[nodeidx].length
     T = juliaeltype(f, meta, convert)
-    if JuliaType(T) !== nothing
-        T = JuliaType(T)
-    end
     @debug 2 "final julia type for primitive: T = $T"
     return Primitive(T, bytes, validity, A, len, meta), nodeidx + 1, bufferidx + 1
 end

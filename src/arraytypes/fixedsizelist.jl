@@ -32,7 +32,7 @@ Base.size(l::FixedSizeList) = (l.ℓ,)
 @propagate_inbounds function Base.getindex(l::FixedSizeList{T}, i::Integer) where {T}
     @boundscheck checkbounds(l, i)
     S = Base.nonmissingtype(T)
-    X = ArrowTypes.ArrowKind(S)
+    X = ArrowTypes.ArrowKind(ArrowTypes.ArrowType(S))
     N = ArrowTypes.getsize(X)
     Y = ArrowTypes.gettype(X)
     if X !== T && !(l.validity[i])
@@ -60,7 +60,7 @@ end
     if v === missing
         @inbounds l.validity[i] = false
     else
-        N = ArrowTypes.getsize(ArrowTypes.ArrowKind(Base.nonmissingtype(T)))
+        N = ArrowTypes.getsize(ArrowTypes.ArrowKind(ArrowTypes.ArrowType(Base.nonmissingtype(T))))
         off = (i - 1) * N
         foreach(1:N) do j
             @inbounds l.data[off + j] = v[j]
@@ -142,7 +142,7 @@ function makenodesbuffers!(col::FixedSizeList{T, A}, fieldnodes, fieldbuffers, b
     @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += blen
     if eltype(A) === UInt8
-        blen = ArrowTypes.getsize(Base.nonmissingtype(T)) * len
+        blen = ArrowTypes.getsize(ArrowTypes.ArrowKind(Base.nonmissingtype(T))) * len
         push!(fieldbuffers, Buffer(bufferoffset, blen))
         @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
         bufferoffset += padding(blen, alignment)

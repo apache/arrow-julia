@@ -43,7 +43,19 @@ function juliaeltype(f::Meta.Field, meta::Dict{String, String}, convert::Bool)
     TT = juliaeltype(f, convert)
     !convert && return TT
     T = finaljuliatype(TT)
+    # deprecated begin
     TTT = ArrowTypes.extensiontype(f, meta)
+    TTT !== nothing && return TTT
+    # end deprecated
+    if haskey(meta, "ARROW:extension:name")
+        typename = meta["ARROW:extension:name"]
+        JT = ArrowTypes.JuliaType(Val(Symbol(typename)), TT)
+        if JT !== nothing
+            return f.nullable ? Union{JT, Missing} : JT
+        else
+            @warn "unsupported ARROW:extension:name type: \"$typename\""
+        end
+    end
     return something(TTT, T)
 end
 
@@ -197,6 +209,7 @@ const DATE_SYMBOL = Symbol("JuliaLang.Date")
 ArrowTypes.arrowname(::Type{Dates.Date}) = DATE_SYMBOL
 ArrowTypes.JuliaType(::Val{DATE_SYMBOL}, S) = Dates.Date
 ArrowTypes.fromarrow(::Type{Dates.Date}, x::DATE) = convert(Dates.Date, x)
+ArrowTypes.default(::Type{Dates.Date}) = Dates.Date(1,1,1)
 
 struct Time{U, T} <: ArrowTimeType
     x::T
@@ -230,6 +243,7 @@ const TIME_SYMBOL = Symbol("JuliaLang.Time")
 ArrowTypes.arrowname(::Type{Dates.Time}) = TIME_SYMBOL
 ArrowTypes.JuliaType(::Val{TIME_SYMBOL}, S) = Dates.Time
 ArrowTypes.fromarrow(::Type{Dates.Time}, x::TIME) = convert(Dates.Time, x)
+ArrowTypes.default(::Type{Dates.Time}) = Dates.Time(1,1,1)
 
 struct Timestamp{U, TZ} <: ArrowTimeType
     x::Int64
@@ -268,13 +282,15 @@ const DATETIME_SYMBOL = Symbol("JuliaLang.DateTime")
 ArrowTypes.arrowname(::Type{Dates.DateTime}) = DATETIME_SYMBOL
 ArrowTypes.JuliaType(::Val{DATETIME_SYMBOL}, S) = Dates.DateTime
 ArrowTypes.fromarrow(::Type{Dates.DateTime}, x::DATETIME) = convert(Dates.DateTime, x)
+ArrowTypes.default(::Type{Dates.DateTime}) = Dates.DateTime(1,1,1,1,1,1)
 
-ArrowTypes.ArrowType(::Type{ZonedDateTime}) = ArrowTypes.PrimitiveKind()
-ArrowTypes.toarrow(x::ZonedDateTime) = convert(Timestamp{Meta.TimeUnit.MILLISECOND, Symbol(x[1].timezone), x)
+ArrowTypes.ArrowType(::Type{ZonedDateTime}) = Timestamp
+ArrowTypes.toarrow(x::ZonedDateTime) = convert(Timestamp{Meta.TimeUnit.MILLISECOND, Symbol(x.timezone)}, x)
 const ZONEDDATETIME_SYMBOL = Symbol("JuliaLang.ZonedDateTime")
 ArrowTypes.arrowname(::Type{ZonedDateTime}) = ZONEDDATETIME_SYMBOL
 ArrowTypes.JuliaType(::Val{ZONEDDATETIME_SYMBOL}, S) = ZonedDateTime
 ArrowTypes.fromarrow(::Type{ZonedDateTime}, x::Timestamp) = convert(ZonedDateTime, x)
+ArrowTypes.default(::Type{TimeZones.ZonedDateTime}) = TimeZones.ZonedDateTime(1,1,1,1,1,1,TimeZones.tz"UTC")
 
 struct Interval{U, T} <: ArrowTimeType
     x::T
@@ -372,7 +388,7 @@ function juliaeltype(f::Meta.Field, list::Meta.FixedSizeList, convert)
 end
 
 function arrowtype(b, x::FixedSizeList{T, A}) where {T, A}
-    N = ArrowTypes.getsize(Base.nonmissingtype(T))
+    N = ArrowTypes.getsize(ArrowTypes.ArrowKind(ArrowTypes.ArrowType(Base.nonmissingtype(T))))
     if eltype(A) == UInt8
         Meta.fixedSizeBinaryStart(b)
         Meta.fixedSizeBinaryAddByteWidth(b, Int32(N))
