@@ -191,11 +191,12 @@ Base.convert(::Type{DATE}, x::Dates.Date) = DATE(Int32(Dates.value(x) - UNIX_EPO
 const UNIX_EPOCH_DATETIME = Dates.value(Dates.DateTime(1970))
 Base.convert(::Type{Date{Meta.DateUnit.MILLISECOND, Int64}}, x::Dates.DateTime) = Date{Meta.DateUnit.MILLISECOND, Int64}(Int64(Dates.value(x) - UNIX_EPOCH_DATETIME))
 
-ArrowTypes.ArrowKind(::Type{Dates.Date}) = ArrowTypes.PrimitiveKind()
+ArrowTypes.ArrowType(::Type{Dates.Date}) = DATE
 ArrowTypes.toarrow(x::Dates.Date) = convert(DATE, x)
 const DATE_SYMBOL = Symbol("JuliaLang.Date")
 ArrowTypes.arrowname(::Type{Dates.Date}) = DATE_SYMBOL
-ArrowTypes.fromarrow(::Val{DATE_SYMBOL}, x::DATE) = convert(Dates.Date, x)
+ArrowTypes.JuliaType(::Val{DATE_SYMBOL}, S) = Dates.Date
+ArrowTypes.fromarrow(::Type{Dates.Date}, x::DATE) = convert(Dates.Date, x)
 
 struct Time{U, T} <: ArrowTimeType
     x::T
@@ -223,11 +224,12 @@ end
 
 Base.convert(::Type{TIME}, x::Dates.Time) = TIME(Dates.value(x))
 
-ArrowTypes.ArrowKind(::Type{Dates.Time}) = ArrowTypes.PrimitiveKind()
+ArrowTypes.ArrowType(::Type{Dates.Time}) = TIME
 ArrowTypes.toarrow(x::Dates.Time) = convert(TIME, x)
 const TIME_SYMBOL = Symbol("JuliaLang.Time")
 ArrowTypes.arrowname(::Type{Dates.Time}) = TIME_SYMBOL
-ArrowTypes.fromarrow(::Val{TIME_SYMBOL}, x::TIME) = convert(Dates.Time, x)
+ArrowTypes.JuliaType(::Val{TIME_SYMBOL}, S) = Dates.Time
+ArrowTypes.fromarrow(::Type{Dates.Time}, x::TIME) = convert(Dates.Time, x)
 
 struct Timestamp{U, TZ} <: ArrowTimeType
     x::Int64
@@ -260,17 +262,19 @@ function arrowtype(b, ::Type{Timestamp{U, TZ}}) where {U, TZ}
     return Meta.Timestamp, Meta.timestampEnd(b), nothing
 end
 
-ArrowTypes.ArrowKind(::Type{Dates.DateTime}) = ArrowTypes.PrimitiveKind()
+ArrowTypes.ArrowType(::Type{Dates.DateTime}) = DATETIME
 ArrowTypes.toarrow(x::Dates.DateTime) = convert(DATETIME, x)
 const DATETIME_SYMBOL = Symbol("JuliaLang.DateTime")
 ArrowTypes.arrowname(::Type{Dates.DateTime}) = DATETIME_SYMBOL
-ArrowTypes.fromarrow(::Val{DATETIME_SYMBOL}, x::DATETIME) = convert(Dates.DateTime, x)
+ArrowTypes.JuliaType(::Val{DATETIME_SYMBOL}, S) = Dates.DateTime
+ArrowTypes.fromarrow(::Type{Dates.DateTime}, x::DATETIME) = convert(Dates.DateTime, x)
 
-ArrowTypes.ArrowKind(::Type{ZonedDateTime}) = ArrowTypes.PrimitiveKind()
+ArrowTypes.ArrowType(::Type{ZonedDateTime}) = ArrowTypes.PrimitiveKind()
 ArrowTypes.toarrow(x::ZonedDateTime) = convert(Timestamp{Meta.TimeUnit.MILLISECOND, Symbol(x[1].timezone), x)
 const ZONEDDATETIME_SYMBOL = Symbol("JuliaLang.ZonedDateTime")
 ArrowTypes.arrowname(::Type{ZonedDateTime}) = ZONEDDATETIME_SYMBOL
-ArrowTypes.fromarrow(::Val{ZONEDDATETIME_SYMBOL}, x::Timestamp) = convert(ZonedDateTime, x)
+ArrowTypes.JuliaType(::Val{ZONEDDATETIME_SYMBOL}, S) = ZonedDateTime
+ArrowTypes.fromarrow(::Type{ZonedDateTime}, x::Timestamp) = convert(ZonedDateTime, x)
 
 struct Interval{U, T} <: ArrowTimeType
     x::T
@@ -318,14 +322,12 @@ arrowperiodtype(::Type{Dates.Nanosecond}) = Meta.TimeUnit.NANOSECOND
 
 Base.convert(::Type{Duration{U}}, x::Dates.Period) where {U} = Duration{U}(Dates.value(periodtype(U)(x)))
 
-ArrowTypes.ArrowKind(::Type{<:Dates.Period}) = ArrowTypes.PrimitiveKind()
+ArrowTypes.ArrowType(::Type{P}) where {P <: Dates.Period} = Duration{arrowperiodtype(P)}
 ArrowTypes.toarrow(x::P) where {P <: Dates.Period} = convert(Duration{arrowperiodtype(P)}, x)
-ArrowTypes.arrowname(::Type{P}) where {P <: Dates.Period} = Symbol("JuliaLang.", P)
-for P in (Dates.Year, Dates.Quarter, Dates.Month, Dates.Week, Dates.Day, Dates.Hour, Dates.Minute,
-          Dates.Second, Dates.Millisecond, Dates.Microsecond, Dates.Nanosecond)
-    sym = Symbol("JuliaLang.", P)
-    @eval ArrowTypes.fromarrow(::Val{$sym}, x::Duration) = convert($P, x)
-end
+const PERIOD_SYMBOL = Symbol("JuliaLang.Dates.Period")
+ArrowTypes.arrowname(::Type{P}) where {P <: Dates.Period} = PERIOD_SYMBOL
+ArrowTypes.JuliaType(::Val{PERIOD_SYMBOL}, S::Duration{U}) where {U} = periodtype(U)
+ArrowTypes.fromarrow(::Type{P}, x::Duration{U}) where {P <: Dates.Period, U} = convert(P, x)
 
 # nested types; call juliaeltype recursively on nested children
 function juliaeltype(f::Meta.Field, list::Union{Meta.List, Meta.LargeList}, convert)
