@@ -38,7 +38,7 @@ Base.size(p::BoolVector) = (p.ℓ,)
     a, b = fldmod1(i, 8)
     @inbounds byte = p.arrow[p.pos + a - 1]
     # check individual bit of byte
-    return getbit(byte, b)
+    return ArrowTypes.fromarrow(T, getbit(byte, b))
 end
 
 @propagate_inbounds function Base.setindex!(p::BoolVector, v, i::Integer)
@@ -50,9 +50,9 @@ end
     return v
 end
 
-arrowvector(::BoolType, x::BoolVector, i, nl, fi, de, ded, meta; kw...) = x
+arrowvector(::BoolKind, x::BoolVector, i, nl, fi, de, ded, meta; kw...) = x
 
-function arrowvector(::BoolType, x, i, nl, fi, de, ded, meta; kw...)
+function arrowvector(::BoolKind, x, i, nl, fi, de, ded, meta; kw...)
     validity = ValidityBitmap(x)
     len = length(x)
     blen = cld(len, 8)

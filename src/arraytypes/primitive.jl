@@ -63,9 +63,9 @@ end
     return v
 end
 
-arrowvector(::PrimitiveType, x::Primitive, i, nl, fi, de, ded, meta; kw...) = x
+arrowvector(::PrimitiveKind, x::Primitive, i, nl, fi, de, ded, meta; kw...) = x
 
-function arrowvector(::PrimitiveType, x, i, nl, fi, de, ded, meta; kw...)
+function arrowvector(::PrimitiveKind, x, i, nl, fi, de, ded, meta; kw...)
     validity = ValidityBitmap(x)
     return Primitive(eltype(x), UInt8[], validity, x, length(x), meta)
 end

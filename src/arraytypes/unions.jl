@@ -27,7 +27,7 @@ unionmode(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = T
 typeids(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = typeIds
 Base.eltype(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = U
 
-ArrowTypes.ArrowKind(::Type{<:UnionT}) = ArrowTypes.UnionType()
+ArrowTypes.ArrowKind(::Type{<:UnionT}) = ArrowTypes.UnionKind()
 
 # iterate a Julia Union{...} type, producing an array of unioned types
 function eachunion(U::Union, elems=nothing)
@@ -73,7 +73,7 @@ nullcount(x::DenseUnion) = 0 # DenseUnion has no validity bitmap; only children 
     @inbounds typeId = s.typeIds[i]
     @inbounds off = s.offsets[i]
     @inbounds x = s.data[typeId + 1][off + 1]
-    return x
+    return ArrowTypes.fromarrow(T, x)
 end
 
 @propagate_inbounds function Base.setindex!(s::DenseUnion{UnionT{T, typeIds, U}}, v, i::Integer) where {T, typeIds, U}
@@ -194,7 +194,7 @@ nullcount(x::SparseUnion) = 0
     @boundscheck checkbounds(s, i)
     @inbounds typeId = s.typeIds[i]
     @inbounds x = s.data[typeId + 1][i]
-    return x
+    return ArrowTypes.fromarrow(T, x)
 end
 
 @propagate_inbounds function Base.setindex!(s::SparseUnion{UnionT{T, typeIds, U}}, v, i::Integer) where {T, typeIds, U}
@@ -209,9 +209,9 @@ end
 arrowvector(U::Union, x, i, nl, fi, de, ded, meta; denseunions::Bool=true, kw...) =
     arrowvector(denseunions ? DenseUnionVector(x) : SparseUnionVector(x), i, nl, fi, de, ded, meta; denseunions=denseunions, kw...)
 
-arrowvector(::UnionType, x::Union{DenseUnion, SparseUnion}, i, nl, fi, de, ded, meta; kw...) = x
+arrowvector(::UnionKind, x::Union{DenseUnion, SparseUnion}, i, nl, fi, de, ded, meta; kw...) = x
 
-function arrowvector(::UnionType, x, i, nl, fi, de, ded, meta; kw...)
+function arrowvector(::UnionKind, x, i, nl, fi, de, ded, meta; kw...)
     UT = eltype(x)
     if unionmode(UT) == Meta.UnionMode.Dense
         x = x isa DenseUnionVector ? x.itr : x

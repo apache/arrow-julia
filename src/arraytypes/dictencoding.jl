@@ -71,7 +71,7 @@ Base.IndexStyle(::Type{<:DictEncode}) = Base.IndexLinear()
 Base.size(x::DictEncode) = (length(x.data),)
 Base.iterate(x::DictEncode, st...) = iterate(x.data, st...)
 Base.getindex(x::DictEncode, i::Int) = getindex(x.data, i)
-ArrowTypes.ArrowKind(::Type{<:DictEncodeType}) = DictEncodedType()
+ArrowTypes.ArrowKind(::Type{<:DictEncodeType}) = DictEncodedKind()
 Base.copy(x::DictEncode) = DictEncode(x.data, x.id)
 
 """
@@ -122,7 +122,7 @@ dictencodeid(colidx, nestedlevel, fieldid) = (Int64(nestedlevel) << 48) | (Int64
 getid(d::DictEncoded) = d.encoding.id
 getid(c::Compressed{Z, A}) where {Z, A <: DictEncoded} = c.data.encoding.id
 
-function arrowvector(::DictEncodedType, x::DictEncoded, i, nl, fi, de, ded, meta; dictencode::Bool=false, dictencodenested::Bool=false, kw...)
+function arrowvector(::DictEncodedKind, x::DictEncoded, i, nl, fi, de, ded, meta; dictencode::Bool=false, dictencodenested::Bool=false, kw...)
     id = x.encoding.id
     if !haskey(de, id)
         de[id] = Lockable(x.encoding)
@@ -152,7 +152,7 @@ function arrowvector(::DictEncodedType, x::DictEncoded, i, nl, fi, de, ded, meta
     return x
 end
 
-function arrowvector(::DictEncodedType, x, i, nl, fi, de, ded, meta; dictencode::Bool=false, dictencodenested::Bool=false, kw...)
+function arrowvector(::DictEncodedKind, x, i, nl, fi, de, ded, meta; dictencode::Bool=false, dictencodenested::Bool=false, kw...)
     @assert x isa DictEncode
     id = x.id == -1 ? dictencodeid(i, nl, fi) : x.id
     x = x.data

@@ -47,16 +47,18 @@ Base.size(l::List) = (l.ℓ,)
 @propagate_inbounds function Base.getindex(l::List{T}, i::Integer) where {T}
     @boundscheck checkbounds(l, i)
     @inbounds lo, hi = l.offsets[i]
-    if ArrowTypes.isstringtype(T)
-        if Base.nonmissingtype(T) !== T
-            return l.validity[i] ? ArrowTypes.arrowconvert(T, unsafe_string(pointer(l.data, lo), hi - lo + 1)) : missing
+    S = Base.nonmissingtype(T)
+    K = ArrowTypes.ArrowKind(S)
+    if ArrowTypes.isstringtype(K)
+        if S !== T
+            return l.validity[i] ? ArrowTypes.fromarrow(T, pointer(l.data, lo), hi - lo + 1) : missing
         else
-            return ArrowTypes.arrowconvert(T, unsafe_string(pointer(l.data, lo), hi - lo + 1))
+            return ArrowTypes.fromarrow(T, pointer(l.data, lo), hi - lo + 1)
         end
-    elseif Base.nonmissingtype(T) !== T
-        return l.validity[i] ? ArrowTypes.arrowconvert(T, view(l.data, lo:hi)) : missing
+    elseif S !== T
+        return l.validity[i] ? ArrowTypes.fromarrow(T, view(l.data, lo:hi)) : missing
     else
-        return ArrowTypes.arrowconvert(T, view(l.data, lo:hi))
+        return ArrowTypes.fromarrow(T, view(l.data, lo:hi))
     end
 end
 
@@ -74,7 +76,8 @@ end
 function ToList(input; largelists::Bool=false)
     AT = eltype(input)
     ST = Base.nonmissingtype(AT)
-    stringtype = ArrowTypes.isstringtype(ST)
+    K = ArrowTypes.ArrowKind(ST)
+    stringtype = ArrowTypes.isstringtype(K)
     T = stringtype ? UInt8 : eltype(ST)
     len = stringtype ? ncodeunits : length
     data = AT[]
@@ -178,9 +181,9 @@ end
     return x, (i, chunk, chunk_i, chunk_len, len)
 end
 
-arrowvector(::ListType, x::List, i, nl, fi, de, ded, meta; kw...) = x
+arrowvector(::ListKind, x::List, i, nl, fi, de, ded, meta; kw...) = x
 
-function arrowvector(::ListType, x, i, nl, fi, de, ded, meta; largelists::Bool=false, kw...)
+function arrowvector(::ListKind, x, i, nl, fi, de, ded, meta; largelists::Bool=false, kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     flat = ToList(x; largelists=largelists)

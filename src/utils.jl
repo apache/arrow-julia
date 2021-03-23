@@ -104,6 +104,19 @@ end
 # given a number of unique values; what dict encoding _index_ type is most appropriate
 encodingtype(n) = n < div(typemax(Int8), 2) ? Int8 : n < div(typemax(Int16), 2) ? Int16 : n < div(typemax(Int32), 2) ? Int32 : Int64
 
+# can be removed once we finish deprecating old registertype! machinery
+struct Converter{T, A} <: AbstractVector{T}
+    data::A
+end
+
+converter(::Type{T}, x::A) where {T, A} = Converter{eltype(A) >: Missing ? Union{T, Missing} : T, A}(x)
+converter(::Type{T}, x::ChainedVector{A}) where {T, A} = ChainedVector([converter(T, x) for x in x.arrays])
+
+Base.IndexStyle(::Type{<:Converter}) = Base.IndexLinear()
+Base.size(x::Converter) = (length(x.data),)
+Base.eltype(x::Converter{T, A}) where {T, A} = T
+Base.getindex(x::Converter{T}, i::Int) where {T} = ArrowTypes.arrowconvert(T, getindex(x.data, i))
+
 maybemissing(::Type{T}) where {T} = T === Missing ? Missing : Base.nonmissingtype(T)
 
 function getfooter(filebytes)

@@ -165,7 +165,7 @@ tt = Arrow.Table(Arrow.tobuffer(t))
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
-# 89 etc. - test deprecation paths for old UUID autoconversion + UUID FixedSizeListType overloads
+# 89 etc. - test deprecation paths for old UUID autoconversion + UUID FixedSizeListKind overloads
 u = 0x6036fcbd20664bd8a65cdfa25434513f
 @test Arrow.ArrowTypes.arrowconvert(UUID, (value=u,)) === UUID(u)
 @test Arrow.ArrowTypes.arrowconvert(UUID, u) === UUID(u)
@@ -186,7 +186,7 @@ x2 = Arrow.toarrowvector(x)
 
 # some dict encoding coverage
 
-# signed indices for DictEncodedType #112 #113 #114
+# signed indices for DictEncodedKind #112 #113 #114
 av = Arrow.toarrowvector(PooledArray(repeat(["a", "b"], inner = 5)))
 @test isa(first(av.indices), Signed)
 

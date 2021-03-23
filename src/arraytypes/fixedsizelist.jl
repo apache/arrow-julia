@@ -31,19 +31,20 @@ Base.size(l::FixedSizeList) = (l.ℓ,)
 
 @propagate_inbounds function Base.getindex(l::FixedSizeList{T}, i::Integer) where {T}
     @boundscheck checkbounds(l, i)
-    X = Base.nonmissingtype(T)
+    S = Base.nonmissingtype(T)
+    X = ArrowTypes.ArrowKind(S)
     N = ArrowTypes.getsize(X)
     Y = ArrowTypes.gettype(X)
     if X !== T && !(l.validity[i])
         return missing
     else
         off = (i - 1) * N
-        if X === T && isbitstype(Y) && l.data isa Vector{UInt8}
-            tup = _unsafe_load_tuple(NTuple{N,Y}, l.data, off + 1)
+        if X === T && isbitstype(Y)
+            tup = _unsafe_load_tuple(NTuple{N, Y}, l.data, off + 1)
         else
             tup = ntuple(j->l.data[off + j], N)
         end
-        return ArrowTypes.arrowconvert(T, tup)
+        return ArrowTypes.fromarrow(T, tup)
     end
 end
 
@@ -59,7 +60,7 @@ end
     if v === missing
         @inbounds l.validity[i] = false
     else
-        N = ArrowTypes.getsize(Base.nonmissingtype(T))
+        N = ArrowTypes.getsize(ArrowTypes.ArrowKind(Base.nonmissingtype(T)))
         off = (i - 1) * N
         foreach(1:N) do j
             @inbounds l.data[off + j] = v[j]
@@ -70,11 +71,11 @@ end
 
 # lazy equal-spaced flattener
 struct ToFixedSizeList{T, N, A} <: AbstractVector{T}
-    data::A # A is AbstractVector of AbstractVector or AbstractString
+    data::A # A is AbstractVector of (AbstractVector or AbstractString)
 end
 
 function ToFixedSizeList(input)
-    NT = Base.nonmissingtype(eltype(input)) # typically NTuple{N, T}
+    NT = ArrowTypes.ArrowKind(Base.nonmissingtype(eltype(input))) # typically NTuple{N, T}
     return ToFixedSizeList{ArrowTypes.gettype(NT), ArrowTypes.getsize(NT), typeof(input)}(input)
 end
 
@@ -102,9 +103,9 @@ end
     return x, (i + 1, chunk, chunk_i, len)
 end
 
-arrowvector(::FixedSizeListType, x::FixedSizeList, i, nl, fi, de, ded, meta; kw...) = x
+arrowvector(::FixedSizeListKind, x::FixedSizeList, i, nl, fi, de, ded, meta; kw...) = x
 
-function arrowvector(::FixedSizeListType, x, i, nl, fi, de, ded, meta; kw...)
+function arrowvector(::FixedSizeListKind, x, i, nl, fi, de, ded, meta; kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     flat = ToFixedSizeList(x)

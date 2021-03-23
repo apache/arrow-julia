@@ -22,75 +22,170 @@ module ArrowTypes
 
 using UUIDs
 
-export ArrowKind, NullType, PrimitiveType, BoolType, ListType, FixedSizeListType, MapType, StructType, UnionType, DictEncodedType, toarrow, arrowname, fromarrow, ToArrow
+export ArrowKind, NullKind, PrimitiveKind, BoolKind, ListKind, FixedSizeListKind, MapKind, StructKind, UnionKind, DictEncodedKind, toarrow, arrowname, fromarrow, ToArrow
 
+"""
+    ArrowTypes.ArrowKind(T)
+
+For a give type `T`, define it's "arrow type kind", or the general category of arrow types it should be treated as. Must be one of:
+  * [`ArrowTypes.NullKind`](@ref): `Missing` is the only type defined as `NullKind`
+  * [`ArrowTypes.PrimitiveKind`](@ref): `<:Integer`, `<:AbstractFloat`, along with `Arrow.Decimal`, and the various `Arrow.ArrowTimeType` subtypes
+  * [`ArrowTypes.BoolKind`](@ref): only `Bool`
+  * [`ArrowTypes.ListKind`](@ref): any `AbstractString` or `AbstractArray`
+  * [`ArrowTypes.FixedSizeList`](@ref): `NTuple{N, T}`
+  * [`ArrowTypes.MapKind`](@ref): any `AbstractDict`
+  * [`ArrowTypes.StructKind`](@ref): any `NamedTuple` or plain struct (mutable or otherwise)
+  * [`ArrowTypes.UnionKind`](@ref): any `Union`
+  * [`ArrowTypes.DictEncodedKind`](@ref): array types that implement the `DataAPI.refarray` interface
+
+The list of `ArrowKind`s listed above translate to different ways to physically store data as supported by the arrow data format.
+See the docs for each for an idea of whether they might be an appropriate fit for a custom type.
+Note that custom types need to satisfy any additional "interface methods" as required by the various `ArrowKind`
+types. By default, if a type in julia is declared like `primitive type ...` it is considered a `PrimitiveKind`
+and if `struct` or `mutable struct` it's considered a `StructKind`. Also note that types will rarely need to define `ArrowKind`;
+much more common is to define `ArrowType(T)` and `toarrow(x::T)` to transform `T` to a natively supported arrow type, which will
+already have its `ArrowKind` defined.
+"""
 abstract type ArrowKind end
 
 ArrowKind(x::T) where {T} = ArrowKind(T)
-ArrowKind(::Type{T}) where {T} = isprimitivetype(T) ? PrimitiveType() : StructType()
+ArrowKind(::Type{T}) where {T} = isprimitivetype(T) ? PrimitiveKind() : StructKind()
 
+"""
+    ArrowTypes.ArrowType(T) = S
+
+Interface method to define the natively supported arrow type `S` that a given type `T` should be converted to before serializing.
+Useful when a custom type wants a "serialization hook" or otherwise needs to be transformed/converted into a natively
+supported arrow type for serialization. If a type defines `ArrowType`, it must also define a corresponding
+[`ArrowTypes.toarrow(::Type{S}, x::T)`](@ref) method which does the actual conversion from `T` to `S`.
+Note that custom structs defined like `struct T` or `mutable struct T` are natively supported in serialization, so unless
+_additional_ transformation/customization is desired, a custom type `T` can serialize with no `ArrowType` definition (by default,
+each field of a struct is serialized, using the results of `fieldnames(T)` and `getfield(x, i)`).
+Note that defining these methods only enables _serialization_ to the arrow format; to be able to _deserialize_ custom types,
+see the docs for [`ArrowTypes.arrowname`](@ref), [`ArrowTypes.JuliaType`](@ref), and [`ArrowTypes.fromarrow`](@ref).
+"""
 function ArrowType end
 ArrowType(::Type{T}) where {T} = T
 
-function toarrow end
-toarrow(T, x) = x
+"""
+    ArrowTypes.toarrow(x::T) => S
 
+Interface method to perform the actual conversion from an object `x` of type `T` to the type `S`. `T` and `S` must match the
+types used when defining `ArrowTypes.ArrowType(::Type{T}) = S`. See [`ArrowTypes.ArrowType`](@ref) docs for more details.
+This enables custom objects to be serialized as a natively supported arrow data type.
+"""
+function toarrow end
+toarrow(x) = x
+
+"""
+    ArrowTypes.arrowname(T) = Symbol(name)
+
+Interface method to define the logical type "label" for a custom Julia type `T`. Names will be global for an entire arrow dataset,
+and conventionally, custom types will just use their type name along with a Julia-specific prefix; for example, for a custom type
+`Foo`, I would define `ArrowTypes.arrowname(::Type{Foo}) = Symbol("JuliaLang.Foo")`. This ensures other language implementations
+won't get confused and are safe to ignore the logical type label.
+When arrow stores non-native data, it must still be _stored_ as a native data type, but can have metadata tied to the data that
+labels the original _logical_ type it originated from. This enables the conversion of native data back to the logical type when
+deserializing, as long as the deserializer has the same definitions when the data was serialized. Namely, the current Julia
+session will need the appropriate [`ArrowTypes.JuliaType`](@ref) and [`ArrowTypes.fromarrow`](@ref) definitions in order to know
+how to convert the native data to the original logical type. See the docs for those interface methods in order to ensure a complete implementation.
+"""
 function arrowname end
 const EMPTY_SYMBOL = Symbol()
 arrowname(T) = EMPTY_SYMBOL
+hasarrowname(T) = arrowname(T) !== EMPTY_SYMBOL
 
+"""
+    ArrowTypes.JuliaType(::Val{Symbol(name)}, ::Type{S}) = T
+
+Interface method to define the custom Julia logical type `T` that a serialized metadata label should be converted to when
+deserializing. When reading arrow data, it may encounter a logical type label for a column, it will call
+`ArrowTypes.JuliaType(Val(Symbol(name)), S)` to see if a Julia type has been "registered" for deserialization. The `name`
+used when defining the method *must* correspond to the same `name` when defining `ArrowTypes.arrowname(::Type{T}) = Symbol(name)`.
+The use of `Val(Symbol(...))` is to allow overloading a method on a specific logical type label. The `S` 2nd argument passed to
+`JuliaType` is the native arrow serialized type. This can be useful for parametric Julia types that wish to correctly parameterize
+their custom type based on what was serialized.
+When defining [`ArrowTypes.arrowname`](@ref) and `ArrowTypes.JuliaType`, you may also want to implement [`ArrowTypes.fromarrow`]
+in order to customize how a custom type `T` should be constructed from the native arrow data type. See its docs for mmore details.
+"""
 function JuliaType end
-JuliaType(x) = nothing
+JuliaType(val, S) = nothing
 
+"""
+    ArrowTypes.fromarrow(::Type{T}, x::S) => T
+
+Interface method that provides a "deserialization hook" for a custom type `T` to be constructed from the native arrow type `S`.
+The `T` and `S` types must correspond to the definitions used in `ArrowTypes.ArrowType(::Type{T}) = S`. This is a paired method
+with [`ArrowTypes.toarrow`](@ref).
+
+The default definition is `ArrowTypes.fromarrow(::Type{T}, x) = T(x)`, so if that works for a custom type already, no additional
+overload is necessary.
+A few `ArrowKind`s allow slightly more custom overloads for their `fromarrow` methods:
+  * `ListKind{true}`: for `String` types, they may overload `fromarrow(::Type{T}, ptr::Ptr{UInt8}, len::Int) = ...` to avoid
+     materializing a `String`
+  * `StructKind`: may overload `fromarrow(::Type{T}, x::NamedTuple)`, or `fromarrow(::Type{T}; kw...)` (values passed as
+     name=>value keyword argument pairs), or `fromarrow(::Type{T}, x...)` where individual fields are passed as separate
+     positional arguments
+"""
 function fromarrow end
-fromarrow(T, x) = x
+fromarrow(::Type{T}, x::T) where {T} = x
+fromarrow(::Type{T}, x...) where {T} = T(x...)
 
-struct NullType <: ArrowKind end
+"NullKind data is actually not physically stored since the data is constant; just the length is needed"
+struct NullKind <: ArrowKind end
 
-ArrowKind(::Type{Missing}) = NullType()
+ArrowKind(::Type{Missing}) = NullKind()
 
-struct PrimitiveType <: ArrowKind end
+"PrimitiveKind data is stored as plain bits in a single contiguous buffer"
+struct PrimitiveKind <: ArrowKind end
 
-ArrowKind(::Type{<:Integer}) = PrimitiveType()
-ArrowKind(::Type{<:AbstractFloat}) = PrimitiveType()
+ArrowKind(::Type{<:Integer}) = PrimitiveKind()
+ArrowKind(::Type{<:AbstractFloat}) = PrimitiveKind()
 
-ArrowKind(::Type{Char}) = PrimitiveType()
+ArrowType(::Type{Char}) = UInt32
 toarrow(x::Char) = convert(UInt32, x)
 const CHAR = Symbol("JuliaLang.Char")
 arrowname(::Type{Char}) = CHAR
-fromarrow(::Val{CHAR}, x::UInt32) = Char(x)
+JuliaType(::Val{CHAR}, ::Type{UInt32}) = Char
+fromarrow(::Type{Char}, x::UInt32) = Char(x)
 
-struct BoolType <: ArrowKind end
-ArrowKind(::Type{Bool}) = BoolType()
+"BoolKind data is stored with values packed down to individual bits; so instead of a traditional Bool being 1 byte/8 bits, 8 Bool values would be packed into a single byte"
+struct BoolKind <: ArrowKind end
+ArrowKind(::Type{Bool}) = BoolKind()
 
-struct ListType{stringtype} <: ArrowKind end
+"ListKind data are stored in two separate buffers; one buffer contains all the original data elements flattened into one long buffer; the 2nd buffer contains an offset into the 1st buffer for how many elements make up the original array element"
+struct ListKind{stringtype} <: ArrowKind end
 
-ListType() = ListType{false}()
+ListKind() = ListKind{false}()
+isstringtype(::Type{ListKind{stringtype}}) where {stringtype} = stringtype
 
-ArrowKind(::Type{<:AbstractString}) = ListType{true}()
+ArrowKind(::Type{<:AbstractString}) = ListKind{true}()
 
-fromarrow(V::Val{name}, ptr::Ptr{UInt8}, len::Int) where {name} = fromarrow(V, unsafe_string(ptr, len))
+fromarrow(::Type{T}, ptr::Ptr{UInt8}, len::Int) where {T} = fromarrow(T, unsafe_string(ptr, len))
 
-_symbol(ptr, len) = ccall(:jl_symbol_n, Ref{Symbol}, (Ptr{UInt8}, Int), ptr, len)
-const SYMBOL = Symbol("JuliaLang.Symbol")
-ArrowKind(::Type{Symbol}) = ListType{true}()
-arrowname(::Type{Symbol}) = SYMBOL
+ArrowType(::Type{Symbol}) = String
 toarrow(x::Symbol) = String(x)
-fromarrow(::Val{SYMBOL}, ptr::Ptr{UInt8}, len::Int) = _symbol(ptr, len)
+const SYMBOL = Symbol("JuliaLang.Symbol")
+arrowname(::Type{Symbol}) = SYMBOL
+JuliaType(::Val{SYMBOL}, S) = Symbol
+_symbol(ptr, len) = ccall(:jl_symbol_n, Ref{Symbol}, (Ptr{UInt8}, Int), ptr, len)
+fromarrow(::Type{Symbol}, ptr::Ptr{UInt8}, len::Int) = _symbol(ptr, len)
 
-ArrowKind(::Type{<:AbstractArray}) = ListType()
+ArrowKind(::Type{<:AbstractArray}) = ListKind()
 
-struct FixedSizeListType{N, T} <: ArrowKind end
-# gettype(::FixedSizeListType{N, T}) where {N, T} = T
-# getsize(::FixedSizeListType{N, T}) where {N, T} = N
+"FixedSizeListKind data are stored in a single contiguous buffer; individual elements can be computed based on the fixed size of the lists"
+struct FixedSizeListKind{N, T} <: ArrowKind end
+gettype(::FixedSizeListKind{N, T}) where {N, T} = T
+getsize(::FixedSizeListKind{N, T}) where {N, T} = N
 
-ArrowKind(::Type{NTuple{N, T}}) where {N, T} = FixedSizeListType{N, T}()
+ArrowKind(::Type{NTuple{N, T}}) where {N, T} = FixedSizeListKind{N, T}()
 
-ArrowKind(::Type{UUID}) = FixedSizeListType{16, UINt8}()
+ArrowType(::Type{UUID}) = NTuple{16, UINt8}
+toarrow(x::UUID) = _cast(NTuple{16, UInt8}, u.value)
 const UUIDSYMBOL = Symbol("JuliaLang.UUID")
 arrowname(::Type{UUID}) = UUIDSYMBOL
-toarrow(x::UUID) = _cast(NTuple{16, UInt8}, u.value)
-fromarrow(::Val{UUIDSYMBOL}, x::NTuple{16, UInt8}) = UUID(_cast(UInt128, x))
+JuliaType(::Val{UUIDSYMBOL}, S) = UUID
+fromarrow(::Type{UUID}, x::NTuple{16, UInt8}) = UUID(_cast(UInt128, x))
 
 function _cast(::Type{Y}, x)::Y where {Y}
     y = Ref{Y}()
@@ -108,29 +203,34 @@ function _unsafe_cast!(y::Ref{Y}, x::Ref, n::Integer) where {Y}
     return y
 end
 
-struct StructType <: ArrowKind end
+"StructKind data are stored in separate buffers for each field of the struct"
+struct StructKind <: ArrowKind end
 
-ArrowKind(::Type{<:NamedTuple}) = StructType()
+ArrowKind(::Type{<:NamedTuple}) = StructKind()
 
-fromarrow(V::Val{name}; kw...) where {name} = fromarrow(V, kw.data)
-fromarrow(V::Val{name}, x::NamedTuple) where {name} = fromarrow(V, Tuple(x)...)
+fromarrow(::Type{T}; kw...) where {T} = fromarrow(T, kw.data)
+fromarrow(::Type{T}, x::NamedTuple) where {T} = fromarrow(T, Tuple(x)...)
 
-ArrowKind(::Type{<:Tuple}) = StructType()
+ArrowKind(::Type{<:Tuple}) = StructKind()
 const TUPLE = Symbol("JuliaLang.Tuple")
+# needed to disambiguate the FixedSizeList case for NTuple
 arrowname(::Type{NTuple{N, T}}) where {N, T} = EMPTY_SYMBOL
 arrowname(::Type{T}) where {T <: Tuple} = TUPLE
-fromarrow(::Val{TUPLE}, x::NamedTuple) = Tuple(x)
+JuliaType(::Val{TUPLE}, ::Type{NamedTuple{names, types}}) where {names, types} = types
+fromarrow(::Type{<:Tuple}, x::NamedTuple) = Tuple(x)
 
-# must implement keytype, valtype
-struct MapType <: ArrowKind end
+"MapKind data are stored similarly to ListKind, where elements are flattened, and a 2nd offsets buffer contains the individual list element length data"
+struct MapKind <: ArrowKind end
 
-ArrowKind(::Type{<:AbstractDict}) = MapType()
+ArrowKind(::Type{<:AbstractDict}) = MapKind()
 
-struct UnionType <: ArrowKind end
+"UnionKind data are stored either in a separate, compacted buffer for each union type (dense), or in full-length buffers for each union type (sparse)"
+struct UnionKind <: ArrowKind end
 
-ArrowKind(::Union) = UnionType()
+ArrowKind(::Union) = UnionKind()
 
-struct DictEncodedType <: ArrowKind end
+"DictEncodedKind store a small pool of unique values in one buffer, with a full-length buffer of integer offsets into the small value pool"
+struct DictEncodedKind <: ArrowKind end
 
 """
 There are a couple places when writing arrow buffers where
@@ -172,45 +272,52 @@ Base.size(x::ToArrow) = (length(x.data),)
 Base.eltype(x::ToArrow{T, A}) where {T, A} = T
 Base.getindex(x::ToArrow{T}, i::Int) where {T} = toarrow(getindex(x.data, i))::T
 
-# const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Type, Tuple{String, Type}}(
-#     Char => ("JuliaLang.Char", UInt32),
-#     Symbol => ("JuliaLang.Symbol", String),
-#     UUID => ("JuliaLang.UUID", NTuple{16,UInt8}),
-# )
+#### DEPRECATED
+function arrowconvert end
+arrowconvert(T, x) = convert(T, x)
+arrowconvert(::Type{Union{T, Missing}}, x) where {T} = arrowconvert(T, x)
+arrowconvert(::Type{Union{T, Missing}}, ::Missing) where {T} = missing
 
-# istyperegistered(::Type{T}) where {T} = haskey(JULIA_TO_ARROW_TYPE_MAPPING, T)
+const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Type, Tuple{String, Type}}(
+    Char => ("JuliaLang.Char", UInt32),
+    Symbol => ("JuliaLang.Symbol", String),
+    UUID => ("JuliaLang.UUID", NTuple{16,UInt8}),
+)
 
-# function getarrowtype!(meta, ::Type{T}) where {T}
-#     arrowname, arrowtype = JULIA_TO_ARROW_TYPE_MAPPING[T]
-#     meta["ARROW:extension:name"] = arrowname
-#     meta["ARROW:extension:metadata"] = ""
-#     return arrowtype
-# end
+istyperegistered(::Type{T}) where {T} = haskey(JULIA_TO_ARROW_TYPE_MAPPING, T)
 
-# const ARROW_TO_JULIA_TYPE_MAPPING = Dict{String, Tuple{Type, Type}}(
-#     "JuliaLang.Char" => (Char, UInt32),
-#     "JuliaLang.Symbol" => (Symbol, String),
-#     "JuliaLang.UUID" => (UUID, NTuple{16,UInt8}),
-# )
+function getarrowtype!(meta, ::Type{T}) where {T}
+    arrowname, arrowtype = JULIA_TO_ARROW_TYPE_MAPPING[T]
+    meta["ARROW:extension:name"] = arrowname
+    meta["ARROW:extension:metadata"] = ""
+    return arrowtype
+end
 
-# function extensiontype(f, meta)
-#     if haskey(meta, "ARROW:extension:name")
-#         typename = meta["ARROW:extension:name"]
-#         if haskey(ARROW_TO_JULIA_TYPE_MAPPING, typename)
-#             T = ARROW_TO_JULIA_TYPE_MAPPING[typename][1]
-#             return f.nullable ? Union{T, Missing} : T
-#         else
-#             @warn "unsupported ARROW:extension:name type: \"$typename\""
-#         end
-#     end
-#     return nothing
-# end
+const ARROW_TO_JULIA_TYPE_MAPPING = Dict{String, Tuple{Type, Type}}(
+    "JuliaLang.Char" => (Char, UInt32),
+    "JuliaLang.Symbol" => (Symbol, String),
+    "JuliaLang.UUID" => (UUID, NTuple{16,UInt8}),
+)
 
-# function registertype!(juliatype::Type, arrowtype::Type, arrowname::String=string("JuliaLang.", string(juliatype)))
-#     # TODO: validate that juliatype isn't already default arrow type
-#     JULIA_TO_ARROW_TYPE_MAPPING[juliatype] = (arrowname, arrowtype)
-#     ARROW_TO_JULIA_TYPE_MAPPING[arrowname] = (juliatype, arrowtype)
-#     return
-# end
+function extensiontype(f, meta)
+    if haskey(meta, "ARROW:extension:name")
+        typename = meta["ARROW:extension:name"]
+        if haskey(ARROW_TO_JULIA_TYPE_MAPPING, typename)
+            T = ARROW_TO_JULIA_TYPE_MAPPING[typename][1]
+            return f.nullable ? Union{T, Missing} : T
+        else
+            @warn "unsupported ARROW:extension:name type: \"$typename\""
+        end
+    end
+    return nothing
+end
+
+function registertype!(juliatype::Type, arrowtype::Type, arrowname::String=string("JuliaLang.", string(juliatype)))
+    @warn "Arrow.ArrowTypes.registertype! is deprecated in favor of defining `ArrowTypes.ArrowType`, `ArrowTypes.arrowname`, and `ArrowTypes.JuliaType`; see their docs for more information on how to migrate"
+    # TODO: validate that juliatype isn't already default arrow type
+    JULIA_TO_ARROW_TYPE_MAPPING[juliatype] = (arrowname, arrowtype)
+    ARROW_TO_JULIA_TYPE_MAPPING[arrowname] = (juliatype, arrowtype)
+    return
+end
 
 end # module ArrowTypes
