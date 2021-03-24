@@ -186,12 +186,16 @@ getsize(::FixedSizeListKind{N, T}) where {N, T} = N
 
 ArrowKind(::Type{NTuple{N, T}}) where {N, T} = FixedSizeListKind{N, T}()
 
+ArrowKind(::Type{UUID}) = FixedSizeListKind{16, UInt8}()
 ArrowType(::Type{UUID}) = NTuple{16, UInt8}
 toarrow(x::UUID) = _cast(NTuple{16, UInt8}, x.value)
 const UUIDSYMBOL = Symbol("JuliaLang.UUID")
 arrowname(::Type{UUID}) = UUIDSYMBOL
 JuliaType(::Val{UUIDSYMBOL}, S) = UUID
 fromarrow(::Type{UUID}, x::NTuple{16, UInt8}) = UUID(_cast(UInt128, x))
+# for backwards compatibility
+arrowconvert(::Type{UUID}, u::NamedTuple{(:value,),Tuple{UInt128}}) = UUID(u.value)
+arrowconvert(::Type{UUID}, u::UInt128) = UUID(u)
 
 function _cast(::Type{Y}, x)::Y where {Y}
     y = Ref{Y}()
@@ -215,6 +219,7 @@ struct StructKind <: ArrowKind end
 ArrowKind(::Type{<:NamedTuple}) = StructKind()
 
 fromarrow(::Type{T}; kw...) where {T} = fromarrow(T, kw.data)
+fromarrow(::Type{NamedTuple{names, types}}, x::NamedTuple{names, types}) where {names, types <: Tuple} = x
 fromarrow(::Type{T}, x::NamedTuple) where {T} = fromarrow(T, Tuple(x)...)
 
 ArrowKind(::Type{<:Tuple}) = StructKind()
@@ -278,12 +283,12 @@ function ToArrow(x::A) where {A}
     T = ArrowType(S)
     if S === T
         return x
-    elseif !isconcretetype(T)
+    elseif !isconcretetype(T) && !(T isa Union)
         # arrow needs concrete types, so try to find a concrete common type, preferring unions
         if isempty(x)
             return Missing[]
         end
-        T = typeof(x[1])
+        T = typeof(toarrow(x[1]))
         for i = 2:length(x)
             @inbounds T = promoteunion(T, typeof(toarrow(x[i])))
         end

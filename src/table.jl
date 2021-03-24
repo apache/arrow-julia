@@ -178,8 +178,8 @@ Tables.getcolumn(t::Table, i::Int) = columns(t)[i]
 Tables.getcolumn(t::Table, nm::Symbol) = lookup(t)[nm]
 
 # high-level user API functions
-Table(io::IO, pos::Integer=1, len=nothing; convert::Bool=true) = Table(Base.read(io), pos, len; convert=convert)
-Table(str::String, pos::Integer=1, len=nothing; convert::Bool=true) = isfile(str) ? Table(Mmap.mmap(str), pos, len; convert=convert) :
+Table(io::IO, pos::Integer=1, len=nothing; kw...) = Table(Base.read(io), pos, len; kw...)
+Table(str::String, pos::Integer=1, len=nothing; kw...) = isfile(str) ? Table(Mmap.mmap(str), pos, len; kw...) :
     throw(ArgumentError("$str is not a file"))
 
 # will detect whether we're reading a Table from a file or stream
@@ -507,10 +507,11 @@ function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, 
     data = Tuple(vecs)
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
+    UT = UnionT(f, convert)
     if L.mode == Meta.UnionMode.Dense
-        B = DenseUnion{T, typeof(data)}(bytes, bytes2, typeIds, offsets, data, meta)
+        B = DenseUnion{T, UT, typeof(data)}(bytes, bytes2, typeIds, offsets, data, meta)
     else
-        B = SparseUnion{T, typeof(data)}(bytes, typeIds, data, meta)
+        B = SparseUnion{T, UT, typeof(data)}(bytes, typeIds, data, meta)
     end
     return B, nodeidx, bufferidx
 end

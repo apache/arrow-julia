@@ -26,6 +26,7 @@ end
 unionmode(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = T
 typeids(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = typeIds
 Base.eltype(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = U
+uniontype(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = Union{(fieldtype(U, i) for i = 1:fieldcount(U))...}
 
 ArrowTypes.ArrowKind(::Type{<:UnionT}) = ArrowTypes.UnionKind()
 
@@ -56,7 +57,7 @@ An `Arrow.DenseUnion`, in comparison to `Arrow.SparseUnion`, stores elements in 
 array, where each offset element is the index into one of the typed arrays. This allows a sort of "compression", where no extra space is
 used/allocated to store all the elements.
 """
-struct DenseUnion{T, S} <: ArrowVector{T}
+struct DenseUnion{T, U, S} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     arrow2::Vector{UInt8} # if arrow blob is compressed, need a 2nd reference for uncompressed offsets bytes
     typeIds::Vector{UInt8}
@@ -68,27 +69,27 @@ end
 Base.size(s::DenseUnion) = size(s.typeIds)
 nullcount(x::DenseUnion) = 0 # DenseUnion has no validity bitmap; only children do
 
-@propagate_inbounds function Base.getindex(s::DenseUnion{T}, i::Integer) where {T}
+@propagate_inbounds function Base.getindex(s::DenseUnion{T, UnionT{M, typeIds, U}}, i::Integer) where {T, M, typeIds, U}
     @boundscheck checkbounds(s, i)
     @inbounds typeId = s.typeIds[i]
     @inbounds off = s.offsets[i]
     @inbounds x = s.data[typeId + 1][off + 1]
-    return ArrowTypes.fromarrow(T, x)
+    return ArrowTypes.fromarrow(fieldtype(U, typeId + 1), x)
 end
 
-@propagate_inbounds function Base.setindex!(s::DenseUnion{UnionT{T, typeIds, U}}, v, i::Integer) where {T, typeIds, U}
-    @boundscheck checkbounds(s, i)
-    @inbounds typeId = s.typeIds[i]
-    typeids = typeIds === nothing ? (0:(fieldcount(U) - 1)) : typeIds
-    vtypeId = Int8(typeids[isatypeid(v, U)])
-    if typeId == vtypeId
-        @inbounds off = s.offsets[i]
-        @inbounds s.data[typeId +1][off + 1] = v
-    else
-        throw(ArgumentError("type of item to set $(typeof(v)) must match existing item $(fieldtype(U, typeid))"))
-    end
-    return v
-end
+# @propagate_inbounds function Base.setindex!(s::DenseUnion{UnionT{T, typeIds, U}}, v, i::Integer) where {T, typeIds, U}
+#     @boundscheck checkbounds(s, i)
+#     @inbounds typeId = s.typeIds[i]
+#     typeids = typeIds === nothing ? (0:(fieldcount(U) - 1)) : typeIds
+#     vtypeId = Int8(typeids[isatypeid(v, U)])
+#     if typeId == vtypeId
+#         @inbounds off = s.offsets[i]
+#         @inbounds s.data[typeId +1][off + 1] = v
+#     else
+#         throw(ArgumentError("type of item to set $(typeof(v)) must match existing item $(fieldtype(U, typeid))"))
+#     end
+#     return v
+# end
 
 # convenience wrappers for signaling that an array shoudld be written
 # as with dense/sparse union arrow buffers
@@ -180,7 +181,7 @@ An `Arrow.SparseUnion`, in comparison to `Arrow.DenseUnion`, stores elements in 
 array has the same length as the full array. This ends up with "wasted" space, since only one slot among the typed arrays is valid per full
 array element, but can allow for certain optimizations when each typed array has the same length.
 """
-struct SparseUnion{T, S} <: ArrowVector{T}
+struct SparseUnion{T, U, S} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     typeIds::Vector{UInt8}
     data::S # Tuple of ArrowVector
@@ -190,21 +191,21 @@ end
 Base.size(s::SparseUnion) = size(s.typeIds)
 nullcount(x::SparseUnion) = 0
 
-@propagate_inbounds function Base.getindex(s::SparseUnion{T}, i::Integer) where {T}
+@propagate_inbounds function Base.getindex(s::SparseUnion{T, UnionT{M, typeIds, U}}, i::Integer) where {T, M, typeIds, U}
     @boundscheck checkbounds(s, i)
     @inbounds typeId = s.typeIds[i]
     @inbounds x = s.data[typeId + 1][i]
-    return ArrowTypes.fromarrow(T, x)
+    return ArrowTypes.fromarrow(fieldtype(U, typeId + 1), x)
 end
 
-@propagate_inbounds function Base.setindex!(s::SparseUnion{UnionT{T, typeIds, U}}, v, i::Integer) where {T, typeIds, U}
-    @boundscheck checkbounds(s, i)
-    typeids = typeIds === nothing ? (0:(fieldcount(U) - 1)) : typeIds
-    vtypeId = Int8(typeids[isatypeid(v, U)])
-    @inbounds s.typeIds[i] = vtypeId
-    @inbounds s.data[vtypeId + 1][i] = v
-    return v
-end
+# @propagate_inbounds function Base.setindex!(s::SparseUnion{UnionT{T, typeIds, U}}, v, i::Integer) where {T, typeIds, U}
+#     @boundscheck checkbounds(s, i)
+#     typeids = typeIds === nothing ? (0:(fieldcount(U) - 1)) : typeIds
+#     vtypeId = Int8(typeids[isatypeid(v, U)])
+#     @inbounds s.typeIds[i] = vtypeId
+#     @inbounds s.data[vtypeId + 1][i] = v
+#     return v
+# end
 
 arrowvector(U::Union, x, i, nl, fi, de, ded, meta; denseunions::Bool=true, kw...) =
     arrowvector(denseunions ? DenseUnionVector(x) : SparseUnionVector(x), i, nl, fi, de, ded, meta; denseunions=denseunions, kw...)
@@ -213,16 +214,17 @@ arrowvector(::UnionKind, x::Union{DenseUnion, SparseUnion}, i, nl, fi, de, ded, 
 
 function arrowvector(::UnionKind, x, i, nl, fi, de, ded, meta; kw...)
     UT = eltype(x)
+    T = uniontype(UT)
     if unionmode(UT) == Meta.UnionMode.Dense
         x = x isa DenseUnionVector ? x.itr : x
         typeids, offsets, data = todense(UT, x)
         data2 = map(y -> arrowvector(y[2], i, nl + 1, y[1], de, ded, nothing; kw...), enumerate(data))
-        return DenseUnion{UT, typeof(data2)}(UInt8[], UInt8[], typeids, offsets, data2, meta)
+        return DenseUnion{T, UT, typeof(data2)}(UInt8[], UInt8[], typeids, offsets, data2, meta)
     else
         x = x isa SparseUnionVector ? x.itr : x
         typeids = sparsetypeids(UT, x)
         data3 = Tuple(arrowvector(ToSparseUnion(fieldtype(eltype(UT), j), x), i, nl + 1, j, de, ded, nothing; kw...) for j = 1:fieldcount(eltype(UT)))
-        return SparseUnion{UT, typeof(data3)}(UInt8[], typeids, data3, meta)
+        return SparseUnion{T, UT, typeof(data3)}(UInt8[], typeids, data3, meta)
     end
 end
 

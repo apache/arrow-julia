@@ -61,7 +61,7 @@ end
 
 function juliaeltype(f::Meta.Field, convert::Bool)
     T = juliaeltype(f, f.type, convert)
-    return (f.nullable ? Union{T, Missing} : T)
+    return f.nullable ? Union{T, Missing} : T
 end
 
 juliaeltype(f::Meta.Field, ::Meta.Null, convert) = Missing
@@ -443,12 +443,15 @@ function arrowtype(b, x::Struct{T, S}) where {T, S}
 end
 
 # Unions
-function juliaeltype(f::Meta.Field, u::Meta.Union, convert)
-    return Union{(juliaeltype(x, buildmetadata(x), convert) for x in f.children)...}
+function UnionT(f::Meta.Field, convert)
+    typeids = f.type.typeIds === nothing ? nothing : Tuple(Int(x) for x in f.type.typeIds)
+    UT =  UnionT{f.type.mode, typeids, Tuple{(juliaeltype(x, buildmetadata(x), convert) for x in f.children)...}}
+    return UT
 end
 
-arrowtype(b, x::Union{DenseUnion{TT, S}, SparseUnion{TT, S}}) where {TT, S} = arrowtype(b, TT, x)
-function arrowtype(b, ::Type{UnionT{T, typeIds, U}}, x::Union{DenseUnion{TT, S}, SparseUnion{TT, S}}) where {T, typeIds, U, TT, S}
+juliaeltype(f::Meta.Field, u::Meta.Union, convert) = Union{(juliaeltype(x, buildmetadata(x), convert) for x in f.children)...}
+
+function arrowtype(b, x::Union{DenseUnion{S, UnionT{T, typeIds, U}}, SparseUnion{S, UnionT{T, typeIds, U}}}) where {S, T, typeIds, U}
     if typeIds !== nothing
         Meta.unionStartTypeIdsVector(b, length(typeIds))
         for id in Iterators.reverse(typeIds)

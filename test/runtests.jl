@@ -153,6 +153,9 @@ tt = Arrow.Table(Arrow.tobuffer(t))
 
 # automatic custom struct serialization/deserialization
 t = (col1=[CustomStruct(1, 2.3, "hey"), CustomStruct(4, 5.6, "there")],)
+
+Arrow.ArrowTypes.arrowname(::Type{CustomStruct}) = Symbol("JuliaLang.CustomStruct")
+Arrow.ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.CustomStruct")}, S) = CustomStruct
 tt = Arrow.Table(Arrow.tobuffer(t))
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
@@ -167,8 +170,8 @@ tt = Arrow.Table(Arrow.tobuffer(t))
 u = 0x6036fcbd20664bd8a65cdfa25434513f
 @test Arrow.ArrowTypes.arrowconvert(UUID, (value=u,)) === UUID(u)
 @test Arrow.ArrowTypes.arrowconvert(UUID, u) === UUID(u)
-@test Arrow.ArrowTypes.gettype(UUID) == UInt8
-@test Arrow.ArrowTypes.getsize(UUID) == 16
+@test Arrow.ArrowTypes.gettype(Arrow.ArrowTypes.ArrowKind(UUID)) == UInt8
+@test Arrow.ArrowTypes.getsize(Arrow.ArrowTypes.ArrowKind(UUID)) == 16
 
 # 98
 t = (a = [Nanosecond(0), Nanosecond(1)], b = [uuid4(), uuid4()], c = [missing, Nanosecond(1)])
