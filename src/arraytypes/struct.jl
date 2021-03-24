@@ -30,11 +30,13 @@ Base.size(s::Struct) = (s.ℓ,)
 
 isnamedtuple(::Type{<:NamedTuple}) = true
 isnamedtuple(T) = false
+istuple(::Type{<:Tuple}) = true
+istuple(T) = false
 
 @propagate_inbounds function Base.getindex(s::Struct{T}, i::Integer) where {T}
     @boundscheck checkbounds(s, i)
     NT = Base.nonmissingtype(T)
-    if isnamedtuple(NT)
+    if isnamedtuple(NT) || istuple(NT)
         if NT !== T
             return s.validity[i] ? NT(ntuple(j->s.data[j][i], fieldcount(NT))) : missing
         else

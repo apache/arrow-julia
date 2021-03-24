@@ -245,6 +245,10 @@ io = IOBuffer()
 tbl = Arrow.Table(Arrow.tobuffer((sets = [Set([1,2,3]), Set([1,2,3])],)))
 @test eltype(tbl.sets) <: Set
 
+# 85
+tbl = Arrow.Table(Arrow.tobuffer((tups = [(1, 3.14, "hey"), (1, 3.14, "hey")],)))
+@test eltype(tbl.tups) <: Tuple
+
 end # @testset "misc"
 
 end

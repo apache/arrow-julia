@@ -347,7 +347,7 @@ function makeschemamsg(sch::Tables.Schema, columns)
 end
 
 function fieldoffset(b, name, col)
-    nameoff = FlatBuffers.createstring!(b, String(name))
+    nameoff = FlatBuffers.createstring!(b, string(name))
     T = eltype(col)
     nullable = T >: Missing
     # check for custom metadata
