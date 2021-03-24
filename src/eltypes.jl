@@ -49,11 +49,11 @@ function juliaeltype(f::Meta.Field, meta::Dict{String, String}, convert::Bool)
     # end deprecated
     if haskey(meta, "ARROW:extension:name")
         typename = meta["ARROW:extension:name"]
-        JT = ArrowTypes.JuliaType(Val(Symbol(typename)), TT)
+        JT = ArrowTypes.JuliaType(Val(Symbol(typename)), maybemissing(TT))
         if JT !== nothing
             return f.nullable ? Union{JT, Missing} : JT
         else
-            @warn "unsupported ARROW:extension:name type: \"$typename\""
+            @warn "unsupported ARROW:extension:name type: \"$typename\", arrow type = $TT"
         end
     end
     return something(TTT, T)
@@ -342,7 +342,7 @@ ArrowTypes.ArrowType(::Type{P}) where {P <: Dates.Period} = Duration{arrowperiod
 ArrowTypes.toarrow(x::P) where {P <: Dates.Period} = convert(Duration{arrowperiodtype(P)}, x)
 const PERIOD_SYMBOL = Symbol("JuliaLang.Dates.Period")
 ArrowTypes.arrowname(::Type{P}) where {P <: Dates.Period} = PERIOD_SYMBOL
-ArrowTypes.JuliaType(::Val{PERIOD_SYMBOL}, S::Duration{U}) where {U} = periodtype(U)
+ArrowTypes.JuliaType(::Val{PERIOD_SYMBOL}, ::Type{Duration{U}}) where {U} = periodtype(U)
 ArrowTypes.fromarrow(::Type{P}, x::Duration{U}) where {P <: Dates.Period, U} = convert(P, x)
 
 # nested types; call juliaeltype recursively on nested children
