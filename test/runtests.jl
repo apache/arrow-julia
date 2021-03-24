@@ -241,6 +241,10 @@ t = Tables.partitioner(
 io = IOBuffer()
 @test_throws ErrorException Arrow.write(io, t)
 
+# 75
+tbl = Arrow.Table(Arrow.tobuffer((sets = [Set([1,2,3]), Set([1,2,3])],)))
+@test eltype(tbl.sets) <: Set
+
 end # @testset "misc"
 
 end

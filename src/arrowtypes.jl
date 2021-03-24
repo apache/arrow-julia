@@ -178,6 +178,12 @@ _symbol(ptr, len) = ccall(:jl_symbol_n, Ref{Symbol}, (Ptr{UInt8}, Int), ptr, len
 fromarrow(::Type{Symbol}, ptr::Ptr{UInt8}, len::Int) = _symbol(ptr, len)
 
 ArrowKind(::Type{<:AbstractArray}) = ListKind()
+ArrowKind(::Type{<:AbstractSet}) = ListKind()
+ArrowType(::Type{T}) where {T <: AbstractSet{S}} where {S} = Vector{S}
+toarrow(x::AbstractSet) = collect(x)
+const SET = Symbol("JuliaLang.Set")
+arrowname(::Type{<:AbstractSet}) = SET
+JuliaType(::Val{SET}, ::Type{T}) where {T <: AbstractVector{S}} where {S} = Set{S}
 
 "FixedSizeListKind data are stored in a single contiguous buffer; individual elements can be computed based on the fixed size of the lists"
 struct FixedSizeListKind{N, T} <: ArrowKind end
