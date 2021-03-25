@@ -57,7 +57,7 @@ ArrowKind(::Type{T}) where {T} = isprimitivetype(T) ? PrimitiveKind() : StructKi
 Interface method to define the natively supported arrow type `S` that a given type `T` should be converted to before serializing.
 Useful when a custom type wants a "serialization hook" or otherwise needs to be transformed/converted into a natively
 supported arrow type for serialization. If a type defines `ArrowType`, it must also define a corresponding
-[`ArrowTypes.toarrow(::Type{S}, x::T)`](@ref) method which does the actual conversion from `T` to `S`.
+[`ArrowTypes.toarrow(x::T)`](@ref) method which does the actual conversion from `T` to `S`.
 Note that custom structs defined like `struct T` or `mutable struct T` are natively supported in serialization, so unless
 _additional_ transformation/customization is desired, a custom type `T` can serialize with no `ArrowType` definition (by default,
 each field of a struct is serialized, using the results of `fieldnames(T)` and `getfield(x, i)`).
