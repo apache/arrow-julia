@@ -44,26 +44,26 @@ istuple(T) = false
         end
     else
         if NT !== T
-            return s.validity[i] ? ArrowTypes.fromarrow(NT, ntuple(j->s.data[j][i], fieldcount(NT))...) : missing
+            return s.validity[i] ? ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(NT))...) : missing
         else
-            return ArrowTypes.fromarrow(NT, ntuple(j->s.data[j][i], fieldcount(NT))...)
+            return ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(NT))...)
         end
     end
 end
 
-@propagate_inbounds function Base.setindex!(s::Struct{T}, v::T, i::Integer) where {T}
-    @boundscheck checkbounds(s, i)
-    if v === missing
-        @inbounds s.validity[i] = false
-    else
-        NT = Base.nonmissingtype(T)
-        N = fieldcount(NT)
-        foreach(1:N) do j
-            @inbounds s.data[j][i] = getfield(v, j)
-        end
-    end
-    return v
-end
+# @propagate_inbounds function Base.setindex!(s::Struct{T}, v::T, i::Integer) where {T}
+#     @boundscheck checkbounds(s, i)
+#     if v === missing
+#         @inbounds s.validity[i] = false
+#     else
+#         NT = Base.nonmissingtype(T)
+#         N = fieldcount(NT)
+#         foreach(1:N) do j
+#             @inbounds s.data[j][i] = getfield(v, j)
+#         end
+#     end
+#     return v
+# end
 
 struct ToStruct{T, i, A} <: AbstractVector{T}
     data::A # eltype is NamedTuple or some struct
@@ -82,12 +82,16 @@ end
 
 arrowvector(::StructKind, x::Struct, i, nl, fi, de, ded, meta; kw...) = x
 
+namedtupletype(::Type{NamedTuple{names, types}}, data) where {names, types} = NamedTuple{names, Tuple{(eltype(x) for x in data)...}}
+namedtupletype(::Type{T}, data) where {T} = NamedTuple{fieldnames(T), Tuple{(eltype(x) for x in data)...}}
+namedtupletype(::Type{T}, data) where {T <: Tuple} = NamedTuple{map(Symbol, fieldnames(T)), Tuple{(eltype(x) for x in data)...}}
+
 function arrowvector(::StructKind, x, i, nl, fi, de, ded, meta; kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     T = Base.nonmissingtype(eltype(x))
     data = Tuple(arrowvector(ToStruct(x, j), i, nl + 1, j, de, ded, nothing; kw...) for j = 1:fieldcount(T))
-    return Struct{eltype(x), typeof(data)}(validity, data, len, meta)
+    return Struct{withmissing(eltype(x), namedtupletype(T, data)), typeof(data)}(validity, data, len, meta)
 end
 
 function compress(Z::Meta.CompressionType, comp, x::A) where {A <: Struct}

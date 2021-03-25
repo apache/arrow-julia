@@ -85,17 +85,24 @@ function arrowvector(::Type{S}, x, i, nl, fi, de, ded, meta; kw...) where {S}
     return arrowvector(ArrowKind(S), x, i, nl, fi, de, ded, meta; kw...)
 end
 
-arrowvector(::NullKind, x, i, nl, fi, de, ded, meta; kw...) = MissingVector(length(x))
-compress(Z::Meta.CompressionType, comp, v::MissingVector) =
-    Compressed{Z, MissingVector}(v, CompressedBuffer[], length(v), length(v), Compressed[])
+struct NullVector{T} <: ArrowVector{T}
+    data::MissingVector
+    metadata::Union{Nothing, Dict{String, String}}
+end
+Base.size(v::NullVector) = (length(v.data),)
+Base.getindex(v::NullVector{T}, i::Int) where {T} = ArrowTypes.fromarrow(T, getindex(v.data, i))
 
-function makenodesbuffers!(col::MissingVector, fieldnodes, fieldbuffers, bufferoffset, alignment)
+arrowvector(::NullKind, x, i, nl, fi, de, ded, meta; kw...) = NullVector{eltype(x)}(MissingVector(length(x)), meta)
+compress(Z::Meta.CompressionType, comp, v::NullVector) =
+    Compressed{Z, NullVector}(v, CompressedBuffer[], length(v), length(v), Compressed[])
+
+function makenodesbuffers!(col::NullVector, fieldnodes, fieldbuffers, bufferoffset, alignment)
     push!(fieldnodes, FieldNode(length(col), length(col)))
     @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     return bufferoffset
 end
 
-function writebuffer(io, col::MissingVector, alignment)
+function writebuffer(io, col::NullVector, alignment)
     return
 end
 

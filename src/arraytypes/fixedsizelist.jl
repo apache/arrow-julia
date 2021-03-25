@@ -74,6 +74,8 @@ struct ToFixedSizeList{T, N, A} <: AbstractVector{T}
     data::A # A is AbstractVector of (AbstractVector or AbstractString)
 end
 
+origtype(::ToFixedSizeList{T, N, A}) where {T, N, A} = eltype(A)
+
 function ToFixedSizeList(input)
     NT = ArrowTypes.ArrowKind(Base.nonmissingtype(eltype(input))) # typically NTuple{N, T}
     return ToFixedSizeList{ArrowTypes.gettype(NT), ArrowTypes.getsize(NT), typeof(input)}(input)
@@ -105,16 +107,18 @@ end
 
 arrowvector(::FixedSizeListKind, x::FixedSizeList, i, nl, fi, de, ded, meta; kw...) = x
 
-function arrowvector(::FixedSizeListKind, x, i, nl, fi, de, ded, meta; kw...)
+function arrowvector(::FixedSizeListKind{N, T}, x, i, nl, fi, de, ded, meta; kw...) where {N, T}
     len = length(x)
     validity = ValidityBitmap(x)
     flat = ToFixedSizeList(x)
     if eltype(flat) == UInt8
         data = flat
+        S = origtype(flat)
     else
         data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; kw...)
+        S = withmissing(eltype(x), NTuple{N, eltype(data)})
     end
-    return FixedSizeList{eltype(x), typeof(data)}(UInt8[], validity, data, len, meta)
+    return FixedSizeList{S, typeof(data)}(UInt8[], validity, data, len, meta)
 end
 
 function compress(Z::Meta.CompressionType, comp, x::FixedSizeList{T, A}) where {T, A}

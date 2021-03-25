@@ -140,6 +140,13 @@ fromarrow(::Type{Union{Missing, T}}, x) where {T} = fromarrow(T, x)
 struct NullKind <: ArrowKind end
 
 ArrowKind(::Type{Missing}) = NullKind()
+ArrowKind(::Type{Nothing}) = NullKind()
+ArrowType(::Type{Nothing}) = Missing
+toarrow(::Nothing) = missing
+const NOTHING = Symbol("JuliaLang.Nothing")
+arrowname(::Type{Nothing}) = NOTHING
+JuliaType(::Val{NOTHING}, S) = Nothing
+fromarrow(::Type{Nothing}, ::Missing) = nothing
 
 "PrimitiveKind data is stored as plain bits in a single contiguous buffer"
 struct PrimitiveKind <: ArrowKind end
@@ -178,6 +185,7 @@ _symbol(ptr, len) = ccall(:jl_symbol_n, Ref{Symbol}, (Ptr{UInt8}, Int), ptr, len
 fromarrow(::Type{Symbol}, ptr::Ptr{UInt8}, len::Int) = _symbol(ptr, len)
 
 ArrowKind(::Type{<:AbstractArray}) = ListKind()
+fromarrow(::Type{A}, x::AbstractVector{T}) where {A <: AbstractVector{T}} where {T} = x
 ArrowKind(::Type{<:AbstractSet}) = ListKind()
 ArrowType(::Type{T}) where {T <: AbstractSet{S}} where {S} = Vector{S}
 toarrow(x::AbstractSet) = collect(x)

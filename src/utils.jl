@@ -118,6 +118,8 @@ Base.eltype(x::Converter{T, A}) where {T, A} = T
 Base.getindex(x::Converter{T}, i::Int) where {T} = ArrowTypes.arrowconvert(T, getindex(x.data, i))
 
 maybemissing(::Type{T}) where {T} = T === Missing ? Missing : Base.nonmissingtype(T)
+withmissing(U::Union, S) = U >: Missing ? Union{Missing, S} : S
+withmissing(T, S) = T === Missing ? Union{Missing, S} : S
 
 function getfooter(filebytes)
     len = readbuffer(filebytes, length(filebytes) - 9, Int32)

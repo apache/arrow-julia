@@ -45,6 +45,8 @@ using Mmap
 import Dates
 using DataAPI, Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd, TimeZones, BitIntegers
 
+export ArrowTypes
+
 using Base: @propagate_inbounds
 import Base: ==
 

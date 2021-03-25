@@ -73,6 +73,8 @@ struct ToList{T, stringtype, A, I} <: AbstractVector{T}
     inds::Vector{I}
 end
 
+origtype(::ToList{T, S, A, I}) where {T, S, A, I} = A
+
 function ToList(input; largelists::Bool=false)
     AT = eltype(input)
     ST = Base.nonmissingtype(AT)
@@ -190,10 +192,12 @@ function arrowvector(::ListKind, x, i, nl, fi, de, ded, meta; largelists::Bool=f
     offsets = Offsets(UInt8[], flat.inds)
     if eltype(flat) == UInt8 # binary or utf8string
         data = flat
+        T = origtype(flat)
     else
         data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; lareglists=largelists, kw...)
+        T = withmissing(eltype(x), Vector{eltype(data)})
     end
-    return List{eltype(x), eltype(flat.inds), typeof(data)}(UInt8[], validity, offsets, data, len, meta)
+    return List{T, eltype(flat.inds), typeof(data)}(UInt8[], validity, offsets, data, len, meta)
 end
 
 function compress(Z::Meta.CompressionType, comp, x::List{T, O, A}) where {T, O, A}
