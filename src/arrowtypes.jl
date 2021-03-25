@@ -291,10 +291,14 @@ struct ToArrow{T, A} <: AbstractVector{T}
     data::A
 end
 
+@noinline concretecheck(T) = !isconcretetype(T) && !(T isa Union) &&
+    throw(ArgumentError("can't serialize column with abstract element type: $T. Column types must be concrete or a union of concrete types and elements must be homogenous for the arrow format"))
+
 function ToArrow(x::A) where {A}
     S = eltype(A)
     T = ArrowType(S)
     if S === T
+        concretecheck(T)
         return x
     elseif !isconcretetype(T) && !(T isa Union)
         # arrow needs concrete types, so try to find a concrete common type, preferring unions
@@ -305,9 +309,7 @@ function ToArrow(x::A) where {A}
         for i = 2:length(x)
             @inbounds T = promoteunion(T, typeof(toarrow(x[i])))
         end
-        if !isconcretetype(T) && !(T isa Union)
-            error("can't serialize column with abstract type: $A")
-        end
+        concretecheck(T)
     end
     return ToArrow{T, A}(x)
 end
@@ -323,11 +325,7 @@ arrowconvert(T, x) = convert(T, x)
 arrowconvert(::Type{Union{T, Missing}}, x) where {T} = arrowconvert(T, x)
 arrowconvert(::Type{Union{T, Missing}}, ::Missing) where {T} = missing
 
-const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Type, Tuple{String, Type}}(
-    Char => ("JuliaLang.Char", UInt32),
-    Symbol => ("JuliaLang.Symbol", String),
-    UUID => ("JuliaLang.UUID", NTuple{16,UInt8}),
-)
+const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Type, Tuple{String, Type}}()
 
 istyperegistered(::Type{T}) where {T} = haskey(JULIA_TO_ARROW_TYPE_MAPPING, T)
 
@@ -338,11 +336,7 @@ function getarrowtype!(meta, ::Type{T}) where {T}
     return arrowtype
 end
 
-const ARROW_TO_JULIA_TYPE_MAPPING = Dict{String, Tuple{Type, Type}}(
-    "JuliaLang.Char" => (Char, UInt32),
-    "JuliaLang.Symbol" => (Symbol, String),
-    "JuliaLang.UUID" => (UUID, NTuple{16,UInt8}),
-)
+const ARROW_TO_JULIA_TYPE_MAPPING = Dict{String, Tuple{Type, Type}}()
 
 function extensiontype(f, meta)
     if haskey(meta, "ARROW:extension:name")
