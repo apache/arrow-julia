@@ -108,7 +108,7 @@ The use of `Val(Symbol(...))` is to allow overloading a method on a specific log
 `JuliaType` is the native arrow serialized type. This can be useful for parametric Julia types that wish to correctly parameterize
 their custom type based on what was serialized.
 When defining [`ArrowTypes.arrowname`](@ref) and `ArrowTypes.JuliaType`, you may also want to implement [`ArrowTypes.fromarrow`]
-in order to customize how a custom type `T` should be constructed from the native arrow data type. See its docs for mmore details.
+in order to customize how a custom type `T` should be constructed from the native arrow data type. See its docs for more details.
 """
 function JuliaType end
 JuliaType(val, S) = nothing
