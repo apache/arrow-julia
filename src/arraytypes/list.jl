@@ -109,7 +109,8 @@ Base.size(x::ToList) = (length(x.inds) == 0 ? 0 : x.inds[end],)
 
 function Base.pointer(A::ToList{UInt8}, i::Integer)
     chunk = searchsortedfirst(A.inds, i)
-    return pointer(A.data[chunk - 1])
+    chunk = chunk > length(A.inds) ? 1 : (chunk - 1)
+    return pointer(A.data[chunk])
 end
 
 @inline function index(A::ToList, i::Integer)
