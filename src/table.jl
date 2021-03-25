@@ -520,7 +520,7 @@ function build(f::Meta.Field, L::Meta.Null, batch, rb, de, nodeidx, bufferidx, c
     @debug 2 "building array: L = $L"
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
-    return NullVector{maybemissing(T)}(MissingVector(rb.nodes[nodeidx].length), meta), nodeidx, bufferidx
+    return NullVector{maybemissing(T)}(MissingVector(rb.nodes[nodeidx].length), meta), nodeidx + 1, bufferidx
 end
 
 # primitives
