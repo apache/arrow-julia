@@ -49,7 +49,8 @@ function juliaeltype(f::Meta.Field, meta::Dict{String, String}, convert::Bool)
     # end deprecated
     if haskey(meta, "ARROW:extension:name")
         typename = meta["ARROW:extension:name"]
-        JT = ArrowTypes.JuliaType(Val(Symbol(typename)), maybemissing(TT))
+        metadata = get(meta, "ARROW:extension:metadata", "")
+        JT = ArrowTypes.JuliaType(Val(Symbol(typename)), maybemissing(TT), metadata)
         if JT !== nothing
             return f.nullable ? Union{JT, Missing} : JT
         else

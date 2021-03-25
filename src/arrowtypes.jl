@@ -61,8 +61,9 @@ supported arrow type for serialization. If a type defines `ArrowType`, it must a
 Note that custom structs defined like `struct T` or `mutable struct T` are natively supported in serialization, so unless
 _additional_ transformation/customization is desired, a custom type `T` can serialize with no `ArrowType` definition (by default,
 each field of a struct is serialized, using the results of `fieldnames(T)` and `getfield(x, i)`).
-Note that defining these methods only enables _serialization_ to the arrow format; to be able to _deserialize_ custom types,
-see the docs for [`ArrowTypes.arrowname`](@ref), [`ArrowTypes.JuliaType`](@ref), and [`ArrowTypes.fromarrow`](@ref).
+Note that defining these methods only deal with custom _serialization_ to the arrow format; to be able to _deserialize_ custom
+types at all, see the docs for [`ArrowTypes.arrowname`](@ref), [`ArrowTypes.arrowmetadata`](@ref), [`ArrowTypes.JuliaType`](@ref),
+and [`ArrowTypes.fromarrow`](@ref).
 """
 function ArrowType end
 ArrowType(::Type{T}) where {T} = T
@@ -73,7 +74,8 @@ ArrowType(::Type{Missing}) = Missing
     ArrowTypes.toarrow(x::T) => S
 
 Interface method to perform the actual conversion from an object `x` of type `T` to the type `S`. `T` and `S` must match the
-types used when defining `ArrowTypes.ArrowType(::Type{T}) = S`. See [`ArrowTypes.ArrowType`](@ref) docs for more details.
+types used when defining `ArrowTypes.ArrowType(::Type{T}) = S`. Hence, `S` is the natively supported arrow type that `T`
+desires to convert to to enable serialization. See [`ArrowTypes.ArrowType`](@ref) docs for more details.
 This enables custom objects to be serialized as a natively supported arrow data type.
 """
 function toarrow end
@@ -86,11 +88,13 @@ Interface method to define the logical type "label" for a custom Julia type `T`.
 and conventionally, custom types will just use their type name along with a Julia-specific prefix; for example, for a custom type
 `Foo`, I would define `ArrowTypes.arrowname(::Type{Foo}) = Symbol("JuliaLang.Foo")`. This ensures other language implementations
 won't get confused and are safe to ignore the logical type label.
-When arrow stores non-native data, it must still be _stored_ as a native data type, but can have metadata tied to the data that
+When arrow stores non-native data, it must still be _stored_ as a native data type, but can have type metadata tied to the data that
 labels the original _logical_ type it originated from. This enables the conversion of native data back to the logical type when
 deserializing, as long as the deserializer has the same definitions when the data was serialized. Namely, the current Julia
 session will need the appropriate [`ArrowTypes.JuliaType`](@ref) and [`ArrowTypes.fromarrow`](@ref) definitions in order to know
-how to convert the native data to the original logical type. See the docs for those interface methods in order to ensure a complete implementation.
+how to convert the native data to the original logical type. See the docs for those interface methods in order to ensure a complete
+implementation. Also see the accompanying [`ArrowTypes.arrowmetadata`](@ref) docs around providing additional metadata about a custom
+logical type that may be necessary to fully re-create a Julia type (e.g. non-field-based type parameters).
 """
 function arrowname end
 const EMPTY_SYMBOL = Symbol()
@@ -98,20 +102,36 @@ arrowname(T) = EMPTY_SYMBOL
 hasarrowname(T) = arrowname(T) !== EMPTY_SYMBOL
 
 """
-    ArrowTypes.JuliaType(::Val{Symbol(name)}, ::Type{S}) = T
+    ArrowTypes.arrowmetadata(T) => String
+
+Interface method to provide additional logical type metadata when serializing extension types. [`ArrowTypes.arrowname`](@ref)
+provides the logical type _name_, which may be all that's needed to return a proper Julia type from [`ArrowTypes.JuliaType`](@ref),
+but some custom types may, for example have type parameters that aren't inferred/based on fields. In order to fully recreate these
+kinds of types when deserializing, these type parameters can be stored by defining `ArrowTypes.arrowmetadata(::Type{T}) = "type_param"`.
+This will then be available to access by overloading `ArrowTypes.JuliaType(::Val{Symbol(name)}, S, arrowmetadata::String)`.
+"""
+function arrowmetadata end
+arrowmetadata(T) = ""
+
+"""
+    ArrowTypes.JuliaType(::Val{Symbol(name)}, ::Type{S}, arrowmetadata::String) = T
 
 Interface method to define the custom Julia logical type `T` that a serialized metadata label should be converted to when
-deserializing. When reading arrow data, it may encounter a logical type label for a column, it will call
-`ArrowTypes.JuliaType(Val(Symbol(name)), S)` to see if a Julia type has been "registered" for deserialization. The `name`
+deserializing. When reading arrow data, and a logical type label is encountered for a column, it will call
+`ArrowTypes.JuliaType(Val(Symbol(name)), S, arrowmetadata)` to see if a Julia type has been "registered" for deserialization. The `name`
 used when defining the method *must* correspond to the same `name` when defining `ArrowTypes.arrowname(::Type{T}) = Symbol(name)`.
 The use of `Val(Symbol(...))` is to allow overloading a method on a specific logical type label. The `S` 2nd argument passed to
 `JuliaType` is the native arrow serialized type. This can be useful for parametric Julia types that wish to correctly parameterize
-their custom type based on what was serialized.
+their custom type based on what was serialized. The 3rd argument `arrowmetadata` is any metadata that was stored when the logical
+type was serialized as the result of calling `ArrowTypes.arrowmetadata(T)`. Note the 2nd and 3rd arguments are optional when
+overloading if unneeded.
 When defining [`ArrowTypes.arrowname`](@ref) and `ArrowTypes.JuliaType`, you may also want to implement [`ArrowTypes.fromarrow`]
 in order to customize how a custom type `T` should be constructed from the native arrow data type. See its docs for more details.
 """
 function JuliaType end
-JuliaType(val, S) = nothing
+JuliaType(val) = nothing
+JuliaType(val, S) = JuliaType(val)
+JuliaType(val, S, meta) = JuliaType(val, S)
 
 """
     ArrowTypes.fromarrow(::Type{T}, x::S) => T
@@ -122,12 +142,14 @@ with [`ArrowTypes.toarrow`](@ref).
 
 The default definition is `ArrowTypes.fromarrow(::Type{T}, x) = T(x)`, so if that works for a custom type already, no additional
 overload is necessary.
-A few `ArrowKind`s allow slightly more custom overloads for their `fromarrow` methods:
+A few `ArrowKind`s have/allow slightly more custom overloads for their `fromarrow` methods:
   * `ListKind{true}`: for `String` types, they may overload `fromarrow(::Type{T}, ptr::Ptr{UInt8}, len::Int) = ...` to avoid
      materializing a `String`
-  * `StructKind`: may overload `fromarrow(::Type{T}, x::NamedTuple)`, or `fromarrow(::Type{T}; kw...)` (values passed as
-     name=>value keyword argument pairs), or `fromarrow(::Type{T}, x...)` where individual fields are passed as separate
-     positional arguments
+  * `StructKind`: must overload `fromarrow(::Type{T}, x...)` where individual fields are passed as separate
+     positional arguments; so if my custom type `Interval` has two fields `first` and `last`, then I'd overload like
+     `ArrowTypes.fromarrow(::Type{Interval}, first, last) = ...`. Note the default implementation is
+     `ArrowTypes.fromarrow(::Type{T}, x...) = T(x...)`, so if your type already accepts all arguments in a constructor
+     no additional `fromarrow` method should be necessary (default struct constructors have this behavior).
 """
 function fromarrow end
 fromarrow(::Type{T}, x::T) where {T} = x

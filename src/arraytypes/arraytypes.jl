@@ -64,7 +64,7 @@ function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dict
     if ArrowTypes.hasarrowname(T)
         meta = meta === nothing ? Dict{String, String}() : meta
         meta["ARROW:extension:name"] = String(ArrowTypes.arrowname(T))
-        meta["ARROW:extension:metadata"] = ""
+        meta["ARROW:extension:metadata"] = String(ArrowTypes.arrowmetadata(T))
     end
     return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)
 end
