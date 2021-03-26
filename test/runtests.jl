@@ -26,6 +26,10 @@ struct CustomStruct
     z::String
 end
 
+struct CustomStruct2{sym}
+    x::Int
+end
+
 @testset "Arrow" begin
 
 @testset "table roundtrips" begin
@@ -248,6 +252,21 @@ tbl = Arrow.Table(Arrow.tobuffer((sets = [Set([1,2,3]), Set([1,2,3])],)))
 # 85
 tbl = Arrow.Table(Arrow.tobuffer((tups = [(1, 3.14, "hey"), (1, 3.14, "hey")],)))
 @test eltype(tbl.tups) <: Tuple
+
+# Nothing
+tbl = Arrow.Table(Arrow.tobuffer((nothings=[nothing, nothing, nothing],)))
+@test tbl.nothings == [nothing, nothing, nothing]
+
+# arrowmetadata
+t = (col1=[CustomStruct2{:hey}(1), CustomStruct2{:hey}(2)],)
+ArrowTypes.arrowname(::Type{<:CustomStruct2}) = Symbol("CustomStruct2")
+tbl = Arrow.Table(Arrow.tobuffer(t))
+# test we get the warning about deserializing
+@test eltype(tbl.col1) <: NamedTuple
+ArrowTypes.arrowmetadata(::Type{CustomStruct2{sym}}) where {sym} = sym
+ArrowTypes.JuliaType(::Val{:CustomStruct2}, S, meta) = CustomStruct2{Symbol(meta)}
+tbl = Arrow.Table(Arrow.tobuffer(t))
+@test eltype(tbl.col1) == CustomStruct2{:hey}
 
 end # @testset "misc"
 
