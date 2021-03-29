@@ -104,7 +104,7 @@ end
 # given a number of unique values; what dict encoding _index_ type is most appropriate
 encodingtype(n) = n < div(typemax(Int8), 2) ? Int8 : n < div(typemax(Int16), 2) ? Int16 : n < div(typemax(Int32), 2) ? Int32 : Int64
 
-# lazily call convert(T, x) on getindex for each x in data
+# can be removed once we finish deprecating old registertype! machinery
 struct Converter{T, A} <: AbstractVector{T}
     data::A
 end
@@ -118,6 +118,8 @@ Base.eltype(x::Converter{T, A}) where {T, A} = T
 Base.getindex(x::Converter{T}, i::Int) where {T} = ArrowTypes.arrowconvert(T, getindex(x.data, i))
 
 maybemissing(::Type{T}) where {T} = T === Missing ? Missing : Base.nonmissingtype(T)
+withmissing(U::Union, S) = U >: Missing ? Union{Missing, S} : S
+withmissing(T, S) = T === Missing ? Union{Missing, S} : S
 
 function getfooter(filebytes)
     len = readbuffer(filebytes, length(filebytes) - 9, Int32)

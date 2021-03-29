@@ -52,58 +52,57 @@ function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dict
     if nl > maxdepth
         error("reached nested serialization level ($nl) deeper than provided max depth argument ($(maxdepth)); to increase allowed nesting level, pass `maxdepth=X`")
     end
-    if !(x isa DictEncode) && !dictencoding && (dictencode || (x isa AbstractArray && DataAPI.refarray(x) !== x))
+    T = maybemissing(eltype(x))
+    if !(x isa DictEncode) && !dictencoding && (dictencode || DataAPI.refarray(x) !== x)
         x = DictEncode(x, dictencodeid(i, nl, fi))
     elseif x isa DictEncoded
         return arrowvector(DictEncodeType, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)    
+    elseif !(x isa DictEncode)
+        x = ToArrow(x)
     end
     S = maybemissing(eltype(x))
+    if ArrowTypes.hasarrowname(T)
+        meta = meta === nothing ? Dict{String, String}() : meta
+        meta["ARROW:extension:name"] = String(ArrowTypes.arrowname(T))
+        meta["ARROW:extension:metadata"] = String(ArrowTypes.arrowmetadata(T))
+    end
     return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)
 end
 
-# defaults for Dates types
-ArrowTypes.default(::Type{Dates.Date}) = Dates.Date(1,1,1)
-ArrowTypes.default(::Type{Dates.Time}) = Dates.Time(1,1,1)
-ArrowTypes.default(::Type{Dates.DateTime}) = Dates.DateTime(1,1,1,1,1,1)
-ArrowTypes.default(::Type{TimeZones.ZonedDateTime}) = TimeZones.ZonedDateTime(1,1,1,1,1,1,TimeZones.tz"UTC")
-
-# conversions to arrow types
-arrowvector(::Type{Dates.Date}, x, i, nl, fi, de, ded, meta; kw...) =
-    arrowvector(converter(DATE, x), i, nl, fi, de, ded, meta; kw...)
-arrowvector(::Type{Dates.Time}, x, i, nl, fi, de, ded, meta; kw...) =
-    arrowvector(converter(TIME, x), i, nl, fi, de, ded, meta; kw...)
-arrowvector(::Type{Dates.DateTime}, x, i, nl, fi, de, ded, meta; kw...) =
-    arrowvector(converter(DATETIME, x), i, nl, fi, de, ded, meta; kw...)
-arrowvector(::Type{ZonedDateTime}, x, i, nl, fi, de, ded, meta; kw...) =
-    arrowvector(converter(Timestamp{Meta.TimeUnit.MILLISECOND, Symbol(x[1].timezone)}, x), i, nl, fi, de, ded, meta; kw...)
-arrowvector(::Type{P}, x, i, nl, fi, de, ded, meta; kw...) where {P <: Dates.Period} =
-    arrowvector(converter(Duration{arrowperiodtype(P)}, x), i, nl, fi, de, ded, meta; kw...)
-
-# fallback that calls ArrowType
+# now we check for ArrowType converions and dispatch on ArrowKind
 function arrowvector(::Type{S}, x, i, nl, fi, de, ded, meta; kw...) where {S}
+    # deprecated and will be removed
     if ArrowTypes.istyperegistered(S)
         meta = meta === nothing ? Dict{String, String}() : meta
         arrowtype = ArrowTypes.getarrowtype!(meta, S)
         if arrowtype === S
-            return arrowvector(ArrowType(S), x, i, nl, fi, de, ded, meta; kw...)
+            return arrowvector(ArrowKind(S), x, i, nl, fi, de, ded, meta; kw...)
         else
             return arrowvector(converter(arrowtype, x), i, nl, fi, de, ded, meta; kw...)
         end
     end
-    return arrowvector(ArrowType(S), x, i, nl, fi, de, ded, meta; kw...)
+    # end deprecation
+    return arrowvector(ArrowKind(S), x, i, nl, fi, de, ded, meta; kw...)
 end
 
-arrowvector(::NullType, x, i, nl, fi, de, ded, meta; kw...) = MissingVector(length(x))
-compress(Z::Meta.CompressionType, comp, v::MissingVector) =
-    Compressed{Z, MissingVector}(v, CompressedBuffer[], length(v), length(v), Compressed[])
+struct NullVector{T} <: ArrowVector{T}
+    data::MissingVector
+    metadata::Union{Nothing, Dict{String, String}}
+end
+Base.size(v::NullVector) = (length(v.data),)
+Base.getindex(v::NullVector{T}, i::Int) where {T} = ArrowTypes.fromarrow(T, getindex(v.data, i))
 
-function makenodesbuffers!(col::MissingVector, fieldnodes, fieldbuffers, bufferoffset, alignment)
+arrowvector(::NullKind, x, i, nl, fi, de, ded, meta; kw...) = NullVector{eltype(x)}(MissingVector(length(x)), meta)
+compress(Z::Meta.CompressionType, comp, v::NullVector) =
+    Compressed{Z, NullVector}(v, CompressedBuffer[], length(v), length(v), Compressed[])
+
+function makenodesbuffers!(col::NullVector, fieldnodes, fieldbuffers, bufferoffset, alignment)
     push!(fieldnodes, FieldNode(length(col), length(col)))
     @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     return bufferoffset
 end
 
-function writebuffer(io, col::MissingVector, alignment)
+function writebuffer(io, col::NullVector, alignment)
     return
 end
 
@@ -114,7 +113,7 @@ A bit-packed array type where each bit corresponds to an element in an
 [`ArrowVector`](@ref), indicating whether that element is "valid" (bit == 1),
 or not (bit == 0). Used to indicate element missingness (whether it's null).
 
-If the null count of an array is zero, the `ValidityBitmap` will be "emtpy"
+If the null count of an array is zero, the `ValidityBitmap` will be "empty"
 and all elements are treated as "valid"/non-null.
 """
 struct ValidityBitmap <: ArrowVector{Bool}

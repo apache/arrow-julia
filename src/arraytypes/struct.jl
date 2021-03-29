@@ -28,37 +28,42 @@ end
 
 Base.size(s::Struct) = (s.ℓ,)
 
+isnamedtuple(::Type{<:NamedTuple}) = true
+isnamedtuple(T) = false
+istuple(::Type{<:Tuple}) = true
+istuple(T) = false
+
 @propagate_inbounds function Base.getindex(s::Struct{T}, i::Integer) where {T}
     @boundscheck checkbounds(s, i)
     NT = Base.nonmissingtype(T)
-    if ArrowTypes.structtype(NT) === ArrowTypes.NAMEDTUPLE
+    if isnamedtuple(NT) || istuple(NT)
         if NT !== T
             return s.validity[i] ? NT(ntuple(j->s.data[j][i], fieldcount(NT))) : missing
         else
             return NT(ntuple(j->s.data[j][i], fieldcount(NT)))
         end
-    elseif ArrowTypes.structtype(NT) === ArrowTypes.STRUCT
+    else
         if NT !== T
-            return s.validity[i] ? NT(ntuple(j->s.data[j][i], fieldcount(NT))...) : missing
+            return s.validity[i] ? ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(NT))...) : missing
         else
-            return NT(ntuple(j->s.data[j][i], fieldcount(NT))...)
+            return ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(NT))...)
         end
     end
 end
 
-@propagate_inbounds function Base.setindex!(s::Struct{T}, v::T, i::Integer) where {T}
-    @boundscheck checkbounds(s, i)
-    if v === missing
-        @inbounds s.validity[i] = false
-    else
-        NT = Base.nonmissingtype(T)
-        N = fieldcount(NT)
-        foreach(1:N) do j
-            @inbounds s.data[j][i] = getfield(v, j)
-        end
-    end
-    return v
-end
+# @propagate_inbounds function Base.setindex!(s::Struct{T}, v::T, i::Integer) where {T}
+#     @boundscheck checkbounds(s, i)
+#     if v === missing
+#         @inbounds s.validity[i] = false
+#     else
+#         NT = Base.nonmissingtype(T)
+#         N = fieldcount(NT)
+#         foreach(1:N) do j
+#             @inbounds s.data[j][i] = getfield(v, j)
+#         end
+#     end
+#     return v
+# end
 
 struct ToStruct{T, i, A} <: AbstractVector{T}
     data::A # eltype is NamedTuple or some struct
@@ -75,19 +80,18 @@ Base.@propagate_inbounds function Base.getindex(A::ToStruct{T, j}, i::Integer) w
     return x === missing ? ArrowTypes.default(T) : getfield(x, j)
 end
 
-arrowvector(::StructType, x::Struct, i, nl, fi, de, ded, meta; kw...) = x
+arrowvector(::StructKind, x::Struct, i, nl, fi, de, ded, meta; kw...) = x
 
-function arrowvector(::StructType, x, i, nl, fi, de, ded, meta; kw...)
+namedtupletype(::Type{NamedTuple{names, types}}, data) where {names, types} = NamedTuple{names, Tuple{(eltype(x) for x in data)...}}
+namedtupletype(::Type{T}, data) where {T} = NamedTuple{fieldnames(T), Tuple{(eltype(x) for x in data)...}}
+namedtupletype(::Type{T}, data) where {T <: Tuple} = NamedTuple{map(Symbol, fieldnames(T)), Tuple{(eltype(x) for x in data)...}}
+
+function arrowvector(::StructKind, x, i, nl, fi, de, ded, meta; kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     T = Base.nonmissingtype(eltype(x))
-    if ArrowTypes.structtype(T) === ArrowTypes.STRUCT
-        meta = meta === nothing ? Dict{String, String}() : meta
-        ArrowTypes.registertype!(T, T)
-        ArrowTypes.getarrowtype!(meta, T)
-    end
     data = Tuple(arrowvector(ToStruct(x, j), i, nl + 1, j, de, ded, nothing; kw...) for j = 1:fieldcount(T))
-    return Struct{eltype(x), typeof(data)}(validity, data, len, meta)
+    return Struct{withmissing(eltype(x), namedtupletype(T, data)), typeof(data)}(validity, data, len, meta)
 end
 
 function compress(Z::Meta.CompressionType, comp, x::A) where {A <: Struct}

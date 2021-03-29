@@ -33,18 +33,20 @@ Base.size(l::Map) = (l.ℓ,)
     @boundscheck checkbounds(l, i)
     @inbounds lo, hi = l.offsets[i]
     if Base.nonmissingtype(T) !== T
-        return l.validity[i] ? ArrowTypes.arrowconvert(T, Dict(x.key => x.value for x in view(l.data, lo:hi))) : missing
+        return l.validity[i] ? ArrowTypes.fromarrow(T, Dict(x.key => x.value for x in view(l.data, lo:hi))) : missing
     else
-        return ArrowTypes.arrowconvert(T, Dict(x.key => x.value for x in view(l.data, lo:hi)))
+        return ArrowTypes.fromarrow(T, Dict(x.key => x.value for x in view(l.data, lo:hi)))
     end
 end
 
 keyvalues(KT, ::Missing) = missing
 keyvalues(KT, x::AbstractDict) = [KT(k, v) for (k, v) in pairs(x)]
 
-arrowvector(::MapType, x::Map, i, nl, fi, de, ded, meta; kw...) = x
+keyvaluetypes(::Type{NamedTuple{(:key, :value), Tuple{K, V}}}) where {K, V} = (K, V)
 
-function arrowvector(::MapType, x, i, nl, fi, de, ded, meta; largelists::Bool=false, kw...)
+arrowvector(::MapKind, x::Map, i, nl, fi, de, ded, meta; kw...) = x
+
+function arrowvector(::MapKind, x, i, nl, fi, de, ded, meta; largelists::Bool=false, kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     ET = eltype(x)
@@ -55,7 +57,8 @@ function arrowvector(::MapType, x, i, nl, fi, de, ded, meta; largelists::Bool=fa
     flat = ToList(T[keyvalues(KT, y) for y in x]; largelists=largelists)
     offsets = Offsets(UInt8[], flat.inds)
     data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; lareglists=largelists, kw...)
-    return Map{ET, eltype(flat.inds), typeof(data)}(validity, offsets, data, len, meta)
+    K, V = keyvaluetypes(eltype(data))
+    return Map{withmissing(ET, Dict{K, V}), eltype(flat.inds), typeof(data)}(validity, offsets, data, len, meta)
 end
 
 function compress(Z::Meta.CompressionType, comp, x::A) where {A <: Map}

@@ -19,7 +19,7 @@ table = Arrow.Table("data.arrow")
 
 ### `Arrow.Table`
 
-The type of `table` in this example will be an `Arrow.Table`. When "reading" the arrow data, `Arrow.Table` first ["mmapped"](https://en.wikipedia.org/wiki/Mmap) the `data.arrow` file, which is an important technique for dealing with data larger than available RAM on a system. By "mmapping" a file, the OS doesn't actually load the entire file contents into RAM at the same time, but file contents are "swapped" into RAM as different regions of a file are requested. Once "mmapped", `Arrow.Table` then inspected the metadata in the file to determine the number of columns, their names and types, at which byte offset each column begins in the file data, and even how many "batches" are included in this file (arrow tables may be partitioned into one ore more "record batches" each containing portions of the data). Armed with all the appropriate metadata, `Arrow.Table` then created custom array objects ([`ArrowVector`](@ref)), which act as "views" into the raw arrow memory bytes. This is a significant point in that no extra memory is allocated for "data" when reading arrow data. This is in contrast to if we wanted to read the data of a csv file as columns into Julia structures; we would need to allocate those array structures ourselves, then parse the file, "filling in" each element of the array with the data we parsed from the file. Arrow data, on the other hand, is *already laid out in memory or on disk* in a binary format, and as long as we have the metadata to interpret the raw bytes, we can figure out whether to treat those bytes as a `Vector{Float64}`, etc. A sample of the kinds of arrow array types you might see when deserializing arrow data, include:
+The type of `table` in this example will be an `Arrow.Table`. When "reading" the arrow data, `Arrow.Table` first ["mmapped"](https://en.wikipedia.org/wiki/Mmap) the `data.arrow` file, which is an important technique for dealing with data larger than available RAM on a system. By "mmapping" a file, the OS doesn't actually load the entire file contents into RAM at the same time, but file contents are "swapped" into RAM as different regions of a file are requested. Once "mmapped", `Arrow.Table` then inspected the metadata in the file to determine the number of columns, their names and types, at which byte offset each column begins in the file data, and even how many "batches" are included in this file (arrow tables may be partitioned into one or more "record batches" each containing portions of the data). Armed with all the appropriate metadata, `Arrow.Table` then created custom array objects ([`ArrowVector`](@ref)), which act as "views" into the raw arrow memory bytes. This is a significant point in that no extra memory is allocated for "data" when reading arrow data. This is in contrast to if we wanted to read data from a csv file as columns into Julia structures; we would need to allocate those array structures ourselves, then parse the file, "filling in" each element of the array with the data we parsed from the file. Arrow data, on the other hand, is *already laid out in memory or on disk* in a binary format, and as long as we have the metadata to interpret the raw bytes, we can figure out whether to treat those bytes as a `Vector{Float64}`, etc. A sample of the kinds of arrow array types you might see when deserializing arrow data, include:
 
 * [`Arrow.Primitive`](@ref): the most common array type for simple, fixed-size elements like integers, floats, time types, and decimals
 * [`Arrow.List`](@ref): an array type where its own elements are also arrays of some kind, like string columns, where each element can be thought of as an array of characters
@@ -30,7 +30,7 @@ The type of `table` in this example will be an `Arrow.Table`. When "reading" the
 * [`Arrow.SparseUnion`](@ref): another array type where elements may be of several different types, but stored as if made up of identically lengthed child arrays for each possible type (less memory efficient than `DenseUnion`)
 * [`Arrow.DictEncoded`](@ref): a special array type where values are "dictionary encoded", meaning the list of unique, possible values for an array are stored internally in an "encoding pool", whereas each stored element of the array is just an integer "code" to index into the encoding pool for the actual value.
 
-And while these custom array types do subtype `AbstractArray`, there is only limited support for `setindex!`. Remember, these arrays are "views" into the raw arrow bytes, so for array types other than `Arrow.Primitive`, it gets pretty tricky to allow manipulating those raw arrow bytes. Nevetheless, it's as simple as calling `copy(x)` where `x` is any `ArrowVector` type, and a normal Julia `Vector` type will be fully materialized (which would then allow mutating/manipulating values).
+And while these custom array types do subtype `AbstractArray`, there is no current support for `setindex!`. Remember, these arrays are "views" into the raw arrow bytes, so for array types other than `Arrow.Primitive`, it gets pretty tricky to allow manipulating those raw arrow bytes. Nevetheless, it's as simple as calling `copy(x)` where `x` is any `ArrowVector` type, and a normal Julia `Vector` type will be fully materialized (which would then allow mutating/manipulating values).
 
 So, what can you do with an `Arrow.Table` full of data? Quite a bit actually!
 
@@ -63,9 +63,7 @@ Note that when `convert=false` is passed, data will be returned in Arrow.jl-defi
 
 #### Custom types
 
-To support writing your custom Julia struct, Arrow.jl utilizes the format's mechanism for "extension types" by storing
-the Julia type name in the field metadata. To "hook in" to this machinery, custom types can just call
-`Arrow.ArrowTypes.registertype!(T, T)`, where `T` is the custom struct type. For example:
+To support writing your custom Julia struct, Arrow.jl utilizes the format's mechanism for "extension types" by allowing the storing of Julia type name and metadata in the field metadata. To "hook in" to this machinery, custom types can utilize the interface methods defined in the `Arrow.ArrowTypes` submodule. For example:
 
 ```julia
 using Arrow
@@ -75,7 +73,13 @@ struct Person
     name::String
 end
 
-Arrow.ArrowTypes.registertype!(Person, Person)
+# overload interface method for custom type Person; return a symbol as the "name"
+# this instructs Arrow.write what "label" to include with a column with this custom type
+ArrowTypes.arrowname(::Type{Person}) = :Person
+# overload JuliaType on `Val(:Person)`, which is like a dispatchable string
+# return our custom *type* Person; this enables Arrow.Table to know how the "label"
+# on a custom column should be mapped to a Julia type and deserialized
+ArrowTypes.JuliaType(::Val(:Person)) = Person
 
 table = (col1=[Person(1, "Bob"), Person(2, "Jane")],)
 io = IOBuffer()
@@ -85,21 +89,67 @@ table2 = Arrow.Table(io)
 ```
 
 In this example, we're writing our `table`, which is a NamedTuple with one column named `col1`, which has two
-elements which are instances of our custom `Person` struct. We call `Arrow.Arrowtypes.registertype!` so that
-Arrow.jl knows how to serialize our `Person` struct. We then read the table back in using `Arrow.Table` and
-the table we get back will be an `Arrow.Table`, with a single `Arrow.Struct` column with element type `Person`.
+elements which are instances of our custom `Person` struct. We overload `Arrowtypes.arrowname` so that
+Arrow.jl knows how to serialize our `Person` struct. We then overload `ArrowTypes.JuliaType` so the deserialization process knows how to map from our type label back to our `Person` struct type. We can then write our data in the arrow format to an in-memory `IOBuffer`, then read the table back in using `Arrow.Table`.
+The table we get back will be an `Arrow.Table`, with a single `Arrow.Struct` column with element type `Person`.
 
-Note that without calling `Arrow.Arrowtypes.registertype!`, we may get into a weird limbo state where we've written
+Note that without calling `Arrowtypes.JuliaType`, we may get into a weird limbo state where we've written
 our table with `Person` structs out as a table, but when reading back in, Arrow.jl doesn't know what a `Person` is;
 deserialization won't fail, but we'll just get a `Namedtuple{(:id, :name), Tuple{Int, String}}` back instead of `Person`.
 
-!!! warning
+While this example is very simple, it shows the basics to allow a custom type to be serialized/deserialized. But the `ArrowTypes` module offers even more powerful functionality for "hooking" non-native arrow types into the serialization/deserialization processes. Let's walk through a couple more examples; if you've had enough custom type shenanigans, feel free to skip to the next section.
 
-    If `Arrow.ArrowTypes.registertype!` is called in a downstream package, e.g. to register a custom type defined in
-    that package, it must be called from the `__init__` function of the package's top-level module
-    (see the [Julia docs](https://docs.julialang.org/en/v1/manual/modules/#Module-initialization-and-precompilation)
-    for more on `__init__` functions). Otherwise, the type will only be registered during the precompilation phase,
-    but that state will be lost afterwards (and in particular, the type will not be registered when the package is loaded).
+Let's take a look at how Arrow.jl allows serializing the `nothing` value, which is often referred to as the "software engineer's NULL" in Julia. While Arrow.jl treats `missing` as the default arrow NULL value, `nothing` is pretty similar, but we'd still like to treat it separately if possible. Here's how we enable serialization/deserialization in the `ArrowTypes` module:
+
+```julia
+ArrowTypes.ArrowKind(::Type{Nothing}) = ArrowTypes.NullKind()
+ArrowTypes.ArrowType(::Type{Nothing}) = Missing
+ArrowTypes.toarrow(::Nothing) = missing
+const NOTHING = Symbol("JuliaLang.Nothing")
+ArrowTypes.arrowname(::Type{Nothing}) = NOTHING
+ArrowTypes.JuliaType(::Val{NOTHING}) = Nothing
+ArrowTypes.fromarrow(::Type{Nothing}, ::Missing) = nothing
+```
+
+Let's walk through what's going on here, line-by-line:
+  * `ArrowKind` overload: `ArrowKind`s are generic "categories" of types supported by the arrow format, like `PrimitiveKind`, `ListKind`, etc. They each correspond to a different data layout strategy supported in the arrow format. Here, we define `nothing`'s kind to be `NullKind`, which means no actual memory is needed for storage, it's strictly a "metadata" type where we store the type and # of elements. In our `Person` example, we didn't need to overload this since types declared like `struct T` or `mutable struct T` are defined as `ArrowTypes.StructKind` by default
+  * `ArrowType` overload: here we're signaling that our type (`Nothing`) maps to the natively supported arrow type of `Missing`; this is important for the serializer so it knows which arrow type it will be serializing. Again, we didn't need to overload this for `Person` since the serializer knows how to serialize custom structs automatically by using reflection methods like `fieldnames(T)` and `getfield(x, i)`.
+  * `ArrowTypes.toarrow` overload: this is a sister method to `ArrowType`; we said our type will map to the `Missing` arrow type, so here we actually define ___how___ it converts to the arrow type; and in this case, it just returns `missing`. This is yet another method that didn't show up for `Person`; why? Well, as we noted in `ArrowType`, the serializer already knows how to serialize custom structs by using all their fields; if, for some reason, we wanted to omit some fields or otherwise transform things, then we could define corresponding `ArrowType` and `toarrow` methods
+  * `arrowname` overload: similar to our `Person` example, we need to instruct the serializer how to label our custom type in the arrow type metadata; here we give it the symbol `Symbol("JuliaLang.Nothing")`. Note that while this will ultimately allow us to disambiguate `nothing` from `missing` when reading arrow data, if we pass this data to other language implementations, they will only treat the data as `missing` since they (probably) won't know how to "understand" the `JuliaLang.Nothing` type label
+  * `JuliaType` overload: again, like our `Person` example, we instruct the deserializer that when it encounters the `JuliaLang.Nothing` type label, it should treat those values as `Nothing` type.
+  * And finally, `fromarrow` overload: this allows specifying how the native-arrow data should be converted back to our custom type. `fromarrow(T, x...)` by default will call `T(x...)`, which is why we didn't need this overload for `Person`, but in this example, `Nothing(missing)` won't work, so we define our own custom conversion.
+
+Let's run through one more complex example, just for fun and to really see how far the system can be pushed:
+
+```julia
+using Intervals
+table = (col = [
+    Interval{Closed,Unbounded}(1,nothing),
+],)
+const NAME = Symbol("JuliaLang.Interval")
+ArrowTypes.arrowname(::Type{Interval{T, L, R}}) where {T, L, R} = NAME
+const LOOKUP = Dict(
+    "Closed" => Closed,
+    "Unbounded" => Unbounded
+)
+ArrowTypes.arrowmetadata(::Type{Interval{T, L, R}}) where {T, L, R} = string(L, ".", R)
+function ArrowTypes.JuliaType(::Val{NAME}, ::Type{NamedTuple{names, types}}, meta) where {names, types}
+    L, R = split(meta, ".")
+    return Interval{fieldtype(types, 1), LOOKUP[L], LOOKUP[R]}
+end
+ArrowTypes.fromarrow(::Type{Interval{T, L, R}}, first, last) where {T, L, R} = Interval{L, R}(first, R == Unbounded ? nothing : last)
+io = Arrow.tobuffer(table)
+tbl = Arrow.Table(io)
+```
+
+Again, let's break down what's going on here:
+  * Here we're trying to save an `Interval` type in the arrow format; this type is unique in that it has two type parameters (`Closed` and `Unbounded`) that are not inferred/based on fields, but are just "type tags" on the type itself
+  * Note that we define a generic `arrowname` method on all `Interval`s, regardless of type parameters. We just want to let arrow know which general type we're dealing with here
+  * Next we use a new method `ArrowTypes.arrowmetadata` to encode the two non-field-based type parameters as a string with a dot delimiter; we encode this information here because remember, we have to match our `arrowname` Symbol typename in our `JuliaType(::Val(name))` definition in order to dispatch correctly; if we encoded the type parameters in `arrowname`, we would need separate `arrowname` definitions for each unique combination of those two type parameters, and corresponding `JuliaType` definitions for each as well; yuck. Instead, we let `arrowname` be generic to our type, and store the type parameters *for this specific column* using `arrowmetadata`
+  * Now in `JuliaType`, note we're using the 3-argument overload; we want the `NamedTuple` type that is the native arrow type our `Interval` is being serialized as; we use this to retrieve the 1st type parameter for our `Interval`, which is simply the type of the two `first` and `last` fields. Then we use the 3rd argument, which is whatever string we returned from `arrowmetadata`. We call `L, R = split(meta, ".")` to parse the two type parameters (in this case `Closed` and `Unbounded`), then do a lookup on those strings from a predefined `LOOKUP` Dict that matches the type parameter name as string to the actual type. We then have all the information to recreate the full `Interval` type. Neat!
+  * The one final wrinkle is in our `fromarrow` method; `Interval`s that are `Unbounded`, actually take `nothing` as the 2nd argument. So letting the default `fromarrow` definition call `Interval{T, L, R}(first, last)`, where `first` and `last` are both integers isn't going to work. Instead, we check if the `R` type parameter is `Unbounded` and if so, pass `nothing` as the 2nd arg, otherwise we can pass `last`.
+
+This stuff can definitely make your eyes glaze over if you stare at it long enough. As always, don't hesitate to reach out for quick questions on the [#data](https://julialang.slack.com/messages/data/) slack channel, or [open a new issue](https://github.com/JuliaData/Arrow.jl/issues/new) detailing what you're trying to do.
 
 ### `Arrow.Stream`
 
@@ -145,7 +195,7 @@ Arrow.write(io, csv_parts)
 ### Multithreaded writing
 
 By default, `Arrow.write` will use multiple threads to write multiple
-record batches simultaneously (e.g. if julia is started with `julia -t 8` or the `JULIA_NUM_THREADS` environment variable is set).
+record batches simultaneously (e.g. if julia is started with `julia -t 8` or the `JULIA_NUM_THREADS` environment variable is set). The number of concurrent tasks to use when writing can be controlled by passing the `ntasks` keyword argument to `Arrow.write`. Passing `ntasks=1` avoids any multithreading when writing.
 
 ### Compression
 

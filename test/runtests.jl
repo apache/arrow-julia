@@ -26,6 +26,10 @@ struct CustomStruct
     z::String
 end
 
+struct CustomStruct2{sym}
+    x::Int
+end
+
 @testset "Arrow" begin
 
 @testset "table roundtrips" begin
@@ -42,9 +46,7 @@ for file in readdir(joinpath(dirname(pathof(Arrow)), "../test/arrowjson"))
     jsonfile = joinpath(joinpath(dirname(pathof(Arrow)), "../test/arrowjson"), file)
     println("integration test for $jsonfile")
     df = ArrowJSON.parsefile(jsonfile);
-    io = IOBuffer()
-    Arrow.write(io, df)
-    seekstart(io)
+    io = Arrow.tobuffer(df)
     tbl = Arrow.Table(io; convert=false);
     @test isequal(df, tbl)
 end
@@ -155,6 +157,9 @@ tt = Arrow.Table(Arrow.tobuffer(t))
 
 # automatic custom struct serialization/deserialization
 t = (col1=[CustomStruct(1, 2.3, "hey"), CustomStruct(4, 5.6, "there")],)
+
+Arrow.ArrowTypes.arrowname(::Type{CustomStruct}) = Symbol("JuliaLang.CustomStruct")
+Arrow.ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.CustomStruct")}, S) = CustomStruct
 tt = Arrow.Table(Arrow.tobuffer(t))
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
@@ -165,12 +170,12 @@ tt = Arrow.Table(Arrow.tobuffer(t))
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
-# 89 etc. - test deprecation paths for old UUID autoconversion + UUID FixedSizeListType overloads
+# 89 etc. - test deprecation paths for old UUID autoconversion + UUID FixedSizeListKind overloads
 u = 0x6036fcbd20664bd8a65cdfa25434513f
 @test Arrow.ArrowTypes.arrowconvert(UUID, (value=u,)) === UUID(u)
 @test Arrow.ArrowTypes.arrowconvert(UUID, u) === UUID(u)
-@test Arrow.ArrowTypes.gettype(UUID) == UInt8
-@test Arrow.ArrowTypes.getsize(UUID) == 16
+@test Arrow.ArrowTypes.gettype(Arrow.ArrowTypes.ArrowKind(UUID)) == UInt8
+@test Arrow.ArrowTypes.getsize(Arrow.ArrowTypes.ArrowKind(UUID)) == 16
 
 # 98
 t = (a = [Nanosecond(0), Nanosecond(1)], b = [uuid4(), uuid4()], c = [missing, Nanosecond(1)])
@@ -186,7 +191,7 @@ x2 = Arrow.toarrowvector(x)
 
 # some dict encoding coverage
 
-# signed indices for DictEncodedType #112 #113 #114
+# signed indices for DictEncodedKind #112 #113 #114
 av = Arrow.toarrowvector(PooledArray(repeat(["a", "b"], inner = 5)))
 @test isa(first(av.indices), Signed)
 
@@ -239,6 +244,29 @@ t = Tables.partitioner(
 )
 io = IOBuffer()
 @test_throws ErrorException Arrow.write(io, t)
+
+# 75
+tbl = Arrow.Table(Arrow.tobuffer((sets = [Set([1,2,3]), Set([1,2,3])],)))
+@test eltype(tbl.sets) <: Set
+
+# 85
+tbl = Arrow.Table(Arrow.tobuffer((tups = [(1, 3.14, "hey"), (1, 3.14, "hey")],)))
+@test eltype(tbl.tups) <: Tuple
+
+# Nothing
+tbl = Arrow.Table(Arrow.tobuffer((nothings=[nothing, nothing, nothing],)))
+@test tbl.nothings == [nothing, nothing, nothing]
+
+# arrowmetadata
+t = (col1=[CustomStruct2{:hey}(1), CustomStruct2{:hey}(2)],)
+ArrowTypes.arrowname(::Type{<:CustomStruct2}) = Symbol("CustomStruct2")
+tbl = Arrow.Table(Arrow.tobuffer(t))
+# test we get the warning about deserializing
+@test eltype(tbl.col1) <: NamedTuple
+ArrowTypes.arrowmetadata(::Type{CustomStruct2{sym}}) where {sym} = sym
+ArrowTypes.JuliaType(::Val{:CustomStruct2}, S, meta) = CustomStruct2{Symbol(meta)}
+tbl = Arrow.Table(Arrow.tobuffer(t))
+@test eltype(tbl.col1) == CustomStruct2{:hey}
 
 end # @testset "misc"
 

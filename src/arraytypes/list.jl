@@ -47,16 +47,18 @@ Base.size(l::List) = (l.ℓ,)
 @propagate_inbounds function Base.getindex(l::List{T}, i::Integer) where {T}
     @boundscheck checkbounds(l, i)
     @inbounds lo, hi = l.offsets[i]
-    if ArrowTypes.isstringtype(T)
-        if Base.nonmissingtype(T) !== T
-            return l.validity[i] ? ArrowTypes.arrowconvert(T, unsafe_string(pointer(l.data, lo), hi - lo + 1)) : missing
+    S = Base.nonmissingtype(T)
+    K = ArrowTypes.ArrowKind(ArrowTypes.ArrowType(S))
+    if ArrowTypes.isstringtype(K)
+        if S !== T
+            return l.validity[i] ? ArrowTypes.fromarrow(T, pointer(l.data, lo), hi - lo + 1) : missing
         else
-            return ArrowTypes.arrowconvert(T, unsafe_string(pointer(l.data, lo), hi - lo + 1))
+            return ArrowTypes.fromarrow(T, pointer(l.data, lo), hi - lo + 1)
         end
-    elseif Base.nonmissingtype(T) !== T
-        return l.validity[i] ? ArrowTypes.arrowconvert(T, view(l.data, lo:hi)) : missing
+    elseif S !== T
+        return l.validity[i] ? ArrowTypes.fromarrow(T, view(l.data, lo:hi)) : missing
     else
-        return ArrowTypes.arrowconvert(T, view(l.data, lo:hi))
+        return ArrowTypes.fromarrow(T, view(l.data, lo:hi))
     end
 end
 
@@ -71,10 +73,13 @@ struct ToList{T, stringtype, A, I} <: AbstractVector{T}
     inds::Vector{I}
 end
 
+origtype(::ToList{T, S, A, I}) where {T, S, A, I} = A
+
 function ToList(input; largelists::Bool=false)
     AT = eltype(input)
     ST = Base.nonmissingtype(AT)
-    stringtype = ArrowTypes.isstringtype(ST)
+    K = ArrowTypes.ArrowKind(ST)
+    stringtype = ArrowTypes.isstringtype(K)
     T = stringtype ? UInt8 : eltype(ST)
     len = stringtype ? ncodeunits : length
     data = AT[]
@@ -104,7 +109,8 @@ Base.size(x::ToList) = (length(x.inds) == 0 ? 0 : x.inds[end],)
 
 function Base.pointer(A::ToList{UInt8}, i::Integer)
     chunk = searchsortedfirst(A.inds, i)
-    return pointer(A.data[chunk - 1])
+    chunk = chunk > length(A.inds) ? 1 : (chunk - 1)
+    return pointer(A.data[chunk])
 end
 
 @inline function index(A::ToList, i::Integer)
@@ -178,19 +184,21 @@ end
     return x, (i, chunk, chunk_i, chunk_len, len)
 end
 
-arrowvector(::ListType, x::List, i, nl, fi, de, ded, meta; kw...) = x
+arrowvector(::ListKind, x::List, i, nl, fi, de, ded, meta; kw...) = x
 
-function arrowvector(::ListType, x, i, nl, fi, de, ded, meta; largelists::Bool=false, kw...)
+function arrowvector(::ListKind, x, i, nl, fi, de, ded, meta; largelists::Bool=false, kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     flat = ToList(x; largelists=largelists)
     offsets = Offsets(UInt8[], flat.inds)
     if eltype(flat) == UInt8 # binary or utf8string
         data = flat
+        T = origtype(flat)
     else
         data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; lareglists=largelists, kw...)
+        T = withmissing(eltype(x), Vector{eltype(data)})
     end
-    return List{eltype(x), eltype(flat.inds), typeof(data)}(UInt8[], validity, offsets, data, len, meta)
+    return List{T, eltype(flat.inds), typeof(data)}(UInt8[], validity, offsets, data, len, meta)
 end
 
 function compress(Z::Meta.CompressionType, comp, x::List{T, O, A}) where {T, O, A}

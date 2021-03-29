@@ -88,6 +88,9 @@ function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Sym
 end
 
 function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
+    if ntasks < 1
+        throw(ArgumentError("ntasks keyword argument must be > 0; pass `ntasks=1` to disable multithreaded writing"))
+    end
     if compress === :lz4
         compress = LZ4_FRAME_COMPRESSOR
     elseif compress === :zstd
@@ -95,9 +98,10 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     elseif compress isa Symbol
         throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
     end
-    if ntasks < 1
-        throw(ArgumentError("ntasks keyword argument must be > 0; pass `ntasks=1` to disable multithreaded writing"))
-    end
+    # TODO: we're probably not threadsafe if user passes own single compressor instance + ntasks > 1
+    # if ntasks > 1 && compres !== nothing && !(compress isa Vector)
+    #     compress = Threads.resize_nthreads!([compress])
+    # end
     if writetofile
         @debug 1 "starting write of arrow formatted file"
         Base.write(io, "ARROW1\0\0")
@@ -343,7 +347,7 @@ function makeschemamsg(sch::Tables.Schema, columns)
 end
 
 function fieldoffset(b, name, col)
-    nameoff = FlatBuffers.createstring!(b, String(name))
+    nameoff = FlatBuffers.createstring!(b, string(name))
     T = eltype(col)
     nullable = T >: Missing
     # check for custom metadata

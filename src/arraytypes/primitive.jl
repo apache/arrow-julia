@@ -43,9 +43,9 @@ end
 @propagate_inbounds function Base.getindex(p::Primitive{T}, i::Integer) where {T}
     @boundscheck checkbounds(p, i)
     if T >: Missing
-        return @inbounds (p.validity[i] ? ArrowTypes.arrowconvert(T, p.data[i]) : missing)
+        return @inbounds (p.validity[i] ? ArrowTypes.fromarrow(T, p.data[i]) : missing)
     else
-        return @inbounds ArrowTypes.arrowconvert(T, p.data[i])
+        return @inbounds ArrowTypes.fromarrow(T, p.data[i])
     end
 end
 
@@ -63,9 +63,9 @@ end
     return v
 end
 
-arrowvector(::PrimitiveType, x::Primitive, i, nl, fi, de, ded, meta; kw...) = x
+arrowvector(::PrimitiveKind, x::Primitive, i, nl, fi, de, ded, meta; kw...) = x
 
-function arrowvector(::PrimitiveType, x, i, nl, fi, de, ded, meta; kw...)
+function arrowvector(::PrimitiveKind, x, i, nl, fi, de, ded, meta; kw...)
     validity = ValidityBitmap(x)
     return Primitive(eltype(x), UInt8[], validity, x, length(x), meta)
 end
