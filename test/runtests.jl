@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-using Test, Arrow, Tables, Dates, PooledArrays, TimeZones, UUIDs, CategoricalArrays
+using Test, Arrow, Tables, Dates, PooledArrays, TimeZones, UUIDs, CategoricalArrays, DataAPI
 
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/integrationtest.jl"))
@@ -207,6 +207,13 @@ av = Arrow.toarrowvector(CategoricalArray(["a", "bb", "ccc"]))
 @test isa(first(av.indices), Signed)
 @test length(av) == 3
 @test eltype(av) == String
+
+# 120
+x = PooledArray(["hey", missing])
+x2 = Arrow.toarrowvector(x)
+@test eltype(DataAPI.refpool(x)) == Union{Missing, String}
+@test eltype(DataAPI.levels(x)) == String
+@test DataAPI.refarray(x) == [1, 2]
 
 # 121
 a = PooledArray(repeat(string.('S', 1:130), inner=5), compress=true)
