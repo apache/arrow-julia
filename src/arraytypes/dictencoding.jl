@@ -279,6 +279,12 @@ function compress(Z::Meta.CompressionType, comp, x::A) where {A <: DictEncoded}
     return Compressed{Z, A}(x, [validity, inds], len, nc, Compressed[])
 end
 
+function DataAPI.levels(x::DictEncoded)
+    rp = DataAPI.refpool(x)   # may contain missing values
+    Missing <: eltype(rp) || return rp
+    convert(AbstractArray{nonmissingtype(eltype(rp))}, deleteat!(rp, ismissing.(rp)))
+end
+
 function makenodesbuffers!(col::DictEncoded{T, S}, fieldnodes, fieldbuffers, bufferoffset, alignment) where {T, S}
     len = length(col)
     nc = nullcount(col)
@@ -296,6 +302,10 @@ function makenodesbuffers!(col::DictEncoded{T, S}, fieldnodes, fieldbuffers, buf
     bufferoffset += padding(blen, alignment)
     return bufferoffset
 end
+
+DataAPI.refarray(x::DictEncoded{T, S}) where {T, S} = x.indices .+ one(S)
+
+DataAPI.refpool(x::DictEncoded) = copy(x.encoding.data)
 
 function writebuffer(io, col::DictEncoded, alignment)
     @debug 1 "writebuffer: col = $(typeof(col))"
