@@ -76,11 +76,11 @@ function write end
 
 write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
 
-function write(file::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, maxdepth::Int=DEFAULT_MAX_DEPTH, ntasks=Inf)
-    open(file, "w") do io
-        write(io, tbl, true, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
+function write(filename::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, maxdepth::Int=DEFAULT_MAX_DEPTH, ntasks=Inf, file::Bool=true)
+    open(filename, "w") do io
+        write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
     end
-    return file
+    return filename
 end
 
 function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, maxdepth::Int=DEFAULT_MAX_DEPTH, ntasks=Inf, file::Bool=false)
