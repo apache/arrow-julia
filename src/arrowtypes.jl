@@ -305,7 +305,7 @@ default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{name
 
 function promoteunion(T, S)
     new = promote_type(T, S)
-    return new === Any ? Union{T, S} : new
+    return isabstracttype(new) ? Union{T, S} : new
 end
 
 # lazily call toarrow(x) on getindex for each x in data
