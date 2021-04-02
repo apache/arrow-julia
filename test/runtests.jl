@@ -211,9 +211,9 @@ av = Arrow.toarrowvector(CategoricalArray(["a", "bb", "ccc"]))
 # 120
 x = PooledArray(["hey", missing])
 x2 = Arrow.toarrowvector(x)
-@test eltype(DataAPI.refpool(x)) == Union{Missing, String}
-@test eltype(DataAPI.levels(x)) == String
-@test DataAPI.refarray(x) == [1, 2]
+@test eltype(DataAPI.refpool(x2)) == Union{Missing, String}
+@test eltype(DataAPI.levels(x2)) == String
+@test DataAPI.refarray(x2) == [1, 2]
 
 # 121
 a = PooledArray(repeat(string.('S', 1:130), inner=5), compress=true)
