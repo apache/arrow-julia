@@ -159,15 +159,17 @@ struct Table <: Tables.AbstractColumns
     columns::Vector{AbstractVector}
     lookup::Dict{Symbol, AbstractVector}
     schema::Ref{Meta.Schema}
+    metadata::Union{Nothing, Dict{String, String}}
 end
 
-Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}())
+Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}(), nothing)
 
 names(t::Table) = getfield(t, :names)
 types(t::Table) = getfield(t, :types)
 columns(t::Table) = getfield(t, :columns)
 lookup(t::Table) = getfield(t, :lookup)
 schema(t::Table) = getfield(t, :schema)
+getmetadata(t::Table) = getfield(t, :metadata)
 
 Tables.istable(::Table) = true
 Tables.columnaccess(::Table) = true
@@ -272,7 +274,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     end
     meta = sch !== nothing ? sch.custom_metadata : nothing
     if meta !== nothing
-        setmetadata!(t, Dict(String(kv.key) => String(kv.value) for kv in meta))
+        setfield!(t, :metadata, meta)
     end
     return t
 end
