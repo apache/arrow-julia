@@ -159,18 +159,18 @@ struct Table <: Tables.AbstractColumns
     columns::Vector{AbstractVector}
     lookup::Dict{Symbol, AbstractVector}
     schema::Ref{Meta.Schema}
-    metadata::Union{Nothing, Dict{String, String}}
+    metadata::Ref{Dict{String, String}}
 end
 
-Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}(), nothing)
-Table(names, types, columns, lookup, schema) = Table(names, types, columns, lookup, schema, nothing)
+Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}(), Ref{Dict{String, String}()})
+Table(names, types, columns, lookup, schema) = Table(names, types, columns, lookup, schema, Ref{Dict{String, String}()})
 
 names(t::Table) = getfield(t, :names)
 types(t::Table) = getfield(t, :types)
 columns(t::Table) = getfield(t, :columns)
 lookup(t::Table) = getfield(t, :lookup)
 schema(t::Table) = getfield(t, :schema)
-getmetadata(t::Table) = getfield(t, :metadata)
+getmetadata(t::Table) = isdefined(getfield(t, :metadata), :x) ? getfield(t, :metadata)[] : nothing
 
 Tables.istable(::Table) = true
 Tables.columnaccess(::Table) = true
@@ -275,7 +275,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     end
     meta = sch !== nothing ? sch.custom_metadata : nothing
     if meta !== nothing
-        setfield!(t, :metadata, meta)
+        getfield(t, :metadata)[] = meta
     end
     return t
 end
