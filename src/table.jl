@@ -163,6 +163,7 @@ struct Table <: Tables.AbstractColumns
 end
 
 Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}(), nothing)
+Table(names, types, columns, lookup, schema) = Table(names, types, columns, lookup, schema, nothing)
 
 names(t::Table) = getfield(t, :names)
 types(t::Table) = getfield(t, :types)
