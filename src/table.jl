@@ -159,15 +159,18 @@ struct Table <: Tables.AbstractColumns
     columns::Vector{AbstractVector}
     lookup::Dict{Symbol, AbstractVector}
     schema::Ref{Meta.Schema}
+    metadata::Ref{Dict{String, String}}
 end
 
-Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}())
+Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}(), Ref{Dict{String, String}}())
+Table(names, types, columns, lookup, schema) = Table(names, types, columns, lookup, schema, Ref{Dict{String, String}}())
 
 names(t::Table) = getfield(t, :names)
 types(t::Table) = getfield(t, :types)
 columns(t::Table) = getfield(t, :columns)
 lookup(t::Table) = getfield(t, :lookup)
 schema(t::Table) = getfield(t, :schema)
+getmetadata(t::Table) = isdefined(getfield(t, :metadata), :x) ? getfield(t, :metadata)[] : nothing
 
 Tables.istable(::Table) = true
 Tables.columnaccess(::Table) = true
@@ -272,7 +275,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     end
     meta = sch !== nothing ? sch.custom_metadata : nothing
     if meta !== nothing
-        setmetadata!(t, Dict(String(kv.key) => String(kv.value) for kv in meta))
+        getfield(t, :metadata)[] = Dict(x.key=>x.value for x in meta)
     end
     return t
 end
