@@ -159,11 +159,11 @@ struct Table <: Tables.AbstractColumns
     columns::Vector{AbstractVector}
     lookup::Dict{Symbol, AbstractVector}
     schema::Ref{Meta.Schema}
-    metadata::Ref{Dict{String, String}}
+    metadata::Ref{Any}
 end
 
-Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}(), Ref{Dict{String, String}}())
-Table(names, types, columns, lookup, schema) = Table(names, types, columns, lookup, schema, Ref{Dict{String, String}}())
+Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}(), Ref{Any}())
+Table(names, types, columns, lookup, schema) = Table(names, types, columns, lookup, schema, Ref{Any}())
 
 names(t::Table) = getfield(t, :names)
 types(t::Table) = getfield(t, :types)
