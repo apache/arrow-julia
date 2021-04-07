@@ -276,6 +276,12 @@ ArrowTypes.JuliaType(::Val{:CustomStruct2}, S, meta) = CustomStruct2{Symbol(meta
 tbl = Arrow.Table(Arrow.tobuffer(t))
 @test eltype(tbl.col1) == CustomStruct2{:hey}
 
+# 170
+tbl = Arrow.Table(Arrow.tobuffer((x = [1,2,3],)))
+m = Dict("a" => "b")
+Arrow.setmetadata!(tbl, m)
+@test Arrow.getmetadata(tbl) === m
+
 end # @testset "misc"
 
 end
