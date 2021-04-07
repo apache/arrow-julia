@@ -171,6 +171,7 @@ columns(t::Table) = getfield(t, :columns)
 lookup(t::Table) = getfield(t, :lookup)
 schema(t::Table) = getfield(t, :schema)
 getmetadata(t::Table) = isdefined(getfield(t, :metadata), :x) ? getfield(t, :metadata)[] : nothing
+setmetadata!(t::Table, m::Dict{String, String}) = (setindex!(getfield(t, :metadata), m); nothing)
 
 Tables.istable(::Table) = true
 Tables.columnaccess(::Table) = true
@@ -245,7 +246,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
                 else
                     A = ChainedVector([dictencoding.data, values])
                     S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
-                    dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)        
+                    dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
                 end
                 continue
             end
