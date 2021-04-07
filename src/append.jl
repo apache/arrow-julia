@@ -187,14 +187,6 @@ function table_info(bytes::Vector{UInt8}; convert::Bool=true)
     Tables.Schema(names, types), dictencodings, compression_codec
 end
 
-function footer_offset(bytes::Vector{UInt8})
-    magic_len = length(FILE_FORMAT_MAGIC_BYTES)
-    startoffset = length(bytes) - magic_len - sizeof(Int32) + 1
-    endoffset = length(bytes) - magic_len
-
-    read(IOBuffer(bytes[startoffset:endoffset]), Int32) + magic_len + sizeof(Int32)
-end
-
 function is_stream_format(file::String)
     open(file) do io
         is_stream_format(io, true)
@@ -211,31 +203,6 @@ function is_stream_format(bytes::Vector{UInt8})
     else
         return true
     end
-end
-
-function convert_to_stream_format(file::String; kwargs...)
-    mktemp() do path, io
-        convert_to_stream_format(file, io; kwargs...)
-        close(io)
-        cp(path, file; force=true)
-    end
-    nothing
-end
-function convert_to_stream_format(source::String, dest::String; kwargs...)
-    open(dest, "w") do destio
-        convert_to_stream_format(source, destio; kwargs...)
-    end
-    nothing
-end
-function convert_to_stream_format(source::String, destio::IO; kwargs...)
-    open(source) do sourceio
-        convert_to_stream_format(sourceio, destio; kwargs...)
-    end
-    nothing
-end
-function convert_to_stream_format(sourceio::IO, destio::IO; kwargs...)
-    write(destio, Stream(sourceio); file=false, kwargs...)
-    nothing
 end
 
 function is_equivalent_schema(sch1::Tables.Schema, sch2::Tables.Schema)
