@@ -1,6 +1,6 @@
 """
     Arrow.append(file::String, tbl)
-    tbl |> Arrow.append(io_or_file)
+    tbl |> Arrow.append(file)
 
 Append any [Tables.jl](https://github.com/JuliaData/Tables.jl)-compatible
 `tbl` to an existing arrow formatted file.
@@ -24,6 +24,7 @@ Supported keyword arguments to `Arrow.append` include:
   * `largelists::Bool=false`: causes list column types to be written with Int64 offset arrays; mainly for testing purposes; by default, Int64 offsets will be used only if needed
   * `maxdepth::Int=$DEFAULT_MAX_DEPTH`: deepest allowed nested serialization level; this is provided by default to prevent accidental infinite recursion with mutually recursive data structures
   * `ntasks::Int`: number of concurrent threaded tasks to allow while writing input partitions out as arrow record batches; default is no limit; to disable multithreaded writing, pass `ntasks=1`
+  * `convert::Bool`: whether certain arrow primitive types in the schema of `file` should be converted to Julia defaults for matching them to the schema of `tbl`; by default, `convert=true`.
 """
 function append end
 
@@ -36,7 +37,8 @@ function append(file::String, tbl;
         dictencodenested::Bool=false,
         alignment::Int=8,
         maxdepth::Int=DEFAULT_MAX_DEPTH,
-        ntasks=Inf)
+        ntasks=Inf,
+        convert::Bool=true)
     if ntasks < 1
         throw(ArgumentError("ntasks keyword argument must be > 0; pass `ntasks=1` to disable multithreaded writing"))
     end
@@ -47,7 +49,7 @@ function append(file::String, tbl;
 
     open(file, "r+") do io
         bytes = Mmap.mmap(io)
-        arrow_schema, dictencodings, compress = table_info(bytes)
+        arrow_schema, compress = table_info(bytes; convert=convert)
         if compress === :lz4
             compress = LZ4_FRAME_COMPRESSOR
         elseif compress === :zstd
@@ -56,15 +58,16 @@ function append(file::String, tbl;
             throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
         end
         seek(io, length(bytes) - 8) # overwrite last 8 bytes of last empty message footer
-        append(io, tbl, arrow_schema, dictencodings, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
+        append(io, tbl, arrow_schema, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
     end
 
     return file
 end
 
-function append(io::IO, source, arrow_schema, dictencodings, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
+function append(io::IO, source, arrow_schema, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
     sch = Ref{Tables.Schema}(arrow_schema)
     msgs = OrderedChannel{Message}(ntasks)
+    dictencodings = Dict{Int64, Any}() # Lockable{DictEncoding}
     # build messages
     blocks = (Block[], Block[])
     # start message writing from channel
@@ -116,6 +119,7 @@ end
 table_info(io::IO; file::Bool=false, kwargs...) = table_info(file ? Mmap.mmap(io) : Base.read(io); kwargs...)
 function table_info(bytes::Vector{UInt8}; convert::Bool=true)
     dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
+    dictencoded = Dict{Int64, Meta.Field}()
     names = []
     types = []
     compression = nothing
@@ -129,12 +133,8 @@ function table_info(bytes::Vector{UInt8}; convert::Bool=true)
             # store custom_metadata?
             for (i, field) in enumerate(header.fields)
                 push!(names, Symbol(field.name))
-                d = field.dictionary
-                if d === nothing
-                    push!(types, juliaeltype(field, false))
-                else
-                    push!(types, d.indexType === nothing ? Int32 : juliaeltype(field, d.indexType, false))
-                end
+                push!(types, juliaeltype(field, buildmetadata(field.custom_metadata), convert))
+                getdictionaries!(dictencoded, field)
             end
         elseif header isa Meta.DictionaryBatch
             id = header.id
@@ -184,7 +184,7 @@ function table_info(bytes::Vector{UInt8}; convert::Bool=true)
             throw(ArgumentError("unsupported compression codec: $(compression.codec)"))
         end
     end
-    Tables.Schema(names, types), dictencodings, compression_codec
+    Tables.Schema(names, types), compression_codec
 end
 
 function is_stream_format(file::String)

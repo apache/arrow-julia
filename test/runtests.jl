@@ -44,7 +44,15 @@ end # @testset "table roundtrips"
 
 @testset "table append" begin
 
-    testappend()
+    for case in testtables
+        testappend(case...)
+    end
+
+    testappend_partitions()
+
+    for compression_option in (:lz4, :zstd)
+        testappend_compression(compression_option)
+    end
 
 end # @testset "table append"
 
