@@ -373,7 +373,8 @@ function extensiontype(f, meta)
 end
 
 function registertype!(juliatype::Type, arrowtype::Type, arrowname::String=string("JuliaLang.", string(juliatype)))
-    @warn "Arrow.ArrowTypes.registertype! is deprecated in favor of defining `ArrowTypes.ArrowType`, `ArrowTypes.arrowname`, and `ArrowTypes.JuliaType`; see their docs for more information on how to migrate"
+    msg = "Arrow.ArrowTypes.registertype! is deprecated in favor of defining `ArrowTypes.ArrowType`, `ArrowTypes.arrowname`, and `ArrowTypes.JuliaType`; see their docs for more information on how to migrate"
+    Base.depwarn(msg, :registertype!)
     # TODO: validate that juliatype isn't already default arrow type
     JULIA_TO_ARROW_TYPE_MAPPING[juliatype] = (arrowname, arrowtype)
     ARROW_TO_JULIA_TYPE_MAPPING[arrowname] = (juliatype, arrowtype)
