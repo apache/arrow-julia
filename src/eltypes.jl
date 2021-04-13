@@ -260,10 +260,20 @@ const DATETIME = Timestamp{Meta.TimeUnit.MILLISECOND, nothing}
 
 finaljuliatype(::Type{Timestamp{U, TZ}}) where {U, TZ} = ZonedDateTime
 finaljuliatype(::Type{Timestamp{U, nothing}}) where {U} = DateTime
-Base.convert(::Type{ZonedDateTime}, x::Timestamp{U, TZ}) where {U, TZ} =
-    ZonedDateTime(Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME))), TimeZone(String(TZ)))
-Base.convert(::Type{DateTime}, x::Timestamp{U, nothing}) where {U} =
-    Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME)))
+
+@noinline warntimestamp(U, T) =
+    @warn "automatically converting Arrow.Timestamp with precision = $U to `$T` which only supports millisecond precision; conversion may be lossy; to avoid converting, pass `Arrow.Table(source; convert=false)" maxlog=1
+
+function Base.convert(::Type{ZonedDateTime}, x::Timestamp{U, TZ}) where {U, TZ}
+    (U === Meta.TimeUnit.MICROSECOND || U == Meta.TimeUnit.NANOSECOND) && warntimestamp(U, ZonedDateTime)
+    return ZonedDateTime(Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME))), TimeZone(String(TZ)))
+end
+
+function Base.convert(::Type{DateTime}, x::Timestamp{U, nothing}) where {U}
+    (U === Meta.TimeUnit.MICROSECOND || U == Meta.TimeUnit.NANOSECOND) && warntimestamp(U, DateTime)
+    return Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME)))
+end
+
 Base.convert(::Type{Timestamp{Meta.TimeUnit.MILLISECOND, TZ}}, x::ZonedDateTime) where {TZ} =
     Timestamp{Meta.TimeUnit.MILLISECOND, TZ}(Int64(Dates.value(DateTime(x)) - UNIX_EPOCH_DATETIME))
 Base.convert(::Type{Timestamp{Meta.TimeUnit.MILLISECOND, nothing}}, x::DateTime) =
@@ -282,7 +292,7 @@ ArrowTypes.toarrow(x::Dates.DateTime) = convert(DATETIME, x)
 const DATETIME_SYMBOL = Symbol("JuliaLang.DateTime")
 ArrowTypes.arrowname(::Type{Dates.DateTime}) = DATETIME_SYMBOL
 ArrowTypes.JuliaType(::Val{DATETIME_SYMBOL}, S) = Dates.DateTime
-ArrowTypes.fromarrow(::Type{Dates.DateTime}, x::DATETIME) = convert(Dates.DateTime, x)
+ArrowTypes.fromarrow(::Type{Dates.DateTime}, x::Timestamp) = convert(Dates.DateTime, x)
 ArrowTypes.default(::Type{Dates.DateTime}) = Dates.DateTime(1,1,1,1,1,1)
 
 ArrowTypes.ArrowType(::Type{ZonedDateTime}) = Timestamp
