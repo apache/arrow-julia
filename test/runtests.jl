@@ -282,6 +282,13 @@ m = Dict("a" => "b")
 Arrow.setmetadata!(tbl, m)
 @test Arrow.getmetadata(tbl) === m
 
+# 166
+t = (
+    col1=[zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.NANOSECOND, nothing})],
+)
+tbl = Arrow.Table(Arrow.tobuffer(t))
+@test tbl.col1[1] == Dates.DateTime(1970)
+
 end # @testset "misc"
 
 end
