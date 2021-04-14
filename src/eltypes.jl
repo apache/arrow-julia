@@ -303,6 +303,26 @@ ArrowTypes.JuliaType(::Val{ZONEDDATETIME_SYMBOL}, S) = ZonedDateTime
 ArrowTypes.fromarrow(::Type{ZonedDateTime}, x::Timestamp) = convert(ZonedDateTime, x)
 ArrowTypes.default(::Type{TimeZones.ZonedDateTime}) = TimeZones.ZonedDateTime(1,1,1,1,1,1,TimeZones.tz"UTC")
 
+"""
+    Arrow.ToTimestamp(x::AbstractVector{ZonedDateTime})
+
+Wrapper array that provides a more efficient encoding of `ZonedDateTime` elements to the arrow format. In the arrow format,
+timestamp columns with timezone information are encoded as the arrow equivalent of a Julia type parameter, meaning an entire column
+_should_ have elements all with the same timezone. If a `ZonedDateTime` column is passed to `Arrow.write`, for correctness, it must
+scan each element to check each timezone. `Arrow.ToTimestamp` provides a "bypass" of this process by encoding the timezone of the
+first element of the `AbstractVector{ZonedDateTime}`, which in turn allows `Arrow.write` to avoid costly checking/conversion and
+can encode the `ZonedDateTime` as `Arrow.Timestamp` directly.
+"""
+struct ToTimestamp{A, TZ} <: AbstractVector{Timestamp{Meta.TimeUnit.MILLISECOND, TZ}}
+    data::A # AbstractVector{ZonedDateTime}
+end
+
+ToTimestamp(x::A) where {A <: AbstractVector{ZonedDateTime}} = ToTimestamp{A, Symbol(x[1].timezone)}(x)
+Base.IndexStyle(::Type{<:ToTimestamp}) = Base.IndexLinear()
+Base.size(x::ToTimestamp) = (length(x.data),)
+Base.eltype(::ToTimestamp{A, TZ}) where {A, TZ} = Timestamp{Meta.TimeUnit.MILLISECOND, TZ}
+Base.getindex(x::ToTimestamp{A, TZ}, i::Int) where {A, TZ} = convert(Timestamp{Meta.TimeUnit.MILLISECOND, TZ}, getindex(x.data, i))
+
 struct Interval{U, T} <: ArrowTimeType
     x::T
 end
