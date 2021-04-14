@@ -217,6 +217,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
             i += 1
         end
     end
+    anyrecordbatches = false
     for batch in BatchIterator(bytes, off)
         # store custom_metadata of batch.msg?
         header = batch.msg.header
@@ -258,6 +259,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
             dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
             @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
         elseif header isa Meta.RecordBatch
+            anyrecordbatches = true
             @debug 1 "parsing record batch message: compression = $(header.compression)"
             put!(tsks, Threads.@spawn begin
                 collect(VectorIterator(sch, batch, dictencodings, convert))
@@ -270,6 +272,13 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     wait(tsk)
     lu = lookup(t)
     ty = types(t)
+    # 158; some implementations may send 0 record batches
+    if !anyrecordbatches
+        for field in sch.fields
+            T = juliaeltype(field, field.custom_metadata, convert)
+            push!(columns(t), T[])
+        end
+    end
     for (nm, col) in zip(names(t), columns(t))
         lu[nm] = col
         push!(ty, eltype(col))
