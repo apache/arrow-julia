@@ -275,7 +275,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     # 158; some implementations may send 0 record batches
     if !anyrecordbatches
         for field in sch.fields
-            T = juliaeltype(field, field.custom_metadata, convert)
+            T = juliaeltype(field, buildmetadata(field), convert)
             push!(columns(t), T[])
         end
     end
@@ -285,7 +285,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
     end
     meta = sch !== nothing ? sch.custom_metadata : nothing
     if meta !== nothing
-        getfield(t, :metadata)[] = Dict(x.key=>x.value for x in meta)
+        getfield(t, :metadata)[] = buildmetadata(meta)
     end
     return t
 end
@@ -346,6 +346,7 @@ end
 buildmetadata(f::Meta.Field) = buildmetadata(f.custom_metadata)
 buildmetadata(meta) = Dict(String(kv.key) => String(kv.value) for kv in meta)
 buildmetadata(::Nothing) = nothing
+buildmetadata(x::Dict{String, String}) = x
 
 function Base.iterate(x::VectorIterator, (columnidx, nodeidx, bufferidx)=(Int64(1), Int64(1), Int64(1)))
     columnidx > length(x.schema.fields) && return nothing
