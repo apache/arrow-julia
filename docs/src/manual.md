@@ -80,10 +80,10 @@ end
 # overload interface method for custom type Person; return a symbol as the "name"
 # this instructs Arrow.write what "label" to include with a column with this custom type
 ArrowTypes.arrowname(::Type{Person}) = :Person
-# overload JuliaType on `Val(:Person)`, which is like a dispatchable string
+# overload JuliaType on `Val{:Person}`, which is like a dispatchable string
 # return our custom *type* Person; this enables Arrow.Table to know how the "label"
 # on a custom column should be mapped to a Julia type and deserialized
-ArrowTypes.JuliaType(::Val(:Person)) = Person
+ArrowTypes.JuliaType(::Val{:Person}) = Person
 
 table = (col1=[Person(1, "Bob"), Person(2, "Jane")],)
 io = IOBuffer()
