@@ -54,7 +54,7 @@ function writearray(io::IO, ::Type{T}, col) where {T}
     return n
 end
 
-getbit(v::UInt8, n::Integer) = Bool((v & 0x02^(n - 1)) >> (n - 1))
+getbit(v::UInt8, n::Integer) = (v & (1 << (n - 1))) > 0x00
 
 function setbit(v::UInt8, b::Bool, n::Integer)
     if b
