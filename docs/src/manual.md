@@ -61,6 +61,10 @@ In the arrow data format, specific logical types are supported, a list of which 
 
 Note that when `convert=false` is passed, data will be returned in Arrow.jl-defined types that exactly match the arrow definitions of those types; the authoritative source for how each type represents its data can be found in the arrow [`Schema.fbs`](https://github.com/apache/arrow/blob/master/format/Schema.fbs) file.
 
+One note on performance: when writing `TimeZones.ZonedDateTime` columns to the arrow format (via `Arrow.write`), it is preferrable to "wrap" the columns in `Arrow.ToTimestamp(col)`, as long
+as the column has `ZonedDateTime` elements that all share a common timezone. This ensures the writing process can know "upfront" which timezone will be encoded and is thus much more
+efficient and performant.
+
 #### Custom types
 
 To support writing your custom Julia struct, Arrow.jl utilizes the format's mechanism for "extension types" by allowing the storing of Julia type name and metadata in the field metadata. To "hook in" to this machinery, custom types can utilize the interface methods defined in the `Arrow.ArrowTypes` submodule. For example:

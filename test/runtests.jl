@@ -289,6 +289,12 @@ t = (
 tbl = Arrow.Table(Arrow.tobuffer(t))
 @test tbl.col1[1] == Dates.DateTime(1970)
 
+# 95; Arrow.ToTimestamp
+x = [ZonedDateTime(Dates.DateTime(2020), tz"Europe/Paris")]
+c = Arrow.ToTimestamp(x)
+@test eltype(c) == Arrow.Timestamp{Arrow.Flatbuf.TimeUnitModule.MILLISECOND, Symbol("Europe/Paris")}
+@test c[1] == Arrow.Timestamp{Arrow.Flatbuf.TimeUnitModule.MILLISECOND, Symbol("Europe/Paris")}(1577836800000)
+
 end # @testset "misc"
 
 end
