@@ -63,11 +63,10 @@ function append(io::IO, tbl;
         throw(ArgumentError("ntasks keyword argument must be > 0; pass `ntasks=1` to disable multithreaded writing"))
     end
 
-    if !is_stream_format(io)
+    isstream, arrow_schema, compress = stream_properties(io; convert=convert)
+    if !isstream
         throw(ArgumentError("append is supported only to files in arrow stream format"))
     end
-
-    arrow_schema, compress = table_info(io; file=file, convert=convert)
 
     if compress === :lz4
         compress = LZ4_FRAME_COMPRESSOR
@@ -132,84 +131,7 @@ function append(io::IO, source, arrow_schema, compress, largelists, denseunions,
     return io
 end
 
-function table_info(io::IO; file::Bool=false, kwargs...)
-    if file
-        table_info(Mmap.mmap(io); kwargs...)
-    else
-        seekstart(io)
-        table_info(Base.read(io); kwargs...)
-    end
-end
-function table_info(bytes::Vector{UInt8}; convert::Bool=true)
-    dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
-    dictencoded = Dict{Int64, Meta.Field}()
-    names = []
-    types = []
-    compression = nothing
-    for batch in BatchIterator(bytes, 1)
-        # store custom_metadata of batch.msg?
-        header = batch.msg.header
-        if header isa Meta.Schema
-            @debug 1 "parsing schema message"
-            # assert endianness?
-            # store custom_metadata?
-            for (i, field) in enumerate(header.fields)
-                push!(names, Symbol(field.name))
-                push!(types, juliaeltype(field, buildmetadata(field.custom_metadata), convert))
-                getdictionaries!(dictencoded, field)
-            end
-        elseif header isa Meta.DictionaryBatch
-            id = header.id
-            recordbatch = header.data
-            @debug 1 "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
-            if recordbatch.compression !== nothing
-                compression = recordbatch.compression
-            end
-            if haskey(dictencodings, id) && header.isDelta
-                # delta
-                field = dictencoded[id]
-                values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
-                dictencoding = dictencodings[id]
-                if typeof(dictencoding.data) <: ChainedVector
-                    append!(dictencoding.data, values)
-                else
-                    A = ChainedVector([dictencoding.data, values])
-                    S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
-                    dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
-                end
-                continue
-            end
-            # new dictencoding or replace
-            field = dictencoded[id]
-            values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
-            A = values
-            S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
-            dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
-            @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
-        elseif header isa Meta.RecordBatch
-            @debug 1 "parsing record batch message: compression = $(header.compression)"
-            if header.compression !== nothing
-                compression = header.compression
-            end
-        else
-            throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
-        end
-    end
-
-    compression_codec = nothing
-    if compression !== nothing
-        if compression.codec == Flatbuf.CompressionType.ZSTD
-            compression_codec = :zstd
-        elseif compression.codec == Flatbuf.CompressionType.LZ4_FRAME
-            compression_codec = :lz4
-        else
-            throw(ArgumentError("unsupported compression codec: $(compression.codec)"))
-        end
-    end
-    Tables.Schema(names, types), compression_codec
-end
-
-function is_stream_format(io::IO)
+function stream_properties(io::IO; convert::Bool=true)
     startpos = position(io)
     buff = similar(FILE_FORMAT_MAGIC_BYTES)
     start_magic = read!(io, buff) == FILE_FORMAT_MAGIC_BYTES
@@ -219,10 +141,17 @@ function is_stream_format(io::IO)
     end_magic = read!(io, buff) == FILE_FORMAT_MAGIC_BYTES
     seek(io, startpos) # leave the stream position unchanged
 
-    if len > 24 && start_magic && end_magic
-        return false
+    isstream = !(len > 24 && start_magic && end_magic)
+    if isstream
+        stream = Stream(io, convert=convert)
+        for table in stream
+            # no need to scan further once we get compression information
+            (stream.compression[] !== nothing) && break
+        end
+        seek(io, startpos) # leave the stream position unchanged
+        return isstream, Tables.Schema(stream.names, stream.types), stream.compression[]
     else
-        return true
+        return isstream, nothing, nothing
     end
 end
 

@@ -44,10 +44,12 @@ struct Stream
     batchiterator::BatchIterator
     pos::Int
     names::Vector{Symbol}
+    types::Vector{Type}
     schema::Meta.Schema
     dictencodings::Dict{Int64, DictEncoding} # dictionary id => DictEncoding
     dictencoded::Dict{Int64, Meta.Field} # dictionary id => field
     convert::Bool
+    compression::Ref{Union{Symbol,Nothing}}
 end
 
 Tables.partitions(x::Stream) = x
@@ -75,19 +77,23 @@ function Stream(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothi
     # assert endianness?
     # store custom_metadata?
     names = Symbol[]
+    types = Type[]
     for (i, field) in enumerate(schema.fields)
         push!(names, Symbol(field.name))
+        push!(types, juliaeltype(field, buildmetadata(field.custom_metadata), convert))
         # recursively find any dictionaries for any fields
         getdictionaries!(dictencoded, field)
         @debug 1 "parsed column from schema: field = $field"
     end
-    return Stream(batchiterator, pos, names, schema, dictencodings, dictencoded, convert)
+    return Stream(batchiterator, pos, names, types, schema, dictencodings, dictencoded, convert, Ref{Union{Symbol,Nothing}}(nothing))
 end
 
 Base.IteratorSize(::Type{Stream}) = Base.SizeUnknown()
 
 function Base.iterate(x::Stream, (pos, id)=(x.pos, 1))
     columns = AbstractVector[]
+    compression = nothing
+
     while true
         state = iterate(x.batchiterator, (pos, id))
         state === nothing && return nothing
@@ -97,6 +103,9 @@ function Base.iterate(x::Stream, (pos, id)=(x.pos, 1))
             id = header.id
             recordbatch = header.data
             @debug 1 "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
+            if recordbatch.compression !== nothing
+                compression = recordbatch.compression
+            end
             if haskey(x.dictencodings, id) && header.isDelta
                 # delta
                 field = x.dictencoded[id]
@@ -114,6 +123,9 @@ function Base.iterate(x::Stream, (pos, id)=(x.pos, 1))
             @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
         elseif header isa Meta.RecordBatch
             @debug 1 "parsing record batch message: compression = $(header.compression)"
+            if header.compression !== nothing
+                compression = header.compression
+            end
             for vec in VectorIterator(x.schema, batch, x.dictencodings, x.convert)
                 push!(columns, vec)
             end
@@ -122,6 +134,17 @@ function Base.iterate(x::Stream, (pos, id)=(x.pos, 1))
             throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
         end
     end
+
+    if compression !== nothing
+        if compression.codec == Flatbuf.CompressionType.ZSTD
+            x.compression[] = :zstd
+        elseif compression.codec == Flatbuf.CompressionType.LZ4_FRAME
+            x.compression[] = :lz4
+        else
+            throw(ArgumentError("unsupported compression codec: $(compression.codec)"))
+        end
+    end
+
     lookup = Dict{Symbol, AbstractVector}()
     types = Type[]
     for (nm, col) in zip(x.names, columns)

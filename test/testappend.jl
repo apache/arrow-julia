@@ -27,7 +27,8 @@ function testappend_compression(compression_option)
         open(file1, "w") do io
             Arrow.write(io, testdata; file=false, compress=compression_option)
         end
-        schema, compression = open(Arrow.table_info, file1)
+        isstream, schema, compression = open(Arrow.stream_properties, file1)
+        @test isstream
         @test compression == compression_option
 
         open(file2, "w") do io
@@ -38,7 +39,8 @@ function testappend_compression(compression_option)
         arrow_table2 |> Arrow.append(file1)
         arrow_table1 = Arrow.Table(file1)
 
-        schema, compression = open(Arrow.table_info, file1)
+        isstream, schema, compression = open(Arrow.stream_properties, file1)
+        @test isstream
         @test compression == compression_option
 
         @test length(Tables.columns(arrow_table1)[1]) == 20
@@ -55,7 +57,8 @@ function testappend_partitions()
             Arrow.write(io, testdata; file=false)
         end
         arrow_table1 = Arrow.Table(file1)
-        schema, compression = open(Arrow.table_info, file1)
+        isstream, schema, compression = open(Arrow.stream_properties, file1)
+        @test isstream
         @test compression === nothing
         @test schema.names == (:col1,)
         @test schema.types == (Int64,)
