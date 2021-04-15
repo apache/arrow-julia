@@ -1,9 +1,18 @@
 """
+    Arrow.append(io::IO, tbl)
     Arrow.append(file::String, tbl)
     tbl |> Arrow.append(file)
 
-Append any [Tables.jl](https://github.com/JuliaData/Tables.jl)-compatible
-`tbl` to an existing arrow formatted file.
+Append any [Tables.jl](https://github.com/JuliaData/Tables.jl)-compatible `tbl`
+to an existing arrow formatted file or IO. The existing arrow data must be in
+IPC stream format. Note that appending to the "feather formatted file" is _not_
+allowed, as this file format doesn't support appending. That means files written
+like `Arrow.write(filename::String, tbl)` _cannot_ be appended to; instead, you
+should write like `Arrow.write(filename::String, tbl; file=false)`.
+
+When an IO object is provided to be written on to, it must support seeking. For
+example, a file opened in `r+` mode or an `IOBuffer` that is readable, writable
+and seekable can be appended to, but not a network stream.
 
 Multiple record batches will be written based on the number of
 `Tables.partitions(tbl)` that are provided; by default, this is just
@@ -25,12 +34,21 @@ Supported keyword arguments to `Arrow.append` include:
   * `maxdepth::Int=$DEFAULT_MAX_DEPTH`: deepest allowed nested serialization level; this is provided by default to prevent accidental infinite recursion with mutually recursive data structures
   * `ntasks::Int`: number of concurrent threaded tasks to allow while writing input partitions out as arrow record batches; default is no limit; to disable multithreaded writing, pass `ntasks=1`
   * `convert::Bool`: whether certain arrow primitive types in the schema of `file` should be converted to Julia defaults for matching them to the schema of `tbl`; by default, `convert=true`.
+  * `file::Bool`: applicable when an `IO` is provided, whether it is a file; by default `file=false`.
 """
 function append end
 
-append(file::String; kw...) = x -> append(file::String, x; kw...)
+append(io_or_file; kw...) = x -> append(io_or_file, x; kw...)
 
-function append(file::String, tbl;
+function append(file::String, tbl; kwargs...)
+    open(file, "r+") do io
+        append(io, tbl; file=true, kwargs...)
+    end
+
+    return file
+end
+
+function append(io::IO, tbl;
         largelists::Bool=false,
         denseunions::Bool=true,
         dictencode::Bool=false,
@@ -38,33 +56,36 @@ function append(file::String, tbl;
         alignment::Int=8,
         maxdepth::Int=DEFAULT_MAX_DEPTH,
         ntasks=Inf,
-        convert::Bool=true)
+        convert::Bool=true,
+        file::Bool=false)
+
     if ntasks < 1
         throw(ArgumentError("ntasks keyword argument must be > 0; pass `ntasks=1` to disable multithreaded writing"))
     end
 
-    if !is_stream_format(file)
+    if !is_stream_format(io)
         throw(ArgumentError("append is supported only to files in arrow stream format"))
     end
 
-    open(file, "r+") do io
-        bytes = Mmap.mmap(io)
-        arrow_schema, compress = table_info(bytes; convert=convert)
-        if compress === :lz4
-            compress = LZ4_FRAME_COMPRESSOR
-        elseif compress === :zstd
-            compress = ZSTD_COMPRESSOR
-        elseif compress isa Symbol
-            throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
-        end
-        seek(io, length(bytes) - 8) # overwrite last 8 bytes of last empty message footer
-        append(io, tbl, arrow_schema, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
+    arrow_schema, compress = table_info(io; file=file, convert=convert)
+
+    if compress === :lz4
+        compress = LZ4_FRAME_COMPRESSOR
+    elseif compress === :zstd
+        compress = ZSTD_COMPRESSOR
+    elseif compress isa Symbol
+        throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
     end
 
-    return file
+    append(io, tbl, arrow_schema, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
+
+    return io
 end
 
 function append(io::IO, source, arrow_schema, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
+    seekend(io)
+    skip(io, -8) # overwrite last 8 bytes of last empty message footer
+
     sch = Ref{Tables.Schema}(arrow_schema)
     msgs = OrderedChannel{Message}(ntasks)
     dictencodings = Dict{Int64, Any}() # Lockable{DictEncoding}
@@ -111,20 +132,21 @@ function append(io::IO, source, arrow_schema, compress, largelists, denseunions,
     return io
 end
 
-function table_info(file::String; kwargs...)
-    open(file) do io
-        table_info(io; file=true, kwargs...)
+function table_info(io::IO; file::Bool=false, kwargs...)
+    if file
+        table_info(Mmap.mmap(io); kwargs...)
+    else
+        seekstart(io)
+        table_info(Base.read(io); kwargs...)
     end
 end
-table_info(io::IO; file::Bool=false, kwargs...) = table_info(file ? Mmap.mmap(io) : Base.read(io); kwargs...)
 function table_info(bytes::Vector{UInt8}; convert::Bool=true)
     dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
     dictencoded = Dict{Int64, Meta.Field}()
     names = []
     types = []
     compression = nothing
-    stream_format = is_stream_format(bytes)
-    for batch in BatchIterator(bytes, stream_format ? 1 : 9)
+    for batch in BatchIterator(bytes, 1)
         # store custom_metadata of batch.msg?
         header = batch.msg.header
         if header isa Meta.Schema
@@ -187,18 +209,17 @@ function table_info(bytes::Vector{UInt8}; convert::Bool=true)
     Tables.Schema(names, types), compression_codec
 end
 
-function is_stream_format(file::String)
-    open(file) do io
-        is_stream_format(io, true)
-    end
-end
-is_stream_format(io::IO, file::Bool=false) = is_stream_format(file ? Mmap.mmap(io) : Base.read(io))
-function is_stream_format(bytes::Vector{UInt8})
-    len = length(bytes)
-    off = 1
-    if len > 24 &&
-        _startswith(bytes, off, FILE_FORMAT_MAGIC_BYTES) &&
-        _endswith(bytes, off + len - 1, FILE_FORMAT_MAGIC_BYTES)
+function is_stream_format(io::IO)
+    startpos = position(io)
+    buff = similar(FILE_FORMAT_MAGIC_BYTES)
+    start_magic = read!(io, buff) == FILE_FORMAT_MAGIC_BYTES
+    seekend(io)
+    len = position(io) - startpos
+    skip(io, -length(FILE_FORMAT_MAGIC_BYTES))
+    end_magic = read!(io, buff) == FILE_FORMAT_MAGIC_BYTES
+    seek(io, startpos) # leave the stream position unchanged
+
+    if len > 24 && start_magic && end_magic
         return false
     else
         return true
