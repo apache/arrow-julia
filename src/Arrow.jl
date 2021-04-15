@@ -42,8 +42,8 @@ See docs for official Arrow.jl API with the [User Manual](@ref) and reference do
 module Arrow
 
 using Mmap
-import Dates
-using DataAPI, Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd, TimeZones, BitIntegers
+import DataAPI, Dates
+using Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd, TimeZones, BitIntegers
 
 export ArrowTypes
 
