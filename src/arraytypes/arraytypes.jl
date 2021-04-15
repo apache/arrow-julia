@@ -164,7 +164,7 @@ end
     #   2) parent array is also empty, so "all" elements are valid
     p.nc == 0 && return true
     # translate element index to bitpacked byte index
-    a, b = fldmod1(i, 8)
+    a, b = divrem(i-1, 8) .+ (1,1)
     @inbounds byte = p.bytes[p.pos + a - 1]
     # check individual bit of byte
     return getbit(byte, b)
