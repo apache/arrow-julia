@@ -92,7 +92,7 @@ include("arraytypes/arraytypes.jl")
 include("eltypes.jl")
 include("table.jl")
 include("write.jl")
-include("cinterface.jl")
+include("CDataInterface/CDataInterface.jl")
 
 const LZ4_FRAME_COMPRESSOR = LZ4FrameCompressor[]
 const ZSTD_COMPRESSOR = ZstdCompressor[]
