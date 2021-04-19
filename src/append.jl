@@ -105,16 +105,17 @@ function append(io::IO, source, arrow_schema, compress, largelists, denseunions,
             error("fatal error writing arrow data")
         end
         @debug 1 "processing table partition i = $i"
-        tbl_schema = Tables.schema(tbl)
+        tbl_cols = Tables.columns(tbl)
+        tbl_schema = Tables.schema(tbl_cols)
 
         if !is_equivalent_schema(arrow_schema, tbl_schema)
             throw(ArgumentError("Table schema does not match existing arrow file schema"))
         end
 
         if threaded
-            Threads.@spawn process_partition(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+            Threads.@spawn process_partition(tbl_cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
         else
-            @async process_partition(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+            @async process_partition(tbl_cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
         end
     end
     if anyerror[]

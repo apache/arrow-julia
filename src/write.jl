@@ -132,8 +132,9 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
             error("fatal error writing arrow data")
         end
         @debug 1 "processing table partition i = $i"
+        tblcols = Tables.columns(tbl)
         if i == 1
-            cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
+            cols = toarrowtable(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
             sch[] = Tables.schema(cols)
             firstcols[] = cols
             put!(msgs, makeschemamsg(sch[], cols), i)
@@ -149,9 +150,9 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
             put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
         else
             if threaded
-                Threads.@spawn process_partition(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+                Threads.@spawn process_partition(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
             else
-                @async process_partition(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+                @async process_partition(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
             end
         end
     end
@@ -205,9 +206,9 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     return io
 end
 
-function process_partition(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+function process_partition(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
     try
-        cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
+        cols = toarrowtable(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
         if !isempty(cols.dictencodingdeltas)
             for de in cols.dictencodingdeltas
                 dictsch = Tables.Schema((:col,), (eltype(de.data),))
@@ -229,9 +230,8 @@ struct ToArrowTable
     dictencodingdeltas::Vector{DictEncoding}
 end
 
-function toarrowtable(x, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
+function toarrowtable(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
     @debug 1 "converting input table to arrow formatted columns"
-    cols = Tables.columns(x)
     meta = getmetadata(cols)
     sch = Tables.schema(cols)
     types = collect(sch.types)
