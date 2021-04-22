@@ -37,8 +37,8 @@ Metadata may be attached to any object via [`Arrow.setmetadata!`](@ref),
 or deserialized via the arrow format directly (the format allows attaching metadata
 to table, column, and other objects).
 
-Note that this function's return value directly aliases `x`'s attached metadata 
-(i.e. is not a copy of the underlying storage). Any method author that overloads 
+Note that this function's return value directly aliases `x`'s attached metadata
+(i.e. is not a copy of the underlying storage). Any method author that overloads
 this function should preserve this behavior so that downstream callers can rely
 on this behavior in generic code.
 """
