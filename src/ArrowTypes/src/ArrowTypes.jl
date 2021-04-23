@@ -208,7 +208,8 @@ _symbol(ptr, len) = ccall(:jl_symbol_n, Ref{Symbol}, (Ptr{UInt8}, Int), ptr, len
 fromarrow(::Type{Symbol}, ptr::Ptr{UInt8}, len::Int) = _symbol(ptr, len)
 
 ArrowKind(::Type{<:AbstractArray}) = ListKind()
-fromarrow(::Type{A}, x::AbstractVector{T}) where {A <: AbstractVector{T}} where {T} = x
+fromarrow(::Type{A}, x::A) where {A <: AbstractVector{T}} where {T} = x
+fromarrow(::Type{A}, x::AbstractVector{T}) where {A <: AbstractVector{T}} where {T} = convert(A, x)
 ArrowKind(::Type{<:AbstractSet}) = ListKind()
 ArrowType(::Type{T}) where {T <: AbstractSet{S}} where {S} = Vector{S}
 toarrow(x::AbstractSet) = collect(x)

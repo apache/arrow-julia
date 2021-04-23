@@ -334,6 +334,13 @@ msg = "reached nested serialization level (42) deeper than provided max depth ar
 @test_throws ErrorException(msg) Arrow.tobuffer(tbl; maxdepth=41).x
 @test Arrow.Table(Arrow.tobuffer(tbl; maxdepth=42)).x == tbl.x
 
+# 167
+t = (
+    col1=[["boop", "she"], ["boop", "she"], ["boo"]],
+)
+tbl = Arrow.Table(Arrow.tobuffer(t))
+@test eltype(tbl.col1) == Vector{String}
+
 end # @testset "misc"
 
 end
