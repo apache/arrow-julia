@@ -106,6 +106,7 @@ function __init__()
         CodecLz4.TranscodingStreams.initialize(lz4)
         push!(LZ4_FRAME_COMPRESSOR, lz4)
     end
+    OBJ_METADATA_LOCK[] = ReentrantLock()
     return
 end
 

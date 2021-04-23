@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+const OBJ_METADATA_LOCK = Ref{ReentrantLock}()
 const OBJ_METADATA = IdDict{Any, Dict{String, String}}()
 
 """
@@ -24,7 +25,9 @@ Metadata attached to a table or column will be serialized when written
 as a stream or file.
 """
 function setmetadata!(x, meta::Dict{String, String})
-    OBJ_METADATA[x] = meta
+    lock(OBJ_METADATA_LOCK) do
+        OBJ_METADATA[x] = meta
+    end
     return
 end
 
@@ -42,7 +45,7 @@ Note that this function's return value directly aliases `x`'s attached metadata
 this function should preserve this behavior so that downstream callers can rely
 on this behavior in generic code.
 """
-getmetadata(x, default=nothing) = get(OBJ_METADATA, x, default)
+getmetadata(x, default=nothing) = lock(() -> get(OBJ_METADATA, x, default), OBJ_METADATA_LOCK)
 
 const DEFAULT_MAX_DEPTH = 6
 
