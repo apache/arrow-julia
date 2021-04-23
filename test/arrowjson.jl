@@ -559,7 +559,7 @@ function DataFile(source)
     dictencodings = Dict{String, Tuple{Base.Type, DictEncoding}}()
     dictid = Ref(0)
     for (i, tbl1) in Tables.partitions(source)
-        tbl = Arrow.toarrowtable(tbl1)
+        tbl = Arrow.toarrowtable(Table.columns(tbl1))
         if i == 1
             sch = Tables.schema(tbl)
             for (nm, T, col) in zip(sch.names, sch.types, Tables.Columns(tbl))

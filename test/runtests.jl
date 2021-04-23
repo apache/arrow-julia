@@ -18,6 +18,7 @@ using Test, Arrow, Tables, Dates, PooledArrays, TimeZones, UUIDs, CategoricalArr
 
 include(joinpath(dirname(pathof(Arrow)), "ArrowTypes/test/tests.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
+include(joinpath(dirname(pathof(Arrow)), "../test/testappend.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/integrationtest.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/dates.jl"))
 
@@ -40,6 +41,20 @@ for case in testtables
 end
 
 end # @testset "table roundtrips"
+
+@testset "table append" begin
+
+    for case in testtables
+        testappend(case...)
+    end
+
+    testappend_partitions()
+
+    for compression_option in (:lz4, :zstd)
+        testappend_compression(compression_option)
+    end
+
+end # @testset "table append"
 
 @testset "arrow json integration tests" begin
 
