@@ -56,7 +56,7 @@ function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dict
     if !(x isa DictEncode) && !dictencoding && (dictencode || DataAPI.refarray(x) !== x)
         x = DictEncode(x, dictencodeid(i, nl, fi))
     elseif x isa DictEncoded
-        return arrowvector(DictEncodeType, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)    
+        return arrowvector(DictEncodeType, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)
     elseif !(x isa DictEncode)
         x = ToArrow(x)
     end
@@ -66,7 +66,7 @@ function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dict
         meta["ARROW:extension:name"] = String(ArrowTypes.arrowname(T))
         meta["ARROW:extension:metadata"] = String(ArrowTypes.arrowmetadata(T))
     end
-    return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)
+    return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, maxdepth=maxdepth, kw...)
 end
 
 # now we check for ArrowType converions and dispatch on ArrowKind

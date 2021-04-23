@@ -308,6 +308,17 @@ tbl = Arrow.Table(bytes)
 @test length(tbl.a) == 0
 @test eltype(tbl.a) == Union{Int64, Missing}
 
+# 181
+tbl = (x = [Dict()],)
+d = tbl.x[];
+for i in 1:20
+    d[i] = Dict()
+    d = d[i]
+end
+msg = "reached nested serialization level (42) deeper than provided max depth argument (41); to increase allowed nesting level, pass `maxdepth=X`"
+@test_throws ErrorException(msg) Arrow.tobuffer(tbl; maxdepth=41).x
+@test Arrow.Table(Arrow.tobuffer(tbl; maxdepth=42)).x == tbl.x
+
 end # @testset "misc"
 
 end
