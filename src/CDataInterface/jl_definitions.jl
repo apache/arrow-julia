@@ -1,12 +1,12 @@
 mutable struct ArrowSchema
-    format::String
-    name::String
-    metadata::Dict{String, String}
-    flags::Int64
-    n_children::Int64
-    children::Vector{ArrowSchema}
-    dictionary::Union{Nothing, ArrowSchema}
-    c_arrow_schema::Ref{CArrowSchema}
+    format ::String
+    name ::String
+    metadata ::Dict{String,String}
+    flags ::Int64
+    n_children ::Int64
+    children ::Vector{ArrowSchema}
+    dictionary ::Union{Nothing,ArrowSchema}
+    c_arrow_schema ::Ref{CArrowSchema}
 end
 
 ArrowSchema(s::Ref{CArrowSchema}) = ArrowSchema(
@@ -31,15 +31,15 @@ ArrowSchema(s::CArrowSchema) = ArrowSchema(
 )
 
 mutable struct ArrowArray
-    length::Int64
-    null_count::Int64
-    offset::Int64
-    n_buffers::Int64
-    n_children::Int64
-    buffers::Vector{Ptr{UInt8}}
-    children::Vector{ArrowArray}
-    dictionary::Union{Nothing, ArrowArray}
-    c_arrow_array::Ref{CArrowArray}
+    length ::Int64
+    null_count ::Int64
+    offset ::Int64
+    n_buffers ::Int64
+    n_children ::Int64
+    buffers ::Vector{Ptr{UInt8}}
+    children ::Vector{ArrowArray}
+    dictionary ::Union{Nothing,ArrowArray}
+    c_arrow_array ::Ref{CArrowArray}
 end
 
 ArrowArray(a::Ref{CArrowArray}) = ArrowArray(
@@ -49,7 +49,8 @@ ArrowArray(a::Ref{CArrowArray}) = ArrowArray(
     a[].n_buffers, 
     a[].n_children, 
     a[].buffers, 
-    map(ArrowArray, a[].children), a[].dictionary === nothing ? nothing : ArrowArray(a[].dictionary), 
+    map(ArrowArray, a[].children), 
+    a[].dictionary === nothing ? nothing : ArrowArray(a[].dictionary), 
     a
 )
 

@@ -1,7 +1,7 @@
 # https://arrow.apache.org/docs/format/CDataInterface.html#data-type-description-format-strings
-module FormatStrings
 
-function get_type_from_format_string(format_string ::String) ::DataType
+function get_type_from_format_string(format_string ::AbstractString) ::Type
+    # Primitives
     if format_string == "n"
         Nothing
     elseif format_string == "b"
@@ -28,20 +28,22 @@ function get_type_from_format_string(format_string ::String) ::DataType
         Float32
     elseif format_string == "g"
         Float64
+    
+    # Binary types
     elseif format_string == "z" || format_string == "Z"
         Vector{UInt8}
     elseif format_string == "u" || format_string == "U"
         String
     elseif format_string[1] == 'd'
-        const splits = split(format_string[3:end], ",")
-        precision = Int(splits[1])
-        scale = Int(splits[2])
-        if length(splits) == 3
-            bandwidth = splits[3]
-        end
-        #TODO return something here
+        splits = Int.(split(format_string[3:end], ","))
+        precision = splits[1]
+        scale = splits[2]
+        bitwidth = if (length(splits) == 3) splits[3] else 128 end
+        Decimal{precision, scale, bitwidth}
     elseif format_string[1] == 'w'
-        #TODO figure out fixed width binary
+        Arrow.FixedSizeList{UInt8}
+
+    # Nested Types
     elseif format_string[1] == '+'
         if format_string[2] == 'l' || format_string[2] == 'L'
             Arrow.List
@@ -59,10 +61,39 @@ function get_type_from_format_string(format_string ::String) ::DataType
             type_strings = split(format_string[5:end], ",") # todo use this somehow
             Arrow.DenseUnion
         end
+
+    # Temporal types
     elseif format_string[1] == 't'
-        if format_string[2:3]
-            Date
+        if format_string[2:3] == "dD"
+            Arrow.Date{Arrow.Flatbuf.DateUnitModule.DAY, Int32}
+        elseif format_string[2:3] == "dm"
+            Arrow.Date{Arrow.Flatbuf.DateUnitModule.MILLISECOND, Int64}
+        elseif format_string[2:3] == "ts"
+            Arrow.Time{Arrow.Flatbuf.TimeUnitModule.SECOND, Int32}
+        elseif format_string[2:3] == "tm"
+            Arrow.Time{Arrow.Flatbuf.TimeUnitModule.MILLISECOND, Int32}
+        elseif format_string[2:3] == "tu"
+            Arrow.Time{Arrow.Flatbuf.TimeUnitModule.MICROSECOND, Int64}
+        elseif format_string[2:3] == "tn"
+            Arrow.Time{Arrow.Flatbuf.TimeUnitModule.NANOSECOND, Int64}
+        elseif format_string[2] == 's'
+            timestamp_unit = if format_string[3] == 's'
+                Arrow.Flatbuf.TimeUnitModule.SECOND
+            elseif format_string[3] == 'm'
+                Arrow.Flatbuf.TimeUnitModule.MILLISECOND
+            elseif format_string[3] == 'u'
+                Arrow.Flatbuf.TimeUnitModule.MICROSECOND
+            elseif format_string[3] == 'n'
+                Arrow.Flatbuf.TimeUnitModule.NANOSECOND
+            end
+
+            timezone = length(format_string) == 4 ? nothing : format_string[5:end]
+
+            Arrow.Timestamp{timestamp_unit, timezone}
+        end
     end
 end
+
+function parse_timezone(s ::AbstractString)
     
-end # module
+end

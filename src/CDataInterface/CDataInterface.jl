@@ -1,5 +1,6 @@
 module CDataInterface
 
+import ..Arrow
 include("c_definitions.jl")
 include("jl_definitions.jl")
 include("format_string_to_types.jl")
