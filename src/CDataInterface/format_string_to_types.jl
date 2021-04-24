@@ -38,7 +38,7 @@ function get_type_from_format_string(format_string ::AbstractString) ::Type
         splits = Int.(split(format_string[3:end], ","))
         precision = splits[1]
         scale = splits[2]
-        bitwidth = if (length(splits) == 3) splits[3] else 128 end
+        bitwidth = length(splits) == 3 ? splits[3] : 128
         Decimal{precision, scale, bitwidth}
     elseif format_string[1] == 'w'
         Arrow.FixedSizeList{UInt8}
@@ -92,8 +92,4 @@ function get_type_from_format_string(format_string ::AbstractString) ::Type
             Arrow.Timestamp{timestamp_unit, timezone}
         end
     end
-end
-
-function parse_timezone(s ::AbstractString)
-    
 end
