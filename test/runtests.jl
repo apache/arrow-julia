@@ -18,6 +18,7 @@ using Test, Arrow, Tables, Dates, PooledArrays, TimeZones, UUIDs, CategoricalArr
 
 include(joinpath(dirname(pathof(Arrow)), "ArrowTypes/test/tests.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
+include(joinpath(dirname(pathof(Arrow)), "../test/testappend.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/integrationtest.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/dates.jl"))
 
@@ -40,6 +41,20 @@ for case in testtables
 end
 
 end # @testset "table roundtrips"
+
+@testset "table append" begin
+
+    for case in testtables
+        testappend(case...)
+    end
+
+    testappend_partitions()
+
+    for compression_option in (:lz4, :zstd)
+        testappend_compression(compression_option)
+    end
+
+end # @testset "table append"
 
 @testset "arrow json integration tests" begin
 
@@ -307,6 +322,24 @@ bytes = UInt8[0xff, 0xff, 0xff, 0xff, 0x78, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 
 tbl = Arrow.Table(bytes)
 @test length(tbl.a) == 0
 @test eltype(tbl.a) == Union{Int64, Missing}
+
+# 181
+tbl = (x = [Dict()],)
+d = tbl.x[];
+for i in 1:20
+    d[i] = Dict()
+    d = d[i]
+end
+msg = "reached nested serialization level (42) deeper than provided max depth argument (41); to increase allowed nesting level, pass `maxdepth=X`"
+@test_throws ErrorException(msg) Arrow.tobuffer(tbl; maxdepth=41).x
+@test Arrow.Table(Arrow.tobuffer(tbl; maxdepth=42)).x == tbl.x
+
+# 167
+t = (
+    col1=[["boop", "she"], ["boop", "she"], ["boo"]],
+)
+tbl = Arrow.Table(Arrow.tobuffer(t))
+@test eltype(tbl.col1) == Vector{String}
 
 end # @testset "misc"
 

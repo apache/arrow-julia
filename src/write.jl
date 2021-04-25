@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+const OBJ_METADATA_LOCK = Ref{ReentrantLock}()
 const OBJ_METADATA = IdDict{Any, Dict{String, String}}()
 
 """
@@ -24,7 +25,9 @@ Metadata attached to a table or column will be serialized when written
 as a stream or file.
 """
 function setmetadata!(x, meta::Dict{String, String})
-    OBJ_METADATA[x] = meta
+    lock(OBJ_METADATA_LOCK[]) do
+        OBJ_METADATA[x] = meta
+    end
     return
 end
 
@@ -37,12 +40,12 @@ Metadata may be attached to any object via [`Arrow.setmetadata!`](@ref),
 or deserialized via the arrow format directly (the format allows attaching metadata
 to table, column, and other objects).
 
-Note that this function's return value directly aliases `x`'s attached metadata 
-(i.e. is not a copy of the underlying storage). Any method author that overloads 
+Note that this function's return value directly aliases `x`'s attached metadata
+(i.e. is not a copy of the underlying storage). Any method author that overloads
 this function should preserve this behavior so that downstream callers can rely
 on this behavior in generic code.
 """
-getmetadata(x, default=nothing) = get(OBJ_METADATA, x, default)
+getmetadata(x, default=nothing) = lock(() -> get(OBJ_METADATA, x, default), OBJ_METADATA_LOCK[])
 
 const DEFAULT_MAX_DEPTH = 6
 
@@ -132,8 +135,9 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
             error("fatal error writing arrow data")
         end
         @debug 1 "processing table partition i = $i"
+        tblcols = Tables.columns(tbl)
         if i == 1
-            cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
+            cols = toarrowtable(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
             sch[] = Tables.schema(cols)
             firstcols[] = cols
             put!(msgs, makeschemamsg(sch[], cols), i)
@@ -149,9 +153,9 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
             put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
         else
             if threaded
-                Threads.@spawn process_partition(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+                Threads.@spawn process_partition(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
             else
-                @async process_partition(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+                @async process_partition(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
             end
         end
     end
@@ -205,9 +209,9 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     return io
 end
 
-function process_partition(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+function process_partition(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
     try
-        cols = toarrowtable(tbl, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
+        cols = toarrowtable(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
         if !isempty(cols.dictencodingdeltas)
             for de in cols.dictencodingdeltas
                 dictsch = Tables.Schema((:col,), (eltype(de.data),))
@@ -229,9 +233,8 @@ struct ToArrowTable
     dictencodingdeltas::Vector{DictEncoding}
 end
 
-function toarrowtable(x, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
+function toarrowtable(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
     @debug 1 "converting input table to arrow formatted columns"
-    cols = Tables.columns(x)
     meta = getmetadata(cols)
     sch = Tables.schema(cols)
     types = collect(sch.types)
