@@ -30,38 +30,38 @@ ArrowSchema(s::CArrowSchema) = ArrowSchema(
     Ref{CArrowSchema}()
 )
 
-mutable struct ArrowArray
+mutable struct InterimCArrowArray
     length ::Int64
     null_count ::Int64
     offset ::Int64
     n_buffers ::Int64
     n_children ::Int64
     buffers ::Vector{Ptr{UInt8}}
-    children ::Vector{ArrowArray}
-    dictionary ::Union{Nothing,ArrowArray}
+    children ::Vector{InterimCArrowArray}
+    dictionary ::Union{Nothing,InterimCArrowArray}
     c_arrow_array ::Ref{CArrowArray}
 end
 
-ArrowArray(a::Ref{CArrowArray}) = ArrowArray(
+InterimCArrowArray(a::Ref{CArrowArray}) = InterimCArrowArray(
     a[].length, 
     a[].null_count, 
     a[].offset, 
     a[].n_buffers, 
     a[].n_children, 
     a[].buffers, 
-    map(ArrowArray, a[].children), 
-    a[].dictionary === nothing ? nothing : ArrowArray(a[].dictionary), 
+    map(InterimCArrowArray, a[].children), 
+    a[].dictionary === nothing ? nothing : InterimCArrowArray(a[].dictionary), 
     a
 )
 
-ArrowArray(a::CArrowArray) = ArrowArray(
+InterimCArrowArray(a::CArrowArray) = InterimCArrowArray(
     a.length, 
     a.null_count, 
     a.offset, 
     a.n_buffers, 
     a.n_children, 
     a.buffers, 
-    map(ArrowArray, a.children), 
-    a.dictionary === nothing ? nothing : ArrowArray(a.dictionary), 
+    map(InterimCArrowArray, a.children), 
+    a.dictionary === nothing ? nothing : InterimCArrowArray(a.dictionary), 
     Ref{CArrowArray}()
 )

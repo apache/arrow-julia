@@ -25,7 +25,7 @@ function get_array(f)
     arr_ref = Ref{CArrowArray}()
     ptr = Base.unsafe_convert(Ptr{CArrowArray}, arr_ref)
     f(ptr)
-    arr = ArrowArray(arr_ref)
+    arr = InterimCArrowArray(arr_ref)
     finalizer(arr) do x
         r = getfield(x.c_arrow_array[], :release)
         if r != C_NULL
