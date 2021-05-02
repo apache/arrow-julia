@@ -2,7 +2,7 @@ using Arrow, PyCall
 pd = pyimport("pandas")
 pa = pyimport("pyarrow")
 ##
-df = pd.DataFrame(py"""{'a': [1, None, 3, 4, 5], 'b': ['a', 'b', None, 'd', 'e']}"""o)
+df = pd.DataFrame(py"""{'a': [i for i in range(1000000)]}"""o)
 
 rb = pa.record_batch(df)
 c_arrow_schema = Arrow.CDataInterface.get_schema() do ptr
@@ -20,4 +20,4 @@ validity_bitmap = Arrow.ValidityBitmap(validity_bytes, 1, length, c_arrow_array.
 ##
 data = reinterpret(T, arrow_data_buffer)
 metadata = nothing
-Arrow.Primitive{T, Vector{T}}(arrow_data_buffer, validity_bitmap, data, length, metadata)
+@time Arrow.Primitive{T, AbstractVector{T}}(arrow_data_buffer, validity_bitmap, data, length, metadata)
