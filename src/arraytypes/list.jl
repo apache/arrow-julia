@@ -16,7 +16,7 @@
 
 struct Offsets{T <: Union{Int32, Int64}} <: ArrowVector{Tuple{T, T}}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
-    offsets::Vector{T}
+    offsets::AbstractVector{T}
 end
 
 Base.size(o::Offsets) = (length(o.offsets) - 1,)
