@@ -72,16 +72,17 @@ function convert_struct(
             c_arrow_schema ::ArrowSchema
         ) ::Arrow.ArrowVector
     
-    children = map(1:c_arrow_schema.n_children) do i
+    children_list = map(1:c_arrow_schema.n_children) do i
         convert_to_jl_arrow(c_arrow_array.children[i], c_arrow_schema.children[i])
     end
+    children_tuple = tuple(children_list ...)
 
     validity_bytes = Base.unsafe_wrap(Array, c_arrow_array.buffers[1], cld(c_arrow_schema.n_children, 8))
     validity_bitmap = Arrow.ValidityBitmap(validity_bytes, 1, c_arrow_schema.n_children, c_arrow_array.null_count)
 
-    Arrow.Struct(
+    Arrow.Struct{Any, typeof(children_tuple)}(
         validity_bitmap,
-        tuple(children...),
+        children_tuple,
         c_arrow_array.length,
         c_arrow_schema.metadata)
 end
