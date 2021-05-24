@@ -1,39 +1,155 @@
 # https://arrow.apache.org/docs/format/CDataInterface.html#data-type-description-format-strings
 
-function get_type_from_format_string(format_string ::AbstractString) ::Type
+nullable = true
+
+function convert_primitive(
+            type ::Type,
+            bitwidth ::Int,
+            c_arrow_array ::InterimCArrowArray,
+            c_arrow_schema ::ArrowSchema
+        ) ::Arrow.ArrowVector
+    length = c_arrow_array.length
+
+    arrow_data_buffer = Base.unsafe_wrap(
+        Array, 
+        c_arrow_array.buffers[2], 
+        cld(length * bitwidth, 8))
+    validity_bytes = Base.unsafe_wrap(
+        Array, 
+        c_arrow_array.buffers[1], 
+        cld(length, 8))
+    validity_bitmap = Arrow.ValidityBitmap(
+        validity_bytes, 
+        1,  # Since we are not reading from a file, the start pos will always be 1
+        length, 
+        c_arrow_array.null_count)
+
+    data = reinterpret(type, arrow_data_buffer)
+    
+    T = nullable ? Union{type, Missing} : type
+
+    Arrow.Primitive{T, AbstractVector{T}}(
+        arrow_data_buffer, 
+        validity_bitmap, 
+        data, 
+        length, 
+        c_arrow_schema.metadata)
+end
+
+function convert_to_string_vector(
+            c_arrow_array ::InterimCArrowArray,
+            c_arrow_schema ::ArrowSchema
+        ) ::Arrow.ArrowVector
+    
+    length = c_arrow_array.length
+    offsets_buffer_binary = Base.unsafe_wrap(
+        Array, 
+        c_arrow_array.buffers[2], 
+        cld((length + 1) * 32, 8))
+    offsets = Arrow.Offsets{Int32}(
+        offsets_buffer_binary, 
+        reinterpret(Int32, offsets_buffer_binary))
+
+    arrow_data_buffer = Base.unsafe_wrap(Array, c_arrow_array.buffers[3], offsets |> last |> last)
+
+    validity_bytes = Base.unsafe_wrap(Array, c_arrow_array.buffers[1], cld(length, 8))
+    validity_bitmap = Arrow.ValidityBitmap(validity_bytes, 1, length, c_arrow_array.null_count)
+
+    type = String
+    T = nullable ? Union{type, Missing} : type
+
+    return Arrow.List{T, Int32, AbstractVector{UInt8}}(
+        arrow_data_buffer, 
+        validity_bitmap, 
+        offsets, 
+        arrow_data_buffer, 
+        length, 
+        c_arrow_schema.metadata)
+end
+
+function convert_to_jl_arrow(
+            c_arrow_array ::InterimCArrowArray, 
+            c_arrow_schema ::ArrowSchema
+        ) ::Arrow.ArrowVector
+
+    format_string = c_arrow_schema.format
     # Primitives
     if format_string == "n"
         Nothing
     elseif format_string == "b"
         Bool
     elseif format_string == "c"
-        Int8
+        convert_primitive(
+            Int8,
+            8,
+            c_arrow_array,
+            c_arrow_schema)
     elseif format_string == "C"
-        UInt8
+        convert_primitive(
+            UInt8,
+            8,
+            c_arrow_array,
+            c_arrow_schema)
     elseif format_string == "s"
-        Int16
+        convert_primitive(
+            Int16,
+            16,
+            c_arrow_array,
+            c_arrow_schema)
     elseif format_string == "S"
-        UInt16
+        convert_primitive(
+            UInt16,
+            16,
+            c_arrow_array,
+            c_arrow_schema)
     elseif format_string == "i"
-        Int32
+        convert_primitive(
+            Int32,
+            32,
+            c_arrow_array,
+            c_arrow_schema)
     elseif format_string == "I"
-        UInt32
+        convert_primitive(
+            UInt32,
+            32,
+            c_arrow_array,
+            c_arrow_schema)
     elseif format_string == "l"
-        Int64
+        convert_primitive(
+            Int64,
+            64,
+            c_arrow_array,
+            c_arrow_schema)
     elseif format_string == "L"
-        UInt64
+        convert_primitive(
+            UInt64,
+            64,
+            c_arrow_array,
+            c_arrow_schema)
     elseif format_string == "e"
-        Float16
+        convert_primitive(
+            Float16,
+            16,
+            c_arrow_array,
+            c_arrow_schema)
     elseif format_string == "f"
-        Float32
+        convert_primitive(
+            Float32,
+            32,
+            c_arrow_array,
+            c_arrow_schema)
     elseif format_string == "g"
-        Float64
+        convert_primitive(
+            Float64,
+            64,
+            c_arrow_array,
+            c_arrow_schema)
     
     # Binary types
     elseif format_string == "z" || format_string == "Z"
         Vector{UInt8}
     elseif format_string == "u" || format_string == "U"
-        String
+        convert_to_string_vector(c_arrow_array, c_arrow_schema)
     elseif format_string[1] == 'd'
         splits = Int.(split(format_string[3:end], ","))
         precision = splits[1]
