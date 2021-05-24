@@ -67,6 +67,34 @@ function convert_to_string_vector(
         c_arrow_schema.metadata)
 end
 
+function convert_struct(
+            c_arrow_array ::InterimCArrowArray, 
+            c_arrow_schema ::ArrowSchema
+        ) ::Arrow.ArrowVector
+    
+    children = map(1:c_arrow_schema.n_children) do i
+        convert_to_jl_arrow(c_arrow_array.children[i], c_arrow_schema.children[i])
+    end
+
+    validity_bytes = Base.unsafe_wrap(Array, c_arrow_array.buffers[1], cld(c_arrow_schema.n_children, 8))
+    validity_bitmap = Arrow.ValidityBitmap(validity_bytes, 1, c_arrow_schema.n_children, c_arrow_array.null_count)
+
+    Arrow.Struct(
+        validity_bitmap,
+        tuple(children...),
+        c_arrow_array.length,
+        c_arrow_schema.metadata)
+end
+
+function get_validity_bitmap(
+            c_arrow_array ::InterimCArrowArray,
+            validity_buffer_pointer ::Ptr{UInt8},
+            length ::Int
+        ) ::Arrow.ValidityBitmap
+    validity_bytes = Base.unsafe_wrap(Array, validity_buffer_pointer, cld(length, 8))
+    return Arrow.ValidityBitmap(validity_bytes, 1, length, c_arrow_array.null_count)
+end
+
 function convert_to_jl_arrow(
             c_arrow_array ::InterimCArrowArray, 
             c_arrow_schema ::ArrowSchema
@@ -167,7 +195,7 @@ function convert_to_jl_arrow(
             size = Int(format_string[4:end]) #TODO use this somehow
             Arrow.FixedSizeList
         elseif format_string[2] == 's'
-            Arrow.Struct
+            convert_struct(c_arrow_array, c_arrow_schema)
         elseif format_string[2] == 'm'
             Arrow.Map
         elseif format_string[2:3] == "ud"
