@@ -266,7 +266,9 @@ t = Tables.partitioner(
     )
 )
 io = IOBuffer()
-@test_throws ErrorException Arrow.write(io, t)
+@test_logs (:error, "error writing arrow data on partition = 2") begin
+    @test_throws ErrorException Arrow.write(io, t)
+end
 
 # 75
 tbl = Arrow.Table(Arrow.tobuffer((sets = [Set([1,2,3]), Set([1,2,3])],)))
