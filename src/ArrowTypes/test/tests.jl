@@ -98,6 +98,13 @@ nt = (id=1, name="bob")
 @test ArrowTypes.JuliaType(Val(ArrowTypes.TUPLE), NamedTuple{(Symbol("1"), Symbol("2")), Tuple{Int, String}}) == Tuple{Int, String}
 @test ArrowTypes.fromarrow(Tuple{Int, String}, nt) == (1, "bob")
 
+v = v"1"
+v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
+@test ArrowTypes.ArrowKind(VersionNumber) == ArrowTypes.StructKind()
+@test ArrowTypes.arrowname(VersionNumber) == ArrowTypes.VERSION_NUMBER
+@test ArrowTypes.JuliaType(Val(ArrowTypes.VERSION_NUMBER)) == VersionNumber
+@test ArrowTypes.fromarrow(typeof(v), v_nt) == v
+
 @test ArrowTypes.ArrowKind(Dict{String, Int}) == ArrowTypes.MapKind()
 @test ArrowTypes.ArrowKind(Union{String, Int}) == ArrowTypes.UnionKind()
 
