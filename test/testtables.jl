@@ -59,6 +59,7 @@ testtables = [
       col17=[zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.SECOND, nothing}), zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.SECOND, nothing}), zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.SECOND, nothing}), missing],
       col18=[zero(Arrow.Interval{Arrow.Meta.IntervalUnit.YEAR_MONTH, Int32}), zero(Arrow.Interval{Arrow.Meta.IntervalUnit.YEAR_MONTH, Int32}), zero(Arrow.Interval{Arrow.Meta.IntervalUnit.YEAR_MONTH, Int32}), missing],
       col19=[zero(Arrow.Duration{Arrow.Meta.TimeUnit.SECOND}), zero(Arrow.Duration{Arrow.Meta.TimeUnit.SECOND}), zero(Arrow.Duration{Arrow.Meta.TimeUnit.SECOND}), missing],
+      col20=[zero(Arrow.Date{Arrow.Meta.DateUnit.MILLISECOND, Int64}), zero(Arrow.Date{Arrow.Meta.DateUnit.MILLISECOND, Int64}), zero(Arrow.Date{Arrow.Meta.DateUnit.MILLISECOND, Int64}), missing],
     ),
     NamedTuple(),
     (convert=false,),
