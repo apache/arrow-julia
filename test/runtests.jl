@@ -347,7 +347,7 @@ tbl = Arrow.Table(Arrow.tobuffer(t))
         col1=[v"1"],
     )
     tbl = Arrow.Table(Arrow.tobuffer(t))
-    @test eltype(tbl.col1) == Vector{VersionNumber}
+    @test eltype(tbl.col1) == VersionNumber
 end
 
 end # @testset "misc"
