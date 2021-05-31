@@ -270,6 +270,16 @@ arrowname(::Type{Tuple{}}) = TUPLE
 JuliaType(::Val{TUPLE}, ::Type{NamedTuple{names, types}}) where {names, types <: Tuple} = types
 fromarrow(::Type{T}, x::NamedTuple) where {T <: Tuple} = Tuple(x)
 
+# VersionNumber
+const VERSION_NUMBER = Symbol("JuliaLang.VersionNumber")
+ArrowKind(::Type{VersionNumber}) = StructKind()
+arrowname(::Type{VersionNumber}) = VERSION_NUMBER
+JuliaType(::Val{VERSION_NUMBER}) = VersionNumber
+
+function fromarrow(::Type{VersionNumber}, v::NamedTuple)
+    VersionNumber(v.major, v.minor, v.patch, v.prerelease, v.build)
+end
+
 "MapKind data are stored similarly to ListKind, where elements are flattened, and a 2nd offsets buffer contains the individual list element length data"
 struct MapKind <: ArrowKind end
 

@@ -341,6 +341,15 @@ t = (
 tbl = Arrow.Table(Arrow.tobuffer(t))
 @test eltype(tbl.col1) == Vector{String}
 
+# 200
+@testset "VersionNumber" begin
+    t = (
+        col1=[v"1"],
+    )
+    tbl = Arrow.Table(Arrow.tobuffer(t))
+    @test eltype(tbl.col1) == VersionNumber
+end
+
 end # @testset "misc"
 
 end
