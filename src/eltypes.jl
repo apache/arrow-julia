@@ -293,6 +293,7 @@ const DATETIME_SYMBOL = Symbol("JuliaLang.DateTime")
 ArrowTypes.arrowname(::Type{Dates.DateTime}) = DATETIME_SYMBOL
 ArrowTypes.JuliaType(::Val{DATETIME_SYMBOL}, S) = Dates.DateTime
 ArrowTypes.fromarrow(::Type{Dates.DateTime}, x::Timestamp) = convert(Dates.DateTime, x)
+ArrowTypes.fromarrow(::Type{Dates.DateTime}, x::Date{Meta.DateUnit.MILLISECOND, Int64}) = convert(Dates.DateTime, x)
 ArrowTypes.default(::Type{Dates.DateTime}) = Dates.DateTime(1,1,1,1,1,1)
 
 ArrowTypes.ArrowType(::Type{ZonedDateTime}) = Timestamp
