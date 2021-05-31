@@ -261,10 +261,12 @@ fromarrow(::Type{NamedTuple{names, types}}, x::NamedTuple{names, types}) where {
 fromarrow(::Type{T}, x::NamedTuple) where {T} = fromarrow(T, Tuple(x)...)
 
 ArrowKind(::Type{<:Tuple}) = StructKind()
+ArrowKind(::Type{Tuple{}}) = StructKind()
 const TUPLE = Symbol("JuliaLang.Tuple")
 # needed to disambiguate the FixedSizeList case for NTuple
 arrowname(::Type{NTuple{N, T}}) where {N, T} = EMPTY_SYMBOL
 arrowname(::Type{T}) where {T <: Tuple} = TUPLE
+arrowname(::Type{Tuple{}}) = TUPLE
 JuliaType(::Val{TUPLE}, ::Type{NamedTuple{names, types}}) where {names, types <: Tuple} = types
 fromarrow(::Type{T}, x::NamedTuple) where {T <: Tuple} = Tuple(x)
 

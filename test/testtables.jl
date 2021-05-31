@@ -80,6 +80,16 @@ testtables = [
     nothing
   ),
   (
+    "empty list types",
+    (
+      col1=[[]],
+      col2=[()],
+    ),
+    NamedTuple(),
+    NamedTuple(),
+    nothing
+  ),
+  (
     "unions",
     (
       col1=Arrow.DenseUnionVector( Union{Int64, Float64, Missing}[1, 2.0, 3, 4.0, missing]),

@@ -92,7 +92,9 @@ nt = (id=1, name="bob")
 @test ArrowTypes.fromarrow(typeof(nt), nt) === nt
 @test ArrowTypes.fromarrow(Person, nt) == Person(1, "bob")
 @test ArrowTypes.ArrowKind(Tuple) == ArrowTypes.StructKind()
+@test ArrowTypes.ArrowKind(Tuple{}) == ArrowTypes.StructKind()
 @test ArrowTypes.arrowname(Tuple{Int, String}) == ArrowTypes.TUPLE
+@test ArrowTypes.arrowname(Tuple{}) == ArrowTypes.TUPLE
 @test ArrowTypes.JuliaType(Val(ArrowTypes.TUPLE), NamedTuple{(Symbol("1"), Symbol("2")), Tuple{Int, String}}) == Tuple{Int, String}
 @test ArrowTypes.fromarrow(Tuple{Int, String}, nt) == (1, "bob")
 
