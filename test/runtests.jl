@@ -266,7 +266,9 @@ t = Tables.partitioner(
     )
 )
 io = IOBuffer()
-@test_throws ErrorException Arrow.write(io, t)
+@test_logs (:error, "error writing arrow data on partition = 2") begin
+    @test_throws ErrorException Arrow.write(io, t)
+end
 
 # 75
 tbl = Arrow.Table(Arrow.tobuffer((sets = [Set([1,2,3]), Set([1,2,3])],)))
@@ -283,8 +285,9 @@ tbl = Arrow.Table(Arrow.tobuffer((nothings=[nothing, nothing, nothing],)))
 # arrowmetadata
 t = (col1=[CustomStruct2{:hey}(1), CustomStruct2{:hey}(2)],)
 ArrowTypes.arrowname(::Type{<:CustomStruct2}) = Symbol("CustomStruct2")
-tbl = Arrow.Table(Arrow.tobuffer(t))
-# test we get the warning about deserializing
+@test_logs (:warn, r"unsupported ARROW:extension:name type: \"CustomStruct2\"") begin
+    tbl = Arrow.Table(Arrow.tobuffer(t))
+end
 @test eltype(tbl.col1) <: NamedTuple
 ArrowTypes.arrowmetadata(::Type{CustomStruct2{sym}}) where {sym} = sym
 ArrowTypes.JuliaType(::Val{:CustomStruct2}, S, meta) = CustomStruct2{Symbol(meta)}
@@ -302,7 +305,9 @@ t = (
     col1=[zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.NANOSECOND, nothing})],
 )
 tbl = Arrow.Table(Arrow.tobuffer(t))
-@test tbl.col1[1] == Dates.DateTime(1970)
+@test_logs (:warn, r"automatically converting Arrow.Timestamp with precision = NANOSECOND") begin
+    @test tbl.col1[1] == Dates.DateTime(1970)
+end
 
 # 95; Arrow.ToTimestamp
 x = [ZonedDateTime(Dates.DateTime(2020), tz"Europe/Paris")]
