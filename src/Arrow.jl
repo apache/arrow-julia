@@ -85,8 +85,7 @@ using .FlatBuffers
 include("metadata/Flatbuf.jl")
 using .Flatbuf; const Meta = Flatbuf
 
-include("ArrowTypes/src/ArrowTypes.jl")
-using .ArrowTypes
+using ArrowTypes
 include("utils.jl")
 include("arraytypes/arraytypes.jl")
 include("eltypes.jl")

@@ -4,6 +4,7 @@ authors = ["quinnj <quinn.jacobd@gmail.com>"]
 version = "1.5.0"
 
 [deps]
+ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
 BitIntegers = "c3b6d118-76ef-56ca-8cc7-ebb389d030a1"
 CodecLz4 = "5ba52731-8f18-5e0d-9241-30f10d1ec561"
 CodecZstd = "6b39b394-51ab-5f42-8807-6242bab2b4c2"
@@ -17,6 +18,7 @@ TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [compat]
+ArrowTypes = "1"
 BitIntegers = "0.2"
 CodecLz4 = "0.4"
 CodecZstd = "0.7"
