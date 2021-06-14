@@ -27,6 +27,15 @@ or to use the official-apache code that follows the official apache release proc
 julia> using Pkg; Pkg.add(url="https://github.com/apache/arrow", subdir="julia/Arrow.jl")
 ```
 
+## Local Development
+
+When developing on Arrow.jl it is recommened that you run the following to ensure that any
+changes to ArrowTypes.jl are immediately available to Arrow.jl without requiring a release:
+
+```sh
+julia --project -e 'using Pkg; Pkg.develop(path="src/ArrowTypes")'
+```
+
 ## Difference between this code and the apache/arrow/julia/Arrow repository
 
 The code in the apache/arrow repository is officially part of the apache/arrow project and as such follows the regulated release cadence of the entire project, following standard community
