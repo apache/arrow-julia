@@ -355,6 +355,24 @@ tbl = Arrow.Table(Arrow.tobuffer(t))
     @test eltype(tbl.col1) == VersionNumber
 end
 
+@testset "`show`" begin
+    table = (; a = 1:5, b = fill(1.0, 5))
+    arrow_table = Arrow.Table(Arrow.tobuffer(table))
+    str = sprint(show, arrow_table)
+    @test length(str) < 100
+    @test occursin("5 rows", str)
+    @test occursin("2 columns", str)
+    @test occursin("Int", str)
+    @test occursin("Float64", str)
+    @test !occursin("metadata", str)
+    Arrow.setmetadata!(arrow_table, Dict("test_meta" => "true", "a" => "2"))
+    str2 = sprint(show, arrow_table)
+    @test length(str2) > length(str)
+    @test length(str2) < 200
+    @test occursin("metadata", str2)
+    @test occursin("\"test_meta\" => \"true\"", str2)
+    @test occursin("\"a\" => \"2\"", str2)
+end
 end # @testset "misc"
 
 end
