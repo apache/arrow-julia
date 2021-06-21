@@ -15,6 +15,7 @@
 # limitations under the License.
 
 using Test, Arrow, Tables, Dates, PooledArrays, TimeZones, UUIDs, CategoricalArrays, DataAPI
+using Random: randstring
 
 include(joinpath(dirname(pathof(Arrow)), "ArrowTypes/test/tests.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
