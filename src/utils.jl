@@ -207,23 +207,3 @@ function tobuffer(data; kwargs...)
     seekstart(io)
     return io
 end
-
-function Base.show(io::IO, table::Arrow.Table; max_cols = 20)
-    ncols = length(Tables.columnnames(table))
-    print(io, "$(typeof(table)) with $(Tables.rowcount(table)) rows, $(ncols) columns, and ")
-    sch = Tables.schema(table)
-    if sch !== nothing
-        print(io, "schema:\n")
-        show(IOContext(io, :print_schema_header => false), sch)
-    else
-        print(io, "an unknown schema.")
-    end
-    meta = getmetadata(table)
-    if meta !== nothing
-        print(io, "\n\nwith metadata:")
-        for kv in pairs(meta)
-            print(io, "\n  ")
-            show(io, kv)
-        end
-    end
-end
