@@ -15,6 +15,7 @@
 # limitations under the License.
 
 using Test, Arrow, Tables, Dates, PooledArrays, TimeZones, UUIDs, CategoricalArrays, DataAPI
+using Random: randstring
 
 include(joinpath(dirname(pathof(Arrow)), "ArrowTypes/test/tests.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
@@ -355,6 +356,35 @@ tbl = Arrow.Table(Arrow.tobuffer(t))
     @test eltype(tbl.col1) == VersionNumber
 end
 
+@testset "`show`" begin
+    table = (; a = 1:5, b = fill(1.0, 5))
+    arrow_table = Arrow.Table(Arrow.tobuffer(table))
+    # 2 and 3-arg show with no metadata
+    for outer str in (sprint(show, arrow_table),
+                sprint(show, MIME"text/plain"(), arrow_table))
+        @test length(str) < 100
+        @test occursin("5 rows", str)
+        @test occursin("2 columns", str)
+        @test occursin("Int", str)
+        @test occursin("Float64", str)
+        @test !occursin("metadata entries", str)
+    end
+
+    # 2-arg show with metadata
+    big_dict = Dict((randstring(rand(5:10)) => randstring(rand(1:3)) for _ = 1:100))
+    Arrow.setmetadata!(arrow_table, big_dict)
+    str2 = sprint(show, arrow_table)
+    @test length(str2) > length(str)
+    @test length(str2) < 200
+    @test occursin("metadata entries", str2)
+
+    # 3-arg show with metadata
+    str3 = sprint(show, MIME"text/plain"(), arrow_table; context = IOContext(IOBuffer(), :displaysize => (24, 100), :limit=>true))
+    @test length(str3) < 1000
+    # some but not too many `=>`'s for printing the metadata
+    @test 5 < length(collect(eachmatch(r"=>", str3))) < 20
+
+end
 end # @testset "misc"
 
 end
