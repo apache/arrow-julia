@@ -157,6 +157,7 @@ fromarrow(::Type{T}, x::T) where {T} = x
 fromarrow(::Type{T}, x...) where {T} = T(x...)
 fromarrow(::Type{Union{Missing, T}}, ::Missing) where {T} = missing
 fromarrow(::Type{Union{Missing, T}}, x::T) where {T} = x
+fromarrow(::Type{Union{Missing, T}}, x::T) where {T<:NamedTuple} = x # ambiguity fix
 fromarrow(::Type{Union{Missing, T}}, x) where {T} = fromarrow(T, x)
 
 "NullKind data is actually not physically stored since the data is constant; just the length is needed"
