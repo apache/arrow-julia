@@ -1,0 +1,5 @@
+---
+codecov:
+  notify:
+    # Wait for all "test" matrix jobs
+    after_n_builds: 6
