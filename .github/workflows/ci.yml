@@ -25,15 +25,15 @@ jobs:
           - ubuntu-latest
         arch:
           - x64
+    env:
+      JULIA_PROJECT: .github/pkgs/${{ matrix.pkg }}
     steps:
       - uses: actions/checkout@v2
       - uses: julia-actions/setup-julia@v1
-        working-directory: .github/pkgs/${{ matrix.pkg }}
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
       - uses: actions/cache@v1
-        working-directory: .github/pkgs/${{ matrix.pkg }}
         env:
           cache-name: cache-artifacts
         with:
@@ -44,13 +44,9 @@ jobs:
             ${{ runner.os }}-test-
             ${{ runner.os }}-
       - uses: julia-actions/julia-buildpkg@v1
-        working-directory: .github/pkgs/${{ matrix.pkg }}
       - uses: julia-actions/julia-runtest@v1
-        working-directory: .github/pkgs/${{ matrix.pkg }}
       - uses: julia-actions/julia-processcoverage@v1
-        working-directory: .github/pkgs/${{ matrix.pkg }}
       - uses: codecov/codecov-action@v1
-        working-directory: .github/pkgs/${{ matrix.pkg }}
         with:
           file: lcov.info
   docs:
