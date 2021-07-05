@@ -385,6 +385,10 @@ end
     @test 5 < length(collect(eachmatch(r"=>", str3))) < 20
 
 end
+
+#194
+@test isempty(Arrow.Table(Arrow.tobuffer(Dict{Symbol, Vector}())))
+
 end # @testset "misc"
 
 end

@@ -247,7 +247,7 @@ function toarrowtable(cols, dictencodings, largelists, compress, denseunions, di
         newtypes[i] = eltype(newcol)
         newcols[i] = newcol
     end
-    minlen, maxlen = extrema(length, newcols)
+    minlen, maxlen = isempty(newcols) ? (0, 0) : extrema(length, newcols)
     minlen == maxlen || throw(ArgumentError("columns with unequal lengths detected: $minlen < $maxlen"))
     return ToArrowTable(Tables.Schema(sch.names, newtypes), newcols, meta, dictencodingdeltas)
 end
