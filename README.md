@@ -29,7 +29,7 @@ julia> using Pkg; Pkg.add(url="https://github.com/apache/arrow", subdir="julia/A
 
 ## Local Development
 
-When developing on Arrow.jl it is recommened that you run the following to ensure that any
+When developing on Arrow.jl it is recommended that you run the following to ensure that any
 changes to ArrowTypes.jl are immediately available to Arrow.jl without requiring a release:
 
 ```sh
