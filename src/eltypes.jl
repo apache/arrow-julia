@@ -54,7 +54,7 @@ function juliaeltype(f::Meta.Field, meta::Dict{String, String}, convert::Bool)
         if JT !== nothing
             return f.nullable ? Union{JT, Missing} : JT
         else
-            @warn "unsupported ARROW:extension:name type: \"$typename\", arrow type = $TT"
+            @warn "unsupported ARROW:extension:name type: \"$typename\", arrow type = $TT" maxlog=1
         end
     end
     return something(TTT, T)
