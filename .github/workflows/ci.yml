@@ -48,7 +48,9 @@ jobs:
             ${{ runner.os }}-test-${{ env.cache-name }}-
             ${{ runner.os }}-test-
             ${{ runner.os }}-
-      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-buildpkg@v1.2
+        with:
+          project: .github/pkgs/${{ matrix.pkg }}
       - uses: julia-actions/julia-runtest@v1
         with:
           project: .github/pkgs/${{ matrix.pkg }}
