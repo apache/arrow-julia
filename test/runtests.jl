@@ -390,6 +390,22 @@ end
 #194
 @test isempty(Arrow.Table(Arrow.tobuffer(Dict{Symbol, Vector}())))
 
+
+#229
+struct Foo229{x}
+    y::String
+    z::Int
+end
+Arrow.ArrowTypes.arrowname(::Type{<:Foo229}) = Symbol("JuliaLang.Foo229")
+Arrow.ArrowTypes.ArrowType(::Type{Foo229{x}}) where {x} = Tuple{String,String,Int}
+Arrow.ArrowTypes.toarrow(row::Foo229{x}) where {x} = (String(x), row.y, row.z)
+Arrow.ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.Foo229")}, ::Any) = Foo229
+Arrow.ArrowTypes.fromarrow(::Type{<:Foo229}, x, y, z) = Foo229{Symbol(x)}(y, z)
+cols = (k1=[Foo229{:a}("a", 1), Foo229{:b}("b", 2)], k2=[Foo229{:c}("c", 3), Foo229{:d}("d", 4)])
+tbl = Arrow.Table(Arrow.tobuffer(cols))
+@test tbl.k1 == cols.k1
+@test tbl.k2 == cols.k2
+
 end # @testset "misc"
 
 end
