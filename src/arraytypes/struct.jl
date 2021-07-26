@@ -33,20 +33,20 @@ isnamedtuple(T) = false
 istuple(::Type{<:Tuple}) = true
 istuple(T) = false
 
-@propagate_inbounds function Base.getindex(s::Struct{T}, i::Integer) where {T}
+@propagate_inbounds function Base.getindex(s::Struct{T,S}, i::Integer) where {T,S}
     @boundscheck checkbounds(s, i)
     NT = Base.nonmissingtype(T)
     if isnamedtuple(NT) || istuple(NT)
         if NT !== T
-            return s.validity[i] ? NT(ntuple(j->s.data[j][i], fieldcount(NT))) : missing
+            return s.validity[i] ? NT(ntuple(j->s.data[j][i], fieldcount(S))) : missing
         else
-            return NT(ntuple(j->s.data[j][i], fieldcount(NT)))
+            return NT(ntuple(j->s.data[j][i], fieldcount(S)))
         end
     else
         if NT !== T
-            return s.validity[i] ? ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(NT))...) : missing
+            return s.validity[i] ? ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(S))...) : missing
         else
-            return ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(NT))...)
+            return ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(S))...)
         end
     end
 end

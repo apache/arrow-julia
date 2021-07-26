@@ -54,7 +54,7 @@ function juliaeltype(f::Meta.Field, meta::Dict{String, String}, convert::Bool)
         if JT !== nothing
             return f.nullable ? Union{JT, Missing} : JT
         else
-            @warn "unsupported ARROW:extension:name type: \"$typename\", arrow type = $TT"
+            @warn "unsupported ARROW:extension:name type: \"$typename\", arrow type = $TT" maxlog=1 _id=hash((:juliaeltype, typename, TT))
         end
     end
     return something(TTT, T)
@@ -262,7 +262,7 @@ finaljuliatype(::Type{Timestamp{U, TZ}}) where {U, TZ} = ZonedDateTime
 finaljuliatype(::Type{Timestamp{U, nothing}}) where {U} = DateTime
 
 @noinline warntimestamp(U, T) =
-    @warn "automatically converting Arrow.Timestamp with precision = $U to `$T` which only supports millisecond precision; conversion may be lossy; to avoid converting, pass `Arrow.Table(source; convert=false)" maxlog=1
+    @warn "automatically converting Arrow.Timestamp with precision = $U to `$T` which only supports millisecond precision; conversion may be lossy; to avoid converting, pass `Arrow.Table(source; convert=false)" maxlog=1 _id=hash((:warntimestamp, U, T))
 
 function Base.convert(::Type{ZonedDateTime}, x::Timestamp{U, TZ}) where {U, TZ}
     (U === Meta.TimeUnit.MICROSECOND || U == Meta.TimeUnit.NANOSECOND) && warntimestamp(U, ZonedDateTime)
