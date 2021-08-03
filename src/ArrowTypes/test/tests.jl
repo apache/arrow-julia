@@ -97,6 +97,7 @@ nt = (id=1, name="bob")
 @test ArrowTypes.arrowname(Tuple{}) == ArrowTypes.TUPLE
 @test ArrowTypes.JuliaType(Val(ArrowTypes.TUPLE), NamedTuple{(Symbol("1"), Symbol("2")), Tuple{Int, String}}) == Tuple{Int, String}
 @test ArrowTypes.fromarrow(Tuple{Int, String}, nt) == (1, "bob")
+@test ArrowTypes.fromarrow(Union{Missing, typeof(nt)}, nt) == nt
 
 v = v"1"
 v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
