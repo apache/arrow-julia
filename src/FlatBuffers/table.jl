@@ -103,7 +103,7 @@ end
 function Array{T}(t::Table, off) where {T}
     a = vector(t, off)
     S = T <: Table ? UOffsetT : T <: Struct ? NTuple{structsizeof(T), UInt8} : T
-    ptr = convert(Ptr{S}, pointer(bytes(t), pos(t) + a + 1))
+    ptr = convert(Ptr{S}, pointer(bytes(t), a + 1))
     data = unsafe_wrap(Base.Array, ptr, vectorlen(t, off))
     return Array{T, S, typeof(t)}(t, a, data)
 end
