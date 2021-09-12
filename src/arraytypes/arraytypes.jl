@@ -62,30 +62,25 @@ function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dict
     end
     S = maybemissing(eltype(x))
     if ArrowTypes.hasarrowname(T)
-        if isnothing(meta)
-            meta = toidict(("ARROW:extension:name" => String(ArrowTypes.arrowname(T)),
-                            "ARROW:extension:metadata" =>  String(ArrowTypes.arrowmetadata(T))))
-        else
-            meta = toidict(String(k) => String(v) for (k, v) in meta)
-        end
+        meta = _arrowtypemeta(meta, T)
     end
     return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, maxdepth=maxdepth, kw...)
 end
 
+function _arrowtypemeta(::Nothing, T)
+    return toidict(("ARROW:extension:name" => String(ArrowTypes.arrowname(T)),
+                    "ARROW:extension:metadata" =>  String(ArrowTypes.arrowmetadata(T))))
+end
+
+function _arrowtypemeta(meta, T)
+    dict = Dict(String(k) => String(v) for (k, v) in meta)
+    dict["ARROW:extension:name"] = String(ArrowTypes.arrowname(T))
+    dict["ARROW:extension:metadata"] = String(ArrowTypes.arrowmetadata(T))
+    return toidict(dict)
+end
+
 # now we check for ArrowType converions and dispatch on ArrowKind
 function arrowvector(::Type{S}, x, i, nl, fi, de, ded, meta; kw...) where {S}
-    # deprecated and will be removed
-    if ArrowTypes.istyperegistered(S)
-        # TODO resolve usages of `ArrowTypes.getarrowtype!` on now immutable metadata structures
-        meta = meta === nothing ? Dict{String, String}() : meta
-        arrowtype = ArrowTypes.getarrowtype!(meta, S)
-        if arrowtype === S
-            return arrowvector(ArrowKind(S), x, i, nl, fi, de, ded, meta; kw...)
-        else
-            return arrowvector(converter(arrowtype, x), i, nl, fi, de, ded, meta; kw...)
-        end
-    end
-    # end deprecation
     return arrowvector(ArrowKind(S), x, i, nl, fi, de, ded, meta; kw...)
 end
 
