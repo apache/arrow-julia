@@ -25,7 +25,7 @@ struct BoolVector{T} <: ArrowVector{T}
     pos::Int
     validity::ValidityBitmap
     ℓ::Int64
-    metadata::Union{Nothing, Dict{String, String}}
+    metadata::Union{Nothing, Base.ImmutableDict{String, String}}
 end
 
 Base.size(p::BoolVector) = (p.ℓ,)

@@ -24,7 +24,7 @@ struct Primitive{T, A} <: ArrowVector{T}
     validity::ValidityBitmap
     data::A
     ℓ::Int64
-    metadata::Union{Nothing, Dict{String, String}}
+    metadata::Union{Nothing, Base.ImmutableDict{String,String}}
 end
 
 Primitive(::Type{T}, b::Vector{UInt8}, v::ValidityBitmap, data::A, l, meta) where {T, A} =

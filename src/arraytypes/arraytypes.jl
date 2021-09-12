@@ -62,9 +62,12 @@ function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dict
     end
     S = maybemissing(eltype(x))
     if ArrowTypes.hasarrowname(T)
-        meta = meta === nothing ? Dict{String, String}() : meta
-        meta["ARROW:extension:name"] = String(ArrowTypes.arrowname(T))
-        meta["ARROW:extension:metadata"] = String(ArrowTypes.arrowmetadata(T))
+        if isnothing(meta)
+            meta = toidict(("ARROW:extension:name" => String(ArrowTypes.arrowname(T)),
+                            "ARROW:extension:metadata" =>  String(ArrowTypes.arrowmetadata(T))))
+        else
+            meta = toidict(String(k) => String(v) for (k, v) in meta)
+        end
     end
     return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, maxdepth=maxdepth, kw...)
 end
@@ -73,6 +76,7 @@ end
 function arrowvector(::Type{S}, x, i, nl, fi, de, ded, meta; kw...) where {S}
     # deprecated and will be removed
     if ArrowTypes.istyperegistered(S)
+        # TODO resolve usages of `ArrowTypes.getarrowtype!` on now immutable metadata structures
         meta = meta === nothing ? Dict{String, String}() : meta
         arrowtype = ArrowTypes.getarrowtype!(meta, S)
         if arrowtype === S
@@ -87,7 +91,7 @@ end
 
 struct NullVector{T} <: ArrowVector{T}
     data::MissingVector
-    metadata::Union{Nothing, Dict{String, String}}
+    metadata::Union{Nothing, Base.ImmutableDict{String, String}}
 end
 Base.size(v::NullVector) = (length(v.data),)
 Base.getindex(v::NullVector{T}, i::Int) where {T} = ArrowTypes.fromarrow(T, getindex(v.data, i))

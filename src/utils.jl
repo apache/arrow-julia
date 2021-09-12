@@ -207,3 +207,11 @@ function tobuffer(data; kwargs...)
     seekstart(io)
     return io
 end
+
+function toidict(pairs)
+    dict = Base.ImmutableDict(first(pairs))
+    for pair in Iterators.drop(pairs, 1)
+        dict = Base.ImmutableDict(dict, pair)
+    end
+    return dict
+end
