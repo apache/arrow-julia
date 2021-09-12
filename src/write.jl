@@ -37,7 +37,7 @@ By default, `Arrow.write` will use multiple threads to write multiple
 record batches simultaneously (e.g. if julia is started with `julia -t 8` or the `JULIA_NUM_THREADS` environment variable is set).
 
 Supported keyword arguments to `Arrow.write` include:
-  * `colmetadata=nothing`: TODO
+  * `colmetadata=nothing`: the metadata that should be written as the table's columns' `custom_metadata` fields; must either be `nothing` or an `AbstractDict` of `column_name::Symbol => column_metadata` where `column_metadata` is an iterable of `<:AbstractString` pairs.
   * `compress`: possible values include `:lz4`, `:zstd`, or your own initialized `LZ4FrameCompressor` or `ZstdCompressor` objects; will cause all buffers in each record batch to use the respective compression encoding
   * `alignment::Int=8`: specify the number of bytes to align buffers to when written in messages; strongly recommended to only use alignment values of 8 or 64 for modern memory cache line optimization
   * `dictencode::Bool=false`: whether all columns should use dictionary encoding when being written; to dict encode specific columns, wrap the column/array in `Arrow.DictEncode(col)`
@@ -210,9 +210,9 @@ function toarrowtable(cols, dictencodings, largelists, compress, denseunions, di
     newcols = Vector{Any}(undef, N)
     newtypes = Vector{Type}(undef, N)
     dictencodingdeltas = DictEncoding[]
-    colmeta = isnothing(colmeta) ? nothing : toidict(colmeta)
     Tables.eachcolumn(sch, cols) do col, i, nm
-        newcolmeta = isnothing(colmeta) ? getmetadata(col) : get(colmeta, nm, nothing)
+        oldcolmeta = getmetadata(col)
+        newcolmeta = isnothing(colmeta) ? oldcolmeta : get(colmeta, nm, oldcolmeta)
         newcol = toarrowvector(col, i, dictencodings, dictencodingdeltas, newcolmeta; compression=compress, largelists=largelists, denseunions=denseunions, dictencode=dictencode, dictencodenested=dictencodenested, maxdepth=maxdepth)
         newtypes[i] = eltype(newcol)
         newcols[i] = newcol

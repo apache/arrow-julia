@@ -229,7 +229,7 @@ function arrowvector(::DictEncodedKind, x, i, nl, fi, de, ded, meta; dictencode:
         end
     end
     if meta !== nothing && getmetadata(encoding) !== nothing
-        merge!(meta, getmetadata(encoding))
+        meta = toidict(merge!(Dict(meta), Dict(getmetadata(encoding))))
     elseif getmetadata(encoding) !== nothing
         meta = getmetadata(encoding)
     end

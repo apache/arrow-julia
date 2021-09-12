@@ -208,6 +208,8 @@ function tobuffer(data; kwargs...)
     return io
 end
 
+toidict(x::Base.ImmutableDict) = x
+
 function toidict(pairs)
     dict = Base.ImmutableDict(first(pairs))
     for pair in Iterators.drop(pairs, 1)

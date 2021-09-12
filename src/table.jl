@@ -188,8 +188,8 @@ end
 Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}(), Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(nothing))
 
 function Table(names, types, columns, lookup, schema)
-    metadata = isassigned(schema) ? Ref(buildmetadata(schema[])) : Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(nothing)
-    return Table(names, types, columns, lookup, schema, metadata)
+    m = isassigned(schema) ? buildmetadata(schema[]) : nothing
+    return Table(names, types, columns, lookup, schema, Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(m))
 end
 
 names(t::Table) = getfield(t, :names)
