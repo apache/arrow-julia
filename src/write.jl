@@ -219,7 +219,7 @@ function toarrowtable(cols, dictencodings, largelists, compress, denseunions, di
     end
     minlen, maxlen = isempty(newcols) ? (0, 0) : extrema(length, newcols)
     minlen == maxlen || throw(ArgumentError("columns with unequal lengths detected: $minlen < $maxlen"))
-    meta = isnothing(meta) ? nothing : toidict(String(k) => String(v) for (k, v) in meta)
+    meta = _normalizemeta(meta)
     return ToArrowTable(Tables.Schema(sch.names, newtypes), newcols, meta, dictencodingdeltas)
 end
 
