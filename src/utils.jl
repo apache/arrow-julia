@@ -210,4 +210,11 @@ end
 
 toidict(x::Base.ImmutableDict) = x
 
-toidict(pairs) = foldl(Base.ImmutableDict, pairs)
+# ref https://github.com/JuliaData/Arrow.jl/pull/238#issuecomment-919415809
+function toidict(pairs)
+    dict = Base.ImmutableDict(first(pairs))
+    for pair in Iterators.drop(pairs, 1)
+        dict = Base.ImmutableDict(dict, pair)
+    end
+    return dict
+end
