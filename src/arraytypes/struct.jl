@@ -23,7 +23,7 @@ struct Struct{T, S} <: ArrowVector{T}
     validity::ValidityBitmap
     data::S # Tuple of ArrowVector
     ℓ::Int
-    metadata::Union{Nothing, Dict{String, String}}
+    metadata::Union{Nothing, Base.ImmutableDict{String,String}}
 end
 
 Base.size(s::Struct) = (s.ℓ,)

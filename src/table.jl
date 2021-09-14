@@ -182,19 +182,37 @@ struct Table <: Tables.AbstractColumns
     columns::Vector{AbstractVector}
     lookup::Dict{Symbol, AbstractVector}
     schema::Ref{Meta.Schema}
-    metadata::Ref{Dict{String, String}}
+    metadata::Ref{Union{Nothing,Base.ImmutableDict{String,String}}}
 end
 
-Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}(), Ref{Dict{String, String}}())
-Table(names, types, columns, lookup, schema) = Table(names, types, columns, lookup, schema, Ref{Dict{String, String}}())
+Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}(), Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(nothing))
+
+function Table(names, types, columns, lookup, schema)
+    m = isassigned(schema) ? buildmetadata(schema[]) : nothing
+    return Table(names, types, columns, lookup, schema, Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(m))
+end
 
 names(t::Table) = getfield(t, :names)
 types(t::Table) = getfield(t, :types)
 columns(t::Table) = getfield(t, :columns)
 lookup(t::Table) = getfield(t, :lookup)
 schema(t::Table) = getfield(t, :schema)
-getmetadata(t::Table) = isdefined(getfield(t, :metadata), :x) ? getfield(t, :metadata)[] : nothing
-setmetadata!(t::Table, m::Dict{String, String}) = (setindex!(getfield(t, :metadata), m); nothing)
+
+"""
+    Arrow.getmetadata(x)
+
+If `x isa Arrow.Table` return a `Base.ImmutableDict{String,String}` representation of `x`'s
+`Schema` `custom_metadata`, or `nothing` if no such metadata exists.
+
+If `x isa Arrow.ArrowVector`, return a `Base.ImmutableDict{String,String}` representation of `x`'s
+`Field` `custom_metadata`, or `nothing` if no such metadata exists.
+
+Otherwise, return `nothing`.
+
+See [the official Arrow documentation for more details on custom application metadata](https://arrow.apache.org/docs/format/Columnar.html#custom-application-metadata).
+"""
+getmetadata(t::Table) = getfield(t, :metadata)[]
+getmetadata(::Any) = nothing
 
 Tables.istable(::Table) = true
 Tables.columnaccess(::Table) = true
@@ -306,10 +324,7 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
         lu[nm] = col
         push!(ty, eltype(col))
     end
-    meta = sch !== nothing ? sch.custom_metadata : nothing
-    if meta !== nothing
-        getfield(t, :metadata)[] = buildmetadata(meta)
-    end
+    getfield(t, :metadata)[] = buildmetadata(sch)
     return t
 end
 
@@ -366,10 +381,10 @@ struct VectorIterator
     convert::Bool
 end
 
-buildmetadata(f::Meta.Field) = buildmetadata(f.custom_metadata)
-buildmetadata(meta) = Dict(String(kv.key) => String(kv.value) for kv in meta)
+buildmetadata(f::Union{Meta.Field,Meta.Schema}) = buildmetadata(f.custom_metadata)
+buildmetadata(meta) = toidict(String(kv.key) => String(kv.value) for kv in meta)
 buildmetadata(::Nothing) = nothing
-buildmetadata(x::Dict{String, String}) = x
+buildmetadata(x::AbstractDict) = x
 
 function Base.iterate(x::VectorIterator, (columnidx, nodeidx, bufferidx)=(Int64(1), Int64(1), Int64(1)))
     columnidx > length(x.schema.fields) && return nothing

@@ -35,7 +35,7 @@ mutable struct DictEncoding{T, S, A} <: ArrowVector{T}
     id::Int64
     data::A
     isOrdered::Bool
-    metadata::Union{Nothing, Dict{String, String}}
+    metadata::Union{Nothing, Base.ImmutableDict{String, String}}
 end
 
 indextype(::Type{DictEncoding{T, S, A}}) where {T, S, A} = S
@@ -91,7 +91,7 @@ struct DictEncoded{T, S, A} <: ArrowVector{T}
     validity::ValidityBitmap
     indices::Vector{S}
     encoding::DictEncoding{T, S, A}
-    metadata::Union{Nothing, Dict{String, String}}
+    metadata::Union{Nothing, Base.ImmutableDict{String, String}}
 end
 
 DictEncoded(b::Vector{UInt8}, v::ValidityBitmap, inds::Vector{S}, encoding::DictEncoding{T, S, A}, meta) where {S, T, A} =
@@ -229,7 +229,7 @@ function arrowvector(::DictEncodedKind, x, i, nl, fi, de, ded, meta; dictencode:
         end
     end
     if meta !== nothing && getmetadata(encoding) !== nothing
-        merge!(meta, getmetadata(encoding))
+        meta = toidict(merge!(Dict(meta), Dict(getmetadata(encoding))))
     elseif getmetadata(encoding) !== nothing
         meta = getmetadata(encoding)
     end

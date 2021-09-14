@@ -366,13 +366,6 @@ const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Type, Tuple{String, Type}}()
 
 istyperegistered(::Type{T}) where {T} = haskey(JULIA_TO_ARROW_TYPE_MAPPING, T)
 
-function getarrowtype!(meta, ::Type{T}) where {T}
-    arrowname, arrowtype = JULIA_TO_ARROW_TYPE_MAPPING[T]
-    meta["ARROW:extension:name"] = arrowname
-    meta["ARROW:extension:metadata"] = ""
-    return arrowtype
-end
-
 const ARROW_TO_JULIA_TYPE_MAPPING = Dict{String, Tuple{Type, Type}}()
 
 function extensiontype(f, meta)

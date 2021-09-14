@@ -41,6 +41,7 @@ See docs for official Arrow.jl API with the [User Manual](@ref) and reference do
 """
 module Arrow
 
+using Base.Iterators
 using Mmap
 import Dates
 using DataAPI, Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd, TimeZones, BitIntegers
@@ -106,7 +107,6 @@ function __init__()
         CodecLz4.TranscodingStreams.initialize(lz4)
         push!(LZ4_FRAME_COMPRESSOR, lz4)
     end
-    OBJ_METADATA_LOCK[] = ReentrantLock()
     return
 end
 

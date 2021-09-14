@@ -62,19 +62,32 @@ function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dict
     end
     S = maybemissing(eltype(x))
     if ArrowTypes.hasarrowname(T)
-        meta = meta === nothing ? Dict{String, String}() : meta
-        meta["ARROW:extension:name"] = String(ArrowTypes.arrowname(T))
-        meta["ARROW:extension:metadata"] = String(ArrowTypes.arrowmetadata(T))
+        meta = _arrowtypemeta(_normalizemeta(meta), String(ArrowTypes.arrowname(T)), String(ArrowTypes.arrowmetadata(T)))
     end
     return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, maxdepth=maxdepth, kw...)
 end
 
+_normalizemeta(::Nothing) = nothing
+_normalizemeta(meta) = toidict(String(k) => String(v) for (k, v) in meta)
+
+function _arrowtypemeta(::Nothing, n, m)
+    return toidict(("ARROW:extension:name" => n, "ARROW:extension:metadata" => m))
+end
+
+function _arrowtypemeta(meta, n, m)
+    dict = Dict(meta)
+    dict["ARROW:extension:name"] = n
+    dict["ARROW:extension:metadata"] = m
+    return toidict(dict)
+end
+
 # now we check for ArrowType converions and dispatch on ArrowKind
 function arrowvector(::Type{S}, x, i, nl, fi, de, ded, meta; kw...) where {S}
+    meta = _normalizemeta(meta)
     # deprecated and will be removed
     if ArrowTypes.istyperegistered(S)
-        meta = meta === nothing ? Dict{String, String}() : meta
-        arrowtype = ArrowTypes.getarrowtype!(meta, S)
+        arrowname, arrowtype = ArrowTypes.JULIA_TO_ARROW_TYPE_MAPPING[S]
+        meta = _arrowtypemeta(meta, arrowname, "")
         if arrowtype === S
             return arrowvector(ArrowKind(S), x, i, nl, fi, de, ded, meta; kw...)
         else
@@ -87,12 +100,12 @@ end
 
 struct NullVector{T} <: ArrowVector{T}
     data::MissingVector
-    metadata::Union{Nothing, Dict{String, String}}
+    metadata::Union{Nothing, Base.ImmutableDict{String, String}}
 end
 Base.size(v::NullVector) = (length(v.data),)
 Base.getindex(v::NullVector{T}, i::Int) where {T} = ArrowTypes.fromarrow(T, getindex(v.data, i))
 
-arrowvector(::NullKind, x, i, nl, fi, de, ded, meta; kw...) = NullVector{eltype(x)}(MissingVector(length(x)), meta)
+arrowvector(::NullKind, x, i, nl, fi, de, ded, meta; kw...) = NullVector{eltype(x)}(MissingVector(length(x)), isnothing(meta) ? nothing : toidict(meta))
 compress(Z::Meta.CompressionType, comp, v::NullVector) =
     Compressed{Z, NullVector}(v, CompressedBuffer[], length(v), length(v), Compressed[])
 

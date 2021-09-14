@@ -159,9 +159,13 @@ This stuff can definitely make your eyes glaze over if you stare at it long enou
 
 In addition to `Arrow.Table`, the Arrow.jl package also provides `Arrow.Stream` for processing arrow data. While `Arrow.Table` will iterate all record batches in an arrow file/stream, concatenating columns, `Arrow.Stream` provides a way to *iterate* through record batches, one at a time. Each iteration yields an `Arrow.Table` instance, with columns/data for a single record batch. This allows, if so desired, "batch processing" of arrow data, one record batch at a time, instead of creating a single long table via `Arrow.Table`.
 
-### Table and column metadata
+### Custom application metadata
 
-The arrow format allows attaching arbitrary metadata in the form of a `Dict{String, String}` to tables and individual columns. The Arrow.jl package supports retrieving serialized metadata by calling `Arrow.getmetadata(table)` or `Arrow.getmetadata(column)`.
+The Arrow format allows data producers to [attach custom metadata](https://arrow.apache.org/docs/format/Columnar.html#custom-application-metadata) to various Arrow objects.
+
+Arrow.jl provides a convenient accessor for this metadata via [`Arrow.getmetadata`](@ref). `Arrow.getmetadata(t::Arrow.Table)` will return an immutable `AbstractDict{String,String}` that represents the [`custom_metadata` of the table's associated `Schema`](https://github.com/apache/arrow/blob/85d8175ea24b4dd99f108a673e9b63996d4f88cc/format/Schema.fbs#L515) (or `nothing` if no such metadata exists), while `Arrow.getmetadata(c::Arrow.ArrowVector)` will return a similar representation of [the column's associated `Field` `custom_metadata`](https://github.com/apache/arrow/blob/85d8175ea24b4dd99f108a673e9b63996d4f88cc/format/Schema.fbs#L480) (or `nothing` if no such metadata exists).
+
+To attach custom schema/column metadata to Arrow tables at serialization time, see the `metadata` and `colmetadata` keyword arguments to [`Arrow.write`](@ref).
 
 ## Writing arrow data
 

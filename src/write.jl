@@ -14,39 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-const OBJ_METADATA_LOCK = Ref{ReentrantLock}()
-const OBJ_METADATA = IdDict{Any, Dict{String, String}}()
-
-"""
-    Arrow.setmetadata!(x, metadata::Dict{String, String})
-
-Set the metadata for any object, provided as a `Dict{String, String}`.
-Metadata attached to a table or column will be serialized when written
-as a stream or file.
-"""
-function setmetadata!(x, meta::Dict{String, String})
-    lock(OBJ_METADATA_LOCK[]) do
-        OBJ_METADATA[x] = meta
-    end
-    return
-end
-
-"""
-    Arrow.getmetadata(x) => Dict{String, String}
-
-Retrieve any metadata (as a `Dict{String, String}`) attached to `x`.
-
-Metadata may be attached to any object via [`Arrow.setmetadata!`](@ref),
-or deserialized via the arrow format directly (the format allows attaching metadata
-to table, column, and other objects).
-
-Note that this function's return value directly aliases `x`'s attached metadata
-(i.e. is not a copy of the underlying storage). Any method author that overloads
-this function should preserve this behavior so that downstream callers can rely
-on this behavior in generic code.
-"""
-getmetadata(x, default=nothing) = lock(() -> get(OBJ_METADATA, x, default), OBJ_METADATA_LOCK[])
-
 const DEFAULT_MAX_DEPTH = 6
 
 """
@@ -70,6 +37,7 @@ By default, `Arrow.write` will use multiple threads to write multiple
 record batches simultaneously (e.g. if julia is started with `julia -t 8` or the `JULIA_NUM_THREADS` environment variable is set).
 
 Supported keyword arguments to `Arrow.write` include:
+  * `colmetadata=nothing`: the metadata that should be written as the table's columns' `custom_metadata` fields; must either be `nothing` or an `AbstractDict` of `column_name::Symbol => column_metadata` where `column_metadata` is an iterable of `<:AbstractString` pairs.
   * `compress`: possible values include `:lz4`, `:zstd`, or your own initialized `LZ4FrameCompressor` or `ZstdCompressor` objects; will cause all buffers in each record batch to use the respective compression encoding
   * `alignment::Int=8`: specify the number of bytes to align buffers to when written in messages; strongly recommended to only use alignment values of 8 or 64 for modern memory cache line optimization
   * `dictencode::Bool=false`: whether all columns should use dictionary encoding when being written; to dict encode specific columns, wrap the column/array in `Arrow.DictEncode(col)`
@@ -77,6 +45,7 @@ Supported keyword arguments to `Arrow.write` include:
   * `denseunions::Bool=true`: whether Julia `Vector{<:Union}` arrays should be written using the dense union layout; passing `false` will result in the sparse union layout
   * `largelists::Bool=false`: causes list column types to be written with Int64 offset arrays; mainly for testing purposes; by default, Int64 offsets will be used only if needed
   * `maxdepth::Int=$DEFAULT_MAX_DEPTH`: deepest allowed nested serialization level; this is provided by default to prevent accidental infinite recursion with mutually recursive data structures
+  * `metadata=Arrow.getmetadata(tbl)`: the metadata that should be written as the table's schema's `custom_metadata` field; must either be `nothing` or an iterable of `<:AbstractString` pairs.
   * `ntasks::Int`: number of concurrent threaded tasks to allow while writing input partitions out as arrow record batches; default is no limit; to disable multithreaded writing, pass `ntasks=1`
   * `file::Bool=false`: if a an `io` argument is being written to, passing `file=true` will cause the arrow file format to be written instead of just IPC streaming
 """
@@ -84,18 +53,18 @@ function write end
 
 write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
 
-function write(filename::String, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, maxdepth::Int=DEFAULT_MAX_DEPTH, ntasks=Inf, file::Bool=true)
+function write(filename::String, tbl; metadata=getmetadata(tbl), colmetadata=nothing, largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, maxdepth::Int=DEFAULT_MAX_DEPTH, ntasks=Inf, file::Bool=true)
     open(filename, "w") do io
-        write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
+        write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks, metadata, colmetadata)
     end
     return filename
 end
 
-function write(io::IO, tbl; largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, maxdepth::Int=DEFAULT_MAX_DEPTH, ntasks=Inf, file::Bool=false)
-    return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
+function write(io::IO, tbl; metadata=getmetadata(tbl), colmetadata=nothing, largelists::Bool=false, compress::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Int=8, maxdepth::Int=DEFAULT_MAX_DEPTH, ntasks=Inf, file::Bool=false)
+    return write(io, tbl, file, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks, metadata, colmetadata)
 end
 
-function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks)
+function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks, meta, colmeta)
     if ntasks < 1
         throw(ArgumentError("ntasks keyword argument must be > 0; pass `ntasks=1` to disable multithreaded writing"))
     end
@@ -137,7 +106,7 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
         @debug 1 "processing table partition i = $i"
         tblcols = Tables.columns(tbl)
         if i == 1
-            cols = toarrowtable(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
+            cols = toarrowtable(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, meta, colmeta)
             sch[] = Tables.schema(cols)
             firstcols[] = cols
             put!(msgs, makeschemamsg(sch[], cols), i)
@@ -153,9 +122,9 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
             put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
         else
             if threaded
-                Threads.@spawn process_partition(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+                Threads.@spawn process_partition(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
             else
-                @async process_partition(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+                @async process_partition(tblcols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
             end
         end
     end
@@ -209,9 +178,9 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     return io
 end
 
-function process_partition(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror)
+function process_partition(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
     try
-        cols = toarrowtable(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
+        cols = toarrowtable(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, meta, colmeta)
         if !isempty(cols.dictencodingdeltas)
             for de in cols.dictencodingdeltas
                 dictsch = Tables.Schema((:col,), (eltype(de.data),))
@@ -229,13 +198,12 @@ end
 struct ToArrowTable
     sch::Tables.Schema
     cols::Vector{Any}
-    metadata::Union{Nothing, Dict{String, String}}
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
     dictencodingdeltas::Vector{DictEncoding}
 end
 
-function toarrowtable(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth)
+function toarrowtable(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, meta, colmeta)
     @debug 1 "converting input table to arrow formatted columns"
-    meta = getmetadata(cols)
     sch = Tables.schema(cols)
     types = collect(sch.types)
     N = length(types)
@@ -243,12 +211,15 @@ function toarrowtable(cols, dictencodings, largelists, compress, denseunions, di
     newtypes = Vector{Type}(undef, N)
     dictencodingdeltas = DictEncoding[]
     Tables.eachcolumn(sch, cols) do col, i, nm
-        newcol = toarrowvector(col, i, dictencodings, dictencodingdeltas; compression=compress, largelists=largelists, denseunions=denseunions, dictencode=dictencode, dictencodenested=dictencodenested, maxdepth=maxdepth)
+        oldcolmeta = getmetadata(col)
+        newcolmeta = isnothing(colmeta) ? oldcolmeta : get(colmeta, nm, oldcolmeta)
+        newcol = toarrowvector(col, i, dictencodings, dictencodingdeltas, newcolmeta; compression=compress, largelists=largelists, denseunions=denseunions, dictencode=dictencode, dictencodenested=dictencodenested, maxdepth=maxdepth)
         newtypes[i] = eltype(newcol)
         newcols[i] = newcol
     end
     minlen, maxlen = isempty(newcols) ? (0, 0) : extrema(length, newcols)
     minlen == maxlen || throw(ArgumentError("columns with unequal lengths detected: $minlen < $maxlen"))
+    meta = _normalizemeta(meta)
     return ToArrowTable(Tables.Schema(sch.names, newtypes), newcols, meta, dictencodingdeltas)
 end
 

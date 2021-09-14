@@ -24,7 +24,7 @@ struct Map{T, O, A} <: ArrowVector{T}
     offsets::Offsets{O}
     data::A
     ℓ::Int
-    metadata::Union{Nothing, Dict{String, String}}
+    metadata::Union{Nothing, Base.ImmutableDict{String,String}}
 end
 
 Base.size(l::Map) = (l.ℓ,)

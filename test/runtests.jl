@@ -120,15 +120,24 @@ tt = Arrow.Table(Arrow.tobuffer(tt; dictencode=true, dictencodenested=true))
 
 t = (col1=Int64[1,2,3,4,5,6,7,8,9,10],)
 meta = Dict("key1" => "value1", "key2" => "value2")
-Arrow.setmetadata!(t, meta)
 meta2 = Dict("colkey1" => "colvalue1", "colkey2" => "colvalue2")
-Arrow.setmetadata!(t.col1, meta2)
-tt = Arrow.Table(Arrow.tobuffer(t))
+tt = Arrow.Table(Arrow.tobuffer(t; colmetadata=Dict(:col1 => meta2), metadata=meta))
 @test length(tt) == length(t)
 @test tt.col1 == t.col1
 @test eltype(tt.col1) === Int64
-@test Arrow.getmetadata(tt) == meta
-@test Arrow.getmetadata(tt.col1) == meta2
+@test Arrow.getmetadata(tt) == Arrow.toidict(meta)
+@test Arrow.getmetadata(tt.col1) ==  Arrow.toidict(meta2)
+
+t = (col1=collect(1:10), col2=collect('a':'j'), col3=collect(1:10))
+meta = ("key1" => :value1, :key2 => "value2")
+meta2 = ("colkey1" => :colvalue1, :colkey2 => "colvalue2")
+meta3 = ("colkey3" => :colvalue3,)
+tt = Arrow.Table(Arrow.tobuffer(t; colmetadata=Dict(:col2 => meta2, :col3 => meta3), metadata=meta))
+@test Arrow.getmetadata(tt) == Arrow.toidict(String(k) => String(v) for (k, v) in meta)
+@test Arrow.getmetadata(tt.col1) === nothing
+@test Arrow.getmetadata(tt.col2)["colkey1"] == "colvalue1"
+@test Arrow.getmetadata(tt.col2)["colkey2"] == "colvalue2"
+@test Arrow.getmetadata(tt.col3)["colkey3"] == "colvalue3"
 
 # custom compressors
 lz4 = Arrow.CodecLz4.LZ4FrameCompressor(; compressionlevel=8)
@@ -296,12 +305,6 @@ ArrowTypes.JuliaType(::Val{:CustomStruct2}, S, meta) = CustomStruct2{Symbol(meta
 tbl = Arrow.Table(Arrow.tobuffer(t))
 @test eltype(tbl.col1) == CustomStruct2{:hey}
 
-# 170
-tbl = Arrow.Table(Arrow.tobuffer((x = [1,2,3],)))
-m = Dict("a" => "b")
-Arrow.setmetadata!(tbl, m)
-@test Arrow.getmetadata(tbl) === m
-
 # 166
 t = (
     col1=[zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.NANOSECOND, nothing})],
@@ -373,7 +376,7 @@ end
 
     # 2-arg show with metadata
     big_dict = Dict((randstring(rand(5:10)) => randstring(rand(1:3)) for _ = 1:100))
-    Arrow.setmetadata!(arrow_table, big_dict)
+    arrow_table = Arrow.Table(Arrow.tobuffer(table; metadata=big_dict))
     str2 = sprint(show, arrow_table)
     @test length(str2) > length(str)
     @test length(str2) < 200

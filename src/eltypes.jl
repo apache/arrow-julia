@@ -39,7 +39,7 @@ function juliaeltype(f::Meta.Field, ::Nothing, convert::Bool)
     return convert ? finaljuliatype(T) : T
 end
 
-function juliaeltype(f::Meta.Field, meta::Dict{String, String}, convert::Bool)
+function juliaeltype(f::Meta.Field, meta::AbstractDict{String, String}, convert::Bool)
     TT = juliaeltype(f, convert)
     !convert && return TT
     T = finaljuliatype(TT)
