@@ -210,4 +210,4 @@ end
 
 toidict(x::Base.ImmutableDict) = x
 
-toiddict(pairs) = foldl(Base.ImmutableDict, pairs)
+toidict(pairs) = foldl(Base.ImmutableDict, pairs)
