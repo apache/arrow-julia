@@ -1,7 +1,7 @@
 name = "ArrowTypes"
 uuid = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
 authors = ["quinnj <quinn.jacobd@gmail.com>"]
-version = "1.2.2"
+version = "2.0.0"
 
 
 [deps]

@@ -43,10 +43,6 @@ function juliaeltype(f::Meta.Field, meta::AbstractDict{String, String}, convert:
     TT = juliaeltype(f, convert)
     !convert && return TT
     T = finaljuliatype(TT)
-    # deprecated begin
-    TTT = ArrowTypes.extensiontype(f, meta)
-    TTT !== nothing && return TTT
-    # end deprecated
     if haskey(meta, "ARROW:extension:name")
         typename = meta["ARROW:extension:name"]
         metadata = get(meta, "ARROW:extension:metadata", "")
