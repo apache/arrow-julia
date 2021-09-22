@@ -356,36 +356,4 @@ Base.size(x::ToArrow) = (length(x.data),)
 Base.eltype(x::ToArrow{T, A}) where {T, A} = T
 Base.getindex(x::ToArrow{T}, i::Int) where {T} = toarrow(getindex(x.data, i))
 
-#### DEPRECATED
-function arrowconvert end
-arrowconvert(T, x) = convert(T, x)
-arrowconvert(::Type{Union{T, Missing}}, x) where {T} = arrowconvert(T, x)
-arrowconvert(::Type{Union{T, Missing}}, ::Missing) where {T} = missing
-
-const JULIA_TO_ARROW_TYPE_MAPPING = Dict{Type, Tuple{String, Type}}()
-
-istyperegistered(::Type{T}) where {T} = haskey(JULIA_TO_ARROW_TYPE_MAPPING, T)
-
-const ARROW_TO_JULIA_TYPE_MAPPING = Dict{String, Tuple{Type, Type}}()
-
-function extensiontype(f, meta)
-    if haskey(meta, "ARROW:extension:name")
-        typename = meta["ARROW:extension:name"]
-        if haskey(ARROW_TO_JULIA_TYPE_MAPPING, typename)
-            T = ARROW_TO_JULIA_TYPE_MAPPING[typename][1]
-            return f.nullable ? Union{T, Missing} : T
-        end
-    end
-    return nothing
-end
-
-function registertype!(juliatype::Type, arrowtype::Type, arrowname::String=string("JuliaLang.", string(juliatype)))
-    msg = "Arrow.ArrowTypes.registertype! is deprecated in favor of defining `ArrowTypes.ArrowType`, `ArrowTypes.arrowname`, and `ArrowTypes.JuliaType`; see their docs for more information on how to migrate"
-    Base.depwarn(msg, :registertype!)
-    # TODO: validate that juliatype isn't already default arrow type
-    JULIA_TO_ARROW_TYPE_MAPPING[juliatype] = (arrowname, arrowtype)
-    ARROW_TO_JULIA_TYPE_MAPPING[arrowname] = (juliatype, arrowtype)
-    return
-end
-
 end # module ArrowTypes

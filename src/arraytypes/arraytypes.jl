@@ -84,17 +84,6 @@ end
 # now we check for ArrowType converions and dispatch on ArrowKind
 function arrowvector(::Type{S}, x, i, nl, fi, de, ded, meta; kw...) where {S}
     meta = _normalizemeta(meta)
-    # deprecated and will be removed
-    if ArrowTypes.istyperegistered(S)
-        arrowname, arrowtype = ArrowTypes.JULIA_TO_ARROW_TYPE_MAPPING[S]
-        meta = _arrowtypemeta(meta, arrowname, "")
-        if arrowtype === S
-            return arrowvector(ArrowKind(S), x, i, nl, fi, de, ded, meta; kw...)
-        else
-            return arrowvector(converter(arrowtype, x), i, nl, fi, de, ded, meta; kw...)
-        end
-    end
-    # end deprecation
     return arrowvector(ArrowKind(S), x, i, nl, fi, de, ded, meta; kw...)
 end
 

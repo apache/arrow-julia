@@ -20,23 +20,30 @@ import TimeZones
 struct WrappedDate
     x::Dates.Date
 end
-Arrow.ArrowTypes.registertype!(WrappedDate, WrappedDate)
+
+ArrowTypes.arrowname(::Type{WrappedDate}) = Symbol("JuliaLang.WrappedDate")
+ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.WrappedDate")}) = WrappedDate
 
 struct WrappedTime
     x::Dates.Time
 end
-Arrow.ArrowTypes.registertype!(WrappedTime, WrappedTime)
+
+ArrowTypes.arrowname(::Type{WrappedTime}) = Symbol("JuliaLang.WrappedTime")
+ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.WrappedTime")}) = WrappedTime
 
 struct WrappedDateTime
     x::Dates.DateTime
 end
-Arrow.ArrowTypes.registertype!(WrappedDateTime, WrappedDateTime)
+
+ArrowTypes.arrowname(::Type{WrappedDateTime}) = Symbol("JuliaLang.WrappedDateTime")
+ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.WrappedDateTime")}) = WrappedDateTime
 
 struct WrappedZonedDateTime
     x::TimeZones.ZonedDateTime
 end
-Arrow.ArrowTypes.registertype!(WrappedZonedDateTime, WrappedZonedDateTime)
 
+ArrowTypes.arrowname(::Type{WrappedZonedDateTime}) = Symbol("JuliaLang.WrappedZonedDateTime")
+ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.WrappedZonedDateTime")}) = WrappedZonedDateTime
 
 @testset "Date and time wrappers with missing" begin
     for T in (WrappedDate, WrappedTime, WrappedDateTime, WrappedZonedDateTime)
