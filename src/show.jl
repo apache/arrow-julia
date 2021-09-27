@@ -14,7 +14,6 @@ end
 
 # 3-arg show: show schema and show metadata entries adaptively according to `displaysize`
 function Base.show(io::IO, mime::MIME"text/plain", table::Table)
-    limit = get(io, :limit, false)::Bool
     display_rows, display_cols = displaysize(io)
     ncols = length(Tables.columnnames(table))
     meta = getmetadata(table)
