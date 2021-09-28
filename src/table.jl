@@ -39,11 +39,13 @@ end
     Arrow.Stream(io::IO; convert::Bool=true)
     Arrow.Stream(file::String; convert::Bool=true)
     Arrow.Stream(bytes::Vector{UInt8}, pos=1, len=nothing; convert::Bool=true)
+    Arrow.Stream(inputs::Vector; convert::Bool=true)
 
 Start reading an arrow formatted table, from:
  * `io`, bytes will be read all at once via `read(io)`
  * `file`, bytes will be read via `Mmap.mmap(file)`
  * `bytes`, a byte vector directly, optionally allowing specifying the starting byte position `pos` and `len`
+ * A `Vector` of any of the above, in which each input should be an IPC or arrow file and must match schema
 
 Reads the initial schema message from the arrow stream/file, then returns an `Arrow.Stream` object
 which will iterate over record batch messages, producing an [`Arrow.Table`](@ref) on each iteration.
@@ -196,11 +198,13 @@ end
     Arrow.Table(io::IO; convert::Bool=true)
     Arrow.Table(file::String; convert::Bool=true)
     Arrow.Table(bytes::Vector{UInt8}, pos=1, len=nothing; convert::Bool=true)
+    Arrow.Table(inputs::Vector; convert::Bool=true)
 
 Read an arrow formatted table, from:
  * `io`, bytes will be read all at once via `read(io)`
  * `file`, bytes will be read via `Mmap.mmap(file)`
  * `bytes`, a byte vector directly, optionally allowing specifying the starting byte position `pos` and `len`
+ * A `Vector` of any of the above, in which each input should be an IPC or arrow file and must match schema
 
 Returns a `Arrow.Table` object that allows column access via `table.col1`, `table[:col1]`, or `table[1]`.
 
