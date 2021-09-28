@@ -437,6 +437,31 @@ end
 d = Arrow.FlatBuffers.getrootas(TestData, buf, 0);
 @test d.DataInt32 == UInt32[1,2,3]
 
+# test multiple inputs treated as one table
+t = (
+    col1=[1, 2, 3, 4, 5],
+    col2=[1.2, 2.3, 3.4, 4.5, 5.6],
+)
+tbl = Arrow.Table([Arrow.tobuffer(t), Arrow.tobuffer(t)])
+@test tbl.col1 == [1, 2, 3, 4, 5, 1, 2, 3, 4, 5]
+@test tbl.col2 == [1.2, 2.3, 3.4, 4.5, 5.6, 1.2, 2.3, 3.4, 4.5, 5.6]
+
+# schemas must match between multiple inputs
+t2 = (
+    col1=[1.2, 2.3, 3.4, 4.5, 5.6],
+)
+@test_throws ArgumentError Arrow.Table([Arrow.tobuffer(t), Arrow.tobuffer(t2)])
+
+# test multiple inputs treated as one table
+tbls = collect(Arrow.Stream([Arrow.tobuffer(t), Arrow.tobuffer(t)]))
+@test tbls[1].col1 == tbls[2].col1
+@test tbls[1].col2 == tbls[2].col2
+
+# schemas must match between multiple inputs
+t2 = (
+    col1=[1.2, 2.3, 3.4, 4.5, 5.6],
+)
+@test_throws ArgumentError collect(Arrow.Stream([Arrow.tobuffer(t), Arrow.tobuffer(t2)]))
 
 end # @testset "misc"
 

@@ -32,6 +32,8 @@ const TableOrStruct = Union{Table, Struct}
 bytes(x::TableOrStruct) = getfield(x, :bytes)
 pos(x::TableOrStruct) = getfield(x, :pos)
 
+==(a::T, b::T) where {T <: TableOrStruct} = all(getproperty(a, p) == getproperty(b, p) for p in propertynames(a))
+
 (::Type{T})(b::Builder) where {T <: TableOrStruct} = T(b.bytes[b.head+1:end], get(b, b.head, Int32))
 
 getrootas(::Type{T}, bytes::Vector{UInt8}, offset) where {T <: Table} = init(T, bytes, offset + readbuffer(bytes, offset, UOffsetT))
