@@ -14,6 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+struct ArrowBlob
+    bytes::Vector{UInt8}
+    pos::Int
+    len::Int
+end
+
+ArrowBlob(bytes::Vector{UInt8}, pos::Int, len::Nothing) = ArrowBlob(bytes, pos, length(bytes))
+
+tobytes(bytes::Vector{UInt8}) = bytes
+tobytes(io::IO) = Base.read(io)
+function tobytes(str)
+    f = string(str)
+    isfile(f) || throw(ArgumentError("$f is not a file"))
+    return Mmap.mmap(f)
+end
+
 struct BatchIterator
     bytes::Vector{UInt8}
     startpos::Int
@@ -40,7 +56,9 @@ This allows iterating over extremely large "arrow tables" in chunks represented 
 Supports the `convert` keyword argument which controls whether certain arrow primitive types will be
 lazily converted to more friendly Julia defaults; by default, `convert=true`.
 """
-struct Stream
+mutable struct Stream
+    inputs::Vector{ArrowBlob}
+    inputindex::Int
     batchiterator::BatchIterator
     pos::Int
     names::Vector{Symbol}
@@ -54,21 +72,22 @@ end
 
 Tables.partitions(x::Stream) = x
 
-Stream(io::IO, pos::Integer=1, len=nothing; convert::Bool=true) = Stream(Base.read(io), pos, len; convert=convert)
-Stream(str::String, pos::Integer=1, len=nothing; convert::Bool=true) = isfile(str) ? Stream(Mmap.mmap(str), pos, len; convert=convert) :
-    throw(ArgumentError("$str is not a file"))
+Stream(input, pos::Integer=1, len=nothing; kw...) = Stream([ArrowBlob(tobytes(input), pos, len)]; kw...)
+Stream(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...) = Stream([ArrowBlob(tobytes(input), pos, len)]; kw...)
+Stream(inputs::Vector; kw...) = Stream([ArrowBlob(tobytes(x), 1, nothing) for x in inputs]; kw...)
 
 # will detect whether we're reading a Stream from a file or stream
-function Stream(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothing}=nothing; convert::Bool=true)
-    len = something(tlen, length(bytes))
-    if len > 24 &&
-        _startswith(bytes, off, FILE_FORMAT_MAGIC_BYTES) &&
-        _endswith(bytes, off + len - 1, FILE_FORMAT_MAGIC_BYTES)
-        off += 8 # skip past magic bytes + padding
-    end
+function Stream(inputs::Vector{ArrowBlob}; convert::Bool=true)
     dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
     dictencoded = Dict{Int64, Meta.Field}() # dictionary id => field
-    batchiterator = BatchIterator(bytes, off)
+    blob = inputs[1]
+    bytes, pos, len = blob.bytes, blob.pos, blob.len
+    if len > 24 &&
+        _startswith(bytes, pos, FILE_FORMAT_MAGIC_BYTES) &&
+        _endswith(bytes, pos + len - 1, FILE_FORMAT_MAGIC_BYTES)
+        pos += 8 # skip past magic bytes + padding
+    end
+    batchiterator = BatchIterator(bytes, pos)
     state = iterate(batchiterator)
     state === nothing && throw(ArgumentError("no arrow ipc messages found in provided input"))
     batch, (pos, id) = state
@@ -85,7 +104,7 @@ function Stream(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothi
         getdictionaries!(dictencoded, field)
         @debug 1 "parsed column from schema: field = $field"
     end
-    return Stream(batchiterator, pos, names, types, schema, dictencodings, dictencoded, convert, Ref{Union{Symbol,Nothing}}(nothing))
+    return Stream(inputs, 1, batchiterator, pos, names, types, schema, dictencodings, dictencoded, convert, Ref{Union{Symbol,Nothing}}(nothing))
 end
 
 Base.IteratorSize(::Type{Stream}) = Base.SizeUnknown()
@@ -96,10 +115,29 @@ function Base.iterate(x::Stream, (pos, id)=(x.pos, 1))
 
     while true
         state = iterate(x.batchiterator, (pos, id))
-        state === nothing && return nothing
+        if state === nothing
+            # check for additional inputs
+            while state === nothing
+                x.inputindex += 1
+                x.inputindex > length(x.inputs) && return nothing
+                blob = x.inputs[x.inputindex]
+                bytes, pos, len = blob.bytes, blob.pos, blob.len
+                if len > 24 &&
+                    _startswith(bytes, pos, FILE_FORMAT_MAGIC_BYTES) &&
+                    _endswith(bytes, pos + len - 1, FILE_FORMAT_MAGIC_BYTES)
+                    pos += 8 # skip past magic bytes + padding
+                end
+                x.batchiterator = BatchIterator(bytes, pos)
+                state = iterate(x.batchiterator, (1, id))
+            end
+        end
         batch, (pos, id) = state
         header = batch.msg.header
-        if header isa Meta.DictionaryBatch
+        if header isa Meta.Schema
+            if header != x.schema
+                throw(ArgumentError("mismatched schemas between different arrow batches: $(x.schema) != $header"))
+            end
+        elseif header isa Meta.DictionaryBatch
             id = header.id
             recordbatch = header.data
             @debug 1 "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
@@ -223,18 +261,12 @@ Tables.getcolumn(t::Table, i::Int) = columns(t)[i]
 Tables.getcolumn(t::Table, nm::Symbol) = lookup(t)[nm]
 
 # high-level user API functions
-Table(io::IO, pos::Integer=1, len=nothing; kw...) = Table(Base.read(io), pos, len; kw...)
-Table(str::String, pos::Integer=1, len=nothing; kw...) = isfile(str) ? Table(Mmap.mmap(str), pos, len; kw...) :
-    throw(ArgumentError("$str is not a file"))
+Table(input, pos::Integer=1, len=nothing; kw...) = Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
+Table(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...) = Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
+Table(inputs::Vector; kw...) = Table([ArrowBlob(tobytes(x), 1, nothing) for x in inputs]; kw...)
 
 # will detect whether we're reading a Table from a file or stream
-function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothing}=nothing; convert::Bool=true)
-    len = something(tlen, length(bytes))
-    if len > 24 &&
-        _startswith(bytes, off, FILE_FORMAT_MAGIC_BYTES) &&
-        _endswith(bytes, off + len - 1, FILE_FORMAT_MAGIC_BYTES)
-        off += 8 # skip past magic bytes + padding
-    end
+function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
     t = Table()
     sch = nothing
     dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
@@ -259,54 +291,66 @@ function Table(bytes::Vector{UInt8}, off::Integer=1, tlen::Union{Integer, Nothin
         end
     end
     anyrecordbatches = false
-    for batch in BatchIterator(bytes, off)
-        # store custom_metadata of batch.msg?
-        header = batch.msg.header
-        if header isa Meta.Schema
-            @debug 1 "parsing schema message"
-            # assert endianness?
-            # store custom_metadata?
-            for (i, field) in enumerate(header.fields)
-                push!(names(t), Symbol(field.name))
-                # recursively find any dictionaries for any fields
-                getdictionaries!(dictencoded, field)
-                @debug 1 "parsed column from schema: field = $field"
-            end
-            sch = header
-            schema(t)[] = sch
-        elseif header isa Meta.DictionaryBatch
-            id = header.id
-            recordbatch = header.data
-            @debug 1 "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
-            if haskey(dictencodings, id) && header.isDelta
-                # delta
+    for blob in blobs
+        bytes, pos, len = blob.bytes, blob.pos, blob.len
+        if len > 24 &&
+            _startswith(bytes, pos, FILE_FORMAT_MAGIC_BYTES) &&
+            _endswith(bytes, pos + len - 1, FILE_FORMAT_MAGIC_BYTES)
+            pos += 8 # skip past magic bytes + padding
+        end
+        for batch in BatchIterator(bytes, pos)
+            # store custom_metadata of batch.msg?
+            header = batch.msg.header
+            if header isa Meta.Schema
+                @debug 1 "parsing schema message"
+                # assert endianness?
+                # store custom_metadata?
+                if sch === nothing
+                    for (i, field) in enumerate(header.fields)
+                        push!(names(t), Symbol(field.name))
+                        # recursively find any dictionaries for any fields
+                        getdictionaries!(dictencoded, field)
+                        @debug 1 "parsed column from schema: field = $field"
+                    end
+                    sch = header
+                    schema(t)[] = sch
+                elseif sch != header
+                    throw(ArgumentError("mismatched schemas between different arrow batches: $sch != $header"))
+                end
+            elseif header isa Meta.DictionaryBatch
+                id = header.id
+                recordbatch = header.data
+                @debug 1 "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
+                if haskey(dictencodings, id) && header.isDelta
+                    # delta
+                    field = dictencoded[id]
+                    values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
+                    dictencoding = dictencodings[id]
+                    if typeof(dictencoding.data) <: ChainedVector
+                        append!(dictencoding.data, values)
+                    else
+                        A = ChainedVector([dictencoding.data, values])
+                        S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
+                        dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
+                    end
+                    continue
+                end
+                # new dictencoding or replace
                 field = dictencoded[id]
                 values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
-                dictencoding = dictencodings[id]
-                if typeof(dictencoding.data) <: ChainedVector
-                    append!(dictencoding.data, values)
-                else
-                    A = ChainedVector([dictencoding.data, values])
-                    S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
-                    dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
-                end
-                continue
+                A = values
+                S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
+                dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
+                @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
+            elseif header isa Meta.RecordBatch
+                anyrecordbatches = true
+                @debug 1 "parsing record batch message: compression = $(header.compression)"
+                put!(tsks, Threads.@spawn begin
+                    collect(VectorIterator(sch, batch, dictencodings, convert))
+                end)
+            else
+                throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
             end
-            # new dictencoding or replace
-            field = dictencoded[id]
-            values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
-            A = values
-            S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
-            dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
-            @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
-        elseif header isa Meta.RecordBatch
-            anyrecordbatches = true
-            @debug 1 "parsing record batch message: compression = $(header.compression)"
-            put!(tsks, Threads.@spawn begin
-                collect(VectorIterator(sch, batch, dictencodings, convert))
-            end)
-        else
-            throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
         end
     end
     close(tsks)

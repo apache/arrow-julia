@@ -16,6 +16,8 @@
 
 module FlatBuffers
 
+import Base: ==
+
 const UOffsetT = UInt32
 const SOffsetT = Int32
 const VOffsetT = UInt16
