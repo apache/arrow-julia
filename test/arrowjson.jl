@@ -559,10 +559,10 @@ function DataFile(source)
     dictencodings = Dict{String, Tuple{Base.Type, DictEncoding}}()
     dictid = Ref(0)
     for (i, tbl1) in Tables.partitions(source)
-        tbl = Arrow.toarrowtable(Table.columns(tbl1))
+        tbl = Arrow.toarrowtable(Table.Columns(tbl1))
         if i == 1
             sch = Tables.schema(tbl)
-            for (nm, T, col) in zip(sch.names, sch.types, Tables.Columns(tbl))
+            for (nm, T, col) in zip(sch.names, sch.types, tbl)
                 if col isa Arrow.DictEncode
                     id = dictid[]
                     dictid[] += 1
@@ -580,7 +580,7 @@ function DataFile(source)
         # build record batch
         len = Tables.rowcount(tbl)
         columns = FieldData[]
-        for (nm, T, col) in zip(sch.names, sch.types, Tables.Columns(tbl))
+        for (nm, T, col) in zip(sch.names, sch.types, tbl)
             push!(columns, FieldData(String(nm), T, col, dictencodings))
         end
         push!(batches, RecordBatch(len, columns))
