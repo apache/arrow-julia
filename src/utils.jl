@@ -170,7 +170,7 @@ end
 function Base.close(ch::OrderedChannel)
     @lock ch.cond begin
         # just need to ensure any tasks waiting to put their tasks have had a chance to put
-        while Base.n_waiters(ch.cond) > 0
+        while !isempty(ch.cond)
             wait(ch.cond)
         end
         close(ch.chan)
