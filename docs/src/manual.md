@@ -14,7 +14,7 @@ Arrow.jl attempts to support any path-like type wherever a function takes a path
 
 When a custom `IO` subtype is returned (`I`) then the following methods also need to be defined:
 
-- `Base.read(io::I, ::Type{UInt8})` or `read(io::I)`
+- `Base.read(io::I, ::Type{UInt8})` or `Base.read(io::I)`
 - `Base.write(io::I, x)`
 
 ## Reading arrow data
@@ -183,7 +183,8 @@ Ok, so that's a pretty good rundown of *reading* arrow data, but how do you *pro
 
 ### `Arrow.write`
 
-With `Arrow.write`, you provide either an `io::IO` argument or a `file_path` to write the arrow data to, as well as a Tables.jl-compatible source that contains the data to be written.
+```suggestion
+With `Arrow.write`, you provide either an `io::IO` argument or a [`file_path`](#support-for-generic-path-like-types) to write the arrow data to, as well as a Tables.jl-compatible source that contains the data to be written.
 
 What are some examples of Tables.jl-compatible sources? A few examples include:
 * `Arrow.write(io, df::DataFrame)`: A `DataFrame` is a collection of indexable columns
