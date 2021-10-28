@@ -15,7 +15,7 @@
 # limitations under the License.
 
 using Test, Arrow, ArrowTypes, Tables, Dates, PooledArrays, TimeZones, UUIDs,
-    CategoricalArrays, DataAPI
+    CategoricalArrays, DataAPI, FilePathsBase
 using Random: randstring
 
 include(joinpath(dirname(pathof(ArrowTypes)), "../test/tests.jl"))
@@ -70,6 +70,31 @@ for file in readdir(joinpath(dirname(pathof(Arrow)), "../test/arrowjson"))
 end
 
 end # @testset "arrow json integration tests"
+
+@testset "abstract path" begin
+    # Make a custom path type that simulates how AWSS3.jl's S3Path works
+    struct CustomPath <: AbstractPath
+        path::PosixPath
+    end
+
+    Base.isfile(p::CustomPath) = isfile(p.path)
+    Base.read(p::CustomPath) = read(p.path)
+
+    io = Arrow.tobuffer((col=[0],))
+    tt = Arrow.Table(io)
+
+    mktempdir() do dir
+        p = Path(joinpath(dir, "test.arrow"))
+        Arrow.write(p, tt)
+        @test isfile(p)
+
+        tt2 = Arrow.Table(p)
+        @test values(tt) == values(tt2)
+
+        tt3 = Arrow.Table(CustomPath(p))
+        @test values(tt) == values(tt3)
+    end
+end # @testset "abstract path"
 
 @testset "misc" begin
 
@@ -168,6 +193,7 @@ tt = Arrow.Table(Arrow.tobuffer(t))
 
 # 49
 @test_throws ArgumentError Arrow.Table("file_that_doesnt_exist")
+@test_throws ArgumentError Arrow.Table(p"file_that_doesnt_exist")
 
 # 52
 t = (a=Arrow.DictEncode(string.(1:129)),)

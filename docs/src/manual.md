@@ -173,7 +173,7 @@ Ok, so that's a pretty good rundown of *reading* arrow data, but how do you *pro
 
 ### `Arrow.write`
 
-With `Arrow.write`, you provide either an `io::IO` argument or `file::String` to write the arrow data to, as well as a Tables.jl-compatible source that contains the data to be written.
+With `Arrow.write`, you provide either an `io::IO` argument or a `file_path` to write the arrow data to, as well as a Tables.jl-compatible source that contains the data to be written.
 
 What are some examples of Tables.jl-compatible sources? A few examples include:
 * `Arrow.write(io, df::DataFrame)`: A `DataFrame` is a collection of indexable columns
