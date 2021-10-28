@@ -183,7 +183,6 @@ Ok, so that's a pretty good rundown of *reading* arrow data, but how do you *pro
 
 ### `Arrow.write`
 
-```suggestion
 With `Arrow.write`, you provide either an `io::IO` argument or a [`file_path`](#support-for-generic-path-like-types) to write the arrow data to, as well as a Tables.jl-compatible source that contains the data to be written.
 
 What are some examples of Tables.jl-compatible sources? A few examples include:
