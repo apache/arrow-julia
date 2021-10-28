@@ -77,7 +77,6 @@ end # @testset "arrow json integration tests"
         path::PosixPath
     end
 
-    Base.isfile(p::CustomPath) = isfile(p.path)
     Base.read(p::CustomPath) = read(p.path)
 
     io = Arrow.tobuffer((col=[0],))
@@ -192,8 +191,8 @@ tt = Arrow.Table(Arrow.tobuffer(t))
 @test tt.a == ["aaaaaaaaaa", "aaaaaaaaaa"]
 
 # 49
-@test_throws ArgumentError Arrow.Table("file_that_doesnt_exist")
-@test_throws ArgumentError Arrow.Table(p"file_that_doesnt_exist")
+@test_throws SystemError Arrow.Table("file_that_doesnt_exist")
+@test_throws SystemError Arrow.Table(p"file_that_doesnt_exist")
 
 # 52
 t = (a=Arrow.DictEncode(string.(1:129)),)

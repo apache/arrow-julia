@@ -25,10 +25,7 @@ ArrowBlob(bytes::Vector{UInt8}, pos::Int, len::Nothing) = ArrowBlob(bytes, pos, 
 tobytes(bytes::Vector{UInt8}) = bytes
 tobytes(io::IO) = Base.read(io)
 tobytes(io::IOStream) = Mmap.mmap(io)
-function tobytes(file_path)
-    isfile(file_path) || throw(ArgumentError("$file_path is not a file"))
-    return open(tobytes, file_path, "r")
-end
+tobytes(file_path) = open(tobytes, file_path, "r")
 
 struct BatchIterator
     bytes::Vector{UInt8}
