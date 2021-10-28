@@ -27,9 +27,7 @@ tobytes(io::IO) = Base.read(io)
 tobytes(io::IOStream) = Mmap.mmap(io)
 function tobytes(file_path)
     isfile(file_path) || throw(ArgumentError("$file_path is not a file"))
-    return open(file_path, "r") do io
-        tobytes(io)
-    end
+    return open(tobytes, file_path, "r")
 end
 
 struct BatchIterator
