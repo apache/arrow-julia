@@ -6,6 +6,16 @@ The best place to learn about the Apache arrow project is [the website itself](h
 
 The [Arrow.jl](https://github.com/JuliaData/Arrow.jl) Julia package is another implementation, allowing the ability to both read and write data in the arrow format. As a data format, arrow specifies an exact memory layout to be used for columnar table data, and as such, "reading" involves custom Julia objects ([`Arrow.Table`](@ref) and [`Arrow.Stream`](@ref)), which read the *metadata* of an "arrow memory blob", then *wrap* the array data contained therein, having learned the type and size, amongst other properties, from the metadata. Let's take a closer look at what this "reading" of arrow memory really means/looks like.
 
+## Support for generic path-like types
+
+Arrow.jl attempts to support any path-like type wherever a function takes a path as an argument. The Arrow.jl API should generically work as long as the type supports:
+
+- `Base.open(path, mode)::I where I <: IO`
+
+When a custom `IO` subtype is returned (`I`) then the following methods also need to be defined:
+
+- `Base.read(io::I, ::Type{UInt8})` or `Base.read(io::I)`
+- `Base.write(io::I, x)`
 
 ## Reading arrow data
 
@@ -173,7 +183,7 @@ Ok, so that's a pretty good rundown of *reading* arrow data, but how do you *pro
 
 ### `Arrow.write`
 
-With `Arrow.write`, you provide either an `io::IO` argument or `file::String` to write the arrow data to, as well as a Tables.jl-compatible source that contains the data to be written.
+With `Arrow.write`, you provide either an `io::IO` argument or a [`file_path`](#support-for-generic-path-like-types) to write the arrow data to, as well as a Tables.jl-compatible source that contains the data to be written.
 
 What are some examples of Tables.jl-compatible sources? A few examples include:
 * `Arrow.write(io, df::DataFrame)`: A `DataFrame` is a collection of indexable columns
