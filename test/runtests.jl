@@ -332,7 +332,7 @@ tbl = Arrow.Table(Arrow.tobuffer(t))
 
 # 166
 t = (
-    col1=[zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.NANOSECOND, nothing})],
+    col1=[zero(Arrow.Timestamp{Arrow.Meta.TimeUnits.NANOSECOND, nothing})],
 )
 tbl = Arrow.Table(Arrow.tobuffer(t))
 @test_logs (:warn, r"automatically converting Arrow.Timestamp with precision = NANOSECOND") begin

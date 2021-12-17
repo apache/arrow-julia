@@ -54,11 +54,11 @@ function Base.getproperty(x::BodyCompression, field::Symbol)
     if field === :codec
         o = FlatBuffers.offset(x, 4)
         o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), CompressionType)
-        return CompressionType.LZ4_FRAME
+        return CompressionTypes.LZ4_FRAME
     elseif field === :method
         o = FlatBuffers.offset(x, 6)
         o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), BodyCompressionMethod)
-        return BodyCompressionMethod.BUFFER
+        return BodyCompressionMethods.BUFFER
     end
     return nothing
 end
