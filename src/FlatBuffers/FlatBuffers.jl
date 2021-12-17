@@ -121,7 +121,7 @@ macro scopedenum(T, syms...)
             push!(defs.args, :(const $(esc(sym)) = $(esc(typename))($i)))
         end
     end
-    mod = Symbol(typename, "Module")
+    mod = Symbol(typename, "s")
     syms = Tuple(Base.values(namemap))
     blk = quote
         module $(esc(mod))
@@ -135,7 +135,6 @@ macro scopedenum(T, syms...)
             if isdefined(Base.Enums, :namemap)
                 Base.Enums.namemap(::Type{$(esc(typename))}) = $(esc(namemap))
             end
-            Base.getproperty(::Type{$(esc(typename))}, sym::Symbol) = sym in $syms ? getfield($(esc(mod)), sym) : getfield($(esc(typename)), sym)
             Base.typemin(x::Type{$(esc(typename))}) = $(esc(typename))($lo)
             Base.typemax(x::Type{$(esc(typename))}) = $(esc(typename))($hi)
             let insts = (Any[ $(esc(typename))(v) for v in $values ]...,)
@@ -144,6 +143,8 @@ macro scopedenum(T, syms...)
             FlatBuffers.basetype(::$(esc(typename))) = $(basetype)
             FlatBuffers.basetype(::Type{$(esc(typename))}) = $(basetype)
             $defs
+            #Base.getproperty(::Type{$(esc(typename))}, sym::Symbol) = sym in $syms ? getfield($(esc(mod)), sym) : getfield($(esc(typename)), sym)
+            export $(syms...)
         end
     end
     push!(blk.args, :nothing)
