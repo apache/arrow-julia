@@ -151,6 +151,8 @@ macro scopedenum(T, syms...)
     push!(blk.args, :nothing)
     blk.head = :toplevel
     push!(blk.args, :(using .$mod))
+    # Return the newly created module, since it's (now) meant to be user visible.
+    push!(blk.args, esc(mod))
     return blk
 end
 
