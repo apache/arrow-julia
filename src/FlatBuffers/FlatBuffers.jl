@@ -121,8 +121,8 @@ macro scopedenum(T, syms...)
             push!(defs.args, :(const $(esc(sym)) = $(esc(typename))($i)))
         end
     end
-    pluralized = typename * (last(string(typename)) == 's' ? "es" : "s")
-    mod = Symbol(pluralized)
+    _typename_str = string(typename)
+    mod = Symbol(_typename_str, last(_typename_str) == 's' ? "es" : "s")
     syms = Tuple(Base.values(namemap))
     blk = quote
         module $(esc(mod))
