@@ -31,9 +31,9 @@ github:
   features:
     issues: true
   enabled_merge_buttons:
-    squash: true
     merge: false
-    rebase: false
+    rebase: true
+    squash: true
   protected_branches:
     main:
       required_linear_history: true
