@@ -23,7 +23,7 @@ notifications:
   pullrequests: github@arrow.apache.org
 
 github:
-  description: "Apache Arrow Julia"
+  description: "Official Julia implementation of Apache Arrow"
   homepage: https://arrow.apache.org/
   labels:
     - apache-arrow
