@@ -488,6 +488,9 @@ t2 = (
 )
 @test_throws ArgumentError collect(Arrow.Stream([Arrow.tobuffer(t), Arrow.tobuffer(t2)]))
 
+# https://github.com/apache/arrow-julia/issues/253
+@test Arrow.toidict(Pair{String, String}[]) == Base.ImmutableDict{String, String}()
+
 end # @testset "misc"
 
 end
