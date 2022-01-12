@@ -70,6 +70,9 @@ end
 _normalizemeta(::Nothing) = nothing
 _normalizemeta(meta) = toidict(String(k) => String(v) for (k, v) in meta)
 
+_normalizecolmeta(::Nothing) = nothing
+_normalizecolmeta(colmeta) = toidict(Symbol(k) => toidict(String(v1) => String(v2) for (v1, v2) in v) for (k, v) in colmeta)
+
 function _arrowtypemeta(::Nothing, n, m)
     return toidict(("ARROW:extension:name" => n, "ARROW:extension:metadata" => m))
 end
