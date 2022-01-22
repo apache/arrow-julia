@@ -199,6 +199,7 @@ toidict(x::Base.ImmutableDict) = x
 
 # ref https://github.com/JuliaData/Arrow.jl/pull/238#issuecomment-919415809
 function toidict(pairs)
+    isempty(pairs) && return Base.ImmutableDict{String, String}()
     dict = Base.ImmutableDict(first(pairs))
     for pair in Iterators.drop(pairs, 1)
         dict = Base.ImmutableDict(dict, pair)
