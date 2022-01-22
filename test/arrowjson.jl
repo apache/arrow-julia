@@ -80,14 +80,14 @@ mutable struct Timestamp <: Type
 end
 
 Timestamp() = Timestamp("", "", nothing)
-unit(U) = U == Arrow.Meta.TimeUnit.SECOND ? "SECOND" :
-          U == Arrow.Meta.TimeUnit.MILLISECOND ? "MILLISECOND" :
-          U == Arrow.Meta.TimeUnit.MICROSECOND ? "MICROSECOND" : "NANOSECOND"
+unit(U) = U == Arrow.Meta.TimeUnits.SECOND ? "SECOND" :
+          U == Arrow.Meta.TimeUnits.MILLISECOND ? "MILLISECOND" :
+          U == Arrow.Meta.TimeUnits.MICROSECOND ? "MICROSECOND" : "NANOSECOND"
 Type(::Base.Type{Arrow.Timestamp{U, TZ}}) where {U, TZ} = Timestamp("timestamp", unit(U), TZ === nothing ? nothing : String(TZ))
 StructTypes.StructType(::Base.Type{Timestamp}) = StructTypes.Mutable()
-unitT(u) = u == "SECOND" ? Arrow.Meta.TimeUnit.SECOND :
-           u == "MILLISECOND" ? Arrow.Meta.TimeUnit.MILLISECOND :
-           u == "MICROSECOND" ? Arrow.Meta.TimeUnit.MICROSECOND : Arrow.Meta.TimeUnit.NANOSECOND
+unitT(u) = u == "SECOND" ? Arrow.Meta.TimeUnits.SECOND :
+           u == "MILLISECOND" ? Arrow.Meta.TimeUnits.MILLISECOND :
+           u == "MICROSECOND" ? Arrow.Meta.TimeUnits.MICROSECOND : Arrow.Meta.TimeUnits.NANOSECOND
 juliatype(f, x::Timestamp) = Arrow.Timestamp{unitT(x.unit), x.timezone === nothing ? nothing : Symbol(x.timezone)}
 
 struct Duration <: Type
@@ -104,9 +104,9 @@ struct Date <: Type
     unit::String
 end
 
-Type(::Base.Type{Arrow.Date{U, T}}) where {U, T} = Date("date", U == Arrow.Meta.DateUnit.DAY ? "DAY" : "MILLISECOND")
+Type(::Base.Type{Arrow.Date{U, T}}) where {U, T} = Date("date", U == Arrow.Meta.DateUnits.DAY ? "DAY" : "MILLISECOND")
 StructTypes.StructType(::Base.Type{Date}) = StructTypes.Struct()
-juliatype(f, x::Date) = Arrow.Date{x.unit == "DAY" ? Arrow.Meta.DateUnit.DAY : Arrow.Meta.DateUnit.MILLISECOND, x.unit == "DAY" ? Int32 : Int64}
+juliatype(f, x::Date) = Arrow.Date{x.unit == "DAY" ? Arrow.Meta.DateUnits.DAY : Arrow.Meta.DateUnits.MILLISECOND, x.unit == "DAY" ? Int32 : Int64}
 
 struct Time <: Type
     name::String
@@ -123,9 +123,9 @@ struct Interval <: Type
     unit::String
 end
 
-Type(::Base.Type{Arrow.Interval{U, T}}) where {U, T} = Interval("interval", U == Arrow.Meta.IntervalUnit.YEAR_MONTH ? "YEAR_MONTH" : "DAY_TIME")
+Type(::Base.Type{Arrow.Interval{U, T}}) where {U, T} = Interval("interval", U == Arrow.Meta.IntervalUnits.YEAR_MONTH ? "YEAR_MONTH" : "DAY_TIME")
 StructTypes.StructType(::Base.Type{Interval}) = StructTypes.Struct()
-juliatype(f, x::Interval) = Arrow.Interval{x.unit == "YEAR_MONTH" ? Arrow.Meta.IntervalUnit.YEAR_MONTH : Arrow.Meta.IntervalUnit.DAY_TIME, x.unit == "YEAR_MONTH" ? Int32 : Int64}
+juliatype(f, x::Interval) = Arrow.Interval{x.unit == "YEAR_MONTH" ? Arrow.Meta.IntervalUnits.YEAR_MONTH : Arrow.Meta.IntervalUnits.DAY_TIME, x.unit == "YEAR_MONTH" ? Int32 : Int64}
 
 struct UnionT <: Type
     name::String
@@ -133,10 +133,10 @@ struct UnionT <: Type
     typIds::Vector{Int64}
 end
 
-Type(::Base.Type{Arrow.UnionT{T, typeIds, U}}) where {T, typeIds, U} = UnionT("union", T == Arrow.Meta.UnionMode.Dense ? "DENSE" : "SPARSE", collect(typeIds))
+Type(::Base.Type{Arrow.UnionT{T, typeIds, U}}) where {T, typeIds, U} = UnionT("union", T == Arrow.Meta.UnionModes.Dense ? "DENSE" : "SPARSE", collect(typeIds))
 children(::Base.Type{Arrow.UnionT{T, typeIds, U}}) where {T, typeIds, U} = Field[Field("", fieldtype(U, i), nothing) for i = 1:fieldcount(U)]
 StructTypes.StructType(::Base.Type{UnionT}) = StructTypes.Struct()
-juliatype(f, x::UnionT) = Arrow.UnionT{x.mode == "DENSE" ? Arrow.Meta.UnionMode.DENSE : Arrow.Meta.UnionMode.SPARSE, Tuple(x.typeIds), Tuple{(juliatype(y) for y in f.children)...}}
+juliatype(f, x::UnionT) = Arrow.UnionT{x.mode == "DENSE" ? Arrow.Meta.UnionModes.DENSE : Arrow.Meta.UnionModes.SPARSE, Tuple(x.typeIds), Tuple{(juliatype(y) for y in f.children)...}}
 
 struct List <: Type
     name::String
@@ -381,7 +381,7 @@ function FieldData(nm, ::Base.Type{T}, col, dictencodings) where {T}
             U = eltype(S)
             tids = Arrow.typeids(S) === nothing ? (0:fieldcount(U)) : Arrow.typeids(S)
             TYPE_ID = [x === missing ? 0 : tids[Arrow.isatypeid(x, U)] for x in col]
-            if Arrow.unionmode(S) == Arrow.Meta.UnionMode.Dense
+            if Arrow.unionmode(S) == Arrow.Meta.UnionModes.Dense
                 offs = zeros(Int32, fieldcount(U))
                 OFFSET = Int32[]
                 for x in col
@@ -502,7 +502,7 @@ function Base.getindex(x::ArrowArray{T}, i::Base.Int) where {T}
         U = eltype(S)
         tids = Arrow.typeids(S) === nothing ? (0:fieldcount(U)) : Arrow.typeids(S)
         typeid = tids[x.fielddata.TYPE_ID[i]]
-        if Arrow.unionmode(S) == Arrow.Meta.UnionMode.DENSE
+        if Arrow.unionmode(S) == Arrow.Meta.UnionModes.DENSE
             off = x.fielddata.OFFSET[i]
             return ArrowArray(x.field.children[typeid+1], x.fielddata.children[typeid+1], x.dictionaries)[off]
         else
