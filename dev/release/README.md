@@ -91,7 +91,7 @@ To publish the release to the Julia General registry, navigate to the GitHub com
 
 `@JuliaRegistrator register()`
 
-The TagBot will respond saying it has opened a pull request to the General registry and under normal circumstances, will be merged automatically.
+JuliaRegistrator will respond saying it has opened a pull request to the General registry and under normal circumstances, will be merged automatically.
 
 ### Verify
 
