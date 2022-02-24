@@ -34,7 +34,7 @@ Run `dev/release/release_rc.sh` on working copy of `git@github.com:apache/arrow-
 $ git clone git@github.com:apache/arrow-julia.git
 $ dev/release/release_rc.sh ${RC}
 (Send a vote email to dev@arrow.apache.org.
- You can use a draft showen by release_rc.sh for the email.)
+ You can use a draft shown by release_rc.sh for the email.)
 ```
 
 Here is an example to release RC1:
