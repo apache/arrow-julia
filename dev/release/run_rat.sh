@@ -28,6 +28,7 @@ if [ ! -f "${RAT_JAR}" ]; then
   curl \
     --fail \
     --output "${RAT_JAR}" \
+    --show-error \
     --silent \
     https://repo1.maven.org/maven2/org/apache/rat/apache-rat/${RAT_VERSION}/apache-rat-${RAT_VERSION}.jar
 fi

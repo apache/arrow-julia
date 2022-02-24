@@ -95,4 +95,26 @@ JuliaRegistrator will respond saying it has opened a pull request to the General
 
 ### Verify
 
-TODO
+We have a script to verify a RC.
+
+You must install the following commands to use the script:
+
+  * `curl`
+  * `gpg`
+  * `shasum` or `sha256sum`/`sha512sum`
+
+You don't need to install Julia. If there isn't Julia in system, the latest Julia is automatically installed only for verification.
+
+To verify a RC, run the following command line:
+
+```console
+$ dev/release/verify.sh ${VERSION} ${RC}
+```
+
+Here is an example to release 2.2.1 RC1:
+
+```console
+$ dev/release/verify.sh 2.2.1 1
+```
+
+If the verification is succeeded, `RC looks good!` is shown.
