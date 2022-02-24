@@ -73,7 +73,7 @@ $ svn ci KEYS
 We need to do the followings to publish a new release:
 
   * Publish to apache.org
-  * Publish to the General Julia package registry
+  * Publish to the Julia General registry
 
 Run `dev/release/release.sh` to publish to apache.org:
 
