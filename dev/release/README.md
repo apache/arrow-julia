@@ -87,7 +87,11 @@ Here is an example to release 2.2.1 RC1:
 $ dev/release/release.sh 2.2.1 1
 ```
 
-TODO: How to use JuliaTagBot to publish to the General Julia package registry.
+To publish the release to the Julia General registry, navigate to the GitHub commit where the project version was incremented in the Project.toml file (step 2 above), then post a comment on the commit with the following:
+
+`@JuliaRegistrator register()`
+
+The TagBot will respond saying it has opened a pull request to the General registry and under normal circumstances, will be merged automatically.
 
 ### Verify
 
