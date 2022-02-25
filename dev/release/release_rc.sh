@@ -30,18 +30,29 @@ fi
 
 rc=$1
 
+: ${RELEASE_DEFAULT:=1}
+: ${RELEASE_CLEANUP:=${RELEASE_DEFAULT}}
+: ${RELEASE_PULL:=${RELEASE_DEFAULT}}
+: ${RELEASE_PUSH_TAG:=${RELEASE_DEFAULT}}
+: ${RELEASE_SIGN:=${RELEASE_DEFAULT}}
+: ${RELEASE_UPLOAD:=${RELEASE_DEFAULT}}
+
 cd "${SOURCE_TOP_DIR}"
 
-git_origin_url="$(git remote get-url origin)"
-if [ "${git_origin_url}" != "git@github.com:apache/arrow-julia.git" ]; then
-  echo "This script must be ran with working copy of apache/arrow-julia."
-  echo "The origin's URL: ${git_origin_url}"
-  exit 1
+if [ ${RELEASE_PULL} -gt 0 -o ${RELEASE_PUSH_TAG} -gt 0 ]; then
+  git_origin_url="$(git remote get-url origin)"
+  if [ "${git_origin_url}" != "git@github.com:apache/arrow-julia.git" ]; then
+    echo "This script must be ran with working copy of apache/arrow-julia."
+    echo "The origin's URL: ${git_origin_url}"
+    exit 1
+  fi
 fi
 
-echo "Ensure using the latest commit"
-git checkout main
-git pull --rebase --prune
+if [ ${RELEASE_PULL} -gt 0 ]; then
+  echo "Ensure using the latest commit"
+  git checkout main
+  git pull --rebase --prune
+fi
 
 version=$(grep -o '^version = ".*"' "Project.toml" | \
             sed -e 's/^version = "//' \
@@ -50,7 +61,9 @@ version=$(grep -o '^version = ".*"' "Project.toml" | \
 rc_tag="v${version}-rc${rc}"
 echo "Tagging for RC: ${rc_tag}"
 git tag -a -m "${version} RC${rc}" "${rc_tag}"
-git push origin "${rc_tag}"
+if [ ${RELEASE_PUSH_TAG} -gt 0 ]; then
+  git push origin "${rc_tag}"
+fi
 
 rc_hash="$(git rev-list --max-count=1 "${rc_tag}")"
 
@@ -75,8 +88,10 @@ pushd "${dev_dist_dir}/${rc_id}"
 echo "Running Rat license checker on ${tar_gz}"
 ../../run_rat.sh ${tar_gz}
 
-echo "Signing tar.gz and creating checksums"
-gpg --armor --output ${tar_gz}.asc --detach-sig ${tar_gz}
+if [ ${RELEASE_SIGN} -gt 0 ]; then
+  echo "Signing tar.gz and creating checksums"
+  gpg --armor --output ${tar_gz}.asc --detach-sig ${tar_gz}
+fi
 
 if type shasum >/dev/null 2>&1; then
   sha256_generate="shasum -a 256"
@@ -88,14 +103,18 @@ fi
 ${sha256_generate} ${tar_gz} > ${tar_gz}.sha256
 ${sha512_generate} ${tar_gz} > ${tar_gz}.sha512
 
-echo "Uploading to ${rc_url}"
-svn add .
-svn ci -m "Apache Arrow Julia ${version} ${rc}"
+if [ ${RELEASE_UPLOAD} -gt 0 ]; then
+  echo "Uploading to ${rc_url}"
+  svn add .
+  svn ci -m "Apache Arrow Julia ${version} ${rc}"
+fi
 
 popd
 
-echo "Removing temporary directory"
-rm -rf "${dev_dist_dir}"
+if [ ${RELEASE_CLEANUP} -gt 0 ]; then
+  echo "Removing temporary directory"
+  rm -rf "${dev_dist_dir}"
+fi
 
 echo "Draft email for dev@arrow.apache.org mailing list"
 echo ""
