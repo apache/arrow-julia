@@ -1,3 +1,5 @@
+#!/bin/bash
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,7 +17,24 @@
 # specific language governing permissions and limitations
 # under the License.
 
-/apache-rat-*.jar
-/dist/
-/filtered_rat.txt
-/rat.xml
+set -eu
+
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 <version> <rc>"
+  echo " e.g.: $0 2.2.1 1"
+  exit 1
+fi
+
+version=$1
+rc=$2
+
+id="apache-arrow-julia-${version}"
+echo "Copying dev/ to release/"
+svn \
+  cp \
+  -m "Apache Arrow Julia ${version}" \
+  https://dist.apache.org/repos/dist/dev/arrow/${id}-rc${rc} \
+  https://dist.apache.org/repos/dist/release/arrow/${id}
+
+echo "Success! The release is available here:"
+echo "  https://dist.apache.org/repos/dist/release/arrow/${id}"

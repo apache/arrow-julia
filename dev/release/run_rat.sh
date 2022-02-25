@@ -19,7 +19,7 @@
 
 set -eu
 
-RELEASE_DIR=$(cd "$(dirname "$BASH_SOURCE")"; pwd)
+RELEASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RAT_VERSION=0.13
 
