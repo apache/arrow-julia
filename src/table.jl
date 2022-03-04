@@ -261,6 +261,32 @@ Tables.columnnames(t::Table) = names(t)
 Tables.getcolumn(t::Table, i::Int) = columns(t)[i]
 Tables.getcolumn(t::Table, nm::Symbol) = lookup(t)[nm]
 
+function Tables.partitions(t::Table)
+    ncol = length(columns(t))
+    if ncol < 1
+      return (t,)
+    end
+    if columns(t)[1] isa ChainedVector
+      arys_of_columns = map(columns(t)) do col::ChainedVector
+        getfield(col, :arrays)
+      end
+      nbat = length(arys_of_columns[1])
+      return [
+        let cols = AbstractVector[arys_of_columns[j][i] for j = 1:ncol]
+          Table(
+            names(t),
+            types(t),
+            cols,
+            Dict(n => c for (n, c) in zip(names(t), cols)),
+            schema(t),
+            getfield(t, :metadata),
+          )
+        end for i = 1:nbat
+      ]
+    end
+    return (t,)
+  end
+  
 # high-level user API functions
 Table(input, pos::Integer=1, len=nothing; kw...) = Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
 Table(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...) = Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
