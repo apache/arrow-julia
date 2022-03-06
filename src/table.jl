@@ -272,7 +272,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
     sch = nothing
     dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
     dictencoded = Dict{Int64, Meta.Field}() # dictionary id => field
-    tsks = Channel{Task}(Inf)
+    tsks = OrderedChannel{Task}(Inf)
     tsk = Threads.@spawn begin
         i = 1
         for tsk in tsks
@@ -292,6 +292,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
         end
     end
     anyrecordbatches = false
+    batchindex = 1
     for blob in blobs
         bytes, pos, len = blob.bytes, blob.pos, blob.len
         if len > 24 &&
@@ -348,7 +349,8 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                 @debug 1 "parsing record batch message: compression = $(header.compression)"
                 put!(tsks, Threads.@spawn begin
                     collect(VectorIterator(sch, batch, dictencodings, convert))
-                end)
+                end, batchindex)
+                batchindex += 1
             else
                 throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
             end
