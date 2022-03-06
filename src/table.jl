@@ -347,9 +347,9 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
             elseif header isa Meta.RecordBatch
                 anyrecordbatches = true
                 @debug 1 "parsing record batch message: compression = $(header.compression)"
-                put!(tsks, Threads.@spawn begin
+                put!(tsks, Threads.@spawn(begin
                     collect(VectorIterator(sch, batch, dictencodings, convert))
-                end, batchindex)
+                end), batchindex)
                 batchindex += 1
             else
                 throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
