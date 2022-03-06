@@ -51,6 +51,15 @@ Supported keyword arguments to `Arrow.write` include:
 """
 function write end
 
+write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
+
+function write(file_path, tbl; kwargs...)
+    open(Writer, file_path; file=true, kwargs...) do writer
+        write(writer, tbl)
+    end
+    file_path
+end
+
 struct Message
     msgflatbuf
     columns
@@ -92,7 +101,7 @@ mutable struct Writer{T<:IO}
     isclosed::Bool
 end
 
-function Base.open(Writer, io::T, compress::Union{Nothing,LZ4FrameCompressor,<:AbstractVector{LZ4FrameCompressor},ZstdCompressor,<:AbstractVector{ZstdCompressor}}, writetofile::Bool, largelists::Bool, denseunions::Bool, dictencode::Bool, dictencodenested::Bool, alignment::Integer, maxdepth::Integer, ntasks::Integer, meta::Union{Nothing,Any}, colmeta::Union{Nothing,Any}, closeio::Bool) where {T<:IO}
+function Base.open(::Type{Writer}, io::T, compress::Union{Nothing,LZ4FrameCompressor,<:AbstractVector{LZ4FrameCompressor},ZstdCompressor,<:AbstractVector{ZstdCompressor}}, writetofile::Bool, largelists::Bool, denseunions::Bool, dictencode::Bool, dictencodenested::Bool, alignment::Integer, maxdepth::Integer, ntasks::Integer, meta::Union{Nothing,Any}, colmeta::Union{Nothing,Any}, closeio::Bool) where {T<:IO}
     if ntasks < 1
         throw(ArgumentError("ntasks keyword argument must be > 0; pass `ntasks=1` to disable multithreaded writing"))
     end
@@ -112,10 +121,10 @@ function Base.open(Writer, io::T, compress::Union{Nothing,LZ4FrameCompressor,<:A
     errorref = Ref{Any}()
     meta = _normalizemeta(meta)
     colmeta = _normalizecolmeta(colmeta)
-    Writer{T}(io, closeio, compress, writetofile, largelists, denseunions, dictencode, dictencodenested, threaded, alignment, maxdepth, meta, colmeta, msgs, schema, firstcols, dictencodings, blocks, task, anyerror, errorref, 1, false)
+    return Writer{T}(io, closeio, compress, writetofile, largelists, denseunions, dictencode, dictencodenested, threaded, alignment, maxdepth, meta, colmeta, msgs, schema, firstcols, dictencodings, blocks, task, anyerror, errorref, 1, false)
 end
 
-function Base.open(Writer, io::IO, compress::Symbol, args...)
+function Base.open(::Type{Writer}, io::IO, compress::Symbol, args...)
     compressor = if compress === :lz4
         LZ4_FRAME_COMPRESSOR
     elseif compress === :zstd
@@ -177,7 +186,7 @@ function write(writer::Writer, source)
         writer.partition_count += 1
     end
     check_errors(writer)
-    nothing
+    return
 end
 
 function Base.close(writer::Writer)
@@ -235,15 +244,6 @@ function Base.close(writer::Writer)
     writer.closeio && close(writer.io)
     writer.isclosed = true
     nothing
-end
-
-write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
-
-function write(file_path, tbl; kwargs...)
-    open(Writer, file_path; file=true, kwargs...) do writer
-        write(writer, tbl)
-    end
-    file_path
 end
 
 function write(io::IO, tbl; kwargs...)
