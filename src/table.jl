@@ -286,7 +286,7 @@ function Tables.partitions(t::Table)
     end
     return (t,)
   end
-  
+
 # high-level user API functions
 Table(input, pos::Integer=1, len=nothing; kw...) = Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
 Table(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...) = Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
@@ -298,9 +298,27 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
     sch = nothing
     dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
     dictencoded = Dict{Int64, Meta.Field}() # dictionary id => field
-    cols_of_batches = []
+    tsks = Channel{Task}(Inf)
+    tsk = Threads.@spawn begin
+        i = 1
+        for tsk in tsks
+            cols = fetch(tsk)
+            if i == 1
+                foreach(x -> push!(columns(t), x), cols)
+            elseif i == 2
+                foreach(1:length(cols)) do i
+                    columns(t)[i] = ChainedVector([columns(t)[i], cols[i]])
+                end
+            else
+                foreach(1:length(cols)) do i
+                    append!(columns(t)[i], cols[i])
+                end
+            end
+            i += 1
+        end
+    end
     anyrecordbatches = false
-    @sync for blob in blobs
+    for blob in blobs
         bytes, pos, len = blob.bytes, blob.pos, blob.len
         if len > 24 &&
             _startswith(bytes, pos, FILE_FORMAT_MAGIC_BYTES) &&
@@ -354,25 +372,16 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
             elseif header isa Meta.RecordBatch
                 anyrecordbatches = true
                 @debug 1 "parsing record batch message: compression = $(header.compression)"
-                let
-                    push!(cols_of_batches, undef)
-                    batch_idx = length(cols_of_batches)
-                    Threads.@spawn begin
-                        cols_of_batches[batch_idx] = collect(VectorIterator(sch, batch, dictencodings, convert))
-                    end
-                end
+                put!(tsks, Threads.@spawn begin
+                    collect(VectorIterator(sch, batch, dictencodings, convert))
+                end)
             else
                 throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
             end
         end
     end
-    if length(cols_of_batches) == 1
-        copy!(columns(t), cols_of_batches[1])
-    elseif length(cols_of_batches) > 1
-        for i = 1:length(cols_of_batches[1])
-            push!(columns(t), ChainedVector([b[i] for b in cols_of_batches]))
-        end
-    end
+    close(tsks)
+    wait(tsk)
     lu = lookup(t)
     ty = types(t)
     # 158; some implementations may send 0 record batches
