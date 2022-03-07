@@ -28,13 +28,14 @@ fi
 version=$1
 rc=$2
 
-id="apache-arrow-julia-${version}"
+rc_id="apache-arrow-julia-${version}-rc${rc}"
+release_id="arrow-julia-${version}"
 echo "Copying dev/ to release/"
 svn \
   cp \
   -m "Apache Arrow Julia ${version}" \
-  https://dist.apache.org/repos/dist/dev/arrow/${id}-rc${rc} \
-  https://dist.apache.org/repos/dist/release/arrow/${id}
+  https://dist.apache.org/repos/dist/dev/arrow/${rc_id} \
+  https://dist.apache.org/repos/dist/release/arrow/${release_id}
 
 echo "Success! The release is available here:"
-echo "  https://dist.apache.org/repos/dist/release/arrow/${id}"
+echo "  https://dist.apache.org/repos/dist/release/arrow/${release_id}"
