@@ -66,6 +66,8 @@ macro scopedenum(T, syms...)
     elseif !isa(T, Symbol)
         throw(ArgumentError("invalid type expression for ScopedEnum $T"))
     end
+    _typename = Symbol("_", string(typename))
+
     values = basetype[]
     seen = Set{Symbol}()
     namemap = Dict{basetype,Symbol}()
@@ -118,31 +120,30 @@ macro scopedenum(T, syms...)
     defs = Expr(:block)
     if isa(typename, Symbol)
         for (i, sym) in namemap
-            push!(defs.args, :(const $(esc(sym)) = $(esc(typename))($i)))
+            push!(defs.args, :(const $(esc(sym)) = $(esc(_typename))($i)))
         end
     end
-    _typename_str = string(typename)
-    mod = Symbol(_typename_str, last(_typename_str) == 's' ? "es" : "s")
+    mod = typename
     syms = Tuple(Base.values(namemap))
     blk = quote
         module $(esc(mod))
-            export $(esc(typename))
+            export $(esc(_typename))
             # enum definition
-            primitive type $(esc(typename)) <: ScopedEnum{$(basetype)} $(sizeof(basetype) * 8) end
-            function $(esc(typename))(x::Integer)
-                $(Base.Enums.membershiptest(:x, values)) || Base.Enums.enum_argument_error($(Expr(:quote, typename)), x)
-                return Core.bitcast($(esc(typename)), convert($(basetype), x))
+            primitive type $(esc(_typename)) <: ScopedEnum{$(basetype)} $(sizeof(basetype) * 8) end
+            function $(esc(_typename))(x::Integer)
+                $(Base.Enums.membershiptest(:x, values)) || Base.Enums.enum_argument_error($(Expr(:quote, _typename)), x)
+                return Core.bitcast($(esc(_typename)), convert($(basetype), x))
             end
             if isdefined(Base.Enums, :namemap)
-                Base.Enums.namemap(::Type{$(esc(typename))}) = $(esc(namemap))
+                Base.Enums.namemap(::Type{$(esc(_typename))}) = $(esc(namemap))
             end
-            Base.typemin(x::Type{$(esc(typename))}) = $(esc(typename))($lo)
-            Base.typemax(x::Type{$(esc(typename))}) = $(esc(typename))($hi)
-            let insts = (Any[ $(esc(typename))(v) for v in $values ]...,)
-                Base.instances(::Type{$(esc(typename))}) = insts
+            Base.typemin(x::Type{$(esc(_typename))}) = $(esc(_typename))($lo)
+            Base.typemax(x::Type{$(esc(_typename))}) = $(esc(_typename))($hi)
+            let insts = (Any[ $(esc(_typename))(v) for v in $values ]...,)
+                Base.instances(::Type{$(esc(_typename))}) = insts
             end
-            FlatBuffers.basetype(::$(esc(typename))) = $(basetype)
-            FlatBuffers.basetype(::Type{$(esc(typename))}) = $(basetype)
+            FlatBuffers.basetype(::$(esc(_typename))) = $(basetype)
+            FlatBuffers.basetype(::Type{$(esc(_typename))}) = $(basetype)
             $defs
         end
     end
