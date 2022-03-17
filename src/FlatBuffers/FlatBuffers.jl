@@ -144,8 +144,6 @@ macro scopedenum(T, syms...)
             FlatBuffers.basetype(::$(esc(typename))) = $(basetype)
             FlatBuffers.basetype(::Type{$(esc(typename))}) = $(basetype)
             $defs
-            #Base.getproperty(::Type{$(esc(typename))}, sym::Symbol) = sym in $syms ? getfield($(esc(mod)), sym) : getfield($(esc(typename)), sym)
-            export $(syms...)
         end
     end
     push!(blk.args, :nothing)
