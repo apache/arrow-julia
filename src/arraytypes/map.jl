@@ -51,7 +51,10 @@ function arrowvector(::MapKind, x, i, nl, fi, de, ded, meta; largelists::Bool=fa
     validity = ValidityBitmap(x)
     ET = eltype(x)
     DT = Base.nonmissingtype(ET)
-    KT = KeyValue{keytype(DT), valtype(DT)}
+    KDT, VDT = keytype(DT), valtype(DT)
+    ArrowTypes.concrete_or_concreteunion(KDT) || throw(ArgumentError("`keytype(d)` must be concrete to serialize map-like `d`, but `keytype(d) == $KDT`"))
+    ArrowTypes.concrete_or_concreteunion(VDT) || throw(ArgumentError("`valtype(d)` must be concrete to serialize map-like `d`, but `valtype(d) == $VDT`"))
+    KT = KeyValue{KDT,VDT}
     VT = Vector{KT}
     T = DT !== ET ? Union{Missing, VT} : VT
     flat = ToList(T[keyvalues(KT, y) for y in x]; largelists=largelists)
