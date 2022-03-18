@@ -490,12 +490,24 @@ t2 = (
 # https://github.com/apache/arrow-julia/issues/253
 @test Arrow.toidict(Pair{String, String}[]) == Base.ImmutableDict{String, String}()
 
+# https://github.com/apache/arrow-julia/issues/232
 t = (; x=[Dict(true => 1.32, 1.2 => 0.53495216)])
 @test_throws ArgumentError("`keytype(d)` must be concrete to serialize map-like `d`, but `keytype(d) == Real`") Arrow.tobuffer(t)
 t = (; x=[Dict(32.0 => true, 1.2 => 0.53495216)])
 @test_throws ArgumentError("`valtype(d)` must be concrete to serialize map-like `d`, but `valtype(d) == Real`") Arrow.tobuffer(t)
 t = (; x=[Dict(true => 1.32, 1.2 => true)])
 @test_throws ArgumentError("`keytype(d)` must be concrete to serialize map-like `d`, but `keytype(d) == Real`") Arrow.tobuffer(t)
+
+# https://github.com/apache/arrow-julia/issues/214
+t1 = (; x = [(Nanosecond(42),)])
+t2 = Arrow.Table(Arrow.tobuffer(t1))
+t3 = Arrow.Table(Arrow.tobuffer(t2))
+@test t3.x == t1.x
+
+t1 = (; x = [(; a=Nanosecond(i), b=Nanosecond(i+1)) for i = 1:5])
+t2 = Arrow.Table(Arrow.tobuffer(t1))
+t3 = Arrow.Table(Arrow.tobuffer(t2))
+@test t3.x == t1.x
 
 end # @testset "misc"
 
