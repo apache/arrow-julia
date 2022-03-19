@@ -359,6 +359,8 @@ function arrowtype(b, ::Type{Duration{U}}) where {U}
     return Meta.Duration, Meta.durationEnd(b), nothing
 end
 
+arrowtype(b, ::Type{P}) where {P <: Dates.Period} = arrowtype(b, Duration{arrowperiodtype(P)})
+
 arrowperiodtype(P) = Meta.TimeUnit.SECOND
 arrowperiodtype(::Type{Dates.Millisecond}) = Meta.TimeUnit.MILLISECOND
 arrowperiodtype(::Type{Dates.Microsecond}) = Meta.TimeUnit.MICROSECOND
