@@ -332,7 +332,7 @@ tbl = Arrow.Table(Arrow.tobuffer(t))
 
 # 166
 t = (
-    col1=[zero(Arrow.Timestamp{Arrow.Meta.TimeUnits.NANOSECOND, nothing})],
+    col1=[zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.NANOSECOND, nothing})],
 )
 tbl = Arrow.Table(Arrow.tobuffer(t))
 @test_logs (:warn, r"automatically converting Arrow.Timestamp with precision = NANOSECOND") begin
@@ -342,8 +342,8 @@ end
 # 95; Arrow.ToTimestamp
 x = [ZonedDateTime(Dates.DateTime(2020), tz"Europe/Paris")]
 c = Arrow.ToTimestamp(x)
-@test eltype(c) == Arrow.Timestamp{Arrow.Flatbuf.TimeUnits.MILLISECOND, Symbol("Europe/Paris")}
-@test c[1] == Arrow.Timestamp{Arrow.Flatbuf.TimeUnits.MILLISECOND, Symbol("Europe/Paris")}(1577836800000)
+@test eltype(c) == Arrow.Timestamp{Arrow.Flatbuf.TimeUnit.MILLISECOND, Symbol("Europe/Paris")}
+@test c[1] == Arrow.Timestamp{Arrow.Flatbuf.TimeUnit.MILLISECOND, Symbol("Europe/Paris")}(1577836800000)
 
 # 158
 # arrow ipc stream generated from pyarrow with no record batches

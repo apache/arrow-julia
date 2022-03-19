@@ -17,7 +17,7 @@
 # Union arrays
 # need a custom representation of Union types since arrow unions
 # are ordered, and possibly indirected via separate typeIds array
-# here, T is Meta.UnionModes.Dense or Meta.UnionModes.Sparse,
+# here, T is Meta.UnionMode.Dense or Meta.UnionMode.Sparse,
 # typeIds is a NTuple{N, Int32}, and U is a Tuple{...} of the
 # unioned types
 struct UnionT{T, typeIds, U}
@@ -93,7 +93,7 @@ end
 
 # convenience wrappers for signaling that an array shoudld be written
 # as with dense/sparse union arrow buffers
-struct DenseUnionVector{T, U} <: AbstractVector{UnionT{Meta.UnionModes.Dense, nothing, U}}
+struct DenseUnionVector{T, U} <: AbstractVector{UnionT{Meta.UnionMode.Dense, nothing, U}}
     itr::T
 end
 
@@ -118,7 +118,7 @@ function todense(::Type{UnionT{T, typeIds, U}}, x) where {T, typeIds, U}
     return types, offsets, data
 end
 
-struct SparseUnionVector{T, U} <: AbstractVector{UnionT{Meta.UnionModes.Sparse, nothing, U}}
+struct SparseUnionVector{T, U} <: AbstractVector{UnionT{Meta.UnionMode.Sparse, nothing, U}}
     itr::T
 end
 
@@ -214,7 +214,7 @@ arrowvector(::UnionKind, x::Union{DenseUnion, SparseUnion}, i, nl, fi, de, ded, 
 
 function arrowvector(::UnionKind, x, i, nl, fi, de, ded, meta; kw...)
     UT = eltype(x)
-    if unionmode(UT) == Meta.UnionModes.Dense
+    if unionmode(UT) == Meta.UnionMode.Dense
         x = x isa DenseUnionVector ? x.itr : x
         typeids, offsets, data = todense(UT, x)
         data2 = map(y -> arrowvector(y[2], i, nl + 1, y[1], de, ded, nothing; kw...), enumerate(data))

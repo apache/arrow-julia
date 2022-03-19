@@ -164,7 +164,7 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
             dicts = FlatBuffers.UOffsetT(0)
         end
         Meta.footerStart(b)
-        Meta.footerAddVersion(b, Meta.MetadataVersions.V4)
+        Meta.footerAddVersion(b, Meta.MetadataVersion.V4)
         Meta.footerAddSchema(b, schfoot)
         Meta.footerAddDictionaries(b, dicts)
         Meta.footerAddRecordBatches(b, recordbatches)
@@ -271,7 +271,7 @@ end
 function makemessage(b, headerType, header, columns=nothing, bodylen=0)
     # write the message flatbuffer object
     Meta.messageStart(b)
-    Meta.messageAddVersion(b, Meta.MetadataVersions.V5)
+    Meta.messageAddVersion(b, Meta.MetadataVersion.V5)
     Meta.messageAddHeaderType(b, headerType)
     Meta.messageAddHeader(b, header)
     Meta.messageAddBodyLength(b, Int64(bodylen))
@@ -312,7 +312,7 @@ function makeschema(b, sch::Tables.Schema{names}, columns) where {names}
     end
     # write schema object
     Meta.schemaStart(b)
-    Meta.schemaAddEndianness(b, Meta.Endiannesses.Little)
+    Meta.schemaAddEndianness(b, Meta.Endianness.Little)
     Meta.schemaAddFields(b, fields)
     Meta.schemaAddCustomMetadata(b, meta)
     return Meta.schemaEnd(b)
@@ -443,7 +443,7 @@ function makerecordbatch(b, sch::Tables.Schema{names, types}, columns, alignment
     if compress !== nothing
         Meta.bodyCompressionStart(b)
         Meta.bodyCompressionAddCodec(b, compress)
-        Meta.bodyCompressionAddMethod(b, Meta.BodyCompressionMethods.BUFFER)
+        Meta.bodyCompressionAddMethod(b, Meta.BodyCompressionMethod.BUFFER)
         compression = Meta.bodyCompressionEnd(b)
     else
         compression = FlatBuffers.UOffsetT(0)
