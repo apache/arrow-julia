@@ -39,16 +39,16 @@ Base.eltype(c::Compressed{Z, A}) where {Z, A} = eltype(A)
 getmetadata(x::Compressed) = getmetadata(x.data)
 compressiontype(c::Compressed{Z}) where {Z} = Z
 
-function compress(Z::Meta.CompressionType, comp, x::Array)
+function compress(Z::Meta.CompressionType.__TYPE__, comp, x::Array)
     GC.@preserve x begin
         y = unsafe_wrap(Array, convert(Ptr{UInt8}, pointer(x)), sizeof(x))
         return CompressedBuffer(transcode(comp, y), length(y))
     end
 end
 
-compress(Z::Meta.CompressionType, comp, x) = compress(Z, comp, convert(Array, x))
+compress(Z::Meta.CompressionType.__TYPE__, comp, x) = compress(Z, comp, convert(Array, x))
 
-compress(Z::Meta.CompressionType, comp, v::ValidityBitmap) =
+compress(Z::Meta.CompressionType.__TYPE__, comp, v::ValidityBitmap) =
     v.nc == 0 ? CompressedBuffer(UInt8[], 0) : compress(Z, comp, view(v.bytes, v.pos:(v.pos + cld(v.ℓ, 8) - 1)))
 
 function makenodesbuffers!(col::Compressed, fieldnodes, fieldbuffers, bufferoffset, alignment)

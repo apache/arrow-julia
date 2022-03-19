@@ -107,7 +107,7 @@ Base.propertynames(x::Union) = (:mode, :typeIds)
 function Base.getproperty(x::Union, field::Symbol)
     if field === :mode
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), UnionMode)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), UnionMode.__TYPE__)
         return UnionMode.Sparse
     elseif field === :typeIds
         o = FlatBuffers.offset(x, 6)
@@ -117,7 +117,7 @@ function Base.getproperty(x::Union, field::Symbol)
 end
 
 unionStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 2)
-unionAddMode(b::FlatBuffers.Builder, mode::UnionMode) = FlatBuffers.prependslot!(b, 0, mode, 0)
+unionAddMode(b::FlatBuffers.Builder, mode::UnionMode.__TYPE__) = FlatBuffers.prependslot!(b, 0, mode, 0)
 unionAddTypeIds(b::FlatBuffers.Builder, typeIds::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 1, typeIds, 0)
 unionStartTypeIdsVector(b::FlatBuffers.Builder, numelems) = FlatBuffers.startvector!(b, 4, numelems, 4)
 unionEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
@@ -165,7 +165,7 @@ function Base.getproperty(x::FloatingPoint, field::Symbol)
 end
 
 floatingPointStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 1)
-floatingPointAddPrecision(b::FlatBuffers.Builder, precision::Precision) = FlatBuffers.prependslot!(b, 0, precision, 0)
+floatingPointAddPrecision(b::FlatBuffers.Builder, precision::Precision.__TYPE__) = FlatBuffers.prependslot!(b, 0, precision, 0)
 floatingPointEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
 struct Utf8 <: FlatBuffers.Table
@@ -286,7 +286,7 @@ function Base.getproperty(x::Date, field::Symbol)
 end
 
 dateStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 1)
-dateAddUnit(b::FlatBuffers.Builder, unit::DateUnit) = FlatBuffers.prependslot!(b, 0, unit, 1)
+dateAddUnit(b::FlatBuffers.Builder, unit::DateUnit.__TYPE__) = FlatBuffers.prependslot!(b, 0, unit, 1)
 dateEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
 FlatBuffers.@scopedenum TimeUnit::Int16 SECOND MILLISECOND MICROSECOND NANOSECOND
@@ -312,7 +312,7 @@ function Base.getproperty(x::Time, field::Symbol)
 end
 
 timeStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 2)
-timeAddUnit(b::FlatBuffers.Builder, unit::TimeUnit) = FlatBuffers.prependslot!(b, 0, unit, 1)
+timeAddUnit(b::FlatBuffers.Builder, unit::TimeUnit.__TYPE__) = FlatBuffers.prependslot!(b, 0, unit, 1)
 timeAddBitWidth(b::FlatBuffers.Builder, bitwidth::Int32) = FlatBuffers.prependslot!(b, 1, bitwidth, 32)
 timeEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
@@ -336,7 +336,7 @@ function Base.getproperty(x::Timestamp, field::Symbol)
 end
 
 timestampStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 2)
-timestampAddUnit(b::FlatBuffers.Builder, unit::TimeUnit) = FlatBuffers.prependslot!(b, 0, unit, 0)
+timestampAddUnit(b::FlatBuffers.Builder, unit::TimeUnit.__TYPE__) = FlatBuffers.prependslot!(b, 0, unit, 0)
 timestampAddTimezone(b::FlatBuffers.Builder, timezone::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 1, timezone, 0)
 timestampEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
@@ -359,7 +359,7 @@ function Base.getproperty(x::Interval, field::Symbol)
 end
 
 intervalStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 1)
-intervalAddUnit(b::FlatBuffers.Builder, unit::IntervalUnit) = FlatBuffers.prependslot!(b, 0, unit, 0)
+intervalAddUnit(b::FlatBuffers.Builder, unit::IntervalUnit.__TYPE__) = FlatBuffers.prependslot!(b, 0, unit, 0)
 intervalEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
 struct Duration <: FlatBuffers.Table
@@ -379,7 +379,7 @@ function Base.getproperty(x::Duration, field::Symbol)
 end
 
 durationStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 1)
-durationAddUnit(b::FlatBuffers.Builder, unit::TimeUnit) = FlatBuffers.prependslot!(b, 0, unit, 1)
+durationAddUnit(b::FlatBuffers.Builder, unit::TimeUnit.__TYPE__) = FlatBuffers.prependslot!(b, 0, unit, 1)
 durationEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
 function Type(b::UInt8)
@@ -481,7 +481,7 @@ function Base.getproperty(x::DictionaryEncoding, field::Symbol)
         return false
     elseif field === :dictionaryKind
         o = FlatBuffers.offset(x, 10)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), DictionaryKind)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), DictionaryKind.__TYPE__)
     end
     return nothing
 end
@@ -586,7 +586,7 @@ Base.propertynames(x::Schema) = (:endianness, :fields, :custom_metadata)
 function Base.getproperty(x::Schema, field::Symbol)
     if field === :endianness
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), Endianness)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), Endianness.__TYPE__)
     elseif field === :fields
         o = FlatBuffers.offset(x, 6)
         if o != 0
@@ -602,7 +602,7 @@ function Base.getproperty(x::Schema, field::Symbol)
 end
 
 schemaStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 3)
-schemaAddEndianness(b::FlatBuffers.Builder, endianness::Endianness) = FlatBuffers.prependslot!(b, 0, endianness, 0)
+schemaAddEndianness(b::FlatBuffers.Builder, endianness::Endianness.__TYPE__) = FlatBuffers.prependslot!(b, 0, endianness, 0)
 schemaAddFields(b::FlatBuffers.Builder, fields::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 1, fields, 0)
 schemaStartFieldsVector(b::FlatBuffers.Builder, numelems) = FlatBuffers.startvector!(b, 4, numelems, 4)
 schemaAddCustomMetadata(b::FlatBuffers.Builder, custommetadata::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 2, custommetadata, 0)

@@ -160,7 +160,7 @@ Base.@propagate_inbounds function Base.getindex(A::ToSparseUnion{T}, i::Integer)
     return @inbounds x isa T ? x : ArrowTypes.default(T)
 end
 
-function compress(Z::Meta.CompressionType, comp, x::A) where {A <: DenseUnion}
+function compress(Z::Meta.CompressionType.__TYPE__, comp, x::A) where {A <: DenseUnion}
     len = length(x)
     nc = nullcount(x)
     typeIds = compress(Z, comp, x.typeIds)
@@ -229,7 +229,7 @@ function arrowvector(::UnionKind, x, i, nl, fi, de, ded, meta; kw...)
     end
 end
 
-function compress(Z::Meta.CompressionType, comp, x::A) where {A <: SparseUnion}
+function compress(Z::Meta.CompressionType.__TYPE__, comp, x::A) where {A <: SparseUnion}
     len = length(x)
     nc = nullcount(x)
     typeIds = compress(Z, comp, x.typeIds)

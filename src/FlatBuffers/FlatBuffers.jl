@@ -66,7 +66,7 @@ macro scopedenum(T, syms...)
     elseif !isa(T, Symbol)
         throw(ArgumentError("invalid type expression for ScopedEnum $T"))
     end
-    _typename = Symbol("_", string(typename))
+    _typename = :__TYPE__ 
 
     values = basetype[]
     seen = Set{Symbol}()

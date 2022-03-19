@@ -77,7 +77,7 @@ function arrowvector(::BoolKind, x, i, nl, fi, de, ded, meta; kw...)
     return BoolVector{eltype(x)}(bytes, 1, validity, len, meta)
 end
 
-function compress(Z::Meta.CompressionType, comp, p::P) where {P <: BoolVector}
+function compress(Z::Meta.CompressionType.__TYPE__, comp, p::P) where {P <: BoolVector}
     len = length(p)
     nc = nullcount(p)
     validity = compress(Z, comp, p.validity)

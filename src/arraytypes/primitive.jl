@@ -70,7 +70,7 @@ function arrowvector(::PrimitiveKind, x, i, nl, fi, de, ded, meta; kw...)
     return Primitive(eltype(x), UInt8[], validity, x, length(x), meta)
 end
 
-function compress(Z::Meta.CompressionType, comp, p::P) where {P <: Primitive}
+function compress(Z::Meta.CompressionType.__TYPE__, comp, p::P) where {P <: Primitive}
     len = length(p)
     nc = nullcount(p)
     validity = compress(Z, comp, p.validity)

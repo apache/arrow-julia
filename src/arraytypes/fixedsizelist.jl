@@ -121,7 +121,7 @@ function arrowvector(::FixedSizeListKind{N, T}, x, i, nl, fi, de, ded, meta; kw.
     return FixedSizeList{S, typeof(data)}(UInt8[], validity, data, len, meta)
 end
 
-function compress(Z::Meta.CompressionType, comp, x::FixedSizeList{T, A}) where {T, A}
+function compress(Z::Meta.CompressionType.__TYPE__, comp, x::FixedSizeList{T, A}) where {T, A}
     len = length(x)
     nc = nullcount(x)
     validity = compress(Z, comp, x.validity)

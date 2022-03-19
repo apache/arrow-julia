@@ -95,7 +95,7 @@ Base.size(v::NullVector) = (length(v.data),)
 Base.getindex(v::NullVector{T}, i::Int) where {T} = ArrowTypes.fromarrow(T, getindex(v.data, i))
 
 arrowvector(::NullKind, x, i, nl, fi, de, ded, meta; kw...) = NullVector{eltype(x)}(MissingVector(length(x)), isnothing(meta) ? nothing : toidict(meta))
-compress(Z::Meta.CompressionType, comp, v::NullVector) =
+compress(Z::Meta.CompressionType.__TYPE__, comp, v::NullVector) =
     Compressed{Z, NullVector}(v, CompressedBuffer[], length(v), length(v), Compressed[])
 
 function makenodesbuffers!(col::NullVector, fieldnodes, fieldbuffers, bufferoffset, alignment)

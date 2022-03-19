@@ -271,7 +271,7 @@ function Base.copy(x::DictEncoded{T, S}) where {T, S}
     return PooledArray(PooledArrays.RefArray(refs), Dict{T, S}(val => i for (i, val) in enumerate(pool)), pool)
 end
 
-function compress(Z::Meta.CompressionType, comp, x::A) where {A <: DictEncoded}
+function compress(Z::Meta.CompressionType.__TYPE__, comp, x::A) where {A <: DictEncoded}
     len = length(x)
     nc = nullcount(x)
     validity = compress(Z, comp, x.validity)

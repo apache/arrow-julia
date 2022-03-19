@@ -178,7 +178,7 @@ end
 const DATE = Date{Meta.DateUnit.DAY, Int32}
 Base.zero(::Type{Date{U, T}}) where {U, T} = Date{U, T}(T(0))
 storagetype(::Type{Date{U, T}}) where {U, T} = T
-bitwidth(x::Meta.DateUnit) = x == Meta.DateUnit.DAY ? Int32 : Int64
+bitwidth(x::Meta.DateUnit.__TYPE__) = x == Meta.DateUnit.DAY ? Int32 : Int64
 Date{Meta.DateUnit.DAY}(days) = DATE(Int32(days))
 Date{Meta.DateUnit.MILLISECOND}(ms) = Date{Meta.DateUnit.MILLISECOND, Int64}(Int64(ms))
 
@@ -215,12 +215,12 @@ end
 Base.zero(::Type{Time{U, T}}) where {U, T} = Time{U, T}(T(0))
 const TIME = Time{Meta.TimeUnit.NANOSECOND, Int64}
 
-bitwidth(x::Meta.TimeUnit) = x == Meta.TimeUnit.SECOND || x == Meta.TimeUnit.MILLISECOND ? Int32 : Int64
-Time{U}(x) where {U <: Meta.TimeUnit} = Time{U, bitwidth(U)}(bitwidth(U)(x))
+bitwidth(x::Meta.TimeUnit.__TYPE__) = x == Meta.TimeUnit.SECOND || x == Meta.TimeUnit.MILLISECOND ? Int32 : Int64
+Time{U}(x) where {U <: Meta.TimeUnit.__TYPE__} = Time{U, bitwidth(U)}(bitwidth(U)(x))
 storagetype(::Type{Time{U, T}}) where {U, T} = T
 juliaeltype(f::Meta.Field, x::Meta.Time, convert) = Time{x.unit, bitwidth(x.unit)}
 finaljuliatype(::Type{<:Time}) = Dates.Time
-periodtype(U::Meta.TimeUnit) = U === Meta.TimeUnit.SECOND ? Dates.Second :
+periodtype(U::Meta.TimeUnit.__TYPE__) = U === Meta.TimeUnit.SECOND ? Dates.Second :
                                U === Meta.TimeUnit.MILLISECOND ? Dates.Millisecond :
                                U === Meta.TimeUnit.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
 Base.convert(::Type{Dates.Time}, x::Time{U, T}) where {U, T} = Dates.Time(Dates.Nanosecond(Dates.tons(periodtype(U)(x.x))))
@@ -326,7 +326,7 @@ end
 
 Base.zero(::Type{Interval{U, T}}) where {U, T} = Interval{U, T}(T(0))
 
-bitwidth(x::Meta.IntervalUnit) = x == Meta.IntervalUnit.YEAR_MONTH ? Int32 : Int64
+bitwidth(x::Meta.IntervalUnit.__TYPE__) = x == Meta.IntervalUnit.YEAR_MONTH ? Int32 : Int64
 Interval{Meta.IntervalUnit.YEAR_MONTH}(x) = Interval{Meta.IntervalUnit.YEAR_MONTH, Int32}(Int32(x))
 Interval{Meta.IntervalUnit.DAY_TIME}(x) = Interval{Meta.IntervalUnit.DAY_TIME, Int64}(Int64(x))
 

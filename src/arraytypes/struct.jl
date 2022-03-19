@@ -94,7 +94,7 @@ function arrowvector(::StructKind, x, i, nl, fi, de, ded, meta; kw...)
     return Struct{withmissing(eltype(x), namedtupletype(T, data)), typeof(data)}(validity, data, len, meta)
 end
 
-function compress(Z::Meta.CompressionType, comp, x::A) where {A <: Struct}
+function compress(Z::Meta.CompressionType.__TYPE__, comp, x::A) where {A <: Struct}
     len = length(x)
     nc = nullcount(x)
     validity = compress(Z, comp, x.validity)
