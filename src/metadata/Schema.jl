@@ -158,7 +158,7 @@ Base.propertynames(x::FloatingPoint) = (:precision,)
 function Base.getproperty(x::FloatingPoint, field::Symbol)
     if field === :precision
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), Precision)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), Precision.__TYPE__)
         return Precision.HALF
     end
     return nothing
@@ -279,7 +279,7 @@ Base.propertynames(x::Date) = (:unit,)
 function Base.getproperty(x::Date, field::Symbol)
     if field === :unit
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), DateUnit)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), DateUnit.__TYPE__)
         return DateUnit.MILLISECOND
     end
     return nothing
@@ -301,7 +301,7 @@ Base.propertynames(x::Time) = (:unit, :bitWidth)
 function Base.getproperty(x::Time, field::Symbol)
     if field === :unit
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), TimeUnit)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), TimeUnit.__TYPE__)
         return TimeUnit.MILLISECOND
     elseif field === :bitWidth
         o = FlatBuffers.offset(x, 6)
@@ -326,7 +326,7 @@ Base.propertynames(x::Timestamp) = (:unit, :timezone)
 function Base.getproperty(x::Timestamp, field::Symbol)
     if field === :unit
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), TimeUnit)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), TimeUnit.__TYPE__)
         return TimeUnit.SECOND
     elseif field === :timezone
         o = FlatBuffers.offset(x, 6)
@@ -352,7 +352,7 @@ Base.propertynames(x::Interval) = (:unit,)
 function Base.getproperty(x::Interval, field::Symbol)
     if field === :unit
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), IntervalUnit)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), IntervalUnit.__TYPE__)
         return IntervalUnit.YEAR_MONTH
     end
     return nothing
@@ -372,7 +372,7 @@ Base.propertynames(x::Duration) = (:unit,)
 function Base.getproperty(x::Duration, field::Symbol)
     if field === :unit
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), TimeUnit)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), TimeUnit.__TYPE__)
         return TimeUnit.MILLISECOND
     end
     return nothing
