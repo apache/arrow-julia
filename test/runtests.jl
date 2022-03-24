@@ -509,6 +509,24 @@ t2 = Arrow.Table(Arrow.tobuffer(t1))
 t3 = Arrow.Table(Arrow.tobuffer(t2))
 @test t3.x == t1.x
 
+@testset "Writer" begin
+    io = IOBuffer()
+    writer = open(Arrow.Writer, io)
+    a = 1:26
+    b = 'A':'Z'
+    partitionsize = 10
+    iter_a = Iterators.partition(a, partitionsize)
+    iter_b = Iterators.partition(b, partitionsize)
+    for (part_a, part_b) in zip(iter_a, iter_b)
+        Arrow.write(writer, (a = part_a, b = part_b))
+    end
+    close(writer)
+    seekstart(io)
+    table = Arrow.Table(io)
+    @test table.a == collect(a)
+    @test table.b == collect(b)
+end
+
 end # @testset "misc"
 
 end

@@ -75,6 +75,39 @@ struct Block
     bodyLength::Int64
 end
 
+"""
+    Arrow.Writer{T<:IO}
+
+An object that can be used to incrementally write Arrow partitions
+
+# Examples
+```julia
+julia> writer = open(Arrow.Writer, tempname())
+
+julia> partition1 = (col1 = [1, 2], col2 = ["A", "B"])
+(col1 = [1, 2], col2 = ["A", "B"])
+
+julia> Arrow.write(writer, partition1)
+
+julia> partition2 = (col1 = [3, 4], col2 = ["C", "D"])
+(col1 = [3, 4], col2 = ["C", "D"])
+
+julia> Arrow.write(writer, partition2)
+
+julia> close(writer)
+```
+
+It's also possible to automatically close the Writer using a do-block:
+
+```julia
+julia> open(Arrow.Writer, tempname()) do writer
+           partition2 = (col1 = [1, 2], col2 = ["A", "B"])
+           Arrow.write(writer, partition1)
+           partition2 = (col1 = [3, 4], col2 = ["C", "D"])
+           Arrow.write(writer, partition1)
+       end
+```
+"""
 mutable struct Writer{T<:IO}
     io::T
     closeio::Bool
