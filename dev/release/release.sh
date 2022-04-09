@@ -30,12 +30,41 @@ rc=$2
 
 rc_id="apache-arrow-julia-${version}-rc${rc}"
 release_id="arrow-julia-${version}"
-echo "Copying dev/ to release/"
+echo "Move from dev/ to release/"
 svn \
-  cp \
+  mv \
   -m "Apache Arrow Julia ${version}" \
   https://dist.apache.org/repos/dist/dev/arrow/${rc_id} \
   https://dist.apache.org/repos/dist/release/arrow/${release_id}
+
+echo "Remove all RCs"
+old_rcs=$(
+  svn ls https://dist.apache.org/repos/dist/dev/arrow/ | \
+  grep -E '^apache-arrow-julia-' | \
+  sort --version-sort --reverse
+)
+for old_rc in $old_rcs; do
+  echo "Remove RC ${old_rc}"
+  svn \
+    delete \
+    -m "Remove old Apache Arrow Julia RC: ${old_rc}" \
+    https://dist.apache.org/repos/dist/dev/arrow/${old_rc}
+done
+
+echo "Keep only the latest versions"
+old_releases=$(
+  svn ls https://dist.apache.org/repos/dist/release/arrow/ | \
+  grep -E '^arrow-julia-' | \
+  sort --version-sort --reverse | \
+  tail -n +2
+)
+for old_release_version in $old_releases; do
+  echo "Remove old release ${old_release_version}"
+  svn \
+    delete \
+    -m "Remove old Apache Arrow Julia release: ${old_release_version}" \
+    https://dist.apache.org/repos/dist/release/arrow/${old_release_version}
+done
 
 echo "Success! The release is available here:"
 echo "  https://dist.apache.org/repos/dist/release/arrow/${release_id}"
