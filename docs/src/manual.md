@@ -229,6 +229,10 @@ csv_parts = Tables.partitioner(CSV.File, csv_files)
 Arrow.write(io, csv_parts)
 ```
 
+### `Arrow.Writer`
+
+With `Arrow.Writer`, you instantiate an `Arrow.Writer` object, write sources using it, and then close it.  This allows for incrmental writes to the same sink.  It is similar to `Arrow.append` without having to close and re-open the sink in between writes and without the limitation of only supporting the IPC stream format.
+
 ### Multithreaded writing
 
 By default, `Arrow.write` will use multiple threads to write multiple
