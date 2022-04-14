@@ -39,3 +39,6 @@ svn \
 
 echo "Success! The release is available here:"
 echo "  https://dist.apache.org/repos/dist/release/arrow/${release_id}"
+echo
+echo "Add this release to ASF's report database:"
+echo "  https://reporter.apache.org/addrelease.html?arrow"

@@ -87,6 +87,8 @@ Here is an example to release 2.2.1 RC1:
 $ dev/release/release.sh 2.2.1 1
 ```
 
+Add the release to ASF's report database via [Apache Committee Report Helper](https://reporter.apache.org/addrelease.html?arrow).
+
 To publish the release to the Julia General registry, navigate to the GitHub commit where the project version was incremented in the Project.toml file (step 2 above), then post a comment on the commit with the following:
 
 `@JuliaRegistrator register()`
