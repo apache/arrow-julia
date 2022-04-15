@@ -108,13 +108,13 @@ You don't need to install Julia. If there isn't Julia in system, the latest Juli
 To verify a RC, run the following command line:
 
 ```console
-$ dev/release/verify.sh ${VERSION} ${RC}
+$ dev/release/verify_rc.sh ${VERSION} ${RC}
 ```
 
 Here is an example to release 2.2.1 RC1:
 
 ```console
-$ dev/release/verify.sh 2.2.1 1
+$ dev/release/verify_rc.sh 2.2.1 1
 ```
 
 If the verification is succeeded, `RC looks good!` is shown.
