@@ -55,13 +55,6 @@ changes to ArrowTypes.jl are immediately available to Arrow.jl without requiring
 julia --project -e 'using Pkg; Pkg.develop(path="src/ArrowTypes")'
 ```
 
-## Difference between this code and the apache/arrow/julia/Arrow repository
-
-The code in the apache/arrow repository is officially part of the apache/arrow project and as such follows the regulated release cadence of the entire project, following standard community
-voting protocols. The JuliaData/Arrow.jl repository can be viewed as a sort of "dev" or "latest" branch of this code that may release more frequently, but without following
-official apache release guidelines. The two repositories are synced, however, so any bugfix patches in JuliaData will be upstreamed to apache/arrow for each release.
-
-
 ## Format Support
 
 This implementation supports the 1.0 version of the specification, including support for:
