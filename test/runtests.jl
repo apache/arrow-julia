@@ -344,7 +344,7 @@ end
 x = [ZonedDateTime(Dates.DateTime(2020), tz"Europe/Paris")]
 c = Arrow.ToTimestamp(x)
 @test eltype(c) == Arrow.Timestamp{Arrow.Flatbuf.TimeUnits.MILLISECOND, Symbol("Europe/Paris")}
-@test c[1] == Arrow.Timestamp{Arrow.Flatbuf.TimeUnits.MILLISECOND, Symbol("Europe/Paris")}(1577836800000)
+@test c[1] == Arrow.Timestamp{Arrow.Flatbuf.TimeUnits.MILLISECOND, Symbol("Europe/Paris")}(1577833200000)
 
 # 158
 # arrow ipc stream generated from pyarrow with no record batches
