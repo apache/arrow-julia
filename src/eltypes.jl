@@ -262,7 +262,7 @@ finaljuliatype(::Type{Timestamp{U, nothing}}) where {U} = DateTime
 
 function Base.convert(::Type{ZonedDateTime}, x::Timestamp{U, TZ}) where {U, TZ}
     (U === Meta.TimeUnits.MICROSECOND || U == Meta.TimeUnits.NANOSECOND) && warntimestamp(U, ZonedDateTime)
-    return ZonedDateTime(Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME))), TimeZone(String(TZ)))
+    return ZonedDateTime(Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME))), TimeZone(String(TZ)); from_utc=true)
 end
 
 function Base.convert(::Type{DateTime}, x::Timestamp{U, nothing}) where {U}
@@ -271,7 +271,7 @@ function Base.convert(::Type{DateTime}, x::Timestamp{U, nothing}) where {U}
 end
 
 Base.convert(::Type{Timestamp{Meta.TimeUnits.MILLISECOND, TZ}}, x::ZonedDateTime) where {TZ} =
-    Timestamp{Meta.TimeUnits.MILLISECOND, TZ}(Int64(Dates.value(DateTime(x)) - UNIX_EPOCH_DATETIME))
+    Timestamp{Meta.TimeUnits.MILLISECOND, TZ}(Int64(Dates.value(DateTime(x, UTC)) - UNIX_EPOCH_DATETIME))
 Base.convert(::Type{Timestamp{Meta.TimeUnits.MILLISECOND, nothing}}, x::DateTime) =
     Timestamp{Meta.TimeUnits.MILLISECOND, nothing}(Int64(Dates.value(x) - UNIX_EPOCH_DATETIME))
 
