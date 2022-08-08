@@ -537,6 +537,12 @@ end
 # https://github.com/apache/arrow-julia/issues/324
 @test_throws ArgumentError filter!(x -> x > 1, Arrow.toarrowvector([1, 2, 3]))
 
+# https://github.com/apache/arrow-julia/issues/327
+zdt = ZonedDateTime(DateTime(2020, 11, 1, 6), tz"America/New_York"; from_utc=true)
+arrow_zdt = ArrowTypes.toarrow(zdt)
+zdt_again = ArrowTypes.fromarrow(ZonedDateTime, arrow_zdt)
+@test zdt == zdt_again
+
 end # @testset "misc"
 
 end
