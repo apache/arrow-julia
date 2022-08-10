@@ -543,6 +543,11 @@ arrow_zdt = ArrowTypes.toarrow(zdt)
 zdt_again = ArrowTypes.fromarrow(ZonedDateTime, arrow_zdt)
 @test zdt == zdt_again
 
+# Check that we still correctly read in old TimeZones
+original_table = (; col = [ ZonedDateTime(DateTime(1, 2, 3, 4, 5, 6), tz"UTC+3") for _ in 1:5])
+table = Arrow.Table(joinpath(@__DIR__, "old_zdt.arrow"))
+@test original_table.col == table.col
+
 end # @testset "misc"
 
 end

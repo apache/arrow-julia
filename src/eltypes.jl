@@ -294,11 +294,22 @@ ArrowTypes.default(::Type{Dates.DateTime}) = Dates.DateTime(1,1,1,1,1,1)
 
 ArrowTypes.ArrowType(::Type{ZonedDateTime}) = Timestamp
 ArrowTypes.toarrow(x::ZonedDateTime) = convert(Timestamp{Meta.TimeUnits.MILLISECOND, Symbol(x.timezone)}, x)
-const ZONEDDATETIME_SYMBOL = Symbol("JuliaLang.ZonedDateTime")
+const ZONEDDATETIME_SYMBOL = Symbol("JuliaLang.ZonedDateTime-UTC")
 ArrowTypes.arrowname(::Type{ZonedDateTime}) = ZONEDDATETIME_SYMBOL
 ArrowTypes.JuliaType(::Val{ZONEDDATETIME_SYMBOL}, S) = ZonedDateTime
 ArrowTypes.fromarrow(::Type{ZonedDateTime}, x::Timestamp) = convert(ZonedDateTime, x)
 ArrowTypes.default(::Type{TimeZones.ZonedDateTime}) = TimeZones.ZonedDateTime(1,1,1,1,1,1,TimeZones.tz"UTC")
+
+# Backwards compatibility: older versions of Arrow saved ZonedDateTime's with this metdata:
+const OLD_ZONEDDATETIME_SYMBOL = Symbol("JuliaLang.ZonedDateTime")
+# and stored the local time instead of the UTC time.
+struct LocalZonedDateTime end
+ArrowTypes.JuliaType(::Val{OLD_ZONEDDATETIME_SYMBOL}, S) = LocalZonedDateTime
+function ArrowTypes.fromarrow(::Type{LocalZonedDateTime}, x::Timestamp{U, TZ}) where {U, TZ}
+    (U === Meta.TimeUnits.MICROSECOND || U == Meta.TimeUnits.NANOSECOND) && warntimestamp(U, ZonedDateTime)
+    return ZonedDateTime(Dates.DateTime(Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME))), TimeZone(String(TZ)))
+end
+
 
 """
     Arrow.ToTimestamp(x::AbstractVector{ZonedDateTime})
