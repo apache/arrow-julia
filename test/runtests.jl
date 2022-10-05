@@ -527,6 +527,12 @@ t3 = Arrow.Table(Arrow.tobuffer(t2))
     @test table.b == collect(b)
 end
 
+# Empty input
+@test Arrow.Table(UInt8[]) isa Arrow.Table
+@test isempty(Tables.rows(Arrow.Table(UInt8[])))
+@test Arrow.Stream(UInt8[]) isa Arrow.Stream
+@test isempty(Tables.partitions(Arrow.Stream(UInt8[])))
+
 end # @testset "misc"
 
 end
