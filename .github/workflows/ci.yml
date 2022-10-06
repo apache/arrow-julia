@@ -72,8 +72,7 @@ jobs:
           - name: ArrowTypes.jl
             dir: './src/ArrowTypes'
         version:
-          - '1.0'
-          - '1.4'
+          - '1.6'
           - '1' # automatically expands to the latest stable 1.x release of Julia
           - 'nightly'
         os:
@@ -84,7 +83,7 @@ jobs:
           # Test Arrow.jl/ArrowTypes.jl on their oldest supported Julia versions
           - pkg:
               name: Arrow.jl
-            version: '1.0'
+            version: '1.6'
           - pkg:
               name: ArrowTypes.jl
             version: '1.4'
