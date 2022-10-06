@@ -122,7 +122,8 @@ mutable struct Writer{T<:IO}
     maxdepth::Int64
     meta::Union{Nothing,Base.ImmutableDict{String,String}}
     colmeta::Union{Nothing,Base.ImmutableDict{Symbol,Base.ImmutableDict{String,String}}}
-    msgs::OrderedChannel{Message}
+    sync::OrderedSynchronizer
+    msgs::Channel{Message}
     schema::Ref{Tables.Schema}
     firstcols::Ref{Any}
     dictencodings::Dict{Int64,Any}
@@ -135,7 +136,8 @@ mutable struct Writer{T<:IO}
 end
 
 function Base.open(::Type{Writer}, io::T, compress::Union{Nothing,LZ4FrameCompressor,<:AbstractVector{LZ4FrameCompressor},ZstdCompressor,<:AbstractVector{ZstdCompressor}}, writetofile::Bool, largelists::Bool, denseunions::Bool, dictencode::Bool, dictencodenested::Bool, alignment::Integer, maxdepth::Integer, ntasks::Integer, meta::Union{Nothing,Any}, colmeta::Union{Nothing,Any}, closeio::Bool) where {T<:IO}
-    msgs = OrderedChannel{Message}(ntasks)
+    sync = OrderedSynchronizer(2)
+    msgs = Channel{Message}(ntasks)
     schema = Ref{Tables.Schema}()
     firstcols = Ref{Any}()
     dictencodings = Dict{Int64,Any}() # Lockable{DictEncoding}
@@ -151,7 +153,7 @@ function Base.open(::Type{Writer}, io::T, compress::Union{Nothing,LZ4FrameCompre
     errorref = Ref{Any}()
     meta = _normalizemeta(meta)
     colmeta = _normalizecolmeta(colmeta)
-    return Writer{T}(io, closeio, compress, writetofile, largelists, denseunions, dictencode, dictencodenested, threaded, alignment, maxdepth, meta, colmeta, msgs, schema, firstcols, dictencodings, blocks, task, anyerror, errorref, 1, false)
+    return Writer{T}(io, closeio, compress, writetofile, largelists, denseunions, dictencode, dictencodenested, threaded, alignment, maxdepth, meta, colmeta, sync, msgs, schema, firstcols, dictencodings, blocks, task, anyerror, errorref, 1, false)
 end
 
 function Base.open(::Type{Writer}, io::IO, compress::Symbol, args...)
@@ -193,24 +195,24 @@ function write(writer::Writer, source)
             cols = toarrowtable(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, meta, writer.colmeta)
             writer.schema[] = Tables.schema(cols)
             writer.firstcols[] = cols
-            put!(writer.msgs, makeschemamsg(writer.schema[], cols), writer.partition_count)
+            put!(writer.msgs, makeschemamsg(writer.schema[], cols))
             if !isempty(writer.dictencodings)
                 des = sort!(collect(writer.dictencodings); by=x -> x.first, rev=true)
                 for (id, delock) in des
                     # assign dict encoding ids
-                    de = delock.x
+                    de = delock.value
                     dictsch = Tables.Schema((:col,), (eltype(de.data),))
                     dictbatchmsg = makedictionarybatchmsg(dictsch, (col=de.data,), id, false, writer.alignment)
-                    put!(writer.msgs, dictbatchmsg, writer.partition_count)
+                    put!(writer.msgs, dictbatchmsg)
                 end
             end
             recbatchmsg = makerecordbatchmsg(writer.schema[], cols, writer.alignment)
-            put!(writer.msgs, recbatchmsg, writer.partition_count, true)
+            put!(writer.msgs, recbatchmsg)
         else
             if writer.threaded
-                Threads.@spawn process_partition(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, writer.msgs, writer.alignment, $(writer.partition_count), writer.schema, writer.errorref, writer.anyerror, writer.meta, writer.colmeta)
+                Threads.@spawn process_partition(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, writer.sync, writer.msgs, writer.alignment, $(writer.partition_count), writer.schema, writer.errorref, writer.anyerror, writer.meta, writer.colmeta)
             else
-                @async process_partition(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, writer.msgs, writer.alignment, $(writer.partition_count), writer.schema, writer.errorref, writer.anyerror, writer.meta, writer.colmeta)
+                @async process_partition(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, writer.sync, writer.msgs, writer.alignment, $(writer.partition_count), writer.schema, writer.errorref, writer.anyerror, writer.meta, writer.colmeta)
             end
         end
         writer.partition_count += 1
@@ -290,16 +292,23 @@ function write(io, source, writetofile, largelists, compress, denseunions, dicte
     io
 end
 
-function process_partition(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
+function process_partition(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, sync, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
     try
         cols = toarrowtable(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, meta, colmeta)
+        dictmsgs = nothing
         if !isempty(cols.dictencodingdeltas)
+            dictmsgs = []
             for de in cols.dictencodingdeltas
                 dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                put!(msgs, makedictionarybatchmsg(dictsch, (col=de.data,), de.id, true, alignment), i)
+                push!(dictmsgs, makedictionarybatchmsg(dictsch, (col=de.data,), de.id, true, alignment))
             end
         end
-        put!(msgs, makerecordbatchmsg(sch[], cols, alignment), i, true)
+        put!(sync, i) do
+            if !isnothing(dictmsgs)
+                foreach(msg -> put!(msgs, msg), dictmsgs)
+            end
+            put!(msgs, makerecordbatchmsg(sch[], cols, alignment))
+        end
     catch e
         errorref[] = (e, catch_backtrace(), i)
         anyerror[] = true

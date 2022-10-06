@@ -107,7 +107,8 @@ function append(io::IO, source, arrow_schema, compress, largelists, denseunions,
     skip(io, -8) # overwrite last 8 bytes of last empty message footer
 
     sch = Ref{Tables.Schema}(arrow_schema)
-    msgs = OrderedChannel{Message}(ntasks)
+    sync = OrderedSynchronizer()
+    msgs = Channel{Message}(ntasks)
     dictencodings = Dict{Int64, Any}() # Lockable{DictEncoding}
     # build messages
     blocks = (Block[], Block[])
@@ -134,9 +135,9 @@ function append(io::IO, source, arrow_schema, compress, largelists, denseunions,
         end
 
         if threaded
-            Threads.@spawn process_partition(tbl_cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
+            Threads.@spawn process_partition(tbl_cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, sync, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
         else
-            @async process_partition(tbl_cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
+            @async process_partition(tbl_cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, sync, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
         end
     end
     if anyerror[]

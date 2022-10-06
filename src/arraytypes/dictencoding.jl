@@ -129,7 +129,7 @@ function arrowvector(::DictEncodedKind, x::DictEncoded, i, nl, fi, de, ded, meta
     else
         encodinglockable = de[id]
         @lock encodinglockable begin
-            encoding = encodinglockable.x
+            encoding = encodinglockable.value
             # in this case, we just need to check if any values in our local pool need to be delta dicationary serialized
             deltas = setdiff(x.encoding, encoding)
             if !isempty(deltas)
@@ -144,7 +144,7 @@ function arrowvector(::DictEncodedKind, x::DictEncoded, i, nl, fi, de, ded, meta
                 else
                     data2 = ChainedVector([encoding.data, data])
                     encoding = DictEncoding{eltype(data2), ET, typeof(data2)}(id, data2, false, getmetadata(encoding))
-                    de[id].x = encoding
+                    de[id] = Lockable(encoding)
                 end
             end
         end
@@ -196,7 +196,7 @@ function arrowvector(::DictEncodedKind, x, i, nl, fi, de, ded, meta; dictencode:
           # also add to deltas updates
         encodinglockable = de[id]
         @lock encodinglockable begin
-            encoding = encodinglockable.x
+            encoding = encodinglockable.value
             len = length(x)
             ET = indextype(encoding)
             pool = Dict{Union{eltype(encoding), eltype(x)}, ET}(a => (b - 1) for (b, a) in enumerate(encoding))
@@ -223,7 +223,7 @@ function arrowvector(::DictEncodedKind, x, i, nl, fi, de, ded, meta; dictencode:
                 else
                     data2 = ChainedVector([encoding.data, data])
                     encoding = DictEncoding{eltype(data2), ET, typeof(data2)}(id, data2, false, getmetadata(encoding))
-                    de[id].x = encoding
+                    de[id] = Lockable(encoding)
                 end
             end
         end

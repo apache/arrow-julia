@@ -44,7 +44,7 @@ module Arrow
 using Base.Iterators
 using Mmap
 import Dates
-using DataAPI, Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd, TimeZones, BitIntegers
+using DataAPI, Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd, TimeZones, BitIntegers, WorkerUtilities
 
 export ArrowTypes
 

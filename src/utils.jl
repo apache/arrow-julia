@@ -127,67 +127,6 @@ function readmessage(filebytes, off=9)
     FlatBuffers.getrootas(Meta.Message, filebytes, off + 8)
 end
 
-# a custom Channel type that only allows put!-ing objects in a specific, monotonically increasing order
-struct OrderedChannel{T}
-    chan::Channel{T}
-    cond::Threads.Condition
-    i::Ref{Int}
-end
-
-OrderedChannel{T}(sz) where {T} = OrderedChannel{T}(Channel{T}(sz), Threads.Condition(), Ref(1))
-Base.iterate(ch::OrderedChannel, st...) = iterate(ch.chan, st...)
-
-macro lock(obj, expr)
-    esc(quote
-        lock($obj)
-        try
-            $expr
-        finally
-            unlock($obj)
-        end
-    end)
-end
-
-# when put!-ing an object, operation may have to wait until other tasks have put their
-# objects to ensure the channel is ordered correctly
-function Base.put!(ch::OrderedChannel{T}, x::T, i::Integer, incr::Bool=false) where {T}
-    @lock ch.cond begin
-        while ch.i[] < i
-            # channel index too early, need to wait for other tasks to put their objects first
-            wait(ch.cond)
-        end
-        # now it's our turn
-        put!(ch.chan, x)
-        if incr
-            ch.i[] += 1
-        end
-        # wake up tasks that may be waiting to put their objects
-        notify(ch.cond)
-    end
-    return
-end
-
-function Base.close(ch::OrderedChannel)
-    @lock ch.cond begin
-        # just need to ensure any tasks waiting to put their tasks have had a chance to put
-        while !isempty(ch.cond)
-            wait(ch.cond)
-        end
-        close(ch.chan)
-    end
-    return
-end
-
-mutable struct Lockable
-    x
-    lock::ReentrantLock
-end
-
-Lockable(x) = Lockable(x, ReentrantLock())
-
-Base.lock(x::Lockable) = lock(x.lock)
-Base.unlock(x::Lockable) = unlock(x.lock)
-
 function tobuffer(data; kwargs...)
     io = IOBuffer()
     write(io, data; kwargs...)
