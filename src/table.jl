@@ -275,11 +275,11 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
     sch = nothing
     dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
     dictencoded = Dict{Int64, Meta.Field}() # dictionary id => field
-    tsks = Channel{Task}(Inf)
+    sync = OrderedSynchronizer()
+    tsks = Channel{Any}(Inf)
     tsk = Threads.@spawn begin
         i = 1
-        for tsk in tsks
-            cols = fetch(tsk)
+        for cols in tsks
             if i == 1
                 foreach(x -> push!(columns(t), x), cols)
             elseif i == 2
@@ -295,7 +295,8 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
         end
     end
     anyrecordbatches = false
-    for blob in blobs
+    rbi = 1
+    @sync for blob in blobs
         bytes, pos, len = blob.bytes, blob.pos, blob.len
         if len > 24 &&
             _startswith(bytes, pos, FILE_FORMAT_MAGIC_BYTES) &&
@@ -349,9 +350,11 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
             elseif header isa Meta.RecordBatch
                 anyrecordbatches = true
                 @debug 1 "parsing record batch message: compression = $(header.compression)"
-                put!(tsks, Threads.@spawn begin
-                    collect(VectorIterator(sch, batch, dictencodings, convert))
-                end)
+                Threads.@spawn begin
+                    cols = collect(VectorIterator(sch, $batch, dictencodings, convert))
+                    put!(() -> put!(tsks, cols), sync, $(rbi))
+                end
+                rbi += 1
             else
                 throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
             end
