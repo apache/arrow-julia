@@ -533,6 +533,9 @@ end
 @test Arrow.Stream(UInt8[]) isa Arrow.Stream
 @test isempty(Tables.partitions(Arrow.Stream(UInt8[])))
 
+# https://github.com/apache/arrow-julia/issues/324
+@test_throws ArgumentError filter!(x -> x > 1, Arrow.toarrowvector([1, 2, 3]))
+
 end # @testset "misc"
 
 end
