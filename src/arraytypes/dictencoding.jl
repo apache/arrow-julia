@@ -128,7 +128,7 @@ function arrowvector(::DictEncodedKind, x::DictEncoded, i, nl, fi, de, ded, meta
         de[id] = Lockable(x.encoding)
     else
         encodinglockable = de[id]
-        @lock encodinglockable begin
+        Base.@lock encodinglockable begin
             encoding = encodinglockable.value
             # in this case, we just need to check if any values in our local pool need to be delta dicationary serialized
             deltas = setdiff(x.encoding, encoding)
@@ -195,7 +195,7 @@ function arrowvector(::DictEncodedKind, x, i, nl, fi, de, ded, meta; dictencode:
           # if value doesn't exist in encoding, push! it
           # also add to deltas updates
         encodinglockable = de[id]
-        @lock encodinglockable begin
+        Base.@lock encodinglockable begin
             encoding = encodinglockable.value
             len = length(x)
             ET = indextype(encoding)

@@ -79,14 +79,6 @@ jobs:
           - ubuntu-latest
         arch:
           - x64
-        exclude:
-          # Test Arrow.jl/ArrowTypes.jl on their oldest supported Julia versions
-          - pkg:
-              name: Arrow.jl
-            version: '1.6'
-          - pkg:
-              name: ArrowTypes.jl
-            version: '1.4'
     steps:
       - uses: actions/checkout@v2
       - uses: julia-actions/setup-julia@v1
