@@ -104,6 +104,7 @@ You must install the following commands to use the script:
   * `curl`
   * `gpg`
   * `shasum` or `sha256sum`/`sha512sum`
+  * `tar`
 
 You don't need to install Julia. If there isn't Julia in system, the latest Julia is automatically installed only for verification.
 
