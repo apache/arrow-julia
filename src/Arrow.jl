@@ -53,6 +53,13 @@ import Base: ==
 
 const DEBUG_LEVEL = Ref(0)
 
+const DEFAULT_BYTE_ALIGNMENT = let
+    require_16 = Base.BinaryPlatforms.Platform("aarch64", "macos";
+                                               libgfortran_version = "5.0.0",
+                                               cxxstring_abi = "cxx11")
+    Base.BinaryPlatforms.HostPlatform() == require_16 ? 16 : 8
+end
+
 function setdebug!(level::Int)
     DEBUG_LEVEL[] = level
     return

@@ -43,7 +43,7 @@ record batches simultaneously (e.g. if julia is started with `julia -t 8`
 or the `JULIA_NUM_THREADS` environment variable is set).
 
 Supported keyword arguments to `Arrow.append` include:
-  * `alignment::Int=8`: specify the number of bytes to align buffers to when written in messages; strongly recommended to only use alignment values of 8 or 64 for modern memory cache line optimization
+  * `alignment::Int=$DEFAULT_BYTE_ALIGNMENT`: specify the number of bytes to align buffers to when written in messages; strongly recommended to only use alignment values of 8 or 64 for modern memory cache line optimization or 16 on Apple silicon.
   * `colmetadata=nothing`: the metadata that should be written as the table's columns' `custom_metadata` fields; must either be `nothing` or an `AbstractDict` of `column_name::Symbol => column_metadata` where `column_metadata` is an iterable of `<:AbstractString` pairs.
   * `dictencode::Bool=false`: whether all columns should use dictionary encoding when being written; to dict encode specific columns, wrap the column/array in `Arrow.DictEncode(col)`
   * `dictencodenested::Bool=false`: whether nested data type columns should also dict encode nested arrays/buffers; other language implementations [may not support this](https://arrow.apache.org/docs/status.html)
@@ -74,7 +74,7 @@ function append(io::IO, tbl;
         denseunions::Bool=true,
         dictencode::Bool=false,
         dictencodenested::Bool=false,
-        alignment::Int=8,
+        alignment::Int=DEFAULT_BYTE_ALIGNMENT,
         maxdepth::Int=DEFAULT_MAX_DEPTH,
         ntasks=Inf,
         convert::Bool=true,
