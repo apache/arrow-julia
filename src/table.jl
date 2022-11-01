@@ -418,10 +418,18 @@ function Base.iterate(x::BatchIterator, (pos, id)=(x.startpos, 0))
         return nothing
     end
     pos += 4
+    if pos + msglen - 1 > length(x.bytes)
+        @debug 1 "not enough bytes left to read Meta.Message"
+        return nothing
+    end
     msg = FlatBuffers.getrootas(Meta.Message, x.bytes, pos-1)
     pos += msglen
     # pos now points to message body
     @debug 1 "parsing message: pos = $pos, msglen = $msglen, bodyLength = $(msg.bodyLength)"
+    if pos + msg.bodyLength - 1 > length(x.bytes)
+        @debug 1 "not enough bytes left to read message body"
+        return nothing
+    end
     return Batch(msg, x.bytes, pos, id), (pos + msg.bodyLength, id + 1)
 end
 
