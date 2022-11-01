@@ -139,16 +139,16 @@ function makenodesbuffers!(col::FixedSizeList{T, A}, fieldnodes, fieldbuffers, b
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
-    @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
+    @debugv 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     # validity bitmap
     blen = nc == 0 ? 0 : bitpackedbytes(len, alignment)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+    @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += blen
     if eltype(A) === UInt8
         blen = ArrowTypes.getsize(ArrowTypes.ArrowKind(Base.nonmissingtype(T))) * len
         push!(fieldbuffers, Buffer(bufferoffset, blen))
-        @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+        @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
         bufferoffset += padding(blen, alignment)
     else
         bufferoffset = makenodesbuffers!(col.data, fieldnodes, fieldbuffers, bufferoffset, alignment)
@@ -157,13 +157,13 @@ function makenodesbuffers!(col::FixedSizeList{T, A}, fieldnodes, fieldbuffers, b
 end
 
 function writebuffer(io, col::FixedSizeList{T, A}, alignment) where {T, A}
-    @debug 1 "writebuffer: col = $(typeof(col))"
-    @debug 2 col
+    @debugv 1 "writebuffer: col = $(typeof(col))"
+    @debugv 2 col
     writebitmap(io, col, alignment)
     # write values array
     if eltype(A) === UInt8
         n = writearray(io, UInt8, col.data)
-        @debug 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n, alignment))"
+        @debugv 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n, alignment))"
         writezeros(io, paddinglength(n, alignment))
     else
         writebuffer(io, col.data, alignment)

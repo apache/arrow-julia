@@ -43,6 +43,7 @@ module Arrow
 
 using Base.Iterators
 using Mmap
+using LoggingExtras
 import Dates
 using DataAPI, Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd, TimeZones, BitIntegers, WorkerUtilities
 

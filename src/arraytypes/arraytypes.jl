@@ -32,8 +32,8 @@ getmetadata(x::ArrowVector) = x.metadata
 Base.deleteat!(x::T, inds) where {T <: ArrowVector} = throw(ArgumentError("`$T` does not support `deleteat!`; arrow data is by nature immutable"))
 
 function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Vector{LZ4FrameCompressor}, LZ4FrameCompressor, Vector{ZstdCompressor}, ZstdCompressor}=nothing, kw...)
-    @debug 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(kw.data)"
-    @debug 3 x
+    @debugv 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(kw.data)"
+    @debugv 3 x
     A = arrowvector(x, i, 0, 0, de, ded, meta; compression=compression, kw...)
     if compression isa LZ4FrameCompressor
         A = compress(Meta.CompressionTypes.LZ4_FRAME, compression, A)
@@ -44,8 +44,8 @@ function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=g
     elseif compression isa Vector{ZstdCompressor}
         A = compress(Meta.CompressionTypes.ZSTD, compression[Threads.threadid()], A)
     end
-    @debug 2 "converted top-level column to arrow format: $(typeof(A))"
-    @debug 3 A
+    @debugv 2 "converted top-level column to arrow format: $(typeof(A))"
+    @debugv 3 A
     return A
 end
 
@@ -104,7 +104,7 @@ compress(Z::Meta.CompressionType, comp, v::NullVector) =
 
 function makenodesbuffers!(col::NullVector, fieldnodes, fieldbuffers, bufferoffset, alignment)
     push!(fieldnodes, FieldNode(length(col), length(col)))
-    @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
+    @debugv 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     return bufferoffset
 end
 
@@ -187,7 +187,7 @@ end
 
 function writebitmap(io, col::ArrowVector, alignment)
     v = col.validity
-    @debug 1 "writing validity bitmap: nc = $(v.nc), n = $(cld(v.ℓ, 8))"
+    @debugv 1 "writing validity bitmap: nc = $(v.nc), n = $(cld(v.ℓ, 8))"
     v.nc == 0 && return 0
     n = Base.write(io, view(v.bytes, v.pos:(v.pos + cld(v.ℓ, 8) - 1)))
     return n + writezeros(io, paddinglength(n, alignment))
