@@ -245,16 +245,16 @@ function makenodesbuffers!(col::Union{DenseUnion, SparseUnion}, fieldnodes, fiel
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
-    @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
+    @debugv 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     # typeIds buffer
     push!(fieldbuffers, Buffer(bufferoffset, len))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+    @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += padding(len, alignment)
     if col isa DenseUnion
         # offsets buffer
         blen = sizeof(Int32) * len
         push!(fieldbuffers, Buffer(bufferoffset, blen))
-        @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+        @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
         bufferoffset += padding(blen, alignment)
     end
     for child in col.data
@@ -264,15 +264,15 @@ function makenodesbuffers!(col::Union{DenseUnion, SparseUnion}, fieldnodes, fiel
 end
 
 function writebuffer(io, col::Union{DenseUnion, SparseUnion}, alignment)
-    @debug 1 "writebuffer: col = $(typeof(col))"
-    @debug 2 col
+    @debugv 1 "writebuffer: col = $(typeof(col))"
+    @debugv 2 col
     # typeIds buffer
     n = writearray(io, UInt8, col.typeIds)
-    @debug 1 "writing array: col = $(typeof(col.typeIds)), n = $n, padded = $(padding(n, alignment))"
+    @debugv 1 "writing array: col = $(typeof(col.typeIds)), n = $n, padded = $(padding(n, alignment))"
     writezeros(io, paddinglength(n, alignment))
     if col isa DenseUnion
         n = writearray(io, Int32, col.offsets)
-        @debug 1 "writing array: col = $(typeof(col.offsets)), n = $n, padded = $(padding(n, alignment))"
+        @debugv 1 "writing array: col = $(typeof(col.offsets)), n = $n, padded = $(padding(n, alignment))"
         writezeros(io, paddinglength(n, alignment))
     end
     for child in col.data

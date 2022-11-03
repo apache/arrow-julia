@@ -79,21 +79,21 @@ function makenodesbuffers!(col::Union{Map{T, O, A}, List{T, O, A}}, fieldnodes, 
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
-    @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
+    @debugv 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     # validity bitmap
     blen = nc == 0 ? 0 : bitpackedbytes(len, alignment)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+    @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     # adjust buffer offset, make array buffer
     bufferoffset += blen
     blen = sizeof(O) * (len + 1)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+    @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += padding(blen, alignment)
     if eltype(A) == UInt8
         blen = length(col.data)
         push!(fieldbuffers, Buffer(bufferoffset, blen))
-        @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+        @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
         bufferoffset += padding(blen, alignment)
     else
         bufferoffset = makenodesbuffers!(col.data, fieldnodes, fieldbuffers, bufferoffset, alignment)
@@ -102,17 +102,17 @@ function makenodesbuffers!(col::Union{Map{T, O, A}, List{T, O, A}}, fieldnodes, 
 end
 
 function writebuffer(io, col::Union{Map{T, O, A}, List{T, O, A}}, alignment) where {T, O, A}
-    @debug 1 "writebuffer: col = $(typeof(col))"
-    @debug 2 col
+    @debugv 1 "writebuffer: col = $(typeof(col))"
+    @debugv 2 col
     writebitmap(io, col, alignment)
     # write offsets
     n = writearray(io, O, col.offsets.offsets)
-    @debug 1 "writing array: col = $(typeof(col.offsets.offsets)), n = $n, padded = $(padding(n, alignment))"
+    @debugv 1 "writing array: col = $(typeof(col.offsets.offsets)), n = $n, padded = $(padding(n, alignment))"
     writezeros(io, paddinglength(n, alignment))
     # write values array
     if eltype(A) == UInt8
         n = writearray(io, UInt8, col.data)
-        @debug 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n, alignment))"
+        @debugv 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n, alignment))"
         writezeros(io, paddinglength(n, alignment))
     else
         writebuffer(io, col.data, alignment)

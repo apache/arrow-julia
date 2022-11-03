@@ -110,11 +110,11 @@ function makenodesbuffers!(col::Struct{T}, fieldnodes, fieldbuffers, bufferoffse
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
-    @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
+    @debugv 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     # validity bitmap
     blen = nc == 0 ? 0 : bitpackedbytes(len, alignment)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+    @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += blen
     for child in col.data
         bufferoffset = makenodesbuffers!(child, fieldnodes, fieldbuffers, bufferoffset, alignment)
@@ -123,8 +123,8 @@ function makenodesbuffers!(col::Struct{T}, fieldnodes, fieldbuffers, bufferoffse
 end
 
 function writebuffer(io, col::Struct, alignment)
-    @debug 1 "writebuffer: col = $(typeof(col))"
-    @debug 2 col
+    @debugv 1 "writebuffer: col = $(typeof(col))"
+    @debugv 2 col
     writebitmap(io, col, alignment)
     # write values arrays
     for child in col.data

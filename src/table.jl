@@ -134,7 +134,7 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
                     push!(x.types, juliaeltype(field, buildmetadata(field.custom_metadata), x.convert))
                     # recursively find any dictionaries for any fields
                     getdictionaries!(x.dictencoded, field)
-                    @debug 1 "parsed column from schema: field = $field"
+                    @debugv 1 "parsed column from schema: field = $field"
                 end
             elseif header != x.schema
                 throw(ArgumentError("mismatched schemas between different arrow batches: $(x.schema) != $header"))
@@ -142,7 +142,7 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
         elseif header isa Meta.DictionaryBatch
             id = header.id
             recordbatch = header.data
-            @debug 1 "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
+            @debugv 1 "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
             if recordbatch.compression !== nothing
                 compression = recordbatch.compression
             end
@@ -160,9 +160,9 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
             A = ChainedVector([values])
             S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
             x.dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
-            @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
+            @debugv 1 "parsed dictionary batch message: id=$id, data=$values\n"
         elseif header isa Meta.RecordBatch
-            @debug 1 "parsing record batch message: compression = $(header.compression)"
+            @debugv 1 "parsing record batch message: compression = $(header.compression)"
             if header.compression !== nothing
                 compression = header.compression
             end
@@ -307,7 +307,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
             # store custom_metadata of batch.msg?
             header = batch.msg.header
             if header isa Meta.Schema
-                @debug 1 "parsing schema message"
+                @debugv 1 "parsing schema message"
                 # assert endianness?
                 # store custom_metadata?
                 if sch === nothing
@@ -315,7 +315,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                         push!(names(t), Symbol(field.name))
                         # recursively find any dictionaries for any fields
                         getdictionaries!(dictencoded, field)
-                        @debug 1 "parsed column from schema: field = $field"
+                        @debugv 1 "parsed column from schema: field = $field"
                     end
                     sch = header
                     schema(t)[] = sch
@@ -325,7 +325,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
             elseif header isa Meta.DictionaryBatch
                 id = header.id
                 recordbatch = header.data
-                @debug 1 "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
+                @debugv 1 "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
                 if haskey(dictencodings, id) && header.isDelta
                     # delta
                     field = dictencoded[id]
@@ -346,10 +346,10 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                 A = values
                 S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
                 dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
-                @debug 1 "parsed dictionary batch message: id=$id, data=$values\n"
+                @debugv 1 "parsed dictionary batch message: id=$id, data=$values\n"
             elseif header isa Meta.RecordBatch
                 anyrecordbatches = true
-                @debug 1 "parsing record batch message: compression = $(header.compression)"
+                @debugv 1 "parsing record batch message: compression = $(header.compression)"
                 Threads.@spawn begin
                     cols = collect(VectorIterator(sch, $batch, dictencodings, convert))
                     put!(() -> put!(tsks, cols), sync, $(rbi))
@@ -398,36 +398,36 @@ struct Batch
 end
 
 function Base.iterate(x::BatchIterator, (pos, id)=(x.startpos, 0))
-    @debug 1 "checking for next arrow message: pos = $pos"
+    @debugv 1 "checking for next arrow message: pos = $pos"
     if pos + 3 > length(x.bytes)
-        @debug 1 "not enough bytes left for another batch message"
+        @debugv 1 "not enough bytes left for another batch message"
         return nothing
     end
     if readbuffer(x.bytes, pos, UInt32) != CONTINUATION_INDICATOR_BYTES
-        @debug 1 "didn't find continuation byte to keep parsing messages: $(readbuffer(x.bytes, pos, UInt32))"
+        @debugv 1 "didn't find continuation byte to keep parsing messages: $(readbuffer(x.bytes, pos, UInt32))"
         return nothing
     end
     pos += 4
     if pos + 3 > length(x.bytes)
-        @debug 1 "not enough bytes left to read length of another batch message"
+        @debugv 1 "not enough bytes left to read length of another batch message"
         return nothing
     end
     msglen = readbuffer(x.bytes, pos, Int32)
     if msglen == 0
-        @debug 1 "message has 0 length; terminating message parsing"
+        @debugv 1 "message has 0 length; terminating message parsing"
         return nothing
     end
     pos += 4
     if pos + msglen - 1 > length(x.bytes)
-        @debug 1 "not enough bytes left to read Meta.Message"
+        @debugv 1 "not enough bytes left to read Meta.Message"
         return nothing
     end
     msg = FlatBuffers.getrootas(Meta.Message, x.bytes, pos-1)
     pos += msglen
     # pos now points to message body
-    @debug 1 "parsing message: pos = $pos, msglen = $msglen, bodyLength = $(msg.bodyLength)"
+    @debugv 1 "parsing message: pos = $pos, msglen = $msglen, bodyLength = $(msg.bodyLength)"
     if pos + msg.bodyLength - 1 > length(x.bytes)
-        @debug 1 "not enough bytes left to read message body"
+        @debugv 1 "not enough bytes left to read message body"
         return nothing
     end
     return Batch(msg, x.bytes, pos, id), (pos + msg.bodyLength, id + 1)
@@ -448,10 +448,10 @@ buildmetadata(x::AbstractDict) = x
 function Base.iterate(x::VectorIterator, (columnidx, nodeidx, bufferidx)=(Int64(1), Int64(1), Int64(1)))
     columnidx > length(x.schema.fields) && return nothing
     field = x.schema.fields[columnidx]
-    @debug 2 "building top-level column: field = $(field), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
+    @debugv 2 "building top-level column: field = $(field), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
     A, nodeidx, bufferidx = build(field, x.batch, x.batch.msg.header, x.dictencodings, nodeidx, bufferidx, x.convert)
-    @debug 2 "built top-level column: A = $(typeof(A)), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
-    @debug 3 A
+    @debugv 2 "built top-level column: A = $(typeof(A)), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
+    @debugv 3 A
     return A, (columnidx + 1, nodeidx, bufferidx)
 end
 
@@ -521,7 +521,7 @@ function reinterp(::Type{T}, batch, buf, compression) where {T}
 end
 
 function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, convert)
-    @debug 2 "building array: L = $L"
+    @debugv 2 "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
@@ -546,7 +546,7 @@ function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, c
 end
 
 function build(f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeList}, batch, rb, de, nodeidx, bufferidx, convert)
-    @debug 2 "building array: L = $L"
+    @debugv 2 "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
     len = rb.nodes[nodeidx].length
@@ -565,7 +565,7 @@ function build(f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeList}
 end
 
 function build(f::Meta.Field, L::Meta.Map, batch, rb, de, nodeidx, bufferidx, convert)
-    @debug 2 "building array: L = $L"
+    @debugv 2 "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
@@ -583,7 +583,7 @@ function build(f::Meta.Field, L::Meta.Map, batch, rb, de, nodeidx, bufferidx, co
 end
 
 function build(f::Meta.Field, L::Meta.Struct, batch, rb, de, nodeidx, bufferidx, convert)
-    @debug 2 "building array: L = $L"
+    @debugv 2 "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
     len = rb.nodes[nodeidx].length
@@ -600,7 +600,7 @@ function build(f::Meta.Field, L::Meta.Struct, batch, rb, de, nodeidx, bufferidx,
 end
 
 function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, convert)
-    @debug 2 "building array: L = $L"
+    @debugv 2 "building array: L = $L"
     buffer = rb.buffers[bufferidx]
     bytes, typeIds = reinterp(UInt8, batch, buffer, rb.compression)
     bufferidx += 1
@@ -628,7 +628,7 @@ function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, 
 end
 
 function build(f::Meta.Field, L::Meta.Null, batch, rb, de, nodeidx, bufferidx, convert)
-    @debug 2 "building array: L = $L"
+    @debugv 2 "building array: L = $L"
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
     return NullVector{maybemissing(T)}(MissingVector(rb.nodes[nodeidx].length), meta), nodeidx + 1, bufferidx
@@ -636,30 +636,30 @@ end
 
 # primitives
 function build(f::Meta.Field, ::L, batch, rb, de, nodeidx, bufferidx, convert) where {L}
-    @debug 2 "building array: L = $L"
+    @debugv 2 "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
     meta = buildmetadata(f.custom_metadata)
     # get storage type (non-converted)
     T = juliaeltype(f, nothing, false)
-    @debug 2 "storage type for primitive: T = $T"
+    @debugv 2 "storage type for primitive: T = $T"
     bytes, A = reinterp(Base.nonmissingtype(T), batch, buffer, rb.compression)
     len = rb.nodes[nodeidx].length
     T = juliaeltype(f, meta, convert)
-    @debug 2 "final julia type for primitive: T = $T"
+    @debugv 2 "final julia type for primitive: T = $T"
     return Primitive(T, bytes, validity, A, len, meta), nodeidx + 1, bufferidx + 1
 end
 
 function build(f::Meta.Field, L::Meta.Bool, batch, rb, de, nodeidx, bufferidx, convert)
-    @debug 2 "building array: L = $L"
+    @debugv 2 "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
     meta = buildmetadata(f.custom_metadata)
     # get storage type (non-converted)
     T = juliaeltype(f, nothing, false)
-    @debug 2 "storage type for primitive: T = $T"
+    @debugv 2 "storage type for primitive: T = $T"
     buffer = rb.buffers[bufferidx]
     voff = batch.pos + buffer.offset
     node = rb.nodes[nodeidx]

@@ -126,7 +126,7 @@ function append(io::IO, source, arrow_schema, compress, largelists, denseunions,
             @error "error writing arrow data on partition = $(errorref[][3])" exception=(errorref[][1], errorref[][2])
             error("fatal error writing arrow data")
         end
-        @debug 1 "processing table partition i = $i"
+        @debugv 1 "processing table partition i = $i"
         tbl_cols = Tables.columns(tbl)
         tbl_schema = Tables.schema(tbl_cols)
 

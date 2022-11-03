@@ -289,16 +289,16 @@ function makenodesbuffers!(col::DictEncoded{T, S}, fieldnodes, fieldbuffers, buf
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
-    @debug 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
+    @debugv 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     # validity bitmap
     blen = nc == 0 ? 0 : bitpackedbytes(len, alignment)
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+    @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += blen
     # indices
     blen = sizeof(S) * len
     push!(fieldbuffers, Buffer(bufferoffset, blen))
-    @debug 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+    @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += padding(blen, alignment)
     return bufferoffset
 end
@@ -308,12 +308,12 @@ DataAPI.refarray(x::DictEncoded{T, S}) where {T, S} = x.indices .+ one(S)
 DataAPI.refpool(x::DictEncoded) = copy(x.encoding.data)
 
 function writebuffer(io, col::DictEncoded, alignment)
-    @debug 1 "writebuffer: col = $(typeof(col))"
-    @debug 2 col
+    @debugv 1 "writebuffer: col = $(typeof(col))"
+    @debugv 2 col
     writebitmap(io, col, alignment)
     # write indices
     n = writearray(io, col.indices)
-    @debug 1 "writing array: col = $(typeof(col.indices)), n = $n, padded = $(padding(n, alignment))"
+    @debugv 1 "writing array: col = $(typeof(col.indices)), n = $n, padded = $(padding(n, alignment))"
     writezeros(io, paddinglength(n, alignment))
     return
 end
