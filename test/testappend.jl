@@ -86,6 +86,14 @@ function testappend_partitions()
         end
         @test_throws ArgumentError Arrow.append(file2, arrow_table1)
 
+        # can append to an empty file
+        rm(file2)
+        for _ in 1:5
+            Arrow.append(file2, arrow_table1)
+        end
+        appended_table1 = Arrow.Table(file2)
+        @test length(Tables.columns(appended_table1)[1]) == 50
+
         # schema must match
         testdata2 = (col2=Int64[1,2,3,4,5,6,7,8,9,10],)
         open(file2, "w") do io
