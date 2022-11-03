@@ -60,7 +60,7 @@ function append end
 append(io_or_file; kw...) = x -> append(io_or_file, x; kw...)
 
 function append(file::String, tbl; kwargs...)
-    open(file, "r+") do io
+    open(file, isfile(file) ? "r+" : "w+") do io
         append(io, tbl; file=true, kwargs...)
     end
 
@@ -84,20 +84,42 @@ function append(io::IO, tbl;
         throw(ArgumentError("ntasks keyword argument must be > 0; pass `ntasks=1` to disable multithreaded writing"))
     end
 
-    isstream, arrow_schema, compress = stream_properties(io; convert=convert)
-    if !isstream
-        throw(ArgumentError("append is supported only to files in arrow stream format"))
-    end
+    startpos = position(io)
+    seekend(io)
+    len = position(io) - startpos
+    seek(io, startpos) # leave the stream position unchanged
 
-    if compress === :lz4
-        compress = LZ4_FRAME_COMPRESSOR
-    elseif compress === :zstd
-        compress = ZSTD_COMPRESSOR
-    elseif compress isa Symbol
-        throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
-    end
+    if len == 0 # empty file, not initialized, we can just write to it
+        kwargs = Dict{Symbol, Any}(
+            :largelists => largelists,
+            :denseunions => denseunions,
+            :dictencode => dictencode,
+            :dictencodenested => dictencodenested,
+            :alignment => alignment,
+            :maxdepth => maxdepth,
+            :metadata => metadata,
+            :colmetadata => colmetadata,
+        )
+        if isa(ntasks, Integer)
+            kwargs[:ntasks] = ntasks
+        end
+        write(io, tbl; kwargs...)
+    else
+        isstream, arrow_schema, compress = stream_properties(io; convert=convert)
+        if !isstream
+            throw(ArgumentError("append is supported only to files in arrow stream format"))
+        end
 
-    append(io, tbl, arrow_schema, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks, metadata, colmetadata)
+        if compress === :lz4
+            compress = LZ4_FRAME_COMPRESSOR
+        elseif compress === :zstd
+            compress = ZSTD_COMPRESSOR
+        elseif compress isa Symbol
+            throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
+        end
+
+        append(io, tbl, arrow_schema, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks, metadata, colmetadata)
+    end
 
     return io
 end
