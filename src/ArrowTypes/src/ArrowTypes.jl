@@ -354,6 +354,6 @@ end
 Base.IndexStyle(::Type{<:ToArrow}) = Base.IndexLinear()
 Base.size(x::ToArrow) = (length(x.data),)
 Base.eltype(x::ToArrow{T, A}) where {T, A} = T
-Base.getindex(x::ToArrow{T}, i::Int) where {T} = toarrow(getindex(x.data, i))
+Base.getindex(x::ToArrow{T}, i::Int) where {T} = toarrow(convert(T, getindex(x.data, i)))
 
 end # module ArrowTypes
