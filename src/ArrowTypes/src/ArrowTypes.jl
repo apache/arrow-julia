@@ -354,6 +354,23 @@ end
 Base.IndexStyle(::Type{<:ToArrow}) = Base.IndexLinear()
 Base.size(x::ToArrow) = (length(x.data),)
 Base.eltype(x::ToArrow{T, A}) where {T, A} = T
-Base.getindex(x::ToArrow{T}, i::Int) where {T} = toarrow(convert(T, getindex(x.data, i)))
+function _convert(::Type{T}, x) where {T}
+    if x isa T
+        return x
+    elseif T isa Union
+        # T was a promoted Union and x is not already one of
+        # the concrete Union types, so we need to just try
+        # to convert, recursively, to one of the Union types
+        # unfortunately not much we can do more efficiently here
+        try
+            return _convert(T.a, x)
+        catch
+            return _convert(T.b, x)
+        end
+    else
+        return convert(T, x)
+    end
+end
+Base.getindex(x::ToArrow{T}, i::Int) where {T} = _convert(T, toarrow(getindex(x.data, i)))
 
 end # module ArrowTypes
