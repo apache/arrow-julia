@@ -233,9 +233,6 @@ const UUIDSYMBOL = Symbol("JuliaLang.UUID")
 arrowname(::Type{UUID}) = UUIDSYMBOL
 JuliaType(::Val{UUIDSYMBOL}) = UUID
 fromarrow(::Type{UUID}, x::NTuple{16, UInt8}) = UUID(_cast(UInt128, x))
-# for backwards compatibility
-arrowconvert(::Type{UUID}, u::NamedTuple{(:value,),Tuple{UInt128}}) = UUID(u.value)
-arrowconvert(::Type{UUID}, u::UInt128) = UUID(u)
 
 function _cast(::Type{Y}, x)::Y where {Y}
     y = Ref{Y}()

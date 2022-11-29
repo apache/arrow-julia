@@ -222,10 +222,7 @@ tt = Arrow.Table(Arrow.tobuffer(t))
 @test length(tt) == length(t)
 @test all(isequal.(values(t), values(tt)))
 
-# 89 etc. - test deprecation paths for old UUID autoconversion + UUID FixedSizeListKind overloads
-u = 0x6036fcbd20664bd8a65cdfa25434513f
-@test Arrow.ArrowTypes.arrowconvert(UUID, (value=u,)) === UUID(u)
-@test Arrow.ArrowTypes.arrowconvert(UUID, u) === UUID(u)
+# 89 etc. - UUID FixedSizeListKind overloads
 @test Arrow.ArrowTypes.gettype(Arrow.ArrowTypes.ArrowKind(UUID)) == UInt8
 @test Arrow.ArrowTypes.getsize(Arrow.ArrowTypes.ArrowKind(UUID)) == 16
 
