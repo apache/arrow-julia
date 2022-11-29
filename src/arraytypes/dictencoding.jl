@@ -45,7 +45,7 @@ Base.size(d::DictEncoding) = size(d.data)
 
 @propagate_inbounds function Base.getindex(d::DictEncoding{T}, i::Integer) where {T}
     @boundscheck checkbounds(d, i)
-    return @inbounds ArrowTypes.arrowconvert(T, d.data[i])
+    return @inbounds ArrowTypes.fromarrow(T, d.data[i])
 end
 
 # convenience wrapper to signal that an input column should be

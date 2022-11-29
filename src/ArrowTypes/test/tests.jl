@@ -141,7 +141,9 @@ v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
 
 @test ArrowTypes.ToArrow([1,2,3]) == [1,2,3]
 @test ArrowTypes.ToArrow([:hey, :ho]) == ["hey", "ho"]
-@test ArrowTypes.ToArrow(Any[1, 3.14]) == [1.0, 3.14]
+x = ArrowTypes.ToArrow(Any[1, 3.14])
+@test x[1] === 1.0
+@test x[2] === 3.14
 @test ArrowTypes.ToArrow(Any[1, 3.14, "hey"]) == [1.0, 3.14, "hey"]
 
 end
