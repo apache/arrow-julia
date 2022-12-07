@@ -344,7 +344,7 @@ end
 x = [ZonedDateTime(Dates.DateTime(2020), tz"Europe/Paris")]
 c = Arrow.ToTimestamp(x)
 @test eltype(c) == Arrow.Timestamp{Arrow.Flatbuf.TimeUnits.MILLISECOND, Symbol("Europe/Paris")}
-@test c[1] == Arrow.Timestamp{Arrow.Flatbuf.TimeUnits.MILLISECOND, Symbol("Europe/Paris")}(1577836800000)
+@test c[1] == Arrow.Timestamp{Arrow.Flatbuf.TimeUnits.MILLISECOND, Symbol("Europe/Paris")}(1577833200000)
 
 # 158
 # arrow ipc stream generated from pyarrow with no record batches
@@ -536,6 +536,17 @@ end
 
 # https://github.com/apache/arrow-julia/issues/324
 @test_throws ArgumentError filter!(x -> x > 1, Arrow.toarrowvector([1, 2, 3]))
+
+# https://github.com/apache/arrow-julia/issues/327
+zdt = ZonedDateTime(DateTime(2020, 11, 1, 6), tz"America/New_York"; from_utc=true)
+arrow_zdt = ArrowTypes.toarrow(zdt)
+zdt_again = ArrowTypes.fromarrow(ZonedDateTime, arrow_zdt)
+@test zdt == zdt_again
+
+# Check that we still correctly read in old TimeZones
+original_table = (; col = [ ZonedDateTime(DateTime(1, 2, 3, 4, 5, 6), tz"UTC+3") for _ in 1:5])
+table = Arrow.Table(joinpath(@__DIR__, "old_zdt.arrow"))
+@test original_table.col == table.col
 
 end # @testset "misc"
 
