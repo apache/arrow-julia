@@ -548,6 +548,12 @@ original_table = (; col = [ ZonedDateTime(DateTime(1, 2, 3, 4, 5, 6), tz"UTC+3")
 table = Arrow.Table(joinpath(@__DIR__, "old_zdt.arrow"))
 @test original_table.col == table.col
 
+# https://github.com/apache/arrow-julia/issues/367
+t = (; x=Union{ZonedDateTime,Missing}[missing])
+a = Arrow.Table(Arrow.tobuffer(t))
+@test Tables.schema(a) == Tables.schema(t)
+@test isequal(a.x, t.x)
+
 end # @testset "misc"
 
 end
