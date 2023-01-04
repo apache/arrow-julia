@@ -304,7 +304,11 @@ default(::Type{Symbol}) = Symbol()
 default(::Type{Char}) = '\0'
 default(::Type{<:AbstractString}) = ""
 default(::Type{Any}) = nothing
+default(::Type{Missing}) = missing
+default(::Type{Nothing}) = nothing
 default(::Type{Union{T, Missing}}) where {T} = default(T)
+default(::Type{Union{T, Nothing}}) where {T} = default(T)
+default(::Type{Union{T, Missing, Nothing}}) where {T} = default(T)
 
 function default(::Type{A}) where {A <: AbstractVector{T}} where {T}
     a = similar(A, 1)
