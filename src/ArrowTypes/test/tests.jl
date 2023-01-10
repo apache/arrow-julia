@@ -122,6 +122,7 @@ v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
 @test ArrowTypes.arrowname(VersionNumber) == ArrowTypes.VERSION_NUMBER
 @test ArrowTypes.JuliaType(Val(ArrowTypes.VERSION_NUMBER)) == VersionNumber
 @test ArrowTypes.fromarrow(typeof(v), v_nt) == v
+@test ArrowTypes.default(VersionNumber) == v"0"
 
 @test ArrowTypes.ArrowKind(Dict{String, Int}) == ArrowTypes.MapKind()
 @test ArrowTypes.ArrowKind(Union{String, Int}) == ArrowTypes.UnionKind()

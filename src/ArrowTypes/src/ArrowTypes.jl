@@ -273,6 +273,7 @@ const VERSION_NUMBER = Symbol("JuliaLang.VersionNumber")
 ArrowKind(::Type{VersionNumber}) = StructKind()
 arrowname(::Type{VersionNumber}) = VERSION_NUMBER
 JuliaType(::Val{VERSION_NUMBER}) = VersionNumber
+default(::Type{VersionNumber}) = v"0"
 
 function fromarrow(::Type{VersionNumber}, v::NamedTuple)
     VersionNumber(v.major, v.minor, v.patch, v.prerelease, v.build)
