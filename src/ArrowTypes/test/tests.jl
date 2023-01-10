@@ -146,4 +146,23 @@ x = ArrowTypes.ToArrow(Any[1, 3.14])
 @test x[2] === 3.14
 @test ArrowTypes.ToArrow(Any[1, 3.14, "hey"]) == [1.0, 3.14, "hey"]
 
+@testset "respect non-missing type" begin
+    struct DateTimeTZ
+        instant::Int64
+        tz::String
+    end
+
+    struct Timestamp{TZ}
+        x::Int64
+    end
+
+    ArrowTypes.ArrowType(::Type{DateTimeTZ}) = Timestamp
+    ArrowTypes.toarrow(x::DateTimeTZ) = Timestamp{Symbol(x.tz)}(x.instant)
+    ArrowTypes.default(::Type{DateTimeTZ}) = DateTimeTZ(0, "UTC")
+
+    T = Union{DateTimeTZ,Missing}
+    @test !ArrowTypes.concrete_or_concreteunion(ArrowTypes.ArrowType(T))
+    @test eltype(ArrowTypes.ToArrow(T[missing])) == Union{Timestamp{:UTC}, Missing}
+end
+
 end
