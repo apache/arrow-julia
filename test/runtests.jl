@@ -18,6 +18,15 @@ using Test, Arrow, ArrowTypes, Tables, Dates, PooledArrays, TimeZones, UUIDs,
     CategoricalArrays, DataAPI, FilePathsBase
 using Random: randstring
 
+# Compat shim for pre-julia 1.9
+if !@isdefined(pkgversion)
+    using TOML
+    function pkgversion(m::Module)
+        toml = TOML.parsefile(joinpath(pkgdir(m), "Project.toml"))
+        return VersionNumber(toml["version"])
+    end
+end
+
 include(joinpath(dirname(pathof(ArrowTypes)), "../test/tests.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/testappend.jl"))
@@ -547,6 +556,12 @@ zdt_again = ArrowTypes.fromarrow(ZonedDateTime, arrow_zdt)
 original_table = (; col = [ ZonedDateTime(DateTime(1, 2, 3, 4, 5, 6), tz"UTC+3") for _ in 1:5])
 table = Arrow.Table(joinpath(@__DIR__, "old_zdt.arrow"))
 @test original_table.col == table.col
+
+if pkgversion(ArrowTypes) >= v"2.0.1" # need the ArrowTypes bugfix to pass this test
+    # https://github.com/apache/arrow-julia/issues/243
+    table = (; col = [(; v=v"1"), (; v=v"2"), missing])
+    @test isequal(Arrow.Table(Arrow.tobuffer(table)).col, table.col)
+end
 
 end # @testset "misc"
 
