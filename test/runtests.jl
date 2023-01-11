@@ -563,6 +563,14 @@ if pkgversion(ArrowTypes) >= v"2.0.1" # need the ArrowTypes bugfix to pass this 
     @test isequal(Arrow.Table(Arrow.tobuffer(table)).col, table.col)
 end
 
+# https://github.com/apache/arrow-julia/issues/367
+if pkgversion(ArrowTypes) >= v"2.0.2"
+    t = (; x=Union{ZonedDateTime,Missing}[missing])
+    a = Arrow.Table(Arrow.tobuffer(t))
+    @test Tables.schema(a) == Tables.schema(t)
+    @test isequal(a.x, t.x)
+end
+
 end # @testset "misc"
 
 end
