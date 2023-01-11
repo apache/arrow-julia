@@ -139,35 +139,37 @@ v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
 @test !ArrowTypes.concrete_or_concreteunion(Union{Real, String})
 @test !ArrowTypes.concrete_or_concreteunion(Any)
 
-@test ArrowTypes.ToArrow([1,2,3]) == [1,2,3]
-@test ArrowTypes.ToArrow([:hey, :ho]) == ["hey", "ho"]
-x = ArrowTypes.ToArrow(Any[1, 3.14])
-@test x[1] === 1.0
-@test x[2] === 3.14
-@test ArrowTypes.ToArrow(Any[1, 3.14, "hey"]) == [1.0, 3.14, "hey"]
+@testset "ToArrow" begin
+    @test ArrowTypes.ToArrow([1,2,3]) == [1,2,3]
+    @test ArrowTypes.ToArrow([:hey, :ho]) == ["hey", "ho"]
+    x = ArrowTypes.ToArrow(Any[1, 3.14])
+    @test x[1] === 1.0
+    @test x[2] === 3.14
+    @test ArrowTypes.ToArrow(Any[1, 3.14, "hey"]) == [1.0, 3.14, "hey"]
 
-@testset "respect non-missing type" begin
-    struct DateTimeTZ
-        instant::Int64
-        tz::String
+    @testset "respect non-missing type" begin
+        struct DateTimeTZ
+            instant::Int64
+            tz::String
+        end
+
+        struct Timestamp{TZ}
+            x::Int64
+        end
+
+        ArrowTypes.ArrowType(::Type{DateTimeTZ}) = Timestamp
+        ArrowTypes.toarrow(x::DateTimeTZ) = Timestamp{Symbol(x.tz)}(x.instant)
+        ArrowTypes.default(::Type{DateTimeTZ}) = DateTimeTZ(0, "UTC")
+
+        T = Union{DateTimeTZ,Missing}
+        @test !ArrowTypes.concrete_or_concreteunion(ArrowTypes.ArrowType(T))
+        @test eltype(ArrowTypes.ToArrow(T[missing])) == Union{Timestamp{:UTC}, Missing}
+
+        # Works since `ArrowTypes.default(Any) === nothing` and
+        # `ArrowTypes.toarrow(nothing) === missing`. Defining `toarrow(::Nothing) = nothing`
+        # would break this test by returning `Union{Nothing,Missing}`.
+        @test eltype(ArrowTypes.ToArrow(Any[missing])) == Missing
     end
-
-    struct Timestamp{TZ}
-        x::Int64
-    end
-
-    ArrowTypes.ArrowType(::Type{DateTimeTZ}) = Timestamp
-    ArrowTypes.toarrow(x::DateTimeTZ) = Timestamp{Symbol(x.tz)}(x.instant)
-    ArrowTypes.default(::Type{DateTimeTZ}) = DateTimeTZ(0, "UTC")
-
-    T = Union{DateTimeTZ,Missing}
-    @test !ArrowTypes.concrete_or_concreteunion(ArrowTypes.ArrowType(T))
-    @test eltype(ArrowTypes.ToArrow(T[missing])) == Union{Timestamp{:UTC}, Missing}
-
-    # Works since `ArrowTypes.default(Any) === nothing` and
-    # `ArrowTypes.toarrow(nothing) === missing`. Defining `toarrow(::Nothing) = nothing`
-    # would break this test by returning `Union{Nothing,Missing}`.
-    @test eltype(ArrowTypes.ToArrow(Any[missing])) == Missing
 end
 
 end
