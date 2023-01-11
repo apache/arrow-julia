@@ -151,14 +151,17 @@ v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
 
     x = ArrowTypes.ToArrow([:hey, :ho])
     @test x isa ArrowTypes.ToArrow{String, Vector{Symbol}}
+    @test eltype(x) == String
     @test x == ["hey", "ho"]
 
     x = ArrowTypes.ToArrow(Any[1, 3.14])
     @test x isa ArrowTypes.ToArrow{Float64, Vector{Any}}
+    @test eltype(x) == Float64
     @test x == [1.0, 3.14]
 
     x = ArrowTypes.ToArrow(Any[1, 3.14, "hey"])
     @test x isa ArrowTypes.ToArrow{Union{Float64, String}, Vector{Any}}
+    @test eltype(x) == Union{Float64, String}
     @test x == [1.0, 3.14, "hey"]
 
     @testset "respect non-missing type" begin
