@@ -146,7 +146,7 @@ v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
 
 @testset "ToArrow" begin
     x = ArrowTypes.ToArrow([1,2,3])
-    @test x isa Int
+    @test x isa Vector{Int}
     @test x == [1,2,3]
 
     x = ArrowTypes.ToArrow([:hey, :ho])
