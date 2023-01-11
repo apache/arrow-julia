@@ -140,12 +140,21 @@ v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
 @test !ArrowTypes.concrete_or_concreteunion(Any)
 
 @testset "ToArrow" begin
-    @test ArrowTypes.ToArrow([1,2,3]) == [1,2,3]
-    @test ArrowTypes.ToArrow([:hey, :ho]) == ["hey", "ho"]
+    x = ArrowTypes.ToArrow([1,2,3])
+    @test x isa Int
+    @test x == [1,2,3]
+
+    x = ArrowTypes.ToArrow([:hey, :ho])
+    @test x isa ArrowTypes.ToArrow{String, Vector{Symbol}}
+    @test x == ["hey", "ho"]
+
     x = ArrowTypes.ToArrow(Any[1, 3.14])
-    @test x[1] === 1.0
-    @test x[2] === 3.14
-    @test ArrowTypes.ToArrow(Any[1, 3.14, "hey"]) == [1.0, 3.14, "hey"]
+    @test x isa ArrowTypes.ToArrow{Float64, Vector{Any}}
+    @test x == [1.0, 3.14]
+
+    x = ArrowTypes.ToArrow(Any[1, 3.14, "hey"])
+    @test x isa ArrowTypes.ToArrow{Union{Float64, String}, Vector{Any}}
+    @test x == [1.0, 3.14, "hey"]
 
     @testset "respect non-missing type" begin
         struct DateTimeTZ
