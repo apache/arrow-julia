@@ -163,6 +163,11 @@ x = ArrowTypes.ToArrow(Any[1, 3.14])
     T = Union{DateTimeTZ,Missing}
     @test !ArrowTypes.concrete_or_concreteunion(ArrowTypes.ArrowType(T))
     @test eltype(ArrowTypes.ToArrow(T[missing])) == Union{Timestamp{:UTC}, Missing}
+
+    # Works since `ArrowTypes.default(Any) === nothing` and
+    # `ArrowTypes.toarrow(nothing) === missing`. Defining `toarrow(::Nothing) = nothing`
+    # would break this test by returning `Union{Nothing,Missing}`.
+    @test eltype(ArrowTypes.ToArrow(Any[missing])) == Missing
 end
 
 end
