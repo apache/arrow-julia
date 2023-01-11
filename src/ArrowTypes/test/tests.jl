@@ -122,6 +122,7 @@ v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
 @test ArrowTypes.arrowname(VersionNumber) == ArrowTypes.VERSION_NUMBER
 @test ArrowTypes.JuliaType(Val(ArrowTypes.VERSION_NUMBER)) == VersionNumber
 @test ArrowTypes.fromarrow(typeof(v), v_nt) == v
+@test ArrowTypes.default(VersionNumber) == v"0"
 
 @test ArrowTypes.ArrowKind(Dict{String, Int}) == ArrowTypes.MapKind()
 @test ArrowTypes.ArrowKind(Union{String, Int}) == ArrowTypes.UnionKind()
@@ -130,7 +131,11 @@ v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
 @test ArrowTypes.default(Symbol) == Symbol()
 @test ArrowTypes.default(Char) == '\0'
 @test ArrowTypes.default(String) == ""
+@test ArrowTypes.default(Missing) === missing
+@test ArrowTypes.default(Nothing) === nothing
 @test ArrowTypes.default(Union{Int, Missing}) == Int(0)
+@test ArrowTypes.default(Union{Int, Nothing}) == Int(0)
+@test ArrowTypes.default(Union{Int, Missing, Nothing}) == Int(0)
 
 @test ArrowTypes.promoteunion(Int, Float64) == Float64
 @test ArrowTypes.promoteunion(Int, String) == Union{Int, String}

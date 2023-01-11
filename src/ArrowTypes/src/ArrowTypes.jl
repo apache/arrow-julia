@@ -273,6 +273,7 @@ const VERSION_NUMBER = Symbol("JuliaLang.VersionNumber")
 ArrowKind(::Type{VersionNumber}) = StructKind()
 arrowname(::Type{VersionNumber}) = VERSION_NUMBER
 JuliaType(::Val{VERSION_NUMBER}) = VersionNumber
+default(::Type{VersionNumber}) = v"0"
 
 function fromarrow(::Type{VersionNumber}, v::NamedTuple)
     VersionNumber(v.major, v.minor, v.patch, v.prerelease, v.build)
@@ -304,7 +305,11 @@ default(::Type{Symbol}) = Symbol()
 default(::Type{Char}) = '\0'
 default(::Type{<:AbstractString}) = ""
 default(::Type{Any}) = nothing
+default(::Type{Missing}) = missing
+default(::Type{Nothing}) = nothing
 default(::Type{Union{T, Missing}}) where {T} = default(T)
+default(::Type{Union{T, Nothing}}) where {T} = default(T)
+default(::Type{Union{T, Missing, Nothing}}) where {T} = default(T)
 
 function default(::Type{A}) where {A <: AbstractVector{T}} where {T}
     a = similar(A, 1)
