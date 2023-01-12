@@ -349,6 +349,9 @@ function ToArrow(x::A) where {A}
         for i = 2:length(x)
             @inbounds T = promoteunion(T, typeof(toarrow(x[i])))
         end
+        if T === Missing
+            T = promoteunion(T, typeof(toarrow(default(S))))
+        end
     end
     return ToArrow{T, A}(x)
 end
