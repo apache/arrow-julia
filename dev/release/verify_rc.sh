@@ -184,6 +184,9 @@ ensure_julia() {
 }
 
 test_source_distribution() {
+  pushd src/ArrowTypes
+  julia --project -e 'import Pkg; Pkg.build(); Pkg.test()'
+  popd
   julia --project -e 'import Pkg; Pkg.build(); Pkg.test()'
 }
 
