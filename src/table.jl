@@ -384,8 +384,10 @@ function getdictionaries!(dictencoded, field)
     if d !== nothing
         dictencoded[d.id] = field
     end
-    for child in field.children
-        getdictionaries!(dictencoded, child)
+    if field.children !== nothing
+        for child in field.children
+            getdictionaries!(dictencoded, child)
+        end
     end
     return
 end
