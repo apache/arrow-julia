@@ -349,7 +349,7 @@ function ToArrow(x::A) where {A}
         for i = 2:length(x)
             @inbounds T = promoteunion(T, typeof(toarrow(x[i])))
         end
-        if T === Missing
+        if T === Missing && concrete_or_concreteunion(S)
             T = promoteunion(T, typeof(toarrow(default(S))))
         end
     end
