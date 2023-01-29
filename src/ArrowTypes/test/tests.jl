@@ -164,7 +164,7 @@ v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
     @test eltype(x) == Union{Float64, String}
     @test x == [1.0, 3.14, "hey"]
 
-    @testset "respect non-missing type" begin
+    @testset "respect non-missing concrete type" begin
         struct DateTimeTZ
             instant::Int64
             tz::String
@@ -186,6 +186,13 @@ v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
         # `ArrowTypes.toarrow(nothing) === missing`. Defining `toarrow(::Nothing) = nothing`
         # would break this test by returning `Union{Nothing,Missing}`.
         @test eltype(ArrowTypes.ToArrow(Any[missing])) == Missing
+    end
+
+    @testset "ignore non-missing abstract type" begin
+        x = ArrowTypes.ToArrow(Union{Missing,Array{Int}}[missing])
+        @test x isa ArrowTypes.ToArrow{Missing, Vector{Union{Missing, Array{Int64}}}}
+        @test eltype(x) == Missing
+        @test isequal(x, [missing])
     end
 end
 
