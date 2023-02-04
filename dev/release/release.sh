@@ -28,12 +28,6 @@ fi
 version=$1
 rc=$2
 
-rc_tag="v${version}-rc${rc}"
-release_tag="v${version}"
-echo "Tagging for release: ${release_tag}"
-git tag -a -m "${version}" "${release_tag}" "${rc_tag}^{}"
-git push origin "${release_tag}"
-
 rc_id="apache-arrow-julia-${version}-rc${rc}"
 release_id="arrow-julia-${version}"
 echo "Move from dev/ to release/"
