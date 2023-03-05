@@ -20,6 +20,7 @@ in order to signal how they should be serialized in the arrow format.
 """
 module ArrowTypes
 
+using Sockets
 using UUIDs
 
 export ArrowKind, NullKind, PrimitiveKind, BoolKind, ListKind, FixedSizeListKind, MapKind, StructKind, UnionKind, DictEncodedKind, toarrow, arrowname, fromarrow, ToArrow
@@ -233,6 +234,22 @@ const UUIDSYMBOL = Symbol("JuliaLang.UUID")
 arrowname(::Type{UUID}) = UUIDSYMBOL
 JuliaType(::Val{UUIDSYMBOL}) = UUID
 fromarrow(::Type{UUID}, x::NTuple{16, UInt8}) = UUID(_cast(UInt128, x))
+
+ArrowKind(::Type{IPv4}) = PrimitiveKind()
+ArrowType(::Type{IPv4}) = UInt32
+toarrow(x::IPv4) = x.host
+const IPV4_SYMBOL = Symbol("JuliaLang.IPv4")
+arrowname(::Type{IPv4}) = IPV4_SYMBOL
+JuliaType(::Val{IPV4_SYMBOL}) = IPv4
+fromarrow(::Type{IPv4}, x::Integer) = IPv4(x)
+
+ArrowKind(::Type{IPv6}) = FixedSizeListKind{16, UInt8}()
+ArrowType(::Type{IPv6}) = NTuple{16, UInt8}
+toarrow(x::IPv6) = _cast(NTuple{16, UInt8}, x.host)
+const IPV6_SYMBOL = Symbol("JuliaLang.IPv6")
+arrowname(::Type{IPv6}) = IPV6_SYMBOL
+JuliaType(::Val{IPV6_SYMBOL}) = IPv6
+fromarrow(::Type{IPv6}, x::NTuple{16, UInt8}) = IPv6(_cast(UInt128, x))
 
 function _cast(::Type{Y}, x)::Y where {Y}
     y = Ref{Y}()

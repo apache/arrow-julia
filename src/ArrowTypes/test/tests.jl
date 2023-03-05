@@ -104,6 +104,23 @@ ubytes = ArrowTypes._cast(NTuple{16, UInt8}, u.value)
 @test ArrowTypes.JuliaType(Val(ArrowTypes.UUIDSYMBOL)) == UUID
 @test ArrowTypes.fromarrow(UUID, ubytes) == u
 
+ip4 = IPv4(rand(UInt32))
+@test ArrowTypes.ArrowKind(ip4) == PrimitiveKind()
+@test ArrowTypes.ArrowType(IPv4) == UInt32
+@test ArrowTypes.toarrow(ip4) == ip4.host
+@test ArrowTypes.arrowname(IPv4) == ArrowTypes.IPV4_SYMBOL
+@test ArrowTypes.JuliaType(Val(ArrowTypes.IPV4_SYMBOL)) == IPv4
+@test ArrowTypes.fromarrow(IPv4, ip4.host) == ip4
+
+ip6 = IPv6(rand(UInt128))
+ip6_ubytes = ArrowTypes._cast(NTuple{16, UInt8}, ip6.host)
+@test ArrowTypes.ArrowKind(ip6) == ArrowTypes.FixedSizeListKind{16, UInt8}()
+@test ArrowTypes.ArrowType(IPv6) == NTuple{16, UInt8}
+@test ArrowTypes.toarrow(ip6) == ip6_ubytes
+@test ArrowTypes.arrowname(IPv6) == ArrowTypes.IPV6_SYMBOL
+@test ArrowTypes.JuliaType(Val(ArrowTypes.IPV6_SYMBOL)) == IPv6
+@test ArrowTypes.fromarrow(IPv6, ip6_ubytes) == ip6
+
 nt = (id=1, name="bob")
 @test ArrowTypes.ArrowKind(NamedTuple) == ArrowTypes.StructKind()
 @test ArrowTypes.fromarrow(typeof(nt), nt) === nt
