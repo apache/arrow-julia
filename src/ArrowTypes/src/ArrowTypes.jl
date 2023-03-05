@@ -102,6 +102,10 @@ function arrowname end
 const EMPTY_SYMBOL = Symbol()
 arrowname(T) = EMPTY_SYMBOL
 hasarrowname(T) = arrowname(T) !== EMPTY_SYMBOL
+arrowname(::Type{Union{T,Missing}}) where {T} = arrowname(T)
+arrowname(::Type{Union{T,Nothing}}) where {T} = arrowname(T)
+arrowname(::Type{Missing}) = EMPTY_SYMBOL
+arrowname(::Type{Any}) = EMPTY_SYMBOL
 
 """
     ArrowTypes.arrowmetadata(T) => String
@@ -113,7 +117,13 @@ kinds of types when deserializing, these type parameters can be stored by defini
 This will then be available to access by overloading `ArrowTypes.JuliaType(::Val{Symbol(name)}, S, arrowmetadata::String)`.
 """
 function arrowmetadata end
-arrowmetadata(T) = ""
+const EMPTY_STRING = ""
+arrowmetadata(T) = EMPTY_STRING
+arrowmetadata(::Type{Union{T,Missing}}) where {T} = arrowmetadata{T}
+arrowmetadata(::Type{Union{T,Nothing}}) where {T} = arrowmetadata{T}
+arrowmetadata(::Type{Nothing}) = EMPTY_STRING
+arrowmetadata(::Type{Missing}) = EMPTY_STRING
+arrowmetadata(::Type{Any}) = EMPTY_STRING
 
 """
     ArrowTypes.JuliaType(::Val{Symbol(name)}, ::Type{S}, arrowmetadata::String) = T
