@@ -87,6 +87,7 @@ Stream(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...) = Stream([Arrow
 Stream(inputs::Vector; kw...) = Stream([ArrowBlob(tobytes(x), 1, nothing) for x in inputs]; kw...)
 
 Base.IteratorSize(::Type{Stream}) = Base.SizeUnknown()
+Base.eltype(::Type{Stream}) = Table
 
 function BatchIterator(blob::ArrowBlob)
     bytes, pos, len = blob.bytes, blob.pos, blob.len
