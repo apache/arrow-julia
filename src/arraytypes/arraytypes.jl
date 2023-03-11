@@ -38,11 +38,17 @@ function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=g
     if compression isa LZ4FrameCompressor
         A = compress(Meta.CompressionTypes.LZ4_FRAME, compression, A)
     elseif compression isa Vector{LZ4FrameCompressor}
-        A = compress(Meta.CompressionTypes.LZ4_FRAME, compression[Threads.threadid()], A)
+        tid=Threads.threadid()
+        A = lock(LZ4_FRAME_DECOMPRESSOR_LOCK[tid]) do
+            compress(Meta.CompressionTypes.LZ4_FRAME, compression[tid], A)
+        end
     elseif compression isa ZstdCompressor
         A = compress(Meta.CompressionTypes.ZSTD, compression, A)
     elseif compression isa Vector{ZstdCompressor}
-        A = compress(Meta.CompressionTypes.ZSTD, compression[Threads.threadid()], A)
+        tid=Threads.threadid()
+        A = lock(ZSTD_DECOMPRESSOR_LOCK[tid]) do
+            compress(Meta.CompressionTypes.ZSTD, compression[tid], A)
+        end
     end
     @debugv 2 "converted top-level column to arrow format: $(typeof(A))"
     @debugv 3 A
