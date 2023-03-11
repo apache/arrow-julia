@@ -2,7 +2,7 @@
 
 # We know the size of each output buffer (saved within Arrow metadata)
 # The below functions mutates the provided output buffer.
-function _transcode!(codec::Union{LZ4FrameDecompressor,LZ4FrameDecompressor}, data::TS.ByteData,output::TS.Buffer)
+function _transcode!(codec::Union{LZ4FrameDecompressor,ZstdDecompressor}, data::TS.ByteData,output::TS.Buffer)
     input = TS.Buffer(data)
     error = TS.Error()
     code = TS.startproc(codec, :write, error)
