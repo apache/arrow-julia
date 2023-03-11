@@ -2,7 +2,8 @@
 
 ### Type extensions
 # Use InlineStrings to get data from pointers (for getindex and similar)
-ArrowTypes.fromarrow(::Type{T}, ptr::Ptr{UInt8}, len::Int) where {T<:InlineString} = ArrowTypes.fromarrow(T, T(ptr, len))
+ArrowTypes.fromarrow(::Type{T}, ptr::Ptr{UInt8}, len::Int) where {T<:InlineString} =ArrowTypes.fromarrow(T, T(ptr, len))
+ArrowTypes.fromarrow(::Type{Union{T,Missing}}, ptr::Ptr{UInt8}, len::Int) where {T<:InlineString} =ArrowTypes.fromarrow(T, T(ptr, len))
 
 ### Utilities for inlining strings
 # determines the maximum string length necessary for the offsets 
