@@ -352,6 +352,8 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true, useinlinestrings::B
                 @debugv 1 "parsing record batch message: compression = $(header.compression)"
                 Threads.@spawn begin
                     cols = collect(VectorIterator(sch, $batch, dictencodings, convert))
+                    # apply inlinestrings to each column if requested
+                    convert && useinlinestrings && (cols .= _inlinestrings.(cols))
                     put!(() -> put!(tsks, cols), sync, $(rbi))
                 end
                 rbi += 1
@@ -362,10 +364,6 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true, useinlinestrings::B
     end
     close(tsks)
     wait(tsk)
-
-    # apply inlinestrings to each column if requested
-    convert && useinlinestrings && (columns(t) .= _inlinestrings.(columns(t)))
-
     lu = lookup(t)
     ty = types(t)
     # 158; some implementations may send 0 record batches
