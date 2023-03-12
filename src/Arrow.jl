@@ -73,6 +73,13 @@ include("show.jl")
 
 const LZ4_FRAME_COMPRESSOR = LZ4FrameCompressor[]
 const ZSTD_COMPRESSOR = ZstdCompressor[]
+const LZ4_FRAME_DECOMPRESSOR = LZ4FrameDecompressor[]
+const ZSTD_DECOMPRESSOR = ZstdDecompressor[]
+# add locks for multithreaded (de/)compression (because we index by threadid which might not be safe under Julia >1.8)
+const LZ4_FRAME_COMPRESSOR_LOCK = ReentrantLock[]
+const ZSTD_COMPRESSOR_LOCK = ReentrantLock[]
+const LZ4_FRAME_DECOMPRESSOR_LOCK = ReentrantLock[]
+const ZSTD_DECOMPRESSOR_LOCK = ReentrantLock[]
 
 function __init__()
     for _ = 1:Threads.nthreads()
@@ -82,6 +89,19 @@ function __init__()
         lz4 = LZ4FrameCompressor(; compressionlevel=4)
         CodecLz4.TranscodingStreams.initialize(lz4)
         push!(LZ4_FRAME_COMPRESSOR, lz4)
+        # Locks
+        push!(LZ4_FRAME_COMPRESSOR_LOCK, ReentrantLock())
+        push!(ZSTD_COMPRESSOR_LOCK, ReentrantLock())
+        # Decompressors
+        zstdd = ZstdDecompressor()
+        CodecZstd.TranscodingStreams.initialize(zstdd)
+        push!(ZSTD_DECOMPRESSOR, zstdd)
+        lz4d = LZ4FrameDecompressor()
+        CodecLz4.TranscodingStreams.initialize(lz4d)
+        push!(LZ4_FRAME_DECOMPRESSOR, lz4d)
+        # Locks
+        push!(LZ4_FRAME_DECOMPRESSOR_LOCK, ReentrantLock())
+        push!(ZSTD_DECOMPRESSOR_LOCK, ReentrantLock())
     end
     return
 end
