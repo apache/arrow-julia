@@ -80,11 +80,32 @@ function Stream(inputs::Vector{ArrowBlob}; convert::Bool=true)
     Stream(inputs, inputindex, batchiterator, names, types, schema, dictencodings, dictencoded, convert, compression)
 end
 
-Tables.partitions(x::Stream) = x
-
 Stream(input, pos::Integer=1, len=nothing; kw...) = Stream([ArrowBlob(tobytes(input), pos, len)]; kw...)
 Stream(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...) = Stream([ArrowBlob(tobytes(input), pos, len)]; kw...)
 Stream(inputs::Vector; kw...) = Stream([ArrowBlob(tobytes(x), 1, nothing) for x in inputs]; kw...)
+
+function initialize!(x::Stream)
+    isempty(getfield(x, :names)) || return
+    # Initialize member fields using iteration and reset state
+    lastinputindex = x.inputindex
+    lastbatchiterator = x.batchiterator
+    iterate(x)
+    x.inputindex = lastinputindex
+    x.batchiterator = lastbatchiterator
+    nothing
+end
+
+Tables.partitions(x::Stream) = x
+
+function Tables.columnnames(x::Stream)
+    initialize!(x)
+    getfield(x, :names)
+end
+
+function Tables.schema(x::Stream)
+    initialize!(x)
+    Tables.Schema(Tables.columnnames(x), getfield(x, :types))
+end
 
 Base.IteratorSize(::Type{Stream}) = Base.SizeUnknown()
 Base.eltype(::Type{Stream}) = Table
