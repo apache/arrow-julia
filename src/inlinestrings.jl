@@ -55,7 +55,6 @@ _inlinestrings(vect::SentinelArrays.ChainedVector{<:Union{T,Union{T,Missing}}}) 
 function _inlinestrings(vectofvect::SentinelArrays.ChainedVector{T, Arrow.List{T,O,A}}) where {T<:Union{AbstractString,Union{Missing,AbstractString}},O,A}
     # find the smallest common denominator string type for all chained arrays
     S = pick_string_type(T, _offsetsints.(vectofvect.arrays))
-    @info "" S T
     if S == T
         # if the type is the same, we can pass it through
         return vectofvect
@@ -66,7 +65,7 @@ function _inlinestrings(vectofvect::SentinelArrays.ChainedVector{T, Arrow.List{T
     end
 end
 
-# TODO: handle ChainedVector that contains something else than Arrow.List with Strings
+# TODO: check that we handle ChainedVector that contains something else than Arrow.List with Strings
 
 # if we detect that the strings are small enough, we can inline them
 function _inlinestrings(vect::Arrow.List{T,O,A}) where {T<:Union{AbstractString,Union{AbstractString,Missing}},O,A}
