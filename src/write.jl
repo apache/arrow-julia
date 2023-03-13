@@ -55,9 +55,10 @@ function write end
 write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
 
 function write(file_path, tbl; chunksize::Union{Nothing,Integer}=64000, kwargs...)
-    if !isnothing(chunksize) && Tables.istable(tbl)
+    # rowaccces is required to ensure we can automatically partition by rows (not satisfied for columntables)
+    if !isnothing(chunksize) && Tables.istable(tbl) && Tables.rowaccess(tbl)
         @assert chunksize >= 0 "chunksize must be >= 0"
-        tbl_source = Iterators.partition(Tables.rows(tbl),chunksize)
+        tbl_source = Iterators.partition(tbl, chunksize)
     else
         tbl_source = tbl 
     end
@@ -286,9 +287,10 @@ function Base.close(writer::Writer)
 end
 
 function write(io::IO, tbl; chunksize::Union{Nothing,Integer}=64000, kwargs...)
-    if !isnothing(chunksize) && Tables.istable(tbl)
+    # rowaccces is required to ensure we can automatically partition by rows (not satisfied for columntables)
+    if !isnothing(chunksize) && Tables.istable(tbl) && Tables.rowaccess(tbl)
         @assert chunksize >= 0 "chunksize must be >= 0"
-        tbl_source = Iterators.partition(Tables.rows(tbl),chunksize)
+        tbl_source = Iterators.partition(tbl, chunksize)
     else
         tbl_source = tbl
     end
