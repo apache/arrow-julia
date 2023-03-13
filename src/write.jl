@@ -55,10 +55,17 @@ function write end
 write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
 
 function write(file_path, tbl; chunksize::Union{Nothing,Integer}=64000, kwargs...)
-    # rowaccces is necessary pre-requisite for row-iteration (not sufficient though)
+    # rowaccces is a necessary pre-requisite for row-iteration (not sufficient though)
     if !isnothing(chunksize) && Tables.istable(tbl) && Tables.rowaccess(tbl)
         @assert chunksize >= 0 "chunksize must be >= 0"
-        tbl_source = Iterators.partition(Tables.rows(tbl), chunksize)
+        if hasmethod(Iterators.partition,(typeof(tbl),))
+            tbl_source = Iterators.partition(tbl, chunksize)
+            # verify that we iterated over rows, not columns
+            @assert length(tbl_source) == cld(size(tbl)[1], chunksize) "Default partitioning method has failed for the provided table (chunks expected: $(cld(size(tbl)[1], chunksize)), chunks found: $(length(tbl_source))). Please set `chunksize=nothing` to disable chunking"
+        else 
+            # general fallback
+            tbl_source = Iterators.partition(Tables.rows(tbl), chunksize)
+        end
     else
         tbl_source = tbl 
     end
@@ -287,12 +294,19 @@ function Base.close(writer::Writer)
 end
 
 function write(io::IO, tbl; chunksize::Union{Nothing,Integer}=64000, kwargs...)
-    # rowaccces is necessary pre-requisite for row-iteration (not sufficient though)
+    # rowaccces is a necessary pre-requisite for row-iteration (not sufficient though)
     if !isnothing(chunksize) && Tables.istable(tbl) && Tables.rowaccess(tbl)
         @assert chunksize >= 0 "chunksize must be >= 0"
-        tbl_source = Iterators.partition(Tables.rows(tbl), chunksize)
+        if hasmethod(Iterators.partition,(typeof(tbl),))
+            tbl_source = Iterators.partition(tbl, chunksize)
+            # verify that we iterated over rows, not columns
+            @assert length(tbl_source) == cld(size(tbl)[1], chunksize) "Default partitioning method has failed for the provided table (chunks expected: $(cld(size(tbl)[1], chunksize)), chunks found: $(length(tbl_source))). Please set `chunksize=nothing` to disable chunking"
+        else 
+            # general fallback
+            tbl_source = Iterators.partition(Tables.rows(tbl), chunksize)
+        end
     else
-        tbl_source = tbl
+        tbl_source = tbl 
     end
     open(Writer, io; file=false, kwargs...) do writer
         write(writer, tbl_source)
