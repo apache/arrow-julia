@@ -205,7 +205,7 @@ struct ListKind{stringtype} <: ArrowKind end
 
 ListKind() = ListKind{false}()
 isstringtype(::ListKind{stringtype}) where {stringtype} = stringtype
-isstringtype(::Type{ListKind{stringtype}}) where {stringtype} = stringtype
+isstringtype(::Type{T}) where {stringtype, T<:ListKind{stringtype}} = stringtype
 
 ArrowKind(::Type{<:AbstractString}) = ListKind{true}()
 # Treate Base.CodeUnits as Binary arrow type
@@ -239,7 +239,7 @@ struct FixedSizeListKind{N, T} <: ArrowKind end
 gettype(::FixedSizeListKind{N, T}) where {N, T} = T
 getsize(::FixedSizeListKind{N, T}) where {N, T} = N
 
-ArrowKind(::Type{NTuple{N, T}}) where {N, T} = FixedSizeListKind{N, T}()
+ArrowKind(::Type{NT}) where {N, T, NT<:NTuple{N, T}} = FixedSizeListKind{N, T}()
 
 ArrowKind(::Type{UUID}) = FixedSizeListKind{16, UInt8}()
 ArrowType(::Type{UUID}) = NTuple{16, UInt8}
@@ -286,7 +286,7 @@ struct StructKind <: ArrowKind end
 
 ArrowKind(::Type{<:NamedTuple}) = StructKind()
 
-fromarrow(::Type{NamedTuple{names, types}}, x::NamedTuple{names, types}) where {names, types <: Tuple} = x
+fromarrow(::Type{NT}, x::NamedTuple{names, types}) where {names, types<:Tuple, NT<:NamedTuple{names,types}} = x
 fromarrow(::Type{T}, x::NamedTuple) where {T} = fromarrow(T, Tuple(x)...)
 
 ArrowKind(::Type{<:Tuple}) = StructKind()
@@ -348,10 +348,10 @@ function default(::Type{A}) where {A <: AbstractVector{T}} where {T}
     return a
 end
 
-default(::Type{NTuple{N, T}}) where {N, T} = ntuple(i -> default(T), N)
+default(::Type{NT}) where {N, T, NT<:NTuple{N, T}} = ntuple(i -> default(T), N)
 default(::Type{T}) where {T <: Tuple} = Tuple(default(fieldtype(T, i)) for i = 1:fieldcount(T))
 default(::Type{T}) where {T <: AbstractDict} = T()
-default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{names}(Tuple(default(fieldtype(types, i)) for i = 1:length(names)))
+default(::Type{NT}) where {names, types, NT<:NamedTuple{names, types}} = NamedTuple{names}(Tuple(default(fieldtype(types, i)) for i = 1:length(names)))
 
 function promoteunion(T, S)
     new = promote_type(T, S)
@@ -389,7 +389,7 @@ end
 
 Base.IndexStyle(::Type{<:ToArrow}) = Base.IndexLinear()
 Base.size(x::ToArrow) = (length(x.data),)
-Base.eltype(x::ToArrow{T, A}) where {T, A} = T
+Base.eltype(::Type{TA}) where {T, A, TA<:ToArrow{T, A}} = T
 function _convert(::Type{T}, x) where {T}
     if x isa T
         return x

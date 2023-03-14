@@ -82,7 +82,7 @@ end
 
 arrowvector(::StructKind, x::Struct, i, nl, fi, de, ded, meta; kw...) = x
 
-namedtupletype(::Type{NamedTuple{names, types}}, data) where {names, types} = NamedTuple{names, Tuple{(eltype(x) for x in data)...}}
+namedtupletype(::Type{NT}, data) where {names, types, NT<:NamedTuple{names, types}} = NamedTuple{names, Tuple{(eltype(x) for x in data)...}}
 namedtupletype(::Type{T}, data) where {T} = NamedTuple{fieldnames(T), Tuple{(eltype(x) for x in data)...}}
 namedtupletype(::Type{T}, data) where {T <: Tuple} = NamedTuple{map(Symbol, fieldnames(T)), Tuple{(eltype(x) for x in data)...}}
 

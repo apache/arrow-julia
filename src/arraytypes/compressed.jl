@@ -35,7 +35,7 @@ struct Compressed{Z, A}
 end
 
 Base.length(c::Compressed) = c.len
-Base.eltype(c::Compressed{Z, A}) where {Z, A} = eltype(A)
+Base.eltype(::Type{C}) where {Z, A, C<:Compressed{Z, A}} = eltype(A)
 getmetadata(x::Compressed) = getmetadata(x.data)
 compressiontype(c::Compressed{Z}) where {Z} = Z
 
