@@ -73,21 +73,11 @@ end
 # count # of missing elements in an iterable
 nullcount(col) = count(ismissing, col)
 
-# like startswith/endswith for strings, but on byte buffers
+# like startswith for strings, but on byte buffers
 function _startswith(a::AbstractVector{UInt8}, pos::Integer, b::AbstractVector{UInt8})
     for i = 1:length(b)
         @inbounds check = a[pos + i - 1] == b[i]
         check || return false
-    end
-    return true
-end
-
-function _endswith(a::AbstractVector{UInt8}, endpos::Integer, b::AbstractVector{UInt8})
-    aoff = endpos - length(b) + 1
-    for i = 1:length(b)
-        @inbounds check = a[aoff] == b[i]
-        check || return false
-        aoff += 1
     end
     return true
 end

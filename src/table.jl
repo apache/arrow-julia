@@ -30,6 +30,13 @@ tobytes(file_path) = open(tobytes, file_path, "r")
 struct BatchIterator
     bytes::Vector{UInt8}
     startpos::Int
+    function BatchIterator(blob::ArrowBlob)
+        bytes, pos, len = blob.bytes, blob.pos, blob.len
+        if len > 24 && _startswith(bytes, pos, FILE_FORMAT_MAGIC_BYTES)
+            pos += 8 # skip past magic bytes + padding
+        end
+        new(bytes, pos)
+    end
 end
 
 """
@@ -109,16 +116,6 @@ end
 
 Base.IteratorSize(::Type{Stream}) = Base.SizeUnknown()
 Base.eltype(::Type{Stream}) = Table
-
-function BatchIterator(blob::ArrowBlob)
-    bytes, pos, len = blob.bytes, blob.pos, blob.len
-    if len > 24 &&
-        _startswith(bytes, pos, FILE_FORMAT_MAGIC_BYTES) &&
-        _endswith(bytes, pos + len - 1, FILE_FORMAT_MAGIC_BYTES)
-        pos += 8 # skip past magic bytes + padding
-    end
-    BatchIterator(bytes, pos)
-end
 
 function Base.iterate(x::Stream, (pos, id)=(1, 0))
     if isnothing(x.batchiterator)
@@ -319,13 +316,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
     anyrecordbatches = false
     rbi = 1
     @sync for blob in blobs
-        bytes, pos, len = blob.bytes, blob.pos, blob.len
-        if len > 24 &&
-            _startswith(bytes, pos, FILE_FORMAT_MAGIC_BYTES) &&
-            _endswith(bytes, pos + len - 1, FILE_FORMAT_MAGIC_BYTES)
-            pos += 8 # skip past magic bytes + padding
-        end
-        for batch in BatchIterator(bytes, pos)
+        for batch in BatchIterator(blob)
             # store custom_metadata of batch.msg?
             header = batch.msg.header
             if header isa Meta.Schema

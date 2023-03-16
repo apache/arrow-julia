@@ -189,7 +189,7 @@ function write(writer::Writer, source)
         if !isassigned(writer.firstcols)
             if writer.writetofile
                 @debugv 1 "starting write of arrow formatted file"
-                Base.write(writer.io, "ARROW1\0\0")
+                Base.write(writer.io, FILE_FORMAT_MAGIC_BYTES, b"\0\0")
             end
             meta = isnothing(writer.meta) ? getmetadata(source) : writer.meta
             cols = toarrowtable(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, meta, writer.colmeta)
@@ -358,7 +358,7 @@ function Base.write(io::IO, msg::Message, blocks, sch, alignment)
     end
     # now write the final message spec out
     # continuation byte
-    n = Base.write(io, 0xFFFFFFFF)
+    n = Base.write(io, CONTINUATION_INDICATOR_BYTES)
     # metadata length
     n += Base.write(io, Int32(metalen))
     # message flatbuffer
