@@ -15,6 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-using Test, ArrowTypes, UUIDs
+using Test, ArrowTypes, UUIDs, Sockets
 
 include("tests.jl")

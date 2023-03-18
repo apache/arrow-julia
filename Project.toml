@@ -18,7 +18,7 @@
 name = "Arrow"
 uuid = "69666777-d1a9-59fb-9406-91d4454c9d45"
 authors = ["quinnj <quinn.jacobd@gmail.com>"]
-version = "2.4.2"
+version = "2.5.0"
 
 [deps]
 ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"

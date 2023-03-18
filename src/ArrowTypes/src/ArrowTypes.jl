@@ -20,6 +20,7 @@ in order to signal how they should be serialized in the arrow format.
 """
 module ArrowTypes
 
+using Sockets
 using UUIDs
 
 export ArrowKind, NullKind, PrimitiveKind, BoolKind, ListKind, FixedSizeListKind, MapKind, StructKind, UnionKind, DictEncodedKind, toarrow, arrowname, fromarrow, ToArrow
@@ -101,6 +102,10 @@ function arrowname end
 const EMPTY_SYMBOL = Symbol()
 arrowname(T) = EMPTY_SYMBOL
 hasarrowname(T) = arrowname(T) !== EMPTY_SYMBOL
+arrowname(::Type{Union{T,Missing}}) where {T} = arrowname(T)
+arrowname(::Type{Union{T,Nothing}}) where {T} = arrowname(T)
+arrowname(::Type{Missing}) = EMPTY_SYMBOL
+arrowname(::Type{Any}) = EMPTY_SYMBOL
 
 """
     ArrowTypes.arrowmetadata(T) => String
@@ -112,7 +117,13 @@ kinds of types when deserializing, these type parameters can be stored by defini
 This will then be available to access by overloading `ArrowTypes.JuliaType(::Val{Symbol(name)}, S, arrowmetadata::String)`.
 """
 function arrowmetadata end
-arrowmetadata(T) = ""
+const EMPTY_STRING = ""
+arrowmetadata(T) = EMPTY_STRING
+arrowmetadata(::Type{Union{T,Missing}}) where {T} = arrowmetadata{T}
+arrowmetadata(::Type{Union{T,Nothing}}) where {T} = arrowmetadata{T}
+arrowmetadata(::Type{Nothing}) = EMPTY_STRING
+arrowmetadata(::Type{Missing}) = EMPTY_STRING
+arrowmetadata(::Type{Any}) = EMPTY_STRING
 
 """
     ArrowTypes.JuliaType(::Val{Symbol(name)}, ::Type{S}, arrowmetadata::String) = T
@@ -234,6 +245,22 @@ arrowname(::Type{UUID}) = UUIDSYMBOL
 JuliaType(::Val{UUIDSYMBOL}) = UUID
 fromarrow(::Type{UUID}, x::NTuple{16, UInt8}) = UUID(_cast(UInt128, x))
 
+ArrowKind(::Type{IPv4}) = PrimitiveKind()
+ArrowType(::Type{IPv4}) = UInt32
+toarrow(x::IPv4) = x.host
+const IPV4_SYMBOL = Symbol("JuliaLang.IPv4")
+arrowname(::Type{IPv4}) = IPV4_SYMBOL
+JuliaType(::Val{IPV4_SYMBOL}) = IPv4
+fromarrow(::Type{IPv4}, x::Integer) = IPv4(x)
+
+ArrowKind(::Type{IPv6}) = FixedSizeListKind{16, UInt8}()
+ArrowType(::Type{IPv6}) = NTuple{16, UInt8}
+toarrow(x::IPv6) = _cast(NTuple{16, UInt8}, x.host)
+const IPV6_SYMBOL = Symbol("JuliaLang.IPv6")
+arrowname(::Type{IPv6}) = IPV6_SYMBOL
+JuliaType(::Val{IPV6_SYMBOL}) = IPv6
+fromarrow(::Type{IPv6}, x::NTuple{16, UInt8}) = IPv6(_cast(UInt128, x))
+
 function _cast(::Type{Y}, x)::Y where {Y}
     y = Ref{Y}()
     _unsafe_cast!(y, Ref(x), 1)
@@ -349,7 +376,7 @@ function ToArrow(x::A) where {A}
         for i = 2:length(x)
             @inbounds T = promoteunion(T, typeof(toarrow(x[i])))
         end
-        if T === Missing
+        if T === Missing && concrete_or_concreteunion(S)
             T = promoteunion(T, typeof(toarrow(default(S))))
         end
     end

@@ -121,6 +121,7 @@ tt = Arrow.Table(io)
 # Arrow.Stream
 seekstart(io)
 str = Arrow.Stream(io)
+@test eltype(str) == Arrow.Table
 state = iterate(str)
 @test state !== nothing
 tt, st = state
