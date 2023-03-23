@@ -32,7 +32,7 @@ getmetadata(x::ArrowVector) = x.metadata
 Base.deleteat!(x::T, inds) where {T <: ArrowVector} = throw(ArgumentError("`$T` does not support `deleteat!`; arrow data is by nature immutable"))
 
 function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Vector{LZ4FrameCompressor}, LZ4FrameCompressor, Vector{ZstdCompressor}, ZstdCompressor}=nothing, kw...)
-    @debugv 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(kw.data)"
+    @debugv 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(values(kw))"
     @debugv 3 x
     A = arrowvector(x, i, 0, 0, de, ded, meta; compression=compression, kw...)
     if compression isa LZ4FrameCompressor
