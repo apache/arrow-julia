@@ -66,9 +66,14 @@ mutable struct Stream
     dictencoded::Dict{Int64, Meta.Field} # dictionary id => field
     convert::Bool
     compression::Ref{Union{Symbol,Nothing}}
+    filtercolumns::Union{Nothing,Vector{String}}
 end
 
-function Stream(inputs::Vector{ArrowBlob}; convert::Bool=true)
+function Stream(
+    inputs::Vector{ArrowBlob};
+    convert::Bool=true,
+    filtercolumns::Union{Nothing,Vector{String}}=nothing,
+)
     inputindex = 1
     batchiterator = nothing
     names = Symbol[]
@@ -77,7 +82,7 @@ function Stream(inputs::Vector{ArrowBlob}; convert::Bool=true)
     dictencodings = Dict{Int64, DictEncoding}()
     dictencoded = Dict{Int64, Meta.Field}()
     compression = Ref{Union{Symbol,Nothing}}(nothing)
-    Stream(inputs, inputindex, batchiterator, names, types, schema, dictencodings, dictencoded, convert, compression)
+    Stream(inputs, inputindex, batchiterator, names, types, schema, dictencodings, dictencoded, convert, compression, filtercolumns)
 end
 
 Stream(input, pos::Integer=1, len=nothing; kw...) = Stream([ArrowBlob(tobytes(input), pos, len)]; kw...)
@@ -152,6 +157,7 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
                 # assert endianness?
                 # store custom_metadata?
                 for (i, field) in enumerate(x.schema.fields)
+                    isnothing(x.filtercolumns) || field.name in x.filtercolumns || continue
                     push!(x.names, Symbol(field.name))
                     push!(x.types, juliaeltype(field, buildmetadata(field.custom_metadata), x.convert))
                     # recursively find any dictionaries for any fields
@@ -188,7 +194,7 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
             if header.compression !== nothing
                 compression = header.compression
             end
-            for vec in VectorIterator(x.schema, batch, x.dictencodings, x.convert)
+            for vec in vectoriterator(x.schema, batch, x.dictencodings, x.convert; x.filtercolumns)
                 push!(columns, vec)
             end
             break
@@ -210,6 +216,7 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
     lookup = Dict{Symbol, AbstractVector}()
     types = Type[]
     for (nm, col) in zip(x.names, columns)
+        isnothing(x.filtercolumns) || String(nm) in x.filtercolumns || continue
         lookup[nm] = col
         push!(types, eltype(col))
     end
@@ -292,7 +299,11 @@ Table(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...) = Table([ArrowBl
 Table(inputs::Vector; kw...) = Table([ArrowBlob(tobytes(x), 1, nothing) for x in inputs]; kw...)
 
 # will detect whether we're reading a Table from a file or stream
-function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
+function Table(
+    blobs::Vector{ArrowBlob};
+    convert::Bool=true,
+    filtercolumns::Union{Nothing,Vector{String}}=nothing,
+)
     t = Table()
     sch = nothing
     dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
@@ -334,6 +345,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                 # store custom_metadata?
                 if sch === nothing
                     for (i, field) in enumerate(header.fields)
+                        isnothing(filtercolumns) || field.name in filtercolumns || continue
                         push!(names(t), Symbol(field.name))
                         # recursively find any dictionaries for any fields
                         getdictionaries!(dictencoded, field)
@@ -351,6 +363,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                 if haskey(dictencodings, id) && header.isDelta
                     # delta
                     field = dictencoded[id]
+                    isnothing(filtercolumns) || field.name in filtercolumns || continue
                     values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
                     dictencoding = dictencodings[id]
                     if typeof(dictencoding.data) <: ChainedVector
@@ -373,7 +386,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                 anyrecordbatches = true
                 @debugv 1 "parsing record batch message: compression = $(header.compression)"
                 Threads.@spawn begin
-                    cols = collect(VectorIterator(sch, $batch, dictencodings, convert))
+                    cols = collect(vectoriterator(sch, $batch, dictencodings, convert; filtercolumns))
                     put!(() -> put!(tsks, cols), sync, $(rbi))
                 end
                 rbi += 1
@@ -389,11 +402,13 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
     # 158; some implementations may send 0 record batches
     if !anyrecordbatches && !isnothing(sch)
         for field in sch.fields
+            isnothing(filtercolumns) || field.name in filtercolumns || continue
             T = juliaeltype(field, buildmetadata(field), convert)
             push!(columns(t), T[])
         end
     end
     for (nm, col) in zip(names(t), columns(t))
+        isnothing(filtercolumns) || String(nm) in filtercolumns || continue
         lu[nm] = col
         push!(ty, eltype(col))
     end
@@ -455,6 +470,14 @@ function Base.iterate(x::BatchIterator, (pos, id)=(x.startpos, 0))
     return Batch(msg, x.bytes, pos, id), (pos + msg.bodyLength, id + 1)
 end
 
+function vectoriterator(schema, batch, de, convert; filtercolumns=nothing)
+    (
+        isnothing(filtercolumns) ?
+        VectorIterator(schema, batch, de, convert) :
+        FilteredVectorIterator(schema, batch, de, convert, filtercolumns)
+    )
+end
+
 struct VectorIterator
     schema::Meta.Schema
     batch::Batch # batch.msg.header MUST BE RecordBatch
@@ -478,6 +501,42 @@ function Base.iterate(x::VectorIterator, (columnidx, nodeidx, bufferidx)=(Int64(
 end
 
 Base.length(x::VectorIterator) = length(x.schema.fields)
+
+struct FilteredVectorIterator
+    schema::Meta.Schema
+    batch::Batch # batch.msg.header MUST BE RecordBatch
+    dictencodings::Dict{Int64, DictEncoding}
+    convert::Bool
+    filtercolumns::Vector{String}
+end
+
+Base.IteratorSize(::Type{FilteredVectorIterator}) = Base.SizeUnknown()
+
+function _nextstate(x::FilteredVectorIterator, state)
+    columnidx, nodeidx, bufferidx = state
+    columnidx > length(x.schema.fields) && return
+    field = x.schema.fields[columnidx]
+    while !(field.name in x.filtercolumns)
+        nodeidx, bufferidx = Arrow._step(field, nodeidx, bufferidx)
+        columnidx += 1
+        columnidx > length(x.schema.fields) && return
+        field = x.schema.fields[columnidx]
+    end
+    (columnidx, nodeidx, bufferidx)
+end
+
+function Base.iterate(x::FilteredVectorIterator, state=(Int64(1), Int64(1), Int64(1)))
+    state = _nextstate(x, state)
+    isnothing(state) && return
+    (columnidx, nodeidx, bufferidx) = state
+    field = x.schema.fields[columnidx]
+    @debugv 2 "building top-level column: field = $(field), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
+    A, nodeidx, bufferidx = build(field, x.batch, x.batch.msg.header, x.dictencodings, nodeidx, bufferidx, x.convert)
+    @debugv 2 "built top-level column: A = $(typeof(A)), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
+    @debugv 3 A
+    columnidx += 1
+    return A, (columnidx, nodeidx, bufferidx)
+end
 
 const ListTypes = Union{Meta.Utf8, Meta.LargeUtf8, Meta.Binary, Meta.LargeBinary, Meta.List, Meta.LargeList}
 const LargeLists = Union{Meta.LargeUtf8, Meta.LargeBinary, Meta.LargeList}
@@ -715,3 +774,66 @@ function build(f::Meta.Field, L::Meta.Bool, batch, rb, de, nodeidx, bufferidx, c
     T = juliaeltype(f, meta, convert)
     return BoolVector{T}(decodedbytes, pos, validity, len, meta), nodeidx + 1, bufferidx + 1
 end
+
+_step(::Meta.Field, ::L, nodeidx, bufferidx) where {L} = nodeidx + 1, bufferidx + 2
+_step(::Meta.Field, ::Meta.Bool, nodeidx, bufferidx) = nodeidx + 1, bufferidx + 2
+
+function _step(field::Meta.Field, nodeidx, bufferidx)
+    if field.dictionary !== nothing
+        return nodeidx+1, bufferidx+2
+    else
+        return _step(field, field.type, nodeidx, bufferidx)
+    end
+end
+
+function _step(f::Meta.Field, L::ListTypes, nodeidx, bufferidx)
+    bufferidx += 2
+    nodeidx += 1
+    if L isa Meta.Utf8 || L isa Meta.LargeUtf8 || L isa Meta.Binary || L isa Meta.LargeBinary
+        bufferidx += 1
+    else
+        nodeidx, bufferidx = _step(f.children[1], nodeidx, bufferidx)
+    end
+    nodeidx, bufferidx
+end
+
+function _step(f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeList}, nodeidx, bufferidx)
+    bufferidx += 1
+    nodeidx += 1
+    if L isa Meta.FixedSizeBinary
+        bufferidx += 1
+    else
+        nodeidx, bufferidx = _step(f.children[1], nodeidx, bufferidx)
+    end
+    nodeidx, bufferidx
+end
+
+function _step(f::Meta.Field, ::Meta.Map, nodeidx, bufferidx)
+    bufferidx += 2
+    nodeidx += 1
+    nodeidx, bufferidx = _step(f.children[1], nodeidx, bufferidx)
+    nodeidx, bufferidx
+end
+
+function _step(f::Meta.Field, ::Meta.Struct, nodeidx, bufferidx)
+    bufferidx += 1
+    nodeidx += 1
+    for child in f.children
+        nodeidx, bufferidx = _step(child, nodeidx, bufferidx)
+    end
+    nodeidx, bufferidx
+end
+
+function _step(f::Meta.Field, L::Meta.Union, nodeidx, bufferidx)
+    bufferidx += 1
+    if L.mode == Meta.UnionModes.Dense
+        bufferidx += 1
+    end
+    nodeidx += 1
+    for child in f.children
+        nodeidx, bufferidx = _step(child, nodeidx, bufferidx)
+    end
+    nodeidx, bufferidx
+end
+
+_step(::Meta.Field, ::Meta.Null, nodeidx, bufferidx) = nodeidx + 1, bufferidx
