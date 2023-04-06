@@ -53,6 +53,7 @@ julia = "1.6"
 
 [extras]
 CategoricalArrays = "324d7699-5711-5eae-9e2f-1d82baa6b597"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 FilePathsBase = "48062228-2e41-5def-b9a4-89aafe57970f"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
@@ -61,4 +62,4 @@ TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["CategoricalArrays", "FilePathsBase", "JSON3", "Random", "StructTypes", "TOML", "Test"]
+test = ["CategoricalArrays", "DataFrames",  "FilePathsBase", "JSON3", "Random", "StructTypes", "TOML", "Test"]
