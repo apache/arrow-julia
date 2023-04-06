@@ -574,13 +574,11 @@ end
 
 # https://github.com/apache/arrow-julia/issues/414
 df = DataFrame(("$i" => rand(1000) for i in 1:65536)...)
-Arrow.write("df.arrow", df)
-df_load = Arrow.Table("df.arrow")
+df_load = Arrow.Table(Arrow.tobuffer(df))
 @test Tables.schema(df) == Tables.schema(df_load)
 for (col1, col2) in zip(Tables.columns(df), Tables.columns(df_load))
     @test col1 == col2
 end
-rm("df.arrow")
 
 
 end # @testset "misc"
