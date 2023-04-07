@@ -15,7 +15,7 @@
 # limitations under the License.
 
 using Test, Arrow, ArrowTypes, Tables, Dates, PooledArrays, TimeZones, UUIDs,
-    CategoricalArrays, DataAPI, FilePathsBase
+    CategoricalArrays, DataAPI, FilePathsBase, DataFrames
 using Random: randstring
 
 # Compat shim for pre-julia 1.9
@@ -571,6 +571,15 @@ if pkgversion(ArrowTypes) >= v"2.0.2"
     @test Tables.schema(a) == Tables.schema(t)
     @test isequal(a.x, t.x)
 end
+
+# https://github.com/apache/arrow-julia/issues/414
+df = DataFrame(("$i" => rand(1000) for i in 1:65536)...)
+df_load = Arrow.Table(Arrow.tobuffer(df))
+@test Tables.schema(df) == Tables.schema(df_load)
+for (col1, col2) in zip(Tables.columns(df), Tables.columns(df_load))
+    @test col1 == col2
+end
+
 
 end # @testset "misc"
 

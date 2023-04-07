@@ -388,8 +388,9 @@ function makemessage(b, headerType, header, columns=nothing, bodylen=0)
     return Message(FlatBuffers.finishedbytes(b), columns, bodylen, headerType == Meta.RecordBatch, headerType == Meta.RecordBatch || headerType == Meta.DictionaryBatch, headerType)
 end
 
-function makeschema(b, sch::Tables.Schema{names}, columns) where {names}
+function makeschema(b, sch::Tables.Schema, columns)
     # build Field objects
+    names = sch.names
     N = length(names)
     fieldoffsets = [fieldoffset(b, names[i], columns.cols[i]) for i = 1:N]
     Meta.schemaStartFieldsVector(b, N)
