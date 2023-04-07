@@ -112,7 +112,6 @@ function writebuffer(io, col::Union{Map{T, O, A}, List{T, O, A}}, alignment) whe
     # write values array
     #
     if eltype(A) == UInt8 && T <: AbstractString
-        @show 1
         n = writearray(io, UInt8, col.data)
         @debugv 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n, alignment))"
         writezeros(io, paddinglength(n, alignment))
