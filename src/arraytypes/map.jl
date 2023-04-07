@@ -90,7 +90,7 @@ function makenodesbuffers!(col::Union{Map{T, O, A}, List{T, O, A}}, fieldnodes, 
     push!(fieldbuffers, Buffer(bufferoffset, blen))
     @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += padding(blen, alignment)
-    if eltype(A) == UInt8
+    if eltype(A) == UInt8 && T <: AbstractString
         blen = length(col.data)
         push!(fieldbuffers, Buffer(bufferoffset, blen))
         @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
@@ -110,7 +110,9 @@ function writebuffer(io, col::Union{Map{T, O, A}, List{T, O, A}}, alignment) whe
     @debugv 1 "writing array: col = $(typeof(col.offsets.offsets)), n = $n, padded = $(padding(n, alignment))"
     writezeros(io, paddinglength(n, alignment))
     # write values array
-    if eltype(A) == UInt8
+    #
+    if eltype(A) == UInt8 && T <: AbstractString
+        @show 1
         n = writearray(io, UInt8, col.data)
         @debugv 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n, alignment))"
         writezeros(io, paddinglength(n, alignment))

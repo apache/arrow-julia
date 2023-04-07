@@ -191,9 +191,10 @@ function arrowvector(::ListKind, x, i, nl, fi, de, ded, meta; largelists::Bool=f
     validity = ValidityBitmap(x)
     flat = ToList(x; largelists=largelists)
     offsets = Offsets(UInt8[], flat.inds)
-    if eltype(flat) == UInt8 # binary or utf8string
+    OT = origtype(flat)
+    if eltype(flat) == UInt8 && OT <: AbstractString # binary or utf8string
         data = flat
-        T = origtype(flat)
+        T = OT
     else
         data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; lareglists=largelists, kw...)
         T = withmissing(eltype(x), Vector{eltype(data)})
