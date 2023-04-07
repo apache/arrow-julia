@@ -111,9 +111,10 @@ function arrowvector(::FixedSizeListKind{N, T}, x, i, nl, fi, de, ded, meta; kw.
     len = length(x)
     validity = ValidityBitmap(x)
     flat = ToFixedSizeList(x)
-    if eltype(flat) == UInt8
+    OT = origtype(flat)
+    if eltype(flat) == UInt8 && ArrowTypes.isstringtype(OT)
         data = flat
-        S = origtype(flat)
+        S = OT
     else
         data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; kw...)
         S = withmissing(eltype(x), NTuple{N, eltype(data)})
@@ -127,7 +128,7 @@ function compress(Z::Meta.CompressionType, comp, x::FixedSizeList{T, A}) where {
     validity = compress(Z, comp, x.validity)
     buffers = [validity]
     children = Compressed[]
-    if eltype(A) == UInt8
+    if eltype(A) == UInt8 && ArrowTypes.isstringtype(T)
         push!(buffers, compress(Z, comp, x.data))
     else
         push!(children, compress(Z, comp, x.data))
@@ -145,7 +146,7 @@ function makenodesbuffers!(col::FixedSizeList{T, A}, fieldnodes, fieldbuffers, b
     push!(fieldbuffers, Buffer(bufferoffset, blen))
     @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += blen
-    if eltype(A) === UInt8
+    if eltype(A) == UInt8 && ArrowTypes.isstringtype(T)
         blen = ArrowTypes.getsize(ArrowTypes.ArrowKind(Base.nonmissingtype(T))) * len
         push!(fieldbuffers, Buffer(bufferoffset, blen))
         @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
@@ -161,7 +162,7 @@ function writebuffer(io, col::FixedSizeList{T, A}, alignment) where {T, A}
     @debugv 2 col
     writebitmap(io, col, alignment)
     # write values array
-    if eltype(A) === UInt8
+    if eltype(A) == UInt8 && ArrowTypes.isstringtype(T)
         n = writearray(io, UInt8, col.data)
         @debugv 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n, alignment))"
         writezeros(io, paddinglength(n, alignment))

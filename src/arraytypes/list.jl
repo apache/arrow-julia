@@ -192,7 +192,7 @@ function arrowvector(::ListKind, x, i, nl, fi, de, ded, meta; largelists::Bool=f
     flat = ToList(x; largelists=largelists)
     offsets = Offsets(UInt8[], flat.inds)
     OT = origtype(flat)
-    if eltype(flat) == UInt8 && OT <: AbstractString # binary or utf8string
+    if eltype(flat) == UInt8 && ArrowTypes.isstringtype(OT)# utf8 or byte string
         data = flat
         T = OT
     else
