@@ -394,22 +394,21 @@ end
 # arrowtype will call fieldoffset recursively for children
 function arrowtype(b, x::List{T, O, A}) where {T, O, A}
     if eltype(A) == UInt8 && T <: AbstractString || T <: Union{AbstractString, Missing}
-            if O == Int32
-                Meta.utf8Start(b)
-                return Meta.Utf8, Meta.utf8End(b), nothing
-            else # if O == Int64
-                Meta.largUtf8Start(b)
-                return Meta.LargeUtf8, Meta.largUtf8End(b), nothing
-            end
-        # else # if Vector{UInt8}
-        #     if O == Int32
-        #         Meta.binaryStart(b)
-        #         return Meta.Binary, Meta.binaryEnd(b), nothing
-        #     else # if O == Int64
-        #         Meta.largeBinaryStart(b)
-        #         return Meta.LargeBinary, Meta.largeBinaryEnd(b), nothing
-        #     end
-        # end
+        if O == Int32
+            Meta.utf8Start(b)
+            return Meta.Utf8, Meta.utf8End(b), nothing
+        else # if O == Int64
+            Meta.largUtf8Start(b)
+            return Meta.LargeUtf8, Meta.largUtf8End(b), nothing
+        end
+    elseif eltype(A) == UInt8 && ArrowTypes.isstringtype(T)
+        if O == Int32
+            Meta.binaryStart(b)
+            return Meta.Binary, Meta.binaryEnd(b), nothing
+        else # if O == Int64
+            Meta.largeBinaryStart(b)
+            return Meta.LargeBinary, Meta.largeBinaryEnd(b), nothing
+        end
     else
         children = [fieldoffset(b, "", x.data)]
         if O == Int32
