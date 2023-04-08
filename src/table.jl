@@ -292,7 +292,7 @@ Table(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...) = Table([ArrowBl
 Table(inputs::Vector; kw...) = Table([ArrowBlob(tobytes(x), 1, nothing) for x in inputs]; kw...)
 
 # will detect whether we're reading a Table from a file or stream
-function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
+function Table(blobs::Vector{ArrowBlob}; convert::Bool=true, useinlinestrings::Bool=true)
     t = Table()
     sch = nothing
     dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
@@ -384,6 +384,8 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
     end
     close(tsks)
     wait(tsk)
+    # apply inlinestrings to each column if requested
+    convert && useinlinestrings && (columns(t) .= _inlinestrings.(columns(t)))
     lu = lookup(t)
     ty = types(t)
     # 158; some implementations may send 0 record batches
@@ -521,10 +523,20 @@ function uncompress(ptr::Ptr{UInt8}, buffer, compression)
     len = unsafe_load(convert(Ptr{Int64}, ptr))
     ptr += 8 # skip past uncompressed length as Int64
     encodedbytes = unsafe_wrap(Array, ptr, buffer.length - 8)
+    tid=Threads.threadid()
+    output=TS.Buffer(len) # pre-allocate for output
     if compression.codec === Meta.CompressionTypes.LZ4_FRAME
-        decodedbytes = transcode(LZ4FrameDecompressor, encodedbytes)
+        # decodedbytes = transcode(LZ4FrameDecompressor, encodedbytes)
+        lock(LZ4_FRAME_DECOMPRESSOR_LOCK[tid]) do
+            _transcode!(LZ4_FRAME_DECOMPRESSOR[tid], encodedbytes, output)
+        end
+        decodedbytes = output.data
     elseif compression.codec === Meta.CompressionTypes.ZSTD
-        decodedbytes = transcode(ZstdDecompressor, encodedbytes)
+        # decodedbytes = transcode(ZstdDecompressor, encodedbytes)
+        lock(ZSTD_DECOMPRESSOR_LOCK[tid]) do
+            _transcode!(ZSTD_DECOMPRESSOR[tid], encodedbytes, output)
+        end
+        decodedbytes = output.data
     else
         error("unsupported compression type when reading arrow buffers: $(typeof(compression.codec))")
     end

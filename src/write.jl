@@ -53,9 +53,14 @@ function write end
 
 write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
 
-function write(file_path, tbl; kwargs...)
+function write(file_path, tbl; chunksize::Union{Nothing,Integer}=64000, kwargs...)
+    if !isnothing(chunksize) && Tables.istable(tbl)
+        tbl_source = Iterators.partition(Tables.rows(tbl),chunksize)
+    else
+        tbl_source = tbl 
+    end
     open(Writer, file_path; file=true, kwargs...) do writer
-        write(writer, tbl)
+        write(writer, tbl_source)
     end
     file_path
 end
@@ -278,9 +283,14 @@ function Base.close(writer::Writer)
     nothing
 end
 
-function write(io::IO, tbl; kwargs...)
+function write(io::IO, tbl; chunksize::Union{Nothing,Integer}=64000, kwargs...)
+    if !isnothing(chunksize) && Tables.istable(tbl)
+        tbl_source = Iterators.partition(Tables.rows(tbl),chunksize)
+    else
+        tbl_source = tbl 
+    end
     open(Writer, io; file=false, kwargs...) do writer
-        write(writer, tbl)
+        write(writer, tbl_source)
     end
     io
 end
