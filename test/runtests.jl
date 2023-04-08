@@ -27,7 +27,7 @@ if !@isdefined(pkgversion)
     end
 end
 
-# include(joinpath(dirname(pathof(ArrowTypes)), "../test/tests.jl"))
+include(joinpath(dirname(pathof(ArrowTypes)), "../test/tests.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/testappend.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/integrationtest.jl"))
