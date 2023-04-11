@@ -13,7 +13,9 @@
 # "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
-# under the License.name = "Arrow"
+# under the License.
+
+name = "Arrow"
 uuid = "69666777-d1a9-59fb-9406-91d4454c9d45"
 authors = ["quinnj <quinn.jacobd@gmail.com>"]
 version = "2.5.1"
