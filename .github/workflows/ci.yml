@@ -137,7 +137,7 @@ jobs:
         shell: julia --project=monorepo {0}
         run: |
           using Pkg;
-          pkg"dev . ./ArrowTypes"
+          Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowTypes")])
       - name: Run monorepo tests
         continue-on-error: true
         run: >
