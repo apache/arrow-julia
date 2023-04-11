@@ -139,7 +139,7 @@ jobs:
           using Pkg;
           Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowTypes")])
       - name: Run monorepo tests
-        continue-on-error: true
+        continue-on-error: false
         run: >
           julia --color=yes --project=monorepo -e 'using Pkg; Pkg.test("Arrow")'
   docs:
