@@ -521,10 +521,11 @@ function uncompress(ptr::Ptr{UInt8}, buffer, compression)
     len = unsafe_load(convert(Ptr{Int64}, ptr))
     ptr += 8 # skip past uncompressed length as Int64
     encodedbytes = unsafe_wrap(Array, ptr, buffer.length - 8)
+    decodedbytes = Vector{UInt8}(undef, len)
     if compression.codec === Meta.CompressionTypes.LZ4_FRAME
-        decodedbytes = transcode(LZ4FrameDecompressor, encodedbytes)
+        transcode(LZ4FrameDecompressor, encodedbytes, decodedbytes)
     elseif compression.codec === Meta.CompressionTypes.ZSTD
-        decodedbytes = transcode(ZstdDecompressor, encodedbytes)
+        transcode(ZstdDecompressor, encodedbytes, decodedbytes)
     else
         error("unsupported compression type when reading arrow buffers: $(typeof(compression.codec))")
     end
