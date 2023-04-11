@@ -22,8 +22,6 @@ struct Person
     name::String
 end
 
-error()
-
 @testset "ArrowTypes" begin
 
 @test ArrowTypes.ArrowKind(MyInt) == ArrowTypes.PrimitiveKind()
