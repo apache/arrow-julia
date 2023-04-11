@@ -31,7 +31,6 @@ LoggingExtras = "e6f89c97-d47a-5376-807f-9c37f3926c36"
 Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 PooledArrays = "2dfb63ee-cc39-5dd5-95bd-886bf059d720"
 SentinelArrays = "91c51154-3ec4-41a3-a24f-3f23e20d615c"
-Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
@@ -61,8 +60,10 @@ FilePathsBase = "48062228-2e41-5def-b9a4-89aafe57970f"
 JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 StructTypes = "856f2bd8-1eba-4b0a-8007-ebc267875bd4"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["CategoricalArrays", "DataFrames", "FilePathsBase", "JSON3", "Random", "StructTypes", "TOML", "Test"]
+test = ["CategoricalArrays", "DataFrames", "FilePathsBase", "JSON3", "Random", "StructTypes",
+"TOML", "Test", "Sockets"]
