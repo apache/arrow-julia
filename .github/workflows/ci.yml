@@ -105,6 +105,43 @@ jobs:
       - uses: codecov/codecov-action@v1
         with:
           file: lcov.info
+  test_monorepo:
+    name: Monorepo dev - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1' # automatically expands to the latest stable 1.x release of Julia
+        os:
+          - ubuntu-latest
+        arch:
+          - x64
+    steps:
+      - uses: actions/checkout@v2
+      - uses: julia-actions/setup-julia@v1
+        with:
+          version: ${{ matrix.version }}
+          arch: ${{ matrix.arch }}
+      - uses: actions/cache@v1
+        env:
+          cache-name: cache-artifacts
+        with:
+          path: ~/.julia/artifacts
+          key: ${{ runner.os }}-test-${{ env.cache-name }}-${{ hashFiles('**/Project.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-test-${{ env.cache-name }}-
+            ${{ runner.os }}-test-
+            ${{ runner.os }}-
+      - name: Dev monorepo dependencies
+        shell: julia --project=monorepo {0}
+        run: |
+          using Pkg;
+          pkg"dev . ./ArrowTypes"
+      - name: Run monorepo tests
+        continue-on-error: true
+        run: >
+          julia --color=yes --project=monorepo -e 'using Pkg; Pkg.test("Arrow")'
   docs:
     name: Documentation
     runs-on: ubuntu-latest
