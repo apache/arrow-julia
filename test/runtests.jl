@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-using Test, Arrow, ArrowTypes, Tables, Dates, PooledArrays, TimeZones, UUIDs,
+using Test, Arrow, ArrowTypes, Tables, Dates, PooledArrays, TimeZones, UUIDs, Sockets,
     CategoricalArrays, DataAPI, FilePathsBase, DataFrames
 using Random: randstring
 
