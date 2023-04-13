@@ -209,7 +209,7 @@ function compress(Z::Meta.CompressionType, comp, x::List{T, O, A}) where {T, O, 
     offsets = compress(Z, comp, x.offsets.offsets)
     buffers = [validity, offsets]
     children = Compressed[]
-    if eltype(A) == UInt8
+    if eltype(A) == UInt8 && ArrowTypes.isstringtype(T)# utf8 or byte string
         push!(buffers, compress(Z, comp, x.data))
     else
         push!(children, compress(Z, comp, x.data))

@@ -206,7 +206,7 @@ struct ListKind{stringtype} <: ArrowKind end
 ListKind() = ListKind{false}()
 isstringtype(::ListKind{stringtype}) where {stringtype} = stringtype
 isstringtype(::Type{ListKind{stringtype}}) where {stringtype} = stringtype
-isstringtype(::Type{T}) where {T} = T <: Union{Base.CodeUnits, AbstractString}
+isstringtype(::Type{T}) where {T} = nonmissingtype(T) <: Union{Base.CodeUnits, AbstractString}
 
 ArrowKind(::Type{<:AbstractString}) = ListKind{true}()
 
