@@ -534,27 +534,27 @@ end
 
 function reinterp(::Type{T}, batch, buf, compression) where {T}
     ptr = pointer(batch.bytes, batch.pos + buf.offset)
-    if compression === nothing
-        # it would be technically more correct to check that T.layout->alignment > 8
-        # but the datatype alignment isn't officially exported, so we're using
-        # primitive types w/ sizeof(T) >= 16 as a proxy for types that need 16-byte alignment
-        if sizeof(T) >= 16 && (UInt(ptr) & 15) != 0
-            # https://github.com/apache/arrow-julia/issues/345
-            # https://github.com/JuliaLang/julia/issues/42326
-            # need to ensure that the data/pointers are aligned to 16 bytes
-            # so we can't use unsafe_wrap here, but do an extra allocation
-            # to avoid the allocation, user needs to ensure input buffer is
-            # 16-byte aligned (somehow, it's not super straightforward how to ensure that)
-            A = Vector{T}(undef, div(buf.length, sizeof(T)))
-            unsafe_copyto!(Ptr{UInt8}(pointer(A)), ptr, buf.length)
-            return batch.bytes, A
-        else
-            return batch.bytes, unsafe_wrap(Array, convert(Ptr{T}, ptr), div(buf.length, sizeof(T)))
-        end
+    bytes = batch.bytes
+    len = buf.length
+    if compression !== nothing
+        len, bytes = uncompress(ptr, buf, compression)
+        ptr = pointer(bytes)
+    end
+    # it would be technically more correct to check that T.layout->alignment > 8
+    # but the datatype alignment isn't officially exported, so we're using
+    # primitive types w/ sizeof(T) >= 16 as a proxy for types that need 16-byte alignment
+    if sizeof(T) >= 16 && (UInt(ptr) & 15) != 0
+        # https://github.com/apache/arrow-julia/issues/345
+        # https://github.com/JuliaLang/julia/issues/42326
+        # need to ensure that the data/pointers are aligned to 16 bytes
+        # so we can't use unsafe_wrap here, but do an extra allocation
+        # to avoid the allocation, user needs to ensure input buffer is
+        # 16-byte aligned (somehow, it's not super straightforward how to ensure that)
+        A = Vector{T}(undef, div(len, sizeof(T)))
+        unsafe_copyto!(Ptr{UInt8}(pointer(A)), ptr, len)
+        return bytes, A
     else
-        # compressed
-        len, decodedbytes = uncompress(ptr, buf, compression)
-        return decodedbytes, unsafe_wrap(Array, convert(Ptr{T}, pointer(decodedbytes)), div(len, sizeof(T)))
+        return bytes, unsafe_wrap(Array, convert(Ptr{T}, ptr), div(len, sizeof(T)))
     end
 end
 
