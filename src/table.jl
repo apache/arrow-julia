@@ -523,7 +523,7 @@ function uncompress(ptr::Ptr{UInt8}, buffer, compression)
     encodedbytes = unsafe_wrap(Array, ptr, buffer.length - 8)
     if len === -1
         # len = -1 means data is not compressed
-        return length(encodedbytes), encodedbytes
+        return length(encodedbytes), copy(encodedbytes)
     end
                                         
     decodedbytes = Vector{UInt8}(undef, len)
