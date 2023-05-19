@@ -629,6 +629,42 @@ for (col1, col2) in zip(Tables.columns(df), Tables.columns(df_load))
     @test col1 == col2
 end
 
+@testset "# 411" begin
+# Vector{UInt8} are written as List{UInt8} in Arrow
+# Base.CodeUnits are written as Binary
+t = (
+    a=[[0x00, 0x01], UInt8[], [0x03]],
+    am=[[0x00, 0x01], [0x03], missing],
+    b=[b"01", b"", b"3"],
+    bm=[b"01", b"3", missing],
+    c=["a", "b", "c"],
+    cm=["a", "c", missing]
+)
+buf = Arrow.tobuffer(t)
+tt = Arrow.Table(buf)
+@test t.a == tt.a
+@test isequal(t.am, tt.am)
+@test t.b == tt.b
+@test isequal(t.bm, tt.bm)
+@test t.c == tt.c
+@test isequal(t.cm, tt.cm)
+@test Arrow.schema(tt)[].fields[1].type isa Arrow.Flatbuf.List
+@test Arrow.schema(tt)[].fields[3].type isa Arrow.Flatbuf.Binary
+pos = position(buf)
+Arrow.append(buf, tt)
+seekstart(buf)
+buf1 = read(buf, pos)
+buf2 = read(buf)
+t1 = Arrow.Table(buf1)
+t2 = Arrow.Table(buf2)
+@test isequal(t1.a, t2.a)
+@test isequal(t1.am, t2.am)
+@test isequal(t1.b, t2.b)
+@test isequal(t1.bm, t2.bm)
+@test isequal(t1.c, t2.c)
+@test isequal(t1.cm, t2.cm)
+
+end
 
 end # @testset "misc"
 

@@ -49,11 +49,20 @@ Base.size(l::List) = (l.ℓ,)
     @inbounds lo, hi = l.offsets[i]
     S = Base.nonmissingtype(T)
     K = ArrowTypes.ArrowKind(ArrowTypes.ArrowType(S))
-    if ArrowTypes.isstringtype(K)
+    # special-case Base.CodeUnits for ArrowTypes compat
+    if ArrowTypes.isstringtype(K) || S <: Base.CodeUnits
         if S !== T
-            return l.validity[i] ? ArrowTypes.fromarrow(T, pointer(l.data, lo), hi - lo + 1) : missing
+            if S <: Base.CodeUnits
+                return l.validity[i] ? Base.CodeUnits(unsafe_string(pointer(l.data, lo), hi - lo + 1)) : missing
+            else
+                return l.validity[i] ? ArrowTypes.fromarrow(T, pointer(l.data, lo), hi - lo + 1) : missing
+            end
         else
-            return ArrowTypes.fromarrow(T, pointer(l.data, lo), hi - lo + 1)
+            if S <: Base.CodeUnits
+                return Base.CodeUnits(unsafe_string(pointer(l.data, lo), hi - lo + 1))
+            else
+                return ArrowTypes.fromarrow(T, pointer(l.data, lo), hi - lo + 1)
+            end
         end
     elseif S !== T
         return l.validity[i] ? ArrowTypes.fromarrow(T, view(l.data, lo:hi)) : missing
@@ -66,6 +75,12 @@ end
 
 # end
 
+# internal interface definitions to be able to treat AbstractString/CodeUnits similarly
+_ncodeunits(x::AbstractString) = ncodeunits(x)
+_codeunits(x::AbstractString) = codeunits(x)
+_ncodeunits(x::Base.CodeUnits) = length(x)
+_codeunits(x::Base.CodeUnits) = x
+
 # an AbstractVector version of Iterators.flatten
 # code based on SentinelArrays.ChainedVector
 struct ToList{T, stringtype, A, I} <: AbstractVector{T}
@@ -74,14 +89,21 @@ struct ToList{T, stringtype, A, I} <: AbstractVector{T}
 end
 
 origtype(::ToList{T, S, A, I}) where {T, S, A, I} = A
+liststringtype(::Type{ToList{T, S, A, I}}) where {T, S, A, I} = S
+function liststringtype(::List{T, O, A}) where {T, O, A}
+    ST = Base.nonmissingtype(T)
+    K = ArrowTypes.ArrowKind(ST)
+    return liststringtype(A) || ArrowTypes.isstringtype(K) || ST <: Base.CodeUnits # add the CodeUnits check for ArrowTypes compat for now
+end
+liststringtype(T) = false
 
 function ToList(input; largelists::Bool=false)
     AT = eltype(input)
     ST = Base.nonmissingtype(AT)
     K = ArrowTypes.ArrowKind(ST)
-    stringtype = ArrowTypes.isstringtype(K)
+    stringtype = ArrowTypes.isstringtype(K) || ST <: Base.CodeUnits # add the CodeUnits check for ArrowTypes compat for now
     T = stringtype ? UInt8 : eltype(ST)
-    len = stringtype ? ncodeunits : length
+    len = stringtype ? _ncodeunits : length
     data = AT[]
     I = largelists ? Int64 : Int32
     inds = I[0]
@@ -122,7 +144,7 @@ Base.@propagate_inbounds function Base.getindex(A::ToList{T, stringtype}, i::Int
     @boundscheck checkbounds(A, i)
     chunk, ix = index(A, i)
     @inbounds x = A.data[chunk]
-    return @inbounds stringtype ? codeunits(x)[ix] : x[ix]
+    return @inbounds stringtype ? _codeunits(x)[ix] : x[ix]
 end
 
 Base.@propagate_inbounds function Base.setindex!(A::ToList{T, stringtype}, v, i::Integer) where {T, stringtype}
@@ -130,7 +152,7 @@ Base.@propagate_inbounds function Base.setindex!(A::ToList{T, stringtype}, v, i:
     chunk, ix = index(A, i)
     @inbounds x = A.data[chunk]
     if stringtype
-        codeunits(x)[ix] = v
+        _codeunits(x)[ix] = v
     else
         x[ix] = v
     end
@@ -149,7 +171,7 @@ end
         chunk_len = A.inds[chunk]
     end
     val = A.data[chunk - 1]
-    x = stringtype ? codeunits(val)[1] : val[1]
+    x = stringtype ? _codeunits(val)[1] : val[1]
     # find next valid index
     i += 1
     if i > chunk_len
@@ -168,7 +190,7 @@ end
 @inline function Base.iterate(A::ToList{T, stringtype}, (i, chunk, chunk_i, chunk_len, len)) where {T, stringtype}
     i > len && return nothing
     @inbounds val = A.data[chunk - 1]
-    @inbounds x = stringtype ? codeunits(val)[chunk_i] : val[chunk_i]
+    @inbounds x = stringtype ? _codeunits(val)[chunk_i] : val[chunk_i]
     i += 1
     if i > chunk_len
         chunk_i = 1
@@ -191,7 +213,7 @@ function arrowvector(::ListKind, x, i, nl, fi, de, ded, meta; largelists::Bool=f
     validity = ValidityBitmap(x)
     flat = ToList(x; largelists=largelists)
     offsets = Offsets(UInt8[], flat.inds)
-    if eltype(flat) == UInt8 # binary or utf8string
+    if liststringtype(typeof(flat)) && eltype(flat) == UInt8 # binary or utf8string
         data = flat
         T = origtype(flat)
     else
@@ -208,7 +230,7 @@ function compress(Z::Meta.CompressionType, comp, x::List{T, O, A}) where {T, O, 
     offsets = compress(Z, comp, x.offsets.offsets)
     buffers = [validity, offsets]
     children = Compressed[]
-    if eltype(A) == UInt8
+    if liststringtype(x)
         push!(buffers, compress(Z, comp, x.data))
     else
         push!(children, compress(Z, comp, x.data))

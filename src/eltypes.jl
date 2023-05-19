@@ -129,7 +129,7 @@ juliaeltype(f::Meta.Field, b::Union{Meta.Utf8, Meta.LargeUtf8}, convert) = Strin
 datasizeof(x) = sizeof(x)
 datasizeof(x::AbstractVector) = sum(datasizeof, x)
 
-juliaeltype(f::Meta.Field, b::Union{Meta.Binary, Meta.LargeBinary}, convert) = Vector{UInt8}
+juliaeltype(f::Meta.Field, b::Union{Meta.Binary, Meta.LargeBinary}, convert) = Base.CodeUnits
 
 juliaeltype(f::Meta.Field, x::Meta.FixedSizeBinary, convert) = NTuple{Int(x.byteWidth), UInt8}
 
@@ -393,7 +393,7 @@ end
 
 # arrowtype will call fieldoffset recursively for children
 function arrowtype(b, x::List{T, O, A}) where {T, O, A}
-    if eltype(A) == UInt8
+    if liststringtype(x)
         if T <: AbstractString || T <: Union{AbstractString, Missing}
             if O == Int32
                 Meta.utf8Start(b)
@@ -402,7 +402,7 @@ function arrowtype(b, x::List{T, O, A}) where {T, O, A}
                 Meta.largUtf8Start(b)
                 return Meta.LargeUtf8, Meta.largUtf8End(b), nothing
             end
-        else # if Vector{UInt8}
+        else # if Base.CodeUnits
             if O == Int32
                 Meta.binaryStart(b)
                 return Meta.Binary, Meta.binaryEnd(b), nothing

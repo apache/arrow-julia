@@ -72,9 +72,12 @@ end
 @test !ArrowTypes.isstringtype(ArrowTypes.ListKind())
 @test !ArrowTypes.isstringtype(typeof(ArrowTypes.ListKind()))
 @test ArrowTypes.ArrowKind(String) == ArrowTypes.ListKind{true}()
+@test ArrowTypes.ArrowKind(Base.CodeUnits) == ArrowTypes.ListKind{true}()
 
 hey = collect(b"hey")
 @test ArrowTypes.fromarrow(String, pointer(hey), 3) == "hey"
+@test ArrowTypes.fromarrow(Base.CodeUnits, pointer(hey), 3) == b"hey"
+@test ArrowTypes.fromarrow(Union{Base.CodeUnits, Missing}, pointer(hey), 3) == b"hey"
 
 @test ArrowTypes.ArrowType(Symbol) == String
 @test ArrowTypes.toarrow(:hey) == "hey"
