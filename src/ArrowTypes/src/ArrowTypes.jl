@@ -213,6 +213,7 @@ ArrowKind(::Type{<:Base.CodeUnits}) = ListKind{true}()
 
 fromarrow(::Type{T}, ptr::Ptr{UInt8}, len::Int) where {T} = fromarrow(T, unsafe_string(ptr, len))
 fromarrow(::Type{T}, x) where {T <: Base.CodeUnits} = Base.CodeUnits(x)
+fromarrow(::Type{Union{Missing, Base.CodeUnits}}, x) = x === missing ? missing : Base.CodeUnits(x)
 
 ArrowType(::Type{Symbol}) = String
 toarrow(x::Symbol) = String(x)
