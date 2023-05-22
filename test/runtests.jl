@@ -666,6 +666,14 @@ t2 = Arrow.Table(buf2)
 
 end
 
+@testset "# 435" begin
+
+t = Arrow.Table(joinpath(dirname(pathof(Arrow)), "../test/java_compress_len_neg_one.arrow"))
+@test length(t) == 15
+@test length(t.isA) == 102
+
+end
+
 end # @testset "misc"
 
 end
