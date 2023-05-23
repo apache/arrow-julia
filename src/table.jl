@@ -521,11 +521,12 @@ function uncompress(ptr::Ptr{UInt8}, buffer, compression)
     len = unsafe_load(convert(Ptr{Int64}, ptr))
     ptr += 8 # skip past uncompressed length as Int64
     encodedbytes = unsafe_wrap(Array, ptr, buffer.length - 8)
-    if len === -1
+    if len == -1
         # len = -1 means data is not compressed
+        # it's unclear why other language implementations allow this
+        # but we support to be able to read data produced as such
         return length(encodedbytes), copy(encodedbytes)
     end
-                                        
     decodedbytes = Vector{UInt8}(undef, len)
     if compression.codec === Meta.CompressionTypes.LZ4_FRAME
         transcode(LZ4FrameDecompressor, encodedbytes, decodedbytes)
