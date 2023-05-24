@@ -674,6 +674,19 @@ t = Arrow.Table(joinpath(dirname(pathof(Arrow)), "../test/java_compress_len_neg_
 
 end
 
+@testset "# 293" begin
+
+t = (a = [1, 2, 3], b = [1.0, 2.0, 3.0])
+buf = Arrow.tobuffer(t)
+tbl = Arrow.Table(buf)
+parts = Tables.partitioner((t, t))
+buf2 = Arrow.tobuffer(parts)
+tbl2 = Arrow.Table(buf2)
+for t in Tables.partitions(tbl2)
+    @test t.a == tbl.a
+    @test t.b == tbl.b
+end
+
 end # @testset "misc"
 
 end

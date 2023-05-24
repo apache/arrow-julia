@@ -261,6 +261,7 @@ types(t::Table) = getfield(t, :types)
 columns(t::Table) = getfield(t, :columns)
 lookup(t::Table) = getfield(t, :lookup)
 schema(t::Table) = getfield(t, :schema)
+metadata(t::Table) = getfield(t, :metadata)
 
 """
     Arrow.getmetadata(x)
@@ -285,6 +286,41 @@ Tables.schema(t::Table) = Tables.Schema(names(t), types(t))
 Tables.columnnames(t::Table) = names(t)
 Tables.getcolumn(t::Table, i::Int) = columns(t)[i]
 Tables.getcolumn(t::Table, nm::Symbol) = lookup(t)[nm]
+
+struct TablePartitions
+    table::Table
+    npartitions::Int
+end
+
+function TablePartitions(table::Table)
+    cols = columns(table)
+    npartitions = if length(cols) == 0
+        0
+    elseif cols[1] isa ChainedVector
+        length(cols[1].arrays)
+    else
+        1
+    end
+    return TablePartitions(table, npartitions)
+end
+
+function Base.iterate(tp::TablePartitions, i=1)
+    i > tp.npartitions && return nothing
+    tp.npartitions == 1 && return tp.table, i + 1
+    cols = columns(tp.table)
+    newcols = AbstractVector[cols[j].arrays[i] for j in 1:length(cols)]
+    nms = names(tp.table)
+    tbl = Table(
+        nms,
+        types(tp.table),
+        newcols,
+        Dict{Symbol, AbstractVector}(nms[i] => newcols[i] for i in 1:length(nms)),
+        schema(tp.table)
+    )
+    return tbl, i + 1
+end
+
+Tables.partitions(t::Table) = TablePartitions(t)
 
 # high-level user API functions
 Table(input, pos::Integer=1, len=nothing; kw...) = Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
