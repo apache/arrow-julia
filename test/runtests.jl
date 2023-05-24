@@ -687,6 +687,8 @@ for t in Tables.partitions(tbl2)
     @test t.b == tbl.b
 end
 
+end
+
 end # @testset "misc"
 
 end
