@@ -16,6 +16,7 @@
 
 module Flatbuf
 
+using EnumX
 using ..FlatBuffers
 
 include("Schema.jl")

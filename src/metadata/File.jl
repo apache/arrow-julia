@@ -24,8 +24,8 @@ Base.propertynames(x::Footer) = (:version, :schema, :dictionaries, :recordBatche
 function Base.getproperty(x::Footer, field::Symbol)
     if field === :version
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), MetadataVersion)
-        return MetadataVersions.V1
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), MetadataVersion.T)
+        return MetadataVersion.V1
     elseif field === :schema
         o = FlatBuffers.offset(x, 6)
         if o != 0
@@ -52,7 +52,7 @@ function Base.getproperty(x::Footer, field::Symbol)
 end
 
 footerStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 4)
-footerAddVersion(b::FlatBuffers.Builder, version::MetadataVersion) = FlatBuffers.prependslot!(b, 0, version, 0)
+footerAddVersion(b::FlatBuffers.Builder, version::MetadataVersion.T) = FlatBuffers.prependslot!(b, 0, version, 0)
 footerAddSchema(b::FlatBuffers.Builder, schema::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 1, schema, 0)
 footerAddDictionaries(b::FlatBuffers.Builder, dictionaries::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 2, dictionaries, 0)
 footerStartDictionariesVector(b::FlatBuffers.Builder, numelems) = FlatBuffers.startvector!(b, 24, numelems, 8)

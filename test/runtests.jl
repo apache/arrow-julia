@@ -369,7 +369,7 @@ end
 
 @testset "# 166" begin
 t = (
-    col1=[zero(Arrow.Timestamp{Arrow.Meta.TimeUnits.NANOSECOND, nothing})],
+    col1=[zero(Arrow.Timestamp{Arrow.Meta.TimeUnit.NANOSECOND, nothing})],
 )
 tbl = Arrow.Table(Arrow.tobuffer(t))
 @test_logs (:warn, r"automatically converting Arrow.Timestamp with precision = NANOSECOND") begin
@@ -380,8 +380,8 @@ end
 @testset "# 95; Arrow.ToTimestamp" begin
 x = [ZonedDateTime(Dates.DateTime(2020), tz"Europe/Paris")]
 c = Arrow.ToTimestamp(x)
-@test eltype(c) == Arrow.Timestamp{Arrow.Flatbuf.TimeUnits.MILLISECOND, Symbol("Europe/Paris")}
-@test c[1] == Arrow.Timestamp{Arrow.Flatbuf.TimeUnits.MILLISECOND, Symbol("Europe/Paris")}(1577833200000)
+@test eltype(c) == Arrow.Timestamp{Arrow.Flatbuf.TimeUnit.MILLISECOND, Symbol("Europe/Paris")}
+@test c[1] == Arrow.Timestamp{Arrow.Flatbuf.TimeUnit.MILLISECOND, Symbol("Europe/Paris")}(1577833200000)
 end
 
 @testset "# 158" begin

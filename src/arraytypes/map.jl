@@ -64,7 +64,7 @@ function arrowvector(::MapKind, x, i, nl, fi, de, ded, meta; largelists::Bool=fa
     return Map{withmissing(ET, Dict{K, V}), eltype(flat.inds), typeof(data)}(validity, offsets, data, len, meta)
 end
 
-function compress(Z::Meta.CompressionType, comp, x::A) where {A <: Map}
+function compress(Z::Meta.CompressionType.T, comp, x::A) where {A <: Map}
     len = length(x)
     nc = nullcount(x)
     validity = compress(Z, comp, x.validity)
