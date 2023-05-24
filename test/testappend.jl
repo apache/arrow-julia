@@ -129,12 +129,13 @@ function testappend_partitions()
         arrow_table2 = Arrow.Table(file2)
         # now
         # arrow_table1: 2 partitions, 20 rows
-        # arrow_table2: 2 partitions, 30 rows (both partitions of table1 are appended as single partition)
+        # arrow_table2: 2 partitions, 30 rows (both partitions of table1 are appended as separate partitions)
 
         @test Tables.schema(arrow_table1) == Tables.schema(arrow_table2)
         @test length(Tables.columns(arrow_table1)[1]) == 20
         @test length(Tables.columns(arrow_table2)[1]) == 30
-        @test length(collect(Tables.partitions(Arrow.Stream(file1)))) == length(collect(Tables.partitions(Arrow.Stream(file2))))
+        @test length(collect(Tables.partitions(Arrow.Stream(file1)))) == 2
+        @test length(collect(Tables.partitions(Arrow.Stream(file2)))) == 3
 
         Arrow.append(file1, Arrow.Stream(file2))
         arrow_table1 = Arrow.Table(file1)
@@ -145,6 +146,7 @@ function testappend_partitions()
         @test Tables.schema(arrow_table1) == Tables.schema(arrow_table2)
         @test length(Tables.columns(arrow_table1)[1]) == 50
         @test length(Tables.columns(arrow_table2)[1]) == 30
-        @test length(collect(Tables.partitions(Arrow.Stream(file1)))) == 2 * length(collect(Tables.partitions(Arrow.Stream(file2))))
+        @test length(collect(Tables.partitions(Arrow.Stream(file1)))) == 5
+        @test length(collect(Tables.partitions(Arrow.Stream(file2)))) == 3
     end
 end
