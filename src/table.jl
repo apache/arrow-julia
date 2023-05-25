@@ -198,9 +198,9 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
     end
 
     if compression !== nothing
-        if compression.codec == Flatbuf.CompressionTypes.ZSTD
+        if compression.codec == Flatbuf.CompressionType.ZSTD
             x.compression[] = :zstd
-        elseif compression.codec == Flatbuf.CompressionTypes.LZ4_FRAME
+        elseif compression.codec == Flatbuf.CompressionType.LZ4_FRAME
             x.compression[] = :lz4
         else
             throw(ArgumentError("unsupported compression codec: $(compression.codec)"))
@@ -528,9 +528,9 @@ function uncompress(ptr::Ptr{UInt8}, buffer, compression)
         return length(encodedbytes), copy(encodedbytes)
     end
     decodedbytes = Vector{UInt8}(undef, len)
-    if compression.codec === Meta.CompressionTypes.LZ4_FRAME
+    if compression.codec === Meta.CompressionType.LZ4_FRAME
         transcode(LZ4FrameDecompressor, encodedbytes, decodedbytes)
-    elseif compression.codec === Meta.CompressionTypes.ZSTD
+    elseif compression.codec === Meta.CompressionType.ZSTD
         transcode(ZstdDecompressor, encodedbytes, decodedbytes)
     else
         error("unsupported compression type when reading arrow buffers: $(typeof(compression.codec))")
@@ -648,7 +648,7 @@ function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, 
     buffer = rb.buffers[bufferidx]
     bytes, typeIds = reinterp(UInt8, batch, buffer, rb.compression)
     bufferidx += 1
-    if L.mode == Meta.UnionModes.Dense
+    if L.mode == Meta.UnionMode.Dense
         buffer = rb.buffers[bufferidx]
         bytes2, offsets = reinterp(Int32, batch, buffer, rb.compression)
         bufferidx += 1
@@ -663,7 +663,7 @@ function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, 
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
     UT = UnionT(f, convert)
-    if L.mode == Meta.UnionModes.Dense
+    if L.mode == Meta.UnionMode.Dense
         B = DenseUnion{T, UT, typeof(data)}(bytes, bytes2, typeIds, offsets, data, meta)
     else
         B = SparseUnion{T, UT, typeof(data)}(bytes, typeIds, data, meta)

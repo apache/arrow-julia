@@ -36,13 +36,13 @@ function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=g
     @debugv 3 x
     A = arrowvector(x, i, 0, 0, de, ded, meta; compression=compression, kw...)
     if compression isa LZ4FrameCompressor
-        A = compress(Meta.CompressionTypes.LZ4_FRAME, compression, A)
+        A = compress(Meta.CompressionType.LZ4_FRAME, compression, A)
     elseif compression isa Vector{LZ4FrameCompressor}
-        A = compress(Meta.CompressionTypes.LZ4_FRAME, compression[Threads.threadid()], A)
+        A = compress(Meta.CompressionType.LZ4_FRAME, compression[Threads.threadid()], A)
     elseif compression isa ZstdCompressor
-        A = compress(Meta.CompressionTypes.ZSTD, compression, A)
+        A = compress(Meta.CompressionType.ZSTD, compression, A)
     elseif compression isa Vector{ZstdCompressor}
-        A = compress(Meta.CompressionTypes.ZSTD, compression[Threads.threadid()], A)
+        A = compress(Meta.CompressionType.ZSTD, compression[Threads.threadid()], A)
     end
     @debugv 2 "converted top-level column to arrow format: $(typeof(A))"
     @debugv 3 A
@@ -99,7 +99,7 @@ Base.size(v::NullVector) = (length(v.data),)
 Base.getindex(v::NullVector{T}, i::Int) where {T} = ArrowTypes.fromarrow(T, getindex(v.data, i))
 
 arrowvector(::NullKind, x, i, nl, fi, de, ded, meta; kw...) = NullVector{eltype(x)}(MissingVector(length(x)), isnothing(meta) ? nothing : toidict(meta))
-compress(Z::Meta.CompressionType, comp, v::NullVector) =
+compress(Z::Meta.CompressionType.T, comp, v::NullVector) =
     Compressed{Z, NullVector}(v, CompressedBuffer[], length(v), length(v), Compressed[])
 
 function makenodesbuffers!(col::NullVector, fieldnodes, fieldbuffers, bufferoffset, alignment)

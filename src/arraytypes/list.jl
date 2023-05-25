@@ -223,7 +223,7 @@ function arrowvector(::ListKind, x, i, nl, fi, de, ded, meta; largelists::Bool=f
     return List{T, eltype(flat.inds), typeof(data)}(UInt8[], validity, offsets, data, len, meta)
 end
 
-function compress(Z::Meta.CompressionType, comp, x::List{T, O, A}) where {T, O, A}
+function compress(Z::Meta.CompressionType.T, comp, x::List{T, O, A}) where {T, O, A}
     len = length(x)
     nc = nullcount(x)
     validity = compress(Z, comp, x.validity)
