@@ -136,7 +136,7 @@ mutable struct Writer{T<:IO}
 end
 
 function Base.open(::Type{Writer}, io::T, compress::Union{Nothing,Symbol,LZ4FrameCompressor,ZstdCompressor}, writetofile::Bool, largelists::Bool, denseunions::Bool, dictencode::Bool, dictencodenested::Bool, alignment::Integer, maxdepth::Integer, ntasks::Integer, meta::Union{Nothing,Any}, colmeta::Union{Nothing,Any}, closeio::Bool) where {T<:IO}
-    if compress !== :lz4 && compress !== :zstd
+    if compress isa Symbol && compress !== :lz4 && compress !== :zstd
         throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
     end
     sync = OrderedSynchronizer(2)
