@@ -31,18 +31,24 @@ nullcount(x::ArrowVector) = validitybitmap(x).nc
 getmetadata(x::ArrowVector) = x.metadata
 Base.deleteat!(x::T, inds) where {T <: ArrowVector} = throw(ArgumentError("`$T` does not support `deleteat!`; arrow data is by nature immutable"))
 
-function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Vector{LZ4FrameCompressor}, LZ4FrameCompressor, Vector{ZstdCompressor}, ZstdCompressor}=nothing, kw...)
+function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, kw...)
     @debugv 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(values(kw))"
     @debugv 3 x
     A = arrowvector(x, i, 0, 0, de, ded, meta; compression=compression, kw...)
     if compression isa LZ4FrameCompressor
         A = compress(Meta.CompressionType.LZ4_FRAME, compression, A)
-    elseif compression isa Vector{LZ4FrameCompressor}
-        A = compress(Meta.CompressionType.LZ4_FRAME, compression[Threads.threadid()], A)
     elseif compression isa ZstdCompressor
         A = compress(Meta.CompressionType.ZSTD, compression, A)
-    elseif compression isa Vector{ZstdCompressor}
-        A = compress(Meta.CompressionType.ZSTD, compression[Threads.threadid()], A)
+    elseif compression isa Symbol && compression == :lz4
+        comp = lz4_frame_compressor()
+        A = Base.@lock comp begin
+            compress(Meta.CompressionType.LZ4_FRAME, comp[], A)
+        end
+    elseif compression isa Symbol && compression == :zstd
+        comp = zstd_compressor()
+        A = Base.@lock comp begin
+            compress(Meta.CompressionType.ZSTD, comp[], A)
+        end
     end
     @debugv 2 "converted top-level column to arrow format: $(typeof(A))"
     @debugv 3 A

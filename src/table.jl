@@ -531,9 +531,15 @@ function uncompress(ptr::Ptr{UInt8}, buffer, compression)
     end
     decodedbytes = Vector{UInt8}(undef, len)
     if compression.codec === Meta.CompressionType.LZ4_FRAME
-        transcode(LZ4FrameDecompressor, encodedbytes, decodedbytes)
+        comp = lz4_frame_decompressor()
+        Base.@lock comp begin
+            transcode(comp[], encodedbytes, decodedbytes)
+        end
     elseif compression.codec === Meta.CompressionType.ZSTD
-        transcode(ZstdDecompressor, encodedbytes, decodedbytes)
+        comp = zstd_decompressor()
+        Base.@lock comp begin
+            transcode(comp[], encodedbytes, decodedbytes)
+        end
     else
         error("unsupported compression type when reading arrow buffers: $(typeof(compression.codec))")
     end
