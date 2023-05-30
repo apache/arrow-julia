@@ -109,15 +109,9 @@ function append(io::IO, tbl;
         if !isstream
             throw(ArgumentError("append is supported only to files in arrow stream format"))
         end
-
-        if compress === :lz4
-            compress = LZ4_FRAME_COMPRESSOR
-        elseif compress === :zstd
-            compress = ZSTD_COMPRESSOR
-        elseif compress isa Symbol
+        if compress isa Symbol && compress !== :lz4 && compress !== :zstd
             throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
         end
-
         append(io, tbl, arrow_schema, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks, metadata, colmetadata)
     end
 
