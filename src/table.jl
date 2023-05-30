@@ -97,7 +97,15 @@ function Stream(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...)
     isempty(b) ? Stream(ArrowBlob[]; kw...) : Stream([ArrowBlob(b, pos, len)]; kw...)
 end
 
-Stream(inputs::AbstractVector; kw...) = Stream([ArrowBlob(tobytes(x), 1, nothing) for x in inputs]; kw...)
+function Stream(inputs::AbstractVector; kw...)
+    blobs = ArrowBlob[]
+    for x in inputs
+        b = tobytes(x)
+        isempty(b) && continue
+        push!(blobs, ArrowBlob(b, 1, nothing))
+    end
+    Stream(blobs; kw...)
+end
 
 function initialize!(x::Stream)
     isempty(getfield(x, :names)) || return
