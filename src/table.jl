@@ -87,9 +87,25 @@ function Stream(inputs::Vector{ArrowBlob}; convert::Bool=true)
     Stream(inputs, inputindex, batchiterator, names, types, schema, dictencodings, dictencoded, convert, compression)
 end
 
-Stream(input, pos::Integer=1, len=nothing; kw...) = Stream([ArrowBlob(tobytes(input), pos, len)]; kw...)
-Stream(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...) = Stream([ArrowBlob(tobytes(input), pos, len)]; kw...)
-Stream(inputs::Vector; kw...) = Stream([ArrowBlob(tobytes(x), 1, nothing) for x in inputs]; kw...)
+function Stream(input, pos::Integer=1, len=nothing; kw...)
+    b = tobytes(input)
+    isempty(b) ? Stream(ArrowBlob[]; kw...) : Stream([ArrowBlob(b, pos, len)]; kw...)
+end
+
+function Stream(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...)
+    b = tobytes(input)
+    isempty(b) ? Stream(ArrowBlob[]; kw...) : Stream([ArrowBlob(b, pos, len)]; kw...)
+end
+
+function Stream(inputs::AbstractVector; kw...)
+    blobs = ArrowBlob[]
+    for x in inputs
+        b = tobytes(x)
+        isempty(b) && continue
+        push!(blobs, ArrowBlob(b, 1, nothing))
+    end
+    Stream(blobs; kw...)
+end
 
 function initialize!(x::Stream)
     isempty(getfield(x, :names)) || return
@@ -116,8 +132,14 @@ end
 
 Base.IteratorSize(::Type{Stream}) = Base.SizeUnknown()
 Base.eltype(::Type{Stream}) = Table
+Base.isdone(x::Stream) = x.inputindex > length(x.inputs)
 
 function Base.iterate(x::Stream, (pos, id)=(1, 0))
+    if Base.isdone(x)
+        x.inputindex = 1
+        x.batchiterator = nothing
+        return nothing
+    end
     if isnothing(x.batchiterator)
         blob = x.inputs[x.inputindex]
         x.batchiterator = BatchIterator(blob)
@@ -132,7 +154,11 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
         # check for additional inputs
         while state === nothing
             x.inputindex += 1
-            x.inputindex > length(x.inputs) && return nothing
+            if Base.isdone(x)
+                x.inputindex = 1
+                x.batchiterator = nothing
+                return nothing
+            end
             blob = x.inputs[x.inputindex]
             x.batchiterator = BatchIterator(blob)
             pos = x.batchiterator.startpos
