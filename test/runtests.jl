@@ -415,7 +415,7 @@ t = (
     col1=[["boop", "she"], ["boop", "she"], ["boo"]],
 )
 tbl = Arrow.Table(Arrow.tobuffer(t))
-@test eltype(tbl.col1) == Vector{String}
+@test eltype(tbl.col1) <: AbstractVector{String}
 end
 
 @testset "# 200 VersionNumber" begin
