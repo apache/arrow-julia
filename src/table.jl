@@ -625,6 +625,8 @@ function reinterp(::Type{T}, batch, buf, compression) where {T}
     end
 end
 
+const SubVector{T, P} = SubArray{T, 1, P, Tuple{UnitRange{Int64}}, true}
+
 function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, convert)
     @debugv 2 "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
@@ -637,16 +639,23 @@ function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, c
     bufferidx += 1
     len = rb.nodes[nodeidx].length
     nodeidx += 1
+    meta = buildmetadata(f.custom_metadata)
     if L isa Meta.Utf8 || L isa Meta.LargeUtf8 || L isa Meta.Binary || L isa Meta.LargeBinary
         buffer = rb.buffers[bufferidx]
         bytes, A = reinterp(UInt8, batch, buffer, rb.compression)
         bufferidx += 1
+        T = juliaeltype(f, meta, convert)
     else
         bytes = UInt8[]
         A, nodeidx, bufferidx = build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
+        T = juliaeltype(f, meta, convert)
+        # juliaeltype returns Vector for List, translate to SubArray
+        S = Base.nonmissingtype(T)
+        if S <: Vector
+            ST = SubVector{eltype(S), typeof(A)}
+            T = S == T ? ST : Union{Missing, ST}
+        end
     end
-    meta = buildmetadata(f.custom_metadata)
-    T = juliaeltype(f, meta, convert)
     return List{T, OT, typeof(A)}(bytes, validity, offsets, A, len, meta), nodeidx, bufferidx
 end
 
