@@ -197,7 +197,13 @@ end
 function is_equivalent_schema(sch1::Tables.Schema, sch2::Tables.Schema)
     (sch1.names == sch2.names) || (return false)
     for (t1,t2) in zip(sch1.types, sch2.types)
-        (t1 === t2) || (return false)
+        tt1 = Base.nonmissingtype(t1)
+        tt2 = Base.nonmissingtype(t2)
+        if t1 == t2 || (tt1 <: AbstractVector && tt2 <: AbstractVector && eltype(tt1) == eltype(tt2))
+            continue
+        else
+            return false
+        end
     end
     true
 end

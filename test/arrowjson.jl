@@ -596,7 +596,7 @@ function DataFile(source)
 end
 
 function Base.isequal(df::DataFile, tbl::Arrow.Table)
-    Tables.schema(df) == Tables.schema(tbl) || return false
+    Arrow.is_equivalent_schema(Tables.schema(df), Tables.schema(tbl)) || return false
     i = 1
     for (col1, col2) in zip(Tables.Columns(df), Tables.Columns(tbl))
         if !isequal(col1, col2)
