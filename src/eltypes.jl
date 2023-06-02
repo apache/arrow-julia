@@ -328,8 +328,8 @@ end
 ToTimestamp(x::A) where {A <: AbstractVector{ZonedDateTime}} = ToTimestamp{A, Symbol(x[1].timezone)}(x)
 Base.IndexStyle(::Type{<:ToTimestamp}) = Base.IndexLinear()
 Base.size(x::ToTimestamp) = (length(x.data),)
-Base.eltype(::ToTimestamp{A, TZ}) where {A, TZ} = Timestamp{Meta.TimeUnit.MILLISECOND, TZ}
-Base.getindex(x::ToTimestamp{A, TZ}, i::Int) where {A, TZ} = convert(Timestamp{Meta.TimeUnit.MILLISECOND, TZ}, getindex(x.data, i))
+Base.eltype(::Type{ToTimestamp{A, TZ}}) where {A, TZ} = Timestamp{Meta.TimeUnit.MILLISECOND, TZ}
+Base.getindex(x::ToTimestamp{A, TZ}, i::Integer) where {A, TZ} = convert(Timestamp{Meta.TimeUnit.MILLISECOND, TZ}, getindex(x.data, i))
 
 struct Interval{U, T} <: ArrowTimeType
     x::T

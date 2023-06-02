@@ -389,7 +389,7 @@ end
 
 Base.IndexStyle(::Type{<:ToArrow}) = Base.IndexLinear()
 Base.size(x::ToArrow) = (length(x.data),)
-Base.eltype(x::ToArrow{T, A}) where {T, A} = T
+Base.eltype(::Type{TA}) where {T, A, TA<:ToArrow{T, A}} = T
 function _convert(::Type{T}, x) where {T}
     if x isa T
         return x
