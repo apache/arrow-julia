@@ -23,10 +23,10 @@
 struct UnionT{T, typeIds, U}
 end
 
-unionmode(::Type{P}) where {T, typeIds, U, P<:UnionT{T, typeIds, U}} = T
-typeids(::Type{P}) where {T, typeIds, U, P<:UnionT{T, typeIds, U}} = typeIds
-Base.eltype(::Type{P}) where {T, typeIds, U, P<:UnionT{T, typeIds, U}} = U
-uniontypewith(::Type{P}, ::Type{U2}) where {T, typeIds, U, P<:UnionT{T, typeIds, U}, U2 <: Tuple} = UnionT{T, typeIds, U2}
+unionmode(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = T
+typeids(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = typeIds
+Base.eltype(::Type{UnionT{T, typeIds, U}}) where {T, typeIds, U} = U
+uniontypewith(::Type{UnionT{T, typeIds, U}}, ::Type{U2}) where {T, typeIds, U, U2 <: Tuple} = UnionT{T, typeIds, U2}
 
 ArrowTypes.ArrowKind(::Type{<:UnionT}) = ArrowTypes.UnionKind()
 
@@ -103,7 +103,7 @@ Base.size(x::DenseUnionVector) = (length(x.itr),)
 Base.iterate(x::DenseUnionVector, st...) = iterate(x.itr, st...)
 Base.getindex(x::DenseUnionVector, i::Int) = getindex(x.itr, i)
 
-function todense(::Type{P}, x) where {T, typeIds, U, P<:UnionT{T, typeIds, U}}
+function todense(::Type{UnionT{T, typeIds, U}}, x) where {T, typeIds, U}
     typeids = typeIds === nothing ? (0:(fieldcount(U) - 1)) : typeIds
     len = length(x)
     types = Vector{UInt8}(undef, len)
@@ -134,7 +134,7 @@ Base.getindex(x::SparseUnionVector, i::Int) = getindex(x.itr, i)
 # but with one child array per unioned type; each child
 # should include the elements from parent of its type
 # and other elements can be missing/default
-function sparsetypeids(::Type{P}, x) where {T, typeIds, U, P<:UnionT{T, typeIds, U}}
+function sparsetypeids(::Type{UnionT{T, typeIds, U}}, x) where {T, typeIds, U}
     typeids = typeIds === nothing ? (0:(fieldcount(U) - 1)) : typeIds
     len = length(x)
     types = Vector{UInt8}(undef, len)

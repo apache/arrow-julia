@@ -328,14 +328,14 @@ end
 ToTimestamp(x::A) where {A <: AbstractVector{ZonedDateTime}} = ToTimestamp{A, Symbol(x[1].timezone)}(x)
 Base.IndexStyle(::Type{<:ToTimestamp}) = Base.IndexLinear()
 Base.size(x::ToTimestamp) = (length(x.data),)
-Base.eltype(::Type{ToTimestamp{A, TZ}}) where {A, TZ} = Timestamp{Meta.TimeUnits.MILLISECOND, TZ}
-Base.getindex(x::ToTimestamp{A, TZ}, i::Integer) where {A, TZ} = convert(Timestamp{Meta.TimeUnits.MILLISECOND, TZ}, getindex(x.data, i))
+Base.eltype(::Type{ToTimestamp{A, TZ}}) where {A, TZ} = Timestamp{Meta.TimeUnit.MILLISECOND, TZ}
+Base.getindex(x::ToTimestamp{A, TZ}, i::Integer) where {A, TZ} = convert(Timestamp{Meta.TimeUnit.MILLISECOND, TZ}, getindex(x.data, i))
 
 struct Interval{U, T} <: ArrowTimeType
     x::T
 end
 
-Base.zero(::Type{I}) where {U, T, I<:Interval{U, T}} = Interval{U, T}(T(0))
+Base.zero(::Type{Interval{U, T}}) where {U, T} = Interval{U, T}(T(0))
 
 bitwidth(x::Meta.IntervalUnit.T) = x == Meta.IntervalUnit.YEAR_MONTH ? Int32 : Int64
 Interval{Meta.IntervalUnit.YEAR_MONTH}(x) = Interval{Meta.IntervalUnit.YEAR_MONTH, Int32}(Int32(x))
@@ -345,7 +345,7 @@ function juliaeltype(f::Meta.Field, x::Meta.Interval, convert)
     return Interval{x.unit, bitwidth(x.unit)}
 end
 
-function arrowtype(b, ::Type{I}) where {U, T, I<:Interval{U, T}}
+function arrowtype(b, ::Type{Interval{U, T}}) where {U, T}
     Meta.intervalStart(b)
     Meta.intervalAddUnit(b, U)
     return Meta.Interval, Meta.intervalEnd(b), nothing
@@ -355,13 +355,13 @@ struct Duration{U} <: ArrowTimeType
     x::Int64
 end
 
-Base.zero(::Type{D}) where {U, D<:Duration{U}} = Duration{U}(Int64(0))
+Base.zero(::Type{Duration{U}}) where {U} = Duration{U}(Int64(0))
 
 function juliaeltype(f::Meta.Field, x::Meta.Duration, convert)
     return Duration{x.unit}
 end
 
-finaljuliatype(::Type{D}) where {U, D<:Duration{U}} = periodtype(U)
+finaljuliatype(::Type{Duration{U}}) where {U} = periodtype(U)
 Base.convert(::Type{P}, x::Duration{U}) where {P <: Dates.Period, U} = P(periodtype(U)(x.x))
 
 function arrowtype(b, ::Type{Duration{U}}) where {U}
@@ -458,13 +458,13 @@ struct KeyValue{K, V}
     key::K
     value::V
 end
-keyvalueK(::Type{KV}) where {K, V, KV<:KeyValue{K, V}} = K
-keyvalueV(::Type{KV}) where {K, V, KV<:KeyValue{K, V}} = V
+keyvalueK(::Type{KeyValue{K, V}}) where {K, V} = K
+keyvalueV(::Type{KeyValue{K, V}}) where {K, V} = V
 Base.length(kv::KeyValue) = 1
 Base.iterate(kv::KeyValue, st=1) = st === nothing ? nothing : (kv, nothing)
-ArrowTypes.default(::Type{KV}) where {K, V, KV<:KeyValue{K, V}} = KeyValue(default(K), default(V))
+ArrowTypes.default(::Type{KeyValue{K, V}}) where {K, V} = KeyValue(default(K), default(V))
 
-function arrowtype(b, ::Type{KV}) where {K, V, KV<:KeyValue{K, V}}
+function arrowtype(b, ::Type{KeyValue{K, V}}) where {K, V}
     children = [fieldoffset(b, "key", K), fieldoffset(b, "value", V)]
     Meta.structStart(b)
     return Meta.Struct, Meta.structEnd(b), children
