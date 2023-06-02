@@ -640,15 +640,14 @@ function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, c
     len = rb.nodes[nodeidx].length
     nodeidx += 1
     meta = buildmetadata(f.custom_metadata)
+    T = juliaeltype(f, meta, convert)
     if L isa Meta.Utf8 || L isa Meta.LargeUtf8 || L isa Meta.Binary || L isa Meta.LargeBinary
         buffer = rb.buffers[bufferidx]
         bytes, A = reinterp(UInt8, batch, buffer, rb.compression)
         bufferidx += 1
-        T = juliaeltype(f, meta, convert)
     else
         bytes = UInt8[]
         A, nodeidx, bufferidx = build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
-        T = juliaeltype(f, meta, convert)
         # juliaeltype returns Vector for List, translate to SubArray
         S = Base.nonmissingtype(T)
         if S <: Vector
