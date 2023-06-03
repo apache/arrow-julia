@@ -570,10 +570,9 @@ function buildbitmap(batch, rb, nodeidx, bufferidx)
 end
 
 function uncompress(ptr::Ptr{UInt8}, buffer, compression)
-    if buffer.length == 0
-        return 0, UInt8[]
-    end
+    buffer.length == 0 && return 0, UInt8[]
     len = unsafe_load(convert(Ptr{Int64}, ptr))
+    len == 0 && return 0, UInt8[]
     ptr += 8 # skip past uncompressed length as Int64
     encodedbytes = unsafe_wrap(Array, ptr, buffer.length - 8)
     if len == -1
