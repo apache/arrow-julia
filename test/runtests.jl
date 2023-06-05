@@ -690,6 +690,14 @@ end
 
 end
 
+@testset "# 437" begin
+
+t = Arrow.Table(joinpath(dirname(pathof(Arrow)), "../test/java_compressed_zero_length.arrow"))
+@test length(t) == 2
+@test length(t.name) == 0
+
+end
+
 end # @testset "misc"
 
 end
