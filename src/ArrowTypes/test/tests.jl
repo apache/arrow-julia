@@ -38,6 +38,8 @@ end
 @test !ArrowTypes.hasarrowname(Int)
 
 @test ArrowTypes.arrowmetadata(Int) == ""
+@test ArrowTypes.arrowmetadata(Union{Nothing,Int}) == ""
+@test ArrowTypes.arrowmetadata(Union{Missing,Int}) == ""
 
 @test ArrowTypes.JuliaType(1) === nothing
 @test ArrowTypes.JuliaType(1, Int) === nothing

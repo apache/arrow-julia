@@ -119,8 +119,8 @@ This will then be available to access by overloading `ArrowTypes.JuliaType(::Val
 function arrowmetadata end
 const EMPTY_STRING = ""
 arrowmetadata(T) = EMPTY_STRING
-arrowmetadata(::Type{Union{T,Missing}}) where {T} = arrowmetadata{T}
-arrowmetadata(::Type{Union{T,Nothing}}) where {T} = arrowmetadata{T}
+arrowmetadata(::Type{Union{T,Missing}}) where {T} = arrowmetadata(T)
+arrowmetadata(::Type{Union{T,Nothing}}) where {T} = arrowmetadata(T)
 arrowmetadata(::Type{Nothing}) = EMPTY_STRING
 arrowmetadata(::Type{Missing}) = EMPTY_STRING
 arrowmetadata(::Type{Any}) = EMPTY_STRING
