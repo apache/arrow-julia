@@ -91,9 +91,17 @@ Add the release to ASF's report database via [Apache Committee Report Helper](ht
 
 To publish the release to the Julia General registry, navigate to the GitHub commit where the project version was incremented in the Project.toml file (step 2 above), then post a comment on the commit with the following:
 
-`@JuliaRegistrator register()`
+```markdown
+@JuliaRegistrator register
+```
 
 JuliaRegistrator will respond saying it has opened a pull request to the General registry and under normal circumstances, will be merged automatically.
+
+If ArrowTypes is also registered, we also need to post a comment on the commit with the following:
+
+```markdown
+@JuliaRegistrator register subdir=src/ArrowTypes
+```
 
 ### Verify
 
