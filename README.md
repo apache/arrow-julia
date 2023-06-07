@@ -21,7 +21,7 @@
 
 [![docs](https://img.shields.io/badge/docs-latest-blue&logo=julia)](https://arrow.juliadata.org/dev/)
 [![CI](https://github.com/apache/arrow-julia/workflows/CI/badge.svg)](https://github.com/apache/arrow-julia/actions?query=workflow%3ACI)
-[![codecov](https://app.codecov.io/gh/apache/arrow-julia/branch/master/graph/badge.svg)](https://app.codecov.io/gh/apache/arrow-julia)
+[![codecov](https://app.codecov.io/gh/apache/arrow-julia/branch/main/graph/badge.svg)](https://app.codecov.io/gh/apache/arrow-julia)
 
 [![deps](https://juliahub.com/docs/Arrow/deps.svg)](https://juliahub.com/ui/Packages/Arrow/QnF3w?t=2)
 [![version](https://juliahub.com/docs/Arrow/version.svg)](https://juliahub.com/ui/Packages/Arrow/QnF3w)
