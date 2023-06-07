@@ -20,8 +20,8 @@
 # Arrow
 
 [![docs](https://img.shields.io/badge/docs-latest-blue&logo=julia)](https://arrow.juliadata.org/dev/)
-[![CI](https://github.com/JuliaData/Arrow.jl/workflows/CI/badge.svg)](https://github.com/JuliaData/Arrow.jl/actions?query=workflow%3ACI)
-[![codecov](https://codecov.io/gh/JuliaData/Arrow.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/JuliaData/Arrow.jl)
+[![CI](https://github.com/apache/arrow-julia/workflows/CI/badge.svg)](https://github.com/apache/arrow-julia/actions?query=workflow%3ACI)
+[![codecov](https://app.codecov.io/gh/apache/arrow-julia/branch/master/graph/badge.svg)](https://app.codecov.io/gh/apache/arrow-julia)
 
 [![deps](https://juliahub.com/docs/Arrow/deps.svg)](https://juliahub.com/ui/Packages/Arrow/QnF3w?t=2)
 [![version](https://juliahub.com/docs/Arrow/version.svg)](https://juliahub.com/ui/Packages/Arrow/QnF3w)
@@ -38,12 +38,6 @@ The package can be installed by typing in the following in a Julia REPL:
 
 ```julia
 julia> using Pkg; Pkg.add("Arrow")
-```
-
-or to use the official-apache code that follows the official apache release process, you can do:
-
-```julia
-julia> using Pkg; Pkg.add(url="https://github.com/apache/arrow", subdir="julia/Arrow.jl")
 ```
 
 ## Local Development

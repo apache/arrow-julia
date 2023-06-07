@@ -126,7 +126,7 @@ end
 
 toidict(x::Base.ImmutableDict) = x
 
-# ref https://github.com/JuliaData/Arrow.jl/pull/238#issuecomment-919415809
+# ref https://github.com/apache/arrow-julia/pull/238#issuecomment-919415809
 function toidict(pairs)
     isempty(pairs) && return Base.ImmutableDict{String, String}()
     dict = Base.ImmutableDict(first(pairs))
