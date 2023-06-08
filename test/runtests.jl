@@ -698,6 +698,15 @@ t = Arrow.Table(joinpath(dirname(pathof(Arrow)), "../test/java_compressed_zero_l
 
 end
 
+@testset "# 458" begin
+
+x = (; a=[[[[1]]]])
+buf = Arrow.tobuffer(x)
+t = Arrow.Table(buf)
+@test t.a[1][1][1][1] == 1
+
+end
+
 end # @testset "misc"
 
 end

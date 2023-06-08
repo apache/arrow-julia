@@ -650,7 +650,7 @@ function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, c
         # juliaeltype returns Vector for List, translate to SubArray
         S = Base.nonmissingtype(T)
         if S <: Vector
-            ST = SubVector{eltype(S), typeof(A)}
+            ST = SubVector{eltype(A), typeof(A)}
             T = S == T ? ST : Union{Missing, ST}
         end
     end
