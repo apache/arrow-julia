@@ -707,6 +707,15 @@ t = Arrow.Table(buf)
 
 end
 
+@testset "# 456" begin
+
+NT = @NamedTuple{x::Int, y::Union{Missing,Int}}
+data = NT[(x=1,y=2), (x=2,y=missing), (x=3,y=4), (x=4,y=5)]
+t = [(a=1,b=view(data,1:2)), (a=2,b=view(data,3:4)), missing]
+@test Arrow.toarrowvector(t) isa Arrow.Struct
+
+end
+
 end # @testset "misc"
 
 end
