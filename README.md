@@ -19,7 +19,7 @@
 
 # Arrow
 
-[![docs](https://img.shields.io/badge/docs-latest-blue&logo=julia)](https://arrow.juliadata.org/dev/)
+[![docs](https://img.shields.io/badge/docs-latest-blue&logo=julia)](https://apache.github.io/arrow-julia/dev/)
 [![CI](https://github.com/apache/arrow-julia/workflows/CI/badge.svg)](https://github.com/apache/arrow-julia/actions?query=workflow%3ACI)
 [![codecov](https://app.codecov.io/gh/apache/arrow-julia/branch/main/graph/badge.svg)](https://app.codecov.io/gh/apache/arrow-julia)
 
