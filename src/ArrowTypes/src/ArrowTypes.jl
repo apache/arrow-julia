@@ -348,6 +348,8 @@ function default(::Type{A}) where {A <: AbstractVector{T}} where {T}
     return a
 end
 
+default(::Type{SubArray{T,N,P,I,L}}) where {T,N,P,I,L} = view(default(P), 0:-1)
+
 default(::Type{NTuple{N, T}}) where {N, T} = ntuple(i -> default(T), N)
 default(::Type{T}) where {T <: Tuple} = Tuple(default(fieldtype(T, i)) for i = 1:fieldcount(T))
 default(::Type{T}) where {T <: AbstractDict} = T()
