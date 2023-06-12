@@ -713,6 +713,15 @@ t = [(a=1,b=view(data,1:2)), (a=2,b=view(data,3:4)), missing]
 
 end
 
+@testset "# 461" begin
+
+table = (; v=[v"1", v"2", missing])
+buf = Arrow.tobuffer(table)
+table2 = Arrow.Table(buf)
+@test isequal(table.v, table2.v)
+
+end
+
 end # @testset "misc"
 
 end

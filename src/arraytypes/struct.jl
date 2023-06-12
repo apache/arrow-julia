@@ -74,10 +74,10 @@ ToStruct(x::A, j::Integer) where {A} = ToStruct{fieldtype(Base.nonmissingtype(el
 Base.IndexStyle(::Type{<:ToStruct}) = Base.IndexLinear()
 Base.size(x::ToStruct) = (length(x.data),)
 
-Base.@propagate_inbounds function Base.getindex(A::ToStruct{T, j}, i::Integer) where {T, j}
-    @boundscheck checkbounds(A, i)
-    @inbounds x = A.data[i]
-    return x === missing ? ArrowTypes.default(T) : getfield(x, j)
+Base.@propagate_inbounds function Base.getindex(a::ToStruct{T, j, A}, i::Integer) where {T, j, A}
+    @boundscheck checkbounds(a, i)
+    @inbounds x = a.data[i]
+    return x === missing ? getfield(ArrowTypes.default(eltype(A)), j) : getfield(x, j)
 end
 
 arrowvector(::StructKind, x::Struct, i, nl, fi, de, ded, meta; kw...) = x
