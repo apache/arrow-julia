@@ -14,18 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-using Test, Arrow, ArrowTypes, Tables, Dates, PooledArrays, TimeZones, UUIDs, Sockets,
-    CategoricalArrays, DataAPI, FilePathsBase, DataFrames
-using Random: randstring
-
-# Compat shim for pre-julia 1.9
-if !@isdefined(pkgversion)
-    using TOML
-    function pkgversion(m::Module)
-        toml = TOML.parsefile(joinpath(pkgdir(m), "Project.toml"))
-        return VersionNumber(toml["version"])
-    end
-end
+using Test
+using Arrow
+using ArrowTypes
+using Tables
+using Dates
+using PooledArrays
+using TimeZones
+using UUIDs
+using Sockets
+using CategoricalArrays
+using DataAPI
+using FilePathsBase
+using DataFrames
+import Random: randstring
 
 include(joinpath(dirname(pathof(ArrowTypes)), "../test/tests.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
@@ -72,11 +74,12 @@ end # @testset "table append"
 
 for file in readdir(joinpath(dirname(pathof(Arrow)), "../test/arrowjson"))
     jsonfile = joinpath(joinpath(dirname(pathof(Arrow)), "../test/arrowjson"), file)
-    println("integration test for $jsonfile")
+    @testset "integration test for $jsonfile" begin
     df = ArrowJSON.parsefile(jsonfile);
     io = Arrow.tobuffer(df)
     tbl = Arrow.Table(io; convert=false);
     @test isequal(df, tbl)
+    end
 end
 
 end # @testset "arrow json integration tests"
@@ -605,21 +608,15 @@ table = Arrow.Table(joinpath(@__DIR__, "old_zdt.arrow"))
 end
 
 @testset "# 243" begin
-if pkgversion(ArrowTypes) >= v"2.0.1" # need the ArrowTypes bugfix to pass this test
-    # https://github.com/apache/arrow-julia/issues/243
-    table = (; col = [(; v=v"1"), (; v=v"2"), missing])
-    @test isequal(Arrow.Table(Arrow.tobuffer(table)).col, table.col)
-end
+table = (; col = [(; v=v"1"), (; v=v"2"), missing])
+@test isequal(Arrow.Table(Arrow.tobuffer(table)).col, table.col)
 end
 
 @testset "# 367" begin
-# https://github.com/apache/arrow-julia/issues/367
-if pkgversion(ArrowTypes) >= v"2.0.2"
-    t = (; x=Union{ZonedDateTime,Missing}[missing])
-    a = Arrow.Table(Arrow.tobuffer(t))
-    @test Tables.schema(a) == Tables.schema(t)
-    @test isequal(a.x, t.x)
-end
+t = (; x=Union{ZonedDateTime,Missing}[missing])
+a = Arrow.Table(Arrow.tobuffer(t))
+@test Tables.schema(a) == Tables.schema(t)
+@test isequal(a.x, t.x)
 end
 
 # https://github.com/apache/arrow-julia/issues/414
@@ -707,14 +704,14 @@ t = Arrow.Table(buf)
 
 end
 
-# @testset "# 456" begin
+@testset "# 456" begin
 
-# NT = @NamedTuple{x::Int, y::Union{Missing,Int}}
-# data = NT[(x=1,y=2), (x=2,y=missing), (x=3,y=4), (x=4,y=5)]
-# t = [(a=1,b=view(data,1:2)), (a=2,b=view(data,3:4)), missing]
-# @test Arrow.toarrowvector(t) isa Arrow.Struct
+NT = @NamedTuple{x::Int, y::Union{Missing,Int}}
+data = NT[(x=1,y=2), (x=2,y=missing), (x=3,y=4), (x=4,y=5)]
+t = [(a=1,b=view(data,1:2)), (a=2,b=view(data,3:4)), missing]
+@test Arrow.toarrowvector(t) isa Arrow.Struct
 
-# end
+end
 
 end # @testset "misc"
 

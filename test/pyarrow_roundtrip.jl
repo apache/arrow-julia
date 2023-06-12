@@ -21,7 +21,7 @@ include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
 
 for (nm, t, writekw, readkw, extratests) in testtables
     nm == "unions" && continue
-    println("pyarrow roundtrip: $nm")
+    @testset "pyarrow roundtrip: $nm" begin
     io = IOBuffer()
     Arrow.write(io, t; writekw...)
     seekstart(io)
@@ -36,7 +36,8 @@ for (nm, t, writekw, readkw, extratests) in testtables
     buf = sink.getvalue()
     jbytes = copy(reinterpret(UInt8, buf))
     tt = Arrow.Table(jbytes)
-    println("pyarrow roundtrip w/ compression: $nm")
+    end
+    @testset "pyarrow roundtrip w/ compression: $nm" begin
     io = IOBuffer()
     Arrow.write(io, t; compress=((:lz4, :zstd)[rand(1:2)]), writekw...)
     seekstart(io)
@@ -51,6 +52,7 @@ for (nm, t, writekw, readkw, extratests) in testtables
     buf = sink.getvalue()
     jbytes = copy(reinterpret(UInt8, buf))
     tt = Arrow.Table(jbytes)
+    end
 end
 
 f1 = pa.field("f1", pa.float64(), true)
