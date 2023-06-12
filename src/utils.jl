@@ -34,7 +34,9 @@ writearray(io, col) = writearray(io, maybemissing(eltype(col)), col)
 function writearray(io::IO, ::Type{T}, col) where {T}
     if col isa Vector{T}
         n = Base.write(io, col)
-    elseif isbitstype(T) && (col isa Vector{Union{T, Missing}} || col isa SentinelVector{T, T, Missing, Vector{T}})
+    elseif isbitstype(T) && (
+        col isa Vector{Union{T,Missing}} || col isa SentinelVector{T,T,Missing,Vector{T}}
+    )
         # need to write the non-selector bytes of isbits Union Arrays
         n = Base.unsafe_write(io, pointer(col), sizeof(T) * length(col))
     elseif col isa ChainedVector
@@ -92,21 +94,23 @@ function readbuffer(t::AbstractVector{UInt8}, pos::Integer, ::Type{T}) where {T}
 end
 
 # given a number of unique values; what dict encoding _index_ type is most appropriate
-encodingtype(n) = n < div(typemax(Int8), 2) ? Int8 : n < div(typemax(Int16), 2) ? Int16 : n < div(typemax(Int32), 2) ? Int32 : Int64
+encodingtype(n) =
+    n < div(typemax(Int8), 2) ? Int8 :
+    n < div(typemax(Int16), 2) ? Int16 : n < div(typemax(Int32), 2) ? Int32 : Int64
 
 maybemissing(::Type{T}) where {T} = T === Missing ? Missing : Base.nonmissingtype(T)
-withmissing(U::Union, S) = U >: Missing ? Union{Missing, S} : S
-withmissing(T, S) = T === Missing ? Union{Missing, S} : S
+withmissing(U::Union, S) = U >: Missing ? Union{Missing,S} : S
+withmissing(T, S) = T === Missing ? Union{Missing,S} : S
 
 function getfooter(filebytes)
     len = readbuffer(filebytes, length(filebytes) - 9, Int32)
-    FlatBuffers.getrootas(Meta.Footer, filebytes[end-(9 + len):end-10], 0)
+    FlatBuffers.getrootas(Meta.Footer, filebytes[(end - (9 + len)):(end - 10)], 0)
 end
 
 function getrb(filebytes)
     f = getfooter(filebytes)
     rb = f.recordBatches[1]
-    return filebytes[rb.offset+1:(rb.offset+1+rb.metaDataLength)]
+    return filebytes[(rb.offset + 1):(rb.offset + 1 + rb.metaDataLength)]
     # FlatBuffers.getrootas(Meta.Message, filebytes, rb.offset)
 end
 
@@ -128,7 +132,7 @@ toidict(x::Base.ImmutableDict) = x
 
 # ref https://github.com/apache/arrow-julia/pull/238#issuecomment-919415809
 function toidict(pairs)
-    isempty(pairs) && return Base.ImmutableDict{String, String}()
+    isempty(pairs) && return Base.ImmutableDict{String,String}()
     dict = Base.ImmutableDict(first(pairs))
     for pair in Iterators.drop(pairs, 1)
         dict = Base.ImmutableDict(dict, pair)

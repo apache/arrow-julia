@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-struct Offsets{T <: Union{Int32, Int64}} <: ArrowVector{Tuple{T, T}}
+struct Offsets{T<:Union{Int32,Int64}} <: ArrowVector{Tuple{T,T}}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     offsets::Vector{T}
 end
@@ -33,13 +33,13 @@ end
 
 An `ArrowVector` where each element is a variable sized list of some kind, like an `AbstractVector` or `AbstractString`.
 """
-struct List{T, O, A} <: ArrowVector{T}
+struct List{T,O,A} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     validity::ValidityBitmap
     offsets::Offsets{O}
     data::A
     ℓ::Int
-    metadata::Union{Nothing, Base.ImmutableDict{String,String}}
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
 end
 
 Base.size(l::List) = (l.ℓ,)
@@ -53,9 +53,12 @@ Base.size(l::List) = (l.ℓ,)
     if ArrowTypes.isstringtype(K) || S <: Base.CodeUnits
         if S !== T
             if S <: Base.CodeUnits
-                return l.validity[i] ? Base.CodeUnits(unsafe_string(pointer(l.data, lo), hi - lo + 1)) : missing
+                return l.validity[i] ?
+                       Base.CodeUnits(unsafe_string(pointer(l.data, lo), hi - lo + 1)) :
+                       missing
             else
-                return l.validity[i] ? ArrowTypes.fromarrow(T, pointer(l.data, lo), hi - lo + 1) : missing
+                return l.validity[i] ?
+                       ArrowTypes.fromarrow(T, pointer(l.data, lo), hi - lo + 1) : missing
             end
         else
             if S <: Base.CodeUnits
@@ -83,14 +86,14 @@ _codeunits(x::Base.CodeUnits) = x
 
 # an AbstractVector version of Iterators.flatten
 # code based on SentinelArrays.ChainedVector
-struct ToList{T, stringtype, A, I} <: AbstractVector{T}
+struct ToList{T,stringtype,A,I} <: AbstractVector{T}
     data::Vector{A} # A is AbstractVector or AbstractString
     inds::Vector{I}
 end
 
-origtype(::ToList{T, S, A, I}) where {T, S, A, I} = A
-liststringtype(::Type{ToList{T, S, A, I}}) where {T, S, A, I} = S
-function liststringtype(::List{T, O, A}) where {T, O, A}
+origtype(::ToList{T,S,A,I}) where {T,S,A,I} = A
+liststringtype(::Type{ToList{T,S,A,I}}) where {T,S,A,I} = S
+function liststringtype(::List{T,O,A}) where {T,O,A}
     ST = Base.nonmissingtype(T)
     K = ArrowTypes.ArrowKind(ST)
     return liststringtype(A) || ArrowTypes.isstringtype(K) || ST <: Base.CodeUnits # add the CodeUnits check for ArrowTypes compat for now
@@ -123,7 +126,7 @@ function ToList(input; largelists::Bool=false)
         end
         push!(inds, totalsize)
     end
-    return ToList{T, stringtype, AT, I}(data, inds)
+    return ToList{T,stringtype,AT,I}(data, inds)
 end
 
 Base.IndexStyle(::Type{<:ToList}) = Base.IndexLinear()
@@ -140,14 +143,21 @@ end
     return chunk - 1, i - (@inbounds A.inds[chunk - 1])
 end
 
-Base.@propagate_inbounds function Base.getindex(A::ToList{T, stringtype}, i::Integer) where {T, stringtype}
+Base.@propagate_inbounds function Base.getindex(
+    A::ToList{T,stringtype},
+    i::Integer,
+) where {T,stringtype}
     @boundscheck checkbounds(A, i)
     chunk, ix = index(A, i)
     @inbounds x = A.data[chunk]
     return @inbounds stringtype ? _codeunits(x)[ix] : x[ix]
 end
 
-Base.@propagate_inbounds function Base.setindex!(A::ToList{T, stringtype}, v, i::Integer) where {T, stringtype}
+Base.@propagate_inbounds function Base.setindex!(
+    A::ToList{T,stringtype},
+    v,
+    i::Integer,
+) where {T,stringtype}
     @boundscheck checkbounds(A, i)
     chunk, ix = index(A, i)
     @inbounds x = A.data[chunk]
@@ -160,7 +170,7 @@ Base.@propagate_inbounds function Base.setindex!(A::ToList{T, stringtype}, v, i:
 end
 
 # efficient iteration
-@inline function Base.iterate(A::ToList{T, stringtype}) where {T, stringtype}
+@inline function Base.iterate(A::ToList{T,stringtype}) where {T,stringtype}
     length(A) == 0 && return nothing
     i = 1
     chunk = 2
@@ -187,7 +197,10 @@ end
     return x, (i, chunk, chunk_i, chunk_len, length(A))
 end
 
-@inline function Base.iterate(A::ToList{T, stringtype}, (i, chunk, chunk_i, chunk_len, len)) where {T, stringtype}
+@inline function Base.iterate(
+    A::ToList{T,stringtype},
+    (i, chunk, chunk_i, chunk_len, len),
+) where {T,stringtype}
     i > len && return nothing
     @inbounds val = A.data[chunk - 1]
     @inbounds x = stringtype ? _codeunits(val)[chunk_i] : val[chunk_i]
@@ -217,13 +230,21 @@ function arrowvector(::ListKind, x, i, nl, fi, de, ded, meta; largelists::Bool=f
         data = flat
         T = origtype(flat)
     else
-        data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; largelists=largelists, kw...)
+        data =
+            arrowvector(flat, i, nl + 1, fi, de, ded, nothing; largelists=largelists, kw...)
         T = withmissing(eltype(x), Vector{eltype(data)})
     end
-    return List{T, eltype(flat.inds), typeof(data)}(UInt8[], validity, offsets, data, len, meta)
+    return List{T,eltype(flat.inds),typeof(data)}(
+        UInt8[],
+        validity,
+        offsets,
+        data,
+        len,
+        meta,
+    )
 end
 
-function compress(Z::Meta.CompressionType.T, comp, x::List{T, O, A}) where {T, O, A}
+function compress(Z::Meta.CompressionType.T, comp, x::List{T,O,A}) where {T,O,A}
     len = length(x)
     nc = nullcount(x)
     validity = compress(Z, comp, x.validity)
@@ -235,5 +256,5 @@ function compress(Z::Meta.CompressionType.T, comp, x::List{T, O, A}) where {T, O
     else
         push!(children, compress(Z, comp, x.data))
     end
-    return Compressed{Z, typeof(x)}(x, buffers, len, nc, children)
+    return Compressed{Z,typeof(x)}(x, buffers, len, nc, children)
 end

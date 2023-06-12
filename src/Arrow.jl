@@ -45,7 +45,15 @@ using Base.Iterators
 using Mmap
 using LoggingExtras
 import Dates
-using DataAPI, Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd, TimeZones, BitIntegers, ConcurrentUtilities
+using DataAPI,
+    Tables,
+    SentinelArrays,
+    PooledArrays,
+    CodecLz4,
+    CodecZstd,
+    TimeZones,
+    BitIntegers,
+    ConcurrentUtilities
 
 export ArrowTypes
 
@@ -60,7 +68,8 @@ include("FlatBuffers/FlatBuffers.jl")
 using .FlatBuffers
 
 include("metadata/Flatbuf.jl")
-using .Flatbuf; const Meta = Flatbuf
+using .Flatbuf
+const Meta = Flatbuf
 
 using ArrowTypes
 include("utils.jl")
@@ -111,12 +120,13 @@ function access_threaded(f, v::Vector)
     end
     return x
 end
-@noinline _length_assert() =  @assert false "0 < tid <= v"
+@noinline _length_assert() = @assert false "0 < tid <= v"
 
 zstd_compressor() = access_threaded(init_zstd_compressor, ZSTD_COMPRESSOR)
 zstd_decompressor() = access_threaded(init_zstd_decompressor, ZSTD_DECOMPRESSOR)
 lz4_frame_compressor() = access_threaded(init_lz4_frame_compressor, LZ4_FRAME_COMPRESSOR)
-lz4_frame_decompressor() = access_threaded(init_lz4_frame_decompressor, LZ4_FRAME_DECOMPRESSOR)
+lz4_frame_decompressor() =
+    access_threaded(init_lz4_frame_decompressor, LZ4_FRAME_DECOMPRESSOR)
 
 function __init__()
     nt = @static if isdefined(Base.Threads, :maxthreadid)

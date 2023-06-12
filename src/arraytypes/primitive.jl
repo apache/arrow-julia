@@ -19,20 +19,20 @@
 
 An `ArrowVector` where each element is a "fixed size" scalar of some kind, like an integer, float, decimal, or time type.
 """
-struct Primitive{T, A} <: ArrowVector{T}
+struct Primitive{T,A} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     validity::ValidityBitmap
     data::A
     ℓ::Int64
-    metadata::Union{Nothing, Base.ImmutableDict{String,String}}
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
 end
 
-Primitive(::Type{T}, b::Vector{UInt8}, v::ValidityBitmap, data::A, l, meta) where {T, A} =
-    Primitive{T, A}(b, v, data, l, meta)
+Primitive(::Type{T}, b::Vector{UInt8}, v::ValidityBitmap, data::A, l, meta) where {T,A} =
+    Primitive{T,A}(b, v, data, l, meta)
 
 Base.size(p::Primitive) = (p.ℓ,)
 
-function Base.copy(p::Primitive{T, A}) where {T, A}
+function Base.copy(p::Primitive{T,A}) where {T,A}
     if nullcount(p) == 0 && T === eltype(A)
         return copy(p.data)
     else
@@ -70,15 +70,21 @@ function arrowvector(::PrimitiveKind, x, i, nl, fi, de, ded, meta; kw...)
     return Primitive(eltype(x), UInt8[], validity, x, length(x), meta)
 end
 
-function compress(Z::Meta.CompressionType.T, comp, p::P) where {P <: Primitive}
+function compress(Z::Meta.CompressionType.T, comp, p::P) where {P<:Primitive}
     len = length(p)
     nc = nullcount(p)
     validity = compress(Z, comp, p.validity)
     data = compress(Z, comp, p.data)
-    return Compressed{Z, P}(p, [validity, data], len, nc, Compressed[])
+    return Compressed{Z,P}(p, [validity, data], len, nc, Compressed[])
 end
 
-function makenodesbuffers!(col::Primitive{T}, fieldnodes, fieldbuffers, bufferoffset, alignment) where {T}
+function makenodesbuffers!(
+    col::Primitive{T},
+    fieldnodes,
+    fieldbuffers,
+    bufferoffset,
+    alignment,
+) where {T}
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))

@@ -20,10 +20,8 @@ const fileIdentifierLength = 4
 Scalar
 A Union of the Julia types `T <: Number` that are allowed in FlatBuffers schema
 """
-const Scalar = Union{Bool,
-Int8, Int16, Int32, Int64,
-UInt8, UInt16, UInt32, UInt64,
-Float32, Float64, Enum}
+const Scalar =
+    Union{Bool,Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64,Float32,Float64,Enum}
 
 """
 Builder is a state machine for creating FlatBuffer objects.
@@ -41,12 +39,22 @@ mutable struct Builder
     head::UOffsetT
     nested::Bool
     finished::Bool
-    sharedstrings::Dict{String, UOffsetT}
+    sharedstrings::Dict{String,UOffsetT}
 end
 
 bytes(b::Builder) = getfield(b, :bytes)
 
-Builder(size=0) = Builder(zeros(UInt8, size), 1, UOffsetT[], UOffsetT(0), UOffsetT[], UOffsetT(size), false, false, Dict{String, UOffsetT}())
+Builder(size=0) = Builder(
+    zeros(UInt8, size),
+    1,
+    UOffsetT[],
+    UOffsetT(0),
+    UOffsetT[],
+    UOffsetT(size),
+    false,
+    false,
+    Dict{String,UOffsetT}(),
+)
 
 function reset!(b::Builder)
     empty!(b.bytes)
@@ -60,11 +68,11 @@ function reset!(b::Builder)
     return
 end
 
-Base.write(sink::Builder, o, x::Union{Bool,UInt8}) = sink.bytes[o+1] = UInt8(x)
+Base.write(sink::Builder, o, x::Union{Bool,UInt8}) = sink.bytes[o + 1] = UInt8(x)
 function Base.write(sink::Builder, off, x::T) where {T}
     off += 1
-    for (i, ind) = enumerate(off:(off + sizeof(T) - 1))
-        sink.bytes[ind] = (x >> ((i-1) * 8)) % UInt8
+    for (i, ind) in enumerate(off:(off + sizeof(T) - 1))
+        sink.bytes[ind] = (x >> ((i - 1) * 8)) % UInt8
     end
 end
 Base.write(b::Builder, o, x::Float32) = write(b, o, reinterpret(UInt32, x))
@@ -124,7 +132,7 @@ function writevtable!(b::Builder)
     if i !== nothing
         resize!(b.vtable, i)
     end
-    
+
     # Search backwards through existing vtables, because similar vtables
     # are likely to have been recently appended. See
     # BenchmarkVtableDeduplication for a case in which this heuristic
@@ -208,7 +216,7 @@ end
 
 offset(b::Builder) = UOffsetT(length(b.bytes) - b.head)
 
-pad!(b::Builder, n) = foreach(x->place!(b, 0x00), 1:n)
+pad!(b::Builder, n) = foreach(x -> place!(b, 0x00), 1:n)
 
 """
 `prep!` prepares to write an element of `size` after `additionalbytes`
@@ -295,7 +303,7 @@ end
 """
 `createstring!` writes a null-terminated string as a vector.
 """
-function createstring!(b::Builder, s::Union{AbstractString, AbstractVector{UInt8}})
+function createstring!(b::Builder, s::Union{AbstractString,AbstractVector{UInt8}})
     assertnotnested(b)
     b.nested = true
     s = codeunits(s)
@@ -305,7 +313,7 @@ function createstring!(b::Builder, s::Union{AbstractString, AbstractVector{UInt8
     l = sizeof(s)
 
     b.head -= l
-    copyto!(b.bytes, b.head+1, s, 1, l)
+    copyto!(b.bytes, b.head + 1, s, 1, l)
     return endvector!(b, sizeof(s))
 end
 
@@ -353,7 +361,7 @@ end
 If value `x` equals default `d`, then the slot will be set to zero and no
 other data will be written.
 """
-function prependslot!(b::Builder, o::Int, x::T, d, sh=false) where {T <: Scalar}
+function prependslot!(b::Builder, o::Int, x::T, d, sh=false) where {T<:Scalar}
     if x != T(d)
         prepend!(b, x)
         slot!(b, o)
@@ -418,13 +426,13 @@ function vtableEqual(a::Vector{UOffsetT}, objectStart, b::AbstractVector{UInt8})
         return false
     end
 
-    for i = 0:(length(a)-1)
+    for i = 0:(length(a) - 1)
         x = read(IOBuffer(view(b, (i * sizeof(VOffsetT) + 1):length(b))), VOffsetT)
 
         # Skip vtable entries that indicate a default value.
-        x == 0 && a[i+1] == 0 && continue
+        x == 0 && a[i + 1] == 0 && continue
 
-        y = objectStart - a[i+1]
+        y = objectStart - a[i + 1]
         x != y && return false
     end
     return true
