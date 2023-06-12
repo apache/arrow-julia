@@ -220,7 +220,7 @@ testtables = [
 ];
 
 function testtable(nm, t, writekw, readkw, extratests)
-  println("testing: $nm")
+  @testset "testing: $nm" begin
   io = Arrow.tobuffer(t; writekw...)
   tt = Arrow.Table(io; readkw...)
   @test length(tt) == length(t)
@@ -253,5 +253,5 @@ function testtable(nm, t, writekw, readkw, extratests)
   tt = first(str)
   @test length(tt) == length(t)
   @test all(isequal.(values(t), values(tt)))
-  return
+  end
 end

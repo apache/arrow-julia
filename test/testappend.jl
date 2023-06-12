@@ -16,7 +16,7 @@
 # under the License.
 
 function testappend(nm, t, writekw, readkw, extratests)
-    println("testing append: $nm")
+    @testset "append: $nm" begin
     io = Arrow.tobuffer(t; writekw...)
     bytes = read(io)
     mktemp() do path, io
@@ -32,6 +32,7 @@ function testappend(nm, t, writekw, readkw, extratests)
             nparts += 1
         end
         @test nparts == 2
+    end
     end
 end
 
