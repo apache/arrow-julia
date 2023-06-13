@@ -37,5 +37,6 @@ makedocs(;
 
 deploydocs(;
     repo="github.com/apache/arrow-julia",
-    devbranch = "main"
+    devbranch = "main",
+    branch = "asf-site"
 )

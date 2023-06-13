@@ -38,3 +38,9 @@ github:
   protected_branches:
     main:
       required_linear_history: true
+
+# publishes the content of the `asf-site` branch to
+# https://arrow.apache.org/julia/
+publish:
+  whoami: asf-site
+  subdir: julia
