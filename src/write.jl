@@ -147,7 +147,7 @@ function Base.open(::Type{Writer}, io::T, compress::Union{Nothing,Symbol,LZ4Fram
     blocks = (Block[], Block[])
     # start message writing from channel
     threaded = Threads.nthreads() > 1
-    task = threaded ? (Threads.@spawn for msg in msgs
+    task = threaded ? (@wkspawn for msg in msgs
         Base.write(io, msg, blocks, schema, alignment)
     end) : (@async for msg in msgs
         Base.write(io, msg, blocks, schema, alignment)
@@ -202,7 +202,7 @@ function write(writer::Writer, source)
             put!(writer.msgs, recbatchmsg)
         else
             if writer.threaded
-                Threads.@spawn process_partition(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, writer.sync, writer.msgs, writer.alignment, $(writer.partition_count), writer.schema, writer.errorref, writer.anyerror, writer.meta, writer.colmeta)
+                @wkspawn process_partition(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, writer.sync, writer.msgs, writer.alignment, $(writer.partition_count), writer.schema, writer.errorref, writer.anyerror, writer.meta, writer.colmeta)
             else
                 @async process_partition(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, writer.sync, writer.msgs, writer.alignment, $(writer.partition_count), writer.schema, writer.errorref, writer.anyerror, writer.meta, writer.colmeta)
             end

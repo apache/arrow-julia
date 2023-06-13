@@ -130,7 +130,7 @@ function append(io::IO, source, arrow_schema, compress, largelists, denseunions,
     blocks = (Block[], Block[])
     # start message writing from channel
     threaded = ntasks > 1
-    tsk = threaded ? (Threads.@spawn for msg in msgs
+    tsk = threaded ? (@wkspawn for msg in msgs
         Base.write(io, msg, blocks, sch, alignment)
     end) : (@async for msg in msgs
         Base.write(io, msg, blocks, sch, alignment)
@@ -151,7 +151,7 @@ function append(io::IO, source, arrow_schema, compress, largelists, denseunions,
         end
 
         if threaded
-            Threads.@spawn process_partition(tbl_cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, sync, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
+            @wkspawn process_partition(tbl_cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, sync, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
         else
             @async process_partition(tbl_cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, sync, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
         end
