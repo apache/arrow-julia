@@ -351,7 +351,13 @@ end
 default(::Type{SubArray{T,N,P,I,L}}) where {T,N,P,I,L} = view(default(P), 0:-1)
 
 default(::Type{NTuple{N, T}}) where {N, T} = ntuple(i -> default(T), N)
-default(::Type{T}) where {T <: Tuple} = Tuple(default(fieldtype(T, i)) for i = 1:fieldcount(T))
+default(::Type{Tuple{}}) = ()
+function default(::Type{T}) where {T <: Tuple}
+    T === Tuple{} && return ()
+    N = Base.isvarargtype(T.parameters[end]) ? length(T.parameters) - 1 : fieldcount(T)
+    return Tuple(default(fieldtype(T, i)) for i = 1:N)
+end
+
 default(::Type{T}) where {T <: AbstractDict} = T()
 default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{names}(Tuple(default(fieldtype(types, i)) for i = 1:length(names)))
 
