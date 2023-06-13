@@ -217,7 +217,7 @@ function arrowvector(::ListKind, x, i, nl, fi, de, ded, meta; largelists::Bool=f
         data = flat
         T = origtype(flat)
     else
-        data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; lareglists=largelists, kw...)
+        data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; largelists=largelists, kw...)
         T = withmissing(eltype(x), Vector{eltype(data)})
     end
     return List{T, eltype(flat.inds), typeof(data)}(UInt8[], validity, offsets, data, len, meta)
