@@ -59,7 +59,7 @@ function arrowvector(::MapKind, x, i, nl, fi, de, ded, meta; largelists::Bool=fa
     T = DT !== ET ? Union{Missing, VT} : VT
     flat = ToList(T[keyvalues(KT, y) for y in x]; largelists=largelists)
     offsets = Offsets(UInt8[], flat.inds)
-    data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; lareglists=largelists, kw...)
+    data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; largelists=largelists, kw...)
     K, V = keyvaluetypes(eltype(data))
     return Map{withmissing(ET, Dict{K, V}), eltype(flat.inds), typeof(data)}(validity, offsets, data, len, meta)
 end
