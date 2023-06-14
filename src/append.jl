@@ -169,7 +169,7 @@ function append(
     # start message writing from channel
     threaded = ntasks > 1
     tsk =
-        threaded ? (Threads.@spawn for msg in msgs
+        threaded ? (@wkspawn for msg in msgs
             Base.write(io, msg, blocks, sch, alignment)
         end) : (@async for msg in msgs
             Base.write(io, msg, blocks, sch, alignment)
@@ -191,7 +191,7 @@ function append(
         end
 
         if threaded
-            Threads.@spawn process_partition(
+            @wkspawn process_partition(
                 tbl_cols,
                 dictencodings,
                 largelists,

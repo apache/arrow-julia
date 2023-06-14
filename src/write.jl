@@ -167,7 +167,7 @@ function Base.open(
     # start message writing from channel
     threaded = Threads.nthreads() > 1
     task =
-        threaded ? (Threads.@spawn for msg in msgs
+        threaded ? (@wkspawn for msg in msgs
             Base.write(io, msg, blocks, schema, alignment)
         end) : (@async for msg in msgs
             Base.write(io, msg, blocks, schema, alignment)
@@ -296,7 +296,7 @@ function write(writer::Writer, source)
             put!(writer.msgs, recbatchmsg)
         else
             if writer.threaded
-                Threads.@spawn process_partition(
+                @wkspawn process_partition(
                     tblcols,
                     writer.dictencodings,
                     writer.largelists,

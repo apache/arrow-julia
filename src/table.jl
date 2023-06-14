@@ -419,7 +419,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
     dictencoded = Dict{Int64,Meta.Field}() # dictionary id => field
     sync = OrderedSynchronizer()
     tsks = Channel{Any}(Inf)
-    tsk = Threads.@spawn begin
+    tsk = @wkspawn begin
         i = 1
         for cols in tsks
             if i == 1
@@ -522,7 +522,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
             elseif header isa Meta.RecordBatch
                 anyrecordbatches = true
                 @debugv 1 "parsing record batch message: compression = $(header.compression)"
-                Threads.@spawn begin
+                @wkspawn begin
                     cols = collect(VectorIterator(sch, $batch, dictencodings, convert))
                     put!(() -> put!(tsks, cols), sync, $(rbi))
                 end
