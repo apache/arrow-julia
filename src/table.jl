@@ -20,7 +20,8 @@ struct ArrowBlob
     len::Int
 end
 
-ArrowBlob(bytes::Vector{UInt8}, pos::Int, len::Nothing) = ArrowBlob(bytes, pos, length(bytes))
+ArrowBlob(bytes::Vector{UInt8}, pos::Int, len::Nothing) =
+    ArrowBlob(bytes, pos, length(bytes))
 
 tobytes(bytes::Vector{UInt8}) = bytes
 tobytes(io::IO) = Base.read(io)
@@ -69,8 +70,8 @@ mutable struct Stream
     names::Vector{Symbol}
     types::Vector{Type}
     schema::Union{Nothing,Meta.Schema}
-    dictencodings::Dict{Int64, DictEncoding} # dictionary id => DictEncoding
-    dictencoded::Dict{Int64, Meta.Field} # dictionary id => field
+    dictencodings::Dict{Int64,DictEncoding} # dictionary id => DictEncoding
+    dictencoded::Dict{Int64,Meta.Field} # dictionary id => field
     convert::Bool
     compression::Ref{Union{Symbol,Nothing}}
 end
@@ -81,10 +82,21 @@ function Stream(inputs::Vector{ArrowBlob}; convert::Bool=true)
     names = Symbol[]
     types = Type[]
     schema = nothing
-    dictencodings = Dict{Int64, DictEncoding}()
-    dictencoded = Dict{Int64, Meta.Field}()
+    dictencodings = Dict{Int64,DictEncoding}()
+    dictencoded = Dict{Int64,Meta.Field}()
     compression = Ref{Union{Symbol,Nothing}}(nothing)
-    Stream(inputs, inputindex, batchiterator, names, types, schema, dictencodings, dictencoded, convert, compression)
+    Stream(
+        inputs,
+        inputindex,
+        batchiterator,
+        names,
+        types,
+        schema,
+        dictencodings,
+        dictencoded,
+        convert,
+        compression,
+    )
 end
 
 function Stream(input, pos::Integer=1, len=nothing; kw...)
@@ -176,13 +188,20 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
                 # store custom_metadata?
                 for (i, field) in enumerate(x.schema.fields)
                     push!(x.names, Symbol(field.name))
-                    push!(x.types, juliaeltype(field, buildmetadata(field.custom_metadata), x.convert))
+                    push!(
+                        x.types,
+                        juliaeltype(field, buildmetadata(field.custom_metadata), x.convert),
+                    )
                     # recursively find any dictionaries for any fields
                     getdictionaries!(x.dictencoded, field)
                     @debugv 1 "parsed column from schema: field = $field"
                 end
             elseif header != x.schema
-                throw(ArgumentError("mismatched schemas between different arrow batches: $(x.schema) != $header"))
+                throw(
+                    ArgumentError(
+                        "mismatched schemas between different arrow batches: $(x.schema) != $header",
+                    ),
+                )
             end
         elseif header isa Meta.DictionaryBatch
             id = header.id
@@ -194,17 +213,42 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
             if haskey(x.dictencodings, id) && header.isDelta
                 # delta
                 field = x.dictencoded[id]
-                values, _, _ = build(field, field.type, batch, recordbatch, x.dictencodings, Int64(1), Int64(1), x.convert)
+                values, _, _ = build(
+                    field,
+                    field.type,
+                    batch,
+                    recordbatch,
+                    x.dictencodings,
+                    Int64(1),
+                    Int64(1),
+                    x.convert,
+                )
                 dictencoding = x.dictencodings[id]
                 append!(dictencoding.data, values)
                 continue
             end
             # new dictencoding or replace
             field = x.dictencoded[id]
-            values, _, _ = build(field, field.type, batch, recordbatch, x.dictencodings, Int64(1), Int64(1), x.convert)
+            values, _, _ = build(
+                field,
+                field.type,
+                batch,
+                recordbatch,
+                x.dictencodings,
+                Int64(1),
+                Int64(1),
+                x.convert,
+            )
             A = ChainedVector([values])
-            S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
-            x.dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
+            S =
+                field.dictionary.indexType === nothing ? Int32 :
+                juliaeltype(field, field.dictionary.indexType, false)
+            x.dictencodings[id] = DictEncoding{eltype(A),S,typeof(A)}(
+                id,
+                A,
+                field.dictionary.isOrdered,
+                values.metadata,
+            )
             @debugv 1 "parsed dictionary batch message: id=$id, data=$values\n"
         elseif header isa Meta.RecordBatch
             @debugv 1 "parsing record batch message: compression = $(header.compression)"
@@ -230,7 +274,7 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
         end
     end
 
-    lookup = Dict{Symbol, AbstractVector}()
+    lookup = Dict{Symbol,AbstractVector}()
     types = Type[]
     for (nm, col) in zip(x.names, columns)
         lookup[nm] = col
@@ -267,16 +311,30 @@ struct Table <: Tables.AbstractColumns
     names::Vector{Symbol}
     types::Vector{Type}
     columns::Vector{AbstractVector}
-    lookup::Dict{Symbol, AbstractVector}
+    lookup::Dict{Symbol,AbstractVector}
     schema::Ref{Meta.Schema}
     metadata::Ref{Union{Nothing,Base.ImmutableDict{String,String}}}
 end
 
-Table() = Table(Symbol[], Type[], AbstractVector[], Dict{Symbol, AbstractVector}(), Ref{Meta.Schema}(), Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(nothing))
+Table() = Table(
+    Symbol[],
+    Type[],
+    AbstractVector[],
+    Dict{Symbol,AbstractVector}(),
+    Ref{Meta.Schema}(),
+    Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(nothing),
+)
 
 function Table(names, types, columns, lookup, schema)
     m = isassigned(schema) ? buildmetadata(schema[]) : nothing
-    return Table(names, types, columns, lookup, schema, Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(m))
+    return Table(
+        names,
+        types,
+        columns,
+        lookup,
+        schema,
+        Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(m),
+    )
 end
 
 names(t::Table) = getfield(t, :names)
@@ -331,14 +389,14 @@ function Base.iterate(tp::TablePartitions, i=1)
     i > tp.npartitions && return nothing
     tp.npartitions == 1 && return tp.table, i + 1
     cols = columns(tp.table)
-    newcols = AbstractVector[cols[j].arrays[i] for j in 1:length(cols)]
+    newcols = AbstractVector[cols[j].arrays[i] for j = 1:length(cols)]
     nms = names(tp.table)
     tbl = Table(
         nms,
         types(tp.table),
         newcols,
-        Dict{Symbol, AbstractVector}(nms[i] => newcols[i] for i in 1:length(nms)),
-        schema(tp.table)
+        Dict{Symbol,AbstractVector}(nms[i] => newcols[i] for i = 1:length(nms)),
+        schema(tp.table),
     )
     return tbl, i + 1
 end
@@ -346,16 +404,19 @@ end
 Tables.partitions(t::Table) = TablePartitions(t)
 
 # high-level user API functions
-Table(input, pos::Integer=1, len=nothing; kw...) = Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
-Table(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...) = Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
-Table(inputs::Vector; kw...) = Table([ArrowBlob(tobytes(x), 1, nothing) for x in inputs]; kw...)
+Table(input, pos::Integer=1, len=nothing; kw...) =
+    Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
+Table(input::Vector{UInt8}, pos::Integer=1, len=nothing; kw...) =
+    Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
+Table(inputs::Vector; kw...) =
+    Table([ArrowBlob(tobytes(x), 1, nothing) for x in inputs]; kw...)
 
 # will detect whether we're reading a Table from a file or stream
 function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
     t = Table()
     sch = nothing
-    dictencodings = Dict{Int64, DictEncoding}() # dictionary id => DictEncoding
-    dictencoded = Dict{Int64, Meta.Field}() # dictionary id => field
+    dictencodings = Dict{Int64,DictEncoding}() # dictionary id => DictEncoding
+    dictencoded = Dict{Int64,Meta.Field}() # dictionary id => field
     sync = OrderedSynchronizer()
     tsks = Channel{Any}(Inf)
     tsk = @wkspawn begin
@@ -395,7 +456,11 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                     sch = header
                     schema(t)[] = sch
                 elseif sch != header
-                    throw(ArgumentError("mismatched schemas between different arrow batches: $sch != $header"))
+                    throw(
+                        ArgumentError(
+                            "mismatched schemas between different arrow batches: $sch != $header",
+                        ),
+                    )
                 end
             elseif header isa Meta.DictionaryBatch
                 id = header.id
@@ -404,23 +469,55 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                 if haskey(dictencodings, id) && header.isDelta
                     # delta
                     field = dictencoded[id]
-                    values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
+                    values, _, _ = build(
+                        field,
+                        field.type,
+                        batch,
+                        recordbatch,
+                        dictencodings,
+                        Int64(1),
+                        Int64(1),
+                        convert,
+                    )
                     dictencoding = dictencodings[id]
                     if typeof(dictencoding.data) <: ChainedVector
                         append!(dictencoding.data, values)
                     else
                         A = ChainedVector([dictencoding.data, values])
-                        S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
-                        dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
+                        S =
+                            field.dictionary.indexType === nothing ? Int32 :
+                            juliaeltype(field, field.dictionary.indexType, false)
+                        dictencodings[id] = DictEncoding{eltype(A),S,typeof(A)}(
+                            id,
+                            A,
+                            field.dictionary.isOrdered,
+                            values.metadata,
+                        )
                     end
                     continue
                 end
                 # new dictencoding or replace
                 field = dictencoded[id]
-                values, _, _ = build(field, field.type, batch, recordbatch, dictencodings, Int64(1), Int64(1), convert)
+                values, _, _ = build(
+                    field,
+                    field.type,
+                    batch,
+                    recordbatch,
+                    dictencodings,
+                    Int64(1),
+                    Int64(1),
+                    convert,
+                )
                 A = values
-                S = field.dictionary.indexType === nothing ? Int32 : juliaeltype(field, field.dictionary.indexType, false)
-                dictencodings[id] = DictEncoding{eltype(A), S, typeof(A)}(id, A, field.dictionary.isOrdered, values.metadata)
+                S =
+                    field.dictionary.indexType === nothing ? Int32 :
+                    juliaeltype(field, field.dictionary.indexType, false)
+                dictencodings[id] = DictEncoding{eltype(A),S,typeof(A)}(
+                    id,
+                    A,
+                    field.dictionary.isOrdered,
+                    values.metadata,
+                )
                 @debugv 1 "parsed dictionary batch message: id=$id, data=$values\n"
             elseif header isa Meta.RecordBatch
                 anyrecordbatches = true
@@ -499,7 +596,7 @@ function Base.iterate(x::BatchIterator, (pos, id)=(x.startpos, 0))
         @debugv 1 "not enough bytes left to read Meta.Message"
         return nothing
     end
-    msg = FlatBuffers.getrootas(Meta.Message, x.bytes, pos-1)
+    msg = FlatBuffers.getrootas(Meta.Message, x.bytes, pos - 1)
     pos += msglen
     # pos now points to message body
     @debugv 1 "parsing message: pos = $pos, msglen = $msglen, bodyLength = $(msg.bodyLength)"
@@ -513,7 +610,7 @@ end
 struct VectorIterator
     schema::Meta.Schema
     batch::Batch # batch.msg.header MUST BE RecordBatch
-    dictencodings::Dict{Int64, DictEncoding}
+    dictencodings::Dict{Int64,DictEncoding}
     convert::Bool
 end
 
@@ -522,11 +619,22 @@ buildmetadata(meta) = toidict(String(kv.key) => String(kv.value) for kv in meta)
 buildmetadata(::Nothing) = nothing
 buildmetadata(x::AbstractDict) = x
 
-function Base.iterate(x::VectorIterator, (columnidx, nodeidx, bufferidx)=(Int64(1), Int64(1), Int64(1)))
+function Base.iterate(
+    x::VectorIterator,
+    (columnidx, nodeidx, bufferidx)=(Int64(1), Int64(1), Int64(1)),
+)
     columnidx > length(x.schema.fields) && return nothing
     field = x.schema.fields[columnidx]
     @debugv 2 "building top-level column: field = $(field), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
-    A, nodeidx, bufferidx = build(field, x.batch, x.batch.msg.header, x.dictencodings, nodeidx, bufferidx, x.convert)
+    A, nodeidx, bufferidx = build(
+        field,
+        x.batch,
+        x.batch.msg.header,
+        x.dictencodings,
+        nodeidx,
+        bufferidx,
+        x.convert,
+    )
     @debugv 2 "built top-level column: A = $(typeof(A)), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
     @debugv 3 A
     return A, (columnidx + 1, nodeidx, bufferidx)
@@ -534,8 +642,9 @@ end
 
 Base.length(x::VectorIterator) = length(x.schema.fields)
 
-const ListTypes = Union{Meta.Utf8, Meta.LargeUtf8, Meta.Binary, Meta.LargeBinary, Meta.List, Meta.LargeList}
-const LargeLists = Union{Meta.LargeUtf8, Meta.LargeBinary, Meta.LargeList}
+const ListTypes =
+    Union{Meta.Utf8,Meta.LargeUtf8,Meta.Binary,Meta.LargeBinary,Meta.List,Meta.LargeList}
+const LargeLists = Union{Meta.LargeUtf8,Meta.LargeBinary,Meta.LargeList}
 
 function build(field::Meta.Field, batch, rb, de, nodeidx, bufferidx, convert)
     d = field.dictionary
@@ -546,11 +655,18 @@ function build(field::Meta.Field, batch, rb, de, nodeidx, bufferidx, convert)
         S = d.indexType === nothing ? Int32 : juliaeltype(field, d.indexType, false)
         bytes, indices = reinterp(S, batch, buffer, rb.compression)
         encoding = de[d.id]
-        A = DictEncoded(bytes, validity, indices, encoding, buildmetadata(field.custom_metadata))
+        A = DictEncoded(
+            bytes,
+            validity,
+            indices,
+            encoding,
+            buildmetadata(field.custom_metadata),
+        )
         nodeidx += 1
         bufferidx += 1
     else
-        A, nodeidx, bufferidx = build(field, field.type, batch, rb, de, nodeidx, bufferidx, convert)
+        A, nodeidx, bufferidx =
+            build(field, field.type, batch, rb, de, nodeidx, bufferidx, convert)
     end
     return A, nodeidx, bufferidx
 end
@@ -593,7 +709,9 @@ function uncompress(ptr::Ptr{UInt8}, buffer, compression)
             transcode(comp[], encodedbytes, decodedbytes)
         end
     else
-        error("unsupported compression type when reading arrow buffers: $(typeof(compression.codec))")
+        error(
+            "unsupported compression type when reading arrow buffers: $(typeof(compression.codec))",
+        )
     end
     return len, decodedbytes
 end
@@ -624,7 +742,7 @@ function reinterp(::Type{T}, batch, buf, compression) where {T}
     end
 end
 
-const SubVector{T, P} = SubArray{T, 1, P, Tuple{UnitRange{Int64}}, true}
+const SubVector{T,P} = SubArray{T,1,P,Tuple{UnitRange{Int64}},true}
 
 function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, convert)
     @debugv 2 "building array: L = $L"
@@ -640,24 +758,37 @@ function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, c
     nodeidx += 1
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
-    if L isa Meta.Utf8 || L isa Meta.LargeUtf8 || L isa Meta.Binary || L isa Meta.LargeBinary
+    if L isa Meta.Utf8 ||
+       L isa Meta.LargeUtf8 ||
+       L isa Meta.Binary ||
+       L isa Meta.LargeBinary
         buffer = rb.buffers[bufferidx]
         bytes, A = reinterp(UInt8, batch, buffer, rb.compression)
         bufferidx += 1
     else
         bytes = UInt8[]
-        A, nodeidx, bufferidx = build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
+        A, nodeidx, bufferidx =
+            build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
         # juliaeltype returns Vector for List, translate to SubArray
         S = Base.nonmissingtype(T)
         if S <: Vector
-            ST = SubVector{eltype(A), typeof(A)}
-            T = S == T ? ST : Union{Missing, ST}
+            ST = SubVector{eltype(A),typeof(A)}
+            T = S == T ? ST : Union{Missing,ST}
         end
     end
-    return List{T, OT, typeof(A)}(bytes, validity, offsets, A, len, meta), nodeidx, bufferidx
+    return List{T,OT,typeof(A)}(bytes, validity, offsets, A, len, meta), nodeidx, bufferidx
 end
 
-function build(f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeList}, batch, rb, de, nodeidx, bufferidx, convert)
+function build(
+    f::Meta.Field,
+    L::Union{Meta.FixedSizeBinary,Meta.FixedSizeList},
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    convert,
+)
     @debugv 2 "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
@@ -669,11 +800,12 @@ function build(f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeList}
         bufferidx += 1
     else
         bytes = UInt8[]
-        A, nodeidx, bufferidx = build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
+        A, nodeidx, bufferidx =
+            build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
     end
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
-    return FixedSizeList{T, typeof(A)}(bytes, validity, A, len, meta), nodeidx, bufferidx
+    return FixedSizeList{T,typeof(A)}(bytes, validity, A, len, meta), nodeidx, bufferidx
 end
 
 function build(f::Meta.Field, L::Meta.Map, batch, rb, de, nodeidx, bufferidx, convert)
@@ -691,7 +823,7 @@ function build(f::Meta.Field, L::Meta.Map, batch, rb, de, nodeidx, bufferidx, co
     A, nodeidx, bufferidx = build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
-    return Map{T, OT, typeof(A)}(validity, offsets, A, len, meta), nodeidx, bufferidx
+    return Map{T,OT,typeof(A)}(validity, offsets, A, len, meta), nodeidx, bufferidx
 end
 
 function build(f::Meta.Field, L::Meta.Struct, batch, rb, de, nodeidx, bufferidx, convert)
@@ -708,7 +840,7 @@ function build(f::Meta.Field, L::Meta.Struct, batch, rb, de, nodeidx, bufferidx,
     data = Tuple(vecs)
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
-    return Struct{T, typeof(data)}(validity, data, len, meta), nodeidx, bufferidx
+    return Struct{T,typeof(data)}(validity, data, len, meta), nodeidx, bufferidx
 end
 
 function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, convert)
@@ -732,9 +864,9 @@ function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, 
     T = juliaeltype(f, meta, convert)
     UT = UnionT(f, convert)
     if L.mode == Meta.UnionMode.Dense
-        B = DenseUnion{T, UT, typeof(data)}(bytes, bytes2, typeIds, offsets, data, meta)
+        B = DenseUnion{T,UT,typeof(data)}(bytes, bytes2, typeIds, offsets, data, meta)
     else
-        B = SparseUnion{T, UT, typeof(data)}(bytes, typeIds, data, meta)
+        B = SparseUnion{T,UT,typeof(data)}(bytes, typeIds, data, meta)
     end
     return B, nodeidx, bufferidx
 end
@@ -743,7 +875,9 @@ function build(f::Meta.Field, L::Meta.Null, batch, rb, de, nodeidx, bufferidx, c
     @debugv 2 "building array: L = $L"
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
-    return NullVector{maybemissing(T)}(MissingVector(rb.nodes[nodeidx].length), meta), nodeidx + 1, bufferidx
+    return NullVector{maybemissing(T)}(MissingVector(rb.nodes[nodeidx].length), meta),
+    nodeidx + 1,
+    bufferidx
 end
 
 # primitives

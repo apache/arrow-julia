@@ -18,7 +18,6 @@
 using Documenter
 using Arrow
 
-
 makedocs(;
     modules=[Arrow],
     repo="https://github.com/apache/arrow-julia/blob/{commit}{path}#L{line}",
@@ -28,15 +27,11 @@ makedocs(;
         canonical="https://arrow.juliadata.org/",
         assets=String[],
     ),
-    pages = [
-        "Home" => "index.md",
+    pages=[
+        "Home" => "index.md",
         "User Manual" => "manual.md",
-        "API Reference" => "reference.md"
-    ]
+        "API Reference" => "reference.md",
+    ],
 )
 
-deploydocs(;
-    repo="github.com/apache/arrow-julia",
-    devbranch = "main",
-    branch = "asf-site"
-)
+deploydocs(; repo="github.com/apache/arrow-julia", devbranch="main", branch="asf-site")

@@ -42,7 +42,8 @@ struct WrappedZonedDateTime
     x::TimeZones.ZonedDateTime
 end
 
-ArrowTypes.arrowname(::Type{WrappedZonedDateTime}) = Symbol("JuliaLang.WrappedZonedDateTime")
+ArrowTypes.arrowname(::Type{WrappedZonedDateTime}) =
+    Symbol("JuliaLang.WrappedZonedDateTime")
 ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.WrappedZonedDateTime")}) = WrappedZonedDateTime
 
 @testset "Date and time wrappers with missing" begin
@@ -52,7 +53,7 @@ ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.WrappedZonedDateTime")}) = WrappedZ
         else
             time = T(Dates.now())
         end
-        table = (; x = [missing, missing, time, missing, time])
+        table = (; x=[missing, missing, time, missing, time])
         io = Arrow.tobuffer(table)
         tbl = Arrow.Table(io)
         @test isequal(collect(tbl.x), table.x)
@@ -60,7 +61,18 @@ ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.WrappedZonedDateTime")}) = WrappedZ
 end
 
 @testset "`default(T) isa T`" begin
-    for T in (Dates.Date, Dates.Time, Dates.DateTime, TimeZones.ZonedDateTime, Dates.Nanosecond, Dates.Millisecond, Dates.Second, Dates.Day, Dates.Month, Dates.Year)
+    for T in (
+        Dates.Date,
+        Dates.Time,
+        Dates.DateTime,
+        TimeZones.ZonedDateTime,
+        Dates.Nanosecond,
+        Dates.Millisecond,
+        Dates.Second,
+        Dates.Day,
+        Dates.Month,
+        Dates.Year,
+    )
         @test Arrow.ArrowTypes.default(T) isa T
     end
 end

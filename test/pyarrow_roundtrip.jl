@@ -22,36 +22,36 @@ include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
 for (nm, t, writekw, readkw, extratests) in testtables
     nm == "unions" && continue
     @testset "pyarrow roundtrip: $nm" begin
-    io = IOBuffer()
-    Arrow.write(io, t; writekw...)
-    seekstart(io)
-    buf = PyCall.pybytes(take!(io))
-    reader = pa.ipc.open_stream(buf)
-    sink = pa.BufferOutputStream()
-    writer = pa.ipc.new_stream(sink, reader.schema)
-    for batch in reader
-        writer.write_batch(batch)
-    end
-    writer.close()
-    buf = sink.getvalue()
-    jbytes = copy(reinterpret(UInt8, buf))
-    tt = Arrow.Table(jbytes)
+        io = IOBuffer()
+        Arrow.write(io, t; writekw...)
+        seekstart(io)
+        buf = PyCall.pybytes(take!(io))
+        reader = pa.ipc.open_stream(buf)
+        sink = pa.BufferOutputStream()
+        writer = pa.ipc.new_stream(sink, reader.schema)
+        for batch in reader
+            writer.write_batch(batch)
+        end
+        writer.close()
+        buf = sink.getvalue()
+        jbytes = copy(reinterpret(UInt8, buf))
+        tt = Arrow.Table(jbytes)
     end
     @testset "pyarrow roundtrip w/ compression: $nm" begin
-    io = IOBuffer()
-    Arrow.write(io, t; compress=((:lz4, :zstd)[rand(1:2)]), writekw...)
-    seekstart(io)
-    buf = PyCall.pybytes(take!(io))
-    reader = pa.ipc.open_stream(buf)
-    sink = pa.BufferOutputStream()
-    writer = pa.ipc.new_stream(sink, reader.schema)
-    for batch in reader
-        writer.write_batch(batch)
-    end
-    writer.close()
-    buf = sink.getvalue()
-    jbytes = copy(reinterpret(UInt8, buf))
-    tt = Arrow.Table(jbytes)
+        io = IOBuffer()
+        Arrow.write(io, t; compress=((:lz4, :zstd)[rand(1:2)]), writekw...)
+        seekstart(io)
+        buf = PyCall.pybytes(take!(io))
+        reader = pa.ipc.open_stream(buf)
+        sink = pa.BufferOutputStream()
+        writer = pa.ipc.new_stream(sink, reader.schema)
+        for batch in reader
+            writer.write_batch(batch)
+        end
+        writer.close()
+        buf = sink.getvalue()
+        jbytes = copy(reinterpret(UInt8, buf))
+        tt = Arrow.Table(jbytes)
     end
 end
 

@@ -24,14 +24,24 @@ subtypes `ArrowVector`. See [`BoolVector`](@ref), [`Primitive`](@ref), [`List`](
 """
 abstract type ArrowVector{T} <: AbstractVector{T} end
 
-Base.IndexStyle(::Type{A}) where {A <: ArrowVector} = Base.IndexLinear()
-Base.similar(::Type{A}, dims::Dims) where {T, A <: ArrowVector{T}} = Vector{T}(undef, dims)
+Base.IndexStyle(::Type{A}) where {A<:ArrowVector} = Base.IndexLinear()
+Base.similar(::Type{A}, dims::Dims) where {T,A<:ArrowVector{T}} = Vector{T}(undef, dims)
 validitybitmap(x::ArrowVector) = x.validity
 nullcount(x::ArrowVector) = validitybitmap(x).nc
 getmetadata(x::ArrowVector) = x.metadata
-Base.deleteat!(x::T, inds) where {T <: ArrowVector} = throw(ArgumentError("`$T` does not support `deleteat!`; arrow data is by nature immutable"))
+Base.deleteat!(x::T, inds) where {T<:ArrowVector} = throw(
+    ArgumentError("`$T` does not support `deleteat!`; arrow data is by nature immutable"),
+)
 
-function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=getmetadata(x); compression::Union{Nothing, Symbol, LZ4FrameCompressor, ZstdCompressor}=nothing, kw...)
+function toarrowvector(
+    x,
+    i=1,
+    de=Dict{Int64,Any}(),
+    ded=DictEncoding[],
+    meta=getmetadata(x);
+    compression::Union{Nothing,Symbol,LZ4FrameCompressor,ZstdCompressor}=nothing,
+    kw...,
+)
     @debugv 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(values(kw))"
     @debugv 3 x
     A = arrowvector(x, i, 0, 0, de, ded, meta; compression=compression, kw...)
@@ -55,30 +65,73 @@ function toarrowvector(x, i=1, de=Dict{Int64, Any}(), ded=DictEncoding[], meta=g
     return A
 end
 
-function arrowvector(x, i, nl, fi, de, ded, meta; dictencoding::Bool=false, dictencode::Bool=false, maxdepth::Int=DEFAULT_MAX_DEPTH, kw...)
+function arrowvector(
+    x,
+    i,
+    nl,
+    fi,
+    de,
+    ded,
+    meta;
+    dictencoding::Bool=false,
+    dictencode::Bool=false,
+    maxdepth::Int=DEFAULT_MAX_DEPTH,
+    kw...,
+)
     if nl > maxdepth
-        error("reached nested serialization level ($nl) deeper than provided max depth argument ($(maxdepth)); to increase allowed nesting level, pass `maxdepth=X`")
+        error(
+            "reached nested serialization level ($nl) deeper than provided max depth argument ($(maxdepth)); to increase allowed nesting level, pass `maxdepth=X`",
+        )
     end
     T = maybemissing(eltype(x))
     if !(x isa DictEncode) && !dictencoding && (dictencode || DataAPI.refarray(x) !== x)
         x = DictEncode(x, dictencodeid(i, nl, fi))
     elseif x isa DictEncoded
-        return arrowvector(DictEncodeType, x, i, nl, fi, de, ded, meta; dictencode=dictencode, kw...)
+        return arrowvector(
+            DictEncodeType,
+            x,
+            i,
+            nl,
+            fi,
+            de,
+            ded,
+            meta;
+            dictencode=dictencode,
+            kw...,
+        )
     elseif !(x isa DictEncode)
         x = ToArrow(x)
     end
     S = maybemissing(eltype(x))
     if ArrowTypes.hasarrowname(T)
-        meta = _arrowtypemeta(_normalizemeta(meta), String(ArrowTypes.arrowname(T)), String(ArrowTypes.arrowmetadata(T)))
+        meta = _arrowtypemeta(
+            _normalizemeta(meta),
+            String(ArrowTypes.arrowname(T)),
+            String(ArrowTypes.arrowmetadata(T)),
+        )
     end
-    return arrowvector(S, x, i, nl, fi, de, ded, meta; dictencode=dictencode, maxdepth=maxdepth, kw...)
+    return arrowvector(
+        S,
+        x,
+        i,
+        nl,
+        fi,
+        de,
+        ded,
+        meta;
+        dictencode=dictencode,
+        maxdepth=maxdepth,
+        kw...,
+    )
 end
 
 _normalizemeta(::Nothing) = nothing
 _normalizemeta(meta) = toidict(String(k) => String(v) for (k, v) in meta)
 
 _normalizecolmeta(::Nothing) = nothing
-_normalizecolmeta(colmeta) = toidict(Symbol(k) => toidict(String(v1) => String(v2) for (v1, v2) in v) for (k, v) in colmeta)
+_normalizecolmeta(colmeta) = toidict(
+    Symbol(k) => toidict(String(v1) => String(v2) for (v1, v2) in v) for (k, v) in colmeta
+)
 
 function _arrowtypemeta(::Nothing, n, m)
     return toidict(("ARROW:extension:name" => n, "ARROW:extension:metadata" => m))
@@ -99,16 +152,26 @@ end
 
 struct NullVector{T} <: ArrowVector{T}
     data::MissingVector
-    metadata::Union{Nothing, Base.ImmutableDict{String, String}}
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
 end
 Base.size(v::NullVector) = (length(v.data),)
-Base.getindex(v::NullVector{T}, i::Int) where {T} = ArrowTypes.fromarrow(T, getindex(v.data, i))
+Base.getindex(v::NullVector{T}, i::Int) where {T} =
+    ArrowTypes.fromarrow(T, getindex(v.data, i))
 
-arrowvector(::NullKind, x, i, nl, fi, de, ded, meta; kw...) = NullVector{eltype(x)}(MissingVector(length(x)), isnothing(meta) ? nothing : toidict(meta))
+arrowvector(::NullKind, x, i, nl, fi, de, ded, meta; kw...) = NullVector{eltype(x)}(
+    MissingVector(length(x)),
+    isnothing(meta) ? nothing : toidict(meta),
+)
 compress(Z::Meta.CompressionType.T, comp, v::NullVector) =
-    Compressed{Z, NullVector}(v, CompressedBuffer[], length(v), length(v), Compressed[])
+    Compressed{Z,NullVector}(v, CompressedBuffer[], length(v), length(v), Compressed[])
 
-function makenodesbuffers!(col::NullVector, fieldnodes, fieldbuffers, bufferoffset, alignment)
+function makenodesbuffers!(
+    col::NullVector,
+    fieldnodes,
+    fieldbuffers,
+    bufferoffset,
+    alignment,
+)
     push!(fieldnodes, FieldNode(length(col), length(col)))
     @debugv 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     return bufferoffset
@@ -176,7 +239,7 @@ end
     #   2) parent array is also empty, so "all" elements are valid
     p.nc == 0 && return true
     # translate element index to bitpacked byte index
-    a, b = divrem(i-1, 8) .+ (1,1)
+    a, b = divrem(i - 1, 8) .+ (1, 1)
     @inbounds byte = p.bytes[p.pos + a - 1]
     # check individual bit of byte
     return getbit(byte, b)
@@ -195,7 +258,7 @@ function writebitmap(io, col::ArrowVector, alignment)
     v = col.validity
     @debugv 1 "writing validity bitmap: nc = $(v.nc), n = $(cld(v.ℓ, 8))"
     v.nc == 0 && return 0
-    n = Base.write(io, view(v.bytes, v.pos:(v.pos + cld(v.ℓ, 8) - 1)))
+    n = Base.write(io, view(v.bytes, (v.pos):(v.pos + cld(v.ℓ, 8) - 1)))
     return n + writezeros(io, paddinglength(n, alignment))
 end
 

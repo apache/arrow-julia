@@ -26,7 +26,7 @@ Represents the compressed version of an [`ArrowVector`](@ref).
 Holds a reference to the original column. May have `Compressed`
 children for nested array types.
 """
-struct Compressed{Z, A}
+struct Compressed{Z,A}
     data::A
     buffers::Vector{CompressedBuffer}
     len::Int64
@@ -35,7 +35,7 @@ struct Compressed{Z, A}
 end
 
 Base.length(c::Compressed) = c.len
-Base.eltype(::Type{C}) where {Z, A, C<:Compressed{Z, A}} = eltype(A)
+Base.eltype(::Type{C}) where {Z,A,C<:Compressed{Z,A}} = eltype(A)
 getmetadata(x::Compressed) = getmetadata(x.data)
 compressiontype(c::Compressed{Z}) where {Z} = Z
 
@@ -49,9 +49,16 @@ end
 compress(Z::Meta.CompressionType.T, comp, x) = compress(Z, comp, convert(Array, x))
 
 compress(Z::Meta.CompressionType.T, comp, v::ValidityBitmap) =
-    v.nc == 0 ? CompressedBuffer(UInt8[], 0) : compress(Z, comp, view(v.bytes, v.pos:(v.pos + cld(v.ℓ, 8) - 1)))
+    v.nc == 0 ? CompressedBuffer(UInt8[], 0) :
+    compress(Z, comp, view(v.bytes, (v.pos):(v.pos + cld(v.ℓ, 8) - 1)))
 
-function makenodesbuffers!(col::Compressed, fieldnodes, fieldbuffers, bufferoffset, alignment)
+function makenodesbuffers!(
+    col::Compressed,
+    fieldnodes,
+    fieldbuffers,
+    bufferoffset,
+    alignment,
+)
     push!(fieldnodes, FieldNode(col.len, col.nullcount))
     @debugv 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     for buffer in col.buffers
@@ -61,7 +68,8 @@ function makenodesbuffers!(col::Compressed, fieldnodes, fieldbuffers, bufferoffs
         bufferoffset += padding(blen, alignment)
     end
     for child in col.children
-        bufferoffset = makenodesbuffers!(child, fieldnodes, fieldbuffers, bufferoffset, alignment)
+        bufferoffset =
+            makenodesbuffers!(child, fieldnodes, fieldbuffers, bufferoffset, alignment)
     end
     return bufferoffset
 end

@@ -61,12 +61,12 @@ function write(file_path, tbl; kwargs...)
 end
 
 struct Message
-    msgflatbuf
-    columns
-    bodylen
+    msgflatbuf::Any
+    columns::Any
+    bodylen::Any
     isrecordbatch::Bool
     blockmsg::Bool
-    headerType
+    headerType::Any
 end
 
 struct Block
@@ -135,9 +135,28 @@ mutable struct Writer{T<:IO}
     isclosed::Bool
 end
 
-function Base.open(::Type{Writer}, io::T, compress::Union{Nothing,Symbol,LZ4FrameCompressor,ZstdCompressor}, writetofile::Bool, largelists::Bool, denseunions::Bool, dictencode::Bool, dictencodenested::Bool, alignment::Integer, maxdepth::Integer, ntasks::Integer, meta::Union{Nothing,Any}, colmeta::Union{Nothing,Any}, closeio::Bool) where {T<:IO}
+function Base.open(
+    ::Type{Writer},
+    io::T,
+    compress::Union{Nothing,Symbol,LZ4FrameCompressor,ZstdCompressor},
+    writetofile::Bool,
+    largelists::Bool,
+    denseunions::Bool,
+    dictencode::Bool,
+    dictencodenested::Bool,
+    alignment::Integer,
+    maxdepth::Integer,
+    ntasks::Integer,
+    meta::Union{Nothing,Any},
+    colmeta::Union{Nothing,Any},
+    closeio::Bool,
+) where {T<:IO}
     if compress isa Symbol && compress !== :lz4 && compress !== :zstd
-        throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
+        throw(
+            ArgumentError(
+                "unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`",
+            ),
+        )
     end
     sync = OrderedSynchronizer(2)
     msgs = Channel{Message}(ntasks)
@@ -147,28 +166,86 @@ function Base.open(::Type{Writer}, io::T, compress::Union{Nothing,Symbol,LZ4Fram
     blocks = (Block[], Block[])
     # start message writing from channel
     threaded = Threads.nthreads() > 1
-    task = threaded ? (@wkspawn for msg in msgs
-        Base.write(io, msg, blocks, schema, alignment)
-    end) : (@async for msg in msgs
-        Base.write(io, msg, blocks, schema, alignment)
-    end)
+    task =
+        threaded ? (@wkspawn for msg in msgs
+            Base.write(io, msg, blocks, schema, alignment)
+        end) : (@async for msg in msgs
+            Base.write(io, msg, blocks, schema, alignment)
+        end)
     anyerror = Threads.Atomic{Bool}(false)
     errorref = Ref{Any}()
     meta = _normalizemeta(meta)
     colmeta = _normalizecolmeta(colmeta)
-    return Writer{T}(io, closeio, compress, writetofile, largelists, denseunions, dictencode, dictencodenested, threaded, alignment, maxdepth, meta, colmeta, sync, msgs, schema, firstcols, dictencodings, blocks, task, anyerror, errorref, 1, false)
+    return Writer{T}(
+        io,
+        closeio,
+        compress,
+        writetofile,
+        largelists,
+        denseunions,
+        dictencode,
+        dictencodenested,
+        threaded,
+        alignment,
+        maxdepth,
+        meta,
+        colmeta,
+        sync,
+        msgs,
+        schema,
+        firstcols,
+        dictencodings,
+        blocks,
+        task,
+        anyerror,
+        errorref,
+        1,
+        false,
+    )
 end
 
-function Base.open(::Type{Writer}, io::IO; compress::Union{Nothing,Symbol,LZ4FrameCompressor,ZstdCompressor}=nothing, file::Bool=true, largelists::Bool=false, denseunions::Bool=true, dictencode::Bool=false, dictencodenested::Bool=false, alignment::Integer=8, maxdepth::Integer=DEFAULT_MAX_DEPTH, ntasks::Integer=typemax(Int32), metadata::Union{Nothing,Any}=nothing, colmetadata::Union{Nothing,Any}=nothing, closeio::Bool=false)
-    open(Writer, io, compress, file, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks, metadata, colmetadata, closeio)
+function Base.open(
+    ::Type{Writer},
+    io::IO;
+    compress::Union{Nothing,Symbol,LZ4FrameCompressor,ZstdCompressor}=nothing,
+    file::Bool=true,
+    largelists::Bool=false,
+    denseunions::Bool=true,
+    dictencode::Bool=false,
+    dictencodenested::Bool=false,
+    alignment::Integer=8,
+    maxdepth::Integer=DEFAULT_MAX_DEPTH,
+    ntasks::Integer=typemax(Int32),
+    metadata::Union{Nothing,Any}=nothing,
+    colmetadata::Union{Nothing,Any}=nothing,
+    closeio::Bool=false,
+)
+    open(
+        Writer,
+        io,
+        compress,
+        file,
+        largelists,
+        denseunions,
+        dictencode,
+        dictencodenested,
+        alignment,
+        maxdepth,
+        ntasks,
+        metadata,
+        colmetadata,
+        closeio,
+    )
 end
 
-Base.open(::Type{Writer}, file_path; kwargs...) = open(Writer, open(file_path, "w"); kwargs..., closeio=true)
+Base.open(::Type{Writer}, file_path; kwargs...) =
+    open(Writer, open(file_path, "w"); kwargs..., closeio=true)
 
 function check_errors(writer::Writer)
     if writer.anyerror[]
         errorref = writer.errorref[]
-        @error "error writing arrow data on partition = $(errorref[3])" exception = (errorref[1], errorref[2])
+        @error "error writing arrow data on partition = $(errorref[3])" exception =
+            (errorref[1], errorref[2])
         error("fatal error writing arrow data")
     end
 end
@@ -184,7 +261,18 @@ function write(writer::Writer, source)
                 Base.write(writer.io, FILE_FORMAT_MAGIC_BYTES, b"\0\0")
             end
             meta = isnothing(writer.meta) ? getmetadata(source) : writer.meta
-            cols = toarrowtable(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, meta, writer.colmeta)
+            cols = toarrowtable(
+                tblcols,
+                writer.dictencodings,
+                writer.largelists,
+                writer.compress,
+                writer.denseunions,
+                writer.dictencode,
+                writer.dictencodenested,
+                writer.maxdepth,
+                meta,
+                writer.colmeta,
+            )
             writer.schema[] = Tables.schema(cols)
             writer.firstcols[] = cols
             put!(writer.msgs, makeschemamsg(writer.schema[], cols))
@@ -194,7 +282,13 @@ function write(writer::Writer, source)
                     # assign dict encoding ids
                     de = delock.value
                     dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                    dictbatchmsg = makedictionarybatchmsg(dictsch, (col=de.data,), id, false, writer.alignment)
+                    dictbatchmsg = makedictionarybatchmsg(
+                        dictsch,
+                        (col=de.data,),
+                        id,
+                        false,
+                        writer.alignment,
+                    )
                     put!(writer.msgs, dictbatchmsg)
                 end
             end
@@ -202,9 +296,45 @@ function write(writer::Writer, source)
             put!(writer.msgs, recbatchmsg)
         else
             if writer.threaded
-                @wkspawn process_partition(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, writer.sync, writer.msgs, writer.alignment, $(writer.partition_count), writer.schema, writer.errorref, writer.anyerror, writer.meta, writer.colmeta)
+                @wkspawn process_partition(
+                    tblcols,
+                    writer.dictencodings,
+                    writer.largelists,
+                    writer.compress,
+                    writer.denseunions,
+                    writer.dictencode,
+                    writer.dictencodenested,
+                    writer.maxdepth,
+                    writer.sync,
+                    writer.msgs,
+                    writer.alignment,
+                    $(writer.partition_count),
+                    writer.schema,
+                    writer.errorref,
+                    writer.anyerror,
+                    writer.meta,
+                    writer.colmeta,
+                )
             else
-                @async process_partition(tblcols, writer.dictencodings, writer.largelists, writer.compress, writer.denseunions, writer.dictencode, writer.dictencodenested, writer.maxdepth, writer.sync, writer.msgs, writer.alignment, $(writer.partition_count), writer.schema, writer.errorref, writer.anyerror, writer.meta, writer.colmeta)
+                @async process_partition(
+                    tblcols,
+                    writer.dictencodings,
+                    writer.largelists,
+                    writer.compress,
+                    writer.denseunions,
+                    writer.dictencode,
+                    writer.dictencodenested,
+                    writer.maxdepth,
+                    writer.sync,
+                    writer.msgs,
+                    writer.alignment,
+                    $(writer.partition_count),
+                    writer.schema,
+                    writer.errorref,
+                    writer.anyerror,
+                    writer.meta,
+                    writer.colmeta,
+                )
             end
         end
         writer.partition_count += 1
@@ -277,22 +407,82 @@ function write(io::IO, tbl; kwargs...)
     io
 end
 
-function write(io, source, writetofile, largelists, compress, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks, meta, colmeta)
-    open(Writer, io, compress, writetofile, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks, meta, colmeta) do writer
+function write(
+    io,
+    source,
+    writetofile,
+    largelists,
+    compress,
+    denseunions,
+    dictencode,
+    dictencodenested,
+    alignment,
+    maxdepth,
+    ntasks,
+    meta,
+    colmeta,
+)
+    open(
+        Writer,
+        io,
+        compress,
+        writetofile,
+        largelists,
+        denseunions,
+        dictencode,
+        dictencodenested,
+        alignment,
+        maxdepth,
+        ntasks,
+        meta,
+        colmeta,
+    ) do writer
         write(writer, source)
     end
     io
 end
 
-function process_partition(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, sync, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
+function process_partition(
+    cols,
+    dictencodings,
+    largelists,
+    compress,
+    denseunions,
+    dictencode,
+    dictencodenested,
+    maxdepth,
+    sync,
+    msgs,
+    alignment,
+    i,
+    sch,
+    errorref,
+    anyerror,
+    meta,
+    colmeta,
+)
     try
-        cols = toarrowtable(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, meta, colmeta)
+        cols = toarrowtable(
+            cols,
+            dictencodings,
+            largelists,
+            compress,
+            denseunions,
+            dictencode,
+            dictencodenested,
+            maxdepth,
+            meta,
+            colmeta,
+        )
         dictmsgs = nothing
         if !isempty(cols.dictencodingdeltas)
             dictmsgs = []
             for de in cols.dictencodingdeltas
                 dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                push!(dictmsgs, makedictionarybatchmsg(dictsch, (col=de.data,), de.id, true, alignment))
+                push!(
+                    dictmsgs,
+                    makedictionarybatchmsg(dictsch, (col=de.data,), de.id, true, alignment),
+                )
             end
         end
         put!(sync, i) do
@@ -315,7 +505,18 @@ struct ToArrowTable
     dictencodingdeltas::Vector{DictEncoding}
 end
 
-function toarrowtable(cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, meta, colmeta)
+function toarrowtable(
+    cols,
+    dictencodings,
+    largelists,
+    compress,
+    denseunions,
+    dictencode,
+    dictencodenested,
+    maxdepth,
+    meta,
+    colmeta,
+)
     @debugv 1 "converting input table to arrow formatted columns"
     sch = Tables.schema(cols)
     types = collect(sch.types)
@@ -326,14 +527,32 @@ function toarrowtable(cols, dictencodings, largelists, compress, denseunions, di
     Tables.eachcolumn(sch, cols) do col, i, nm
         oldcolmeta = getmetadata(col)
         newcolmeta = isnothing(colmeta) ? oldcolmeta : get(colmeta, nm, oldcolmeta)
-        newcol = toarrowvector(col, i, dictencodings, dictencodingdeltas, newcolmeta; compression=compress, largelists=largelists, denseunions=denseunions, dictencode=dictencode, dictencodenested=dictencodenested, maxdepth=maxdepth)
+        newcol = toarrowvector(
+            col,
+            i,
+            dictencodings,
+            dictencodingdeltas,
+            newcolmeta;
+            compression=compress,
+            largelists=largelists,
+            denseunions=denseunions,
+            dictencode=dictencode,
+            dictencodenested=dictencodenested,
+            maxdepth=maxdepth,
+        )
         newtypes[i] = eltype(newcol)
         newcols[i] = newcol
     end
     minlen, maxlen = isempty(newcols) ? (0, 0) : extrema(length, newcols)
-    minlen == maxlen || throw(ArgumentError("columns with unequal lengths detected: $minlen < $maxlen"))
+    minlen == maxlen ||
+        throw(ArgumentError("columns with unequal lengths detected: $minlen < $maxlen"))
     meta = _normalizemeta(meta)
-    return ToArrowTable(Tables.Schema(sch.names, newtypes), newcols, meta, dictencodingdeltas)
+    return ToArrowTable(
+        Tables.Schema(sch.names, newtypes),
+        newcols,
+        meta,
+        dictencodingdeltas,
+    )
 end
 
 Tables.columns(x::ToArrowTable) = x
@@ -346,7 +565,10 @@ function Base.write(io::IO, msg::Message, blocks, sch, alignment)
     metalen = padding(length(msg.msgflatbuf), alignment)
     @debugv 1 "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch), headerType = $(msg.headerType)"
     if msg.blockmsg
-        push!(blocks[msg.isrecordbatch ? 1 : 2], Block(position(io), metalen + 8, msg.bodylen))
+        push!(
+            blocks[msg.isrecordbatch ? 1 : 2],
+            Block(position(io), metalen + 8, msg.bodylen),
+        )
     end
     # now write the final message spec out
     # continuation byte
@@ -377,7 +599,14 @@ function makemessage(b, headerType, header, columns=nothing, bodylen=0)
     # Meta.messageStartCustomMetadataVector(b, num_meta_elems)
     msg = Meta.messageEnd(b)
     FlatBuffers.finish!(b, msg)
-    return Message(FlatBuffers.finishedbytes(b), columns, bodylen, headerType == Meta.RecordBatch, headerType == Meta.RecordBatch || headerType == Meta.DictionaryBatch, headerType)
+    return Message(
+        FlatBuffers.finishedbytes(b),
+        columns,
+        bodylen,
+        headerType == Meta.RecordBatch,
+        headerType == Meta.RecordBatch || headerType == Meta.DictionaryBatch,
+        headerType,
+    )
 end
 
 function makeschema(b, sch::Tables.Schema, columns)
@@ -499,13 +728,22 @@ struct Buffer
     length::Int64
 end
 
-function makerecordbatchmsg(sch::Tables.Schema{names,types}, columns, alignment) where {names,types}
+function makerecordbatchmsg(
+    sch::Tables.Schema{names,types},
+    columns,
+    alignment,
+) where {names,types}
     b = FlatBuffers.Builder(1024)
     recordbatch, bodylen = makerecordbatch(b, sch, columns, alignment)
     return makemessage(b, Meta.RecordBatch, recordbatch, columns, bodylen)
 end
 
-function makerecordbatch(b, sch::Tables.Schema{names,types}, columns, alignment) where {names,types}
+function makerecordbatch(
+    b,
+    sch::Tables.Schema{names,types},
+    columns,
+    alignment,
+) where {names,types}
     nrows = Tables.rowcount(columns)
 
     compress = nothing
@@ -516,7 +754,8 @@ function makerecordbatch(b, sch::Tables.Schema{names,types}, columns, alignment)
         if col isa Compressed
             compress = compressiontype(col)
         end
-        bufferoffset = makenodesbuffers!(col, fieldnodes, fieldbuffers, bufferoffset, alignment)
+        bufferoffset =
+            makenodesbuffers!(col, fieldnodes, fieldbuffers, bufferoffset, alignment)
     end
     @debugv 1 "building record batch message: nrows = $nrows, sch = $sch, compress = $compress"
 
