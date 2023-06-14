@@ -23,7 +23,20 @@ module ArrowTypes
 using Sockets
 using UUIDs
 
-export ArrowKind, NullKind, PrimitiveKind, BoolKind, ListKind, FixedSizeListKind, MapKind, StructKind, UnionKind, DictEncodedKind, toarrow, arrowname, fromarrow, ToArrow
+export ArrowKind,
+    NullKind,
+    PrimitiveKind,
+    BoolKind,
+    ListKind,
+    FixedSizeListKind,
+    MapKind,
+    StructKind,
+    UnionKind,
+    DictEncodedKind,
+    toarrow,
+    arrowname,
+    fromarrow,
+    ToArrow
 
 """
     ArrowTypes.ArrowKind(T)
@@ -69,7 +82,7 @@ and [`ArrowTypes.fromarrow`](@ref).
 function ArrowType end
 ArrowType(::Type{T}) where {T} = T
 ArrowType(::Type{Any}) = Any
-ArrowType(::Type{Union{Missing, T}}) where {T} = Union{Missing, ArrowType(T)}
+ArrowType(::Type{Union{Missing,T}}) where {T} = Union{Missing,ArrowType(T)}
 ArrowType(::Type{Missing}) = Missing
 
 """
@@ -166,10 +179,10 @@ A few `ArrowKind`s have/allow slightly more custom overloads for their `fromarro
 function fromarrow end
 fromarrow(::Type{T}, x::T) where {T} = x
 fromarrow(::Type{T}, x...) where {T} = T(x...)
-fromarrow(::Type{Union{Missing, T}}, ::Missing) where {T} = missing
-fromarrow(::Type{Union{Missing, T}}, x::T) where {T} = x
-fromarrow(::Type{Union{Missing, T}}, x::T) where {T<:NamedTuple} = x # ambiguity fix
-fromarrow(::Type{Union{Missing, T}}, x) where {T} = fromarrow(T, x)
+fromarrow(::Type{Union{Missing,T}}, ::Missing) where {T} = missing
+fromarrow(::Type{Union{Missing,T}}, x::T) where {T} = x
+fromarrow(::Type{Union{Missing,T}}, x::T) where {T<:NamedTuple} = x # ambiguity fix
+fromarrow(::Type{Union{Missing,T}}, x) where {T} = fromarrow(T, x)
 
 "NullKind data is actually not physically stored since the data is constant; just the length is needed"
 struct NullKind <: ArrowKind end
@@ -211,9 +224,11 @@ ArrowKind(::Type{<:AbstractString}) = ListKind{true}()
 # Treate Base.CodeUnits as Binary arrow type
 ArrowKind(::Type{<:Base.CodeUnits}) = ListKind{true}()
 
-fromarrow(::Type{T}, ptr::Ptr{UInt8}, len::Int) where {T} = fromarrow(T, unsafe_string(ptr, len))
-fromarrow(::Type{T}, x) where {T <: Base.CodeUnits} = Base.CodeUnits(x)
-fromarrow(::Type{Union{Missing, Base.CodeUnits}}, x) = x === missing ? missing : Base.CodeUnits(x)
+fromarrow(::Type{T}, ptr::Ptr{UInt8}, len::Int) where {T} =
+    fromarrow(T, unsafe_string(ptr, len))
+fromarrow(::Type{T}, x) where {T<:Base.CodeUnits} = Base.CodeUnits(x)
+fromarrow(::Type{Union{Missing,Base.CodeUnits}}, x) =
+    x === missing ? missing : Base.CodeUnits(x)
 
 ArrowType(::Type{Symbol}) = String
 toarrow(x::Symbol) = String(x)
@@ -224,30 +239,31 @@ _symbol(ptr, len) = ccall(:jl_symbol_n, Ref{Symbol}, (Ptr{UInt8}, Int), ptr, len
 fromarrow(::Type{Symbol}, ptr::Ptr{UInt8}, len::Int) = _symbol(ptr, len)
 
 ArrowKind(::Type{<:AbstractArray}) = ListKind()
-fromarrow(::Type{A}, x::A) where {A <: AbstractVector{T}} where {T} = x
-fromarrow(::Type{A}, x::AbstractVector{T}) where {A <: AbstractVector{T}} where {T} = convert(A, x)
+fromarrow(::Type{A}, x::A) where {A<:AbstractVector{T}} where {T} = x
+fromarrow(::Type{A}, x::AbstractVector{T}) where {A<:AbstractVector{T}} where {T} =
+    convert(A, x)
 ArrowKind(::Type{<:AbstractSet}) = ListKind()
-ArrowType(::Type{T}) where {T <: AbstractSet{S}} where {S} = Vector{S}
+ArrowType(::Type{T}) where {T<:AbstractSet{S}} where {S} = Vector{S}
 toarrow(x::AbstractSet) = collect(x)
 const SET = Symbol("JuliaLang.Set")
 arrowname(::Type{<:AbstractSet}) = SET
-JuliaType(::Val{SET}, ::Type{T}) where {T <: AbstractVector{S}} where {S} = Set{S}
-fromarrow(::Type{T}, x) where {T <: AbstractSet} = T(x)
+JuliaType(::Val{SET}, ::Type{T}) where {T<:AbstractVector{S}} where {S} = Set{S}
+fromarrow(::Type{T}, x) where {T<:AbstractSet} = T(x)
 
 "FixedSizeListKind data are stored in a single contiguous buffer; individual elements can be computed based on the fixed size of the lists"
-struct FixedSizeListKind{N, T} <: ArrowKind end
-gettype(::FixedSizeListKind{N, T}) where {N, T} = T
-getsize(::FixedSizeListKind{N, T}) where {N, T} = N
+struct FixedSizeListKind{N,T} <: ArrowKind end
+gettype(::FixedSizeListKind{N,T}) where {N,T} = T
+getsize(::FixedSizeListKind{N,T}) where {N,T} = N
 
-ArrowKind(::Type{NTuple{N, T}}) where {N, T} = FixedSizeListKind{N, T}()
+ArrowKind(::Type{NTuple{N,T}}) where {N,T} = FixedSizeListKind{N,T}()
 
-ArrowKind(::Type{UUID}) = FixedSizeListKind{16, UInt8}()
-ArrowType(::Type{UUID}) = NTuple{16, UInt8}
-toarrow(x::UUID) = _cast(NTuple{16, UInt8}, x.value)
+ArrowKind(::Type{UUID}) = FixedSizeListKind{16,UInt8}()
+ArrowType(::Type{UUID}) = NTuple{16,UInt8}
+toarrow(x::UUID) = _cast(NTuple{16,UInt8}, x.value)
 const UUIDSYMBOL = Symbol("JuliaLang.UUID")
 arrowname(::Type{UUID}) = UUIDSYMBOL
 JuliaType(::Val{UUIDSYMBOL}) = UUID
-fromarrow(::Type{UUID}, x::NTuple{16, UInt8}) = UUID(_cast(UInt128, x))
+fromarrow(::Type{UUID}, x::NTuple{16,UInt8}) = UUID(_cast(UInt128, x))
 
 ArrowKind(::Type{IPv4}) = PrimitiveKind()
 ArrowType(::Type{IPv4}) = UInt32
@@ -257,13 +273,13 @@ arrowname(::Type{IPv4}) = IPV4_SYMBOL
 JuliaType(::Val{IPV4_SYMBOL}) = IPv4
 fromarrow(::Type{IPv4}, x::Integer) = IPv4(x)
 
-ArrowKind(::Type{IPv6}) = FixedSizeListKind{16, UInt8}()
-ArrowType(::Type{IPv6}) = NTuple{16, UInt8}
-toarrow(x::IPv6) = _cast(NTuple{16, UInt8}, x.host)
+ArrowKind(::Type{IPv6}) = FixedSizeListKind{16,UInt8}()
+ArrowType(::Type{IPv6}) = NTuple{16,UInt8}
+toarrow(x::IPv6) = _cast(NTuple{16,UInt8}, x.host)
 const IPV6_SYMBOL = Symbol("JuliaLang.IPv6")
 arrowname(::Type{IPv6}) = IPV6_SYMBOL
 JuliaType(::Val{IPV6_SYMBOL}) = IPv6
-fromarrow(::Type{IPv6}, x::NTuple{16, UInt8}) = IPv6(_cast(UInt128, x))
+fromarrow(::Type{IPv6}, x::NTuple{16,UInt8}) = IPv6(_cast(UInt128, x))
 
 function _cast(::Type{Y}, x)::Y where {Y}
     y = Ref{Y}()
@@ -286,18 +302,21 @@ struct StructKind <: ArrowKind end
 
 ArrowKind(::Type{<:NamedTuple}) = StructKind()
 
-fromarrow(::Type{NamedTuple{names, types}}, x::NamedTuple{names, types}) where {names, types <: Tuple} = x
+fromarrow(
+    ::Type{NamedTuple{names,types}},
+    x::NamedTuple{names,types},
+) where {names,types<:Tuple} = x
 fromarrow(::Type{T}, x::NamedTuple) where {T} = fromarrow(T, Tuple(x)...)
 
 ArrowKind(::Type{<:Tuple}) = StructKind()
 ArrowKind(::Type{Tuple{}}) = StructKind()
 const TUPLE = Symbol("JuliaLang.Tuple")
 # needed to disambiguate the FixedSizeList case for NTuple
-arrowname(::Type{NTuple{N, T}}) where {N, T} = EMPTY_SYMBOL
-arrowname(::Type{T}) where {T <: Tuple} = TUPLE
+arrowname(::Type{NTuple{N,T}}) where {N,T} = EMPTY_SYMBOL
+arrowname(::Type{T}) where {T<:Tuple} = TUPLE
 arrowname(::Type{Tuple{}}) = TUPLE
-JuliaType(::Val{TUPLE}, ::Type{NamedTuple{names, types}}) where {names, types <: Tuple} = types
-fromarrow(::Type{T}, x::NamedTuple) where {T <: Tuple} = Tuple(x)
+JuliaType(::Val{TUPLE}, ::Type{NamedTuple{names,types}}) where {names,types<:Tuple} = types
+fromarrow(::Type{T}, x::NamedTuple) where {T<:Tuple} = Tuple(x)
 
 # VersionNumber
 const VERSION_NUMBER = Symbol("JuliaLang.VersionNumber")
@@ -338,11 +357,11 @@ default(::Type{<:AbstractString}) = ""
 default(::Type{Any}) = nothing
 default(::Type{Missing}) = missing
 default(::Type{Nothing}) = nothing
-default(::Type{Union{T, Missing}}) where {T} = default(T)
-default(::Type{Union{T, Nothing}}) where {T} = default(T)
-default(::Type{Union{T, Missing, Nothing}}) where {T} = default(T)
+default(::Type{Union{T,Missing}}) where {T} = default(T)
+default(::Type{Union{T,Nothing}}) where {T} = default(T)
+default(::Type{Union{T,Missing,Nothing}}) where {T} = default(T)
 
-function default(::Type{A}) where {A <: AbstractVector{T}} where {T}
+function default(::Type{A}) where {A<:AbstractVector{T}} where {T}
     a = similar(A, 1)
     a[1] = default(T)
     return a
@@ -350,28 +369,30 @@ end
 
 default(::Type{SubArray{T,N,P,I,L}}) where {T,N,P,I,L} = view(default(P), 0:-1)
 
-default(::Type{NTuple{N, T}}) where {N, T} = ntuple(i -> default(T), N)
+default(::Type{NTuple{N,T}}) where {N,T} = ntuple(i -> default(T), N)
 default(::Type{Tuple{}}) = ()
-function default(::Type{T}) where {T <: Tuple}
+function default(::Type{T}) where {T<:Tuple}
     T === Tuple{} && return ()
     N = Base.isvarargtype(T.parameters[end]) ? length(T.parameters) - 1 : fieldcount(T)
     return Tuple(default(fieldtype(T, i)) for i = 1:N)
 end
 
-default(::Type{T}) where {T <: AbstractDict} = T()
-default(::Type{NamedTuple{names, types}}) where {names, types} = NamedTuple{names}(Tuple(default(fieldtype(types, i)) for i = 1:length(names)))
+default(::Type{T}) where {T<:AbstractDict} = T()
+default(::Type{NamedTuple{names,types}}) where {names,types} =
+    NamedTuple{names}(Tuple(default(fieldtype(types, i)) for i = 1:length(names)))
 
 function promoteunion(T, S)
     new = promote_type(T, S)
-    return isabstracttype(new) ? Union{T, S} : new
+    return isabstracttype(new) ? Union{T,S} : new
 end
 
 # lazily call toarrow(x) on getindex for each x in data
-struct ToArrow{T, A} <: AbstractVector{T}
+struct ToArrow{T,A} <: AbstractVector{T}
     data::A
 end
 
-concrete_or_concreteunion(T) = isconcretetype(T) ||
+concrete_or_concreteunion(T) =
+    isconcretetype(T) ||
     (T isa Union && concrete_or_concreteunion(T.a) && concrete_or_concreteunion(T.b))
 
 function ToArrow(x::A) where {A}
@@ -392,12 +413,12 @@ function ToArrow(x::A) where {A}
             T = promoteunion(T, typeof(toarrow(default(S))))
         end
     end
-    return ToArrow{T, A}(x)
+    return ToArrow{T,A}(x)
 end
 
 Base.IndexStyle(::Type{<:ToArrow}) = Base.IndexLinear()
 Base.size(x::ToArrow) = (length(x.data),)
-Base.eltype(::Type{TA}) where {T, A, TA<:ToArrow{T, A}} = T
+Base.eltype(::Type{TA}) where {T,A,TA<:ToArrow{T,A}} = T
 function _convert(::Type{T}, x) where {T}
     if x isa T
         return x

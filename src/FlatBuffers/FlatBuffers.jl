@@ -24,7 +24,7 @@ const VOffsetT = UInt16
 const VtableMetadataFields = 2
 
 basetype(::Enum) = UInt8
-basetype(::Type{T}) where {T <: Enum{S}} where {S} = S
+basetype(::Type{T}) where {T<:Enum{S}} where {S} = S
 
 function readbuffer(t::AbstractVector{UInt8}, pos::Integer, ::Type{Bool})
     @inbounds b = t[pos + 1]
@@ -46,7 +46,12 @@ function Base.show(io::IO, x::TableOrStruct)
     if isempty(propertynames(x))
         print(io, "()")
     else
-        show(io, NamedTuple{propertynames(x)}(Tuple(getproperty(x, y) for y in propertynames(x))))
+        show(
+            io,
+            NamedTuple{propertynames(x)}(
+                Tuple(getproperty(x, y) for y in propertynames(x)),
+            ),
+        )
     end
 end
 

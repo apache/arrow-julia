@@ -19,7 +19,8 @@ struct Footer <: FlatBuffers.Table
     pos::Base.Int
 end
 
-Base.propertynames(x::Footer) = (:version, :schema, :dictionaries, :recordBatches, :custom_metadata)
+Base.propertynames(x::Footer) =
+    (:version, :schema, :dictionaries, :recordBatches, :custom_metadata)
 
 function Base.getproperty(x::Footer, field::Symbol)
     if field === :version
@@ -52,12 +53,18 @@ function Base.getproperty(x::Footer, field::Symbol)
 end
 
 footerStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 4)
-footerAddVersion(b::FlatBuffers.Builder, version::MetadataVersion.T) = FlatBuffers.prependslot!(b, 0, version, 0)
-footerAddSchema(b::FlatBuffers.Builder, schema::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 1, schema, 0)
-footerAddDictionaries(b::FlatBuffers.Builder, dictionaries::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 2, dictionaries, 0)
-footerStartDictionariesVector(b::FlatBuffers.Builder, numelems) = FlatBuffers.startvector!(b, 24, numelems, 8)
-footerAddRecordBatches(b::FlatBuffers.Builder, recordbatches::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 3, recordbatches, 0)
-footerStartRecordBatchesVector(b::FlatBuffers.Builder, numelems) = FlatBuffers.startvector!(b, 24, numelems, 8)
+footerAddVersion(b::FlatBuffers.Builder, version::MetadataVersion.T) =
+    FlatBuffers.prependslot!(b, 0, version, 0)
+footerAddSchema(b::FlatBuffers.Builder, schema::FlatBuffers.UOffsetT) =
+    FlatBuffers.prependoffsetslot!(b, 1, schema, 0)
+footerAddDictionaries(b::FlatBuffers.Builder, dictionaries::FlatBuffers.UOffsetT) =
+    FlatBuffers.prependoffsetslot!(b, 2, dictionaries, 0)
+footerStartDictionariesVector(b::FlatBuffers.Builder, numelems) =
+    FlatBuffers.startvector!(b, 24, numelems, 8)
+footerAddRecordBatches(b::FlatBuffers.Builder, recordbatches::FlatBuffers.UOffsetT) =
+    FlatBuffers.prependoffsetslot!(b, 3, recordbatches, 0)
+footerStartRecordBatchesVector(b::FlatBuffers.Builder, numelems) =
+    FlatBuffers.startvector!(b, 24, numelems, 8)
 footerEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
 struct Block <: FlatBuffers.Struct
@@ -80,7 +87,12 @@ function Base.getproperty(x::Block, field::Symbol)
     return nothing
 end
 
-function createBlock(b::FlatBuffers.Builder, offset::Int64, metadatalength::Int32, bodylength::Int64)
+function createBlock(
+    b::FlatBuffers.Builder,
+    offset::Int64,
+    metadatalength::Int32,
+    bodylength::Int64,
+)
     FlatBuffers.prep!(b, 8, 24)
     prepend!(b, bodylength)
     FlatBuffers.pad!(b, 4)

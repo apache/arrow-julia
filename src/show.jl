@@ -38,16 +38,27 @@ function Base.show(io::IO, mime::MIME"text/plain", table::Table)
         display_rows -= 1 # decrement for metadata header line
         display_rows -= min(length(meta), 2) # decrement so we can show at least 2 lines of metadata
     end
-    print(io, "$(typeof(table)) with $(Tables.rowcount(table)) rows, $(ncols) columns, and ")
+    print(
+        io,
+        "$(typeof(table)) with $(Tables.rowcount(table)) rows, $(ncols) columns, and ",
+    )
     sch = Tables.schema(table)
     print(io, "schema:\n")
-    schema_context = IOContext(io, :print_schema_header => false, :displaysize => (max(display_rows, 3), display_cols))
+    schema_context = IOContext(
+        io,
+        :print_schema_header => false,
+        :displaysize => (max(display_rows, 3), display_cols),
+    )
     schema_str = sprint(show, mime, sch; context=schema_context)
     print(io, schema_str)
     display_rows -= (count("\n", schema_str) + 1) # decrement for number of lines printed
     if meta !== nothing
         print(io, "\n\nwith metadata given by a ")
-        show(IOContext(io, :displaysize => (max(display_rows, 5), display_cols)), mime, meta)
+        show(
+            IOContext(io, :displaysize => (max(display_rows, 5), display_cols)),
+            mime,
+            meta,
+        )
     end
     return nothing
 end
