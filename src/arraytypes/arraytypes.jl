@@ -200,6 +200,7 @@ end
 
 Base.size(p::ValidityBitmap) = (p.ℓ,)
 nullcount(x::ValidityBitmap) = x.nc
+Base.all(x::ValidityBitmap) = x.nc == 0
 
 function ValidityBitmap(x)
     T = eltype(x)
