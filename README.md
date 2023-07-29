@@ -68,4 +68,4 @@ Third-party data formats:
   * Other Tables.jl-compatible packages automatically supported ([DataFrames.jl](https://github.com/JuliaData/DataFrames.jl), [JSONTables.jl](https://github.com/JuliaData/JSONTables.jl), [JuliaDB.jl](https://github.com/JuliaData/JuliaDB.jl), [SQLite.jl](https://github.com/JuliaDatabases/SQLite.jl), [MySQL.jl](https://github.com/JuliaDatabases/MySQL.jl), [JDBC.jl](https://github.com/JuliaDatabases/JDBC.jl), [ODBC.jl](https://github.com/JuliaDatabases/ODBC.jl), [XLSX.jl](https://github.com/felipenoris/XLSX.jl), etc.)
   * No current Julia packages support ORC
 
-See the [full documentation](https://arrow.juliadata.org/dev/) for details on reading and writing arrow data.
+See the [full documentation](https://arrow.apache.org/julia/dev/) for details on reading and writing arrow data.
