@@ -1016,4 +1016,44 @@ end
         # end
 
     end # @testset "misc"
+
+    @testset "DataAPI.metadata" begin
+        df = DataFrame(a=1, b=2, c=3)
+        for i in 1:2
+            io = IOBuffer()
+            if i == 1 # skip writing metadata in the first iteration
+                Arrow.write(io, df)
+            else
+                Arrow.write(io, df, metadata=metadata(df), colmetadata=colmetadata(df))
+            end
+            seekstart(io)
+            tbl = Arrow.Table(io)
+
+            @test DataAPI.metadatasupport(typeof(tbl)) == (read=true, write=false)
+            @test metadata(tbl) == metadata(df)
+            @test metadata(tbl; style=true) == metadata(df; style=true)
+            @test_throws Exception metadata(tbl, "xyz")
+            @test metadata(tbl, "xyz", "something") == "something"
+            @test metadata(tbl, "xyz", "something"; style=true) == ("something", :default)
+            @test metadatakeys(tbl) == metadatakeys(df)
+
+            @test DataAPI.colmetadatasupport(typeof(tbl)) == (read=true, write=false)
+            @test colmetadata(tbl) == colmetadata(df)
+            @test colmetadata(tbl; style=true) == colmetadata(df; style=true)
+            @test_throws MethodError colmetadata(tbl, "xyz")
+            @test_throws KeyError colmetadata(tbl, :xyz)
+            @test colmetadata(tbl, :b) == colmetadata(df, :b)
+            @test_throws MethodError colmetadata(tbl, :b, "xyz")
+            @test colmetadata(tbl, :b, "xyz", "something") == "something"
+            @test colmetadata(tbl, :b, "xyz", "something"; style=true) == ("something", :default)
+            @test Set(colmetadatakeys(tbl)) == Set(colmetadatakeys(df))
+
+            # add metadata for the second iteration
+            metadata!(df, "tkey", "tvalue")
+            metadata!(df, "tkey2", "tvalue2")
+            colmetadata!(df, :a, "ackey", "acvalue")
+            colmetadata!(df, :a, "ackey2", "acvalue2")
+            colmetadata!(df, :c, "cckey", "ccvalue")
+        end
+    end # @testset "DataAPI.metadata"
 end

@@ -360,6 +360,53 @@ See [the official Arrow documentation for more details on custom application met
 getmetadata(t::Table) = getfield(t, :metadata)[]
 getmetadata(::Any) = nothing
 
+DataAPI.metadatasupport(::Type{Table}) = (read=true, write=false)
+DataAPI.colmetadatasupport(::Type{Table}) = (read=true, write=false)
+
+function DataAPI.metadata(t::Table, key::AbstractString; style::Bool=false)
+    meta = getmetadata(t)[key]
+    return style ? (meta, :default) : meta
+end
+
+function DataAPI.metadata(t::Table, key::AbstractString, default; style::Bool=false)
+    meta = getmetadata(t)
+    if meta !== nothing
+        haskey(meta, key) && return style ? meta[key] : (meta[key], :default)
+    end
+    return style ? (default, :default) : default
+end
+
+function DataAPI.metadatakeys(t::Table)
+    meta = getmetadata(t)
+    meta === nothing && return ()
+    return keys(meta)
+end
+
+function DataAPI.colmetadata(t::Table, col, key::AbstractString; style::Bool=false)
+    meta = getmetadata(t[col])[key]
+    return style ? (meta, :default) : meta
+end
+
+function DataAPI.colmetadata(t::Table, col, key::AbstractString, default; style::Bool=false)
+    meta = getmetadata(t[col])
+    if meta !== nothing
+        haskey(meta, key) && return style ? (meta[key], :default) : meta[key]
+    end
+    return style ? (default, :default) : default
+end
+
+function DataAPI.colmetadatakeys(t::Table, col)
+    meta = getmetadata(t[col])
+    meta === nothing && return ()
+    return keys(meta)
+end
+
+function DataAPI.colmetadatakeys(t::Table)
+    return (col => DataAPI.colmetadatakeys(t, col) for
+            col in Tables.columnnames(t) if
+            getmetadata(t[col]) !== nothing)
+end
+
 Tables.istable(::Table) = true
 Tables.columnaccess(::Table) = true
 Tables.columns(t::Table) = Tables.CopiedColumns(t)
