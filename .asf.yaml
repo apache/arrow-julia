@@ -25,7 +25,7 @@ notifications:
 
 github:
   description: "Official Julia implementation of Apache Arrow"
-  homepage: https://arrow.apache.org/
+  homepage: https://arrow.apache.org/julia/
   labels:
     - apache-arrow
     - julia
