@@ -24,7 +24,7 @@ makedocs(;
     sitename="Arrow.jl",
     format=Documenter.HTML(;
         prettyurls=get(ENV, "CI", "false") == "true",
-        canonical="https://arrow.juliadata.org/",
+        canonical="https://arrow.apache.org/julia/",
         assets=String[],
     ),
     pages=[
