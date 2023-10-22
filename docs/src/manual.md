@@ -66,7 +66,7 @@ So, what can you do with an `Arrow.Table` full of data? Quite a bit actually!
 Because `Arrow.Table` implements the [Tables.jl](https://juliadata.github.io/Tables.jl/stable/) interface, it opens up a world of integrations for using arrow data. A few examples include:
 
 * `df = DataFrame(Arrow.Table(file))`: Build a [`DataFrame`](https://juliadata.github.io/DataFrames.jl/stable/), using the arrow vectors themselves; this allows utilizing a host of DataFrames.jl functionality directly on arrow data; grouping, joining, selecting, etc.
-* `df = copy(DataFrame(Arrow.Table(file)))`: Build a [`DataFrame`](https://juliadata.github.io/DataFrames.jl/stable/), where the columns are regular `Vector`s. This requires that you have enough memory to load the entire DataFrame into memory.
+* `df = copy(DataFrame(Arrow.Table(file)))`: Build a [`DataFrame`](https://juliadata.github.io/DataFrames.jl/stable/), where the columns are regular in-memory vectors (specifically, `Base.Vector`s and/or `PooledVector`s). This requires that you have enough memory to load the entire DataFrame into memory.
 * `Tables.datavaluerows(Arrow.Table(file)) |> @map(...) |> @filter(...) |> DataFrame`: use [`Query.jl`'s](https://www.queryverse.org/Query.jl/stable/standalonequerycommands/) row-processing utilities to map, group, filter, mutate, etc. directly over arrow data.
 * `Arrow.Table(file) |> SQLite.load!(db, "arrow_table")`: load arrow data directly into an sqlite database/table, where sql queries can be executed on the data
 * `Arrow.Table(file) |> CSV.write("arrow.csv")`: write arrow data out to a csv file
