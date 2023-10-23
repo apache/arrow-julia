@@ -190,7 +190,12 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
                     push!(x.names, Symbol(field.name))
                     push!(
                         x.types,
-                        juliaeltype(field, buildmetadata(field.custom_metadata), x.convert),
+                        juliaeltype(
+                            field,
+                            buildmetadata(field.custom_metadata),
+                            x.convert,
+                            false,
+                        ),
                     )
                     # recursively find any dictionaries for any fields
                     getdictionaries!(x.dictencoded, field)
@@ -242,7 +247,7 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
             A = ChainedVector([values])
             S =
                 field.dictionary.indexType === nothing ? Int32 :
-                juliaeltype(field, field.dictionary.indexType, false)
+                juliaeltype(field, field.dictionary.indexType, false, false)
             x.dictencodings[id] = DictEncoding{eltype(A),S,typeof(A)}(
                 id,
                 A,
@@ -486,7 +491,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                         A = ChainedVector([dictencoding.data, values])
                         S =
                             field.dictionary.indexType === nothing ? Int32 :
-                            juliaeltype(field, field.dictionary.indexType, false)
+                            juliaeltype(field, field.dictionary.indexType, false, false)
                         dictencodings[id] = DictEncoding{eltype(A),S,typeof(A)}(
                             id,
                             A,
@@ -511,7 +516,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                 A = values
                 S =
                     field.dictionary.indexType === nothing ? Int32 :
-                    juliaeltype(field, field.dictionary.indexType, false)
+                    juliaeltype(field, field.dictionary.indexType, false, false)
                 dictencodings[id] = DictEncoding{eltype(A),S,typeof(A)}(
                     id,
                     A,
@@ -539,7 +544,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
     # 158; some implementations may send 0 record batches
     if !anyrecordbatches && !isnothing(sch)
         for field in sch.fields
-            T = juliaeltype(field, buildmetadata(field), convert)
+            T = juliaeltype(field, buildmetadata(field), convert, false)
             push!(columns(t), T[])
         end
     end
@@ -652,7 +657,10 @@ function build(field::Meta.Field, batch, rb, de, nodeidx, bufferidx, convert)
         validity = buildbitmap(batch, rb, nodeidx, bufferidx)
         bufferidx += 1
         buffer = rb.buffers[bufferidx]
-        S = d.indexType === nothing ? Int32 : juliaeltype(field, d.indexType, false)
+        S =
+            d.indexType === nothing ? Int32 :
+            juliaeltype(field, d.indexType, false, all(validity))
+
         bytes, indices = reinterp(S, batch, buffer, rb.compression)
         encoding = de[d.id]
         A = DictEncoded(
@@ -757,7 +765,7 @@ function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, c
     len = rb.nodes[nodeidx].length
     nodeidx += 1
     meta = buildmetadata(f.custom_metadata)
-    T = juliaeltype(f, meta, convert)
+    T = juliaeltype(f, meta, convert, all(validity))
     if L isa Meta.Utf8 ||
        L isa Meta.LargeUtf8 ||
        L isa Meta.Binary ||
@@ -804,7 +812,7 @@ function build(
             build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
     end
     meta = buildmetadata(f.custom_metadata)
-    T = juliaeltype(f, meta, convert)
+    T = juliaeltype(f, meta, convert, all(validity))
     return FixedSizeList{T,typeof(A)}(bytes, validity, A, len, meta), nodeidx, bufferidx
 end
 
@@ -822,7 +830,7 @@ function build(f::Meta.Field, L::Meta.Map, batch, rb, de, nodeidx, bufferidx, co
     nodeidx += 1
     A, nodeidx, bufferidx = build(f.children[1], batch, rb, de, nodeidx, bufferidx, convert)
     meta = buildmetadata(f.custom_metadata)
-    T = juliaeltype(f, meta, convert)
+    T = juliaeltype(f, meta, convert, all(validity))
     return Map{T,OT,typeof(A)}(validity, offsets, A, len, meta), nodeidx, bufferidx
 end
 
@@ -839,12 +847,13 @@ function build(f::Meta.Field, L::Meta.Struct, batch, rb, de, nodeidx, bufferidx,
     end
     data = Tuple(vecs)
     meta = buildmetadata(f.custom_metadata)
-    T = juliaeltype(f, meta, convert)
+    T = juliaeltype(f, meta, convert, all(validity))
     return Struct{T,typeof(data)}(validity, data, len, meta), nodeidx, bufferidx
 end
 
 function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, convert)
     @debugv 2 "building array: L = $L"
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     buffer = rb.buffers[bufferidx]
     bytes, typeIds = reinterp(UInt8, batch, buffer, rb.compression)
     bufferidx += 1
@@ -861,7 +870,7 @@ function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, 
     end
     data = Tuple(vecs)
     meta = buildmetadata(f.custom_metadata)
-    T = juliaeltype(f, meta, convert)
+    T = juliaeltype(f, meta, convert, all(validity))
     UT = UnionT(f, convert)
     if L.mode == Meta.UnionMode.Dense
         B = DenseUnion{T,UT,typeof(data)}(bytes, bytes2, typeIds, offsets, data, meta)
@@ -874,7 +883,7 @@ end
 function build(f::Meta.Field, L::Meta.Null, batch, rb, de, nodeidx, bufferidx, convert)
     @debugv 2 "building array: L = $L"
     meta = buildmetadata(f.custom_metadata)
-    T = juliaeltype(f, meta, convert)
+    T = juliaeltype(f, meta, convert, false)
     return NullVector{maybemissing(T)}(MissingVector(rb.nodes[nodeidx].length), meta),
     nodeidx + 1,
     bufferidx
@@ -888,11 +897,11 @@ function build(f::Meta.Field, ::L, batch, rb, de, nodeidx, bufferidx, convert) w
     buffer = rb.buffers[bufferidx]
     meta = buildmetadata(f.custom_metadata)
     # get storage type (non-converted)
-    T = juliaeltype(f, nothing, false)
+    T = juliaeltype(f, nothing, false, all(validity))
     @debugv 2 "storage type for primitive: T = $T"
     bytes, A = reinterp(Base.nonmissingtype(T), batch, buffer, rb.compression)
     len = rb.nodes[nodeidx].length
-    T = juliaeltype(f, meta, convert)
+    T = juliaeltype(f, meta, convert, all(validity))
     @debugv 2 "final julia type for primitive: T = $T"
     return Primitive(T, bytes, validity, A, len, meta), nodeidx + 1, bufferidx + 1
 end
@@ -904,7 +913,7 @@ function build(f::Meta.Field, L::Meta.Bool, batch, rb, de, nodeidx, bufferidx, c
     buffer = rb.buffers[bufferidx]
     meta = buildmetadata(f.custom_metadata)
     # get storage type (non-converted)
-    T = juliaeltype(f, nothing, false)
+    T = juliaeltype(f, nothing, false, all(validity))
     @debugv 2 "storage type for primitive: T = $T"
     buffer = rb.buffers[bufferidx]
     voff = batch.pos + buffer.offset
@@ -921,6 +930,6 @@ function build(f::Meta.Field, L::Meta.Bool, batch, rb, de, nodeidx, bufferidx, c
         # return ValidityBitmap(decodedbytes, 1, node.length, node.null_count)
     end
     len = rb.nodes[nodeidx].length
-    T = juliaeltype(f, meta, convert)
+    T = juliaeltype(f, meta, convert, all(validity))
     return BoolVector{T}(decodedbytes, pos, validity, len, meta), nodeidx + 1, bufferidx + 1
 end
