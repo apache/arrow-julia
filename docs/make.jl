@@ -20,11 +20,11 @@ using Arrow
 
 makedocs(;
     modules=[Arrow],
-    repo="https://github.com/apache/arrow-julia/blob/{commit}{path}#L{line}",
+    repo=Remotes.GitHub("apache", "arrow-julia"),
     sitename="Arrow.jl",
     format=Documenter.HTML(;
         prettyurls=get(ENV, "CI", "false") == "true",
-        canonical="https://arrow.juliadata.org/",
+        canonical="https://arrow.apache.org/julia/",
         assets=String[],
     ),
     pages=[
