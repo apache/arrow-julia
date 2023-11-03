@@ -262,7 +262,8 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
             if header.compression !== nothing
                 compression = header.compression
             end
-            for vec in vectoriterator(x.schema, batch, x.dictencodings, x.convert; x.filtercolumns)
+            for vec in
+                vectoriterator(x.schema, batch, x.dictencodings, x.convert; x.filtercolumns)
                 push!(columns, vec)
             end
             break
@@ -537,7 +538,9 @@ function Table(
                 anyrecordbatches = true
                 @debugv 1 "parsing record batch message: compression = $(header.compression)"
                 @wkspawn begin
-                    cols = collect(vectoriterator(sch, $batch, dictencodings, convert; filtercolumns))
+                    cols = collect(
+                        vectoriterator(sch, $batch, dictencodings, convert; filtercolumns),
+                    )
                     put!(() -> put!(tsks, cols), sync, $(rbi))
                 end
                 rbi += 1
@@ -625,8 +628,7 @@ end
 
 function vectoriterator(schema, batch, de, convert; filtercolumns=nothing)
     (
-        isnothing(filtercolumns) ?
-        VectorIterator(schema, batch, de, convert) :
+        isnothing(filtercolumns) ? VectorIterator(schema, batch, de, convert) :
         FilteredVectorIterator(schema, batch, de, convert, filtercolumns)
     )
 end
@@ -669,7 +671,7 @@ Base.length(x::VectorIterator) = length(x.schema.fields)
 struct FilteredVectorIterator
     schema::Meta.Schema
     batch::Batch # batch.msg.header MUST BE RecordBatch
-    dictencodings::Dict{Int64, DictEncoding}
+    dictencodings::Dict{Int64,DictEncoding}
     convert::Bool
     filtercolumns::Vector{String}
 end
@@ -695,7 +697,15 @@ function Base.iterate(x::FilteredVectorIterator, state=(Int64(1), Int64(1), Int6
     (columnidx, nodeidx, bufferidx) = state
     field = x.schema.fields[columnidx]
     @debugv 2 "building top-level column: field = $(field), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
-    A, nodeidx, bufferidx = build(field, x.batch, x.batch.msg.header, x.dictencodings, nodeidx, bufferidx, x.convert)
+    A, nodeidx, bufferidx = build(
+        field,
+        x.batch,
+        x.batch.msg.header,
+        x.dictencodings,
+        nodeidx,
+        bufferidx,
+        x.convert,
+    )
     @debugv 2 "built top-level column: A = $(typeof(A)), columnidx = $columnidx, nodeidx = $nodeidx, bufferidx = $bufferidx"
     @debugv 3 A
     columnidx += 1
@@ -990,7 +1000,7 @@ _step(::Meta.Field, ::Meta.Bool, nodeidx, bufferidx) = nodeidx + 1, bufferidx + 
 
 function _step(field::Meta.Field, nodeidx, bufferidx)
     if field.dictionary !== nothing
-        return nodeidx+1, bufferidx+2
+        return nodeidx + 1, bufferidx + 2
     else
         return _step(field, field.type, nodeidx, bufferidx)
     end
@@ -999,7 +1009,10 @@ end
 function _step(f::Meta.Field, L::ListTypes, nodeidx, bufferidx)
     bufferidx += 2
     nodeidx += 1
-    if L isa Meta.Utf8 || L isa Meta.LargeUtf8 || L isa Meta.Binary || L isa Meta.LargeBinary
+    if L isa Meta.Utf8 ||
+       L isa Meta.LargeUtf8 ||
+       L isa Meta.Binary ||
+       L isa Meta.LargeBinary
         bufferidx += 1
     else
         nodeidx, bufferidx = _step(f.children[1], nodeidx, bufferidx)
@@ -1007,7 +1020,12 @@ function _step(f::Meta.Field, L::ListTypes, nodeidx, bufferidx)
     nodeidx, bufferidx
 end
 
-function _step(f::Meta.Field, L::Union{Meta.FixedSizeBinary, Meta.FixedSizeList}, nodeidx, bufferidx)
+function _step(
+    f::Meta.Field,
+    L::Union{Meta.FixedSizeBinary,Meta.FixedSizeList},
+    nodeidx,
+    bufferidx,
+)
     bufferidx += 1
     nodeidx += 1
     if L isa Meta.FixedSizeBinary
