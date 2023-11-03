@@ -45,7 +45,15 @@ using Base.Iterators
 using Mmap
 using LoggingExtras
 import Dates
-using DataAPI, Tables, SentinelArrays, PooledArrays, CodecLz4, CodecZstd, TimeZones, BitIntegers, WorkerUtilities
+using DataAPI,
+    Tables,
+    SentinelArrays,
+    PooledArrays,
+    CodecLz4,
+    CodecZstd,
+    TimeZones,
+    BitIntegers,
+    ConcurrentUtilities
 
 export ArrowTypes
 
@@ -60,7 +68,8 @@ include("FlatBuffers/FlatBuffers.jl")
 using .FlatBuffers
 
 include("metadata/Flatbuf.jl")
-using .Flatbuf; const Meta = Flatbuf
+using .Flatbuf
+const Meta = Flatbuf
 
 using ArrowTypes
 include("utils.jl")
@@ -71,18 +80,64 @@ include("write.jl")
 include("append.jl")
 include("show.jl")
 
-const LZ4_FRAME_COMPRESSOR = LZ4FrameCompressor[]
-const ZSTD_COMPRESSOR = ZstdCompressor[]
+const ZSTD_COMPRESSOR = Lockable{ZstdCompressor}[]
+const ZSTD_DECOMPRESSOR = Lockable{ZstdDecompressor}[]
+const LZ4_FRAME_COMPRESSOR = Lockable{LZ4FrameCompressor}[]
+const LZ4_FRAME_DECOMPRESSOR = Lockable{LZ4FrameDecompressor}[]
+
+function init_zstd_compressor()
+    zstd = ZstdCompressor(; level=3)
+    CodecZstd.TranscodingStreams.initialize(zstd)
+    return Lockable(zstd)
+end
+
+function init_zstd_decompressor()
+    zstd = ZstdDecompressor()
+    CodecZstd.TranscodingStreams.initialize(zstd)
+    return Lockable(zstd)
+end
+
+function init_lz4_frame_compressor()
+    lz4 = LZ4FrameCompressor(; compressionlevel=4)
+    CodecLz4.TranscodingStreams.initialize(lz4)
+    return Lockable(lz4)
+end
+
+function init_lz4_frame_decompressor()
+    lz4 = LZ4FrameDecompressor()
+    CodecLz4.TranscodingStreams.initialize(lz4)
+    return Lockable(lz4)
+end
+
+function access_threaded(f, v::Vector)
+    tid = Threads.threadid()
+    0 < tid <= length(v) || _length_assert()
+    if @inbounds isassigned(v, tid)
+        @inbounds x = v[tid]
+    else
+        x = f()
+        @inbounds v[tid] = x
+    end
+    return x
+end
+@noinline _length_assert() = @assert false "0 < tid <= v"
+
+zstd_compressor() = access_threaded(init_zstd_compressor, ZSTD_COMPRESSOR)
+zstd_decompressor() = access_threaded(init_zstd_decompressor, ZSTD_DECOMPRESSOR)
+lz4_frame_compressor() = access_threaded(init_lz4_frame_compressor, LZ4_FRAME_COMPRESSOR)
+lz4_frame_decompressor() =
+    access_threaded(init_lz4_frame_decompressor, LZ4_FRAME_DECOMPRESSOR)
 
 function __init__()
-    for _ = 1:Threads.nthreads()
-        zstd = ZstdCompressor(; level=3)
-        CodecZstd.TranscodingStreams.initialize(zstd)
-        push!(ZSTD_COMPRESSOR, zstd)
-        lz4 = LZ4FrameCompressor(; compressionlevel=4)
-        CodecLz4.TranscodingStreams.initialize(lz4)
-        push!(LZ4_FRAME_COMPRESSOR, lz4)
+    nt = @static if isdefined(Base.Threads, :maxthreadid)
+        Threads.maxthreadid()
+    else
+        Threads.nthreads()
     end
+    resize!(empty!(LZ4_FRAME_COMPRESSOR), nt)
+    resize!(empty!(ZSTD_COMPRESSOR), nt)
+    resize!(empty!(LZ4_FRAME_DECOMPRESSOR), nt)
+    resize!(empty!(ZSTD_DECOMPRESSOR), nt)
     return
 end
 

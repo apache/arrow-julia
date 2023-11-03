@@ -67,21 +67,27 @@ function append(file::String, tbl; kwargs...)
     return file
 end
 
-function append(io::IO, tbl;
-        metadata=getmetadata(tbl),
-        colmetadata=nothing,
-        largelists::Bool=false,
-        denseunions::Bool=true,
-        dictencode::Bool=false,
-        dictencodenested::Bool=false,
-        alignment::Int=8,
-        maxdepth::Int=DEFAULT_MAX_DEPTH,
-        ntasks=Inf,
-        convert::Bool=true,
-        file::Bool=false)
-
+function append(
+    io::IO,
+    tbl;
+    metadata=getmetadata(tbl),
+    colmetadata=nothing,
+    largelists::Bool=false,
+    denseunions::Bool=true,
+    dictencode::Bool=false,
+    dictencodenested::Bool=false,
+    alignment::Int=8,
+    maxdepth::Int=DEFAULT_MAX_DEPTH,
+    ntasks=Inf,
+    convert::Bool=true,
+    file::Bool=false,
+)
     if ntasks < 1
-        throw(ArgumentError("ntasks keyword argument must be > 0; pass `ntasks=1` to disable multithreaded writing"))
+        throw(
+            ArgumentError(
+                "ntasks keyword argument must be > 0; pass `ntasks=1` to disable multithreaded writing",
+            ),
+        )
     end
 
     startpos = position(io)
@@ -90,7 +96,7 @@ function append(io::IO, tbl;
     seek(io, startpos) # leave the stream position unchanged
 
     if len == 0 # empty file, not initialized, we can just write to it
-        kwargs = Dict{Symbol, Any}(
+        kwargs = Dict{Symbol,Any}(
             :largelists => largelists,
             :denseunions => denseunions,
             :dictencode => dictencode,
@@ -109,43 +115,71 @@ function append(io::IO, tbl;
         if !isstream
             throw(ArgumentError("append is supported only to files in arrow stream format"))
         end
-
-        if compress === :lz4
-            compress = LZ4_FRAME_COMPRESSOR
-        elseif compress === :zstd
-            compress = ZSTD_COMPRESSOR
-        elseif compress isa Symbol
-            throw(ArgumentError("unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`"))
+        if compress isa Symbol && compress !== :lz4 && compress !== :zstd
+            throw(
+                ArgumentError(
+                    "unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`",
+                ),
+            )
         end
-
-        append(io, tbl, arrow_schema, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks, metadata, colmetadata)
+        append(
+            io,
+            tbl,
+            arrow_schema,
+            compress,
+            largelists,
+            denseunions,
+            dictencode,
+            dictencodenested,
+            alignment,
+            maxdepth,
+            ntasks,
+            metadata,
+            colmetadata,
+        )
     end
 
     return io
 end
 
-function append(io::IO, source, arrow_schema, compress, largelists, denseunions, dictencode, dictencodenested, alignment, maxdepth, ntasks, meta, colmeta)
+function append(
+    io::IO,
+    source,
+    arrow_schema,
+    compress,
+    largelists,
+    denseunions,
+    dictencode,
+    dictencodenested,
+    alignment,
+    maxdepth,
+    ntasks,
+    meta,
+    colmeta,
+)
     seekend(io)
     skip(io, -8) # overwrite last 8 bytes of last empty message footer
 
     sch = Ref{Tables.Schema}(arrow_schema)
     sync = OrderedSynchronizer()
     msgs = Channel{Message}(ntasks)
-    dictencodings = Dict{Int64, Any}() # Lockable{DictEncoding}
+    dictencodings = Dict{Int64,Any}() # Lockable{DictEncoding}
     # build messages
     blocks = (Block[], Block[])
     # start message writing from channel
     threaded = ntasks > 1
-    tsk = threaded ? (Threads.@spawn for msg in msgs
-        Base.write(io, msg, blocks, sch, alignment)
-    end) : (@async for msg in msgs
-        Base.write(io, msg, blocks, sch, alignment)
-    end)
+    tsk =
+        threaded ? (@wkspawn for msg in msgs
+            Base.write(io, msg, blocks, sch, alignment)
+        end) : (@async for msg in msgs
+            Base.write(io, msg, blocks, sch, alignment)
+        end)
     anyerror = Threads.Atomic{Bool}(false)
     errorref = Ref{Any}()
     @sync for (i, tbl) in enumerate(Tables.partitions(source))
         if anyerror[]
-            @error "error writing arrow data on partition = $(errorref[][3])" exception=(errorref[][1], errorref[][2])
+            @error "error writing arrow data on partition = $(errorref[][3])" exception =
+                (errorref[][1], errorref[][2])
             error("fatal error writing arrow data")
         end
         @debugv 1 "processing table partition i = $i"
@@ -157,13 +191,50 @@ function append(io::IO, source, arrow_schema, compress, largelists, denseunions,
         end
 
         if threaded
-            Threads.@spawn process_partition(tbl_cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, sync, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
+            @wkspawn process_partition(
+                tbl_cols,
+                dictencodings,
+                largelists,
+                compress,
+                denseunions,
+                dictencode,
+                dictencodenested,
+                maxdepth,
+                sync,
+                msgs,
+                alignment,
+                i,
+                sch,
+                errorref,
+                anyerror,
+                meta,
+                colmeta,
+            )
         else
-            @async process_partition(tbl_cols, dictencodings, largelists, compress, denseunions, dictencode, dictencodenested, maxdepth, sync, msgs, alignment, i, sch, errorref, anyerror, meta, colmeta)
+            @async process_partition(
+                tbl_cols,
+                dictencodings,
+                largelists,
+                compress,
+                denseunions,
+                dictencode,
+                dictencodenested,
+                maxdepth,
+                sync,
+                msgs,
+                alignment,
+                i,
+                sch,
+                errorref,
+                anyerror,
+                meta,
+                colmeta,
+            )
         end
     end
     if anyerror[]
-        @error "error writing arrow data on partition = $(errorref[][3])" exception=(errorref[][1], errorref[][2])
+        @error "error writing arrow data on partition = $(errorref[][3])" exception =
+            (errorref[][1], errorref[][2])
         error("fatal error writing arrow data")
     end
     # close our message-writing channel, no further put!-ing is allowed
@@ -171,7 +242,13 @@ function append(io::IO, source, arrow_schema, compress, largelists, denseunions,
     # now wait for our message-writing task to finish writing
     wait(tsk)
 
-    Base.write(io, Message(UInt8[], nothing, 0, true, false, Meta.Schema), blocks, sch, alignment)
+    Base.write(
+        io,
+        Message(UInt8[], nothing, 0, true, false, Meta.Schema),
+        blocks,
+        sch,
+        alignment,
+    )
 
     return io
 end
@@ -202,8 +279,15 @@ end
 
 function is_equivalent_schema(sch1::Tables.Schema, sch2::Tables.Schema)
     (sch1.names == sch2.names) || (return false)
-    for (t1,t2) in zip(sch1.types, sch2.types)
-        (t1 === t2) || (return false)
+    for (t1, t2) in zip(sch1.types, sch2.types)
+        tt1 = Base.nonmissingtype(t1)
+        tt2 = Base.nonmissingtype(t2)
+        if t1 == t2 ||
+           (tt1 <: AbstractVector && tt2 <: AbstractVector && eltype(tt1) == eltype(tt2))
+            continue
+        else
+            return false
+        end
     end
     true
 end

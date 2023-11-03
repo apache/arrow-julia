@@ -18,24 +18,20 @@
 using Documenter
 using Arrow
 
-
 makedocs(;
     modules=[Arrow],
-    repo="https://github.com/JuliaData/Arrow.jl/blob/{commit}{path}#L{line}",
+    repo="https://github.com/apache/arrow-julia/blob/{commit}{path}#L{line}",
     sitename="Arrow.jl",
     format=Documenter.HTML(;
         prettyurls=get(ENV, "CI", "false") == "true",
-        canonical="https://JuliaData.github.io/Arrow.jl",
+        canonical="https://arrow.juliadata.org/",
         assets=String[],
     ),
-    pages = [
-        "Home" => "index.md",
+    pages=[
+        "Home" => "index.md",
         "User Manual" => "manual.md",
-        "API Reference" => "reference.md"
-    ]
+        "API Reference" => "reference.md",
+    ],
 )
 
-deploydocs(;
-    repo="github.com/JuliaData/Arrow.jl",
-    devbranch = "main"
-)
+deploydocs(; repo="github.com/apache/arrow-julia", devbranch="main", branch="asf-site")

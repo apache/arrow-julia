@@ -27,22 +27,25 @@ The actual values in the table follow `pos` offset and size of the vtable.
 abstract type Table end
 abstract type Struct end
 
-const TableOrStruct = Union{Table, Struct}
+const TableOrStruct = Union{Table,Struct}
 
 bytes(x::TableOrStruct) = getfield(x, :bytes)
 pos(x::TableOrStruct) = getfield(x, :pos)
 
-==(a::T, b::T) where {T <: TableOrStruct} = all(getproperty(a, p) == getproperty(b, p) for p in propertynames(a))
+==(a::T, b::T) where {T<:TableOrStruct} =
+    all(getproperty(a, p) == getproperty(b, p) for p in propertynames(a))
 
-(::Type{T})(b::Builder) where {T <: TableOrStruct} = T(b.bytes[b.head+1:end], get(b, b.head, Int32))
+(::Type{T})(b::Builder) where {T<:TableOrStruct} =
+    T(b.bytes[(b.head + 1):end], get(b, b.head, Int32))
 
-getrootas(::Type{T}, bytes::Vector{UInt8}, offset) where {T <: Table} = init(T, bytes, offset + readbuffer(bytes, offset, UOffsetT))
-init(::Type{T}, bytes::Vector{UInt8}, pos::Integer) where {T <: TableOrStruct} = T(bytes, pos)
+getrootas(::Type{T}, bytes::Vector{UInt8}, offset) where {T<:Table} =
+    init(T, bytes, offset + readbuffer(bytes, offset, UOffsetT))
+init(::Type{T}, bytes::Vector{UInt8}, pos::Integer) where {T<:TableOrStruct} = T(bytes, pos)
 
-const TableOrBuilder = Union{Table, Struct, Builder}
+const TableOrBuilder = Union{Table,Struct,Builder}
 
 Base.get(t::TableOrBuilder, pos, ::Type{T}) where {T} = readbuffer(bytes(t), pos, T)
-Base.get(t::TableOrBuilder, pos, ::Type{T}) where {T <: Enum} = T(get(t, pos, basetype(T)))
+Base.get(t::TableOrBuilder, pos, ::Type{T}) where {T<:Enum} = T(get(t, pos, basetype(T)))
 
 """
 `offset` provides access into the Table's vtable.
@@ -51,15 +54,16 @@ Deprecated fields are ignored by checking against the vtable's length.
 """
 function offset(t::Table, vtableoffset)
     vtable = pos(t) - get(t, pos(t), SOffsetT)
-    return vtableoffset < get(t, vtable, VOffsetT) ? get(t, vtable + vtableoffset, VOffsetT) : VOffsetT(0)
+    return vtableoffset < get(t, vtable, VOffsetT) ?
+           get(t, vtable + vtableoffset, VOffsetT) : VOffsetT(0)
 end
 
 "`indirect` retrieves the relative offset stored at `offset`."
 indirect(t::Table, off) = off + get(t, off, UOffsetT)
 
 getvalue(t, o, ::Type{Nothing}) = nothing
-getvalue(t, o, ::Type{T}) where {T <: Scalar} = get(t, pos(t) + o, T)
-getvalue(t, o, ::Type{T}) where {T <: Enum} = T(get(t, pos(t) + o, enumtype(T)))
+getvalue(t, o, ::Type{T}) where {T<:Scalar} = get(t, pos(t) + o, T)
+getvalue(t, o, ::Type{T}) where {T<:Enum} = T(get(t, pos(t) + o, enumtype(T)))
 
 function Base.String(t::Table, off)
     off += get(t, off, UOffsetT)
@@ -96,7 +100,7 @@ function vector(t::Table, off)
     return x + sizeof(UOffsetT)
 end
 
-struct Array{T, S, TT} <: AbstractVector{T}
+struct Array{T,S,TT} <: AbstractVector{T}
     _tab::TT
     pos::Int64
     data::Vector{S}
@@ -104,17 +108,17 @@ end
 
 function Array{T}(t::Table, off) where {T}
     a = vector(t, off)
-    S = T <: Table ? UOffsetT : T <: Struct ? NTuple{structsizeof(T), UInt8} : T
+    S = T <: Table ? UOffsetT : T <: Struct ? NTuple{structsizeof(T),UInt8} : T
     ptr = convert(Ptr{S}, pointer(bytes(t), a + 1))
     data = unsafe_wrap(Base.Array, ptr, vectorlen(t, off))
-    return Array{T, S, typeof(t)}(t, a, data)
+    return Array{T,S,typeof(t)}(t, a, data)
 end
 
 function structsizeof end
 
 Base.IndexStyle(::Type{<:Array}) = Base.IndexLinear()
 Base.size(x::Array) = size(x.data)
-Base.@propagate_inbounds function Base.getindex(A::Array{T, S}, i::Integer) where {T, S}
+Base.@propagate_inbounds function Base.getindex(A::Array{T,S}, i::Integer) where {T,S}
     if T === S
         return A.data[i]
     elseif T <: Struct
@@ -124,7 +128,7 @@ Base.@propagate_inbounds function Base.getindex(A::Array{T, S}, i::Integer) wher
     end
 end
 
-Base.@propagate_inbounds function Base.setindex!(A::Array{T, S}, v, i::Integer) where {T, S}
+Base.@propagate_inbounds function Base.setindex!(A::Array{T,S}, v, i::Integer) where {T,S}
     if T === S
         return setindex!(A.data, v, i)
     else

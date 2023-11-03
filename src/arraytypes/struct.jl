@@ -19,11 +19,11 @@
 
 An `ArrowVector` where each element is a "struct" of some kind with ordered, named fields, like a `NamedTuple{names, types}` or regular julia `struct`.
 """
-struct Struct{T, S} <: ArrowVector{T}
+struct Struct{T,S} <: ArrowVector{T}
     validity::ValidityBitmap
     data::S # Tuple of ArrowVector
     ℓ::Int
-    metadata::Union{Nothing, Base.ImmutableDict{String,String}}
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
 end
 
 Base.size(s::Struct) = (s.ℓ,)
@@ -38,13 +38,15 @@ istuple(T) = false
     NT = Base.nonmissingtype(T)
     if isnamedtuple(NT) || istuple(NT)
         if NT !== T
-            return s.validity[i] ? NT(ntuple(j->s.data[j][i], fieldcount(S))) : missing
+            return s.validity[i] ? NT(ntuple(j -> s.data[j][i], fieldcount(S))) : missing
         else
-            return NT(ntuple(j->s.data[j][i], fieldcount(S)))
+            return NT(ntuple(j -> s.data[j][i], fieldcount(S)))
         end
     else
         if NT !== T
-            return s.validity[i] ? ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(S))...) : missing
+            return s.validity[i] ?
+                   ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(S))...) :
+                   missing
         else
             return ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(S))...)
         end
@@ -65,16 +67,17 @@ end
 #     return v
 # end
 
-struct ToStruct{T, i, A} <: AbstractVector{T}
+struct ToStruct{T,i,A} <: AbstractVector{T}
     data::A # eltype is NamedTuple or some struct
 end
 
-ToStruct(x::A, j::Integer) where {A} = ToStruct{fieldtype(Base.nonmissingtype(eltype(A)), j), j, A}(x)
+ToStruct(x::A, j::Integer) where {A} =
+    ToStruct{fieldtype(Base.nonmissingtype(eltype(A)), j),j,A}(x)
 
 Base.IndexStyle(::Type{<:ToStruct}) = Base.IndexLinear()
 Base.size(x::ToStruct) = (length(x.data),)
 
-Base.@propagate_inbounds function Base.getindex(A::ToStruct{T, j}, i::Integer) where {T, j}
+Base.@propagate_inbounds function Base.getindex(A::ToStruct{T,j}, i::Integer) where {T,j}
     @boundscheck checkbounds(A, i)
     @inbounds x = A.data[i]
     return x === missing ? ArrowTypes.default(T) : getfield(x, j)
@@ -82,19 +85,30 @@ end
 
 arrowvector(::StructKind, x::Struct, i, nl, fi, de, ded, meta; kw...) = x
 
-namedtupletype(::Type{NamedTuple{names, types}}, data) where {names, types} = NamedTuple{names, Tuple{(eltype(x) for x in data)...}}
-namedtupletype(::Type{T}, data) where {T} = NamedTuple{fieldnames(T), Tuple{(eltype(x) for x in data)...}}
-namedtupletype(::Type{T}, data) where {T <: Tuple} = NamedTuple{map(Symbol, fieldnames(T)), Tuple{(eltype(x) for x in data)...}}
+namedtupletype(::Type{NamedTuple{names,types}}, data) where {names,types} =
+    NamedTuple{names,Tuple{(eltype(x) for x in data)...}}
+namedtupletype(::Type{T}, data) where {T} =
+    NamedTuple{fieldnames(T),Tuple{(eltype(x) for x in data)...}}
+namedtupletype(::Type{T}, data) where {T<:Tuple} =
+    NamedTuple{map(Symbol, fieldnames(T)),Tuple{(eltype(x) for x in data)...}}
 
 function arrowvector(::StructKind, x, i, nl, fi, de, ded, meta; kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     T = Base.nonmissingtype(eltype(x))
-    data = Tuple(arrowvector(ToStruct(x, j), i, nl + 1, j, de, ded, nothing; kw...) for j = 1:fieldcount(T))
-    return Struct{withmissing(eltype(x), namedtupletype(T, data)), typeof(data)}(validity, data, len, meta)
+    data = Tuple(
+        arrowvector(ToStruct(x, j), i, nl + 1, j, de, ded, nothing; kw...) for
+        j = 1:fieldcount(T)
+    )
+    return Struct{withmissing(eltype(x), namedtupletype(T, data)),typeof(data)}(
+        validity,
+        data,
+        len,
+        meta,
+    )
 end
 
-function compress(Z::Meta.CompressionType, comp, x::A) where {A <: Struct}
+function compress(Z::Meta.CompressionType.T, comp, x::A) where {A<:Struct}
     len = length(x)
     nc = nullcount(x)
     validity = compress(Z, comp, x.validity)
@@ -103,10 +117,16 @@ function compress(Z::Meta.CompressionType, comp, x::A) where {A <: Struct}
     for y in x.data
         push!(children, compress(Z, comp, y))
     end
-    return Compressed{Z, A}(x, buffers, len, nc, children)
+    return Compressed{Z,A}(x, buffers, len, nc, children)
 end
 
-function makenodesbuffers!(col::Struct{T}, fieldnodes, fieldbuffers, bufferoffset, alignment) where {T}
+function makenodesbuffers!(
+    col::Struct{T},
+    fieldnodes,
+    fieldbuffers,
+    bufferoffset,
+    alignment,
+) where {T}
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
@@ -117,7 +137,8 @@ function makenodesbuffers!(col::Struct{T}, fieldnodes, fieldbuffers, bufferoffse
     @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += blen
     for child in col.data
-        bufferoffset = makenodesbuffers!(child, fieldnodes, fieldbuffers, bufferoffset, alignment)
+        bufferoffset =
+            makenodesbuffers!(child, fieldnodes, fieldbuffers, bufferoffset, alignment)
     end
     return bufferoffset
 end

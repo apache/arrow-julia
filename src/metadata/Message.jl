@@ -39,9 +39,9 @@ function createFieldNode(b::FlatBuffers.Builder, length::Int64, nullCount::Int64
     return FlatBuffers.offset(b)
 end
 
-FlatBuffers.@scopedenum CompressionType::Int8 LZ4_FRAME ZSTD
+@enumx CompressionType::Int8 LZ4_FRAME ZSTD
 
-FlatBuffers.@scopedenum BodyCompressionMethod::Int8 BUFFER
+@enumx BodyCompressionMethod::Int8 BUFFER
 
 struct BodyCompression <: FlatBuffers.Table
     bytes::Vector{UInt8}
@@ -53,19 +53,21 @@ Base.propertynames(x::BodyCompression) = (:codec, :method)
 function Base.getproperty(x::BodyCompression, field::Symbol)
     if field === :codec
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), CompressionType)
-        return CompressionTypes.LZ4_FRAME
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), CompressionType.T)
+        return CompressionType.LZ4_FRAME
     elseif field === :method
         o = FlatBuffers.offset(x, 6)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), BodyCompressionMethod)
-        return BodyCompressionMethods.BUFFER
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), BodyCompressionMethod.T)
+        return BodyCompressionMethod.BUFFER
     end
     return nothing
 end
 
 bodyCompressionStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 2)
-bodyCompressionAddCodec(b::FlatBuffers.Builder, codec::CompressionType) = FlatBuffers.prependslot!(b, 0, codec, 0)
-bodyCompressionAddMethod(b::FlatBuffers.Builder, method::BodyCompressionMethod) = FlatBuffers.prependslot!(b, 1, method, 0)
+bodyCompressionAddCodec(b::FlatBuffers.Builder, codec::CompressionType.T) =
+    FlatBuffers.prependslot!(b, 0, codec, 0)
+bodyCompressionAddMethod(b::FlatBuffers.Builder, method::BodyCompressionMethod.T) =
+    FlatBuffers.prependslot!(b, 1, method, 0)
 bodyCompressionEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
 struct RecordBatch <: FlatBuffers.Table
@@ -100,12 +102,18 @@ function Base.getproperty(x::RecordBatch, field::Symbol)
 end
 
 recordBatchStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 4)
-recordBatchAddLength(b::FlatBuffers.Builder, length::Int64) = FlatBuffers.prependslot!(b, 0, length, 0)
-recordBatchAddNodes(b::FlatBuffers.Builder, nodes::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 1, nodes, 0)
-recordBatchStartNodesVector(b::FlatBuffers.Builder, numelems) = FlatBuffers.startvector!(b, 16, numelems, 8)
-recordBatchAddBuffers(b::FlatBuffers.Builder, buffers::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 2, buffers, 0)
-recordBatchStartBuffersVector(b::FlatBuffers.Builder, numelems) = FlatBuffers.startvector!(b, 16, numelems, 8)
-recordBatchAddCompression(b::FlatBuffers.Builder, c::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 3, c, 0)
+recordBatchAddLength(b::FlatBuffers.Builder, length::Int64) =
+    FlatBuffers.prependslot!(b, 0, length, 0)
+recordBatchAddNodes(b::FlatBuffers.Builder, nodes::FlatBuffers.UOffsetT) =
+    FlatBuffers.prependoffsetslot!(b, 1, nodes, 0)
+recordBatchStartNodesVector(b::FlatBuffers.Builder, numelems) =
+    FlatBuffers.startvector!(b, 16, numelems, 8)
+recordBatchAddBuffers(b::FlatBuffers.Builder, buffers::FlatBuffers.UOffsetT) =
+    FlatBuffers.prependoffsetslot!(b, 2, buffers, 0)
+recordBatchStartBuffersVector(b::FlatBuffers.Builder, numelems) =
+    FlatBuffers.startvector!(b, 16, numelems, 8)
+recordBatchAddCompression(b::FlatBuffers.Builder, c::FlatBuffers.UOffsetT) =
+    FlatBuffers.prependoffsetslot!(b, 3, c, 0)
 recordBatchEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
 struct DictionaryBatch <: FlatBuffers.Table
@@ -135,9 +143,12 @@ function Base.getproperty(x::DictionaryBatch, field::Symbol)
 end
 
 dictionaryBatchStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 3)
-dictionaryBatchAddId(b::FlatBuffers.Builder, id::Int64) = FlatBuffers.prependslot!(b, 0, id, 0)
-dictionaryBatchAddData(b::FlatBuffers.Builder, data::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 1, data, 0)
-dictionaryBatchAddIsDelta(b::FlatBuffers.Builder, isdelta::Base.Bool) = FlatBuffers.prependslot!(b, 2, isdelta, false)
+dictionaryBatchAddId(b::FlatBuffers.Builder, id::Int64) =
+    FlatBuffers.prependslot!(b, 0, id, 0)
+dictionaryBatchAddData(b::FlatBuffers.Builder, data::FlatBuffers.UOffsetT) =
+    FlatBuffers.prependoffsetslot!(b, 1, data, 0)
+dictionaryBatchAddIsDelta(b::FlatBuffers.Builder, isdelta::Base.Bool) =
+    FlatBuffers.prependslot!(b, 2, isdelta, false)
 dictionaryBatchEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
 function MessageHeader(b::UInt8)
@@ -168,7 +179,7 @@ Base.propertynames(x::Message) = (:version, :header, :bodyLength, :custom_metada
 function Base.getproperty(x::Message, field::Symbol)
     if field === :version
         o = FlatBuffers.offset(x, 4)
-        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), MetadataVersion)
+        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), MetadataVersion.T)
     elseif field === :header
         o = FlatBuffers.offset(x, 6)
         if o != 0
@@ -193,10 +204,16 @@ function Base.getproperty(x::Message, field::Symbol)
 end
 
 messageStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 5)
-messageAddVersion(b::FlatBuffers.Builder, version::MetadataVersion) = FlatBuffers.prependslot!(b, 0, version, 0)
-messageAddHeaderType(b::FlatBuffers.Builder, ::Core.Type{T}) where {T} = FlatBuffers.prependslot!(b, 1, MessageHeader(T), 0)
-messageAddHeader(b::FlatBuffers.Builder, header::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 2, header, 0)
-messageAddBodyLength(b::FlatBuffers.Builder, bodyLength::Int64) = FlatBuffers.prependslot!(b, 3, bodyLength, 0)
-messageAddCustomMetadata(b::FlatBuffers.Builder, meta::FlatBuffers.UOffsetT) = FlatBuffers.prependoffsetslot!(b, 4, meta, 0)
-messageStartCustomMetadataVector(b::FlatBuffers.Builder, numelems) = FlatBuffers.startvector!(b, 4, numelems, 4)
+messageAddVersion(b::FlatBuffers.Builder, version::MetadataVersion.T) =
+    FlatBuffers.prependslot!(b, 0, version, 0)
+messageAddHeaderType(b::FlatBuffers.Builder, ::Core.Type{T}) where {T} =
+    FlatBuffers.prependslot!(b, 1, MessageHeader(T), 0)
+messageAddHeader(b::FlatBuffers.Builder, header::FlatBuffers.UOffsetT) =
+    FlatBuffers.prependoffsetslot!(b, 2, header, 0)
+messageAddBodyLength(b::FlatBuffers.Builder, bodyLength::Int64) =
+    FlatBuffers.prependslot!(b, 3, bodyLength, 0)
+messageAddCustomMetadata(b::FlatBuffers.Builder, meta::FlatBuffers.UOffsetT) =
+    FlatBuffers.prependoffsetslot!(b, 4, meta, 0)
+messageStartCustomMetadataVector(b::FlatBuffers.Builder, numelems) =
+    FlatBuffers.startvector!(b, 4, numelems, 4)
 messageEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)

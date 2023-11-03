@@ -19,12 +19,12 @@
 
 An `ArrowVector` where each element is a "map" of some kind, like a `Dict`.
 """
-struct Map{T, O, A} <: ArrowVector{T}
+struct Map{T,O,A} <: ArrowVector{T}
     validity::ValidityBitmap
     offsets::Offsets{O}
     data::A
     ℓ::Int
-    metadata::Union{Nothing, Base.ImmutableDict{String,String}}
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
 end
 
 Base.size(l::Map) = (l.ℓ,)
@@ -33,7 +33,11 @@ Base.size(l::Map) = (l.ℓ,)
     @boundscheck checkbounds(l, i)
     @inbounds lo, hi = l.offsets[i]
     if Base.nonmissingtype(T) !== T
-        return l.validity[i] ? ArrowTypes.fromarrow(T, Dict(x.key => x.value for x in view(l.data, lo:hi))) : missing
+        return l.validity[i] ?
+               ArrowTypes.fromarrow(
+            T,
+            Dict(x.key => x.value for x in view(l.data, lo:hi)),
+        ) : missing
     else
         return ArrowTypes.fromarrow(T, Dict(x.key => x.value for x in view(l.data, lo:hi)))
     end
@@ -42,7 +46,7 @@ end
 keyvalues(KT, ::Missing) = missing
 keyvalues(KT, x::AbstractDict) = [KT(k, v) for (k, v) in pairs(x)]
 
-keyvaluetypes(::Type{NamedTuple{(:key, :value), Tuple{K, V}}}) where {K, V} = (K, V)
+keyvaluetypes(::Type{NamedTuple{(:key, :value),Tuple{K,V}}}) where {K,V} = (K, V)
 
 arrowvector(::MapKind, x::Map, i, nl, fi, de, ded, meta; kw...) = x
 
@@ -52,19 +56,33 @@ function arrowvector(::MapKind, x, i, nl, fi, de, ded, meta; largelists::Bool=fa
     ET = eltype(x)
     DT = Base.nonmissingtype(ET)
     KDT, VDT = keytype(DT), valtype(DT)
-    ArrowTypes.concrete_or_concreteunion(KDT) || throw(ArgumentError("`keytype(d)` must be concrete to serialize map-like `d`, but `keytype(d) == $KDT`"))
-    ArrowTypes.concrete_or_concreteunion(VDT) || throw(ArgumentError("`valtype(d)` must be concrete to serialize map-like `d`, but `valtype(d) == $VDT`"))
+    ArrowTypes.concrete_or_concreteunion(KDT) || throw(
+        ArgumentError(
+            "`keytype(d)` must be concrete to serialize map-like `d`, but `keytype(d) == $KDT`",
+        ),
+    )
+    ArrowTypes.concrete_or_concreteunion(VDT) || throw(
+        ArgumentError(
+            "`valtype(d)` must be concrete to serialize map-like `d`, but `valtype(d) == $VDT`",
+        ),
+    )
     KT = KeyValue{KDT,VDT}
     VT = Vector{KT}
-    T = DT !== ET ? Union{Missing, VT} : VT
+    T = DT !== ET ? Union{Missing,VT} : VT
     flat = ToList(T[keyvalues(KT, y) for y in x]; largelists=largelists)
     offsets = Offsets(UInt8[], flat.inds)
-    data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; lareglists=largelists, kw...)
+    data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; largelists=largelists, kw...)
     K, V = keyvaluetypes(eltype(data))
-    return Map{withmissing(ET, Dict{K, V}), eltype(flat.inds), typeof(data)}(validity, offsets, data, len, meta)
+    return Map{withmissing(ET, Dict{K,V}),eltype(flat.inds),typeof(data)}(
+        validity,
+        offsets,
+        data,
+        len,
+        meta,
+    )
 end
 
-function compress(Z::Meta.CompressionType, comp, x::A) where {A <: Map}
+function compress(Z::Meta.CompressionType.T, comp, x::A) where {A<:Map}
     len = length(x)
     nc = nullcount(x)
     validity = compress(Z, comp, x.validity)
@@ -72,10 +90,16 @@ function compress(Z::Meta.CompressionType, comp, x::A) where {A <: Map}
     buffers = [validity, offsets]
     children = Compressed[]
     push!(children, compress(Z, comp, x.data))
-    return Compressed{Z, A}(x, buffers, len, nc, children)
+    return Compressed{Z,A}(x, buffers, len, nc, children)
 end
 
-function makenodesbuffers!(col::Union{Map{T, O, A}, List{T, O, A}}, fieldnodes, fieldbuffers, bufferoffset, alignment) where {T, O, A}
+function makenodesbuffers!(
+    col::Union{Map{T,O,A},List{T,O,A}},
+    fieldnodes,
+    fieldbuffers,
+    bufferoffset,
+    alignment,
+) where {T,O,A}
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
@@ -90,18 +114,19 @@ function makenodesbuffers!(col::Union{Map{T, O, A}, List{T, O, A}}, fieldnodes, 
     push!(fieldbuffers, Buffer(bufferoffset, blen))
     @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
     bufferoffset += padding(blen, alignment)
-    if eltype(A) == UInt8
+    if liststringtype(col)
         blen = length(col.data)
         push!(fieldbuffers, Buffer(bufferoffset, blen))
         @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
         bufferoffset += padding(blen, alignment)
     else
-        bufferoffset = makenodesbuffers!(col.data, fieldnodes, fieldbuffers, bufferoffset, alignment)
+        bufferoffset =
+            makenodesbuffers!(col.data, fieldnodes, fieldbuffers, bufferoffset, alignment)
     end
     return bufferoffset
 end
 
-function writebuffer(io, col::Union{Map{T, O, A}, List{T, O, A}}, alignment) where {T, O, A}
+function writebuffer(io, col::Union{Map{T,O,A},List{T,O,A}}, alignment) where {T,O,A}
     @debugv 1 "writebuffer: col = $(typeof(col))"
     @debugv 2 col
     writebitmap(io, col, alignment)
@@ -110,7 +135,7 @@ function writebuffer(io, col::Union{Map{T, O, A}, List{T, O, A}}, alignment) whe
     @debugv 1 "writing array: col = $(typeof(col.offsets.offsets)), n = $n, padded = $(padding(n, alignment))"
     writezeros(io, paddinglength(n, alignment))
     # write values array
-    if eltype(A) == UInt8
+    if liststringtype(col)
         n = writearray(io, UInt8, col.data)
         @debugv 1 "writing array: col = $(typeof(col.data)), n = $n, padded = $(padding(n, alignment))"
         writezeros(io, paddinglength(n, alignment))

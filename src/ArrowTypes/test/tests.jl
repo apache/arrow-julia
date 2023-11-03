@@ -23,194 +23,204 @@ struct Person
 end
 
 @testset "ArrowTypes" begin
+    @test ArrowTypes.ArrowKind(MyInt) == ArrowTypes.PrimitiveKind()
+    @test ArrowTypes.ArrowKind(Person) == ArrowTypes.StructKind()
+    @test ArrowTypes.ArrowKind(Person(0, "bob")) == ArrowTypes.StructKind()
 
-@test ArrowTypes.ArrowKind(MyInt) == ArrowTypes.PrimitiveKind()
-@test ArrowTypes.ArrowKind(Person) == ArrowTypes.StructKind()
-@test ArrowTypes.ArrowKind(Person(0, "bob")) == ArrowTypes.StructKind()
+    @test ArrowTypes.ArrowType(Int) == Int
+    @test ArrowTypes.ArrowType(Union{Int,Missing}) == Union{Int,Missing}
+    @test ArrowTypes.ArrowType(Missing) == Missing
 
-@test ArrowTypes.ArrowType(Int) == Int
-@test ArrowTypes.ArrowType(Union{Int, Missing}) == Union{Int, Missing}
-@test ArrowTypes.ArrowType(Missing) == Missing
+    @test ArrowTypes.toarrow(1) === 1
 
-@test ArrowTypes.toarrow(1) === 1
+    @test ArrowTypes.arrowname(Int) == Symbol()
+    @test !ArrowTypes.hasarrowname(Int)
 
-@test ArrowTypes.arrowname(Int) == Symbol()
-@test !ArrowTypes.hasarrowname(Int)
+    @test ArrowTypes.arrowmetadata(Int) == ""
+    @test ArrowTypes.arrowmetadata(Union{Nothing,Int}) == ""
+    @test ArrowTypes.arrowmetadata(Union{Missing,Int}) == ""
 
-@test ArrowTypes.arrowmetadata(Int) == ""
+    @test ArrowTypes.JuliaType(1) === nothing
+    @test ArrowTypes.JuliaType(1, Int) === nothing
+    @test ArrowTypes.JuliaType(1, Int, nothing) === nothing
 
-@test ArrowTypes.JuliaType(1) === nothing
-@test ArrowTypes.JuliaType(1, Int) === nothing
-@test ArrowTypes.JuliaType(1, Int, nothing) === nothing
+    @test ArrowTypes.fromarrow(Int, 1) === 1
+    @test ArrowTypes.fromarrow(Person, 1, "bob") == Person(1, "bob")
+    @test ArrowTypes.fromarrow(Union{Int,Missing}, missing) === missing
+    @test ArrowTypes.fromarrow(Union{Int,Missing}, 1) === 1
+    @test ArrowTypes.fromarrow(Union{Float64,Missing}, 1) === 1.0
 
-@test ArrowTypes.fromarrow(Int, 1) === 1
-@test ArrowTypes.fromarrow(Person, 1, "bob") == Person(1, "bob")
-@test ArrowTypes.fromarrow(Union{Int, Missing}, missing) === missing
-@test ArrowTypes.fromarrow(Union{Int, Missing}, 1) === 1
-@test ArrowTypes.fromarrow(Union{Float64, Missing}, 1) === 1.0
+    @test ArrowTypes.ArrowKind(Missing) == ArrowTypes.NullKind()
+    @test ArrowTypes.ArrowKind(Nothing) == ArrowTypes.NullKind()
+    @test ArrowTypes.ArrowType(Nothing) == Missing
+    @test ArrowTypes.toarrow(nothing) === missing
+    @test ArrowTypes.arrowname(Nothing) == ArrowTypes.NOTHING
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.NOTHING)) == Nothing
+    @test ArrowTypes.fromarrow(Nothing, missing) === nothing
 
-@test ArrowTypes.ArrowKind(Missing) == ArrowTypes.NullKind()
-@test ArrowTypes.ArrowKind(Nothing) == ArrowTypes.NullKind()
-@test ArrowTypes.ArrowType(Nothing) == Missing
-@test ArrowTypes.toarrow(nothing) === missing
-@test ArrowTypes.arrowname(Nothing) == ArrowTypes.NOTHING
-@test ArrowTypes.JuliaType(Val(ArrowTypes.NOTHING)) == Nothing
-@test ArrowTypes.fromarrow(Nothing, missing) === nothing
+    @test ArrowTypes.ArrowKind(Int) == ArrowTypes.PrimitiveKind()
+    @test ArrowTypes.ArrowKind(Float64) == ArrowTypes.PrimitiveKind()
 
-@test ArrowTypes.ArrowKind(Int) == ArrowTypes.PrimitiveKind()
-@test ArrowTypes.ArrowKind(Float64) == ArrowTypes.PrimitiveKind()
+    @test ArrowTypes.ArrowType(Char) == UInt32
+    @test ArrowTypes.toarrow('1') == UInt32('1')
+    @test ArrowTypes.arrowname(Char) == ArrowTypes.CHAR
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.CHAR)) == Char
+    @test ArrowTypes.fromarrow(Char, UInt32('1')) == '1'
 
-@test ArrowTypes.ArrowType(Char) == UInt32
-@test ArrowTypes.toarrow('1') == UInt32('1')
-@test ArrowTypes.arrowname(Char) == ArrowTypes.CHAR
-@test ArrowTypes.JuliaType(Val(ArrowTypes.CHAR)) == Char
-@test ArrowTypes.fromarrow(Char, UInt32('1')) == '1'
+    @test ArrowTypes.ArrowKind(Bool) == ArrowTypes.BoolKind()
 
-@test ArrowTypes.ArrowKind(Bool) == ArrowTypes.BoolKind()
+    @test ArrowTypes.ListKind() == ArrowTypes.ListKind{false}()
+    @test !ArrowTypes.isstringtype(ArrowTypes.ListKind())
+    @test !ArrowTypes.isstringtype(typeof(ArrowTypes.ListKind()))
+    @test ArrowTypes.ArrowKind(String) == ArrowTypes.ListKind{true}()
+    @test ArrowTypes.ArrowKind(Base.CodeUnits) == ArrowTypes.ListKind{true}()
 
-@test ArrowTypes.ListKind() == ArrowTypes.ListKind{false}()
-@test !ArrowTypes.isstringtype(ArrowTypes.ListKind())
-@test !ArrowTypes.isstringtype(typeof(ArrowTypes.ListKind()))
-@test ArrowTypes.ArrowKind(String) == ArrowTypes.ListKind{true}()
+    hey = collect(b"hey")
+    @test ArrowTypes.fromarrow(String, pointer(hey), 3) == "hey"
+    @test ArrowTypes.fromarrow(Base.CodeUnits, pointer(hey), 3) == b"hey"
+    @test ArrowTypes.fromarrow(Union{Base.CodeUnits,Missing}, pointer(hey), 3) == b"hey"
 
-hey = collect(b"hey")
-@test ArrowTypes.fromarrow(String, pointer(hey), 3) == "hey"
+    @test ArrowTypes.ArrowType(Symbol) == String
+    @test ArrowTypes.toarrow(:hey) == "hey"
+    @test ArrowTypes.arrowname(Symbol) == ArrowTypes.SYMBOL
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.SYMBOL)) == Symbol
+    @test ArrowTypes.fromarrow(Symbol, pointer(hey), 3) == :hey
 
-@test ArrowTypes.ArrowType(Symbol) == String
-@test ArrowTypes.toarrow(:hey) == "hey"
-@test ArrowTypes.arrowname(Symbol) == ArrowTypes.SYMBOL
-@test ArrowTypes.JuliaType(Val(ArrowTypes.SYMBOL)) == Symbol
-@test ArrowTypes.fromarrow(Symbol, pointer(hey), 3) == :hey
+    @test ArrowTypes.ArrowKind(Vector{Int}) == ArrowTypes.ListKind()
+    @test ArrowTypes.ArrowKind(Set{Int}) == ArrowTypes.ListKind()
+    @test ArrowTypes.ArrowType(Set{Int}) == Vector{Int}
+    @test typeof(ArrowTypes.toarrow(Set([1, 2, 3]))) <: Vector{Int}
+    @test ArrowTypes.arrowname(Set{Int}) == ArrowTypes.SET
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.SET), Vector{Int}) == Set{Int}
+    @test ArrowTypes.fromarrow(Set{Int}, [1, 2, 3]) == Set([1, 2, 3])
 
-@test ArrowTypes.ArrowKind(Vector{Int}) == ArrowTypes.ListKind()
-@test ArrowTypes.ArrowKind(Set{Int}) == ArrowTypes.ListKind()
-@test ArrowTypes.ArrowType(Set{Int}) == Vector{Int}
-@test typeof(ArrowTypes.toarrow(Set([1,2,3]))) <: Vector{Int}
-@test ArrowTypes.arrowname(Set{Int}) == ArrowTypes.SET
-@test ArrowTypes.JuliaType(Val(ArrowTypes.SET), Vector{Int}) == Set{Int}
-@test ArrowTypes.fromarrow(Set{Int}, [1,2,3]) == Set([1,2,3])
+    K = ArrowTypes.ArrowKind(NTuple{3,UInt8})
+    @test ArrowTypes.gettype(K) == UInt8
+    @test ArrowTypes.getsize(K) == 3
+    @test K == ArrowTypes.FixedSizeListKind{3,UInt8}()
 
-K = ArrowTypes.ArrowKind(NTuple{3, UInt8})
-@test ArrowTypes.gettype(K) == UInt8
-@test ArrowTypes.getsize(K) == 3
-@test K == ArrowTypes.FixedSizeListKind{3, UInt8}()
+    u = UUID(rand(UInt128))
+    ubytes = ArrowTypes._cast(NTuple{16,UInt8}, u.value)
+    @test ArrowTypes.ArrowKind(u) == ArrowTypes.FixedSizeListKind{16,UInt8}()
+    @test ArrowTypes.ArrowType(UUID) == NTuple{16,UInt8}
+    @test ArrowTypes.toarrow(u) == ubytes
+    @test ArrowTypes.arrowname(UUID) == ArrowTypes.UUIDSYMBOL
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.UUIDSYMBOL)) == UUID
+    @test ArrowTypes.fromarrow(UUID, ubytes) == u
 
-u = UUID(rand(UInt128))
-ubytes = ArrowTypes._cast(NTuple{16, UInt8}, u.value)
-@test ArrowTypes.ArrowKind(u) == ArrowTypes.FixedSizeListKind{16, UInt8}()
-@test ArrowTypes.ArrowType(UUID) == NTuple{16, UInt8}
-@test ArrowTypes.toarrow(u) == ubytes
-@test ArrowTypes.arrowname(UUID) == ArrowTypes.UUIDSYMBOL
-@test ArrowTypes.JuliaType(Val(ArrowTypes.UUIDSYMBOL)) == UUID
-@test ArrowTypes.fromarrow(UUID, ubytes) == u
+    ip4 = IPv4(rand(UInt32))
+    @test ArrowTypes.ArrowKind(ip4) == PrimitiveKind()
+    @test ArrowTypes.ArrowType(IPv4) == UInt32
+    @test ArrowTypes.toarrow(ip4) == ip4.host
+    @test ArrowTypes.arrowname(IPv4) == ArrowTypes.IPV4_SYMBOL
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.IPV4_SYMBOL)) == IPv4
+    @test ArrowTypes.fromarrow(IPv4, ip4.host) == ip4
 
-ip4 = IPv4(rand(UInt32))
-@test ArrowTypes.ArrowKind(ip4) == PrimitiveKind()
-@test ArrowTypes.ArrowType(IPv4) == UInt32
-@test ArrowTypes.toarrow(ip4) == ip4.host
-@test ArrowTypes.arrowname(IPv4) == ArrowTypes.IPV4_SYMBOL
-@test ArrowTypes.JuliaType(Val(ArrowTypes.IPV4_SYMBOL)) == IPv4
-@test ArrowTypes.fromarrow(IPv4, ip4.host) == ip4
+    ip6 = IPv6(rand(UInt128))
+    ip6_ubytes = ArrowTypes._cast(NTuple{16,UInt8}, ip6.host)
+    @test ArrowTypes.ArrowKind(ip6) == ArrowTypes.FixedSizeListKind{16,UInt8}()
+    @test ArrowTypes.ArrowType(IPv6) == NTuple{16,UInt8}
+    @test ArrowTypes.toarrow(ip6) == ip6_ubytes
+    @test ArrowTypes.arrowname(IPv6) == ArrowTypes.IPV6_SYMBOL
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.IPV6_SYMBOL)) == IPv6
+    @test ArrowTypes.fromarrow(IPv6, ip6_ubytes) == ip6
 
-ip6 = IPv6(rand(UInt128))
-ip6_ubytes = ArrowTypes._cast(NTuple{16, UInt8}, ip6.host)
-@test ArrowTypes.ArrowKind(ip6) == ArrowTypes.FixedSizeListKind{16, UInt8}()
-@test ArrowTypes.ArrowType(IPv6) == NTuple{16, UInt8}
-@test ArrowTypes.toarrow(ip6) == ip6_ubytes
-@test ArrowTypes.arrowname(IPv6) == ArrowTypes.IPV6_SYMBOL
-@test ArrowTypes.JuliaType(Val(ArrowTypes.IPV6_SYMBOL)) == IPv6
-@test ArrowTypes.fromarrow(IPv6, ip6_ubytes) == ip6
+    nt = (id=1, name="bob")
+    @test ArrowTypes.ArrowKind(NamedTuple) == ArrowTypes.StructKind()
+    @test ArrowTypes.fromarrow(typeof(nt), nt) === nt
+    @test ArrowTypes.fromarrow(Person, nt) == Person(1, "bob")
+    @test ArrowTypes.ArrowKind(Tuple) == ArrowTypes.StructKind()
+    @test ArrowTypes.ArrowKind(Tuple{}) == ArrowTypes.StructKind()
+    @test ArrowTypes.arrowname(Tuple{Int,String}) == ArrowTypes.TUPLE
+    @test ArrowTypes.arrowname(Tuple{}) == ArrowTypes.TUPLE
+    @test ArrowTypes.JuliaType(
+        Val(ArrowTypes.TUPLE),
+        NamedTuple{(Symbol("1"), Symbol("2")),Tuple{Int,String}},
+    ) == Tuple{Int,String}
+    @test ArrowTypes.fromarrow(Tuple{Int,String}, nt) == (1, "bob")
+    @test ArrowTypes.fromarrow(Union{Missing,typeof(nt)}, nt) == nt
+    # #461
+    @test ArrowTypes.default(Tuple{}) == ()
+    @test ArrowTypes.default(Tuple{Vararg{Int}}) == ()
+    @test ArrowTypes.default(Tuple{String,Vararg{Int}}) == ("",)
 
-nt = (id=1, name="bob")
-@test ArrowTypes.ArrowKind(NamedTuple) == ArrowTypes.StructKind()
-@test ArrowTypes.fromarrow(typeof(nt), nt) === nt
-@test ArrowTypes.fromarrow(Person, nt) == Person(1, "bob")
-@test ArrowTypes.ArrowKind(Tuple) == ArrowTypes.StructKind()
-@test ArrowTypes.ArrowKind(Tuple{}) == ArrowTypes.StructKind()
-@test ArrowTypes.arrowname(Tuple{Int, String}) == ArrowTypes.TUPLE
-@test ArrowTypes.arrowname(Tuple{}) == ArrowTypes.TUPLE
-@test ArrowTypes.JuliaType(Val(ArrowTypes.TUPLE), NamedTuple{(Symbol("1"), Symbol("2")), Tuple{Int, String}}) == Tuple{Int, String}
-@test ArrowTypes.fromarrow(Tuple{Int, String}, nt) == (1, "bob")
-@test ArrowTypes.fromarrow(Union{Missing, typeof(nt)}, nt) == nt
+    v = v"1"
+    v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
+    @test ArrowTypes.ArrowKind(VersionNumber) == ArrowTypes.StructKind()
+    @test ArrowTypes.arrowname(VersionNumber) == ArrowTypes.VERSION_NUMBER
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.VERSION_NUMBER)) == VersionNumber
+    @test ArrowTypes.fromarrow(typeof(v), v_nt) == v
+    @test ArrowTypes.default(VersionNumber) == v"0"
 
-v = v"1"
-v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
-@test ArrowTypes.ArrowKind(VersionNumber) == ArrowTypes.StructKind()
-@test ArrowTypes.arrowname(VersionNumber) == ArrowTypes.VERSION_NUMBER
-@test ArrowTypes.JuliaType(Val(ArrowTypes.VERSION_NUMBER)) == VersionNumber
-@test ArrowTypes.fromarrow(typeof(v), v_nt) == v
-@test ArrowTypes.default(VersionNumber) == v"0"
+    @test ArrowTypes.ArrowKind(Dict{String,Int}) == ArrowTypes.MapKind()
+    @test ArrowTypes.ArrowKind(Union{String,Int}) == ArrowTypes.UnionKind()
 
-@test ArrowTypes.ArrowKind(Dict{String, Int}) == ArrowTypes.MapKind()
-@test ArrowTypes.ArrowKind(Union{String, Int}) == ArrowTypes.UnionKind()
+    @test ArrowTypes.default(Int) == Int(0)
+    @test ArrowTypes.default(Symbol) == Symbol()
+    @test ArrowTypes.default(Char) == '\0'
+    @test ArrowTypes.default(String) == ""
+    @test ArrowTypes.default(Missing) === missing
+    @test ArrowTypes.default(Nothing) === nothing
+    @test ArrowTypes.default(Union{Int,Missing}) == Int(0)
+    @test ArrowTypes.default(Union{Int,Nothing}) == Int(0)
+    @test ArrowTypes.default(Union{Int,Missing,Nothing}) == Int(0)
 
-@test ArrowTypes.default(Int) == Int(0)
-@test ArrowTypes.default(Symbol) == Symbol()
-@test ArrowTypes.default(Char) == '\0'
-@test ArrowTypes.default(String) == ""
-@test ArrowTypes.default(Missing) === missing
-@test ArrowTypes.default(Nothing) === nothing
-@test ArrowTypes.default(Union{Int, Missing}) == Int(0)
-@test ArrowTypes.default(Union{Int, Nothing}) == Int(0)
-@test ArrowTypes.default(Union{Int, Missing, Nothing}) == Int(0)
+    @test ArrowTypes.promoteunion(Int, Float64) == Float64
+    @test ArrowTypes.promoteunion(Int, String) == Union{Int,String}
 
-@test ArrowTypes.promoteunion(Int, Float64) == Float64
-@test ArrowTypes.promoteunion(Int, String) == Union{Int, String}
+    @test ArrowTypes.concrete_or_concreteunion(Int)
+    @test !ArrowTypes.concrete_or_concreteunion(Union{Real,String})
+    @test !ArrowTypes.concrete_or_concreteunion(Any)
 
-@test ArrowTypes.concrete_or_concreteunion(Int)
-@test !ArrowTypes.concrete_or_concreteunion(Union{Real, String})
-@test !ArrowTypes.concrete_or_concreteunion(Any)
+    @testset "ToArrow" begin
+        x = ArrowTypes.ToArrow([1, 2, 3])
+        @test x isa Vector{Int}
+        @test x == [1, 2, 3]
 
-@testset "ToArrow" begin
-    x = ArrowTypes.ToArrow([1,2,3])
-    @test x isa Vector{Int}
-    @test x == [1,2,3]
+        x = ArrowTypes.ToArrow([:hey, :ho])
+        @test x isa ArrowTypes.ToArrow{String,Vector{Symbol}}
+        @test eltype(x) == String
+        @test x == ["hey", "ho"]
 
-    x = ArrowTypes.ToArrow([:hey, :ho])
-    @test x isa ArrowTypes.ToArrow{String, Vector{Symbol}}
-    @test eltype(x) == String
-    @test x == ["hey", "ho"]
+        x = ArrowTypes.ToArrow(Any[1, 3.14])
+        @test x isa ArrowTypes.ToArrow{Float64,Vector{Any}}
+        @test eltype(x) == Float64
+        @test x == [1.0, 3.14]
 
-    x = ArrowTypes.ToArrow(Any[1, 3.14])
-    @test x isa ArrowTypes.ToArrow{Float64, Vector{Any}}
-    @test eltype(x) == Float64
-    @test x == [1.0, 3.14]
+        x = ArrowTypes.ToArrow(Any[1, 3.14, "hey"])
+        @test x isa ArrowTypes.ToArrow{Union{Float64,String},Vector{Any}}
+        @test eltype(x) == Union{Float64,String}
+        @test x == [1.0, 3.14, "hey"]
 
-    x = ArrowTypes.ToArrow(Any[1, 3.14, "hey"])
-    @test x isa ArrowTypes.ToArrow{Union{Float64, String}, Vector{Any}}
-    @test eltype(x) == Union{Float64, String}
-    @test x == [1.0, 3.14, "hey"]
+        @testset "respect non-missing concrete type" begin
+            struct DateTimeTZ
+                instant::Int64
+                tz::String
+            end
 
-    @testset "respect non-missing concrete type" begin
-        struct DateTimeTZ
-            instant::Int64
-            tz::String
+            struct Timestamp{TZ}
+                x::Int64
+            end
+
+            ArrowTypes.ArrowType(::Type{DateTimeTZ}) = Timestamp
+            ArrowTypes.toarrow(x::DateTimeTZ) = Timestamp{Symbol(x.tz)}(x.instant)
+            ArrowTypes.default(::Type{DateTimeTZ}) = DateTimeTZ(0, "UTC")
+
+            T = Union{DateTimeTZ,Missing}
+            @test !ArrowTypes.concrete_or_concreteunion(ArrowTypes.ArrowType(T))
+            @test eltype(ArrowTypes.ToArrow(T[missing])) == Union{Timestamp{:UTC},Missing}
+
+            # Works since `ArrowTypes.default(Any) === nothing` and
+            # `ArrowTypes.toarrow(nothing) === missing`. Defining `toarrow(::Nothing) = nothing`
+            # would break this test by returning `Union{Nothing,Missing}`.
+            @test eltype(ArrowTypes.ToArrow(Any[missing])) == Missing
         end
 
-        struct Timestamp{TZ}
-            x::Int64
+        @testset "ignore non-missing abstract type" begin
+            x = ArrowTypes.ToArrow(Union{Missing,Array{Int}}[missing])
+            @test x isa ArrowTypes.ToArrow{Missing,Vector{Union{Missing,Array{Int64}}}}
+            @test eltype(x) == Missing
+            @test isequal(x, [missing])
         end
-
-        ArrowTypes.ArrowType(::Type{DateTimeTZ}) = Timestamp
-        ArrowTypes.toarrow(x::DateTimeTZ) = Timestamp{Symbol(x.tz)}(x.instant)
-        ArrowTypes.default(::Type{DateTimeTZ}) = DateTimeTZ(0, "UTC")
-
-        T = Union{DateTimeTZ,Missing}
-        @test !ArrowTypes.concrete_or_concreteunion(ArrowTypes.ArrowType(T))
-        @test eltype(ArrowTypes.ToArrow(T[missing])) == Union{Timestamp{:UTC}, Missing}
-
-        # Works since `ArrowTypes.default(Any) === nothing` and
-        # `ArrowTypes.toarrow(nothing) === missing`. Defining `toarrow(::Nothing) = nothing`
-        # would break this test by returning `Union{Nothing,Missing}`.
-        @test eltype(ArrowTypes.ToArrow(Any[missing])) == Missing
     end
-
-    @testset "ignore non-missing abstract type" begin
-        x = ArrowTypes.ToArrow(Union{Missing,Array{Int}}[missing])
-        @test x isa ArrowTypes.ToArrow{Missing, Vector{Union{Missing, Array{Int64}}}}
-        @test eltype(x) == Missing
-        @test isequal(x, [missing])
-    end
-end
-
 end

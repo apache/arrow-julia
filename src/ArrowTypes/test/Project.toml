@@ -15,32 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# https://cwiki.apache.org/confluence/display/INFRA/Git+-+.asf.yaml+features
-
-notifications:
-  commits: commits@arrow.apache.org
-  issues_status: issues@arrow.apache.org
-  issues_comment: github@arrow.apache.org
-  pullrequests: github@arrow.apache.org
-
-github:
-  description: "Official Julia implementation of Apache Arrow"
-  homepage: https://arrow.apache.org/
-  labels:
-    - apache-arrow
-    - julia
-  features:
-    issues: true
-  enabled_merge_buttons:
-    merge: false
-    rebase: true
-    squash: true
-  protected_branches:
-    main:
-      required_linear_history: true
-
-# publishes the content of the `asf-site` branch to
-# https://arrow.apache.org/julia/
-publish:
-  whoami: asf-site
-  subdir: julia
+[deps]
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"

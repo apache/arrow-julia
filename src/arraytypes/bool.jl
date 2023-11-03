@@ -25,7 +25,7 @@ struct BoolVector{T} <: ArrowVector{T}
     pos::Int
     validity::ValidityBitmap
     ℓ::Int64
-    metadata::Union{Nothing, Base.ImmutableDict{String, String}}
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
 end
 
 Base.size(p::BoolVector) = (p.ℓ,)
@@ -77,15 +77,21 @@ function arrowvector(::BoolKind, x, i, nl, fi, de, ded, meta; kw...)
     return BoolVector{eltype(x)}(bytes, 1, validity, len, meta)
 end
 
-function compress(Z::Meta.CompressionType, comp, p::P) where {P <: BoolVector}
+function compress(Z::Meta.CompressionType.T, comp, p::P) where {P<:BoolVector}
     len = length(p)
     nc = nullcount(p)
     validity = compress(Z, comp, p.validity)
-    data = compress(Z, comp, view(p.arrow, p.pos:(p.pos + cld(p.ℓ, 8) - 1)))
-    return Compressed{Z, P}(p, [validity, data], len, nc, Compressed[])
+    data = compress(Z, comp, view(p.arrow, (p.pos):(p.pos + cld(p.ℓ, 8) - 1)))
+    return Compressed{Z,P}(p, [validity, data], len, nc, Compressed[])
 end
 
-function makenodesbuffers!(col::BoolVector, fieldnodes, fieldbuffers, bufferoffset, alignment)
+function makenodesbuffers!(
+    col::BoolVector,
+    fieldnodes,
+    fieldbuffers,
+    bufferoffset,
+    alignment,
+)
     len = length(col)
     nc = nullcount(col)
     push!(fieldnodes, FieldNode(len, nc))
@@ -106,6 +112,6 @@ function writebuffer(io, col::BoolVector, alignment)
     @debugv 1 "writebuffer: col = $(typeof(col))"
     @debugv 2 col
     writebitmap(io, col, alignment)
-    n = Base.write(io, view(col.arrow, col.pos:(col.pos + cld(col.ℓ, 8) - 1)))
+    n = Base.write(io, view(col.arrow, (col.pos):(col.pos + cld(col.ℓ, 8) - 1)))
     return n + writezeros(io, paddinglength(n, alignment))
 end
