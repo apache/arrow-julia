@@ -101,7 +101,7 @@ function Stream(
         dictencoded,
         convert,
         compression,
-        filtercolumnns,
+        filtercolumns,
     )
 end
 
