@@ -14,12 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+struct StructElement{T<:NamedTuple}
+    fields::T
+end
+
+ArrowTypes.fromarrow(::Type{T}, x::StructElement) where {T} = fromarrow(T, values(x.fields)...)
+ArrowTypes.fromarrow(::Type{Union{Missing,T}}, x::StructElement) where {T} = fromarrow(T, x) # resolves method ambiguity
+
 """
     Arrow.Struct
 
 An `ArrowVector` where each element is a "struct" of some kind with ordered, named fields, like a `NamedTuple{names, types}` or regular julia `struct`.
 """
-struct Struct{T,S} <: ArrowVector{T}
+struct Struct{T,S,fnames} <: ArrowVector{T}
     validity::ValidityBitmap
     data::S # Tuple of ArrowVector
     ℓ::Int
@@ -33,23 +40,15 @@ isnamedtuple(T) = false
 istuple(::Type{<:Tuple}) = true
 istuple(T) = false
 
-@propagate_inbounds function Base.getindex(s::Struct{T,S}, i::Integer) where {T,S}
+@propagate_inbounds function Base.getindex(s::Struct{T,S,fnames}, i::Integer) where {T,S,fnames}
     @boundscheck checkbounds(s, i)
     NT = Base.nonmissingtype(T)
+    NT !== T && (s.validity[i] || return missing)
+    vals = ntuple(j -> s.data[j][i], fieldcount(S))
     if isnamedtuple(NT) || istuple(NT)
-        if NT !== T
-            return s.validity[i] ? NT(ntuple(j -> s.data[j][i], fieldcount(S))) : missing
-        else
-            return NT(ntuple(j -> s.data[j][i], fieldcount(S)))
-        end
+        return NT(vals)
     else
-        if NT !== T
-            return s.validity[i] ?
-                   ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(S))...) :
-                   missing
-        else
-            return ArrowTypes.fromarrow(NT, (s.data[j][i] for j = 1:fieldcount(S))...)
-        end
+        return ArrowTypes.fromarrow(NT, StructElement(NamedTuple{fnames}(vals)))
     end
 end
 
@@ -100,7 +99,8 @@ function arrowvector(::StructKind, x, i, nl, fi, de, ded, meta; kw...)
         arrowvector(ToStruct(x, j), i, nl + 1, j, de, ded, nothing; kw...) for
         j = 1:fieldcount(T)
     )
-    return Struct{withmissing(eltype(x), namedtupletype(T, data)),typeof(data)}(
+    NT = namedtupletype(T, data)
+    return Struct{withmissing(eltype(x), NT),typeof(data),fieldnames(NT)}(
         validity,
         data,
         len,

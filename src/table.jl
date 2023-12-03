@@ -840,7 +840,8 @@ function build(f::Meta.Field, L::Meta.Struct, batch, rb, de, nodeidx, bufferidx,
     data = Tuple(vecs)
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
-    return Struct{T,typeof(data)}(validity, data, len, meta), nodeidx, bufferidx
+    fnames = ntuple(i -> Symbol(f.children[i].name), length(f.children))
+    return Struct{T,typeof(data),fnames}(validity, data, len, meta), nodeidx, bufferidx
 end
 
 function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, convert)
