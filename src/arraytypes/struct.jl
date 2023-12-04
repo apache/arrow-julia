@@ -35,7 +35,11 @@ istuple(T) = false
 
 if isdefined(ArrowTypes, :StructElement)
     # https://github.com/apache/arrow-julia/pull/493
-    @inline function _struct_access_fromarrow(::Type{Val{fnames}}, T::Type, vals) where {fnames}
+    @inline function _struct_access_fromarrow(
+        ::Type{Val{fnames}},
+        T::Type,
+        vals,
+    ) where {fnames}
         return ArrowTypes.fromarrow(T, ArrowTypes.StructElement(NamedTuple{fnames}(vals)))
     end
 else
