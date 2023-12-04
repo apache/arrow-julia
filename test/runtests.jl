@@ -1027,8 +1027,9 @@ end
                 end
                 ArrowTypes.arrowname(::Type{Foo493}) = Symbol("JuliaLang.Foo493")
                 ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.Foo493")}, T) = Foo493
-                function ArrowTypes.fromarrow(::Type{Foo493}, f::ArrowTypes.StructElement)
-                    return Foo493(f.fields.x + 1, f.fields.y + 1)
+                function ArrowTypes.fromarrowstruct(::Type{Foo493}, ::Val{fnames}, x...) where {fnames}
+                    nt = NamedTuple{fnames}(x)
+                    return Foo493(nt.x + 1, nt.y + 1)
                 end
                 t = (; f=[Foo493(1, 2), Foo493(3, 4)])
                 buf = Arrow.tobuffer(t)

@@ -176,8 +176,8 @@ A few `ArrowKind`s have/allow slightly more custom overloads for their `fromarro
      `ArrowTypes.fromarrow(::Type{Interval}, first, last) = ...`. Note the default implementation is
      `ArrowTypes.fromarrow(::Type{T}, x...) = T(x...)`, so if your type already accepts all arguments in a constructor
      no additional `fromarrow` method should be necessary (default struct constructors have this behavior).
-     * Alternatively, may overload `fromarrow(::Type{T}, x::ArrowTypes.StructElement)`, where fields are stored in
-     `x.fields::NamedTuple`. Use this approach over the positional approach when you need to implement deserialization
+     * Alternatively, may overload `fromarrowstruct(::Type{T}, ::Val{fnames}, x...)`, where `fnames` is a tuple of the
+     field names corresponding to the values in `x`. This approach is useful when you need to implement deserialization
      in a manner that is agnostic to the field order used by the serializer.
 """
 function fromarrow end
@@ -306,9 +306,7 @@ struct StructKind <: ArrowKind end
 
 ArrowKind(::Type{<:NamedTuple}) = StructKind()
 
-struct StructFieldNames{n} end
-
-@inline fromarrow(T::Type, ::StructFieldNames, x...) = fromarrow(T, x...)
+@inline fromarrowstruct(T::Type, ::Val, x...) = fromarrow(T, x...)
 
 fromarrow(
     ::Type{NamedTuple{names,types}},
