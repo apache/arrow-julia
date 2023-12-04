@@ -306,15 +306,9 @@ struct StructKind <: ArrowKind end
 
 ArrowKind(::Type{<:NamedTuple}) = StructKind()
 
-struct StructElement{T<:NamedTuple}
-    fields::T
-end
+struct StructFieldNames{n} end
 
-function fromarrow(::Type{T}, x::StructElement) where {T}
-    return fromarrow(T, values(x.fields)...)
-end
-
-fromarrow(::Type{Union{Missing,T}}, x::StructElement) where {T} = fromarrow(T, x) # resolves method ambiguity
+@inline fromarrow(T::Type, ::StructFieldNames, x...) = fromarrow(T, x...)
 
 fromarrow(
     ::Type{NamedTuple{names,types}},

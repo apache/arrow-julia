@@ -33,14 +33,14 @@ isnamedtuple(T) = false
 istuple(::Type{<:Tuple}) = true
 istuple(T) = false
 
-if isdefined(ArrowTypes, :StructElement)
+if isdefined(ArrowTypes, :StructFieldNames)
     # https://github.com/apache/arrow-julia/pull/493
     @inline function _struct_access_fromarrow(
         ::Type{Val{fnames}},
         T::Type,
-        vals,
+        vals...,
     ) where {fnames}
-        return ArrowTypes.fromarrow(T, ArrowTypes.StructElement(NamedTuple{fnames}(vals)))
+        return ArrowTypes.fromarrow(T, ArrowTypes.StructFieldNames{fnames}(), vals...)
     end
 else
     @inline function _struct_access_fromarrow(::Type, T::Type, vals)
@@ -59,7 +59,8 @@ end
     if isnamedtuple(NT) || istuple(NT)
         return NT(vals)
     else
-        return _struct_access_fromarrow(Val{fnames}, NT, vals)
+        return ArrowTypes.fromarrow(T, vals...)
+        # return _struct_access_fromarrow(Val{fnames}, NT, (s.data[j][i] for j = 1:fieldcount(S))...)
     end
 end
 
