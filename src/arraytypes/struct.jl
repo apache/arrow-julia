@@ -18,7 +18,10 @@ struct StructElement{T<:NamedTuple}
     fields::T
 end
 
-ArrowTypes.fromarrow(::Type{T}, x::StructElement) where {T} = fromarrow(T, values(x.fields)...)
+function ArrowTypes.fromarrow(::Type{T}, x::StructElement) where {T}
+    return fromarrow(T, values(x.fields)...)
+end
+
 ArrowTypes.fromarrow(::Type{Union{Missing,T}}, x::StructElement) where {T} = fromarrow(T, x) # resolves method ambiguity
 
 """
@@ -40,7 +43,10 @@ isnamedtuple(T) = false
 istuple(::Type{<:Tuple}) = true
 istuple(T) = false
 
-@propagate_inbounds function Base.getindex(s::Struct{T,S,fnames}, i::Integer) where {T,S,fnames}
+@propagate_inbounds function Base.getindex(
+    s::Struct{T,S,fnames},
+    i::Integer,
+) where {T,S,fnames}
     @boundscheck checkbounds(s, i)
     NT = Base.nonmissingtype(T)
     NT !== T && (s.validity[i] || return missing)
