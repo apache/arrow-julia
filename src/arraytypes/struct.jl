@@ -14,16 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-struct StructElement{T<:NamedTuple}
-    fields::T
-end
-
-function ArrowTypes.fromarrow(::Type{T}, x::StructElement) where {T}
-    return fromarrow(T, values(x.fields)...)
-end
-
-ArrowTypes.fromarrow(::Type{Union{Missing,T}}, x::StructElement) where {T} = fromarrow(T, x) # resolves method ambiguity
-
 """
     Arrow.Struct
 
@@ -43,6 +33,17 @@ isnamedtuple(T) = false
 istuple(::Type{<:Tuple}) = true
 istuple(T) = false
 
+if isdefined(ArrowTypes, :StructElement)
+    # https://github.com/apache/arrow-julia/pull/493
+    @inline function _struct_access_fromarrow(::Type{Val{fnames}}, T::Type, vals) where {fnames}
+        return ArrowTypes.fromarrow(T, ArrowTypes.StructElement(NamedTuple{fnames}(vals)))
+    end
+else
+    @inline function _struct_access_fromarrow(::Type, T::Type, vals)
+        return ArrowTypes.fromarrow(T, vals...)
+    end
+end
+
 @propagate_inbounds function Base.getindex(
     s::Struct{T,S,fnames},
     i::Integer,
@@ -54,7 +55,7 @@ istuple(T) = false
     if isnamedtuple(NT) || istuple(NT)
         return NT(vals)
     else
-        return ArrowTypes.fromarrow(NT, StructElement(NamedTuple{fnames}(vals)))
+        return _struct_access_fromarrow(Val{fnames}, NT, vals)
     end
 end
 

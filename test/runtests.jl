@@ -1014,28 +1014,28 @@ end
         # @test isequal(table.v, table2.v)
 
         # end
-
-        @testset "# 493" begin
-            # This test stresses the existence of the mechanism
-            # implemented in https://github.com/apache/arrow-julia/pull/493,
-            # but doesn't stress the actual use case that motivates
-            # that mechanism, simply because it'd be more annoying to
-            # write that test; see the PR for details.
-            struct Foo493
-                x::Int
-                y::Int
+        if isdefined(ArrowTypes, :StructElement)
+            @testset "# 493" begin
+                # This test stresses the existence of the mechanism
+                # implemented in https://github.com/apache/arrow-julia/pull/493,
+                # but doesn't stress the actual use case that motivates
+                # that mechanism, simply because it'd be more annoying to
+                # write that test; see the PR for details.
+                struct Foo493
+                    x::Int
+                    y::Int
+                end
+                ArrowTypes.arrowname(::Type{Foo493}) = Symbol("JuliaLang.Foo493")
+                ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.Foo493")}, T) = Foo493
+                function ArrowTypes.fromarrow(::Type{Foo493}, f::ArrowTypes.StructElement)
+                    return Foo493(f.fields.x + 1, f.fields.y + 1)
+                end
+                t = (; f=[Foo493(1, 2), Foo493(3, 4)])
+                buf = Arrow.tobuffer(t)
+                tbl = Arrow.Table(buf)
+                @test tbl.f[1] === Foo493(2, 3)
+                @test tbl.f[2] === Foo493(4, 5)
             end
-            Arrow.ArrowTypes.arrowname(::Type{Foo493}) = Symbol("JuliaLang.Foo493")
-            Arrow.ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.Foo493")}, T) = Foo493
-            function Arrow.ArrowTypes.fromarrow(::Type{Foo493}, f::Arrow.StructElement)
-                return Foo493(f.fields.x + 1, f.fields.y + 1)
-            end
-            t = (; f=[Foo493(1, 2), Foo493(3, 4)])
-            buf = Arrow.tobuffer(t)
-            tbl = Arrow.Table(buf)
-            @test tbl.f[1] === Foo493(2, 3)
-            @test tbl.f[2] === Foo493(4, 5)
         end
-
     end # @testset "misc"
 end
