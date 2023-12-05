@@ -178,7 +178,7 @@ A few `ArrowKind`s have/allow slightly more custom overloads for their `fromarro
      no additional `fromarrow` method should be necessary (default struct constructors have this behavior).
      * Alternatively, may overload `fromarrowstruct(::Type{T}, ::Val{fnames}, x...)`, where `fnames` is a tuple of the
      field names corresponding to the values in `x`. This approach is useful when you need to implement deserialization
-     in a manner that is agnostic to the field order used by the serializer.
+     in a manner that is agnostic to the field order used by the serializer. When implemented, `fromarrowstruct` takes precedence over `fromarrow` in `StructKind` deserialization.
 """
 function fromarrow end
 fromarrow(::Type{T}, x::T) where {T} = x
