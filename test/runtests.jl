@@ -1027,7 +1027,11 @@ end
                 end
                 ArrowTypes.arrowname(::Type{Foo493}) = Symbol("JuliaLang.Foo493")
                 ArrowTypes.JuliaType(::Val{Symbol("JuliaLang.Foo493")}, T) = Foo493
-                function ArrowTypes.fromarrowstruct(::Type{Foo493}, ::Val{fnames}, x...) where {fnames}
+                function ArrowTypes.fromarrowstruct(
+                    ::Type{Foo493},
+                    ::Val{fnames},
+                    x...,
+                ) where {fnames}
                     nt = NamedTuple{fnames}(x)
                     return Foo493(nt.x + 1, nt.y + 1)
                 end
