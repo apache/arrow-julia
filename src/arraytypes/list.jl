@@ -131,7 +131,7 @@ end
 
 Base.IndexStyle(::Type{<:ToList}) = Base.IndexLinear()
 Base.size(x::ToList{T,S,A,I}) where {T,S,A,I} =
-    (length(x.inds) == 0 ? zero(I) : x.inds[end],)
+    (isempty(x.inds) ? zero(I) : x.inds[end],)
 
 function Base.pointer(A::ToList{UInt8}, i::Integer)
     chunk = searchsortedfirst(A.inds, i)
