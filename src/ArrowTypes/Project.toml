@@ -21,8 +21,14 @@ authors = ["quinnj <quinn.jacobd@gmail.com>"]
 version = "2.3.0"
 
 [deps]
+
+[weakdeps]
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
+[extensions]
+ArrowTypesSocketsExt = "Sockets"
+ArrowTypesUUIDsExt = "UUIDs"
+
 [compat]
-julia = "1.0"
+julia = "1.9"
