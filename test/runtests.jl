@@ -1042,5 +1042,25 @@ end
                 @test tbl.f[2] === Foo493(4, 5)
             end
         end
+
+        @testset "# tbd" begin
+            struct A
+                x::Int
+            end
+            
+            struct B
+                a::A
+            end
+
+            v = [B(A(i)) for i =1:3]
+            io = IOBuffer()
+            Arrow.write(io, v; file=false)
+            seekstart(io)
+            Arrow.append(io, v) # testing the compatility between the schema of the arrow Table, and the "schema" of v (using the fallback mechanism of Tables.jl)
+            seekstart(io)
+            t = Arrow.Table(io)
+            @test Arrow.Tables.rowcount(t) == 6
+        end
+
     end # @testset "misc"
 end
