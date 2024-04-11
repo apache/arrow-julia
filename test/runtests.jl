@@ -1043,16 +1043,16 @@ end
             end
         end
 
-        @testset "# tbd" begin
-            struct A
+        @testset "# 504" begin
+            struct Foo504
                 x::Int
             end
             
-            struct B
-                a::A
+            struct Bar504
+                a::Foo504
             end
 
-            v = [B(A(i)) for i =1:3]
+            v = [Bar504(Foo504(i)) for i =1:3]
             io = IOBuffer()
             Arrow.write(io, v; file=false)
             seekstart(io)
