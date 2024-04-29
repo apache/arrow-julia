@@ -1047,12 +1047,12 @@ end
             struct Foo504
                 x::Int
             end
-            
+
             struct Bar504
                 a::Foo504
             end
 
-            v = [Bar504(Foo504(i)) for i =1:3]
+            v = [Bar504(Foo504(i)) for i = 1:3]
             io = IOBuffer()
             Arrow.write(io, v; file=false)
             seekstart(io)
@@ -1061,6 +1061,5 @@ end
             t = Arrow.Table(io)
             @test Arrow.Tables.rowcount(t) == 6
         end
-
     end # @testset "misc"
 end
