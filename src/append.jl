@@ -282,9 +282,31 @@ function is_equivalent_schema(sch1::Tables.Schema, sch2::Tables.Schema)
     for (t1, t2) in zip(sch1.types, sch2.types)
         tt1 = Base.nonmissingtype(t1)
         tt2 = Base.nonmissingtype(t2)
-        if t1 == t2 ||
-           (tt1 <: AbstractVector && tt2 <: AbstractVector && eltype(tt1) == eltype(tt2))
+        if t1 == t2
             continue
+        elseif tt1 <: AbstractVector && tt2 <: AbstractVector && eltype(tt1) == eltype(tt2)
+            continue
+        elseif isstructtype(tt1) && isstructtype(tt2)
+            is_equivalent_type_by_field(tt1, tt2)
+        else
+            return false
+        end
+    end
+    true
+end
+
+function is_equivalent_type_by_field(T1, T2)
+    n1 = fieldcount(T1)
+    n2 = fieldcount(T2)
+    n1 != n2 && return false
+
+    for i = 1:n1
+        fieldname(T1, i) == fieldname(T2, i) || return false
+
+        if fieldtype(T1, i) == fieldtype(T2, i)
+            continue
+        elseif isstructtype(T1) && isstructtype(T2)
+            is_equivalent_type_by_field(T1, T2) || continue
         else
             return false
         end
