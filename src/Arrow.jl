@@ -51,7 +51,6 @@ using DataAPI,
     PooledArrays,
     CodecLz4,
     CodecZstd,
-    TimeZones,
     BitIntegers,
     ConcurrentUtilities
 
@@ -139,6 +138,12 @@ function __init__()
     resize!(empty!(LZ4_FRAME_DECOMPRESSOR), nt)
     resize!(empty!(ZSTD_DECOMPRESSOR), nt)
     return
+end
+
+if !isdefined(Base, :get_extension)
+    include("../ext/ArrowTimeZonesExt.jl")
+    using .ArrowTimeZonesExt
+    const ToTimestamp = ArrowTimeZonesExt.ToTimestamp
 end
 
 end  # module Arrow
