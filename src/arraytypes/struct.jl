@@ -77,8 +77,11 @@ struct ToStruct{T,i,A} <: AbstractVector{T}
     data::A # eltype is NamedTuple or some struct
 end
 
-ToStruct(x::A, j::Integer) where {A} =
-    ToStruct{fieldtype(Base.nonmissingtype(eltype(A)), j),j,A}(x)
+function ToStruct(x::A, j::Integer, hasmissing::Bool=false) where {A}
+    AT = fieldtype(eltype(A), j)
+    T = hasmissing ? Union{Missing,AT} : AT
+    ToStruct{T,j,A}(x)
+end
 
 Base.IndexStyle(::Type{<:ToStruct}) = Base.IndexLinear()
 Base.size(x::ToStruct) = (length(x.data),)
@@ -86,7 +89,7 @@ Base.size(x::ToStruct) = (length(x.data),)
 Base.@propagate_inbounds function Base.getindex(A::ToStruct{T,j}, i::Integer) where {T,j}
     @boundscheck checkbounds(A, i)
     @inbounds x = A.data[i]
-    return x === missing ? ArrowTypes.default(T) : getfield(x, j)
+    ismissing(x) ? missing : getfield(x, j)
 end
 
 arrowvector(::StructKind, x::Struct, i, nl, fi, de, ded, meta; kw...) = x
@@ -102,9 +105,10 @@ function arrowvector(::StructKind, x, i, nl, fi, de, ded, meta; kw...)
     len = length(x)
     validity = ValidityBitmap(x)
     T = Base.nonmissingtype(eltype(x))
+    hasmissing = Missing <: eltype(x)
     data = Tuple(
-        arrowvector(ToStruct(x, j), i, nl + 1, j, de, ded, nothing; kw...) for
-        j = 1:fieldcount(T)
+        arrowvector(ToStruct(x, j, hasmissing), i, nl + 1, j, de, ded, nothing; kw...)
+        for j = 1:fieldcount(T)
     )
     NT = namedtupletype(T, data)
     return Struct{withmissing(eltype(x), NT),typeof(data),fieldnames(NT)}(
