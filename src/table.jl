@@ -643,8 +643,8 @@ end
 Base.length(x::VectorIterator) = length(x.schema.fields)
 
 const ListTypes =
-    Union{Meta.Utf8,Meta.LargeUtf8,Meta.Binary,Meta.LargeBinary,Meta.List,Meta.LargeList}
-const LargeLists = Union{Meta.LargeUtf8,Meta.LargeBinary,Meta.LargeList}
+    Union{Meta.Utf8,Meta.Utf8View,Meta.LargeUtf8,Meta.Binary,Meta.BinaryView,Meta.LargeBinary,Meta.List,Meta.ListView,Meta.LargeList,Meta.LargeListView}
+const LargeLists = Union{Meta.LargeUtf8,Meta.LargeBinary,Meta.LargeList,Meta.LargeListView}
 
 function build(field::Meta.Field, batch, rb, de, nodeidx, bufferidx, convert)
     d = field.dictionary
@@ -759,8 +759,10 @@ function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, c
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
     if L isa Meta.Utf8 ||
+       L isa Meta.Utf8View ||
        L isa Meta.LargeUtf8 ||
        L isa Meta.Binary ||
+       L isa Meta.BinaryView ||
        L isa Meta.LargeBinary
         buffer = rb.buffers[bufferidx]
         bytes, A = reinterp(UInt8, batch, buffer, rb.compression)
