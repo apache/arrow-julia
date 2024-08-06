@@ -43,6 +43,10 @@ jobs:
           - ubuntu-latest
     steps:
       - uses: actions/checkout@v3
+      - name: Install dependencies
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install julia subversion
       - name: Create
         run: |
           git config user.name "github-actions[bot]"
