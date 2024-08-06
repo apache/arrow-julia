@@ -111,7 +111,7 @@ latest_julia_version() {
     --location \
     --show-error \
     --silent \
-    https://api.github.com/repos/JuliaLang/julia/releases | \
+    https://api.github.com/repos/JuliaLang/julia/releases/latest | \
     grep -o '"tag_name": "v.*"' | \
     head -n 1 | \
     sed -e 's/^"tag_name": "v//g' \
@@ -132,12 +132,11 @@ ensure_julia() {
     Darwin)
       julia_binary_url+="/mac"
       case "$(arch)" in
-        # TODO
-        # aarch64)
-        #   julia_binary_url+="/aarch64"
-        #   julia_binary_url+="/${julia_version_series}"
-        #   julia_binary_url+="/julia-${julia_version}-macaarch64.dmg"
-        #   ;;
+        arm64)
+          julia_binary_url+="/aarch64"
+          julia_binary_url+="/${julia_version_series}"
+          julia_binary_url+="/julia-${julia_version}-macaarch64.tar.gz"
+          ;;
         i386)
           julia_binary_url+="/x64"
           julia_binary_url+="/${julia_version_series}"
