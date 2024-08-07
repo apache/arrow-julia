@@ -401,6 +401,91 @@ durationAddUnit(b::FlatBuffers.Builder, unit::TimeUnit.T) =
     FlatBuffers.prependslot!(b, 0, unit, 1)
 durationEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
+# /// Contains two child arrays, run_ends and values.
+# /// The run_ends child array must be a 16/32/64-bit integer array
+# /// which encodes the indices at which the run with the value in 
+# /// each corresponding index in the values child array ends.
+# /// Like list/struct types, the value array can be of any type.
+# table RunEndEncoded {
+# }
+struct RunEndEncoded <: FlatBuffers.Table
+    bytes::Vector{UInt8}
+    pos::Base.Int
+end
+
+Base.propertynames(x::RunEndEncoded) = ()
+
+runEndEncodedStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
+runEndEncodedEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
+
+# /// Logically the same as Binary, but the internal representation uses a view
+# /// struct that contains the string length and either the string's entire data
+# /// inline (for small strings) or an inlined prefix, an index of another buffer,
+# /// and an offset pointing to a slice in that buffer (for non-small strings).
+# ///
+# /// Since it uses a variable number of data buffers, each Field with this type
+# /// must have a corresponding entry in `variadicBufferCounts`.
+# table BinaryView {
+# }
+struct BinaryView <: FlatBuffers.Table
+    bytes::Vector{UInt8}
+    pos::Base.Int
+end
+
+Base.propertynames(x::BinaryView) = ()
+
+binaryViewStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
+binaryViewEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
+
+# /// Logically the same as Utf8, but the internal representation uses a view
+# /// struct that contains the string length and either the string's entire data
+# /// inline (for small strings) or an inlined prefix, an index of another buffer,
+# /// and an offset pointing to a slice in that buffer (for non-small strings).
+# ///
+# /// Since it uses a variable number of data buffers, each Field with this type
+# /// must have a corresponding entry in `variadicBufferCounts`.
+# table Utf8View {
+# }
+struct Utf8View <: FlatBuffers.Table
+    bytes::Vector{UInt8}
+    pos::Base.Int
+end
+
+Base.propertynames(x::Utf8View) = ()
+
+utf8ViewStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
+utf8ViewEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
+
+# /// Represents the same logical types that List can, but contains offsets and
+# /// sizes allowing for writes in any order and sharing of child values among
+# /// list values.
+# table ListView {
+# }
+struct ListView <: FlatBuffers.Table
+    bytes::Vector{UInt8}
+    pos::Base.Int
+end
+
+Base.propertynames(x::ListView) = ()
+
+listViewStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
+listViewEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
+
+# /// Represents the same logical types that LargeList can, but contains offsets
+# /// and sizes allowing for writes in any order and sharing of child values among
+# /// list values.
+# table LargeListView {
+# }
+struct LargeListView <: FlatBuffers.Table
+    bytes::Vector{UInt8}
+    pos::Base.Int
+end
+
+Base.propertynames(x::LargeListView) = ()
+
+largeListViewStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
+largeListViewEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
+
 function Type(b::UInt8)
     b == 1 && return Null
     b == 2 && return Int
@@ -423,6 +508,11 @@ function Type(b::UInt8)
     b == 19 && return LargeBinary
     b == 20 && return LargeUtf8
     b == 21 && return LargeList
+    b == 22 && return RunEndEncoded
+    b == 23 && return BinaryView
+    b == 24 && return Utf8View
+    b == 25 && return ListView
+    b == 26 && return LargeListView
     return nothing
 end
 

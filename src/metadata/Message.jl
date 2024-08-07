@@ -75,7 +75,7 @@ struct RecordBatch <: FlatBuffers.Table
     pos::Base.Int
 end
 
-Base.propertynames(x::RecordBatch) = (:length, :nodes, :buffers, :compression)
+Base.propertynames(x::RecordBatch) = (:length, :nodes, :buffers, :compression, :variadicBufferCounts)
 
 function Base.getproperty(x::RecordBatch, field::Symbol)
     if field === :length
@@ -96,6 +96,11 @@ function Base.getproperty(x::RecordBatch, field::Symbol)
         if o != 0
             y = FlatBuffers.indirect(x, o + FlatBuffers.pos(x))
             return FlatBuffers.init(BodyCompression, FlatBuffers.bytes(x), y)
+        end
+    elseif field === :variadicBufferCounts
+        o = FlatBuffers.offset(x, 12)
+        if o != 0
+            return FlatBuffers.Array{Int32}(x, o)
         end
     end
     return nothing
