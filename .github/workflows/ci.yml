@@ -52,7 +52,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           RELEASE_DEFAULT=0 dev/release/release_rc.sh 100
-      - uses: actions/cache@v1
+      - uses: actions/cache@v4
         with:
           path: ~/.julia/artifacts
           key: ${{ runner.os }}-release-${{ hashFiles('**/Project.toml') }}
@@ -90,7 +90,7 @@ jobs:
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-      - uses: actions/cache@v1
+      - uses: actions/cache@v4
         env:
           cache-name: cache-artifacts
         with:
@@ -130,7 +130,7 @@ jobs:
         with:
           version: ${{ matrix.version }}
           arch: ${{ matrix.arch }}
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         env:
           cache-name: cache-artifacts
         with:
