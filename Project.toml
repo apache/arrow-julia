@@ -17,7 +17,7 @@
 name = "Arrow"
 uuid = "69666777-d1a9-59fb-9406-91d4454c9d45"
 authors = ["quinnj <quinn.jacobd@gmail.com>"]
-version = "2.7.2"
+version = "3.0.0"
 
 [deps]
 ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
@@ -52,3 +52,12 @@ Tables = "1.1"
 TimeZones = "1"
 TranscodingStreams = "0.9.12, 0.10, 0.11"
 julia = "1.6"
+
+[weakdeps]
+TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
+
+[extensions]
+# name of extension to the left
+# extension dependencies required to load the extension to the right
+# use a list for multiple extension dependencies
+ArrowTimeZonesExt = ["TimeZones"]
