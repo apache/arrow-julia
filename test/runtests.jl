@@ -1061,5 +1061,13 @@ end
             t = Arrow.Table(io)
             @test Arrow.Tables.rowcount(t) == 6
         end
+
+        @testset "# 526: Arrow.Time" begin
+            tt = testtables[4]
+            # just to make sure we're grabbing the correct table
+            @test first(tt) == "arrow date/time types"
+            tbl = Arrow.Table(Arrow.tobuffer(tt[2]))
+            @test tbl.col16[1] == Dates.Time(0, 0, 0)
+        end
     end # @testset "misc"
 end
