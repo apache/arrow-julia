@@ -251,9 +251,8 @@ ArrowTypes.toarrow(x::Dates.Time) = convert(TIME, x)
 const TIME_SYMBOL = Symbol("JuliaLang.Time")
 ArrowTypes.arrowname(::Type{Dates.Time}) = TIME_SYMBOL
 ArrowTypes.JuliaType(::Val{TIME_SYMBOL}, S) = Dates.Time
-ArrowTypes.fromarrow(::Type{Dates.Time}, x::TIME) = convert(Dates.Time, x)
-ArrowTypes.default(::Type{Dates.Time}) = Dates.Time(1, 1, 1)
 ArrowTypes.fromarrow(::Type{Dates.Time}, x::Arrow.Time) = convert(Dates.Time, x)
+ArrowTypes.default(::Type{Dates.Time}) = Dates.Time(1, 1, 1)
 
 struct Timestamp{U,TZ} <: ArrowTimeType
     x::Int64
