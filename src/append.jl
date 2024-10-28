@@ -182,7 +182,7 @@ function append(
                 (errorref[][1], errorref[][2])
             error("fatal error writing arrow data")
         end
-        @debugv 1 "processing table partition i = $i"
+        @debug "processing table partition i = $i"
         tbl_cols = Tables.columns(tbl)
         tbl_schema = Tables.schema(tbl_cols)
 
