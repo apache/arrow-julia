@@ -60,11 +60,11 @@ function makenodesbuffers!(
     alignment,
 )
     push!(fieldnodes, FieldNode(col.len, col.nullcount))
-    @debugv 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
+    @debug "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     for buffer in col.buffers
         blen = length(buffer.data) == 0 ? 0 : 8 + length(buffer.data)
         push!(fieldbuffers, Buffer(bufferoffset, blen))
-        @debugv 1 "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
+        @debug "made field buffer: bufferidx = $(length(fieldbuffers)), offset = $(fieldbuffers[end].offset), len = $(fieldbuffers[end].length), padded = $(padding(fieldbuffers[end].length, alignment))"
         bufferoffset += padding(blen, alignment)
     end
     for child in col.children
@@ -77,16 +77,16 @@ end
 function writearray(io, b::CompressedBuffer)
     if length(b.data) > 0
         n = Base.write(io, b.uncompressedlength)
-        @debugv 1 "writing compressed buffer: uncompressedlength = $(b.uncompressedlength), n = $(length(b.data))"
-        @debugv 2 b.data
+        @debug "writing compressed buffer: uncompressedlength = $(b.uncompressedlength), n = $(length(b.data))"
+        @debug b.data
         return n + Base.write(io, b.data)
     end
     return 0
 end
 
 function writebuffer(io, col::Compressed, alignment)
-    @debugv 1 "writebuffer: col = $(typeof(col))"
-    @debugv 2 col
+    @debug "writebuffer: col = $(typeof(col))"
+    @debug col
     for buffer in col.buffers
         n = writearray(io, buffer)
         writezeros(io, paddinglength(n, alignment))

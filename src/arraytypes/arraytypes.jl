@@ -42,8 +42,8 @@ function toarrowvector(
     compression::Union{Nothing,Symbol,LZ4FrameCompressor,ZstdCompressor}=nothing,
     kw...,
 )
-    @debugv 2 "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(values(kw))"
-    @debugv 3 x
+    @debug "converting top-level column to arrow format: col = $(typeof(x)), compression = $compression, kw = $(values(kw))"
+    @debug x
     A = arrowvector(x, i, 0, 0, de, ded, meta; compression=compression, kw...)
     if compression isa LZ4FrameCompressor
         A = compress(Meta.CompressionType.LZ4_FRAME, compression, A)
@@ -60,8 +60,8 @@ function toarrowvector(
             compress(Meta.CompressionType.ZSTD, comp[], A)
         end
     end
-    @debugv 2 "converted top-level column to arrow format: $(typeof(A))"
-    @debugv 3 A
+    @debug "converted top-level column to arrow format: $(typeof(A))"
+    @debug A
     return A
 end
 
@@ -173,7 +173,7 @@ function makenodesbuffers!(
     alignment,
 )
     push!(fieldnodes, FieldNode(length(col), length(col)))
-    @debugv 1 "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
+    @debug "made field node: nodeidx = $(length(fieldnodes)), col = $(typeof(col)), len = $(fieldnodes[end].length), nc = $(fieldnodes[end].null_count)"
     return bufferoffset
 end
 
@@ -256,7 +256,7 @@ end
 
 function writebitmap(io, col::ArrowVector, alignment)
     v = col.validity
-    @debugv 1 "writing validity bitmap: nc = $(v.nc), n = $(cld(v.ℓ, 8))"
+    @debug "writing validity bitmap: nc = $(v.nc), n = $(cld(v.ℓ, 8))"
     v.nc == 0 && return 0
     n = Base.write(io, view(v.bytes, (v.pos):(v.pos + cld(v.ℓ, 8) - 1)))
     return n + writezeros(io, paddinglength(n, alignment))

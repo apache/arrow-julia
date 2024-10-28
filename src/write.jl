@@ -253,11 +253,11 @@ end
 function write(writer::Writer, source)
     @sync for tbl in Tables.partitions(source)
         check_errors(writer)
-        @debugv 1 "processing table partition $(writer.partition_count)"
+        @debug "processing table partition $(writer.partition_count)"
         tblcols = Tables.columns(tbl)
         if !isassigned(writer.firstcols)
             if writer.writetofile
-                @debugv 1 "starting write of arrow formatted file"
+                @debug "starting write of arrow formatted file"
                 Base.write(writer.io, FILE_FORMAT_MAGIC_BYTES, b"\0\0")
             end
             meta = isnothing(writer.meta) ? getmetadata(source) : writer.meta
@@ -517,7 +517,7 @@ function toarrowtable(
     meta,
     colmeta,
 )
-    @debugv 1 "converting input table to arrow formatted columns"
+    @debug "converting input table to arrow formatted columns"
     sch = Tables.schema(cols)
     types = collect(sch.types)
     N = length(types)
@@ -563,7 +563,7 @@ Tables.getcolumn(x::ToArrowTable, i::Int) = x.cols[i]
 
 function Base.write(io::IO, msg::Message, blocks, sch, alignment)
     metalen = padding(length(msg.msgflatbuf), alignment)
-    @debugv 1 "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch), headerType = $(msg.headerType)"
+    @debug "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch), headerType = $(msg.headerType)"
     if msg.blockmsg
         push!(
             blocks[msg.isrecordbatch ? 1 : 2],
@@ -647,7 +647,7 @@ function makeschema(b, sch::Tables.Schema, columns)
 end
 
 function makeschemamsg(sch::Tables.Schema, columns)
-    @debugv 1 "building schema message: sch = $sch"
+    @debug "building schema message: sch = $sch"
     b = FlatBuffers.Builder(1024)
     schema = makeschema(b, sch, columns)
     return makemessage(b, Meta.Schema, schema)
@@ -703,9 +703,9 @@ function fieldoffset(b, name, col)
     end
     # build field object
     if isdictencoded(col)
-        @debugv 1 "building field: name = $name, nullable = $nullable, T = $T, type = $type, inttype = $IT, dictionary id = $(getid(col))"
+        @debug "building field: name = $name, nullable = $nullable, T = $T, type = $type, inttype = $IT, dictionary id = $(getid(col))"
     else
-        @debugv 1 "building field: name = $name, nullable = $nullable, T = $T, type = $type"
+        @debug "building field: name = $name, nullable = $nullable, T = $T, type = $type"
     end
     Meta.fieldStart(b)
     Meta.fieldAddName(b, nameoff)
@@ -757,7 +757,7 @@ function makerecordbatch(
         bufferoffset =
             makenodesbuffers!(col, fieldnodes, fieldbuffers, bufferoffset, alignment)
     end
-    @debugv 1 "building record batch message: nrows = $nrows, sch = $sch, compress = $compress"
+    @debug "building record batch message: nrows = $nrows, sch = $sch, compress = $compress"
 
     # write field nodes objects
     FN = length(fieldnodes)
@@ -788,7 +788,7 @@ function makerecordbatch(
     end
 
     # write record batch object
-    @debugv 1 "built record batch message: nrows = $nrows, nodes = $fieldnodes, buffers = $fieldbuffers, compress = $compress, bodylen = $bodylen"
+    @debug "built record batch message: nrows = $nrows, nodes = $fieldnodes, buffers = $fieldbuffers, compress = $compress, bodylen = $bodylen"
     Meta.recordBatchStart(b)
     Meta.recordBatchAddLength(b, Int64(nrows))
     Meta.recordBatchAddNodes(b, nodes)
@@ -798,7 +798,7 @@ function makerecordbatch(
 end
 
 function makedictionarybatchmsg(sch, columns, id, isdelta, alignment)
-    @debugv 1 "building dictionary message: id = $id, sch = $sch, isdelta = $isdelta"
+    @debug "building dictionary message: id = $id, sch = $sch, isdelta = $isdelta"
     b = FlatBuffers.Builder(1024)
     recordbatch, bodylen = makerecordbatch(b, sch, columns, alignment)
     Meta.dictionaryBatchStart(b)

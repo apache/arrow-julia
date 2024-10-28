@@ -43,7 +43,6 @@ module Arrow
 
 using Base.Iterators
 using Mmap
-using LoggingExtras
 import Dates
 using DataAPI,
     Tables,
