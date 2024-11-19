@@ -26,6 +26,7 @@ permissions:
 jobs:
   CompatHelper:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Check if Julia is already available in the PATH
         id: julia_in_path
