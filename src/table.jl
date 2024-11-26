@@ -479,7 +479,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                             field.type,
                             batch,
                             recordbatch,
-                            dictencodings,
+                            dictencodingslockable,
                             Int64(1),
                             Int64(1),
                             convert,
