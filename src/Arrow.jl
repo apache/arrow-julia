@@ -52,7 +52,8 @@ using DataAPI,
     CodecZstd,
     TimeZones,
     BitIntegers,
-    ConcurrentUtilities
+    ConcurrentUtilities,
+    StringViews
 
 export ArrowTypes
 
