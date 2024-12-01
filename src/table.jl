@@ -215,12 +215,13 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
                 if haskey(dictencodings, id) && header.isDelta
                     # delta
                     field = x.dictencoded[id]
-                    values, _, _ = build(
+                    values, _, _, _ = build(
                         field,
                         field.type,
                         batch,
                         recordbatch,
                         x.dictencodings,
+                        Int64(1),
                         Int64(1),
                         Int64(1),
                         x.convert,
@@ -231,12 +232,13 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
                 end
                 # new dictencoding or replace
                 field = x.dictencoded[id]
-                values, _, _ = build(
+                values, _, _, _ = build(
                     field,
                     field.type,
                     batch,
                     recordbatch,
                     x.dictencodings,
+                    Int64(1),
                     Int64(1),
                     Int64(1),
                     x.convert,
@@ -521,12 +523,13 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                     if haskey(dictencodings, id) && header.isDelta
                         # delta
                         field = dictencoded[id]
-                        values, _, _ = build(
+                        values, _, _, _ = build(
                             field,
                             field.type,
                             batch,
                             recordbatch,
                             dictencodingslockable,
+                            Int64(1),
                             Int64(1),
                             Int64(1),
                             convert,
@@ -550,12 +553,13 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                     end
                     # new dictencoding or replace
                     field = dictencoded[id]
-                    values, _, _ = build(
+                    values, _, _, _ = build(
                         field,
                         field.type,
                         batch,
                         recordbatch,
                         dictencodingslockable,
+                        Int64(1),
                         Int64(1),
                         Int64(1),
                         convert,
