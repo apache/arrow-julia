@@ -129,12 +129,12 @@ function arrowtype(b, ::Type{T}) where {T<:AbstractFloat}
     return Meta.FloatingPoint, Meta.floatingPointEnd(b), nothing
 end
 
-juliaeltype(f::Meta.Field, b::Union{Meta.Utf8,Meta.LargeUtf8}, convert) = String
+juliaeltype(f::Meta.Field, b::Union{Meta.Utf8,Meta.LargeUtf8,Meta.Utf8View}, convert) = String
 
 datasizeof(x) = sizeof(x)
 datasizeof(x::AbstractVector) = sum(datasizeof, x)
 
-juliaeltype(f::Meta.Field, b::Union{Meta.Binary,Meta.LargeBinary}, convert) = Base.CodeUnits
+juliaeltype(f::Meta.Field, b::Union{Meta.Binary,Meta.LargeBinary,Meta.BinaryView}, convert) = Base.CodeUnits
 
 juliaeltype(f::Meta.Field, x::Meta.FixedSizeBinary, convert) =
     NTuple{Int(x.byteWidth),UInt8}
@@ -428,7 +428,7 @@ ArrowTypes.JuliaType(::Val{PERIOD_SYMBOL}, ::Type{Duration{U}}) where {U} = peri
 ArrowTypes.fromarrow(::Type{P}, x::Duration{U}) where {P<:Dates.Period,U} = convert(P, x)
 
 # nested types; call juliaeltype recursively on nested children
-function juliaeltype(f::Meta.Field, list::Union{Meta.List,Meta.LargeList}, convert)
+function juliaeltype(f::Meta.Field, list::Union{Meta.List,Meta.LargeList,Meta.ListView,Meta.LargeListView}, convert)
     return Vector{juliaeltype(f.children[1], buildmetadata(f.children[1]), convert)}
 end
 
