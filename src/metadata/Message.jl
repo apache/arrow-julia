@@ -75,7 +75,8 @@ struct RecordBatch <: FlatBuffers.Table
     pos::Base.Int
 end
 
-Base.propertynames(x::RecordBatch) = (:length, :nodes, :buffers, :compression, :variadicBufferCounts)
+Base.propertynames(x::RecordBatch) =
+    (:length, :nodes, :buffers, :compression, :variadicBufferCounts)
 
 function Base.getproperty(x::RecordBatch, field::Symbol)
     if field === :length

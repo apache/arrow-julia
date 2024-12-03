@@ -407,9 +407,10 @@ function DataAPI.colmetadatakeys(t::Table, col)
 end
 
 function DataAPI.colmetadatakeys(t::Table)
-    return (col => DataAPI.colmetadatakeys(t, col) for
-            col in Tables.columnnames(t) if
-            getmetadata(t[col]) !== nothing)
+    return (
+        col => DataAPI.colmetadatakeys(t, col) for
+        col in Tables.columnnames(t) if getmetadata(t[col]) !== nothing
+    )
 end
 
 Tables.istable(::Table) = true
@@ -580,7 +581,8 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                 anyrecordbatches = true
                 @debug "parsing record batch message: compression = $(header.compression)"
                 @wkspawn begin
-                    cols = collect(VectorIterator(sch, $batch, dictencodingslockable, convert))
+                    cols =
+                        collect(VectorIterator(sch, $batch, dictencodingslockable, convert))
                     put!(() -> put!(tsks, cols), sync, $(rbi))
                 end
                 rbi += 1
@@ -726,8 +728,17 @@ function build(field::Meta.Field, batch, rb, de, nodeidx, bufferidx, varbufferid
         nodeidx += 1
         bufferidx += 1
     else
-        A, nodeidx, bufferidx, varbufferidx =
-            build(field, field.type, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+        A, nodeidx, bufferidx, varbufferidx = build(
+            field,
+            field.type,
+            batch,
+            rb,
+            de,
+            nodeidx,
+            bufferidx,
+            varbufferidx,
+            convert,
+        )
     end
     return A, nodeidx, bufferidx, varbufferidx
 end
@@ -805,7 +816,17 @@ end
 
 const SubVector{T,P} = SubArray{T,1,P,Tuple{UnitRange{Int64}},true}
 
-function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+function build(
+    f::Meta.Field,
+    L::ListTypes,
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    varbufferidx,
+    convert,
+)
     @debug "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
@@ -839,10 +860,23 @@ function build(f::Meta.Field, L::ListTypes, batch, rb, de, nodeidx, bufferidx, v
             T = S == T ? ST : Union{Missing,ST}
         end
     end
-    return List{T,OT,typeof(A)}(bytes, validity, offsets, A, len, meta), nodeidx, bufferidx, varbufferidx
+    return List{T,OT,typeof(A)}(bytes, validity, offsets, A, len, meta),
+    nodeidx,
+    bufferidx,
+    varbufferidx
 end
 
-function build(f::Meta.Field, L::ViewTypes, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+function build(
+    f::Meta.Field,
+    L::ViewTypes,
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    varbufferidx,
+    convert,
+)
     @debug "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
@@ -861,7 +895,10 @@ function build(f::Meta.Field, L::ViewTypes, batch, rb, de, nodeidx, bufferidx, v
     nodeidx += 1
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
-    return View{T}(batch.bytes, validity, views, inline, buffers, len, meta), nodeidx, bufferidx, varbufferidx
+    return View{T}(batch.bytes, validity, views, inline, buffers, len, meta),
+    nodeidx,
+    bufferidx,
+    varbufferidx
 end
 
 function build(
@@ -891,10 +928,23 @@ function build(
     end
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
-    return FixedSizeList{T,typeof(A)}(bytes, validity, A, len, meta), nodeidx, bufferidx, varbufferidx
+    return FixedSizeList{T,typeof(A)}(bytes, validity, A, len, meta),
+    nodeidx,
+    bufferidx,
+    varbufferidx
 end
 
-function build(f::Meta.Field, L::Meta.Map, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+function build(
+    f::Meta.Field,
+    L::Meta.Map,
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    varbufferidx,
+    convert,
+)
     @debug "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
@@ -906,13 +956,27 @@ function build(f::Meta.Field, L::Meta.Map, batch, rb, de, nodeidx, bufferidx, va
     bufferidx += 1
     len = rb.nodes[nodeidx].length
     nodeidx += 1
-    A, nodeidx, bufferidx, varbufferidx = build(f.children[1], batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+    A, nodeidx, bufferidx, varbufferidx =
+        build(f.children[1], batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
-    return Map{T,OT,typeof(A)}(validity, offsets, A, len, meta), nodeidx, bufferidx, varbufferidx
+    return Map{T,OT,typeof(A)}(validity, offsets, A, len, meta),
+    nodeidx,
+    bufferidx,
+    varbufferidx
 end
 
-function build(f::Meta.Field, L::Meta.Struct, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+function build(
+    f::Meta.Field,
+    L::Meta.Struct,
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    varbufferidx,
+    convert,
+)
     @debug "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
@@ -920,17 +984,31 @@ function build(f::Meta.Field, L::Meta.Struct, batch, rb, de, nodeidx, bufferidx,
     vecs = []
     nodeidx += 1
     for child in f.children
-        A, nodeidx, bufferidx, varbufferidx = build(child, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+        A, nodeidx, bufferidx, varbufferidx =
+            build(child, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
         push!(vecs, A)
     end
     data = Tuple(vecs)
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
     fnames = ntuple(i -> Symbol(f.children[i].name), length(f.children))
-    return Struct{T,typeof(data),fnames}(validity, data, len, meta), nodeidx, bufferidx, varbufferidx
+    return Struct{T,typeof(data),fnames}(validity, data, len, meta),
+    nodeidx,
+    bufferidx,
+    varbufferidx
 end
 
-function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+function build(
+    f::Meta.Field,
+    L::Meta.Union,
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    varbufferidx,
+    convert,
+)
     @debug "building array: L = $L"
     buffer = rb.buffers[bufferidx]
     bytes, typeIds = reinterp(UInt8, batch, buffer, rb.compression)
@@ -943,7 +1021,8 @@ function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, 
     vecs = []
     nodeidx += 1
     for child in f.children
-        A, nodeidx, bufferidx, varbufferidx = build(child, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+        A, nodeidx, bufferidx, varbufferidx =
+            build(child, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
         push!(vecs, A)
     end
     data = Tuple(vecs)
@@ -958,18 +1037,38 @@ function build(f::Meta.Field, L::Meta.Union, batch, rb, de, nodeidx, bufferidx, 
     return B, nodeidx, bufferidx, varbufferidx
 end
 
-function build(f::Meta.Field, L::Meta.Null, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+function build(
+    f::Meta.Field,
+    L::Meta.Null,
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    varbufferidx,
+    convert,
+)
     @debug "building array: L = $L"
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
     return NullVector{maybemissing(T)}(MissingVector(rb.nodes[nodeidx].length), meta),
-        nodeidx + 1,
-        bufferidx,
-        varbufferidx
+    nodeidx + 1,
+    bufferidx,
+    varbufferidx
 end
 
 # primitives
-function build(f::Meta.Field, ::L, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert) where {L}
+function build(
+    f::Meta.Field,
+    ::L,
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    varbufferidx,
+    convert,
+) where {L}
     @debug "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
@@ -982,10 +1081,23 @@ function build(f::Meta.Field, ::L, batch, rb, de, nodeidx, bufferidx, varbufferi
     len = rb.nodes[nodeidx].length
     T = juliaeltype(f, meta, convert)
     @debug "final julia type for primitive: T = $T"
-    return Primitive(T, bytes, validity, A, len, meta), nodeidx + 1, bufferidx + 1, varbufferidx
+    return Primitive(T, bytes, validity, A, len, meta),
+    nodeidx + 1,
+    bufferidx + 1,
+    varbufferidx
 end
 
-function build(f::Meta.Field, L::Meta.Bool, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+function build(
+    f::Meta.Field,
+    L::Meta.Bool,
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    varbufferidx,
+    convert,
+)
     @debug "building array: L = $L"
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
@@ -1010,5 +1122,8 @@ function build(f::Meta.Field, L::Meta.Bool, batch, rb, de, nodeidx, bufferidx, v
     end
     len = rb.nodes[nodeidx].length
     T = juliaeltype(f, meta, convert)
-    return BoolVector{T}(decodedbytes, pos, validity, len, meta), nodeidx + 1, bufferidx + 1, varbufferidx
+    return BoolVector{T}(decodedbytes, pos, validity, len, meta),
+    nodeidx + 1,
+    bufferidx + 1,
+    varbufferidx
 end

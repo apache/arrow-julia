@@ -45,15 +45,33 @@ Base.size(l::View) = (l.ℓ,)
     if S <: Base.CodeUnits
         # BinaryView
         return !l.validity[i] ? missing :
-            v.length < 13 ?
-                Base.CodeUnits(StringView(@view l.inline[(((i - 1) * 16) + 5):(((i - 1) * 16) + 5 + v.length - 1)])) :
-                Base.CodeUnits(StringView(@view l.buffers[v.bufindex + 1][(v.offset + 1):(v.offset + v.length)]))
+               v.length < 13 ?
+               Base.CodeUnits(
+            StringView(
+                @view l.inline[(((i - 1) * 16) + 5):(((i - 1) * 16) + 5 + v.length - 1)]
+            ),
+        ) :
+               Base.CodeUnits(
+            StringView(
+                @view l.buffers[v.bufindex + 1][(v.offset + 1):(v.offset + v.length)]
+            ),
+        )
     else
         # Utf8View
         return !l.validity[i] ? missing :
-            v.length < 13 ?
-                ArrowTypes.fromarrow(T, StringView(@view l.inline[(((i - 1) * 16) + 5):(((i - 1) * 16) + 5 + v.length - 1)])) :
-                ArrowTypes.fromarrow(T, StringView(@view l.buffers[v.bufindex + 1][(v.offset + 1):(v.offset + v.length)]))
+               v.length < 13 ?
+               ArrowTypes.fromarrow(
+            T,
+            StringView(
+                @view l.inline[(((i - 1) * 16) + 5):(((i - 1) * 16) + 5 + v.length - 1)]
+            ),
+        ) :
+               ArrowTypes.fromarrow(
+            T,
+            StringView(
+                @view l.buffers[v.bufindex + 1][(v.offset + 1):(v.offset + v.length)]
+            ),
+        )
     end
 end
 

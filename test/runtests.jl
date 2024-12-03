@@ -1073,7 +1073,7 @@ end
 
     @testset "DataAPI.metadata" begin
         df = DataFrame(a=1, b=2, c=3)
-        for i in 1:2
+        for i = 1:2
             io = IOBuffer()
             if i == 1 # skip writing metadata in the first iteration
                 Arrow.write(io, df)
@@ -1099,7 +1099,8 @@ end
             @test colmetadata(tbl, :b) == colmetadata(df, :b)
             @test_throws MethodError colmetadata(tbl, :b, "xyz")
             @test colmetadata(tbl, :b, "xyz", "something") == "something"
-            @test colmetadata(tbl, :b, "xyz", "something"; style=true) == ("something", :default)
+            @test colmetadata(tbl, :b, "xyz", "something"; style=true) ==
+                  ("something", :default)
             @test Set(colmetadatakeys(tbl)) == Set(colmetadatakeys(df))
 
             # add metadata for the second iteration
