@@ -518,7 +518,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
             elseif header isa Meta.DictionaryBatch
                 id = header.id
                 recordbatch = header.data
-                @info "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
+                @debug "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
                 @lock dictencodingslockable begin
                     dictencodings = dictencodingslockable[]
                     if haskey(dictencodings, id) && header.isDelta
