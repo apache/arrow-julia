@@ -17,12 +17,6 @@
 
 # https://cwiki.apache.org/confluence/display/INFRA/Git+-+.asf.yaml+features
 
-notifications:
-  commits: commits@arrow.apache.org
-  issues_status: issues@arrow.apache.org
-  issues_comment: github@arrow.apache.org
-  pullrequests: github@arrow.apache.org
-
 github:
   description: "Official Julia implementation of Apache Arrow"
   homepage: https://arrow.apache.org/julia/
