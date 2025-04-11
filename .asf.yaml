@@ -31,6 +31,7 @@ github:
     - julia
   features:
     issues: true
+    discussions: true
   enabled_merge_buttons:
     merge: false
     rebase: true
@@ -38,6 +39,13 @@ github:
   protected_branches:
     main:
       required_linear_history: true
+
+notifications:
+  commits: commits@arrow.apache.org
+  issues_status: issues@arrow.apache.org
+  issues_comment: github@arrow.apache.org
+  pullrequests: github@arrow.apache.org
+  discussions: user@arrow.apache.org
 
 # publishes the content of the `asf-site` branch to
 # https://arrow.apache.org/julia/
