@@ -109,11 +109,12 @@ end
 
 # overload interface method for custom type Person; return a symbol as the "name"
 # this instructs Arrow.write what "label" to include with a column with this custom type
-ArrowTypes.arrowname(::Type{Person}) = :Person
-# overload JuliaType on `Val{:Person}`, which is like a dispatchable string
+const NAME = Symbol("JuliaLang.MyPackage.Person")
+ArrowTypes.arrowname(::Type{Person}) = NAME
+# overload JuliaType on `Val{NAME}`, which is like a dispatchable string
 # return our custom *type* Person; this enables Arrow.Table to know how the "label"
 # on a custom column should be mapped to a Julia type and deserialized
-ArrowTypes.JuliaType(::Val{:Person}) = Person
+ArrowTypes.JuliaType(::Val{NAME}) = Person
 
 table = (col1=[Person(1, "Bob"), Person(2, "Jane")],)
 io = IOBuffer()
@@ -160,7 +161,7 @@ using Intervals
 table = (col = [
     Interval{Closed,Unbounded}(1,nothing),
 ],)
-const NAME = Symbol("JuliaLang.Interval")
+const NAME = Symbol("JuliaLang.Intervals.Interval")
 ArrowTypes.arrowname(::Type{Interval{T, L, R}}) where {T, L, R} = NAME
 const LOOKUP = Dict(
     "Closed" => Closed,
