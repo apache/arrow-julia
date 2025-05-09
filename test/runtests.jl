@@ -1069,6 +1069,16 @@ end
             tbl = Arrow.Table(Arrow.tobuffer(tt[2]))
             @test tbl.col16[1] == Dates.Time(0, 0, 0)
         end
+
+        @testset "#511: Bug in reading Utf8View data" begin
+            t = Arrow.Table(
+                joinpath(
+                    dirname(pathof(Arrow)),
+                    "../test/reject_reason_trimmed.arrow",
+                ),
+            )
+            @test t.reject_reason[end] == "POST_ONLY"
+        end
     end # @testset "misc"
 
     @testset "DataAPI.metadata" begin
