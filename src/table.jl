@@ -881,7 +881,8 @@ function build(
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
-    inline, views = reinterp(ViewElement, batch, buffer, rb.compression)
+    _, views = reinterp(ViewElement, batch, buffer, rb.compression)
+    inline = reinterpret(UInt8, views)  # reuse the (possibly realigned) memory backing `views`
     bufferidx += 1
     buffers = Vector{UInt8}[]
     for i = 1:rb.variadicBufferCounts[varbufferidx]
