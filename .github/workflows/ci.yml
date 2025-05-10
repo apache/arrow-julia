@@ -19,8 +19,11 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
-    tags: ['*']
+    branches:
+      - '**'
+      - '!dependabot/**'
+    tags:
+      - '**'
 jobs:
   license:
     name: Audit licenses
