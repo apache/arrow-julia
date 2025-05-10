@@ -100,9 +100,9 @@ toarrow(x) = x
     ArrowTypes.arrowname(T) = Symbol(name)
 
 Interface method to define the logical type "label" for a custom Julia type `T`. Names will be global for an entire arrow dataset,
-and conventionally, custom types will just use their type name along with a Julia-specific prefix; for example, for a custom type
-`Foo`, I would define `ArrowTypes.arrowname(::Type{Foo}) = Symbol("JuliaLang.Foo")`. This ensures other language implementations
-won't get confused and are safe to ignore the logical type label.
+and conventionally, custom types will just use their type name along with a Julia- and package-specific prefix; for example,
+for a custom type `Foo`, I would define `ArrowTypes.arrowname(::Type{Foo}) = Symbol("JuliaLang.MyPackage.Foo")`.
+This ensures other language implementations won't get confused and are safe to ignore the logical type label.
 When arrow stores non-native data, it must still be _stored_ as a native data type, but can have type metadata tied to the data that
 labels the original _logical_ type it originated from. This enables the conversion of native data back to the logical type when
 deserializing, as long as the deserializer has the same definitions when the data was serialized. Namely, the current Julia
