@@ -220,29 +220,15 @@ function arrowvector(
         if DataAPI.refarray(x) === x || DataAPI.refpool(x) === nothing
             # need to encode ourselves
             x = PooledArray(x; signed=true, compress=true)
-            inds = DataAPI.refarray(x)
+            inds = refa = DataAPI.refarray(x)
             pool = DataAPI.refpool(x)
         else
             pool = DataAPI.refpool(x)
             refa = DataAPI.refarray(x)
             inds = copyto!(similar(Vector{signedtype(length(pool))}, length(refa)), refa)
         end
-        # horrible hack? yes. better than taking CategoricalArrays dependency? also yes.
-        if typeof(pool).name.name == :CategoricalRefPool
-            if eltype(x) >: Missing
-                pool = vcat(missing, DataAPI.levels(x))
-            else
-                pool = DataAPI.levels(x)
-                for i = 1:length(inds)
-                    @inbounds inds[i] -= 1
-                end
-            end
-        else
-            # adjust to "offset" instead of index
-            for i = 1:length(inds)
-                @inbounds inds[i] -= 1
-            end
-        end
+        # adjust to "offset" instead of index
+        inds .-= firstindex(refa)
         data = arrowvector(
             pool,
             i,
@@ -278,11 +264,7 @@ function arrowvector(
             )
             deltas = eltype(x)[]
             inds = Vector{ET}(undef, len)
-            categorical = typeof(x).name.name == :CategoricalArray
             for (j, val) in enumerate(x)
-                if categorical
-                    val = get(val)
-                end
                 @inbounds inds[j] = get!(pool, val) do
                     push!(deltas, val)
                     return length(pool)
