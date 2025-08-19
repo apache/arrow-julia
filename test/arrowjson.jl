@@ -284,7 +284,7 @@ const SUBTYPES = @eval (
     list=List,
     largelist=LargeList,
     fixedsizelist=FixedSizeList,
-    $(Symbol("struct"))=Struct,
+    ($(Symbol("struct")))=Struct,
     map=Map,
     null=Null,
     utf8=Utf8,
@@ -596,10 +596,8 @@ function Base.getindex(x::ArrowArray{T}, i::Base.Int) where {T}
     @boundscheck checkbounds(x, i)
     S = Base.nonmissingtype(T)
     if x.field.dictionary !== nothing
-        fielddata = x.dictionaries[findfirst(
-            y -> y.id == x.field.dictionary.id,
-            x.dictionaries,
-        )].data.columns[1]
+        fielddata =
+            x.dictionaries[findfirst(y -> y.id == x.field.dictionary.id, x.dictionaries)].data.columns[1]
         field = copy(x.field)
         field.dictionary = nothing
         idx = x.fielddata.DATA[i] + 1
