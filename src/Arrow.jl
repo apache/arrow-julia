@@ -26,11 +26,13 @@ This implementation supports the 1.0 version of the specification, including sup
   * Extension types
   * Streaming, file, record batch, and replacement and isdelta dictionary messages
   * Buffer compression/decompression via the standard LZ4 frame and Zstd formats
+  * Sparse tensor support with COO, CSR/CSC, and CSF formats
 
 It currently doesn't include support for:
-  * Tensors or sparse tensors
+  * Dense tensor support
   * Flight RPC
-  * C data interface
+  * C data interface for zero-copy interoperability with other Arrow implementations
+
 
 Third-party data formats:
   * csv and parquet support via the existing [CSV.jl](https://github.com/JuliaData/CSV.jl) and [Parquet.jl](https://github.com/JuliaIO/Parquet.jl) packages
@@ -47,6 +49,7 @@ import Dates
 using DataAPI,
     Tables,
     SentinelArrays,
+    SparseArrays,
     PooledArrays,
     CodecLz4,
     CodecZstd,
@@ -79,6 +82,7 @@ include("table.jl")
 include("write.jl")
 include("append.jl")
 include("show.jl")
+include("tensors.jl")
 
 const ZSTD_COMPRESSOR = Lockable{ZstdCompressor}[]
 const ZSTD_DECOMPRESSOR = Lockable{ZstdDecompressor}[]
@@ -138,6 +142,10 @@ function __init__()
     resize!(empty!(ZSTD_COMPRESSOR), nt)
     resize!(empty!(LZ4_FRAME_DECOMPRESSOR), nt)
     resize!(empty!(ZSTD_DECOMPRESSOR), nt)
+
+    # Initialize tensor extensions
+    __init_tensors__()
+
     return
 end
 
