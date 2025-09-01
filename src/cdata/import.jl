@@ -95,7 +95,12 @@ function _parse_imported_schema(schema::CArrowSchema)
     is_nullable = (schema.flags & ARROW_FLAG_NULLABLE) != 0
     
     if is_nullable && base_type !== Missing
-        return Union{base_type, Missing}
+        if base_type isa Symbol
+            # Handle symbolic types - for complex types, just return the symbol for now
+            return base_type
+        else
+            return Union{base_type, Missing}
+        end
     else
         return base_type
     end
@@ -106,6 +111,11 @@ end
 
 Create an Arrow vector that wraps imported foreign data.
 """
+# Method for handling Symbol types (complex types like :list, :struct)
+function _create_arrow_vector_from_import(schema::CArrowSchema, array::CArrowArray, julia_type::Symbol, handle::ImportedArrayHandle)
+    return _create_arrow_vector_from_import(schema, array, Any, handle)
+end
+
 function _create_arrow_vector_from_import(schema::CArrowSchema, array::CArrowArray, julia_type::Type, handle::ImportedArrayHandle)
     # Read the format string to determine the Arrow vector type to create
     format_str = _read_c_string(schema.format)
@@ -137,7 +147,7 @@ Create a primitive Arrow vector from imported data.
 """
 function _create_primitive_vector(schema::CArrowSchema, array::CArrowArray, julia_type::Type, handle::ImportedArrayHandle)
     # Get the element type (strip Missing if union type)
-    element_type = julia_type <: Union ? Base.nonmissingtype(julia_type) : julia_type
+    element_type = julia_type isa Union ? Base.nonmissingtype(julia_type) : julia_type
     
     # Import validity bitmap
     validity = _import_validity_bitmap(array, handle)
@@ -238,13 +248,22 @@ function _create_bool_vector(schema::CArrowSchema, array::CArrowArray, julia_typ
     # Boolean vectors are bit-packed, similar to validity bitmaps
     validity = _import_validity_bitmap(array, handle)
     
-    if array.n_buffers < 2
-        throw(ArgumentError("Boolean array must have at least 2 buffers (validity + data)"))
+    if array.n_buffers < 1
+        throw(ArgumentError("Boolean array must have at least 1 buffer"))
     end
     
-    # Get data buffer (second buffer, bit-packed)
+    # Get data buffer - could be first or second buffer depending on whether validity is present
     buffers_array = unsafe_wrap(Array, array.buffers, array.n_buffers)
-    data_ptr = buffers_array[2]
+    
+    # Find the data buffer (non-null buffer that's not validity)
+    data_ptr = C_NULL
+    for i in 1:array.n_buffers
+        ptr = buffers_array[i]
+        if ptr != C_NULL
+            # This could be validity or data - for simplicity, take the last non-null buffer
+            data_ptr = ptr
+        end
+    end
     
     if data_ptr == C_NULL
         throw(ArgumentError("Data buffer cannot be NULL for boolean array"))
@@ -359,19 +378,354 @@ function Base.getindex(v::ImportedStringVector, i::Int)
     return String(string_bytes)
 end
 
+"""
+    ImportedBinaryVector
+
+Simplified Arrow vector wrapper for imported binary data.
+"""
+struct ImportedBinaryVector <: ArrowVector{Union{Vector{UInt8}, Missing}}
+    offsets::Vector{Int32}
+    data_bytes::Vector{UInt8}
+    validity::ValidityBitmap  
+    length::Int
+    handle::ImportedArrayHandle
+end
+
+Base.size(v::ImportedBinaryVector) = (v.length,)
+validitybitmap(v::ImportedBinaryVector) = v.validity
+nullcount(v::ImportedBinaryVector) = v.validity.nc  
+getmetadata(v::ImportedBinaryVector) = nothing
+
+function Base.getindex(v::ImportedBinaryVector, i::Int)
+    @boundscheck checkbounds(v, i)
+    if !v.validity[i]
+        return missing
+    end
+    
+    # Get binary data bounds from offsets
+    start_offset = Int(v.offsets[i]) + 1    # Convert to 1-based indexing
+    end_offset = Int(v.offsets[i + 1])
+    
+    if start_offset > end_offset
+        return UInt8[]
+    end
+    
+    # Extract binary data from data buffer
+    binary_bytes = view(v.data_bytes, start_offset:end_offset)
+    return collect(binary_bytes)  # Return as Vector{UInt8}
+end
+
+"""
+    ImportedListVector{T}
+
+Simplified Arrow vector wrapper for imported list data.
+"""
+struct ImportedListVector{T} <: ArrowVector{Union{Vector{T}, Missing}}
+    offsets::Vector{Int32}
+    child_vector::ArrowVector  # Allow any ArrowVector type
+    validity::ValidityBitmap
+    length::Int
+    handle::ImportedArrayHandle
+end
+
+Base.size(v::ImportedListVector) = (v.length,)
+validitybitmap(v::ImportedListVector) = v.validity
+nullcount(v::ImportedListVector) = v.validity.nc
+getmetadata(v::ImportedListVector) = nothing
+
+function Base.getindex(v::ImportedListVector{T}, i::Int) where {T}
+    @boundscheck checkbounds(v, i)
+    if !v.validity[i]
+        return missing
+    end
+    
+    # Get list bounds from offsets
+    start_offset = Int(v.offsets[i]) + 1    # Convert to 1-based indexing
+    end_offset = Int(v.offsets[i + 1])
+    
+    if start_offset > end_offset
+        return T[]
+    end
+    
+    # Extract elements from child vector
+    elements = T[]
+    for j in start_offset:end_offset
+        push!(elements, v.child_vector[j])
+    end
+    
+    return elements
+end
+
+"""
+    ImportedFixedSizeListVector{T}
+
+Simplified Arrow vector wrapper for imported fixed-size list data.
+"""
+struct ImportedFixedSizeListVector{T} <: ArrowVector{Union{Vector{T}, Missing}}
+    fixed_size::Int
+    child_vector::ArrowVector{T}
+    validity::ValidityBitmap
+    length::Int
+    handle::ImportedArrayHandle
+end
+
+Base.size(v::ImportedFixedSizeListVector) = (v.length,)
+validitybitmap(v::ImportedFixedSizeListVector) = v.validity
+nullcount(v::ImportedFixedSizeListVector) = v.validity.nc
+getmetadata(v::ImportedFixedSizeListVector) = nothing
+
+function Base.getindex(v::ImportedFixedSizeListVector{T}, i::Int) where {T}
+    @boundscheck checkbounds(v, i)
+    if !v.validity[i]
+        return missing
+    end
+    
+    # Calculate bounds for fixed-size list element
+    start_idx = (i - 1) * v.fixed_size + 1
+    end_idx = i * v.fixed_size
+    
+    if start_idx > length(v.child_vector)
+        return T[]
+    end
+    
+    # Extract elements from child vector
+    elements = T[]
+    for j in start_idx:min(end_idx, length(v.child_vector))
+        push!(elements, v.child_vector[j])
+    end
+    
+    return elements
+end
+
+"""
+    ImportedStructVector
+
+Simplified Arrow vector wrapper for imported struct data.
+"""
+struct ImportedStructVector <: ArrowVector{Union{NamedTuple, Missing}}
+    child_vectors::Vector{ArrowVector}
+    field_names::Vector{String}
+    validity::ValidityBitmap
+    length::Int
+    handle::ImportedArrayHandle
+end
+
+Base.size(v::ImportedStructVector) = (v.length,)
+validitybitmap(v::ImportedStructVector) = v.validity
+nullcount(v::ImportedStructVector) = v.validity.nc
+getmetadata(v::ImportedStructVector) = nothing
+
+function Base.getindex(v::ImportedStructVector, i::Int)
+    @boundscheck checkbounds(v, i)
+    if !v.validity[i]
+        return missing
+    end
+    
+    # Create named tuple from child values
+    field_symbols = Symbol.(v.field_names)
+    field_values = [child_vector[i] for child_vector in v.child_vectors]
+    
+    return NamedTuple{Tuple(field_symbols)}(field_values)
+end
+
 # Placeholder implementations for other vector types
 function _create_binary_vector(schema::CArrowSchema, array::CArrowArray, julia_type::Type, handle::ImportedArrayHandle)
-    throw(ArgumentError("Binary vector import not yet implemented"))
+    # Binary arrays have the same structure as string arrays (validity + offsets + data)
+    validity = _import_validity_bitmap(array, handle)
+    
+    if array.n_buffers < 3
+        throw(ArgumentError("Binary array must have at least 3 buffers (validity + offsets + data)"))
+    end
+    
+    buffers_array = unsafe_wrap(Array, array.buffers, array.n_buffers)
+    offsets_ptr = buffers_array[2]  # Second buffer is offsets
+    data_ptr = buffers_array[3]     # Third buffer is binary data
+    
+    if offsets_ptr == C_NULL || data_ptr == C_NULL
+        throw(ArgumentError("Offsets and data buffers cannot be NULL for binary array"))
+    end
+    
+    # Import offsets (Int32 typically for regular binary)
+    offsets_length = array.length + 1
+    offsets = unsafe_wrap(Array, convert(Ptr{Int32}, offsets_ptr), offsets_length)
+    
+    # Import data buffer - use the last offset to get size
+    if length(offsets) > 0
+        data_size = Int(offsets[end])
+        data_bytes = unsafe_wrap(Array, convert(Ptr{UInt8}, data_ptr), data_size)
+    else
+        data_bytes = UInt8[]
+    end
+    
+    return ImportedBinaryVector(offsets, data_bytes, validity, Int(array.length), handle)
 end
 
 function _create_list_vector(schema::CArrowSchema, array::CArrowArray, julia_type::Type, handle::ImportedArrayHandle)
-    throw(ArgumentError("List vector import not yet implemented"))
+    # List arrays have validity, offsets buffers, plus child arrays
+    validity = _import_validity_bitmap(array, handle)
+    
+    if array.n_buffers < 2
+        throw(ArgumentError("List array must have at least 2 buffers (validity + offsets)"))
+    end
+    
+    if array.n_children != 1
+        throw(ArgumentError("List array must have exactly 1 child array"))
+    end
+    
+    # Get offsets buffer
+    buffers_array = unsafe_wrap(Array, array.buffers, array.n_buffers)
+    offsets_ptr = buffers_array[2]  # Second buffer is offsets
+    
+    if offsets_ptr == C_NULL
+        throw(ArgumentError("Offsets buffer cannot be NULL for list array"))
+    end
+    
+    # Import offsets
+    offsets_length = array.length + 1
+    offsets = unsafe_wrap(Array, convert(Ptr{Int32}, offsets_ptr), offsets_length)
+    
+    # Import child array
+    if array.children == C_NULL
+        throw(ArgumentError("Children pointer cannot be NULL for list array"))
+    end
+    
+    children_ptrs = unsafe_wrap(Array, array.children, array.n_children)
+    child_array_ptr = children_ptrs[1]
+    
+    if child_array_ptr == C_NULL
+        throw(ArgumentError("Child array pointer cannot be NULL"))
+    end
+    
+    # Import child schema (we need this to understand the child type)
+    if schema.children == C_NULL || schema.n_children != 1
+        throw(ArgumentError("List schema must have exactly 1 child schema"))
+    end
+    
+    child_schema_ptrs = unsafe_wrap(Array, schema.children, schema.n_children)
+    child_schema_ptr = child_schema_ptrs[1]
+    
+    if child_schema_ptr == C_NULL
+        throw(ArgumentError("Child schema pointer cannot be NULL"))
+    end
+    
+    # Recursively import the child array
+    child_array = unsafe_load(child_array_ptr)
+    child_schema = unsafe_load(child_schema_ptr)
+    child_julia_type = _parse_imported_schema(child_schema)
+    child_vector = _create_arrow_vector_from_import(child_schema, child_array, child_julia_type, handle)
+    
+    # Determine the element type from the child vector
+    # Use the actual child vector's element type to ensure compatibility
+    child_vector_type = eltype(child_vector)
+    child_element_type = child_vector_type isa Union ? Base.nonmissingtype(child_vector_type) : child_vector_type
+    
+    return ImportedListVector{child_element_type}(offsets, child_vector, validity, Int(array.length), handle)
 end
 
 function _create_fixed_size_list_vector(schema::CArrowSchema, array::CArrowArray, julia_type::Type, handle::ImportedArrayHandle)
-    throw(ArgumentError("Fixed-size list vector import not yet implemented"))
+    # Fixed-size list arrays have validity buffer and child arrays (no offsets)
+    validity = _import_validity_bitmap(array, handle)
+    
+    if array.n_children != 1
+        throw(ArgumentError("Fixed-size list array must have exactly 1 child array"))
+    end
+    
+    # Get fixed list size from format string  
+    format_str = _read_c_string(schema.format)
+    if !startswith(format_str, "+w:")
+        throw(ArgumentError("Invalid fixed-size list format: $format_str"))
+    end
+    
+    size_str = format_str[4:end]
+    fixed_size = try
+        parse(Int, size_str)
+    catch
+        throw(ArgumentError("Invalid fixed-size list format: $format_str"))
+    end
+    
+    # Import child array
+    if array.children == C_NULL
+        throw(ArgumentError("Children pointer cannot be NULL for fixed-size list array"))
+    end
+    
+    children_ptrs = unsafe_wrap(Array, array.children, array.n_children)
+    child_array_ptr = children_ptrs[1]
+    
+    if child_array_ptr == C_NULL
+        throw(ArgumentError("Child array pointer cannot be NULL"))
+    end
+    
+    # Import child schema
+    if schema.children == C_NULL || schema.n_children != 1
+        throw(ArgumentError("Fixed-size list schema must have exactly 1 child schema"))
+    end
+    
+    child_schema_ptrs = unsafe_wrap(Array, schema.children, schema.n_children)
+    child_schema_ptr = child_schema_ptrs[1]
+    
+    if child_schema_ptr == C_NULL
+        throw(ArgumentError("Child schema pointer cannot be NULL"))
+    end
+    
+    # Recursively import the child array
+    child_array = unsafe_load(child_array_ptr)
+    child_schema = unsafe_load(child_schema_ptr)
+    child_julia_type = _parse_imported_schema(child_schema)
+    child_vector = _create_arrow_vector_from_import(child_schema, child_array, child_julia_type, handle)
+    
+    # Determine the element type from the child vector
+    child_element_type = child_julia_type isa Union ? Base.nonmissingtype(child_julia_type) : child_julia_type
+    
+    return ImportedFixedSizeListVector{child_element_type}(fixed_size, child_vector, validity, Int(array.length), handle)
 end
 
 function _create_struct_vector(schema::CArrowSchema, array::CArrowArray, julia_type::Type, handle::ImportedArrayHandle)
-    throw(ArgumentError("Struct vector import not yet implemented"))
+    # Struct arrays have validity buffer plus child arrays (no offsets)
+    validity = _import_validity_bitmap(array, handle)
+    
+    if array.n_children != schema.n_children
+        throw(ArgumentError("Struct array and schema must have same number of children"))
+    end
+    
+    if array.n_children == 0
+        throw(ArgumentError("Struct must have at least one child field"))
+    end
+    
+    # Import child arrays
+    if array.children == C_NULL || schema.children == C_NULL
+        throw(ArgumentError("Children pointers cannot be NULL for struct array"))
+    end
+    
+    array_children_ptrs = unsafe_wrap(Array, array.children, array.n_children)
+    schema_children_ptrs = unsafe_wrap(Array, schema.children, schema.n_children)
+    
+    child_vectors = ArrowVector[]
+    field_names = String[]
+    
+    for i in 1:array.n_children
+        child_array_ptr = array_children_ptrs[i]
+        child_schema_ptr = schema_children_ptrs[i]
+        
+        if child_array_ptr == C_NULL || child_schema_ptr == C_NULL
+            throw(ArgumentError("Child array or schema pointer cannot be NULL"))
+        end
+        
+        # Load child structures
+        child_array = unsafe_load(child_array_ptr)
+        child_schema = unsafe_load(child_schema_ptr)
+        
+        # Get field name
+        field_name = _read_c_string(child_schema.name)
+        if isempty(field_name)
+            field_name = "field_$i"  # Fallback name
+        end
+        push!(field_names, field_name)
+        
+        # Recursively import child
+        child_julia_type = _parse_imported_schema(child_schema)
+        child_vector = _create_arrow_vector_from_import(child_schema, child_array, child_julia_type, handle)
+        push!(child_vectors, child_vector)
+    end
+    
+    return ImportedStructVector(child_vectors, field_names, validity, Int(array.length), handle)
 end

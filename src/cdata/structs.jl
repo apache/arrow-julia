@@ -102,11 +102,11 @@ strong references to all underlying buffers and arrays.
 """
 mutable struct GuardianObject
     # References to keep data alive
-    arrow_vector::ArrowVector
+    arrow_vector::Any  # Can be ArrowVector or other Arrow types
     buffers::Vector{Any}  # Raw buffer references
     children::Vector{Any}  # Child guardian objects
     
-    GuardianObject(av::ArrowVector) = new(av, Any[], Any[])
+    GuardianObject(av::Any) = new(av, Any[], Any[])
 end
 
 """
@@ -122,8 +122,8 @@ mutable struct ImportedArrayHandle
     
     function ImportedArrayHandle(array_ptr::Ptr{CArrowArray}, schema_ptr::Ptr{CArrowSchema})
         handle = new(array_ptr, schema_ptr)
-        # Attach finalizer to call release callbacks when handle is GC'd
-        finalizer(_release_imported_data, handle)
+        # Note: Do not attach finalizer for import - the original producer manages release
+        # The consumer should call the release callbacks when done
         return handle
     end
 end

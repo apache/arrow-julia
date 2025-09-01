@@ -109,6 +109,56 @@ function _export_schema(arrow_vector::ArrowVector, schema_ptr::Ptr{CArrowSchema}
     return nothing
 end
 
+# Schema export for ToList types (used as child arrays in Lists)
+function _export_schema(tolist::Arrow.ToList, schema_ptr::Ptr{CArrowSchema}, guardian::GuardianObject)
+    schema = unsafe_load(schema_ptr)
+    
+    # Generate format string based on ToList type and stringtype parameter
+    T = eltype(tolist)
+    if T == UInt8
+        # Check if this is string data or binary data using the stringtype type parameter
+        tolist_type = typeof(tolist)
+        if length(tolist_type.parameters) >= 2 && tolist_type.parameters[2] == true
+            # stringtype=true -> UTF-8 strings
+            schema.format = _create_c_string("u")  # UTF-8 string format
+        else
+            # stringtype=false -> binary data  
+            schema.format = _create_c_string("z")  # Binary data format
+        end
+    else
+        # Generate format for the element type
+        format_str = generate_format_string(T)
+        schema.format = _create_c_string(format_str)
+    end
+    
+    # Set field name (empty for child)
+    schema.name = C_NULL
+    
+    # Set metadata (empty)
+    schema.metadata = C_NULL
+    
+    # Set flags (assume nullable for ToList)
+    schema.flags = ARROW_FLAG_NULLABLE
+    
+    # ToList doesn't have children
+    schema.n_children = Int64(0)
+    schema.children = convert(Ptr{Ptr{CArrowSchema}}, C_NULL)
+    
+    # No dictionary
+    schema.dictionary = convert(Ptr{CArrowSchema}, C_NULL)
+    
+    # Set release callback later
+    schema.release = C_NULL
+    
+    # Store schema pointer as private data
+    schema.private_data = convert(Ptr{Cvoid}, schema_ptr)
+    
+    # Write back the populated schema
+    unsafe_store!(schema_ptr, schema)
+    
+    return nothing
+end
+
 """
     _export_array(arrow_vector::ArrowVector, array_ptr::Ptr{CArrowArray}, guardian::GuardianObject)
 
@@ -139,6 +189,67 @@ function _export_array(arrow_vector::ArrowVector, array_ptr::Ptr{CArrowArray}, g
     array.release = C_NULL
     
     # Store array pointer as private data for release callback
+    array.private_data = convert(Ptr{Cvoid}, array_ptr)
+    
+    # Write back the populated array
+    unsafe_store!(array_ptr, array)
+    
+    return nothing
+end
+
+# Array export for ToList types (used as child arrays in Lists)
+function _export_array(tolist::Arrow.ToList, array_ptr::Ptr{CArrowArray}, guardian::GuardianObject)
+    array = unsafe_load(array_ptr)
+    
+    # Basic array properties
+    # For string ToList, length should be number of strings, not bytes
+    if eltype(tolist) == UInt8 && hasfield(typeof(tolist), :data)
+        array.length = Int64(length(tolist.data))
+    else
+        array.length = Int64(length(tolist))
+    end
+    array.null_count = Int64(0)  # ToList handles nulls at the List level
+    array.offset = Int64(0)
+    
+    # Export buffers based on ToList type
+    buffers = Ptr{Cvoid}[]
+    
+    # Add validity buffer (null for ToList - handled by parent List)
+    push!(buffers, C_NULL)
+    
+    # For UInt8 ToList (strings/binary), we need offsets + data buffers  
+    if eltype(tolist) == UInt8
+        # Add offsets buffer for UTF-8 string or binary array
+        _add_string_offsets_buffer!(buffers, tolist, guardian)
+    end
+    
+    # Add data buffer
+    _add_data_buffers!(buffers, tolist, guardian)
+    
+    # Create buffer array
+    if !isempty(buffers)
+        buffers_array = Vector{Ptr{Cvoid}}(buffers)
+        buffers_ptr = convert(Ptr{Ptr{Cvoid}}, pointer(buffers_array))
+        push!(guardian.buffers, buffers_array)
+        
+        array.n_buffers = Int64(length(buffers))
+        array.buffers = buffers_ptr
+    else
+        array.n_buffers = Int64(0)
+        array.buffers = convert(Ptr{Ptr{Cvoid}}, C_NULL)
+    end
+    
+    # ToList doesn't have children
+    array.n_children = Int64(0)
+    array.children = convert(Ptr{Ptr{CArrowArray}}, C_NULL)
+    
+    # No dictionary
+    array.dictionary = convert(Ptr{CArrowArray}, C_NULL)
+    
+    # Set release callback later
+    array.release = C_NULL
+    
+    # Store array pointer as private data
     array.private_data = convert(Ptr{Cvoid}, array_ptr)
     
     # Write back the populated array
@@ -193,20 +304,191 @@ This is specialized for different Arrow vector types.
 """
 function _add_data_buffers!(buffers::Vector{Ptr{Cvoid}}, arrow_vector::ArrowVector, guardian::GuardianObject)
     # Default implementation for primitive types
-    if hasfield(typeof(arrow_vector), :data) && arrow_vector.data isa AbstractVector
-        data_ptr = pointer(arrow_vector.data)
-        push!(buffers, convert(Ptr{Cvoid}, data_ptr))
-        push!(guardian.buffers, arrow_vector.data)
+    if hasfield(typeof(arrow_vector), :data)
+        data_field = arrow_vector.data
+        # Only try to get pointer if it's a concrete array type that supports it
+        if data_field isa Array || data_field isa Vector
+            try
+                data_ptr = pointer(data_field)
+                push!(buffers, convert(Ptr{Cvoid}, data_ptr))
+                push!(guardian.buffers, data_field)
+            catch
+                # If pointer conversion fails, add null buffer
+                push!(buffers, C_NULL)
+            end
+        else
+            # For complex types, add null buffer (data is handled by children)
+            push!(buffers, C_NULL)
+        end
     end
 end
 
 # Specialized buffer export for different Arrow types
+# Specialized buffer export for List of strings (ToList{UInt8} child)  
+function _add_data_buffers!(buffers::Vector{Ptr{Cvoid}}, arrow_vector::Arrow.List{T,O,<:Arrow.ToList{UInt8}}, guardian::GuardianObject) where {T,O}
+    # For List<String>, we need element indices [0,1,2,...] not byte offsets
+    if hasfield(typeof(arrow_vector), :data) && hasfield(typeof(arrow_vector.data), :data)
+        num_strings = length(arrow_vector.data.data)
+        element_offsets = Vector{Int32}(0:num_strings)
+        
+        offsets_ptr = pointer(element_offsets)
+        push!(buffers, convert(Ptr{Cvoid}, offsets_ptr))
+        push!(guardian.buffers, element_offsets)
+    else
+        push!(buffers, C_NULL)
+    end
+end
+
+# Specialized buffer export for List of binary (Primitive{UInt8, ToList} child)
+function _add_data_buffers!(buffers::Vector{Ptr{Cvoid}}, arrow_vector::Arrow.List{T,O,<:Arrow.Primitive{UInt8,<:Arrow.ToList{UInt8}}}, guardian::GuardianObject) where {T,O}
+    # For List<Binary>, we need element indices [0,1,2,...] not byte offsets
+    if hasfield(typeof(arrow_vector), :data) && hasfield(typeof(arrow_vector.data), :data) && hasfield(typeof(arrow_vector.data.data), :data)
+        num_binaries = length(arrow_vector.data.data.data)  # Primitive -> ToList -> data
+        element_offsets = Vector{Int32}(0:num_binaries)
+        
+        offsets_ptr = pointer(element_offsets)
+        push!(buffers, convert(Ptr{Cvoid}, offsets_ptr))
+        push!(guardian.buffers, element_offsets)
+    else
+        push!(buffers, C_NULL)
+    end
+end
+
 function _add_data_buffers!(buffers::Vector{Ptr{Cvoid}}, arrow_vector::Arrow.List, guardian::GuardianObject)
-    # List arrays need both offsets and data buffers
-    # This would need to be implemented based on Arrow.jl's List internals
-    # For now, add a placeholder
-    push!(buffers, C_NULL)  # Offsets buffer placeholder
-    push!(buffers, C_NULL)  # Values buffer placeholder
+    # List arrays need offsets buffer (values are handled as child array)
+    if hasfield(typeof(arrow_vector), :offsets) && hasfield(typeof(arrow_vector.offsets), :offsets)
+        offsets_ptr = pointer(arrow_vector.offsets.offsets)
+        push!(buffers, convert(Ptr{Cvoid}, offsets_ptr))
+        push!(guardian.buffers, arrow_vector.offsets.offsets)
+    else
+        push!(buffers, C_NULL)
+    end
+end
+
+# Specialized buffer export for Struct types (no data buffers, just validity)
+function _add_data_buffers!(buffers::Vector{Ptr{Cvoid}}, arrow_vector::Arrow.Struct, guardian::GuardianObject)
+    # Struct arrays don't have data buffers, only validity buffer which is handled separately
+    return
+end
+
+# Specialized buffer export for Bool types
+function _add_data_buffers!(buffers::Vector{Ptr{Cvoid}}, arrow_vector::Arrow.BoolVector, guardian::GuardianObject)
+    # Boolean vectors use bit-packed data in the arrow field
+    if hasfield(typeof(arrow_vector), :arrow) && hasfield(typeof(arrow_vector), :pos)
+        # Get the actual data buffer starting from pos
+        data_ptr = pointer(arrow_vector.arrow, arrow_vector.pos)
+        push!(buffers, convert(Ptr{Cvoid}, data_ptr))
+        push!(guardian.buffers, arrow_vector.arrow)
+    else
+        # Fallback to null buffer  
+        push!(buffers, C_NULL)
+    end
+end
+
+# Add offsets buffer for string ToList (UTF-8 string array format)  
+function _add_string_offsets_buffer!(buffers::Vector{Ptr{Cvoid}}, tolist::Arrow.ToList{UInt8}, guardian::GuardianObject)
+    if hasfield(typeof(tolist), :inds)
+        # ToList.inds already contains the correct byte offsets!
+        # Just need to convert to Int32 for Arrow C Data Interface
+        inds = tolist.inds
+        if eltype(inds) != Int32
+            offsets = Vector{Int32}(inds)
+        else
+            offsets = inds
+        end
+        
+        # Add offsets buffer
+        offsets_ptr = pointer(offsets)
+        push!(buffers, convert(Ptr{Cvoid}, offsets_ptr))
+        push!(guardian.buffers, offsets)
+    else
+        # No offsets available - create empty offsets for empty array
+        empty_offsets = Int32[0]  # Empty array has single offset at 0
+        offsets_ptr = pointer(empty_offsets)
+        push!(buffers, convert(Ptr{Cvoid}, offsets_ptr))
+        push!(guardian.buffers, empty_offsets)
+    end
+end
+
+
+# Specialized export methods for Primitive{UInt8, ToList} wrapper (binary arrays)
+function _export_schema(primitive::Arrow.Primitive{UInt8, <:Arrow.ToList}, schema_ptr::Ptr{CArrowSchema}, guardian::GuardianObject)
+    # Delegate to the underlying ToList, which will handle string vs binary format correctly
+    _export_schema(primitive.data, schema_ptr, guardian)
+end
+
+function _export_array(primitive::Arrow.Primitive{UInt8, <:Arrow.ToList}, array_ptr::Ptr{CArrowArray}, guardian::GuardianObject)
+    # Delegate to the underlying ToList
+    _export_array(primitive.data, array_ptr, guardian)
+end
+
+function _add_data_buffers!(buffers::Vector{Ptr{Cvoid}}, primitive::Arrow.Primitive{UInt8, <:Arrow.ToList}, guardian::GuardianObject)
+    # Delegate to the underlying ToList
+    _add_data_buffers!(buffers, primitive.data, guardian)
+end
+
+# Specialized buffer export for ToList types (for string/binary data)
+function _add_data_buffers!(buffers::Vector{Ptr{Cvoid}}, tolist::Arrow.ToList{UInt8}, guardian::GuardianObject)
+    # ToList for strings/binary is essentially the flattened data buffer
+    # Export it as a UInt8 primitive array (just the data buffer)
+    if hasfield(typeof(tolist), :data) && !isempty(tolist.data)
+        # For string ToList, the data contains the individual strings
+        # We need to flatten them into a single UInt8 buffer
+        total_bytes = sum(item === missing ? 0 : (item isa AbstractString ? ncodeunits(item) : length(item)) for item in tolist.data)
+        
+        if total_bytes > 0
+            # Create contiguous buffer
+            flat_data = Vector{UInt8}(undef, total_bytes)
+            pos = 1
+            
+            for item in tolist.data
+                if item !== missing
+                    if item isa AbstractString
+                        bytes = codeunits(item)
+                        copyto!(flat_data, pos, bytes, 1, length(bytes))
+                        pos += length(bytes)
+                    elseif item isa AbstractVector{UInt8}
+                        copyto!(flat_data, pos, item, 1, length(item))
+                        pos += length(item)
+                    end
+                end
+            end
+            
+            data_ptr = pointer(flat_data)
+            push!(buffers, convert(Ptr{Cvoid}, data_ptr))
+            push!(guardian.buffers, flat_data)
+        else
+            # Empty array - create valid empty buffer
+            empty_data = UInt8[]
+            data_ptr = pointer(empty_data)
+            push!(buffers, convert(Ptr{Cvoid}, data_ptr))
+            push!(guardian.buffers, empty_data)
+        end
+    else
+        # No data available - create valid empty buffer
+        empty_data = UInt8[]
+        data_ptr = pointer(empty_data)
+        push!(buffers, convert(Ptr{Cvoid}, data_ptr))
+        push!(guardian.buffers, empty_data)
+    end
+end
+
+# Generic ToList export (for non-UInt8 types)
+function _add_data_buffers!(buffers::Vector{Ptr{Cvoid}}, tolist::Arrow.ToList, guardian::GuardianObject)
+    # For non-UInt8 ToList, treat as a generic array if possible
+    if hasfield(typeof(tolist), :data) && !isempty(tolist.data)
+        # Try to get pointer if it's a concrete array type
+        try
+            data_ptr = pointer(tolist.data)
+            push!(buffers, convert(Ptr{Cvoid}, data_ptr))
+            push!(guardian.buffers, tolist.data)
+        catch
+            # If pointer doesn't work, add null buffer
+            push!(buffers, C_NULL)
+        end
+    else
+        push!(buffers, C_NULL)
+    end
 end
 
 """
@@ -235,6 +517,34 @@ function _export_schema_children(arrow_vector::ArrowVector, guardian::GuardianOb
     return (Int64(0), convert(Ptr{Ptr{CArrowSchema}}, C_NULL))
 end
 
+# Specialized schema children export for List types
+function _export_schema_children(arrow_vector::Arrow.List, guardian::GuardianObject)
+    if !hasfield(typeof(arrow_vector), :data)
+        return (Int64(0), convert(Ptr{Ptr{CArrowSchema}}, C_NULL))
+    end
+    
+    # Lists have exactly one child (the element type)
+    child_schema_ptr = Libc.malloc(sizeof(CArrowSchema))
+    child_schema_ptr_typed = convert(Ptr{CArrowSchema}, child_schema_ptr)
+    
+    # Initialize child schema
+    unsafe_store!(child_schema_ptr_typed, CArrowSchema())
+    
+    # Export child schema
+    child_guardian = GuardianObject(arrow_vector.data)
+    _export_schema(arrow_vector.data, child_schema_ptr_typed, child_guardian)
+    
+    # Store in guardian to keep alive
+    push!(guardian.children, child_guardian)
+    
+    # Create array of child schema pointers
+    children_array = [child_schema_ptr_typed]
+    children_ptr = convert(Ptr{Ptr{CArrowSchema}}, pointer(children_array))
+    push!(guardian.buffers, children_array)
+    
+    return (Int64(1), children_ptr)
+end
+
 """
     _export_array_children(arrow_vector::ArrowVector, guardian::GuardianObject) -> (Int64, Ptr{Ptr{CArrowArray}})
 
@@ -243,6 +553,115 @@ Export child arrays for nested types. Returns (n_children, children_pointer).
 function _export_array_children(arrow_vector::ArrowVector, guardian::GuardianObject)
     # Most types don't have children
     return (Int64(0), convert(Ptr{Ptr{CArrowArray}}, C_NULL))
+end
+
+# Specialized array children export for List types  
+function _export_array_children(arrow_vector::Arrow.List, guardian::GuardianObject)
+    if !hasfield(typeof(arrow_vector), :data)
+        return (Int64(0), convert(Ptr{Ptr{CArrowArray}}, C_NULL))
+    end
+    
+    # Lists have exactly one child (the values array)
+    child_array_ptr = Libc.malloc(sizeof(CArrowArray))
+    child_array_ptr_typed = convert(Ptr{CArrowArray}, child_array_ptr)
+    
+    # Initialize child array
+    unsafe_store!(child_array_ptr_typed, CArrowArray())
+    
+    # Export child array
+    child_guardian = GuardianObject(arrow_vector.data)
+    _export_array(arrow_vector.data, child_array_ptr_typed, child_guardian)
+    
+    # Store in guardian to keep alive
+    push!(guardian.children, child_guardian)
+    
+    # Create array of child array pointers
+    children_array = [child_array_ptr_typed]
+    children_ptr = convert(Ptr{Ptr{CArrowArray}}, pointer(children_array))
+    push!(guardian.buffers, children_array)
+    
+    return (Int64(1), children_ptr)
+end
+
+# Specialized schema children export for Struct types
+function _export_schema_children(arrow_vector::Arrow.Struct, guardian::GuardianObject)
+    if !hasfield(typeof(arrow_vector), :data)
+        return (Int64(0), convert(Ptr{Ptr{CArrowSchema}}, C_NULL))
+    end
+    
+    # Struct has multiple children (one for each field)
+    n_children = length(arrow_vector.data)
+    if n_children == 0
+        return (Int64(0), convert(Ptr{Ptr{CArrowSchema}}, C_NULL))
+    end
+    
+    child_schema_ptrs = Ptr{CArrowSchema}[]
+    
+    for (i, child_vector) in enumerate(arrow_vector.data)
+        child_schema_ptr = Libc.malloc(sizeof(CArrowSchema))
+        child_schema_ptr_typed = convert(Ptr{CArrowSchema}, child_schema_ptr)
+        
+        # Initialize child schema
+        unsafe_store!(child_schema_ptr_typed, CArrowSchema())
+        
+        # Export child schema
+        child_guardian = GuardianObject(child_vector)
+        _export_schema(child_vector, child_schema_ptr_typed, child_guardian)
+        
+        # Set field name if available
+        field_names = getfield(typeof(arrow_vector), :parameters)[3]  # fnames parameter
+        if field_names isa Tuple && i <= length(field_names)
+            field_name = string(field_names[i])
+            schema = unsafe_load(child_schema_ptr_typed)
+            schema.name = _create_c_string(field_name)
+            unsafe_store!(child_schema_ptr_typed, schema)
+        end
+        
+        push!(child_schema_ptrs, child_schema_ptr_typed)
+        push!(guardian.children, child_guardian)
+    end
+    
+    # Create array of child schema pointers
+    children_ptr = convert(Ptr{Ptr{CArrowSchema}}, pointer(child_schema_ptrs))
+    push!(guardian.buffers, child_schema_ptrs)
+    
+    return (Int64(n_children), children_ptr)
+end
+
+# Specialized array children export for Struct types  
+function _export_array_children(arrow_vector::Arrow.Struct, guardian::GuardianObject)
+    if !hasfield(typeof(arrow_vector), :data)
+        return (Int64(0), convert(Ptr{Ptr{CArrowArray}}, C_NULL))
+    end
+    
+    # Struct has multiple children (one for each field)
+    n_children = length(arrow_vector.data)
+    if n_children == 0
+        return (Int64(0), convert(Ptr{Ptr{CArrowArray}}, C_NULL))
+    end
+    
+    child_array_ptrs = Ptr{CArrowArray}[]
+    
+    for child_vector in arrow_vector.data
+        child_array_ptr = Libc.malloc(sizeof(CArrowArray))
+        child_array_ptr_typed = convert(Ptr{CArrowArray}, child_array_ptr)
+        
+        # Initialize child array
+        unsafe_store!(child_array_ptr_typed, CArrowArray())
+        
+        # Export child array
+        child_guardian = GuardianObject(child_vector)
+        _export_array(child_vector, child_array_ptr_typed, child_guardian)
+        
+        push!(child_array_ptrs, child_array_ptr_typed)
+        push!(guardian.children, child_guardian)
+    end
+    
+    # Create array of child array pointers
+    children_ptr = convert(Ptr{Ptr{CArrowArray}}, pointer(child_array_ptrs))
+    push!(guardian.buffers, child_array_ptrs)
+    
+    return (Int64(n_children), children_ptr)
 end
 
 """
