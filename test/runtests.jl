@@ -35,6 +35,7 @@ include(joinpath(dirname(pathof(Arrow)), "../test/testappend.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/integrationtest.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/dates.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/test_cdata.jl"))
+include(joinpath(dirname(pathof(Arrow)), "../test/test_cdata_property.jl"))
 
 struct CustomStruct
     x::Int
