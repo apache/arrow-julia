@@ -486,6 +486,11 @@ Base.propertynames(x::LargeListView) = ()
 largeListViewStart(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, 0)
 largeListViewEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
+# Ensure this binding is distinct from `Base.Type` by forward-declaring it. Otherwise, in
+# Julia 1.12, defining a function called `Type` by simply defining methods ends up actually
+# defining methods for `Base.Type`.
+function Type end
+
 function Type(b::UInt8)
     b == 1 && return Null
     b == 2 && return Int
