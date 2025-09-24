@@ -50,7 +50,7 @@ For a give type `T`, define it's "arrow type kind", or the general category of a
   * [`ArrowTypes.MapKind`](@ref): any `AbstractDict`
   * [`ArrowTypes.StructKind`](@ref): any `NamedTuple` or plain struct (mutable or otherwise)
   * [`ArrowTypes.UnionKind`](@ref): any `Union`
-  * [`ArrowTypes.DictEncodedKind`](@ref): array types that implement the `DataAPI.refarray` interface
+  * [`ArrowTypes.DictEncodedKind`](@ref): array types that implement the `DataAPI.refpool` interface
 
 The list of `ArrowKind`s listed above translate to different ways to physically store data as supported by the arrow data format.
 See the docs for each for an idea of whether they might be an appropriate fit for a custom type.
@@ -404,17 +404,15 @@ concrete_or_concreteunion(T) =
 function ToArrow(x::A) where {A}
     S = eltype(A)
     T = ArrowType(S)
-    if S === T && concrete_or_concreteunion(S)
+    fi = firstindex(x)
+    if S === T && concrete_or_concreteunion(S) && fi == 1
         return x
     elseif !concrete_or_concreteunion(T)
         # arrow needs concrete types, so try to find a concrete common type, preferring unions
         if isempty(x)
             return Missing[]
         end
-        T = typeof(toarrow(x[1]))
-        for i = 2:length(x)
-            @inbounds T = promoteunion(T, typeof(toarrow(x[i])))
-        end
+        T = mapreduce(typeof ∘ toarrow, promoteunion, x)
         if T === Missing && concrete_or_concreteunion(S)
             T = promoteunion(T, typeof(toarrow(default(S))))
         end
@@ -442,6 +440,7 @@ function _convert(::Type{T}, x) where {T}
         return convert(T, x)
     end
 end
-Base.getindex(x::ToArrow{T}, i::Int) where {T} = _convert(T, toarrow(getindex(x.data, i)))
+Base.getindex(x::ToArrow{T}, i::Int) where {T} =
+    _convert(T, toarrow(getindex(x.data, i + firstindex(x.data) - 1)))
 
 end # module ArrowTypes
