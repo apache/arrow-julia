@@ -310,6 +310,15 @@ function testtable(nm, t, writekw, readkw, extratests)
         @test all(isequal.(values(t), values(tt)))
         extratests !== nothing && extratests(tt)
         seekstart(io)
+
+        # Explicitly unthreaded
+        io = Arrow.tobuffer(t; writekw...)
+        tt = Arrow.Table(io; threaded=false, readkw...)
+        @test length(tt) == length(t)
+        @test all(isequal.(values(t), values(tt)))
+        extratests !== nothing && extratests(tt)
+        seekstart(io)
+
         str = Arrow.Stream(io; readkw...)
         tt = first(str)
         @test length(tt) == length(t)
