@@ -28,6 +28,12 @@ function writezeros(io::IO, n::Integer)
     s
 end
 
+if isdefined(Base, :waitall)
+    const _waitall = waitall
+else
+    _waitall(tasks) = foreach(wait, tasks)
+end
+
 # efficient writing of arrays
 writearray(io, col) = writearray(io, maybemissing(eltype(col)), col)
 
