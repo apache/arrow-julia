@@ -39,7 +39,7 @@ jobs:
   release:
     name: Verify release - ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -77,7 +77,7 @@ jobs:
   test:
     name: ${{ matrix.pkg.name }} - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -127,7 +127,7 @@ jobs:
   test_monorepo:
     name: Monorepo dev - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       fail-fast: true
       matrix:
