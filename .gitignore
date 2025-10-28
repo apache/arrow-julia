@@ -16,6 +16,7 @@
 # under the License.
 
 Manifest.toml
+Manifest-v*.toml
 .DS_STORE
 *.jl.cov
 *.jl.*.cov
