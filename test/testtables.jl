@@ -300,6 +300,35 @@ testtables = [
         (convert=false,),
         nothing,
     ),
+    (
+        "RunEndEncoded simple",
+        (col1=[1, 1, 1, 2, 2],),
+        NamedTuple(),
+        NamedTuple(),
+        function (tt)
+            @test tt.col1 isa Arrow.RunEndEncoded
+            @test collect(tt.col1) == [1, 1, 1, 2, 2]
+            @test length(tt.col1) == 5
+            @test tt.col1[1] == 1
+            @test tt.col1[3] == 1
+            @test tt.col1[4] == 2
+            @test tt.col1[5] == 2
+        end,
+    ),
+    (
+        "RunEndEncoded with nulls",
+        (col1=[1.0, 1.0, 1.0, 1.0, missing, missing, 2.0, 2.0, 2.0, 2.0],),
+        NamedTuple(),
+        NamedTuple(),
+        function (tt)
+            @test tt.col1 isa Arrow.RunEndEncoded
+            @test collect(tt.col1) == [1.0, 1.0, 1.0, 1.0, missing, missing, 2.0, 2.0, 2.0, 2.0]
+            @test length(tt.col1) == 10
+            @test tt.col1[1] == 1.0
+            @test ismissing(tt.col1[5])
+            @test tt.col1[7] == 2.0
+        end,
+    ),
 ];
 
 function testtable(nm, t, writekw, readkw, extratests)

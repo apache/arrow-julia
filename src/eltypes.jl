@@ -432,6 +432,30 @@ ArrowTypes.arrowname(::Type{P}) where {P<:Dates.Period} = PERIOD_SYMBOL
 ArrowTypes.JuliaType(::Val{PERIOD_SYMBOL}, ::Type{Duration{U}}) where {U} = periodtype(U)
 ArrowTypes.fromarrow(::Type{P}, x::Duration{U}) where {P<:Dates.Period,U} = convert(P, x)
 
+# RunEndEncoded type
+function juliaeltype(f::Meta.Field, ree::Meta.RunEndEncoded, convert)
+    # RunEndEncoded has two child arrays: run_ends and values
+    # The element type is determined by the values child array
+    @assert length(f.children) == 2 "RunEndEncoded must have exactly 2 children (run_ends and values)"
+    run_ends_field = f.children[1]
+    values_field = f.children[2]
+
+    # Get the element type from the values child
+    values_type = juliaeltype(values_field, buildmetadata(values_field), convert)
+
+    return values_type
+end
+
+function arrowtype(b, x::RunEndEncoded{T,R,A}) where {T,R,A}
+    # Create field offsets for the two child arrays
+    children = [
+        fieldoffset(b, "run_ends", x.run_ends),
+        fieldoffset(b, "values", x.values)
+    ]
+    Meta.runEndEncodedStart(b)
+    return Meta.RunEndEncoded, Meta.runEndEncodedEnd(b), children
+end
+
 # nested types; call juliaeltype recursively on nested children
 function juliaeltype(
     f::Meta.Field,
