@@ -33,6 +33,7 @@ export ArrowKind,
     StructKind,
     UnionKind,
     DictEncodedKind,
+    RunEndEncodedKind,
     toarrow,
     arrowname,
     fromarrow,
@@ -347,6 +348,9 @@ ArrowKind(::Union) = UnionKind()
 
 "DictEncodedKind store a small pool of unique values in one buffer, with a full-length buffer of integer offsets into the small value pool"
 struct DictEncodedKind <: ArrowKind end
+
+"RunEndEncodedKind efficiently stores arrays with repeated values using run-end encoding, with two child arrays: run_ends (indices where runs end) and values (the actual values)"
+struct RunEndEncodedKind <: ArrowKind end
 
 """
 There are a couple places when writing arrow buffers where
