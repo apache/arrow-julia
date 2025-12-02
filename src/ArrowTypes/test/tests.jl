@@ -192,6 +192,16 @@ end
         @test eltype(x) == Union{Float64,String}
         @test x == [1.0, 3.14, "hey"]
 
+        x = ArrowTypes.ToArrow(OffsetArray([1, 2, 3], -3:-1))
+        @test x isa ArrowTypes.ToArrow{Int,OffsetVector{Int,Vector{Int}}}
+        @test eltype(x) == Int
+        @test x == [1, 2, 3]
+
+        x = ArrowTypes.ToArrow(OffsetArray(Any[1, 3.14], -3:-2))
+        @test x isa ArrowTypes.ToArrow{Float64,OffsetVector{Any,Vector{Any}}}
+        @test eltype(x) == Float64
+        @test x == [1, 3.14]
+
         @testset "respect non-missing concrete type" begin
             struct DateTimeTZ
                 instant::Int64
