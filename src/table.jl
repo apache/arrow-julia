@@ -1065,6 +1065,52 @@ end
 
 function build(
     f::Meta.Field,
+    ree::Meta.RunEndEncoded,
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    varbufferidx,
+    convert,
+)
+    @debug "building array: RunEndEncoded"
+    # REE parent has empty validity bitmap
+    validity = buildbitmap(batch, rb, nodeidx, bufferidx)
+    bufferidx += 1
+    len = rb.nodes[nodeidx].length
+    nodeidx += 1
+
+    meta = buildmetadata(f.custom_metadata)
+    T = juliaeltype(f, meta, convert)
+
+    # Build the two child arrays: run_ends and values
+    @assert length(f.children) == 2 "RunEndEncoded must have exactly 2 children"
+
+    # First child: run_ends (Int16, Int32, or Int64)
+    run_ends_child = f.children[1]
+    run_ends_array, nodeidx, bufferidx, varbufferidx =
+        build(run_ends_child, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+
+    # Extract the actual run_ends vector
+    # run_ends_array should be a Primitive{R, Vector{R}} where R is Int16/Int32/Int64
+    run_ends = run_ends_array.data
+    R = eltype(run_ends)
+
+    # Second child: values (any Arrow type)
+    values_child = f.children[2]
+    values_array, nodeidx, bufferidx, varbufferidx =
+        build(values_child, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+
+    bytes = UInt8[]  # Reference to arrow memory (from children)
+    return RunEndEncoded{T,R,typeof(values_array)}(bytes, validity, run_ends, values_array, len, meta),
+    nodeidx,
+    bufferidx,
+    varbufferidx
+end
+
+function build(
+    f::Meta.Field,
     L::Meta.Null,
     batch,
     rb,
