@@ -45,7 +45,7 @@ struct CustomStruct2{sym}
     x::Int
 end
 
-@testset "Arrow" begin
+# @testset "Arrow" begin
     @testset "table roundtrips" begin
         for case in testtables
             testtable(case...)
@@ -388,6 +388,7 @@ end
             ))
             tt = Arrow.Table(Arrow.tobuffer(t))
             @test length(tt.a) == 12
+            #  Evaluated: [1, 2, 3, 1, 2, 3, 4, 1, 2, 3, 4, 4]
             @test tt.a == [1, 2, 3, 1, 2, 3, 4, 1, 2, 3, 4, 5]
 
             t = Tables.partitioner((
@@ -1118,4 +1119,4 @@ end
             colmetadata!(df, :c, "cckey", "ccvalue")
         end
     end # @testset "DataAPI.metadata"
-end
+# end
