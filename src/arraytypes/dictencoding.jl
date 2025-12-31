@@ -191,7 +191,7 @@ function arrowvector(
                     false,
                     getmetadata(encoding),
                 )
-                de[id] = Lockable(encoding)
+                de[id] = Lockable(encoding, encodinglockable.lock)
             end
         end
     end
@@ -327,7 +327,7 @@ function arrowvector(
                         false,
                         getmetadata(encoding),
                     )
-                    de[id] = Lockable(encoding)
+                    de[id] = Lockable(encoding, encodinglockable.lock)
                 end
             end
         end
