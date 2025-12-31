@@ -30,11 +30,14 @@ using DataFrames
 import Random: randstring
 using TestSetExtensions: ExtendedTestSet
 
+# this formulation tests the loaded ArrowTypes, even if it's not the dev version
+# within the mono-repo
 include(joinpath(dirname(pathof(ArrowTypes)), "../test/tests.jl"))
-include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
-include(joinpath(dirname(pathof(Arrow)), "../test/testappend.jl"))
-include(joinpath(dirname(pathof(Arrow)), "../test/integrationtest.jl"))
-include(joinpath(dirname(pathof(Arrow)), "../test/dates.jl"))
+
+include(joinpath(@__DIR__, "testtables.jl"))
+include(joinpath(@__DIR__, "testappend.jl"))
+include(joinpath(@__DIR__, "integrationtest.jl"))
+include(joinpath(@__DIR__, "dates.jl"))
 
 struct CustomStruct
     x::Int
