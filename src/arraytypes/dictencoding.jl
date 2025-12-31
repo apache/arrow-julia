@@ -167,7 +167,7 @@ function arrowvector(
                 de,
                 ded,
                 nothing;
-                dictencode=dictencode,
+                dictencode=dictencodenested,
                 dictencodenested=dictencodenested,
                 dictencoding=true,
                 kw...,
@@ -252,7 +252,7 @@ function arrowvector(
             de,
             ded,
             nothing;
-            dictencode=dictencode,
+            dictencode=dictencodenested,
             dictencodenested=dictencodenested,
             dictencoding=true,
             kw...,
@@ -303,7 +303,7 @@ function arrowvector(
                     de,
                     ded,
                     nothing;
-                    dictencode=dictencode,
+                    dictencode=dictencodenested,
                     dictencodenested=dictencodenested,
                     dictencoding=true,
                     kw...,
