@@ -28,6 +28,7 @@ using DataAPI
 using FilePathsBase
 using DataFrames
 import Random: randstring
+using TestSetExtensions: ExtendedTestSet
 
 include(joinpath(dirname(pathof(ArrowTypes)), "../test/tests.jl"))
 include(joinpath(dirname(pathof(Arrow)), "../test/testtables.jl"))
@@ -45,7 +46,7 @@ struct CustomStruct2{sym}
     x::Int
 end
 
-# @testset "Arrow" begin
+@testset ExtendedTestSet "Arrow" begin
     @testset "table roundtrips" begin
         for case in testtables
             testtable(case...)
@@ -1119,4 +1120,4 @@ end
             colmetadata!(df, :c, "cckey", "ccvalue")
         end
     end # @testset "DataAPI.metadata"
-# end
+end
