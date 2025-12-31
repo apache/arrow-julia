@@ -142,6 +142,8 @@ function arrowvector(
     kw...,
 )
     id = x.encoding.id
+    # XXX This is a race condition if two workers hit this block at the same time, then they'll create
+    # distinct locks
     if !haskey(de, id)
         de[id] = Lockable(x.encoding)
         return x
@@ -216,6 +218,8 @@ function arrowvector(
     x = x.data
     len = length(x)
     validity = ValidityBitmap(x)
+    # XXX This is a race condition if two workers hit this block at the same time, then they'll create
+    # distinct locks
     if !haskey(de, id)
         # dict encoding doesn't exist yet, so create for 1st time
         if DataAPI.refarray(x) === x || DataAPI.refpool(x) === nothing
