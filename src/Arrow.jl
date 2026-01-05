@@ -26,11 +26,11 @@ This implementation supports the 1.0 version of the specification, including sup
   * Extension types
   * Streaming, file, record batch, and replacement and isdelta dictionary messages
   * Buffer compression/decompression via the standard LZ4 frame and Zstd formats
+  * C data interface for zero-copy interoperability with other Arrow implementations
 
 It currently doesn't include support for:
   * Tensors or sparse tensors
   * Flight RPC
-  * C data interface
 
 Third-party data formats:
   * csv and parquet support via the existing [CSV.jl](https://github.com/JuliaData/CSV.jl) and [Parquet.jl](https://github.com/JuliaIO/Parquet.jl) packages
@@ -79,6 +79,7 @@ include("table.jl")
 include("write.jl")
 include("append.jl")
 include("show.jl")
+include("cdata.jl")
 
 const ZSTD_COMPRESSOR = Lockable{ZstdCompressor}[]
 const ZSTD_DECOMPRESSOR = Lockable{ZstdDecompressor}[]
