@@ -385,6 +385,8 @@ end
         end
 
         @testset "# 126" begin
+            # XXX This test also captures a race condition in multithreaded
+            # writes of dictionary encoded arrays
             t = Tables.partitioner((
                 (a=Arrow.toarrowvector(PooledArray([1, 2, 3])),),
                 (a=Arrow.toarrowvector(PooledArray([1, 2, 3, 4])),),
@@ -392,7 +394,6 @@ end
             ))
             tt = Arrow.Table(Arrow.tobuffer(t))
             @test length(tt.a) == 12
-            #  Evaluated: [1, 2, 3, 1, 2, 3, 4, 1, 2, 3, 4, 4]
             @test tt.a == [1, 2, 3, 1, 2, 3, 4, 1, 2, 3, 4, 5]
 
             t = Tables.partitioner((
