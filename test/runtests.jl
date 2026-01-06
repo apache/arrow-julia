@@ -610,7 +610,7 @@ end
         @testset "# 181" begin
             # XXX this test hangs on Julia 1.12 when using a deeper nesting
             d = Dict{Int,Int}()
-            for i in 1:1
+            for i = 1:1
                 d = Dict(i => d)
             end
             tbl = (x=[d],)
