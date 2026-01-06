@@ -607,6 +607,7 @@ end
             @test eltype(tbl.a) == Union{Int64,Missing}
         end
 
+        @testset "# 181" begin
             # XXX this test hangs on Julia 1.12 when using a deeper nesting
             d = Dict{Int,Int}()
             for i in 1:1
