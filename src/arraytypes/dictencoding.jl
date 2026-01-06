@@ -146,54 +146,53 @@ function arrowvector(
     # distinct locks
     if !haskey(de, id)
         de[id] = Lockable(x.encoding)
-        return x
-    end
-
-    encodinglockable = de[id]
-    Base.@lock encodinglockable begin
-        encoding = encodinglockable.value
-        # in this case, we just need to check if any values in our local pool need to be delta dicationary serialized
-        deltas = setdiff(x.encoding, encoding)
-        if !isempty(deltas)
-            ET = indextype(encoding)
-            if length(deltas) + length(encoding) > typemax(ET)
-                error(
-                    "fatal error serializing dict encoded column with ref index type of $ET; subsequent record batch unique values resulted in $(length(deltas) + length(encoding)) unique values, which exceeds possible index values in $ET",
+    else
+        encodinglockable = de[id]
+        Base.@lock encodinglockable begin
+            encoding = encodinglockable.value
+            # in this case, we just need to check if any values in our local pool need to be delta dicationary serialized
+            deltas = setdiff(x.encoding, encoding)
+            if !isempty(deltas)
+                ET = indextype(encoding)
+                if length(deltas) + length(encoding) > typemax(ET)
+                    error(
+                        "fatal error serializing dict encoded column with ref index type of $ET; subsequent record batch unique values resulted in $(length(deltas) + length(encoding)) unique values, which exceeds possible index values in $ET",
+                    )
+                end
+                data = arrowvector(
+                    deltas,
+                    i,
+                    nl,
+                    fi,
+                    de,
+                    ded,
+                    nothing;
+                    dictencode=dictencodenested,
+                    dictencodenested=dictencodenested,
+                    dictencoding=true,
+                    kw...,
                 )
-            end
-            data = arrowvector(
-                deltas,
-                i,
-                nl,
-                fi,
-                de,
-                ded,
-                nothing;
-                dictencode=dictencodenested,
-                dictencodenested=dictencodenested,
-                dictencoding=true,
-                kw...,
-            )
-            push!(
-                ded,
-                DictEncoding{eltype(data),ET,typeof(data)}(
-                    id,
-                    data,
-                    false,
-                    getmetadata(data),
-                ),
-            )
-            if typeof(encoding.data) <: ChainedVector
-                append!(encoding.data, data)
-            else
-                data2 = ChainedVector([encoding.data, data])
-                encoding = DictEncoding{eltype(data2),ET,typeof(data2)}(
-                    id,
-                    data2,
-                    false,
-                    getmetadata(encoding),
+                push!(
+                    ded,
+                    DictEncoding{eltype(data),ET,typeof(data)}(
+                        id,
+                        data,
+                        false,
+                        getmetadata(data),
+                    ),
                 )
-                de[id] = Lockable(encoding, encodinglockable.lock)
+                if typeof(encoding.data) <: ChainedVector
+                    append!(encoding.data, data)
+                else
+                    data2 = ChainedVector([encoding.data, data])
+                    encoding = DictEncoding{eltype(data2),ET,typeof(data2)}(
+                        id,
+                        data2,
+                        false,
+                        getmetadata(encoding),
+                    )
+                    de[id] = Lockable(encoding)
+                end
             end
         end
     end
@@ -331,7 +330,7 @@ function arrowvector(
                         false,
                         getmetadata(encoding),
                     )
-                    de[id] = Lockable(encoding, encodinglockable.lock)
+                    de[id] = Lockable(encoding)
                 end
             end
         end
