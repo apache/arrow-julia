@@ -318,25 +318,25 @@ function write(writer::Writer, source)
             #         writer.colmeta,
             #     )
             # else
-                @async process_partition(
-                    tblcols,
-                    writer.dictencodings,
-                    writer.largelists,
-                    writer.compress,
-                    writer.denseunions,
-                    writer.dictencode,
-                    writer.dictencodenested,
-                    writer.maxdepth,
-                    writer.sync,
-                    writer.msgs,
-                    writer.alignment,
-                    $(writer.partition_count),
-                    writer.schema,
-                    writer.errorref,
-                    writer.anyerror,
-                    writer.meta,
-                    writer.colmeta,
-                )
+            @async process_partition(
+                tblcols,
+                writer.dictencodings,
+                writer.largelists,
+                writer.compress,
+                writer.denseunions,
+                writer.dictencode,
+                writer.dictencodenested,
+                writer.maxdepth,
+                writer.sync,
+                writer.msgs,
+                writer.alignment,
+                $(writer.partition_count),
+                writer.schema,
+                writer.errorref,
+                writer.anyerror,
+                writer.meta,
+                writer.colmeta,
+            )
             # end
         end
         writer.partition_count += 1
