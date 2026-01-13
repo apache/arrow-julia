@@ -295,47 +295,49 @@ function write(writer::Writer, source)
             recbatchmsg = makerecordbatchmsg(writer.schema[], cols, writer.alignment)
             put!(writer.msgs, recbatchmsg)
         else
-            if writer.threaded
-                @wkspawn process_partition(
-                    tblcols,
-                    writer.dictencodings,
-                    writer.largelists,
-                    writer.compress,
-                    writer.denseunions,
-                    writer.dictencode,
-                    writer.dictencodenested,
-                    writer.maxdepth,
-                    writer.sync,
-                    writer.msgs,
-                    writer.alignment,
-                    $(writer.partition_count),
-                    writer.schema,
-                    writer.errorref,
-                    writer.anyerror,
-                    writer.meta,
-                    writer.colmeta,
-                )
-            else
-                @async process_partition(
-                    tblcols,
-                    writer.dictencodings,
-                    writer.largelists,
-                    writer.compress,
-                    writer.denseunions,
-                    writer.dictencode,
-                    writer.dictencodenested,
-                    writer.maxdepth,
-                    writer.sync,
-                    writer.msgs,
-                    writer.alignment,
-                    $(writer.partition_count),
-                    writer.schema,
-                    writer.errorref,
-                    writer.anyerror,
-                    writer.meta,
-                    writer.colmeta,
-                )
-            end
+            # XXX There is a race condition in the processing of dict encodings
+            # so we disable multithreaded writing until that can be addressed. See #582
+            # if writer.threaded
+            #     @wkspawn process_partition(
+            #         tblcols,
+            #         writer.dictencodings,
+            #         writer.largelists,
+            #         writer.compress,
+            #         writer.denseunions,
+            #         writer.dictencode,
+            #         writer.dictencodenested,
+            #         writer.maxdepth,
+            #         writer.sync,
+            #         writer.msgs,
+            #         writer.alignment,
+            #         $(writer.partition_count),
+            #         writer.schema,
+            #         writer.errorref,
+            #         writer.anyerror,
+            #         writer.meta,
+            #         writer.colmeta,
+            #     )
+            # else
+            @async process_partition(
+                tblcols,
+                writer.dictencodings,
+                writer.largelists,
+                writer.compress,
+                writer.denseunions,
+                writer.dictencode,
+                writer.dictencodenested,
+                writer.maxdepth,
+                writer.sync,
+                writer.msgs,
+                writer.alignment,
+                $(writer.partition_count),
+                writer.schema,
+                writer.errorref,
+                writer.anyerror,
+                writer.meta,
+                writer.colmeta,
+            )
+            # end
         end
         writer.partition_count += 1
     end
