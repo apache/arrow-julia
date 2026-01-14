@@ -233,10 +233,12 @@ function arrowvector(
         end
         # horrible hack? yes. better than taking CategoricalArrays dependency? also yes.
         if typeof(pool).name.name == :CategoricalRefPool
+            # In CategoricalArrays 1.0+, levels() returns a CategoricalArray,
+            # so we need to collect() to get a plain array
             if eltype(x) >: Missing
-                pool = vcat(missing, DataAPI.levels(x))
+                pool = vcat(missing, collect(DataAPI.levels(x)))
             else
-                pool = DataAPI.levels(x)
+                pool = collect(DataAPI.levels(x))
                 for i = 1:length(inds)
                     @inbounds inds[i] -= 1
                 end

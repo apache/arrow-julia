@@ -54,6 +54,17 @@ function write end
 write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
 
 function write(file_path, tbl; kwargs...)
+    # Check if tbl is an Arrow.Table that was mmap'd from the target file
+    # Writing to the same file would cause a bus error (SIGBUS) because
+    # opening for write truncates the file, invalidating the mmap'd memory
+    if tbl isa Table && ismmappedfrom(tbl, file_path)
+        path_str = file_path isa AbstractString ? abspath(file_path) : string(file_path)
+        throw(ArgumentError(
+            "Cannot write to '$(path_str)': the source table contains data " *
+            "mmap'd from this file. Writing would invalidate the memory and cause a crash. " *
+            "To overwrite the file, first copy the data: Arrow.write(path, Arrow.Table(copy.(eachcol(tbl))))"
+        ))
+    end
     open(Writer, file_path; file=true, kwargs...) do writer
         write(writer, tbl)
     end
@@ -567,10 +578,20 @@ function Base.write(io::IO, msg::Message, blocks, sch, alignment)
     metalen = padding(length(msg.msgflatbuf), alignment)
     @debug "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch), headerType = $(msg.headerType)"
     if msg.blockmsg
-        push!(
-            blocks[msg.isrecordbatch ? 1 : 2],
-            Block(position(io), metalen + 8, msg.bodylen),
-        )
+        # Track block positions for file format footer
+        # Skip for non-seekable streams (streaming to FIFOs, sockets, etc.)
+        # where position() would fail - block tracking is only needed for file format
+        pos = try
+            position(io)
+        catch
+            nothing  # Non-seekable stream, skip block tracking
+        end
+        if pos !== nothing
+            push!(
+                blocks[msg.isrecordbatch ? 1 : 2],
+                Block(pos, metalen + 8, msg.bodylen),
+            )
+        end
     end
     # now write the final message spec out
     # continuation byte
