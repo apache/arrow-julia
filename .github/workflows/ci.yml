@@ -115,6 +115,12 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1.6
         with:
           project: ${{ matrix.pkg.dir }}
+      - name: Dev local ArrowTypes for Arrow.jl tests
+        if: matrix.pkg.name == 'Arrow.jl'
+        shell: julia --project=. {0}
+        run: |
+          using Pkg
+          Pkg.develop(PackageSpec(path="src/ArrowTypes"))
       - uses: julia-actions/julia-runtest@v1
         env:
           JULIA_NUM_THREADS: ${{ matrix.nthreads }}
