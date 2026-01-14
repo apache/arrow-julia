@@ -27,6 +27,7 @@ using CategoricalArrays
 using DataAPI
 using FilePathsBase
 using DataFrames
+using OffsetArrays
 import Random: randstring
 using TestSetExtensions: ExtendedTestSet
 
