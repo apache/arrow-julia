@@ -23,10 +23,56 @@ end
 ArrowBlob(bytes::Vector{UInt8}, pos::Int, len::Nothing) =
     ArrowBlob(bytes, pos, length(bytes))
 
+# Registry to track mmap'd byte arrays and their source file paths
+# Used to detect when user tries to write to a file they're currently reading from
+const MMAP_FILE_REGISTRY = WeakKeyDict{Vector{UInt8},String}()
+
 tobytes(bytes::Vector{UInt8}) = bytes
 tobytes(io::IO) = Base.read(io)
-tobytes(io::IOStream) = Mmap.mmap(io)
+
+function tobytes(io::IOStream)
+    # Try to use mmap for seekable streams (regular files)
+    # Fall back to read() for non-seekable streams (FIFOs, pipes, etc.)
+    # where mmap would return empty bytes or fail
+    try
+        # Check if stream is seekable by testing position/seek
+        pos = position(io)
+        seek(io, pos)
+        # Also check filesize - FIFOs report size 0
+        if filesize(io) > 0
+            return Mmap.mmap(io)
+        end
+    catch
+        # Not seekable, fall through to read
+    end
+    # Non-seekable or zero-size: read all bytes
+    return Base.read(io)
+end
+
+function tobytes(file_path::AbstractString)
+    bytes = open(tobytes, file_path, "r")
+    # Register the mmap'd bytes with the absolute file path for later detection
+    MMAP_FILE_REGISTRY[bytes] = abspath(file_path)
+    return bytes
+end
+# Fallback for other path-like types (e.g., FilePathsBase.PosixPath, AWSS3.S3Path)
+# These types implement `open(file_path, mode)` so use the same pattern
 tobytes(file_path) = open(tobytes, file_path, "r")
+
+"""
+    Arrow.getsourcefile(bytes::Vector{UInt8})
+
+Return the source file path if `bytes` was mmap'd from a file, otherwise `nothing`.
+"""
+getsourcefile(bytes::Vector{UInt8}) = get(MMAP_FILE_REGISTRY, bytes, nothing)
+
+"""
+    Arrow.sourcefile(x)
+
+Return the source file path if `x` is an Arrow array backed by mmap'd data, otherwise `nothing`.
+"""
+sourcefile(x) = nothing
+sourcefile(x::ArrowVector) = getfield(x, :arrow) isa Vector{UInt8} ? getsourcefile(getfield(x, :arrow)) : nothing
 
 struct BatchIterator
     bytes::Vector{UInt8}
@@ -348,6 +394,51 @@ columns(t::Table) = getfield(t, :columns)
 lookup(t::Table) = getfield(t, :lookup)
 schema(t::Table) = getfield(t, :schema)
 metadata(t::Table) = getfield(t, :metadata)
+
+"""
+    Arrow.sourcefiles(t::Table)
+
+Return a vector of unique source file paths that the table's columns are backed by.
+Returns an empty vector if no columns are backed by mmap'd files.
+"""
+function sourcefiles(t::Table)
+    files = String[]
+    for col in columns(t)
+        f = sourcefile(col)
+        if f !== nothing && f ∉ files
+            push!(files, f)
+        end
+    end
+    return files
+end
+
+"""
+    Arrow.ismmappedfrom(t::Table, file_path::AbstractString)
+    Arrow.ismmappedfrom(t::Table, file_path)
+
+Return `true` if the table contains columns backed by mmap'd data from the specified file.
+"""
+function ismmappedfrom(t::Table, file_path::AbstractString)
+    target = abspath(file_path)
+    for col in columns(t)
+        f = sourcefile(col)
+        if f !== nothing && f == target
+            return true
+        end
+    end
+    return false
+end
+# Fallback for path-like types (e.g., FilePathsBase.PosixPath)
+# Note: We only track string paths in MMAP_FILE_REGISTRY, so non-string paths
+# won't match anyway. This fallback tries string conversion, but returns false
+# if conversion fails (some path types have broken string() implementations).
+function ismmappedfrom(t::Table, file_path)
+    try
+        return ismmappedfrom(t, string(file_path))
+    catch
+        return false  # Can't convert to string, can't match registry
+    end
+end
 
 """
     Arrow.getmetadata(x)
