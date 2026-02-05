@@ -420,9 +420,10 @@ function ToArrow(x::A) where {A}
     return ToArrow{T,A}(x)
 end
 
-Base.IndexStyle(::Type{<:ToArrow}) = Base.IndexLinear()
-Base.size(x::ToArrow) = (length(x.data),)
-Base.eltype(::Type{TA}) where {T,A,TA<:ToArrow{T,A}} = T
+Base.IndexStyle(::Type{<:ToArrow{<:Any,A}}) where {A} = Base.IndexStyle(A)
+Base.size(x::ToArrow) = size(x.data)
+Base.axes(x::ToArrow) = axes(x.data)
+
 function _convert(::Type{T}, x) where {T}
     if x isa T
         return x
