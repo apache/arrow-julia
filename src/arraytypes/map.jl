@@ -43,8 +43,108 @@ Base.size(l::Map) = (l.ℓ,)
     end
 end
 
-keyvalues(KT, ::Missing) = missing
-keyvalues(KT, x::AbstractDict) = [KT(k, v) for (k, v) in pairs(x)]
+@inline function _promotemapoffsets(offsets::Vector{Int32}, len::Int, filled::Int)
+    promoted = Vector{Int64}(undef, len + 1)
+    copyto!(promoted, 1, offsets, 1, filled)
+    return promoted
+end
+
+function _mapoffsetsandvaluesindexed(::Type{KT}, x; largelists::Bool=false) where {KT}
+    len = length(x)
+    O = largelists ? Int64 : Int32
+    offsets = Vector{O}(undef, len + 1)
+    offsets[1] = zero(O)
+    total = 0
+    off = firstindex(x) - 1
+    @inbounds for i = 1:len
+        y = x[i + off]
+        if y !== missing
+            total += length(y)
+            if O === Int32 && total > typemax(Int32)
+                O = Int64
+                offsets = _promotemapoffsets(offsets, len, i)
+            end
+        end
+        offsets[i + 1] = total
+    end
+    values = Vector{KT}(undef, total)
+    pos = 1
+    @inbounds for i = 1:len
+        y = x[i + off]
+        y === missing && continue
+        for (k, v) in pairs(y)
+            values[pos] = KT(k, v)
+            pos += 1
+        end
+    end
+    return offsets, values
+end
+
+function mapoffsetsandvalues(::Type{KT}, x; largelists::Bool=false) where {KT}
+    Base.has_offset_axes(x) &&
+        return _mapoffsetsandvaluesindexed(KT, x; largelists=largelists)
+    len = length(x)
+    O = largelists ? Int64 : Int32
+    offsets = Vector{O}(undef, len + 1)
+    offsets[1] = zero(O)
+    total = 0
+    i = 1
+    for y in x
+        if y !== missing
+            total += length(y)
+            if O === Int32 && total > typemax(Int32)
+                O = Int64
+                offsets = _promotemapoffsets(offsets, len, i)
+            end
+        end
+        @inbounds offsets[i + 1] = total
+        i += 1
+    end
+    values = Vector{KT}(undef, total)
+    pos = 1
+    for y in x
+        y === missing && continue
+        for (k, v) in pairs(y)
+            @inbounds values[pos] = KT(k, v)
+            pos += 1
+        end
+    end
+    return offsets, values
+end
+
+function mapoffsetsandvalues(
+    ::Type{KT},
+    x::ArrowTypes.ToArrow;
+    largelists::Bool=false,
+) where {KT}
+    len = length(x)
+    O = largelists ? Int64 : Int32
+    offsets = Vector{O}(undef, len + 1)
+    offsets[1] = zero(O)
+    total = 0
+    @inbounds for i = 1:len
+        y = x[i]
+        if y !== missing
+            total += length(y)
+            if O === Int32 && total > typemax(Int32)
+                O = Int64
+                offsets = _promotemapoffsets(offsets, len, i)
+            end
+        end
+        offsets[i + 1] = total
+    end
+    values = Vector{KT}(undef, total)
+    pos = 1
+    @inbounds for i = 1:len
+        y = x[i]
+        y === missing && continue
+        for (k, v) in pairs(y)
+            values[pos] = KT(k, v)
+            pos += 1
+        end
+    end
+    return offsets, values
+end
 
 keyvaluetypes(::Type{NamedTuple{(:key, :value),Tuple{K,V}}}) where {K,V} = (K, V)
 
@@ -67,13 +167,12 @@ function arrowvector(::MapKind, x, i, nl, fi, de, ded, meta; largelists::Bool=fa
         ),
     )
     KT = KeyValue{KDT,VDT}
-    VT = Vector{KT}
-    T = DT !== ET ? Union{Missing,VT} : VT
-    flat = ToList(T[keyvalues(KT, y) for y in x]; largelists=largelists)
-    offsets = Offsets(UInt8[], flat.inds)
-    data = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; largelists=largelists, kw...)
+    offsetsdata, values = mapoffsetsandvalues(KT, x; largelists=largelists)
+    offsets = Offsets(UInt8[], offsetsdata)
+    data =
+        arrowvector(values, i, nl + 1, fi, de, ded, nothing; largelists=largelists, kw...)
     K, V = keyvaluetypes(eltype(data))
-    return Map{withmissing(ET, Dict{K,V}),eltype(flat.inds),typeof(data)}(
+    return Map{withmissing(ET, Dict{K,V}),eltype(offsetsdata),typeof(data)}(
         validity,
         offsets,
         data,

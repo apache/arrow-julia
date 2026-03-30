@@ -86,13 +86,17 @@ _codeunits(x::Base.CodeUnits) = x
 
 # an AbstractVector version of Iterators.flatten
 # code based on SentinelArrays.ChainedVector
-struct ToList{T,stringtype,A,I} <: AbstractVector{T}
-    data::Vector{A} # A is AbstractVector or AbstractString
+struct ToList{T,stringtype,A<:AbstractVector,I} <: AbstractVector{T}
+    data::A # A is the outer AbstractVector of AbstractVector or AbstractString
     inds::Vector{I}
+    offset::Int
 end
 
-origtype(::ToList{T,S,A,I}) where {T,S,A,I} = A
+origtype(::ToList{T,S,A,I}) where {T,S,A<:AbstractVector,I} = eltype(A)
 liststringtype(::Type{ToList{T,S,A,I}}) where {T,S,A,I} = S
+materializeouter(::Type) = false
+materializeouter(input) = materializeouter(typeof(input))
+materializeouterdata(input) = materializeouter(input) ? collect(input) : input
 function liststringtype(::List{T,O,A}) where {T,O,A}
     ST = Base.nonmissingtype(T)
     K = ArrowTypes.ArrowKind(ST)
@@ -100,42 +104,80 @@ function liststringtype(::List{T,O,A}) where {T,O,A}
 end
 liststringtype(T) = false
 
-function ToList(input; largelists::Bool=false)
+@inline function _tolisttraits(input)
     AT = eltype(input)
     ST = Base.nonmissingtype(AT)
     K = ArrowTypes.ArrowKind(ST)
     stringtype = ArrowTypes.isstringtype(K) || ST <: Base.CodeUnits # add the CodeUnits check for ArrowTypes compat for now
     T = stringtype ? UInt8 : eltype(ST)
-    len = stringtype ? _ncodeunits : length
-    data = AT[]
+    lenf = stringtype ? _ncodeunits : length
+    return T, stringtype, lenf
+end
+
+@inline function _promotetolistinds(inds::Vector{Int32}, len::Int, filled::Int)
+    promoted = Vector{Int64}(undef, len + 1)
+    copyto!(promoted, 1, inds, 1, filled)
+    return promoted
+end
+
+function _buildtolist(input, data, dataoffset::Int, len::Int; largelists::Bool=false)
+    T, stringtype, lenf = _tolisttraits(input)
     I = largelists ? Int64 : Int32
-    inds = I[0]
-    sizehint!(data, length(input))
-    sizehint!(inds, length(input))
+    inds = Vector{I}(undef, len + 1)
+    inds[1] = zero(I)
     totalsize = I(0)
-    for x in input
-        if x === missing
-            push!(data, missing)
-        else
-            push!(data, x)
-            totalsize += len(x)
-            if I === Int32 && totalsize > 2147483647
+    @inbounds for i = 1:len
+        x = data[i + dataoffset]
+        if x !== missing
+            totalsize += lenf(x)
+            if I === Int32 && totalsize > typemax(Int32)
                 I = Int64
-                inds = convert(Vector{Int64}, inds)
+                inds = _promotetolistinds(inds, len, i)
             end
         end
-        push!(inds, totalsize)
+        inds[i + 1] = totalsize
     end
-    return ToList{T,stringtype,AT,I}(data, inds)
+    return ToList{T,stringtype,typeof(data),I}(data, inds, dataoffset)
+end
+
+function _tolistgeneric(input; largelists::Bool=false)
+    data = materializeouterdata(input)
+    return _buildtolist(
+        input,
+        data,
+        ArrowTypes._offsetshift(data),
+        length(data);
+        largelists=largelists,
+    )
+end
+
+function ToList(input; largelists::Bool=false)
+    return _tolistgeneric(input; largelists=largelists)
+end
+
+function ToList(input::ArrowTypes.ToArrow; largelists::Bool=false)
+    ArrowTypes._needsconvert(input) && return _tolistgeneric(input; largelists=largelists)
+    data = ArrowTypes._sourcedata(input)
+    return _buildtolist(
+        input,
+        data,
+        ArrowTypes._sourceoffset(input),
+        length(input);
+        largelists=largelists,
+    )
 end
 
 Base.IndexStyle(::Type{<:ToList}) = Base.IndexLinear()
 Base.size(x::ToList{T,S,A,I}) where {T,S,A,I} = (isempty(x.inds) ? zero(I) : x.inds[end],)
 
+@inline _tolistdata(A::ToList) = getfield(A, :data)
+@inline _tolistoffset(A::ToList) = getfield(A, :offset)
+@inline _tolistchunk(A::ToList, i::Integer) = @inbounds _tolistdata(A)[i + _tolistoffset(A)]
+
 function Base.pointer(A::ToList{UInt8}, i::Integer)
     chunk = searchsortedfirst(A.inds, i)
     chunk = chunk > length(A.inds) ? 1 : (chunk - 1)
-    return pointer(A.data[chunk])
+    return pointer(_tolistchunk(A, chunk))
 end
 
 @inline function index(A::ToList, i::Integer)
@@ -149,7 +191,7 @@ Base.@propagate_inbounds function Base.getindex(
 ) where {T,stringtype}
     @boundscheck checkbounds(A, i)
     chunk, ix = index(A, i)
-    @inbounds x = A.data[chunk]
+    x = _tolistchunk(A, chunk)
     return @inbounds stringtype ? _codeunits(x)[ix] : x[ix]
 end
 
@@ -160,7 +202,7 @@ Base.@propagate_inbounds function Base.setindex!(
 ) where {T,stringtype}
     @boundscheck checkbounds(A, i)
     chunk, ix = index(A, i)
-    @inbounds x = A.data[chunk]
+    x = _tolistchunk(A, chunk)
     if stringtype
         _codeunits(x)[ix] = v
     else
@@ -180,7 +222,7 @@ end
         chunk += 1
         chunk_len = A.inds[chunk]
     end
-    val = A.data[chunk - 1]
+    val = _tolistchunk(A, chunk - 1)
     x = stringtype ? _codeunits(val)[1] : val[1]
     # find next valid index
     i += 1
@@ -202,7 +244,7 @@ end
     (i, chunk, chunk_i, chunk_len, len),
 ) where {T,stringtype}
     i > len && return nothing
-    @inbounds val = A.data[chunk - 1]
+    val = _tolistchunk(A, chunk - 1)
     @inbounds x = stringtype ? _codeunits(val)[chunk_i] : val[chunk_i]
     i += 1
     if i > chunk_len
@@ -217,6 +259,100 @@ end
         chunk_i += 1
     end
     return x, (i, chunk, chunk_i, chunk_len, len)
+end
+
+@inline function _writeuint8chunk(io::IO, bytes)
+    GC.@preserve bytes begin
+        return Base.unsafe_write(io, pointer(bytes), length(bytes))
+    end
+end
+
+@inline function _writeutf8chunk(io::IO, chunk::AbstractString)
+    GC.@preserve chunk begin
+        return Base.unsafe_write(io, pointer(chunk), ncodeunits(chunk))
+    end
+end
+
+@inline function _sizehint_iobuffer!(io::IO, n::Integer)
+    io isa IOBuffer || return nothing
+    data = getfield(io, :data)
+    data isa Vector{UInt8} || return nothing
+    sizehint!(data, max(length(data), position(io) + n))
+    return nothing
+end
+
+function _writearray_tolist_bitstype(io::IO, ::Type{T}, col::ToList{T,false}) where {T}
+    n = 0
+    off = _tolistoffset(col)
+    data = _tolistdata(col)
+    if off == 0
+        for chunk in data
+            chunk === missing && continue
+            n += writearray(io, T, chunk)
+        end
+    else
+        len = length(data)
+        @inbounds for i = 1:len
+            chunk = data[i + off]
+            chunk === missing && continue
+            n += writearray(io, T, chunk)
+        end
+    end
+    return n
+end
+
+function _writearray_tolist_uint8(io::IO, col::ToList{UInt8,stringtype}) where {stringtype}
+    n = 0
+    _sizehint_iobuffer!(io, length(col))
+    off = _tolistoffset(col)
+    data = _tolistdata(col)
+    if off == 0
+        for chunk in data
+            chunk === missing && continue
+            bytes = stringtype ? _codeunits(chunk) : chunk
+            n += _writeuint8chunk(io, bytes)
+        end
+    else
+        len = length(data)
+        @inbounds for i = 1:len
+            chunk = data[i + off]
+            chunk === missing && continue
+            bytes = stringtype ? _codeunits(chunk) : chunk
+            n += _writeuint8chunk(io, bytes)
+        end
+    end
+    return n
+end
+
+function _writearray_tolist_uint8(
+    io::IO,
+    col::ToList{UInt8,true,A},
+) where {A<:AbstractVector{<:AbstractString}}
+    n = 0
+    _sizehint_iobuffer!(io, length(col))
+    off = _tolistoffset(col)
+    data = _tolistdata(col)
+    if off == 0
+        for chunk in data
+            chunk === missing && continue
+            n += _writeutf8chunk(io, chunk)
+        end
+    else
+        len = length(data)
+        @inbounds for i = 1:len
+            chunk = data[i + off]
+            chunk === missing && continue
+            n += _writeutf8chunk(io, chunk)
+        end
+    end
+    return n
+end
+
+function writearray(io::IO, ::Type{T}, col::ToList{T,stringtype}) where {T,stringtype}
+    T === UInt8 && return _writearray_tolist_uint8(io, col)
+    isbitstype(T) || return _writearrayfallback(io, T, col)
+    stringtype && return _writearrayfallback(io, T, col)
+    return _writearray_tolist_bitstype(io, T, col)
 end
 
 arrowvector(::ListKind, x::List, i, nl, fi, de, ded, meta; kw...) = x

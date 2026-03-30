@@ -16,6 +16,7 @@
 # under the License.
 
 Manifest.toml
+*/Manifest.toml
 dev/release/apache-rat-*.jar
 dev/release/filtered_rat.txt
 dev/release/rat.xml

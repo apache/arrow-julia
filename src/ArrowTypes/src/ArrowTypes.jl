@@ -324,6 +324,14 @@ arrowname(::Type{Tuple{}}) = TUPLE
 JuliaType(::Val{TUPLE}, ::Type{NamedTuple{names,types}}) where {names,types<:Tuple} = types
 fromarrow(::Type{T}, x::NamedTuple) where {T<:Tuple} = Tuple(x)
 
+# Complex
+const COMPLEX = Symbol("JuliaLang.Complex")
+arrowname(::Type{<:Complex}) = COMPLEX
+JuliaType(::Val{COMPLEX}, ::Type{NamedTuple{names,Tuple{T,T}}}) where {names,T<:Real} =
+    Complex{T}
+fromarrowstruct(::Type{T}, ::Val{(:re, :im)}, re, im) where {T<:Complex} = T(re, im)
+fromarrowstruct(::Type{T}, ::Val{(:im, :re)}, im, re) where {T<:Complex} = T(re, im)
+
 # VersionNumber
 const VERSION_NUMBER = Symbol("JuliaLang.VersionNumber")
 ArrowKind(::Type{VersionNumber}) = StructKind()
@@ -388,13 +396,67 @@ default(::Type{NamedTuple{names,types}}) where {names,types} =
     NamedTuple{names}(Tuple(default(fieldtype(types, i)) for i = 1:length(names)))
 
 function promoteunion(T, S)
+    T === S && return T
     new = promote_type(T, S)
     return isabstracttype(new) ? Union{T,S} : new
 end
 
+function _toarroweltype(x)
+    state = iterate(x)
+    state === nothing && return Missing
+    y, st = state
+    srcT = Union{}
+    stable = false
+    T = Missing
+    if y !== missing
+        srcT = typeof(y)
+        mapped = ArrowType(srcT)
+        stable = isconcretetype(mapped)
+        T = stable ? mapped : typeof(toarrow(y))
+    end
+    while true
+        state = iterate(x, st)
+        state === nothing && return T
+        y, st = state
+        if y === missing
+            S = Missing
+        elseif srcT === Union{}
+            srcT = typeof(y)
+            mapped = ArrowType(srcT)
+            stable = isconcretetype(mapped)
+            S = stable ? mapped : typeof(toarrow(y))
+        elseif stable && typeof(y) === srcT
+            continue
+        else
+            S = typeof(toarrow(y))
+            if stable && typeof(y) !== srcT
+                stable = false
+            end
+        end
+        S === T && continue
+        T = promoteunion(T, S)
+    end
+end
+
+@inline _hasoffsetaxes(data) = Base.has_offset_axes(data)
+@inline _offsetshift(data) = _hasoffsetaxes(data) ? firstindex(data) - 1 : 0
+@inline _hasonebasedaxes(data) = !_hasoffsetaxes(data)
+
 # lazily call toarrow(x) on getindex for each x in data
 struct ToArrow{T,A} <: AbstractVector{T}
     data::A
+    offset::Int
+    needsconvert::Bool
+end
+@inline _sourcedata(x::ToArrow) = getfield(x, :data)
+@inline _sourceoffset(x::ToArrow) = getfield(x, :offset)
+@inline _needsconvert(x::ToArrow) = getfield(x, :needsconvert)
+@inline _sourcevalue(x::ToArrow, i::Integer) =
+    @inbounds getindex(_sourcedata(x), i + _sourceoffset(x))
+
+function ToArrow{T,A}(data::A) where {T,A}
+    needsconvert = !(eltype(A) === T && concrete_or_concreteunion(T))
+    return ToArrow{T,A}(data, _offsetshift(data), needsconvert)
 end
 
 concrete_or_concreteunion(T) =
@@ -404,15 +466,14 @@ concrete_or_concreteunion(T) =
 function ToArrow(x::A) where {A}
     S = eltype(A)
     T = ArrowType(S)
-    fi = firstindex(x)
-    if S === T && concrete_or_concreteunion(S) && fi == 1
+    if S === T && concrete_or_concreteunion(S) && _hasonebasedaxes(x)
         return x
     elseif !concrete_or_concreteunion(T)
         # arrow needs concrete types, so try to find a concrete common type, preferring unions
         if isempty(x)
             return Missing[]
         end
-        T = mapreduce(typeof ∘ toarrow, promoteunion, x)
+        T = _toarroweltype(x)
         if T === Missing && concrete_or_concreteunion(S)
             T = promoteunion(T, typeof(toarrow(default(S))))
         end
@@ -440,7 +501,29 @@ function _convert(::Type{T}, x) where {T}
         return convert(T, x)
     end
 end
-Base.getindex(x::ToArrow{T}, i::Int) where {T} =
-    _convert(T, toarrow(getindex(x.data, i + firstindex(x.data) - 1)))
+
+@inline function _toarrowvalue(x::ToArrow{T}, value) where {T}
+    _needsconvert(x) || return value
+    return _convert(T, toarrow(value))
+end
+
+Base.@propagate_inbounds function Base.getindex(x::ToArrow{T}, i::Int) where {T}
+    value = _sourcevalue(x, i)
+    return _toarrowvalue(x, value)
+end
+
+function Base.iterate(x::ToArrow)
+    state = iterate(x.data)
+    state === nothing && return nothing
+    value, st = state
+    return _toarrowvalue(x, value), st
+end
+
+function Base.iterate(x::ToArrow, st)
+    state = iterate(x.data, st)
+    state === nothing && return nothing
+    value, st = state
+    return _toarrowvalue(x, value), st
+end
 
 end # module ArrowTypes

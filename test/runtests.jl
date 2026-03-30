@@ -39,6 +39,7 @@ include(joinpath(@__DIR__, "testtables.jl"))
 include(joinpath(@__DIR__, "testappend.jl"))
 include(joinpath(@__DIR__, "integrationtest.jl"))
 include(joinpath(@__DIR__, "dates.jl"))
+include(joinpath(@__DIR__, "flight.jl"))
 
 struct CustomStruct
     x::Int
@@ -263,6 +264,93 @@ end
             @test all(isequal.(values(t), values(tt)))
         end
 
+        @testset "single-partition tobuffer byte equivalence" begin
+            t = (col=OffsetArray(["a", "bc", "def"], 0:2),)
+            io = IOBuffer()
+            Arrow.write(io, t)
+            seekstart(io)
+            @test read(Arrow.tobuffer(t)) == read(io)
+
+            tm = (col=OffsetArray(Union{Missing,String}["a", missing, "def"], 0:2),)
+            io = IOBuffer()
+            Arrow.write(io, tm)
+            seekstart(io)
+            @test read(Arrow.tobuffer(tm)) == read(io)
+
+            bt =
+                (col=OffsetArray([codeunits("a"), codeunits("bc"), codeunits("def")], 0:2),)
+            io = IOBuffer()
+            Arrow.write(io, bt)
+            seekstart(io)
+            @test read(Arrow.tobuffer(bt)) == read(io)
+
+            btm = (
+                col=OffsetArray(
+                    Union{Missing,Base.CodeUnits{UInt8,String}}[
+                        codeunits("a"),
+                        missing,
+                        codeunits("def"),
+                    ],
+                    0:2,
+                ),
+            )
+            io = IOBuffer()
+            Arrow.write(io, btm)
+            seekstart(io)
+            @test read(Arrow.tobuffer(btm)) == read(io)
+
+            mapt = (
+                col=OffsetArray([Dict("a" => 1, "b" => 2), Dict("a" => 3, "b" => 4)], 0:1),
+            )
+            io = IOBuffer()
+            Arrow.write(io, mapt)
+            seekstart(io)
+            @test read(Arrow.tobuffer(mapt)) == read(io)
+
+            pooled = (col=PooledArray(["a", "b", "a", "c"]),)
+            io = IOBuffer()
+            Arrow.write(io, pooled; dictencode=true)
+            seekstart(io)
+            @test read(Arrow.tobuffer(pooled; dictencode=true)) == read(io)
+
+            meta = Dict("key1" => "value1")
+            colmeta = Dict(:col => Dict("colkey1" => "colvalue1"))
+            io = IOBuffer()
+            Arrow.write(io, t; metadata=meta, colmetadata=colmeta)
+            seekstart(io)
+            @test read(Arrow.tobuffer(t; metadata=meta, colmetadata=colmeta)) == read(io)
+
+            parts = Tables.partitioner([t, t])
+            io = IOBuffer()
+            Arrow.write(io, parts)
+            seekstart(io)
+            @test read(Arrow.tobuffer(parts)) == read(io)
+
+            string_missing_parts = Tables.partitioner([tm, tm])
+            io = IOBuffer()
+            Arrow.write(io, string_missing_parts)
+            seekstart(io)
+            @test read(Arrow.tobuffer(string_missing_parts)) == read(io)
+
+            binary_parts = Tables.partitioner([bt, bt])
+            io = IOBuffer()
+            Arrow.write(io, binary_parts)
+            seekstart(io)
+            @test read(Arrow.tobuffer(binary_parts)) == read(io)
+
+            binary_missing_parts = Tables.partitioner([btm, btm])
+            io = IOBuffer()
+            Arrow.write(io, binary_missing_parts)
+            seekstart(io)
+            @test read(Arrow.tobuffer(binary_missing_parts)) == read(io)
+
+            map_parts = Tables.partitioner([mapt, mapt])
+            io = IOBuffer()
+            Arrow.write(io, map_parts)
+            seekstart(io)
+            @test read(Arrow.tobuffer(map_parts)) == read(io)
+        end
+
         @testset "# 53" begin
             s = "a"^100
             t = (a=[SubString(s, 1:10), SubString(s, 11:20)],)
@@ -292,6 +380,38 @@ end
             t = (a=['a', missing],)
             tt = Arrow.Table(Arrow.tobuffer(t))
             @test isequal(tt.a, ['a', missing])
+        end
+
+        @testset "# offset bool write paths" begin
+            t = (
+                a=OffsetArray(Bool[true, false, true], -1:1),
+                b=OffsetArray(Union{Missing,Bool}[true, missing, false], -1:1),
+                c=OffsetArray(Any[true, false, true], -1:1),
+                d=OffsetArray(Any[true, missing, false], -1:1),
+            )
+            tt = Arrow.Table(Arrow.tobuffer(t))
+            @test eltype(tt.c) == Bool
+            @test eltype(tt.d) == Union{Missing,Bool}
+            @test tt.a == Bool[true, false, true]
+            @test isequal(tt.b, Union{Missing,Bool}[true, missing, false])
+            @test tt.c == Bool[true, false, true]
+            @test isequal(tt.d, Union{Missing,Bool}[true, missing, false])
+        end
+
+        @testset "# offset primitive write paths" begin
+            t = (
+                a=OffsetArray(Int64[1, 2, 3], -1:1),
+                b=OffsetArray(Union{Missing,Int64}[1, missing, 3], -1:1),
+                c=OffsetArray(Any[1, 2, 3], -1:1),
+                d=OffsetArray(Any[1, missing, 3], -1:1),
+            )
+            tt = Arrow.Table(Arrow.tobuffer(t))
+            @test eltype(tt.c) == Int64
+            @test eltype(tt.d) == Union{Missing,Int64}
+            @test tt.a == Int64[1, 2, 3]
+            @test isequal(tt.b, Union{Missing,Int64}[1, missing, 3])
+            @test tt.c == Int64[1, 2, 3]
+            @test isequal(tt.d, Union{Missing,Int64}[1, missing, 3])
         end
 
         @testset "# automatic custom struct serialization/deserialization" begin
@@ -328,6 +448,47 @@ end
             @test copy(tt.a) isa Vector{Nanosecond}
             @test copy(tt.b) isa Vector{UUID}
             @test copy(tt.c) isa Vector{Union{Missing,Nanosecond}}
+
+            toffset = (
+                b=OffsetArray(
+                    [
+                        UUID("550e8400-e29b-41d4-a716-446655440000"),
+                        UUID("550e8400-e29b-41d4-a716-446655440001"),
+                    ],
+                    -1:0,
+                ),
+                bm=OffsetArray(
+                    Union{Missing,UUID}[
+                        UUID("550e8400-e29b-41d4-a716-446655440000"),
+                        missing,
+                    ],
+                    -1:0,
+                ),
+                ba=OffsetArray(
+                    Any[
+                        UUID("550e8400-e29b-41d4-a716-446655440000"),
+                        UUID("550e8400-e29b-41d4-a716-446655440001"),
+                    ],
+                    -1:0,
+                ),
+                bam=OffsetArray(
+                    Any[UUID("550e8400-e29b-41d4-a716-446655440000"), missing],
+                    -1:0,
+                ),
+            )
+            ttoffset = Arrow.Table(Arrow.tobuffer(toffset))
+            @test collect(toffset.b) == ttoffset.b
+            @test isequal(collect(toffset.bm), ttoffset.bm)
+            @test eltype(ttoffset.ba) == NTuple{16,UInt8}
+            @test eltype(ttoffset.bam) == Union{Missing,NTuple{16,UInt8}}
+            @test map(Arrow.ArrowTypes.toarrow, collect(toffset.ba)) == copy(ttoffset.ba)
+            @test isequal(
+                map(
+                    x -> ismissing(x) ? missing : Arrow.ArrowTypes.toarrow(x),
+                    collect(toffset.bam),
+                ),
+                copy(ttoffset.bam),
+            )
         end
 
         @testset "# copy on DictEncoding w/ missing values" begin
@@ -624,12 +785,46 @@ end
             t = (col1=[["boop", "she"], ["boop", "she"], ["boo"]],)
             tbl = Arrow.Table(Arrow.tobuffer(t))
             @test eltype(tbl.col1) <: AbstractVector{String}
+
+            toffset = (
+                col1=OffsetArray([Int64[1, 2], Int64[3, 4], Int64[]], -1:1),
+                col2=OffsetArray(
+                    Union{Missing,Vector{Int64}}[Int64[1], missing, Int64[2, 3]],
+                    -1:1,
+                ),
+            )
+            tt = Arrow.Table(Arrow.tobuffer(toffset))
+            @test eltype(tt.col1) <: AbstractVector{Int64}
+            @test Base.nonmissingtype(eltype(tt.col2)) <: AbstractVector{Int64}
+            @test collect(toffset.col1) == tt.col1
+            @test isequal(collect(toffset.col2), tt.col2)
         end
 
         @testset "# 200 VersionNumber" begin
             t = (col1=[v"1"],)
             tbl = Arrow.Table(Arrow.tobuffer(t))
             @test eltype(tbl.col1) == VersionNumber
+        end
+
+        @testset "offset struct string write paths" begin
+            rows = OffsetArray(
+                Union{Missing,NamedTuple{(:s,),Tuple{String}}}[
+                    (s="a",),
+                    missing,
+                    (s="bc",),
+                ],
+                -1:1,
+            )
+            tt = Arrow.Table(Arrow.tobuffer((rows=rows,)))
+            @test Base.nonmissingtype(eltype(tt.rows)) == NamedTuple{(:s,),Tuple{String}}
+            @test isequal(collect(rows), tt.rows)
+        end
+
+        @testset "Complex" begin
+            t = (col1=Union{ComplexF64,Missing}[1 + 2im, missing, 3 + 4im],)
+            tbl = Arrow.Table(Arrow.tobuffer(t))
+            @test eltype(tbl.col1) == Union{ComplexF64,Missing}
+            @test isequal(collect(tbl.col1), t.col1)
         end
 
         @testset "`show`" begin
@@ -852,6 +1047,95 @@ end
             @test_throws ArgumentError(
                 "`keytype(d)` must be concrete to serialize map-like `d`, but `keytype(d) == Real`",
             ) Arrow.tobuffer(t)
+
+            t = (
+                x=OffsetArray([Dict("a" => 1, "b" => 2), Dict("c" => 3)], -1:0),
+                xm=OffsetArray(
+                    Union{Missing,Dict{String,Int}}[Dict("a" => 1), missing],
+                    -1:0,
+                ),
+                xe=OffsetArray(
+                    [Dict("a" => 1, "b" => 2, "c" => 3), Dict{String,Int}()],
+                    -1:0,
+                ),
+                xem=OffsetArray(
+                    Union{Missing,Dict{String,Int}}[Dict{String,Int}(), missing],
+                    -1:0,
+                ),
+                xa=OffsetArray(Any[Dict("a" => 1, "b" => 2), Dict("c" => 3)], -1:0),
+                xam=OffsetArray(Any[Dict("a" => 1), missing], -1:0),
+                xame=OffsetArray(Any[Dict{String,Int}(), missing], -1:0),
+            )
+            tt = Arrow.Table(Arrow.tobuffer(t))
+            @test eltype(tt.x) == Dict{String,Int64}
+            @test eltype(tt.xm) == Union{Missing,Dict{String,Int64}}
+            @test eltype(tt.xe) == Dict{String,Int64}
+            @test eltype(tt.xem) == Union{Missing,Dict{String,Int64}}
+            @test eltype(tt.xa) == Dict{String,Int64}
+            @test eltype(tt.xam) == Union{Missing,Dict{String,Int64}}
+            @test eltype(tt.xame) == Union{Missing,Dict{String,Int64}}
+            @test copy(tt.x) isa Vector{Dict{String,Int64}}
+            @test copy(tt.xm) isa Vector{Union{Missing,Dict{String,Int64}}}
+            @test copy(tt.xem) isa Vector{Union{Missing,Dict{String,Int64}}}
+            @test copy(tt.xa) isa Vector{Dict{String,Int64}}
+            @test copy(tt.xam) isa Vector{Union{Missing,Dict{String,Int64}}}
+            @test copy(tt.xame) isa Vector{Union{Missing,Dict{String,Int64}}}
+            @test collect(t.x) == tt.x
+            @test isequal(collect(t.xm), tt.xm)
+            @test collect(t.xe) == tt.xe
+            @test isequal(collect(t.xem), tt.xem)
+            @test collect(t.xa) == tt.xa
+            @test isequal(collect(t.xam), tt.xam)
+            @test isequal(collect(t.xame), tt.xame)
+
+            mapio = IOBuffer()
+            Arrow.write(mapio, (x=t.xm,))
+            seekstart(mapio)
+            @test read(Arrow.tobuffer((x=t.xm,))) == read(mapio)
+
+            mapbuf = Arrow.tobuffer((x=t.xm,))
+            seekend(mapbuf)
+            mappos = position(mapbuf)
+            Arrow.append(mapbuf, Arrow.Table(Arrow.tobuffer((x=t.xm,))))
+            seekstart(mapbuf)
+            mapbuf1 = read(mapbuf, mappos)
+            mapbuf2 = read(mapbuf)
+            mapt1 = Arrow.Table(mapbuf1)
+            mapt2 = Arrow.Table(mapbuf2)
+            @test isequal(collect(mapt1.x), collect(mapt2.x))
+
+            emptymapbuf = Arrow.tobuffer((x=t.xe,))
+            seekend(emptymapbuf)
+            emptymappos = position(emptymapbuf)
+            Arrow.append(emptymapbuf, Arrow.Table(Arrow.tobuffer((x=t.xe,))))
+            seekstart(emptymapbuf)
+            emptymapbuf1 = read(emptymapbuf, emptymappos)
+            emptymapbuf2 = read(emptymapbuf)
+            emptymapt1 = Arrow.Table(emptymapbuf1)
+            emptymapt2 = Arrow.Table(emptymapbuf2)
+            @test isequal(collect(emptymapt1.x), collect(emptymapt2.x))
+
+            anymapbuf = Arrow.tobuffer((x=t.xam,))
+            seekend(anymapbuf)
+            anymappos = position(anymapbuf)
+            Arrow.append(anymapbuf, Arrow.Table(Arrow.tobuffer((x=t.xam,))))
+            seekstart(anymapbuf)
+            anymapbuf1 = read(anymapbuf, anymappos)
+            anymapbuf2 = read(anymapbuf)
+            anymapt1 = Arrow.Table(anymapbuf1)
+            anymapt2 = Arrow.Table(anymapbuf2)
+            @test isequal(collect(anymapt1.x), collect(anymapt2.x))
+
+            anyemptymapbuf = Arrow.tobuffer((x=t.xame,))
+            seekend(anyemptymapbuf)
+            anyemptymappos = position(anyemptymapbuf)
+            Arrow.append(anyemptymapbuf, Arrow.Table(Arrow.tobuffer((x=t.xame,))))
+            seekstart(anyemptymapbuf)
+            anyemptymapbuf1 = read(anyemptymapbuf, anyemptymappos)
+            anyemptymapbuf2 = read(anyemptymapbuf)
+            anyemptymapt1 = Arrow.Table(anyemptymapbuf1)
+            anyemptymapt2 = Arrow.Table(anyemptymapbuf2)
+            @test isequal(collect(anyemptymapt1.x), collect(anyemptymapt2.x))
         end
 
         @testset "# 214" begin
@@ -966,6 +1250,45 @@ end
             @test isequal(t1.bm, t2.bm)
             @test isequal(t1.c, t2.c)
             @test isequal(t1.cm, t2.cm)
+
+            toffset = (
+                b=OffsetArray([b"01", b"", b"3"], -1:1),
+                bm=OffsetArray(
+                    Union{Missing,Base.CodeUnits{UInt8,String}}[b"01", b"3", missing],
+                    -1:1,
+                ),
+                ba=OffsetArray(Any[b"01", b"", b"3"], -1:1),
+                bam=OffsetArray(Any[b"01", missing, b"3"], -1:1),
+                c=OffsetArray(["a", "b", "c"], -1:1),
+                cm=OffsetArray(Union{Missing,String}["a", "c", missing], -1:1),
+            )
+            ttoffset = Arrow.Table(Arrow.tobuffer(toffset))
+            @test eltype(ttoffset.b) <: Base.CodeUnits
+            @test Base.nonmissingtype(eltype(ttoffset.bm)) <: Base.CodeUnits
+            @test eltype(ttoffset.ba) <: Base.CodeUnits
+            @test Base.nonmissingtype(eltype(ttoffset.bam)) <: Base.CodeUnits
+            @test eltype(ttoffset.c) == String
+            @test eltype(ttoffset.cm) == Union{Missing,String}
+            @test collect(toffset.b) == ttoffset.b
+            @test isequal(collect(toffset.bm), ttoffset.bm)
+            @test collect(toffset.ba) == copy(ttoffset.ba)
+            @test isequal(collect(toffset.bam), copy(ttoffset.bam))
+            @test collect(toffset.c) == ttoffset.c
+            @test isequal(collect(toffset.cm), ttoffset.cm)
+
+            offsetbuf = Arrow.tobuffer(toffset)
+            seekend(offsetbuf)
+            offsetpos = position(offsetbuf)
+            Arrow.append(offsetbuf, ttoffset)
+            seekstart(offsetbuf)
+            offsetbuf1 = read(offsetbuf, offsetpos)
+            offsetbuf2 = read(offsetbuf)
+            offsett1 = Arrow.Table(offsetbuf1)
+            offsett2 = Arrow.Table(offsetbuf2)
+            @test collect(offsett1.b) == collect(offsett2.b)
+            @test isequal(collect(offsett1.bm), collect(offsett2.bm))
+            @test collect(offsett1.c) == collect(offsett2.c)
+            @test isequal(collect(offsett1.cm), collect(offsett2.cm))
         end
 
         @testset "# 435" begin

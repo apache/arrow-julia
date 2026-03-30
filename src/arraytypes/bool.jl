@@ -52,9 +52,7 @@ end
 
 arrowvector(::BoolKind, x::BoolVector, i, nl, fi, de, ded, meta; kw...) = x
 
-function arrowvector(::BoolKind, x, i, nl, fi, de, ded, meta; kw...)
-    validity = ValidityBitmap(x)
-    len = length(x)
+function _packboolbytes(x, len)
     blen = cld(len, 8)
     bytes = Vector{UInt8}(undef, blen)
     b = 0xff
@@ -74,7 +72,23 @@ function arrowvector(::BoolKind, x, i, nl, fi, de, ded, meta; kw...)
     if j > 1
         bytes[k] = b
     end
+    return bytes
+end
+
+function arrowvector(::BoolKind, x, i, nl, fi, de, ded, meta; kw...)
+    validity = ValidityBitmap(x)
+    len = length(x)
+    bytes = _packboolbytes(x, len)
     return BoolVector{eltype(x)}(bytes, 1, validity, len, meta)
+end
+
+function arrowvector(::BoolKind, x::ArrowTypes.ToArrow, i, nl, fi, de, ded, meta; kw...)
+    data = _materializeconverted(x)
+    validity = _toarrowvalidity(x, data)
+    len = length(data)
+    source = data === x ? _toarrowvaliditysource(x) : data
+    bytes = _packboolbytes(source, len)
+    return BoolVector{eltype(data)}(bytes, 1, validity, len, meta)
 end
 
 function compress(Z::Meta.CompressionType.T, comp, p::P) where {P<:BoolVector}

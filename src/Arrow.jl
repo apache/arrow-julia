@@ -29,8 +29,26 @@ This implementation supports the 1.0 version of the specification, including sup
 
 It currently doesn't include support for:
   * Tensors or sparse tensors
-  * Flight RPC
   * C data interface
+
+Flight RPC status:
+  * Experimental `Arrow.Flight` support is available in-tree
+  * Requires Julia `1.12+`
+  * Includes generated protocol bindings and client constructors for the `FlightService` RPC surface
+  * Keeps the top-level Flight module shell thin, with exports and generated-protocol setup split out of `src/flight/Flight.jl`
+  * Includes high-level `FlightData <-> Arrow IPC` helpers for `Arrow.Table`, `Arrow.Stream`, and DoPut payload generation
+  * Keeps the Flight IPC conversion layer modular under `src/flight/convert/`, with `src/flight/convert.jl` retained as a thin entrypoint
+  * Includes client helpers for request headers, binary metadata, handshake token reuse, and TLS configuration via `withheaders`, `withtoken`, and `authenticate`
+  * Keeps the Flight client implementation modular under `src/flight/client/`, with thin entrypoints at `src/flight/client.jl` and `src/flight/client/rpc_methods.jl`
+  * Includes a transport-agnostic server core (`Service`, `ServerCallContext`, `ServiceDescriptor`, `MethodDescriptor`) for local Flight method dispatch, path lookup, and handler testing
+  * Keeps the transport-agnostic server core modular under `src/flight/server/`, with `src/flight/server.jl` retained as a thin entrypoint
+  * Includes an optional `gRPCServer.jl` package extension that maps `Arrow.Flight.Service` into `gRPCServer.ServiceDescriptor` and registers Flight proto types with the external server package when it is present
+  * Keeps the optional `gRPCServer.jl` bridge modular under `ext/arrowgrpcserverext/`, with `ext/ArrowgRPCServerExt.jl` retained as a thin entrypoint
+  * Includes optional live interoperability coverage for `Handshake`, authenticated token propagation, `PollFlightInfo`, and TLS via dedicated Python reference servers
+  * Includes optional live `pyarrow.flight` interoperability coverage for `ListFlights`, `GetFlightInfo`, `GetSchema`, `DoGet`, `DoPut`, `DoExchange`, `ListActions`, and `DoAction`
+  * Keeps targeted Flight verification modular under `test/flight/`, with `test/flight.jl` retained as a thin entrypoint for local and CI invocation stability, the client-constructor/protocol-wrapper checks decomposed under `test/flight/client_surface/`, the optional `gRPCServer` extension scenarios decomposed under `test/flight/grpcserver_extension/`, the `pyarrow.flight` interop scenarios decomposed under `test/flight/pyarrow_interop/`, and the transport-agnostic server-core checks decomposed under `test/flight/server_core/`
+  * Includes `test/flight_grpcserver.jl` as a temporary-environment runner for optional native `gRPCServer` coverage without mutating `test/Project.toml`
+  * Dedicated CI jobs now exercise the Flight interop suite on stable and nightly Linux; native Julia server transport remains optional/experimental and is not part of the default Flight suite
 
 Third-party data formats:
   * csv and parquet support via the existing [CSV.jl](https://github.com/JuliaData/CSV.jl) and [Parquet.jl](https://github.com/JuliaIO/Parquet.jl) packages
@@ -55,7 +73,7 @@ using DataAPI,
     ConcurrentUtilities,
     StringViews
 
-export ArrowTypes
+export ArrowTypes, Flight
 
 using Base: @propagate_inbounds
 import Base: ==
@@ -79,6 +97,7 @@ include("table.jl")
 include("write.jl")
 include("append.jl")
 include("show.jl")
+include("flight/Flight.jl")
 
 const ZSTD_COMPRESSOR = Lockable{ZstdCompressor}[]
 const ZSTD_DECOMPRESSOR = Lockable{ZstdDecompressor}[]

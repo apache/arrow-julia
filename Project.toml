@@ -21,6 +21,7 @@ version = "2.8.1"
 
 [deps]
 ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 BitIntegers = "c3b6d118-76ef-56ca-8cc7-ebb389d030a1"
 CodecLz4 = "5ba52731-8f18-5e0d-9241-30f10d1ec561"
 CodecZstd = "6b39b394-51ab-5f42-8807-6242bab2b4c2"
@@ -28,6 +29,8 @@ ConcurrentUtilities = "f0e56b4a-5159-44fe-b623-3e5288b988bb"
 DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 EnumX = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
+ProtoBuf = "3349acd9-ac6a-5e09-bcdb-63829b23a429"
+gRPCClient = "aaca4a50-36af-4a1d-b878-4c443f2061ad"
 Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
 PooledArrays = "2dfb63ee-cc39-5dd5-95bd-886bf059d720"
 SentinelArrays = "91c51154-3ec4-41a3-a24f-3f23e20d615c"
@@ -37,6 +40,15 @@ TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
+[weakdeps]
+gRPCServer = "608c6337-0d7d-447f-bb69-0f5674ee3959"
+
+[extensions]
+ArrowgRPCServerExt = "gRPCServer"
+
+[sources]
+ArrowTypes = { path = "src/ArrowTypes" }
+
 [compat]
 ArrowTypes = "1.1,2"
 BitIntegers = "0.2, 0.3"
@@ -45,10 +57,13 @@ CodecZstd = "0.7, 0.8"
 ConcurrentUtilities = "2"
 DataAPI = "1"
 EnumX = "1"
+ProtoBuf = "~1.2.1"
+gRPCClient = "1"
+gRPCServer = "0.1"
 PooledArrays = "0.5, 1.0"
 SentinelArrays = "1"
 StringViews = "1"
 Tables = "1.1"
 TimeZones = "1"
 TranscodingStreams = "0.9.12, 0.10, 0.11"
-julia = "1.9"
+julia = "1.12"

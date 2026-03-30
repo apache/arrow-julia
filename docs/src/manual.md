@@ -97,9 +97,19 @@ One note on performance: when writing `TimeZones.ZonedDateTime` columns to the a
 as the column has `ZonedDateTime` elements that all share a common timezone. This ensures the writing process can know "upfront" which timezone will be encoded and is thus much more
 efficient and performant.
 
+Similarly, `ArrowTypes.ToArrow` avoids repeated type-promotion work for
+homogeneous custom columns even when `ArrowTypes.ArrowType(T)` is abstract, so
+write-time conversion does not pay unnecessary overhead once the serialized
+element type is stable.
+
 #### Custom types
 
 To support writing your custom Julia struct, Arrow.jl utilizes the format's mechanism for "extension types" by allowing the storing of Julia type name and metadata in the field metadata. To "hook in" to this machinery, custom types can utilize the interface methods defined in the `Arrow.ArrowTypes` submodule. For example:
+
+Arrow.jl already uses this mechanism for several Base logical types, including
+`nothing`, `Tuple`, `VersionNumber`, and `Complex`, so those values roundtrip as
+their original Julia types instead of falling back to plain struct-shaped
+`NamedTuple`s.
 
 ```julia
 using Arrow

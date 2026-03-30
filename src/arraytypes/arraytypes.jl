@@ -99,7 +99,7 @@ function arrowvector(
             dictencode=dictencode,
             kw...,
         )
-    elseif !(x isa DictEncode)
+    elseif !(x isa DictEncode) && !_keeprawmapvector(T, x)
         x = ToArrow(x)
     end
     S = maybemissing(eltype(x))
@@ -142,6 +142,64 @@ function _arrowtypemeta(meta, n, m)
     dict["ARROW:extension:name"] = n
     dict["ARROW:extension:metadata"] = m
     return toidict(dict)
+end
+
+@inline function _materializeconverted(x::ArrowTypes.ToArrow)
+    data = ArrowTypes._sourcedata(x)
+    if ArrowTypes._needsconvert(x) && !ArrowTypes.concrete_or_concreteunion(eltype(data))
+        return _materializeconverted(eltype(x), x)
+    end
+    return x
+end
+
+function _materializeconverted(::Type{T}, x::ArrowTypes.ToArrow{T,A}) where {T,A}
+    len = length(x)
+    data = Vector{T}(undef, len)
+    source = ArrowTypes._sourcedata(x)
+    i = 1
+    for value in source
+        @inbounds data[i] =
+            value isa T ? value : ArrowTypes._convert(T, ArrowTypes.toarrow(value))
+        i += 1
+    end
+    return data
+end
+
+@inline function _materializefixedbytes16(value)
+    if value isa ArrowTypes.UUID
+        return ArrowTypes._cast(NTuple{16,UInt8}, value.value)
+    elseif value isa NTuple{16,UInt8}
+        return value
+    else
+        return ArrowTypes._convert(NTuple{16,UInt8}, ArrowTypes.toarrow(value))
+    end
+end
+
+function _materializeconverted(
+    ::Type{NTuple{16,UInt8}},
+    x::ArrowTypes.ToArrow{NTuple{16,UInt8},A},
+) where {A}
+    len = length(x)
+    data = Vector{NTuple{16,UInt8}}(undef, len)
+    source = ArrowTypes._sourcedata(x)
+    i = 1
+    for value in source
+        @inbounds data[i] = _materializefixedbytes16(value)
+        i += 1
+    end
+    return data
+end
+
+@inline _toarrowvaliditysource(x::ArrowTypes.ToArrow) =
+    ArrowTypes._needsconvert(x) ? x : ArrowTypes._sourcedata(x)
+
+@inline _toarrowvalidity(x::ArrowTypes.ToArrow, data) =
+    data === x ? ValidityBitmap(x) : ValidityBitmap(data)
+
+@inline function _keeprawmapvector(::Type{T}, x) where {T}
+    return Base.has_offset_axes(x) &&
+           ArrowTypes.concrete_or_concreteunion(T) &&
+           ArrowKind(T) isa ArrowTypes.MapKind
 end
 
 # now we check for ArrowType converions and dispatch on ArrowKind
@@ -201,15 +259,10 @@ end
 Base.size(p::ValidityBitmap) = (p.ℓ,)
 nullcount(x::ValidityBitmap) = x.nc
 
-function ValidityBitmap(x)
-    T = eltype(x)
-    if !(T >: Missing)
-        return ValidityBitmap(UInt8[], 1, length(x), 0)
-    end
+function _validitybitmap(x, len)
     len = length(x)
     blen = cld(len, 8)
     bytes = Vector{UInt8}(undef, blen)
-    st = iterate(x)
     nc = 0
     b = 0xff
     j = k = 1
@@ -230,6 +283,23 @@ function ValidityBitmap(x)
         bytes[k] = b
     end
     return ValidityBitmap(nc == 0 ? UInt8[] : bytes, 1, nc == 0 ? 0 : len, nc)
+end
+
+function ValidityBitmap(x)
+    T = eltype(x)
+    if !(T >: Missing)
+        return ValidityBitmap(UInt8[], 1, length(x), 0)
+    end
+    return _validitybitmap(x, length(x))
+end
+
+function ValidityBitmap(x::ArrowTypes.ToArrow)
+    T = eltype(x)
+    if !(T >: Missing)
+        return ValidityBitmap(UInt8[], 1, length(x), 0)
+    end
+    source = _toarrowvaliditysource(x)
+    return _validitybitmap(source, length(x))
 end
 
 @propagate_inbounds function Base.getindex(p::ValidityBitmap, i::Integer)
