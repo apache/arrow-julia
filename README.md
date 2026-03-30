@@ -64,6 +64,7 @@ This implementation supports the 1.0 version of the specification, including sup
   * All nested data types
   * Dictionary encodings and messages
   * Extension types
+  * View-backed Utf8/Binary columns, including recovery from under-reported variadic buffer counts by inferring the required external buffers from valid view elements
   * Streaming, file, record batch, and replacement and isdelta dictionary messages
 
 It currently doesn't include support for:

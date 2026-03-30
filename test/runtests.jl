@@ -264,6 +264,30 @@ end
             @test all(isequal.(values(t), values(tt)))
         end
 
+        @testset "View buffer count inference" begin
+            inline_len = Int32(Arrow.VIEW_INLINE_BYTES)
+            views = Arrow.ViewElement[
+                Arrow.ViewElement(inline_len, Int32(0), Int32(0), Int32(0)),
+                Arrow.ViewElement(inline_len + Int32(148), Int32(0), Int32(0), Int32(0)),
+                Arrow.ViewElement(inline_len + Int32(207), Int32(0), Int32(1), Int32(160)),
+            ]
+            validity = Arrow.ValidityBitmap(UInt8[], 1, length(views), 0)
+            @test Arrow._viewisinline(inline_len)
+            @test !Arrow._viewisinline(inline_len + Int32(1))
+            @test Arrow._viewbuffercount(validity, views, Int32(0)) == 2
+            @test Arrow._viewbuffercount(validity, views, Int32(1)) == 2
+            @test Arrow._viewbuffercount(validity, views, Int32(3)) == 3
+
+            sparse_validity = Arrow.ValidityBitmap(UInt8[0x05], 1, 3, 1)
+            sparse_views = Arrow.ViewElement[
+                Arrow.ViewElement(inline_len + Int32(64), Int32(0), Int32(0), Int32(0)),
+                Arrow.ViewElement(inline_len + Int32(64), Int32(0), Int32(99), Int32(0)),
+                Arrow.ViewElement(inline_len, Int32(0), Int32(0), Int32(0)),
+            ]
+            @test !sparse_validity[2]
+            @test Arrow._viewbuffercount(sparse_validity, sparse_views, Int32(0)) == 1
+        end
+
         @testset "single-partition tobuffer byte equivalence" begin
             t = (col=OffsetArray(["a", "bc", "def"], 0:2),)
             io = IOBuffer()

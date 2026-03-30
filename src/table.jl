@@ -732,6 +732,18 @@ const ListTypes =
 const LargeLists = Union{Meta.LargeUtf8,Meta.LargeBinary,Meta.LargeList,Meta.LargeListView}
 const ViewTypes = Union{Meta.Utf8View,Meta.BinaryView,Meta.ListView,Meta.LargeListView}
 
+@inline function _viewbuffercount(validity, views, declared::Integer)
+    count = Int(declared)
+    for i in eachindex(views)
+        validity[i] || continue
+        v = @inbounds views[i]
+        if !_viewisinline(v.length)
+            count = max(count, Int(v.bufindex) + 1)
+        end
+    end
+    return count
+end
+
 function build(field::Meta.Field, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
     d = field.dictionary
     if d !== nothing
@@ -910,7 +922,8 @@ function build(
     inline = reinterpret(UInt8, views)  # reuse the (possibly realigned) memory backing `views`
     bufferidx += 1
     buffers = Vector{UInt8}[]
-    for i = 1:rb.variadicBufferCounts[varbufferidx]
+    nvariadic = _viewbuffercount(validity, views, rb.variadicBufferCounts[varbufferidx])
+    for i = 1:nvariadic
         buffer = rb.buffers[bufferidx]
         _, A = reinterp(UInt8, batch, buffer, rb.compression)
         push!(buffers, A)
