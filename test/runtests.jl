@@ -538,6 +538,13 @@ end
             @test isa(first(av.indices), Signed)
             @test length(av) == 3
             @test eltype(av) == String
+
+            x = CategoricalArray(Union{Missing,String}["a", missing, "ccc"])
+            tt = Arrow.Table(Arrow.tobuffer((x=x,); dictencode=true))
+            @test isequal(collect(tt.x), collect(x))
+            @test isequal(collect(copy(tt.x)), collect(x))
+            df = DataFrame(tt; copycols=true)
+            @test isequal(collect(df.x), collect(x))
         end
 
         @testset "# 120" begin
