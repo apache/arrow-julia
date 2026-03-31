@@ -101,9 +101,9 @@ One note on performance: when writing `TimeZones.ZonedDateTime` columns to the a
 as the column has `ZonedDateTime` elements that all share a common timezone. This ensures the writing process can know "upfront" which timezone will be encoded and is thus much more
 efficient and performant.
 
-Run-End Encoded arrays are not implemented in Arrow.jl yet. Files containing
-that layout now fail explicitly during read with a clear unsupported error
-instead of partially decoding.
+Run-End Encoded arrays are now supported on the read path. Arrow.jl exposes REE
+columns as read-only vectors and continues to reject REE on write paths, rather
+than attempting a partial or lossy re-encoding.
 
 Similarly, `ArrowTypes.ToArrow` avoids repeated type-promotion work for
 homogeneous custom columns even when `ArrowTypes.ArrowType(T)` is abstract, so

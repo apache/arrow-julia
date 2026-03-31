@@ -72,7 +72,7 @@ This implementation supports the 1.0 version of the specification, including sup
 It currently doesn't include support for:
   * Tensors or sparse tensors
   * C data interface
-  * Run-End Encoded arrays; Arrow.jl now rejects them explicitly during read instead of falling through partially
+  * Writing Run-End Encoded arrays; Arrow.jl now reads REE arrays and exposes them as read-only vectors, but still rejects REE on write paths
 
 Flight RPC status:
   * Experimental `Arrow.Flight` support is available in-tree

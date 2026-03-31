@@ -781,10 +781,22 @@ const hybrid = EnumRoundtripModule.hybrid
             )
         end
 
-        @testset "Run-End Encoded rejection" begin
+        @testset "Run-End Encoded read support" begin
             path = joinpath(@__DIR__, "run_end_encoded_small.arrow")
-            @test_throws ArgumentError(Arrow.RUN_END_ENCODED_UNSUPPORTED) Arrow.Table(path)
-            @test_throws ArgumentError(Arrow.RUN_END_ENCODED_UNSUPPORTED) collect(Arrow.Stream(path))
+            expected = ["a", "a", "b", "b", "b"]
+
+            tt = Arrow.Table(path)
+            @test tt isa Arrow.Table
+            @test eltype(tt.x) == Union{Missing,String}
+            @test collect(tt.x) == expected
+            @test copy(tt.x) == expected
+
+            batches = collect(Arrow.Stream(path))
+            @test length(batches) == 1
+            @test collect(batches[1].x) == expected
+
+            @test_throws ArgumentError(Arrow.RUN_END_ENCODED_UNSUPPORTED) Arrow.tobuffer(tt)
+            @test_throws ArgumentError(Arrow.RUN_END_ENCODED_UNSUPPORTED) Arrow.tobuffer((x=tt.x,))
         end
 
         @testset "canonical bool8/json/opaque" begin

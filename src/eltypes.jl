@@ -494,8 +494,9 @@ function juliaeltype(f::Meta.Field, x::Meta.Interval, convert)
     return Interval{x.unit,bitwidth(x.unit)}
 end
 
-juliaeltype(f::Meta.Field, x::Meta.RunEndEncoded, convert) =
-    throw(ArgumentError(RUN_END_ENCODED_UNSUPPORTED))
+function juliaeltype(f::Meta.Field, x::Meta.RunEndEncoded, convert)
+    return juliaeltype(f.children[2], buildmetadata(f.children[2]), convert)
+end
 
 function arrowtype(b, ::Type{Interval{U,T}}) where {U,T}
     Meta.intervalStart(b)

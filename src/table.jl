@@ -30,7 +30,6 @@ tobytes(file_path) = open(tobytes, file_path, "r")
 
 rejectunsupported(field::Meta.Field) = (rejectunsupported(field.type); foreach(rejectunsupported, field.children))
 rejectunsupported(x) = nothing
-rejectunsupported(x::Meta.RunEndEncoded) = throw(ArgumentError(RUN_END_ENCODED_UNSUPPORTED))
 
 struct BatchIterator
     bytes::Vector{UInt8}
@@ -920,7 +919,19 @@ function build(
     varbufferidx,
     convert,
 )
-    throw(ArgumentError(RUN_END_ENCODED_UNSUPPORTED))
+    @debug "building array: x = $x"
+    len = rb.nodes[nodeidx].length
+    nodeidx += 1
+    meta = buildmetadata(f.custom_metadata)
+    T = juliaeltype(f, meta, convert)
+    run_ends, nodeidx, bufferidx, varbufferidx =
+        build(f.children[1], batch, rb, de, nodeidx, bufferidx, varbufferidx, false)
+    values, nodeidx, bufferidx, varbufferidx =
+        build(f.children[2], batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+    return _makerunendencoded(T, run_ends, values, len, meta),
+    nodeidx,
+    bufferidx,
+    varbufferidx
 end
 
 function build(
