@@ -80,6 +80,8 @@ import Base: ==
 
 const FILE_FORMAT_MAGIC_BYTES = b"ARROW1"
 const CONTINUATION_INDICATOR_BYTES = 0xffffffff
+const TENSOR_UNSUPPORTED = "Tensor messages are not supported yet"
+const SPARSE_TENSOR_UNSUPPORTED = "SparseTensor messages are not supported yet"
 
 # vendored flatbuffers code for now
 include("FlatBuffers/FlatBuffers.jl")

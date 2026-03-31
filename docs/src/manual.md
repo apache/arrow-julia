@@ -106,6 +106,10 @@ Run-End Encoded arrays are now supported on the read path. Arrow.jl exposes REE
 columns as read-only vectors and continues to reject REE on write paths, rather
 than attempting a partial or lossy re-encoding.
 
+Tensor and SparseTensor IPC messages are still unsupported, but Arrow.jl now
+recognizes those message headers explicitly and rejects them with precise
+errors instead of falling through to a generic unsupported-message failure.
+
 Similarly, `ArrowTypes.ToArrow` avoids repeated type-promotion work for
 homogeneous custom columns even when `ArrowTypes.ArrowType(T)` is abstract, so
 write-time conversion does not pay unnecessary overhead once the serialized

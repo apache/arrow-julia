@@ -181,10 +181,13 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
         end
         batch, (pos, id) = state
         header = batch.msg.header
-        if isnothing(x.schema) && !isa(header, Meta.Schema)
+        if header isa Meta.Tensor
+            throw(ArgumentError(TENSOR_UNSUPPORTED))
+        elseif header isa Meta.SparseTensor
+            throw(ArgumentError(SPARSE_TENSOR_UNSUPPORTED))
+        elseif isnothing(x.schema) && !isa(header, Meta.Schema)
             throw(ArgumentError("first arrow ipc message MUST be a schema message"))
-        end
-        if header isa Meta.Schema
+        elseif header isa Meta.Schema
             if isnothing(x.schema)
                 x.schema = header
                 # assert endianness?
@@ -268,6 +271,10 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
                 push!(columns, vec)
             end
             break
+        elseif header isa Meta.Tensor
+            throw(ArgumentError(TENSOR_UNSUPPORTED))
+        elseif header isa Meta.SparseTensor
+            throw(ArgumentError(SPARSE_TENSOR_UNSUPPORTED))
         else
             throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
         end
@@ -583,6 +590,10 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                     ),
                 )
                 rbi += 1
+            elseif header isa Meta.Tensor
+                throw(ArgumentError(TENSOR_UNSUPPORTED))
+            elseif header isa Meta.SparseTensor
+                throw(ArgumentError(SPARSE_TENSOR_UNSUPPORTED))
             else
                 throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
             end

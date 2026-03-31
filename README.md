@@ -70,7 +70,7 @@ This implementation supports the 1.0 version of the specification, including sup
   * Streaming, file, record batch, and replacement and isdelta dictionary messages
 
 It currently doesn't include support for:
-  * Tensors or sparse tensors
+  * Tensor or sparse tensor IPC payload semantics; Arrow.jl now recognizes those message headers explicitly and rejects them with precise errors instead of falling through to a generic unsupported-message path
   * C data interface
   * Writing Run-End Encoded arrays; Arrow.jl now reads REE arrays and exposes them as read-only vectors, but still rejects REE on write paths
 

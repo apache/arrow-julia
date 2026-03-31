@@ -923,6 +923,31 @@ const hybrid = EnumRoundtripModule.hybrid
             end
         end
 
+        @testset "tensor message boundary" begin
+            function patch_message_header_type(bytes, header_type::UInt8)
+                patched = copy(bytes)
+                msg = Arrow.FlatBuffers.getrootas(Arrow.Meta.Message, patched, 8)
+                offset = Arrow.FlatBuffers.offset(msg, 6)
+                @test offset != 0
+                patched[Arrow.FlatBuffers.pos(msg) + offset + 1] = header_type
+                return patched
+            end
+
+            base = take!(Arrow.tobuffer((x=[1, 2],)))
+
+            tensor_bytes = patch_message_header_type(base, UInt8(4))
+            @test_throws ArgumentError(Arrow.TENSOR_UNSUPPORTED) Arrow.Table(tensor_bytes)
+            @test_throws ArgumentError(Arrow.TENSOR_UNSUPPORTED) collect(Arrow.Stream(tensor_bytes))
+
+            sparse_tensor_bytes = patch_message_header_type(base, UInt8(5))
+            @test_throws ArgumentError(Arrow.SPARSE_TENSOR_UNSUPPORTED) Arrow.Table(
+                sparse_tensor_bytes,
+            )
+            @test_throws ArgumentError(Arrow.SPARSE_TENSOR_UNSUPPORTED) collect(
+                Arrow.Stream(sparse_tensor_bytes),
+            )
+        end
+
         @testset "# 158" begin
             # arrow ipc stream generated from pyarrow with no record batches
             bytes = UInt8[
