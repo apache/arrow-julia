@@ -72,6 +72,7 @@ This implementation supports the 1.0 version of the specification, including sup
 It currently doesn't include support for:
   * Tensors or sparse tensors
   * C data interface
+  * Run-End Encoded arrays; Arrow.jl now rejects them explicitly during read instead of falling through partially
 
 Flight RPC status:
   * Experimental `Arrow.Flight` support is available in-tree
@@ -96,5 +97,10 @@ Third-party data formats:
   * CSV, parquet and avro support via the existing [CSV.jl](https://github.com/JuliaData/CSV.jl), [Parquet.jl](https://github.com/JuliaIO/Parquet.jl) and [Avro.jl](https://github.com/JuliaData/Avro.jl) packages
   * Other Tables.jl-compatible packages automatically supported ([DataFrames.jl](https://github.com/JuliaData/DataFrames.jl), [JSONTables.jl](https://github.com/JuliaData/JSONTables.jl), [JuliaDB.jl](https://github.com/JuliaData/JuliaDB.jl), [SQLite.jl](https://github.com/JuliaDatabases/SQLite.jl), [MySQL.jl](https://github.com/JuliaDatabases/MySQL.jl), [JDBC.jl](https://github.com/JuliaDatabases/JDBC.jl), [ODBC.jl](https://github.com/JuliaDatabases/ODBC.jl), [XLSX.jl](https://github.com/felipenoris/XLSX.jl), etc.)
   * No current Julia packages support ORC
+
+Canonical extension highlights:
+  * `UUID` now writes the canonical `arrow.uuid` extension name by default while retaining reader compatibility with legacy `JuliaLang.UUID` metadata
+  * `Arrow.TimestampWithOffset{U}` provides a canonical `arrow.timestamp_with_offset` logical type without conflating offset-only semantics with `ZonedDateTime`
+  * Legacy `JuliaLang.ZonedDateTime-UTC` and `JuliaLang.ZonedDateTime` files remain readable for backward compatibility
 
 See the [full documentation](https://arrow.apache.org/julia/) for details on reading and writing arrow data.

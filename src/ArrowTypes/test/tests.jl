@@ -126,6 +126,7 @@ const hybrid = EnumTestModule.hybrid
     @test ArrowTypes.toarrow(u) == ubytes
     @test ArrowTypes.arrowname(UUID) == ArrowTypes.UUIDSYMBOL
     @test ArrowTypes.JuliaType(Val(ArrowTypes.UUIDSYMBOL)) == UUID
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.LEGACY_UUIDSYMBOL)) == UUID
     @test ArrowTypes.fromarrow(UUID, ubytes) == u
 
     ip4 = IPv4(rand(UInt32))

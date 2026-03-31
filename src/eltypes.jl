@@ -24,6 +24,8 @@ finaljuliatype(T) = T
 finaljuliatype(::Type{Missing}) = Missing
 finaljuliatype(::Type{Union{T,Missing}}) where {T} = Union{Missing,finaljuliatype(T)}
 
+const RUN_END_ENCODED_UNSUPPORTED = "Run-End Encoded arrays are not supported yet"
+
 """
 Given a FlatBuffers.Builder and a Julia column or column eltype,
 Write the field.type flatbuffer definition of the eltype
@@ -46,7 +48,11 @@ function juliaeltype(f::Meta.Field, meta::AbstractDict{String,String}, convert::
     if haskey(meta, "ARROW:extension:name")
         typename = meta["ARROW:extension:name"]
         metadata = get(meta, "ARROW:extension:metadata", "")
-        JT = ArrowTypes.JuliaType(Val(Symbol(typename)), maybemissing(TT), metadata)
+        typenamesym = Symbol(typename)
+        storageT =
+            typenamesym === TIMESTAMP_WITH_OFFSET_SYMBOL ? maybemissing(juliaeltype(f, false)) :
+            maybemissing(TT)
+        JT = ArrowTypes.JuliaType(Val(typenamesym), storageT, metadata)
         if JT !== nothing
             return f.nullable ? Union{JT,Missing} : JT
         else
@@ -265,6 +271,19 @@ end
 
 Base.zero(::Type{Timestamp{U,T}}) where {U,T} = Timestamp{U,T}(Int64(0))
 
+struct TimestampWithOffset{U}
+    timestamp::Timestamp{U,:UTC}
+    offset_minutes::Int16
+end
+
+TimestampWithOffset(
+    timestamp::Timestamp{U,:UTC},
+    offset_minutes::Integer,
+) where {U} = TimestampWithOffset{U}(timestamp, Int16(offset_minutes))
+
+Base.zero(::Type{TimestampWithOffset{U}}) where {U} =
+    TimestampWithOffset{U}(zero(Timestamp{U,:UTC}), Int16(0))
+
 function juliaeltype(f::Meta.Field, x::Meta.Timestamp, convert)
     return Timestamp{x.unit,x.timezone === nothing ? nothing : Symbol(x.timezone)}
 end
@@ -335,6 +354,32 @@ ArrowTypes.fromarrow(::Type{ZonedDateTime}, x::Timestamp) = convert(ZonedDateTim
 ArrowTypes.default(::Type{TimeZones.ZonedDateTime}) =
     TimeZones.ZonedDateTime(1, 1, 1, 1, 1, 1, TimeZones.tz"UTC")
 
+const TIMESTAMP_WITH_OFFSET_SYMBOL = Symbol("arrow.timestamp_with_offset")
+ArrowTypes.arrowname(::Type{TimestampWithOffset{U}}) where {U} = TIMESTAMP_WITH_OFFSET_SYMBOL
+ArrowTypes.JuliaType(
+    ::Val{TIMESTAMP_WITH_OFFSET_SYMBOL},
+    ::Type{
+        NamedTuple{
+            (:timestamp, :offset_minutes),
+            Tuple{Timestamp{U,:UTC},Int16},
+        },
+    },
+    metadata::String,
+) where {U} = TimestampWithOffset{U}
+ArrowTypes.default(::Type{TimestampWithOffset{U}}) where {U} = zero(TimestampWithOffset{U})
+ArrowTypes.fromarrowstruct(
+    ::Type{TimestampWithOffset{U}},
+    ::Val{(:timestamp, :offset_minutes)},
+    timestamp::Timestamp{U,:UTC},
+    offset_minutes::Int16,
+) where {U} = TimestampWithOffset{U}(timestamp, offset_minutes)
+ArrowTypes.fromarrowstruct(
+    ::Type{TimestampWithOffset{U}},
+    ::Val{(:offset_minutes, :timestamp)},
+    offset_minutes::Int16,
+    timestamp::Timestamp{U,:UTC},
+) where {U} = TimestampWithOffset{U}(timestamp, offset_minutes)
+
 # Backwards compatibility: older versions of Arrow saved ZonedDateTime's with this metdata:
 const OLD_ZONEDDATETIME_SYMBOL = Symbol("JuliaLang.ZonedDateTime")
 # and stored the local time instead of the UTC time.
@@ -389,6 +434,9 @@ Interval{Meta.IntervalUnit.DAY_TIME}(x) =
 function juliaeltype(f::Meta.Field, x::Meta.Interval, convert)
     return Interval{x.unit,bitwidth(x.unit)}
 end
+
+juliaeltype(f::Meta.Field, x::Meta.RunEndEncoded, convert) =
+    throw(ArgumentError(RUN_END_ENCODED_UNSUPPORTED))
 
 function arrowtype(b, ::Type{Interval{U,T}}) where {U,T}
     Meta.intervalStart(b)

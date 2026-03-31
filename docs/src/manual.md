@@ -87,7 +87,8 @@ In the arrow data format, specific logical types are supported, a list of which 
 
 * `Date`, `Time`, `Timestamp`, and `Duration` all have natural Julia defintions in `Dates.Date`, `Dates.Time`, `TimeZones.ZonedDateTime`, and `Dates.Period` subtypes, respectively.
 * `Char` and `Symbol` Julia types are mapped to arrow string types, with additional metadata of the original Julia type; this allows deserializing directly to `Char` and `Symbol` in Julia, while other language implementations will see these columns as just strings
-* Similarly to the above, the `UUID` Julia type is mapped to a 128-bit `FixedSizeBinary` arrow type.
+* `UUID` is mapped to a 128-bit `FixedSizeBinary` arrow type and now writes the canonical `arrow.uuid` extension name by default while still reading older `JuliaLang.UUID` metadata
+* `Arrow.TimestampWithOffset{U}` is the canonical offset-only logical type for `arrow.timestamp_with_offset`; it stores a UTC `Arrow.Timestamp{U,:UTC}` plus `offset_minutes::Int16` and does not imply a timezone-name interpretation
 * `Decimal128` and `Decimal256` have no corresponding builtin Julia types, so they're deserialized using a compatible type definition in Arrow.jl itself: `Arrow.Decimal`
 
 
@@ -96,6 +97,10 @@ Note that when `convert=false` is passed, data will be returned in Arrow.jl-defi
 One note on performance: when writing `TimeZones.ZonedDateTime` columns to the arrow format (via `Arrow.write`), it is preferrable to "wrap" the columns in `Arrow.ToTimestamp(col)`, as long
 as the column has `ZonedDateTime` elements that all share a common timezone. This ensures the writing process can know "upfront" which timezone will be encoded and is thus much more
 efficient and performant.
+
+Run-End Encoded arrays are not implemented in Arrow.jl yet. Files containing
+that layout now fail explicitly during read with a clear unsupported error
+instead of partially decoding.
 
 Similarly, `ArrowTypes.ToArrow` avoids repeated type-promotion work for
 homogeneous custom columns even when `ArrowTypes.ArrowType(T)` is abstract, so

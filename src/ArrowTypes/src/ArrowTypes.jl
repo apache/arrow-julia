@@ -339,9 +339,11 @@ ArrowKind(::Type{NTuple{N,T}}) where {N,T} = FixedSizeListKind{N,T}()
 ArrowKind(::Type{UUID}) = FixedSizeListKind{16,UInt8}()
 ArrowType(::Type{UUID}) = NTuple{16,UInt8}
 toarrow(x::UUID) = _cast(NTuple{16,UInt8}, x.value)
-const UUIDSYMBOL = Symbol("JuliaLang.UUID")
+const UUIDSYMBOL = Symbol("arrow.uuid")
+const LEGACY_UUIDSYMBOL = Symbol("JuliaLang.UUID")
 arrowname(::Type{UUID}) = UUIDSYMBOL
 JuliaType(::Val{UUIDSYMBOL}) = UUID
+JuliaType(::Val{LEGACY_UUIDSYMBOL}) = UUID
 fromarrow(::Type{UUID}, x::NTuple{16,UInt8}) = UUID(_cast(UInt128, x))
 
 ArrowKind(::Type{IPv4}) = PrimitiveKind()

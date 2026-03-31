@@ -28,6 +28,10 @@ tobytes(io::IO) = Base.read(io)
 tobytes(io::IOStream) = Mmap.mmap(io)
 tobytes(file_path) = open(tobytes, file_path, "r")
 
+rejectunsupported(field::Meta.Field) = (rejectunsupported(field.type); foreach(rejectunsupported, field.children))
+rejectunsupported(x) = nothing
+rejectunsupported(x::Meta.RunEndEncoded) = throw(ArgumentError(RUN_END_ENCODED_UNSUPPORTED))
+
 struct BatchIterator
     bytes::Vector{UInt8}
     startpos::Int
@@ -187,6 +191,7 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
                 # assert endianness?
                 # store custom_metadata?
                 for (i, field) in enumerate(x.schema.fields)
+                    rejectunsupported(field)
                     push!(x.names, Symbol(field.name))
                     push!(
                         x.types,
@@ -487,6 +492,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                 # store custom_metadata?
                 if sch === nothing
                     for (i, field) in enumerate(header.fields)
+                        rejectunsupported(field)
                         push!(names(t), Symbol(field.name))
                         # recursively find any dictionaries for any fields
                         getdictionaries!(dictencoded, field)
@@ -901,6 +907,20 @@ function build(
     nodeidx,
     bufferidx,
     varbufferidx
+end
+
+function build(
+    f::Meta.Field,
+    x::Meta.RunEndEncoded,
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    varbufferidx,
+    convert,
+)
+    throw(ArgumentError(RUN_END_ENCODED_UNSUPPORTED))
 end
 
 function build(

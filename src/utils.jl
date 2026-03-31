@@ -163,7 +163,10 @@ end
 
 @inline function _directtobuffercoleligible(col)
     T = Base.nonmissingtype(eltype(col))
-    return !(T <: AbstractString || T <: Base.CodeUnits)
+    T <: AbstractString && return false
+    T <: Base.CodeUnits && return false
+    K = ArrowTypes.ArrowKind(ArrowTypes.ArrowType(T))
+    return !(K isa ArrowTypes.ListKind)
 end
 
 @inline function _directtobufferstringonly(col)

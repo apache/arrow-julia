@@ -340,6 +340,12 @@ const hybrid = EnumRoundtripModule.hybrid
             seekstart(io)
             @test read(Arrow.tobuffer(mapt)) == read(io)
 
+            nestedt = (col=OffsetArray([Int64[1, 2], Int64[3, 4], Int64[]], 0:2),)
+            io = IOBuffer()
+            Arrow.write(io, nestedt)
+            seekstart(io)
+            @test read(Arrow.tobuffer(nestedt)) == read(io)
+
             pooled = (col=PooledArray(["a", "b", "a", "c"]),)
             io = IOBuffer()
             Arrow.write(io, pooled; dictencode=true)
@@ -510,6 +516,26 @@ const hybrid = EnumRoundtripModule.hybrid
             @test copy(tt.a) isa Vector{Nanosecond}
             @test copy(tt.b) isa Vector{UUID}
             @test copy(tt.c) isa Vector{Union{Missing,Nanosecond}}
+            @test Arrow.getmetadata(tt.b)["ARROW:extension:name"] == "arrow.uuid"
+
+            legacy = (
+                b=[
+                    Arrow.ArrowTypes.toarrow(UUID("550e8400-e29b-41d4-a716-446655440000")),
+                    Arrow.ArrowTypes.toarrow(UUID("550e8400-e29b-41d4-a716-446655440001")),
+                ],
+            )
+            legacy_tt = Arrow.Table(
+                Arrow.tobuffer(
+                    legacy;
+                    colmetadata=Dict(
+                        :b => Dict("ARROW:extension:name" => "JuliaLang.UUID"),
+                    ),
+                ),
+            )
+            @test copy(legacy_tt.b) == [
+                UUID("550e8400-e29b-41d4-a716-446655440000"),
+                UUID("550e8400-e29b-41d4-a716-446655440001"),
+            ]
 
             toffset = (
                 b=OffsetArray(
@@ -691,6 +717,74 @@ const hybrid = EnumRoundtripModule.hybrid
                   Arrow.Timestamp{Arrow.Flatbuf.TimeUnit.MILLISECOND,Symbol("Europe/Paris")}(
                 1577833200000,
             )
+        end
+
+        @testset "canonical timestamp_with_offset" begin
+            values = Union{Missing,Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND}}[
+                Arrow.TimestampWithOffset(
+                    Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC}(1577836800000),
+                    330,
+                ),
+                missing,
+                Arrow.TimestampWithOffset(
+                    Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC}(1577923200000),
+                    -480,
+                ),
+            ]
+            tt = Arrow.Table(Arrow.tobuffer((col=values,)))
+            @test eltype(tt.col) ==
+                  Union{Missing,Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND}}
+            @test isequal(copy(tt.col), values)
+            @test Arrow.getmetadata(tt.col)["ARROW:extension:name"] ==
+                  "arrow.timestamp_with_offset"
+
+            raw_tt = Arrow.Table(Arrow.tobuffer((col=values,)); convert=false)
+            @test eltype(raw_tt.col) ==
+                  Union{
+                Missing,
+                NamedTuple{
+                    (:timestamp, :offset_minutes),
+                    Tuple{
+                        Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC},
+                        Int16,
+                    },
+                },
+            }
+            @test isequal(
+                copy(raw_tt.col),
+                Union{
+                    Missing,
+                    NamedTuple{
+                        (:timestamp, :offset_minutes),
+                        Tuple{
+                            Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC},
+                            Int16,
+                        },
+                    },
+                }[
+                    (
+                        timestamp=Arrow.Timestamp{
+                            Arrow.Meta.TimeUnit.MILLISECOND,
+                            :UTC,
+                        }(1577836800000),
+                        offset_minutes=Int16(330),
+                    ),
+                    missing,
+                    (
+                        timestamp=Arrow.Timestamp{
+                            Arrow.Meta.TimeUnit.MILLISECOND,
+                            :UTC,
+                        }(1577923200000),
+                        offset_minutes=Int16(-480),
+                    ),
+                ],
+            )
+        end
+
+        @testset "Run-End Encoded rejection" begin
+            path = joinpath(@__DIR__, "run_end_encoded_small.arrow")
+            @test_throws ArgumentError(Arrow.RUN_END_ENCODED_UNSUPPORTED) Arrow.Table(path)
+            @test_throws ArgumentError(Arrow.RUN_END_ENCODED_UNSUPPORTED) collect(Arrow.Stream(path))
         end
 
         @testset "# 158" begin
