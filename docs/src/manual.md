@@ -92,7 +92,9 @@ In the arrow data format, specific logical types are supported, a list of which 
 * `Arrow.Bool8` is an explicit opt-in logical type for the canonical `arrow.bool8` extension; it uses `Int8` storage, while plain Julia `Bool` continues to use Arrow's packed-bit boolean layout
 * `Arrow.JSONText{String}` is a text-backed logical type for the canonical `arrow.json` extension; Arrow.jl preserves the payload as text and does not parse JSON automatically
 * `arrow.opaque` is treated as interoperability metadata over the underlying storage type; explicit metadata can be generated with `Arrow.opaquemetadata(type_name, vendor_name)` when writing
-* `arrow.parquet.variant`, `arrow.fixed_shape_tensor`, and `arrow.variable_shape_tensor` are recognized as canonical passthrough extensions on read; Arrow.jl currently returns their underlying storage types and does not yet implement higher-level semantic interpretation or automatic writer surfaces for them
+* `Arrow.variantmetadata()`, `Arrow.fixedshapetensormetadata(...)`, and `Arrow.variableshapetensormetadata(...)` generate canonical metadata strings for advanced canonical extensions when writing explicit storage-backed values
+* `arrow.fixed_shape_tensor` and `arrow.variable_shape_tensor` are recognized as canonical passthrough extensions on read; Arrow.jl returns their underlying storage types, validates canonical metadata and top-level storage shape, and does not yet implement higher-level semantic interpretation or automatic writer surfaces for them
+* `arrow.parquet.variant` is recognized as a canonical passthrough extension on read; Arrow.jl currently validates only the required empty metadata string and does not yet implement deeper variant semantics or an automatic writer surface
 * `Decimal128` and `Decimal256` have no corresponding builtin Julia types, so they're deserialized using a compatible type definition in Arrow.jl itself: `Arrow.Decimal`
 
 

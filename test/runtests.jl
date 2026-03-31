@@ -27,6 +27,7 @@ using CategoricalArrays
 using DataAPI
 using FilePathsBase
 using DataFrames
+using JSON3
 using OffsetArrays
 import Random: randstring
 using TestSetExtensions: ExtendedTestSet
@@ -843,13 +844,55 @@ const hybrid = EnumRoundtripModule.hybrid
         end
 
         @testset "canonical advanced passthrough" begin
+            function assert_canonical_extension_error(f::Function, needle::AbstractString)
+                err = try
+                    f()
+                    nothing
+                catch e
+                    e
+                end
+                @test err !== nothing
+                @test occursin(needle, sprint(showerror, err))
+                return
+            end
+
+            @test Arrow.variantmetadata() == ""
+
+            fixed_metadata = Arrow.fixedshapetensormetadata(
+                [2, 2];
+                dim_names=["x", "y"],
+                permutation=[1, 0],
+            )
+            @test JSON3.read(fixed_metadata)["shape"] == [2, 2]
+            @test JSON3.read(fixed_metadata)["dim_names"] == ["x", "y"]
+            @test JSON3.read(fixed_metadata)["permutation"] == [1, 0]
+
+            variable_metadata = Arrow.variableshapetensormetadata(
+                uniform_shape=Union{Nothing,Int}[2],
+                dim_names=["axis0"],
+                permutation=[0],
+            )
+            @test JSON3.read(variable_metadata)["uniform_shape"] == [2]
+            @test JSON3.read(variable_metadata)["dim_names"] == ["axis0"]
+            @test JSON3.read(variable_metadata)["permutation"] == [0]
+            @test Arrow.variableshapetensormetadata() == ""
+
+            @test_throws ArgumentError Arrow.fixedshapetensormetadata(
+                [2, 2];
+                dim_names=["x"],
+            )
+            @test_throws ArgumentError Arrow.variableshapetensormetadata(
+                uniform_shape=Union{Nothing,Int}[2, nothing];
+                permutation=[0],
+            )
+
             variant_values = Union{
                 Missing,
                 NamedTuple{(:metadata, :value),Tuple{String,String}},
             }[
                 (metadata="json", value="{\"a\":1}"),
                 missing,
-                (metadata="string", value="abc"),
+                (metadata="str", value="abc"),
             ]
             @test_logs min_level=Base.CoreLogging.Warn begin
                 variant_tt = Arrow.Table(
@@ -858,7 +901,7 @@ const hybrid = EnumRoundtripModule.hybrid
                         colmetadata=Dict(
                             :col => Dict(
                                 "ARROW:extension:name" => "arrow.parquet.variant",
-                                "ARROW:extension:metadata" => "",
+                                "ARROW:extension:metadata" => Arrow.variantmetadata(),
                             ),
                         ),
                     ),
@@ -881,7 +924,7 @@ const hybrid = EnumRoundtripModule.hybrid
                         colmetadata=Dict(
                             :col => Dict(
                                 "ARROW:extension:name" => "arrow.fixed_shape_tensor",
-                                "ARROW:extension:metadata" => "{\"shape\":[2,2],\"dim_names\":[\"x\",\"y\"]}",
+                                "ARROW:extension:metadata" => fixed_metadata,
                             ),
                         ),
                     ),
@@ -892,10 +935,13 @@ const hybrid = EnumRoundtripModule.hybrid
                       "arrow.fixed_shape_tensor"
             end
 
-            variable_tensor_values = Union{Missing,Vector{Int32}}[
-                Int32[1, 2, 3, 4],
+            variable_tensor_values = Union{
+                Missing,
+                NamedTuple{(:data, :shape),Tuple{Vector{Int32},NTuple{1,Int32}}},
+            }[
+                (data=Int32[1, 2, 3, 4], shape=(Int32(2),)),
                 missing,
-                Int32[5, 6],
+                (data=Int32[5, 6], shape=(Int32(1),)),
             ]
             @test_logs min_level=Base.CoreLogging.Warn begin
                 variable_tensor_tt = Arrow.Table(
@@ -904,23 +950,66 @@ const hybrid = EnumRoundtripModule.hybrid
                         colmetadata=Dict(
                             :col => Dict(
                                 "ARROW:extension:name" => "arrow.variable_shape_tensor",
-                                "ARROW:extension:metadata" => "{\"uniform_shape\":[2]}",
+                                "ARROW:extension:metadata" => variable_metadata,
                             ),
                         ),
                     ),
                 )
-                @test Base.nonmissingtype(eltype(variable_tensor_tt.col)) <: AbstractVector{Int32}
+                @test eltype(variable_tensor_tt.col) == eltype(variable_tensor_values)
                 @test isequal(
-                    map(x -> x === missing ? missing : copy(x), copy(variable_tensor_tt.col)),
-                    Union{Missing,Vector{Int32}}[
-                        Int32[1, 2, 3, 4],
-                        missing,
-                        Int32[5, 6],
-                    ],
+                    map(
+                        x -> x === missing ? missing : (data=copy(x.data), shape=x.shape),
+                        copy(variable_tensor_tt.col),
+                    ),
+                    variable_tensor_values,
                 )
                 @test Arrow.getmetadata(variable_tensor_tt.col)["ARROW:extension:name"] ==
                       "arrow.variable_shape_tensor"
             end
+
+            invalid_variant_bytes = Arrow.tobuffer(
+                (col=variant_values,);
+                colmetadata=Dict(
+                    :col => Dict(
+                        "ARROW:extension:name" => "arrow.parquet.variant",
+                        "ARROW:extension:metadata" => "{\"unexpected\":true}",
+                    ),
+                ),
+            )
+            assert_canonical_extension_error(
+                () -> Arrow.Table(invalid_variant_bytes),
+                "invalid canonical arrow.parquet.variant extension",
+            )
+
+            invalid_fixed_bytes = Arrow.tobuffer(
+                (col=fixed_tensor_values,);
+                colmetadata=Dict(
+                    :col => Dict(
+                        "ARROW:extension:name" => "arrow.fixed_shape_tensor",
+                        "ARROW:extension:metadata" => Arrow.fixedshapetensormetadata([3, 2]),
+                    ),
+                ),
+            )
+            assert_canonical_extension_error(
+                () -> Arrow.Table(invalid_fixed_bytes),
+                "invalid canonical arrow.fixed_shape_tensor extension",
+            )
+
+            invalid_variable_bytes = Arrow.tobuffer(
+                (col=["a", "b"],);
+                colmetadata=Dict(
+                    :col => Dict(
+                        "ARROW:extension:name" => "arrow.variable_shape_tensor",
+                        "ARROW:extension:metadata" => Arrow.variableshapetensormetadata(
+                            uniform_shape=Union{Nothing,Int}[1],
+                        ),
+                    ),
+                ),
+            )
+            assert_canonical_extension_error(
+                () -> Arrow.Table(invalid_variable_bytes),
+                "invalid canonical arrow.variable_shape_tensor extension",
+            )
         end
 
         @testset "tensor message boundary" begin
