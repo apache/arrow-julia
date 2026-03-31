@@ -51,6 +51,15 @@ struct CustomStruct2{sym}
     x::Int
 end
 
+module EnumRoundtripModule
+@enum RankingStrategy lexical=1 semantic=2 hybrid=3
+end
+
+const RankingStrategy = EnumRoundtripModule.RankingStrategy
+const lexical = EnumRoundtripModule.lexical
+const semantic = EnumRoundtripModule.semantic
+const hybrid = EnumRoundtripModule.hybrid
+
 @testset ExtendedTestSet "Arrow" begin
     @testset "table roundtrips" begin
         for case in testtables
@@ -448,6 +457,35 @@ end
             tt = Arrow.Table(Arrow.tobuffer(t))
             @test length(tt) == length(t)
             @test all(isequal.(values(t), values(tt)))
+        end
+
+        @testset "# Julia Enum extension logical type roundtrip" begin
+            t = (
+                col1=[lexical, hybrid],
+                col2=Union{Missing, RankingStrategy}[missing, semantic],
+            )
+
+            bytes = read(Arrow.tobuffer(t))
+            tt = Arrow.Table(IOBuffer(bytes))
+            raw = Arrow.Table(IOBuffer(bytes); convert=false)
+
+            @test length(tt) == length(t)
+            @test eltype(tt.col1) == RankingStrategy
+            @test eltype(tt.col2) == Union{Missing, RankingStrategy}
+            @test tt.col1 == [lexical, hybrid]
+            @test isequal(
+                tt.col2,
+                Union{Missing, RankingStrategy}[missing, semantic],
+            )
+            @test eltype(raw.col1) == Int32
+            @test eltype(raw.col2) == Union{Missing, Int32}
+            @test raw.col1 == Int32[1, 3]
+            @test isequal(raw.col2, Union{Missing, Int32}[missing, 2])
+            @test Arrow.getmetadata(tt.col1)["ARROW:extension:name"] == "JuliaLang.Enum"
+            @test occursin(
+                "Main.EnumRoundtripModule.RankingStrategy",
+                Arrow.getmetadata(tt.col1)["ARROW:extension:metadata"],
+            )
         end
 
         @testset "# 76" begin

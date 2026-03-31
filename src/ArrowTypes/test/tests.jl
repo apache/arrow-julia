@@ -22,6 +22,15 @@ struct Person
     name::String
 end
 
+module EnumTestModule
+@enum RankingStrategy lexical=1 semantic=2 hybrid=3
+end
+
+const RankingStrategy = EnumTestModule.RankingStrategy
+const lexical = EnumTestModule.lexical
+const semantic = EnumTestModule.semantic
+const hybrid = EnumTestModule.hybrid
+
 @testset "ArrowTypes" begin
     @test ArrowTypes.ArrowKind(MyInt) == ArrowTypes.PrimitiveKind()
     @test ArrowTypes.ArrowKind(Person) == ArrowTypes.StructKind()
@@ -66,6 +75,17 @@ end
     @test ArrowTypes.arrowname(Char) == ArrowTypes.CHAR
     @test ArrowTypes.JuliaType(Val(ArrowTypes.CHAR)) == Char
     @test ArrowTypes.fromarrow(Char, UInt32('1')) == '1'
+
+    enum_metadata = ArrowTypes.arrowmetadata(RankingStrategy)
+    @test ArrowTypes.ArrowKind(RankingStrategy) == ArrowTypes.PrimitiveKind()
+    @test ArrowTypes.ArrowType(RankingStrategy) == Int32
+    @test ArrowTypes.toarrow(hybrid) == Int32(3)
+    @test ArrowTypes.arrowname(RankingStrategy) == ArrowTypes.ENUM
+    @test occursin("type=Main.EnumTestModule.RankingStrategy", enum_metadata)
+    @test occursin("labels=lexical:1,semantic:2,hybrid:3", enum_metadata)
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM), Int32, enum_metadata) == RankingStrategy
+    @test ArrowTypes.fromarrow(RankingStrategy, Int32(2)) == semantic
+    @test ArrowTypes.default(RankingStrategy) == lexical
 
     @test ArrowTypes.ArrowKind(Bool) == ArrowTypes.BoolKind()
 

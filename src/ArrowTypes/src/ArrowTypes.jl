@@ -213,6 +213,81 @@ arrowname(::Type{Char}) = CHAR
 JuliaType(::Val{CHAR}) = Char
 fromarrow(::Type{Char}, x::UInt32) = Char(x)
 
+ArrowType(::Type{T}) where {T<:Enum} = Base.Enums.basetype(T)
+toarrow(x::T) where {T<:Enum} = convert(Base.Enums.basetype(T), Int(x))
+const ENUM = Symbol("JuliaLang.Enum")
+arrowname(::Type{T}) where {T<:Enum} = ENUM
+
+function _qualifiedtypepath(::Type{T}) where {T}
+    module_path = join(string.(Base.fullname(parentmodule(T))), ".")
+    return string(module_path, ".", nameof(T))
+end
+
+function _enum_labels(::Type{T}) where {T<:Enum}
+    B = Base.Enums.basetype(T)
+    return join((string(instance, ":", convert(B, Int(instance))) for instance in instances(T)), ",")
+end
+
+function arrowmetadata(::Type{T}) where {T<:Enum}
+    return string("type=", _qualifiedtypepath(T), ";labels=", _enum_labels(T))
+end
+
+function _parsemetadata(metadata::AbstractString)
+    parsed = Dict{String, String}()
+    isempty(metadata) && return parsed
+    for entry in split(metadata, ';')
+        isempty(entry) && continue
+        delimiter = findfirst(==('='), entry)
+        delimiter === nothing && continue
+        key = entry[1:prevind(entry, delimiter)]
+        value = entry[nextind(entry, delimiter):end]
+        parsed[key] = value
+    end
+    return parsed
+end
+
+function _rootmodule(name::Symbol)
+    name === :Main && return Main
+    if isdefined(Main, name)
+        candidate = getfield(Main, name)
+        candidate isa Module && return candidate
+    end
+    try
+        return Base.root_module(Main, name)
+    catch
+        return nothing
+    end
+end
+
+function _resolvequalifiedtype(path::AbstractString)
+    parts = split(path, '.')
+    length(parts) < 2 && return nothing
+    current = _rootmodule(Symbol(first(parts)))
+    current isa Module || return nothing
+    for part in parts[2:(end - 1)]
+        symbol = Symbol(part)
+        isdefined(current, symbol) || return nothing
+        current = getfield(current, symbol)
+        current isa Module || return nothing
+    end
+    type_symbol = Symbol(last(parts))
+    isdefined(current, type_symbol) || return nothing
+    return getfield(current, type_symbol)
+end
+
+function JuliaType(::Val{ENUM}, S, metadata::String)
+    parsed = _parsemetadata(metadata)
+    haskey(parsed, "type") || return nothing
+    T = _resolvequalifiedtype(parsed["type"])
+    T isa DataType || return nothing
+    T <: Enum || return nothing
+    storage_type = Base.nonmissingtype(S)
+    Base.Enums.basetype(T) === storage_type || return nothing
+    return T
+end
+
+fromarrow(::Type{T}, x::Integer) where {T<:Enum} = T(x)
+
 "BoolKind data is stored with values packed down to individual bits; so instead of a traditional Bool being 1 byte/8 bits, 8 Bool values would be packed into a single byte"
 struct BoolKind <: ArrowKind end
 ArrowKind(::Type{Bool}) = BoolKind()
@@ -367,6 +442,7 @@ function default end
 default(T) = zero(T)
 default(::Type{Symbol}) = Symbol()
 default(::Type{Char}) = '\0'
+default(::Type{T}) where {T<:Enum} = first(instances(T))
 default(::Type{<:AbstractString}) = ""
 default(::Type{Any}) = nothing
 default(::Type{Missing}) = missing

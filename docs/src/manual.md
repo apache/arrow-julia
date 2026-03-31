@@ -111,6 +111,26 @@ Arrow.jl already uses this mechanism for several Base logical types, including
 their original Julia types instead of falling back to plain struct-shaped
 `NamedTuple`s.
 
+Base Julia `@enum` types also work out of the box through the same extension
+machinery. Arrow stores the enum as its primitive basetype plus a
+`JuliaLang.Enum` extension label that records the qualified Julia type path and
+label/value mapping. Native Julia readers reconstruct the enum type, while
+`Arrow.Table(...; convert=false)` and non-Julia consumers continue to see the
+primitive storage values.
+
+```julia
+using Arrow
+
+@enum RankingStrategy lexical=1 semantic=2 hybrid=3
+
+bytes = read(Arrow.tobuffer((strategy = [lexical, hybrid],)))
+typed = Arrow.Table(IOBuffer(bytes))
+raw = Arrow.Table(IOBuffer(bytes); convert=false)
+
+eltype(typed.strategy) == RankingStrategy
+eltype(raw.strategy) == Int32
+```
+
 ```julia
 using Arrow
 

@@ -65,6 +65,7 @@ This implementation supports the 1.0 version of the specification, including sup
   * Dictionary encodings and messages
   * Dictionary-encoded `CategoricalArray` interop, including missing-value roundtrips through `Arrow.Table`, `copy`, and `DataFrame(...; copycols=true)`
   * Extension types
+  * Base Julia `Enum` logical types via the `JuliaLang.Enum` extension label, with native Julia roundtrips back to the original enum type while `convert=false` and non-Julia consumers still see the primitive storage type
   * View-backed Utf8/Binary columns, including recovery from under-reported variadic buffer counts by inferring the required external buffers from valid view elements
   * Streaming, file, record batch, and replacement and isdelta dictionary messages
 
