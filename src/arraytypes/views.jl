@@ -21,6 +21,17 @@ struct ViewElement
     offset::Int32
 end
 
+const VIEW_ELEMENT_BYTES = sizeof(ViewElement)
+const VIEW_LENGTH_BYTES = sizeof(Int32)
+const VIEW_INLINE_BYTES = VIEW_ELEMENT_BYTES - VIEW_LENGTH_BYTES
+
+@inline _viewisinline(length::Integer) = length <= VIEW_INLINE_BYTES
+@inline _viewinlinestart(i::Integer) =
+    ((i - 1) * VIEW_ELEMENT_BYTES) + VIEW_LENGTH_BYTES + 1
+@inline _viewinlineend(i::Integer, length::Integer) = _viewinlinestart(i) + length - 1
+@inline _viewinlineslice(inline::Vector{UInt8}, i::Integer, length::Integer) =
+    @view inline[_viewinlinestart(i):_viewinlineend(i, length)]
+
 """
     Arrow.View
 
@@ -45,12 +56,8 @@ Base.size(l::View) = (l.ℓ,)
     if S <: Base.CodeUnits
         # BinaryView
         return !l.validity[i] ? missing :
-               v.length < 13 ?
-               Base.CodeUnits(
-            StringView(
-                @view l.inline[(((i - 1) * 16) + 5):(((i - 1) * 16) + 5 + v.length - 1)]
-            ),
-        ) :
+               _viewisinline(v.length) ?
+               Base.CodeUnits(StringView(_viewinlineslice(l.inline, i, v.length))) :
                Base.CodeUnits(
             StringView(
                 @view l.buffers[v.bufindex + 1][(v.offset + 1):(v.offset + v.length)]
@@ -59,12 +66,10 @@ Base.size(l::View) = (l.ℓ,)
     else
         # Utf8View
         return !l.validity[i] ? missing :
-               v.length < 13 ?
+               _viewisinline(v.length) ?
                ArrowTypes.fromarrow(
             T,
-            StringView(
-                @view l.inline[(((i - 1) * 16) + 5):(((i - 1) * 16) + 5 + v.length - 1)]
-            ),
+            StringView(_viewinlineslice(l.inline, i, v.length)),
         ) :
                ArrowTypes.fromarrow(
             T,

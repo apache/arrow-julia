@@ -70,6 +70,22 @@ function arrowvector(::PrimitiveKind, x, i, nl, fi, de, ded, meta; kw...)
     return Primitive(eltype(x), UInt8[], validity, x, length(x), meta)
 end
 
+function arrowvector(
+    ::PrimitiveKind,
+    x::ArrowTypes.ToArrow,
+    i,
+    nl,
+    fi,
+    de,
+    ded,
+    meta;
+    kw...,
+)
+    data = _materializeconverted(x)
+    validity = _toarrowvalidity(x, data)
+    return Primitive(eltype(data), UInt8[], validity, data, length(data), meta)
+end
+
 function compress(Z::Meta.CompressionType.T, comp, p::P) where {P<:Primitive}
     len = length(p)
     nc = nullcount(p)

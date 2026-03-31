@@ -119,6 +119,8 @@ signedtype(::Type{UInt32}) = Int32
 signedtype(::Type{UInt64}) = Int64
 signedtype(::Type{T}) where {T<:Signed} = T
 
+@inline _dictrefshift(pool) = firstindex(pool)
+
 indtype(d::DictEncoded{T,S,A}) where {T,S,A} = S
 indtype(c::Compressed{Z,A}) where {Z,A<:DictEncoded} = indtype(c.data)
 
@@ -232,7 +234,7 @@ function arrowvector(
             inds = copyto!(similar(Vector{signedtype(length(pool))}, length(refa)), refa)
         end
         # adjust to "offset" instead of index
-        inds .-= firstindex(refa)
+        inds .-= _dictrefshift(pool)
         data = arrowvector(
             pool,
             i,

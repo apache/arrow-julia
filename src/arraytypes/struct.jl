@@ -80,13 +80,72 @@ end
 ToStruct(x::A, j::Integer) where {A} =
     ToStruct{fieldtype(Base.nonmissingtype(eltype(A)), j),j,A}(x)
 
+@inline _structsource(A::ToStruct) = getfield(A, :data)
+@inline _structsourcevalue(A::ToStruct, i::Integer) = @inbounds _structsource(A)[i]
+
 Base.IndexStyle(::Type{<:ToStruct}) = Base.IndexLinear()
-Base.size(x::ToStruct) = (length(x.data),)
+Base.size(x::ToStruct) = (length(_structsource(x)),)
+
+@inline _structfield(::Type{T}, x, j) where {T} =
+    x === missing ? ArrowTypes.default(T) : getfield(x, j)
 
 Base.@propagate_inbounds function Base.getindex(A::ToStruct{T,j}, i::Integer) where {T,j}
     @boundscheck checkbounds(A, i)
-    @inbounds x = A.data[i]
-    return x === missing ? ArrowTypes.default(T) : getfield(x, j)
+    x = _structsourcevalue(A, i)
+    return _structfield(T, x, j)
+end
+
+function Base.iterate(A::ToStruct{T,j}) where {T,j}
+    state = iterate(_structsource(A))
+    state === nothing && return nothing
+    x, st = state
+    return _structfield(T, x, j), st
+end
+
+function Base.iterate(A::ToStruct{T,j}, st) where {T,j}
+    state = iterate(_structsource(A), st)
+    state === nothing && return nothing
+    x, st = state
+    return _structfield(T, x, j), st
+end
+
+function writearray(io::IO, ::Type{T}, col::ToStruct{T,j}) where {T,j}
+    isbitstype(T) || return _writearrayfallback(io, T, col)
+    data = Vector{T}(undef, length(col))
+    i = 1
+    for x in col
+        @inbounds data[i] = x
+        i += 1
+    end
+    return _writearraycontiguous(io, T, data)
+end
+
+function writearray(
+    io::IO,
+    ::Type{UInt8},
+    col::ToList{UInt8,stringtype,A},
+) where {stringtype,T,j,A<:ToStruct{T,j}}
+    off = _tolistoffset(col)
+    off == 0 || return _writearray_tolist_uint8(io, col)
+    len = length(col)
+    len <= 1_048_576 || return _writearray_tolist_uint8(io, col)
+    outer = _tolistdata(col)
+    data = _structsource(outer)
+    buf = Vector{UInt8}(undef, len)
+    pos = 1
+    @inbounds for idx in eachindex(data)
+        chunk = _structfield(T, data[idx], j)
+        chunk === missing && continue
+        bytes = stringtype ? _codeunits(chunk) : chunk
+        for b in bytes
+            buf[pos] = b
+            pos += 1
+        end
+    end
+    written = pos - 1
+    GC.@preserve buf begin
+        return Base.unsafe_write(io, pointer(buf), written)
+    end
 end
 
 arrowvector(::StructKind, x::Struct, i, nl, fi, de, ded, meta; kw...) = x

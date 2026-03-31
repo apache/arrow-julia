@@ -213,6 +213,81 @@ arrowname(::Type{Char}) = CHAR
 JuliaType(::Val{CHAR}) = Char
 fromarrow(::Type{Char}, x::UInt32) = Char(x)
 
+ArrowType(::Type{T}) where {T<:Enum} = Base.Enums.basetype(T)
+toarrow(x::T) where {T<:Enum} = convert(Base.Enums.basetype(T), Int(x))
+const ENUM = Symbol("JuliaLang.Enum")
+arrowname(::Type{T}) where {T<:Enum} = ENUM
+
+function _qualifiedtypepath(::Type{T}) where {T}
+    module_path = join(string.(Base.fullname(parentmodule(T))), ".")
+    return string(module_path, ".", nameof(T))
+end
+
+function _enum_labels(::Type{T}) where {T<:Enum}
+    B = Base.Enums.basetype(T)
+    return join((string(instance, ":", convert(B, Int(instance))) for instance in instances(T)), ",")
+end
+
+function arrowmetadata(::Type{T}) where {T<:Enum}
+    return string("type=", _qualifiedtypepath(T), ";labels=", _enum_labels(T))
+end
+
+function _parsemetadata(metadata::AbstractString)
+    parsed = Dict{String, String}()
+    isempty(metadata) && return parsed
+    for entry in split(metadata, ';')
+        isempty(entry) && continue
+        delimiter = findfirst(==('='), entry)
+        delimiter === nothing && continue
+        key = entry[1:prevind(entry, delimiter)]
+        value = entry[nextind(entry, delimiter):end]
+        parsed[key] = value
+    end
+    return parsed
+end
+
+function _rootmodule(name::Symbol)
+    name === :Main && return Main
+    if isdefined(Main, name)
+        candidate = getfield(Main, name)
+        candidate isa Module && return candidate
+    end
+    try
+        return Base.root_module(Main, name)
+    catch
+        return nothing
+    end
+end
+
+function _resolvequalifiedtype(path::AbstractString)
+    parts = split(path, '.')
+    length(parts) < 2 && return nothing
+    current = _rootmodule(Symbol(first(parts)))
+    current isa Module || return nothing
+    for part in parts[2:(end - 1)]
+        symbol = Symbol(part)
+        isdefined(current, symbol) || return nothing
+        current = getfield(current, symbol)
+        current isa Module || return nothing
+    end
+    type_symbol = Symbol(last(parts))
+    isdefined(current, type_symbol) || return nothing
+    return getfield(current, type_symbol)
+end
+
+function JuliaType(::Val{ENUM}, S, metadata::String)
+    parsed = _parsemetadata(metadata)
+    haskey(parsed, "type") || return nothing
+    T = _resolvequalifiedtype(parsed["type"])
+    T isa DataType || return nothing
+    T <: Enum || return nothing
+    storage_type = Base.nonmissingtype(S)
+    Base.Enums.basetype(T) === storage_type || return nothing
+    return T
+end
+
+fromarrow(::Type{T}, x::Integer) where {T<:Enum} = T(x)
+
 "BoolKind data is stored with values packed down to individual bits; so instead of a traditional Bool being 1 byte/8 bits, 8 Bool values would be packed into a single byte"
 struct BoolKind <: ArrowKind end
 ArrowKind(::Type{Bool}) = BoolKind()
@@ -264,9 +339,11 @@ ArrowKind(::Type{NTuple{N,T}}) where {N,T} = FixedSizeListKind{N,T}()
 ArrowKind(::Type{UUID}) = FixedSizeListKind{16,UInt8}()
 ArrowType(::Type{UUID}) = NTuple{16,UInt8}
 toarrow(x::UUID) = _cast(NTuple{16,UInt8}, x.value)
-const UUIDSYMBOL = Symbol("JuliaLang.UUID")
+const UUIDSYMBOL = Symbol("arrow.uuid")
+const LEGACY_UUIDSYMBOL = Symbol("JuliaLang.UUID")
 arrowname(::Type{UUID}) = UUIDSYMBOL
 JuliaType(::Val{UUIDSYMBOL}) = UUID
+JuliaType(::Val{LEGACY_UUIDSYMBOL}) = UUID
 fromarrow(::Type{UUID}, x::NTuple{16,UInt8}) = UUID(_cast(UInt128, x))
 
 ArrowKind(::Type{IPv4}) = PrimitiveKind()
@@ -324,6 +401,14 @@ arrowname(::Type{Tuple{}}) = TUPLE
 JuliaType(::Val{TUPLE}, ::Type{NamedTuple{names,types}}) where {names,types<:Tuple} = types
 fromarrow(::Type{T}, x::NamedTuple) where {T<:Tuple} = Tuple(x)
 
+# Complex
+const COMPLEX = Symbol("JuliaLang.Complex")
+arrowname(::Type{<:Complex}) = COMPLEX
+JuliaType(::Val{COMPLEX}, ::Type{NamedTuple{names,Tuple{T,T}}}) where {names,T<:Real} =
+    Complex{T}
+fromarrowstruct(::Type{T}, ::Val{(:re, :im)}, re, im) where {T<:Complex} = T(re, im)
+fromarrowstruct(::Type{T}, ::Val{(:im, :re)}, im, re) where {T<:Complex} = T(re, im)
+
 # VersionNumber
 const VERSION_NUMBER = Symbol("JuliaLang.VersionNumber")
 ArrowKind(::Type{VersionNumber}) = StructKind()
@@ -359,6 +444,7 @@ function default end
 default(T) = zero(T)
 default(::Type{Symbol}) = Symbol()
 default(::Type{Char}) = '\0'
+default(::Type{T}) where {T<:Enum} = first(instances(T))
 default(::Type{<:AbstractString}) = ""
 default(::Type{Any}) = nothing
 default(::Type{Missing}) = missing
@@ -388,13 +474,67 @@ default(::Type{NamedTuple{names,types}}) where {names,types} =
     NamedTuple{names}(Tuple(default(fieldtype(types, i)) for i = 1:length(names)))
 
 function promoteunion(T, S)
+    T === S && return T
     new = promote_type(T, S)
     return isabstracttype(new) ? Union{T,S} : new
 end
 
+function _toarroweltype(x)
+    state = iterate(x)
+    state === nothing && return Missing
+    y, st = state
+    srcT = Union{}
+    stable = false
+    T = Missing
+    if y !== missing
+        srcT = typeof(y)
+        mapped = ArrowType(srcT)
+        stable = isconcretetype(mapped)
+        T = stable ? mapped : typeof(toarrow(y))
+    end
+    while true
+        state = iterate(x, st)
+        state === nothing && return T
+        y, st = state
+        if y === missing
+            S = Missing
+        elseif srcT === Union{}
+            srcT = typeof(y)
+            mapped = ArrowType(srcT)
+            stable = isconcretetype(mapped)
+            S = stable ? mapped : typeof(toarrow(y))
+        elseif stable && typeof(y) === srcT
+            continue
+        else
+            S = typeof(toarrow(y))
+            if stable && typeof(y) !== srcT
+                stable = false
+            end
+        end
+        S === T && continue
+        T = promoteunion(T, S)
+    end
+end
+
+@inline _hasoffsetaxes(data) = Base.has_offset_axes(data)
+@inline _offsetshift(data) = _hasoffsetaxes(data) ? firstindex(data) - 1 : 0
+@inline _hasonebasedaxes(data) = !_hasoffsetaxes(data)
+
 # lazily call toarrow(x) on getindex for each x in data
 struct ToArrow{T,A} <: AbstractVector{T}
     data::A
+    offset::Int
+    needsconvert::Bool
+end
+@inline _sourcedata(x::ToArrow) = getfield(x, :data)
+@inline _sourceoffset(x::ToArrow) = getfield(x, :offset)
+@inline _needsconvert(x::ToArrow) = getfield(x, :needsconvert)
+@inline _sourcevalue(x::ToArrow, i::Integer) =
+    @inbounds getindex(_sourcedata(x), i + _sourceoffset(x))
+
+function ToArrow{T,A}(data::A) where {T,A}
+    needsconvert = !(eltype(A) === T && concrete_or_concreteunion(T))
+    return ToArrow{T,A}(data, _offsetshift(data), needsconvert)
 end
 
 concrete_or_concreteunion(T) =
@@ -404,15 +544,14 @@ concrete_or_concreteunion(T) =
 function ToArrow(x::A) where {A}
     S = eltype(A)
     T = ArrowType(S)
-    fi = firstindex(x)
-    if S === T && concrete_or_concreteunion(S) && fi == 1
+    if S === T && concrete_or_concreteunion(S) && _hasonebasedaxes(x)
         return x
     elseif !concrete_or_concreteunion(T)
         # arrow needs concrete types, so try to find a concrete common type, preferring unions
         if isempty(x)
             return Missing[]
         end
-        T = mapreduce(typeof ∘ toarrow, promoteunion, x)
+        T = _toarroweltype(x)
         if T === Missing && concrete_or_concreteunion(S)
             T = promoteunion(T, typeof(toarrow(default(S))))
         end
@@ -440,7 +579,29 @@ function _convert(::Type{T}, x) where {T}
         return convert(T, x)
     end
 end
-Base.getindex(x::ToArrow{T}, i::Int) where {T} =
-    _convert(T, toarrow(getindex(x.data, i + firstindex(x.data) - 1)))
+
+@inline function _toarrowvalue(x::ToArrow{T}, value) where {T}
+    _needsconvert(x) || return value
+    return _convert(T, toarrow(value))
+end
+
+Base.@propagate_inbounds function Base.getindex(x::ToArrow{T}, i::Int) where {T}
+    value = _sourcevalue(x, i)
+    return _toarrowvalue(x, value)
+end
+
+function Base.iterate(x::ToArrow)
+    state = iterate(x.data)
+    state === nothing && return nothing
+    value, st = state
+    return _toarrowvalue(x, value), st
+end
+
+function Base.iterate(x::ToArrow, st)
+    state = iterate(x.data, st)
+    state === nothing && return nothing
+    value, st = state
+    return _toarrowvalue(x, value), st
+end
 
 end # module ArrowTypes

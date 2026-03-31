@@ -28,6 +28,9 @@ tobytes(io::IO) = Base.read(io)
 tobytes(io::IOStream) = Mmap.mmap(io)
 tobytes(file_path) = open(tobytes, file_path, "r")
 
+rejectunsupported(field::Meta.Field) = (rejectunsupported(field.type); foreach(rejectunsupported, field.children))
+rejectunsupported(x) = nothing
+
 struct BatchIterator
     bytes::Vector{UInt8}
     startpos::Int
@@ -178,15 +181,19 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
         end
         batch, (pos, id) = state
         header = batch.msg.header
-        if isnothing(x.schema) && !isa(header, Meta.Schema)
+        if header isa Meta.Tensor
+            throw(ArgumentError(TENSOR_UNSUPPORTED))
+        elseif header isa Meta.SparseTensor
+            throw(ArgumentError(SPARSE_TENSOR_UNSUPPORTED))
+        elseif isnothing(x.schema) && !isa(header, Meta.Schema)
             throw(ArgumentError("first arrow ipc message MUST be a schema message"))
-        end
-        if header isa Meta.Schema
+        elseif header isa Meta.Schema
             if isnothing(x.schema)
                 x.schema = header
                 # assert endianness?
                 # store custom_metadata?
                 for (i, field) in enumerate(x.schema.fields)
+                    rejectunsupported(field)
                     push!(x.names, Symbol(field.name))
                     push!(
                         x.types,
@@ -264,6 +271,10 @@ function Base.iterate(x::Stream, (pos, id)=(1, 0))
                 push!(columns, vec)
             end
             break
+        elseif header isa Meta.Tensor
+            throw(ArgumentError(TENSOR_UNSUPPORTED))
+        elseif header isa Meta.SparseTensor
+            throw(ArgumentError(SPARSE_TENSOR_UNSUPPORTED))
         else
             throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
         end
@@ -487,6 +498,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                 # store custom_metadata?
                 if sch === nothing
                     for (i, field) in enumerate(header.fields)
+                        rejectunsupported(field)
                         push!(names(t), Symbol(field.name))
                         # recursively find any dictionaries for any fields
                         getdictionaries!(dictencoded, field)
@@ -578,6 +590,10 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                     ),
                 )
                 rbi += 1
+            elseif header isa Meta.Tensor
+                throw(ArgumentError(TENSOR_UNSUPPORTED))
+            elseif header isa Meta.SparseTensor
+                throw(ArgumentError(SPARSE_TENSOR_UNSUPPORTED))
             else
                 throw(ArgumentError("unsupported arrow message type: $(typeof(header))"))
             end
@@ -731,6 +747,18 @@ const ListTypes =
     Union{Meta.Utf8,Meta.LargeUtf8,Meta.Binary,Meta.LargeBinary,Meta.List,Meta.LargeList}
 const LargeLists = Union{Meta.LargeUtf8,Meta.LargeBinary,Meta.LargeList,Meta.LargeListView}
 const ViewTypes = Union{Meta.Utf8View,Meta.BinaryView,Meta.ListView,Meta.LargeListView}
+
+@inline function _viewbuffercount(validity, views, declared::Integer)
+    count = Int(declared)
+    for i in eachindex(views)
+        validity[i] || continue
+        v = @inbounds views[i]
+        if !_viewisinline(v.length)
+            count = max(count, Int(v.bufindex) + 1)
+        end
+    end
+    return count
+end
 
 function build(field::Meta.Field, batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
     d = field.dictionary
@@ -893,6 +921,32 @@ end
 
 function build(
     f::Meta.Field,
+    x::Meta.RunEndEncoded,
+    batch,
+    rb,
+    de,
+    nodeidx,
+    bufferidx,
+    varbufferidx,
+    convert,
+)
+    @debug "building array: x = $x"
+    len = rb.nodes[nodeidx].length
+    nodeidx += 1
+    meta = buildmetadata(f.custom_metadata)
+    T = juliaeltype(f, meta, convert)
+    run_ends, nodeidx, bufferidx, varbufferidx =
+        build(f.children[1], batch, rb, de, nodeidx, bufferidx, varbufferidx, false)
+    values, nodeidx, bufferidx, varbufferidx =
+        build(f.children[2], batch, rb, de, nodeidx, bufferidx, varbufferidx, convert)
+    return _makerunendencoded(T, run_ends, values, len, meta),
+    nodeidx,
+    bufferidx,
+    varbufferidx
+end
+
+function build(
+    f::Meta.Field,
     L::ViewTypes,
     batch,
     rb,
@@ -910,7 +964,8 @@ function build(
     inline = reinterpret(UInt8, views)  # reuse the (possibly realigned) memory backing `views`
     bufferidx += 1
     buffers = Vector{UInt8}[]
-    for i = 1:rb.variadicBufferCounts[varbufferidx]
+    nvariadic = _viewbuffercount(validity, views, rb.variadicBufferCounts[varbufferidx])
+    for i = 1:nvariadic
         buffer = rb.buffers[bufferidx]
         _, A = reinterp(UInt8, batch, buffer, rb.compression)
         push!(buffers, A)

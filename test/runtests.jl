@@ -27,6 +27,7 @@ using CategoricalArrays
 using DataAPI
 using FilePathsBase
 using DataFrames
+using JSON3
 using OffsetArrays
 import Random: randstring
 using TestSetExtensions: ExtendedTestSet
@@ -39,6 +40,7 @@ include(joinpath(@__DIR__, "testtables.jl"))
 include(joinpath(@__DIR__, "testappend.jl"))
 include(joinpath(@__DIR__, "integrationtest.jl"))
 include(joinpath(@__DIR__, "dates.jl"))
+include(joinpath(@__DIR__, "flight.jl"))
 
 struct CustomStruct
     x::Int
@@ -49,6 +51,15 @@ end
 struct CustomStruct2{sym}
     x::Int
 end
+
+module EnumRoundtripModule
+@enum RankingStrategy lexical=1 semantic=2 hybrid=3
+end
+
+const RankingStrategy = EnumRoundtripModule.RankingStrategy
+const lexical = EnumRoundtripModule.lexical
+const semantic = EnumRoundtripModule.semantic
+const hybrid = EnumRoundtripModule.hybrid
 
 @testset ExtendedTestSet "Arrow" begin
     @testset "table roundtrips" begin
@@ -263,6 +274,123 @@ end
             @test all(isequal.(values(t), values(tt)))
         end
 
+        @testset "View buffer count inference" begin
+            inline_len = Int32(Arrow.VIEW_INLINE_BYTES)
+            views = Arrow.ViewElement[
+                Arrow.ViewElement(inline_len, Int32(0), Int32(0), Int32(0)),
+                Arrow.ViewElement(inline_len + Int32(148), Int32(0), Int32(0), Int32(0)),
+                Arrow.ViewElement(inline_len + Int32(207), Int32(0), Int32(1), Int32(160)),
+            ]
+            validity = Arrow.ValidityBitmap(UInt8[], 1, length(views), 0)
+            @test Arrow._viewisinline(inline_len)
+            @test !Arrow._viewisinline(inline_len + Int32(1))
+            @test Arrow._viewbuffercount(validity, views, Int32(0)) == 2
+            @test Arrow._viewbuffercount(validity, views, Int32(1)) == 2
+            @test Arrow._viewbuffercount(validity, views, Int32(3)) == 3
+
+            sparse_validity = Arrow.ValidityBitmap(UInt8[0x05], 1, 3, 1)
+            sparse_views = Arrow.ViewElement[
+                Arrow.ViewElement(inline_len + Int32(64), Int32(0), Int32(0), Int32(0)),
+                Arrow.ViewElement(inline_len + Int32(64), Int32(0), Int32(99), Int32(0)),
+                Arrow.ViewElement(inline_len, Int32(0), Int32(0), Int32(0)),
+            ]
+            @test !sparse_validity[2]
+            @test Arrow._viewbuffercount(sparse_validity, sparse_views, Int32(0)) == 1
+        end
+
+        @testset "single-partition tobuffer byte equivalence" begin
+            t = (col=OffsetArray(["a", "bc", "def"], 0:2),)
+            io = IOBuffer()
+            Arrow.write(io, t)
+            seekstart(io)
+            @test read(Arrow.tobuffer(t)) == read(io)
+
+            tm = (col=OffsetArray(Union{Missing,String}["a", missing, "def"], 0:2),)
+            io = IOBuffer()
+            Arrow.write(io, tm)
+            seekstart(io)
+            @test read(Arrow.tobuffer(tm)) == read(io)
+
+            bt =
+                (col=OffsetArray([codeunits("a"), codeunits("bc"), codeunits("def")], 0:2),)
+            io = IOBuffer()
+            Arrow.write(io, bt)
+            seekstart(io)
+            @test read(Arrow.tobuffer(bt)) == read(io)
+
+            btm = (
+                col=OffsetArray(
+                    Union{Missing,Base.CodeUnits{UInt8,String}}[
+                        codeunits("a"),
+                        missing,
+                        codeunits("def"),
+                    ],
+                    0:2,
+                ),
+            )
+            io = IOBuffer()
+            Arrow.write(io, btm)
+            seekstart(io)
+            @test read(Arrow.tobuffer(btm)) == read(io)
+
+            mapt = (
+                col=OffsetArray([Dict("a" => 1, "b" => 2), Dict("a" => 3, "b" => 4)], 0:1),
+            )
+            io = IOBuffer()
+            Arrow.write(io, mapt)
+            seekstart(io)
+            @test read(Arrow.tobuffer(mapt)) == read(io)
+
+            nestedt = (col=OffsetArray([Int64[1, 2], Int64[3, 4], Int64[]], 0:2),)
+            io = IOBuffer()
+            Arrow.write(io, nestedt)
+            seekstart(io)
+            @test read(Arrow.tobuffer(nestedt)) == read(io)
+
+            pooled = (col=PooledArray(["a", "b", "a", "c"]),)
+            io = IOBuffer()
+            Arrow.write(io, pooled; dictencode=true)
+            seekstart(io)
+            @test read(Arrow.tobuffer(pooled; dictencode=true)) == read(io)
+
+            meta = Dict("key1" => "value1")
+            colmeta = Dict(:col => Dict("colkey1" => "colvalue1"))
+            io = IOBuffer()
+            Arrow.write(io, t; metadata=meta, colmetadata=colmeta)
+            seekstart(io)
+            @test read(Arrow.tobuffer(t; metadata=meta, colmetadata=colmeta)) == read(io)
+
+            parts = Tables.partitioner([t, t])
+            io = IOBuffer()
+            Arrow.write(io, parts)
+            seekstart(io)
+            @test read(Arrow.tobuffer(parts)) == read(io)
+
+            string_missing_parts = Tables.partitioner([tm, tm])
+            io = IOBuffer()
+            Arrow.write(io, string_missing_parts)
+            seekstart(io)
+            @test read(Arrow.tobuffer(string_missing_parts)) == read(io)
+
+            binary_parts = Tables.partitioner([bt, bt])
+            io = IOBuffer()
+            Arrow.write(io, binary_parts)
+            seekstart(io)
+            @test read(Arrow.tobuffer(binary_parts)) == read(io)
+
+            binary_missing_parts = Tables.partitioner([btm, btm])
+            io = IOBuffer()
+            Arrow.write(io, binary_missing_parts)
+            seekstart(io)
+            @test read(Arrow.tobuffer(binary_missing_parts)) == read(io)
+
+            map_parts = Tables.partitioner([mapt, mapt])
+            io = IOBuffer()
+            Arrow.write(io, map_parts)
+            seekstart(io)
+            @test read(Arrow.tobuffer(map_parts)) == read(io)
+        end
+
         @testset "# 53" begin
             s = "a"^100
             t = (a=[SubString(s, 1:10), SubString(s, 11:20)],)
@@ -294,6 +422,38 @@ end
             @test isequal(tt.a, ['a', missing])
         end
 
+        @testset "# offset bool write paths" begin
+            t = (
+                a=OffsetArray(Bool[true, false, true], -1:1),
+                b=OffsetArray(Union{Missing,Bool}[true, missing, false], -1:1),
+                c=OffsetArray(Any[true, false, true], -1:1),
+                d=OffsetArray(Any[true, missing, false], -1:1),
+            )
+            tt = Arrow.Table(Arrow.tobuffer(t))
+            @test eltype(tt.c) == Bool
+            @test eltype(tt.d) == Union{Missing,Bool}
+            @test tt.a == Bool[true, false, true]
+            @test isequal(tt.b, Union{Missing,Bool}[true, missing, false])
+            @test tt.c == Bool[true, false, true]
+            @test isequal(tt.d, Union{Missing,Bool}[true, missing, false])
+        end
+
+        @testset "# offset primitive write paths" begin
+            t = (
+                a=OffsetArray(Int64[1, 2, 3], -1:1),
+                b=OffsetArray(Union{Missing,Int64}[1, missing, 3], -1:1),
+                c=OffsetArray(Any[1, 2, 3], -1:1),
+                d=OffsetArray(Any[1, missing, 3], -1:1),
+            )
+            tt = Arrow.Table(Arrow.tobuffer(t))
+            @test eltype(tt.c) == Int64
+            @test eltype(tt.d) == Union{Missing,Int64}
+            @test tt.a == Int64[1, 2, 3]
+            @test isequal(tt.b, Union{Missing,Int64}[1, missing, 3])
+            @test tt.c == Int64[1, 2, 3]
+            @test isequal(tt.d, Union{Missing,Int64}[1, missing, 3])
+        end
+
         @testset "# automatic custom struct serialization/deserialization" begin
             t = (col1=[CustomStruct(1, 2.3, "hey"), CustomStruct(4, 5.6, "there")],)
 
@@ -304,6 +464,35 @@ end
             tt = Arrow.Table(Arrow.tobuffer(t))
             @test length(tt) == length(t)
             @test all(isequal.(values(t), values(tt)))
+        end
+
+        @testset "# Julia Enum extension logical type roundtrip" begin
+            t = (
+                col1=[lexical, hybrid],
+                col2=Union{Missing, RankingStrategy}[missing, semantic],
+            )
+
+            bytes = read(Arrow.tobuffer(t))
+            tt = Arrow.Table(IOBuffer(bytes))
+            raw = Arrow.Table(IOBuffer(bytes); convert=false)
+
+            @test length(tt) == length(t)
+            @test eltype(tt.col1) == RankingStrategy
+            @test eltype(tt.col2) == Union{Missing, RankingStrategy}
+            @test tt.col1 == [lexical, hybrid]
+            @test isequal(
+                tt.col2,
+                Union{Missing, RankingStrategy}[missing, semantic],
+            )
+            @test eltype(raw.col1) == Int32
+            @test eltype(raw.col2) == Union{Missing, Int32}
+            @test raw.col1 == Int32[1, 3]
+            @test isequal(raw.col2, Union{Missing, Int32}[missing, 2])
+            @test Arrow.getmetadata(tt.col1)["ARROW:extension:name"] == "JuliaLang.Enum"
+            @test occursin(
+                "Main.EnumRoundtripModule.RankingStrategy",
+                Arrow.getmetadata(tt.col1)["ARROW:extension:metadata"],
+            )
         end
 
         @testset "# 76" begin
@@ -328,6 +517,67 @@ end
             @test copy(tt.a) isa Vector{Nanosecond}
             @test copy(tt.b) isa Vector{UUID}
             @test copy(tt.c) isa Vector{Union{Missing,Nanosecond}}
+            @test Arrow.getmetadata(tt.b)["ARROW:extension:name"] == "arrow.uuid"
+
+            legacy = (
+                b=[
+                    Arrow.ArrowTypes.toarrow(UUID("550e8400-e29b-41d4-a716-446655440000")),
+                    Arrow.ArrowTypes.toarrow(UUID("550e8400-e29b-41d4-a716-446655440001")),
+                ],
+            )
+            legacy_tt = Arrow.Table(
+                Arrow.tobuffer(
+                    legacy;
+                    colmetadata=Dict(
+                        :b => Dict("ARROW:extension:name" => "JuliaLang.UUID"),
+                    ),
+                ),
+            )
+            @test copy(legacy_tt.b) == [
+                UUID("550e8400-e29b-41d4-a716-446655440000"),
+                UUID("550e8400-e29b-41d4-a716-446655440001"),
+            ]
+
+            toffset = (
+                b=OffsetArray(
+                    [
+                        UUID("550e8400-e29b-41d4-a716-446655440000"),
+                        UUID("550e8400-e29b-41d4-a716-446655440001"),
+                    ],
+                    -1:0,
+                ),
+                bm=OffsetArray(
+                    Union{Missing,UUID}[
+                        UUID("550e8400-e29b-41d4-a716-446655440000"),
+                        missing,
+                    ],
+                    -1:0,
+                ),
+                ba=OffsetArray(
+                    Any[
+                        UUID("550e8400-e29b-41d4-a716-446655440000"),
+                        UUID("550e8400-e29b-41d4-a716-446655440001"),
+                    ],
+                    -1:0,
+                ),
+                bam=OffsetArray(
+                    Any[UUID("550e8400-e29b-41d4-a716-446655440000"), missing],
+                    -1:0,
+                ),
+            )
+            ttoffset = Arrow.Table(Arrow.tobuffer(toffset))
+            @test collect(toffset.b) == ttoffset.b
+            @test isequal(collect(toffset.bm), ttoffset.bm)
+            @test eltype(ttoffset.ba) == NTuple{16,UInt8}
+            @test eltype(ttoffset.bam) == Union{Missing,NTuple{16,UInt8}}
+            @test map(Arrow.ArrowTypes.toarrow, collect(toffset.ba)) == copy(ttoffset.ba)
+            @test isequal(
+                map(
+                    x -> ismissing(x) ? missing : Arrow.ArrowTypes.toarrow(x),
+                    collect(toffset.bam),
+                ),
+                copy(ttoffset.bam),
+            )
         end
 
         @testset "# copy on DictEncoding w/ missing values" begin
@@ -353,6 +603,13 @@ end
             @test isa(first(av.indices), Signed)
             @test length(av) == 3
             @test eltype(av) == String
+
+            x = CategoricalArray(Union{Missing,String}["a", missing, "ccc"])
+            tt = Arrow.Table(Arrow.tobuffer((x=x,); dictencode=true))
+            @test isequal(collect(tt.x), collect(x))
+            @test isequal(collect(copy(tt.x)), collect(x))
+            df = DataFrame(tt; copycols=true)
+            @test isequal(collect(df.x), collect(x))
         end
 
         @testset "# 120" begin
@@ -460,6 +717,323 @@ end
             @test c[1] ==
                   Arrow.Timestamp{Arrow.Flatbuf.TimeUnit.MILLISECOND,Symbol("Europe/Paris")}(
                 1577833200000,
+            )
+        end
+
+        @testset "canonical timestamp_with_offset" begin
+            values = Union{Missing,Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND}}[
+                Arrow.TimestampWithOffset(
+                    Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC}(1577836800000),
+                    330,
+                ),
+                missing,
+                Arrow.TimestampWithOffset(
+                    Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC}(1577923200000),
+                    -480,
+                ),
+            ]
+            tt = Arrow.Table(Arrow.tobuffer((col=values,)))
+            @test eltype(tt.col) ==
+                  Union{Missing,Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND}}
+            @test isequal(copy(tt.col), values)
+            @test Arrow.getmetadata(tt.col)["ARROW:extension:name"] ==
+                  "arrow.timestamp_with_offset"
+
+            raw_tt = Arrow.Table(Arrow.tobuffer((col=values,)); convert=false)
+            @test eltype(raw_tt.col) ==
+                  Union{
+                Missing,
+                NamedTuple{
+                    (:timestamp, :offset_minutes),
+                    Tuple{
+                        Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC},
+                        Int16,
+                    },
+                },
+            }
+            @test isequal(
+                copy(raw_tt.col),
+                Union{
+                    Missing,
+                    NamedTuple{
+                        (:timestamp, :offset_minutes),
+                        Tuple{
+                            Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC},
+                            Int16,
+                        },
+                    },
+                }[
+                    (
+                        timestamp=Arrow.Timestamp{
+                            Arrow.Meta.TimeUnit.MILLISECOND,
+                            :UTC,
+                        }(1577836800000),
+                        offset_minutes=Int16(330),
+                    ),
+                    missing,
+                    (
+                        timestamp=Arrow.Timestamp{
+                            Arrow.Meta.TimeUnit.MILLISECOND,
+                            :UTC,
+                        }(1577923200000),
+                        offset_minutes=Int16(-480),
+                    ),
+                ],
+            )
+        end
+
+        @testset "Run-End Encoded read support" begin
+            path = joinpath(@__DIR__, "run_end_encoded_small.arrow")
+            expected = ["a", "a", "b", "b", "b"]
+
+            tt = Arrow.Table(path)
+            @test tt isa Arrow.Table
+            @test eltype(tt.x) == Union{Missing,String}
+            @test collect(tt.x) == expected
+            @test copy(tt.x) == expected
+
+            batches = collect(Arrow.Stream(path))
+            @test length(batches) == 1
+            @test collect(batches[1].x) == expected
+
+            @test_throws ArgumentError(Arrow.RUN_END_ENCODED_UNSUPPORTED) Arrow.tobuffer(tt)
+            @test_throws ArgumentError(Arrow.RUN_END_ENCODED_UNSUPPORTED) Arrow.tobuffer((x=tt.x,))
+        end
+
+        @testset "canonical bool8/json/opaque" begin
+            bools = Union{Missing,Arrow.Bool8}[Arrow.Bool8(true), missing, Arrow.Bool8(false)]
+            tt = Arrow.Table(Arrow.tobuffer((col=bools,)))
+            @test eltype(tt.col) == Union{Missing,Arrow.Bool8}
+            @test isequal(copy(tt.col), bools)
+            @test Arrow.getmetadata(tt.col)["ARROW:extension:name"] == "arrow.bool8"
+
+            raw_tt = Arrow.Table(Arrow.tobuffer((col=bools,)); convert=false)
+            @test eltype(raw_tt.col) == Union{Missing,Int8}
+            @test isequal(copy(raw_tt.col), Union{Missing,Int8}[1, missing, 0])
+
+            jsons = Union{Missing,Arrow.JSONText{String}}[
+                Arrow.JSONText("{\"a\":1}"),
+                missing,
+                Arrow.JSONText("[1,2,3]"),
+            ]
+            json_tt = Arrow.Table(Arrow.tobuffer((col=jsons,)))
+            @test eltype(json_tt.col) == Union{Missing,Arrow.JSONText{String}}
+            @test isequal(copy(json_tt.col), jsons)
+            @test Arrow.getmetadata(json_tt.col)["ARROW:extension:name"] == "arrow.json"
+
+            raw_json_tt = Arrow.Table(Arrow.tobuffer((col=jsons,)); convert=false)
+            @test eltype(raw_json_tt.col) == Union{Missing,String}
+            @test isequal(copy(raw_json_tt.col), Union{Missing,String}["{\"a\":1}", missing, "[1,2,3]"])
+
+            opaque_meta = Arrow.opaquemetadata("pkg.Type", "vendor.example")
+            opaque_tt = Arrow.Table(
+                Arrow.tobuffer(
+                    (col=["a", "b"],);
+                    colmetadata=Dict(
+                        :col => Dict(
+                            "ARROW:extension:name" => "arrow.opaque",
+                            "ARROW:extension:metadata" => opaque_meta,
+                        ),
+                    ),
+                ),
+            )
+            @test eltype(opaque_tt.col) == String
+            @test copy(opaque_tt.col) == ["a", "b"]
+            @test Arrow.getmetadata(opaque_tt.col)["ARROW:extension:name"] == "arrow.opaque"
+            @test Arrow.getmetadata(opaque_tt.col)["ARROW:extension:metadata"] == opaque_meta
+        end
+
+        @testset "canonical advanced passthrough" begin
+            function assert_canonical_extension_error(f::Function, needle::AbstractString)
+                err = try
+                    f()
+                    nothing
+                catch e
+                    e
+                end
+                @test err !== nothing
+                @test occursin(needle, sprint(showerror, err))
+                return
+            end
+
+            @test Arrow.variantmetadata() == ""
+
+            fixed_metadata = Arrow.fixedshapetensormetadata(
+                [2, 2];
+                dim_names=["x", "y"],
+                permutation=[1, 0],
+            )
+            @test JSON3.read(fixed_metadata)["shape"] == [2, 2]
+            @test JSON3.read(fixed_metadata)["dim_names"] == ["x", "y"]
+            @test JSON3.read(fixed_metadata)["permutation"] == [1, 0]
+
+            variable_metadata = Arrow.variableshapetensormetadata(
+                uniform_shape=Union{Nothing,Int}[2],
+                dim_names=["axis0"],
+                permutation=[0],
+            )
+            @test JSON3.read(variable_metadata)["uniform_shape"] == [2]
+            @test JSON3.read(variable_metadata)["dim_names"] == ["axis0"]
+            @test JSON3.read(variable_metadata)["permutation"] == [0]
+            @test Arrow.variableshapetensormetadata() == ""
+
+            @test_throws ArgumentError Arrow.fixedshapetensormetadata(
+                [2, 2];
+                dim_names=["x"],
+            )
+            @test_throws ArgumentError Arrow.variableshapetensormetadata(
+                uniform_shape=Union{Nothing,Int}[2, nothing];
+                permutation=[0],
+            )
+
+            variant_values = Union{
+                Missing,
+                NamedTuple{(:metadata, :value),Tuple{String,String}},
+            }[
+                (metadata="json", value="{\"a\":1}"),
+                missing,
+                (metadata="str", value="abc"),
+            ]
+            @test_logs min_level=Base.CoreLogging.Warn begin
+                variant_tt = Arrow.Table(
+                    Arrow.tobuffer(
+                        (col=variant_values,);
+                        colmetadata=Dict(
+                            :col => Dict(
+                                "ARROW:extension:name" => "arrow.parquet.variant",
+                                "ARROW:extension:metadata" => Arrow.variantmetadata(),
+                            ),
+                        ),
+                    ),
+                )
+                @test eltype(variant_tt.col) == eltype(variant_values)
+                @test isequal(copy(variant_tt.col), variant_values)
+                @test Arrow.getmetadata(variant_tt.col)["ARROW:extension:name"] ==
+                      "arrow.parquet.variant"
+            end
+
+            fixed_tensor_values = Union{Missing,NTuple{4,Int32}}[
+                (Int32(1), Int32(2), Int32(3), Int32(4)),
+                missing,
+                (Int32(5), Int32(6), Int32(7), Int32(8)),
+            ]
+            @test_logs min_level=Base.CoreLogging.Warn begin
+                fixed_tensor_tt = Arrow.Table(
+                    Arrow.tobuffer(
+                        (col=fixed_tensor_values,);
+                        colmetadata=Dict(
+                            :col => Dict(
+                                "ARROW:extension:name" => "arrow.fixed_shape_tensor",
+                                "ARROW:extension:metadata" => fixed_metadata,
+                            ),
+                        ),
+                    ),
+                )
+                @test eltype(fixed_tensor_tt.col) == eltype(fixed_tensor_values)
+                @test isequal(copy(fixed_tensor_tt.col), fixed_tensor_values)
+                @test Arrow.getmetadata(fixed_tensor_tt.col)["ARROW:extension:name"] ==
+                      "arrow.fixed_shape_tensor"
+            end
+
+            variable_tensor_values = Union{
+                Missing,
+                NamedTuple{(:data, :shape),Tuple{Vector{Int32},NTuple{1,Int32}}},
+            }[
+                (data=Int32[1, 2, 3, 4], shape=(Int32(2),)),
+                missing,
+                (data=Int32[5, 6], shape=(Int32(1),)),
+            ]
+            @test_logs min_level=Base.CoreLogging.Warn begin
+                variable_tensor_tt = Arrow.Table(
+                    Arrow.tobuffer(
+                        (col=variable_tensor_values,);
+                        colmetadata=Dict(
+                            :col => Dict(
+                                "ARROW:extension:name" => "arrow.variable_shape_tensor",
+                                "ARROW:extension:metadata" => variable_metadata,
+                            ),
+                        ),
+                    ),
+                )
+                @test eltype(variable_tensor_tt.col) == eltype(variable_tensor_values)
+                @test isequal(
+                    map(
+                        x -> x === missing ? missing : (data=copy(x.data), shape=x.shape),
+                        copy(variable_tensor_tt.col),
+                    ),
+                    variable_tensor_values,
+                )
+                @test Arrow.getmetadata(variable_tensor_tt.col)["ARROW:extension:name"] ==
+                      "arrow.variable_shape_tensor"
+            end
+
+            invalid_variant_bytes = Arrow.tobuffer(
+                (col=variant_values,);
+                colmetadata=Dict(
+                    :col => Dict(
+                        "ARROW:extension:name" => "arrow.parquet.variant",
+                        "ARROW:extension:metadata" => "{\"unexpected\":true}",
+                    ),
+                ),
+            )
+            assert_canonical_extension_error(
+                () -> Arrow.Table(invalid_variant_bytes),
+                "invalid canonical arrow.parquet.variant extension",
+            )
+
+            invalid_fixed_bytes = Arrow.tobuffer(
+                (col=fixed_tensor_values,);
+                colmetadata=Dict(
+                    :col => Dict(
+                        "ARROW:extension:name" => "arrow.fixed_shape_tensor",
+                        "ARROW:extension:metadata" => Arrow.fixedshapetensormetadata([3, 2]),
+                    ),
+                ),
+            )
+            assert_canonical_extension_error(
+                () -> Arrow.Table(invalid_fixed_bytes),
+                "invalid canonical arrow.fixed_shape_tensor extension",
+            )
+
+            invalid_variable_bytes = Arrow.tobuffer(
+                (col=["a", "b"],);
+                colmetadata=Dict(
+                    :col => Dict(
+                        "ARROW:extension:name" => "arrow.variable_shape_tensor",
+                        "ARROW:extension:metadata" => Arrow.variableshapetensormetadata(
+                            uniform_shape=Union{Nothing,Int}[1],
+                        ),
+                    ),
+                ),
+            )
+            assert_canonical_extension_error(
+                () -> Arrow.Table(invalid_variable_bytes),
+                "invalid canonical arrow.variable_shape_tensor extension",
+            )
+        end
+
+        @testset "tensor message boundary" begin
+            function patch_message_header_type(bytes, header_type::UInt8)
+                patched = copy(bytes)
+                msg = Arrow.FlatBuffers.getrootas(Arrow.Meta.Message, patched, 8)
+                offset = Arrow.FlatBuffers.offset(msg, 6)
+                @test offset != 0
+                patched[Arrow.FlatBuffers.pos(msg) + offset + 1] = header_type
+                return patched
+            end
+
+            base = take!(Arrow.tobuffer((x=[1, 2],)))
+
+            tensor_bytes = patch_message_header_type(base, UInt8(4))
+            @test_throws ArgumentError(Arrow.TENSOR_UNSUPPORTED) Arrow.Table(tensor_bytes)
+            @test_throws ArgumentError(Arrow.TENSOR_UNSUPPORTED) collect(Arrow.Stream(tensor_bytes))
+
+            sparse_tensor_bytes = patch_message_header_type(base, UInt8(5))
+            @test_throws ArgumentError(Arrow.SPARSE_TENSOR_UNSUPPORTED) Arrow.Table(
+                sparse_tensor_bytes,
+            )
+            @test_throws ArgumentError(Arrow.SPARSE_TENSOR_UNSUPPORTED) collect(
+                Arrow.Stream(sparse_tensor_bytes),
             )
         end
 
@@ -624,12 +1198,46 @@ end
             t = (col1=[["boop", "she"], ["boop", "she"], ["boo"]],)
             tbl = Arrow.Table(Arrow.tobuffer(t))
             @test eltype(tbl.col1) <: AbstractVector{String}
+
+            toffset = (
+                col1=OffsetArray([Int64[1, 2], Int64[3, 4], Int64[]], -1:1),
+                col2=OffsetArray(
+                    Union{Missing,Vector{Int64}}[Int64[1], missing, Int64[2, 3]],
+                    -1:1,
+                ),
+            )
+            tt = Arrow.Table(Arrow.tobuffer(toffset))
+            @test eltype(tt.col1) <: AbstractVector{Int64}
+            @test Base.nonmissingtype(eltype(tt.col2)) <: AbstractVector{Int64}
+            @test collect(toffset.col1) == tt.col1
+            @test isequal(collect(toffset.col2), tt.col2)
         end
 
         @testset "# 200 VersionNumber" begin
             t = (col1=[v"1"],)
             tbl = Arrow.Table(Arrow.tobuffer(t))
             @test eltype(tbl.col1) == VersionNumber
+        end
+
+        @testset "offset struct string write paths" begin
+            rows = OffsetArray(
+                Union{Missing,NamedTuple{(:s,),Tuple{String}}}[
+                    (s="a",),
+                    missing,
+                    (s="bc",),
+                ],
+                -1:1,
+            )
+            tt = Arrow.Table(Arrow.tobuffer((rows=rows,)))
+            @test Base.nonmissingtype(eltype(tt.rows)) == NamedTuple{(:s,),Tuple{String}}
+            @test isequal(collect(rows), tt.rows)
+        end
+
+        @testset "Complex" begin
+            t = (col1=Union{ComplexF64,Missing}[1 + 2im, missing, 3 + 4im],)
+            tbl = Arrow.Table(Arrow.tobuffer(t))
+            @test eltype(tbl.col1) == Union{ComplexF64,Missing}
+            @test isequal(collect(tbl.col1), t.col1)
         end
 
         @testset "`show`" begin
@@ -852,6 +1460,95 @@ end
             @test_throws ArgumentError(
                 "`keytype(d)` must be concrete to serialize map-like `d`, but `keytype(d) == Real`",
             ) Arrow.tobuffer(t)
+
+            t = (
+                x=OffsetArray([Dict("a" => 1, "b" => 2), Dict("c" => 3)], -1:0),
+                xm=OffsetArray(
+                    Union{Missing,Dict{String,Int}}[Dict("a" => 1), missing],
+                    -1:0,
+                ),
+                xe=OffsetArray(
+                    [Dict("a" => 1, "b" => 2, "c" => 3), Dict{String,Int}()],
+                    -1:0,
+                ),
+                xem=OffsetArray(
+                    Union{Missing,Dict{String,Int}}[Dict{String,Int}(), missing],
+                    -1:0,
+                ),
+                xa=OffsetArray(Any[Dict("a" => 1, "b" => 2), Dict("c" => 3)], -1:0),
+                xam=OffsetArray(Any[Dict("a" => 1), missing], -1:0),
+                xame=OffsetArray(Any[Dict{String,Int}(), missing], -1:0),
+            )
+            tt = Arrow.Table(Arrow.tobuffer(t))
+            @test eltype(tt.x) == Dict{String,Int64}
+            @test eltype(tt.xm) == Union{Missing,Dict{String,Int64}}
+            @test eltype(tt.xe) == Dict{String,Int64}
+            @test eltype(tt.xem) == Union{Missing,Dict{String,Int64}}
+            @test eltype(tt.xa) == Dict{String,Int64}
+            @test eltype(tt.xam) == Union{Missing,Dict{String,Int64}}
+            @test eltype(tt.xame) == Union{Missing,Dict{String,Int64}}
+            @test copy(tt.x) isa Vector{Dict{String,Int64}}
+            @test copy(tt.xm) isa Vector{Union{Missing,Dict{String,Int64}}}
+            @test copy(tt.xem) isa Vector{Union{Missing,Dict{String,Int64}}}
+            @test copy(tt.xa) isa Vector{Dict{String,Int64}}
+            @test copy(tt.xam) isa Vector{Union{Missing,Dict{String,Int64}}}
+            @test copy(tt.xame) isa Vector{Union{Missing,Dict{String,Int64}}}
+            @test collect(t.x) == tt.x
+            @test isequal(collect(t.xm), tt.xm)
+            @test collect(t.xe) == tt.xe
+            @test isequal(collect(t.xem), tt.xem)
+            @test collect(t.xa) == tt.xa
+            @test isequal(collect(t.xam), tt.xam)
+            @test isequal(collect(t.xame), tt.xame)
+
+            mapio = IOBuffer()
+            Arrow.write(mapio, (x=t.xm,))
+            seekstart(mapio)
+            @test read(Arrow.tobuffer((x=t.xm,))) == read(mapio)
+
+            mapbuf = Arrow.tobuffer((x=t.xm,))
+            seekend(mapbuf)
+            mappos = position(mapbuf)
+            Arrow.append(mapbuf, Arrow.Table(Arrow.tobuffer((x=t.xm,))))
+            seekstart(mapbuf)
+            mapbuf1 = read(mapbuf, mappos)
+            mapbuf2 = read(mapbuf)
+            mapt1 = Arrow.Table(mapbuf1)
+            mapt2 = Arrow.Table(mapbuf2)
+            @test isequal(collect(mapt1.x), collect(mapt2.x))
+
+            emptymapbuf = Arrow.tobuffer((x=t.xe,))
+            seekend(emptymapbuf)
+            emptymappos = position(emptymapbuf)
+            Arrow.append(emptymapbuf, Arrow.Table(Arrow.tobuffer((x=t.xe,))))
+            seekstart(emptymapbuf)
+            emptymapbuf1 = read(emptymapbuf, emptymappos)
+            emptymapbuf2 = read(emptymapbuf)
+            emptymapt1 = Arrow.Table(emptymapbuf1)
+            emptymapt2 = Arrow.Table(emptymapbuf2)
+            @test isequal(collect(emptymapt1.x), collect(emptymapt2.x))
+
+            anymapbuf = Arrow.tobuffer((x=t.xam,))
+            seekend(anymapbuf)
+            anymappos = position(anymapbuf)
+            Arrow.append(anymapbuf, Arrow.Table(Arrow.tobuffer((x=t.xam,))))
+            seekstart(anymapbuf)
+            anymapbuf1 = read(anymapbuf, anymappos)
+            anymapbuf2 = read(anymapbuf)
+            anymapt1 = Arrow.Table(anymapbuf1)
+            anymapt2 = Arrow.Table(anymapbuf2)
+            @test isequal(collect(anymapt1.x), collect(anymapt2.x))
+
+            anyemptymapbuf = Arrow.tobuffer((x=t.xame,))
+            seekend(anyemptymapbuf)
+            anyemptymappos = position(anyemptymapbuf)
+            Arrow.append(anyemptymapbuf, Arrow.Table(Arrow.tobuffer((x=t.xame,))))
+            seekstart(anyemptymapbuf)
+            anyemptymapbuf1 = read(anyemptymapbuf, anyemptymappos)
+            anyemptymapbuf2 = read(anyemptymapbuf)
+            anyemptymapt1 = Arrow.Table(anyemptymapbuf1)
+            anyemptymapt2 = Arrow.Table(anyemptymapbuf2)
+            @test isequal(collect(anyemptymapt1.x), collect(anyemptymapt2.x))
         end
 
         @testset "# 214" begin
@@ -966,6 +1663,45 @@ end
             @test isequal(t1.bm, t2.bm)
             @test isequal(t1.c, t2.c)
             @test isequal(t1.cm, t2.cm)
+
+            toffset = (
+                b=OffsetArray([b"01", b"", b"3"], -1:1),
+                bm=OffsetArray(
+                    Union{Missing,Base.CodeUnits{UInt8,String}}[b"01", b"3", missing],
+                    -1:1,
+                ),
+                ba=OffsetArray(Any[b"01", b"", b"3"], -1:1),
+                bam=OffsetArray(Any[b"01", missing, b"3"], -1:1),
+                c=OffsetArray(["a", "b", "c"], -1:1),
+                cm=OffsetArray(Union{Missing,String}["a", "c", missing], -1:1),
+            )
+            ttoffset = Arrow.Table(Arrow.tobuffer(toffset))
+            @test eltype(ttoffset.b) <: Base.CodeUnits
+            @test Base.nonmissingtype(eltype(ttoffset.bm)) <: Base.CodeUnits
+            @test eltype(ttoffset.ba) <: Base.CodeUnits
+            @test Base.nonmissingtype(eltype(ttoffset.bam)) <: Base.CodeUnits
+            @test eltype(ttoffset.c) == String
+            @test eltype(ttoffset.cm) == Union{Missing,String}
+            @test collect(toffset.b) == ttoffset.b
+            @test isequal(collect(toffset.bm), ttoffset.bm)
+            @test collect(toffset.ba) == copy(ttoffset.ba)
+            @test isequal(collect(toffset.bam), copy(ttoffset.bam))
+            @test collect(toffset.c) == ttoffset.c
+            @test isequal(collect(toffset.cm), ttoffset.cm)
+
+            offsetbuf = Arrow.tobuffer(toffset)
+            seekend(offsetbuf)
+            offsetpos = position(offsetbuf)
+            Arrow.append(offsetbuf, ttoffset)
+            seekstart(offsetbuf)
+            offsetbuf1 = read(offsetbuf, offsetpos)
+            offsetbuf2 = read(offsetbuf)
+            offsett1 = Arrow.Table(offsetbuf1)
+            offsett2 = Arrow.Table(offsetbuf2)
+            @test collect(offsett1.b) == collect(offsett2.b)
+            @test isequal(collect(offsett1.bm), collect(offsett2.bm))
+            @test collect(offsett1.c) == collect(offsett2.c)
+            @test isequal(collect(offsett1.cm), collect(offsett2.cm))
         end
 
         @testset "# 435" begin

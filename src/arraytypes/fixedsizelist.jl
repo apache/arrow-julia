@@ -81,6 +81,8 @@ struct ToFixedSizeList{T,N,A} <: AbstractVector{T}
 end
 
 origtype(::ToFixedSizeList{T,N,A}) where {T,N,A} = eltype(A)
+@inline _fixedsizedata(A::ToFixedSizeList) = getfield(A, :data)
+@inline _fixedsizevalue(A::ToFixedSizeList, i::Integer) = @inbounds _fixedsizedata(A)[i]
 
 function ToFixedSizeList(input)
     NT = ArrowTypes.ArrowKind(Base.nonmissingtype(eltype(input))) # typically NTuple{N, T}
@@ -90,7 +92,7 @@ function ToFixedSizeList(input)
 end
 
 Base.IndexStyle(::Type{<:ToFixedSizeList}) = Base.IndexLinear()
-Base.size(x::ToFixedSizeList{T,N}) where {T,N} = (N * length(x.data),)
+Base.size(x::ToFixedSizeList{T,N}) where {T,N} = (N * length(_fixedsizedata(x)),)
 
 Base.@propagate_inbounds function Base.getindex(
     A::ToFixedSizeList{T,N},
@@ -98,7 +100,7 @@ Base.@propagate_inbounds function Base.getindex(
 ) where {T,N}
     @boundscheck checkbounds(A, i)
     a, b = fldmod1(i, N)
-    @inbounds x = A.data[a]
+    x = _fixedsizevalue(A, a)
     return @inbounds x === missing ? ArrowTypes.default(T) : x[b]
 end
 
@@ -108,7 +110,7 @@ end
     (i, chunk, chunk_i, len)=(1, 1, 1, length(A)),
 ) where {T,N}
     i > len && return nothing
-    @inbounds y = A.data[chunk]
+    y = _fixedsizevalue(A, chunk)
     @inbounds x = y === missing ? ArrowTypes.default(T) : y[chunk_i]
     if chunk_i == N
         chunk += 1
@@ -119,7 +121,59 @@ end
     return x, (i + 1, chunk, chunk_i, len)
 end
 
+@inline function _writefixedsizechunk(io::IO, chunk::NTuple{N,UInt8}) where {N}
+    ref = Ref(chunk)
+    GC.@preserve ref begin
+        return Base.unsafe_write(io, Base.unsafe_convert(Ptr{UInt8}, ref), N)
+    end
+end
+
+@inline function _writefixedsizecontiguous(io::IO, data::Vector{NTuple{N,UInt8}}) where {N}
+    GC.@preserve data begin
+        return Base.unsafe_write(io, Ptr{UInt8}(pointer(data)), N * length(data))
+    end
+end
+
+function writearray(io::IO, ::Type{UInt8}, col::ToFixedSizeList{UInt8,N}) where {N}
+    n = 0
+    defaultchunk = ntuple(_ -> ArrowTypes.default(UInt8), Val(N))
+    data = _fixedsizedata(col)
+    data isa Vector{NTuple{N,UInt8}} && return _writefixedsizecontiguous(io, data)
+    for chunk in data
+        n += _writefixedsizechunk(io, chunk === missing ? defaultchunk : chunk)
+    end
+    return n
+end
+
 arrowvector(::FixedSizeListKind, x::FixedSizeList, i, nl, fi, de, ded, meta; kw...) = x
+
+function arrowvector(
+    kind::FixedSizeListKind{N,T},
+    x::ArrowTypes.ToArrow,
+    i,
+    nl,
+    fi,
+    de,
+    ded,
+    meta;
+    kw...,
+) where {N,T}
+    data = _materializeconverted(x)
+    if data !== x
+        return arrowvector(kind, data, i, nl, fi, de, ded, meta; kw...)
+    end
+    len = length(x)
+    validity = ValidityBitmap(x)
+    flat = ToFixedSizeList(x)
+    if eltype(flat) == UInt8
+        child = flat
+        S = origtype(flat)
+    else
+        child = arrowvector(flat, i, nl + 1, fi, de, ded, nothing; kw...)
+        S = withmissing(eltype(x), NTuple{N,eltype(child)})
+    end
+    return FixedSizeList{S,typeof(child)}(UInt8[], validity, child, len, meta)
+end
 
 function arrowvector(
     ::FixedSizeListKind{N,T},

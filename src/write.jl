@@ -403,6 +403,17 @@ function Base.close(writer::Writer)
 end
 
 function write(io::IO, tbl; kwargs...)
+    if !get(kwargs, :file, false)
+        parts = Tables.partitions(tbl)
+        streamstate = _directstreamstate(parts)
+        if !isnothing(streamstate)
+            firstpart, state = streamstate
+            if _directstreameligible(firstpart)
+                _directstreamwrite!(io, firstpart, state, parts, tbl, kwargs)
+                return io
+            end
+        end
+    end
     open(Writer, io; file=false, kwargs...) do writer
         write(writer, tbl)
     end

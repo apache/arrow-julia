@@ -24,6 +24,205 @@ finaljuliatype(T) = T
 finaljuliatype(::Type{Missing}) = Missing
 finaljuliatype(::Type{Union{T,Missing}}) where {T} = Union{Missing,finaljuliatype(T)}
 
+const RUN_END_ENCODED_UNSUPPORTED = "Run-End Encoded arrays are not supported yet"
+const BOOL8_SYMBOL = Symbol("arrow.bool8")
+const JSON_SYMBOL = Symbol("arrow.json")
+const OPAQUE_SYMBOL = Symbol("arrow.opaque")
+const PARQUET_VARIANT_SYMBOL = Symbol("arrow.parquet.variant")
+const FIXED_SHAPE_TENSOR_SYMBOL = Symbol("arrow.fixed_shape_tensor")
+const VARIABLE_SHAPE_TENSOR_SYMBOL = Symbol("arrow.variable_shape_tensor")
+
+@inline _canonicalextensionerror(sym::Symbol, msg::AbstractString) =
+    throw(ArgumentError("invalid canonical $(String(sym)) extension: $msg"))
+
+@inline _fieldchildren(field::Meta.Field) =
+    field.children === nothing ? Meta.Field[] : field.children
+
+@inline _jsonhaskey(x, key::AbstractString) = haskey(x, key)
+@inline _jsonget(x, key::AbstractString) = x[key]
+
+function _parsecanonicalmetadata(sym::Symbol, metadata::String; required::Bool=false)
+    isempty(metadata) && return required ? _canonicalextensionerror(sym, "metadata is required") : nothing
+    value = try
+        JSON3.read(metadata)
+    catch
+        _canonicalextensionerror(sym, "metadata must be valid JSON")
+    end
+    value isa JSON3.Object || _canonicalextensionerror(sym, "metadata must be a JSON object")
+    return value
+end
+
+function _parseintvector(sym::Symbol, value, label::AbstractString; allow_null::Bool=false)
+    value isa AbstractVector ||
+        _canonicalextensionerror(sym, "\"$label\" must be a JSON array")
+    parsed = Vector{allow_null ? Union{Nothing,Int} : Int}()
+    for item in value
+        if allow_null && isnothing(item)
+            push!(parsed, nothing)
+        elseif item isa Integer
+            item >= 0 || _canonicalextensionerror(sym, "\"$label\" values must be non-negative")
+            push!(parsed, Int(item))
+        else
+            suffix = allow_null ? "integers or null" : "integers"
+            _canonicalextensionerror(sym, "\"$label\" must contain only $suffix")
+        end
+    end
+    return parsed
+end
+
+function _parsestringvector(sym::Symbol, value, label::AbstractString)
+    value isa AbstractVector ||
+        _canonicalextensionerror(sym, "\"$label\" must be a JSON array")
+    parsed = String[]
+    for item in value
+        item isa AbstractString ||
+            _canonicalextensionerror(sym, "\"$label\" must contain only strings")
+        push!(parsed, String(item))
+    end
+    return parsed
+end
+
+function _validatepermutation(sym::Symbol, permutation::Vector{Int}, ndim::Int)
+    length(permutation) == ndim ||
+        _canonicalextensionerror(sym, "\"permutation\" must have length $ndim")
+    length(unique(permutation)) == ndim ||
+        _canonicalextensionerror(sym, "\"permutation\" must not contain duplicates")
+    return permutation
+end
+
+function _extractdimensionalmetadata(sym::Symbol, metadata; ndim::Union{Nothing,Int}=nothing)
+    metadata === nothing && return (nothing, nothing, nothing)
+    dim_names =
+        _jsonhaskey(metadata, "dim_names") ?
+        _parsestringvector(sym, _jsonget(metadata, "dim_names"), "dim_names") : nothing
+    permutation =
+        _jsonhaskey(metadata, "permutation") ?
+        _parseintvector(sym, _jsonget(metadata, "permutation"), "permutation") : nothing
+    uniform_shape =
+        _jsonhaskey(metadata, "uniform_shape") ?
+        _parseintvector(sym, _jsonget(metadata, "uniform_shape"), "uniform_shape"; allow_null=true) :
+        nothing
+    if ndim !== nothing
+        dim_names !== nothing && length(dim_names) == ndim ||
+            isnothing(dim_names) || _canonicalextensionerror(sym, "\"dim_names\" must have length $ndim")
+        permutation !== nothing && _validatepermutation(sym, permutation, ndim)
+        uniform_shape !== nothing && length(uniform_shape) == ndim ||
+            isnothing(uniform_shape) ||
+            _canonicalextensionerror(sym, "\"uniform_shape\" must have length $ndim")
+    end
+    return dim_names, permutation, uniform_shape
+end
+
+@inline _isliststoragetype(x) =
+    x isa Union{Meta.List,Meta.LargeList,Meta.ListView,Meta.LargeListView}
+
+@inline _isbinarystoragetype(x) =
+    x isa Union{Meta.Binary,Meta.LargeBinary,Meta.BinaryView,Meta.FixedSizeBinary}
+
+function _validateparquetvariant(field::Meta.Field, metadata::String)
+    isempty(metadata) || _canonicalextensionerror(PARQUET_VARIANT_SYMBOL, "metadata must be the empty string")
+    field
+    return
+end
+
+function _validatefixedshapetensor(field::Meta.Field, metadata::String)
+    meta = _parsecanonicalmetadata(FIXED_SHAPE_TENSOR_SYMBOL, metadata; required=true)
+    _jsonhaskey(meta, "shape") ||
+        _canonicalextensionerror(FIXED_SHAPE_TENSOR_SYMBOL, "\"shape\" is required")
+    shape = _parseintvector(
+        FIXED_SHAPE_TENSOR_SYMBOL,
+        _jsonget(meta, "shape"),
+        "shape",
+    )
+    dim_names, permutation, _ = _extractdimensionalmetadata(
+        FIXED_SHAPE_TENSOR_SYMBOL,
+        meta;
+        ndim=length(shape),
+    )
+    field.type isa Meta.FixedSizeList ||
+        _canonicalextensionerror(
+            FIXED_SHAPE_TENSOR_SYMBOL,
+            "storage must be a FixedSizeList",
+        )
+    length(collect(_fieldchildren(field))) == 1 ||
+        _canonicalextensionerror(
+            FIXED_SHAPE_TENSOR_SYMBOL,
+            "storage must contain exactly one child field",
+        )
+    expected = isempty(shape) ? 1 : prod(shape)
+    Int(field.type.listSize) == expected ||
+        _canonicalextensionerror(
+            FIXED_SHAPE_TENSOR_SYMBOL,
+            "\"shape\" product $expected does not match FixedSizeList size $(field.type.listSize)",
+        )
+    dim_names
+    permutation
+    return
+end
+
+function _validatevariableshapetensor(field::Meta.Field, metadata::String)
+    field.type isa Meta.Struct ||
+        _canonicalextensionerror(
+            VARIABLE_SHAPE_TENSOR_SYMBOL,
+            "storage must be a Struct",
+        )
+    children = Dict(String(child.name) => child for child in collect(_fieldchildren(field)))
+    keys(children) == Set(("data", "shape")) ||
+        _canonicalextensionerror(
+            VARIABLE_SHAPE_TENSOR_SYMBOL,
+            "storage must contain exactly \"data\" and \"shape\" fields",
+        )
+    data_field = children["data"]
+    shape_field = children["shape"]
+    _isliststoragetype(data_field.type) ||
+        _canonicalextensionerror(
+            VARIABLE_SHAPE_TENSOR_SYMBOL,
+            "\"data\" field must use list storage",
+        )
+    length(collect(_fieldchildren(data_field))) == 1 ||
+        _canonicalextensionerror(
+            VARIABLE_SHAPE_TENSOR_SYMBOL,
+            "\"data\" field must contain exactly one child field",
+        )
+    shape_field.type isa Meta.FixedSizeList ||
+        _canonicalextensionerror(
+            VARIABLE_SHAPE_TENSOR_SYMBOL,
+            "\"shape\" field must use FixedSizeList storage",
+        )
+    shape_children = collect(_fieldchildren(shape_field))
+    length(shape_children) == 1 ||
+        _canonicalextensionerror(
+            VARIABLE_SHAPE_TENSOR_SYMBOL,
+            "\"shape\" field must contain exactly one child field",
+        )
+    shape_value = only(shape_children)
+    shape_value.type isa Meta.Int ||
+        _canonicalextensionerror(
+            VARIABLE_SHAPE_TENSOR_SYMBOL,
+            "\"shape\" values must use Int32 storage",
+        )
+    (shape_value.type.bitWidth == 32 && shape_value.type.is_signed) ||
+        _canonicalextensionerror(
+            VARIABLE_SHAPE_TENSOR_SYMBOL,
+            "\"shape\" values must use signed Int32 storage",
+        )
+    ndim = Int(shape_field.type.listSize)
+    meta = _parsecanonicalmetadata(VARIABLE_SHAPE_TENSOR_SYMBOL, metadata)
+    _extractdimensionalmetadata(VARIABLE_SHAPE_TENSOR_SYMBOL, meta; ndim=ndim)
+    return
+end
+
+function _validatecanonicalpassthrough(field::Meta.Field, typenamesym::Symbol, metadata::String)
+    if typenamesym === PARQUET_VARIANT_SYMBOL
+        _validateparquetvariant(field, metadata)
+    elseif typenamesym === FIXED_SHAPE_TENSOR_SYMBOL
+        _validatefixedshapetensor(field, metadata)
+    elseif typenamesym === VARIABLE_SHAPE_TENSOR_SYMBOL
+        _validatevariableshapetensor(field, metadata)
+    end
+    return
+end
+
 """
 Given a FlatBuffers.Builder and a Julia column or column eltype,
 Write the field.type flatbuffer definition of the eltype
@@ -41,12 +240,17 @@ end
 
 function juliaeltype(f::Meta.Field, meta::AbstractDict{String,String}, convert::Bool)
     TT = juliaeltype(f, convert)
-    !convert && return TT
-    T = finaljuliatype(TT)
     if haskey(meta, "ARROW:extension:name")
         typename = meta["ARROW:extension:name"]
         metadata = get(meta, "ARROW:extension:metadata", "")
-        JT = ArrowTypes.JuliaType(Val(Symbol(typename)), maybemissing(TT), metadata)
+        typenamesym = Symbol(typename)
+        _validatecanonicalpassthrough(f, typenamesym, metadata)
+        !convert && return TT
+        T = finaljuliatype(TT)
+        storageT =
+            typenamesym === TIMESTAMP_WITH_OFFSET_SYMBOL ? maybemissing(juliaeltype(f, false)) :
+            maybemissing(TT)
+        JT = ArrowTypes.JuliaType(Val(typenamesym), storageT, metadata)
         if JT !== nothing
             return f.nullable ? Union{JT,Missing} : JT
         else
@@ -54,6 +258,8 @@ function juliaeltype(f::Meta.Field, meta::AbstractDict{String,String}, convert::
                 1 _id = hash((:juliaeltype, typename, TT))
         end
     end
+    !convert && return TT
+    T = finaljuliatype(TT)
     return something(TT, T)
 end
 
@@ -106,6 +312,126 @@ function arrowtype(b, ::Type{T}) where {T<:Integer}
     Meta.intAddBitWidth(b, Int32(8 * sizeof(T)))
     Meta.intAddIsSigned(b, T <: Signed)
     return Meta.Int, Meta.intEnd(b), nothing
+end
+
+struct Bool8
+    value::Bool
+end
+
+Bool8(x::Integer) = Bool8(!iszero(x))
+
+Base.Bool(x::Bool8) = getfield(x, :value)
+Base.convert(::Type{Bool}, x::Bool8) = Bool(x)
+Base.convert(::Type{Int8}, x::Bool8) = Int8(Bool(x))
+Base.zero(::Type{Bool8}) = Bool8(false)
+Base.:(==)(x::Bool8, y::Bool8) = Bool(x) == Bool(y)
+Base.isequal(x::Bool8, y::Bool8) = isequal(Bool(x), Bool(y))
+
+ArrowTypes.ArrowType(::Type{Bool8}) = Int8
+ArrowTypes.toarrow(x::Bool8) = Int8(Bool(x))
+ArrowTypes.arrowname(::Type{Bool8}) = BOOL8_SYMBOL
+ArrowTypes.JuliaType(::Val{BOOL8_SYMBOL}, ::Type{Int8}, metadata::String) = Bool8
+ArrowTypes.fromarrow(::Type{Bool8}, x::Int8) = Bool8(x)
+ArrowTypes.default(::Type{Bool8}) = zero(Bool8)
+
+function writearray(io::IO, ::Type{Int8}, col::ArrowTypes.ToArrow{Int8,A}) where {A<:AbstractVector{Bool8}}
+    data = ArrowTypes._sourcedata(col)
+    strides(data) == (1,) || return _writearrayfallback(io, Int8, col)
+    return Base.write(io, reinterpret(Int8, data))
+end
+
+struct JSONText{S<:AbstractString}
+    value::S
+end
+
+Base.String(x::JSONText) = String(getfield(x, :value))
+Base.convert(::Type{String}, x::JSONText) = String(x)
+Base.:(==)(x::JSONText, y::JSONText) = getfield(x, :value) == getfield(y, :value)
+Base.isequal(x::JSONText, y::JSONText) = isequal(getfield(x, :value), getfield(y, :value))
+
+ArrowTypes.ArrowType(::Type{JSONText{S}}) where {S<:AbstractString} = S
+ArrowTypes.toarrow(x::JSONText) = getfield(x, :value)
+ArrowTypes.arrowname(::Type{JSONText{S}}) where {S<:AbstractString} = JSON_SYMBOL
+ArrowTypes.JuliaType(::Val{JSON_SYMBOL}, ::Type{S}, metadata::String) where {S<:AbstractString} =
+    JSONText{S}
+ArrowTypes.fromarrow(::Type{JSONText{String}}, ptr::Ptr{UInt8}, len::Int) =
+    JSONText(unsafe_string(ptr, len))
+ArrowTypes.fromarrow(::Type{JSONText{S}}, x::S) where {S<:AbstractString} = JSONText{S}(x)
+ArrowTypes.default(::Type{JSONText{S}}) where {S<:AbstractString} =
+    JSONText{S}(ArrowTypes.default(S))
+
+ArrowTypes.JuliaType(::Val{OPAQUE_SYMBOL}, S, metadata::String) = S
+ArrowTypes.JuliaType(::Val{PARQUET_VARIANT_SYMBOL}, S, metadata::String) = S
+ArrowTypes.JuliaType(::Val{FIXED_SHAPE_TENSOR_SYMBOL}, S, metadata::String) = S
+ArrowTypes.JuliaType(::Val{VARIABLE_SHAPE_TENSOR_SYMBOL}, S, metadata::String) = S
+
+@inline function _jsonstringliteral(x::AbstractString)
+    return '"' * escape_string(x) * '"'
+end
+
+opaquemetadata(type_name::AbstractString, vendor_name::AbstractString) =
+    "{\"type_name\":" * _jsonstringliteral(type_name) *
+    ",\"vendor_name\":" * _jsonstringliteral(vendor_name) * "}"
+
+variantmetadata() = ""
+
+function fixedshapetensormetadata(
+    shape::AbstractVector{<:Integer};
+    dim_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing,
+    permutation::Union{Nothing,AbstractVector{<:Integer}}=nothing,
+)
+    parsed_shape = _parseintvector(FIXED_SHAPE_TENSOR_SYMBOL, collect(shape), "shape")
+    parsed_dim_names = dim_names === nothing ? nothing : String.(dim_names)
+    parsed_permutation =
+        permutation === nothing ? nothing : _validatepermutation(
+            FIXED_SHAPE_TENSOR_SYMBOL,
+            Int.(permutation),
+            length(parsed_shape),
+        )
+    parsed_dim_names !== nothing && length(parsed_dim_names) == length(parsed_shape) ||
+        isnothing(parsed_dim_names) ||
+        _canonicalextensionerror(
+            FIXED_SHAPE_TENSOR_SYMBOL,
+            "\"dim_names\" must have length $(length(parsed_shape))",
+        )
+    body = Dict{String,Any}("shape" => parsed_shape)
+    parsed_dim_names !== nothing && (body["dim_names"] = parsed_dim_names)
+    parsed_permutation !== nothing && (body["permutation"] = parsed_permutation)
+    return JSON3.write(body)
+end
+
+function variableshapetensormetadata(;
+    uniform_shape::Union{Nothing,AbstractVector}=nothing,
+    dim_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing,
+    permutation::Union{Nothing,AbstractVector{<:Integer}}=nothing,
+)
+    uniform = uniform_shape === nothing ? nothing :
+              _parseintvector(
+        VARIABLE_SHAPE_TENSOR_SYMBOL,
+        collect(uniform_shape),
+        "uniform_shape";
+        allow_null=true,
+    )
+    ndim = uniform === nothing ? nothing : length(uniform)
+    parsed_dim_names = dim_names === nothing ? nothing : String.(dim_names)
+    parsed_permutation =
+        permutation === nothing ? nothing :
+        Int.(permutation)
+    ndim !== nothing && parsed_dim_names !== nothing &&
+        length(parsed_dim_names) == ndim ||
+        ndim === nothing ||
+        isnothing(parsed_dim_names) ||
+        _canonicalextensionerror(
+            VARIABLE_SHAPE_TENSOR_SYMBOL,
+            "\"dim_names\" must have length $ndim",
+        )
+    ndim !== nothing && parsed_permutation !== nothing &&
+        _validatepermutation(VARIABLE_SHAPE_TENSOR_SYMBOL, parsed_permutation, ndim)
+    body = Dict{String,Any}()
+    uniform !== nothing && (body["uniform_shape"] = uniform)
+    parsed_dim_names !== nothing && (body["dim_names"] = parsed_dim_names)
+    parsed_permutation !== nothing && (body["permutation"] = parsed_permutation)
+    return isempty(body) ? "" : JSON3.write(body)
 end
 
 # primitive types
@@ -265,6 +591,19 @@ end
 
 Base.zero(::Type{Timestamp{U,T}}) where {U,T} = Timestamp{U,T}(Int64(0))
 
+struct TimestampWithOffset{U}
+    timestamp::Timestamp{U,:UTC}
+    offset_minutes::Int16
+end
+
+TimestampWithOffset(
+    timestamp::Timestamp{U,:UTC},
+    offset_minutes::Integer,
+) where {U} = TimestampWithOffset{U}(timestamp, Int16(offset_minutes))
+
+Base.zero(::Type{TimestampWithOffset{U}}) where {U} =
+    TimestampWithOffset{U}(zero(Timestamp{U,:UTC}), Int16(0))
+
 function juliaeltype(f::Meta.Field, x::Meta.Timestamp, convert)
     return Timestamp{x.unit,x.timezone === nothing ? nothing : Symbol(x.timezone)}
 end
@@ -335,6 +674,32 @@ ArrowTypes.fromarrow(::Type{ZonedDateTime}, x::Timestamp) = convert(ZonedDateTim
 ArrowTypes.default(::Type{TimeZones.ZonedDateTime}) =
     TimeZones.ZonedDateTime(1, 1, 1, 1, 1, 1, TimeZones.tz"UTC")
 
+const TIMESTAMP_WITH_OFFSET_SYMBOL = Symbol("arrow.timestamp_with_offset")
+ArrowTypes.arrowname(::Type{TimestampWithOffset{U}}) where {U} = TIMESTAMP_WITH_OFFSET_SYMBOL
+ArrowTypes.JuliaType(
+    ::Val{TIMESTAMP_WITH_OFFSET_SYMBOL},
+    ::Type{
+        NamedTuple{
+            (:timestamp, :offset_minutes),
+            Tuple{Timestamp{U,:UTC},Int16},
+        },
+    },
+    metadata::String,
+) where {U} = TimestampWithOffset{U}
+ArrowTypes.default(::Type{TimestampWithOffset{U}}) where {U} = zero(TimestampWithOffset{U})
+ArrowTypes.fromarrowstruct(
+    ::Type{TimestampWithOffset{U}},
+    ::Val{(:timestamp, :offset_minutes)},
+    timestamp::Timestamp{U,:UTC},
+    offset_minutes::Int16,
+) where {U} = TimestampWithOffset{U}(timestamp, offset_minutes)
+ArrowTypes.fromarrowstruct(
+    ::Type{TimestampWithOffset{U}},
+    ::Val{(:offset_minutes, :timestamp)},
+    offset_minutes::Int16,
+    timestamp::Timestamp{U,:UTC},
+) where {U} = TimestampWithOffset{U}(timestamp, offset_minutes)
+
 # Backwards compatibility: older versions of Arrow saved ZonedDateTime's with this metdata:
 const OLD_ZONEDDATETIME_SYMBOL = Symbol("JuliaLang.ZonedDateTime")
 # and stored the local time instead of the UTC time.
@@ -388,6 +753,10 @@ Interval{Meta.IntervalUnit.DAY_TIME}(x) =
 
 function juliaeltype(f::Meta.Field, x::Meta.Interval, convert)
     return Interval{x.unit,bitwidth(x.unit)}
+end
+
+function juliaeltype(f::Meta.Field, x::Meta.RunEndEncoded, convert)
+    return juliaeltype(f.children[2], buildmetadata(f.children[2]), convert)
 end
 
 function arrowtype(b, ::Type{Interval{U,T}}) where {U,T}

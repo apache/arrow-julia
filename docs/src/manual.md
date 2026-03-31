@@ -87,7 +87,14 @@ In the arrow data format, specific logical types are supported, a list of which 
 
 * `Date`, `Time`, `Timestamp`, and `Duration` all have natural Julia defintions in `Dates.Date`, `Dates.Time`, `TimeZones.ZonedDateTime`, and `Dates.Period` subtypes, respectively.
 * `Char` and `Symbol` Julia types are mapped to arrow string types, with additional metadata of the original Julia type; this allows deserializing directly to `Char` and `Symbol` in Julia, while other language implementations will see these columns as just strings
-* Similarly to the above, the `UUID` Julia type is mapped to a 128-bit `FixedSizeBinary` arrow type.
+* `UUID` is mapped to a 128-bit `FixedSizeBinary` arrow type and now writes the canonical `arrow.uuid` extension name by default while still reading older `JuliaLang.UUID` metadata
+* `Arrow.TimestampWithOffset{U}` is the canonical offset-only logical type for `arrow.timestamp_with_offset`; it stores a UTC `Arrow.Timestamp{U,:UTC}` plus `offset_minutes::Int16` and does not imply a timezone-name interpretation
+* `Arrow.Bool8` is an explicit opt-in logical type for the canonical `arrow.bool8` extension; it uses `Int8` storage, while plain Julia `Bool` continues to use Arrow's packed-bit boolean layout
+* `Arrow.JSONText{String}` is a text-backed logical type for the canonical `arrow.json` extension; Arrow.jl preserves the payload as text and does not parse JSON automatically
+* `arrow.opaque` is treated as interoperability metadata over the underlying storage type; explicit metadata can be generated with `Arrow.opaquemetadata(type_name, vendor_name)` when writing
+* `Arrow.variantmetadata()`, `Arrow.fixedshapetensormetadata(...)`, and `Arrow.variableshapetensormetadata(...)` generate canonical metadata strings for advanced canonical extensions when writing explicit storage-backed values
+* `arrow.fixed_shape_tensor` and `arrow.variable_shape_tensor` are recognized as canonical passthrough extensions on read; Arrow.jl returns their underlying storage types, validates canonical metadata and top-level storage shape, and does not yet implement higher-level semantic interpretation or automatic writer surfaces for them
+* `arrow.parquet.variant` is recognized as a canonical passthrough extension on read; Arrow.jl currently validates only the required empty metadata string and does not yet implement deeper variant semantics or an automatic writer surface
 * `Decimal128` and `Decimal256` have no corresponding builtin Julia types, so they're deserialized using a compatible type definition in Arrow.jl itself: `Arrow.Decimal`
 
 
@@ -97,9 +104,47 @@ One note on performance: when writing `TimeZones.ZonedDateTime` columns to the a
 as the column has `ZonedDateTime` elements that all share a common timezone. This ensures the writing process can know "upfront" which timezone will be encoded and is thus much more
 efficient and performant.
 
+Run-End Encoded arrays are now supported on the read path. Arrow.jl exposes REE
+columns as read-only vectors and continues to reject REE on write paths, rather
+than attempting a partial or lossy re-encoding.
+
+Tensor and SparseTensor IPC messages are still unsupported, but Arrow.jl now
+recognizes those message headers explicitly and rejects them with precise
+errors instead of falling through to a generic unsupported-message failure.
+
+Similarly, `ArrowTypes.ToArrow` avoids repeated type-promotion work for
+homogeneous custom columns even when `ArrowTypes.ArrowType(T)` is abstract, so
+write-time conversion does not pay unnecessary overhead once the serialized
+element type is stable.
+
 #### Custom types
 
 To support writing your custom Julia struct, Arrow.jl utilizes the format's mechanism for "extension types" by allowing the storing of Julia type name and metadata in the field metadata. To "hook in" to this machinery, custom types can utilize the interface methods defined in the `Arrow.ArrowTypes` submodule. For example:
+
+Arrow.jl already uses this mechanism for several Base logical types, including
+`nothing`, `Tuple`, `VersionNumber`, and `Complex`, so those values roundtrip as
+their original Julia types instead of falling back to plain struct-shaped
+`NamedTuple`s.
+
+Base Julia `@enum` types also work out of the box through the same extension
+machinery. Arrow stores the enum as its primitive basetype plus a
+`JuliaLang.Enum` extension label that records the qualified Julia type path and
+label/value mapping. Native Julia readers reconstruct the enum type, while
+`Arrow.Table(...; convert=false)` and non-Julia consumers continue to see the
+primitive storage values.
+
+```julia
+using Arrow
+
+@enum RankingStrategy lexical=1 semantic=2 hybrid=3
+
+bytes = read(Arrow.tobuffer((strategy = [lexical, hybrid],)))
+typed = Arrow.Table(IOBuffer(bytes))
+raw = Arrow.Table(IOBuffer(bytes); convert=false)
+
+eltype(typed.strategy) == RankingStrategy
+eltype(raw.strategy) == Int32
+```
 
 ```julia
 using Arrow

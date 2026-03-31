@@ -22,6 +22,15 @@ struct Person
     name::String
 end
 
+module EnumTestModule
+@enum RankingStrategy lexical=1 semantic=2 hybrid=3
+end
+
+const RankingStrategy = EnumTestModule.RankingStrategy
+const lexical = EnumTestModule.lexical
+const semantic = EnumTestModule.semantic
+const hybrid = EnumTestModule.hybrid
+
 @testset "ArrowTypes" begin
     @test ArrowTypes.ArrowKind(MyInt) == ArrowTypes.PrimitiveKind()
     @test ArrowTypes.ArrowKind(Person) == ArrowTypes.StructKind()
@@ -67,6 +76,17 @@ end
     @test ArrowTypes.JuliaType(Val(ArrowTypes.CHAR)) == Char
     @test ArrowTypes.fromarrow(Char, UInt32('1')) == '1'
 
+    enum_metadata = ArrowTypes.arrowmetadata(RankingStrategy)
+    @test ArrowTypes.ArrowKind(RankingStrategy) == ArrowTypes.PrimitiveKind()
+    @test ArrowTypes.ArrowType(RankingStrategy) == Int32
+    @test ArrowTypes.toarrow(hybrid) == Int32(3)
+    @test ArrowTypes.arrowname(RankingStrategy) == ArrowTypes.ENUM
+    @test occursin("type=Main.EnumTestModule.RankingStrategy", enum_metadata)
+    @test occursin("labels=lexical:1,semantic:2,hybrid:3", enum_metadata)
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM), Int32, enum_metadata) == RankingStrategy
+    @test ArrowTypes.fromarrow(RankingStrategy, Int32(2)) == semantic
+    @test ArrowTypes.default(RankingStrategy) == lexical
+
     @test ArrowTypes.ArrowKind(Bool) == ArrowTypes.BoolKind()
 
     @test ArrowTypes.ListKind() == ArrowTypes.ListKind{false}()
@@ -106,6 +126,7 @@ end
     @test ArrowTypes.toarrow(u) == ubytes
     @test ArrowTypes.arrowname(UUID) == ArrowTypes.UUIDSYMBOL
     @test ArrowTypes.JuliaType(Val(ArrowTypes.UUIDSYMBOL)) == UUID
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.LEGACY_UUIDSYMBOL)) == UUID
     @test ArrowTypes.fromarrow(UUID, ubytes) == u
 
     ip4 = IPv4(rand(UInt32))
@@ -144,6 +165,17 @@ end
     @test ArrowTypes.default(Tuple{Vararg{Int}}) == ()
     @test ArrowTypes.default(Tuple{String,Vararg{Int}}) == ("",)
 
+    z = 1.0 + 2.0im
+    @test ArrowTypes.ArrowKind(typeof(z)) == ArrowTypes.StructKind()
+    @test ArrowTypes.arrowname(typeof(z)) == ArrowTypes.COMPLEX
+    @test ArrowTypes.arrowname(Union{Missing,typeof(z)}) == ArrowTypes.COMPLEX
+    @test ArrowTypes.JuliaType(
+        Val(ArrowTypes.COMPLEX),
+        NamedTuple{(:re, :im),Tuple{Float64,Float64}},
+    ) == ComplexF64
+    @test ArrowTypes.fromarrowstruct(ComplexF64, Val((:re, :im)), 1.0, 2.0) == z
+    @test ArrowTypes.fromarrowstruct(ComplexF64, Val((:im, :re)), 2.0, 1.0) == z
+
     v = v"1"
     v_nt = (major=1, minor=0, patch=0, prerelease=(), build=())
     @test ArrowTypes.ArrowKind(VersionNumber) == ArrowTypes.StructKind()
@@ -167,39 +199,97 @@ end
 
     @test ArrowTypes.promoteunion(Int, Float64) == Float64
     @test ArrowTypes.promoteunion(Int, String) == Union{Int,String}
+    @test ArrowTypes.promoteunion(Int, Int) == Int
 
     @test ArrowTypes.concrete_or_concreteunion(Int)
     @test !ArrowTypes.concrete_or_concreteunion(Union{Real,String})
     @test !ArrowTypes.concrete_or_concreteunion(Any)
 
     @testset "ToArrow" begin
+        @test !ArrowTypes._hasoffsetaxes([1, 2, 3])
+        @test ArrowTypes._offsetshift([1, 2, 3]) == 0
+
         x = ArrowTypes.ToArrow([1, 2, 3])
         @test x isa Vector{Int}
         @test x == [1, 2, 3]
 
+        baseview = @view [1, 2, 3][1:3]
+        x = ArrowTypes.ToArrow(baseview)
+        @test x === baseview
+
         x = ArrowTypes.ToArrow([:hey, :ho])
         @test x isa ArrowTypes.ToArrow{String,Vector{Symbol}}
         @test eltype(x) == String
+        @test ArrowTypes._needsconvert(x)
+        @test x[1] == "hey"
+        @test collect(x) == ["hey", "ho"]
         @test x == ["hey", "ho"]
 
         x = ArrowTypes.ToArrow(Any[1, 3.14])
         @test x isa ArrowTypes.ToArrow{Float64,Vector{Any}}
         @test eltype(x) == Float64
+        @test collect(x) == [1.0, 3.14]
         @test x == [1.0, 3.14]
+
+        x = ArrowTypes.ToArrow(Any[UUID(UInt128(1)), UUID(UInt128(2))])
+        @test x isa ArrowTypes.ToArrow{NTuple{16,UInt8},Vector{Any}}
+        @test eltype(x) == NTuple{16,UInt8}
+        @test collect(x) ==
+              [ArrowTypes.toarrow(UUID(UInt128(1))), ArrowTypes.toarrow(UUID(UInt128(2)))]
+
+        x = ArrowTypes.ToArrow(Any[missing, UUID(UInt128(1))])
+        @test x isa ArrowTypes.ToArrow{Union{Missing,NTuple{16,UInt8}},Vector{Any}}
+        @test eltype(x) == Union{Missing,NTuple{16,UInt8}}
+        @test isequal(
+            collect(x),
+            Union{Missing,NTuple{16,UInt8}}[missing, ArrowTypes.toarrow(UUID(UInt128(1)))],
+        )
 
         x = ArrowTypes.ToArrow(Any[1, 3.14, "hey"])
         @test x isa ArrowTypes.ToArrow{Union{Float64,String},Vector{Any}}
         @test eltype(x) == Union{Float64,String}
+        @test collect(x) == Union{Float64,String}[1.0, 3.14, "hey"]
         @test x == [1.0, 3.14, "hey"]
+
+        x = ArrowTypes.ToArrow(Any[UUID(UInt128(1)), "tail"])
+        @test x isa ArrowTypes.ToArrow{Union{NTuple{16,UInt8},String},Vector{Any}}
+        @test eltype(x) == Union{NTuple{16,UInt8},String}
+        @test collect(x) ==
+              Union{NTuple{16,UInt8},String}[ArrowTypes.toarrow(UUID(UInt128(1))), "tail"]
 
         x = ArrowTypes.ToArrow(OffsetArray([1, 2, 3], -3:-1))
         @test x isa ArrowTypes.ToArrow{Int,OffsetVector{Int,Vector{Int}}}
+        @test ArrowTypes._hasoffsetaxes(getfield(x, :data))
+        @test getfield(x, :offset) == ArrowTypes._offsetshift(getfield(x, :data))
+        @test ArrowTypes._sourcedata(x) === getfield(x, :data)
+        @test ArrowTypes._sourceoffset(x) == getfield(x, :offset)
+        @test !ArrowTypes._needsconvert(x)
+        @test ArrowTypes._sourcevalue(x, 1) == 1
         @test eltype(x) == Int
+        @test x[1] == 1
+        @test x[3] == 3
+        @test collect(x) == [1, 2, 3]
         @test x == [1, 2, 3]
+
+        x = ArrowTypes.ToArrow(OffsetArray(Union{Missing,Int}[1, missing], -3:-2))
+        @test x isa ArrowTypes.ToArrow{
+            Union{Missing,Int},
+            OffsetVector{Union{Missing,Int},Vector{Union{Missing,Int}}},
+        }
+        @test !ArrowTypes._needsconvert(x)
+        @test x[1] == 1
+        @test x[2] === missing
+        @test isequal(collect(x), Union{Missing,Int}[1, missing])
 
         x = ArrowTypes.ToArrow(OffsetArray(Any[1, 3.14], -3:-2))
         @test x isa ArrowTypes.ToArrow{Float64,OffsetVector{Any,Vector{Any}}}
+        @test getfield(x, :offset) == ArrowTypes._offsetshift(getfield(x, :data))
+        @test ArrowTypes._sourcevalue(x, 2) == 3.14
         @test eltype(x) == Float64
+        @test ArrowTypes._needsconvert(x)
+        @test x[1] == 1
+        @test x[2] == 3.14
+        @test collect(x) == [1.0, 3.14]
         @test x == [1, 3.14]
 
         @testset "respect non-missing concrete type" begin
@@ -219,6 +309,15 @@ end
             T = Union{DateTimeTZ,Missing}
             @test !ArrowTypes.concrete_or_concreteunion(ArrowTypes.ArrowType(T))
             @test eltype(ArrowTypes.ToArrow(T[missing])) == Union{Timestamp{:UTC},Missing}
+            @test eltype(
+                ArrowTypes.ToArrow(DateTimeTZ[DateTimeTZ(1, "UTC"), DateTimeTZ(2, "UTC")]),
+            ) == Timestamp{:UTC}
+            @test eltype(
+                ArrowTypes.ToArrow(DateTimeTZ[DateTimeTZ(1, "UTC"), DateTimeTZ(2, "PST")]),
+            ) == Timestamp
+            @test eltype(
+                ArrowTypes.ToArrow(Any[DateTimeTZ(1, "UTC"), DateTimeTZ(2, "UTC")]),
+            ) == Timestamp{:UTC}
 
             # Works since `ArrowTypes.default(Any) === nothing` and
             # `ArrowTypes.toarrow(nothing) === missing`. Defining `toarrow(::Nothing) = nothing`

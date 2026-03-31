@@ -157,12 +157,28 @@ dictionaryBatchAddIsDelta(b::FlatBuffers.Builder, isdelta::Base.Bool) =
     FlatBuffers.prependslot!(b, 2, isdelta, false)
 dictionaryBatchEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
+struct Tensor <: FlatBuffers.Table
+    bytes::Vector{UInt8}
+    pos::Base.Int
+end
+
+Base.propertynames(x::Tensor) = ()
+Base.getproperty(x::Tensor, field::Symbol) = nothing
+
+struct SparseTensor <: FlatBuffers.Table
+    bytes::Vector{UInt8}
+    pos::Base.Int
+end
+
+Base.propertynames(x::SparseTensor) = ()
+Base.getproperty(x::SparseTensor, field::Symbol) = nothing
+
 function MessageHeader(b::UInt8)
     b == 1 && return Schema
     b == 2 && return DictionaryBatch
     b == 3 && return RecordBatch
-    # b == 4 && return Tensor
-    # b == 5 && return SparseTensor
+    b == 4 && return Tensor
+    b == 5 && return SparseTensor
     return nothing
 end
 
@@ -170,8 +186,8 @@ function MessageHeader(::Base.Type{T})::Int16 where {T}
     T == Schema && return 1
     T == DictionaryBatch && return 2
     T == RecordBatch && return 3
-    # T == Tensor && return 4
-    # T == SparseTensor && return 5
+    T == Tensor && return 4
+    T == SparseTensor && return 5
     return 0
 end
 
