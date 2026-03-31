@@ -25,6 +25,9 @@ finaljuliatype(::Type{Missing}) = Missing
 finaljuliatype(::Type{Union{T,Missing}}) where {T} = Union{Missing,finaljuliatype(T)}
 
 const RUN_END_ENCODED_UNSUPPORTED = "Run-End Encoded arrays are not supported yet"
+const BOOL8_SYMBOL = Symbol("arrow.bool8")
+const JSON_SYMBOL = Symbol("arrow.json")
+const OPAQUE_SYMBOL = Symbol("arrow.opaque")
 
 """
 Given a FlatBuffers.Builder and a Julia column or column eltype,
@@ -113,6 +116,62 @@ function arrowtype(b, ::Type{T}) where {T<:Integer}
     Meta.intAddIsSigned(b, T <: Signed)
     return Meta.Int, Meta.intEnd(b), nothing
 end
+
+struct Bool8
+    value::Bool
+end
+
+Bool8(x::Integer) = Bool8(!iszero(x))
+
+Base.Bool(x::Bool8) = getfield(x, :value)
+Base.convert(::Type{Bool}, x::Bool8) = Bool(x)
+Base.convert(::Type{Int8}, x::Bool8) = Int8(Bool(x))
+Base.zero(::Type{Bool8}) = Bool8(false)
+Base.:(==)(x::Bool8, y::Bool8) = Bool(x) == Bool(y)
+Base.isequal(x::Bool8, y::Bool8) = isequal(Bool(x), Bool(y))
+
+ArrowTypes.ArrowType(::Type{Bool8}) = Int8
+ArrowTypes.toarrow(x::Bool8) = Int8(Bool(x))
+ArrowTypes.arrowname(::Type{Bool8}) = BOOL8_SYMBOL
+ArrowTypes.JuliaType(::Val{BOOL8_SYMBOL}, ::Type{Int8}, metadata::String) = Bool8
+ArrowTypes.fromarrow(::Type{Bool8}, x::Int8) = Bool8(x)
+ArrowTypes.default(::Type{Bool8}) = zero(Bool8)
+
+function writearray(io::IO, ::Type{Int8}, col::ArrowTypes.ToArrow{Int8,A}) where {A<:AbstractVector{Bool8}}
+    data = ArrowTypes._sourcedata(col)
+    strides(data) == (1,) || return _writearrayfallback(io, Int8, col)
+    return Base.write(io, reinterpret(Int8, data))
+end
+
+struct JSONText{S<:AbstractString}
+    value::S
+end
+
+Base.String(x::JSONText) = String(getfield(x, :value))
+Base.convert(::Type{String}, x::JSONText) = String(x)
+Base.:(==)(x::JSONText, y::JSONText) = getfield(x, :value) == getfield(y, :value)
+Base.isequal(x::JSONText, y::JSONText) = isequal(getfield(x, :value), getfield(y, :value))
+
+ArrowTypes.ArrowType(::Type{JSONText{S}}) where {S<:AbstractString} = S
+ArrowTypes.toarrow(x::JSONText) = getfield(x, :value)
+ArrowTypes.arrowname(::Type{JSONText{S}}) where {S<:AbstractString} = JSON_SYMBOL
+ArrowTypes.JuliaType(::Val{JSON_SYMBOL}, ::Type{S}, metadata::String) where {S<:AbstractString} =
+    JSONText{S}
+ArrowTypes.fromarrow(::Type{JSONText{String}}, ptr::Ptr{UInt8}, len::Int) =
+    JSONText(unsafe_string(ptr, len))
+ArrowTypes.fromarrow(::Type{JSONText{S}}, x::S) where {S<:AbstractString} = JSONText{S}(x)
+ArrowTypes.default(::Type{JSONText{S}}) where {S<:AbstractString} =
+    JSONText{S}(ArrowTypes.default(S))
+
+ArrowTypes.JuliaType(::Val{OPAQUE_SYMBOL}, S, metadata::String) = S
+
+@inline function _jsonstringliteral(x::AbstractString)
+    return '"' * escape_string(x) * '"'
+end
+
+opaquemetadata(type_name::AbstractString, vendor_name::AbstractString) =
+    "{\"type_name\":" * _jsonstringliteral(type_name) *
+    ",\"vendor_name\":" * _jsonstringliteral(vendor_name) * "}"
 
 # primitive types
 function juliaeltype(f::Meta.Field, fp::Meta.FloatingPoint, convert)

@@ -101,6 +101,9 @@ Third-party data formats:
 Canonical extension highlights:
   * `UUID` now writes the canonical `arrow.uuid` extension name by default while retaining reader compatibility with legacy `JuliaLang.UUID` metadata
   * `Arrow.TimestampWithOffset{U}` provides a canonical `arrow.timestamp_with_offset` logical type without conflating offset-only semantics with `ZonedDateTime`
+  * `Arrow.Bool8` provides an explicit opt-in writer/reader surface for the canonical `arrow.bool8` extension without changing the default packed-bit `Bool` path
+  * `Arrow.JSONText{String}` provides a text-backed logical type for the canonical `arrow.json` extension without parsing payloads during read or write
+  * `arrow.opaque` now reads as the underlying storage type without warning, and explicit writer metadata can be generated with `Arrow.opaquemetadata(type_name, vendor_name)`
   * Legacy `JuliaLang.ZonedDateTime-UTC` and `JuliaLang.ZonedDateTime` files remain readable for backward compatibility
 
 See the [full documentation](https://arrow.apache.org/julia/) for details on reading and writing arrow data.

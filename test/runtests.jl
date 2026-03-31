@@ -787,6 +787,49 @@ const hybrid = EnumRoundtripModule.hybrid
             @test_throws ArgumentError(Arrow.RUN_END_ENCODED_UNSUPPORTED) collect(Arrow.Stream(path))
         end
 
+        @testset "canonical bool8/json/opaque" begin
+            bools = Union{Missing,Arrow.Bool8}[Arrow.Bool8(true), missing, Arrow.Bool8(false)]
+            tt = Arrow.Table(Arrow.tobuffer((col=bools,)))
+            @test eltype(tt.col) == Union{Missing,Arrow.Bool8}
+            @test isequal(copy(tt.col), bools)
+            @test Arrow.getmetadata(tt.col)["ARROW:extension:name"] == "arrow.bool8"
+
+            raw_tt = Arrow.Table(Arrow.tobuffer((col=bools,)); convert=false)
+            @test eltype(raw_tt.col) == Union{Missing,Int8}
+            @test isequal(copy(raw_tt.col), Union{Missing,Int8}[1, missing, 0])
+
+            jsons = Union{Missing,Arrow.JSONText{String}}[
+                Arrow.JSONText("{\"a\":1}"),
+                missing,
+                Arrow.JSONText("[1,2,3]"),
+            ]
+            json_tt = Arrow.Table(Arrow.tobuffer((col=jsons,)))
+            @test eltype(json_tt.col) == Union{Missing,Arrow.JSONText{String}}
+            @test isequal(copy(json_tt.col), jsons)
+            @test Arrow.getmetadata(json_tt.col)["ARROW:extension:name"] == "arrow.json"
+
+            raw_json_tt = Arrow.Table(Arrow.tobuffer((col=jsons,)); convert=false)
+            @test eltype(raw_json_tt.col) == Union{Missing,String}
+            @test isequal(copy(raw_json_tt.col), Union{Missing,String}["{\"a\":1}", missing, "[1,2,3]"])
+
+            opaque_meta = Arrow.opaquemetadata("pkg.Type", "vendor.example")
+            opaque_tt = Arrow.Table(
+                Arrow.tobuffer(
+                    (col=["a", "b"],);
+                    colmetadata=Dict(
+                        :col => Dict(
+                            "ARROW:extension:name" => "arrow.opaque",
+                            "ARROW:extension:metadata" => opaque_meta,
+                        ),
+                    ),
+                ),
+            )
+            @test eltype(opaque_tt.col) == String
+            @test copy(opaque_tt.col) == ["a", "b"]
+            @test Arrow.getmetadata(opaque_tt.col)["ARROW:extension:name"] == "arrow.opaque"
+            @test Arrow.getmetadata(opaque_tt.col)["ARROW:extension:metadata"] == opaque_meta
+        end
+
         @testset "# 158" begin
             # arrow ipc stream generated from pyarrow with no record batches
             bytes = UInt8[

@@ -89,6 +89,9 @@ In the arrow data format, specific logical types are supported, a list of which 
 * `Char` and `Symbol` Julia types are mapped to arrow string types, with additional metadata of the original Julia type; this allows deserializing directly to `Char` and `Symbol` in Julia, while other language implementations will see these columns as just strings
 * `UUID` is mapped to a 128-bit `FixedSizeBinary` arrow type and now writes the canonical `arrow.uuid` extension name by default while still reading older `JuliaLang.UUID` metadata
 * `Arrow.TimestampWithOffset{U}` is the canonical offset-only logical type for `arrow.timestamp_with_offset`; it stores a UTC `Arrow.Timestamp{U,:UTC}` plus `offset_minutes::Int16` and does not imply a timezone-name interpretation
+* `Arrow.Bool8` is an explicit opt-in logical type for the canonical `arrow.bool8` extension; it uses `Int8` storage, while plain Julia `Bool` continues to use Arrow's packed-bit boolean layout
+* `Arrow.JSONText{String}` is a text-backed logical type for the canonical `arrow.json` extension; Arrow.jl preserves the payload as text and does not parse JSON automatically
+* `arrow.opaque` is treated as interoperability metadata over the underlying storage type; explicit metadata can be generated with `Arrow.opaquemetadata(type_name, vendor_name)` when writing
 * `Decimal128` and `Decimal256` have no corresponding builtin Julia types, so they're deserialized using a compatible type definition in Arrow.jl itself: `Arrow.Decimal`
 
 
