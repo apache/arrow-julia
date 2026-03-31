@@ -28,6 +28,9 @@ const RUN_END_ENCODED_UNSUPPORTED = "Run-End Encoded arrays are not supported ye
 const BOOL8_SYMBOL = Symbol("arrow.bool8")
 const JSON_SYMBOL = Symbol("arrow.json")
 const OPAQUE_SYMBOL = Symbol("arrow.opaque")
+const PARQUET_VARIANT_SYMBOL = Symbol("arrow.parquet.variant")
+const FIXED_SHAPE_TENSOR_SYMBOL = Symbol("arrow.fixed_shape_tensor")
+const VARIABLE_SHAPE_TENSOR_SYMBOL = Symbol("arrow.variable_shape_tensor")
 
 """
 Given a FlatBuffers.Builder and a Julia column or column eltype,
@@ -164,6 +167,9 @@ ArrowTypes.default(::Type{JSONText{S}}) where {S<:AbstractString} =
     JSONText{S}(ArrowTypes.default(S))
 
 ArrowTypes.JuliaType(::Val{OPAQUE_SYMBOL}, S, metadata::String) = S
+ArrowTypes.JuliaType(::Val{PARQUET_VARIANT_SYMBOL}, S, metadata::String) = S
+ArrowTypes.JuliaType(::Val{FIXED_SHAPE_TENSOR_SYMBOL}, S, metadata::String) = S
+ArrowTypes.JuliaType(::Val{VARIABLE_SHAPE_TENSOR_SYMBOL}, S, metadata::String) = S
 
 @inline function _jsonstringliteral(x::AbstractString)
     return '"' * escape_string(x) * '"'

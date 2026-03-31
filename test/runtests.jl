@@ -842,6 +842,87 @@ const hybrid = EnumRoundtripModule.hybrid
             @test Arrow.getmetadata(opaque_tt.col)["ARROW:extension:metadata"] == opaque_meta
         end
 
+        @testset "canonical advanced passthrough" begin
+            variant_values = Union{
+                Missing,
+                NamedTuple{(:metadata, :value),Tuple{String,String}},
+            }[
+                (metadata="json", value="{\"a\":1}"),
+                missing,
+                (metadata="string", value="abc"),
+            ]
+            @test_logs min_level=Base.CoreLogging.Warn begin
+                variant_tt = Arrow.Table(
+                    Arrow.tobuffer(
+                        (col=variant_values,);
+                        colmetadata=Dict(
+                            :col => Dict(
+                                "ARROW:extension:name" => "arrow.parquet.variant",
+                                "ARROW:extension:metadata" => "",
+                            ),
+                        ),
+                    ),
+                )
+                @test eltype(variant_tt.col) == eltype(variant_values)
+                @test isequal(copy(variant_tt.col), variant_values)
+                @test Arrow.getmetadata(variant_tt.col)["ARROW:extension:name"] ==
+                      "arrow.parquet.variant"
+            end
+
+            fixed_tensor_values = Union{Missing,NTuple{4,Int32}}[
+                (Int32(1), Int32(2), Int32(3), Int32(4)),
+                missing,
+                (Int32(5), Int32(6), Int32(7), Int32(8)),
+            ]
+            @test_logs min_level=Base.CoreLogging.Warn begin
+                fixed_tensor_tt = Arrow.Table(
+                    Arrow.tobuffer(
+                        (col=fixed_tensor_values,);
+                        colmetadata=Dict(
+                            :col => Dict(
+                                "ARROW:extension:name" => "arrow.fixed_shape_tensor",
+                                "ARROW:extension:metadata" => "{\"shape\":[2,2],\"dim_names\":[\"x\",\"y\"]}",
+                            ),
+                        ),
+                    ),
+                )
+                @test eltype(fixed_tensor_tt.col) == eltype(fixed_tensor_values)
+                @test isequal(copy(fixed_tensor_tt.col), fixed_tensor_values)
+                @test Arrow.getmetadata(fixed_tensor_tt.col)["ARROW:extension:name"] ==
+                      "arrow.fixed_shape_tensor"
+            end
+
+            variable_tensor_values = Union{Missing,Vector{Int32}}[
+                Int32[1, 2, 3, 4],
+                missing,
+                Int32[5, 6],
+            ]
+            @test_logs min_level=Base.CoreLogging.Warn begin
+                variable_tensor_tt = Arrow.Table(
+                    Arrow.tobuffer(
+                        (col=variable_tensor_values,);
+                        colmetadata=Dict(
+                            :col => Dict(
+                                "ARROW:extension:name" => "arrow.variable_shape_tensor",
+                                "ARROW:extension:metadata" => "{\"uniform_shape\":[2]}",
+                            ),
+                        ),
+                    ),
+                )
+                @test Base.nonmissingtype(eltype(variable_tensor_tt.col)) <: AbstractVector{Int32}
+                @test isequal(
+                    map(x -> x === missing ? missing : copy(x), copy(variable_tensor_tt.col)),
+                    Union{Missing,Vector{Int32}}[
+                        Int32[1, 2, 3, 4],
+                        missing,
+                        Int32[5, 6],
+                    ],
+                )
+                @test Arrow.getmetadata(variable_tensor_tt.col)["ARROW:extension:name"] ==
+                      "arrow.variable_shape_tensor"
+            end
+        end
+
         @testset "# 158" begin
             # arrow ipc stream generated from pyarrow with no record batches
             bytes = UInt8[

@@ -104,6 +104,7 @@ Canonical extension highlights:
   * `Arrow.Bool8` provides an explicit opt-in writer/reader surface for the canonical `arrow.bool8` extension without changing the default packed-bit `Bool` path
   * `Arrow.JSONText{String}` provides a text-backed logical type for the canonical `arrow.json` extension without parsing payloads during read or write
   * `arrow.opaque` now reads as the underlying storage type without warning, and explicit writer metadata can be generated with `Arrow.opaquemetadata(type_name, vendor_name)`
+  * `arrow.parquet.variant`, `arrow.fixed_shape_tensor`, and `arrow.variable_shape_tensor` are recognized on read as canonical passthrough extensions over their storage types without claiming full semantic interpretation or automatic writer support
   * Legacy `JuliaLang.ZonedDateTime-UTC` and `JuliaLang.ZonedDateTime` files remain readable for backward compatibility
 
 See the [full documentation](https://arrow.apache.org/julia/) for details on reading and writing arrow data.
