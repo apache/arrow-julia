@@ -28,7 +28,8 @@ tobytes(io::IO) = Base.read(io)
 tobytes(io::IOStream) = Mmap.mmap(io)
 tobytes(file_path) = open(tobytes, file_path, "r")
 
-rejectunsupported(field::Meta.Field) = (rejectunsupported(field.type); foreach(rejectunsupported, field.children))
+rejectunsupported(field::Meta.Field) =
+    (rejectunsupported(field.type); foreach(rejectunsupported, field.children))
 rejectunsupported(x) = nothing
 
 struct BatchIterator

@@ -83,7 +83,8 @@ const hybrid = EnumTestModule.hybrid
     @test ArrowTypes.arrowname(RankingStrategy) == ArrowTypes.ENUM
     @test occursin("type=Main.EnumTestModule.RankingStrategy", enum_metadata)
     @test occursin("labels=lexical:1,semantic:2,hybrid:3", enum_metadata)
-    @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM), Int32, enum_metadata) == RankingStrategy
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM), Int32, enum_metadata) ==
+          RankingStrategy
     @test ArrowTypes.fromarrow(RankingStrategy, Int32(2)) == semantic
     @test ArrowTypes.default(RankingStrategy) == lexical
 

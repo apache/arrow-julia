@@ -225,7 +225,10 @@ end
 
 function _enum_labels(::Type{T}) where {T<:Enum}
     B = Base.Enums.basetype(T)
-    return join((string(instance, ":", convert(B, Int(instance))) for instance in instances(T)), ",")
+    return join(
+        (string(instance, ":", convert(B, Int(instance))) for instance in instances(T)),
+        ",",
+    )
 end
 
 function arrowmetadata(::Type{T}) where {T<:Enum}
@@ -233,7 +236,7 @@ function arrowmetadata(::Type{T}) where {T<:Enum}
 end
 
 function _parsemetadata(metadata::AbstractString)
-    parsed = Dict{String, String}()
+    parsed = Dict{String,String}()
     isempty(metadata) && return parsed
     for entry in split(metadata, ';')
         isempty(entry) && continue

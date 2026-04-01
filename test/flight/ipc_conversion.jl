@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+using Tables
+using UUIDs
+
 @testset "Flight IPC conversion helpers" begin
     missing_schema_fragment = "the server may have terminated the stream before emitting the first schema-bearing FlightData message"
     descriptor = Arrow.Flight.Protocol.FlightDescriptor(
@@ -75,4 +78,21 @@
     )
     @test isempty(empty_tbl.id)
     @test isempty(empty_tbl.label)
+
+    extension_source = (
+        uuid=[UUID(UInt128(1)), UUID(UInt128(2))],
+        flag=[Arrow.Bool8(true), Arrow.Bool8(false)],
+    )
+    extension_messages = Arrow.Flight.flightdata(extension_source)
+    extension_batches = collect(Arrow.Flight.stream(extension_messages))
+    extension_tbl = Arrow.Flight.table(extension_messages)
+
+    @test Arrow.getmetadata(extension_batches[1].uuid)[Arrow.EXTENSION_NAME_KEY] ==
+          "arrow.uuid"
+    @test Arrow.getmetadata(extension_batches[1].flag)[Arrow.EXTENSION_NAME_KEY] ==
+          "arrow.bool8"
+    @test Arrow.getmetadata(extension_tbl.uuid)[Arrow.EXTENSION_NAME_KEY] == "arrow.uuid"
+    @test Arrow.getmetadata(extension_tbl.flag)[Arrow.EXTENSION_NAME_KEY] == "arrow.bool8"
+    @test copy(extension_tbl.uuid) == extension_source.uuid
+    @test Bool.(copy(extension_tbl.flag)) == Bool.(extension_source.flag)
 end

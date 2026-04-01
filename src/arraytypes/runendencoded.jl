@@ -64,11 +64,13 @@ function _validaterunendencoded(run_ends, values, len)
         )
         last_end = current_end
     end
-    len == 0 || last_end == len || throw(
-        ArgumentError(
-            "invalid Run-End Encoded array: final run end $last_end does not match logical length $len",
-        ),
-    )
+    len == 0 ||
+        last_end == len ||
+        throw(
+            ArgumentError(
+                "invalid Run-End Encoded array: final run end $last_end does not match logical length $len",
+            ),
+        )
     return
 end
 

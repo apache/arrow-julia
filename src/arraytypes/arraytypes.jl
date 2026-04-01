@@ -103,13 +103,7 @@ function arrowvector(
         x = ToArrow(x)
     end
     S = maybemissing(eltype(x))
-    if ArrowTypes.hasarrowname(T)
-        meta = _arrowtypemeta(
-            _normalizemeta(meta),
-            String(ArrowTypes.arrowname(T)),
-            String(ArrowTypes.arrowmetadata(T)),
-        )
-    end
+    meta = _extensionmetadatafor(T, _normalizemeta(meta))
     return arrowvector(
         S,
         x,
@@ -132,17 +126,6 @@ _normalizecolmeta(::Nothing) = nothing
 _normalizecolmeta(colmeta) = toidict(
     Symbol(k) => toidict(String(v1) => String(v2) for (v1, v2) in v) for (k, v) in colmeta
 )
-
-function _arrowtypemeta(::Nothing, n, m)
-    return toidict(("ARROW:extension:name" => n, "ARROW:extension:metadata" => m))
-end
-
-function _arrowtypemeta(meta, n, m)
-    dict = Dict(meta)
-    dict["ARROW:extension:name"] = n
-    dict["ARROW:extension:metadata"] = m
-    return toidict(dict)
-end
 
 @inline function _materializeconverted(x::ArrowTypes.ToArrow)
     data = ArrowTypes._sourcedata(x)
