@@ -24,13 +24,26 @@ function pyarrow_interop_test_exchange(client, exchange_descriptor)
         Arrow.Flight.flightdata(exchange_source; descriptor=exchange_descriptor)
 
     exchange_req, exchange_request, exchange_response = Arrow.Flight.doexchange(client)
-    exchanged_messages = pyarrow_interop_send_messages(
-        exchange_req,
-        exchange_request,
-        exchange_response,
-        exchange_messages,
+    sender = @async begin
+        for message in exchange_messages
+            put!(exchange_request, message)
+        end
+        close(exchange_request)
+    end
+    exchanged_messages = Arrow.Flight.Protocol.FlightData[]
+    exchange_batches = collect(
+        Arrow.Flight.stream((
+            (push!(exchanged_messages, message); message) for message in exchange_response
+        ),),
     )
+    wait(sender)
+    gRPCClient.grpc_async_await(exchange_req)
 
+    @test length(exchange_batches) == 2
+    @test exchange_batches[1].id == [21, 22]
+    @test exchange_batches[1].name == ["twenty-one", "twenty-two"]
+    @test exchange_batches[2].id == [23]
+    @test exchange_batches[2].name == ["twenty-three"]
     exchange_table = Arrow.Flight.table(exchanged_messages)
     @test exchange_table.id == [21, 22, 23]
     @test exchange_table.name == ["twenty-one", "twenty-two", "twenty-three"]

@@ -64,10 +64,6 @@ jobs:
           JULIA_NUM_THREADS: ${{ matrix.nthreads }}
         with:
           project: ${{ matrix.pkg.dir }}
-      - uses: julia-actions/julia-processcoverage@v1
-      - uses: codecov/codecov-action@v5
-        with:
-          files: lcov.info
   test_monorepo:
     name: Monorepo dev - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}

@@ -15,7 +15,20 @@
 # specific language governing permissions and limitations
 # under the License.
 
-function flightdata(
+function _sourcedefaultcolmetadata(cols)
+    sch = Tables.schema(cols)
+    isnothing(sch) && return nothing
+    colmeta = Dict{Symbol,Any}()
+    Tables.eachcolumn(sch, cols) do col, _, nm
+        meta = ArrowParent.getmetadata(col)
+        isnothing(meta) || (colmeta[nm] = meta)
+    end
+    isempty(colmeta) && return nothing
+    return ArrowParent._normalizecolmeta(colmeta)
+end
+
+function _emitflightdata!(
+    emit,
     source;
     descriptor::Union{Nothing,Protocol.FlightDescriptor}=nothing,
     compress=nothing,
@@ -29,13 +42,25 @@ function flightdata(
     colmetadata::Union{Nothing,Any}=nothing,
 )
     dictencodings = Dict{Int64,Any}()
-    messages = Protocol.FlightData[]
     schema = Ref{Tables.Schema}()
     normalized_colmetadata = ArrowParent._normalizecolmeta(colmetadata)
-    meta = isnothing(metadata) ? ArrowParent.getmetadata(source) : metadata
+    source_meta = isnothing(metadata) ? ArrowParent.getmetadata(source) : metadata
+    source_colmetadata = isnothing(colmetadata) ? nothing : normalized_colmetadata
 
     for tbl in Tables.partitions(source)
         tblcols = Tables.columns(tbl)
+        if isnothing(metadata)
+            tblmeta = ArrowParent.getmetadata(tbl)
+            isnothing(tblmeta) && (tblmeta = source_meta)
+        else
+            tblmeta = metadata
+        end
+        if isnothing(colmetadata)
+            tblcolmetadata = _sourcedefaultcolmetadata(tblcols)
+            isnothing(tblcolmetadata) && (tblcolmetadata = source_colmetadata)
+        else
+            tblcolmetadata = normalized_colmetadata
+        end
         cols = ArrowParent.toarrowtable(
             tblcols,
             dictencodings,
@@ -45,13 +70,12 @@ function flightdata(
             dictencode,
             dictencodenested,
             maxdepth,
-            meta,
-            normalized_colmetadata,
+            tblmeta,
+            tblcolmetadata,
         )
         if !isassigned(schema)
             schema[] = Tables.schema(cols)
-            push!(
-                messages,
+            emit(
                 _flightdata_message(
                     ArrowParent.makeschemamsg(schema[], cols);
                     descriptor=descriptor,
@@ -62,8 +86,7 @@ function flightdata(
                 for (id, delock) in sort!(collect(dictencodings); by=x -> x.first, rev=true)
                     de = delock.value
                     dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                    push!(
-                        messages,
+                    emit(
                         _flightdata_message(
                             ArrowParent.makedictionarybatchmsg(
                                 dictsch,
@@ -80,8 +103,7 @@ function flightdata(
         elseif !isempty(cols.dictencodingdeltas)
             for de in cols.dictencodingdeltas
                 dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                push!(
-                    messages,
+                emit(
                     _flightdata_message(
                         ArrowParent.makedictionarybatchmsg(
                             dictsch,
@@ -95,8 +117,7 @@ function flightdata(
                 )
             end
         end
-        push!(
-            messages,
+        emit(
             _flightdata_message(
                 ArrowParent.makerecordbatchmsg(schema[], cols, alignment);
                 alignment=alignment,
@@ -104,5 +125,72 @@ function flightdata(
         )
         descriptor = nothing
     end
+    return nothing
+end
+
+function flightdata(
+    source;
+    descriptor::Union{Nothing,Protocol.FlightDescriptor}=nothing,
+    compress=nothing,
+    largelists::Bool=false,
+    denseunions::Bool=true,
+    dictencode::Bool=false,
+    dictencodenested::Bool=false,
+    alignment::Integer=DEFAULT_IPC_ALIGNMENT,
+    maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
+    metadata::Union{Nothing,Any}=nothing,
+    colmetadata::Union{Nothing,Any}=nothing,
+)
+    messages = Protocol.FlightData[]
+    _emitflightdata!(
+        message -> push!(messages, message),
+        source;
+        descriptor=descriptor,
+        compress=compress,
+        largelists=largelists,
+        denseunions=denseunions,
+        dictencode=dictencode,
+        dictencodenested=dictencodenested,
+        alignment=alignment,
+        maxdepth=maxdepth,
+        metadata=metadata,
+        colmetadata=colmetadata,
+    )
     return messages
+end
+
+function putflightdata!(
+    sink,
+    source;
+    close::Bool=false,
+    descriptor::Union{Nothing,Protocol.FlightDescriptor}=nothing,
+    compress=nothing,
+    largelists::Bool=false,
+    denseunions::Bool=true,
+    dictencode::Bool=false,
+    dictencodenested::Bool=false,
+    alignment::Integer=DEFAULT_IPC_ALIGNMENT,
+    maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
+    metadata::Union{Nothing,Any}=nothing,
+    colmetadata::Union{Nothing,Any}=nothing,
+)
+    try
+        _emitflightdata!(
+            message -> put!(sink, message),
+            source;
+            descriptor=descriptor,
+            compress=compress,
+            largelists=largelists,
+            denseunions=denseunions,
+            dictencode=dictencode,
+            dictencodenested=dictencodenested,
+            alignment=alignment,
+            maxdepth=maxdepth,
+            metadata=metadata,
+            colmetadata=colmetadata,
+        )
+    finally
+        close && Base.close(sink)
+    end
+    return sink
 end

@@ -438,12 +438,39 @@ struct TablePartitions
     npartitions::Int
 end
 
+Base.IteratorSize(::Type{TablePartitions}) = Base.HasLength()
+Base.length(tp::TablePartitions) = tp.npartitions
+
+_partitionarrays(col) = col isa ChainedVector ? col.arrays : _wrappedpartitionarrays(col)
+
+function _wrappedpartitionarrays(col)
+    if hasfield(typeof(col), :data)
+        data = getfield(col, :data)
+        data isa ChainedVector && return data.arrays
+    end
+    return nothing
+end
+
+_partitioncolumn(col, i::Int) =
+    col isa ChainedVector ? col.arrays[i] : _wrappedpartitioncolumn(col, i)
+
+function _wrappedpartitioncolumn(col, i::Int)
+    if hasfield(typeof(col), :data) && hasfield(typeof(col), :metadata)
+        data = getfield(col, :data)
+        if data isa ChainedVector
+            wrapper = getfield(parentmodule(typeof(col)), nameof(typeof(col)))
+            return wrapper(data.arrays[i], getfield(col, :metadata))
+        end
+    end
+    return col
+end
+
 function TablePartitions(table::Table)
     cols = columns(table)
     npartitions = if length(cols) == 0
         0
-    elseif cols[1] isa ChainedVector
-        length(cols[1].arrays)
+    elseif (arrays = _partitionarrays(cols[1])) !== nothing
+        length(arrays)
     else
         1
     end
@@ -454,7 +481,7 @@ function Base.iterate(tp::TablePartitions, i=1)
     i > tp.npartitions && return nothing
     tp.npartitions == 1 && return tp.table, i + 1
     cols = columns(tp.table)
-    newcols = AbstractVector[cols[j].arrays[i] for j = 1:length(cols)]
+    newcols = AbstractVector[_partitioncolumn(cols[j], i) for j = 1:length(cols)]
     nms = names(tp.table)
     tbl = Table(
         nms,

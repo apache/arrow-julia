@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
+using DataAPI
 using Tables
 using UUIDs
 
@@ -78,6 +79,50 @@ using UUIDs
     )
     @test isempty(empty_tbl.id)
     @test isempty(empty_tbl.label)
+
+    metadata_source = Tables.partitioner(((title=["red", "blue"],), (title=["green"],)))
+    metadata_messages = Arrow.Flight.flightdata(
+        metadata_source;
+        metadata=Dict("dataset" => "flight"),
+        colmetadata=Dict(:title => Dict("lang" => "en")),
+    )
+    metadata_schema_bytes = Arrow.Flight.schemaipc(first(metadata_messages))
+    metadata_info = Arrow.Flight.Protocol.FlightInfo(
+        metadata_schema_bytes[5:end],
+        nothing,
+        Arrow.Flight.Protocol.FlightEndpoint[],
+        Int64(-1),
+        Int64(-1),
+        false,
+        UInt8[],
+    )
+    metadata_batches =
+        collect(Arrow.Flight.stream(metadata_messages[2:end]; schema=metadata_info))
+    metadata_table = Arrow.Flight.table(metadata_messages[2:end]; schema=metadata_info)
+
+    @test length(metadata_batches) == 2
+    @test DataAPI.metadata(metadata_batches[1], "dataset") == "flight"
+    @test DataAPI.colmetadata(metadata_batches[1], :title, "lang") == "en"
+    @test DataAPI.metadata(metadata_batches[2], "dataset") == "flight"
+    @test DataAPI.colmetadata(metadata_batches[2], :title, "lang") == "en"
+    @test metadata_table.title == ["red", "blue", "green"]
+    @test DataAPI.metadata(metadata_table, "dataset") == "flight"
+    @test DataAPI.colmetadata(metadata_table, :title, "lang") == "en"
+    metadata_parts = collect(Tables.partitions(metadata_table))
+    @test length(metadata_parts) == 2
+    @test metadata_parts[1].title == ["red", "blue"]
+    @test metadata_parts[2].title == ["green"]
+    @test DataAPI.colmetadata(metadata_parts[1], :title, "lang") == "en"
+
+    reemitted_channel = Channel{Arrow.Flight.Protocol.FlightData}(8)
+    reemit_task =
+        @async Arrow.Flight.putflightdata!(reemitted_channel, metadata_table; close=true)
+    reemitted_messages = collect(reemitted_channel)
+    wait(reemit_task)
+    reemitted_table = Arrow.Flight.table(reemitted_messages)
+    @test reemitted_table.title == metadata_table.title
+    @test DataAPI.metadata(reemitted_table, "dataset") == "flight"
+    @test DataAPI.colmetadata(reemitted_table, :title, "lang") == "en"
 
     extension_source = (
         uuid=[UUID(UInt128(1)), UUID(UInt128(2))],

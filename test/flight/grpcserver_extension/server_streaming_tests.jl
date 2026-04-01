@@ -32,8 +32,10 @@ function grpcserver_extension_test_server_streaming(grpcserver, service, fixture
     )
     @test doget_closed[]
     @test length(doget_messages) == length(fixture.messages)
-    @test Arrow.Flight.table(doget_messages; schema=fixture.info).name ==
-          ["one", "two", "three"]
+    doget_table = Arrow.Flight.table(doget_messages; schema=fixture.info)
+    @test doget_table.name == ["one", "two", "three"]
+    @test Arrow.getmetadata(doget_table)["dataset"] == "native"
+    @test Arrow.getmetadata(doget_table.name)["lang"] == "en"
 
     doget_any_messages = Any[]
     doget_any_closed = Ref(false)

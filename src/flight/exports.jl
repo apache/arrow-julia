@@ -43,4 +43,5 @@ export Client,
     streambytes,
     stream,
     table,
-    flightdata
+    flightdata,
+    putflightdata!

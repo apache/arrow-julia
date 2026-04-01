@@ -72,6 +72,11 @@ function grpcserver_extension_test_bidi_streaming(grpcserver, service, fixture, 
     )
     @test doexchange_closed[]
     @test length(doexchange_messages) == length(fixture.exchange_messages)
+    doexchange_table = Arrow.Flight.table(doexchange_messages)
+    @test doexchange_table.id == [10]
+    @test doexchange_table.name == ["ten"]
+    @test Arrow.getmetadata(doexchange_table)["dataset"] == "exchange"
+    @test Arrow.getmetadata(doexchange_table.name)["lang"] == "exchange"
 
     failing_service = Arrow.Flight.Service(
         doexchange=(ctx, request, response) ->
