@@ -56,6 +56,10 @@ module EnumRoundtripModule
 @enum RankingStrategy lexical=1 semantic=2 hybrid=3
 end
 
+module WideEnumRoundtripModule
+@enum WideRanking::UInt64 tiny=1 colossal=0xffffffffffffffff
+end
+
 @testset ExtendedTestSet "Arrow" begin
     @testset "table roundtrips" begin
         for case in testtables
@@ -494,6 +498,51 @@ end
                 "Main.EnumRoundtripModule.RankingStrategy",
                 Arrow.getmetadata(tt.col1)["ARROW:extension:metadata"],
             )
+        end
+
+        @testset "# Julia Enum extension contract edge cases" begin
+            t = (
+                col=[WideEnumRoundtripModule.tiny, WideEnumRoundtripModule.colossal],
+                nullable=Union{Missing,WideEnumRoundtripModule.WideRanking}[
+                    missing,
+                    WideEnumRoundtripModule.colossal,
+                ],
+            )
+            bytes = read(Arrow.tobuffer(t))
+            tt = Arrow.Table(IOBuffer(bytes))
+            raw = Arrow.Table(IOBuffer(bytes); convert=false)
+
+            @test eltype(tt.col) == WideEnumRoundtripModule.WideRanking
+            @test eltype(tt.nullable) == Union{Missing,WideEnumRoundtripModule.WideRanking}
+            @test tt.col == [WideEnumRoundtripModule.tiny, WideEnumRoundtripModule.colossal]
+            @test isequal(
+                tt.nullable,
+                Union{Missing,WideEnumRoundtripModule.WideRanking}[
+                    missing,
+                    WideEnumRoundtripModule.colossal,
+                ],
+            )
+            @test eltype(raw.col) == UInt64
+            @test eltype(raw.nullable) == Union{Missing,UInt64}
+            @test raw.col == UInt64[1, typemax(UInt64)]
+            @test isequal(raw.nullable, Union{Missing,UInt64}[missing, typemax(UInt64)])
+
+            mismatch_metadata = "type=Main.WideEnumRoundtripModule.WideRanking;labels=tiny:1,colossal:2"
+            @test_logs (:warn, r"unsupported ARROW:extension:name type: \"JuliaLang.Enum\"") begin
+                mismatch_tt = Arrow.Table(
+                    Arrow.tobuffer(
+                        (col=UInt64[1, typemax(UInt64)],);
+                        colmetadata=Dict(
+                            :col => Dict(
+                                "ARROW:extension:name" => "JuliaLang.Enum",
+                                "ARROW:extension:metadata" => mismatch_metadata,
+                            ),
+                        ),
+                    ),
+                )
+                @test eltype(mismatch_tt.col) == UInt64
+                @test copy(mismatch_tt.col) == UInt64[1, typemax(UInt64)]
+            end
         end
 
         @testset "# 76" begin

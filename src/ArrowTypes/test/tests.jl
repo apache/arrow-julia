@@ -26,10 +26,17 @@ module EnumTestModule
 @enum RankingStrategy lexical=1 semantic=2 hybrid=3
 end
 
+module WideEnumTestModule
+@enum WideRanking::UInt64 small=1 colossal=0xffffffffffffffff
+end
+
 const RankingStrategy = EnumTestModule.RankingStrategy
 const lexical = EnumTestModule.lexical
 const semantic = EnumTestModule.semantic
 const hybrid = EnumTestModule.hybrid
+const WideRanking = WideEnumTestModule.WideRanking
+const small = WideEnumTestModule.small
+const colossal = WideEnumTestModule.colossal
 
 @testset "ArrowTypes" begin
     @test ArrowTypes.ArrowKind(MyInt) == ArrowTypes.PrimitiveKind()
@@ -85,8 +92,34 @@ const hybrid = EnumTestModule.hybrid
     @test occursin("labels=lexical:1,semantic:2,hybrid:3", enum_metadata)
     @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM), Int32, enum_metadata) ==
           RankingStrategy
+    reordered_enum_metadata = "type=Main.EnumTestModule.RankingStrategy;labels=semantic:2,hybrid:3,lexical:1"
+    mismatched_enum_metadata = "type=Main.EnumTestModule.RankingStrategy;labels=lexical:1,semantic:2,hybrid:4"
+    malformed_enum_metadata = "type=Main.EnumTestModule.RankingStrategy;labels=lexical:1,semantic:nope"
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM), Int32, reordered_enum_metadata) ==
+          RankingStrategy
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM), Int32, mismatched_enum_metadata) ===
+          nothing
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM), Int32, malformed_enum_metadata) ===
+          nothing
+    @test ArrowTypes.JuliaType(
+        Val(ArrowTypes.ENUM),
+        Int32,
+        "type=Main.EnumTestModule.RankingStrategy",
+    ) === nothing
     @test ArrowTypes.fromarrow(RankingStrategy, Int32(2)) == semantic
     @test ArrowTypes.default(RankingStrategy) == lexical
+
+    wide_enum_metadata = ArrowTypes.arrowmetadata(WideRanking)
+    @test ArrowTypes.ArrowKind(WideRanking) == ArrowTypes.PrimitiveKind()
+    @test ArrowTypes.ArrowType(WideRanking) == UInt64
+    @test ArrowTypes.toarrow(colossal) == typemax(UInt64)
+    @test ArrowTypes.arrowname(WideRanking) == ArrowTypes.ENUM
+    @test occursin("type=Main.WideEnumTestModule.WideRanking", wide_enum_metadata)
+    @test occursin("labels=small:1,colossal:18446744073709551615", wide_enum_metadata)
+    @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM), UInt64, wide_enum_metadata) ==
+          WideRanking
+    @test ArrowTypes.fromarrow(WideRanking, typemax(UInt64)) == colossal
+    @test ArrowTypes.default(WideRanking) == small
 
     @test ArrowTypes.ArrowKind(Bool) == ArrowTypes.BoolKind()
 

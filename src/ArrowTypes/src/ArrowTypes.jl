@@ -214,7 +214,7 @@ JuliaType(::Val{CHAR}) = Char
 fromarrow(::Type{Char}, x::UInt32) = Char(x)
 
 ArrowType(::Type{T}) where {T<:Enum} = Base.Enums.basetype(T)
-toarrow(x::T) where {T<:Enum} = convert(Base.Enums.basetype(T), Int(x))
+toarrow(x::T) where {T<:Enum} = Base.Enums.basetype(T)(x)
 const ENUM = Symbol("JuliaLang.Enum")
 arrowname(::Type{T}) where {T<:Enum} = ENUM
 
@@ -225,10 +225,35 @@ end
 
 function _enum_labels(::Type{T}) where {T<:Enum}
     B = Base.Enums.basetype(T)
-    return join(
-        (string(instance, ":", convert(B, Int(instance))) for instance in instances(T)),
-        ",",
-    )
+    return join((string(instance, ":", B(instance)) for instance in instances(T)), ",")
+end
+
+function _parseenumlabels(labels::AbstractString, ::Type{B}) where {B<:Integer}
+    pairs = Pair{String,B}[]
+    isempty(labels) && return pairs
+    for entry in split(labels, ',')
+        isempty(entry) && return nothing
+        delimiter = findfirst(==(':'), entry)
+        delimiter === nothing && return nothing
+        label = entry[1:prevind(entry, delimiter)]
+        value = entry[nextind(entry, delimiter):end]
+        isempty(label) && return nothing
+        parsed = tryparse(B, value)
+        parsed === nothing && return nothing
+        push!(pairs, label => parsed)
+    end
+    return pairs
+end
+
+function _enumlabelsmatch(::Type{T}, labels::AbstractString) where {T<:Enum}
+    B = Base.Enums.basetype(T)
+    parsed = _parseenumlabels(labels, B)
+    parsed === nothing && return false
+    expected = [string(instance) => B(instance) for instance in instances(T)]
+    length(parsed) == length(expected) || return false
+    parsed_dict = Dict(parsed)
+    length(parsed_dict) == length(parsed) || return false
+    return parsed_dict == Dict(expected)
 end
 
 function arrowmetadata(::Type{T}) where {T<:Enum}
@@ -281,11 +306,13 @@ end
 function JuliaType(::Val{ENUM}, S, metadata::String)
     parsed = _parsemetadata(metadata)
     haskey(parsed, "type") || return nothing
+    haskey(parsed, "labels") || return nothing
     T = _resolvequalifiedtype(parsed["type"])
     T isa DataType || return nothing
     T <: Enum || return nothing
     storage_type = Base.nonmissingtype(S)
     Base.Enums.basetype(T) === storage_type || return nothing
+    _enumlabelsmatch(T, parsed["labels"]) || return nothing
     return T
 end
 

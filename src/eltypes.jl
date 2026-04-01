@@ -32,13 +32,6 @@ const PARQUET_VARIANT_SYMBOL = Symbol("arrow.parquet.variant")
 const FIXED_SHAPE_TENSOR_SYMBOL = Symbol("arrow.fixed_shape_tensor")
 const VARIABLE_SHAPE_TENSOR_SYMBOL = Symbol("arrow.variable_shape_tensor")
 
-_builtinextensionspec(::Type{ArrowTypes.UUID}) =
-    ExtensionTypeSpec(ArrowTypes.UUIDSYMBOL, "")
-_builtinextensionjuliatype(::Val{ArrowTypes.UUIDSYMBOL}, S, metadata::String) =
-    ArrowTypes.UUID
-_builtinextensionjuliatype(::Val{ArrowTypes.LEGACY_UUIDSYMBOL}, S, metadata::String) =
-    ArrowTypes.UUID
-
 @inline _canonicalextensionerror(sym::Symbol, msg::AbstractString) =
     throw(ArgumentError("invalid canonical $(String(sym)) extension: $msg"))
 
@@ -339,8 +332,6 @@ ArrowTypes.arrowname(::Type{Bool8}) = BOOL8_SYMBOL
 ArrowTypes.JuliaType(::Val{BOOL8_SYMBOL}, ::Type{Int8}, metadata::String) = Bool8
 ArrowTypes.fromarrow(::Type{Bool8}, x::Int8) = Bool8(x)
 ArrowTypes.default(::Type{Bool8}) = zero(Bool8)
-_builtinextensionspec(::Type{Bool8}) = ExtensionTypeSpec(BOOL8_SYMBOL, "")
-_builtinextensionjuliatype(::Val{BOOL8_SYMBOL}, ::Type{Int8}, metadata::String) = Bool8
 
 function writearray(
     io::IO,
@@ -374,22 +365,11 @@ ArrowTypes.fromarrow(::Type{JSONText{String}}, ptr::Ptr{UInt8}, len::Int) =
 ArrowTypes.fromarrow(::Type{JSONText{S}}, x::S) where {S<:AbstractString} = JSONText{S}(x)
 ArrowTypes.default(::Type{JSONText{S}}) where {S<:AbstractString} =
     JSONText{S}(ArrowTypes.default(S))
-_builtinextensionspec(::Type{JSONText{S}}) where {S<:AbstractString} =
-    ExtensionTypeSpec(JSON_SYMBOL, "")
-_builtinextensionjuliatype(
-    ::Val{JSON_SYMBOL},
-    ::Type{S},
-    metadata::String,
-) where {S<:AbstractString} = JSONText{S}
 
 ArrowTypes.JuliaType(::Val{OPAQUE_SYMBOL}, S, metadata::String) = S
 ArrowTypes.JuliaType(::Val{PARQUET_VARIANT_SYMBOL}, S, metadata::String) = S
 ArrowTypes.JuliaType(::Val{FIXED_SHAPE_TENSOR_SYMBOL}, S, metadata::String) = S
 ArrowTypes.JuliaType(::Val{VARIABLE_SHAPE_TENSOR_SYMBOL}, S, metadata::String) = S
-_builtinextensionjuliatype(::Val{OPAQUE_SYMBOL}, S, metadata::String) = S
-_builtinextensionjuliatype(::Val{PARQUET_VARIANT_SYMBOL}, S, metadata::String) = S
-_builtinextensionjuliatype(::Val{FIXED_SHAPE_TENSOR_SYMBOL}, S, metadata::String) = S
-_builtinextensionjuliatype(::Val{VARIABLE_SHAPE_TENSOR_SYMBOL}, S, metadata::String) = S
 
 @inline function _jsonstringliteral(x::AbstractString)
     return '"' * escape_string(x) * '"'
@@ -700,8 +680,6 @@ ArrowTypes.JuliaType(::Val{ZONEDDATETIME_SYMBOL}, S) = ZonedDateTime
 ArrowTypes.fromarrow(::Type{ZonedDateTime}, x::Timestamp) = convert(ZonedDateTime, x)
 ArrowTypes.default(::Type{TimeZones.ZonedDateTime}) =
     TimeZones.ZonedDateTime(1, 1, 1, 1, 1, 1, TimeZones.tz"UTC")
-_builtinextensionspec(::Type{ZonedDateTime}) = ExtensionTypeSpec(ZONEDDATETIME_SYMBOL, "")
-_builtinextensionjuliatype(::Val{ZONEDDATETIME_SYMBOL}, S, metadata::String) = ZonedDateTime
 
 const TIMESTAMP_WITH_OFFSET_SYMBOL = Symbol("arrow.timestamp_with_offset")
 ArrowTypes.arrowname(::Type{TimestampWithOffset{U}}) where {U} =
@@ -724,21 +702,12 @@ ArrowTypes.fromarrowstruct(
     offset_minutes::Int16,
     timestamp::Timestamp{U,:UTC},
 ) where {U} = TimestampWithOffset{U}(timestamp, offset_minutes)
-_builtinextensionspec(::Type{TimestampWithOffset{U}}) where {U} =
-    ExtensionTypeSpec(TIMESTAMP_WITH_OFFSET_SYMBOL, "")
-_builtinextensionjuliatype(
-    ::Val{TIMESTAMP_WITH_OFFSET_SYMBOL},
-    ::Type{NamedTuple{(:timestamp, :offset_minutes),Tuple{Timestamp{U,:UTC},Int16}}},
-    metadata::String,
-) where {U} = TimestampWithOffset{U}
 
 # Backwards compatibility: older versions of Arrow saved ZonedDateTime's with this metdata:
 const OLD_ZONEDDATETIME_SYMBOL = Symbol("JuliaLang.ZonedDateTime")
 # and stored the local time instead of the UTC time.
 struct LocalZonedDateTime end
 ArrowTypes.JuliaType(::Val{OLD_ZONEDDATETIME_SYMBOL}, S) = LocalZonedDateTime
-_builtinextensionjuliatype(::Val{OLD_ZONEDDATETIME_SYMBOL}, S, metadata::String) =
-    LocalZonedDateTime
 function ArrowTypes.fromarrow(::Type{LocalZonedDateTime}, x::Timestamp{U,TZ}) where {U,TZ}
     (U === Meta.TimeUnit.MICROSECOND || U == Meta.TimeUnit.NANOSECOND) &&
         warntimestamp(U, ZonedDateTime)
