@@ -68,6 +68,86 @@ function doput(
     return req, request, response
 end
 
+function doput(
+    client::Client,
+    source,
+    response::Channel{Protocol.PutResult};
+    request_capacity::Integer=DEFAULT_STREAM_BUFFER,
+    headers::AbstractVector{<:Pair}=HeaderPair[],
+    descriptor::Union{Nothing,Protocol.FlightDescriptor}=nothing,
+    compress=nothing,
+    largelists::Bool=false,
+    denseunions::Bool=true,
+    dictencode::Bool=false,
+    dictencodenested::Bool=false,
+    alignment::Integer=DEFAULT_IPC_ALIGNMENT,
+    maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
+    metadata::Union{Nothing,Any}=nothing,
+    colmetadata::Union{Nothing,Any}=nothing,
+    kwargs...,
+)
+    request = Channel{Protocol.FlightData}(request_capacity)
+    grpc_request = doput(client, request, response; headers=headers, kwargs...)
+    producer = errormonitor(
+        Threads.@spawn putflightdata!(
+            request,
+            source;
+            close=true,
+            descriptor=descriptor,
+            compress=compress,
+            largelists=largelists,
+            denseunions=denseunions,
+            dictencode=dictencode,
+            dictencodenested=dictencodenested,
+            alignment=alignment,
+            maxdepth=maxdepth,
+            metadata=metadata,
+            colmetadata=colmetadata,
+        )
+    )
+    return FlightAsyncRequest(grpc_request, producer)
+end
+
+function doput(
+    client::Client,
+    source;
+    request_capacity::Integer=DEFAULT_STREAM_BUFFER,
+    response_capacity::Integer=DEFAULT_STREAM_BUFFER,
+    headers::AbstractVector{<:Pair}=HeaderPair[],
+    descriptor::Union{Nothing,Protocol.FlightDescriptor}=nothing,
+    compress=nothing,
+    largelists::Bool=false,
+    denseunions::Bool=true,
+    dictencode::Bool=false,
+    dictencodenested::Bool=false,
+    alignment::Integer=DEFAULT_IPC_ALIGNMENT,
+    maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
+    metadata::Union{Nothing,Any}=nothing,
+    colmetadata::Union{Nothing,Any}=nothing,
+    kwargs...,
+)
+    response = Channel{Protocol.PutResult}(response_capacity)
+    req = doput(
+        client,
+        source,
+        response;
+        request_capacity=request_capacity,
+        headers=headers,
+        descriptor=descriptor,
+        compress=compress,
+        largelists=largelists,
+        denseunions=denseunions,
+        dictencode=dictencode,
+        dictencodenested=dictencodenested,
+        alignment=alignment,
+        maxdepth=maxdepth,
+        metadata=metadata,
+        colmetadata=colmetadata,
+        kwargs...,
+    )
+    return req, response
+end
+
 doexchange(
     client::Client,
     request::Channel{Protocol.FlightData},
@@ -93,4 +173,84 @@ function doexchange(
     response = Channel{Protocol.FlightData}(response_capacity)
     req = doexchange(client, request, response; headers=headers, kwargs...)
     return req, request, response
+end
+
+function doexchange(
+    client::Client,
+    source,
+    response::Channel{Protocol.FlightData};
+    request_capacity::Integer=DEFAULT_STREAM_BUFFER,
+    headers::AbstractVector{<:Pair}=HeaderPair[],
+    descriptor::Union{Nothing,Protocol.FlightDescriptor}=nothing,
+    compress=nothing,
+    largelists::Bool=false,
+    denseunions::Bool=true,
+    dictencode::Bool=false,
+    dictencodenested::Bool=false,
+    alignment::Integer=DEFAULT_IPC_ALIGNMENT,
+    maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
+    metadata::Union{Nothing,Any}=nothing,
+    colmetadata::Union{Nothing,Any}=nothing,
+    kwargs...,
+)
+    request = Channel{Protocol.FlightData}(request_capacity)
+    grpc_request = doexchange(client, request, response; headers=headers, kwargs...)
+    producer = errormonitor(
+        Threads.@spawn putflightdata!(
+            request,
+            source;
+            close=true,
+            descriptor=descriptor,
+            compress=compress,
+            largelists=largelists,
+            denseunions=denseunions,
+            dictencode=dictencode,
+            dictencodenested=dictencodenested,
+            alignment=alignment,
+            maxdepth=maxdepth,
+            metadata=metadata,
+            colmetadata=colmetadata,
+        )
+    )
+    return FlightAsyncRequest(grpc_request, producer)
+end
+
+function doexchange(
+    client::Client,
+    source;
+    request_capacity::Integer=DEFAULT_STREAM_BUFFER,
+    response_capacity::Integer=DEFAULT_STREAM_BUFFER,
+    headers::AbstractVector{<:Pair}=HeaderPair[],
+    descriptor::Union{Nothing,Protocol.FlightDescriptor}=nothing,
+    compress=nothing,
+    largelists::Bool=false,
+    denseunions::Bool=true,
+    dictencode::Bool=false,
+    dictencodenested::Bool=false,
+    alignment::Integer=DEFAULT_IPC_ALIGNMENT,
+    maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
+    metadata::Union{Nothing,Any}=nothing,
+    colmetadata::Union{Nothing,Any}=nothing,
+    kwargs...,
+)
+    response = Channel{Protocol.FlightData}(response_capacity)
+    req = doexchange(
+        client,
+        source,
+        response;
+        request_capacity=request_capacity,
+        headers=headers,
+        descriptor=descriptor,
+        compress=compress,
+        largelists=largelists,
+        denseunions=denseunions,
+        dictencode=dictencode,
+        dictencodenested=dictencodenested,
+        alignment=alignment,
+        maxdepth=maxdepth,
+        metadata=metadata,
+        colmetadata=colmetadata,
+        kwargs...,
+    )
+    return req, response
 end

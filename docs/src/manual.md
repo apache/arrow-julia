@@ -245,6 +245,12 @@ Arrow.jl provides a convenient accessor for this metadata via [`Arrow.getmetadat
 
 To attach custom schema/column metadata to Arrow tables at serialization time, see the `metadata` and `colmetadata` keyword arguments to [`Arrow.write`](@ref).
 
+For lightweight overlays on existing Tables.jl sources, Arrow.jl also provides
+`Arrow.withmetadata(table_like; metadata=..., colmetadata=...)`. This keeps any
+existing schema/field metadata already exposed by the source, overlays new
+entries on top, and returns a wrapper that can be passed directly to
+[`Arrow.write`](@ref), `Arrow.tobuffer`, or the Flight IPC helpers.
+
 ## Writing arrow data
 
 Ok, so that's a pretty good rundown of *reading* arrow data, but how do you *produce* arrow data? Enter `Arrow.write`.

@@ -119,6 +119,32 @@ function _grpc_async_request(
     end
 end
 
+struct FlightAsyncRequest{R}
+    request::R
+    producer::Union{Nothing,Task}
+end
+
+function Base.wait(req::FlightAsyncRequest)
+    producer = getfield(req, :producer)
+    isnothing(producer) || wait(producer)
+    return wait(getfield(req, :request))
+end
+
+function gRPCClient.grpc_async_await(req::FlightAsyncRequest)
+    producer = getfield(req, :producer)
+    isnothing(producer) || wait(producer)
+    return gRPCClient.grpc_async_await(getfield(req, :request))
+end
+
+function gRPCClient.grpc_async_await(
+    client::gRPCClient.gRPCServiceClient{TRequest,true,TResponse,false},
+    req::FlightAsyncRequest,
+) where {TRequest<:Any,TResponse<:Any}
+    producer = getfield(req, :producer)
+    isnothing(producer) || wait(producer)
+    return gRPCClient.grpc_async_await(client, getfield(req, :request))
+end
+
 _default_rpc_options(client::Client) = (
     secure=client.secure,
     grpc=client.grpc,

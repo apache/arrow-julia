@@ -112,7 +112,31 @@ using UUIDs
     @test length(metadata_parts) == 2
     @test metadata_parts[1].title == ["red", "blue"]
     @test metadata_parts[2].title == ["green"]
+    @test DataAPI.metadata(metadata_parts[1], "dataset") == "flight"
     @test DataAPI.colmetadata(metadata_parts[1], :title, "lang") == "en"
+    @test DataAPI.metadata(metadata_parts[2], "dataset") == "flight"
+    @test DataAPI.colmetadata(metadata_parts[2], :title, "lang") == "en"
+
+    app_metadata_messages = [
+        index == 1 ? message :
+        Arrow.Flight.Protocol.FlightData(
+            message.flight_descriptor,
+            message.data_header,
+            Vector{UInt8}(codeunits("batch:$(index - 2)")),
+            message.data_body,
+        ) for (index, message) in enumerate(metadata_messages)
+    ]
+    metadata_batches_with_app =
+        collect(Arrow.Flight.stream(app_metadata_messages; include_app_metadata=true))
+    metadata_table_with_app =
+        Arrow.Flight.table(app_metadata_messages; include_app_metadata=true)
+    @test length(metadata_batches_with_app) == 2
+    @test metadata_batches_with_app[1].table.title == ["red", "blue"]
+    @test metadata_batches_with_app[2].table.title == ["green"]
+    @test String(metadata_batches_with_app[1].app_metadata) == "batch:0"
+    @test String(metadata_batches_with_app[2].app_metadata) == "batch:1"
+    @test metadata_table_with_app.table.title == ["red", "blue", "green"]
+    @test String.(metadata_table_with_app.app_metadata) == ["batch:0", "batch:1"]
 
     reemitted_channel = Channel{Arrow.Flight.Protocol.FlightData}(8)
     reemit_task =

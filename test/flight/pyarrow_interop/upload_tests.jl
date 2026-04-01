@@ -20,15 +20,17 @@ function pyarrow_interop_test_upload(client, upload_descriptor)
         (id=Int64[10, 11], name=["ten", "eleven"]),
         (id=Int64[12], name=["twelve"]),
     ))
-    upload_messages = Arrow.Flight.flightdata(upload_source; descriptor=upload_descriptor)
-
-    doput_req, doput_request, doput_response = Arrow.Flight.doput(client)
-    put_results = pyarrow_interop_send_messages(
-        doput_req,
-        doput_request,
-        doput_response,
-        upload_messages,
+    upload_metadata = Dict("dataset" => "interop-upload")
+    upload_colmetadata = Dict(:name => Dict("lang" => "en"))
+    doput_req, doput_response = Arrow.Flight.doput(
+        client,
+        upload_source;
+        descriptor=upload_descriptor,
+        metadata=upload_metadata,
+        colmetadata=upload_colmetadata,
     )
+    put_results = collect(doput_response)
+    gRPCClient.grpc_async_await(doput_req)
 
     @test !isempty(put_results)
     @test String(put_results[end].app_metadata) == "stored"
@@ -41,4 +43,6 @@ function pyarrow_interop_test_upload(client, upload_descriptor)
     uploaded_table = Arrow.Flight.table(uploaded_messages; schema=uploaded_info)
     @test uploaded_table.id == [10, 11, 12]
     @test uploaded_table.name == ["ten", "eleven", "twelve"]
+    @test DataAPI.metadata(uploaded_table, "dataset") == "interop-upload"
+    @test DataAPI.colmetadata(uploaded_table, :name, "lang") == "en"
 end

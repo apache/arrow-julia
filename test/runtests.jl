@@ -248,6 +248,26 @@ end
             @test Arrow.getmetadata(tt.col2)["colkey1"] == "colvalue1"
             @test Arrow.getmetadata(tt.col2)["colkey2"] == "colvalue2"
             @test Arrow.getmetadata(tt.col3)["colkey3"] == "colvalue3"
+
+            source = Arrow.withmetadata(
+                (col1=collect(1:3), col2=["a", "b", "c"]);
+                metadata=["source" => "base"],
+                colmetadata=Dict(:col1 => ["semantic.role" => "left"]),
+            )
+            overlay = Arrow.withmetadata(
+                source;
+                metadata=["overlay" => "yes"],
+                colmetadata=Dict(
+                    :col1 => ["unit" => "count"],
+                    :col2 => ["semantic.role" => "right"],
+                ),
+            )
+            overlay_tt = Arrow.Table(Arrow.tobuffer(overlay))
+            @test Arrow.getmetadata(overlay_tt)["source"] == "base"
+            @test Arrow.getmetadata(overlay_tt)["overlay"] == "yes"
+            @test Arrow.getmetadata(overlay_tt.col1)["semantic.role"] == "left"
+            @test Arrow.getmetadata(overlay_tt.col1)["unit"] == "count"
+            @test Arrow.getmetadata(overlay_tt.col2)["semantic.role"] == "right"
         end
 
         @testset "# custom compressors" begin

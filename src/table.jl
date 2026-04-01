@@ -433,6 +433,24 @@ Tables.columnnames(t::Table) = names(t)
 Tables.getcolumn(t::Table, i::Int) = columns(t)[i]
 Tables.getcolumn(t::Table, nm::Symbol) = lookup(t)[nm]
 
+struct MetadataVector{T,A<:AbstractVector{T},M} <: AbstractVector{T}
+    data::A
+    metadata::M
+end
+
+Base.IndexStyle(::Type{<:MetadataVector}) = Base.IndexLinear()
+Base.size(x::MetadataVector) = size(x.data)
+Base.axes(x::MetadataVector) = axes(x.data)
+Base.length(x::MetadataVector) = length(x.data)
+Base.getindex(x::MetadataVector, i::Int) = getindex(x.data, i)
+Base.iterate(x::MetadataVector) = iterate(x.data)
+Base.iterate(x::MetadataVector, state) = iterate(x.data, state)
+getmetadata(x::MetadataVector) = x.metadata
+
+_metadatavectordata(x::MetadataVector) = x.data
+_metadatavectordata(x) = x
+_wrapmetadata(data, metadata) = metadata === nothing ? data : MetadataVector(data, metadata)
+
 struct TablePartitions
     table::Table
     npartitions::Int
@@ -440,6 +458,11 @@ end
 
 Base.IteratorSize(::Type{TablePartitions}) = Base.HasLength()
 Base.length(tp::TablePartitions) = tp.npartitions
+
+function _partitionarrays(col::MetadataVector)
+    data = getfield(col, :data)
+    return data isa ChainedVector ? data.arrays : nothing
+end
 
 _partitionarrays(col) = col isa ChainedVector ? col.arrays : _wrappedpartitionarrays(col)
 
@@ -450,6 +473,9 @@ function _wrappedpartitionarrays(col)
     end
     return nothing
 end
+
+_partitioncolumn(col::MetadataVector, i::Int) =
+    MetadataVector(getfield(col, :data).arrays[i], getfield(col, :metadata))
 
 _partitioncolumn(col, i::Int) =
     col isa ChainedVector ? col.arrays[i] : _wrappedpartitioncolumn(col, i)

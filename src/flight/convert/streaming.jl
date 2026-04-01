@@ -32,19 +32,9 @@ mutable struct FlightStream{M}
     convert::Bool
 end
 
-struct FlightMetadataVector{T,A<:AbstractVector{T}} <: AbstractVector{T}
-    data::A
-    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
+struct FlightStreamWithAppMetadata{S}
+    stream::S
 end
-
-Base.IndexStyle(::Type{<:FlightMetadataVector}) = Base.IndexLinear()
-Base.size(x::FlightMetadataVector) = size(x.data)
-Base.axes(x::FlightMetadataVector) = axes(x.data)
-Base.length(x::FlightMetadataVector) = length(x.data)
-Base.getindex(x::FlightMetadataVector, i::Int) = getindex(x.data, i)
-Base.iterate(x::FlightMetadataVector) = iterate(x.data)
-Base.iterate(x::FlightMetadataVector, state) = iterate(x.data, state)
-ArrowParent.getmetadata(x::FlightMetadataVector) = x.metadata
 
 function FlightStream(messages; schema=nothing, convert::Bool=true)
     x = FlightStream(
@@ -68,7 +58,12 @@ Base.IteratorSize(::Type{<:FlightStream}) = Base.SizeUnknown()
 Base.eltype(::Type{<:FlightStream}) = ArrowParent.Table
 Base.isdone(x::FlightStream) = x.exhausted
 
+Base.IteratorSize(::Type{<:FlightStreamWithAppMetadata}) = Base.SizeUnknown()
+Base.eltype(::Type{<:FlightStreamWithAppMetadata}) =
+    NamedTuple{(:table, :app_metadata),Tuple{ArrowParent.Table,Vector{UInt8}}}
+
 Tables.partitions(x::FlightStream) = x
+Tables.partitions(x::FlightStreamWithAppMetadata) = x
 
 function Tables.columnnames(x::FlightStream)
     _ensure_schema!(x)
@@ -86,6 +81,14 @@ end
 
 function Base.iterate(x::FlightStream, ::Nothing)
     return _iterate_flight_stream!(x)
+end
+
+function Base.iterate(x::FlightStreamWithAppMetadata)
+    return _iterate_flight_stream!(x.stream; include_app_metadata=true)
+end
+
+function Base.iterate(x::FlightStreamWithAppMetadata, ::Nothing)
+    return _iterate_flight_stream!(x.stream; include_app_metadata=true)
 end
 
 function _missing_schema_message()
@@ -278,14 +281,24 @@ function _copy_flight_table(batch::ArrowParent.Table)
     return ArrowParent.Table(names, types, columns, lookup, Ref(schema))
 end
 
-_flightcolumndata(col::FlightMetadataVector) = col.data
-_flightcolumndata(col) = col
+_copy_app_metadata(message::Protocol.FlightData) = copy(message.app_metadata)
+
+function _flight_batch_result(
+    table::ArrowParent.Table,
+    message::Protocol.FlightData;
+    include_app_metadata::Bool,
+)
+    include_app_metadata || return table
+    return (table=table, app_metadata=_copy_app_metadata(message))
+end
+
+_flightcolumndata(col) = ArrowParent._metadatavectordata(col)
 
 function _chain_flight_column(col, batch_col)
     metadata = ArrowParent.getmetadata(col)
     chained =
         ArrowParent.ChainedVector([_flightcolumndata(col), _flightcolumndata(batch_col)])
-    return metadata === nothing ? chained : FlightMetadataVector(chained, metadata)
+    return ArrowParent._wrapmetadata(chained, metadata)
 end
 
 function _append_flight_column!(col, batch_col)
@@ -316,25 +329,39 @@ function _append_flight_batch!(
     return table
 end
 
-function _materialize_flight_table(messages; schema=nothing, convert::Bool=true)
+function _materialize_flight_table(
+    messages;
+    schema=nothing,
+    convert::Bool=true,
+    include_app_metadata::Bool=false,
+)
     stream_state = FlightStream(messages; schema=schema, convert=convert)
-    state = iterate(stream_state)
-    state === nothing && return _empty_flight_table(stream_state)
-    table, next_state = state
-    next = iterate(stream_state, next_state)
-    next === nothing && return table
-    out = _copy_flight_table(table)
-    batchindex = 2
-    while next !== nothing
-        batch, next_state = next
-        _append_flight_batch!(out, batch, batchindex)
-        batchindex += 1
-        next = iterate(stream_state, next_state)
+    state = _iterate_flight_stream!(stream_state; include_app_metadata=include_app_metadata)
+    if state === nothing
+        empty_table = _empty_flight_table(stream_state)
+        return include_app_metadata ? (table=empty_table, app_metadata=Vector{UInt8}[]) :
+               empty_table
     end
-    return out
+    first_value, _ = state
+    first_table = include_app_metadata ? first_value.table : first_value
+    out = _copy_flight_table(first_table)
+    batch_app_metadata =
+        include_app_metadata ? Vector{Vector{UInt8}}([first_value.app_metadata]) : nothing
+    batchindex = 2
+    while true
+        next =
+            _iterate_flight_stream!(stream_state; include_app_metadata=include_app_metadata)
+        next === nothing && break
+        batch_value, _ = next
+        batch = include_app_metadata ? batch_value.table : batch_value
+        _append_flight_batch!(out, batch, batchindex)
+        include_app_metadata && push!(batch_app_metadata, batch_value.app_metadata)
+        batchindex += 1
+    end
+    return include_app_metadata ? (table=out, app_metadata=batch_app_metadata) : out
 end
 
-function _iterate_flight_stream!(x::FlightStream)
+function _iterate_flight_stream!(x::FlightStream; include_app_metadata::Bool=false)
     _ensure_schema!(x)
     while true
         message = _next_flight_message!(x)
@@ -362,7 +389,12 @@ function _iterate_flight_stream!(x::FlightStream)
                     getfield(x, :convert),
                 ),
             )
-            return _flight_table(x, columns), nothing
+            return _flight_batch_result(
+                _flight_table(x, columns),
+                message;
+                include_app_metadata=include_app_metadata,
+            ),
+            nothing
         elseif header isa ArrowParent.Meta.Tensor
             throw(ArgumentError(ArrowParent.TENSOR_UNSUPPORTED))
         elseif header isa ArrowParent.Meta.SparseTensor
@@ -398,20 +430,28 @@ function stream(
     messages;
     schema=nothing,
     convert::Bool=true,
+    include_app_metadata::Bool=false,
     alignment::Integer=DEFAULT_IPC_ALIGNMENT,
     end_marker::Bool=true,
 )
     messages isa AbstractVector{<:Protocol.FlightData} &&
         _require_schema_messages(messages, schema)
-    return FlightStream(messages; schema=schema, convert=convert)
+    flight_stream = FlightStream(messages; schema=schema, convert=convert)
+    return include_app_metadata ? FlightStreamWithAppMetadata(flight_stream) : flight_stream
 end
 
 function table(
     messages;
     schema=nothing,
     convert::Bool=true,
+    include_app_metadata::Bool=false,
     alignment::Integer=DEFAULT_IPC_ALIGNMENT,
     end_marker::Bool=true,
 )
-    return _materialize_flight_table(messages; schema=schema, convert=convert)
+    return _materialize_flight_table(
+        messages;
+        schema=schema,
+        convert=convert,
+        include_app_metadata=include_app_metadata,
+    )
 end
