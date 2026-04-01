@@ -43,5 +43,6 @@ export Client,
     streambytes,
     stream,
     table,
+    withappmetadata,
     flightdata,
     putflightdata!

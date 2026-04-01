@@ -22,6 +22,9 @@ function pyarrow_interop_test_exchange(client, exchange_descriptor)
     ))
     exchange_metadata = Dict("dataset" => "interop-exchange")
     exchange_colmetadata = Dict(:name => Dict("lang" => "en"))
+    exchange_app_metadata = ["client:0", "client:1"]
+    exchange_source =
+        Arrow.Flight.withappmetadata(exchange_source; app_metadata=exchange_app_metadata)
     exchange_req, exchange_response = Arrow.Flight.doexchange(
         client,
         exchange_source;
@@ -52,18 +55,18 @@ function pyarrow_interop_test_exchange(client, exchange_descriptor)
     @test DataAPI.metadata(exchange_table, "dataset") == "interop-exchange"
     @test DataAPI.colmetadata(exchange_table, :name, "lang") == "en"
     @test filter(!isempty, getfield.(exchanged_messages, :app_metadata)) ==
-          [b"exchange:0", b"exchange:1"]
+          [b"client:0", b"client:1"]
 
     exchange_batches_with_app =
         collect(Arrow.Flight.stream(exchanged_messages; include_app_metadata=true))
     @test exchange_batches_with_app[1].table.id == [21, 22]
     @test exchange_batches_with_app[2].table.id == [23]
     @test String.(getproperty.(exchange_batches_with_app, :app_metadata)) ==
-          ["exchange:0", "exchange:1"]
+          exchange_app_metadata
 
     exchange_table_with_app =
         Arrow.Flight.table(exchanged_messages; include_app_metadata=true)
     @test exchange_table_with_app.table.id == [21, 22, 23]
     @test exchange_table_with_app.table.name == ["twenty-one", "twenty-two", "twenty-three"]
-    @test String.(exchange_table_with_app.app_metadata) == ["exchange:0", "exchange:1"]
+    @test String.(exchange_table_with_app.app_metadata) == exchange_app_metadata
 end

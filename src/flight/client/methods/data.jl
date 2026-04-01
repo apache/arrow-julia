@@ -84,6 +84,7 @@ function doput(
     maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
     metadata::Union{Nothing,Any}=nothing,
     colmetadata::Union{Nothing,Any}=nothing,
+    app_metadata=nothing,
     kwargs...,
 )
     request = Channel{Protocol.FlightData}(request_capacity)
@@ -103,6 +104,7 @@ function doput(
             maxdepth=maxdepth,
             metadata=metadata,
             colmetadata=colmetadata,
+            app_metadata=app_metadata,
         )
     )
     return FlightAsyncRequest(grpc_request, producer)
@@ -124,6 +126,7 @@ function doput(
     maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
     metadata::Union{Nothing,Any}=nothing,
     colmetadata::Union{Nothing,Any}=nothing,
+    app_metadata=nothing,
     kwargs...,
 )
     response = Channel{Protocol.PutResult}(response_capacity)
@@ -143,6 +146,7 @@ function doput(
         maxdepth=maxdepth,
         metadata=metadata,
         colmetadata=colmetadata,
+        app_metadata=app_metadata,
         kwargs...,
     )
     return req, response
@@ -191,6 +195,7 @@ function doexchange(
     maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
     metadata::Union{Nothing,Any}=nothing,
     colmetadata::Union{Nothing,Any}=nothing,
+    app_metadata=nothing,
     kwargs...,
 )
     request = Channel{Protocol.FlightData}(request_capacity)
@@ -210,6 +215,7 @@ function doexchange(
             maxdepth=maxdepth,
             metadata=metadata,
             colmetadata=colmetadata,
+            app_metadata=app_metadata,
         )
     )
     return FlightAsyncRequest(grpc_request, producer)
@@ -231,6 +237,7 @@ function doexchange(
     maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
     metadata::Union{Nothing,Any}=nothing,
     colmetadata::Union{Nothing,Any}=nothing,
+    app_metadata=nothing,
     kwargs...,
 )
     response = Channel{Protocol.FlightData}(response_capacity)
@@ -250,6 +257,7 @@ function doexchange(
         maxdepth=maxdepth,
         metadata=metadata,
         colmetadata=colmetadata,
+        app_metadata=app_metadata,
         kwargs...,
     )
     return req, response

@@ -117,15 +117,12 @@ using UUIDs
     @test DataAPI.metadata(metadata_parts[2], "dataset") == "flight"
     @test DataAPI.colmetadata(metadata_parts[2], :title, "lang") == "en"
 
-    app_metadata_messages = [
-        index == 1 ? message :
-        Arrow.Flight.Protocol.FlightData(
-            message.flight_descriptor,
-            message.data_header,
-            Vector{UInt8}(codeunits("batch:$(index - 2)")),
-            message.data_body,
-        ) for (index, message) in enumerate(metadata_messages)
-    ]
+    app_metadata_messages = Arrow.Flight.flightdata(
+        metadata_source;
+        metadata=Dict("dataset" => "flight"),
+        colmetadata=Dict(:title => Dict("lang" => "en")),
+        app_metadata=("batch:0", "batch:1"),
+    )
     metadata_batches_with_app =
         collect(Arrow.Flight.stream(app_metadata_messages; include_app_metadata=true))
     metadata_table_with_app =
@@ -138,15 +135,64 @@ using UUIDs
     @test metadata_table_with_app.table.title == ["red", "blue", "green"]
     @test String.(metadata_table_with_app.app_metadata) == ["batch:0", "batch:1"]
 
+    wrapped_metadata_source = Arrow.Flight.withappmetadata(
+        metadata_source;
+        app_metadata=("wrapped:0", "wrapped:1"),
+    )
+    wrapped_metadata_messages = Arrow.Flight.flightdata(
+        wrapped_metadata_source;
+        metadata=Dict("dataset" => "flight"),
+        colmetadata=Dict(:title => Dict("lang" => "en")),
+    )
+    wrapped_metadata_table =
+        Arrow.Flight.table(wrapped_metadata_messages; include_app_metadata=true)
+    @test wrapped_metadata_table.table.title == ["red", "blue", "green"]
+    @test String.(wrapped_metadata_table.app_metadata) == ["wrapped:0", "wrapped:1"]
+
     reemitted_channel = Channel{Arrow.Flight.Protocol.FlightData}(8)
-    reemit_task =
-        @async Arrow.Flight.putflightdata!(reemitted_channel, metadata_table; close=true)
+    reemit_task = @async Arrow.Flight.putflightdata!(
+        reemitted_channel,
+        Arrow.Flight.withappmetadata(
+            metadata_table_with_app.table;
+            app_metadata=("batch:0", "batch:1"),
+        );
+        close=true,
+    )
     reemitted_messages = collect(reemitted_channel)
     wait(reemit_task)
+    @test String.(getfield.(reemitted_messages[2:end], :app_metadata)) ==
+          ["batch:0", "batch:1"]
     reemitted_table = Arrow.Flight.table(reemitted_messages)
     @test reemitted_table.title == metadata_table.title
     @test DataAPI.metadata(reemitted_table, "dataset") == "flight"
     @test DataAPI.colmetadata(reemitted_table, :title, "lang") == "en"
+
+    app_metadata_error = try
+        Arrow.Flight.flightdata(metadata_source; app_metadata=("only-one",))
+        nothing
+    catch err
+        err
+    end
+    @test app_metadata_error isa ArgumentError
+    @test occursin("app_metadata was exhausted", sprint(showerror, app_metadata_error))
+
+    duplicate_app_metadata_error = try
+        Arrow.Flight.flightdata(
+            Arrow.Flight.withappmetadata(
+                metadata_source;
+                app_metadata=("wrapped:0", "wrapped:1"),
+            );
+            app_metadata=("extra:0", "extra:1"),
+        )
+        nothing
+    catch err
+        err
+    end
+    @test duplicate_app_metadata_error isa ArgumentError
+    @test occursin(
+        "Arrow.Flight.withappmetadata",
+        sprint(showerror, duplicate_app_metadata_error),
+    )
 
     extension_source = (
         uuid=[UUID(UInt128(1)), UUID(UInt128(2))],

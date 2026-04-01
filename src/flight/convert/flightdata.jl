@@ -27,6 +27,82 @@ function _sourcedefaultcolmetadata(cols)
     return ArrowParent._normalizecolmeta(colmeta)
 end
 
+struct FlightAppMetadataSource{T,M}
+    source::T
+    app_metadata::M
+end
+
+ArrowParent.getmetadata(x::FlightAppMetadataSource) = ArrowParent.getmetadata(x.source)
+
+"""
+    Arrow.Flight.withappmetadata(source; app_metadata)
+
+Return a lightweight wrapper around `source` that carries batch-wise Flight
+`app_metadata` alongside the Arrow payload. The wrapper can be passed directly
+to [`Arrow.Flight.flightdata`](@ref), [`Arrow.Flight.putflightdata!`](@ref),
+or source-based [`Arrow.Flight.doexchange`](@ref) without manually threading
+`app_metadata=...` through each call site.
+"""
+withappmetadata(source; app_metadata) =
+    isnothing(app_metadata) ? source : FlightAppMetadataSource(source, app_metadata)
+
+function _unwrap_app_metadata_source(source, app_metadata)
+    source isa FlightAppMetadataSource || return source, app_metadata
+    isnothing(app_metadata) || throw(
+        ArgumentError(
+            "app_metadata cannot be provided both via Arrow.Flight.withappmetadata(...) and the app_metadata keyword",
+        ),
+    )
+    return source.source, source.app_metadata
+end
+
+_is_app_metadata_value(x) = x isa AbstractString || x isa AbstractVector{UInt8}
+
+function _normalize_app_metadata_value(value)
+    value === nothing && return UInt8[]
+    value isa AbstractString && return Vector{UInt8}(codeunits(value))
+    value isa AbstractVector{UInt8} && return Vector{UInt8}(value)
+    throw(
+        ArgumentError(
+            "app_metadata entries must be AbstractString, AbstractVector{UInt8}, or nothing",
+        ),
+    )
+end
+
+function _normalize_app_metadata_source(app_metadata)
+    isnothing(app_metadata) && return nothing
+    return _is_app_metadata_value(app_metadata) ? (app_metadata,) : app_metadata
+end
+
+_app_metadata_cursor(app_metadata) =
+    let metadata_iter = _normalize_app_metadata_source(app_metadata)
+        isnothing(metadata_iter) ? nothing :
+        (iter=metadata_iter, state=nothing, started=false)
+    end
+
+function _next_app_metadata(cursor)
+    isnothing(cursor) && return UInt8[], cursor
+    iter = cursor.iter
+    next = cursor.started ? iterate(iter, cursor.state) : iterate(iter)
+    isnothing(next) && throw(
+        ArgumentError("app_metadata was exhausted before all record batches were emitted"),
+    )
+    value, state = next
+    return _normalize_app_metadata_value(value), (iter=iter, state=state, started=true)
+end
+
+function _ensure_app_metadata_consumed(cursor)
+    isnothing(cursor) && return nothing
+    next = cursor.started ? iterate(cursor.iter, cursor.state) : iterate(cursor.iter)
+    isnothing(next) && return nothing
+    throw(ArgumentError("app_metadata contains more entries than source partitions"))
+end
+
+function _partition_with_app_metadata(tbl, cursor)
+    app_metadata, cursor = _next_app_metadata(cursor)
+    return tbl, app_metadata, cursor
+end
+
 function _emitflightdata!(
     emit,
     source;
@@ -40,14 +116,19 @@ function _emitflightdata!(
     maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
     metadata::Union{Nothing,Any}=nothing,
     colmetadata::Union{Nothing,Any}=nothing,
+    app_metadata=nothing,
 )
+    source, app_metadata = _unwrap_app_metadata_source(source, app_metadata)
     dictencodings = Dict{Int64,Any}()
     schema = Ref{Tables.Schema}()
     normalized_colmetadata = ArrowParent._normalizecolmeta(colmetadata)
     source_meta = isnothing(metadata) ? ArrowParent.getmetadata(source) : metadata
     source_colmetadata = isnothing(colmetadata) ? nothing : normalized_colmetadata
+    app_metadata_cursor = _app_metadata_cursor(app_metadata)
 
-    for tbl in Tables.partitions(source)
+    for partition in Tables.partitions(source)
+        tbl, record_app_metadata, app_metadata_cursor =
+            _partition_with_app_metadata(partition, app_metadata_cursor)
         tblcols = Tables.columns(tbl)
         if isnothing(metadata)
             tblmeta = ArrowParent.getmetadata(tbl)
@@ -120,11 +201,13 @@ function _emitflightdata!(
         emit(
             _flightdata_message(
                 ArrowParent.makerecordbatchmsg(schema[], cols, alignment);
+                app_metadata=record_app_metadata,
                 alignment=alignment,
             ),
         )
         descriptor = nothing
     end
+    _ensure_app_metadata_consumed(app_metadata_cursor)
     return nothing
 end
 
@@ -140,6 +223,7 @@ function flightdata(
     maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
     metadata::Union{Nothing,Any}=nothing,
     colmetadata::Union{Nothing,Any}=nothing,
+    app_metadata=nothing,
 )
     messages = Protocol.FlightData[]
     _emitflightdata!(
@@ -155,6 +239,7 @@ function flightdata(
         maxdepth=maxdepth,
         metadata=metadata,
         colmetadata=colmetadata,
+        app_metadata=app_metadata,
     )
     return messages
 end
@@ -173,6 +258,7 @@ function putflightdata!(
     maxdepth::Integer=ArrowParent.DEFAULT_MAX_DEPTH,
     metadata::Union{Nothing,Any}=nothing,
     colmetadata::Union{Nothing,Any}=nothing,
+    app_metadata=nothing,
 )
     try
         _emitflightdata!(
@@ -188,6 +274,7 @@ function putflightdata!(
             maxdepth=maxdepth,
             metadata=metadata,
             colmetadata=colmetadata,
+            app_metadata=app_metadata,
         )
     finally
         close && Base.close(sink)

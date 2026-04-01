@@ -251,6 +251,17 @@ existing schema/field metadata already exposed by the source, overlays new
 entries on top, and returns a wrapper that can be passed directly to
 [`Arrow.write`](@ref), `Arrow.tobuffer`, or the Flight IPC helpers.
 
+The Flight IPC helpers also expose batch-wise Flight `app_metadata`.
+[`Arrow.Flight.stream`](@ref) and [`Arrow.Flight.table`](@ref) can surface it
+with `include_app_metadata=true`, while [`Arrow.Flight.flightdata`](@ref),
+[`Arrow.Flight.putflightdata!`](@ref), and source-based
+[`Arrow.Flight.doexchange`](@ref) accept `app_metadata=...` to emit one payload
+per record batch without dropping down to raw protocol messages.
+[`Arrow.Flight.withappmetadata`](@ref) provides the same payload metadata as a
+lightweight wrapper around a table or partitioned source, so the metadata can
+ride with the source itself instead of being re-specified at every emit call
+site.
+
 ## Writing arrow data
 
 Ok, so that's a pretty good rundown of *reading* arrow data, but how do you *produce* arrow data? Enter `Arrow.write`.

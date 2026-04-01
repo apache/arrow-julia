@@ -27,12 +27,18 @@ end
 function _flightdata_message(
     msg::ArrowParent.Message;
     descriptor::Union{Nothing,Protocol.FlightDescriptor}=nothing,
+    app_metadata::AbstractVector{UInt8}=UInt8[],
     alignment::Integer=DEFAULT_IPC_ALIGNMENT,
 )
     body = _message_body(msg, alignment)
     length(body) == msg.bodylen ||
         throw(ArgumentError("FlightData body length mismatch while encoding Arrow IPC"))
-    return Protocol.FlightData(descriptor, Vector{UInt8}(msg.msgflatbuf), UInt8[], body)
+    return Protocol.FlightData(
+        descriptor,
+        Vector{UInt8}(msg.msgflatbuf),
+        Vector{UInt8}(app_metadata),
+        body,
+    )
 end
 
 function _write_framed_message(

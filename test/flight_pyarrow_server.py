@@ -112,7 +112,9 @@ class InteropFlightServer(fl.FlightServerBase):
                 break
             if chunk.data is None:
                 continue
-            metadata = pa.py_buffer(f"exchange:{batch_index}".encode("utf-8"))
+            metadata = chunk.app_metadata
+            if metadata is None:
+                metadata = pa.py_buffer(f"exchange:{batch_index}".encode("utf-8"))
             writer.write_with_metadata(chunk.data, metadata)
             batch_index += 1
 
