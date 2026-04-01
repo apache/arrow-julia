@@ -82,6 +82,14 @@ using UUIDs
     extension_source = (
         uuid=[UUID(UInt128(1)), UUID(UInt128(2))],
         flag=[Arrow.Bool8(true), Arrow.Bool8(false)],
+        json=Union{Missing,Arrow.JSONText{String}}[Arrow.JSONText("{\"a\":1}"), missing],
+        ts=Union{Missing,Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND}}[
+            Arrow.TimestampWithOffset(
+                Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC}(123),
+                Int16(-480),
+            ),
+            missing,
+        ],
     )
     extension_messages = Arrow.Flight.flightdata(extension_source)
     extension_batches = collect(Arrow.Flight.stream(extension_messages))
@@ -91,8 +99,17 @@ using UUIDs
           "arrow.uuid"
     @test Arrow.getmetadata(extension_batches[1].flag)[Arrow.EXTENSION_NAME_KEY] ==
           "arrow.bool8"
+    @test Arrow.getmetadata(extension_batches[1].json)[Arrow.EXTENSION_NAME_KEY] ==
+          "arrow.json"
+    @test Arrow.getmetadata(extension_batches[1].ts)[Arrow.EXTENSION_NAME_KEY] ==
+          "arrow.timestamp_with_offset"
     @test Arrow.getmetadata(extension_tbl.uuid)[Arrow.EXTENSION_NAME_KEY] == "arrow.uuid"
     @test Arrow.getmetadata(extension_tbl.flag)[Arrow.EXTENSION_NAME_KEY] == "arrow.bool8"
+    @test Arrow.getmetadata(extension_tbl.json)[Arrow.EXTENSION_NAME_KEY] == "arrow.json"
+    @test Arrow.getmetadata(extension_tbl.ts)[Arrow.EXTENSION_NAME_KEY] ==
+          "arrow.timestamp_with_offset"
     @test copy(extension_tbl.uuid) == extension_source.uuid
     @test Bool.(copy(extension_tbl.flag)) == Bool.(extension_source.flag)
+    @test isequal(copy(extension_tbl.json), extension_source.json)
+    @test isequal(copy(extension_tbl.ts), extension_source.ts)
 end

@@ -25,7 +25,20 @@ end
 
 @inline _extensiontypename(spec::ExtensionTypeSpec) = String(spec.name)
 @inline _builtinextensionspec(::Type{T}) where {T} = nothing
+@inline _builtinextensionjuliatype(::Val{name}, storageT) where {name} =
+    _builtinextensionjuliatype(Val(name), storageT, "")
 @inline _builtinextensionjuliatype(::Val{name}, storageT, metadata) where {name} = nothing
+@inline _builtinarrowtype(::Type{T}) where {T} = nothing
+@inline _builtintoarrow(x) = nothing
+@inline _builtinarrowname(::Type{T}) where {T} = nothing
+function _builtinfromarrow end
+function _builtinfromarrowstruct end
+function _builtindefault end
+function _builtinopaquemetadata end
+function _builtinvariantmetadata end
+function _builtinfixedshapetensormetadata end
+function _builtinvariableshapetensormetadata end
+@inline _validatebuiltinextension(::Val{name}, field, metadata) where {name} = nothing
 
 @inline function _extensionmetadatafor(::Type{T}, meta) where {T}
     spec = _extensionspec(T)
@@ -81,4 +94,8 @@ end
     builtin = _builtinextensionjuliatype(spec, storageT)
     builtin !== nothing && return builtin
     return ArrowTypes.JuliaType(Val(spec.name), storageT, spec.metadata)
+end
+
+@inline function _validatebuiltinextension(spec::ExtensionTypeSpec, field::Meta.Field)
+    return _validatebuiltinextension(Val(spec.name), field, spec.metadata)
 end

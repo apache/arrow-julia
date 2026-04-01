@@ -787,6 +787,14 @@ end
                         -480,
                     ),
                 ]
+            @test ArrowTypes.JuliaType(
+                Val(Symbol("arrow.timestamp_with_offset")),
+                NamedTuple{
+                    (:timestamp, :offset_minutes),
+                    Tuple{Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC},Int16},
+                },
+                "",
+            ) == Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND}
             tt = Arrow.Table(Arrow.tobuffer((col=values,)))
             @test eltype(tt.col) ==
                   Union{Missing,Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND}}
@@ -851,6 +859,7 @@ end
         @testset "canonical bool8/json/opaque" begin
             bools =
                 Union{Missing,Arrow.Bool8}[Arrow.Bool8(true), missing, Arrow.Bool8(false)]
+            @test ArrowTypes.JuliaType(Val(Symbol("arrow.bool8")), Int8, "") == Arrow.Bool8
             tt = Arrow.Table(Arrow.tobuffer((col=bools,)))
             @test eltype(tt.col) == Union{Missing,Arrow.Bool8}
             @test isequal(copy(tt.col), bools)
@@ -865,6 +874,8 @@ end
                 missing,
                 Arrow.JSONText("[1,2,3]"),
             ]
+            @test ArrowTypes.JuliaType(Val(Symbol("arrow.json")), String, "") ==
+                  Arrow.JSONText{String}
             json_tt = Arrow.Table(Arrow.tobuffer((col=jsons,)))
             @test eltype(json_tt.col) == Union{Missing,Arrow.JSONText{String}}
             @test isequal(copy(json_tt.col), jsons)
@@ -878,6 +889,8 @@ end
             )
 
             opaque_meta = Arrow.opaquemetadata("pkg.Type", "vendor.example")
+            @test ArrowTypes.JuliaType(Val(Symbol("arrow.opaque")), String, opaque_meta) ==
+                  String
             opaque_tt = Arrow.Table(
                 Arrow.tobuffer(
                     (col=["a", "b"],);
@@ -925,6 +938,18 @@ end
                 dim_names=["axis0"],
                 permutation=[0],
             )
+            @test ArrowTypes.JuliaType(Val(Symbol("arrow.parquet.variant")), String, "") ==
+                  String
+            @test ArrowTypes.JuliaType(
+                Val(Symbol("arrow.fixed_shape_tensor")),
+                NTuple{4,Int32},
+                fixed_metadata,
+            ) == NTuple{4,Int32}
+            @test ArrowTypes.JuliaType(
+                Val(Symbol("arrow.variable_shape_tensor")),
+                NamedTuple{(:data, :shape),Tuple{Vector{Int32},NTuple{1,Int32}}},
+                variable_metadata,
+            ) == NamedTuple{(:data, :shape),Tuple{Vector{Int32},NTuple{1,Int32}}}
             @test JSON3.read(variable_metadata)["uniform_shape"] == [2]
             @test JSON3.read(variable_metadata)["dim_names"] == ["axis0"]
             @test JSON3.read(variable_metadata)["permutation"] == [0]
@@ -1066,6 +1091,16 @@ end
         end
 
         @testset "logical extension runtime contract" begin
+            uuid = UUID("550e8400-e29b-41d4-a716-446655440000")
+            @test Arrow._builtinarrowtype(UUID) == NTuple{16,UInt8}
+            @test Arrow._builtintoarrow(uuid) ==
+                  ArrowTypes._cast(NTuple{16,UInt8}, uuid.value)
+            @test Arrow._builtinarrowname(UUID) == Symbol("arrow.uuid")
+            @test ArrowTypes.ArrowType(UUID) == Arrow._builtinarrowtype(UUID)
+            @test ArrowTypes.toarrow(uuid) == Arrow._builtintoarrow(uuid)
+            @test ArrowTypes.arrowname(UUID) == Arrow._builtinarrowname(UUID)
+            @test ArrowTypes.JuliaType(Val(Symbol("arrow.uuid"))) == UUID
+            @test ArrowTypes.JuliaType(Val(Symbol("JuliaLang.UUID"))) == UUID
             uuid_spec = Arrow._extensionspec(UUID)
             @test uuid_spec isa Arrow.ExtensionTypeSpec
             @test uuid_spec.name == Arrow.ArrowTypes.UUIDSYMBOL
@@ -1078,12 +1113,73 @@ end
             bool8_spec = Arrow._extensionspec(Arrow.Bool8)
             @test bool8_spec isa Arrow.ExtensionTypeSpec
             @test bool8_spec.name == Symbol("arrow.bool8")
+            @test Arrow._builtinarrowtype(Arrow.Bool8) == Int8
+            @test Arrow._builtintoarrow(Arrow.Bool8(true)) == Int8(1)
+            @test Arrow._builtinarrowname(Arrow.Bool8) == Symbol("arrow.bool8")
+            @test Arrow._builtinfromarrow(Arrow.Bool8, Int8(1)) == Arrow.Bool8(true)
+            @test Arrow._builtindefault(Arrow.Bool8) == Arrow.Bool8(false)
             @test Arrow._resolveextensionjuliatype(bool8_spec, Int8) == Arrow.Bool8
+
+            @test Arrow._builtinarrowtype(Arrow.JSONText{String}) == String
+            @test Arrow._builtintoarrow(Arrow.JSONText("abc")) == "abc"
+            @test Arrow._builtinarrowname(Arrow.JSONText{String}) == Symbol("arrow.json")
+            @test Arrow._builtinfromarrow(Arrow.JSONText{String}, pointer("abc"), 3) ==
+                  Arrow.JSONText("abc")
+            @test Arrow._builtinfromarrow(Arrow.JSONText{String}, "xyz") ==
+                  Arrow.JSONText("xyz")
+            @test Arrow._builtindefault(Arrow.JSONText{String}) == Arrow.JSONText("")
 
             timestamp_storage = NamedTuple{
                 (:timestamp, :offset_minutes),
                 Tuple{Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC},Int16},
             }
+            zdt = ZonedDateTime(Dates.DateTime(2020), tz"Europe/Paris")
+            @test Arrow._builtinarrowtype(ZonedDateTime) == Arrow.Timestamp
+            @test Arrow._builtintoarrow(zdt) == convert(
+                Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,Symbol("Europe/Paris")},
+                zdt,
+            )
+            @test Arrow._builtinarrowname(ZonedDateTime) ==
+                  Symbol("JuliaLang.ZonedDateTime-UTC")
+            paris_timestamp =
+                Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,Symbol("Europe/Paris")}(0)
+            @test Arrow._builtinfromarrow(ZonedDateTime, paris_timestamp) ==
+                  convert(ZonedDateTime, paris_timestamp)
+            @test Arrow._builtindefault(ZonedDateTime) ==
+                  ZonedDateTime(1, 1, 1, 1, 1, 1, tz"UTC")
+            @test Arrow._builtinarrowname(
+                Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND},
+            ) == Symbol("arrow.timestamp_with_offset")
+            @test Arrow._builtinarrowtype(
+                Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND},
+            ) == NamedTuple{
+                (:timestamp, :offset_minutes),
+                Tuple{Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC},Int16},
+            }
+            ts_with_offset = Arrow.TimestampWithOffset(
+                Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC}(123),
+                Int16(-480),
+            )
+            @test Arrow._builtintoarrow(ts_with_offset) == (
+                timestamp=Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC}(123),
+                offset_minutes=Int16(-480),
+            )
+            @test ArrowTypes.ArrowType(
+                Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND},
+            ) == Arrow._builtinarrowtype(
+                Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND},
+            )
+            @test ArrowTypes.toarrow(ts_with_offset) ==
+                  Arrow._builtintoarrow(ts_with_offset)
+            @test Arrow._builtindefault(
+                Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND},
+            ) == zero(Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND})
+            @test Arrow._builtinfromarrowstruct(
+                Arrow.TimestampWithOffset{Arrow.Meta.TimeUnit.MILLISECOND},
+                Val((:timestamp, :offset_minutes)),
+                Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC}(123),
+                Int16(-480),
+            ) == ts_with_offset
             @test Arrow._resolveextensionjuliatype(
                 Arrow.ExtensionTypeSpec(Symbol("arrow.timestamp_with_offset"), ""),
                 timestamp_storage,
@@ -1093,8 +1189,49 @@ end
                 Symbol("arrow.opaque"),
                 Arrow.opaquemetadata("demo.type", "demo.vendor"),
             )
+            @test Arrow.opaquemetadata("demo.type", "demo.vendor") ==
+                  Arrow._builtinopaquemetadata("demo.type", "demo.vendor")
             @test Arrow._resolveextensionjuliatype(opaque_spec, Vector{UInt8}) ==
                   Vector{UInt8}
+            @test Arrow.variantmetadata() == Arrow._builtinvariantmetadata()
+            @test Arrow.fixedshapetensormetadata(
+                [2, 2];
+                dim_names=["row", "col"],
+                permutation=[1, 0],
+            ) == Arrow._builtinfixedshapetensormetadata(
+                [2, 2];
+                dim_names=["row", "col"],
+                permutation=[1, 0],
+            )
+            @test Arrow.variableshapetensormetadata(
+                uniform_shape=[2, nothing];
+                dim_names=["row", "col"],
+                permutation=[1, 0],
+            ) == Arrow._builtinvariableshapetensormetadata(
+                uniform_shape=[2, nothing];
+                dim_names=["row", "col"],
+                permutation=[1, 0],
+            )
+            @test Arrow._builtinextensionjuliatype(
+                Val(Symbol("JuliaLang.ZonedDateTime-UTC")),
+                Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC},
+            ) == ZonedDateTime
+            @test ArrowTypes.JuliaType(
+                Val(Symbol("JuliaLang.ZonedDateTime-UTC")),
+                Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC},
+            ) == ZonedDateTime
+            @test Arrow._builtinextensionjuliatype(
+                Val(Symbol("JuliaLang.ZonedDateTime")),
+                Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC},
+            ) == Arrow.LocalZonedDateTime
+            @test ArrowTypes.JuliaType(
+                Val(Symbol("JuliaLang.ZonedDateTime")),
+                Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,:UTC},
+            ) == Arrow.LocalZonedDateTime
+            local_zdt_timestamp =
+                Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,Symbol("Europe/Paris")}(0)
+            @test Arrow._builtinfromarrow(Arrow.LocalZonedDateTime, local_zdt_timestamp) ==
+                  ArrowTypes.fromarrow(Arrow.LocalZonedDateTime, local_zdt_timestamp)
 
             @test Arrow._resolveextensionjuliatype(
                 Arrow.ExtensionTypeSpec(Symbol("JuliaLang.ZonedDateTime"), ""),

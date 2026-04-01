@@ -208,21 +208,6 @@ function _validatevariableshapetensor(field::Meta.Field, metadata::String)
     return
 end
 
-function _validatecanonicalpassthrough(
-    field::Meta.Field,
-    typenamesym::Symbol,
-    metadata::String,
-)
-    if typenamesym === PARQUET_VARIANT_SYMBOL
-        _validateparquetvariant(field, metadata)
-    elseif typenamesym === FIXED_SHAPE_TENSOR_SYMBOL
-        _validatefixedshapetensor(field, metadata)
-    elseif typenamesym === VARIABLE_SHAPE_TENSOR_SYMBOL
-        _validatevariableshapetensor(field, metadata)
-    end
-    return
-end
-
 """
 Given a FlatBuffers.Builder and a Julia column or column eltype,
 Write the field.type flatbuffer definition of the eltype
@@ -242,7 +227,7 @@ function juliaeltype(f::Meta.Field, meta::AbstractDict{String,String}, convert::
     TT = juliaeltype(f, convert)
     spec = _extensionspec(meta)
     if spec !== nothing
-        _validatecanonicalpassthrough(f, spec.name, spec.metadata)
+        _validatebuiltinextension(spec, f)
         !convert && return TT
         T = finaljuliatype(TT)
         storageT =
@@ -326,12 +311,13 @@ Base.zero(::Type{Bool8}) = Bool8(false)
 Base.:(==)(x::Bool8, y::Bool8) = Bool(x) == Bool(y)
 Base.isequal(x::Bool8, y::Bool8) = isequal(Bool(x), Bool(y))
 
-ArrowTypes.ArrowType(::Type{Bool8}) = Int8
-ArrowTypes.toarrow(x::Bool8) = Int8(Bool(x))
-ArrowTypes.arrowname(::Type{Bool8}) = BOOL8_SYMBOL
-ArrowTypes.JuliaType(::Val{BOOL8_SYMBOL}, ::Type{Int8}, metadata::String) = Bool8
-ArrowTypes.fromarrow(::Type{Bool8}, x::Int8) = Bool8(x)
-ArrowTypes.default(::Type{Bool8}) = zero(Bool8)
+ArrowTypes.ArrowType(::Type{Bool8}) = _builtinarrowtype(Bool8)
+ArrowTypes.toarrow(x::Bool8) = _builtintoarrow(x)
+ArrowTypes.arrowname(::Type{Bool8}) = _builtinarrowname(Bool8)
+ArrowTypes.JuliaType(::Val{BOOL8_SYMBOL}, ::Type{Int8}, metadata::String) =
+    _builtinextensionjuliatype(Val(BOOL8_SYMBOL), Int8, metadata)
+ArrowTypes.fromarrow(::Type{Bool8}, x::Int8) = _builtinfromarrow(Bool8, x)
+ArrowTypes.default(::Type{Bool8}) = _builtindefault(Bool8)
 
 function writearray(
     io::IO,
@@ -352,62 +338,51 @@ Base.convert(::Type{String}, x::JSONText) = String(x)
 Base.:(==)(x::JSONText, y::JSONText) = getfield(x, :value) == getfield(y, :value)
 Base.isequal(x::JSONText, y::JSONText) = isequal(getfield(x, :value), getfield(y, :value))
 
-ArrowTypes.ArrowType(::Type{JSONText{S}}) where {S<:AbstractString} = S
-ArrowTypes.toarrow(x::JSONText) = getfield(x, :value)
-ArrowTypes.arrowname(::Type{JSONText{S}}) where {S<:AbstractString} = JSON_SYMBOL
+ArrowTypes.ArrowType(::Type{JSONText{S}}) where {S<:AbstractString} =
+    _builtinarrowtype(JSONText{S})
+ArrowTypes.toarrow(x::JSONText) = _builtintoarrow(x)
+ArrowTypes.arrowname(::Type{JSONText{S}}) where {S<:AbstractString} =
+    _builtinarrowname(JSONText{S})
 ArrowTypes.JuliaType(
     ::Val{JSON_SYMBOL},
     ::Type{S},
     metadata::String,
-) where {S<:AbstractString} = JSONText{S}
+) where {S<:AbstractString} = _builtinextensionjuliatype(Val(JSON_SYMBOL), S, metadata)
 ArrowTypes.fromarrow(::Type{JSONText{String}}, ptr::Ptr{UInt8}, len::Int) =
-    JSONText(unsafe_string(ptr, len))
-ArrowTypes.fromarrow(::Type{JSONText{S}}, x::S) where {S<:AbstractString} = JSONText{S}(x)
+    _builtinfromarrow(JSONText{String}, ptr, len)
+ArrowTypes.fromarrow(::Type{JSONText{S}}, x::S) where {S<:AbstractString} =
+    _builtinfromarrow(JSONText{S}, x)
 ArrowTypes.default(::Type{JSONText{S}}) where {S<:AbstractString} =
-    JSONText{S}(ArrowTypes.default(S))
+    _builtindefault(JSONText{S})
 
-ArrowTypes.JuliaType(::Val{OPAQUE_SYMBOL}, S, metadata::String) = S
-ArrowTypes.JuliaType(::Val{PARQUET_VARIANT_SYMBOL}, S, metadata::String) = S
-ArrowTypes.JuliaType(::Val{FIXED_SHAPE_TENSOR_SYMBOL}, S, metadata::String) = S
-ArrowTypes.JuliaType(::Val{VARIABLE_SHAPE_TENSOR_SYMBOL}, S, metadata::String) = S
+ArrowTypes.JuliaType(::Val{OPAQUE_SYMBOL}, S, metadata::String) =
+    _builtinextensionjuliatype(Val(OPAQUE_SYMBOL), S, metadata)
+ArrowTypes.JuliaType(::Val{PARQUET_VARIANT_SYMBOL}, S, metadata::String) =
+    _builtinextensionjuliatype(Val(PARQUET_VARIANT_SYMBOL), S, metadata)
+ArrowTypes.JuliaType(::Val{FIXED_SHAPE_TENSOR_SYMBOL}, S, metadata::String) =
+    _builtinextensionjuliatype(Val(FIXED_SHAPE_TENSOR_SYMBOL), S, metadata)
+ArrowTypes.JuliaType(::Val{VARIABLE_SHAPE_TENSOR_SYMBOL}, S, metadata::String) =
+    _builtinextensionjuliatype(Val(VARIABLE_SHAPE_TENSOR_SYMBOL), S, metadata)
 
 @inline function _jsonstringliteral(x::AbstractString)
     return '"' * escape_string(x) * '"'
 end
 
 opaquemetadata(type_name::AbstractString, vendor_name::AbstractString) =
-    "{\"type_name\":" *
-    _jsonstringliteral(type_name) *
-    ",\"vendor_name\":" *
-    _jsonstringliteral(vendor_name) *
-    "}"
+    _builtinopaquemetadata(type_name, vendor_name)
 
-variantmetadata() = ""
+variantmetadata() = _builtinvariantmetadata()
 
 function fixedshapetensormetadata(
     shape::AbstractVector{<:Integer};
     dim_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing,
     permutation::Union{Nothing,AbstractVector{<:Integer}}=nothing,
 )
-    parsed_shape = _parseintvector(FIXED_SHAPE_TENSOR_SYMBOL, collect(shape), "shape")
-    parsed_dim_names = dim_names === nothing ? nothing : String.(dim_names)
-    parsed_permutation =
-        permutation === nothing ? nothing :
-        _validatepermutation(
-            FIXED_SHAPE_TENSOR_SYMBOL,
-            Int.(permutation),
-            length(parsed_shape),
-        )
-    parsed_dim_names !== nothing && length(parsed_dim_names) == length(parsed_shape) ||
-        isnothing(parsed_dim_names) ||
-        _canonicalextensionerror(
-            FIXED_SHAPE_TENSOR_SYMBOL,
-            "\"dim_names\" must have length $(length(parsed_shape))",
-        )
-    body = Dict{String,Any}("shape" => parsed_shape)
-    parsed_dim_names !== nothing && (body["dim_names"] = parsed_dim_names)
-    parsed_permutation !== nothing && (body["permutation"] = parsed_permutation)
-    return JSON3.write(body)
+    return _builtinfixedshapetensormetadata(
+        shape;
+        dim_names=dim_names,
+        permutation=permutation,
+    )
 end
 
 function variableshapetensormetadata(;
@@ -415,32 +390,11 @@ function variableshapetensormetadata(;
     dim_names::Union{Nothing,AbstractVector{<:AbstractString}}=nothing,
     permutation::Union{Nothing,AbstractVector{<:Integer}}=nothing,
 )
-    uniform =
-        uniform_shape === nothing ? nothing :
-        _parseintvector(
-            VARIABLE_SHAPE_TENSOR_SYMBOL,
-            collect(uniform_shape),
-            "uniform_shape";
-            allow_null=true,
-        )
-    ndim = uniform === nothing ? nothing : length(uniform)
-    parsed_dim_names = dim_names === nothing ? nothing : String.(dim_names)
-    parsed_permutation = permutation === nothing ? nothing : Int.(permutation)
-    ndim !== nothing && parsed_dim_names !== nothing && length(parsed_dim_names) == ndim ||
-        ndim === nothing ||
-        isnothing(parsed_dim_names) ||
-        _canonicalextensionerror(
-            VARIABLE_SHAPE_TENSOR_SYMBOL,
-            "\"dim_names\" must have length $ndim",
-        )
-    ndim !== nothing &&
-        parsed_permutation !== nothing &&
-        _validatepermutation(VARIABLE_SHAPE_TENSOR_SYMBOL, parsed_permutation, ndim)
-    body = Dict{String,Any}()
-    uniform !== nothing && (body["uniform_shape"] = uniform)
-    parsed_dim_names !== nothing && (body["dim_names"] = parsed_dim_names)
-    parsed_permutation !== nothing && (body["permutation"] = parsed_permutation)
-    return isempty(body) ? "" : JSON3.write(body)
+    return _builtinvariableshapetensormetadata(;
+        uniform_shape=uniform_shape,
+        dim_names=dim_names,
+        permutation=permutation,
+    )
 end
 
 # primitive types
@@ -671,53 +625,64 @@ ArrowTypes.fromarrow(::Type{Dates.DateTime}, x::Date{Meta.DateUnit.MILLISECOND,I
     convert(Dates.DateTime, x)
 ArrowTypes.default(::Type{Dates.DateTime}) = Dates.DateTime(1, 1, 1, 1, 1, 1)
 
-ArrowTypes.ArrowType(::Type{ZonedDateTime}) = Timestamp
-ArrowTypes.toarrow(x::ZonedDateTime) =
-    convert(Timestamp{Meta.TimeUnit.MILLISECOND,Symbol(x.timezone)}, x)
+ArrowTypes.ArrowType(::Type{ZonedDateTime}) = _builtinarrowtype(ZonedDateTime)
+ArrowTypes.toarrow(x::ZonedDateTime) = _builtintoarrow(x)
 const ZONEDDATETIME_SYMBOL = Symbol("JuliaLang.ZonedDateTime-UTC")
-ArrowTypes.arrowname(::Type{ZonedDateTime}) = ZONEDDATETIME_SYMBOL
-ArrowTypes.JuliaType(::Val{ZONEDDATETIME_SYMBOL}, S) = ZonedDateTime
-ArrowTypes.fromarrow(::Type{ZonedDateTime}, x::Timestamp) = convert(ZonedDateTime, x)
-ArrowTypes.default(::Type{TimeZones.ZonedDateTime}) =
-    TimeZones.ZonedDateTime(1, 1, 1, 1, 1, 1, TimeZones.tz"UTC")
+ArrowTypes.arrowname(::Type{ZonedDateTime}) = _builtinarrowname(ZonedDateTime)
+ArrowTypes.JuliaType(::Val{ZONEDDATETIME_SYMBOL}, S) =
+    _builtinextensionjuliatype(Val(ZONEDDATETIME_SYMBOL), S)
+ArrowTypes.fromarrow(::Type{ZonedDateTime}, x::Timestamp) =
+    _builtinfromarrow(ZonedDateTime, x)
+ArrowTypes.default(::Type{TimeZones.ZonedDateTime}) = _builtindefault(ZonedDateTime)
 
 const TIMESTAMP_WITH_OFFSET_SYMBOL = Symbol("arrow.timestamp_with_offset")
+ArrowTypes.ArrowType(::Type{TimestampWithOffset{U}}) where {U} =
+    _builtinarrowtype(TimestampWithOffset{U})
+ArrowTypes.toarrow(x::TimestampWithOffset{U}) where {U} = _builtintoarrow(x)
 ArrowTypes.arrowname(::Type{TimestampWithOffset{U}}) where {U} =
-    TIMESTAMP_WITH_OFFSET_SYMBOL
+    _builtinarrowname(TimestampWithOffset{U})
 ArrowTypes.JuliaType(
     ::Val{TIMESTAMP_WITH_OFFSET_SYMBOL},
     ::Type{NamedTuple{(:timestamp, :offset_minutes),Tuple{Timestamp{U,:UTC},Int16}}},
     metadata::String,
-) where {U} = TimestampWithOffset{U}
-ArrowTypes.default(::Type{TimestampWithOffset{U}}) where {U} = zero(TimestampWithOffset{U})
+) where {U} = _builtinextensionjuliatype(
+    Val(TIMESTAMP_WITH_OFFSET_SYMBOL),
+    NamedTuple{(:timestamp, :offset_minutes),Tuple{Timestamp{U,:UTC},Int16}},
+    metadata,
+)
+ArrowTypes.default(::Type{TimestampWithOffset{U}}) where {U} =
+    _builtindefault(TimestampWithOffset{U})
 ArrowTypes.fromarrowstruct(
     ::Type{TimestampWithOffset{U}},
     ::Val{(:timestamp, :offset_minutes)},
     timestamp::Timestamp{U,:UTC},
     offset_minutes::Int16,
-) where {U} = TimestampWithOffset{U}(timestamp, offset_minutes)
+) where {U} = _builtinfromarrowstruct(
+    TimestampWithOffset{U},
+    Val((:timestamp, :offset_minutes)),
+    timestamp,
+    offset_minutes,
+)
 ArrowTypes.fromarrowstruct(
     ::Type{TimestampWithOffset{U}},
     ::Val{(:offset_minutes, :timestamp)},
     offset_minutes::Int16,
     timestamp::Timestamp{U,:UTC},
-) where {U} = TimestampWithOffset{U}(timestamp, offset_minutes)
+) where {U} = _builtinfromarrowstruct(
+    TimestampWithOffset{U},
+    Val((:offset_minutes, :timestamp)),
+    offset_minutes,
+    timestamp,
+)
 
 # Backwards compatibility: older versions of Arrow saved ZonedDateTime's with this metdata:
 const OLD_ZONEDDATETIME_SYMBOL = Symbol("JuliaLang.ZonedDateTime")
 # and stored the local time instead of the UTC time.
 struct LocalZonedDateTime end
-ArrowTypes.JuliaType(::Val{OLD_ZONEDDATETIME_SYMBOL}, S) = LocalZonedDateTime
-function ArrowTypes.fromarrow(::Type{LocalZonedDateTime}, x::Timestamp{U,TZ}) where {U,TZ}
-    (U === Meta.TimeUnit.MICROSECOND || U == Meta.TimeUnit.NANOSECOND) &&
-        warntimestamp(U, ZonedDateTime)
-    return ZonedDateTime(
-        Dates.DateTime(
-            Dates.UTM(Int64(Dates.toms(periodtype(U)(x.x)) + UNIX_EPOCH_DATETIME)),
-        ),
-        TimeZone(String(TZ)),
-    )
-end
+ArrowTypes.JuliaType(::Val{OLD_ZONEDDATETIME_SYMBOL}, S) =
+    _builtinextensionjuliatype(Val(OLD_ZONEDDATETIME_SYMBOL), S)
+ArrowTypes.fromarrow(::Type{LocalZonedDateTime}, x::Timestamp{U,TZ}) where {U,TZ} =
+    _builtinfromarrow(LocalZonedDateTime, x)
 
 """
     Arrow.ToTimestamp(x::AbstractVector{ZonedDateTime})
