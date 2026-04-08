@@ -30,7 +30,6 @@ This implementation supports the 1.0 version of the specification, including sup
 It currently doesn't include support for:
   * Tensors or sparse tensors
   * Flight RPC
-  * C data interface
 
 Third-party data formats:
   * csv and parquet support via the existing [CSV.jl](https://github.com/JuliaData/CSV.jl) and [Parquet.jl](https://github.com/JuliaIO/Parquet.jl) packages
@@ -56,6 +55,7 @@ using DataAPI,
     StringViews
 
 export ArrowTypes
+export ArrowSchema, ArrowArray, CImportedArray, CImportedTable, from_c_data, to_c_data, release_c_data
 
 using Base: @propagate_inbounds
 import Base: ==
@@ -79,6 +79,7 @@ include("table.jl")
 include("write.jl")
 include("append.jl")
 include("show.jl")
+include("cdatainterface.jl")
 
 const ZSTD_COMPRESSOR = Lockable{ZstdCompressor}[]
 const ZSTD_DECOMPRESSOR = Lockable{ZstdDecompressor}[]
@@ -138,6 +139,12 @@ function __init__()
     resize!(empty!(ZSTD_COMPRESSOR), nt)
     resize!(empty!(LZ4_FRAME_DECOMPRESSOR), nt)
     resize!(empty!(ZSTD_DECOMPRESSOR), nt)
+    global _SCHEMA_RELEASE_CFUNC = @cfunction(
+        _release_exported_schema, Cvoid, (Ptr{ArrowSchema},)
+    )
+    global _ARRAY_RELEASE_CFUNC = @cfunction(
+        _release_exported_array, Cvoid, (Ptr{ArrowArray},)
+    )
     return
 end
 
