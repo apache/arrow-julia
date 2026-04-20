@@ -25,7 +25,26 @@ ArrowBlob(bytes::Vector{UInt8}, pos::Int, len::Nothing) =
 
 tobytes(bytes::Vector{UInt8}) = bytes
 tobytes(io::IO) = Base.read(io)
-tobytes(io::IOStream) = Mmap.mmap(io)
+
+function tobytes(io::IOStream)
+    # Try to use mmap for seekable streams (regular files)
+    # Fall back to read() for non-seekable streams (FIFOs, pipes, etc.)
+    # where mmap would return empty bytes or fail
+    try
+        # Check if stream is seekable by testing position/seek
+        pos = position(io)
+        seek(io, pos)
+        # Also check filesize - FIFOs report size 0
+        if filesize(io) > 0
+            return Mmap.mmap(io)
+        end
+    catch
+        # Not seekable, fall through to read
+    end
+    # Non-seekable or zero-size: read all bytes
+    return Base.read(io)
+end
+
 tobytes(file_path) = open(tobytes, file_path, "r")
 
 struct BatchIterator

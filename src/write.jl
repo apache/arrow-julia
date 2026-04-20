@@ -567,10 +567,20 @@ function Base.write(io::IO, msg::Message, blocks, sch, alignment)
     metalen = padding(length(msg.msgflatbuf), alignment)
     @debug "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch), headerType = $(msg.headerType)"
     if msg.blockmsg
-        push!(
-            blocks[msg.isrecordbatch ? 1 : 2],
-            Block(position(io), metalen + 8, msg.bodylen),
-        )
+        # Track block positions for file format footer
+        # Skip for non-seekable streams (streaming to FIFOs, sockets, etc.)
+        # where position() would fail - block tracking is only needed for file format
+        pos = try
+            position(io)
+        catch
+            nothing  # Non-seekable stream, skip block tracking
+        end
+        if pos !== nothing
+            push!(
+                blocks[msg.isrecordbatch ? 1 : 2],
+                Block(pos, metalen + 8, msg.bodylen),
+            )
+        end
     end
     # now write the final message spec out
     # continuation byte
