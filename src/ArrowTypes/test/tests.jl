@@ -100,30 +100,44 @@ end
     @test K == ArrowTypes.FixedSizeListKind{3,UInt8}()
 
     u = UUID(rand(UInt128))
-    ubytes = ArrowTypes._cast(NTuple{16,UInt8}, u.value)
+    ubytes = reinterpret(NTuple{16,UInt8}, u.value)
     @test ArrowTypes.ArrowKind(u) == ArrowTypes.FixedSizeListKind{16,UInt8}()
     @test ArrowTypes.ArrowType(UUID) == NTuple{16,UInt8}
     @test ArrowTypes.toarrow(u) == ubytes
-    @test ArrowTypes.arrowname(UUID) == ArrowTypes.UUIDSYMBOL
-    @test ArrowTypes.JuliaType(Val(ArrowTypes.UUIDSYMBOL)) == UUID
+    UUID_SYMBOL = Symbol("JuliaLang.UUID")
+    @test ArrowTypes.arrowname(UUID) == UUID_SYMBOL
+    @test ArrowTypes.JuliaType(Val(UUID_SYMBOL)) == UUID
     @test ArrowTypes.fromarrow(UUID, ubytes) == u
 
     ip4 = IPv4(rand(UInt32))
     @test ArrowTypes.ArrowKind(ip4) == PrimitiveKind()
     @test ArrowTypes.ArrowType(IPv4) == UInt32
     @test ArrowTypes.toarrow(ip4) == ip4.host
-    @test ArrowTypes.arrowname(IPv4) == ArrowTypes.IPV4_SYMBOL
-    @test ArrowTypes.JuliaType(Val(ArrowTypes.IPV4_SYMBOL)) == IPv4
+    IPV4_SYMBOL = Symbol("JuliaLang.IPv4")
+    @test ArrowTypes.arrowname(IPv4) == IPV4_SYMBOL
+    @test ArrowTypes.JuliaType(Val(IPV4_SYMBOL)) == IPv4
     @test ArrowTypes.fromarrow(IPv4, ip4.host) == ip4
 
     ip6 = IPv6(rand(UInt128))
-    ip6_ubytes = ArrowTypes._cast(NTuple{16,UInt8}, ip6.host)
+    ip6_ubytes = reinterpret(NTuple{16,UInt8}, ip6.host)
     @test ArrowTypes.ArrowKind(ip6) == ArrowTypes.FixedSizeListKind{16,UInt8}()
     @test ArrowTypes.ArrowType(IPv6) == NTuple{16,UInt8}
     @test ArrowTypes.toarrow(ip6) == ip6_ubytes
-    @test ArrowTypes.arrowname(IPv6) == ArrowTypes.IPV6_SYMBOL
-    @test ArrowTypes.JuliaType(Val(ArrowTypes.IPV6_SYMBOL)) == IPv6
+    IPV6_SYMBOL = Symbol("JuliaLang.IPv6")
+    @test ArrowTypes.arrowname(IPv6) == IPV6_SYMBOL
+    @test ArrowTypes.JuliaType(Val(IPV6_SYMBOL)) == IPv6
     @test ArrowTypes.fromarrow(IPv6, ip6_ubytes) == ip6
+
+    INET_ADDR_SYMBOL = Symbol("JuliaLang.InetAddr")
+    @test ArrowTypes.arrowname(Sockets.InetAddr{IPv4}) == INET_ADDR_SYMBOL
+    @test ArrowTypes.JuliaType(
+        Val(INET_ADDR_SYMBOL),
+        @NamedTuple{host::IPv4, port::UInt16},
+    ) == Sockets.InetAddr{IPv4}
+    @test ArrowTypes.JuliaType(
+        Val(INET_ADDR_SYMBOL),
+        @NamedTuple{host::IPv6, port::UInt16},
+    ) == Sockets.InetAddr{IPv6}
 
     nt = (id=1, name="bob")
     @test ArrowTypes.ArrowKind(NamedTuple) == ArrowTypes.StructKind()
