@@ -387,7 +387,7 @@ function _import_arrowvec(
     if fmt == "+s"
         vecs = AbstractVector[]
         child_names = Symbol[]
-        child_types = DataType[]
+        child_types = Type[]
         for i in 0:Int(sch.n_children)-1
             child_av = _import_arrowvec(_cchild_arr(arr, i), _cchild_sch(sch, i), handle, convert)
             push!(vecs, child_av)
@@ -530,7 +530,6 @@ function from_c_data(
     sp = Ptr{ArrowSchema}(schema_ptr)
     ap = Ptr{ArrowArray}(array_ptr)
     handle = CDataHandle(sp, ap)
-    finalizer(_release_cdata_handle, handle)
     vec = _import_arrowvec(ap, sp, handle, convert)
     T = eltype(vec)
     return CImportedArray{T}(vec, handle)
@@ -560,7 +559,6 @@ function from_c_data(
         sp = Ptr{ArrowSchema}(sp_raw)
         ap = Ptr{ArrowArray}(ap_raw)
         handle = CDataHandle(sp, ap)
-        finalizer(_release_cdata_handle, handle)
         vec = _import_arrowvec(ap, sp, handle, convert)
         T = eltype(vec)
         push!(cols, CImportedArray{T}(vec, handle))
