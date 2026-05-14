@@ -233,12 +233,8 @@ function arrowvector(
         end
         # adjust to "offset" instead of index
         inds .-= firstindex(refa)
-        # CategoricalRefPool uses 0-based indices with pool[0] as a missing sentinel;
-        # skip it so arrowvector receives a standard 1-based sequence.
-        pool_first = firstindex(pool)
-        dict_pool = pool_first == 1 ? pool : @view(pool[(pool_first + 1):lastindex(pool)])
         data = arrowvector(
-            dict_pool,
+            pool,
             i,
             nl,
             fi,
