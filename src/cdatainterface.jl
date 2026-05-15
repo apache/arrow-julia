@@ -277,8 +277,8 @@ function _fmt_to_storage_type(fmt::String)
     end
     if startswith(fmt, "d:")
         parts = split(fmt[3:end], ',')
-        p = parse(Int32, parts[1])
-        s_val = parse(Int32, parts[2])
+        p = parse(Int, parts[1])
+        s_val = parse(Int, parts[2])
         bw = length(parts) >= 3 ? parse(Int, parts[3]) : 128
         return bw == 256 ? Decimal{p,s_val,Int256} : Decimal{p,s_val,Int128}
     end
@@ -436,7 +436,7 @@ function _import_arrowvec(
         optr = Ptr{Int32}(_cbuf(arr, 1))
         offsets_vec = optr == C_NULL ? Int32[] : unsafe_wrap(Array, optr, n; own=false)
         vecs = AbstractVector[]
-        child_types = DataType[]
+        child_types = Type[]
         for i in 0:Int(sch.n_children)-1
             cv = _import_arrowvec(_cchild_arr(arr, i), _cchild_sch(sch, i), handle, convert)
             push!(vecs, cv)
@@ -458,7 +458,7 @@ function _import_arrowvec(
         n = len + off
         typeids_vec = tptr == C_NULL ? UInt8[] : unsafe_wrap(Array, tptr, n; own=false)
         vecs = AbstractVector[]
-        child_types = DataType[]
+        child_types = Type[]
         for i in 0:Int(sch.n_children)-1
             cv = _import_arrowvec(_cchild_arr(arr, i), _cchild_sch(sch, i), handle, convert)
             push!(vecs, cv)
@@ -1213,7 +1213,7 @@ Export all columns of an `Arrow.Table` to the Arrow C Data Interface format.
 Returns two vectors of `Ref`s (one per column). Each column has its own
 `release` token so they can be released independently.
 """
-function to_c_data(tbl::Arrow.Table; names::Vector{String}=String.(Arrow.Table.names(tbl)))
+function to_c_data(tbl::Arrow.Table; names::Vector{String}=String.(Tables.columnnames(tbl)))
     schema_refs = Ref{ArrowSchema}[]
     array_refs  = Ref{ArrowArray}[]
     for (i, col) in enumerate(Tables.columns(tbl))
