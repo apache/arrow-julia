@@ -55,7 +55,8 @@ using DataAPI,
     StringViews
 
 export ArrowTypes
-export ArrowSchema, ArrowArray, CImportedArray, CImportedTable, from_c_data, to_c_data, release_c_data
+export ArrowSchema,
+    ArrowArray, CImportedArray, CImportedTable, from_c_data, to_c_data, release_c_data
 
 using Base: @propagate_inbounds
 import Base: ==
@@ -139,12 +140,10 @@ function __init__()
     resize!(empty!(ZSTD_COMPRESSOR), nt)
     resize!(empty!(LZ4_FRAME_DECOMPRESSOR), nt)
     resize!(empty!(ZSTD_DECOMPRESSOR), nt)
-    global _SCHEMA_RELEASE_CFUNC = @cfunction(
-        _release_exported_schema, Cvoid, (Ptr{ArrowSchema},)
-    )
-    global _ARRAY_RELEASE_CFUNC = @cfunction(
-        _release_exported_array, Cvoid, (Ptr{ArrowArray},)
-    )
+    global _SCHEMA_RELEASE_CFUNC =
+        @cfunction(_release_exported_schema, Cvoid, (Ptr{ArrowSchema},))
+    global _ARRAY_RELEASE_CFUNC =
+        @cfunction(_release_exported_array, Cvoid, (Ptr{ArrowArray},))
     return
 end
 

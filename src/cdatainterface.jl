@@ -64,9 +64,9 @@ end
 @assert sizeof(ArrowArray) == 10 * 8 "ArrowArray size mismatch; expected $(10*8), got $(sizeof(ArrowArray))"
 
 # Schema flags
-const CDATA_FLAG_NULLABLE         = Int64(2)
-const CDATA_FLAG_DICT_ORDERED     = Int64(1)
-const CDATA_FLAG_MAP_KEYS_SORTED  = Int64(4)
+const CDATA_FLAG_NULLABLE = Int64(2)
+const CDATA_FLAG_DICT_ORDERED = Int64(1)
+const CDATA_FLAG_MAP_KEYS_SORTED = Int64(4)
 
 ###############################################################################
 # Import path (C → Julia)                                                     #
@@ -145,9 +145,8 @@ Tables.schema(t::CImportedTable) = Tables.Schema(t.names, map(eltype, t.columns)
 DataAPI.metadatasupport(::Type{CImportedTable}) = (read=true, write=false)
 DataAPI.metadata(t::CImportedTable, key::AbstractString; style::Bool=false) =
     style ? (get(t.metadata === nothing ? Dict() : t.metadata, key, nothing), :default) :
-            get(t.metadata === nothing ? Dict() : t.metadata, key, nothing)
-DataAPI.metadatakeys(t::CImportedTable) =
-    t.metadata === nothing ? () : keys(t.metadata)
+    get(t.metadata === nothing ? Dict() : t.metadata, key, nothing)
+DataAPI.metadatakeys(t::CImportedTable) = t.metadata === nothing ? () : keys(t.metadata)
 
 """
     Arrow.release_c_data(x::CImportedArray)
@@ -176,7 +175,7 @@ function _parse_c_metadata(ptr::Cstring)
     n_pairs <= 0 && return nothing
     pos = 4  # byte offset from p
     dict = Base.ImmutableDict{String,String}()
-    for _ in 1:n_pairs
+    for _ = 1:n_pairs
         key_len = unsafe_load(Ptr{Int32}(p + pos))
         pos += 4
         key = unsafe_string(p + pos, key_len)
@@ -191,8 +190,8 @@ function _parse_c_metadata(ptr::Cstring)
 end
 
 # Load the i-th buffer pointer from an ArrowArray (0-indexed, pointer arithmetic in units of sizeof(Ptr))
-_cbuf(arr::ArrowArray, i::Int) = (arr.n_buffers > i && arr.buffers != C_NULL) ?
-    unsafe_load(arr.buffers, i + 1) : C_NULL
+_cbuf(arr::ArrowArray, i::Int) =
+    (arr.n_buffers > i && arr.buffers != C_NULL) ? unsafe_load(arr.buffers, i + 1) : C_NULL
 
 # Load the i-th child array pointer from an ArrowArray (0-indexed)
 _cchild_arr(arr::ArrowArray, i::Int) = unsafe_load(arr.children, i + 1)
@@ -222,14 +221,14 @@ end
 function _copy_bit_range(src::Vector{UInt8}, off::Int, len::Int)
     nbytes = cld(len, 8)
     dest = fill(0xff, nbytes)
-    for i in 0:len-1
+    for i = 0:(len - 1)
         src_pos = off + i
         src_byte = src_pos >> 3
-        src_bit  = src_pos & 7
+        src_bit = src_pos & 7
         bit = (src[src_byte + 1] >> src_bit) & 1
         if bit == 0
             dst_byte = i >> 3
-            dst_bit  = i & 7
+            dst_bit = i & 7
             dest[dst_byte + 1] &= ~(UInt8(1) << dst_bit)
         end
     end
@@ -246,17 +245,17 @@ end
 
 # Parse a primitive/simple format string to its Julia storage type
 function _fmt_to_storage_type(fmt::String)
-    fmt == "c"   && return Int8
-    fmt == "C"   && return UInt8
-    fmt == "s"   && return Int16
-    fmt == "S"   && return UInt16
-    fmt == "i"   && return Int32
-    fmt == "I"   && return UInt32
-    fmt == "l"   && return Int64
-    fmt == "L"   && return UInt64
-    fmt == "e"   && return Float16
-    fmt == "f"   && return Float32
-    fmt == "g"   && return Float64
+    fmt == "c" && return Int8
+    fmt == "C" && return UInt8
+    fmt == "s" && return Int16
+    fmt == "S" && return UInt16
+    fmt == "i" && return Int32
+    fmt == "I" && return UInt32
+    fmt == "l" && return Int64
+    fmt == "L" && return UInt64
+    fmt == "e" && return Float16
+    fmt == "f" && return Float32
+    fmt == "g" && return Float64
     fmt == "tdD" && return Date{Meta.DateUnit.DAY,Int32}
     fmt == "tdm" && return Date{Meta.DateUnit.MILLISECOND,Int64}
     fmt == "tts" && return Time{Meta.TimeUnit.SECOND,Int32}
@@ -333,7 +332,7 @@ function _import_arrowvec(
         n_bytes = (len + off) * N
         data_bytes = dptr == C_NULL ? UInt8[] : unsafe_wrap(Array, dptr, n_bytes; own=false)
         # Apply offset: skip first `off*N` bytes
-        data_view = off == 0 ? data_bytes : view(data_bytes, off*N+1:n_bytes)
+        data_view = off == 0 ? data_bytes : view(data_bytes, (off * N + 1):n_bytes)
         return FixedSizeList{T,typeof(data_view)}(UInt8[], validity, data_view, len, meta)
     end
 
@@ -345,12 +344,13 @@ function _import_arrowvec(
         optr = Ptr{OT}(_cbuf(arr, 1))
         n_offs = len + off + 1
         offs_arr = optr == C_NULL ? OT[] : unsafe_wrap(Array, optr, n_offs; own=false)
-        offs_view = off == 0 ? offs_arr : view(offs_arr, off+1:n_offs)
+        offs_view = off == 0 ? offs_arr : view(offs_arr, (off + 1):n_offs)
         offsets = Offsets(UInt8[], offs_view)
         dptr = Ptr{UInt8}(_cbuf(arr, 2))
         # data length = last offset value
         data_len = n_offs > 0 && optr != C_NULL ? Int(offs_arr[n_offs]) : 0
-        data_bytes = dptr == C_NULL ? UInt8[] : unsafe_wrap(Array, dptr, data_len; own=false)
+        data_bytes =
+            dptr == C_NULL ? UInt8[] : unsafe_wrap(Array, dptr, data_len; own=false)
         return List{T,OT,Vector{UInt8}}(UInt8[], validity, offsets, data_bytes, len, meta)
     end
 
@@ -360,7 +360,7 @@ function _import_arrowvec(
         optr = Ptr{OT}(_cbuf(arr, 1))
         n_offs = len + off + 1
         offs_arr = optr == C_NULL ? OT[] : unsafe_wrap(Array, optr, n_offs; own=false)
-        offs_view = off == 0 ? offs_arr : view(offs_arr, off+1:n_offs)
+        offs_view = off == 0 ? offs_arr : view(offs_arr, (off + 1):n_offs)
         offsets = Offsets(UInt8[], offs_view)
         child_arr_ptr = _cchild_arr(arr, 0)
         child_sch_ptr = _cchild_sch(sch, 0)
@@ -388,11 +388,14 @@ function _import_arrowvec(
         vecs = AbstractVector[]
         child_names = Symbol[]
         child_types = Type[]
-        for i in 0:Int(sch.n_children)-1
-            child_av = _import_arrowvec(_cchild_arr(arr, i), _cchild_sch(sch, i), handle, convert)
+        for i = 0:(Int(sch.n_children) - 1)
+            child_av =
+                _import_arrowvec(_cchild_arr(arr, i), _cchild_sch(sch, i), handle, convert)
             push!(vecs, child_av)
             child_sch_i = unsafe_load(_cchild_sch(sch, i))
-            nm = child_sch_i.name != C_NULL ? Symbol(unsafe_string(child_sch_i.name)) : Symbol("f$i")
+            nm =
+                child_sch_i.name != C_NULL ? Symbol(unsafe_string(child_sch_i.name)) :
+                Symbol("f$i")
             push!(child_names, nm)
             push!(child_types, eltype(child_av))
         end
@@ -408,7 +411,7 @@ function _import_arrowvec(
         optr = Ptr{Int32}(_cbuf(arr, 1))
         n_offs = len + off + 1
         offs_arr = optr == C_NULL ? Int32[] : unsafe_wrap(Array, optr, n_offs; own=false)
-        offs_view = off == 0 ? offs_arr : view(offs_arr, off+1:n_offs)
+        offs_view = off == 0 ? offs_arr : view(offs_arr, (off + 1):n_offs)
         offsets = Offsets(UInt8[], offs_view)
         # child[0] is entries struct (key + value fields)
         A = _import_arrowvec(_cchild_arr(arr, 0), _cchild_sch(sch, 0), handle, convert)
@@ -428,7 +431,8 @@ function _import_arrowvec(
     # Dense union "+ud:typeIds"
     if startswith(fmt, "+ud:")
         typeids_str = fmt[5:end]
-        typeids_parsed = isempty(typeids_str) ? nothing :
+        typeids_parsed =
+            isempty(typeids_str) ? nothing :
             Tuple(parse(Int32, s) for s in split(typeids_str, ','))
         tptr = Ptr{UInt8}(_cbuf(arr, 0))
         n = len + off
@@ -437,7 +441,7 @@ function _import_arrowvec(
         offsets_vec = optr == C_NULL ? Int32[] : unsafe_wrap(Array, optr, n; own=false)
         vecs = AbstractVector[]
         child_types = Type[]
-        for i in 0:Int(sch.n_children)-1
+        for i = 0:(Int(sch.n_children) - 1)
             cv = _import_arrowvec(_cchild_arr(arr, i), _cchild_sch(sch, i), handle, convert)
             push!(vecs, cv)
             push!(child_types, eltype(cv))
@@ -446,20 +450,28 @@ function _import_arrowvec(
         U_types = Tuple{child_types...}
         UT = UnionT{Meta.UnionMode.Dense,typeids_parsed,U_types}
         T = Union{child_types...}
-        return DenseUnion{T,UT,typeof(data)}(UInt8[], UInt8[], typeids_vec, offsets_vec, data, meta)
+        return DenseUnion{T,UT,typeof(data)}(
+            UInt8[],
+            UInt8[],
+            typeids_vec,
+            offsets_vec,
+            data,
+            meta,
+        )
     end
 
     # Sparse union "+us:typeIds"
     if startswith(fmt, "+us:")
         typeids_str = fmt[5:end]
-        typeids_parsed = isempty(typeids_str) ? nothing :
+        typeids_parsed =
+            isempty(typeids_str) ? nothing :
             Tuple(parse(Int32, s) for s in split(typeids_str, ','))
         tptr = Ptr{UInt8}(_cbuf(arr, 0))
         n = len + off
         typeids_vec = tptr == C_NULL ? UInt8[] : unsafe_wrap(Array, tptr, n; own=false)
         vecs = AbstractVector[]
         child_types = Type[]
-        for i in 0:Int(sch.n_children)-1
+        for i = 0:(Int(sch.n_children) - 1)
             cv = _import_arrowvec(_cchild_arr(arr, i), _cchild_sch(sch, i), handle, convert)
             push!(vecs, cv)
             push!(child_types, eltype(cv))
@@ -479,7 +491,7 @@ function _import_arrowvec(
         iptr = Ptr{S}(_cbuf(arr, 1))
         n_idx = len + off
         idx_arr = iptr == C_NULL ? S[] : unsafe_wrap(Array, iptr, n_idx; own=false)
-        idx_view = off == 0 ? idx_arr : view(idx_arr, off+1:n_idx)
+        idx_view = off == 0 ? idx_arr : view(idx_arr, (off + 1):n_idx)
         idx_vec = Vector{S}(idx_view)  # make a copy since DictEncoded.indices is Vector{S}
         # Import dictionary values
         dict_arr_ptr = arr.dictionary
@@ -501,7 +513,7 @@ function _import_arrowvec(
     end
     n = len + off
     data_arr = unsafe_wrap(Array, dptr, n; own=false)
-    data_view = off == 0 ? data_arr : view(data_arr, off+1:n)
+    data_view = off == 0 ? data_arr : view(data_arr, (off + 1):n)
     return Primitive(T, UInt8[], validity, data_view, len, meta)
 end
 
@@ -522,11 +534,7 @@ collect(col)  # materialise elements
 Arrow.release_c_data(col)  # or let GC handle it
 ```
 """
-function from_c_data(
-    schema_ptr::Ptr{Cvoid},
-    array_ptr::Ptr{Cvoid};
-    convert::Bool=true,
-)
+function from_c_data(schema_ptr::Ptr{Cvoid}, array_ptr::Ptr{Cvoid}; convert::Bool=true)
     sp = Ptr{ArrowSchema}(schema_ptr)
     ap = Ptr{ArrowArray}(array_ptr)
     handle = CDataHandle(sp, ap)
@@ -579,9 +587,9 @@ end
 ###############################################################################
 
 # Global roots dict: keeps Julia objects alive while C holds pointers
-const _EXPORT_ROOTS      = Dict{UInt64,Vector{Any}}()
+const _EXPORT_ROOTS = Dict{UInt64,Vector{Any}}()
 const _EXPORT_ROOTS_LOCK = ReentrantLock()
-const _EXPORT_TOKEN      = Threads.Atomic{UInt64}(0)
+const _EXPORT_TOKEN = Threads.Atomic{UInt64}(0)
 
 function _next_export_token()
     return Threads.atomic_add!(_EXPORT_TOKEN, UInt64(1))
@@ -590,7 +598,7 @@ end
 # Release callbacks (function pointers set in __init__)
 # Declared as globals here; assigned in Arrow.__init__
 global _SCHEMA_RELEASE_CFUNC::Ptr{Cvoid} = C_NULL
-global _ARRAY_RELEASE_CFUNC::Ptr{Cvoid}  = C_NULL
+global _ARRAY_RELEASE_CFUNC::Ptr{Cvoid} = C_NULL
 
 function _release_exported_schema(ptr::Ptr{ArrowSchema})::Cvoid
     sch = unsafe_load(ptr)
@@ -646,19 +654,19 @@ end
 _array_to_format(v::NullVector) = "n"
 
 function _type_to_format(S::Type, v::ArrowVector)
-    S === Missing   && return "n"
-    S === Bool      && return "b"
-    S === Int8      && return "c"
-    S === UInt8     && return "C"
-    S === Int16     && return "s"
-    S === UInt16    && return "S"
-    S === Int32     && return "i"
-    S === UInt32    && return "I"
-    S === Int64     && return "l"
-    S === UInt64    && return "L"
-    S === Float16   && return "e"
-    S === Float32   && return "f"
-    S === Float64   && return "g"
+    S === Missing && return "n"
+    S === Bool && return "b"
+    S === Int8 && return "c"
+    S === UInt8 && return "C"
+    S === Int16 && return "s"
+    S === UInt16 && return "S"
+    S === Int32 && return "i"
+    S === UInt32 && return "I"
+    S === Int64 && return "l"
+    S === UInt64 && return "L"
+    S === Float16 && return "e"
+    S === Float32 && return "f"
+    S === Float64 && return "g"
     return _type_to_format_extended(S, v)
 end
 
@@ -679,16 +687,18 @@ function _type_to_format_extended(S::Type, v::ArrowVector)
     elseif S <: Timestamp
         U = S.parameters[1]
         TZ = S.parameters[2]
-        unit_char = U === Meta.TimeUnit.SECOND ? 's' :
-                    U === Meta.TimeUnit.MILLISECOND ? 'm' :
-                    U === Meta.TimeUnit.MICROSECOND ? 'u' : 'n'
+        unit_char =
+            U === Meta.TimeUnit.SECOND ? 's' :
+            U === Meta.TimeUnit.MILLISECOND ? 'm' :
+            U === Meta.TimeUnit.MICROSECOND ? 'u' : 'n'
         tz_str = TZ === nothing ? "" : String(TZ)
         return "ts$(unit_char):$(tz_str)"
     elseif S <: Duration
         U = S.parameters[1]
-        unit_char = U === Meta.TimeUnit.SECOND ? 's' :
-                    U === Meta.TimeUnit.MILLISECOND ? 'm' :
-                    U === Meta.TimeUnit.MICROSECOND ? 'u' : 'n'
+        unit_char =
+            U === Meta.TimeUnit.SECOND ? 's' :
+            U === Meta.TimeUnit.MILLISECOND ? 'm' :
+            U === Meta.TimeUnit.MICROSECOND ? 'u' : 'n'
         return "tD$(unit_char)"
     elseif S === Interval{Meta.IntervalUnit.YEAR_MONTH,Int32}
         return "tiM"
@@ -737,30 +747,31 @@ function _container_to_format(v::FixedSizeList{T,A}) where {T,A}
     end
 end
 
-_container_to_format(v::Map)        = "+m"
-_container_to_format(v::Struct)     = "+s"
+_container_to_format(v::Map) = "+m"
+_container_to_format(v::Struct) = "+s"
 _container_to_format(v::NullVector) = "n"
 
 function _container_to_format(v::DenseUnion{T,UnionT{M,typeIds,U}}) where {T,M,typeIds,U}
-    ids_str = typeIds === nothing ? join(0:fieldcount(U)-1, ',') : join(typeIds, ',')
+    ids_str = typeIds === nothing ? join(0:(fieldcount(U) - 1), ',') : join(typeIds, ',')
     return "+ud:$(ids_str)"
 end
 
 function _container_to_format(v::SparseUnion{T,UnionT{M,typeIds,U}}) where {T,M,typeIds,U}
-    ids_str = typeIds === nothing ? join(0:fieldcount(U)-1, ',') : join(typeIds, ',')
+    ids_str = typeIds === nothing ? join(0:(fieldcount(U) - 1), ',') : join(typeIds, ',')
     return "+us:$(ids_str)"
 end
 
 function _container_to_format(v::DictEncoded{T,S,A}) where {T,S,A}
     # Format is the INDEX type
-    S === Int8  && return "c"
+    S === Int8 && return "c"
     S === Int16 && return "s"
     S === Int32 && return "i"
     S === Int64 && return "l"
     return "i"  # fallback
 end
 
-_container_to_format(v::ArrowVector) = error("Cannot determine format string for $(typeof(v))")
+_container_to_format(v::ArrowVector) =
+    error("Cannot determine format string for $(typeof(v))")
 
 # Compute schema flags from an ArrowVector
 function _schema_flags(v::ArrowVector)
@@ -815,8 +826,7 @@ function _fill_schema!(
     flags = _schema_flags(v)
 
     # Build children schemas
-    child_schema_refs, n_children, children_ptr =
-        _make_child_schemas!(v, token, roots)
+    child_schema_refs, n_children, children_ptr = _make_child_schemas!(v, token, roots)
 
     # Dictionary schema
     dict_schema_ref, dict_ptr = _make_dict_schema!(v, token, roots)
@@ -842,7 +852,11 @@ function _make_child_schemas!(v::ArrowVector, token::UInt64, roots::Vector{Any})
     return Ref{ArrowSchema}[], 0, Ptr{Ptr{ArrowSchema}}(C_NULL)
 end
 
-function _make_child_schemas!(v::Union{List,FixedSizeList,Map}, token::UInt64, roots::Vector{Any})
+function _make_child_schemas!(
+    v::Union{List,FixedSizeList,Map},
+    token::UInt64,
+    roots::Vector{Any},
+)
     # These types have a single child
     if v isa List && liststringtype(v)
         # String/binary lists have no child array in C Data Interface
@@ -916,11 +930,19 @@ _get_child_vec(v::FixedSizeList) = v.data
 _get_child_vec(v::Map) = v.data
 
 # Specialisation for NullVector (has no validity field)
-function _fill_array!(out::Ref{ArrowArray}, v::NullVector, token::UInt64, roots::Vector{Any})
+function _fill_array!(
+    out::Ref{ArrowArray},
+    v::NullVector,
+    token::UInt64,
+    roots::Vector{Any},
+)
     len = Int64(length(v))
     out[] = ArrowArray(
-        len, len, Int64(0),
-        Int64(0), Int64(0),
+        len,
+        len,
+        Int64(0),
+        Int64(0),
+        Int64(0),
         Ptr{Ptr{Cvoid}}(C_NULL),
         Ptr{Ptr{ArrowArray}}(C_NULL),
         Ptr{ArrowArray}(C_NULL),
@@ -938,7 +960,7 @@ function _fill_array!(
     roots::Vector{Any},
 )
     len = Int64(length(v))
-    nc  = Int64(nullcount(v))
+    nc = Int64(nullcount(v))
     off = Int64(0)
 
     buffers, n_buffers = _make_buffers(v, roots)
@@ -946,7 +968,9 @@ function _fill_array!(
     dict_array_ref, dict_arr_ptr = _make_dict_array!(v, token, roots)
 
     out[] = ArrowArray(
-        len, nc, off,
+        len,
+        nc,
+        off,
         Int64(n_buffers),
         Int64(n_children),
         buffers,
@@ -1192,7 +1216,7 @@ function to_c_data(col::ArrowVector; name::String="")
     roots = Any[]
 
     schema_ref = Ref{ArrowSchema}()
-    array_ref  = Ref{ArrowArray}()
+    array_ref = Ref{ArrowArray}()
 
     _fill_schema!(schema_ref, col, name, token, roots)
     _fill_array!(array_ref, col, token, roots)
@@ -1215,7 +1239,7 @@ Returns two vectors of `Ref`s (one per column). Each column has its own
 """
 function to_c_data(tbl::Arrow.Table; names::Vector{String}=String.(Tables.columnnames(tbl)))
     schema_refs = Ref{ArrowSchema}[]
-    array_refs  = Ref{ArrowArray}[]
+    array_refs = Ref{ArrowArray}[]
     for (i, col) in enumerate(Tables.columns(tbl))
         nm = i <= length(names) ? names[i] : ""
         s_ref, a_ref = to_c_data(col; name=nm)

@@ -15,10 +15,9 @@
 # limitations under the License.
 
 @testset "Arrow C Data Interface" begin
-
     @testset "struct sizes" begin
         @test sizeof(Arrow.ArrowSchema) == 9 * 8
-        @test sizeof(Arrow.ArrowArray)  == 10 * 8
+        @test sizeof(Arrow.ArrowArray) == 10 * 8
     end
 
     # Helper: convert a Julia array to ArrowVector for export
@@ -28,19 +27,19 @@
 
     @testset "export: format strings" begin
         for (input, expected) in [
-            (Int8[1],      "c"),
-            (UInt8[1],     "C"),
-            (Int16[1],     "s"),
-            (UInt16[1],    "S"),
-            (Int32[1],     "i"),
-            (UInt32[1],    "I"),
-            (Int64[1],     "l"),
-            (UInt64[1],    "L"),
+            (Int8[1], "c"),
+            (UInt8[1], "C"),
+            (Int16[1], "s"),
+            (UInt16[1], "S"),
+            (Int32[1], "i"),
+            (UInt32[1], "I"),
+            (Int64[1], "l"),
+            (UInt64[1], "L"),
             (Float32[1.0], "f"),
             (Float64[1.0], "g"),
-            (Bool[true],   "b"),
-            (["hello"],    "u"),
-            ([missing],    "n"),
+            (Bool[true], "b"),
+            (["hello"], "u"),
+            ([missing], "n"),
         ]
             s_ref, a_ref = Arrow.to_c_data(to_arrow(input))
             GC.@preserve s_ref a_ref begin
@@ -61,9 +60,9 @@
         data = Int32[10, 20, 30]
         s_ref, a_ref = Arrow.to_c_data(to_arrow(data))
         arr = a_ref[]
-        @test arr.length    == 3
+        @test arr.length == 3
         @test arr.null_count == 0
-        @test arr.offset    == 0
+        @test arr.offset == 0
         @test arr.n_buffers == 2
         @test arr.n_children == 0
         # validity buffer should be C_NULL (no nulls)
@@ -115,7 +114,7 @@
         @test unsafe_string(sch.format) == "+s"
         @test sch.n_children == 2
         @test arr.n_children == 2
-        @test arr.n_buffers  == 1
+        @test arr.n_buffers == 1
         # child 0: x field
         c0_sch = unsafe_load(unsafe_load(sch.children))
         @test unsafe_string(c0_sch.format) == "i"
@@ -129,8 +128,12 @@
         @test haskey(Arrow._EXPORT_ROOTS, token)
 
         # Simulate C calling release on the array
-        ccall(arr.release, Cvoid, (Ptr{Arrow.ArrowArray},),
-              Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref))
+        ccall(
+            arr.release,
+            Cvoid,
+            (Ptr{Arrow.ArrowArray},),
+            Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref),
+        )
 
         # Token should be removed
         @test !haskey(Arrow._EXPORT_ROOTS, token)
@@ -144,7 +147,7 @@
         s_ref, a_ref = Arrow.to_c_data(av)
         imported = Arrow.from_c_data(
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s_ref)),
-            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  a_ref)),
+            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test collect(imported) == data
     end
@@ -155,7 +158,7 @@
         s_ref, a_ref = Arrow.to_c_data(av)
         imported = Arrow.from_c_data(
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s_ref)),
-            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  a_ref)),
+            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test isequal(collect(imported), data)
     end
@@ -166,7 +169,7 @@
         s_ref, a_ref = Arrow.to_c_data(av)
         imported = Arrow.from_c_data(
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s_ref)),
-            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  a_ref)),
+            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test collect(imported) == data
     end
@@ -177,7 +180,7 @@
         s_ref, a_ref = Arrow.to_c_data(av)
         imported = Arrow.from_c_data(
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s_ref)),
-            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  a_ref)),
+            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test isequal(collect(imported), data)
     end
@@ -188,7 +191,7 @@
         s_ref, a_ref = Arrow.to_c_data(av)
         imported = Arrow.from_c_data(
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s_ref)),
-            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  a_ref)),
+            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test collect(imported) == data
     end
@@ -199,7 +202,7 @@
         s_ref, a_ref = Arrow.to_c_data(av)
         imported = Arrow.from_c_data(
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s_ref)),
-            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  a_ref)),
+            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test isequal(collect(imported), data)
     end
@@ -210,7 +213,7 @@
         s_ref, a_ref = Arrow.to_c_data(av)
         imported = Arrow.from_c_data(
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s_ref)),
-            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  a_ref));
+            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref));
             convert=false,
         )
         @test collect(imported) == collect(av)
@@ -222,7 +225,7 @@
         s_ref, a_ref = Arrow.to_c_data(av)
         imported = Arrow.from_c_data(
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s_ref)),
-            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  a_ref));
+            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref));
             convert=false,
         )
         @test collect(imported) == collect(av)
@@ -234,7 +237,7 @@
         s_ref, a_ref = Arrow.to_c_data(av)
         imported = Arrow.from_c_data(
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s_ref)),
-            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  a_ref)),
+            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         result = collect(imported)
         @test length(result) == 2
@@ -250,7 +253,7 @@
         s_ref, a_ref = Arrow.to_c_data(av)
         imported = Arrow.from_c_data(
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s_ref)),
-            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  a_ref)),
+            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test collect(imported) == ["a", "b", "a", "c", "b"]
     end
@@ -262,7 +265,7 @@
         @test unsafe_string(s_ref[].format) == "n"
         imported = Arrow.from_c_data(
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s_ref)),
-            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  a_ref)),
+            Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test length(imported) == 5
         @test all(ismissing, imported)
@@ -273,34 +276,38 @@
         data = Int32[99, 99, 1, 2, 3]   # logical elements start at index 3
         buf_ptrs = Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(data))]
 
-        arr_ref = Ref(Arrow.ArrowArray(
-            Int64(3),   # length = 3
-            Int64(0),   # null_count = 0
-            Int64(2),   # offset = 2
-            Int64(2),   # n_buffers = 2
-            Int64(0),   # n_children = 0
-            Ptr{Ptr{Cvoid}}(pointer(buf_ptrs)),
-            Ptr{Ptr{Arrow.ArrowArray}}(C_NULL),
-            Ptr{Arrow.ArrowArray}(C_NULL),
-            Ptr{Cvoid}(C_NULL),  # no release needed (Julia-owned data)
-            Ptr{Cvoid}(C_NULL),
-        ))
+        arr_ref = Ref(
+            Arrow.ArrowArray(
+                Int64(3),   # length = 3
+                Int64(0),   # null_count = 0
+                Int64(2),   # offset = 2
+                Int64(2),   # n_buffers = 2
+                Int64(0),   # n_children = 0
+                Ptr{Ptr{Cvoid}}(pointer(buf_ptrs)),
+                Ptr{Ptr{Arrow.ArrowArray}}(C_NULL),
+                Ptr{Arrow.ArrowArray}(C_NULL),
+                Ptr{Cvoid}(C_NULL),  # no release needed (Julia-owned data)
+                Ptr{Cvoid}(C_NULL),
+            ),
+        )
         fmt_bytes = Vector{UInt8}("i\0")
-        sch_ref = Ref(Arrow.ArrowSchema(
-            Cstring(pointer(fmt_bytes)),
-            Cstring(C_NULL),
-            Cstring(C_NULL),
-            Int64(0),
-            Int64(0),
-            Ptr{Ptr{Arrow.ArrowSchema}}(C_NULL),
-            Ptr{Arrow.ArrowSchema}(C_NULL),
-            Ptr{Cvoid}(C_NULL),
-            Ptr{Cvoid}(C_NULL),
-        ))
+        sch_ref = Ref(
+            Arrow.ArrowSchema(
+                Cstring(pointer(fmt_bytes)),
+                Cstring(C_NULL),
+                Cstring(C_NULL),
+                Int64(0),
+                Int64(0),
+                Ptr{Ptr{Arrow.ArrowSchema}}(C_NULL),
+                Ptr{Arrow.ArrowSchema}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+            ),
+        )
         GC.@preserve data buf_ptrs fmt_bytes arr_ref sch_ref begin
             imported = Arrow.from_c_data(
                 Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, sch_ref)),
-                Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  arr_ref)),
+                Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, arr_ref)),
             )
             @test collect(imported) == Int32[1, 2, 3]
         end
@@ -309,23 +316,38 @@
     @testset "import: C_NULL validity with null_count=0" begin
         data = Int32[10, 20, 30]
         buf_ptrs = Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(data))]
-        arr_ref = Ref(Arrow.ArrowArray(
-            Int64(3), Int64(0), Int64(0), Int64(2), Int64(0),
-            Ptr{Ptr{Cvoid}}(pointer(buf_ptrs)),
-            Ptr{Ptr{Arrow.ArrowArray}}(C_NULL), Ptr{Arrow.ArrowArray}(C_NULL),
-            Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL),
-        ))
+        arr_ref = Ref(
+            Arrow.ArrowArray(
+                Int64(3),
+                Int64(0),
+                Int64(0),
+                Int64(2),
+                Int64(0),
+                Ptr{Ptr{Cvoid}}(pointer(buf_ptrs)),
+                Ptr{Ptr{Arrow.ArrowArray}}(C_NULL),
+                Ptr{Arrow.ArrowArray}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+            ),
+        )
         fmt_bytes = Vector{UInt8}("i\0")
-        sch_ref = Ref(Arrow.ArrowSchema(
-            Cstring(pointer(fmt_bytes)), Cstring(C_NULL), Cstring(C_NULL),
-            Int64(0), Int64(0),
-            Ptr{Ptr{Arrow.ArrowSchema}}(C_NULL), Ptr{Arrow.ArrowSchema}(C_NULL),
-            Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL),
-        ))
+        sch_ref = Ref(
+            Arrow.ArrowSchema(
+                Cstring(pointer(fmt_bytes)),
+                Cstring(C_NULL),
+                Cstring(C_NULL),
+                Int64(0),
+                Int64(0),
+                Ptr{Ptr{Arrow.ArrowSchema}}(C_NULL),
+                Ptr{Arrow.ArrowSchema}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+            ),
+        )
         GC.@preserve data buf_ptrs fmt_bytes arr_ref sch_ref begin
             imported = Arrow.from_c_data(
                 Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, sch_ref)),
-                Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray},  arr_ref)),
+                Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, arr_ref)),
             )
             @test collect(imported) == Int32[10, 20, 30]
         end
@@ -336,7 +358,8 @@
         av = to_arrow(data)
         # Manually create a Primitive with metadata
         meta = Base.ImmutableDict("key1" => "val1", "key2" => "val2")
-        av_meta = Arrow.Primitive(eltype(av), av.arrow, av.validity, av.data, length(av), meta)
+        av_meta =
+            Arrow.Primitive(eltype(av), av.arrow, av.validity, av.data, length(av), meta)
         s_ref, a_ref = Arrow.to_c_data(av_meta)
         sch = s_ref[]
         @test sch.metadata != C_NULL
@@ -352,10 +375,14 @@
         s1, a1 = Arrow.to_c_data(col1; name="x")
         s2, a2 = Arrow.to_c_data(col2; name="y")
         tbl = Arrow.from_c_data(
-            [Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s1)),
-             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s2))],
-            [Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a1)),
-             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a2))],
+            [
+                Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s1)),
+                Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, s2)),
+            ],
+            [
+                Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a1)),
+                Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a2)),
+            ],
         )
         @test Tables.columnnames(tbl) == [:x, :y]
         @test collect(Tables.getcolumn(tbl, :x)) == Int32[1, 2, 3]
@@ -572,23 +599,37 @@
     @testset "import: Bool with non-byte-aligned offset=3" begin
         # Packed byte: 0b10110110 (LSB first)
         # bits 3,4,5,6,7 → 0,1,1,0,1  (reading from bit-position 3)
-        bools    = UInt8[0b10110110]
+        bools = UInt8[0b10110110]
         validity = UInt8[0xff]
         buf_ptrs = Ptr{Cvoid}[Ptr{Cvoid}(pointer(validity)), Ptr{Cvoid}(pointer(bools))]
-        arr_ref = Ref(Arrow.ArrowArray(
-            Int64(5), Int64(0), Int64(3), Int64(2), Int64(0),
-            Ptr{Ptr{Cvoid}}(pointer(buf_ptrs)),
-            Ptr{Ptr{Arrow.ArrowArray}}(C_NULL),
-            Ptr{Arrow.ArrowArray}(C_NULL),
-            Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL),
-        ))
+        arr_ref = Ref(
+            Arrow.ArrowArray(
+                Int64(5),
+                Int64(0),
+                Int64(3),
+                Int64(2),
+                Int64(0),
+                Ptr{Ptr{Cvoid}}(pointer(buf_ptrs)),
+                Ptr{Ptr{Arrow.ArrowArray}}(C_NULL),
+                Ptr{Arrow.ArrowArray}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+            ),
+        )
         fmt_bytes = Vector{UInt8}("b\0")
-        sch_ref = Ref(Arrow.ArrowSchema(
-            Cstring(pointer(fmt_bytes)), Cstring(C_NULL), Cstring(C_NULL),
-            Int64(0), Int64(0),
-            Ptr{Ptr{Arrow.ArrowSchema}}(C_NULL), Ptr{Arrow.ArrowSchema}(C_NULL),
-            Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL),
-        ))
+        sch_ref = Ref(
+            Arrow.ArrowSchema(
+                Cstring(pointer(fmt_bytes)),
+                Cstring(C_NULL),
+                Cstring(C_NULL),
+                Int64(0),
+                Int64(0),
+                Ptr{Ptr{Arrow.ArrowSchema}}(C_NULL),
+                Ptr{Arrow.ArrowSchema}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+            ),
+        )
         GC.@preserve bools validity buf_ptrs arr_ref sch_ref begin
             imported = Arrow.from_c_data(_cptr(sch_ref), _cptr(arr_ref))
             @test collect(imported) == [false, true, true, false, true]
@@ -610,5 +651,4 @@
             @test_nowarn Arrow.release_c_data(tbl)  # second call must not throw
         end
     end
-
 end # @testset "Arrow C Data Interface"
