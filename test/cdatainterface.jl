@@ -15,6 +15,8 @@
 # limitations under the License.
 
 @testset "Arrow C Data Interface" begin
+    _initial_count = Arrow.UNRELEASED_HANDLE_COUNT[]
+
     @testset "struct sizes" begin
         @test sizeof(Arrow.ArrowSchema) == 9 * 8
         @test sizeof(Arrow.ArrowArray) == 10 * 8
@@ -150,6 +152,7 @@
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test collect(imported) == data
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: Float64 with missing" begin
@@ -161,6 +164,7 @@
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test isequal(collect(imported), data)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: Bool" begin
@@ -172,6 +176,7 @@
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test collect(imported) == data
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: Bool with missing" begin
@@ -183,6 +188,7 @@
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test isequal(collect(imported), data)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: String" begin
@@ -194,6 +200,7 @@
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test collect(imported) == data
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: String with missing" begin
@@ -205,6 +212,7 @@
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test isequal(collect(imported), data)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: Date" begin
@@ -217,6 +225,7 @@
             convert=false,
         )
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: Timestamp" begin
@@ -229,6 +238,7 @@
             convert=false,
         )
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: struct" begin
@@ -245,6 +255,7 @@
         @test result[1].y == "a"
         @test result[2].x == Int32(2)
         @test result[2].y == "b"
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: dict encoded" begin
@@ -256,6 +267,7 @@
             Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, a_ref)),
         )
         @test collect(imported) == ["a", "b", "a", "c", "b"]
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: null array" begin
@@ -269,6 +281,7 @@
         )
         @test length(imported) == 5
         @test all(ismissing, imported)
+        Arrow.release_c_data(imported)
     end
 
     @testset "import: non-zero offset" begin
@@ -310,6 +323,7 @@
                 Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, arr_ref)),
             )
             @test collect(imported) == Int32[1, 2, 3]
+            Arrow.release_c_data(imported)
         end
     end
 
@@ -350,6 +364,7 @@
                 Ptr{Cvoid}(Base.unsafe_convert(Ptr{Arrow.ArrowArray}, arr_ref)),
             )
             @test collect(imported) == Int32[10, 20, 30]
+            Arrow.release_c_data(imported)
         end
     end
 
@@ -387,6 +402,7 @@
         @test Tables.columnnames(tbl) == [:x, :y]
         @test collect(Tables.getcolumn(tbl, :x)) == Int32[1, 2, 3]
         @test collect(Tables.getcolumn(tbl, :y)) == ["a", "b", "c"]
+        Arrow.release_c_data(tbl)
     end
 
     # Helper: convert a Ref to a Ptr{Cvoid} for from_c_data
@@ -404,6 +420,7 @@
         @test unsafe_string(s_ref[].format) == "+l"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: list of Int32 with missing (+l)" begin
@@ -413,6 +430,7 @@
         @test unsafe_string(s_ref[].format) == "+l"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
         @test isequal(collect(imported), collect(av))
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: list of String (+l)" begin
@@ -422,6 +440,7 @@
         @test unsafe_string(s_ref[].format) == "+l"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     # ── Fixed-size list ──────────────────────────────────────────────────────
@@ -433,6 +452,7 @@
         @test unsafe_string(s_ref[].format) == "+w:2"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref); convert=false)
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: fixed-size list NTuple{3,Int64} (+w:3)" begin
@@ -442,6 +462,7 @@
         @test unsafe_string(s_ref[].format) == "+w:3"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref); convert=false)
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     # ── Map ──────────────────────────────────────────────────────────────────
@@ -453,6 +474,7 @@
         @test unsafe_string(s_ref[].format) == "+m"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     # ── Unions ───────────────────────────────────────────────────────────────
@@ -464,6 +486,7 @@
         @test startswith(unsafe_string(s_ref[].format), "+ud:")
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: sparse union Union{Int32,Float64} (+us:)" begin
@@ -473,6 +496,7 @@
         @test startswith(unsafe_string(s_ref[].format), "+us:")
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     # ── Time-of-day ──────────────────────────────────────────────────────────
@@ -484,6 +508,7 @@
         @test unsafe_string(s_ref[].format) == "ttn"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref); convert=false)
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     # ── Duration ─────────────────────────────────────────────────────────────
@@ -495,6 +520,7 @@
         @test unsafe_string(s_ref[].format) == "tDs"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref); convert=false)
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: Duration milliseconds (tDm)" begin
@@ -504,6 +530,7 @@
         @test unsafe_string(s_ref[].format) == "tDm"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref); convert=false)
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: Duration microseconds (tDu)" begin
@@ -513,6 +540,7 @@
         @test unsafe_string(s_ref[].format) == "tDu"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref); convert=false)
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: Duration nanoseconds (tDn)" begin
@@ -522,6 +550,7 @@
         @test unsafe_string(s_ref[].format) == "tDn"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref); convert=false)
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     # ── Timestamp with timezone ───────────────────────────────────────────────
@@ -537,6 +566,7 @@
         @test startswith(fmt, "ts") && endswith(fmt, ":UTC")
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref); convert=false)
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     # ── Interval ─────────────────────────────────────────────────────────────
@@ -550,6 +580,7 @@
         @test unsafe_string(s_ref[].format) == "tiM"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref); convert=false)
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: Interval day-time (tiD)" begin
@@ -561,6 +592,7 @@
         @test unsafe_string(s_ref[].format) == "tiD"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref); convert=false)
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     # ── Decimal ───────────────────────────────────────────────────────────────
@@ -573,6 +605,7 @@
         @test unsafe_string(s_ref[].format) == "d:10,2,128"
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref); convert=false)
         @test collect(imported) == collect(av)
+        Arrow.release_c_data(imported)
     end
 
     # ── Table export ──────────────────────────────────────────────────────────
@@ -591,6 +624,7 @@
             @test Tables.columnnames(tbl2) == [:x, :y]
             @test collect(Tables.getcolumn(tbl2, :x)) == Int32[1, 2, 3]
             @test collect(Tables.getcolumn(tbl2, :y)) == ["a", "b", "c"]
+            Arrow.release_c_data(tbl2)
         end
     end
 
@@ -633,6 +667,7 @@
         GC.@preserve bools validity buf_ptrs arr_ref sch_ref begin
             imported = Arrow.from_c_data(_cptr(sch_ref), _cptr(arr_ref))
             @test collect(imported) == [false, true, true, false, true]
+            Arrow.release_c_data(imported)
         end
     end
 
@@ -656,14 +691,16 @@
 
     @testset "finalizer: increments leak counter when not released" begin
         before = Arrow.UNRELEASED_HANDLE_COUNT[]
-        let
-            av = to_arrow(Int32[1, 2, 3])
-            s_ref, a_ref = Arrow.to_c_data(av)
-            Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
-            # CImportedArray and its CDataHandle go out of scope here
+        redirect_stderr(devnull) do
+            let
+                av = to_arrow(Int32[1, 2, 3])
+                s_ref, a_ref = Arrow.to_c_data(av)
+                Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
+                # CImportedArray and its CDataHandle go out of scope here
+            end
+            GC.gc(true)
+            GC.gc(true)
         end
-        GC.gc(true)
-        GC.gc(true)
         @test Arrow.UNRELEASED_HANDLE_COUNT[] == before + 1
     end
 
@@ -689,6 +726,7 @@
         @test a_ref[].length == 0
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
         @test collect(imported) == Int32[]
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: empty String array" begin
@@ -698,6 +736,7 @@
         @test a_ref[].length == 0
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
         @test collect(imported) == String[]
+        Arrow.release_c_data(imported)
     end
 
     # ── Large arrays ─────────────────────────────────────────────────────────
@@ -709,6 +748,7 @@
         @test a_ref[].length == 1_000_000
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
         @test collect(imported) == data
+        Arrow.release_c_data(imported)
     end
 
     @testset "round-trip: large nullable Float64 array (1M rows)" begin
@@ -718,5 +758,12 @@
         @test a_ref[].length == 1_000_000
         imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
         @test isequal(collect(imported), data)
+        Arrow.release_c_data(imported)
+    end
+
+    @testset "no unexpected resource leaks" begin
+        GC.gc(true)
+        GC.gc(true)
+        @test Arrow.UNRELEASED_HANDLE_COUNT[] == _initial_count + 1  # +1 for the intentional leak test
     end
 end # @testset "Arrow C Data Interface"
