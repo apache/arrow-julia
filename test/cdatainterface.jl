@@ -22,6 +22,75 @@
         @test sizeof(Arrow.ArrowArray) == 10 * 8
     end
 
+    @testset "struct field offsets match C ABI" begin
+        c_src = """
+        #include <stddef.h>
+        #include <stdint.h>
+        #include <stdio.h>
+        struct ArrowSchema {
+            const char* format;
+            const char* name;
+            const char* metadata;
+            int64_t flags;
+            int64_t n_children;
+            struct ArrowSchema** children;
+            struct ArrowSchema* dictionary;
+            void (*release)(struct ArrowSchema*);
+            void* private_data;
+        };
+        struct ArrowArray {
+            int64_t length;
+            int64_t null_count;
+            int64_t offset;
+            int64_t n_buffers;
+            int64_t n_children;
+            const void** buffers;
+            struct ArrowArray** children;
+            struct ArrowArray* dictionary;
+            void (*release)(struct ArrowArray*);
+            void* private_data;
+        };
+        int main() {
+            printf("%zu %zu %zu %zu %zu %zu %zu %zu %zu\\n",
+                offsetof(struct ArrowSchema, format),
+                offsetof(struct ArrowSchema, name),
+                offsetof(struct ArrowSchema, metadata),
+                offsetof(struct ArrowSchema, flags),
+                offsetof(struct ArrowSchema, n_children),
+                offsetof(struct ArrowSchema, children),
+                offsetof(struct ArrowSchema, dictionary),
+                offsetof(struct ArrowSchema, release),
+                offsetof(struct ArrowSchema, private_data));
+            printf("%zu %zu %zu %zu %zu %zu %zu %zu %zu %zu\\n",
+                offsetof(struct ArrowArray, length),
+                offsetof(struct ArrowArray, null_count),
+                offsetof(struct ArrowArray, offset),
+                offsetof(struct ArrowArray, n_buffers),
+                offsetof(struct ArrowArray, n_children),
+                offsetof(struct ArrowArray, buffers),
+                offsetof(struct ArrowArray, children),
+                offsetof(struct ArrowArray, dictionary),
+                offsetof(struct ArrowArray, release),
+                offsetof(struct ArrowArray, private_data));
+        }
+        """
+        mktempdir() do d
+            src = joinpath(d, "probe.c")
+            bin = joinpath(d, "probe")
+            write(src, c_src)
+            run(`cc -o $bin $src`)
+            lines = split(readchomp(`$bin`), '\n')
+            schema_offsets = parse.(Int, split(lines[1]))
+            array_offsets = parse.(Int, split(lines[2]))
+            for (i, off) in enumerate(schema_offsets)
+                @test fieldoffset(Arrow.ArrowSchema, i) == off
+            end
+            for (i, off) in enumerate(array_offsets)
+                @test fieldoffset(Arrow.ArrowArray, i) == off
+            end
+        end
+    end
+
     # Helper: convert a Julia array to ArrowVector for export
     function to_arrow(x)
         return Arrow.toarrowvector(x)

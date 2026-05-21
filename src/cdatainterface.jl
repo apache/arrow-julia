@@ -93,8 +93,12 @@ function _warn_unreleased(h::CDataHandle)
     h.released && return
     Threads.atomic_add!(UNRELEASED_HANDLE_COUNT, 1)
     # Use jl_safe_printf since task switches are forbidden in finalizers.
-    ccall(:jl_safe_printf, Cvoid, (Cstring,),
-        "Arrow.CDataHandle GC'd without explicit release_c_data — resource leak detected\n")
+    ccall(
+        :jl_safe_printf,
+        Cvoid,
+        (Cstring,),
+        "Arrow.CDataHandle GC'd without explicit release_c_data — resource leak detected\n",
+    )
     _release_cdata_handle(h)
 end
 
