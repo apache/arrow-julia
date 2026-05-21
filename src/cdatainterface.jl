@@ -75,8 +75,10 @@ const CDATA_FLAG_MAP_KEYS_SORTED = Int64(4)
 """
     CDataHandle
 
-Holds C-side pointers for an imported Arrow C Data Interface pair and calls
-the C `release` callbacks when the Julia wrapper is garbage collected.
+Holds C-side pointers for an imported Arrow C Data Interface pair.
+Call `Arrow.release_c_data` to release C resources explicitly.
+If the handle is garbage-collected without being released, an error is logged
+and `Arrow.UNRELEASED_HANDLE_COUNT` is incremented.
 """
 mutable struct CDataHandle
     schema_ptr::Ptr{ArrowSchema}
@@ -84,7 +86,21 @@ mutable struct CDataHandle
     released::Bool
 end
 
-CDataHandle(sp::Ptr{ArrowSchema}, ap::Ptr{ArrowArray}) = CDataHandle(sp, ap, false)
+# Counts CDataHandles that were GC'd without an explicit release_c_data call.
+const UNRELEASED_HANDLE_COUNT = Threads.Atomic{Int}(0)
+
+function _warn_unreleased(h::CDataHandle)
+    h.released && return
+    Threads.atomic_add!(UNRELEASED_HANDLE_COUNT, 1)
+    ccall(:jl_safe_printf, Cvoid, (Cstring,),
+        "Arrow.CDataHandle GC'd without explicit release_c_data — resource leak detected\n")
+end
+
+function CDataHandle(sp::Ptr{ArrowSchema}, ap::Ptr{ArrowArray})
+    h = CDataHandle(sp, ap, false)
+    finalizer(_warn_unreleased, h)
+    return h
+end
 
 function _release_cdata_handle(h::CDataHandle)
     h.released && return

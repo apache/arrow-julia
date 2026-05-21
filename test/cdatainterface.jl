@@ -651,4 +651,72 @@
             @test_nowarn Arrow.release_c_data(tbl)  # second call must not throw
         end
     end
+
+    # ── Finalizer / leak counter ──────────────────────────────────────────────
+
+    @testset "finalizer: increments leak counter when not released" begin
+        before = Arrow.UNRELEASED_HANDLE_COUNT[]
+        let
+            av = to_arrow(Int32[1, 2, 3])
+            s_ref, a_ref = Arrow.to_c_data(av)
+            Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
+            # CImportedArray and its CDataHandle go out of scope here
+        end
+        GC.gc(true)
+        GC.gc(true)
+        @test Arrow.UNRELEASED_HANDLE_COUNT[] == before + 1
+    end
+
+    @testset "finalizer: does NOT increment counter when released explicitly" begin
+        before = Arrow.UNRELEASED_HANDLE_COUNT[]
+        let
+            av = to_arrow(Int32[1, 2, 3])
+            s_ref, a_ref = Arrow.to_c_data(av)
+            col = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
+            Arrow.release_c_data(col)
+        end
+        GC.gc(true)
+        GC.gc(true)
+        @test Arrow.UNRELEASED_HANDLE_COUNT[] == before
+    end
+
+    # ── Empty arrays ─────────────────────────────────────────────────────────
+
+    @testset "round-trip: empty Int32 array" begin
+        data = Int32[]
+        av = to_arrow(data)
+        s_ref, a_ref = Arrow.to_c_data(av)
+        @test a_ref[].length == 0
+        imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
+        @test collect(imported) == Int32[]
+    end
+
+    @testset "round-trip: empty String array" begin
+        data = String[]
+        av = to_arrow(data)
+        s_ref, a_ref = Arrow.to_c_data(av)
+        @test a_ref[].length == 0
+        imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
+        @test collect(imported) == String[]
+    end
+
+    # ── Large arrays ─────────────────────────────────────────────────────────
+
+    @testset "round-trip: large Int32 array (1M rows)" begin
+        data = rand(Int32, 1_000_000)
+        av = to_arrow(data)
+        s_ref, a_ref = Arrow.to_c_data(av)
+        @test a_ref[].length == 1_000_000
+        imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
+        @test collect(imported) == data
+    end
+
+    @testset "round-trip: large nullable Float64 array (1M rows)" begin
+        data = Union{Float64,Missing}[isodd(i) ? Float64(i) : missing for i = 1:1_000_000]
+        av = to_arrow(data)
+        s_ref, a_ref = Arrow.to_c_data(av)
+        @test a_ref[].length == 1_000_000
+        imported = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
+        @test isequal(collect(imported), data)
+    end
 end # @testset "Arrow C Data Interface"
