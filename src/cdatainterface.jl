@@ -141,7 +141,10 @@ end
 Base.size(x::CImportedArray) = size(x.data)
 Base.IndexStyle(::Type{<:CImportedArray}) = Base.IndexLinear()
 Base.@propagate_inbounds function Base.getindex(x::CImportedArray, i::Integer)
-    @boundscheck checkbounds(x, i)
+    @boundscheck begin
+        x.handle.released && throw(ArgumentError("CImportedArray accessed after release_c_data"))
+        checkbounds(x, i)
+    end
     return @inbounds x.data[i]
 end
 
