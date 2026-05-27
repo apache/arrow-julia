@@ -457,11 +457,8 @@ function _import_arrowvec(
         T_inner = NTuple{N,UInt8}
         T = nullable ? Union{T_inner,Missing} : T_inner
         dptr = Ptr{UInt8}(_cbuf(arr, 1))
-        n_bytes = (len + off) * N
-        data_bytes = dptr == C_NULL ? _EMPTY_BYTES : unsafe_wrap(Array, dptr, n_bytes; own=false)
-        # Apply offset: skip first `off*N` bytes
-        data_view = off == 0 ? data_bytes : view(data_bytes, (off * N + 1):n_bytes)
-        return FixedSizeList{T,typeof(data_view)}(_EMPTY_BYTES, validity, data_view, len, meta)
+        data_bytes = dptr == C_NULL ? _EMPTY_BYTES : unsafe_wrap(Array, dptr + off * N, len * N; own=false)
+        return FixedSizeList{T,typeof(data_bytes)}(_EMPTY_BYTES, validity, data_bytes, len, meta)
     end
 
     # String / binary (list with inline data)
@@ -470,13 +467,11 @@ function _import_arrowvec(
         T_inner = (fmt == "u" || fmt == "U") ? String : Base.CodeUnits{UInt8,String}
         T = nullable ? Union{T_inner,Missing} : T_inner
         optr = Ptr{OT}(_cbuf(arr, 1))
-        n_offs = len + off + 1
-        offs_arr = optr == C_NULL ? OT[] : unsafe_wrap(Array, optr, n_offs; own=false)
-        offs_view = off == 0 ? offs_arr : view(offs_arr, (off + 1):n_offs)
-        offsets = Offsets(_EMPTY_BYTES, offs_view)
+        offs_arr = optr == C_NULL ? OT[] : unsafe_wrap(Array, optr + off * sizeof(OT), len + 1; own=false)
+        offsets = Offsets(_EMPTY_BYTES, offs_arr)
         dptr = Ptr{UInt8}(_cbuf(arr, 2))
         # data length = last offset value
-        data_len = n_offs > 0 && optr != C_NULL ? Int(offs_arr[n_offs]) : 0
+        data_len = isempty(offs_arr) ? 0 : Int(offs_arr[end])
         data_bytes =
             dptr == C_NULL ? _EMPTY_BYTES : unsafe_wrap(Array, dptr, data_len; own=false)
         return List{T,OT,Vector{UInt8}}(_EMPTY_BYTES, validity, offsets, data_bytes, len, meta)
@@ -486,10 +481,8 @@ function _import_arrowvec(
     if fmt == "+l" || fmt == "+L"
         OT = fmt == "+L" ? Int64 : Int32
         optr = Ptr{OT}(_cbuf(arr, 1))
-        n_offs = len + off + 1
-        offs_arr = optr == C_NULL ? OT[] : unsafe_wrap(Array, optr, n_offs; own=false)
-        offs_view = off == 0 ? offs_arr : view(offs_arr, (off + 1):n_offs)
-        offsets = Offsets(_EMPTY_BYTES, offs_view)
+        offs_arr = optr == C_NULL ? OT[] : unsafe_wrap(Array, optr + off * sizeof(OT), len + 1; own=false)
+        offsets = Offsets(_EMPTY_BYTES, offs_arr)
         child_arr_ptr = _cchild_arr(arr, 0)
         child_sch_ptr = _cchild_sch(sch, 0)
         A = _import_arrowvec(child_arr_ptr, child_sch_ptr, handle, convert)
@@ -537,10 +530,8 @@ function _import_arrowvec(
     # Map "+m"
     if fmt == "+m"
         optr = Ptr{Int32}(_cbuf(arr, 1))
-        n_offs = len + off + 1
-        offs_arr = optr == C_NULL ? Int32[] : unsafe_wrap(Array, optr, n_offs; own=false)
-        offs_view = off == 0 ? offs_arr : view(offs_arr, (off + 1):n_offs)
-        offsets = Offsets(_EMPTY_BYTES, offs_view)
+        offs_arr = optr == C_NULL ? Int32[] : unsafe_wrap(Array, optr + off * sizeof(Int32), len + 1; own=false)
+        offsets = Offsets(_EMPTY_BYTES, offs_arr)
         # child[0] is entries struct (key + value fields)
         A = _import_arrowvec(_cchild_arr(arr, 0), _cchild_sch(sch, 0), handle, convert)
         T_entry = eltype(A)
@@ -615,10 +606,8 @@ function _import_arrowvec(
     if sch.dictionary != C_NULL
         S = _fmt_to_storage_type(fmt)  # index type (e.g., Int8)
         iptr = Ptr{S}(_cbuf(arr, 1))
-        n_idx = len + off
-        idx_arr = iptr == C_NULL ? S[] : unsafe_wrap(Array, iptr, n_idx; own=false)
-        idx_view = off == 0 ? idx_arr : view(idx_arr, (off + 1):n_idx)
-        idx_vec = Vector{S}(idx_view)  # make a copy since DictEncoded.indices is Vector{S}
+        idx_arr = iptr == C_NULL ? S[] : unsafe_wrap(Array, iptr + off * sizeof(S), len; own=false)
+        idx_vec = Vector{S}(idx_arr)  # make a copy since DictEncoded.indices is Vector{S}
         dict_arr_ptr = arr.dictionary
         dict_sch_ptr = sch.dictionary
         dict_vec = _import_arrowvec(dict_arr_ptr, dict_sch_ptr, handle, convert)
@@ -636,10 +625,8 @@ function _import_arrowvec(
     if dptr == C_NULL
         return Primitive(T, _EMPTY_BYTES, validity, S[], len, meta)
     end
-    n = len + off
-    data_arr = unsafe_wrap(Array, dptr, n; own=false)
-    data_view = off == 0 ? data_arr : view(data_arr, (off + 1):n)
-    return Primitive(T, _EMPTY_BYTES, validity, data_view, len, meta)
+    data_arr = unsafe_wrap(Array, dptr + off * sizeof(S), len; own=false)
+    return Primitive(T, _EMPTY_BYTES, validity, data_arr, len, meta)
 end
 
 """
@@ -845,20 +832,18 @@ function _import_arrowvec_fast(
         T_inner = NTuple{N,UInt8}
         T = nullable ? Union{T_inner,Missing} : T_inner
         dptr = Ptr{UInt8}(_cbuf(arr, 1))
-        n_bytes = (len + off) * N
-        data_bytes = dptr == C_NULL ? _EMPTY_BYTES : unsafe_wrap(Array, dptr, n_bytes; own=false)
-        data_view = off == 0 ? data_bytes : view(data_bytes, (off * N + 1):n_bytes)
-        return FixedSizeList{T,typeof(data_view)}(_EMPTY_BYTES, validity, data_view, len, meta)
+        data = dptr == C_NULL ? CBuffer{UInt8}(Ptr{UInt8}(C_NULL), 0) :
+                                CBuffer{UInt8}(dptr + off * N, len * N)
+        return FixedSizeList{T,CBuffer{UInt8}}(_EMPTY_BYTES, validity, data, len, meta)
     end
 
     if k == CKIND_STR32 || k == CKIND_BIN32
         T_inner = k == CKIND_STR32 ? String : Base.CodeUnits{UInt8,String}
         T = nullable ? Union{T_inner,Missing} : T_inner
         optr = Ptr{Int32}(_cbuf(arr, 1))
-        n_offs = len + off + 1
-        offsets = COffsets{Int32}(optr, len + off)
+        offsets = COffsets{Int32}(optr + off, len)
         dptr = Ptr{UInt8}(_cbuf(arr, 2))
-        data_len = optr != C_NULL ? Int(unsafe_load(optr, n_offs)) : 0
+        data_len = optr != C_NULL ? Int(unsafe_load(optr + off, len + 1)) : 0
         data_bytes = dptr == C_NULL ? CBuffer{UInt8}(Ptr{UInt8}(C_NULL), 0) :
                                        CBuffer{UInt8}(dptr, data_len)
         return List{T,Int32,CBuffer{UInt8},COffsets{Int32}}(_EMPTY_BYTES, validity, offsets, data_bytes, len, meta)
@@ -868,10 +853,9 @@ function _import_arrowvec_fast(
         T_inner = k == CKIND_STR64 ? String : Base.CodeUnits{UInt8,String}
         T = nullable ? Union{T_inner,Missing} : T_inner
         optr = Ptr{Int64}(_cbuf(arr, 1))
-        n_offs = len + off + 1
-        offsets = COffsets{Int64}(optr, len + off)
+        offsets = COffsets{Int64}(optr + off, len)
         dptr = Ptr{UInt8}(_cbuf(arr, 2))
-        data_len = optr != C_NULL ? Int(unsafe_load(optr, n_offs)) : 0
+        data_len = optr != C_NULL ? Int(unsafe_load(optr + off, len + 1)) : 0
         data_bytes = dptr == C_NULL ? CBuffer{UInt8}(Ptr{UInt8}(C_NULL), 0) :
                                        CBuffer{UInt8}(dptr, data_len)
         return List{T,Int64,CBuffer{UInt8},COffsets{Int64}}(_EMPTY_BYTES, validity, offsets, data_bytes, len, meta)
@@ -879,7 +863,7 @@ function _import_arrowvec_fast(
 
     if k == CKIND_LIST32
         optr = Ptr{Int32}(_cbuf(arr, 1))
-        offsets = COffsets{Int32}(optr, len + off)
+        offsets = COffsets{Int32}(optr + off, len)
         A = _import_arrowvec_fast(_cchild_arr(arr, 0), node.children[1])
         T_child = eltype(A)
         ST = SubArray{T_child,1,typeof(A),Tuple{UnitRange{Int64}},true}
@@ -889,7 +873,7 @@ function _import_arrowvec_fast(
 
     if k == CKIND_LIST64
         optr = Ptr{Int64}(_cbuf(arr, 1))
-        offsets = COffsets{Int64}(optr, len + off)
+        offsets = COffsets{Int64}(optr + off, len)
         A = _import_arrowvec_fast(_cchild_arr(arr, 0), node.children[1])
         T_child = eltype(A)
         ST = SubArray{T_child,1,typeof(A),Tuple{UnitRange{Int64}},true}
@@ -982,10 +966,8 @@ end
 @generated function _make_dict_indices(arr::ArrowArray, len::Int, off::Int, ::Val{S}) where {S}
     quote
         iptr = Ptr{$S}(_cbuf(arr, 1))
-        n_idx = len + off
-        idx_arr = iptr == C_NULL ? CBuffer{$S}(Ptr{$S}(C_NULL), 0) : CBuffer{$S}(iptr, n_idx)
-        idx_view = off == 0 ? idx_arr : view(idx_arr, (off + 1):n_idx)
-        return Vector{$S}(idx_view)
+        iptr == C_NULL && return $S[]
+        return Vector{$S}(CBuffer{$S}(iptr + off, len))
     end
 end
 
@@ -998,10 +980,7 @@ end
         T = nullable ? Union{$S,Missing} : $S
         dptr = Ptr{$S}(_cbuf(arr, 1))
         dptr == C_NULL && return Primitive(T, _EMPTY_BYTES, validity, $S[], len, meta)
-        n = len + off
-        data = CBuffer{$S}(dptr, n)
-        data_view = off == 0 ? data : view(data, (off + 1):n)
-        return Primitive(T, _EMPTY_BYTES, validity, data_view, len, meta)
+        return Primitive(T, _EMPTY_BYTES, validity, CBuffer{$S}(dptr + off, len), len, meta)
     end
 end
 
