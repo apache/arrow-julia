@@ -19,12 +19,18 @@
 
 An `ArrowVector` where each element is a "map" of some kind, like a `Dict`.
 """
-struct Map{T,O,A} <: ArrowVector{T}
+struct Map{T,O,A,OF} <: ArrowVector{T}
     validity::ValidityBitmap
-    offsets::Offsets{O}
+    offsets::OF
     data::A
     ℓ::Int
     metadata::Union{Nothing,Base.ImmutableDict{String,String}}
+end
+
+function Map{T,O,A}(
+    validity, offsets::OF, data, ℓ, meta,
+) where {T,O,A,OF<:AbstractOffsets}
+    return Map{T,O,A,OF}(validity, offsets, data, ℓ, meta)
 end
 
 Base.size(l::Map) = (l.ℓ,)
@@ -86,7 +92,7 @@ function compress(Z::Meta.CompressionType.T, comp, x::A) where {A<:Map}
     len = length(x)
     nc = nullcount(x)
     validity = compress(Z, comp, x.validity)
-    offsets = compress(Z, comp, x.offsets.offsets)
+    offsets = compress(Z, comp, _raw_offsets(x.offsets))
     buffers = [validity, offsets]
     children = Compressed[]
     push!(children, compress(Z, comp, x.data))
@@ -131,8 +137,8 @@ function writebuffer(io, col::Union{Map{T,O,A},List{T,O,A}}, alignment) where {T
     @debug col
     writebitmap(io, col, alignment)
     # write offsets
-    n = writearray(io, O, col.offsets.offsets)
-    @debug "writing array: col = $(typeof(col.offsets.offsets)), n = $n, padded = $(padding(n, alignment))"
+    n = writearray(io, O, _raw_offsets(col.offsets))
+    @debug "writing array: col = $(typeof(_raw_offsets(col.offsets))), n = $n, padded = $(padding(n, alignment))"
     writezeros(io, paddinglength(n, alignment))
     # write values array
     if liststringtype(col)

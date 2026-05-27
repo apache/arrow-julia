@@ -56,7 +56,15 @@ using DataAPI,
 
 export ArrowTypes
 export ArrowSchema,
-    ArrowArray, CImportedArray, CImportedTable, from_c_data, to_c_data, release_c_data
+    ArrowArray,
+    CImportedArray,
+    CImportedTable,
+    SchemaNode,
+    TableSchema,
+    from_c_data,
+    parse_c_schema,
+    to_c_data,
+    release_c_data
 
 using Base: @propagate_inbounds
 import Base: ==

@@ -29,7 +29,7 @@
 Mirrors `struct ArrowSchema` from the Arrow C Data Interface specification.
 Layout must be ABI-compatible with the C struct (9 pointer-sized fields).
 """
-mutable struct ArrowSchema
+struct ArrowSchema
     format::Cstring
     name::Cstring
     metadata::Cstring
@@ -47,7 +47,7 @@ end
 Mirrors `struct ArrowArray` from the Arrow C Data Interface specification.
 Layout must be ABI-compatible with the C struct (10 pointer-sized fields).
 """
-mutable struct ArrowArray
+struct ArrowArray
     length::Int64
     null_count::Int64
     offset::Int64
@@ -68,6 +68,114 @@ const CDATA_FLAG_NULLABLE = Int64(2)
 const CDATA_FLAG_DICT_ORDERED = Int64(1)
 const CDATA_FLAG_MAP_KEYS_SORTED = Int64(4)
 
+# Shared empty buffer used in all imported ArrowVectors (never mutated)
+const _EMPTY_BYTES = UInt8[]
+
+# Singleton "all valid" ValidityBitmap: returned for every null-free column so that
+# Primitive/List/etc. store a pointer to this one object rather than allocating a new one.
+const _ALL_VALID = ValidityBitmap(UInt8[], 1, 0, 0)
+
+"""
+    CBuffer{T}
+
+An isbits `AbstractVector{T}` that reads directly through a C pointer with no
+heap allocation — unlike `unsafe_wrap`, which allocates a Julia array header.
+Used internally by the C Data Interface import path.
+"""
+struct CBuffer{T} <: AbstractVector{T}
+    ptr::Ptr{T}
+    len::Int
+end
+
+Base.size(b::CBuffer) = (b.len,)
+Base.IndexStyle(::Type{<:CBuffer}) = Base.IndexLinear()
+@inline Base.getindex(b::CBuffer{T}, i::Int) where {T} = unsafe_load(b.ptr, i)
+Base.unsafe_convert(::Type{Ptr{T}}, b::CBuffer{T}) where {T} = b.ptr
+Base.pointer(b::CBuffer{T}) where {T} = b.ptr
+Base.pointer(b::CBuffer{T}, i::Integer) where {T} = b.ptr + (i - 1) * sizeof(T)
+
+"""
+    COffsets{T}
+
+An isbits `AbstractOffsets{T}` that reads offset pairs directly through a C pointer.
+Unlike `Offsets{T}`, which wraps a `Vector{T}`, `COffsets{T}` is zero-allocation —
+it stores only a `Ptr{T}` and a length, and is embedded inline inside `List` and `Map`.
+"""
+struct COffsets{T<:Union{Int32,Int64}} <: AbstractOffsets{T}
+    ptr::Ptr{T}
+    len::Int
+end
+
+Base.size(o::COffsets) = (o.len,)
+
+@inline function Base.getindex(o::COffsets{T}, i::Integer) where {T}
+    @boundscheck checkbounds(o, i)
+    lo = unsafe_load(o.ptr, i) + one(T)
+    hi = unsafe_load(o.ptr, i + 1)
+    return lo, hi
+end
+
+# Kind tags for SchemaNode dispatch — avoids re-parsing the format string per batch
+const CKIND_NULL        = UInt8(0)
+const CKIND_BOOL        = UInt8(1)
+const CKIND_PRIM        = UInt8(2)
+const CKIND_FIXED_BIN   = UInt8(3)   # "w:N"
+const CKIND_STR32       = UInt8(4)   # "u"
+const CKIND_STR64       = UInt8(5)   # "U"
+const CKIND_BIN32       = UInt8(6)   # "z"
+const CKIND_BIN64       = UInt8(7)   # "Z"
+const CKIND_LIST32      = UInt8(8)   # "+l"
+const CKIND_LIST64      = UInt8(9)   # "+L"
+const CKIND_FIXED_LIST  = UInt8(10)  # "+w:N"
+const CKIND_STRUCT      = UInt8(11)  # "+s"
+const CKIND_MAP         = UInt8(12)  # "+m"
+const CKIND_DENSE_UNION = UInt8(13)  # "+ud:..."
+const CKIND_SPARSE_UNION= UInt8(14)  # "+us:..."
+const CKIND_DICT        = UInt8(15)  # dictionary-encoded
+
+"""
+    SchemaNode
+
+Parsed representation of an `ArrowSchema` tree. Captures format, nullability,
+metadata, children, and dictionary as Julia values, and pre-computes the dispatch
+kind, storage type, and fixed sizes so that [`from_c_data`](@ref) can import
+repeated batches with the same schema without re-parsing anything per batch.
+
+Obtain one via [`Arrow.parse_c_schema`](@ref).
+"""
+struct SchemaNode
+    fmt::String
+    name::Symbol
+    nullable::Bool
+    flags::Int64
+    n_children::Int
+    children::Vector{SchemaNode}
+    has_dictionary::Bool
+    dict_node::Union{Nothing,SchemaNode}
+    meta::Union{Nothing,Base.ImmutableDict{String,String}}
+    # Pre-parsed fields: computed once at schema-parse time, reused per batch
+    kind::UInt8
+    storage_type::Type            # for CKIND_PRIM and CKIND_DICT (index type)
+    fixed_size::Int               # for CKIND_FIXED_BIN and CKIND_FIXED_LIST
+    type_ids::Union{Nothing,Tuple{Vararg{Int32}}}  # for union kinds
+end
+
+"""
+    TableSchema
+
+Parsed schema for a multi-column table. Holds the per-column [`SchemaNode`](@ref)s
+together with the pre-built column-name vector and name→index lookup so that
+[`from_c_data`](@ref) can import repeated batches with zero per-batch allocations
+for schema work.
+
+Obtain one via `Arrow.parse_c_schema(schema_ptrs)`.
+"""
+struct TableSchema
+    nodes::Vector{SchemaNode}
+    col_names::Vector{Symbol}
+    lookup::Dict{Symbol,Int}
+end
+
 ###############################################################################
 # Import path (C → Julia)                                                     #
 ###############################################################################
@@ -77,36 +185,20 @@ const CDATA_FLAG_MAP_KEYS_SORTED = Int64(4)
 
 Holds C-side pointers for an imported Arrow C Data Interface pair.
 Call `Arrow.release_c_data` to release C resources explicitly.
-If the handle is garbage-collected without being released, an error is logged
-and `Arrow.UNRELEASED_HANDLE_COUNT` is incremented.
+
+If `owns_array_memory` is `true`, `_release_cdata_handle` calls `Libc.free`
+on `array_ptr` after invoking the arrow release callback.  Used by the
+C Stream Interface path, which allocates the `ArrowArray` struct via
+`Libc.malloc` rather than receiving it on the Rust heap.
 """
 mutable struct CDataHandle
     schema_ptr::Ptr{ArrowSchema}
     array_ptr::Ptr{ArrowArray}
     released::Bool
+    owns_array_memory::Bool
 end
 
-# Counts CDataHandles that were GC'd without an explicit release_c_data call.
-const UNRELEASED_HANDLE_COUNT = Threads.Atomic{Int}(0)
-
-function _warn_unreleased(h::CDataHandle)
-    h.released && return
-    Threads.atomic_add!(UNRELEASED_HANDLE_COUNT, 1)
-    # Use jl_safe_printf since task switches are forbidden in finalizers.
-    ccall(
-        :jl_safe_printf,
-        Cvoid,
-        (Cstring,),
-        "Arrow.CDataHandle GC'd without explicit release_c_data — resource leak detected\n",
-    )
-    _release_cdata_handle(h)
-end
-
-function CDataHandle(sp::Ptr{ArrowSchema}, ap::Ptr{ArrowArray})
-    h = CDataHandle(sp, ap, false)
-    finalizer(_warn_unreleased, h)
-    return h
-end
+CDataHandle(sp::Ptr{ArrowSchema}, ap::Ptr{ArrowArray}) = CDataHandle(sp, ap, false, false)
 
 function _release_cdata_handle(h::CDataHandle)
     h.released && return
@@ -115,6 +207,9 @@ function _release_cdata_handle(h::CDataHandle)
         arr = unsafe_load(h.array_ptr)
         if arr.release != C_NULL
             ccall(arr.release, Cvoid, (Ptr{ArrowArray},), h.array_ptr)
+        end
+        if h.owns_array_memory
+            Libc.free(h.array_ptr)
         end
     end
     if h.schema_ptr != C_NULL
@@ -149,21 +244,31 @@ end
     CImportedTable
 
 A `Tables.AbstractColumns` wrapping imported Arrow C Data Interface arrays.
+Column `ArrowVector`s are constructed on demand in `getcolumn` — `arr_ptrs` holds
+isbits `Ptr{ArrowArray}` values with no boxing.
+
+`shared_handle`: if non-`nothing`, all columns share this handle (stream path —
+release the root and all children are freed together). If `nothing`, each column
+pointer is individually owned and released via its C release callback.
 """
 struct CImportedTable
-    names::Vector{Symbol}
-    columns::Vector{CImportedArray}
-    lookup::Dict{Symbol,CImportedArray}
+    schema::TableSchema
+    arr_ptrs::Vector{Ptr{ArrowArray}}  # one per column, isbits — no boxing
+    shared_handle::Union{Nothing,CDataHandle}
     metadata::Union{Nothing,Base.ImmutableDict{String,String}}
 end
 
 Tables.istable(::Type{<:CImportedTable}) = true
 Tables.columnaccess(::Type{<:CImportedTable}) = true
 Tables.columns(t::CImportedTable) = t
-Tables.columnnames(t::CImportedTable) = t.names
-Tables.getcolumn(t::CImportedTable, nm::Symbol) = t.lookup[nm]
-Tables.getcolumn(t::CImportedTable, i::Int) = t.columns[i]
-Tables.schema(t::CImportedTable) = Tables.Schema(t.names, map(eltype, t.columns))
+Tables.columnnames(t::CImportedTable) = t.schema.col_names
+function Tables.getcolumn(t::CImportedTable, i::Int)
+    return _import_arrowvec_fast(t.arr_ptrs[i], t.schema.nodes[i])
+end
+Tables.getcolumn(t::CImportedTable, nm::Symbol) =
+    Tables.getcolumn(t, t.schema.lookup[nm])
+Tables.schema(t::CImportedTable) =
+    Tables.Schema(t.schema.col_names, nothing)
 DataAPI.metadatasupport(::Type{CImportedTable}) = (read=true, write=false)
 DataAPI.metadata(t::CImportedTable, key::AbstractString; style::Bool=false) =
     style ? (get(t.metadata === nothing ? Dict() : t.metadata, key, nothing), :default) :
@@ -179,12 +284,13 @@ After calling this, the data in `x` or `t` may become invalid.
 """
 release_c_data(x::CImportedArray) = _release_cdata_handle(x.handle)
 function release_c_data(t::CImportedTable)
-    seen = Set{UInt}()
-    for col in t.columns
-        id = UInt(pointer_from_objref(col.handle))
-        if id ∉ seen
-            push!(seen, id)
-            _release_cdata_handle(col.handle)
+    if t.shared_handle !== nothing
+        _release_cdata_handle(t.shared_handle)
+    else
+        for ap in t.arr_ptrs
+            arr = unsafe_load(ap)
+            arr.release != C_NULL &&
+                ccall(arr.release, Cvoid, (Ptr{ArrowArray},), ap)
         end
     end
 end
@@ -226,7 +332,7 @@ function _import_validity(arr::ArrowArray, len::Int, off::Int)
     nc = Int(arr.null_count)
     vptr = Ptr{UInt8}(_cbuf(arr, 0))
     if nc == 0 || vptr == C_NULL
-        return ValidityBitmap(UInt8[], 1, len, 0)
+        return _ALL_VALID
     end
     n_bytes = cld(len + off, 8)
     vbytes = unsafe_wrap(Array, vptr, n_bytes; own=false)
@@ -333,7 +439,7 @@ function _import_arrowvec(
         T = nullable ? Union{Bool,Missing} : Bool
         dptr = Ptr{UInt8}(_cbuf(arr, 1))
         if dptr == C_NULL
-            return BoolVector{T}(UInt8[], 1, validity, len, meta)
+            return BoolVector{T}(_EMPTY_BYTES, 1, validity, len, meta)
         end
         n_bytes = cld(len + off, 8)
         data_bytes = unsafe_wrap(Array, dptr, n_bytes; own=false)
@@ -352,10 +458,10 @@ function _import_arrowvec(
         T = nullable ? Union{T_inner,Missing} : T_inner
         dptr = Ptr{UInt8}(_cbuf(arr, 1))
         n_bytes = (len + off) * N
-        data_bytes = dptr == C_NULL ? UInt8[] : unsafe_wrap(Array, dptr, n_bytes; own=false)
+        data_bytes = dptr == C_NULL ? _EMPTY_BYTES : unsafe_wrap(Array, dptr, n_bytes; own=false)
         # Apply offset: skip first `off*N` bytes
         data_view = off == 0 ? data_bytes : view(data_bytes, (off * N + 1):n_bytes)
-        return FixedSizeList{T,typeof(data_view)}(UInt8[], validity, data_view, len, meta)
+        return FixedSizeList{T,typeof(data_view)}(_EMPTY_BYTES, validity, data_view, len, meta)
     end
 
     # String / binary (list with inline data)
@@ -367,13 +473,13 @@ function _import_arrowvec(
         n_offs = len + off + 1
         offs_arr = optr == C_NULL ? OT[] : unsafe_wrap(Array, optr, n_offs; own=false)
         offs_view = off == 0 ? offs_arr : view(offs_arr, (off + 1):n_offs)
-        offsets = Offsets(UInt8[], offs_view)
+        offsets = Offsets(_EMPTY_BYTES, offs_view)
         dptr = Ptr{UInt8}(_cbuf(arr, 2))
         # data length = last offset value
         data_len = n_offs > 0 && optr != C_NULL ? Int(offs_arr[n_offs]) : 0
         data_bytes =
-            dptr == C_NULL ? UInt8[] : unsafe_wrap(Array, dptr, data_len; own=false)
-        return List{T,OT,Vector{UInt8}}(UInt8[], validity, offsets, data_bytes, len, meta)
+            dptr == C_NULL ? _EMPTY_BYTES : unsafe_wrap(Array, dptr, data_len; own=false)
+        return List{T,OT,Vector{UInt8}}(_EMPTY_BYTES, validity, offsets, data_bytes, len, meta)
     end
 
     # Generic list "+l" / "+L"
@@ -383,14 +489,14 @@ function _import_arrowvec(
         n_offs = len + off + 1
         offs_arr = optr == C_NULL ? OT[] : unsafe_wrap(Array, optr, n_offs; own=false)
         offs_view = off == 0 ? offs_arr : view(offs_arr, (off + 1):n_offs)
-        offsets = Offsets(UInt8[], offs_view)
+        offsets = Offsets(_EMPTY_BYTES, offs_view)
         child_arr_ptr = _cchild_arr(arr, 0)
         child_sch_ptr = _cchild_sch(sch, 0)
         A = _import_arrowvec(child_arr_ptr, child_sch_ptr, handle, convert)
         T_child = eltype(A)
         ST = SubArray{T_child,1,typeof(A),Tuple{UnitRange{Int64}},true}
         T = nullable ? Union{ST,Missing} : ST
-        return List{T,OT,typeof(A)}(UInt8[], validity, offsets, A, len, meta)
+        return List{T,OT,typeof(A)}(_EMPTY_BYTES, validity, offsets, A, len, meta)
     end
 
     # Fixed-size list "+w:N"
@@ -402,7 +508,7 @@ function _import_arrowvec(
         T_child = eltype(A)
         T_inner = NTuple{N,T_child}
         T = nullable ? Union{T_inner,Missing} : T_inner
-        return FixedSizeList{T,typeof(A)}(UInt8[], validity, A, len, meta)
+        return FixedSizeList{T,typeof(A)}(_EMPTY_BYTES, validity, A, len, meta)
     end
 
     # Struct "+s"
@@ -434,7 +540,7 @@ function _import_arrowvec(
         n_offs = len + off + 1
         offs_arr = optr == C_NULL ? Int32[] : unsafe_wrap(Array, optr, n_offs; own=false)
         offs_view = off == 0 ? offs_arr : view(offs_arr, (off + 1):n_offs)
-        offsets = Offsets(UInt8[], offs_view)
+        offsets = Offsets(_EMPTY_BYTES, offs_view)
         # child[0] is entries struct (key + value fields)
         A = _import_arrowvec(_cchild_arr(arr, 0), _cchild_sch(sch, 0), handle, convert)
         T_entry = eltype(A)
@@ -458,7 +564,7 @@ function _import_arrowvec(
             Tuple(parse(Int32, s) for s in split(typeids_str, ','))
         tptr = Ptr{UInt8}(_cbuf(arr, 0))
         n = len + off
-        typeids_vec = tptr == C_NULL ? UInt8[] : unsafe_wrap(Array, tptr, n; own=false)
+        typeids_vec = tptr == C_NULL ? _EMPTY_BYTES : unsafe_wrap(Array, tptr, n; own=false)
         optr = Ptr{Int32}(_cbuf(arr, 1))
         offsets_vec = optr == C_NULL ? Int32[] : unsafe_wrap(Array, optr, n; own=false)
         vecs = AbstractVector[]
@@ -473,8 +579,8 @@ function _import_arrowvec(
         UT = UnionT{Meta.UnionMode.Dense,typeids_parsed,U_types}
         T = Union{child_types...}
         return DenseUnion{T,UT,typeof(data)}(
-            UInt8[],
-            UInt8[],
+            _EMPTY_BYTES,
+            _EMPTY_BYTES,
             typeids_vec,
             offsets_vec,
             data,
@@ -490,7 +596,7 @@ function _import_arrowvec(
             Tuple(parse(Int32, s) for s in split(typeids_str, ','))
         tptr = Ptr{UInt8}(_cbuf(arr, 0))
         n = len + off
-        typeids_vec = tptr == C_NULL ? UInt8[] : unsafe_wrap(Array, tptr, n; own=false)
+        typeids_vec = tptr == C_NULL ? _EMPTY_BYTES : unsafe_wrap(Array, tptr, n; own=false)
         vecs = AbstractVector[]
         child_types = Type[]
         for i = 0:(Int(sch.n_children) - 1)
@@ -502,20 +608,17 @@ function _import_arrowvec(
         U_types = Tuple{child_types...}
         UT = UnionT{Meta.UnionMode.Sparse,typeids_parsed,U_types}
         T = Union{child_types...}
-        return SparseUnion{T,UT,typeof(data)}(UInt8[], typeids_vec, data, meta)
+        return SparseUnion{T,UT,typeof(data)}(_EMPTY_BYTES, typeids_vec, data, meta)
     end
 
     # Dictionary encoded: schema.dictionary != C_NULL
     if sch.dictionary != C_NULL
-        # schema.format is the INDEX type
         S = _fmt_to_storage_type(fmt)  # index type (e.g., Int8)
-        nullable_idx = nullable  # indices may be nullable
         iptr = Ptr{S}(_cbuf(arr, 1))
         n_idx = len + off
         idx_arr = iptr == C_NULL ? S[] : unsafe_wrap(Array, iptr, n_idx; own=false)
         idx_view = off == 0 ? idx_arr : view(idx_arr, (off + 1):n_idx)
         idx_vec = Vector{S}(idx_view)  # make a copy since DictEncoded.indices is Vector{S}
-        # Import dictionary values
         dict_arr_ptr = arr.dictionary
         dict_sch_ptr = sch.dictionary
         dict_vec = _import_arrowvec(dict_arr_ptr, dict_sch_ptr, handle, convert)
@@ -523,7 +626,7 @@ function _import_arrowvec(
         ordered = (sch.flags & CDATA_FLAG_DICT_ORDERED) != 0
         encoding = DictEncoding{T_val,S,typeof(dict_vec)}(0, dict_vec, ordered, nothing)
         T = nullable ? Union{T_val,Missing} : T_val
-        return DictEncoded{T,S,typeof(dict_vec)}(UInt8[], validity, idx_vec, encoding, meta)
+        return DictEncoded{T,S,typeof(dict_vec)}(_EMPTY_BYTES, validity, idx_vec, encoding, meta)
     end
 
     # Primitive numeric / time types
@@ -531,12 +634,12 @@ function _import_arrowvec(
     T = nullable ? Union{S,Missing} : S
     dptr = Ptr{S}(_cbuf(arr, 1))
     if dptr == C_NULL
-        return Primitive(T, UInt8[], validity, S[], len, meta)
+        return Primitive(T, _EMPTY_BYTES, validity, S[], len, meta)
     end
     n = len + off
     data_arr = unsafe_wrap(Array, dptr, n; own=false)
     data_view = off == 0 ? data_arr : view(data_arr, (off + 1):n)
-    return Primitive(T, UInt8[], validity, data_view, len, meta)
+    return Primitive(T, _EMPTY_BYTES, validity, data_view, len, meta)
 end
 
 """
@@ -583,25 +686,476 @@ function from_c_data(
     convert::Bool=true,
     metadata=nothing,
 )
-    cols = CImportedArray[]
-    col_names = Symbol[]
-    for (i, (sp_raw, ap_raw)) in enumerate(zip(schema_ptrs, array_ptrs))
-        sp = Ptr{ArrowSchema}(sp_raw)
-        ap = Ptr{ArrowArray}(ap_raw)
-        handle = CDataHandle(sp, ap)
-        vec = _import_arrowvec(ap, sp, handle, convert)
-        T = eltype(vec)
-        push!(cols, CImportedArray{T}(vec, handle))
-        if names !== nothing
-            push!(col_names, names[i])
-        else
-            sch = unsafe_load(sp)
-            nm = sch.name != C_NULL ? unsafe_string(sch.name) : "col$i"
-            push!(col_names, Symbol(nm))
-        end
+    nodes = [_build_schema_node(Ptr{ArrowSchema}(sp)) for sp in schema_ptrs]
+    n = length(nodes)
+    col_names = if names !== nothing
+        names
+    else
+        [node.name == Symbol("") ? Symbol("col$i") : node.name
+         for (i, node) in enumerate(nodes)]
     end
-    lookup = Dict{Symbol,CImportedArray}(col_names[i] => cols[i] for i in eachindex(cols))
-    return CImportedTable(col_names, cols, lookup, metadata)
+    lookup = Dict{Symbol,Int}(col_names[i] => i for i in 1:n)
+    schema = TableSchema(nodes, col_names, lookup)
+    ptrs = [Ptr{ArrowArray}(ap) for ap in array_ptrs]
+    return CImportedTable(schema, ptrs, nothing, metadata)
+end
+
+###############################################################################
+# Arrow C Stream Interface                                                    #
+###############################################################################
+
+"""
+    Arrow.FFI_ArrowArrayStream
+
+Mirrors `struct ArrowArrayStream` from the Arrow C Stream Interface spec.
+All 5 fields are pointer-sized; total size is 40 bytes on 64-bit.
+"""
+mutable struct FFI_ArrowArrayStream
+    get_schema::Ptr{Cvoid}
+    get_next::Ptr{Cvoid}
+    get_last_error::Ptr{Cvoid}
+    release::Ptr{Cvoid}
+    private_data::Ptr{Cvoid}
+end
+
+@assert sizeof(FFI_ArrowArrayStream) == 5 * 8 "FFI_ArrowArrayStream size mismatch"
+
+"""
+    Arrow.parse_c_schema(ptr) -> SchemaNode
+    Arrow.parse_c_schema(ptrs) -> TableSchema
+
+Parse one `ArrowSchema` pointer into a [`SchemaNode`](@ref), or an iterable of
+pointers into a [`TableSchema`](@ref). The C structs are read but their `release`
+callbacks are **not** called — the caller retains ownership.
+
+# Example — single column
+```julia
+node = Arrow.parse_c_schema(schema_ptr)
+for ap in batch_array_ptrs
+    col = Arrow.from_c_data(node, ap)
+end
+```
+
+# Example — table
+```julia
+schema = Arrow.parse_c_schema(schema_ptrs)
+for batch_array_ptrs in stream
+    tbl = Arrow.from_c_data(schema, batch_array_ptrs)
+end
+```
+"""
+parse_c_schema(ptr::Ptr{Cvoid}) = _build_schema_node(Ptr{ArrowSchema}(ptr))
+parse_c_schema(ptr::Ptr{ArrowSchema}) = _build_schema_node(ptr)
+
+function parse_c_schema(ptrs)
+    nodes = [_build_schema_node(Ptr{ArrowSchema}(p)) for p in ptrs]
+    col_names = [node.name == Symbol("") ? Symbol("col$i") : node.name
+                 for (i, node) in enumerate(nodes)]
+    lookup = Dict{Symbol,Int}(col_names[i] => i for i in eachindex(col_names))
+    return TableSchema(nodes, col_names, lookup)
+end
+
+# Internal implementation — see parse_c_schema for the public entry point.
+"""
+    _build_schema_node(sch_ptr) -> SchemaNode
+
+Recursively parse an `ArrowSchema` tree into a `SchemaNode` tree.
+"""
+function _build_schema_node(sch_ptr::Ptr{ArrowSchema})::SchemaNode
+    sch = unsafe_load(sch_ptr)
+    fmt = unsafe_string(sch.format)
+    nm = sch.name != C_NULL ? Symbol(unsafe_string(sch.name)) : Symbol("")
+    nullable = (sch.flags & CDATA_FLAG_NULLABLE) != 0
+    meta = _parse_c_metadata(sch.metadata)
+    nc = Int(sch.n_children)
+    children = Vector{SchemaNode}(undef, nc)
+    for i = 0:(nc - 1)
+        children[i + 1] = _build_schema_node(_cchild_sch(sch, i))
+    end
+    has_dict = sch.dictionary != C_NULL
+    dict_node = has_dict ? _build_schema_node(sch.dictionary) : nothing
+
+    # Pre-parse format string once so _import_arrowvec_fast does no string work per batch
+    fixed_size = 0
+    type_ids   = nothing
+    storage_type::Type = Missing
+    kind = if has_dict
+        storage_type = _fmt_to_storage_type(fmt)
+        CKIND_DICT
+    elseif fmt == "n";  CKIND_NULL
+    elseif fmt == "b";  CKIND_BOOL
+    elseif fmt == "u";  CKIND_STR32
+    elseif fmt == "U";  CKIND_STR64
+    elseif fmt == "z";  CKIND_BIN32
+    elseif fmt == "Z";  CKIND_BIN64
+    elseif fmt == "+l"; CKIND_LIST32
+    elseif fmt == "+L"; CKIND_LIST64
+    elseif fmt == "+s"; CKIND_STRUCT
+    elseif fmt == "+m"; CKIND_MAP
+    elseif startswith(fmt, "w:")
+        fixed_size = parse(Int, fmt[3:end])
+        CKIND_FIXED_BIN
+    elseif startswith(fmt, "+w:")
+        fixed_size = parse(Int, fmt[4:end])
+        CKIND_FIXED_LIST
+    elseif startswith(fmt, "+ud:")
+        ts = fmt[5:end]
+        type_ids = isempty(ts) ? nothing : Tuple(parse(Int32, s) for s in split(ts, ','))
+        CKIND_DENSE_UNION
+    elseif startswith(fmt, "+us:")
+        ts = fmt[5:end]
+        type_ids = isempty(ts) ? nothing : Tuple(parse(Int32, s) for s in split(ts, ','))
+        CKIND_SPARSE_UNION
+    else
+        storage_type = _fmt_to_storage_type(fmt)
+        CKIND_PRIM
+    end
+
+    return SchemaNode(fmt, nm, nullable, sch.flags, nc, children, has_dict, dict_node, meta,
+                      kind, storage_type, fixed_size, type_ids)
+end
+
+# Import an ArrowVector using a pre-cached SchemaNode — zero string parsing per batch.
+function _import_arrowvec_fast(
+    arr_ptr::Ptr{ArrowArray},
+    node::SchemaNode,
+)
+    arr = unsafe_load(arr_ptr)
+    k   = node.kind
+    len = Int(arr.length)
+    off = Int(arr.offset)
+    nullable = node.nullable
+    meta     = node.meta
+    validity = _import_validity(arr, len, off)
+
+    k == CKIND_NULL && return NullVector{Missing}(MissingVector(len), meta)
+
+    if k == CKIND_BOOL
+        T = nullable ? Union{Bool,Missing} : Bool
+        bdptr = Ptr{UInt8}(_cbuf(arr, 1))
+        bdptr == C_NULL && return BoolVector{T}(_EMPTY_BYTES, 1, validity, len, meta)
+        n_bytes = cld(len + off, 8)
+        bool_bytes = unsafe_wrap(Array, bdptr, n_bytes; own=false)
+        off % 8 == 0 && return BoolVector{T}(bool_bytes, off ÷ 8 + 1, validity, len, meta)
+        return BoolVector{T}(_copy_bit_range(bool_bytes, off, len), 1, validity, len, meta)
+    end
+
+    if k == CKIND_FIXED_BIN
+        N = node.fixed_size
+        T_inner = NTuple{N,UInt8}
+        T = nullable ? Union{T_inner,Missing} : T_inner
+        dptr = Ptr{UInt8}(_cbuf(arr, 1))
+        n_bytes = (len + off) * N
+        data_bytes = dptr == C_NULL ? _EMPTY_BYTES : unsafe_wrap(Array, dptr, n_bytes; own=false)
+        data_view = off == 0 ? data_bytes : view(data_bytes, (off * N + 1):n_bytes)
+        return FixedSizeList{T,typeof(data_view)}(_EMPTY_BYTES, validity, data_view, len, meta)
+    end
+
+    if k == CKIND_STR32 || k == CKIND_BIN32
+        T_inner = k == CKIND_STR32 ? String : Base.CodeUnits{UInt8,String}
+        T = nullable ? Union{T_inner,Missing} : T_inner
+        optr = Ptr{Int32}(_cbuf(arr, 1))
+        n_offs = len + off + 1
+        offsets = COffsets{Int32}(optr, len + off)
+        dptr = Ptr{UInt8}(_cbuf(arr, 2))
+        data_len = optr != C_NULL ? Int(unsafe_load(optr, n_offs)) : 0
+        data_bytes = dptr == C_NULL ? CBuffer{UInt8}(Ptr{UInt8}(C_NULL), 0) :
+                                       CBuffer{UInt8}(dptr, data_len)
+        return List{T,Int32,CBuffer{UInt8},COffsets{Int32}}(_EMPTY_BYTES, validity, offsets, data_bytes, len, meta)
+    end
+
+    if k == CKIND_STR64 || k == CKIND_BIN64
+        T_inner = k == CKIND_STR64 ? String : Base.CodeUnits{UInt8,String}
+        T = nullable ? Union{T_inner,Missing} : T_inner
+        optr = Ptr{Int64}(_cbuf(arr, 1))
+        n_offs = len + off + 1
+        offsets = COffsets{Int64}(optr, len + off)
+        dptr = Ptr{UInt8}(_cbuf(arr, 2))
+        data_len = optr != C_NULL ? Int(unsafe_load(optr, n_offs)) : 0
+        data_bytes = dptr == C_NULL ? CBuffer{UInt8}(Ptr{UInt8}(C_NULL), 0) :
+                                       CBuffer{UInt8}(dptr, data_len)
+        return List{T,Int64,CBuffer{UInt8},COffsets{Int64}}(_EMPTY_BYTES, validity, offsets, data_bytes, len, meta)
+    end
+
+    if k == CKIND_LIST32
+        optr = Ptr{Int32}(_cbuf(arr, 1))
+        offsets = COffsets{Int32}(optr, len + off)
+        A = _import_arrowvec_fast(_cchild_arr(arr, 0), node.children[1])
+        T_child = eltype(A)
+        ST = SubArray{T_child,1,typeof(A),Tuple{UnitRange{Int64}},true}
+        T = nullable ? Union{ST,Missing} : ST
+        return List{T,Int32,typeof(A),COffsets{Int32}}(_EMPTY_BYTES, validity, offsets, A, len, meta)
+    end
+
+    if k == CKIND_LIST64
+        optr = Ptr{Int64}(_cbuf(arr, 1))
+        offsets = COffsets{Int64}(optr, len + off)
+        A = _import_arrowvec_fast(_cchild_arr(arr, 0), node.children[1])
+        T_child = eltype(A)
+        ST = SubArray{T_child,1,typeof(A),Tuple{UnitRange{Int64}},true}
+        T = nullable ? Union{ST,Missing} : ST
+        return List{T,Int64,typeof(A),COffsets{Int64}}(_EMPTY_BYTES, validity, offsets, A, len, meta)
+    end
+
+    if k == CKIND_FIXED_LIST
+        N = node.fixed_size
+        A = _import_arrowvec_fast(_cchild_arr(arr, 0), node.children[1])
+        T_child = eltype(A)
+        T_inner = NTuple{N,T_child}
+        T = nullable ? Union{T_inner,Missing} : T_inner
+        return FixedSizeList{T,typeof(A)}(_EMPTY_BYTES, validity, A, len, meta)
+    end
+
+    if k == CKIND_STRUCT
+        vecs = AbstractVector[]
+        child_names = Symbol[]
+        child_types = Type[]
+        for i = 0:(node.n_children - 1)
+            child_av = _import_arrowvec_fast(_cchild_arr(arr, i), node.children[i + 1])
+            push!(vecs, child_av)
+            push!(child_names, node.children[i + 1].name)
+            push!(child_types, eltype(child_av))
+        end
+        fnames = Tuple(child_names)
+        data = Tuple(vecs)
+        NT = NamedTuple{fnames,Tuple{child_types...}}
+        T = nullable ? Union{NT,Missing} : NT
+        return Struct{T,typeof(data),fnames}(validity, data, len, meta)
+    end
+
+    if k == CKIND_MAP
+        optr = Ptr{Int32}(_cbuf(arr, 1))
+        offsets = COffsets{Int32}(optr, len + off)
+        A = _import_arrowvec_fast(_cchild_arr(arr, 0), node.children[1])
+        T_entry = eltype(A)
+        T_inner = T_entry <: NamedTuple ? Dict{fieldtype(T_entry,:key),fieldtype(T_entry,:value)} : Dict{Any,Any}
+        T = nullable ? Union{T_inner,Missing} : T_inner
+        return Map{T,Int32,typeof(A),COffsets{Int32}}(validity, offsets, A, len, meta)
+    end
+
+    if k == CKIND_DENSE_UNION
+        tptr = Ptr{UInt8}(_cbuf(arr, 0)); n = len + off
+        typeids_vec = tptr == C_NULL ? _EMPTY_BYTES : unsafe_wrap(Array, tptr, n; own=false)
+        optr = Ptr{Int32}(_cbuf(arr, 1))
+        offsets_vec = optr == C_NULL ? Int32[] : unsafe_wrap(Array, optr, n; own=false)
+        vecs = AbstractVector[]; child_types = Type[]
+        for i = 0:(node.n_children - 1)
+            cv = _import_arrowvec_fast(_cchild_arr(arr, i), node.children[i + 1])
+            push!(vecs, cv); push!(child_types, eltype(cv))
+        end
+        data = Tuple(vecs); U_types = Tuple{child_types...}
+        UT = UnionT{Meta.UnionMode.Dense,node.type_ids,U_types}
+        return DenseUnion{Union{child_types...},UT,typeof(data)}(
+            _EMPTY_BYTES, _EMPTY_BYTES, typeids_vec, offsets_vec, data, meta)
+    end
+
+    if k == CKIND_SPARSE_UNION
+        tptr = Ptr{UInt8}(_cbuf(arr, 0)); n = len + off
+        typeids_vec = tptr == C_NULL ? _EMPTY_BYTES : unsafe_wrap(Array, tptr, n; own=false)
+        vecs = AbstractVector[]; child_types = Type[]
+        for i = 0:(node.n_children - 1)
+            cv = _import_arrowvec_fast(_cchild_arr(arr, i), node.children[i + 1])
+            push!(vecs, cv); push!(child_types, eltype(cv))
+        end
+        data = Tuple(vecs); U_types = Tuple{child_types...}
+        UT = UnionT{Meta.UnionMode.Sparse,node.type_ids,U_types}
+        return SparseUnion{Union{child_types...},UT,typeof(data)}(_EMPTY_BYTES, typeids_vec, data, meta)
+    end
+
+    if k == CKIND_DICT
+        dict_vec = _import_arrowvec_fast(arr.dictionary, node.dict_node::SchemaNode)
+        T_val = eltype(dict_vec)
+        ordered = (node.flags & CDATA_FLAG_DICT_ORDERED) != 0
+        T = nullable ? Union{T_val,Missing} : T_val
+        idx_vec = _make_dict_indices(arr, len, off, Val(node.storage_type))
+        S = node.storage_type
+        encoding = DictEncoding{T_val,S,typeof(dict_vec)}(0, dict_vec, ordered, nothing)
+        return DictEncoded{T,S,typeof(dict_vec)}(_EMPTY_BYTES, validity, idx_vec, encoding, meta)
+    end
+
+    # CKIND_PRIM — dispatch on the concrete storage type via Val so S is known at compile time
+    return _import_prim_fast(arr, validity, len, off, nullable, meta, Val(node.storage_type))
+end
+
+# Specialised only on S (index type: Int8/Int16/Int32/Int64) so CBuffer{S} is proven isbits.
+# Avoids specialising on the dict value type A, which could explode combinatorially.
+@generated function _make_dict_indices(arr::ArrowArray, len::Int, off::Int, ::Val{S}) where {S}
+    quote
+        iptr = Ptr{$S}(_cbuf(arr, 1))
+        n_idx = len + off
+        idx_arr = iptr == C_NULL ? CBuffer{$S}(Ptr{$S}(C_NULL), 0) : CBuffer{$S}(iptr, n_idx)
+        idx_view = off == 0 ? idx_arr : view(idx_arr, (off + 1):n_idx)
+        return Vector{$S}(idx_view)
+    end
+end
+
+@generated function _import_prim_fast(
+    arr::ArrowArray, validity::ValidityBitmap, len::Int, off::Int,
+    nullable::Bool, meta::Union{Nothing,Base.ImmutableDict{String,String}},
+    ::Val{S},
+) where {S}
+    quote
+        T = nullable ? Union{$S,Missing} : $S
+        dptr = Ptr{$S}(_cbuf(arr, 1))
+        dptr == C_NULL && return Primitive(T, _EMPTY_BYTES, validity, $S[], len, meta)
+        n = len + off
+        data = CBuffer{$S}(dptr, n)
+        data_view = off == 0 ? data : view(data, (off + 1):n)
+        return Primitive(T, _EMPTY_BYTES, validity, data_view, len, meta)
+    end
+end
+
+"""
+    Arrow.from_c_data(node::SchemaNode, array_ptr; convert=true) -> CImportedArray
+
+Import an Arrow array using a pre-parsed [`SchemaNode`](@ref), skipping all
+schema parsing. `array_ptr` is a `Ptr` to an `ArrowArray` C struct; ownership
+of the array is transferred to Julia.
+
+Use [`Arrow.parse_c_schema`](@ref) to build the node once, then call this for
+every subsequent batch.
+"""
+function from_c_data(node::SchemaNode, array_ptr::Ptr{Cvoid}; convert::Bool=true)
+    ap = Ptr{ArrowArray}(array_ptr)
+    handle = CDataHandle(Ptr{ArrowSchema}(C_NULL), ap)
+    vec = _import_arrowvec_fast(ap, node)
+    return CImportedArray{eltype(vec)}(vec, handle)
+end
+
+from_c_data(node::SchemaNode, ap::Ptr{ArrowArray}; kw...) =
+    from_c_data(node, Ptr{Cvoid}(ap); kw...)
+
+"""
+    Arrow.from_c_data(schema::TableSchema, array_ptrs; metadata=nothing) -> CImportedTable
+
+Import a batch of Arrow arrays using a pre-parsed [`TableSchema`](@ref). No schema
+work is done per batch — column names and the name→index lookup are reused directly
+from the schema.
+
+Obtain a `TableSchema` via `Arrow.parse_c_schema(schema_ptrs)`.
+"""
+function from_c_data(schema::TableSchema, array_ptrs; metadata=nothing)
+    ptrs = [Ptr{ArrowArray}(ap) for ap in array_ptrs]
+    return CImportedTable(schema, ptrs, nothing, metadata)
+end
+
+# Convenience: accept a plain vector of nodes (builds TableSchema on the fly)
+function from_c_data(nodes::AbstractVector{SchemaNode}, array_ptrs; kw...)
+    col_names = [node.name == Symbol("") ? Symbol("col$i") : node.name
+                 for (i, node) in enumerate(nodes)]
+    lookup = Dict{Symbol,Int}(col_names[i] => i for i in eachindex(col_names))
+    return from_c_data(TableSchema(nodes, col_names, lookup), array_ptrs; kw...)
+end
+
+"""
+    CStreamHandle
+
+Wraps a heap-stable `Ref{FFI_ArrowArrayStream}` together with the cached
+`SchemaNode` tree and column names.  Obtain via `open_c_stream`; iterate with
+`next_c_stream_batch!`; release with `close_c_stream!`.
+"""
+mutable struct CStreamHandle
+    stream::Ref{FFI_ArrowArrayStream}
+    top_node::SchemaNode              # cached top-level "+s" struct node
+    schema_nodes::Vector{SchemaNode}  # == top_node.children
+    col_names::Vector{Symbol}
+    col_lookup::Dict{Symbol,Int}      # name → column index; built once at open time
+    stream_schema::TableSchema        # pre-built for CImportedTable construction
+    released::Bool
+end
+
+"""
+    open_c_stream(stream_ref::Ref{FFI_ArrowArrayStream}) -> CStreamHandle
+
+Call `get_schema` exactly once on `stream_ref`, parse the schema tree into
+`SchemaNode`s, release the C schema struct, and return a handle.
+"""
+function open_c_stream(stream_ref::Ref{FFI_ArrowArrayStream})::CStreamHandle
+    stream_ptr = Base.unsafe_convert(Ptr{FFI_ArrowArrayStream}, stream_ref)
+    get_schema_fn = stream_ref[].get_schema
+
+    # Allocate a C-heap ArrowSchema for get_schema to write into.  Using Libc.malloc
+    # avoids GC lifetime concerns around the temporary pointer.
+    sch_ptr = Ptr{ArrowSchema}(Libc.malloc(sizeof(ArrowSchema)))
+    sch_ptr == C_NULL && error("malloc failed for ArrowSchema")
+
+    ret = ccall(get_schema_fn, Int32, (Ptr{FFI_ArrowArrayStream}, Ptr{ArrowSchema}),
+                stream_ptr, sch_ptr)
+    if ret != 0
+        Libc.free(sch_ptr)
+        error("FFI_ArrowArrayStream.get_schema returned $ret")
+    end
+
+    top_node = _build_schema_node(sch_ptr)
+
+    # Release the C schema (frees arrow-rs buffers).
+    sch = unsafe_load(sch_ptr)
+    if sch.release != C_NULL
+        ccall(sch.release, Cvoid, (Ptr{ArrowSchema},), sch_ptr)
+    end
+    Libc.free(sch_ptr)
+
+    col_names = [child.name for child in top_node.children]
+    col_lookup = Dict{Symbol,Int}(col_names[i] => i for i in eachindex(col_names))
+    stream_schema = TableSchema(top_node.children, col_names, col_lookup)
+    return CStreamHandle(stream_ref, top_node, top_node.children, col_names, col_lookup, stream_schema, false)
+end
+
+"""
+    next_c_stream_batch!(handle::CStreamHandle) -> Union{CImportedTable, Nothing}
+
+Fetch the next batch.  Returns a `CImportedTable` on success (zero-copy views
+into Rust memory), or `nothing` at end of stream.
+
+Call `release_c_data(table)` when done; the underlying Rust memory is freed
+at that point.
+"""
+function next_c_stream_batch!(handle::CStreamHandle)::Union{CImportedTable,Nothing}
+    handle.released && return nothing
+    stream_ptr = Base.unsafe_convert(Ptr{FFI_ArrowArrayStream}, handle.stream)
+
+    # Allocate a C-heap ArrowArray struct for get_next to write into.
+    arr_ptr = Ptr{ArrowArray}(Libc.malloc(sizeof(ArrowArray)))
+    arr_ptr == C_NULL && error("malloc failed for ArrowArray")
+
+    get_next_fn = handle.stream[].get_next
+    ret = ccall(get_next_fn, Int32, (Ptr{FFI_ArrowArrayStream}, Ptr{ArrowArray}),
+                stream_ptr, arr_ptr)
+    if ret != 0
+        Libc.free(arr_ptr)
+        error("FFI_ArrowArrayStream.get_next returned $ret")
+    end
+
+    # End-of-stream: Rust zeroed the struct, so release == C_NULL.
+    loaded = unsafe_load(arr_ptr)
+    if loaded.release == C_NULL
+        Libc.free(arr_ptr)
+        return nothing
+    end
+
+    # One shared CDataHandle owns arr_ptr: calling release_c_data(table) releases
+    # the root, which frees all child column arrays at once (Arrow C spec).
+    shared_h = CDataHandle(Ptr{ArrowSchema}(C_NULL), arr_ptr, false, true)
+
+    n_cols = length(handle.schema_nodes)
+    child_ptrs = [_cchild_arr(loaded, i - 1) for i = 1:n_cols]
+    return CImportedTable(handle.stream_schema, child_ptrs, shared_h, nothing)
+end
+
+"""
+    close_c_stream!(handle::CStreamHandle)
+
+Call the stream's `release` callback and mark the handle as released.
+After this the handle must not be used.
+"""
+function close_c_stream!(handle::CStreamHandle)
+    handle.released && return
+    handle.released = true
+    stream_ptr = Base.unsafe_convert(Ptr{FFI_ArrowArrayStream}, handle.stream)
+    release_fn = handle.stream[].release
+    release_fn != C_NULL &&
+        ccall(release_fn, Cvoid, (Ptr{FFI_ArrowArrayStream},), stream_ptr)
+    return nothing
 end
 
 ###############################################################################
@@ -1051,14 +1605,14 @@ function _make_buffers(v::List, roots::Vector{Any})
         push!(roots, data_bytes)
         dp = isempty(data_bytes) ? C_NULL : Ptr{Cvoid}(pointer(data_bytes))
         # offsets may also need materialising (view → copy)
-        offs = v.offsets.offsets isa Vector ? v.offsets.offsets : collect(v.offsets.offsets)
+        offs = let r = _raw_offsets(v.offsets); r isa Vector ? r : collect(r) end
         push!(roots, offs)
         op = Ptr{Cvoid}(pointer(offs))
         bufs = [vp, op, dp]
         push!(roots, bufs)
         return Ptr{Ptr{Cvoid}}(pointer(bufs)), 3
     else
-        offs = v.offsets.offsets isa Vector ? v.offsets.offsets : collect(v.offsets.offsets)
+        offs = let r = _raw_offsets(v.offsets); r isa Vector ? r : collect(r) end
         push!(roots, offs)
         op = Ptr{Cvoid}(pointer(offs))
         bufs = [vp, op]

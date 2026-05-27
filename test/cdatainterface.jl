@@ -15,7 +15,6 @@
 # limitations under the License.
 
 @testset "Arrow C Data Interface" begin
-    _initial_count = Arrow.UNRELEASED_HANDLE_COUNT[]
 
     @testset "struct sizes" begin
         @test sizeof(Arrow.ArrowSchema) == 9 * 8
@@ -756,36 +755,6 @@
         end
     end
 
-    # ── Finalizer / leak counter ──────────────────────────────────────────────
-
-    @testset "finalizer: increments leak counter when not released" begin
-        before = Arrow.UNRELEASED_HANDLE_COUNT[]
-        redirect_stderr(devnull) do
-            let
-                av = to_arrow(Int32[1, 2, 3])
-                s_ref, a_ref = Arrow.to_c_data(av)
-                Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
-                # CImportedArray and its CDataHandle go out of scope here
-            end
-            GC.gc(true)
-            GC.gc(true)
-        end
-        @test Arrow.UNRELEASED_HANDLE_COUNT[] == before + 1
-    end
-
-    @testset "finalizer: does NOT increment counter when released explicitly" begin
-        before = Arrow.UNRELEASED_HANDLE_COUNT[]
-        let
-            av = to_arrow(Int32[1, 2, 3])
-            s_ref, a_ref = Arrow.to_c_data(av)
-            col = Arrow.from_c_data(_cptr(s_ref), _cptr(a_ref))
-            Arrow.release_c_data(col)
-        end
-        GC.gc(true)
-        GC.gc(true)
-        @test Arrow.UNRELEASED_HANDLE_COUNT[] == before
-    end
-
     # ── Empty arrays ─────────────────────────────────────────────────────────
 
     @testset "round-trip: empty Int32 array" begin
@@ -830,9 +799,4 @@
         Arrow.release_c_data(imported)
     end
 
-    @testset "no unexpected resource leaks" begin
-        GC.gc(true)
-        GC.gc(true)
-        @test Arrow.UNRELEASED_HANDLE_COUNT[] == _initial_count + 1  # +1 for the intentional leak test
-    end
 end # @testset "Arrow C Data Interface"

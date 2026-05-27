@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-struct Offsets{T<:Union{Int32,Int64}} <: ArrowVector{Tuple{T,T}}
+abstract type AbstractOffsets{T<:Union{Int32,Int64}} <: AbstractVector{Tuple{T,T}} end
+
+struct Offsets{T<:Union{Int32,Int64}} <: AbstractOffsets{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     offsets::Vector{T}
 end
@@ -28,18 +30,27 @@ Base.size(o::Offsets) = (length(o.offsets) - 1,)
     return lo, hi
 end
 
+_raw_offsets(o::Offsets) = o.offsets
+
 """
     Arrow.List
 
 An `ArrowVector` where each element is a variable sized list of some kind, like an `AbstractVector` or `AbstractString`.
 """
-struct List{T,O,A} <: ArrowVector{T}
+struct List{T,O,A,OF} <: ArrowVector{T}
     arrow::Vector{UInt8} # need to hold a reference to arrow memory blob
     validity::ValidityBitmap
-    offsets::Offsets{O}
+    offsets::OF
     data::A
     ℓ::Int
     metadata::Union{Nothing,Base.ImmutableDict{String,String}}
+end
+
+# Backward-compatible 3-param constructor: infers OF from the offsets argument
+function List{T,O,A}(
+    arrow, validity, offsets::OF, data, ℓ, meta,
+) where {T,O,A,OF<:AbstractOffsets}
+    return List{T,O,A,OF}(arrow, validity, offsets, data, ℓ, meta)
 end
 
 Base.size(l::List) = (l.ℓ,)
@@ -248,7 +259,7 @@ function compress(Z::Meta.CompressionType.T, comp, x::List{T,O,A}) where {T,O,A}
     len = length(x)
     nc = nullcount(x)
     validity = compress(Z, comp, x.validity)
-    offsets = compress(Z, comp, x.offsets.offsets)
+    offsets = compress(Z, comp, _raw_offsets(x.offsets))
     buffers = [validity, offsets]
     children = Compressed[]
     if liststringtype(x)
