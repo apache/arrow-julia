@@ -233,4 +233,45 @@ end
             @test isequal(x, [missing])
         end
     end
+
+    @testset "Enum" begin
+        @enum Fruit apple=0 banana=1 cherry=2
+
+        # ArrowType and toarrow
+        @test ArrowTypes.ArrowType(Fruit) == Int32
+        @test ArrowTypes.toarrow(apple) === Int32(0)
+        @test ArrowTypes.toarrow(cherry) === Int32(2)
+
+        # arrowname
+        @test ArrowTypes.arrowname(Fruit) === ArrowTypes.ENUM_SYMBOL
+        @test ArrowTypes.hasarrowname(Fruit)
+
+        # arrowmetadata registers the type and returns the name
+        meta = ArrowTypes.arrowmetadata(Fruit)
+        @test meta == "Fruit"
+        @test ArrowTypes.ENUM_TYPES["Fruit"] === Fruit
+
+        # JuliaType lookup via registry
+        @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM_SYMBOL), Int32, "Fruit") === Fruit
+        @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM_SYMBOL), Int32, "NoSuchEnum") === nothing
+
+        # fromarrow
+        @test ArrowTypes.fromarrow(Fruit, Int32(0)) === apple
+        @test ArrowTypes.fromarrow(Fruit, Int32(2)) === cherry
+
+        # default
+        @test ArrowTypes.default(Fruit) === apple
+
+        # Manual registertype!
+        @enum Planet mercury=0 venus=1 earth=2
+        # Not yet registered (unless arrowmetadata was called)
+        delete!(ArrowTypes.ENUM_TYPES, "Planet")
+        @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM_SYMBOL), Int32, "Planet") === nothing
+        ArrowTypes.registertype!(Planet)
+        @test ArrowTypes.JuliaType(Val(ArrowTypes.ENUM_SYMBOL), Int32, "Planet") === Planet
+
+        # Union{Enum, Missing} passthrough
+        @test ArrowTypes.arrowname(Union{Fruit,Missing}) === ArrowTypes.ENUM_SYMBOL
+        @test ArrowTypes.arrowmetadata(Union{Fruit,Missing}) == "Fruit"
+    end
 end
