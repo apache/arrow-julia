@@ -456,6 +456,15 @@ end
 
 Tables.partitions(t::Table) = TablePartitions(t)
 
+# Build a Table directly from a NamedTuple of column vectors (Arrow C Data path).
+function Table(nt::NamedTuple{names}) where {names}
+    nms = collect(Symbol, names)
+    cols = AbstractVector[nt[nm] for nm in names]
+    tps = Type[eltype(c) for c in cols]
+    lup = Dict{Symbol,AbstractVector}(zip(nms, cols))
+    return Table(nms, tps, cols, lup, Ref{Meta.Schema}())
+end
+
 # high-level user API functions
 Table(input, pos::Integer=1, len=nothing; kw...) =
     Table([ArrowBlob(tobytes(input), pos, len)]; kw...)
