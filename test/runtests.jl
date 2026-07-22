@@ -1084,6 +1084,41 @@ end
             )
             @test t.reject_reason[end] == "POST_ONLY"
         end
+
+        @testset "Enum roundtrip" begin
+            @enum Direction north=0 south=1 east=2 west=3
+
+            # Basic roundtrip
+            orig = [north, south, east, west, north]
+            tbl = Arrow.Table(Arrow.tobuffer((dir=orig,)))
+            @test tbl.dir == orig
+            @test eltype(tbl.dir) == Direction
+
+            # Union{Enum, Missing}
+            orig_m = Union{Direction,Missing}[north, missing, east, missing, west]
+            tbl2 = Arrow.Table(Arrow.tobuffer((dir=orig_m,)))
+            @test isequal(tbl2.dir, orig_m)
+            @test eltype(tbl2.dir) == Union{Direction,Missing}
+
+            # Multiple enum columns
+            @enum Priority low=0 medium=1 high=2
+            orig_d = [north, south, east]
+            orig_p = [low, high, medium]
+            tbl3 = Arrow.Table(Arrow.tobuffer((dir=orig_d, pri=orig_p)))
+            @test tbl3.dir == orig_d
+            @test eltype(tbl3.dir) == Direction
+            @test tbl3.pri == orig_p
+            @test eltype(tbl3.pri) == Priority
+
+            # Multiple record batches
+            orig_long = repeat([north, south, east, west], 100)
+            io = IOBuffer()
+            Arrow.write(io, (dir=orig_long,); file=false)
+            seekstart(io)
+            tbl4 = Arrow.Table(io)
+            @test tbl4.dir == orig_long
+            @test eltype(tbl4.dir) == Direction
+        end
     end # @testset "misc"
 
     @testset "DataAPI.metadata" begin
