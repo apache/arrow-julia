@@ -111,8 +111,10 @@ const AC = ArrowCore
         wait(entered)
         @test forceclose!(r; timeout_ms=0) == false
         @test AC.phase(@atomic r.state) == AC.PHASE_CLOSING
+        waiter = Threads.@spawn forceclose!(r)
         notify(finish)
         @test fetch(first)
+        @test fetch(waiter)
         @test calls[] == 1
         @test AC.phase(@atomic r.state) == AC.PHASE_CLOSED
     end

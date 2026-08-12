@@ -237,31 +237,35 @@ function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
     timeout_ms >= 0 || throw(ArgumentError("timeout_ms must be non-negative"))
     timeout_ms <= typemax(UInt64) ÷ 1_000_000 ||
         throw(ArgumentError("timeout_ms is too large"))
-    st = @atomic :acquire r.state
-    phase(st) == PHASE_CLOSED && return true
-    # Only OPEN may win the transition. In particular, a second closer must
-    # not successfully CAS `closing => closing` and publish CLOSED while the
-    # unique winner is still executing the release callback.
-    phase(st) == PHASE_OPEN || return false
-    # open -> closing. Failure means someone else is closing (wait via retry)
-    # or already closed.
-    closing = (generation(st) << 2) | PHASE_CLOSING
-    # Close is cold-path: default (sequentially consistent) ordering. (A
-    # single non-seqcst ordering is rejected here because it must double as
-    # the CAS *failure* ordering.)
-    old, ok = @atomicreplace r.state st => closing
-    if !ok
-        return phase(old) == PHASE_CLOSED
+    started = time_ns()
+    timeout_ns = UInt64(timeout_ms) * 1_000_000
+    st = UInt64(0)
+    closing = UInt64(0)
+    while true
+        st = @atomic :acquire r.state
+        phase(st) == PHASE_CLOSED && return true
+        if phase(st) == PHASE_CLOSING
+            # Another closer is the sole callback owner. Wait for it to
+            # publish CLOSED (success) or restore OPEN (then retry). Never
+            # CAS closing=>closing: that would create a second winner.
+            time_ns() - started >= timeout_ns && return false
+            yield()
+            continue
+        end
+        closing = (generation(st) << 2) | PHASE_CLOSING
+        # Close is cold-path: default (sequentially consistent) ordering. (A
+        # single non-seqcst ordering is rejected here because it must double
+        # as the CAS failure ordering.)
+        old, ok = @atomicreplace r.state st => closing
+        ok && break
     end
     # Wait for in-flight guards. Guards are short-lived by contract, so this
     # terminates quickly; the timeout is a safety valve, not a normal path.
-    started = time_ns()
-    timeout_ns = UInt64(timeout_ms) * 1_000_000
     while (@atomic r.guards) != 0   # seq_cst: pairs with withguard's increment
         if time_ns() - started >= timeout_ns
             # Restore only our exact closing state. This remains robust to
             # explicit `finalize(r)` and future lifecycle transitions.
-            restored_from, restored = @atomicreplace r.state closing => st
+            @atomicreplace r.state closing => st
             return false
         end
         yield()
