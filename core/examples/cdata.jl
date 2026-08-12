@@ -19,7 +19,7 @@
 #
 #     julia --startup-file=no core/examples/cdata.jl
 #
-# The point of the whole Core design is that this file is SMALL and BORING:
+# The point of the whole Core design is that this adapter is a direct mapping:
 # because `ArrayData` already has the shape of the C `ArrowArray` (buffers +
 # children + dictionary + length/null_count/offset), export is struct
 # filling and import is struct reading — after five stalled attempts to bolt
@@ -132,7 +132,7 @@ function parseformat(fmt::AbstractString, flags::Int64=0)::ArrowType
 end
 
 # ---------------------------------------------------------------------------
-# Export: Core -> C structs, control block + registry + reap queue
+# Export: Core -> C structs, per-node controls + registry + explicit reaper
 # ---------------------------------------------------------------------------
 
 # Per-node control block layout (malloc'd, never GC-scanned):
@@ -141,10 +141,11 @@ end
 const CONTROL_BLOCK_BYTES = 16
 
 """
-Everything one export must keep alive and eventually free: the Core columns
-(whose OwnerRegions root the actual buffers), every malloc'd C struct and
-string, and the control block. Held in EXPORT_REGISTRY under the control
-block's key until the consumer calls release and the reaper runs.
+Everything one export tree must keep alive and eventually free: the Core
+columns (whose OwnerRegions root the actual buffers), every malloc'd C struct
+and string, and every per-node control block. Held in EXPORT_REGISTRY under
+their shared aggregate key until all non-moved and moved nodes have been
+released and the reaper runs.
 """
 mutable struct ExportedRoot
     roots::Vector{Any}          # ArrayData/Field/Schema kept reachable
@@ -189,7 +190,7 @@ function _finish_node!(p, control::Ptr{Cvoid})
     # This locked block is the callback's final access to export-owned memory.
     # The reaper observes zero only after every non-moved descendant callback,
     # and every independently moved node callback, has completed. Scanning in
-    # reap! keeps allocation and queue mutation out of the C callback.
+    # reap! keeps allocation and registry removal out of the C callback.
     lock(REGISTRY_LOCK) do
         unsafe_load(Ptr{UInt8}(control)) == 0x01 ||
             error("C Data node is not in releasing state")
@@ -543,9 +544,10 @@ bufferptr(a::CArrowArray, i::Int) = unsafe_load(a.buffers, i)
 """
     from_c_data(schemaptr, arrayptr) -> (Field, ArrayData)
 
-Import (MOVE) a C-data column. Per spec the source structures are consumed:
-we copy them by value and null the source's release so the producer side
-cannot double-free. Buffer extents are computed from length/offset/layout —
+Import a C-data column. The ArrowArray is moved: it is copied by value and its
+source release is nulled so the producer side cannot double-free. The
+ArrowSchema is parsed and then released in place. Buffer extents are computed
+from length/offset/layout —
 DECLARED extents (report §9): the ABI cannot prove the allocation sizes, so
 this is the trusted-in-process boundary, and validation runs on the declared
 geometry. A failed import releases the moved tree exactly once.
@@ -961,7 +963,7 @@ function main()
     @assert isequal(materialize(df2, dd2), [missing, "x"])
     release!(dd2.owner::ForeignOwner)
     @assert reap!() == 2
-    println("dictionary flags and value nullability round-trip ✓")
+    println("dictionary ordered flag and nullable pool values round-trip ✓")
 
     sp, ap = to_c_data(df, dd)
     sdict = unsafe_load(sp).dictionary

@@ -674,7 +674,8 @@ end
         @test !(@atomic d.semachecked)
         validate_semantic(f, d)
         @test (@atomic d.semachecked)
-        validate_semantic(f, d)   # second call is the cached no-op path
+        # The data-intrinsic scan is cached; Field contracts still run.
+        validate_semantic(f, d)
         @test (@atomic d.semachecked)
     end
 end

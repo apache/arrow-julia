@@ -26,9 +26,10 @@ Design rules this module is built to demonstrate:
 
 1. One physical data model. `ArrayData` = layout + buffers + children +
    dictionary, mirroring the Arrow C data interface's `ArrowArray`. Logical
-   type parameters (timezone, precision/scale, field names) are runtime
-   VALUES on `ArrowType` descriptors, never Julia type parameters — schema
-   size cannot multiply method instances.
+   type parameters such as timezone and precision/scale are fields on
+   `ArrowType` descriptors. Names and nullability are fields on `Field`.
+   None parameterize the Core storage types. The prove-out's Struct
+   materializer may still construct `NamedTuple{names}` as a facade shortcut.
 
 2. Ownership is an object, not a convention. Every buffer is a `BufferSlice`
    into an `OwnerRegion` that knows its extent, its alignment, and how to
@@ -47,12 +48,15 @@ Design rules this module is built to demonstrate:
    Generic code (buffer walking, structural validation, the IPC adapter's
    node/buffer accounting in core/examples/ipc_read.jl) is driven by the
    registry; per-layout SEMANTICS (element access, semantic validation) are
-   ordinary methods grouped per layout below. Adding a layout = one registry
-   entry + one small method group.
+   ordinary methods grouped per layout below. Adding a layout means one
+   registry entry plus bounded method groups in the layers that support it.
 
 4. Validation is staged (report §9): structural checks here are O(buffers)
-   and run at construction/adaptation time; semantic checks are O(n), run
-   once on first exposure, and cached; full checks (UTF-8) are opt-in.
+   and run at construction/adaptation time. Data-intrinsic semantic checks
+   are O(n) when an adapter or caller requests them; a successful result is
+   cached. Benign concurrent callers may repeat the same scan.
+   Field-dependent contracts, including nullability, run on every validation
+   call. Full checks (UTF-8) are opt-in.
    Framing-stage checks (checked spans, metadata verification, and resource
    limits before metadata-directed allocation) belong to the adapters and
    are exercised in the IPC example.
@@ -705,7 +709,7 @@ mutable struct ArrayData
     const dictionary::Union{Nothing,ArrayData}
     const owner::Any                  # adapter lifetime anchor, if needed
     @atomic nullcount::Int64      # -1 = unknown, computed on demand
-    @atomic semachecked::Bool     # semantic validation ran and passed
+    @atomic semachecked::Bool     # data-intrinsic semantic checks passed
 end
 
 function ArrayData(type::ArrowType, len::Integer, buffers;
@@ -846,8 +850,9 @@ Recurses into children and the dictionary.
 
 BufferSlice construction has already bounded every slice inside its region,
 so this stage never touches memory — it is pure arithmetic on declared
-sizes. (The framing stage — resource limits before allocation, message-body
-spans — belongs to the adapters; see core/examples/ipc_read.jl.)
+sizes. (The framing stage — resource limits before metadata-directed decode
+allocation and checked message-body spans — belongs to the adapters; see
+core/examples/ipc_read.jl.)
 """
 function validate_structural(f::Field, d::ArrayData)
     typeequal(f.type, d.type) ||
