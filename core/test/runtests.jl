@@ -523,6 +523,32 @@ end
         @test_throws ValidationError validate_semantic(f, d)
     end
 
+    @testset "semantic: Date64 and Time values obey their domains" begin
+        function checkvalues(t, values; valid=true)
+            f = Field("temporal", t; nullable=false)
+            d = AC.ArrayData(t, length(values),
+                [BufferSlice(), AC._databuffer(values)]; nullcount=0)
+            validate_structural(f, d)
+            if valid
+                @test validate_semantic(f, d) === d
+            else
+                @test_throws ValidationError validate_semantic(f, d)
+            end
+        end
+
+        checkvalues(DateType(AC.MILLISECOND_DATE),
+            Int64[-86_400_000, 0, 86_400_000])
+        checkvalues(DateType(AC.MILLISECOND_DATE), Int64[1]; valid=false)
+        checkvalues(TimeType(AC.SECOND, 32), Int32[0, 86_399])
+        checkvalues(TimeType(AC.SECOND, 32), Int32[-1]; valid=false)
+        checkvalues(TimeType(AC.SECOND, 32), Int32[86_400]; valid=false)
+        checkvalues(TimeType(AC.MILLISECOND, 32), Int32[86_399_999])
+        checkvalues(TimeType(AC.MICROSECOND, 64), Int64[86_399_999_999])
+        checkvalues(TimeType(AC.NANOSECOND, 64), Int64[86_399_999_999_999])
+        checkvalues(TimeType(AC.NANOSECOND, 64),
+            Int64[86_400_000_000_000]; valid=false)
+    end
+
     @testset "semantic: dictionary index out of bounds" begin
         f, d = AC.fromjulia_dict("d", ["a", "b"], [0, 1])
         # corrupt: poke an index past the pool through a rebuilt ArrayData

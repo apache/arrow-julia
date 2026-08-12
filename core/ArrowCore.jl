@@ -983,6 +983,38 @@ dictvaluefield(f::Field, t::DictionaryType) =
     # nullable flag describes only the indices and cannot constrain the pool.
     Field(f.name, t.valuetype; nullable=true, children=f.children)
 
+const MILLISECONDS_PER_DAY = Int64(86_400_000)
+
+_validate_temporal_values(::ArrowType, ::ArrayData) = nothing
+function _validate_temporal_values(t::DateType, d::ArrayData)
+    t.unit == MILLISECOND_DATE || return nothing
+    data = rolebuffer(d, DATA)
+    for i = 1:d.len
+        isvalid_at(d, i) || continue
+        value = loadat(data, Int64, _slotbyteoff(d, Int64(i), 8))
+        value % MILLISECONDS_PER_DAY == 0 ||
+            throw(ValidationError("Date64 value $value is not a whole day in milliseconds"))
+    end
+    return nothing
+end
+
+function _validate_temporal_values(t::TimeType, d::ArrayData)
+    units_per_day = t.unit == SECOND ? Int64(86_400) :
+        t.unit == MILLISECOND ? MILLISECONDS_PER_DAY :
+        t.unit == MICROSECOND ? Int64(86_400_000_000) :
+        Int64(86_400_000_000_000)
+    data = rolebuffer(d, DATA)
+    T = t.bits == 32 ? Int32 : Int64
+    width = Int64(sizeof(T))
+    for i = 1:d.len
+        isvalid_at(d, i) || continue
+        value = loadat(data, T, _slotbyteoff(d, Int64(i), width))
+        0 <= value < units_per_day ||
+            throw(ValidationError("Time value $value is outside [0, $units_per_day) for $(t.unit)"))
+    end
+    return nothing
+end
+
 """
     validate_semantic(field, data)
 
@@ -1048,6 +1080,7 @@ function validate_semantic(f::Field, d::ArrayData)
                 end
             end
         end
+        _validate_temporal_values(t, d)
         actual_nulls = _count_nulls(d)
         declared_nulls = @atomic :monotonic d.nullcount
         if declared_nulls >= 0 && declared_nulls != actual_nulls
