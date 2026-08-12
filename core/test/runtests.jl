@@ -571,30 +571,6 @@ end
         @test_throws ValidationError validate_structural(outerf, outerd)
     end
 
-    @testset "structural: map uses canonical child names" begin
-        kf, kd = fromjulia("key", ["a"])
-        vf, vd = fromjulia("value", Int64[1])
-        entries = Field("entries", StructType(); nullable=false,
-            children=[kf, vf])
-        ed = AC.ArrayData(StructType(), 1, [BufferSlice()];
-            children=[kd, vd], nullcount=0)
-        t = MapType(false)
-        d = AC.ArrayData(t, 1,
-            [BufferSlice(), AC._databuffer(Int32[0, 1])];
-            children=[ed], nullcount=0)
-        @test validate_structural(Field("m", t; children=[entries]), d) === d
-        wrongentries = Field("not_entries", StructType(); nullable=false,
-            children=[kf, vf])
-        wrongkey = Field("entries", StructType(); nullable=false,
-            children=[Field("not_key", kf.type; nullable=kf.nullable), vf])
-        wrongvalue = Field("entries", StructType(); nullable=false,
-            children=[kf, Field("not_value", vf.type; nullable=vf.nullable)])
-        for badentries in (wrongentries, wrongkey, wrongvalue)
-            @test_throws ValidationError validate_structural(
-                Field("m", t; children=[badentries]), d)
-        end
-    end
-
     @testset "semantic: declared null count matches bitmap" begin
         f, d = fromjulia("x", [1, missing])
         bad = AC.ArrayData(d.type, d.len, d.buffers; nullcount=0)

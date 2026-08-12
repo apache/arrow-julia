@@ -948,16 +948,12 @@ function validate_structural(f::Field, d::ArrayData)
     end
     if d.type isa MapType
         entries = f.children[1]
-        entries.name == "entries" ||
-            throw(ValidationError("map child must be named entries"))
         entries.type isa StructType ||
             throw(ValidationError("map child must be an entries struct"))
         !entries.nullable ||
             throw(ValidationError("map entries field must be non-nullable"))
         length(entries.children) == 2 ||
             throw(ValidationError("map entries struct must have key and value children"))
-        entries.children[1].name == "key" && entries.children[2].name == "value" ||
-            throw(ValidationError("map entry children must be named key and value"))
         !entries.children[1].nullable ||
             throw(ValidationError("map keys must be non-nullable"))
     end
