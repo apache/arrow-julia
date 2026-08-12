@@ -437,7 +437,7 @@ datatype_alignment(::Type{T}) where {T} = Base.datatype_alignment(T)
     return reinterpret_bytes(T, bytes)
 end
 @inline reinterpret_bytes(::Type{T}, bytes::NTuple{N,UInt8}) where {T,N} =
-    (r = Ref(bytes); GC.@preserve r unsafe_load(Ptr{T}(Base.unsafe_convert(Ptr{NTuple{N,UInt8}}, r))))
+    reinterpret(T, bytes)
 
 "Copy the slice into a fresh `Vector{UInt8}` (used by materialize/tests)."
 function slicebytes(b::BufferSlice)
