@@ -85,7 +85,8 @@ Logical parent offsets and nested slices are tested. Struct scalars use a
 ordered vector of `Pair{String,Any}` so valid duplicate or omitted names do
 not fail. Utf8View, BinaryView, ListView, and run-end encoding have registry
 entries and structural validation but no accessors. This is a declared scope
-boundary.
+boundary. `validate_full` adds UTF-8 well-formedness only; canonical padding
+and unused-bit checks remain production work.
 
 The IPC example has a narrower mapping. It reads streams containing integer,
 floating point, Boolean, decimal, date, time, timestamp, duration, UTF-8,

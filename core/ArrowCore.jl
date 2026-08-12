@@ -1025,9 +1025,10 @@ end
 
 Stage-3 validation: O(n) content checks that make later guarded accessors
 safe — offset monotonicity + final-offset bounds, dictionary index bounds,
-union type-id domain. Data-intrinsic checks run once and are cached on the
-ArrayData (`semachecked`). Field-dependent contracts, including nullability,
-run on every call because the same data can be checked against another Field.
+union type-id domain. Successful data-intrinsic results are cached on the
+ArrayData (`semachecked`); benign concurrent callers may repeat the same scan.
+Field-dependent contracts, including nullability, run on every call because
+the same data can be checked against another Field.
 """
 function validate_semantic(f::Field, d::ArrayData)
     t = d.type
