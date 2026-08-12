@@ -190,16 +190,23 @@ Convert a metadata Field to a Core Field. Dictionary-encoded fields become
 `DictionaryType` here; the IPC dictionary id is recorded in the adapter's
 side table (`dictids`), NOT on the Core field — Core never learns about ids.
 """
-function corefield(f::Meta.Field, dictids::Dict{Int64,Meta.Field})
-    children = Field[corefield(c, dictids) for c in something(f.children, Meta.Field[])]
+function corefield(f::Meta.Field, dictids::Dict{Int64,Meta.Field},
+    fielddictids::IdDict{Field,Int64})
+    children = Field[corefield(c, dictids, fielddictids)
+                     for c in something(f.children, Meta.Field[])]
     t = coretype(f.type)
-    if f.dictionary !== nothing
-        dictids[f.dictionary.id] = f
-        idxt = f.dictionary.indexType === nothing ? IntType(32, true) :
-            coretype(f.dictionary.indexType)::IntType
-        t = DictionaryType(idxt, t, f.dictionary.isOrdered)
+    if f.dictionary === nothing
+        return Field(String(f.name), t, f.nullable, nothing, children)
     end
-    return Field(String(f.name), t, f.nullable, nothing, children)
+    dictids[f.dictionary.id] = f
+    idxt = f.dictionary.indexType === nothing ? IntType(32, true) :
+        coretype(f.dictionary.indexType)::IntType
+    cf = Field(String(f.name), DictionaryType(idxt, t, f.dictionary.isOrdered),
+        f.nullable, nothing, children)
+    # Identity-keyed: safe for duplicate column names and nested dict fields
+    # (name matching would be neither).
+    fielddictids[cf] = f.dictionary.id
+    return cf
 end
 
 # ---------------------------------------------------------------------------
@@ -291,12 +298,8 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
         throw(ValidationError("first IPC message must be a schema"))
     metaschema = msgs[1].msg.header
     dictids = Dict{Int64,Meta.Field}()
-    fields = Field[corefield(f, dictids) for f in metaschema.fields]
-    # Adapter-side id lookup: which Core field corresponds to which id.
-    fielddictids = IdDict{Field,Int64}()
-    for (id, mf) in dictids, f in fields
-        f.name == String(mf.name) && (fielddictids[f] = id)
-    end
+    fielddictids = IdDict{Field,Int64}()   # adapter-side id table (report §9)
+    fields = Field[corefield(f, dictids, fielddictids) for f in metaschema.fields]
     sch = Schema(fields)
     dicts = Dict{Int64,ArrayData}()
     batches = AC.RecordBatch[]
@@ -312,8 +315,11 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
             # the VALUE type; decode it with the same generic decoder. The
             # value field is the metadata field minus its dictionary tag.
             mf = dictids[header.id]
+            # Nested dictionary-encoded children of a dictionary's VALUES
+            # are out of prove-out scope; the throwaway tables make that an
+            # explicit decode error (missing id) rather than silent misreads.
             vf = Field(String(mf.name), coretype(mf.type), mf.nullable, nothing,
-                Field[corefield(c, Dict{Int64,Meta.Field}())
+                Field[corefield(c, Dict{Int64,Meta.Field}(), IdDict{Field,Int64}())
                       for c in something(mf.children, Meta.Field[])])
             cursor = DecodeCursor(rb.nodes, rb.buffers, fm.body, 1, 1)
             dicts[header.id] = decodefield(vf, cursor, dicts, fielddictids)

@@ -181,8 +181,14 @@ closer got there first, our post-increment state check sees `closing` and we
 back out. Either way no dereference overlaps a release.
 """
 @inline function withguard(f, r::OwnerRegion)
-    @atomic :acquire_release r.guards += 1
-    st = @atomic :acquire r.state
+    # Both sides of this handshake are sequentially consistent on purpose:
+    # guard-increment/state-load here race against state-CAS/guards-load in
+    # `forceclose!` on two different locations — the classic store/load
+    # pattern where acquire/release alone permits both sides to read stale
+    # values (closer sees guards==0 while we see state==open). seq_cst RMWs
+    # restore a single total order; the release decrement can stay cheaper.
+    @atomic r.guards += 1
+    st = @atomic r.state
     if phase(st) != PHASE_OPEN
         @atomic :acquire_release r.guards -= 1
         throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
@@ -219,7 +225,7 @@ function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
     # Wait for in-flight guards. Guards are short-lived by contract, so this
     # terminates quickly; the timeout is a safety valve, not a normal path.
     deadline = time_ns() + UInt64(timeout_ms) * 1_000_000
-    while (@atomic :acquire r.guards) != 0
+    while (@atomic r.guards) != 0   # seq_cst: pairs with withguard's increment
         if time_ns() > deadline
             # Restore open unconditionally: we are the unique closer (we won
             # the CAS above), so nobody else can have touched the state.
@@ -766,6 +772,15 @@ function validate_structural(f::Field, d::ArrayData)
         need = checked_mul(total, Int64(d.type.listsize))
         length(d.children[1]) >= need ||
             throw(ValidationError("fixed-size-list child too short: $(length(d.children[1])) < $need"))
+    end
+    # Struct and sparse-union children are parent-length arrays indexed at
+    # parent.offset + i (each child then applies its own offset), so every
+    # child must cover offset+len slots.
+    if d.type isa StructType || (d.type isa UnionType && d.type.mode == SparseMode)
+        for (ci, child) in enumerate(d.children)
+            length(child) >= total ||
+                throw(ValidationError("child $ci too short for parent extent: $(length(child)) < $total"))
+        end
     end
     return d
 end

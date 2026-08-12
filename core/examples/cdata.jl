@@ -151,16 +151,20 @@ const NEXT_KEY = Ref{Int64}(0)
 const REAP_QUEUE = Int64[]
 
 function _release_thunk(p::Ptr{Cvoid})
-    # Runs when the CONSUMER releases the exported structure. Native-safe
-    # work only: read the control block, flip the flag exactly once, record
-    # the key. (v1 contract: Julia-attached threads — see report §9.)
+    # Runs when the CONSUMER releases the exported structure. (v1 contract:
+    # Julia-attached threads — see report §9.) The exactly-once check-and-set
+    # happens under the registry lock so two racing release calls cannot both
+    # observe the live flag; the production adapter replaces this with a
+    # native CAS in the control block so the callback never takes a Julia
+    # lock at all.
     p == C_NULL && return nothing
-    flag = unsafe_load(Ptr{UInt8}(p))
-    flag == 0x01 && return nothing            # exactly-once
-    unsafe_store!(Ptr{UInt8}(p), 0x01)
-    key = unsafe_load(Ptr{Int64}(p + 8))
-    lock(REGISTRY_LOCK) do
-        push!(REAP_QUEUE, key)
+    key = lock(REGISTRY_LOCK) do
+        flag = unsafe_load(Ptr{UInt8}(p))
+        flag == 0x01 && return Int64(-1)      # already released
+        unsafe_store!(Ptr{UInt8}(p), 0x01)
+        k = unsafe_load(Ptr{Int64}(p + 8))
+        push!(REAP_QUEUE, k)
+        k
     end
     return nothing
 end
@@ -401,12 +405,15 @@ function from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray})
         d = _import_array(f, arr, owner)
         validate_structural(f, d)
         validate_semantic(f, d)
-        # The schema struct is released independently (separate lifetime).
-        _release_c_schema!(sp, sch)
         return f, d
     catch
         release!(owner)   # failed-import cleanup: exactly once, then rethrow
         rethrow()
+    finally
+        # The schema struct's lifetime is separate from the array's and it
+        # is fully consumed by _import_field — release it on BOTH paths so a
+        # failed import cannot leak the producer's schema resources.
+        _release_c_schema!(sp, sch)
     end
 end
 
@@ -454,10 +461,10 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
         nbytes = if role == AC.VALIDITY
             p == C_NULL ? Int64(0) : AC.expected_validity_bytes(total)
         elseif role == AC.OFFSETS
-            Int64((total + 1) * spec.offsetwidth)
+            AC.checked_mul(AC.checked_add(total, Int64(1)), Int64(spec.offsetwidth))
         elseif role == AC.DATA
             if spec.fixedwidth > 0
-                Int64(total * spec.fixedwidth)
+                AC.checked_mul(total, Int64(spec.fixedwidth))
             elseif spec.fixedwidth == -1
                 AC.expected_validity_bytes(total)
             else
