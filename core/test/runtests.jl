@@ -433,6 +433,25 @@ end
         @test materialize(uf, ud) == ["y", 30]
     end
 
+    @testset "struct access preserves duplicate and omitted names" begin
+        af, ad = fromjulia("dup", Int64[1])
+        bf, bd = fromjulia("dup", Int64[2])
+        f = Field("s", StructType(); children=[af, bf])
+        d = AC.ArrayData(StructType(), 1, [BufferSlice()];
+            children=[ad, bd], nullcount=0)
+        validate_structural(f, d)
+        validate_semantic(f, d)
+        @test getvalue(f, d, 1) == ["dup" => 1, "dup" => 2]
+
+        unnamed = Field("s", StructType(); children=[
+            Field("", af.type; nullable=false),
+            Field("", bf.type; nullable=false),
+        ])
+        validate_structural(unnamed, d)
+        validate_semantic(unnamed, d)
+        @test getvalue(unnamed, d, 1) == ["" => 1, "" => 2]
+    end
+
     @testset "view/REE layouts: registry-known, access explicitly unsupported" begin
         t = RunEndEncodedType()
         ref, red = fromjulia("run_ends", Int32[2, 3])

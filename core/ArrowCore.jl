@@ -1267,10 +1267,15 @@ end
 
 function _value(::StructType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
-    names = Tuple(Symbol(cf.name) for cf in f.children)
     childindex = checked_add(d.offset, i)
     vals = Tuple(getvalue(cf, cd, childindex) for (cf, cd) in zip(f.children, d.children))
-    return NamedTuple{names}(vals)
+    names = Tuple(cf.name for cf in f.children)
+    if all(!isempty, names) && length(unique(names)) == length(names)
+        return NamedTuple{Tuple(Symbol(name) for name in names)}(vals)
+    end
+    # Arrow permits duplicate and omitted field names. NamedTuple cannot
+    # represent duplicates, so retain the exact order and names as pairs.
+    return Pair{String,Any}[names[j] => vals[j] for j in eachindex(names)]
 end
 
 function _value(t::MapType, f::Field, d::ArrayData, i::Int64)
