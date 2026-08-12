@@ -569,6 +569,23 @@ end
         @test_throws ArgumentError AC.ArrayData(d.type, d.len, d.buffers; nullcount=3)
     end
 
+    @testset "field nullability is checked outside the data cache" begin
+        nullable, d = fromjulia("x", [1, missing])
+        validate_semantic(nullable, d)
+        @test (@atomic d.semachecked)
+        nonnullable = Field("x", d.type; nullable=false)
+        @test_throws ValidationError validate_semantic(nonnullable, d)
+
+        af, ad = fromjulia("a", Union{Missing,Int64}[missing])
+        uf = Field("u", UnionType(AC.DenseMode, Int8[0]); nullable=false,
+            children=[af])
+        ud = AC.ArrayData(uf.type, 1,
+            [AC._databuffer(Int8[0]), AC._databuffer(Int32[0])];
+            children=[ad], nullcount=0)
+        validate_structural(uf, ud)
+        @test_throws ValidationError validate_semantic(uf, ud)
+    end
+
     @testset "full: invalid UTF-8" begin
         t = Utf8Type(false)
         f = Field("s", t)

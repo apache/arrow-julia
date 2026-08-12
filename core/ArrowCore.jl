@@ -33,8 +33,10 @@ Design rules this module is built to demonstrate:
 2. Ownership is an object, not a convention. Every buffer is a `BufferSlice`
    into an `OwnerRegion` that knows its extent, its alignment, and how to
    release itself. Slices are bounds-checked against the region at
-   construction, so corrupt metadata produces an error at open, never a
-   segfault at access. Views hold GC *reachability* of the region; every
+   construction. Owned and verified IPC regions therefore reject corrupt
+   metadata before access. Foreign C-data extents remain a documented,
+   trusted declaration because that ABI supplies no allocation sizes. Views
+   hold GC *reachability* of the region; every
    pointer dereference additionally takes a short-lived access *guard*, so a
    deterministic `forceclose!` can wait out in-flight access, invalidate all
    views via a generation bump, and unmap — an escaped view can delay a
@@ -51,8 +53,9 @@ Design rules this module is built to demonstrate:
 4. Validation is staged (report §9): structural checks here are O(buffers)
    and run at construction/adaptation time; semantic checks are O(n), run
    once on first exposure, and cached; full checks (UTF-8) are opt-in.
-   Framing-stage checks (resource limits before allocation) belong to the
-   adapters and are exercised in the IPC example.
+   Framing-stage checks (checked spans, metadata verification, and resource
+   limits before metadata-directed allocation) belong to the adapters and
+   are exercised in the IPC example.
 
 Deliberately out of scope for the prove-out (tracked in the report roadmap):
 view layouts (Utf8View/BinaryView/ListView) and run-end encoding have
@@ -312,6 +315,9 @@ Map a file read-only and own the mapping. The region performs its own
 mmap/munmap via ccall (the report's choice: the stdlib Mmap ties unmap to a
 finalizer on internals with no public eager-unmap API, which is precisely
 the lifecycle problem this type exists to fix). POSIX only in the prove-out.
+The caller must prevent external truncation of the opened inode while the
+mapping is live; an mmap cannot be made safe against another process that
+truncates its file.
 """
 function mmapregion(path::AbstractString)
     Sys.isunix() || error("mmapregion: prove-out implements POSIX only")
@@ -982,79 +988,114 @@ dictvaluefield(f::Field, t::DictionaryType) =
 
 Stage-3 validation: O(n) content checks that make later guarded accessors
 safe — offset monotonicity + final-offset bounds, dictionary index bounds,
-union type-id domain. Runs once; the result is cached on the ArrayData
-(`semachecked`), so adapters can call this at hand-off and accessors get it
-for free.
+union type-id domain. Data-intrinsic checks run once and are cached on the
+ArrayData (`semachecked`). Field-dependent contracts, including nullability,
+run on every call because the same data can be checked against another Field.
 """
 function validate_semantic(f::Field, d::ArrayData)
-    (@atomic :monotonic d.semachecked) && return d
     t = d.type
-    spec = layoutspec(t)
-    oi = findfirst(==(OFFSETS), spec.buffers)
-    if oi !== nothing && spec.offsetwidth != 0
-        O = spec.offsetwidth == 8 ? Int64 : Int32
-        offs = d.buffers[oi]
-        if !(isempty_buffer(offs) && d.len == 0 && d.offset == 0)
-            databytes = if t isa Utf8Type || t isa BinaryType
-                di = findfirst(==(DATA), spec.buffers)
-                d.buffers[di].len
-            else
-                isempty(d.children) ? Int64(0) : Int64(length(d.children[1]))
+    if !(@atomic :monotonic d.semachecked)
+        spec = layoutspec(t)
+        oi = findfirst(==(OFFSETS), spec.buffers)
+        if oi !== nothing && spec.offsetwidth != 0
+            O = spec.offsetwidth == 8 ? Int64 : Int32
+            offs = d.buffers[oi]
+            if !(isempty_buffer(offs) && d.len == 0 && d.offset == 0)
+                databytes = if t isa Utf8Type || t isa BinaryType
+                    di = findfirst(==(DATA), spec.buffers)
+                    d.buffers[di].len
+                else
+                    isempty(d.children) ? Int64(0) : Int64(length(d.children[1]))
+                end
+                prev = loadat(offs, O, checked_mul(d.offset, Int64(sizeof(O))))
+                prev >= 0 || throw(ValidationError("negative first offset"))
+                for i = 1:d.len
+                    cur = loadat(offs, O,
+                        checked_mul(checked_add(d.offset, Int64(i)), Int64(sizeof(O))))
+                    cur >= prev || throw(ValidationError("offsets not monotonically non-decreasing at $i"))
+                    prev = cur
+                end
+                Int64(prev) <= databytes ||
+                    throw(ValidationError("final offset $prev exceeds data extent $databytes"))
             end
-            prev = loadat(offs, O, checked_mul(d.offset, Int64(sizeof(O))))
-            prev >= 0 || throw(ValidationError("negative first offset"))
+        end
+        if t isa DictionaryType
+            dictlen = length(d.dictionary)
+            data = rolebuffer(d, DATA)
+            w = primwidth(t.indextype)
             for i = 1:d.len
-                cur = loadat(offs, O,
-                    checked_mul(checked_add(d.offset, Int64(i)), Int64(sizeof(O))))
-                cur >= prev || throw(ValidationError("offsets not monotonically non-decreasing at $i"))
-                prev = cur
-            end
-            Int64(prev) <= databytes ||
-                throw(ValidationError("final offset $prev exceeds data extent $databytes"))
-        end
-    end
-    if t isa DictionaryType
-        dictlen = length(d.dictionary)
-        data = rolebuffer(d, DATA)
-        w = primwidth(t.indextype)
-        for i = 1:d.len
-            isvalid_at(d, i) || continue
-            idx = _load_int(data, t.indextype, _slotbyteoff(d, Int64(i), w))
-            0 <= idx < dictlen ||
-                throw(ValidationError("dictionary index $idx out of bounds [0, $dictlen)"))
-        end
-        validate_semantic(dictvaluefield(f, t), d.dictionary)
-    end
-    if t isa UnionType
-        ids = rolebuffer(d, TYPE_IDS)
-        lastoffset = fill(Int64(-1), length(d.children))
-        for i = 1:d.len
-            tid = loadat(ids, Int8, _slotindex0(d, Int64(i)))
-            pos = findfirst(==(tid), t.typeids)
-            pos === nothing && throw(ValidationError("union type id $tid not in declared domain"))
-            if t.mode == DenseMode
-                off = loadat(rolebuffer(d, ELEMENT_OFFSETS), Int32,
-                    _slotbyteoff(d, Int64(i), 4))
-                0 <= off < length(d.children[pos]) ||
-                    throw(ValidationError("dense union offset $off out of bounds for child $pos"))
-                Int64(off) >= lastoffset[pos] ||
-                    throw(ValidationError("dense union offsets must be nondecreasing within child $pos"))
-                lastoffset[pos] = Int64(off)
+                isvalid_at(d, i) || continue
+                idx = _load_int(data, t.indextype, _slotbyteoff(d, Int64(i), w))
+                0 <= idx < dictlen ||
+                    throw(ValidationError("dictionary index $idx out of bounds [0, $dictlen)"))
             end
         end
+        if t isa UnionType
+            ids = rolebuffer(d, TYPE_IDS)
+            lastoffset = fill(Int64(-1), length(d.children))
+            for i = 1:d.len
+                tid = loadat(ids, Int8, _slotindex0(d, Int64(i)))
+                pos = findfirst(==(tid), t.typeids)
+                pos === nothing && throw(ValidationError("union type id $tid not in declared domain"))
+                if t.mode == DenseMode
+                    off = loadat(rolebuffer(d, ELEMENT_OFFSETS), Int32,
+                        _slotbyteoff(d, Int64(i), 4))
+                    0 <= off < length(d.children[pos]) ||
+                        throw(ValidationError("dense union offset $off out of bounds for child $pos"))
+                    Int64(off) >= lastoffset[pos] ||
+                        throw(ValidationError("dense union offsets must be nondecreasing within child $pos"))
+                    lastoffset[pos] = Int64(off)
+                end
+            end
+        end
+        actual_nulls = _count_nulls(d)
+        declared_nulls = @atomic :monotonic d.nullcount
+        if declared_nulls >= 0 && declared_nulls != actual_nulls
+            throw(ValidationError("declared null count $declared_nulls does not match bitmap count $actual_nulls"))
+        elseif declared_nulls < 0
+            @atomic :monotonic d.nullcount = actual_nulls
+        end
+        @atomic :monotonic d.semachecked = true
     end
+
+    # Field contracts are not part of the ArrayData cache. The same frozen
+    # data may be checked against a different Field, so recurse and enforce
+    # nullability on every call even when intrinsic data checks are cached.
     for (cf, cd) in zip(childfields(f), d.children)
         validate_semantic(cf, cd)
     end
-    actual_nulls = _count_nulls(d)
-    declared_nulls = @atomic :monotonic d.nullcount
-    if declared_nulls >= 0 && declared_nulls != actual_nulls
-        throw(ValidationError("declared null count $declared_nulls does not match bitmap count $actual_nulls"))
-    elseif declared_nulls < 0
-        @atomic :monotonic d.nullcount = actual_nulls
+    if t isa DictionaryType
+        validate_semantic(dictvaluefield(f, t), d.dictionary)
     end
-    @atomic :monotonic d.semachecked = true
+    if !f.nullable && _has_logical_null(f, d)
+        throw(ValidationError("non-nullable field $(repr(f.name)) contains null values"))
+    end
     return d
+end
+
+function _logical_null_at(f::Field, d::ArrayData, i::Int64)
+    t = d.type
+    t isa NullType && return true
+    if t isa UnionType
+        tid = loadat(rolebuffer(d, TYPE_IDS), Int8, _slotindex0(d, i))
+        pos = findfirst(==(tid), t.typeids)
+        pos === nothing && throw(ValidationError("union type id $tid not in declared domain"))
+        childi = if t.mode == DenseMode
+            off = loadat(rolebuffer(d, ELEMENT_OFFSETS), Int32, _slotbyteoff(d, i, 4))
+            checked_add(Int64(off), Int64(1))
+        else
+            checked_add(d.offset, i)
+        end
+        return _logical_null_at(f.children[pos], d.children[pos], childi)
+    end
+    spec = layoutspec(t)
+    return !isempty(spec.buffers) && spec.buffers[1] == VALIDITY && !isvalid_at(d, i)
+end
+
+function _has_logical_null(f::Field, d::ArrayData)
+    d.len == 0 && return false
+    d.type isa UnionType || return nullcount(d) != 0
+    return any(i -> _logical_null_at(f, d, Int64(i)), 1:d.len)
 end
 
 """
