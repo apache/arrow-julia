@@ -28,18 +28,21 @@
 #
 # Lifecycle, mapped to the report (§9 "C-data adapter"):
 #
-#   * Export: ONE release callback per moved root structure (children and
-#     dictionary are released by the root's callback, per spec — never
-#     per-buffer). `private_data` points to a malloc'd, never-GC-scanned
-#     CONTROL BLOCK holding an exactly-once state and the registry key; the
-#     Julia-side owner (which roots the Core columns and every malloc'd C
+#   * Export: ONE release callback per C structure (never per buffer). A
+#     parent callback releases each child/dictionary that has not been moved;
+#     a moved child keeps the shared export allocation alive until its own
+#     callback runs. `private_data` points to a per-node malloc'd,
+#     never-GC-scanned CONTROL BLOCK holding an exactly-once state and the
+#     registry key. The Julia-side owner (which roots the Core columns and
+#     every malloc'd C
 #     struct) stays in a global EXPORT REGISTRY until release — a raw
 #     pointer in private_data roots nothing by itself. The @cfunction
-#     release callback recursively marks the C tree released, then queues the
-#     key; a reaper pass frees mallocs, drops the registry root, and releases
-#     source-region pins. Prove-out thread contract: callbacks run only on
-#     Julia-attached threads. A native foreign-thread trampoline/queue is
-#     production adapter work.
+#     release callback recursively marks the C tree released. A reaper pass
+#     scans for aggregates whose last outstanding node was released, frees
+#     mallocs, drops the registry root, and releases
+#     source-region pins. Prove-out callback contract: releases for one tree
+#     are serialized and run only on Julia-attached threads. A native
+#     foreign-thread, concurrent trampoline/queue is production adapter work.
 #
 #   * Import: the moved ArrowArray becomes ONE ForeignOwner shared by every
 #     child/dictionary BufferSlice (a single release for the whole tree —
@@ -132,10 +135,8 @@ end
 # Export: Core -> C structs, control block + registry + reap queue
 # ---------------------------------------------------------------------------
 
-# Control block layout (malloc'd, never GC-scanned):
-#   offset 0: UInt8 state (0 = live, 1 = traversing, 2 = released/queued,
-#                         3 = draining active descendant callbacks)
-#   offset 4: Int32 active descendant release callbacks
+# Per-node control block layout (malloc'd, never GC-scanned):
+#   offset 0: UInt8 state (0 = live, 1 = releasing, 2 = released)
 #   offset 8: Int64 registry key
 const CONTROL_BLOCK_BYTES = 16
 
@@ -149,90 +150,56 @@ mutable struct ExportedRoot
     roots::Vector{Any}          # ArrayData/Field/Schema kept reachable
     mallocs::Vector{Ptr{Cvoid}} # every Libc.malloc'd allocation, freed on reap
     pins::Vector{OwnerRegion}   # long-lived source access guards for C pointers
-    control::Ptr{Cvoid}
+    key::Int64
+    remaining::Int64           # exported C nodes whose callback has not run
 end
 
 const EXPORT_REGISTRY = Dict{Int64,ExportedRoot}()
 const REGISTRY_LOCK = ReentrantLock()
 const NEXT_KEY = Ref{Int64}(0)
-# Reap queue: release callbacks push keys while holding the registry lock;
-# reap!() drains it. This Julia callback path is limited to attached threads,
-# as stated in the header. A native queue is production adapter work.
-const REAP_QUEUE = Int64[]
-
-function _claim_release(p::Ptr{Cvoid})
-    p == C_NULL && return false
-    return lock(REGISTRY_LOCK) do
-        flag = unsafe_load(Ptr{UInt8}(p))
-        flag == 0x00 || return false
-        unsafe_store!(Ptr{UInt8}(p), 0x01)
-        true
-    end
-end
-
-function _publish_release(p::Ptr{Cvoid})
-    # This is the callback's final pointer access. Publishing the key only
-    # after the entire tree is marked released prevents a concurrent reaper
-    # from freeing C structs under the callback.
-    lock(REGISTRY_LOCK) do
-        unsafe_load(Ptr{UInt8}(p)) == 0x03 || return nothing
-        key = unsafe_load(Ptr{Int64}(p + 8))
-        unsafe_store!(Ptr{UInt8}(p), 0x02)
-        push!(REAP_QUEUE, key)
-    end
-    return nothing
-end
-
-function _claim_array_child(a::Ptr{CArrowArray})
+function _claim_array_node(a::Ptr{CArrowArray})
     a == C_NULL && return nothing
     return lock(REGISTRY_LOCK) do
         arr = unsafe_load(a)
         arr.release == C_NULL && return nothing
-        state = unsafe_load(Ptr{UInt8}(arr.private_data))
-        state in (0x00, 0x01) || return nothing
-        _store_field!(a, :release, Ptr{Cvoid}(C_NULL))
-        activep = Ptr{Int32}(arr.private_data + 4)
-        unsafe_store!(activep, AC.checked_add(unsafe_load(activep), Int32(1)))
-        arr
+        p = arr.private_data
+        p == C_NULL && return nothing
+        flag = unsafe_load(Ptr{UInt8}(p))
+        flag == 0x00 || return nothing
+        unsafe_store!(Ptr{UInt8}(p), 0x01)
+        (arr, p)
     end
 end
 
-function _claim_schema_child(s::Ptr{CArrowSchema})
+function _claim_schema_node(s::Ptr{CArrowSchema})
     s == C_NULL && return nothing
     return lock(REGISTRY_LOCK) do
         sch = unsafe_load(s)
         sch.release == C_NULL && return nothing
-        state = unsafe_load(Ptr{UInt8}(sch.private_data))
-        state in (0x00, 0x01) || return nothing
-        _store_field!(s, :release, Ptr{Cvoid}(C_NULL))
-        activep = Ptr{Int32}(sch.private_data + 4)
-        unsafe_store!(activep, AC.checked_add(unsafe_load(activep), Int32(1)))
-        sch
+        p = sch.private_data
+        p == C_NULL && return nothing
+        flag = unsafe_load(Ptr{UInt8}(p))
+        flag == 0x00 || return nothing
+        unsafe_store!(Ptr{UInt8}(p), 0x01)
+        (sch, p)
     end
 end
 
-function _finish_child(control::Ptr{Cvoid})
-    lock(REGISTRY_LOCK) do
-        activep = Ptr{Int32}(control + 4)
-        active = unsafe_load(activep)
-        active > 0 || error("C Data child release counter underflow")
-        unsafe_store!(activep, active - Int32(1))
-    end
-    return nothing
-end
-
-function _drain_children(control::Ptr{Cvoid})
+function _finish_node!(p, control::Ptr{Cvoid})
+    # This locked block is the callback's final access to export-owned memory.
+    # The reaper observes zero only after every non-moved descendant callback,
+    # and every independently moved node callback, has completed. Scanning in
+    # reap! keeps allocation and queue mutation out of the C callback.
     lock(REGISTRY_LOCK) do
         unsafe_load(Ptr{UInt8}(control)) == 0x01 ||
-            error("C Data root is not in traversing state")
-        # Stop new independent child callbacks before observing the active
-        # count. Callbacks that already claimed are included in the count.
-        unsafe_store!(Ptr{UInt8}(control), 0x03)
-    end
-    while lock(REGISTRY_LOCK) do
-        unsafe_load(Ptr{Int32}(control + 4)) != 0
-    end
-        yield()
+            error("C Data node is not in releasing state")
+        _store_field!(p, :release, Ptr{Cvoid}(C_NULL))
+        key = unsafe_load(Ptr{Int64}(control + 8))
+        root = get(EXPORT_REGISTRY, key, nothing)
+        root === nothing && error("C Data export root disappeared during release")
+        root.remaining > 0 || error("C Data export node counter underflow")
+        unsafe_store!(Ptr{UInt8}(control), 0x02)
+        root.remaining -= 1
     end
     return nothing
 end
@@ -241,13 +208,17 @@ function _release_array_children!(arr::CArrowArray)
     for i = 1:arr.n_children
         child = unsafe_load(arr.children, i)
         child == C_NULL && continue
-        c = unsafe_load(child)
-        c.release == C_NULL || ccall(c.release, Cvoid, (Ptr{CArrowArray},), child)
+        release = lock(REGISTRY_LOCK) do
+            unsafe_load(child).release
+        end
+        release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowArray},), child)
     end
     if arr.dictionary != C_NULL
-        d = unsafe_load(arr.dictionary)
-        d.release == C_NULL ||
-            ccall(d.release, Cvoid, (Ptr{CArrowArray},), arr.dictionary)
+        release = lock(REGISTRY_LOCK) do
+            unsafe_load(arr.dictionary).release
+        end
+        release == C_NULL ||
+            ccall(release, Cvoid, (Ptr{CArrowArray},), arr.dictionary)
     end
     return nothing
 end
@@ -256,61 +227,36 @@ function _release_schema_children!(sch::CArrowSchema)
     for i = 1:sch.n_children
         child = unsafe_load(sch.children, i)
         child == C_NULL && continue
-        c = unsafe_load(child)
-        c.release == C_NULL || ccall(c.release, Cvoid, (Ptr{CArrowSchema},), child)
+        release = lock(REGISTRY_LOCK) do
+            unsafe_load(child).release
+        end
+        release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowSchema},), child)
     end
     if sch.dictionary != C_NULL
-        d = unsafe_load(sch.dictionary)
-        d.release == C_NULL ||
-            ccall(d.release, Cvoid, (Ptr{CArrowSchema},), sch.dictionary)
-    end
-    return nothing
-end
-
-# Descendant callbacks satisfy the C-data transitive-release rule but do not
-# enqueue the shared allocation owner. Only the base structure publishes it.
-function _release_array_child(a::Ptr{CArrowArray})
-    arr = _claim_array_child(a)
-    arr === nothing && return nothing
-    try
-        _release_array_children!(arr)
-    finally
-        _finish_child(arr.private_data)
-    end
-    return nothing
-end
-function _release_schema_child(s::Ptr{CArrowSchema})
-    sch = _claim_schema_child(s)
-    sch === nothing && return nothing
-    try
-        _release_schema_children!(sch)
-    finally
-        _finish_child(sch.private_data)
+        release = lock(REGISTRY_LOCK) do
+            unsafe_load(sch.dictionary).release
+        end
+        release == C_NULL ||
+            ccall(release, Cvoid, (Ptr{CArrowSchema},), sch.dictionary)
     end
     return nothing
 end
 
 function _release_array(a::Ptr{CArrowArray})
-    a == C_NULL && return nothing
-    arr = unsafe_load(a)
-    arr.release == C_NULL && return nothing
-    _claim_release(arr.private_data) || return nothing
+    claimed = _claim_array_node(a)
+    claimed === nothing && return nothing
+    arr, control = claimed
     _release_array_children!(arr)
-    _store_field!(a, :release, Ptr{Cvoid}(C_NULL))
-    _drain_children(arr.private_data)
-    _publish_release(arr.private_data)
+    _finish_node!(a, control)
     return nothing
 end
 
 function _release_schema(s::Ptr{CArrowSchema})
-    s == C_NULL && return nothing
-    sch = unsafe_load(s)
-    sch.release == C_NULL && return nothing
-    _claim_release(sch.private_data) || return nothing
+    claimed = _claim_schema_node(s)
+    claimed === nothing && return nothing
+    sch, control = claimed
     _release_schema_children!(sch)
-    _store_field!(s, :release, Ptr{Cvoid}(C_NULL))
-    _drain_children(sch.private_data)
-    _publish_release(sch.private_data)
+    _finish_node!(s, control)
     return nothing
 end
 
@@ -327,28 +273,25 @@ _store_field!(p, name::Symbol, v) = _store_field!(p, Val(name), v)
 """
     reap!() -> Int
 
-Drain the reap queue: free every malloc owned by released exports and drop
-their registry roots. In the real adapter this is a background reaper task;
-the example calls it explicitly to keep the demo deterministic.
+Find fully released exports: free every malloc they own and drop their
+registry roots. In the real adapter this is a background reaper task; the
+example calls it explicitly to keep the demo deterministic.
 """
 function reap!()
-    keys = lock(REGISTRY_LOCK) do
-        ks = copy(REAP_QUEUE)
-        empty!(REAP_QUEUE)
-        ks
+    roots = lock(REGISTRY_LOCK) do
+        keys = Int64[k for (k, root) in EXPORT_REGISTRY if root.remaining == 0]
+        ExportedRoot[pop!(EXPORT_REGISTRY, k) for k in keys]
     end
-    for k in keys
-        root = lock(REGISTRY_LOCK) do
-            pop!(EXPORT_REGISTRY, k, nothing)
-        end
-        root === nothing && continue
+    for root in roots
         _free_export!(root)
     end
-    return length(keys)
+    return length(roots)
 end
 
 _malloc!(root::ExportedRoot, n::Integer) = begin
-    p = Libc.malloc(max(n, 1))
+    n >= 0 || throw(ArgumentError("negative export allocation size"))
+    n64 = Int64(n)
+    p = Libc.malloc(max(n64, Int64(1)))
     p == C_NULL && throw(OutOfMemoryError())
     push!(root.mallocs, p)
     Ptr{Cvoid}(p)
@@ -356,7 +299,7 @@ end
 
 function _cstring!(root::ExportedRoot, s::AbstractString)
     n = ncodeunits(s)
-    p = Ptr{UInt8}(_malloc!(root, n + 1))
+    p = Ptr{UInt8}(_malloc!(root, AC.checked_add(Int64(n), Int64(1))))
     for (i, b) in enumerate(codeunits(s))
         unsafe_store!(p, b, i)
     end
@@ -364,43 +307,52 @@ function _cstring!(root::ExportedRoot, s::AbstractString)
     return p
 end
 
-function _export_schema!(root::ExportedRoot, f::Field, release::Ptr{Cvoid},
-    childrelease::Ptr{Cvoid}; isroot::Bool=false)::Ptr{CArrowSchema}
+function _newcontrol!(root::ExportedRoot)
+    control = _malloc!(root, CONTROL_BLOCK_BYTES)
+    unsafe_store!(Ptr{UInt8}(control), 0x00)
+    unsafe_store!(Ptr{Int64}(control + 8), root.key)
+    root.remaining = AC.checked_add(root.remaining, Int64(1))
+    return control
+end
+
+function _export_schema!(root::ExportedRoot, f::Field,
+    release::Ptr{Cvoid})::Ptr{CArrowSchema}
     p = Ptr{CArrowSchema}(_malloc!(root, sizeof(CArrowSchema)))
     childfields = f.type isa DictionaryType ? Field[] : f.children
     nchildren = length(childfields)
     childptrs = Ptr{Ptr{CArrowSchema}}(C_NULL)
     if nchildren > 0
-        childptrs = Ptr{Ptr{CArrowSchema}}(_malloc!(root, nchildren * sizeof(Ptr)))
+        childptrs = Ptr{Ptr{CArrowSchema}}(_malloc!(root,
+            AC.checked_mul(Int64(nchildren), Int64(sizeof(Ptr)))))
         for (i, cf) in enumerate(childfields)
-            unsafe_store!(childptrs,
-                _export_schema!(root, cf, release, childrelease), i)
+            unsafe_store!(childptrs, _export_schema!(root, cf, release), i)
         end
     end
     dict = Ptr{CArrowSchema}(C_NULL)
     if f.type isa DictionaryType
-        dict = _export_schema!(root, AC.dictvaluefield(f, f.type),
-            release, childrelease)
+        dict = _export_schema!(root, AC.dictvaluefield(f, f.type), release)
     end
     flags = f.nullable ? ARROW_FLAG_NULLABLE : Int64(0)
     f.type isa DictionaryType && f.type.ordered &&
         (flags |= ARROW_FLAG_DICTIONARY_ORDERED)
     f.type isa MapType && f.type.keyssorted &&
         (flags |= ARROW_FLAG_MAP_KEYS_SORTED)
+    control = _newcontrol!(root)
     unsafe_store!(p, CArrowSchema(
         _cstring!(root, formatstring(f.type)),
         _cstring!(root, f.name),
         Ptr{UInt8}(C_NULL),
         flags, nchildren, childptrs, dict,
-        isroot ? release : childrelease, root.control))
+        release, control))
     return p
 end
 
-function _export_array!(root::ExportedRoot, d::ArrayData, release::Ptr{Cvoid},
-    childrelease::Ptr{Cvoid}; isroot::Bool=false)::Ptr{CArrowArray}
+function _export_array!(root::ExportedRoot, d::ArrayData,
+    release::Ptr{Cvoid})::Ptr{CArrowArray}
     p = Ptr{CArrowArray}(_malloc!(root, sizeof(CArrowArray)))
     nbuf = length(d.buffers)
-    bufptrs = Ptr{Ptr{Cvoid}}(_malloc!(root, max(nbuf, 1) * sizeof(Ptr)))
+    bufptrs = Ptr{Ptr{Cvoid}}(_malloc!(root,
+        AC.checked_mul(Int64(max(nbuf, 1)), Int64(sizeof(Ptr)))))
     for (i, b) in enumerate(d.buffers)
         # Spec: an absent validity bitmap is a NULL buffer pointer.
         unsafe_store!(bufptrs, AC.isempty_buffer(b) ? Ptr{Cvoid}(C_NULL) :
@@ -409,27 +361,29 @@ function _export_array!(root::ExportedRoot, d::ArrayData, release::Ptr{Cvoid},
     nchildren = length(d.children)
     childptrs = Ptr{Ptr{CArrowArray}}(C_NULL)
     if nchildren > 0
-        childptrs = Ptr{Ptr{CArrowArray}}(_malloc!(root, nchildren * sizeof(Ptr)))
+        childptrs = Ptr{Ptr{CArrowArray}}(_malloc!(root,
+            AC.checked_mul(Int64(nchildren), Int64(sizeof(Ptr)))))
         for (i, c) in enumerate(d.children)
-            unsafe_store!(childptrs,
-                _export_array!(root, c, release, childrelease), i)
+            unsafe_store!(childptrs, _export_array!(root, c, release), i)
         end
     end
     dict = d.dictionary === nothing ? Ptr{CArrowArray}(C_NULL) :
-        _export_array!(root, d.dictionary, release, childrelease)
+        _export_array!(root, d.dictionary, release)
+    control = _newcontrol!(root)
     unsafe_store!(p, CArrowArray(d.len, nullcount(d), d.offset, nbuf,
         nchildren, bufptrs, childptrs, dict,
-        isroot ? release : childrelease, root.control))
+        release, control))
     return p
 end
 
 """
     to_c_data(field, data) -> (Ptr{CArrowSchema}, Ptr{CArrowArray})
 
-Export one column. The schema and array have separate control blocks and
-separate Julia-side roots, as required by their independent C Data
-lifetimes. Releasing either root recursively marks only that structure tree
-released. The array root also holds source-region pins until it is reaped.
+Export one column. The schema and array have separate sets of per-node
+control blocks and separate Julia-side roots, as required by their
+independent C Data lifetimes. Releasing either root recursively marks only
+that structure tree released. Moved descendants defer aggregate cleanup.
+The array root also holds source-region pins until it is reaped.
 """
 function to_c_data(f::Field, d::ArrayData)
     # Reject mismatched schema/data and malformed buffers before publishing
@@ -437,16 +391,14 @@ function to_c_data(f::Field, d::ArrayData)
     validate_structural(f, d)
     validate_semantic(f, d)
     arel = @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},))
-    achildrel = @cfunction(_release_array_child, Cvoid, (Ptr{CArrowArray},))
     srel = @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
-    schildrel = @cfunction(_release_schema_child, Cvoid, (Ptr{CArrowSchema},))
     sp = _newroot(Any[f]) do root
-        _export_schema!(root, f, srel, schildrel; isroot=true)
+        _export_schema!(root, f, srel)
     end
     try
         pins = _pin_regions(d)
         ap = _newroot(Any[d]; pins=pins) do root
-            _export_array!(root, d, arel, achildrel; isroot=true)
+            _export_array!(root, d, arel)
         end
         return sp, ap
     catch
@@ -522,18 +474,7 @@ function _newroot(build, roots::Vector{Any}; pins::Vector{OwnerRegion}=OwnerRegi
         end
         rethrow()
     end
-    control = Libc.malloc(CONTROL_BLOCK_BYTES)
-    if control == C_NULL
-        for region in pins
-            AC._releaseguard!(region)
-        end
-        throw(OutOfMemoryError())
-    end
-    unsafe_store!(Ptr{UInt8}(control), 0x00)
-    unsafe_store!(Ptr{Int32}(Ptr{Cvoid}(control) + 4), Int32(0))
-    unsafe_store!(Ptr{Int64}(Ptr{Cvoid}(control) + 8), key)
-    root = ExportedRoot(roots, Ptr{Cvoid}[Ptr{Cvoid}(control)], pins,
-        Ptr{Cvoid}(control))
+    root = ExportedRoot(roots, Ptr{Cvoid}[], pins, key, 0)
     lock(REGISTRY_LOCK) do
         EXPORT_REGISTRY[key] = root
     end
@@ -811,14 +752,18 @@ _registry_count() = lock(REGISTRY_LOCK) do
 end
 
 function _call_release(p::Ptr{CArrowSchema})
-    x = unsafe_load(p)
-    x.release == C_NULL || ccall(x.release, Cvoid, (Ptr{CArrowSchema},), p)
+    release = lock(REGISTRY_LOCK) do
+        unsafe_load(p).release
+    end
+    release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowSchema},), p)
     return nothing
 end
 
 function _call_release(p::Ptr{CArrowArray})
-    x = unsafe_load(p)
-    x.release == C_NULL || ccall(x.release, Cvoid, (Ptr{CArrowArray},), p)
+    release = lock(REGISTRY_LOCK) do
+        unsafe_load(p).release
+    end
+    release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowArray},), p)
     return nothing
 end
 
@@ -829,10 +774,17 @@ function main()
         @assert sizeof(CArrowArray) == 80
         @assert fieldoffset.(Ref(CArrowArray), 1:10) == 0:8:72
     elseif Sys.WORD_SIZE == 32
-        @assert sizeof(CArrowSchema) == 48
-        @assert fieldoffset.(Ref(CArrowSchema), 1:9) == [0, 4, 8, 16, 24, 32, 36, 40, 44]
-        @assert sizeof(CArrowArray) == 64
-        @assert fieldoffset.(Ref(CArrowArray), 1:10) == [0, 8, 16, 24, 32, 40, 44, 48, 52, 56]
+        if Base.datatype_alignment(Int64) == 4 # i686 SysV ABI
+            @assert sizeof(CArrowSchema) == 44
+            @assert fieldoffset.(Ref(CArrowSchema), 1:9) == [0, 4, 8, 12, 20, 28, 32, 36, 40]
+            @assert sizeof(CArrowArray) == 60
+            @assert fieldoffset.(Ref(CArrowArray), 1:10) == [0, 8, 16, 24, 32, 40, 44, 48, 52, 56]
+        else # 32-bit ABIs that align int64_t to 8 bytes
+            @assert sizeof(CArrowSchema) == 48
+            @assert fieldoffset.(Ref(CArrowSchema), 1:9) == [0, 4, 8, 16, 24, 32, 36, 40, 44]
+            @assert sizeof(CArrowArray) == 64
+            @assert fieldoffset.(Ref(CArrowArray), 1:10) == [0, 8, 16, 24, 32, 40, 44, 48, 52, 56]
+        end
     else
         error("unsupported pointer width $(Sys.WORD_SIZE)")
     end
@@ -930,32 +882,35 @@ function main()
     @assert reap!() == 2
     println("root release is transitive across child trees ✓")
 
+    # C Data move semantics permit a consumer to shallow-copy a child and
+    # null the source child's release field. The parent must skip that child,
+    # and the aggregate allocation must remain live until the moved copy is
+    # released independently.
     sp, ap = to_c_data(lf, ld)
     schild = unsafe_load(unsafe_load(sp).children, 1)
     achild = unsafe_load(unsafe_load(ap).children, 1)
-    _call_release(schild)
-    _call_release(achild)
+    smoved = Ref(unsafe_load(schild))
+    amoved = Ref(unsafe_load(achild))
+    _store_field!(schild, :release, Ptr{Cvoid}(C_NULL))
+    _store_field!(achild, :release, Ptr{Cvoid}(C_NULL))
     _call_release(sp)
     _call_release(ap)
-    @assert unsafe_load(schild).release == C_NULL
-    @assert unsafe_load(achild).release == C_NULL
-    @assert reap!() == 2
-    println("independent child release remains root-exactly-once ✓")
-
-    if Threads.nthreads() > 1
-        for _ = 1:100
-            sp, ap = to_c_data(lf, ld)
-            schild = unsafe_load(unsafe_load(sp).children, 1)
-            achild = unsafe_load(unsafe_load(ap).children, 1)
-            tasks = (Threads.@spawn(_call_release(sp)),
-                Threads.@spawn(_call_release(schild)),
-                Threads.@spawn(_call_release(ap)),
-                Threads.@spawn(_call_release(achild)))
-            fetch.(tasks)
-            @assert reap!() == 2
-        end
-        println("concurrent root/child release stress passed ✓")
+    @assert reap!() == 0
+    @assert _registry_count() == 2
+    moved_source_region = ld.children[1].buffers[2].region
+    @assert !forceclose!(moved_source_region; timeout_ms=0)
+    GC.@preserve smoved amoved begin
+        smovedp = Base.unsafe_convert(Ptr{CArrowSchema}, smoved)
+        amovedp = Base.unsafe_convert(Ptr{CArrowArray}, amoved)
+        @assert unsafe_load(smovedp).release != C_NULL
+        @assert unsafe_load(amovedp).release != C_NULL
+        movedf, movedd = from_c_data(smovedp, amovedp)
+        @assert materialize(movedf, movedd) == [1, 2, 3]
+        release!(movedd.owner::ForeignOwner)
     end
+    @assert reap!() == 2
+    @assert forceclose!(moved_source_region; timeout_ms=0)
+    println("moved children retain aggregate ownership until release ✓")
 
     # Raw C pointers hold long-lived access pins. A deterministic close must
     # report busy until the consumer releases and the array root is reaped.
@@ -1008,6 +963,26 @@ function main()
     @assert reap!() == 2
     println("dictionary flags and value nullability round-trip ✓")
 
+    sp, ap = to_c_data(df, dd)
+    sdict = unsafe_load(sp).dictionary
+    adict = unsafe_load(ap).dictionary
+    smoved = Ref(unsafe_load(sdict))
+    amoved = Ref(unsafe_load(adict))
+    _store_field!(sdict, :release, Ptr{Cvoid}(C_NULL))
+    _store_field!(adict, :release, Ptr{Cvoid}(C_NULL))
+    _call_release(sp)
+    _call_release(ap)
+    @assert reap!() == 0
+    GC.@preserve smoved amoved begin
+        movedf, movedd = from_c_data(
+            Base.unsafe_convert(Ptr{CArrowSchema}, smoved),
+            Base.unsafe_convert(Ptr{CArrowArray}, amoved))
+        @assert isequal(materialize(movedf, movedd), [missing, "x"])
+        release!(movedd.owner::ForeignOwner)
+    end
+    @assert reap!() == 2
+    println("moved dictionaries retain aggregate ownership until release ✓")
+
     kf, kd = fromjulia("key", ["a"])
     mvf, mvd = fromjulia("value", Int64[7])
     entriesf = Field("entries", StructType(); nullable=false,
@@ -1027,6 +1002,61 @@ function main()
     release!(mapd2.owner::ForeignOwner)
     @assert reap!() == 2
     println("map sorted-key flag round-trips ✓")
+
+    # Moving a nested subtree keeps all of its descendants live. Releasing
+    # the moved entries struct recursively releases its key/value children.
+    sp, ap = to_c_data(mapf, mapd)
+    sentries = unsafe_load(unsafe_load(sp).children, 1)
+    aentries = unsafe_load(unsafe_load(ap).children, 1)
+    smoved = Ref(unsafe_load(sentries))
+    amoved = Ref(unsafe_load(aentries))
+    _store_field!(sentries, :release, Ptr{Cvoid}(C_NULL))
+    _store_field!(aentries, :release, Ptr{Cvoid}(C_NULL))
+    _call_release(sp)
+    _call_release(ap)
+    @assert reap!() == 0
+    GC.@preserve smoved amoved begin
+        movedf, movedd = from_c_data(
+            Base.unsafe_convert(Ptr{CArrowSchema}, smoved),
+            Base.unsafe_convert(Ptr{CArrowArray}, amoved))
+        @assert materialize(movedf, movedd) == [(key="a", value=7)]
+        release!(movedd.owner::ForeignOwner)
+    end
+    @assert reap!() == 2
+    println("moved nested subtrees retain descendants until release ✓")
+
+    # Two moved siblings keep one aggregate alive. Releasing the first does
+    # not free either tree; the second release performs the single reap.
+    af, ad = fromjulia("a", Int64[1, 2])
+    bf, bd = fromjulia("b", Int64[3, 4])
+    sf = Field("s", StructType(); children=[af, bf])
+    sd = ArrayData(StructType(), 2, [BufferSlice()];
+        children=[ad, bd], nullcount=0)
+    sp, ap = to_c_data(sf, sd)
+    smoved = Ref{CArrowSchema}[]
+    amoved = Ref{CArrowArray}[]
+    for i = 1:2
+        source_s = unsafe_load(unsafe_load(sp).children, i)
+        source_a = unsafe_load(unsafe_load(ap).children, i)
+        push!(smoved, Ref(unsafe_load(source_s)))
+        push!(amoved, Ref(unsafe_load(source_a)))
+        _store_field!(source_s, :release, Ptr{Cvoid}(C_NULL))
+        _store_field!(source_a, :release, Ptr{Cvoid}(C_NULL))
+    end
+    _call_release(sp)
+    _call_release(ap)
+    @assert reap!() == 0
+    for (i, expected_values) in enumerate(([1, 2], [3, 4]))
+        GC.@preserve smoved amoved begin
+            movedf, movedd = from_c_data(
+                Base.unsafe_convert(Ptr{CArrowSchema}, smoved[i]),
+                Base.unsafe_convert(Ptr{CArrowArray}, amoved[i]))
+            @assert materialize(movedf, movedd) == expected_values
+            release!(movedd.owner::ForeignOwner)
+        end
+        @assert reap!() == (i == 2 ? 2 : 0)
+    end
+    println("multiple moved siblings defer one aggregate reap ✓")
 
     # Even when every imported buffer pointer is NULL, ArrayData owns the
     # ForeignOwner. GC cannot release the producer while the empty array lives.
