@@ -133,7 +133,9 @@ end
 # ---------------------------------------------------------------------------
 
 # Control block layout (malloc'd, never GC-scanned):
-#   offset 0: UInt8 state (0 = live, 1 = releasing, 2 = released/queued)
+#   offset 0: UInt8 state (0 = live, 1 = traversing, 2 = released/queued,
+#                         3 = draining active descendant callbacks)
+#   offset 4: Int32 active descendant release callbacks
 #   offset 8: Int64 registry key
 const CONTROL_BLOCK_BYTES = 16
 
@@ -173,10 +175,64 @@ function _publish_release(p::Ptr{Cvoid})
     # after the entire tree is marked released prevents a concurrent reaper
     # from freeing C structs under the callback.
     lock(REGISTRY_LOCK) do
-        unsafe_load(Ptr{UInt8}(p)) == 0x01 || return nothing
+        unsafe_load(Ptr{UInt8}(p)) == 0x03 || return nothing
         key = unsafe_load(Ptr{Int64}(p + 8))
         unsafe_store!(Ptr{UInt8}(p), 0x02)
         push!(REAP_QUEUE, key)
+    end
+    return nothing
+end
+
+function _claim_array_child(a::Ptr{CArrowArray})
+    a == C_NULL && return nothing
+    return lock(REGISTRY_LOCK) do
+        arr = unsafe_load(a)
+        arr.release == C_NULL && return nothing
+        state = unsafe_load(Ptr{UInt8}(arr.private_data))
+        state in (0x00, 0x01) || return nothing
+        _store_field!(a, :release, Ptr{Cvoid}(C_NULL))
+        activep = Ptr{Int32}(arr.private_data + 4)
+        unsafe_store!(activep, AC.checked_add(unsafe_load(activep), Int32(1)))
+        arr
+    end
+end
+
+function _claim_schema_child(s::Ptr{CArrowSchema})
+    s == C_NULL && return nothing
+    return lock(REGISTRY_LOCK) do
+        sch = unsafe_load(s)
+        sch.release == C_NULL && return nothing
+        state = unsafe_load(Ptr{UInt8}(sch.private_data))
+        state in (0x00, 0x01) || return nothing
+        _store_field!(s, :release, Ptr{Cvoid}(C_NULL))
+        activep = Ptr{Int32}(sch.private_data + 4)
+        unsafe_store!(activep, AC.checked_add(unsafe_load(activep), Int32(1)))
+        sch
+    end
+end
+
+function _finish_child(control::Ptr{Cvoid})
+    lock(REGISTRY_LOCK) do
+        activep = Ptr{Int32}(control + 4)
+        active = unsafe_load(activep)
+        active > 0 || error("C Data child release counter underflow")
+        unsafe_store!(activep, active - Int32(1))
+    end
+    return nothing
+end
+
+function _drain_children(control::Ptr{Cvoid})
+    lock(REGISTRY_LOCK) do
+        unsafe_load(Ptr{UInt8}(control)) == 0x01 ||
+            error("C Data root is not in traversing state")
+        # Stop new independent child callbacks before observing the active
+        # count. Callbacks that already claimed are included in the count.
+        unsafe_store!(Ptr{UInt8}(control), 0x03)
+    end
+    while lock(REGISTRY_LOCK) do
+        unsafe_load(Ptr{Int32}(control + 4)) != 0
+    end
+        yield()
     end
     return nothing
 end
@@ -214,19 +270,23 @@ end
 # Descendant callbacks satisfy the C-data transitive-release rule but do not
 # enqueue the shared allocation owner. Only the base structure publishes it.
 function _release_array_child(a::Ptr{CArrowArray})
-    a == C_NULL && return nothing
-    arr = unsafe_load(a)
-    arr.release == C_NULL && return nothing
-    _release_array_children!(arr)
-    _store_field!(a, :release, Ptr{Cvoid}(C_NULL))
+    arr = _claim_array_child(a)
+    arr === nothing && return nothing
+    try
+        _release_array_children!(arr)
+    finally
+        _finish_child(arr.private_data)
+    end
     return nothing
 end
 function _release_schema_child(s::Ptr{CArrowSchema})
-    s == C_NULL && return nothing
-    sch = unsafe_load(s)
-    sch.release == C_NULL && return nothing
-    _release_schema_children!(sch)
-    _store_field!(s, :release, Ptr{Cvoid}(C_NULL))
+    sch = _claim_schema_child(s)
+    sch === nothing && return nothing
+    try
+        _release_schema_children!(sch)
+    finally
+        _finish_child(sch.private_data)
+    end
     return nothing
 end
 
@@ -237,6 +297,7 @@ function _release_array(a::Ptr{CArrowArray})
     _claim_release(arr.private_data) || return nothing
     _release_array_children!(arr)
     _store_field!(a, :release, Ptr{Cvoid}(C_NULL))
+    _drain_children(arr.private_data)
     _publish_release(arr.private_data)
     return nothing
 end
@@ -248,6 +309,7 @@ function _release_schema(s::Ptr{CArrowSchema})
     _claim_release(sch.private_data) || return nothing
     _release_schema_children!(sch)
     _store_field!(s, :release, Ptr{Cvoid}(C_NULL))
+    _drain_children(sch.private_data)
     _publish_release(sch.private_data)
     return nothing
 end
@@ -468,6 +530,7 @@ function _newroot(build, roots::Vector{Any}; pins::Vector{OwnerRegion}=OwnerRegi
         throw(OutOfMemoryError())
     end
     unsafe_store!(Ptr{UInt8}(control), 0x00)
+    unsafe_store!(Ptr{Int32}(Ptr{Cvoid}(control) + 4), Int32(0))
     unsafe_store!(Ptr{Int64}(Ptr{Cvoid}(control) + 8), key)
     root = ExportedRoot(roots, Ptr{Cvoid}[Ptr{Cvoid}(control)], pins,
         Ptr{Cvoid}(control))
@@ -760,6 +823,21 @@ function _call_release(p::Ptr{CArrowArray})
 end
 
 function main()
+    if Sys.WORD_SIZE == 64
+        @assert sizeof(CArrowSchema) == 72
+        @assert fieldoffset.(Ref(CArrowSchema), 1:9) == 0:8:64
+        @assert sizeof(CArrowArray) == 80
+        @assert fieldoffset.(Ref(CArrowArray), 1:10) == 0:8:72
+    elseif Sys.WORD_SIZE == 32
+        @assert sizeof(CArrowSchema) == 48
+        @assert fieldoffset.(Ref(CArrowSchema), 1:9) == [0, 4, 8, 16, 24, 32, 36, 40, 44]
+        @assert sizeof(CArrowArray) == 64
+        @assert fieldoffset.(Ref(CArrowArray), 1:10) == [0, 8, 16, 24, 32, 40, 44, 48, 52, 56]
+    else
+        error("unsupported pointer width $(Sys.WORD_SIZE)")
+    end
+    println("C ABI size and field-offset gate passed for $(Sys.WORD_SIZE)-bit ✓")
+
     b = batch((
         xs=Int64[1, 2, 3, 4],
         ys=[1.5, missing, 3.5, missing],
@@ -851,6 +929,33 @@ function main()
     @assert unsafe_load(achild).release == C_NULL
     @assert reap!() == 2
     println("root release is transitive across child trees ✓")
+
+    sp, ap = to_c_data(lf, ld)
+    schild = unsafe_load(unsafe_load(sp).children, 1)
+    achild = unsafe_load(unsafe_load(ap).children, 1)
+    _call_release(schild)
+    _call_release(achild)
+    _call_release(sp)
+    _call_release(ap)
+    @assert unsafe_load(schild).release == C_NULL
+    @assert unsafe_load(achild).release == C_NULL
+    @assert reap!() == 2
+    println("independent child release remains root-exactly-once ✓")
+
+    if Threads.nthreads() > 1
+        for _ = 1:100
+            sp, ap = to_c_data(lf, ld)
+            schild = unsafe_load(unsafe_load(sp).children, 1)
+            achild = unsafe_load(unsafe_load(ap).children, 1)
+            tasks = (Threads.@spawn(_call_release(sp)),
+                Threads.@spawn(_call_release(schild)),
+                Threads.@spawn(_call_release(ap)),
+                Threads.@spawn(_call_release(achild)))
+            fetch.(tasks)
+            @assert reap!() == 2
+        end
+        println("concurrent root/child release stress passed ✓")
+    end
 
     # Raw C pointers hold long-lived access pins. A deterministic close must
     # report busy until the consumer releases and the array root is reaped.
