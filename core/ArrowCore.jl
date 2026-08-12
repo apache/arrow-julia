@@ -948,12 +948,16 @@ function validate_structural(f::Field, d::ArrayData)
     end
     if d.type isa MapType
         entries = f.children[1]
+        entries.name == "entries" ||
+            throw(ValidationError("map child must be named entries"))
         entries.type isa StructType ||
             throw(ValidationError("map child must be an entries struct"))
         !entries.nullable ||
             throw(ValidationError("map entries field must be non-nullable"))
         length(entries.children) == 2 ||
             throw(ValidationError("map entries struct must have key and value children"))
+        entries.children[1].name == "key" && entries.children[2].name == "value" ||
+            throw(ValidationError("map entry children must be named key and value"))
         !entries.children[1].nullable ||
             throw(ValidationError("map keys must be non-nullable"))
     end
@@ -1254,7 +1258,8 @@ function _value(t::ListType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth)
     child, cf = d.children[1], f.children[1]
-    return [getvalue(cf, child, j) for j = (lo + 1):hi]
+    lo == hi && return Any[]
+    return [getvalue(cf, child, j) for j = checked_add(lo, Int64(1)):hi]
 end
 
 function _value(t::FixedSizeListType, f::Field, d::ArrayData, i::Int64)
@@ -1279,10 +1284,11 @@ function _value(t::MapType, f::Field, d::ArrayData, i::Int64)
     entries, ef = d.children[1], f.children[1]
     kf, vf = ef.children[1], ef.children[2]
     kd, vd = entries.children[1], entries.children[2]
+    lo == hi && return Pair[]
     return [begin
         entryindex = checked_add(entries.offset, Int64(j))
         getvalue(kf, kd, entryindex) => getvalue(vf, vd, entryindex)
-    end for j = (lo + 1):hi]
+    end for j = checked_add(lo, Int64(1)):hi]
 end
 
 function _value(t::UnionType, f::Field, d::ArrayData, i::Int64)

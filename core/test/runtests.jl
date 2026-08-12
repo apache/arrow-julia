@@ -347,6 +347,19 @@ end
         @test materialize(f, d) == [["a" => 1, "b" => 2]]
     end
 
+    @testset "empty large-list range does not wrap" begin
+        cf = Field("item", NullType())
+        cd = AC.ArrayData(NullType(), typemax(Int64), BufferSlice[])
+        t = ListType(true)
+        f = Field("list", t; children=[cf])
+        d = AC.ArrayData(t, 1,
+            [BufferSlice(), AC._databuffer(Int64[typemax(Int64), typemax(Int64)])];
+            children=[cd], nullcount=0)
+        validate_structural(f, d)
+        validate_semantic(f, d)
+        @test getvalue(f, d, 1) == Any[]
+    end
+
     @testset "dense union" begin
         t = UnionType(AC.DenseMode, Int8[0, 1])
         af, ad = fromjulia("i", Int64[10, 20])
@@ -556,6 +569,30 @@ end
         outerd = AC.ArrayData(RunEndEncodedType(), 1, BufferSlice[];
             children=[rd, innerd], nullcount=0)
         @test_throws ValidationError validate_structural(outerf, outerd)
+    end
+
+    @testset "structural: map uses canonical child names" begin
+        kf, kd = fromjulia("key", ["a"])
+        vf, vd = fromjulia("value", Int64[1])
+        entries = Field("entries", StructType(); nullable=false,
+            children=[kf, vf])
+        ed = AC.ArrayData(StructType(), 1, [BufferSlice()];
+            children=[kd, vd], nullcount=0)
+        t = MapType(false)
+        d = AC.ArrayData(t, 1,
+            [BufferSlice(), AC._databuffer(Int32[0, 1])];
+            children=[ed], nullcount=0)
+        @test validate_structural(Field("m", t; children=[entries]), d) === d
+        wrongentries = Field("not_entries", StructType(); nullable=false,
+            children=[kf, vf])
+        wrongkey = Field("entries", StructType(); nullable=false,
+            children=[Field("not_key", kf.type; nullable=kf.nullable), vf])
+        wrongvalue = Field("entries", StructType(); nullable=false,
+            children=[kf, Field("not_value", vf.type; nullable=vf.nullable)])
+        for badentries in (wrongentries, wrongkey, wrongvalue)
+            @test_throws ValidationError validate_structural(
+                Field("m", t; children=[badentries]), d)
+        end
     end
 
     @testset "semantic: declared null count matches bitmap" begin
