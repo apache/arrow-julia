@@ -130,20 +130,31 @@ when the memory itself must be returned (munmap, C release callback);
 `nothing` for memory the GC owns via `root`.
 """
 mutable struct OwnerRegion
-    ptr::Ptr{UInt8}
-    len::Int64
-    kind::MemoryKind
-    alignment::Int          # actual alignment of ptr; slices/views consult it
-    root::Any               # GC anchor for borrowed memory; nothing otherwise
+    const ptr::Ptr{UInt8}
+    const len::Int64
+    const kind::MemoryKind
+    const alignment::Int    # actual alignment of ptr; slices/views consult it
+    const root::Any         # GC anchor for borrowed memory; nothing otherwise
+    # Foreign C-data trees use one zero-length lifecycle region for every
+    # buffer allocation in the moved tree. `nothing` means this region owns
+    # its own state. A shared lifecycle makes release and invalidation one
+    # atomic tree-wide operation without conflating allocation extents.
+    const lifecycle::Union{Nothing,OwnerRegion}
     releasefn::Any          # region -> nothing, or nothing
     @atomic state::UInt64
     @atomic guards::Int
 
     function OwnerRegion(ptr::Ptr{UInt8}, len::Integer, kind::MemoryKind;
-        root=nothing, releasefn=nothing)
+        root=nothing, releasefn=nothing,
+        lifecycle::Union{Nothing,OwnerRegion}=nothing)
         len >= 0 || throw(ArgumentError("region length must be non-negative"))
+        (ptr != C_NULL || len == 0) ||
+            throw(ArgumentError("a non-empty region requires a non-NULL pointer"))
+        lifecycle !== nothing && releasefn !== nothing &&
+            throw(ArgumentError("a shared-lifecycle region cannot own a release callback"))
         align = ptr == C_NULL ? 64 : (1 << trailing_zeros(UInt(ptr) | UInt(64)))
-        r = new(ptr, Int64(len), kind, align, root, releasefn, PHASE_OPEN, 0)
+        r = new(ptr, Int64(len), kind, align, root, lifecycle,
+            releasefn, PHASE_OPEN, 0)
         # Shared-mode cleanup: only regions that own non-GC memory need a
         # finalizer. A finalizer only runs when the region is unreachable, at
         # which point no guard can exist, so releasing directly is safe.
@@ -154,14 +165,14 @@ mutable struct OwnerRegion
     end
 end
 
+@inline _lifecycle(r::OwnerRegion) = r.lifecycle === nothing ? r : r.lifecycle
+
 function _finalize_region!(r::OwnerRegion)
-    st = @atomic :monotonic r.state
-    phase(st) == PHASE_CLOSED && return
-    # No CAS needed: finalizers run when nothing else can touch `r`.
-    @atomic :monotonic r.state = ((generation(st) + 1) << 2) | PHASE_CLOSED
-    f = r.releasefn
-    r.releasefn = nothing
-    f === nothing || f(r)
+    # Natural finalization implies no live guards, but `finalize(r)` is also
+    # a public Julia operation and can be called while `r` is reachable.
+    # Use the same CAS/guard handshake as explicit close. If a manual
+    # finalization finds the region busy, install the backstop again.
+    forceclose!(r; timeout_ms=0) || finalizer(_finalize_region!, r)
     return
 end
 
@@ -180,7 +191,8 @@ count is incremented BEFORE the state check. A closer that CASes to
 closer got there first, our post-increment state check sees `closing` and we
 back out. Either way no dereference overlaps a release.
 """
-@inline function withguard(f, r::OwnerRegion)
+@inline function _acquireguard!(r::OwnerRegion)
+    r = _lifecycle(r)
     # Both sides of this handshake are sequentially consistent on purpose:
     # guard-increment/state-load here race against state-CAS/guards-load in
     # `forceclose!` on two different locations — the classic store/load
@@ -193,10 +205,21 @@ back out. Either way no dereference overlaps a release.
         @atomic :acquire_release r.guards -= 1
         throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
     end
+    return nothing
+end
+
+@inline function _releaseguard!(r::OwnerRegion)
+    r = _lifecycle(r)
+    @atomic :acquire_release r.guards -= 1
+    return nothing
+end
+
+@inline function withguard(f, r::OwnerRegion)
+    _acquireguard!(r)
     try
         return f()
     finally
-        @atomic :acquire_release r.guards -= 1
+        _releaseguard!(r)
     end
 end
 
@@ -210,8 +233,16 @@ call may simply be retried. After a successful close every view built on the
 region throws `InvalidatedError` on access.
 """
 function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
+    r = _lifecycle(r)
+    timeout_ms >= 0 || throw(ArgumentError("timeout_ms must be non-negative"))
+    timeout_ms <= typemax(UInt64) ÷ 1_000_000 ||
+        throw(ArgumentError("timeout_ms is too large"))
     st = @atomic :acquire r.state
     phase(st) == PHASE_CLOSED && return true
+    # Only OPEN may win the transition. In particular, a second closer must
+    # not successfully CAS `closing => closing` and publish CLOSED while the
+    # unique winner is still executing the release callback.
+    phase(st) == PHASE_OPEN || return false
     # open -> closing. Failure means someone else is closing (wait via retry)
     # or already closed.
     closing = (generation(st) << 2) | PHASE_CLOSING
@@ -224,20 +255,27 @@ function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
     end
     # Wait for in-flight guards. Guards are short-lived by contract, so this
     # terminates quickly; the timeout is a safety valve, not a normal path.
-    deadline = time_ns() + UInt64(timeout_ms) * 1_000_000
+    started = time_ns()
+    timeout_ns = UInt64(timeout_ms) * 1_000_000
     while (@atomic r.guards) != 0   # seq_cst: pairs with withguard's increment
-        if time_ns() > deadline
-            # Restore open unconditionally: we are the unique closer (we won
-            # the CAS above), so nobody else can have touched the state.
-            @atomic :release r.state = st
+        if time_ns() - started >= timeout_ns
+            # Restore only our exact closing state. This remains robust to
+            # explicit `finalize(r)` and future lifecycle transitions.
+            restored_from, restored = @atomicreplace r.state closing => st
             return false
         end
         yield()
     end
     f = r.releasefn
     r.releasefn = nothing
-    f === nothing || f(r)
-    @atomic :release r.state = ((generation(st) + 1) << 2) | PHASE_CLOSED
+    try
+        f === nothing || f(r)
+    finally
+        # A release callback is exactly-once even if it reports an error.
+        # Never strand the region in `closing`, where every later close
+        # would fail without a way to recover or retry safely.
+        @atomic :release r.state = ((generation(st) + 1) << 2) | PHASE_CLOSED
+    end
     return true
 end
 
@@ -273,9 +311,12 @@ the lifecycle problem this type exists to fix). POSIX only in the prove-out.
 """
 function mmapregion(path::AbstractString)
     Sys.isunix() || error("mmapregion: prove-out implements POSIX only")
-    len = filesize(path)
-    len > 0 || throw(ArgumentError("cannot map empty or missing file: $path"))
     open(path, "r") do io
+        # Size the exact opened file descriptor. Sizing the path first lets
+        # a concurrent rename/symlink swap pair one inode's length with a
+        # different, shorter fd and later raise SIGBUS on an in-range load.
+        len = filesize(io)
+        len > 0 || throw(ArgumentError("cannot map empty file: $path"))
         fd = Base.Filesystem.fd(io)
         # PROT_READ=1, MAP_SHARED=1 (Linux) / MAP_SHARED=1 (Darwin) — shared,
         # read-only mapping; MAP_FAILED is (void*)-1.
@@ -337,6 +378,8 @@ sliceptr(b::BufferSlice) = b.region === nothing ? Ptr{UInt8}(0) : b.region.ptr +
 
 "Sub-slice with checked arithmetic (relative bounds against the parent slice)."
 function subslice(b::BufferSlice, offset::Integer, len::Integer)
+    offset >= 0 || throw(ArgumentError("negative subslice offset"))
+    len >= 0 || throw(ArgumentError("negative subslice length"))
     b.region === nothing && (len == 0 && offset == 0) && return b
     b.region === nothing && throw(ArgumentError("cannot subslice the empty buffer"))
     checked_add(Int64(offset), Int64(len)) <= b.len ||
@@ -361,7 +404,11 @@ of as a copy workaround scattered through per-type code.
     # Bounds: byteoff + sizeof(T) <= len. byteoff is computed by callers from
     # validated element indices, but re-check cheaply: this is the last line
     # of defense before a raw pointer dereference.
-    (byteoff >= 0 && byteoff + sizeof(T) <= b.len) ||
+    width = Int64(sizeof(T))
+    # Express this as subtraction, not `byteoff + width <= len`: a hostile
+    # byte offset near typemax(Int64) must not wrap through the last bounds
+    # check and reach pointer arithmetic.
+    (byteoff >= 0 && width <= b.len && byteoff <= b.len - width) ||
         throw(BoundsError(b, byteoff))
     return _guarded(b) do
         p = sliceptr(b) + byteoff
@@ -413,6 +460,23 @@ diversity costs data, not method instances (fixes the #503 class by
 construction).
 """
 abstract type ArrowType end
+
+"""
+Read-only, defensively-copied vector storage for the frozen data model.
+Its type does not encode the length, so schema width and nesting depth do
+not create a new family of container types. The backing field is internal;
+normal mutation APIs such as `setindex!` and `push!` are unavailable.
+"""
+struct FrozenVector{T} <: AbstractVector{T}
+    _data::Vector{T}
+    FrozenVector{T}(data::Vector{T}, ::Nothing) where {T} = new{T}(data)
+end
+FrozenVector{T}(xs::FrozenVector{T}) where {T} = xs
+FrozenVector{T}(xs) where {T} = FrozenVector{T}(collect(T, xs), nothing)
+Base.size(v::FrozenVector) = size(getfield(v, :_data))
+Base.length(v::FrozenVector) = length(getfield(v, :_data))
+Base.getindex(v::FrozenVector, i::Int) = getfield(v, :_data)[i]
+Base.IndexStyle(::Type{<:FrozenVector}) = IndexLinear()
 
 @enum TimeUnit::UInt8 SECOND MILLISECOND MICROSECOND NANOSECOND
 @enum DateUnit::UInt8 DAY MILLISECOND_DATE
@@ -472,8 +536,9 @@ struct MapType <: ArrowType
 end
 struct UnionType <: ArrowType
     mode::UnionMode
-    typeids::Vector{Int8}             # declared type-id domain, child order
+    typeids::FrozenVector{Int8}       # declared type-id domain, child order
 end
+UnionType(mode::UnionMode, typeids) = UnionType(mode, FrozenVector{Int8}(typeids))
 "Dictionary-encoded: `indextype` is the physical index; values live in `ArrayData.dictionary`."
 struct DictionaryType <: ArrowType
     indextype::IntType
@@ -504,19 +569,26 @@ struct Field
     name::String
     type::ArrowType
     nullable::Bool
-    metadata::Union{Nothing,Dict{String,String}}
-    children::Vector{Field}
+    metadata::Union{Nothing,FrozenVector{Pair{String,String}}}
+    children::FrozenVector{Field}
 end
-Field(name, type; nullable=true, metadata=nothing, children=Field[]) =
-    Field(String(name), type, nullable, metadata, children)
+_freezemetadata(::Nothing) = nothing
+_freezemetadata(metadata::FrozenVector{Pair{String,String}}) = metadata
+_freezemetadata(metadata) =
+    FrozenVector{Pair{String,String}}(String(k) => String(v) for (k, v) in pairs(metadata))
+Field(name, type; nullable=true, metadata=nothing, children=()) =
+    Field(String(name), type, Bool(nullable), _freezemetadata(metadata),
+        FrozenVector{Field}(children))
+Field(name, type, nullable, metadata, children) =
+    Field(name, type; nullable=nullable, metadata=metadata, children=children)
 
 struct Schema
-    fields::Vector{Field}
-    metadata::Union{Nothing,Dict{String,String}}
+    fields::FrozenVector{Field}
+    metadata::Union{Nothing,FrozenVector{Pair{String,String}}}
     endianness::Endianness
 end
-Schema(fields::Vector{Field}; metadata=nothing, endianness=LittleEndian) =
-    Schema(fields, metadata, endianness)
+Schema(fields; metadata=nothing, endianness=LittleEndian) =
+    Schema(FrozenVector{Field}(fields), _freezemetadata(metadata), endianness)
 
 # ---------------------------------------------------------------------------
 # §3 Layout registry (structural facts only)
@@ -543,12 +615,15 @@ access element `i`) are per-layout methods, not registry rows (report §8.4:
 data buffer is byte-addressed (varbinary) or absent, and -1 for bit-packed.
 """
 struct LayoutSpec
-    buffers::Vector{BufferRole}
+    buffers::FrozenVector{BufferRole}
     childcount::Int
     offsetwidth::Int    # 0, 4, or 8 — width of the OFFSETS buffer entries
     fixedwidth::Int
     variadic::Bool
 end
+LayoutSpec(buffers, childcount, offsetwidth, fixedwidth, variadic) =
+    LayoutSpec(FrozenVector{BufferRole}(buffers), childcount, offsetwidth,
+        fixedwidth, variadic)
 
 primwidth(t::IntType) = t.bits ÷ 8
 primwidth(t::FloatType) = t.bits ÷ 8
@@ -561,7 +636,7 @@ primwidth(t::IntervalType) =
     t.unit == YEAR_MONTH ? 4 : t.unit == DAY_TIME ? 8 : 16
 primwidth(t::FixedSizeBinaryType) = t.nbytes
 
-const VALIDITY_DATA = [VALIDITY, DATA]
+const VALIDITY_DATA = FrozenVector{BufferRole}((VALIDITY, DATA))
 
 layoutspec(::NullType) = LayoutSpec(BufferRole[], 0, 0, 0, false)
 layoutspec(::BoolType) = LayoutSpec(VALIDITY_DATA, 0, 0, -1, false)
@@ -590,7 +665,9 @@ layoutspec(t::DictionaryType) =
     LayoutSpec(VALIDITY_DATA, 0, 0, primwidth(t.indextype), false)
 layoutspec(::ViewType) = LayoutSpec([VALIDITY, VIEWS], 0, 0, 16, true)
 layoutspec(t::ListViewType) =
-    LayoutSpec([VALIDITY, OFFSETS, SIZES], 1, t.large ? 8 : 4, 0, false)
+    # ListView has one offset and one size per parent slot. These are not
+    # the length+1 monotone range offsets used by List/Utf8/Binary.
+    LayoutSpec([VALIDITY, ELEMENT_OFFSETS, SIZES], 1, t.large ? 8 : 4, 0, false)
 # REE: no top-level validity; run_ends and values are CHILDREN, not buffers.
 layoutspec(::RunEndEncodedType) = LayoutSpec(BufferRole[], 2, 0, 0, false)
 
@@ -613,23 +690,33 @@ mutable struct ArrayData
     const type::ArrowType
     const len::Int64
     const offset::Int64
-    const buffers::Vector{BufferSlice}
-    const children::Vector{ArrayData}
+    const buffers::FrozenVector{BufferSlice}
+    const children::FrozenVector{ArrayData}
     const dictionary::Union{Nothing,ArrayData}
+    const owner::Any                  # adapter lifetime anchor, if needed
     @atomic nullcount::Int64      # -1 = unknown, computed on demand
     @atomic semachecked::Bool     # semantic validation ran and passed
 end
 
-function ArrayData(type::ArrowType, len::Integer, buffers::Vector{BufferSlice};
-    offset::Integer=0, children::Vector{ArrayData}=ArrayData[],
-    dictionary::Union{Nothing,ArrayData}=nothing, nullcount::Integer=-1)
+function ArrayData(type::ArrowType, len::Integer, buffers;
+    offset::Integer=0, children=(),
+    dictionary::Union{Nothing,ArrayData}=nothing, owner=nothing,
+    nullcount::Integer=-1)
     len >= 0 || throw(ArgumentError("negative array length"))
     offset >= 0 || throw(ArgumentError("negative array offset"))
-    return ArrayData(type, Int64(len), Int64(offset), buffers, children,
-        dictionary, Int64(nullcount), false)
+    -1 <= nullcount <= len ||
+        throw(ArgumentError("null count must be -1 or in [0, length]"))
+    return ArrayData(type, Int64(len), Int64(offset),
+        FrozenVector{BufferSlice}(buffers), FrozenVector{ArrayData}(children),
+        dictionary, owner, Int64(nullcount), false)
 end
 
 Base.length(d::ArrayData) = d.len
+
+@inline _slotindex0(d::ArrayData, i::Int64) =
+    checked_add(d.offset, checked_sub(i, Int64(1)))
+@inline _slotbyteoff(d::ArrayData, i::Int64, width::Integer) =
+    checked_mul(_slotindex0(d, i), Int64(width))
 
 # Buffer-by-role lookup, driven by the registry. Structural validation
 # guarantees position/arity, so adapters and accessors never hand-count.
@@ -653,7 +740,7 @@ through their own accessors.
 @inline function isvalid_at(d::ArrayData, i::Integer)
     v = validitybuffer(d)
     isempty_buffer(v) && return true
-    return getbit(v, Int64(d.offset + i - 1))
+    return getbit(v, _slotindex0(d, Int64(i)))
 end
 
 """
@@ -680,7 +767,7 @@ function _count_nulls(d::ArrayData)
     isempty_buffer(v) && return Int64(0)
     n = Int64(0)
     for i = 1:d.len
-        n += !getbit(v, Int64(d.offset + i - 1))
+        n += !getbit(v, _slotindex0(d, Int64(i)))
     end
     return n
 end
@@ -693,7 +780,50 @@ struct ValidationError <: Exception
     msg::String
 end
 
-expected_validity_bytes(len::Int64) = (len + 7) >> 3
+function expected_validity_bytes(len::Int64)
+    len >= 0 || throw(ArgumentError("negative bitmap length"))
+    return checked_add(len, Int64(7)) >> 3
+end
+
+# Runtime descriptor equality must compare values, not only Julia types.
+# The fallback `==` for immutable structs containing vectors/strings is not
+# a stable semantic contract for all descriptors.
+_typeparam_equal(a::ArrowType, b::ArrowType) = typeequal(a, b)
+_typeparam_equal(a, b) = a == b
+function typeequal(a::ArrowType, b::ArrowType)
+    typeof(a) === typeof(b) || return false
+    return all(_typeparam_equal(getfield(a, i), getfield(b, i))
+               for i = 1:fieldcount(typeof(a)))
+end
+
+_validate_descriptor(::ArrowType) = nothing
+_validate_descriptor(t::IntType) = t.bits in (8, 16, 32, 64) ||
+    throw(ValidationError("integer bit width must be 8, 16, 32, or 64"))
+_validate_descriptor(t::FloatType) = t.bits in (16, 32, 64) ||
+    throw(ValidationError("floating-point bit width must be 16, 32, or 64"))
+function _validate_descriptor(t::DecimalType)
+    maxprecision = t.bits == 32 ? 9 : t.bits == 64 ? 18 :
+        t.bits == 128 ? 38 : t.bits == 256 ? 76 : 0
+    maxprecision != 0 ||
+        throw(ValidationError("decimal bit width must be 32, 64, 128, or 256"))
+    1 <= t.precision <= maxprecision ||
+        throw(ValidationError("decimal precision $(t.precision) is invalid for $(t.bits)-bit storage"))
+    return nothing
+end
+_validate_descriptor(t::FixedSizeBinaryType) = t.nbytes >= 0 ||
+    throw(ValidationError("fixed-size-binary width must be non-negative"))
+function _validate_descriptor(t::TimeType)
+    valid = t.unit in (SECOND, MILLISECOND) ? t.bits == 32 : t.bits == 64
+    valid || throw(ValidationError("time unit $(t.unit) is incompatible with $(t.bits)-bit storage"))
+    return nothing
+end
+_validate_descriptor(t::FixedSizeListType) = t.listsize >= 0 ||
+    throw(ValidationError("fixed-size-list size must be non-negative"))
+function _validate_descriptor(t::DictionaryType)
+    _validate_descriptor(t.indextype)
+    _validate_descriptor(t.valuetype)
+    return nothing
+end
 
 """
     validate_structural(field, data)
@@ -710,16 +840,24 @@ sizes. (The framing stage — resource limits before allocation, message-body
 spans — belongs to the adapters; see core/examples/ipc_read.jl.)
 """
 function validate_structural(f::Field, d::ArrayData)
-    f.type == d.type || (typeof(f.type) == typeof(d.type)) ||
+    typeequal(f.type, d.type) ||
         throw(ValidationError("field/type mismatch: $(f.type) vs $(d.type)"))
+    _validate_descriptor(d.type)
     spec = layoutspec(d.type)
-    length(d.buffers) == length(spec.buffers) ||
-        throw(ValidationError("$(typeof(d.type)): expected $(length(spec.buffers)) buffers, got $(length(d.buffers))"))
+    nfixed = length(spec.buffers)
+    buffers_ok = spec.variadic ? length(d.buffers) >= nfixed : length(d.buffers) == nfixed
+    buffers_ok || throw(ValidationError(
+        "$(typeof(d.type)): expected $(spec.variadic ? "at least " : "")$nfixed buffers, got $(length(d.buffers))"))
     total = checked_add(d.len, d.offset)
+    declared_nulls = @atomic :monotonic d.nullcount
     for (i, role) in enumerate(spec.buffers)
         b = d.buffers[i]
         if role == VALIDITY
-            isempty_buffer(b) && continue
+            if isempty_buffer(b)
+                declared_nulls > 0 &&
+                    throw(ValidationError("absent validity bitmap with positive null count"))
+                continue
+            end
             b.len >= expected_validity_bytes(total) ||
                 throw(ValidationError("validity bitmap too small: $(b.len) bytes for $total slots"))
         elseif role == DATA
@@ -734,6 +872,10 @@ function validate_structural(f::Field, d::ArrayData)
             # fixedwidth == 0 (varbinary DATA): bounded by offsets in the
             # semantic stage — nothing structural to require here.
         elseif role == OFFSETS
+            # Canonical empty offset-based arrays may omit the offsets
+            # buffer. A sliced empty array (`offset > 0`) still needs the
+            # physical prefix that its offset addresses.
+            isempty_buffer(b) && d.len == 0 && d.offset == 0 && continue
             need = checked_mul(checked_add(total, Int64(1)), Int64(spec.offsetwidth))
             b.len >= need ||
                 throw(ValidationError("offsets buffer too small: $(b.len) < $need bytes"))
@@ -756,10 +898,12 @@ function validate_structural(f::Field, d::ArrayData)
     end
     # Child arity: registry-declared, or Field-declared for struct/union/REE.
     expected_children = spec.childcount == -1 ? length(f.children) : spec.childcount
+    if !(d.type isa DictionaryType)
+        length(f.children) == expected_children ||
+            throw(ValidationError("$(typeof(d.type)): expected $expected_children child fields, got $(length(f.children))"))
+    end
     length(d.children) == expected_children ||
         throw(ValidationError("$(typeof(d.type)): expected $expected_children children, got $(length(d.children))"))
-    spec.childcount == -1 && length(f.children) != length(d.children) &&
-        throw(ValidationError("field declares $(length(f.children)) children, data has $(length(d.children))"))
     for (cf, cd) in zip(childfields(f), d.children)
         validate_structural(cf, cd)
     end
@@ -767,6 +911,8 @@ function validate_structural(f::Field, d::ArrayData)
         d.dictionary === nothing &&
             throw(ValidationError("dictionary-encoded array without a dictionary"))
         validate_structural(dictvaluefield(f, d.type), d.dictionary)
+    elseif d.dictionary !== nothing
+        throw(ValidationError("dictionary values attached to a non-dictionary array"))
     end
     if d.type isa FixedSizeListType
         need = checked_mul(total, Int64(d.type.listsize))
@@ -782,6 +928,39 @@ function validate_structural(f::Field, d::ArrayData)
                 throw(ValidationError("child $ci too short for parent extent: $(length(child)) < $total"))
         end
     end
+    if d.type isa UnionType
+        length(d.type.typeids) == length(f.children) ||
+            throw(ValidationError("union type-id count must equal child count"))
+        length(unique(d.type.typeids)) == length(d.type.typeids) ||
+            throw(ValidationError("union type ids must be unique"))
+        all(>=(0), d.type.typeids) ||
+            throw(ValidationError("union type ids must be in [0, 127]"))
+    end
+    if d.type isa MapType
+        entries = f.children[1]
+        entries.type isa StructType ||
+            throw(ValidationError("map child must be an entries struct"))
+        !entries.nullable ||
+            throw(ValidationError("map entries field must be non-nullable"))
+        length(entries.children) == 2 ||
+            throw(ValidationError("map entries struct must have key and value children"))
+        !entries.children[1].nullable ||
+            throw(ValidationError("map keys must be non-nullable"))
+    end
+    if d.type isa RunEndEncodedType
+        runfield, valuefield = f.children
+        runfield.name == "run_ends" && valuefield.name == "values" ||
+            throw(ValidationError("REE children must be named run_ends and values"))
+        runtype = runfield.type
+        runtype isa IntType && runtype.signed && runtype.bits in (16, 32, 64) ||
+            throw(ValidationError("REE run ends must be signed int16, int32, or int64"))
+        !runfield.nullable ||
+            throw(ValidationError("REE run ends must be non-nullable"))
+        length(d.children[1]) == length(d.children[2]) ||
+            throw(ValidationError("REE run-end and value child lengths must match"))
+        !(valuefield.type isa RunEndEncodedType) ||
+            throw(ValidationError("nested run-end encoding is not permitted"))
+    end
     return d
 end
 
@@ -790,16 +969,18 @@ end
 # value type.
 childfields(f::Field) = f.children
 dictvaluefield(f::Field, t::DictionaryType) =
-    Field(f.name, t.valuetype; nullable=f.nullable, children=f.children)
+    # Dictionary values have their own nullability. The index field's
+    # nullable flag describes only the indices and cannot constrain the pool.
+    Field(f.name, t.valuetype; nullable=true, children=f.children)
 
 """
     validate_semantic(field, data)
 
-Stage-3 validation: O(n) content checks that make later accessors safe to
-run unguarded — offset monotonicity + final-offset bounds, dictionary index
-bounds, union type-id domain. Runs once; the result is cached on the
-ArrayData (`semachecked`), so adapters can call this at hand-off and
-accessors get it for free.
+Stage-3 validation: O(n) content checks that make later guarded accessors
+safe — offset monotonicity + final-offset bounds, dictionary index bounds,
+union type-id domain. Runs once; the result is cached on the ArrayData
+(`semachecked`), so adapters can call this at hand-off and accessors get it
+for free.
 """
 function validate_semantic(f::Field, d::ArrayData)
     (@atomic :monotonic d.semachecked) && return d
@@ -809,21 +990,24 @@ function validate_semantic(f::Field, d::ArrayData)
     if oi !== nothing && spec.offsetwidth != 0
         O = spec.offsetwidth == 8 ? Int64 : Int32
         offs = d.buffers[oi]
-        databytes = if t isa Utf8Type || t isa BinaryType
-            di = findfirst(==(DATA), spec.buffers)
-            d.buffers[di].len
-        else
-            isempty(d.children) ? Int64(0) : Int64(length(d.children[1]))
+        if !(isempty_buffer(offs) && d.len == 0 && d.offset == 0)
+            databytes = if t isa Utf8Type || t isa BinaryType
+                di = findfirst(==(DATA), spec.buffers)
+                d.buffers[di].len
+            else
+                isempty(d.children) ? Int64(0) : Int64(length(d.children[1]))
+            end
+            prev = loadat(offs, O, checked_mul(d.offset, Int64(sizeof(O))))
+            prev >= 0 || throw(ValidationError("negative first offset"))
+            for i = 1:d.len
+                cur = loadat(offs, O,
+                    checked_mul(checked_add(d.offset, Int64(i)), Int64(sizeof(O))))
+                cur >= prev || throw(ValidationError("offsets not monotonically non-decreasing at $i"))
+                prev = cur
+            end
+            Int64(prev) <= databytes ||
+                throw(ValidationError("final offset $prev exceeds data extent $databytes"))
         end
-        prev = loadat(offs, O, Int64(d.offset) * sizeof(O))
-        prev >= 0 || throw(ValidationError("negative first offset"))
-        for i = 1:d.len
-            cur = loadat(offs, O, Int64(d.offset + i) * sizeof(O))
-            cur >= prev || throw(ValidationError("offsets not monotonically non-decreasing at $i"))
-            prev = cur
-        end
-        Int64(prev) <= databytes ||
-            throw(ValidationError("final offset $prev exceeds data extent $databytes"))
     end
     if t isa DictionaryType
         dictlen = length(d.dictionary)
@@ -831,7 +1015,7 @@ function validate_semantic(f::Field, d::ArrayData)
         w = primwidth(t.indextype)
         for i = 1:d.len
             isvalid_at(d, i) || continue
-            idx = _load_int(data, t.indextype, Int64(d.offset + i - 1) * w)
+            idx = _load_int(data, t.indextype, _slotbyteoff(d, Int64(i), w))
             0 <= idx < dictlen ||
                 throw(ValidationError("dictionary index $idx out of bounds [0, $dictlen)"))
         end
@@ -839,19 +1023,31 @@ function validate_semantic(f::Field, d::ArrayData)
     end
     if t isa UnionType
         ids = rolebuffer(d, TYPE_IDS)
+        lastoffset = fill(Int64(-1), length(d.children))
         for i = 1:d.len
-            tid = loadat(ids, Int8, Int64(d.offset + i - 1))
+            tid = loadat(ids, Int8, _slotindex0(d, Int64(i)))
             pos = findfirst(==(tid), t.typeids)
             pos === nothing && throw(ValidationError("union type id $tid not in declared domain"))
             if t.mode == DenseMode
-                off = loadat(rolebuffer(d, ELEMENT_OFFSETS), Int32, Int64(d.offset + i - 1) * 4)
+                off = loadat(rolebuffer(d, ELEMENT_OFFSETS), Int32,
+                    _slotbyteoff(d, Int64(i), 4))
                 0 <= off < length(d.children[pos]) ||
                     throw(ValidationError("dense union offset $off out of bounds for child $pos"))
+                Int64(off) >= lastoffset[pos] ||
+                    throw(ValidationError("dense union offsets must be nondecreasing within child $pos"))
+                lastoffset[pos] = Int64(off)
             end
         end
     end
     for (cf, cd) in zip(childfields(f), d.children)
         validate_semantic(cf, cd)
+    end
+    actual_nulls = _count_nulls(d)
+    declared_nulls = @atomic :monotonic d.nullcount
+    if declared_nulls >= 0 && declared_nulls != actual_nulls
+        throw(ValidationError("declared null count $declared_nulls does not match bitmap count $actual_nulls"))
+    elseif declared_nulls < 0
+        @atomic :monotonic d.nullcount = actual_nulls
     end
     @atomic :monotonic d.semachecked = true
     return d
@@ -877,6 +1073,9 @@ function validate_full(f::Field, d::ArrayData)
     end
     for (cf, cd) in zip(childfields(f), d.children)
         validate_full(cf, cd)
+    end
+    if d.type isa DictionaryType
+        validate_full(dictvaluefield(f, d.type), d.dictionary)
     end
     return d
 end
@@ -904,7 +1103,7 @@ juliatype(t::FixedSizeBinaryType) = Vector{UInt8}
 
 @inline function _load_int(b::BufferSlice, t::IntType, byteoff::Int64)
     T = juliatype(t)
-    return Int64(loadat(b, T, byteoff))
+    return loadat(b, T, byteoff)
 end
 
 """
@@ -927,7 +1126,7 @@ function _value(t::Union{IntType,FloatType,TimestampType,DurationType,DateType,T
     f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     T = juliatype(t)
-    return loadat(rolebuffer(d, DATA), T, (d.offset + i - 1) * sizeof(T))
+    return loadat(rolebuffer(d, DATA), T, _slotbyteoff(d, i, sizeof(T)))
 end
 
 function _value(t::DecimalType, f::Field, d::ArrayData, i::Int64)
@@ -936,13 +1135,13 @@ function _value(t::DecimalType, f::Field, d::ArrayData, i::Int64)
     # 128/256-bit decimals surface as raw little-endian bytes in the
     # prove-out (BigInt/Int256 conversion is facade work); 32/64 as integers.
     if t.bits == 32
-        return loadat(rolebuffer(d, DATA), Int32, (d.offset + i - 1) * w)
+        return loadat(rolebuffer(d, DATA), Int32, _slotbyteoff(d, i, w))
     elseif t.bits == 64
-        return loadat(rolebuffer(d, DATA), Int64, (d.offset + i - 1) * w)
+        return loadat(rolebuffer(d, DATA), Int64, _slotbyteoff(d, i, w))
     else
         b = rolebuffer(d, DATA)
-        off = (d.offset + i - 1) * w
-        return [loadat(b, UInt8, off + k) for k = 0:(w - 1)]
+        off = _slotbyteoff(d, i, w)
+        return [loadat(b, UInt8, checked_add(off, Int64(k))) for k = 0:(w - 1)]
     end
 end
 
@@ -950,20 +1149,22 @@ function _value(t::IntervalType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     b = rolebuffer(d, DATA)
     if t.unit == YEAR_MONTH
-        return loadat(b, Int32, (d.offset + i - 1) * 4)
+        return loadat(b, Int32, _slotbyteoff(d, i, 4))
     elseif t.unit == DAY_TIME
-        off = (d.offset + i - 1) * 8
-        return (days=loadat(b, Int32, off), millis=loadat(b, Int32, off + 4))
+        off = _slotbyteoff(d, i, 8)
+        return (days=loadat(b, Int32, off),
+            millis=loadat(b, Int32, checked_add(off, Int64(4))))
     else # MONTH_DAY_NANO — the unit today's Arrow.jl cannot even parse
-        off = (d.offset + i - 1) * 16
-        return (months=loadat(b, Int32, off), days=loadat(b, Int32, off + 4),
-            nanos=loadat(b, Int64, off + 8))
+        off = _slotbyteoff(d, i, 16)
+        return (months=loadat(b, Int32, off),
+            days=loadat(b, Int32, checked_add(off, Int64(4))),
+            nanos=loadat(b, Int64, checked_add(off, Int64(8))))
     end
 end
 
 function _value(::BoolType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
-    return getbit(rolebuffer(d, DATA), d.offset + i - 1)
+    return getbit(rolebuffer(d, DATA), _slotindex0(d, i))
 end
 
 function _value(::NullType, f::Field, d::ArrayData, i::Int64)
@@ -973,7 +1174,7 @@ end
 function _value(t::FixedSizeBinaryType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     b = rolebuffer(d, DATA)
-    off = (d.offset + i - 1) * t.nbytes
+    off = _slotbyteoff(d, i, t.nbytes)
     return slicebytes(subslice(b, off, t.nbytes))
 end
 
@@ -982,8 +1183,10 @@ end
 @inline function _offsets_at(d::ArrayData, i::Int64, width::Int)
     O = width == 8 ? Int64 : Int32
     offs = rolebuffer(d, OFFSETS)
-    lo = loadat(offs, O, (d.offset + i - 1) * sizeof(O))
-    hi = loadat(offs, O, (d.offset + i) * sizeof(O))
+    slot = _slotindex0(d, i)
+    lo = loadat(offs, O, checked_mul(slot, Int64(sizeof(O))))
+    hi = loadat(offs, O,
+        checked_mul(checked_add(slot, Int64(1)), Int64(sizeof(O))))
     return Int64(lo), Int64(hi)
 end
 
@@ -1012,14 +1215,15 @@ end
 function _value(t::FixedSizeListType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     child, cf = d.children[1], f.children[1]
-    base = (d.offset + i - 1) * t.listsize
-    return [getvalue(cf, child, base + j) for j = 1:t.listsize]
+    base = _slotbyteoff(d, i, t.listsize)
+    return [getvalue(cf, child, checked_add(base, Int64(j))) for j = 1:t.listsize]
 end
 
 function _value(::StructType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     names = Tuple(Symbol(cf.name) for cf in f.children)
-    vals = Tuple(getvalue(cf, cd, d.offset + i) for (cf, cd) in zip(f.children, d.children))
+    childindex = checked_add(d.offset, i)
+    vals = Tuple(getvalue(cf, cd, childindex) for (cf, cd) in zip(f.children, d.children))
     return NamedTuple{names}(vals)
 end
 
@@ -1030,27 +1234,31 @@ function _value(t::MapType, f::Field, d::ArrayData, i::Int64)
     entries, ef = d.children[1], f.children[1]
     kf, vf = ef.children[1], ef.children[2]
     kd, vd = entries.children[1], entries.children[2]
-    return [getvalue(kf, kd, j) => getvalue(vf, vd, j) for j = (lo + 1):hi]
+    return [begin
+        entryindex = checked_add(entries.offset, Int64(j))
+        getvalue(kf, kd, entryindex) => getvalue(vf, vd, entryindex)
+    end for j = (lo + 1):hi]
 end
 
 function _value(t::UnionType, f::Field, d::ArrayData, i::Int64)
-    tid = loadat(rolebuffer(d, TYPE_IDS), Int8, d.offset + i - 1)
+    tid = loadat(rolebuffer(d, TYPE_IDS), Int8, _slotindex0(d, i))
     pos = findfirst(==(tid), t.typeids)
     pos === nothing && throw(ValidationError("union type id $tid not in declared domain"))
     child, cf = d.children[pos], f.children[pos]
     if t.mode == DenseMode
-        off = loadat(rolebuffer(d, ELEMENT_OFFSETS), Int32, (d.offset + i - 1) * 4)
-        return getvalue(cf, child, off + 1)
+        off = loadat(rolebuffer(d, ELEMENT_OFFSETS), Int32, _slotbyteoff(d, i, 4))
+        return getvalue(cf, child, checked_add(Int64(off), Int64(1)))
     else
-        return getvalue(cf, child, d.offset + i)
+        return getvalue(cf, child, checked_add(d.offset, i))
     end
 end
 
 function _value(t::DictionaryType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     w = primwidth(t.indextype)
-    idx = _load_int(rolebuffer(d, DATA), t.indextype, (d.offset + i - 1) * w)
-    return getvalue(dictvaluefield(f, t), d.dictionary, idx + 1)
+    idx = _load_int(rolebuffer(d, DATA), t.indextype, _slotbyteoff(d, i, w))
+    return getvalue(dictvaluefield(f, t), d.dictionary,
+        checked_add(idx, one(idx)))
 end
 
 _value(t::Union{ViewType,ListViewType,RunEndEncodedType}, f::Field, d::ArrayData, i::Int64) =
@@ -1246,18 +1454,22 @@ facade convenience that never crosses a boundary).
 """
 struct RecordBatch
     schema::Schema
-    columns::Vector{ArrayData}
+    columns::FrozenVector{ArrayData}
     nrows::Int64
-    function RecordBatch(schema::Schema, columns::Vector{ArrayData})
-        n = isempty(columns) ? 0 : length(columns[1])
-        for (f, c) in zip(schema.fields, columns)
+    function RecordBatch(schema::Schema, columns, nrows::Integer)
+        cols = FrozenVector{ArrayData}(columns)
+        n = Int64(nrows)
+        n >= 0 || throw(ArgumentError("negative row count"))
+        for (f, c) in zip(schema.fields, cols)
             length(c) == n || throw(ArgumentError("unequal column lengths"))
         end
-        length(schema.fields) == length(columns) ||
+        length(schema.fields) == length(cols) ||
             throw(ArgumentError("schema/column count mismatch"))
-        return new(schema, columns, n)
+        return new(schema, cols, n)
     end
 end
+RecordBatch(schema::Schema, columns) =
+    RecordBatch(schema, columns, isempty(columns) ? 0 : length(first(columns)))
 
 "Build a batch from a NamedTuple of Julia vectors (test/example convenience)."
 function batch(nt::NamedTuple)

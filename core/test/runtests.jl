@@ -33,6 +33,8 @@ const AC = ArrowCore
         b = BufferSlice(r, 0, 32)
         @test AC.loadat(b, Int64, Int64(0)) == 1
         @test AC.loadat(b, Int64, Int64(24)) == 4
+        @test_throws ErrorException setproperty!(r, :ptr, Ptr{UInt8}(0))
+        @test_throws ErrorException setproperty!(r, :root, nothing)
     end
 
     @testset "mmap region: read, deterministic close, invalidation" begin
@@ -78,6 +80,57 @@ const AC = ArrowCore
         @test_throws InvalidatedError withguard(() -> 1, r)
         @test (@atomic r.guards) == 0   # failed acquire backed out its count
     end
+
+    @testset "invalid construction and release errors stay closed" begin
+        @test_throws ArgumentError AC.OwnerRegion(Ptr{UInt8}(0), 1, AC.Foreign)
+        @test_throws ArgumentError forceclose!(heapregion(UInt8[0]); timeout_ms=-1)
+        calls = Ref(0)
+        bytes = UInt8[0]
+        r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
+            root=bytes, releasefn=_ -> (calls[] += 1; error("release failed")))
+        @test_throws ErrorException forceclose!(r)
+        @test calls[] == 1
+        @test AC.phase(@atomic r.state) == AC.PHASE_CLOSED
+        @test forceclose!(r)
+        @test calls[] == 1
+    end
+
+
+    @testset "one closer owns the release callback" begin
+        bytes = UInt8[0]
+        entered = Base.Event()
+        finish = Base.Event()
+        calls = Threads.Atomic{Int}(0)
+        r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
+            root=bytes, releasefn=_ -> begin
+                Threads.atomic_add!(calls, 1)
+                notify(entered)
+                wait(finish)
+            end)
+        first = Threads.@spawn forceclose!(r)
+        wait(entered)
+        @test forceclose!(r; timeout_ms=0) == false
+        @test AC.phase(@atomic r.state) == AC.PHASE_CLOSING
+        notify(finish)
+        @test fetch(first)
+        @test calls[] == 1
+        @test AC.phase(@atomic r.state) == AC.PHASE_CLOSED
+    end
+
+    @testset "manual finalization honors an active guard" begin
+        bytes = UInt8[0]
+        calls = Ref(0)
+        r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
+            root=bytes, releasefn=_ -> (calls[] += 1))
+        withguard(r) do
+            finalize(r)
+            @test calls[] == 0
+            @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
+        end
+        finalize(r)
+        @test calls[] == 1
+        @test AC.phase(@atomic r.state) == AC.PHASE_CLOSED
+    end
 end
 
 @testset "BufferSlice bounds" begin
@@ -88,11 +141,14 @@ end
     b = BufferSlice(r, 8, 8)
     @test length(b) == 8
     @test_throws ArgumentError AC.subslice(b, 4, 8)   # 4+8 > 8
+    @test_throws ArgumentError AC.subslice(b, -1, 1)  # cannot escape parent span
+    @test_throws ArgumentError AC.subslice(b, 0, -1)
     sub = AC.subslice(b, 4, 4)
     @test length(sub) == 4
     # loadat re-checks: last line of defense before the pointer
     @test_throws BoundsError AC.loadat(b, UInt64, Int64(1))
     @test_throws BoundsError AC.loadat(b, UInt8, Int64(8))
+    @test_throws BoundsError AC.loadat(b, UInt8, typemax(Int64))
     # empty buffer
     e = BufferSlice()
     @test length(e) == 0
@@ -131,6 +187,35 @@ end
     # two timestamps with different timezones: same Julia type (the #503 fix)
     @test typeof(TimestampType(AC.SECOND, "America/Denver")) ==
           typeof(TimestampType(AC.NANOSECOND, nothing))
+
+    # Schema/data containers defensively copy mutable caller input and expose
+    # no normal mutation API. This keeps semantic-cache results stable.
+    ids = Int8[0, 1]
+    ut = UnionType(AC.SparseMode, ids)
+    ids[1] = 7
+    @test collect(ut.typeids) == Int8[0, 1]
+    @test_throws Exception setindex!(ut.typeids, Int8(7), 1)
+    children = Field[fromjulia("x", Int64[])[1]]
+    frozen = Field("l", ListType(false); children=children)
+    empty!(children)
+    @test length(frozen.children) == 1
+
+    # ListView offsets are per-slot and may be unordered; view data buffers
+    # are variadic after the fixed validity/views pair.
+    cf, cd = fromjulia("item", Int64[1, 2, 3])
+    lvt = ListViewType(false)
+    lvf = Field("lv", lvt; children=[cf])
+    lvd = AC.ArrayData(lvt, 2,
+        [BufferSlice(), AC._databuffer(Int32[2, 0]), AC._databuffer(Int32[1, 2])];
+        children=[cd], nullcount=0)
+    @test validate_structural(lvf, lvd) === lvd
+    @test validate_semantic(lvf, lvd) === lvd
+    vt = ViewType(true)
+    vf = Field("v", vt)
+    vd = AC.ArrayData(vt, 1,
+        [BufferSlice(), AC._databuffer(zeros(UInt8, 16)), AC._databuffer(UInt8[0x61])];
+        nullcount=0)
+    @test validate_structural(vf, vd) === vd
 end
 
 @testset "fromjulia round-trips" begin
@@ -185,6 +270,37 @@ end
         validate_semantic(f, d)
         @test isequal(materialize(f, d), ["lo", "hi", missing, "lo"])
     end
+
+    @testset "canonical empty offset arrays" begin
+        st = Utf8Type(false)
+        sf = Field("s", st)
+        sd = AC.ArrayData(st, 0,
+            [BufferSlice(), BufferSlice(), BufferSlice()]; nullcount=0)
+        @test validate_structural(sf, sd) === sd
+        @test validate_semantic(sf, sd) === sd
+        @test isempty(materialize(sf, sd))
+
+        cf, cd = fromjulia("item", Int64[])
+        lt = ListType(false)
+        lf = Field("l", lt; children=[cf])
+        ld = AC.ArrayData(lt, 0, [BufferSlice(), BufferSlice()];
+            children=[cd], nullcount=0)
+        @test validate_structural(lf, ld) === ld
+        @test validate_semantic(lf, ld) === ld
+        @test isempty(materialize(lf, ld))
+    end
+
+    @testset "dictionary pool nullability is independent" begin
+        vf, vd = fromjulia("pool", Union{Missing,String}[missing, "x"])
+        t = DictionaryType(IntType(32, true), vf.type, false)
+        f = Field("d", t; nullable=false, children=vf.children)
+        d = AC.ArrayData(t, 2,
+            [BufferSlice(), AC._databuffer(Int32[0, 1])];
+            dictionary=vd, nullcount=0)
+        validate_structural(f, d)
+        validate_semantic(f, d)
+        @test isequal(materialize(f, d), [missing, "x"])
+    end
 end
 
 # Layouts fromjulia doesn't build: construct by hand to prove the accessors.
@@ -212,6 +328,21 @@ end
         validate_structural(f, d)
         validate_semantic(f, d)
         @test materialize(f, d) == [["a" => 1, "b" => 2], ["c" => 3]]
+    end
+
+    @testset "map applies the entries struct offset" begin
+        kf, kd = fromjulia("key", ["skip", "a", "b"])
+        vf, vd = fromjulia("value", Int64[0, 1, 2])
+        ef = Field("entries", StructType(); nullable=false, children=[kf, vf])
+        ed = AC.ArrayData(StructType(), 2, [BufferSlice()]; offset=1,
+            children=[kd, vd], nullcount=0)
+        t = MapType(false)
+        f = Field("m", t; children=[ef])
+        d = AC.ArrayData(t, 1,
+            [BufferSlice(), AC._databuffer(Int32[0, 2])]; children=[ed], nullcount=0)
+        validate_structural(f, d)
+        validate_semantic(f, d)
+        @test materialize(f, d) == [["a" => 1, "b" => 2]]
     end
 
     @testset "dense union" begin
@@ -269,6 +400,24 @@ end
         @test materialize(f, d) == [3, 4, 5]
     end
 
+    @testset "logical offset in struct and sparse union" begin
+        af, ad = fromjulia("a", Int64[10, 20, 30])
+        sf = Field("st", StructType(); children=[af])
+        sd = AC.ArrayData(StructType(), 2, [BufferSlice()]; offset=1,
+            children=[ad], nullcount=0)
+        validate_structural(sf, sd)
+        @test materialize(sf, sd) == [(a=20,), (a=30,)]
+
+        uf = Field("u", UnionType(AC.SparseMode, Int8[0, 1]);
+            children=[af, fromjulia("b", ["x", "y", "z"])[1]])
+        bd = fromjulia("b", ["x", "y", "z"])[2]
+        ud = AC.ArrayData(uf.type, 2, [AC._databuffer(Int8[0, 1, 0])];
+            offset=1, children=[ad, bd], nullcount=0)
+        validate_structural(uf, ud)
+        validate_semantic(uf, ud)
+        @test materialize(uf, ud) == ["y", 30]
+    end
+
     @testset "view/REE layouts: registry-known, access explicitly unsupported" begin
         t = RunEndEncodedType()
         ref, red = fromjulia("run_ends", Int32[2, 3])
@@ -281,6 +430,22 @@ end
 end
 
 @testset "staged validation rejects corrupt metadata" begin
+    @testset "structural: descriptor values and field shape must match" begin
+        f = Field("x", IntType(32, true))
+        d = AC.ArrayData(IntType(64, true), 1,
+            [BufferSlice(), AC._databuffer(Int64[1])]; nullcount=0)
+        @test_throws ValidationError validate_structural(f, d)
+        @test_throws ValidationError validate_structural(
+            Field("l", ListType(false)),
+            AC.ArrayData(ListType(false), 1,
+                [BufferSlice(), AC._databuffer(Int32[0, 0])];
+                children=[fromjulia("item", Int64[])[2]], nullcount=0))
+        badt = IntType(24, true)
+        @test_throws ValidationError validate_structural(Field("bad", badt),
+            AC.ArrayData(badt, 1,
+                [BufferSlice(), AC._databuffer(UInt8[0, 0, 0])]; nullcount=0))
+    end
+
     @testset "structural: wrong buffer arity" begin
         t = IntType(64, true)
         f = Field("x", t)
@@ -342,12 +507,86 @@ end
         @test_throws ValidationError validate_semantic(f, d)
     end
 
+    @testset "union ids and dense offsets obey the format" begin
+        af, ad = fromjulia("i", Int64[1, 2])
+        bf, bd = fromjulia("j", Int64[3, 4])
+        dupt = UnionType(AC.SparseMode, Int8[0, 0])
+        @test_throws ValidationError validate_structural(
+            Field("u", dupt; children=[af, bf]),
+            AC.ArrayData(dupt, 2, [AC._databuffer(Int8[0, 0])];
+                children=[ad, bd], nullcount=0))
+
+        negt = UnionType(AC.SparseMode, Int8[-1, 0])
+        @test_throws ValidationError validate_structural(
+            Field("u", negt; children=[af, bf]),
+            AC.ArrayData(negt, 2, [AC._databuffer(Int8[-1, 0])];
+                children=[ad, bd], nullcount=0))
+
+        shortt = UnionType(AC.SparseMode, Int8[0])
+        @test_throws ValidationError validate_structural(
+            Field("u", shortt; children=[af, bf]),
+            AC.ArrayData(shortt, 2, [AC._databuffer(Int8[0, 0])];
+                children=[ad, bd], nullcount=0))
+
+        t = UnionType(AC.DenseMode, Int8[0])
+        f = Field("u", t; children=[af])
+        d = AC.ArrayData(t, 2,
+            [AC._databuffer(Int8[0, 0]), AC._databuffer(Int32[1, 0])];
+            children=[ad], nullcount=0)
+        validate_structural(f, d)
+        @test_throws ValidationError validate_semantic(f, d)
+
+        # Equal dense offsets are valid; only decreases are forbidden.
+        repeated = AC.ArrayData(t, 2,
+            [AC._databuffer(Int8[0, 0]), AC._databuffer(Int32[0, 0])];
+            children=[ad], nullcount=0)
+        validate_structural(f, repeated)
+        @test validate_semantic(f, repeated) === repeated
+    end
+
+    @testset "structural: nested REE is forbidden" begin
+        rf, rd = fromjulia("run_ends", Int32[1])
+        vf, vd = fromjulia("values", Int64[1])
+        innerf = Field("values", RunEndEncodedType(); children=[rf, vf])
+        innerd = AC.ArrayData(RunEndEncodedType(), 1, BufferSlice[];
+            children=[rd, vd], nullcount=0)
+        outerf = Field("ree", RunEndEncodedType(); children=[rf, innerf])
+        outerd = AC.ArrayData(RunEndEncodedType(), 1, BufferSlice[];
+            children=[rd, innerd], nullcount=0)
+        @test_throws ValidationError validate_structural(outerf, outerd)
+    end
+
+    @testset "semantic: declared null count matches bitmap" begin
+        f, d = fromjulia("x", [1, missing])
+        bad = AC.ArrayData(d.type, d.len, d.buffers; nullcount=0)
+        validate_structural(f, bad)
+        @test_throws ValidationError validate_semantic(f, bad)
+        absent = AC.ArrayData(d.type, d.len,
+            [BufferSlice(), d.buffers[2]]; nullcount=1)
+        @test_throws ValidationError validate_structural(f, absent)
+        @test_throws ArgumentError AC.ArrayData(d.type, d.len, d.buffers; nullcount=3)
+    end
+
     @testset "full: invalid UTF-8" begin
         t = Utf8Type(false)
         f = Field("s", t)
         offs = AC._databuffer(Int32[0, 2])
         data = AC._databuffer(UInt8[0xff, 0xfe])
         d = AC.ArrayData(t, 1, [BufferSlice(), offs, data])
+        validate_structural(f, d)
+        validate_semantic(f, d)
+        @test_throws ValidationError validate_full(f, d)
+    end
+
+    @testset "full: invalid UTF-8 in dictionary values" begin
+        vt = Utf8Type(false)
+        vd = AC.ArrayData(vt, 1,
+            [BufferSlice(), AC._databuffer(Int32[0, 1]), AC._databuffer(UInt8[0xff])];
+            nullcount=0)
+        t = DictionaryType(IntType(32, true), vt, false)
+        f = Field("d", t; nullable=false)
+        d = AC.ArrayData(t, 1,
+            [BufferSlice(), AC._databuffer(Int32[0])]; dictionary=vd, nullcount=0)
         validate_structural(f, d)
         validate_semantic(f, d)
         @test_throws ValidationError validate_full(f, d)
@@ -379,6 +618,13 @@ end
     @test materialize(b.schema.fields[1], b.columns[1]) == [1, 2, 3]
     @test_throws ArgumentError RecordBatch(b.schema,
         [b.columns[1], AC.fromjulia("b", ["only-one"])[2]])
+    empty_schema = Schema(Field[])
+    @test RecordBatch(empty_schema, ArrayData[], 7).nrows == 7
 end
 
 end # ArrowCore testset
+
+# The required standalone command commonly starts Julia with one thread.
+# Run the memory-order stress in a small four-thread child so this gate tests
+# real OS-thread interleavings on every invocation.
+run(`$(Base.julia_cmd()) --startup-file=no --threads=4 $(joinpath(@__DIR__, "threaded_stress.jl"))`)
