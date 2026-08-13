@@ -305,7 +305,7 @@ function _vkeyvalue(t::_VTable, state::_VState, depth::Int)
     _vvisit!(state, :keyvalue, t) || return nothing
     depth <= state.limits.max_nesting_depth || _vfail("metadata nesting exceeds limit")
     _vstring(t, 0, state; required=true)
-    _vstring(t, 1, state)
+    _vstring(t, 1, state; required=true)
     return nothing
 end
 
@@ -1373,6 +1373,54 @@ function _misaligned_empty_buffers_stream()
     return out
 end
 
+function _metadata_value_stream(explicit_empty::Bool)
+    b = FB.Builder(1024)
+    key = FB.createstring!(b, "owner")
+    value = explicit_empty ? FB.createstring!(b, "") : zero(FB.UOffsetT)
+    Meta.keyValueStart(b)
+    Meta.keyValueAddKey(b, key)
+    explicit_empty && Meta.keyValueAddValue(b, value)
+    kv = Meta.keyValueEnd(b)
+    Meta.schemaStartCustomMetadataVector(b, 1)
+    FB.prependoffset!(b, kv)
+    custom = FB.endvector!(b, 1)
+
+    name = FB.createstring!(b, "x")
+    Meta.intStart(b)
+    Meta.intAddBitWidth(b, Int32(64))
+    Meta.intAddIsSigned(b, true)
+    typ = Meta.intEnd(b)
+    Meta.fieldStart(b)
+    Meta.fieldAddName(b, name)
+    Meta.fieldAddNullable(b, true)
+    Meta.fieldAddTypeType(b, Meta.Int)
+    Meta.fieldAddType(b, typ)
+    field = Meta.fieldEnd(b)
+    Meta.schemaStartFieldsVector(b, 1)
+    FB.prependoffset!(b, field)
+    fields = FB.endvector!(b, 1)
+
+    Meta.schemaStart(b)
+    Meta.schemaAddEndianness(b, Meta.Endianness.Little)
+    Meta.schemaAddFields(b, fields)
+    Meta.schemaAddCustomMetadata(b, custom)
+    schema = Meta.schemaEnd(b)
+    Meta.messageStart(b)
+    Meta.messageAddVersion(b, Meta.MetadataVersion.V5)
+    Meta.messageAddHeaderType(b, Meta.Schema)
+    Meta.messageAddHeader(b, schema)
+    msg = Meta.messageEnd(b)
+    FB.finish!(b, msg)
+    meta = collect(FB.finishedbytes(b))
+    resize!(meta, 8cld(length(meta), 8))
+    out = UInt8[]
+    append!(out, reinterpret(UInt8,
+        UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
+    append!(out, meta)
+    append!(out, reinterpret(UInt8, UInt32[UInt32(CONTINUATION), 0]))
+    return out
+end
+
 # ---------------------------------------------------------------------------
 # Acceptance: 2.x writes, Core reads
 # ---------------------------------------------------------------------------
@@ -1392,6 +1440,11 @@ function main()
     @assert isempty(materialize(emptybuffers.schema.fields[1],
         emptybuffers.batches[1].columns[1]))
     println("empty struct vectors need no nominal element alignment ✓")
+
+    emptyvalue = readstream(_metadata_value_stream(true))
+    @assert collect(emptyvalue.schema.metadata) == ["owner" => ""]
+    @assert _rejects(() -> readstream(_metadata_value_stream(false)))
+    println("metadata values are present, including explicit empty strings ✓")
 
     expected = (
         ints=Int64[1, 2, 3, 4, 5],
