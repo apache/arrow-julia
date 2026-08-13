@@ -525,6 +525,30 @@ end
         namef, named = fromjulia(invalidname, Int64[1])
         @test_throws ValidationError validate_structural(namef, named)
 
+        badtimeunit = reinterpret(AC.TimeUnit, UInt8(0xff))
+        baddateunit = reinterpret(AC.DateUnit, UInt8(0xff))
+        badintervalunit = reinterpret(AC.IntervalUnit, UInt8(0xff))
+        badunionmode = reinterpret(AC.UnionMode, UInt8(0xff))
+        for t in (
+            DateType(baddateunit),
+            TimeType(badtimeunit, 64),
+            TimestampType(badtimeunit, nothing),
+            DurationType(badtimeunit),
+            IntervalType(badintervalunit),
+        )
+            spec = layoutspec(t)
+            d = AC.ArrayData(t, 0,
+                [BufferSlice() for _ in spec.buffers]; nullcount=0)
+            @test_throws ValidationError validate_structural(Field("bad", t), d)
+        end
+
+        cf, cd = fromjulia("item", Int64[])
+        badunion = UnionType(badunionmode, Int8[0])
+        baduniondata = AC.ArrayData(badunion, 0,
+            [BufferSlice(), BufferSlice()]; children=[cd], nullcount=0)
+        @test_throws ValidationError validate_structural(
+            Field("bad-union", badunion; children=[cf]), baduniondata)
+
         if Sys.WORD_SIZE > 32
             for scale in (Int(typemin(Int32)) - 1, Int(typemax(Int32)) + 1)
                 badscale = DecimalType(1, scale, 32)

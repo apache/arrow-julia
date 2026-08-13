@@ -850,13 +850,29 @@ function _validate_descriptor(t::DecimalType)
 end
 _validate_descriptor(t::FixedSizeBinaryType) = 0 <= t.nbytes <= typemax(Int32) ||
     throw(ValidationError("fixed-size-binary width must be in [0, $(typemax(Int32))]"))
+_validate_descriptor(t::DateType) = t.unit in (DAY, MILLISECOND_DATE) ||
+    throw(ValidationError("invalid Arrow date unit $(repr(t.unit))"))
 function _validate_descriptor(t::TimeType)
+    t.unit in (SECOND, MILLISECOND, MICROSECOND, NANOSECOND) ||
+        throw(ValidationError("invalid Arrow time unit $(repr(t.unit))"))
     valid = t.unit in (SECOND, MILLISECOND) ? t.bits == 32 : t.bits == 64
     valid || throw(ValidationError("time unit $(t.unit) is incompatible with $(t.bits)-bit storage"))
     return nothing
 end
+_validate_descriptor(t::TimestampType) =
+    t.unit in (SECOND, MILLISECOND, MICROSECOND, NANOSECOND) ||
+        throw(ValidationError("invalid Arrow timestamp unit $(repr(t.unit))"))
+_validate_descriptor(t::DurationType) =
+    t.unit in (SECOND, MILLISECOND, MICROSECOND, NANOSECOND) ||
+        throw(ValidationError("invalid Arrow duration unit $(repr(t.unit))"))
+_validate_descriptor(t::IntervalType) =
+    t.unit in (YEAR_MONTH, DAY_TIME, MONTH_DAY_NANO) ||
+        throw(ValidationError("invalid Arrow interval unit $(repr(t.unit))"))
 _validate_descriptor(t::FixedSizeListType) = 0 <= t.listsize <= typemax(Int32) ||
     throw(ValidationError("fixed-size-list size must be in [0, $(typemax(Int32))]"))
+_validate_descriptor(t::UnionType) =
+    t.mode in (SparseMode, DenseMode) ||
+        throw(ValidationError("invalid Arrow union mode $(repr(t.mode))"))
 function _validate_descriptor(t::DictionaryType)
     _validate_descriptor(t.indextype)
     _validate_descriptor(t.valuetype)
