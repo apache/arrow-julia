@@ -208,8 +208,13 @@ are copied into dictionaries, so duplicate keys and original ordering are not
 lossless. `IPCStream` is a single-owner pull cursor. Overlapping `nextbatch!`
 calls throw `ConcurrencyViolationError`.
 
-The C Data example maps Boolean, integer, floating point, UTF-8, binary, list,
-struct, map, and dictionary formats. Other Core layouts are not mapped. Field
+The C Data example maps the same descriptor set Core's accessors cover:
+Boolean, integer, floating point, null, decimal (32/64/128/256 widths in the
+`d:` form), date, time, timestamp (with and without timezone), duration, all
+three interval units, UTF-8 and binary (both offset widths), fixed-size
+binary, list, large list, fixed-size list, struct, map, sparse and dense
+union (type ids carried in the format string), and dictionary. View and REE
+formats are refused (the Core scope boundary). Field
 metadata is omitted on export and ignored on import; dictionary value-schema
 names, nullability, and metadata are not a lossless round trip. Foreign
 allocation extents cannot be verified by the ABI and remain trusted

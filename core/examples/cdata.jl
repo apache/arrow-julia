@@ -110,23 +110,65 @@ const ARROW_FLAG_ALL_SUPPORTED = ARROW_FLAG_NULLABLE |
     ARROW_FLAG_DICTIONARY_ORDERED | ARROW_FLAG_MAP_KEYS_SORTED
 
 # ---------------------------------------------------------------------------
-# Format strings <-> Core descriptors (the subset the demo exercises)
+# Format strings <-> Core descriptors (parity with Core's accessor set)
 # ---------------------------------------------------------------------------
+
+_tuchar(u) = u == AC.SECOND ? "s" : u == AC.MILLISECOND ? "m" :
+    u == AC.MICROSECOND ? "u" : "n"
 
 formatstring(t::IntType) =
     (t.signed ? Dict(8 => "c", 16 => "s", 32 => "i", 64 => "l") :
      Dict(8 => "C", 16 => "S", 32 => "I", 64 => "L"))[t.bits]
 formatstring(t::FloatType) = Dict(16 => "e", 32 => "f", 64 => "g")[t.bits]
 formatstring(::BoolType) = "b"
+formatstring(::NullType) = "n"
 formatstring(t::Utf8Type) = t.large ? "U" : "u"
 formatstring(t::BinaryType) = t.large ? "Z" : "z"
+formatstring(t::FixedSizeBinaryType) = "w:$(t.nbytes)"
+formatstring(t::DecimalType) =
+    t.bits == 128 ? "d:$(t.precision),$(t.scale)" :
+    "d:$(t.precision),$(t.scale),$(t.bits)"
+formatstring(t::DateType) = t.unit == AC.DAY ? "tdD" : "tdm"
+formatstring(t::TimeType) = "tt" * _tuchar(t.unit)
+formatstring(t::TimestampType) =
+    "ts" * _tuchar(t.unit) * ":" * something(t.timezone, "")
+formatstring(t::DurationType) = "tD" * _tuchar(t.unit)
+formatstring(t::IntervalType) = t.unit == AC.YEAR_MONTH ? "tiM" :
+    t.unit == AC.DAY_TIME ? "tiD" : "tin"
 formatstring(t::ListType) = t.large ? "+L" : "+l"
+formatstring(t::FixedSizeListType) = "+w:$(t.listsize)"
 formatstring(::StructType) = "+s"
 formatstring(::MapType) = "+m"
+formatstring(t::UnionType) =
+    (t.mode == AC.SparseMode ? "+us:" : "+ud:") * join(Int.(t.typeids), ",")
 formatstring(t::DictionaryType) = formatstring(t.indextype)  # per spec: index format; values on schema.dictionary
+
+_formaterror(fmt) = throw(ValidationError(
+    "cdata prove-out: unmapped format string \"$fmt\"; view and REE C-data " *
+    "mapping is outside this prove-out"))
+
+function _parseformatint(fmt, s, what; low=0, high=typemax(Int32))
+    n = tryparse(Int64, s)
+    (n === nothing || !(low <= n <= high)) &&
+        throw(ValidationError("invalid $what in C format string \"$fmt\""))
+    return Int(n)
+end
+
+_parsetimeunit(fmt, c) = c == 's' ? AC.SECOND : c == 'm' ? AC.MILLISECOND :
+    c == 'u' ? AC.MICROSECOND : c == 'n' ? AC.NANOSECOND : _formaterror(fmt)
+
+function _parseunionids(fmt, body)
+    ids = Int8[]
+    isempty(body) && return ids
+    for part in split(body, ',')
+        push!(ids, Int8(_parseformatint(fmt, part, "union type id"; high=127)))
+    end
+    return ids
+end
 
 function parseformat(fmt::AbstractString, flags::Int64=0)::ArrowType
     fmt == "b" && return BoolType()
+    fmt == "n" && return NullType()
     fmt == "u" && return Utf8Type(false)
     fmt == "U" && return Utf8Type(true)
     fmt == "z" && return BinaryType(false)
@@ -138,10 +180,47 @@ function parseformat(fmt::AbstractString, flags::Int64=0)::ArrowType
     fmt == "e" && return FloatType(16)
     fmt == "f" && return FloatType(32)
     fmt == "g" && return FloatType(64)
+    fmt == "tdD" && return DateType(AC.DAY)
+    fmt == "tdm" && return DateType(AC.MILLISECOND_DATE)
+    fmt == "tiM" && return IntervalType(AC.YEAR_MONTH)
+    fmt == "tiD" && return IntervalType(AC.DAY_TIME)
+    fmt == "tin" && return IntervalType(AC.MONTH_DAY_NANO)
     m = Dict("c" => (8, true), "C" => (8, false), "s" => (16, true), "S" => (16, false),
         "i" => (32, true), "I" => (32, false), "l" => (64, true), "L" => (64, false))
     haskey(m, fmt) && return IntType(m[fmt]...)
-    error("cdata prove-out: unmapped format string \"$fmt\"")
+    if length(fmt) == 3 && startswith(fmt, "tt")
+        u = _parsetimeunit(fmt, fmt[3])
+        return TimeType(u, u == AC.SECOND || u == AC.MILLISECOND ? 32 : 64)
+    end
+    length(fmt) == 3 && startswith(fmt, "tD") &&
+        return DurationType(_parsetimeunit(fmt, fmt[3]))
+    if startswith(fmt, "ts") && length(fmt) >= 4 && fmt[4] == ':'
+        u = _parsetimeunit(fmt, fmt[3])
+        tz = fmt[5:end]
+        return TimestampType(u, isempty(tz) ? nothing : String(tz))
+    end
+    if startswith(fmt, "w:")
+        return FixedSizeBinaryType(_parseformatint(fmt, fmt[3:end], "byte width"))
+    end
+    if startswith(fmt, "+w:")
+        return FixedSizeListType(_parseformatint(fmt, fmt[4:end], "list size"))
+    end
+    if startswith(fmt, "d:")
+        parts = split(fmt[3:end], ',')
+        2 <= length(parts) <= 3 ||
+            throw(ValidationError("invalid decimal C format string \"$fmt\""))
+        precision = _parseformatint(fmt, parts[1], "decimal precision")
+        scale = _parseformatint(fmt, parts[2], "decimal scale";
+            low=typemin(Int32))
+        bits = length(parts) == 3 ?
+            _parseformatint(fmt, parts[3], "decimal bit width") : 128
+        return DecimalType(precision, scale, bits)
+    end
+    startswith(fmt, "+us:") &&
+        return UnionType(AC.SparseMode, _parseunionids(fmt, fmt[5:end]))
+    startswith(fmt, "+ud:") &&
+        return UnionType(AC.DenseMode, _parseunionids(fmt, fmt[5:end]))
+    _formaterror(fmt)
 end
 
 # ---------------------------------------------------------------------------
@@ -943,6 +1022,8 @@ function _import_field(sch::CArrowSchema)::Field
     for i = 1:sch.n_children
         push!(children, _import_field(unsafe_load(unsafe_load(sch.children, i))))
     end
+    t isa UnionType && length(t.typeids) != length(children) &&
+        throw(ValidationError("union format declares $(length(t.typeids)) type ids for $(length(children)) children"))
     if sch.dictionary != C_NULL
         vf = _import_field(unsafe_load(sch.dictionary))
         t isa IntType || throw(ValidationError("dictionary index format must be an integer"))
@@ -997,8 +1078,16 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
                     end
                 end
             end
+        elseif role == AC.TYPE_IDS
+            # One Int8 discriminator per union slot.
+            total
+        elseif role == AC.ELEMENT_OFFSETS
+            # Dense-union offsets are per-slot values, not monotone ranges:
+            # exactly `total` entries, no +1 terminator.
+            AC.checked_mul(total, Int64(spec.offsetwidth))
         else
-            error("cdata prove-out: role $role import is roadmap slice work")
+            throw(ValidationError(
+                "cdata prove-out: $role buffers belong to view layouts, which are outside this prove-out"))
         end
         if p == C_NULL
             nbytes == 0 || throw(ValidationError("NULL $role buffer with nonzero required size"))
@@ -1398,6 +1487,118 @@ function main()
         @assert (@atomic (d2.owner::ForeignOwner).released)
     end
     println("released owners are flagged; post-release access is out of contract ✓")
+
+    # Format parity with Core's accessor set: every mapped descriptor
+    # round-trips its format string, declared geometry, and values through
+    # the raw C ABI. Ground truth is the SOURCE column's materialization.
+    fslu, _ = fromjulia("fsl-child", Int64[1, 2, 3, 4])
+    sui, sud = fromjulia("i", Int64[10, 20, 30])
+    sus, susd = fromjulia("s", ["x", "y", "z"])
+    dui, duid = fromjulia("i", Int64[10, 30])
+    dus, dusd = fromjulia("s", ["y"])
+    sut = UnionType(AC.SparseMode, Int8[0, 1])
+    dut = UnionType(AC.DenseMode, Int8[0, 1])
+    tsnulls = TimestampType(AC.MICROSECOND, "UTC")
+    paritycases = Tuple{Field,ArrayData}[
+        (Field("dec128", DecimalType(38, 10, 128)),
+            ArrayData(DecimalType(38, 10, 128), 2,
+                [BufferSlice(), AC._databuffer(Int128[123, -456])]; nullcount=0)),
+        (Field("dec32", DecimalType(9, 2, 32)),
+            ArrayData(DecimalType(9, 2, 32), 2,
+                [BufferSlice(), AC._databuffer(Int32[1234, -5678])]; nullcount=0)),
+        (Field("date32", DateType(AC.DAY)),
+            ArrayData(DateType(AC.DAY), 2,
+                [BufferSlice(), AC._databuffer(Int32[0, 19000])]; nullcount=0)),
+        (Field("date64", DateType(AC.MILLISECOND_DATE)),
+            ArrayData(DateType(AC.MILLISECOND_DATE), 2,
+                [BufferSlice(), AC._databuffer(Int64[0, 86_400_000])]; nullcount=0)),
+        (Field("time32s", TimeType(AC.SECOND, 32)),
+            ArrayData(TimeType(AC.SECOND, 32), 2,
+                [BufferSlice(), AC._databuffer(Int32[0, 86_399])]; nullcount=0)),
+        (Field("time64n", TimeType(AC.NANOSECOND, 64)),
+            ArrayData(TimeType(AC.NANOSECOND, 64), 2,
+                [BufferSlice(), AC._databuffer(Int64[0, 12_345])]; nullcount=0)),
+        (Field("ts-utc", tsnulls),
+            ArrayData(tsnulls, 3,
+                [AC._databuffer(UInt8[0x05]), AC._databuffer(Int64[7, 0, 9])];
+                nullcount=1)),
+        (Field("ts-naive", TimestampType(AC.SECOND, nothing)),
+            ArrayData(TimestampType(AC.SECOND, nothing), 1,
+                [BufferSlice(), AC._databuffer(Int64[42])]; nullcount=0)),
+        (Field("dur", DurationType(AC.MILLISECOND)),
+            ArrayData(DurationType(AC.MILLISECOND), 2,
+                [BufferSlice(), AC._databuffer(Int64[5, -5])]; nullcount=0)),
+        (Field("iym", IntervalType(AC.YEAR_MONTH)),
+            ArrayData(IntervalType(AC.YEAR_MONTH), 2,
+                [BufferSlice(), AC._databuffer(Int32[12, -1])]; nullcount=0)),
+        (Field("idt", IntervalType(AC.DAY_TIME)),
+            ArrayData(IntervalType(AC.DAY_TIME), 2,
+                [BufferSlice(), AC._databuffer(Int32[1, 2, 3, 4])]; nullcount=0)),
+        (Field("imdn", IntervalType(AC.MONTH_DAY_NANO)),
+            ArrayData(IntervalType(AC.MONTH_DAY_NANO), 1,
+                [BufferSlice(), AC._databuffer(
+                    vcat(reinterpret(UInt8, Int32[1, 2]),
+                        reinterpret(UInt8, Int64[3])))]; nullcount=0)),
+        (Field("fsb", FixedSizeBinaryType(3)),
+            ArrayData(FixedSizeBinaryType(3), 2,
+                [BufferSlice(), AC._databuffer(collect(codeunits("abcdef")))]; nullcount=0)),
+        (Field("fsl", FixedSizeListType(2); children=[fslu]),
+            ArrayData(FixedSizeListType(2), 2, [BufferSlice()];
+                children=[fromjulia("fsl-child", Int64[1, 2, 3, 4])[2]],
+                nullcount=0)),
+        (Field("lu", Utf8Type(true)),
+            ArrayData(Utf8Type(true), 2,
+                [BufferSlice(), AC._databuffer(Int64[0, 1, 3]),
+                 AC._databuffer(collect(codeunits("abc")))]; nullcount=0)),
+        (Field("lz", BinaryType(true)),
+            ArrayData(BinaryType(true), 2,
+                [BufferSlice(), AC._databuffer(Int64[0, 2, 3]),
+                 AC._databuffer(UInt8[0x01, 0x02, 0x03])]; nullcount=0)),
+        (Field("ll", ListType(true); children=[fslu]),
+            ArrayData(ListType(true), 2,
+                [BufferSlice(), AC._databuffer(Int64[0, 2, 4])];
+                children=[fromjulia("fsl-child", Int64[1, 2, 3, 4])[2]],
+                nullcount=0)),
+        (Field("su", sut; nullable=false, children=[sui, sus]),
+            ArrayData(sut, 3, [AC._databuffer(Int8[0, 1, 0])];
+                children=[sud, susd], nullcount=0)),
+        (Field("du", dut; nullable=false, children=[dui, dus]),
+            ArrayData(dut, 3,
+                [AC._databuffer(Int8[0, 1, 0]), AC._databuffer(Int32[0, 0, 1])];
+                children=[duid, dusd], nullcount=0)),
+        (Field("nulls", NullType()),
+            ArrayData(NullType(), 3, BufferSlice[]; nullcount=3)),
+    ]
+    for (f, d) in paritycases
+        want = collect(Any, materialize(f, d))
+        sp, ap = to_c_data(f, d)
+        f2, d2 = from_c_data(sp, ap)
+        @assert AC.typeequal(f2.type, f.type) f.name
+        @assert isequal(collect(Any, materialize(f2, d2)), want) f.name
+        release!(d2.owner::ForeignOwner)
+    end
+    @assert reap!() == 2 * length(paritycases)
+    println("format parity round-trips for $(length(paritycases)) descriptor shapes ✓")
+
+    # Format-string spot checks and refusals.
+    @assert formatstring(DecimalType(38, 10, 128)) == "d:38,10"
+    @assert formatstring(DecimalType(9, 2, 32)) == "d:9,2,32"
+    @assert formatstring(TimestampType(AC.MICROSECOND, "UTC")) == "tsu:UTC"
+    @assert formatstring(TimestampType(AC.SECOND, nothing)) == "tss:"
+    @assert formatstring(IntervalType(AC.MONTH_DAY_NANO)) == "tin"
+    @assert formatstring(UnionType(AC.DenseMode, Int8[0, 1])) == "+ud:0,1"
+    @assert formatstring(FixedSizeListType(2)) == "+w:2"
+    @assert parseformat("tsu:UTC") == TimestampType(AC.MICROSECOND, "UTC")
+    @assert parseformat("d:38,10") == DecimalType(38, 10, 128)
+    for bad in ("vu", "vz", "+vl", "+r", "d:x", "w:", "tsq:", "+ud:200")
+        @assert try
+            parseformat(bad)
+            false
+        catch e
+            e isa ValidationError
+        end (bad)
+    end
+    println("format strings map both ways and refuse view/REE/corrupt forms ✓")
 
     # Import of an already-released structure is refused.
     f, col = b.schema.fields[1], b.columns[1]
