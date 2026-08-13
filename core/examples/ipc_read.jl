@@ -462,7 +462,17 @@ or lying stream is an error here — not a silent early return (the current
 framer returns `nothing` on truncation, src/table.jl:679-708) and not a
 segfault three batches later.
 """
-function framemessages(region::OwnerRegion, limits::Limits=Limits())
+framemessages(region::OwnerRegion, limits::Limits=Limits()) =
+    _framemessages(region, limits, Base.ENDIAN_BOM)
+
+function _framemessages(region::OwnerRegion, limits::Limits,
+    host_endian_bom::UInt32)
+    # The borrowed generated FlatBuffers bindings use native-endian scalar
+    # loads. Reject an unsupported host before any generated getter sees the
+    # little-endian wire bytes. The explicit argument keeps this ordering
+    # testable on the supported little-endian CI host.
+    host_endian_bom == UInt32(0x04030201) ||
+        throw(ValidationError("this prove-out requires a little-endian host"))
     limits.max_metadata_bytes >= 0 || throw(ArgumentError("negative metadata limit"))
     limits.max_body_bytes >= 0 || throw(ArgumentError("negative body limit"))
     limits.max_buffer_bytes >= 0 || throw(ArgumentError("negative buffer limit"))
@@ -914,8 +924,6 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
     endian = something(metaschema.endianness, Meta.Endianness.Little)
     endian == Meta.Endianness.Little ||
         throw(ValidationError("big-endian IPC requires normalization, which is outside this prove-out"))
-    Base.ENDIAN_BOM == 0x04030201 ||
-        throw(ValidationError("this prove-out requires a little-endian host"))
     dictids = Dict{Int64,Meta.Field}()
     fielddictids = IdDict{Field,Int64}()   # adapter-side id table (report §9)
     fields = Field[corefield(f, dictids, fielddictids)
@@ -1334,6 +1342,15 @@ end
 # ---------------------------------------------------------------------------
 
 function main()
+    hostgate = try
+        _framemessages(heapregion(UInt8[]), Limits(), UInt32(0x01020304))
+        false
+    catch e
+        e isa ValidationError && occursin("little-endian host", e.msg)
+    end
+    @assert hostgate
+    println("unsupported hosts fail before generated metadata getters ✓")
+
     expected = (
         ints=Int64[1, 2, 3, 4, 5],
         floats=[1.5, missing, 3.5, missing, 5.5],

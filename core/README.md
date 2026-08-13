@@ -120,6 +120,8 @@ plus distinct pool data.
 The IPC adapter runs structural and semantic Core validation before it exposes
 a batch. It does not opt into `validate_full`, so UTF-8 body content is not
 checked. The byte-wise metadata verifier does validate FlatBuffer strings.
+The framer rejects a non-little-endian host before it calls the older generated
+FlatBuffers getters, which use native-endian scalar loads.
 
 The IPC example reads one borrowed `Vector{UInt8}` and eagerly decodes all
 batches before it exposes the `RecordBatchSource` pull interface. The caller
