@@ -213,7 +213,7 @@ function _claim_schema_node(s::Ptr{CArrowSchema}, claimed_slot,
     end
 end
 
-function _finish_node!(p, control::Ptr{Cvoid}, claimed_slot,
+function _finish_node!(p, control::Ptr{Cvoid}, claimed_slot, committed_slot,
     after_step=nothing)
     # This locked block is the callback's final access to export-owned memory.
     # The reaper observes zero only after every non-moved descendant callback,
@@ -240,11 +240,12 @@ function _finish_node!(p, control::Ptr{Cvoid}, claimed_slot,
                 # zero: a reaper may free it as soon as this lock is released.
                 # Transfer the completed claim while the lock still excludes
                 # cleanup. A later exception observes a committed callback.
+                committed_slot[] = true
                 claimed_slot[] = nothing
                 after_step === nothing || after_step(:commit)
             end
         catch
-            if claimed_slot[] !== nothing
+            if !committed_slot[]
                 # Nothing can reap this root while the registry lock is held.
                 # Restore the whole commit before the outer transaction
                 # returns the node from RELEASING to LIVE. This rollback may
@@ -339,45 +340,51 @@ function _release_schema_children!(topology, after_child=nothing)
 end
 
 function _release_array_impl(a::Ptr{CArrowArray}, after_claim=nothing,
-    after_child=nothing, after_finish=nothing, after_commit=nothing)
+    after_child=nothing, after_finish=nothing, after_commit=nothing,
+    committed_slot=Ref(false))
     claimed_slot = Ref{Any}(nothing)
     try
         claimed = _claim_array_node(a, claimed_slot, after_claim)
         claimed === nothing && return nothing
         control, topology = claimed
         _release_array_children!(topology, after_child)
-        _finish_node!(a, control, claimed_slot, after_finish)
+        _finish_node!(a, control, claimed_slot, committed_slot, after_finish)
         after_commit === nothing || after_commit()
     catch
         # Descendant releases are idempotent: a completed child has a NULL
         # callback and a retry skips it. Return this node to LIVE so a failed
         # transaction never leaves its aggregate root and source pins stuck.
-        claimed = claimed_slot[]
-        claimed === nothing || _reset_node_claim_noescape!(claimed[1])
+        if !committed_slot[]
+            claimed = claimed_slot[]
+            claimed === nothing || _reset_node_claim_noescape!(claimed[1])
+        end
         rethrow()
     end
     return nothing
 end
 
 function _release_schema_impl(s::Ptr{CArrowSchema}, after_claim=nothing,
-    after_child=nothing, after_finish=nothing, after_commit=nothing)
+    after_child=nothing, after_finish=nothing, after_commit=nothing,
+    committed_slot=Ref(false))
     claimed_slot = Ref{Any}(nothing)
     try
         claimed = _claim_schema_node(s, claimed_slot, after_claim)
         claimed === nothing && return nothing
         control, topology = claimed
         _release_schema_children!(topology, after_child)
-        _finish_node!(s, control, claimed_slot, after_finish)
+        _finish_node!(s, control, claimed_slot, committed_slot, after_finish)
         after_commit === nothing || after_commit()
     catch
-        claimed = claimed_slot[]
-        claimed === nothing || _reset_node_claim_noescape!(claimed[1])
+        if !committed_slot[]
+            claimed = claimed_slot[]
+            claimed === nothing || _reset_node_claim_noescape!(claimed[1])
+        end
         rethrow()
     end
     return nothing
 end
 
-function _run_release_callback(f)
+function _run_release_callback(f, committed_slot=Ref(false))
     # Arrow release callbacks have a void C signature and no error channel.
     # Do not return to the consumer until one idempotent transaction completes.
     while true
@@ -388,6 +395,7 @@ function _run_release_callback(f)
                         f()
                         return nothing
                     catch
+                        committed_slot[] && return nothing
                         # _release_*_impl returns its node to LIVE before an
                         # exception reaches this boundary. Completed children
                         # are NULL, so the next transaction skips them.
@@ -396,6 +404,7 @@ function _run_release_callback(f)
             end
             return nothing
         catch
+            committed_slot[] && return nothing
             # SIGINT can arrive immediately before signals are disabled or as
             # normal delivery is restored. The callback is still idempotent.
         end
@@ -404,18 +413,20 @@ end
 
 function _release_array_entry(a::Ptr{CArrowArray}, after_claim=nothing,
     after_child=nothing, after_finish=nothing, after_commit=nothing)
-    _run_release_callback() do
+    committed_slot = Ref(false)
+    _run_release_callback(committed_slot) do
         _release_array_impl(a, after_claim, after_child, after_finish,
-            after_commit)
+            after_commit, committed_slot)
     end
     return nothing
 end
 
 function _release_schema_entry(s::Ptr{CArrowSchema}, after_claim=nothing,
     after_child=nothing, after_finish=nothing, after_commit=nothing)
-    _run_release_callback() do
+    committed_slot = Ref(false)
+    _run_release_callback(committed_slot) do
         _release_schema_impl(s, after_claim, after_child, after_finish,
-            after_commit)
+            after_commit, committed_slot)
     end
     return nothing
 end
@@ -456,8 +467,12 @@ _malloc!(root::ExportedRoot, n::Integer,
     catch
         if owned
             if length(root.mallocs) == oldlen
-                _retry_interrupts(() -> deallocate!(p))
-                owned = false
+                _retry_interrupts() do
+                    if owned
+                        deallocate!(p)
+                        owned = false
+                    end
+                end
             elseif length(root.mallocs) == oldlen + 1 &&
                     root.mallocs[end] == p
                 owned = false
@@ -1761,15 +1776,13 @@ function main()
     csp, cap = to_c_data(cf, cd)
     ccontrol = unsafe_load(cap).private_data
     ckey = unsafe_load(Ptr{Int64}(ccontrol + 8))
-    @assert try
-        _release_array_impl(cap, nothing, nothing, nothing, () -> begin
+    commit_attempts = Ref(0)
+    @assert _release_array_entry(cap, nothing, nothing, nothing, () -> begin
+            commit_attempts[] += 1
             @assert reap!() == 1
             throw(InterruptException())
-        end)
-        false
-    catch e
-        e isa InterruptException
-    end
+        end) === nothing
+    @assert commit_attempts[] == 1
     @assert !lock(REGISTRY_LOCK) do
         haskey(EXPORT_REGISTRY, ckey)
     end
