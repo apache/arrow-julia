@@ -133,6 +133,27 @@ const AC = ArrowCore
         @test calls[] == 1
         @test AC.phase(@atomic r.state) == AC.PHASE_CLOSED
     end
+
+    @testset "delegated lifecycles share one root gate" begin
+        bytes = UInt8[0]
+        calls = Ref(0)
+        gate = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1,
+            AC.Foreign; root=bytes, releasefn=_ -> (calls[] += 1))
+        child = AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
+            root=bytes, lifecycle=gate)
+        grandchild = AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
+            root=bytes, lifecycle=child)
+
+        @test grandchild.lifecycle === gate
+        withguard(grandchild) do
+            @test !forceclose!(gate; timeout_ms=0)
+            @test calls[] == 0
+            @test AC.phase(@atomic gate.state) == AC.PHASE_OPEN
+        end
+        @test forceclose!(gate; timeout_ms=0)
+        @test calls[] == 1
+        @test_throws InvalidatedError withguard(() -> nothing, grandchild)
+    end
 end
 
 @testset "BufferSlice bounds" begin

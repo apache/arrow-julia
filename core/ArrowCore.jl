@@ -159,6 +159,11 @@ mutable struct OwnerRegion
             throw(ArgumentError("a non-empty region requires a non-NULL pointer"))
         lifecycle !== nothing && releasefn !== nothing &&
             throw(ArgumentError("a shared-lifecycle region cannot own a release callback"))
+        # Keep delegation one hop deep. Otherwise a region that delegates to
+        # another delegated region increments the intermediate guard count,
+        # while closing the root gate can still observe zero guards and
+        # release memory underneath that access.
+        lifecycle = lifecycle === nothing ? nothing : _lifecycle(lifecycle)
         align = ptr == C_NULL ? 64 : (1 << trailing_zeros(UInt(ptr) | UInt(64)))
         r = new(ptr, Int64(len), kind, align, root, lifecycle,
             releasefn, PHASE_OPEN, 0)
