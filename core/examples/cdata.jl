@@ -167,8 +167,7 @@ end
 const EXPORT_REGISTRY = Dict{Int64,ExportedRoot}()
 const REGISTRY_LOCK = ReentrantLock()
 const NEXT_KEY = Ref{Int64}(0)
-function _claim_array_node(a::Ptr{CArrowArray}, claimed_slot,
-    after_claim=nothing)
+function _claim_array_node(a::Ptr{CArrowArray}, claimed_slot)
     a == C_NULL && return nothing
     return lock(REGISTRY_LOCK) do
         arr = unsafe_load(a)
@@ -185,13 +184,11 @@ function _claim_array_node(a::Ptr{CArrowArray}, claimed_slot,
         claimed = (p, topology)
         claimed_slot[] = claimed
         unsafe_store!(Ptr{UInt8}(p), 0x01)
-        after_claim === nothing || after_claim()
         return claimed
     end
 end
 
-function _claim_schema_node(s::Ptr{CArrowSchema}, claimed_slot,
-    after_claim=nothing)
+function _claim_schema_node(s::Ptr{CArrowSchema}, claimed_slot)
     s == C_NULL && return nothing
     return lock(REGISTRY_LOCK) do
         sch = unsafe_load(s)
@@ -208,13 +205,11 @@ function _claim_schema_node(s::Ptr{CArrowSchema}, claimed_slot,
         claimed = (p, topology)
         claimed_slot[] = claimed
         unsafe_store!(Ptr{UInt8}(p), 0x01)
-        after_claim === nothing || after_claim()
         return claimed
     end
 end
 
-function _finish_node!(p, control::Ptr{Cvoid}, claimed_slot, committed_slot,
-    after_step=nothing)
+function _finish_node!(p, control::Ptr{Cvoid}, claimed_slot, committed_slot)
     # This locked block is the callback's final access to export-owned memory.
     # The reaper observes zero only after every non-moved descendant callback,
     # and every independently moved node callback, has completed. Scanning in
@@ -229,32 +224,23 @@ function _finish_node!(p, control::Ptr{Cvoid}, claimed_slot, committed_slot,
         oldremaining = root.remaining
         oldrelease = unsafe_load(p).release
         try
-            begin
-                root.remaining = oldremaining - 1
-                after_step === nothing || after_step(:remaining)
-                unsafe_store!(Ptr{UInt8}(control), 0x02)
-                after_step === nothing || after_step(:control)
-                _store_field!(p, :release, Ptr{Cvoid}(C_NULL))
-                after_step === nothing || after_step(:release)
-                # The outer catch must not touch `control` once remaining is
-                # zero: a reaper may free it as soon as this lock is released.
-                # Transfer the completed claim while the lock still excludes
-                # cleanup. A later exception observes a committed callback.
-                committed_slot[] = true
-                claimed_slot[] = nothing
-                after_step === nothing || after_step(:commit)
-            end
+            root.remaining = oldremaining - 1
+            unsafe_store!(Ptr{UInt8}(control), 0x02)
+            _store_field!(p, :release, Ptr{Cvoid}(C_NULL))
+            # The outer catch must not touch `control` once remaining is
+            # zero: a reaper may free it as soon as this lock is released.
+            # Transfer the completed claim while the lock still excludes
+            # cleanup. A later exception observes a committed callback.
+            committed_slot[] = true
+            claimed_slot[] = nothing
         catch
             if !committed_slot[]
                 # Nothing can reap this root while the registry lock is held.
                 # Restore the whole commit before the outer transaction
-                # returns the node from RELEASING to LIVE. This rollback may
-                # not escape half-done after a second interruption.
-                begin
-                    root.remaining = oldremaining
-                    unsafe_store!(Ptr{UInt8}(control), 0x01)
-                    _store_field!(p, :release, oldrelease)
-                end
+                # returns the node from RELEASING to LIVE.
+                root.remaining = oldremaining
+                unsafe_store!(Ptr{UInt8}(control), 0x01)
+                _store_field!(p, :release, oldrelease)
             end
             rethrow()
         end
@@ -272,7 +258,7 @@ function _reset_node_claim!(control::Ptr{Cvoid})
 end
 
 
-function _release_array_children!(topology, after_child=nothing)
+function _release_array_children!(topology)
     children, dictionary = topology
     for child in children
         release = lock(REGISTRY_LOCK) do
@@ -284,7 +270,6 @@ function _release_array_children!(topology, after_child=nothing)
                 unsafe_load(child).release == C_NULL ||
                     error("C Data child array release did not complete")
             end
-            after_child === nothing || after_child(child)
         end
     end
     if dictionary != C_NULL
@@ -297,13 +282,12 @@ function _release_array_children!(topology, after_child=nothing)
                 unsafe_load(dictionary).release == C_NULL ||
                     error("C Data dictionary array release did not complete")
             end
-            after_child === nothing || after_child(dictionary)
         end
     end
     return nothing
 end
 
-function _release_schema_children!(topology, after_child=nothing)
+function _release_schema_children!(topology)
     children, dictionary = topology
     for child in children
         release = lock(REGISTRY_LOCK) do
@@ -315,7 +299,6 @@ function _release_schema_children!(topology, after_child=nothing)
                 unsafe_load(child).release == C_NULL ||
                     error("C Data child schema release did not complete")
             end
-            after_child === nothing || after_child(child)
         end
     end
     if dictionary != C_NULL
@@ -328,106 +311,50 @@ function _release_schema_children!(topology, after_child=nothing)
                 unsafe_load(dictionary).release == C_NULL ||
                     error("C Data dictionary schema release did not complete")
             end
-            after_child === nothing || after_child(dictionary)
         end
     end
     return nothing
 end
 
-function _release_array_impl(a::Ptr{CArrowArray}, after_claim=nothing,
-    after_child=nothing, after_finish=nothing, after_commit=nothing,
-    committed_slot=Ref(false))
+function _release_array(a::Ptr{CArrowArray})
+    committed_slot = Ref(false)
     claimed_slot = Ref{Any}(nothing)
     try
-        claimed = _claim_array_node(a, claimed_slot, after_claim)
+        claimed = _claim_array_node(a, claimed_slot)
         claimed === nothing && return nothing
         control, topology = claimed
-        _release_array_children!(topology, after_child)
-        _finish_node!(a, control, claimed_slot, committed_slot, after_finish)
-        after_commit === nothing || after_commit()
+        _release_array_children!(topology)
+        _finish_node!(a, control, claimed_slot, committed_slot)
     catch
-        # Descendant releases are idempotent: a completed child has a NULL
-        # callback and a retry skips it. Return this node to LIVE so a failed
-        # transaction never leaves its aggregate root and source pins stuck.
+        # A C release callback has no error channel, and a Julia exception
+        # must not unwind through the C ABI. Completed descendants are
+        # already NULL. Restore this node to LIVE so a later explicit call
+        # can resume without double release.
         if !committed_slot[]
             claimed = claimed_slot[]
             claimed === nothing || _reset_node_claim!(claimed[1])
         end
-        rethrow()
     end
     return nothing
 end
 
-function _release_schema_impl(s::Ptr{CArrowSchema}, after_claim=nothing,
-    after_child=nothing, after_finish=nothing, after_commit=nothing,
-    committed_slot=Ref(false))
+function _release_schema(s::Ptr{CArrowSchema})
+    committed_slot = Ref(false)
     claimed_slot = Ref{Any}(nothing)
     try
-        claimed = _claim_schema_node(s, claimed_slot, after_claim)
+        claimed = _claim_schema_node(s, claimed_slot)
         claimed === nothing && return nothing
         control, topology = claimed
-        _release_schema_children!(topology, after_child)
-        _finish_node!(s, control, claimed_slot, committed_slot, after_finish)
-        after_commit === nothing || after_commit()
+        _release_schema_children!(topology)
+        _finish_node!(s, control, claimed_slot, committed_slot)
     catch
         if !committed_slot[]
             claimed = claimed_slot[]
             claimed === nothing || _reset_node_claim!(claimed[1])
         end
-        rethrow()
     end
     return nothing
 end
-
-function _run_release_callback(f, committed_slot=Ref(false))
-    # Arrow release callbacks have a void C signature and no error channel.
-    # Do not return to the consumer until one idempotent transaction completes.
-    while true
-        try
-            begin
-                while true
-                    try
-                        f()
-                        return nothing
-                    catch
-                        committed_slot[] && return nothing
-                        # _release_*_impl returns its node to LIVE before an
-                        # exception reaches this boundary. Completed children
-                        # are NULL, so the next transaction skips them.
-                    end
-                end
-            end
-            return nothing
-        catch
-            committed_slot[] && return nothing
-            # SIGINT can arrive immediately before signals are disabled or as
-            # normal delivery is restored. The callback is still idempotent.
-        end
-    end
-end
-
-function _release_array_entry(a::Ptr{CArrowArray}, after_claim=nothing,
-    after_child=nothing, after_finish=nothing, after_commit=nothing)
-    committed_slot = Ref(false)
-    _run_release_callback(committed_slot) do
-        _release_array_impl(a, after_claim, after_child, after_finish,
-            after_commit, committed_slot)
-    end
-    return nothing
-end
-
-function _release_schema_entry(s::Ptr{CArrowSchema}, after_claim=nothing,
-    after_child=nothing, after_finish=nothing, after_commit=nothing)
-    committed_slot = Ref(false)
-    _run_release_callback(committed_slot) do
-        _release_schema_impl(s, after_claim, after_child, after_finish,
-            after_commit, committed_slot)
-    end
-    return nothing
-end
-
-_release_array(a::Ptr{CArrowArray}) = _release_array_entry(a)
-_release_schema(s::Ptr{CArrowSchema}) = _release_schema_entry(s)
 
 # Store one field of a C struct in place (structs are immutable in Julia;
 # the C memory is not).
@@ -440,8 +367,7 @@ end
 _store_field!(p, name::Symbol, v) = _store_field!(p, Val(name), v)
 
 _malloc!(root::ExportedRoot, n::Integer,
-    register! = push!, deallocate! = Libc.free;
-    allocator = Libc.malloc, after_allocate=nothing) = begin
+    register! = push!, deallocate! = Libc.free) = begin
     n >= 0 || throw(ArgumentError("negative export allocation size"))
     n64 = Int64(n)
     # Reserve the ledger slot before acquiring native memory. After malloc,
@@ -451,22 +377,17 @@ _malloc!(root::ExportedRoot, n::Integer,
     p = Ptr{Cvoid}(C_NULL)
     owned = false
     try
-        begin
-            p = allocator(max(n64, Int64(1)))
-            p == C_NULL && throw(OutOfMemoryError())
-            owned = true
-            after_allocate === nothing || after_allocate(p)
-            register!(root.mallocs, p)
-            owned = false
-        end
+        p = Libc.malloc(max(n64, Int64(1)))
+        p == C_NULL && throw(OutOfMemoryError())
+        owned = true
+        register!(root.mallocs, p)
+        owned = false
     catch
         if owned
             if length(root.mallocs) == oldlen
-                begin
-                    if owned
-                        deallocate!(p)
-                        owned = false
-                    end
+                if owned
+                    deallocate!(p)
+                    owned = false
                 end
             elseif length(root.mallocs) == oldlen + 1 &&
                     root.mallocs[end] == p
@@ -580,16 +501,13 @@ that structure tree released. Moved descendants defer aggregate cleanup.
 The array root also holds source-region pins until it is reaped.
 """
 function _build_c_data!(sp, skey, ap, akey, f::Field, d::ArrayData,
-    arel, srel;
-    after_schema=nothing, after_array=nothing)
+    arel, srel)
     _newroot(Any[f]; result_slot=sp, key_slot=skey) do root
         _export_schema!(root, f, srel)
     end
-    after_schema === nothing || after_schema(sp[])
     _newroot(Any[d], d; result_slot=ap, key_slot=akey) do root
         _export_array!(root, d, arel)
     end
-    after_array === nothing || after_array(ap[])
     return nothing
 end
 
@@ -609,10 +527,8 @@ function to_c_data(f::Field, d::ArrayData)
         # The exact public method owns both output slots until its tuple return.
         # A helper cannot lose a published pointer at its own return boundary:
         # _newroot records each result in the caller's slot when it publishes.
-        return begin
-            _build_c_data!(sp, skey, ap, akey, f, d, arel, srel)
-            return sp[], ap[]
-        end
+        _build_c_data!(sp, skey, ap, akey, f, d, arel, srel)
+        return sp[], ap[]
     catch
         # Schema and array are separate C lifetimes, but export is one API
         # transaction. Neither has escaped on this path, so discard both.
@@ -636,32 +552,26 @@ end
 
 function _release_pins!(pins::Vector{OwnerRegion})
     while !isempty(pins)
-        begin
-            AC._releaseguard!(last(pins))
-            pop!(pins)
-        end
+        AC._releaseguard!(last(pins))
+        pop!(pins)
     end
     return nothing
 end
 
-function _pin_regions!(root::ExportedRoot, d::ArrayData,
-    acquire! = AC._acquireguard!; after_acquire=nothing)
+function _pin_regions!(root::ExportedRoot, d::ArrayData)
     regions = collect(keys(_walk_regions!(IdDict{OwnerRegion,Nothing}(), d)))
     sizehint!(root.pins, AC.checked_add(length(root.pins), length(regions)))
     try
         for region in regions
             owned = false
-            begin
-                try
-                    acquire!(region)
-                    owned = true
-                    after_acquire === nothing || after_acquire(region)
-                    push!(root.pins, region)
-                    owned = false
-                catch
-                    owned && AC._releaseguard!(region)
-                    rethrow()
-                end
+            try
+                AC._acquireguard!(region)
+                owned = true
+                push!(root.pins, region)
+                owned = false
+            catch
+                owned && AC._releaseguard!(region)
+                rethrow()
             end
         end
     catch
@@ -688,41 +598,34 @@ function _free_export!(root::ExportedRoot, after_step=nothing)
 end
 
 function _cleanup_registered_root!(key::Int64; require_released=true,
-    after_claim=nothing, after_step=nothing)
+    after_step=nothing)
     claimed_slot = Ref{Union{Nothing,ExportedRoot}}(nothing)
     try
-        return begin
-            root = lock(REGISTRY_LOCK) do
-                candidate = get(EXPORT_REGISTRY, key, nothing)
-                candidate === nothing && return nothing
-                candidate.cleaning && return nothing
-                require_released && candidate.remaining != 0 && return nothing
-                claimed_slot[] = candidate
-                candidate.cleaning = true
-                after_claim === nothing || after_claim(candidate)
-                return candidate
-            end
-            root === nothing && return false
-            _free_export!(root, after_step)
-            lock(REGISTRY_LOCK) do
-                get(EXPORT_REGISTRY, key, nothing) === root ||
-                    error("C Data export root changed during cleanup")
-                pop!(EXPORT_REGISTRY, key)
-            end
-            return true
+        root = lock(REGISTRY_LOCK) do
+            candidate = get(EXPORT_REGISTRY, key, nothing)
+            candidate === nothing && return nothing
+            candidate.cleaning && return nothing
+            require_released && candidate.remaining != 0 && return nothing
+            claimed_slot[] = candidate
+            candidate.cleaning = true
+            return candidate
         end
+        root === nothing && return false
+        _free_export!(root, after_step)
+        lock(REGISTRY_LOCK) do
+            get(EXPORT_REGISTRY, key, nothing) === root ||
+                error("C Data export root changed during cleanup")
+            pop!(EXPORT_REGISTRY, key)
+        end
+        return true
     catch
         root = claimed_slot[]
         if root !== nothing
-            # A cleanup claim must never remain armed after failure. This
-            # rollback is itself a no-escape handoff: another interrupt while
-            # waiting for the registry lock would otherwise make every later
-            # cleanup spin on `cleaning == true` forever.
-            begin
-                lock(REGISTRY_LOCK) do
-                    get(EXPORT_REGISTRY, key, nothing) === root &&
-                        (root.cleaning = false)
-                end
+            # A cleanup claim must never remain armed after failure. Otherwise
+            # every later cleanup would spin on `cleaning == true` forever.
+            lock(REGISTRY_LOCK) do
+                get(EXPORT_REGISTRY, key, nothing) === root &&
+                    (root.cleaning = false)
             end
         end
         rethrow()
@@ -748,68 +651,47 @@ function reap!()
     return reaped
 end
 
-function _discard_export!(p::Ptr)
-    p == C_NULL && return nothing
-    # Resolve the stable key before cleanup can free `p`. Retrying by pointer
-    # after a pending interrupt at successful cleanup would be a use-after-free.
-    key = begin
-        control = unsafe_load(p).private_data
-        unsafe_load(Ptr{Int64}(control + 8))
+function _cleanup_key!(key::Int64; require_released=false)
+    while true
+        _cleanup_registered_root!(key;
+            require_released=require_released) && return nothing
+        present = lock(REGISTRY_LOCK) do
+            haskey(EXPORT_REGISTRY, key)
+        end
+        present || return nothing
+        yield()
     end
-    _cleanup_key_noescape!(key; require_released=false)
+end
+
+function _cleanup_private_root!(root::ExportedRoot, key::Int64)
+    registered = lock(REGISTRY_LOCK) do
+        get(EXPORT_REGISTRY, key, nothing) === root
+    end
+    if registered
+        _cleanup_key!(key; require_released=false)
+    else
+        _free_export!(root)
+    end
     return nothing
 end
 
-
-function _cleanup_key_noescape!(key::Int64; require_released=false)
-    return begin
-        while true
-            _cleanup_registered_root!(key;
-                require_released=require_released) && return nothing
-            present = lock(REGISTRY_LOCK) do
-                haskey(EXPORT_REGISTRY, key)
-            end
-            present || return nothing
-            yield()
-        end
-    end
-end
-
-function _cleanup_private_root_noescape!(root::ExportedRoot, key::Int64)
-    return begin
-        registered = lock(REGISTRY_LOCK) do
-            get(EXPORT_REGISTRY, key, nothing) === root
-        end
-        if registered
-            _cleanup_key_noescape!(key; require_released=false)
-        else
-            _free_export!(root)
-        end
-        return nothing
-    end
-end
-
 function _cleanup_export_slots!(sp, skey, ap, akey)
-    return begin
-        # Clear raw pointer slots before any free. The stable registry keys
-        # remain valid cleanup tokens even if interruption occurs after a root
-        # is freed but before its key slot is cleared.
-        sp[] = C_NULL
-        ap[] = C_NULL
-        if akey[] != 0
-            _cleanup_key_noescape!(akey[]; require_released=false)
-            akey[] = 0
-                    end
-        if skey[] != 0
-            _cleanup_key_noescape!(skey[]; require_released=false)
-            skey[] = 0
-        end
-        return nothing
+    # Clear raw pointer slots before any free. Stable registry keys remain
+    # valid cleanup tokens until their corresponding root is gone.
+    sp[] = C_NULL
+    ap[] = C_NULL
+    if akey[] != 0
+        _cleanup_key!(akey[]; require_released=false)
+        akey[] = 0
     end
+    if skey[] != 0
+        _cleanup_key!(skey[]; require_released=false)
+        skey[] = 0
+    end
+    return nothing
 end
 
-function _newroot(build, roots::Vector{Any}, pinsource=nothing,
-    rootfactory=ExportedRoot; after_pin=nothing, after_publish=nothing,
+function _newroot(build, roots::Vector{Any}, pinsource=nothing;
     result_slot=nothing, key_slot=nothing)
     key = Int64(0)
     root = nothing
@@ -817,13 +699,12 @@ function _newroot(build, roots::Vector{Any}, pinsource=nothing,
         key = lock(REGISTRY_LOCK) do
             NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
         end
-        root = rootfactory(roots, Ptr{Cvoid}[], OwnerRegion[], key, 0, false,
+        root = ExportedRoot(roots, Ptr{Cvoid}[], OwnerRegion[], key, 0, false,
             Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}(),
             Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}())::ExportedRoot
         # Construct all Julia bookkeeping before acquiring source guards. Once
         # guards exist, every remaining failure unwinds through _free_export!.
-        pinsource === nothing || _pin_regions!(root, pinsource;
-            after_acquire=after_pin)
+        pinsource === nothing || _pin_regions!(root, pinsource)
         # The pointer cannot escape before `build` returns. Keep the root
         # private until then: publishing it with `remaining == 0` would let a
         # concurrent reaper free partial mallocs and source pins underneath
@@ -834,17 +715,14 @@ function _newroot(build, roots::Vector{Any}, pinsource=nothing,
             key_slot === nothing || (key_slot[] = key)
             result_slot === nothing || (result_slot[] = result)
         end
-        after_publish === nothing || after_publish(result)
         return result
     catch
         # Export-failure cleanup keeps a published root registered until every
-        # resource is gone. This also covers interruption during publication.
+        # resource is gone.
         if root !== nothing
-            begin
-                result_slot === nothing || (result_slot[] = C_NULL)
-                key_slot === nothing || (key_slot[] = 0)
-                _cleanup_private_root_noescape!(root, key)
-            end
+            result_slot === nothing || (result_slot[] = C_NULL)
+            key_slot === nothing || (key_slot[] = 0)
+            _cleanup_private_root!(root, key)
         end
         rethrow()
     end
@@ -876,9 +754,9 @@ mutable struct ForeignOwner
         unsafe_store!(o.arrayblock, arr)
         # Construct the gate with a FREE-ONLY action (cb = NULL skips the
         # producer callback): until the source ArrowArray's release field is
-        # nulled, the source remains the sole owner of producer resources,
-        # and an interruption before the move completes must reclaim only
-        # OUR malloc'd copy — never call the producer twice. Arming to the
+        # nulled, the source remains the sole owner of producer resources.
+        # A failure before the move completes must reclaim only our malloc'd
+        # copy — never call the producer twice. Arming to the
         # full call-then-free action happens after the move commits.
         o.gate = OwnerRegion(Ptr{UInt8}(0), 0, AC.Foreign; root=o,
             releasefn=CcallRelease(C_NULL, Ptr{Cvoid}(block); freearg=true))
@@ -905,10 +783,8 @@ function _release_moved_owner!(o::ForeignOwner)
     # A failure may occur after the source move but before arming. Install
     # the full action locally so forceclose! still owns the copied producer
     # release in that seam.
-    begin
-        _foreign_owner_armed(o) || _arm_foreign_owner!(o)
-        release!(o)
-    end
+    _foreign_owner_armed(o) || _arm_foreign_owner!(o)
+    release!(o)
     return nothing
 end
 
@@ -917,24 +793,12 @@ _call_foreign_release(release, p::Ptr{CArrowArray}) =
 _call_foreign_release(release, p::Ptr{CArrowSchema}) =
     ccall(release, Cvoid, (Ptr{CArrowSchema},), p)
 
-function _run_foreign_release_pointer!(p; after_call=nothing)
-    begin
-        release = unsafe_load(p).release
-        if release != C_NULL
-            _call_foreign_release(release, p)
-            after_call === nothing || after_call()
-            unsafe_load(p).release == C_NULL ||
-                error("C Data producer release did not mark the structure released")
-        end
-    end
-    return nothing
-end
-
-function _run_foreign_release!(ref::Base.RefValue{T};
-    after_call=nothing) where {T}
-    GC.@preserve ref begin
-        _run_foreign_release_pointer!(Base.unsafe_convert(Ptr{T}, ref);
-            after_call=after_call)
+function _run_foreign_release_pointer!(p)
+    release = unsafe_load(p).release
+    if release != C_NULL
+        _call_foreign_release(release, p)
+        unsafe_load(p).release == C_NULL ||
+            error("C Data producer release did not mark the structure released")
     end
     return nothing
 end
@@ -961,10 +825,10 @@ this is the trusted-in-process boundary, and validation runs on the declared
 geometry. A failed import releases the moved tree exactly once.
 """
 from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}) =
-    _from_c_data(sp, ap, () -> nothing)
+    _from_c_data(sp, ap)
 
-function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray},
-    after_move; ownerfactory=ForeignOwner, after_schema_release=nothing)
+function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray};
+    ownerfactory=ForeignOwner)
     sp == C_NULL && throw(ArgumentError("ArrowSchema pointer is NULL"))
     ap == C_NULL && throw(ArgumentError("ArrowArray pointer is NULL"))
     sch = unsafe_load(sp)
@@ -977,11 +841,8 @@ function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray},
             owner = ownerfactory(arr)::ForeignOwner
             # MOVE: relinquish source ownership before arming the copied
             # owner's finalizer. The source release field is authoritative.
-            begin
-                _store_field!(ap, :release, Ptr{Cvoid}(C_NULL))
-                after_move()
-                _arm_foreign_owner!(owner)
-            end
+            _store_field!(ap, :release, Ptr{Cvoid}(C_NULL))
+            _arm_foreign_owner!(owner)
             _preflight_schema(sch)
             f = _import_field(sch)
             _preflight_array(f, arr)
@@ -994,7 +855,6 @@ function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray},
             # The schema lifetime is separate and must end on every path,
             # including owner-construction failure.
             _release_c_schema!(sp, sch)
-            after_schema_release === nothing || after_schema_release()
         end
     catch
         # Before the move, the caller's source remains the owner. After the
@@ -1067,10 +927,9 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
     return nothing
 end
 
-function _release_c_schema!(sp::Ptr{CArrowSchema}, sch::CArrowSchema;
-    after_call=nothing)
+function _release_c_schema!(sp::Ptr{CArrowSchema}, sch::CArrowSchema)
     sch.release == C_NULL && return nothing
-    _run_foreign_release_pointer!(sp; after_call=after_call)
+    _run_foreign_release_pointer!(sp)
     return nothing
 end
 
@@ -1157,9 +1016,13 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
                 if offsets_slice === nothing || AC.isempty_buffer(offsets_slice)
                     Int64(0)
                 else
-                    O = spec.offsetwidth == 8 ? Int64 : Int32
-                    Int64(AC.loadat(offsets_slice, O,
-                        AC.checked_mul(total, Int64(sizeof(O)))))
+                    if spec.offsetwidth == 8
+                        AC.loadat(offsets_slice, Int64,
+                            AC.checked_mul(total, Int64(8)))
+                    else
+                        Int64(AC.loadat(offsets_slice, Int32,
+                            AC.checked_mul(total, Int64(4))))
+                    end
                 end
             end
         else
@@ -1381,12 +1244,6 @@ function main()
     @assert _registry_count() == before
 
     _, pda = fromjulia("pin-a", Int64[1])
-    _, pdb = fromjulia("pin-b", Int64[2])
-    pdd = ArrayData(StructType(), 1, [BufferSlice()];
-        children=[pda, pdb], nullcount=0)
-    pinregions = OwnerRegion[pda.buffers[2].region, pdb.buffers[2].region]
-    # Pins release on any construction failure (plain error path).
-    @assert all((@atomic region.guards) == 0 for region in pinregions)
 
     # Published schema and array roots do not transfer until the result tuple
     # reaches the caller. Failure at either return boundary cleans both roots.
@@ -1409,15 +1266,6 @@ function main()
     @assert forceclose!(handoffregion; timeout_ms=0)
 
     factoryregion = pda.buffers[2].region
-    @assert try
-        _newroot(_ -> nothing, Any[pda], pda,
-            (_args...) -> error("injected root construction failure"))
-        false
-    catch e
-        e isa ErrorException && e.msg == "injected root construction failure"
-    end
-    @assert (@atomic factoryregion.guards) == 0
-    @assert _registry_count() == before
     @assert try
         _newroot(Any[pda], pda) do root
             @assert (@atomic factoryregion.guards) == 1
@@ -1465,7 +1313,7 @@ function main()
     end
     @assert (@atomic cleanup_region.guards) == 0
     @assert forceclose!(cleanup_region; timeout_ms=0)
-    println("interrupted export cleanup remains registered and retryable ✓")
+    println("failed export cleanup remains registered and retryable ✓")
 
     # The registry, not the caller's Julia variables, must keep all source
     # objects and their buffers alive while raw C pointers are outstanding.
@@ -1566,7 +1414,7 @@ function main()
     construction_region = cd.buffers[2].region
     sp, ap = to_c_data(cf, cd)
     @assert try
-        _from_c_data(sp, ap, () -> nothing;
+        _from_c_data(sp, ap;
             ownerfactory=_ -> error("injected owner construction failure"))
         false
     catch e
@@ -1583,9 +1431,8 @@ function main()
 
 
 
-    # Producer C callbacks have no error channel. An interruption at their
-    # return boundary retries against the persistent struct until release is
-    # NULL, without calling an already-completed producer a second time.
+    # Producer C callbacks have no error channel. The concrete release action
+    # calls the persistent struct once and checks that release becomes NULL.
     pf, pd = fromjulia("producer-release", Int64[1])
     producer_region = pd.buffers[2].region
     sp, ap = to_c_data(pf, pd)
@@ -1596,9 +1443,7 @@ function main()
     _arm_foreign_owner!(producer_owner)
     # The armed action is concrete data: the producer callback, the copy's
     # stable malloc'd address, and the spec conformance check (the callback
-    # must null the copy's release field) execute as ONE committed step with
-    # SIGINT deferred — the old retry-after-partial-interrupt path no longer
-    # exists because there is no partial state to retry.
+    # must null the copy's release field) execute as one state-machine step.
     act = producer_owner.gate.releasefn::ReleaseAction
     @assert act.cb != C_NULL
     @assert act.verify_null_at == CARROWARRAY_RELEASE_OFFSET
@@ -1680,6 +1525,37 @@ function main()
     _call_release(sp)
     @assert reap!() == 1
     println("C release entrypoints commit exactly once and repeats are inert ✓")
+
+    # A persistent internal error must not spin forever inside the void C
+    # callback. The claimed parent returns to LIVE. Completed descendants
+    # stay NULL, and a later explicit call can resume safely.
+    retryf, retryd = fromjulia("child", Int64[1])
+    retrysf = Field("parent", StructType(); children=[retryf])
+    retrysd = ArrayData(StructType(), 1, [BufferSlice()];
+        children=[retryd], nullcount=0)
+    retry_source = retryd.buffers[2].region
+    sp, ap = to_c_data(retrysf, retrysd)
+    parentcontrol = unsafe_load(ap).private_data
+    childp = unsafe_load(unsafe_load(ap).children, 1)
+    childcontrol = unsafe_load(childp).private_data
+    retrykey = unsafe_load(Ptr{Int64}(parentcontrol + 8))
+    childtopology = lock(REGISTRY_LOCK) do
+        pop!(EXPORT_REGISTRY[retrykey].array_topology, childcontrol)
+    end
+    _call_release(ap)
+    @assert unsafe_load(ap).release != C_NULL
+    @assert unsafe_load(childp).release != C_NULL
+    @assert unsafe_load(Ptr{UInt8}(parentcontrol)) == 0x00
+    lock(REGISTRY_LOCK) do
+        EXPORT_REGISTRY[retrykey].array_topology[childcontrol] = childtopology
+    end
+    _call_release(ap)
+    @assert unsafe_load(ap).release == C_NULL
+    @assert unsafe_load(childp).release == C_NULL
+    _call_release(sp)
+    @assert reap!() == 2
+    @assert forceclose!(retry_source; timeout_ms=0)
+    println("failed C release callbacks return LIVE and resume on a later call ✓")
 
     # Schema/data mismatch and malformed buffers must fail before either
     # independently-owned export root is published.
