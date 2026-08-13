@@ -302,12 +302,26 @@ function reap!()
     return length(roots)
 end
 
-_malloc!(root::ExportedRoot, n::Integer) = begin
+_malloc!(root::ExportedRoot, n::Integer,
+    register! = push!, deallocate! = Libc.free) = begin
     n >= 0 || throw(ArgumentError("negative export allocation size"))
     n64 = Int64(n)
+    # Reserve the ledger slot before acquiring native memory. After malloc,
+    # either registration owns the pointer or the local catch deallocates it.
+    sizehint!(root.mallocs, AC.checked_add(length(root.mallocs), 1))
+    oldlen = length(root.mallocs)
     p = Libc.malloc(max(n64, Int64(1)))
     p == C_NULL && throw(OutOfMemoryError())
-    push!(root.mallocs, p)
+    try
+        register!(root.mallocs, p)
+    catch
+        if length(root.mallocs) == oldlen
+            deallocate!(p)
+        elseif !(length(root.mallocs) == oldlen + 1 && root.mallocs[end] == p)
+            error("export malloc registration left an invalid ledger state")
+        end
+        rethrow()
+    end
     Ptr{Cvoid}(p)
 end
 
@@ -422,8 +436,7 @@ function to_c_data(f::Field, d::ArrayData)
         _export_schema!(root, f, srel)
     end
     try
-        pins = _pin_regions(d)
-        ap = _newroot(Any[d]; pins=pins) do root
+        ap = _newroot(Any[d], d) do root
             _export_array!(root, d, arel)
         end
         return sp, ap
@@ -448,19 +461,25 @@ function _walk_regions!(seen::IdDict{OwnerRegion,Nothing}, d::ArrayData)
     return seen
 end
 
-function _pin_regions(d::ArrayData)
+function _release_pins!(pins::Vector{OwnerRegion}, n::Int=length(pins))
+    for i = 1:n
+        AC._releaseguard!(pins[i])
+    end
+    empty!(pins)
+    return nothing
+end
+
+function _pin_regions(d::ArrayData, acquire! = AC._acquireguard!)
     pins = collect(keys(_walk_regions!(IdDict{OwnerRegion,Nothing}(), d)))
-    acquired = OwnerRegion[]
+    acquired = 0
     try
         for region in pins
-            AC._acquireguard!(region)
-            push!(acquired, region)
+            acquire!(region)
+            acquired += 1
         end
-        return acquired
+        return pins
     catch
-        for region in acquired
-            AC._releaseguard!(region)
-        end
+        _release_pins!(pins, acquired)
         rethrow()
     end
 end
@@ -473,10 +492,7 @@ function _free_export!(root::ExportedRoot)
     end
     empty!(root.mallocs)
     empty!(root.roots)
-    for region in root.pins
-        AC._releaseguard!(region)
-    end
-    empty!(root.pins)
+    _release_pins!(root.pins)
     return nothing
 end
 
@@ -491,21 +507,20 @@ function _discard_export!(p::Ptr)
     return nothing
 end
 
-function _newroot(build, roots::Vector{Any}; pins::Vector{OwnerRegion}=OwnerRegion[])
-    key = try
-        lock(REGISTRY_LOCK) do
+function _newroot(build, roots::Vector{Any}, pinsource=nothing,
+    rootfactory=ExportedRoot)
+    key = Int64(0)
+    root = nothing
+    try
+        key = lock(REGISTRY_LOCK) do
             NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
         end
-    catch
-        for region in pins
-            AC._releaseguard!(region)
-        end
-        rethrow()
-    end
-    root = ExportedRoot(roots, Ptr{Cvoid}[], pins, key, 0,
-        Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}(),
-        Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}())
-    try
+        root = rootfactory(roots, Ptr{Cvoid}[], OwnerRegion[], key, 0,
+            Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}(),
+            Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}())::ExportedRoot
+        # Construct all Julia bookkeeping before acquiring source guards. Once
+        # guards exist, every remaining failure unwinds through _free_export!.
+        pinsource === nothing || (root.pins = _pin_regions(pinsource))
         # The pointer cannot escape before `build` returns. Keep the root
         # private until then: publishing it with `remaining == 0` would let a
         # concurrent reaper free partial mallocs and source pins underneath
@@ -518,10 +533,12 @@ function _newroot(build, roots::Vector{Any}; pins::Vector{OwnerRegion}=OwnerRegi
     catch
         # Export-failure cleanup path: remove a root if publication itself was
         # interrupted, and free everything built so far exactly once.
-        lock(REGISTRY_LOCK) do
-            pop!(EXPORT_REGISTRY, key, nothing)
+        if root !== nothing
+            lock(REGISTRY_LOCK) do
+                pop!(EXPORT_REGISTRY, key, nothing)
+            end
+            _free_export!(root)
         end
-        _free_export!(root)
         rethrow()
     end
 end
@@ -906,6 +923,88 @@ function main()
     @assert reap!() == 1
     @assert _registry_count() == before
     println("in-progress exports are hidden from the reaper ✓")
+
+    # Every native allocation and source guard must have an owner before the
+    # next fallible operation. Inject failures at each ownership handoff.
+    deallocations = Ref(0)
+    @assert try
+        _newroot(Any[]) do root
+            _malloc!(root, 64,
+                (_ledger, _p) -> error("injected malloc registration failure"),
+                p -> begin
+                    deallocations[] += 1
+                    Libc.free(p)
+                end)
+        end
+        false
+    catch e
+        e isa ErrorException &&
+            e.msg == "injected malloc registration failure"
+    end
+    @assert deallocations[] == 1
+    @assert _registry_count() == before
+    # A registration method may append successfully and fail before it
+    # returns. In that state root cleanup, not the local catch, owns the entry.
+    innerdeallocations = Ref(0)
+    @assert try
+        _newroot(Any[]) do root
+            _malloc!(root, 64,
+                (ledger, p) -> begin
+                    push!(ledger, p)
+                    error("injected post-registration failure")
+                end,
+                _ -> (innerdeallocations[] += 1))
+        end
+        false
+    catch e
+        e isa ErrorException &&
+            e.msg == "injected post-registration failure"
+    end
+    @assert innerdeallocations[] == 0
+    @assert _registry_count() == before
+
+    _, pda = fromjulia("pin-a", Int64[1])
+    _, pdb = fromjulia("pin-b", Int64[2])
+    pdd = ArrayData(StructType(), 1, [BufferSlice()];
+        children=[pda, pdb], nullcount=0)
+    pinregions = OwnerRegion[pda.buffers[2].region, pdb.buffers[2].region]
+    acquirecalls = Ref(0)
+    @assert try
+        _pin_regions(pdd, region -> begin
+            acquirecalls[] += 1
+            acquirecalls[] == 2 && error("injected guard acquisition failure")
+            AC._acquireguard!(region)
+        end)
+        false
+    catch e
+        e isa ErrorException && e.msg == "injected guard acquisition failure"
+    end
+    @assert acquirecalls[] == 2
+    @assert all((@atomic region.guards) == 0 for region in pinregions)
+
+    factoryregion = pda.buffers[2].region
+    @assert try
+        _newroot(_ -> nothing, Any[pda], pda,
+            (_args...) -> error("injected root construction failure"))
+        false
+    catch e
+        e isa ErrorException && e.msg == "injected root construction failure"
+    end
+    @assert (@atomic factoryregion.guards) == 0
+    @assert _registry_count() == before
+    @assert try
+        _newroot(Any[pda], pda) do root
+            @assert (@atomic factoryregion.guards) == 1
+            _malloc!(root, 64)
+            error("injected export build failure")
+        end
+        false
+    catch e
+        e isa ErrorException && e.msg == "injected export build failure"
+    end
+    @assert (@atomic factoryregion.guards) == 0
+    @assert _registry_count() == before
+    println("failed export handoffs return mallocs and source guards ✓")
 
     b = batch((
         xs=Int64[1, 2, 3, 4],
