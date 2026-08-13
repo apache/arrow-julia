@@ -1128,6 +1128,83 @@ function _schema_stream_from_field!(b, field)
     return out
 end
 
+function _dictionary_schema_frame_with_replacement(id::Int64)
+    b = FB.Builder(512)
+    name = FB.createstring!(b, "d")
+
+    Meta.utf8Start(b)
+    valuetype = Meta.utf8End(b)
+    Meta.intStart(b)
+    Meta.intAddBitWidth(b, Int32(8))
+    Meta.intAddIsSigned(b, true)
+    indextype = Meta.intEnd(b)
+    Meta.dictionaryEncodingStart(b)
+    Meta.dictionaryEncodingAddId(b, id)
+    Meta.dictionaryEncodingAddIndexType(b, indextype)
+    dict = Meta.dictionaryEncodingEnd(b)
+
+    Meta.fieldStartChildrenVector(b, 0)
+    children = FB.endvector!(b, 0)
+    Meta.fieldStart(b)
+    Meta.fieldAddName(b, name)
+    Meta.fieldAddTypeType(b, Meta.Utf8)
+    Meta.fieldAddType(b, valuetype)
+    Meta.fieldAddDictionary(b, dict)
+    Meta.fieldAddChildren(b, children)
+    field = Meta.fieldEnd(b)
+
+    Meta.schemaStartFieldsVector(b, 1)
+    FB.prependoffset!(b, field)
+    fields = FB.endvector!(b, 1)
+    FB.startvector!(b, 8, 1, 8)
+    FB.prepend!(b, Int64(1)) # Feature.DICTIONARY_REPLACEMENT
+    features = FB.endvector!(b, 1)
+
+    # The vendored Schema binding predates the features field. Build the same
+    # four-slot table directly for this forward-compatibility regression.
+    FB.startobject!(b, 4)
+    Meta.schemaAddEndianness(b, Meta.Endianness.Little)
+    Meta.schemaAddFields(b, fields)
+    FB.prependoffsetslot!(b, 3, features, 0)
+    sch = FB.endobject!(b)
+    Meta.messageStart(b)
+    Meta.messageAddVersion(b, Meta.MetadataVersion.V5)
+    Meta.messageAddHeaderType(b, Meta.Schema)
+    Meta.messageAddHeader(b, sch)
+    msg = Meta.messageEnd(b)
+    FB.finish!(b, msg)
+    meta = collect(FB.finishedbytes(b))
+    append!(meta, zeros(UInt8, mod(-length(meta), 8)))
+    frame = UInt8[]
+    append!(frame, reinterpret(UInt8,
+        UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
+    append!(frame, meta)
+    return frame
+end
+
+function _dictionary_replacement_stream()
+    id = Int64(7)
+    firstio = IOBuffer()
+    Arrow.write(firstio,
+        (d=Arrow.DictEncode(["aa", "bb", "aa"], id),); file=false)
+    firstbytes = take!(firstio)
+    secondio = IOBuffer()
+    Arrow.write(secondio,
+        (d=Arrow.DictEncode(["xx", "yy", "xx"], id),); file=false)
+    secondbytes = take!(secondio)
+    firstframes = _frameinfo(firstbytes)
+    secondframes = _frameinfo(secondbytes)
+    frameof(frames, bytes, kind) = bytes[only(x.frame for x in frames if x.kind == kind)]
+    return vcat(
+        _dictionary_schema_frame_with_replacement(id),
+        frameof(firstframes, firstbytes, UInt8(2)),
+        frameof(firstframes, firstbytes, UInt8(3)),
+        frameof(secondframes, secondbytes, UInt8(2)),
+        frameof(secondframes, secondbytes, UInt8(3)),
+        frameof(firstframes, firstbytes, UInt8(0)),
+    )
+end
+
 function _aliased_field_stream(depth::Int)
     b = FB.Builder(1024)
     Meta.intStart(b)
@@ -1479,7 +1556,15 @@ function main()
         bytes[spans[dictidx].frame],
         bytes[(last(spans[dictidx].frame) + 1):end])
     @assert _rejects(() -> readstream(duplicate))
-    println("dictionary accounting and required replacement flags are enforced ✓")
+
+    replaced = readstream(_dictionary_replacement_stream())
+    @assert length(replaced.batches) == 2
+    df = replaced.schema.fields[1]
+    @assert materialize(df, replaced.batches[1].columns[1]) == ["aa", "bb", "aa"]
+    @assert materialize(df, replaced.batches[2].columns[1]) == ["xx", "yy", "xx"]
+    @assert replaced.batches[1].columns[1].dictionary !==
+        replaced.batches[2].columns[1].dictionary
+    println("dictionary replacement is feature-gated and snapshots stay immutable ✓")
 
     nestedvals = [[Int64(1), 2], [3]]
     sharedio = IOBuffer()
