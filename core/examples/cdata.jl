@@ -56,10 +56,11 @@
 #     imports release the moved structure exactly once before throwing.
 #     Per spec, moving marks the source released (release = NULL).
 #
-# The demo: build a Core batch (nullable ints, strings, list column) →
-# export to C structs → wipe our references → import from the C structs →
-# materialize and compare → consumer calls release → reap → assert the
-# registry is empty and double-release is inert.
+# The demo includes a registry-rooting round trip that drops all Julia source
+# references before GC and import. It also exports a Core batch (nullable ints,
+# strings, list column), materializes and compares imported columns, releases
+# and reaps them, and proves that the registry is empty and double release is
+# inert.
 # =============================================================================
 
 include(joinpath(@__DIR__, "..", "ArrowCore.jl"))

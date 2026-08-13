@@ -459,9 +459,10 @@ end
 Walk the IPC stream framing (continuation marker, metadata length, metadata
 flatbuffer, body), checking every declared length against the limits and the
 region's real extent before metadata-directed decode allocation. A truncated
-or lying stream is an error here — not a silent early return (the current
-framer returns `nothing` on truncation, src/table.jl:679-708) and not a
-segfault three batches later.
+prefix, metadata block, or body is an error here — not a silent early return
+(the current framer returns `nothing` on truncation, src/table.jl:679-708) and
+not a segfault three batches later. EOF exactly after a complete message is
+the intentional missing-EOS boundary case and is accepted.
 """
 framemessages(region::OwnerRegion, limits::Limits=Limits()) =
     _framemessages(region, limits, Base.ENDIAN_BOM)

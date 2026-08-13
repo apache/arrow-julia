@@ -1013,7 +1013,7 @@ function _validate_structural(f::Field, d::ArrayData,
                 throw(ValidationError("views buffer too small"))
         end
     end
-    # Child arity: registry-declared, or Field-declared for struct/union/REE.
+    # Child arity: registry-declared, or Field-declared for struct/union.
     expected_children = spec.childcount == -1 ? length(f.children) : spec.childcount
     if !(d.type isa DictionaryType)
         length(f.children) == expected_children ||
@@ -1483,8 +1483,8 @@ end
 Read logical element `i` (1-based). Layout dispatch happens on the runtime
 descriptor — one dynamic dispatch per call. This is Core's honest contract
 (report §8.9): scalar access through the erased representation pays a
-boundary cost; bulk paths go through `materialize`/`foreachvalue`, which
-resolve the layout once and loop through a function barrier.
+boundary cost; `materialize` resolves the layout once and loops through a
+function barrier.
 """
 function getvalue(f::Field, d::ArrayData, i::Integer)
     1 <= i <= d.len || throw(BoundsError(d, i))
