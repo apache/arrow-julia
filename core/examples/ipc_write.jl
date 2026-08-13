@@ -828,28 +828,37 @@ function _schemaside(metaschema::Meta.Schema)
     valueschemas = validatedictionaryids(fields, fielddictids)
     length(valueschemas) == length(dictids) ||
         throw(ValidationError("duplicate dictionary id in file schema"))
-    return fields, fielddictids
+    return fields
+end
+
+function _fieldwireequal(a::Meta.Field, b::Meta.Field)
+    _metadataequal(a.custom_metadata, b.custom_metadata) || return false
+    adict, bdict = a.dictionary, b.dictionary
+    (adict === nothing) == (bdict === nothing) || return false
+    if adict !== nothing
+        adict.id == bdict.id || return false
+    end
+    achildren = something(a.children, Meta.Field[])
+    bchildren = something(b.children, Meta.Field[])
+    length(achildren) == length(bchildren) || return false
+    return all(_fieldwireequal(x, y)
+        for (x, y) in zip(achildren, bchildren))
 end
 
 function _schemaequal(a::Meta.Schema, b::Meta.Schema)
     something(a.endianness, Meta.Endianness.Little) ==
         something(b.endianness, Meta.Endianness.Little) || return false
-    afields, aids = _schemaside(a)
-    bfields, bids = _schemaside(b)
+    ametafields = something(a.fields, Meta.Field[])
+    bmetafields = something(b.fields, Meta.Field[])
+    length(ametafields) == length(bmetafields) || return false
+    all(_fieldwireequal(x, y)
+        for (x, y) in zip(ametafields, bmetafields)) || return false
+    afields = _schemaside(a)
+    bfields = _schemaside(b)
     length(afields) == length(bfields) || return false
     _metadataequal(a.custom_metadata, b.custom_metadata) || return false
     all(_fieldequal(x, y) for (x, y) in zip(afields, bfields)) || return false
-    function sameids(xs, ys)::Bool
-        for (x, y) in zip(xs, ys)
-            if x.type isa DictionaryType
-                aids[x] == bids[y] || return false
-            else
-                sameids(x.children, y.children) || return false
-            end
-        end
-        return true
-    end
-    return sameids(afields, bfields)
+    return true
 end
 
 function _fileschema(region::OwnerRegion, footerstart::Int64, limits::Limits,
