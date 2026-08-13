@@ -213,7 +213,8 @@ function _claim_schema_node(s::Ptr{CArrowSchema}, claimed_slot,
     end
 end
 
-function _finish_node!(p, control::Ptr{Cvoid})
+function _finish_node!(p, control::Ptr{Cvoid}, claimed_slot,
+    after_step=nothing)
     # This locked block is the callback's final access to export-owned memory.
     # The reaper observes zero only after every non-moved descendant callback,
     # and every independently moved node callback, has completed. Scanning in
@@ -225,9 +226,37 @@ function _finish_node!(p, control::Ptr{Cvoid})
         root = get(EXPORT_REGISTRY, key, nothing)
         root === nothing && error("C Data export root disappeared during release")
         root.remaining > 0 || error("C Data export node counter underflow")
-        root.remaining -= 1
-        unsafe_store!(Ptr{UInt8}(control), 0x02)
-        _store_field!(p, :release, Ptr{Cvoid}(C_NULL))
+        oldremaining = root.remaining
+        oldrelease = unsafe_load(p).release
+        try
+            Base.disable_sigint() do
+                root.remaining = oldremaining - 1
+                after_step === nothing || after_step(:remaining)
+                unsafe_store!(Ptr{UInt8}(control), 0x02)
+                after_step === nothing || after_step(:control)
+                _store_field!(p, :release, Ptr{Cvoid}(C_NULL))
+                after_step === nothing || after_step(:release)
+                # The outer catch must not touch `control` once remaining is
+                # zero: a reaper may free it as soon as this lock is released.
+                # Transfer the completed claim while the lock still excludes
+                # cleanup. A later exception observes a committed callback.
+                claimed_slot[] = nothing
+                after_step === nothing || after_step(:commit)
+            end
+        catch
+            if claimed_slot[] !== nothing
+                # Nothing can reap this root while the registry lock is held.
+                # Restore the whole commit before the outer transaction
+                # returns the node from RELEASING to LIVE. This rollback may
+                # not escape half-done after a second interruption.
+                _retry_interrupts() do
+                    root.remaining = oldremaining
+                    unsafe_store!(Ptr{UInt8}(control), 0x01)
+                    _store_field!(p, :release, oldrelease)
+                end
+            end
+            rethrow()
+        end
     end
     return nothing
 end
@@ -238,6 +267,12 @@ function _reset_node_claim!(control::Ptr{Cvoid})
         flag == 0x01 || return nothing
         unsafe_store!(Ptr{UInt8}(control), 0x00)
     end
+    return nothing
+end
+
+function _reset_node_claim_noescape!(control::Ptr{Cvoid},
+    reset! = _reset_node_claim!)
+    _retry_interrupts(() -> reset!(control))
     return nothing
 end
 
@@ -304,37 +339,39 @@ function _release_schema_children!(topology, after_child=nothing)
 end
 
 function _release_array_impl(a::Ptr{CArrowArray}, after_claim=nothing,
-    after_child=nothing)
+    after_child=nothing, after_finish=nothing, after_commit=nothing)
     claimed_slot = Ref{Any}(nothing)
     try
         claimed = _claim_array_node(a, claimed_slot, after_claim)
         claimed === nothing && return nothing
         control, topology = claimed
         _release_array_children!(topology, after_child)
-        _finish_node!(a, control)
+        _finish_node!(a, control, claimed_slot, after_finish)
+        after_commit === nothing || after_commit()
     catch
         # Descendant releases are idempotent: a completed child has a NULL
         # callback and a retry skips it. Return this node to LIVE so a failed
         # transaction never leaves its aggregate root and source pins stuck.
         claimed = claimed_slot[]
-        claimed === nothing || _reset_node_claim!(claimed[1])
+        claimed === nothing || _reset_node_claim_noescape!(claimed[1])
         rethrow()
     end
     return nothing
 end
 
 function _release_schema_impl(s::Ptr{CArrowSchema}, after_claim=nothing,
-    after_child=nothing)
+    after_child=nothing, after_finish=nothing, after_commit=nothing)
     claimed_slot = Ref{Any}(nothing)
     try
         claimed = _claim_schema_node(s, claimed_slot, after_claim)
         claimed === nothing && return nothing
         control, topology = claimed
         _release_schema_children!(topology, after_child)
-        _finish_node!(s, control)
+        _finish_node!(s, control, claimed_slot, after_finish)
+        after_commit === nothing || after_commit()
     catch
         claimed = claimed_slot[]
-        claimed === nothing || _reset_node_claim!(claimed[1])
+        claimed === nothing || _reset_node_claim_noescape!(claimed[1])
         rethrow()
     end
     return nothing
@@ -366,17 +403,19 @@ function _run_release_callback(f)
 end
 
 function _release_array_entry(a::Ptr{CArrowArray}, after_claim=nothing,
-    after_child=nothing)
+    after_child=nothing, after_finish=nothing, after_commit=nothing)
     _run_release_callback() do
-        _release_array_impl(a, after_claim, after_child)
+        _release_array_impl(a, after_claim, after_child, after_finish,
+            after_commit)
     end
     return nothing
 end
 
 function _release_schema_entry(s::Ptr{CArrowSchema}, after_claim=nothing,
-    after_child=nothing)
+    after_child=nothing, after_finish=nothing, after_commit=nothing)
     _run_release_callback() do
-        _release_schema_impl(s, after_claim, after_child)
+        _release_schema_impl(s, after_claim, after_child, after_finish,
+            after_commit)
     end
     return nothing
 end
@@ -1619,6 +1658,7 @@ function main()
     sp, ap = to_c_data(rf, rd)
     scontrol = unsafe_load(sp).private_data
     acontrol = unsafe_load(ap).private_data
+    akey = unsafe_load(Ptr{Int64}(acontrol + 8))
     @assert try
         _release_schema_impl(sp, () -> throw(InterruptException()))
         false
@@ -1635,6 +1675,38 @@ function main()
     @assert unsafe_load(Ptr{UInt8}(acontrol)) == 0x00
     @assert unsafe_load(sp).release != C_NULL
     @assert unsafe_load(ap).release != C_NULL
+
+    # The final node commit is one transaction. An exception after any store
+    # restores the counter, control flag, and public callback together.
+    for failed_step in (:remaining, :control, :release)
+        @assert try
+            _release_array_impl(ap, nothing, nothing, step -> begin
+                step == failed_step && throw(InterruptException())
+            end)
+            false
+        catch e
+            e isa InterruptException
+        end
+        @assert unsafe_load(Ptr{UInt8}(acontrol)) == 0x00
+        @assert unsafe_load(ap).release != C_NULL
+        @assert lock(REGISTRY_LOCK) do
+            EXPORT_REGISTRY[akey].remaining == 1
+        end
+    end
+
+    # Claim rollback is also no-escape. A second interruption cannot leave a
+    # node in RELEASING so that the void callback mistakes it for completion.
+    claimed_slot = Ref{Any}(nothing)
+    @assert _claim_array_node(ap, claimed_slot) !== nothing
+    reset_attempts = Ref(0)
+    _reset_node_claim_noescape!(acontrol, control -> begin
+        reset_attempts[] += 1
+        reset_attempts[] == 1 && throw(InterruptException())
+        _reset_node_claim!(control)
+    end)
+    @assert reset_attempts[] == 2
+    @assert unsafe_load(Ptr{UInt8}(acontrol)) == 0x00
+
     attempts = Ref(0)
     @assert _release_array_entry(ap, () -> begin
             attempts[] += 1
@@ -1646,6 +1718,29 @@ function main()
     @assert reap!() == 1
     @assert forceclose!(retry_region; timeout_ms=0)
     _call_release(sp)
+    @assert reap!() == 1
+
+    # An exception after the claim slot transfers is post-commit. The outer
+    # catch must not read a control block that is now eligible for reaping.
+    cf, cd = fromjulia("committed-release", Int64[1])
+    committed_region = cd.buffers[2].region
+    csp, cap = to_c_data(cf, cd)
+    ccontrol = unsafe_load(cap).private_data
+    ckey = unsafe_load(Ptr{Int64}(ccontrol + 8))
+    @assert try
+        _release_array_impl(cap, nothing, nothing, nothing, () -> begin
+            @assert reap!() == 1
+            throw(InterruptException())
+        end)
+        false
+    catch e
+        e isa InterruptException
+    end
+    @assert !lock(REGISTRY_LOCK) do
+        haskey(EXPORT_REGISTRY, ckey)
+    end
+    @assert forceclose!(committed_region; timeout_ms=0)
+    _call_release(csp)
     @assert reap!() == 1
     println("interrupted C release callbacks remain retryable ✓")
 
