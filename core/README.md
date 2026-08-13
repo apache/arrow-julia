@@ -38,8 +38,8 @@ listed under Honest status.
 | `test/runtests.jl` | Core layout, validation, cache, bounds, region, mmap, and concurrency tests; it also starts a four-thread stress subprocess |
 | `examples/ipc_read.jl` | Checked IPC stream framing, a bounded metadata verifier, metadata-to-Core mapping, dictionary state, and one registry-driven decoder over real 2.x-written streams |
 | `examples/ipc_write.jl` | The write half over the same registry: Core-to-metadata mapping, one generic registry-driven encoder, replacement-on-change dictionary batches, per-buffer compression, and the file format (Block index + Footer) with a lazy random-access `ArrowFile` reader |
-| `examples/cdata.jl` | C ABI definitions, zero-copy export and import, shared-tree ownership, C move semantics, and exactly-once release tests |
-| `REVIEW-codex-r1.md` through `REVIEW-codex-r12.md` | Adversarial review findings and the disposition of each item |
+| `examples/cdata.jl` | Full mapped C Data format parity plus bidirectional `ArrowArrayStream`, zero-copy ownership, move semantics, and exactly-once release tests |
+| `REVIEW-codex-r1.md` through `REVIEW-codex-r14.md` | Adversarial review findings and the disposition of each item |
 
 ## Run it
 
@@ -95,9 +95,10 @@ What the constraint gives up, knowingly:
   under the guard design, which could not prevent it either.
 
 Exactly-once release survives where it belongs: in the C-data adapter's
-`ForeignOwner` (one `@atomic` flag, a finalizer, and an explicit `release!`)
-and in the export registry, which roots exported columns until the consumer
-releases them and a reap drops the root.
+`ForeignOwner` and C-stream adapter's `StreamOwner` (one `@atomic` flag each,
+a finalizer, and an explicit `release!`), and in the export registries. Those
+registries root exported columns and streams until the consumer releases them
+and cleanup drops the root.
 
 ## Simplification shown by the prove-out
 
@@ -173,20 +174,29 @@ per-buffer LZ4_FRAME/ZSTD compression behind the spec's Int64 prefix and the
 `-1` stored-raw fallback. Dictionary handling is replacement-on-change:
 one batch per pool snapshot, a replacement batch only when a later batch's
 pool identity differs, `Feature.DICTIONARY_REPLACEMENT` declared in that
-case (and `COMPRESSED_BODY` when compressing). Every column is semantically
-validated before its bytes are emitted. The writer is eager and sequential —
+case (and `COMPRESSED_BODY` when a compressed batch is emitted). Files declare
+the same compression feature in both schema copies and reject dictionary
+replacement. Every column is semantically validated against every applicable
+Field contract before its bytes are emitted. The writer is eager and sequential —
 it assembles byte vectors and copies buffer contents into message bodies;
 the report's parallel encode pipeline with byte-credit accounting, its
 incremental `IO` sink tiers, and append-as-resume remain production work.
-Arrays with a nonzero element offset are refused (materialize first), each
-field gets its own dictionary id (identity-shared pools re-encode per
-field), and the file format refuses pools that change identity across
-batches (one dictionary batch per id). `readfile` verifies both magics, the
-footer, and every Block's extents before use; `ArrowFile` decodes record
-batches lazily by footer index — each `getindex` runs with a fresh
+Arrays with a nonzero element offset are refused (materialize first). Each
+schema position must use a distinct `Field` object and gets its own dictionary
+id; identity-shared pools re-encode per field. Canonical empty offset arrays
+materialize their required terminal zero on the wire. The file format refuses
+pools that change identity across batches (one dictionary batch per id).
+`readfile` verifies both magics, the leading and footer schemas, cumulative
+footer work, and every Block's extents and overlap before use; `ArrowFile`
+decodes record batches lazily by footer index — each `getindex` runs with a fresh
 allocation budget and codec contexts over the shared, eagerly-decoded
 dictionary set, so concurrent reads need no coordination. An `mmapregion`
 input exercises the same path over a mapped file.
+
+Core supports the full Int8 union-id domain and the IPC writer preserves
+custom mappings. The 2.x interoperability checks use canonical union ids;
+Arrow.jl 2.x currently treats a custom id as a child position and cannot read
+that valid form.
 
 The IPC read example reads one borrowed `Vector{UInt8}` and eagerly decodes
 all batches before it exposes the `RecordBatchSource` pull interface. The
@@ -223,6 +233,10 @@ until Core releases it. Import checks the pointer tables, counts, descriptor
 shape, and checked geometry that the ABI does expose. Import and export run
 full UTF-8 validation. Field names that contain an embedded NUL are rejected
 because the C interface uses NUL-terminated strings.
+The format parser accepts only the specified decimal integer grammar, bounds
+decimal descriptors and union ids before recursive or geometry work, and
+rejects invalid UTF-8 or embedded NULs. Empty offset layouts export and require
+one non-NULL terminal zero offset for strict cross-implementation parity.
 
 The C release callbacks use producer-owned canonical child and dictionary
 topology, so cleanup does not depend on caller-mutated public counts or pointer
@@ -265,8 +279,9 @@ vector. External writes or truncation of a mapped file while the mapping or
 cached validation results remain in use are unsupported. On systems that
 prohibit deleting active mapped files, collection must complete before the
 path can be deleted.
-The ABI layout checks include 32-bit expectations, but this review executed
-them only on the available 64-bit host.
+The ABI layout checks include 32-bit expectations. The standard prove-out is
+currently executed on available 64-bit hosts; the 32-bit branch is inspected
+but not exercised there.
 
 ## Trim-compile support (JuliaC `--trim=safe`)
 
@@ -321,7 +336,8 @@ on. Relatedly, `Threads.Atomic` boxes appear nowhere in `core/`. The
 `ArrowCore` module uses atomics only for the two `ArrayData` validation caches
 and the `ReleaseCounter` test utility; its constrained memory model has no
 region lifecycle to synchronize. The adapters add one pull-claim flag on
-`IPCStream` and one exactly-once flag on `ForeignOwner`.
+`IPCStream` and one exactly-once flag on each of `ForeignOwner` and
+`StreamOwner`.
 
 ## Compression
 

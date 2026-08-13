@@ -1949,9 +1949,8 @@ end
     RecordBatch
 
 Schema + equal-length columns: the intended interchange unit in report §9.
-The implemented IPC adapter uses batches. Future C-stream and partition
-adapters can use the same boundary; chunked columns remain a facade
-convenience.
+The implemented IPC and C-stream adapters use batches. Future partition
+adapters can use the same boundary; chunked columns remain a facade convenience.
 """
 struct RecordBatch
     schema::Schema
@@ -1991,7 +1990,7 @@ end
 
 The shared pull-iteration protocol (report §9): implement
 `nextbatch!(src) -> Union{Nothing,RecordBatch}` and `schema(src)`. The IPC
-reader presents this shape. A future C-stream importer and facade can use the
+reader and C-stream importer present this shape. A future facade can use the
 same shape so that a dataset layer or writer need not know which adapter
 produced the stream.
 """

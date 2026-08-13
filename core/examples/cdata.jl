@@ -67,7 +67,9 @@
 # references before GC and import. It also exports a Core batch (integer,
 # nullable floating-point, string, and list columns), materializes and compares
 # imported columns, releases and reaps them, and proves that the registry is
-# empty and double release is inert.
+# empty and double release is inert. The final section maps
+# `ArrowArrayStream` in both directions, with one independently-owned export
+# root per result and exception-safe move/release handoffs.
 # =============================================================================
 
 include(joinpath(@__DIR__, "..", "ArrowCore.jl"))
