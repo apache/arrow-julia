@@ -19,8 +19,9 @@
 
 Prove-out of the runtime-tagged, C-data-shaped core proposed in the Arrow.jl
 redesign report (Arrow-redesign-report.md, §9). Standalone: depends only on
-Base. The existing package is untouched; `core/examples/` shows how the IPC
-and C-data adapters sit on top of this module.
+Base and the Mmap standard library. The existing package is untouched;
+`core/examples/` shows how the IPC and C-data adapters sit on top of this
+module.
 
 Design rules this module is built to demonstrate:
 
@@ -39,9 +40,10 @@ Design rules this module is built to demonstrate:
    trusted declaration because that ABI supplies no allocation sizes. Views
    hold GC *reachability* of the region; every
    pointer dereference additionally takes a short-lived access *guard*, so a
-   deterministic `forceclose!` can wait out in-flight access, invalidate all
-   views via a generation bump, and unmap — an escaped view can delay a
-   forced close only for the duration of a guard, never forever.
+   deterministic `forceclose!` can wait out in-flight access and invalidate
+   all views. It then runs an owned release action or drops a GC anchor. An
+   escaped view can delay a forced close only for the duration of a guard,
+   never forever. Mmap stdlib storage is unmapped later by its GC finalizer.
 
 3. One structural layout registry. `layoutspec(type)` returns the buffer
    roles / child arity / offset width for each of the format-1.5 layouts.
@@ -126,17 +128,17 @@ const PHASE_CLOSED = 2
 # Trim-compile support (JuliaC `--trim=safe`) forbids reachable dynamic
 # dispatch, and an `Any`-typed release callback is exactly that. The insight
 # that makes this a design improvement rather than a workaround: release
-# behavior in the real system IS a closed set — nothing (GC-owned memory),
-# munmap (mapped files), one C callback (foreign/C-data trees), and the
-# notify/rendezvous observers the lifecycle tests need. Encoding it as data
-# on one concrete struct keeps `_run_release!` fully static, makes release
-# behavior serializable/inspectable, and removes a whole class of
-# "arbitrary code inside the lifecycle state machine" hazards.
+# behavior that needs an action in the real system IS a closed set — one C
+# callback for foreign/C-data trees, plus the notify/rendezvous observers the
+# lifecycle tests need. Heap and mapped storage are GC-owned and use no
+# action. Encoding the active cases as data on one concrete struct keeps
+# `_run_release!` fully static, makes release behavior serializable/inspectable,
+# and removes a whole class of "arbitrary code inside the lifecycle state
+# machine" hazards.
 # ---------------------------------------------------------------------------
 
-# `@atomic`-field helpers used across the lifecycle machinery. (Base's
-# `Threads.Atomic` boxes are effectively deprecated in favor of atomic
-# struct fields; nothing in this module uses them.)
+# Atomic observation-counter helper. The region lifecycle itself uses plain
+# fields under its condition lock. `Threads.Atomic` boxes appear nowhere.
 
 "An exactly-once/observation counter with a single atomic field."
 mutable struct ReleaseCounter
@@ -215,26 +217,28 @@ without one.
 
 Lifetime contract (report §9 "two lifetime modes"):
 
-  * Shared mode (default): views keep the region reachable; `release` runs
-    from the finalizer when the last reference dies. This is today's
-    behavior, minus the segfaults.
+  * Shared mode (default): views keep the region and its GC root reachable.
+    A foreign release action runs from the region finalizer when the last
+    reference dies. A mapped root uses the Mmap stdlib's own finalizer.
   * Scoped mode: `forceclose!(region)` transitions open→closing (new guards
     now fail), waits for in-flight guards (bounded: guards are short-lived),
-    releases, bumps the generation, and marks the region closed. On guard
-    wait timeout it atomically restores `open` and returns `false` — the
-    caller retries or gives up; there is no half-closed limbo.
+    releases, and marks the region closed. On guard-wait timeout it restores
+    `open` under the same condition lock and returns `false` — the caller
+    retries or gives up; there is no half-closed limbo.
 
-`root` is the GC anchor for borrowed memory (the wrapped Julia array, the
-adapter's byte blob). `releasefn` is executed exactly once when the memory
-itself must be returned (munmap or a C release callback); `nothing` for
-memory the GC owns via `root`.
+`root` is the GC anchor for borrowed or mapped memory (the wrapped Julia
+array, mapped array, or adapter byte blob). `releasefn` is executed exactly
+once for foreign memory and internal lifecycle observers; it is `nothing`
+when memory is GC-owned through `root`. Normal property assignment is
+read-only. The close protocol performs its internal field transitions under
+the condition lock.
 """
 mutable struct OwnerRegion
     const ptr::Ptr{UInt8}
     const len::Int64
     const kind::MemoryKind
     const alignment::Int    # actual alignment of ptr; slices/views consult it
-    root::Any               # GC anchor for borrowed memory; cleared on close
+    root::Any               # GC anchor for borrowed/mapped memory; cleared on close
     # Foreign C-data trees use one zero-length lifecycle region for every
     # buffer allocation in the moved tree. `nothing` means this region owns
     # its own state. A shared lifecycle makes release and invalidation one
@@ -330,7 +334,7 @@ end
 function _finalize_region!(r::OwnerRegion)
     # Natural finalization implies no live guards, but `finalize(r)` is also
     # a public Julia operation and can be called while `r` is reachable.
-    # Use the same CAS/guard handshake as explicit close. If a manual
+    # Use the same condition/guard protocol as explicit close. If a manual
     # finalization finds the region busy, install the backstop again.
     if !forceclose!(r; timeout_ms=0)
         _register_region_finalizer!(r)
@@ -479,18 +483,21 @@ end
 """
     forceclose!(region; timeout_ms=1000) -> Bool
 
-Deterministically release the region (scoped mode). Returns `true` when the
-region was released (or already closed). On guard-wait timeout, restores
-`open` and returns `false`: the region is exactly as it was and the call may
-simply be retried. After a successful close every view built on the region
-throws `InvalidatedError` on access.
+Deterministically close the region (scoped mode). Returns `true` when the
+region was closed (or already closed). On guard-wait timeout, restores `open`
+and returns `false`: the region is exactly as it was and the call may simply
+be retried. After a successful close every view built on the region throws
+`InvalidatedError` on access. A mapped region drops its array anchor here;
+the Mmap stdlib performs the actual unmap later at collection.
 
 The release action runs OUTSIDE the lock (it may block, e.g. the rendezvous
 test action), with the region in `closing`: new guards and competing closers
 wait on the condition and observe the final `closed` state. The action is
 exactly-once even if it throws — the `finally` publishes `closed` and clears
-the action either way. `timeout_ms=0` never waits: it reports busy
-immediately (used by finalizers, which must not block).
+the action either way. `timeout_ms=0` never waits for guards or another
+closer: it reports busy immediately. A winning call still runs its release
+action, whose own work may block. Finalizers use zero only to avoid lifecycle
+waits.
 """
 function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
     r = _lifecycle(r)
@@ -594,10 +601,19 @@ packages use) is version-fragile. If/when a public API lands upstream, a
 release action can restore eager unmap without changing this type's
 contract.
 
+The anchor is an intentionally fixed-size `Matrix{UInt8}`. A mapped Vector
+can be resized on Julia 1.11 and later, which detaches it from its mapped
+storage and would invalidate a cached pointer. The matrix has the same
+contiguous bytes but no in-place resize operation. Core keeps it reachable
+for every open guarded access and checks this pointer-stability contract in
+tests across GC.
+
 The caller must prevent external writes or truncation of the mapped file
 while the region or any cached validation result remains in use: a shared
 mapping cannot keep a semantic certificate valid when another process
-changes its bytes, and truncation can make an in-range load fault.
+changes its bytes, and truncation can make an in-range load fault. On systems
+that forbid deleting a mapped file, collect the dropped mapping after close
+before deleting its path.
 """
 function mmapregion(path::AbstractString)
     io = open(path, "r")

@@ -22,8 +22,9 @@
 A working implementation of the runtime-tagged, C-data-shaped core proposed
 in the Arrow.jl redesign report (`Arrow-redesign-report.md`, §9). Two examples
 show how IPC and C Data adapters sit above that core. Nothing outside `core/`
-is changed. `ArrowCore.jl` depends only on Base; the IPC example uses the
-repository project to write fixtures and reuse its generated metadata bindings.
+is changed. `ArrowCore.jl` depends on Base and the Mmap standard library; the
+IPC example uses the repository project to write fixtures and reuse its
+generated metadata bindings.
 
 This is more than a sketch and less than a package. It contains enough code,
 tests, and adversarial fixtures to test the architecture. The exact limits are
@@ -53,7 +54,7 @@ julia --startup-file=no core/test/trim_compile_tests.jl         # JuliaC --trim=
 | Report claim (§) | Where proven |
 |---|---|
 | Ownership as an object; bad owned/verified spans fail before access (§8.2) | `OwnerRegion`, checked `BufferSlice` construction, guarded `loadat`, and staged-validation tests. Foreign C extents remain a trusted declaration. |
-| Deterministic close (§9 Core) | `withguard` and `forceclose!` use one lifecycle word. A sole closer blocks new guards, waits for active guards, restores open state on timeout, and publishes a new closed generation after release. Finalization uses the same protocol. |
+| Deterministic close (§9 Core) | `withguard` and `forceclose!` use one `Threads.Condition`. A sole closer blocks new guards, waits for active guards, restores open state on timeout, and publishes closed state after release. Finalization uses the same protocol. Mapped close invalidates views and drops the array anchor; the stdlib unmaps at collection. |
 | Logical parameters are values (§8.1) | `TimestampType(unit, timezone)`, `DecimalType(precision, scale, bitwidth)`, and the other descriptors keep schema data out of Julia type parameters. |
 | One structural registry plus bounded per-layout methods (§8.4) | `layoutspec` defines buffer roles, child arity, offset width, and variadic status. Access and semantic rules remain grouped methods. |
 | Staged validation and bounded IPC metadata work (§8.5) | Structural checks are separate from semantic and full checks, and each later public stage composes the earlier stages. Data-intrinsic semantic results are cached; Field contracts run every time. The IPC framer enforces metadata, body, message, and allocation limits; the byte verifier enforces object, depth, and copy-reserve limits; and the decode cursor enforces array and buffer limits before the related work. |
@@ -178,8 +179,12 @@ the Mmap STDLIB (cross-platform); `forceclose!` on a mapped region
 invalidates every view and drops the GC anchor, with the actual unmap
 happening when the array is collected — eager unmapping waits on a public
 stdlib API (reaching around the stdlib's internal finalizer is
-version-fragile). External writes or truncation of a mapped file while the
-mapping or cached validation results remain in use are unsupported.
+version-fragile). The anchor is a fixed-size `Matrix{UInt8}` because mapped
+Vectors can detach from their storage when resized on Julia 1.11 and later.
+Tests prove that its pointer stays stable across GC while open. External writes
+or truncation of a mapped file while the mapping or cached validation results
+remain in use are unsupported. On systems that prohibit deleting active mapped
+files, collection must complete after close before the path can be deleted.
 The ABI layout checks include 32-bit expectations, but this review executed
 them only on the available 64-bit host.
 
@@ -203,9 +208,10 @@ implementation:
 - **Literal load widths.** `loadat(b, T, off)` with a runtime `T::DataType`
   builds an unresolvable guarded closure; accessors branch to literal widths
   instead (also faster).
-- **CAS instead of atomic RMW.** JuliaC's verifier has not implemented
+- **CAS for the remaining atomic counter.** JuliaC's verifier has not implemented
   `Core.modifyfield!` (each `@atomic x.f += 1` is a verifier warning), while
-  `@atomicreplace` verifies clean — counters and guards use CAS loops.
+  `@atomicreplace` verifies clean, so `ReleaseCounter` uses a CAS loop. Region
+  state and guards are plain fields under one `Threads.Condition`.
 - **`Ptr{Cvoid}` finalizers.** Base's generic `finalizer(f, o)` is
   `@nospecialize`d and unresolvable; the typed pointer form
   (`finalizer(@cfunction(...), o)`) is an ordinary ccall. The C entry
@@ -233,12 +239,12 @@ delivered. Ordinary exception safety (error paths clean up; release is
 exactly-once, even when the release action itself throws) **is** in
 contract and tested. A formal revisit is planned when Julia 1.14's
 structured cancellation gives Base a real system to build on. Relatedly,
-`Threads.Atomic` boxes appear nowhere in `core/` — atomic state lives in
-`@atomic` struct fields (`ReleaseCounter`) — and the region lifecycle
-itself needs none: its state and guard count are plain Ints under one
-`Threads.Condition`, with waiters using wait/notify rather than spin/yield
-loops, and the release action running outside the lock so blocking actions
-cannot deadlock closers or acquirers.
+`Threads.Atomic` boxes appear nowhere in `core/`; only `ReleaseCounter` keeps
+an `@atomic` struct field. The region lifecycle itself needs no atomics: its
+state and guard count are plain Ints under one `Threads.Condition`, with
+waiters using wait/notify rather than spin/yield loops. The release action
+runs outside the lock so blocking actions cannot deadlock closers or
+acquirers.
 
 ## Compression
 
