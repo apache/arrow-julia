@@ -280,7 +280,7 @@ function _vvector(t::_VTable, slot::Int, elemsize::Int;
     _vcount!(state, n, "vector entries")
     start = AC.checked_add(p, Int64(4))
     _vrange(t.bytes, start, AC.checked_mul(n, Int64(elemsize)), "vector data")
-    elemsize > 1 && start % min(elemsize, 8) != 0 &&
+    n > 0 && elemsize > 1 && start % min(elemsize, 8) != 0 &&
         _vfail("vector data is misaligned")
     _vcharge!(state, AC.checked_add(METADATA_VECTOR_BASE_RESERVE,
         AC.checked_mul(n, METADATA_VECTOR_ELEMENT_RESERVE)), "vector")
@@ -1337,6 +1337,42 @@ function _zero_width_schema_stream(fixedlist::Bool)
     return _schema_stream_from_field!(b, field)
 end
 
+function _misaligned_empty_buffers_stream()
+    # FlatBuffers C++ historically aligns an empty vector only for its UInt32
+    # length, not for an element that does not exist. Official Arrow
+    # integration streams therefore contain empty vectors of 16-byte Buffer
+    # structs whose nominal element area is four-byte aligned. Relocate the
+    # empty buffers vector from a 2.x-written zero-row Null batch to reproduce
+    # that valid encoding without carrying a binary fixture in this example.
+    io = IOBuffer()
+    Arrow.write(io, (x=Missing[],); file=false)
+    bytes = take!(io)
+    frames = _frameinfo(bytes)
+    schemaidx = only(findall(x -> x.kind == 1, frames))
+    recordidx = only(findall(x -> x.kind == 3, frames))
+    eosidx = only(findall(x -> x.kind == 0, frames))
+
+    meta = copy(bytes[frames[recordidx].metadata])
+    msg = _vtable(meta, Int64(_vu32(meta, 0)))
+    record = _headertable(meta, msg)
+    bufferslot = _vfield(record, 2, 4; required=true)
+    oldvector = _vref(record, 2; required=true)
+    _vu32(meta, oldvector) == 0 || error("Null fixture has nonempty buffers")
+
+    target = Int64(length(meta))
+    target % 8 == 0 || error("padded metadata is not eight-byte aligned")
+    append!(meta, zeros(UInt8, 8)) # zero length plus framing padding
+    _write_u32!(meta, bufferslot, UInt32(target - bufferslot))
+
+    out = UInt8[]
+    append!(out, bytes[frames[schemaidx].frame])
+    append!(out, reinterpret(UInt8,
+        UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
+    append!(out, meta)
+    append!(out, bytes[frames[eosidx].frame])
+    return out
+end
+
 # ---------------------------------------------------------------------------
 # Acceptance: 2.x writes, Core reads
 # ---------------------------------------------------------------------------
@@ -1350,6 +1386,12 @@ function main()
     end
     @assert hostgate
     println("unsupported hosts fail before generated metadata getters ✓")
+
+    emptybuffers = readstream(_misaligned_empty_buffers_stream())
+    @assert emptybuffers.batches[1].nrows == 0
+    @assert isempty(materialize(emptybuffers.schema.fields[1],
+        emptybuffers.batches[1].columns[1]))
+    println("empty struct vectors need no nominal element alignment ✓")
 
     expected = (
         ints=Int64[1, 2, 3, 4, 5],
