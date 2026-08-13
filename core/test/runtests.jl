@@ -115,6 +115,18 @@ end
             (_p, _len) -> (committed_calls[] += 1))
         @test committed_calls[] == 1
 
+        rollback_state = Threads.Atomic{UInt8}(0x00)
+        rollback_interrupts = Ref(0)
+        @test_throws InterruptException AC._release_mapping_once!(
+            rollback_state, Ptr{Cvoid}(1), 1,
+            (_p, _len) -> throw(InterruptException());
+            before_rollback=() -> begin
+                rollback_interrupts[] += 1
+                rollback_interrupts[] == 1 && throw(InterruptException())
+            end)
+        @test rollback_state[] == 0x00
+        @test rollback_interrupts[] == 2
+
         # A constructor failure has no escaped owner that can retry cleanup.
         # An interrupted attempt must finish before the original error escapes.
         construction_attempts = Ref(0)
@@ -126,6 +138,25 @@ end
         @test_throws ErrorException AC._mmapregion(path, makeowner;
             unmapper=construction_unmapper)
         @test construction_attempts[] == 2
+
+        # A successful mmap is owned before any later hook or constructor can
+        # fail. The catch releases it once even before an OwnerRegion exists.
+        mapped = Ref{Ptr{Cvoid}}(C_NULL)
+        after_mmap_unmaps = Ref(0)
+        mapper = function (fd, len)
+            mapped[] = ccall(:mmap, Ptr{Cvoid},
+                (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
+                C_NULL, len, 1, 1, fd, 0)
+        end
+        @test_throws InterruptException AC._mmapregion(path;
+            mapper=mapper,
+            after_mmap=(_p, _len) -> throw(InterruptException()),
+            unmapper=(p, len) -> begin
+                after_mmap_unmaps[] += 1
+                AC._munmap!(p, len)
+            end)
+        @test mapped[] != Ptr{Cvoid}(-1)
+        @test after_mmap_unmaps[] == 1
 
         # The mmap-specific OwnerRegion callback has the same no-escape rule.
         # Generic callbacks are still exactly-once when they throw.

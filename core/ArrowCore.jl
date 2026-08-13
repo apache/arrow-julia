@@ -340,7 +340,17 @@ function _forceclose!(r::OwnerRegion, timeout_ms::Integer, waitfn;
     catch
         # Any failure before callback entry returns the exact close claim. The
         # callback commit above owns all failures after release starts.
-        claimed && !release_started && (@atomicreplace r.state closing => st)
+        if claimed && !release_started
+            while phase(@atomic r.state) == PHASE_CLOSING
+                try
+                    Base.disable_sigint() do
+                        @atomicreplace r.state closing => st
+                    end
+                catch e
+                    e isa InterruptException || rethrow()
+                end
+            end
+        end
         rethrow()
     end
 end
@@ -387,7 +397,7 @@ function _munmap!(p::Ptr, len::Integer)
 end
 
 function _release_mapping_once!(state::Threads.Atomic{UInt8}, p::Ptr,
-    len::Integer, unmapper; after_release=nothing)
+    len::Integer, unmapper; after_release=nothing, before_rollback=nothing)
     # The constructor catch and an already-armed OwnerRegion finalizer can
     # race to return the same mapping. Serialize attempts with a retryable
     # LIVE -> RELEASING -> RELEASED state. An unmapper failure restores LIVE;
@@ -413,7 +423,21 @@ function _release_mapping_once!(state::Threads.Atomic{UInt8}, p::Ptr,
             after_release === nothing || after_release()
         end
     catch
-        owned && state[] == 0x01 && (state[] = 0x00)
+        if owned
+            # A failed unmap must return the release claim before it escapes.
+            # A second interruption at this rollback boundary cannot strand
+            # RELEASING and make every later cleanup spin forever.
+            while state[] == 0x01
+                try
+                    Base.disable_sigint() do
+                        before_rollback === nothing || before_rollback()
+                        Threads.atomic_cas!(state, 0x01, 0x00)
+                    end
+                catch e
+                    e isa InterruptException || rethrow()
+                end
+            end
+        end
         rethrow()
     end
     return nothing
@@ -435,7 +459,7 @@ function _release_mapping_noescape!(state::Threads.Atomic{UInt8}, p::Ptr,
 end
 
 function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
-    unmapper=_munmap!)
+    unmapper=_munmap!, mapper=nothing, after_mmap=nothing)
     Sys.isunix() || error("mmapregion: prove-out implements POSIX only")
     open(path, "r") do io
         # Size the exact opened file descriptor. Sizing the path first lets
@@ -451,19 +475,29 @@ function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
         released = Threads.Atomic{UInt8}(0x00)
         release = (r::OwnerRegion) ->
             _release_mapping_noescape!(released, r.ptr, r.len, unmapper)
-        p = ccall(:mmap, Ptr{Cvoid},
-            (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
-            C_NULL, len, 1 #= PROT_READ =#, 1 #= MAP_SHARED =#, fd, 0)
-        p == Ptr{Cvoid}(-1) && Base.systemerror("mmap($path)", true)
-        # `mmap` has transferred ownership to us, but OwnerRegion has not yet
-        # registered its finalizer. Nothing fallible may cross that handoff
-        # without returning the mapping directly.
+        p = Ptr{Cvoid}(-1)
         try
-            owner = makeowner(Ptr{UInt8}(p), len, Mmap;
-                releasefn=release)::OwnerRegion
-            return owner
+            # Defer SIGINT from successful mmap through finalizer arming and
+            # the return handoff. The catch owns the shared release token for
+            # every failure after the kernel transfers the mapping.
+            return Base.disable_sigint() do
+                p = if mapper === nothing
+                    ccall(:mmap, Ptr{Cvoid},
+                        (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
+                        C_NULL, len, 1 #= PROT_READ =#,
+                        1 #= MAP_SHARED =#, fd, 0)
+                else
+                    mapper(fd, len)
+                end
+                p == Ptr{Cvoid}(-1) &&
+                    Base.systemerror("mmap($path)", true)
+                after_mmap === nothing || after_mmap(p, len)
+                return makeowner(Ptr{UInt8}(p), len, Mmap;
+                    releasefn=release)::OwnerRegion
+            end
         catch
-            _release_mapping_noescape!(released, p, len, unmapper)
+            p == Ptr{Cvoid}(-1) ||
+                _release_mapping_noescape!(released, p, len, unmapper)
             rethrow()
         end
     end
