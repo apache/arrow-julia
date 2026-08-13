@@ -99,6 +99,8 @@ end
 const ARROW_FLAG_NULLABLE = Int64(2)
 const ARROW_FLAG_DICTIONARY_ORDERED = Int64(1)
 const ARROW_FLAG_MAP_KEYS_SORTED = Int64(4)
+const ARROW_FLAG_ALL_SUPPORTED = ARROW_FLAG_NULLABLE |
+    ARROW_FLAG_DICTIONARY_ORDERED | ARROW_FLAG_MAP_KEYS_SORTED
 
 # ---------------------------------------------------------------------------
 # Format strings <-> Core descriptors (the subset the demo exercises)
@@ -707,8 +709,22 @@ function _import_cstring(p::Ptr{UInt8}, what::AbstractString)
     return s
 end
 
+function _validate_schema_flags(sch::CArrowSchema, fmt::AbstractString)
+    sch.flags & ~ARROW_FLAG_ALL_SUPPORTED == 0 ||
+        throw(ValidationError("C schema contains unsupported flag bits"))
+    (sch.flags & ARROW_FLAG_DICTIONARY_ORDERED == 0 ||
+        sch.dictionary != C_NULL) ||
+        throw(ValidationError(
+            "ARROW_FLAG_DICTIONARY_ORDERED requires a dictionary schema"))
+    (sch.flags & ARROW_FLAG_MAP_KEYS_SORTED == 0 || fmt == "+m") ||
+        throw(ValidationError(
+            "ARROW_FLAG_MAP_KEYS_SORTED requires a map schema"))
+    return nothing
+end
+
 function _import_field(sch::CArrowSchema)::Field
     fmt = _import_cstring(sch.format, "format")
+    _validate_schema_flags(sch, fmt)
     name = sch.name == C_NULL ? "" : _import_cstring(sch.name, "field name")
     nullable = (sch.flags & ARROW_FLAG_NULLABLE) != 0
     t = parseformat(fmt, sch.flags)
@@ -860,6 +876,27 @@ function _expect_invalid_dictionary_topology!(mutate)
     sp, ap = to_c_data(f, d)
     @assert !forceclose!(source_region; timeout_ms=0)
     mutate(sp, ap)
+    @assert try
+        from_c_data(sp, ap)
+        false
+    catch e
+        e isa ValidationError
+    end
+    @assert unsafe_load(sp).release == C_NULL
+    @assert unsafe_load(ap).release == C_NULL
+    @assert reap!() == 2
+    @assert _registry_count() == before
+    @assert forceclose!(source_region; timeout_ms=0)
+    return nothing
+end
+
+function _expect_invalid_schema_flags!(flags::Int64)
+    f, d = fromjulia("bad-flags", Int64[1])
+    source_region = d.buffers[2].region
+    before = _registry_count()
+    sp, ap = to_c_data(f, d)
+    @assert !forceclose!(source_region; timeout_ms=0)
+    _store_field!(sp, :flags, flags)
     @assert try
         from_c_data(sp, ap)
         false
@@ -1368,6 +1405,14 @@ function main()
     @assert reap!() == 2
     @assert _registry_count() == 0
     println("invalid C pointer tables fail with exact cleanup ✓")
+
+    # Flags carry schema semantics, so the importer must reject unknown bits
+    # and known flags on layouts where those meanings do not apply. Silent
+    # acceptance would discard information that this adapter cannot preserve.
+    _expect_invalid_schema_flags!(Int64(8))
+    _expect_invalid_schema_flags!(ARROW_FLAG_DICTIONARY_ORDERED)
+    _expect_invalid_schema_flags!(ARROW_FLAG_MAP_KEYS_SORTED)
+    println("unknown and type-invalid schema flags fail with exact cleanup ✓")
 
     # A failed import invokes producer callbacks after it has copied the
     # caller-visible structs. Cleanup must therefore use the topology that the
