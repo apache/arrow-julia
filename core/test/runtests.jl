@@ -894,6 +894,25 @@ end
         visible_list = AC.ArrayData(lt, 1, [BufferSlice(), offsets];
             children=[cd], nullcount=0)
         @test_throws ValidationError validate_semantic(lf, visible_list)
+
+        keyfield = Field("key", IntType(64, true); nullable=false)
+        keydata = AC.ArrayData(keyfield.type, 1,
+            [AC._databuffer(UInt8[0x00]), AC._databuffer(Int64[0])];
+            nullcount=1)
+        valuefield, valuedata = fromjulia("value", Int64[1])
+        entriesfield = Field("entries", StructType(); nullable=false,
+            children=[keyfield, valuefield])
+        entriesdata = AC.ArrayData(StructType(), 1, [BufferSlice()];
+            children=[keydata, valuedata], nullcount=0)
+        mt = MapType(false)
+        mf = Field("map", mt; children=[entriesfield])
+        masked_map = AC.ArrayData(mt, 1,
+            [AC._databuffer(UInt8[0x00]), offsets];
+            children=[entriesdata], nullcount=1)
+        @test validate_semantic(mf, masked_map) === masked_map
+        visible_map = AC.ArrayData(mt, 1, [BufferSlice(), offsets];
+            children=[entriesdata], nullcount=0)
+        @test_throws ValidationError validate_semantic(mf, visible_map)
     end
 
     @testset "union contracts inspect only selected child slots" begin
@@ -913,6 +932,24 @@ end
             [AC._databuffer(Int8[1]), AC._databuffer(Int32[0])];
             children=[ad, bd], nullcount=0)
         @test_throws ValidationError validate_semantic(f, selected_null)
+
+        # Sparse selection applies the parent offset, but still ignores every
+        # unselected child's storage at that logical position.
+        saf, sad = fromjulia("a", Int64[1, 2])
+        sbf = Field("b", IntType(64, true); nullable=false)
+        sbd = AC.ArrayData(sbf.type, 2,
+            [AC._databuffer(UInt8[0x00]), AC._databuffer(Int64[0, 0])];
+            nullcount=2)
+        st = UnionType(AC.SparseMode, Int8[0, 1])
+        sf = Field("u", st; children=[saf, sbf])
+        sparse_valid = AC.ArrayData(st, 1,
+            [AC._databuffer(Int8[1, 0])]; offset=1,
+            children=[sad, sbd], nullcount=0)
+        @test validate_semantic(sf, sparse_valid) === sparse_valid
+        sparse_null = AC.ArrayData(st, 1,
+            [AC._databuffer(Int8[0, 1])]; offset=1,
+            children=[sad, sbd], nullcount=0)
+        @test_throws ValidationError validate_semantic(sf, sparse_null)
     end
 
     @testset "nested dictionary pools retain field contracts" begin
