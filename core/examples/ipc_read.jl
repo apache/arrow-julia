@@ -900,17 +900,90 @@ mutable struct PendingRecord
     slot::Int
 end
 AC.schema(s::IPCStream) = s.schema
-function AC.nextbatch!(s::IPCStream)
-    _, claimed = @atomicreplace s.pulling false => true
-    claimed || throw(Base.ConcurrencyViolationError(
-        "IPCStream supports only one active nextbatch! call"))
-    try
-        s.nextindex > length(s.batches) && return nothing
-        b = s.batches[s.nextindex]
-        s.nextindex += 1
+
+function _ipc_retry_interrupts(f)
+    while true
+        try
+            return Base.disable_sigint(f)
+        catch e
+            e isa InterruptException || rethrow()
+        end
+    end
+end
+
+function _nextbatch_body!(s, claimed, advanced, oldindex,
+    after_claim, after_advance)
+    return Base.disable_sigint() do
+        _, ok = @atomicreplace s.pulling false => true
+        ok || throw(Base.ConcurrencyViolationError(
+            "IPCStream supports only one active nextbatch! call"))
+        claimed[] = true
+        oldindex[] = s.nextindex
+        after_claim === nothing || after_claim()
+        oldindex[] > length(s.batches) && return nothing
+        b = s.batches[oldindex[]]
+        s.nextindex = oldindex[] + 1
+        advanced[] = true
+        after_advance === nothing || after_advance()
         return b
+    end
+end
+
+function _rollback_nextbatch!(s, claimed, advanced, oldindex)
+    if advanced[]
+        _ipc_retry_interrupts() do
+            if advanced[]
+                s.nextindex = oldindex[]
+                advanced[] = false
+            end
+        end
+    end
+    return nothing
+end
+
+function _release_nextbatch_claim!(s, claimed)
+    if claimed[]
+        _ipc_retry_interrupts() do
+            if claimed[]
+                @atomic :release s.pulling = false
+                claimed[] = false
+            end
+        end
+    end
+    return nothing
+end
+
+function AC.nextbatch!(s::IPCStream)
+    claimed = Ref(false)
+    advanced = Ref(false)
+    oldindex = Ref(0)
+    try
+        # This exact public frame owns both cursor state changes through its
+        # return. A helper records every claim in caller-owned slots, so an
+        # exception at the helper-return boundary still rolls the index back.
+        return _nextbatch_body!(s, claimed, advanced, oldindex,
+            nothing, nothing)
+    catch
+        _rollback_nextbatch!(s, claimed, advanced, oldindex)
+        rethrow()
     finally
-        @atomic :release s.pulling = false
+        _release_nextbatch_claim!(s, claimed)
+    end
+end
+
+function _nextbatch!(s::IPCStream; after_claim=nothing,
+    after_advance=nothing)
+    claimed = Ref(false)
+    advanced = Ref(false)
+    oldindex = Ref(0)
+    try
+        return _nextbatch_body!(s, claimed, advanced, oldindex,
+            after_claim, after_advance)
+    catch
+        _rollback_nextbatch!(s, claimed, advanced, oldindex)
+        rethrow()
+    finally
+        _release_nextbatch_claim!(s, claimed)
     end
 end
 
@@ -1614,6 +1687,25 @@ function main()
     @assert nextbatch!(pulled) isa RecordBatch
     @assert nextbatch!(pulled) === nothing
     println("RecordBatchSource pull protocol works ✓")
+
+    interrupted_pulls = readstream(bytes)
+    for boundary in (:claim, :advance)
+        @assert try
+            _nextbatch!(interrupted_pulls;
+                after_claim=boundary == :claim ?
+                    () -> throw(InterruptException()) : nothing,
+                after_advance=boundary == :advance ?
+                    () -> throw(InterruptException()) : nothing)
+            false
+        catch e
+            e isa InterruptException
+        end
+        @assert !(@atomic interrupted_pulls.pulling)
+        @assert interrupted_pulls.nextindex == 1
+    end
+    @assert nextbatch!(interrupted_pulls) isa RecordBatch
+    @assert interrupted_pulls.nextindex == 2
+    println("interrupted IPC pulls restore their claim and cursor ✓")
 
     reporoot = normpath(joinpath(@__DIR__, "..", ".."))
     stresscmd = `$(Base.julia_cmd()) --startup-file=no --threads=4 --project=$reporoot $(abspath(@__FILE__))`
