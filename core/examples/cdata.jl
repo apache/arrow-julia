@@ -180,8 +180,9 @@ function _claim_array_node(a::Ptr{CArrowArray})
         topology === nothing && error("C Data array topology disappeared during release")
         flag = unsafe_load(Ptr{UInt8}(p))
         flag == 0x00 || return nothing
+        claimed = (p, topology)
         unsafe_store!(Ptr{UInt8}(p), 0x01)
-        (p, topology)
+        return claimed
     end
 end
 
@@ -199,8 +200,9 @@ function _claim_schema_node(s::Ptr{CArrowSchema})
         topology === nothing && error("C Data schema topology disappeared during release")
         flag = unsafe_load(Ptr{UInt8}(p))
         flag == 0x00 || return nothing
+        claimed = (p, topology)
         unsafe_store!(Ptr{UInt8}(p), 0x01)
-        (p, topology)
+        return claimed
     end
 end
 
@@ -212,70 +214,166 @@ function _finish_node!(p, control::Ptr{Cvoid})
     lock(REGISTRY_LOCK) do
         unsafe_load(Ptr{UInt8}(control)) == 0x01 ||
             error("C Data node is not in releasing state")
-        _store_field!(p, :release, Ptr{Cvoid}(C_NULL))
         key = unsafe_load(Ptr{Int64}(control + 8))
         root = get(EXPORT_REGISTRY, key, nothing)
         root === nothing && error("C Data export root disappeared during release")
         root.remaining > 0 || error("C Data export node counter underflow")
-        unsafe_store!(Ptr{UInt8}(control), 0x02)
         root.remaining -= 1
+        unsafe_store!(Ptr{UInt8}(control), 0x02)
+        _store_field!(p, :release, Ptr{Cvoid}(C_NULL))
     end
     return nothing
 end
 
-function _release_array_children!(topology)
+function _reset_node_claim!(control::Ptr{Cvoid})
+    lock(REGISTRY_LOCK) do
+        flag = unsafe_load(Ptr{UInt8}(control))
+        flag == 0x01 || return nothing
+        unsafe_store!(Ptr{UInt8}(control), 0x00)
+    end
+    return nothing
+end
+
+function _release_array_children!(topology, after_child=nothing)
     children, dictionary = topology
     for child in children
         release = lock(REGISTRY_LOCK) do
             unsafe_load(child).release
         end
-        release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowArray},), child)
+        if release != C_NULL
+            ccall(release, Cvoid, (Ptr{CArrowArray},), child)
+            lock(REGISTRY_LOCK) do
+                unsafe_load(child).release == C_NULL ||
+                    error("C Data child array release did not complete")
+            end
+            after_child === nothing || after_child(child)
+        end
     end
     if dictionary != C_NULL
         release = lock(REGISTRY_LOCK) do
             unsafe_load(dictionary).release
         end
-        release == C_NULL ||
+        if release != C_NULL
             ccall(release, Cvoid, (Ptr{CArrowArray},), dictionary)
+            lock(REGISTRY_LOCK) do
+                unsafe_load(dictionary).release == C_NULL ||
+                    error("C Data dictionary array release did not complete")
+            end
+            after_child === nothing || after_child(dictionary)
+        end
     end
     return nothing
 end
 
-function _release_schema_children!(topology)
+function _release_schema_children!(topology, after_child=nothing)
     children, dictionary = topology
     for child in children
         release = lock(REGISTRY_LOCK) do
             unsafe_load(child).release
         end
-        release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowSchema},), child)
+        if release != C_NULL
+            ccall(release, Cvoid, (Ptr{CArrowSchema},), child)
+            lock(REGISTRY_LOCK) do
+                unsafe_load(child).release == C_NULL ||
+                    error("C Data child schema release did not complete")
+            end
+            after_child === nothing || after_child(child)
+        end
     end
     if dictionary != C_NULL
         release = lock(REGISTRY_LOCK) do
             unsafe_load(dictionary).release
         end
-        release == C_NULL ||
+        if release != C_NULL
             ccall(release, Cvoid, (Ptr{CArrowSchema},), dictionary)
+            lock(REGISTRY_LOCK) do
+                unsafe_load(dictionary).release == C_NULL ||
+                    error("C Data dictionary schema release did not complete")
+            end
+            after_child === nothing || after_child(dictionary)
+        end
     end
     return nothing
 end
 
-function _release_array(a::Ptr{CArrowArray})
+function _release_array_impl(a::Ptr{CArrowArray}, after_claim=nothing,
+    after_child=nothing)
     claimed = _claim_array_node(a)
     claimed === nothing && return nothing
     control, topology = claimed
-    _release_array_children!(topology)
-    _finish_node!(a, control)
+    try
+        after_claim === nothing || after_claim()
+        _release_array_children!(topology, after_child)
+        _finish_node!(a, control)
+    catch
+        # Descendant releases are idempotent: a completed child has a NULL
+        # callback and a retry skips it. Return this node to LIVE so a failed
+        # transaction never leaves its aggregate root and source pins stuck.
+        _reset_node_claim!(control)
+        rethrow()
+    end
     return nothing
 end
 
-function _release_schema(s::Ptr{CArrowSchema})
+function _release_schema_impl(s::Ptr{CArrowSchema}, after_claim=nothing,
+    after_child=nothing)
     claimed = _claim_schema_node(s)
     claimed === nothing && return nothing
     control, topology = claimed
-    _release_schema_children!(topology)
-    _finish_node!(s, control)
+    try
+        after_claim === nothing || after_claim()
+        _release_schema_children!(topology, after_child)
+        _finish_node!(s, control)
+    catch
+        _reset_node_claim!(control)
+        rethrow()
+    end
     return nothing
 end
+
+function _run_release_callback(f)
+    # Arrow release callbacks have a void C signature and no error channel.
+    # Do not return to the consumer until one idempotent transaction completes.
+    while true
+        try
+            Base.disable_sigint() do
+                while true
+                    try
+                        f()
+                        return nothing
+                    catch
+                        # _release_*_impl returns its node to LIVE before an
+                        # exception reaches this boundary. Completed children
+                        # are NULL, so the next transaction skips them.
+                    end
+                end
+            end
+            return nothing
+        catch
+            # SIGINT can arrive immediately before signals are disabled or as
+            # normal delivery is restored. The callback is still idempotent.
+        end
+    end
+end
+
+function _release_array_entry(a::Ptr{CArrowArray}, after_claim=nothing,
+    after_child=nothing)
+    _run_release_callback() do
+        _release_array_impl(a, after_claim, after_child)
+    end
+    return nothing
+end
+
+function _release_schema_entry(s::Ptr{CArrowSchema}, after_claim=nothing,
+    after_child=nothing)
+    _run_release_callback() do
+        _release_schema_impl(s, after_claim, after_child)
+    end
+    return nothing
+end
+
+_release_array(a::Ptr{CArrowArray}) = _release_array_entry(a)
+_release_schema(s::Ptr{CArrowSchema}) = _release_schema_entry(s)
 
 # Store one field of a C struct in place (structs are immutable in Julia;
 # the C memory is not).
@@ -1250,6 +1348,73 @@ function main()
     @assert reap!() == 2
     @assert forceclose!(source_region; timeout_ms=0)
     println("C export pins source regions until reap ✓")
+
+    # A Julia exception after a callback claim must return the node to LIVE.
+    # The void C entrypoint then retries the idempotent transaction before it
+    # returns to the consumer.
+    rf, rd = fromjulia("retryable-release", Int64[1])
+    retry_region = rd.buffers[2].region
+    sp, ap = to_c_data(rf, rd)
+    scontrol = unsafe_load(sp).private_data
+    acontrol = unsafe_load(ap).private_data
+    @assert try
+        _release_schema_impl(sp, () -> throw(InterruptException()))
+        false
+    catch e
+        e isa InterruptException
+    end
+    @assert try
+        _release_array_impl(ap, () -> throw(InterruptException()))
+        false
+    catch e
+        e isa InterruptException
+    end
+    @assert unsafe_load(Ptr{UInt8}(scontrol)) == 0x00
+    @assert unsafe_load(Ptr{UInt8}(acontrol)) == 0x00
+    @assert unsafe_load(sp).release != C_NULL
+    @assert unsafe_load(ap).release != C_NULL
+    attempts = Ref(0)
+    @assert _release_array_entry(ap, () -> begin
+            attempts[] += 1
+            attempts[] == 1 && throw(ErrorException("retry once"))
+        end) === nothing
+    @assert attempts[] == 2
+    @assert unsafe_load(Ptr{UInt8}(acontrol)) == 0x02
+    @assert unsafe_load(ap).release == C_NULL
+    @assert reap!() == 1
+    @assert forceclose!(retry_region; timeout_ms=0)
+    _call_release(sp)
+    @assert reap!() == 1
+    println("interrupted C release callbacks remain retryable ✓")
+
+    # Retry must also preserve partial descendant progress. The first child is
+    # already NULL on retry, so each child callback runs exactly once.
+    c1f, c1d = fromjulia("a", Int64[1])
+    c2f, c2d = fromjulia("b", Int64[2])
+    tf = Field("tree", StructType(); children=[c1f, c2f])
+    td = ArrayData(StructType(), 1, [BufferSlice()];
+        children=[c1d, c2d], nullcount=0)
+    tree_regions = OwnerRegion[c1d.buffers[2].region, c2d.buffers[2].region]
+    tsp, tap = to_c_data(tf, td)
+    tcontrol = unsafe_load(tap).private_data
+    tkey = unsafe_load(Ptr{Int64}(tcontrol + 8))
+    released_children = Ptr{CArrowArray}[]
+    _release_array_entry(tap, nothing, child -> begin
+        push!(released_children, child)
+        length(released_children) == 1 && throw(ErrorException("retry subtree"))
+    end)
+    tchildren = unsafe_load(tap).children
+    @assert length(released_children) == 2
+    @assert length(unique(released_children)) == 2
+    @assert all(unsafe_load(unsafe_load(tchildren, i)).release == C_NULL for i = 1:2)
+    @assert unsafe_load(tap).release == C_NULL
+    @assert lock(REGISTRY_LOCK) do
+        EXPORT_REGISTRY[tkey].remaining == 0
+    end
+    _call_release(tsp)
+    @assert reap!() == 2
+    @assert all(forceclose!(region; timeout_ms=0) for region in tree_regions)
+    println("C release retry preserves partial descendant progress ✓")
 
     # Schema/data mismatch and malformed buffers must fail before either
     # independently-owned export root is published.
