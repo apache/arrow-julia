@@ -237,6 +237,8 @@ The format parser accepts only the specified decimal integer grammar, bounds
 decimal descriptors and union ids before recursive or geometry work, and
 rejects invalid UTF-8 or embedded NULs. Empty offset layouts export and require
 one non-NULL terminal zero offset for strict cross-implementation parity.
+The C timestamp format has one empty-timezone spelling, so a Core empty string
+canonicalizes to `nothing` when it is imported again.
 
 The C release callbacks use producer-owned canonical child and dictionary
 topology, so cleanup does not depend on caller-mutated public counts or pointer
