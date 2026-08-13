@@ -877,11 +877,11 @@ tree stays alive while any slice does, and the C release callback runs
 exactly once — from `release!` or the finalizer, whichever comes first.
 """
 mutable struct ForeignOwner
-    array::CArrowArray          # the moved struct (by value; source was nulled)
+    arrayref::Base.RefValue{CArrowArray} # stable producer callback address
     gate::OwnerRegion           # one lifecycle state shared by the whole tree
     function ForeignOwner(arr::CArrowArray)
         o = new()
-        o.array = arr
+        o.arrayref = Ref(arr)
         # Construct the gate unarmed. Until the source ArrowArray's release
         # field is nulled, that source remains the sole owner. Arming a
         # finalizer here would create two owners if the task were interrupted
@@ -903,23 +903,47 @@ function _release_moved_owner!(o::ForeignOwner)
     # A failure may occur after the source move but before finalizer
     # registration. Install the callback locally so forceclose! still owns
     # the copied producer release in that seam.
-    o.gate.releasefn === nothing &&
-        (o.gate.releasefn = _release_foreign_tree!)
-    release!(o)
+    _retry_interrupts() do
+        o.gate.releasefn === nothing &&
+            (o.gate.releasefn = _release_foreign_tree!)
+        release!(o)
+    end
     return nothing
 end
 
-function _release_foreign_tree!(gate::OwnerRegion)
+_call_foreign_release(release, p::Ptr{CArrowArray}) =
+    ccall(release, Cvoid, (Ptr{CArrowArray},), p)
+_call_foreign_release(release, p::Ptr{CArrowSchema}) =
+    ccall(release, Cvoid, (Ptr{CArrowSchema},), p)
+
+function _run_foreign_release_pointer!(p; after_call=nothing)
+    _retry_interrupts() do
+        release = unsafe_load(p).release
+        if release != C_NULL
+            _call_foreign_release(release, p)
+            after_call === nothing || after_call()
+            unsafe_load(p).release == C_NULL ||
+                error("C Data producer release did not mark the structure released")
+        end
+    end
+    return nothing
+end
+
+function _run_foreign_release!(ref::Base.RefValue{T};
+    after_call=nothing) where {T}
+    GC.@preserve ref begin
+        _run_foreign_release_pointer!(Base.unsafe_convert(Ptr{T}, ref);
+            after_call=after_call)
+    end
+    return nothing
+end
+
+function _release_foreign_tree!(gate::OwnerRegion, after_call=nothing)
     o = gate.root::ForeignOwner
-    o.array.release == C_NULL && return nothing
     # Call the producer's release with a pointer to our copy — legal per
     # spec: release takes the structure address, frees producer resources,
     # and marks it released.
-    ref = Ref(o.array)
-    GC.@preserve ref begin
-        ccall(o.array.release, Cvoid, (Ptr{CArrowArray},),
-            Base.unsafe_convert(Ptr{CArrowArray}, ref))
-    end
+    _run_foreign_release!(o.arrayref; after_call=after_call)
     return nothing
 end
 
@@ -948,42 +972,45 @@ from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}) =
     _from_c_data(sp, ap, () -> nothing)
 
 function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray},
-    after_move)
+    after_move; ownerfactory=ForeignOwner, after_schema_release=nothing)
     sp == C_NULL && throw(ArgumentError("ArrowSchema pointer is NULL"))
     ap == C_NULL && throw(ArgumentError("ArrowArray pointer is NULL"))
     sch = unsafe_load(sp)
     arr = unsafe_load(ap)
     (sch.release == C_NULL || arr.release == C_NULL) &&
         throw(ArgumentError("cannot import a released structure"))
-    owner = ForeignOwner(arr)
+    owner = nothing
     try
-        # MOVE: relinquish source ownership before arming the copied owner's
-        # finalizer. The source release field is the authoritative ownership
-        # marker if a task-delivered exception lands at this exact store.
-        Base.disable_sigint() do
-            _store_field!(ap, :release, Ptr{Cvoid}(C_NULL))
-            after_move()
-            _arm_foreign_owner!(owner)
+        try
+            owner = ownerfactory(arr)::ForeignOwner
+            # MOVE: relinquish source ownership before arming the copied
+            # owner's finalizer. The source release field is authoritative.
+            Base.disable_sigint() do
+                _store_field!(ap, :release, Ptr{Cvoid}(C_NULL))
+                after_move()
+                _arm_foreign_owner!(owner)
+            end
+            _preflight_schema(sch)
+            f = _import_field(sch)
+            _preflight_array(f, arr)
+            d = _import_array(f, arr, owner)
+            validate_structural(f, d)
+            validate_semantic(f, d)
+            validate_full(f, d)
+            return f, d
+        finally
+            # The schema lifetime is separate and must end on every path,
+            # including owner-construction failure.
+            _release_c_schema!(sp, sch)
+            after_schema_release === nothing || after_schema_release()
         end
-        _preflight_schema(sch)
-        f = _import_field(sch)
-        _preflight_array(f, arr)
-        d = _import_array(f, arr, owner)
-        validate_structural(f, d)
-        validate_semantic(f, d)
-        validate_full(f, d)
-        return f, d
     catch
         # Before the move, the caller's source remains the owner. After the
         # move, this local copy must release exactly once even when finalizer
         # registration or later validation failed.
-        unsafe_load(ap).release == C_NULL && _release_moved_owner!(owner)
+        owner !== nothing && unsafe_load(ap).release == C_NULL &&
+            _release_moved_owner!(owner)
         rethrow()
-    finally
-        # The schema struct's lifetime is separate from the array's and it
-        # is fully consumed by _import_field — release it on BOTH paths so a
-        # failed import cannot leak the producer's schema resources.
-        _release_c_schema!(sp, sch)
     end
 end
 
@@ -1048,9 +1075,10 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
     return nothing
 end
 
-function _release_c_schema!(sp::Ptr{CArrowSchema}, sch::CArrowSchema)
+function _release_c_schema!(sp::Ptr{CArrowSchema}, sch::CArrowSchema;
+    after_call=nothing)
     sch.release == C_NULL && return nothing
-    ccall(sch.release, Cvoid, (Ptr{CArrowSchema},), sp)
+    _run_foreign_release_pointer!(sp; after_call=after_call)
     return nothing
 end
 
@@ -1641,6 +1669,72 @@ function main()
     @assert _registry_count() == 0
     @assert forceclose!(handoff_region; timeout_ms=0)
     println("interrupted C import handoff retains one owner ✓")
+
+    # Schema cleanup is installed before owner construction. If construction
+    # fails, the array remains with its source while the schema is released.
+    cf, cd = fromjulia("owner-construction", Int64[1])
+    construction_region = cd.buffers[2].region
+    sp, ap = to_c_data(cf, cd)
+    @assert try
+        _from_c_data(sp, ap, () -> nothing;
+            ownerfactory=_ -> error("injected owner construction failure"))
+        false
+    catch e
+        e isa ErrorException &&
+            e.msg == "injected owner construction failure"
+    end
+    @assert unsafe_load(sp).release == C_NULL
+    @assert unsafe_load(ap).release != C_NULL
+    @assert reap!() == 1
+    @assert !forceclose!(construction_region; timeout_ms=0)
+    _call_release(ap)
+    @assert reap!() == 1
+    @assert forceclose!(construction_region; timeout_ms=0)
+
+    # A failure after mandatory schema cleanup still reaches the outer owner
+    # catch. The moved array is released before either pointer is lost.
+    sf, sd = fromjulia("schema-finally", Int64[1])
+    schema_finally_region = sd.buffers[2].region
+    sp, ap = to_c_data(sf, sd)
+    @assert try
+        _from_c_data(sp, ap, () -> nothing;
+            after_schema_release=() -> throw(InterruptException()))
+        false
+    catch e
+        e isa InterruptException
+    end
+    @assert unsafe_load(sp).release == C_NULL
+    @assert unsafe_load(ap).release == C_NULL
+    @assert reap!() == 2
+    @assert forceclose!(schema_finally_region; timeout_ms=0)
+
+    # Producer C callbacks have no error channel. An interruption at their
+    # return boundary retries against the persistent struct until release is
+    # NULL, without calling an already-completed producer a second time.
+    pf, pd = fromjulia("producer-release", Int64[1])
+    producer_region = pd.buffers[2].region
+    sp, ap = to_c_data(pf, pd)
+    schema_attempts = Ref(0)
+    _release_c_schema!(sp, unsafe_load(sp); after_call=() -> begin
+        schema_attempts[] += 1
+        throw(InterruptException())
+    end)
+    @assert schema_attempts[] == 1
+    arr = unsafe_load(ap)
+    producer_owner = ForeignOwner(arr)
+    _store_field!(ap, :release, Ptr{Cvoid}(C_NULL))
+    _arm_foreign_owner!(producer_owner)
+    array_attempts = Ref(0)
+    _release_foreign_tree!(producer_owner.gate, () -> begin
+        array_attempts[] += 1
+        throw(InterruptException())
+    end)
+    @assert array_attempts[] == 1
+    @assert producer_owner.arrayref[].release == C_NULL
+    release!(producer_owner)
+    @assert reap!() == 2
+    @assert forceclose!(producer_region; timeout_ms=0)
+    println("producer release and import cleanup are interruption-safe ✓")
 
     # A root release must transitively release every child. Inspect before
     # reap, while the exported structs remain allocated.
