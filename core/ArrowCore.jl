@@ -192,7 +192,13 @@ mutable struct OwnerRegion
                     after_finalizer === nothing || after_finalizer(r)
                 end
             catch
-                forceclose!(r; timeout_ms=0)
+                while phase(@atomic r.state) != PHASE_CLOSED
+                    try
+                        forceclose!(r; timeout_ms=0)
+                    catch e
+                        e isa InterruptException || rethrow()
+                    end
+                end
                 rethrow()
             end
         end
