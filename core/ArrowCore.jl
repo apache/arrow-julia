@@ -350,9 +350,10 @@ Map a file read-only and own the mapping. The region performs its own
 mmap/munmap via ccall (the report's choice: the stdlib Mmap ties unmap to a
 finalizer on internals with no public eager-unmap API, which is precisely
 the lifecycle problem this type exists to fix). POSIX only in the prove-out.
-The caller must prevent external truncation of the opened inode while the
-mapping is live; an mmap cannot be made safe against another process that
-truncates its file.
+The caller must prevent external writes or truncation of the opened inode
+while the mapping or any cached validation result remains in use. A shared
+mapping cannot keep a semantic certificate valid when another file handle or
+process changes its bytes, and truncation can also make an in-range load fault.
 """
 function _munmap!(p::Ptr, len::Integer)
     ccall(:munmap, Cint, (Ptr{Cvoid}, Csize_t), p, len)
@@ -400,7 +401,9 @@ exactly once — from `forceclose!` or the finalizer — and is where the
 imported structure's release callback gets called. The extent is DECLARED,
 not verified: the ABI gives us no way to prove the allocation is `len` bytes
 (report §9, C-data adapter), so slices bound accesses to the declaration and
-the trust decision is the importer's.
+the trust decision is the importer's. The producer must keep the declared
+storage alive and unchanged until Core releases it; otherwise pointers or
+cached validation results can become invalid outside Core's control.
 """
 foreignregion(ptr::Ptr{UInt8}, len::Integer, release) =
     OwnerRegion(ptr, len, Foreign; releasefn=release)

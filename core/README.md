@@ -146,10 +146,11 @@ struct, map, and dictionary formats. Other Core layouts are not mapped. Field
 metadata is omitted on export and ignored on import; dictionary value-schema
 names, nullability, and metadata are not a lossless round trip. Foreign
 allocation extents cannot be verified by the ABI and remain trusted
-declarations. Import checks the pointer tables, counts, descriptor shape, and
-checked geometry that the ABI does expose. Import and export run full UTF-8
-validation. Field names that contain an embedded NUL are rejected because
-the C interface uses NUL-terminated strings.
+declarations. The producer must keep declared storage alive and unchanged
+until Core releases it. Import checks the pointer tables, counts, descriptor
+shape, and checked geometry that the ABI does expose. Import and export run
+full UTF-8 validation. Field names that contain an embedded NUL are rejected
+because the C interface uses NUL-terminated strings.
 
 The C release callbacks use producer-owned canonical child and dictionary
 topology, so cleanup does not depend on caller-mutated public counts or pointer
@@ -165,6 +166,7 @@ have independent aggregate lifetimes and per-node control blocks.
 Other exclusions are unchanged: no IPC file footer/index, compression,
 writer coordinator, facade, `ViewPlan`, typed views, ArrowTypes integration,
 C stream interface, or builders beyond test support. `mmapregion` is
-POSIX-only. Concurrent external truncation of a mapped file is unsupported.
+POSIX-only. External writes or truncation of a mapped file while the mapping
+or cached validation results remain in use are unsupported.
 The ABI layout checks include 32-bit expectations, but this review executed
 them only on the available 64-bit host.
