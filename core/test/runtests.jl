@@ -498,7 +498,7 @@ end
         ref, red = fromjulia("run_ends", Int32[2, 3])
         vf, vd = fromjulia("values", Int64[7, 9])
         f = Field("ree", t; children=[ref, vf])
-        d = AC.ArrayData(t, 3, BufferSlice[]; children=[red, vd])
+        d = AC.ArrayData(t, 3, BufferSlice[]; children=[red, vd], nullcount=0)
         validate_structural(f, d)  # structure IS validated
         @test_throws ValidationError validate_semantic(f, d)
         @test_throws ErrorException getvalue(f, d, 1)
@@ -678,6 +678,27 @@ end
         outerd = AC.ArrayData(RunEndEncodedType(), 1, BufferSlice[];
             children=[rd, innerd], nullcount=0)
         @test_throws ValidationError validate_structural(outerf, outerd)
+    end
+
+    @testset "structural: REE geometry must be representable" begin
+        erf, erd = fromjulia("run_ends", Int16[])
+        evf, evd = fromjulia("values", Int64[])
+        t = RunEndEncodedType()
+        f = Field("ree", t; children=[erf, evf])
+        emptyphysical = AC.ArrayData(t, 1, BufferSlice[];
+            children=[erd, evd], nullcount=0)
+        @test_throws ValidationError validate_structural(f, emptyphysical)
+
+        rf, rd = fromjulia("run_ends", Int16[typemax(Int16)])
+        vf, vd = fromjulia("values", Int64[1])
+        f = Field("ree", t; children=[rf, vf])
+        overflow = AC.ArrayData(t, Int64(typemax(Int16)) + 1, BufferSlice[];
+            children=[rd, vd], nullcount=0)
+        @test_throws ValidationError validate_structural(f, overflow)
+
+        badnulls = AC.ArrayData(t, 1, BufferSlice[];
+            children=[rd, vd], nullcount=1)
+        @test_throws ValidationError validate_structural(f, badnulls)
     end
 
     @testset "semantic: declared null count matches bitmap" begin
