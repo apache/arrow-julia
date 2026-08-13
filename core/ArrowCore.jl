@@ -155,7 +155,8 @@ mutable struct OwnerRegion
 
     function OwnerRegion(ptr::Ptr{UInt8}, len::Integer, kind::MemoryKind;
         root=nothing, releasefn=nothing,
-        lifecycle::Union{Nothing,OwnerRegion}=nothing)
+        lifecycle::Union{Nothing,OwnerRegion}=nothing,
+        after_finalizer=nothing)
         len >= 0 || throw(ArgumentError("region length must be non-negative"))
         n = Int64(len)
         (ptr != C_NULL || n == 0) ||
@@ -182,7 +183,18 @@ mutable struct OwnerRegion
         # finalizer. A finalizer only runs when the region is unreachable, at
         # which point no guard can exist, so releasing directly is safe.
         if releasefn !== nothing
-            finalizer(_finalize_region!, r)
+            try
+                # Until this method returns, `r` is the only record of the
+                # transferred resource. Keep a cleanup handler around
+                # finalizer registration so cancellation cannot lose it.
+                Base.disable_sigint() do
+                    finalizer(_finalize_region!, r)
+                    after_finalizer === nothing || after_finalizer(r)
+                end
+            catch
+                forceclose!(r; timeout_ms=0)
+                rethrow()
+            end
         end
         return r
     end

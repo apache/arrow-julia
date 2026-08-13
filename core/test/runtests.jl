@@ -48,6 +48,25 @@ end
         @test_throws ErrorException setproperty!(r, :root, nothing)
     end
 
+    @testset "release owner survives finalizer handoff failure" begin
+        bytes = UInt8[0]
+        calls = Ref(0)
+        captured = Ref{Union{Nothing,OwnerRegion}}(nothing)
+        @test_throws InterruptException GC.@preserve bytes AC.OwnerRegion(
+            Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
+            root=bytes,
+            releasefn=_ -> (calls[] += 1),
+            after_finalizer=r -> begin
+                captured[] = r
+                throw(InterruptException())
+            end)
+        @test calls[] == 1
+        @test AC.phase(@atomic (captured[]::OwnerRegion).state) ==
+            AC.PHASE_CLOSED
+        finalize(captured[]::OwnerRegion)
+        @test calls[] == 1
+    end
+
     @testset "mmap region: read, deterministic close, invalidation" begin
         path = tempname()
         write(path, UInt8[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
