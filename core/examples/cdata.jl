@@ -434,22 +434,36 @@ end
 _store_field!(p, name::Symbol, v) = _store_field!(p, Val(name), v)
 
 _malloc!(root::ExportedRoot, n::Integer,
-    register! = push!, deallocate! = Libc.free) = begin
+    register! = push!, deallocate! = Libc.free;
+    allocator = Libc.malloc, after_allocate=nothing) = begin
     n >= 0 || throw(ArgumentError("negative export allocation size"))
     n64 = Int64(n)
     # Reserve the ledger slot before acquiring native memory. After malloc,
     # either registration owns the pointer or the local catch deallocates it.
     sizehint!(root.mallocs, AC.checked_add(length(root.mallocs), 1))
     oldlen = length(root.mallocs)
-    p = Libc.malloc(max(n64, Int64(1)))
-    p == C_NULL && throw(OutOfMemoryError())
+    p = Ptr{Cvoid}(C_NULL)
+    owned = false
     try
-        register!(root.mallocs, p)
+        Base.disable_sigint() do
+            p = allocator(max(n64, Int64(1)))
+            p == C_NULL && throw(OutOfMemoryError())
+            owned = true
+            after_allocate === nothing || after_allocate(p)
+            register!(root.mallocs, p)
+            owned = false
+        end
     catch
-        if length(root.mallocs) == oldlen
-            deallocate!(p)
-        elseif !(length(root.mallocs) == oldlen + 1 && root.mallocs[end] == p)
-            error("export malloc registration left an invalid ledger state")
+        if owned
+            if length(root.mallocs) == oldlen
+                _retry_interrupts(() -> deallocate!(p))
+                owned = false
+            elseif length(root.mallocs) == oldlen + 1 &&
+                    root.mallocs[end] == p
+                owned = false
+            else
+                error("export malloc registration left an invalid ledger state")
+            end
         end
         rethrow()
     end
@@ -1309,6 +1323,26 @@ function main()
             e.msg == "injected malloc registration failure"
     end
     @assert deallocations[] == 1
+    @assert _registry_count() == before
+    # The allocator result is owned before the first later fallible action.
+    # Interruption at that boundary frees it once without needing a ledger.
+    allocated = Ref(0)
+    freed = Ref(0)
+    @assert try
+        _newroot(Any[]) do root
+            _malloc!(root, 64, push!, _ -> (freed[] += 1);
+                allocator=_ -> begin
+                    allocated[] += 1
+                    Ptr{Cvoid}(1)
+                end,
+                after_allocate=_ -> throw(InterruptException()))
+        end
+        false
+    catch e
+        e isa InterruptException
+    end
+    @assert allocated[] == 1
+    @assert freed[] == 1
     @assert _registry_count() == before
     # A registration method may append successfully and fail before it
     # returns. In that state root cleanup, not the local catch, owns the entry.
