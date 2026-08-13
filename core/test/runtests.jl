@@ -553,6 +553,16 @@ end
         f = Field("x", t)
         d = AC.ArrayData(t, 3, [BufferSlice()])   # missing DATA buffer
         @test_throws ValidationError validate_structural(f, d)
+        @test_throws ValidationError validate_semantic(f, d)
+        @test_throws ValidationError validate_full(f, d)
+        @test !(@atomic d.semachecked)
+
+        wrongf = Field("x", IntType(32, true))
+        good64 = AC.ArrayData(t, 1,
+            [BufferSlice(), AC._databuffer(Int64[1])]; nullcount=0)
+        @test_throws ValidationError validate_semantic(wrongf, good64)
+        @test_throws ValidationError validate_full(wrongf, good64)
+        @test !(@atomic good64.semachecked)
     end
 
     @testset "structural: short data buffer (checked arithmetic)" begin
@@ -731,6 +741,59 @@ end
             children=[ad], nullcount=0)
         validate_structural(uf, ud)
         @test_throws ValidationError validate_semantic(uf, ud)
+    end
+
+    @testset "parent nulls mask hidden non-nullable child slots" begin
+        cf = Field("x", IntType(64, true); nullable=false)
+        cd = AC.ArrayData(cf.type, 2,
+            [AC._databuffer(UInt8[0x00]), AC._databuffer(Int64[0, 0])];
+            nullcount=2)
+
+        sf = Field("s", StructType(); children=[cf])
+        masked_struct = AC.ArrayData(StructType(), 1,
+            [AC._databuffer(UInt8[0x00])]; children=[cd], nullcount=1)
+        @test validate_semantic(sf, masked_struct) === masked_struct
+        visible_struct = AC.ArrayData(StructType(), 1, [BufferSlice()];
+            children=[cd], nullcount=0)
+        @test_throws ValidationError validate_semantic(sf, visible_struct)
+
+        flt = FixedSizeListType(2)
+        flf = Field("fixed", flt; children=[cf])
+        masked_fixed = AC.ArrayData(flt, 1,
+            [AC._databuffer(UInt8[0x00])]; children=[cd], nullcount=1)
+        @test validate_semantic(flf, masked_fixed) === masked_fixed
+        visible_fixed = AC.ArrayData(flt, 1, [BufferSlice()];
+            children=[cd], nullcount=0)
+        @test_throws ValidationError validate_semantic(flf, visible_fixed)
+
+        lt = ListType(false)
+        lf = Field("list", lt; children=[cf])
+        offsets = AC._databuffer(Int32[0, 1])
+        masked_list = AC.ArrayData(lt, 1,
+            [AC._databuffer(UInt8[0x00]), offsets]; children=[cd], nullcount=1)
+        @test validate_semantic(lf, masked_list) === masked_list
+        visible_list = AC.ArrayData(lt, 1, [BufferSlice(), offsets];
+            children=[cd], nullcount=0)
+        @test_throws ValidationError validate_semantic(lf, visible_list)
+    end
+
+    @testset "union contracts inspect only selected child slots" begin
+        af, ad = fromjulia("a", Int64[1])
+        bf = Field("b", IntType(64, true); nullable=false)
+        bd = AC.ArrayData(bf.type, 1,
+            [AC._databuffer(UInt8[0x00]), AC._databuffer(Int64[0])];
+            nullcount=1)
+        t = UnionType(AC.DenseMode, Int8[0, 1])
+        f = Field("u", t; children=[af, bf])
+        selected_valid = AC.ArrayData(t, 1,
+            [AC._databuffer(Int8[0]), AC._databuffer(Int32[0])];
+            children=[ad, bd], nullcount=0)
+        @test validate_semantic(f, selected_valid) === selected_valid
+
+        selected_null = AC.ArrayData(t, 1,
+            [AC._databuffer(Int8[1]), AC._databuffer(Int32[0])];
+            children=[ad, bd], nullcount=0)
+        @test_throws ValidationError validate_semantic(f, selected_null)
     end
 
     @testset "full: invalid UTF-8" begin

@@ -1058,15 +1058,23 @@ end
 """
     validate_semantic(field, data)
 
-Stage-3 validation: O(n) content checks that make later guarded accessors
-safe — offset monotonicity + final-offset bounds, dictionary index bounds,
-union type-id domain. Successful data-intrinsic results are cached on the
-ArrayData (`semachecked`); benign concurrent callers may repeat the same scan.
-Field-dependent contracts, including nullability, run on every call because
-the same data can be checked against another Field. Layouts declared as
-structural-only fail closed here instead of caching an incomplete check.
+Stage-3 validation. This public stage composes structural validation before
+any content access, so callers cannot accidentally certify malformed buffer
+geometry by skipping `validate_structural`. Data-intrinsic checks are cached
+on the ArrayData (`semachecked`); benign concurrent callers may repeat the
+same scan. Field-dependent contracts, including ancestor-masked nullability,
+run on every call because the same data can be checked against another Field.
+Layouts declared as structural-only fail closed instead of caching an
+incomplete check.
 """
 function validate_semantic(f::Field, d::ArrayData)
+    validate_structural(f, d)
+    _validate_semantic_intrinsic(f, d)
+    _validate_field_contracts(f, d)
+    return d
+end
+
+function _validate_semantic_intrinsic(f::Field, d::ArrayData)
     t = d.type
     if t isa Union{ViewType,ListViewType,RunEndEncodedType}
         throw(ValidationError(
@@ -1137,18 +1145,11 @@ function validate_semantic(f::Field, d::ArrayData)
         end
         @atomic :monotonic d.semachecked = true
     end
-
-    # Field contracts are not part of the ArrayData cache. The same frozen
-    # data may be checked against a different Field, so recurse and enforce
-    # nullability on every call even when intrinsic data checks are cached.
     for (cf, cd) in zip(childfields(f), d.children)
-        validate_semantic(cf, cd)
+        _validate_semantic_intrinsic(cf, cd)
     end
     if t isa DictionaryType
-        validate_semantic(dictvaluefield(f, t), d.dictionary)
-    end
-    if !f.nullable && _has_logical_null(f, d)
-        throw(ValidationError("non-nullable field $(repr(f.name)) contains null values"))
+        _validate_semantic_intrinsic(dictvaluefield(f, t), d.dictionary)
     end
     return d
 end
@@ -1172,21 +1173,95 @@ function _logical_null_at(f::Field, d::ArrayData, i::Int64)
     return !isempty(spec.buffers) && spec.buffers[1] == VALIDITY && !isvalid_at(d, i)
 end
 
-function _has_logical_null(f::Field, d::ArrayData)
-    d.len == 0 && return false
-    d.type isa UnionType || return nullcount(d) != 0
-    return any(i -> _logical_null_at(f, d, Int64(i)), 1:d.len)
+function _union_child(f::Field, d::ArrayData, i::Int64)
+    t = d.type::UnionType
+    tid = loadat(rolebuffer(d, TYPE_IDS), Int8, _slotindex0(d, i))
+    pos = findfirst(==(tid), t.typeids)
+    pos === nothing && throw(ValidationError("union type id $tid not in declared domain"))
+    childi = if t.mode == DenseMode
+        off = loadat(rolebuffer(d, ELEMENT_OFFSETS), Int32, _slotbyteoff(d, i, 4))
+        checked_add(Int64(off), Int64(1))
+    else
+        checked_add(d.offset, i)
+    end
+    return f.children[pos], d.children[pos], childi
+end
+
+function _validate_field_contract_at(f::Field, d::ArrayData, i::Int64)
+    t = d.type
+    if t isa UnionType
+        if !f.nullable && _logical_null_at(f, d, i)
+            throw(ValidationError(
+                "non-nullable field $(repr(f.name)) contains a null at element $i"))
+        end
+        # A union has no parent validity bitmap. Its selected child supplies
+        # both the value and any logical null, so validate that child even
+        # when the union Field itself permits nulls. Unselected child slots
+        # are not part of this logical value and must remain ignored.
+        cf, cd, childi = _union_child(f, d, i)
+        _validate_field_contract_at(cf, cd, childi)
+        return nothing
+    end
+
+    slotnull = t isa NullType || !isvalid_at(d, i)
+    if slotnull
+        f.nullable || throw(ValidationError(
+            "non-nullable field $(repr(f.name)) contains a null at element $i"))
+        # Child storage below a null parent value is unspecified. In
+        # particular, null Struct/FixedSizeList slots and null List/Map
+        # ranges mask nulls in otherwise non-nullable child Fields.
+        return nothing
+    end
+
+    if t isa StructType
+        childi = checked_add(d.offset, i)
+        for (cf, cd) in zip(f.children, d.children)
+            _validate_field_contract_at(cf, cd, childi)
+        end
+    elseif t isa FixedSizeListType
+        base = checked_mul(_slotindex0(d, i), Int64(t.listsize))
+        cf, cd = f.children[1], d.children[1]
+        for j = 1:t.listsize
+            _validate_field_contract_at(cf, cd,
+                checked_add(base, Int64(j)))
+        end
+    elseif t isa Union{ListType,MapType}
+        lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth)
+        lo == hi && return nothing
+        cf, cd = f.children[1], d.children[1]
+        for childi = checked_add(lo, Int64(1)):hi
+            _validate_field_contract_at(cf, cd, childi)
+        end
+    end
+    return nothing
+end
+
+function _validate_field_contracts(f::Field, d::ArrayData)
+    for i = 1:d.len
+        _validate_field_contract_at(f, d, Int64(i))
+    end
+    # Dictionary values form an independent array. Index nullability never
+    # constrains pool nullability, but nested Field contracts inside the pool
+    # still apply to every pool value.
+    if d.type isa DictionaryType
+        _validate_field_contracts(dictvaluefield(f, d.type), d.dictionary)
+    end
+    return nothing
 end
 
 """
     validate_full(field, data)
 
-Stage-4 (opt-in) content validation: currently UTF-8 well-formedness for
-Utf8 columns. Deliberately separate — it is O(bytes) and most callers trust
-their producers this far.
+Stage-4 (opt-in) content validation. It composes semantic (and therefore
+structural) validation before the more expensive whole-content checks.
 """
 function validate_full(f::Field, d::ArrayData)
     validate_semantic(f, d)
+    _validate_full_content(f, d)
+    return d
+end
+
+function _validate_full_content(f::Field, d::ArrayData)
     if d.type isa Utf8Type
         for i = 1:d.len
             isvalid_at(d, i) || continue
@@ -1197,12 +1272,12 @@ function validate_full(f::Field, d::ArrayData)
         end
     end
     for (cf, cd) in zip(childfields(f), d.children)
-        validate_full(cf, cd)
+        _validate_full_content(cf, cd)
     end
     if d.type isa DictionaryType
-        validate_full(dictvaluefield(f, d.type), d.dictionary)
+        _validate_full_content(dictvaluefield(f, d.type), d.dictionary)
     end
-    return d
+    return nothing
 end
 
 # ---------------------------------------------------------------------------
