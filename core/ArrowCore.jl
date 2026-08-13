@@ -1121,7 +1121,7 @@ function _decimal_fits_precision(t::DecimalType, data::BufferSlice, byteoff::Int
         limit = ntuple(4) do limb
             product = UInt128(limit[limb]) * UInt128(10) + carry
             carry = product >> 64
-            UInt64(product)
+            UInt64(product & UInt128(typemax(UInt64)))
         end
     end
     for limb = 4:-1:1

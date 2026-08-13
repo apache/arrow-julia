@@ -705,6 +705,15 @@ end
             checkdecimal(t, collect(reinterpret(UInt8, T[-10])); valid=false)
         end
 
+        limit128 = Int128(10)^38
+        t128max = DecimalType(38, 0, 128)
+        checkdecimal(t128max,
+            collect(reinterpret(UInt8, Int128[limit128 - 1, -limit128 + 1])))
+        checkdecimal(t128max,
+            collect(reinterpret(UInt8, Int128[limit128])); valid=false)
+        checkdecimal(t128max,
+            collect(reinterpret(UInt8, Int128[-limit128])); valid=false)
+
         # Decimal256 values are represented here as four little-endian UInt64
         # limbs. Cover positive/negative precision edges without a BigInt
         # dependency in either Core or its tests.
@@ -715,6 +724,16 @@ end
             typemax(UInt64), typemax(UInt64)]
         checkdecimal(t256, collect(reinterpret(UInt8, vcat(pos9, neg9))))
         checkdecimal(t256, collect(reinterpret(UInt8, pos10)); valid=false)
+
+        # 10^76 spans all four limbs. These exact boundaries exercise carry
+        # propagation when the precision limit is built.
+        limit76 = UInt64[0x0000000000000000, 0x7775a5f171951000,
+            0x0764b4abe8652979, 0x161bcca7119915b5]
+        below76 = UInt64[0xffffffffffffffff, 0x7775a5f171950fff,
+            0x0764b4abe8652979, 0x161bcca7119915b5]
+        t256max = DecimalType(76, 0, 256)
+        checkdecimal(t256max, collect(reinterpret(UInt8, below76)))
+        checkdecimal(t256max, collect(reinterpret(UInt8, limit76)); valid=false)
 
         # Invalid bytes in a null slot are masked and do not violate the
         # precision contract.
