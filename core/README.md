@@ -75,47 +75,15 @@ julia --startup-file=no core/test/trim_compile_tests.jl         # JuliaC --trim=
   adapter, and accessor methods. The registry does not claim to remove those
   layout-specific rules.
 
-## Interruption safety
-
-This prove-out makes its committed ownership handoffs interruption-atomic. An
-acquired access guard transfers to `withguard` cleanup or rolls back. A close
-claim is restored until release-callback entry; callback entry commits an
-at-most-once generic release. Successful mmap acquisition, C export allocation
-and pin registration, C import moves, C export release commits, and IPC cursor
-claims and advances are recorded in owner, registry, or caller-owned rollback
-state before interruptible work resumes. Failure at one of these handoffs
-either restores the prior state or leaves the resource under a committed
-cleanup owner. A successful public return commits returned C pointers or an
-IPC batch to the caller.
-
-This is not instruction-level async-exception atomicity. Julia can deliver
-`InterruptException` and task cancellation at safepoints, and any allocation
-can throw. Julia has no operation that atomically combines a native effect such
-as `mmap`, `munmap`, `malloc`, `free`, or a foreign callback with publication of
-Julia state. The code defers SIGINT only across bounded handoffs. It re-enables
-SIGINT during waits and user work.
-
-Cleanup outside those committed handoffs is best effort. `OwnerRegion` and
-imported-owner finalizers backstop resources that have a Julia owner. Mmap and C
-producer cleanup retry interruption only when an explicit state marker or a
-`release == NULL` marker makes retry safe. A generic release callback runs at
-most once after entry because it may have partly freed its resource before it
-fails. Successful C exports have no Julia finalizer. They remain registry-rooted
-until the consumer calls their release callbacks and `reap!` performs cleanup.
-Abrupt process termination, arbitrary instruction-level exception injection,
-and a foreign callback that does not return or fails after partial cleanup are
-outside this guarantee.
-
 ## Honest status
 
 Core accessors and validation cover integer, floating point, Boolean,
 decimal, date, time, timestamp, duration, all interval variants, UTF-8 and
 binary with 32-bit or 64-bit offsets, fixed-size binary, list, fixed-size
 list, struct, map, sparse and dense union, dictionary, and null arrays.
-Logical parent offsets and nested slices are tested. Struct scalars use a
-`NamedTuple` only when names are unique, nonempty, and valid Julia Symbol
-names; otherwise they use an ordered vector of `Pair{String,Any}` so valid
-duplicate, omitted, or non-Symbol-compatible names do not fail. Utf8View,
+Logical parent offsets and nested slices are tested. Struct scalars always use
+an ordered `Vector{Pair{String,Any}}`, so names stay in the value domain and
+valid duplicate, empty, or non-Symbol-compatible names do not fail. Utf8View,
 BinaryView, ListView, and run-end encoding have registry
 entries and structural validation but no semantic validation or accessors.
 `validate_semantic` and `validate_full` reject those layouts instead of
@@ -140,7 +108,10 @@ V4 and V5 metadata on little-endian hosts, supports feature-gated full
 dictionary replacement, preserves old dictionary snapshots, and rejects
 delta dictionaries. It requires the current eight-byte continuation-marker
 framing and does not accept the pre-0.15 four-byte legacy prefix. Compression
-and endian normalization are excluded.
+uses the V5 `BodyCompression` field for LZ4_FRAME and ZSTD. It accepts the
+standard `COMPRESSED_BODY` schema feature. It also accepts V5 compressed
+streams from Arrow.jl 2.x that omit that feature for compatibility. It rejects
+`BodyCompression` under V4. Endian normalization is excluded.
 
 Compatible fields that share one IPC dictionary id also share one immutable
 pool object. Eager stream decoding fully validates each immutable pool
@@ -165,10 +136,12 @@ It is not the report's incremental `IO` framer or file-footer reader. Its
 byte-wise verifier is a local bridge around the repository's older generated
 bindings. Production work must regenerate the bindings from the pinned
 schema and use a generated verifier; the report explicitly rejects a custom
-parser as the final design. `max_total_allocated_bytes` is a conservative
-budget for metadata copies and metadata-directed Julia containers. It is not
-an exact measurement of every Julia runtime allocation. Message bodies stay
-zero-copy and have separate body and buffer limits. Schema and Field metadata
+parser as the final design. `max_total_allocated_bytes` is one reader-wide,
+conservative budget for metadata copies, metadata-directed Julia containers,
+and exact-sized decompressed outputs across all eager dictionary and record
+batches. It is not an exact measurement of every Julia runtime allocation.
+Wire message bodies stay zero-copy and have separate body and buffer limits;
+positively compressed buffers become owned copies. Schema and Field metadata
 are copied into dictionaries, so duplicate keys and original ordering are not
 lossless. `IPCStream` is a single-owner pull cursor. Overlapping `nextbatch!`
 calls throw `ConcurrencyViolationError`.
@@ -187,7 +160,10 @@ because the C interface uses NUL-terminated strings.
 The C release callbacks use producer-owned canonical child and dictionary
 topology, so cleanup does not depend on caller-mutated public counts or pointer
 tables. They still inspect canonical descendants' public release fields to
-honor consumer moves. The callbacks implement transitive release and consumer
+honor consumer moves. A callback transaction that fails before commit restores
+its node to LIVE and returns at the void C boundary; a later explicit call can
+resume it without repeating completed children. It does not retry forever
+inside the callback. The callbacks implement transitive release and consumer
 move semantics only under this prove-out execution contract: callbacks for
 one exported tree are serialized and run on Julia-attached threads. They call
 Julia and use a `ReentrantLock`. The production native CAS and lock-free
@@ -195,8 +171,8 @@ foreign-thread trampoline from §9 is not implemented. `reap!` performs an
 explicit registry scan; there is no background reaper. Schema and array trees
 have independent aggregate lifetimes and per-node control blocks.
 
-Other exclusions are unchanged: no IPC file footer/index, compression,
-writer coordinator, facade, `ViewPlan`, typed views, ArrowTypes integration,
+Other exclusions are unchanged: no IPC file footer/index, writer coordinator,
+facade, `ViewPlan`, typed views, ArrowTypes integration,
 C stream interface, or builders beyond test support. `mmapregion` is
 POSIX-only. External writes or truncation of a mapped file while the mapping
 or cached validation results remain in use are unsupported.
@@ -259,13 +235,19 @@ structured cancellation gives Base a real system to build on. Relatedly,
 ## Compression
 
 The IPC example implements spec buffer compression for **LZ4_FRAME and
-ZSTD**: per-reader codec contexts (created lazily, closed on every
-`readstream` exit path — no global pools), the per-buffer Int64
-uncompressed-length prefix with the `-1` stored-raw sentinel, declared sizes
-bounded **before** any allocation and charged to a decode-side budget, exact
-declared/actual size matching, and each decompressed buffer in its own
-exact-sized owned region. Acceptance covers 2.x-written streams for both
-codecs (compressed dictionary batches included) plus adversarial
-hostile/understated prefixes located via the framer itself. In the
-production package the codecs are package extensions; the example's
-closed two-codec switch is the trim-friendly shape of the same idea.
+ZSTD**. Each reader lazily creates raw native codec contexts and closes them
+on every `readstream` exit path; there are no global pools. The adapter checks
+the per-buffer Int64 uncompressed-length prefix and the `-1` stored-raw
+sentinel. A zero-byte wire buffer may omit the prefix. A nonzero compressed
+buffer, including declared length zero, must contain a valid frame.
+
+Declared sizes are bounded and charged to the shared reader budget before one
+exact-sized output vector is allocated. The codecs decode directly from the
+guarded wire slice, with no payload copy and no growable output. The LZ4 loop
+requires one complete frame, exact input consumption, and exact output size.
+The ZSTD one-shot decode uses the same exact destination. Acceptance covers
+V5 feature handling, 2.x-written record and dictionary batches, empty and raw
+buffers, hostile prefixes, compressed bombs, aggregate batch budgets,
+truncation, concatenated LZ4 frames, and corrupt-context cleanup. In the
+production package the codecs are package extensions; the example's closed
+two-codec switch is the trim-friendly shape of the same idea.
