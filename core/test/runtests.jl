@@ -521,6 +521,10 @@ end
             AC.ArrayData(badt, 1,
                 [BufferSlice(), AC._databuffer(UInt8[0, 0, 0])]; nullcount=0))
 
+        invalidname = String(UInt8[0xff])
+        namef, named = fromjulia(invalidname, Int64[1])
+        @test_throws ValidationError validate_structural(namef, named)
+
         if Sys.WORD_SIZE > 32
             for scale in (Int(typemin(Int32)) - 1, Int(typemax(Int32)) + 1)
                 badscale = DecimalType(1, scale, 32)

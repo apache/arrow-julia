@@ -879,6 +879,8 @@ allocation and checked message-body spans — belongs to the adapters; see
 core/examples/ipc_read.jl.)
 """
 function validate_structural(f::Field, d::ArrayData)
+    isvalid(f.name) ||
+        throw(ValidationError("field name is not valid UTF-8"))
     typeequal(f.type, d.type) ||
         throw(ValidationError("field/type mismatch: $(f.type) vs $(d.type)"))
     _validate_descriptor(d.type)
