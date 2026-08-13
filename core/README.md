@@ -74,6 +74,37 @@ julia --startup-file=no core/examples/cdata.jl
   adapter, and accessor methods. The registry does not claim to remove those
   layout-specific rules.
 
+## Interruption safety
+
+This prove-out makes its committed ownership handoffs interruption-atomic. An
+acquired access guard transfers to `withguard` cleanup or rolls back. A close
+claim is restored until release-callback entry; callback entry commits an
+at-most-once generic release. Successful mmap acquisition, C export allocation
+and pin registration, C import moves, C export release commits, and IPC cursor
+claims and advances are recorded in owner, registry, or caller-owned rollback
+state before interruptible work resumes. Failure at one of these handoffs
+either restores the prior state or leaves the resource under a committed
+cleanup owner. A successful public return commits returned C pointers or an
+IPC batch to the caller.
+
+This is not instruction-level async-exception atomicity. Julia can deliver
+`InterruptException` and task cancellation at safepoints, and any allocation
+can throw. Julia has no operation that atomically combines a native effect such
+as `mmap`, `munmap`, `malloc`, `free`, or a foreign callback with publication of
+Julia state. The code defers SIGINT only across bounded handoffs. It re-enables
+SIGINT during waits and user work.
+
+Cleanup outside those committed handoffs is best effort. `OwnerRegion` and
+imported-owner finalizers backstop resources that have a Julia owner. Mmap and C
+producer cleanup retry interruption only when an explicit state marker or a
+`release == NULL` marker makes retry safe. A generic release callback runs at
+most once after entry because it may have partly freed its resource before it
+fails. Successful C exports have no Julia finalizer. They remain registry-rooted
+until the consumer calls their release callbacks and `reap!` performs cleanup.
+Abrupt process termination, arbitrary instruction-level exception injection,
+and a foreign callback that does not return or fails after partial cleanup are
+outside this guarantee.
+
 ## Honest status
 
 Core accessors and validation cover integer, floating point, Boolean,
