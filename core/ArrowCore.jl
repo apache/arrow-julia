@@ -610,8 +610,12 @@ struct Field
 end
 _freezemetadata(::Nothing) = nothing
 _freezemetadata(metadata::FrozenVector{Pair{String,String}}) = metadata
+_freezemetadata(metadata::Union{AbstractVector,Tuple}) =
+    FrozenVector{Pair{String,String}}(
+        String(first(kv)) => String(last(kv)) for kv in metadata)
 _freezemetadata(metadata) =
-    FrozenVector{Pair{String,String}}(String(k) => String(v) for (k, v) in pairs(metadata))
+    FrozenVector{Pair{String,String}}(
+        String(k) => String(v) for (k, v) in pairs(metadata))
 Field(name, type; nullable=true, metadata=nothing, children=()) =
     Field(String(name), type, Bool(nullable), _freezemetadata(metadata),
         FrozenVector{Field}(children))
@@ -860,8 +864,13 @@ function _validate_descriptor(t::TimeType)
     return nothing
 end
 _validate_descriptor(t::TimestampType) =
-    t.unit in (SECOND, MILLISECOND, MICROSECOND, NANOSECOND) ||
-        throw(ValidationError("invalid Arrow timestamp unit $(repr(t.unit))"))
+    begin
+        t.unit in (SECOND, MILLISECOND, MICROSECOND, NANOSECOND) ||
+            throw(ValidationError("invalid Arrow timestamp unit $(repr(t.unit))"))
+        (t.timezone === nothing || isvalid(t.timezone)) ||
+            throw(ValidationError("timestamp timezone is not valid UTF-8"))
+        nothing
+    end
 _validate_descriptor(t::DurationType) =
     t.unit in (SECOND, MILLISECOND, MICROSECOND, NANOSECOND) ||
         throw(ValidationError("invalid Arrow duration unit $(repr(t.unit))"))
@@ -877,6 +886,22 @@ function _validate_descriptor(t::DictionaryType)
     _validate_descriptor(t.indextype)
     _validate_descriptor(t.valuetype)
     return nothing
+end
+
+function _validate_metadata(metadata, what::AbstractString)
+    metadata === nothing && return nothing
+    for (key, value) in metadata
+        isvalid(key) || throw(ValidationError("$what metadata key is not valid UTF-8"))
+        isvalid(value) || throw(ValidationError("$what metadata value is not valid UTF-8"))
+    end
+    return nothing
+end
+
+function _validate_schema(s::Schema)
+    s.endianness in (LittleEndian, BigEndian) ||
+        throw(ValidationError("invalid Arrow schema endianness $(repr(s.endianness))"))
+    _validate_metadata(s.metadata, "schema")
+    return s
 end
 
 """
@@ -897,6 +922,7 @@ core/examples/ipc_read.jl.)
 function validate_structural(f::Field, d::ArrayData)
     isvalid(f.name) ||
         throw(ValidationError("field name is not valid UTF-8"))
+    _validate_metadata(f.metadata, "field")
     typeequal(f.type, d.type) ||
         throw(ValidationError("field/type mismatch: $(f.type) vs $(d.type)"))
     _validate_descriptor(d.type)
@@ -1684,6 +1710,7 @@ struct RecordBatch
     columns::FrozenVector{ArrayData}
     nrows::Int64
     function RecordBatch(schema::Schema, columns, nrows::Integer)
+        _validate_schema(schema)
         cols = FrozenVector{ArrayData}(columns)
         n = Int64(nrows)
         n >= 0 || throw(ArgumentError("negative row count"))

@@ -232,6 +232,17 @@ end
     empty!(children)
     @test length(frozen.children) == 1
 
+    # Sequential metadata is the lossless representation: preserve order and
+    # duplicate keys while defensively copying the caller's container.
+    ordered_metadata = ["k" => "first", "k" => "second", "z" => "last"]
+    metadata_field = Field("m", IntType(8, true); metadata=ordered_metadata)
+    pop!(ordered_metadata)
+    @test collect(metadata_field.metadata) ==
+        ["k" => "first", "k" => "second", "z" => "last"]
+    @test collect(Schema([metadata_field];
+        metadata=("a" => "1", "a" => "2")).metadata) ==
+        ["a" => "1", "a" => "2"]
+
     # ListView offsets are per-slot and may be unordered; view data buffers
     # are variadic after the fixed validity/views pair.
     cf, cd = fromjulia("item", Int64[1, 2, 3])
@@ -524,6 +535,19 @@ end
         invalidname = String(UInt8[0xff])
         namef, named = fromjulia(invalidname, Int64[1])
         @test_throws ValidationError validate_structural(namef, named)
+
+        badutf8 = String(UInt8[0xff])
+        for metadata in (Dict(badutf8 => "v"), Dict("k" => badutf8))
+            badfield = Field("metadata", IntType(8, true); metadata=metadata)
+            baddata = AC.ArrayData(badfield.type, 0,
+                [BufferSlice(), BufferSlice()]; nullcount=0)
+            @test_throws ValidationError validate_structural(badfield, baddata)
+        end
+        badtimezone = TimestampType(AC.SECOND, badutf8)
+        @test_throws ValidationError validate_structural(
+            Field("timestamp", badtimezone),
+            AC.ArrayData(badtimezone, 0,
+                [BufferSlice(), BufferSlice()]; nullcount=0))
 
         badtimeunit = reinterpret(AC.TimeUnit, UInt8(0xff))
         baddateunit = reinterpret(AC.DateUnit, UInt8(0xff))
@@ -874,6 +898,14 @@ end
         [b.columns[1], AC.fromjulia("b", ["only-one"])[2]])
     empty_schema = Schema(Field[])
     @test RecordBatch(empty_schema, ArrayData[], 7).nrows == 7
+    badutf8 = String(UInt8[0xff])
+    @test_throws ValidationError RecordBatch(
+        Schema(Field[]; metadata=Dict(badutf8 => "v")), ArrayData[], 0)
+    @test_throws ValidationError RecordBatch(
+        Schema(Field[]; metadata=Dict("k" => badutf8)), ArrayData[], 0)
+    badendian = reinterpret(AC.Endianness, UInt8(0xff))
+    @test_throws ValidationError RecordBatch(
+        Schema(Field[]; endianness=badendian), ArrayData[], 0)
 end
 
 end # ArrowCore testset
