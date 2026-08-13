@@ -45,6 +45,9 @@ const NONCONFORMING_C_RELEASE =
         @test AC.loadat(b, Int64, Int64(0)) == 1
         @test AC.loadat(b, Int64, Int64(24)) == 4
         @test_throws ErrorException setproperty!(r, :ptr, Ptr{UInt8}(0))
+        @test_throws ErrorException setproperty!(r, :root, nothing)
+        @test_throws ErrorException setproperty!(r, :state, AC.PHASE_CLOSED)
+        @test_throws ErrorException setproperty!(r, :guards, 0)
     end
 
     @testset "mmap region: read, deterministic close, invalidation" begin
@@ -105,6 +108,43 @@ const NONCONFORMING_C_RELEASE =
         @test_throws InvalidatedError withguard(() -> 1, r)
     end
 
+    @testset "wait errors restore a claimed close" begin
+        bytes = UInt8[0]
+        calls = AC.ReleaseCounter()
+        r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1,
+            AC.Foreign; root=bytes, releasefn=AC.NotifyRelease(calls))
+        AC._acquireguard!(r)
+        closer = Threads.@spawn forceclose!(r; timeout_ms=10_000)
+        while AC.regionphase(r) != AC.PHASE_CLOSING
+            yield()
+        end
+        lock(r.cond)
+        try
+            # Model the last guard draining, then inject an ordinary wait
+            # failure. Rollback must use claim progress, not guard count.
+            setfield!(r, :guards, 0)
+            notify(r.cond, ErrorException("injected wait failure");
+                all=true, error=true)
+        finally
+            unlock(r.cond)
+        end
+        @test_throws TaskFailedException fetch(closer)
+        @test AC.regionphase(r) == AC.PHASE_OPEN
+        @test AC.guardcount(r) == 0
+        @test calls[] == 0
+        @test forceclose!(r; timeout_ms=0)
+        @test calls[] == 1
+    end
+
+    @testset "deadline arithmetic wraps safely" begin
+        started = typemax(UInt64) - UInt64(5)
+        @test AC._elapsed_ns(started, UInt64(3)) == UInt64(9)
+        @test !AC._expired(started, UInt64(10), UInt64(3))
+        @test AC._remaining_ns(started, UInt64(10), UInt64(3)) == UInt64(1)
+        @test AC._expired(started, UInt64(9), UInt64(3))
+        @test AC._remaining_ns(started, UInt64(9), UInt64(3)) == UInt64(0)
+    end
+
     @testset "guard acquired after close fails" begin
         r = heapregion(zeros(UInt8, 8))
         @test forceclose!(r)
@@ -129,7 +169,7 @@ const NONCONFORMING_C_RELEASE =
         # registration error must synchronously release the new region.
         registration_calls = AC.ReleaseCounter()
         unarmed = AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0, AC.Foreign)
-        unarmed.releasefn = AC.NotifyRelease(registration_calls)
+        setfield!(unarmed, :releasefn, AC.NotifyRelease(registration_calls))
         @test_throws ArgumentError AC._register_initial_region_finalizer!(
             unarmed, Ptr{Cvoid}(C_NULL))
         @test registration_calls[] == 1
@@ -227,12 +267,16 @@ const NONCONFORMING_C_RELEASE =
 
         @test grandchild.lifecycle === gate
         withguard(grandchild) do
+            @test AC.guardcount(child) == 1
+            @test AC.guardcount(grandchild) == 1
             @test !forceclose!(gate; timeout_ms=0)
             @test calls[] == 0
             @test AC.regionphase(gate) == AC.PHASE_OPEN
         end
         @test forceclose!(gate; timeout_ms=0)
         @test calls[] == 1
+        @test AC.regionphase(child) == AC.PHASE_CLOSED
+        @test AC.regionphase(grandchild) == AC.PHASE_CLOSED
         @test_throws InvalidatedError withguard(() -> nothing, grandchild)
     end
 end

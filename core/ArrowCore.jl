@@ -287,6 +287,13 @@ end
 
 @inline _lifecycle(r::OwnerRegion) = r.lifecycle === nothing ? r : r.lifecycle
 
+# `OwnerRegion` is exported, but lifecycle mutation is not public API. Keep
+# callers from dropping a live GC anchor or changing state outside `cond`.
+# Internal transitions use `setfield!` while holding the required lock.
+function Base.setproperty!(::OwnerRegion, name::Symbol, value)
+    throw(ErrorException("OwnerRegion.$name is read-only"))
+end
+
 function _run_release!(a::ReleaseAction, r::OwnerRegion)
     n = a.note
     n === nothing || increment!(n)
@@ -404,7 +411,7 @@ end
     Base.@lock r.cond begin
         r.state == PHASE_OPEN ||
             throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
-        r.guards += 1
+        setfield!(r, :guards, r.guards + 1)
     end
     return r
 end
@@ -412,24 +419,40 @@ end
 function _releaseguard!(r::OwnerRegion)
     r = _lifecycle(r)
     Base.@lock r.cond begin
-        r.guards -= 1
+        setfield!(r, :guards, r.guards - 1)
         r.guards == 0 && notify(r.cond; all=true)
     end
     return nothing
 end
 
 "Locked read of the region's lifecycle phase (test/diagnostic accessor)."
-regionphase(r::OwnerRegion) = Base.@lock r.cond r.state
+function regionphase(r::OwnerRegion)
+    r = _lifecycle(r)
+    return Base.@lock r.cond r.state
+end
 "Locked read of the region's in-flight guard count (test/diagnostic accessor)."
-guardcount(r::OwnerRegion) = Base.@lock r.cond r.guards
+function guardcount(r::OwnerRegion)
+    r = _lifecycle(r)
+    return Base.@lock r.cond r.guards
+end
 
 # `Threads.Condition` has no timed wait; a Timer notifies the condition at
 # the deadline so waiters wake and re-check their predicate. Callers loop on
 # (predicate, deadline) after every wakeup, so spurious wakeups are benign.
-function _wait_with_deadline(c::Threads.Condition, deadline::UInt64)
-    now = time_ns()
-    now >= deadline && return nothing
-    t = Timer((deadline - now) / 1.0e9) do _
+@inline _elapsed_ns(started::UInt64, now::UInt64=time_ns()) = now - started
+@inline _expired(started::UInt64, timeout_ns::UInt64,
+    now::UInt64=time_ns()) = _elapsed_ns(started, now) >= timeout_ns
+@inline _remaining_ns(started::UInt64, timeout_ns::UInt64,
+    now::UInt64=time_ns()) = begin
+    elapsed = _elapsed_ns(started, now)
+    elapsed >= timeout_ns ? UInt64(0) : timeout_ns - elapsed
+end
+
+function _wait_with_deadline(c::Threads.Condition, started::UInt64,
+    timeout_ns::UInt64)
+    remaining = _remaining_ns(started, timeout_ns)
+    remaining == 0 && return nothing
+    t = Timer(remaining / 1.0e9) do _
         lock(c)
         try
             notify(c; all=true)
@@ -440,7 +463,15 @@ function _wait_with_deadline(c::Threads.Condition, deadline::UInt64)
     try
         wait(c)
     finally
-        close(t)
+        # `wait(c)` returns with `c` locked. `close(::Timer)` may yield while
+        # libuv closes its handle, so never do that work under the lifecycle
+        # lock. Preserve the caller contract by reacquiring before exit.
+        unlock(c)
+        try
+            close(t)
+        finally
+            lock(c)
+        end
     end
     return nothing
 end
@@ -466,37 +497,40 @@ function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
     timeout_ms >= 0 || throw(ArgumentError("timeout_ms must be non-negative"))
     timeout_ms <= typemax(Int64) ÷ 1_000_000 ||
         throw(ArgumentError("timeout_ms is too large"))
-    deadline = time_ns() + UInt64(timeout_ms) * 1_000_000
+    started = time_ns()
+    timeout_ns = UInt64(timeout_ms) * 1_000_000
     lock(r.cond)
     claimed = false
+    ready_to_release = false
     try
         while true
             r.state == PHASE_CLOSED && return true
             if r.state == PHASE_CLOSING
                 # Another closer owns the release action; wait for it to
                 # publish CLOSED (or time out reporting busy).
-                (timeout_ms == 0 || time_ns() >= deadline) && return false
-                _wait_with_deadline(r.cond, deadline)
+                (timeout_ms == 0 || _expired(started, timeout_ns)) && return false
+                _wait_with_deadline(r.cond, started, timeout_ns)
                 continue
             end
             break
         end
-        r.state = PHASE_CLOSING
+        setfield!(r, :state, PHASE_CLOSING)
         claimed = true
         while r.guards != 0
-            if timeout_ms == 0 || time_ns() >= deadline
-                r.state = PHASE_OPEN
+            if timeout_ms == 0 || _expired(started, timeout_ns)
+                setfield!(r, :state, PHASE_OPEN)
                 claimed = false
                 notify(r.cond; all=true)
                 return false
             end
-            _wait_with_deadline(r.cond, deadline)
+            _wait_with_deadline(r.cond, started, timeout_ns)
         end
+        ready_to_release = true
     finally
         # An unexpected error while claiming (e.g. from Timer machinery)
         # must not strand `closing`.
-        if claimed && r.state == PHASE_CLOSING && r.guards != 0
-            r.state = PHASE_OPEN
+        if claimed && !ready_to_release && r.state == PHASE_CLOSING
+            setfield!(r, :state, PHASE_OPEN)
             notify(r.cond; all=true)
         end
         unlock(r.cond)
@@ -513,9 +547,9 @@ function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
             # storage cannot safely be retried. Never strand `closing`, and
             # drop the GC anchor so borrowed/mapped storage (e.g. an Mmap
             # stdlib array) can be collected promptly.
-            r.releasefn = nothing
-            r.state = PHASE_CLOSED
-            r.root = nothing
+            setfield!(r, :releasefn, nothing)
+            setfield!(r, :state, PHASE_CLOSED)
+            setfield!(r, :root, nothing)
             notify(r.cond; all=true)
         end
     end
@@ -523,7 +557,7 @@ function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
 end
 
 Base.close(r::OwnerRegion) = (forceclose!(r) ||
-    error("region busy: guards still held after timeout"); nothing)
+    error("region close did not complete before timeout"); nothing)
 
 # --- region constructors ----------------------------------------------------
 

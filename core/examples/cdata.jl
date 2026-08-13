@@ -769,13 +769,21 @@ function _arm_foreign_owner!(o::ForeignOwner)
     # then free the copy. The OwnerRegion constructor already registered the
     # shared-mode finalizer backstop when the free-only action was installed.
     cb = unsafe_load(o.arrayblock).release
-    o.gate.releasefn = CcallRelease(cb, Ptr{Cvoid}(o.arrayblock);
-        freearg=true, verify_null_at=CARROWARRAY_RELEASE_OFFSET)
+    Base.@lock o.gate.cond begin
+        o.gate.state == AC.PHASE_OPEN ||
+            error("cannot arm a foreign owner after close has started")
+        setfield!(o.gate, :releasefn,
+            CcallRelease(cb, Ptr{Cvoid}(o.arrayblock);
+                freearg=true, verify_null_at=CARROWARRAY_RELEASE_OFFSET))
+    end
     return nothing
 end
 
 _foreign_owner_armed(o::ForeignOwner) =
-    (a = o.gate.releasefn; a !== nothing && a.cb != C_NULL)
+    Base.@lock o.gate.cond begin
+        a = o.gate.releasefn
+        a !== nothing && a.cb != C_NULL
+    end
 
 function _release_moved_owner!(o::ForeignOwner)
     # A failure may occur after the source move but before arming. Install
@@ -788,7 +796,7 @@ end
 
 function release!(o::ForeignOwner; timeout_ms::Integer=1000)
     forceclose!(o.gate; timeout_ms=timeout_ms) ||
-        error("foreign array busy: access guards still held after timeout")
+        error("foreign array close did not complete before timeout")
     return nothing
 end
 
