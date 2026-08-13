@@ -258,6 +258,10 @@ call may simply be retried. After a successful close every view built on the
 region throws `InvalidatedError` on access.
 """
 function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
+    return _forceclose!(r, timeout_ms, yield)
+end
+
+function _forceclose!(r::OwnerRegion, timeout_ms::Integer, waitfn)
     r = _lifecycle(r)
     timeout_ms >= 0 || throw(ArgumentError("timeout_ms must be non-negative"))
     timeout_ms <= typemax(UInt64) ÷ 1_000_000 ||
@@ -286,14 +290,22 @@ function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
     end
     # Wait for in-flight guards. Guards are short-lived by contract, so this
     # terminates quickly; the timeout is a safety valve, not a normal path.
-    while (@atomic r.guards) != 0   # seq_cst: pairs with withguard's increment
-        if time_ns() - started >= timeout_ns
-            # Restore only our exact closing state. This remains robust to
-            # explicit `finalize(r)` and future lifecycle transitions.
-            @atomicreplace r.state closing => st
-            return false
+    try
+        while (@atomic r.guards) != 0   # seq_cst: pairs with withguard's increment
+            if time_ns() - started >= timeout_ns
+                # Restore only our exact closing state. This remains robust to
+                # explicit `finalize(r)` and future lifecycle transitions.
+                @atomicreplace r.state closing => st
+                return false
+            end
+            waitfn()
         end
-        yield()
+    catch
+        # The winning closer owns CLOSING until release starts. Task
+        # cancellation or another wait failure must return that ownership;
+        # otherwise the region is stranded closed-but-unreleased forever.
+        @atomicreplace r.state closing => st
+        rethrow()
     end
     f = r.releasefn
     r.releasefn = nothing

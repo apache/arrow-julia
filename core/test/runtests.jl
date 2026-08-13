@@ -105,6 +105,26 @@ end
         @test_throws InvalidatedError withguard(() -> 1, r)
     end
 
+    @testset "interrupted close wait restores open" begin
+        bytes = UInt8[0]
+        calls = Ref(0)
+        r = GC.@preserve bytes AC.OwnerRegion(
+            Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
+            root=bytes, releasefn=_ -> (calls[] += 1))
+        AC._acquireguard!(r)
+        try
+            @test_throws InterruptException AC._forceclose!(r, 1000,
+                () -> throw(InterruptException()))
+            @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
+            @test calls[] == 0
+        finally
+            AC._releaseguard!(r)
+        end
+        @test withguard(() -> 1, r) == 1
+        @test forceclose!(r)
+        @test calls[] == 1
+    end
+
     @testset "guard acquired after close fails" begin
         r = heapregion(zeros(UInt8, 8))
         @test forceclose!(r)
