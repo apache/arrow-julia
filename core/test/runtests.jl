@@ -45,7 +45,6 @@ const NONCONFORMING_C_RELEASE =
         @test AC.loadat(b, Int64, Int64(0)) == 1
         @test AC.loadat(b, Int64, Int64(24)) == 4
         @test_throws ErrorException setproperty!(r, :ptr, Ptr{UInt8}(0))
-        @test_throws ErrorException setproperty!(r, :root, nothing)
     end
 
     @testset "mmap region: read, deterministic close, invalidation" begin
@@ -63,115 +62,24 @@ const NONCONFORMING_C_RELEASE =
         rm(path)
     end
 
-    @testset "mmap ownership handoff cleans up construction failure" begin
+    @testset "mapped regions: stdlib-backed lifecycle" begin
         path = tempname()
-        write(path, UInt8[0x11])
-        unmaps = Ref(0)
-        unmapper = function (p, len)
-            unmaps[] += 1
-            AC._munmap!(p, len)
-        end
-        makeowner = (args...; kwargs...) -> error("injected owner failure")
-        @test_throws ErrorException AC._mmapregion(path, makeowner;
-            unmapper=unmapper)
-        @test unmaps[] == 1
-
-        # A factory can fail after OwnerRegion has armed its finalizer but
-        # before _mmapregion receives the owner. The constructor catch and the
-        # later finalizer must share one release claim, not unmap twice.
-        lateowner = Ref{Union{Nothing,OwnerRegion}}(nothing)
-        latefailure = function (args...; kwargs...)
-            lateowner[] = OwnerRegion(args...; kwargs...)
-            error("injected post-finalizer owner failure")
-        end
-        @test_throws ErrorException AC._mmapregion(path, latefailure;
-            unmapper=unmapper)
-        @test unmaps[] == 2
-        finalize(lateowner[]::OwnerRegion)
-        @test unmaps[] == 2
-
-        # Plain error semantics on the shared claim: a failed unmap restores
-        # LIVE (the mapping still exists), a later attempt may succeed and
-        # publish RELEASED, and RELEASED short-circuits every further call.
-        claim = AC.MapClaim()
-        attempts = Ref(0)
-        flaky = function (_p, _len)
-            attempts[] += 1
-            attempts[] == 1 && error("transient unmap failure")
-            nothing
-        end
-        @test_throws ErrorException AC._release_mapping_once!(
-            claim, Ptr{Cvoid}(1), 1, flaky)
-        @test (@atomic claim.s) == 0x00
-        AC._release_mapping_once!(claim, Ptr{Cvoid}(1), 1, flaky)
-        @test (@atomic claim.s) == 0x02
-        AC._release_mapping_once!(claim, Ptr{Cvoid}(1), 1, flaky)
-        @test attempts[] == 2
-
-        # Two possible owners may arrive while the first release is in
-        # progress. Only one unmapper runs; the waiter observes RELEASED.
-        raceclaim = AC.MapClaim()
-        racecalls = AC.ReleaseCounter()
-        entered = Base.Event()
-        finish = Base.Event()
-        blocking = function (_p, _len)
-            AC.increment!(racecalls)
-            notify(entered)
-            wait(finish)
-            nothing
-        end
-        first = Threads.@spawn AC._release_mapping_once!(
-            raceclaim, Ptr{Cvoid}(1), 1, blocking)
-        wait(entered)
-        second = Threads.@spawn AC._release_mapping_once!(
-            raceclaim, Ptr{Cvoid}(1), 1, blocking)
-        yield()
-        @test !istaskdone(second)
-        notify(finish)
-        @test fetch(first) === nothing
-        @test fetch(second) === nothing
-        @test racecalls[] == 1
-        @test (@atomic raceclaim.s) == 0x02
-
-        # If the winner fails, it restores LIVE. A waiting owner can then
-        # claim the mapping and publish RELEASED.
-        retryclaim = AC.MapClaim()
-        retrycalls = AC.ReleaseCounter()
-        retryentered = Base.Event()
-        retryfinish = Base.Event()
-        retrying = function (_p, _len)
-            attempt = AC.increment!(retrycalls)
-            if attempt == 1
-                notify(retryentered)
-                wait(retryfinish)
-                error("injected unmap failure")
-            end
-            nothing
-        end
-        failed = Threads.@spawn try
-            AC._release_mapping_once!(retryclaim, Ptr{Cvoid}(1), 1, retrying)
-            nothing
-        catch e
-            e
-        end
-        wait(retryentered)
-        recovered = Threads.@spawn AC._release_mapping_once!(
-            retryclaim, Ptr{Cvoid}(1), 1, retrying)
-        notify(retryfinish)
-        @test fetch(failed) isa ErrorException
-        @test fetch(recovered) === nothing
-        @test retrycalls[] == 2
-        @test (@atomic retryclaim.s) == 0x02
-
-        # The armed release is concrete data: exactly one action execution,
-        # observed via the note counter, and a finalizer after close is inert.
-        closed_notes = AC.ReleaseCounter()
-        r = AC._mmapregion(path; unmapper=unmapper, note=closed_notes)
-        @test unmaps[] == 2              # constructor-path count is unchanged
+        write(path, UInt8[0x11, 0x22, 0x33])
+        r = mmapregion(path)
+        @test r.kind == AC.Mapped
+        @test r.root isa Vector{UInt8}
+        b = BufferSlice(r, 0, 3)
+        @test AC.loadat(b, UInt8, Int64(2)) == 0x33
+        # forceclose invalidates every view and drops the GC anchor; the
+        # stdlib's own machinery unmaps once the array is collected.
         @test forceclose!(r)
-        @test closed_notes[] == 1
-        finalize(r)
-        @test closed_notes[] == 1
+        @test r.root === nothing
+        @test_throws InvalidatedError AC.loadat(b, UInt8, Int64(0))
+        emptypath = tempname()
+        touch(emptypath)
+        @test_throws ArgumentError mmapregion(emptypath)   # empty file
+        rm(emptypath)
+        @test_throws SystemError mmapregion(tempname())    # missing file
         rm(path)
     end
 
@@ -188,7 +96,7 @@ const NONCONFORMING_C_RELEASE =
         wait(entered)
         # a guard is held: a short-timeout close must fail AND restore open
         @test forceclose!(r; timeout_ms=50) == false
-        @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
+        @test AC.regionphase(r) == AC.PHASE_OPEN
         # region still fully usable after the busy close
         @test withguard(() -> 1, r) == 1
         notify(release)
@@ -201,7 +109,7 @@ const NONCONFORMING_C_RELEASE =
         r = heapregion(zeros(UInt8, 8))
         @test forceclose!(r)
         @test_throws InvalidatedError withguard(() -> 1, r)
-        @test (@atomic r.guards) == 0   # failed acquire backed out its count
+        @test AC.guardcount(r) == 0   # failed acquire backed out its count
     end
 
     @testset "invalid construction and release errors stay closed" begin
@@ -213,7 +121,7 @@ const NONCONFORMING_C_RELEASE =
             root=bytes, releasefn=AC.NotifyRelease(calls; fail=true))
         @test_throws ErrorException forceclose!(r)
         @test calls[] == 1
-        @test AC.phase(@atomic r.state) == AC.PHASE_CLOSED
+        @test AC.regionphase(r) == AC.PHASE_CLOSED
         @test forceclose!(r)
         @test calls[] == 1
 
@@ -226,7 +134,7 @@ const NONCONFORMING_C_RELEASE =
             unarmed, Ptr{Cvoid}(C_NULL))
         @test registration_calls[] == 1
         @test unarmed.releasefn === nothing
-        @test AC.phase(@atomic unarmed.state) == AC.PHASE_CLOSED
+        @test AC.regionphase(unarmed) == AC.PHASE_CLOSED
         @test forceclose!(unarmed)
         @test registration_calls[] == 1
 
@@ -255,7 +163,7 @@ const NONCONFORMING_C_RELEASE =
                 freearg=true, note=ccall_notes, verify_null_at=0))
         @test_throws ErrorException forceclose!(badrelease)
         @test ccall_notes[] == 1
-        @test AC.phase(@atomic badrelease.state) == AC.PHASE_CLOSED
+        @test AC.regionphase(badrelease) == AC.PHASE_CLOSED
         @test forceclose!(badrelease)
         @test ccall_notes[] == 1
 
@@ -266,7 +174,7 @@ const NONCONFORMING_C_RELEASE =
             releasefn=AC.NotifyRelease(finalizer_calls; fail=true))
         @test finalize(finalized) === nothing
         @test finalizer_calls[] == 1
-        @test AC.phase(@atomic finalized.state) == AC.PHASE_CLOSED
+        @test AC.regionphase(finalized) == AC.PHASE_CLOSED
         @test forceclose!(finalized)
         @test finalizer_calls[] == 1
     end
@@ -283,13 +191,13 @@ const NONCONFORMING_C_RELEASE =
         first = Threads.@spawn forceclose!(r)
         wait(entered)
         @test forceclose!(r; timeout_ms=0) == false
-        @test AC.phase(@atomic r.state) == AC.PHASE_CLOSING
+        @test AC.regionphase(r) == AC.PHASE_CLOSING
         waiter = Threads.@spawn forceclose!(r)
         notify(finish)
         @test fetch(first)
         @test fetch(waiter)
         @test calls[] == 1
-        @test AC.phase(@atomic r.state) == AC.PHASE_CLOSED
+        @test AC.regionphase(r) == AC.PHASE_CLOSED
     end
 
     @testset "manual finalization honors an active guard" begin
@@ -300,11 +208,11 @@ const NONCONFORMING_C_RELEASE =
         withguard(r) do
             finalize(r)
             @test calls[] == 0
-            @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
+            @test AC.regionphase(r) == AC.PHASE_OPEN
         end
         finalize(r)
         @test calls[] == 1
-        @test AC.phase(@atomic r.state) == AC.PHASE_CLOSED
+        @test AC.regionphase(r) == AC.PHASE_CLOSED
     end
 
     @testset "delegated lifecycles share one root gate" begin
@@ -321,7 +229,7 @@ const NONCONFORMING_C_RELEASE =
         withguard(grandchild) do
             @test !forceclose!(gate; timeout_ms=0)
             @test calls[] == 0
-            @test AC.phase(@atomic gate.state) == AC.PHASE_OPEN
+            @test AC.regionphase(gate) == AC.PHASE_OPEN
         end
         @test forceclose!(gate; timeout_ms=0)
         @test calls[] == 1

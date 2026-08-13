@@ -82,6 +82,7 @@ pattern the facade will formalize.
 module ArrowCore
 
 using Base: Checked
+import Mmap
 const checked_add = Checked.checked_add
 const checked_sub = Checked.checked_sub
 const checked_mul = Checked.checked_mul
@@ -104,24 +105,20 @@ export OwnerRegion, BufferSlice, MemoryKind, InvalidatedError, forceclose!,
 # §1 Memory: OwnerRegion + BufferSlice + access guards
 # ---------------------------------------------------------------------------
 
-@enum MemoryKind::UInt8 Heap Mmap Foreign IPCBlob
+@enum MemoryKind::UInt8 Heap Mapped Foreign IPCBlob
 
 "Thrown when a view is used after its region was force-closed."
 struct InvalidatedError <: Exception
     msg::String
 end
 
-# Region lifecycle state is one atomic word: (generation << 2) | phase.
-# Phases: 0=open, 1=closing, 2=closed. The generation increments on every
-# successful close so a stale view's cached expectations can never match a
-# recycled state word.
-const PHASE_OPEN = 0x0000000000000000
-const PHASE_CLOSING = 0x0000000000000001
-const PHASE_CLOSED = 0x0000000000000002
-const PHASE_MASK = 0x0000000000000003
-
-phase(state::UInt64) = state & PHASE_MASK
-generation(state::UInt64) = state >> 2
+# Region lifecycle state: a plain Int guarded by the region's condition
+# lock. 0=open, 1=closing, 2=closed. No atomics, no generation packing —
+# every transition and every guard-count change happens under one
+# `Threads.Condition`, and waiters use wait/notify instead of yield spins.
+const PHASE_OPEN = 0
+const PHASE_CLOSING = 1
+const PHASE_CLOSED = 2
 
 # ---------------------------------------------------------------------------
 # Release actions: a CLOSED, concrete set instead of an `Any` callback.
@@ -159,22 +156,14 @@ function increment!(c::ReleaseCounter)
     end
 end
 
-# One mapping's release claim, shared by the two possible owners (the armed
-# region's release action and the constructor's failure path): LIVE(0) ->
-# RELEASING(1) -> RELEASED(2); a failed unmap restores LIVE.
-mutable struct MapClaim
-    @atomic s::UInt8
-end
-MapClaim() = MapClaim(0x00)
-
-@enum ReleaseKind::UInt8 RELEASE_MUNMAP RELEASE_CCALL RELEASE_NOTIFY RELEASE_RENDEZVOUS
+@enum ReleaseKind::UInt8 RELEASE_CCALL RELEASE_NOTIFY RELEASE_RENDEZVOUS
 
 """
     ReleaseAction
 
 The concrete description of what releasing a region's memory means. Built
-via [`MunmapRelease`](@ref), [`CcallRelease`](@ref), [`NotifyRelease`](@ref)
-or [`RendezvousRelease`](@ref); executed exactly once by the lifecycle state
+via [`CcallRelease`](@ref), [`NotifyRelease`](@ref) or
+[`RendezvousRelease`](@ref); executed exactly once by the lifecycle state
 machine via `_run_release!`. `note` (any kind) is bumped on entry so tests
 and metrics can observe exactly-once without injecting code.
 """
@@ -187,20 +176,9 @@ struct ReleaseAction
     fail::Bool                                # RELEASE_NOTIFY: throw after noting
     entered::Union{Nothing,Base.Event}        # RELEASE_RENDEZVOUS
     finish::Union{Nothing,Base.Event}         # RELEASE_RENDEZVOUS
-    mapstate::Union{Nothing,MapClaim}         # RELEASE_MUNMAP claim word
     verify_null_at::Int32   # RELEASE_CCALL: byte offset of a pointer field in
                             # *arg that the callback must null (-1 = no check)
 end
-
-"""
-Release a mapped region with the exactly-once munmap machinery. `mapstate`
-is the mapping's shared LIVE/RELEASING/RELEASED claim (also consulted by the
-constructor's failure path, so both possible owners serialize on one word).
-"""
-MunmapRelease(mapstate::MapClaim;
-    note::Union{Nothing,ReleaseCounter}=nothing) =
-    ReleaseAction(RELEASE_MUNMAP, C_NULL, C_NULL, false, note, false,
-        nothing, nothing, mapstate, Int32(-1))
 
 """
 Release by calling a C function pointer with `arg` (skipped when `cb` is
@@ -212,18 +190,18 @@ CcallRelease(cb::Ptr{Cvoid}, arg::Ptr{Cvoid}; freearg::Bool=false,
     note::Union{Nothing,ReleaseCounter}=nothing,
     verify_null_at::Integer=-1) =
     ReleaseAction(RELEASE_CCALL, cb, arg, freearg, note, false, nothing,
-        nothing, nothing, Int32(verify_null_at))
+        nothing, Int32(verify_null_at))
 
 "Observe release: bump `note`; `fail=true` then throws (error-path tests)."
 NotifyRelease(note::ReleaseCounter; fail::Bool=false) =
     ReleaseAction(RELEASE_NOTIFY, C_NULL, C_NULL, false, note, fail, nothing,
-        nothing, nothing, Int32(-1))
+        nothing, Int32(-1))
 
 "Observe + block: bump `note`, notify `entered`, wait on `finish` (closer-race tests)."
 RendezvousRelease(entered::Base.Event, finish::Base.Event;
     note::Union{Nothing,ReleaseCounter}=nothing) =
     ReleaseAction(RELEASE_RENDEZVOUS, C_NULL, C_NULL, false, note, false,
-        entered, finish, nothing, Int32(-1))
+        entered, finish, Int32(-1))
 
 
 """
@@ -256,15 +234,21 @@ mutable struct OwnerRegion
     const len::Int64
     const kind::MemoryKind
     const alignment::Int    # actual alignment of ptr; slices/views consult it
-    const root::Any         # GC anchor for borrowed memory; nothing otherwise
+    root::Any               # GC anchor for borrowed memory; cleared on close
     # Foreign C-data trees use one zero-length lifecycle region for every
     # buffer allocation in the moved tree. `nothing` means this region owns
     # its own state. A shared lifecycle makes release and invalidation one
     # atomic tree-wide operation without conflating allocation extents.
     const lifecycle::Union{Nothing,OwnerRegion}
     releasefn::Union{Nothing,ReleaseAction}
-    @atomic state::UInt64
-    @atomic guards::Int
+    # Lifecycle state machine: plain fields, every read and write under
+    # `cond`'s lock; state transitions notify waiters. Simpler to reason
+    # about than the previous lock-free CAS word, and the uncontended lock
+    # cost on the guard path is comparable to the seq_cst CAS pair it
+    # replaced.
+    const cond::Threads.Condition
+    state::Int
+    guards::Int
 
     function OwnerRegion(ptr::Ptr{UInt8}, len::Integer, kind::MemoryKind;
         root=nothing, releasefn::Union{Nothing,ReleaseAction}=nothing,
@@ -290,7 +274,7 @@ mutable struct OwnerRegion
         lifecycle = lifecycle === nothing ? nothing : _lifecycle(lifecycle)
         align = ptr == C_NULL ? 64 : (1 << trailing_zeros(UInt(ptr) | UInt(64)))
         r = new(ptr, n, kind, align, root, lifecycle,
-            releasefn, PHASE_OPEN, 0)
+            releasefn, Threads.Condition(), PHASE_OPEN, 0)
         # Shared-mode cleanup: only regions that own non-GC memory need a
         # finalizer. A finalizer only runs when the region is unreachable, at
         # which point no guard can exist, so releasing directly is safe.
@@ -306,9 +290,7 @@ end
 function _run_release!(a::ReleaseAction, r::OwnerRegion)
     n = a.note
     n === nothing || increment!(n)
-    if a.kind == RELEASE_MUNMAP
-        _release_mapping_once!(a.mapstate::MapClaim, r.ptr, r.len, _munmap!)
-    elseif a.kind == RELEASE_CCALL
+    if a.kind == RELEASE_CCALL
         _run_ccall_release!(a, _libc_free!)
     elseif a.kind == RELEASE_RENDEZVOUS
         notify(a.entered::Base.Event)
@@ -402,48 +384,14 @@ scalar accessors and may take several guards per element; a future facade
 bulk kernel can deliberately amortize one guard across its work. Throws
 `InvalidatedError` if the region is closing or closed.
 
-The ordering that makes this race-free against `forceclose!`: the guard
-count is incremented BEFORE the state check. A closer that CASes to
-`closing` after our increment will see our guard and wait for it; if the
-closer got there first, our post-increment state check sees `closing` and we
-back out. Either way no dereference overlaps a release.
+Guard bookkeeping is a locked increment/decrement on the region's condition
+lock; `f` itself always runs OUTSIDE the lock. A closer that has set
+`closing` blocks new guards (they see the state under the same lock) and
+waits on the condition until in-flight guards drain — no ordering
+subtleties, no spinning.
 """
-@inline function _acquireguard!(r::OwnerRegion)
-    r = _lifecycle(r)
-    # Both sides of this handshake are sequentially consistent on purpose:
-    # guard-increment/state-load here race against state-CAS/guards-load in
-    # `forceclose!` on two different locations — the classic store/load
-    # pattern where acquire/release alone permits both sides to read stale
-    # values (closer sees guards==0 while we see state==open). seq_cst RMWs
-    # restore a single total order; the release decrement can stay cheaper.
-    _guard_add!(r, 1)
-    st = @atomic r.state
-    if phase(st) != PHASE_OPEN
-        _guard_add!(r, -1)
-        throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
-    end
-    return r
-end
-
-function _releaseguard!(r::OwnerRegion)
-    r = _lifecycle(r)
-    _guard_add!(r, -1)
-    return nothing
-end
-
-# Sequentially-consistent CAS loop; see `increment!` for why this is not a
-# plain `@atomic r.guards += delta`. seq_cst on both handshake sides is load-
-# bearing (see `_acquireguard!`), and CAS is seq_cst by default.
-@inline function _guard_add!(r::OwnerRegion, delta::Int)
-    while true
-        old = @atomic r.guards
-        _, ok = @atomicreplace r.guards old => old + delta
-        ok && return nothing
-    end
-end
-
 @inline function withguard(f, r::OwnerRegion)
-    _acquireguard!(r)
+    r = _acquireguard!(r)
     try
         return f()
     finally
@@ -451,60 +399,125 @@ end
     end
 end
 
+@inline function _acquireguard!(r::OwnerRegion)
+    r = _lifecycle(r)
+    Base.@lock r.cond begin
+        r.state == PHASE_OPEN ||
+            throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
+        r.guards += 1
+    end
+    return r
+end
+
+function _releaseguard!(r::OwnerRegion)
+    r = _lifecycle(r)
+    Base.@lock r.cond begin
+        r.guards -= 1
+        r.guards == 0 && notify(r.cond; all=true)
+    end
+    return nothing
+end
+
+"Locked read of the region's lifecycle phase (test/diagnostic accessor)."
+regionphase(r::OwnerRegion) = Base.@lock r.cond r.state
+"Locked read of the region's in-flight guard count (test/diagnostic accessor)."
+guardcount(r::OwnerRegion) = Base.@lock r.cond r.guards
+
+# `Threads.Condition` has no timed wait; a Timer notifies the condition at
+# the deadline so waiters wake and re-check their predicate. Callers loop on
+# (predicate, deadline) after every wakeup, so spurious wakeups are benign.
+function _wait_with_deadline(c::Threads.Condition, deadline::UInt64)
+    now = time_ns()
+    now >= deadline && return nothing
+    t = Timer((deadline - now) / 1.0e9) do _
+        lock(c)
+        try
+            notify(c; all=true)
+        finally
+            unlock(c)
+        end
+    end
+    try
+        wait(c)
+    finally
+        close(t)
+    end
+    return nothing
+end
+
 """
     forceclose!(region; timeout_ms=1000) -> Bool
 
 Deterministically release the region (scoped mode). Returns `true` when the
-region was released (or already closed). On guard-wait timeout, atomically
-restores `open` and returns `false`: the region is exactly as it was and the
-call may simply be retried. After a successful close every view built on the
-region throws `InvalidatedError` on access.
+region was released (or already closed). On guard-wait timeout, restores
+`open` and returns `false`: the region is exactly as it was and the call may
+simply be retried. After a successful close every view built on the region
+throws `InvalidatedError` on access.
+
+The release action runs OUTSIDE the lock (it may block, e.g. the rendezvous
+test action), with the region in `closing`: new guards and competing closers
+wait on the condition and observe the final `closed` state. The action is
+exactly-once even if it throws — the `finally` publishes `closed` and clears
+the action either way. `timeout_ms=0` never waits: it reports busy
+immediately (used by finalizers, which must not block).
 """
 function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
     r = _lifecycle(r)
     timeout_ms >= 0 || throw(ArgumentError("timeout_ms must be non-negative"))
-    timeout_ms <= typemax(UInt64) ÷ 1_000_000 ||
+    timeout_ms <= typemax(Int64) ÷ 1_000_000 ||
         throw(ArgumentError("timeout_ms is too large"))
-    started = time_ns()
-    timeout_ns = UInt64(timeout_ms) * 1_000_000
-    st = UInt64(0)
-    closing = UInt64(0)
-    while true
-        st = @atomic :acquire r.state
-        phase(st) == PHASE_CLOSED && return true
-        if phase(st) == PHASE_CLOSING
-            # Another closer is the sole release-action owner. Wait for it to
-            # publish CLOSED (success) or restore OPEN (then retry). Never
-            # CAS closing => closing: that would create a second winner.
-            time_ns() - started >= timeout_ns && return false
-            yield()
-            continue
+    deadline = time_ns() + UInt64(timeout_ms) * 1_000_000
+    lock(r.cond)
+    claimed = false
+    try
+        while true
+            r.state == PHASE_CLOSED && return true
+            if r.state == PHASE_CLOSING
+                # Another closer owns the release action; wait for it to
+                # publish CLOSED (or time out reporting busy).
+                (timeout_ms == 0 || time_ns() >= deadline) && return false
+                _wait_with_deadline(r.cond, deadline)
+                continue
+            end
+            break
         end
-        closing = (generation(st) << 2) | PHASE_CLOSING
-        # Close is cold-path: default (sequentially consistent) ordering.
-        _, ok = @atomicreplace r.state st => closing
-        ok && break
-    end
-    # Wait for in-flight guards. Guards are short-lived by contract, so this
-    # normally terminates quickly; the timeout is a safety valve.
-    while (@atomic r.guards) != 0
-        if time_ns() - started >= timeout_ns
-            # Restore only our exact closing word: we won the claim above, so
-            # nobody else can have transitioned the state since.
-            @atomicreplace r.state closing => st
-            return false
+        r.state = PHASE_CLOSING
+        claimed = true
+        while r.guards != 0
+            if timeout_ms == 0 || time_ns() >= deadline
+                r.state = PHASE_OPEN
+                claimed = false
+                notify(r.cond; all=true)
+                return false
+            end
+            _wait_with_deadline(r.cond, deadline)
         end
-        yield()
+    finally
+        # An unexpected error while claiming (e.g. from Timer machinery)
+        # must not strand `closing`.
+        if claimed && r.state == PHASE_CLOSING && r.guards != 0
+            r.state = PHASE_OPEN
+            notify(r.cond; all=true)
+        end
+        unlock(r.cond)
     end
+    # Guards are drained and the region is CLOSING: we exclusively own the
+    # release action. Run it unlocked so a blocking action cannot deadlock
+    # concurrent closers or acquirers (they wait on the condition).
     f = r.releasefn
     try
         f === nothing || _run_release!(f, r)
     finally
-        # The release action is exactly-once even if it reports an error:
-        # partially freed storage cannot safely be retried. Never strand the
-        # region in `closing`.
-        r.releasefn = nothing
-        @atomic :release r.state = ((generation(st) + 1) << 2) | PHASE_CLOSED
+        Base.@lock r.cond begin
+            # Exactly-once even if the action throws: partially freed
+            # storage cannot safely be retried. Never strand `closing`, and
+            # drop the GC anchor so borrowed/mapped storage (e.g. an Mmap
+            # stdlib array) can be collected promptly.
+            r.releasefn = nothing
+            r.state = PHASE_CLOSED
+            r.root = nothing
+            notify(r.cond; all=true)
+        end
     end
     return true
 end
@@ -535,84 +548,34 @@ end
 """
     mmapregion(path) -> OwnerRegion
 
-Map a file read-only and own the mapping. The region performs its own
-mmap/munmap via ccall (the report's choice: the stdlib Mmap ties unmap to a
-finalizer on internals with no public eager-unmap API, which is precisely
-the lifecycle problem this type exists to fix). POSIX only in the prove-out.
-The caller must prevent external writes or truncation of the opened inode
-while the mapping or any cached validation result remains in use. A shared
-mapping cannot keep a semantic certificate valid when another file handle or
-process changes its bytes, and truncation can also make an in-range load fault.
+Map a file read-only via the Mmap STDLIB (cross-platform) and wrap the
+mapped array as a region: the array is the GC anchor (`root`), and the
+stdlib's own machinery unmaps when the array is collected. `forceclose!` on
+a mapped region therefore means: invalidate every view (the safety
+property), then drop the anchor so collection — and with it the unmap — can
+happen promptly. Eager, deterministic unmapping is deliberately NOT
+attempted: the stdlib ties unmap to an internal finalizer with no public
+eager API, and reaching around it (the `finalize(arr.ref.mem)` trick some
+packages use) is version-fragile. If/when a public API lands upstream, a
+release action can restore eager unmap without changing this type's
+contract.
+
+The caller must prevent external writes or truncation of the mapped file
+while the region or any cached validation result remains in use: a shared
+mapping cannot keep a semantic certificate valid when another process
+changes its bytes, and truncation can make an in-range load fault.
 """
-function _munmap!(p::Ptr, len::Integer)
-    rc = ccall(:munmap, Cint, (Ptr{Cvoid}, Csize_t), p, len)
-    Base.systemerror("munmap", rc != 0)
-    return nothing
-end
-
-function _release_mapping_once!(claim::MapClaim, p::Ptr,
-    len::Integer, unmapper::U) where {U}
-    # The constructor's failure path and an armed OwnerRegion release can
-    # race to return the same mapping. Serialize attempts with a LIVE(0) ->
-    # RELEASING(1) -> RELEASED(2) claim. An unmapper failure restores LIVE
-    # and rethrows; a completed munmap publishes RELEASED. There is no ABA:
-    # only the active owner writes RELEASING -> LIVE after its own failed
-    # call, every contender rereads before CAS, and RELEASED is terminal.
-    while true
-        current = @atomic claim.s
-        current == 0x02 && return nothing
-        if current == 0x01
-            yield()
-            continue
-        end
-        _, ok = @atomicreplace claim.s 0x00 => 0x01
-        ok && break
-    end
-    try
-        unmapper(p, len)
-    catch
-        @atomic claim.s = 0x00
-        rethrow()
-    end
-    @atomic claim.s = 0x02
-    return nothing
-end
-
-function _mmapregion(path::String, makeowner::MK=OwnerRegion;
-    unmapper::U=_munmap!,
-    note::Union{Nothing,ReleaseCounter}=nothing) where {MK,U}
-    Sys.isunix() || error("mmapregion: prove-out implements POSIX only")
+function mmapregion(path::AbstractString)
     io = open(path, "r")
-    try
-    # Size the exact opened file descriptor. Sizing the path first lets
-    # a concurrent rename/symlink swap pair one inode's length with a
-    # different, shorter fd and later raise SIGBUS on an in-range load.
-    len = filesize(io)
-    len > 0 || throw(ArgumentError("cannot map empty file: $path"))
-    fd = Base.Filesystem.fd(io)
-    # One shared release claim for the two possible owners: the armed
-    # region's action, and the failure path below when region
-    # construction throws after the kernel has transferred the mapping.
-    claim = MapClaim()
-    # PROT_READ=1, MAP_SHARED=1 (Linux) / MAP_SHARED=1 (Darwin) — shared,
-    # read-only mapping; MAP_FAILED is (void*)-1.
-    p = ccall(:mmap, Ptr{Cvoid},
-        (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
-        C_NULL, len, 1 #= PROT_READ =#, 1 #= MAP_SHARED =#, fd, 0)
-    p == Ptr{Cvoid}(-1) && Base.systemerror("mmap($path)", true)
-    try
-        return makeowner(Ptr{UInt8}(p), len, Mmap;
-            releasefn=MunmapRelease(claim; note=note))::OwnerRegion
-    catch
-        _release_mapping_once!(claim, p, len, unmapper)
-        rethrow()
-    end
+    arr = try
+        Mmap.mmap(io, Vector{UInt8})
     finally
+        # The mapping outlives the descriptor.
         close(io)
     end
+    isempty(arr) && throw(ArgumentError("cannot map empty file: $path"))
+    return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr), Mapped; root=arr)
 end
-
-mmapregion(path::AbstractString) = _mmapregion(String(path))
 
 """
     foreignregion(ptr, len, release) -> OwnerRegion

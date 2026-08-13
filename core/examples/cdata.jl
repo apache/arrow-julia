@@ -1247,13 +1247,13 @@ function main()
     @assert sp_slot[] == C_NULL && ap_slot[] == C_NULL
     @assert skey_slot[] == 0 && akey_slot[] == 0
     @assert _registry_count() == before
-    @assert (@atomic handoffregion.guards) == 0
+    @assert AC.guardcount(handoffregion) == 0
     @assert forceclose!(handoffregion; timeout_ms=0)
 
     factoryregion = pda.buffers[2].region
     @assert try
         _newroot(Any[pda], pda) do root
-            @assert (@atomic factoryregion.guards) == 1
+            @assert AC.guardcount(factoryregion) == 1
             _malloc!(root, 64)
             error("injected export build failure")
         end
@@ -1261,7 +1261,7 @@ function main()
     catch e
         e isa ErrorException && e.msg == "injected export build failure"
     end
-    @assert (@atomic factoryregion.guards) == 0
+    @assert AC.guardcount(factoryregion) == 0
     @assert _registry_count() == before
     println("failed export handoffs return mallocs and source guards ✓")
 
@@ -1277,7 +1277,7 @@ function main()
         _malloc!(root, 64)
         return nothing
     end
-    @assert (@atomic cleanup_region.guards) == 1
+    @assert AC.guardcount(cleanup_region) == 1
     cleanup_steps = Ref(0)
     @assert try
         _cleanup_registered_root!(cleanup_key[]; after_step=_ -> begin
@@ -1296,7 +1296,7 @@ function main()
     @assert lock(REGISTRY_LOCK) do
         !haskey(EXPORT_REGISTRY, cleanup_key[])
     end
-    @assert (@atomic cleanup_region.guards) == 0
+    @assert AC.guardcount(cleanup_region) == 0
     @assert forceclose!(cleanup_region; timeout_ms=0)
     println("failed export cleanup remains registered and retryable ✓")
 

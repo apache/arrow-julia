@@ -173,9 +173,13 @@ have independent aggregate lifetimes and per-node control blocks.
 
 Other exclusions are unchanged: no IPC file footer/index, writer coordinator,
 facade, `ViewPlan`, typed views, ArrowTypes integration,
-C stream interface, or builders beyond test support. `mmapregion` is
-POSIX-only. External writes or truncation of a mapped file while the mapping
-or cached validation results remain in use are unsupported.
+C stream interface, or builders beyond test support. `mmapregion` maps via
+the Mmap STDLIB (cross-platform); `forceclose!` on a mapped region
+invalidates every view and drops the GC anchor, with the actual unmap
+happening when the array is collected — eager unmapping waits on a public
+stdlib API (reaching around the stdlib's internal finalizer is
+version-fragile). External writes or truncation of a mapped file while the
+mapping or cached validation results remain in use are unsupported.
 The ABI layout checks include 32-bit expectations, but this review executed
 them only on the available 64-bit host.
 
@@ -230,7 +234,11 @@ exactly-once, even when the release action itself throws) **is** in
 contract and tested. A formal revisit is planned when Julia 1.14's
 structured cancellation gives Base a real system to build on. Relatedly,
 `Threads.Atomic` boxes appear nowhere in `core/` — atomic state lives in
-`@atomic` struct fields (`ReleaseCounter`, `MapClaim`, region state/guards).
+`@atomic` struct fields (`ReleaseCounter`) — and the region lifecycle
+itself needs none: its state and guard count are plain Ints under one
+`Threads.Condition`, with waiters using wait/notify rather than spin/yield
+loops, and the release action running outside the lock so blocking actions
+cannot deadlock closers or acquirers.
 
 ## Compression
 
