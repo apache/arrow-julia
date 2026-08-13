@@ -148,25 +148,82 @@ _formaterror(fmt) = throw(ValidationError(
     "mapping is outside this prove-out"))
 
 function _parseformatint(fmt, s, what; low=0, high=typemax(Int32))
+    bytes = codeunits(s)
+    isempty(bytes) &&
+        throw(ValidationError("invalid $what in C format string \"$fmt\""))
+    firstdigit = 1
+    if bytes[1] == UInt8('-')
+        low < 0 ||
+            throw(ValidationError("invalid $what in C format string \"$fmt\""))
+        length(bytes) > 1 ||
+            throw(ValidationError("invalid $what in C format string \"$fmt\""))
+        firstdigit = 2
+    end
+    for i = firstdigit:length(bytes)
+        UInt8('0') <= bytes[i] <= UInt8('9') ||
+            throw(ValidationError("invalid $what in C format string \"$fmt\""))
+    end
     n = tryparse(Int64, s)
     (n === nothing || !(low <= n <= high)) &&
         throw(ValidationError("invalid $what in C format string \"$fmt\""))
     return Int(n)
 end
 
-_parsetimeunit(fmt, c) = c == 's' ? AC.SECOND : c == 'm' ? AC.MILLISECOND :
-    c == 'u' ? AC.MICROSECOND : c == 'n' ? AC.NANOSECOND : _formaterror(fmt)
+_parsetimeunit(fmt, c) = c == UInt8('s') ? AC.SECOND :
+    c == UInt8('m') ? AC.MILLISECOND :
+    c == UInt8('u') ? AC.MICROSECOND :
+    c == UInt8('n') ? AC.NANOSECOND : _formaterror(fmt)
 
 function _parseunionids(fmt, body)
     ids = Int8[]
     isempty(body) && return ids
-    for part in split(body, ',')
-        push!(ids, Int8(_parseformatint(fmt, part, "union type id"; high=127)))
+    # A valid Int8-domain union has at most 128 children. Count separators
+    # without splitting so an overlong malformed string cannot direct a large
+    # temporary allocation before it is rejected.
+    nids = 1
+    for b in codeunits(body)
+        b == UInt8(',') || continue
+        nids += 1
+        nids <= 128 ||
+            throw(ValidationError("union C format string declares more than 128 type ids"))
     end
+    sizehint!(ids, nids)
+    seen = UInt128(0)
+    value = 0
+    have_digit = false
+    for b in codeunits(body)
+        if UInt8('0') <= b <= UInt8('9')
+            have_digit = true
+            value = 10 * value + Int(b - UInt8('0'))
+            value <= 127 ||
+                throw(ValidationError("union type ids must be in [0, 127]"))
+        elseif b == UInt8(',')
+            have_digit ||
+                throw(ValidationError("invalid union type id in C format string \"$fmt\""))
+            bit = UInt128(1) << value
+            seen & bit == 0 ||
+                throw(ValidationError("union type ids must be unique"))
+            push!(ids, Int8(value))
+            seen |= bit
+            value = 0
+            have_digit = false
+        else
+            throw(ValidationError("invalid union type id in C format string \"$fmt\""))
+        end
+    end
+    have_digit ||
+        throw(ValidationError("invalid union type id in C format string \"$fmt\""))
+    bit = UInt128(1) << value
+    seen & bit == 0 || throw(ValidationError("union type ids must be unique"))
+    push!(ids, Int8(value))
     return ids
 end
 
 function parseformat(fmt::AbstractString, flags::Int64=0)::ArrowType
+    isvalid(fmt) || throw(ValidationError("C format string is not valid UTF-8"))
+    occursin('\0', fmt) &&
+        throw(ValidationError("C format string cannot contain embedded NUL characters"))
+    fmt = String(fmt)
     fmt == "b" && return BoolType()
     fmt == "n" && return NullType()
     fmt == "u" && return Utf8Type(false)
@@ -188,15 +245,16 @@ function parseformat(fmt::AbstractString, flags::Int64=0)::ArrowType
     m = Dict("c" => (8, true), "C" => (8, false), "s" => (16, true), "S" => (16, false),
         "i" => (32, true), "I" => (32, false), "l" => (64, true), "L" => (64, false))
     haskey(m, fmt) && return IntType(m[fmt]...)
-    if length(fmt) == 3 && startswith(fmt, "tt")
-        u = _parsetimeunit(fmt, fmt[3])
+    if ncodeunits(fmt) == 3 && startswith(fmt, "tt")
+        u = _parsetimeunit(fmt, codeunit(fmt, 3))
         return TimeType(u, u == AC.SECOND || u == AC.MILLISECOND ? 32 : 64)
     end
-    length(fmt) == 3 && startswith(fmt, "tD") &&
-        return DurationType(_parsetimeunit(fmt, fmt[3]))
-    if startswith(fmt, "ts") && length(fmt) >= 4 && fmt[4] == ':'
-        u = _parsetimeunit(fmt, fmt[3])
-        tz = fmt[5:end]
+    ncodeunits(fmt) == 3 && startswith(fmt, "tD") &&
+        return DurationType(_parsetimeunit(fmt, codeunit(fmt, 3)))
+    if startswith(fmt, "ts") && ncodeunits(fmt) >= 4 &&
+        codeunit(fmt, 4) == UInt8(':')
+        u = _parsetimeunit(fmt, codeunit(fmt, 3))
+        tz = SubString(fmt, 5)
         return TimestampType(u, isempty(tz) ? nothing : String(tz))
     end
     if startswith(fmt, "w:")
@@ -206,7 +264,7 @@ function parseformat(fmt::AbstractString, flags::Int64=0)::ArrowType
         return FixedSizeListType(_parseformatint(fmt, fmt[4:end], "list size"))
     end
     if startswith(fmt, "d:")
-        parts = split(fmt[3:end], ',')
+        parts = split(fmt[3:end], ","; limit=4, keepempty=true)
         2 <= length(parts) <= 3 ||
             throw(ValidationError("invalid decimal C format string \"$fmt\""))
         precision = _parseformatint(fmt, parts[1], "decimal precision")
@@ -214,7 +272,9 @@ function parseformat(fmt::AbstractString, flags::Int64=0)::ArrowType
             low=typemin(Int32))
         bits = length(parts) == 3 ?
             _parseformatint(fmt, parts[3], "decimal bit width") : 128
-        return DecimalType(precision, scale, bits)
+        t = DecimalType(precision, scale, bits)
+        AC._validate_descriptor(t)
+        return t
     end
     startswith(fmt, "+us:") &&
         return UnionType(AC.SparseMode, _parseunionids(fmt, fmt[5:end]))
@@ -545,13 +605,31 @@ end
 function _export_array!(root::ExportedRoot, d::ArrayData,
     release::Ptr{Cvoid})::Ptr{CArrowArray}
     p = Ptr{CArrowArray}(_malloc!(root, sizeof(CArrowArray)))
+    spec = layoutspec(d.type)
     nbuf = length(d.buffers)
     bufptrs = Ptr{Ptr{Cvoid}}(_malloc!(root,
         AC.checked_mul(Int64(max(nbuf, 1)), Int64(sizeof(Ptr)))))
     for (i, b) in enumerate(d.buffers)
-        # Spec: an absent validity bitmap is a NULL buffer pointer.
-        unsafe_store!(bufptrs, AC.isempty_buffer(b) ? Ptr{Cvoid}(C_NULL) :
-                               Ptr{Cvoid}(AC.sliceptr(b)), i)
+        role = spec.buffers[i]
+        bufferp = if role == AC.OFFSETS && d.len == 0 && d.offset == 0 &&
+            AC.isempty_buffer(b)
+            # Core's canonical empty representation omits this otherwise
+            # unused allocation. C Data still exposes the Columnar
+            # length+1 offsets buffer, so root one terminal zero in the
+            # export aggregate without changing the Core array.
+            zerop = Ptr{UInt8}(_malloc!(root, spec.offsetwidth))
+            for j = 1:spec.offsetwidth
+                unsafe_store!(zerop, UInt8(0), j)
+            end
+            Ptr{Cvoid}(zerop)
+        elseif AC.isempty_buffer(b)
+            # An absent validity bitmap, or any actual zero-byte buffer, is
+            # represented by a NULL pointer.
+            Ptr{Cvoid}(C_NULL)
+        else
+            Ptr{Cvoid}(AC.sliceptr(b))
+        end
+        unsafe_store!(bufptrs, bufferp, i)
     end
     nchildren = length(d.children)
     canonical_children = Ptr{CArrowArray}[]
@@ -1030,13 +1108,13 @@ function _import_field(sch::CArrowSchema)::Field
     if expected_children >= 0 && sch.n_children != expected_children
         throw(ValidationError("C schema for $(typeof(t)) declares $(sch.n_children) children; expected $expected_children"))
     end
+    t isa UnionType && length(t.typeids) != sch.n_children &&
+        throw(ValidationError("union format declares $(length(t.typeids)) type ids for $(sch.n_children) children"))
 
     children = Field[]
     for i = 1:sch.n_children
         push!(children, _import_field(unsafe_load(unsafe_load(sch.children, i))))
     end
-    t isa UnionType && length(t.typeids) != length(children) &&
-        throw(ValidationError("union format declares $(length(t.typeids)) type ids for $(length(children)) children"))
     if sch.dictionary != C_NULL
         vf = _import_field(unsafe_load(sch.dictionary))
         t isa IntType || throw(ValidationError("dictionary index format must be an integer"))
@@ -1069,8 +1147,8 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
                 throw(ValidationError("NULL validity buffer requires null_count == 0"))
             p == C_NULL ? Int64(0) : AC.expected_validity_bytes(total)
         elseif role == AC.OFFSETS
-            p == C_NULL && arr.length == 0 && arr.offset == 0 ? Int64(0) :
-                AC.checked_mul(AC.checked_add(total, Int64(1)), Int64(spec.offsetwidth))
+            AC.checked_mul(AC.checked_add(total, Int64(1)),
+                Int64(spec.offsetwidth))
         elseif role == AC.DATA
             if spec.fixedwidth > 0
                 AC.checked_mul(total, Int64(spec.fixedwidth))
@@ -1082,13 +1160,16 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
                 if offsets_slice === nothing || AC.isempty_buffer(offsets_slice)
                     Int64(0)
                 else
-                    if spec.offsetwidth == 8
+                    finaloffset = if spec.offsetwidth == 8
                         AC.loadat(offsets_slice, Int64,
                             AC.checked_mul(total, Int64(8)))
                     else
                         Int64(AC.loadat(offsets_slice, Int32,
                             AC.checked_mul(total, Int64(4))))
                     end
+                    finaloffset >= 0 ||
+                        throw(ValidationError("negative final offset $finaloffset"))
+                    finaloffset
                 end
             end
         elseif role == AC.TYPE_IDS
@@ -2053,8 +2134,20 @@ function main()
     @assert formatstring(UnionType(AC.DenseMode, Int8[0, 1])) == "+ud:0,1"
     @assert formatstring(FixedSizeListType(2)) == "+w:2"
     @assert parseformat("tsu:UTC") == TimestampType(AC.MICROSECOND, "UTC")
+    @assert parseformat("tsu:Δ") == TimestampType(AC.MICROSECOND, "Δ")
     @assert parseformat("d:38,10") == DecimalType(38, 10, 128)
-    for bad in ("vu", "vz", "+vl", "+r", "d:x", "w:", "tsq:", "+ud:200")
+    @assert parseformat("d:38,-2") == DecimalType(38, -2, 128)
+    badformats = String[
+        "vu", "vz", "+vl", "+r", "d:x", "w:", "tsq:",
+        "tsé:", "ts💣:", "tsu:UTC\0hidden",
+        "w: 1", "w:1 ", "w:+1", "w:0x10", "+w: 2",
+        "d: 1,0", "d:1, 0", "d:+1,+0", "d:0x9,0x2,0x20",
+        "d:0,0", "d:39,0", "d:1,0,1", "d:77,0,256",
+        "+ud:200", "+ud:0,0", "+ud: 0,1", "+us:+1",
+        "+ud:0x0,0x1", "+ud:" * join(0:128, ","),
+    ]
+    push!(badformats, String(UInt8[0x74, 0x73, 0x75, 0x3a, 0xff]))
+    for bad in badformats
         @assert try
             parseformat(bad)
             false
@@ -2062,7 +2155,121 @@ function main()
             e isa ValidationError
         end (bad)
     end
-    println("format strings map both ways and refuse view/REE/corrupt forms ✓")
+    println("format strings use strict byte-safe grammar and reject corrupt forms ✓")
+
+    # Core can omit the physical offsets allocation for a canonical empty
+    # array. C Data still requires its length+1 terminal offset. The export
+    # aggregate owns that adapter-only zero until the consumer releases it.
+    emptyitemf, emptyitemd = fromjulia("item", Int64[])
+    emptyoffsetcases = Tuple{Field,ArrayData}[]
+    for t in (Utf8Type(false), Utf8Type(true), BinaryType(false), BinaryType(true))
+        push!(emptyoffsetcases, (Field("empty", t),
+            ArrayData(t, 0, [BufferSlice(), BufferSlice(), BufferSlice()];
+                nullcount=0)))
+    end
+    for t in (ListType(false), ListType(true))
+        push!(emptyoffsetcases, (Field("empty-list", t; children=[emptyitemf]),
+            ArrayData(t, 0, [BufferSlice(), BufferSlice()];
+                children=[emptyitemd], nullcount=0)))
+    end
+    emptykeyt = Utf8Type(false)
+    emptykeyf = Field("key", emptykeyt; nullable=false)
+    emptykeyd = ArrayData(emptykeyt, 0,
+        [BufferSlice(), BufferSlice(), BufferSlice()]; nullcount=0)
+    emptyvaluef, emptyvalued = fromjulia("value", Int64[])
+    emptyentriesf = Field("entries", StructType(); nullable=false,
+        children=[emptykeyf, emptyvaluef])
+    emptyentriesd = ArrayData(StructType(), 0, [BufferSlice()];
+        children=[emptykeyd, emptyvalued], nullcount=0)
+    emptymapt = MapType(false)
+    push!(emptyoffsetcases, (Field("empty-map", emptymapt;
+        children=[emptyentriesf]),
+        ArrayData(emptymapt, 0, [BufferSlice(), BufferSlice()];
+            children=[emptyentriesd], nullcount=0)))
+    for (f, d) in emptyoffsetcases
+        spec = layoutspec(f.type)
+        oi = findfirst(==(AC.OFFSETS), spec.buffers)::Int
+        sp, ap = to_c_data(f, d)
+        arr = unsafe_load(ap)
+        offsetp = Ptr{UInt8}(unsafe_load(arr.buffers, oi))
+        @assert offsetp != C_NULL
+        GC.gc(true)
+        @assert spec.offsetwidth == 4 ?
+            unsafe_load(Ptr{Int32}(offsetp)) == 0 :
+            unsafe_load(Ptr{Int64}(offsetp)) == 0
+        f2, d2 = from_c_data(sp, ap)
+        @assert d2.buffers[oi].len == spec.offsetwidth
+        @assert isempty(materialize(f2, d2))
+        release!(d2.owner::ForeignOwner)
+        @assert reap!() == 2
+    end
+    println("empty C Data offset layouts export one rooted terminal zero ✓")
+
+    nullf = Field("null-empty", Utf8Type(false))
+    nulld = ArrayData(Utf8Type(false), 0,
+        [BufferSlice(), BufferSlice(), BufferSlice()]; nullcount=0)
+    sp, ap = to_c_data(nullf, nulld)
+    unsafe_store!(unsafe_load(ap).buffers, Ptr{Cvoid}(C_NULL), 2)
+    @assert try
+        from_c_data(sp, ap)
+        false
+    catch e
+        e isa ValidationError && occursin("NULL OFFSETS buffer", e.msg)
+    end
+    @assert reap!() == 2
+    println("NULL empty C Data offsets fail with exact cleanup ✓")
+
+    # Descriptor and union shape failures must happen before malformed
+    # metadata can direct recursive or fixed-width geometry work.
+    earlyf, earlyd = fromjulia("early", Int64[1])
+    sp, ap = to_c_data(earlyf, earlyd)
+    baddecimal = "d:1,0,2147483647"
+    GC.@preserve baddecimal begin
+        _store_field!(sp, :format, pointer(baddecimal))
+        _store_field!(ap, :length, typemax(Int64))
+        @assert try
+            from_c_data(sp, ap)
+            false
+        catch e
+            e isa ValidationError
+        end
+    end
+    @assert reap!() == 2
+
+    earlyunionf = Field("early-union", sut; children=[sui, sus])
+    earlyuniond = ArrayData(sut, 3, [AC._databuffer(Int8[0, 1, 0])];
+        children=[sud, susd], nullcount=0)
+    sp, ap = to_c_data(earlyunionf, earlyuniond)
+    shortunion = "+us:0"
+    badchild = "not-a-format"
+    firstchild = unsafe_load(unsafe_load(sp).children, 1)
+    GC.@preserve shortunion badchild begin
+        _store_field!(sp, :format, pointer(shortunion))
+        _store_field!(firstchild, :format, pointer(badchild))
+        @assert try
+            from_c_data(sp, ap)
+            false
+        catch e
+            e isa ValidationError && occursin("type ids", e.msg)
+        end
+    end
+    @assert reap!() == 2
+    println("invalid descriptors and union counts fail before geometry/children ✓")
+
+    # A negative final variable-length offset cannot become a negative foreign
+    # region extent. Reject it at the adapter boundary with ValidationError.
+    negativef, negatived = fromjulia("negative-offset", ["x"])
+    sp, ap = to_c_data(negativef, negatived)
+    offsetp = Ptr{Int32}(unsafe_load(unsafe_load(ap).buffers, 2))
+    unsafe_store!(offsetp, Int32(-1), 2)
+    @assert try
+        from_c_data(sp, ap)
+        false
+    catch e
+        e isa ValidationError && occursin("negative final offset", e.msg)
+    end
+    @assert reap!() == 2
+    println("negative C Data final offsets fail cleanly ✓")
 
     # Import of an already-released structure is refused.
     f, col = b.schema.fields[1], b.columns[1]
