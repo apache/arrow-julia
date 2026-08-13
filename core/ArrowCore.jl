@@ -33,12 +33,12 @@ Design rules this module is built to demonstrate:
    returns `Vector{Pair{String,Any}}`; a typed facade remains separate work.
 
 2. Memory validity is GC reachability. Every buffer is a `BufferSlice`
-   into an `OwnerRegion` — an immutable (pointer, length, root) triple whose
-   `root` anchors the backing storage. Slices are bounds-checked against the
-   region at construction. For verified owned and IPC extents, corrupt spans
-   therefore fail before access; foreign extents remain trusted declarations,
-   and mapped files remain exposed to external changes. Loads are a final
-   bounds check plus a raw load, with no per-access synchronization.
+   into an `OwnerRegion` — an immutable (pointer, length, alignment, root)
+   record whose `root` anchors the backing storage. Slices are bounds-checked
+   against the region at construction. For verified owned and IPC extents,
+   corrupt spans therefore fail before access; foreign extents remain trusted
+   declarations, and mapped files remain exposed to external changes. Loads
+   are a final bounds check plus a raw load, with no per-access synchronization.
    Deterministic eager release is deliberately constrained out of this core
    (see §1). Mmap stdlib storage is unmapped later by its GC finalizer.
 
@@ -105,12 +105,12 @@ export OwnerRegion, BufferSlice, heapregion, mmapregion,
 #
 # DESIGN DECISION (maintainer review, 2026-08-13): buffer validity is
 # GC REACHABILITY — Julia's native memory-safety contract — and nothing else.
-# A region is an immutable (pointer, length, root) triple: the `root` is
-# whatever keeps the memory alive (the wrapped Julia array, the Mmap-stdlib
-# array whose own finalizer unmaps at collection, a C-data adapter's owner
-# object whose finalizer calls the producer's release). Views hold their
-# region; the region holds its root; therefore memory a view can reach is
-# memory that is valid.
+# A region is an immutable (pointer, length, alignment, root) record: the
+# `root` is whatever keeps the memory alive (the wrapped Julia array, the
+# Mmap-stdlib array whose own finalizer unmaps at collection, a C-data
+# adapter's owner object whose finalizer calls the producer's release). Views
+# hold their region; the region holds its root; therefore memory a view can
+# reach is memory that is valid.
 #
 # The earlier prove-out iterations carried a full lifecycle state machine
 # (guards, phases, deterministic forceclose!, release actions, per-kind
@@ -159,8 +159,9 @@ One contiguous memory region and the object that keeps it alive. Immutable:
 there is no lifecycle to manage — the region is valid exactly as long as it
 is reachable, because `root` anchors the backing storage (a borrowed Julia
 array, the Mmap-stdlib array, or an adapter's owner object). Slices
-bounds-check against `len` at construction, so corrupt metadata fails at
-adaptation time; loads are a final bounds check plus a raw load.
+reject geometry outside the declared `len` at construction. For adapters that
+verify the backing extent, corrupt spans therefore fail before access. Loads
+retain a final bounds check before the raw read.
 
 The scoped-borrow contract for wrapped Julia arrays: the caller must not
 mutate or resize the array while the region or any cached validation result
@@ -170,7 +171,7 @@ reallocate the storage and invalidate its pointer.
 struct OwnerRegion
     ptr::Ptr{UInt8}
     len::Int64
-    alignment::Int      # actual alignment of ptr; loads consult it
+    alignment::Int      # guaranteed ptr alignment, capped at 64; loads consult it
     root::Any           # GC anchor; never dispatched on, only stored
 
     function OwnerRegion(ptr::Ptr{UInt8}, len::Integer; root=nothing)
@@ -295,7 +296,10 @@ of as a copy workaround scattered through per-type code.
     # the full dereference so its region and opaque root remain reachable.
     GC.@preserve b begin
         p = sliceptr(b) + byteoff
-        if UInt(p) % datatype_alignment(T) == 0
+        required = datatype_alignment(T)
+        relative = checked_add(b.offset, byteoff)
+        region = b.region::OwnerRegion
+        if region.alignment >= required && relative % required == 0
             return unsafe_load(Ptr{T}(p))
         else
             return _load_unaligned(T, p)
