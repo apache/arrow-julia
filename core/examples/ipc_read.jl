@@ -1356,6 +1356,14 @@ function main()
     end
     println("all columns round-tripped through ArrowCore ✓")
 
+    # The 2.x writer permits a coefficient outside its declared decimal
+    # precision. The Core semantic boundary must reject it before exposure.
+    baddecimalio = IOBuffer()
+    D = Arrow.Decimal{Int32(1),Int32(0),Int128}
+    Arrow.write(baddecimalio, (d=D[D(Int128(10))],); file=false)
+    @assert _rejects(() -> readstream(take!(baddecimalio)))
+    println("decimal coefficients outside declared precision are rejected ✓")
+
     pulled = readstream(bytes)
     @assert nextbatch!(pulled) isa RecordBatch
     @assert nextbatch!(pulled) isa RecordBatch
