@@ -1047,6 +1047,12 @@ end
     @test materialize(b.schema.fields[1], b.columns[1]) == [1, 2, 3]
     @test_throws ArgumentError RecordBatch(b.schema,
         [b.columns[1], AC.fromjulia("b", ["only-one"])[2]])
+    wrongtype = AC.fromjulia("a", Float64[1, 2, 3])[2]
+    @test_throws ValidationError RecordBatch(
+        Schema([b.schema.fields[1]]), [wrongtype])
+    missingdata = AC.ArrayData(IntType(64, true), 3, BufferSlice[])
+    @test_throws ValidationError RecordBatch(
+        Schema([b.schema.fields[1]]), [missingdata])
     empty_schema = Schema(Field[])
     @test RecordBatch(empty_schema, ArrayData[], 7).nrows == 7
     badutf8 = String(UInt8[0xff])

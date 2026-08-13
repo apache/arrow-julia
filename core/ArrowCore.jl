@@ -1803,6 +1803,7 @@ struct RecordBatch
         n >= 0 || throw(ArgumentError("negative row count"))
         for (f, c) in zip(schema.fields, cols)
             length(c) == n || throw(ArgumentError("unequal column lengths"))
+            validate_structural(f, c)
         end
         length(schema.fields) == length(cols) ||
             throw(ArgumentError("schema/column count mismatch"))
