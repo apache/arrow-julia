@@ -520,6 +520,28 @@ end
         @test_throws ValidationError validate_structural(Field("bad", badt),
             AC.ArrayData(badt, 1,
                 [BufferSlice(), AC._databuffer(UInt8[0, 0, 0])]; nullcount=0))
+
+        if Sys.WORD_SIZE > 32
+            for scale in (Int(typemin(Int32)) - 1, Int(typemax(Int32)) + 1)
+                badscale = DecimalType(1, scale, 32)
+                @test_throws ValidationError validate_structural(
+                    Field("decimal", badscale),
+                    AC.ArrayData(badscale, 0,
+                        [BufferSlice(), BufferSlice()]; nullcount=0))
+            end
+
+            badwidth = FixedSizeBinaryType(Int(typemax(Int32)) + 1)
+            @test_throws ValidationError validate_structural(
+                Field("fixed", badwidth),
+                AC.ArrayData(badwidth, 0, [BufferSlice(), BufferSlice()]; nullcount=0))
+
+            cf, cd = fromjulia("item", Int64[])
+            badsize = FixedSizeListType(Int(typemax(Int32)) + 1)
+            @test_throws ValidationError validate_structural(
+                Field("list", badsize; children=[cf]),
+                AC.ArrayData(badsize, 0, [BufferSlice()];
+                    children=[cd], nullcount=0))
+        end
     end
 
     @testset "structural: wrong buffer arity" begin

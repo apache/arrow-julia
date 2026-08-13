@@ -842,17 +842,19 @@ function _validate_descriptor(t::DecimalType)
         throw(ValidationError("decimal bit width must be 32, 64, 128, or 256"))
     1 <= t.precision <= maxprecision ||
         throw(ValidationError("decimal precision $(t.precision) is invalid for $(t.bits)-bit storage"))
+    typemin(Int32) <= t.scale <= typemax(Int32) ||
+        throw(ValidationError("decimal scale $(t.scale) does not fit the Arrow Int32 wire field"))
     return nothing
 end
-_validate_descriptor(t::FixedSizeBinaryType) = t.nbytes >= 0 ||
-    throw(ValidationError("fixed-size-binary width must be non-negative"))
+_validate_descriptor(t::FixedSizeBinaryType) = 0 <= t.nbytes <= typemax(Int32) ||
+    throw(ValidationError("fixed-size-binary width must be in [0, $(typemax(Int32))]"))
 function _validate_descriptor(t::TimeType)
     valid = t.unit in (SECOND, MILLISECOND) ? t.bits == 32 : t.bits == 64
     valid || throw(ValidationError("time unit $(t.unit) is incompatible with $(t.bits)-bit storage"))
     return nothing
 end
-_validate_descriptor(t::FixedSizeListType) = t.listsize >= 0 ||
-    throw(ValidationError("fixed-size-list size must be non-negative"))
+_validate_descriptor(t::FixedSizeListType) = 0 <= t.listsize <= typemax(Int32) ||
+    throw(ValidationError("fixed-size-list size must be in [0, $(typemax(Int32))]"))
 function _validate_descriptor(t::DictionaryType)
     _validate_descriptor(t.indextype)
     _validate_descriptor(t.valuetype)
