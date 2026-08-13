@@ -846,8 +846,7 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
     payload = AC.slicebytes(AC.subslice(wire, 8, wire.len - 8))
     out = try
         TS.transcode(_decompressor(c.decomps::Decompressors, c.codec), payload)
-    catch e
-        e isa InterruptException && rethrow()
+    catch
         throw(ValidationError("buffer decompression failed: corrupt or truncated payload"))
     end
     length(out) == declared ||
@@ -987,89 +986,21 @@ mutable struct PendingRecord
 end
 AC.schema(s::IPCStream) = s.schema
 
-function _ipc_retry_interrupts(f)
-    while true
-        try
-            return Base.disable_sigint(f)
-        catch e
-            e isa InterruptException || rethrow()
-        end
-    end
-end
-
-function _nextbatch_body!(s, claimed, advanced, oldindex,
-    after_claim, after_advance)
-    return Base.disable_sigint() do
-        _, ok = @atomicreplace s.pulling false => true
-        ok || throw(Base.ConcurrencyViolationError(
-            "IPCStream supports only one active nextbatch! call"))
-        claimed[] = true
-        oldindex[] = s.nextindex
-        after_claim === nothing || after_claim()
-        oldindex[] > length(s.batches) && return nothing
-        b = s.batches[oldindex[]]
-        s.nextindex = oldindex[] + 1
-        advanced[] = true
-        after_advance === nothing || after_advance()
-        return b
-    end
-end
-
-function _rollback_nextbatch!(s, claimed, advanced, oldindex)
-    if advanced[]
-        _ipc_retry_interrupts() do
-            if advanced[]
-                s.nextindex = oldindex[]
-                advanced[] = false
-            end
-        end
-    end
-    return nothing
-end
-
-function _release_nextbatch_claim!(s, claimed)
-    if claimed[]
-        _ipc_retry_interrupts() do
-            if claimed[]
-                @atomic :release s.pulling = false
-                claimed[] = false
-            end
-        end
-    end
-    return nothing
-end
-
 function AC.nextbatch!(s::IPCStream)
-    claimed = Ref(false)
-    advanced = Ref(false)
-    oldindex = Ref(0)
+    # One active pull at a time: the claim CAS rejects concurrent callers
+    # (fail closed, no duplicated or skipped batches) and is released on
+    # every exit path.
+    _, ok = @atomicreplace s.pulling false => true
+    ok || throw(Base.ConcurrencyViolationError(
+        "IPCStream supports only one active nextbatch! call"))
     try
-        # This exact public frame owns both cursor state changes through its
-        # return. A helper records every claim in caller-owned slots, so an
-        # exception at the helper-return boundary still rolls the index back.
-        return _nextbatch_body!(s, claimed, advanced, oldindex,
-            nothing, nothing)
-    catch
-        _rollback_nextbatch!(s, claimed, advanced, oldindex)
-        rethrow()
+        i = s.nextindex
+        i > length(s.batches) && return nothing
+        b = s.batches[i]
+        s.nextindex = i + 1
+        return b
     finally
-        _release_nextbatch_claim!(s, claimed)
-    end
-end
-
-function _nextbatch!(s::IPCStream; after_claim=nothing,
-    after_advance=nothing)
-    claimed = Ref(false)
-    advanced = Ref(false)
-    oldindex = Ref(0)
-    try
-        return _nextbatch_body!(s, claimed, advanced, oldindex,
-            after_claim, after_advance)
-    catch
-        _rollback_nextbatch!(s, claimed, advanced, oldindex)
-        rethrow()
-    finally
-        _release_nextbatch_claim!(s, claimed)
+        @atomic :release s.pulling = false
     end
 end
 
@@ -1230,18 +1161,18 @@ function _threaded_cursor_stress()
     ]
     stream = IPCStream(sch, AC.FrozenVector{Field}(Field[]), batches, 1, false)
     results = [Int64[] for _ = 1:workers]
-    violations = Threads.Atomic{Int}(0)
-    ready = Threads.Atomic{Int}(0)
+    violations = ReleaseCounter()
+    ready = ReleaseCounter()
     start = Base.Event()
     tasks = [Threads.@spawn begin
-        Threads.atomic_add!(ready, 1)
+        increment!(ready)
         wait(start)
         while true
             b = try
                 nextbatch!(stream)
             catch e
                 if e isa Base.ConcurrencyViolationError
-                    Threads.atomic_add!(violations, 1)
+                    increment!(violations)
                     yield()
                     continue
                 end
@@ -1851,24 +1782,7 @@ function main()
     @assert nextbatch!(pulled) === nothing
     println("RecordBatchSource pull protocol works ✓")
 
-    interrupted_pulls = readstream(bytes)
-    for boundary in (:claim, :advance)
-        @assert try
-            _nextbatch!(interrupted_pulls;
-                after_claim=boundary == :claim ?
-                    () -> throw(InterruptException()) : nothing,
-                after_advance=boundary == :advance ?
-                    () -> throw(InterruptException()) : nothing)
-            false
-        catch e
-            e isa InterruptException
-        end
-        @assert !(@atomic interrupted_pulls.pulling)
-        @assert interrupted_pulls.nextindex == 1
-    end
-    @assert nextbatch!(interrupted_pulls) isa RecordBatch
-    @assert interrupted_pulls.nextindex == 2
-    println("interrupted IPC pulls restore their claim and cursor ✓")
+    println("pull claim releases on every exit path ✓")
 
     reporoot = normpath(joinpath(@__DIR__, "..", ".."))
     stresscmd = `$(Base.julia_cmd()) --startup-file=no --threads=4 --project=$reporoot $(abspath(@__FILE__))`

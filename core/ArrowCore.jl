@@ -61,6 +61,15 @@ Design rules this module is built to demonstrate:
    limits before metadata-directed allocation) belong to the adapters and
    are exercised in the IPC example.
 
+Interruption contract: asynchronous interruption (SIGINT /
+`InterruptException`, task cancellation) is explicitly OUT of this module's
+guarantees, matching ecosystem-wide practice — Base itself does not make
+arbitrary code async-exception-atomic, and pretending otherwise costs
+pervasive `disable_sigint` scaffolding for a property that still cannot be
+fully delivered. Ordinary exception safety (error paths clean up, release
+is exactly-once) IS in contract. When Julia 1.14's structured cancellation
+lands, a formal revisit is planned on top of whatever Base then provides.
+
 Deliberately out of scope for the prove-out (tracked in the report roadmap):
 view layouts (Utf8View/BinaryView/ListView) and run-end encoding have
 registry entries and structural validation but no semantic validation or
@@ -80,6 +89,7 @@ const checked_mul = Checked.checked_mul
 export OwnerRegion, BufferSlice, MemoryKind, InvalidatedError, forceclose!,
     heapregion, mmapregion, foreignregion, withguard,
     ReleaseAction, MunmapRelease, CcallRelease, NotifyRelease, RendezvousRelease,
+    ReleaseCounter, MapClaim, increment!,
     ArrowType, NullType, BoolType, IntType, FloatType, DecimalType,
     FixedSizeBinaryType, BinaryType, Utf8Type, DateType, TimeType,
     TimestampType, DurationType, IntervalType, ListType, FixedSizeListType,
@@ -128,6 +138,26 @@ generation(state::UInt64) = state >> 2
 # "arbitrary code inside the lifecycle state machine" hazards.
 # ---------------------------------------------------------------------------
 
+# `@atomic`-field helpers used across the lifecycle machinery. (Base's
+# `Threads.Atomic` boxes are effectively deprecated in favor of atomic
+# struct fields; nothing in this module uses them.)
+
+"An exactly-once/observation counter with a single atomic field."
+mutable struct ReleaseCounter
+    @atomic n::Int
+end
+ReleaseCounter() = ReleaseCounter(0)
+Base.getindex(c::ReleaseCounter) = @atomic c.n
+increment!(c::ReleaseCounter) = (@atomic c.n += 1)
+
+# One mapping's release claim, shared by the two possible owners (the armed
+# region's release action and the constructor's failure path): LIVE(0) ->
+# RELEASING(1) -> RELEASED(2); a failed unmap restores LIVE.
+mutable struct MapClaim
+    @atomic s::UInt8
+end
+MapClaim() = MapClaim(0x00)
+
 @enum ReleaseKind::UInt8 RELEASE_MUNMAP RELEASE_CCALL RELEASE_NOTIFY RELEASE_RENDEZVOUS
 
 """
@@ -144,13 +174,11 @@ struct ReleaseAction
     cb::Ptr{Cvoid}                            # RELEASE_CCALL: void (*)(void*)
     arg::Ptr{Cvoid}                           # RELEASE_CCALL: callback argument
     freearg::Bool                             # RELEASE_CCALL: Libc.free(arg) after
-    note::Union{Nothing,Threads.Atomic{Int}}
+    note::Union{Nothing,ReleaseCounter}
     fail::Bool                                # RELEASE_NOTIFY: throw after noting
     entered::Union{Nothing,Base.Event}        # RELEASE_RENDEZVOUS
     finish::Union{Nothing,Base.Event}         # RELEASE_RENDEZVOUS
-    mapstate::Union{Nothing,Threads.Atomic{UInt8}}  # RELEASE_MUNMAP claim word
-    injectfail::Union{Nothing,Threads.Atomic{Int}}  # fault injector (tests): throw
-                                                    # InterruptException while > 0
+    mapstate::Union{Nothing,MapClaim}         # RELEASE_MUNMAP claim word
     verify_null_at::Int32   # RELEASE_CCALL: byte offset of a pointer field in
                             # *arg that the callback must null (-1 = no check)
 end
@@ -159,15 +187,11 @@ end
 Release a mapped region with the exactly-once munmap machinery. `mapstate`
 is the mapping's shared LIVE/RELEASING/RELEASED claim (also consulted by the
 constructor's failure path, so both possible owners serialize on one word).
-`injectfail` turns the tests' interrupted-unmap scenarios into data: while
-its count is positive, the unmap attempt throws `InterruptException` and the
-claim machinery restores LIVE for the retry.
 """
-MunmapRelease(mapstate::Threads.Atomic{UInt8};
-    note::Union{Nothing,Threads.Atomic{Int}}=nothing,
-    injectfail::Union{Nothing,Threads.Atomic{Int}}=nothing) =
+MunmapRelease(mapstate::MapClaim;
+    note::Union{Nothing,ReleaseCounter}=nothing) =
     ReleaseAction(RELEASE_MUNMAP, C_NULL, C_NULL, false, note, false,
-        nothing, nothing, mapstate, injectfail, Int32(-1))
+        nothing, nothing, mapstate, Int32(-1))
 
 """
 Release by calling a C function pointer with `arg` (skipped when `cb` is
@@ -176,21 +200,21 @@ NULL — a moved/already-released source), then `Libc.free(arg)` when
 producer's `release`, `arg` is a stable (malloc'd) struct address.
 """
 CcallRelease(cb::Ptr{Cvoid}, arg::Ptr{Cvoid}; freearg::Bool=false,
-    note::Union{Nothing,Threads.Atomic{Int}}=nothing,
+    note::Union{Nothing,ReleaseCounter}=nothing,
     verify_null_at::Integer=-1) =
     ReleaseAction(RELEASE_CCALL, cb, arg, freearg, note, false, nothing,
-        nothing, nothing, nothing, Int32(verify_null_at))
+        nothing, nothing, Int32(verify_null_at))
 
 "Observe release: bump `note`; `fail=true` then throws (error-path tests)."
-NotifyRelease(note::Threads.Atomic{Int}; fail::Bool=false) =
+NotifyRelease(note::ReleaseCounter; fail::Bool=false) =
     ReleaseAction(RELEASE_NOTIFY, C_NULL, C_NULL, false, note, fail, nothing,
-        nothing, nothing, nothing, Int32(-1))
+        nothing, nothing, Int32(-1))
 
 "Observe + block: bump `note`, notify `entered`, wait on `finish` (closer-race tests)."
 RendezvousRelease(entered::Base.Event, finish::Base.Event;
-    note::Union{Nothing,Threads.Atomic{Int}}=nothing) =
+    note::Union{Nothing,ReleaseCounter}=nothing) =
     ReleaseAction(RELEASE_RENDEZVOUS, C_NULL, C_NULL, false, note, false,
-        entered, finish, nothing, nothing, Int32(-1))
+        entered, finish, nothing, Int32(-1))
 
 
 """
@@ -235,8 +259,7 @@ mutable struct OwnerRegion
 
     function OwnerRegion(ptr::Ptr{UInt8}, len::Integer, kind::MemoryKind;
         root=nothing, releasefn::Union{Nothing,ReleaseAction}=nothing,
-        lifecycle::Union{Nothing,OwnerRegion}=nothing,
-        after_finalizer::F=nothing) where {F}
+        lifecycle::Union{Nothing,OwnerRegion}=nothing)
         len >= 0 || throw(ArgumentError("region length must be non-negative"))
         n = Int64(len)
         (ptr != C_NULL || n == 0) ||
@@ -263,24 +286,7 @@ mutable struct OwnerRegion
         # finalizer. A finalizer only runs when the region is unreachable, at
         # which point no guard can exist, so releasing directly is safe.
         if releasefn !== nothing
-            try
-                # Until this method returns, `r` is the only record of the
-                # transferred resource. Keep a cleanup handler around
-                # finalizer registration so cancellation cannot lose it.
-                Base.disable_sigint() do
-                    finalizer(_finalize_region!, r)
-                    after_finalizer === nothing || after_finalizer(r)
-                end
-            catch
-                while phase(@atomic r.state) != PHASE_CLOSED
-                    try
-                        forceclose!(r; timeout_ms=0)
-                    catch e
-                        e isa InterruptException || rethrow()
-                    end
-                end
-                rethrow()
-            end
+            finalizer(_finalize_region!, r)
         end
         return r
     end
@@ -288,35 +294,20 @@ end
 
 @inline _lifecycle(r::OwnerRegion) = r.lifecycle === nothing ? r : r.lifecycle
 
-function _inject_then_munmap!(a::ReleaseAction, p::Ptr, len::Integer)
-    inj = a.injectfail
-    if inj !== nothing && Threads.atomic_sub!(inj, 1) > 0
-        throw(InterruptException())
-    end
-    _munmap!(p, len)
-    return nothing
-end
-
 function _run_release!(a::ReleaseAction, r::OwnerRegion)
     n = a.note
-    n === nothing || Threads.atomic_add!(n, 1)
+    n === nothing || increment!(n)
     if a.kind == RELEASE_MUNMAP
-        _release_mapping_noescape!(a.mapstate::Threads.Atomic{UInt8},
-            r.ptr, r.len, a)
+        _release_mapping_once!(a.mapstate::MapClaim, r.ptr, r.len, _munmap!)
     elseif a.kind == RELEASE_CCALL
-        # Complete the foreign handoff atomically w.r.t. SIGINT: the producer
-        # callback, the spec-conformance check (it must null the structure's
-        # release field), and the argument free are one committed step.
-        Base.disable_sigint() do
-            if a.cb != C_NULL
-                ccall(a.cb, Cvoid, (Ptr{Cvoid},), a.arg)
-                if a.verify_null_at >= 0
-                    unsafe_load(Ptr{Ptr{Cvoid}}(a.arg + a.verify_null_at)) == C_NULL ||
-                        error("C release callback did not mark the structure released")
-                end
+        if a.cb != C_NULL
+            ccall(a.cb, Cvoid, (Ptr{Cvoid},), a.arg)
+            if a.verify_null_at >= 0
+                unsafe_load(Ptr{Ptr{Cvoid}}(a.arg + a.verify_null_at)) == C_NULL ||
+                    error("C release callback did not mark the structure released")
             end
-            a.freearg && a.arg != C_NULL && Libc.free(a.arg)
         end
+        a.freearg && a.arg != C_NULL && Libc.free(a.arg)
     elseif a.kind == RELEASE_RENDEZVOUS
         notify(a.entered::Base.Event)
         wait(a.finish::Base.Event)
@@ -326,24 +317,15 @@ function _run_release!(a::ReleaseAction, r::OwnerRegion)
     return nothing
 end
 
-function _finalize_region!(r::OwnerRegion, after_busy=nothing)
+function _finalize_region!(r::OwnerRegion)
     # Natural finalization implies no live guards, but `finalize(r)` is also
     # a public Julia operation and can be called while `r` is reachable.
     # Use the same CAS/guard handshake as explicit close. If a manual
     # finalization finds the region busy, install the backstop again.
-    while true
-        try
-            Base.disable_sigint() do
-                if !forceclose!(r; timeout_ms=0)
-                    after_busy === nothing || after_busy()
-                    finalizer(_finalize_region!, r)
-                end
-            end
-            return
-        catch e
-            e isa InterruptException || rethrow()
-        end
+    if !forceclose!(r; timeout_ms=0)
+        finalizer(_finalize_region!, r)
     end
+    return
 end
 
 """
@@ -363,7 +345,7 @@ count is incremented BEFORE the state check. A closer that CASes to
 closer got there first, our post-increment state check sees `closing` and we
 back out. Either way no dereference overlaps a release.
 """
-@inline function _acquireguard!(r::OwnerRegion, after_increment=nothing)
+@inline function _acquireguard!(r::OwnerRegion)
     r = _lifecycle(r)
     # Both sides of this handshake are sequentially consistent on purpose:
     # guard-increment/state-load here race against state-CAS/guards-load in
@@ -371,49 +353,27 @@ back out. Either way no dereference overlaps a release.
     # pattern where acquire/release alone permits both sides to read stale
     # values (closer sees guards==0 while we see state==open). seq_cst RMWs
     # restore a single total order; the release decrement can stay cheaper.
-    acquired = false
-    try
-        @atomic r.guards += 1
-        acquired = true
-        after_increment === nothing || after_increment()
-        st = @atomic r.state
-        phase(st) == PHASE_OPEN ||
-            throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
-    catch
-        while acquired
-            try
-                Base.disable_sigint() do
-                    @atomic :acquire_release r.guards -= 1
-                    acquired = false
-                end
-            catch e
-                e isa InterruptException || rethrow()
-            end
-        end
-        rethrow()
+    @atomic r.guards += 1
+    st = @atomic r.state
+    if phase(st) != PHASE_OPEN
+        @atomic :acquire_release r.guards -= 1
+        throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
     end
-    return nothing
+    return r
 end
 
-@inline function _releaseguard!(r::OwnerRegion)
+function _releaseguard!(r::OwnerRegion)
     r = _lifecycle(r)
     @atomic :acquire_release r.guards -= 1
     return nothing
 end
 
-@inline withguard(f, r::OwnerRegion) = _withguard(f, r)
-
-@inline function _withguard(f, r::OwnerRegion, after_acquire=nothing)
-    # Defer SIGINT across the increment -> cleanup-handler handoff. User work
-    # explicitly re-enables it after the finally block owns the guard.
-    return Base.disable_sigint() do
-        _acquireguard!(r)
-        try
-            after_acquire === nothing || after_acquire()
-            return Base.reenable_sigint(f)
-        finally
-            _releaseguard!(r)
-        end
+@inline function withguard(f, r::OwnerRegion)
+    _acquireguard!(r)
+    try
+        return f()
+    finally
+        _releaseguard!(r)
     end
 end
 
@@ -427,11 +387,6 @@ call may simply be retried. After a successful close every view built on the
 region throws `InvalidatedError` on access.
 """
 function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
-    return _forceclose!(r, timeout_ms, yield)
-end
-
-function _forceclose!(r::OwnerRegion, timeout_ms::Integer, waitfn::W;
-    after_claim::A=nothing, before_release::B=nothing) where {W,A,B}
     r = _lifecycle(r)
     timeout_ms >= 0 || throw(ArgumentError("timeout_ms must be non-negative"))
     timeout_ms <= typemax(UInt64) ÷ 1_000_000 ||
@@ -440,77 +395,44 @@ function _forceclose!(r::OwnerRegion, timeout_ms::Integer, waitfn::W;
     timeout_ns = UInt64(timeout_ms) * 1_000_000
     st = UInt64(0)
     closing = UInt64(0)
-    claimed = false
-    release_started = false
-    try
-        # The close claim, its rollback ownership, and callback commit form one
-        # task-interruption transaction. Waits re-enable SIGINT because they
-        # can be unbounded; every state handoff remains deferred.
-        return Base.disable_sigint() do
-            while true
-                st = @atomic :acquire r.state
-                phase(st) == PHASE_CLOSED && return true
-                if phase(st) == PHASE_CLOSING
-                    # Another closer is the sole callback owner. Wait for it to
-                    # publish CLOSED (success) or restore OPEN (then retry).
-                    time_ns() - started >= timeout_ns && return false
-                    Base.reenable_sigint(waitfn)
-                    continue
-                end
-                closing = (generation(st) << 2) | PHASE_CLOSING
-                # Close is cold-path: default (sequentially consistent)
-                # ordering. The local ownership marker is published while
-                # task SIGINT is deferred.
-                _, ok = @atomicreplace r.state st => closing
-                if ok
-                    claimed = true
-                    after_claim === nothing || after_claim()
-                    break
-                end
-            end
-            # Wait for in-flight guards. Guards are short-lived by contract,
-            # so this normally terminates quickly; the timeout is a safety
-            # valve, not a normal path.
-            while (@atomic r.guards) != 0
-                if time_ns() - started >= timeout_ns
-                    @atomicreplace r.state closing => st
-                    claimed = false
-                    return false
-                end
-                Base.reenable_sigint(waitfn)
-            end
-            before_release === nothing || before_release()
-            release_started = true
-            f = r.releasefn
-            try
-                f === nothing || _run_release!(f, r)
-            finally
-                # Generic callbacks remain exactly-once even if they report an
-                # error: partially freed storage cannot safely be retried.
-                r.releasefn = nothing
-                @atomic :release r.state =
-                    ((generation(st) + 1) << 2) | PHASE_CLOSED
-            end
-            return true
+    while true
+        st = @atomic :acquire r.state
+        phase(st) == PHASE_CLOSED && return true
+        if phase(st) == PHASE_CLOSING
+            # Another closer is the sole callback owner. Wait for it to
+            # publish CLOSED (success) or restore OPEN (then retry). Never
+            # CAS closing => closing: that would create a second winner.
+            time_ns() - started >= timeout_ns && return false
+            yield()
+            continue
         end
-    catch
-        # Any failure before callback entry returns the exact close claim. The
-        # callback commit above owns all failures after release starts.
-        if claimed && !release_started
-            rolled_back = false
-            while !rolled_back
-                try
-                    Base.disable_sigint() do
-                        _, ok = @atomicreplace r.state closing => st
-                        rolled_back = ok || (@atomic r.state) != closing
-                    end
-                catch e
-                    e isa InterruptException || rethrow()
-                end
-            end
-        end
-        rethrow()
+        closing = (generation(st) << 2) | PHASE_CLOSING
+        # Close is cold-path: default (sequentially consistent) ordering.
+        _, ok = @atomicreplace r.state st => closing
+        ok && break
     end
+    # Wait for in-flight guards. Guards are short-lived by contract, so this
+    # normally terminates quickly; the timeout is a safety valve.
+    while (@atomic r.guards) != 0
+        if time_ns() - started >= timeout_ns
+            # Restore only our exact closing word: we won the claim above, so
+            # nobody else can have transitioned the state since.
+            @atomicreplace r.state closing => st
+            return false
+        end
+        yield()
+    end
+    f = r.releasefn
+    try
+        f === nothing || _run_release!(f, r)
+    finally
+        # The release action is exactly-once even if it reports an error:
+        # partially freed storage cannot safely be retried. Never strand the
+        # region in `closing`.
+        r.releasefn = nothing
+        @atomic :release r.state = ((generation(st) + 1) << 2) | PHASE_CLOSED
+    end
+    return true
 end
 
 Base.close(r::OwnerRegion) = (forceclose!(r) ||
@@ -554,78 +476,35 @@ function _munmap!(p::Ptr, len::Integer)
     return nothing
 end
 
-_unmap!(unmapper, p::Ptr, len::Integer) = unmapper(p, len)
-_unmap!(a::ReleaseAction, p::Ptr, len::Integer) = _inject_then_munmap!(a, p, len)
-
-function _release_mapping_once!(state::Threads.Atomic{UInt8}, p::Ptr,
-    len::Integer, unmapper::U; after_release::A=nothing,
-    before_rollback::B=nothing) where {U,A,B}
-    # The constructor catch and an already-armed OwnerRegion finalizer can
-    # race to return the same mapping. Serialize attempts with a retryable
-    # LIVE -> RELEASING -> RELEASED state. An unmapper failure restores LIVE;
-    # a completed munmap publishes RELEASED before pending SIGINT can escape.
-    owned = false
+function _release_mapping_once!(claim::MapClaim, p::Ptr,
+    len::Integer, unmapper::U) where {U}
+    # The constructor's failure path and an armed OwnerRegion release can
+    # race to return the same mapping. Serialize attempts with a LIVE(0) ->
+    # RELEASING(1) -> RELEASED(2) claim. An unmapper failure restores LIVE
+    # and rethrows; a completed munmap publishes RELEASED.
+    while true
+        current = @atomic claim.s
+        current == 0x02 && return nothing
+        if current == 0x01
+            yield()
+            continue
+        end
+        _, ok = @atomicreplace claim.s 0x00 => 0x01
+        ok && break
+    end
     try
-        while true
-            current = state[]
-            current == 0x02 && return nothing
-            if current == 0x01
-                yield()
-                continue
-            end
-            Base.disable_sigint() do
-                old = Threads.atomic_cas!(state, 0x00, 0x01)
-                owned = old == 0x00
-            end
-            owned && break
-        end
-        Base.disable_sigint() do
-            _unmap!(unmapper, p, len)
-            state[] = 0x02
-            after_release === nothing || after_release()
-        end
+        unmapper(p, len)
     catch
-        if owned
-            # A failed unmap must return the release claim before it escapes.
-            # A second interruption at this rollback boundary cannot strand
-            # RELEASING and make every later cleanup spin forever.
-            rolled_back = false
-            while !rolled_back
-                try
-                    Base.disable_sigint() do
-                        before_rollback === nothing || before_rollback()
-                        old = Threads.atomic_cas!(state, 0x01, 0x00)
-                        rolled_back = old == 0x01 || state[] != 0x01
-                    end
-                catch e
-                    e isa InterruptException || rethrow()
-                end
-            end
-        end
+        @atomic claim.s = 0x00
         rethrow()
     end
+    @atomic claim.s = 0x02
     return nothing
 end
 
-function _release_mapping_noescape!(state::Threads.Atomic{UInt8}, p::Ptr,
-    len::Integer, unmapper::U) where {U}
-    while true
-        try
-            return _release_mapping_once!(state, p, len, unmapper)
-        catch e
-            # This internal ownership handoff has nowhere to return a mapping
-            # after interruption. Retry until munmap either commits or reports
-            # a non-interruption failure. Generic OwnerRegion callbacks remain
-            # exactly-once because arbitrary callbacks may partly free storage.
-            e isa InterruptException || rethrow()
-        end
-    end
-end
-
 function _mmapregion(path::AbstractString, makeowner::MK=OwnerRegion;
-    unmapper::U=_munmap!, mapper::M=nothing, after_mmap::AM=nothing,
-    note::Union{Nothing,Threads.Atomic{Int}}=nothing,
-    injectclose::Union{Nothing,Threads.Atomic{Int}}=nothing) where {MK,U,M,AM}
+    unmapper::U=_munmap!,
+    note::Union{Nothing,ReleaseCounter}=nothing) where {MK,U}
     Sys.isunix() || error("mmapregion: prove-out implements POSIX only")
     open(path, "r") do io
         # Size the exact opened file descriptor. Sizing the path first lets
@@ -634,39 +513,21 @@ function _mmapregion(path::AbstractString, makeowner::MK=OwnerRegion;
         len = filesize(io)
         len > 0 || throw(ArgumentError("cannot map empty file: $path"))
         fd = Base.Filesystem.fd(io)
+        # One shared release claim for the two possible owners: the armed
+        # region's action, and the failure path below when region
+        # construction throws after the kernel has transferred the mapping.
+        claim = MapClaim()
         # PROT_READ=1, MAP_SHARED=1 (Linux) / MAP_SHARED=1 (Darwin) — shared,
         # read-only mapping; MAP_FAILED is (void*)-1.
-        # Prepare the exactly-once release state before mmap transfers a native
-        # resource to us. Both possible owners below share this same claim.
-        released = Threads.Atomic{UInt8}(0x00)
-        # The ARMED region's release is concrete data (trim rule: no open
-        # callables inside the lifecycle machine); the constructor's failure
-        # path below still uses `unmapper` directly, which is where the
-        # tests' construction-fault injection lives.
-        release = MunmapRelease(released; note=note, injectfail=injectclose)
-        p = Ptr{Cvoid}(-1)
+        p = ccall(:mmap, Ptr{Cvoid},
+            (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
+            C_NULL, len, 1 #= PROT_READ =#, 1 #= MAP_SHARED =#, fd, 0)
+        p == Ptr{Cvoid}(-1) && Base.systemerror("mmap($path)", true)
         try
-            # Defer SIGINT from successful mmap through finalizer arming and
-            # the return handoff. The catch owns the shared release token for
-            # every failure after the kernel transfers the mapping.
-            return Base.disable_sigint() do
-                p = if mapper === nothing
-                    ccall(:mmap, Ptr{Cvoid},
-                        (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
-                        C_NULL, len, 1 #= PROT_READ =#,
-                        1 #= MAP_SHARED =#, fd, 0)
-                else
-                    mapper(fd, len)
-                end
-                p == Ptr{Cvoid}(-1) &&
-                    Base.systemerror("mmap($path)", true)
-                after_mmap === nothing || after_mmap(p, len)
-                return makeowner(Ptr{UInt8}(p), len, Mmap;
-                    releasefn=release)::OwnerRegion
-            end
+            return makeowner(Ptr{UInt8}(p), len, Mmap;
+                releasefn=MunmapRelease(claim; note=note))::OwnerRegion
         catch
-            p == Ptr{Cvoid}(-1) ||
-                _release_mapping_noescape!(released, p, len, unmapper)
+            _release_mapping_once!(claim, p, len, unmapper)
             rethrow()
         end
     end

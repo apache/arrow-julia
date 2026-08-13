@@ -48,25 +48,6 @@ end
         @test_throws ErrorException setproperty!(r, :root, nothing)
     end
 
-    @testset "release owner survives finalizer handoff failure" begin
-        bytes = UInt8[0]
-        calls = Threads.Atomic{Int}(0)
-        captured = Ref{Union{Nothing,OwnerRegion}}(nothing)
-        @test_throws InterruptException GC.@preserve bytes AC.OwnerRegion(
-            Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes,
-            releasefn=NotifyRelease(calls),
-            after_finalizer=r -> begin
-                captured[] = r
-                throw(InterruptException())
-            end)
-        @test calls[] == 1
-        @test AC.phase(@atomic (captured[]::OwnerRegion).state) ==
-            AC.PHASE_CLOSED
-        finalize(captured[]::OwnerRegion)
-        @test calls[] == 1
-    end
-
     @testset "mmap region: read, deterministic close, invalidation" begin
         path = tempname()
         write(path, UInt8[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
@@ -109,94 +90,33 @@ end
         finalize(lateowner[]::OwnerRegion)
         @test unmaps[] == 2
 
-        # A failed release attempt must restore LIVE. Once the unmapper has
-        # succeeded, an exception at the commit boundary must leave RELEASED.
-        state = Threads.Atomic{UInt8}(0x00)
+        # Plain error semantics on the shared claim: a failed unmap restores
+        # LIVE (the mapping still exists), a later attempt may succeed and
+        # publish RELEASED, and RELEASED short-circuits every further call.
+        claim = AC.MapClaim()
         attempts = Ref(0)
-        transient = function (_p, _len)
+        flaky = function (_p, _len)
             attempts[] += 1
-            attempts[] == 1 && throw(InterruptException())
+            attempts[] == 1 && error("transient unmap failure")
+            nothing
         end
-        @test_throws InterruptException AC._release_mapping_once!(
-            state, Ptr{Cvoid}(1), 1, transient)
-        @test state[] == 0x00
-        AC._release_mapping_once!(state, Ptr{Cvoid}(1), 1, transient)
-        @test state[] == 0x02
+        @test_throws ErrorException AC._release_mapping_once!(
+            claim, Ptr{Cvoid}(1), 1, flaky)
+        @test (@atomic claim.s) == 0x00
+        AC._release_mapping_once!(claim, Ptr{Cvoid}(1), 1, flaky)
+        @test (@atomic claim.s) == 0x02
+        AC._release_mapping_once!(claim, Ptr{Cvoid}(1), 1, flaky)
         @test attempts[] == 2
-        committed = Threads.Atomic{UInt8}(0x00)
-        committed_calls = Ref(0)
-        @test_throws InterruptException AC._release_mapping_once!(
-            committed, Ptr{Cvoid}(1), 1,
-            (_p, _len) -> (committed_calls[] += 1);
-            after_release=() -> throw(InterruptException()))
-        @test committed[] == 0x02
-        AC._release_mapping_once!(committed, Ptr{Cvoid}(1), 1,
-            (_p, _len) -> (committed_calls[] += 1))
-        @test committed_calls[] == 1
 
-        rollback_state = Threads.Atomic{UInt8}(0x00)
-        rollback_interrupts = Ref(0)
-        @test_throws InterruptException AC._release_mapping_once!(
-            rollback_state, Ptr{Cvoid}(1), 1,
-            (_p, _len) -> throw(InterruptException());
-            before_rollback=() -> begin
-                rollback_interrupts[] += 1
-                rollback_interrupts[] == 1 && throw(InterruptException())
-            end)
-        @test rollback_state[] == 0x00
-        @test rollback_interrupts[] == 2
-
-        # A constructor failure has no escaped owner that can retry cleanup.
-        # An interrupted attempt must finish before the original error escapes.
-        construction_attempts = Ref(0)
-        construction_unmapper = function (p, len)
-            construction_attempts[] += 1
-            construction_attempts[] == 1 && throw(InterruptException())
-            AC._munmap!(p, len)
-        end
-        @test_throws ErrorException AC._mmapregion(path, makeowner;
-            unmapper=construction_unmapper)
-        @test construction_attempts[] == 2
-
-        # A successful mmap is owned before any later hook or constructor can
-        # fail. The catch releases it once even before an OwnerRegion exists.
-        mapped = Ref{Ptr{Cvoid}}(C_NULL)
-        after_mmap_unmaps = Ref(0)
-        mapper = function (fd, len)
-            mapped[] = ccall(:mmap, Ptr{Cvoid},
-                (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
-                C_NULL, len, 1, 1, fd, 0)
-        end
-        @test_throws InterruptException AC._mmapregion(path;
-            mapper=mapper,
-            after_mmap=(_p, _len) -> throw(InterruptException()),
-            unmapper=(p, len) -> begin
-                after_mmap_unmaps[] += 1
-                AC._munmap!(p, len)
-            end)
-        @test mapped[] != Ptr{Cvoid}(-1)
-        @test after_mmap_unmaps[] == 1
-
-        # The armed mmap release is concrete data with the same no-escape
-        # rule: fault injection is a counter on the action (not a closure),
-        # the interrupted attempt restores LIVE, and the noescape loop
-        # retries until munmap commits — all within ONE action execution.
-        inj = Threads.Atomic{Int}(1)
-        closed_notes = Threads.Atomic{Int}(0)
-        interrupted_close = AC._mmapregion(path;
-            injectclose=inj, note=closed_notes)
-        @test forceclose!(interrupted_close)
-        @test inj[] <= 0                 # the injected interrupt fired
-        @test closed_notes[] == 1        # exactly one action execution
-        @test AC.phase(@atomic interrupted_close.state) == AC.PHASE_CLOSED
-        finalize(interrupted_close)
-        @test closed_notes[] == 1        # finalizer found it already closed
-
-        r_notes = Threads.Atomic{Int}(0)
-        r = AC._mmapregion(path; unmapper=unmapper, note=r_notes)
+        # The armed release is concrete data: exactly one action execution,
+        # observed via the note counter, and a finalizer after close is inert.
+        closed_notes = ReleaseCounter()
+        r = AC._mmapregion(path; unmapper=unmapper, note=closed_notes)
         @test unmaps[] == 2              # constructor-path count is unchanged
         @test forceclose!(r)
-        @test r_notes[] == 1
+        @test closed_notes[] == 1
+        finalize(r)
+        @test closed_notes[] == 1
         rm(path)
     end
 
@@ -222,76 +142,6 @@ end
         @test_throws InvalidatedError withguard(() -> 1, r)
     end
 
-    @testset "busy finalizer interruption rearms cleanup" begin
-        bytes = UInt8[0]
-        calls = Threads.Atomic{Int}(0)
-        r = GC.@preserve bytes AC.OwnerRegion(
-            Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=NotifyRelease(calls))
-        AC._acquireguard!(r)
-        attempts = Ref(0)
-        AC._finalize_region!(r, () -> begin
-            attempts[] += 1
-            attempts[] == 1 && throw(InterruptException())
-        end)
-        @test attempts[] == 2
-        @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
-        @test calls[] == 0
-        AC._releaseguard!(r)
-        finalize(r)
-        @test calls[] == 1
-    end
-
-    @testset "interrupted close wait restores open" begin
-        bytes = UInt8[0]
-        calls = Threads.Atomic{Int}(0)
-        r = GC.@preserve bytes AC.OwnerRegion(
-            Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=NotifyRelease(calls))
-        AC._acquireguard!(r)
-        try
-            @test_throws InterruptException AC._forceclose!(r, 1000,
-                () -> throw(InterruptException()))
-            @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
-            @test calls[] == 0
-        finally
-            AC._releaseguard!(r)
-        end
-        @test withguard(() -> 1, r) == 1
-        @test forceclose!(r)
-        @test calls[] == 1
-    end
-
-    @testset "guard and close claims are interruption-atomic" begin
-        bytes = UInt8[0]
-        calls = Threads.Atomic{Int}(0)
-        r = GC.@preserve bytes AC.OwnerRegion(
-            Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=NotifyRelease(calls))
-
-        @test_throws InterruptException AC._acquireguard!(r,
-            () -> throw(InterruptException()))
-        @test (@atomic r.guards) == 0
-        @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
-
-        @test_throws InterruptException AC._withguard(() -> nothing, r,
-            () -> throw(InterruptException()))
-        @test (@atomic r.guards) == 0
-
-        @test_throws InterruptException AC._forceclose!(r, 1000, yield;
-            after_claim=() -> throw(InterruptException()))
-        @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
-        @test calls[] == 0
-
-        @test_throws InterruptException AC._forceclose!(r, 1000, yield;
-            before_release=() -> throw(InterruptException()))
-        @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
-        @test calls[] == 0
-        @test forceclose!(r)
-        @test calls[] == 1
-        @test (@atomic r.guards) == 0
-    end
-
     @testset "guard acquired after close fails" begin
         r = heapregion(zeros(UInt8, 8))
         @test forceclose!(r)
@@ -302,7 +152,7 @@ end
     @testset "invalid construction and release errors stay closed" begin
         @test_throws ArgumentError AC.OwnerRegion(Ptr{UInt8}(0), 1, AC.Foreign)
         @test_throws ArgumentError forceclose!(heapregion(UInt8[0]); timeout_ms=-1)
-        calls = Threads.Atomic{Int}(0)
+        calls = ReleaseCounter()
         bytes = UInt8[0]
         r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
             root=bytes, releasefn=NotifyRelease(calls; fail=true))
@@ -318,7 +168,7 @@ end
         bytes = UInt8[0]
         entered = Base.Event()
         finish = Base.Event()
-        calls = Threads.Atomic{Int}(0)
+        calls = ReleaseCounter()
         r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
             root=bytes,
             releasefn=RendezvousRelease(entered, finish; note=calls))
@@ -336,7 +186,7 @@ end
 
     @testset "manual finalization honors an active guard" begin
         bytes = UInt8[0]
-        calls = Threads.Atomic{Int}(0)
+        calls = ReleaseCounter()
         r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
             root=bytes, releasefn=NotifyRelease(calls))
         withguard(r) do
@@ -351,7 +201,7 @@ end
 
     @testset "delegated lifecycles share one root gate" begin
         bytes = UInt8[0]
-        calls = Threads.Atomic{Int}(0)
+        calls = ReleaseCounter()
         gate = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1,
             AC.Foreign; root=bytes, releasefn=NotifyRelease(calls))
         child = AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
