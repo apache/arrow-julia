@@ -879,6 +879,13 @@ end
     return nothing
 end
 
+@noinline function _export_and_forget()
+    f, d = fromjulia("registry-rooted", Int64[1, 2])
+    region = d.buffers[2].region
+    sp, ap = to_c_data(f, d)
+    return sp, ap, WeakRef(d), WeakRef(region)
+end
+
 function main()
     if Sys.WORD_SIZE == 64
         @assert sizeof(CArrowSchema) == 72
@@ -1005,6 +1012,20 @@ function main()
     @assert (@atomic factoryregion.guards) == 0
     @assert _registry_count() == before
     println("failed export handoffs return mallocs and source guards ✓")
+
+    # The registry, not the caller's Julia variables, must keep all source
+    # objects and their buffers alive while raw C pointers are outstanding.
+    sp, ap, dataref, regionref = _export_and_forget()
+    GC.gc(true)
+    @assert dataref.value !== nothing
+    @assert regionref.value !== nothing
+    rootedf, rootedd = from_c_data(sp, ap)
+    @assert materialize(rootedf, rootedd) == [1, 2]
+    @assert reap!() == 1
+    release!(rootedd.owner::ForeignOwner)
+    @assert reap!() == 1
+    @assert _registry_count() == before
+    println("export registry roots dropped Julia sources across GC ✓")
 
     b = batch((
         xs=Int64[1, 2, 3, 4],
