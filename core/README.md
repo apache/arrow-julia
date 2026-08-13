@@ -37,7 +37,7 @@ listed under Honest status.
 | `test/runtests.jl` | Core layout, validation, cache, bounds, lifecycle, mmap, and concurrency tests; it also starts a four-thread stress subprocess |
 | `examples/ipc_read.jl` | Checked IPC stream framing, a bounded metadata verifier, metadata-to-Core mapping, dictionary state, and one registry-driven decoder over real 2.x-written streams |
 | `examples/cdata.jl` | C ABI definitions, zero-copy export and import, shared-tree ownership, C move semantics, exactly-once release, and lifecycle tests |
-| `REVIEW-codex-r1.md`, `REVIEW-codex-r2.md`, `REVIEW-codex-r3.md` | Adversarial review findings and the disposition of each item |
+| `REVIEW-codex-r1.md`, `REVIEW-codex-r2.md`, `REVIEW-codex-r3.md`, `REVIEW-codex-r4.md` | Adversarial review findings and the disposition of each item |
 
 ## Run it
 
