@@ -26,6 +26,13 @@ struct ManagedLoad
     value::Any
 end
 
+struct ValidationProbeType <: AC.ArrowType end
+const VALIDATION_PROBE_VISITS = Ref(0)
+function AC.layoutspec(::ValidationProbeType)
+    VALIDATION_PROBE_VISITS[] += 1
+    return AC.LayoutSpec([AC.VALIDITY], 0, 0, 0, false)
+end
+
 @testset "ArrowCore" begin
 
 @testset "OwnerRegion lifecycle" begin
@@ -1067,6 +1074,32 @@ end
         AC.BigEndian : AC.LittleEndian
     @test_throws ValidationError RecordBatch(
         Schema(Field[]; endianness=nonnative), ArrayData[], 0)
+
+    @testset "certified dictionary pools are not revisited" begin
+        valuetype = ValidationProbeType()
+        valuefield = Field("pool", valuetype)
+        pool = AC.ArrayData(valuetype, 1, [BufferSlice()]; nullcount=0)
+        validate_semantic(valuefield, pool)
+        validated = AC._ValidatedDictionaries(pool => nothing)
+
+        # Make an intrinsic revisit observable. The certificate remains valid:
+        # it records the completed validation, not the state of this cache bit.
+        @atomic :monotonic pool.semachecked = false
+        VALIDATION_PROBE_VISITS[] = 0
+
+        dicttype = DictionaryType(IntType(8, false), valuetype, false)
+        dictfield = Field("d", dicttype; nullable=false)
+        dictdata = AC.ArrayData(dicttype, 1,
+            [BufferSlice(), AC._databuffer(UInt8[0])];
+            dictionary=pool, nullcount=0)
+        @test AC._validate_semantic(dictfield, dictdata, validated) === dictdata
+        @test VALIDATION_PROBE_VISITS[] == 0
+        @test !(@atomic :monotonic pool.semachecked)
+
+        batch = AC.RecordBatch(Schema([dictfield]), [dictdata], 1, validated)
+        @test batch.columns[1] === dictdata
+        @test VALIDATION_PROBE_VISITS[] == 0
+    end
 end
 
 end # ArrowCore testset

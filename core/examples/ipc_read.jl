@@ -824,13 +824,13 @@ function decodefield(f::Field, c::DecodeCursor, dicts::Dict{Int64,ArrayData},
 end
 
 function validaterecordcolumns(fields, cols,
-    validated_dictionaries=IdDict{ArrayData,Vector{Field}}())
+    validated_dictionaries::AC._ValidatedDictionaries)
     for (f, col) in zip(fields, cols)
         # One IPC dictionary id can back many fields. Compatible value
-        # schemas were proved when the stream schema was built, so scan each
-        # immutable pool snapshot's Field contracts once per stream instead
-        # of once per reference. Index contracts still run independently for
-        # every field.
+        # schemas were proved when the stream schema was built. Each immutable
+        # pool snapshot is fully certified at its DictionaryBatch, so record
+        # validation skips that pool tree. Index contracts still run
+        # independently for every field.
         AC._validate_semantic(f, col, validated_dictionaries)
     end
     return validated_dictionaries
@@ -853,7 +853,7 @@ function decoderecord(fm::FramedMessage, fields, sch::Schema,
     validaterecordcolumns(fields, cols, validated_dictionaries)
     all(col -> col.len == rblen, cols) ||
         throw(ValidationError("RecordBatch length does not match top-level field nodes"))
-    return AC.RecordBatch(sch, cols, rblen)
+    return AC.RecordBatch(sch, cols, rblen, validated_dictionaries)
 end
 
 # ---------------------------------------------------------------------------
@@ -925,7 +925,7 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
     sch = Schema(fields; metadata=coremetadata(metaschema.custom_metadata),
         endianness=AC.LittleEndian)
     dicts = Dict{Int64,ArrayData}()
-    validated_dictionaries = IdDict{ArrayData,Vector{Field}}()
+    validated_dictionaries = AC._ValidatedDictionaries()
     batchslots = Union{Nothing,AC.RecordBatch}[]
     pending = PendingRecord[]
     features = Set(msgs[1].features)
@@ -964,7 +964,12 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
             finishcursor!(cursor)
             decoded.len == rblen ||
                 throw(ValidationError("dictionary RecordBatch length does not match its field node"))
-            AC._validate_semantic_once(vf, decoded, validated_dictionaries)
+            # Certify the entire immutable pool snapshot before publication.
+            # Later record validation may then skip every recursive stage for
+            # this exact identity. Replacements decode to a new identity and
+            # must earn their own certificate here.
+            validate_semantic(vf, decoded)
+            validated_dictionaries[decoded] = nothing
             dicts[header.id] = decoded
 
             # The IPC spec permits an all-null dictionary column before its
@@ -1354,14 +1359,13 @@ function main()
     dictfield = stream.schema.fields[dictpos]
     dictpool = stream.batches[1].columns[dictpos].dictionary
     @assert dictpool === stream.batches[2].columns[dictpos].dictionary
-    validated = IdDict{ArrayData,Vector{Field}}()
-    AC._validate_semantic_once(AC.dictvaluefield(dictfield, dictfield.type),
-        dictpool, validated)
+    validated = AC._ValidatedDictionaries()
+    validate_semantic(AC.dictvaluefield(dictfield, dictfield.type), dictpool)
+    validated[dictpool] = nothing
     for b in stream.batches
         validaterecordcolumns(stream.schema.fields, b.columns, validated)
     end
     @assert length(validated) == 1
-    @assert length(validated[dictpool]) == 1
 
     wanted = (
         ints=Any[1, 2, 3, 4, 5],
@@ -1611,10 +1615,14 @@ function main()
     end
     sharedcols = sharedstream.batches[1].columns
     @assert sharedcols[1].dictionary === sharedcols[2].dictionary
-    sharedvalidated = validaterecordcolumns(sharedstream.schema.fields, sharedcols)
+    sharedpool = sharedcols[1].dictionary
+    sharedtype = sharedstream.schema.fields[1].type::DictionaryType
+    validate_semantic(AC.dictvaluefield(sharedstream.schema.fields[1], sharedtype),
+        sharedpool)
+    sharedvalidated = AC._ValidatedDictionaries(sharedpool => nothing)
+    validaterecordcolumns(sharedstream.schema.fields, sharedcols, sharedvalidated)
     @assert length(sharedvalidated) == 1
-    @assert length(sharedvalidated[sharedcols[1].dictionary]) == 1
-    println("shared dictionary ids reuse one pool-contract scan ✓")
+    println("shared dictionary ids reuse one full pool certificate ✓")
 
     pool = PooledArray(Union{Missing,String}[missing, "x"])
     poolio = IOBuffer()

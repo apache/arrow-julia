@@ -757,6 +757,14 @@ end
 
 Base.length(d::ArrayData) = d.len
 
+# Adapter-private certificate set. An entry means that one immutable
+# dictionary pool snapshot already passed structural, intrinsic semantic, and
+# Field-contract validation under the adapter's canonical value Field.
+const _ValidatedDictionaries = IdDict{ArrayData,Nothing}
+@inline _dictionary_validated(::Nothing, ::ArrayData) = false
+@inline _dictionary_validated(memo::_ValidatedDictionaries, d::ArrayData) =
+    haskey(memo, d)
+
 @inline _slotindex0(d::ArrayData, i::Int64) =
     checked_add(d.offset, checked_sub(i, Int64(1)))
 @inline _slotbyteoff(d::ArrayData, i::Int64, width::Integer) =
@@ -926,7 +934,11 @@ sizes. (The framing stage — resource limits before metadata-directed decode
 allocation and checked message-body spans — belongs to the adapters; see
 core/examples/ipc_read.jl.)
 """
-function validate_structural(f::Field, d::ArrayData)
+validate_structural(f::Field, d::ArrayData) =
+    _validate_structural(f, d, nothing)
+
+function _validate_structural(f::Field, d::ArrayData,
+    validated_dictionaries::Union{Nothing,_ValidatedDictionaries})
     isvalid(f.name) ||
         throw(ValidationError("field name is not valid UTF-8"))
     _validate_metadata(f.metadata, "field")
@@ -995,12 +1007,15 @@ function validate_structural(f::Field, d::ArrayData)
     length(d.children) == expected_children ||
         throw(ValidationError("$(typeof(d.type)): expected $expected_children children, got $(length(d.children))"))
     for (cf, cd) in zip(childfields(f), d.children)
-        validate_structural(cf, cd)
+        _validate_structural(cf, cd, validated_dictionaries)
     end
     if d.type isa DictionaryType
         d.dictionary === nothing &&
             throw(ValidationError("dictionary-encoded array without a dictionary"))
-        validate_structural(dictvaluefield(f, d.type), d.dictionary)
+        dictionary = d.dictionary::ArrayData
+        _dictionary_validated(validated_dictionaries, dictionary) ||
+            _validate_structural(dictvaluefield(f, d.type), dictionary,
+                validated_dictionaries)
     elseif d.dictionary !== nothing
         throw(ValidationError("dictionary values attached to a non-dictionary array"))
     end
@@ -1185,18 +1200,19 @@ Layouts declared as structural-only fail closed instead of caching an
 incomplete check.
 """
 function validate_semantic(f::Field, d::ArrayData)
-    return _validate_semantic(f, d, IdDict{ArrayData,Vector{Field}}())
+    return _validate_semantic(f, d, nothing)
 end
 
 function _validate_semantic(f::Field, d::ArrayData,
-    validated_dictionaries::IdDict{ArrayData,Vector{Field}})
-    validate_structural(f, d)
-    _validate_semantic_intrinsic(f, d)
+    validated_dictionaries::Union{Nothing,_ValidatedDictionaries})
+    _validate_structural(f, d, validated_dictionaries)
+    _validate_semantic_intrinsic(f, d, validated_dictionaries)
     _validate_field_contracts(f, d, validated_dictionaries)
     return d
 end
 
-function _validate_semantic_intrinsic(f::Field, d::ArrayData)
+function _validate_semantic_intrinsic(f::Field, d::ArrayData,
+    validated_dictionaries::Union{Nothing,_ValidatedDictionaries}=nothing)
     t = d.type
     if t isa Union{ViewType,ListViewType,RunEndEncodedType}
         throw(ValidationError(
@@ -1269,10 +1285,13 @@ function _validate_semantic_intrinsic(f::Field, d::ArrayData)
         @atomic :monotonic d.semachecked = true
     end
     for (cf, cd) in zip(childfields(f), d.children)
-        _validate_semantic_intrinsic(cf, cd)
+        _validate_semantic_intrinsic(cf, cd, validated_dictionaries)
     end
     if t isa DictionaryType
-        _validate_semantic_intrinsic(dictvaluefield(f, t), d.dictionary)
+        dictionary = d.dictionary::ArrayData
+        _dictionary_validated(validated_dictionaries, dictionary) ||
+            _validate_semantic_intrinsic(dictvaluefield(f, t), dictionary,
+                validated_dictionaries)
     end
     return d
 end
@@ -1359,41 +1378,17 @@ function _validate_field_contract_at(f::Field, d::ArrayData, i::Int64)
     return nothing
 end
 
-function _same_field_contract(a::Field, b::Field)
-    a.nullable == b.nullable && typeequal(a.type, b.type) || return false
-    length(a.children) == length(b.children) || return false
-    return all(_same_field_contract(x, y) for (x, y) in zip(a.children, b.children))
-end
-
-function _validate_field_contracts_once(f::Field, d::ArrayData,
-    validated_dictionaries::IdDict{ArrayData,Vector{Field}})
-    contracts = get!(validated_dictionaries, d, Field[])
-    if !any(c -> _same_field_contract(c, f), contracts)
-        _validate_field_contracts(f, d, validated_dictionaries)
-        push!(contracts, f)
-    end
-    return nothing
-end
-
-function _validate_semantic_once(f::Field, d::ArrayData,
-    validated_dictionaries::IdDict{ArrayData,Vector{Field}})
-    validate_structural(f, d)
-    _validate_semantic_intrinsic(f, d)
-    _validate_field_contracts_once(f, d, validated_dictionaries)
-    return d
-end
-
 function _validate_dictionary_contracts(f::Field, d::ArrayData,
-    validated_dictionaries::IdDict{ArrayData,Vector{Field}})
+    validated_dictionaries::Union{Nothing,_ValidatedDictionaries})
     if d.type isa DictionaryType
         # Dictionary values form an independent array. Index nullability never
         # constrains pool nullability, but nested Field contracts inside the
         # pool still apply to every pool value, even when the dictionary array
         # itself is nested below a masked parent.
         dictionary = d.dictionary::ArrayData
-        valuefield = dictvaluefield(f, d.type)
-        _validate_field_contracts_once(valuefield, dictionary,
-            validated_dictionaries)
+        _dictionary_validated(validated_dictionaries, dictionary) ||
+            _validate_field_contracts(dictvaluefield(f, d.type), dictionary,
+                validated_dictionaries)
     end
     for (cf, cd) in zip(f.children, d.children)
         _validate_dictionary_contracts(cf, cd, validated_dictionaries)
@@ -1402,7 +1397,7 @@ function _validate_dictionary_contracts(f::Field, d::ArrayData,
 end
 
 function _validate_field_contracts(f::Field, d::ArrayData,
-    validated_dictionaries::IdDict{ArrayData,Vector{Field}})
+    validated_dictionaries::Union{Nothing,_ValidatedDictionaries}=nothing)
     for i = 1:d.len
         _validate_field_contract_at(f, d, Int64(i))
     end
@@ -1830,14 +1825,15 @@ struct RecordBatch
     schema::Schema
     columns::FrozenVector{ArrayData}
     nrows::Int64
-    function RecordBatch(schema::Schema, columns, nrows::Integer)
+    function RecordBatch(schema::Schema, columns, nrows::Integer,
+        validated_dictionaries::Union{Nothing,_ValidatedDictionaries}=nothing)
         _validate_schema(schema)
         cols = FrozenVector{ArrayData}(columns)
         n = Int64(nrows)
         n >= 0 || throw(ArgumentError("negative row count"))
         for (f, c) in zip(schema.fields, cols)
             length(c) == n || throw(ArgumentError("unequal column lengths"))
-            validate_structural(f, c)
+            _validate_structural(f, c, validated_dictionaries)
         end
         length(schema.fields) == length(cols) ||
             throw(ArgumentError("schema/column count mismatch"))
