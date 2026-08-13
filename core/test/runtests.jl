@@ -32,6 +32,27 @@ end
 const NONCONFORMING_C_RELEASE =
     @cfunction(_nonconforming_c_release, Cvoid, (Ptr{Cvoid},))
 
+function _exercise_mapped_region(path::String)
+    r = mmapregion(path)
+    @test r.kind == AC.Mapped
+    @test r.root isa Matrix{UInt8}
+    @test size(r.root) == (8, 1)
+    @test_throws MethodError resize!(r.root, 10)
+    anchor = WeakRef(r.root)
+    mappedptr = r.ptr
+    GC.gc(true)
+    @test anchor.value !== nothing
+    @test pointer(anchor.value) == mappedptr
+    b = BufferSlice(r, 0, 8)
+    @test AC.loadat(b, UInt8, Int64(0)) == 0x11
+    @test AC.loadat(b, UInt32, Int64(4)) == 0x88776655
+    @test forceclose!(r)
+    @test r.root === nothing
+    @test_throws InvalidatedError AC.loadat(b, UInt8, Int64(0))
+    @test forceclose!(r) # idempotent
+    return anchor
+end
+
 
 @testset "ArrowCore" begin
 
@@ -50,40 +71,21 @@ const NONCONFORMING_C_RELEASE =
         @test_throws ErrorException setproperty!(r, :guards, 0)
     end
 
-    @testset "mmap region: read, deterministic close, invalidation" begin
+    @testset "mapped region: stable root, close, and invalidation" begin
         path = tempname()
         write(path, UInt8[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
-        r = mmapregion(path)
-        b = BufferSlice(r, 0, 8)
-        @test AC.loadat(b, UInt8, Int64(0)) == 0x11
-        @test AC.loadat(b, UInt32, Int64(4)) == 0x88776655
-        @test forceclose!(r)
-        # closed: every subsequent access through the region fails cleanly
-        @test_throws InvalidatedError AC.loadat(b, UInt8, Int64(0))
-        # idempotent
-        @test forceclose!(r)
+        anchor = _exercise_mapped_region(path)
+        GC.gc(true)
+        GC.gc(true)
+        @test anchor.value === nothing
+        # The stdlib mapping is now finalized, so this is also valid on
+        # platforms that forbid deleting an actively mapped file.
         rm(path)
-    end
-
-    @testset "mapped regions: stdlib-backed lifecycle" begin
-        path = tempname()
-        write(path, UInt8[0x11, 0x22, 0x33])
-        r = mmapregion(path)
-        @test r.kind == AC.Mapped
-        @test r.root isa Vector{UInt8}
-        b = BufferSlice(r, 0, 3)
-        @test AC.loadat(b, UInt8, Int64(2)) == 0x33
-        # forceclose invalidates every view and drops the GC anchor; the
-        # stdlib's own machinery unmaps once the array is collected.
-        @test forceclose!(r)
-        @test r.root === nothing
-        @test_throws InvalidatedError AC.loadat(b, UInt8, Int64(0))
         emptypath = tempname()
         touch(emptypath)
         @test_throws ArgumentError mmapregion(emptypath)   # empty file
         rm(emptypath)
         @test_throws SystemError mmapregion(tempname())    # missing file
-        rm(path)
     end
 
     @testset "forceclose! waits for guards; timeout restores open" begin

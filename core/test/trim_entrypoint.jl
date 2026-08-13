@@ -157,6 +157,11 @@ function run_trim_workload()::Nothing
     mkdir(dir)
     try
         exercise_mmap(dir)
+        # `forceclose!` drops the mapped-array anchor. The stdlib owns the
+        # actual unmap at collection, so collect before deleting the file on
+        # platforms that forbid deleting an active mapping.
+        GC.gc(true)
+        GC.gc(true)
     finally
         rm(joinpath(dir, "trim.bin"); force=true)
         rm(dir)

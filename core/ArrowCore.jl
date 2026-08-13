@@ -602,13 +602,23 @@ changes its bytes, and truncation can make an in-range load fault.
 function mmapregion(path::AbstractString)
     io = open(path, "r")
     arr = try
-        Mmap.mmap(io, Vector{UInt8})
+        len = filesize(io)
+        len > 0 || throw(ArgumentError("cannot map empty file: $path"))
+        len <= typemax(Int) ||
+            throw(ArgumentError("mapped file is not addressable: $path"))
+        # A one-dimensional mmap is a Vector. On Julia 1.11+, resize! can
+        # detach that Vector from its mapped Memory and leave `ptr` stale.
+        # Use a fixed-size Matrix as the anchor; views may reshape it, but
+        # resizing such a view detaches the view and cannot move this root.
+        Mmap.mmap(io, Matrix{UInt8}, (Int(len), 1))
     finally
         # The mapping outlives the descriptor.
         close(io)
     end
-    isempty(arr) && throw(ArgumentError("cannot map empty file: $path"))
-    return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr), Mapped; root=arr)
+    GC.@preserve arr begin
+        return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr), Mapped;
+            root=arr)
+    end
 end
 
 """
