@@ -461,7 +461,7 @@ end
         @test materialize(uf, ud) == ["y", 30]
     end
 
-    @testset "struct access preserves duplicate and omitted names" begin
+    @testset "struct access preserves names that NamedTuple cannot represent" begin
         af, ad = fromjulia("dup", Int64[1])
         bf, bd = fromjulia("dup", Int64[2])
         f = Field("s", StructType(); children=[af, bf])
@@ -478,6 +478,16 @@ end
         validate_structural(unnamed, d)
         validate_semantic(unnamed, d)
         @test getvalue(unnamed, d, 1) == ["" => 1, "" => 2]
+
+        nulname = "embedded\0nul"
+        nulnamed = Field("s", StructType(); children=[
+            Field(nulname, af.type; nullable=false),
+        ])
+        nuld = AC.ArrayData(StructType(), 1, [BufferSlice()];
+            children=[ad], nullcount=0)
+        validate_structural(nulnamed, nuld)
+        validate_semantic(nulnamed, nuld)
+        @test getvalue(nulnamed, nuld, 1) == [nulname => 1]
     end
 
     @testset "view/REE layouts: registry-known, access explicitly unsupported" begin

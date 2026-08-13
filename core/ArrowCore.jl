@@ -1318,11 +1318,15 @@ function _value(::StructType, f::Field, d::ArrayData, i::Int64)
     childindex = checked_add(d.offset, i)
     vals = Tuple(getvalue(cf, cd, childindex) for (cf, cd) in zip(f.children, d.children))
     names = Tuple(cf.name for cf in f.children)
-    if all(!isempty, names) && length(unique(names)) == length(names)
+    # Arrow names are strings, but not every valid Arrow name can be a Julia
+    # Symbol. In particular, Symbol rejects embedded NUL characters. Keep the
+    # exact Arrow spelling in the pair fallback instead of failing access.
+    symbolnames = all(name -> !isempty(name) && isvalid(name) && !occursin('\0', name), names)
+    if symbolnames && length(unique(names)) == length(names)
         return NamedTuple{Tuple(Symbol(name) for name in names)}(vals)
     end
-    # Arrow permits duplicate and omitted field names. NamedTuple cannot
-    # represent duplicates, so retain the exact order and names as pairs.
+    # Arrow permits duplicate, omitted, and non-Symbol-compatible field names.
+    # NamedTuple cannot represent them, so retain exact order and spelling.
     return Pair{String,Any}[names[j] => vals[j] for j in eachindex(names)]
 end
 

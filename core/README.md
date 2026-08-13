@@ -81,9 +81,10 @@ decimal, date, time, timestamp, duration, all interval variants, UTF-8 and
 binary with 32-bit or 64-bit offsets, fixed-size binary, list, fixed-size
 list, struct, map, sparse and dense union, dictionary, and null arrays.
 Logical parent offsets and nested slices are tested. Struct scalars use a
-`NamedTuple` only when names are unique and nonempty; otherwise they use an
-ordered vector of `Pair{String,Any}` so valid duplicate or omitted names do
-not fail. Utf8View, BinaryView, ListView, and run-end encoding have registry
+`NamedTuple` only when names are unique, nonempty, and valid Julia Symbol
+names; otherwise they use an ordered vector of `Pair{String,Any}` so valid
+duplicate, omitted, or non-Symbol-compatible names do not fail. Utf8View,
+BinaryView, ListView, and run-end encoding have registry
 entries and structural validation but no accessors. This is a declared scope
 boundary. `validate_full` adds UTF-8 well-formedness only; canonical padding
 and unused-bit checks remain production work.
