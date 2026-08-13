@@ -944,6 +944,83 @@ function _validateblockindex(dictblocks, recordblocks, dataend::Int64;
     return indexedend
 end
 
+function _blockrange(b::BufferSlice, pos::Int64, len::Int64,
+    what::AbstractString)
+    (pos >= 0 && len >= 0 && len <= b.len && pos <= b.len - len) ||
+        throw(ValidationError("$what escapes block metadata"))
+    return nothing
+end
+
+function _blockload(b::BufferSlice, ::Type{T}, pos::Int64,
+    what::AbstractString) where {T}
+    _blockrange(b, pos, Int64(sizeof(T)), what)
+    return AC.loadat(b, T, pos)
+end
+
+"""
+Read only the fixed Message envelope needed to bind one Footer Block to its
+on-wire frame. The complete metadata graph remains lazily verified by
+`_blockmessage`; this zero-allocation preflight prevents optional-EOS
+classification from trusting forged Footer extents first.
+"""
+function _blockmessagebodylength(metadata::BufferSlice)
+    root = Int64(_blockload(metadata, UInt32, Int64(0), "message root"))
+    root >= 4 || throw(ValidationError("invalid block message root offset"))
+    root % 4 == 0 || throw(ValidationError("block message table is misaligned"))
+    back = Int64(_blockload(metadata, Int32, root, "message table"))
+    back != 0 || throw(ValidationError("block message has a zero vtable offset"))
+    vpos = try
+        AC.checked_sub(root, back)
+    catch e
+        e isa OverflowError || rethrow()
+        throw(ValidationError("block message vtable offset overflows"))
+    end
+    vpos % 2 == 0 || throw(ValidationError("block message vtable is misaligned"))
+    vlen = Int64(_blockload(metadata, UInt16, vpos, "message vtable header"))
+    olen = Int64(_blockload(metadata, UInt16, vpos + 2,
+        "message vtable header"))
+    vlen >= 4 && iseven(vlen) ||
+        throw(ValidationError("invalid block message vtable length $vlen"))
+    olen >= 4 ||
+        throw(ValidationError("invalid block message object length $olen"))
+    _blockrange(metadata, vpos, vlen, "message vtable")
+    _blockrange(metadata, root, olen, "message table")
+
+    # Message.bodyLength is slot 3. An absent FlatBuffers scalar has value 0.
+    vlen < 12 && return Int64(0)
+    entry = AC.checked_add(vpos, Int64(10))
+    off = Int64(_blockload(metadata, UInt16, entry,
+        "message body-length vtable entry"))
+    off == 0 && return Int64(0)
+    (off >= 4 && olen >= 8 && off <= olen - 8) ||
+        throw(ValidationError("block message body-length slot exceeds its object"))
+    pos = AC.checked_add(root, off)
+    pos % 8 == 0 ||
+        throw(ValidationError("block message body-length slot is misaligned"))
+    return _blockload(metadata, Int64, pos, "message body-length slot")
+end
+
+function _verifyblockframes(region::OwnerRegion, dictblocks, recordblocks,
+    dataend::Int64; datastart::Int64=0)
+    indexedend = _validateblockindex(dictblocks, recordblocks, dataend;
+        datastart=datastart)
+    blob = BufferSlice(region, 0, region.len)
+    for block in Iterators.flatten((dictblocks, recordblocks))
+        offset, metalen, bodylen = block
+        AC.loadat(blob, UInt32, offset) == CONTINUATION ||
+            throw(ValidationError("footer block does not point at a message"))
+        declared = Int64(AC.loadat(blob, Int32, offset + 4))
+        declared == metalen - 8 ||
+            throw(ValidationError(
+                "footer block metadata length does not match the message"))
+        metadata = AC.subslice(blob, offset + 8, declared)
+        _blockmessagebodylength(metadata) == bodylen ||
+            throw(ValidationError(
+                "footer block body length does not match the message"))
+    end
+    return indexedend
+end
+
 
 function _blockmessage(region::OwnerRegion, block::NTuple{3,Int64},
     dataend::Int64, limits::Limits, budget::AllocationBudget)
@@ -1036,7 +1113,7 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
         throw(ValidationError("file schema and footer schema differ"))
     _metadataequal(schemafm.msg.custom_metadata, footer.custom_metadata) ||
         throw(ValidationError("file schema and footer custom metadata differ"))
-    indexedend = _validateblockindex(dictblocks, recordblocks, footerstart;
+    indexedend = _verifyblockframes(region, dictblocks, recordblocks, footerstart;
         datastart=schemaend)
     haseos = footerstart - indexedend >= 8 &&
         AC.loadat(blob, UInt32, footerstart - 8) == CONTINUATION &&
@@ -1593,6 +1670,14 @@ function main()
         NTuple{3,Int64}[(Int64(8), Int64(16), Int64(8))],
         NTuple{3,Int64}[(Int64(24), Int64(16), Int64(0))], Int64(64)))
 
+    # A zero-body Block ends exactly after its metadata. The Message omits its
+    # default-zero bodyLength slot, and the frame preflight must accept it.
+    zerobodyschema = Schema(Field[])
+    zerobodybatch = AC.RecordBatch(zerobodyschema, ArrayData[], 3)
+    zerobodyfile = readfile(writefile(zerobodyschema, [zerobodybatch]))
+    @assert only(zerobodyfile.recordblocks)[3] == 0
+    @assert zerobodyfile[1].nrows == 3
+
     # The footer copy and verified graph share one allocation budget. File
     # message count and lazy bodies use the same limits as stream framing.
     simplefield, simpledata = fromjulia("x", Int64[1])
@@ -1644,6 +1729,24 @@ function main()
         noeosfile[1].columns[1]) == Int64[Int64(0x00000000ffffffff)]
     @assert length(Tables.getcolumn(Tables.columns(
         Arrow.Table(IOBuffer(copy(noeos)))), 1)) == 1
+
+    # Footer extents are not verified until they agree with the on-wire
+    # Message envelope. Merely shortening the final Block must not make its
+    # marker-shaped data look like an optional EOS marker at file-open time.
+    forgedcollision = copy(noeos)
+    forgedfooterlen = Int64(reinterpret(Int32,
+        forgedcollision[(end - 9):(end - 6)])[1])
+    forgedfooterstart = Int64(length(forgedcollision)) - 10 - forgedfooterlen
+    forgedfooter = copy(forgedcollision[
+        (forgedfooterstart + 1):(forgedfooterstart + forgedfooterlen)])
+    forgedtable = _vtable(forgedfooter, Int64(_vu32(forgedfooter, 0)))
+    forgedblocks, nforgedblocks = _vvector(forgedtable, 3, 24; required=true)
+    @assert nforgedblocks == 1
+    forgedbodylen = _vi64(forgedfooter, forgedblocks + 16)
+    @assert forgedbodylen >= 8
+    _write_i64!(forgedcollision,
+        forgedfooterstart + forgedblocks + 16, forgedbodylen - 8)
+    @assert _rejects(() -> readfile(forgedcollision))
 
     _, _, _, _, footreserve = verify_footer(simplefooter, Limits())
     tightbudget = max(simplefooterlen, footreserve)
