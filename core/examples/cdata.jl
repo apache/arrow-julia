@@ -299,6 +299,9 @@ _malloc!(root::ExportedRoot, n::Integer) = begin
 end
 
 function _cstring!(root::ExportedRoot, s::AbstractString)
+    isvalid(s) || throw(ValidationError("C Data strings must be valid UTF-8"))
+    occursin('\0', s) &&
+        throw(ValidationError("C Data strings cannot contain embedded NUL characters"))
     n = ncodeunits(s)
     p = Ptr{UInt8}(_malloc!(root, AC.checked_add(Int64(n), Int64(1))))
     for (i, b) in enumerate(codeunits(s))
@@ -391,6 +394,7 @@ function to_c_data(f::Field, d::ArrayData)
     # either independently-owned C root.
     validate_structural(f, d)
     validate_semantic(f, d)
+    validate_full(f, d)
     arel = @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},))
     srel = @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
     sp = _newroot(Any[f]) do root
@@ -574,6 +578,7 @@ function from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray})
         d = _import_array(f, arr, owner)
         validate_structural(f, d)
         validate_semantic(f, d)
+        validate_full(f, d)
         return f, d
     catch
         release!(owner)   # failed-import cleanup: exactly once, then rethrow
@@ -653,9 +658,15 @@ function _release_c_schema!(sp::Ptr{CArrowSchema}, sch::CArrowSchema)
     return nothing
 end
 
+function _import_cstring(p::Ptr{UInt8}, what::AbstractString)
+    s = unsafe_string(p)
+    isvalid(s) || throw(ValidationError("C Data $what is not valid UTF-8"))
+    return s
+end
+
 function _import_field(sch::CArrowSchema)::Field
-    fmt = unsafe_string(sch.format)
-    name = sch.name == C_NULL ? "" : unsafe_string(sch.name)
+    fmt = _import_cstring(sch.format, "format")
+    name = sch.name == C_NULL ? "" : _import_cstring(sch.name, "field name")
     nullable = (sch.flags & ARROW_FLAG_NULLABLE) != 0
     t = parseformat(fmt, sch.flags)
 
@@ -975,6 +986,29 @@ function main()
     @assert _registry_count() == before
     println("failed exports leave no registry roots ✓")
 
+    # C strings cannot represent embedded NULs, and Utf8 arrays require
+    # valid UTF-8. Reject both before any export root becomes visible.
+    badname = Field("embedded\0nul", IntType(64, true); nullable=false)
+    @assert try
+        to_c_data(badname, md)
+        false
+    catch e
+        e isa ValidationError
+    end
+    badutf8type = Utf8Type(false)
+    badutf8field = Field("bad-utf8", badutf8type)
+    badutf8data = ArrayData(badutf8type, 1,
+        [BufferSlice(), AC._databuffer(Int32[0, 1]),
+         AC._databuffer(UInt8[0xff])]; nullcount=0)
+    @assert try
+        to_c_data(badutf8field, badutf8data)
+        false
+    catch e
+        e isa ValidationError
+    end
+    @assert _registry_count() == before
+    println("unrepresentable names and invalid UTF-8 fail before export ✓")
+
     # Dictionary values have independent nullability. Ordered state is a C
     # schema flag, and a non-nullable index may select a null pool value.
     vf, vd = fromjulia("dict", Union{Missing,String}[missing, "x"])
@@ -1116,6 +1150,35 @@ function main()
     @assert reap!() == 2
     @assert _registry_count() == 0
     println("invalid C pointer tables fail with exact cleanup ✓")
+
+    # Imported C names and Utf8 buffers receive the same full validation.
+    # Both failures happen after the array move, so both producer lifetimes
+    # must still be released exactly once.
+    nf, nd = fromjulia("name", Int64[1])
+    sp, ap = to_c_data(nf, nd)
+    unsafe_store!(unsafe_load(sp).name, 0xff, 1)
+    @assert try
+        from_c_data(sp, ap)
+        false
+    catch e
+        e isa ValidationError
+    end
+    @assert reap!() == 2
+    @assert _registry_count() == 0
+
+    uf, ud = fromjulia("utf8", ["a"])
+    sp, ap = to_c_data(uf, ud)
+    datap = Ptr{UInt8}(unsafe_load(unsafe_load(ap).buffers, 3))
+    unsafe_store!(datap, 0xff, 1)
+    @assert try
+        from_c_data(sp, ap)
+        false
+    catch e
+        e isa ValidationError
+    end
+    @assert reap!() == 2
+    @assert _registry_count() == 0
+    println("invalid imported names and UTF-8 fail with exact cleanup ✓")
 
     println()
     println("C Data ownership and round-trip checks passed.")
