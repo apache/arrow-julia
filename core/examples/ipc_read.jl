@@ -274,6 +274,7 @@ function _vvector(t::_VTable, slot::Int, elemsize::Int;
     p = _vref(t, slot; required=required)
     p === nothing && return nothing
     _vrange(t.bytes, p, 4, "vector length")
+    p % 4 == 0 || _vfail("vector length is misaligned")
     n = Int64(_vu32(t.bytes, p))
     n <= state.limits.max_metadata_objects ||
         _vfail("vector count $n exceeds metadata object limit")
@@ -1373,6 +1374,23 @@ function _misaligned_empty_buffers_stream()
     return out
 end
 
+function _misaligned_empty_children_stream()
+    bytes = _zero_width_schema_stream(false)
+    _mutatemessage!(bytes, 1) do meta, msg
+        schema = _headertable(meta, msg)
+        fields, nfields = _vvector(schema, 1, 4; required=true)
+        nfields == 1 || error("fixture schema has an unexpected field count")
+        field = _vtable(meta, fields + Int64(_vu32(meta, fields)))
+        slot = _vfield(field, 5, 4; required=true)
+        vector = _vref(field, 5; required=true)
+        _vu32(meta, vector) == 0 || error("fixture has nonempty children")
+        vector > 0 && all(iszero, @view meta[vector:(vector + 3)]) ||
+            error("fixture has no zero padding before its children vector")
+        _write_u32!(meta, slot, UInt32(_vu32(meta, slot) - 1))
+    end
+    return bytes
+end
+
 function _metadata_value_stream(explicit_empty::Bool)
     b = FB.Builder(1024)
     key = FB.createstring!(b, "owner")
@@ -1440,6 +1458,9 @@ function main()
     @assert isempty(materialize(emptybuffers.schema.fields[1],
         emptybuffers.batches[1].columns[1]))
     println("empty struct vectors need no nominal element alignment ✓")
+
+    @assert _rejects(() -> readstream(_misaligned_empty_children_stream()))
+    println("vector length words are aligned before generated getters ✓")
 
     emptyvalue = readstream(_metadata_value_stream(true))
     @assert collect(emptyvalue.schema.metadata) == ["owner" => ""]
