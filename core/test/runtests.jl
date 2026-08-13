@@ -26,6 +26,30 @@ struct ManagedLoad
     value::Any
 end
 
+struct GcTriggeredLoad
+    value::UInt8
+end
+
+mutable struct RegionRootProbe
+    bytes::Vector{UInt8}
+    finalized::Base.RefValue{Bool}
+end
+
+function AC.datatype_alignment(::Type{GcTriggeredLoad})
+    GC.gc(true)
+    return 1
+end
+
+@noinline function load_while_collecting(finalized)
+    root = RegionRootProbe(UInt8[0x2a], finalized)
+    finalizer(root) do probe
+        probe.finalized[] = true
+    end
+    region = AC.OwnerRegion(Ptr{UInt8}(pointer(root.bytes)), 1; root=root)
+    slice = BufferSlice(region, 0, 1)
+    return AC.loadat(slice, GcTriggeredLoad, Int64(0)), finalized[]
+end
+
 @testset "ArrowCore" begin
 
 @testset "OwnerRegion: reachability-based validity" begin
@@ -39,6 +63,14 @@ end
         @test AC.loadat(b, Int64, Int64(24)) == 4
         # Regions are immutable values: nothing to close, nothing to race.
         @test_throws ErrorException setproperty!(r, :root, nothing)
+    end
+
+
+    @testset "raw load preserves the region root" begin
+        finalized = Ref(false)
+        value, finalized_during_load = load_while_collecting(finalized)
+        @test value == GcTriggeredLoad(0x2a)
+        @test !finalized_during_load
     end
 
     @testset "construction validation" begin
