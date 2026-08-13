@@ -490,15 +490,7 @@ framemessages(region::OwnerRegion, limits::Limits=Limits()) =
     _framemessages(region, limits, Base.ENDIAN_BOM,
         AllocationBudget(limits.max_total_allocated_bytes))
 
-function _framemessages(region::OwnerRegion, limits::Limits,
-    host_endian_bom::UInt32,
-    budget::AllocationBudget=AllocationBudget(limits.max_total_allocated_bytes))
-    # The borrowed generated FlatBuffers bindings use native-endian scalar
-    # loads. Reject an unsupported host before any generated getter sees the
-    # little-endian wire bytes. The explicit argument keeps this ordering
-    # testable on the supported little-endian CI host.
-    host_endian_bom == UInt32(0x04030201) ||
-        throw(ValidationError("this prove-out requires a little-endian host"))
+function _validatelimits(limits::Limits)
     limits.max_metadata_bytes >= 0 || throw(ArgumentError("negative metadata limit"))
     limits.max_body_bytes >= 0 || throw(ArgumentError("negative body limit"))
     limits.max_buffer_bytes >= 0 || throw(ArgumentError("negative buffer limit"))
@@ -509,6 +501,19 @@ function _framemessages(region::OwnerRegion, limits::Limits,
         throw(ArgumentError("negative metadata-object limit"))
     limits.max_nesting_depth >= 0 || throw(ArgumentError("negative nesting limit"))
     limits.max_array_length >= 0 || throw(ArgumentError("negative array-length limit"))
+    return nothing
+end
+
+function _framemessages(region::OwnerRegion, limits::Limits,
+    host_endian_bom::UInt32,
+    budget::AllocationBudget=AllocationBudget(limits.max_total_allocated_bytes))
+    # The borrowed generated FlatBuffers bindings use native-endian scalar
+    # loads. Reject an unsupported host before any generated getter sees the
+    # little-endian wire bytes. The explicit argument keeps this ordering
+    # testable on the supported little-endian CI host.
+    host_endian_bom == UInt32(0x04030201) ||
+        throw(ValidationError("this prove-out requires a little-endian host"))
+    _validatelimits(limits)
     blob = BufferSlice(region, 0, region.len)
     msgs = FramedMessage[]
     pos = Int64(0)   # 0-based byte position within the blob
@@ -636,11 +641,20 @@ function _coremetatype(mt, children::Vector{Field})::ArrowType
     mt isa Meta.Union || return coretype(mt)
     mode = mt.mode == Meta.UnionMode.Dense ? AC.DenseMode : AC.SparseMode
     ids = mt.typeIds
-    ids === nothing &&
-        return UnionType(mode, Int8[Int8(i) for i = 0:(length(children) - 1)])
+    nchildren = length(children)
+    nchildren <= 128 ||
+        throw(ValidationError("a union cannot have more than 128 children"))
+    if ids === nothing
+        return UnionType(mode, Int8[Int8(i) for i = 0:(nchildren - 1)])
+    end
+    length(ids) == nchildren ||
+        throw(ValidationError("union type-id count must equal child count"))
     all(x -> 0 <= x <= 127, ids) ||
         throw(ValidationError("union type ids must be in [0, 127]"))
-    return UnionType(mode, Int8[Int8(x) for x in ids])
+    coreids = Int8[Int8(x) for x in ids]
+    length(unique(coreids)) == length(coreids) ||
+        throw(ValidationError("union type ids must be unique"))
+    return UnionType(mode, coreids)
 end
 
 timeunit(u) = u == Meta.TimeUnit.SECOND ? AC.SECOND :
@@ -1013,6 +1027,13 @@ function decodefield(f::Field, c::DecodeCursor, dicts::Dict{Int64,ArrayData},
     node = takenode!(c)
     spec = layoutspec(t)
     buffers = BufferSlice[takebuffer!(c) for _ in spec.buffers]
+    for (role, buffer) in zip(spec.buffers, buffers)
+        if role == AC.OFFSETS && node.length == 0 &&
+            buffer.len < spec.offsetwidth
+            throw(ValidationError(
+                "IPC empty offset array must carry its terminal zero offset"))
+        end
+    end
     children = ArrayData[]
     if t isa DictionaryType
         # Index buffers were just consumed; values come from the side table.
@@ -1025,6 +1046,11 @@ function decodefield(f::Field, c::DecodeCursor, dicts::Dict{Int64,ArrayData},
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     for i = 1:nchildren
         push!(children, decodefield(f.children[i], c, dicts, fielddictids))
+    end
+    if t isa UnionType && t.mode == AC.SparseMode
+        all(child -> child.len == node.length, children) ||
+            throw(ValidationError(
+                "IPC sparse-union children must equal the union length"))
     end
     return ArrayData(t, node.length, buffers; children=children,
         nullcount=node.null_count)
