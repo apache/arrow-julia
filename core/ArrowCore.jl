@@ -1817,9 +1817,10 @@ end
 """
     RecordBatch
 
-Schema + equal-length columns: the ONLY interchange unit (report §9 — IPC,
-C-data, and partition iteration all speak batches; chunked columns are a
-facade convenience that never crosses a boundary).
+Schema + equal-length columns: the intended interchange unit in report §9.
+The implemented IPC adapter uses batches. Future C-stream and partition
+adapters can use the same boundary; chunked columns remain a facade
+convenience.
 """
 struct RecordBatch
     schema::Schema
