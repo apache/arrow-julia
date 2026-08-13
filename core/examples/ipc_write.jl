@@ -192,13 +192,28 @@ function metatype!(b::FB.Builder, t::ArrowType)
         Meta.decimalAddScale(b, Int32(t.scale))
         Meta.decimalAddBitWidth(b, Int32(t.bits))
         return Meta.Decimal, Meta.decimalEnd(b)
+    elseif t isa IntervalType
+        # The vendored enum predates MONTH_DAY_NANO; write the raw unit slot
+        # (the read side's `_rawintervalunit` is the same bridge).
+        Meta.intervalStart(b)
+        FB.prependslot!(b, 0, Int16(UInt8(t.unit)), Int16(0))
+        return Meta.Interval, Meta.intervalEnd(b)
+    elseif t isa UnionType
+        Meta.unionStartTypeIdsVector(b, length(t.typeids))
+        foreach(x -> FB.prepend!(b, Int32(x)), Iterators.reverse(t.typeids))
+        idvec = FB.endvector!(b, length(t.typeids))
+        Meta.unionStart(b)
+        Meta.unionAddMode(b, t.mode == AC.DenseMode ? Meta.UnionMode.Dense :
+            Meta.UnionMode.Sparse)
+        Meta.unionAddTypeIds(b, idvec)
+        return Meta.Union, Meta.unionEnd(b)
     elseif t isa NullType
         Meta.nullStart(b)
         return Meta.Null, Meta.nullEnd(b)
     else
         throw(ValidationError("IPC writer does not map descriptor " *
-            "$(AC.descriptorname(t)); union, interval, view, and REE IPC " *
-            "mapping is outside this prove-out"))
+            "$(AC.descriptorname(t)); view and REE IPC mapping is outside " *
+            "this prove-out"))
     end
 end
 
@@ -932,6 +947,22 @@ end
 # Acceptance: this writer's bytes, read by Core AND by Arrow.jl 2.x
 # ---------------------------------------------------------------------------
 
+"""
+Hand-build a one-column batch from raw buffer bytes (the write-side mirror of
+the read fixtures): interval layouts have no 2.x writer to lean on.
+"""
+function _handbatch(t::ArrowType, n::Int, buffers::Vector{Vector{UInt8}};
+    nullcount::Int=0)
+    f = Field("x", t, true, nothing, Field[])
+    slices = BufferSlice[isempty(bytes) ? BufferSlice() :
+        BufferSlice(heapregion(bytes), 0, length(bytes)) for bytes in buffers]
+    d = ArrayData(t, n, slices; nullcount=nullcount)
+    sch = Schema(Field[f])
+    return sch, AC.RecordBatch(sch, ArrayData[d], n)
+end
+
+_le(xs...) = reduce(vcat, [collect(reinterpret(UInt8, [x])) for x in xs])
+
 function _materialized(stream)
     return [[materialize(f, b.columns[i])
              for (i, f) in enumerate(stream.schema.fields)]
@@ -1083,6 +1114,54 @@ function main()
     end
     @assert caught
     println("offset views, schema mismatches, and unknown codecs are refused ✓")
+
+    # Unions, both modes: 2.x writes them, Core reads and re-encodes them,
+    # and 2.x reads this writer's bytes back. The mapped set now matches
+    # Core's accessor coverage (views and REE stay out by declared boundary).
+    for (modename, dense) in (("dense", true), ("sparse", false))
+        uio = IOBuffer()
+        Arrow.write(uio, (u=Union{Int64,String}[1, "x", 2, "y"],);
+            file=false, denseunions=dense)
+        usource = readstream(take!(uio))
+        ut = usource.schema.fields[1].type
+        @assert ut isa UnionType
+        @assert (ut.mode == AC.DenseMode) == dense
+        ubytes = writestream(usource)
+        _assert_stream_equal(usource, readstream(ubytes))
+        _assert_2x_reads(ubytes, usource)
+        println("$(modename) unions round-trip (Core + 2.x) ✓")
+    end
+
+    # Intervals, all three units, hand-built (2.x has no interval writer).
+    # MONTH_DAY_NANO exceeds 2.x entirely: its vendored enum predates the
+    # unit, so 2.x must fail while this adapter round-trips it.
+    ym = _handbatch(IntervalType(AC.YEAR_MONTH), 3,
+        [UInt8[0x05], _le(Int32(12), Int32(0), Int32(7))]; nullcount=1)
+    dt = _handbatch(IntervalType(AC.DAY_TIME), 3,
+        [UInt8[], _le(Int32(1), Int32(2), Int32(3), Int32(4), Int32(5), Int32(6))])
+    mdn = _handbatch(IntervalType(AC.MONTH_DAY_NANO), 2,
+        [UInt8[], _le(Int32(1), Int32(2), Int64(3), Int32(4), Int32(5), Int64(6))])
+    intervalwant = (
+        (ym, Any[12, missing, 7]),
+        (dt, Any[(days=1, millis=2), (days=3, millis=4), (days=5, millis=6)]),
+        (mdn, Any[(months=1, days=2, nanos=3), (months=4, days=5, nanos=6)]),
+    )
+    for ((sch, batch), want) in intervalwant
+        ibytes = writestream(sch, [batch])
+        istream = readstream(ibytes)
+        @assert istream.schema.fields[1].type == sch.fields[1].type
+        got = materialize(istream.schema.fields[1], istream.batches[1].columns[1])
+        @assert isequal(collect(Any, got), want)
+    end
+    mdnbytes = writestream(mdn[1], [mdn[2]])
+    mdnfailed = try
+        Arrow.Table(IOBuffer(mdnbytes))
+        false
+    catch
+        true
+    end
+    @assert mdnfailed
+    println("intervals round-trip, including MONTH_DAY_NANO beyond 2.x ✓")
 
     # ---- File format ----------------------------------------------------
 

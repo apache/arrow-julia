@@ -135,11 +135,13 @@ normalize non-native input before it constructs a batch.
 Timestamp validation checks the Arrow unit domain and timezone-string UTF-8.
 It does not resolve names against a timezone database.
 
-The IPC example has a narrower mapping. It reads streams containing integer,
-floating point, Boolean, decimal, date, time, timestamp, duration, UTF-8,
-binary, fixed-size binary, list, fixed-size list, struct, map, null, and
-dictionary overlays. It rejects interval, union, variadic view, and run-end
-metadata because the reused bindings and adapter do not map them. Nested
+The IPC examples map integer, floating point, Boolean, decimal, date, time,
+timestamp, duration, all three interval units (MONTH_DAY_NANO through a raw
+unit-slot bridge — the vendored enum predates it, and 2.x cannot parse it),
+UTF-8, binary (32- and 64-bit offsets), fixed-size binary, list, large list,
+fixed-size list, struct, map, sparse and dense union, null, and dictionary
+overlays — the same set Core's accessors cover. Variadic view and run-end
+metadata are rejected (the Core scope boundary). Nested
 dictionary encodings inside a dictionary value are also rejected. It accepts
 V4 and V5 metadata on little-endian hosts, supports feature-gated full
 dictionary replacement, preserves old dictionary snapshots, and rejects

@@ -607,12 +607,40 @@ function coretype(t)::ArrowType
         DurationType(timeunit(t.unit))
     elseif t isa Meta.Decimal
         DecimalType(Int(t.precision), Int(t.scale), Int(t.bitWidth))
+    elseif t isa Meta.Interval
+        u = _rawintervalunit(t)
+        IntervalType(u == 0 ? AC.YEAR_MONTH : u == 1 ? AC.DAY_TIME :
+            AC.MONTH_DAY_NANO)
     elseif t isa Meta.Null
         NullType()
     else
         throw(ValidationError("IPC adapter does not map metadata type $(typeof(t)); " *
-            "union, interval, view, and REE IPC mapping is outside this prove-out"))
+            "view and REE IPC mapping is outside this prove-out"))
     end
+end
+
+# The vendored IntervalUnit enum predates MONTH_DAY_NANO (format 1.2 — the
+# exact 2.x gap the report's Phase 0A flags), so the unit slot is read as its
+# raw Int16. The verifier already bounds it to the spec's 0:2 domain.
+function _rawintervalunit(t::Meta.Interval)
+    o = FB.offset(t, 4)
+    return o == 0 ? Int16(0) : FB.get(t, o + FB.pos(t), Int16)
+end
+
+"""
+Map one metadata type to a Core descriptor, with the built child Fields in
+hand — Union is the one type whose descriptor (mode + type ids) spans the
+type table AND the children vector, so it cannot go through `coretype`.
+"""
+function _coremetatype(mt, children::Vector{Field})::ArrowType
+    mt isa Meta.Union || return coretype(mt)
+    mode = mt.mode == Meta.UnionMode.Dense ? AC.DenseMode : AC.SparseMode
+    ids = mt.typeIds
+    ids === nothing &&
+        return UnionType(mode, Int8[Int8(i) for i = 0:(length(children) - 1)])
+    all(x -> 0 <= x <= 127, ids) ||
+        throw(ValidationError("union type ids must be in [0, 127]"))
+    return UnionType(mode, Int8[Int8(x) for x in ids])
 end
 
 timeunit(u) = u == Meta.TimeUnit.SECOND ? AC.SECOND :
@@ -636,7 +664,7 @@ function corefield(f::Meta.Field, dictids::Dict{Int64,Meta.Field},
     fielddictids::IdDict{Field,Int64})
     children = Field[corefield(c, dictids, fielddictids)
                      for c in something(f.children, Meta.Field[])]
-    t = coretype(f.type)
+    t = _coremetatype(f.type, children)
     if f.dictionary === nothing
         return Field(String(something(f.name, "")), t, f.nullable,
             coremetadata(f.custom_metadata), children)
