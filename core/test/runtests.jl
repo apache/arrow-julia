@@ -139,6 +139,36 @@ end
         @test calls[] == 1
     end
 
+    @testset "guard and close claims are interruption-atomic" begin
+        bytes = UInt8[0]
+        calls = Ref(0)
+        r = GC.@preserve bytes AC.OwnerRegion(
+            Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
+            root=bytes, releasefn=_ -> (calls[] += 1))
+
+        @test_throws InterruptException AC._acquireguard!(r,
+            () -> throw(InterruptException()))
+        @test (@atomic r.guards) == 0
+        @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
+
+        @test_throws InterruptException AC._withguard(() -> nothing, r,
+            () -> throw(InterruptException()))
+        @test (@atomic r.guards) == 0
+
+        @test_throws InterruptException AC._forceclose!(r, 1000, yield;
+            after_claim=() -> throw(InterruptException()))
+        @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
+        @test calls[] == 0
+
+        @test_throws InterruptException AC._forceclose!(r, 1000, yield;
+            before_release=() -> throw(InterruptException()))
+        @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
+        @test calls[] == 0
+        @test forceclose!(r)
+        @test calls[] == 1
+        @test (@atomic r.guards) == 0
+    end
+
     @testset "guard acquired after close fails" begin
         r = heapregion(zeros(UInt8, 8))
         @test forceclose!(r)

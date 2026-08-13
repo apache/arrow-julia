@@ -216,7 +216,7 @@ count is incremented BEFORE the state check. A closer that CASes to
 closer got there first, our post-increment state check sees `closing` and we
 back out. Either way no dereference overlaps a release.
 """
-@inline function _acquireguard!(r::OwnerRegion)
+@inline function _acquireguard!(r::OwnerRegion, after_increment=nothing)
     r = _lifecycle(r)
     # Both sides of this handshake are sequentially consistent on purpose:
     # guard-increment/state-load here race against state-CAS/guards-load in
@@ -224,11 +224,17 @@ back out. Either way no dereference overlaps a release.
     # pattern where acquire/release alone permits both sides to read stale
     # values (closer sees guards==0 while we see state==open). seq_cst RMWs
     # restore a single total order; the release decrement can stay cheaper.
-    @atomic r.guards += 1
-    st = @atomic r.state
-    if phase(st) != PHASE_OPEN
-        @atomic :acquire_release r.guards -= 1
-        throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
+    acquired = false
+    try
+        @atomic r.guards += 1
+        acquired = true
+        after_increment === nothing || after_increment()
+        st = @atomic r.state
+        phase(st) == PHASE_OPEN ||
+            throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
+    catch
+        acquired && (@atomic :acquire_release r.guards -= 1)
+        rethrow()
     end
     return nothing
 end
@@ -239,12 +245,19 @@ end
     return nothing
 end
 
-@inline function withguard(f, r::OwnerRegion)
-    _acquireguard!(r)
-    try
-        return f()
-    finally
-        _releaseguard!(r)
+@inline withguard(f, r::OwnerRegion) = _withguard(f, r)
+
+@inline function _withguard(f, r::OwnerRegion, after_acquire=nothing)
+    # Defer SIGINT across the increment -> cleanup-handler handoff. User work
+    # explicitly re-enables it after the finally block owns the guard.
+    return Base.disable_sigint() do
+        _acquireguard!(r)
+        try
+            after_acquire === nothing || after_acquire()
+            return Base.reenable_sigint(f)
+        finally
+            _releaseguard!(r)
+        end
     end
 end
 
@@ -261,7 +274,8 @@ function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
     return _forceclose!(r, timeout_ms, yield)
 end
 
-function _forceclose!(r::OwnerRegion, timeout_ms::Integer, waitfn)
+function _forceclose!(r::OwnerRegion, timeout_ms::Integer, waitfn;
+    after_claim=nothing, before_release=nothing)
     r = _lifecycle(r)
     timeout_ms >= 0 || throw(ArgumentError("timeout_ms must be non-negative"))
     timeout_ms <= typemax(UInt64) ÷ 1_000_000 ||
@@ -270,54 +284,65 @@ function _forceclose!(r::OwnerRegion, timeout_ms::Integer, waitfn)
     timeout_ns = UInt64(timeout_ms) * 1_000_000
     st = UInt64(0)
     closing = UInt64(0)
-    while true
-        st = @atomic :acquire r.state
-        phase(st) == PHASE_CLOSED && return true
-        if phase(st) == PHASE_CLOSING
-            # Another closer is the sole callback owner. Wait for it to
-            # publish CLOSED (success) or restore OPEN (then retry). Never
-            # CAS closing=>closing: that would create a second winner.
-            time_ns() - started >= timeout_ns && return false
-            yield()
-            continue
-        end
-        closing = (generation(st) << 2) | PHASE_CLOSING
-        # Close is cold-path: default (sequentially consistent) ordering. (A
-        # single non-seqcst ordering is rejected here because it must double
-        # as the CAS failure ordering.)
-        old, ok = @atomicreplace r.state st => closing
-        ok && break
-    end
-    # Wait for in-flight guards. Guards are short-lived by contract, so this
-    # terminates quickly; the timeout is a safety valve, not a normal path.
+    claimed = false
+    release_started = false
     try
-        while (@atomic r.guards) != 0   # seq_cst: pairs with withguard's increment
-            if time_ns() - started >= timeout_ns
-                # Restore only our exact closing state. This remains robust to
-                # explicit `finalize(r)` and future lifecycle transitions.
-                @atomicreplace r.state closing => st
-                return false
+        # The close claim, its rollback ownership, and callback commit form one
+        # task-interruption transaction. Waits re-enable SIGINT because they
+        # can be unbounded; every state handoff remains deferred.
+        return Base.disable_sigint() do
+            while true
+                st = @atomic :acquire r.state
+                phase(st) == PHASE_CLOSED && return true
+                if phase(st) == PHASE_CLOSING
+                    # Another closer is the sole callback owner. Wait for it to
+                    # publish CLOSED (success) or restore OPEN (then retry).
+                    time_ns() - started >= timeout_ns && return false
+                    Base.reenable_sigint(waitfn)
+                    continue
+                end
+                closing = (generation(st) << 2) | PHASE_CLOSING
+                # Close is cold-path: default (sequentially consistent)
+                # ordering. The local ownership marker is published while
+                # task SIGINT is deferred.
+                _, ok = @atomicreplace r.state st => closing
+                if ok
+                    claimed = true
+                    after_claim === nothing || after_claim()
+                    break
+                end
             end
-            waitfn()
+            # Wait for in-flight guards. Guards are short-lived by contract,
+            # so this normally terminates quickly; the timeout is a safety
+            # valve, not a normal path.
+            while (@atomic r.guards) != 0
+                if time_ns() - started >= timeout_ns
+                    @atomicreplace r.state closing => st
+                    claimed = false
+                    return false
+                end
+                Base.reenable_sigint(waitfn)
+            end
+            before_release === nothing || before_release()
+            release_started = true
+            f = r.releasefn
+            try
+                f === nothing || f(r)
+            finally
+                # Generic callbacks remain exactly-once even if they report an
+                # error: partially freed storage cannot safely be retried.
+                r.releasefn = nothing
+                @atomic :release r.state =
+                    ((generation(st) + 1) << 2) | PHASE_CLOSED
+            end
+            return true
         end
     catch
-        # The winning closer owns CLOSING until release starts. Task
-        # cancellation or another wait failure must return that ownership;
-        # otherwise the region is stranded closed-but-unreleased forever.
-        @atomicreplace r.state closing => st
+        # Any failure before callback entry returns the exact close claim. The
+        # callback commit above owns all failures after release starts.
+        claimed && !release_started && (@atomicreplace r.state closing => st)
         rethrow()
     end
-    f = r.releasefn
-    r.releasefn = nothing
-    try
-        f === nothing || f(r)
-    finally
-        # A release callback is exactly-once even if it reports an error.
-        # Never strand the region in `closing`, where every later close
-        # would fail without a way to recover or retry safely.
-        @atomic :release r.state = ((generation(st) + 1) << 2) | PHASE_CLOSED
-    end
-    return true
 end
 
 Base.close(r::OwnerRegion) = (forceclose!(r) ||
