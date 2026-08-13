@@ -37,6 +37,7 @@ listed under Honest status.
 | `ArrowCore.jl` | Reachability-rooted ownership regions, runtime descriptors, `Field`/`Schema`, `ArrayData`, the layout registry, staged validation, accessors, minimal builders, `RecordBatch`, and `RecordBatchSource` |
 | `test/runtests.jl` | Core layout, validation, cache, bounds, region, mmap, and concurrency tests; it also starts a four-thread stress subprocess |
 | `examples/ipc_read.jl` | Checked IPC stream framing, a bounded metadata verifier, metadata-to-Core mapping, dictionary state, and one registry-driven decoder over real 2.x-written streams |
+| `examples/ipc_write.jl` | The write half over the same registry: Core-to-metadata mapping, one generic registry-driven encoder, replacement-on-change dictionary batches, per-buffer compression, and the file format (Block index + Footer) with a lazy random-access `ArrowFile` reader |
 | `examples/cdata.jl` | C ABI definitions, zero-copy export and import, shared-tree ownership, C move semantics, and exactly-once release tests |
 | `REVIEW-codex-r1.md` through `REVIEW-codex-r12.md` | Adversarial review findings and the disposition of each item |
 
@@ -45,6 +46,7 @@ listed under Honest status.
 ```bash
 julia --startup-file=no core/test/runtests.jl
 julia --project=. --startup-file=no core/examples/ipc_read.jl   # needs the repo project (uses 2.x to write test bytes)
+julia --project=. --startup-file=no core/examples/ipc_write.jl  # needs the repo project (2.x reads this writer's bytes back)
 julia --startup-file=no core/examples/cdata.jl
 julia --startup-file=no core/test/trim_compile_tests.jl         # JuliaC --trim=safe gate (installs JuliaC on first run)
 ```
@@ -161,13 +163,36 @@ checked. The byte-wise metadata verifier does validate FlatBuffer strings.
 The framer rejects a non-little-endian host before it calls the older generated
 FlatBuffers getters, which use native-endian scalar loads.
 
-The IPC example reads one borrowed `Vector{UInt8}` and eagerly decodes all
-batches before it exposes the `RecordBatchSource` pull interface. The caller
-must not mutate or resize that vector while the stream or its batches live.
-The same immutable-borrow rule applies to Julia vectors wrapped directly by
-Core builders or `heapregion` while their `ArrayData` or cached validation
-results remain in use.
-It is not the report's incremental `IO` framer or file-footer reader. Its
+The write half (`ipc_write.jl`) covers the same mapped subset with one
+registry-driven encoder — the declared inverse of `decodefield`. It writes
+V5 stream bytes (schema, dictionary batches, record batches, end-of-stream)
+and the file format (leading/trailing magic, Block indexes, Footer), with
+per-buffer LZ4_FRAME/ZSTD compression behind the spec's Int64 prefix and the
+`-1` stored-raw fallback. Dictionary handling is replacement-on-change:
+one batch per pool snapshot, a replacement batch only when a later batch's
+pool identity differs, `Feature.DICTIONARY_REPLACEMENT` declared in that
+case (and `COMPRESSED_BODY` when compressing). Every column is semantically
+validated before its bytes are emitted. The writer is eager and sequential —
+it assembles byte vectors and copies buffer contents into message bodies;
+the report's parallel encode pipeline with byte-credit accounting, its
+incremental `IO` sink tiers, and append-as-resume remain production work.
+Arrays with a nonzero element offset are refused (materialize first), each
+field gets its own dictionary id (identity-shared pools re-encode per
+field), and the file format refuses pools that change identity across
+batches (one dictionary batch per id). `readfile` verifies both magics, the
+footer, and every Block's extents before use; `ArrowFile` decodes record
+batches lazily by footer index — each `getindex` runs with a fresh
+allocation budget and codec contexts over the shared, eagerly-decoded
+dictionary set, so concurrent reads need no coordination. An `mmapregion`
+input exercises the same path over a mapped file.
+
+The IPC read example reads one borrowed `Vector{UInt8}` and eagerly decodes
+all batches before it exposes the `RecordBatchSource` pull interface. The
+caller must not mutate or resize that vector while the stream or its batches
+live. The same immutable-borrow rule applies to Julia vectors wrapped
+directly by Core builders or `heapregion` while their `ArrayData` or cached
+validation results remain in use.
+It is not the report's incremental `IO` framer. Its
 byte-wise verifier is a local bridge around the repository's older generated
 bindings. Production work must regenerate the bindings from the pinned
 schema and use a generated verifier; the report explicitly rejects a custom
@@ -206,9 +231,9 @@ foreign-thread trampoline from §9 is not implemented. `reap!` performs an
 explicit registry scan; there is no background reaper. Schema and array trees
 have independent aggregate lifetimes and per-node control blocks.
 
-Other exclusions are unchanged: no IPC file footer/index, writer coordinator,
-facade, `ViewPlan`, typed views, ArrowTypes integration,
-C stream interface, or builders beyond test support. `mmapregion` maps via
+Other exclusions are unchanged: no parallel writer coordinator or byte-credit
+pipeline, append-as-resume, facade, `ViewPlan`, typed views, ArrowTypes
+integration, C stream interface, or builders beyond test support. `mmapregion` maps via
 the Mmap STDLIB (cross-platform) and keeps the mapped array as the region's
 `root`; the stdlib finalizer unmaps when that root becomes unreachable (see
 "Memory model"). The mapped array is an internal anchor: resizing it through
@@ -277,9 +302,13 @@ region lifecycle to synchronize. The adapters add one pull-claim flag on
 
 ## Compression
 
-The IPC example implements spec buffer compression for **LZ4_FRAME and
-ZSTD**. Each reader lazily creates raw native codec contexts and closes them
-on every `readstream` exit path; there are no global pools. The adapter checks
+The IPC examples implement spec buffer compression for **LZ4_FRAME and
+ZSTD**, both directions. Each reader lazily creates raw native codec contexts
+and closes them on every `readstream` exit path; each writer owns one lazily
+initialized compressor object per codec and finalizes it on every writer exit
+path; there are no global pools. The write side emits the Int64
+uncompressed-length prefix per buffer and stores incompressible payloads raw
+behind the `-1` sentinel. The adapter checks
 the per-buffer Int64 uncompressed-length prefix and the `-1` stored-raw
 sentinel. A zero-byte wire buffer may omit the prefix. A nonzero compressed
 buffer, including declared length zero, must contain a valid frame.
