@@ -911,14 +911,15 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
         # This is the only output allocation. Its size was checked and
         # charged before either native decoder sees the input frame.
         out = Vector{UInt8}(undef, Int(declared))
-        AC.withguard(wire.region::OwnerRegion) do
-            GC.@preserve out begin
-                src = AC.sliceptr(wire) + 8
-                if c.codec == CODEC_LZ4_FRAME
-                    _decode_lz4!(state, src, payloadlen, out, declared)
-                else
-                    _decode_zstd!(state, src, payloadlen, out, declared)
-                end
+        # The native decoders read through a raw pointer, so the wire
+        # region's root must stay reachable for the whole call (Core rule 2).
+        wireregion = wire.region::OwnerRegion
+        GC.@preserve out wireregion begin
+            src = AC.sliceptr(wire) + 8
+            if c.codec == CODEC_LZ4_FRAME
+                _decode_lz4!(state, src, payloadlen, out, declared)
+            else
+                _decode_zstd!(state, src, payloadlen, out, declared)
             end
         end
         result = BufferSlice(heapregion(out), 0, declared)

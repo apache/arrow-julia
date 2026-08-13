@@ -26,279 +26,48 @@ struct ManagedLoad
     value::Any
 end
 
-function _nonconforming_c_release(::Ptr{Cvoid})::Cvoid
-    return nothing
-end
-const NONCONFORMING_C_RELEASE =
-    @cfunction(_nonconforming_c_release, Cvoid, (Ptr{Cvoid},))
-
-function _exercise_mapped_region(path::String)
-    r = mmapregion(path)
-    @test r.kind == AC.Mapped
-    @test r.root isa AbstractMatrix{UInt8}
-    @test size(r.root) == (8, 1)
-    @test_throws MethodError resize!(r.root, 10)
-    anchor = WeakRef(r.root)
-    mapping = WeakRef(parent(r.root))
-    mappedptr = r.ptr
-    GC.gc(true)
-    @test anchor.value !== nothing
-    @test pointer(anchor.value) == mappedptr
-    b = BufferSlice(r, 0, 8)
-    @test AC.loadat(b, UInt8, Int64(0)) == 0x11
-    @test AC.loadat(b, UInt32, Int64(4)) == 0x88776655
-    # The exposed root is a non-owning view. Manual finalization must not run
-    # the stdlib mapping finalizer while the region is still open.
-    finalize(r.root)
-    GC.gc(true)
-    @test AC.loadat(b, UInt8, Int64(0)) == 0x11
-    @test forceclose!(r)
-    @test r.root === nothing
-    @test_throws InvalidatedError AC.loadat(b, UInt8, Int64(0))
-    @test forceclose!(r) # idempotent
-    return anchor, mapping
-end
-
-
 @testset "ArrowCore" begin
 
-@testset "OwnerRegion lifecycle" begin
+@testset "OwnerRegion: reachability-based validity" begin
     @testset "heap wrap is zero-copy and rooted" begin
         v = Int64[1, 2, 3, 4]
         r = heapregion(v)
         @test r.len == 32
-        @test r.kind == AC.Heap
+        @test r.root === v
         b = BufferSlice(r, 0, 32)
         @test AC.loadat(b, Int64, Int64(0)) == 1
         @test AC.loadat(b, Int64, Int64(24)) == 4
-        @test_throws ErrorException setproperty!(r, :ptr, Ptr{UInt8}(0))
+        # Regions are immutable values: nothing to close, nothing to race.
         @test_throws ErrorException setproperty!(r, :root, nothing)
-        @test_throws ErrorException setproperty!(r, :state, AC.PHASE_CLOSED)
-        @test_throws ErrorException setproperty!(r, :guards, 0)
     end
 
-    @testset "mapped region: stable root, close, and invalidation" begin
+    @testset "construction validation" begin
+        @test_throws ArgumentError AC.OwnerRegion(Ptr{UInt8}(0), 1)
+        @test_throws ArgumentError AC.OwnerRegion(Ptr{UInt8}(8), -1)
+        # extents that would wrap native pointer arithmetic are rejected
+        @test_throws ArgumentError AC.OwnerRegion(
+            Ptr{UInt8}(typemax(UInt) - 8), 64; root=nothing)
+        @test_throws ArgumentError heapregion(["not", "isbits"])
+    end
+
+    @testset "mapped region: stdlib-backed, reachability-valid" begin
         path = tempname()
         write(path, UInt8[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
-        anchor, mapping = _exercise_mapped_region(path)
-        GC.gc(true)
-        GC.gc(true)
-        @test anchor.value === nothing
-        @test mapping.value === nothing
-        # The stdlib mapping is now finalized, so this is also valid on
-        # platforms that forbid deleting an actively mapped file.
-        rm(path)
+        r = mmapregion(path)
+        @test r.root isa Vector{UInt8}
+        b = BufferSlice(r, 0, 8)
+        @test AC.loadat(b, UInt8, Int64(0)) == 0x11
+        @test AC.loadat(b, UInt32, Int64(4)) == 0x88776655
+        # The mapping stays valid for as long as any slice can reach it —
+        # even under GC pressure with no other references.
+        GC.gc()
+        @test AC.loadat(b, UInt8, Int64(7)) == 0x88
         emptypath = tempname()
         touch(emptypath)
-        @test_throws ArgumentError mmapregion(emptypath)   # empty file
+        @test_throws ArgumentError mmapregion(emptypath)
         rm(emptypath)
-        @test_throws SystemError mmapregion(tempname())    # missing file
-    end
-
-    @testset "forceclose! waits for guards; timeout restores open" begin
-        v = zeros(UInt8, 64)
-        r = heapregion(v)
-        entered = Base.Event()
-        release = Base.Event()
-        t = Threads.@spawn withguard(r) do
-            notify(entered)
-            wait(release)
-            42
-        end
-        wait(entered)
-        # a guard is held: a short-timeout close must fail AND restore open
-        @test forceclose!(r; timeout_ms=50) == false
-        @test AC.regionphase(r) == AC.PHASE_OPEN
-        # region still fully usable after the busy close
-        @test withguard(() -> 1, r) == 1
-        notify(release)
-        @test fetch(t) == 42
-        @test forceclose!(r)
-        @test_throws InvalidatedError withguard(() -> 1, r)
-    end
-
-    @testset "wait errors restore a claimed close" begin
-        bytes = UInt8[0]
-        calls = AC.ReleaseCounter()
-        r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1,
-            AC.Foreign; root=bytes, releasefn=AC.NotifyRelease(calls))
-        AC._acquireguard!(r)
-        closer = Threads.@spawn forceclose!(r; timeout_ms=10_000)
-        while AC.regionphase(r) != AC.PHASE_CLOSING
-            yield()
-        end
-        lock(r.cond)
-        try
-            # Model the last guard draining, then inject an ordinary wait
-            # failure. Rollback must use claim progress, not guard count.
-            setfield!(r, :guards, 0)
-            notify(r.cond, ErrorException("injected wait failure");
-                all=true, error=true)
-        finally
-            unlock(r.cond)
-        end
-        @test_throws TaskFailedException fetch(closer)
-        @test AC.regionphase(r) == AC.PHASE_OPEN
-        @test AC.guardcount(r) == 0
-        @test calls[] == 0
-        @test forceclose!(r; timeout_ms=0)
-        @test calls[] == 1
-    end
-
-    @testset "deadline arithmetic wraps safely" begin
-        started = typemax(UInt64) - UInt64(5)
-        @test AC._elapsed_ns(started, UInt64(3)) == UInt64(9)
-        @test !AC._expired(started, UInt64(10), UInt64(3))
-        @test AC._remaining_ns(started, UInt64(10), UInt64(3)) == UInt64(1)
-        @test AC._expired(started, UInt64(9), UInt64(3))
-        @test AC._remaining_ns(started, UInt64(9), UInt64(3)) == UInt64(0)
-    end
-
-    @testset "guard acquired after close fails" begin
-        r = heapregion(zeros(UInt8, 8))
-        @test forceclose!(r)
-        @test_throws InvalidatedError withguard(() -> 1, r)
-        @test AC.guardcount(r) == 0   # failed acquire backed out its count
-    end
-
-    @testset "Base.close is idempotent and releases once" begin
-        bytes = UInt8[0]
-        calls = AC.ReleaseCounter()
-        r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1,
-            AC.Foreign; root=bytes, releasefn=AC.NotifyRelease(calls))
-        @test close(r) === nothing
-        @test AC.regionphase(r) == AC.PHASE_CLOSED
-        @test calls[] == 1
-        @test close(r) === nothing
-        @test calls[] == 1
-    end
-
-    @testset "invalid construction and release errors stay closed" begin
-        @test_throws ArgumentError AC.OwnerRegion(Ptr{UInt8}(0), 1, AC.Foreign)
-        @test_throws ArgumentError forceclose!(heapregion(UInt8[0]); timeout_ms=-1)
-        calls = AC.ReleaseCounter()
-        bytes = UInt8[0]
-        r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=AC.NotifyRelease(calls; fail=true))
-        @test_throws ErrorException forceclose!(r)
-        @test calls[] == 1
-        @test AC.regionphase(r) == AC.PHASE_CLOSED
-        @test forceclose!(r)
-        @test calls[] == 1
-
-        # Initial finalizer registration owns the rollback path. A plain
-        # registration error must synchronously release the new region.
-        registration_calls = AC.ReleaseCounter()
-        unarmed = AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0, AC.Foreign)
-        setfield!(unarmed, :releasefn, AC.NotifyRelease(registration_calls))
-        @test_throws ArgumentError AC._register_initial_region_finalizer!(
-            unarmed, Ptr{Cvoid}(C_NULL))
-        @test registration_calls[] == 1
-        @test unarmed.releasefn === nothing
-        @test AC.regionphase(unarmed) == AC.PHASE_CLOSED
-        @test forceclose!(unarmed)
-        @test registration_calls[] == 1
-
-        # C-call wrapper storage is deallocated even when the producer
-        # callback returns without setting release=NULL.
-        block = Libc.malloc(sizeof(Ptr{Cvoid}))
-        block == C_NULL && throw(OutOfMemoryError())
-        freed = Ptr{Cvoid}[]
-        try
-            unsafe_store!(Ptr{Ptr{Cvoid}}(block), NONCONFORMING_C_RELEASE)
-            action = CcallRelease(NONCONFORMING_C_RELEASE, block;
-                freearg=true, verify_null_at=0)
-            observer = p -> (push!(freed, p); nothing)
-            @test_throws ErrorException AC._run_ccall_release!(action, observer)
-            @test freed == Ptr{Cvoid}[block]
-        finally
-            Libc.free(block)
-        end
-
-        ccall_notes = AC.ReleaseCounter()
-        ownedblock = Libc.malloc(sizeof(Ptr{Cvoid}))
-        ownedblock == C_NULL && throw(OutOfMemoryError())
-        unsafe_store!(Ptr{Ptr{Cvoid}}(ownedblock), NONCONFORMING_C_RELEASE)
-        badrelease = AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0, AC.Foreign;
-            releasefn=CcallRelease(NONCONFORMING_C_RELEASE, ownedblock;
-                freearg=true, note=ccall_notes, verify_null_at=0))
-        @test_throws ErrorException forceclose!(badrelease)
-        @test ccall_notes[] == 1
-        @test AC.regionphase(badrelease) == AC.PHASE_CLOSED
-        @test forceclose!(badrelease)
-        @test ccall_notes[] == 1
-
-        # The Ptr{Cvoid} finalizer boundary intentionally swallows a release
-        # error. Its state-machine finally still commits CLOSED exactly once.
-        finalizer_calls = AC.ReleaseCounter()
-        finalized = AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0, AC.Foreign;
-            releasefn=AC.NotifyRelease(finalizer_calls; fail=true))
-        @test finalize(finalized) === nothing
-        @test finalizer_calls[] == 1
-        @test AC.regionphase(finalized) == AC.PHASE_CLOSED
-        @test forceclose!(finalized)
-        @test finalizer_calls[] == 1
-    end
-
-
-    @testset "one closer owns the release callback" begin
-        bytes = UInt8[0]
-        entered = Base.Event()
-        finish = Base.Event()
-        calls = AC.ReleaseCounter()
-        r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes,
-            releasefn=AC.RendezvousRelease(entered, finish; note=calls))
-        first = Threads.@spawn forceclose!(r)
-        wait(entered)
-        @test forceclose!(r; timeout_ms=0) == false
-        @test AC.regionphase(r) == AC.PHASE_CLOSING
-        waiter = Threads.@spawn forceclose!(r)
-        notify(finish)
-        @test fetch(first)
-        @test fetch(waiter)
-        @test calls[] == 1
-        @test AC.regionphase(r) == AC.PHASE_CLOSED
-    end
-
-    @testset "manual finalization honors an active guard" begin
-        bytes = UInt8[0]
-        calls = AC.ReleaseCounter()
-        r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=AC.NotifyRelease(calls))
-        withguard(r) do
-            finalize(r)
-            @test calls[] == 0
-            @test AC.regionphase(r) == AC.PHASE_OPEN
-        end
-        finalize(r)
-        @test calls[] == 1
-        @test AC.regionphase(r) == AC.PHASE_CLOSED
-    end
-
-    @testset "delegated lifecycles share one root gate" begin
-        bytes = UInt8[0]
-        calls = AC.ReleaseCounter()
-        gate = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1,
-            AC.Foreign; root=bytes, releasefn=AC.NotifyRelease(calls))
-        child = AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, lifecycle=gate)
-        grandchild = AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, lifecycle=child)
-
-        @test grandchild.lifecycle === gate
-        withguard(grandchild) do
-            @test AC.guardcount(child) == 1
-            @test AC.guardcount(grandchild) == 1
-            @test !forceclose!(gate; timeout_ms=0)
-            @test calls[] == 0
-            @test AC.regionphase(gate) == AC.PHASE_OPEN
-        end
-        @test forceclose!(gate; timeout_ms=0)
-        @test calls[] == 1
-        @test AC.regionphase(child) == AC.PHASE_CLOSED
-        @test AC.regionphase(grandchild) == AC.PHASE_CLOSED
-        @test_throws InvalidatedError withguard(() -> nothing, grandchild)
+        @test_throws SystemError mmapregion(tempname())
+        rm(path)
     end
 end
 
@@ -319,7 +88,7 @@ end
     @test_throws BoundsError AC.loadat(b, UInt8, Int64(8))
     @test_throws BoundsError AC.loadat(b, UInt8, typemax(Int64))
     @test_throws ArgumentError OwnerRegion(
-        Ptr{UInt8}(typemax(UInt)), 2, AC.Foreign)
+        Ptr{UInt8}(typemax(UInt)), 2)
     # empty buffer
     e = BufferSlice()
     @test length(e) == 0

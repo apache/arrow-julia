@@ -32,18 +32,13 @@ Design rules this module is built to demonstrate:
    None parameterize the Core storage types. Struct materialization always
    returns `Vector{Pair{String,Any}}`; a typed facade remains separate work.
 
-2. Ownership is an object, not a convention. Every buffer is a `BufferSlice`
-   into an `OwnerRegion` that knows its extent, its alignment, and how to
-   release itself. Slices are bounds-checked against the region at
-   construction. Owned and verified IPC regions therefore reject corrupt
-   metadata before access. Foreign C-data extents remain a documented,
-   trusted declaration because that ABI supplies no allocation sizes. Views
-   hold GC *reachability* of the region; every
-   pointer dereference additionally takes a short-lived access *guard*, so a
-   deterministic `forceclose!` can wait out in-flight access and invalidate
-   all views. It then runs an owned release action or drops a GC anchor. An
-   escaped view can delay a forced close only for the duration of a guard,
-   never forever. Mmap stdlib storage is unmapped later by its GC finalizer.
+2. Memory validity is GC reachability. Every buffer is a `BufferSlice`
+   into an `OwnerRegion` — an immutable (pointer, length, root) triple whose
+   `root` anchors the backing storage. Slices are bounds-checked against the
+   region at construction, so corrupt metadata produces an error at open,
+   never a segfault at access; loads are a final bounds check plus a raw
+   load, with no per-access synchronization. Deterministic eager release is
+   deliberately constrained out of this core (see §1). Mmap stdlib storage is unmapped later by its GC finalizer.
 
 3. One structural layout registry. `layoutspec(type)` returns the buffer
    roles / child arity / offset width for each of the format-1.5 layouts.
@@ -89,9 +84,8 @@ const checked_add = Checked.checked_add
 const checked_sub = Checked.checked_sub
 const checked_mul = Checked.checked_mul
 
-export OwnerRegion, BufferSlice, MemoryKind, InvalidatedError, forceclose!,
-    heapregion, mmapregion, foreignregion, withguard,
-    ReleaseAction, CcallRelease,
+export OwnerRegion, BufferSlice, heapregion, mmapregion,
+    ReleaseCounter, increment!,
     ArrowType, NullType, BoolType, IntType, FloatType, DecimalType,
     FixedSizeBinaryType, BinaryType, Utf8Type, DateType, TimeType,
     TimestampType, DurationType, IntervalType, ListType, FixedSizeListType,
@@ -104,52 +98,50 @@ export OwnerRegion, BufferSlice, MemoryKind, InvalidatedError, forceclose!,
     fromjulia, batch
 
 # ---------------------------------------------------------------------------
-# §1 Memory: OwnerRegion + BufferSlice + access guards
+# §1 Memory: regions as GC anchors (constrained model)
 # ---------------------------------------------------------------------------
-
-@enum MemoryKind::UInt8 Heap Mapped Foreign IPCBlob
-
-"Thrown when a view is used after its region was force-closed."
-struct InvalidatedError <: Exception
-    msg::String
-end
-
-# Region lifecycle state: a plain Int guarded by the region's condition
-# lock. 0=open, 1=closing, 2=closed. No atomics, no generation packing —
-# every transition and every guard-count change happens under one
-# `Threads.Condition`, and waiters use wait/notify instead of yield spins.
-const PHASE_OPEN = 0
-const PHASE_CLOSING = 1
-const PHASE_CLOSED = 2
-
-# ---------------------------------------------------------------------------
-# Release actions: a CLOSED, concrete set instead of an `Any` callback.
 #
-# Trim-compile support (JuliaC `--trim=safe`) forbids reachable dynamic
-# dispatch, and an `Any`-typed release callback is exactly that. The insight
-# that makes this a design improvement rather than a workaround: release
-# behavior that needs an action in the real system IS a closed set — one C
-# callback for foreign/C-data trees, plus the notify/rendezvous observers the
-# lifecycle tests need. Heap and mapped storage are GC-owned and use no
-# action. Encoding the active cases as data on one concrete struct keeps
-# `_run_release!` fully static, makes release behavior serializable/inspectable,
-# and removes a whole class of "arbitrary code inside the lifecycle state
-# machine" hazards.
-# ---------------------------------------------------------------------------
+# DESIGN DECISION (maintainer review, 2026-08-13): buffer validity is
+# GC REACHABILITY — Julia's native memory-safety contract — and nothing else.
+# A region is an immutable (pointer, length, root) triple: the `root` is
+# whatever keeps the memory alive (the wrapped Julia array, the Mmap-stdlib
+# array whose own finalizer unmaps at collection, a C-data adapter's owner
+# object whose finalizer calls the producer's release). Views hold their
+# region; the region holds its root; therefore memory a view can reach is
+# memory that is valid.
+#
+# The earlier prove-out iterations carried a full lifecycle state machine
+# (guards, phases, deterministic forceclose!, release actions, per-kind
+# machinery). Review concluded it was a ton of complexity for unproven
+# use-cases: the guard/invalidate system existed to make OUR OWN optional
+# eager-release feature safe, while the failures that actually occur in the
+# wild (a mapped file truncated or rewritten externally) were never
+# preventable by any in-process state machine. Constraining eager release
+# out of scope deletes the machinery wholesale and makes every buffer load
+# a bounds check plus a raw load — no per-access synchronization.
+#
+# What this deliberately gives up, so the constraint is informed:
+#   * Eager, deterministic unmap (e.g. delete-a-mapped-file-now on Windows):
+#     unmapping happens when the GC collects the mapping. Revisit if real
+#     demand appears, likely as an opt-in layer once upstream offers a
+#     public API.
+#   * A guard/invalidate error for use-after-release: with no eager release
+#     in Core there is nothing to use-after. The C-data adapter's explicit
+#     `release!` is caller-contract (post-release access is undefined) —
+#     which is the C data interface spec's own rule for released structures.
+#   * External-truncation protection: never existed anywhere; a shared
+#     mapping's pages can vanish under any implementation. Same exposure as
+#     every mmap-based reader.
 
-# Atomic observation-counter helper. The region lifecycle itself uses plain
-# fields under its condition lock. `Threads.Atomic` boxes appear nowhere.
-
-"An exactly-once/observation counter with a single atomic field."
+"An atomic counter (observation/exactly-once bookkeeping for adapters and tests)."
 mutable struct ReleaseCounter
     @atomic n::Int
 end
 ReleaseCounter() = ReleaseCounter(0)
 Base.getindex(c::ReleaseCounter) = @atomic c.n
 # CAS loop rather than `@atomic c.n += 1`: the atomic read-modify-write
-# builtin (`Core.modifyfield!`) is not yet implemented in JuliaC's trim
-# verifier, while compare-and-swap (`replacefield!`) is. Contention on these
-# counters is negligible, so the loop costs nothing in practice.
+# builtin is not yet implemented in JuliaC's trim verifier, while
+# compare-and-swap is; contention here is negligible.
 function increment!(c::ReleaseCounter)
     while true
         old = @atomic c.n
@@ -158,105 +150,28 @@ function increment!(c::ReleaseCounter)
     end
 end
 
-@enum ReleaseKind::UInt8 RELEASE_CCALL RELEASE_NOTIFY RELEASE_RENDEZVOUS
-
-"""
-    ReleaseAction
-
-The concrete description of what releasing a region's memory means. Built
-via [`CcallRelease`](@ref), [`NotifyRelease`](@ref) or
-[`RendezvousRelease`](@ref); executed exactly once by the lifecycle state
-machine via `_run_release!`. `note` (any kind) is bumped on entry so tests
-and metrics can observe exactly-once without injecting code.
-"""
-struct ReleaseAction
-    kind::ReleaseKind
-    cb::Ptr{Cvoid}                            # RELEASE_CCALL: void (*)(void*)
-    arg::Ptr{Cvoid}                           # RELEASE_CCALL: callback argument
-    freearg::Bool                             # RELEASE_CCALL: Libc.free(arg) after
-    note::Union{Nothing,ReleaseCounter}
-    fail::Bool                                # RELEASE_NOTIFY: throw after noting
-    entered::Union{Nothing,Base.Event}        # RELEASE_RENDEZVOUS
-    finish::Union{Nothing,Base.Event}         # RELEASE_RENDEZVOUS
-    verify_null_at::Int32   # RELEASE_CCALL: byte offset of a pointer field in
-                            # *arg that the callback must null (-1 = no check)
-end
-
-"""
-Release by calling a C function pointer with `arg` (skipped when `cb` is
-NULL — a moved/already-released source), then `Libc.free(arg)` when
-`freearg` is set. This is the C-data-interface shape: the callback is the
-producer's `release`, `arg` is a stable (malloc'd) struct address.
-"""
-CcallRelease(cb::Ptr{Cvoid}, arg::Ptr{Cvoid}; freearg::Bool=false,
-    note::Union{Nothing,ReleaseCounter}=nothing,
-    verify_null_at::Integer=-1) =
-    ReleaseAction(RELEASE_CCALL, cb, arg, freearg, note, false, nothing,
-        nothing, Int32(verify_null_at))
-
-"Observe release: bump `note`; `fail=true` then throws (error-path tests)."
-NotifyRelease(note::ReleaseCounter; fail::Bool=false) =
-    ReleaseAction(RELEASE_NOTIFY, C_NULL, C_NULL, false, note, fail, nothing,
-        nothing, Int32(-1))
-
-"Observe + block: bump `note`, notify `entered`, wait on `finish` (closer-race tests)."
-RendezvousRelease(entered::Base.Event, finish::Base.Event;
-    note::Union{Nothing,ReleaseCounter}=nothing) =
-    ReleaseAction(RELEASE_RENDEZVOUS, C_NULL, C_NULL, false, note, false,
-        entered, finish, Int32(-1))
-
-
 """
     OwnerRegion
 
-One contiguous memory region with a single owner: a heap allocation (or a
-borrowed Julia array), an mmap'd file range, a foreign (C-imported)
-allocation, or an adapter-owned IPC blob. All Arrow buffers are
-`BufferSlice`s of a region; nothing in this module holds a raw pointer
-without one.
+One contiguous memory region and the object that keeps it alive. Immutable:
+there is no lifecycle to manage — the region is valid exactly as long as it
+is reachable, because `root` anchors the backing storage (a borrowed Julia
+array, the Mmap-stdlib array, or an adapter's owner object). Slices
+bounds-check against `len` at construction, so corrupt metadata fails at
+adaptation time; loads are a final bounds check plus a raw load.
 
-Lifetime contract (report §9 "two lifetime modes"):
-
-  * Shared mode (default): views keep the region and its GC root reachable.
-    A foreign release action runs from the region finalizer when the last
-    reference dies. A mapped root uses the Mmap stdlib's own finalizer.
-  * Scoped mode: `forceclose!(region)` transitions open→closing (new guards
-    now fail), waits for in-flight guards (bounded: guards are short-lived),
-    releases, and marks the region closed. On guard-wait timeout it restores
-    `open` under the same condition lock and returns `false` — the caller
-    retries or gives up; there is no half-closed limbo.
-
-`root` is the GC anchor for borrowed or mapped memory (the wrapped Julia
-array, mapped array, or adapter byte blob). `releasefn` is executed exactly
-once for foreign memory and internal lifecycle observers; it is `nothing`
-when memory is GC-owned through `root`. Normal property assignment is
-read-only. The close protocol performs its internal field transitions under
-the condition lock.
+The scoped-borrow contract for wrapped Julia arrays: the caller must not
+mutate or resize the array while the region or any cached validation result
+remains in use. Mutation can invalidate a semantic certificate; resizing can
+reallocate the storage and invalidate its pointer.
 """
-mutable struct OwnerRegion
-    const ptr::Ptr{UInt8}
-    const len::Int64
-    const kind::MemoryKind
-    const alignment::Int    # actual alignment of ptr; slices/views consult it
-    root::Any               # GC anchor for borrowed/mapped memory; cleared on close
-    # Foreign C-data trees use one zero-length lifecycle region for every
-    # buffer allocation in the moved tree. `nothing` means this region owns
-    # its own state. A shared lifecycle makes release and invalidation one
-    # atomic tree-wide operation without conflating allocation extents.
-    const lifecycle::Union{Nothing,OwnerRegion}
-    releasefn::Union{Nothing,ReleaseAction}
-    # Lifecycle state machine: plain fields, every read and write under
-    # `cond`'s lock; state transitions notify waiters. Simpler to reason
-    # about than the previous lock-free CAS word, and the uncontended lock
-    # cost on the guard path is comparable to the seq_cst CAS pair it
-    # replaced.
-    const cond::Threads.Condition
-    state::Int
-    guards::Int
+struct OwnerRegion
+    ptr::Ptr{UInt8}
+    len::Int64
+    alignment::Int      # actual alignment of ptr; loads consult it
+    root::Any           # GC anchor; never dispatched on, only stored
 
-    function OwnerRegion(ptr::Ptr{UInt8}, len::Integer, kind::MemoryKind;
-        root=nothing, releasefn::Union{Nothing,ReleaseAction}=nothing,
-        lifecycle::Union{Nothing,OwnerRegion}=nothing)
+    function OwnerRegion(ptr::Ptr{UInt8}, len::Integer; root=nothing)
         len >= 0 || throw(ArgumentError("region length must be non-negative"))
         n = Int64(len)
         (ptr != C_NULL || n == 0) ||
@@ -269,392 +184,44 @@ mutable struct OwnerRegion
             lastaddr <= UInt128(typemax(UInt)) ||
                 throw(ArgumentError("region extent wraps the native address space"))
         end
-        lifecycle !== nothing && releasefn !== nothing &&
-            throw(ArgumentError("a shared-lifecycle region cannot own a release action"))
-        # Keep delegation one hop deep. Otherwise a region that delegates to
-        # another delegated region increments the intermediate guard count,
-        # while closing the root gate can still observe zero guards and
-        # release memory underneath that access.
-        lifecycle = lifecycle === nothing ? nothing : _lifecycle(lifecycle)
         align = ptr == C_NULL ? 64 : (1 << trailing_zeros(UInt(ptr) | UInt(64)))
-        r = new(ptr, n, kind, align, root, lifecycle,
-            releasefn, Threads.Condition(), PHASE_OPEN, 0)
-        # Shared-mode cleanup: only regions that own non-GC memory need a
-        # finalizer. A finalizer only runs when the region is unreachable, at
-        # which point no guard can exist, so releasing directly is safe.
-        if releasefn !== nothing
-            _register_initial_region_finalizer!(r)
-        end
-        return r
+        return new(ptr, n, align, root)
     end
-end
-
-@inline _lifecycle(r::OwnerRegion) = r.lifecycle === nothing ? r : r.lifecycle
-
-# `OwnerRegion` is exported, but lifecycle mutation is not public API. Keep
-# callers from dropping a live GC anchor or changing state outside `cond`.
-# Internal transitions use `setfield!` while holding the required lock.
-function Base.setproperty!(::OwnerRegion, name::Symbol, value)
-    throw(ErrorException("OwnerRegion.$name is read-only"))
-end
-
-function _run_release!(a::ReleaseAction, r::OwnerRegion)
-    n = a.note
-    n === nothing || increment!(n)
-    if a.kind == RELEASE_CCALL
-        _run_ccall_release!(a, _libc_free!)
-    elseif a.kind == RELEASE_RENDEZVOUS
-        notify(a.entered::Base.Event)
-        wait(a.finish::Base.Event)
-    elseif a.fail
-        error("release failed")
-    end
-    return nothing
-end
-
-@inline _libc_free!(p::Ptr{Cvoid}) = (Libc.free(p); nothing)
-
-function _run_ccall_release!(a::ReleaseAction, deallocate!::F) where {F}
-    try
-        if a.cb != C_NULL
-            ccall(a.cb, Cvoid, (Ptr{Cvoid},), a.arg)
-            if a.verify_null_at >= 0
-                unsafe_load(Ptr{Ptr{Cvoid}}(a.arg + a.verify_null_at)) == C_NULL ||
-                    error("C release callback did not mark the structure released")
-            end
-        end
-    finally
-        # `arg` is an adapter-owned C-struct copy. Its allocation is ours
-        # even when the producer callback fails its release=NULL contract.
-        a.freearg && a.arg != C_NULL && deallocate!(a.arg)
-    end
-    return nothing
-end
-
-function _finalize_region!(r::OwnerRegion)
-    # Natural finalization implies no live guards, but `finalize(r)` is also
-    # a public Julia operation and can be called while `r` is reachable.
-    # Use the same condition/guard protocol as explicit close. If a manual
-    # finalization finds the region busy, install the backstop again.
-    if !forceclose!(r; timeout_ms=0)
-        _register_region_finalizer!(r)
-    end
-    return
-end
-
-# Finalizers register through Base's `Ptr{Cvoid}` form: the generic
-# `finalizer(f, o)` method is `@nospecialize`d in Base, which leaves the
-# registered callable unresolvable for JuliaC trim verification, while the
-# pointer form is an ordinary typed ccall. The C entry re-enters Julia via
-# a compiled @cfunction and must never unwind into the GC's finalizer
-# runner. This prove-out intentionally drops release errors at that boundary.
-# `forceclose!` has already cleared the action and published CLOSED in its
-# `finally`, and C-call wrapper storage is freed in `_run_ccall_release!`'s
-# own `finally`, so the swallowed error cannot leave an owned resource armed.
-function _finalize_region_c(p::Ptr{Cvoid})::Cvoid
-    r = unsafe_pointer_to_objref(p)::OwnerRegion
-    try
-        _finalize_region!(r)
-    catch
-    end
-    return nothing
-end
-
-@inline function _register_region_finalizer!(r::OwnerRegion)
-    finalizer(@cfunction(_finalize_region_c, Cvoid, (Ptr{Cvoid},)), r)
-    return nothing
-end
-
-
-@inline _register_initial_region_finalizer!(r::OwnerRegion) =
-    _register_initial_region_finalizer!(r,
-        @cfunction(_finalize_region_c, Cvoid, (Ptr{Cvoid},)))
-
-function _register_initial_region_finalizer!(r::OwnerRegion, fp::Ptr{Cvoid})
-    try
-        fp == C_NULL && throw(ArgumentError("NULL region finalizer"))
-        finalizer(fp, r)
-    catch
-        # Ownership has transferred into a new, unescaped region. Restore the
-        # ordinary exception guarantee if Base rejects finalizer registration.
-        forceclose!(r; timeout_ms=0) ||
-            error("unescaped region was unexpectedly busy during cleanup")
-        rethrow()
-    end
-    return nothing
 end
 
 """
-    withguard(f, region)
-
-Run `f()` while holding an access guard on `region`. Guards are the
-short-lived permission to dereference the region's pointer; they are NOT
-view references (views only keep the region reachable). Each low-level
-pointer operation takes a guard. This prove-out's `materialize` path reuses
-scalar accessors and may take several guards per element; a future facade
-bulk kernel can deliberately amortize one guard across its work. Throws
-`InvalidatedError` if the region is closing or closed.
-
-Guard bookkeeping is a locked increment/decrement on the region's condition
-lock; `f` itself always runs OUTSIDE the lock. A closer that has set
-`closing` blocks new guards (they see the state under the same lock) and
-waits on the condition until in-flight guards drain — no ordering
-subtleties, no spinning.
-"""
-@inline function withguard(f, r::OwnerRegion)
-    r = _acquireguard!(r)
-    try
-        return f()
-    finally
-        _releaseguard!(r)
-    end
-end
-
-@inline function _acquireguard!(r::OwnerRegion)
-    r = _lifecycle(r)
-    Base.@lock r.cond begin
-        r.state == PHASE_OPEN ||
-            throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
-        setfield!(r, :guards, r.guards + 1)
-    end
-    return r
-end
-
-function _releaseguard!(r::OwnerRegion)
-    r = _lifecycle(r)
-    Base.@lock r.cond begin
-        setfield!(r, :guards, r.guards - 1)
-        r.guards == 0 && notify(r.cond; all=true)
-    end
-    return nothing
-end
-
-"Locked read of the region's lifecycle phase (test/diagnostic accessor)."
-function regionphase(r::OwnerRegion)
-    r = _lifecycle(r)
-    return Base.@lock r.cond r.state
-end
-"Locked read of the region's in-flight guard count (test/diagnostic accessor)."
-function guardcount(r::OwnerRegion)
-    r = _lifecycle(r)
-    return Base.@lock r.cond r.guards
-end
-
-# `Threads.Condition` has no timed wait; a Timer notifies the condition at
-# the deadline so waiters wake and re-check their predicate. Callers loop on
-# (predicate, deadline) after every wakeup, so spurious wakeups are benign.
-@inline _elapsed_ns(started::UInt64, now::UInt64=time_ns()) = now - started
-@inline _expired(started::UInt64, timeout_ns::UInt64,
-    now::UInt64=time_ns()) = _elapsed_ns(started, now) >= timeout_ns
-@inline _remaining_ns(started::UInt64, timeout_ns::UInt64,
-    now::UInt64=time_ns()) = begin
-    elapsed = _elapsed_ns(started, now)
-    elapsed >= timeout_ns ? UInt64(0) : timeout_ns - elapsed
-end
-
-function _wait_with_deadline(c::Threads.Condition, started::UInt64,
-    timeout_ns::UInt64)
-    remaining = _remaining_ns(started, timeout_ns)
-    remaining == 0 && return nothing
-    t = Timer(remaining / 1.0e9) do _
-        lock(c)
-        try
-            notify(c; all=true)
-        finally
-            unlock(c)
-        end
-    end
-    try
-        wait(c)
-    finally
-        # `wait(c)` returns with `c` locked. `close(::Timer)` may yield while
-        # libuv closes its handle, so never do that work under the lifecycle
-        # lock. Preserve the caller contract by reacquiring before exit.
-        unlock(c)
-        try
-            close(t)
-        finally
-            lock(c)
-        end
-    end
-    return nothing
-end
-
-"""
-    forceclose!(region; timeout_ms=1000) -> Bool
-
-Deterministically close the region (scoped mode). Returns `true` when the
-region was closed (or already closed). On guard-wait timeout, restores `open`
-and returns `false`: the region is exactly as it was and the call may simply
-be retried. After a successful close every view built on the region throws
-`InvalidatedError` on access. A mapped region drops its array anchor here;
-the Mmap stdlib performs the actual unmap later at collection.
-
-The release action runs OUTSIDE the lock (it may block, e.g. the rendezvous
-test action), with the region in `closing`: new guards and competing closers
-wait on the condition and observe the final `closed` state. The action is
-exactly-once even if it throws — the `finally` publishes `closed` and clears
-the action either way. `timeout_ms=0` never waits for guards or another
-closer: it reports busy immediately. A winning call still runs its release
-action, whose own work may block. Finalizers use zero only to avoid lifecycle
-waits.
-"""
-function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
-    r = _lifecycle(r)
-    timeout_ms >= 0 || throw(ArgumentError("timeout_ms must be non-negative"))
-    timeout_ms <= typemax(Int64) ÷ 1_000_000 ||
-        throw(ArgumentError("timeout_ms is too large"))
-    started = time_ns()
-    timeout_ns = UInt64(timeout_ms) * 1_000_000
-    lock(r.cond)
-    claimed = false
-    ready_to_release = false
-    try
-        while true
-            r.state == PHASE_CLOSED && return true
-            if r.state == PHASE_CLOSING
-                # Another closer owns the release action; wait for it to
-                # publish CLOSED (or time out reporting busy).
-                (timeout_ms == 0 || _expired(started, timeout_ns)) && return false
-                _wait_with_deadline(r.cond, started, timeout_ns)
-                continue
-            end
-            break
-        end
-        setfield!(r, :state, PHASE_CLOSING)
-        claimed = true
-        while r.guards != 0
-            if timeout_ms == 0 || _expired(started, timeout_ns)
-                setfield!(r, :state, PHASE_OPEN)
-                claimed = false
-                notify(r.cond; all=true)
-                return false
-            end
-            _wait_with_deadline(r.cond, started, timeout_ns)
-        end
-        ready_to_release = true
-    finally
-        # An unexpected error while claiming (e.g. from Timer machinery)
-        # must not strand `closing`.
-        if claimed && !ready_to_release && r.state == PHASE_CLOSING
-            setfield!(r, :state, PHASE_OPEN)
-            notify(r.cond; all=true)
-        end
-        unlock(r.cond)
-    end
-    # Guards are drained and the region is CLOSING: we exclusively own the
-    # release action. Run it unlocked so a blocking action cannot deadlock
-    # concurrent closers or acquirers (they wait on the condition).
-    f = r.releasefn
-    try
-        f === nothing || _run_release!(f, r)
-    finally
-        Base.@lock r.cond begin
-            # Exactly-once even if the action throws: partially freed
-            # storage cannot safely be retried. Never strand `closing`, and
-            # drop the GC anchor so borrowed/mapped storage (e.g. an Mmap
-            # stdlib array) can be collected promptly.
-            setfield!(r, :releasefn, nothing)
-            setfield!(r, :state, PHASE_CLOSED)
-            setfield!(r, :root, nothing)
-            notify(r.cond; all=true)
-        end
-    end
-    return true
-end
-
-Base.close(r::OwnerRegion) = (forceclose!(r) ||
-    error("region close did not complete before timeout"); nothing)
-
-# --- region constructors ----------------------------------------------------
-
-"""
-    heapregion(bytes::Vector{UInt8}) -> OwnerRegion
     heapregion(v::Vector{T}) -> OwnerRegion
 
-Borrow a Julia array as a region (zero-copy). The array is the `root`, so
-the region keeps it alive. When the region backs `ArrayData`, the caller must
-not mutate or resize the array while that data or its cached validation
-results remain in use (the scoped-borrow contract from the report). Mutation
-can invalidate a semantic certificate; resizing can also reallocate the
-storage and invalidate its pointer.
+Borrow a Julia array as a region (zero-copy). The array is the `root`.
 """
 function heapregion(v::Vector{T}) where {T}
     isbitstype(T) || throw(ArgumentError("heapregion requires an isbits element type"))
-    GC.@preserve v begin
-        return OwnerRegion(Ptr{UInt8}(pointer(v)), sizeof(v), Heap; root=v)
-    end
+    return OwnerRegion(Ptr{UInt8}(pointer(v)), sizeof(v); root=v)
 end
 
 """
     mmapregion(path) -> OwnerRegion
 
 Map a file read-only via the Mmap STDLIB (cross-platform) and wrap the
-mapped array as a region: the array is the GC anchor (`root`), and the
-stdlib's own machinery unmaps when the array is collected. `forceclose!` on
-a mapped region therefore means: invalidate every view (the safety
-property), then drop the anchor so collection — and with it the unmap — can
-happen promptly. Eager, deterministic unmapping is deliberately NOT
-attempted: the stdlib ties unmap to an internal finalizer with no public
-eager API, and reaching around it (the `finalize(arr.ref.mem)` trick some
-packages use) is version-fragile. If/when a public API lands upstream, a
-release action can restore eager unmap without changing this type's
-contract.
-
-The anchor is an intentionally fixed-size matrix view. A mapped Vector can
-be resized on Julia 1.11 and later, which detaches it from its mapped storage
-and would invalidate a cached pointer. The view has the same contiguous bytes
-but no in-place resize operation. It also keeps the stdlib-owned mapping as
-its parent, so manually finalizing the exposed root cannot finalize the
-mapping itself. Core keeps the root reachable for every open guarded access
-and checks this pointer-stability contract in tests across GC.
+mapped array as the region's `root`. The stdlib's own machinery unmaps when
+the array is collected — validity is reachability, like every other region.
 
 The caller must prevent external writes or truncation of the mapped file
 while the region or any cached validation result remains in use: a shared
 mapping cannot keep a semantic certificate valid when another process
-changes its bytes, and truncation can make an in-range load fault. On systems
-that forbid deleting a mapped file, collect the dropped mapping after close
-before deleting its path.
+changes its bytes, and truncation can make an in-range load fault.
 """
 function mmapregion(path::AbstractString)
     io = open(path, "r")
     arr = try
-        len = filesize(io)
-        len > 0 || throw(ArgumentError("cannot map empty file: $path"))
-        len <= typemax(Int) ||
-            throw(ArgumentError("mapped file is not addressable: $path"))
-        # A one-dimensional mmap is a Vector. On Julia 1.11+, resize! can
-        # detach that Vector from its mapped Memory and leave `ptr` stale.
-        # Start with a fixed-size Matrix; a Vector view may detach on resize,
-        # but cannot move this owner.
-        Mmap.mmap(io, Matrix{UInt8}, (Int(len), 1))
+        Mmap.mmap(io, Vector{UInt8})
     finally
         # The mapping outlives the descriptor.
         close(io)
     end
-    # Keep the mapping behind a fixed-size view. `finalize(root)` then affects
-    # only the view, not the stdlib object that owns the unmap finalizer.
-    root = view(arr, :, :)
-    GC.@preserve arr root begin
-        return OwnerRegion(Ptr{UInt8}(pointer(root)), length(root), Mapped;
-            root=root)
-    end
+    isempty(arr) && throw(ArgumentError("cannot map empty file: $path"))
+    return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr); root=arr)
 end
-
-"""
-    foreignregion(ptr, len, release) -> OwnerRegion
-
-Wrap memory owned by foreign code (a C-data import). `release` is invoked
-exactly once — from `forceclose!` or the finalizer — and its action calls the
-imported structure's release callback. The extent is DECLARED,
-not verified: the ABI gives us no way to prove the allocation is `len` bytes
-(report §9, C-data adapter), so slices bound accesses to the declaration and
-the trust decision is the importer's. The producer must keep the declared
-storage alive and unchanged until Core releases it; otherwise pointers or
-cached validation results can become invalid outside Core's control.
-"""
-foreignregion(ptr::Ptr{UInt8}, len::Integer, release::ReleaseAction) =
-    OwnerRegion(ptr, len, Foreign; releasefn=release)
 
 # --- BufferSlice ------------------------------------------------------------
 
@@ -699,9 +266,11 @@ function subslice(b::BufferSlice, offset::Integer, len::Integer)
 end
 
 @inline function _guarded(f, b::BufferSlice)
-    r = b.region
-    r === nothing && throw(ArgumentError("empty buffer has no data"))
-    return withguard(f, r)
+    b.region === nothing && throw(ArgumentError("empty buffer has no data"))
+    # No synchronization: the slice roots its region, the region roots the
+    # backing storage, so the pointer is valid for exactly as long as this
+    # call can exist (§1).
+    return f()
 end
 
 """

@@ -34,10 +34,10 @@ listed under Honest status.
 
 | File | Purpose |
 |---|---|
-| `ArrowCore.jl` | Ownership and access guards, runtime descriptors, `Field`/`Schema`, `ArrayData`, the layout registry, staged validation, accessors, minimal builders, `RecordBatch`, and `RecordBatchSource` |
-| `test/runtests.jl` | Core layout, validation, cache, bounds, lifecycle, mmap, and concurrency tests; it also starts a four-thread stress subprocess |
+| `ArrowCore.jl` | Reachability-rooted ownership regions, runtime descriptors, `Field`/`Schema`, `ArrayData`, the layout registry, staged validation, accessors, minimal builders, `RecordBatch`, and `RecordBatchSource` |
+| `test/runtests.jl` | Core layout, validation, cache, bounds, region, mmap, and concurrency tests; it also starts a four-thread stress subprocess |
 | `examples/ipc_read.jl` | Checked IPC stream framing, a bounded metadata verifier, metadata-to-Core mapping, dictionary state, and one registry-driven decoder over real 2.x-written streams |
-| `examples/cdata.jl` | C ABI definitions, zero-copy export and import, shared-tree ownership, C move semantics, exactly-once release, and lifecycle tests |
+| `examples/cdata.jl` | C ABI definitions, zero-copy export and import, shared-tree ownership, C move semantics, and exactly-once release tests |
 | `REVIEW-codex-r1.md` through `REVIEW-codex-r12.md` | Adversarial review findings and the disposition of each item |
 
 ## Run it
@@ -53,20 +53,54 @@ julia --startup-file=no core/test/trim_compile_tests.jl         # JuliaC --trim=
 
 | Report claim (§) | Where proven |
 |---|---|
-| Ownership as an object; bad owned/verified spans fail before access (§8.2) | `OwnerRegion`, checked `BufferSlice` construction, guarded `loadat`, and staged-validation tests. Foreign C extents remain a trusted declaration. |
-| Deterministic close (§9 Core) | `withguard` and `forceclose!` use one `Threads.Condition`. A sole closer blocks new guards, waits for active guards, restores open state on timeout, and publishes closed state after release. Finalization uses the same protocol. Mapped close invalidates views and drops the array anchor; the stdlib unmaps at collection. |
+| Ownership as an object; bad owned/verified spans fail before access (§8.2) | `OwnerRegion`, checked `BufferSlice` construction, bounds-checked `loadat`, and staged-validation tests. Foreign C extents remain a trusted declaration. |
+| Deterministic close (§9 Core) | **Revised out** — see "Memory model" below. Validity is GC reachability; there is no close operation, no guard on the load path, and no revocation state. The report's deterministic-close machinery was cut as unproven complexity by maintainer decision during this prove-out. |
 | Logical parameters are values (§8.1) | `TimestampType(unit, timezone)`, `DecimalType(precision, scale, bitwidth)`, and the other descriptors keep schema data out of Julia type parameters. |
 | One structural registry plus bounded per-layout methods (§8.4) | `layoutspec` defines buffer roles, child arity, offset width, and variadic status. Access and semantic rules remain grouped methods. |
 | Staged validation and bounded IPC metadata work (§8.5) | Structural checks are separate from semantic and full checks, and each later public stage composes the earlier stages. Data-intrinsic semantic results are cached; Field contracts run every time. The IPC framer enforces metadata, body, message, and allocation limits; the byte verifier enforces object, depth, and copy-reserve limits; and the decode cursor enforces array and buffer limits before the related work. |
 | Message body is the decode authority (§9 IPC) | Every declared batch buffer becomes a checked `subslice` of its own message body. Cursor completion and non-overlap checks reject skewed buffer tables. |
 | IPC ids remain adapter state (§9) | `corefield` records ids in identity-keyed adapter tables. `DictionaryType` holds the value type and `ArrayData.dictionary` holds the value array; neither stores an IPC id. |
-| C Data is a direct mapping over `ArrayData` (§9 C Data) | `to_c_data` and `from_c_data` use per-structure callbacks and controls, separate schema/array aggregate roots, source-region pins, transitive release, and explicit reaping. Tests cover child moves, nested moves, siblings, dictionaries, failures, and post-release access. |
+| C Data is a direct mapping over `ArrayData` (§9 C Data) | `to_c_data` and `from_c_data` use per-structure callbacks and controls, separate schema/array aggregate roots that keep sources reachable, transitive release, and explicit reaping. Tests cover child moves, nested moves, siblings, dictionaries, failures, and exactly-once release. |
 | Function-barrier bulk access (§8.9) | `materialize` enters `_materialize_loop`; scalar `getvalue` keeps runtime dispatch explicit. |
+
+## Memory model (constrained by design)
+
+Buffer validity is GC reachability, nothing more. An `OwnerRegion` is an
+immutable `(ptr, len, alignment, root)` record: `root` is an opaque GC
+anchor (the wrapped `Vector`, the Mmap-stdlib array, or an adapter's owner
+object), and holding any slice of a region keeps the backing memory alive by
+construction. Loads are a bounds check plus a raw load — no lock, no guard,
+no atomic, no state machine on the hot path.
+
+This is a deliberate revision of the report's §9 Layer 0 (maintainer
+decision, Aug 2026, during this prove-out). The earlier lifecycle machinery
+— per-load guards, `withguard`/`forceclose!`, `InvalidatedError`,
+`MemoryKind`, concrete release actions — existed to make *optional eager
+release* safe, and eager release was the only feature it protected. The
+guards could never protect against external file truncation (no userspace
+scheme can), so cutting eager release collapses the whole apparatus.
+What the constraint gives up, knowingly:
+
+- **No eager unmap.** A mapped file's unmap happens when the last region
+  becomes unreachable and the GC runs the stdlib finalizer. On Windows the
+  file cannot be deleted until then (`GC.gc()` before delete, the same rule
+  the Mmap stdlib itself documents).
+- **No revocation.** Nothing can invalidate outstanding slices; there is no
+  `InvalidatedError`. A C-data consumer that touches an imported tree after
+  explicitly releasing it gets undefined behavior — exactly the C Data
+  spec's own post-release rule, now stated instead of policed.
+- **External truncation of a mapped file remains unsupported** — as it was
+  under the guard design, which could not prevent it either.
+
+Exactly-once release survives where it belongs: in the C-data adapter's
+`ForeignOwner` (one `@atomic` flag, a finalizer, and an explicit `release!`)
+and in the export registry, which roots exported columns until the consumer
+releases them and a reap drops the root.
 
 ## Simplification shown by the prove-out
 
-- Buffer rooting, bounds, alignment, and deterministic invalidation live in
-  `OwnerRegion` and `BufferSlice`, not in every array wrapper.
+- Buffer rooting, bounds, and alignment live in `OwnerRegion` and
+  `BufferSlice`, not in every array wrapper.
 - One cursor and recursive decoder account for nodes and fixed buffers for the
   mapped IPC subset. Record and dictionary batches use the same path.
 - Runtime type mapping is separate from Julia value conversion.
@@ -175,17 +209,13 @@ have independent aggregate lifetimes and per-node control blocks.
 Other exclusions are unchanged: no IPC file footer/index, writer coordinator,
 facade, `ViewPlan`, typed views, ArrowTypes integration,
 C stream interface, or builders beyond test support. `mmapregion` maps via
-the Mmap STDLIB (cross-platform); `forceclose!` on a mapped region
-invalidates every view and drops the GC anchor, with the actual unmap
-happening when the array is collected — eager unmapping waits on a public
-stdlib API (reaching around the stdlib's internal finalizer is
-version-fragile). The anchor is a fixed-size matrix view because mapped Vectors
-can detach from their storage when resized on Julia 1.11 and later. The view
-also separates manual root finalization from the parent object that owns the
-mapping. Tests prove that its pointer stays stable across GC while open.
-External writes or truncation of a mapped file while the mapping or cached
-validation results remain in use are unsupported. On systems that prohibit
-deleting active mapped files, collection must complete after close before the
+the Mmap STDLIB (cross-platform) and keeps the mapped array as the region's
+`root`; the stdlib finalizer unmaps when that root becomes unreachable (see
+"Memory model"). The mapped array is an internal anchor: resizing it through
+`region.root` falls under the same immutable-borrow rule as any wrapped
+vector. External writes or truncation of a mapped file while the mapping or
+cached validation results remain in use are unsupported. On systems that
+prohibit deleting active mapped files, collection must complete before the
 path can be deleted.
 The ABI layout checks include 32-bit expectations, but this review executed
 them only on the available 64-bit host.
@@ -205,19 +235,18 @@ implementation:
   `typeequal`, `descriptorname`, `_validate_descriptor_of`) devirtualize
   every generic entry point. Multiple dispatch remains the per-layout
   extension surface underneath.
-- **Concrete release actions, not callbacks** (`ReleaseAction`): release
-  behavior is data; nothing in the lifecycle machine calls an `Any`.
 - **Literal load widths.** `loadat(b, T, off)` with a runtime `T::DataType`
-  builds an unresolvable guarded closure; accessors branch to literal widths
+  builds an unresolvable closure; accessors branch to literal widths
   instead (also faster).
-- **CAS for the remaining atomic counter.** JuliaC's verifier has not implemented
+- **CAS for atomic counters.** JuliaC's verifier has not implemented
   `Core.modifyfield!` (each `@atomic x.f += 1` is a verifier warning), while
-  `@atomicreplace` verifies clean, so `ReleaseCounter` uses a CAS loop. Region
-  state and guards are plain fields under one `Threads.Condition`.
-- **`Ptr{Cvoid}` finalizers.** Base's generic `finalizer(f, o)` is
-  `@nospecialize`d and unresolvable; the typed pointer form
-  (`finalizer(@cfunction(...), o)`) is an ordinary ccall. The C entry
-  swallows errors so nothing unwinds into the GC's finalizer runner.
+  `@atomicreplace` verifies clean, so `ReleaseCounter` uses a CAS loop. The
+  constrained memory model needs no other synchronization in core at all.
+- **`Ptr{Cvoid}` finalizers** (adapter guidance — core itself registers no
+  finalizer since regions are plain immutable records). Base's generic
+  `finalizer(f, o)` is `@nospecialize`d and unresolvable; the typed pointer
+  form (`finalizer(@cfunction(...), o)`) is an ordinary ccall. The C entry
+  must swallow errors so nothing unwinds into the GC's finalizer runner.
 - **Concrete containers at the boundary.** Struct scalars are
   `Vector{Pair{String,Any}}` (a NamedTuple carries names in the TYPE domain
   — intrinsically dynamic from runtime schemas, and unable to represent
@@ -237,16 +266,14 @@ Asynchronous interruption (SIGINT / `InterruptException`, task cancellation)
 is explicitly **out of contract**, matching ecosystem practice — Base itself
 does not make arbitrary code async-exception-atomic, and the earlier
 `disable_sigint`/retry scaffolding bought a property that cannot be fully
-delivered. Ordinary exception safety (error paths clean up; release is
-exactly-once, even when the release action itself throws) **is** in
-contract and tested. A formal revisit is planned when Julia 1.14's
-structured cancellation gives Base a real system to build on. Relatedly,
-`Threads.Atomic` boxes appear nowhere in `core/`; only `ReleaseCounter` keeps
-an `@atomic` struct field. The region lifecycle itself needs no atomics: its
-state and guard count are plain Ints under one `Threads.Condition`, with
-waiters using wait/notify rather than spin/yield loops. The release action
-runs outside the lock so blocking actions cannot deadlock closers or
-acquirers.
+delivered. Ordinary exception safety (error paths clean up; adapter release
+is exactly-once) **is** in contract and tested. A formal revisit is planned
+when Julia 1.14's structured cancellation gives Base a real system to build
+on. Relatedly, `Threads.Atomic` boxes appear nowhere in `core/`. Core's only
+atomics are the two validation-cache fields on `ArrayData` and the
+`ReleaseCounter` test utility; the constrained memory model has no region
+lifecycle to synchronize (the C-data adapter's `ForeignOwner` keeps one
+`@atomic` exactly-once flag).
 
 ## Compression
 
@@ -259,7 +286,8 @@ buffer, including declared length zero, must contain a valid frame.
 
 Declared sizes are bounded and charged to the shared reader budget before one
 exact-sized output vector is allocated. The codecs decode directly from the
-guarded wire slice, with no payload copy and no growable output. The LZ4 loop
+wire slice (its region rooted across the native call with `GC.@preserve`),
+with no payload copy and no growable output. The LZ4 loop
 requires one complete frame, exact input consumption, and exact output size.
 The ZSTD one-shot decode uses the same exact destination. Acceptance covers
 V5 feature handling, 2.x-written record and dictionary batches, empty and raw

@@ -37,20 +37,23 @@ function exercise_regions()::Nothing
     checked(AC.loadat(b, Int64, Int64(24)) == 4, "heap tail load failed")
     sub = AC.subslice(b, 8, 16)
     checked(AC.loadat(sub, Int64, Int64(0)) == 2, "subslice load failed")
-    notes = AC.ReleaseCounter()
+    # Validity is reachability: the region's root IS the backing vector, and
+    # holding the region is what keeps the memory alive. No lifecycle state
+    # exists to exercise.
+    checked(r.root === v, "heap region root identity failed")
     bytes = UInt8[0x7f]
-    fr = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1,
-        AC.Foreign; root=bytes, releasefn=AC.NotifyRelease(notes))
-    checked(withguard(() -> 1, fr) == 1, "guard failed")
-    checked(forceclose!(fr), "forceclose failed")
-    checked(notes[] == 1, "release action did not run exactly once")
+    fr = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1;
+        root=bytes)
+    fb = BufferSlice(fr, 0, 1)
+    checked(AC.loadat(fb, UInt8, Int64(0)) == 0x7f, "rooted raw load failed")
+    # Bounds checks are the only per-load guard in the constrained model.
     caught = false
     try
-        withguard(() -> 1, fr)
+        AC.loadat(b, Int64, Int64(32))
     catch e
-        caught = e isa InvalidatedError
+        caught = e isa BoundsError
     end
-    checked(caught, "closed region accepted a guard")
+    checked(caught, "out-of-bounds load accepted")
     return nothing
 end
 
@@ -65,14 +68,11 @@ function exercise_mmap(dir::String)::Nothing
     r = mmapregion(path)
     b = BufferSlice(r, 0, 8)
     checked(AC.loadat(b, UInt32, Int64(4)) == 0x88776655, "mmap load failed")
-    checked(forceclose!(r), "mmap close failed")
-    caught = false
-    try
-        AC.loadat(b, UInt8, Int64(0))
-    catch e
-        caught = e isa InvalidatedError
-    end
-    checked(caught, "closed mapping still readable")
+    # The Mmap-stdlib array is the root; its finalizer owns the unmap once
+    # the region becomes unreachable. Nothing to close explicitly.
+    root = r.root
+    checked(root isa Vector{UInt8} && length(root) == 8,
+        "mmap region root is not the stdlib-mapped array")
     return nothing
 end
 
@@ -157,8 +157,8 @@ function run_trim_workload()::Nothing
     mkdir(dir)
     try
         exercise_mmap(dir)
-        # `forceclose!` drops the mapped-array anchor. The stdlib owns the
-        # actual unmap at collection, so collect before deleting the file on
+        # The mapping unmaps when its region becomes unreachable and the
+        # stdlib finalizer runs. Collect before deleting the file on
         # platforms that forbid deleting an active mapping.
         GC.gc(true)
         GC.gc(true)
