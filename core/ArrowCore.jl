@@ -204,8 +204,10 @@ end
 
 Run `f()` while holding an access guard on `region`. Guards are the
 short-lived permission to dereference the region's pointer; they are NOT
-view references (views only keep the region reachable). Bulk kernels take
-one guard per call; scalar accessors take one per access. Throws
+view references (views only keep the region reachable). Each low-level
+pointer operation takes a guard. This prove-out's `materialize` path reuses
+scalar accessors and may take several guards per element; a future facade
+bulk kernel can deliberately amortize one guard across its work. Throws
 `InvalidatedError` if the region is closing or closed.
 
 The ordering that makes this race-free against `forceclose!`: the guard
