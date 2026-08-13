@@ -330,10 +330,11 @@ Base.close(r::OwnerRegion) = (forceclose!(r) ||
     heapregion(v::Vector{T}) -> OwnerRegion
 
 Borrow a Julia array as a region (zero-copy). The array is the `root`, so
-the region keeps it alive; the caller must not resize the array while the
-region is in use (the scoped-borrow contract from the report). `pointer` on
-a Vector is stable for its current allocation; a resize can reallocate,
-which is exactly why the contract forbids it.
+the region keeps it alive. When the region backs `ArrayData`, the caller must
+not mutate or resize the array while that data or its cached validation
+results remain in use (the scoped-borrow contract from the report). Mutation
+can invalidate a semantic certificate; resizing can also reallocate the
+storage and invalidate its pointer.
 """
 function heapregion(v::Vector{T}) where {T}
     isbitstype(T) || throw(ArgumentError("heapregion requires an isbits element type"))

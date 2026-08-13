@@ -126,6 +126,9 @@ FlatBuffers getters, which use native-endian scalar loads.
 The IPC example reads one borrowed `Vector{UInt8}` and eagerly decodes all
 batches before it exposes the `RecordBatchSource` pull interface. The caller
 must not mutate or resize that vector while the stream or its batches live.
+The same immutable-borrow rule applies to Julia vectors wrapped directly by
+Core builders or `heapregion` while their `ArrayData` or cached validation
+results remain in use.
 It is not the report's incremental `IO` framer or file-footer reader. Its
 byte-wise verifier is a local bridge around the repository's older generated
 bindings. Production work must regenerate the bindings from the pinned
