@@ -63,6 +63,26 @@ end
         rm(path)
     end
 
+    @testset "mmap ownership handoff cleans up construction failure" begin
+        path = tempname()
+        write(path, UInt8[0x11])
+        unmaps = Ref(0)
+        unmapper = function (p, len)
+            unmaps[] += 1
+            AC._munmap!(p, len)
+        end
+        makeowner = (args...; kwargs...) -> error("injected owner failure")
+        @test_throws ErrorException AC._mmapregion(path, makeowner;
+            unmapper=unmapper)
+        @test unmaps[] == 1
+
+        r = AC._mmapregion(path; unmapper=unmapper)
+        @test unmaps[] == 1
+        @test forceclose!(r)
+        @test unmaps[] == 2
+        rm(path)
+    end
+
     @testset "forceclose! waits for guards; timeout restores open" begin
         v = zeros(UInt8, 64)
         r = heapregion(v)

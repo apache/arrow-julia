@@ -341,7 +341,13 @@ The caller must prevent external truncation of the opened inode while the
 mapping is live; an mmap cannot be made safe against another process that
 truncates its file.
 """
-function mmapregion(path::AbstractString)
+function _munmap!(p::Ptr, len::Integer)
+    ccall(:munmap, Cint, (Ptr{Cvoid}, Csize_t), p, len)
+    return nothing
+end
+
+function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
+    unmapper=_munmap!)
     Sys.isunix() || error("mmapregion: prove-out implements POSIX only")
     open(path, "r") do io
         # Size the exact opened file descriptor. Sizing the path first lets
@@ -356,13 +362,22 @@ function mmapregion(path::AbstractString)
             (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
             C_NULL, len, 1 #= PROT_READ =#, 1 #= MAP_SHARED =#, fd, 0)
         p == Ptr{Cvoid}(-1) && Base.systemerror("mmap($path)", true)
-        release = function (r::OwnerRegion)
-            ccall(:munmap, Cint, (Ptr{Cvoid}, Csize_t), r.ptr, r.len)
-            return
+        # `mmap` has transferred ownership to us, but OwnerRegion has not yet
+        # registered its finalizer. Nothing fallible may cross that handoff
+        # without returning the mapping directly.
+        try
+            release = (r::OwnerRegion) -> unmapper(r.ptr, r.len)
+            owner = makeowner(Ptr{UInt8}(p), len, Mmap;
+                releasefn=release)::OwnerRegion
+            return owner
+        catch
+            unmapper(p, len)
+            rethrow()
         end
-        return OwnerRegion(Ptr{UInt8}(p), len, Mmap; releasefn=release)
     end
 end
+
+mmapregion(path::AbstractString) = _mmapregion(path)
 
 """
     foreignregion(ptr, len, release) -> OwnerRegion
