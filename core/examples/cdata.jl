@@ -791,12 +791,15 @@ ForeignOwner(arr::CArrowArray) = ForeignOwner(arr, finalizer)
 # and this store can throw.
 function _arm_foreign_owner!(o::ForeignOwner)
     (@atomic o.released) && error("cannot arm a released foreign owner")
-    _store_field!(o.arrayblock, :release, o.producer_release)
+    GC.@preserve o _store_field!(o.arrayblock, :release, o.producer_release)
     return nothing
 end
 
-_foreign_owner_armed(o::ForeignOwner) =
-    unsafe_load(o.arrayblock).release != C_NULL
+function _foreign_owner_armed(o::ForeignOwner)
+    GC.@preserve o begin
+        return unsafe_load(o.arrayblock).release != C_NULL
+    end
+end
 
 function _release_moved_owner!(o::ForeignOwner)
     # A failure may occur after the source move but before arming. Arm first
@@ -822,14 +825,16 @@ release!(o::ForeignOwner) = _release_foreign_owner!(o, Libc.free)
 
 function _release_foreign_owner!(o::ForeignOwner, deallocate!)
     @atomicswap(o.released = true) && return nothing
-    cb = unsafe_load(o.arrayblock).release
-    if cb != C_NULL
-        ccall(cb, Cvoid, (Ptr{CArrowArray},), o.arrayblock)
-        unsafe_load(o.arrayblock).release == C_NULL ||
-            (deallocate!(o.arrayblock);
-                error("C Data producer release did not mark the structure released"))
+    GC.@preserve o begin
+        cb = unsafe_load(o.arrayblock).release
+        if cb != C_NULL
+            ccall(cb, Cvoid, (Ptr{CArrowArray},), o.arrayblock)
+            unsafe_load(o.arrayblock).release == C_NULL ||
+                (deallocate!(o.arrayblock);
+                    error("C Data producer release did not mark the structure released"))
+        end
+        deallocate!(o.arrayblock)
     end
-    deallocate!(o.arrayblock)
     return nothing
 end
 
@@ -984,6 +989,14 @@ function _release_c_schema!(sp::Ptr{CArrowSchema}, sch::CArrowSchema)
     return nothing
 end
 
+function _release_c_array!(ap::Ptr{CArrowArray}, arr::CArrowArray)
+    arr.release == C_NULL && return nothing
+    ccall(arr.release, Cvoid, (Ptr{CArrowArray},), ap)
+    unsafe_load(ap).release == C_NULL ||
+        error("C Data producer release did not mark the structure released")
+    return nothing
+end
+
 function _import_cstring(p::Ptr{UInt8}, what::AbstractString)
     s = unsafe_string(p)
     isvalid(s) || throw(ValidationError("C Data $what is not valid UTF-8"))
@@ -1133,7 +1146,7 @@ struct CArrowArrayStream
     private_data::Ptr{Cvoid}
 end
 
-const EINVAL = Cint(22)
+const EINVAL = Cint(Base.Libc.EINVAL)
 
 mutable struct ExportedStreamState
     batchfield::Field                 # struct-typed: children are the schema
@@ -1156,26 +1169,58 @@ function _stream_state(sp::Ptr{CArrowArrayStream})
     return state, control
 end
 
-function _set_stream_error!(state::ExportedStreamState, msg::AbstractString)
-    clean = replace(msg, '\0' => ' ')
-    bytes = codeunits(clean)
-    p = Libc.malloc(length(bytes) + 1)
-    p == C_NULL && return nothing   # error reporting must not throw
-    for (i, b) in enumerate(bytes)
-        unsafe_store!(Ptr{UInt8}(p), b, i)
-    end
-    unsafe_store!(Ptr{UInt8}(p), 0x00, length(bytes) + 1)
+function _set_stream_error!(state::ExportedStreamState, msg::AbstractString,
+    allocate! = Libc.malloc, deallocate! = Libc.free)
+    # The prior pointer expires at the next stream operation even if building
+    # its replacement fails. Clear it first so malloc failure cannot report a
+    # stale error from an earlier operation.
     old = state.lasterror
-    state.lasterror = Ptr{UInt8}(p)
-    old == C_NULL || Libc.free(old)
+    state.lasterror = Ptr{UInt8}(C_NULL)
+    try
+        old == C_NULL || deallocate!(old)
+    catch
+        # Error reporting is called from C callbacks and must never throw.
+    end
+    p = Ptr{UInt8}(C_NULL)
+    try
+        clean = replace(msg, '\0' => ' ')
+        bytes = codeunits(clean)
+        n = AC.checked_add(Int64(length(bytes)), Int64(1))
+        p = Ptr{UInt8}(allocate!(n))
+        p == C_NULL && return nothing
+        for (i, b) in enumerate(bytes)
+            unsafe_store!(p, b, i)
+        end
+        unsafe_store!(p, 0x00, length(bytes) + 1)
+        state.lasterror = p
+    catch
+        try
+            p == C_NULL || deallocate!(p)
+        catch
+        end
+    end
+    return nothing
+end
+
+function _set_stream_exception!(state::ExportedStreamState, e)
+    try
+        _set_stream_error!(state, sprint(showerror, e))
+    catch
+        # `_set_stream_error!` is itself best-effort, but keep the callback
+        # boundary closed if exception rendering fails before it is called.
+        _set_stream_error!(state, "stream callback failed")
+    end
     return nothing
 end
 
 function _stream_get_schema(sp::Ptr{CArrowArrayStream},
     out::Ptr{CArrowSchema})::Cint
-    state, _ = _stream_state(sp)
-    state === nothing && return EINVAL
+    state = nothing
     try
+        sp == C_NULL && return EINVAL
+        state, _ = _stream_state(sp)
+        state === nothing && return EINVAL
+        out == C_NULL && throw(ArgumentError("ArrowSchema output pointer is NULL"))
         srel = @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
         shell = Ref{Ptr{CArrowSchema}}(C_NULL)
         _newroot(Any[state.batchfield]; result_slot=shell) do root
@@ -1187,16 +1232,19 @@ function _stream_get_schema(sp::Ptr{CArrowArrayStream},
         unsafe_store!(out, unsafe_load(shell[]))
         return Cint(0)
     catch e
-        _set_stream_error!(state, sprint(showerror, e))
+        state isa ExportedStreamState && _set_stream_exception!(state, e)
         return EINVAL
     end
 end
 
 function _stream_get_next(sp::Ptr{CArrowArrayStream},
     out::Ptr{CArrowArray})::Cint
-    state, _ = _stream_state(sp)
-    state === nothing && return EINVAL
+    state = nothing
     try
+        sp == C_NULL && return EINVAL
+        state, _ = _stream_state(sp)
+        state === nothing && return EINVAL
+        out == C_NULL && throw(ArgumentError("ArrowArray output pointer is NULL"))
         if state.nextindex > length(state.batches)
             # End of stream: a released (NULL-release) struct, per spec.
             unsafe_store!(out, CArrowArray(0, 0, 0, 0, 0,
@@ -1220,35 +1268,46 @@ function _stream_get_next(sp::Ptr{CArrowArrayStream},
         state.nextindex += 1
         return Cint(0)
     catch e
-        _set_stream_error!(state, sprint(showerror, e))
+        state isa ExportedStreamState && _set_stream_exception!(state, e)
         return EINVAL
     end
 end
 
 function _stream_get_last_error(sp::Ptr{CArrowArrayStream})::Ptr{UInt8}
-    state, _ = _stream_state(sp)
-    state === nothing && return Ptr{UInt8}(C_NULL)
-    return state.lasterror
+    try
+        sp == C_NULL && return Ptr{UInt8}(C_NULL)
+        state, _ = _stream_state(sp)
+        state === nothing && return Ptr{UInt8}(C_NULL)
+        return state.lasterror
+    catch
+        return Ptr{UInt8}(C_NULL)
+    end
 end
 
 function _stream_release(sp::Ptr{CArrowArrayStream})::Cvoid
     # Claim/commit with no error channel, like the node callbacks. Batch and
     # schema roots already handed to the consumer keep their own lifetimes.
-    lock(REGISTRY_LOCK) do
-        stream = unsafe_load(sp)
-        stream.release == C_NULL && return nothing
-        control = stream.private_data
-        control == C_NULL && return nothing
-        key = unsafe_load(Ptr{Int64}(control + 8))
-        state = get(STREAM_REGISTRY, key, nothing)
-        state === nothing && return nothing
-        pop!(STREAM_REGISTRY, key)
-        state.lasterror == C_NULL || Libc.free(state.lasterror)
-        state.lasterror = Ptr{UInt8}(C_NULL)
-        _store_field!(sp, :release, Ptr{Cvoid}(C_NULL))
-        _store_field!(sp, :private_data, Ptr{Cvoid}(C_NULL))
-        Libc.free(control)
-        return nothing
+    try
+        sp == C_NULL && return nothing
+        lock(REGISTRY_LOCK) do
+            stream = unsafe_load(sp)
+            stream.release == C_NULL && return nothing
+            control = stream.private_data
+            control == C_NULL && return nothing
+            key = unsafe_load(Ptr{Int64}(control + 8))
+            state = get(STREAM_REGISTRY, key, nothing)
+            state === nothing && return nothing
+            pop!(STREAM_REGISTRY, key)
+            errorp = state.lasterror
+            state.lasterror = Ptr{UInt8}(C_NULL)
+            errorp == C_NULL || Libc.free(errorp)
+            _store_field!(sp, :release, Ptr{Cvoid}(C_NULL))
+            _store_field!(sp, :private_data, Ptr{Cvoid}(C_NULL))
+            Libc.free(control)
+            return nothing
+        end
+    catch
+        # A void C callback has no error channel. Never unwind into C.
     end
     return nothing
 end
@@ -1263,36 +1322,59 @@ registry root keeps schema fields and batches reachable until `release`;
 every `get_schema`/`get_next` result is its own export root with the same
 lifecycle as `to_c_data` output.
 """
-function export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
-    batches::AbstractVector{AC.RecordBatch})
+export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
+    batches::AbstractVector{AC.RecordBatch}) =
+    _export_stream!(sp, sch, batches, Libc.malloc, Libc.free, unsafe_store!)
+
+function _export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
+    batches::AbstractVector{AC.RecordBatch}, allocate!, deallocate!, publish!)
+    sp == C_NULL && throw(ArgumentError("ArrowArrayStream pointer is NULL"))
     for b in batches
         length(b.columns) == length(sch.fields) ||
             throw(ValidationError("stream batch column count does not match the schema"))
     end
     batchfield = Field("", StructType(); nullable=false,
         children=collect(Field, sch.fields))
-    control = Libc.malloc(CONTROL_BLOCK_BYTES)
-    control == C_NULL && throw(OutOfMemoryError())
-    key = lock(REGISTRY_LOCK) do
-        NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
-    end
-    unsafe_store!(Ptr{UInt8}(control), 0x00)
-    unsafe_store!(Ptr{Int64}(control + 8), key)
     state = ExportedStreamState(batchfield,
         collect(AC.RecordBatch, batches), 1, Ptr{UInt8}(C_NULL))
-    lock(REGISTRY_LOCK) do
-        STREAM_REGISTRY[key] = state
+    get_schema = @cfunction(_stream_get_schema, Cint,
+        (Ptr{CArrowArrayStream}, Ptr{CArrowSchema}))
+    get_next = @cfunction(_stream_get_next, Cint,
+        (Ptr{CArrowArrayStream}, Ptr{CArrowArray}))
+    get_last_error = @cfunction(_stream_get_last_error, Ptr{UInt8},
+        (Ptr{CArrowArrayStream},))
+    release = @cfunction(_stream_release, Cvoid, (Ptr{CArrowArrayStream},))
+    control = Ptr{Cvoid}(C_NULL)
+    key = Int64(0)
+    havekey = false
+    try
+        control = Ptr{Cvoid}(allocate!(CONTROL_BLOCK_BYTES))
+        control == C_NULL && throw(OutOfMemoryError())
+        key = lock(REGISTRY_LOCK) do
+            NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
+        end
+        havekey = true
+        unsafe_store!(Ptr{UInt8}(control), 0x00)
+        unsafe_store!(Ptr{Int64}(control + 8), key)
+        lock(REGISTRY_LOCK) do
+            STREAM_REGISTRY[key] = state
+        end
+        publish!(sp, CArrowArrayStream(get_schema, get_next, get_last_error,
+            release, control))
+        return sp
+    catch
+        if havekey
+            lock(REGISTRY_LOCK) do
+                get(STREAM_REGISTRY, key, nothing) === state &&
+                    pop!(STREAM_REGISTRY, key)
+            end
+        end
+        errorp = state.lasterror
+        state.lasterror = Ptr{UInt8}(C_NULL)
+        errorp == C_NULL || deallocate!(errorp)
+        control == C_NULL || deallocate!(control)
+        rethrow()
     end
-    unsafe_store!(sp, CArrowArrayStream(
-        @cfunction(_stream_get_schema, Cint,
-            (Ptr{CArrowArrayStream}, Ptr{CArrowSchema})),
-        @cfunction(_stream_get_next, Cint,
-            (Ptr{CArrowArrayStream}, Ptr{CArrowArray})),
-        @cfunction(_stream_get_last_error, Ptr{UInt8},
-            (Ptr{CArrowArrayStream},)),
-        @cfunction(_stream_release, Cvoid, (Ptr{CArrowArrayStream},)),
-        control))
-    return sp
 end
 
 _stream_registry_count() = lock(REGISTRY_LOCK) do
@@ -1309,38 +1391,63 @@ finalizer, and post-release calls are the spec's own undefined behavior.
 """
 mutable struct StreamOwner
     const block::Ptr{CArrowArrayStream}
+    const producer_release::Ptr{Cvoid}
     @atomic released::Bool
-    function StreamOwner(stream::CArrowArrayStream)
+    function StreamOwner(stream::CArrowArrayStream, registerfinalizer)
         block = Libc.malloc(sizeof(CArrowArrayStream))
         block == C_NULL && throw(OutOfMemoryError())
         p = Ptr{CArrowArrayStream}(block)
         o = try
             unsafe_store!(p, stream)
-            new(p, false)
+            _store_field!(p, :release, Ptr{Cvoid}(C_NULL)) # inert until moved
+            new(p, stream.release, false)
         catch
             Libc.free(block)
             rethrow()
         end
         try
-            finalizer(release!, o)
+            registerfinalizer(release!, o)
         catch
+            # The source still owns the producer stream. Free only the inert
+            # copy; an already-installed finalizer observes released=true.
             release!(o)
             rethrow()
         end
         return o
     end
 end
+StreamOwner(stream::CArrowArrayStream) = StreamOwner(stream, finalizer)
+
+function _stream_owner_armed(o::StreamOwner)
+    GC.@preserve o begin
+        return unsafe_load(o.block).release != C_NULL
+    end
+end
+
+function _arm_stream_owner!(o::StreamOwner)
+    (@atomic o.released) && error("cannot arm a released stream owner")
+    GC.@preserve o _store_field!(o.block, :release, o.producer_release)
+    return nothing
+end
+
+function _release_moved_stream_owner!(o::StreamOwner)
+    _stream_owner_armed(o) || _arm_stream_owner!(o)
+    release!(o)
+    return nothing
+end
 
 function release!(o::StreamOwner)
     @atomicswap(o.released = true) && return nothing
-    cb = unsafe_load(o.block).release
-    if cb != C_NULL
-        ccall(cb, Cvoid, (Ptr{CArrowArrayStream},), o.block)
-        unsafe_load(o.block).release == C_NULL ||
-            (Libc.free(o.block);
-                error("C stream producer release did not mark the structure released"))
+    GC.@preserve o begin
+        cb = unsafe_load(o.block).release
+        if cb != C_NULL
+            ccall(cb, Cvoid, (Ptr{CArrowArrayStream},), o.block)
+            unsafe_load(o.block).release == C_NULL ||
+                (Libc.free(o.block);
+                    error("C stream producer release did not mark the structure released"))
+        end
+        Libc.free(o.block)
     end
-    Libc.free(o.block)
     return nothing
 end
 
@@ -1365,11 +1472,13 @@ AC.schema(s::ImportedStream) = s.schema
 release!(s::ImportedStream) = release!(s.owner)
 
 function _stream_call_failed(o::StreamOwner, what::AbstractString)
-    cb = unsafe_load(o.block).get_last_error
     msg = "C stream $what failed"
-    if cb != C_NULL
-        p = ccall(cb, Ptr{UInt8}, (Ptr{CArrowArrayStream},), o.block)
-        p == C_NULL || (msg *= ": " * _import_cstring(p, "stream error"))
+    GC.@preserve o begin
+        cb = unsafe_load(o.block).get_last_error
+        if cb != C_NULL
+            p = ccall(cb, Ptr{UInt8}, (Ptr{CArrowArrayStream},), o.block)
+            p == C_NULL || (msg *= ": " * _import_cstring(p, "stream error"))
+        end
     end
     throw(ValidationError(msg))
 end
@@ -1386,15 +1495,19 @@ function from_c_stream(sp::Ptr{CArrowArrayStream})
     stream = unsafe_load(sp)
     stream.release == C_NULL &&
         throw(ArgumentError("cannot import a released stream"))
-    (stream.get_schema == C_NULL || stream.get_next == C_NULL) &&
+    (stream.get_schema == C_NULL || stream.get_next == C_NULL ||
+        stream.get_last_error == C_NULL) &&
         throw(ArgumentError("C stream is missing required callbacks"))
     owner = StreamOwner(stream)
-    _store_field!(sp, :release, Ptr{Cvoid}(C_NULL))   # the move commit
+    moved = false
     try
+        _store_field!(sp, :release, Ptr{Cvoid}(C_NULL)) # the move commit
+        moved = true
+        _arm_stream_owner!(owner)
         out = Ref(CArrowSchema(Ptr{UInt8}(C_NULL), Ptr{UInt8}(C_NULL),
             Ptr{UInt8}(C_NULL), 0, 0, Ptr{Ptr{CArrowSchema}}(C_NULL),
             Ptr{CArrowSchema}(C_NULL), Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL)))
-        status = GC.@preserve out ccall(unsafe_load(owner.block).get_schema,
+        status = GC.@preserve owner out ccall(unsafe_load(owner.block).get_schema,
             Cint, (Ptr{CArrowArrayStream}, Ptr{CArrowSchema}),
             owner.block, Base.unsafe_convert(Ptr{CArrowSchema}, out))
         status == 0 || _stream_call_failed(owner, "get_schema")
@@ -1410,12 +1523,14 @@ function from_c_stream(sp::Ptr{CArrowArrayStream})
         return ImportedStream(owner, batchfield,
             Schema(collect(Field, batchfield.children)), false)
     catch
-        release!(owner)
+        moved ? _release_moved_stream_owner!(owner) : release!(owner)
         rethrow()
     end
 end
 
-function AC.nextbatch!(s::ImportedStream)
+AC.nextbatch!(s::ImportedStream) = _nextbatch!(s, ForeignOwner)
+
+function _nextbatch!(s::ImportedStream, ownerfactory)
     # Fail closed on a released stream even when it already ended naturally:
     # release terminates the consumer contract, not just the batch supply.
     (@atomic s.owner.released) &&
@@ -1424,7 +1539,7 @@ function AC.nextbatch!(s::ImportedStream)
     out = Ref(CArrowArray(0, 0, 0, 0, 0, Ptr{Ptr{Cvoid}}(C_NULL),
         Ptr{Ptr{CArrowArray}}(C_NULL), Ptr{CArrowArray}(C_NULL),
         Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL)))
-    status = GC.@preserve out ccall(unsafe_load(s.owner.block).get_next,
+    status = GC.@preserve s out ccall(unsafe_load(s.owner.block).get_next,
         Cint, (Ptr{CArrowArrayStream}, Ptr{CArrowArray}),
         s.owner.block, Base.unsafe_convert(Ptr{CArrowArray}, out))
     status == 0 || _stream_call_failed(s.owner, "get_next")
@@ -1433,9 +1548,22 @@ function AC.nextbatch!(s::ImportedStream)
         s.done = true
         return nothing
     end
-    # The producer moved this array into our stack slot; it is ours to own.
-    batchowner = ForeignOwner(arr)
+    # The producer filled consumer-owned storage. Build an inert destination
+    # owner first. If that construction fails, the live source slot still owns
+    # the result and must release it. Then null the source and arm the copy.
+    batchowner = try
+        ownerfactory(arr)::ForeignOwner
+    catch
+        GC.@preserve out _release_c_array!(
+            Base.unsafe_convert(Ptr{CArrowArray}, out), arr)
+        rethrow()
+    end
+    moved = false
     d = try
+        GC.@preserve out _store_field!(
+            Base.unsafe_convert(Ptr{CArrowArray}, out), :release,
+            Ptr{Cvoid}(C_NULL))
+        moved = true
         _arm_foreign_owner!(batchowner)
         _preflight_array(s.batchfield, arr)
         d0 = _import_array(s.batchfield, arr, batchowner)
@@ -1444,7 +1572,7 @@ function AC.nextbatch!(s::ImportedStream)
         validate_full(s.batchfield, d0)
         d0
     catch
-        _release_moved_owner!(batchowner)
+        moved ? _release_moved_owner!(batchowner) : release!(batchowner)
         rethrow()
     end
     return AC.RecordBatch(s.schema, collect(ArrayData, d.children), d.len)
@@ -2422,6 +2550,156 @@ function main()
     stbefore = _stream_registry_count()
     b1 = batch((xs=Int64[1, 2, 3], strs=["a", missing, "c"]))
     b2 = batch((xs=Int64[4, 5], strs=[missing, "e"]))
+
+    # Stream export owns its control allocation before the next fallible
+    # operation. Key overflow and final publication failure must both return
+    # that allocation and leave no registry entry.
+    stream_deallocations = Ref(0)
+    stream_deallocate! = p -> begin
+        stream_deallocations[] += 1
+        Libc.free(p)
+    end
+    streamtxnref = Ref{CArrowArrayStream}()
+    savedkey = NEXT_KEY[]
+    try
+        NEXT_KEY[] = typemax(Int64)
+        GC.@preserve streamtxnref begin
+            streamtxnp = Base.unsafe_convert(Ptr{CArrowArrayStream}, streamtxnref)
+            @assert try
+                _export_stream!(streamtxnp, b1.schema, AC.RecordBatch[],
+                    Libc.malloc, stream_deallocate!, unsafe_store!)
+                false
+            catch e
+                e isa OverflowError
+            end
+        end
+    finally
+        NEXT_KEY[] = savedkey
+    end
+    @assert stream_deallocations[] == 1
+    @assert _stream_registry_count() == stbefore
+    stream_deallocations[] = 0
+    GC.@preserve streamtxnref begin
+        streamtxnp = Base.unsafe_convert(Ptr{CArrowArrayStream}, streamtxnref)
+        @assert try
+            _export_stream!(streamtxnp, b1.schema, AC.RecordBatch[],
+                Libc.malloc, stream_deallocate!,
+                (_p, _stream) -> error("injected stream publication failure"))
+            false
+        catch e
+            e isa ErrorException &&
+                e.msg == "injected stream publication failure"
+        end
+    end
+    @assert stream_deallocations[] == 1
+    @assert _stream_registry_count() == stbefore
+    println("failed stream export handoffs return control and registry roots ✓")
+
+    # Every exported callback closes its C exception boundary. Error-message
+    # allocation failure clears the previous message instead of reporting it
+    # for the new operation. The mandatory get_last_error callback is checked
+    # before a foreign stream is moved.
+    callbackref = Ref{CArrowArrayStream}()
+    GC.@preserve callbackref begin
+        callbackp = Base.unsafe_convert(Ptr{CArrowArrayStream}, callbackref)
+        export_stream!(callbackp, b1.schema, AC.RecordBatch[])
+        callbackstate, _ = _stream_state(callbackp)
+        _set_stream_error!(callbackstate, "old error")
+        @assert callbackstate.lasterror != C_NULL
+        _set_stream_error!(callbackstate, "new error",
+            _ -> Ptr{Cvoid}(C_NULL), Libc.free)
+        @assert callbackstate.lasterror == C_NULL
+        callbacks = callbackref[]
+        @assert ccall(callbacks.get_schema, Cint,
+            (Ptr{CArrowArrayStream}, Ptr{CArrowSchema}),
+            callbackp, Ptr{CArrowSchema}(C_NULL)) == EINVAL
+        errorp = ccall(callbacks.get_last_error, Ptr{UInt8},
+            (Ptr{CArrowArrayStream},), callbackp)
+        @assert errorp != C_NULL
+        @assert occursin("output pointer is NULL", unsafe_string(errorp))
+        @assert ccall(callbacks.get_next, Cint,
+            (Ptr{CArrowArrayStream}, Ptr{CArrowArray}),
+            callbackp, Ptr{CArrowArray}(C_NULL)) == EINVAL
+        @assert ccall(callbacks.get_last_error, Ptr{UInt8},
+            (Ptr{CArrowArrayStream},), Ptr{CArrowArrayStream}(C_NULL)) == C_NULL
+        ccall(callbacks.release, Cvoid, (Ptr{CArrowArrayStream},),
+            Ptr{CArrowArrayStream}(C_NULL))
+        _store_field!(callbackp, :get_last_error, Ptr{Cvoid}(C_NULL))
+        @assert try
+            from_c_stream(callbackp)
+            false
+        catch e
+            e isa ArgumentError
+        end
+        ccall(callbacks.release, Cvoid, (Ptr{CArrowArrayStream},), callbackp)
+    end
+    @assert _stream_registry_count() == stbefore
+    println("stream callbacks close errors and required callbacks are enforced ✓")
+
+    # Finalizer registration happens before the stream move. A failure after
+    # registration frees only the inert copy; the source remains the sole
+    # live stream and its later release drops the registry root exactly once.
+    ownerfailref = Ref{CArrowArrayStream}()
+    GC.@preserve ownerfailref begin
+        ownerfailp = Base.unsafe_convert(Ptr{CArrowArrayStream}, ownerfailref)
+        export_stream!(ownerfailp, b1.schema, AC.RecordBatch[])
+        captured_stream_owner = Ref{Any}(nothing)
+        stream_failing_registrar = (f, o) -> begin
+            captured_stream_owner[] = o
+            finalizer(f, o)
+            error("injected stream finalizer registration failure")
+        end
+        @assert try
+            StreamOwner(ownerfailref[], stream_failing_registrar)
+            false
+        catch e
+            e isa ErrorException &&
+                e.msg == "injected stream finalizer registration failure"
+        end
+        failed_stream_owner = captured_stream_owner[]::StreamOwner
+        @assert (@atomic failed_stream_owner.released)
+        @assert ownerfailref[].release != C_NULL
+        @assert _stream_registry_count() == stbefore + 1
+        finalize(failed_stream_owner)
+        release!(failed_stream_owner)
+        @assert ownerfailref[].release != C_NULL
+        ccall(ownerfailref[].release, Cvoid, (Ptr{CArrowArrayStream},), ownerfailp)
+    end
+    @assert _stream_registry_count() == stbefore
+    println("failed stream-owner finalizer handoff leaves the source live ✓")
+
+    # get_next has already transferred its result when a ForeignOwner
+    # constructor runs. If registration fails, release that still-live output
+    # slot rather than stranding the batch export root.
+    batchfailref = Ref{CArrowArrayStream}()
+    GC.@preserve batchfailref begin
+        batchfailp = Base.unsafe_convert(Ptr{CArrowArrayStream}, batchfailref)
+        export_stream!(batchfailp, b1.schema, AC.RecordBatch[b1])
+        batchfailstream = from_c_stream(batchfailp)
+        captured_batch_owner = Ref{Any}(nothing)
+        batch_owner_factory = arr -> ForeignOwner(arr, (f, o) -> begin
+            captured_batch_owner[] = o
+            finalizer(f, o)
+            error("injected batch-owner finalizer registration failure")
+        end)
+        @assert try
+            _nextbatch!(batchfailstream, batch_owner_factory)
+            false
+        catch e
+            e isa ErrorException &&
+                e.msg == "injected batch-owner finalizer registration failure"
+        end
+        failed_batch_owner = captured_batch_owner[]::ForeignOwner
+        @assert (@atomic failed_batch_owner.released)
+        finalize(failed_batch_owner)
+        release!(failed_batch_owner)
+        release!(batchfailstream)
+    end
+    @assert reap!() == 2                    # schema result + failed batch result
+    @assert _registry_count() == sbefore
+    @assert _stream_registry_count() == stbefore
+    println("failed pulled-batch owner handoff releases its live result ✓")
+
     streamref = Ref{CArrowArrayStream}()
     GC.@preserve streamref begin
         spp = Base.unsafe_convert(Ptr{CArrowArrayStream}, streamref)
