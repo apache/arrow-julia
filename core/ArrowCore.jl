@@ -1859,9 +1859,9 @@ end
 
 The shared pull-iteration protocol (report §9): implement
 `nextbatch!(src) -> Union{Nothing,RecordBatch}` and `schema(src)`. The IPC
-reader, the C-stream importer, and facade partitions all present this shape,
-which is what lets a dataset layer or a writer consume any of them without
-knowing which adapter produced the stream.
+reader presents this shape. A future C-stream importer and facade can use the
+same shape so that a dataset layer or writer need not know which adapter
+produced the stream.
 """
 abstract type RecordBatchSource end
 function nextbatch! end
