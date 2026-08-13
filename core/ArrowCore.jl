@@ -1347,16 +1347,25 @@ function _validate_field_contract_at(f::Field, d::ArrayData, i::Int64)
     return nothing
 end
 
+function _validate_dictionary_contracts(f::Field, d::ArrayData)
+    if d.type isa DictionaryType
+        # Dictionary values form an independent array. Index nullability never
+        # constrains pool nullability, but nested Field contracts inside the
+        # pool still apply to every pool value, even when the dictionary array
+        # itself is nested below a masked parent.
+        _validate_field_contracts(dictvaluefield(f, d.type), d.dictionary)
+    end
+    for (cf, cd) in zip(f.children, d.children)
+        _validate_dictionary_contracts(cf, cd)
+    end
+    return nothing
+end
+
 function _validate_field_contracts(f::Field, d::ArrayData)
     for i = 1:d.len
         _validate_field_contract_at(f, d, Int64(i))
     end
-    # Dictionary values form an independent array. Index nullability never
-    # constrains pool nullability, but nested Field contracts inside the pool
-    # still apply to every pool value.
-    if d.type isa DictionaryType
-        _validate_field_contracts(dictvaluefield(f, d.type), d.dictionary)
-    end
+    _validate_dictionary_contracts(f, d)
     return nothing
 end
 

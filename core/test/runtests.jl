@@ -915,6 +915,34 @@ end
         @test_throws ValidationError validate_semantic(f, selected_null)
     end
 
+    @testset "nested dictionary pools retain field contracts" begin
+        valuefield = Field("x", IntType(64, true); nullable=false)
+        nullvalue = AC.ArrayData(valuefield.type, 1,
+            [AC._databuffer(UInt8[0x00]), AC._databuffer(Int64[0])];
+            nullcount=1)
+        valuetype = StructType()
+        pool = AC.ArrayData(valuetype, 1, [BufferSlice()];
+            children=[nullvalue], nullcount=0)
+        dicttype = DictionaryType(IntType(32, true), valuetype, false)
+        dictfield = Field("dict", dicttype; children=[valuefield])
+        dictdata = AC.ArrayData(dicttype, 1,
+            [BufferSlice(), AC._databuffer(Int32[0])];
+            dictionary=pool, nullcount=0)
+        outerfield = Field("outer", StructType(); children=[dictfield])
+        outerdata = AC.ArrayData(StructType(), 1, [BufferSlice()];
+            children=[dictdata], nullcount=0)
+        @test_throws ValidationError validate_semantic(outerfield, outerdata)
+
+        maskedpool = AC.ArrayData(valuetype, 1,
+            [AC._databuffer(UInt8[0x00])]; children=[nullvalue], nullcount=1)
+        maskeddict = AC.ArrayData(dicttype, 1,
+            [BufferSlice(), AC._databuffer(Int32[0])];
+            dictionary=maskedpool, nullcount=0)
+        maskedouter = AC.ArrayData(StructType(), 1, [BufferSlice()];
+            children=[maskeddict], nullcount=0)
+        @test validate_semantic(outerfield, maskedouter) === maskedouter
+    end
+
     @testset "full: invalid UTF-8" begin
         t = Utf8Type(false)
         f = Field("s", t)
