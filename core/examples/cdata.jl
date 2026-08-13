@@ -676,17 +676,27 @@ mutable struct ForeignOwner
                                        # producer's release callback
     const producer_release::Ptr{Cvoid} # the moved struct's real callback
     @atomic released::Bool             # one swap picks the single releaser
-    function ForeignOwner(arr::CArrowArray)
+    function ForeignOwner(arr::CArrowArray, registerfinalizer)
         block = Libc.malloc(sizeof(CArrowArray))
         block == C_NULL && throw(OutOfMemoryError())
         p = Ptr{CArrowArray}(block)
         unsafe_store!(p, arr)
         _store_field!(p, :release, Ptr{Cvoid}(C_NULL))  # inert until armed
         o = new(p, arr.release, false)
-        finalizer(release!, o)
+        try
+            registerfinalizer(release!, o)
+        catch
+            # The source still owns the producer resources. The copy is inert,
+            # so constructor cleanup frees only our malloc'd storage. If the
+            # registrar installed a finalizer before throwing, its later call
+            # observes released=true and is inert.
+            release!(o)
+            rethrow()
+        end
         return o
     end
 end
+ForeignOwner(arr::CArrowArray) = ForeignOwner(arr, finalizer)
 
 # The move commit: the source ArrowArray's release has been nulled, so this
 # copy is now the sole owner of the producer's resources. Storing the real
@@ -1302,6 +1312,38 @@ function main()
     _call_release(ap)
     @assert reap!() == 1
     @assert _registry_count() == cbefore
+
+    # Finalizer registration is the last ownership handoff in construction.
+    # If a registrar installs the finalizer and then throws, constructor
+    # cleanup frees the inert malloc'd copy without releasing the producer.
+    rf, rd = fromjulia("finalizer-registration", Int64[1])
+    rbefore = _registry_count()
+    sp, ap = to_c_data(rf, rd)
+    _release_c_schema!(sp, unsafe_load(sp))
+    captured_owner = Ref{Any}(nothing)
+    failing_registrar = (f, o) -> begin
+        captured_owner[] = o
+        finalizer(f, o)
+        error("injected post-registration failure")
+    end
+    @assert try
+        ForeignOwner(unsafe_load(ap), failing_registrar)
+        false
+    catch e
+        e isa ErrorException &&
+            e.msg == "injected post-registration failure"
+    end
+    failed_owner = captured_owner[]::ForeignOwner
+    @assert (@atomic failed_owner.released)
+    @assert unsafe_load(ap).release != C_NULL
+    finalize(failed_owner)
+    release!(failed_owner)
+    @assert unsafe_load(ap).release != C_NULL
+    @assert reap!() == 1                       # schema root only
+    _call_release(ap)
+    @assert reap!() == 1
+    @assert _registry_count() == rbefore
+    println("failed finalizer registration frees only the inert owner copy ✓")
 
     # Producer C callbacks have no error channel. release! calls the
     # persistent malloc'd copy once, checks the producer nulled the copy's
