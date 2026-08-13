@@ -876,36 +876,53 @@ tree (children, dictionary) use regions whose `root` is this object, so the
 tree stays alive while any slice does, and the C release callback runs
 exactly once — from `release!` or the finalizer, whichever comes first.
 """
+# Byte offset of the `release` pointer inside CArrowArray, used by the
+# concrete CcallRelease conformance check (the producer must null it).
+const CARROWARRAY_RELEASE_OFFSET = Int(fieldoffset(CArrowArray, findfirst(==(:release), fieldnames(CArrowArray))))
+
 mutable struct ForeignOwner
-    arrayref::Base.RefValue{CArrowArray} # stable producer callback address
-    gate::OwnerRegion           # one lifecycle state shared by the whole tree
+    arrayblock::Ptr{CArrowArray} # malloc'd copy of the moved struct: a stable
+                                 # native address for the producer's release
+    gate::OwnerRegion            # one lifecycle state shared by the whole tree
     function ForeignOwner(arr::CArrowArray)
         o = new()
-        o.arrayref = Ref(arr)
-        # Construct the gate unarmed. Until the source ArrowArray's release
-        # field is nulled, that source remains the sole owner. Arming a
-        # finalizer here would create two owners if the task were interrupted
-        # before the move completed.
-        o.gate = OwnerRegion(Ptr{UInt8}(0), 0, AC.Foreign; root=o)
+        block = Libc.malloc(sizeof(CArrowArray))
+        block == C_NULL && throw(OutOfMemoryError())
+        o.arrayblock = Ptr{CArrowArray}(block)
+        unsafe_store!(o.arrayblock, arr)
+        # Construct the gate with a FREE-ONLY action (cb = NULL skips the
+        # producer callback): until the source ArrowArray's release field is
+        # nulled, the source remains the sole owner of producer resources,
+        # and an interruption before the move completes must reclaim only
+        # OUR malloc'd copy — never call the producer twice. Arming to the
+        # full call-then-free action happens after the move commits.
+        o.gate = OwnerRegion(Ptr{UInt8}(0), 0, AC.Foreign; root=o,
+            releasefn=CcallRelease(C_NULL, Ptr{Cvoid}(block); freearg=true))
         return o
     end
 end
 
 function _arm_foreign_owner!(o::ForeignOwner)
-    # The gate has no data extent. Its finalizer is the shared-mode backstop.
-    # Every imported BufferSlice guards this same lifecycle.
-    o.gate.releasefn = _release_foreign_tree!
-    finalizer(AC._finalize_region!, o.gate)
+    # Upgrade the gate's release from free-only to the full producer handoff:
+    # call the moved struct's release with the malloc'd copy's stable
+    # address, verify the producer nulled the copy's release field (spec),
+    # then free the copy. The OwnerRegion constructor already registered the
+    # shared-mode finalizer backstop when the free-only action was installed.
+    cb = unsafe_load(o.arrayblock).release
+    o.gate.releasefn = CcallRelease(cb, Ptr{Cvoid}(o.arrayblock);
+        freearg=true, verify_null_at=CARROWARRAY_RELEASE_OFFSET)
     return nothing
 end
 
+_foreign_owner_armed(o::ForeignOwner) =
+    (a = o.gate.releasefn; a !== nothing && a.cb != C_NULL)
+
 function _release_moved_owner!(o::ForeignOwner)
-    # A failure may occur after the source move but before finalizer
-    # registration. Install the callback locally so forceclose! still owns
-    # the copied producer release in that seam.
+    # A failure may occur after the source move but before arming. Install
+    # the full action locally so forceclose! still owns the copied producer
+    # release in that seam.
     _retry_interrupts() do
-        o.gate.releasefn === nothing &&
-            (o.gate.releasefn = _release_foreign_tree!)
+        _foreign_owner_armed(o) || _arm_foreign_owner!(o)
         release!(o)
     end
     return nothing
@@ -935,15 +952,6 @@ function _run_foreign_release!(ref::Base.RefValue{T};
         _run_foreign_release_pointer!(Base.unsafe_convert(Ptr{T}, ref);
             after_call=after_call)
     end
-    return nothing
-end
-
-function _release_foreign_tree!(gate::OwnerRegion, after_call=nothing)
-    o = gate.root::ForeignOwner
-    # Call the producer's release with a pointer to our copy — legal per
-    # spec: release takes the structure address, frees producer resources,
-    # and marks it released.
-    _run_foreign_release!(o.arrayref; after_call=after_call)
     return nothing
 end
 
@@ -1724,17 +1732,18 @@ function main()
     producer_owner = ForeignOwner(arr)
     _store_field!(ap, :release, Ptr{Cvoid}(C_NULL))
     _arm_foreign_owner!(producer_owner)
-    array_attempts = Ref(0)
-    _release_foreign_tree!(producer_owner.gate, () -> begin
-        array_attempts[] += 1
-        throw(InterruptException())
-    end)
-    @assert array_attempts[] == 1
-    @assert producer_owner.arrayref[].release == C_NULL
+    # The armed action is concrete data: the producer callback, the copy's
+    # stable malloc'd address, and the spec conformance check (the callback
+    # must null the copy's release field) execute as ONE committed step with
+    # SIGINT deferred — the old retry-after-partial-interrupt path no longer
+    # exists because there is no partial state to retry.
+    act = producer_owner.gate.releasefn::ReleaseAction
+    @assert act.cb != C_NULL
+    @assert act.verify_null_at == CARROWARRAY_RELEASE_OFFSET
     release!(producer_owner)
     @assert reap!() == 2
     @assert forceclose!(producer_region; timeout_ms=0)
-    println("producer release and import cleanup are interruption-safe ✓")
+    println("producer release is one committed, conformance-checked step ✓")
 
     # A root release must transitively release every child. Inspect before
     # reap, while the exported structs remain allocated.

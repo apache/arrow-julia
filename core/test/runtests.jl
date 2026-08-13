@@ -50,12 +50,12 @@ end
 
     @testset "release owner survives finalizer handoff failure" begin
         bytes = UInt8[0]
-        calls = Ref(0)
+        calls = Threads.Atomic{Int}(0)
         captured = Ref{Union{Nothing,OwnerRegion}}(nothing)
         @test_throws InterruptException GC.@preserve bytes AC.OwnerRegion(
             Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
             root=bytes,
-            releasefn=_ -> (calls[] += 1),
+            releasefn=NotifyRelease(calls),
             after_finalizer=r -> begin
                 captured[] = r
                 throw(InterruptException())
@@ -177,25 +177,26 @@ end
         @test mapped[] != Ptr{Cvoid}(-1)
         @test after_mmap_unmaps[] == 1
 
-        # The mmap-specific OwnerRegion callback has the same no-escape rule.
-        # Generic callbacks are still exactly-once when they throw.
-        close_attempts = Ref(0)
-        close_unmapper = function (p, len)
-            close_attempts[] += 1
-            close_attempts[] == 1 && throw(InterruptException())
-            AC._munmap!(p, len)
-        end
-        interrupted_close = AC._mmapregion(path; unmapper=close_unmapper)
+        # The armed mmap release is concrete data with the same no-escape
+        # rule: fault injection is a counter on the action (not a closure),
+        # the interrupted attempt restores LIVE, and the noescape loop
+        # retries until munmap commits — all within ONE action execution.
+        inj = Threads.Atomic{Int}(1)
+        closed_notes = Threads.Atomic{Int}(0)
+        interrupted_close = AC._mmapregion(path;
+            injectclose=inj, note=closed_notes)
         @test forceclose!(interrupted_close)
-        @test close_attempts[] == 2
+        @test inj[] <= 0                 # the injected interrupt fired
+        @test closed_notes[] == 1        # exactly one action execution
         @test AC.phase(@atomic interrupted_close.state) == AC.PHASE_CLOSED
         finalize(interrupted_close)
-        @test close_attempts[] == 2
+        @test closed_notes[] == 1        # finalizer found it already closed
 
-        r = AC._mmapregion(path; unmapper=unmapper)
-        @test unmaps[] == 2
+        r_notes = Threads.Atomic{Int}(0)
+        r = AC._mmapregion(path; unmapper=unmapper, note=r_notes)
+        @test unmaps[] == 2              # constructor-path count is unchanged
         @test forceclose!(r)
-        @test unmaps[] == 3
+        @test r_notes[] == 1
         rm(path)
     end
 
@@ -223,10 +224,10 @@ end
 
     @testset "busy finalizer interruption rearms cleanup" begin
         bytes = UInt8[0]
-        calls = Ref(0)
+        calls = Threads.Atomic{Int}(0)
         r = GC.@preserve bytes AC.OwnerRegion(
             Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=_ -> (calls[] += 1))
+            root=bytes, releasefn=NotifyRelease(calls))
         AC._acquireguard!(r)
         attempts = Ref(0)
         AC._finalize_region!(r, () -> begin
@@ -243,10 +244,10 @@ end
 
     @testset "interrupted close wait restores open" begin
         bytes = UInt8[0]
-        calls = Ref(0)
+        calls = Threads.Atomic{Int}(0)
         r = GC.@preserve bytes AC.OwnerRegion(
             Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=_ -> (calls[] += 1))
+            root=bytes, releasefn=NotifyRelease(calls))
         AC._acquireguard!(r)
         try
             @test_throws InterruptException AC._forceclose!(r, 1000,
@@ -263,10 +264,10 @@ end
 
     @testset "guard and close claims are interruption-atomic" begin
         bytes = UInt8[0]
-        calls = Ref(0)
+        calls = Threads.Atomic{Int}(0)
         r = GC.@preserve bytes AC.OwnerRegion(
             Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=_ -> (calls[] += 1))
+            root=bytes, releasefn=NotifyRelease(calls))
 
         @test_throws InterruptException AC._acquireguard!(r,
             () -> throw(InterruptException()))
@@ -301,10 +302,10 @@ end
     @testset "invalid construction and release errors stay closed" begin
         @test_throws ArgumentError AC.OwnerRegion(Ptr{UInt8}(0), 1, AC.Foreign)
         @test_throws ArgumentError forceclose!(heapregion(UInt8[0]); timeout_ms=-1)
-        calls = Ref(0)
+        calls = Threads.Atomic{Int}(0)
         bytes = UInt8[0]
         r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=_ -> (calls[] += 1; error("release failed")))
+            root=bytes, releasefn=NotifyRelease(calls; fail=true))
         @test_throws ErrorException forceclose!(r)
         @test calls[] == 1
         @test AC.phase(@atomic r.state) == AC.PHASE_CLOSED
@@ -319,11 +320,8 @@ end
         finish = Base.Event()
         calls = Threads.Atomic{Int}(0)
         r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=_ -> begin
-                Threads.atomic_add!(calls, 1)
-                notify(entered)
-                wait(finish)
-            end)
+            root=bytes,
+            releasefn=RendezvousRelease(entered, finish; note=calls))
         first = Threads.@spawn forceclose!(r)
         wait(entered)
         @test forceclose!(r; timeout_ms=0) == false
@@ -338,9 +336,9 @@ end
 
     @testset "manual finalization honors an active guard" begin
         bytes = UInt8[0]
-        calls = Ref(0)
+        calls = Threads.Atomic{Int}(0)
         r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=_ -> (calls[] += 1))
+            root=bytes, releasefn=NotifyRelease(calls))
         withguard(r) do
             finalize(r)
             @test calls[] == 0
@@ -353,9 +351,9 @@ end
 
     @testset "delegated lifecycles share one root gate" begin
         bytes = UInt8[0]
-        calls = Ref(0)
+        calls = Threads.Atomic{Int}(0)
         gate = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1,
-            AC.Foreign; root=bytes, releasefn=_ -> (calls[] += 1))
+            AC.Foreign; root=bytes, releasefn=NotifyRelease(calls))
         child = AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
             root=bytes, lifecycle=gate)
         grandchild = AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;

@@ -79,6 +79,7 @@ const checked_mul = Checked.checked_mul
 
 export OwnerRegion, BufferSlice, MemoryKind, InvalidatedError, forceclose!,
     heapregion, mmapregion, foreignregion, withguard,
+    ReleaseAction, MunmapRelease, CcallRelease, NotifyRelease, RendezvousRelease,
     ArrowType, NullType, BoolType, IntType, FloatType, DecimalType,
     FixedSizeBinaryType, BinaryType, Utf8Type, DateType, TimeType,
     TimestampType, DurationType, IntervalType, ListType, FixedSizeListType,
@@ -112,6 +113,85 @@ const PHASE_MASK = 0x0000000000000003
 
 phase(state::UInt64) = state & PHASE_MASK
 generation(state::UInt64) = state >> 2
+
+# ---------------------------------------------------------------------------
+# Release actions: a CLOSED, concrete set instead of an `Any` callback.
+#
+# Trim-compile support (JuliaC `--trim=safe`) forbids reachable dynamic
+# dispatch, and an `Any`-typed release callback is exactly that. The insight
+# that makes this a design improvement rather than a workaround: release
+# behavior in the real system IS a closed set — nothing (GC-owned memory),
+# munmap (mapped files), one C callback (foreign/C-data trees), and the
+# notify/rendezvous observers the lifecycle tests need. Encoding it as data
+# on one concrete struct keeps `_run_release!` fully static, makes release
+# behavior serializable/inspectable, and removes a whole class of
+# "arbitrary code inside the lifecycle state machine" hazards.
+# ---------------------------------------------------------------------------
+
+@enum ReleaseKind::UInt8 RELEASE_MUNMAP RELEASE_CCALL RELEASE_NOTIFY RELEASE_RENDEZVOUS
+
+"""
+    ReleaseAction
+
+The concrete description of what releasing a region's memory means. Built
+via [`MunmapRelease`](@ref), [`CcallRelease`](@ref), [`NotifyRelease`](@ref)
+or [`RendezvousRelease`](@ref); executed exactly once by the lifecycle state
+machine via `_run_release!`. `note` (any kind) is bumped on entry so tests
+and metrics can observe exactly-once without injecting code.
+"""
+struct ReleaseAction
+    kind::ReleaseKind
+    cb::Ptr{Cvoid}                            # RELEASE_CCALL: void (*)(void*)
+    arg::Ptr{Cvoid}                           # RELEASE_CCALL: callback argument
+    freearg::Bool                             # RELEASE_CCALL: Libc.free(arg) after
+    note::Union{Nothing,Threads.Atomic{Int}}
+    fail::Bool                                # RELEASE_NOTIFY: throw after noting
+    entered::Union{Nothing,Base.Event}        # RELEASE_RENDEZVOUS
+    finish::Union{Nothing,Base.Event}         # RELEASE_RENDEZVOUS
+    mapstate::Union{Nothing,Threads.Atomic{UInt8}}  # RELEASE_MUNMAP claim word
+    injectfail::Union{Nothing,Threads.Atomic{Int}}  # fault injector (tests): throw
+                                                    # InterruptException while > 0
+    verify_null_at::Int32   # RELEASE_CCALL: byte offset of a pointer field in
+                            # *arg that the callback must null (-1 = no check)
+end
+
+"""
+Release a mapped region with the exactly-once munmap machinery. `mapstate`
+is the mapping's shared LIVE/RELEASING/RELEASED claim (also consulted by the
+constructor's failure path, so both possible owners serialize on one word).
+`injectfail` turns the tests' interrupted-unmap scenarios into data: while
+its count is positive, the unmap attempt throws `InterruptException` and the
+claim machinery restores LIVE for the retry.
+"""
+MunmapRelease(mapstate::Threads.Atomic{UInt8};
+    note::Union{Nothing,Threads.Atomic{Int}}=nothing,
+    injectfail::Union{Nothing,Threads.Atomic{Int}}=nothing) =
+    ReleaseAction(RELEASE_MUNMAP, C_NULL, C_NULL, false, note, false,
+        nothing, nothing, mapstate, injectfail, Int32(-1))
+
+"""
+Release by calling a C function pointer with `arg` (skipped when `cb` is
+NULL — a moved/already-released source), then `Libc.free(arg)` when
+`freearg` is set. This is the C-data-interface shape: the callback is the
+producer's `release`, `arg` is a stable (malloc'd) struct address.
+"""
+CcallRelease(cb::Ptr{Cvoid}, arg::Ptr{Cvoid}; freearg::Bool=false,
+    note::Union{Nothing,Threads.Atomic{Int}}=nothing,
+    verify_null_at::Integer=-1) =
+    ReleaseAction(RELEASE_CCALL, cb, arg, freearg, note, false, nothing,
+        nothing, nothing, nothing, Int32(verify_null_at))
+
+"Observe release: bump `note`; `fail=true` then throws (error-path tests)."
+NotifyRelease(note::Threads.Atomic{Int}; fail::Bool=false) =
+    ReleaseAction(RELEASE_NOTIFY, C_NULL, C_NULL, false, note, fail, nothing,
+        nothing, nothing, nothing, Int32(-1))
+
+"Observe + block: bump `note`, notify `entered`, wait on `finish` (closer-race tests)."
+RendezvousRelease(entered::Base.Event, finish::Base.Event;
+    note::Union{Nothing,Threads.Atomic{Int}}=nothing) =
+    ReleaseAction(RELEASE_RENDEZVOUS, C_NULL, C_NULL, false, note, false,
+        entered, finish, nothing, nothing, Int32(-1))
+
 
 """
     OwnerRegion
@@ -149,14 +229,14 @@ mutable struct OwnerRegion
     # its own state. A shared lifecycle makes release and invalidation one
     # atomic tree-wide operation without conflating allocation extents.
     const lifecycle::Union{Nothing,OwnerRegion}
-    releasefn::Any          # region -> nothing, or nothing
+    releasefn::Union{Nothing,ReleaseAction}
     @atomic state::UInt64
     @atomic guards::Int
 
     function OwnerRegion(ptr::Ptr{UInt8}, len::Integer, kind::MemoryKind;
-        root=nothing, releasefn=nothing,
+        root=nothing, releasefn::Union{Nothing,ReleaseAction}=nothing,
         lifecycle::Union{Nothing,OwnerRegion}=nothing,
-        after_finalizer=nothing)
+        after_finalizer::F=nothing) where {F}
         len >= 0 || throw(ArgumentError("region length must be non-negative"))
         n = Int64(len)
         (ptr != C_NULL || n == 0) ||
@@ -207,6 +287,44 @@ mutable struct OwnerRegion
 end
 
 @inline _lifecycle(r::OwnerRegion) = r.lifecycle === nothing ? r : r.lifecycle
+
+function _inject_then_munmap!(a::ReleaseAction, p::Ptr, len::Integer)
+    inj = a.injectfail
+    if inj !== nothing && Threads.atomic_sub!(inj, 1) > 0
+        throw(InterruptException())
+    end
+    _munmap!(p, len)
+    return nothing
+end
+
+function _run_release!(a::ReleaseAction, r::OwnerRegion)
+    n = a.note
+    n === nothing || Threads.atomic_add!(n, 1)
+    if a.kind == RELEASE_MUNMAP
+        _release_mapping_noescape!(a.mapstate::Threads.Atomic{UInt8},
+            r.ptr, r.len, a)
+    elseif a.kind == RELEASE_CCALL
+        # Complete the foreign handoff atomically w.r.t. SIGINT: the producer
+        # callback, the spec-conformance check (it must null the structure's
+        # release field), and the argument free are one committed step.
+        Base.disable_sigint() do
+            if a.cb != C_NULL
+                ccall(a.cb, Cvoid, (Ptr{Cvoid},), a.arg)
+                if a.verify_null_at >= 0
+                    unsafe_load(Ptr{Ptr{Cvoid}}(a.arg + a.verify_null_at)) == C_NULL ||
+                        error("C release callback did not mark the structure released")
+                end
+            end
+            a.freearg && a.arg != C_NULL && Libc.free(a.arg)
+        end
+    elseif a.kind == RELEASE_RENDEZVOUS
+        notify(a.entered::Base.Event)
+        wait(a.finish::Base.Event)
+    elseif a.fail
+        error("release failed")
+    end
+    return nothing
+end
 
 function _finalize_region!(r::OwnerRegion, after_busy=nothing)
     # Natural finalization implies no live guards, but `finalize(r)` is also
@@ -312,8 +430,8 @@ function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
     return _forceclose!(r, timeout_ms, yield)
 end
 
-function _forceclose!(r::OwnerRegion, timeout_ms::Integer, waitfn;
-    after_claim=nothing, before_release=nothing)
+function _forceclose!(r::OwnerRegion, timeout_ms::Integer, waitfn::W;
+    after_claim::A=nothing, before_release::B=nothing) where {W,A,B}
     r = _lifecycle(r)
     timeout_ms >= 0 || throw(ArgumentError("timeout_ms must be non-negative"))
     timeout_ms <= typemax(UInt64) ÷ 1_000_000 ||
@@ -365,7 +483,7 @@ function _forceclose!(r::OwnerRegion, timeout_ms::Integer, waitfn;
             release_started = true
             f = r.releasefn
             try
-                f === nothing || f(r)
+                f === nothing || _run_release!(f, r)
             finally
                 # Generic callbacks remain exactly-once even if they report an
                 # error: partially freed storage cannot safely be retried.
@@ -436,8 +554,12 @@ function _munmap!(p::Ptr, len::Integer)
     return nothing
 end
 
+_unmap!(unmapper, p::Ptr, len::Integer) = unmapper(p, len)
+_unmap!(a::ReleaseAction, p::Ptr, len::Integer) = _inject_then_munmap!(a, p, len)
+
 function _release_mapping_once!(state::Threads.Atomic{UInt8}, p::Ptr,
-    len::Integer, unmapper; after_release=nothing, before_rollback=nothing)
+    len::Integer, unmapper::U; after_release::A=nothing,
+    before_rollback::B=nothing) where {U,A,B}
     # The constructor catch and an already-armed OwnerRegion finalizer can
     # race to return the same mapping. Serialize attempts with a retryable
     # LIVE -> RELEASING -> RELEASED state. An unmapper failure restores LIVE;
@@ -458,7 +580,7 @@ function _release_mapping_once!(state::Threads.Atomic{UInt8}, p::Ptr,
             owned && break
         end
         Base.disable_sigint() do
-            unmapper(p, len)
+            _unmap!(unmapper, p, len)
             state[] = 0x02
             after_release === nothing || after_release()
         end
@@ -486,7 +608,7 @@ function _release_mapping_once!(state::Threads.Atomic{UInt8}, p::Ptr,
 end
 
 function _release_mapping_noescape!(state::Threads.Atomic{UInt8}, p::Ptr,
-    len::Integer, unmapper)
+    len::Integer, unmapper::U) where {U}
     while true
         try
             return _release_mapping_once!(state, p, len, unmapper)
@@ -500,8 +622,10 @@ function _release_mapping_noescape!(state::Threads.Atomic{UInt8}, p::Ptr,
     end
 end
 
-function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
-    unmapper=_munmap!, mapper=nothing, after_mmap=nothing)
+function _mmapregion(path::AbstractString, makeowner::MK=OwnerRegion;
+    unmapper::U=_munmap!, mapper::M=nothing, after_mmap::AM=nothing,
+    note::Union{Nothing,Threads.Atomic{Int}}=nothing,
+    injectclose::Union{Nothing,Threads.Atomic{Int}}=nothing) where {MK,U,M,AM}
     Sys.isunix() || error("mmapregion: prove-out implements POSIX only")
     open(path, "r") do io
         # Size the exact opened file descriptor. Sizing the path first lets
@@ -515,8 +639,11 @@ function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
         # Prepare the exactly-once release state before mmap transfers a native
         # resource to us. Both possible owners below share this same claim.
         released = Threads.Atomic{UInt8}(0x00)
-        release = (r::OwnerRegion) ->
-            _release_mapping_noescape!(released, r.ptr, r.len, unmapper)
+        # The ARMED region's release is concrete data (trim rule: no open
+        # callables inside the lifecycle machine); the constructor's failure
+        # path below still uses `unmapper` directly, which is where the
+        # tests' construction-fault injection lives.
+        release = MunmapRelease(released; note=note, injectfail=injectclose)
         p = Ptr{Cvoid}(-1)
         try
             # Defer SIGINT from successful mmap through finalizer arming and
@@ -559,7 +686,7 @@ the trust decision is the importer's. The producer must keep the declared
 storage alive and unchanged until Core releases it; otherwise pointers or
 cached validation results can become invalid outside Core's control.
 """
-foreignregion(ptr::Ptr{UInt8}, len::Integer, release) =
+foreignregion(ptr::Ptr{UInt8}, len::Integer, release::ReleaseAction) =
     OwnerRegion(ptr, len, Foreign; releasefn=release)
 
 # --- BufferSlice ------------------------------------------------------------

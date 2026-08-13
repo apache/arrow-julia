@@ -18,7 +18,7 @@ const AC = ArrowCore
             r = GC.@preserve bytes AC.OwnerRegion(
                 Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
                 root=bytes,
-                releasefn=_ -> (Threads.atomic_add!(calls, 1); nothing))
+                releasefn=NotifyRelease(calls))
             go = Threads.Atomic{Bool}(false)
             tasks = [Threads.@spawn begin
                 while !go[]
@@ -37,11 +37,11 @@ const AC = ArrowCore
     @testset "guard and release handshake" begin
         for _ = 1:100
             bytes = UInt8[0x5a]
-            released = Threads.Atomic{Bool}(false)
+            released = Threads.Atomic{Int}(0)
             overlap = Threads.Atomic{Bool}(false)
             r = GC.@preserve bytes AC.OwnerRegion(
                 Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-                root=bytes, releasefn=_ -> (released[] = true))
+                root=bytes, releasefn=NotifyRelease(released))
             go = Threads.Atomic{Bool}(false)
             workers = [Threads.@spawn begin
                 while !go[]
@@ -50,10 +50,10 @@ const AC = ArrowCore
                 for _ = 1:100
                     try
                         withguard(r) do
-                            released[] && (overlap[] = true)
+                            released[] > 0 && (overlap[] = true)
                             unsafe_load(r.ptr) == 0x5a || (overlap[] = true)
                             yield()
-                            released[] && (overlap[] = true)
+                            released[] > 0 && (overlap[] = true)
                         end
                     catch e
                         e isa InvalidatedError || rethrow()
