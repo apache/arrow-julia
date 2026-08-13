@@ -384,7 +384,7 @@ function _vschema(t::_VTable, state::_VState, depth::Int)
     _vvisit!(state, :schema, t) || return Int64[]
     limits = state.limits
     _venum(t, 0, 2, UInt64(0):UInt64(1))
-    _vtablevector(t, 1, _vfieldmeta, state, depth)
+    _vtablevector(t, 1, _vfieldmeta, state, depth; required=true)
     _vmetadata(t, 2, state, depth)
     features = Int64[]
     vec = _vvector(t, 3, 8; state=state)
@@ -1809,6 +1809,12 @@ function main()
     emptystream = readstream(emptybytes)
     @assert isempty(emptystream.schema.fields)
     @assert emptystream.batches[1].nrows == 3
+    missingfields = copy(emptybytes)
+    _mutatemessage!(missingfields, 1) do meta, msg
+        schema = _headertable(meta, msg)
+        _write_i16!(meta, schema.vpos + 6, Int16(0)) # omit fields vtable slot
+    end
+    @assert _rejects(() -> readstream(missingfields))
     toolong = copy(emptybytes)
     _mutatemessage!(toolong, emptyrecord) do meta, msg
         rb = _headertable(meta, msg)
