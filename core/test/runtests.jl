@@ -76,10 +76,24 @@ end
             unmapper=unmapper)
         @test unmaps[] == 1
 
-        r = AC._mmapregion(path; unmapper=unmapper)
-        @test unmaps[] == 1
-        @test forceclose!(r)
+        # A factory can fail after OwnerRegion has armed its finalizer but
+        # before _mmapregion receives the owner. The constructor catch and the
+        # later finalizer must share one release claim, not unmap twice.
+        lateowner = Ref{Union{Nothing,OwnerRegion}}(nothing)
+        latefailure = function (args...; kwargs...)
+            lateowner[] = OwnerRegion(args...; kwargs...)
+            error("injected post-finalizer owner failure")
+        end
+        @test_throws ErrorException AC._mmapregion(path, latefailure;
+            unmapper=unmapper)
         @test unmaps[] == 2
+        finalize(lateowner[]::OwnerRegion)
+        @test unmaps[] == 2
+
+        r = AC._mmapregion(path; unmapper=unmapper)
+        @test unmaps[] == 2
+        @test forceclose!(r)
+        @test unmaps[] == 3
         rm(path)
     end
 

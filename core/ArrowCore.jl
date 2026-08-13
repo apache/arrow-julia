@@ -360,6 +360,18 @@ function _munmap!(p::Ptr, len::Integer)
     return nothing
 end
 
+function _release_mapping_once!(claimed::Threads.Atomic{Bool}, p::Ptr,
+    len::Integer, unmapper)
+    # The constructor catch and an already-armed OwnerRegion finalizer can
+    # race to return the same mapping. Claim and release it as one
+    # non-interruptible handoff so exactly one path calls munmap.
+    Base.disable_sigint() do
+        Threads.atomic_cas!(claimed, false, true) && return nothing
+        unmapper(p, len)
+    end
+    return nothing
+end
+
 function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
     unmapper=_munmap!)
     Sys.isunix() || error("mmapregion: prove-out implements POSIX only")
@@ -372,6 +384,11 @@ function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
         fd = Base.Filesystem.fd(io)
         # PROT_READ=1, MAP_SHARED=1 (Linux) / MAP_SHARED=1 (Darwin) — shared,
         # read-only mapping; MAP_FAILED is (void*)-1.
+        # Prepare the exactly-once release state before mmap transfers a native
+        # resource to us. Both possible owners below share this same claim.
+        released = Threads.Atomic{Bool}(false)
+        release = (r::OwnerRegion) ->
+            _release_mapping_once!(released, r.ptr, r.len, unmapper)
         p = ccall(:mmap, Ptr{Cvoid},
             (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
             C_NULL, len, 1 #= PROT_READ =#, 1 #= MAP_SHARED =#, fd, 0)
@@ -380,12 +397,11 @@ function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
         # registered its finalizer. Nothing fallible may cross that handoff
         # without returning the mapping directly.
         try
-            release = (r::OwnerRegion) -> unmapper(r.ptr, r.len)
             owner = makeowner(Ptr{UInt8}(p), len, Mmap;
                 releasefn=release)::OwnerRegion
             return owner
         catch
-            unmapper(p, len)
+            _release_mapping_once!(released, p, len, unmapper)
             rethrow()
         end
     end
