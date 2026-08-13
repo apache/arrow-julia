@@ -111,11 +111,11 @@ const NONCONFORMING_C_RELEASE =
         # Two possible owners may arrive while the first release is in
         # progress. Only one unmapper runs; the waiter observes RELEASED.
         raceclaim = AC.MapClaim()
-        racecalls = ReleaseCounter()
+        racecalls = AC.ReleaseCounter()
         entered = Base.Event()
         finish = Base.Event()
         blocking = function (_p, _len)
-            increment!(racecalls)
+            AC.increment!(racecalls)
             notify(entered)
             wait(finish)
             nothing
@@ -136,11 +136,11 @@ const NONCONFORMING_C_RELEASE =
         # If the winner fails, it restores LIVE. A waiting owner can then
         # claim the mapping and publish RELEASED.
         retryclaim = AC.MapClaim()
-        retrycalls = ReleaseCounter()
+        retrycalls = AC.ReleaseCounter()
         retryentered = Base.Event()
         retryfinish = Base.Event()
         retrying = function (_p, _len)
-            attempt = increment!(retrycalls)
+            attempt = AC.increment!(retrycalls)
             if attempt == 1
                 notify(retryentered)
                 wait(retryfinish)
@@ -165,7 +165,7 @@ const NONCONFORMING_C_RELEASE =
 
         # The armed release is concrete data: exactly one action execution,
         # observed via the note counter, and a finalizer after close is inert.
-        closed_notes = ReleaseCounter()
+        closed_notes = AC.ReleaseCounter()
         r = AC._mmapregion(path; unmapper=unmapper, note=closed_notes)
         @test unmaps[] == 2              # constructor-path count is unchanged
         @test forceclose!(r)
@@ -207,10 +207,10 @@ const NONCONFORMING_C_RELEASE =
     @testset "invalid construction and release errors stay closed" begin
         @test_throws ArgumentError AC.OwnerRegion(Ptr{UInt8}(0), 1, AC.Foreign)
         @test_throws ArgumentError forceclose!(heapregion(UInt8[0]); timeout_ms=-1)
-        calls = ReleaseCounter()
+        calls = AC.ReleaseCounter()
         bytes = UInt8[0]
         r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=NotifyRelease(calls; fail=true))
+            root=bytes, releasefn=AC.NotifyRelease(calls; fail=true))
         @test_throws ErrorException forceclose!(r)
         @test calls[] == 1
         @test AC.phase(@atomic r.state) == AC.PHASE_CLOSED
@@ -219,9 +219,9 @@ const NONCONFORMING_C_RELEASE =
 
         # Initial finalizer registration owns the rollback path. A plain
         # registration error must synchronously release the new region.
-        registration_calls = ReleaseCounter()
+        registration_calls = AC.ReleaseCounter()
         unarmed = AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0, AC.Foreign)
-        unarmed.releasefn = NotifyRelease(registration_calls)
+        unarmed.releasefn = AC.NotifyRelease(registration_calls)
         @test_throws ArgumentError AC._register_initial_region_finalizer!(
             unarmed, Ptr{Cvoid}(C_NULL))
         @test registration_calls[] == 1
@@ -246,7 +246,7 @@ const NONCONFORMING_C_RELEASE =
             Libc.free(block)
         end
 
-        ccall_notes = ReleaseCounter()
+        ccall_notes = AC.ReleaseCounter()
         ownedblock = Libc.malloc(sizeof(Ptr{Cvoid}))
         ownedblock == C_NULL && throw(OutOfMemoryError())
         unsafe_store!(Ptr{Ptr{Cvoid}}(ownedblock), NONCONFORMING_C_RELEASE)
@@ -261,9 +261,9 @@ const NONCONFORMING_C_RELEASE =
 
         # The Ptr{Cvoid} finalizer boundary intentionally swallows a release
         # error. Its state-machine finally still commits CLOSED exactly once.
-        finalizer_calls = ReleaseCounter()
+        finalizer_calls = AC.ReleaseCounter()
         finalized = AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0, AC.Foreign;
-            releasefn=NotifyRelease(finalizer_calls; fail=true))
+            releasefn=AC.NotifyRelease(finalizer_calls; fail=true))
         @test finalize(finalized) === nothing
         @test finalizer_calls[] == 1
         @test AC.phase(@atomic finalized.state) == AC.PHASE_CLOSED
@@ -276,10 +276,10 @@ const NONCONFORMING_C_RELEASE =
         bytes = UInt8[0]
         entered = Base.Event()
         finish = Base.Event()
-        calls = ReleaseCounter()
+        calls = AC.ReleaseCounter()
         r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
             root=bytes,
-            releasefn=RendezvousRelease(entered, finish; note=calls))
+            releasefn=AC.RendezvousRelease(entered, finish; note=calls))
         first = Threads.@spawn forceclose!(r)
         wait(entered)
         @test forceclose!(r; timeout_ms=0) == false
@@ -294,9 +294,9 @@ const NONCONFORMING_C_RELEASE =
 
     @testset "manual finalization honors an active guard" begin
         bytes = UInt8[0]
-        calls = ReleaseCounter()
+        calls = AC.ReleaseCounter()
         r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-            root=bytes, releasefn=NotifyRelease(calls))
+            root=bytes, releasefn=AC.NotifyRelease(calls))
         withguard(r) do
             finalize(r)
             @test calls[] == 0
@@ -309,9 +309,9 @@ const NONCONFORMING_C_RELEASE =
 
     @testset "delegated lifecycles share one root gate" begin
         bytes = UInt8[0]
-        calls = ReleaseCounter()
+        calls = AC.ReleaseCounter()
         gate = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1,
-            AC.Foreign; root=bytes, releasefn=NotifyRelease(calls))
+            AC.Foreign; root=bytes, releasefn=AC.NotifyRelease(calls))
         child = AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
             root=bytes, lifecycle=gate)
         grandchild = AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;

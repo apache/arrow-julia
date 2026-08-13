@@ -28,8 +28,8 @@ Design rules this module is built to demonstrate:
    dictionary, mirroring the Arrow C data interface's `ArrowArray`. Logical
    type parameters such as timezone and precision/scale are fields on
    `ArrowType` descriptors. Names and nullability are fields on `Field`.
-   None parameterize the Core storage types. The prove-out's Struct
-   materializer may still construct `NamedTuple{names}` as a facade shortcut.
+   None parameterize the Core storage types. Struct materialization always
+   returns `Vector{Pair{String,Any}}`; a typed facade remains separate work.
 
 2. Ownership is an object, not a convention. Every buffer is a `BufferSlice`
    into an `OwnerRegion` that knows its extent, its alignment, and how to
@@ -74,8 +74,8 @@ Deliberately out of scope for the prove-out (tracked in the report roadmap):
 view layouts (Utf8View/BinaryView/ListView) and run-end encoding have
 registry entries and structural validation but no semantic validation or
 element accessors; semantic/full validation rejects them rather than marking
-unchecked content valid. There is no compression, no Tables.jl integration,
-and no `ViewPlan` — bulk access
+unchecked content valid. Core has no codec dependency; the IPC adapter
+implements compression. There is no Tables.jl integration or `ViewPlan` — bulk access
 here uses a plain function barrier (`materialize`) to demonstrate the
 pattern the facade will formalize.
 """
@@ -88,8 +88,7 @@ const checked_mul = Checked.checked_mul
 
 export OwnerRegion, BufferSlice, MemoryKind, InvalidatedError, forceclose!,
     heapregion, mmapregion, foreignregion, withguard,
-    ReleaseAction, MunmapRelease, CcallRelease, NotifyRelease, RendezvousRelease,
-    ReleaseCounter, MapClaim, increment!,
+    ReleaseAction, CcallRelease,
     ArrowType, NullType, BoolType, IntType, FloatType, DecimalType,
     FixedSizeBinaryType, BinaryType, Utf8Type, DateType, TimeType,
     TimestampType, DurationType, IntervalType, ListType, FixedSizeListType,
@@ -1183,7 +1182,7 @@ Closed-set name ladder for error messages: `nameof(typeof(x))` on an
 abstract-typed value is itself a dynamic call, so diagnostics use this
 instead.
 """
-function descriptorname(t::ArrowType)::Symbol
+@inline function descriptorname(t::ArrowType)::Symbol
     t isa IntType && return :IntType
     t isa FloatType && return :FloatType
     t isa Utf8Type && return :Utf8Type
@@ -1578,11 +1577,15 @@ function _validate_temporal_values(t::TimeType, d::ArrayData)
         t.unit == MICROSECOND ? Int64(86_400_000_000) :
         Int64(86_400_000_000_000)
     data = rolebuffer(d, DATA)
-    T = t.bits == 32 ? Int32 : Int64
-    width = Int64(sizeof(T))
     for i = 1:d.len
         isvalid_at(d, i) || continue
-        value = loadat(data, T, _slotbyteoff(d, Int64(i), width))
+        value = if t.bits == 32
+            Int64(loadat(data, Int32,
+                _slotbyteoff(d, Int64(i), Int64(4))))
+        else
+            loadat(data, Int64,
+                _slotbyteoff(d, Int64(i), Int64(8)))
+        end
         0 <= value < units_per_day ||
             throw(ValidationError("Time value $value is outside [0, $units_per_day) for $(t.unit)"))
     end

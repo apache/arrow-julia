@@ -1245,18 +1245,18 @@ function _threaded_cursor_stress()
     ]
     stream = IPCStream(sch, AC.FrozenVector{Field}(Field[]), batches, 1, false)
     results = [Int64[] for _ = 1:workers]
-    violations = ReleaseCounter()
-    ready = ReleaseCounter()
+    violations = AC.ReleaseCounter()
+    ready = AC.ReleaseCounter()
     start = Base.Event()
     tasks = [Threads.@spawn begin
-        increment!(ready)
+        AC.increment!(ready)
         wait(start)
         while true
             b = try
                 nextbatch!(stream)
             catch e
                 if e isa Base.ConcurrencyViolationError
-                    increment!(violations)
+                    AC.increment!(violations)
                     yield()
                     continue
                 end

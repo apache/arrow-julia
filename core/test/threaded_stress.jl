@@ -23,11 +23,11 @@ isopen_gate(g::Gate) = @atomic g.open
     @testset "one concurrent closer releases" begin
         for _ = 1:100
             bytes = UInt8[0]
-            calls = ReleaseCounter()
+            calls = AC.ReleaseCounter()
             r = GC.@preserve bytes AC.OwnerRegion(
                 Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
                 root=bytes,
-                releasefn=NotifyRelease(calls))
+                releasefn=AC.NotifyRelease(calls))
             go = Gate()
             tasks = [Threads.@spawn begin
                 while !isopen_gate(go)
@@ -46,11 +46,11 @@ isopen_gate(g::Gate) = @atomic g.open
     @testset "guard and release handshake" begin
         for _ = 1:100
             bytes = UInt8[0x5a]
-            released = ReleaseCounter()
+            released = AC.ReleaseCounter()
             overlap = Gate()
             r = GC.@preserve bytes AC.OwnerRegion(
                 Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
-                root=bytes, releasefn=NotifyRelease(released))
+                root=bytes, releasefn=AC.NotifyRelease(released))
             go = Gate()
             workers = [Threads.@spawn begin
                 while !isopen_gate(go)
@@ -88,13 +88,13 @@ isopen_gate(g::Gate) = @atomic g.open
         f, built = fromjulia("x", [i % 7 == 0 ? missing : i for i = 1:10_000])
         d = AC.ArrayData(built.type, built.len, built.buffers)
         expected = count(i -> i % 7 == 0, 1:10_000)
-        failures = ReleaseCounter()
+        failures = AC.ReleaseCounter()
         Threads.@threads for _ = 1:1000
             try
-                nullcount(d) == expected || increment!(failures)
-                validate_semantic(f, d) === d || increment!(failures)
+                nullcount(d) == expected || AC.increment!(failures)
+                validate_semantic(f, d) === d || AC.increment!(failures)
             catch
-                increment!(failures)
+                AC.increment!(failures)
             end
         end
         @test failures[] == 0

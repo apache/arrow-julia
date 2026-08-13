@@ -37,10 +37,10 @@ function exercise_regions()::Nothing
     checked(AC.loadat(b, Int64, Int64(24)) == 4, "heap tail load failed")
     sub = AC.subslice(b, 8, 16)
     checked(AC.loadat(sub, Int64, Int64(0)) == 2, "subslice load failed")
-    notes = ReleaseCounter()
+    notes = AC.ReleaseCounter()
     bytes = UInt8[0x7f]
     fr = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1,
-        AC.Foreign; root=bytes, releasefn=NotifyRelease(notes))
+        AC.Foreign; root=bytes, releasefn=AC.NotifyRelease(notes))
     checked(withguard(() -> 1, fr) == 1, "guard failed")
     checked(forceclose!(fr), "forceclose failed")
     checked(notes[] == 1, "release action did not run exactly once")
