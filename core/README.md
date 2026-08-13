@@ -37,7 +37,7 @@ listed under Honest status.
 | `test/runtests.jl` | Core layout, validation, cache, bounds, lifecycle, mmap, and concurrency tests; it also starts a four-thread stress subprocess |
 | `examples/ipc_read.jl` | Checked IPC stream framing, a bounded metadata verifier, metadata-to-Core mapping, dictionary state, and one registry-driven decoder over real 2.x-written streams |
 | `examples/cdata.jl` | C ABI definitions, zero-copy export and import, shared-tree ownership, C move semantics, exactly-once release, and lifecycle tests |
-| `REVIEW-codex-r1.md` | Round-1 findings and the disposition of each item |
+| `REVIEW-codex-r1.md`, `REVIEW-codex-r2.md`, `REVIEW-codex-r3.md` | Adversarial review findings and the disposition of each item |
 
 ## Run it
 
@@ -55,7 +55,7 @@ julia --startup-file=no core/examples/cdata.jl
 | Deterministic close (§9 Core) | `withguard` and `forceclose!` use one lifecycle word. A sole closer blocks new guards, waits for active guards, restores open state on timeout, and publishes a new closed generation after release. Finalization uses the same protocol. |
 | Logical parameters are values (§8.1) | `TimestampType(unit, timezone)`, `DecimalType(precision, scale, bitwidth)`, and the other descriptors keep schema data out of Julia type parameters. |
 | One structural registry plus bounded per-layout methods (§8.4) | `layoutspec` defines buffer roles, child arity, offset width, and variadic status. Access and semantic rules remain grouped methods. |
-| Staged validation and bounded IPC metadata work (§8.5) | Structural checks are separate from semantic and full checks. Data-intrinsic semantic results are cached; Field contracts run every time. The IPC verifier applies object, depth, byte, message, buffer, and array limits before metadata-directed decode work. |
+| Staged validation and bounded IPC metadata work (§8.5) | Structural checks are separate from semantic and full checks, and each later public stage composes the earlier stages. Data-intrinsic semantic results are cached; Field contracts run every time. The IPC verifier applies object, depth, byte, message, buffer, and array limits before metadata-directed decode work. |
 | Message body is the decode authority (§9 IPC) | Every declared batch buffer becomes a checked `subslice` of its own message body. Cursor completion and non-overlap checks reject skewed buffer tables. |
 | IPC ids remain adapter state (§9) | `corefield` records ids in identity-keyed adapter tables. `DictionaryType` holds the value type and `ArrayData.dictionary` holds the value array; neither stores an IPC id. |
 | C Data is a direct mapping over `ArrayData` (§9 C Data) | `to_c_data` and `from_c_data` use per-structure callbacks and controls, separate schema/array aggregate roots, source-region pins, transitive release, and explicit reaping. Tests cover child moves, nested moves, siblings, dictionaries, failures, and post-release access. |
@@ -90,6 +90,13 @@ entries and structural validation but no semantic validation or accessors.
 certifying unchecked content. This is a declared scope boundary.
 `validate_full` adds UTF-8 well-formedness only for supported layouts;
 canonical padding and unused-bit checks remain production work.
+Map validation checks physical layout and reachable Field nullability. It does
+not check key uniqueness, hashability, or ordering; `keysSorted` remains a
+producer declaration.
+Core `RecordBatch` buffers must use host-native endianness. An adapter must
+normalize non-native input before it constructs a batch.
+Timestamp validation checks the Arrow unit domain and timezone-string UTF-8.
+It does not resolve names against a timezone database.
 
 The IPC example has a narrower mapping. It reads streams containing integer,
 floating point, Boolean, decimal, date, time, timestamp, duration, UTF-8,
@@ -102,6 +109,10 @@ dictionary replacement, preserves old dictionary snapshots, and rejects
 delta dictionaries. It requires the current eight-byte continuation-marker
 framing and does not accept the pre-0.15 four-byte legacy prefix. Compression
 and endian normalization are excluded.
+
+The IPC adapter runs structural and semantic Core validation before it exposes
+a batch. It does not opt into `validate_full`, so UTF-8 body content is not
+checked. The byte-wise metadata verifier does validate FlatBuffer strings.
 
 The IPC example reads one borrowed `Vector{UInt8}` and eagerly decodes all
 batches before it exposes the `RecordBatchSource` pull interface. The caller
@@ -128,8 +139,11 @@ checked geometry that the ABI does expose. Import and export run full UTF-8
 validation. Field names that contain an embedded NUL are rejected because
 the C interface uses NUL-terminated strings.
 
-The C release callbacks implement transitive release and consumer move
-semantics only under this prove-out execution contract: callbacks for
+The C release callbacks use producer-owned canonical child and dictionary
+topology, so cleanup does not depend on caller-mutated public counts or pointer
+tables. They still inspect canonical descendants' public release fields to
+honor consumer moves. The callbacks implement transitive release and consumer
+move semantics only under this prove-out execution contract: callbacks for
 one exported tree are serialized and run on Julia-attached threads. They call
 Julia and use a `ReentrantLock`. The production native CAS and lock-free
 foreign-thread trampoline from §9 is not implemented. `reap!` performs an

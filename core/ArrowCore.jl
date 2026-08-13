@@ -1459,8 +1459,9 @@ end
 function _value(t::DecimalType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     w = primwidth(t)
-    # 128/256-bit decimals surface as raw little-endian bytes in the
-    # prove-out (BigInt/Int256 conversion is facade work); 32/64 as integers.
+    # 128/256-bit decimals surface as raw native-endian bytes in the prove-out
+    # (BigInt/Int256 conversion is facade work); 32/64 as integers. Core
+    # RecordBatches accept native-endian buffers only.
     if t.bits == 32
         return loadat(rolebuffer(d, DATA), Int32, _slotbyteoff(d, i, w))
     elseif t.bits == 64
