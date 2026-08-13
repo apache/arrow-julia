@@ -1115,6 +1115,342 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
 end
 
 # ---------------------------------------------------------------------------
+# C stream interface (ArrowArrayStream): batches over the same two mappings
+# ---------------------------------------------------------------------------
+
+# Execution contract (report §9, v1): stream callbacks call into Julia, so
+# `get_schema`/`get_next`/`get_last_error`/`release` are legal ONLY from
+# Julia-attached threads, and calls on one stream must not overlap (the C
+# stream spec itself declares the structure not thread-safe). Marshaling to
+# a Julia-owned worker so any-thread callers become legal is production
+# adapter work, not prove-out work.
+
+struct CArrowArrayStream
+    get_schema::Ptr{Cvoid}     # int (*)(ArrowArrayStream*, ArrowSchema* out)
+    get_next::Ptr{Cvoid}       # int (*)(ArrowArrayStream*, ArrowArray* out)
+    get_last_error::Ptr{Cvoid} # const char* (*)(ArrowArrayStream*)
+    release::Ptr{Cvoid}        # void (*)(ArrowArrayStream*)
+    private_data::Ptr{Cvoid}
+end
+
+const EINVAL = Cint(22)
+
+mutable struct ExportedStreamState
+    batchfield::Field                 # struct-typed: children are the schema
+    batches::Vector{AC.RecordBatch}
+    nextindex::Int
+    lasterror::Ptr{UInt8}             # malloc'd NUL string; freed on replace/release
+end
+
+const STREAM_REGISTRY = Dict{Int64,ExportedStreamState}()
+
+function _stream_state(sp::Ptr{CArrowArrayStream})
+    stream = unsafe_load(sp)
+    stream.release == C_NULL && return nothing, Ptr{Cvoid}(C_NULL)
+    control = stream.private_data
+    control == C_NULL && return nothing, Ptr{Cvoid}(C_NULL)
+    key = unsafe_load(Ptr{Int64}(control + 8))
+    state = lock(REGISTRY_LOCK) do
+        get(STREAM_REGISTRY, key, nothing)
+    end
+    return state, control
+end
+
+function _set_stream_error!(state::ExportedStreamState, msg::AbstractString)
+    clean = replace(msg, '\0' => ' ')
+    bytes = codeunits(clean)
+    p = Libc.malloc(length(bytes) + 1)
+    p == C_NULL && return nothing   # error reporting must not throw
+    for (i, b) in enumerate(bytes)
+        unsafe_store!(Ptr{UInt8}(p), b, i)
+    end
+    unsafe_store!(Ptr{UInt8}(p), 0x00, length(bytes) + 1)
+    old = state.lasterror
+    state.lasterror = Ptr{UInt8}(p)
+    old == C_NULL || Libc.free(old)
+    return nothing
+end
+
+function _stream_get_schema(sp::Ptr{CArrowArrayStream},
+    out::Ptr{CArrowSchema})::Cint
+    state, _ = _stream_state(sp)
+    state === nothing && return EINVAL
+    try
+        srel = @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
+        shell = Ref{Ptr{CArrowSchema}}(C_NULL)
+        _newroot(Any[state.batchfield]; result_slot=shell) do root
+            _export_schema!(root, state.batchfield, srel)
+        end
+        # The consumer owns the copy in `out`; release finds our control
+        # through private_data, so the copied struct is the live node and the
+        # shell malloc simply waits for the reap.
+        unsafe_store!(out, unsafe_load(shell[]))
+        return Cint(0)
+    catch e
+        _set_stream_error!(state, sprint(showerror, e))
+        return EINVAL
+    end
+end
+
+function _stream_get_next(sp::Ptr{CArrowArrayStream},
+    out::Ptr{CArrowArray})::Cint
+    state, _ = _stream_state(sp)
+    state === nothing && return EINVAL
+    try
+        if state.nextindex > length(state.batches)
+            # End of stream: a released (NULL-release) struct, per spec.
+            unsafe_store!(out, CArrowArray(0, 0, 0, 0, 0,
+                Ptr{Ptr{Cvoid}}(C_NULL), Ptr{Ptr{CArrowArray}}(C_NULL),
+                Ptr{CArrowArray}(C_NULL), Ptr{Cvoid}(C_NULL),
+                Ptr{Cvoid}(C_NULL)))
+            return Cint(0)
+        end
+        b = state.batches[state.nextindex]
+        d = ArrayData(StructType(), b.nrows, [BufferSlice()];
+            children=collect(ArrayData, b.columns), nullcount=0)
+        validate_structural(state.batchfield, d)
+        validate_semantic(state.batchfield, d)
+        validate_full(state.batchfield, d)
+        arel = @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},))
+        shell = Ref{Ptr{CArrowArray}}(C_NULL)
+        _newroot(Any[d]; result_slot=shell) do root
+            _export_array!(root, d, arel)
+        end
+        unsafe_store!(out, unsafe_load(shell[]))
+        state.nextindex += 1
+        return Cint(0)
+    catch e
+        _set_stream_error!(state, sprint(showerror, e))
+        return EINVAL
+    end
+end
+
+function _stream_get_last_error(sp::Ptr{CArrowArrayStream})::Ptr{UInt8}
+    state, _ = _stream_state(sp)
+    state === nothing && return Ptr{UInt8}(C_NULL)
+    return state.lasterror
+end
+
+function _stream_release(sp::Ptr{CArrowArrayStream})::Cvoid
+    # Claim/commit with no error channel, like the node callbacks. Batch and
+    # schema roots already handed to the consumer keep their own lifetimes.
+    lock(REGISTRY_LOCK) do
+        stream = unsafe_load(sp)
+        stream.release == C_NULL && return nothing
+        control = stream.private_data
+        control == C_NULL && return nothing
+        key = unsafe_load(Ptr{Int64}(control + 8))
+        state = get(STREAM_REGISTRY, key, nothing)
+        state === nothing && return nothing
+        pop!(STREAM_REGISTRY, key)
+        state.lasterror == C_NULL || Libc.free(state.lasterror)
+        state.lasterror = Ptr{UInt8}(C_NULL)
+        _store_field!(sp, :release, Ptr{Cvoid}(C_NULL))
+        _store_field!(sp, :private_data, Ptr{Cvoid}(C_NULL))
+        Libc.free(control)
+        return nothing
+    end
+    return nothing
+end
+
+"""
+    export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema, batches)
+
+Fill a CALLER-owned ArrowArrayStream struct (the C stream convention: the
+producer fills, the consumer owns the struct storage) streaming `batches` as
+struct-typed arrays whose children are the schema's columns. The stream's
+registry root keeps schema fields and batches reachable until `release`;
+every `get_schema`/`get_next` result is its own export root with the same
+lifecycle as `to_c_data` output.
+"""
+function export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
+    batches::AbstractVector{AC.RecordBatch})
+    for b in batches
+        length(b.columns) == length(sch.fields) ||
+            throw(ValidationError("stream batch column count does not match the schema"))
+    end
+    batchfield = Field("", StructType(); nullable=false,
+        children=collect(Field, sch.fields))
+    control = Libc.malloc(CONTROL_BLOCK_BYTES)
+    control == C_NULL && throw(OutOfMemoryError())
+    key = lock(REGISTRY_LOCK) do
+        NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
+    end
+    unsafe_store!(Ptr{UInt8}(control), 0x00)
+    unsafe_store!(Ptr{Int64}(control + 8), key)
+    state = ExportedStreamState(batchfield,
+        collect(AC.RecordBatch, batches), 1, Ptr{UInt8}(C_NULL))
+    lock(REGISTRY_LOCK) do
+        STREAM_REGISTRY[key] = state
+    end
+    unsafe_store!(sp, CArrowArrayStream(
+        @cfunction(_stream_get_schema, Cint,
+            (Ptr{CArrowArrayStream}, Ptr{CArrowSchema})),
+        @cfunction(_stream_get_next, Cint,
+            (Ptr{CArrowArrayStream}, Ptr{CArrowArray})),
+        @cfunction(_stream_get_last_error, Ptr{UInt8},
+            (Ptr{CArrowArrayStream},)),
+        @cfunction(_stream_release, Cvoid, (Ptr{CArrowArrayStream},)),
+        control))
+    return sp
+end
+
+_stream_registry_count() = lock(REGISTRY_LOCK) do
+    length(STREAM_REGISTRY)
+end
+
+# ---- import half ----------------------------------------------------------
+
+"""
+One owner for one MOVED ArrowArrayStream, mirroring ForeignOwner: a malloc'd
+copy of the moved struct gives the producer's callbacks a stable address, one
+atomic flag picks the single releaser between explicit `release!` and the GC
+finalizer, and post-release calls are the spec's own undefined behavior.
+"""
+mutable struct StreamOwner
+    const block::Ptr{CArrowArrayStream}
+    @atomic released::Bool
+    function StreamOwner(stream::CArrowArrayStream)
+        block = Libc.malloc(sizeof(CArrowArrayStream))
+        block == C_NULL && throw(OutOfMemoryError())
+        p = Ptr{CArrowArrayStream}(block)
+        o = try
+            unsafe_store!(p, stream)
+            new(p, false)
+        catch
+            Libc.free(block)
+            rethrow()
+        end
+        try
+            finalizer(release!, o)
+        catch
+            release!(o)
+            rethrow()
+        end
+        return o
+    end
+end
+
+function release!(o::StreamOwner)
+    @atomicswap(o.released = true) && return nothing
+    cb = unsafe_load(o.block).release
+    if cb != C_NULL
+        ccall(cb, Cvoid, (Ptr{CArrowArrayStream},), o.block)
+        unsafe_load(o.block).release == C_NULL ||
+            (Libc.free(o.block);
+                error("C stream producer release did not mark the structure released"))
+    end
+    Libc.free(o.block)
+    return nothing
+end
+
+"""
+    ImportedStream
+
+Consumer side of a moved ArrowArrayStream: `schema(s)` is fixed at import,
+`nextbatch!(s)` pulls one struct-typed batch (returning `nothing` at end of
+stream), and `release!(s)` ends the producer's stream exactly once. Each
+pulled batch owns its own ForeignOwner and outlives the stream if the caller
+keeps it. Producer-reported failures surface as `ValidationError`s carrying
+the producer's `get_last_error` text.
+"""
+mutable struct ImportedStream <: AC.RecordBatchSource
+    const owner::StreamOwner
+    const batchfield::Field
+    const schema::Schema
+    done::Bool
+end
+
+AC.schema(s::ImportedStream) = s.schema
+release!(s::ImportedStream) = release!(s.owner)
+
+function _stream_call_failed(o::StreamOwner, what::AbstractString)
+    cb = unsafe_load(o.block).get_last_error
+    msg = "C stream $what failed"
+    if cb != C_NULL
+        p = ccall(cb, Ptr{UInt8}, (Ptr{CArrowArrayStream},), o.block)
+        p == C_NULL || (msg *= ": " * _import_cstring(p, "stream error"))
+    end
+    throw(ValidationError(msg))
+end
+
+"""
+    from_c_stream(sp::Ptr{CArrowArrayStream}) -> ImportedStream
+
+Move a producer's stream (copy the struct, null the source release) and read
+its schema. The schema must be a struct-typed batch schema, per the C stream
+convention; its fields become the imported `Schema`.
+"""
+function from_c_stream(sp::Ptr{CArrowArrayStream})
+    sp == C_NULL && throw(ArgumentError("ArrowArrayStream pointer is NULL"))
+    stream = unsafe_load(sp)
+    stream.release == C_NULL &&
+        throw(ArgumentError("cannot import a released stream"))
+    (stream.get_schema == C_NULL || stream.get_next == C_NULL) &&
+        throw(ArgumentError("C stream is missing required callbacks"))
+    owner = StreamOwner(stream)
+    _store_field!(sp, :release, Ptr{Cvoid}(C_NULL))   # the move commit
+    try
+        out = Ref(CArrowSchema(Ptr{UInt8}(C_NULL), Ptr{UInt8}(C_NULL),
+            Ptr{UInt8}(C_NULL), 0, 0, Ptr{Ptr{CArrowSchema}}(C_NULL),
+            Ptr{CArrowSchema}(C_NULL), Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL)))
+        status = GC.@preserve out ccall(unsafe_load(owner.block).get_schema,
+            Cint, (Ptr{CArrowArrayStream}, Ptr{CArrowSchema}),
+            owner.block, Base.unsafe_convert(Ptr{CArrowSchema}, out))
+        status == 0 || _stream_call_failed(owner, "get_schema")
+        sch = out[]
+        batchfield = GC.@preserve out try
+            _preflight_schema(sch)
+            _import_field(sch)
+        finally
+            _release_c_schema!(Base.unsafe_convert(Ptr{CArrowSchema}, out), sch)
+        end
+        batchfield.type isa StructType ||
+            throw(ValidationError("C stream schema must be a struct-typed batch schema"))
+        return ImportedStream(owner, batchfield,
+            Schema(collect(Field, batchfield.children)), false)
+    catch
+        release!(owner)
+        rethrow()
+    end
+end
+
+function AC.nextbatch!(s::ImportedStream)
+    # Fail closed on a released stream even when it already ended naturally:
+    # release terminates the consumer contract, not just the batch supply.
+    (@atomic s.owner.released) &&
+        throw(ArgumentError("cannot pull from a released stream"))
+    s.done && return nothing
+    out = Ref(CArrowArray(0, 0, 0, 0, 0, Ptr{Ptr{Cvoid}}(C_NULL),
+        Ptr{Ptr{CArrowArray}}(C_NULL), Ptr{CArrowArray}(C_NULL),
+        Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL)))
+    status = GC.@preserve out ccall(unsafe_load(s.owner.block).get_next,
+        Cint, (Ptr{CArrowArrayStream}, Ptr{CArrowArray}),
+        s.owner.block, Base.unsafe_convert(Ptr{CArrowArray}, out))
+    status == 0 || _stream_call_failed(s.owner, "get_next")
+    arr = out[]
+    if arr.release == C_NULL
+        s.done = true
+        return nothing
+    end
+    # The producer moved this array into our stack slot; it is ours to own.
+    batchowner = ForeignOwner(arr)
+    d = try
+        _arm_foreign_owner!(batchowner)
+        _preflight_array(s.batchfield, arr)
+        d0 = _import_array(s.batchfield, arr, batchowner)
+        validate_structural(s.batchfield, d0)
+        validate_semantic(s.batchfield, d0)
+        validate_full(s.batchfield, d0)
+        d0
+    catch
+        _release_moved_owner!(batchowner)
+        rethrow()
+    end
+    return AC.RecordBatch(s.schema, collect(ArrayData, d.children), d.len)
+end
+
+# ---------------------------------------------------------------------------
 # Demo: export -> import round-trip, release lifecycle, failure paths
 # ---------------------------------------------------------------------------
 
@@ -2075,6 +2411,108 @@ function main()
     @assert reap!() == 2
     @assert _registry_count() == 0
     println("invalid imported names and UTF-8 fail with exact cleanup ✓")
+
+    # ---- C stream interface --------------------------------------------
+
+    # Export a two-batch stream through a caller-owned struct, move it into
+    # an importer, and compare both batches against the source. Every
+    # get_schema/get_next result is its own export root; the stream root
+    # itself lives in the stream registry until release.
+    sbefore = _registry_count()
+    stbefore = _stream_registry_count()
+    b1 = batch((xs=Int64[1, 2, 3], strs=["a", missing, "c"]))
+    b2 = batch((xs=Int64[4, 5], strs=[missing, "e"]))
+    streamref = Ref{CArrowArrayStream}()
+    GC.@preserve streamref begin
+        spp = Base.unsafe_convert(Ptr{CArrowArrayStream}, streamref)
+        export_stream!(spp, b1.schema, AC.RecordBatch[b1, b2])
+        @assert _stream_registry_count() == stbefore + 1
+        s = from_c_stream(spp)
+        @assert streamref[].release == C_NULL      # moved out of the source
+        @assert length(s.schema.fields) == 2
+        @assert [f.name for f in s.schema.fields] == ["xs", "strs"]
+        owners = ForeignOwner[]
+        for source in (b1, b2)
+            got = nextbatch!(s)
+            @assert got isa AC.RecordBatch
+            @assert got.nrows == source.nrows
+            for (i, f) in enumerate(s.schema.fields)
+                @assert isequal(collect(Any, materialize(f, got.columns[i])),
+                    collect(Any, materialize(source.schema.fields[i],
+                        source.columns[i]))) f.name
+            end
+            push!(owners, got.columns[1].owner::ForeignOwner)
+        end
+        @assert nextbatch!(s) === nothing
+        @assert nextbatch!(s) === nothing          # end of stream is sticky
+        release!(s)
+        release!(s)                                 # exactly-once
+        @assert try
+            nextbatch!(s)
+            false
+        catch e
+            e isa ArgumentError
+        end
+        foreach(release!, owners)
+    end
+    @assert reap!() == 3                            # one schema + two batch roots
+    @assert _registry_count() == sbefore
+    @assert _stream_registry_count() == stbefore
+    println("C stream export/import round-trips with exact lifecycle ✓")
+
+    # Producer-side failures surface through get_last_error: batch two is
+    # invalid UTF-8, so its get_next reports EINVAL and the importer throws
+    # a ValidationError carrying the producer's message.
+    okf, okd = fromjulia("s", ["ok"])
+    badd = ArrayData(Utf8Type(false), 1,
+        [BufferSlice(), AC._databuffer(Int32[0, 1]),
+         AC._databuffer(UInt8[0xff])]; nullcount=0)
+    badsch = Schema(Field[okf])
+    streamref2 = Ref{CArrowArrayStream}()
+    GC.@preserve streamref2 begin
+        spp2 = Base.unsafe_convert(Ptr{CArrowArrayStream}, streamref2)
+        export_stream!(spp2, badsch, AC.RecordBatch[
+            AC.RecordBatch(badsch, ArrayData[okd], 1),
+            AC.RecordBatch(badsch, ArrayData[badd], 1)])
+        s2 = from_c_stream(spp2)
+        first = nextbatch!(s2)
+        @assert first isa AC.RecordBatch
+        caught = try
+            nextbatch!(s2)
+            false
+        catch e
+            e isa ValidationError && occursin("UTF-8", e.msg)
+        end
+        @assert caught
+        release!(s2)
+        release!(first.columns[1].owner::ForeignOwner)
+    end
+    @assert reap!() == 2                            # schema + first batch root
+    @assert _registry_count() == sbefore
+    @assert _stream_registry_count() == stbefore
+    println("producer errors travel through get_last_error into clean throws ✓")
+
+    # Zero-batch streams end immediately; a moved source cannot be imported
+    # twice; releasing the producer side directly leaves importer calls
+    # failing cleanly rather than crashing.
+    streamref3 = Ref{CArrowArrayStream}()
+    GC.@preserve streamref3 begin
+        spp3 = Base.unsafe_convert(Ptr{CArrowArrayStream}, streamref3)
+        export_stream!(spp3, b1.schema, AC.RecordBatch[])
+        s3 = from_c_stream(spp3)
+        @assert try
+            from_c_stream(spp3)
+            false
+        catch e
+            e isa ArgumentError
+        end
+        @assert nextbatch!(s3) === nothing
+        release!(s3)
+    end
+    @assert reap!() == 1                            # the get_schema root
+    @assert _stream_registry_count() == stbefore
+    @assert _registry_count() == sbefore
+    println("zero-batch streams, double import, and release edges hold ✓")
 
     stresscmd = `$(Base.julia_cmd()) --startup-file=no --threads=4 $(abspath(@__FILE__))`
     success(addenv(stresscmd, "ARROWCORE_CDATA_STRESS" => "1")) ||

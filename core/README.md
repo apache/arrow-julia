@@ -238,9 +238,25 @@ foreign-thread trampoline from §9 is not implemented. `reap!` performs an
 explicit registry scan; there is no background reaper. Schema and array trees
 have independent aggregate lifetimes and per-node control blocks.
 
+The C stream interface (`ArrowArrayStream`) is mapped in both directions.
+`export_stream!` fills a caller-owned struct that streams batches as
+struct-typed arrays (children = the schema's columns); each
+`get_schema`/`get_next` result is an ordinary export root with the standard
+release/reap lifecycle, producer-side failures are reported through
+`get_last_error` (EINVAL + a NUL-terminated message owned by the stream
+until replaced or released), and the stream's own registry root drops at its
+release callback. `from_c_stream` moves a producer's stream (struct copy +
+source release null), reads the schema once, pulls batches whose trees each
+own one ForeignOwner, and surfaces producer errors as exceptions carrying
+the producer's message. Execution contract (report §9, v1, stated loudly):
+stream callbacks call into Julia, so they are legal only from Julia-attached
+threads, and calls on one stream must not overlap — the C stream spec itself
+declares the structure not thread-safe. The marshaling worker that would
+make any-thread callers legal is production work.
+
 Other exclusions are unchanged: no parallel writer coordinator or byte-credit
 pipeline, append-as-resume, facade, `ViewPlan`, typed views, ArrowTypes
-integration, C stream interface, or builders beyond test support. `mmapregion` maps via
+integration, or builders beyond test support. `mmapregion` maps via
 the Mmap STDLIB (cross-platform) and keeps the mapped array as the region's
 `root`; the stdlib finalizer unmaps when that root becomes unreachable (see
 "Memory model"). The mapped array is an internal anchor: resizing it through
