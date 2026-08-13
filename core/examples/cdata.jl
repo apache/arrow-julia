@@ -562,12 +562,31 @@ mutable struct ForeignOwner
     function ForeignOwner(arr::CArrowArray)
         o = new()
         o.array = arr
-        # The gate has no data extent. Its finalizer is the shared-mode
-        # backstop. Every imported BufferSlice guards this same lifecycle.
-        o.gate = OwnerRegion(Ptr{UInt8}(0), 0, AC.Foreign; root=o,
-            releasefn=_release_foreign_tree!)
+        # Construct the gate unarmed. Until the source ArrowArray's release
+        # field is nulled, that source remains the sole owner. Arming a
+        # finalizer here would create two owners if the task were interrupted
+        # before the move completed.
+        o.gate = OwnerRegion(Ptr{UInt8}(0), 0, AC.Foreign; root=o)
         return o
     end
+end
+
+function _arm_foreign_owner!(o::ForeignOwner)
+    # The gate has no data extent. Its finalizer is the shared-mode backstop.
+    # Every imported BufferSlice guards this same lifecycle.
+    o.gate.releasefn = _release_foreign_tree!
+    finalizer(AC._finalize_region!, o.gate)
+    return nothing
+end
+
+function _release_moved_owner!(o::ForeignOwner)
+    # A failure may occur after the source move but before finalizer
+    # registration. Install the callback locally so forceclose! still owns
+    # the copied producer release in that seam.
+    o.gate.releasefn === nothing &&
+        (o.gate.releasefn = _release_foreign_tree!)
+    release!(o)
+    return nothing
 end
 
 function _release_foreign_tree!(gate::OwnerRegion)
@@ -583,7 +602,6 @@ function _release_foreign_tree!(gate::OwnerRegion)
     end
     return nothing
 end
-
 
 function release!(o::ForeignOwner; timeout_ms::Integer=1000)
     forceclose!(o.gate; timeout_ms=timeout_ms) ||
@@ -606,7 +624,11 @@ DECLARED extents (report §9): the ABI cannot prove the allocation sizes, so
 this is the trusted-in-process boundary, and validation runs on the declared
 geometry. A failed import releases the moved tree exactly once.
 """
-function from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray})
+from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}) =
+    _from_c_data(sp, ap, () -> nothing)
+
+function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray},
+    after_move)
     sp == C_NULL && throw(ArgumentError("ArrowSchema pointer is NULL"))
     ap == C_NULL && throw(ArgumentError("ArrowArray pointer is NULL"))
     sch = unsafe_load(sp)
@@ -614,9 +636,17 @@ function from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray})
     (sch.release == C_NULL || arr.release == C_NULL) &&
         throw(ArgumentError("cannot import a released structure"))
     owner = ForeignOwner(arr)
-    # MOVE: the source array struct no longer owns anything.
-    _store_field!(ap, :release, Ptr{Cvoid}(C_NULL))
+    moved = false
     try
+        # MOVE: relinquish source ownership before arming the copied owner's
+        # finalizer. Keep the store and local handoff flag non-interruptible so
+        # cleanup always knows which side owns the producer callback.
+        Base.disable_sigint() do
+            _store_field!(ap, :release, Ptr{Cvoid}(C_NULL))
+            moved = true
+            after_move()
+            _arm_foreign_owner!(owner)
+        end
         _preflight_schema(sch)
         f = _import_field(sch)
         _preflight_array(f, arr)
@@ -626,7 +656,10 @@ function from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray})
         validate_full(f, d)
         return f, d
     catch
-        release!(owner)   # failed-import cleanup: exactly once, then rethrow
+        # Before the move, the caller's source remains the owner. After the
+        # move, this local copy must release exactly once even when finalizer
+        # registration or later validation failed.
+        moved && _release_moved_owner!(owner)
         rethrow()
     finally
         # The schema struct's lifetime is separate from the array's and it
@@ -1141,6 +1174,25 @@ function main()
     release!(_d.owner::ForeignOwner)
     @assert reap!() == 2
     println("moved (released) source cannot be imported twice ✓")
+
+    # Ownership transfer must remain exactly-once if the task fails after the
+    # source release field is nulled but before the copied owner is armed.
+    hf, hd = fromjulia("handoff", Int64[1])
+    handoff_region = hd.buffers[2].region
+    sp, ap = to_c_data(hf, hd)
+    @assert !forceclose!(handoff_region; timeout_ms=0)
+    @assert try
+        _from_c_data(sp, ap, () -> throw(InterruptException()))
+        false
+    catch e
+        e isa InterruptException
+    end
+    @assert unsafe_load(sp).release == C_NULL
+    @assert unsafe_load(ap).release == C_NULL
+    @assert reap!() == 2
+    @assert _registry_count() == 0
+    @assert forceclose!(handoff_region; timeout_ms=0)
+    println("interrupted C import handoff retains one owner ✓")
 
     # A root release must transitively release every child. Inspect before
     # reap, while the exported structs remain allocated.
