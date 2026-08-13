@@ -115,6 +115,33 @@ end
             (_p, _len) -> (committed_calls[] += 1))
         @test committed_calls[] == 1
 
+        # A constructor failure has no escaped owner that can retry cleanup.
+        # An interrupted attempt must finish before the original error escapes.
+        construction_attempts = Ref(0)
+        construction_unmapper = function (p, len)
+            construction_attempts[] += 1
+            construction_attempts[] == 1 && throw(InterruptException())
+            AC._munmap!(p, len)
+        end
+        @test_throws ErrorException AC._mmapregion(path, makeowner;
+            unmapper=construction_unmapper)
+        @test construction_attempts[] == 2
+
+        # The mmap-specific OwnerRegion callback has the same no-escape rule.
+        # Generic callbacks are still exactly-once when they throw.
+        close_attempts = Ref(0)
+        close_unmapper = function (p, len)
+            close_attempts[] += 1
+            close_attempts[] == 1 && throw(InterruptException())
+            AC._munmap!(p, len)
+        end
+        interrupted_close = AC._mmapregion(path; unmapper=close_unmapper)
+        @test forceclose!(interrupted_close)
+        @test close_attempts[] == 2
+        @test AC.phase(@atomic interrupted_close.state) == AC.PHASE_CLOSED
+        finalize(interrupted_close)
+        @test close_attempts[] == 2
+
         r = AC._mmapregion(path; unmapper=unmapper)
         @test unmaps[] == 2
         @test forceclose!(r)

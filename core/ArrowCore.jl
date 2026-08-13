@@ -381,7 +381,8 @@ mapping cannot keep a semantic certificate valid when another file handle or
 process changes its bytes, and truncation can also make an in-range load fault.
 """
 function _munmap!(p::Ptr, len::Integer)
-    ccall(:munmap, Cint, (Ptr{Cvoid}, Csize_t), p, len)
+    rc = ccall(:munmap, Cint, (Ptr{Cvoid}, Csize_t), p, len)
+    Base.systemerror("munmap", rc != 0)
     return nothing
 end
 
@@ -418,6 +419,21 @@ function _release_mapping_once!(state::Threads.Atomic{UInt8}, p::Ptr,
     return nothing
 end
 
+function _release_mapping_noescape!(state::Threads.Atomic{UInt8}, p::Ptr,
+    len::Integer, unmapper)
+    while true
+        try
+            return _release_mapping_once!(state, p, len, unmapper)
+        catch e
+            # This internal ownership handoff has nowhere to return a mapping
+            # after interruption. Retry until munmap either commits or reports
+            # a non-interruption failure. Generic OwnerRegion callbacks remain
+            # exactly-once because arbitrary callbacks may partly free storage.
+            e isa InterruptException || rethrow()
+        end
+    end
+end
+
 function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
     unmapper=_munmap!)
     Sys.isunix() || error("mmapregion: prove-out implements POSIX only")
@@ -434,7 +450,7 @@ function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
         # resource to us. Both possible owners below share this same claim.
         released = Threads.Atomic{UInt8}(0x00)
         release = (r::OwnerRegion) ->
-            _release_mapping_once!(released, r.ptr, r.len, unmapper)
+            _release_mapping_noescape!(released, r.ptr, r.len, unmapper)
         p = ccall(:mmap, Ptr{Cvoid},
             (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
             C_NULL, len, 1 #= PROT_READ =#, 1 #= MAP_SHARED =#, fd, 0)
@@ -447,7 +463,7 @@ function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
                 releasefn=release)::OwnerRegion
             return owner
         catch
-            _release_mapping_once!(released, p, len, unmapper)
+            _release_mapping_noescape!(released, p, len, unmapper)
             rethrow()
         end
     end
