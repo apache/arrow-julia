@@ -54,7 +54,7 @@ julia --startup-file=no core/test/trim_compile_tests.jl         # JuliaC --trim=
 | Report claim (§) | Where proven |
 |---|---|
 | Ownership as an object; bad owned/verified spans fail before access (§8.2) | `OwnerRegion`, checked `BufferSlice` construction, bounds-checked `loadat`, and staged-validation tests. Foreign C extents remain a trusted declaration. |
-| Deterministic close (§9 Core) | **Revised out** — see "Memory model" below. Validity is GC reachability; there is no close operation, no guard on the load path, and no revocation state. The report's deterministic-close machinery was cut as unproven complexity by maintainer decision during this prove-out. |
+| Core memory ownership (§9 Core) | See "Memory model" below. Regions use GC reachability as their sole validity contract. |
 | Logical parameters are values (§8.1) | `TimestampType(unit, timezone)`, `DecimalType(precision, scale, bitwidth)`, and the other descriptors keep schema data out of Julia type parameters. |
 | One structural registry plus bounded per-layout methods (§8.4) | `layoutspec` defines buffer roles, child arity, offset width, and variadic status. Access and semantic rules remain grouped methods. |
 | Staged validation and bounded IPC metadata work (§8.5) | Structural checks are separate from semantic and full checks, and each later public stage composes the earlier stages. Data-intrinsic semantic results are cached; Field contracts run every time. The IPC framer enforces metadata, body, message, and allocation limits; the byte verifier enforces object, depth, and copy-reserve limits; and the decode cursor enforces array and buffer limits before the related work. |
@@ -82,9 +82,9 @@ scheme can), so cutting eager release collapses the whole apparatus.
 What the constraint gives up, knowingly:
 
 - **No eager unmap.** A mapped file's unmap happens when the last region
-  becomes unreachable and the GC runs the stdlib finalizer. On Windows the
-  file cannot be deleted until then (`GC.gc()` before delete, the same rule
-  the Mmap stdlib itself documents).
+  becomes unreachable and the GC runs the stdlib finalizer. On platforms that
+  prohibit deleting a live mapping, collection must complete before the path
+  can be deleted.
 - **No revocation.** Nothing can invalidate outstanding slices; there is no
   `InvalidatedError`. A C-data consumer that touches an imported tree after
   explicitly releasing it gets undefined behavior — exactly the C Data

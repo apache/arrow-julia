@@ -160,7 +160,7 @@ and string, and every per-node control block. Held in EXPORT_REGISTRY under
 their shared aggregate key until all non-moved and moved nodes have been
 released and the reaper runs. Rooting the columns here is the entire
 source-liveness story: raw C pointers handed to a consumer stay valid because
-this object is reachable, not because any region is pinned or locked.
+the registry keeps this object and all source regions reachable.
 """
 mutable struct ExportedRoot
     roots::Vector{Any}          # ArrayData/Field/Schema kept reachable
@@ -544,10 +544,8 @@ function to_c_data(f::Field, d::ArrayData)
 end
 
 function _free_export!(root::ExportedRoot)
-    # Nothing here can fail: freeing mallocs and dropping references are the
-    # only steps left once source liveness is plain reachability. The old
-    # retryable-cleanup protocol existed because releasing region pins could
-    # throw; with no pins there is nothing to retry.
+    # After a root is claimed, cleanup only drops Julia references and frees
+    # tracked mallocs. There is no fallible ownership transition to retry.
     empty!(root.schema_topology)
     empty!(root.array_topology)
     while !isempty(root.mallocs)
@@ -1122,7 +1120,7 @@ function main()
     @assert _registry_count() == before
     println("in-progress exports are hidden from the reaper ✓")
 
-    # Every native allocation and source guard must have an owner before the
+    # Every native allocation and source lifetime must have an owner before the
     # next fallible operation. Inject failures at each ownership handoff.
     deallocations = Ref(0)
     @assert try

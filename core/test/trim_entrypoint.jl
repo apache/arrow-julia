@@ -46,7 +46,7 @@ function exercise_regions()::Nothing
         root=bytes)
     fb = BufferSlice(fr, 0, 1)
     checked(AC.loadat(fb, UInt8, Int64(0)) == 0x7f, "rooted raw load failed")
-    # Bounds checks are the only per-load guard in the constrained model.
+    # Each raw load retains its final bounds check in the constrained model.
     caught = false
     try
         AC.loadat(b, Int64, Int64(32))
