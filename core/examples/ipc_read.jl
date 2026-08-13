@@ -57,6 +57,13 @@
 
 using Arrow                      # the existing 2.x package (repo project)
 using Arrow.Tables               # partitioner for the multi-batch test write
+# Buffer compression codecs (repo-project deps, reused like the metadata
+# bindings). In the production package these are package extensions; here the
+# closed two-codec set is a concrete switch — which is also the trim-friendly
+# shape (report §14.4: codecs behind extensions, chosen statically per build).
+using Arrow.CodecLz4: LZ4FrameCompressor, LZ4FrameDecompressor
+using Arrow.CodecZstd: ZstdCompressor, ZstdDecompressor
+import Arrow.CodecZstd.TranscodingStreams as TS
 using PooledArrays               # adversarial dictionary-pool fixture
 const FB = Arrow.FlatBuffers     # vendored flatbuffers runtime (reused as-is)
 const Meta = Arrow.Meta          # vendored format metadata bindings (reused)
@@ -708,6 +715,46 @@ end
 # thrown error at the *end* of the batch (leftover nodes/buffers), not
 # corruption.
 
+# Buffer compression (report §9 IPC adapter): one codec context per reader,
+# reused across buffers and explicitly finalized when the reader is done — no
+# global pools (the 2.x design retains one native context per possible thread
+# for process lifetime with no finalization, src/Arrow.jl:83-142).
+const CODEC_NONE = Int8(-1)
+const CODEC_LZ4_FRAME = Int8(0)   # Meta.CompressionType.LZ4_FRAME
+const CODEC_ZSTD = Int8(1)        # Meta.CompressionType.ZSTD
+
+mutable struct Decompressors
+    lz4::Union{Nothing,LZ4FrameDecompressor}
+    zstd::Union{Nothing,ZstdDecompressor}
+end
+Decompressors() = Decompressors(nothing, nothing)
+
+function _decompressor(d::Decompressors, codec::Int8)
+    if codec == CODEC_LZ4_FRAME
+        if d.lz4 === nothing
+            c = LZ4FrameDecompressor()
+            TS.initialize(c)
+            d.lz4 = c
+        end
+        return d.lz4
+    else
+        if d.zstd === nothing
+            c = ZstdDecompressor()
+            TS.initialize(c)
+            d.zstd = c
+        end
+        return d.zstd
+    end
+end
+
+function Base.close(d::Decompressors)
+    d.lz4 === nothing || TS.finalize(d.lz4)
+    d.zstd === nothing || TS.finalize(d.zstd)
+    d.lz4 = nothing
+    d.zstd = nothing
+    return nothing
+end
+
 mutable struct DecodeCursor
     nodes::AbstractVector{Meta.FieldNode}
     buffers::AbstractVector{Meta.Buffer}
@@ -717,12 +764,17 @@ mutable struct DecodeCursor
     nodeidx::Int
     bufidx::Int
     last_nonempty_end::Int64
+    codec::Int8                   # CODEC_NONE, or the batch's declared codec
+    decomps::Union{Nothing,Decompressors}
+    alloc_left::Int64             # decode-side budget for decompressed bytes
 end
 
-DecodeCursor(nodes, buffers, body, limits::Limits) =
+DecodeCursor(nodes, buffers, body, limits::Limits;
+    codec::Int8=CODEC_NONE, decomps::Union{Nothing,Decompressors}=nothing) =
     DecodeCursor(something(nodes, Meta.FieldNode[]),
         something(buffers, Meta.Buffer[]), body,
-        limits.max_buffer_bytes, limits.max_array_length, 1, 1, 0)
+        limits.max_buffer_bytes, limits.max_array_length, 1, 1, 0,
+        codec, decomps, limits.max_total_allocated_bytes)
 
 function takenode!(c::DecodeCursor)
     c.nodeidx <= length(c.nodes) ||
@@ -761,12 +813,46 @@ function takebuffer!(c::DecodeCursor)
     # THE checked-subslice step: a buffer is only ever a window into this
     # message's body span. Checked arithmetic in `subslice` turns a corrupt
     # offset/length into a clean ValidationError.
-    try
-        return AC.subslice(c.body, offset, len)
+    wire = try
+        AC.subslice(c.body, offset, len)
     catch e
         e isa ArgumentError || e isa OverflowError || rethrow()
         throw(ValidationError("batch buffer [$offset, $len] escapes its message body"))
     end
+    (c.codec == CODEC_NONE || len == 0) && return wire
+    return _decompressbuffer!(c, wire)
+end
+
+"""
+Decode one compressed buffer per the spec: an Int64 uncompressed-length
+prefix, then the compressed payload; a prefix of -1 means the payload is
+stored uncompressed. Every declared size is bounded BEFORE allocation (the
+2.x reader allocates an attacker-controlled Int64 straight from this prefix,
+src/table.jl:804-816), the decompressed size must match the declaration
+exactly, and each decompressed buffer becomes its own exact-sized owned
+region — the wire mapping is never the backing store of decompressed data.
+"""
+function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
+    wire.len >= 8 ||
+        throw(ValidationError("compressed buffer of $(wire.len) bytes lacks its length prefix"))
+    declared = AC.loadat(wire, Int64, Int64(0))
+    declared == -1 && return AC.subslice(wire, 8, wire.len - 8)  # stored raw
+    0 <= declared <= c.max_buffer_bytes ||
+        throw(ValidationError("declared decompressed length $declared exceeds the buffer limit"))
+    declared <= c.alloc_left ||
+        throw(ValidationError("decompressed bytes exceed the decode allocation budget"))
+    c.alloc_left -= declared
+    declared == 0 && return BufferSlice()
+    payload = AC.slicebytes(AC.subslice(wire, 8, wire.len - 8))
+    out = try
+        TS.transcode(_decompressor(c.decomps::Decompressors, c.codec), payload)
+    catch e
+        e isa InterruptException && rethrow()
+        throw(ValidationError("buffer decompression failed: corrupt or truncated payload"))
+    end
+    length(out) == declared ||
+        throw(ValidationError("decompressed $(length(out)) bytes but the prefix declared $declared"))
+    return BufferSlice(heapregion(out), 0, declared)
 end
 
 function finishcursor!(c::DecodeCursor)
@@ -851,16 +937,16 @@ end
 
 function decoderecord(fm::FramedMessage, fields, sch::Schema,
     dicts::Dict{Int64,ArrayData}, fielddictids::IdDict{Field,Int64},
-    limits::Limits, validated_dictionaries)
+    limits::Limits, validated_dictionaries, decomps::Decompressors)
     header = fm.msg.header::Meta.RecordBatch
-    header.compression === nothing ||
-        throw(ValidationError("compression is outside this prove-out"))
+    codec = _batchcodec(header.compression)
     isempty(something(header.variadicBufferCounts, Int64[])) ||
         throw(ValidationError("variadic-buffer layouts are outside this prove-out"))
     rblen = something(header.length, Int64(0))
     0 <= rblen <= limits.max_array_length ||
         throw(ValidationError("record batch length $rblen exceeds limit"))
-    cursor = DecodeCursor(header.nodes, header.buffers, fm.body, limits)
+    cursor = DecodeCursor(header.nodes, header.buffers, fm.body, limits;
+        codec=codec, decomps=decomps)
     cols = ArrayData[decodefield(f, cursor, dicts, fielddictids) for f in fields]
     finishcursor!(cursor)
     validaterecordcolumns(fields, cols, validated_dictionaries)
@@ -988,6 +1074,21 @@ function _nextbatch!(s::IPCStream; after_claim=nothing,
 end
 
 """
+Map a batch's declared BodyCompression to a codec id, enforcing the spec
+subset this adapter supports: BUFFER-method LZ4_FRAME or ZSTD.
+"""
+function _batchcodec(compression)::Int8
+    compression === nothing && return CODEC_NONE
+    method = something(compression.method, Meta.BodyCompressionMethod.BUFFER)
+    method == Meta.BodyCompressionMethod.BUFFER ||
+        throw(ValidationError("unsupported body-compression method $method"))
+    codec = something(compression.codec, Meta.CompressionType.LZ4_FRAME)
+    codec == Meta.CompressionType.LZ4_FRAME && return CODEC_LZ4_FRAME
+    codec == Meta.CompressionType.ZSTD && return CODEC_ZSTD
+    throw(ValidationError("unsupported compression codec $codec"))
+end
+
+"""
     readstream(bytes; limits=Limits()) -> IPCStream
 
 Decode a stream from a borrowed byte vector. Batch buffers remain zero-copy
@@ -1020,12 +1121,16 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
     sch = Schema(fields; metadata=coremetadata(metaschema.custom_metadata),
         endianness=AC.LittleEndian)
     dicts = Dict{Int64,ArrayData}()
+    # One codec context per reader, shared by every compressed batch in the
+    # stream and explicitly finalized on every exit path (report §9).
+    decomps = Decompressors()
     validated_dictionaries = AC._ValidatedDictionaries()
     batchslots = Union{Nothing,AC.RecordBatch}[]
     pending = PendingRecord[]
     features = Set(msgs[1].features)
     schemaversion = msgs[1].version
-    for fm in msgs[2:end]
+    try
+        for fm in msgs[2:end]
         fm.version == schemaversion ||
             throw(ValidationError("IPC metadata version changes within the stream"))
         # Arrow 0.17 V4 streams signaled buffer compression on the Message,
@@ -1037,8 +1142,7 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
             header.isDelta &&
                 throw(ValidationError("delta dictionaries are outside this prove-out"))
             rb = header.data
-            rb.compression === nothing ||
-                throw(ValidationError("compression is outside this prove-out"))
+            codec = _batchcodec(rb.compression)
             isempty(something(rb.variadicBufferCounts, Int64[])) ||
                 throw(ValidationError("variadic-buffer layouts are outside this prove-out"))
             haskey(dictids, header.id) ||
@@ -1058,7 +1162,8 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
             rblen = something(rb.length, Int64(0))
             0 <= rblen <= limits.max_array_length ||
                 throw(ValidationError("dictionary batch length $rblen exceeds limit"))
-            cursor = DecodeCursor(rb.nodes, rb.buffers, fm.body, limits)
+            cursor = DecodeCursor(rb.nodes, rb.buffers, fm.body, limits;
+                codec=codec, decomps=decomps)
             decoded = decodefield(vf, cursor, dicts, fielddictids)
             finishcursor!(cursor)
             decoded.len == rblen ||
@@ -1085,7 +1190,7 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
                     if isempty(p.missing)
                         batchslots[p.slot] = decoderecord(p.fm, fields, sch,
                             p.dictionaries, fielddictids, limits,
-                            validated_dictionaries)
+                            validated_dictionaries, decomps)
                     else
                         push!(stillpending, p)
                     end
@@ -1098,7 +1203,7 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
             slot = length(batchslots)
             if isempty(missing)
                 batchslots[slot] = decoderecord(fm, fields, sch, dicts,
-                    fielddictids, limits, validated_dictionaries)
+                    fielddictids, limits, validated_dictionaries, decomps)
             else
                 push!(pending, PendingRecord(fm, copy(dicts), missing, slot))
             end
@@ -1106,10 +1211,13 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
             throw(ValidationError("unsupported IPC message header $(typeof(header))"))
         end
     end
-    isempty(pending) ||
-        throw(ValidationError("stream ended before required dictionary batches arrived"))
-    batches = AC.RecordBatch[b::AC.RecordBatch for b in batchslots]
-    return IPCStream(sch, AC.FrozenVector{Field}(fields), batches, 1, false)
+        isempty(pending) ||
+            throw(ValidationError("stream ended before required dictionary batches arrived"))
+        batches = AC.RecordBatch[b::AC.RecordBatch for b in batchslots]
+        return IPCStream(sch, AC.FrozenVector{Field}(fields), batches, 1, false)
+    finally
+        close(decomps)
+    end
 end
 
 function _threaded_cursor_stress()
@@ -1673,6 +1781,61 @@ function main()
         end
     end
     println("all columns round-tripped through ArrowCore ✓")
+
+    # Compressed acceptance: the same table, written by 2.x with each codec
+    # (dictionary batches are compressed too), read back through Core. The
+    # per-buffer Int64 prefix is bounded before allocation, the decompressed
+    # size must match the declaration, and every decompressed buffer lives in
+    # its own exact-sized owned region.
+    for (codecname, kw) in (("lz4", :lz4), ("zstd", :zstd))
+        cio = IOBuffer()
+        Arrow.write(cio, Tables.partitioner([expected, expected]);
+            file=false, compress=kw)
+        cbytes = take!(cio)
+        cstream = readstream(cbytes)
+        @assert length(cstream.batches) == 2
+        for b in cstream.batches
+            for (i, f) in enumerate(cstream.schema.fields)
+                got = materialize(f, b.columns[i])
+                want = wanted[Symbol(f.name)]
+                @assert isequal(collect(Any, got), want) "compressed $(codecname) column $(f.name): got $got"
+            end
+        end
+        println("$(codecname)-compressed stream (incl. dictionary batches) decodes ✓")
+
+        # Adversarial prefix manipulation, located via the framer itself:
+        # find the first record batch's first nonempty buffer and rewrite its
+        # Int64 uncompressed-length prefix in the raw bytes.
+        prefixpos = let
+            region = heapregion(copy(cbytes))
+            msgs = framemessages(region, Limits())
+            pos = Int64(-1)
+            for fm in msgs
+                fm.header_type == UInt8(3) || continue   # RecordBatch
+                rb = fm.msg.header::Meta.RecordBatch
+                for mb in rb.buffers
+                    if mb.length > 0
+                        pos = fm.body.offset + Int64(mb.offset)
+                        break
+                    end
+                end
+                pos >= 0 && break
+            end
+            @assert pos >= 0 "no nonempty compressed buffer found"
+            pos
+        end
+        # (a) a hostile declared length is rejected BEFORE any allocation
+        lying = copy(cbytes)
+        lying[prefixpos+1:prefixpos+8] .= reinterpret(UInt8, [Int64(2)^61])
+        @assert _rejects(() -> readstream(lying))
+        println("$(codecname): hostile decompressed-length prefix rejected before allocation ✓")
+        # (b) a prefix that understates the payload is a mismatch error, not
+        # silent truncation
+        short = copy(cbytes)
+        short[prefixpos+1:prefixpos+8] .= reinterpret(UInt8, [Int64(1)])
+        @assert _rejects(() -> readstream(short))
+        println("$(codecname): declared/actual decompressed-size mismatch rejected ✓")
+    end
 
     # The 2.x writer permits a coefficient outside its declared decimal
     # precision. The Core semantic boundary must reject it before exposure.
