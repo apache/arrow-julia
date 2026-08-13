@@ -167,7 +167,8 @@ end
 const EXPORT_REGISTRY = Dict{Int64,ExportedRoot}()
 const REGISTRY_LOCK = ReentrantLock()
 const NEXT_KEY = Ref{Int64}(0)
-function _claim_array_node(a::Ptr{CArrowArray})
+function _claim_array_node(a::Ptr{CArrowArray}, claimed_slot,
+    after_claim=nothing)
     a == C_NULL && return nothing
     return lock(REGISTRY_LOCK) do
         arr = unsafe_load(a)
@@ -182,12 +183,15 @@ function _claim_array_node(a::Ptr{CArrowArray})
         flag = unsafe_load(Ptr{UInt8}(p))
         flag == 0x00 || return nothing
         claimed = (p, topology)
+        claimed_slot[] = claimed
         unsafe_store!(Ptr{UInt8}(p), 0x01)
+        after_claim === nothing || after_claim()
         return claimed
     end
 end
 
-function _claim_schema_node(s::Ptr{CArrowSchema})
+function _claim_schema_node(s::Ptr{CArrowSchema}, claimed_slot,
+    after_claim=nothing)
     s == C_NULL && return nothing
     return lock(REGISTRY_LOCK) do
         sch = unsafe_load(s)
@@ -202,7 +206,9 @@ function _claim_schema_node(s::Ptr{CArrowSchema})
         flag = unsafe_load(Ptr{UInt8}(p))
         flag == 0x00 || return nothing
         claimed = (p, topology)
+        claimed_slot[] = claimed
         unsafe_store!(Ptr{UInt8}(p), 0x01)
+        after_claim === nothing || after_claim()
         return claimed
     end
 end
@@ -299,18 +305,19 @@ end
 
 function _release_array_impl(a::Ptr{CArrowArray}, after_claim=nothing,
     after_child=nothing)
-    claimed = _claim_array_node(a)
-    claimed === nothing && return nothing
-    control, topology = claimed
+    claimed_slot = Ref{Any}(nothing)
     try
-        after_claim === nothing || after_claim()
+        claimed = _claim_array_node(a, claimed_slot, after_claim)
+        claimed === nothing && return nothing
+        control, topology = claimed
         _release_array_children!(topology, after_child)
         _finish_node!(a, control)
     catch
         # Descendant releases are idempotent: a completed child has a NULL
         # callback and a retry skips it. Return this node to LIVE so a failed
         # transaction never leaves its aggregate root and source pins stuck.
-        _reset_node_claim!(control)
+        claimed = claimed_slot[]
+        claimed === nothing || _reset_node_claim!(claimed[1])
         rethrow()
     end
     return nothing
@@ -318,15 +325,16 @@ end
 
 function _release_schema_impl(s::Ptr{CArrowSchema}, after_claim=nothing,
     after_child=nothing)
-    claimed = _claim_schema_node(s)
-    claimed === nothing && return nothing
-    control, topology = claimed
+    claimed_slot = Ref{Any}(nothing)
     try
-        after_claim === nothing || after_claim()
+        claimed = _claim_schema_node(s, claimed_slot, after_claim)
+        claimed === nothing && return nothing
+        control, topology = claimed
         _release_schema_children!(topology, after_child)
         _finish_node!(s, control)
     catch
-        _reset_node_claim!(control)
+        claimed = claimed_slot[]
+        claimed === nothing || _reset_node_claim!(claimed[1])
         rethrow()
     end
     return nothing
@@ -586,32 +594,37 @@ end
 
 function _cleanup_registered_root!(key::Int64; require_released=true,
     after_claim=nothing, after_step=nothing)
-    return Base.disable_sigint() do
-        root = lock(REGISTRY_LOCK) do
-            candidate = get(EXPORT_REGISTRY, key, nothing)
-            candidate === nothing && return nothing
-            candidate.cleaning && return nothing
-            require_released && candidate.remaining != 0 && return nothing
-            candidate.cleaning = true
-            return candidate
-        end
-        root === nothing && return false
-        try
-            after_claim === nothing || after_claim(root)
+    claimed_slot = Ref{Union{Nothing,ExportedRoot}}(nothing)
+    try
+        return Base.disable_sigint() do
+            root = lock(REGISTRY_LOCK) do
+                candidate = get(EXPORT_REGISTRY, key, nothing)
+                candidate === nothing && return nothing
+                candidate.cleaning && return nothing
+                require_released && candidate.remaining != 0 && return nothing
+                claimed_slot[] = candidate
+                candidate.cleaning = true
+                after_claim === nothing || after_claim(candidate)
+                return candidate
+            end
+            root === nothing && return false
             _free_export!(root, after_step)
             lock(REGISTRY_LOCK) do
                 get(EXPORT_REGISTRY, key, nothing) === root ||
                     error("C Data export root changed during cleanup")
                 pop!(EXPORT_REGISTRY, key)
             end
-        catch
+            return true
+        end
+    catch
+        root = claimed_slot[]
+        if root !== nothing
             lock(REGISTRY_LOCK) do
                 get(EXPORT_REGISTRY, key, nothing) === root &&
                     (root.cleaning = false)
             end
-            rethrow()
         end
-        return true
+        rethrow()
     end
 end
 
