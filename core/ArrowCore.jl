@@ -35,10 +35,12 @@ Design rules this module is built to demonstrate:
 2. Memory validity is GC reachability. Every buffer is a `BufferSlice`
    into an `OwnerRegion` — an immutable (pointer, length, root) triple whose
    `root` anchors the backing storage. Slices are bounds-checked against the
-   region at construction, so corrupt metadata produces an error at open,
-   never a segfault at access; loads are a final bounds check plus a raw
-   load, with no per-access synchronization. Deterministic eager release is
-   deliberately constrained out of this core (see §1). Mmap stdlib storage is unmapped later by its GC finalizer.
+   region at construction. For verified owned and IPC extents, corrupt spans
+   therefore fail before access; foreign extents remain trusted declarations,
+   and mapped files remain exposed to external changes. Loads are a final
+   bounds check plus a raw load, with no per-access synchronization.
+   Deterministic eager release is deliberately constrained out of this core
+   (see §1). Mmap stdlib storage is unmapped later by its GC finalizer.
 
 3. One structural layout registry. `layoutspec(type)` returns the buffer
    roles / child arity / offset width for each of the format-1.5 layouts.
@@ -176,6 +178,8 @@ struct OwnerRegion
         n = Int64(len)
         (ptr != C_NULL || n == 0) ||
             throw(ArgumentError("a non-empty region requires a non-NULL pointer"))
+        (root !== nothing || n == 0) ||
+            throw(ArgumentError("a non-empty region requires a GC root"))
         # BufferSlice bounds are only meaningful if every declared byte also
         # has a representable pointer address. Reject a foreign extent whose
         # final byte would wrap native pointer arithmetic.
@@ -265,14 +269,6 @@ function subslice(b::BufferSlice, offset::Integer, len::Integer)
     return BufferSlice(b.region, checked_add(b.offset, Int64(offset)), Int64(len))
 end
 
-@inline function _guarded(f, b::BufferSlice)
-    b.region === nothing && throw(ArgumentError("empty buffer has no data"))
-    # No synchronization: the slice roots its region, the region roots the
-    # backing storage, so the pointer is valid for exactly as long as this
-    # call can exist (§1).
-    return f()
-end
-
 """
 Load a `T` at byte offset `byteoff` (0-based) within the slice. Handles the
 misaligned case with a byte-wise load: alignment is a property of the region
@@ -294,12 +290,15 @@ of as a copy workaround scattered through per-type code.
     # check and reach pointer arithmetic.
     (byteoff >= 0 && width <= b.len && byteoff <= b.len - width) ||
         throw(BoundsError(b, byteoff))
-    return _guarded(b) do
+    b.region === nothing && throw(ArgumentError("empty buffer has no data"))
+    # Raw pointers do not keep Julia owners alive. Preserve the slice through
+    # the full dereference so its region and opaque root remain reachable.
+    GC.@preserve b begin
         p = sliceptr(b) + byteoff
         if UInt(p) % datatype_alignment(T) == 0
-            unsafe_load(Ptr{T}(p))
+            return unsafe_load(Ptr{T}(p))
         else
-            _load_unaligned(T, p)
+            return _load_unaligned(T, p)
         end
     end
 end
@@ -316,8 +315,11 @@ end
 "Copy the slice into a fresh `Vector{UInt8}` (used by materialize/tests)."
 function slicebytes(b::BufferSlice)
     b.len == 0 && return UInt8[]
+    b.region === nothing && throw(ArgumentError("empty buffer has no data"))
     out = Vector{UInt8}(undef, b.len)
-    _guarded(b) do
+    # Preserve both owners across the raw copy. Neither pointer roots its
+    # source or destination allocation.
+    GC.@preserve b out begin
         unsafe_copyto!(pointer(out), sliceptr(b), b.len)
     end
     return out
@@ -1458,8 +1460,8 @@ juliatype(::BinaryType) = Vector{UInt8}
 juliatype(t::FixedSizeBinaryType) = Vector{UInt8}
 
 @inline function _load_int(b::BufferSlice, t::IntType, byteoff::Int64)::Int64
-    # Literal load widths (a runtime DataType here builds a non-concrete
-    # guard closure, which trim rejects).
+    # Literal load widths avoid a runtime DataType in the raw-load path, which
+    # produces code that the trim verifier cannot resolve.
     if t.signed
         t.bits == 64 && return loadat(b, Int64, byteoff)
         t.bits == 32 && return Int64(loadat(b, Int32, byteoff))
@@ -1489,9 +1491,9 @@ end
 
 # -- primitives -------------------------------------------------------------
 
-# Primitive accessors branch to LITERAL load widths: `loadat(b, T, off)`
-# with a runtime `T::DataType` builds a non-concrete closure under the guard,
-# which trim verification rejects — and a concrete branch is faster anyway.
+# Primitive accessors branch to LITERAL load widths: `loadat(b, T, off)` with
+# a runtime `T::DataType` leaves the raw-load path unresolved under trim
+# verification, and a concrete branch is faster anyway.
 function _value(t::IntType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     b = rolebuffer(d, DATA)

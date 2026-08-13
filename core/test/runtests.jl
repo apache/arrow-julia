@@ -76,9 +76,10 @@ end
     @testset "construction validation" begin
         @test_throws ArgumentError AC.OwnerRegion(Ptr{UInt8}(0), 1)
         @test_throws ArgumentError AC.OwnerRegion(Ptr{UInt8}(8), -1)
+        @test_throws ArgumentError AC.OwnerRegion(Ptr{UInt8}(8), 1)
         # extents that would wrap native pointer arithmetic are rejected
         @test_throws ArgumentError AC.OwnerRegion(
-            Ptr{UInt8}(typemax(UInt) - 8), 64; root=nothing)
+            Ptr{UInt8}(typemax(UInt) - 8), 64; root=UInt8[])
         @test_throws ArgumentError heapregion(["not", "isbits"])
     end
 
