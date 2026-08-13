@@ -675,6 +675,43 @@ end
             Int64[86_400_000_000_000]; valid=false)
     end
 
+    @testset "semantic: decimal values fit declared precision" begin
+        function checkdecimal(t, bytes; valid=true, bitmap=BufferSlice(), nullcount=0)
+            f = Field("decimal", t)
+            d = AC.ArrayData(t, length(bytes) ÷ (t.bits ÷ 8),
+                [bitmap, AC._databuffer(bytes)]; nullcount=nullcount)
+            if valid
+                @test validate_semantic(f, d) === d
+            else
+                @test_throws ValidationError validate_semantic(f, d)
+            end
+        end
+
+        for (bits, T) in ((32, Int32), (64, Int64), (128, Int128))
+            t = DecimalType(1, 0, bits)
+            checkdecimal(t, collect(reinterpret(UInt8, T[9, -9])))
+            checkdecimal(t, collect(reinterpret(UInt8, T[10])); valid=false)
+            checkdecimal(t, collect(reinterpret(UInt8, T[-10])); valid=false)
+        end
+
+        # Decimal256 values are represented here as four little-endian UInt64
+        # limbs. Cover positive/negative precision edges without a BigInt
+        # dependency in either Core or its tests.
+        t256 = DecimalType(1, 0, 256)
+        pos9 = UInt64[9, 0, 0, 0]
+        pos10 = UInt64[10, 0, 0, 0]
+        neg9 = UInt64[typemax(UInt64) - 8, typemax(UInt64),
+            typemax(UInt64), typemax(UInt64)]
+        checkdecimal(t256, collect(reinterpret(UInt8, vcat(pos9, neg9))))
+        checkdecimal(t256, collect(reinterpret(UInt8, pos10)); valid=false)
+
+        # Invalid bytes in a null slot are masked and do not violate the
+        # precision contract.
+        checkdecimal(DecimalType(1, 0, 32),
+            collect(reinterpret(UInt8, Int32[10]));
+            bitmap=AC._databuffer(UInt8[0x00]), nullcount=1)
+    end
+
     @testset "semantic: dictionary index out of bounds" begin
         f, d = AC.fromjulia_dict("d", ["a", "b"], [0, 1])
         # corrupt: poke an index past the pool through a rebuilt ArrayData

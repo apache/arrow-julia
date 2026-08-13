@@ -1080,6 +1080,71 @@ function _validate_temporal_values(t::DateType, d::ArrayData)
     return nothing
 end
 
+function _decimal_fits_precision(t::DecimalType, data::BufferSlice, byteoff::Int64)
+    # Arrow decimal storage is a little-endian two's-complement integer. A
+    # value fits precision p exactly when its magnitude is less than 10^p.
+    # Work in UInt256-style four-limb arithmetic so Core stays Base-only and
+    # Decimal256 does not require BigInt allocations or BitIntegers.
+    nlimbs = cld(t.bits, 64)
+    limbs = ntuple(limb -> begin
+        if limb <= nlimbs
+            base = checked_add(byteoff, Int64(8 * (limb - 1)))
+            if t.bits == 32
+                UInt64(loadat(data, UInt32, base))
+            else
+                loadat(data, UInt64, base)
+            end
+        else
+            UInt64(0)
+        end
+    end, 4)
+    signbit = t.bits == 32 ? UInt64(1) << 31 : UInt64(1) << 63
+    negative = (limbs[nlimbs] & signbit) != 0
+    if negative && t.bits == 32
+        limbs = (limbs[1] | (typemax(UInt64) << 32), limbs[2], limbs[3], limbs[4])
+    end
+    magnitude = ntuple(limb -> limb <= nlimbs ?
+        (negative ? ~limbs[limb] : limbs[limb]) : UInt64(0), 4)
+    if negative
+        carry = true
+        magnitude = ntuple(4) do limb
+            value = magnitude[limb]
+            result = carry ? value + UInt64(1) : value
+            carry &= result == 0
+            result
+        end
+    end
+
+    limit = (UInt64(1), UInt64(0), UInt64(0), UInt64(0))
+    for _ = 1:t.precision
+        carry = UInt128(0)
+        limit = ntuple(4) do limb
+            product = UInt128(limit[limb]) * UInt128(10) + carry
+            carry = product >> 64
+            UInt64(product)
+        end
+    end
+    for limb = 4:-1:1
+        magnitude[limb] < limit[limb] && return true
+        magnitude[limb] > limit[limb] && return false
+    end
+    return false
+end
+
+_validate_decimal_values(::ArrowType, ::ArrayData) = nothing
+function _validate_decimal_values(t::DecimalType, d::ArrayData)
+    data = rolebuffer(d, DATA)
+    width = Int64(primwidth(t))
+    for i = 1:d.len
+        isvalid_at(d, i) || continue
+        byteoff = _slotbyteoff(d, Int64(i), width)
+        _decimal_fits_precision(t, data, byteoff) ||
+            throw(ValidationError(
+                "Decimal value at element $i does not fit precision $(t.precision)"))
+    end
+    return nothing
+end
+
 function _validate_temporal_values(t::TimeType, d::ArrayData)
     units_per_day = t.unit == SECOND ? Int64(86_400) :
         t.unit == MILLISECOND ? MILLISECONDS_PER_DAY :
@@ -1178,6 +1243,7 @@ function _validate_semantic_intrinsic(f::Field, d::ArrayData)
             end
         end
         _validate_temporal_values(t, d)
+        _validate_decimal_values(t, d)
         actual_nulls = _count_nulls(d)
         declared_nulls = @atomic :monotonic d.nullcount
         if declared_nulls >= 0 && declared_nulls != actual_nulls
