@@ -1185,9 +1185,14 @@ Layouts declared as structural-only fail closed instead of caching an
 incomplete check.
 """
 function validate_semantic(f::Field, d::ArrayData)
+    return _validate_semantic(f, d, IdDict{ArrayData,Vector{Field}}())
+end
+
+function _validate_semantic(f::Field, d::ArrayData,
+    validated_dictionaries::IdDict{ArrayData,Vector{Field}})
     validate_structural(f, d)
     _validate_semantic_intrinsic(f, d)
-    _validate_field_contracts(f, d)
+    _validate_field_contracts(f, d, validated_dictionaries)
     return d
 end
 
@@ -1354,25 +1359,54 @@ function _validate_field_contract_at(f::Field, d::ArrayData, i::Int64)
     return nothing
 end
 
-function _validate_dictionary_contracts(f::Field, d::ArrayData)
+function _same_field_contract(a::Field, b::Field)
+    a.nullable == b.nullable && typeequal(a.type, b.type) || return false
+    length(a.children) == length(b.children) || return false
+    return all(_same_field_contract(x, y) for (x, y) in zip(a.children, b.children))
+end
+
+function _validate_field_contracts_once(f::Field, d::ArrayData,
+    validated_dictionaries::IdDict{ArrayData,Vector{Field}})
+    contracts = get!(validated_dictionaries, d, Field[])
+    if !any(c -> _same_field_contract(c, f), contracts)
+        _validate_field_contracts(f, d, validated_dictionaries)
+        push!(contracts, f)
+    end
+    return nothing
+end
+
+function _validate_semantic_once(f::Field, d::ArrayData,
+    validated_dictionaries::IdDict{ArrayData,Vector{Field}})
+    validate_structural(f, d)
+    _validate_semantic_intrinsic(f, d)
+    _validate_field_contracts_once(f, d, validated_dictionaries)
+    return d
+end
+
+function _validate_dictionary_contracts(f::Field, d::ArrayData,
+    validated_dictionaries::IdDict{ArrayData,Vector{Field}})
     if d.type isa DictionaryType
         # Dictionary values form an independent array. Index nullability never
         # constrains pool nullability, but nested Field contracts inside the
         # pool still apply to every pool value, even when the dictionary array
         # itself is nested below a masked parent.
-        _validate_field_contracts(dictvaluefield(f, d.type), d.dictionary)
+        dictionary = d.dictionary::ArrayData
+        valuefield = dictvaluefield(f, d.type)
+        _validate_field_contracts_once(valuefield, dictionary,
+            validated_dictionaries)
     end
     for (cf, cd) in zip(f.children, d.children)
-        _validate_dictionary_contracts(cf, cd)
+        _validate_dictionary_contracts(cf, cd, validated_dictionaries)
     end
     return nothing
 end
 
-function _validate_field_contracts(f::Field, d::ArrayData)
+function _validate_field_contracts(f::Field, d::ArrayData,
+    validated_dictionaries::IdDict{ArrayData,Vector{Field}})
     for i = 1:d.len
         _validate_field_contract_at(f, d, Int64(i))
     end
-    _validate_dictionary_contracts(f, d)
+    _validate_dictionary_contracts(f, d, validated_dictionaries)
     return nothing
 end
 

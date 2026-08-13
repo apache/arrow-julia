@@ -110,6 +110,12 @@ delta dictionaries. It requires the current eight-byte continuation-marker
 framing and does not accept the pre-0.15 four-byte legacy prefix. Compression
 and endian normalization are excluded.
 
+Compatible fields that share one IPC dictionary id also share one immutable
+pool object. Eager stream validation scans each immutable pool snapshot's
+Field contracts once, while it still checks each field's index array
+independently. This keeps validation work linear in the encoded indices plus
+distinct pool data.
+
 The IPC adapter runs structural and semantic Core validation before it exposes
 a batch. It does not opt into `validate_full`, so UTF-8 body content is not
 checked. The byte-wise metadata verifier does validate FlatBuffer strings.

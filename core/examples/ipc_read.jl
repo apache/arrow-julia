@@ -823,9 +823,22 @@ function decodefield(f::Field, c::DecodeCursor, dicts::Dict{Int64,ArrayData},
         nullcount=node.null_count)
 end
 
+function validaterecordcolumns(fields, cols,
+    validated_dictionaries=IdDict{ArrayData,Vector{Field}}())
+    for (f, col) in zip(fields, cols)
+        # One IPC dictionary id can back many fields. Compatible value
+        # schemas were proved when the stream schema was built, so scan each
+        # immutable pool snapshot's Field contracts once per stream instead
+        # of once per reference. Index contracts still run independently for
+        # every field.
+        AC._validate_semantic(f, col, validated_dictionaries)
+    end
+    return validated_dictionaries
+end
+
 function decoderecord(fm::FramedMessage, fields, sch::Schema,
     dicts::Dict{Int64,ArrayData}, fielddictids::IdDict{Field,Int64},
-    limits::Limits)
+    limits::Limits, validated_dictionaries)
     header = fm.msg.header::Meta.RecordBatch
     header.compression === nothing ||
         throw(ValidationError("compression is outside this prove-out"))
@@ -837,10 +850,7 @@ function decoderecord(fm::FramedMessage, fields, sch::Schema,
     cursor = DecodeCursor(header.nodes, header.buffers, fm.body, limits)
     cols = ArrayData[decodefield(f, cursor, dicts, fielddictids) for f in fields]
     finishcursor!(cursor)
-    for (f, col) in zip(fields, cols)
-        validate_structural(f, col)
-        validate_semantic(f, col)
-    end
+    validaterecordcolumns(fields, cols, validated_dictionaries)
     all(col -> col.len == rblen, cols) ||
         throw(ValidationError("RecordBatch length does not match top-level field nodes"))
     return AC.RecordBatch(sch, cols, rblen)
@@ -915,6 +925,7 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
     sch = Schema(fields; metadata=coremetadata(metaschema.custom_metadata),
         endianness=AC.LittleEndian)
     dicts = Dict{Int64,ArrayData}()
+    validated_dictionaries = IdDict{ArrayData,Vector{Field}}()
     batchslots = Union{Nothing,AC.RecordBatch}[]
     pending = PendingRecord[]
     features = Set(msgs[1].features)
@@ -953,8 +964,7 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
             finishcursor!(cursor)
             decoded.len == rblen ||
                 throw(ValidationError("dictionary RecordBatch length does not match its field node"))
-            validate_structural(vf, decoded)
-            validate_semantic(vf, decoded)
+            AC._validate_semantic_once(vf, decoded, validated_dictionaries)
             dicts[header.id] = decoded
 
             # The IPC spec permits an all-null dictionary column before its
@@ -970,7 +980,8 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
                     end
                     if isempty(p.missing)
                         batchslots[p.slot] = decoderecord(p.fm, fields, sch,
-                            p.dictionaries, fielddictids, limits)
+                            p.dictionaries, fielddictids, limits,
+                            validated_dictionaries)
                     else
                         push!(stillpending, p)
                     end
@@ -983,7 +994,7 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
             slot = length(batchslots)
             if isempty(missing)
                 batchslots[slot] = decoderecord(fm, fields, sch, dicts,
-                    fielddictids, limits)
+                    fielddictids, limits, validated_dictionaries)
             else
                 push!(pending, PendingRecord(fm, copy(dicts), missing, slot))
             end
@@ -1338,6 +1349,20 @@ function main()
             "$(length(stream.schema.fields)) columns")
     @assert length(stream.batches) == 2
 
+    dictpos = findfirst(f -> f.type isa DictionaryType, stream.schema.fields)
+    dictpos === nothing && error("acceptance stream has no dictionary field")
+    dictfield = stream.schema.fields[dictpos]
+    dictpool = stream.batches[1].columns[dictpos].dictionary
+    @assert dictpool === stream.batches[2].columns[dictpos].dictionary
+    validated = IdDict{ArrayData,Vector{Field}}()
+    AC._validate_semantic_once(AC.dictvaluefield(dictfield, dictfield.type),
+        dictpool, validated)
+    for b in stream.batches
+        validaterecordcolumns(stream.schema.fields, b.columns, validated)
+    end
+    @assert length(validated) == 1
+    @assert length(validated[dictpool]) == 1
+
     wanted = (
         ints=Any[1, 2, 3, 4, 5],
         floats=Any[1.5, missing, 3.5, missing, 5.5],
@@ -1584,7 +1609,12 @@ function main()
         @assert materialize(sharedstream.schema.fields[i],
             sharedstream.batches[1].columns[i]) == nestedvals
     end
-    println("nested dictionary value schemas may share an id ✓")
+    sharedcols = sharedstream.batches[1].columns
+    @assert sharedcols[1].dictionary === sharedcols[2].dictionary
+    sharedvalidated = validaterecordcolumns(sharedstream.schema.fields, sharedcols)
+    @assert length(sharedvalidated) == 1
+    @assert length(sharedvalidated[sharedcols[1].dictionary]) == 1
+    println("shared dictionary ids reuse one pool-contract scan ✓")
 
     pool = PooledArray(Union{Missing,String}[missing, "x"])
     poolio = IOBuffer()
