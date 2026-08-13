@@ -517,7 +517,6 @@ function assigndictids(fields)
         if f.type isa DictionaryType
             ids[f] = next[]
             next[] += 1
-            return
         end
         foreach(walk, f.children)
     end
@@ -929,18 +928,20 @@ end
 function _validateblockindex(dictblocks, recordblocks, dataend::Int64;
     datastart::Int64=0)
     extents = Tuple{Int64,Int64}[]
+    indexedend = datastart
     for block in Iterators.flatten((dictblocks, recordblocks))
         extent = _blockextent(block, dataend)
         extent[1] >= datastart ||
             throw(ValidationError("footer block overlaps the file schema"))
         push!(extents, extent)
+        indexedend = max(indexedend, extent[2])
     end
     sort!(extents; by=first)
     for i = 2:length(extents)
         extents[i - 1][2] <= extents[i][1] ||
             throw(ValidationError("footer blocks overlap"))
     end
-    return nothing
+    return indexedend
 end
 
 
@@ -1015,16 +1016,6 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
         AC.checked_add(Int64(length(dictblocks)), Int64(length(recordblocks))))
     nmessages <= limits.max_messages ||
         throw(ValidationError("message count exceeds limit"))
-    # Current Arrow writers differ on the optional file EOS marker. When it
-    # is present, it is not batch body space and indexed blocks must stop
-    # before it. Without it, the Footer itself is the data boundary.
-    dataend = if footerstart >= 8 &&
-        AC.loadat(blob, UInt32, footerstart - 8) == CONTINUATION &&
-        AC.loadat(blob, UInt32, footerstart - 4) == UInt32(0)
-        footerstart - 8
-    else
-        footerstart
-    end
     footer = FB.getrootas(Meta.Footer, footerbytes, 0)
     metaschema = footer.schema
     metaschema === nothing ||
@@ -1032,7 +1023,11 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
         throw(ValidationError("big-endian IPC requires normalization, which is outside this prove-out")))
     metaschema === nothing &&
         throw(ValidationError("file footer carries no schema"))
-    schemafm, schemaend = _fileschema(region, dataend, limits, budget)
+    # Validate the leading schema and indexed messages against the Footer
+    # boundary first. Only then can the final eight bytes be classified as an
+    # optional EOS marker: a no-EOS file may end its last data buffer with the
+    # same byte pattern.
+    schemafm, schemaend = _fileschema(region, footerstart, limits, budget)
     schemafm.version == version ||
         throw(ValidationError("file schema and footer metadata versions differ"))
     schemafm.features == features ||
@@ -1041,6 +1036,12 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
         throw(ValidationError("file schema and footer schema differ"))
     _metadataequal(schemafm.msg.custom_metadata, footer.custom_metadata) ||
         throw(ValidationError("file schema and footer custom metadata differ"))
+    indexedend = _validateblockindex(dictblocks, recordblocks, footerstart;
+        datastart=schemaend)
+    haseos = footerstart - indexedend >= 8 &&
+        AC.loadat(blob, UInt32, footerstart - 8) == CONTINUATION &&
+        AC.loadat(blob, UInt32, footerstart - 4) == UInt32(0)
+    dataend = haseos ? footerstart - 8 : footerstart
     _validateblockindex(dictblocks, recordblocks, dataend;
         datastart=schemaend)
     dictids = Dict{Int64,Meta.Field}()
@@ -1337,6 +1338,13 @@ function main()
     aliasbatch = AC.RecordBatch(aliasschema,
         ArrayData[aliasdata1, aliasdata2], 2)
     @assert _rejects(() -> writestream(aliasschema, [aliasbatch]))
+    sharedvaluechild = Field("value", IntType(64, true))
+    aliaseddict = Field("dict",
+        DictionaryType(IntType(32, true), StructType(), false);
+        children=[sharedvaluechild])
+    aliasedlist = Field("list", ListType(false);
+        children=[sharedvaluechild])
+    @assert _rejects(() -> assigndictids([aliaseddict, aliasedlist]))
 
     # One pool shared through two dictionary fields must satisfy both value
     # schemas. The batch's own schema permits the null; the requested writer
@@ -1610,11 +1618,32 @@ function main()
     crossingroot = _vtable(crossingmessage,
         Int64(_vu32(crossingmessage, 0)))
     bodypos = _vfield(crossingroot, 3, 8; required=true)
-    newbodylen = crossingbody + 8
+    newbodylen = crossingbody + 16
     _write_i64!(crossing, crossingoffset + 8 + bodypos, newbodylen)
     _write_i64!(crossing,
         simplefooterstart + crossingstart + 16, newbodylen)
     @assert _rejects(() -> readfile(crossing))
+
+    # A no-EOS file may end its last data buffer with the eight-byte EOS byte
+    # pattern. Indexed block extents, not that ambiguous pattern alone, decide
+    # whether those bytes are data. Arrow.jl 2.x writes and accepts no-EOS
+    # files, so retain that interoperable form.
+    collisionfield, collisiondata =
+        fromjulia("collision", Int64[Int64(0x00000000ffffffff)])
+    collisionbatch = AC.RecordBatch(Schema([collisionfield]),
+        [collisiondata], 1)
+    collision = writefile(collisionbatch.schema, [collisionbatch])
+    collisionfooterlen = Int64(reinterpret(Int32,
+        collision[(end - 9):(end - 6)])[1])
+    collisionfooterstart = Int64(length(collision)) - 10 - collisionfooterlen
+    noeos = copy(collision)
+    deleteat!(noeos,
+        Int(collisionfooterstart - 7):Int(collisionfooterstart))
+    noeosfile = readfile(noeos)
+    @assert materialize(noeosfile.schema.fields[1],
+        noeosfile[1].columns[1]) == Int64[Int64(0x00000000ffffffff)]
+    @assert length(Tables.getcolumn(Tables.columns(
+        Arrow.Table(IOBuffer(copy(noeos)))), 1)) == 1
 
     _, _, _, _, footreserve = verify_footer(simplefooter, Limits())
     tightbudget = max(simplefooterlen, footreserve)
