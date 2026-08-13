@@ -159,6 +159,7 @@ mutable struct ExportedRoot
     pins::Vector{OwnerRegion}   # long-lived source access guards for C pointers
     key::Int64
     remaining::Int64           # exported C nodes whose callback has not run
+    cleaning::Bool             # one reaper owns cleanup while this is true
     schema_topology::Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}
     array_topology::Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}
 end
@@ -385,24 +386,6 @@ _release_schema(s::Ptr{CArrowSchema}) = _release_schema_entry(s)
 end
 _store_field!(p, name::Symbol, v) = _store_field!(p, Val(name), v)
 
-"""
-    reap!() -> Int
-
-Find fully released exports: free every malloc they own and drop their
-registry roots. In the real adapter this is a background reaper task; the
-example calls it explicitly to keep the demo deterministic.
-"""
-function reap!()
-    roots = lock(REGISTRY_LOCK) do
-        keys = Int64[k for (k, root) in EXPORT_REGISTRY if root.remaining == 0]
-        ExportedRoot[pop!(EXPORT_REGISTRY, k) for k in keys]
-    end
-    for root in roots
-        _free_export!(root)
-    end
-    return length(roots)
-end
-
 _malloc!(root::ExportedRoot, n::Integer,
     register! = push!, deallocate! = Libc.free) = begin
     n >= 0 || throw(ArgumentError("negative export allocation size"))
@@ -585,26 +568,79 @@ function _pin_regions(d::ArrayData, acquire! = AC._acquireguard!)
     end
 end
 
-function _free_export!(root::ExportedRoot)
+function _free_export!(root::ExportedRoot, after_step=nothing)
     empty!(root.schema_topology)
     empty!(root.array_topology)
-    for m in root.mallocs
+    while !isempty(root.mallocs)
+        m = pop!(root.mallocs)
         Libc.free(m)
+        after_step === nothing || after_step(:malloc)
     end
-    empty!(root.mallocs)
     empty!(root.roots)
-    _release_pins!(root.pins)
+    while !isempty(root.pins)
+        AC._releaseguard!(pop!(root.pins))
+        after_step === nothing || after_step(:pin)
+    end
     return nothing
+end
+
+function _cleanup_registered_root!(key::Int64; require_released=true,
+    after_claim=nothing, after_step=nothing)
+    return Base.disable_sigint() do
+        root = lock(REGISTRY_LOCK) do
+            candidate = get(EXPORT_REGISTRY, key, nothing)
+            candidate === nothing && return nothing
+            candidate.cleaning && return nothing
+            require_released && candidate.remaining != 0 && return nothing
+            candidate.cleaning = true
+            return candidate
+        end
+        root === nothing && return false
+        try
+            after_claim === nothing || after_claim(root)
+            _free_export!(root, after_step)
+            lock(REGISTRY_LOCK) do
+                get(EXPORT_REGISTRY, key, nothing) === root ||
+                    error("C Data export root changed during cleanup")
+                pop!(EXPORT_REGISTRY, key)
+            end
+        catch
+            lock(REGISTRY_LOCK) do
+                get(EXPORT_REGISTRY, key, nothing) === root &&
+                    (root.cleaning = false)
+            end
+            rethrow()
+        end
+        return true
+    end
+end
+
+"""
+    reap!() -> Int
+
+Find fully released exports: free every malloc they own and drop their
+registry roots. In the real adapter this is a background reaper task; the
+example calls it explicitly to keep the demo deterministic.
+"""
+function reap!()
+    keys = lock(REGISTRY_LOCK) do
+        Int64[k for (k, root) in EXPORT_REGISTRY
+            if root.remaining == 0 && !root.cleaning]
+    end
+    reaped = 0
+    for key in keys
+        reaped += _cleanup_registered_root!(key)
+    end
+    return reaped
 end
 
 function _discard_export!(p::Ptr)
     p == C_NULL && return nothing
-    control = unsafe_load(p).private_data
-    key = unsafe_load(Ptr{Int64}(control + 8))
-    root = lock(REGISTRY_LOCK) do
-        pop!(EXPORT_REGISTRY, key, nothing)
+    Base.disable_sigint() do
+        control = unsafe_load(p).private_data
+        key = unsafe_load(Ptr{Int64}(control + 8))
+        _cleanup_registered_root!(key; require_released=false)
     end
-    root === nothing || _free_export!(root)
     return nothing
 end
 
@@ -616,7 +652,7 @@ function _newroot(build, roots::Vector{Any}, pinsource=nothing,
         key = lock(REGISTRY_LOCK) do
             NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
         end
-        root = rootfactory(roots, Ptr{Cvoid}[], OwnerRegion[], key, 0,
+        root = rootfactory(roots, Ptr{Cvoid}[], OwnerRegion[], key, 0, false,
             Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}(),
             Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}())::ExportedRoot
         # Construct all Julia bookkeeping before acquiring source guards. Once
@@ -632,13 +668,19 @@ function _newroot(build, roots::Vector{Any}, pinsource=nothing,
         end
         return result
     catch
-        # Export-failure cleanup path: remove a root if publication itself was
-        # interrupted, and free everything built so far exactly once.
+        # Export-failure cleanup keeps a published root registered until every
+        # resource is gone. This also covers interruption during publication.
         if root !== nothing
-            lock(REGISTRY_LOCK) do
-                pop!(EXPORT_REGISTRY, key, nothing)
+            Base.disable_sigint() do
+                registered = lock(REGISTRY_LOCK) do
+                    get(EXPORT_REGISTRY, key, nothing) === root
+                end
+                if registered
+                    _cleanup_registered_root!(key; require_released=false)
+                else
+                    _free_export!(root)
+                end
             end
-            _free_export!(root)
         end
         rethrow()
     end
@@ -1181,6 +1223,52 @@ function main()
     @assert (@atomic factoryregion.guards) == 0
     @assert _registry_count() == before
     println("failed export handoffs return mallocs and source guards ✓")
+
+    # Cleanup owns a registry-visible claim until every resource is gone. A
+    # failed claim remains retryable, and completed free steps are removed from
+    # the ledger before an injected failure can escape.
+    _, cleanup_data = fromjulia("cleanup", Int64[1])
+    cleanup_region = cleanup_data.buffers[2].region
+    cleanup_key = Ref{Int64}(0)
+    _newroot(Any[cleanup_data], cleanup_data) do root
+        cleanup_key[] = root.key
+        _malloc!(root, 64)
+        _malloc!(root, 64)
+        return nothing
+    end
+    @assert (@atomic cleanup_region.guards) == 1
+    @assert try
+        _cleanup_registered_root!(cleanup_key[];
+            after_claim=_ -> throw(InterruptException()))
+        false
+    catch e
+        e isa InterruptException
+    end
+    @assert lock(REGISTRY_LOCK) do
+        root = EXPORT_REGISTRY[cleanup_key[]]
+        !root.cleaning && length(root.mallocs) == 2 && length(root.pins) == 1
+    end
+    cleanup_steps = Ref(0)
+    @assert try
+        _cleanup_registered_root!(cleanup_key[]; after_step=_ -> begin
+            cleanup_steps[] += 1
+            cleanup_steps[] == 1 && error("injected cleanup step failure")
+        end)
+        false
+    catch e
+        e isa ErrorException && e.msg == "injected cleanup step failure"
+    end
+    @assert lock(REGISTRY_LOCK) do
+        root = EXPORT_REGISTRY[cleanup_key[]]
+        !root.cleaning && length(root.mallocs) == 1 && length(root.pins) == 1
+    end
+    @assert reap!() == 1
+    @assert lock(REGISTRY_LOCK) do
+        !haskey(EXPORT_REGISTRY, cleanup_key[])
+    end
+    @assert (@atomic cleanup_region.guards) == 0
+    @assert forceclose!(cleanup_region; timeout_ms=0)
+    println("interrupted export cleanup remains registered and retryable ✓")
 
     # The registry, not the caller's Julia variables, must keep all source
     # objects and their buffers alive while raw C pointers are outstanding.
