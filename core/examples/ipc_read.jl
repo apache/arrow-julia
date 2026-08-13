@@ -95,6 +95,7 @@ struct FramedMessage
 end
 
 const CONTINUATION = 0xFFFFFFFF
+const EXPERIMENTAL_COMPRESSION_KEY = "ARROW:experimental_compression"
 
 # ---------------------------------------------------------------------------
 # FlatBuffers verifier
@@ -868,6 +869,17 @@ function decoderecord(fm::FramedMessage, fields, sch::Schema,
     return AC.RecordBatch(sch, cols, rblen, validated_dictionaries)
 end
 
+function rejectexperimentalcompression(fm::FramedMessage)
+    fm.version == Int16(3) || return nothing # V4
+    fm.header_type in (UInt8(2), UInt8(3)) || return nothing
+    metadata = fm.msg.custom_metadata
+    metadata === nothing && return nothing
+    any(kv -> kv.key == EXPERIMENTAL_COMPRESSION_KEY, metadata) &&
+        throw(ValidationError(
+            "experimental V4 IPC compression is outside this prove-out"))
+    return nothing
+end
+
 # ---------------------------------------------------------------------------
 # Stream reader: RecordBatchSource over framed messages
 # ---------------------------------------------------------------------------
@@ -943,6 +955,10 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
     for fm in msgs[2:end]
         fm.version == schemaversion ||
             throw(ValidationError("IPC metadata version changes within the stream"))
+        # Arrow 0.17 V4 streams signaled buffer compression on the Message,
+        # before RecordBatch.compression existed. Reject that legacy marker
+        # before treating its length-prefixed compressed buffers as raw data.
+        rejectexperimentalcompression(fm)
         header = fm.msg.header
         if header isa Meta.DictionaryBatch
             header.isDelta &&
@@ -1229,6 +1245,72 @@ function _dictionary_replacement_stream()
         frameof(secondframes, secondbytes, UInt8(3)),
         frameof(firstframes, firstbytes, UInt8(0)),
     )
+end
+
+function _experimental_v4_stream(value::Int64)
+    sb = FB.Builder(256)
+    name = FB.createstring!(sb, "x")
+    Meta.intStart(sb)
+    Meta.intAddBitWidth(sb, Int32(64))
+    Meta.intAddIsSigned(sb, true)
+    typ = Meta.intEnd(sb)
+    Meta.fieldStartChildrenVector(sb, 0)
+    kids = FB.endvector!(sb, 0)
+    Meta.fieldStart(sb)
+    Meta.fieldAddName(sb, name)
+    Meta.fieldAddNullable(sb, true)
+    Meta.fieldAddTypeType(sb, Meta.Int)
+    Meta.fieldAddType(sb, typ)
+    Meta.fieldAddChildren(sb, kids)
+    schema = _schema_stream_from_field!(sb, Meta.fieldEnd(sb))
+    _mutatemessage!(schema, 1) do meta, msg
+        _write_i16!(meta, _vfield(msg, 0, 2; required=true), Int16(3)) # V4
+    end
+    resize!(schema, length(schema) - 8) # remove helper EOS
+
+    raw = collect(reinterpret(UInt8, [value]))
+    compressed = transcode(Arrow.LZ4FrameCompressor, raw)
+    body = vcat(collect(reinterpret(UInt8, Int64[Int64(length(raw))])), compressed)
+    encodedlen = length(body)
+    append!(body, zeros(UInt8, mod(-length(body), 8)))
+
+    b = FB.Builder(512)
+    key = FB.createstring!(b, EXPERIMENTAL_COMPRESSION_KEY)
+    val = FB.createstring!(b, "LZ4")
+    Meta.keyValueStart(b)
+    Meta.keyValueAddKey(b, key)
+    Meta.keyValueAddValue(b, val)
+    kv = Meta.keyValueEnd(b)
+    Meta.recordBatchStartNodesVector(b, 1)
+    Meta.createFieldNode(b, Int64(1), Int64(0))
+    nodes = FB.endvector!(b, 1)
+    Meta.recordBatchStartBuffersVector(b, 2)
+    Meta.createBuffer(b, Int64(0), Int64(encodedlen)) # data (reverse build)
+    Meta.createBuffer(b, Int64(0), Int64(0))          # validity
+    buffers = FB.endvector!(b, 2)
+    Meta.recordBatchStart(b)
+    Meta.recordBatchAddLength(b, Int64(1))
+    Meta.recordBatchAddNodes(b, nodes)
+    Meta.recordBatchAddBuffers(b, buffers)
+    rb = Meta.recordBatchEnd(b)
+    Meta.messageStartCustomMetadataVector(b, 1)
+    FB.prependoffset!(b, kv)
+    custom = FB.endvector!(b, 1)
+    Meta.messageStart(b)
+    Meta.messageAddVersion(b, Meta.MetadataVersion.V4)
+    Meta.messageAddHeaderType(b, Meta.RecordBatch)
+    Meta.messageAddHeader(b, rb)
+    Meta.messageAddBodyLength(b, Int64(length(body)))
+    Meta.messageAddCustomMetadata(b, custom)
+    msg = Meta.messageEnd(b)
+    FB.finish!(b, msg)
+    meta = collect(FB.finishedbytes(b))
+    append!(meta, zeros(UInt8, mod(-length(meta), 8)))
+    prefix = collect(reinterpret(UInt8,
+        UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
+    eos = collect(reinterpret(UInt8,
+        UInt32[UInt32(CONTINUATION), UInt32(0)]))
+    return vcat(schema, prefix, meta, body, eos)
 end
 
 function _aliased_field_stream(depth::Int)
@@ -1620,6 +1702,12 @@ function main()
     end
     @assert _rejects(() -> readstream(mixedversion))
     println("FlatBuffer bounds and metadata versions are verified ✓")
+
+    # Arrow 0.17 V4 used Message custom metadata for its experimental
+    # compression marker. The body below is a real length-prefixed LZ4 frame;
+    # it must fail closed instead of exposing that prefix as an Int64 value.
+    @assert _rejects(() -> readstream(_experimental_v4_stream(Int64(42))))
+    println("legacy V4 compression is rejected before body decoding ✓")
 
     bigendian = copy(bytes)
     _mutatemessage!(bigendian, 1) do meta, msg
