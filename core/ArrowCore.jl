@@ -190,13 +190,24 @@ end
 
 @inline _lifecycle(r::OwnerRegion) = r.lifecycle === nothing ? r : r.lifecycle
 
-function _finalize_region!(r::OwnerRegion)
+function _finalize_region!(r::OwnerRegion, after_busy=nothing)
     # Natural finalization implies no live guards, but `finalize(r)` is also
     # a public Julia operation and can be called while `r` is reachable.
     # Use the same CAS/guard handshake as explicit close. If a manual
     # finalization finds the region busy, install the backstop again.
-    forceclose!(r; timeout_ms=0) || finalizer(_finalize_region!, r)
-    return
+    while true
+        try
+            Base.disable_sigint() do
+                if !forceclose!(r; timeout_ms=0)
+                    after_busy === nothing || after_busy()
+                    finalizer(_finalize_region!, r)
+                end
+            end
+            return
+        catch e
+            e isa InterruptException || rethrow()
+        end
+    end
 end
 
 """
@@ -233,7 +244,16 @@ back out. Either way no dereference overlaps a release.
         phase(st) == PHASE_OPEN ||
             throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
     catch
-        acquired && (@atomic :acquire_release r.guards -= 1)
+        while acquired
+            try
+                Base.disable_sigint() do
+                    @atomic :acquire_release r.guards -= 1
+                    acquired = false
+                end
+            catch e
+                e isa InterruptException || rethrow()
+            end
+        end
         rethrow()
     end
     return nothing
@@ -341,10 +361,12 @@ function _forceclose!(r::OwnerRegion, timeout_ms::Integer, waitfn;
         # Any failure before callback entry returns the exact close claim. The
         # callback commit above owns all failures after release starts.
         if claimed && !release_started
-            while phase(@atomic r.state) == PHASE_CLOSING
+            rolled_back = false
+            while !rolled_back
                 try
                     Base.disable_sigint() do
-                        @atomicreplace r.state closing => st
+                        _, ok = @atomicreplace r.state closing => st
+                        rolled_back = ok || (@atomic r.state) != closing
                     end
                 catch e
                     e isa InterruptException || rethrow()
@@ -427,11 +449,13 @@ function _release_mapping_once!(state::Threads.Atomic{UInt8}, p::Ptr,
             # A failed unmap must return the release claim before it escapes.
             # A second interruption at this rollback boundary cannot strand
             # RELEASING and make every later cleanup spin forever.
-            while state[] == 0x01
+            rolled_back = false
+            while !rolled_back
                 try
                     Base.disable_sigint() do
                         before_rollback === nothing || before_rollback()
-                        Threads.atomic_cas!(state, 0x01, 0x00)
+                        old = Threads.atomic_cas!(state, 0x01, 0x00)
+                        rolled_back = old == 0x01 || state[] != 0x01
                     end
                 catch e
                     e isa InterruptException || rethrow()

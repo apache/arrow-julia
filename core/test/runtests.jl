@@ -202,6 +202,26 @@ end
         @test_throws InvalidatedError withguard(() -> 1, r)
     end
 
+    @testset "busy finalizer interruption rearms cleanup" begin
+        bytes = UInt8[0]
+        calls = Ref(0)
+        r = GC.@preserve bytes AC.OwnerRegion(
+            Ptr{UInt8}(pointer(bytes)), 1, AC.Foreign;
+            root=bytes, releasefn=_ -> (calls[] += 1))
+        AC._acquireguard!(r)
+        attempts = Ref(0)
+        AC._finalize_region!(r, () -> begin
+            attempts[] += 1
+            attempts[] == 1 && throw(InterruptException())
+        end)
+        @test attempts[] == 2
+        @test AC.phase(@atomic r.state) == AC.PHASE_OPEN
+        @test calls[] == 0
+        AC._releaseguard!(r)
+        finalize(r)
+        @test calls[] == 1
+    end
+
     @testset "interrupted close wait restores open" begin
         bytes = UInt8[0]
         calls = Ref(0)
