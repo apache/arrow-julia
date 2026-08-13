@@ -39,6 +39,7 @@ function _exercise_mapped_region(path::String)
     @test size(r.root) == (8, 1)
     @test_throws MethodError resize!(r.root, 10)
     anchor = WeakRef(r.root)
+    mapping = WeakRef(parent(r.root))
     mappedptr = r.ptr
     GC.gc(true)
     @test anchor.value !== nothing
@@ -55,7 +56,7 @@ function _exercise_mapped_region(path::String)
     @test r.root === nothing
     @test_throws InvalidatedError AC.loadat(b, UInt8, Int64(0))
     @test forceclose!(r) # idempotent
-    return anchor
+    return anchor, mapping
 end
 
 
@@ -79,10 +80,11 @@ end
     @testset "mapped region: stable root, close, and invalidation" begin
         path = tempname()
         write(path, UInt8[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
-        anchor = _exercise_mapped_region(path)
+        anchor, mapping = _exercise_mapped_region(path)
         GC.gc(true)
         GC.gc(true)
         @test anchor.value === nothing
+        @test mapping.value === nothing
         # The stdlib mapping is now finalized, so this is also valid on
         # platforms that forbid deleting an actively mapped file.
         rm(path)
@@ -157,6 +159,18 @@ end
         @test forceclose!(r)
         @test_throws InvalidatedError withguard(() -> 1, r)
         @test AC.guardcount(r) == 0   # failed acquire backed out its count
+    end
+
+    @testset "Base.close is idempotent and releases once" begin
+        bytes = UInt8[0]
+        calls = AC.ReleaseCounter()
+        r = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1,
+            AC.Foreign; root=bytes, releasefn=AC.NotifyRelease(calls))
+        @test close(r) === nothing
+        @test AC.regionphase(r) == AC.PHASE_CLOSED
+        @test calls[] == 1
+        @test close(r) === nothing
+        @test calls[] == 1
     end
 
     @testset "invalid construction and release errors stay closed" begin
