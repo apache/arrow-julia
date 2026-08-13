@@ -155,8 +155,17 @@ mutable struct OwnerRegion
         root=nothing, releasefn=nothing,
         lifecycle::Union{Nothing,OwnerRegion}=nothing)
         len >= 0 || throw(ArgumentError("region length must be non-negative"))
-        (ptr != C_NULL || len == 0) ||
+        n = Int64(len)
+        (ptr != C_NULL || n == 0) ||
             throw(ArgumentError("a non-empty region requires a non-NULL pointer"))
+        # BufferSlice bounds are only meaningful if every declared byte also
+        # has a representable pointer address. Reject a foreign extent whose
+        # final byte would wrap native pointer arithmetic.
+        if n > 0
+            lastaddr = UInt128(UInt(ptr)) + UInt128(n - 1)
+            lastaddr <= UInt128(typemax(UInt)) ||
+                throw(ArgumentError("region extent wraps the native address space"))
+        end
         lifecycle !== nothing && releasefn !== nothing &&
             throw(ArgumentError("a shared-lifecycle region cannot own a release callback"))
         # Keep delegation one hop deep. Otherwise a region that delegates to
@@ -165,7 +174,7 @@ mutable struct OwnerRegion
         # release memory underneath that access.
         lifecycle = lifecycle === nothing ? nothing : _lifecycle(lifecycle)
         align = ptr == C_NULL ? 64 : (1 << trailing_zeros(UInt(ptr) | UInt(64)))
-        r = new(ptr, Int64(len), kind, align, root, lifecycle,
+        r = new(ptr, n, kind, align, root, lifecycle,
             releasefn, PHASE_OPEN, 0)
         # Shared-mode cleanup: only regions that own non-GC memory need a
         # finalizer. A finalizer only runs when the region is unreachable, at

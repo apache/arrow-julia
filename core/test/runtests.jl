@@ -176,6 +176,8 @@ end
     @test_throws BoundsError AC.loadat(b, UInt64, Int64(1))
     @test_throws BoundsError AC.loadat(b, UInt8, Int64(8))
     @test_throws BoundsError AC.loadat(b, UInt8, typemax(Int64))
+    @test_throws ArgumentError OwnerRegion(
+        Ptr{UInt8}(typemax(UInt)), 2, AC.Foreign)
     # empty buffer
     e = BufferSlice()
     @test length(e) == 0
