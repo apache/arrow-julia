@@ -302,6 +302,17 @@ end
         @test isequal(out, [[1, 2], Int[], missing, [3]])
     end
 
+    @testset "empty lists preserve their declared child type" begin
+        ff, fd = fromjulia("empty-float-list", Vector{Vector{Float64}}())
+        @test ff.children[1].type == FloatType(64)
+        @test isempty(materialize(ff, fd))
+
+        uf, ud = fromjulia("missing-uint-list",
+            Union{Missing,Vector{UInt8}}[missing, missing])
+        @test uf.children[1].type == IntType(8, false)
+        @test isequal(materialize(uf, ud), [missing, missing])
+    end
+
     @testset "struct" begin
         f, d = AC.fromjulia_struct("st", (a=Int64[1, 2], b=["x", "y"]))
         validate_structural(f, d)

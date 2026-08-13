@@ -1718,7 +1718,8 @@ function _build_list(name, v::Vector)
         offsets[i + 1] = Int32(total)
     end
     nonmissing = [x for x in v if x !== missing]
-    flat = isempty(nonmissing) ? Int64[] : reduce(vcat, nonmissing)
+    childtype = eltype(Base.nonmissingtype(eltype(v)))
+    flat = isempty(nonmissing) ? Vector{childtype}() : reduce(vcat, nonmissing)
     cf, cd = fromjulia("item", collect(flat))
     nc = count(!, present)
     t = ListType(false)
