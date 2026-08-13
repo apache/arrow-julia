@@ -247,9 +247,9 @@ Lifetime contract (report §9 "two lifetime modes"):
     caller retries or gives up; there is no half-closed limbo.
 
 `root` is the GC anchor for borrowed memory (the wrapped Julia array, the
-adapter's byte blob). `releasefn` is called exactly once with the region
-when the memory itself must be returned (munmap, C release callback);
-`nothing` for memory the GC owns via `root`.
+adapter's byte blob). `releasefn` is executed exactly once when the memory
+itself must be returned (munmap or a C release callback); `nothing` for
+memory the GC owns via `root`.
 """
 mutable struct OwnerRegion
     const ptr::Ptr{UInt8}
@@ -282,7 +282,7 @@ mutable struct OwnerRegion
                 throw(ArgumentError("region extent wraps the native address space"))
         end
         lifecycle !== nothing && releasefn !== nothing &&
-            throw(ArgumentError("a shared-lifecycle region cannot own a release callback"))
+            throw(ArgumentError("a shared-lifecycle region cannot own a release action"))
         # Keep delegation one hop deep. Otherwise a region that delegates to
         # another delegated region increments the intermediate guard count,
         # while closing the root gate can still observe zero guards and
@@ -473,7 +473,7 @@ function forceclose!(r::OwnerRegion; timeout_ms::Integer=1000)
         st = @atomic :acquire r.state
         phase(st) == PHASE_CLOSED && return true
         if phase(st) == PHASE_CLOSING
-            # Another closer is the sole callback owner. Wait for it to
+            # Another closer is the sole release-action owner. Wait for it to
             # publish CLOSED (success) or restore OPEN (then retry). Never
             # CAS closing => closing: that would create a second winner.
             time_ns() - started >= timeout_ns && return false
@@ -618,8 +618,8 @@ mmapregion(path::AbstractString) = _mmapregion(String(path))
     foreignregion(ptr, len, release) -> OwnerRegion
 
 Wrap memory owned by foreign code (a C-data import). `release` is invoked
-exactly once — from `forceclose!` or the finalizer — and is where the
-imported structure's release callback gets called. The extent is DECLARED,
+exactly once — from `forceclose!` or the finalizer — and its action calls the
+imported structure's release callback. The extent is DECLARED,
 not verified: the ABI gives us no way to prove the allocation is `len` bytes
 (report §9, C-data adapter), so slices bound accesses to the declaration and
 the trust decision is the importer's. The producer must keep the declared

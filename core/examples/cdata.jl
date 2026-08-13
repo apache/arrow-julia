@@ -385,10 +385,8 @@ _malloc!(root::ExportedRoot, n::Integer,
     catch
         if owned
             if length(root.mallocs) == oldlen
-                if owned
-                    deallocate!(p)
-                    owned = false
-                end
+                deallocate!(p)
+                owned = false
             elseif length(root.mallocs) == oldlen + 1 &&
                     root.mallocs[end] == p
                 owned = false
@@ -788,21 +786,6 @@ function _release_moved_owner!(o::ForeignOwner)
     return nothing
 end
 
-_call_foreign_release(release, p::Ptr{CArrowArray}) =
-    ccall(release, Cvoid, (Ptr{CArrowArray},), p)
-_call_foreign_release(release, p::Ptr{CArrowSchema}) =
-    ccall(release, Cvoid, (Ptr{CArrowSchema},), p)
-
-function _run_foreign_release_pointer!(p)
-    release = unsafe_load(p).release
-    if release != C_NULL
-        _call_foreign_release(release, p)
-        unsafe_load(p).release == C_NULL ||
-            error("C Data producer release did not mark the structure released")
-    end
-    return nothing
-end
-
 function release!(o::ForeignOwner; timeout_ms::Integer=1000)
     forceclose!(o.gate; timeout_ms=timeout_ms) ||
         error("foreign array busy: access guards still held after timeout")
@@ -929,7 +912,9 @@ end
 
 function _release_c_schema!(sp::Ptr{CArrowSchema}, sch::CArrowSchema)
     sch.release == C_NULL && return nothing
-    _run_foreign_release_pointer!(sp)
+    ccall(sch.release, Cvoid, (Ptr{CArrowSchema},), sp)
+    unsafe_load(sp).release == C_NULL ||
+        error("C Data producer release did not mark the structure released")
     return nothing
 end
 
