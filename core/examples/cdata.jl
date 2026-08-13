@@ -57,10 +57,10 @@
 #     Per spec, moving marks the source released (release = NULL).
 #
 # The demo includes a registry-rooting round trip that drops all Julia source
-# references before GC and import. It also exports a Core batch (nullable ints,
-# strings, list column), materializes and compares imported columns, releases
-# and reaps them, and proves that the registry is empty and double release is
-# inert.
+# references before GC and import. It also exports a Core batch (integer,
+# nullable floating-point, string, and list columns), materializes and compares
+# imported columns, releases and reaps them, and proves that the registry is
+# empty and double release is inert.
 # =============================================================================
 
 include(joinpath(@__DIR__, "..", "ArrowCore.jl"))
@@ -516,6 +516,20 @@ independent C Data lifetimes. Releasing either root recursively marks only
 that structure tree released. Moved descendants defer aggregate cleanup.
 The array root also holds source-region pins until it is reaped.
 """
+function _build_c_data!(sp, skey, ap, akey, f::Field, d::ArrayData,
+    arel, srel;
+    after_schema=nothing, after_array=nothing)
+    _newroot(Any[f]; result_slot=sp, key_slot=skey) do root
+        _export_schema!(root, f, srel)
+    end
+    after_schema === nothing || after_schema(sp[])
+    _newroot(Any[d], d; result_slot=ap, key_slot=akey) do root
+        _export_array!(root, d, arel)
+    end
+    after_array === nothing || after_array(ap[])
+    return nothing
+end
+
 function to_c_data(f::Field, d::ArrayData)
     # Reject mismatched schema/data and malformed buffers before publishing
     # either independently-owned C root.
@@ -524,18 +538,22 @@ function to_c_data(f::Field, d::ArrayData)
     validate_full(f, d)
     arel = @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},))
     srel = @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
-    sp = _newroot(Any[f]) do root
-        _export_schema!(root, f, srel)
-    end
+    sp = Ref{Ptr{CArrowSchema}}(C_NULL)
+    skey = Ref{Int64}(0)
+    ap = Ref{Ptr{CArrowArray}}(C_NULL)
+    akey = Ref{Int64}(0)
     try
-        ap = _newroot(Any[d], d) do root
-            _export_array!(root, d, arel)
+        # The exact public method owns both output slots until its tuple return.
+        # A helper cannot lose a published pointer at its own return boundary:
+        # _newroot records each result in the caller's slot when it publishes.
+        return Base.disable_sigint() do
+            _build_c_data!(sp, skey, ap, akey, f, d, arel, srel)
+            return sp[], ap[]
         end
-        return sp, ap
     catch
         # Schema and array are separate C lifetimes, but export is one API
-        # transaction. The schema has not escaped yet, so discard it directly.
-        _discard_export!(sp)
+        # transaction. Neither has escaped on this path, so discard both.
+        _cleanup_export_slots_noescape!(sp, skey, ap, akey)
         rethrow()
     end
 end
@@ -553,27 +571,41 @@ function _walk_regions!(seen::IdDict{OwnerRegion,Nothing}, d::ArrayData)
     return seen
 end
 
-function _release_pins!(pins::Vector{OwnerRegion}, n::Int=length(pins))
-    for i = 1:n
-        AC._releaseguard!(pins[i])
+function _release_pins!(pins::Vector{OwnerRegion})
+    while !isempty(pins)
+        Base.disable_sigint() do
+            AC._releaseguard!(last(pins))
+            pop!(pins)
+        end
     end
-    empty!(pins)
     return nothing
 end
 
-function _pin_regions(d::ArrayData, acquire! = AC._acquireguard!)
-    pins = collect(keys(_walk_regions!(IdDict{OwnerRegion,Nothing}(), d)))
-    acquired = 0
+function _pin_regions!(root::ExportedRoot, d::ArrayData,
+    acquire! = AC._acquireguard!; after_acquire=nothing)
+    regions = collect(keys(_walk_regions!(IdDict{OwnerRegion,Nothing}(), d)))
+    sizehint!(root.pins, AC.checked_add(length(root.pins), length(regions)))
     try
-        for region in pins
-            acquire!(region)
-            acquired += 1
+        for region in regions
+            owned = false
+            Base.disable_sigint() do
+                try
+                    acquire!(region)
+                    owned = true
+                    after_acquire === nothing || after_acquire(region)
+                    push!(root.pins, region)
+                    owned = false
+                catch
+                    owned && AC._releaseguard!(region)
+                    rethrow()
+                end
+            end
         end
-        return pins
     catch
-        _release_pins!(pins, acquired)
+        _retry_interrupts(() -> _release_pins!(root.pins))
         rethrow()
     end
+    return root.pins
 end
 
 function _free_export!(root::ExportedRoot, after_step=nothing)
@@ -619,9 +651,15 @@ function _cleanup_registered_root!(key::Int64; require_released=true,
     catch
         root = claimed_slot[]
         if root !== nothing
-            lock(REGISTRY_LOCK) do
-                get(EXPORT_REGISTRY, key, nothing) === root &&
-                    (root.cleaning = false)
+            # A cleanup claim must never remain armed after failure. This
+            # rollback is itself a no-escape handoff: another interrupt while
+            # waiting for the registry lock would otherwise make every later
+            # cleanup spin on `cleaning == true` forever.
+            _retry_interrupts() do
+                lock(REGISTRY_LOCK) do
+                    get(EXPORT_REGISTRY, key, nothing) === root &&
+                        (root.cleaning = false)
+                end
             end
         end
         rethrow()
@@ -649,16 +687,78 @@ end
 
 function _discard_export!(p::Ptr)
     p == C_NULL && return nothing
-    Base.disable_sigint() do
+    # Resolve the stable key before cleanup can free `p`. Retrying by pointer
+    # after a pending interrupt at successful cleanup would be a use-after-free.
+    key = _retry_interrupts() do
         control = unsafe_load(p).private_data
-        key = unsafe_load(Ptr{Int64}(control + 8))
-        _cleanup_registered_root!(key; require_released=false)
+        unsafe_load(Ptr{Int64}(control + 8))
     end
+    _cleanup_key_noescape!(key; require_released=false)
     return nothing
 end
 
+function _retry_interrupts(f)
+    while true
+        try
+            return Base.disable_sigint(f)
+        catch e
+            e isa InterruptException || rethrow()
+        end
+    end
+end
+
+function _cleanup_key_noescape!(key::Int64; require_released=false)
+    return _retry_interrupts() do
+        while true
+            _cleanup_registered_root!(key;
+                require_released=require_released) && return nothing
+            present = lock(REGISTRY_LOCK) do
+                haskey(EXPORT_REGISTRY, key)
+            end
+            present || return nothing
+            yield()
+        end
+    end
+end
+
+function _cleanup_private_root_noescape!(root::ExportedRoot, key::Int64)
+    return _retry_interrupts() do
+        registered = lock(REGISTRY_LOCK) do
+            get(EXPORT_REGISTRY, key, nothing) === root
+        end
+        if registered
+            _cleanup_key_noescape!(key; require_released=false)
+        else
+            _free_export!(root)
+        end
+        return nothing
+    end
+end
+
+function _cleanup_export_slots_noescape!(sp, skey, ap, akey;
+    after_array=nothing)
+    return _retry_interrupts() do
+        # Clear raw pointer slots before any free. The stable registry keys
+        # remain valid cleanup tokens even if interruption occurs after a root
+        # is freed but before its key slot is cleared.
+        sp[] = C_NULL
+        ap[] = C_NULL
+        if akey[] != 0
+            _cleanup_key_noescape!(akey[]; require_released=false)
+            akey[] = 0
+            after_array === nothing || after_array()
+        end
+        if skey[] != 0
+            _cleanup_key_noescape!(skey[]; require_released=false)
+            skey[] = 0
+        end
+        return nothing
+    end
+end
+
 function _newroot(build, roots::Vector{Any}, pinsource=nothing,
-    rootfactory=ExportedRoot)
+    rootfactory=ExportedRoot; after_pin=nothing, after_publish=nothing,
+    result_slot=nothing, key_slot=nothing)
     key = Int64(0)
     root = nothing
     try
@@ -670,7 +770,8 @@ function _newroot(build, roots::Vector{Any}, pinsource=nothing,
             Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}())::ExportedRoot
         # Construct all Julia bookkeeping before acquiring source guards. Once
         # guards exist, every remaining failure unwinds through _free_export!.
-        pinsource === nothing || (root.pins = _pin_regions(pinsource))
+        pinsource === nothing || _pin_regions!(root, pinsource;
+            after_acquire=after_pin)
         # The pointer cannot escape before `build` returns. Keep the root
         # private until then: publishing it with `remaining == 0` would let a
         # concurrent reaper free partial mallocs and source pins underneath
@@ -678,21 +779,19 @@ function _newroot(build, roots::Vector{Any}, pinsource=nothing,
         result = build(root)
         lock(REGISTRY_LOCK) do
             EXPORT_REGISTRY[key] = root
+            key_slot === nothing || (key_slot[] = key)
+            result_slot === nothing || (result_slot[] = result)
         end
+        after_publish === nothing || after_publish(result)
         return result
     catch
         # Export-failure cleanup keeps a published root registered until every
         # resource is gone. This also covers interruption during publication.
         if root !== nothing
-            Base.disable_sigint() do
-                registered = lock(REGISTRY_LOCK) do
-                    get(EXPORT_REGISTRY, key, nothing) === root
-                end
-                if registered
-                    _cleanup_registered_root!(key; require_released=false)
-                else
-                    _free_export!(root)
-                end
+            _retry_interrupts() do
+                result_slot === nothing || (result_slot[] = C_NULL)
+                key_slot === nothing || (key_slot[] = 0)
+                _cleanup_private_root_noescape!(root, key)
             end
         end
         rethrow()
@@ -1199,17 +1298,81 @@ function main()
     pinregions = OwnerRegion[pda.buffers[2].region, pdb.buffers[2].region]
     acquirecalls = Ref(0)
     @assert try
-        _pin_regions(pdd, region -> begin
-            acquirecalls[] += 1
-            acquirecalls[] == 2 && error("injected guard acquisition failure")
-            AC._acquireguard!(region)
-        end)
+        _newroot(_ -> nothing, Any[pdd], pdd;
+            after_pin=_ -> begin
+                acquirecalls[] += 1
+                acquirecalls[] == 2 &&
+                    throw(InterruptException())
+            end)
         false
     catch e
-        e isa ErrorException && e.msg == "injected guard acquisition failure"
+        e isa InterruptException
     end
     @assert acquirecalls[] == 2
     @assert all((@atomic region.guards) == 0 for region in pinregions)
+
+    # Published schema and array roots do not transfer until the result tuple
+    # reaches the caller. Failure at either return boundary cleans both roots.
+    handofff, handoffd = fromjulia("export-handoff", Int64[1])
+    handoffregion = handoffd.buffers[2].region
+    handoff_arel = @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},))
+    handoff_srel = @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
+    for hook in (:schema, :array)
+        sp_slot = Ref{Ptr{CArrowSchema}}(C_NULL)
+        skey_slot = Ref{Int64}(0)
+        ap_slot = Ref{Ptr{CArrowArray}}(C_NULL)
+        akey_slot = Ref{Int64}(0)
+        @assert try
+            try
+                Base.disable_sigint() do
+                    _build_c_data!(sp_slot, skey_slot, ap_slot, akey_slot,
+                        handofff, handoffd, handoff_arel, handoff_srel;
+                        after_schema=hook == :schema ?
+                            _ -> throw(InterruptException()) : nothing,
+                        after_array=hook == :array ?
+                            _ -> throw(InterruptException()) : nothing)
+                end
+            catch
+                _cleanup_export_slots_noescape!(sp_slot, skey_slot,
+                    ap_slot, akey_slot)
+                rethrow()
+            end
+            false
+        catch e
+            e isa InterruptException
+        end
+        @assert _registry_count() == before
+        @assert (@atomic handoffregion.guards) == 0
+    end
+
+    # Multi-root cleanup retains stable keys across an interruption after the
+    # first native tree is already gone. It never rereads its freed pointer.
+    sp_slot = Ref{Ptr{CArrowSchema}}(C_NULL)
+    skey_slot = Ref{Int64}(0)
+    ap_slot = Ref{Ptr{CArrowArray}}(C_NULL)
+    akey_slot = Ref{Int64}(0)
+    _build_c_data!(sp_slot, skey_slot, ap_slot, akey_slot,
+        handofff, handoffd, handoff_arel, handoff_srel)
+    cleanup_interrupts = Ref(0)
+    _cleanup_export_slots_noescape!(sp_slot, skey_slot,
+        ap_slot, akey_slot; after_array=() -> begin
+            cleanup_interrupts[] += 1
+            cleanup_interrupts[] == 1 && throw(InterruptException())
+        end)
+    @assert cleanup_interrupts[] == 1
+    @assert sp_slot[] == C_NULL && ap_slot[] == C_NULL
+    @assert skey_slot[] == 0 && akey_slot[] == 0
+    @assert _registry_count() == before
+    @assert (@atomic handoffregion.guards) == 0
+    @assert forceclose!(handoffregion; timeout_ms=0)
+
+    retrycalls = Ref(0)
+    @assert _retry_interrupts() do
+        retrycalls[] += 1
+        retrycalls[] == 1 && throw(InterruptException())
+        true
+    end
+    @assert retrycalls[] == 2
 
     factoryregion = pda.buffers[2].region
     @assert try
