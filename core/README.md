@@ -115,7 +115,8 @@ budget for metadata copies and metadata-directed Julia containers. It is not
 an exact measurement of every Julia runtime allocation. Message bodies stay
 zero-copy and have separate body and buffer limits. Schema and Field metadata
 are copied into dictionaries, so duplicate keys and original ordering are not
-lossless.
+lossless. `IPCStream` is a single-owner pull cursor. Overlapping `nextbatch!`
+calls throw `ConcurrencyViolationError`.
 
 The C Data example maps Boolean, integer, floating point, UTF-8, binary, list,
 struct, map, and dictionary formats. Other Core layouts are not mapped. Field

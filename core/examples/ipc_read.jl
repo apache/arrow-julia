@@ -855,6 +855,7 @@ mutable struct IPCStream <: AC.RecordBatchSource
     corefields::AC.FrozenVector{Field}
     batches::Vector{AC.RecordBatch}
     nextindex::Int
+    @atomic pulling::Bool
 end
 
 
@@ -866,10 +867,17 @@ mutable struct PendingRecord
 end
 AC.schema(s::IPCStream) = s.schema
 function AC.nextbatch!(s::IPCStream)
-    s.nextindex > length(s.batches) && return nothing
-    b = s.batches[s.nextindex]
-    s.nextindex += 1
-    return b
+    _, claimed = @atomicreplace s.pulling false => true
+    claimed || throw(Base.ConcurrencyViolationError(
+        "IPCStream supports only one active nextbatch! call"))
+    try
+        s.nextindex > length(s.batches) && return nothing
+        b = s.batches[s.nextindex]
+        s.nextindex += 1
+        return b
+    finally
+        @atomic :release s.pulling = false
+    end
 end
 
 """
@@ -879,6 +887,8 @@ Decode a stream from a borrowed byte vector. Batch buffers remain zero-copy
 views of `bytes`; the caller must not mutate or resize it until the returned
 stream and all batches from it are unreachable. A production IO framer owns
 its backing storage instead of exposing this prove-out borrow contract.
+`IPCStream` is a single-owner cursor; overlapping `nextbatch!` calls throw
+`ConcurrencyViolationError`.
 """
 function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
     region = heapregion(bytes)
@@ -984,7 +994,51 @@ function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
     isempty(pending) ||
         throw(ValidationError("stream ended before required dictionary batches arrived"))
     batches = AC.RecordBatch[b::AC.RecordBatch for b in batchslots]
-    return IPCStream(sch, AC.FrozenVector{Field}(fields), batches, 1)
+    return IPCStream(sch, AC.FrozenVector{Field}(fields), batches, 1, false)
+end
+
+function _threaded_cursor_stress()
+    workers = min(4, Threads.nthreads())
+    workers > 1 || error("threaded IPC cursor stress requires multiple threads")
+    n = 200_000
+    sch = Schema(Field[])
+    batches = AC.RecordBatch[
+        AC.RecordBatch(sch, ArrayData[], i) for i = 1:n
+    ]
+    stream = IPCStream(sch, AC.FrozenVector{Field}(Field[]), batches, 1, false)
+    results = [Int64[] for _ = 1:workers]
+    violations = Threads.Atomic{Int}(0)
+    ready = Threads.Atomic{Int}(0)
+    start = Base.Event()
+    tasks = [Threads.@spawn begin
+        Threads.atomic_add!(ready, 1)
+        wait(start)
+        while true
+            b = try
+                nextbatch!(stream)
+            catch e
+                if e isa Base.ConcurrencyViolationError
+                    Threads.atomic_add!(violations, 1)
+                    yield()
+                    continue
+                end
+                rethrow()
+            end
+            b === nothing && break
+            push!(results[worker], b.nrows)
+        end
+    end for worker = 1:workers]
+    while ready[] != workers
+        yield()
+    end
+    notify(start)
+    fetch.(tasks)
+    got = reduce(vcat, results)
+    @assert length(got) == n
+    sort!(got)
+    @assert got == collect(Int64, 1:n)
+    @assert violations[] > 0
+    return nothing
 end
 
 # Test-support helpers for exact, length-preserving metadata mutations. They
@@ -1230,6 +1284,11 @@ function main()
     @assert nextbatch!(pulled) isa RecordBatch
     @assert nextbatch!(pulled) === nothing
     println("RecordBatchSource pull protocol works ✓")
+
+    reporoot = normpath(joinpath(@__DIR__, "..", ".."))
+    stresscmd = `$(Base.julia_cmd()) --startup-file=no --threads=4 --project=$reporoot $(abspath(@__FILE__))`
+    run(addenv(stresscmd, "ARROWCORE_IPC_CURSOR_STRESS" => "1"))
+    println("concurrent IPC pulls fail closed without duplicate batches ✓")
 
     # Framing limits actually bite: a 1KB body cap must reject this stream
     # BEFORE any decode work happens.
@@ -1544,5 +1603,9 @@ function main()
 end
 
 if abspath(PROGRAM_FILE) == abspath(@__FILE__)
-    main()
+    if get(ENV, "ARROWCORE_IPC_CURSOR_STRESS", "") == "1"
+        _threaded_cursor_stress()
+    else
+        main()
+    end
 end
