@@ -242,6 +242,10 @@ end
     @test collect(Schema([metadata_field];
         metadata=("a" => "1", "a" => "2")).metadata) ==
         ["a" => "1", "a" => "2"]
+    @test_throws ArgumentError Field("m", IntType(8, true);
+        metadata=["not a pair"])
+    @test_throws ArgumentError Schema([metadata_field];
+        metadata=("not a pair",))
 
     # ListView offsets are per-slot and may be unordered; view data buffers
     # are variadic after the fixed validity/views pair.

@@ -610,9 +610,12 @@ struct Field
 end
 _freezemetadata(::Nothing) = nothing
 _freezemetadata(metadata::FrozenVector{Pair{String,String}}) = metadata
-_freezemetadata(metadata::Union{AbstractVector,Tuple}) =
-    FrozenVector{Pair{String,String}}(
+function _freezemetadata(metadata::Union{AbstractVector,Tuple})
+    all(kv -> kv isa Pair, metadata) ||
+        throw(ArgumentError("metadata sequences must contain Pair values"))
+    return FrozenVector{Pair{String,String}}(
         String(first(kv)) => String(last(kv)) for kv in metadata)
+end
 _freezemetadata(metadata) =
     FrozenVector{Pair{String,String}}(
         String(k) => String(v) for (k, v) in pairs(metadata))
