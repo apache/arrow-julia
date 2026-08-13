@@ -476,14 +476,19 @@ function _newroot(build, roots::Vector{Any}; pins::Vector{OwnerRegion}=OwnerRegi
         rethrow()
     end
     root = ExportedRoot(roots, Ptr{Cvoid}[], pins, key, 0)
-    lock(REGISTRY_LOCK) do
-        EXPORT_REGISTRY[key] = root
-    end
     try
-        return build(root)
+        # The pointer cannot escape before `build` returns. Keep the root
+        # private until then: publishing it with `remaining == 0` would let a
+        # concurrent reaper free partial mallocs and source pins underneath
+        # the builder, before its first node control increments `remaining`.
+        result = build(root)
+        lock(REGISTRY_LOCK) do
+            EXPORT_REGISTRY[key] = root
+        end
+        return result
     catch
-        # Export-failure cleanup path: unpublish and free everything built
-        # so far, exactly once, then rethrow (report §9).
+        # Export-failure cleanup path: remove a root if publication itself was
+        # interrupted, and free everything built so far exactly once.
         lock(REGISTRY_LOCK) do
             pop!(EXPORT_REGISTRY, key, nothing)
         end
@@ -791,6 +796,28 @@ function main()
         error("unsupported pointer width $(Sys.WORD_SIZE)")
     end
     println("C ABI size and field-offset gate passed for $(Sys.WORD_SIZE)-bit ✓")
+
+    # A reaper may run while an export tree is being built. Partial mallocs
+    # and source pins must stay private until the finished tree is published.
+    before = _registry_count()
+    entered = Base.Event()
+    finish = Base.Event()
+    builder = @async _newroot(Any[]) do root
+        p = _malloc!(root, 64)
+        notify(entered)
+        wait(finish)
+        @assert !isempty(root.mallocs)
+        p
+    end
+    wait(entered)
+    @assert _registry_count() == before
+    @assert reap!() == 0
+    notify(finish)
+    fetch(builder)
+    @assert _registry_count() == before + 1
+    @assert reap!() == 1
+    @assert _registry_count() == before
+    println("in-progress exports are hidden from the reaper ✓")
 
     b = batch((
         xs=Int64[1, 2, 3, 4],
