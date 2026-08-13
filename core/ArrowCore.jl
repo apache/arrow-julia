@@ -385,14 +385,35 @@ function _munmap!(p::Ptr, len::Integer)
     return nothing
 end
 
-function _release_mapping_once!(claimed::Threads.Atomic{Bool}, p::Ptr,
-    len::Integer, unmapper)
+function _release_mapping_once!(state::Threads.Atomic{UInt8}, p::Ptr,
+    len::Integer, unmapper; after_release=nothing)
     # The constructor catch and an already-armed OwnerRegion finalizer can
-    # race to return the same mapping. Claim and release it as one
-    # non-interruptible handoff so exactly one path calls munmap.
-    Base.disable_sigint() do
-        Threads.atomic_cas!(claimed, false, true) && return nothing
-        unmapper(p, len)
+    # race to return the same mapping. Serialize attempts with a retryable
+    # LIVE -> RELEASING -> RELEASED state. An unmapper failure restores LIVE;
+    # a completed munmap publishes RELEASED before pending SIGINT can escape.
+    owned = false
+    try
+        while true
+            current = state[]
+            current == 0x02 && return nothing
+            if current == 0x01
+                yield()
+                continue
+            end
+            Base.disable_sigint() do
+                old = Threads.atomic_cas!(state, 0x00, 0x01)
+                owned = old == 0x00
+            end
+            owned && break
+        end
+        Base.disable_sigint() do
+            unmapper(p, len)
+            state[] = 0x02
+            after_release === nothing || after_release()
+        end
+    catch
+        owned && state[] == 0x01 && (state[] = 0x00)
+        rethrow()
     end
     return nothing
 end
@@ -411,7 +432,7 @@ function _mmapregion(path::AbstractString, makeowner=OwnerRegion;
         # read-only mapping; MAP_FAILED is (void*)-1.
         # Prepare the exactly-once release state before mmap transfers a native
         # resource to us. Both possible owners below share this same claim.
-        released = Threads.Atomic{Bool}(false)
+        released = Threads.Atomic{UInt8}(0x00)
         release = (r::OwnerRegion) ->
             _release_mapping_once!(released, r.ptr, r.len, unmapper)
         p = ccall(:mmap, Ptr{Cvoid},

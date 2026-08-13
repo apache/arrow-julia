@@ -90,6 +90,31 @@ end
         finalize(lateowner[]::OwnerRegion)
         @test unmaps[] == 2
 
+        # A failed release attempt must restore LIVE. Once the unmapper has
+        # succeeded, an exception at the commit boundary must leave RELEASED.
+        state = Threads.Atomic{UInt8}(0x00)
+        attempts = Ref(0)
+        transient = function (_p, _len)
+            attempts[] += 1
+            attempts[] == 1 && throw(InterruptException())
+        end
+        @test_throws InterruptException AC._release_mapping_once!(
+            state, Ptr{Cvoid}(1), 1, transient)
+        @test state[] == 0x00
+        AC._release_mapping_once!(state, Ptr{Cvoid}(1), 1, transient)
+        @test state[] == 0x02
+        @test attempts[] == 2
+        committed = Threads.Atomic{UInt8}(0x00)
+        committed_calls = Ref(0)
+        @test_throws InterruptException AC._release_mapping_once!(
+            committed, Ptr{Cvoid}(1), 1,
+            (_p, _len) -> (committed_calls[] += 1);
+            after_release=() -> throw(InterruptException()))
+        @test committed[] == 0x02
+        AC._release_mapping_once!(committed, Ptr{Cvoid}(1), 1,
+            (_p, _len) -> (committed_calls[] += 1))
+        @test committed_calls[] == 1
+
         r = AC._mmapregion(path; unmapper=unmapper)
         @test unmaps[] == 2
         @test forceclose!(r)
