@@ -263,6 +263,8 @@ function _vstring(t::_VTable, slot::Int, state::_VState; required::Bool=false)
     _vrange(t.bytes, start, AC.checked_add(n, Int64(1)), "string")
     t.bytes[start + n + 1] == 0 || _vfail("string has no NUL terminator")
     _vcharge!(state, AC.checked_add(METADATA_STRING_BASE_RESERVE, n), "string")
+    payload = @view t.bytes[(start + 1):(start + n)]
+    isvalid(String, payload) || _vfail("string is not valid UTF-8")
     return nothing
 end
 
@@ -1338,6 +1340,18 @@ function main()
         _write_i32!(meta, _vfield(inttype, 0, 4; required=true), Int32(24))
     end
     @assert _rejects(() -> readstream(badschema))
+
+    badutf8 = copy(bytes)
+    _mutatemessage!(badutf8, 1) do meta, msg
+        schema = _headertable(meta, msg)
+        start, n = _vvector(schema, 1, 4; required=true)
+        n > 0 || error("schema fixture has no fields")
+        firstfield = _vtable(meta, start + Int64(_vu32(meta, start)))
+        name = _vref(firstfield, 0; required=true)
+        _vu32(meta, name) > 0 || error("schema fixture has an empty field name")
+        meta[name + 5] = 0xff
+    end
+    @assert _rejects(() -> readstream(badutf8))
     println("endianness and schema descriptors are checked before batches ✓")
 
     # Zero is the FlatBuffers scalar default and may be omitted. Both widths
