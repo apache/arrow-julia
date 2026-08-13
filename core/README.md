@@ -179,12 +179,14 @@ the Mmap STDLIB (cross-platform); `forceclose!` on a mapped region
 invalidates every view and drops the GC anchor, with the actual unmap
 happening when the array is collected — eager unmapping waits on a public
 stdlib API (reaching around the stdlib's internal finalizer is
-version-fragile). The anchor is a fixed-size `Matrix{UInt8}` because mapped
-Vectors can detach from their storage when resized on Julia 1.11 and later.
-Tests prove that its pointer stays stable across GC while open. External writes
-or truncation of a mapped file while the mapping or cached validation results
-remain in use are unsupported. On systems that prohibit deleting active mapped
-files, collection must complete after close before the path can be deleted.
+version-fragile). The anchor is a fixed-size matrix view because mapped Vectors
+can detach from their storage when resized on Julia 1.11 and later. The view
+also separates manual root finalization from the parent object that owns the
+mapping. Tests prove that its pointer stays stable across GC while open.
+External writes or truncation of a mapped file while the mapping or cached
+validation results remain in use are unsupported. On systems that prohibit
+deleting active mapped files, collection must complete after close before the
+path can be deleted.
 The ABI layout checks include 32-bit expectations, but this review executed
 them only on the available 64-bit host.
 

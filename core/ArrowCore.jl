@@ -601,12 +601,13 @@ packages use) is version-fragile. If/when a public API lands upstream, a
 release action can restore eager unmap without changing this type's
 contract.
 
-The anchor is an intentionally fixed-size `Matrix{UInt8}`. A mapped Vector
-can be resized on Julia 1.11 and later, which detaches it from its mapped
-storage and would invalidate a cached pointer. The matrix has the same
-contiguous bytes but no in-place resize operation. Core keeps it reachable
-for every open guarded access and checks this pointer-stability contract in
-tests across GC.
+The anchor is an intentionally fixed-size matrix view. A mapped Vector can
+be resized on Julia 1.11 and later, which detaches it from its mapped storage
+and would invalidate a cached pointer. The view has the same contiguous bytes
+but no in-place resize operation. It also keeps the stdlib-owned mapping as
+its parent, so manually finalizing the exposed root cannot finalize the
+mapping itself. Core keeps the root reachable for every open guarded access
+and checks this pointer-stability contract in tests across GC.
 
 The caller must prevent external writes or truncation of the mapped file
 while the region or any cached validation result remains in use: a shared
@@ -624,16 +625,19 @@ function mmapregion(path::AbstractString)
             throw(ArgumentError("mapped file is not addressable: $path"))
         # A one-dimensional mmap is a Vector. On Julia 1.11+, resize! can
         # detach that Vector from its mapped Memory and leave `ptr` stale.
-        # Use a fixed-size Matrix as the anchor; views may reshape it, but
-        # resizing such a view detaches the view and cannot move this root.
+        # Start with a fixed-size Matrix; a Vector view may detach on resize,
+        # but cannot move this owner.
         Mmap.mmap(io, Matrix{UInt8}, (Int(len), 1))
     finally
         # The mapping outlives the descriptor.
         close(io)
     end
-    GC.@preserve arr begin
-        return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr), Mapped;
-            root=arr)
+    # Keep the mapping behind a fixed-size view. `finalize(root)` then affects
+    # only the view, not the stdlib object that owns the unmap finalizer.
+    root = view(arr, :, :)
+    GC.@preserve arr root begin
+        return OwnerRegion(Ptr{UInt8}(pointer(root)), length(root), Mapped;
+            root=root)
     end
 end
 

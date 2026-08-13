@@ -35,7 +35,7 @@ const NONCONFORMING_C_RELEASE =
 function _exercise_mapped_region(path::String)
     r = mmapregion(path)
     @test r.kind == AC.Mapped
-    @test r.root isa Matrix{UInt8}
+    @test r.root isa AbstractMatrix{UInt8}
     @test size(r.root) == (8, 1)
     @test_throws MethodError resize!(r.root, 10)
     anchor = WeakRef(r.root)
@@ -46,6 +46,11 @@ function _exercise_mapped_region(path::String)
     b = BufferSlice(r, 0, 8)
     @test AC.loadat(b, UInt8, Int64(0)) == 0x11
     @test AC.loadat(b, UInt32, Int64(4)) == 0x88776655
+    # The exposed root is a non-owning view. Manual finalization must not run
+    # the stdlib mapping finalizer while the region is still open.
+    finalize(r.root)
+    GC.gc(true)
+    @test AC.loadat(b, UInt8, Int64(0)) == 0x11
     @test forceclose!(r)
     @test r.root === nothing
     @test_throws InvalidatedError AC.loadat(b, UInt8, Int64(0))
