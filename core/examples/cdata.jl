@@ -37,9 +37,12 @@
 #     every malloc'd C
 #     struct) stays in a global EXPORT REGISTRY until release — a raw
 #     pointer in private_data roots nothing by itself. The @cfunction
-#     release callback recursively marks the C tree released. A reaper pass
-#     scans for aggregates whose last outstanding node was released, frees
-#     mallocs, drops the registry root, and releases
+#     release callback recursively marks the C tree released. Callback
+#     traversal uses producer-owned canonical child/dictionary topology, not
+#     the caller-visible counts and pointer tables. It still reads each
+#     canonical descendant's public release field so conforming moves are
+#     honored. A reaper pass scans for aggregates whose last outstanding node
+#     was released, frees mallocs, drops the registry root, and releases
 #     source-region pins. Prove-out callback contract: releases for one tree
 #     are serialized and run only on Julia-attached threads. A native
 #     foreign-thread, concurrent trampoline/queue is production adapter work.
@@ -153,6 +156,8 @@ mutable struct ExportedRoot
     pins::Vector{OwnerRegion}   # long-lived source access guards for C pointers
     key::Int64
     remaining::Int64           # exported C nodes whose callback has not run
+    schema_topology::Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}
+    array_topology::Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}
 end
 
 const EXPORT_REGISTRY = Dict{Int64,ExportedRoot}()
@@ -165,10 +170,15 @@ function _claim_array_node(a::Ptr{CArrowArray})
         arr.release == C_NULL && return nothing
         p = arr.private_data
         p == C_NULL && return nothing
+        key = unsafe_load(Ptr{Int64}(p + 8))
+        root = get(EXPORT_REGISTRY, key, nothing)
+        root === nothing && error("C Data export root disappeared during release")
+        topology = get(root.array_topology, p, nothing)
+        topology === nothing && error("C Data array topology disappeared during release")
         flag = unsafe_load(Ptr{UInt8}(p))
         flag == 0x00 || return nothing
         unsafe_store!(Ptr{UInt8}(p), 0x01)
-        (arr, p)
+        (p, topology)
     end
 end
 
@@ -179,10 +189,15 @@ function _claim_schema_node(s::Ptr{CArrowSchema})
         sch.release == C_NULL && return nothing
         p = sch.private_data
         p == C_NULL && return nothing
+        key = unsafe_load(Ptr{Int64}(p + 8))
+        root = get(EXPORT_REGISTRY, key, nothing)
+        root === nothing && error("C Data export root disappeared during release")
+        topology = get(root.schema_topology, p, nothing)
+        topology === nothing && error("C Data schema topology disappeared during release")
         flag = unsafe_load(Ptr{UInt8}(p))
         flag == 0x00 || return nothing
         unsafe_store!(Ptr{UInt8}(p), 0x01)
-        (sch, p)
+        (p, topology)
     end
 end
 
@@ -205,40 +220,38 @@ function _finish_node!(p, control::Ptr{Cvoid})
     return nothing
 end
 
-function _release_array_children!(arr::CArrowArray)
-    for i = 1:arr.n_children
-        child = unsafe_load(arr.children, i)
-        child == C_NULL && continue
+function _release_array_children!(topology)
+    children, dictionary = topology
+    for child in children
         release = lock(REGISTRY_LOCK) do
             unsafe_load(child).release
         end
         release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowArray},), child)
     end
-    if arr.dictionary != C_NULL
+    if dictionary != C_NULL
         release = lock(REGISTRY_LOCK) do
-            unsafe_load(arr.dictionary).release
+            unsafe_load(dictionary).release
         end
         release == C_NULL ||
-            ccall(release, Cvoid, (Ptr{CArrowArray},), arr.dictionary)
+            ccall(release, Cvoid, (Ptr{CArrowArray},), dictionary)
     end
     return nothing
 end
 
-function _release_schema_children!(sch::CArrowSchema)
-    for i = 1:sch.n_children
-        child = unsafe_load(sch.children, i)
-        child == C_NULL && continue
+function _release_schema_children!(topology)
+    children, dictionary = topology
+    for child in children
         release = lock(REGISTRY_LOCK) do
             unsafe_load(child).release
         end
         release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowSchema},), child)
     end
-    if sch.dictionary != C_NULL
+    if dictionary != C_NULL
         release = lock(REGISTRY_LOCK) do
-            unsafe_load(sch.dictionary).release
+            unsafe_load(dictionary).release
         end
         release == C_NULL ||
-            ccall(release, Cvoid, (Ptr{CArrowSchema},), sch.dictionary)
+            ccall(release, Cvoid, (Ptr{CArrowSchema},), dictionary)
     end
     return nothing
 end
@@ -246,8 +259,8 @@ end
 function _release_array(a::Ptr{CArrowArray})
     claimed = _claim_array_node(a)
     claimed === nothing && return nothing
-    arr, control = claimed
-    _release_array_children!(arr)
+    control, topology = claimed
+    _release_array_children!(topology)
     _finish_node!(a, control)
     return nothing
 end
@@ -255,8 +268,8 @@ end
 function _release_schema(s::Ptr{CArrowSchema})
     claimed = _claim_schema_node(s)
     claimed === nothing && return nothing
-    sch, control = claimed
-    _release_schema_children!(sch)
+    control, topology = claimed
+    _release_schema_children!(topology)
     _finish_node!(s, control)
     return nothing
 end
@@ -324,12 +337,15 @@ function _export_schema!(root::ExportedRoot, f::Field,
     p = Ptr{CArrowSchema}(_malloc!(root, sizeof(CArrowSchema)))
     childfields = f.type isa DictionaryType ? Field[] : f.children
     nchildren = length(childfields)
+    canonical_children = Ptr{CArrowSchema}[]
     childptrs = Ptr{Ptr{CArrowSchema}}(C_NULL)
     if nchildren > 0
         childptrs = Ptr{Ptr{CArrowSchema}}(_malloc!(root,
             AC.checked_mul(Int64(nchildren), Int64(sizeof(Ptr)))))
         for (i, cf) in enumerate(childfields)
-            unsafe_store!(childptrs, _export_schema!(root, cf, release), i)
+            child = _export_schema!(root, cf, release)
+            push!(canonical_children, child)
+            unsafe_store!(childptrs, child, i)
         end
     end
     dict = Ptr{CArrowSchema}(C_NULL)
@@ -348,6 +364,7 @@ function _export_schema!(root::ExportedRoot, f::Field,
         Ptr{UInt8}(C_NULL),
         flags, nchildren, childptrs, dict,
         release, control))
+    root.schema_topology[control] = (canonical_children, dict)
     return p
 end
 
@@ -363,12 +380,15 @@ function _export_array!(root::ExportedRoot, d::ArrayData,
                                Ptr{Cvoid}(AC.sliceptr(b)), i)
     end
     nchildren = length(d.children)
+    canonical_children = Ptr{CArrowArray}[]
     childptrs = Ptr{Ptr{CArrowArray}}(C_NULL)
     if nchildren > 0
         childptrs = Ptr{Ptr{CArrowArray}}(_malloc!(root,
             AC.checked_mul(Int64(nchildren), Int64(sizeof(Ptr)))))
         for (i, c) in enumerate(d.children)
-            unsafe_store!(childptrs, _export_array!(root, c, release), i)
+            child = _export_array!(root, c, release)
+            push!(canonical_children, child)
+            unsafe_store!(childptrs, child, i)
         end
     end
     dict = d.dictionary === nothing ? Ptr{CArrowArray}(C_NULL) :
@@ -377,6 +397,7 @@ function _export_array!(root::ExportedRoot, d::ArrayData,
     unsafe_store!(p, CArrowArray(d.len, nullcount(d), d.offset, nbuf,
         nchildren, bufptrs, childptrs, dict,
         release, control))
+    root.array_topology[control] = (canonical_children, dict)
     return p
 end
 
@@ -445,6 +466,8 @@ function _pin_regions(d::ArrayData)
 end
 
 function _free_export!(root::ExportedRoot)
+    empty!(root.schema_topology)
+    empty!(root.array_topology)
     for m in root.mallocs
         Libc.free(m)
     end
@@ -479,7 +502,9 @@ function _newroot(build, roots::Vector{Any}; pins::Vector{OwnerRegion}=OwnerRegi
         end
         rethrow()
     end
-    root = ExportedRoot(roots, Ptr{Cvoid}[], pins, key, 0)
+    root = ExportedRoot(roots, Ptr{Cvoid}[], pins, key, 0,
+        Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}(),
+        Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}())
     try
         # The pointer cannot escape before `build` returns. Keep the root
         # private until then: publishing it with `remaining == 0` would let a
@@ -782,6 +807,58 @@ function _call_release(p::Ptr{CArrowArray})
         unsafe_load(p).release
     end
     release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowArray},), p)
+    return nothing
+end
+
+function _expect_invalid_list_topology!(mutate)
+    f, d = fromjulia("bad-list", [Int64[1]])
+    source_region = d.buffers[2].region
+    before = _registry_count()
+    sp, ap = to_c_data(f, d)
+    @assert !forceclose!(source_region; timeout_ms=0)
+    mutate(sp, ap)
+    @assert try
+        from_c_data(sp, ap)
+        false
+    catch e
+        e isa ValidationError
+    end
+    @assert unsafe_load(sp).release == C_NULL
+    @assert unsafe_load(ap).release == C_NULL
+    @assert reap!() == 2
+    @assert _registry_count() == before
+    @assert forceclose!(source_region; timeout_ms=0)
+    return nothing
+end
+
+function _expect_invalid_dictionary_topology!(mutate)
+    vf, vd = fromjulia("values", ["x"])
+    t = DictionaryType(IntType(32, true), vf.type, false)
+    f = Field("bad-dictionary", t; nullable=false, children=vf.children)
+    d = ArrayData(t, 1, [BufferSlice(), AC._databuffer(Int32[0])];
+        dictionary=vd, nullcount=0)
+    source_region = vd.buffers[3].region
+    before = _registry_count()
+    sp, ap = to_c_data(f, d)
+    @assert !forceclose!(source_region; timeout_ms=0)
+    mutate(sp, ap)
+    @assert try
+        from_c_data(sp, ap)
+        false
+    catch e
+        e isa ValidationError
+    end
+    @assert unsafe_load(sp).release == C_NULL
+    @assert unsafe_load(ap).release == C_NULL
+    @assert reap!() == 2
+    @assert _registry_count() == before
+    @assert forceclose!(source_region; timeout_ms=0)
+    return nothing
+end
+
+@noinline function _import_and_forget(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray})
+    f, d = from_c_data(sp, ap)
+    @assert materialize(f, d) == [1]
     return nothing
 end
 
@@ -1136,6 +1213,26 @@ function main()
     @assert reap!() == 1
     println("empty imports retain their shared foreign owner ✓")
 
+    # Natural collection of the shared lifecycle gate is also an exactly-once
+    # release path. The array producer and its source pin must not depend on a
+    # caller remembering the deterministic release! convenience.
+    ff, fd = fromjulia("finalized", Int64[1])
+    finalized_source_region = fd.buffers[2].region
+    sp, ap = to_c_data(ff, fd)
+    @assert !forceclose!(finalized_source_region; timeout_ms=0)
+    _import_and_forget(sp, ap)
+    finalized_reaped = reap!()
+    for _ = 1:10
+        finalized_reaped == 2 && break
+        GC.gc(true)
+        yield()
+        finalized_reaped += reap!()
+    end
+    @assert finalized_reaped == 2
+    @assert _registry_count() == 0
+    @assert forceclose!(finalized_source_region; timeout_ms=0)
+    println("natural foreign-owner finalization releases the producer ✓")
+
     # Verifiable C structural failures are clean errors and still release
     # both moved lifetimes exactly once.
     bf, bd = fromjulia("bad", Int64[1])
@@ -1150,6 +1247,31 @@ function main()
     @assert reap!() == 2
     @assert _registry_count() == 0
     println("invalid C pointer tables fail with exact cleanup ✓")
+
+    # A failed import invokes producer callbacks after it has copied the
+    # caller-visible structs. Cleanup must therefore use the topology that the
+    # producer recorded at export time. Otherwise a NULL child table crashes
+    # the callback, while a forged zero child count strands descendants and
+    # source pins. Cover both schema and array roots.
+    _expect_invalid_list_topology!() do _sp, ap
+        _store_field!(ap, :children, Ptr{Ptr{CArrowArray}}(C_NULL))
+    end
+    _expect_invalid_list_topology!() do sp, _ap
+        _store_field!(sp, :children, Ptr{Ptr{CArrowSchema}}(C_NULL))
+    end
+    _expect_invalid_list_topology!() do _sp, ap
+        _store_field!(ap, :n_children, Int64(0))
+    end
+    _expect_invalid_list_topology!() do sp, _ap
+        _store_field!(sp, :n_children, Int64(0))
+    end
+    _expect_invalid_dictionary_topology!() do _sp, ap
+        _store_field!(ap, :dictionary, Ptr{CArrowArray}(C_NULL))
+    end
+    _expect_invalid_dictionary_topology!() do sp, _ap
+        _store_field!(sp, :dictionary, Ptr{CArrowSchema}(C_NULL))
+    end
+    println("malformed public topology cannot corrupt producer cleanup ✓")
 
     # Imported C names and Utf8 buffers receive the same full validation.
     # Both failures happen after the array move, so both producer lifetimes
