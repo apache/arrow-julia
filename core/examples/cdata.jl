@@ -1294,8 +1294,33 @@ function _set_stream_exception!(state::ExportedStreamState, e)
     return nothing
 end
 
-function _stream_get_schema(sp::Ptr{CArrowArrayStream},
-    out::Ptr{CArrowSchema})::Cint
+function _publish_stream_result!(build, roots::Vector{Any}, result_slot,
+    out, publish!)
+    key_slot = Ref{Int64}(0)
+    committed = false
+    try
+        _newroot(build, roots; result_slot=result_slot, key_slot=key_slot)
+        publish!(out, unsafe_load(result_slot[]))
+        committed = true
+    catch
+        # The result root became public inside Julia, but no usable C struct
+        # reached the consumer. Remove it immediately. Cleanup is best-effort
+        # here so it cannot replace the operation's original exception or
+        # cross the enclosing C callback boundary.
+        if !committed && key_slot[] != 0
+            try
+                _cleanup_registered_root!(key_slot[]; require_released=false)
+            catch
+            end
+            key_slot[] = 0
+        end
+        rethrow()
+    end
+    return nothing
+end
+
+function _stream_get_schema_impl(sp::Ptr{CArrowArrayStream},
+    out::Ptr{CArrowSchema}, publish!)::Cint
     state = nothing
     try
         sp == C_NULL && return EINVAL
@@ -1304,13 +1329,10 @@ function _stream_get_schema(sp::Ptr{CArrowArrayStream},
         out == C_NULL && throw(ArgumentError("ArrowSchema output pointer is NULL"))
         srel = @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
         shell = Ref{Ptr{CArrowSchema}}(C_NULL)
-        _newroot(Any[state.batchfield]; result_slot=shell) do root
+        _publish_stream_result!(Any[state.batchfield], shell, out,
+            publish!) do root
             _export_schema!(root, state.batchfield, srel)
         end
-        # The consumer owns the copy in `out`; release finds our control
-        # through private_data, so the copied struct is the live node and the
-        # shell malloc simply waits for the reap.
-        unsafe_store!(out, unsafe_load(shell[]))
         return Cint(0)
     catch e
         state isa ExportedStreamState && _set_stream_exception!(state, e)
@@ -1318,8 +1340,12 @@ function _stream_get_schema(sp::Ptr{CArrowArrayStream},
     end
 end
 
-function _stream_get_next(sp::Ptr{CArrowArrayStream},
-    out::Ptr{CArrowArray})::Cint
+_stream_get_schema(sp::Ptr{CArrowArrayStream},
+    out::Ptr{CArrowSchema})::Cint =
+    _stream_get_schema_impl(sp, out, unsafe_store!)
+
+function _stream_get_next_impl(sp::Ptr{CArrowArrayStream},
+    out::Ptr{CArrowArray}, publish!)::Cint
     state = nothing
     try
         sp == C_NULL && return EINVAL
@@ -1328,7 +1354,7 @@ function _stream_get_next(sp::Ptr{CArrowArrayStream},
         out == C_NULL && throw(ArgumentError("ArrowArray output pointer is NULL"))
         if state.nextindex > length(state.batches)
             # End of stream: a released (NULL-release) struct, per spec.
-            unsafe_store!(out, CArrowArray(0, 0, 0, 0, 0,
+            publish!(out, CArrowArray(0, 0, 0, 0, 0,
                 Ptr{Ptr{Cvoid}}(C_NULL), Ptr{Ptr{CArrowArray}}(C_NULL),
                 Ptr{CArrowArray}(C_NULL), Ptr{Cvoid}(C_NULL),
                 Ptr{Cvoid}(C_NULL)))
@@ -1342,10 +1368,9 @@ function _stream_get_next(sp::Ptr{CArrowArrayStream},
         validate_full(state.batchfield, d)
         arel = @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},))
         shell = Ref{Ptr{CArrowArray}}(C_NULL)
-        _newroot(Any[d]; result_slot=shell) do root
+        _publish_stream_result!(Any[d], shell, out, publish!) do root
             _export_array!(root, d, arel)
         end
-        unsafe_store!(out, unsafe_load(shell[]))
         state.nextindex += 1
         return Cint(0)
     catch e
@@ -1353,6 +1378,10 @@ function _stream_get_next(sp::Ptr{CArrowArrayStream},
         return EINVAL
     end
 end
+
+_stream_get_next(sp::Ptr{CArrowArrayStream},
+    out::Ptr{CArrowArray})::Cint =
+    _stream_get_next_impl(sp, out, unsafe_store!)
 
 function _stream_get_last_error(sp::Ptr{CArrowArrayStream})::Ptr{UInt8}
     try
@@ -2801,6 +2830,52 @@ function main()
     @assert stream_deallocations[] == 1
     @assert _stream_registry_count() == stbefore
     println("failed stream export handoffs return control and registry roots ✓")
+
+    # A result root is registered before its C struct is copied into the
+    # caller-owned output slot. If that final copy fails, the consumer owns
+    # nothing: discard the unpublished root immediately. A failed get_next
+    # must also leave the batch available for a later retry.
+    resulttxnref = Ref{CArrowArrayStream}()
+    schemaout = Ref(CArrowSchema(Ptr{UInt8}(C_NULL), Ptr{UInt8}(C_NULL),
+        Ptr{UInt8}(C_NULL), 0, 0, Ptr{Ptr{CArrowSchema}}(C_NULL),
+        Ptr{CArrowSchema}(C_NULL), Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL)))
+    arrayout = Ref(CArrowArray(0, 0, 0, 0, 0,
+        Ptr{Ptr{Cvoid}}(C_NULL), Ptr{Ptr{CArrowArray}}(C_NULL),
+        Ptr{CArrowArray}(C_NULL), Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL)))
+    fail_result_publish! = (_out, _result) ->
+        error("injected stream result publication failure")
+    GC.@preserve resulttxnref schemaout arrayout begin
+        resulttxnp = Base.unsafe_convert(Ptr{CArrowArrayStream}, resulttxnref)
+        schemaoutp = Base.unsafe_convert(Ptr{CArrowSchema}, schemaout)
+        arrayoutp = Base.unsafe_convert(Ptr{CArrowArray}, arrayout)
+        export_stream!(resulttxnp, b1.schema, AC.RecordBatch[b1])
+        resultstate, _ = _stream_state(resulttxnp)
+        resultroots = _registry_count()
+
+        @assert _stream_get_schema_impl(resulttxnp, schemaoutp,
+            fail_result_publish!) == EINVAL
+        @assert _registry_count() == resultroots
+
+        @assert resultstate.nextindex == 1
+        @assert _stream_get_next_impl(resulttxnp, arrayoutp,
+            fail_result_publish!) == EINVAL
+        @assert _registry_count() == resultroots
+        @assert resultstate.nextindex == 1
+
+        @assert _stream_get_next_impl(resulttxnp, arrayoutp,
+            unsafe_store!) == 0
+        @assert arrayout[].release != C_NULL
+        @assert arrayout[].length == b1.nrows
+        @assert resultstate.nextindex == 2
+        @assert _registry_count() == resultroots + 1
+        _release_c_array!(arrayoutp, arrayout[])
+        callbacks = resulttxnref[]
+        ccall(callbacks.release, Cvoid, (Ptr{CArrowArrayStream},), resulttxnp)
+    end
+    @assert reap!() == 1
+    @assert _registry_count() == sbefore
+    @assert _stream_registry_count() == stbefore
+    println("failed stream result publication cleans roots and permits retry ✓")
 
     # Every exported callback closes its C exception boundary. Error-message
     # allocation failure clears the previous message instead of reporting it
