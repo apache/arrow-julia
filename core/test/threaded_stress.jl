@@ -43,6 +43,38 @@ isopen_gate(g::Gate) = @atomic g.open
         end
     end
 
+    @testset "one concurrent MapClaim owner releases" begin
+        for _ = 1:100
+            claim = AC.MapClaim()
+            calls = AC.ReleaseCounter()
+            ready = AC.ReleaseCounter()
+            go = Gate()
+            unmapper = function (_p, _len)
+                AC.increment!(calls)
+                # Keep RELEASING visible while contenders execute their CAS
+                # loops on other worker threads.
+                for _ = 1:8
+                    yield()
+                end
+                nothing
+            end
+            tasks = [Threads.@spawn begin
+                AC.increment!(ready)
+                while !isopen_gate(go)
+                    yield()
+                end
+                AC._release_mapping_once!(claim, Ptr{Cvoid}(1), 1, unmapper)
+            end for _ = 1:16]
+            while ready[] != length(tasks)
+                yield()
+            end
+            open!(go)
+            @test all(x -> x === nothing, fetch.(tasks))
+            @test calls[] == 1
+            @test (@atomic claim.s) == 0x02
+        end
+    end
+
     @testset "guard and release handshake" begin
         for _ = 1:100
             bytes = UInt8[0x5a]
