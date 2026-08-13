@@ -26,6 +26,12 @@ struct ManagedLoad
     value::Any
 end
 
+function _nonconforming_c_release(::Ptr{Cvoid})::Cvoid
+    return nothing
+end
+const NONCONFORMING_C_RELEASE =
+    @cfunction(_nonconforming_c_release, Cvoid, (Ptr{Cvoid},))
+
 
 @testset "ArrowCore" begin
 
@@ -102,6 +108,61 @@ end
         AC._release_mapping_once!(claim, Ptr{Cvoid}(1), 1, flaky)
         @test attempts[] == 2
 
+        # Two possible owners may arrive while the first release is in
+        # progress. Only one unmapper runs; the waiter observes RELEASED.
+        raceclaim = AC.MapClaim()
+        racecalls = ReleaseCounter()
+        entered = Base.Event()
+        finish = Base.Event()
+        blocking = function (_p, _len)
+            increment!(racecalls)
+            notify(entered)
+            wait(finish)
+            nothing
+        end
+        first = Threads.@spawn AC._release_mapping_once!(
+            raceclaim, Ptr{Cvoid}(1), 1, blocking)
+        wait(entered)
+        second = Threads.@spawn AC._release_mapping_once!(
+            raceclaim, Ptr{Cvoid}(1), 1, blocking)
+        yield()
+        @test !istaskdone(second)
+        notify(finish)
+        @test fetch(first) === nothing
+        @test fetch(second) === nothing
+        @test racecalls[] == 1
+        @test (@atomic raceclaim.s) == 0x02
+
+        # If the winner fails, it restores LIVE. A waiting owner can then
+        # claim the mapping and publish RELEASED.
+        retryclaim = AC.MapClaim()
+        retrycalls = ReleaseCounter()
+        retryentered = Base.Event()
+        retryfinish = Base.Event()
+        retrying = function (_p, _len)
+            attempt = increment!(retrycalls)
+            if attempt == 1
+                notify(retryentered)
+                wait(retryfinish)
+                error("injected unmap failure")
+            end
+            nothing
+        end
+        failed = Threads.@spawn try
+            AC._release_mapping_once!(retryclaim, Ptr{Cvoid}(1), 1, retrying)
+            nothing
+        catch e
+            e
+        end
+        wait(retryentered)
+        recovered = Threads.@spawn AC._release_mapping_once!(
+            retryclaim, Ptr{Cvoid}(1), 1, retrying)
+        notify(retryfinish)
+        @test fetch(failed) isa ErrorException
+        @test fetch(recovered) === nothing
+        @test retrycalls[] == 2
+        @test (@atomic retryclaim.s) == 0x02
+
         # The armed release is concrete data: exactly one action execution,
         # observed via the note counter, and a finalizer after close is inert.
         closed_notes = ReleaseCounter()
@@ -155,6 +216,59 @@ end
         @test AC.phase(@atomic r.state) == AC.PHASE_CLOSED
         @test forceclose!(r)
         @test calls[] == 1
+
+        # Initial finalizer registration owns the rollback path. A plain
+        # registration error must synchronously release the new region.
+        registration_calls = ReleaseCounter()
+        unarmed = AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0, AC.Foreign)
+        unarmed.releasefn = NotifyRelease(registration_calls)
+        @test_throws ArgumentError AC._register_initial_region_finalizer!(
+            unarmed, Ptr{Cvoid}(C_NULL))
+        @test registration_calls[] == 1
+        @test unarmed.releasefn === nothing
+        @test AC.phase(@atomic unarmed.state) == AC.PHASE_CLOSED
+        @test forceclose!(unarmed)
+        @test registration_calls[] == 1
+
+        # C-call wrapper storage is deallocated even when the producer
+        # callback returns without setting release=NULL.
+        block = Libc.malloc(sizeof(Ptr{Cvoid}))
+        block == C_NULL && throw(OutOfMemoryError())
+        freed = Ptr{Cvoid}[]
+        try
+            unsafe_store!(Ptr{Ptr{Cvoid}}(block), NONCONFORMING_C_RELEASE)
+            action = CcallRelease(NONCONFORMING_C_RELEASE, block;
+                freearg=true, verify_null_at=0)
+            observer = p -> (push!(freed, p); nothing)
+            @test_throws ErrorException AC._run_ccall_release!(action, observer)
+            @test freed == Ptr{Cvoid}[block]
+        finally
+            Libc.free(block)
+        end
+
+        ccall_notes = ReleaseCounter()
+        ownedblock = Libc.malloc(sizeof(Ptr{Cvoid}))
+        ownedblock == C_NULL && throw(OutOfMemoryError())
+        unsafe_store!(Ptr{Ptr{Cvoid}}(ownedblock), NONCONFORMING_C_RELEASE)
+        badrelease = AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0, AC.Foreign;
+            releasefn=CcallRelease(NONCONFORMING_C_RELEASE, ownedblock;
+                freearg=true, note=ccall_notes, verify_null_at=0))
+        @test_throws ErrorException forceclose!(badrelease)
+        @test ccall_notes[] == 1
+        @test AC.phase(@atomic badrelease.state) == AC.PHASE_CLOSED
+        @test forceclose!(badrelease)
+        @test ccall_notes[] == 1
+
+        # The Ptr{Cvoid} finalizer boundary intentionally swallows a release
+        # error. Its state-machine finally still commits CLOSED exactly once.
+        finalizer_calls = ReleaseCounter()
+        finalized = AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0, AC.Foreign;
+            releasefn=NotifyRelease(finalizer_calls; fail=true))
+        @test finalize(finalized) === nothing
+        @test finalizer_calls[] == 1
+        @test AC.phase(@atomic finalized.state) == AC.PHASE_CLOSED
+        @test forceclose!(finalized)
+        @test finalizer_calls[] == 1
     end
 
 

@@ -296,7 +296,7 @@ mutable struct OwnerRegion
         # finalizer. A finalizer only runs when the region is unreachable, at
         # which point no guard can exist, so releasing directly is safe.
         if releasefn !== nothing
-            _register_region_finalizer!(r)
+            _register_initial_region_finalizer!(r)
         end
         return r
     end
@@ -310,6 +310,20 @@ function _run_release!(a::ReleaseAction, r::OwnerRegion)
     if a.kind == RELEASE_MUNMAP
         _release_mapping_once!(a.mapstate::MapClaim, r.ptr, r.len, _munmap!)
     elseif a.kind == RELEASE_CCALL
+        _run_ccall_release!(a, _libc_free!)
+    elseif a.kind == RELEASE_RENDEZVOUS
+        notify(a.entered::Base.Event)
+        wait(a.finish::Base.Event)
+    elseif a.fail
+        error("release failed")
+    end
+    return nothing
+end
+
+@inline _libc_free!(p::Ptr{Cvoid}) = (Libc.free(p); nothing)
+
+function _run_ccall_release!(a::ReleaseAction, deallocate!::F) where {F}
+    try
         if a.cb != C_NULL
             ccall(a.cb, Cvoid, (Ptr{Cvoid},), a.arg)
             if a.verify_null_at >= 0
@@ -317,12 +331,10 @@ function _run_release!(a::ReleaseAction, r::OwnerRegion)
                     error("C release callback did not mark the structure released")
             end
         end
-        a.freearg && a.arg != C_NULL && Libc.free(a.arg)
-    elseif a.kind == RELEASE_RENDEZVOUS
-        notify(a.entered::Base.Event)
-        wait(a.finish::Base.Event)
-    elseif a.fail
-        error("release failed")
+    finally
+        # `arg` is an adapter-owned C-struct copy. Its allocation is ours
+        # even when the producer callback fails its release=NULL contract.
+        a.freearg && a.arg != C_NULL && deallocate!(a.arg)
     end
     return nothing
 end
@@ -343,8 +355,10 @@ end
 # registered callable unresolvable for JuliaC trim verification, while the
 # pointer form is an ordinary typed ccall. The C entry re-enters Julia via
 # a compiled @cfunction and must never unwind into the GC's finalizer
-# runner, so it swallows release errors (matching Base's own behavior of
-# logging-not-propagating finalizer errors).
+# runner. This prove-out intentionally drops release errors at that boundary.
+# `forceclose!` has already cleared the action and published CLOSED in its
+# `finally`, and C-call wrapper storage is freed in `_run_ccall_release!`'s
+# own `finally`, so the swallowed error cannot leave an owned resource armed.
 function _finalize_region_c(p::Ptr{Cvoid})::Cvoid
     r = unsafe_pointer_to_objref(p)::OwnerRegion
     try
@@ -356,6 +370,25 @@ end
 
 @inline function _register_region_finalizer!(r::OwnerRegion)
     finalizer(@cfunction(_finalize_region_c, Cvoid, (Ptr{Cvoid},)), r)
+    return nothing
+end
+
+
+@inline _register_initial_region_finalizer!(r::OwnerRegion) =
+    _register_initial_region_finalizer!(r,
+        @cfunction(_finalize_region_c, Cvoid, (Ptr{Cvoid},)))
+
+function _register_initial_region_finalizer!(r::OwnerRegion, fp::Ptr{Cvoid})
+    try
+        fp == C_NULL && throw(ArgumentError("NULL region finalizer"))
+        finalizer(fp, r)
+    catch
+        # Ownership has transferred into a new, unescaped region. Restore the
+        # ordinary exception guarantee if Base rejects finalizer registration.
+        forceclose!(r; timeout_ms=0) ||
+            error("unescaped region was unexpectedly busy during cleanup")
+        rethrow()
+    end
     return nothing
 end
 
@@ -523,7 +556,9 @@ function _release_mapping_once!(claim::MapClaim, p::Ptr,
     # The constructor's failure path and an armed OwnerRegion release can
     # race to return the same mapping. Serialize attempts with a LIVE(0) ->
     # RELEASING(1) -> RELEASED(2) claim. An unmapper failure restores LIVE
-    # and rethrows; a completed munmap publishes RELEASED.
+    # and rethrows; a completed munmap publishes RELEASED. There is no ABA:
+    # only the active owner writes RELEASING -> LIVE after its own failed
+    # call, every contender rereads before CAS, and RELEASED is terminal.
     while true
         current = @atomic claim.s
         current == 0x02 && return nothing
