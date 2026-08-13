@@ -789,14 +789,12 @@ function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray},
     (sch.release == C_NULL || arr.release == C_NULL) &&
         throw(ArgumentError("cannot import a released structure"))
     owner = ForeignOwner(arr)
-    moved = false
     try
         # MOVE: relinquish source ownership before arming the copied owner's
-        # finalizer. Keep the store and local handoff flag non-interruptible so
-        # cleanup always knows which side owns the producer callback.
+        # finalizer. The source release field is the authoritative ownership
+        # marker if a task-delivered exception lands at this exact store.
         Base.disable_sigint() do
             _store_field!(ap, :release, Ptr{Cvoid}(C_NULL))
-            moved = true
             after_move()
             _arm_foreign_owner!(owner)
         end
@@ -812,7 +810,7 @@ function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray},
         # Before the move, the caller's source remains the owner. After the
         # move, this local copy must release exactly once even when finalizer
         # registration or later validation failed.
-        moved && _release_moved_owner!(owner)
+        unsafe_load(ap).release == C_NULL && _release_moved_owner!(owner)
         rethrow()
     finally
         # The schema struct's lifetime is separate from the array's and it
