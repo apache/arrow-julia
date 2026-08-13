@@ -50,6 +50,16 @@ end
     return AC.loadat(slice, GcTriggeredLoad, Int64(0)), finalized[]
 end
 
+@noinline function read_mapped_slice_while_collecting(path)
+    # Keep only the slice local. Its region must be enough to retain the Mmap
+    # array through collection and the raw loads below.
+    b = BufferSlice(mmapregion(path), 0, 8)
+    rooted = b.region.root isa Vector{UInt8}
+    GC.gc(true)
+    return rooted, AC.loadat(b, UInt8, Int64(0)),
+        AC.loadat(b, UInt32, Int64(4)), AC.loadat(b, UInt8, Int64(7))
+end
+
 @testset "ArrowCore" begin
 
 @testset "OwnerRegion: reachability-based validity" begin
@@ -86,20 +96,21 @@ end
     @testset "mapped region: stdlib-backed, reachability-valid" begin
         path = tempname()
         write(path, UInt8[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
-        r = mmapregion(path)
-        @test r.root isa Vector{UInt8}
-        b = BufferSlice(r, 0, 8)
-        @test AC.loadat(b, UInt8, Int64(0)) == 0x11
-        @test AC.loadat(b, UInt32, Int64(4)) == 0x88776655
-        # The mapping stays valid for as long as any slice can reach it —
-        # even under GC pressure with no other references.
-        GC.gc()
-        @test AC.loadat(b, UInt8, Int64(7)) == 0x88
+        rooted, firstbyte, lastword, lastbyte =
+            read_mapped_slice_while_collecting(path)
+        @test rooted
+        @test firstbyte == 0x11
+        @test lastword == 0x88776655
+        @test lastbyte == 0x88
         emptypath = tempname()
         touch(emptypath)
         @test_throws ArgumentError mmapregion(emptypath)
         rm(emptypath)
         @test_throws SystemError mmapregion(tempname())
+        # The helper returned no region or slice. Collect the stdlib mapping
+        # before deleting the path on platforms that lock active mappings.
+        GC.gc(true)
+        GC.gc(true)
         rm(path)
     end
 end
