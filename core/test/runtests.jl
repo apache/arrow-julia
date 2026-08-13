@@ -1005,6 +1005,10 @@ end
     badendian = reinterpret(AC.Endianness, UInt8(0xff))
     @test_throws ValidationError RecordBatch(
         Schema(Field[]; endianness=badendian), ArrayData[], 0)
+    nonnative = AC._native_endianness() == AC.LittleEndian ?
+        AC.BigEndian : AC.LittleEndian
+    @test_throws ValidationError RecordBatch(
+        Schema(Field[]; endianness=nonnative), ArrayData[], 0)
 end
 
 end # ArrowCore testset

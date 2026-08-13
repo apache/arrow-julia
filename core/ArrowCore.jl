@@ -519,6 +519,7 @@ Base.IndexStyle(::Type{<:FrozenVector}) = IndexLinear()
 @enum IntervalUnit::UInt8 YEAR_MONTH DAY_TIME MONTH_DAY_NANO
 @enum UnionMode::UInt8 SparseMode DenseMode
 @enum Endianness::UInt8 LittleEndian BigEndian
+_native_endianness() = Base.ENDIAN_BOM == 0x04030201 ? LittleEndian : BigEndian
 
 struct NullType <: ArrowType end
 struct BoolType <: ArrowType end
@@ -630,7 +631,7 @@ struct Schema
     metadata::Union{Nothing,FrozenVector{Pair{String,String}}}
     endianness::Endianness
 end
-Schema(fields; metadata=nothing, endianness=LittleEndian) =
+Schema(fields; metadata=nothing, endianness=_native_endianness()) =
     Schema(FrozenVector{Field}(fields), _freezemetadata(metadata), endianness)
 
 # ---------------------------------------------------------------------------
@@ -903,6 +904,9 @@ end
 function _validate_schema(s::Schema)
     s.endianness in (LittleEndian, BigEndian) ||
         throw(ValidationError("invalid Arrow schema endianness $(repr(s.endianness))"))
+    s.endianness == _native_endianness() ||
+        throw(ValidationError(
+            "non-native Arrow schema endianness must be normalized before Core access"))
     _validate_metadata(s.metadata, "schema")
     return s
 end
@@ -1084,14 +1088,17 @@ function _validate_temporal_values(t::DateType, d::ArrayData)
 end
 
 function _decimal_fits_precision(t::DecimalType, data::BufferSlice, byteoff::Int64)
-    # Arrow decimal storage is a little-endian two's-complement integer. A
-    # value fits precision p exactly when its magnitude is less than 10^p.
-    # Work in UInt256-style four-limb arithmetic so Core stays Base-only and
-    # Decimal256 does not require BigInt allocations or BitIntegers.
+    # Core accepts only native-endian array buffers. Arrow decimal storage is
+    # a two's-complement integer, so put native chunks into least-significant
+    # limb order before comparing its magnitude with 10^p. Work in fixed
+    # UInt256-style arithmetic so Core stays Base-only and Decimal256 does not
+    # require BigInt allocations or BitIntegers.
     nlimbs = cld(t.bits, 64)
     limbs = ntuple(limb -> begin
         if limb <= nlimbs
-            base = checked_add(byteoff, Int64(8 * (limb - 1)))
+            source_limb = _native_endianness() == LittleEndian ?
+                limb : nlimbs - limb + 1
+            base = checked_add(byteoff, Int64(8 * (source_limb - 1)))
             if t.bits == 32
                 UInt64(loadat(data, UInt32, base))
             else
