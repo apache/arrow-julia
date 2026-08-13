@@ -45,6 +45,7 @@ listed under Honest status.
 julia --startup-file=no core/test/runtests.jl
 julia --project=. --startup-file=no core/examples/ipc_read.jl   # needs the repo project (uses 2.x to write test bytes)
 julia --startup-file=no core/examples/cdata.jl
+julia --startup-file=no core/test/trim_compile_tests.jl         # JuliaC --trim=safe gate (installs JuliaC on first run)
 ```
 
 ## What each report claim looks like in code
@@ -201,3 +202,70 @@ POSIX-only. External writes or truncation of a mapped file while the mapping
 or cached validation results remain in use are unsupported.
 The ABI layout checks include 32-bit expectations, but this review executed
 them only on the available 64-bit host.
+
+## Trim-compile support (JuliaC `--trim=safe`)
+
+`core/test/trim_compile_tests.jl` compiles `core/test/trim_entrypoint.jl`
+with JuliaC's `--trim=safe` and holds the same bar as the JSON/HTTP/Reseau/
+StructUtils harnesses: **zero verifier errors, zero verifier warnings, and
+the produced binary runs to exit 0** (binary ≈ 2.2 MB). The design rules
+that get a runtime-tagged core there — worth carrying into the real
+implementation:
+
+- **Closed-set dispatch ladders.** Dispatch on an abstract-typed field is
+  dynamic; the descriptor set is closed (it IS the layout registry), so
+  `@inline` `isa` ladders (`layoutspec_of`, `_value_of`, `_materialize_of`,
+  `typeequal`, `descriptorname`, `_validate_descriptor_of`) devirtualize
+  every generic entry point. Multiple dispatch remains the per-layout
+  extension surface underneath.
+- **Concrete release actions, not callbacks** (`ReleaseAction`): release
+  behavior is data; nothing in the lifecycle machine calls an `Any`.
+- **Literal load widths.** `loadat(b, T, off)` with a runtime `T::DataType`
+  builds an unresolvable guarded closure; accessors branch to literal widths
+  instead (also faster).
+- **CAS instead of atomic RMW.** JuliaC's verifier has not implemented
+  `Core.modifyfield!` (each `@atomic x.f += 1` is a verifier warning), while
+  `@atomicreplace` verifies clean — counters and guards use CAS loops.
+- **`Ptr{Cvoid}` finalizers.** Base's generic `finalizer(f, o)` is
+  `@nospecialize`d and unresolvable; the typed pointer form
+  (`finalizer(@cfunction(...), o)`) is an ordinary ccall. The C entry
+  swallows errors so nothing unwinds into the GC's finalizer runner.
+- **Concrete containers at the boundary.** Struct scalars are
+  `Vector{Pair{String,Any}}` (a NamedTuple carries names in the TYPE domain
+  — intrinsically dynamic from runtime schemas, and unable to represent
+  Arrow's duplicate/empty names); lists materialize as `Vector{Any}` without
+  the runtime-narrowing comprehension. Typed element containers and the
+  NamedTuple surface are the facade's ViewPlan work (report §14.2).
+- **Beware splatting Base conveniences.** `write(filename, x)` and
+  `open(...) do` route through vararg-splatting internals; `mktempdir`'s
+  cleanup registry parks the trimmed runtime's scheduler. The workload uses
+  the primitive forms.
+- Heterogeneous NamedTuple ingestion (`batch(nt)`, `fromjulia_struct`) is
+  runtime-schema builder work and stays outside the trim-safe surface.
+
+## Interruption contract
+
+Asynchronous interruption (SIGINT / `InterruptException`, task cancellation)
+is explicitly **out of contract**, matching ecosystem practice — Base itself
+does not make arbitrary code async-exception-atomic, and the earlier
+`disable_sigint`/retry scaffolding bought a property that cannot be fully
+delivered. Ordinary exception safety (error paths clean up; release is
+exactly-once, even when the release action itself throws) **is** in
+contract and tested. A formal revisit is planned when Julia 1.14's
+structured cancellation gives Base a real system to build on. Relatedly,
+`Threads.Atomic` boxes appear nowhere in `core/` — atomic state lives in
+`@atomic` struct fields (`ReleaseCounter`, `MapClaim`, region state/guards).
+
+## Compression
+
+The IPC example implements spec buffer compression for **LZ4_FRAME and
+ZSTD**: per-reader codec contexts (created lazily, closed on every
+`readstream` exit path — no global pools), the per-buffer Int64
+uncompressed-length prefix with the `-1` stored-raw sentinel, declared sizes
+bounded **before** any allocation and charged to a decode-side budget, exact
+declared/actual size matching, and each decompressed buffer in its own
+exact-sized owned region. Acceptance covers 2.x-written streams for both
+codecs (compressed dictionary batches included) plus adversarial
+hostile/understated prefixes located via the framer itself. In the
+production package the codecs are package extensions; the example's
+closed two-codec switch is the trim-friendly shape of the same idea.

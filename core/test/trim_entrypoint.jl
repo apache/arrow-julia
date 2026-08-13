@@ -56,7 +56,12 @@ end
 
 function exercise_mmap(dir::String)::Nothing
     path = joinpath(dir, "trim.bin")
-    write(path, UInt8[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
+    # Explicit open/write/close: Base's `write(filename, x)` convenience
+    # routes through the vararg-splatting do-block `open`, which trim cannot
+    # resolve.
+    io = open(path, "w")
+    write(io, UInt8[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88])
+    close(io)
     r = mmapregion(path)
     b = BufferSlice(r, 0, 8)
     checked(AC.loadat(b, UInt32, Int64(4)) == 0x88776655, "mmap load failed")
@@ -72,33 +77,41 @@ function exercise_mmap(dir::String)::Nothing
 end
 
 function exercise_values()::Nothing
-    b = batch((
-        xs=Int64[1, 2, 3],
-        ys=[1.5, missing, 3.5],
-        flags=[true, missing, false],
-        strs=["a", "", missing],
-        lists=[[1, 2], missing, Int64[]],
-    ))
-    checked(b.nrows == 3, "batch row count wrong")
-    for (f, col) in zip(b.schema.fields, b.columns)
+    # Columns are adapted one concrete vector at a time: heterogeneous
+    # NamedTuple iteration (the `batch(nt)` convenience) is runtime-schema
+    # work that belongs to the facade's builders, not a trim-safe core path.
+    f1, c1 = fromjulia("xs", Int64[1, 2, 3])
+    f2, c2 = fromjulia("ys", [1.5, missing, 3.5])
+    f3, c3 = fromjulia("flags", [true, missing, false])
+    f4, c4 = fromjulia("strs", ["a", "", missing])
+    # A concrete Vector{Vector{Int64}} column; missing-list coverage lives
+    # in the plain test suite (a Union-eltype column makes this call's
+    # argument type imprecise for trim verification).
+    f5, c5 = fromjulia("lists", [Int64[1, 2], Int64[3], Int64[]])
+    for (f, col) in ((f1, c1), (f2, c2), (f3, c3), (f4, c4), (f5, c5))
         validate_structural(f, col)
         validate_semantic(f, col)
     end
-    f1, c1 = b.schema.fields[1], b.columns[1]
     checked(getvalue(f1, c1, 2) === Int64(2), "int getvalue failed")
-    checked(nullcount(b.columns[2]) == 1, "nullcount failed")
+    checked(nullcount(c2) == 1, "nullcount failed")
     m1 = materialize(f1, c1)
     checked(length(m1) == 3, "materialize length wrong")
-    f4, c4 = b.schema.fields[4], b.columns[4]
     checked(getvalue(f4, c4, 1) == "a", "string getvalue failed")
     checked(getvalue(f4, c4, 3) === missing, "missing string wrong")
-    f5, c5 = b.schema.fields[5], b.columns[5]
     v5 = getvalue(f5, c5, 1)
-    checked(v5 !== missing && length(v5) == 2, "list getvalue failed")
-    sf, sd = AC.fromjulia_struct("st", (a=Int64[7, 8], b=["x", "y"]))
+    checked(v5 isa Vector{Any} && length(v5) == 2, "list getvalue failed")
+    checked(getvalue(f5, c5, 3) isa Vector{Any}, "empty list getvalue failed")
+    # Hand-built struct column: `fromjulia_struct` iterates a heterogeneous
+    # NamedTuple (runtime-schema builder work, facade territory).
+    saf, sad = fromjulia("a", Int64[7, 8])
+    sbf, sbd = fromjulia("b", ["x", "y"])
+    sf = Field("st", StructType(); nullable=false, children=[saf, sbf])
+    sd = AC.ArrayData(StructType(), 2, [BufferSlice()];
+        children=[sad, sbd], nullcount=0)
     validate_structural(sf, sd)
     sv = getvalue(sf, sd, 2)
-    checked(sv !== missing, "struct getvalue missing")
+    checked(sv isa Vector{Pair{String,Any}} && length(sv) == 2,
+        "struct getvalue failed")
     df, dd = AC.fromjulia_dict("d", ["lo", "hi"], [0, 1, missing, 0])
     validate_structural(df, dd)
     validate_semantic(df, dd)
@@ -137,8 +150,16 @@ end
 
 function run_trim_workload()::Nothing
     exercise_regions()
-    mktempdir() do dir
+    # Plain mkdir/rm rather than `mktempdir() do`: Base's temp-path cleanup
+    # registry (locks + atexit hooks) parks the scheduler under the trimmed
+    # runtime; the primitive filesystem calls are all the workload needs.
+    dir = joinpath(tempdir(), "arrowcore-trim-" * string(getpid()))
+    mkdir(dir)
+    try
         exercise_mmap(dir)
+    finally
+        rm(joinpath(dir, "trim.bin"); force=true)
+        rm(dir)
     end
     exercise_values()
     exercise_validation_errors()

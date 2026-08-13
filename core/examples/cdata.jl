@@ -1799,7 +1799,7 @@ function main()
         movedf, movedd = from_c_data(
             Base.unsafe_convert(Ptr{CArrowSchema}, smoved),
             Base.unsafe_convert(Ptr{CArrowArray}, amoved))
-        @assert materialize(movedf, movedd) == [(key="a", value=7)]
+        @assert materialize(movedf, movedd) == [["key" => "a", "value" => 7]]
         release!(movedd.owner::ForeignOwner)
     end
     @assert reap!() == 2

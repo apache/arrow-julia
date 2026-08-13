@@ -1701,7 +1701,10 @@ function main()
         bools=Any[true, false, true, missing, false],
         strs=Any["hey", "", missing, "αβ∀", "last"],
         lists=Any[[1, 2], Int64[], [3], missing, [4, 5, 6]],
-        structs=Any[(a=1, b="x"), (a=2, b="y"), (a=3, b="z"), (a=4, b="w"), (a=5, b="v")],
+        # Core struct scalars are ordered pairs (report §14.2); the writer
+        # side above still feeds 2.x NamedTuples.
+        structs=Any[["a" => 1, "b" => "x"], ["a" => 2, "b" => "y"],
+            ["a" => 3, "b" => "z"], ["a" => 4, "b" => "w"], ["a" => 5, "b" => "v"]],
         dict=Any["lo", "hi", "lo", missing, "hi"],
     )
     for b in stream.batches

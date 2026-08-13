@@ -148,7 +148,17 @@ mutable struct ReleaseCounter
 end
 ReleaseCounter() = ReleaseCounter(0)
 Base.getindex(c::ReleaseCounter) = @atomic c.n
-increment!(c::ReleaseCounter) = (@atomic c.n += 1)
+# CAS loop rather than `@atomic c.n += 1`: the atomic read-modify-write
+# builtin (`Core.modifyfield!`) is not yet implemented in JuliaC's trim
+# verifier, while compare-and-swap (`replacefield!`) is. Contention on these
+# counters is negligible, so the loop costs nothing in practice.
+function increment!(c::ReleaseCounter)
+    while true
+        old = @atomic c.n
+        _, ok = @atomicreplace c.n old => old + 1
+        ok && return old + 1
+    end
+end
 
 # One mapping's release claim, shared by the two possible owners (the armed
 # region's release action and the constructor's failure path): LIVE(0) ->
@@ -286,7 +296,7 @@ mutable struct OwnerRegion
         # finalizer. A finalizer only runs when the region is unreachable, at
         # which point no guard can exist, so releasing directly is safe.
         if releasefn !== nothing
-            finalizer(_finalize_region!, r)
+            _register_region_finalizer!(r)
         end
         return r
     end
@@ -323,9 +333,30 @@ function _finalize_region!(r::OwnerRegion)
     # Use the same CAS/guard handshake as explicit close. If a manual
     # finalization finds the region busy, install the backstop again.
     if !forceclose!(r; timeout_ms=0)
-        finalizer(_finalize_region!, r)
+        _register_region_finalizer!(r)
     end
     return
+end
+
+# Finalizers register through Base's `Ptr{Cvoid}` form: the generic
+# `finalizer(f, o)` method is `@nospecialize`d in Base, which leaves the
+# registered callable unresolvable for JuliaC trim verification, while the
+# pointer form is an ordinary typed ccall. The C entry re-enters Julia via
+# a compiled @cfunction and must never unwind into the GC's finalizer
+# runner, so it swallows release errors (matching Base's own behavior of
+# logging-not-propagating finalizer errors).
+function _finalize_region_c(p::Ptr{Cvoid})::Cvoid
+    r = unsafe_pointer_to_objref(p)::OwnerRegion
+    try
+        _finalize_region!(r)
+    catch
+    end
+    return nothing
+end
+
+@inline function _register_region_finalizer!(r::OwnerRegion)
+    finalizer(@cfunction(_finalize_region_c, Cvoid, (Ptr{Cvoid},)), r)
+    return nothing
 end
 
 """
@@ -353,10 +384,10 @@ back out. Either way no dereference overlaps a release.
     # pattern where acquire/release alone permits both sides to read stale
     # values (closer sees guards==0 while we see state==open). seq_cst RMWs
     # restore a single total order; the release decrement can stay cheaper.
-    @atomic r.guards += 1
+    _guard_add!(r, 1)
     st = @atomic r.state
     if phase(st) != PHASE_OPEN
-        @atomic :acquire_release r.guards -= 1
+        _guard_add!(r, -1)
         throw(InvalidatedError("memory region was closed (kind=$(r.kind))"))
     end
     return r
@@ -364,8 +395,19 @@ end
 
 function _releaseguard!(r::OwnerRegion)
     r = _lifecycle(r)
-    @atomic :acquire_release r.guards -= 1
+    _guard_add!(r, -1)
     return nothing
+end
+
+# Sequentially-consistent CAS loop; see `increment!` for why this is not a
+# plain `@atomic r.guards += delta`. seq_cst on both handshake sides is load-
+# bearing (see `_acquireguard!`), and CAS is seq_cst by default.
+@inline function _guard_add!(r::OwnerRegion, delta::Int)
+    while true
+        old = @atomic r.guards
+        _, ok = @atomicreplace r.guards old => old + delta
+        ok && return nothing
+    end
 end
 
 @inline function withguard(f, r::OwnerRegion)
@@ -502,38 +544,41 @@ function _release_mapping_once!(claim::MapClaim, p::Ptr,
     return nothing
 end
 
-function _mmapregion(path::AbstractString, makeowner::MK=OwnerRegion;
+function _mmapregion(path::String, makeowner::MK=OwnerRegion;
     unmapper::U=_munmap!,
     note::Union{Nothing,ReleaseCounter}=nothing) where {MK,U}
     Sys.isunix() || error("mmapregion: prove-out implements POSIX only")
-    open(path, "r") do io
-        # Size the exact opened file descriptor. Sizing the path first lets
-        # a concurrent rename/symlink swap pair one inode's length with a
-        # different, shorter fd and later raise SIGBUS on an in-range load.
-        len = filesize(io)
-        len > 0 || throw(ArgumentError("cannot map empty file: $path"))
-        fd = Base.Filesystem.fd(io)
-        # One shared release claim for the two possible owners: the armed
-        # region's action, and the failure path below when region
-        # construction throws after the kernel has transferred the mapping.
-        claim = MapClaim()
-        # PROT_READ=1, MAP_SHARED=1 (Linux) / MAP_SHARED=1 (Darwin) — shared,
-        # read-only mapping; MAP_FAILED is (void*)-1.
-        p = ccall(:mmap, Ptr{Cvoid},
-            (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
-            C_NULL, len, 1 #= PROT_READ =#, 1 #= MAP_SHARED =#, fd, 0)
-        p == Ptr{Cvoid}(-1) && Base.systemerror("mmap($path)", true)
-        try
-            return makeowner(Ptr{UInt8}(p), len, Mmap;
-                releasefn=MunmapRelease(claim; note=note))::OwnerRegion
-        catch
-            _release_mapping_once!(claim, p, len, unmapper)
-            rethrow()
-        end
+    io = open(path, "r")
+    try
+    # Size the exact opened file descriptor. Sizing the path first lets
+    # a concurrent rename/symlink swap pair one inode's length with a
+    # different, shorter fd and later raise SIGBUS on an in-range load.
+    len = filesize(io)
+    len > 0 || throw(ArgumentError("cannot map empty file: $path"))
+    fd = Base.Filesystem.fd(io)
+    # One shared release claim for the two possible owners: the armed
+    # region's action, and the failure path below when region
+    # construction throws after the kernel has transferred the mapping.
+    claim = MapClaim()
+    # PROT_READ=1, MAP_SHARED=1 (Linux) / MAP_SHARED=1 (Darwin) — shared,
+    # read-only mapping; MAP_FAILED is (void*)-1.
+    p = ccall(:mmap, Ptr{Cvoid},
+        (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
+        C_NULL, len, 1 #= PROT_READ =#, 1 #= MAP_SHARED =#, fd, 0)
+    p == Ptr{Cvoid}(-1) && Base.systemerror("mmap($path)", true)
+    try
+        return makeowner(Ptr{UInt8}(p), len, Mmap;
+            releasefn=MunmapRelease(claim; note=note))::OwnerRegion
+    catch
+        _release_mapping_once!(claim, p, len, unmapper)
+        rethrow()
+    end
+    finally
+        close(io)
     end
 end
 
-mmapregion(path::AbstractString) = _mmapregion(path)
+mmapregion(path::AbstractString) = _mmapregion(String(path))
 
 """
     foreignregion(ptr, len, release) -> OwnerRegion
@@ -888,6 +933,45 @@ layoutspec(t::ListViewType) =
 # REE: no top-level validity; run_ends and values are CHILDREN, not buffers.
 layoutspec(::RunEndEncodedType) = LayoutSpec(BufferRole[], 2, 0, 0, false)
 
+"""
+    layoutspec_of(t::ArrowType) -> LayoutSpec
+
+The closed-set dispatch ladder over the runtime descriptors. This is the
+trim-compile story for a runtime-tagged core (report §8.9, §14.2): dispatch
+on an abstract-typed field is dynamic, which JuliaC `--trim=safe` rejects —
+but the descriptor set is CLOSED (it is the layout registry), so one
+`isa` ladder devirtualizes every generic call site statically. Multiple
+dispatch remains the extension surface (each branch calls the ordinary
+`layoutspec` method); the ladder is only the entry point generic code uses
+when the descriptor's concrete type is unknown. Branches are ordered by
+expected frequency.
+"""
+@inline function layoutspec_of(t::ArrowType)::LayoutSpec
+    t isa IntType && return layoutspec(t)
+    t isa FloatType && return layoutspec(t)
+    t isa Utf8Type && return layoutspec(t)
+    t isa BoolType && return layoutspec(t)
+    t isa ListType && return layoutspec(t)
+    t isa StructType && return layoutspec(t)
+    t isa DictionaryType && return layoutspec(t)
+    t isa TimestampType && return layoutspec(t)
+    t isa DateType && return layoutspec(t)
+    t isa TimeType && return layoutspec(t)
+    t isa DurationType && return layoutspec(t)
+    t isa BinaryType && return layoutspec(t)
+    t isa FixedSizeBinaryType && return layoutspec(t)
+    t isa FixedSizeListType && return layoutspec(t)
+    t isa MapType && return layoutspec(t)
+    t isa UnionType && return layoutspec(t)
+    t isa DecimalType && return layoutspec(t)
+    t isa IntervalType && return layoutspec(t)
+    t isa NullType && return layoutspec(t)
+    t isa ViewType && return layoutspec(t)
+    t isa ListViewType && return layoutspec(t)
+    t isa RunEndEncodedType && return layoutspec(t)
+    throw(ArgumentError("unregistered ArrowType"))
+end
+
 # ---------------------------------------------------------------------------
 # §4 ArrayData
 # ---------------------------------------------------------------------------
@@ -946,7 +1030,7 @@ const _ValidatedDictionaries = IdDict{ArrayData,Nothing}
 # Buffer-by-role lookup, driven by the registry. Structural validation
 # guarantees position/arity, so adapters and accessors never hand-count.
 function rolebuffer(d::ArrayData, role::BufferRole)
-    spec = layoutspec(d.type)
+    spec = layoutspec_of(d.type)
     idx = findfirst(==(role), spec.buffers)
     idx === nothing && throw(ArgumentError("layout $(typeof(d.type)) has no $role buffer"))
     return d.buffers[idx]
@@ -985,7 +1069,7 @@ end
 
 function _count_nulls(d::ArrayData)
     d.type isa NullType && return d.len
-    spec = layoutspec(d.type)
+    spec = layoutspec_of(d.type)
     isempty(spec.buffers) && return Int64(0)
     spec.buffers[1] == VALIDITY || return Int64(0)   # unions: no top-level nulls
     v = d.buffers[1]
@@ -1011,17 +1095,112 @@ function expected_validity_bytes(len::Int64)
 end
 
 # Runtime descriptor equality must compare values, not only Julia types.
-# The fallback `==` for immutable structs containing vectors/strings is not
-# a stable semantic contract for all descriptors.
-_typeparam_equal(a::ArrowType, b::ArrowType) = typeequal(a, b)
-_typeparam_equal(a, b) = a == b
-function typeequal(a::ArrowType, b::ArrowType)
-    typeof(a) === typeof(b) || return false
-    return all(_typeparam_equal(getfield(a, i), getfield(b, i))
-               for i = 1:fieldcount(typeof(a)))
+# One more closed-set ladder (no fieldcount/getfield reflection — that is
+# dynamic and trim-hostile); each branch compares its descriptor's fields
+# explicitly.
+# Non-recursive: the spec forbids dictionary-encoded dictionary VALUES, so
+# a DictionaryType's valuetype is never itself a DictionaryType (enforced in
+# _validate_descriptor) and one nested ladder suffices — which is what lets
+# both levels inline at abstract call sites for trim.
+@inline function _typeequal_nondict(a::ArrowType, b::ArrowType)
+    a isa IntType && return b isa IntType && a.bits == b.bits && a.signed == b.signed
+    a isa FloatType && return b isa FloatType && a.bits == b.bits
+    a isa Utf8Type && return b isa Utf8Type && a.large == b.large
+    a isa BoolType && return b isa BoolType
+    a isa ListType && return b isa ListType && a.large == b.large
+    a isa StructType && return b isa StructType
+    a isa TimestampType && return b isa TimestampType && a.unit == b.unit &&
+        a.timezone == b.timezone
+    a isa DateType && return b isa DateType && a.unit == b.unit
+    a isa TimeType && return b isa TimeType && a.unit == b.unit && a.bits == b.bits
+    a isa DurationType && return b isa DurationType && a.unit == b.unit
+    a isa BinaryType && return b isa BinaryType && a.large == b.large
+    a isa FixedSizeBinaryType && return b isa FixedSizeBinaryType && a.nbytes == b.nbytes
+    a isa FixedSizeListType && return b isa FixedSizeListType && a.listsize == b.listsize
+    a isa MapType && return b isa MapType && a.keyssorted == b.keyssorted
+    a isa UnionType && return b isa UnionType && a.mode == b.mode && a.typeids == b.typeids
+    a isa DecimalType && return b isa DecimalType && a.precision == b.precision &&
+        a.scale == b.scale && a.bits == b.bits
+    a isa IntervalType && return b isa IntervalType && a.unit == b.unit
+    a isa NullType && return b isa NullType
+    a isa ViewType && return b isa ViewType && a.utf8 == b.utf8
+    a isa ListViewType && return b isa ListViewType && a.large == b.large
+    a isa RunEndEncodedType && return b isa RunEndEncodedType
+    return false
+end
+
+@inline function typeequal(a::ArrowType, b::ArrowType)
+    if a isa DictionaryType
+        return b isa DictionaryType &&
+            a.indextype.bits == b.indextype.bits &&
+            a.indextype.signed == b.indextype.signed &&
+            _typeequal_nondict(a.valuetype, b.valuetype) &&
+            a.ordered == b.ordered
+    end
+    b isa DictionaryType && return false
+    return _typeequal_nondict(a, b)
+end
+
+"""
+    descriptorname(t::ArrowType) -> Symbol
+
+Closed-set name ladder for error messages: `nameof(typeof(x))` on an
+abstract-typed value is itself a dynamic call, so diagnostics use this
+instead.
+"""
+function descriptorname(t::ArrowType)::Symbol
+    t isa IntType && return :IntType
+    t isa FloatType && return :FloatType
+    t isa Utf8Type && return :Utf8Type
+    t isa BoolType && return :BoolType
+    t isa ListType && return :ListType
+    t isa StructType && return :StructType
+    t isa DictionaryType && return :DictionaryType
+    t isa TimestampType && return :TimestampType
+    t isa DateType && return :DateType
+    t isa TimeType && return :TimeType
+    t isa DurationType && return :DurationType
+    t isa BinaryType && return :BinaryType
+    t isa FixedSizeBinaryType && return :FixedSizeBinaryType
+    t isa FixedSizeListType && return :FixedSizeListType
+    t isa MapType && return :MapType
+    t isa UnionType && return :UnionType
+    t isa DecimalType && return :DecimalType
+    t isa IntervalType && return :IntervalType
+    t isa NullType && return :NullType
+    t isa ViewType && return :ViewType
+    t isa ListViewType && return :ListViewType
+    t isa RunEndEncodedType && return :RunEndEncodedType
+    return :UnknownArrowType
 end
 
 _validate_descriptor(::ArrowType) = nothing
+
+@inline function _validate_descriptor_of(t::ArrowType)
+    t isa IntType && return _validate_descriptor(t)
+    t isa FloatType && return _validate_descriptor(t)
+    t isa Utf8Type && return _validate_descriptor(t)
+    t isa BoolType && return _validate_descriptor(t)
+    t isa ListType && return _validate_descriptor(t)
+    t isa StructType && return _validate_descriptor(t)
+    t isa DictionaryType && return _validate_descriptor(t)
+    t isa TimestampType && return _validate_descriptor(t)
+    t isa DateType && return _validate_descriptor(t)
+    t isa TimeType && return _validate_descriptor(t)
+    t isa DurationType && return _validate_descriptor(t)
+    t isa BinaryType && return _validate_descriptor(t)
+    t isa FixedSizeBinaryType && return _validate_descriptor(t)
+    t isa FixedSizeListType && return _validate_descriptor(t)
+    t isa MapType && return _validate_descriptor(t)
+    t isa UnionType && return _validate_descriptor(t)
+    t isa DecimalType && return _validate_descriptor(t)
+    t isa IntervalType && return _validate_descriptor(t)
+    t isa NullType && return _validate_descriptor(t)
+    t isa ViewType && return _validate_descriptor(t)
+    t isa ListViewType && return _validate_descriptor(t)
+    t isa RunEndEncodedType && return _validate_descriptor(t)
+    throw(ArgumentError("unregistered ArrowType"))
+end
 _validate_descriptor(t::IntType) = t.bits in (8, 16, 32, 64) ||
     throw(ValidationError("integer bit width must be 8, 16, 32, or 64"))
 _validate_descriptor(t::FloatType) = t.bits in (16, 32, 64) ||
@@ -1069,7 +1248,11 @@ _validate_descriptor(t::UnionType) =
         throw(ValidationError("invalid Arrow union mode $(repr(t.mode))"))
 function _validate_descriptor(t::DictionaryType)
     _validate_descriptor(t.indextype)
-    _validate_descriptor(t.valuetype)
+    # The spec forbids dictionary-encoded dictionary values; enforcing it
+    # here is also what keeps descriptor equality non-recursive (typeequal).
+    t.valuetype isa DictionaryType &&
+        throw(ValidationError("dictionary values cannot themselves be dictionary-encoded"))
+    _validate_descriptor_of(t.valuetype)
     return nothing
 end
 
@@ -1116,14 +1299,14 @@ function _validate_structural(f::Field, d::ArrayData,
         throw(ValidationError("field name is not valid UTF-8"))
     _validate_metadata(f.metadata, "field")
     typeequal(f.type, d.type) ||
-        throw(ValidationError("field/type mismatch: $(f.type) vs $(d.type)"))
-    _validate_descriptor(d.type)
-    spec = layoutspec(d.type)
+        throw(ValidationError("field/type mismatch: $(descriptorname(f.type)) vs $(descriptorname(d.type))"))
+    _validate_descriptor_of(d.type)
+    spec = layoutspec_of(d.type)
     nfixed = length(spec.buffers)
     buffers_ok = spec.variadic ? length(d.buffers) >= nfixed : length(d.buffers) == nfixed
     buffers_ok || throw(ValidationError(
-        "$(typeof(d.type)): expected $(spec.variadic ? "at least " : "")$nfixed buffers, got $(length(d.buffers))"))
-    total = checked_add(d.len, d.offset)
+        "$(descriptorname(d.type)): expected $(spec.variadic ? "at least " : "")$nfixed buffers, got $(length(d.buffers))"))
+    total::Int64 = checked_add(d.len, d.offset)
     declared_nulls = @atomic :monotonic d.nullcount
     for (i, role) in enumerate(spec.buffers)
         b = d.buffers[i]
@@ -1192,8 +1375,9 @@ function _validate_structural(f::Field, d::ArrayData,
     elseif d.dictionary !== nothing
         throw(ValidationError("dictionary values attached to a non-dictionary array"))
     end
-    if d.type isa FixedSizeListType
-        need = checked_mul(total, Int64(d.type.listsize))
+    fslt = d.type
+    if fslt isa FixedSizeListType
+        need = checked_mul(total, Int64(fslt.listsize))
         length(d.children[1]) >= need ||
             throw(ValidationError("fixed-size-list child too short: $(length(d.children[1])) < $need"))
     end
@@ -1206,12 +1390,13 @@ function _validate_structural(f::Field, d::ArrayData,
                 throw(ValidationError("child $ci too short for parent extent: $(length(child)) < $total"))
         end
     end
-    if d.type isa UnionType
-        length(d.type.typeids) == length(f.children) ||
+    ut = d.type
+    if ut isa UnionType
+        length(ut.typeids) == length(f.children) ||
             throw(ValidationError("union type-id count must equal child count"))
-        length(unique(d.type.typeids)) == length(d.type.typeids) ||
+        length(unique(ut.typeids)) == length(ut.typeids) ||
             throw(ValidationError("union type ids must be unique"))
-        all(>=(0), d.type.typeids) ||
+        all(>=(0), ut.typeids) ||
             throw(ValidationError("union type ids must be in [0, 127]"))
     end
     if d.type isa MapType
@@ -1229,8 +1414,11 @@ function _validate_structural(f::Field, d::ArrayData,
         runfield, valuefield = f.children
         runfield.name == "run_ends" && valuefield.name == "values" ||
             throw(ValidationError("REE children must be named run_ends and values"))
-        runtype = runfield.type
-        runtype isa IntType && runtype.signed && runtype.bits in (16, 32, 64) ||
+        runtype0 = runfield.type
+        runtype0 isa IntType ||
+            throw(ValidationError("REE run ends must be signed int16, int32, or int64"))
+        runtype = runtype0::IntType
+        (runtype.signed && runtype.bits in (16, 32, 64)) ||
             throw(ValidationError("REE run ends must be signed int16, int32, or int64"))
         !runfield.nullable ||
             throw(ValidationError("REE run ends must be non-nullable"))
@@ -1275,58 +1463,64 @@ function _validate_temporal_values(t::DateType, d::ArrayData)
     return nothing
 end
 
+function _decimal_limb(t::DecimalType, data::BufferSlice, byteoff::Int64,
+    nlimbs::Int, limb::Int)::UInt64
+    limb <= nlimbs || return UInt64(0)
+    source_limb = _native_endianness() == LittleEndian ? limb : nlimbs - limb + 1
+    base = checked_add(byteoff, Int64(8 * (source_limb - 1)))
+    return t.bits == 32 ? UInt64(loadat(data, UInt32, base)) :
+        loadat(data, UInt64, base)
+end
+
 function _decimal_fits_precision(t::DecimalType, data::BufferSlice, byteoff::Int64)
     # Core accepts only native-endian array buffers. Arrow decimal storage is
     # a two's-complement integer, so put native chunks into least-significant
     # limb order before comparing its magnitude with 10^p. Work in fixed
     # UInt256-style arithmetic so Core stays Base-only and Decimal256 does not
-    # require BigInt allocations or BitIntegers.
+    # require BigInt allocations or BitIntegers. (No closures here: captured
+    # and reassigned locals box, which defeats trim verification.)
     nlimbs = cld(t.bits, 64)
-    limbs = ntuple(limb -> begin
-        if limb <= nlimbs
-            source_limb = _native_endianness() == LittleEndian ?
-                limb : nlimbs - limb + 1
-            base = checked_add(byteoff, Int64(8 * (source_limb - 1)))
-            if t.bits == 32
-                UInt64(loadat(data, UInt32, base))
-            else
-                loadat(data, UInt64, base)
-            end
-        else
-            UInt64(0)
-        end
-    end, 4)
+    l1 = _decimal_limb(t, data, byteoff, nlimbs, 1)
+    l2 = _decimal_limb(t, data, byteoff, nlimbs, 2)
+    l3 = _decimal_limb(t, data, byteoff, nlimbs, 3)
+    l4 = _decimal_limb(t, data, byteoff, nlimbs, 4)
     signbit = t.bits == 32 ? UInt64(1) << 31 : UInt64(1) << 63
-    negative = (limbs[nlimbs] & signbit) != 0
+    negative = ((nlimbs == 1 ? l1 : nlimbs == 2 ? l2 : nlimbs == 3 ? l3 : l4) & signbit) != 0
     if negative && t.bits == 32
-        limbs = (limbs[1] | (typemax(UInt64) << 32), limbs[2], limbs[3], limbs[4])
+        l1 |= typemax(UInt64) << 32
     end
-    magnitude = ntuple(limb -> limb <= nlimbs ?
-        (negative ? ~limbs[limb] : limbs[limb]) : UInt64(0), 4)
+    m1 = nlimbs >= 1 ? (negative ? ~l1 : l1) : UInt64(0)
+    m2 = nlimbs >= 2 ? (negative ? ~l2 : l2) : UInt64(0)
+    m3 = nlimbs >= 3 ? (negative ? ~l3 : l3) : UInt64(0)
+    m4 = nlimbs >= 4 ? (negative ? ~l4 : l4) : UInt64(0)
     if negative
-        carry = true
-        magnitude = ntuple(4) do limb
-            value = magnitude[limb]
-            result = carry ? value + UInt64(1) : value
-            carry &= result == 0
-            result
-        end
+        m1 += UInt64(1)
+        c = m1 == 0
+        m2 += c ? UInt64(1) : UInt64(0)
+        c &= m2 == 0
+        m3 += c ? UInt64(1) : UInt64(0)
+        c &= m3 == 0
+        m4 += c ? UInt64(1) : UInt64(0)
     end
 
-    limit = (UInt64(1), UInt64(0), UInt64(0), UInt64(0))
+    L1, L2, L3, L4 = UInt64(1), UInt64(0), UInt64(0), UInt64(0)
     for _ = 1:t.precision
-        carry = UInt128(0)
-        limit = ntuple(4) do limb
-            product = UInt128(limit[limb]) * UInt128(10) + carry
-            carry = product >> 64
-            UInt64(product & UInt128(typemax(UInt64)))
-        end
+        p1 = UInt128(L1) * 10
+        p2 = UInt128(L2) * 10 + (p1 >> 64)
+        p3 = UInt128(L3) * 10 + (p2 >> 64)
+        p4 = UInt128(L4) * 10 + (p3 >> 64)
+        L1 = UInt64(p1 & UInt128(typemax(UInt64)))
+        L2 = UInt64(p2 & UInt128(typemax(UInt64)))
+        L3 = UInt64(p3 & UInt128(typemax(UInt64)))
+        L4 = UInt64(p4 & UInt128(typemax(UInt64)))
     end
-    for limb = 4:-1:1
-        magnitude[limb] < limit[limb] && return true
-        magnitude[limb] > limit[limb] && return false
-    end
-    return false
+    m4 < L4 && return true
+    m4 > L4 && return false
+    m3 < L3 && return true
+    m3 > L3 && return false
+    m2 < L2 && return true
+    m2 > L2 && return false
+    return m1 < L1
 end
 
 _validate_decimal_values(::ArrowType, ::ArrayData) = nothing
@@ -1389,14 +1583,14 @@ function _validate_semantic_intrinsic(f::Field, d::ArrayData,
     t = d.type
     if t isa Union{ViewType,ListViewType,RunEndEncodedType}
         throw(ValidationError(
-            "semantic validation is not implemented for $(nameof(typeof(t))); " *
+            "semantic validation is not implemented for $(descriptorname(t)); " *
             "only structural validation is available"))
     end
     if !(@atomic :monotonic d.semachecked)
-        spec = layoutspec(t)
+        spec = layoutspec_of(t)
         oi = findfirst(==(OFFSETS), spec.buffers)
         if oi !== nothing && spec.offsetwidth != 0
-            O = spec.offsetwidth == 8 ? Int64 : Int32
+            wide = spec.offsetwidth == 8
             offs = d.buffers[oi]
             if !(isempty_buffer(offs) && d.len == 0 && d.offset == 0)
                 databytes = if t isa Utf8Type || t isa BinaryType
@@ -1405,15 +1599,14 @@ function _validate_semantic_intrinsic(f::Field, d::ArrayData,
                 else
                     isempty(d.children) ? Int64(0) : Int64(length(d.children[1]))
                 end
-                prev = loadat(offs, O, checked_mul(d.offset, Int64(sizeof(O))))
+                prev = _load_offset(offs, wide, d.offset)
                 prev >= 0 || throw(ValidationError("negative first offset"))
                 for i = 1:d.len
-                    cur = loadat(offs, O,
-                        checked_mul(checked_add(d.offset, Int64(i)), Int64(sizeof(O))))
+                    cur = _load_offset(offs, wide, checked_add(d.offset, Int64(i)))
                     cur >= prev || throw(ValidationError("offsets not monotonically non-decreasing at $i"))
                     prev = cur
                 end
-                Int64(prev) <= databytes ||
+                prev <= databytes ||
                     throw(ValidationError("final offset $prev exceeds data extent $databytes"))
             end
         end
@@ -1484,7 +1677,7 @@ function _logical_null_at(f::Field, d::ArrayData, i::Int64)
         end
         return _logical_null_at(f.children[pos], d.children[pos], childi)
     end
-    spec = layoutspec(t)
+    spec = layoutspec_of(t)
     return !isempty(spec.buffers) && spec.buffers[1] == VALIDITY && !isvalid_at(d, i)
 end
 
@@ -1541,7 +1734,7 @@ function _validate_field_contract_at(f::Field, d::ArrayData, i::Int64)
                 checked_add(base, Int64(j)))
         end
     elseif t isa Union{ListType,MapType}
-        lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth)
+        lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth == 8)
         lo == hi && return nothing
         cf, cd = f.children[1], d.children[1]
         for childi = checked_add(lo, Int64(1)):hi
@@ -1630,9 +1823,20 @@ juliatype(::Utf8Type) = String
 juliatype(::BinaryType) = Vector{UInt8}
 juliatype(t::FixedSizeBinaryType) = Vector{UInt8}
 
-@inline function _load_int(b::BufferSlice, t::IntType, byteoff::Int64)
-    T = juliatype(t)
-    return loadat(b, T, byteoff)
+@inline function _load_int(b::BufferSlice, t::IntType, byteoff::Int64)::Int64
+    # Literal load widths (a runtime DataType here builds a non-concrete
+    # guard closure, which trim rejects).
+    if t.signed
+        t.bits == 64 && return loadat(b, Int64, byteoff)
+        t.bits == 32 && return Int64(loadat(b, Int32, byteoff))
+        t.bits == 16 && return Int64(loadat(b, Int16, byteoff))
+        return Int64(loadat(b, Int8, byteoff))
+    else
+        t.bits == 64 && return Int64(loadat(b, UInt64, byteoff))
+        t.bits == 32 && return Int64(loadat(b, UInt32, byteoff))
+        t.bits == 16 && return Int64(loadat(b, UInt16, byteoff))
+        return Int64(loadat(b, UInt8, byteoff))
+    end
 end
 
 """
@@ -1646,16 +1850,55 @@ function barrier.
 """
 function getvalue(f::Field, d::ArrayData, i::Integer)
     1 <= i <= d.len || throw(BoundsError(d, i))
-    return _value(d.type, f, d, Int64(i))
+    return _value_of(d.type, f, d, Int64(i))
 end
 
 # -- primitives -------------------------------------------------------------
 
-function _value(t::Union{IntType,FloatType,TimestampType,DurationType,DateType,TimeType},
-    f::Field, d::ArrayData, i::Int64)
+# Primitive accessors branch to LITERAL load widths: `loadat(b, T, off)`
+# with a runtime `T::DataType` builds a non-concrete closure under the guard,
+# which trim verification rejects — and a concrete branch is faster anyway.
+function _value(t::IntType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
-    T = juliatype(t)
-    return loadat(rolebuffer(d, DATA), T, _slotbyteoff(d, i, sizeof(T)))
+    b = rolebuffer(d, DATA)
+    if t.signed
+        t.bits == 64 && return loadat(b, Int64, _slotbyteoff(d, i, 8))
+        t.bits == 32 && return loadat(b, Int32, _slotbyteoff(d, i, 4))
+        t.bits == 16 && return loadat(b, Int16, _slotbyteoff(d, i, 2))
+        return loadat(b, Int8, _slotbyteoff(d, i, 1))
+    else
+        t.bits == 64 && return loadat(b, UInt64, _slotbyteoff(d, i, 8))
+        t.bits == 32 && return loadat(b, UInt32, _slotbyteoff(d, i, 4))
+        t.bits == 16 && return loadat(b, UInt16, _slotbyteoff(d, i, 2))
+        return loadat(b, UInt8, _slotbyteoff(d, i, 1))
+    end
+end
+
+function _value(t::FloatType, f::Field, d::ArrayData, i::Int64)
+    isvalid_at(d, i) || return missing
+    b = rolebuffer(d, DATA)
+    t.bits == 64 && return loadat(b, Float64, _slotbyteoff(d, i, 8))
+    t.bits == 32 && return loadat(b, Float32, _slotbyteoff(d, i, 4))
+    return loadat(b, Float16, _slotbyteoff(d, i, 2))
+end
+
+function _value(t::Union{TimestampType,DurationType}, f::Field, d::ArrayData, i::Int64)
+    isvalid_at(d, i) || return missing
+    return loadat(rolebuffer(d, DATA), Int64, _slotbyteoff(d, i, 8))
+end
+
+function _value(t::DateType, f::Field, d::ArrayData, i::Int64)
+    isvalid_at(d, i) || return missing
+    b = rolebuffer(d, DATA)
+    return t.unit == DAY ? loadat(b, Int32, _slotbyteoff(d, i, 4)) :
+        loadat(b, Int64, _slotbyteoff(d, i, 8))
+end
+
+function _value(t::TimeType, f::Field, d::ArrayData, i::Int64)
+    isvalid_at(d, i) || return missing
+    b = rolebuffer(d, DATA)
+    return t.bits == 32 ? loadat(b, Int32, _slotbyteoff(d, i, 4)) :
+        loadat(b, Int64, _slotbyteoff(d, i, 8))
 end
 
 function _value(t::DecimalType, f::Field, d::ArrayData, i::Int64)
@@ -1710,19 +1953,22 @@ end
 
 # -- varbinary --------------------------------------------------------------
 
-@inline function _offsets_at(d::ArrayData, i::Int64, width::Int)
-    O = width == 8 ? Int64 : Int32
+"Concrete-width offset load: `idx0` is the 0-based entry index."
+@inline function _load_offset(offs::BufferSlice, wide::Bool, idx0::Int64)::Int64
+    return wide ? loadat(offs, Int64, checked_mul(idx0, Int64(8))) :
+        Int64(loadat(offs, Int32, checked_mul(idx0, Int64(4))))
+end
+
+@inline function _offsets_at(d::ArrayData, i::Int64, wide::Bool)
     offs = rolebuffer(d, OFFSETS)
-    slot = _slotindex0(d, i)
-    lo = loadat(offs, O, checked_mul(slot, Int64(sizeof(O))))
-    hi = loadat(offs, O,
-        checked_mul(checked_add(slot, Int64(1)), Int64(sizeof(O))))
-    return Int64(lo), Int64(hi)
+    lo = _load_offset(offs, wide, d.offset + i - 1)
+    hi = _load_offset(offs, wide, d.offset + i)
+    return lo, hi
 end
 
 function _value(t::Union{Utf8Type,BinaryType}, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
-    lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth)
+    lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth == 8)
     data = rolebuffer(d, DATA)
     n = hi - lo
     n == 0 && return t isa Utf8Type ? "" : UInt8[]
@@ -1737,48 +1983,61 @@ end
 
 function _value(t::ListType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
-    lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth)
+    lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth == 8)
     child, cf = d.children[1], f.children[1]
-    lo == hi && return Any[]
-    return [getvalue(cf, child, j) for j = checked_add(lo, Int64(1)):hi]
+    # Explicit Vector{Any}: an Any-first comprehension re-narrows its result
+    # at runtime, which is both trim-hostile and wasted work — typed element
+    # containers are the facade's job (report §9 facade).
+    out = Vector{Any}(undef, Int(hi - lo))
+    for k = 1:Int(hi - lo)
+        out[k] = getvalue(cf, child, checked_add(lo, Int64(k)))
+    end
+    return out
 end
 
 function _value(t::FixedSizeListType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     child, cf = d.children[1], f.children[1]
     base = _slotbyteoff(d, i, t.listsize)
-    return [getvalue(cf, child, checked_add(base, Int64(j))) for j = 1:t.listsize]
+    out = Vector{Any}(undef, t.listsize)
+    for j = 1:t.listsize
+        out[j] = getvalue(cf, child, checked_add(base, Int64(j)))
+    end
+    return out
 end
 
 function _value(::StructType, f::Field, d::ArrayData, i::Int64)
+    # Core's struct scalar is an ordered Vector{Pair{String,Any}} — always.
+    # A NamedTuple carries its names in the TYPE domain, so building one from
+    # runtime schema names is intrinsically dynamic (and cannot represent
+    # Arrow's duplicate/empty/non-Symbol names at all). The typed NamedTuple
+    # surface is exactly the facade's ViewPlan decision in the report
+    # (§9 facade, §14.2); Core stays concrete and trim-clean.
     isvalid_at(d, i) || return missing
     childindex = checked_add(d.offset, i)
-    vals = Tuple(getvalue(cf, cd, childindex) for (cf, cd) in zip(f.children, d.children))
-    names = Tuple(cf.name for cf in f.children)
-    # Arrow names are strings, but not every valid Arrow name can be a Julia
-    # Symbol. In particular, Symbol rejects embedded NUL characters. Keep the
-    # exact Arrow spelling in the pair fallback instead of failing access.
-    symbolnames = all(name -> !isempty(name) && isvalid(name) && !occursin('\0', name), names)
-    if symbolnames && length(unique(names)) == length(names)
-        return NamedTuple{Tuple(Symbol(name) for name in names)}(vals)
+    n = length(f.children)
+    out = Vector{Pair{String,Any}}(undef, n)
+    for j = 1:n
+        out[j] = Pair{String,Any}(f.children[j].name,
+            getvalue(f.children[j], d.children[j], childindex))
     end
-    # Arrow permits duplicate, omitted, and non-Symbol-compatible field names.
-    # NamedTuple cannot represent them, so retain exact order and spelling.
-    return Pair{String,Any}[names[j] => vals[j] for j in eachindex(names)]
+    return out
 end
 
 function _value(t::MapType, f::Field, d::ArrayData, i::Int64)
     # Map = List<Struct<key,value>>; reuse the list walk and pair up.
     isvalid_at(d, i) || return missing
-    lo, hi = _offsets_at(d, i, 4)
+    lo, hi = _offsets_at(d, i, false)
     entries, ef = d.children[1], f.children[1]
     kf, vf = ef.children[1], ef.children[2]
     kd, vd = entries.children[1], entries.children[2]
-    lo == hi && return Pair[]
-    return [begin
-        entryindex = checked_add(entries.offset, Int64(j))
-        getvalue(kf, kd, entryindex) => getvalue(vf, vd, entryindex)
-    end for j = checked_add(lo, Int64(1)):hi]
+    out = Vector{Pair{Any,Any}}(undef, Int(hi - lo))
+    for k = 1:Int(hi - lo)
+        entryindex = checked_add(entries.offset, checked_add(lo, Int64(k)))
+        out[k] = Pair{Any,Any}(getvalue(kf, kd, entryindex),
+            getvalue(vf, vd, entryindex))
+    end
+    return out
 end
 
 function _value(t::UnionType, f::Field, d::ArrayData, i::Int64)
@@ -1798,12 +2057,14 @@ function _value(t::DictionaryType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     w = primwidth(t.indextype)
     idx = _load_int(rolebuffer(d, DATA), t.indextype, _slotbyteoff(d, i, w))
-    return getvalue(dictvaluefield(f, t), d.dictionary,
+    dict = d.dictionary
+    dict === nothing && throw(ValidationError("dictionary-encoded array without a dictionary"))
+    return getvalue(dictvaluefield(f, t), dict,
         checked_add(Int64(idx), Int64(1)))
 end
 
 _value(t::Union{ViewType,ListViewType,RunEndEncodedType}, f::Field, d::ArrayData, i::Int64) =
-    error("element access for $(typeof(t)) is roadmap work (report §13, slices 2f/2h); " *
+    error("element access for $(descriptorname(t)) is roadmap work (report §13, slices 2f/2h); " *
           "the layout is registry-known and structurally validated only")
 
 """
@@ -1815,16 +2076,73 @@ function barrier. `_materialize_loop` is generic over the concrete
 descriptor type it receives, so the loop body compiles per LAYOUT (a small
 closed set), never per schema.
 """
-materialize(f::Field, d::ArrayData) = _materialize_loop(d.type, f, d)
+materialize(f::Field, d::ArrayData) = _materialize_of(d.type, f, d)
+
+# The same closed-set ladder as `layoutspec_of`, for element access and the
+# materialize function barrier: generic entry devirtualizes here; per-layout
+# `_value` methods stay the extension surface.
+@inline function _value_of(t::ArrowType, f::Field, d::ArrayData, i::Int64)
+    t isa IntType && return _value(t, f, d, i)
+    t isa FloatType && return _value(t, f, d, i)
+    t isa Utf8Type && return _value(t, f, d, i)
+    t isa BoolType && return _value(t, f, d, i)
+    t isa ListType && return _value(t, f, d, i)
+    t isa StructType && return _value(t, f, d, i)
+    t isa DictionaryType && return _value(t, f, d, i)
+    t isa TimestampType && return _value(t, f, d, i)
+    t isa DateType && return _value(t, f, d, i)
+    t isa TimeType && return _value(t, f, d, i)
+    t isa DurationType && return _value(t, f, d, i)
+    t isa BinaryType && return _value(t, f, d, i)
+    t isa FixedSizeBinaryType && return _value(t, f, d, i)
+    t isa FixedSizeListType && return _value(t, f, d, i)
+    t isa MapType && return _value(t, f, d, i)
+    t isa UnionType && return _value(t, f, d, i)
+    t isa DecimalType && return _value(t, f, d, i)
+    t isa IntervalType && return _value(t, f, d, i)
+    t isa NullType && return _value(t, f, d, i)
+    t isa ViewType && return _value(t, f, d, i)
+    t isa ListViewType && return _value(t, f, d, i)
+    t isa RunEndEncodedType && return _value(t, f, d, i)
+    throw(ArgumentError("unregistered ArrowType"))
+end
+
+@inline function _materialize_of(t::ArrowType, f::Field, d::ArrayData)
+    t isa IntType && return _materialize_loop(t, f, d)
+    t isa FloatType && return _materialize_loop(t, f, d)
+    t isa Utf8Type && return _materialize_loop(t, f, d)
+    t isa BoolType && return _materialize_loop(t, f, d)
+    t isa ListType && return _materialize_loop(t, f, d)
+    t isa StructType && return _materialize_loop(t, f, d)
+    t isa DictionaryType && return _materialize_loop(t, f, d)
+    t isa TimestampType && return _materialize_loop(t, f, d)
+    t isa DateType && return _materialize_loop(t, f, d)
+    t isa TimeType && return _materialize_loop(t, f, d)
+    t isa DurationType && return _materialize_loop(t, f, d)
+    t isa BinaryType && return _materialize_loop(t, f, d)
+    t isa FixedSizeBinaryType && return _materialize_loop(t, f, d)
+    t isa FixedSizeListType && return _materialize_loop(t, f, d)
+    t isa MapType && return _materialize_loop(t, f, d)
+    t isa UnionType && return _materialize_loop(t, f, d)
+    t isa DecimalType && return _materialize_loop(t, f, d)
+    t isa IntervalType && return _materialize_loop(t, f, d)
+    t isa NullType && return _materialize_loop(t, f, d)
+    t isa ViewType && return _materialize_loop(t, f, d)
+    t isa ListViewType && return _materialize_loop(t, f, d)
+    t isa RunEndEncodedType && return _materialize_loop(t, f, d)
+    throw(ArgumentError("unregistered ArrowType"))
+end
 
 function _materialize_loop(t::T, f::Field, d::ArrayData) where {T<:ArrowType}
     out = Vector{Any}(undef, d.len)
     for i = 1:d.len
         out[i] = _value(t, f, d, Int64(i))
     end
-    # Narrow after the fact; the facade's typed views make this unnecessary,
-    # but for the prove-out a concretely-typed result keeps tests honest.
-    return [x for x in out]
+    # Vector{Any} by design: result-element typing (and the narrowing pass
+    # 2.x users expect) is the facade's typed-view work, and the runtime
+    # narrow is trim-hostile. Tests compare with ==/isequal, which is
+    # eltype-agnostic.
+    return out
 end
 
 # ---------------------------------------------------------------------------
