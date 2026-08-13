@@ -680,9 +680,17 @@ mutable struct ForeignOwner
         block = Libc.malloc(sizeof(CArrowArray))
         block == C_NULL && throw(OutOfMemoryError())
         p = Ptr{CArrowArray}(block)
-        unsafe_store!(p, arr)
-        _store_field!(p, :release, Ptr{Cvoid}(C_NULL))  # inert until armed
-        o = new(p, arr.release, false)
+        o = try
+            unsafe_store!(p, arr)
+            _store_field!(p, :release, Ptr{Cvoid}(C_NULL))  # inert until armed
+            new(p, arr.release, false)
+        catch
+            # The native copy exists before the Julia owner does. If copy
+            # initialization or owner allocation fails, no finalizer can
+            # reclaim that copy for us.
+            Libc.free(block)
+            rethrow()
+        end
         try
             registerfinalizer(release!, o)
         catch
@@ -731,17 +739,44 @@ this tree is undefined behavior — the C Data spec's own post-release rule.
 A conformance failure throws; from the finalizer path Julia reports it as a
 finalizer error.
 """
-function release!(o::ForeignOwner)
+release!(o::ForeignOwner) = _release_foreign_owner!(o, Libc.free)
+
+function _release_foreign_owner!(o::ForeignOwner, deallocate!)
     @atomicswap(o.released = true) && return nothing
     cb = unsafe_load(o.arrayblock).release
     if cb != C_NULL
         ccall(cb, Cvoid, (Ptr{CArrowArray},), o.arrayblock)
         unsafe_load(o.arrayblock).release == C_NULL ||
-            (Libc.free(o.arrayblock);
+            (deallocate!(o.arrayblock);
                 error("C Data producer release did not mark the structure released"))
     end
-    Libc.free(o.arrayblock)
+    deallocate!(o.arrayblock)
     return nothing
+end
+
+const TEST_CONFORMING_RELEASES = ReleaseCounter()
+const TEST_NONCONFORMING_RELEASES = ReleaseCounter()
+
+function _test_conforming_release(p::Ptr{CArrowArray})::Cvoid
+    increment!(TEST_CONFORMING_RELEASES)
+    _store_field!(p, :release, Ptr{Cvoid}(C_NULL))
+    return nothing
+end
+
+function _test_nonconforming_release(::Ptr{CArrowArray})::Cvoid
+    increment!(TEST_NONCONFORMING_RELEASES)
+    return nothing
+end
+
+const TEST_CONFORMING_RELEASE =
+    @cfunction(_test_conforming_release, Cvoid, (Ptr{CArrowArray},))
+const TEST_NONCONFORMING_RELEASE =
+    @cfunction(_test_nonconforming_release, Cvoid, (Ptr{CArrowArray},))
+
+function _test_c_array(release::Ptr{Cvoid})
+    return CArrowArray(0, 0, 0, 0, 0, Ptr{Ptr{Cvoid}}(C_NULL),
+        Ptr{Ptr{CArrowArray}}(C_NULL), Ptr{CArrowArray}(C_NULL), release,
+        Ptr{Cvoid}(C_NULL))
 end
 
 "Read child/dictionary struct pointers out of a CArrowArray."
@@ -1085,6 +1120,95 @@ end
     return sp, ap, WeakRef(d), WeakRef(region)
 end
 
+function _stress_reaper(ready, start, done, workers)
+    increment!(ready)
+    wait(start)
+    reaped = 0
+    for _ = 1:10_000
+        reaped += reap!()
+        done[] == workers && _registry_count() == 0 && break
+        yield()
+    end
+    return reaped
+end
+
+function _threaded_cdata_stress()
+    Threads.nthreads() >= 4 ||
+        error("threaded C Data stress requires at least four threads")
+
+    # Different exported trees may release concurrently. Reapers scan and
+    # claim those roots at the same time; each root must be popped once.
+    n = 1_000
+    workers = 4
+    f, d = fromjulia("registry-race", Int64[1])
+    roots = [to_c_data(f, d) for _ = 1:n]
+    ready = ReleaseCounter()
+    done = ReleaseCounter()
+    start = Base.Event()
+    releasers = [errormonitor(Threads.@spawn begin
+        increment!(ready)
+        wait(start)
+        try
+            for i = worker:workers:n
+                sp, ap = roots[i]
+                _call_release(sp)
+                _call_release(ap)
+                i % 16 == 0 && yield()
+            end
+        finally
+            increment!(done)
+        end
+    end) for worker = 1:workers]
+    reapers = [errormonitor(Threads.@spawn _stress_reaper(
+        ready, start, done, workers)) for _ = 1:3]
+    while ready[] != length(releasers) + length(reapers)
+        yield()
+    end
+    notify(start)
+    foreach(fetch, releasers)
+    reaped_by_task = fetch.(reapers)
+    reaped = sum(reaped_by_task) + reap!()
+    @assert reaped == 2n (reaped, reaped_by_task, _registry_count())
+    @assert _registry_count() == 0
+
+    # One atomic swap must choose between explicit release and the registered
+    # finalizer before either path reads or frees the native struct copy.
+    rounds = 200
+    before = TEST_CONFORMING_RELEASES[]
+    owners = ForeignOwner[]
+    for _ = 1:rounds
+        owner = ForeignOwner(_test_c_array(TEST_CONFORMING_RELEASE))
+        _arm_foreign_owner!(owner)
+        push!(owners, owner)
+    end
+    ready = ReleaseCounter()
+    start = Base.Event()
+    contenders = Task[]
+    for owner in owners
+        push!(contenders, errormonitor(Threads.@spawn begin
+            increment!(ready)
+            wait(start)
+            release!(owner)
+        end))
+        push!(contenders, errormonitor(Threads.@spawn begin
+            increment!(ready)
+            wait(start)
+            finalize(owner)
+        end))
+    end
+    while ready[] != length(contenders)
+        yield()
+    end
+    notify(start)
+    foreach(fetch, contenders)
+    @assert TEST_CONFORMING_RELEASES[] - before == rounds
+    for owner in owners
+        @assert (@atomic owner.released)
+    end
+    println("threaded registry reaping and foreign-owner release passed ✓")
+    return nothing
+end
+
 function main()
     if Sys.WORD_SIZE == 64
         @assert sizeof(CArrowSchema) == 72
@@ -1344,6 +1468,42 @@ function main()
     @assert reap!() == 1
     @assert _registry_count() == rbefore
     println("failed finalizer registration frees only the inert owner copy ✓")
+
+    # A producer that violates release=NULL still loses its stable copy once,
+    # reports the conformance error, and leaves every later release inert.
+    before_calls = TEST_NONCONFORMING_RELEASES[]
+    deallocations = Ref(0)
+    nonconforming_owner =
+        ForeignOwner(_test_c_array(TEST_NONCONFORMING_RELEASE))
+    _arm_foreign_owner!(nonconforming_owner)
+    @assert try
+        _release_foreign_owner!(nonconforming_owner, p -> begin
+            deallocations[] += 1
+            Libc.free(p)
+        end)
+        false
+    catch e
+        e isa ErrorException &&
+            e.msg == "C Data producer release did not mark the structure released"
+    end
+    @assert deallocations[] == 1
+    @assert TEST_NONCONFORMING_RELEASES[] == before_calls + 1
+    finalize(nonconforming_owner)
+    release!(nonconforming_owner)
+    @assert TEST_NONCONFORMING_RELEASES[] == before_calls + 1
+    # Explicit `finalize` exercises the registered finalizer's error path.
+    # Julia reports finalizer errors instead of throwing them to this caller,
+    # so suppress the expected diagnostic and verify the durable state.
+    finalizer_error_owner =
+        ForeignOwner(_test_c_array(TEST_NONCONFORMING_RELEASE))
+    _arm_foreign_owner!(finalizer_error_owner)
+    redirect_stderr(devnull) do
+        finalize(finalizer_error_owner)
+    end
+    @assert (@atomic finalizer_error_owner.released)
+    @assert TEST_NONCONFORMING_RELEASES[] == before_calls + 2
+    release!(finalizer_error_owner)
+    println("nonconforming producer release frees once and reports the error ✓")
 
     # Producer C callbacks have no error channel. release! calls the
     # persistent malloc'd copy once, checks the producer nulled the copy's
@@ -1715,8 +1875,17 @@ function main()
     @assert _registry_count() == 0
     println("invalid imported names and UTF-8 fail with exact cleanup ✓")
 
+    stresscmd = `$(Base.julia_cmd()) --startup-file=no --threads=4 $(abspath(@__FILE__))`
+    success(addenv(stresscmd, "ARROWCORE_CDATA_STRESS" => "1")) ||
+        error("threaded C Data stress failed")
+    println("threaded C Data stress passed in a four-thread child ✓")
+
     println()
     println("C Data ownership and round-trip checks passed.")
 end
 
-main()
+if get(ENV, "ARROWCORE_CDATA_STRESS", "") == "1"
+    _threaded_cdata_stress()
+else
+    main()
+end
