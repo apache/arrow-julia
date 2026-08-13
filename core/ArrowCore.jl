@@ -420,6 +420,10 @@ pointers can be anything), so the branch lives here, in one place, instead
 of as a copy workaround scattered through per-type code.
 """
 @inline function loadat(b::BufferSlice, ::Type{T}, byteoff::Int64) where {T}
+    # Raw Arrow bytes may only materialize pointer-free values. Loading a
+    # struct with managed references would treat attacker-controlled bytes as
+    # GC pointers and can crash Julia before it can report an ordinary error.
+    isbitstype(T) || throw(ArgumentError("loadat requires an isbits type, got $T"))
     # Bounds: byteoff + sizeof(T) <= len. byteoff is computed by callers from
     # validated element indices, but re-check cheaply: this is the last line
     # of defense before a raw pointer dereference.

@@ -22,6 +22,10 @@ include(joinpath(@__DIR__, "..", "ArrowCore.jl"))
 using .ArrowCore
 const AC = ArrowCore
 
+struct ManagedLoad
+    value::Any
+end
+
 @testset "ArrowCore" begin
 
 @testset "OwnerRegion lifecycle" begin
@@ -176,6 +180,9 @@ end
     e = BufferSlice()
     @test length(e) == 0
     @test AC.isempty_buffer(e)
+    # Arbitrary bytes must never become managed Julia references.
+    managed = BufferSlice(r, 0, sizeof(ManagedLoad))
+    @test_throws ArgumentError AC.loadat(managed, ManagedLoad, Int64(0))
 end
 
 @testset "unaligned loads" begin
