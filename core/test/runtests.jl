@@ -241,13 +241,14 @@ end
         [BufferSlice(), AC._databuffer(Int32[2, 0]), AC._databuffer(Int32[1, 2])];
         children=[cd], nullcount=0)
     @test validate_structural(lvf, lvd) === lvd
-    @test validate_semantic(lvf, lvd) === lvd
+    @test_throws ValidationError validate_semantic(lvf, lvd)
     vt = ViewType(true)
     vf = Field("v", vt)
     vd = AC.ArrayData(vt, 1,
         [BufferSlice(), AC._databuffer(zeros(UInt8, 16)), AC._databuffer(UInt8[0x61])];
         nullcount=0)
     @test validate_structural(vf, vd) === vd
+    @test_throws ValidationError validate_semantic(vf, vd)
 end
 
 @testset "fromjulia round-trips" begin
@@ -499,6 +500,7 @@ end
         f = Field("ree", t; children=[ref, vf])
         d = AC.ArrayData(t, 3, BufferSlice[]; children=[red, vd])
         validate_structural(f, d)  # structure IS validated
+        @test_throws ValidationError validate_semantic(f, d)
         @test_throws ErrorException getvalue(f, d, 1)
     end
 end

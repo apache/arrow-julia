@@ -63,8 +63,10 @@ Design rules this module is built to demonstrate:
 
 Deliberately out of scope for the prove-out (tracked in the report roadmap):
 view layouts (Utf8View/BinaryView/ListView) and run-end encoding have
-registry entries and structural validation but no element accessors; there
-is no compression, no Tables.jl integration, and no `ViewPlan` — bulk access
+registry entries and structural validation but no semantic validation or
+element accessors; semantic/full validation rejects them rather than marking
+unchecked content valid. There is no compression, no Tables.jl integration,
+and no `ViewPlan` — bulk access
 here uses a plain function barrier (`materialize`) to demonstrate the
 pattern the facade will formalize.
 """
@@ -1046,10 +1048,16 @@ safe — offset monotonicity + final-offset bounds, dictionary index bounds,
 union type-id domain. Successful data-intrinsic results are cached on the
 ArrayData (`semachecked`); benign concurrent callers may repeat the same scan.
 Field-dependent contracts, including nullability, run on every call because
-the same data can be checked against another Field.
+the same data can be checked against another Field. Layouts declared as
+structural-only fail closed here instead of caching an incomplete check.
 """
 function validate_semantic(f::Field, d::ArrayData)
     t = d.type
+    if t isa Union{ViewType,ListViewType,RunEndEncodedType}
+        throw(ValidationError(
+            "semantic validation is not implemented for $(nameof(typeof(t))); " *
+            "only structural validation is available"))
+    end
     if !(@atomic :monotonic d.semachecked)
         spec = layoutspec(t)
         oi = findfirst(==(OFFSETS), spec.buffers)
