@@ -236,8 +236,8 @@ implementation:
   every generic entry point. Multiple dispatch remains the per-layout
   extension surface underneath.
 - **Literal load widths.** `loadat(b, T, off)` with a runtime `T::DataType`
-  builds an unresolvable closure; accessors branch to literal widths
-  instead (also faster).
+  leaves the raw-load path unresolved; accessors branch to literal widths
+  instead. This is also faster.
 - **CAS for atomic counters.** JuliaC's verifier has not implemented
   `Core.modifyfield!` (each `@atomic x.f += 1` is a verifier warning), while
   `@atomicreplace` verifies clean, so `ReleaseCounter` uses a CAS loop. The
@@ -269,11 +269,11 @@ does not make arbitrary code async-exception-atomic, and the earlier
 delivered. Ordinary exception safety (error paths clean up; adapter release
 is exactly-once) **is** in contract and tested. A formal revisit is planned
 when Julia 1.14's structured cancellation gives Base a real system to build
-on. Relatedly, `Threads.Atomic` boxes appear nowhere in `core/`. Core's only
-atomics are the two validation-cache fields on `ArrayData` and the
-`ReleaseCounter` test utility; the constrained memory model has no region
-lifecycle to synchronize (the C-data adapter's `ForeignOwner` keeps one
-`@atomic` exactly-once flag).
+on. Relatedly, `Threads.Atomic` boxes appear nowhere in `core/`. The
+`ArrowCore` module uses atomics only for the two `ArrayData` validation caches
+and the `ReleaseCounter` test utility; its constrained memory model has no
+region lifecycle to synchronize. The adapters add one pull-claim flag on
+`IPCStream` and one exactly-once flag on `ForeignOwner`.
 
 ## Compression
 
