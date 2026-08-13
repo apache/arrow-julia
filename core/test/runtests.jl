@@ -330,6 +330,21 @@ end
         @test isequal(materialize(f, d), ["lo", "hi", missing, "lo"])
     end
 
+    @testset "maximum narrow dictionary indices" begin
+        for (T, signed) in ((Int8, true), (UInt8, false))
+            n = Int(typemax(T)) + 1
+            vf, vd = fromjulia("pool", collect(Int64(1):Int64(n)))
+            t = DictionaryType(IntType(8, signed), vf.type, false)
+            f = Field("d", t; nullable=false)
+            d = AC.ArrayData(t, 1,
+                [BufferSlice(), AC._databuffer(T[typemax(T)])];
+                dictionary=vd, nullcount=0)
+            validate_structural(f, d)
+            validate_semantic(f, d)
+            @test materialize(f, d) == Int64[n]
+        end
+    end
+
     @testset "canonical empty offset arrays" begin
         st = Utf8Type(false)
         sf = Field("s", st)

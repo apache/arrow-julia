@@ -1597,7 +1597,7 @@ function _value(t::DictionaryType, f::Field, d::ArrayData, i::Int64)
     w = primwidth(t.indextype)
     idx = _load_int(rolebuffer(d, DATA), t.indextype, _slotbyteoff(d, i, w))
     return getvalue(dictvaluefield(f, t), d.dictionary,
-        checked_add(idx, one(idx)))
+        checked_add(Int64(idx), Int64(1)))
 end
 
 _value(t::Union{ViewType,ListViewType,RunEndEncodedType}, f::Field, d::ArrayData, i::Int64) =
