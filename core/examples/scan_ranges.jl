@@ -286,6 +286,12 @@ function _scantable(names, outcols, nrows::Int)
     return isempty(names) ? _ScanColumns(table, nrows) : table
 end
 
+function _addscanrows(total::Int, rows::Int64)
+    (0 <= total && 0 <= rows && rows <= typemax(Int) - total) ||
+        throw(ValidationError("scan result row count is not addressable"))
+    return total + Int(rows)
+end
+
 function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool},
     budget::AllocationBudget, state::DecodeState)
     fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
@@ -316,16 +322,20 @@ the window are absent — never decoded.
 function _batchwindow(rowcounts::Vector{Int64}, offset::Int, limit::Union{Nothing,Int})
     window = Tuple{Int,Int64,Int64}[]   # (batch index, skip, take)
     remaining_skip = Int64(offset)
-    remaining_take = limit === nothing ? typemax(Int64) : Int64(limit)
+    unlimited = limit === nothing
+    remaining_take = unlimited ? Int64(0) : Int64(limit)
     for (i, rows) in enumerate(rowcounts)
-        remaining_take <= 0 && break
+        !unlimited && remaining_take <= 0 && break
         if remaining_skip >= rows
             remaining_skip -= rows
             continue
         end
-        take = min(rows - remaining_skip, remaining_take)
+        take = unlimited ? rows - remaining_skip :
+            min(rows - remaining_skip, remaining_take)
         push!(window, (i, remaining_skip, take))
-        remaining_take -= take
+        if !unlimited
+            remaining_take -= take
+        end
         remaining_skip = 0
     end
     return window
@@ -371,7 +381,7 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
         for (i, skip, take) in window
             keep[i] || continue
             rblen, cols = _scanbatch(f, i, mask, budget, state)
-            outrows += Int(take >= 0 ? take : rblen)
+            outrows = _addscanrows(outrows, take >= 0 ? take : rblen)
             for idx in decodeidx
                 col = materialize(f.fields[idx], cols[idx]::ArrayData)
                 take >= 0 && (col = col[(skip + 1):(skip + take)])
@@ -827,7 +837,7 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
             body = SparseBody(block[3], block[1] + block[2], bodyspans)
             _, cols = _maskedrecord(msg, v, body, fields, dicts, fielddictids,
                 validated, limits, version, mask, state)
-            outrows += Int(take >= 0 ? take : rowcounts[p])
+            outrows = _addscanrows(outrows, take >= 0 ? take : rowcounts[p])
             for idx in decodeidx
                 col = materialize(fields[idx], cols[idx]::ArrayData)
                 take >= 0 && (col = col[(skip + 1):(skip + take)])
@@ -1267,7 +1277,11 @@ end
 function _fulltable(f::ArrowFile)
     names = Tuple(Symbol(fld.name) for fld in f.fields)
     if isempty(names)
-        return _ScanColumns(NamedTuple(), Int(sum(_batchrows(f, i) for i = 1:length(f); init=0)))
+        nrows = 0
+        for i = 1:length(f)
+            nrows = _addscanrows(nrows, _batchrows(f, i))
+        end
+        return _ScanColumns(NamedTuple(), nrows)
     end
     cols = Tuple(begin
         parts = Any[materialize(fld, f[i].columns[j]) for i = 1:length(f)]
@@ -1499,6 +1513,46 @@ function _scan_main()
         @assert Tables.rowcount(Tables.columns(got)) == 5
     end
     println("zero-column scans preserve their row count ✓")
+
+    # A zero-column file can declare an addressable row count without body
+    # bytes. The aggregate result must still fit Tables' Int row-count API.
+    maxrows = Int64(typemax(Int))
+    edgebatches = AC.RecordBatch[
+        AC.RecordBatch(zerosch, ArrayData[], maxrows - 1),
+        AC.RecordBatch(zerosch, ArrayData[], 1)]
+    overflowbatches = AC.RecordBatch[
+        AC.RecordBatch(zerosch, ArrayData[], maxrows),
+        AC.RecordBatch(zerosch, ArrayData[], 1)]
+    sentinelbatches = vcat(overflowbatches,
+        AC.RecordBatch[AC.RecordBatch(zerosch, ArrayData[], 1)])
+    edgebytes = writefile(zerosch, edgebatches)
+    overflowbytes = writefile(zerosch, overflowbatches)
+    sentinelbytes = writefile(zerosch, sentinelbatches)
+    edgelimits = Limits(max_array_length=typemax(Int64))
+    for source in (readfile(copy(edgebytes); limits=edgelimits),
+        RangedFile(RangedSource(copy(edgebytes)); limits=edgelimits))
+        got = Tables.read(source, Tables.Scan())
+        @assert Tables.rowcount(Tables.columns(got)) == typemax(Int)
+    end
+    for source in (readfile(copy(overflowbytes); limits=edgelimits),
+        RangedFile(RangedSource(copy(overflowbytes)); limits=edgelimits))
+        empty = Tables.read(source, Tables.Scan(limit=0))
+        @assert Tables.rowcount(Tables.columns(empty)) == 0
+        capped = Tables.read(source, Tables.Scan(limit=typemax(Int)))
+        @assert Tables.rowcount(Tables.columns(capped)) == typemax(Int)
+        shifted = Tables.read(source, Tables.Scan(offset=1))
+        @assert Tables.rowcount(Tables.columns(shifted)) == typemax(Int)
+        @assert _rejects(() -> Tables.read(source, Tables.Scan()))
+        @assert _rejects(() -> Tables.read(source,
+            Tables.Scan(filter=Tables.AlwaysTrue())))
+    end
+    @assert _rejects(() -> _fulltable(
+        readfile(copy(overflowbytes); limits=edgelimits)))
+    for source in (readfile(copy(sentinelbytes); limits=edgelimits),
+        RangedFile(RangedSource(copy(sentinelbytes)); limits=edgelimits))
+        @assert _rejects(() -> Tables.read(source, Tables.Scan(offset=1)))
+    end
+    println("unaddressable cumulative row counts fail closed ✓")
 
     println()
     println("Tables.Scan Stage-A pushdown checks passed.")

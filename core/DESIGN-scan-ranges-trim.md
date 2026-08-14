@@ -69,7 +69,11 @@ implemented in `examples/scan_ranges.jl`):
 - **Wire row counts are trusted only after metadata validation.** Before a
   `RecordBatch.length` drives a window, it is range-checked and matched to
   every top-level FieldNode length. Exact node/buffer counts and buffer
-  geometry are also checked from metadata alone.
+  geometry are also checked from metadata alone. Aggregate scan row counts
+  must fit Tables' `Int` row-count API: Stage A accepts a planned result through
+  `typemax(Int)` and rejects a larger one. An offset-only window represents
+  `limit=nothing` explicitly; it does not use a finite sentinel that can omit
+  later batches.
 - **One apply call has one allocation budget.** Standalone lazy `file[i]`
   calls retain their documented per-call budgets. A scan that visits many
   batches shares one budget and codec state across all of its metadata and
