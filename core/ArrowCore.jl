@@ -1409,10 +1409,14 @@ function _validate_ree_values(d::ArrayData)
     declared > 0 && throw(ValidationError("the REE parent null count field is always 0"))
     total = checked_add(d.offset, d.len)
     data = rolebuffer(runs, DATA)
-    w = primwidth(rt)
+    # The typeassert re-concretizes after the `||`-condition check above —
+    # without it `primwidth`/`_load_int` see `ArrowType` and the trim
+    # verifier reports unresolved calls.
+    rti = rt::IntType
+    w = primwidth(rti)
     prev = Int64(0)
     for i = 1:runs.len
-        re = _load_int(data, rt, _slotbyteoff(runs, Int64(i), w))
+        re = _load_int(data, rti, _slotbyteoff(runs, Int64(i), w))
         re > prev ||
             throw(ValidationError("run ends must be positive and strictly ascending"))
         prev = re
