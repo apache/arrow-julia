@@ -222,8 +222,18 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
     else
         Tuple{Int,Int64,Int64}[(i, Int64(0), Int64(-1)) for i = 1:length(f)]
     end
+    # Statistics pruning (design §3): one-sided — a pruned batch is provably
+    # empty under the filter; the filter itself always stays in the residual.
+    keep = trues(length(f))
+    if scan.filter !== nothing
+        stats = _readstats(f.schema.metadata, length(f))
+        stats === nothing ||
+            (keep = Bool[_maypass(scan.filter, stats[i].cols, names, stats[i].rows)
+                         for i = 1:length(f)])
+    end
     parts = Dict{Int,Vector{Any}}(idx => Any[] for idx in decodeidx)
     for (i, skip, take) in window
+        keep[i] || continue
         rblen, cols = _scanbatch(f, i, mask)
         for idx in decodeidx
             col = materialize(f.fields[idx], cols[idx]::ArrayData)
@@ -503,14 +513,28 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
             throw(ValidationError("footer block escapes the data section"))
     end
 
-    # One coalesced metadata pass over every block (record AND dictionary —
-    # ids and row counts both live there); bodies come later and only for
-    # what the scan needs.
-    allblocks = vcat(dictblocks, recordblocks)
-    metaspans = _fetchspans(src, NTuple{2,Int64}[(bl[1], bl[2]) for bl in allblocks],
+    # Statistics pruning happens FIRST (design §3): the stats live in the
+    # footer schema's metadata, so pruned batches never even get their
+    # block metadata fetched. Pruning applies only under a filter, and the
+    # window applies only without one, so the two never interact.
+    nrec = length(recordblocks)
+    keep = trues(nrec)
+    if scan.filter !== nothing
+        stats = _readstats(coremetadata(metaschema.custom_metadata), nrec)
+        stats === nothing ||
+            (keep = Bool[_maypass(scan.filter, stats[i].cols, names, stats[i].rows)
+                         for i = 1:nrec])
+    end
+    recidxs = Int[i for i = 1:nrec if keep[i]]
+
+    # One coalesced metadata pass over the dictionary blocks and the
+    # SURVIVING record blocks; bodies come later and only for what the scan
+    # needs.
+    metablocks = vcat(dictblocks, NTuple{3,Int64}[recordblocks[i] for i in recidxs])
+    metaspans = _fetchspans(src, NTuple{2,Int64}[(bl[1], bl[2]) for bl in metablocks],
         rf.coalesce_gap)
-    blockmeta = Vector{Tuple{Meta.Message,Int16}}(undef, length(allblocks))
-    for (i, block) in enumerate(allblocks)
+    blockmeta = Vector{Tuple{Meta.Message,Int16}}(undef, length(metablocks))
+    for (i, block) in enumerate(metablocks)
         payload = AC.slicebytes(_spanslice(metaspans, block[1], block[2]))
         msg, v, header_type = _parseblockmeta(payload, block, limits, budget)
         expected_dict = i <= length(dictblocks)
@@ -578,19 +602,20 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
 
         # Batch window from metadata row counts, then per-buffer body ranges
         # for exactly the decode set of exactly the surviving batches.
-        nrec = length(recordblocks)
-        headers = [blockmeta[length(dictblocks) + i][1].header::Meta.RecordBatch
-                   for i = 1:nrec]
+        # Positions index `recidxs` (identity when no filter pruned).
+        nsurv = length(recidxs)
+        headers = [blockmeta[length(dictblocks) + p][1].header::Meta.RecordBatch
+                   for p = 1:nsurv]
         rowcounts = Int64[something(h.length, Int64(0)) for h in headers]
         consumed = scan.filter === nothing && (scan.limit !== nothing || scan.offset > 0)
         window = consumed ? _batchwindow(rowcounts, scan.offset, scan.limit) :
-            Tuple{Int,Int64,Int64}[(i, Int64(0), Int64(-1)) for i = 1:nrec]
+            Tuple{Int,Int64,Int64}[(p, Int64(0), Int64(-1)) for p = 1:nsurv]
 
         bodyranges = NTuple{2,Int64}[]
         blockwants = Dict{Int,Vector{NTuple{2,Int64}}}()
-        for (i, _, _) in window
-            block = recordblocks[i]
-            header = headers[i]
+        for (p, _, _) in window
+            block = recordblocks[recidxs[p]]
+            header = headers[p]
             buffers = something(header.buffers, Meta.Buffer[])
             wants = NTuple{2,Int64}[]
             bufidx = 1
@@ -611,16 +636,16 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
                 end
                 bufidx += span
             end
-            blockwants[i] = wants
+            blockwants[p] = wants
             bodystart = block[1] + block[2]
             append!(bodyranges, NTuple{2,Int64}[(bodystart + off, len) for (off, len) in wants])
         end
         bodyspans = _fetchspans(src, bodyranges, rf.coalesce_gap)
 
         parts = Dict{Int,Vector{Any}}(idx => Any[] for idx in decodeidx)
-        for (i, skip, take) in window
-            block = recordblocks[i]
-            msg, v = blockmeta[length(dictblocks) + i]
+        for (p, skip, take) in window
+            block = recordblocks[recidxs[p]]
+            msg, v = blockmeta[length(dictblocks) + p]
             body = SparseBody(block[3], block[1] + block[2], bodyspans)
             _, cols = _maskedrecord(msg, v, body, fields, dicts, fielddictids,
                 validated, limits, version, mask, state)
@@ -642,6 +667,318 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     finally
         close(state)
     end
+end
+
+# ===========================================================================
+# §3: per-batch statistics — the official value layout in a footer key
+# ===========================================================================
+
+import Base64
+
+# Placement is OUR convention (the statistics-schema spec's non-goals
+# explicitly exclude placement); the VALUE layout is the official one:
+#     struct<column: int32, statistics:
+#            map<dictionary<utf8, int32>, dense_union<int64,float64,utf8,bool>>>
+# serialized as one embedded IPC stream with one statistics record batch per
+# data record batch, base64-wrapped into schema-level custom metadata so the
+# tail fetch alone powers pruning. Upgradeable: if upstream ever
+# standardizes placement, we emit both keys through a deprecation cycle.
+const STATS_KEY = "JuliaArrow:batch_statistics.v1"
+const STATS_ROW_COUNT = "ARROW:row_count:exact"
+const STATS_NULL_COUNT = "ARROW:null_count:exact"
+const STATS_MIN = "ARROW:min_value:exact"
+const STATS_MAX = "ARROW:max_value:exact"
+const STATS_KEYPOOL = [STATS_ROW_COUNT, STATS_NULL_COUNT, STATS_MIN, STATS_MAX]
+
+function _statsschema()
+    key = Field("key", DictionaryType(IntType(32, true), Utf8Type(false), false);
+        nullable=false, children=Field[])
+    value = Field("value", UnionType(AC.DenseMode, Int8[0, 1, 2, 3]);
+        nullable=false, children=Field[
+            Field("i64", IntType(64, true); nullable=false),
+            Field("f64", FloatType(64); nullable=false),
+            Field("str", Utf8Type(false); nullable=false),
+            Field("bool", BoolType(); nullable=false)])
+    entries = Field("entries", StructType(); nullable=false,
+        children=Field[key, value])
+    return Schema(Field[
+        Field("column", IntType(32, true); nullable=true),
+        Field("statistics", MapType(false); nullable=false,
+            children=Field[entries])])
+end
+
+_bitmapbytes(bits::Vector{Bool}) = begin
+    bytes = zeros(UInt8, cld(length(bits), 8))
+    for (i, b) in enumerate(bits)
+        b && (bytes[1 + (i - 1) ÷ 8] |= UInt8(1) << ((i - 1) % 8))
+    end
+    bytes
+end
+
+function _utf8data(strs::Vector{String})
+    offsets = Int32[0]
+    bytes = UInt8[]
+    for s in strs
+        append!(bytes, codeunits(s))
+        push!(offsets, Int32(length(bytes)))
+    end
+    return ArrayData(Utf8Type(false), length(strs),
+        [BufferSlice(), AC._databuffer(offsets), AC._databuffer(bytes)];
+        nullcount=0)
+end
+
+"""
+Fold one column's statistics: (null count, min, max) with `nothing` bounds
+for empty, all-null, or unsupported-type columns. Values normalize into the
+union's members: Int64 for integral scalars (dates, times, timestamps, and
+durations are integral in the value domain), Float64, String, Bool.
+"""
+function _statfold(f::Field, d::ArrayData)
+    nc = AC.nullcount(d)
+    t = f.type
+    stat = t isa DictionaryType ? t.valuetype : t
+    supported = stat isa IntType ? (stat.signed || stat.bits < 64) :
+        stat isa FloatType || stat isa BoolType || stat isa Utf8Type ||
+        stat isa DateType || stat isa TimeType || stat isa TimestampType ||
+        stat isa DurationType
+    supported || return nc, nothing, nothing
+    lo = hi = nothing
+    for i = 1:d.len
+        AC.isvalid_at(d, i) || continue
+        v = AC.getvalue(f, d, i)
+        v isa NamedTuple && return nc, nothing, nothing
+        if lo === nothing
+            lo = v
+            hi = v
+        else
+            isless(v, lo) && (lo = v)
+            isless(hi, v) && (hi = v)
+        end
+    end
+    _statnorm(v) = v isa Bool ? v : v isa AbstractString ? String(v) :
+        v isa AbstractFloat ? Float64(v) : Int64(v)
+    return nc, lo === nothing ? nothing : _statnorm(lo),
+        hi === nothing ? nothing : _statnorm(hi)
+end
+
+"One statistics record batch (the official layout) for one data batch."
+function _statsbatch(statssch::Schema, nrows::Int64,
+    colstats::Vector{Tuple{Int,Int64,Any,Any}})
+    rows = 1 + length(colstats)               # batch-level row + per-column rows
+    colvalid = vcat(false, trues(length(colstats)))
+    colvals = vcat(Int32(0), Int32[Int32(c[1] - 1) for c in colstats])
+    columndata = ArrayData(IntType(32, true), rows,
+        [AC._databuffer(_bitmapbytes(colvalid)), AC._databuffer(colvals)];
+        nullcount=1)
+    keyidx = Int32[]
+    typeids = Int8[]
+    offsets = Int32[]
+    i64s = Int64[]
+    f64s = Float64[]
+    strs = String[]
+    bools = Bool[]
+    mapoffsets = Int32[0]
+    function pushstat!(key::String, v)
+        push!(keyidx, Int32(findfirst(==(key), STATS_KEYPOOL) - 1))
+        if v isa Bool
+            push!(typeids, Int8(3)); push!(offsets, Int32(length(bools))); push!(bools, v)
+        elseif v isa String
+            push!(typeids, Int8(2)); push!(offsets, Int32(length(strs))); push!(strs, v)
+        elseif v isa Float64
+            push!(typeids, Int8(1)); push!(offsets, Int32(length(f64s))); push!(f64s, v)
+        else
+            push!(typeids, Int8(0)); push!(offsets, Int32(length(i64s))); push!(i64s, Int64(v))
+        end
+        return nothing
+    end
+    pushstat!(STATS_ROW_COUNT, nrows)
+    push!(mapoffsets, Int32(length(keyidx)))
+    for (_, nc, lo, hi) in colstats
+        pushstat!(STATS_NULL_COUNT, nc)
+        lo === nothing || pushstat!(STATS_MIN, lo)
+        hi === nothing || pushstat!(STATS_MAX, hi)
+        push!(mapoffsets, Int32(length(keyidx)))
+    end
+    nentries = length(keyidx)
+    pool = _utf8data(String.(STATS_KEYPOOL))
+    keydata = ArrayData(DictionaryType(IntType(32, true), Utf8Type(false), false),
+        nentries, [BufferSlice(), AC._databuffer(keyidx)];
+        dictionary=pool, nullcount=0)
+    booldata = ArrayData(BoolType(), length(bools),
+        [BufferSlice(), AC._databuffer(_bitmapbytes(bools))]; nullcount=0)
+    valuedata = ArrayData(UnionType(AC.DenseMode, Int8[0, 1, 2, 3]), nentries,
+        [AC._databuffer(typeids), AC._databuffer(offsets)];
+        children=[ArrayData(IntType(64, true), length(i64s),
+                [BufferSlice(), AC._databuffer(i64s)]; nullcount=0),
+            ArrayData(FloatType(64), length(f64s),
+                [BufferSlice(), AC._databuffer(f64s)]; nullcount=0),
+            _utf8data(strs), booldata],
+        nullcount=0)
+    entriesdata = ArrayData(StructType(), nentries, [BufferSlice()];
+        children=[keydata, valuedata], nullcount=0)
+    mapdata = ArrayData(MapType(false), rows,
+        [BufferSlice(), AC._databuffer(mapoffsets)];
+        children=[entriesdata], nullcount=0)
+    return AC.RecordBatch(statssch, ArrayData[columndata, mapdata], rows)
+end
+
+"""
+    withstatistics(sch, batches) -> Schema
+
+The writer half: fold per-batch column statistics, serialize them as one
+IPC stream in the OFFICIAL statistics value layout (through this very
+writer — statistics ARE Arrow data), and return a schema whose metadata
+carries the base64 blob under `$STATS_KEY`. `writefile(withstatistics(sch,
+batches), batches)` is the whole integration — statistics are pure schema
+metadata; the writer itself is untouched.
+"""
+function withstatistics(sch::Schema, batches::AbstractVector{AC.RecordBatch})
+    statssch = _statsschema()
+    statsbatches = AC.RecordBatch[]
+    for batch in batches
+        colstats = Tuple{Int,Int64,Any,Any}[]
+        for (j, (f, col)) in enumerate(zip(sch.fields, batch.columns))
+            nc, lo, hi = _statfold(f, col)
+            push!(colstats, (j, nc, lo, hi))
+        end
+        push!(statsbatches, _statsbatch(statssch, batch.nrows, colstats))
+    end
+    blob = Base64.base64encode(writestream(statssch, statsbatches))
+    metadata = Dict{String,String}(something(sch.metadata, Dict{String,String}()))
+    metadata[STATS_KEY] = blob
+    return Schema(collect(Field, sch.fields); metadata=metadata,
+        endianness=sch.endianness)
+end
+
+statsfile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
+    compress::Symbol=:none) =
+    writefile(withstatistics(sch, batches), batches; compress=compress)
+
+# ---- read + prune ---------------------------------------------------------
+
+"""
+Parse the statistics blob back through this reader. Any failure — missing
+key, corrupt base64, corrupt stream, wrong batch count — degrades to
+`nothing`: no pruning, never an error. Returns per-batch `Dict{Int,...}`
+column stats (1-based indices) with `missing` bounds where absent.
+"""
+function _readstats(metadata, nbatches::Int)
+    metadata === nothing && return nothing
+    blob = get(Dict(metadata), STATS_KEY, nothing)
+    blob === nothing && return nothing
+    try
+        stream = readstream(Base64.base64decode(blob))
+        length(stream.batches) == nbatches || return nothing
+        colfield, mapfield = stream.schema.fields
+        out = map(stream.batches) do sb
+            cols = materialize(colfield, sb.columns[1])
+            maps = materialize(mapfield, sb.columns[2])
+            rows = missing
+            d = Dict{Int,NamedTuple{(:nullcount, :min, :max),
+                Tuple{Union{Missing,Int64},Any,Any}}}()
+            for (colref, pairs) in zip(cols, maps)
+                stats = Dict{String,Any}(String(k) => v for (k, v) in pairs)
+                if colref === missing
+                    rc = get(stats, STATS_ROW_COUNT, missing)
+                    rc === missing || (rows = Int64(rc))
+                    continue
+                end
+                d[Int(colref) + 1] = (nullcount=get(stats, STATS_NULL_COUNT, missing),
+                    min=get(stats, STATS_MIN, missing),
+                    max=get(stats, STATS_MAX, missing))
+            end
+            (rows=rows, cols=d)
+        end
+        return out
+    catch e
+        e isa Union{ValidationError,ArgumentError} && return nothing
+        rethrow()
+    end
+end
+
+"Bytewise successor of a prefix, or `nothing` when none exists."
+function _nextprefix(s::String)
+    bytes = collect(codeunits(s))
+    while !isempty(bytes)
+        if bytes[end] < 0xff
+            bytes[end] += 0x01
+            return String(bytes)
+        end
+        pop!(bytes)
+    end
+    return nothing
+end
+
+_statcmp(f, a, b) = try
+    f(a, b)
+catch
+    true   # incomparable literal/stat types: never prune
+end
+
+"""
+One-sided may-contain evaluation of a scan predicate against one batch's
+column statistics: `false` means PROVABLY no row qualifies (prune); `true`
+means fetch and let the residual filter decide. Comparisons follow SQL
+missing semantics — null rows never satisfy a comparison, so an all-null
+column proves compare/`in_` predicates false.
+"""
+function _maypass(e::Tables.ScanExpr, stats, names, rowcount::Union{Missing,Int64})
+    lookup(col) = begin
+        i = Tables._findcol(names, col.ref)
+        i === nothing ? nothing : get(stats, i, nothing)
+    end
+    allnull(s) = s.nullcount !== missing && rowcount !== missing &&
+        s.nullcount >= rowcount
+    if e isa Tables.Cmp
+        s = lookup(e.lhs)
+        s === nothing && return true
+        allnull(s) && return false
+        (s.min === missing || s.max === missing) && return true
+        v = e.rhs
+        e.op == Tables.OP_EQ &&
+            return _statcmp(!isless, v, s.min) && _statcmp(!isless, s.max, v)
+        e.op == Tables.OP_LT && return _statcmp(isless, s.min, v)
+        e.op == Tables.OP_LE && return _statcmp(!isless, v, s.min)
+        e.op == Tables.OP_GT && return _statcmp(isless, v, s.max)
+        return _statcmp(!isless, s.max, v)          # OP_GE
+    elseif e isa Tables.In
+        s = lookup(e.lhs)
+        s === nothing && return true
+        allnull(s) && return false
+        (s.min === missing || s.max === missing) && return true
+        return any(_statcmp(!isless, v, s.min) && _statcmp(!isless, s.max, v)
+                   for v in e.values)
+    elseif e isa Tables.IsNull
+        s = lookup(e.lhs)
+        s === nothing && return true
+        s.nullcount === missing && return true
+        return e.negated ? !allnull(s) : s.nullcount > 0
+    elseif e isa Tables.StrPred
+        e.kind == Tables.STR_STARTSWITH || return true
+        s = lookup(e.lhs)
+        s === nothing && return true
+        (s.min === missing || s.max === missing) && return true
+        _statcmp(!isless, s.max, e.s) || return false
+        next = _nextprefix(e.s)
+        return next === nothing || _statcmp(isless, s.min, next)
+    elseif e isa Tables.AndExpr
+        return all(_maypass(a, stats, names, rowcount) for a in e.args)
+    elseif e isa Tables.OrExpr
+        return any(_maypass(a, stats, names, rowcount) for a in e.args)
+    elseif e isa Tables.NotExpr
+        inner = e.arg
+        if inner isa Tables.Cmp && inner.op == Tables.OP_EQ
+            s = lookup(inner.lhs)
+            s === nothing && return true
+            (s.min === missing || s.max === missing) && return true
+            # everything equals v only when min == max == v
+            return !(isequal(s.min, inner.rhs) && isequal(s.max, inner.rhs))
+        end
+        return true
+    elseif e isa Tables.AlwaysFalse
+        return false
+    end
+    return true    # AlwaysTrue, OpNode, unknown growth: never prune
 end
 
 # ---------------------------------------------------------------------------
@@ -915,7 +1252,113 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     println("Byte-range scan checks passed.")
 end
 
+function _stats_main()
+    # Two batches with DISJOINT ranges so predicates can discriminate:
+    # batch 1: x ∈ 1:5, s ∈ "apple".."eagle";  batch 2: x ∈ 6:10, s ∈ "fig".."jam".
+    t1 = (x=Int64[1, 2, 3, 4, 5], s=["apple", "berry", "cedar", "date", "eagle"])
+    t2 = (x=Int64[6, 7, 8, 9, 10], s=["fig", "grape", "hazel", "iris", "jam"])
+    io = IOBuffer()
+    Arrow.write(io, Tables.partitioner([t1, t2]); file=false)
+    source = readstream(take!(io))
+    sbytes = statsfile(source.schema, source.batches)
+    saf = readfile(copy(sbytes))
+    sfull = _fulltable(saf)
+
+    # The statistics blob is itself a valid stream this reader accepts, and
+    # a file carrying it stays readable by this reader AND Arrow.jl 2.x.
+    stats = _readstats(saf.schema.metadata, 2)
+    @assert stats !== nothing
+    @assert stats[1].rows == 5 && stats[2].rows == 5
+    @assert stats[1].cols[1].min == 1 && stats[1].cols[1].max == 5
+    @assert stats[2].cols[2].min == "fig" && stats[2].cols[2].max == "jam"
+    filetbl = Arrow.Table(IOBuffer(copy(sbytes)))
+    @assert length(Tables.getcolumn(Tables.columns(filetbl), 1)) == 10
+    println("statistics round-trip the official value layout (Core + 2.x carry) ✓")
+
+    # Differential correctness with pruning active, whole-file and ranged.
+    prunescans = Tables.Scan[
+        Tables.Scan(filter=Tables.col(:x) > 7),
+        Tables.Scan(select=(:s,), filter=Tables.col(:x) <= 3),
+        Tables.Scan(filter=Tables.col(:x) > 100),
+        Tables.Scan(filter=Tables.in_(Tables.col(:x), (2, 4))),
+        Tables.Scan(filter=Tables.isnull(Tables.col(:x))),
+        Tables.Scan(filter=Tables.startswith(Tables.col(:s), "i")),
+        Tables.Scan(filter=(Tables.col(:x) > 2) & (Tables.col(:x) < 9)),
+        Tables.Scan(filter=!(Tables.col(:x) == 3)),
+    ]
+    for scan in prunescans
+        want = Tables.finish(sfull, scan)
+        @assert _tables_equal(Tables.read(saf, scan), want) sprint(show, scan)
+        @assert _tables_equal(
+            Tables.read(RangedFile(RangedSource(copy(sbytes))), scan), want) sprint(show, scan)
+    end
+    println("pruned scans stay differentially exact (whole-file + ranged) ✓")
+
+    # Fetch proof: x > 7 prunes batch 1 — its block metadata AND body are
+    # never fetched over a ranged source.
+    block1 = saf.recordblocks[1]
+    logp, srcp = countingsource(sbytes)
+    got = Tables.read(RangedFile(srcp; tailbytes=256, coalesce_gap=0),
+        Tables.Scan(filter=Tables.col(:x) > 7))
+    @assert isequal(collect(Any, got.x), Any[8, 9, 10])
+    @assert !any(_fetched(logp, block1[1] + k) for k = 0:8:(block1[2] + block1[3] - 1))
+    println("stat-pruned batches are never fetched, metadata included ✓")
+
+    # Decode proof (whole-file): semantic corruption inside a pruned batch
+    # stays invisible with statistics, and is caught without them.
+    soff, slen = _bufferposition(sbytes, 1, 4)          # batch 1 `s` offsets
+    @assert slen > 8
+    scorrupt = copy(sbytes)
+    scorrupt[(soff + 5):(soff + 8)] .= reinterpret(UInt8, Int32[Int32(2)^30])
+    scanx = Tables.Scan(select=(:s,), filter=Tables.col(:x) > 7)
+    got = Tables.read(readfile(copy(scorrupt)), scanx)
+    @assert isequal(collect(Any, got.s), Any["hazel", "iris", "jam"])
+    plainbytes = writefile(source.schema, source.batches)
+    pcorrupt = copy(plainbytes)
+    poff, _ = _bufferposition(plainbytes, 1, 4)
+    pcorrupt[(poff + 5):(poff + 8)] .= reinterpret(UInt8, Int32[Int32(2)^30])
+    @assert _rejects(() -> Tables.read(readfile(copy(pcorrupt)), scanx))
+    println("pruning skips decode; without statistics the same scan must decode ✓")
+
+    # Malformed statistics degrade to no pruning, never to an error.
+    badmeta = Dict{String,String}(STATS_KEY => "!!not-base64!!")
+    badsch = Schema(collect(Field, source.schema.fields); metadata=badmeta,
+        endianness=source.schema.endianness)
+    badbytes = writefile(badsch, source.batches)
+    got = Tables.read(readfile(copy(badbytes)), Tables.Scan(filter=Tables.col(:x) > 7))
+    @assert isequal(collect(Any, got.x), Any[8, 9, 10])
+    println("malformed statistics degrade to no pruning ✓")
+
+    # The trust model, pinned (design §3): wide lies only cost pruning;
+    # narrow lies silently LOSE rows — statistics are trusted-for-
+    # completeness, exactly like Parquet row-group stats.
+    function liarfile(lo2, hi2)
+        statssch = _statsschema()
+        lie = AC.RecordBatch[
+            _statsbatch(statssch, Int64(5),
+                [(1, Int64(0), Int64(1), Int64(5)), (2, Int64(0), "apple", "eagle")]),
+            _statsbatch(statssch, Int64(5),
+                [(1, Int64(0), lo2, hi2), (2, Int64(0), "fig", "jam")])]
+        blob = Base64.base64encode(writestream(statssch, lie))
+        liesch = Schema(collect(Field, source.schema.fields);
+            metadata=Dict{String,String}(STATS_KEY => blob),
+            endianness=source.schema.endianness)
+        return writefile(liesch, source.batches)
+    end
+    wide = Tables.read(readfile(liarfile(Int64(-1000), Int64(1000))),
+        Tables.Scan(filter=Tables.col(:x) > 8))
+    @assert isequal(collect(Any, wide.x), Any[9, 10])
+    narrow = Tables.read(readfile(liarfile(Int64(6), Int64(7))),
+        Tables.Scan(filter=Tables.col(:x) > 8))
+    @assert isempty(narrow.x)          # rows 9, 10 silently lost: the trust boundary
+    println("wide lies cost pruning only; narrow lies lose rows (trust model pinned) ✓")
+
+    println()
+    println("Statistics write/prune checks passed.")
+end
+
 if abspath(PROGRAM_FILE) == abspath(@__FILE__)
     filebytes, af, full = _scan_main()
     _ranged_main(filebytes, af, full)
+    _stats_main()
 end

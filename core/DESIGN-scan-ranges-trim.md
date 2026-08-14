@@ -191,14 +191,18 @@ standardized upstream. Proposal, kept deliberately conservative:
   only. Append (§ report) must recompute or drop — dropping with a warning
   is the honest v1.
 - Reader: prune under `Cmp`/`In`/`IsNull` (and `StrPred` prefix ranges for
-  `startswith`) with three-valued logic — a batch survives unless the
-  predicate is provably false for ALL rows; the filter always stays in the
-  residual (pruning is inexact by design). Missing/foreign/stale statistics
-  degrade to "no pruning", never to wrong answers; `validate_semantic`
-  still guards decoded data, so lying statistics can suppress rows only if
-  they lie in the conservative direction — worth one adversarial test:
-  stats that contradict decoded content must not corrupt exactness of the
-  residual pipeline (they cannot, because the residual filter re-runs).
+  `startswith`) with one-sided may-contain logic — a batch survives unless
+  the predicate is provably false for ALL rows; the filter always stays in
+  the residual (pruning is inexact by design). Missing or MALFORMED
+  statistics degrade to "no pruning", never to an error.
+- **Trust model, stated plainly (P3 pinned this)**: statistics are
+  trusted-for-completeness, exactly like Parquet row-group stats. The
+  residual re-filter protects one direction only — batches kept by lying
+  stats still filter row-exactly. The other direction has no net: stats
+  that under-report a range cause false EXCLUSION, and excluded batches
+  are never fetched, so their qualifying rows are silently lost. Wide
+  (conservative) lies cost pruning, never correctness; narrow lies lose
+  rows. The acceptance battery pins all three behaviors.
 
 ---
 
@@ -238,15 +242,22 @@ README ("Trim-compile support") and they bind this design too:
 
 ## 5. Phasing (each phase codex-reviewed per the standing protocol)
 
-- **P1 — Scan on the prove-out** (small): `skipfield!`, `Tables.apply` for
-  `ArrowFile`/`readstream` (Stage A semantics), limit/offset batch
-  skipping, closed-ladder filter evaluator + differential tests against
-  `Tables.finish`-only execution.
-- **P2 — RangedSource** (medium): the fetcher contract, planner, sparse
-  region assembly in `readfile`, counting-source differential tests
-  (bytes/requests), mmap/vector adapters. Proves the fetch-count model.
-- **P3 — statistics** (small-medium): writer fold + footer metadata key,
-  reader pruning, adversarial stats tests. Unlocks tail-fetch-only pruning.
+- **P1 — Scan on the prove-out** — **IMPLEMENTED** (`examples/scan_ranges.jl`):
+  `skipfield!`, `Tables.apply(::ArrowFile, scan)` with Stage-A semantics,
+  exact limit/offset batch skipping, resolved residual selections, and the
+  differential battery with corruption-backed never-decoded proofs.
+- **P2 — RangedSource** — **IMPLEMENTED**: the `RangedSource{F}` contract,
+  `RangedFile` fetch protocol, coalescing planner, `SparseBody` decode
+  (`DecodeCursor{B}`), counting-source proofs (14% of bytes for a narrow
+  column over a 2.3MB file; never-fetched proofs for skipped columns,
+  window-excluded batches, and unneeded dictionary bodies).
+- **P3 — statistics** — **IMPLEMENTED**: `withstatistics`/`statsfile` fold
+  the official statistics value layout into `JuliaArrow:batch_statistics.v1`
+  (footer schema metadata, base64-wrapped IPC stream, one statistics batch
+  per data batch, serialized through this very writer); `_maypass`
+  may-contain pruning wired into both applies (ranged pruning happens
+  before the block-metadata pass, so pruned batches cost zero fetches);
+  acceptance pins exactness, degradation, and both lie directions.
 - **P4 (production)**: `ArrowCloudStoreExt`, Stage B facade `apply`,
   upstream-placement tracking for statistics.
 
