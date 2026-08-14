@@ -51,8 +51,9 @@ returned table **keeps them under source names and leaves `select` in the
 residual** — `finish` then filters, projects, renames, and converts. This is
 the only correct composition: if the adapter consumed `select` while leaving
 `filter` in the residual, `finish` could not evaluate predicates over
-already-dropped columns. Simple, correct, and captures the dominant win
-(unselected columns cost zero decode — and with §2, zero bytes).
+already-dropped columns. Simple, correct, and captures the dominant win:
+unselected columns cost zero decode and add zero planned body bytes. Tail reads
+and coalescing may still over-read them under §2's explicit policy.
 
 Two refinements the P1 prove-out's differential tests forced (both now
 implemented in `examples/scan_ranges.jl`):
@@ -251,10 +252,11 @@ standardized upstream. The prove-out convention is deliberately conservative:
   trusted-for-completeness, exactly like Parquet row-group stats. The
   residual re-filter protects one direction only — batches kept by lying
   stats still filter row-exactly. The other direction has no net: stats
-  that under-report a range cause false EXCLUSION, and excluded batches
-  are never fetched, so their qualifying rows are silently lost. Wide
-  (conservative) lies cost pruning, never correctness; narrow lies lose
-  rows. The acceptance battery pins all three behaviors.
+  that under-report a range cause false EXCLUSION. Excluded batches are not
+  decoded and cause no dedicated metadata/body range request, so their
+  qualifying rows are silently lost. Tail/coalescing over-read does not restore
+  them. Wide (conservative) lies cost pruning, never correctness; narrow lies
+  lose rows. The acceptance battery pins all three behaviors.
 
 ---
 
@@ -310,7 +312,8 @@ support") still constrain the production form:
   (footer schema metadata, base64-wrapped IPC stream, one statistics batch
   per data batch, serialized through this very writer); `_maypass`
   may-contain pruning wired into both applies (ranged pruning happens
-  before the block-metadata pass, so pruned batches cost zero fetches);
+  before the block-metadata pass, so pruned batches cause no dedicated
+  metadata/body request; configured tail/coalescing may over-read them);
   acceptance pins exactness, degradation, and both lie directions.
 - **P4 (production)**: `ArrowCloudStoreExt`, Stage B facade `apply`,
   upstream-placement tracking for statistics.

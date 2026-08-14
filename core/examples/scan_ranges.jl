@@ -58,8 +58,8 @@ isdefined(Tables, :Scan) ||
 Advance the cursor past one field's node and buffers — the exact traversal
 `decodefield` performs, with every buffer-table invariant still enforced
 (`_buffermeta!`), but no body access: nothing is sliced, decompressed,
-validated, or kept. Over a ranged source (§2) the skipped bytes are never
-even fetched.
+validated, or kept. Over a ranged source (§2), no body range is planned for
+the skipped bytes; tail reads and coalescing may still over-read them.
 """
 function skipfield!(f::Field, c::DecodeCursor)
     t = f.type
@@ -188,7 +188,6 @@ function _planminbytes(role, spec, node, len::Int64)
         end
         return Int64(0)
     elseif role == AC.OFFSETS
-        len == 0 && node.length == 0 && return Int64(0)
         count = _planadd(node.length, Int64(1), "planned offset count")
         return _planmul(count, Int64(spec.offsetwidth), "planned offsets-buffer size")
     elseif role == AC.ELEMENT_OFFSETS || role == AC.SIZES
@@ -202,8 +201,19 @@ function _planminbytes(role, spec, node, len::Int64)
     return Int64(0)
 end
 
-function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
+function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8,
+    top::Bool=false)
     node = takenode!(c)
+    t = f.type
+    if t isa NullType
+        node.null_count == node.length || throw(ValidationError(
+            "Null field-node null count must equal its length"))
+    elseif t isa UnionType
+        node.null_count == 0 || throw(ValidationError(
+            "Union field-node null count must be zero"))
+    end
+    top && !f.nullable && node.null_count > 0 && throw(ValidationError(
+        "non-nullable top-level field declares a positive null count"))
     spec = layoutspec(f.type)
     for role in spec.buffers
         _, len = _buffermeta!(c)
@@ -218,17 +228,19 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
     end
     f.type isa DictionaryType && return node.length
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
-    childlens = Int64[_validateplannedfield!(f.children[i], c, codec)
+    childlens = Int64[_validateplannedfield!(f.children[i], c, codec, false)
                       for i = 1:nchildren]
-    t = f.type
     if t isa FixedSizeListType
         need = _planmul(node.length, Int64(t.listsize),
             "fixed-size-list child length")
         childlens[1] >= need || throw(ValidationError(
             "fixed-size-list child is shorter than its parent extent"))
-    elseif t isa StructType || (t isa UnionType && t.mode == AC.SparseMode)
+    elseif t isa StructType
         all(>=(node.length), childlens) || throw(ValidationError(
-            "struct or sparse-union child is shorter than its parent extent"))
+            "struct child is shorter than its parent extent"))
+    elseif t isa UnionType && t.mode == AC.SparseMode
+        all(==(node.length), childlens) || throw(ValidationError(
+            "sparse-union child length does not equal its parent length"))
     elseif t isa RunEndEncodedType
         node.null_count == 0 || throw(ValidationError(
             "REE parent null count must be zero"))
@@ -251,7 +263,7 @@ function _validatebodyplan(header::Meta.RecordBatch, fields, limits::Limits,
     cursor = DecodeCursor(header.nodes, header.buffers, BufferSlice(), limits;
         codec=codec)
     for (j, f) in enumerate(fields)
-        mask[j] ? _validateplannedfield!(f, cursor, codec) : skipfield!(f, cursor)
+        mask[j] ? _validateplannedfield!(f, cursor, codec, true) : skipfield!(f, cursor)
     end
     finishcursor!(cursor)
     return nothing
@@ -1449,6 +1461,21 @@ function _setnodelength!(bytes::Vector{UInt8}, block::NTuple{3,Int64},
     return bytes
 end
 
+function _setnodenullcount!(bytes::Vector{UInt8}, block::NTuple{3,Int64},
+    nodeindex::Int, count::Int64)
+    meta = copy(bytes[(block[1] + 9):(block[1] + block[2])])
+    msg = _vtable(meta, Int64(_vu32(meta, 0)))
+    header = _headertable(meta, msg)
+    kind = _vu8(meta, _vfield(msg, 1, 1; required=true))
+    rb = kind == UInt8(2) ?
+        _vtable(meta, _vref(header, 1; required=true)) : header
+    start, n = _vvector(rb, 1, 16; required=true)
+    1 <= nodeindex <= n || throw(BoundsError(1:n, nodeindex))
+    _write_i64!(meta, start + (nodeindex - 1) * 16 + 8, count)
+    copyto!(bytes, block[1] + 9, meta, 1, length(meta))
+    return bytes
+end
+
 "File fixture carrying Arrow 0.17's V4 message-level compression marker."
 function _legacyv4file()
     stream = _experimental_v4_stream(Int64(42))
@@ -1875,6 +1902,29 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert _rejects(() -> Tables.read(RangedFile(srcvalid;
         tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:x,))))
     @assert !_fetched(logvalid, validpos)
+    validbudget = AllocationBudget(validfile.limits.max_total_allocated_bytes)
+    validmsg = _blockmessage(validfile.region, validfile.recordblocks[1],
+        validfile.dataend, validfile.limits, validbudget)
+    validfield = validfile.fields[1]
+    strictfield = Field(validfield.name, validfield.type, false,
+        validfield.metadata, validfield.children)
+    validheader = validmsg.msg.header::Meta.RecordBatch
+    validcodec = _batchcodec(validheader.compression, validmsg.version)
+    @assert _rejects(() -> _validatebodyplan(validheader, (strictfield,),
+        validfile.limits, validcodec, Bool[true]))
+
+    emptylistio = IOBuffer()
+    Arrow.write(emptylistio, (x=[String[]],); file=false)
+    emptylistbytes = writefile(readstream(take!(emptylistio)))
+    emptylistfile = readfile(copy(emptylistbytes))
+    emptylistblock = emptylistfile.recordblocks[1]
+    bademptyoffset = _setbufferlength!(copy(emptylistbytes), emptylistblock,
+        4, Int64(0))
+    parentoffsetpos, _ = _bufferposition(emptylistbytes, 1, 2)
+    logemptyoffset, srcemptyoffset = countingsource(bademptyoffset)
+    @assert _rejects(() -> Tables.read(RangedFile(srcemptyoffset;
+        tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:x,))))
+    @assert !_fetched(logemptyoffset, parentoffsetpos)
 
     badoffsets = _setbufferlength!(copy(filebytes), block1, 8, Int64(4))
     offsetpos, _ = _bufferposition(filebytes, 1, 8)
@@ -1889,6 +1939,29 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert _rejects(() -> Tables.read(RangedFile(srcstruct;
         tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:structs,))))
     @assert !_fetched(logstruct, structpos)
+
+    nullfield = Field("n", NullType())
+    sparsetype = UnionType(AC.SparseMode, Int8[0])
+    sparsefield = Field("u", sparsetype; children=[nullfield])
+    nulldata = ArrayData(NullType(), 1, BufferSlice[]; nullcount=1)
+    sparsedata = ArrayData(sparsetype, 1, [AC._databuffer(Int8[0])];
+        children=[nulldata], nullcount=0)
+    sparseschema = Schema([sparsefield])
+    sparsebytes = writefile(sparseschema,
+        [AC.RecordBatch(sparseschema, [sparsedata], 1)])
+    sparsefile = readfile(copy(sparsebytes))
+    sparseblock = sparsefile.recordblocks[1]
+    sparsepos, _ = _bufferposition(sparsebytes, 1, 1)
+    sparsefailures = (
+        _setnodelength!(copy(sparsebytes), sparseblock, 2, Int64(2)),
+        _setnodenullcount!(copy(sparsebytes), sparseblock, 1, Int64(1)),
+        _setnodenullcount!(copy(sparsebytes), sparseblock, 2, Int64(0)))
+    for broken in sparsefailures
+        logsparse, srcsparse = countingsource(broken)
+        @assert _rejects(() -> Tables.read(RangedFile(srcsparse;
+            tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:u,))))
+        @assert !_fetched(logsparse, sparsepos)
+    end
 
     zfile = readfile(copy(zbytes))
     zblock = zfile.recordblocks[1]
