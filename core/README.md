@@ -39,7 +39,7 @@ listed under Honest status.
 | `examples/ipc_read.jl` | Checked IPC stream framing, a bounded metadata verifier, metadata-to-Core mapping, dictionary state, and one registry-driven decoder over real 2.x-written streams |
 | `examples/ipc_write.jl` | The write half over the same registry: Core-to-metadata mapping, one generic registry-driven encoder, replacement-on-change dictionary batches, per-buffer compression, and the file format (Block index + Footer) with a lazy random-access `ArrowFile` reader |
 | `examples/cdata.jl` | Full mapped C Data format parity plus bidirectional `ArrowArrayStream`, zero-copy ownership, move semantics, and exactly-once release tests |
-| `REVIEW-codex-r1.md` through `REVIEW-codex-r14.md` | Adversarial review findings and the disposition of each item |
+| `REVIEW-codex-r1.md` through `REVIEW-codex-r15.md` | Adversarial review findings and the disposition of each item |
 
 ## Run it
 
@@ -187,8 +187,9 @@ id; identity-shared pools re-encode per field. Canonical empty offset arrays
 materialize their required terminal zero on the wire. The file format refuses
 pools that change identity across batches (one dictionary batch per id).
 `readfile` verifies both magics, the leading and footer schemas, cumulative
-footer work, and every Block's extents and overlap before use; `ArrowFile`
-decodes record batches lazily by footer index — each `getindex` runs with a fresh
+footer work, and every Block's frame, Message kind, wire-buffer extents, and
+overlap before optional-EOS classification; `ArrowFile` decodes record batches
+lazily by footer index — each `getindex` runs with a fresh
 allocation budget and codec contexts over the shared, eagerly-decoded
 dictionary set, so concurrent reads need no coordination. An `mmapregion`
 input exercises the same path over a mapped file.
