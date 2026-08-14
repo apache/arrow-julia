@@ -588,10 +588,12 @@ metadata, dictionary bodies only for decode-set ids, and per-buffer body
 ranges for exactly the decode set, coalesced under `coalesce_gap`.
 
 Trust note, stated loudly: the ranged reader treats the FOOTER as the sole
-schema authority — it does not fetch and cross-check the leading schema
-message or inspect the optional EOS marker. Footer Block non-overlap,
-resource limits, message kinds, and every RecordBatch node/buffer invariant
-are still validated from fetched metadata before any body fetch.
+schema authority — it does not parse and cross-check the leading schema
+message or inspect the optional EOS marker. Head, tail, and coalesced requests
+may physically over-read unrequested bytes. The full Footer Block index and
+global features/message limit are checked up front. Per-record limits stay
+lazy; every surviving candidate's metadata-only plan is validated before any
+planned body range is requested.
 """
 struct RangedFile{F}
     src::RangedSource{F}
@@ -660,17 +662,9 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     mask = falses(length(names))
     mask[decodeidx] .= true
 
-    # Footer Blocks remain mutually exclusive and bounded even though the
-    # leading schema and optional EOS bytes are not fetched.
+    # Footer Blocks remain mutually exclusive and bounded without parsing the
+    # leading schema or optional EOS bytes. A tail request may over-read them.
     _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
-    for block in vcat(dictblocks, recordblocks)
-        _, metalen, bodylen = block
-        declared = metalen - 8
-        0 < declared <= limits.max_metadata_bytes || throw(ValidationError(
-            "metadata length $declared outside (0, $(limits.max_metadata_bytes)]"))
-        0 <= bodylen <= limits.max_body_bytes || throw(ValidationError(
-            "body length $bodylen outside [0, $(limits.max_body_bytes)]"))
-    end
 
     # Statistics pruning happens FIRST (design §3): the stats live in the
     # footer schema's metadata, so pruned batches never even get their
@@ -691,6 +685,16 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     # SURVIVING record blocks; bodies come later and only for what the scan
     # needs.
     metablocks = vcat(dictblocks, NTuple{3,Int64}[recordblocks[i] for i in recidxs])
+    # Match ArrowFile's lazy record limits: statistics-pruned records never
+    # become candidates. Every candidate is bounded before its metadata fetch.
+    for block in metablocks
+        _, metalen, bodylen = block
+        declared = metalen - 8
+        0 < declared <= limits.max_metadata_bytes || throw(ValidationError(
+            "metadata length $declared outside (0, $(limits.max_metadata_bytes)]"))
+        0 <= bodylen <= limits.max_body_bytes || throw(ValidationError(
+            "body length $bodylen outside [0, $(limits.max_body_bytes)]"))
+    end
     metaspans = _fetchspans(src,
         NTuple{2,Int64}[(bl[1], bl[2]) for bl in metablocks], rf.coalesce_gap;
         budget=budget, what="metadata range fetch")
@@ -705,8 +709,10 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
                 "footer record block is not a record batch"))
         v == version ||
             throw(ValidationError("IPC metadata version changes within the file"))
+        rejectexperimentalcompression(msg, v, header_type)
         if !expected_dict
-            _recordbatchmeta(msg.header::Meta.RecordBatch, fields, limits, block[3])
+            _recordbatchmeta(msg.header::Meta.RecordBatch, fields, limits,
+                block[3])
         end
         blockmeta[i] = (msg, v)
     end
@@ -744,8 +750,16 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
             throw(ValidationError("the file format carries one dictionary batch per id"))
         push!(seenids, header.id)
         _recordbatchmeta(header.data, (dictvaluefields[header.id],), limits, block[3])
+        _batchcodec(header.data.compression, blockmeta[i][2])
         header.id in needed && push!(wanted_dict, i)
     end
+    for (p, _, _) in window
+        _, v = blockmeta[length(dictblocks) + p]
+        _batchcodec(headers[p].compression, v)
+    end
+    missingids = setdiff(needed, seenids)
+    isempty(missingids) || throw(ValidationError(
+        "record batch references dictionary id $(first(missingids)) before its dictionary batch"))
     state = DecodeState(budget)
     try
         if !isempty(wanted_dict)
@@ -1286,6 +1300,45 @@ function _bufferposition(bytes::Vector{UInt8}, i::Int, bufindex::Int)
     return bodystart + Int64(buf.offset), Int64(buf.length)
 end
 
+"File fixture carrying Arrow 0.17's V4 message-level compression marker."
+function _legacyv4file()
+    stream = _experimental_v4_stream(Int64(42))
+    frames = _frameinfo(stream)
+    schemaframe = stream[frames[1].frame]
+    recordframe = stream[frames[2].frame]
+    metalen = Int64(8 + length(frames[2].metadata))
+    bodylen = Int64(length(recordframe)) - metalen
+
+    out = UInt8[]
+    append!(out, FILE_MAGIC)
+    append!(out, zeros(UInt8, 2))
+    append!(out, schemaframe)
+    recordoffset = Int64(length(out))
+    append!(out, recordframe)
+    append!(out, reinterpret(UInt8, UInt32[CONTINUATION, UInt32(0)]))
+
+    sch = Schema(Field[Field("x", IntType(64, true); nullable=true)])
+    fielddictids = assigndictids(sch.fields)
+    b = FB.Builder(512)
+    schoff = _metaschema!(b, sch, fielddictids, Int64[])
+    Meta.footerStartDictionariesVector(b, 0)
+    dictvec = FB.endvector!(b, 0)
+    Meta.footerStartRecordBatchesVector(b, 1)
+    Meta.createBlock(b, recordoffset, Int32(metalen), bodylen)
+    recordvec = FB.endvector!(b, 1)
+    FB.startobject!(b, 5)
+    Meta.footerAddVersion(b, Meta.MetadataVersion.V4)
+    Meta.footerAddSchema(b, schoff)
+    Meta.footerAddDictionaries(b, dictvec)
+    Meta.footerAddRecordBatches(b, recordvec)
+    FB.finish!(b, Meta.footerEnd(b))
+    footer = collect(FB.finishedbytes(b))
+    append!(out, footer)
+    append!(out, reinterpret(UInt8, Int32[Int32(length(footer))]))
+    append!(out, FILE_MAGIC)
+    return out, (recordoffset, metalen, bodylen)
+end
+
 function _scan_main()
     expected = (
         ints=Int64[1, 2, 3, 4, 5],
@@ -1541,6 +1594,25 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
                  for k = 0:8:(dictblockbody[2] - 1))
     println("dictionary bodies are fetched only for decode-set ids ✓")
 
+    # A selected dictionary id missing from the Footer is a metadata-only
+    # refusal. It must fail before any record body is fetched.
+    missingdict = copy(filebytes)
+    footerlen = Int64(reinterpret(Int32, missingdict[(end - 9):(end - 6)])[1])
+    footerstart = Int64(length(missingdict)) - 10 - footerlen
+    footerbytes = copy(missingdict[(footerstart + 1):(footerstart + footerlen)])
+    footertable = _vtable(footerbytes, Int64(_vu32(footerbytes, 0)))
+    _write_u32!(footerbytes, _vref(footertable, 2; required=true), UInt32(0))
+    copyto!(missingdict, footerstart + 1, footerbytes, 1, length(footerbytes))
+    missingrecords = verify_footer(footerbytes, Limits())[4]
+    missingscan = Tables.Scan(select=(:dict,))
+    @assert _rejects(() -> Tables.read(readfile(copy(missingdict)), missingscan))
+    logmissing, srcmissing = countingsource(missingdict)
+    @assert _rejects(() -> Tables.read(RangedFile(srcmissing;
+        tailbytes=32, coalesce_gap=0), missingscan))
+    @assert !any(_fetched(logmissing, block[1] + block[2])
+                 for block in missingrecords)
+    println("missing dictionary plans reject before record-body fetches ✓")
+
     # Coalescing: an infinite gap merges every body range into one request;
     # a zero gap issues more, smaller requests; both agree with the truth.
     logbig, srcbig = countingsource(filebytes)
@@ -1584,6 +1656,17 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert isequal(collect(Any, gotz.x), collect(Any, zfull.x))
     @assert logz.bytes < length(zbytes)
     println("compressed files range-read through self-contained buffers ✓")
+
+    # Legacy V4 message-level compression is rejected from metadata even when
+    # limit=0 leaves no body to decode.
+    legacyv4, legacyblock = _legacyv4file()
+    legacyscan = Tables.Scan(select=(:x,), limit=0)
+    @assert _rejects(() -> Tables.read(readfile(copy(legacyv4)), legacyscan))
+    loglegacy, srclegacy = countingsource(legacyv4)
+    @assert _rejects(() -> Tables.read(RangedFile(srclegacy;
+        tailbytes=32, coalesce_gap=0), legacyscan))
+    @assert !_fetched(loglegacy, legacyblock[1] + legacyblock[2])
+    println("legacy compression rejects before record-body fetches ✓")
 
     # Hostile inputs fail closed: forged footer length, overlapping Blocks,
     # out-of-body zero-length buffers, and truncated objects.
@@ -1755,6 +1838,37 @@ function _stats_main()
     @assert isequal(collect(Any, got.x), Any[8, 9, 10])
     @assert !any(_fetched(logp, block1[1] + k) for k = 0:8:(block1[2] + block1[3] - 1))
     println("stat-pruned batches are never fetched, metadata included ✓")
+
+    # Per-record limits stay lazy on both paths. A statistics-pruned large
+    # record is accepted; a surviving one rejects before its ranged metadata
+    # or body is fetched.
+    limitio = IOBuffer()
+    Arrow.write(limitio, (x=collect(Int64, 1:10_000),); file=false)
+    limitsource = readstream(take!(limitio))
+    limitbytes = statsfile(limitsource.schema, limitsource.batches)
+    limitfooterlen = Int64(reinterpret(Int32,
+        limitbytes[(end - 9):(end - 6)])[1])
+    limitfooterstart = Int64(length(limitbytes)) - 10 - limitfooterlen
+    limitfooter = copy(limitbytes[
+        (limitfooterstart + 1):(limitfooterstart + limitfooterlen)])
+    limitblock = only(verify_footer(limitfooter, Limits())[4])
+    lazylimits = Limits(max_body_bytes=4096)
+    @assert limitblock[3] > lazylimits.max_body_bytes
+    prunedscan = Tables.Scan(filter=Tables.col(:x) < 0)
+    @assert isempty(Tables.read(readfile(copy(limitbytes); limits=lazylimits),
+        prunedscan).x)
+    logpruned, srcpruned = countingsource(limitbytes)
+    @assert isempty(Tables.read(RangedFile(srcpruned; limits=lazylimits,
+        tailbytes=32, coalesce_gap=0), prunedscan).x)
+    @assert !_fetched(logpruned, limitblock[1])
+    keptscan = Tables.Scan(filter=Tables.col(:x) > 0)
+    @assert _rejects(() -> Tables.read(readfile(copy(limitbytes);
+        limits=lazylimits), keptscan))
+    logkept, srckept = countingsource(limitbytes)
+    @assert _rejects(() -> Tables.read(RangedFile(srckept; limits=lazylimits,
+        tailbytes=32, coalesce_gap=0), keptscan))
+    @assert !_fetched(logkept, limitblock[1])
+    println("whole and ranged record limits have the same lazy boundary ✓")
 
     # Decode proof (whole-file): semantic corruption inside a pruned batch
     # stays invisible with statistics, and is caught without them.

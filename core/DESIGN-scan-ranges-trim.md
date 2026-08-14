@@ -27,8 +27,8 @@ select/rename/type items, a closed predicate algebra (`Cmp`/`In`/`IsNull`/
 
 | Axis | Mechanism | Exactness |
 |---|---|---|
-| `select` | decode only (selected ∪ filter-referenced) columns: a registry-driven `skipfield!` advances the node/buffer cursor past unselected fields without body slicing, content validation, or materialization. Complete node/buffer metadata is still validated first. Nested subtrees skip with their parent; bodies for unselected dictionary columns are not fetched. | exact as IO/decode reduction (see below for who projects) |
-| `limit`/`offset` | `RecordBatch.length` is wire metadata: whole batches before `offset` and after `offset+limit` are never decoded. Ranged reads still fetch candidate RecordBatch metadata because Footer Blocks have no row counts, but they do not fetch excluded body bytes. | exact when no filter; poisoned by any filter per the contract |
+| `select` | decode only (selected ∪ filter-referenced) columns: a registry-driven `skipfield!` advances the node/buffer cursor past unselected fields without body slicing, content validation, or materialization. Complete node/buffer metadata is still validated first. Nested subtrees skip with their parent; no body range is requested for an unselected dictionary column. | exact as IO/decode reduction (see below for who projects) |
+| `limit`/`offset` | `RecordBatch.length` is wire metadata: whole batches before `offset` and after `offset+limit` are never decoded. Ranged reads still fetch candidate RecordBatch metadata because Footer Blocks have no row counts, but request no body range for excluded batches. Tail reads and configured coalescing may physically over-read otherwise unrequested bytes. | exact when no filter; poisoned by any filter per the contract |
 | `filter` | two tiers: (a) **statistics pruning** — per-batch min/max/null-count, when present (§3 of this doc), prune batches that cannot satisfy the predicate; (b) **mask at materialization** — evaluate the predicate over decoded columns through Core accessors and apply the mask when building output columns. | (a) inexact — filter stays in residual; (b) exact — enables limit pushdown with filters |
 | `types` (`ref => T`) | left in the residual for `finish`'s elementwise convert. Arrow's schema is source-fixed; an override is a conversion request, not a parse seed (unlike CSV). Exception: see §4 — in trim mode the overrides double as the known-schema pin. | residual |
 
@@ -193,11 +193,16 @@ live in extensions:
   the fetcher closure can bake in `If-Match`).
 
 The ranged reader deliberately uses the Footer schema as its sole schema
-authority and does not fetch the leading schema message or optional EOS marker.
-It does not weaken the Footer's other claims: Block extents are bounded and
-non-overlapping, required features and limits are enforced, and complete
-RecordBatch node/buffer metadata is validated before it can drive a window or
-body fetch. Skipped buffer contents remain unread and unvalidated by design.
+authority. It does not parse or cross-check the leading schema message or
+optional EOS marker, although a head, tail, or coalesced request can physically
+over-read those or other unrequested bytes. The complete Footer Block index is
+bounded and checked for overlap. Required features and message limits are
+global. Per-record metadata/body/buffer limits stay lazy like `ArrowFile`:
+dictionary blocks and statistics-surviving record candidates are checked, while
+statistics-pruned record metadata is not fetched or validated. Message kind,
+version, legacy-compression state, complete node/buffer metadata, planned codec,
+and required dictionary presence are validated before any planned body range is
+requested. Skipped buffer contents remain unvalidated by design.
 
 ---
 
