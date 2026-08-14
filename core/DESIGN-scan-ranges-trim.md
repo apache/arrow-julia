@@ -74,6 +74,11 @@ implemented in `examples/scan_ranges.jl`):
   calls retain their documented per-call budgets. A scan that visits many
   batches shares one budget and codec state across all of its metadata and
   decompression work, matching the ranged operation.
+- **Authority-overflow windows stay residual.** The current `Tables.finish`
+  implementation forms `offset + 1` and `offset + limit` with unchecked
+  `Int` arithmetic. Stage A does not consume a request when either expression
+  would overflow, so the apply/finish equation remains exact until Tables
+  adopts saturating window arithmetic.
 - **Stage A needs no row-level predicate evaluator.** The filter always
   stays in the residual, so `Tables.finish`/`filtermask` do row evaluation;
   Arrow-side predicate logic first appears as the *interval* ladder for

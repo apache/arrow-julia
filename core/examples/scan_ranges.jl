@@ -331,6 +331,12 @@ function _batchwindow(rowcounts::Vector{Int64}, offset::Int, limit::Union{Nothin
     return window
 end
 
+# The current Tables.finish authority forms `offset + 1` and, with a limit,
+# `offset + limit` in Int arithmetic. Keep an overflowing request residual so
+# both sides of the apply/finish contract have the same observable result.
+_canconsumewindow(scan::Tables.Scan) = scan.offset < typemax(Int) &&
+    (scan.limit === nothing || scan.limit <= typemax(Int) - scan.offset)
+
 function Tables.apply(f::ArrowFile, scan::Tables.Scan)
     names = Symbol[Symbol(fld.name) for fld in f.fields]
     allunique(names) || throw(ValidationError(
@@ -342,7 +348,8 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
     budget = AllocationBudget(f.limits.max_total_allocated_bytes)
     state = DecodeState(budget)
     try
-        consumed = scan.filter === nothing && (scan.limit !== nothing || scan.offset > 0)
+        consumed = scan.filter === nothing && _canconsumewindow(scan) &&
+            (scan.limit !== nothing || scan.offset > 0)
         window = if consumed
             _batchwindow(Int64[_batchrows(f, i, budget) for i = 1:length(f)],
                 scan.offset, scan.limit)
@@ -711,7 +718,8 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
                for p = 1:nsurv]
     rowcounts = Int64[_recordbatchmeta(h, fields, limits,
         recordblocks[recidxs[p]][3]) for (p, h) in enumerate(headers)]
-    consumed = scan.filter === nothing && (scan.limit !== nothing || scan.offset > 0)
+    consumed = scan.filter === nothing && _canconsumewindow(scan) &&
+        (scan.limit !== nothing || scan.offset > 0)
     window = consumed ? _batchwindow(rowcounts, scan.offset, scan.limit) :
         Tuple{Int,Int64,Int64}[(p, Int64(0), Int64(-1)) for p = 1:nsurv]
 
@@ -1327,6 +1335,30 @@ function _scan_main()
     _, r2 = Tables.apply(af, Tables.Scan(filter=Tables.col(:ints) > 2, limit=2))
     @assert r2.limit == 2 && r2.filter !== nothing
     println("limit/offset consume exactly; filters poison the window ✓")
+
+    # Tables.finish currently overflows on these otherwise valid Int values.
+    # Residualizing the window preserves the protocol's observable contract
+    # until that authority uses saturating arithmetic.
+    extreme = Tables.Scan(select=(:ints,), offset=typemax(Int), limit=typemax(Int))
+    authorityfails = try
+        Tables.finish(full, extreme)
+        false
+    catch e
+        e isa BoundsError
+    end
+    @assert authorityfails
+    for sourcefile in (af, RangedFile(RangedSource(filebytes)))
+        _, residual = Tables.apply(sourcefile, extreme)
+        @assert residual.offset == extreme.offset && residual.limit == extreme.limit
+        failed = try
+            Tables.read(sourcefile, extreme)
+            false
+        catch e
+            e isa BoundsError
+        end
+        @assert failed
+    end
+    println("overflowing Tables.finish windows remain residual ✓")
 
     # Skip proof 1 (columns): corrupt the `strs` OFFSETS buffer of batch 2 so
     # semantic validation must reject any decode that touches it. Buffer
