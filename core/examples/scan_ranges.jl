@@ -202,7 +202,7 @@ function _planminbytes(role, spec, node, len::Int64)
 end
 
 function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8,
-    top::Bool=false)
+    allslots::Bool=false)
     node = takenode!(c)
     t = f.type
     if t isa NullType
@@ -212,8 +212,8 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8,
         node.null_count == 0 || throw(ValidationError(
             "Union field-node null count must be zero"))
     end
-    top && !f.nullable && node.null_count > 0 && throw(ValidationError(
-        "non-nullable top-level field declares a positive null count"))
+    allslots && !f.nullable && node.null_count > 0 && throw(ValidationError(
+        "fully covered non-nullable field declares a positive null count"))
     spec = layoutspec(f.type)
     for role in spec.buffers
         _, len = _buffermeta!(c)
@@ -231,12 +231,21 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8,
     end
     f.type isa DictionaryType && return node.length
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
-    childlens = Int64[_validateplannedfield!(f.children[i], c, codec, false)
-                      for i = 1:nchildren]
+    childlens = Int64[]
+    fslextent = t isa FixedSizeListType ? _planmul(node.length,
+        Int64(t.listsize), "fixed-size-list child length") : Int64(0)
+    for i = 1:nchildren
+        childall = false
+        if allslots && node.null_count == 0 && c.nodeidx <= length(c.nodes)
+            childlen = Int64(c.nodes[c.nodeidx].length)
+            childall = t isa StructType ? childlen == node.length :
+                t isa FixedSizeListType ? childlen == fslextent : false
+        end
+        push!(childlens,
+            _validateplannedfield!(f.children[i], c, codec, childall))
+    end
     if t isa FixedSizeListType
-        need = _planmul(node.length, Int64(t.listsize),
-            "fixed-size-list child length")
-        childlens[1] >= need || throw(ValidationError(
+        childlens[1] >= fslextent || throw(ValidationError(
             "fixed-size-list child is shorter than its parent extent"))
     elseif t isa StructType
         all(>=(node.length), childlens) || throw(ValidationError(
@@ -1915,6 +1924,26 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     validcodec = _batchcodec(validheader.compression, validmsg.version)
     @assert _rejects(() -> _validatebodyplan(validheader, (strictfield,),
         validfile.limits, validcodec, Bool[true]))
+
+    structio = IOBuffer()
+    structdata = NamedTuple{(:n,),Tuple{Union{Missing,Int64}}}[
+        (n=missing,), (n=Int64(2),)]
+    Arrow.write(structio, (x=structdata,); file=false)
+    structbytes = writefile(readstream(take!(structio)))
+    structfile = readfile(copy(structbytes))
+    structbudget = AllocationBudget(structfile.limits.max_total_allocated_bytes)
+    structmsg = _blockmessage(structfile.region, structfile.recordblocks[1],
+        structfile.dataend, structfile.limits, structbudget)
+    parentfield = structfile.fields[1]
+    childfield = parentfield.children[1]
+    strictchild = Field(childfield.name, childfield.type, false,
+        childfield.metadata, childfield.children)
+    strictparent = Field(parentfield.name, parentfield.type,
+        parentfield.nullable, parentfield.metadata, [strictchild])
+    structheader = structmsg.msg.header::Meta.RecordBatch
+    structcodec = _batchcodec(structheader.compression, structmsg.version)
+    @assert _rejects(() -> _validatebodyplan(structheader, (strictparent,),
+        structfile.limits, structcodec, Bool[true]))
 
     emptylistio = IOBuffer()
     Arrow.write(emptylistio, (x=[String[]],); file=false)

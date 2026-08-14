@@ -207,9 +207,9 @@ dictionary blocks and statistics-surviving record candidates are checked, while
 statistics-pruned record metadata causes no dedicated range request and is not
 validated (a tail or coalesced request may still over-read it). Message kind,
 version, legacy-compression state, complete node/buffer metadata,
-layout-derived buffer minima and child extents for planned subtrees, planned
-codec, and required dictionary presence are validated before any planned body
-range is requested.
+layout-derived buffer minima, child extents, and fixed or fully-covered
+null-count contracts for planned subtrees, planned codec, and required
+dictionary presence are validated before any planned body range is requested.
 Skipped buffer contents remain unvalidated by design.
 
 ---
