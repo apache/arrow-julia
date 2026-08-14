@@ -53,6 +53,21 @@ the only correct composition: if the adapter consumed `select` while leaving
 already-dropped columns. Simple, correct, and captures the dominant win
 (unselected columns cost zero decode — and with §2, zero bytes).
 
+Two refinements the P1 prove-out's differential tests forced (both now
+implemented in `examples/scan_ranges.jl`):
+
+- **The residual selection must be RESOLVED, not passed through.** `Not` and
+  `Regex` select items re-bound against the reduced output table are wrong
+  (`Not(:x)`'s excluded name no longer exists; a regex can over-match a
+  filter-only column). The residual carries the bound columns as concrete
+  source-name items with their renames and type overrides attached.
+- **Stage A needs no row-level predicate evaluator.** The filter always
+  stays in the residual, so `Tables.finish`/`filtermask` do row evaluation;
+  Arrow-side predicate logic first appears as the *interval* ladder for
+  statistics pruning (§3). Stream handles keep the default no-push `apply`
+  — the eager prove-out stream has already decoded by the time `apply`
+  runs; stream pushdown belongs to the production incremental framer.
+
 **Stage B (facade-level, ViewPlan era).** The facade's `apply` consumes
 everything exactly: per-column masks evaluated through Core accessors (no
 materialization of excluded rows), projection/renames applied at ViewPlan

@@ -891,7 +891,14 @@ function takenode!(c::DecodeCursor)
     return n
 end
 
-function takebuffer!(c::DecodeCursor)
+"""
+Consume one buffer-table entry's METADATA: bounds, alignment, limits, and
+the non-overlap/monotone invariants — everything checkable without touching
+a single body byte. `takebuffer!` adds the body subslice (+ decompression);
+`skipbuffer!` stops here, which is what lets scan pushdown skip columns
+whose bytes were never decoded — or, over a ranged source, never fetched.
+"""
+function _buffermeta!(c::DecodeCursor)
     c.bufidx <= length(c.buffers) ||
         throw(ValidationError("metadata declares fewer buffers than the schema requires"))
     b = c.buffers[c.bufidx]
@@ -913,6 +920,13 @@ function takebuffer!(c::DecodeCursor)
             throw(ValidationError("batch buffer end overflows"))
         end
     end
+    return offset, len
+end
+
+skipbuffer!(c::DecodeCursor) = (_buffermeta!(c); nothing)
+
+function takebuffer!(c::DecodeCursor)
+    offset, len = _buffermeta!(c)
     # THE checked-subslice step: a buffer is only ever a window into this
     # message's body span. Checked arithmetic in `subslice` turns a corrupt
     # offset/length into a clean ValidationError.
