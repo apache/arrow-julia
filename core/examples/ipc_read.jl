@@ -859,10 +859,14 @@ function _decode_zstd!(state::DecodeState, src::Ptr{UInt8}, srclen::Int64,
     return nothing
 end
 
-mutable struct DecodeCursor
+# `B` is the body representation: a contiguous `BufferSlice` for in-memory
+# and mmapped messages, or a sparse body (scan_ranges.jl) whose fetched
+# spans stand in for the contiguous message body. `_bodyslice` is the one
+# seam between them; the parameter keeps the cursor concrete per use.
+mutable struct DecodeCursor{B}
     nodes::AbstractVector{Meta.FieldNode}
     buffers::AbstractVector{Meta.Buffer}
-    body::BufferSlice
+    body::B
     max_buffer_bytes::Int64
     max_array_length::Int64
     nodeidx::Int
@@ -871,6 +875,10 @@ mutable struct DecodeCursor
     codec::Int8                   # CODEC_NONE, or the batch's declared codec
     state::Union{Nothing,DecodeState}
 end
+
+"Resolve one declared buffer window against the message body."
+_bodyslice(body::BufferSlice, offset::Int64, len::Int64) =
+    AC.subslice(body, offset, len)
 
 DecodeCursor(nodes, buffers, body, limits::Limits;
     codec::Int8=CODEC_NONE, state::Union{Nothing,DecodeState}=nothing) =
@@ -928,10 +936,11 @@ skipbuffer!(c::DecodeCursor) = (_buffermeta!(c); nothing)
 function takebuffer!(c::DecodeCursor)
     offset, len = _buffermeta!(c)
     # THE checked-subslice step: a buffer is only ever a window into this
-    # message's body span. Checked arithmetic in `subslice` turns a corrupt
-    # offset/length into a clean ValidationError.
+    # message's body span (or, for a sparse body, into a fetched span that
+    # was itself derived from this buffer table). Checked arithmetic turns a
+    # corrupt offset/length into a clean ValidationError.
     wire = try
-        AC.subslice(c.body, offset, len)
+        _bodyslice(c.body, offset, len)
     catch e
         e isa ArgumentError || e isa OverflowError || rethrow()
         throw(ValidationError("batch buffer [$offset, $len] escapes its message body"))
@@ -1103,16 +1112,19 @@ function decoderecord(fm::FramedMessage, fields, sch::Schema,
     return AC.RecordBatch(sch, cols, rblen, validated_dictionaries)
 end
 
-function rejectexperimentalcompression(fm::FramedMessage)
-    fm.version == Int16(3) || return nothing # V4
-    fm.header_type in (UInt8(2), UInt8(3)) || return nothing
-    metadata = fm.msg.custom_metadata
+function rejectexperimentalcompression(msg::Meta.Message, version::Int16,
+    header_type::UInt8)
+    version == Int16(3) || return nothing # V4
+    header_type in (UInt8(2), UInt8(3)) || return nothing
+    metadata = msg.custom_metadata
     metadata === nothing && return nothing
     any(kv -> kv.key == EXPERIMENTAL_COMPRESSION_KEY, metadata) &&
         throw(ValidationError(
             "experimental V4 IPC compression is outside this prove-out"))
     return nothing
 end
+rejectexperimentalcompression(fm::FramedMessage) =
+    rejectexperimentalcompression(fm.msg, fm.version, fm.header_type)
 
 # ---------------------------------------------------------------------------
 # Stream reader: RecordBatchSource over framed messages
