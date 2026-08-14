@@ -1137,11 +1137,10 @@ function _verifyblockframe(blob::BufferSlice, block::NTuple{3,Int64},
     return nothing
 end
 
-function _verifyblockframes(region::OwnerRegion, dictblocks, recordblocks,
+function _verifyblockframes(blob::BufferSlice, dictblocks, recordblocks,
     dataend::Int64; datastart::Int64=0)
     indexedend = _validateblockindex(dictblocks, recordblocks, dataend;
         datastart=datastart)
-    blob = BufferSlice(region, 0, region.len)
     foreach(block -> _verifyblockframe(blob, block, UInt8(2)), dictblocks)
     foreach(block -> _verifyblockframe(blob, block, UInt8(3)), recordblocks)
     return indexedend
@@ -1239,7 +1238,7 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
         throw(ValidationError("file schema and footer schema differ"))
     _metadataequal(schemafm.msg.custom_metadata, footer.custom_metadata) ||
         throw(ValidationError("file schema and footer custom metadata differ"))
-    indexedend = _verifyblockframes(region, dictblocks, recordblocks, footerstart;
+    indexedend = _verifyblockframes(blob, dictblocks, recordblocks, footerstart;
         datastart=schemaend)
     haseos = footerstart - indexedend >= 8 &&
         AC.loadat(blob, UInt32, footerstart - 8) == CONTINUATION &&
