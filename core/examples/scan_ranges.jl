@@ -1777,8 +1777,11 @@ function _stats_main()
     badsch = Schema(collect(Field, source.schema.fields); metadata=badmeta,
         endianness=source.schema.endianness)
     badbytes = writefile(badsch, source.batches)
-    got = Tables.read(readfile(copy(badbytes)), Tables.Scan(filter=Tables.col(:x) > 7))
-    @assert isequal(collect(Any, got.x), Any[8, 9, 10])
+    for sourcefile in (readfile(copy(badbytes)), RangedFile(RangedSource(badbytes)))
+        got = Tables.read(sourcefile, Tables.Scan(filter=Tables.col(:x) > 7))
+        @assert isequal(collect(Any, got.x), Any[8, 9, 10])
+    end
+    @assert _readstats(nestedstats.metadata, 2, source.schema.fields) === nothing
     wrongio = IOBuffer()
     Arrow.write(wrongio, Tables.partitioner([(q=Int64[1],), (q=Int64[2],)]); file=false)
     wrongblob = Base64.base64encode(take!(wrongio))
@@ -1852,12 +1855,17 @@ function _stats_main()
             endianness=source.schema.endianness)
         return writefile(liesch, source.batches)
     end
-    wide = Tables.read(readfile(liarfile(Int64(-1000), Int64(1000))),
-        Tables.Scan(filter=Tables.col(:x) > 8))
-    @assert isequal(collect(Any, wide.x), Any[9, 10])
-    narrow = Tables.read(readfile(liarfile(Int64(6), Int64(7))),
-        Tables.Scan(filter=Tables.col(:x) > 8))
-    @assert isempty(narrow.x)          # rows 9, 10 silently lost: the trust boundary
+    wides = liarfile(Int64(-1000), Int64(1000))
+    narrows = liarfile(Int64(6), Int64(7))
+    trustscan = Tables.Scan(filter=Tables.col(:x) > 8)
+    for sourcefile in (readfile(copy(wides)), RangedFile(RangedSource(wides)))
+        wide = Tables.read(sourcefile, trustscan)
+        @assert isequal(collect(Any, wide.x), Any[9, 10])
+    end
+    for sourcefile in (readfile(copy(narrows)), RangedFile(RangedSource(narrows)))
+        narrow = Tables.read(sourcefile, trustscan)
+        @assert isempty(narrow.x)      # rows 9, 10 silently lost: the trust boundary
+    end
     println("wide lies cost pruning only; narrow lies lose rows (trust model pinned) ✓")
 
     println()
