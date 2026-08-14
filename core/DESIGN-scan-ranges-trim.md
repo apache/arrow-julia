@@ -70,6 +70,10 @@ implemented in `examples/scan_ranges.jl`):
   `RecordBatch.length` drives a window, it is range-checked and matched to
   every top-level FieldNode length. Exact node/buffer counts and buffer
   geometry are also checked from metadata alone.
+- **One apply call has one allocation budget.** Standalone lazy `file[i]`
+  calls retain their documented per-call budgets. A scan that visits many
+  batches shares one budget and codec state across all of its metadata and
+  decompression work, matching the ranged operation.
 - **Stage A needs no row-level predicate evaluator.** The filter always
   stays in the residual, so `Tables.finish`/`filtermask` do row evaluation;
   Arrow-side predicate logic first appears as the *interval* ladder for
@@ -119,11 +123,14 @@ sequential — cloud-native access is a file-format feature, stated plainly.
    Covers footer-length + magic + the whole Footer in almost every real
    file; if `footerlen + 10 > tailbytes`, one exact follow-up fetch.
    → schema, Block indexes, (§3) statistics — everything pruning needs.
-2. **Prune** batches by scan (`limit`/`offset` windows, statistics) —
-   zero additional fetches.
-3. **Block metadata fetches**: `(offset, metaDataLength)` per surviving
-   batch, coalesced across adjacent batches. → per-buffer tables.
-4. **Buffer-range plan**: bound column set → buffer index set (subtree-
+2. **Statistics prune** from the Footer metadata — zero additional fetches.
+3. **Block metadata fetches**: dictionary metadata plus
+   `(offset, metaDataLength)` for each statistics-surviving record batch,
+   coalesced across nearby spans. RecordBatch row counts are here, not in the
+   Footer, so `limit`/`offset` windowing happens after this pass.
+4. **Window and buffer-range plan**: row counts choose the exact batch/body
+   window when there is no filter; the bound column set then maps to a buffer
+   index set (subtree-
    inclusive; dictionary Blocks for selected dictionary columns) → byte
    ranges → **coalesce** ranges with gaps below `coalesce_gap` (default
    ~256 KiB — a gap fetch is usually cheaper than a request round-trip;
@@ -135,11 +142,14 @@ sequential — cloud-native access is a file-format feature, stated plainly.
    was itself derived from the verified buffer table"*: same trust story,
    sparse backing.
 
-Request-count model (what actually matters against cloud latency): `1` tail
-+ `⌈surviving-batch metadata spans after coalescing⌉` + `⌈coalesced body
-ranges⌉` — for a 40-column file reading 3 columns of every batch, typically
-2 + one body request per batch group, moving ~`3/40` of the body bytes plus
-metadata. With statistics pruning, batches drop out entirely at step 2.
+Request-count model (what actually matters against cloud latency): `1` head
++ `1` tail (plus one exact Footer follow-up when the tail is too small)
++ `⌈candidate metadata spans after coalescing⌉` + `⌈coalesced body ranges⌉`.
+For a 40-column file reading 3 columns of every batch, this moves roughly
+`3/40` of the body bytes plus metadata. Statistics-pruned batches contribute
+no requested metadata/body range. Coalescing is an explicit over-read policy,
+so a requested span may cross otherwise unneeded bytes when the configured
+gap permits it.
 
 ### The interface (no HTTP/CloudStore deps in Arrow)
 
@@ -176,6 +186,13 @@ live in extensions:
   coalescing, retries (the fetcher's job), writers over ranges, stream
   format, mutation detection (ETag pinning is the extension's concern —
   the fetcher closure can bake in `If-Match`).
+
+The ranged reader deliberately uses the Footer schema as its sole schema
+authority and does not fetch the leading schema message or optional EOS marker.
+It does not weaken the Footer's other claims: Block extents are bounded and
+non-overlapping, required features and limits are enforced, and complete
+RecordBatch node/buffer metadata is validated before it can drive a window or
+body fetch. Skipped buffer contents remain unread and unvalidated by design.
 
 ---
 

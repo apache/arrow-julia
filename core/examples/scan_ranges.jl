@@ -197,13 +197,18 @@ end
 # ---------------------------------------------------------------------------
 
 "Row count of batch `i` from Block metadata alone — no body access."
-function _batchrows(f::ArrowFile, i::Int)
-    budget = AllocationBudget(f.limits.max_total_allocated_bytes)
+function _batchrows(f::ArrowFile, i::Int, budget::AllocationBudget)
     fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
+    fm.version == f.schemaversion ||
+        throw(ValidationError("IPC metadata version changes within the file"))
+    rejectexperimentalcompression(fm)
     fm.msg.header isa Meta.RecordBatch ||
         throw(ValidationError("footer record block is not a record batch"))
     return _recordbatchmeta(fm.msg.header, f.fields, f.limits, fm.body.len)
 end
+
+_batchrows(f::ArrowFile, i::Int) = _batchrows(f, i,
+    AllocationBudget(f.limits.max_total_allocated_bytes))
 
 """
 The masked-decode core shared by the in-memory and ranged paths: masked-in
@@ -281,14 +286,19 @@ function _scantable(names, outcols, nrows::Int)
     return isempty(names) ? _ScanColumns(table, nrows) : table
 end
 
+function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool},
+    budget::AllocationBudget, state::DecodeState)
+    fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
+    return _maskedrecord(fm.msg, fm.version, fm.body, f.fields,
+        f.dictionaries, f.fielddictids, f.validated, f.limits,
+        f.schemaversion, mask, state)
+end
+
 function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool})
     budget = AllocationBudget(f.limits.max_total_allocated_bytes)
-    fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
     state = DecodeState(budget)
     try
-        return _maskedrecord(fm.msg, fm.version, fm.body, f.fields,
-            f.dictionaries, f.fielddictids, f.validated, f.limits,
-            f.schemaversion, mask, state)
+        return _scanbatch(f, i, mask, budget, state)
     finally
         close(state)
     end
@@ -329,49 +339,55 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
     decodeidx = sort!(unique!(vcat(Int[c.index for c in b.columns], copy(b.filtercols))))
     mask = falses(length(names))
     mask[decodeidx] .= true
-    consumed = scan.filter === nothing && (scan.limit !== nothing || scan.offset > 0)
-    window = if consumed
-        _batchwindow(Int64[_batchrows(f, i) for i = 1:length(f)],
-            scan.offset, scan.limit)
-    else
-        Tuple{Int,Int64,Int64}[(i, Int64(0), Int64(-1)) for i = 1:length(f)]
-    end
-    # Statistics pruning (design §3): one-sided — a pruned batch is provably
-    # empty under the filter; the filter itself always stays in the residual.
-    keep = trues(length(f))
-    if scan.filter !== nothing
-        stats = _readstats(f.schema.metadata, length(f))
-        stats === nothing ||
-            (keep = Bool[_maypass(scan.filter, stats[i].cols, names, stats[i].rows)
-                         for i = 1:length(f)])
-    end
-    parts = Dict{Int,Vector{Any}}(idx => Any[] for idx in decodeidx)
-    outrows = 0
-    for (i, skip, take) in window
-        keep[i] || continue
-        rblen, cols = _scanbatch(f, i, mask)
-        outrows += Int(take >= 0 ? take : rblen)
-        for idx in decodeidx
-            col = materialize(f.fields[idx], cols[idx]::ArrayData)
-            take >= 0 && (col = col[(skip + 1):(skip + take)])
-            push!(parts[idx], col)
+    budget = AllocationBudget(f.limits.max_total_allocated_bytes)
+    state = DecodeState(budget)
+    try
+        consumed = scan.filter === nothing && (scan.limit !== nothing || scan.offset > 0)
+        window = if consumed
+            _batchwindow(Int64[_batchrows(f, i, budget) for i = 1:length(f)],
+                scan.offset, scan.limit)
+        else
+            Tuple{Int,Int64,Int64}[(i, Int64(0), Int64(-1)) for i = 1:length(f)]
         end
+        # Statistics pruning (design §3): one-sided — a pruned batch is provably
+        # empty under the filter; the filter itself always stays in the residual.
+        keep = trues(length(f))
+        if scan.filter !== nothing
+            stats = _readstats(f.schema.metadata, length(f))
+            stats === nothing ||
+                (keep = Bool[_maypass(scan.filter, stats[i].cols, names, stats[i].rows)
+                             for i = 1:length(f)])
+        end
+        parts = Dict{Int,Vector{Any}}(idx => Any[] for idx in decodeidx)
+        outrows = 0
+        for (i, skip, take) in window
+            keep[i] || continue
+            rblen, cols = _scanbatch(f, i, mask, budget, state)
+            outrows += Int(take >= 0 ? take : rblen)
+            for idx in decodeidx
+                col = materialize(f.fields[idx], cols[idx]::ArrayData)
+                take >= 0 && (col = col[(skip + 1):(skip + take)])
+                push!(parts[idx], col)
+            end
+        end
+        outcols = Tuple(isempty(parts[idx]) ? Any[] : reduce(vcat, parts[idx])
+                        for idx in decodeidx)
+        table = _scantable(names[decodeidx], outcols, outrows)
+        # The residual's selection must be RESOLVED against the source schema:
+        # the output table carries only the decode set, so re-binding `Not`
+        # (whose excluded names are gone) or a `Regex` (which could over-match a
+        # filter-only column) against it would be wrong. Bound columns become
+        # concrete source-name items carrying their renames and type overrides.
+        residualselect = scan.select === nothing ? nothing :
+            Tables.SelectItem[Tables.SelectItem(names[c.index], c.type,
+                c.name == names[c.index] ? nothing : c.name) for c in b.columns]
+        limit = consumed ? nothing : scan.limit
+        offset = consumed ? 0 : scan.offset
+        residualfilter = _resolvefilter(scan.filter, names)
+        return table, Tables.Scan(residualselect, residualfilter, limit, offset, scan.validate)
+    finally
+        close(state)
     end
-    outcols = Tuple(isempty(parts[idx]) ? Any[] : reduce(vcat, parts[idx])
-                    for idx in decodeidx)
-    table = _scantable(names[decodeidx], outcols, outrows)
-    # The residual's selection must be RESOLVED against the source schema:
-    # the output table carries only the decode set, so re-binding `Not`
-    # (whose excluded names are gone) or a `Regex` (which could over-match a
-    # filter-only column) against it would be wrong. Bound columns become
-    # concrete source-name items carrying their renames and type overrides.
-    residualselect = scan.select === nothing ? nothing :
-        Tables.SelectItem[Tables.SelectItem(names[c.index], c.type,
-            c.name == names[c.index] ? nothing : c.name) for c in b.columns]
-    limit = consumed ? nothing : scan.limit
-    offset = consumed ? 0 : scan.offset
-    residualfilter = _resolvefilter(scan.filter, names)
-    return table, Tables.Scan(residualselect, residualfilter, limit, offset, scan.validate)
 end
 
 # ===========================================================================
@@ -438,12 +454,17 @@ cheaper than another request round-trip. Returns file-coordinate spans.
 """
 function _coalesce(ranges::Vector{NTuple{2,Int64}}, gap::Int64)
     isempty(ranges) && return NTuple{2,Int64}[]
+    gap >= 0 || throw(ArgumentError("negative coalesce gap"))
+    all(r -> r[1] >= 0 && r[2] >= 0, ranges) ||
+        throw(ArgumentError("negative range offset or length"))
     sorted = sort(ranges)
     out = NTuple{2,Int64}[sorted[1]]
     for (off, len) in Iterators.drop(sorted, 1)
         loff, llen = out[end]
-        if off <= loff + llen + gap
-            out[end] = (loff, max(llen, AC.checked_add(off, len) - loff))
+        loend = AC.checked_add(loff, llen)
+        thisend = AC.checked_add(off, len)
+        if off <= loend || off - loend <= gap
+            out[end] = (loff, max(loend, thisend) - loff)
         else
             push!(out, (off, len))
         end
@@ -458,9 +479,18 @@ struct FetchedSpans
     slices::Vector{BufferSlice}
 end
 
-function _fetchspans(src::RangedSource, ranges::Vector{NTuple{2,Int64}}, gap::Int64)
+function _fetchspans(src::RangedSource, ranges::Vector{NTuple{2,Int64}}, gap::Int64;
+    budget::Union{Nothing,AllocationBudget}=nothing,
+    what::AbstractString="range fetch")
     spans = _coalesce(ranges, gap)
+    budget === nothing || foreach(s -> _charge!(budget, s[2], what), spans)
     payloads = fetchranges(src, spans)
+    length(payloads) == length(spans) || throw(ValidationError(
+        "range fetch returned $(length(payloads)) payloads, expected $(length(spans))"))
+    for (payload, (_, len)) in zip(payloads, spans)
+        length(payload) == len || throw(ValidationError(
+            "range fetch returned $(length(payload)) bytes, expected $len"))
+    end
     slices = BufferSlice[BufferSlice(heapregion(p), 0, length(p)) for p in payloads]
     return FetchedSpans(Int64[s[1] for s in spans], Int64[s[2] for s in spans], slices)
 end
@@ -468,7 +498,8 @@ end
 function _spanslice(fs::FetchedSpans, off::Int64, len::Int64)
     len == 0 && return BufferSlice()
     i = searchsortedlast(fs.starts, off)
-    (i >= 1 && off >= fs.starts[i] && AC.checked_add(off, len) <= fs.starts[i] + fs.lens[i]) ||
+    (i >= 1 && off >= fs.starts[i] &&
+     AC.checked_add(off, len) <= AC.checked_add(fs.starts[i], fs.lens[i])) ||
         throw(ValidationError("required bytes [$off, $len] were not fetched"))
     return AC.subslice(fs.slices[i], off - fs.starts[i], len)
 end
@@ -488,9 +519,9 @@ struct SparseBody
 end
 
 function _bodyslice(sb::SparseBody, offset::Int64, len::Int64)
-    len == 0 && return BufferSlice()
     (offset >= 0 && len >= 0 && offset <= sb.bodylen - len) ||
         throw(ArgumentError("batch buffer escapes its message body"))
+    len == 0 && return BufferSlice()
     return _spanslice(sb.spans, AC.checked_add(sb.bodystart, offset), len)
 end
 
@@ -526,6 +557,10 @@ function _parseblockmeta(bytes::Vector{UInt8}, block::NTuple{3,Int64},
     declared = Int64(reinterpret(Int32, bytes[5:8])[1])
     declared == metalen - 8 ||
         throw(ValidationError("footer block metadata length does not match the message"))
+    0 < declared <= limits.max_metadata_bytes || throw(ValidationError(
+        "metadata length $declared outside (0, $(limits.max_metadata_bytes)]"))
+    0 <= bodylen <= limits.max_body_bytes || throw(ValidationError(
+        "body length $bodylen outside [0, $(limits.max_body_bytes)]"))
     _charge!(budget, declared, "metadata allocation")
     metabytes = bytes[9:end]
     version, header_type, _, reserve = verify_ipc_metadata(metabytes, limits, budget.left)
@@ -546,10 +581,9 @@ ranges for exactly the decode set, coalesced under `coalesce_gap`.
 
 Trust note, stated loudly: the ranged reader treats the FOOTER as the sole
 schema authority — it does not fetch and cross-check the leading schema
-message, and it bounds blocks by the footer start rather than running the
-whole-file optional-EOS preflight (both need bytes a range reader has no
-other reason to fetch). A forged block overlapping unfetched territory
-fails at decode validation, not at open.
+message or inspect the optional EOS marker. Footer Block non-overlap,
+resource limits, message kinds, and every RecordBatch node/buffer invariant
+are still validated from fetched metadata before any body fetch.
 """
 struct RangedFile{F}
     src::RangedSource{F}
@@ -557,13 +591,18 @@ struct RangedFile{F}
     tailbytes::Int64
     coalesce_gap::Int64
 end
-RangedFile(src::RangedSource; limits::Limits=Limits(),
-    tailbytes::Integer=65536, coalesce_gap::Integer=262144) =
-    RangedFile(src, limits, Int64(max(tailbytes, 32)), Int64(coalesce_gap))
+function RangedFile(src::RangedSource; limits::Limits=Limits(),
+    tailbytes::Integer=65536, coalesce_gap::Integer=262144)
+    gap = Int64(coalesce_gap)
+    gap >= 0 || throw(ArgumentError("negative coalesce gap"))
+    return RangedFile(src, limits, Int64(max(tailbytes, 32)), gap)
+end
 
 function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     src = rf.src
     limits = rf.limits
+    _requirelittleendian()
+    _validatelimits(limits)
     L = src.len
     L >= Int64(8 + 8 + 4 + 6) ||
         throw(ValidationError("file is too short to be an IPC file"))
@@ -584,9 +623,15 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     footerbytes = footerstart >= tailstart ?
         tail[(footerstart - tailstart + 1):(footerstart - tailstart + footerlen)] :
         _fetchexact(src, footerstart, footerlen)
-    version, _, dictblocks, recordblocks, reserve =
+    version, features, dictblocks, recordblocks, reserve =
         verify_footer(footerbytes, limits, budget.left)
     _charge!(budget, reserve, "verified footer expansion")
+    Int64(1) in features && throw(ValidationError(
+        "dictionary replacement is forbidden in the IPC file format"))
+    nmessages = AC.checked_add(Int64(1),
+        AC.checked_add(Int64(length(dictblocks)), Int64(length(recordblocks))))
+    nmessages <= limits.max_messages ||
+        throw(ValidationError("message count exceeds limit"))
     footer = FB.getrootas(Meta.Footer, footerbytes, 0)
     metaschema = footer.schema
     metaschema === nothing &&
@@ -607,15 +652,16 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     mask = falses(length(names))
     mask[decodeidx] .= true
 
-    # Block extents against the data boundary (footer start), pairwise
-    # non-overlap by sortedness of the verified footer vectors.
+    # Footer Blocks remain mutually exclusive and bounded even though the
+    # leading schema and optional EOS bytes are not fetched.
+    _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
     for block in vcat(dictblocks, recordblocks)
-        off, metalen, bodylen = block
-        (off >= 8 && metalen >= 16 && bodylen >= 0 &&
-         off % 8 == 0 && metalen % 8 == 0 && bodylen % 8 == 0) ||
-            throw(ValidationError("footer block has invalid extents"))
-        AC.checked_add(AC.checked_add(off, metalen), bodylen) <= footerstart ||
-            throw(ValidationError("footer block escapes the data section"))
+        _, metalen, bodylen = block
+        declared = metalen - 8
+        0 < declared <= limits.max_metadata_bytes || throw(ValidationError(
+            "metadata length $declared outside (0, $(limits.max_metadata_bytes)]"))
+        0 <= bodylen <= limits.max_body_bytes || throw(ValidationError(
+            "body length $bodylen outside [0, $(limits.max_body_bytes)]"))
     end
 
     # Statistics pruning happens FIRST (design §3): the stats live in the
@@ -636,8 +682,9 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     # SURVIVING record blocks; bodies come later and only for what the scan
     # needs.
     metablocks = vcat(dictblocks, NTuple{3,Int64}[recordblocks[i] for i in recidxs])
-    metaspans = _fetchspans(src, NTuple{2,Int64}[(bl[1], bl[2]) for bl in metablocks],
-        rf.coalesce_gap)
+    metaspans = _fetchspans(src,
+        NTuple{2,Int64}[(bl[1], bl[2]) for bl in metablocks], rf.coalesce_gap;
+        budget=budget, what="metadata range fetch")
     blockmeta = Vector{Tuple{Meta.Message,Int16}}(undef, length(metablocks))
     for (i, block) in enumerate(metablocks)
         payload = AC.slicebytes(_spanslice(metaspans, block[1], block[2]))
@@ -649,12 +696,27 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
                 "footer record block is not a record batch"))
         v == version ||
             throw(ValidationError("IPC metadata version changes within the file"))
+        if !expected_dict
+            _recordbatchmeta(msg.header::Meta.RecordBatch, fields, limits, block[3])
+        end
         blockmeta[i] = (msg, v)
     end
 
+    # RecordBatch lengths live in block metadata, not the Footer. The metadata
+    # pass above is required before limit/offset can choose body ranges.
+    nsurv = length(recidxs)
+    headers = [blockmeta[length(dictblocks) + p][1].header::Meta.RecordBatch
+               for p = 1:nsurv]
+    rowcounts = Int64[_recordbatchmeta(h, fields, limits,
+        recordblocks[recidxs[p]][3]) for (p, h) in enumerate(headers)]
+    consumed = scan.filter === nothing && (scan.limit !== nothing || scan.offset > 0)
+    window = consumed ? _batchwindow(rowcounts, scan.offset, scan.limit) :
+        Tuple{Int,Int64,Int64}[(p, Int64(0), Int64(-1)) for p = 1:nsurv]
+
     # Decode-set dictionaries: whole bodies, coalesced; everything else is
     # metadata-only forever.
-    needed = _neededdictids(fields, fielddictids, mask)
+    needed = isempty(window) ? Set{Int64}() :
+        _neededdictids(fields, fielddictids, mask)
     dicts = Dict{Int64,ArrayData}()
     validated = AC._ValidatedDictionaries()
     seenids = Set{Int64}()
@@ -671,6 +733,7 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
         header.id in seenids &&
             throw(ValidationError("the file format carries one dictionary batch per id"))
         push!(seenids, header.id)
+        _recordbatchmeta(header.data, (dictvaluefields[header.id],), limits, block[3])
         header.id in needed && push!(wanted_dict, i)
     end
     state = DecodeState(budget)
@@ -686,12 +749,8 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
                 rejectexperimentalcompression(msg, v, UInt8(2))
                 rb = header.data
                 codec = _batchcodec(rb.compression, v)
-                isempty(something(rb.variadicBufferCounts, Int64[])) ||
-                    throw(ValidationError("variadic-buffer layouts are outside this prove-out"))
                 vf = dictvaluefields[header.id]
-                rblen = something(rb.length, Int64(0))
-                0 <= rblen <= limits.max_array_length ||
-                    throw(ValidationError("dictionary batch length $rblen exceeds limit"))
+                rblen = _recordbatchmeta(rb, (vf,), limits, block[3])
                 body = _spanslice(bodyspans, block[1] + block[2], block[3])
                 cursor = DecodeCursor(rb.nodes, rb.buffers, body, limits;
                     codec=codec, state=state)
@@ -704,18 +763,6 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
                 dicts[header.id] = decoded
             end
         end
-
-        # Batch window from metadata row counts, then per-buffer body ranges
-        # for exactly the decode set of exactly the surviving batches.
-        # Positions index `recidxs` (identity when no filter pruned).
-        nsurv = length(recidxs)
-        headers = [blockmeta[length(dictblocks) + p][1].header::Meta.RecordBatch
-                   for p = 1:nsurv]
-        rowcounts = Int64[_recordbatchmeta(h, fields, limits,
-            recordblocks[recidxs[p]][3]) for (p, h) in enumerate(headers)]
-        consumed = scan.filter === nothing && (scan.limit !== nothing || scan.offset > 0)
-        window = consumed ? _batchwindow(rowcounts, scan.offset, scan.limit) :
-            Tuple{Int,Int64,Int64}[(p, Int64(0), Int64(-1)) for p = 1:nsurv]
 
         bodyranges = NTuple{2,Int64}[]
         blockwants = Dict{Int,Vector{NTuple{2,Int64}}}()
@@ -733,10 +780,10 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
                             throw(ValidationError("metadata declares fewer buffers than the schema requires"))
                         buf = buffers[k]
                         len = Int64(buf.length)
-                        len == 0 && continue
                         off = Int64(buf.offset)
                         (off >= 0 && len >= 0 && AC.checked_add(off, len) <= block[3]) ||
                             throw(ValidationError("batch buffer [$off, $len] escapes its message body"))
+                        len == 0 && continue
                         push!(wants, (off, len))
                     end
                 end
@@ -1333,7 +1380,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     logw, srcw = countingsource(filebytes)
     Tables.read(RangedFile(srcw; tailbytes=256, coalesce_gap=0), Tables.Scan(select=(:strs,), limit=5))
     @assert !any(_fetched(logw, body2[1] + k) for k = 0:8:(body2[2] - 1))
-    println("window-excluded batches are never fetched ✓")
+    println("window-excluded batch bodies are never fetched ✓")
 
     # Dictionary bodies are fetched only when a dictionary column is in the
     # decode set.
@@ -1354,6 +1401,11 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     Tables.read(RangedFile(srcd; tailbytes=256, coalesce_gap=0), Tables.Scan(select=(:dict,)))
     @assert any(_fetched(logd, dictblockbody[1] + k)
                 for k = 0:8:(dictblockbody[2] - 1))
+    logd0, srcd0 = countingsource(filebytes)
+    Tables.read(RangedFile(srcd0; tailbytes=256, coalesce_gap=0),
+        Tables.Scan(select=(:dict,), limit=0))
+    @assert !any(_fetched(logd0, dictblockbody[1] + k)
+                 for k = 0:8:(dictblockbody[2] - 1))
     println("dictionary bodies are fetched only for decode-set ids ✓")
 
     # Coalescing: an infinite gap merges every body range into one request;
@@ -1368,6 +1420,14 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert _tables_equal(gotbig, want) && _tables_equal(gotzero, want)
     @assert logbig.requests < logzero.requests
     @assert logzero.bytes <= logbig.bytes
+    @assert _coalesce(NTuple{2,Int64}[(0, 8), (16, 8)], typemax(Int64)) ==
+        NTuple{2,Int64}[(0, 24)]
+    @assert try
+        _coalesce(NTuple{2,Int64}[(0, 8)], Int64(-1))
+        false
+    catch e
+        e isa ArgumentError
+    end
     println("coalescing trades requests for bytes without changing results " *
             "($(logbig.requests) reqs/$(logbig.bytes)B vs $(logzero.requests) reqs/$(logzero.bytes)B) ✓")
 
@@ -1392,14 +1452,66 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert logz.bytes < length(zbytes)
     println("compressed files range-read through self-contained buffers ✓")
 
-    # Hostile inputs fail closed: forged footer length, block escaping the
-    # data section, and truncated objects.
+    # Hostile inputs fail closed: forged footer length, overlapping Blocks,
+    # out-of-body zero-length buffers, and truncated objects.
     badlen = copy(filebytes)
     lenpos = length(badlen) - 9
     badlen[lenpos:(lenpos + 3)] .= reinterpret(UInt8, Int32[Int32(2)^30])
     @assert _rejects(() -> Tables.read(RangedFile(RangedSource(badlen)), Tables.Scan()))
     @assert _rejects(() -> Tables.read(RangedFile(RangedSource(filebytes[1:20])), Tables.Scan()))
+
+    overlap = copy(filebytes)
+    footerlen = Int64(reinterpret(Int32, overlap[(end - 9):(end - 6)])[1])
+    footerstart = Int64(length(overlap)) - 10 - footerlen
+    footerbytes = copy(overlap[(footerstart + 1):(footerstart + footerlen)])
+    footertable = _vtable(footerbytes, Int64(_vu32(footerbytes, 0)))
+    recordstart, nrecords = _vvector(footertable, 3, 24; required=true)
+    @assert nrecords >= 2
+    firstblock = verify_footer(footerbytes, Limits())[4][1]
+    _write_i64!(footerbytes, recordstart + 24, firstblock[1])
+    _write_i32!(footerbytes, recordstart + 32, Int32(firstblock[2]))
+    _write_i64!(footerbytes, recordstart + 40, firstblock[3])
+    copyto!(overlap, footerstart + 1, footerbytes, 1, length(footerbytes))
+    @assert _rejects(() -> readfile(copy(overlap)))
+    @assert _rejects(() -> Tables.read(RangedFile(RangedSource(overlap)), Tables.Scan()))
+
+    zerobuffer = copy(filebytes)
+    block = af.recordblocks[1]
+    meta = copy(zerobuffer[(block[1] + 9):(block[1] + block[2])])
+    msg = _vtable(meta, Int64(_vu32(meta, 0)))
+    rb = _headertable(meta, msg)
+    bufferstart, _ = _vvector(rb, 2, 16; required=true)
+    _write_i64!(meta, bufferstart, block[3] + 8)
+    copyto!(zerobuffer, block[1] + 9, meta, 1, length(meta))
+    @assert _rejects(() -> readfile(copy(zerobuffer)))
+    @assert _rejects(() -> Tables.read(RangedFile(RangedSource(zerobuffer)),
+        Tables.Scan(select=(:ints,))))
     println("forged footers and truncated objects fail closed ✓")
+
+    # Ranged limits are checked before body fetching. One whole-file Scan also
+    # keeps one aggregate budget across every batch it decompresses.
+    @assert _rejects(() -> Tables.read(
+        RangedFile(RangedSource(filebytes); limits=Limits(max_body_bytes=32)),
+        Tables.Scan(select=(:ints,))))
+    @assert _rejects(() -> Tables.read(
+        RangedFile(RangedSource(filebytes); limits=Limits(max_messages=1)), Tables.Scan()))
+    loglimit, srclimit = countingsource(filebytes)
+    intoff, _ = _bufferposition(filebytes, 1, 2)
+    @assert _rejects(() -> Tables.read(RangedFile(srclimit;
+        limits=Limits(max_buffer_bytes=8), tailbytes=256, coalesce_gap=0),
+        Tables.Scan(select=(:ints,))))
+    @assert !_fetched(loglimit, intoff)
+
+    large = (x=zeros(Int64, 10_000),)
+    largeio = IOBuffer()
+    Arrow.write(largeio, Tables.partitioner([large, large]); file=false)
+    largebytes = writefile(readstream(take!(largeio)); compress=:zstd)
+    tight = Limits(max_total_allocated_bytes=100_000)
+    @assert _rejects(() -> Tables.read(readfile(copy(largebytes); limits=tight),
+        Tables.Scan(select=(:x,))))
+    @assert _rejects(() -> Tables.read(RangedFile(RangedSource(largebytes); limits=tight),
+        Tables.Scan(select=(:x,))))
+    println("range limits and scan-wide allocation budgets fail before overuse ✓")
 
     println()
     println("Byte-range scan checks passed.")
