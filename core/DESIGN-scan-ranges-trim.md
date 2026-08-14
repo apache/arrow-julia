@@ -305,8 +305,9 @@ support") still constrain the production form:
 - **P2 — RangedSource** — **IMPLEMENTED**: the `RangedSource{F}` contract,
   `RangedFile` fetch protocol, coalescing planner, `SparseBody` decode
   (`DecodeCursor{B}`), counting-source proofs (14% of bytes for a narrow
-  column over a 2.3MB file; never-fetched proofs for skipped columns,
-  window-excluded batches, and unneeded dictionary bodies).
+  column over a 2.3MB file; zero planned body ranges for skipped columns,
+  window-excluded batches, and unneeded dictionary bodies, with exact
+  request-log checks under the fixtures' tail/coalescing settings).
 - **P3 — statistics** — **IMPLEMENTED**: `withstatistics`/`statsfile` fold
   the official statistics value layout into `JuliaArrow:batch_statistics.v1`
   (footer schema metadata, base64-wrapped IPC stream, one statistics batch

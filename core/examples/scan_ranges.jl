@@ -1775,8 +1775,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     println("narrow selections fetch a fraction of the bytes " *
             "($(logone.bytes) vs $(logall.bytes) of $(length(bigbytes))) ✓")
 
-    # Unfetched-column proof: corrupt an unselected column's buffer ON THE
-    # SOURCE — the scan succeeds AND the corrupted byte was never fetched.
+    # Skipped-column range proof: corrupt an unselected column's buffer ON THE
+    # SOURCE. The scan plans no body range for it; under this fixture's small
+    # tail and zero coalescing gap, the request log also excludes that byte.
     off, len = _bufferposition(filebytes, 2, 8)          # strs offsets, batch 2
     corrupt = copy(filebytes)
     corrupt[(off + 5):(off + 8)] .= reinterpret(UInt8, Int32[Int32(2)^30])
@@ -1786,18 +1787,20 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert !_fetched(logc, off + 5)
     @assert _rejects(() -> Tables.read(RangedFile(RangedSource(corrupt)),
         Tables.Scan(select=(:strs,))))
-    println("skipped columns are never fetched (corruption stays untouched) ✓")
+    println("skipped columns add no planned body range " *
+            "(fixture request log excludes the corruption) ✓")
 
-    # Window proof: limit inside batch 1 fetches no batch-2 body bytes.
+    # Window proof: a limit inside batch 1 plans no batch-2 body range. This
+    # fixture's request log also excludes sampled batch-2 body bytes.
     block2 = af.recordblocks[2]
     body2 = (block2[1] + block2[2], block2[3])
     logw, srcw = countingsource(filebytes)
     Tables.read(RangedFile(srcw; tailbytes=256, coalesce_gap=0), Tables.Scan(select=(:strs,), limit=5))
     @assert !any(_fetched(logw, body2[1] + k) for k = 0:8:(body2[2] - 1))
-    println("window-excluded batch bodies are never fetched ✓")
+    println("window-excluded batches add no planned body range ✓")
 
-    # Dictionary bodies are fetched only when a dictionary column is in the
-    # decode set.
+    # A dictionary body gets a planned range only when its column is in the
+    # decode set. The zero-gap fixture also checks the observed request spans.
     dictblock = let
         # dict block extents via the footer: re-derive from the file bytes
         footerlen = Int64(reinterpret(Int32,
@@ -1821,10 +1824,10 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         Tables.Scan(select=(:dict,), limit=0))
     @assert !any(_fetched(logd0, dictblockbody[1] + k)
                  for k = 0:8:(dictblockbody[2] - 1))
-    println("dictionary bodies are fetched only for decode-set ids ✓")
+    println("dictionary body ranges are planned only for decode-set ids ✓")
 
     # A selected dictionary id missing from the Footer is a metadata-only
-    # refusal. It must fail before any record body is fetched.
+    # refusal. It must fail before any dedicated record-body request.
     missingdict = copy(filebytes)
     footerlen = Int64(reinterpret(Int32, missingdict[(end - 9):(end - 6)])[1])
     footerstart = Int64(length(missingdict)) - 10 - footerlen
@@ -1840,7 +1843,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         tailbytes=32, coalesce_gap=0), missingscan))
     @assert !any(_fetched(logmissing, block[1] + block[2])
                  for block in missingrecords)
-    println("missing dictionary plans reject before record-body fetches ✓")
+    println("missing dictionary plans reject before dedicated record-body requests ✓")
 
     # Coalescing: an infinite gap merges every body range into one request;
     # a zero gap issues more, smaller requests; both agree with the truth.
@@ -2024,7 +2027,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         Tables.Scan(select=(:ints,), limit=5))
     @assert isequal(collect(Any, windowed.ints), collect(Any, full.ints[1:5]))
     @assert !_fetched(logwindow, windowpos)
-    println("planned metadata failures reject before body fetches ✓")
+    println("planned metadata failures reject before dedicated body requests ✓")
 
     # Legacy V4 message-level compression is rejected from metadata even when
     # limit=0 leaves no body to decode.
@@ -2035,7 +2038,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert _rejects(() -> Tables.read(RangedFile(srclegacy;
         tailbytes=32, coalesce_gap=0), legacyscan))
     @assert !_fetched(loglegacy, legacyblock[1] + legacyblock[2])
-    println("legacy compression rejects before record-body fetches ✓")
+    println("legacy compression rejects before dedicated record-body requests ✓")
 
     # Hostile inputs fail closed: forged footer length, overlapping Blocks,
     # out-of-body zero-length buffers, and truncated objects.
@@ -2073,8 +2076,8 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         Tables.Scan(select=(:ints,))))
     println("forged footers and truncated objects fail closed ✓")
 
-    # Ranged limits are checked before body fetching. One whole-file Scan also
-    # keeps one aggregate budget across every batch it decompresses.
+    # Ranged limits are checked before dedicated body requests. One whole-file
+    # Scan also keeps one aggregate budget across every batch it decompresses.
     @assert _rejects(() -> Tables.read(
         RangedFile(RangedSource(filebytes); limits=Limits(max_body_bytes=32)),
         Tables.Scan(select=(:ints,))))
@@ -2198,15 +2201,16 @@ function _stats_main()
     @assert _statfold(dfield, ddata) == (1, nothing, nothing)
     println("dictionary statistics count null pool values logically ✓")
 
-    # Fetch proof: x > 7 prunes batch 1 — its block metadata AND body are
-    # never fetched over a ranged source.
+    # Request-plan proof: x > 7 prunes batch 1, so its block metadata and body
+    # add no dedicated ranges. This fixture's request log also excludes its
+    # indexed bytes.
     block1 = saf.recordblocks[1]
     logp, srcp = countingsource(sbytes)
     got = Tables.read(RangedFile(srcp; tailbytes=256, coalesce_gap=0),
         Tables.Scan(filter=Tables.col(:x) > 7))
     @assert isequal(collect(Any, got.x), Any[8, 9, 10])
     @assert !any(_fetched(logp, block1[1] + k) for k = 0:8:(block1[2] + block1[3] - 1))
-    println("stat-pruned batches are never fetched, metadata included ✓")
+    println("stat-pruned batches add no dedicated metadata/body range ✓")
 
     # Per-record limits stay lazy on both paths. A statistics-pruned large
     # record is accepted; a surviving one rejects before its ranged metadata
