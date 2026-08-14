@@ -203,7 +203,8 @@ end
         metadata=("not a pair",))
 
     # ListView offsets are per-slot and may be unordered; view data buffers
-    # are variadic after the fixed validity/views pair.
+    # are variadic after the fixed validity/views pair. Both now validate
+    # and read end-to-end.
     cf, cd = fromjulia("item", Int64[1, 2, 3])
     lvt = ListViewType(false)
     lvf = Field("lv", lvt; children=[cf])
@@ -211,14 +212,17 @@ end
         [BufferSlice(), AC._databuffer(Int32[2, 0]), AC._databuffer(Int32[1, 2])];
         children=[cd], nullcount=0)
     @test validate_structural(lvf, lvd) === lvd
-    @test_throws ValidationError validate_semantic(lvf, lvd)
+    @test validate_semantic(lvf, lvd) === lvd
+    @test getvalue(lvf, lvd, 1) == [3]          # unordered offsets: slot 1 reads the tail
+    @test getvalue(lvf, lvd, 2) == [1, 2]
     vt = ViewType(true)
     vf = Field("v", vt)
     vd = AC.ArrayData(vt, 1,
         [BufferSlice(), AC._databuffer(zeros(UInt8, 16)), AC._databuffer(UInt8[0x61])];
         nullcount=0)
     @test validate_structural(vf, vd) === vd
-    @test_throws ValidationError validate_semantic(vf, vd)
+    @test validate_semantic(vf, vd) === vd
+    @test getvalue(vf, vd, 1) == ""             # zeroed entry: inline empty string
 end
 
 @testset "fromjulia round-trips" begin
@@ -492,15 +496,126 @@ end
         @test getvalue(nulnamed, nuld, 1) == [nulname => 1]
     end
 
-    @testset "view/REE layouts: registry-known, access explicitly unsupported" begin
+    @testset "run-end encoding: validation, access, logical nulls, slicing" begin
         t = RunEndEncodedType()
         ref, red = fromjulia("run_ends", Int32[2, 3])
         vf, vd = fromjulia("values", Int64[7, 9])
         f = Field("ree", t; children=[ref, vf])
         d = AC.ArrayData(t, 3, BufferSlice[]; children=[red, vd], nullcount=0)
-        validate_structural(f, d)  # structure IS validated
-        @test_throws ValidationError validate_semantic(f, d)
-        @test_throws ErrorException getvalue(f, d, 1)
+        validate_structural(f, d)
+        @test validate_semantic(f, d) === d
+        @test [getvalue(f, d, i) for i = 1:3] == [7, 7, 9]
+        @test materialize(f, d) == [7, 7, 9]
+        @test nullcount(d) == 0
+
+        # nulls are runs whose VALUE is null; the parent has no bitmap
+        nvf, nvd = fromjulia("values", Union{Missing,Int64}[missing, 4])
+        nf = Field("ree", t; children=[ref, nvf])
+        nd = AC.ArrayData(t, 3, BufferSlice[]; children=[red, nvd], nullcount=0)
+        @test validate_semantic(nf, nd) === nd
+        @test isequal(materialize(nf, nd), [missing, missing, 4])
+
+        # slicing shifts logical positions through the run search
+        sliced = AC.ArrayData(t, 2, BufferSlice[]; offset=1,
+            children=[red, vd], nullcount=0)
+        @test validate_semantic(f, sliced) === sliced
+        @test materialize(f, sliced) == [7, 9]
+
+        # adversarial: non-ascending, zero/negative, short coverage,
+        # unequal children, declared parent nulls
+        badruns(v) = AC.ArrayData(t, 3, BufferSlice[];
+            children=[fromjulia("run_ends", v)[2], vd], nullcount=0)
+        @test_throws ValidationError validate_semantic(f, badruns(Int32[3, 2]))
+        @test_throws ValidationError validate_semantic(f, badruns(Int32[0, 3]))
+        @test_throws ValidationError validate_semantic(f, badruns(Int32[2, 2]))
+        @test_throws ValidationError validate_semantic(f, badruns(Int32[1, 2]))
+        shortchild = AC.ArrayData(t, 3, BufferSlice[];
+            children=[red, fromjulia("values", Int64[7])[2]], nullcount=0)
+        @test_throws ValidationError validate_semantic(f, shortchild)
+        declared = AC.ArrayData(t, 3, BufferSlice[];
+            children=[red, nvd], nullcount=2)
+        @test_throws ValidationError validate_semantic(nf, declared)
+    end
+
+    @testset "view layouts: entries, prefixes, variadic buffers" begin
+        # helper: build one 16-byte view entry
+        entry(len::Int, rest::Vector{UInt8}) =
+            vcat(reinterpret(UInt8, Int32[Int32(len)]), rest,
+                 zeros(UInt8, 12 - length(rest)))
+        long(len, prefix, bufidx, off) =
+            vcat(reinterpret(UInt8, Int32[Int32(len)]), prefix,
+                 reinterpret(UInt8, Int32[Int32(bufidx), Int32(off)]))
+        vt = ViewType(true)
+        vf = Field("v", vt; nullable=true)
+        payload = collect(codeunits("hello-world-beyond-inline"))
+        views = vcat(
+            entry(5, collect(codeunits("hello"))),                # inline short
+            long(25, payload[1:4], 0, 0),                          # out-of-line
+            entry(12, collect(codeunits("exactly-12bb"))))         # inline max
+        vd = AC.ArrayData(vt, 3,
+            [BufferSlice(), AC._databuffer(views), AC._databuffer(payload)];
+            nullcount=0)
+        @test validate_semantic(vf, vd) === vd
+        @test AC.validate_full(vf, vd) === vd
+        @test materialize(vf, vd) ==
+              ["hello", "hello-world-beyond-inline", "exactly-12bb"]
+
+        # binary views return bytes
+        bt = ViewType(false)
+        bf = Field("b", bt)
+        bd = AC.ArrayData(bt, 1,
+            [BufferSlice(), AC._databuffer(entry(2, UInt8[0xff, 0x00]))];
+            nullcount=0)
+        @test validate_semantic(bf, bd) === bd
+        @test getvalue(bf, bd, 1) == UInt8[0xff, 0x00]
+
+        # null slots' entry bytes are unrestricted by the spec
+        nulld = AC.ArrayData(vt, 1,
+            [AC._databuffer(UInt8[0x00]), AC._databuffer(long(99, UInt8[1, 2, 3, 4], 7, -5))];
+            nullcount=1)
+        @test validate_semantic(vf, nulld) === nulld
+        @test getvalue(vf, nulld, 1) === missing
+
+        # adversarial: bad prefix, escaping range, bad buffer index,
+        # negative length/offset
+        badprefix = AC.ArrayData(vt, 1,
+            [BufferSlice(), AC._databuffer(long(25, UInt8[1, 2, 3, 4], 0, 0)),
+             AC._databuffer(payload)]; nullcount=0)
+        @test_throws ValidationError validate_semantic(vf, badprefix)
+        escaping = AC.ArrayData(vt, 1,
+            [BufferSlice(), AC._databuffer(long(26, payload[1:4], 0, 4)),
+             AC._databuffer(payload)]; nullcount=0)
+        @test_throws ValidationError validate_semantic(vf, escaping)
+        badbuf = AC.ArrayData(vt, 1,
+            [BufferSlice(), AC._databuffer(long(25, payload[1:4], 3, 0)),
+             AC._databuffer(payload)]; nullcount=0)
+        @test_throws ValidationError validate_semantic(vf, badbuf)
+        neglen = AC.ArrayData(vt, 1,
+            [BufferSlice(), AC._databuffer(entry(-1, UInt8[]))]; nullcount=0)
+        @test_throws ValidationError validate_semantic(vf, neglen)
+
+        # ListView invariants bind NULL slots too (spec rule)
+        cf, cd = fromjulia("item", Int64[1, 2, 3])
+        lvt = ListViewType(false)
+        lvf = Field("lv", lvt; nullable=true, children=[cf])
+        nullbad = AC.ArrayData(lvt, 1,
+            [AC._databuffer(UInt8[0x00]), AC._databuffer(Int32[9]),
+             AC._databuffer(Int32[9])]; children=[cd], nullcount=1)
+        @test_throws ValidationError validate_semantic(lvf, nullbad)
+        # overlapping, shared child ranges are legal
+        overlap = AC.ArrayData(lvt, 2,
+            [BufferSlice(), AC._databuffer(Int32[0, 0]), AC._databuffer(Int32[3, 2])];
+            children=[cd], nullcount=0)
+        @test validate_semantic(lvf, overlap) === overlap
+        @test materialize(lvf, overlap) == [[1, 2, 3], [1, 2]]
+        # large list-view uses 64-bit offsets and sizes
+        llvt = ListViewType(true)
+        llvf = Field("llv", llvt; children=[cf])
+        llvd = AC.ArrayData(llvt, 1,
+            [BufferSlice(), AC._databuffer(Int64[1]), AC._databuffer(Int64[2])];
+            children=[cd], nullcount=0)
+        @test validate_semantic(llvf, llvd) === llvd
+        @test getvalue(llvf, llvd, 1) == [2, 3]
     end
 end
 

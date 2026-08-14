@@ -1233,11 +1233,6 @@ end
 function _validate_semantic_intrinsic(f::Field, d::ArrayData,
     validated_dictionaries::Union{Nothing,_ValidatedDictionaries}=nothing)
     t = d.type
-    if t isa Union{ViewType,ListViewType,RunEndEncodedType}
-        throw(ValidationError(
-            "semantic validation is not implemented for $(descriptorname(t)); " *
-            "only structural validation is available"))
-    end
     if !(@atomic :monotonic d.semachecked)
         spec = layoutspec_of(t)
         oi = findfirst(==(OFFSETS), spec.buffers)
@@ -1291,6 +1286,9 @@ function _validate_semantic_intrinsic(f::Field, d::ArrayData,
                 end
             end
         end
+        t isa ViewType && _validate_view_values(t, d)
+        t isa ListViewType && _validate_listview_values(t, d)
+        t isa RunEndEncodedType && _validate_ree_values(d)
         _validate_temporal_values(t, d)
         _validate_decimal_values(t, d)
         actual_nulls = _count_nulls(d)
@@ -1314,9 +1312,142 @@ function _validate_semantic_intrinsic(f::Field, d::ArrayData,
     return d
 end
 
+# -- view layouts (format 1.4) ----------------------------------------------
+
+# One 16-byte view entry: length, then either 12 inline bytes (length <= 12,
+# zero-padded) or prefix + buffer index + offset into one of the variadic
+# data buffers that follow validity and views.
+const VIEW_INLINE_MAX = Int32(12)
+
+@inline _viewbase(d::ArrayData, i::Int64) = _slotbyteoff(d, i, 16)
+
+function _viewdatabuffer(d::ArrayData, bufidx::Int32)
+    nvariadic = length(d.buffers) - 2
+    0 <= bufidx < nvariadic ||
+        throw(ValidationError("view buffer index $bufidx outside [0, $nvariadic)"))
+    return d.buffers[3 + Int(bufidx)]
+end
+
+"""
+Semantic checks for Utf8View/BinaryView: non-null long entries must point
+inside their indicated variadic buffer, and the inline prefix MUST be a copy
+of the referenced data's first four bytes (the spec's comparison-fast-path
+contract). Null entries' bytes are unrestricted by the spec, so only valid
+slots are checked; canonical zero-padding of short entries' unused inline
+bytes remains a `validate_full`-tier concern alongside canonical bitmaps.
+"""
+function _validate_view_values(t::ViewType, d::ArrayData)
+    views = rolebuffer(d, VIEWS)
+    for i = 1:d.len
+        isvalid_at(d, i) || continue
+        base = _viewbase(d, Int64(i))
+        len = loadat(views, Int32, base)
+        len >= 0 || throw(ValidationError("negative view length $len"))
+        len <= VIEW_INLINE_MAX && continue
+        bufidx = loadat(views, Int32, checked_add(base, Int64(8)))
+        off = Int64(loadat(views, Int32, checked_add(base, Int64(12))))
+        data = _viewdatabuffer(d, bufidx)
+        off >= 0 || throw(ValidationError("negative view offset $off"))
+        checked_add(off, Int64(len)) <= data.len ||
+            throw(ValidationError("view range [$off, $len) escapes data buffer $bufidx"))
+        for k = 0:3
+            loadat(views, UInt8, checked_add(base, Int64(4 + k))) ==
+                loadat(data, UInt8, checked_add(off, Int64(k))) ||
+                throw(ValidationError("view prefix does not match referenced data"))
+        end
+    end
+    return nothing
+end
+
+@inline function _listview_range(t::ListViewType, d::ArrayData, i::Int64)
+    wide = t.large
+    slot = _slotindex0(d, i)
+    offs = rolebuffer(d, ELEMENT_OFFSETS)
+    sizes = rolebuffer(d, SIZES)
+    off = wide ? loadat(offs, Int64, checked_mul(slot, Int64(8))) :
+        Int64(loadat(offs, Int32, checked_mul(slot, Int64(4))))
+    sz = wide ? loadat(sizes, Int64, checked_mul(slot, Int64(8))) :
+        Int64(loadat(sizes, Int32, checked_mul(slot, Int64(4))))
+    return off, sz
+end
+
+"""
+Semantic checks for ListView/LargeListView. The spec's invariants bind EVERY
+slot, null included: `0 <= offsets[i]`, `0 <= sizes[i]`, and
+`offsets[i] + sizes[i] <= child length`. Out-of-order and overlapping ranges
+are legal — that is the layout's point.
+"""
+function _validate_listview_values(t::ListViewType, d::ArrayData)
+    childlen = Int64(length(d.children[1]))
+    for i = 1:d.len
+        off, sz = _listview_range(t, d, Int64(i))
+        (off >= 0 && sz >= 0) ||
+            throw(ValidationError("list-view offset and size must be non-negative"))
+        checked_add(off, sz) <= childlen ||
+            throw(ValidationError("list-view range [$off, $sz) escapes child length $childlen"))
+    end
+    return nothing
+end
+
+"""
+Semantic checks for run-end encoding: a signed 16/32/64-bit run-ends child
+with no nulls, equal-length children (one value per run), run ends positive
+and strictly ascending, and the last run end covering every logical slot
+(`>= offset + length` — equality holds for unsliced arrays). The REE parent
+has no validity bitmap and its null count field is always 0; logical nulls
+live in the values child's runs.
+"""
+function _validate_ree_values(d::ArrayData)
+    runs, values = d.children[1], d.children[2]
+    rt = runs.type
+    rt isa IntType && rt.signed && rt.bits in (16, 32, 64) ||
+        throw(ValidationError("run-ends child must be a signed 16/32/64-bit integer"))
+    runs.len == values.len ||
+        throw(ValidationError("run-ends and values children must have equal length"))
+    nullcount(runs) == 0 || throw(ValidationError("a run end cannot be null"))
+    declared = @atomic :monotonic d.nullcount
+    declared > 0 && throw(ValidationError("the REE parent null count field is always 0"))
+    total = checked_add(d.offset, d.len)
+    data = rolebuffer(runs, DATA)
+    w = primwidth(rt)
+    prev = Int64(0)
+    for i = 1:runs.len
+        re = _load_int(data, rt, _slotbyteoff(runs, Int64(i), w))
+        re > prev ||
+            throw(ValidationError("run ends must be positive and strictly ascending"))
+        prev = re
+    end
+    d.len == 0 || prev >= total ||
+        throw(ValidationError("run ends cover $prev of $total logical slots"))
+    return nothing
+end
+
+"""
+The run whose end first reaches 1-based logical position `offset + i` —
+binary search over the run-ends child, the REE random-access primitive.
+"""
+function _ree_runindex(d::ArrayData, i::Int64)
+    runs = d.children[1]
+    rt = runs.type::IntType
+    data = rolebuffer(runs, DATA)
+    w = primwidth(rt)
+    target = checked_add(d.offset, i)
+    lo, hi = Int64(1), runs.len
+    while lo < hi
+        mid = (lo + hi) >>> 1
+        re = _load_int(data, rt, _slotbyteoff(runs, mid, w))
+        re >= target ? (hi = mid) : (lo = mid + 1)
+    end
+    return lo
+end
+
 function _logical_null_at(f::Field, d::ArrayData, i::Int64)
     t = d.type
     t isa NullType && return true
+    if t isa RunEndEncodedType
+        run = _ree_runindex(d, i)
+        return _logical_null_at(f.children[2], d.children[2], run)
+    end
     if t isa UnionType
         tid = loadat(rolebuffer(d, TYPE_IDS), Int8, _slotindex0(d, i))
         pos = findfirst(==(tid), t.typeids)
@@ -1360,6 +1491,17 @@ function _validate_field_contract_at(f::Field, d::ArrayData, i::Int64)
         # are not part of this logical value and must remain ignored.
         cf, cd, childi = _union_child(f, d, i)
         _validate_field_contract_at(cf, cd, childi)
+        return nothing
+    end
+    if t isa RunEndEncodedType
+        # Same bitmap-less shape as unions: the selected VALUES run supplies
+        # the value and any logical null. The runs child was already checked
+        # whole (no nulls, ascending) by the intrinsic stage.
+        if !f.nullable && _logical_null_at(f, d, i)
+            throw(ValidationError(
+                "non-nullable field $(repr(f.name)) contains a null at element $i"))
+        end
+        _validate_field_contract_at(f.children[2], d.children[2], _ree_runindex(d, i))
         return nothing
     end
 
@@ -1436,7 +1578,7 @@ function validate_full(f::Field, d::ArrayData)
 end
 
 function _validate_full_content(f::Field, d::ArrayData)
-    if d.type isa Utf8Type
+    if d.type isa Utf8Type || (d.type isa ViewType && d.type.utf8)
         for i = 1:d.len
             isvalid_at(d, i) || continue
             s = getvalue(f, d, i)::String
@@ -1715,9 +1857,41 @@ function _value(t::DictionaryType, f::Field, d::ArrayData, i::Int64)
         checked_add(Int64(idx), Int64(1)))
 end
 
-_value(t::Union{ViewType,ListViewType,RunEndEncodedType}, f::Field, d::ArrayData, i::Int64) =
-    error("element access for $(descriptorname(t)) is roadmap work (report §13, slices 2f/2h); " *
-          "the layout is registry-known and structurally validated only")
+function _value(t::ViewType, f::Field, d::ArrayData, i::Int64)
+    isvalid_at(d, i) || return missing
+    views = rolebuffer(d, VIEWS)
+    base = _viewbase(d, i)
+    len = loadat(views, Int32, base)
+    len >= 0 || throw(ValidationError("negative view length $len"))
+    n = Int64(len)
+    # Semantic validation certified geometry and prefixes; subslice re-checks
+    # bounds so unvalidated access still cannot escape a buffer.
+    bytes = if len <= VIEW_INLINE_MAX
+        slicebytes(subslice(views, checked_add(base, Int64(4)), n))
+    else
+        bufidx = loadat(views, Int32, checked_add(base, Int64(8)))
+        off = Int64(loadat(views, Int32, checked_add(base, Int64(12))))
+        off >= 0 || throw(ValidationError("negative view offset $off"))
+        slicebytes(subslice(_viewdatabuffer(d, bufidx), off, n))
+    end
+    return t.utf8 ? String(bytes) : bytes
+end
+
+function _value(t::ListViewType, f::Field, d::ArrayData, i::Int64)
+    isvalid_at(d, i) || return missing
+    off, sz = _listview_range(t, d, i)
+    (off >= 0 && sz >= 0) ||
+        throw(ValidationError("list-view offset and size must be non-negative"))
+    child, cf = d.children[1], f.children[1]
+    out = Vector{Any}(undef, Int(sz))
+    for k = 1:Int(sz)
+        out[k] = getvalue(cf, child, checked_add(off, Int64(k)))
+    end
+    return out
+end
+
+_value(::RunEndEncodedType, f::Field, d::ArrayData, i::Int64) =
+    getvalue(f.children[2], d.children[2], _ree_runindex(d, i))
 
 """
     materialize(field, data) -> Vector
