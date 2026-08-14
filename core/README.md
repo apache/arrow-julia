@@ -39,7 +39,9 @@ listed under Honest status.
 | `examples/ipc_read.jl` | Checked IPC stream framing, a bounded metadata verifier, metadata-to-Core mapping, dictionary state, and one registry-driven decoder over real 2.x-written streams |
 | `examples/ipc_write.jl` | The write half over the same registry: Core-to-metadata mapping, one generic registry-driven encoder, replacement-on-change dictionary batches, per-buffer compression, and the file format (Block index + Footer) with a lazy random-access `ArrowFile` reader |
 | `examples/cdata.jl` | Full mapped C Data format parity plus bidirectional `ArrowArrayStream`, zero-copy ownership, move semantics, and exactly-once release tests |
-| `REVIEW-codex-r1.md` through `REVIEW-codex-r15.md` | Adversarial review findings and the disposition of each item |
+| `examples/scan_ranges.jl` | Stage-A `Tables.Scan` pushdown, sparse byte-range reads, embedded per-batch statistics, and differential/fetch/trust acceptance tests |
+| `DESIGN-scan-ranges-trim.md` | The P1–P3 prove-out contract and the remaining P4 production/trim work |
+| `REVIEW-codex-r1.md` through `REVIEW-codex-r18.md` | Adversarial review findings and the disposition of each item |
 
 ## Run it
 
@@ -48,8 +50,14 @@ julia --startup-file=no core/test/runtests.jl
 julia --project=. --startup-file=no core/examples/ipc_read.jl   # needs the repo project (uses 2.x to write test bytes)
 julia --project=. --startup-file=no core/examples/ipc_write.jl  # needs the repo project (2.x reads this writer's bytes back)
 julia --startup-file=no core/examples/cdata.jl
+julia --project=. --startup-file=no core/examples/scan_ranges.jl
 julia --startup-file=no core/test/trim_compile_tests.jl         # JuliaC --trim=safe gate (installs JuliaC on first run)
 ```
+
+`scan_ranges.jl` currently needs Tables.jl's unreleased `jq/scan` branch.
+Develop `~/.julia/dev/Tables` into the repository project before running it.
+The local `Manifest.toml` records that development dependency and is not part
+of this prove-out.
 
 ## What each report claim looks like in code
 
@@ -194,6 +202,18 @@ allocation budget and codec contexts over the shared, eagerly-decoded
 dictionary set, so concurrent reads need no coordination. An `mmapregion`
 input exercises the same path over a mapped file.
 
+`scan_ranges.jl` extends the file adapter only. Stage A binds a `Tables.Scan`,
+decodes the selected and filter columns, keeps projection/filter/type work in
+a resolved residual, and consumes `limit`/`offset` only when no filter is
+present and the active Tables authority can represent the window safely.
+`RangedFile` uses the Footer as its sole schema authority, validates all Block
+and RecordBatch metadata before it plans body ranges, and intentionally does
+not fetch the leading schema message or optional EOS marker. Embedded batch
+statistics use the official Arrow statistics value layout under the local
+`JuliaArrow:batch_statistics.v1` placement key. They are trusted for
+completeness: conservative lies cost pruning, but narrow lies can lose rows.
+This is prove-out code, not yet part of the package API.
+
 Core supports the full Int8 union-id domain and the IPC writer preserves
 custom mappings. The 2.x interoperability checks use canonical union ids;
 Arrow.jl 2.x currently treats a custom id as a child position and cannot read
@@ -294,6 +314,10 @@ StructUtils harnesses: **zero verifier errors, zero verifier warnings, and
 the produced binary runs to exit 0** (binary ≈ 2.2 MB). The design rules
 that get a runtime-tagged core there — worth carrying into the real
 implementation:
+
+The current harness does not load the project-dependent scan/range/statistics
+example. P4 must add a scan-and-materialize trim workload before those paths
+can claim the same guarantee.
 
 - **Closed-set dispatch ladders.** Dispatch on an abstract-typed field is
   dynamic; the descriptor set is closed (it IS the layout registry), so

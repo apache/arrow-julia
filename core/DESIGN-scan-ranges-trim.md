@@ -1,11 +1,11 @@
 # Design: Tables.Scan pushdown, cloud byte-range reads, and the trim contract
 
-Status: PROPOSAL (Aug 14, 2026) — extends the redesign report's §9 IPC adapter
-and §14 decision rules. Nothing here is implemented yet except where noted as
-already existing in the prove-out. The three pieces are designed together
-because they share one mechanism: **a bound column set drives both what gets
-decoded and what gets fetched, and every value involved is plain data the
-trim verifier can see through.**
+Status: P1–P3 PROVE-OUT IMPLEMENTED (Aug 14, 2026); P4 remains a production
+proposal. This extends the redesign report's §9 IPC adapter and §14 decision
+rules. The three pieces share one mechanism: **a bound column set drives both
+what gets decoded and what gets fetched, and every request value is plain
+data intended to remain visible to the trim verifier.** Section 4 separates
+that design intent from what the current trim harness actually compiles.
 
 ---
 
@@ -27,8 +27,8 @@ select/rename/type items, a closed predicate algebra (`Cmp`/`In`/`IsNull`/
 
 | Axis | Mechanism | Exactness |
 |---|---|---|
-| `select` | decode only (selected ∪ filter-referenced) columns: a registry-driven `skipfield!` advances the node/buffer cursor past unselected fields without slicing, validating, or materializing them. Nested subtrees skip with their parent; unselected dictionary columns skip their dictionary batches (file format: never even framed). | exact as IO/decode reduction (see below for who projects) |
-| `limit`/`offset` | `RecordBatch.length` is wire metadata: whole batches before `offset` and after `offset+limit` are never decoded (file format: never fetched). Row counts are known without touching a single body byte. | exact when no filter; poisoned by any filter per the contract |
+| `select` | decode only (selected ∪ filter-referenced) columns: a registry-driven `skipfield!` advances the node/buffer cursor past unselected fields without body slicing, content validation, or materialization. Complete node/buffer metadata is still validated first. Nested subtrees skip with their parent; bodies for unselected dictionary columns are not fetched. | exact as IO/decode reduction (see below for who projects) |
+| `limit`/`offset` | `RecordBatch.length` is wire metadata: whole batches before `offset` and after `offset+limit` are never decoded. Ranged reads still fetch candidate RecordBatch metadata because Footer Blocks have no row counts, but they do not fetch excluded body bytes. | exact when no filter; poisoned by any filter per the contract |
 | `filter` | two tiers: (a) **statistics pruning** — per-batch min/max/null-count, when present (§3 of this doc), prune batches that cannot satisfy the predicate; (b) **mask at materialization** — evaluate the predicate over decoded columns through Core accessors and apply the mask when building output columns. | (a) inexact — filter stays in residual; (b) exact — enables limit pushdown with filters |
 | `types` (`ref => T`) | left in the residual for `finish`'s elementwise convert. Arrow's schema is source-fixed; an override is a conversion request, not a parse seed (unlike CSV). Exception: see §4 — in trim mode the overrides double as the known-schema pin. | residual |
 
@@ -93,17 +93,16 @@ construction, `limit`/`offset` composed with exact masks. Residual: empty,
 CSV-kernel style. Stage B subsumes Stage A; Stage A ships first because it
 needs no facade.
 
-Predicate evaluation in both stages is a **closed `isa` ladder over the
-closed `ScanExpr` set**, walking Core accessors (`isvalid_at` + `_value`)
-column-at-a-time. `OpNode` is rejected (the algebra's own documented rule:
-only sources that recognize a node may consume it; ours recognizes none).
-No closures, no `Function` fields — the evaluator is trim-clean by the same
-construction as the layout registry (§4).
+Stage B's future row evaluator is a **closed `isa` ladder over the closed
+`ScanExpr` set**, walking Core accessors (`isvalid_at` + `_value`)
+column-at-a-time. Stage A implements only `_maypass`, a separate closed ladder
+over statistics values. `Tables.bind` rejects `OpNode` because this adapter
+recognizes none. No closures or `Function` fields are needed.
 
-Dictionary columns prune cheaply under equality/membership predicates: test
-the predicate against the **pool** once, then compare index sets — worth
-noting in the design since the snapshot model makes pool identity stable per
-batch run.
+The P3 statistics fold resolves dictionary indices through the pool before it
+computes logical null/min/max values. A future Stage B row evaluator can test
+equality/membership against each stable pool snapshot once and then compare
+indices; that pool-index optimization is not part of Stage A.
 
 ---
 
@@ -170,8 +169,9 @@ live in extensions:
         # concurrent range GETs (CloudStore does this well) — concurrency
         # stays in the extension, never in Arrow.
 
-- `readfile(::RangedSource; scan=...)` is the entry point; the existing
-  whole-buffer and `mmapregion` paths become trivial `RangedSource`s
+- The prove-out entry point is `Tables.read(RangedFile(source), scan)`. A
+  production `readfile(::RangedSource; scan=...)` can make the existing
+  whole-buffer and `mmapregion` paths trivial `RangedSource`s
   (fetch = copy/subslice), so ONE reader serves local and remote and the
   differential test is free: sparse fetch ≡ whole-file read, plus
   fetch-count/byte-count assertions on a counting test source.
@@ -206,7 +206,7 @@ body fetch. Skipped buffer contents remain unread and unvalidated by design.
 Arrow's format has no per-batch statistics on the wire; the ecosystem's
 "statistics schema" standardizes the **value layout** for exchanging
 statistics as Arrow data, but placement in IPC files is not (yet)
-standardized upstream. Proposal, kept deliberately conservative:
+standardized upstream. The prove-out convention is deliberately conservative:
 
 - **Placement (our convention, upgradeable)**: one schema-level custom
   metadata key, e.g. `JuliaArrow:batch_statistics.v1`, carried in the
@@ -248,10 +248,12 @@ standardized upstream. Proposal, kept deliberately conservative:
 
 ## 4. The trim contract (staying on the radar, explicitly)
 
-Reaffirmed: **trimmability is a standing gate, not an aspiration.** The
-prove-out's `--trim=safe` gate (0 errors / 0 warnings / binary exit 0) has
-stayed green through every round; the rules that keep it green are in the
-README ("Trim-compile support") and they bind this design too:
+Reaffirmed: **trimmability is a standing production gate, not an aspiration.**
+The current `--trim=safe` harness (0 errors / 0 warnings / binary exit 0)
+compiles `ArrowCore.jl` plus its value-domain workload. It does **not** load
+the repo-project-dependent `examples/scan_ranges.jl`, so it is not yet proof
+that P1/P2/P3 compile under trim. The rules in the README ("Trim-compile
+support") still constrain the production form:
 
 - `Tables.Scan` is already trim-aligned by its own charter (no `Function`
   fields; closed algebra). Our evaluator adds the same closed-set `isa`
@@ -263,10 +265,10 @@ README ("Trim-compile support") and they bind this design too:
 - **Two-tier public API (mirroring the CSV rewrite)**: the runtime-tagged
   core is inherently trim-safe — descriptors are values, accessors use
   literal load widths, struct scalars are `Vector{Pair{String,Any}}`. So:
-  - **Tier 1 (trimmable, guaranteed)**: the value-domain entry points —
+  - **Tier 1 (production trim target)**: the value-domain entry points —
     open/scan/materialize returning value-domain data, plus C-data/stream
-    interop. Gate: a trim harness compiles a scan-and-materialize app at
-    0/0/exit-0, permanently in CI.
+    interop. P4 must add a harness that compiles a scan-and-materialize app at
+    0/0/exit-0 and keep it permanently in CI before this becomes guaranteed.
   - **Tier 2 (dynamic, ergonomic)**: the typed facade (`Arrow.Table`
     property access, NamedTuple rows, ViewPlan specialization) — explicitly
     NOT trim-guaranteed, same split the CSV rewrite made.
@@ -301,8 +303,9 @@ README ("Trim-compile support") and they bind this design too:
 - **P4 (production)**: `ArrowCloudStoreExt`, Stage B facade `apply`,
   upstream-placement tracking for statistics.
 
-Open decisions before P1 starts: (a) Stage-A residual shape as specified
-(full residual, source names) — sign-off; (b) `RangedSource` functor vs
-abstract type; (c) statistics placement key + whether P3 lands in the
-prove-out or waits for the real package; (d) whether `Tables.jl#jq/scan`
-is API-stable enough to build against now, or P1 should pin a commit.
+Resolved prove-out decisions: Stage A returns a resolved full residual;
+`RangedSource` uses a parametric functor; P3 uses
+`JuliaArrow:batch_statistics.v1`; and the example develops Tables.jl's
+`jq/scan` branch without claiming that branch is a released API. P4 must
+settle the released Tables dependency, cloud extensions, standardized
+statistics placement, Stage B, and the missing scan trim harness.
