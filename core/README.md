@@ -209,9 +209,10 @@ present and the active Tables authority can represent the window safely.
 `RangedFile` uses the Footer as its sole schema authority. It validates the
 full Footer Block index and the complete metadata plan for every
 statistics-surviving record before it requests a body range. Per-record limits
-stay lazy, so statistics-pruned record metadata is not fetched or validated.
-It does not parse or cross-check the leading schema message or optional EOS
-marker, although tail reads and coalescing can physically over-read them.
+stay lazy, so no separate range is requested for statistics-pruned record
+metadata and it is not parsed or validated. It does not parse or cross-check
+the leading schema message or optional EOS marker. Tail reads and coalescing
+can physically over-read any of these unrequested bytes.
 Embedded batch statistics use the official Arrow statistics value layout
 under the local `JuliaArrow:batch_statistics.v1` placement key. They are
 trusted for completeness: conservative lies cost pruning, but narrow lies can

@@ -158,6 +158,105 @@ function _recordbatchmeta(header::Meta.RecordBatch, fields, limits::Limits,
     return rblen
 end
 
+function _planadd(a::Int64, b::Int64, what::AbstractString)
+    try
+        return AC.checked_add(a, b)
+    catch e
+        e isa OverflowError || rethrow()
+        throw(ValidationError("$what overflows"))
+    end
+end
+
+function _planmul(a::Int64, b::Int64, what::AbstractString)
+    try
+        return AC.checked_mul(a, b)
+    catch e
+        e isa OverflowError || rethrow()
+        throw(ValidationError("$what overflows"))
+    end
+end
+
+function _planminbytes(role, spec, node, len::Int64)
+    if role == AC.VALIDITY
+        len == 0 && node.null_count == 0 && return Int64(0)
+        return node.length ÷ 8 + (node.length % 8 == 0 ? 0 : 1)
+    elseif role == AC.DATA
+        spec.fixedwidth > 0 && return _planmul(
+            node.length, Int64(spec.fixedwidth), "planned data-buffer size")
+        if spec.fixedwidth == -1
+            return node.length ÷ 8 + (node.length % 8 == 0 ? 0 : 1)
+        end
+        return Int64(0)
+    elseif role == AC.OFFSETS
+        len == 0 && node.length == 0 && return Int64(0)
+        count = _planadd(node.length, Int64(1), "planned offset count")
+        return _planmul(count, Int64(spec.offsetwidth), "planned offsets-buffer size")
+    elseif role == AC.ELEMENT_OFFSETS || role == AC.SIZES
+        return _planmul(node.length, Int64(spec.offsetwidth),
+            "planned element-buffer size")
+    elseif role == AC.TYPE_IDS
+        return node.length
+    elseif role == AC.VIEWS
+        return _planmul(node.length, Int64(16), "planned views-buffer size")
+    end
+    return Int64(0)
+end
+
+function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
+    node = takenode!(c)
+    spec = layoutspec(f.type)
+    for role in spec.buffers
+        _, len = _buffermeta!(c)
+        if codec == CODEC_NONE || len == 0
+            need = _planminbytes(role, spec, node, len)
+            len >= need || throw(ValidationError(
+                "planned buffer length $len is smaller than required $need"))
+        else
+            len >= 8 || throw(ValidationError(
+                "compressed buffer of $len bytes lacks its length prefix"))
+        end
+    end
+    f.type isa DictionaryType && return node.length
+    nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
+    childlens = Int64[_validateplannedfield!(f.children[i], c, codec)
+                      for i = 1:nchildren]
+    t = f.type
+    if t isa FixedSizeListType
+        need = _planmul(node.length, Int64(t.listsize),
+            "fixed-size-list child length")
+        childlens[1] >= need || throw(ValidationError(
+            "fixed-size-list child is shorter than its parent extent"))
+    elseif t isa StructType || (t isa UnionType && t.mode == AC.SparseMode)
+        all(>=(node.length), childlens) || throw(ValidationError(
+            "struct or sparse-union child is shorter than its parent extent"))
+    elseif t isa RunEndEncodedType
+        node.null_count == 0 || throw(ValidationError(
+            "REE parent null count must be zero"))
+        childlens[1] == childlens[2] || throw(ValidationError(
+            "REE run-end and value child lengths must match"))
+        node.length == 0 || childlens[1] > 0 || throw(ValidationError(
+            "a nonempty REE array requires at least one physical run"))
+        runtype = f.children[1].type::IntType
+        maxrunend = runtype.bits == 16 ? Int64(typemax(Int16)) :
+            runtype.bits == 32 ? Int64(typemax(Int32)) : typemax(Int64)
+        node.length <= maxrunend || throw(ValidationError(
+            "REE logical extent exceeds its run-end range"))
+    end
+    return node.length
+end
+
+"Validate every metadata-only invariant for the subtrees whose bodies are planned."
+function _validatebodyplan(header::Meta.RecordBatch, fields, limits::Limits,
+    codec::Int8, mask::AbstractVector{Bool})
+    cursor = DecodeCursor(header.nodes, header.buffers, BufferSlice(), limits;
+        codec=codec)
+    for (j, f) in enumerate(fields)
+        mask[j] ? _validateplannedfield!(f, cursor, codec) : skipfield!(f, cursor)
+    end
+    finishcursor!(cursor)
+    return nothing
+end
+
 """
 Like `missingdicts`, but a missing dictionary only matters when its field is
 in the decode set — a batch may legally reference an id its skipped columns
@@ -677,9 +776,9 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
 
     # Statistics pruning happens FIRST (design §3): the stats live in the
-    # footer schema's metadata, so pruned batches never even get their
-    # block metadata fetched. Pruning applies only under a filter, and the
-    # window applies only without one, so the two never interact.
+    # footer schema's metadata, so pruned batches cause no block-metadata range
+    # request. Tail reads may still over-read them. Pruning applies only under
+    # a filter, and the window applies only without one, so they never interact.
     nrec = length(recordblocks)
     keep = trues(nrec)
     if scan.filter !== nothing
@@ -759,13 +858,19 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
         header.id in seenids &&
             throw(ValidationError("the file format carries one dictionary batch per id"))
         push!(seenids, header.id)
-        _recordbatchmeta(header.data, (dictvaluefields[header.id],), limits, block[3])
-        _batchcodec(header.data.compression, blockmeta[i][2])
-        header.id in needed && push!(wanted_dict, i)
+        rb = header.data
+        vf = dictvaluefields[header.id]
+        _recordbatchmeta(rb, (vf,), limits, block[3])
+        codec = _batchcodec(rb.compression, blockmeta[i][2])
+        if header.id in needed
+            _validatebodyplan(rb, (vf,), limits, codec, Bool[true])
+            push!(wanted_dict, i)
+        end
     end
     for (p, _, _) in window
         _, v = blockmeta[length(dictblocks) + p]
-        _batchcodec(headers[p].compression, v)
+        codec = _batchcodec(headers[p].compression, v)
+        _validatebodyplan(headers[p], fields, limits, codec, mask)
     end
     missingids = setdiff(needed, seenids)
     isempty(missingids) || throw(ValidationError(
@@ -1314,6 +1419,36 @@ function _bufferposition(bytes::Vector{UInt8}, i::Int, bufindex::Int)
     return bodystart + Int64(buf.offset), Int64(buf.length)
 end
 
+function _setbufferlength!(bytes::Vector{UInt8}, block::NTuple{3,Int64},
+    bufindex::Int, len::Int64)
+    meta = copy(bytes[(block[1] + 9):(block[1] + block[2])])
+    msg = _vtable(meta, Int64(_vu32(meta, 0)))
+    header = _headertable(meta, msg)
+    kind = _vu8(meta, _vfield(msg, 1, 1; required=true))
+    rb = kind == UInt8(2) ?
+        _vtable(meta, _vref(header, 1; required=true)) : header
+    start, n = _vvector(rb, 2, 16; required=true)
+    1 <= bufindex <= n || throw(BoundsError(1:n, bufindex))
+    _write_i64!(meta, start + (bufindex - 1) * 16 + 8, len)
+    copyto!(bytes, block[1] + 9, meta, 1, length(meta))
+    return bytes
+end
+
+function _setnodelength!(bytes::Vector{UInt8}, block::NTuple{3,Int64},
+    nodeindex::Int, len::Int64)
+    meta = copy(bytes[(block[1] + 9):(block[1] + block[2])])
+    msg = _vtable(meta, Int64(_vu32(meta, 0)))
+    header = _headertable(meta, msg)
+    kind = _vu8(meta, _vfield(msg, 1, 1; required=true))
+    rb = kind == UInt8(2) ?
+        _vtable(meta, _vref(header, 1; required=true)) : header
+    start, n = _vvector(rb, 1, 16; required=true)
+    1 <= nodeindex <= n || throw(BoundsError(1:n, nodeindex))
+    _write_i64!(meta, start + (nodeindex - 1) * 16, len)
+    copyto!(bytes, block[1] + 9, meta, 1, length(meta))
+    return bytes
+end
+
 "File fixture carrying Arrow 0.17's V4 message-level compression marker."
 function _legacyv4file()
     stream = _experimental_v4_stream(Int64(42))
@@ -1624,15 +1759,16 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
 
     # Dictionary bodies are fetched only when a dictionary column is in the
     # decode set.
-    dictblockbody = let
+    dictblock = let
         # dict block extents via the footer: re-derive from the file bytes
         footerlen = Int64(reinterpret(Int32,
             filebytes[(end - 9):(end - 6)])[1])
         fb = filebytes[(end - 9 - footerlen):(end - 10)]
         _, _, dblocks, _, _ = verify_footer(fb, Limits())
         @assert length(dblocks) == 1
-        (dblocks[1][1] + dblocks[1][2], dblocks[1][3])
+        dblocks[1]
     end
+    dictblockbody = (dictblock[1] + dictblock[2], dictblock[3])
     lognod, srcnod = countingsource(filebytes)
     Tables.read(RangedFile(srcnod; tailbytes=256, coalesce_gap=0), Tables.Scan(select=(:ints,)))
     @assert !any(_fetched(lognod, dictblockbody[1] + k)
@@ -1710,6 +1846,77 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert isequal(collect(Any, gotz.x), collect(Any, zfull.x))
     @assert logz.bytes < length(zbytes)
     println("compressed files range-read through self-contained buffers ✓")
+
+    # Every failure derivable from the selected metadata plan precedes its
+    # first body request. Skipped columns and window-excluded batches keep
+    # their intentional lazy boundary.
+    block1 = af.recordblocks[1]
+    badfixed = _setbufferlength!(copy(filebytes), block1, 2, Int64(1))
+    fixedoff, _ = _bufferposition(filebytes, 1, 2)
+    @assert _rejects(() -> Tables.read(readfile(copy(badfixed)),
+        Tables.Scan(select=(:ints,))))
+    logfixed, srcfixed = countingsource(badfixed)
+    @assert _rejects(() -> Tables.read(RangedFile(srcfixed;
+        tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:ints,))))
+    @assert !_fetched(logfixed, fixedoff)
+    skipped = Tables.read(RangedFile(RangedSource(copy(badfixed));
+        tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:floats,)))
+    @assert isequal(collect(Any, skipped.floats), collect(Any, full.floats))
+
+    validio = IOBuffer()
+    validdata = Union{Missing,Int64}[missing; collect(Int64, 2:16)]
+    Arrow.write(validio, (x=validdata,); file=false)
+    validbytes = writefile(readstream(take!(validio)))
+    validfile = readfile(copy(validbytes))
+    badvalid = _setbufferlength!(copy(validbytes), validfile.recordblocks[1],
+        1, Int64(1))
+    validpos, _ = _bufferposition(validbytes, 1, 1)
+    logvalid, srcvalid = countingsource(badvalid)
+    @assert _rejects(() -> Tables.read(RangedFile(srcvalid;
+        tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:x,))))
+    @assert !_fetched(logvalid, validpos)
+
+    badoffsets = _setbufferlength!(copy(filebytes), block1, 8, Int64(4))
+    offsetpos, _ = _bufferposition(filebytes, 1, 8)
+    logoffsets, srcoffsets = countingsource(badoffsets)
+    @assert _rejects(() -> Tables.read(RangedFile(srcoffsets;
+        tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:strs,))))
+    @assert !_fetched(logoffsets, offsetpos)
+
+    badstruct = _setnodelength!(copy(filebytes), block1, 8, Int64(4))
+    structpos, _ = _bufferposition(filebytes, 1, 16)
+    logstruct, srcstruct = countingsource(badstruct)
+    @assert _rejects(() -> Tables.read(RangedFile(srcstruct;
+        tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:structs,))))
+    @assert !_fetched(logstruct, structpos)
+
+    zfile = readfile(copy(zbytes))
+    zblock = zfile.recordblocks[1]
+    badcompressed = _setbufferlength!(copy(zbytes), zblock, 2, Int64(1))
+    compressedpos, _ = _bufferposition(zbytes, 1, 2)
+    logcompressed, srccompressed = countingsource(badcompressed)
+    @assert _rejects(() -> Tables.read(RangedFile(srccompressed;
+        tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:x,))))
+    @assert !_fetched(logcompressed, compressedpos)
+
+    baddict = _setbufferlength!(copy(filebytes), dictblock, 2, Int64(1))
+    logbaddict, srcbaddict = countingsource(baddict)
+    @assert _rejects(() -> Tables.read(RangedFile(srcbaddict;
+        tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:dict,))))
+    @assert !any(_fetched(logbaddict, dictblockbody[1] + k)
+                 for k = 0:8:(dictblockbody[2] - 1))
+    skippeddict = Tables.read(RangedFile(RangedSource(copy(baddict));
+        tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:ints,)))
+    @assert isequal(collect(Any, skippeddict.ints), collect(Any, full.ints))
+
+    badwindow = _setbufferlength!(copy(filebytes), af.recordblocks[2], 2, Int64(1))
+    windowpos, _ = _bufferposition(filebytes, 2, 2)
+    logwindow, srcwindow = countingsource(badwindow)
+    windowed = Tables.read(RangedFile(srcwindow; tailbytes=32, coalesce_gap=0),
+        Tables.Scan(select=(:ints,), limit=5))
+    @assert isequal(collect(Any, windowed.ints), collect(Any, full.ints[1:5]))
+    @assert !_fetched(logwindow, windowpos)
+    println("planned metadata failures reject before body fetches ✓")
 
     # Legacy V4 message-level compression is rejected from metadata even when
     # limit=0 leaves no body to decode.
