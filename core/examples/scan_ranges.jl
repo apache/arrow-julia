@@ -224,6 +224,9 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8,
         else
             len >= 8 || throw(ValidationError(
                 "compressed buffer of $len bytes lacks its length prefix"))
+            need = _planminbytes(role, spec, node, Int64(0))
+            need > 0 && len == 8 && throw(ValidationError(
+                "compressed planned buffer requires a nonempty payload"))
         end
     end
     f.type isa DictionaryType && return node.length
@@ -1953,7 +1956,8 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     sparseblock = sparsefile.recordblocks[1]
     sparsepos, _ = _bufferposition(sparsebytes, 1, 1)
     sparsefailures = (
-        _setnodelength!(copy(sparsebytes), sparseblock, 2, Int64(2)),
+        _setnodenullcount!(_setnodelength!(copy(sparsebytes), sparseblock,
+            2, Int64(2)), sparseblock, 2, Int64(2)),
         _setnodenullcount!(copy(sparsebytes), sparseblock, 1, Int64(1)),
         _setnodenullcount!(copy(sparsebytes), sparseblock, 2, Int64(0)))
     for broken in sparsefailures
@@ -1965,12 +1969,14 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
 
     zfile = readfile(copy(zbytes))
     zblock = zfile.recordblocks[1]
-    badcompressed = _setbufferlength!(copy(zbytes), zblock, 2, Int64(1))
     compressedpos, _ = _bufferposition(zbytes, 1, 2)
-    logcompressed, srccompressed = countingsource(badcompressed)
-    @assert _rejects(() -> Tables.read(RangedFile(srccompressed;
-        tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:x,))))
-    @assert !_fetched(logcompressed, compressedpos)
+    for badlen in (Int64(1), Int64(8))
+        badcompressed = _setbufferlength!(copy(zbytes), zblock, 2, badlen)
+        logcompressed, srccompressed = countingsource(badcompressed)
+        @assert _rejects(() -> Tables.read(RangedFile(srccompressed;
+            tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:x,))))
+        @assert !_fetched(logcompressed, compressedpos)
+    end
 
     baddict = _setbufferlength!(copy(filebytes), dictblock, 2, Int64(1))
     logbaddict, srcbaddict = countingsource(baddict)
