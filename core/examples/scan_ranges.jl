@@ -353,7 +353,8 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
         # empty under the filter; the filter itself always stays in the residual.
         keep = trues(length(f))
         if scan.filter !== nothing
-            stats = _readstats(f.schema.metadata, length(f))
+            stats = _readstats(f.schema.metadata, length(f), f.fields;
+                limits=f.limits, budget=budget)
             stats === nothing ||
                 (keep = Bool[_maypass(scan.filter, stats[i].cols, names, stats[i].rows)
                              for i = 1:length(f)])
@@ -671,7 +672,8 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     nrec = length(recordblocks)
     keep = trues(nrec)
     if scan.filter !== nothing
-        stats = _readstats(coremetadata(metaschema.custom_metadata), nrec)
+        stats = _readstats(coremetadata(metaschema.custom_metadata), nrec, fields;
+            limits=limits, budget=budget)
         stats === nothing ||
             (keep = Bool[_maypass(scan.filter, stats[i].cols, names, stats[i].rows)
                          for i = 1:nrec])
@@ -863,7 +865,7 @@ function _statsschema()
             children=Field[entries])])
 end
 
-_bitmapbytes(bits::Vector{Bool}) = begin
+_bitmapbytes(bits::AbstractVector{Bool}) = begin
     bytes = zeros(UInt8, cld(length(bits), 8))
     for (i, b) in enumerate(bits)
         b && (bytes[1 + (i - 1) ÷ 8] |= UInt8(1) << ((i - 1) % 8))
@@ -890,19 +892,31 @@ union's members: Int64 for integral scalars (dates, times, timestamps, and
 durations are integral in the value domain), Float64, String, Bool.
 """
 function _statfold(f::Field, d::ArrayData)
-    nc = AC.nullcount(d)
     t = f.type
     stat = t isa DictionaryType ? t.valuetype : t
+    nc = if t isa DictionaryType
+        count(1:d.len) do i
+            !AC.isvalid_at(d, i) || ismissing(AC.getvalue(f, d, i))
+        end
+    else
+        AC.nullcount(d)
+    end
     supported = stat isa IntType ? (stat.signed || stat.bits < 64) :
         stat isa FloatType || stat isa BoolType || stat isa Utf8Type ||
         stat isa DateType || stat isa TimeType || stat isa TimestampType ||
         stat isa DurationType
     supported || return nc, nothing, nothing
     lo = hi = nothing
+    hasnan = false
     for i = 1:d.len
         AC.isvalid_at(d, i) || continue
         v = AC.getvalue(f, d, i)
+        ismissing(v) && continue
         v isa NamedTuple && return nc, nothing, nothing
+        if v isa AbstractFloat && isnan(v)
+            hasnan = true
+            continue
+        end
         if lo === nothing
             lo = v
             hi = v
@@ -913,8 +927,8 @@ function _statfold(f::Field, d::ArrayData)
     end
     _statnorm(v) = v isa Bool ? v : v isa AbstractString ? String(v) :
         v isa AbstractFloat ? Float64(v) : Int64(v)
-    return nc, lo === nothing ? nothing : _statnorm(lo),
-        hi === nothing ? nothing : _statnorm(hi)
+    return nc, lo === nothing || hasnan ? nothing : _statnorm(lo),
+        hi === nothing || hasnan ? nothing : _statnorm(hi)
 end
 
 "One statistics record batch (the official layout) for one data batch."
@@ -993,9 +1007,11 @@ function withstatistics(sch::Schema, batches::AbstractVector{AC.RecordBatch})
     statsbatches = AC.RecordBatch[]
     for batch in batches
         colstats = Tuple{Int,Int64,Any,Any}[]
+        fieldref = 1  # official zero-based FieldNode index, plus one for _statsbatch
         for (j, (f, col)) in enumerate(zip(sch.fields, batch.columns))
             nc, lo, hi = _statfold(f, col)
-            push!(colstats, (j, nc, lo, hi))
+            push!(colstats, (fieldref, nc, lo, hi))
+            fieldref += _fieldnodespan(f)
         end
         push!(statsbatches, _statsbatch(statssch, batch.nrows, colstats))
     end
@@ -1006,6 +1022,34 @@ function withstatistics(sch::Schema, batches::AbstractVector{AC.RecordBatch})
         endianness=sch.endianness)
 end
 
+"Validate the canonical outer statistics-schema shape before using values."
+function _validatestatsschema(sch::Schema)
+    length(sch.fields) == 2 ||
+        throw(ArgumentError("statistics schema must have two fields"))
+    column, statistics = sch.fields
+    ct = column.type
+    column.name == "column" && column.nullable && ct isa IntType &&
+        ct.bits == 32 && ct.signed && isempty(column.children) ||
+        throw(ArgumentError("statistics column field is not nullable int32"))
+    statistics.name == "statistics" && !statistics.nullable &&
+        statistics.type isa MapType && length(statistics.children) == 1 ||
+        throw(ArgumentError("statistics field is not a non-null map"))
+    entries = statistics.children[1]
+    !entries.nullable && entries.type isa StructType &&
+        length(entries.children) == 2 ||
+        throw(ArgumentError("statistics map entries are not a non-null key/value struct"))
+    key, value = entries.children
+    kt = key.type
+    !key.nullable && kt isa DictionaryType && kt.indextype.bits == 32 &&
+        kt.indextype.signed && kt.valuetype isa Utf8Type &&
+        !kt.valuetype.large && isempty(key.children) ||
+        throw(ArgumentError("statistics keys are not non-null dictionary<utf8, int32>"))
+    !value.nullable && value.type isa UnionType &&
+        value.type.mode == AC.DenseMode ||
+        throw(ArgumentError("statistics values are not a non-null dense union"))
+    return nothing
+end
+
 statsfile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
     compress::Symbol=:none) =
     writefile(withstatistics(sch, batches), batches; compress=compress)
@@ -1013,22 +1057,43 @@ statsfile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
 # ---- read + prune ---------------------------------------------------------
 
 """
-Parse the statistics blob back through this reader. Any failure — missing
-key, corrupt base64, corrupt stream, wrong batch count — degrades to
-`nothing`: no pruning, never an error. Returns per-batch `Dict{Int,...}`
-column stats (1-based indices) with `missing` bounds where absent.
+Parse the statistics blob back through this reader. A missing key, corrupt
+base64/stream, wrong schema, or wrong batch count degrades to `nothing` (no
+pruning). Exhausting the caller's cumulative allocation budget still throws.
+Returns per-batch `Dict{Int,...}` column stats (1-based top-level indices)
+with `missing` bounds where absent.
 """
-function _readstats(metadata, nbatches::Int)
+function _readstats(metadata, nbatches::Int, datafields=nothing;
+    limits::Limits=Limits(), budget::Union{Nothing,AllocationBudget}=nothing)
     metadata === nothing && return nothing
     blob = get(Dict(metadata), STATS_KEY, nothing)
     blob === nothing && return nothing
+    localbudget = budget === nothing ?
+        AllocationBudget(limits.max_total_allocated_bytes) : budget
     try
-        stream = readstream(Base64.base64decode(blob))
+        encodedbytes = Int64(ncodeunits(blob))
+        maxdecoded = AC.checked_mul(cld(encodedbytes, Int64(4)), Int64(3))
+        _charge!(localbudget, maxdecoded, "statistics base64 allocation")
+        decoded = Base64.base64decode(blob)
+        localbudget.left += maxdecoded - Int64(length(decoded))
+        stream = _readstream(decoded, limits, localbudget)
         length(stream.batches) == nbatches || return nothing
+        _validatestatsschema(stream.schema)
         colfield, mapfield = stream.schema.fields
-        out = map(stream.batches) do sb
+        wiretotop = Dict{Int,Int}()
+        totalnodes = 0
+        if datafields !== nothing
+            for (j, f) in enumerate(datafields)
+                wiretotop[totalnodes] = j
+                totalnodes += _fieldnodespan(f)
+            end
+        end
+        out = NamedTuple[]
+        for sb in stream.batches
             cols = materialize(colfield, sb.columns[1])
             maps = materialize(mapfield, sb.columns[2])
+            length(cols) == length(maps) ||
+                throw(ArgumentError("statistics columns have different lengths"))
             rows = missing
             d = Dict{Int,NamedTuple{(:nullcount, :min, :max),
                 Tuple{Union{Missing,Int64},Any,Any}}}()
@@ -1036,19 +1101,46 @@ function _readstats(metadata, nbatches::Int)
                 stats = Dict{String,Any}(String(k) => v for (k, v) in pairs)
                 if colref === missing
                     rc = get(stats, STATS_ROW_COUNT, missing)
-                    rc === missing || (rows = Int64(rc))
+                    if rc !== missing
+                        rc isa Int64 && rc >= 0 || throw(ArgumentError(
+                            "statistics row count must be a nonnegative Int64"))
+                        rows = rc
+                    end
                     continue
                 end
-                d[Int(colref) + 1] = (nullcount=get(stats, STATS_NULL_COUNT, missing),
+                colref isa Integer ||
+                    throw(ArgumentError("statistics column index must be integral"))
+                wire = Int(colref)
+                wire >= 0 || throw(ArgumentError("negative statistics column index"))
+                top = if datafields === nothing
+                    wire + 1
+                else
+                    wire < totalnodes ||
+                        throw(ArgumentError("statistics column index exceeds the schema"))
+                    get(wiretotop, wire, nothing)
+                end
+                top === nothing && continue  # valid nested-field statistics
+                nc = get(stats, STATS_NULL_COUNT, missing)
+                if nc !== missing
+                    nc isa Int64 && nc >= 0 || throw(ArgumentError(
+                        "statistics null count must be a nonnegative Int64"))
+                end
+                d[top] = (nullcount=nc,
                     min=get(stats, STATS_MIN, missing),
                     max=get(stats, STATS_MAX, missing))
             end
-            (rows=rows, cols=d)
+            if rows !== missing
+                all(s -> s.nullcount === missing || s.nullcount <= rows, values(d)) ||
+                    throw(ArgumentError("statistics null count exceeds row count"))
+            end
+            push!(out, (rows=rows, cols=d))
         end
         return out
     catch e
-        e isa Union{ValidationError,ArgumentError} && return nothing
-        rethrow()
+        e isa AllocationLimitError && rethrow()
+        e isa InterruptException && rethrow()
+        e isa OutOfMemoryError && rethrow()
+        return nothing
     end
 end
 
@@ -1066,9 +1158,15 @@ function _nextprefix(s::String)
 end
 
 _statcmp(f, a, b) = try
-    f(a, b)
+    f(a, b) === false ? false : true
 catch
     true   # incomparable literal/stat types: never prune
+end
+
+_stateq(a, b) = try
+    (a == b) === true
+catch
+    false
 end
 
 """
@@ -1085,24 +1183,27 @@ function _maypass(e::Tables.ScanExpr, stats, names, rowcount::Union{Missing,Int6
     end
     allnull(s) = s.nullcount !== missing && rowcount !== missing &&
         s.nullcount >= rowcount
+    unknownbounds(s) = s.min === missing || s.max === missing ||
+        (s.min isa AbstractFloat && isnan(s.min)) ||
+        (s.max isa AbstractFloat && isnan(s.max))
     if e isa Tables.Cmp
         s = lookup(e.lhs)
         s === nothing && return true
         allnull(s) && return false
-        (s.min === missing || s.max === missing) && return true
+        unknownbounds(s) && return true
         v = e.rhs
         e.op == Tables.OP_EQ &&
-            return _statcmp(!isless, v, s.min) && _statcmp(!isless, s.max, v)
-        e.op == Tables.OP_LT && return _statcmp(isless, s.min, v)
-        e.op == Tables.OP_LE && return _statcmp(!isless, v, s.min)
-        e.op == Tables.OP_GT && return _statcmp(isless, v, s.max)
-        return _statcmp(!isless, s.max, v)          # OP_GE
+            return _statcmp(>=, v, s.min) && _statcmp(>=, s.max, v)
+        e.op == Tables.OP_LT && return _statcmp(<, s.min, v)
+        e.op == Tables.OP_LE && return _statcmp(<=, s.min, v)
+        e.op == Tables.OP_GT && return _statcmp(>, s.max, v)
+        return _statcmp(>=, s.max, v)          # OP_GE
     elseif e isa Tables.In
         s = lookup(e.lhs)
         s === nothing && return true
         allnull(s) && return false
-        (s.min === missing || s.max === missing) && return true
-        return any(_statcmp(!isless, v, s.min) && _statcmp(!isless, s.max, v)
+        unknownbounds(s) && return true
+        return any(_statcmp(>=, v, s.min) && _statcmp(>=, s.max, v)
                    for v in e.values)
     elseif e isa Tables.IsNull
         s = lookup(e.lhs)
@@ -1113,10 +1214,10 @@ function _maypass(e::Tables.ScanExpr, stats, names, rowcount::Union{Missing,Int6
         e.kind == Tables.STR_STARTSWITH || return true
         s = lookup(e.lhs)
         s === nothing && return true
-        (s.min === missing || s.max === missing) && return true
-        _statcmp(!isless, s.max, e.s) || return false
+        unknownbounds(s) && return true
+        _statcmp(>=, s.max, e.s) || return false
         next = _nextprefix(e.s)
-        return next === nothing || _statcmp(isless, s.min, next)
+        return next === nothing || _statcmp(<, s.min, next)
     elseif e isa Tables.AndExpr
         return all(_maypass(a, stats, names, rowcount) for a in e.args)
     elseif e isa Tables.OrExpr
@@ -1126,9 +1227,9 @@ function _maypass(e::Tables.ScanExpr, stats, names, rowcount::Union{Missing,Int6
         if inner isa Tables.Cmp && inner.op == Tables.OP_EQ
             s = lookup(inner.lhs)
             s === nothing && return true
-            (s.min === missing || s.max === missing) && return true
+            unknownbounds(s) && return true
             # everything equals v only when min == max == v
-            return !(isequal(s.min, inner.rhs) && isequal(s.max, inner.rhs))
+            return !(_stateq(s.min, inner.rhs) && _stateq(s.max, inner.rhs))
         end
         return true
     elseif e isa Tables.AlwaysFalse
@@ -1531,7 +1632,7 @@ function _stats_main()
 
     # The statistics blob is itself a valid stream this reader accepts, and
     # a file carrying it stays readable by this reader AND Arrow.jl 2.x.
-    stats = _readstats(saf.schema.metadata, 2)
+    stats = _readstats(saf.schema.metadata, 2, saf.fields)
     @assert stats !== nothing
     @assert stats[1].rows == 5 && stats[2].rows == 5
     @assert stats[1].cols[1].min == 1 && stats[1].cols[1].max == 5
@@ -1539,6 +1640,25 @@ function _stats_main()
     filetbl = Arrow.Table(IOBuffer(copy(sbytes)))
     @assert length(Tables.getcolumn(Tables.columns(filetbl), 1)) == 10
     println("statistics round-trip the official value layout (Core + 2.x carry) ✓")
+
+    # Official column references use the flattened RecordBatch FieldNode
+    # order. A top-level field after a nested subtree is not its top-level
+    # ordinal.
+    nestedfields = Field[
+        Field("st", StructType(); children=Field[
+            Field("a", IntType(64, true)), Field("b", IntType(64, true))]),
+        Field("x", IntType(64, true))]
+    nestedsch = Schema(nestedfields)
+    ints(v) = ArrayData(IntType(64, true), length(v),
+        [BufferSlice(), AC._databuffer(Int64.(v))]; nullcount=0)
+    structdata = ArrayData(StructType(), 2, [BufferSlice()];
+        children=[ints([1, 2]), ints([3, 4])], nullcount=0)
+    nestedbatch = AC.RecordBatch(nestedsch, [structdata, ints([5, 6])], 2)
+    nestedstats = withstatistics(nestedsch, [nestedbatch])
+    nestedstream = readstream(Base64.base64decode(Dict(nestedstats.metadata)[STATS_KEY]))
+    refs = materialize(nestedstream.schema.fields[1], nestedstream.batches[1].columns[1])
+    @assert isequal(collect(Any, refs), Any[missing, Int32(0), Int32(3)])
+    println("statistics use official flattened FieldNode column indexes ✓")
 
     # Differential correctness with pruning active, whole-file and ranged.
     prunescans = Tables.Scan[
@@ -1558,6 +1678,41 @@ function _stats_main()
             Tables.read(RangedFile(RangedSource(copy(sbytes))), scan), want) sprint(show, scan)
     end
     println("pruned scans stay differentially exact (whole-file + ranged) ✓")
+
+    # Float pruning must use the same IEEE operators as Tables.finish.
+    fio = IOBuffer()
+    Arrow.write(fio, Tables.partitioner([
+        (x=Float64[0.0, 0.0],),
+        (x=Float64[-0.0, -0.0],),
+        (x=Float64[NaN, NaN],)]); file=false)
+    fsource = readstream(take!(fio))
+    fbytes = statsfile(fsource.schema, fsource.batches)
+    faf = readfile(copy(fbytes))
+    ffull = _fulltable(faf)
+    floatscans = Tables.Scan[
+        Tables.Scan(filter=Tables.col(:x) == -0.0),
+        Tables.Scan(filter=Tables.col(:x) <= -0.0),
+        Tables.Scan(filter=Tables.col(:x) >= 0.0),
+        Tables.Scan(filter=Tables.in_(Tables.col(:x), (-0.0,))),
+        Tables.Scan(filter=!(Tables.col(:x) == NaN))]
+    for scan in floatscans
+        want = Tables.finish(ffull, scan)
+        @assert _tables_equal(Tables.read(faf, scan), want)
+        @assert _tables_equal(Tables.read(RangedFile(RangedSource(fbytes)), scan), want)
+    end
+    println("float pruning preserves signed-zero and NaN predicate semantics ✓")
+
+    # Dictionary nullness is logical: a valid outer index can resolve to a
+    # null pool value and must count as null without entering min/max folds.
+    pool = ArrayData(Utf8Type(false), 1,
+        [AC._databuffer(UInt8[0x00]), AC._databuffer(Int32[0, 0]), BufferSlice()];
+        nullcount=1)
+    dtype = DictionaryType(IntType(32, true), Utf8Type(false), false)
+    dfield = Field("d", dtype)
+    ddata = ArrayData(dtype, 1,
+        [BufferSlice(), AC._databuffer(Int32[0])]; dictionary=pool, nullcount=0)
+    @assert _statfold(dfield, ddata) == (1, nothing, nothing)
+    println("dictionary statistics count null pool values logically ✓")
 
     # Fetch proof: x > 7 prunes batch 1 — its block metadata AND body are
     # never fetched over a ranged source.
@@ -1592,7 +1747,62 @@ function _stats_main()
     badbytes = writefile(badsch, source.batches)
     got = Tables.read(readfile(copy(badbytes)), Tables.Scan(filter=Tables.col(:x) > 7))
     @assert isequal(collect(Any, got.x), Any[8, 9, 10])
-    println("malformed statistics degrade to no pruning ✓")
+    wrongio = IOBuffer()
+    Arrow.write(wrongio, Tables.partitioner([(q=Int64[1],), (q=Int64[2],)]); file=false)
+    wrongblob = Base64.base64encode(take!(wrongio))
+    wrongsch = Schema(collect(Field, source.schema.fields);
+        metadata=Dict{String,String}(STATS_KEY => wrongblob),
+        endianness=source.schema.endianness)
+    wrongbytes = writefile(wrongsch, source.batches)
+    for sourcefile in (readfile(copy(wrongbytes)), RangedFile(RangedSource(wrongbytes)))
+        got = Tables.read(sourcefile, Tables.Scan(filter=Tables.col(:x) > 7))
+        @assert isequal(collect(Any, got.x), Any[8, 9, 10])
+    end
+
+    # A two-field stream is not enough: the canonical physical skeleton is
+    # part of the official value-layout contract.
+    rawstats = readstream(Base64.base64decode(Dict(saf.schema.metadata)[STATS_KEY]))
+    boolsch = Schema(Field[
+        Field("column", BoolType(); nullable=true), rawstats.schema.fields[2]])
+    boolbatches = AC.RecordBatch[]
+    for sb in rawstats.batches
+        valid = trues(sb.nrows)
+        valid[1] = false
+        boolcol = ArrayData(BoolType(), sb.nrows,
+            [AC._databuffer(_bitmapbytes(valid)),
+             AC._databuffer(_bitmapbytes(trues(sb.nrows)))]; nullcount=1)
+        push!(boolbatches, AC.RecordBatch(boolsch,
+            ArrayData[boolcol, sb.columns[2]], sb.nrows))
+    end
+    boolblob = Base64.base64encode(writestream(boolsch, boolbatches))
+    @assert _readstats(Dict(STATS_KEY => boolblob), 2, source.schema.fields) === nothing
+
+    statssch = _statsschema()
+    hugevalue = repeat("x", 2_000_000)
+    hugebatches = AC.RecordBatch[_statsbatch(statssch, Int64(1),
+        Tuple{Int64,Int64,Any,Any}[(1, Int64(0), hugevalue, hugevalue)])]
+    hugeblob = Base64.base64encode(writestream(statssch, hugebatches; compress=:zstd))
+    bombio = IOBuffer()
+    Arrow.write(bombio, (s=["x"],); file=false)
+    bombsource = readstream(take!(bombio))
+    hugesch = Schema(collect(Field, bombsource.schema.fields);
+        metadata=Dict{String,String}(STATS_KEY => hugeblob),
+        endianness=bombsource.schema.endianness)
+    hugebytes = writefile(hugesch, bombsource.batches)
+    for cap in (Int64(50_000), Int64(100_000))
+        tight = Limits(max_total_allocated_bytes=cap)
+        for sourcefile in (readfile(copy(hugebytes); limits=tight),
+            RangedFile(RangedSource(hugebytes); limits=tight))
+            rejected = try
+                Tables.read(sourcefile, Tables.Scan(filter=Tables.col(:s) == "x"))
+                false
+            catch e
+                e isa AllocationLimitError
+            end
+            @assert rejected
+        end
+    end
+    println("malformed statistics degrade; allocation exhaustion propagates ✓")
 
     # The trust model, pinned (design §3): wide lies only cost pruning;
     # narrow lies silently LOSE rows — statistics are trusted-for-

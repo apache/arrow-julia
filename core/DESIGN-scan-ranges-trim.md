@@ -208,19 +208,28 @@ standardized upstream. Proposal, kept deliberately conservative:
   **Footer's** schema copy so the tail fetch alone powers pruning.
 - **Value layout**: follow the official statistics-schema array layout,
   serialized as one embedded IPC stream (statistics ARE Arrow data); per
-  record batch × per column: min, max, null_count, distinct_count-if-known.
+  record batch × flattened RecordBatch FieldNode index: min, max,
+  null_count, distinct_count-if-known. Top-level fields after nested fields
+  therefore do not use their top-level ordinal as the `column` value.
   Using the official layout keeps us convention-compatible if upstream
   standardizes placement later — we then emit both keys for a deprecation
   cycle and read either.
-- Writer: opt-in kwarg (`statistics=true`), computed streaming during
-  encode (min/max/nullcount are cheap fold state per column); file format
-  only. Append (§ report) must recompute or drop — dropping with a warning
-  is the honest v1.
+- Writer prove-out: `withstatistics` / `statsfile` eagerly compute the
+  embedded stream for already-encoded batches. A production writer should
+  expose an opt-in `statistics=true` keyword and compute the same fold state
+  during encode; file format only. Append (§ report) must recompute or drop
+  — dropping with a warning is the honest v1.
 - Reader: prune under `Cmp`/`In`/`IsNull` (and `StrPred` prefix ranges for
   `startswith`) with one-sided may-contain logic — a batch survives unless
   the predicate is provably false for ALL rows; the filter always stays in
   the residual (pruning is inexact by design). Missing or MALFORMED
-  statistics degrade to "no pruning", never to an error.
+  statistics degrade to "no pruning", never to an error. The embedded
+  stream and Base64 output share the enclosing scan allocation budget;
+  exhausting that cumulative caller limit remains a scan error instead of
+  being mistaken for malformed optional metadata.
+  Float comparisons use the predicate's IEEE operators; any NaN disables
+  bounds, and signed zero is not ordered with `isless`. Dictionary folds
+  count null pool results as logical nulls.
 - **Trust model, stated plainly (P3 pinned this)**: statistics are
   trusted-for-completeness, exactly like Parquet row-group stats. The
   residual re-filter protects one direction only — batches kept by lying

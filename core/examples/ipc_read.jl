@@ -99,10 +99,16 @@ mutable struct AllocationBudget
     left::Int64
 end
 
+"A caller-supplied cumulative allocation limit was exhausted."
+struct AllocationLimitError <: Exception
+    msg::String
+end
+Base.showerror(io::IO, e::AllocationLimitError) = print(io, e.msg)
+
 function _charge!(budget::AllocationBudget, amount::Int64, what::AbstractString)
     amount >= 0 || throw(ArgumentError("negative allocation charge"))
     amount <= budget.left ||
-        throw(ValidationError("$what exceeds the reader allocation budget"))
+        throw(AllocationLimitError("$what exceeds the reader allocation budget"))
     budget.left -= amount
     return nothing
 end
@@ -181,8 +187,8 @@ function _vcharge!(state::_VState, bytes::Int64, what::AbstractString)
         e isa OverflowError || rethrow()
         _vfail("allocation charge overflow for $what")
     end
-    state.reserved <= state.reserve_limit ||
-        _vfail("metadata-directed allocation budget exceeded while visiting $what")
+    state.reserved <= state.reserve_limit || throw(AllocationLimitError(
+        "metadata-directed allocation budget exceeded while visiting $what"))
     return nothing
 end
 
@@ -991,7 +997,7 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
         committed = true
         return result
     catch e
-        e isa ValidationError && rethrow()
+        e isa Union{ValidationError,AllocationLimitError} && rethrow()
         e isa OutOfMemoryError && rethrow()
         e isa InterruptException && rethrow()
         throw(ValidationError("buffer decompression failed: $(sprint(showerror, e))"))
@@ -1193,9 +1199,11 @@ its backing storage instead of exposing this prove-out borrow contract.
 `IPCStream` is a single-owner cursor; overlapping `nextbatch!` calls throw
 `ConcurrencyViolationError`.
 """
-function readstream(bytes::Vector{UInt8}; limits::Limits=Limits())
+readstream(bytes::Vector{UInt8}; limits::Limits=Limits()) =
+    _readstream(bytes, limits, AllocationBudget(limits.max_total_allocated_bytes))
+
+function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBudget)
     region = heapregion(bytes)
-    budget = AllocationBudget(limits.max_total_allocated_bytes)
     msgs = _framemessages(region, limits, Base.ENDIAN_BOM, budget)
     isempty(msgs) && throw(ValidationError("empty IPC stream"))
     first(msgs).header_type == 1 ||
@@ -1420,7 +1428,7 @@ _rejects(f) = try
     f()
     false
 catch e
-    e isa ValidationError
+    e isa Union{ValidationError,AllocationLimitError}
 end
 
 function _compressed_wire(payload::Vector{UInt8}, declared::Int64)
