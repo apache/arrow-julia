@@ -608,6 +608,15 @@ expected frequency.
     throw(ArgumentError("unregistered ArrowType"))
 end
 
+# A plain-dispatch collapse of these ladders was tried (Aug 2026) and
+# rejected by evidence: JuliaC's `--trim=safe` verifier reports the abstract
+# call site (`layoutspec(d.type::ArrowType)`) as an unresolved call — it
+# does not enumerate the closed method table, so the ladders remain the
+# devirtualization mechanism. The throwing `::Any` fallback below is the
+# piece of that simplification worth keeping: junk descriptors get a clean
+# error instead of a `MethodError` wherever the raw method table is called.
+layoutspec(::Any) = throw(ArgumentError("unregistered ArrowType"))
+
 # ---------------------------------------------------------------------------
 # §4 ArrayData
 # ---------------------------------------------------------------------------
@@ -811,6 +820,9 @@ instead.
 end
 
 _validate_descriptor(::ArrowType) = nothing
+_validate_descriptor(::Any) = throw(ArgumentError("unregistered ArrowType"))
+_value(::Any, ::Field, ::ArrayData, ::Int64) =
+    throw(ArgumentError("unregistered ArrowType"))
 
 @inline function _validate_descriptor_of(t::ArrowType)
     t isa IntType && return _validate_descriptor(t)
