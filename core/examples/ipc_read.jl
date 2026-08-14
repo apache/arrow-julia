@@ -909,8 +909,9 @@ end
 Consume one buffer-table entry's METADATA: bounds, alignment, limits, and
 the non-overlap/monotone invariants — everything checkable without touching
 a single body byte. `takebuffer!` adds the body subslice (+ decompression);
-`skipbuffer!` stops here, which is what lets scan pushdown skip columns
-whose bytes were never decoded — or, over a ranged source, never fetched.
+`skipbuffer!` stops here, which lets scan pushdown avoid decoding a column or
+planning its body range. Ranged tail reads and coalescing may still over-read
+those bytes.
 """
 function _buffermeta!(c::DecodeCursor)
     c.bufidx <= length(c.buffers) ||
