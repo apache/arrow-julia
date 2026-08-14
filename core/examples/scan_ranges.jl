@@ -76,6 +76,88 @@ function skipfield!(f::Field, c::DecodeCursor)
     return nothing
 end
 
+"FieldNode entries consumed by one field subtree."
+function _fieldnodespan(f::Field)
+    f.type isa DictionaryType && return 1
+    spec = layoutspec(f.type)
+    nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
+    return 1 + sum(_fieldnodespan(f.children[i]) for i = 1:nchildren; init=0)
+end
+
+"Buffers consumed by one field subtree — the planner's registry arithmetic."
+function _bufferspan(f::Field)
+    spec = layoutspec(f.type)
+    n = length(spec.buffers)
+    f.type isa DictionaryType && return n
+    nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
+    for i = 1:nchildren
+        n += _bufferspan(f.children[i])
+    end
+    return n
+end
+
+"""
+Validate the metadata needed before a RecordBatch length may drive a scan
+window or a buffer table may drive a range fetch. This is the metadata-only
+half of the decode cursor: exact node/buffer counts, every node invariant,
+top-level row-count agreement, and every buffer's geometry.
+"""
+function _recordbatchmeta(header::Meta.RecordBatch, fields, limits::Limits,
+    bodylen::Int64)
+    isempty(something(header.variadicBufferCounts, Int64[])) ||
+        throw(ValidationError("variadic-buffer layouts are outside this prove-out"))
+    rblen = something(header.length, Int64(0))
+    0 <= rblen <= limits.max_array_length ||
+        throw(ValidationError("record batch length $rblen exceeds limit"))
+
+    nodes = something(header.nodes, Meta.FieldNode[])
+    expectednodes = sum(_fieldnodespan(f) for f in fields; init=0)
+    length(nodes) == expectednodes || throw(ValidationError(
+        "field-node count does not match the schema"))
+    nodeidx = 1
+    for f in fields
+        node = nodes[nodeidx]
+        node.length == rblen || throw(ValidationError(
+            "RecordBatch length does not match top-level field nodes"))
+        nodeidx += _fieldnodespan(f)
+    end
+    for node in nodes
+        0 <= node.length <= limits.max_array_length ||
+            throw(ValidationError("field-node length $(node.length) exceeds limit"))
+        0 <= node.null_count <= node.length ||
+            throw(ValidationError("invalid field-node null count $(node.null_count)"))
+    end
+
+    buffers = something(header.buffers, Meta.Buffer[])
+    expectedbuffers = sum(_bufferspan(f) for f in fields; init=0)
+    length(buffers) == expectedbuffers ||
+        throw(ValidationError("buffer count does not match the schema"))
+    last_nonempty_end = Int64(0)
+    for b in buffers
+        offset = Int64(b.offset)
+        len = Int64(b.length)
+        offset >= 0 || throw(ValidationError("negative batch buffer offset $offset"))
+        offset % 8 == 0 || throw(ValidationError(
+            "batch buffer offset $offset is not 8-byte aligned"))
+        0 <= len <= limits.max_buffer_bytes ||
+            throw(ValidationError("batch buffer length $len exceeds limit"))
+        bufferend = try
+            AC.checked_add(offset, len)
+        catch e
+            e isa OverflowError || rethrow()
+            throw(ValidationError("batch buffer end overflows"))
+        end
+        bufferend <= bodylen || throw(ValidationError(
+            "batch buffer [$offset, $len] escapes its message body"))
+        if len > 0
+            offset >= last_nonempty_end || throw(ValidationError(
+                "batch buffers overlap or move backwards"))
+            last_nonempty_end = bufferend
+        end
+    end
+    return rblen
+end
+
 """
 Like `missingdicts`, but a missing dictionary only matters when its field is
 in the decode set — a batch may legally reference an id its skipped columns
@@ -120,7 +202,7 @@ function _batchrows(f::ArrowFile, i::Int)
     fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
     fm.msg.header isa Meta.RecordBatch ||
         throw(ValidationError("footer record block is not a record batch"))
-    return something(fm.msg.header.length, Int64(0))
+    return _recordbatchmeta(fm.msg.header, f.fields, f.limits, fm.body.len)
 end
 
 """
@@ -140,12 +222,9 @@ function _maskedrecord(msg::Meta.Message, version::Int16, body,
     header isa Meta.RecordBatch ||
         throw(ValidationError("footer record block is not a record batch"))
     codec = _batchcodec(header.compression, version)
-    isempty(something(header.variadicBufferCounts, Int64[])) ||
-        throw(ValidationError("variadic-buffer layouts are outside this prove-out"))
+    rblen = _recordbatchmeta(header, fields, limits,
+        body isa BufferSlice ? body.len : body.bodylen)
     _scanmissingdicts(fields, header.nodes, dicts, fielddictids, mask)
-    rblen = something(header.length, Int64(0))
-    0 <= rblen <= limits.max_array_length ||
-        throw(ValidationError("record batch length $rblen exceeds limit"))
     cursor = DecodeCursor(header.nodes, header.buffers, body, limits;
         codec=codec, state=state)
     cols = Vector{Union{Nothing,ArrayData}}(nothing, length(fields))
@@ -165,6 +244,41 @@ function _maskedrecord(msg::Meta.Message, version::Int16, body,
             throw(ValidationError("RecordBatch length does not match top-level field nodes"))
     end
     return rblen, cols
+end
+
+"Resolve positional filter references once, against the source schema."
+_resolvefilter(::Nothing, names) = nothing
+function _resolvefilter(e::Tables.ScanExpr, names)
+    col(c) = c.ref isa Int && 1 <= c.ref <= length(names) ?
+        Tables.Col(names[c.ref]) : c
+    e isa Tables.Cmp && return Tables.Cmp(e.op, col(e.lhs), e.rhs)
+    e isa Tables.In && return Tables.In(col(e.lhs), e.values)
+    e isa Tables.IsNull && return Tables.IsNull(col(e.lhs), e.negated)
+    e isa Tables.StrPred && return Tables.StrPred(e.kind, col(e.lhs), e.s)
+    e isa Tables.AndExpr && return Tables.AndExpr(
+        Tables.ScanExpr[_resolvefilter(a, names) for a in e.args])
+    e isa Tables.OrExpr && return Tables.OrExpr(
+        Tables.ScanExpr[_resolvefilter(a, names) for a in e.args])
+    e isa Tables.NotExpr && return Tables.NotExpr(_resolvefilter(e.arg, names))
+    return e
+end
+
+"Column table that preserves a row count when there are no columns."
+struct _ScanColumns{T}
+    columns::T
+    nrows::Int
+end
+Tables.istable(::Type{<:_ScanColumns}) = true
+Tables.columnaccess(::Type{<:_ScanColumns}) = true
+Tables.columns(t::_ScanColumns) = t
+Tables.columnnames(t::_ScanColumns) = propertynames(t.columns)
+Tables.getcolumn(t::_ScanColumns, i::Int) = getfield(t.columns, i)
+Tables.getcolumn(t::_ScanColumns, name::Symbol) = getproperty(t.columns, name)
+Tables.rowcount(t::_ScanColumns) = t.nrows
+
+function _scantable(names, outcols, nrows::Int)
+    table = NamedTuple{Tuple(names)}(outcols)
+    return isempty(names) ? _ScanColumns(table, nrows) : table
 end
 
 function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool})
@@ -232,9 +346,11 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
                          for i = 1:length(f)])
     end
     parts = Dict{Int,Vector{Any}}(idx => Any[] for idx in decodeidx)
+    outrows = 0
     for (i, skip, take) in window
         keep[i] || continue
         rblen, cols = _scanbatch(f, i, mask)
+        outrows += Int(take >= 0 ? take : rblen)
         for idx in decodeidx
             col = materialize(f.fields[idx], cols[idx]::ArrayData)
             take >= 0 && (col = col[(skip + 1):(skip + take)])
@@ -243,7 +359,7 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
     end
     outcols = Tuple(isempty(parts[idx]) ? Any[] : reduce(vcat, parts[idx])
                     for idx in decodeidx)
-    table = NamedTuple{Tuple(names[decodeidx])}(outcols)
+    table = _scantable(names[decodeidx], outcols, outrows)
     # The residual's selection must be RESOLVED against the source schema:
     # the output table carries only the decode set, so re-binding `Not`
     # (whose excluded names are gone) or a `Regex` (which could over-match a
@@ -254,7 +370,8 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
             c.name == names[c.index] ? nothing : c.name) for c in b.columns]
     limit = consumed ? nothing : scan.limit
     offset = consumed ? 0 : scan.offset
-    return table, Tables.Scan(residualselect, scan.filter, limit, offset, scan.validate)
+    residualfilter = _resolvefilter(scan.filter, names)
+    return table, Tables.Scan(residualselect, residualfilter, limit, offset, scan.validate)
 end
 
 # ===========================================================================
@@ -375,18 +492,6 @@ function _bodyslice(sb::SparseBody, offset::Int64, len::Int64)
     (offset >= 0 && len >= 0 && offset <= sb.bodylen - len) ||
         throw(ArgumentError("batch buffer escapes its message body"))
     return _spanslice(sb.spans, AC.checked_add(sb.bodystart, offset), len)
-end
-
-"Buffers consumed by one field subtree — the planner's registry arithmetic."
-function _bufferspan(f::Field)
-    spec = layoutspec(f.type)
-    n = length(spec.buffers)
-    f.type isa DictionaryType && return n
-    nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
-    for i = 1:nchildren
-        n += _bufferspan(f.children[i])
-    end
-    return n
 end
 
 "Ids of every dictionary field inside the masked top-level subtrees."
@@ -606,7 +711,8 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
         nsurv = length(recidxs)
         headers = [blockmeta[length(dictblocks) + p][1].header::Meta.RecordBatch
                    for p = 1:nsurv]
-        rowcounts = Int64[something(h.length, Int64(0)) for h in headers]
+        rowcounts = Int64[_recordbatchmeta(h, fields, limits,
+            recordblocks[recidxs[p]][3]) for (p, h) in enumerate(headers)]
         consumed = scan.filter === nothing && (scan.limit !== nothing || scan.offset > 0)
         window = consumed ? _batchwindow(rowcounts, scan.offset, scan.limit) :
             Tuple{Int,Int64,Int64}[(p, Int64(0), Int64(-1)) for p = 1:nsurv]
@@ -643,12 +749,14 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
         bodyspans = _fetchspans(src, bodyranges, rf.coalesce_gap)
 
         parts = Dict{Int,Vector{Any}}(idx => Any[] for idx in decodeidx)
+        outrows = 0
         for (p, skip, take) in window
             block = recordblocks[recidxs[p]]
             msg, v = blockmeta[length(dictblocks) + p]
             body = SparseBody(block[3], block[1] + block[2], bodyspans)
             _, cols = _maskedrecord(msg, v, body, fields, dicts, fielddictids,
                 validated, limits, version, mask, state)
+            outrows += Int(take >= 0 ? take : rowcounts[p])
             for idx in decodeidx
                 col = materialize(fields[idx], cols[idx]::ArrayData)
                 take >= 0 && (col = col[(skip + 1):(skip + take)])
@@ -657,13 +765,14 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
         end
         outcols = Tuple(isempty(parts[idx]) ? Any[] : reduce(vcat, parts[idx])
                         for idx in decodeidx)
-        table = NamedTuple{Tuple(names[decodeidx])}(outcols)
+        table = _scantable(names[decodeidx], outcols, outrows)
         residualselect = scan.select === nothing ? nothing :
             Tables.SelectItem[Tables.SelectItem(names[c.index], c.type,
                 c.name == names[c.index] ? nothing : c.name) for c in b.columns]
         limit = consumed ? nothing : scan.limit
         offset = consumed ? 0 : scan.offset
-        return table, Tables.Scan(residualselect, scan.filter, limit, offset, scan.validate)
+        residualfilter = _resolvefilter(scan.filter, names)
+        return table, Tables.Scan(residualselect, residualfilter, limit, offset, scan.validate)
     finally
         close(state)
     end
@@ -987,14 +1096,19 @@ end
 
 function _fulltable(f::ArrowFile)
     names = Tuple(Symbol(fld.name) for fld in f.fields)
-    cols = Tuple(reduce(vcat, Any[materialize(fld, f[i].columns[j])
-                                  for i = 1:length(f)])
-                 for (j, fld) in enumerate(f.fields))
+    if isempty(names)
+        return _ScanColumns(NamedTuple(), Int(sum(_batchrows(f, i) for i = 1:length(f); init=0)))
+    end
+    cols = Tuple(begin
+        parts = Any[materialize(fld, f[i].columns[j]) for i = 1:length(f)]
+        isempty(parts) ? Any[] : reduce(vcat, parts)
+    end for (j, fld) in enumerate(f.fields))
     return NamedTuple{names}(cols)
 end
 
 function _tables_equal(a, b)
     ca, cb = Tables.columns(a), Tables.columns(b)
+    Tables.rowcount(ca) == Tables.rowcount(cb) || return false
     na, nb = Tables.columnnames(ca), Tables.columnnames(cb)
     collect(na) == collect(nb) || return false
     for n in na
@@ -1049,6 +1163,8 @@ function _scan_main()
         Tables.Scan(select=(:ints => Float64,)),
         Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2),
         Tables.Scan(filter=Tables.in_(Tables.col(:strs), ("hey", "last"))),
+        Tables.Scan(select=(:strs, :lists), filter=Tables.col(3) == true),
+        Tables.Scan(select=(:strs => :ints,), filter=Tables.col(4) == "hey"),
     ]
     for scan in scans
         got = Tables.read(af, scan)
@@ -1115,6 +1231,42 @@ function _scan_main()
     @assert _rejects(() -> Tables.apply(dupaf, Tables.Scan(select=(1,))))
     println("duplicate-name scans refuse cleanly (facade boundary) ✓")
 
+    # Window row counts are metadata, but they are not trusted until the
+    # RecordBatch length agrees with every top-level FieldNode. Otherwise a
+    # corrupt skipped batch can shift the window and return valid but wrong
+    # rows from a later batch.
+    xio = IOBuffer()
+    Arrow.write(xio, Tables.partitioner([(x=collect(Int64, 1:5),),
+        (x=collect(Int64, 6:10),)]); file=false)
+    xbytes = writefile(readstream(take!(xio)))
+    badrows = copy(xbytes)
+    xfile = readfile(copy(xbytes))
+    block = xfile.recordblocks[1]
+    meta = copy(badrows[(block[1] + 9):(block[1] + block[2])])
+    msg = _vtable(meta, Int64(_vu32(meta, 0)))
+    rb = _headertable(meta, msg)
+    _write_i64!(meta, _vfield(rb, 0, 8; required=true), Int64(4))
+    copyto!(badrows, block[1] + 9, meta, 1, length(meta))
+    shifted = Tables.Scan(select=(:x,), offset=5, limit=1)
+    @assert _rejects(() -> Tables.read(readfile(copy(badrows)), shifted))
+    @assert _rejects(() -> Tables.read(RangedFile(RangedSource(copy(badrows))), shifted))
+    println("window row counts require top-level FieldNode agreement ✓")
+
+    # A column table cannot infer row count when it has no columns. The scan
+    # wrapper keeps the RecordBatch lengths so an empty scan remains identity.
+    zerosch = Schema(Field[])
+    zerobatches = AC.RecordBatch[
+        AC.RecordBatch(zerosch, ArrayData[], 3),
+        AC.RecordBatch(zerosch, ArrayData[], 0),
+        AC.RecordBatch(zerosch, ArrayData[], 2)]
+    zerobytes = writefile(zerosch, zerobatches)
+    for source in (readfile(copy(zerobytes)), RangedFile(RangedSource(copy(zerobytes))))
+        got = Tables.read(source, Tables.Scan())
+        @assert isempty(Tables.columnnames(Tables.columns(got)))
+        @assert Tables.rowcount(Tables.columns(got)) == 5
+    end
+    println("zero-column scans preserve their row count ✓")
+
     println()
     println("Tables.Scan Stage-A pushdown checks passed.")
     return filebytes, af, full
@@ -1132,6 +1284,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         Tables.Scan(select=(:floats,), filter=Tables.col(:ints) > 2),
         Tables.Scan(offset=4, limit=3),
         Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2),
+        Tables.Scan(select=(:strs, :lists), filter=Tables.col(3) == true),
     ]
     for scan in scans
         log, src = countingsource(filebytes)

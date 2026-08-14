@@ -40,6 +40,7 @@ handles does **IO-and-decode reduction with a full residual**:
     apply(f, scan) =
       bind against schema names →
       decode set = selected ∪ filtercols (source order, source names) →
+      resolve positional filter refs to source names →
       batch set = limit/offset window (when filter === nothing),
                   ∩ stats-surviving batches (when stats present) →
       return (table over decode set, residual)
@@ -61,6 +62,14 @@ implemented in `examples/scan_ranges.jl`):
   (`Not(:x)`'s excluded name no longer exists; a regex can over-match a
   filter-only column). The residual carries the bound columns as concrete
   source-name items with their renames and type overrides attached.
+- **The residual filter must resolve positional references too.** A bound
+  `col(3)` means source column 3. Re-binding that integer against the reduced
+  decode-set table can select a different column or fail. Matched integer
+  references therefore become source-name references in the residual.
+- **Wire row counts are trusted only after metadata validation.** Before a
+  `RecordBatch.length` drives a window, it is range-checked and matched to
+  every top-level FieldNode length. Exact node/buffer counts and buffer
+  geometry are also checked from metadata alone.
 - **Stage A needs no row-level predicate evaluator.** The filter always
   stays in the residual, so `Tables.finish`/`filtermask` do row evaluation;
   Arrow-side predicate logic first appears as the *interval* ladder for
