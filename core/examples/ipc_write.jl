@@ -957,47 +957,184 @@ function _blockload(b::BufferSlice, ::Type{T}, pos::Int64,
     return AC.loadat(b, T, pos)
 end
 
-"""
-Read only the fixed Message envelope needed to bind one Footer Block to its
-on-wire frame. The complete metadata graph remains lazily verified by
-`_blockmessage`; this zero-allocation preflight prevents optional-EOS
-classification from trusting forged Footer extents first.
-"""
-function _blockmessagebodylength(metadata::BufferSlice)
-    root = Int64(_blockload(metadata, UInt32, Int64(0), "message root"))
-    root >= 4 || throw(ValidationError("invalid block message root offset"))
-    root % 4 == 0 || throw(ValidationError("block message table is misaligned"))
-    back = Int64(_blockload(metadata, Int32, root, "message table"))
-    back != 0 || throw(ValidationError("block message has a zero vtable offset"))
-    vpos = try
-        AC.checked_sub(root, back)
+function _blockadd(a::Int64, b::Int64, what::AbstractString)
+    try
+        return AC.checked_add(a, b)
     catch e
         e isa OverflowError || rethrow()
-        throw(ValidationError("block message vtable offset overflows"))
+        throw(ValidationError("$what overflows"))
     end
-    vpos % 2 == 0 || throw(ValidationError("block message vtable is misaligned"))
-    vlen = Int64(_blockload(metadata, UInt16, vpos, "message vtable header"))
-    olen = Int64(_blockload(metadata, UInt16, vpos + 2,
-        "message vtable header"))
-    vlen >= 4 && iseven(vlen) ||
-        throw(ValidationError("invalid block message vtable length $vlen"))
-    olen >= 4 ||
-        throw(ValidationError("invalid block message object length $olen"))
-    _blockrange(metadata, vpos, vlen, "message vtable")
-    _blockrange(metadata, root, olen, "message table")
+end
 
-    # Message.bodyLength is slot 3. An absent FlatBuffers scalar has value 0.
-    vlen < 12 && return Int64(0)
-    entry = AC.checked_add(vpos, Int64(10))
-    off = Int64(_blockload(metadata, UInt16, entry,
-        "message body-length vtable entry"))
-    off == 0 && return Int64(0)
-    (off >= 4 && olen >= 8 && off <= olen - 8) ||
-        throw(ValidationError("block message body-length slot exceeds its object"))
-    pos = AC.checked_add(root, off)
-    pos % 8 == 0 ||
-        throw(ValidationError("block message body-length slot is misaligned"))
-    return _blockload(metadata, Int64, pos, "message body-length slot")
+function _blocksub(a::Int64, b::Int64, what::AbstractString)
+    try
+        return AC.checked_sub(a, b)
+    catch e
+        e isa OverflowError || rethrow()
+        throw(ValidationError("$what overflows"))
+    end
+end
+
+function _blockmul(a::Int64, b::Int64, what::AbstractString)
+    try
+        return AC.checked_mul(a, b)
+    catch e
+        e isa OverflowError || rethrow()
+        throw(ValidationError("$what overflows"))
+    end
+end
+
+struct _BlockTable
+    metadata::BufferSlice
+    pos::Int64
+    vpos::Int64
+    vlen::Int64
+    olen::Int64
+end
+
+function _blocktable(metadata::BufferSlice, pos::Int64, what::AbstractString)
+    pos % 4 == 0 || throw(ValidationError("$what is misaligned"))
+    back = Int64(_blockload(metadata, Int32, pos, what))
+    back != 0 || throw(ValidationError("$what has a zero vtable offset"))
+    vpos = _blocksub(pos, back, what)
+    vpos % 2 == 0 || throw(ValidationError("$what vtable is misaligned"))
+    vlen = Int64(_blockload(metadata, UInt16, vpos, what))
+    olen = Int64(_blockload(metadata, UInt16,
+        _blockadd(vpos, Int64(2), what), what))
+    vlen >= 4 && iseven(vlen) ||
+        throw(ValidationError("invalid $what vtable length $vlen"))
+    olen >= 4 || throw(ValidationError("invalid $what object length $olen"))
+    _blockrange(metadata, vpos, vlen, what)
+    _blockrange(metadata, pos, olen, what)
+    return _BlockTable(metadata, pos, vpos, vlen, olen)
+end
+
+function _blockfield(t::_BlockTable, slot::Int, width::Int,
+    what::AbstractString; required::Bool=false)
+    entryoff = Int64(4 + 2slot)
+    if entryoff > t.vlen - 2
+        required && throw(ValidationError("required $what is absent"))
+        return nothing
+    end
+    entry = _blockadd(t.vpos, entryoff, what)
+    off = Int64(_blockload(t.metadata, UInt16, entry, what))
+    if off == 0
+        required && throw(ValidationError("required $what is absent"))
+        return nothing
+    end
+    (off >= 4 && width <= t.olen && off <= t.olen - width) ||
+        throw(ValidationError("$what exceeds its table object"))
+    pos = _blockadd(t.pos, off, what)
+    width > 1 && pos % min(width, 8) != 0 &&
+        throw(ValidationError("$what is misaligned"))
+    _blockrange(t.metadata, pos, Int64(width), what)
+    return pos
+end
+
+function _blockref(t::_BlockTable, slot::Int, what::AbstractString;
+    required::Bool=false)
+    pos = _blockfield(t, slot, 4, what; required=required)
+    pos === nothing && return nothing
+    rel = Int64(_blockload(t.metadata, UInt32, pos, what))
+    rel > 0 || throw(ValidationError("$what has a null or backward offset"))
+    target = _blockadd(pos, rel, what)
+    _blockrange(t.metadata, target, Int64(1), what)
+    return target
+end
+
+function _blockvector(t::_BlockTable, slot::Int, elemsize::Int,
+    what::AbstractString)
+    pos = _blockref(t, slot, what)
+    pos === nothing && return nothing
+    pos % 4 == 0 || throw(ValidationError("$what length is misaligned"))
+    n = Int64(_blockload(t.metadata, UInt32, pos, what))
+    start = _blockadd(pos, Int64(4), what)
+    bytes = _blockmul(n, Int64(elemsize), what)
+    _blockrange(t.metadata, start, bytes, what)
+    n > 0 && elemsize > 1 && start % min(elemsize, 8) != 0 &&
+        throw(ValidationError("$what data is misaligned"))
+    return start, n
+end
+
+"""
+Read the fixed Message/RecordBatch envelope and wire-buffer structs needed to
+bind one Footer Block to its on-wire frame. The complete metadata graph remains
+lazily verified by `_blockmessage`; this zero-allocation preflight prevents
+optional-EOS classification from trusting forged Footer extents first.
+"""
+function _blockmessagebatch(metadata::BufferSlice)
+    root = Int64(_blockload(metadata, UInt32, Int64(0), "message root"))
+    root >= 4 || throw(ValidationError("invalid block message root offset"))
+    msg = _blocktable(metadata, root, "block message table")
+    bodypos = _blockfield(msg, 3, 8, "message body-length slot")
+    bodylen = bodypos === nothing ? Int64(0) :
+        _blockload(metadata, Int64, bodypos, "message body-length slot")
+    headerpos = _blockfield(msg, 1, 1, "message header type"; required=true)
+    headertype = _blockload(metadata, UInt8, headerpos, "message header type")
+    headerref = _blockref(msg, 2, "message header"; required=true)
+    header = _blocktable(metadata, headerref, "message header table")
+    batch = if headertype == UInt8(2) # DictionaryBatch.data
+        dataref = _blockref(header, 1, "dictionary batch data"; required=true)
+        _blocktable(metadata, dataref, "dictionary record-batch table")
+    elseif headertype == UInt8(3) # RecordBatch
+        header
+    else
+        throw(ValidationError(
+            "footer block has unsupported message header type $headertype"))
+    end
+    return bodylen, headertype, batch
+end
+
+_blockmessagebodylength(metadata::BufferSlice) =
+    first(_blockmessagebatch(metadata))
+
+function _verifyblockbuffers(batch::_BlockTable, bodylen::Int64)
+    buffers = _blockvector(batch, 2, 16, "record-batch buffer vector")
+    buffers === nothing && return nothing
+    start, n = buffers
+    last_nonempty_end = Int64(0)
+    for i = Int64(0):(n - 1)
+        base = _blockadd(start, _blockmul(i, Int64(16),
+            "record-batch buffer position"), "record-batch buffer position")
+        offset = _blockload(batch.metadata, Int64, base,
+            "record-batch buffer offset")
+        len = _blockload(batch.metadata, Int64,
+            _blockadd(base, Int64(8), "record-batch buffer length"),
+            "record-batch buffer length")
+        offset >= 0 || throw(ValidationError("negative batch buffer offset $offset"))
+        len >= 0 || throw(ValidationError("negative batch buffer length $len"))
+        offset % 8 == 0 ||
+            throw(ValidationError("batch buffer offset $offset is not 8-byte aligned"))
+        bufferend = _blockadd(offset, len, "batch buffer end")
+        bufferend <= bodylen ||
+            throw(ValidationError("batch buffer [$offset, $len] escapes its message body"))
+        if len > 0
+            offset >= last_nonempty_end ||
+                throw(ValidationError("batch buffers overlap or move backwards"))
+            last_nonempty_end = bufferend
+        end
+    end
+    return nothing
+end
+
+function _verifyblockframe(blob::BufferSlice, block::NTuple{3,Int64},
+    expectedheadertype::UInt8)
+    offset, metalen, bodylen = block
+    AC.loadat(blob, UInt32, offset) == CONTINUATION ||
+        throw(ValidationError("footer block does not point at a message"))
+    declared = Int64(AC.loadat(blob, Int32, offset + 4))
+    declared == metalen - 8 ||
+        throw(ValidationError(
+            "footer block metadata length does not match the message"))
+    metadata = AC.subslice(blob, offset + 8, declared)
+    messagebodylen, headertype, batch = _blockmessagebatch(metadata)
+    messagebodylen == bodylen ||
+        throw(ValidationError(
+            "footer block body length does not match the message"))
+    headertype == expectedheadertype ||
+        throw(ValidationError("footer block has the wrong message header type"))
+    _verifyblockbuffers(batch, bodylen)
+    return nothing
 end
 
 function _verifyblockframes(region::OwnerRegion, dictblocks, recordblocks,
@@ -1005,19 +1142,8 @@ function _verifyblockframes(region::OwnerRegion, dictblocks, recordblocks,
     indexedend = _validateblockindex(dictblocks, recordblocks, dataend;
         datastart=datastart)
     blob = BufferSlice(region, 0, region.len)
-    for block in Iterators.flatten((dictblocks, recordblocks))
-        offset, metalen, bodylen = block
-        AC.loadat(blob, UInt32, offset) == CONTINUATION ||
-            throw(ValidationError("footer block does not point at a message"))
-        declared = Int64(AC.loadat(blob, Int32, offset + 4))
-        declared == metalen - 8 ||
-            throw(ValidationError(
-                "footer block metadata length does not match the message"))
-        metadata = AC.subslice(blob, offset + 8, declared)
-        _blockmessagebodylength(metadata) == bodylen ||
-            throw(ValidationError(
-                "footer block body length does not match the message"))
-    end
+    foreach(block -> _verifyblockframe(blob, block, UInt8(2)), dictblocks)
+    foreach(block -> _verifyblockframe(blob, block, UInt8(3)), recordblocks)
     return indexedend
 end
 
@@ -1747,6 +1873,20 @@ function main()
     _write_i64!(forgedcollision,
         forgedfooterstart + forgedblocks + 16, forgedbodylen - 8)
     @assert _rejects(() -> readfile(forgedcollision))
+
+    # Coordinating the same lie in Message.bodyLength is still insufficient:
+    # the RecordBatch buffer table proves that the excluded bytes are data.
+    coordinated = copy(forgedcollision)
+    forgedoffset = _vi64(forgedfooter, forgedblocks)
+    forgedmetalen = Int64(_vi32(forgedfooter, forgedblocks + 8))
+    forgedmessage = copy(coordinated[
+        (forgedoffset + 9):(forgedoffset + forgedmetalen)])
+    forgedmessagetable = _vtable(forgedmessage,
+        Int64(_vu32(forgedmessage, 0)))
+    forgedmessagebody = _vfield(forgedmessagetable, 3, 8; required=true)
+    _write_i64!(coordinated,
+        forgedoffset + 8 + forgedmessagebody, forgedbodylen - 8)
+    @assert _rejects(() -> readfile(coordinated))
 
     _, _, _, _, footreserve = verify_footer(simplefooter, Limits())
     tightbudget = max(simplefooterlen, footreserve)
