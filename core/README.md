@@ -206,12 +206,16 @@ input exercises the same path over a mapped file.
 decodes the selected and filter columns, keeps projection/filter/type work in
 a resolved residual, and consumes `limit`/`offset` only when no filter is
 present and the active Tables authority can represent the window safely.
-`RangedFile` uses the Footer as its sole schema authority, validates all Block
-and RecordBatch metadata before it plans body ranges, and intentionally does
-not fetch the leading schema message or optional EOS marker. Embedded batch
-statistics use the official Arrow statistics value layout under the local
-`JuliaArrow:batch_statistics.v1` placement key. They are trusted for
-completeness: conservative lies cost pruning, but narrow lies can lose rows.
+`RangedFile` uses the Footer as its sole schema authority. It validates the
+full Footer Block index and the complete metadata plan for every
+statistics-surviving record before it requests a body range. Per-record limits
+stay lazy, so statistics-pruned record metadata is not fetched or validated.
+It does not parse or cross-check the leading schema message or optional EOS
+marker, although tail reads and coalescing can physically over-read them.
+Embedded batch statistics use the official Arrow statistics value layout
+under the local `JuliaArrow:batch_statistics.v1` placement key. They are
+trusted for completeness: conservative lies cost pruning, but narrow lies can
+lose rows.
 This is prove-out code, not yet part of the package API.
 
 Core supports the full Int8 union-id domain and the IPC writer preserves
