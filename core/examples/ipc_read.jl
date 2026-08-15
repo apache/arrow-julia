@@ -42,12 +42,13 @@
 #     adapter-side table (`dictionaries::Dict{Int64,...}`); Core Fields
 #     carry `DictionaryType` object references and never see an id.
 #
-#   * The adapter REUSES the existing generated FlatBuffers metadata bindings
-#     after a local, byte-wise verifier. This verifier is a prove-out bridge,
-#     not the report's production solution: regenerated bindings plus a
-#     generated verifier replace it. The generated Schema binding predates the
-#     `features` field, so the verifier reads that field directly and enforces
-#     required-feature use.
+#   * The adapter uses metadata bindings REGENERATED from the current
+#     apache/arrow format/*.fbs (core/tools/fbsgen.jl -> core/metadata/),
+#     over the vendored FlatBuffers runtime, behind a local byte-wise
+#     verifier. The verifier is still a prove-out bridge — the report's
+#     production answer is a generated verifier — but the bindings are now
+#     the spec's shape (features, variadicBufferCounts as [long], type tags
+#     through 26, MONTH_DAY_NANO), so no raw-slot workarounds remain.
 #
 # The acceptance test at the bottom: today's Arrow.jl 2.x WRITES a stream
 # (multi-batch, with nulls, strings, lists, structs, and a dict-encoded
@@ -68,7 +69,18 @@ const CZSTD = Arrow.CodecZstd
 const ZSTD = CZSTD.LibZstd
 using PooledArrays               # adversarial dictionary-pool fixture
 const FB = Arrow.FlatBuffers     # vendored flatbuffers runtime (reused as-is)
-const Meta = Arrow.Meta          # vendored format metadata bindings (reused)
+# Metadata bindings REGENERATED from the current apache/arrow format/*.fbs
+# by core/tools/fbsgen.jl (core/metadata/). The vendored 2.x bindings
+# (Arrow.Meta) were hand-written against a 2020-era schema and drift from
+# the spec in eight known places; the prove-out reads the spec's shape.
+module GeneratedMeta
+    using EnumX
+    using ..FB
+    include(joinpath(@__DIR__, "..", "metadata", "Schema.jl"))
+    include(joinpath(@__DIR__, "..", "metadata", "File.jl"))
+    include(joinpath(@__DIR__, "..", "metadata", "Message.jl"))
+end
+const Meta = GeneratedMeta
 
 include(joinpath(@__DIR__, "..", "ArrowCore.jl"))
 using .ArrowCore
@@ -619,9 +631,8 @@ function coretype(t)::ArrowType
     elseif t isa Meta.Decimal
         DecimalType(Int(t.precision), Int(t.scale), Int(t.bitWidth))
     elseif t isa Meta.Interval
-        u = _rawintervalunit(t)
-        IntervalType(u == 0 ? AC.YEAR_MONTH : u == 1 ? AC.DAY_TIME :
-            AC.MONTH_DAY_NANO)
+        IntervalType(t.unit == Meta.IntervalUnit.YEAR_MONTH ? AC.YEAR_MONTH :
+            t.unit == Meta.IntervalUnit.DAY_TIME ? AC.DAY_TIME : AC.MONTH_DAY_NANO)
     elseif t isa Meta.Utf8View
         ViewType(true)
     elseif t isa Meta.BinaryView
@@ -637,14 +648,6 @@ function coretype(t)::ArrowType
     else
         throw(ValidationError("IPC adapter does not map metadata type $(typeof(t))"))
     end
-end
-
-# The vendored IntervalUnit enum predates MONTH_DAY_NANO (format 1.2 — the
-# exact 2.x gap the report's Phase 0A flags), so the unit slot is read as its
-# raw Int16. The verifier already bounds it to the spec's 0:2 domain.
-function _rawintervalunit(t::Meta.Interval)
-    o = FB.offset(t, 4)
-    return o == 0 ? Int16(0) : FB.get(t, o + FB.pos(t), Int16)
 end
 
 """
@@ -893,8 +896,6 @@ mutable struct DecodeCursor{B}
     # One entry per view-typed field in depth-first schema order: how many
     # variadic data buffers that field consumes (format 1.4). Non-view
     # batches carry an empty vector; a leftover entry is a skew error.
-    # NOTE: the vendored binding reads the spec's `[long]` as Int32
-    # elements; the abstract eltype absorbs that mismatch here.
     variadics::AbstractVector{<:Integer}
     varidx::Int
 end
@@ -914,18 +915,14 @@ DecodeCursor(nodes, buffers, body, limits::Limits;
 """
     variadiccounts(rb::Meta.RecordBatch) -> Vector{Int64}
 
-The batch's `variadicBufferCounts` read at the spec's `[long]` width. The
-vendored 2.x binding declares this vector's ELEMENTS as Int32 (a binding
-bug that would mis-stride any real view stream), so this reads the verified
-vector directly: the byte-wise verifier already sized it at 8 bytes per
-element (`_vvector(t, 4, 8)`), and this getter uses the same table/offset
-arithmetic through the generated table's own vtable lookup.
+The batch's `variadicBufferCounts` as a concrete `Vector{Int64}` (empty when
+the slot is absent). The generated binding reads the spec's `[long]` at
+8-byte width; this accessor exists so every site shares one normalized shape
+— and it is where the vendored 2.x binding's Int32-elements bug was bridged
+before regeneration.
 """
-function variadiccounts(rb::Meta.RecordBatch)
-    o = FB.offset(rb, 12)              # slot 4 -> vtable byte offset 4 + 2*4
-    o == 0 && return Int64[]
-    return collect(Int64, FB.Array{Int64}(rb, o))
-end
+variadiccounts(rb::Meta.RecordBatch) =
+    collect(Int64, something(rb.variadicBufferCounts, Int64[]))
 
 "One variadic-buffer count, in depth-first view-field order (format 1.4)."
 function takevariadic!(c::DecodeCursor)
@@ -1510,13 +1507,11 @@ function _schema_stream_from_field!(b, field; features::Vector{Int64}=Int64[])
         foreach(x -> FB.prepend!(b, x), Iterators.reverse(features))
         featurevec = FB.endvector!(b, length(features))
     end
-    # The vendored binding predates Schema.features. Build the four-slot
-    # table directly so standards-conforming V5 streams can be tested.
-    FB.startobject!(b, 4)
+    Meta.schemaStart(b)
     Meta.schemaAddEndianness(b, Meta.Endianness.Little)
     Meta.schemaAddFields(b, fields)
-    featurevec == 0 || FB.prependoffsetslot!(b, 3, featurevec, 0)
-    sch = FB.endobject!(b)
+    featurevec == 0 || Meta.schemaAddFeatures(b, featurevec)
+    sch = Meta.schemaEnd(b)
     Meta.messageStart(b)
     Meta.messageAddVersion(b, Meta.MetadataVersion.V5)
     Meta.messageAddHeaderType(b, Meta.Schema)
@@ -1583,13 +1578,11 @@ function _dictionary_schema_frame_with_replacement(id::Int64)
     FB.prepend!(b, Int64(1)) # Feature.DICTIONARY_REPLACEMENT
     features = FB.endvector!(b, 1)
 
-    # The vendored Schema binding predates the features field. Build the same
-    # four-slot table directly for this forward-compatibility regression.
-    FB.startobject!(b, 4)
+    Meta.schemaStart(b)
     Meta.schemaAddEndianness(b, Meta.Endianness.Little)
     Meta.schemaAddFields(b, fields)
-    FB.prependoffsetslot!(b, 3, features, 0)
-    sch = FB.endobject!(b)
+    Meta.schemaAddFeatures(b, features)
+    sch = Meta.schemaEnd(b)
     Meta.messageStart(b)
     Meta.messageAddVersion(b, Meta.MetadataVersion.V5)
     Meta.messageAddHeaderType(b, Meta.Schema)
@@ -1834,8 +1827,12 @@ function _misaligned_empty_children_stream()
         slot = _vfield(field, 5, 4; required=true)
         vector = _vref(field, 5; required=true)
         _vu32(meta, vector) == 0 || error("fixture has nonempty children")
-        vector > 0 && all(iszero, @view meta[vector:(vector + 3)]) ||
-            error("fixture has no zero padding before its children vector")
+        # Retarget the children reference one byte early: the length word
+        # then sits at a position that is not 4-aligned, which the verifier
+        # must reject before any generated getter dereferences it. (An older
+        # form of this fixture also required zero padding there — a layout
+        # accident of the previous builder, not part of the property.)
+        vector % 4 == 0 || error("fixture vector was not aligned to begin with")
         _write_u32!(meta, slot, UInt32(_vu32(meta, slot) - 1))
     end
     return bytes

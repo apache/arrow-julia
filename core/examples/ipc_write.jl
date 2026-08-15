@@ -131,9 +131,8 @@ function metatype!(b::FB.Builder, t::ArrowType)
         return Meta.Bool, Meta.boolEnd(b)
     elseif t isa Utf8Type
         if t.large
-            # `largUtf8Start` is the vendored binding's own (typo) name.
-            Meta.largUtf8Start(b)
-            return Meta.LargeUtf8, Meta.largUtf8End(b)
+            Meta.largeUtf8Start(b)
+            return Meta.LargeUtf8, Meta.largeUtf8End(b)
         end
         Meta.utf8Start(b)
         return Meta.Utf8, Meta.utf8End(b)
@@ -194,10 +193,10 @@ function metatype!(b::FB.Builder, t::ArrowType)
         Meta.decimalAddBitWidth(b, Int32(t.bits))
         return Meta.Decimal, Meta.decimalEnd(b)
     elseif t isa IntervalType
-        # The vendored enum predates MONTH_DAY_NANO; write the raw unit slot
-        # (the read side's `_rawintervalunit` is the same bridge).
         Meta.intervalStart(b)
-        FB.prependslot!(b, 0, Int16(UInt8(t.unit)), Int16(0))
+        Meta.intervalAddUnit(b, t.unit == AC.YEAR_MONTH ? Meta.IntervalUnit.YEAR_MONTH :
+            t.unit == AC.DAY_TIME ? Meta.IntervalUnit.DAY_TIME :
+            Meta.IntervalUnit.MONTH_DAY_NANO)
         return Meta.Interval, Meta.intervalEnd(b)
     elseif t isa UnionType
         Meta.unionStartTypeIdsVector(b, length(t.typeids))
@@ -232,19 +231,6 @@ function metatype!(b::FB.Builder, t::ArrowType)
         throw(ValidationError("IPC writer does not map descriptor " *
             "$(AC.descriptorname(t))"))
     end
-end
-
-# The vendored T -> tag table stops at LargeList (21); the format 1.3/1.4
-# tags are written through the same raw slot the generated helper uses.
-const _LATE_TYPE_TAGS = IdDict{Any,Int16}(
-    Meta.RunEndEncoded => Int16(22), Meta.BinaryView => Int16(23),
-    Meta.Utf8View => Int16(24), Meta.ListView => Int16(25),
-    Meta.LargeListView => Int16(26))
-
-function _addtypetag!(b::FB.Builder, ::Base.Type{T}) where {T}
-    tag = get(_LATE_TYPE_TAGS, T, nothing)
-    tag === nothing && return Meta.fieldAddTypeType(b, T)
-    return FB.prependslot!(b, 2, tag, Int16(0))
 end
 
 function _metakeyvalues!(b::FB.Builder, metadata)
@@ -297,7 +283,7 @@ function metafield!(b::FB.Builder, f::Field, fielddictids::IdDict{Field,Int64})
     Meta.fieldStart(b)
     Meta.fieldAddName(b, name)
     Meta.fieldAddNullable(b, f.nullable)
-    _addtypetag!(b, tag)
+    Meta.fieldAddTypeType(b, tag)
     Meta.fieldAddType(b, typeoff)
     dictoff == 0 || Meta.fieldAddDictionary(b, dictoff)
     Meta.fieldAddChildren(b, childvec)
@@ -335,14 +321,12 @@ function _metaschema!(b::FB.Builder, sch::Schema,
         foreach(x -> FB.prepend!(b, x), Iterators.reverse(features))
         featurevec = FB.endvector!(b, length(features))
     end
-    # The vendored Schema binding predates `features`; build the four-slot
-    # table directly (same bridge the reader fixtures use).
-    FB.startobject!(b, 4)
+    Meta.schemaStart(b)
     Meta.schemaAddEndianness(b, Meta.Endianness.Little)
     Meta.schemaAddFields(b, fieldvec)
     kvvec == 0 || Meta.schemaAddCustomMetadata(b, kvvec)
-    featurevec == 0 || FB.prependoffsetslot!(b, 3, featurevec, 0)
-    return FB.endobject!(b)
+    featurevec == 0 || Meta.schemaAddFeatures(b, featurevec)
+    return Meta.schemaEnd(b)
 end
 
 function _schemamessage!(out::Vector{UInt8}, sch::Schema,
@@ -491,23 +475,16 @@ function _batchheader!(b::FB.Builder, c::EncodeCursor, nrows::Int64)
     end
     varvec = FB.UOffsetT(0)
     if !isempty(c.variadics)
-        FB.startvector!(b, 8, length(c.variadics), 8)
+        Meta.recordBatchStartVariadicBufferCountsVector(b, length(c.variadics))
         foreach(x -> FB.prepend!(b, x), Iterators.reverse(c.variadics))
         varvec = FB.endvector!(b, length(c.variadics))
     end
-    if varvec == 0
-        Meta.recordBatchStart(b)
-    else
-        # The vendored recordBatchStart is a four-slot table predating
-        # variadicBufferCounts; build the five-slot table directly (the same
-        # bridge the schema-features writer uses).
-        FB.startobject!(b, 5)
-    end
+    Meta.recordBatchStart(b)
     Meta.recordBatchAddLength(b, nrows)
     Meta.recordBatchAddNodes(b, nodes)
     Meta.recordBatchAddBuffers(b, buffers)
     compression == 0 || Meta.recordBatchAddCompression(b, compression)
-    varvec == 0 || FB.prependoffsetslot!(b, 4, varvec, 0)
+    varvec == 0 || Meta.recordBatchAddVariadicBufferCounts(b, varvec)
     return Meta.recordBatchEnd(b)
 end
 
@@ -793,9 +770,7 @@ function writefile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
             Meta.createBlock(b, off, Int32(metalen), bodylen)
         end
         recordvec = FB.endvector!(b, length(recordblocks))
-        # The vendored Footer binding predates custom_metadata. Build all five
-        # slots directly so verifier and equivalence checks see current geometry.
-        FB.startobject!(b, 5)
+        Meta.footerStart(b)
         Meta.footerAddVersion(b, Meta.MetadataVersion.V5)
         Meta.footerAddSchema(b, schoff)
         Meta.footerAddDictionaries(b, dictvec)
@@ -2009,18 +1984,26 @@ function main()
     norf, nord = fromjulia("run_ends", Int32[2, 4])
     nf = Field("nested", rt; children=[norf, nif])
     nd = ArrayData(rt, 4, BufferSlice[]; children=[nord, nid], nullcount=0)
+    # 64-bit-offset utf8/binary: the only IPC path exercising the LargeUtf8/
+    # LargeBinary metadata tables (the vendored typo `largUtf8Start` hid
+    # here undetected until regeneration).
+    luf = Field("lu", Utf8Type(true); nullable=false)
+    lud = ArrayData(Utf8Type(true), 4,
+        [BufferSlice(), AC._databuffer(Int64[0, 1, 1, 3, 6]),
+         AC._databuffer(collect(codeunits("abcdef")))]; nullcount=0)
     # a plain column AFTER the exotic ones proves no buffer skew
     tf, td = fromjulia("tail", Int64[1, 2, 3, 4])
-    exsch = Schema(Field[vf, lvf, rf, nf, tf])
+    exsch = Schema(Field[vf, lvf, rf, nf, luf, tf])
     exlv = ArrayData(lvt, 4,
         [BufferSlice(), AC._databuffer(Int32[2, 0, 0, 1]),
          AC._databuffer(Int32[1, 2, 3, 0])]; children=[lvcd], nullcount=0)
-    exbatch = AC.RecordBatch(exsch, ArrayData[vd, exlv, rd, nd, td], 4)
+    exbatch = AC.RecordBatch(exsch, ArrayData[vd, exlv, rd, nd, lud, td], 4)
     exwant = Dict(
         "v" => Any["abc", "first-out-of-line-payload", missing, ""],
         "lv" => Any[[30], [10, 20], [10, 20, 30], Int64[]],
         "ree" => Any["x", "x", missing, "z"],
         "nested" => Any["p", "p", "q", "q"],
+        "lu" => Any["a", "", "bc", "def"],
         "tail" => Any[1, 2, 3, 4])
     for compress in (:none, :zstd)
         exbytes = writestream(exsch, [exbatch]; compress=compress)
@@ -2047,7 +2030,7 @@ function main()
     exmeta = exframes[1].msg.header::Meta.Schema
     @assert [typeof(f.type) for f in exmeta.fields] ==
         [Meta.Utf8View, Meta.ListView, Meta.RunEndEncoded,
-         Meta.RunEndEncoded, Meta.Int]
+         Meta.RunEndEncoded, Meta.LargeUtf8, Meta.Int]
     println("variadic counts and 1.3/1.4 type tags are on the wire ✓")
 
     # A view column with ZERO variadic buffers (all inline) is legal and
