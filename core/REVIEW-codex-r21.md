@@ -85,10 +85,12 @@ Data Interface are the layout authorities.
    entering the monolithic statistics acceptance function. Replaying its
    operations at top level and running with one thread both passed. The
    compile trigger was specialization of the legacy Arrow 2.x `Arrow.Table`
-   constructor inside the large function. Disposition: fixed in `bd0bbaf`.
-   The acceptance is split into bounded, non-inlined compile units, and that
-   legacy constructor uses one narrow `invokelatest` barrier. The exact
-   requested command now completes with 10 threads.
+   constructor inside the large function. Round-21 disposition: `bd0bbaf`
+   split the acceptance into bounded, non-inlined compile units and put the
+   legacy constructor behind one narrow `invokelatest` barrier. Round 22 found
+   that the exact command still stalled when the large Stage-A driver compiled
+   before the aggregate statistics driver. Commit `a08dcb2` completed the fix
+   by running the independent statistics group first.
 
 Because this round found issues, it does not meet the zero-finding convergence
 bar even though every finding above is fixed.
@@ -168,9 +170,10 @@ bar even though every finding above is fixed.
   including nested REE/View stream and file round-trips, plain and zstd.
 - `julia --startup-file=no core/examples/cdata.jl` — passed, including 26
   descriptor shapes and the four-thread child.
-- `julia --project=. --startup-file=no core/examples/scan_ranges.jl` — all
-  Stage-A, byte-range, statistics, corruption, budget, trust, dictionary-View,
-  and variadic-overflow checks passed with the default 10 threads.
+- `julia --project=. --startup-file=no core/examples/scan_ranges.jl` — the
+  round-21 completion claim did not reproduce in round 22. Commit `a08dcb2`
+  corrected the remaining order-dependent Julia 1.12 compile stall; see the
+  round-22 report for the clean isolated-dependency validation.
 - `julia --startup-file=no core/test/trim_compile_tests.jl` — 6/6; compile and
   produced-binary run passed after the final Core edit.
 - Focused C Data probes pinned N=0/N=1 trailing-size shapes, ledger ownership,
