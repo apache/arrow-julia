@@ -41,7 +41,7 @@ listed under Honest status.
 | `examples/cdata.jl` | Full mapped C Data format parity plus bidirectional `ArrowArrayStream`, zero-copy ownership, move semantics, and exactly-once release tests |
 | `examples/scan_ranges.jl` | Stage-A `Tables.Scan` pushdown, sparse byte-range reads, embedded per-batch statistics, and differential/fetch/trust acceptance tests |
 | `DESIGN-scan-ranges-trim.md` | The P1–P3 prove-out contract and the remaining P4 production/trim work |
-| `REVIEW-codex-r1.md` through `REVIEW-codex-r18.md` | Adversarial review findings and the disposition of each item |
+| `REVIEW-codex-r1.md` through `REVIEW-codex-r20.md` | Adversarial review findings and the disposition of each item |
 
 ## Run it
 
@@ -343,9 +343,10 @@ can claim the same guarantee.
   `@inline` `isa` ladders (`layoutspec_of`, `_value_of`, `_materialize_of`,
   `typeequal`, `descriptorname`, `_validate_descriptor_of`) devirtualize
   every generic entry point. Multiple dispatch remains the per-layout
-  extension surface underneath. Collapsing the ladders to plain forwards
-  (`layoutspec_of(t::T) where {T} = layoutspec(t)`) was tried and rejected
-  by evidence (Aug 2026): the verifier reports the abstract call site as
+  extension surface underneath. Collapsing the four `_of` ladders
+  (`layoutspec_of`, `_validate_descriptor_of`, `_value_of`, and
+  `_materialize_of`) to plain forwards was tried and rejected by evidence
+  (Aug 2026): the verifier reports the abstract `layoutspec` call site as
   unresolved and does not enumerate the closed method table — gate 2/6.
   Throwing `::Any` fallbacks were kept from that experiment.
 - **Narrow after `||`-checks.** An `isa` test inside an `||` condition does

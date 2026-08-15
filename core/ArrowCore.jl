@@ -69,14 +69,13 @@ fully delivered. Ordinary exception safety (error paths clean up, release
 is exactly-once) IS in contract. When Julia 1.14's structured cancellation
 lands, a formal revisit is planned on top of whatever Base then provides.
 
-Deliberately out of scope for the prove-out (tracked in the report roadmap):
-view layouts (Utf8View/BinaryView/ListView) and run-end encoding have
-registry entries and structural validation but no semantic validation or
-element accessors; semantic/full validation rejects them rather than marking
-unchecked content valid. Core has no codec dependency; the IPC adapter
-implements compression. There is no Tables.jl integration or `ViewPlan` — bulk access
-here uses a plain function barrier (`materialize`) to demonstrate the
-pattern the facade will formalize.
+The registry, staged validation, element access, and materialization cover
+the mapped format-1.5 layouts, including binary views, list views, and
+run-end encoding. Canonical padding and unused-bit checks remain production
+work. Core has no codec dependency; the IPC adapter implements compression.
+There is no Tables.jl integration or `ViewPlan` — bulk access here uses a
+plain function barrier (`materialize`) to demonstrate the pattern the facade
+will formalize.
 """
 module ArrowCore
 
@@ -436,15 +435,15 @@ struct DictionaryType <: ArrowType
     valuetype::ArrowType
     ordered::Bool
 end
-"Utf8View / BinaryView (format 1.4). Registry + structural validation only in the prove-out."
+"Utf8View / BinaryView (format 1.4): 16-byte entries plus variadic data buffers."
 struct ViewType <: ArrowType
     utf8::Bool
 end
-"ListView / LargeListView (format 1.4). Registry + structural validation only in the prove-out."
+"ListView / LargeListView (format 1.4): per-slot child offsets and sizes."
 struct ListViewType <: ArrowType
     large::Bool
 end
-"Run-end encoded (format 1.3). Registry + structural validation only in the prove-out."
+"Run-end encoded (format 1.3): signed run ends and values of any Arrow type."
 struct RunEndEncodedType <: ArrowType end
 
 """
@@ -1222,8 +1221,6 @@ geometry by skipping `validate_structural`. Data-intrinsic checks are cached
 on the ArrayData (`semachecked`); benign concurrent callers may repeat the
 same scan. Field-dependent contracts, including ancestor-masked nullability,
 run on every call because the same data can be checked against another Field.
-Layouts declared as structural-only fail closed instead of caching an
-incomplete check.
 """
 function validate_semantic(f::Field, d::ArrayData)
     return _validate_semantic(f, d, nothing)
