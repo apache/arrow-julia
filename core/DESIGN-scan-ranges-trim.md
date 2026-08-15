@@ -174,7 +174,7 @@ live in extensions:
         # concurrent range GETs (CloudStore does this well) — concurrency
         # stays in the extension, never in Arrow.
 
-- The prove-out entry point is `Tables.read(RangedFile(source), scan)`. A
+- The prove-out entry point is `Tables.scan(RangedFile(source), scan)`. A
   production `readfile(::RangedSource; scan=...)` can make the existing
   whole-buffer and `mmapregion` paths trivial `RangedSource`s
   (fetch = copy/subslice), so ONE reader serves local and remote and the
