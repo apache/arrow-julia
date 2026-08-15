@@ -1083,15 +1083,13 @@ function _validate_structural(f::Field, d::ArrayData,
             throw(ValidationError("REE parent null count must be zero"))
         length(d.children[1]) == length(d.children[2]) ||
             throw(ValidationError("REE run-end and value child lengths must match"))
-        total == 0 || length(d.children[1]) > 0 ||
+        d.len == 0 || length(d.children[1]) > 0 ||
             throw(ValidationError("a nonempty REE array requires at least one physical run"))
         maxrunend = runtype.bits == 16 ? Int64(typemax(Int16)) :
             runtype.bits == 32 ? Int64(typemax(Int32)) : typemax(Int64)
         total <= maxrunend ||
             throw(ValidationError(
                 "REE logical extent $total exceeds the $(runtype.bits)-bit run-end range"))
-        !(valuefield.type isa RunEndEncodedType) ||
-            throw(ValidationError("nested run-end encoding is not permitted"))
     end
     return d
 end

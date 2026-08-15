@@ -2131,6 +2131,13 @@ function main()
     sut = UnionType(AC.SparseMode, Int8[0, 1])
     dut = UnionType(AC.DenseMode, Int8[0, 1])
     tsnulls = TimestampType(AC.MICROSECOND, "UTC")
+    nestedirf, nestedird = fromjulia("run_ends", Int32[1, 2])
+    nestedivf, nestedivd = fromjulia("values", Int64[10, 20])
+    nestedinnerf = Field("values", RunEndEncodedType();
+        children=[nestedirf, nestedivf])
+    nestedinnerd = ArrayData(RunEndEncodedType(), 2, BufferSlice[];
+        children=[nestedird, nestedivd], nullcount=0)
+    nestedorf, nestedord = fromjulia("run_ends", Int32[2, 4])
     paritycases = Tuple{Field,ArrayData}[
         (Field("dec128", DecimalType(38, 10, 128)),
             ArrayData(DecimalType(38, 10, 128), 2,
@@ -2234,6 +2241,10 @@ function main()
                 children=[fromjulia("run_ends", Int32[2, 3, 4])[2],
                           fromjulia("values", Union{Missing,String}["x", missing, "z"])[2]],
                 nullcount=0)),
+        (Field("nested-ree", RunEndEncodedType();
+                children=[nestedorf, nestedinnerf]),
+            ArrayData(RunEndEncodedType(), 4, BufferSlice[];
+                children=[nestedord, nestedinnerd], nullcount=0)),
     ]
     for (f, d) in paritycases
         want = collect(Any, materialize(f, d))

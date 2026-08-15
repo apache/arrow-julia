@@ -893,16 +893,19 @@ end
         @test validate_semantic(f, repeated) === repeated
     end
 
-    @testset "structural: nested REE is forbidden" begin
-        rf, rd = fromjulia("run_ends", Int32[1])
-        vf, vd = fromjulia("values", Int64[1])
-        innerf = Field("values", RunEndEncodedType(); children=[rf, vf])
-        innerd = AC.ArrayData(RunEndEncodedType(), 1, BufferSlice[];
-            children=[rd, vd], nullcount=0)
-        outerf = Field("ree", RunEndEncodedType(); children=[rf, innerf])
-        outerd = AC.ArrayData(RunEndEncodedType(), 1, BufferSlice[];
-            children=[rd, innerd], nullcount=0)
-        @test_throws ValidationError validate_structural(outerf, outerd)
+    @testset "structural: nested REE values are supported" begin
+        irf, ird = fromjulia("run_ends", Int32[1, 2])
+        ivf, ivd = fromjulia("values", Int64[10, 20])
+        innerf = Field("values", RunEndEncodedType(); children=[irf, ivf])
+        innerd = AC.ArrayData(RunEndEncodedType(), 2, BufferSlice[];
+            children=[ird, ivd], nullcount=0)
+        orf, ord = fromjulia("run_ends", Int32[2, 4])
+        outerf = Field("ree", RunEndEncodedType(); children=[orf, innerf])
+        outerd = AC.ArrayData(RunEndEncodedType(), 4, BufferSlice[];
+            children=[ord, innerd], nullcount=0)
+        @test validate_full(outerf, outerd) === outerd
+        @test getvalue(outerf, outerd, 3) == 20
+        @test materialize(outerf, outerd) == [10, 10, 20, 20]
     end
 
     @testset "structural: REE geometry must be representable" begin
@@ -910,6 +913,9 @@ end
         evf, evd = fromjulia("values", Int64[])
         t = RunEndEncodedType()
         f = Field("ree", t; children=[erf, evf])
+        emptyslice = AC.ArrayData(t, 0, BufferSlice[];
+            offset=5, children=[erd, evd], nullcount=0)
+        @test validate_full(f, emptyslice) === emptyslice
         emptyphysical = AC.ArrayData(t, 1, BufferSlice[];
             children=[erd, evd], nullcount=0)
         @test_throws ValidationError validate_structural(f, emptyphysical)
