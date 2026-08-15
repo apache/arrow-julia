@@ -348,6 +348,10 @@ end
 function _offsetlist(d::ArrayData, wide::Bool)
     b = AC.rolebuffer(d, AC.OFFSETS)
     n = d.len
+    # A zero-length unsliced array may carry Core's canonical empty offsets
+    # buffer (nanoarrow and C++ write that form); the JSON column still
+    # declares the single terminal zero.
+    b.len == 0 && n == 0 && return wide ? Int64[0] : Int32[0]
     if wide
         return Int64[AC.loadat(b, Int64, (d.offset + i) * 8) for i = 0:n]
     end

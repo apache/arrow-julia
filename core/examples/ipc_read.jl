@@ -1117,10 +1117,15 @@ function decodefield(f::Field, c::DecodeCursor, dicts::Dict{Int64,ArrayData},
         end
     end
     for (role, buffer) in zip(spec.buffers, buffers)
+        # A zero-length array may omit its offsets buffer entirely — Core
+        # accepts that canonical empty form, and nanoarrow and C++ write it
+        # (the oracle suite caught us refusing nanoarrow's bytes). A PARTIAL
+        # offsets buffer — nonempty but short of one slot — is still
+        # malformed framing.
         if role == AC.OFFSETS && node.length == 0 &&
-            buffer.len < spec.offsetwidth
+            0 < buffer.len < spec.offsetwidth
             throw(ValidationError(
-                "IPC empty offset array must carry its terminal zero offset"))
+                "IPC offsets buffer is shorter than one offset slot"))
         end
     end
     children = ArrayData[]

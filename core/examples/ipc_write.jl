@@ -1518,15 +1518,20 @@ function main()
     emptybuffers = something((emptyframes[2].msg.header::Meta.RecordBatch).buffers,
         Meta.Buffer[])
     @assert emptybuffers[2].length == 4
-    malformedempty = copy(emptybytes)
-    _mutatemessage!(malformedempty, 2) do meta, msg
+    # ... and the reader ACCEPTS the omitted-offsets form for zero-length
+    # arrays (Core's canonical empty; nanoarrow and C++ write it), which the
+    # same message with its offsets buffer length zeroed exercises.
+    omittedempty = copy(emptybytes)
+    _mutatemessage!(omittedempty, 2) do meta, msg
         rb = _headertable(meta, msg)
         bufferstart, nbufs = _vvector(rb, 2, 16; required=true)
         @assert nbufs == 3
         _write_i64!(meta, bufferstart + 16 + 8, Int64(0))
     end
-    @assert _rejects(() -> readstream(malformedempty))
-    println("empty IPC offset arrays carry one terminal zero offset ✓")
+    omittedstream = readstream(omittedempty)
+    @assert isempty(materialize(omittedstream.schema.fields[1],
+        omittedstream.batches[1].columns[1]))
+    println("empty IPC offset arrays: written with one terminal zero, read with none ✓")
 
     # Schema and field metadata round-trip through the writer.
     mio = IOBuffer()
