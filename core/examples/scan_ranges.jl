@@ -1100,8 +1100,17 @@ function _statfold(f::Field, d::ArrayData)
     # their pools, and REE columns fold through their values child — the REE
     # parent's physical null count is always 0 (spec), so its logical null
     # count must be derived or `isnull` pruning would drop real nulls.
-    stat = t isa DictionaryType ? t.valuetype :
-        t isa RunEndEncodedType ? f.children[2].type : t
+    statfield = f
+    stat = t
+    while stat isa DictionaryType || stat isa RunEndEncodedType
+        if stat isa DictionaryType
+            statfield = AC.dictvaluefield(statfield, stat)
+            stat = stat.valuetype
+        else
+            statfield = statfield.children[2]
+            stat = statfield.type
+        end
+    end
     nc = if t isa DictionaryType || t isa RunEndEncodedType
         count(i -> ismissing(AC.getvalue(f, d, i)), 1:d.len)
     else
@@ -2315,6 +2324,26 @@ function _stats_main()
         [BufferSlice(), AC._databuffer(Int32[0])]; dictionary=pool, nullcount=0)
     @assert _statfold(dfield, ddata) == (1, nothing, nothing)
     println("dictionary statistics count null pool values logically ✓")
+
+    # Wrapper unwrapping is recursive: nested REE values may themselves use
+    # a view layout. Logical null counts repeat the null value for every slot
+    # in its outer run, while supported bounds keep their String domain.
+    nvt = ViewType(true)
+    nviews = vcat(reinterpret(UInt8, Int32[Int32(1)]), UInt8[0x70],
+        zeros(UInt8, 11), zeros(UInt8, 16))
+    nvf = Field("values", nvt; nullable=true)
+    nvd = ArrayData(nvt, 2,
+        [AC._databuffer(UInt8[0x01]), AC._databuffer(nviews)]; nullcount=1)
+    nirf, nird = fromjulia("run_ends", Int32[1, 2])
+    nif = Field("values", RunEndEncodedType(); children=[nirf, nvf])
+    nid = ArrayData(RunEndEncodedType(), 2, BufferSlice[];
+        children=[nird, nvd], nullcount=0)
+    norf, nord = fromjulia("run_ends", Int32[2, 4])
+    nf = Field("nested", RunEndEncodedType(); children=[norf, nif])
+    nd = ArrayData(RunEndEncodedType(), 4, BufferSlice[];
+        children=[nord, nid], nullcount=0)
+    @assert _statfold(nf, nd) == (2, "p", "p")
+    println("nested REE/view statistics fold logical nulls and String bounds ✓")
 
     # Request-plan proof: x > 7 prunes batch 1, so its block metadata and body
     # add no dedicated ranges. This fixture's request log also excludes its
