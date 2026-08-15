@@ -723,6 +723,11 @@ function validatedictionaryids(fields, fielddictids::IdDict{Field,Int64})
     compatible(a::Field, b::Field; compare_name::Bool=false) =
         (!compare_name || a.name == b.name) &&
         AC.typeequal(a.type, b.type) && a.nullable == b.nullable &&
+        # One id resolves ONE pool, so repeated ids must agree on the whole
+        # nested dictionary-id topology: compatible value schemas whose
+        # nested fields carry DIFFERENT wire ids would decode the second
+        # field through pools its schema never declared.
+        (!(a.type isa DictionaryType) || fielddictids[a] == fielddictids[b]) &&
         length(a.children) == length(b.children) &&
         all(compatible(x, y; compare_name=true)
             for (x, y) in zip(a.children, b.children))
@@ -1326,6 +1331,8 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
             # Reusing them avoids repeated metadata-string/container
             # allocation on dictionary replacement messages. Pool
             # nullability is independent from the encoded index field.
+            haskey(dictvaluefields, header.id) ||
+                throw(ValidationError("dictionary batch has unknown id $(header.id)"))
             vf = dictvaluefields[header.id]
             rblen = something(rb.length, Int64(0))
             0 <= rblen <= limits.max_array_length ||

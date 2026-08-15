@@ -155,14 +155,14 @@ fixed-size list, struct, map, sparse and dense union, null, dictionary
 overlays, and the format 1.3/1.4 layouts — Utf8View/BinaryView (the
 `variadicBufferCounts` vector consumed depth-first per view field, appended
 data buffers after the fixed validity/views pair), ListView/LargeListView,
-and run-end encoding (type tags 22–26 written through a raw slot; the
-vendored builder's tag table stops at 21). One binding bug is bridged and
-named: the vendored getter declares `variadicBufferCounts` elements as Int32
-where the spec says `[long]`, so `variadiccounts(rb)` reads the verified
-vector at 8-byte width and every site routes through it. These layouts have
+and run-end encoding. The FlatBuffers bindings are regenerated from the
+current spec (`core/metadata/`, generator `core/tools/fbsgen.jl`): 64-bit
+`variadicBufferCounts`, type tags through LargeListView, five-slot
+RecordBatch and Footer. The view/REE layouts have
 no 2.x writer, so their acceptance is self round-trip on both formats with
-wire-shape assertions. Nested
-dictionary encodings inside a dictionary value are rejected. It accepts
+wire-shape assertions. Nested dictionary encoding (a pool whose value
+schema is itself dictionary-encoded) is read and written in dependency
+order. It accepts
 V4 and V5 metadata on little-endian hosts, supports feature-gated full
 dictionary replacement, preserves old dictionary snapshots, and rejects
 delta dictionaries. It requires the current eight-byte continuation-marker
@@ -195,15 +195,20 @@ one batch per pool snapshot, a replacement batch only when a later batch's
 pool identity differs, `Feature.DICTIONARY_REPLACEMENT` declared in that
 case (and `COMPRESSED_BODY` when a compressed batch is emitted). Files declare
 the same compression feature in both schema copies and reject dictionary
-replacement. Every column is semantically validated against every applicable
-Field contract before its bytes are emitted. The writer is eager and sequential —
+replacement. Every column is semantically validated before its bytes are emitted
+(advisory contracts — nullability, Date64 divisibility, time range, decimal
+precision — live in the opt-in `validate_full` tier). The writer is eager and sequential —
 it assembles byte vectors and copies buffer contents into message bodies;
 the report's parallel encode pipeline with byte-credit accounting, its
 incremental `IO` sink tiers, and append-as-resume remain production work.
 Arrays with a nonzero element offset are refused (materialize first). Each
-schema position must use a distinct `Field` object and gets its own dictionary
-id; identity-shared pools re-encode per field. Canonical empty offset arrays
-materialize their required terminal zero on the wire. The file format refuses
+schema position must use a distinct `Field` object. Fresh dictionary ids are
+assigned per field; a caller-supplied id table (as the readers carry) makes
+shared ids write as one shared dictionary batch, with value-schema
+compatibility, one nested-id topology per repeated id, and one pool per id
+within each batch enforced before bytes are emitted. Canonical empty offset
+arrays materialize their required terminal zero on the wire (and the reader
+accepts the omitted form other writers emit). The file format refuses
 pools that change identity across batches (one dictionary batch per id).
 `readfile` verifies both magics, the leading and footer schemas, cumulative
 footer work, and every Block's frame, Message kind, wire-buffer extents, and
@@ -241,11 +246,11 @@ caller must not mutate or resize that vector while the stream or its batches
 live. The same immutable-borrow rule applies to Julia vectors wrapped
 directly by Core builders or `heapregion` while their `ArrayData` or cached
 validation results remain in use.
-It is not the report's incremental `IO` framer. Its
-byte-wise verifier is a local bridge around the repository's older generated
-bindings. Production work must regenerate the bindings from the pinned
-schema and use a generated verifier; the report explicitly rejects a custom
-parser as the final design. `max_total_allocated_bytes` is one reader-wide,
+It is not the report's incremental `IO` framer. The
+bindings are regenerated from the current spec, but the byte-wise verifier
+in front of them is still a local implementation; production work must use
+a generated verifier — the report explicitly rejects a custom parser as the
+final design. `max_total_allocated_bytes` is one reader-wide,
 conservative budget for metadata copies, metadata-directed Julia containers,
 and exact-sized decompressed outputs across all eager dictionary and record
 batches. It is not an exact measurement of every Julia runtime allocation.

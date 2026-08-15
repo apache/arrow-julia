@@ -81,8 +81,12 @@ function _eq(a, b, path::String, diffs::Vector{String})
             length(diffs) > 20 && return
         end
     elseif a isa AbstractFloat || b isa AbstractFloat
+        # EXACT equality (± zero unified, NaN equal): a tolerance here would
+        # bless changed values. Sub-double columns are canonicalized to
+        # their physical precision by _normalize! first, which is what makes
+        # exact comparison correct across writers' decimal choices.
         fa, fb = Float64(_num(a)), Float64(_num(b))
-        (isnan(fa) && isnan(fb)) || isapprox(fa, fb; rtol=1e-6, atol=1e-9) ||
+        (isnan(fa) && isnan(fb)) || fa == fb ||
             push!(diffs, "$path: $a vs $b")
     elseif a isa Bool || b isa Bool
         Bool(a) == Bool(b) || push!(diffs, "$path: $a vs $b")
@@ -129,6 +133,50 @@ function _normalize!(doc::AbstractDict)
             c["name"] = "DICT"
         end
     end
+    # Half/single float values parsed from another writer's shortest-repr
+    # decimals do not lift to the same Float64s ours do; canonicalize every
+    # sub-double column through its physical precision so the comparison can
+    # be EXACT for all floats.
+    canonfloat(precision, v) = !(v isa Real) ? v :
+        precision == "HALF" ? Float64(Float16(Float64(v))) :
+        precision == "SINGLE" ? Float64(Float32(Float64(v))) : Float64(v)
+    function normfloatcols!(f, col)
+        (f isa AbstractDict && col isa AbstractDict) || return
+        # A dictionary field's batch column carries integer INDICES; its
+        # float values live in the dictionaries section, paired below.
+        haskey(f, "dictionary") && return
+        t = get(f, "type", Dict())
+        if get(t, "name", "") == "floatingpoint" && haskey(col, "DATA")
+            p = get(t, "precision", "DOUBLE")
+            col["DATA"] = Any[canonfloat(p, v) for v in col["DATA"]]
+        end
+        for (x, y) in zip(get(f, "children", Any[]), get(col, "children", Any[]))
+            normfloatcols!(x, y)
+        end
+    end
+    fields = get(get(doc, "schema", Dict()), "fields", Any[])
+    for b in get(doc, "batches", Any[])
+        for (f, c) in zip(fields, get(b, "columns", Any[]))
+            normfloatcols!(f, c)
+        end
+    end
+    # Pools pair with dictionary fields in the same depth-first order
+    # `renumber!` rebuilt the dictionaries array in.
+    pools = get(doc, "dictionaries", Any[])
+    poolindex = Ref(0)
+    function normfloatpools!(f)
+        f isa AbstractDict || return
+        if get(f, "dictionary", nothing) isa AbstractDict
+            poolindex[] += 1
+            valuefield = Dict{String,Any}("type" => get(f, "type", Dict()),
+                "children" => get(f, "children", Any[]))
+            for pc in pools[poolindex[]]["data"]["columns"]
+                normfloatcols!(valuefield, pc)
+            end
+        end
+        foreach(normfloatpools!, get(f, "children", Any[]))
+    end
+    foreach(normfloatpools!, fields)
     # Map entries-struct names are NOT round-trip stable in the corpus itself:
     # generated_map_non_canonical's gold .stream carries `entries` while its
     # gold .arrow_file and .json carry `some_entries` (the C++ stream writer

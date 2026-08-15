@@ -54,8 +54,11 @@ Design rules this module is built to demonstrate:
    and run at construction/adaptation time. Data-intrinsic semantic checks
    are O(n) when an adapter or caller requests them; a successful result is
    cached. Benign concurrent callers may repeat the same scan.
-   Field-dependent contracts, including nullability, run on every validation
-   call. Full checks (UTF-8) are opt-in.
+   Field-dependent dictionary contracts run on every validation call.
+   Advisory contracts — Field.nullable enforcement, Date64 day
+   divisibility, time-of-day range, decimal precision, and body UTF-8 —
+   are opt-in via `validate_full`: the ecosystem's gold files violate them
+   and the reference implementation reads those files.
    Framing-stage checks (checked spans, metadata verification, and resource
    limits before metadata-directed allocation) belong to the adapters and
    are exercised in the IPC example.
@@ -1231,8 +1234,9 @@ Stage-3 validation. This public stage composes structural validation before
 any content access, so callers cannot accidentally certify malformed buffer
 geometry by skipping `validate_structural`. Data-intrinsic checks are cached
 on the ArrayData (`semachecked`); benign concurrent callers may repeat the
-same scan. Field-dependent contracts, including ancestor-masked nullability,
-run on every call because the same data can be checked against another Field.
+same scan. Field-dependent dictionary contracts run on every call because
+the same data can be checked against another Field. Per-slot nullability
+enforcement is advisory and lives in the opt-in `validate_full` tier.
 """
 function validate_semantic(f::Field, d::ArrayData)
     return _validate_semantic(f, d, nothing)

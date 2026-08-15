@@ -228,8 +228,7 @@ function _planminbytes(role, spec, node, len::Int64)
     return Int64(0)
 end
 
-function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8,
-    allslots::Bool=false)
+function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
     node = takenode!(c)
     t = f.type
     if t isa NullType
@@ -239,8 +238,9 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8,
         node.null_count == 0 || throw(ValidationError(
             "Union field-node null count must be zero"))
     end
-    allslots && !f.nullable && node.null_count > 0 && throw(ValidationError(
-        "fully covered non-nullable field declares a positive null count"))
+    # Field.nullable is advisory (enforced only by the opt-in validate_full
+    # tier), so a planned scan makes no nullability judgment here — the same
+    # contract the whole-file path applies.
     spec = layoutspec(f.type)
     for role in spec.buffers
         _, len = _buffermeta!(c)
@@ -272,14 +272,7 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8,
     fslextent = t isa FixedSizeListType ? _planmul(node.length,
         Int64(t.listsize), "fixed-size-list child length") : Int64(0)
     for i = 1:nchildren
-        childall = false
-        if allslots && node.null_count == 0 && c.nodeidx <= length(c.nodes)
-            childlen = Int64(c.nodes[c.nodeidx].length)
-            childall = t isa StructType ? childlen == node.length :
-                t isa FixedSizeListType ? childlen == fslextent : false
-        end
-        push!(childlens,
-            _validateplannedfield!(f.children[i], c, codec, childall))
+        push!(childlens, _validateplannedfield!(f.children[i], c, codec))
     end
     if t isa FixedSizeListType
         childlens[1] >= fslextent || throw(ValidationError(
@@ -312,7 +305,7 @@ function _validatebodyplan(header::Meta.RecordBatch, fields, limits::Limits,
     cursor = DecodeCursor(header.nodes, header.buffers, BufferSlice(), limits;
         codec=codec, variadics=variadiccounts(header))
     for (j, f) in enumerate(fields)
-        mask[j] ? _validateplannedfield!(f, cursor, codec, true) : skipfield!(f, cursor)
+        mask[j] ? _validateplannedfield!(f, cursor, codec) : skipfield!(f, cursor)
     end
     finishcursor!(cursor)
     return nothing
@@ -2049,8 +2042,11 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         validfield.metadata, validfield.children)
     validheader = validmsg.msg.header::Meta.RecordBatch
     validcodec = _batchcodec(validheader.compression, validmsg.version)
-    @assert _rejects(() -> _validatebodyplan(validheader, (strictfield,),
-        validfile.limits, validcodec, Bool[true]))
+    # Field.nullable is advisory: the planned path accepts the strict
+    # declaration over data with nulls, exactly as the whole-file path does
+    # (validate_full is where the declaration is enforced).
+    @assert _validatebodyplan(validheader, (strictfield,),
+        validfile.limits, validcodec, Bool[true]) === nothing
 
     structio = IOBuffer()
     structdata = NamedTuple{(:n,),Tuple{Union{Missing,Int64}}}[
@@ -2069,8 +2065,8 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         parentfield.nullable, parentfield.metadata, [strictchild])
     structheader = structmsg.msg.header::Meta.RecordBatch
     structcodec = _batchcodec(structheader.compression, structmsg.version)
-    @assert _rejects(() -> _validatebodyplan(structheader, (strictparent,),
-        structfile.limits, structcodec, Bool[true]))
+    @assert _validatebodyplan(structheader, (strictparent,),
+        structfile.limits, structcodec, Bool[true]) === nothing
 
     emptylistio = IOBuffer()
     Arrow.write(emptylistio, (x=[String[]],); file=false)

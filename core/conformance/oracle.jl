@@ -78,14 +78,10 @@ def na_stream(path):
     return na.ArrayStream(naipc.InputStream.from_path(path))
 
 def classify(e):
-    # An oracle refusing a FEATURE its build has not implemented (nanoarrow:
-    # compression, views, REE) is an oracle capability gap — a skip, not a
-    # finding against either implementation. Everything else is a finding.
-    msg = f"{type(e).__name__}: {e}"
-    low = msg.lower()
-    if "not yet supported" in low or "unsupported feature" in low:
-        return "skip: " + msg[:180]
-    return msg[:200]
+    # Raw error text only — the Julia side decides skip-vs-fail against an
+    # explicit whitelist of known oracle capability gaps, so a NEW
+    # interoperability failure can never classify itself into a skip.
+    return f"{type(e).__name__}: {e}"[:200]
 
 def rewrite(batches, schema, open_sink):
     # Per-batch rewrite: read_all()/write_table merges chunks and drops
@@ -247,6 +243,24 @@ const ORACLE_CHECKS = (
     ("ours→nanoarrow stream", "nanoarrow_stream", ".nanoarrow.stream", _stream_to_json),
 )
 
+# The ONLY oracle errors this suite treats as skips: known capability gaps,
+# whitelisted by check, case, and error text. Anything else — including a
+# feature error on a case not listed here — is a failure to investigate.
+const ORACLE_EXPECTED_GAPS = (
+    ("nanoarrow_stream", n -> endswith(n, "+lz4") || endswith(n, "+zstd"),
+        "unsupported feature COMPRESSED_BODY"),
+    ("nanoarrow_stream", n -> occursin("generated_binary_view", n),
+        "BinaryView not yet supported"),
+    ("nanoarrow_stream", n -> occursin("generated_list_view", n),
+        "ListView/LargeListView not yet supported"),
+    ("nanoarrow_stream", n -> occursin("generated_run_end_encoded", n),
+        "RunEndEncoded not yet supported"),
+)
+
+_expectedgap(key::String, name::String, status::String) =
+    any(k == key && pred(name) && occursin(text, status)
+        for (k, pred, text) in ORACLE_EXPECTED_GAPS)
+
 function runoracle(corpus::String=DEFAULT_CORPUS;
     workdir::String=get(ENV, "ORACLE_WORKDIR", mktempdir(prefix="arrow-oracle-")))
     cases, skips = preparecases(corpus, workdir)
@@ -270,11 +284,13 @@ function compareresults(cases::Vector{OracleCase}, skips, results, workdir::Stri
         r = get(results["cases"], case.name, Dict{String,Any}())
         for (check, key, suffix, reader) in ORACLE_CHECKS
             status = get(r, key, "driver produced no result")
-            if startswith(status, "skip")
-                push!(verdicts, Verdict(case.label, check, :skip, status))
-                continue
-            elseif status != "ok"
-                push!(verdicts, Verdict(case.label, check, :fail, status))
+            if status != "ok"
+                # "skip: ..." comes only from the driver's import-failure
+                # path (no nanoarrow wheel); feature errors skip only via
+                # the explicit whitelist.
+                kind = startswith(status, "skip") ||
+                    _expectedgap(key, case.name, status) ? :skip : :fail
+                push!(verdicts, Verdict(case.label, check, kind, status))
                 continue
             end
             try

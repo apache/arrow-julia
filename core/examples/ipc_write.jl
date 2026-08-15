@@ -541,17 +541,28 @@ adapter bookkeeping; Core fields never carry them).
 function assigndictids(fields, given::IdDict{Field,Int64}=IdDict{Field,Int64}())
     # `given` lets a caller preserve ids from a source (a reader's table): two
     # fields sharing one id then share one dictionary batch, exactly as the
-    # source did (4.0.0-shareddict). Fresh ids never collide with given ones.
+    # source did (4.0.0-shareddict). Fresh ids fill the lowest unoccupied
+    # values so they never collide with given ones — including given ids at
+    # the top of the signed-long domain, where `max + 1` would wrap.
     ids = IdDict{Field,Int64}(given)
     seen = IdDict{Field,Nothing}()
-    next = Ref(isempty(given) ? Int64(0) : maximum(values(given)) + 1)
+    used = Set{Int64}(values(ids))
+    next = Ref(Int64(0))
+    function freshid()
+        while next[] in used
+            next[] < typemax(Int64) || throw(ValidationError(
+                "IPC dictionary id space is exhausted"))
+            next[] += 1
+        end
+        push!(used, next[])
+        return next[]
+    end
     function walk(f::Field)
         haskey(seen, f) && throw(ValidationError(
             "IPC writer schema reuses one Field object in multiple positions"))
         seen[f] = nothing
         if f.type isa DictionaryType && !haskey(ids, f)
-            ids[f] = next[]
-            next[] += 1
+            ids[f] = freshid()
         end
         foreach(walk, f.children)
     end
@@ -612,13 +623,23 @@ function _validatewriterschema(sch::Schema)
     return nothing
 end
 
-function _validatewriterbatches(sch::Schema, batches)
+function _validatewriterbatches(sch::Schema, batches, ids::IdDict{Field,Int64})
     validated = AC._ValidatedDictionaries()
     for batch in batches
         # A shared immutable pool must satisfy every value-field contract
         # through which the schema refers to it. Identity caching is safe only
         # after those field-specific checks have run.
+        current = Dict{Int64,ArrayData}()
         for (f, pool) in dictionarypools(sch.fields, batch.columns)
+            # One id names ONE pool within a record batch: every dictionary
+            # message precedes the record message on the wire, so an
+            # intra-batch pool change is not temporal replacement — it would
+            # silently retarget the earlier field to the later pool.
+            id = ids[f]
+            haskey(current, id) && current[id] !== pool &&
+                throw(ValidationError(
+                    "dictionary id $id carries two different pools in one record batch"))
+            current[id] = pool
             validate_semantic(AC.dictvaluefield(f, f.type::DictionaryType), pool)
             validated[pool] = nothing
         end
@@ -672,7 +693,11 @@ function writestream(sch::Schema, batches::AbstractVector{AC.RecordBatch};
     _validatewriterschema(sch)
     ids = assigndictids(sch.fields, dictids)
     fielddictids = IdDict{Field,Int64}(ids)
-    _validatewriterbatches(sch, batches)
+    # Caller-supplied shared ids must name compatible value schemas with one
+    # nested id topology — the same contract the reader enforces on a wire
+    # schema — before any bytes are emitted under them.
+    validatedictionaryids(sch.fields, fielddictids)
+    _validatewriterbatches(sch, batches, ids)
     out = UInt8[]
     state = codec == CODEC_NONE ? nothing : EncodeState()
     try
@@ -728,7 +753,10 @@ function writefile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
         throw(ValidationError("the IPC file format carries one dictionary batch per id; " *
             "changing pools require the stream format"))
     fielddictids = IdDict{Field,Int64}(ids)
-    _validatewriterbatches(sch, batches)
+    # Same shared-id contract as the stream writer: compatible value schemas,
+    # one nested id topology, one pool per id within each batch.
+    validatedictionaryids(sch.fields, fielddictids)
+    _validatewriterbatches(sch, batches, ids)
     filefeatures = _streamfeatures(sch, batches, ids, codec)
     out = UInt8[]
     append!(out, FILE_MAGIC)
@@ -1622,6 +1650,42 @@ function main()
     @assert _rejects(() -> AC.validate_full(strictfields[2], dictdata))
     @assert AC.validate_full(batchfields[2], dictdata) === dictdata
     println("dictionary field aliases are refused; contract skew is validate_full's ✓")
+
+    # One id names ONE pool within a record batch: a caller id table mapping
+    # two fields to one id with DIFFERENT pools would decode both fields
+    # through whichever pool was emitted last (round-24 finding).
+    skewf1, skewd1 = AC.fromjulia_dict("s1", ["a"], [0])
+    skewf2, skewd2 = AC.fromjulia_dict("s2", ["b"], [0])
+    skewids = IdDict{Field,Int64}(skewf1 => Int64(7), skewf2 => Int64(7))
+    skewsch = Schema(Field[skewf1, skewf2])
+    skewbatch = AC.RecordBatch(skewsch, ArrayData[skewd1, skewd2], 1)
+    @assert _rejects(() -> writestream(skewsch, [skewbatch]; dictids=skewids))
+    okd2 = ArrayData(skewf2.type, 1, skewd2.buffers;
+        dictionary=skewd1.dictionary, nullcount=0)
+    okbatch = AC.RecordBatch(skewsch, ArrayData[skewd1, okd2], 1)
+    okstream = readstream(writestream(skewsch, [okbatch]; dictids=skewids))
+    @assert okstream.fielddictids[okstream.schema.fields[1]] ==
+        okstream.fielddictids[okstream.schema.fields[2]]
+    # ... and a repeated id must carry ONE nested dictionary-id topology, or
+    # the second field would decode through pools its schema never declared.
+    innerty = DictionaryType(IntType(32, true), Utf8Type(false), false)
+    inner1 = Field("inner", innerty)
+    inner2 = Field("inner", innerty)
+    outerty = DictionaryType(IntType(32, true), StructType(), false)
+    topo1 = Field("o1", outerty; children=[inner1])
+    topo2 = Field("o2", outerty; children=[inner2])
+    topoids = IdDict{Field,Int64}(topo1 => Int64(10), topo2 => Int64(10),
+        inner1 => Int64(20), inner2 => Int64(21))
+    @assert _rejects(() -> validatedictionaryids(Field[topo1, topo2], topoids))
+    topoids[inner2] = Int64(20)
+    @assert validatedictionaryids(Field[topo1, topo2], topoids) isa Dict
+    # ... and fresh ids fill unoccupied values instead of wrapping past a
+    # given id at the top of the signed-long domain.
+    wrapfs = Field[Field("w$i", innerty) for i = 1:3]
+    wrapids = assigndictids(wrapfs, IdDict{Field,Int64}(
+        wrapfs[1] => typemin(Int64), wrapfs[2] => typemax(Int64)))
+    @assert length(Set(values(wrapids))) == 3
+    println("shared dictionary ids: one pool per batch, one nested topology, no id wrap ✓")
 
     # Unions, both modes: 2.x writes them, Core reads and re-encodes them,
     # and 2.x reads this writer's bytes back. The mapped set now matches
