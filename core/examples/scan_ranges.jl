@@ -68,6 +68,11 @@ function skipfield!(f::Field, c::DecodeCursor)
     for _ in spec.buffers
         skipbuffer!(c)
     end
+    if spec.variadic
+        for _ = 1:takevariadic!(c)
+            skipbuffer!(c)
+        end
+    end
     t isa DictionaryType && return nothing
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     for i = 1:nchildren
@@ -84,14 +89,30 @@ function _fieldnodespan(f::Field)
     return 1 + sum(_fieldnodespan(f.children[i]) for i = 1:nchildren; init=0)
 end
 
-"Buffers consumed by one field subtree — the planner's registry arithmetic."
-function _bufferspan(f::Field)
+"""
+Buffers consumed by one field subtree — the planner's registry arithmetic.
+View fields consume their declared variadic count on top of the fixed
+registry pair, so the walk carries the batch's variadic-count cursor in
+depth-first order (the same order the decode cursor consumes it).
+"""
+function _bufferspan(f::Field, variadics::AbstractVector{Int64},
+    varidx::Base.RefValue{Int})
     spec = layoutspec(f.type)
     n = length(spec.buffers)
+    if spec.variadic
+        varidx[] <= length(variadics) || throw(ValidationError(
+            "metadata declares fewer variadic buffer counts than the schema requires"))
+        vc = variadics[varidx[]]
+        varidx[] += 1
+        0 <= vc <= typemax(Int) - n || throw(ValidationError(
+            "variadic buffer count $vc is invalid"))
+        n += Int(vc)
+    end
     f.type isa DictionaryType && return n
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     for i = 1:nchildren
-        n += _bufferspan(f.children[i])
+        n = _planadd(Int64(n), Int64(_bufferspan(f.children[i], variadics, varidx)),
+            "buffer span") |> Int
     end
     return n
 end
@@ -104,8 +125,6 @@ top-level row-count agreement, and every buffer's geometry.
 """
 function _recordbatchmeta(header::Meta.RecordBatch, fields, limits::Limits,
     bodylen::Int64)
-    isempty(something(header.variadicBufferCounts, Int64[])) ||
-        throw(ValidationError("variadic-buffer layouts are outside this prove-out"))
     rblen = something(header.length, Int64(0))
     0 <= rblen <= limits.max_array_length ||
         throw(ValidationError("record batch length $rblen exceeds limit"))
@@ -129,7 +148,11 @@ function _recordbatchmeta(header::Meta.RecordBatch, fields, limits::Limits,
     end
 
     buffers = something(header.buffers, Meta.Buffer[])
-    expectedbuffers = sum(_bufferspan(f) for f in fields; init=0)
+    variadics = variadiccounts(header)
+    varidx = Ref(1)
+    expectedbuffers = sum(_bufferspan(f, variadics, varidx) for f in fields; init=0)
+    varidx[] == length(variadics) + 1 || throw(ValidationError(
+        "unconsumed variadic buffer counts: schema/batch mismatch"))
     length(buffers) == expectedbuffers ||
         throw(ValidationError("buffer count does not match the schema"))
     last_nonempty_end = Int64(0)
@@ -229,6 +252,16 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8,
                 "compressed planned buffer requires a nonempty payload"))
         end
     end
+    if spec.variadic
+        # Variadic view-data buffers have no metadata-derivable minimum
+        # (views reference them arbitrarily); geometry and, under
+        # compression, the prefix rule are the plannable invariants.
+        for _ = 1:takevariadic!(c)
+            _, len = _buffermeta!(c)
+            codec == CODEC_NONE || len == 0 || len >= 8 || throw(ValidationError(
+                "compressed buffer of $len bytes lacks its length prefix"))
+        end
+    end
     f.type isa DictionaryType && return node.length
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     childlens = Int64[]
@@ -273,7 +306,7 @@ end
 function _validatebodyplan(header::Meta.RecordBatch, fields, limits::Limits,
     codec::Int8, mask::AbstractVector{Bool})
     cursor = DecodeCursor(header.nodes, header.buffers, BufferSlice(), limits;
-        codec=codec)
+        codec=codec, variadics=variadiccounts(header))
     for (j, f) in enumerate(fields)
         mask[j] ? _validateplannedfield!(f, cursor, codec, true) : skipfield!(f, cursor)
     end
@@ -354,7 +387,7 @@ function _maskedrecord(msg::Meta.Message, version::Int16, body,
         body isa BufferSlice ? body.len : body.bodylen)
     _scanmissingdicts(fields, header.nodes, dicts, fielddictids, mask)
     cursor = DecodeCursor(header.nodes, header.buffers, body, limits;
-        codec=codec, state=state)
+        codec=codec, state=state, variadics=variadiccounts(header))
     cols = Vector{Union{Nothing,ArrayData}}(nothing, length(fields))
     for (j, fld) in enumerate(fields)
         if mask[j]
@@ -933,10 +966,12 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
             block = recordblocks[recidxs[p]]
             header = headers[p]
             buffers = something(header.buffers, Meta.Buffer[])
+            variadics = variadiccounts(header)
+            varidx = Ref(1)
             wants = NTuple{2,Int64}[]
             bufidx = 1
             for (j, fld) in enumerate(fields)
-                span = _bufferspan(fld)
+                span = _bufferspan(fld, variadics, varidx)
                 if mask[j]
                     for k = bufidx:(bufidx + span - 1)
                         k <= length(buffers) ||
@@ -1054,23 +1089,29 @@ durations are integral in the value domain), Float64, String, Bool.
 """
 function _statfold(f::Field, d::ArrayData)
     t = f.type
-    stat = t isa DictionaryType ? t.valuetype : t
-    nc = if t isa DictionaryType
-        count(1:d.len) do i
-            !AC.isvalid_at(d, i) || ismissing(AC.getvalue(f, d, i))
-        end
+    # Statistics describe LOGICAL values: dictionary columns fold through
+    # their pools, and REE columns fold through their values child — the REE
+    # parent's physical null count is always 0 (spec), so its logical null
+    # count must be derived or `isnull` pruning would drop real nulls.
+    stat = t isa DictionaryType ? t.valuetype :
+        t isa RunEndEncodedType ? f.children[2].type : t
+    nc = if t isa DictionaryType || t isa RunEndEncodedType
+        count(i -> ismissing(AC.getvalue(f, d, i)), 1:d.len)
     else
         AC.nullcount(d)
     end
     supported = stat isa IntType ? (stat.signed || stat.bits < 64) :
         stat isa FloatType || stat isa BoolType || stat isa Utf8Type ||
+        (stat isa ViewType && stat.utf8) ||
         stat isa DateType || stat isa TimeType || stat isa TimestampType ||
         stat isa DurationType
     supported || return nc, nothing, nothing
     lo = hi = nothing
     hasnan = false
     for i = 1:d.len
-        AC.isvalid_at(d, i) || continue
+        # getvalue's own first step is the validity check (or, for
+        # bitmap-less layouts, the logical-null route), so `missing` here is
+        # the one uniform null signal across every layout.
         v = AC.getvalue(f, d, i)
         ismissing(v) && continue
         v isa NamedTuple && return nc, nothing, nothing

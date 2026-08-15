@@ -208,14 +208,43 @@ function metatype!(b::FB.Builder, t::ArrowType)
             Meta.UnionMode.Sparse)
         Meta.unionAddTypeIds(b, idvec)
         return Meta.Union, Meta.unionEnd(b)
+    elseif t isa ViewType
+        if t.utf8
+            Meta.utf8ViewStart(b)
+            return Meta.Utf8View, Meta.utf8ViewEnd(b)
+        end
+        Meta.binaryViewStart(b)
+        return Meta.BinaryView, Meta.binaryViewEnd(b)
+    elseif t isa ListViewType
+        if t.large
+            Meta.largeListViewStart(b)
+            return Meta.LargeListView, Meta.largeListViewEnd(b)
+        end
+        Meta.listViewStart(b)
+        return Meta.ListView, Meta.listViewEnd(b)
+    elseif t isa RunEndEncodedType
+        Meta.runEndEncodedStart(b)
+        return Meta.RunEndEncoded, Meta.runEndEncodedEnd(b)
     elseif t isa NullType
         Meta.nullStart(b)
         return Meta.Null, Meta.nullEnd(b)
     else
         throw(ValidationError("IPC writer does not map descriptor " *
-            "$(AC.descriptorname(t)); view and REE IPC mapping is outside " *
-            "this prove-out"))
+            "$(AC.descriptorname(t))"))
     end
+end
+
+# The vendored T -> tag table stops at LargeList (21); the format 1.3/1.4
+# tags are written through the same raw slot the generated helper uses.
+const _LATE_TYPE_TAGS = IdDict{Any,Int16}(
+    Meta.RunEndEncoded => Int16(22), Meta.BinaryView => Int16(23),
+    Meta.Utf8View => Int16(24), Meta.ListView => Int16(25),
+    Meta.LargeListView => Int16(26))
+
+function _addtypetag!(b::FB.Builder, ::Base.Type{T}) where {T}
+    tag = get(_LATE_TYPE_TAGS, T, nothing)
+    tag === nothing && return Meta.fieldAddTypeType(b, T)
+    return FB.prependslot!(b, 2, tag, Int16(0))
 end
 
 function _metakeyvalues!(b::FB.Builder, metadata)
@@ -268,7 +297,7 @@ function metafield!(b::FB.Builder, f::Field, fielddictids::IdDict{Field,Int64})
     Meta.fieldStart(b)
     Meta.fieldAddName(b, name)
     Meta.fieldAddNullable(b, f.nullable)
-    Meta.fieldAddTypeType(b, tag)
+    _addtypetag!(b, tag)
     Meta.fieldAddType(b, typeoff)
     dictoff == 0 || Meta.fieldAddDictionary(b, dictoff)
     Meta.fieldAddChildren(b, childvec)
@@ -337,9 +366,11 @@ mutable struct EncodeCursor
     body::Vector{UInt8}
     codec::Int8
     state::Union{Nothing,EncodeState}
+    variadics::Vector{Int64}             # per view field, depth-first order
 end
 EncodeCursor(codec::Int8, state::Union{Nothing,EncodeState}) =
-    EncodeCursor(NTuple{2,Int64}[], NTuple{2,Int64}[], UInt8[], codec, state)
+    EncodeCursor(NTuple{2,Int64}[], NTuple{2,Int64}[], UInt8[], codec, state,
+        Int64[])
 
 function _compressbytes(state::EncodeState, codec::Int8, raw::Vector{UInt8})
     codec == CODEC_LZ4_FRAME && return transcode(_lz4c!(state), raw)
@@ -399,10 +430,13 @@ function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
         throw(ValidationError("IPC encode of offset array views is outside this prove-out; materialize first"))
     push!(c.nodes, (d.len, AC.nullcount(d)))
     spec = layoutspec(t)
-    spec.variadic &&
-        throw(ValidationError("IPC writer does not map variadic layouts"))
-    length(d.buffers) == length(spec.buffers) ||
-        throw(ValidationError("column buffer count does not match its layout"))
+    if spec.variadic
+        length(d.buffers) >= length(spec.buffers) ||
+            throw(ValidationError("column buffer count does not match its layout"))
+    else
+        length(d.buffers) == length(spec.buffers) ||
+            throw(ValidationError("column buffer count does not match its layout"))
+    end
     for (role, b) in zip(spec.buffers, d.buffers)
         if role == AC.OFFSETS && d.len == 0 && b.len == 0
             # Core canonicalizes an empty offset array without allocating its
@@ -410,6 +444,15 @@ function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
             # terminal zero offset (length + 1 entries).
             encodebuffer!(c, zeros(UInt8, spec.offsetwidth))
         else
+            encodebuffer!(c, AC.slicebytes(b))
+        end
+    end
+    if spec.variadic
+        # View layouts append their variadic data buffers after the fixed
+        # validity/views pair; the count travels in the header's
+        # variadicBufferCounts vector, depth-first (format 1.4).
+        push!(c.variadics, Int64(length(d.buffers) - length(spec.buffers)))
+        for b in Iterators.drop(d.buffers, length(spec.buffers))
             encodebuffer!(c, AC.slicebytes(b))
         end
     end
@@ -446,11 +489,25 @@ function _batchheader!(b::FB.Builder, c::EncodeCursor, nrows::Int64)
             Meta.CompressionType.LZ4_FRAME : Meta.CompressionType.ZSTD)
         compression = Meta.bodyCompressionEnd(b)
     end
-    Meta.recordBatchStart(b)
+    varvec = FB.UOffsetT(0)
+    if !isempty(c.variadics)
+        FB.startvector!(b, 8, length(c.variadics), 8)
+        foreach(x -> FB.prepend!(b, x), Iterators.reverse(c.variadics))
+        varvec = FB.endvector!(b, length(c.variadics))
+    end
+    if varvec == 0
+        Meta.recordBatchStart(b)
+    else
+        # The vendored recordBatchStart is a four-slot table predating
+        # variadicBufferCounts; build the five-slot table directly (the same
+        # bridge the schema-features writer uses).
+        FB.startobject!(b, 5)
+    end
     Meta.recordBatchAddLength(b, nrows)
     Meta.recordBatchAddNodes(b, nodes)
     Meta.recordBatchAddBuffers(b, buffers)
     compression == 0 || Meta.recordBatchAddCompression(b, compression)
+    varvec == 0 || FB.prependoffsetslot!(b, 4, varvec, 0)
     return Meta.recordBatchEnd(b)
 end
 
@@ -1274,14 +1331,12 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
                 throw(ValidationError("the file format carries one dictionary batch per id"))
             rb = header.data
             codec = _batchcodec(rb.compression, fm.version)
-            isempty(something(rb.variadicBufferCounts, Int64[])) ||
-                throw(ValidationError("variadic-buffer layouts are outside this prove-out"))
             vf = dictvaluefields[header.id]
             rblen = something(rb.length, Int64(0))
             0 <= rblen <= limits.max_array_length ||
                 throw(ValidationError("dictionary batch length $rblen exceeds limit"))
             cursor = DecodeCursor(rb.nodes, rb.buffers, fm.body, limits;
-                codec=codec, state=state)
+                codec=codec, state=state, variadics=variadiccounts(rb))
             decoded = decodefield(vf, cursor, dicts, fielddictids)
             finishcursor!(cursor)
             decoded.len == rblen ||
@@ -1903,6 +1958,104 @@ function main()
         file2.dataend, file2.limits, file2.schemaversion)
     @assert _rejects(() -> badfile[1])
     println("file magic, footer, and block extents are verified ✓")
+
+    # ---- Format 1.3/1.4 layouts: views and run-end encoding ------------
+    # 2.x cannot write these (and misreads ListView per the report), so the
+    # acceptance is self round-trip on both formats plus wire-shape checks:
+    # the variadicBufferCounts vector, the late type tags, and the buffer
+    # accounting that skewed nothing after them.
+    viewentry(len, rest) = vcat(reinterpret(UInt8, Int32[Int32(len)]), rest,
+        zeros(UInt8, 12 - length(rest)))
+    viewlong(len, prefix, bufidx, off) =
+        vcat(reinterpret(UInt8, Int32[Int32(len)]), prefix,
+             reinterpret(UInt8, Int32[Int32(bufidx), Int32(off)]))
+    payload1 = collect(codeunits("first-out-of-line-payload"))
+    payload2 = collect(codeunits("second-buffer-payload-here"))
+    views = vcat(
+        viewentry(3, collect(codeunits("abc"))),
+        viewlong(25, payload1[1:4], 0, 0),
+        viewlong(26, payload2[1:4], 1, 0),
+        viewentry(0, UInt8[]))
+    vt = ViewType(true)
+    vf = Field("v", vt; nullable=true)
+    vd = ArrayData(vt, 4,
+        [AC._databuffer(UInt8[0x0b]), AC._databuffer(views),
+         AC._databuffer(payload1), AC._databuffer(payload2)]; nullcount=1)
+    lvt = ListViewType(false)
+    lvcf, lvcd = fromjulia("item", Int64[10, 20, 30])
+    lvf = Field("lv", lvt; children=[lvcf])
+    lvd = ArrayData(lvt, 3,
+        [BufferSlice(), AC._databuffer(Int32[2, 0, 0]),
+         AC._databuffer(Int32[1, 2, 3])]; children=[lvcd], nullcount=0)
+    rt = RunEndEncodedType()
+    ref, red = fromjulia("run_ends", Int32[2, 3, 4])
+    rvf, rvd = fromjulia("values", Union{Missing,String}["x", missing, "z"])
+    rf = Field("ree", rt; children=[ref, rvf])
+    rd = ArrayData(rt, 4, BufferSlice[]; children=[red, rvd], nullcount=0)
+    # a plain column AFTER the exotic ones proves no buffer skew
+    tf, td = fromjulia("tail", Int64[1, 2, 3, 4])
+    exsch = Schema(Field[vf, lvf, rf, tf])
+    exlv = ArrayData(lvt, 4,
+        [BufferSlice(), AC._databuffer(Int32[2, 0, 0, 1]),
+         AC._databuffer(Int32[1, 2, 3, 0])]; children=[lvcd], nullcount=0)
+    exbatch = AC.RecordBatch(exsch, ArrayData[vd, exlv, rd, td], 4)
+    exwant = Dict(
+        "v" => Any["abc", "first-out-of-line-payload", missing, ""],
+        "lv" => Any[[30], [10, 20], [10, 20, 30], Int64[]],
+        "ree" => Any["x", "x", missing, "z"],
+        "tail" => Any[1, 2, 3, 4])
+    for compress in (:none, :zstd)
+        exbytes = writestream(exsch, [exbatch]; compress=compress)
+        exstream = readstream(exbytes)
+        for (i, f) in enumerate(exstream.schema.fields)
+            @assert AC.typeequal(f.type, exsch.fields[i].type)
+            got = collect(Any, materialize(f, exstream.batches[1].columns[i]))
+            @assert isequal(got, exwant[f.name]) "$(f.name) ($compress): $got"
+        end
+        exfile = readfile(writefile(exsch, [exbatch]; compress=compress))
+        for (i, f) in enumerate(exfile.schema.fields)
+            got = collect(Any, materialize(f, exfile[1].columns[i]))
+            @assert isequal(got, exwant[f.name]) "file $(f.name) ($compress): $got"
+        end
+    end
+    println("views, list-views, and REE round-trip on both formats (plain + zstd) ✓")
+
+    # Wire shape: the batch declares exactly one variadic count (2 buffers
+    # for the view column) and no other; the type tags are the 1.3/1.4 ids.
+    exframes = framemessages(heapregion(copy(writestream(exsch, [exbatch]))))
+    exrb = exframes[2].msg.header::Meta.RecordBatch
+    @assert variadiccounts(exrb) == Int64[2]
+    exmeta = exframes[1].msg.header::Meta.Schema
+    @assert [typeof(f.type) for f in exmeta.fields] ==
+        [Meta.Utf8View, Meta.ListView, Meta.RunEndEncoded, Meta.Int]
+    println("variadic counts and 1.3/1.4 type tags are on the wire ✓")
+
+    # A view column with ZERO variadic buffers (all inline) is legal and
+    # round-trips with an explicit 0 count.
+    inl = ArrayData(vt, 2,
+        [BufferSlice(), AC._databuffer(vcat(viewentry(2, collect(codeunits("hi"))),
+                                            viewentry(1, collect(codeunits("!")))))];
+        nullcount=0)
+    inlsch = Schema(Field[Field("v", vt)])
+    inlstream = readstream(writestream(inlsch, [AC.RecordBatch(inlsch, ArrayData[inl], 2)]))
+    @assert materialize(inlstream.schema.fields[1], inlstream.batches[1].columns[1]) ==
+        ["hi", "!"]
+    println("all-inline views carry an explicit zero variadic count ✓")
+
+    # Corrupt variadic counts fail closed: overstated (consumes into the
+    # tail column's buffers → skew caught) and understated (leftover buffers).
+    exraw = writestream(exsch, [exbatch])
+    for lie in (Int64(3), Int64(1))
+        lied = copy(exraw)
+        _mutatemessage!(lied, 2) do meta, msg
+            rb = _headertable(meta, msg)
+            start, n = _vvector(rb, 4, 8; required=true)
+            n == 1 || error("fixture declares $n variadic counts")
+            _write_i64!(meta, start, lie)
+        end
+        @assert _rejects(() -> readstream(lied)) "variadic lie $lie accepted"
+    end
+    println("misdeclared variadic counts are rejected as skew ✓")
 
     println()
     println("IPC write, file-format, interop, and adversarial checks passed.")

@@ -373,9 +373,9 @@ function _vtype(t::_VTable, code::UInt8, state::_VState, depth::Int)
         _vfield(t, 0, 4)             # FlatBuffers scalar default is zero
     elseif code == 17               # Map
         _vbool(t, 0)
-    elseif code in (22, 23, 24, 25, 26)
-        throw(ValidationError("IPC metadata type tag $code is outside this prove-out"))
-    elseif !(code in (1, 4, 5, 6, 12, 13, 19, 20, 21))
+    elseif !(code in (1, 4, 5, 6, 12, 13, 19, 20, 21, 22, 23, 24, 25, 26))
+        # 22..26 (RunEndEncoded and the view types) are field-less tables:
+        # nothing to verify beyond the table shell itself.
         _vfail("unknown Arrow type tag $code")
     end
     return nothing
@@ -622,11 +622,20 @@ function coretype(t)::ArrowType
         u = _rawintervalunit(t)
         IntervalType(u == 0 ? AC.YEAR_MONTH : u == 1 ? AC.DAY_TIME :
             AC.MONTH_DAY_NANO)
+    elseif t isa Meta.Utf8View
+        ViewType(true)
+    elseif t isa Meta.BinaryView
+        ViewType(false)
+    elseif t isa Meta.ListView
+        ListViewType(false)
+    elseif t isa Meta.LargeListView
+        ListViewType(true)
+    elseif t isa Meta.RunEndEncoded
+        RunEndEncodedType()
     elseif t isa Meta.Null
         NullType()
     else
-        throw(ValidationError("IPC adapter does not map metadata type $(typeof(t)); " *
-            "view and REE IPC mapping is outside this prove-out"))
+        throw(ValidationError("IPC adapter does not map metadata type $(typeof(t))"))
     end
 end
 
@@ -880,6 +889,13 @@ mutable struct DecodeCursor{B}
     last_nonempty_end::Int64
     codec::Int8                   # CODEC_NONE, or the batch's declared codec
     state::Union{Nothing,DecodeState}
+    # One entry per view-typed field in depth-first schema order: how many
+    # variadic data buffers that field consumes (format 1.4). Non-view
+    # batches carry an empty vector; a leftover entry is a skew error.
+    # NOTE: the vendored binding reads the spec's `[long]` as Int32
+    # elements; the abstract eltype absorbs that mismatch here.
+    variadics::AbstractVector{<:Integer}
+    varidx::Int
 end
 
 "Resolve one declared buffer window against the message body."
@@ -887,11 +903,39 @@ _bodyslice(body::BufferSlice, offset::Int64, len::Int64) =
     AC.subslice(body, offset, len)
 
 DecodeCursor(nodes, buffers, body, limits::Limits;
-    codec::Int8=CODEC_NONE, state::Union{Nothing,DecodeState}=nothing) =
+    codec::Int8=CODEC_NONE, state::Union{Nothing,DecodeState}=nothing,
+    variadics=nothing) =
     DecodeCursor(something(nodes, Meta.FieldNode[]),
         something(buffers, Meta.Buffer[]), body,
         limits.max_buffer_bytes, limits.max_array_length, 1, 1, 0,
-        codec, state)
+        codec, state, something(variadics, Int64[]), 1)
+
+"""
+    variadiccounts(rb::Meta.RecordBatch) -> Vector{Int64}
+
+The batch's `variadicBufferCounts` read at the spec's `[long]` width. The
+vendored 2.x binding declares this vector's ELEMENTS as Int32 (a binding
+bug that would mis-stride any real view stream), so this reads the verified
+vector directly: the byte-wise verifier already sized it at 8 bytes per
+element (`_vvector(t, 4, 8)`), and this getter uses the same table/offset
+arithmetic through the generated table's own vtable lookup.
+"""
+function variadiccounts(rb::Meta.RecordBatch)
+    o = FB.offset(rb, 12)              # slot 4 -> vtable byte offset 4 + 2*4
+    o == 0 && return Int64[]
+    return collect(Int64, FB.Array{Int64}(rb, o))
+end
+
+"One variadic-buffer count, in depth-first view-field order (format 1.4)."
+function takevariadic!(c::DecodeCursor)
+    c.varidx <= length(c.variadics) ||
+        throw(ValidationError("metadata declares fewer variadic buffer counts than the schema requires"))
+    n = c.variadics[c.varidx]
+    c.varidx += 1
+    0 <= n <= length(c.buffers) ||
+        throw(ValidationError("variadic buffer count $n outside [0, $(length(c.buffers))]"))
+    return Int(n)
+end
 
 function takenode!(c::DecodeCursor)
     c.nodeidx <= length(c.nodes) ||
@@ -1012,6 +1056,8 @@ function finishcursor!(c::DecodeCursor)
         throw(ValidationError("unconsumed field nodes: schema/batch mismatch"))
     c.bufidx == length(c.buffers) + 1 ||
         throw(ValidationError("unconsumed buffers: schema/batch mismatch"))
+    c.varidx == length(c.variadics) + 1 ||
+        throw(ValidationError("unconsumed variadic buffer counts: schema/batch mismatch"))
     return nothing
 end
 
@@ -1057,6 +1103,13 @@ function decodefield(f::Field, c::DecodeCursor, dicts::Dict{Int64,ArrayData},
     node = takenode!(c)
     spec = layoutspec(t)
     buffers = BufferSlice[takebuffer!(c) for _ in spec.buffers]
+    if spec.variadic
+        # View layouts append their declared count of variadic data buffers
+        # after the fixed validity/views pair (format 1.4).
+        for _ = 1:takevariadic!(c)
+            push!(buffers, takebuffer!(c))
+        end
+    end
     for (role, buffer) in zip(spec.buffers, buffers)
         if role == AC.OFFSETS && node.length == 0 &&
             buffer.len < spec.offsetwidth
@@ -1104,13 +1157,11 @@ function decoderecord(fm::FramedMessage, fields, sch::Schema,
     limits::Limits, validated_dictionaries, state::DecodeState)
     header = fm.msg.header::Meta.RecordBatch
     codec = _batchcodec(header.compression, fm.version)
-    isempty(something(header.variadicBufferCounts, Int64[])) ||
-        throw(ValidationError("variadic-buffer layouts are outside this prove-out"))
     rblen = something(header.length, Int64(0))
     0 <= rblen <= limits.max_array_length ||
         throw(ValidationError("record batch length $rblen exceeds limit"))
     cursor = DecodeCursor(header.nodes, header.buffers, fm.body, limits;
-        codec=codec, state=state)
+        codec=codec, state=state, variadics=variadiccounts(header))
     cols = ArrayData[decodefield(f, cursor, dicts, fielddictids) for f in fields]
     finishcursor!(cursor)
     validaterecordcolumns(fields, cols, validated_dictionaries)
@@ -1248,8 +1299,6 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
                 throw(ValidationError("delta dictionaries are outside this prove-out"))
             rb = header.data
             codec = _batchcodec(rb.compression, fm.version)
-            isempty(something(rb.variadicBufferCounts, Int64[])) ||
-                throw(ValidationError("variadic-buffer layouts are outside this prove-out"))
             haskey(dictids, header.id) ||
                 throw(ValidationError("dictionary batch has unknown id $(header.id)"))
             replacement = haskey(dicts, header.id)
@@ -1268,7 +1317,7 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
             0 <= rblen <= limits.max_array_length ||
                 throw(ValidationError("dictionary batch length $rblen exceeds limit"))
             cursor = DecodeCursor(rb.nodes, rb.buffers, fm.body, limits;
-                codec=codec, state=state)
+                codec=codec, state=state, variadics=variadiccounts(rb))
             decoded = decodefield(vf, cursor, dicts, fielddictids)
             finishcursor!(cursor)
             decoded.len == rblen ||
