@@ -494,11 +494,13 @@ function emitverifier(io::IO, alldecls)
         (d isa FbsTable && !d.isstruct) || continue
         name = jlname(d.name)
         _, slotof = slotmap(d, enums)
-        println(io, "function verify_", name,
-            "(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)")
-        println(io, "    t = _vtable(bytes, pos)")
-        println(io, "    _vvisit!(ctx, \"", name, "\")")
-        println(io, "    depth <= ctx.maxdepth || _vfail(\"metadata nesting exceeds limit\")")
+        # Two stages per table: INLINE (table shell, accounting, and every
+        # non-reference field) and REFS (everything that traverses away from
+        # the table). Adapters gate policy fields — the metadata version —
+        # between the ROOT's stages, so rejected input fails in constant
+        # time instead of after a full attacker-directed graph walk.
+        inline = IOBuffer()
+        refs = IOBuffer()
         for f in d.fields
             f.deprecated && continue
             slot = slotof[f.name]
@@ -509,79 +511,108 @@ function emitverifier(io::IO, alldecls)
             if haskey(enums, t) && enums[t].isunion
                 e = enums[t]
                 tslot = slotof[f.name * "_type"]
-                println(io, "    tagp = _vfield(t, ", tslot, ", 1", reqkw, ")")
-                println(io, "    tag = tagp === nothing ? 0x00 : _vu8(bytes, tagp)")
-                req && println(io,
+                println(refs, "    tagp = _vfield(t, ", tslot, ", 1", reqkw, ")")
+                println(refs, "    tag = tagp === nothing ? 0x00 : _vu8(bytes, tagp)")
+                req && println(refs,
                     "    tag != 0x00 || _vfail(\"", label, " union tag is required\")")
-                println(io, "    valp = _vref(t, ", slot, reqkw, ")")
-                println(io, "    if tag == 0x00")
-                println(io, "        valp === nothing ||")
-                println(io, "            _vfail(\"", label, " union has a value but no tag\")")
+                println(refs, "    valp = _vref(t, ", slot, reqkw, ")")
+                println(refs, "    if tag == 0x00")
+                println(refs, "        valp === nothing ||")
+                println(refs, "            _vfail(\"", label, " union has a value but no tag\")")
                 firstmember = true
                 for (mname, v) in e.members
                     mname == "NONE" && continue
-                    println(io, "    elseif tag == 0x", string(v, base=16, pad=2))
+                    println(refs, "    elseif tag == 0x", string(v, base=16, pad=2))
                     if haskey(tables, mname) && !tables[mname].isstruct
-                        println(io, "        valp === nothing &&")
-                        println(io, "            _vfail(\"", label, " union has a tag but no value\")")
-                        println(io, "        verify_", jlname(mname), "(bytes, valp, ctx, depth + 1)")
+                        println(refs, "        valp === nothing &&")
+                        println(refs, "            _vfail(\"", label, " union has a tag but no value\")")
+                        println(refs, "        verify_", jlname(mname), "(bytes, valp, ctx, depth + 1)")
                     else
-                        println(io, "        _vfail(\"", label, " union member ", mname,
+                        println(refs, "        _vfail(\"", label, " union member ", mname,
                             " is outside the generated schemas\")")
                     end
                     firstmember = false
                 end
-                println(io, "    else")
-                println(io, "        _vfail(\"", label, " union has unknown tag\")")
-                println(io, "    end")
+                println(refs, "    else")
+                println(refs, "        _vfail(\"", label, " union has unknown tag\")")
+                println(refs, "    end")
             elseif haskey(enums, t)
                 e = enums[t]
-                println(io, "    _venum(t, ", slot, ", ", SCALARS[e.basetype][2],
+                println(inline, "    _venum(t, ", slot, ", ", SCALARS[e.basetype][2],
                     ", ", domain(e), ")")
             elseif t == "bool"
-                println(io, "    _vbool(t, ", slot, ")")
+                println(inline, "    _vbool(t, ", slot, ")")
             elseif haskey(SCALARS, t)
-                println(io, "    _vfield(t, ", slot, ", ", SCALARS[t][2], reqkw, ")")
+                println(inline, "    _vfield(t, ", slot, ", ", SCALARS[t][2], reqkw, ")")
             elseif t == "string"
-                println(io, "    _vstring(t, ", slot, ", ctx", reqkw, ")")
+                println(refs, "    _vstring(t, ", slot, ", ctx", reqkw, ")")
             elseif isvector(t)
                 et = elemtype(t)
                 if haskey(enums, et) && !enums[et].isunion
                     e = enums[et]
-                    println(io, "    _venumvector(t, ", slot, ", ",
+                    println(refs, "    _venumvector(t, ", slot, ", ",
                         SCALARS[e.basetype][2], ", ", domain(e),
                         ", ctx, \"", label, "\"", reqkw, ")")
                 elseif haskey(SCALARS, et)
-                    println(io, "    _vvector(t, ", slot, ", ", SCALARS[et][2],
+                    println(refs, "    _vvector(t, ", slot, ", ", SCALARS[et][2],
                         ", ctx", reqkw, ")")
                 elseif haskey(tables, et) && tables[et].isstruct
-                    println(io, "    _vvector(t, ", slot, ", ",
+                    println(refs, "    _vvector(t, ", slot, ", ",
                         structsize(tables[et]), ", ctx", reqkw, ")")
                 elseif haskey(tables, et)
-                    println(io, "    _vtablevector(t, ", slot, ", verify_",
+                    println(refs, "    _vtablevector(t, ", slot, ", verify_",
                         jlname(et), ", ctx, depth", reqkw, ")")
                 else
                     error("verifier: unsupported vector element '$et' in $(d.name).$(f.name)")
                 end
             elseif haskey(tables, t) && tables[t].isstruct
-                println(io, "    _vfield(t, ", slot, ", ", structsize(tables[t]), reqkw, ")")
+                println(inline, "    _vfield(t, ", slot, ", ", structsize(tables[t]), reqkw, ")")
             elseif haskey(tables, t)
-                println(io, "    p = _vref(t, ", slot, reqkw, ")")
-                println(io, "    p === nothing || verify_", jlname(t),
+                println(refs, "    p = _vref(t, ", slot, reqkw, ")")
+                println(refs, "    p === nothing || verify_", jlname(t),
                     "(bytes, p, ctx, depth + 1)")
             else
                 error("verifier: unsupported field type '$t' in $(d.name).$(f.name)")
             end
         end
+        println(io, "function verifyinline_", name,
+            "(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)")
+        println(io, "    t = _vtable(bytes, pos)")
+        println(io, "    _vvisit!(ctx, \"", name, "\")")
+        println(io, "    depth <= ctx.maxdepth || _vfail(\"metadata nesting exceeds limit\")")
+        print(io, String(take!(inline)))
+        println(io, "    return t")
+        println(io, "end")
+        println(io)
+        println(io, "function verifyrefs_", name,
+            "(t::VTable, ctx::VerifyContext, depth::Base.Int)")
+        println(io, "    bytes = t.bytes")
+        print(io, String(take!(refs)))
         println(io, "    return nothing")
         println(io, "end")
         println(io)
-        println(io, "function verifyroot_", name,
+        println(io, "function verify_", name,
+            "(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)")
+        println(io, "    verifyrefs_", name,
+            "(verifyinline_", name, "(bytes, pos, ctx, depth), ctx, depth)")
+        println(io, "    return nothing")
+        println(io, "end")
+        println(io)
+        println(io, "function verifyrootstart_", name,
             "(bytes::Vector{UInt8}, ctx::VerifyContext)")
         println(io, "    length(bytes) >= 4 || _vfail(\"missing root offset\")")
         println(io, "    root = Int64(_vu32(bytes, Int64(0)))")
         println(io, "    root >= 4 || _vfail(\"invalid root offset\")")
-        println(io, "    verify_", name, "(bytes, root, ctx, 0)")
+        println(io, "    return verifyinline_", name, "(bytes, root, ctx, 0)")
+        println(io, "end")
+        println(io)
+        println(io, "verifyrootrest_", name,
+            "(t::VTable, ctx::VerifyContext) = verifyrefs_", name, "(t, ctx, 0)")
+        println(io)
+        println(io, "function verifyroot_", name,
+            "(bytes::Vector{UInt8}, ctx::VerifyContext)")
+        println(io, "    verifyrootrest_", name,
+            "(verifyrootstart_", name, "(bytes, ctx), ctx)")
         println(io, "    return nothing")
         println(io, "end")
         println(io)

@@ -169,16 +169,16 @@ _verifyctx(limits::Limits, reserve_limit::Int64) =
     Meta.VerifyContext(Int64(limits.max_metadata_objects),
         limits.max_nesting_depth, reserve_limit)
 
-function _verifyroot(verifyroot::F, bytes::Vector{UInt8},
-    ctx::Meta.VerifyContext) where {F}
+# Translate the metadata module's verifier exceptions into the adapter's
+# error vocabulary at the wrapper boundary.
+function _verified(f::F) where {F}
     try
-        verifyroot(bytes, ctx)
+        return f()
     catch e
         e isa Meta.VerifyError && _vfail(e.msg)
         e isa Meta.VerifyBudgetError && throw(AllocationLimitError(e.msg))
         rethrow()
     end
-    return nothing
 end
 
 function _schemafeatures(sch::Meta.Schema, version::Int16)
@@ -192,11 +192,17 @@ end
 function verify_ipc_metadata(bytes::Vector{UInt8}, limits::Limits,
     reserve_limit::Int64=limits.max_total_allocated_bytes)
     ctx = _verifyctx(limits, reserve_limit)
-    _verifyroot(Meta.verifyroot_Message, bytes, ctx)
+    # STAGED root verification: the inline stage proves the table shell and
+    # every non-reference field (the version among them), the adapter gates
+    # the version, and only then does the reference stage walk the header
+    # graph — an unsupported version rejects in constant time instead of
+    # after a full attacker-directed traversal (round-27 finding).
+    t = _verified(() -> Meta.verifyrootstart_Message(bytes, ctx))
     msg = FB.getrootas(Meta.Message, bytes, 0)
     version = Int16(Int64(msg.version))
     version in (Int16(3), Int16(4)) ||
         _vfail("unsupported metadata version $version (only V4/V5 are accepted)")
+    _verified(() -> Meta.verifyrootrest_Message(t, ctx))
     # The verifier proved header presence and rejected union members outside
     # the generated schemas (the Tensor family), so this dispatch is total.
     header = msg.header

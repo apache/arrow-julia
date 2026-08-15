@@ -838,11 +838,14 @@ supply the Block indexes.
 function verify_footer(bytes::Vector{UInt8}, limits::Limits,
     reserve_limit::Int64=limits.max_total_allocated_bytes)
     ctx = _verifyctx(limits, reserve_limit)
-    _verifyroot(Meta.verifyroot_Footer, bytes, ctx)
+    # Staged like verify_ipc_metadata: version gates between the inline and
+    # reference stages, so an unsupported footer rejects in constant time.
+    t = _verified(() -> Meta.verifyrootstart_Footer(bytes, ctx))
     footer = FB.getrootas(Meta.Footer, bytes, 0)
     version = Int16(Int64(footer.version))
     version in (Int16(3), Int16(4)) ||
         _vfail("unsupported footer version $version (only V4/V5 are accepted)")
+    _verified(() -> Meta.verifyrootrest_Footer(t, ctx))
     features = _schemafeatures(footer.schema::Meta.Schema, version)
     return version, features, _blocktuples(footer.dictionaries),
         _blocktuples(footer.recordBatches), ctx.reserved
