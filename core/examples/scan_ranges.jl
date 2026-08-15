@@ -2534,7 +2534,7 @@ function _stats_main()
 end
 
 if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+    _stats_main()
     filebytes, af, full = _scan_main()
     _ranged_main(filebytes, af, full)
-    _stats_main()
 end
