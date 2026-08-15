@@ -98,21 +98,21 @@ depth-first order (the same order the decode cursor consumes it).
 function _bufferspan(f::Field, variadics::AbstractVector{Int64},
     varidx::Base.RefValue{Int})
     spec = layoutspec(f.type)
-    n = length(spec.buffers)
+    n = Int64(length(spec.buffers))
     if spec.variadic
         varidx[] <= length(variadics) || throw(ValidationError(
             "metadata declares fewer variadic buffer counts than the schema requires"))
         vc = variadics[varidx[]]
         varidx[] += 1
-        0 <= vc <= typemax(Int) - n || throw(ValidationError(
+        vc >= 0 || throw(ValidationError(
             "variadic buffer count $vc is invalid"))
-        n += Int(vc)
+        n = _planadd(n, vc, "buffer span")
     end
     f.type isa DictionaryType && return n
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     for i = 1:nchildren
-        n = _planadd(Int64(n), Int64(_bufferspan(f.children[i], variadics, varidx)),
-            "buffer span") |> Int
+        n = _planadd(n, _bufferspan(f.children[i], variadics, varidx),
+            "buffer span")
     end
     return n
 end
@@ -150,7 +150,11 @@ function _recordbatchmeta(header::Meta.RecordBatch, fields, limits::Limits,
     buffers = something(header.buffers, Meta.Buffer[])
     variadics = variadiccounts(header)
     varidx = Ref(1)
-    expectedbuffers = sum(_bufferspan(f, variadics, varidx) for f in fields; init=0)
+    expectedbuffers = Int64(0)
+    for f in fields
+        expectedbuffers = _planadd(expectedbuffers,
+            _bufferspan(f, variadics, varidx), "record-batch buffer span")
+    end
     varidx[] == length(variadics) + 1 || throw(ValidationError(
         "unconsumed variadic buffer counts: schema/batch mismatch"))
     length(buffers) == expectedbuffers ||
@@ -949,7 +953,7 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
                 rblen = _recordbatchmeta(rb, (vf,), limits, block[3])
                 body = _spanslice(bodyspans, block[1] + block[2], block[3])
                 cursor = DecodeCursor(rb.nodes, rb.buffers, body, limits;
-                    codec=codec, state=state)
+                    codec=codec, state=state, variadics=variadiccounts(rb))
                 decoded = decodefield(vf, cursor, dicts, fielddictids)
                 finishcursor!(cursor)
                 decoded.len == rblen ||
@@ -971,7 +975,10 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
             wants = NTuple{2,Int64}[]
             bufidx = 1
             for (j, fld) in enumerate(fields)
-                span = _bufferspan(fld, variadics, varidx)
+                span64 = _bufferspan(fld, variadics, varidx)
+                span64 <= typemax(Int) || throw(ValidationError(
+                    "field buffer span $span64 exceeds the host index range"))
+                span = Int(span64)
                 if mask[j]
                     for k = bufidx:(bufidx + span - 1)
                         k <= length(buffers) ||
@@ -1714,6 +1721,45 @@ function _scan_main()
     @assert _rejects(() -> Tables.read(RangedFile(RangedSource(copy(badrows))), shifted))
     println("window row counts require top-level FieldNode agreement ✓")
 
+    # Checked buffer-span addition is required before a zero-row window may
+    # exclude the body. Without it, these three individually valid counts
+    # wrap to the six fixed buffers and make corrupt metadata look exact.
+    ovt = ViewType(true)
+    ovfields = Field[Field("v$i", ovt) for i = 1:3]
+    ovcols = ArrayData[ArrayData(ovt, 1,
+        [BufferSlice(), AC._databuffer(zeros(UInt8, 16))]; nullcount=0)
+        for _ = 1:3]
+    ovsch = Schema(ovfields)
+    ovbytes = writefile(ovsch, [AC.RecordBatch(ovsch, ovcols, 1)])
+    ovfile = readfile(copy(ovbytes))
+    ovblock = only(ovfile.recordblocks)
+    ovmeta = copy(ovbytes[(ovblock[1] + 9):(ovblock[1] + ovblock[2])])
+    ovmsg = _vtable(ovmeta, Int64(_vu32(ovmeta, 0)))
+    ovrb = _headertable(ovmeta, ovmsg)
+    ovstart, ovn = _vvector(ovrb, 4, 8; required=true)
+    @assert ovn == 3
+    for (i, count) in enumerate(Int64[typemax(Int64) - 2,
+                                      typemax(Int64) - 2, 6])
+        _write_i64!(ovmeta, ovstart + (i - 1) * 8, count)
+    end
+    copyto!(ovbytes, ovblock[1] + 9, ovmeta, 1, length(ovmeta))
+    overflowed = try
+        badfile = readfile(copy(ovbytes))
+        badfm = _blockmessage(badfile.region, only(badfile.recordblocks),
+            badfile.dataend, badfile.limits,
+            AllocationBudget(badfile.limits.max_total_allocated_bytes))
+        _recordbatchmeta(badfm.msg.header::Meta.RecordBatch,
+            badfile.fields, badfile.limits, badfm.body.len)
+        false
+    catch e
+        e isa ValidationError &&
+            occursin("record-batch buffer span overflows", sprint(showerror, e))
+    end
+    @assert overflowed
+    @assert _rejects(() -> Tables.read(
+        RangedFile(RangedSource(copy(ovbytes))), Tables.Scan(limit=0)))
+    println("overflowing variadic buffer spans reject before window exclusion ✓")
+
     # A column table cannot infer row count when it has no columns. The scan
     # wrapper keeps the RecordBatch lengths so an empty scan remains identity.
     zerosch = Schema(Field[])
@@ -1866,6 +1912,34 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert !any(_fetched(logd0, dictblockbody[1] + k)
                  for k = 0:8:(dictblockbody[2] - 1))
     println("dictionary body ranges are planned only for decode-set ids ✓")
+
+    # A dictionary batch has its own variadic-count cursor. Keep that cursor
+    # when the dictionary values use a view layout, including the legal zero
+    # count for an all-inline pool. A following plain field pins record-batch
+    # alignment after the dictionary is installed.
+    scanviewentry(s) = let bytes = collect(codeunits(s))
+        @assert length(bytes) <= 12
+        vcat(reinterpret(UInt8, Int32[Int32(length(bytes))]), bytes,
+            zeros(UInt8, 12 - length(bytes)))
+    end
+    dvt = ViewType(true)
+    dvpool = ArrayData(dvt, 2,
+        [BufferSlice(), AC._databuffer(vcat(
+            scanviewentry("a"), scanviewentry("view")))]; nullcount=0)
+    dvtpe = DictionaryType(IntType(32, true), dvt, false)
+    dvf = Field("dictview", dvtpe; nullable=false)
+    dvd = ArrayData(dvtpe, 3,
+        [BufferSlice(), AC._databuffer(Int32[0, 1, 0])];
+        dictionary=dvpool, nullcount=0)
+    dvtailf, dvtaild = fromjulia("tail", Int64[7, 8, 9])
+    dvsch = Schema(Field[dvf, dvtailf])
+    dvbytes = writefile(dvsch,
+        [AC.RecordBatch(dvsch, ArrayData[dvd, dvtaild], 3)])
+    dvgot = Tables.read(RangedFile(RangedSource(copy(dvbytes))),
+        Tables.Scan(select=(:dictview, :tail)))
+    @assert collect(Any, dvgot.dictview) == Any["a", "view", "a"]
+    @assert collect(Any, dvgot.tail) == Any[7, 8, 9]
+    println("ranged dictionary views consume their own variadic counts ✓")
 
     # A selected dictionary id missing from the Footer is a metadata-only
     # refusal. It must fail before any dedicated record-body request.
