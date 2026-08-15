@@ -2229,7 +2229,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     println("Byte-range scan checks passed.")
 end
 
-function _stats_main()
+@noinline function _stats_base_fixture()
     # Two batches with DISJOINT ranges so predicates can discriminate:
     # batch 1: x ∈ 1:5, s ∈ "apple".."eagle";  batch 2: x ∈ 6:10, s ∈ "fig".."jam".
     t1 = (x=Int64[1, 2, 3, 4, 5], s=["apple", "berry", "cedar", "date", "eagle"])
@@ -2248,10 +2248,16 @@ function _stats_main()
     @assert stats[1].rows == 5 && stats[2].rows == 5
     @assert stats[1].cols[1].min == 1 && stats[1].cols[1].max == 5
     @assert stats[2].cols[2].min == "fig" && stats[2].cols[2].max == "jam"
-    filetbl = Arrow.Table(IOBuffer(copy(sbytes)))
+    # Keep the legacy 2.x constructor behind a function barrier. Specializing
+    # it inside this large acceptance function stalls Julia 1.12 compilation.
+    filetbl = Base.invokelatest(Arrow.Table, IOBuffer(copy(sbytes)))
     @assert length(Tables.getcolumn(Tables.columns(filetbl), 1)) == 10
     println("statistics round-trip the official value layout (Core + 2.x carry) ✓")
 
+    return source, sbytes, saf, sfull
+end
+
+@noinline function _stats_fieldnode_check(source)
     # Official column references use the flattened RecordBatch FieldNode
     # order. A top-level field after a nested subtree is not its top-level
     # ordinal.
@@ -2271,6 +2277,10 @@ function _stats_main()
     @assert isequal(collect(Any, refs), Any[missing, Int32(0), Int32(3)])
     println("statistics use official flattened FieldNode column indexes ✓")
 
+    return nestedstats
+end
+
+@noinline function _stats_predicate_checks(sbytes, saf, sfull)
     # Differential correctness with pruning active, whole-file and ranged.
     prunescans = Tables.Scan[
         Tables.Scan(filter=Tables.col(:x) > 7),
@@ -2355,7 +2365,10 @@ function _stats_main()
     @assert isequal(collect(Any, got.x), Any[8, 9, 10])
     @assert !any(_fetched(logp, block1[1] + k) for k = 0:8:(block1[2] + block1[3] - 1))
     println("stat-pruned batches add no dedicated metadata/body range ✓")
+    return nothing
+end
 
+@noinline function _stats_limit_and_decode_checks(source, sbytes)
     # Per-record limits stay lazy on both paths. A statistics-pruned large
     # record is accepted; a surviving one rejects before its ranged metadata
     # or body is fetched.
@@ -2402,7 +2415,10 @@ function _stats_main()
     pcorrupt[(poff + 5):(poff + 8)] .= reinterpret(UInt8, Int32[Int32(2)^30])
     @assert _rejects(() -> Tables.read(readfile(copy(pcorrupt)), scanx))
     println("pruning skips decode; without statistics the same scan must decode ✓")
+    return nothing
+end
 
+@noinline function _stats_malformed_checks(source, saf, nestedstats)
     # Malformed statistics degrade to no pruning, never to an error.
     badmeta = Dict{String,String}(STATS_KEY => "!!not-base64!!")
     badsch = Schema(collect(Field, source.schema.fields); metadata=badmeta,
@@ -2469,7 +2485,10 @@ function _stats_main()
         end
     end
     println("malformed statistics degrade; allocation exhaustion propagates ✓")
+    return nothing
+end
 
+@noinline function _stats_trust_checks(source)
     # The trust model, pinned (design §3): wide lies only cost pruning;
     # narrow lies silently LOSE rows — statistics are trusted-for-
     # completeness, exactly like Parquet row-group stats.
@@ -2499,8 +2518,19 @@ function _stats_main()
     end
     println("wide lies cost pruning only; narrow lies lose rows (trust model pinned) ✓")
 
+    return nothing
+end
+
+function _stats_main()
+    source, sbytes, saf, sfull = _stats_base_fixture()
+    nestedstats = _stats_fieldnode_check(source)
+    _stats_predicate_checks(sbytes, saf, sfull)
+    _stats_limit_and_decode_checks(source, sbytes)
+    _stats_malformed_checks(source, saf, nestedstats)
+    _stats_trust_checks(source)
     println()
     println("Statistics write/prune checks passed.")
+    return nothing
 end
 
 if abspath(PROGRAM_FILE) == abspath(@__FILE__)
