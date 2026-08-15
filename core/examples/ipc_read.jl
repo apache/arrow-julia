@@ -763,8 +763,9 @@ function validateschemafield(f::Field)
     elseif f.type isa RunEndEncodedType
         length(f.children) == 2 || throw(ValidationError("REE requires two children"))
         run, values = f.children
-        run.type isa IntType && run.type.signed && run.type.bits in (16, 32, 64) &&
-            !run.nullable && !(values.type isa RunEndEncodedType) ||
+        run.name == "run_ends" && values.name == "values" &&
+            run.type isa IntType && run.type.signed && run.type.bits in (16, 32, 64) &&
+            !run.nullable ||
             throw(ValidationError("invalid run-end encoded schema"))
     end
     foreach(validateschemafield, f.children)

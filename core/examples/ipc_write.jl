@@ -1581,11 +1581,16 @@ function main()
     badnameschema = Schema(Field[Field(invalidname, IntType(64, true))])
     badmetaschema = Schema(emptysch.fields; metadata=[invalidname => "value"])
     bigschema = Schema(emptysch.fields; endianness=AC.BigEndian)
+    badreeschema = Schema(Field[Field("ree", RunEndEncodedType(); children=[
+        Field("wrong", IntType(32, true); nullable=false),
+        Field("also-wrong", IntType(64, true))])])
     @assert _rejects(() -> writestream(badnameschema, AC.RecordBatch[]))
     @assert _rejects(() -> writefile(badnameschema, AC.RecordBatch[]))
     @assert _rejects(() -> writefile(badmetaschema, AC.RecordBatch[]))
     @assert _rejects(() -> writestream(bigschema, AC.RecordBatch[]))
-    println("schema-only writers validate names, metadata, and endianness ✓")
+    @assert _rejects(() -> writestream(badreeschema, AC.RecordBatch[]))
+    @assert _rejects(() -> writefile(badreeschema, AC.RecordBatch[]))
+    println("schema-only writers validate names, metadata, endianness, and REE children ✓")
 
     # A Field object is one writer-side dictionary-id key. Reusing that exact
     # object at two positions used to collapse two distinct pools onto one id.
@@ -1630,7 +1635,8 @@ function main()
 
     # Unions, both modes: 2.x writes them, Core reads and re-encodes them,
     # and 2.x reads this writer's bytes back. The mapped set now matches
-    # Core's accessor coverage (views and REE stay out by declared boundary).
+    # Core's accessor coverage; the self-round-trips below cover the newer
+    # view layouts and REE that Arrow.jl 2.x cannot yet emit.
     sparsebytes = UInt8[]
     for (modename, dense) in (("dense", true), ("sparse", false))
         uio = IOBuffer()
@@ -1992,17 +1998,29 @@ function main()
     rvf, rvd = fromjulia("values", Union{Missing,String}["x", missing, "z"])
     rf = Field("ree", rt; children=[ref, rvf])
     rd = ArrayData(rt, 4, BufferSlice[]; children=[red, rvd], nullcount=0)
+    nvv = ArrayData(vt, 2,
+        [BufferSlice(), AC._databuffer(vcat(
+            viewentry(1, collect(codeunits("p"))),
+            viewentry(1, collect(codeunits("q")))))]; nullcount=0)
+    nvf = Field("values", vt; nullable=false)
+    nirf, nird = fromjulia("run_ends", Int32[1, 2])
+    nif = Field("values", rt; children=[nirf, nvf])
+    nid = ArrayData(rt, 2, BufferSlice[]; children=[nird, nvv], nullcount=0)
+    norf, nord = fromjulia("run_ends", Int32[2, 4])
+    nf = Field("nested", rt; children=[norf, nif])
+    nd = ArrayData(rt, 4, BufferSlice[]; children=[nord, nid], nullcount=0)
     # a plain column AFTER the exotic ones proves no buffer skew
     tf, td = fromjulia("tail", Int64[1, 2, 3, 4])
-    exsch = Schema(Field[vf, lvf, rf, tf])
+    exsch = Schema(Field[vf, lvf, rf, nf, tf])
     exlv = ArrayData(lvt, 4,
         [BufferSlice(), AC._databuffer(Int32[2, 0, 0, 1]),
          AC._databuffer(Int32[1, 2, 3, 0])]; children=[lvcd], nullcount=0)
-    exbatch = AC.RecordBatch(exsch, ArrayData[vd, exlv, rd, td], 4)
+    exbatch = AC.RecordBatch(exsch, ArrayData[vd, exlv, rd, nd, td], 4)
     exwant = Dict(
         "v" => Any["abc", "first-out-of-line-payload", missing, ""],
         "lv" => Any[[30], [10, 20], [10, 20, 30], Int64[]],
         "ree" => Any["x", "x", missing, "z"],
+        "nested" => Any["p", "p", "q", "q"],
         "tail" => Any[1, 2, 3, 4])
     for compress in (:none, :zstd)
         exbytes = writestream(exsch, [exbatch]; compress=compress)
@@ -2018,16 +2036,18 @@ function main()
             @assert isequal(got, exwant[f.name]) "file $(f.name) ($compress): $got"
         end
     end
-    println("views, list-views, and REE round-trip on both formats (plain + zstd) ✓")
+    println("views, list-views, and nested REE round-trip on both formats (plain + zstd) ✓")
 
-    # Wire shape: the batch declares exactly one variadic count (2 buffers
-    # for the view column) and no other; the type tags are the 1.3/1.4 ids.
+    # Wire shape: variadic counts follow field preorder (2 buffers for the
+    # top-level view, then 0 for the inline view below nested REE); the type
+    # tags are the 1.3/1.4 ids.
     exframes = framemessages(heapregion(copy(writestream(exsch, [exbatch]))))
     exrb = exframes[2].msg.header::Meta.RecordBatch
-    @assert variadiccounts(exrb) == Int64[2]
+    @assert variadiccounts(exrb) == Int64[2, 0]
     exmeta = exframes[1].msg.header::Meta.Schema
     @assert [typeof(f.type) for f in exmeta.fields] ==
-        [Meta.Utf8View, Meta.ListView, Meta.RunEndEncoded, Meta.Int]
+        [Meta.Utf8View, Meta.ListView, Meta.RunEndEncoded,
+         Meta.RunEndEncoded, Meta.Int]
     println("variadic counts and 1.3/1.4 type tags are on the wire ✓")
 
     # A view column with ZERO variadic buffers (all inline) is legal and
@@ -2050,7 +2070,7 @@ function main()
         _mutatemessage!(lied, 2) do meta, msg
             rb = _headertable(meta, msg)
             start, n = _vvector(rb, 4, 8; required=true)
-            n == 1 || error("fixture declares $n variadic counts")
+            n == 2 || error("fixture declares $n variadic counts")
             _write_i64!(meta, start, lie)
         end
         @assert _rejects(() -> readstream(lied)) "variadic lie $lie accepted"
