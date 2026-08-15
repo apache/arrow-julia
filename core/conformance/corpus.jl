@@ -36,9 +36,10 @@
 #                    differ in padding, dictionary ordering, and metadata.
 #
 # Comparison is value-level over the JSON documents (schema, dictionaries,
-# batches) with numeric normalization (floats compared approximately, 64-bit
-# strings vs numbers unified). Skips are explicit and categorized so the
-# report reads as coverage, not silence.
+# batches) with numeric normalization (floats compared EXACTLY after
+# half/single columns are canonicalized through their physical precision;
+# 64-bit strings vs numbers unified). Skips are explicit and categorized so
+# the report reads as coverage, not silence.
 # =============================================================================
 
 using JSON, CodecZlib
