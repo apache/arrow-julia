@@ -30,6 +30,8 @@ struct GcTriggeredLoad
     value::UInt8
 end
 
+struct UnregisteredArrowType <: ArrowType end
+
 mutable struct RegionRootProbe
     bytes::Vector{UInt8}
     finalized::Base.RefValue{Bool}
@@ -171,6 +173,8 @@ end
         # offsets width only ever 0/4/8
         @test spec.offsetwidth in (0, 4, 8)
     end
+    @test_throws ArgumentError layoutspec(UnregisteredArrowType())
+    @test_throws ArgumentError AC._validate_descriptor(UnregisteredArrowType())
     # two timestamps with different timezones: same Julia type (the #503 fix)
     @test typeof(TimestampType(AC.SECOND, "America/Denver")) ==
           typeof(TimestampType(AC.NANOSECOND, nothing))

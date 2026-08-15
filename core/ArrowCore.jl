@@ -819,7 +819,16 @@ instead.
     return :UnknownArrowType
 end
 
-_validate_descriptor(::ArrowType) = nothing
+_validate_descriptor(::Utf8Type) = nothing
+_validate_descriptor(::BoolType) = nothing
+_validate_descriptor(::ListType) = nothing
+_validate_descriptor(::StructType) = nothing
+_validate_descriptor(::BinaryType) = nothing
+_validate_descriptor(::MapType) = nothing
+_validate_descriptor(::NullType) = nothing
+_validate_descriptor(::ViewType) = nothing
+_validate_descriptor(::ListViewType) = nothing
+_validate_descriptor(::RunEndEncodedType) = nothing
 _validate_descriptor(::Any) = throw(ArgumentError("unregistered ArrowType"))
 _value(::Any, ::Field, ::ArrayData, ::Int64) =
     throw(ArgumentError("unregistered ArrowType"))
