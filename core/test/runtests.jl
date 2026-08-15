@@ -524,6 +524,10 @@ end
             children=[red, vd], nullcount=0)
         @test validate_semantic(f, sliced) === sliced
         @test materialize(f, sliced) == [7, 9]
+        boundary = AC.ArrayData(t, 1, BufferSlice[]; offset=2,
+            children=[red, vd], nullcount=0)
+        @test validate_semantic(f, boundary) === boundary
+        @test materialize(f, boundary) == [9]
 
         # adversarial: non-ascending, zero/negative, short coverage,
         # unequal children, declared parent nulls
@@ -563,6 +567,18 @@ end
         @test AC.validate_full(vf, vd) === vd
         @test materialize(vf, vd) ==
               ["hello", "hello-world-beyond-inline", "exactly-12bb"]
+
+        # Length 12 is inline; length 13 is out-of-line. The parent offset
+        # selects the second physical 16-byte view entry.
+        payload13 = collect(codeunits("exactly-13-by"))
+        boundaryviews = vcat(
+            entry(12, collect(codeunits("exactly-12bb"))),
+            long(13, payload13[1:4], 0, 0))
+        slicedview = AC.ArrayData(vt, 1,
+            [BufferSlice(), AC._databuffer(boundaryviews),
+             AC._databuffer(payload13)]; offset=1, nullcount=0)
+        @test validate_full(vf, slicedview) === slicedview
+        @test materialize(vf, slicedview) == ["exactly-13-by"]
 
         # binary views return bytes
         bt = ViewType(false)
@@ -612,6 +628,12 @@ end
             children=[cd], nullcount=0)
         @test validate_semantic(lvf, overlap) === overlap
         @test materialize(lvf, overlap) == [[1, 2, 3], [1, 2]]
+        slicedlistview = AC.ArrayData(lvt, 1,
+            [BufferSlice(), AC._databuffer(Int32[2, 0]),
+             AC._databuffer(Int32[1, 2])];
+            offset=1, children=[cd], nullcount=0)
+        @test validate_semantic(lvf, slicedlistview) === slicedlistview
+        @test materialize(lvf, slicedlistview) == [[1, 2]]
         # large list-view uses 64-bit offsets and sizes
         llvt = ListViewType(true)
         llvf = Field("llv", llvt; children=[cf])
