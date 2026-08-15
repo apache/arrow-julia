@@ -123,19 +123,22 @@ and cleanup drops the root.
 
 ## Honest status
 
-Core accessors and validation cover integer, floating point, Boolean,
-decimal, date, time, timestamp, duration, all interval variants, UTF-8 and
-binary with 32-bit or 64-bit offsets, fixed-size binary, list, fixed-size
-list, struct, map, sparse and dense union, dictionary, and null arrays.
-Logical parent offsets and nested slices are tested. Struct scalars always use
-an ordered `Vector{Pair{String,Any}}`, so names stay in the value domain and
-valid duplicate, empty, or non-Symbol-compatible names do not fail. Utf8View,
-BinaryView, ListView, and run-end encoding have registry
-entries and structural validation but no semantic validation or accessors.
-`validate_semantic` and `validate_full` reject those layouts instead of
-certifying unchecked content. This is a declared scope boundary.
-`validate_full` adds UTF-8 well-formedness only for supported layouts;
-canonical padding and unused-bit checks remain production work.
+Core accessors and validation cover every format-1.5 layout: integer,
+floating point, Boolean, decimal, date, time, timestamp, duration, all
+interval variants, UTF-8 and binary with 32-bit or 64-bit offsets, Utf8View
+and BinaryView (16-byte entries, inline and out-of-line, variadic data
+buffers, the spec's prefix-must-match rule), fixed-size binary, list,
+fixed-size list, ListView and LargeListView (per-slot offsets and sizes,
+unordered and overlapping ranges, invariants binding null slots too),
+struct, map, sparse and dense union, run-end encoding (signed 16/32/64
+no-null strictly-ascending run ends, binary-search access, logical nulls
+through the values child, parent null count pinned to 0), dictionary, and
+null arrays. Logical parent offsets and nested slices are tested. Struct
+scalars always use an ordered `Vector{Pair{String,Any}}`, so names stay in
+the value domain and valid duplicate, empty, or non-Symbol-compatible names
+do not fail. `validate_full` adds UTF-8 well-formedness for Utf8 and
+Utf8View; canonical padding (including unused inline view bytes) and
+unused-bit checks remain production work.
 Map validation checks physical layout and reachable Field nullability. It does
 not check key uniqueness, hashability, or ordering; `keysSorted` remains a
 producer declaration.
@@ -148,10 +151,18 @@ The IPC examples map integer, floating point, Boolean, decimal, date, time,
 timestamp, duration, all three interval units (MONTH_DAY_NANO through a raw
 unit-slot bridge — the vendored enum predates it, and 2.x cannot parse it),
 UTF-8, binary (32- and 64-bit offsets), fixed-size binary, list, large list,
-fixed-size list, struct, map, sparse and dense union, null, and dictionary
-overlays — the same set Core's accessors cover. Variadic view and run-end
-metadata are rejected (the Core scope boundary). Nested
-dictionary encodings inside a dictionary value are also rejected. It accepts
+fixed-size list, struct, map, sparse and dense union, null, dictionary
+overlays, and the format 1.3/1.4 layouts — Utf8View/BinaryView (the
+`variadicBufferCounts` vector consumed depth-first per view field, appended
+data buffers after the fixed validity/views pair), ListView/LargeListView,
+and run-end encoding (type tags 22–26 written through a raw slot; the
+vendored builder's tag table stops at 21). One binding bug is bridged and
+named: the vendored getter declares `variadicBufferCounts` elements as Int32
+where the spec says `[long]`, so `variadiccounts(rb)` reads the verified
+vector at 8-byte width and every site routes through it. These layouts have
+no 2.x writer, so their acceptance is self round-trip on both formats with
+wire-shape assertions. Nested
+dictionary encodings inside a dictionary value are rejected. It accepts
 V4 and V5 metadata on little-endian hosts, supports feature-gated full
 dictionary replacement, preserves old dictionary snapshots, and rejects
 delta dictionaries. It requires the current eight-byte continuation-marker
@@ -249,8 +260,11 @@ Boolean, integer, floating point, null, decimal (32/64/128/256 widths in the
 `d:` form), date, time, timestamp (with and without timezone), duration, all
 three interval units, UTF-8 and binary (both offset widths), fixed-size
 binary, list, large list, fixed-size list, struct, map, sparse and dense
-union (type ids carried in the format string), and dictionary. View and REE
-formats are refused (the Core scope boundary). Field
+union (type ids carried in the format string), dictionary, Utf8View and
+BinaryView (`vu`/`vz`, with the C-Data-only trailing int64 buffer of
+variadic data-buffer lengths appended on export and consumed on import as
+the ABI's sole source of those extents), ListView/LargeListView
+(`+vl`/`+vL`), and run-end encoding (`+r`). Field
 metadata is omitted on export and ignored on import; dictionary value-schema
 names, nullability, and metadata are not a lossless round trip. Foreign
 allocation extents cannot be verified by the ABI and remain trusted
@@ -329,7 +343,14 @@ can claim the same guarantee.
   `@inline` `isa` ladders (`layoutspec_of`, `_value_of`, `_materialize_of`,
   `typeequal`, `descriptorname`, `_validate_descriptor_of`) devirtualize
   every generic entry point. Multiple dispatch remains the per-layout
-  extension surface underneath.
+  extension surface underneath. Collapsing the ladders to plain forwards
+  (`layoutspec_of(t::T) where {T} = layoutspec(t)`) was tried and rejected
+  by evidence (Aug 2026): the verifier reports the abstract call site as
+  unresolved and does not enumerate the closed method table — gate 2/6.
+  Throwing `::Any` fallbacks were kept from that experiment.
+- **Narrow after `||`-checks.** An `isa` test inside an `||` condition does
+  not narrow the binding; a typeassert after it (`rt::IntType`) is what lets
+  `primwidth`/`_load_int` resolve. Missing it is a 2/6 gate, not a warning.
 - **Literal load widths.** `loadat(b, T, off)` with a runtime `T::DataType`
   leaves the raw-load path unresolved; accessors branch to literal widths
   instead. This is also faster.
