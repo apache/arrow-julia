@@ -41,7 +41,7 @@ listed under Honest status.
 | `examples/cdata.jl` | Full mapped C Data format parity plus bidirectional `ArrowArrayStream`, zero-copy ownership, move semantics, and exactly-once release tests |
 | `examples/scan_ranges.jl` | Stage-A `Tables.Scan` pushdown, sparse byte-range reads, embedded per-batch statistics, and differential/fetch/trust acceptance tests |
 | `DESIGN-scan-ranges-trim.md` | The P1–P3 prove-out contract and the remaining P4 production/trim work |
-| `REVIEW-codex-r1.md` through `REVIEW-codex-r20.md` | Adversarial review findings and the disposition of each item |
+| `REVIEW-codex-r1.md` through `REVIEW-codex-r21.md` | Adversarial review findings and the disposition of each item |
 
 ## Run it
 
