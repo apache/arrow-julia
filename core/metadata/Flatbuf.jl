@@ -25,5 +25,9 @@ using ..FlatBuffers
 include("Schema.jl")
 include("File.jl")
 include("Message.jl")
+# Hand-maintained, schema-independent verifier runtime; the generated
+# walkers in Verifier.jl call into it.
+include("VerifierRuntime.jl")
+include("Verifier.jl")
 
 end # module

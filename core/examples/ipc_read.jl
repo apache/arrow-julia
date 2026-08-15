@@ -79,6 +79,8 @@ module GeneratedMeta
     include(joinpath(@__DIR__, "..", "metadata", "Schema.jl"))
     include(joinpath(@__DIR__, "..", "metadata", "File.jl"))
     include(joinpath(@__DIR__, "..", "metadata", "Message.jl"))
+    include(joinpath(@__DIR__, "..", "metadata", "VerifierRuntime.jl"))
+    include(joinpath(@__DIR__, "..", "metadata", "Verifier.jl"))
 end
 const Meta = GeneratedMeta
 
@@ -137,360 +139,73 @@ const CONTINUATION = 0xFFFFFFFF
 const EXPERIMENTAL_COMPRESSION_KEY = "ARROW:experimental_compression"
 
 # ---------------------------------------------------------------------------
-# FlatBuffers verifier
+# FlatBuffers verification (generated walkers over a schema-blind runtime)
 # ---------------------------------------------------------------------------
 
-# Verifier positions are zero-based. Loads are assembled byte-by-byte, so
-# they cannot escape the metadata vector or depend on host alignment.
+# The shape verifier is GENERATED from the vendored format/*.fbs by
+# core/tools/fbsgen.jl (core/metadata/Verifier.jl): table/vtable geometry,
+# scalar widths and alignment, enum domains, string bounds/NUL/UTF-8, vector
+# bounds, complete union dispatch, and the nesting/object/reserve accounting
+# all derive from the schema, so binding drift cannot reach them. The
+# wrappers below own only what the schema cannot express: which metadata
+# versions and message kinds this adapter accepts, and the features/version
+# coupling. Fixture helpers reuse the runtime's traversal primitives to
+# LOCATE bytes they corrupt, so those names are aliased here.
+const _VTable = Meta.VTable
+const _vtable = Meta._vtable
+const _vfield = Meta._vfield
+const _vref = Meta._vref
+const _vvector = Meta._vvector
+const _vrange = Meta._vrange
+const _vu8 = Meta._vu8
+const _vu16 = Meta._vu16
+const _vu32 = Meta._vu32
+const _vi32 = Meta._vi32
+const _vi64 = Meta._vi64
+
 _vfail(msg) = throw(ValidationError("invalid IPC FlatBuffer: $msg"))
 
-function _vrange(bytes::Vector{UInt8}, pos::Int64, len::Int64,
-    what::AbstractString)
-    (pos >= 0 && len >= 0 && len <= length(bytes) && pos <= length(bytes) - len) ||
-        _vfail("$what is outside metadata")
-    return pos
-end
+_verifyctx(limits::Limits, reserve_limit::Int64) =
+    Meta.VerifyContext(Int64(limits.max_metadata_objects),
+        limits.max_nesting_depth, reserve_limit)
 
-function _vu(bytes, pos::Int64, width::Int)
-    _vrange(bytes, pos, width, "scalar")
-    x = UInt64(0)
-    for i = 0:(width - 1)
-        x |= UInt64(bytes[pos + i + 1]) << (8i)
-    end
-    return x
-end
-_vu8(bytes, pos) = UInt8(_vu(bytes, pos, 1))
-_vu16(bytes, pos) = UInt16(_vu(bytes, pos, 2))
-_vu32(bytes, pos) = UInt32(_vu(bytes, pos, 4))
-_vi32(bytes, pos) = reinterpret(Int32, _vu32(bytes, pos))
-_vi64(bytes, pos) = reinterpret(Int64, UInt64(_vu(bytes, pos, 8)))
-
-struct _VTable
-    bytes::Vector{UInt8}
-    pos::Int64
-    vpos::Int64
-    vlen::Int64
-    olen::Int64
-end
-
-mutable struct _VState
-    limits::Limits
-    objects::Int64
-    reserved::Int64
-    reserve_limit::Int64
-end
-_VState(limits::Limits, reserve_limit::Int64) =
-    _VState(limits, 0, 0, reserve_limit)
-
-# Conservative charges for Julia objects and containers whose sizes are
-# directed by verified metadata. String payload bytes are charged on every
-# logical getter occurrence. Message bodies remain zero-copy and have their
-# own body/buffer byte limits.
-const METADATA_OBJECT_RESERVE = Int64(2048)
-const METADATA_VECTOR_BASE_RESERVE = Int64(256)
-const METADATA_VECTOR_ELEMENT_RESERVE = Int64(1024)
-const METADATA_STRING_BASE_RESERVE = Int64(128)
-
-function _vcharge!(state::_VState, bytes::Int64, what::AbstractString)
-    bytes >= 0 || _vfail("negative allocation charge for $what")
-    state.reserved = try
-        AC.checked_add(state.reserved, bytes)
+function _verifyroot(verifyroot::F, bytes::Vector{UInt8},
+    ctx::Meta.VerifyContext) where {F}
+    try
+        verifyroot(bytes, ctx)
     catch e
-        e isa OverflowError || rethrow()
-        _vfail("allocation charge overflow for $what")
-    end
-    state.reserved <= state.reserve_limit || throw(AllocationLimitError(
-        "metadata-directed allocation budget exceeded while visiting $what"))
-    return nothing
-end
-
-function _vvisit!(state::_VState, kind::Symbol, t::_VTable)
-    # Count logical occurrences, not unique byte positions. FlatBuffers may
-    # alias a table, while generated getters and corefield expand it once per
-    # parent occurrence. Forward UOffsets make the graph acyclic.
-    state.objects = try
-        AC.checked_add(state.objects, Int64(1))
-    catch e
-        e isa OverflowError || rethrow()
-        _vfail("metadata object count overflow")
-    end
-    state.objects <= state.limits.max_metadata_objects ||
-        _vfail("metadata object count exceeds limit")
-    _vcharge!(state, METADATA_OBJECT_RESERVE, String(kind))
-    return true
-end
-
-function _vcount!(state::_VState, n::Int64, what::AbstractString)
-    n >= 0 || _vfail("negative metadata object count for $what")
-    state.objects = try
-        AC.checked_add(state.objects, n)
-    catch e
-        e isa OverflowError || rethrow()
-        _vfail("metadata object count overflow")
-    end
-    state.objects <= state.limits.max_metadata_objects ||
-        _vfail("metadata object count exceeds limit")
-    return nothing
-end
-
-function _vtable(bytes::Vector{UInt8}, pos::Int64)
-    _vrange(bytes, pos, 4, "table")
-    pos % 4 == 0 || _vfail("table at $pos is misaligned")
-    back = Int64(_vi32(bytes, pos))
-    back != 0 || _vfail("table at $pos has a zero vtable offset")
-    vpos = AC.checked_sub(pos, back)
-    _vrange(bytes, vpos, 4, "vtable header")
-    vpos % 2 == 0 || _vfail("vtable at $vpos is misaligned")
-    vlen = Int64(_vu16(bytes, vpos))
-    olen = Int64(_vu16(bytes, vpos + 2))
-    vlen >= 4 && iseven(vlen) || _vfail("invalid vtable length $vlen")
-    olen >= 4 || _vfail("invalid table object length $olen")
-    _vrange(bytes, vpos, vlen, "vtable")
-    _vrange(bytes, pos, olen, "table object")
-    return _VTable(bytes, pos, vpos, vlen, olen)
-end
-
-function _vfield(t::_VTable, slot::Int, width::Int=1; required::Bool=false)
-    ep = t.vpos + 4 + 2slot
-    if ep + 2 > t.vpos + t.vlen
-        required && _vfail("required table slot $slot is absent")
-        return nothing
-    end
-    off = Int64(_vu16(t.bytes, ep))
-    if off == 0
-        required && _vfail("required table slot $slot is absent")
-        return nothing
-    end
-    off >= 4 && off + width <= t.olen || _vfail("table slot $slot exceeds object")
-    p = t.pos + off
-    _vrange(t.bytes, p, width, "table slot $slot")
-    width > 1 && p % min(width, 8) != 0 &&
-        _vfail("table slot $slot is misaligned")
-    return p
-end
-
-function _vref(t::_VTable, slot::Int; required::Bool=false)
-    p = _vfield(t, slot, 4; required=required)
-    p === nothing && return nothing
-    rel = Int64(_vu32(t.bytes, p))
-    rel > 0 || _vfail("reference slot $slot has a null/backward offset")
-    target = AC.checked_add(p, rel)
-    _vrange(t.bytes, target, 1, "reference slot $slot target")
-    return target
-end
-
-function _vbool(t::_VTable, slot::Int)
-    p = _vfield(t, slot, 1)
-    p === nothing && return nothing
-    _vu8(t.bytes, p) in (0x00, 0x01) || _vfail("invalid boolean in slot $slot")
-    return nothing
-end
-
-function _venum(t::_VTable, slot::Int, width::Int, valid)
-    p = _vfield(t, slot, width)
-    p === nothing && return nothing
-    _vu(t.bytes, p, width) in valid || _vfail("invalid enum in slot $slot")
-    return nothing
-end
-
-function _vstring(t::_VTable, slot::Int, state::_VState; required::Bool=false)
-    p = _vref(t, slot; required=required)
-    p === nothing && return nothing
-    p % 4 == 0 || _vfail("string length is misaligned")
-    _vrange(t.bytes, p, 4, "string length")
-    n = Int64(_vu32(t.bytes, p))
-    start = AC.checked_add(p, Int64(4))
-    _vrange(t.bytes, start, AC.checked_add(n, Int64(1)), "string")
-    t.bytes[start + n + 1] == 0 || _vfail("string has no NUL terminator")
-    _vcharge!(state, AC.checked_add(METADATA_STRING_BASE_RESERVE, n), "string")
-    payload = @view t.bytes[(start + 1):(start + n)]
-    isvalid(String, payload) || _vfail("string is not valid UTF-8")
-    return nothing
-end
-
-function _vvector(t::_VTable, slot::Int, elemsize::Int;
-    required::Bool=false,
-    state::_VState=_VState(Limits(), typemax(Int64)))
-    p = _vref(t, slot; required=required)
-    p === nothing && return nothing
-    _vrange(t.bytes, p, 4, "vector length")
-    p % 4 == 0 || _vfail("vector length is misaligned")
-    n = Int64(_vu32(t.bytes, p))
-    n <= state.limits.max_metadata_objects ||
-        _vfail("vector count $n exceeds metadata object limit")
-    _vcount!(state, n, "vector entries")
-    start = AC.checked_add(p, Int64(4))
-    _vrange(t.bytes, start, AC.checked_mul(n, Int64(elemsize)), "vector data")
-    n > 0 && elemsize > 1 && start % min(elemsize, 8) != 0 &&
-        _vfail("vector data is misaligned")
-    _vcharge!(state, AC.checked_add(METADATA_VECTOR_BASE_RESERVE,
-        AC.checked_mul(n, METADATA_VECTOR_ELEMENT_RESERVE)), "vector")
-    return start, Int(n)
-end
-
-function _vtablevector(t::_VTable, slot::Int, verifyone, state::_VState,
-    depth::Int; required::Bool=false)
-    vec = _vvector(t, slot, 4; required=required, state=state)
-    vec === nothing && return 0
-    start, n = vec
-    for i = 0:(n - 1)
-        ep = start + 4i
-        rel = Int64(_vu32(t.bytes, ep))
-        rel > 0 || _vfail("table vector has null entry")
-        verifyone(_vtable(t.bytes, AC.checked_add(ep, rel)), state, depth + 1)
-    end
-    return n
-end
-
-function _vkeyvalue(t::_VTable, state::_VState, depth::Int)
-    _vvisit!(state, :keyvalue, t) || return nothing
-    depth <= state.limits.max_nesting_depth || _vfail("metadata nesting exceeds limit")
-    _vstring(t, 0, state; required=true)
-    _vstring(t, 1, state; required=true)
-    return nothing
-end
-
-_vmetadata(t::_VTable, slot::Int, state::_VState, depth::Int) =
-    _vtablevector(t, slot, _vkeyvalue, state, depth)
-
-function _vtype(t::_VTable, code::UInt8, state::_VState, depth::Int)
-    _vvisit!(state, Symbol("type", code), t) || return nothing
-    limits = state.limits
-    depth <= limits.max_nesting_depth || _vfail("metadata nesting exceeds limit")
-    if code == 2                    # Int
-        _vfield(t, 0, 4; required=true)
-        _vbool(t, 1)
-    elseif code == 3                # FloatingPoint
-        _venum(t, 0, 2, UInt64(0):UInt64(2))
-    elseif code == 8                # Date
-        _venum(t, 0, 2, UInt64(0):UInt64(1))
-    elseif code == 11               # Interval
-        _venum(t, 0, 2, UInt64(0):UInt64(2))
-    elseif code == 18               # Duration
-        _venum(t, 0, 2, UInt64(0):UInt64(3))
-    elseif code == 7                # Decimal
-        _vfield(t, 0, 4; required=true)
-        _vfield(t, 1, 4)
-        _vfield(t, 2, 4)
-    elseif code == 9                # Time
-        _venum(t, 0, 2, UInt64(0):UInt64(3))
-        _vfield(t, 1, 4)
-    elseif code == 10               # Timestamp
-        _venum(t, 0, 2, UInt64(0):UInt64(3))
-        _vstring(t, 1, state)
-    elseif code == 14               # Union
-        _venum(t, 0, 2, UInt64(0):UInt64(1))
-        _vvector(t, 1, 4; state=state)
-    elseif code in (15, 16)         # fixed-size binary/list
-        _vfield(t, 0, 4)             # FlatBuffers scalar default is zero
-    elseif code == 17               # Map
-        _vbool(t, 0)
-    elseif !(code in (1, 4, 5, 6, 12, 13, 19, 20, 21, 22, 23, 24, 25, 26))
-        # 22..26 (RunEndEncoded and the view types) are field-less tables:
-        # nothing to verify beyond the table shell itself.
-        _vfail("unknown Arrow type tag $code")
+        e isa Meta.VerifyError && _vfail(e.msg)
+        e isa Meta.VerifyBudgetError && throw(AllocationLimitError(e.msg))
+        rethrow()
     end
     return nothing
 end
 
-function _vdict(t::_VTable, state::_VState, depth::Int)
-    _vvisit!(state, :dictionary, t) || return nothing
-    _vfield(t, 0, 8)
-    p = _vref(t, 1)
-    p === nothing || _vtype(_vtable(t.bytes, p), UInt8(2), state, depth + 1)
-    _vbool(t, 2)
-    _venum(t, 3, 2, (UInt64(0),))
-    return nothing
-end
-
-function _vfieldmeta(t::_VTable, state::_VState, depth::Int)
-    _vvisit!(state, :field, t) || return nothing
-    limits = state.limits
-    depth <= limits.max_nesting_depth || _vfail("field nesting exceeds limit")
-    _vstring(t, 0, state)
-    _vbool(t, 1)
-    tagp = _vfield(t, 2, 1; required=true)
-    code = _vu8(t.bytes, tagp)
-    code != 0 || _vfail("field has no type tag")
-    typep = _vref(t, 3; required=true)
-    _vtype(_vtable(t.bytes, typep), code, state, depth + 1)
-    dp = _vref(t, 4)
-    dp === nothing || _vdict(_vtable(t.bytes, dp), state, depth + 1)
-    _vtablevector(t, 5, _vfieldmeta, state, depth)
-    _vmetadata(t, 6, state, depth)
-    return nothing
-end
-
-function _vschema(t::_VTable, state::_VState, depth::Int)
-    _vvisit!(state, :schema, t) || return Int64[]
-    limits = state.limits
-    _venum(t, 0, 2, UInt64(0):UInt64(1))
-    _vtablevector(t, 1, _vfieldmeta, state, depth; required=true)
-    _vmetadata(t, 2, state, depth)
-    features = Int64[]
-    vec = _vvector(t, 3, 8; state=state)
-    if vec !== nothing
-        start, n = vec
-        for i = 0:(n - 1)
-            push!(features, _vi64(t.bytes, start + 8i))
-        end
-    end
-    all(x -> x in (0, 1, 2), features) ||
-        _vfail("schema declares an unknown required feature")
+function _schemafeatures(sch::Meta.Schema, version::Int16)
+    fv = sch.features
+    features = fv === nothing ? Int64[] : Int64[Int64(x) for x in fv]
+    version == Int16(3) && !isempty(features) &&
+        _vfail("schema features require metadata V5")
     return features
-end
-
-function _vrecordbatch(t::_VTable, state::_VState, depth::Int)
-    _vvisit!(state, :recordbatch, t) || return nothing
-    limits = state.limits
-    _vfield(t, 0, 8)
-    _vvector(t, 1, 16; state=state)
-    _vvector(t, 2, 16; state=state)
-    cp = _vref(t, 3)
-    if cp !== nothing
-        c = _vtable(t.bytes, cp)
-        _venum(c, 0, 1, UInt64(0):UInt64(1))
-        _venum(c, 1, 1, (UInt64(0),))
-    end
-    _vvector(t, 4, 8; state=state)
-    return nothing
-end
-
-function _vdictbatch(t::_VTable, state::_VState, depth::Int)
-    _vvisit!(state, :dictionarybatch, t) || return nothing
-    _vfield(t, 0, 8)
-    dp = _vref(t, 1; required=true)
-    _vrecordbatch(_vtable(t.bytes, dp), state, depth + 1)
-    _vbool(t, 2)
-    return nothing
 end
 
 function verify_ipc_metadata(bytes::Vector{UInt8}, limits::Limits,
     reserve_limit::Int64=limits.max_total_allocated_bytes)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, 0))
-    root >= 4 || _vfail("invalid root offset")
-    msg = _vtable(bytes, root)
-    state = _VState(limits, reserve_limit)
-    _vvisit!(state, :message, msg)
-    vp = _vfield(msg, 0, 2)
-    version = vp === nothing ? Int16(0) : reinterpret(Int16, _vu16(bytes, vp))
+    ctx = _verifyctx(limits, reserve_limit)
+    _verifyroot(Meta.verifyroot_Message, bytes, ctx)
+    msg = FB.getrootas(Meta.Message, bytes, 0)
+    version = Int16(Int64(msg.version))
     version in (Int16(3), Int16(4)) ||
         _vfail("unsupported metadata version $version (only V4/V5 are accepted)")
-    hp = _vfield(msg, 1, 1; required=true)
-    header_type = _vu8(bytes, hp)
-    header_type in (UInt8(1), UInt8(2), UInt8(3)) ||
-        _vfail("unsupported message header tag $header_type")
-    headerp = _vref(msg, 2; required=true)
-    header = _vtable(bytes, headerp)
-    features = header_type == 1 ? _vschema(header, state, 0) :
-        header_type == 2 ? (_vdictbatch(header, state, 0); Int64[]) :
-        (_vrecordbatch(header, state, 0); Int64[])
-    version == Int16(3) && !isempty(features) &&
-        _vfail("schema features require metadata V5")
-    _vfield(msg, 3, 8)
-    _vmetadata(msg, 4, state, 0)
-    return version, header_type, features, state.reserved
+    # The verifier proved header presence and rejected union members outside
+    # the generated schemas (the Tensor family), so this dispatch is total.
+    header = msg.header
+    header_type = header isa Meta.Schema ? UInt8(1) :
+        header isa Meta.DictionaryBatch ? UInt8(2) :
+        header isa Meta.RecordBatch ? UInt8(3) :
+        _vfail("unsupported message header tag")
+    features = header isa Meta.Schema ? _schemafeatures(header, version) : Int64[]
+    return version, header_type, features, ctx.reserved
 end
 
 """

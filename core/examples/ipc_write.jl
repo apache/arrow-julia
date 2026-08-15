@@ -826,43 +826,26 @@ writefile(s::IPCStream; compress::Symbol=:none) =
 # File reader: footer verification + lazy random-access batch handle
 # ---------------------------------------------------------------------------
 
-function _vblockvector(t::_VTable, slot::Int, state::_VState)
-    vec = _vvector(t, slot, 24; state=state)
-    vec === nothing && return NTuple{3,Int64}[]
-    start, n = vec
-    blocks = Vector{NTuple{3,Int64}}(undef, n)
-    for i = 0:(n - 1)
-        base = start + 24i
-        blocks[i + 1] = (_vi64(t.bytes, base),
-            Int64(_vi32(t.bytes, base + 8)), _vi64(t.bytes, base + 16))
-    end
-    return blocks
-end
+_blocktuples(blocks) = blocks === nothing ? NTuple{3,Int64}[] :
+    NTuple{3,Int64}[(Int64(b.offset), Int64(b.metaDataLength), Int64(b.bodyLength))
+                    for b in blocks]
 
 """
-Byte-wise Footer verification (same bridge role as `verify_ipc_metadata`):
-bound the whole table graph, then return the verified Block indexes. The
-schema subgraph reuses the message verifier's `_vschema`.
+Footer verification, same wrapper role as `verify_ipc_metadata`: the
+generated walker bounds the whole table graph, then the verified getters
+supply the Block indexes.
 """
 function verify_footer(bytes::Vector{UInt8}, limits::Limits,
     reserve_limit::Int64=limits.max_total_allocated_bytes)
-    state = _VState(limits, reserve_limit)
-    length(bytes) >= 4 || _vfail("missing footer root offset")
-    root = Int64(_vu32(bytes, 0))
-    t = _vtable(bytes, root)
-    _vvisit!(state, :footer, t)
-    vp = _vfield(t, 0, 2)
-    version = vp === nothing ? Int16(0) : reinterpret(Int16, _vu16(bytes, vp))
+    ctx = _verifyctx(limits, reserve_limit)
+    _verifyroot(Meta.verifyroot_Footer, bytes, ctx)
+    footer = FB.getrootas(Meta.Footer, bytes, 0)
+    version = Int16(Int64(footer.version))
     version in (Int16(3), Int16(4)) ||
         _vfail("unsupported footer version $version (only V4/V5 are accepted)")
-    sp = _vref(t, 1; required=true)
-    features = _vschema(_vtable(bytes, sp), state, 0)
-    version == Int16(3) && !isempty(features) &&
-        _vfail("schema features require metadata V5")
-    dictblocks = _vblockvector(t, 2, state)
-    recordblocks = _vblockvector(t, 3, state)
-    _vmetadata(t, 4, state, 0)
-    return version, features, dictblocks, recordblocks, state.reserved
+    features = _schemafeatures(footer.schema::Meta.Schema, version)
+    return version, features, _blocktuples(footer.dictionaries),
+        _blocktuples(footer.recordBatches), ctx.reserved
 end
 
 function _metadataequal(a, b)

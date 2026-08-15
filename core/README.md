@@ -181,8 +181,8 @@ plus distinct pool data.
 
 The IPC adapter runs structural and semantic Core validation before it exposes
 a batch. It does not opt into `validate_full`, so UTF-8 body content is not
-checked. The byte-wise metadata verifier does validate FlatBuffer strings.
-The framer rejects a non-little-endian host before it calls the older generated
+checked. The generated metadata verifier does validate FlatBuffer strings.
+The framer rejects a non-little-endian host before it calls the generated
 FlatBuffers getters, which use native-endian scalar loads.
 
 The write half (`ipc_write.jl`) covers the same mapped subset with one
@@ -246,11 +246,15 @@ caller must not mutate or resize that vector while the stream or its batches
 live. The same immutable-borrow rule applies to Julia vectors wrapped
 directly by Core builders or `heapregion` while their `ArrayData` or cached
 validation results remain in use.
-It is not the report's incremental `IO` framer. The
-bindings are regenerated from the current spec, but the byte-wise verifier
-in front of them is still a local implementation; production work must use
-a generated verifier — the report explicitly rejects a custom parser as the
-final design. `max_total_allocated_bytes` is one reader-wide,
+It is not the report's incremental `IO` framer. Both the
+bindings and the shape verifier are generated from the vendored spec
+schemas (`core/metadata/fbs/`, generator `core/tools/fbsgen.jl`): the
+verifier's table walkers, enum domains, union tag ladders, and struct sizes
+all derive from the schema over a schema-blind hand-maintained runtime
+(`core/metadata/VerifierRuntime.jl`), and no generated getter runs before
+the walker has bounded the graph. Adapter wrappers keep only the semantics
+the schema cannot express (accepted versions and message kinds, the
+features/version coupling). `max_total_allocated_bytes` is one reader-wide,
 conservative budget for metadata copies, metadata-directed Julia containers,
 and exact-sized decompressed outputs across all eager dictionary and record
 batches. It is not an exact measurement of every Julia runtime allocation.

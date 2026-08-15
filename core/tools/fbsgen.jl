@@ -180,6 +180,58 @@ lowerfirst(s) = isempty(s) ? s : lowercase(s[1:1]) * s[2:end]
 # matches every name the prove-out actually calls (verified by the rewire).
 camel(s) = join(uppercasefirst.(split(s, '_')))
 
+# Union fields occupy TWO vtable slots (type tag, then value); every emitter
+# must agree on the numbering.
+function slotmap(d::FbsTable, enums)
+    slots = String[]
+    slotof = Dict{String,Int}()
+    for f in d.fields
+        if haskey(enums, f.type) && enums[f.type].isunion
+            slotof[f.name * "_type"] = length(slots)
+            push!(slots, f.name * "_type")
+        end
+        slotof[f.name] = length(slots)
+        push!(slots, f.name)
+    end
+    return slots, slotof
+end
+
+"Fixed byte size of a struct (natural alignment, padded to max alignment)."
+function structsize(st::FbsTable)
+    off = 0
+    ma = 1
+    for f in st.fields
+        sz = SCALARS[f.type][2]
+        off = cld(off, sz) * sz + sz
+        ma = max(ma, sz)
+    end
+    return cld(off, ma) * ma
+end
+
+# Enum members as raw wire constants (two's complement at the base width),
+# for domain checks against byte-assembled loads.
+function enumdomain(e::FbsEnum)
+    width = SCALARS[e.basetype][2]
+    mask = width == 8 ? typemax(UInt64) : (UInt64(1) << (8 * width)) - UInt64(1)
+    return [reinterpret(UInt64, Int64(v)) & mask for (_, v) in e.members]
+end
+
+# Arrow-semantic required fields. The .fbs files declare no `(required)`
+# attributes, but the format is meaningless without these, and the readers'
+# downstream mapping assumes verification enforced them (a Field without a
+# type, a Message without a header). For union entries both the tag and the
+# value are required and the tag must be a named member.
+const REQUIRED = Dict(
+    "Message" => ("header",),
+    "Field" => ("type",),
+    "Schema" => ("fields",),
+    "DictionaryBatch" => ("data",),
+    "Footer" => ("schema",),
+    "KeyValue" => ("key", "value"),
+)
+isrequired(tname::String, fname::String) =
+    fname in get(REQUIRED, tname, ())
+
 function emit(decls, io::IO; alldecls=decls)
     # Name resolution spans every generated schema (Message.fbs references
     # Schema.fbs tables; all three land in one module), so `alldecls`
@@ -295,15 +347,7 @@ function emittable(io::IO, d::FbsTable, enums, tables)
     println(io, "    pos::Base.Int")
     println(io, "end")
     println(io)
-    # Union fields occupy TWO vtable slots (type tag, value); count slots.
-    slots = String[]
-    slotof = Dict{String,Int}()
-    for f in d.fields
-        if haskey(enums, f.type) && enums[f.type].isunion
-            slotof[f.name * "_type"] = length(slots); push!(slots, f.name * "_type")
-        end
-        slotof[f.name] = length(slots); push!(slots, f.name)
-    end
+    slots, slotof = slotmap(d, enums)
     props = [f.name for f in d.fields if !f.deprecated]
     println(io, "Base.propertynames(x::", name, ") = (",
         join((":" * p for p in props), ", "), length(props) == 1 ? ",)" : ")")
@@ -426,6 +470,124 @@ function emittable(io::IO, d::FbsTable, enums, tables)
     println(io)
 end
 
+# --- verifier emitter -------------------------------------------------------------
+#
+# One shape-verification function per table, driven entirely by the parsed
+# schema: scalar widths and alignment, bool and enum domains (from the enum
+# declarations), string bounds/NUL/UTF-8, vector bounds with element sizes
+# (struct sizes computed from their layout), table recursion with depth and
+# object accounting, and COMPLETE union dispatch — the tag ladder is the
+# schema's member list, so it can never stop short the way a hand-written
+# table did. Members whose tables live outside the generated schemas
+# (Tensor family) fail closed by name.
+
+function emitverifier(io::IO, alldecls)
+    enums = Dict{String,FbsEnum}()
+    tables = Dict{String,FbsTable}()
+    for d in alldecls
+        d isa FbsEnum && (enums[d.name] = d)
+        d isa FbsTable && (tables[d.name] = d)
+    end
+    domain(e::FbsEnum) =
+        "(" * join(("0x" * string(v, base=16, pad=16) for v in enumdomain(e)), ", ") * ",)"
+    for d in alldecls
+        (d isa FbsTable && !d.isstruct) || continue
+        name = jlname(d.name)
+        _, slotof = slotmap(d, enums)
+        println(io, "function verify_", name,
+            "(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)")
+        println(io, "    t = _vtable(bytes, pos)")
+        println(io, "    _vvisit!(ctx, \"", name, "\")")
+        println(io, "    depth <= ctx.maxdepth || _vfail(\"metadata nesting exceeds limit\")")
+        for f in d.fields
+            f.deprecated && continue
+            slot = slotof[f.name]
+            req = isrequired(d.name, f.name)
+            reqkw = req ? "; required=true" : ""
+            t = f.type
+            label = "$(d.name).$(f.name)"
+            if haskey(enums, t) && enums[t].isunion
+                e = enums[t]
+                tslot = slotof[f.name * "_type"]
+                println(io, "    tagp = _vfield(t, ", tslot, ", 1", reqkw, ")")
+                println(io, "    tag = tagp === nothing ? 0x00 : _vu8(bytes, tagp)")
+                req && println(io,
+                    "    tag != 0x00 || _vfail(\"", label, " union tag is required\")")
+                println(io, "    valp = _vref(t, ", slot, reqkw, ")")
+                println(io, "    if tag == 0x00")
+                println(io, "        valp === nothing ||")
+                println(io, "            _vfail(\"", label, " union has a value but no tag\")")
+                firstmember = true
+                for (mname, v) in e.members
+                    mname == "NONE" && continue
+                    println(io, "    elseif tag == 0x", string(v, base=16, pad=2))
+                    if haskey(tables, mname) && !tables[mname].isstruct
+                        println(io, "        valp === nothing &&")
+                        println(io, "            _vfail(\"", label, " union has a tag but no value\")")
+                        println(io, "        verify_", jlname(mname), "(bytes, valp, ctx, depth + 1)")
+                    else
+                        println(io, "        _vfail(\"", label, " union member ", mname,
+                            " is outside the generated schemas\")")
+                    end
+                    firstmember = false
+                end
+                println(io, "    else")
+                println(io, "        _vfail(\"", label, " union has unknown tag\")")
+                println(io, "    end")
+            elseif haskey(enums, t)
+                e = enums[t]
+                println(io, "    _venum(t, ", slot, ", ", SCALARS[e.basetype][2],
+                    ", ", domain(e), ")")
+            elseif t == "bool"
+                println(io, "    _vbool(t, ", slot, ")")
+            elseif haskey(SCALARS, t)
+                println(io, "    _vfield(t, ", slot, ", ", SCALARS[t][2], reqkw, ")")
+            elseif t == "string"
+                println(io, "    _vstring(t, ", slot, ", ctx", reqkw, ")")
+            elseif isvector(t)
+                et = elemtype(t)
+                if haskey(enums, et) && !enums[et].isunion
+                    e = enums[et]
+                    println(io, "    _venumvector(t, ", slot, ", ",
+                        SCALARS[e.basetype][2], ", ", domain(e),
+                        ", ctx, \"", label, "\"", reqkw, ")")
+                elseif haskey(SCALARS, et)
+                    println(io, "    _vvector(t, ", slot, ", ", SCALARS[et][2],
+                        ", ctx", reqkw, ")")
+                elseif haskey(tables, et) && tables[et].isstruct
+                    println(io, "    _vvector(t, ", slot, ", ",
+                        structsize(tables[et]), ", ctx", reqkw, ")")
+                elseif haskey(tables, et)
+                    println(io, "    _vtablevector(t, ", slot, ", verify_",
+                        jlname(et), ", ctx, depth", reqkw, ")")
+                else
+                    error("verifier: unsupported vector element '$et' in $(d.name).$(f.name)")
+                end
+            elseif haskey(tables, t) && tables[t].isstruct
+                println(io, "    _vfield(t, ", slot, ", ", structsize(tables[t]), reqkw, ")")
+            elseif haskey(tables, t)
+                println(io, "    p = _vref(t, ", slot, reqkw, ")")
+                println(io, "    p === nothing || verify_", jlname(t),
+                    "(bytes, p, ctx, depth + 1)")
+            else
+                error("verifier: unsupported field type '$t' in $(d.name).$(f.name)")
+            end
+        end
+        println(io, "    return nothing")
+        println(io, "end")
+        println(io)
+        println(io, "function verifyroot_", name,
+            "(bytes::Vector{UInt8}, ctx::VerifyContext)")
+        println(io, "    length(bytes) >= 4 || _vfail(\"missing root offset\")")
+        println(io, "    root = Int64(_vu32(bytes, Int64(0)))")
+        println(io, "    root >= 4 || _vfail(\"invalid root offset\")")
+        println(io, "    verify_", name, "(bytes, root, ctx, 0)")
+        println(io, "    return nothing")
+        println(io, "end")
+        println(io)
+    end
+end
+
 const HEADER = """
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
@@ -461,6 +623,11 @@ function generate(fbsdir::AbstractString, outdir::AbstractString)
         write(joinpath(outdir, name * ".jl"), take!(io))
         println("generated ", name, ".jl: ", length(decls), " declarations")
     end
+    vio = IOBuffer()
+    print(vio, replace(HEADER, "{name}" => "{Schema,File,Message}"))
+    emitverifier(vio, alldecls)
+    write(joinpath(outdir, "Verifier.jl"), take!(vio))
+    println("generated Verifier.jl")
     write(joinpath(outdir, "Flatbuf.jl"), replace(HEADER, "{name}" => "*") * """
 module Flatbuf
 
@@ -470,6 +637,10 @@ using ..FlatBuffers
 include("Schema.jl")
 include("File.jl")
 include("Message.jl")
+# Hand-maintained, schema-independent verifier runtime; the generated
+# walkers in Verifier.jl call into it.
+include("VerifierRuntime.jl")
+include("Verifier.jl")
 
 end # module
 """)
