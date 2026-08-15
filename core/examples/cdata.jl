@@ -143,11 +143,13 @@ formatstring(::StructType) = "+s"
 formatstring(::MapType) = "+m"
 formatstring(t::UnionType) =
     (t.mode == AC.SparseMode ? "+us:" : "+ud:") * join(Int.(t.typeids), ",")
+formatstring(t::ViewType) = t.utf8 ? "vu" : "vz"
+formatstring(t::ListViewType) = t.large ? "+vL" : "+vl"
+formatstring(::RunEndEncodedType) = "+r"
 formatstring(t::DictionaryType) = formatstring(t.indextype)  # per spec: index format; values on schema.dictionary
 
 _formaterror(fmt) = throw(ValidationError(
-    "cdata prove-out: unmapped format string \"$fmt\"; view and REE C-data " *
-    "mapping is outside this prove-out"))
+    "cdata prove-out: unmapped format string \"$fmt\""))
 
 function _parseformatint(fmt, s, what; low=0, high=typemax(Int32))
     bytes = codeunits(s)
@@ -234,6 +236,11 @@ function parseformat(fmt::AbstractString, flags::Int64=0)::ArrowType
     fmt == "Z" && return BinaryType(true)
     fmt == "+l" && return ListType(false)
     fmt == "+L" && return ListType(true)
+    fmt == "vu" && return ViewType(true)
+    fmt == "vz" && return ViewType(false)
+    fmt == "+vl" && return ListViewType(false)
+    fmt == "+vL" && return ListViewType(true)
+    fmt == "+r" && return RunEndEncodedType()
     fmt == "+s" && return StructType()
     fmt == "+m" && return MapType((flags & ARROW_FLAG_MAP_KEYS_SORTED) != 0)
     fmt == "e" && return FloatType(16)
@@ -608,11 +615,16 @@ function _export_array!(root::ExportedRoot, d::ArrayData,
     release::Ptr{Cvoid})::Ptr{CArrowArray}
     p = Ptr{CArrowArray}(_malloc!(root, sizeof(CArrowArray)))
     spec = layoutspec(d.type)
-    nbuf = length(d.buffers)
+    ncore = length(d.buffers)
+    # C Data appends one int64 buffer of variadic data-buffer LENGTHS to view
+    # arrays (extents are not otherwise recoverable from the ABI); it counts
+    # toward n_buffers here and nowhere else in the format.
+    nvariadic = spec.variadic ? ncore - length(spec.buffers) : 0
+    nbuf = spec.variadic ? ncore + 1 : ncore
     bufptrs = Ptr{Ptr{Cvoid}}(_malloc!(root,
         AC.checked_mul(Int64(max(nbuf, 1)), Int64(sizeof(Ptr)))))
     for (i, b) in enumerate(d.buffers)
-        role = spec.buffers[i]
+        role = i <= length(spec.buffers) ? spec.buffers[i] : AC.DATA
         bufferp = if role == AC.OFFSETS && d.len == 0 && d.offset == 0 &&
             AC.isempty_buffer(b)
             # Core's canonical empty representation omits this otherwise
@@ -632,6 +644,14 @@ function _export_array!(root::ExportedRoot, d::ArrayData,
             Ptr{Cvoid}(AC.sliceptr(b))
         end
         unsafe_store!(bufptrs, bufferp, i)
+    end
+    if spec.variadic
+        sizesp = Ptr{Int64}(_malloc!(root,
+            AC.checked_mul(Int64(max(nvariadic, 1)), Int64(8))))
+        for k = 1:nvariadic
+            unsafe_store!(sizesp, d.buffers[length(spec.buffers) + k].len, k)
+        end
+        unsafe_store!(bufptrs, Ptr{Cvoid}(sizesp), nbuf)
     end
     nchildren = length(d.children)
     canonical_children = Ptr{CArrowArray}[]
@@ -1037,8 +1057,15 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
 
     spec = layoutspec(f.type)
     expected_buffers = length(spec.buffers)
-    Int64(arr.n_buffers) == expected_buffers ||
-        throw(ValidationError("layout $(typeof(f.type)) declares $expected_buffers buffers, producer sent $(arr.n_buffers)"))
+    if spec.variadic
+        # validity + views + N variadic data buffers + the trailing int64
+        # sizes buffer: at least the fixed pair plus the sizes buffer.
+        Int64(arr.n_buffers) >= expected_buffers + 1 ||
+            throw(ValidationError("view layout $(typeof(f.type)) requires at least $(expected_buffers + 1) buffers, producer sent $(arr.n_buffers)"))
+    else
+        Int64(arr.n_buffers) == expected_buffers ||
+            throw(ValidationError("layout $(typeof(f.type)) declares $expected_buffers buffers, producer sent $(arr.n_buffers)"))
+    end
     expected_children = spec.childcount == -1 ? length(f.children) : spec.childcount
     Int64(arr.n_children) == expected_children ||
         throw(ValidationError("layout $(typeof(f.type)) declares $expected_children children, producer sent $(arr.n_children)"))
@@ -1177,13 +1204,14 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
         elseif role == AC.TYPE_IDS
             # One Int8 discriminator per union slot.
             total
-        elseif role == AC.ELEMENT_OFFSETS
-            # Dense-union offsets are per-slot values, not monotone ranges:
-            # exactly `total` entries, no +1 terminator.
+        elseif role == AC.ELEMENT_OFFSETS || role == AC.SIZES
+            # Per-slot values (dense-union offsets; list-view offsets and
+            # sizes), not monotone ranges: exactly `total` entries, no +1.
             AC.checked_mul(total, Int64(spec.offsetwidth))
+        elseif role == AC.VIEWS
+            AC.checked_mul(total, Int64(16))
         else
-            throw(ValidationError(
-                "cdata prove-out: $role buffers belong to view layouts, which are outside this prove-out"))
+            throw(ValidationError("cdata prove-out: unmapped buffer role $role"))
         end
         if p == C_NULL
             nbytes == 0 || throw(ValidationError("NULL $role buffer with nonzero required size"))
@@ -1193,6 +1221,27 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
             slice = BufferSlice(region, 0, nbytes)
             role == AC.OFFSETS && (offsets_slice = slice)
             push!(buffers, slice)
+        end
+    end
+    if spec.variadic
+        # The trailing int64 sizes buffer declares each variadic data
+        # buffer's extent — the one place the ABI carries a length for them.
+        nfixed = length(spec.buffers)
+        nvariadic = Int(arr.n_buffers) - nfixed - 1
+        sizesp = Ptr{Int64}(bufferptr(arr, Int(arr.n_buffers)))
+        (nvariadic == 0 || sizesp != C_NULL) ||
+            throw(ValidationError("view array with variadic buffers has a NULL sizes buffer"))
+        for k = 1:nvariadic
+            len = unsafe_load(sizesp, k)
+            len >= 0 || throw(ValidationError("negative variadic buffer length $len"))
+            p = bufferptr(arr, nfixed + k)
+            if p == C_NULL
+                len == 0 || throw(ValidationError("NULL variadic buffer with nonzero declared length"))
+                push!(buffers, BufferSlice())
+            else
+                region = OwnerRegion(Ptr{UInt8}(p), len; root=owner)
+                push!(buffers, BufferSlice(region, 0, len))
+            end
         end
     end
     children = ArrayData[]
@@ -1874,6 +1923,13 @@ function _threaded_cdata_stress()
     return nothing
 end
 
+# Test-support: one 16-byte view entry (inline / out-of-line forms).
+_viewentry(len::Int, rest::Vector{UInt8}) =
+    vcat(reinterpret(UInt8, Int32[Int32(len)]), rest, zeros(UInt8, 12 - length(rest)))
+_viewlong(len::Int, prefix::Vector{UInt8}, bufidx::Int, off::Int) =
+    vcat(reinterpret(UInt8, Int32[Int32(len)]), prefix,
+         reinterpret(UInt8, Int32[Int32(bufidx), Int32(off)]))
+
 function main()
     if Sys.WORD_SIZE == 64
         @assert sizeof(CArrowSchema) == 72
@@ -2144,6 +2200,40 @@ function main()
                 children=[duid, dusd], nullcount=0)),
         (Field("nulls", NullType()),
             ArrayData(NullType(), 3, BufferSlice[]; nullcount=3)),
+        # format 1.3/1.4: views (with the C-only trailing sizes buffer),
+        # list-views (per-slot offsets+sizes, unordered/overlapping), REE
+        (Field("vu", ViewType(true); nullable=true),
+            ArrayData(ViewType(true), 3,
+                [AC._databuffer(UInt8[0x05]),
+                 AC._databuffer(vcat(
+                    _viewentry(3, collect(codeunits("abc"))),
+                    _viewlong(25, collect(codeunits("firs")), 0, 0),
+                    _viewlong(26, collect(codeunits("seco")), 1, 0))),
+                 AC._databuffer(collect(codeunits("first-out-of-line-payload"))),
+                 AC._databuffer(collect(codeunits("second-buffer-payload-here")))];
+                nullcount=1)),
+        (Field("vz", ViewType(false)),
+            ArrayData(ViewType(false), 1,
+                [BufferSlice(), AC._databuffer(_viewentry(2, UInt8[0xff, 0x00]))];
+                nullcount=0)),
+        (Field("lv", ListViewType(false); children=[fslu]),
+            ArrayData(ListViewType(false), 3,
+                [BufferSlice(), AC._databuffer(Int32[2, 0, 0]),
+                 AC._databuffer(Int32[2, 2, 4])];
+                children=[fromjulia("fsl-child", Int64[1, 2, 3, 4])[2]],
+                nullcount=0)),
+        (Field("Lv", ListViewType(true); children=[fslu]),
+            ArrayData(ListViewType(true), 1,
+                [BufferSlice(), AC._databuffer(Int64[1]), AC._databuffer(Int64[3])];
+                children=[fromjulia("fsl-child", Int64[1, 2, 3, 4])[2]],
+                nullcount=0)),
+        (Field("ree", RunEndEncodedType(); children=[
+                Field("run_ends", IntType(32, true); nullable=false),
+                Field("values", Utf8Type(false); nullable=true)]),
+            ArrayData(RunEndEncodedType(), 4, BufferSlice[];
+                children=[fromjulia("run_ends", Int32[2, 3, 4])[2],
+                          fromjulia("values", Union{Missing,String}["x", missing, "z"])[2]],
+                nullcount=0)),
     ]
     for (f, d) in paritycases
         want = collect(Any, materialize(f, d))
@@ -2168,8 +2258,15 @@ function main()
     @assert parseformat("tsu:Δ") == TimestampType(AC.MICROSECOND, "Δ")
     @assert parseformat("d:38,10") == DecimalType(38, 10, 128)
     @assert parseformat("d:38,-2") == DecimalType(38, -2, 128)
+    @assert parseformat("vu") == ViewType(true) && formatstring(ViewType(true)) == "vu"
+    @assert parseformat("vz") == ViewType(false) && formatstring(ViewType(false)) == "vz"
+    @assert parseformat("+vl") == ListViewType(false)
+    @assert parseformat("+vL") == ListViewType(true) &&
+        formatstring(ListViewType(true)) == "+vL"
+    @assert parseformat("+r") == RunEndEncodedType() &&
+        formatstring(RunEndEncodedType()) == "+r"
     badformats = String[
-        "vu", "vz", "+vl", "+r", "d:x", "w:", "tsq:",
+        "v", "vx", "+v", "+vx", "+rr", "d:x", "w:", "tsq:",
         "tsé:", "ts💣:", "tsu:UTC\0hidden",
         "w: 1", "w:1 ", "w:+1", "w:0x10", "+w: 2",
         "d: 1,0", "d:1, 0", "d:+1,+0", "d:0x9,0x2,0x20",
