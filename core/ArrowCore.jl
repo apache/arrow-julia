@@ -1547,6 +1547,13 @@ function _validate_field_contract_at(f::Field, d::ArrayData, i::Int64)
         for childi = checked_add(lo, Int64(1)):hi
             _validate_field_contract_at(cf, cd, childi)
         end
+    elseif t isa ListViewType
+        off, sz = _listview_range(t, d, i)
+        sz == 0 && return nothing
+        cf, cd = f.children[1], d.children[1]
+        for childi = checked_add(off, Int64(1)):checked_add(off, sz)
+            _validate_field_contract_at(cf, cd, childi)
+        end
     end
     return nothing
 end

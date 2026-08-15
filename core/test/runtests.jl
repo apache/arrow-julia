@@ -987,6 +987,22 @@ end
             children=[cd], nullcount=0)
         @test_throws ValidationError validate_semantic(lf, visible_list)
 
+        lvt = ListViewType(false)
+        lvf = Field("listview", lvt; children=[cf])
+        lvoffsets = AC._databuffer(Int32[0])
+        lvsizes = AC._databuffer(Int32[1])
+        masked_listview = AC.ArrayData(lvt, 1,
+            [AC._databuffer(UInt8[0x00]), lvoffsets, lvsizes];
+            children=[cd], nullcount=1)
+        @test validate_semantic(lvf, masked_listview) === masked_listview
+        visible_listview = AC.ArrayData(lvt, 1,
+            [BufferSlice(), lvoffsets, lvsizes]; children=[cd], nullcount=0)
+        @test_throws ValidationError validate_semantic(lvf, visible_listview)
+        empty_at_end = AC.ArrayData(lvt, 1,
+            [BufferSlice(), AC._databuffer(Int32[2]), AC._databuffer(Int32[0])];
+            children=[cd], nullcount=0)
+        @test validate_semantic(lvf, empty_at_end) === empty_at_end
+
         keyfield = Field("key", IntType(64, true); nullable=false)
         keydata = AC.ArrayData(keyfield.type, 1,
             [AC._databuffer(UInt8[0x00]), AC._databuffer(Int64[0])];
