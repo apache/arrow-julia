@@ -779,21 +779,31 @@ end
     end
 
     @testset "semantic: Date64 and Time values obey their domains" begin
+        # Temporal value domains (Date64 whole days, Time-of-day range) are
+        # ADVISORY: the semantic stage accepts anything the layout admits and
+        # the opt-in validate_full tier enforces the domain.
         function checkvalues(t, values; valid=true)
             f = Field("temporal", t; nullable=false)
             d = AC.ArrayData(t, length(values),
                 [BufferSlice(), AC._databuffer(values)]; nullcount=0)
             validate_structural(f, d)
+            @test validate_semantic(f, d) === d
             if valid
-                @test validate_semantic(f, d) === d
+                @test AC.validate_full(f, d) === d
             else
-                @test_throws ValidationError validate_semantic(f, d)
+                @test_throws ValidationError AC.validate_full(f, d)
             end
         end
 
         checkvalues(DateType(AC.MILLISECOND_DATE),
             Int64[-86_400_000, 0, 86_400_000])
-        checkvalues(DateType(AC.MILLISECOND_DATE), Int64[1]; valid=false)
+        # Date64 whole-day divisibility is ADVISORY (the arrow-testing gold
+        # corpus itself violates it): semantic accepts, validate_full rejects.
+        let t = DateType(AC.MILLISECOND_DATE), f = Field("temporal", t; nullable=false),
+            d = AC.ArrayData(t, 1, [BufferSlice(), AC._databuffer(Int64[1])]; nullcount=0)
+            @test validate_semantic(f, d) === d
+            @test_throws ValidationError AC.validate_full(f, d)
+        end
         checkvalues(TimeType(AC.SECOND, 32), Int32[0, 86_399])
         checkvalues(TimeType(AC.SECOND, 32), Int32[-1]; valid=false)
         checkvalues(TimeType(AC.SECOND, 32), Int32[86_400]; valid=false)
@@ -805,14 +815,18 @@ end
     end
 
     @testset "semantic: decimal values fit declared precision" begin
+        # Decimal precision is ADVISORY (the arrow-testing gold corpus carries
+        # decimal(3,2) values with five digits): validate_semantic accepts any
+        # coefficient; validate_full enforces the declared digit count.
         function checkdecimal(t, bytes; valid=true, bitmap=BufferSlice(), nullcount=0)
             f = Field("decimal", t)
             d = AC.ArrayData(t, length(bytes) ÷ (t.bits ÷ 8),
                 [bitmap, AC._databuffer(bytes)]; nullcount=nullcount)
+            @test validate_semantic(f, d) === d
             if valid
-                @test validate_semantic(f, d) === d
+                @test AC.validate_full(f, d) === d
             else
-                @test_throws ValidationError validate_semantic(f, d)
+                @test_throws ValidationError AC.validate_full(f, d)
             end
         end
 
@@ -969,8 +983,13 @@ end
         nullable, d = fromjulia("x", [1, missing])
         validate_semantic(nullable, d)
         @test (@atomic d.semachecked)
+        # `nullable` is ADVISORY (the arrow-testing gold corpus has
+        # non-nullable fields holding nulls, and C++ reads them): the semantic
+        # stage accepts and the cached certificate is not poisoned by the
+        # Field; the opt-in validate_full tier enforces the declaration.
         nonnullable = Field("x", d.type; nullable=false)
-        @test_throws ValidationError validate_semantic(nonnullable, d)
+        @test validate_semantic(nonnullable, d) === d
+        @test_throws ValidationError AC.validate_full(nonnullable, d)
 
         af, ad = fromjulia("a", Union{Missing,Int64}[missing])
         uf = Field("u", UnionType(AC.DenseMode, Int8[0]); nullable=false,
@@ -979,9 +998,12 @@ end
             [AC._databuffer(Int8[0]), AC._databuffer(Int32[0])];
             children=[ad], nullcount=0)
         validate_structural(uf, ud)
-        @test_throws ValidationError validate_semantic(uf, ud)
+        @test validate_semantic(uf, ud) === ud
+        @test_throws ValidationError AC.validate_full(uf, ud)
     end
 
+    # These pin the MASKING rules of the nullability walk (a null parent hides
+    # non-nullable child slots), which now runs in the validate_full tier.
     @testset "parent nulls mask hidden non-nullable child slots" begin
         cf = Field("x", IntType(64, true); nullable=false)
         cd = AC.ArrayData(cf.type, 2,
@@ -991,29 +1013,29 @@ end
         sf = Field("s", StructType(); children=[cf])
         masked_struct = AC.ArrayData(StructType(), 1,
             [AC._databuffer(UInt8[0x00])]; children=[cd], nullcount=1)
-        @test validate_semantic(sf, masked_struct) === masked_struct
+        @test AC.validate_full(sf, masked_struct) === masked_struct
         visible_struct = AC.ArrayData(StructType(), 1, [BufferSlice()];
             children=[cd], nullcount=0)
-        @test_throws ValidationError validate_semantic(sf, visible_struct)
+        @test_throws ValidationError AC.validate_full(sf, visible_struct)
 
         flt = FixedSizeListType(2)
         flf = Field("fixed", flt; children=[cf])
         masked_fixed = AC.ArrayData(flt, 1,
             [AC._databuffer(UInt8[0x00])]; children=[cd], nullcount=1)
-        @test validate_semantic(flf, masked_fixed) === masked_fixed
+        @test AC.validate_full(flf, masked_fixed) === masked_fixed
         visible_fixed = AC.ArrayData(flt, 1, [BufferSlice()];
             children=[cd], nullcount=0)
-        @test_throws ValidationError validate_semantic(flf, visible_fixed)
+        @test_throws ValidationError AC.validate_full(flf, visible_fixed)
 
         lt = ListType(false)
         lf = Field("list", lt; children=[cf])
         offsets = AC._databuffer(Int32[0, 1])
         masked_list = AC.ArrayData(lt, 1,
             [AC._databuffer(UInt8[0x00]), offsets]; children=[cd], nullcount=1)
-        @test validate_semantic(lf, masked_list) === masked_list
+        @test AC.validate_full(lf, masked_list) === masked_list
         visible_list = AC.ArrayData(lt, 1, [BufferSlice(), offsets];
             children=[cd], nullcount=0)
-        @test_throws ValidationError validate_semantic(lf, visible_list)
+        @test_throws ValidationError AC.validate_full(lf, visible_list)
 
         lvt = ListViewType(false)
         lvf = Field("listview", lvt; children=[cf])
@@ -1022,14 +1044,14 @@ end
         masked_listview = AC.ArrayData(lvt, 1,
             [AC._databuffer(UInt8[0x00]), lvoffsets, lvsizes];
             children=[cd], nullcount=1)
-        @test validate_semantic(lvf, masked_listview) === masked_listview
+        @test AC.validate_full(lvf, masked_listview) === masked_listview
         visible_listview = AC.ArrayData(lvt, 1,
             [BufferSlice(), lvoffsets, lvsizes]; children=[cd], nullcount=0)
-        @test_throws ValidationError validate_semantic(lvf, visible_listview)
+        @test_throws ValidationError AC.validate_full(lvf, visible_listview)
         empty_at_end = AC.ArrayData(lvt, 1,
             [BufferSlice(), AC._databuffer(Int32[2]), AC._databuffer(Int32[0])];
             children=[cd], nullcount=0)
-        @test validate_semantic(lvf, empty_at_end) === empty_at_end
+        @test AC.validate_full(lvf, empty_at_end) === empty_at_end
 
         keyfield = Field("key", IntType(64, true); nullable=false)
         keydata = AC.ArrayData(keyfield.type, 1,
@@ -1045,12 +1067,14 @@ end
         masked_map = AC.ArrayData(mt, 1,
             [AC._databuffer(UInt8[0x00]), offsets];
             children=[entriesdata], nullcount=1)
-        @test validate_semantic(mf, masked_map) === masked_map
+        @test AC.validate_full(mf, masked_map) === masked_map
         visible_map = AC.ArrayData(mt, 1, [BufferSlice(), offsets];
             children=[entriesdata], nullcount=0)
-        @test_throws ValidationError validate_semantic(mf, visible_map)
+        @test_throws ValidationError AC.validate_full(mf, visible_map)
     end
 
+    # Nullability lives in the validate_full tier; these pin that only the
+    # SELECTED union child slot is inspected.
     @testset "union contracts inspect only selected child slots" begin
         af, ad = fromjulia("a", Int64[1])
         bf = Field("b", IntType(64, true); nullable=false)
@@ -1062,12 +1086,12 @@ end
         selected_valid = AC.ArrayData(t, 1,
             [AC._databuffer(Int8[0]), AC._databuffer(Int32[0])];
             children=[ad, bd], nullcount=0)
-        @test validate_semantic(f, selected_valid) === selected_valid
+        @test AC.validate_full(f, selected_valid) === selected_valid
 
         selected_null = AC.ArrayData(t, 1,
             [AC._databuffer(Int8[1]), AC._databuffer(Int32[0])];
             children=[ad, bd], nullcount=0)
-        @test_throws ValidationError validate_semantic(f, selected_null)
+        @test_throws ValidationError AC.validate_full(f, selected_null)
 
         # Sparse selection applies the parent offset, but still ignores every
         # unselected child's storage at that logical position.
@@ -1081,11 +1105,11 @@ end
         sparse_valid = AC.ArrayData(st, 1,
             [AC._databuffer(Int8[1, 0])]; offset=1,
             children=[sad, sbd], nullcount=0)
-        @test validate_semantic(sf, sparse_valid) === sparse_valid
+        @test AC.validate_full(sf, sparse_valid) === sparse_valid
         sparse_null = AC.ArrayData(st, 1,
             [AC._databuffer(Int8[0, 1])]; offset=1,
             children=[sad, sbd], nullcount=0)
-        @test_throws ValidationError validate_semantic(sf, sparse_null)
+        @test_throws ValidationError AC.validate_full(sf, sparse_null)
     end
 
     @testset "nested dictionary pools retain field contracts" begin
@@ -1104,7 +1128,7 @@ end
         outerfield = Field("outer", StructType(); children=[dictfield])
         outerdata = AC.ArrayData(StructType(), 1, [BufferSlice()];
             children=[dictdata], nullcount=0)
-        @test_throws ValidationError validate_semantic(outerfield, outerdata)
+        @test_throws ValidationError AC.validate_full(outerfield, outerdata)
 
         maskedpool = AC.ArrayData(valuetype, 1,
             [AC._databuffer(UInt8[0x00])]; children=[nullvalue], nullcount=1)
@@ -1113,7 +1137,7 @@ end
             dictionary=maskedpool, nullcount=0)
         maskedouter = AC.ArrayData(StructType(), 1, [BufferSlice()];
             children=[maskeddict], nullcount=0)
-        @test validate_semantic(outerfield, maskedouter) === maskedouter
+        @test AC.validate_full(outerfield, maskedouter) === maskedouter
     end
 
     @testset "full: invalid UTF-8" begin

@@ -701,8 +701,12 @@ function corefield(f::Meta.Field, dictids::Dict{Int64,Meta.Field},
         return Field(String(something(f.name, "")), t, f.nullable,
             coremetadata(f.custom_metadata), children)
     end
-    any(_containsdictionary, children) &&
-        throw(ValidationError("children of an IPC dictionary field cannot be dictionary encoded"))
+    # Nested dictionary encoding (a dictionary field whose VALUE type has
+    # dictionary-encoded children) is spec-legal and present in the
+    # arrow-testing gold corpus (nested_dictionary: dict(list(dict(utf8)))).
+    # A dictionary batch's values decode through the same `decodefield`
+    # with the live pool table, so inner pools resolve as long as batches
+    # arrive in dependency order — which the IPC spec requires.
     dictids[f.dictionary.id] = f
     idxt = f.dictionary.indexType === nothing ? IntType(32, true) :
         coretype(f.dictionary.indexType)::IntType
@@ -732,6 +736,10 @@ function validatedictionaryids(fields, fielddictids::IdDict{Field,Int64})
                     throw(ValidationError("dictionary id $id is shared by incompatible value schemas"))
             else
                 seen[id] = vf
+                # A pool's value schema may itself hold dictionary-encoded
+                # fields (nested dictionary encoding); their ids resolve
+                # through this same table, so register them too.
+                walk(vf)
             end
             return
         end
@@ -1192,7 +1200,10 @@ mutable struct IPCStream <: AC.RecordBatchSource
     batches::Vector{AC.RecordBatch}
     nextindex::Int
     @atomic pulling::Bool
+    fielddictids::IdDict{Field,Int64}   # adapter-side id table (shared ids preserved)
 end
+IPCStream(sch, fields, batches, nextindex, pulling) =
+    IPCStream(sch, fields, batches, nextindex, pulling, IdDict{Field,Int64}())
 
 
 mutable struct PendingRecord
@@ -1366,7 +1377,8 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
         isempty(pending) ||
             throw(ValidationError("stream ended before required dictionary batches arrived"))
         batches = AC.RecordBatch[b::AC.RecordBatch for b in batchslots]
-        return IPCStream(sch, AC.FrozenVector{Field}(fields), batches, 1, false)
+        return IPCStream(sch, AC.FrozenVector{Field}(fields), batches, 1, false,
+            fielddictids)
     finally
         close(state)
     end
@@ -2120,12 +2132,16 @@ function main()
     println("zero-byte compressed buffers may omit the prefix ✓")
 
     # The 2.x writer permits a coefficient outside its declared decimal
-    # precision. The Core semantic boundary must reject it before exposure.
+    # precision. Precision is advisory at the semantic boundary (the gold
+    # corpus itself carries five digits in a decimal(3,2)); the opt-in
+    # validate_full tier enforces the declaration.
     baddecimalio = IOBuffer()
     D = Arrow.Decimal{Int32(1),Int32(0),Int128}
     Arrow.write(baddecimalio, (d=D[D(Int128(10))],); file=false)
-    @assert _rejects(() -> readstream(take!(baddecimalio)))
-    println("decimal coefficients outside declared precision are rejected ✓")
+    baddec = readstream(take!(baddecimalio))
+    @assert _rejects(() -> AC.validate_full(baddec.schema.fields[1],
+        baddec.batches[1].columns[1]))
+    println("decimal coefficients outside declared precision are validate_full's ✓")
 
     pulled = readstream(bytes)
     @assert nextbatch!(pulled) isa RecordBatch

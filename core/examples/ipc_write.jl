@@ -261,8 +261,6 @@ function metafield!(b::FB.Builder, f::Field, fielddictids::IdDict{Field,Int64})
     valuetype = t
     dictoff = FB.UOffsetT(0)
     if t isa DictionaryType
-        any(_containsdictionary, f.children) &&
-            throw(ValidationError("children of an IPC dictionary field cannot be dictionary encoded"))
         valuetype = t.valuetype
         idxtag, idxoff = metatype!(b, t.indextype)
         idxtag === Meta.Int ||
@@ -540,15 +538,18 @@ Assign one IPC dictionary id per dictionary-typed field, depth-first over the
 schema — the writer-side half of the adapter id table (report §9: ids are
 adapter bookkeeping; Core fields never carry them).
 """
-function assigndictids(fields)
-    ids = IdDict{Field,Int64}()
+function assigndictids(fields, given::IdDict{Field,Int64}=IdDict{Field,Int64}())
+    # `given` lets a caller preserve ids from a source (a reader's table): two
+    # fields sharing one id then share one dictionary batch, exactly as the
+    # source did (4.0.0-shareddict). Fresh ids never collide with given ones.
+    ids = IdDict{Field,Int64}(given)
     seen = IdDict{Field,Nothing}()
-    next = Ref(Int64(0))
+    next = Ref(isempty(given) ? Int64(0) : maximum(values(given)) + 1)
     function walk(f::Field)
         haskey(seen, f) && throw(ValidationError(
             "IPC writer schema reuses one Field object in multiple positions"))
         seen[f] = nothing
-        if f.type isa DictionaryType
+        if f.type isa DictionaryType && !haskey(ids, f)
             ids[f] = next[]
             next[] += 1
         end
@@ -568,6 +569,10 @@ function dictionarypools(fields, cols)
         if f.type isa DictionaryType
             d.dictionary === nothing &&
                 throw(ValidationError("dictionary column carries no pool"))
+            # Post-order: pools nested INSIDE this pool's values are collected
+            # (and therefore emitted) before it — the dependency order the
+            # IPC spec requires for nested dictionary encoding.
+            walk(AC.dictvaluefield(f, f.type), d.dictionary)
             push!(pairs, (f, d.dictionary))
             return
         end
@@ -658,14 +663,14 @@ semantically validated before any of its bytes are emitted — the writer
 refuses to publish data Core would refuse to read.
 """
 function writestream(sch::Schema, batches::AbstractVector{AC.RecordBatch};
-    compress::Symbol=:none)
+    compress::Symbol=:none, dictids::IdDict{Field,Int64}=IdDict{Field,Int64}())
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
         throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
     codec = CODEC_NAMES[compress]
     _checkbatches(sch, batches)
     _validatewriterschema(sch)
-    ids = assigndictids(sch.fields)
+    ids = assigndictids(sch.fields, dictids)
     fielddictids = IdDict{Field,Int64}(ids)
     _validatewriterbatches(sch, batches)
     out = UInt8[]
@@ -692,7 +697,7 @@ function writestream(sch::Schema, batches::AbstractVector{AC.RecordBatch};
 end
 
 writestream(s::IPCStream; compress::Symbol=:none) =
-    writestream(s.schema, s.batches; compress=compress)
+    writestream(s.schema, s.batches; compress=compress, dictids=s.fielddictids)
 
 # ---------------------------------------------------------------------------
 # File format: magic + stream messages + Block index + Footer
@@ -711,14 +716,14 @@ carries exactly one dictionary batch per id, so batches whose pools change
 identity are a clean refusal (the stream format handles replacement).
 """
 function writefile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
-    compress::Symbol=:none)
+    compress::Symbol=:none, dictids::IdDict{Field,Int64}=IdDict{Field,Int64}())
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
         throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
     codec = CODEC_NAMES[compress]
     _checkbatches(sch, batches)
     _validatewriterschema(sch)
-    ids = assigndictids(sch.fields)
+    ids = assigndictids(sch.fields, dictids)
     isempty(_streamfeatures(sch, batches, ids, CODEC_NONE)) ||
         throw(ValidationError("the IPC file format carries one dictionary batch per id; " *
             "changing pools require the stream format"))
@@ -787,7 +792,7 @@ function writefile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
 end
 
 writefile(s::IPCStream; compress::Symbol=:none) =
-    writefile(s.schema, s.batches; compress=compress)
+    writefile(s.schema, s.batches; compress=compress, dictids=s.fielddictids)
 
 # ---------------------------------------------------------------------------
 # File reader: footer verification + lazy random-access batch handle
@@ -1605,8 +1610,13 @@ function main()
     ]
     sharedbatch = AC.RecordBatch(Schema(batchfields),
         ArrayData[dictdata, dictdata], 1)
-    @assert _rejects(() -> writestream(Schema(strictfields), [sharedbatch]))
-    println("dictionary field aliases and shared-pool contract skew are refused ✓")
+    # Field.nullable is advisory at the semantic tier (the gold corpus itself
+    # violates it), so the skewed write is accepted; the strict declaration
+    # is enforced by the opt-in validate_full tier.
+    @assert readstream(writestream(Schema(strictfields), [sharedbatch])) isa IPCStream
+    @assert _rejects(() -> AC.validate_full(strictfields[2], dictdata))
+    @assert AC.validate_full(batchfields[2], dictdata) === dictdata
+    println("dictionary field aliases are refused; contract skew is validate_full's ✓")
 
     # Unions, both modes: 2.x writes them, Core reads and re-encodes them,
     # and 2.x reads this writer's bytes back. The mapped set now matches

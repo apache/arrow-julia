@@ -1105,7 +1105,18 @@ dictvaluefield(f::Field, t::DictionaryType) =
 const MILLISECONDS_PER_DAY = Int64(86_400_000)
 
 _validate_temporal_values(::ArrowType, ::ArrayData) = nothing
-function _validate_temporal_values(t::DateType, d::ArrayData)
+
+# Date64 whole-day divisibility and Decimal precision are ADVISORY in
+# practice: the spec phrases Date64 as "evenly divisible by 86400000" and
+# precision as "total number of decimal digits", but the reference C++
+# implementation neither enforces them on read nor honors them on write — the
+# apache/arrow-testing gold corpus itself carries Date64 values off day
+# boundaries and decimal(3,2) values with five digits. Rejecting those in
+# `validate_semantic` made a conforming reader refuse canonical data, so both
+# checks live in the opt-in `validate_full` tier (`_validate_full_content`),
+# where strict callers can still demand them.
+_validate_advisory_values(::ArrowType, ::ArrayData) = nothing
+function _validate_advisory_values(t::DateType, d::ArrayData)
     t.unit == MILLISECOND_DATE || return nothing
     data = rolebuffer(d, DATA)
     for i = 1:d.len
@@ -1177,8 +1188,7 @@ function _decimal_fits_precision(t::DecimalType, data::BufferSlice, byteoff::Int
     return m1 < L1
 end
 
-_validate_decimal_values(::ArrowType, ::ArrayData) = nothing
-function _validate_decimal_values(t::DecimalType, d::ArrayData)
+function _validate_advisory_values(t::DecimalType, d::ArrayData)
     data = rolebuffer(d, DATA)
     width = Int64(primwidth(t))
     for i = 1:d.len
@@ -1191,7 +1201,9 @@ function _validate_decimal_values(t::DecimalType, d::ArrayData)
     return nothing
 end
 
-function _validate_temporal_values(t::TimeType, d::ArrayData)
+# Time-of-day range is advisory for the same reason as Date64 divisibility:
+# the 1.0.0 gold corpus carries out-of-range Time32 values that C++ reads.
+function _validate_advisory_values(t::TimeType, d::ArrayData)
     units_per_day = t.unit == SECOND ? Int64(86_400) :
         t.unit == MILLISECOND ? MILLISECONDS_PER_DAY :
         t.unit == MICROSECOND ? Int64(86_400_000_000) :
@@ -1294,7 +1306,6 @@ function _validate_semantic_intrinsic(f::Field, d::ArrayData,
         t isa ListViewType && _validate_listview_values(t, d)
         t isa RunEndEncodedType && _validate_ree_values(d)
         _validate_temporal_values(t, d)
-        _validate_decimal_values(t, d)
         actual_nulls = _count_nulls(d)
         declared_nulls = @atomic :monotonic d.nullcount
         if declared_nulls >= 0 && declared_nulls != actual_nulls
@@ -1571,12 +1582,39 @@ function _validate_dictionary_contracts(f::Field, d::ArrayData,
     return nothing
 end
 
+# `Field.nullable` is ADVISORY schema metadata in the ecosystem: the
+# reference C++ implementation neither enforces it on read nor rejects a
+# non-nullable field whose data holds nulls, and the apache/arrow-testing
+# gold corpus carries exactly that (a `nullable=false` union whose selected
+# child is null). The semantic stage therefore validates only the
+# structurally-load-bearing dictionary contracts; the per-slot nullability
+# walk (`_validate_field_contract_at`) runs in the opt-in `validate_full`
+# tier for callers who want the declaration enforced.
 function _validate_field_contracts(f::Field, d::ArrayData,
     validated_dictionaries::Union{Nothing,_ValidatedDictionaries}=nothing)
+    _validate_dictionary_contracts(f, d, validated_dictionaries)
+    return nothing
+end
+
+function _validate_nullability(f::Field, d::ArrayData)
     for i = 1:d.len
         _validate_field_contract_at(f, d, Int64(i))
     end
-    _validate_dictionary_contracts(f, d, validated_dictionaries)
+    # Dictionary pools are independent arrays: their nested Field contracts
+    # apply to every pool value regardless of which indices reference them
+    # (and regardless of masking above the dictionary array), so each pool
+    # gets its own root walk.
+    _validate_pool_nullability(f, d)
+    return nothing
+end
+
+function _validate_pool_nullability(f::Field, d::ArrayData)
+    if d.type isa DictionaryType
+        _validate_nullability(dictvaluefield(f, d.type), d.dictionary::ArrayData)
+    end
+    for (cf, cd) in zip(f.children, d.children)
+        _validate_pool_nullability(cf, cd)
+    end
     return nothing
 end
 
@@ -1588,11 +1626,16 @@ structural) validation before the more expensive whole-content checks.
 """
 function validate_full(f::Field, d::ArrayData)
     validate_semantic(f, d)
+    # The nullability walk enters ONCE at the root: it routes through
+    # unions/REE and applies parent-null masking itself, so recursing it per
+    # child would flag masked slots that are not part of any logical value.
+    _validate_nullability(f, d)
     _validate_full_content(f, d)
     return d
 end
 
 function _validate_full_content(f::Field, d::ArrayData)
+    _validate_advisory_values(d.type, d)
     if d.type isa Utf8Type || (d.type isa ViewType && d.type.utf8)
         for i = 1:d.len
             isvalid_at(d, i) || continue
