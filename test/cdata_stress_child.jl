@@ -14,22 +14,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-name = "Arrow"
-uuid = "69666777-d1a9-59fb-9406-91d4454c9d45"
-authors = ["quinnj <quinn.jacobd@gmail.com>"]
-version = "3.0.0-DEV"
+# Four-thread child the C Data battery re-execs for its concurrency stress
+# (a fresh process so thread count and lifecycle state start clean).
+module CdataStressChild
 
-[deps]
-Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
-CodecLz4 = "5ba52731-8f18-5e0d-9241-30f10d1ec561"
-CodecZstd = "6b39b394-51ab-5f42-8807-6242bab2b4c2"
-EnumX = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
-Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
-Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
+using Test
+using Tables
+import Base64
+using Arrow
 
-[compat]
-CodecLz4 = "0.4"
-CodecZstd = "0.7, 0.8"
-EnumX = "1"
-Tables = "1.1"
-julia = "1.12"
+for n in union(names(Arrow; all=true), names(Arrow.ArrowCore))
+    sn = String(n)
+    (startswith(sn, "#") || n in (:eval, :include, :Arrow)) && continue
+    isdefined(Arrow, n) || continue
+    @eval const $n = Arrow.$n
+end
+
+include("battery_helpers.jl")
+include("cdata_battery.jl")
+
+_threaded_cdata_stress()
+
+end # module

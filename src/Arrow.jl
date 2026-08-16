@@ -15,130 +15,70 @@
 # limitations under the License.
 
 """
-    Arrow.jl
+    Arrow.jl 3.0 — a ground-up rewrite of the Apache Arrow implementation.
 
-A pure Julia implementation of the [apache arrow](https://arrow.apache.org/) memory format specification.
+The engine layering (docs/dev/core-README.md documents each layer in depth):
 
-This implementation supports the 1.0 version of the specification, including support for:
-  * All primitive data types
-  * All nested data types
-  * Dictionary encodings, nested dictionary encodings, and messages
-  * Extension types
-  * Streaming, file, record batch, and replacement and isdelta dictionary messages
-  * Buffer compression/decompression via the standard LZ4 frame and Zstd formats
+- `ArrowCore` (private): ownership regions, layout registry, `ArrayData`,
+  staged validation, accessors — the trim-friendly, dependency-free core.
+- `Meta`: FlatBuffers metadata bindings AND the shape verifier, both
+  GENERATED from the vendored spec schemas (`src/metadata/fbs/`, generator
+  `tools/fbsgen.jl`) over the vendored `FlatBuffers` runtime.
+- IPC adapters (`ipc_read.jl`, `ipc_write.jl`): stream and file formats,
+  framing, resource limits, compression, dictionary lifecycles.
+- `cdata.jl`: the C data interface, import and export, with lifecycle
+  accounting.
+- `scan.jl`: `Tables.Scan` pushdown over byte ranges plus footer-carried
+  statistics pruning.
 
-It currently doesn't include support for:
-  * Tensors or sparse tensors
-  * Flight RPC
-  * C data interface
-
-Third-party data formats:
-  * csv and parquet support via the existing [CSV.jl](https://github.com/JuliaData/CSV.jl) and [Parquet.jl](https://github.com/JuliaIO/Parquet.jl) packages
-  * Other [Tables.jl](https://github.com/JuliaData/Tables.jl)-compatible packages automatically supported ([DataFrames.jl](https://github.com/JuliaData/DataFrames.jl), [JSONTables.jl](https://github.com/JuliaData/JSONTables.jl), [JuliaDB.jl](https://github.com/JuliaData/JuliaDB.jl), [SQLite.jl](https://github.com/JuliaDatabases/SQLite.jl), [MySQL.jl](https://github.com/JuliaDatabases/MySQL.jl), [JDBC.jl](https://github.com/JuliaDatabases/JDBC.jl), [ODBC.jl](https://github.com/JuliaDatabases/ODBC.jl), [XLSX.jl](https://github.com/felipenoris/XLSX.jl), etc.)
-  * No current Julia packages support ORC or Avro data formats
-
-See docs for official Arrow.jl API with the [User Manual](@ref) and reference docs for [`Arrow.Table`](@ref), [`Arrow.write`](@ref), and [`Arrow.Stream`](@ref).
+The user-facing facade (`Arrow.Table`, `Arrow.Stream`, builders, ViewPlan)
+is the next arc of the rewrite; until it lands, the adapter entry points
+(`readstream`, `writestream`, `readfile`, `writefile`) are the surface,
+exercised by the test batteries, the arrow-testing conformance corpus, and
+the pyarrow/nanoarrow oracle suite under `conformance/`.
 """
 module Arrow
 
-using Base.Iterators
-using Mmap
-import Dates
-using DataAPI,
-    Tables,
-    SentinelArrays,
-    PooledArrays,
-    CodecLz4,
-    CodecZstd,
-    TimeZones,
-    BitIntegers,
-    ConcurrentUtilities,
-    StringViews
+using Tables
+using EnumX
+import Base64
+import Mmap
+import CodecLz4
+import CodecZstd
+using CodecLz4: LZ4FrameCompressor
+using CodecZstd: ZstdCompressor
 
-export ArrowTypes
+const CLZ4 = CodecLz4
+const CZSTD = CodecZstd
+const ZSTD = CZSTD.LibZstd
+const TS = CLZ4.TranscodingStreams
 
-using Base: @propagate_inbounds
-import Base: ==
+isdefined(Tables, :Scan) ||
+    error("Arrow 3.0's scan support needs Tables.jl's `Tables.Scan` " *
+          "interface; upgrade Tables.jl (or dev the `jq/scan` branch)")
 
-const FILE_FORMAT_MAGIC_BYTES = b"ARROW1"
-const CONTINUATION_INDICATOR_BYTES = 0xffffffff
+include(joinpath("FlatBuffers", "FlatBuffers.jl"))
+const FB = FlatBuffers
 
-# vendored flatbuffers code for now
-include("FlatBuffers/FlatBuffers.jl")
-using .FlatBuffers
-
-include("metadata/Flatbuf.jl")
-using .Flatbuf
-const Meta = Flatbuf
-
-using ArrowTypes
-include("utils.jl")
-include("arraytypes/arraytypes.jl")
-include("eltypes.jl")
-include("table.jl")
-include("write.jl")
-include("append.jl")
-include("show.jl")
-
-const ZSTD_COMPRESSOR = Lockable{ZstdCompressor}[]
-const ZSTD_DECOMPRESSOR = Lockable{ZstdDecompressor}[]
-const LZ4_FRAME_COMPRESSOR = Lockable{LZ4FrameCompressor}[]
-const LZ4_FRAME_DECOMPRESSOR = Lockable{LZ4FrameDecompressor}[]
-
-function init_zstd_compressor()
-    zstd = ZstdCompressor(; level=3)
-    CodecZstd.TranscodingStreams.initialize(zstd)
-    return Lockable(zstd)
+# Generated metadata bindings + shape verifier (regenerate with
+# `julia tools/fbsgen.jl src/metadata/fbs src/metadata`).
+module Meta
+    using EnumX
+    using ..FlatBuffers
+    include(joinpath("metadata", "Schema.jl"))
+    include(joinpath("metadata", "File.jl"))
+    include(joinpath("metadata", "Message.jl"))
+    include(joinpath("metadata", "VerifierRuntime.jl"))
+    include(joinpath("metadata", "Verifier.jl"))
 end
 
-function init_zstd_decompressor()
-    zstd = ZstdDecompressor()
-    CodecZstd.TranscodingStreams.initialize(zstd)
-    return Lockable(zstd)
-end
+include("ArrowCore.jl")
+using .ArrowCore
+const AC = ArrowCore
 
-function init_lz4_frame_compressor()
-    lz4 = LZ4FrameCompressor(; compressionlevel=4)
-    CodecLz4.TranscodingStreams.initialize(lz4)
-    return Lockable(lz4)
-end
+include("ipc_read.jl")
+include("ipc_write.jl")
+include("cdata.jl")
+include("scan.jl")
 
-function init_lz4_frame_decompressor()
-    lz4 = LZ4FrameDecompressor()
-    CodecLz4.TranscodingStreams.initialize(lz4)
-    return Lockable(lz4)
-end
-
-function access_threaded(f, v::Vector)
-    tid = Threads.threadid()
-    0 < tid <= length(v) || _length_assert()
-    if @inbounds isassigned(v, tid)
-        @inbounds x = v[tid]
-    else
-        x = f()
-        @inbounds v[tid] = x
-    end
-    return x
-end
-@noinline _length_assert() = @assert false "0 < tid <= v"
-
-zstd_compressor() = access_threaded(init_zstd_compressor, ZSTD_COMPRESSOR)
-zstd_decompressor() = access_threaded(init_zstd_decompressor, ZSTD_DECOMPRESSOR)
-lz4_frame_compressor() = access_threaded(init_lz4_frame_compressor, LZ4_FRAME_COMPRESSOR)
-lz4_frame_decompressor() =
-    access_threaded(init_lz4_frame_decompressor, LZ4_FRAME_DECOMPRESSOR)
-
-function __init__()
-    nt = @static if isdefined(Base.Threads, :maxthreadid)
-        Threads.maxthreadid()
-    else
-        Threads.nthreads()
-    end
-    resize!(empty!(LZ4_FRAME_COMPRESSOR), nt)
-    resize!(empty!(ZSTD_COMPRESSOR), nt)
-    resize!(empty!(LZ4_FRAME_DECOMPRESSOR), nt)
-    resize!(empty!(ZSTD_DECOMPRESSOR), nt)
-    return
-end
-
-end  # module Arrow
+end # module Arrow
