@@ -45,13 +45,14 @@ import Base64
 import Mmap
 import CodecLz4
 import CodecZstd
+import TranscodingStreams
 using CodecLz4: LZ4FrameCompressor
 using CodecZstd: ZstdCompressor
 
 const CLZ4 = CodecLz4
 const CZSTD = CodecZstd
 const ZSTD = CZSTD.LibZstd
-const TS = CLZ4.TranscodingStreams
+const TS = TranscodingStreams
 
 isdefined(Tables, :Scan) ||
     error("Arrow 3.0's scan support needs Tables.jl's `Tables.Scan` " *
