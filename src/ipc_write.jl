@@ -55,8 +55,8 @@
 # =============================================================================
 
 
-# TranscodingStreams comes through the codec packages (it is not a direct
-# repo dependency); both codecs share one streams API.
+# TranscodingStreams is a direct dependency; both codecs share its one
+# streams API.
 
 # ---------------------------------------------------------------------------
 # Encode-side codec state: per-writer objects, explicitly finalized
