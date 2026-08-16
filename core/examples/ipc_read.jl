@@ -139,6 +139,28 @@ const CONTINUATION = 0xFFFFFFFF
 const EXPERIMENTAL_COMPRESSION_KEY = "ARROW:experimental_compression"
 
 # ---------------------------------------------------------------------------
+# 2.x-written fixtures: bytes the OLD package wrote, frozen to disk so 3.0
+# keeps proving it reads what deployed 2.x writers produced. While 2.x is
+# still importable, ARROW_FIXTURE_MODE=record runs each site's closure (the
+# original 2.x write, kept inline as provenance) and snapshots its bytes;
+# the default replay mode never executes the closure — it reads the frozen
+# file, so the closures may reference APIs that no longer exist.
+# ---------------------------------------------------------------------------
+const FIXTURES2X_DIR = Ref(joinpath(@__DIR__, "..", "test", "fixtures2x"))
+function _fixture2x(write2x::F, name::String) where {F}
+    path = joinpath(FIXTURES2X_DIR[], name * ".arrowbytes")
+    if get(ENV, "ARROW_FIXTURE_MODE", "") == "record"
+        bytes = write2x()::Vector{UInt8}
+        mkpath(dirname(path))
+        write(path, bytes)
+        return bytes
+    end
+    isfile(path) || error("missing 2.x fixture $name — regenerate against " *
+        "a 2.x checkout with ARROW_FIXTURE_MODE=record")
+    return read(path)
+end
+
+# ---------------------------------------------------------------------------
 # FlatBuffers verification (generated walkers over a schema-blind runtime)
 # ---------------------------------------------------------------------------
 
@@ -1345,14 +1367,18 @@ end
 
 function _dictionary_replacement_stream()
     id = Int64(7)
-    firstio = IOBuffer()
-    Arrow.write(firstio,
-        (d=Arrow.DictEncode(["aa", "bb", "aa"], id),); file=false)
-    firstbytes = take!(firstio)
-    secondio = IOBuffer()
-    Arrow.write(secondio,
-        (d=Arrow.DictEncode(["xx", "yy", "xx"], id),); file=false)
-    secondbytes = take!(secondio)
+    firstbytes = _fixture2x("dict-replacement-first") do
+        firstio = IOBuffer()
+        Arrow.write(firstio,
+            (d=Arrow.DictEncode(["aa", "bb", "aa"], id),); file=false)
+        take!(firstio)
+    end
+    secondbytes = _fixture2x("dict-replacement-second") do
+        secondio = IOBuffer()
+        Arrow.write(secondio,
+            (d=Arrow.DictEncode(["xx", "yy", "xx"], id),); file=false)
+        take!(secondio)
+    end
     firstframes = _frameinfo(firstbytes)
     secondframes = _frameinfo(secondbytes)
     frameof(frames, bytes, kind) = bytes[only(x.frame for x in frames if x.kind == kind)]
@@ -1533,9 +1559,11 @@ function _misaligned_empty_buffers_stream()
     # structs whose nominal element area is four-byte aligned. Relocate the
     # empty buffers vector from a 2.x-written zero-row Null batch to reproduce
     # that valid encoding without carrying a binary fixture in this example.
-    io = IOBuffer()
-    Arrow.write(io, (x=Missing[],); file=false)
-    bytes = take!(io)
+    bytes = _fixture2x("null-column-zero-rows") do
+        io = IOBuffer()
+        Arrow.write(io, (x=Missing[],); file=false)
+        take!(io)
+    end
     frames = _frameinfo(bytes)
     schemaidx = only(findall(x -> x.kind == 1, frames))
     recordidx = only(findall(x -> x.kind == 3, frames))
@@ -1669,9 +1697,11 @@ function main()
         dict=Arrow.DictEncode(["lo", "hi", "lo", missing, "hi"]),
     )
     # Two partitions -> two record batches (plus dictionary batches).
-    io = IOBuffer()
-    Arrow.write(io, Tables.partitioner([expected, expected]); file=false)
-    bytes = take!(io)
+    bytes = _fixture2x("mixed-two-partitions") do
+        io = IOBuffer()
+        Arrow.write(io, Tables.partitioner([expected, expected]); file=false)
+        take!(io)
+    end
     println("2.x-written stream: $(length(bytes)) bytes")
 
     stream = readstream(bytes)
@@ -1719,10 +1749,12 @@ function main()
     # size must match the declaration, and every decompressed buffer lives in
     # its own exact-sized owned region.
     for (codecname, kw) in (("lz4", :lz4), ("zstd", :zstd))
-        cio = IOBuffer()
-        Arrow.write(cio, Tables.partitioner([expected, expected]);
-            file=false, compress=kw)
-        cbytes = take!(cio)
+        cbytes = _fixture2x("mixed-two-partitions-$(codecname)") do
+            cio = IOBuffer()
+            Arrow.write(cio, Tables.partitioner([expected, expected]);
+                file=false, compress=kw)
+            take!(cio)
+        end
         cstream = readstream(cbytes)
         @assert length(cstream.batches) == 2
         for b in cstream.batches
@@ -1819,9 +1851,11 @@ function main()
     # The schema feature is standard in V5. Arrow.jl 2.x omits it from its
     # compressed output, which this adapter accepts for compatibility. A
     # standards-conforming stream that declares it must also be accepted.
-    simpleio = IOBuffer()
-    Arrow.write(simpleio, (x=Int64[1, 2, 3],); file=false, compress=:zstd)
-    simplebytes = take!(simpleio)
+    simplebytes = _fixture2x("int64-three-zstd") do
+        simpleio = IOBuffer()
+        Arrow.write(simpleio, (x=Int64[1, 2, 3],); file=false, compress=:zstd)
+        take!(simpleio)
+    end
     simpleframes = _frameinfo(simplebytes)
     standardschema = _int64_schema_stream(Int64[2])
     resize!(standardschema, length(standardschema) - 8)
@@ -1845,20 +1879,29 @@ function main()
     # The allocation limit is reader-wide. It does not reset for each eager
     # batch retained by IPCStream.
     large = (x=zeros(Int64, 10_000),)
-    oneio = IOBuffer()
-    Arrow.write(oneio, large; file=false, compress=:zstd)
+    onebytes = _fixture2x("large-zeros-zstd") do
+        oneio = IOBuffer()
+        Arrow.write(oneio, large; file=false, compress=:zstd)
+        take!(oneio)
+    end
     aggregate_limit = Limits(max_total_allocated_bytes=100_000)
-    @assert length(readstream(take!(oneio); limits=aggregate_limit).batches) == 1
-    twoio = IOBuffer()
-    Arrow.write(twoio, Tables.partitioner([large, large]);
-        file=false, compress=:zstd)
-    @assert _rejects(() -> readstream(take!(twoio); limits=aggregate_limit))
+    @assert length(readstream(onebytes; limits=aggregate_limit).batches) == 1
+    twobytes = _fixture2x("large-zeros-zstd-two-partitions") do
+        twoio = IOBuffer()
+        Arrow.write(twoio, Tables.partitioner([large, large]);
+            file=false, compress=:zstd)
+        take!(twoio)
+    end
+    @assert _rejects(() -> readstream(twobytes; limits=aggregate_limit))
     println("metadata and decompressed bytes share one reader-wide budget ✓")
 
     for kw in (:lz4, :zstd)
-        emptyio = IOBuffer()
-        Arrow.write(emptyio, (x=Int64[],); file=false, compress=kw)
-        emptystream = readstream(take!(emptyio))
+        emptycompressed = _fixture2x("int64-empty-$(kw)") do
+            emptyio = IOBuffer()
+            Arrow.write(emptyio, (x=Int64[],); file=false, compress=kw)
+            take!(emptyio)
+        end
+        emptystream = readstream(emptycompressed)
         @assert isempty(materialize(emptystream.schema.fields[1],
             emptystream.batches[1].columns[1]))
     end
@@ -1868,10 +1911,13 @@ function main()
     # precision. Precision is advisory at the semantic boundary (the gold
     # corpus itself carries five digits in a decimal(3,2)); the opt-in
     # validate_full tier enforces the declaration.
-    baddecimalio = IOBuffer()
-    D = Arrow.Decimal{Int32(1),Int32(0),Int128}
-    Arrow.write(baddecimalio, (d=D[D(Int128(10))],); file=false)
-    baddec = readstream(take!(baddecimalio))
+    baddecbytes = _fixture2x("decimal-over-precision") do
+        baddecimalio = IOBuffer()
+        D = Arrow.Decimal{Int32(1),Int32(0),Int128}
+        Arrow.write(baddecimalio, (d=D[D(Int128(10))],); file=false)
+        take!(baddecimalio)
+    end
+    baddec = readstream(baddecbytes)
     @assert _rejects(() -> AC.validate_full(baddec.schema.fields[1],
         baddec.batches[1].columns[1]))
     println("decimal coefficients outside declared precision are validate_full's ✓")
@@ -2047,9 +2093,11 @@ function main()
     end
     @assert _rejects(() -> readstream(negativebuffer))
 
-    overlapio = IOBuffer()
-    Arrow.write(overlapio, (x=Int64[1], y=Int64[2]); file=false)
-    overlap = take!(overlapio)
+    overlap = _fixture2x("two-int64-columns") do
+        overlapio = IOBuffer()
+        Arrow.write(overlapio, (x=Int64[1], y=Int64[2]); file=false)
+        take!(overlapio)
+    end
     overlaprecord = findfirst(x -> x.kind == 3, _frameinfo(overlap))
     _mutatemessage!(overlap, overlaprecord) do meta, msg
         rb = _headertable(meta, msg)
@@ -2095,11 +2143,14 @@ function main()
     println("dictionary replacement is feature-gated and snapshots stay immutable ✓")
 
     nestedvals = [[Int64(1), 2], [3]]
-    sharedio = IOBuffer()
-    Arrow.write(sharedio,
-        (a=Arrow.DictEncode(nestedvals, 7), b=Arrow.DictEncode(nestedvals, 7));
-        file=false)
-    sharedstream = readstream(take!(sharedio))
+    sharedbytes = _fixture2x("shared-nested-dict") do
+        sharedio = IOBuffer()
+        Arrow.write(sharedio,
+            (a=Arrow.DictEncode(nestedvals, 7), b=Arrow.DictEncode(nestedvals, 7));
+            file=false)
+        take!(sharedio)
+    end
+    sharedstream = readstream(sharedbytes)
     for i = 1:2
         @assert materialize(sharedstream.schema.fields[i],
             sharedstream.batches[1].columns[i]) == nestedvals
@@ -2115,10 +2166,12 @@ function main()
     @assert length(sharedvalidated) == 1
     println("shared dictionary ids reuse one full pool certificate ✓")
 
-    pool = PooledArray(Union{Missing,String}[missing, "x"])
-    poolio = IOBuffer()
-    Arrow.write(poolio, (d=Arrow.DictEncode(view(pool, 2:2)),); file=false)
-    poolbytes = take!(poolio)
+    poolbytes = _fixture2x("pooled-view-dict") do
+        pool = PooledArray(Union{Missing,String}[missing, "x"])
+        poolio = IOBuffer()
+        Arrow.write(poolio, (d=Arrow.DictEncode(view(pool, 2:2)),); file=false)
+        take!(poolio)
+    end
     _mutatemessage!(poolbytes, 1) do meta, msg
         schema = _headertable(meta, msg)
         start, n = _vvector(schema, 1, 4; required=true)
@@ -2137,10 +2190,12 @@ function main()
         poolstream.batches[1].columns[1]) == ["x"]
     println("dictionary pool nullability is independent from index fields ✓")
 
-    nullio = IOBuffer()
     nullvalues = Union{Missing,String}[missing, missing]
-    Arrow.write(nullio, (d=Arrow.DictEncode(nullvalues),); file=false)
-    nullbytes = take!(nullio)
+    nullbytes = _fixture2x("all-null-dict") do
+        nullio = IOBuffer()
+        Arrow.write(nullio, (d=Arrow.DictEncode(nullvalues),); file=false)
+        take!(nullio)
+    end
     nullframes = _frameinfo(nullbytes)
     nschema = findfirst(x -> x.kind == 1, nullframes)
     ndict = findfirst(x -> x.kind == 2, nullframes)
@@ -2159,17 +2214,22 @@ function main()
 
     # The 2.x writer omits Map.keysSorted when false. The generated getter
     # returns `nothing`; the adapter must apply the FlatBuffers default.
-    mapio = IOBuffer()
-    Arrow.write(mapio, (m=[Dict("a" => Int64(1))],); file=false)
-    mapstream = readstream(take!(mapio))
+    mapbytes = _fixture2x("map-default-keyssorted") do
+        mapio = IOBuffer()
+        Arrow.write(mapio, (m=[Dict("a" => Int64(1))],); file=false)
+        take!(mapio)
+    end
+    mapstream = readstream(mapbytes)
     mf = mapstream.schema.fields[1]
     @assert mf.type == MapType(false)
     @assert materialize(mf, mapstream.batches[1].columns[1]) == [["a" => 1]]
     println("valid 2.x Map streams decode with default keysSorted=false ✓")
 
-    emptyio = IOBuffer()
-    Arrow.write(emptyio, (x=Int64[1, 2, 3],); file=false)
-    emptybytes = take!(emptyio)
+    emptybytes = _fixture2x("int64-three") do
+        emptyio = IOBuffer()
+        Arrow.write(emptyio, (x=Int64[1, 2, 3],); file=false)
+        take!(emptyio)
+    end
     emptyframes = _frameinfo(emptybytes)
     emptyrecord = findfirst(x -> x.kind == 3, emptyframes)
     emptyrecord === nothing && error("empty-schema fixture has no record batch")
@@ -2203,26 +2263,35 @@ function main()
         limits=Limits(max_array_length=1)))
     println("zero-column batches retain their explicit row count ✓")
 
-    emptyrecordio = IOBuffer()
-    Arrow.write(emptyrecordio, (x=Int64[],); file=false)
-    emptyrecordstream = readstream(take!(emptyrecordio))
+    emptyrecordbytes = _fixture2x("int64-empty") do
+        emptyrecordio = IOBuffer()
+        Arrow.write(emptyrecordio, (x=Int64[],); file=false)
+        take!(emptyrecordio)
+    end
+    emptyrecordstream = readstream(emptyrecordbytes)
     @assert emptyrecordstream.batches[1].nrows == 0
     @assert isempty(materialize(emptyrecordstream.schema.fields[1],
         emptyrecordstream.batches[1].columns[1]))
 
-    emptydictio = IOBuffer()
-    Arrow.write(emptydictio, (d=Arrow.DictEncode(String[]),); file=false)
-    emptydictstream = readstream(take!(emptydictio))
+    emptydictbytes = _fixture2x("empty-dict") do
+        emptydictio = IOBuffer()
+        Arrow.write(emptydictio, (d=Arrow.DictEncode(String[]),); file=false)
+        take!(emptydictio)
+    end
+    emptydictstream = readstream(emptydictbytes)
     @assert emptydictstream.batches[1].nrows == 0
     @assert isempty(materialize(emptydictstream.schema.fields[1],
         emptydictstream.batches[1].columns[1]))
     println("omitted zero-length record and dictionary lengths use defaults ✓")
 
-    metaio = IOBuffer()
-    Arrow.write(metaio, (x=Int64[1],); file=false,
-        metadata=Dict("owner" => "jacob"),
-        colmetadata=Dict(:x => Dict("unit" => "count")))
-    metastream = readstream(take!(metaio))
+    metabytes2x = _fixture2x("schema-field-metadata") do
+        metaio = IOBuffer()
+        Arrow.write(metaio, (x=Int64[1],); file=false,
+            metadata=Dict("owner" => "jacob"),
+            colmetadata=Dict(:x => Dict("unit" => "count")))
+        take!(metaio)
+    end
+    metastream = readstream(metabytes2x)
     @assert Dict(metastream.schema.metadata) == Dict("owner" => "jacob")
     @assert Dict(metastream.schema.fields[1].metadata) == Dict("unit" => "count")
     println("schema and field metadata are preserved ✓")

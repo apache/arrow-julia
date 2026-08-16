@@ -1412,29 +1412,6 @@ function _assert_stream_equal(a, b)
     return nothing
 end
 
-function _assert_2x_reads(bytes::Vector{UInt8}, stream)
-    tbl = Arrow.Table(IOBuffer(bytes))
-    cols = Tables.columns(tbl)
-    names = Tables.columnnames(cols)
-    @assert length(names) == length(stream.schema.fields)
-    total = [reduce(vcat, [collect(Any, materialize(f, b.columns[i]))
-                           for b in stream.batches]; init=Any[])
-             for (i, f) in enumerate(stream.schema.fields)]
-    for (i, name) in enumerate(names)
-        got = collect(Any, Tables.getcolumn(cols, name))
-        want = total[i]
-        # 2.x materializes structs as NamedTuples; Core scalars are ordered
-        # pairs. Compare through one canonical form.
-        canon(x) = x isa NamedTuple ? [String(k) => canon(v) for (k, v) in pairs(x)] :
-            x isa AbstractVector{<:Pair} ? [k => canon(v) for (k, v) in x] :
-            x isa AbstractVector ? Any[canon(v) for v in x] :
-            x isa AbstractDict ? sort!([k => canon(v) for (k, v) in x]; by=first) :
-            x
-        @assert isequal(canon.(got), canon.(want)) "2.x column $name mismatch"
-    end
-    return nothing
-end
-
 function main()
     # The same fixture table the read acceptance uses: 2.x writes it, Core
     # decodes it, and from here on the WRITER is the system under test.
@@ -1447,9 +1424,11 @@ function main()
         structs=[(a=1, b="x"), (a=2, b="y"), (a=3, b="z"), (a=4, b="w"), (a=5, b="v")],
         dict=Arrow.DictEncode(["lo", "hi", "lo", missing, "hi"]),
     )
-    io = IOBuffer()
-    Arrow.write(io, Tables.partitioner([expected, expected]); file=false)
-    source = readstream(take!(io))
+    source = readstream(_fixture2x("mixed-two-partitions") do
+        io = IOBuffer()
+        Arrow.write(io, Tables.partitioner([expected, expected]); file=false)
+        take!(io)
+    end)
 
     # Stream round-trip: our writer -> our reader.
     bytes = writestream(source)
@@ -1457,9 +1436,6 @@ function main()
     _assert_stream_equal(source, roundtrip)
     println("writer -> reader stream round-trip ✓")
 
-    # Stream interop: our writer -> Arrow.jl 2.x.
-    _assert_2x_reads(bytes, source)
-    println("2.x reads this writer's stream ✓")
 
     # The dictionary batch is emitted once: the second batch reuses the same
     # pool snapshot, so no replacement message and no feature declaration.
@@ -1473,19 +1449,20 @@ function main()
         cbytes = writestream(source; compress=codec)
         cstream = readstream(cbytes)
         _assert_stream_equal(source, cstream)
-        _assert_2x_reads(cbytes, source)
         # The compression feature is declared (standards-conforming; 2.x
         # omits it and the reader accepts both).
         cframes = framemessages(heapregion(copy(cbytes)))
         @assert Int64(2) in cframes[1].features
-        println("$(codec)-compressed writer stream round-trips (Core + 2.x) ✓")
+        println("$(codec)-compressed writer stream round-trips ✓")
     end
 
     # Incompressible buffers fall back to the -1 stored-raw prefix.
-    rng_bytes = Vector{UInt8}(reinterpret(UInt8, hash.(1:4096)))
-    rawio = IOBuffer()
-    Arrow.write(rawio, (x=rng_bytes,); file=false)
-    rawsource = readstream(take!(rawio))
+    rawsource = readstream(_fixture2x("incompressible-bytes") do
+        rng_bytes = Vector{UInt8}(reinterpret(UInt8, hash.(1:4096)))
+        rawio = IOBuffer()
+        Arrow.write(rawio, (x=rng_bytes,); file=false)
+        take!(rawio)
+    end)
     rawbytes = writestream(rawsource; compress=:lz4)
     rawstream = readstream(rawbytes)
     _assert_stream_equal(rawsource, rawstream)
@@ -1514,8 +1491,9 @@ function main()
     @assert isempty(schemaonlystream.batches)
     @assert isempty(framemessages(heapregion(copy(writestream(emptysch,
         AC.RecordBatch[]; compress=:zstd))))[1].features)
-    zerorow = readstream(writestream(readstream(
-        let z = IOBuffer(); Arrow.write(z, (x=Int64[],); file=false); take!(z) end)))
+    zerorow = readstream(writestream(readstream(_fixture2x("int64-empty") do
+        z = IOBuffer(); Arrow.write(z, (x=Int64[],); file=false); take!(z)
+    end)))
     @assert zerorow.batches[1].nrows == 0
     println("schema-only streams do not overdeclare compression; zero rows round-trip ✓")
 
@@ -1548,11 +1526,13 @@ function main()
     println("empty IPC offset arrays: written with one terminal zero, read with none ✓")
 
     # Schema and field metadata round-trip through the writer.
-    mio = IOBuffer()
-    Arrow.write(mio, (x=Int64[1],); file=false,
-        metadata=Dict("owner" => "jacob"),
-        colmetadata=Dict(:x => Dict("unit" => "count")))
-    msource = readstream(take!(mio))
+    msource = readstream(_fixture2x("schema-field-metadata") do
+        mio = IOBuffer()
+        Arrow.write(mio, (x=Int64[1],); file=false,
+            metadata=Dict("owner" => "jacob"),
+            colmetadata=Dict(:x => Dict("unit" => "count")))
+        take!(mio)
+    end)
     mstream = readstream(writestream(msource))
     @assert Dict(mstream.schema.metadata) == Dict("owner" => "jacob")
     @assert Dict(mstream.schema.fields[1].metadata) == Dict("unit" => "count")
@@ -1679,18 +1659,19 @@ function main()
     # view layouts and REE that Arrow.jl 2.x cannot yet emit.
     sparsebytes = UInt8[]
     for (modename, dense) in (("dense", true), ("sparse", false))
-        uio = IOBuffer()
-        Arrow.write(uio, (u=Union{Int64,String}[1, "x", 2, "y"],);
-            file=false, denseunions=dense)
-        usource = readstream(take!(uio))
+        usource = readstream(_fixture2x("union-$(modename)") do
+            uio = IOBuffer()
+            Arrow.write(uio, (u=Union{Int64,String}[1, "x", 2, "y"],);
+                file=false, denseunions=dense)
+            take!(uio)
+        end)
         ut = usource.schema.fields[1].type
         @assert ut isa UnionType
         @assert (ut.mode == AC.DenseMode) == dense
         ubytes = writestream(usource)
         dense || (sparsebytes = copy(ubytes))
         _assert_stream_equal(usource, readstream(ubytes))
-        _assert_2x_reads(ubytes, usource)
-        println("$(modename) unions round-trip (Core + 2.x) ✓")
+        println("$(modename) unions round-trip ✓")
     end
 
     # IPC sparse-union children have exactly the parent length. Core allows a
@@ -1778,18 +1759,19 @@ function main()
     end
     println("writer -> readfile random-access round-trip ✓")
 
-    # 2.x reads our file; we read a 2.x file.
-    filetbl = Arrow.Table(IOBuffer(copy(filebytes)))
-    @assert length(Tables.getcolumn(Tables.columns(filetbl), 1)) == 10
-    fio = IOBuffer()
-    Arrow.write(fio, Tables.partitioner([expected, expected]); file=true)
-    theirs = readfile(take!(fio))
+    # We read a 2.x-written file (the reverse direction — other
+    # implementations reading OUR bytes — is the oracle suite's job).
+    theirs = readfile(_fixture2x("mixed-two-partitions-file") do
+        fio = IOBuffer()
+        Arrow.write(fio, Tables.partitioner([expected, expected]); file=true)
+        take!(fio)
+    end)
     @assert length(theirs) == 2
     for i = 1:2, (j, f) in enumerate(theirs.schema.fields)
         @assert isequal(collect(Any, materialize(f, theirs[i].columns[j])),
             collect(Any, materialize(f, source.batches[i].columns[j])))
     end
-    println("file interop holds in both directions with 2.x ✓")
+    println("2.x-written files read back ✓")
 
     # Compressed file round-trip.
     zfilebytes = writefile(source; compress=:zstd)

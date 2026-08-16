@@ -1587,9 +1587,11 @@ function _scan_main()
         structs=[(a=1, b="x"), (a=2, b="y"), (a=3, b="z"), (a=4, b="w"), (a=5, b="v")],
         dict=Arrow.DictEncode(["lo", "hi", "lo", missing, "hi"]),
     )
-    io = IOBuffer()
-    Arrow.write(io, Tables.partitioner([expected, expected]); file=false)
-    source = readstream(take!(io))
+    source = readstream(_fixture2x("mixed-two-partitions") do
+        io = IOBuffer()
+        Arrow.write(io, Tables.partitioner([expected, expected]); file=false)
+        take!(io)
+    end)
     filebytes = writefile(source)
     af = readfile(copy(filebytes))
     full = _fulltable(af)
@@ -1706,10 +1708,12 @@ function _scan_main()
     # RecordBatch length agrees with every top-level FieldNode. Otherwise a
     # corrupt skipped batch can shift the window and return valid but wrong
     # rows from a later batch.
-    xio = IOBuffer()
-    Arrow.write(xio, Tables.partitioner([(x=collect(Int64, 1:5),),
-        (x=collect(Int64, 6:10),)]); file=false)
-    xbytes = writefile(readstream(take!(xio)))
+    xbytes = writefile(readstream(_fixture2x("int64-two-batches") do
+        xio = IOBuffer()
+        Arrow.write(xio, Tables.partitioner([(x=collect(Int64, 1:5),),
+            (x=collect(Int64, 6:10),)]); file=false)
+        take!(xio)
+    end))
     badrows = copy(xbytes)
     xfile = readfile(copy(xbytes))
     block = xfile.recordblocks[1]
@@ -1849,12 +1853,14 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     # column must fetch a small fraction of what the full scan fetches.
     n = 20_000
     fat(i) = string("padding-padding-padding-padding-padding-", i)
-    bigio = IOBuffer()
-    Arrow.write(bigio, Tables.partitioner([
-        (a=collect(Int64, 1:n), b=[fat(i) for i = 1:n]),
-        (a=collect(Int64, (n + 1):2n), b=[fat(i) for i = (n + 1):2n])]);
-        file=false)
-    bigbytes = writefile(readstream(take!(bigio)))
+    bigbytes = writefile(readstream(_fixture2x("wide-two-batches") do
+        bigio = IOBuffer()
+        Arrow.write(bigio, Tables.partitioner([
+            (a=collect(Int64, 1:n), b=[fat(i) for i = 1:n]),
+            (a=collect(Int64, (n + 1):2n), b=[fat(i) for i = (n + 1):2n])]);
+            file=false)
+        take!(bigio)
+    end))
     logall, srcall = countingsource(bigbytes)
     Tables.scan(RangedFile(srcall; tailbytes=256, coalesce_gap=64), Tables.Scan())
     logone, srcone = countingsource(bigbytes)
@@ -1993,11 +1999,13 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
 
     # Compressed files range-read identically (per-buffer frames are
     # self-contained behind their prefixes).
-    io = IOBuffer()
-    Arrow.write(io, Tables.partitioner([
-        (x=Int64[1, 2, 3], s=["a", "bb", "ccc"]),
-        (x=Int64[4, 5, 6], s=["dd", "e", "ff"])]); file=false)
-    zsource = readstream(take!(io))
+    zsource = readstream(_fixture2x("int64-strings-two-batches") do
+        io = IOBuffer()
+        Arrow.write(io, Tables.partitioner([
+            (x=Int64[1, 2, 3], s=["a", "bb", "ccc"]),
+            (x=Int64[4, 5, 6], s=["dd", "e", "ff"])]); file=false)
+        take!(io)
+    end)
     zbytes = writefile(zsource; compress=:zstd)
     zfull = _fulltable(readfile(copy(zbytes)))
     logz, srcz = countingsource(zbytes)
@@ -2022,10 +2030,12 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         tailbytes=32, coalesce_gap=0), Tables.Scan(select=(:floats,)))
     @assert isequal(collect(Any, skipped.floats), collect(Any, full.floats))
 
-    validio = IOBuffer()
-    validdata = Union{Missing,Int64}[missing; collect(Int64, 2:16)]
-    Arrow.write(validio, (x=validdata,); file=false)
-    validbytes = writefile(readstream(take!(validio)))
+    validbytes = writefile(readstream(_fixture2x("nullable-int64-sixteen") do
+        validio = IOBuffer()
+        validdata = Union{Missing,Int64}[missing; collect(Int64, 2:16)]
+        Arrow.write(validio, (x=validdata,); file=false)
+        take!(validio)
+    end))
     validfile = readfile(copy(validbytes))
     badvalid = _setbufferlength!(copy(validbytes), validfile.recordblocks[1],
         1, Int64(1))
@@ -2048,11 +2058,13 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert _validatebodyplan(validheader, (strictfield,),
         validfile.limits, validcodec, Bool[true]) === nothing
 
-    structio = IOBuffer()
-    structdata = NamedTuple{(:n,),Tuple{Union{Missing,Int64}}}[
-        (n=missing,), (n=Int64(2),)]
-    Arrow.write(structio, (x=structdata,); file=false)
-    structbytes = writefile(readstream(take!(structio)))
+    structbytes = writefile(readstream(_fixture2x("nullable-struct-child") do
+        structio = IOBuffer()
+        structdata = NamedTuple{(:n,),Tuple{Union{Missing,Int64}}}[
+            (n=missing,), (n=Int64(2),)]
+        Arrow.write(structio, (x=structdata,); file=false)
+        take!(structio)
+    end))
     structfile = readfile(copy(structbytes))
     structbudget = AllocationBudget(structfile.limits.max_total_allocated_bytes)
     structmsg = _blockmessage(structfile.region, structfile.recordblocks[1],
@@ -2068,9 +2080,11 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert _validatebodyplan(structheader, (strictparent,),
         structfile.limits, structcodec, Bool[true]) === nothing
 
-    emptylistio = IOBuffer()
-    Arrow.write(emptylistio, (x=[String[]],); file=false)
-    emptylistbytes = writefile(readstream(take!(emptylistio)))
+    emptylistbytes = writefile(readstream(_fixture2x("empty-string-list") do
+        emptylistio = IOBuffer()
+        Arrow.write(emptylistio, (x=[String[]],); file=false)
+        take!(emptylistio)
+    end))
     emptylistfile = readfile(copy(emptylistbytes))
     emptylistblock = emptylistfile.recordblocks[1]
     bademptyoffset = _setbufferlength!(copy(emptylistbytes), emptylistblock,
@@ -2210,10 +2224,12 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         Tables.Scan(select=(:ints,))))
     @assert !_fetched(loglimit, intoff)
 
-    large = (x=zeros(Int64, 10_000),)
-    largeio = IOBuffer()
-    Arrow.write(largeio, Tables.partitioner([large, large]); file=false)
-    largebytes = writefile(readstream(take!(largeio)); compress=:zstd)
+    largebytes = writefile(readstream(_fixture2x("large-zeros-two-partitions") do
+        large = (x=zeros(Int64, 10_000),)
+        largeio = IOBuffer()
+        Arrow.write(largeio, Tables.partitioner([large, large]); file=false)
+        take!(largeio)
+    end); compress=:zstd)
     tight = Limits(max_total_allocated_bytes=100_000)
     @assert _rejects(() -> Tables.scan(readfile(copy(largebytes); limits=tight),
         Tables.Scan(select=(:x,))))
@@ -2230,9 +2246,11 @@ end
     # batch 1: x ∈ 1:5, s ∈ "apple".."eagle";  batch 2: x ∈ 6:10, s ∈ "fig".."jam".
     t1 = (x=Int64[1, 2, 3, 4, 5], s=["apple", "berry", "cedar", "date", "eagle"])
     t2 = (x=Int64[6, 7, 8, 9, 10], s=["fig", "grape", "hazel", "iris", "jam"])
-    io = IOBuffer()
-    Arrow.write(io, Tables.partitioner([t1, t2]); file=false)
-    source = readstream(take!(io))
+    source = readstream(_fixture2x("stats-two-batches") do
+        io = IOBuffer()
+        Arrow.write(io, Tables.partitioner([t1, t2]); file=false)
+        take!(io)
+    end)
     sbytes = statsfile(source.schema, source.batches)
     saf = readfile(copy(sbytes))
     sfull = _fulltable(saf)
@@ -2297,12 +2315,14 @@ end
     println("pruned scans stay differentially exact (whole-file + ranged) ✓")
 
     # Float pruning must use the same IEEE operators as Tables.finish.
-    fio = IOBuffer()
-    Arrow.write(fio, Tables.partitioner([
-        (x=Float64[0.0, 0.0],),
-        (x=Float64[-0.0, -0.0],),
-        (x=Float64[NaN, NaN],)]); file=false)
-    fsource = readstream(take!(fio))
+    fsource = readstream(_fixture2x("float-zero-signs-nan") do
+        fio = IOBuffer()
+        Arrow.write(fio, Tables.partitioner([
+            (x=Float64[0.0, 0.0],),
+            (x=Float64[-0.0, -0.0],),
+            (x=Float64[NaN, NaN],)]); file=false)
+        take!(fio)
+    end)
     fbytes = statsfile(fsource.schema, fsource.batches)
     faf = readfile(copy(fbytes))
     ffull = _fulltable(faf)
@@ -2368,9 +2388,11 @@ end
     # Per-record limits stay lazy on both paths. A statistics-pruned large
     # record is accepted; a surviving one rejects before its ranged metadata
     # or body is fetched.
-    limitio = IOBuffer()
-    Arrow.write(limitio, (x=collect(Int64, 1:10_000),); file=false)
-    limitsource = readstream(take!(limitio))
+    limitsource = readstream(_fixture2x("int64-ten-thousand") do
+        limitio = IOBuffer()
+        Arrow.write(limitio, (x=collect(Int64, 1:10_000),); file=false)
+        take!(limitio)
+    end)
     limitbytes = statsfile(limitsource.schema, limitsource.batches)
     limitfooterlen = Int64(reinterpret(Int32,
         limitbytes[(end - 9):(end - 6)])[1])
@@ -2425,9 +2447,11 @@ end
         @assert isequal(collect(Any, got.x), Any[8, 9, 10])
     end
     @assert _readstats(nestedstats.metadata, 2, source.schema.fields) === nothing
-    wrongio = IOBuffer()
-    Arrow.write(wrongio, Tables.partitioner([(q=Int64[1],), (q=Int64[2],)]); file=false)
-    wrongblob = Base64.base64encode(take!(wrongio))
+    wrongblob = Base64.base64encode(_fixture2x("stats-wrong-schema") do
+        wrongio = IOBuffer()
+        Arrow.write(wrongio, Tables.partitioner([(q=Int64[1],), (q=Int64[2],)]); file=false)
+        take!(wrongio)
+    end)
     wrongsch = Schema(collect(Field, source.schema.fields);
         metadata=Dict{String,String}(STATS_KEY => wrongblob),
         endianness=source.schema.endianness)
@@ -2460,9 +2484,11 @@ end
     hugebatches = AC.RecordBatch[_statsbatch(statssch, Int64(1),
         Tuple{Int64,Int64,Any,Any}[(1, Int64(0), hugevalue, hugevalue)])]
     hugeblob = Base64.base64encode(writestream(statssch, hugebatches; compress=:zstd))
-    bombio = IOBuffer()
-    Arrow.write(bombio, (s=["x"],); file=false)
-    bombsource = readstream(take!(bombio))
+    bombsource = readstream(_fixture2x("single-string") do
+        bombio = IOBuffer()
+        Arrow.write(bombio, (s=["x"],); file=false)
+        take!(bombio)
+    end)
     hugesch = Schema(collect(Field, bombsource.schema.fields);
         metadata=Dict{String,String}(STATS_KEY => hugeblob),
         endianness=bombsource.schema.endianness)
