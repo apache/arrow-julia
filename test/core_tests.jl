@@ -1433,8 +1433,13 @@ end
         f24 = Field("x", IntType(24, true); nullable=false)
         @test_throws ArgumentError materialize(Int64, f24, i24)
         @test_throws ArgumentError getvalue(Int64, f24, i24, 1)
+        # The buffer is PADDED to hold two Float64 bit patterns: a removed
+        # bulk-width gate would then copy wrong-width values successfully
+        # instead of tripping buffer bounds — this pin must fail on the
+        # wrong VALUES, not pass on an incidental bounds error.
+        f64bytes = collect(reinterpret(UInt8, Float64[1.25, -3.5]))
         fl24 = AC.ArrayData(FloatType(24), 2,
-            [BufferSlice(), AC._databuffer(UInt8[0, 0, 0, 0, 0, 0])])
+            [BufferSlice(), AC._databuffer(f64bytes)])
         ff24 = Field("y", FloatType(24); nullable=false)
         @test_throws ArgumentError materialize(Float64, ff24, fl24)
         @test_throws ArgumentError getvalue(Float64, ff24, fl24, 1)
