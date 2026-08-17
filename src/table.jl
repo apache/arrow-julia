@@ -211,6 +211,31 @@ end
 _facadeeltype(f::AC.Field) = f.nullable ?
     Union{Missing,_facadebasetype(f.type)} : _facadebasetype(f.type)
 
+# A claim the R5 typed path resolves without boxing: concrete scalars,
+# their Missing unions, and Vectors thereof. `Vector{Any}` (lists of
+# unresolved children) and the `Vector{Pair}` composite rows gain nothing
+# typed, so they stay on the dynamic path.
+function _closedclaim(::Type{T}) where {T}
+    T === Any && return false
+    NT = Base.nonmissingtype(T)
+    NT <: Vector && return _closedclaim(eltype(NT))
+    NT <: Pair && return false
+    return isconcretetype(NT)
+end
+
+"""
+Materialize one batch column for the facade: through the TYPED element
+path when the field's raw storage domain is closed (no per-element
+boxing — the benchmark-dominant cost of facade reads), else the dynamic
+path. The claim is the RAW domain (`_declaredeltype(f, false)`): the
+facade's Dates conversion happens after, in `_postconvert`.
+"""
+function _batchcolumn(f::AC.Field, d::AC.ArrayData)
+    T = _declaredeltype(f, false)
+    _closedclaim(T) || return AC.materialize(f, d)
+    return AC.materialize(T, f, d)
+end
+
 function _facadecolumn(f::AC.Field, parts::Vector)
     T = _facadeeltype(f)
     isempty(parts) && return T === Any ? Any[] : Vector{T}()
@@ -496,7 +521,7 @@ _corefields(s::IPCStream) = collect(AC.Field, s.corefields)
 _corefields(f::ArrowFile) = collect(AC.Field, f.fields)
 
 _rawcolumn(s::IPCStream, i::Base.Int) = begin
-    parts = [materialize(s.corefields[i], b.columns[i]) for b in s.batches]
+    parts = [_batchcolumn(s.corefields[i], b.columns[i]) for b in s.batches]
     isempty(parts) ? Any[] : reduce(vcat, parts)
 end
 
@@ -506,7 +531,7 @@ _tableschema(f::ArrowFile) = f.schema
 function _materialize_table(src::IPCStream, regions)
     names = Symbol[Symbol(f.name) for f in src.schema.fields]
     cols = AbstractVector[
-        _facadecolumn(f, [materialize(f, b.columns[i]) for b in src.batches])
+        _facadecolumn(f, [_batchcolumn(f, b.columns[i]) for b in src.batches])
         for (i, f) in enumerate(src.corefields)]
     nrows = sum(Base.Int(b.nrows) for b in src.batches; init=0)
     return _table(names, cols, src.schema, regions, nrows)
@@ -517,7 +542,7 @@ function _materialize_table(src::ArrowFile, regions)
     nb = length(src)
     batches = [src[i] for i = 1:nb]
     cols = AbstractVector[
-        _facadecolumn(f, [materialize(f, b.columns[i]) for b in batches])
+        _facadecolumn(f, [_batchcolumn(f, b.columns[i]) for b in batches])
         for (i, f) in enumerate(src.fields)]
     nrows = sum(Base.Int(b.nrows) for b in batches; init=0)
     return _table(names, cols, src.schema, regions, nrows)
@@ -706,7 +731,7 @@ function Base.iterate(s::Stream, i::Base.Int=1)
     b = _batch(s.src, i)
     fields = _batchfields(s.src)
     names = Symbol[Symbol(f.name) for f in fields]
-    cols = AbstractVector[_facadecolumn(f, [materialize(f, b.columns[j])])
+    cols = AbstractVector[_facadecolumn(f, [_batchcolumn(f, b.columns[j])])
                           for (j, f) in enumerate(fields)]
     return _table(names, cols, _tableschema(s.src), s.regions,
         Base.Int(b.nrows)), i + 1
