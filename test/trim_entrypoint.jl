@@ -188,6 +188,24 @@ function exercise_typed_values()::Nothing
     df, dd = AC.fromjulia_dict("d", ["lo", "hi"], [0, 1, missing, 0])
     checked(getvalue(Union{Missing,String}, df, dd, 2) == "hi",
         "typed dictionary failed")
+    # Four HETEROGENEOUS NamedTuple fields, both entry points: ntuple
+    # closures erase per-field types at this arity — the unrolled struct
+    # row must stay fully resolved.
+    h1f, h1d = fromjulia("a", Int64[1, 2])
+    h2f, h2d = fromjulia("b", [1.5, 2.5])
+    h3f, h3d = fromjulia("c", ["x", "y"])
+    h4f, h4d = fromjulia("flag", [true, false])
+    hf = Field("st4", StructType(); nullable=false,
+        children=[h1f, h2f, h3f, h4f])
+    hd = AC.ArrayData(StructType(), 2, [BufferSlice()];
+        children=[h1d, h2d, h3d, h4d], nullcount=0)
+    NT4 = NamedTuple{(:a, :b, :c, :flag),Tuple{Int64,Float64,String,Bool}}
+    hv = getvalue(NT4, hf, hd, 2)
+    checked(hv === (a=Int64(2), b=2.5, c="y", flag=false),
+        "typed 4-field struct getvalue failed")
+    hm = materialize(NT4, hf, hd)
+    checked(hm isa Vector{NT4} && hm[1].c == "x",
+        "typed 4-field struct materialize failed")
     # The claim is exact: a mismatched static type refuses, never converts.
     caught = false
     try

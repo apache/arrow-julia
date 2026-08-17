@@ -1370,6 +1370,40 @@ end
             (df, dd, Union{Missing,String}))
             @test isequal(materialize(T, ff, cc), materialize(ff, cc))
         end
+        # The claim checks against the DESCRIPTOR: empty or all-null data
+        # certifies nothing.
+        fe, de = fromjulia("e", Int64[])
+        @test_throws ArgumentError materialize(String, fe, de)
+        @test materialize(Int64, fe, de) == Int64[]
+        fan, dan = fromjulia("an", Union{Missing,Int64}[missing, missing])
+        @test_throws ArgumentError materialize(Union{Missing,String}, fan, dan)
+        fel, del = fromjulia("el", Vector{Int32}[])
+        @test_throws ArgumentError materialize(Vector{Int64}, fel, del)
+        @test materialize(Vector{Int32}, fel, del) == Vector{Int32}[]
+        # Four heterogeneous NamedTuple fields (the compile-time-unrolled
+        # struct row; ntuple closures lose per-field types at this arity).
+        h1 = fromjulia("a", Int64[1, 2]); h2 = fromjulia("b", [1.5, 2.5])
+        h3 = fromjulia("c", ["x", "y"]); h4 = fromjulia("d", [true, false])
+        hf = Field("st", StructType(); nullable=false,
+            children=[h1[1], h2[1], h3[1], h4[1]])
+        hd = AC.ArrayData(StructType(), 2, [BufferSlice()];
+            children=[h1[2], h2[2], h3[2], h4[2]], nullcount=0)
+        NT4 = NamedTuple{(:a, :b, :c, :d),Tuple{Int64,Float64,String,Bool}}
+        @test getvalue(NT4, hf, hd, 2) === (a=Int64(2), b=2.5, c="y", d=false)
+        @test materialize(NT4, hf, hd) isa Vector{NT4}
+        # A null struct never certifies a wrong claim either.
+        WRONG4 = NamedTuple{(:a, :b, :c, :z),Tuple{Int64,Float64,String,Bool}}
+        @test_throws ArgumentError getvalue(WRONG4, hf, hd, 1)
+        # Typed recursion keeps the dynamic path's child LOGICAL bounds: a
+        # hidden physical value past a child's logical length is unreadable.
+        leafd = AC.ArrayData(IntType(64, true), 1,
+            [BufferSlice(), AC._databuffer(Int64[11, 22])])
+        listd = AC.ArrayData(ListType(false), 1,
+            [BufferSlice(), AC._databuffer(Int32[0, 2])]; children=[leafd])
+        lfb = Field("l", ListType(false); nullable=false,
+            children=[Field("item", IntType(64, true); nullable=false)])
+        @test_throws BoundsError getvalue(Vector{Int64}, lfb, listd, 1)
+        @test_throws BoundsError getvalue(lfb, listd, 1)   # dynamic parity
     end
 end # ArrowCore testset
 

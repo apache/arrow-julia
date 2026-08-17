@@ -2159,6 +2159,14 @@ end
 # accessors return (storage integers for temporal, `Vector{Pair}` rows for
 # struct/map): the read produces exactly that type or refuses with a clear
 # error. `Any` is the dynamic path unchanged.
+#
+# Recursion architecture, stated loudly: it mirrors the dynamic path
+# exactly. Recursive edges route through `_typedchild` — a COMPILED
+# function whose argument types are all concrete (like public `getvalue`
+# on the dynamic side) — so the cycle's one non-inlined call is fully
+# resolvable; the `@inline` ladder and leaf methods flatten into it. An
+# `@inline` ladder call carrying an abstract descriptor as the recursive
+# edge is unresolvable under trim (no standalone specialization exists).
 # ---------------------------------------------------------------------------
 
 """
@@ -2167,34 +2175,160 @@ end
 
 Statically typed element access: `T` asserts the element domain (what the
 dynamic accessors return for this layout — see `juliatype`), with
-`Missing <: T` required to admit nulls. Composites recurse: a `List<Int64>`
-column reads as `Vector{Vector{Int64}}`, and a `Struct` column may read as
-a `NamedTuple` row type whose names match the child fields in order.
-Mismatches refuse with `ArgumentError` — values are never converted.
-`T === Any` delegates to the dynamic path.
+`Missing <: T` required to admit nulls. The claim checks against the
+DESCRIPTOR up front — an empty or all-null column certifies nothing.
+Composites recurse: a `List<Int64>` column reads as
+`Vector{Vector{Int64}}`, and a `Struct` column may read as a `NamedTuple`
+row type whose names match the child fields in order. Mismatches refuse
+with `ArgumentError` — values are never converted. `T === Any` delegates
+to the dynamic path.
 """
 function getvalue(::Type{T}, f::Field, d::ArrayData, i::Integer) where {T}
     T === Any && return getvalue(f, d, i)
+    _checkclaim(T, f, d)
     1 <= i <= d.len || throw(BoundsError(d, i))
     return _typedvalue_of(T, d.type, f, d, Int64(i))::T
 end
 
 function materialize(::Type{T}, f::Field, d::ArrayData) where {T}
     T === Any && return materialize(f, d)
+    _checkclaim(T, f, d)
     return _typedmaterialize_of(T, d.type, f, d)::Vector{T}
 end
 
 # The message names the layout via `nameof` (generic struct/type `show` is
-# trim-hostile); `juliatype(t)` tells a caller the exact expected claim.
-@noinline _typedrefuse(::Type{E}, t::ArrowType, f::Field) where {E} =
-    throw(ArgumentError("field $(f.name) materializes " *
-        "$(string(nameof(typeof(t))))-layout values; the claimed static " *
-        "element type does not match"))
+# trim-hostile, and an abstract descriptor argument would leave the throw
+# helper unresolvable); `juliatype(t)` tells a caller the expected claim.
+# Closed-set ladder to literal strings: `nameof(typeof(t))` on an abstract
+# descriptor is itself an unresolvable call under trim.
+@inline function _layoutname(t::ArrowType)
+    t isa IntType && return "IntType"
+    t isa FloatType && return "FloatType"
+    t isa BoolType && return "BoolType"
+    t isa Utf8Type && return "Utf8Type"
+    t isa BinaryType && return "BinaryType"
+    t isa FixedSizeBinaryType && return "FixedSizeBinaryType"
+    t isa TimestampType && return "TimestampType"
+    t isa DateType && return "DateType"
+    t isa TimeType && return "TimeType"
+    t isa DurationType && return "DurationType"
+    t isa ViewType && return "ViewType"
+    t isa DecimalType && return "DecimalType"
+    t isa IntervalType && return "IntervalType"
+    t isa MapType && return "MapType"
+    t isa StructType && return "StructType"
+    t isa ListType && return "ListType"
+    t isa ListViewType && return "ListViewType"
+    t isa FixedSizeListType && return "FixedSizeListType"
+    t isa DictionaryType && return "DictionaryType"
+    t isa RunEndEncodedType && return "RunEndEncodedType"
+    t isa UnionType && return "UnionType"
+    t isa NullType && return "NullType"
+    return "ArrowType"
+end
+@noinline _typedrefuse(::Type{E}, kind::String, f::Field) where {E} =
+    throw(ArgumentError("field $(f.name) materializes $(kind)-layout " *
+        "values; the claimed static element type does not match"))
 @noinline _typednullrefuse(f::Field) =
     throw(ArgumentError("field $(f.name) holds a null but the static " *
         "element type does not admit missing"))
 @inline _typedmissing(::Type{T}, f::Field) where {T} =
     Missing <: T ? missing : _typednullrefuse(f)
+
+"""
+Descriptor-level claim preflight: `T` must match the element domain the
+schema DECLARES — acceptance never depends on which values a batch
+happens to contain (an empty or all-null column certifies nothing).
+Shapes, field counts, and names check ONCE here; the element loop stays
+check-free. Compiled (not `@inline`): its recursion keeps the claim
+intact through transparent wrappers, and a compiled concrete-arg edge is
+what makes that cycle trim-resolvable.
+"""
+function _checkclaim(::Type{T}, f::Field, d::ArrayData)::Nothing where {T}
+    t = d.type
+    if t isa ListType || t isa ListViewType || t isa FixedSizeListType
+        E = Base.nonmissingtype(T)
+        E <: Vector || _typedrefuse(E, _layoutname(t), f)
+        length(f.children) == 1 && length(d.children) == 1 ||
+            _typedrefuse(E, _layoutname(t), f)
+        return _checkclaim(eltype(E), f.children[1], d.children[1])
+    end
+    if t isa StructType
+        E = Base.nonmissingtype(T)
+        E === Vector{Pair{String,Any}} && return nothing
+        E <: NamedTuple || _typedrefuse(E, _layoutname(t), f)
+        (fieldcount(E) == length(f.children) &&
+         fieldcount(E) == length(d.children)) || _typedrefuse(E, _layoutname(t), f)
+        return _checkstructclaim(E, f, d)
+    end
+    if t isa DictionaryType
+        dict = d.dictionary
+        dict === nothing &&
+            throw(ValidationError("dictionary-encoded array without a dictionary"))
+        return _checkclaim(T, dictvaluefield(f, t), dict)
+    end
+    if t isa RunEndEncodedType
+        (length(f.children) == 2 && length(d.children) == 2) ||
+            _typedrefuse(Base.nonmissingtype(T), _layoutname(t), f)
+        return _checkclaim(T, f.children[2], d.children[2])
+    end
+    t isa UnionType && _typedrefuse(Base.nonmissingtype(T), _layoutname(t), f)
+    if t isa NullType
+        Missing <: T || _typednullrefuse(f)
+        return nothing
+    end
+    E = Base.nonmissingtype(T)
+    E === _juliatype_of(t) || _typedrefuse(E, _layoutname(t), f)
+    return nothing
+end
+
+# Generated so every field index is a LITERAL: `fieldtype(E, j)` with a
+# runtime `j` yields an abstract `Type` and poisons the recursion, and the
+# name strings bake in at generation (no per-call conversion at all).
+@generated function _checkstructclaim(::Type{E}, f::Field,
+    d::ArrayData)::Nothing where {E<:NamedTuple}
+    checks = Expr[]
+    for j = 1:fieldcount(E)
+        push!(checks, :($(String(fieldnames(E)[j])) == f.children[$j].name ||
+            _typedrefuse(E, _layoutname(d.type), f)))
+        push!(checks, :(_checkclaim($(fieldtype(E, j)), f.children[$j],
+            d.children[$j])))
+    end
+    return quote
+        $(checks...)
+        return nothing
+    end
+end
+
+# Closed-set ladder for the preflight's scalar leafs (an abstract
+# `juliatype(t::ArrowType)` call would defeat trim resolution).
+@inline function _juliatype_of(t::ArrowType)
+    t isa IntType && return juliatype(t)
+    t isa FloatType && return juliatype(t)
+    t isa BoolType && return juliatype(t)
+    t isa Utf8Type && return juliatype(t)
+    t isa BinaryType && return juliatype(t)
+    t isa FixedSizeBinaryType && return juliatype(t)
+    t isa TimestampType && return juliatype(t)
+    t isa DateType && return juliatype(t)
+    t isa TimeType && return juliatype(t)
+    t isa DurationType && return juliatype(t)
+    t isa ViewType && return juliatype(t)
+    t isa DecimalType && return juliatype(t)
+    t isa IntervalType && return juliatype(t)
+    t isa MapType && return juliatype(t)
+    t isa StructType && return juliatype(t)
+    throw(ArgumentError("unregistered ArrowType"))
+end
+
+# Typed recursion enters children HERE: the same logical-bounds guard the
+# dynamic path gets from public `getvalue` — unvalidated geometry must not
+# read hidden backing values past a child's logical length. COMPILED with
+# all-concrete argument types: this is the cycle's resolvable edge.
+function _typedchild(::Type{T}, f::Field, d::ArrayData, i::Int64) where {T}
+    1 <= i <= d.len || throw(BoundsError(d, i))
+    return _typedvalue_of(T, d.type, f, d, i)
+end
 
 # The same closed-set ladder as `_value_of`, with the claimed type threaded.
 @inline function _typedvalue_of(::Type{T}, t::ArrowType, f::Field,
@@ -2234,7 +2368,7 @@ function _typedvalue(::Type{T},
     f::Field, d::ArrayData, i::Int64) where {T}
     isvalid_at(d, i) || return _typedmissing(T, f)
     E = Base.nonmissingtype(T)
-    E === juliatype(t) || _typedrefuse(E, t, f)
+    E === juliatype(t) || _typedrefuse(E, _layoutname(t), f)
     return _value(t, f, d, i)::E
 end
 
@@ -2242,7 +2376,7 @@ function _typedvalue(::Type{T}, t::Union{ListType,ListViewType}, f::Field,
     d::ArrayData, i::Int64) where {T}
     isvalid_at(d, i) || return _typedmissing(T, f)
     E = Base.nonmissingtype(T)
-    E <: Vector || _typedrefuse(E, t, f)
+    E <: Vector || _typedrefuse(E, _layoutname(t), f)
     if t isa ListType
         lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth == 8)
         off = lo
@@ -2256,8 +2390,7 @@ function _typedvalue(::Type{T}, t::Union{ListType,ListViewType}, f::Field,
     CE = eltype(E)
     out = Vector{CE}(undef, Int(n))
     for k = 1:Int(n)
-        out[k] = _typedvalue_of(CE, child.type, cf, child,
-            checked_add(off, Int64(k)))
+        out[k] = _typedchild(CE, cf, child, checked_add(off, Int64(k)))
     end
     return out
 end
@@ -2266,14 +2399,13 @@ function _typedvalue(::Type{T}, t::FixedSizeListType, f::Field,
     d::ArrayData, i::Int64) where {T}
     isvalid_at(d, i) || return _typedmissing(T, f)
     E = Base.nonmissingtype(T)
-    E <: Vector || _typedrefuse(E, t, f)
+    E <: Vector || _typedrefuse(E, _layoutname(t), f)
     child, cf = d.children[1], f.children[1]
     base = _slotbyteoff(d, i, t.listsize)
     CE = eltype(E)
     out = Vector{CE}(undef, t.listsize)
     for j = 1:t.listsize
-        out[j] = _typedvalue_of(CE, child.type, cf, child,
-            checked_add(base, Int64(j)))
+        out[j] = _typedchild(CE, cf, child, checked_add(base, Int64(j)))
     end
     return out
 end
@@ -2283,16 +2415,19 @@ function _typedvalue(::Type{T}, t::StructType, f::Field, d::ArrayData,
     isvalid_at(d, i) || return _typedmissing(T, f)
     E = Base.nonmissingtype(T)
     E === Vector{Pair{String,Any}} && return _value(t, f, d, i)::E
-    E <: NamedTuple || _typedrefuse(E, t, f)
-    names = fieldnames(E)
-    length(names) == length(f.children) || _typedrefuse(E, t, f)
-    childindex = checked_add(d.offset, i)
-    vals = ntuple(Val(fieldcount(E))) do j
-        String(names[j]) == f.children[j].name || _typedrefuse(E, t, f)
-        _typedvalue_of(fieldtype(E, j), d.children[j].type, f.children[j],
-            d.children[j], childindex)
-    end
-    return E(vals)
+    E <: NamedTuple || _typedrefuse(E, _layoutname(t), f)
+    return _structrow(E, f, d, checked_add(d.offset, i))
+end
+
+# Generated so every field's claim is a LITERAL type and the row build is
+# a flat tuple expression: an `ntuple(Val(N))` closure erases per-field
+# types to `NTuple{N,Any}` at arity >= 4, and index-recursion trips the
+# inference recursion limiter. The preflight already checked names.
+@generated function _structrow(::Type{E}, f::Field, d::ArrayData,
+    childindex::Int64) where {E<:NamedTuple}
+    vals = Expr[:(_typedchild($(fieldtype(E, j)), f.children[$j],
+        d.children[$j], childindex)) for j = 1:fieldcount(E)]
+    return :(E(($(vals...),)))
 end
 
 function _typedvalue(::Type{T}, t::DictionaryType, f::Field, d::ArrayData,
@@ -2303,15 +2438,13 @@ function _typedvalue(::Type{T}, t::DictionaryType, f::Field, d::ArrayData,
     dict = d.dictionary
     dict === nothing &&
         throw(ValidationError("dictionary-encoded array without a dictionary"))
-    vf = dictvaluefield(f, t)
-    return _typedvalue_of(T, dict.type, vf, dict,
+    return _typedchild(T, dictvaluefield(f, t), dict,
         checked_add(Int64(idx), Int64(1)))
 end
 
 _typedvalue(::Type{T}, t::RunEndEncodedType, f::Field, d::ArrayData,
     i::Int64) where {T} =
-    _typedvalue_of(T, d.children[2].type, f.children[2], d.children[2],
-        _ree_runindex(d, i))
+    _typedchild(T, f.children[2], d.children[2], _ree_runindex(d, i))
 
 _typedvalue(::Type{T}, ::NullType, f::Field, ::ArrayData, ::Int64) where {T} =
     _typedmissing(T, f)
@@ -2320,7 +2453,7 @@ _typedvalue(::Type{T}, ::NullType, f::Field, ::ArrayData, ::Int64) where {T} =
 # hold across children, so only the dynamic path reads unions.
 _typedvalue(::Type{T}, t::UnionType, f::Field, ::ArrayData,
     ::Int64) where {T} =
-    _typedrefuse(Base.nonmissingtype(T), t, f)
+    _typedrefuse(Base.nonmissingtype(T), _layoutname(t), f)
 
 @inline function _typedmaterialize_of(::Type{T}, t::ArrowType, f::Field,
     d::ArrayData) where {T}
