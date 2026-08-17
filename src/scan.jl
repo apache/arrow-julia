@@ -397,6 +397,78 @@ function _maskedrecord(msg::Meta.Message, version::Int16, body,
     return rblen, cols
 end
 
+"""
+Three-valued evaluation of a scan predicate over a ZERO-FIELD row: every
+column reference is an all-missing column, constants evaluate, and the
+result is `true`, `false`, or `missing` (SQL semantics; only `true` keeps
+rows). Row-invariant by construction, so one evaluation covers every row —
+no per-row mask may be allocated from an untrusted row count.
+"""
+function _zerofieldpredicate(e)
+    e === nothing && return true
+    e isa Tables.AlwaysTrue && return true
+    e isa Tables.AlwaysFalse && return false
+    e isa Tables.IsNull && return !e.negated
+    if e isa Tables.AndExpr
+        sawmissing = false
+        for a in e.args
+            r = _zerofieldpredicate(a)
+            r === false && return false
+            r === missing && (sawmissing = true)
+        end
+        return sawmissing ? missing : true
+    end
+    if e isa Tables.OrExpr
+        sawmissing = false
+        for a in e.args
+            r = _zerofieldpredicate(a)
+            r === true && return true
+            r === missing && (sawmissing = true)
+        end
+        return sawmissing ? missing : false
+    end
+    if e isa Tables.NotExpr
+        r = _zerofieldpredicate(e.arg)
+        return r === missing ? missing : !r
+    end
+    return missing   # Cmp/In/StrPred against a missing column
+end
+
+"Window arithmetic over a known row count (filter already evaluated)."
+function _zerofieldcount(n0::Int64, keep, limit, offset)
+    keep === true || return Int64(0)
+    lo = min(Int64(offset), n0)
+    n = n0 - lo
+    limit === nothing ? n : min(n, Int64(limit))
+end
+
+"""
+Window a SEQUENCE of batch row counts without summing past the request: a
+limit saturates (a hostile total never overflows a capped scan), while an
+unbounded request keeps the checked-add contract — an overflowing total is
+a refusal, exactly as the column-bearing paths refuse.
+"""
+function _zerofieldwindow(counts, keep, limit, offset)
+    keep === true || return Int64(0)
+    off = Int64(offset)
+    lim = limit === nothing ? Int64(-1) : Int64(limit)
+    n = Int64(0)
+    for r0 in counts
+        r = Int64(r0)
+        skip = min(off, r)
+        off -= skip
+        r -= skip
+        if lim >= 0
+            take = min(r, lim - n)
+            n += take
+            n == lim && return n
+        else
+            n = _planadd(n, r, "zero-field scan row count")
+        end
+    end
+    return n
+end
+
 "Resolve positional filter references once, against the source schema."
 _resolvefilter(::Nothing, names) = nothing
 function _resolvefilter(e::Tables.ScanExpr, names)
@@ -498,6 +570,15 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
     allunique(names) || throw(ValidationError(
         "scan pushdown over duplicate column names is facade work; read the file without a scan"))
     b = Tables.bind(scan, names)
+    if isempty(names)
+        # Zero-field sources: consume filter and window HERE — an empty
+        # residual NamedTuple cannot carry a row count through finish.
+        keep = _zerofieldpredicate(scan.filter)
+        n = _zerofieldwindow((_batchrows(f, i) for i = 1:length(f)), keep,
+            scan.limit, scan.offset)
+        return _scantable(Symbol[], (), Int(n)),
+            Tables.Scan(nothing, nothing, nothing, 0, scan.validate)
+    end
     decodeidx = sort!(unique!(vcat(Int[c.index for c in b.columns], copy(b.filtercols))))
     mask = falses(length(names))
     mask[decodeidx] .= true
@@ -818,6 +899,30 @@ function _rangedfooter(rf::RangedFile, budget::AllocationBudget)
         metaschema)
 end
 
+"Per-batch rows of a zero-field ranged file: block headers only, charged."
+function _zerofieldbatchrows(rf::RangedFile)
+    budget = AllocationBudget(rf.limits.max_total_allocated_bytes)
+    ft = _rangedfooter(rf, budget)
+    counts = Int64[]
+    for block in ft.recordblocks
+        off, metalen, bodylen = block
+        declared = metalen - 8
+        0 < declared <= rf.limits.max_metadata_bytes ||
+            throw(ValidationError("record block metadata length outside limits"))
+        raw = _fetchexact(rf.src, off + 8, declared)
+        _charge!(budget, declared, "metadata allocation")
+        version, header_type, _, reserve =
+            verify_ipc_metadata(raw, rf.limits, budget.left)
+        _charge!(budget, reserve, "verified metadata expansion")
+        header_type == UInt8(3) || throw(ValidationError(
+            "footer record block is not a record batch"))
+        msg = FB.getrootas(Meta.Message, raw, 0)
+        push!(counts, _recordbatchmeta(msg.header::Meta.RecordBatch,
+            ft.fields, rf.limits, bodylen))
+    end
+    return counts
+end
+
 "Schema-only ranged read for the facade (one tail fetch)."
 function rangedschema(rf::RangedFile)
     budget = AllocationBudget(rf.limits.max_total_allocated_bytes)
@@ -846,6 +951,15 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     allunique(names) || throw(ValidationError(
         "scan pushdown over duplicate column names is facade work; read the file without a scan"))
     b = Tables.bind(scan, names)
+    if isempty(names)
+        # Zero-field sources: consume filter and window HERE — an empty
+        # residual NamedTuple cannot carry a row count through finish.
+        keep = _zerofieldpredicate(scan.filter)
+        n = _zerofieldwindow(_zerofieldbatchrows(rf), keep,
+            scan.limit, scan.offset)
+        return _scantable(Symbol[], (), Int(n)),
+            Tables.Scan(nothing, nothing, nothing, 0, scan.validate)
+    end
     decodeidx = sort!(unique!(vcat(Int[c.index for c in b.columns], copy(b.filtercols))))
     mask = falses(length(names))
     mask[decodeidx] .= true

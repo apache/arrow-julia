@@ -461,21 +461,11 @@ function _publicscan(full::Table, schema, sourcefields, scan, regions)
         # any filter over zero columns matches nothing, and the window
         # arithmetic runs directly.
         scan.validate && Tables.bind(scan, Symbol[])
-        n0 = Tables.rowcount(full)
-        n1 = if scan.filter !== nothing
-            # The authority evaluates constants and treats unmatched column
-            # references (validate=false) as all-missing columns. Delegate:
-            # one all-missing dummy column carries the row count while every
-            # real reference stays unmatched.
-            dummy = (; var"#arrowcount#"=fill(missing, n0))
-            counted = Tables.finish(dummy, Tables.Scan(nothing, scan.filter,
-                scan.limit, scan.offset, false))
-            Base.Int(Tables.rowcount(Tables.columns(counted)))
-        else
-            lo = min(Base.Int(scan.offset), n0)
-            n = n0 - lo
-            scan.limit === nothing ? n : min(n, Base.Int(scan.limit))
-        end
+        # Row-invariant predicate, evaluated ONCE — no mask or index vector
+        # may be allocated from an untrusted row count.
+        keep = _zerofieldpredicate(scan.filter)
+        n1 = Base.Int(_zerofieldcount(Int64(Tables.rowcount(full)), keep,
+            scan.limit, scan.offset))
         return _table(Symbol[], AbstractVector[], schema,
             AC.OwnerRegion[regions...], n1)
     end
@@ -547,6 +537,7 @@ function _boundschema(schema, sourcefields, scan, precols)
     for (i, bc) in enumerate(b.columns)
         f = sourcefields[bc.index]
         if bc.type !== nothing && i <= length(precols) &&
+           !isempty(precols[i]) &&
            !(eltype(precols[i]) <: Union{bc.type,Missing})
             continue
         end

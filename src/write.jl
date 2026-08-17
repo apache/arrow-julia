@@ -66,9 +66,41 @@ function _writecolumn(name::String, v::AbstractVector)
         return AC.fromjulia_struct(name, cols)
     elseif T <: AbstractString && T != String
         return AC.fromjulia(name, _missings_to(String, v))
+    elseif T === Any || (T <: AbstractVector && eltype(T) === Any)
+        # Materialized facade columns are Any-eltype for composite layouts;
+        # one narrowing pass recovers list columns (inner vectors narrow
+        # element-wise, empties adopt the joined element type).
+        w = _narrowlists(v)
+        NW = Base.nonmissingtype(eltype(w))
+        (NW === Any || (NW <: AbstractVector && eltype(NW) === Any)) &&
+            throw(ArgumentError(
+            "column $name has element type Any and cannot be narrowed to " *
+            "a writable Arrow column; give it a concrete element type"))
+        return _writecolumn(name, w)
     else
         return AC.fromjulia(name, _plainvector(v))
     end
+end
+
+"Narrow an Any-eltype column, recovering list-of-T structure when present."
+function _narrowlists(v::AbstractVector)
+    w = map(x -> x isa AbstractVector ? map(identity, x) : x, v)
+    w = map(identity, w)
+    NT = Base.nonmissingtype(eltype(w))
+    NT <: AbstractVector || return w
+    # Join the inner element types (empties narrow to Union{} and would
+    # otherwise poison the join), then retype every inner vector.
+    E = Union{}
+    for x in w
+        x === missing && continue
+        isempty(x) && continue
+        E = typejoin(E, eltype(x))
+    end
+    E === Union{} && (E = Any)
+    E === Any && return w
+    hasm = eltype(w) >: Missing
+    S = hasm ? Union{Missing,Vector{E}} : Vector{E}
+    return S[x === missing ? missing : convert(Vector{E}, x) for x in w]
 end
 
 function _writecolumn(name::String, d::DictEncode)

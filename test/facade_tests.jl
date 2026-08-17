@@ -576,6 +576,52 @@ end
         @test DataAPI.colmetadata(t4, :l, "k") == "v"
     end
 
+    @testset "zero-field scans hold at the Tables.scan layer too" begin
+        sch = Arrow.AC.Schema(Arrow.AC.Field[])
+        zb = Arrow.writefile(sch,
+            [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 3)])
+        af = Arrow.readfile(zb)
+        for (scan, want) in (
+            (Tables.Scan(filter=Tables.AlwaysTrue()), 3),
+            (Tables.Scan(filter=Tables.AlwaysTrue(), limit=1, offset=1), 1),
+            (Tables.Scan(filter=Tables.isnull(Tables.col(:gone)),
+                validate=false), 3),
+            (Tables.Scan(filter=Tables.AlwaysFalse()), 0))
+            got = Tables.scan(af, scan)
+            @test Tables.rowcount(Tables.columns(got)) == want
+            rgot = Tables.scan(Arrow.RangedFile(Arrow.RangedSource(zb)), scan)
+            @test Tables.rowcount(Tables.columns(rgot)) == want
+        end
+        # The facade path allocates nothing proportional to a hostile count:
+        # a tiny file claiming a million rows answers limit=1 instantly.
+        big = Arrow.writefile(sch,
+            [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 1_000_000)])
+        stats = @timed Arrow.Table(big; scan=Tables.Scan(
+            filter=Tables.AlwaysTrue(), limit=1))
+        @test Tables.rowcount(stats.value) == 1
+        @test stats.bytes < 1_000_000
+    end
+
+    @testset "list columns rewrite after materialization" begin
+        io = IOBuffer()
+        Arrow.write(io, (l=[[1, 2], Int64[], [3]],); file=false)
+        t = Arrow.Table(take!(io))
+        io2 = IOBuffer()
+        Arrow.write(io2, t; file=false)
+        t2 = Arrow.Table(take!(io2))
+        @test isequal(t2.l, [Any[1, 2], Any[], Any[3]])
+        # empty list column with a retained field keeps descriptor+metadata
+        io3 = IOBuffer()
+        Arrow.write(io3, (l=Vector{Int64}[],); file=false,
+            colmetadata=Dict(:l => Dict("k" => "v")))
+        lb = take!(io3)
+        t3 = Arrow.Table(lb; scan=Tables.Scan(select=(:l => Vector,)))
+        rsch = getfield(t3, :schema)
+        @test length(rsch.fields) == 1
+        @test rsch.fields[1].type isa Arrow.AC.ListType
+        @test DataAPI.colmetadata(t3, :l, "k") == "v"
+    end
+
     @testset "errors are clean" begin
         @test_throws ArgumentError Arrow.write(IOBuffer(),
             Tables.partitioner(NamedTuple[]))
