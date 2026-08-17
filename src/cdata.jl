@@ -873,20 +873,36 @@ failure between construction and the move commit therefore frees just our
 copy and never calls the producer — the source, whose release field is still
 set, remains the owner.
 """
+function _release_owner_action(p::Ptr{Cvoid})::Cvoid
+    slot = unsafe_pointer_to_objref(p)::Base.RefValue{Any}
+    x = slot[]
+    x === nothing || release!(x)
+    return nothing
+end
+
 mutable struct ForeignOwner
     const arrayblock::Ptr{CArrowArray} # malloc'd copy of the moved struct: a
                                        # stable native address for the
                                        # producer's release callback
     const producer_release::Ptr{Cvoid} # the moved struct's real callback
     @atomic released::Bool             # one swap picks the single releaser
+    # ONE revocation cell for every OwnerRegion built over this import: the
+    # producer's release frees the whole tree at once, so closing any
+    # imported buffer must revoke all of its siblings first (they share this
+    # lifetime). The cell's release action routes through `release!`, which
+    # stays exactly-once against the GC-finalizer path.
+    const cell::AC.ReleaseCell
     function ForeignOwner(arr::CArrowArray, registerfinalizer)
         block = Libc.malloc(sizeof(CArrowArray))
         block == C_NULL && throw(OutOfMemoryError())
         p = Ptr{CArrowArray}(block)
+        slot = Ref{Any}(nothing)
+        cell = AC.ReleaseCell(
+            @cfunction(_release_owner_action, Cvoid, (Ptr{Cvoid},)), slot)
         o = try
             unsafe_store!(p, arr)
             _store_field!(p, Val(:release), Ptr{Cvoid}(C_NULL))  # inert until armed
-            new(p, arr.release, false)
+            new(p, arr.release, false, cell)
         catch
             # The native copy exists before the Julia owner does. If copy
             # initialization or owner allocation fails, no finalizer can
@@ -894,6 +910,7 @@ mutable struct ForeignOwner
             Libc.free(block)
             rethrow()
         end
+        slot[] = o
         try
             registerfinalizer(release!, o)
         catch
@@ -946,6 +963,13 @@ A conformance failure throws; from the finalizer path Julia reports it as a
 finalizer error.
 """
 release!(o::ForeignOwner) = _release_foreign_owner!(o, Libc.free)
+
+# close!(o::ForeignOwner): deterministically release an imported C-data
+# tree through its shared revocation cell — every OwnerRegion built over
+# the import is revoked, then the producer's release callback runs exactly
+# once. The entry point for imports whose arrays are empty and carry no
+# region at all (ArrayData.owner is then the only handle on the lifetime).
+AC.close!(o::ForeignOwner) = AC.close!(o.cell)
 
 function _release_foreign_owner!(o::ForeignOwner, deallocate!)
     @atomicswap(o.released = true) && return nothing
@@ -1216,7 +1240,7 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
             nbytes == 0 || throw(ValidationError("NULL $role buffer with nonzero required size"))
             push!(buffers, BufferSlice())
         else
-            region = OwnerRegion(Ptr{UInt8}(p), nbytes; root=owner)
+            region = OwnerRegion(Ptr{UInt8}(p), nbytes; root=owner, cell=owner.cell)
             slice = BufferSlice(region, 0, nbytes)
             role == AC.OFFSETS && (offsets_slice = slice)
             push!(buffers, slice)
@@ -1238,7 +1262,7 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
                 len == 0 || throw(ValidationError("NULL variadic buffer with nonzero declared length"))
                 push!(buffers, BufferSlice())
             else
-                region = OwnerRegion(Ptr{UInt8}(p), len; root=owner)
+                region = OwnerRegion(Ptr{UInt8}(p), len; root=owner, cell=owner.cell)
                 push!(buffers, BufferSlice(region, 0, len))
             end
         end

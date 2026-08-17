@@ -42,6 +42,8 @@ module Arrow
 using Tables
 using EnumX
 import Base64
+import DataAPI
+import Dates
 import Mmap
 import CodecLz4
 import CodecZstd
@@ -81,5 +83,11 @@ include("ipc_read.jl")
 include("ipc_write.jl")
 include("cdata.jl")
 include("scan.jl")
+
+# The public facade.
+include("table.jl")
+include("write.jl")
+
+export close!
 
 end # module Arrow

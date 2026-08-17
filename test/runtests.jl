@@ -19,6 +19,9 @@ using Test
 # Core unit tests (ArrowCore in isolation).
 include("core_tests.jl")
 
+# The public facade (Arrow.Table / Arrow.Stream / Arrow.write).
+include("facade_tests.jl")
+
 # The adapter acceptance batteries: assertion-dense scripts over the
 # package's internals. They ran standalone during the prove-out; here they
 # share one module that aliases the package namespace wholesale.

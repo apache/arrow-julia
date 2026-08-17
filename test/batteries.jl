@@ -31,7 +31,7 @@ using Arrow
 # reach Arrow through `using` and need listing explicitly.
 for n in union(names(Arrow; all=true), names(Arrow.ArrowCore))
     sn = String(n)
-    (startswith(sn, "#") || n in (:eval, :include, :Arrow)) && continue
+    (startswith(sn, "#") || n in (:eval, :include, :Arrow, :write, :Table, :Stream)) && continue
     isdefined(Arrow, n) || continue
     @eval const $n = Arrow.$n
 end

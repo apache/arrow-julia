@@ -49,7 +49,7 @@ using Arrow
 # batteries do, until the facade formalizes a public surface.
 for n in names(Arrow; all=true)
     sn = String(n)
-    (startswith(sn, "#") || n in (:eval, :include, :Arrow)) && continue
+    (startswith(sn, "#") || n in (:eval, :include, :Arrow, :write, :Table, :Stream)) && continue
     isdefined(Arrow, n) || continue
     @eval const $n = Arrow.$n
 end

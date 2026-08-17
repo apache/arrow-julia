@@ -18,6 +18,13 @@
 
 using Test
 
+# Top-level release-action trampoline for the ReleaseCell test (the closure
+# form of @cfunction is unsupported on some platforms).
+function _cell_bump(p::Ptr{Cvoid})::Cvoid
+    (unsafe_pointer_to_objref(p)::Base.RefValue{Int})[] += 1
+    return nothing
+end
+
 using Arrow
 using Arrow.ArrowCore
 const AC = ArrowCore
@@ -265,18 +272,47 @@ end
         buf = d.buffers[2]
         @test AC.loadat(buf, Int64, Int64(0)) == 1
         r = buf.region::OwnerRegion
+        # A heap region is a BORROW: close! revokes but must not run the
+        # caller's own finalizers on the borrowed vector.
+        borrowed = r.root::Vector{Int64}
+        callerfin = Ref(false)
+        finalizer(_ -> callerfin[] = true, borrowed)
         close!(r)
+        @test !callerfin[]
         @test_throws InvalidStateException AC.loadat(buf, Int64, Int64(0))
         @test_throws InvalidStateException AC.slicebytes(buf)
         @test_throws InvalidStateException materialize(f, d)
         close!(r)   # idempotent
-        # An mmap-backed region unmaps eagerly and later access still throws.
+        GC.@preserve borrowed nothing
+
+        # Regions sharing one ReleaseCell are revoked together and the
+        # release action runs exactly once.
+        released = Ref(0)
+        cell = ReleaseCell(@cfunction(_cell_bump, Cvoid, (Ptr{Cvoid},)), released)
+        v1, v2 = UInt8[1, 2], UInt8[3, 4]
+        ra = GC.@preserve v1 OwnerRegion(pointer(v1), 2; root=v1, cell=cell)
+        rb = GC.@preserve v2 OwnerRegion(pointer(v2), 2; root=v2, cell=cell)
+        sa, sb = BufferSlice(ra, 0, 2), BufferSlice(rb, 0, 2)
+        @test AC.loadat(sb, UInt8, Int64(0)) == 0x03
+        close!(ra)
+        @test_throws InvalidStateException AC.loadat(sa, UInt8, Int64(0))
+        @test_throws InvalidStateException AC.loadat(sb, UInt8, Int64(0))
+        close!(rb)
+        @test released[] == 1
+
+        # An mmap-backed region actually unmaps NOW: the release targets the
+        # backing Memory (where Mmap registers the unmap finalizer), and the
+        # observer proves it ran — rm() alone would not, since POSIX happily
+        # unlinks mapped files.
         path, io = mktemp()
         write(io, zeros(UInt8, 64)); close(io)
         mr = mmapregion(path)
         mslice = BufferSlice(mr, 0, mr.len)
         @test AC.loadat(mslice, UInt8, Int64(0)) == 0x00
+        unmapped = Ref(false)
+        finalizer(_ -> unmapped[] = true, (mr.root::Vector{UInt8}).ref.mem)
         close!(mr)
+        @test unmapped[]
         @test_throws InvalidStateException AC.loadat(mslice, UInt8, Int64(0))
         rm(path)
     end

@@ -883,7 +883,11 @@ end
         Tables.Scan(filter=Tables.col(:x) <= -0.0),
         Tables.Scan(filter=Tables.col(:x) >= 0.0),
         Tables.Scan(filter=Tables.in_(Tables.col(:x), (-0.0,))),
-        Tables.Scan(filter=Tables.colne(Tables.col(:x), NaN))]
+        Tables.Scan(filter=Tables.colne(Tables.col(:x), NaN)),
+        # OP_NE pruning: a constant batch equal to the literal is the ONLY
+        # provably prunable case; mixed batches and NaN stats must fetch.
+        Tables.Scan(filter=Tables.colne(Tables.col(:x), 0.0)),
+        Tables.Scan(filter=Tables.colne(Tables.col(:x), -0.0))]
     for scan in floatscans
         want = Tables.finish(ffull, scan)
         @assert _tables_equal(Tables.scan(faf, scan), want)

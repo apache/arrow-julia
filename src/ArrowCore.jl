@@ -32,15 +32,17 @@ Design rules this module is built to demonstrate:
    None parameterize the Core storage types. Struct materialization always
    returns `Vector{Pair{String,Any}}`; a typed facade remains separate work.
 
-2. Memory validity is GC reachability. Every buffer is a `BufferSlice`
-   into an `OwnerRegion` — an immutable (pointer, length, alignment, root)
-   record whose `root` anchors the backing storage. Slices are bounds-checked
-   against the region at construction. For verified owned and IPC extents,
-   corrupt spans therefore fail before access; foreign extents remain trusted
-   declarations, and mapped files remain exposed to external changes. Loads
-   are a final bounds check plus a raw load, with no per-access synchronization.
-   Deterministic eager release is deliberately constrained out of this core
-   (see §1). Mmap stdlib storage is unmapped later by its GC finalizer.
+2. Memory validity is GC reachability, plus one revocation bit. Every
+   buffer is a `BufferSlice` into an `OwnerRegion` — a (pointer, length,
+   alignment, root, cell) record whose `root` anchors the backing storage
+   and whose `ReleaseCell` supports `close!`: regions sharing one
+   underlying lifetime share one cell, so a close revokes every sibling and
+   runs the release action (mmap unmap, foreign release callback) exactly
+   once, and later access is a clean error. Slices are bounds-checked
+   against the region at construction; loads are a final bounds check, one
+   monotonic closed-flag load, and the raw read. Foreign extents remain
+   trusted declarations, and mapped files remain exposed to external
+   changes.
 
 3. One structural layout registry. `layoutspec(type)` returns the buffer
    roles / child arity / offset width for each of the format-1.5 layouts.
@@ -82,7 +84,7 @@ const checked_add = Checked.checked_add
 const checked_sub = Checked.checked_sub
 const checked_mul = Checked.checked_mul
 
-export OwnerRegion, BufferSlice, heapregion, mmapregion, close!,
+export OwnerRegion, BufferSlice, heapregion, mmapregion, close!, ReleaseCell,
     ReleaseCounter, increment!,
     ArrowType, NullType, BoolType, IntType, FloatType, DecimalType,
     FixedSizeBinaryType, BinaryType, Utf8Type, DateType, TimeType,
@@ -99,37 +101,22 @@ export OwnerRegion, BufferSlice, heapregion, mmapregion, close!,
 # §1 Memory: regions as GC anchors (constrained model)
 # ---------------------------------------------------------------------------
 #
-# DESIGN DECISION (maintainer review, 2026-08-13): buffer validity is
-# GC REACHABILITY — Julia's native memory-safety contract — and nothing else.
-# A region is an immutable (pointer, length, alignment, root) record: the
-# `root` is whatever keeps the memory alive (the wrapped Julia array, the
-# Mmap-stdlib array whose own finalizer unmaps at collection, a C-data
-# adapter's owner object whose finalizer calls the producer's release). Views
-# hold their region; the region holds its root; therefore memory a view can
-# reach is memory that is valid.
-#
-# The earlier prove-out iterations carried a full lifecycle state machine
-# (guards, phases, deterministic forceclose!, release actions, per-kind
-# machinery). Review concluded it was a ton of complexity for unproven
-# use-cases: the guard/invalidate system existed to make OUR OWN optional
-# eager-release feature safe, while the failures that actually occur in the
-# wild (a mapped file truncated or rewritten externally) were never
-# preventable by any in-process state machine. Constraining eager release
-# out of scope deletes the machinery wholesale and makes every buffer load
-# a bounds check plus a raw load — no per-access synchronization.
-#
-# What this deliberately gives up, so the constraint is informed:
-#   * Eager, deterministic unmap (e.g. delete-a-mapped-file-now on Windows):
-#     unmapping happens when the GC collects the mapping. Revisit if real
-#     demand appears, likely as an opt-in layer once upstream offers a
-#     public API.
-#   * A guard/invalidate error for use-after-release: with no eager release
-#     in Core there is nothing to use-after. The C-data adapter's explicit
-#     `release!` is caller-contract (post-release access is undefined) —
-#     which is the C data interface spec's own rule for released structures.
-#   * External-truncation protection: never existed anywhere; a shared
-#     mapping's pages can vanish under any implementation. Same exposure as
-#     every mmap-based reader.
+# Buffer validity is GC REACHABILITY — Julia's native memory-safety
+# contract — plus one explicit revocation layer. A region's `root` is
+# whatever keeps the memory alive (the wrapped Julia array, the Mmap-stdlib
+# array, a C-data adapter's owner object); views hold their region, the
+# region holds its root, so memory a view can reach is memory that is
+# valid. `close!` is the deterministic release path on top: one
+# `ReleaseCell` per underlying lifetime revokes every region over it and
+# runs the eager release action exactly once (unmap now; run the foreign
+# release now), turning use-after-close into `InvalidStateException`
+# instead of undefined behavior. What stays out of scope, so the contract
+# is informed:
+#   * Data-race shielding for loads concurrent WITH close!: quiescing
+#     readers first is the caller's contract, as with `Base.close` on a
+#     shared IO. Loads take no locks.
+#   * External-truncation protection: a shared mapping's pages can vanish
+#     under any implementation. Same exposure as every mmap-based reader.
 
 "An atomic counter (observation/exactly-once bookkeeping for adapters and tests)."
 mutable struct ReleaseCounter
@@ -149,33 +136,75 @@ function increment!(c::ReleaseCounter)
 end
 
 """
+    ReleaseCell(action::Ptr{Cvoid}, arg)
+    ReleaseCell()
+
+The revocation state one release action guards. Every `OwnerRegion` carries
+a cell; regions that share one underlying lifetime (all buffers imported
+from one C-data tree) share ONE cell, so closing any of them revokes every
+sibling before the single release action runs. The action is a
+`@cfunction(f, Cvoid, (Ptr{Cvoid},))` trampoline receiving
+`pointer_from_objref(arg)` — pure C ABI, the same idiom the C-data
+adapter's release callbacks use and the form the trim verifier accepts
+(an `Any`-argument cfunction is not) — or `C_NULL` when the backing
+storage is a borrow with no eager action (a heap vector — running a
+borrowed object's finalizers is not ours to do). `arg` must be a mutable
+heap object; the cell's reference keeps it alive across the call. Build
+trampolines at runtime, never in a module-level const (a serialized
+cfunction pointer is garbage after precompile reload).
+"""
+mutable struct ReleaseCell
+    @atomic closed::Bool
+    const action::Ptr{Cvoid}
+    const arg::Any
+end
+ReleaseCell(action::Ptr{Cvoid}, arg) = ReleaseCell(false, action, arg)
+ReleaseCell() = ReleaseCell(false, Ptr{Cvoid}(C_NULL), nothing)
+
+"""
+    close!(cell::ReleaseCell)
+
+Revoke every region sharing the cell — later raw access throws
+`InvalidStateException` — and run the cell's release action exactly once.
+Idempotent. Not a data-race shield for accesses concurrent WITH the close;
+quiescing readers first is the caller's contract, as with `Base.close` on
+a shared IO.
+"""
+function close!(cell::ReleaseCell)
+    (@atomicswap :acquire_release cell.closed = true) && return nothing
+    if cell.action != C_NULL
+        arg = cell.arg
+        GC.@preserve arg ccall(cell.action, Cvoid, (Ptr{Cvoid},),
+            pointer_from_objref(arg))
+    end
+    return nothing
+end
+
+"""
     OwnerRegion
 
-One contiguous memory region and the object that keeps it alive. Immutable:
-there is no lifecycle to manage — the region is valid exactly as long as it
-is reachable, because `root` anchors the backing storage (a borrowed Julia
-array, the Mmap-stdlib array, or an adapter's owner object). Slices
-reject geometry outside the declared `len` at construction. For adapters that
-verify the backing extent, corrupt spans therefore fail before access. Loads
-retain a final bounds check before the raw read.
+One contiguous memory region, the object that keeps it alive, and the
+[`ReleaseCell`](@ref) that can revoke it. The region is valid while it is
+reachable — `root` anchors the backing storage (a borrowed Julia array, the
+Mmap-stdlib array, or an adapter's owner object) — or until `close!` runs
+its cell's release action, after which every raw access through `sliceptr`
+throws. Slices reject geometry outside the declared `len` at construction;
+loads retain a final bounds check before the raw read.
 
 The scoped-borrow contract for wrapped Julia arrays: the caller must not
 mutate or resize the array while the region or any cached validation result
 remains in use. Mutation can invalidate a semantic certificate; resizing can
 reallocate the storage and invalidate its pointer.
 """
-mutable struct OwnerRegion
-    const ptr::Ptr{UInt8}
-    const len::Int64
-    const alignment::Base.Int   # guaranteed ptr alignment, capped at 64; loads consult it
-    const root::Any             # GC anchor; never dispatched on, only stored
-    # `close!` support: once set, every raw access through `sliceptr` throws.
-    # The flag makes use-AFTER-close a deterministic error; it is not a
-    # data-race shield for accesses concurrent WITH close! — quiescing users
-    # first is the caller's contract, as with `Base.close` on an IO.
-    @atomic closed::Bool
+struct OwnerRegion
+    ptr::Ptr{UInt8}
+    len::Int64
+    alignment::Base.Int   # guaranteed ptr alignment, capped at 64; loads consult it
+    root::Any             # GC anchor; never dispatched on, only stored
+    cell::ReleaseCell
 
-    function OwnerRegion(ptr::Ptr{UInt8}, len::Integer; root=nothing)
+    function OwnerRegion(ptr::Ptr{UInt8}, len::Integer; root=nothing,
+        cell::ReleaseCell=ReleaseCell())
         len >= 0 || throw(ArgumentError("region length must be non-negative"))
         n = Int64(len)
         (ptr != C_NULL || n == 0) ||
@@ -191,29 +220,23 @@ mutable struct OwnerRegion
                 throw(ArgumentError("region extent wraps the native address space"))
         end
         align = ptr == C_NULL ? 64 : (1 << trailing_zeros(UInt(ptr) | UInt(64)))
-        return new(ptr, n, align, root, false)
+        return new(ptr, n, align, root, cell)
     end
 end
 
 """
     close!(r::OwnerRegion)
 
-Deterministically release the region's backing storage: mark the region
-closed — every later raw access through its slices throws
-`InvalidStateException` — and run the root's finalizers now (an mmap root
-unmaps immediately; a foreign C-data root runs its release callback; a
-plain heap root has nothing eager to do and simply becomes unreachable
-through this region). Idempotent. Callers must quiesce concurrent readers
-first, exactly as with `Base.close` on a shared IO.
-
-The eager path exists for hosts where a GC-timed unmap is not enough —
-deleting a still-mapped file on Windows being the canonical case.
+Deterministically release the region's backing storage through its
+[`ReleaseCell`](@ref): every region sharing the cell is revoked (later raw
+access throws `InvalidStateException`) and the cell's release action runs
+exactly once — an mmap region unmaps NOW (the eager path exists for hosts
+where a GC-timed unmap is not enough, deleting a still-mapped file on
+Windows being the canonical case); an imported C-data tree runs the
+producer's release callback; a borrowed heap region is revoked with no
+eager action. Idempotent.
 """
-function close!(r::OwnerRegion)
-    (@atomicswap :acquire_release r.closed = true) && return nothing
-    r.root === nothing || finalize(r.root)
-    return nothing
-end
+close!(r::OwnerRegion) = close!(r.cell)
 
 """
     heapregion(v::Vector{T}) -> OwnerRegion
@@ -237,6 +260,11 @@ while the region or any cached validation result remains in use: a shared
 mapping cannot keep a semantic certificate valid when another process
 changes its bytes, and truncation can make an in-range load fault.
 """
+function _release_mmap(p::Ptr{Cvoid})::Cvoid
+    finalize(unsafe_pointer_to_objref(p)::Memory{UInt8})
+    return nothing
+end
+
 function mmapregion(path::AbstractString)
     io = open(path, "r")
     arr = try
@@ -246,8 +274,15 @@ function mmapregion(path::AbstractString)
         close(io)
     end
     isempty(arr) && throw(ArgumentError("cannot map empty file: $path"))
-    return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr); root=arr)
+    # The unmap finalizer is registered on the array's backing Memory, not
+    # on the Vector wrapper: `finalize(arr)` would be a no-op. The cell's
+    # release targets the Memory so close! truly unmaps now.
+    cell = ReleaseCell(@cfunction(_release_mmap, Cvoid, (Ptr{Cvoid},)),
+        arr.ref.mem)
+    return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr); root=arr,
+        cell=cell)
 end
+
 
 # --- BufferSlice ------------------------------------------------------------
 
@@ -281,7 +316,7 @@ isempty_buffer(b::BufferSlice) = b.len == 0
 @inline function sliceptr(b::BufferSlice)
     b.region === nothing && return Ptr{UInt8}(0)
     r = b.region::OwnerRegion
-    (@atomic :monotonic r.closed) && throw(InvalidStateException(
+    (@atomic :monotonic r.cell.closed) && throw(InvalidStateException(
         "the backing region was released by close!", :closed))
     return r.ptr + b.offset
 end

@@ -1401,10 +1401,16 @@ function _maypass(e::Tables.ScanExpr, stats, names, rowcount::Union{Missing,Int6
         v = e.rhs
         e.op == Tables.OP_EQ &&
             return _statcmp(>=, v, s.min) && _statcmp(>=, s.max, v)
+        # NE prunes only a provably constant batch equal to the literal:
+        # min == max == v. Anything weaker (including any NaN, where the
+        # equalities are false) must fetch.
+        e.op == Tables.OP_NE &&
+            return !(_stateq(s.min, v) && _stateq(s.max, v))
         e.op == Tables.OP_LT && return _statcmp(<, s.min, v)
         e.op == Tables.OP_LE && return _statcmp(<=, s.min, v)
         e.op == Tables.OP_GT && return _statcmp(>, s.max, v)
-        return _statcmp(>=, s.max, v)          # OP_GE
+        e.op == Tables.OP_GE && return _statcmp(>=, s.max, v)
+        return true    # unknown comparison ops never prune
     elseif e isa Tables.In
         s = lookup(e.lhs)
         s === nothing && return true
