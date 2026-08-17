@@ -44,7 +44,9 @@ One exception: a filter literal with no exact storage representation for
 its column (a cross-domain or out-of-range value) makes the scan
 unpushable — the whole source is then read and the scan evaluates over the
 converted public values. Over a ranged source that fallback fetches the
-entire object; plan remote filters in each column's public value domain.
+entire object, as does reading a zero-field source (its row count lives
+in batch metadata); plan remote filters in each column's public value
+domain.
 
 Columns are materialized (plain `Vector`s): the returned table does not
 borrow the source bytes, and [`Arrow.close!`](@ref) may be called at any
@@ -407,8 +409,10 @@ function Table(source; scan::Union{Nothing,Tables.Scan}=nothing,
             # A zero-field object is bytes-tiny; fetch it whole so the row
             # count survives the read.
             bytes = _fetchexact(rf.src, Int64(0), rf.src.len)
-            return _publicscan(_materialize_table(readfile(bytes),
-                AC.OwnerRegion[]), sch, rfields, theScan, AC.OwnerRegion[])
+            return _publicscan(
+                _materialize_table(readfile(bytes; limits=rf.limits),
+                    AC.OwnerRegion[]), sch, rfields, theScan,
+                AC.OwnerRegion[])
         end
         pushscan, pushable = _lowerscan(theScan, rfields)
         if pushable
@@ -452,12 +456,19 @@ end
 "Evaluate a scan in the PUBLIC value domain over a converted Table."
 function _publicscan(full::Table, schema, sourcefields, scan, regions)
     if isempty(Tables.columnnames(full))
-        # No columns can carry the count through Tables.finish; apply the
-        # window arithmetic directly (a filter cannot reference anything).
+        # No columns can carry the count through Tables.finish. Validation
+        # still applies (column references and invalid selections error),
+        # any filter over zero columns matches nothing, and the window
+        # arithmetic runs directly.
+        scan.validate && Tables.bind(scan, Symbol[])
         n0 = Tables.rowcount(full)
-        lo = min(Base.Int(scan.offset), n0)
-        n1 = n0 - lo
-        scan.limit === nothing || (n1 = min(n1, Base.Int(scan.limit)))
+        n1 = if scan.filter !== nothing
+            0
+        else
+            lo = min(Base.Int(scan.offset), n0)
+            n = n0 - lo
+            scan.limit === nothing ? n : min(n, Base.Int(scan.limit))
+        end
         return _table(Symbol[], AbstractVector[], schema,
             AC.OwnerRegion[regions...], n1)
     end
@@ -515,7 +526,7 @@ function _boundschema(schema, sourcefields, scan)
     for bc in b.columns
         f = sourcefields[bc.index]
         if bc.type !== nothing &&
-           Base.nonmissingtype(bc.type) !== _facadebasetype(f.type)
+           !(_facadeeltype(f) <: Union{bc.type,Missing})
             # A type override changed the public column type; the retained
             # descriptor no longer describes it. Omit the field — a later
             # rewrite re-infers this column naturally.
@@ -548,13 +559,11 @@ function _wrapscanned(got, schema, sourcefields, scan;
             # Public type overrides run HERE, after facade conversion —
             # they are public-domain requests, never storage casts, and
             # they preserve missing exactly as Tables.finish does.
-            if bc.type === nothing
-                T = _facadeeltype(f)
-                columns[i] = T === Any ? map(identity, converted) :
-                    collect(T, converted)
-            else
-                columns[i] = _applyoverride(bc.type, converted)
-            end
+            T = _facadeeltype(f)
+            base = T === Any ? map(identity, converted) :
+                collect(T, converted)
+            columns[i] = bc.type === nothing ? base :
+                _applyoverride(bc.type, base)
         end
     end
     nrows = isempty(columns) ? _scanrowcount(got) : length(columns[1])
@@ -564,10 +573,14 @@ end
 
 _scanrowcount(got) = Base.Int(Tables.rowcount(Tables.columns(got)))
 
-"Convert a column to an override type, preserving missing like Tables.finish."
+"Convert a column to an override type with Tables.finish's exact rules."
 function _applyoverride(T, col)
+    # finish's no-op rule: a column already accepted by Union{T,Missing}
+    # passes through untouched (supertype overrides included).
+    eltype(col) <: Union{T,Missing} && return col
     TN = Base.nonmissingtype(T)
-    if T >: Missing || any(x -> x === missing, col)
+    if eltype(col) >: Missing
+        # Declared nullability, not observed values.
         return Union{Missing,TN}[x === missing ? missing : convert(TN, x)
                                  for x in col]
     end

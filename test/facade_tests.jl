@@ -479,6 +479,69 @@ end
         end
     end
 
+    @testset "override subsumption is a no-op; zero-field filters count" begin
+        io = IOBuffer()
+        Arrow.write(io, (x=Union{Missing,Int64}[1, 2],
+            s=Union{Missing,String}["a", "b"]))
+        fb = take!(io)
+        # nullable source, no observed missing: supertype/no-op overrides
+        # keep the DECLARED element type, exactly like Tables.finish.
+        t = Arrow.Table(fb; scan=Tables.Scan(select=(
+            :x => Int64, :s => AbstractString)))
+        @test eltype(t.x) == Union{Missing,Int64}
+        @test eltype(t.s) == Union{Missing,String}
+        io2 = IOBuffer()
+        Arrow.write(io2, t; file=false)   # rewrites cleanly, metadata intact
+        @test isequal(Arrow.Table(take!(io2)).x, [1, 2])
+        # zero-field: filters and validation apply
+        sch = Arrow.AC.Schema(Arrow.AC.Field[])
+        zb = Arrow.writefile(sch,
+            [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 3)])
+        tz = Arrow.Table(zb; scan=Tables.Scan(
+            filter=Tables.coleq(Tables.col(:nope), 1), validate=false))
+        @test Tables.rowcount(tz) == 0
+        @test_throws ArgumentError Arrow.Table(zb; scan=Tables.Scan(
+            filter=Tables.coleq(Tables.col(:nope), 1)))
+        # ranged zero-field honors RangedFile limits
+        rfz = Arrow.RangedFile(Arrow.RangedSource(zb);
+            limits=Arrow.Limits(max_array_length=2))
+        @test_throws Arrow.AC.ValidationError Arrow.Table(rfz)
+    end
+
+    @testset "replaced columns are refused before value access" begin
+        io = IOBuffer()
+        Arrow.write(io, (n=Int64[1], s=["x"], p=Arrow.DictEncode(["x"])))
+        t = Arrow.Table(take!(io))
+        for (col, bad) in ((:n, ["oops"]), (:s, Int64[1]), (:p, Int64[7]))
+            cols = AbstractVector[c for c in getfield(t, :columns)]
+            cols[getfield(t, :lookup)[col]] = bad
+            broken = Arrow.Table(getfield(t, :names), cols,
+                getfield(t, :lookup), getfield(t, :schema),
+                Arrow.AC.OwnerRegion[], 1)
+            io2 = IOBuffer()
+            @test_throws ArgumentError Arrow.write(io2, broken; file=false)
+        end
+        # missing into a non-nullable retained dictionary is refused
+        pool = ["a"]
+        pf, pd = Arrow.AC.fromjulia("d", pool)
+        dt = Arrow.AC.DictionaryType(Arrow.AC.IntType(32, true), pf.type, false)
+        dd = Arrow.AC.ArrayData(dt, 1,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int32[0])];
+            dictionary=pd, nullcount=0)
+        df = Arrow.AC.Field("d", dt; nullable=false)
+        dsch = Arrow.AC.Schema([df])
+        dbytes = Arrow.writestream(dsch,
+            [Arrow.AC.RecordBatch(dsch, [dd], 1)])
+        td = Arrow.Table(dbytes)
+        cols = AbstractVector[Union{Missing,String}["a", missing][1:1]]
+        cols[1] = Union{Missing,String}[missing]
+        brokend = Arrow.Table(getfield(td, :names), cols,
+            getfield(td, :lookup), getfield(td, :schema),
+            Arrow.AC.OwnerRegion[], 1)
+        io3 = IOBuffer()
+        @test_throws ArgumentError Arrow.write(io3, brokend; file=false)
+    end
+
     @testset "errors are clean" begin
         @test_throws ArgumentError Arrow.write(IOBuffer(),
             Tables.partitioner(NamedTuple[]))

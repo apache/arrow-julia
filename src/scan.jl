@@ -785,7 +785,7 @@ function _rangedfooter(rf::RangedFile, budget::AllocationBudget)
         throw(ValidationError("footer length $footerlen outside (0, $(limits.max_metadata_bytes)]"))
     footerstart = L - 10 - footerlen
     footerstart >= 8 || throw(ValidationError("footer escapes the file"))
-    
+
     _charge!(budget, footerlen, "footer allocation")
     footerbytes = footerstart >= tailstart ?
         tail[(footerstart - tailstart + 1):(footerstart - tailstart + footerlen)] :

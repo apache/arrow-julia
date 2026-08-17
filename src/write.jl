@@ -140,18 +140,23 @@ end
 "Build one column under a retained Field: descriptor, nullability, metadata."
 function _writecolumn(f::AC.Field, v::AbstractVector)
     t = f.type
+    # Identity FIRST, for every retained field with a known facade type:
+    # a replaced column is rejected on its declared element type before any
+    # value is read.
+    Fp = _facadebasetype(t)
+    if Fp !== Any
+        NT = Base.nonmissingtype(eltype(v))
+        NT <: Fp || NT === Union{} || throw(ArgumentError(
+            "column $(f.name) holds $(NT) values, but its retained Arrow " *
+            "type $(repr(t)) materializes as $(Fp); the column was " *
+            "replaced with incompatible data"))
+        eltype(v) >: Missing && !f.nullable && throw(ArgumentError(
+            "column $(f.name) may hold missing values but its retained " *
+            "field is non-nullable"))
+    end
     if t isa AC.DateType || t isa AC.TimestampType || t isa AC.TimeType ||
        t isa AC.DurationType
-        # Identity first: the visible column must hold the facade type this
-        # descriptor materializes as. Scan-literal compatibility is a
-        # different, looser contract.
-        F = _facadebasetype(t)
-        NT = Base.nonmissingtype(eltype(v))
-        NT <: F || (isempty(v) && NT === Union{}) || throw(ArgumentError(
-            "column $(f.name) holds $(NT) values, but its retained Arrow " *
-            "type $(repr(t)) materializes as $(F); the column was replaced " *
-            "with incompatible data"))
-        if F === Int64
+        if Fp === Int64
             storage = Union{Missing,Int64}[x === missing ? missing : Int64(x)
                                            for x in v]
         else
@@ -332,6 +337,21 @@ function _writebytes(tbl; file::Bool=true, compress::Union{Nothing,Symbol}=nothi
             vals = [partcols[k][j] isa DictEncode ?
                     (partcols[k][j]::DictEncode).data : partcols[k][j]
                     for k = 1:nparts]
+            if rf !== nothing
+                Fv = _facadebasetype(rf.type)
+                for k = 1:nparts
+                    NT = Base.nonmissingtype(eltype(vals[k]))
+                    Fv !== Any && !(NT <: Fv) && NT !== Union{} &&
+                        throw(ArgumentError(
+                        "column $(names[j]) holds $(NT) values, but its " *
+                        "retained dictionary materializes as $(Fv); the " *
+                        "column was replaced with incompatible data"))
+                    eltype(vals[k]) >: Missing && !rf.nullable &&
+                        throw(ArgumentError(
+                        "column $(names[j]) may hold missing values but " *
+                        "its retained dictionary field is non-nullable"))
+                end
+            end
             pool = unique(x for k = 1:nparts for x in skipmissing(vals[k]))
             lookup = Dict{Any,Int32}(x => Int32(i - 1)
                                      for (i, x) in enumerate(pool))
