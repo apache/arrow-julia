@@ -904,7 +904,6 @@ end
 IPCStream(sch, fields, batches, nextindex, pulling) =
     IPCStream(sch, fields, batches, nextindex, pulling, IdDict{Field,Int64}())
 
-
 mutable struct PendingRecord
     fm::FramedMessage
     dictionaries::Dict{Int64,ArrayData}
@@ -1083,48 +1082,4 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
     finally
         close(state)
     end
-end
-
-function _threaded_cursor_stress()
-    workers = min(4, Threads.nthreads())
-    workers > 1 || error("threaded IPC cursor stress requires multiple threads")
-    n = 200_000
-    sch = Schema(Field[])
-    batches = AC.RecordBatch[
-        AC.RecordBatch(sch, ArrayData[], i) for i = 1:n
-    ]
-    stream = IPCStream(sch, AC.FrozenVector{Field}(Field[]), batches, 1, false)
-    results = [Int64[] for _ = 1:workers]
-    violations = AC.ReleaseCounter()
-    ready = AC.ReleaseCounter()
-    start = Base.Event()
-    tasks = [Threads.@spawn begin
-        AC.increment!(ready)
-        wait(start)
-        while true
-            b = try
-                nextbatch!(stream)
-            catch e
-                if e isa Base.ConcurrencyViolationError
-                    AC.increment!(violations)
-                    yield()
-                    continue
-                end
-                rethrow()
-            end
-            b === nothing && break
-            push!(results[worker], b.nrows)
-        end
-    end for worker = 1:workers]
-    while ready[] != workers
-        yield()
-    end
-    notify(start)
-    fetch.(tasks)
-    got = reduce(vcat, results)
-    @assert length(got) == n
-    sort!(got)
-    @assert got == collect(Int64, 1:n)
-    @assert violations[] > 0
-    return nothing
 end

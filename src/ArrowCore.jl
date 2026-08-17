@@ -63,19 +63,13 @@ Design rules this module is built to demonstrate:
    limits before metadata-directed allocation) belong to the adapters and
    are exercised in the IPC example.
 
-Interruption contract: asynchronous interruption (SIGINT /
-`InterruptException`, task cancellation) is explicitly OUT of this module's
-guarantees, matching ecosystem-wide practice — Base itself does not make
-arbitrary code async-exception-atomic, and pretending otherwise costs
-pervasive `disable_sigint` scaffolding for a property that still cannot be
-fully delivered. Ordinary exception safety (error paths clean up, release
-is exactly-once) IS in contract. When Julia 1.14's structured cancellation
-lands, a formal revisit is planned on top of whatever Base then provides.
-
 The registry, staged validation, element access, and materialization cover
 the mapped format-1.5 layouts, including binary views, list views, and
-run-end encoding. Canonical padding and unused-bit checks remain production
-work. Core has no codec dependency; the IPC adapter implements compression.
+run-end encoding. `validate_full` additionally enforces canonical
+bit-packed form (zeroed trailing bits and padding); on-wire buffer padding
+is a writer guarantee, not a reader requirement — the spec permits unpadded
+buffers and this reader accepts them. Core has no codec dependency; the
+IPC adapter implements compression.
 There is no Tables.jl integration or `ViewPlan` — bulk access here uses a
 plain function barrier (`materialize`) to demonstrate the pattern the facade
 will formalize.
@@ -614,13 +608,8 @@ expected frequency.
     throw(ArgumentError("unregistered ArrowType"))
 end
 
-# A plain-dispatch collapse of these ladders was tried (Aug 2026) and
-# rejected by evidence: JuliaC's `--trim=safe` verifier reports the abstract
-# call site (`layoutspec(d.type::ArrowType)`) as an unresolved call — it
-# does not enumerate the closed method table, so the ladders remain the
-# devirtualization mechanism. The throwing `::Any` fallback below is the
-# piece of that simplification worth keeping: junk descriptors get a clean
-# error instead of a `MethodError` wherever the raw method table is called.
+# Junk descriptors get a clean error instead of a MethodError wherever the
+# raw method table is called directly.
 layoutspec(::Any) = throw(ArgumentError("unregistered ArrowType"))
 
 # ---------------------------------------------------------------------------
@@ -1642,8 +1631,38 @@ function validate_full(f::Field, d::ArrayData)
     return d
 end
 
+# Canonical bit-packed form: the spec recommends writers zero the unused
+# trailing bits of the final byte and any padding bytes, and forbids readers
+# from relying on either — so enforcement is full-tier only. Sliced arrays
+# are exempt: trailing bits inside a shared bitmap window can legitimately
+# belong to a sibling slice.
+function _validate_canonical_bits(d::ArrayData)
+    d.offset == 0 && d.len > 0 || return nothing
+    spec = layoutspec_of(d.type)
+    for (idx, role) in enumerate(spec.buffers)
+        role == VALIDITY || (role == DATA && d.type isa BoolType) || continue
+        b = d.buffers[idx]
+        nbytes = Int64(cld(d.len, 8))
+        b.len >= nbytes || continue     # absent/short bitmaps are the
+                                        # structural tier's concern
+        tail = d.len % 8
+        if tail != 0
+            mask = UInt8(0xff) << tail
+            loadat(b, UInt8, nbytes - 1) & mask == 0x00 || throw(ValidationError(
+                "canonical form requires zeroed unused bits in the final " *
+                "byte of a bit-packed buffer"))
+        end
+        for i = nbytes:(b.len - 1)
+            loadat(b, UInt8, i) == 0x00 || throw(ValidationError(
+                "canonical form requires zeroed padding in bit-packed buffers"))
+        end
+    end
+    return nothing
+end
+
 function _validate_full_content(f::Field, d::ArrayData)
     _validate_advisory_values(d.type, d)
+    _validate_canonical_bits(d)
     if d.type isa Utf8Type || (d.type isa ViewType && d.type.utf8)
         for i = 1:d.len
             isvalid_at(d, i) || continue

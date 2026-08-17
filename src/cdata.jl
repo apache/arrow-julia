@@ -409,7 +409,6 @@ function _reset_node_claim!(control::Ptr{Cvoid})
     return nothing
 end
 
-
 function _release_array_children!(topology)
     children, dictionary = topology
     for child in children
@@ -518,8 +517,8 @@ end
 end
 _store_field!(p, name::Symbol, v) = _store_field!(p, Val(name), v)
 
-_malloc!(root::ExportedRoot, n::Integer,
-    register! = push!, deallocate! = Libc.free) = begin
+function _malloc!(root::ExportedRoot, n::Integer,
+    register! = push!, deallocate! = Libc.free)
     n >= 0 || throw(ArgumentError("negative export allocation size"))
     n64 = Int64(n)
     # Reserve the ledger slot before acquiring native memory. After malloc,
@@ -548,7 +547,7 @@ _malloc!(root::ExportedRoot, n::Integer,
         end
         rethrow()
     end
-    Ptr{Cvoid}(p)
+    return Ptr{Cvoid}(p)
 end
 
 function _cstring!(root::ExportedRoot, s::AbstractString)
@@ -933,35 +932,6 @@ function _release_foreign_owner!(o::ForeignOwner, deallocate!)
         deallocate!(o.arrayblock)
     end
     return nothing
-end
-
-const TEST_CONFORMING_RELEASES = ReleaseCounter()
-const TEST_NONCONFORMING_RELEASES = ReleaseCounter()
-
-function _test_conforming_release(p::Ptr{CArrowArray})::Cvoid
-    increment!(TEST_CONFORMING_RELEASES)
-    _store_field!(p, :release, Ptr{Cvoid}(C_NULL))
-    return nothing
-end
-
-function _test_nonconforming_release(::Ptr{CArrowArray})::Cvoid
-    increment!(TEST_NONCONFORMING_RELEASES)
-    return nothing
-end
-
-# Runtime accessors, NOT module-level pointer constants: a raw @cfunction
-# pointer stored in a const is serialized into the precompile cache and is
-# garbage when the package reloads. The static @cfunction form is cheap at
-# runtime (it returns the session's cached trampoline).
-test_conforming_release() =
-    @cfunction(_test_conforming_release, Cvoid, (Ptr{CArrowArray},))
-test_nonconforming_release() =
-    @cfunction(_test_nonconforming_release, Cvoid, (Ptr{CArrowArray},))
-
-function _test_c_array(release::Ptr{Cvoid})
-    return CArrowArray(0, 0, 0, 0, 0, Ptr{Ptr{Cvoid}}(C_NULL),
-        Ptr{Ptr{CArrowArray}}(C_NULL), Ptr{CArrowArray}(C_NULL), release,
-        Ptr{Cvoid}(C_NULL))
 end
 
 "Read child/dictionary struct pointers out of a CArrowArray."
@@ -1739,195 +1709,3 @@ function _nextbatch!(s::ImportedStream, ownerfactory)
     end
     return AC.RecordBatch(s.schema, collect(ArrayData, d.children), d.len)
 end
-
-# ---------------------------------------------------------------------------
-# Demo: export -> import round-trip, release lifecycle, failure paths
-# ---------------------------------------------------------------------------
-
-_registry_count() = lock(REGISTRY_LOCK) do
-    length(EXPORT_REGISTRY)
-end
-
-function _call_release(p::Ptr{CArrowSchema})
-    release = lock(REGISTRY_LOCK) do
-        unsafe_load(p).release
-    end
-    release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowSchema},), p)
-    return nothing
-end
-
-function _call_release(p::Ptr{CArrowArray})
-    release = lock(REGISTRY_LOCK) do
-        unsafe_load(p).release
-    end
-    release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowArray},), p)
-    return nothing
-end
-
-function _expect_invalid_list_topology!(mutate)
-    f, d = fromjulia("bad-list", [Int64[1]])
-    before = _registry_count()
-    sp, ap = to_c_data(f, d)
-    mutate(sp, ap)
-    @assert try
-        from_c_data(sp, ap)
-        false
-    catch e
-        e isa ValidationError
-    end
-    @assert unsafe_load(sp).release == C_NULL
-    @assert unsafe_load(ap).release == C_NULL
-    @assert reap!() == 2
-    @assert _registry_count() == before
-    return nothing
-end
-
-function _expect_invalid_dictionary_topology!(mutate)
-    vf, vd = fromjulia("values", ["x"])
-    t = DictionaryType(IntType(32, true), vf.type, false)
-    f = Field("bad-dictionary", t; nullable=false, children=vf.children)
-    d = ArrayData(t, 1, [BufferSlice(), AC._databuffer(Int32[0])];
-        dictionary=vd, nullcount=0)
-    before = _registry_count()
-    sp, ap = to_c_data(f, d)
-    mutate(sp, ap)
-    @assert try
-        from_c_data(sp, ap)
-        false
-    catch e
-        e isa ValidationError
-    end
-    @assert unsafe_load(sp).release == C_NULL
-    @assert unsafe_load(ap).release == C_NULL
-    @assert reap!() == 2
-    @assert _registry_count() == before
-    return nothing
-end
-
-function _expect_invalid_schema_flags!(flags::Int64)
-    f, d = fromjulia("bad-flags", Int64[1])
-    before = _registry_count()
-    sp, ap = to_c_data(f, d)
-    _store_field!(sp, :flags, flags)
-    @assert try
-        from_c_data(sp, ap)
-        false
-    catch e
-        e isa ValidationError
-    end
-    @assert unsafe_load(sp).release == C_NULL
-    @assert unsafe_load(ap).release == C_NULL
-    @assert reap!() == 2
-    @assert _registry_count() == before
-    return nothing
-end
-
-@noinline function _import_and_forget(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray})
-    f, d = from_c_data(sp, ap)
-    @assert materialize(f, d) == [1]
-    return nothing
-end
-
-@noinline function _export_and_forget()
-    f, d = fromjulia("registry-rooted", Int64[1, 2])
-    region = d.buffers[2].region
-    sp, ap = to_c_data(f, d)
-    return sp, ap, WeakRef(d), WeakRef(region)
-end
-
-function _stress_reaper(ready, start, done, workers)
-    increment!(ready)
-    wait(start)
-    reaped = 0
-    for _ = 1:10_000
-        reaped += reap!()
-        done[] == workers && _registry_count() == 0 && break
-        yield()
-    end
-    return reaped
-end
-
-function _threaded_cdata_stress()
-    Threads.nthreads() >= 4 ||
-        error("threaded C Data stress requires at least four threads")
-
-    # Different exported trees may release concurrently. Reapers scan and
-    # claim those roots at the same time; each root must be popped once.
-    n = 1_000
-    workers = 4
-    f, d = fromjulia("registry-race", Int64[1])
-    roots = [to_c_data(f, d) for _ = 1:n]
-    ready = ReleaseCounter()
-    done = ReleaseCounter()
-    start = Base.Event()
-    releasers = [errormonitor(Threads.@spawn begin
-        increment!(ready)
-        wait(start)
-        try
-            for i = worker:workers:n
-                sp, ap = roots[i]
-                _call_release(sp)
-                _call_release(ap)
-                i % 16 == 0 && yield()
-            end
-        finally
-            increment!(done)
-        end
-    end) for worker = 1:workers]
-    reapers = [errormonitor(Threads.@spawn _stress_reaper(
-        ready, start, done, workers)) for _ = 1:3]
-    while ready[] != length(releasers) + length(reapers)
-        yield()
-    end
-    notify(start)
-    foreach(fetch, releasers)
-    reaped_by_task = fetch.(reapers)
-    reaped = sum(reaped_by_task) + reap!()
-    @assert reaped == 2n (reaped, reaped_by_task, _registry_count())
-    @assert _registry_count() == 0
-
-    # One atomic swap must choose between explicit release and the registered
-    # finalizer before either path reads or frees the native struct copy.
-    rounds = 200
-    before = TEST_CONFORMING_RELEASES[]
-    owners = ForeignOwner[]
-    for _ = 1:rounds
-        owner = ForeignOwner(_test_c_array(test_conforming_release()))
-        _arm_foreign_owner!(owner)
-        push!(owners, owner)
-    end
-    ready = ReleaseCounter()
-    start = Base.Event()
-    contenders = Task[]
-    for owner in owners
-        push!(contenders, errormonitor(Threads.@spawn begin
-            increment!(ready)
-            wait(start)
-            release!(owner)
-        end))
-        push!(contenders, errormonitor(Threads.@spawn begin
-            increment!(ready)
-            wait(start)
-            finalize(owner)
-        end))
-    end
-    while ready[] != length(contenders)
-        yield()
-    end
-    notify(start)
-    foreach(fetch, contenders)
-    @assert TEST_CONFORMING_RELEASES[] - before == rounds
-    for owner in owners
-        @assert (@atomic owner.released)
-    end
-    println("threaded registry reaping and foreign-owner release passed ✓")
-    return nothing
-end
-
-# Test-support: one 16-byte view entry (inline / out-of-line forms).
-_viewentry(len::Int, rest::Vector{UInt8}) =
-    vcat(reinterpret(UInt8, Int32[Int32(len)]), rest, zeros(UInt8, 12 - length(rest)))
-_viewlong(len::Int, prefix::Vector{UInt8}, bufidx::Int, off::Int) =
-    vcat(reinterpret(UInt8, Int32[Int32(len)]), prefix,
-         reinterpret(UInt8, Int32[Int32(bufidx), Int32(off)]))
-

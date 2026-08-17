@@ -178,8 +178,8 @@ function _scan_main()
         Tables.Scan(select=(:ints => Float64,)),
         Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2),
         Tables.Scan(filter=Tables.in_(Tables.col(:strs), ("hey", "last"))),
-        Tables.Scan(select=(:strs, :lists), filter=Tables.col(3) == true),
-        Tables.Scan(select=(:strs => :ints,), filter=Tables.col(4) == "hey"),
+        Tables.Scan(select=(:strs, :lists), filter=Tables.coleq(Tables.col(3), true)),
+        Tables.Scan(select=(:strs => :ints,), filter=Tables.coleq(Tables.col(4), "hey")),
     ]
     for scan in scans
         got = Tables.scan(af, scan)
@@ -195,29 +195,17 @@ function _scan_main()
     @assert r2.limit == 2 && r2.filter !== nothing
     println("limit/offset consume exactly; filters poison the window ✓")
 
-    # Tables.finish currently overflows on these otherwise valid Int values.
-    # Residualizing the window preserves the protocol's observable contract
-    # until that authority uses saturating arithmetic.
+    # Extreme-but-valid windows: Tables.finish saturates, so the whole
+    # pipeline agrees on the empty result whether the window is consumed at
+    # the source or residualized.
     extreme = Tables.Scan(select=(:ints,), offset=typemax(Int), limit=typemax(Int))
-    authorityfails = try
-        Tables.finish(full, extreme)
-        false
-    catch e
-        e isa BoundsError
-    end
-    @assert authorityfails
+    extremewant = Tables.finish(full, extreme)
     for sourcefile in (af, RangedFile(RangedSource(filebytes)))
-        _, residual = Tables.apply(sourcefile, extreme)
-        @assert residual.offset == extreme.offset && residual.limit == extreme.limit
-        failed = try
-            Tables.scan(sourcefile, extreme)
-            false
-        catch e
-            e isa BoundsError
-        end
-        @assert failed
+        got = Tables.scan(sourcefile, extreme)
+        @assert _tables_equal(got, extremewant)
+        @assert length(Tables.getcolumn(Tables.columns(got), 1)) == 0
     end
-    println("overflowing Tables.finish windows remain residual ✓")
+    println("extreme scan windows saturate to the empty result ✓")
 
     # Skip proof 1 (columns): corrupt the `strs` OFFSETS buffer of batch 2 so
     # semantic validation must reject any decode that touches it. Buffer
@@ -404,7 +392,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         Tables.Scan(select=(:floats,), filter=Tables.col(:ints) > 2),
         Tables.Scan(offset=4, limit=3),
         Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2),
-        Tables.Scan(select=(:strs, :lists), filter=Tables.col(3) == true),
+        Tables.Scan(select=(:strs, :lists), filter=Tables.coleq(Tables.col(3), true)),
     ]
     for scan in scans
         log, src = countingsource(filebytes)
@@ -868,7 +856,7 @@ end
         Tables.Scan(filter=Tables.isnull(Tables.col(:x))),
         Tables.Scan(filter=Tables.startswith(Tables.col(:s), "i")),
         Tables.Scan(filter=(Tables.col(:x) > 2) & (Tables.col(:x) < 9)),
-        Tables.Scan(filter=!(Tables.col(:x) == 3)),
+        Tables.Scan(filter=Tables.colne(Tables.col(:x), 3)),
     ]
     for scan in prunescans
         want = Tables.finish(sfull, scan)
@@ -891,11 +879,11 @@ end
     faf = readfile(copy(fbytes))
     ffull = _fulltable(faf)
     floatscans = Tables.Scan[
-        Tables.Scan(filter=Tables.col(:x) == -0.0),
+        Tables.Scan(filter=Tables.coleq(Tables.col(:x), -0.0)),
         Tables.Scan(filter=Tables.col(:x) <= -0.0),
         Tables.Scan(filter=Tables.col(:x) >= 0.0),
         Tables.Scan(filter=Tables.in_(Tables.col(:x), (-0.0,))),
-        Tables.Scan(filter=!(Tables.col(:x) == NaN))]
+        Tables.Scan(filter=Tables.colne(Tables.col(:x), NaN))]
     for scan in floatscans
         want = Tables.finish(ffull, scan)
         @assert _tables_equal(Tables.scan(faf, scan), want)
@@ -1062,7 +1050,7 @@ end
         for sourcefile in (readfile(copy(hugebytes); limits=tight),
             RangedFile(RangedSource(hugebytes); limits=tight))
             rejected = try
-                Tables.scan(sourcefile, Tables.Scan(filter=Tables.col(:s) == "x"))
+                Tables.scan(sourcefile, Tables.Scan(filter=Tables.coleq(Tables.col(:s), "x")))
                 false
             catch e
                 e isa AllocationLimitError

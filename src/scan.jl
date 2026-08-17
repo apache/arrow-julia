@@ -1360,16 +1360,20 @@ function _nextprefix(s::String)
     return nothing
 end
 
-_statcmp(f, a, b) = try
-    f(a, b) === false ? false : true
-catch
-    true   # incomparable literal/stat types: never prune
+function _statcmp(f, a, b)
+    return try
+        f(a, b) === false ? false : true
+    catch
+        true   # incomparable literal/stat types: never prune
+    end
 end
 
-_stateq(a, b) = try
-    (a == b) === true
-catch
-    false
+function _stateq(a, b)
+    return try
+        (a == b) === true
+    catch
+        false
+    end
 end
 
 """

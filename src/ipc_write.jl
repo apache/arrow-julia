@@ -54,7 +54,6 @@
 # Adversarial writer-refusal and file-index cases cover the boundaries.
 # =============================================================================
 
-
 # TranscodingStreams is a direct dependency; both codecs share its one
 # streams API.
 
@@ -1194,7 +1193,6 @@ function _verifyblockframes(blob::BufferSlice, dictblocks, recordblocks,
     foreach(block -> _verifyblockframe(blob, block, UInt8(3)), recordblocks)
     return indexedend
 end
-
 
 function _blockmessage(region::OwnerRegion, block::NTuple{3,Int64},
     dataend::Int64, limits::Limits, budget::AllocationBudget)

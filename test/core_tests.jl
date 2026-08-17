@@ -260,6 +260,26 @@ end
         @test isequal(materialize(f, d), vals)
     end
 
+    @testset "canonical bit-packed form is full-tier only" begin
+        # A junk trailing bit in the final validity byte: semantic accepts
+        # (readers must not rely on unused bits), validate_full rejects.
+        vals = Union{Missing,Int64}[1, missing, 3]
+        f, d = fromjulia("x", vals)
+        vbytes = AC.slicebytes(AC.validitybuffer(d))
+        junk = copy(vbytes)
+        junk[end] |= 0x80                     # bit 8 of a 3-element bitmap
+        jd = AC.ArrayData(d.type, d.len,
+            [AC._databuffer(junk), d.buffers[2]]; nullcount=1)
+        @test validate_semantic(f, jd) === jd
+        @test_throws ValidationError AC.validate_full(f, jd)
+        @test AC.validate_full(f, d) === d    # canonical original passes
+        # Sliced windows are exempt: trailing bits may belong to a sibling.
+        sliced = AC.ArrayData(d.type, 2, [AC._databuffer(junk), d.buffers[2]];
+            offset=1, nullcount=1)
+        @test validate_semantic(f, sliced) === sliced
+        @test AC.validate_full(f, sliced) === sliced
+    end
+
     @testset "list of ints with missing" begin
         vals = [[1, 2], Int[], missing, [3]]
         f, d = fromjulia("l", collect(vals))
