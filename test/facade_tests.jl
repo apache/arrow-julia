@@ -542,6 +542,40 @@ end
         @test_throws ArgumentError Arrow.write(io3, brokend; file=false)
     end
 
+    @testset "override conversions follow the authority exactly" begin
+        io = IOBuffer()
+        Arrow.write(io, (a=Int64[1, 2], b=Union{Missing,Int64}[1, 2]))
+        fb = take!(io)
+        # Real conversions: requested type exact, missing only when observed.
+        t = Arrow.Table(fb; scan=Tables.Scan(select=(
+            :a => Union{Missing,Float64}, :b => Float64)))
+        @test eltype(t.a) == Union{Missing,Float64}
+        @test eltype(t.b) == Float64
+        # Zero-field: true-valued and unmatched-reference filters keep rows.
+        sch = Arrow.AC.Schema(Arrow.AC.Field[])
+        zb = Arrow.writefile(sch,
+            [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 3)])
+        t2 = Arrow.Table(zb; scan=Tables.Scan(
+            filter=Tables.isnull(Tables.col(:gone)), validate=false))
+        @test Tables.rowcount(t2) == 3
+        t3 = Arrow.Table(zb; scan=Tables.Scan(
+            filter=Tables.isnull(Tables.col(:gone)), validate=false,
+            limit=1, offset=1))
+        @test Tables.rowcount(t3) == 1
+        # List => Vector is a no-op: values, retained field, and metadata
+        # all survive.
+        io4 = IOBuffer()
+        Arrow.write(io4, (l=[[1, 2], [3]],); file=false,
+            colmetadata=Dict(:l => Dict("k" => "v")))
+        lb = take!(io4)
+        t4 = Arrow.Table(lb; scan=Tables.Scan(select=(:l => Vector,)))
+        @test isequal(t4.l, [Any[1, 2], Any[3]])
+        rsch = getfield(t4, :schema)
+        @test length(rsch.fields) == 1
+        @test rsch.fields[1].type isa Arrow.AC.ListType
+        @test DataAPI.colmetadata(t4, :l, "k") == "v"
+    end
+
     @testset "errors are clean" begin
         @test_throws ArgumentError Arrow.write(IOBuffer(),
             Tables.partitioner(NamedTuple[]))

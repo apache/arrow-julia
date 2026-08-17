@@ -40,13 +40,13 @@ filter, and exact limit/offset windows skip whole batches. On the file
 format (and ranged sources) pruning happens before bytes are fetched or
 decoded; on the stream format the scan is applied after decode.
 
-One exception: a filter literal with no exact storage representation for
-its column (a cross-domain or out-of-range value) makes the scan
-unpushable — the whole source is then read and the scan evaluates over the
-converted public values. Over a ranged source that fallback fetches the
-entire object, as does reading a zero-field source (its row count lives
-in batch metadata); plan remote filters in each column's public value
-domain.
+One exception: a scan that cannot run in the storage domain — a filter
+literal with no exact storage representation (a cross-domain or
+out-of-range value), or an empty projection (`select=()`), whose row count
+only the full read can carry — falls back to reading the whole source and
+evaluating over the converted public values. Over a ranged source that
+fallback fetches the entire object, as does reading a zero-field source;
+plan remote filters in each column's public value domain.
 
 Columns are materialized (plain `Vector`s): the returned table does not
 borrow the source bytes, and [`Arrow.close!`](@ref) may be called at any
@@ -463,7 +463,14 @@ function _publicscan(full::Table, schema, sourcefields, scan, regions)
         scan.validate && Tables.bind(scan, Symbol[])
         n0 = Tables.rowcount(full)
         n1 = if scan.filter !== nothing
-            0
+            # The authority evaluates constants and treats unmatched column
+            # references (validate=false) as all-missing columns. Delegate:
+            # one all-missing dummy column carries the row count while every
+            # real reference stays unmatched.
+            dummy = (; var"#arrowcount#"=fill(missing, n0))
+            counted = Tables.finish(dummy, Tables.Scan(nothing, scan.filter,
+                scan.limit, scan.offset, false))
+            Base.Int(Tables.rowcount(Tables.columns(counted)))
         else
             lo = min(Base.Int(scan.offset), n0)
             n = n0 - lo
@@ -472,6 +479,7 @@ function _publicscan(full::Table, schema, sourcefields, scan, regions)
         return _table(Symbol[], AbstractVector[], schema,
             AC.OwnerRegion[regions...], n1)
     end
+
     # Row count survives an empty projection: window+filter first over the
     # full column set, then project.
     counted = Tables.finish(full,
@@ -483,7 +491,14 @@ function _publicscan(full::Table, schema, sourcefields, scan, regions)
     cols = Tables.columns(got)
     names = collect(Symbol, Tables.columnnames(cols))
     columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
-    bound = _boundschema(schema, sourcefields, scan)
+    precols = AbstractVector[]
+    if !isempty(sourcefields)
+        srcnames = Symbol[Symbol(f.name) for f in sourcefields]
+        b = Tables.bind(scan, srcnames)
+        precols = AbstractVector[Tables.getcolumn(full, srcnames[bc.index])
+                                 for bc in b.columns]
+    end
+    bound = _boundschema(schema, sourcefields, scan, precols)
     return _table(names, columns, bound, AC.OwnerRegion[regions...], n)
 end
 
@@ -518,18 +533,21 @@ function _materialize_table(src::ArrowFile, regions)
     return _table(names, cols, src.schema, regions, nrows)
 end
 
-"The OUTPUT schema of a scan: bound source fields under their output names."
-function _boundschema(schema, sourcefields, scan)
+"""
+The OUTPUT schema of a scan: bound source fields under their output names.
+`precols` supplies each output's pre-override (facade-narrowed) column, so
+override keep/drop follows the SAME actual-subtype decision the conversion
+made: a no-op override keeps its retained field; a real conversion drops it
+(a later rewrite re-infers the column).
+"""
+function _boundschema(schema, sourcefields, scan, precols)
     (schema === nothing || scan === nothing) && return schema
     b = Tables.bind(scan, Symbol[Symbol(f.name) for f in sourcefields])
     outfields = AC.Field[]
-    for bc in b.columns
+    for (i, bc) in enumerate(b.columns)
         f = sourcefields[bc.index]
-        if bc.type !== nothing &&
-           !(_facadeeltype(f) <: Union{bc.type,Missing})
-            # A type override changed the public column type; the retained
-            # descriptor no longer describes it. Omit the field — a later
-            # rewrite re-infers this column naturally.
+        if bc.type !== nothing && i <= length(precols) &&
+           !(eltype(precols[i]) <: Union{bc.type,Missing})
             continue
         end
         push!(outfields, AC.Field(String(bc.name), f.type;
@@ -548,6 +566,7 @@ function _wrapscanned(got, schema, sourcefields, scan;
     cols = Tables.columns(got)
     names = collect(Symbol, Tables.columnnames(cols))
     columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
+    precols = AbstractVector[]
     if scan !== nothing && !isempty(sourcefields)
         b = Tables.bind(scan, Symbol[Symbol(f.name) for f in sourcefields])
         length(b.columns) == length(columns) || throw(AssertionError(
@@ -562,12 +581,13 @@ function _wrapscanned(got, schema, sourcefields, scan;
             T = _facadeeltype(f)
             base = T === Any ? map(identity, converted) :
                 collect(T, converted)
+            push!(precols, base)
             columns[i] = bc.type === nothing ? base :
                 _applyoverride(bc.type, base)
         end
     end
     nrows = isempty(columns) ? _scanrowcount(got) : length(columns[1])
-    bound = _boundschema(schema, sourcefields, scan)
+    bound = _boundschema(schema, sourcefields, scan, precols)
     return _table(names, columns, bound, AC.OwnerRegion[regions...], nrows)
 end
 
@@ -578,11 +598,14 @@ function _applyoverride(T, col)
     # finish's no-op rule: a column already accepted by Union{T,Missing}
     # passes through untouched (supertype overrides included).
     eltype(col) <: Union{T,Missing} && return col
+    # A REAL conversion preserves the requested target type exactly and
+    # widens with Missing only for OBSERVED missing values — the
+    # authority's rule, opposite of declared-nullability.
     TN = Base.nonmissingtype(T)
-    if eltype(col) >: Missing
-        # Declared nullability, not observed values.
-        return Union{Missing,TN}[x === missing ? missing : convert(TN, x)
-                                 for x in col]
+    hasmissing = any(x -> x === missing, col)
+    if T >: Missing || hasmissing
+        S = T >: Missing ? T : Union{Missing,TN}
+        return S[x === missing ? missing : convert(TN, x) for x in col]
     end
     return TN[convert(TN, x) for x in col]
 end
