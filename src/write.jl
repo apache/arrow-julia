@@ -196,6 +196,15 @@ function _writecolumn(f::AC.Field, v::AbstractVector)
         end
         return _rebuildtemporal(f, storage, length(v))
     end
+    # List fields: the retained CHILD descriptor supplies the element type
+    # observation cannot — zero-row, all-empty, and nested list columns have
+    # no values to observe. Unresolvable children (temporal storage,
+    # composites without a closed facade mapping) fall back to natural
+    # inference unchanged.
+    if t isa AC.ListType && length(f.children) == 1
+        E = _retainedlisteltype(f.children[1])
+        E === nothing || (v = _retypelist(f, v, E))
+    end
     # Non-temporal: build naturally, then impose the retained descriptor —
     # types must agree and nullability comes from the RETAINED field (values
     # holding missing under a non-nullable field are a replacement error).
@@ -211,6 +220,73 @@ function _writecolumn(f::AC.Field, v::AbstractVector)
             collect(Pair{String,String}, f.metadata),
         children=collect(AC.Field, fn.children))
     return rebuilt, dn
+end
+
+"""
+The DECLARED Julia value type of a retained list child, when the facade
+materializes it faithfully: primitives and strings resolve, nested lists
+recurse, and everything else returns `nothing` (temporal children stay raw
+storage integers at the facade; other composites have no closed mapping) —
+the caller then keeps natural inference, the pre-retype behavior.
+"""
+function _retainedlisteltype(c::AC.Field)
+    t = c.type
+    if t isa AC.ListType
+        length(c.children) == 1 || return nothing
+        inner = _retainedlisteltype(c.children[1])
+        inner === nothing && return nothing
+        return c.nullable ? Union{Missing,Vector{inner}} : Vector{inner}
+    end
+    (t isa AC.DateType || t isa AC.TimestampType || t isa AC.TimeType ||
+        t isa AC.DurationType || t isa AC.DictionaryType) && return nothing
+    E0 = _facadebasetype(t)
+    E0 === Any && return nothing
+    return c.nullable ? Union{Missing,E0} : E0
+end
+
+"""
+Retype list rows to the retained child element type — IDENTITY-strict at
+every depth, like the scalar retained gate: values must already BE the
+declared element type (a replaced column must refuse, never coerce — a
+`convert` would silently turn a replacement `true` into `Int64(1)`).
+Structure recovers (Any-eltyped rows retype), values never change.
+"""
+function _retypelist(f::AC.Field, v::AbstractVector, ::Type{E}) where {E}
+    S = eltype(v) >: Missing ? Union{Missing,Vector{E}} : Vector{E}
+    out = Vector{S}(undef, length(v))
+    for (i, x) in enumerate(v)
+        out[i] = x === missing ? missing : _retypevalue(Vector{E}, x, f)
+    end
+    return out
+end
+
+function _retypevalue(::Type{T}, x, f::AC.Field) where {T}
+    if x === missing
+        Missing <: T || throw(ArgumentError(
+            "column $(f.name) holds missing elements but its retained " *
+            "list child is non-nullable"))
+        return missing
+    end
+    NT = Base.nonmissingtype(T)
+    if NT <: AbstractVector
+        x isa AbstractVector || throw(ArgumentError(
+            "column $(f.name) holds $(typeof(x)) values, but its retained " *
+            "Arrow type $(repr(f.type)) materializes as vectors; the " *
+            "column was replaced with incompatible data"))
+        E = eltype(NT)
+        w = Vector{E}(undef, length(x))
+        i = 0
+        for elt in x
+            i += 1
+            w[i] = _retypevalue(E, elt, f)
+        end
+        return w
+    end
+    x isa NT || throw(ArgumentError(
+        "column $(f.name) holds $(typeof(x)) elements that do not match " *
+        "its retained list element type $(NT); the column was replaced " *
+        "with incompatible data"))
+    return x
 end
 
 function _rebuildtemporal(f::AC.Field, storage, n)

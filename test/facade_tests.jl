@@ -600,6 +600,33 @@ end
             filter=Tables.AlwaysTrue(), limit=1))
         @test Tables.rowcount(stats.value) == 1
         @test stats.bytes < 1_000_000
+        # The metadata-only ranged read keeps the reader trust boundary: a
+        # corrupted continuation prefix rejects exactly as the full reader
+        # rejects it.
+        bad = copy(zb)
+        bad[65:68] .= 0x00
+        @test_throws Arrow.AC.ValidationError Arrow.readfile(copy(bad))
+        @test_throws Arrow.AC.ValidationError Tables.scan(
+            Arrow.RangedFile(Arrow.RangedSource(copy(bad))), Tables.Scan())
+        # Header reads share ONE cumulative budget, as Limits documents:
+        # many tiny batches refuse under a bound one batch fits.
+        many = Arrow.writefile(sch,
+            [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 1) for _ = 1:200])
+        tight = Arrow.Limits(max_total_allocated_bytes=6000)
+        @test_throws Arrow.AllocationLimitError Tables.scan(
+            Arrow.readfile(copy(many); limits=tight), Tables.Scan())
+        @test_throws Arrow.AllocationLimitError Tables.scan(
+            Arrow.RangedFile(Arrow.RangedSource(copy(many)); limits=tight),
+            Tables.Scan())
+        # Structural binding is unconditional: an unsupported predicate node
+        # rejects even with validate=false, on every facade path.
+        zs = Arrow.writestream(sch,
+            [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 3)])
+        for source in (zb, zs, Arrow.RangedSource(zb))
+            @test_throws ArgumentError Arrow.Table(source;
+                scan=Tables.Scan(filter=Tables.OpNode(:custom, Any[]),
+                    validate=false))
+        end
     end
 
     @testset "list columns rewrite after materialization" begin
@@ -620,6 +647,54 @@ end
         @test length(rsch.fields) == 1
         @test rsch.fields[1].type isa Arrow.AC.ListType
         @test DataAPI.colmetadata(t3, :l, "k") == "v"
+        # The full transition matrix: empty and nonempty list facades from
+        # every input path rewrite cleanly to both output formats — the
+        # retained child descriptor supplies the element type observation
+        # cannot (zero-row, all-empty-rows, and nested shapes included).
+        for rows in (Vector{Int64}[], [[1, 2], Int64[], [3]],
+            [Int64[], Int64[]], [[Int64[1, 2]], [Int64[]]])
+            iof = IOBuffer(); Arrow.write(iof, (l=rows,); file=true)
+            fbb = take!(iof)
+            ios = IOBuffer(); Arrow.write(ios, (l=rows,); file=false)
+            sbb = take!(ios)
+            for src in (Arrow.Table(fbb), Arrow.Table(sbb),
+                Arrow.Table(Arrow.RangedSource(fbb)))
+                for file in (true, false)
+                    out = IOBuffer()
+                    Arrow.write(out, src; file=file)
+                    back = Arrow.Table(take!(out))
+                    @test isequal(collect(Any, back.l), collect(Any, rows))
+                    bsch = getfield(back, :schema)
+                    @test bsch.fields[1].type isa Arrow.AC.ListType
+                end
+            end
+        end
+        # An EMPTY real conversion drops the stale source descriptor (the
+        # declared facade type decides, exactly as a nonempty column would)
+        # and the rewrite re-infers from the converted values.
+        io5 = IOBuffer()
+        Arrow.write(io5, (a=Int64[],); file=false)
+        eb = take!(io5)
+        tec = Arrow.Table(eb; scan=Tables.Scan(select=(:a => Float64,)))
+        @test eltype(Tables.getcolumn(tec, :a)) === Float64
+        @test isempty(getfield(tec, :schema).fields)
+        out5 = IOBuffer()
+        Arrow.write(out5, tec; file=true)
+        @test eltype(Arrow.Table(take!(out5)).a) === Float64
+        tes = Arrow.Table(lb; scan=Tables.Scan(select=(:l => String,)))
+        @test isempty(getfield(tes, :schema).fields)
+        # Identity-strict at every depth: a replaced list column refuses,
+        # never coerces (convert would turn true into Int64(1)).
+        io6 = IOBuffer()
+        Arrow.write(io6, (l=[[1, 2]],); file=false)
+        trl = Arrow.Table(take!(io6))
+        cols = AbstractVector[c for c in getfield(trl, :columns)]
+        cols[1] = Any[Any[true, false]]
+        swapped = Arrow.Table(getfield(trl, :names), cols,
+            getfield(trl, :lookup), getfield(trl, :schema),
+            Arrow.AC.OwnerRegion[], 1)
+        @test_throws ArgumentError Arrow.write(IOBuffer(), swapped;
+            file=false)
     end
 
     @testset "errors are clean" begin

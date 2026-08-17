@@ -456,11 +456,11 @@ end
 "Evaluate a scan in the PUBLIC value domain over a converted Table."
 function _publicscan(full::Table, schema, sourcefields, scan, regions)
     if isempty(Tables.columnnames(full))
-        # No columns can carry the count through Tables.finish. Validation
-        # still applies (column references and invalid selections error),
-        # any filter over zero columns matches nothing, and the window
-        # arithmetic runs directly.
-        scan.validate && Tables.bind(scan, Symbol[])
+        # No columns can carry the count through Tables.finish. Binding is
+        # STRUCTURAL and always runs — unsupported predicate nodes reject
+        # regardless of `validate`, exactly as Tables.bind rules; validate
+        # only opts out of unmatched column references.
+        Tables.bind(scan, Symbol[])
         # Row-invariant predicate, evaluated ONCE — no mask or index vector
         # may be allocated from an untrusted row count.
         keep = _zerofieldpredicate(scan.filter)
@@ -530,16 +530,27 @@ override keep/drop follows the SAME actual-subtype decision the conversion
 made: a no-op override keeps its retained field; a real conversion drops it
 (a later rewrite re-infers the column).
 """
+# The eltype the keep/drop decision uses for an EMPTY pre-override column:
+# the descriptor's declared facade type. Composites materialize rows as
+# vectors (their eltype accident is `Any[]` when no rows exist), so the
+# declared domain — not the accident — must drive subsumption, keeping the
+# empty decision identical to the nonempty one.
+_declaredeltype(f::AC.Field) = f.nullable ?
+    Union{Missing,_declaredbasetype(f.type)} : _declaredbasetype(f.type)
+_declaredbasetype(t::AC.ArrowType) =
+    t isa AC.ListType ? Vector{Any} :
+    t isa AC.DictionaryType ? _declaredbasetype(t.valuetype) :
+    _facadebasetype(t)
+
 function _boundschema(schema, sourcefields, scan, precols)
     (schema === nothing || scan === nothing) && return schema
     b = Tables.bind(scan, Symbol[Symbol(f.name) for f in sourcefields])
     outfields = AC.Field[]
     for (i, bc) in enumerate(b.columns)
         f = sourcefields[bc.index]
-        if bc.type !== nothing && i <= length(precols) &&
-           !isempty(precols[i]) &&
-           !(eltype(precols[i]) <: Union{bc.type,Missing})
-            continue
+        if bc.type !== nothing && i <= length(precols)
+            D = isempty(precols[i]) ? _declaredeltype(f) : eltype(precols[i])
+            D <: Union{bc.type,Missing} || continue
         end
         push!(outfields, AC.Field(String(bc.name), f.type;
             nullable=f.nullable,

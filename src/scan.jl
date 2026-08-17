@@ -572,10 +572,13 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
     b = Tables.bind(scan, names)
     if isempty(names)
         # Zero-field sources: consume filter and window HERE — an empty
-        # residual NamedTuple cannot carry a row count through finish.
+        # residual NamedTuple cannot carry a row count through finish. The
+        # header reads share ONE budget: `Limits` documents a cumulative
+        # allocation bound per read, exactly as the column path enforces.
         keep = _zerofieldpredicate(scan.filter)
-        n = _zerofieldwindow((_batchrows(f, i) for i = 1:length(f)), keep,
-            scan.limit, scan.offset)
+        zfbudget = AllocationBudget(f.limits.max_total_allocated_bytes)
+        n = _zerofieldwindow((_batchrows(f, i, zfbudget) for i = 1:length(f)),
+            keep, scan.limit, scan.offset)
         return _scantable(Symbol[], (), Int(n)),
             Tables.Scan(nothing, nothing, nothing, 0, scan.validate)
     end
@@ -899,28 +902,36 @@ function _rangedfooter(rf::RangedFile, budget::AllocationBudget)
         metaschema)
 end
 
-"Per-batch rows of a zero-field ranged file: block headers only, charged."
-function _zerofieldbatchrows(rf::RangedFile)
-    budget = AllocationBudget(rf.limits.max_total_allocated_bytes)
-    ft = _rangedfooter(rf, budget)
-    counts = Int64[]
-    for block in ft.recordblocks
-        off, metalen, bodylen = block
-        declared = metalen - 8
-        0 < declared <= rf.limits.max_metadata_bytes ||
-            throw(ValidationError("record block metadata length outside limits"))
-        raw = _fetchexact(rf.src, off + 8, declared)
-        _charge!(budget, declared, "metadata allocation")
-        version, header_type, _, reserve =
-            verify_ipc_metadata(raw, rf.limits, budget.left)
-        _charge!(budget, reserve, "verified metadata expansion")
-        header_type == UInt8(3) || throw(ValidationError(
+"""
+One block's row count for the zero-field ranged path — the SAME frame
+discipline as the column path's metadata pass: extent bounds before the
+fetch, the fetch and parse charged to the caller's cumulative budget,
+`_parseblockmeta` framing (continuation prefix, declared length, verified
+graph, body-length cross-check), header kind, footer-version agreement,
+and compression rejection. Dictionary blocks validate and count zero.
+"""
+function _zerofieldblockcount(rf::RangedFile, block::NTuple{3,Int64},
+    expected_dict::Bool, version::Int16, fields::Vector{Field},
+    budget::AllocationBudget)
+    _, metalen, bodylen = block
+    declared = metalen - 8
+    0 < declared <= rf.limits.max_metadata_bytes || throw(ValidationError(
+        "metadata length $declared outside (0, $(rf.limits.max_metadata_bytes)]"))
+    0 <= bodylen <= rf.limits.max_body_bytes || throw(ValidationError(
+        "body length $bodylen outside [0, $(rf.limits.max_body_bytes)]"))
+    _charge!(budget, metalen, "metadata range fetch")
+    payload = _fetchexact(rf.src, block[1], metalen)
+    msg, v, header_type = _parseblockmeta(payload, block, rf.limits, budget)
+    (expected_dict ? header_type == UInt8(2) : header_type == UInt8(3)) ||
+        throw(ValidationError(expected_dict ?
+            "footer dictionary block is not a dictionary batch" :
             "footer record block is not a record batch"))
-        msg = FB.getrootas(Meta.Message, raw, 0)
-        push!(counts, _recordbatchmeta(msg.header::Meta.RecordBatch,
-            ft.fields, rf.limits, bodylen))
-    end
-    return counts
+    v == version ||
+        throw(ValidationError("IPC metadata version changes within the file"))
+    rejectexperimentalcompression(msg, v, header_type)
+    expected_dict && return Int64(0)
+    return _recordbatchmeta(msg.header::Meta.RecordBatch, fields, rf.limits,
+        bodylen)
 end
 
 "Schema-only ranged read for the facade (one tail fetch)."
@@ -953,10 +964,18 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     b = Tables.bind(scan, names)
     if isempty(names)
         # Zero-field sources: consume filter and window HERE — an empty
-        # residual NamedTuple cannot carry a row count through finish.
+        # residual NamedTuple cannot carry a row count through finish. The
+        # metadata-only read keeps the column path's trust boundary: the
+        # block index validates first, every touched block passes the full
+        # frame checks, and every fetch charges the one cumulative budget.
+        _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
         keep = _zerofieldpredicate(scan.filter)
-        n = _zerofieldwindow(_zerofieldbatchrows(rf), keep,
-            scan.limit, scan.offset)
+        for block in dictblocks
+            _zerofieldblockcount(rf, block, true, version, fields, budget)
+        end
+        n = _zerofieldwindow(
+            (_zerofieldblockcount(rf, block, false, version, fields, budget)
+             for block in recordblocks), keep, scan.limit, scan.offset)
         return _scantable(Symbol[], (), Int(n)),
             Tables.Scan(nothing, nothing, nothing, 0, scan.validate)
     end
