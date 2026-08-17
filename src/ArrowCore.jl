@@ -2256,7 +2256,11 @@ function _checkclaim(::Type{T}, f::Field, d::ArrayData)::Nothing where {T}
     if t isa StructType
         E = Base.nonmissingtype(T)
         E === Vector{Pair{String,Any}} && return nothing
-        E <: NamedTuple || _typedrefuse(E, _layoutname(t), f)
+        # An EXACT NamedTuple shape only: a Union or UnionAll of row types
+        # satisfies `<: NamedTuple` but has no field reflection — it must
+        # refuse here, not leak a generation error.
+        (E isa DataType && E <: NamedTuple) ||
+            _typedrefuse(E, _layoutname(t), f)
         (fieldcount(E) == length(f.children) &&
          fieldcount(E) == length(d.children)) || _typedrefuse(E, _layoutname(t), f)
         return _checkstructclaim(E, f, d)
@@ -2325,9 +2329,36 @@ end
 # dynamic path gets from public `getvalue` — unvalidated geometry must not
 # read hidden backing values past a child's logical length. COMPILED with
 # all-concrete argument types: this is the cycle's resolvable edge.
-function _typedchild(::Type{T}, f::Field, d::ArrayData, i::Int64) where {T}
+# The recursion edge, split for two masters. SCALAR leafs inline into
+# the parent's loop (SROA removes the buffer-slice temporaries — a
+# compiled boundary costs ~64 bytes per child read); COMPOSITE children
+# route to `_typedchildbox`, a dedicated compiled shell with all-concrete
+# argument types — the resolvable edge trim requires. The generic ladder
+# reliably flattens into a dedicated shell but NOT into arbitrary hoisted
+# contexts, so the shell is the only place that calls it. The ::T asserts
+# pin inference to the claim even where the same-claim wrapper cycle
+# (Dictionary/REE) would widen to Any in a fresh process.
+@inline function _typedchild(::Type{T}, f::Field, d::ArrayData,
+    i::Int64) where {T}
     1 <= i <= d.len || throw(BoundsError(d, i))
-    return _typedvalue_of(T, d.type, f, d, i)
+    t = d.type
+    t isa IntType && return _typedvalue(T, t, f, d, i)::T
+    t isa FloatType && return _typedvalue(T, t, f, d, i)::T
+    t isa BoolType && return _typedvalue(T, t, f, d, i)::T
+    t isa Utf8Type && return _typedvalue(T, t, f, d, i)::T
+    t isa BinaryType && return _typedvalue(T, t, f, d, i)::T
+    t isa FixedSizeBinaryType && return _typedvalue(T, t, f, d, i)::T
+    t isa TimestampType && return _typedvalue(T, t, f, d, i)::T
+    t isa DateType && return _typedvalue(T, t, f, d, i)::T
+    t isa TimeType && return _typedvalue(T, t, f, d, i)::T
+    t isa DurationType && return _typedvalue(T, t, f, d, i)::T
+    t isa DecimalType && return _typedvalue(T, t, f, d, i)::T
+    return _typedchildbox(T, f, d, i)::T
+end
+
+function _typedchildbox(::Type{T}, f::Field, d::ArrayData,
+    i::Int64) where {T}
+    return _typedvalue_of(T, d.type, f, d, i)::T
 end
 
 # The same closed-set ladder as `_value_of`, with the claimed type threaded.
@@ -2339,7 +2370,11 @@ end
     t isa BoolType && return _typedvalue(T, t, f, d, i)
     t isa ListType && return _typedvalue(T, t, f, d, i)
     t isa StructType && return _typedvalue(T, t, f, d, i)
-    t isa DictionaryType && return _typedvalue(T, t, f, d, i)
+    # Wrapper branches keep the claim intact, so they alone can recurse
+    # with an UNCHANGED signature: the ::T assert stops that cycle from
+    # widening every other branch to Any in fresh-process inference (the
+    # box codex round 45 measured); the wrapper read itself pays one box.
+    t isa DictionaryType && return _typedvalue(T, t, f, d, i)::T
     t isa TimestampType && return _typedvalue(T, t, f, d, i)
     t isa DateType && return _typedvalue(T, t, f, d, i)
     t isa TimeType && return _typedvalue(T, t, f, d, i)
@@ -2354,7 +2389,7 @@ end
     t isa NullType && return _typedvalue(T, t, f, d, i)
     t isa ViewType && return _typedvalue(T, t, f, d, i)
     t isa ListViewType && return _typedvalue(T, t, f, d, i)
-    t isa RunEndEncodedType && return _typedvalue(T, t, f, d, i)
+    t isa RunEndEncodedType && return _typedvalue(T, t, f, d, i)::T
     throw(ArgumentError("unregistered ArrowType"))
 end
 
@@ -2372,8 +2407,8 @@ function _typedvalue(::Type{T},
     return _value(t, f, d, i)::E
 end
 
-function _typedvalue(::Type{T}, t::Union{ListType,ListViewType}, f::Field,
-    d::ArrayData, i::Int64) where {T}
+function _typedvalue(::Type{T}, t::Union{ListType,ListViewType},
+    f::Field, d::ArrayData, i::Int64) where {T}
     isvalid_at(d, i) || return _typedmissing(T, f)
     E = Base.nonmissingtype(T)
     E <: Vector || _typedrefuse(E, _layoutname(t), f)
@@ -2410,8 +2445,8 @@ function _typedvalue(::Type{T}, t::FixedSizeListType, f::Field,
     return out
 end
 
-function _typedvalue(::Type{T}, t::StructType, f::Field, d::ArrayData,
-    i::Int64) where {T}
+function _typedvalue(::Type{T}, t::StructType, f::Field,
+    d::ArrayData, i::Int64) where {T}
     isvalid_at(d, i) || return _typedmissing(T, f)
     E = Base.nonmissingtype(T)
     E === Vector{Pair{String,Any}} && return _value(t, f, d, i)::E
@@ -2430,8 +2465,8 @@ end
     return :(E(($(vals...),)))
 end
 
-function _typedvalue(::Type{T}, t::DictionaryType, f::Field, d::ArrayData,
-    i::Int64) where {T}
+function _typedvalue(::Type{T}, t::DictionaryType, f::Field,
+    d::ArrayData, i::Int64) where {T}
     isvalid_at(d, i) || return _typedmissing(T, f)
     w = primwidth(t.indextype)
     idx = _load_int(rolebuffer(d, DATA), t.indextype, _slotbyteoff(d, i, w))
@@ -2442,8 +2477,8 @@ function _typedvalue(::Type{T}, t::DictionaryType, f::Field, d::ArrayData,
         checked_add(Int64(idx), Int64(1)))
 end
 
-_typedvalue(::Type{T}, t::RunEndEncodedType, f::Field, d::ArrayData,
-    i::Int64) where {T} =
+_typedvalue(::Type{T}, t::RunEndEncodedType, f::Field,
+    d::ArrayData, i::Int64) where {T} =
     _typedchild(T, f.children[2], d.children[2], _ree_runindex(d, i))
 
 _typedvalue(::Type{T}, ::NullType, f::Field, ::ArrayData, ::Int64) where {T} =

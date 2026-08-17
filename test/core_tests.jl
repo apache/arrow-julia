@@ -1404,6 +1404,17 @@ end
             children=[Field("item", IntType(64, true); nullable=false)])
         @test_throws BoundsError getvalue(Vector{Int64}, lfb, listd, 1)
         @test_throws BoundsError getvalue(lfb, listd, 1)   # dynamic parity
+        # Non-exact NamedTuple shapes (Unions, UnionAlls) refuse with the
+        # documented ArgumentError, never a generation-time MethodError.
+        UNT = Union{NamedTuple{(:a, :b),Tuple{Int64,Int64}},
+            NamedTuple{(:a, :b),Tuple{Int64,String}}}
+        @test_throws ArgumentError getvalue(UNT, hf, hd, 1)
+        @test_throws ArgumentError materialize(UNT, hf, hd)
+        # Fresh-process allocation: the typed hot loop must reach steady
+        # state without compiler-introspection priming (a separate process
+        # so this suite's own inference cannot mask a regression).
+        run(`$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $(joinpath(@__DIR__, "typed_alloc_child.jl"))`)
+        @test true
     end
 end # ArrowCore testset
 
