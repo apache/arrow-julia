@@ -806,6 +806,64 @@ end
             children=[Arrow.AC.Field("a", Arrow.AC.IntType(64, true);
                 nullable=false)])
         @test Arrow._declaredeltype(u1) === Int64
+        # The declared domain equals the ACTUAL container type: temporal
+        # leaves under a transparent wrapper stay raw storage, and a
+        # multi-child union declares the mixed-population join.
+        dtf = Arrow.AC.Field("values", Arrow.AC.DateType(Arrow.AC.DAY);
+            nullable=true)
+        rnf = Arrow.AC.Field("run_ends", Arrow.AC.IntType(32, true);
+            nullable=false)
+        reef0 = Arrow.AC.Field("r", Arrow.AC.RunEndEncodedType();
+            nullable=false, children=[rnf, dtf])
+        @test Arrow._declaredeltype(reef0) === Union{Missing,Int32}
+        huf = Arrow.AC.Field("u", Arrow.AC.UnionType(Arrow.AC.SparseMode,
+            Int8[0, 1]); nullable=false,
+            children=[Arrow.AC.Field("a", Arrow.AC.IntType(64, true);
+                nullable=false),
+                Arrow.AC.Field("b", Arrow.AC.Utf8Type(false);
+                    nullable=false)])
+        @test Arrow._declaredeltype(huf) === Any
+        # REE<Date32> end-to-end: raw Int32 rows, => Integer keeps the
+        # retained field for empty and nonempty columns alike.
+        for (n, runs, vals) in ((3, Int32[2, 3], Int32[19000, 19001]),
+            (0, Int32[], Int32[]))
+            vd = Arrow.AC.ArrayData(Arrow.AC.DateType(Arrow.AC.DAY),
+                length(vals), [Arrow.AC.BufferSlice(),
+                    Arrow.AC._databuffer(vals)])
+            rd = Arrow.AC.ArrayData(Arrow.AC.IntType(32, true),
+                length(runs), [Arrow.AC.BufferSlice(),
+                    Arrow.AC._databuffer(runs)])
+            reed = Arrow.AC.ArrayData(Arrow.AC.RunEndEncodedType(), n,
+                Arrow.AC.BufferSlice[]; children=[rd, vd], nullcount=0)
+            rsch0 = Arrow.AC.Schema([reef0])
+            rb = Arrow.writestream(rsch0,
+                [Arrow.AC.RecordBatch(rsch0, Arrow.AC.ArrayData[reed], n)])
+            n > 0 && @test Arrow.Table(rb).r == Int32[19000, 19000, 19001]
+            tre = Arrow.Table(rb; scan=Tables.Scan(select=(:r => Integer,)))
+            rsch2 = getfield(tre, :schema)
+            @test length(rsch2.fields) == 1
+            @test rsch2.fields[1].type isa Arrow.AC.RunEndEncodedType
+        end
+        # Mixed heterogeneous union: a valid mixed population widens to Any,
+        # so empty and nonempty drop the field alike under a union target.
+        for n in (2, 0)
+            tid = Arrow.AC._databuffer(Int8[0, 1][1:n])
+            uad = Arrow.AC.ArrayData(Arrow.AC.IntType(64, true), n,
+                [Arrow.AC.BufferSlice(),
+                 Arrow.AC._databuffer(Int64[5, 6][1:n])])
+            ubd = Arrow.AC.ArrayData(Arrow.AC.Utf8Type(false), n,
+                [Arrow.AC.BufferSlice(),
+                 Arrow.AC._databuffer(Int32[0, 1, 2][1:(n + 1)]),
+                 Arrow.AC._databuffer(UInt8[0x61, 0x62][1:n])])
+            uud = Arrow.AC.ArrayData(Arrow.AC.UnionType(Arrow.AC.SparseMode,
+                Int8[0, 1]), n, [tid]; children=[uad, ubd], nullcount=0)
+            usch0 = Arrow.AC.Schema([huf])
+            ub0 = Arrow.writestream(usch0,
+                [Arrow.AC.RecordBatch(usch0, Arrow.AC.ArrayData[uud], n)])
+            tuo = Arrow.Table(ub0; scan=Tables.Scan(
+                select=(:u => Union{Integer,AbstractString},)))
+            @test isempty(getfield(tuo, :schema).fields)
+        end
         # End-to-end: Decimal64 rows are raw Int64 — an => Integer override
         # keeps the retained field for empty and nonempty columns alike.
         for (n, vals) in ((2, Int64[1234, 5678]), (0, Int64[]))

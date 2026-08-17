@@ -538,26 +538,44 @@ made: a no-op override keeps its retained field; a real conversion drops it
 # Field-aware cases: run-end encoding is transparent at the value layer
 # (rows ARE the values child's rows, no REE-level validity); dictionary
 # rows are pool VALUES whose composite children live on the value FIELD
-# (Dictionary<REE<...>>); union rows take the WINNING child's type, so the
-# declared domain is the union of the children's declared domains — closed
-# for one-child and all-compatible unions, honest for heterogeneous ones.
-# Missing in the declared type never changes keep/drop (the rule tests
-# `D <: Union{T,Missing}`), so nullability wraps are cosmetic.
-function _declaredeltype(f::AC.Field)
+# (Dictionary<REE<...>>); union rows take the WINNING child's type. The
+# declared domain must equal the ACTUAL pre-override container type:
+# `_postconvert` dispatches on the ROOT descriptor only, so temporal
+# leaves under a transparent wrapper stay RAW storage integers (the
+# `converted` flag tracks that), and a multi-child union declares what a
+# valid MIXED population materializes as — Julia's pairwise
+# `promote_typejoin`, exactly the widening `map(identity)` performs — not
+# the mathematical union of child domains. Missing in the declared type
+# never changes keep/drop (the rule tests `D <: Union{T,Missing}`), so
+# nullability wraps are cosmetic.
+function _declaredeltype(f::AC.Field, converted::Bool=true)
     t = f.type
     if t isa AC.RunEndEncodedType && length(f.children) == 2
-        return _declaredeltype(f.children[2])
+        return _declaredeltype(f.children[2], false)
     end
     if t isa AC.DictionaryType
-        D0 = _declaredeltype(AC.dictvaluefield(f, t))
+        D0 = _declaredeltype(AC.dictvaluefield(f, t), converted)
         return f.nullable ? Union{Missing,D0} : D0
     end
     if t isa AC.UnionType && !isempty(f.children)
-        return Union{Any[_declaredeltype(c) for c in f.children]...}
+        D = _declaredeltype(f.children[1], false)
+        for k = 2:length(f.children)
+            D = Base.promote_typejoin(D, _declaredeltype(f.children[k], false))
+        end
+        return D
     end
-    D = _declaredbasetype(t)
+    D = converted ? _declaredbasetype(t) : _rawdeclaredbasetype(t)
     return f.nullable ? Union{Missing,D} : D
 end
+
+# The units the facade converts at the TOP level; under a wrapper their
+# columns keep Core storage integers, sized by the descriptor width.
+_istemporalconv(t::AC.ArrowType) =
+    t isa AC.DateType || t isa AC.TimeType || t isa AC.DurationType ||
+    (t isa AC.TimestampType &&
+     (t.unit == AC.SECOND || t.unit == AC.MILLISECOND))
+_rawdeclaredbasetype(t::AC.ArrowType) = _istemporalconv(t) ?
+    (AC.primwidth(t) == 4 ? Int32 : Int64) : _declaredbasetype(t)
 # One entry per Core layout whose _value materializes a CLOSED row type
 # (the _value methods are the authority): every one must appear here, or
 # empty and nonempty columns of that layout would decide keep/drop
