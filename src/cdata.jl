@@ -642,15 +642,7 @@ function _export_schema!(root::ExportedRoot, f::Field,
     end
     dict = Ptr{CArrowSchema}(C_NULL)
     if f.type isa DictionaryType
-        # The single Core/IPC metadata slot describes the VALUE type, so it
-        # rides the dependent value node, as the C++ bridge does for
-        # dictionary extension values; the wrapper node carries none.
-        vf0 = AC.dictvaluefield(f, f.type)
-        vf = f.metadata === nothing ? vf0 :
-            Field(vf0.name, vf0.type; nullable=vf0.nullable,
-                metadata=collect(Pair{String,String}, f.metadata),
-                children=collect(Field, vf0.children))
-        dict = _export_schema!(root, vf, release)
+        dict = _export_schema!(root, AC.dictvaluefield(f, f.type), release)
     end
     flags = f.nullable ? ARROW_FLAG_NULLABLE : Int64(0)
     f.type isa DictionaryType && f.type.ordered &&
@@ -661,7 +653,11 @@ function _export_schema!(root::ExportedRoot, f::Field,
     unsafe_store!(p, CArrowSchema(
         _cstring!(root, formatstring_of(f.type)),
         _cstring!(root, f.name),
-        _cmetadata!(root, f.type isa DictionaryType ? nothing : f.metadata),
+        # Field metadata rides the OUTER node for every field, dictionary
+        # wrappers included — the C++ bridge exports field.metadata() on
+        # the wrapper and only TYPE metadata (extensions) on the dependent
+        # value node, and PyArrow imports only the wrapper's pairs.
+        _cmetadata!(root, f.metadata),
         flags, nchildren, childptrs, dict,
         release, control))
     root.schema_topology[control] = (canonical_children, dict)

@@ -1288,33 +1288,36 @@ function cdata_battery()
     dmf = Field("d", dvf.type; nullable=dvf.nullable,
         metadata=["dk" => "dv"], children=collect(Field, dvf.children))
     dsp, dap = to_c_data(dmf, dvd)
-    # Dictionary field metadata rides the DEPENDENT value node (the C++
-    # bridge convention): wrapper NULL, value node populated.
+    # Dictionary field metadata rides the OUTER wrapper node (the C++
+    # bridge exports field metadata there; PyArrow imports only the
+    # wrapper's pairs); the dependent value node carries none.
     dsch = unsafe_load(dsp)
-    @assert dsch.metadata == C_NULL
-    @assert unsafe_load(dsch.dictionary).metadata != C_NULL
+    @assert dsch.metadata != C_NULL
+    @assert unsafe_load(dsch.dictionary).metadata == C_NULL
     df2, dd2 = from_c_data(dsp, dap)
     @assert collect(df2.metadata) == ["dk" => "dv"]
     @assert getvalue(df2, dd2, 2) == "hi"
     close!(dd2.buffers[2].region::OwnerRegion)
     reap!()
-    # A foreign producer annotating BOTH nodes loses no pair on import:
-    # wrapper pairs first, then the dependent node's.
+    # A foreign producer annotating the DEPENDENT node too (extension-type
+    # metadata is legal there) loses no pair on import: wrapper pairs
+    # first, then the dependent node's.
     wsp, wap = to_c_data(dmf, dvd)
     wsch0 = unsafe_load(wsp)
+    vsch0 = unsafe_load(wsch0.dictionary)
     wblob = vcat(reinterpret(UInt8, Int32[1]),
-        reinterpret(UInt8, Int32[2]), codeunits("wk"),
-        reinterpret(UInt8, Int32[2]), codeunits("wv"))
-    wsch = GC.@preserve wblob CArrowSchema(wsch0.format, wsch0.name,
-        pointer(wblob), wsch0.flags, wsch0.n_children, wsch0.children,
-        wsch0.dictionary, wsch0.release, wsch0.private_data)
-    wref = Ref(wsch)
-    wf2, wd2 = GC.@preserve wblob wref begin
-        from_c_data(Base.unsafe_convert(Ptr{CArrowSchema}, wref), wap)
+        reinterpret(UInt8, Int32[2]), codeunits("vk"),
+        reinterpret(UInt8, Int32[2]), codeunits("vv"))
+    GC.@preserve wblob begin
+        unsafe_store!(wsch0.dictionary, CArrowSchema(vsch0.format,
+            vsch0.name, pointer(wblob), vsch0.flags, vsch0.n_children,
+            vsch0.children, vsch0.dictionary, vsch0.release,
+            vsch0.private_data))
+        wf2, wd2 = from_c_data(wsp, wap)
+        @assert collect(wf2.metadata) == ["dk" => "dv", "vk" => "vv"]
+        close!(wd2.buffers[2].region::OwnerRegion)
+        reap!()
     end
-    @assert collect(wf2.metadata) == ["wk" => "wv", "dk" => "dv"]
-    close!(wd2.buffers[2].region::OwnerRegion)
-    reap!()
     pf, pd = fromjulia("plain", Int64[1])
     psp, pap = to_c_data(pf, pd)
     pf2, pd2 = from_c_data(psp, pap)
