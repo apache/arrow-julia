@@ -779,6 +779,49 @@ end
             @test bsch2.fields[1].type isa Arrow.AC.BinaryType
             @test DataAPI.colmetadata(tb, :b, "bk") == "bv"
         end
+        # The declared row domain covers EVERY closed materializer (the
+        # Core _value methods are the authority), including Field-aware
+        # compositions; empty and nonempty columns decide keep/drop alike.
+        @test Arrow._declaredbasetype(Arrow.AC.ListViewType(false)) ===
+              Vector{Any}
+        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(10, 2, 32)) ===
+              Int32
+        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(38, 2, 128)) ===
+              Vector{UInt8}
+        @test Arrow._declaredbasetype(
+            Arrow.AC.IntervalType(Arrow.AC.YEAR_MONTH)) === Int32
+        @test Arrow._declaredbasetype(
+            Arrow.AC.IntervalType(Arrow.AC.DAY_TIME)) ===
+              NamedTuple{(:days, :millis),Tuple{Int32,Int32}}
+        dleaf = Arrow.AC.Field("v", Arrow.AC.BinaryType(false); nullable=true)
+        druns = Arrow.AC.Field("run_ends", Arrow.AC.IntType(32, true);
+            nullable=false)
+        dref = Arrow.AC.Field("d",
+            Arrow.AC.DictionaryType(Arrow.AC.IntType(32, true),
+                Arrow.AC.RunEndEncodedType(), false);
+            nullable=true, children=[druns, dleaf])
+        @test Arrow._declaredeltype(dref) === Union{Missing,Vector{UInt8}}
+        u1 = Arrow.AC.Field("u", Arrow.AC.UnionType(Arrow.AC.DenseMode,
+            Int8[0]); nullable=false,
+            children=[Arrow.AC.Field("a", Arrow.AC.IntType(64, true);
+                nullable=false)])
+        @test Arrow._declaredeltype(u1) === Int64
+        # End-to-end: Decimal64 rows are raw Int64 — an => Integer override
+        # keeps the retained field for empty and nonempty columns alike.
+        for (n, vals) in ((2, Int64[1234, 5678]), (0, Int64[]))
+            dd = Arrow.AC.ArrayData(Arrow.AC.DecimalType(10, 2, 64), n,
+                [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(vals)])
+            df = Arrow.AC.Field("dec", Arrow.AC.DecimalType(10, 2, 64);
+                nullable=false, metadata=["dk" => "dv"])
+            dsch = Arrow.AC.Schema([df])
+            db = Arrow.writestream(dsch,
+                [Arrow.AC.RecordBatch(dsch, Arrow.AC.ArrayData[dd], n)])
+            td = Arrow.Table(db; scan=Tables.Scan(select=(:dec => Integer,)))
+            dsch2 = getfield(td, :schema)
+            @test length(dsch2.fields) == 1
+            @test dsch2.fields[1].type isa Arrow.AC.DecimalType
+            @test DataAPI.colmetadata(td, :dec, "dk") == "dv"
+        end
         # Identity-strict at every depth: a replaced list column refuses,
         # never coerces (convert would turn true into Int64(1)).
         io6 = IOBuffer()

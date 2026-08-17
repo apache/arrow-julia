@@ -535,21 +535,36 @@ made: a no-op override keeps its retained field; a real conversion drops it
 # vectors (their eltype accident is `Any[]` when no rows exist), so the
 # declared domain — not the accident — must drive subsumption, keeping the
 # empty decision identical to the nonempty one.
-# Run-end encoding is transparent at the value layer (rows ARE the values
-# child's rows, no REE-level validity), so the declared type recurses into
-# the values child field.
-_declaredeltype(f::AC.Field) =
-    (f.type isa AC.RunEndEncodedType && length(f.children) == 2) ?
-    _declaredeltype(f.children[2]) :
-    (f.nullable ? Union{Missing,_declaredbasetype(f.type)} :
-     _declaredbasetype(f.type))
+# Field-aware cases: run-end encoding is transparent at the value layer
+# (rows ARE the values child's rows, no REE-level validity); dictionary
+# rows are pool VALUES whose composite children live on the value FIELD
+# (Dictionary<REE<...>>); union rows take the WINNING child's type, so the
+# declared domain is the union of the children's declared domains — closed
+# for one-child and all-compatible unions, honest for heterogeneous ones.
+# Missing in the declared type never changes keep/drop (the rule tests
+# `D <: Union{T,Missing}`), so nullability wraps are cosmetic.
+function _declaredeltype(f::AC.Field)
+    t = f.type
+    if t isa AC.RunEndEncodedType && length(f.children) == 2
+        return _declaredeltype(f.children[2])
+    end
+    if t isa AC.DictionaryType
+        D0 = _declaredeltype(AC.dictvaluefield(f, t))
+        return f.nullable ? Union{Missing,D0} : D0
+    end
+    if t isa AC.UnionType && !isempty(f.children)
+        return Union{Any[_declaredeltype(c) for c in f.children]...}
+    end
+    D = _declaredbasetype(t)
+    return f.nullable ? Union{Missing,D} : D
+end
 # One entry per Core layout whose _value materializes a CLOSED row type
 # (the _value methods are the authority): every one must appear here, or
 # empty and nonempty columns of that layout would decide keep/drop
-# differently. Union rows take the winning child's type — no closed
-# mapping exists, so Any is the descriptor truth there.
+# differently.
 _declaredbasetype(t::AC.ArrowType) =
     t isa AC.ListType ? Vector{Any} :
+    t isa AC.ListViewType ? Vector{Any} :
     t isa AC.FixedSizeListType ? Vector{Any} :
     t isa AC.BinaryType ? Vector{UInt8} :
     t isa AC.FixedSizeBinaryType ? Vector{UInt8} :
@@ -557,6 +572,12 @@ _declaredbasetype(t::AC.ArrowType) =
     t isa AC.StructType ? Vector{Pair{String,Any}} :
     t isa AC.MapType ? Vector{Pair{Any,Any}} :
     t isa AC.NullType ? Missing :
+    t isa AC.DecimalType ? (t.bits == 32 ? Int32 :
+        t.bits == 64 ? Int64 : Vector{UInt8}) :
+    t isa AC.IntervalType ? (t.unit == AC.YEAR_MONTH ? Int32 :
+        t.unit == AC.DAY_TIME ?
+        NamedTuple{(:days, :millis),Tuple{Int32,Int32}} :
+        NamedTuple{(:months, :days, :nanos),Tuple{Int32,Int32,Int64}}) :
     t isa AC.DictionaryType ? _declaredbasetype(t.valuetype) :
     _facadebasetype(t)
 
