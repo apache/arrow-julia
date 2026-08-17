@@ -2522,9 +2522,56 @@ end
 
 function _typedmaterialize_loop(::Type{T}, t::TT, f::Field,
     d::ArrayData) where {T,TT<:ArrowType}
+    bulk = _bulkmaterialize(T, t, f, d)
+    bulk === nothing || return bulk::Vector{T}
     out = Vector{T}(undef, d.len)
     for i = 1:d.len
         out[i] = _typedvalue(T, t, f, d, Int64(i))
+    end
+    return out
+end
+
+# ---------------------------------------------------------------------------
+# Bulk fixed-width extraction: for closed isbits claims over plain
+# fixed-width layouts, one bounds-checked byte copy replaces ten million
+# per-element calls (the benchmark-dominant cost of materializing reads).
+# Nulls punch in afterward from the validity bitmap. Everything else
+# (strings, composites, bitmaps, decimal-as-bytes) keeps the element loop.
+# ---------------------------------------------------------------------------
+
+_bulkmaterialize(::Type{T}, ::ArrowType, ::Field, ::ArrayData) where {T} =
+    nothing
+
+function _bulkmaterialize(::Type{T},
+    t::Union{IntType,FloatType,TimestampType,DateType,TimeType,DurationType,
+        DecimalType},
+    f::Field, d::ArrayData) where {T}
+    E = Base.nonmissingtype(T)
+    isbitstype(E) || return nothing
+    E === juliatype(t) || return nothing
+    n = d.len
+    w = Int64(sizeof(E))
+    # The typed path serves unvalidated data too: subslice re-checks the
+    # extraction window against the buffer's declared bounds.
+    src = subslice(rolebuffer(d, DATA), checked_mul(d.offset, w),
+        checked_mul(n, w))
+    vals = Vector{E}(undef, n)
+    if n > 0
+        GC.@preserve vals d begin
+            unsafe_copyto!(Ptr{UInt8}(pointer(vals)), sliceptr(src),
+                Int(src.len))
+        end
+    end
+    nc = nullcount(d)
+    if !(Missing <: T)
+        nc == 0 || _typednullrefuse(f)
+        return vals
+    end
+    out = Vector{T}(undef, n)
+    copyto!(out, vals)
+    nc == 0 && return out
+    for i = 1:n
+        isvalid_at(d, Int64(i)) || (out[i] = missing)
     end
     return out
 end
