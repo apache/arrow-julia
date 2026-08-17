@@ -40,6 +40,12 @@ filter, and exact limit/offset windows skip whole batches. On the file
 format (and ranged sources) pruning happens before bytes are fetched or
 decoded; on the stream format the scan is applied after decode.
 
+One exception: a filter literal with no exact storage representation for
+its column (a cross-domain or out-of-range value) makes the scan
+unpushable — the whole source is then read and the scan evaluates over the
+converted public values. Over a ranged source that fallback fetches the
+entire object; plan remote filters in each column's public value domain.
+
 Columns are materialized (plain `Vector`s): the returned table does not
 borrow the source bytes, and [`Arrow.close!`](@ref) may be called at any
 time afterward to release a memory-mapped file deterministically — do this
@@ -228,61 +234,57 @@ end
 # change predicate semantics.
 function _storagevalue(t::AC.ArrowType, v)
     t isa AC.DictionaryType && return _storagevalue(t.valuetype, v)
-    if t isa AC.DateType
-        if v isa Dates.Date
-            t.unit == AC.DAY &&
-                return true, Int32(Dates.value(v) - _EPOCH_DAYS)
-            return true, Int64(Dates.value(Dates.DateTime(v)) -
-                Dates.UNIXEPOCH)
-        elseif v isa Dates.DateTime
-            if t.unit == AC.DAY
-                # Only a midnight DateTime equals a Date32 value exactly.
-                v == Dates.DateTime(Dates.Date(v)) || return false, v
-                return true, Int32(Dates.value(Dates.Date(v)) - _EPOCH_DAYS)
+    istemporal = t isa AC.DateType || t isa AC.TimestampType ||
+        t isa AC.TimeType || t isa AC.DurationType
+    if istemporal
+        # The contract is the FACADE comparison domain, not physical
+        # representability: a literal lowers only when public-domain
+        # comparison against this column's facade values could succeed.
+        F = _facadebasetype(t)
+        try
+            if F === Int64
+                # Raw-integer facade (sub-millisecond timestamps): only
+                # integer literals compare in public; temporal literals are
+                # never equal to Int64 values.
+                v isa Integer && return true, Int64(v)
+                return false, v
+            elseif F === Dates.Date
+                v isa Dates.Date &&
+                    return true, Int32(Dates.value(v) - _EPOCH_DAYS)
+                if v isa Dates.DateTime
+                    v == Dates.DateTime(Dates.Date(v)) || return false, v
+                    return true,
+                        Int32(Dates.value(Dates.Date(v)) - _EPOCH_DAYS)
+                end
+                return false, v
+            elseif F === Dates.DateTime
+                dt = v isa Dates.DateTime ? v :
+                    v isa Dates.Date ? Dates.DateTime(v) : nothing
+                dt === nothing && return false, v
+                ms = Int64(Dates.value(dt) - Dates.UNIXEPOCH)
+                t isa AC.DateType && return true, ms       # Date64
+                t.unit == AC.MILLISECOND && return true, ms
+                return _exactdiv(ms, 1_000)                # SECOND
+            elseif F === Dates.Time
+                v isa Dates.Time || return false, v
+                ns = Int64(Dates.value(v))
+                t.unit == AC.NANOSECOND && return true, ns
+                t.unit == AC.MICROSECOND && return _exactdiv(ns, 1_000)
+                t.unit == AC.MILLISECOND && return _exactdiv(ns, 1_000_000)
+                return _exactdiv(ns, 1_000_000_000)
+            elseif F <: Dates.Period
+                v isa Dates.Period || return false, v
+                return true, Int64(Dates.value(convert(F, v)))
             end
-            return true, Int64(Dates.value(v) - Dates.UNIXEPOCH)
+        catch
+            # Any conversion failure — range, inexactness, no method — means
+            # the literal has no representation here; take the fallback.
+            return false, v
         end
         return false, v
     end
-    if t isa AC.TimestampType
-        dt = v isa Dates.DateTime ? v :
-            v isa Dates.Date ? Dates.DateTime(v) : nothing
-        dt === nothing && return false, v
-        ms = Int64(Dates.value(dt) - Dates.UNIXEPOCH)
-        t.unit == AC.MILLISECOND && return true, ms
-        t.unit == AC.SECOND && return _exactdiv(ms, 1_000)
-        try
-            t.unit == AC.MICROSECOND &&
-                return true, Base.Checked.checked_mul(ms, Int64(1_000))
-            return true, Base.Checked.checked_mul(ms, Int64(1_000_000))
-        catch e
-            e isa OverflowError && return false, v
-            rethrow()
-        end
-    end
-    if t isa AC.TimeType
-        v isa Dates.Time || return false, v
-        ns = Int64(Dates.value(v))
-        t.unit == AC.NANOSECOND && return true, ns
-        t.unit == AC.MICROSECOND && return _exactdiv(ns, 1_000)
-        t.unit == AC.MILLISECOND && return _exactdiv(ns, 1_000_000)
-        return _exactdiv(ns, 1_000_000_000)
-    end
-    if t isa AC.DurationType
-        v isa Dates.Period || return false, v
-        target = t.unit == AC.SECOND ? Dates.Second :
-            t.unit == AC.MILLISECOND ? Dates.Millisecond :
-            t.unit == AC.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
-        try
-            return true, Int64(Dates.value(convert(target, v)))
-        catch e
-            e isa InexactError && return false, v
-            rethrow()
-        end
-    end
     # Non-temporal fields compare in their storage (== public) domain, but a
-    # temporal-typed PUBLIC literal against them is incompatible.
-    istemporalfield = false
+    # temporal-typed public literal against them is incompatible.
     if v isa Dates.Date || v isa Dates.DateTime || v isa Dates.Time ||
        v isa Dates.Period
         return false, v
@@ -401,6 +403,13 @@ function Table(source; scan::Union{Nothing,Tables.Scan}=nothing,
         # exactly-once output conversion, and DataAPI metadata all need it.
         sch, rfields = rangedschema(rf)
         theScan = scan === nothing ? Tables.Scan() : scan
+        if isempty(rfields)
+            # A zero-field object is bytes-tiny; fetch it whole so the row
+            # count survives the read.
+            bytes = _fetchexact(rf.src, Int64(0), rf.src.len)
+            return _publicscan(_materialize_table(readfile(bytes),
+                AC.OwnerRegion[]), sch, rfields, theScan, AC.OwnerRegion[])
+        end
         pushscan, pushable = _lowerscan(theScan, rfields)
         if pushable
             got = Tables.scan(rf, pushscan)
@@ -442,6 +451,16 @@ end
 
 "Evaluate a scan in the PUBLIC value domain over a converted Table."
 function _publicscan(full::Table, schema, sourcefields, scan, regions)
+    if isempty(Tables.columnnames(full))
+        # No columns can carry the count through Tables.finish; apply the
+        # window arithmetic directly (a filter cannot reference anything).
+        n0 = Tables.rowcount(full)
+        lo = min(Base.Int(scan.offset), n0)
+        n1 = n0 - lo
+        scan.limit === nothing || (n1 = min(n1, Base.Int(scan.limit)))
+        return _table(Symbol[], AbstractVector[], schema,
+            AC.OwnerRegion[regions...], n1)
+    end
     # Row count survives an empty projection: window+filter first over the
     # full column set, then project.
     counted = Tables.finish(full,
@@ -495,6 +514,13 @@ function _boundschema(schema, sourcefields, scan)
     outfields = AC.Field[]
     for bc in b.columns
         f = sourcefields[bc.index]
+        if bc.type !== nothing &&
+           Base.nonmissingtype(bc.type) !== _facadebasetype(f.type)
+            # A type override changed the public column type; the retained
+            # descriptor no longer describes it. Omit the field — a later
+            # rewrite re-infers this column naturally.
+            continue
+        end
         push!(outfields, AC.Field(String(bc.name), f.type;
             nullable=f.nullable,
             metadata=f.metadata === nothing ? nothing :
@@ -520,10 +546,15 @@ function _wrapscanned(got, schema, sourcefields, scan;
             f = sourcefields[bc.index]
             converted = _postconvert(f.type, columns[i])
             # Public type overrides run HERE, after facade conversion —
-            # they are public-domain requests, never storage casts.
-            T = bc.type === nothing ? _facadeeltype(f) : bc.type
-            columns[i] = T === Any ? map(identity, converted) :
-                collect(T, converted)
+            # they are public-domain requests, never storage casts, and
+            # they preserve missing exactly as Tables.finish does.
+            if bc.type === nothing
+                T = _facadeeltype(f)
+                columns[i] = T === Any ? map(identity, converted) :
+                    collect(T, converted)
+            else
+                columns[i] = _applyoverride(bc.type, converted)
+            end
         end
     end
     nrows = isempty(columns) ? _scanrowcount(got) : length(columns[1])
@@ -532,6 +563,16 @@ function _wrapscanned(got, schema, sourcefields, scan;
 end
 
 _scanrowcount(got) = Base.Int(Tables.rowcount(Tables.columns(got)))
+
+"Convert a column to an override type, preserving missing like Tables.finish."
+function _applyoverride(T, col)
+    TN = Base.nonmissingtype(T)
+    if T >: Missing || any(x -> x === missing, col)
+        return Union{Missing,TN}[x === missing ? missing : convert(TN, x)
+                                 for x in col]
+    end
+    return TN[convert(TN, x) for x in col]
+end
 
 # --- Stream ------------------------------------------------------------------
 

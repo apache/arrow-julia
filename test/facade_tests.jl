@@ -419,6 +419,66 @@ end
         @test_throws ArgumentError DataAPI.colmetadata(t, :nope, "k")
     end
 
+    @testset "lowering honors the facade comparison domain" begin
+        # Sub-ms timestamps materialize as raw Int64: a DateTime literal is
+        # never equal in public, and integers compare directly.
+        us = Union{Missing,Int64}[1_000_000, 2_000_000]
+        f, d = Arrow.AC.fromjulia("us", us)
+        t_us = Arrow.AC.TimestampType(Arrow.AC.MICROSECOND, nothing)
+        d_us = Arrow.AC._arraydata(t_us, 2, d.buffers, 0,
+            Arrow.AC.ArrayData[], nothing, nothing, 2 - 2)
+        sch = Arrow.AC.Schema([Arrow.AC.Field("us", t_us; nullable=true)])
+        bytes = Arrow.writestream(sch,
+            [Arrow.AC.RecordBatch(sch, [d_us], 2)])
+        data = (us=us,)
+        for scan in (
+            Tables.Scan(filter=Tables.coleq(Tables.col(:us),
+                DateTime(1970, 1, 1, 0, 0, 1))),
+            Tables.Scan(filter=Tables.coleq(Tables.col(:us), 2_000_000)))
+            want = Tables.finish(data, scan)
+            got = Arrow.Table(bytes; scan=scan)
+            @test isequal(got.us, want.us)
+        end
+        # Out-of-range and cross-Period literals fall back, matching the
+        # authority instead of throwing.
+        pdata = (d=[Date(2024, 1, 1)], s=[Second(30)])
+        io = IOBuffer(); Arrow.write(io, pdata); pb = take!(io)
+        for scan in (
+            Tables.Scan(filter=Tables.coleq(Tables.col(:d),
+                Date(6_000_000, 1, 1))),
+            Tables.Scan(filter=Tables.coleq(Tables.col(:s), Month(1))))
+            want = Tables.finish(pdata, scan)
+            got = Arrow.Table(pb; scan=scan)
+            @test Tables.rowcount(got) == Tables.rowcount(Tables.columns(want))
+        end
+    end
+
+    @testset "overrides preserve missing and re-infer on rewrite" begin
+        io = IOBuffer()
+        Arrow.write(io, (x=Union{Missing,Int64}[1, missing],))
+        fb = take!(io)
+        t = Arrow.Table(fb; scan=Tables.Scan(select=(:x => Float64,)))
+        @test isequal(t.x, Union{Missing,Float64}[1.0, missing])
+        # rewrite after an override re-infers the column cleanly
+        io2 = IOBuffer()
+        Arrow.write(io2, t; file=false)
+        t2 = Arrow.Table(take!(io2))
+        @test isequal(t2.x, Union{Missing,Float64}[1.0, missing])
+        @test getfield(t2, :schema).fields[1].type isa Arrow.AC.FloatType
+    end
+
+    @testset "zero-field counts across all paths" begin
+        sch = Arrow.AC.Schema(Arrow.AC.Field[])
+        bytes = Arrow.writefile(sch,
+            [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 3)])
+        for source in (bytes, Arrow.RangedSource(bytes))
+            t = Arrow.Table(source; scan=Tables.Scan())
+            @test Tables.rowcount(t) == 3
+            tw = Arrow.Table(source; scan=Tables.Scan(limit=1, offset=1))
+            @test Tables.rowcount(tw) == 1
+        end
+    end
+
     @testset "errors are clean" begin
         @test_throws ArgumentError Arrow.write(IOBuffer(),
             Tables.partitioner(NamedTuple[]))

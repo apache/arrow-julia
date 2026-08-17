@@ -129,7 +129,7 @@ function _retainedstorage(t::AC.ArrowType, v::AbstractVector, name::String)
             ok, sv = _storagevalue(t, x)
             ok && sv isa Integer || throw(ArgumentError(
                 "column $name holds $(typeof(x)) values that do not match " *
-                "its retained Arrow type $(summary(t)); the column was " *
+                "its retained Arrow type $(repr(t)); the column was " *
                 "replaced with incompatible data"))
             push!(out, Int64(sv))
         end
@@ -142,15 +142,16 @@ function _writecolumn(f::AC.Field, v::AbstractVector)
     t = f.type
     if t isa AC.DateType || t isa AC.TimestampType || t isa AC.TimeType ||
        t isa AC.DurationType
-        if Base.nonmissingtype(eltype(v)) <: Integer
-            # Integer input is physical storage ONLY for descriptors whose
-            # facade representation IS raw integers (sub-millisecond
-            # timestamps); anywhere else it is a replaced, incompatible
-            # column and must not be reinterpreted.
-            _facadebasetype(t) === Int64 || throw(ArgumentError(
-                "column $(f.name) was replaced with integers, but its " *
-                "retained Arrow type $(summary(t)) materializes as " *
-                "$(_facadebasetype(t)); rewrite requires matching values"))
+        # Identity first: the visible column must hold the facade type this
+        # descriptor materializes as. Scan-literal compatibility is a
+        # different, looser contract.
+        F = _facadebasetype(t)
+        NT = Base.nonmissingtype(eltype(v))
+        NT <: F || (isempty(v) && NT === Union{}) || throw(ArgumentError(
+            "column $(f.name) holds $(NT) values, but its retained Arrow " *
+            "type $(repr(t)) materializes as $(F); the column was replaced " *
+            "with incompatible data"))
+        if F === Int64
             storage = Union{Missing,Int64}[x === missing ? missing : Int64(x)
                                            for x in v]
         else
@@ -164,7 +165,7 @@ function _writecolumn(f::AC.Field, v::AbstractVector)
     fn, dn = _writecolumn(f.name, v)
     AC.typeequal(fn.type, t) || throw(ArgumentError(
         "column $(f.name) no longer matches its retained Arrow type " *
-        "$(summary(t)); it now maps to $(summary(fn.type))"))
+        "$(repr(t)); it now maps to $(repr(fn.type))"))
     fn.nullable && !f.nullable && AC.nullcount(dn) > 0 && throw(ArgumentError(
         "column $(f.name) holds missing values but its retained field is " *
         "non-nullable"))
@@ -363,8 +364,8 @@ function _writebytes(tbl; file::Bool=true, compress::Union{Nothing,Symbol}=nothi
                     AC.typeequal(fk.type, firstfield.type) ||
                         throw(ArgumentError(
                         "partition $k column $(names[j]) maps to Arrow " *
-                        "type $(summary(fk.type)), but the first partition " *
-                        "declared $(summary(firstfield.type)); make the " *
+                        "type $(repr(fk.type)), but the first partition " *
+                        "declared $(repr(firstfield.type)); make the " *
                         "column types agree across partitions"))
                     fk.nullable && !firstfield.nullable &&
                         throw(ArgumentError(
