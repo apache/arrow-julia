@@ -51,12 +51,13 @@ struct Table <: Tables.AbstractColumns
     lookup::Dict{Symbol,Base.Int}
     schema::Union{Nothing,AC.Schema}
     regions::Vector{AC.OwnerRegion}
+    nrows::Base.Int   # authoritative even with zero columns
 end
 
 function _table(names::Vector{Symbol}, columns::Vector{AbstractVector},
-    schema, regions)
+    schema, regions, nrows::Integer)
     lookup = Dict{Symbol,Base.Int}(nm => i for (i, nm) in enumerate(names))
-    return Table(names, columns, lookup, schema, regions)
+    return Table(names, columns, lookup, schema, regions, Base.Int(nrows))
 end
 
 Tables.istable(::Type{Table}) = true
@@ -70,21 +71,29 @@ Tables.schema(t::Table) = Tables.Schema(getfield(t, :names),
     [eltype(c) for c in getfield(t, :columns)])
 Base.propertynames(t::Table) = getfield(t, :names)
 Base.getproperty(t::Table, nm::Symbol) = Tables.getcolumn(t, nm)
+Tables.rowcount(t::Table) = getfield(t, :nrows)
+Base.length(t::Table) = getfield(t, :nrows)
 
 DataAPI.metadatasupport(::Type{Table}) = (read=true, write=false)
 DataAPI.colmetadatasupport(::Type{Table}) = (read=true, write=false)
+
+const _NO_DEFAULT = gensym(:nodefault)
+
 function DataAPI.metadatakeys(t::Table)
     sch = getfield(t, :schema)
     (sch === nothing || sch.metadata === nothing) && return ()
     return (String(first(kv)) for kv in sch.metadata)
 end
-function DataAPI.metadata(t::Table, key::AbstractString; style::Bool=false)
+function DataAPI.metadata(t::Table, key::AbstractString,
+    default=_NO_DEFAULT; style::Bool=false)
     sch = getfield(t, :schema)
-    sch === nothing || sch.metadata === nothing && throw(KeyError(key))
-    for kv in sch.metadata
-        first(kv) == key && return style ? (last(kv), :default) : last(kv)
+    if sch !== nothing && sch.metadata !== nothing
+        for kv in sch.metadata
+            first(kv) == key && return style ? (last(kv), :default) : last(kv)
+        end
     end
-    throw(KeyError(key))
+    default === _NO_DEFAULT && throw(KeyError(key))
+    return style ? (default, :default) : default
 end
 function _schemafield(t::Table, col::Symbol)
     sch = getfield(t, :schema)
@@ -92,19 +101,26 @@ function _schemafield(t::Table, col::Symbol)
     i = findfirst(f -> f.name == String(col), collect(sch.fields))
     return i === nothing ? nothing : sch.fields[i]
 end
-function DataAPI.colmetadatakeys(t::Table, col::Symbol)
-    f = _schemafield(t, col)
+_colsymbol(t::Table, col::Symbol) = col
+_colsymbol(t::Table, col::Base.Int) = getfield(t, :names)[col]
+function DataAPI.colmetadatakeys(t::Table, col::Union{Symbol,Base.Int})
+    f = _schemafield(t, _colsymbol(t, col))
     (f === nothing || f.metadata === nothing) && return ()
     return (String(first(kv)) for kv in f.metadata)
 end
-function DataAPI.colmetadata(t::Table, col::Symbol, key::AbstractString;
-    style::Bool=false)
-    f = _schemafield(t, col)
-    f === nothing || f.metadata === nothing && throw(KeyError(key))
-    for kv in f.metadata
-        first(kv) == key && return style ? (last(kv), :default) : last(kv)
+DataAPI.colmetadatakeys(t::Table) =
+    (nm => DataAPI.colmetadatakeys(t, nm) for nm in getfield(t, :names)
+     if !isempty(DataAPI.colmetadatakeys(t, nm)))
+function DataAPI.colmetadata(t::Table, col::Union{Symbol,Base.Int},
+    key::AbstractString, default=_NO_DEFAULT; style::Bool=false)
+    f = _schemafield(t, _colsymbol(t, col))
+    if f !== nothing && f.metadata !== nothing
+        for kv in f.metadata
+            first(kv) == key && return style ? (last(kv), :default) : last(kv)
+        end
     end
-    throw(KeyError(key))
+    default === _NO_DEFAULT && throw(KeyError(key))
+    return style ? (default, :default) : default
 end
 
 """
@@ -155,12 +171,125 @@ function _postconvert(t::AC.DurationType, col)
 end
 _postconvert(t::AC.DictionaryType, col) = _postconvert(t.valuetype, col)
 
+# The Julia element type a Field materializes as at the facade — a CLOSED
+# mapping from the descriptor (the schema authority), never from observed
+# values: an all-missing nullable Utf8 column is Vector{Union{Missing,
+# String}}, a zero-row Int64 column is Vector{Int64}.
+function _facadebasetype(t::AC.ArrowType)
+    t isa AC.DateType &&
+        return t.unit == AC.DAY ? Dates.Date : Dates.DateTime
+    if t isa AC.TimestampType
+        return t.unit == AC.SECOND || t.unit == AC.MILLISECOND ?
+            Dates.DateTime : Int64
+    end
+    t isa AC.TimeType && return Dates.Time
+    if t isa AC.DurationType
+        return t.unit == AC.SECOND ? Dates.Second :
+            t.unit == AC.MILLISECOND ? Dates.Millisecond :
+            t.unit == AC.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
+    end
+    t isa AC.DictionaryType && return _facadebasetype(t.valuetype)
+    t isa AC.IntType && return AC.juliatype(t)
+    t isa AC.FloatType && return AC.juliatype(t)
+    t isa AC.BoolType && return Bool
+    t isa AC.Utf8Type && return String
+    (t isa AC.ViewType && t.utf8) && return String
+    return Any
+end
+_facadeeltype(f::AC.Field) = f.nullable ?
+    Union{Missing,_facadebasetype(f.type)} : _facadebasetype(f.type)
+
 function _facadecolumn(f::AC.Field, parts::Vector)
+    T = _facadeeltype(f)
+    isempty(parts) && return T === Any ? Any[] : Vector{T}()
     col = length(parts) == 1 ? parts[1] : reduce(vcat, parts)
-    # materialize returns Vector{Any} (the typed zero-copy layer is
-    # ViewPlan's, later); narrow to the natural concrete eltype so
-    # downstream consumers see Vector{Int64}, Vector{Union{Missing,T}}, ...
-    return _postconvert(f.type, map(identity, col))
+    converted = _postconvert(f.type, col)
+    # materialize returns Vector{Any} (typed zero-copy views are ViewPlan's,
+    # later); the FIELD decides the public eltype.
+    return T === Any ? map(identity, converted) : collect(T, converted)
+end
+
+# --- scan value domain -------------------------------------------------------
+# Pushdown and residual filtering run over PHYSICAL storage values; facade
+# filter literals arrive in public Julia types. Lower every literal to the
+# referenced field's storage domain BEFORE the scan, so file, ranged, and
+# stream paths share one value domain; conversion back to public types then
+# happens exactly once, on the scan OUTPUT (rename-aware via Tables.bind).
+
+function _storagevalue(t::AC.ArrowType, v)
+    t isa AC.DictionaryType && return _storagevalue(t.valuetype, v)
+    if t isa AC.DateType && v isa Dates.Date
+        t.unit == AC.DAY && return Int32(Dates.value(v) - _EPOCH_DAYS)
+        return Int64(Dates.value(Dates.DateTime(v)) - Dates.UNIXEPOCH)
+    end
+    if v isa Dates.DateTime
+        ms = Int64(Dates.value(v) - Dates.UNIXEPOCH)
+        t isa AC.DateType && t.unit == AC.MILLISECOND && return ms
+        if t isa AC.TimestampType
+            t.unit == AC.MILLISECOND && return ms
+            t.unit == AC.SECOND && return _exactdiv(ms, 1_000, v, "SECOND")
+            t.unit == AC.MICROSECOND && return ms * Int64(1_000)
+            return ms * Int64(1_000_000)
+        end
+    end
+    if t isa AC.TimeType && v isa Dates.Time
+        ns = Int64(Dates.value(v))
+        t.unit == AC.NANOSECOND && return ns
+        t.unit == AC.MICROSECOND && return _exactdiv(ns, 1_000, v, "MICROSECOND")
+        t.unit == AC.MILLISECOND &&
+            return _exactdiv(ns, 1_000_000, v, "MILLISECOND")
+        return _exactdiv(ns, 1_000_000_000, v, "SECOND")
+    end
+    if t isa AC.DurationType && v isa Dates.Period
+        target = t.unit == AC.SECOND ? Dates.Second :
+            t.unit == AC.MILLISECOND ? Dates.Millisecond :
+            t.unit == AC.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
+        return Int64(Dates.value(convert(target, v)))
+    end
+    return v
+end
+
+function _exactdiv(x::Int64, d::Integer, v, unit::String)
+    q, r = divrem(x, Int64(d))
+    r == 0 || throw(ArgumentError(
+        "filter literal $v is not representable in the column's $unit unit"))
+    return q
+end
+
+function _fieldfor(fields, ref, names)
+    ref isa Base.Int && 1 <= ref <= length(fields) && return fields[ref]
+    i = findfirst(==(Symbol(ref)), names)
+    return i === nothing ? nothing : fields[i]
+end
+
+function _lowerexpr(e, fields, names)
+    e === nothing && return nothing
+    if e isa Tables.Cmp
+        f = _fieldfor(fields, e.lhs.ref, names)
+        f === nothing && return e
+        return Tables.Cmp(e.op, e.lhs, _storagevalue(f.type, e.rhs))
+    elseif e isa Tables.In
+        f = _fieldfor(fields, e.lhs.ref, names)
+        f === nothing && return e
+        return Tables.In(e.lhs,
+            Tuple(_storagevalue(f.type, v) for v in e.values))
+    elseif e isa Tables.AndExpr
+        return Tables.AndExpr(
+            Tables.ScanExpr[_lowerexpr(a, fields, names) for a in e.args])
+    elseif e isa Tables.OrExpr
+        return Tables.OrExpr(
+            Tables.ScanExpr[_lowerexpr(a, fields, names) for a in e.args])
+    elseif e isa Tables.NotExpr
+        return Tables.NotExpr(_lowerexpr(e.arg, fields, names))
+    end
+    return e
+end
+
+function _lowerscan(scan::Tables.Scan, fields)
+    scan.filter === nothing && return scan
+    names = Symbol[Symbol(f.name) for f in fields]
+    return Tables.Scan(scan.select, _lowerexpr(scan.filter, fields, names),
+        scan.limit, scan.offset, scan.validate)
 end
 
 # --- source opening ---------------------------------------------------------
@@ -208,18 +337,36 @@ function Table(source; scan::Union{Nothing,Tables.Scan}=nothing,
     mmap::Bool=true)
     if source isa RangedSource || source isa RangedFile
         rf = source isa RangedSource ? RangedFile(source) : source
-        got = Tables.scan(rf, scan === nothing ? Tables.Scan() : scan)
-        return _wrapscanned(got, nothing)
+        # One extra tail fetch buys the schema up front: literal lowering,
+        # exactly-once output conversion, and DataAPI metadata all need it.
+        sch, rfields = rangedschema(rf)
+        theScan = scan === nothing ? Tables.Scan() : scan
+        got = Tables.scan(rf, _lowerscan(theScan, rfields))
+        return _wrapscanned(got, sch, rfields, theScan)
     end
     src = _opensource(source; mmap=mmap)
     regions = _sourceregions(src)
+    fields = _corefields(src)
     if scan !== nothing && src isa ArrowFile
-        got = Tables.scan(src, scan)
-        return _wrapscanned(got, src.schema; regions=regions)
+        got = Tables.scan(src, _lowerscan(scan, fields))
+        return _wrapscanned(got, src.schema, fields, scan; regions=regions)
     end
-    t = _materialize_table(src, regions)
-    scan === nothing && return t
-    return _wrapscanned(Tables.finish(t, scan), _tableschema(src))
+    scan === nothing && return _materialize_table(src, regions)
+    # Stream format: decode RAW columns, scan in the storage domain, then
+    # convert the output once — the same value domain as the pushdown paths.
+    names = Symbol[Symbol(f.name) for f in fields]
+    raw = NamedTuple{Tuple(names)}(Tuple(_rawcolumn(src, i)
+        for i = 1:length(fields)))
+    got = Tables.finish(raw, _lowerscan(scan, fields))
+    return _wrapscanned(got, _tableschema(src), fields, scan; regions=regions)
+end
+
+_corefields(s::IPCStream) = collect(AC.Field, s.corefields)
+_corefields(f::ArrowFile) = collect(AC.Field, f.fields)
+
+_rawcolumn(s::IPCStream, i::Base.Int) = begin
+    parts = [materialize(s.corefields[i], b.columns[i]) for b in s.batches]
+    isempty(parts) ? Any[] : reduce(vcat, parts)
 end
 
 _tableschema(s::IPCStream) = s.schema
@@ -230,7 +377,8 @@ function _materialize_table(src::IPCStream, regions)
     cols = AbstractVector[
         _facadecolumn(f, [materialize(f, b.columns[i]) for b in src.batches])
         for (i, f) in enumerate(src.corefields)]
-    return _table(names, cols, src.schema, regions)
+    nrows = sum(Base.Int(b.nrows) for b in src.batches; init=0)
+    return _table(names, cols, src.schema, regions, nrows)
 end
 
 function _materialize_table(src::ArrowFile, regions)
@@ -240,26 +388,35 @@ function _materialize_table(src::ArrowFile, regions)
     cols = AbstractVector[
         _facadecolumn(f, [materialize(f, b.columns[i]) for b in batches])
         for (i, f) in enumerate(src.fields)]
-    return _table(names, cols, src.schema, regions)
+    nrows = sum(Base.Int(b.nrows) for b in batches; init=0)
+    return _table(names, cols, src.schema, regions, nrows)
 end
 
-"Wrap a scan/finish result (plain columns) into a Table."
-function _wrapscanned(got, schema; regions=AC.OwnerRegion[])
+"Wrap a scan output (storage-domain columns) into a Table, converting once."
+function _wrapscanned(got, schema, sourcefields, scan;
+    regions=AC.OwnerRegion[])
     cols = Tables.columns(got)
     names = collect(Symbol, Tables.columnnames(cols))
     columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
-    # Post-convert temporal columns by matching scanned names to schema
-    # fields (scan output may be a renamed/typed subset).
-    if schema !== nothing
-        byname = Dict(f.name => f for f in schema.fields)
-        for (i, nm) in enumerate(names)
-            f = get(byname, String(nm), nothing)
-            f === nothing && continue
-            columns[i] = _postconvert(f.type, columns[i])
+    # The bound selection maps each OUTPUT column to its SOURCE field —
+    # renames and positional references included — so conversion and the
+    # public eltype are schema-driven even for renamed output.
+    if scan !== nothing && !isempty(sourcefields)
+        b = Tables.bind(scan, Symbol[Symbol(f.name) for f in sourcefields])
+        for (i, bc) in enumerate(b.columns)
+            i <= length(columns) || break
+            f = sourcefields[bc.index]
+            converted = _postconvert(f.type, columns[i])
+            T = bc.type === nothing ? _facadeeltype(f) : bc.type
+            columns[i] = T === Any ? map(identity, converted) :
+                collect(T, converted)
         end
     end
-    return _table(names, columns, schema, AC.OwnerRegion[regions...])
+    nrows = isempty(columns) ? _scanrowcount(got) : length(columns[1])
+    return _table(names, columns, schema, AC.OwnerRegion[regions...], nrows)
 end
+
+_scanrowcount(got) = Base.Int(Tables.rowcount(Tables.columns(got)))
 
 # --- Stream ------------------------------------------------------------------
 
@@ -300,7 +457,8 @@ function Base.iterate(s::Stream, i::Base.Int=1)
     names = Symbol[Symbol(f.name) for f in fields]
     cols = AbstractVector[_facadecolumn(f, [materialize(f, b.columns[j])])
                           for (j, f) in enumerate(fields)]
-    return _table(names, cols, _tableschema(s.src), s.regions), i + 1
+    return _table(names, cols, _tableschema(s.src), s.regions,
+        Base.Int(b.nrows)), i + 1
 end
 
 Tables.partitions(s::Stream) = s

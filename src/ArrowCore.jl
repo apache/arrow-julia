@@ -2217,7 +2217,9 @@ function _build_nullable_primitive(name, v::Vector{T}) where {T}
         data = _databuffer(vals)
     end
     nc = count(!, present)
-    return Field(name, t; nullable=nc > 0),
+    # Nullability is the DECLARED element type's, not the observed count's:
+    # a Union{Missing,T} column with no missing values is still nullable.
+    return Field(name, t; nullable=true),
     ArrayData(t, length(v), [validity, data]; nullcount=nc)
 end
 
@@ -2241,7 +2243,7 @@ function _build_strings(name, v::Vector)
     end
     nc = count(!, present)
     data = nbytes == 0 ? BufferSlice() : BufferSlice(heapregion(bytes), 0, nbytes)
-    return Field(name, t; nullable=nc > 0),
+    return Field(name, t; nullable=eltype(v) >: Missing),
     ArrayData(t, length(v), [_bitmapbuffer(present), _databuffer(offsets), data];
         nullcount=nc)
 end

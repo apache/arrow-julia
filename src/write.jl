@@ -116,6 +116,78 @@ function _temporalcolumn(name::String, v::AbstractVector, t::AC.ArrowType,
     return AC.Field(name, t; nullable=eltype(v) >: Missing), d
 end
 
+# --- retained-schema rewrite (facade Table/Stream round-trips) --------------
+
+"Storage integers for a public column under a RETAINED temporal descriptor."
+function _retainedstorage(t::AC.ArrowType, v::AbstractVector)
+    tostore(x) = _storagevalue(t, x)
+    return Union{Missing,Int64}[x === missing ? missing : Int64(tostore(x))
+                                for x in v]
+end
+
+"Build one column under a retained Field: descriptor, nullability, metadata."
+function _writecolumn(f::AC.Field, v::AbstractVector)
+    t = f.type
+    if t isa AC.DateType || t isa AC.TimestampType || t isa AC.TimeType ||
+       t isa AC.DurationType
+        if Base.nonmissingtype(eltype(v)) <: Integer
+            # Sub-millisecond and other raw-carried temporals round-trip as
+            # their storage integers.
+            storage = Union{Missing,Int64}[x === missing ? missing : Int64(x)
+                                           for x in v]
+        else
+            storage = _retainedstorage(t, v)
+        end
+        return _rebuildtemporal(f, storage, length(v))
+    end
+    # Non-temporal: build naturally, then impose the retained descriptor's
+    # nullability and metadata (types must agree).
+    fn, dn = _writecolumn(f.name, v)
+    AC.typeequal(fn.type, t) || throw(ArgumentError(
+        "column $(f.name) no longer matches its retained Arrow type " *
+        "$(summary(t)); it now maps to $(summary(fn.type))"))
+    rebuilt = AC.Field(f.name, fn.type; nullable=f.nullable || fn.nullable,
+        metadata=f.metadata === nothing ? nothing :
+            collect(Pair{String,String}, f.metadata),
+        children=collect(AC.Field, fn.children))
+    return rebuilt, dn
+end
+
+function _rebuildtemporal(f::AC.Field, storage, n)
+    t = f.type
+    f0, d0 = AC.fromjulia("x", storage)
+    width = AC.primwidth(t)
+    buffers = d0.buffers
+    if width == 4
+        narrow = Vector{Int32}(undef, n)
+        for (i, x) in enumerate(storage)
+            narrow[i] = x === missing ? Int32(0) : Int32(x)
+        end
+        buffers = [d0.buffers[1], AC._databuffer(narrow)]
+    end
+    d = AC._arraydata(t, d0.len, buffers, 0, AC.ArrayData[], nothing,
+        d0.owner, AC.nullcount(d0))
+    fld = AC.Field(f.name, t; nullable=f.nullable || eltype(storage) >: Missing,
+        metadata=f.metadata === nothing ? nothing :
+            collect(Pair{String,String}, f.metadata))
+    return fld, d
+end
+
+function _writecolumn(f::AC.Field, v::AbstractVector,
+    pool::Vector, lookup::Dict)
+    t = f.type::AC.DictionaryType
+    indices = Union{Missing,Int32}[x === missing ? missing : lookup[x]
+                                   for x in v]
+    fn, dn = AC.fromjulia_dict(f.name, pool, indices)
+    AC.typeequal(fn.type, t) || throw(ArgumentError(
+        "column $(f.name) no longer matches its retained dictionary type"))
+    fld = AC.Field(f.name, t; nullable=f.nullable,
+        metadata=f.metadata === nothing ? nothing :
+            collect(Pair{String,String}, f.metadata),
+        children=collect(AC.Field, fn.children))
+    return fld, dn
+end
+
 """
     Arrow.write(sink, table; file=true, compress=nothing,
                 metadata=nothing, colmetadata=nothing)
@@ -144,25 +216,126 @@ function write(io::IO, tbl; kwargs...)
     return io
 end
 
+"Retained Arrow schema when the source is a facade read, else nothing."
+_retainedschema(t::Table) = getfield(t, :schema)
+_retainedschema(s::Stream) = _tableschema(getfield(s, :src))
+_retainedschema(::Any) = nothing
+
+"One shared-pool dictionary batch: identical pool OBJECT across batches."
+function _dictbatch(fld::AC.Field, indices::Vector, pool_d::AC.ArrayData)
+    present = [x !== missing for x in indices]
+    inds = Int32[x === missing ? Int32(0) : Int32(x) for x in indices]
+    nc = count(!, present)
+    d = AC.ArrayData(fld.type, length(indices),
+        [AC._bitmapbuffer(present), AC._databuffer(inds)];
+        dictionary=pool_d, nullcount=nc)
+    return d
+end
+
 function _writebytes(tbl; file::Bool=true, compress::Union{Nothing,Symbol}=nothing,
     metadata=nothing, colmetadata=nothing)
-    sch = nothing
-    fields = AC.Field[]
-    batches = AC.RecordBatch[]
+    retained = _retainedschema(tbl)
+    # Phase 1: materialize every partition's columns (this writer is eager),
+    # validating name/order agreement — a drift here would silently bind
+    # data to the wrong fields.
+    names = Symbol[]
+    partcols = Vector{AbstractVector}[]
+    rowcounts = Base.Int[]
     for part in Tables.partitions(tbl)
         cols = Tables.columns(part)
-        names = Tables.columnnames(cols)
-        pairs = [_writecolumn(String(nm), Tables.getcolumn(cols, nm))
-                 for nm in names]
-        if sch === nothing
-            fields = AC.Field[_withcolmeta(p[1], colmetadata) for p in pairs]
-            sch = AC.Schema(fields; metadata=_metapairs(metadata))
+        pnames = collect(Symbol, Tables.columnnames(cols))
+        if isempty(partcols)
+            names = pnames
+        else
+            pnames == names || throw(ArgumentError(
+                "partition $(length(partcols) + 1) column names $(pnames) " *
+                "do not match the first partition's $(names) (same names, " *
+                "same order); reorder or rename the partition's columns"))
         end
-        n = isempty(pairs) ? 0 : pairs[1][2].len
-        push!(batches, AC.RecordBatch(sch, AC.ArrayData[p[2] for p in pairs], n))
+        push!(partcols, AbstractVector[Tables.getcolumn(cols, nm)
+                                       for nm in pnames])
+        push!(rowcounts, Base.Int(Tables.rowcount(cols)))
     end
-    sch === nothing &&
+    isempty(partcols) &&
         throw(ArgumentError("table has no partitions; cannot infer a schema"))
+    nparts = length(partcols)
+    ncols = length(names)
+    retainedfield(j) = begin
+        retained === nothing && return nothing
+        i = findfirst(f -> f.name == String(names[j]),
+            collect(retained.fields))
+        i === nothing ? nothing : retained.fields[i]
+    end
+    # Phase 2: build columns. Dictionary-intent columns (retained
+    # DictionaryType or DictEncode input) share ONE pool object across all
+    # partitions — the file format carries one dictionary batch per id, and
+    # per-partition pools would read as replacement.
+    fields = Vector{AC.Field}(undef, ncols)
+    coldata = [Vector{AC.ArrayData}(undef, nparts) for _ = 1:ncols]
+    for j = 1:ncols
+        rf = retainedfield(j)
+        dictintent = (rf !== nothing && rf.type isa AC.DictionaryType) ||
+            any(partcols[k][j] isa DictEncode for k = 1:nparts)
+        if dictintent
+            vals = [partcols[k][j] isa DictEncode ?
+                    (partcols[k][j]::DictEncode).data : partcols[k][j]
+                    for k = 1:nparts]
+            pool = unique(x for k = 1:nparts for x in skipmissing(vals[k]))
+            lookup = Dict{Any,Int32}(x => Int32(i - 1)
+                                     for (i, x) in enumerate(pool))
+            firstidx = Union{Missing,Int32}[x === missing ? missing :
+                lookup[x] for x in vals[1]]
+            f1, d1 = AC.fromjulia_dict(String(names[j]), collect(pool),
+                firstidx)
+            fld = rf === nothing ? f1 :
+                AC.Field(f1.name, f1.type; nullable=rf.nullable || f1.nullable,
+                    metadata=rf.metadata === nothing ? nothing :
+                        collect(Pair{String,String}, rf.metadata),
+                    children=collect(AC.Field, f1.children))
+            fields[j] = fld
+            coldata[j][1] = d1
+            for k = 2:nparts
+                idx = Union{Missing,Int32}[x === missing ? missing :
+                    lookup[x] for x in vals[k]]
+                coldata[j][k] = _dictbatch(fld, idx,
+                    d1.dictionary::AC.ArrayData)
+            end
+        else
+            local firstfield::AC.Field
+            for k = 1:nparts
+                fk, dk = rf === nothing ?
+                    _writecolumn(String(names[j]), partcols[k][j]) :
+                    _writecolumn(rf, partcols[k][j])
+                if k == 1
+                    firstfield = fk
+                else
+                    AC.typeequal(fk.type, firstfield.type) ||
+                        throw(ArgumentError(
+                        "partition $k column $(names[j]) maps to Arrow " *
+                        "type $(summary(fk.type)), but the first partition " *
+                        "declared $(summary(firstfield.type)); make the " *
+                        "column types agree across partitions"))
+                    fk.nullable && !firstfield.nullable &&
+                        throw(ArgumentError(
+                        "partition $k column $(names[j]) is nullable but " *
+                        "the first partition declared it non-nullable; " *
+                        "make the first partition's column eltype " *
+                        "Union{Missing,T} to widen the schema"))
+                end
+                coldata[j][k] = dk
+            end
+            fields[j] = firstfield
+        end
+    end
+    outfields = AC.Field[_withcolmeta(fields[j], colmetadata) for j = 1:ncols]
+    schmeta = metadata !== nothing ? _metapairs(metadata) :
+        (retained === nothing || retained.metadata === nothing ? nothing :
+         collect(Pair{String,String}, retained.metadata))
+    sch = AC.Schema(outfields; metadata=schmeta)
+    batches = AC.RecordBatch[
+        AC.RecordBatch(sch,
+            AC.ArrayData[coldata[j][k] for j = 1:ncols], rowcounts[k])
+        for k = 1:nparts]
     codec = compress === nothing ? :none : compress
     return file ? writefile(sch, batches; compress=codec) :
         writestream(sch, batches; compress=codec)

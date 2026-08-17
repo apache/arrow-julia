@@ -764,7 +764,8 @@ function RangedFile(src::RangedSource; limits::Limits=Limits(),
     return RangedFile(src, limits, Int64(max(tailbytes, 32)), gap)
 end
 
-function Tables.apply(rf::RangedFile, scan::Tables.Scan)
+"Fetch and verify the ranged footer: schema, fields, blocks, id table."
+function _rangedfooter(rf::RangedFile, budget::AllocationBudget)
     src = rf.src
     limits = rf.limits
     _requirelittleendian()
@@ -784,7 +785,7 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
         throw(ValidationError("footer length $footerlen outside (0, $(limits.max_metadata_bytes)]"))
     footerstart = L - 10 - footerlen
     footerstart >= 8 || throw(ValidationError("footer escapes the file"))
-    budget = AllocationBudget(limits.max_total_allocated_bytes)
+    
     _charge!(budget, footerlen, "footer allocation")
     footerbytes = footerstart >= tailstart ?
         tail[(footerstart - tailstart + 1):(footerstart - tailstart + footerlen)] :
@@ -810,6 +811,37 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
                    for f in something(metaschema.fields, Meta.Field[])]
     foreach(validateschemafield, fields)
     dictvaluefields = validatedictionaryids(fields, fielddictids)
+    sch = Schema(fields; metadata=coremetadata(metaschema.custom_metadata),
+        endianness=AC.LittleEndian)
+    return (; sch, fields, dictids, fielddictids, dictvaluefields, version,
+        features, dictblocks, recordblocks, footerstart, tail, tailstart,
+        metaschema)
+end
+
+"Schema-only ranged read for the facade (one tail fetch)."
+function rangedschema(rf::RangedFile)
+    budget = AllocationBudget(rf.limits.max_total_allocated_bytes)
+    ft = _rangedfooter(rf, budget)
+    return ft.sch, ft.fields
+end
+
+function Tables.apply(rf::RangedFile, scan::Tables.Scan)
+    src = rf.src
+    limits = rf.limits
+    budget = AllocationBudget(limits.max_total_allocated_bytes)
+    ft = _rangedfooter(rf, budget)
+    fields = ft.fields
+    dictids = ft.dictids
+    fielddictids = ft.fielddictids
+    dictvaluefields = ft.dictvaluefields
+    version = ft.version
+    features = ft.features
+    dictblocks = ft.dictblocks
+    recordblocks = ft.recordblocks
+    footerstart = ft.footerstart
+    tail = ft.tail
+    tailstart = ft.tailstart
+    metaschema = ft.metaschema
     names = Symbol[Symbol(fld.name) for fld in fields]
     allunique(names) || throw(ValidationError(
         "scan pushdown over duplicate column names is facade work; read the file without a scan"))

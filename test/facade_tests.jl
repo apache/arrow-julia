@@ -168,6 +168,140 @@ end
         @test t.st == [["a" => 1, "b" => "x"], ["a" => 2, "b" => "y"]]
     end
 
+    @testset "partition drift is refused, not misbound" begin
+        io = IOBuffer()
+        @test_throws ArgumentError Arrow.write(io, Tables.partitioner([
+            (left=Int64[1], right=Int64[10]),
+            (right=Int64[20], left=Int64[2])]); file=false)
+        @test_throws ArgumentError Arrow.write(io, Tables.partitioner([
+            (x=Int64[1],), (y=Int64[2],)]); file=false)
+        @test_throws ArgumentError Arrow.write(io, Tables.partitioner([
+            (x=Int64[1],), (x=Int32[2],)]); file=false)
+    end
+
+    @testset "schema is the authority for facade eltypes" begin
+        io = IOBuffer()
+        Arrow.write(io, (s=Union{Missing,String}["a", "b"],
+            m=Union{Missing,String}[missing, missing],); file=false)
+        t = Arrow.Table(take!(io))
+        @test eltype(t.s) == Union{Missing,String}
+        @test eltype(t.m) == Union{Missing,String}
+        # all-missing columns round-trip as their DECLARED type
+        io2 = IOBuffer()
+        Arrow.write(io2, t; file=false)
+        t2 = Arrow.Table(take!(io2))
+        @test eltype(t2.m) == Union{Missing,String}
+        @test isequal(t2.m, [missing, missing])
+        # zero-row typed columns, including via a scan with no matches
+        io3 = IOBuffer()
+        Arrow.write(io3, (x=Int64[1],); file=false)
+        b3 = take!(io3)
+        t3 = Arrow.Table(b3; scan=Tables.Scan(filter=Tables.coleq(
+            Tables.col(:x), 99)))
+        @test eltype(t3.x) == Int64 && isempty(t3.x)
+    end
+
+    @testset "temporal scans agree across formats and renames" begin
+        data = (x=Int64[1, 2, 3],
+            date=[Date(2024, 1, 1), Date(2024, 1, 2), Date(2024, 1, 3)],
+            stamp=[DateTime(1970, 1, 1), DateTime(1970, 1, 1, 0, 0, 2),
+                DateTime(2001, 9, 9)])
+        fio = IOBuffer(); Arrow.write(fio, data)
+        sio = IOBuffer(); Arrow.write(sio, data; file=false)
+        scan = Tables.Scan(filter=Tables.coleq(Tables.col(:date),
+            Date(2024, 1, 3)))
+        want = Tables.finish(data, scan)
+        for bytes in (take!(fio), take!(sio))
+            got = Arrow.Table(bytes; scan=scan)
+            @test got.x == want.x
+            @test got.date == want.date && eltype(got.date) <: Union{Missing,Date}
+            @test got.stamp == want.stamp
+        end
+        # renamed temporal output still converts
+        rio = IOBuffer(); Arrow.write(rio, data)
+        tr = Arrow.Table(take!(rio); scan=Tables.Scan(
+            select=(:date => :d,), limit=1))
+        @test tr.d == [Date(2024, 1, 1)]
+    end
+
+    @testset "ranged reads carry the schema" begin
+        io = IOBuffer()
+        Arrow.write(io, (stamp=[DateTime(2020, 5, 5)],);
+            metadata=Dict("origin" => "ranged"))
+        fb = take!(io)
+        src = Arrow.RangedSource(fb)
+        t = Arrow.Table(src)
+        @test t.stamp == [DateTime(2020, 5, 5)]
+        @test eltype(t.stamp) == Union{Missing,DateTime} || eltype(t.stamp) == DateTime
+        @test DataAPI.metadata(t, "origin") == "ranged"
+    end
+
+    @testset "facade rewrite preserves the retained schema" begin
+        # Build exotic units through the core writer, then facade-read and
+        # facade-rewrite; the logical schema must not drift.
+        micros = Union{Missing,Int64}[1, 1001]
+        f, d = Arrow.AC.fromjulia("us", micros)
+        t_us = Arrow.AC.TimestampType(Arrow.AC.MICROSECOND, nothing)
+        d_us = Arrow.AC._arraydata(t_us, d.len, d.buffers, 0,
+            Arrow.AC.ArrayData[], nothing, d.owner, Arrow.AC.nullcount(d))
+        f_us = Arrow.AC.Field("us", t_us; nullable=true)
+        sch = Arrow.AC.Schema([f_us]; metadata=["k" => "v"])
+        bytes = Arrow.writestream(sch,
+            [Arrow.AC.RecordBatch(sch, [d_us], 2)])
+        t = Arrow.Table(bytes)
+        @test t.us == [1, 1001]          # sub-ms stays raw, exact
+        io = IOBuffer()
+        Arrow.write(io, t; file=false)
+        rt = Arrow.Table(take!(io))
+        rsch = getfield(rt, :schema)
+        @test rsch.fields[1].type isa Arrow.AC.TimestampType
+        @test rsch.fields[1].type.unit == Arrow.AC.MICROSECOND
+        @test DataAPI.metadata(rt, "k") == "v"   # schema metadata carried
+        @test rt.us == [1, 1001]
+        # dictionary columns round-trip as dictionaries, multi-partition,
+        # file format (one shared pool, no replacement refusal)
+        io2 = IOBuffer()
+        Arrow.write(io2, Tables.partitioner([
+            (d=Arrow.DictEncode(["a", "b"]),),
+            (d=Arrow.DictEncode(["b", "c"]),)]); file=true)
+        t2 = Arrow.Table(take!(io2))
+        @test t2.d == ["a", "b", "b", "c"]
+        sch2 = getfield(t2, :schema)
+        @test sch2.fields[1].type isa Arrow.AC.DictionaryType
+        io3 = IOBuffer()
+        Arrow.write(io3, t2; file=true)
+        t3 = Arrow.Table(take!(io3))
+        @test getfield(t3, :schema).fields[1].type isa Arrow.AC.DictionaryType
+        @test t3.d == ["a", "b", "b", "c"]
+    end
+
+    @testset "zero-column row counts survive" begin
+        # A zero-column three-row batch built at the core level: the facade
+        # read must preserve the count, and a facade round-trip must carry
+        # it back out (Table knows its row count even with no columns).
+        sch = Arrow.AC.Schema(Arrow.AC.Field[])
+        bytes = Arrow.writestream(sch,
+            [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 3)])
+        t = Arrow.Table(bytes)
+        @test Tables.rowcount(t) == 3
+        @test isempty(Tables.columnnames(t))
+        io = IOBuffer()
+        Arrow.write(io, t; file=false)
+        t2 = Arrow.Table(take!(io))
+        @test Tables.rowcount(t2) == 3
+    end
+
+    @testset "DataAPI defaults and selectors" begin
+        io = IOBuffer()
+        Arrow.write(io, (x=Int64[1],); file=false,
+            colmetadata=Dict(:x => Dict("u" => "1")))
+        t = Arrow.Table(take!(io))
+        @test DataAPI.metadata(t, "absent", "fallback") == "fallback"
+        @test DataAPI.colmetadata(t, 1, "u") == "1"
+        @test DataAPI.colmetadata(t, :x, "nope", :d) == :d
+        @test collect(first.(DataAPI.colmetadatakeys(t))) == [:x]
+    end
+
     @testset "errors are clean" begin
         @test_throws ArgumentError Arrow.write(IOBuffer(),
             Tables.partitioner(NamedTuple[]))
