@@ -2353,6 +2353,9 @@ end
     t isa TimeType && return _typedvalue(T, t, f, d, i)::T
     t isa DurationType && return _typedvalue(T, t, f, d, i)::T
     t isa DecimalType && return _typedvalue(T, t, f, d, i)::T
+    t isa IntervalType && return _typedvalue(T, t, f, d, i)::T
+    t isa ViewType && return _typedvalue(T, t, f, d, i)::T
+    t isa NullType && return _typedvalue(T, t, f, d, i)::T
     return _typedchildbox(T, f, d, i)::T
 end
 
