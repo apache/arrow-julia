@@ -208,7 +208,10 @@ function _writecolumn(f::AC.Field, v::AbstractVector)
     # Non-temporal: build naturally, then impose the retained descriptor —
     # types must agree and nullability comes from the RETAINED field (values
     # holding missing under a non-nullable field are a replacement error).
+    # List fields impose RECURSIVELY: retained identity includes the child
+    # fields (names, nullability, metadata) and each level's list width.
     fn, dn = _writecolumn(f.name, v)
+    t isa AC.ListType && return _imposelist(f, fn, dn, f.name)
     AC.typeequal(fn.type, t) || throw(ArgumentError(
         "column $(f.name) no longer matches its retained Arrow type " *
         "$(repr(t)); it now maps to $(repr(fn.type))"))
@@ -220,6 +223,59 @@ function _writecolumn(f::AC.Field, v::AbstractVector)
             collect(Pair{String,String}, f.metadata),
         children=collect(AC.Field, fn.children))
     return rebuilt, dn
+end
+
+"""
+Impose a retained list descriptor TREE onto a naturally built column: the
+retained side supplies names, nullability, metadata, and list width at
+every level (the natural builder always emits small lists — a retained
+large list rebuilds its offsets at the declared width); the natural side
+supplies the values, untouched. Nulls under a non-nullable retained level
+refuse, exactly like the flat retained gate.
+"""
+function _imposelist(rf::AC.Field, nf::AC.Field, nd::AC.ArrayData,
+    colname::String)
+    rt = rf.type
+    nt = nf.type
+    if rt isa AC.ListType
+        (nt isa AC.ListType && length(rf.children) == 1 &&
+         length(nf.children) == 1) || throw(ArgumentError(
+            "column $colname no longer matches its retained Arrow type " *
+            "$(repr(rt)); it now maps to $(repr(nt))"))
+        cf, cd = _imposelist(rf.children[1], nf.children[1], nd.children[1],
+            colname)
+        buffers = nd.buffers
+        if rt.large != nt.large
+            nt.large && throw(ArgumentError(
+                "column $colname no longer matches its retained Arrow " *
+                "type $(repr(rt)); it now maps to $(repr(nt))"))
+            nentries = nd.offset + nd.len + 1
+            small = reinterpret(Int32, copy(AC.slicebytes(AC.subslice(
+                nd.buffers[2], Int64(0), Int64(4) * nentries))))
+            buffers = [nd.buffers[1], AC._databuffer(collect(Int64, small))]
+        end
+        AC.nullcount(nd) > 0 && !rf.nullable && throw(ArgumentError(
+            "column $colname holds missing values but its retained field " *
+            "is non-nullable"))
+        d = AC._arraydata(rt, nd.len, buffers, nd.offset, AC.ArrayData[cd],
+            nothing, nd.owner, AC.nullcount(nd))
+        fld = AC.Field(rf.name, rt; nullable=rf.nullable,
+            metadata=rf.metadata === nothing ? nothing :
+                collect(Pair{String,String}, rf.metadata),
+            children=AC.Field[cf])
+        return fld, d
+    end
+    AC.typeequal(nt, rt) || throw(ArgumentError(
+        "column $colname no longer matches its retained Arrow type " *
+        "$(repr(rt)); it now maps to $(repr(nt))"))
+    AC.nullcount(nd) > 0 && !rf.nullable && throw(ArgumentError(
+        "column $colname holds missing values but its retained field " *
+        "is non-nullable"))
+    fld = AC.Field(rf.name, rt; nullable=rf.nullable,
+        metadata=rf.metadata === nothing ? nothing :
+            collect(Pair{String,String}, rf.metadata),
+        children=collect(AC.Field, nf.children))
+    return fld, nd
 end
 
 """

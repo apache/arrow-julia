@@ -618,6 +618,40 @@ end
         @test_throws Arrow.AllocationLimitError Tables.scan(
             Arrow.RangedFile(Arrow.RangedSource(copy(many)); limits=tight),
             Tables.Scan())
+        # A zero-field schema declares no dictionary ids: a footer listing a
+        # well-framed dictionary block is orphaned, and the metadata-only
+        # ranged read rejects it exactly as the full reader does.
+        f0 = Arrow.readfile(copy(zb))
+        (roff, rmetalen, rbodylen) = f0.recordblocks[1]
+        recbytes = zb[Int(roff)+1:Int(roff + rmetalen + rbodylen)]
+        dataend = Int(roff + rmetalen + rbodylen)
+        doctored = copy(zb[1:dataend])
+        append!(doctored, recbytes)
+        append!(doctored,
+            reinterpret(UInt8, UInt32[Arrow.CONTINUATION, UInt32(0)]))
+        fbb = Arrow.FB.Builder(1024)
+        schoff = Arrow._metaschema!(fbb, sch,
+            Base.IdDict{Arrow.AC.Field,Int64}(), Int64[])
+        Arrow.Meta.footerStartDictionariesVector(fbb, 1)
+        Arrow.Meta.createBlock(fbb, Int64(dataend), Int32(rmetalen), rbodylen)
+        dictvec = Arrow.FB.endvector!(fbb, 1)
+        Arrow.Meta.footerStartRecordBatchesVector(fbb, 1)
+        Arrow.Meta.createBlock(fbb, roff, Int32(rmetalen), rbodylen)
+        recordvec = Arrow.FB.endvector!(fbb, 1)
+        Arrow.Meta.footerStart(fbb)
+        Arrow.Meta.footerAddVersion(fbb, Arrow.Meta.MetadataVersion.V5)
+        Arrow.Meta.footerAddSchema(fbb, schoff)
+        Arrow.Meta.footerAddDictionaries(fbb, dictvec)
+        Arrow.Meta.footerAddRecordBatches(fbb, recordvec)
+        Arrow.FB.finish!(fbb, Arrow.Meta.footerEnd(fbb))
+        ftr = collect(Arrow.FB.finishedbytes(fbb))
+        append!(doctored, ftr)
+        append!(doctored, reinterpret(UInt8, Int32[Int32(length(ftr))]))
+        append!(doctored, Arrow.FILE_MAGIC)
+        @test_throws Arrow.AC.ValidationError Arrow.readfile(copy(doctored))
+        @test_throws Arrow.AC.ValidationError Tables.scan(
+            Arrow.RangedFile(Arrow.RangedSource(copy(doctored))),
+            Tables.Scan())
         # Structural binding is unconditional: an unsupported predicate node
         # rejects even with validate=false, on every facade path.
         zs = Arrow.writestream(sch,
@@ -683,6 +717,68 @@ end
         @test eltype(Arrow.Table(take!(out5)).a) === Float64
         tes = Arrow.Table(lb; scan=Tables.Scan(select=(:l => String,)))
         @test isempty(getfield(tes, :schema).fields)
+        # Retained identity is RECURSIVE: names, nullability, metadata, and
+        # list WIDTH survive a rewrite at every level (the natural builder
+        # only emits small lists — imposition rebuilds retained large
+        # offsets), for row-bearing and zero-row columns alike.
+        leafd = Arrow.AC.ArrayData(Arrow.AC.IntType(64, true), 3,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int64[10, 20, 30])])
+        innerd = Arrow.AC.ArrayData(Arrow.AC.ListType(false), 2,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int32[0, 2, 3])];
+            children=[leafd])
+        outerd = Arrow.AC.ArrayData(Arrow.AC.ListType(true), 2,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int64[0, 1, 2])];
+            children=[innerd])
+        leaff = Arrow.AC.Field("item", Arrow.AC.IntType(64, true);
+            nullable=false)
+        innerf = Arrow.AC.Field("inner", Arrow.AC.ListType(false);
+            nullable=true, metadata=["ik" => "iv"], children=[leaff])
+        outerf = Arrow.AC.Field("l", Arrow.AC.ListType(true); nullable=false,
+            metadata=["ok" => "ov"], children=[innerf])
+        nsch = Arrow.AC.Schema([outerf])
+        for nrows in (2, 0)
+            data = nrows == 0 ? Arrow.AC.ArrayData(Arrow.AC.ListType(true),
+                0, [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int64[0])];
+                children=[Arrow.AC.ArrayData(Arrow.AC.ListType(false), 0,
+                    [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int32[0])];
+                    children=[Arrow.AC.ArrayData(Arrow.AC.IntType(64, true),
+                        0, [Arrow.AC.BufferSlice(),
+                            Arrow.AC._databuffer(Int64[])])])]) : outerd
+            nb = Arrow.writestream(nsch,
+                [Arrow.AC.RecordBatch(nsch, Arrow.AC.ArrayData[data], nrows)])
+            tsrc = Arrow.Table(nb)
+            outn = IOBuffer()
+            Arrow.write(outn, tsrc; file=false)
+            tback = Arrow.Table(take!(outn))
+            @test isequal(tback.l, tsrc.l)
+            fb1 = getfield(tback, :schema).fields[1]
+            @test fb1.type == Arrow.AC.ListType(true)
+            @test fb1.metadata !== nothing && ("ok" => "ov") in fb1.metadata
+            fi = fb1.children[1]
+            @test fi.name == "inner" && fi.type == Arrow.AC.ListType(false)
+            @test fi.nullable
+            @test fi.metadata !== nothing && ("ik" => "iv") in fi.metadata
+            @test fi.children[1].name == "item"
+        end
+        # Every vector-materializing descriptor decides keep/drop the same
+        # for empty and nonempty columns: Binary rows are Vector{UInt8}, so
+        # => Vector subsumes and keeps the field either way.
+        for (n, offs, bytes) in ((2, Int32[0, 2, 3], UInt8[1, 2, 3]),
+            (0, Int32[0], UInt8[]))
+            bd = Arrow.AC.ArrayData(Arrow.AC.BinaryType(false), n,
+                [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(offs),
+                 Arrow.AC._databuffer(bytes)])
+            bf = Arrow.AC.Field("b", Arrow.AC.BinaryType(false);
+                nullable=false, metadata=["bk" => "bv"])
+            bsch = Arrow.AC.Schema([bf])
+            bb = Arrow.writestream(bsch,
+                [Arrow.AC.RecordBatch(bsch, Arrow.AC.ArrayData[bd], n)])
+            tb = Arrow.Table(bb; scan=Tables.Scan(select=(:b => Vector,)))
+            bsch2 = getfield(tb, :schema)
+            @test length(bsch2.fields) == 1
+            @test bsch2.fields[1].type isa Arrow.AC.BinaryType
+            @test DataAPI.colmetadata(tb, :b, "bk") == "bv"
+        end
         # Identity-strict at every depth: a replaced list column refuses,
         # never coerces (convert would turn true into Int64(1)).
         io6 = IOBuffer()

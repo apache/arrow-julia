@@ -535,10 +535,28 @@ made: a no-op override keeps its retained field; a real conversion drops it
 # vectors (their eltype accident is `Any[]` when no rows exist), so the
 # declared domain — not the accident — must drive subsumption, keeping the
 # empty decision identical to the nonempty one.
-_declaredeltype(f::AC.Field) = f.nullable ?
-    Union{Missing,_declaredbasetype(f.type)} : _declaredbasetype(f.type)
+# Run-end encoding is transparent at the value layer (rows ARE the values
+# child's rows, no REE-level validity), so the declared type recurses into
+# the values child field.
+_declaredeltype(f::AC.Field) =
+    (f.type isa AC.RunEndEncodedType && length(f.children) == 2) ?
+    _declaredeltype(f.children[2]) :
+    (f.nullable ? Union{Missing,_declaredbasetype(f.type)} :
+     _declaredbasetype(f.type))
+# One entry per Core layout whose _value materializes a CLOSED row type
+# (the _value methods are the authority): every one must appear here, or
+# empty and nonempty columns of that layout would decide keep/drop
+# differently. Union rows take the winning child's type — no closed
+# mapping exists, so Any is the descriptor truth there.
 _declaredbasetype(t::AC.ArrowType) =
     t isa AC.ListType ? Vector{Any} :
+    t isa AC.FixedSizeListType ? Vector{Any} :
+    t isa AC.BinaryType ? Vector{UInt8} :
+    t isa AC.FixedSizeBinaryType ? Vector{UInt8} :
+    (t isa AC.ViewType && !t.utf8) ? Vector{UInt8} :
+    t isa AC.StructType ? Vector{Pair{String,Any}} :
+    t isa AC.MapType ? Vector{Pair{Any,Any}} :
+    t isa AC.NullType ? Missing :
     t isa AC.DictionaryType ? _declaredbasetype(t.valuetype) :
     _facadebasetype(t)
 

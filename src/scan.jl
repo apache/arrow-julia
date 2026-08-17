@@ -903,16 +903,15 @@ function _rangedfooter(rf::RangedFile, budget::AllocationBudget)
 end
 
 """
-One block's row count for the zero-field ranged path — the SAME frame
-discipline as the column path's metadata pass: extent bounds before the
-fetch, the fetch and parse charged to the caller's cumulative budget,
+One record block's row count for the zero-field ranged path — the SAME
+frame discipline as the column path's metadata pass: extent bounds before
+the fetch, the fetch and parse charged to the caller's cumulative budget,
 `_parseblockmeta` framing (continuation prefix, declared length, verified
 graph, body-length cross-check), header kind, footer-version agreement,
-and compression rejection. Dictionary blocks validate and count zero.
+and compression rejection.
 """
 function _zerofieldblockcount(rf::RangedFile, block::NTuple{3,Int64},
-    expected_dict::Bool, version::Int16, fields::Vector{Field},
-    budget::AllocationBudget)
+    version::Int16, fields::Vector{Field}, budget::AllocationBudget)
     _, metalen, bodylen = block
     declared = metalen - 8
     0 < declared <= rf.limits.max_metadata_bytes || throw(ValidationError(
@@ -922,14 +921,11 @@ function _zerofieldblockcount(rf::RangedFile, block::NTuple{3,Int64},
     _charge!(budget, metalen, "metadata range fetch")
     payload = _fetchexact(rf.src, block[1], metalen)
     msg, v, header_type = _parseblockmeta(payload, block, rf.limits, budget)
-    (expected_dict ? header_type == UInt8(2) : header_type == UInt8(3)) ||
-        throw(ValidationError(expected_dict ?
-            "footer dictionary block is not a dictionary batch" :
-            "footer record block is not a record batch"))
+    header_type == UInt8(3) ||
+        throw(ValidationError("footer record block is not a record batch"))
     v == version ||
         throw(ValidationError("IPC metadata version changes within the file"))
     rejectexperimentalcompression(msg, v, header_type)
-    expected_dict && return Int64(0)
     return _recordbatchmeta(msg.header::Meta.RecordBatch, fields, rf.limits,
         bodylen)
 end
@@ -969,12 +965,14 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
         # block index validates first, every touched block passes the full
         # frame checks, and every fetch charges the one cumulative budget.
         _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
+        # A zero-field schema declares no dictionary ids, so every indexed
+        # dictionary block is orphaned — the same rejection the id-membership
+        # check produces on the column path and in the full reader.
+        isempty(dictblocks) || throw(ValidationError(
+            "dictionary batch has no declaring field in a zero-field schema"))
         keep = _zerofieldpredicate(scan.filter)
-        for block in dictblocks
-            _zerofieldblockcount(rf, block, true, version, fields, budget)
-        end
         n = _zerofieldwindow(
-            (_zerofieldblockcount(rf, block, false, version, fields, budget)
+            (_zerofieldblockcount(rf, block, version, fields, budget)
              for block in recordblocks), keep, scan.limit, scan.offset)
         return _scantable(Symbol[], (), Int(n)),
             Tables.Scan(nothing, nothing, nothing, 0, scan.validate)
