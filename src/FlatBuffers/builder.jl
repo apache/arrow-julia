@@ -56,17 +56,6 @@ Builder(size=0) = Builder(
     Dict{String,UOffsetT}(),
 )
 
-function reset!(b::Builder)
-    empty!(b.bytes)
-    empty!(b.vtable)
-    emtpy!(b.vtables)
-    empty!(b.sharedstrings)
-    b.minalign = 1
-    b.nested = false
-    b.finished = false
-    b.head = 0
-    return
-end
 
 Base.write(sink::Builder, o, x::Union{Bool,UInt8}) = sink.bytes[o + 1] = UInt8(x)
 function Base.write(sink::Builder, off, x::T) where {T}
@@ -427,7 +416,8 @@ function vtableEqual(a::Vector{UOffsetT}, objectStart, b::AbstractVector{UInt8})
     end
 
     for i = 0:(length(a) - 1)
-        x = read(IOBuffer(view(b, (i * sizeof(VOffsetT) + 1):length(b))), VOffsetT)
+        base = i * sizeof(VOffsetT)
+        x = VOffsetT(b[base + 1]) | (VOffsetT(b[base + 2]) << 8)
 
         # Skip vtable entries that indicate a default value.
         x == 0 && a[i + 1] == 0 && continue

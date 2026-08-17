@@ -72,12 +72,6 @@ function Base.String(t::Table, off)
     return unsafe_string(pointer(bytes(t), start + 1), len)
 end
 
-function bytevector(t::Table, off)
-    off += get(t, off, UOffsetT)
-    start = off + sizeof(UOffsetT)
-    len = get(t, off, UOffsetT)
-    return view(bytes(t), (start + 1):(start + len + 1))
-end
 
 """
 `vectorlen` retrieves the length of the vector whose offset is stored at
@@ -141,12 +135,6 @@ function union(t::Table, off)
     return off + get(t, off, UOffsetT)
 end
 
-function union!(t::Table, t2::Table, off)
-    off += pos(t)
-    t2.pos = off + get(t, off, UOffsetT)
-    t2.bytes = bytes(t)
-    return
-end
 
 """
 GetVOffsetTSlot retrieves the VOffsetT that the given vtable location

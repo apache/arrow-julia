@@ -260,6 +260,27 @@ end
         @test isequal(materialize(f, d), vals)
     end
 
+    @testset "close! releases deterministically" begin
+        f, d = fromjulia("x", Int64[1, 2, 3])
+        buf = d.buffers[2]
+        @test AC.loadat(buf, Int64, Int64(0)) == 1
+        r = buf.region::OwnerRegion
+        close!(r)
+        @test_throws InvalidStateException AC.loadat(buf, Int64, Int64(0))
+        @test_throws InvalidStateException AC.slicebytes(buf)
+        @test_throws InvalidStateException materialize(f, d)
+        close!(r)   # idempotent
+        # An mmap-backed region unmaps eagerly and later access still throws.
+        path, io = mktemp()
+        write(io, zeros(UInt8, 64)); close(io)
+        mr = mmapregion(path)
+        mslice = BufferSlice(mr, 0, mr.len)
+        @test AC.loadat(mslice, UInt8, Int64(0)) == 0x00
+        close!(mr)
+        @test_throws InvalidStateException AC.loadat(mslice, UInt8, Int64(0))
+        rm(path)
+    end
+
     @testset "canonical bit-packed form is full-tier only" begin
         # A junk trailing bit in the final validity byte: semantic accepts
         # (readers must not rely on unused bits), validate_full rejects.

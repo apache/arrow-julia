@@ -23,6 +23,9 @@
 include(joinpath(@__DIR__, "..", "src", "ArrowCore.jl"))
 using .ArrowCore
 const AC = ArrowCore
+# The C data interface is part of the trim-safe surface: a trimmed binary
+# that moves columns across the C seams is the canonical embedding use.
+include(joinpath(@__DIR__, "..", "src", "cdata.jl"))
 
 function checked(cond::Bool, msg::String)::Nothing
     cond || error(msg)
@@ -68,11 +71,42 @@ function exercise_mmap(dir::String)::Nothing
     r = mmapregion(path)
     b = BufferSlice(r, 0, 8)
     checked(AC.loadat(b, UInt32, Int64(4)) == 0x88776655, "mmap load failed")
-    # The Mmap-stdlib array is the root; its finalizer owns the unmap once
-    # the region becomes unreachable. Nothing to close explicitly.
     root = r.root
     checked(root isa Vector{UInt8} && length(root) == 8,
         "mmap region root is not the stdlib-mapped array")
+    # Deterministic release: close! unmaps NOW (the Windows delete-a-mapped-
+    # file case) and later access is a clean error, not a fault.
+    close!(r)
+    caught = false
+    try
+        AC.loadat(b, UInt32, Int64(4))
+    catch e
+        caught = e isa InvalidStateException
+    end
+    checked(caught, "use after close! accepted")
+    return nothing
+end
+
+function exercise_cdata()::Nothing
+    f, d = fromjulia("xs", Int64[1, 2, 3])
+    sp, ap = to_c_data(f, d)
+    f2, d2 = from_c_data(sp, ap)
+    validate_semantic(f2, d2)
+    checked(getvalue(f2, d2, 3) === Int64(3), "cdata round-trip value failed")
+    checked(nullcount(d2) == 0, "cdata round-trip nullcount failed")
+    # close! on the imported region runs the foreign release callback now;
+    # the export registry must be empty once the consumer releases.
+    close!(d2.buffers[2].region::OwnerRegion)
+    caught = false
+    try
+        getvalue(f2, d2, 1)
+    catch e
+        caught = e isa InvalidStateException
+    end
+    checked(caught, "use after cdata release accepted")
+    # Consumer release marks the export roots; reap! collects them.
+    reap!()
+    checked(isempty(EXPORT_REGISTRY), "export registry not empty after reap")
     return nothing
 end
 
@@ -157,17 +191,13 @@ function run_trim_workload()::Nothing
     mkdir(dir)
     try
         exercise_mmap(dir)
-        # The mapping unmaps when its region becomes unreachable and the
-        # stdlib finalizer runs. Collect before deleting the file on
-        # platforms that forbid deleting an active mapping.
-        GC.gc(true)
-        GC.gc(true)
     finally
         rm(joinpath(dir, "trim.bin"); force=true)
         rm(dir)
     end
     exercise_values()
     exercise_validation_errors()
+    exercise_cdata()
     return nothing
 end
 

@@ -82,7 +82,7 @@ const checked_add = Checked.checked_add
 const checked_sub = Checked.checked_sub
 const checked_mul = Checked.checked_mul
 
-export OwnerRegion, BufferSlice, heapregion, mmapregion,
+export OwnerRegion, BufferSlice, heapregion, mmapregion, close!,
     ReleaseCounter, increment!,
     ArrowType, NullType, BoolType, IntType, FloatType, DecimalType,
     FixedSizeBinaryType, BinaryType, Utf8Type, DateType, TimeType,
@@ -164,11 +164,16 @@ mutate or resize the array while the region or any cached validation result
 remains in use. Mutation can invalidate a semantic certificate; resizing can
 reallocate the storage and invalidate its pointer.
 """
-struct OwnerRegion
-    ptr::Ptr{UInt8}
-    len::Int64
-    alignment::Int      # guaranteed ptr alignment, capped at 64; loads consult it
-    root::Any           # GC anchor; never dispatched on, only stored
+mutable struct OwnerRegion
+    const ptr::Ptr{UInt8}
+    const len::Int64
+    const alignment::Base.Int   # guaranteed ptr alignment, capped at 64; loads consult it
+    const root::Any             # GC anchor; never dispatched on, only stored
+    # `close!` support: once set, every raw access through `sliceptr` throws.
+    # The flag makes use-AFTER-close a deterministic error; it is not a
+    # data-race shield for accesses concurrent WITH close! — quiescing users
+    # first is the caller's contract, as with `Base.close` on an IO.
+    @atomic closed::Bool
 
     function OwnerRegion(ptr::Ptr{UInt8}, len::Integer; root=nothing)
         len >= 0 || throw(ArgumentError("region length must be non-negative"))
@@ -186,8 +191,28 @@ struct OwnerRegion
                 throw(ArgumentError("region extent wraps the native address space"))
         end
         align = ptr == C_NULL ? 64 : (1 << trailing_zeros(UInt(ptr) | UInt(64)))
-        return new(ptr, n, align, root)
+        return new(ptr, n, align, root, false)
     end
+end
+
+"""
+    close!(r::OwnerRegion)
+
+Deterministically release the region's backing storage: mark the region
+closed — every later raw access through its slices throws
+`InvalidStateException` — and run the root's finalizers now (an mmap root
+unmaps immediately; a foreign C-data root runs its release callback; a
+plain heap root has nothing eager to do and simply becomes unreachable
+through this region). Idempotent. Callers must quiesce concurrent readers
+first, exactly as with `Base.close` on a shared IO.
+
+The eager path exists for hosts where a GC-timed unmap is not enough —
+deleting a still-mapped file on Windows being the canonical case.
+"""
+function close!(r::OwnerRegion)
+    (@atomicswap :acquire_release r.closed = true) && return nothing
+    r.root === nothing || finalize(r.root)
+    return nothing
 end
 
 """
@@ -253,7 +278,13 @@ end
 
 Base.length(b::BufferSlice) = b.len
 isempty_buffer(b::BufferSlice) = b.len == 0
-sliceptr(b::BufferSlice) = b.region === nothing ? Ptr{UInt8}(0) : b.region.ptr + b.offset
+@inline function sliceptr(b::BufferSlice)
+    b.region === nothing && return Ptr{UInt8}(0)
+    r = b.region::OwnerRegion
+    (@atomic :monotonic r.closed) && throw(InvalidStateException(
+        "the backing region was released by close!", :closed))
+    return r.ptr + b.offset
+end
 
 "Sub-slice with checked arithmetic (relative bounds against the parent slice)."
 function subslice(b::BufferSlice, offset::Integer, len::Integer)
@@ -643,6 +674,17 @@ function ArrayData(type::ArrowType, len::Integer, buffers;
     offset::Integer=0, children=(),
     dictionary::Union{Nothing,ArrayData}=nothing, owner=nothing,
     nullcount::Integer=-1)
+    return _arraydata(type, len, buffers, offset, children, dictionary,
+        owner, nullcount)
+end
+
+# Positional twin of the keyword constructor: Julia's kwcall machinery does
+# not statically resolve over an abstract-typed leading argument, so
+# trim-verified adapters (the C-data import walk) construct through this
+# single generic method instead.
+function _arraydata(@nospecialize(type::ArrowType), len::Integer, buffers,
+    offset::Integer, children, dictionary::Union{Nothing,ArrayData}, owner,
+    nullcount::Integer)
     len >= 0 || throw(ArgumentError("negative array length"))
     offset >= 0 || throw(ArgumentError("negative array offset"))
     -1 <= nullcount <= len ||
@@ -1660,8 +1702,18 @@ function _validate_canonical_bits(d::ArrayData)
     return nothing
 end
 
+# Closed-set ladder over the three advisory-check descriptors (same
+# devirtualization story as layoutspec_of).
+@inline function _validate_advisory_values_of(d::ArrayData)
+    t = d.type
+    t isa DateType && return _validate_advisory_values(t, d)
+    t isa TimeType && return _validate_advisory_values(t, d)
+    t isa DecimalType && return _validate_advisory_values(t, d)
+    return nothing
+end
+
 function _validate_full_content(f::Field, d::ArrayData)
-    _validate_advisory_values(d.type, d)
+    _validate_advisory_values_of(d)
     _validate_canonical_bits(d)
     if d.type isa Utf8Type || (d.type isa ViewType && d.type.utf8)
         for i = 1:d.len

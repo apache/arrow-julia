@@ -883,7 +883,9 @@ function rejectexperimentalcompression(msg::Meta.Message, version::Int16,
     metadata === nothing && return nothing
     any(kv -> kv.key == EXPERIMENTAL_COMPRESSION_KEY, metadata) &&
         throw(ValidationError(
-            "experimental V4 IPC compression is outside this prove-out"))
+            "pre-1.0 experimental V4 IPC compression (the " *
+            "ARROW:experimental_compression metadata convention, superseded " *
+            "by V5 BodyCompression in 2020) is not supported"))
     return nothing
 end
 rejectexperimentalcompression(fm::FramedMessage) =

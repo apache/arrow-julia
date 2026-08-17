@@ -145,6 +145,34 @@ formatstring(t::ListViewType) = t.large ? "+vL" : "+vl"
 formatstring(::RunEndEncodedType) = "+r"
 formatstring(t::DictionaryType) = formatstring(t.indextype)  # per spec: index format; values on schema.dictionary
 
+# Closed-set ladder (same devirtualization story as AC.layoutspec_of): the
+# export walk reaches this with an abstract-typed Field slot.
+@inline function formatstring_of(t::ArrowType)::String
+    t isa IntType && return formatstring(t)
+    t isa FloatType && return formatstring(t)
+    t isa BoolType && return formatstring(t)
+    t isa NullType && return formatstring(t)
+    t isa Utf8Type && return formatstring(t)
+    t isa BinaryType && return formatstring(t)
+    t isa FixedSizeBinaryType && return formatstring(t)
+    t isa DecimalType && return formatstring(t)
+    t isa DateType && return formatstring(t)
+    t isa TimeType && return formatstring(t)
+    t isa TimestampType && return formatstring(t)
+    t isa DurationType && return formatstring(t)
+    t isa IntervalType && return formatstring(t)
+    t isa ListType && return formatstring(t)
+    t isa FixedSizeListType && return formatstring(t)
+    t isa StructType && return formatstring(t)
+    t isa MapType && return formatstring(t)
+    t isa UnionType && return formatstring(t)
+    t isa ViewType && return formatstring(t)
+    t isa ListViewType && return formatstring(t)
+    t isa RunEndEncodedType && return formatstring(t)
+    t isa DictionaryType && return formatstring_of(t.indextype)
+    throw(ArgumentError("unregistered ArrowType"))
+end
+
 _formaterror(fmt) = throw(ValidationError(
     "cdata prove-out: unmapped format string \"$fmt\""))
 
@@ -378,7 +406,7 @@ function _finish_node!(p, control::Ptr{Cvoid}, claimed_slot, committed_slot)
         try
             root.remaining = oldremaining - 1
             unsafe_store!(Ptr{UInt8}(control), 0x02)
-            _store_field!(p, :release, Ptr{Cvoid}(C_NULL))
+            _store_field!(p, Val(:release), Ptr{Cvoid}(C_NULL))
             # The outer catch must not touch `control` once remaining is
             # zero: a reaper may free it as soon as this lock is released.
             # Transfer the completed claim while the lock still excludes
@@ -392,7 +420,7 @@ function _finish_node!(p, control::Ptr{Cvoid}, claimed_slot, committed_slot)
                 # returns the node from RELEASING to LIVE.
                 root.remaining = oldremaining
                 unsafe_store!(Ptr{UInt8}(control), 0x01)
-                _store_field!(p, :release, oldrelease)
+                _store_field!(p, Val(:release), oldrelease)
             end
             rethrow()
         end
@@ -469,7 +497,7 @@ end
 
 function _release_array(a::Ptr{CArrowArray})
     committed_slot = Ref(false)
-    claimed_slot = Ref{Any}(nothing)
+    claimed_slot = Ref{Union{Nothing,Tuple{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}}}(nothing)
     try
         claimed = _claim_array_node(a, claimed_slot)
         claimed === nothing && return nothing
@@ -491,7 +519,7 @@ end
 
 function _release_schema(s::Ptr{CArrowSchema})
     committed_slot = Ref(false)
-    claimed_slot = Ref{Any}(nothing)
+    claimed_slot = Ref{Union{Nothing,Tuple{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}}}(nothing)
     try
         claimed = _claim_schema_node(s, claimed_slot)
         claimed === nothing && return nothing
@@ -598,7 +626,7 @@ function _export_schema!(root::ExportedRoot, f::Field,
         (flags |= ARROW_FLAG_MAP_KEYS_SORTED)
     control = _newcontrol!(root)
     unsafe_store!(p, CArrowSchema(
-        _cstring!(root, formatstring(f.type)),
+        _cstring!(root, formatstring_of(f.type)),
         _cstring!(root, f.name),
         Ptr{UInt8}(C_NULL),
         flags, nchildren, childptrs, dict,
@@ -610,7 +638,7 @@ end
 function _export_array!(root::ExportedRoot, d::ArrayData,
     release::Ptr{Cvoid})::Ptr{CArrowArray}
     p = Ptr{CArrowArray}(_malloc!(root, sizeof(CArrowArray)))
-    spec = layoutspec(d.type)
+    spec = AC.layoutspec_of(d.type)
     ncore = length(d.buffers)
     # C Data appends one int64 buffer of variadic data-buffer LENGTHS to view
     # arrays (extents are not otherwise recoverable from the ABI); it counts
@@ -797,15 +825,17 @@ end
 
 function _newroot(build, roots::Vector{Any};
     result_slot=nothing, key_slot=nothing)
-    key = Int64(0)
-    root = nothing
+    # key and root are single-assignment BEFORE the try: reassignment of a
+    # closure-captured local boxes it, which the trim verifier rejects.
+    # Nothing before the try owns native memory, so there is nothing to
+    # clean on those paths.
+    key = lock(REGISTRY_LOCK) do
+        NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
+    end
+    root = ExportedRoot(roots, Ptr{Cvoid}[], key, 0,
+        Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}(),
+        Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}())::ExportedRoot
     try
-        key = lock(REGISTRY_LOCK) do
-            NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
-        end
-        root = ExportedRoot(roots, Ptr{Cvoid}[], key, 0,
-            Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}(),
-            Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}())::ExportedRoot
         # The pointer cannot escape before `build` returns. Keep the root
         # private until then: publishing it with `remaining == 0` would let a
         # concurrent reaper free partial mallocs underneath the builder,
@@ -819,11 +849,9 @@ function _newroot(build, roots::Vector{Any};
         return result
     catch
         # Export-failure cleanup: unregister (if published) and free.
-        if root !== nothing
-            result_slot === nothing || (result_slot[] = C_NULL)
-            key_slot === nothing || (key_slot[] = 0)
-            _cleanup_private_root!(root, key)
-        end
+        result_slot === nothing || (result_slot[] = C_NULL)
+        key_slot === nothing || (key_slot[] = 0)
+        _cleanup_private_root!(root, key)
         rethrow()
     end
 end
@@ -857,7 +885,7 @@ mutable struct ForeignOwner
         p = Ptr{CArrowArray}(block)
         o = try
             unsafe_store!(p, arr)
-            _store_field!(p, :release, Ptr{Cvoid}(C_NULL))  # inert until armed
+            _store_field!(p, Val(:release), Ptr{Cvoid}(C_NULL))  # inert until armed
             new(p, arr.release, false)
         catch
             # The native copy exists before the Julia owner does. If copy
@@ -887,7 +915,7 @@ ForeignOwner(arr::CArrowArray) = ForeignOwner(arr, finalizer)
 # and this store can throw.
 function _arm_foreign_owner!(o::ForeignOwner)
     (@atomic o.released) && error("cannot arm a released foreign owner")
-    GC.@preserve o _store_field!(o.arrayblock, :release, o.producer_release)
+    GC.@preserve o _store_field!(o.arrayblock, Val(:release), o.producer_release)
     return nothing
 end
 
@@ -966,7 +994,7 @@ function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray};
             owner = ownerfactory(arr)::ForeignOwner
             # MOVE: relinquish source ownership before arming the copied
             # owner. The source release field is authoritative.
-            _store_field!(ap, :release, Ptr{Cvoid}(C_NULL))
+            _store_field!(ap, Val(:release), Ptr{Cvoid}(C_NULL))
             _arm_foreign_owner!(owner)
             _preflight_schema(sch)
             f = _import_field(sch)
@@ -1026,7 +1054,7 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
     arr.n_children == 0 || arr.children != C_NULL ||
         throw(ValidationError("C array child table is NULL"))
 
-    spec = layoutspec(f.type)
+    spec = AC.layoutspec_of(f.type)
     expected_buffers = length(spec.buffers)
     if spec.variadic
         # validity + views + N variadic data buffers + the trailing int64
@@ -1103,7 +1131,7 @@ function _import_field(sch::CArrowSchema)::Field
 
     # Check the schema shape before indexing any recursively-created child.
     # Struct is the only mapped layout with field-declared arity.
-    spec = layoutspec(t)
+    spec = AC.layoutspec_of(t)
     expected_children = spec.childcount
     if expected_children >= 0 && sch.n_children != expected_children
         throw(ValidationError("C schema for $(typeof(t)) declares $(sch.n_children) children; expected $expected_children"))
@@ -1136,7 +1164,7 @@ registry's buffer order, so the loop stays generic.
 """
 function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayData
     t = f.type
-    spec = layoutspec(t)
+    spec = AC.layoutspec_of(t)
     total = AC.checked_add(arr.offset, arr.length)
     buffers = BufferSlice[]
     offsets_slice = nothing
@@ -1225,9 +1253,8 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
         t isa DictionaryType || throw(ValidationError("dictionary array on a non-dictionary field"))
         dict = _import_array(AC.dictvaluefield(f, t), unsafe_load(arr.dictionary), owner)
     end
-    return ArrayData(t, arr.length, buffers; offset=arr.offset,
-        children=children, dictionary=dict, owner=owner,
-        nullcount=arr.null_count)
+    return AC._arraydata(t, arr.length, buffers, arr.offset, children,
+        dict, owner, arr.null_count)
 end
 
 # ---------------------------------------------------------------------------
@@ -1433,8 +1460,8 @@ function _stream_release(sp::Ptr{CArrowArrayStream})::Cvoid
             errorp = state.lasterror
             state.lasterror = Ptr{UInt8}(C_NULL)
             errorp == C_NULL || Libc.free(errorp)
-            _store_field!(sp, :release, Ptr{Cvoid}(C_NULL))
-            _store_field!(sp, :private_data, Ptr{Cvoid}(C_NULL))
+            _store_field!(sp, Val(:release), Ptr{Cvoid}(C_NULL))
+            _store_field!(sp, Val(:private_data), Ptr{Cvoid}(C_NULL))
             Libc.free(control)
             return nothing
         end
@@ -1531,7 +1558,7 @@ mutable struct StreamOwner
         p = Ptr{CArrowArrayStream}(block)
         o = try
             unsafe_store!(p, stream)
-            _store_field!(p, :release, Ptr{Cvoid}(C_NULL)) # inert until moved
+            _store_field!(p, Val(:release), Ptr{Cvoid}(C_NULL)) # inert until moved
             new(p, stream.release, false)
         catch
             Libc.free(block)
@@ -1558,7 +1585,7 @@ end
 
 function _arm_stream_owner!(o::StreamOwner)
     (@atomic o.released) && error("cannot arm a released stream owner")
-    GC.@preserve o _store_field!(o.block, :release, o.producer_release)
+    GC.@preserve o _store_field!(o.block, Val(:release), o.producer_release)
     return nothing
 end
 
@@ -1633,7 +1660,7 @@ function from_c_stream(sp::Ptr{CArrowArrayStream})
     owner = StreamOwner(stream)
     moved = false
     try
-        _store_field!(sp, :release, Ptr{Cvoid}(C_NULL)) # the move commit
+        _store_field!(sp, Val(:release), Ptr{Cvoid}(C_NULL)) # the move commit
         moved = true
         _arm_stream_owner!(owner)
         out = Ref(CArrowSchema(Ptr{UInt8}(C_NULL), Ptr{UInt8}(C_NULL),
