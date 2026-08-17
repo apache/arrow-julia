@@ -927,6 +927,10 @@ end
             Arrow.AC.RunEndEncodedType(); nullable=false,
             children=[Arrow.AC.Field("run_ends",
                 Arrow.AC.IntType(32, true); nullable=false), uf]))
+        @test !Arrow._typedroutable(Arrow.AC.Field("d",
+            Arrow.AC.DictionaryType(Arrow.AC.IntType(32, true),
+                uf.type, false); nullable=false,
+            children=collect(Arrow.AC.Field, uf.children)))
     end
 
     @testset "errors are clean" begin

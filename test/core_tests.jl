@@ -1433,6 +1433,11 @@ end
         f24 = Field("x", IntType(24, true); nullable=false)
         @test_throws ArgumentError materialize(Int64, f24, i24)
         @test_throws ArgumentError getvalue(Int64, f24, i24, 1)
+        fl24 = AC.ArrayData(FloatType(24), 2,
+            [BufferSlice(), AC._databuffer(UInt8[0, 0, 0, 0, 0, 0])])
+        ff24 = Field("y", FloatType(24); nullable=false)
+        @test_throws ArgumentError materialize(Float64, ff24, fl24)
+        @test_throws ArgumentError getvalue(Float64, ff24, fl24, 1)
         # Fresh-process allocation: the typed hot loop must reach steady
         # state without compiler-introspection priming (a separate process
         # so this suite's own inference cannot mask a regression).
