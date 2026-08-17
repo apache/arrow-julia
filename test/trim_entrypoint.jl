@@ -93,6 +93,11 @@ function exercise_cdata()::Nothing
     f2, d2 = from_c_data(sp, ap)
     validate_semantic(f2, d2)
     checked(getvalue(f2, d2, 3) === Int64(3), "cdata round-trip value failed")
+    # The R5 workflow verbatim: a column imported over the C seam reads
+    # through a caller-supplied static type, fully resolved.
+    tm = materialize(Int64, f2, d2)
+    checked(tm isa Vector{Int64} && tm == Int64[1, 2, 3],
+        "cdata typed materialize failed")
     checked(nullcount(d2) == 0, "cdata round-trip nullcount failed")
     # close! on the imported region runs the foreign release callback now;
     # the export registry must be empty once the consumer releases.
@@ -154,6 +159,53 @@ function exercise_values()::Nothing
     return nothing
 end
 
+function exercise_typed_values()::Nothing
+    # The R5 contract: a caller-supplied static schema makes element access
+    # fully resolvable — concrete claims at every call site below.
+    f1, c1 = fromjulia("xs", Int64[1, 2, 3])
+    checked(getvalue(Int64, f1, c1, 2) === Int64(2), "typed int failed")
+    m1 = materialize(Int64, f1, c1)
+    checked(m1 isa Vector{Int64} && m1[3] === Int64(3),
+        "typed int materialize failed")
+    f2, c2 = fromjulia("ys", [1.5, missing, 3.5])
+    m2 = materialize(Union{Missing,Float64}, f2, c2)
+    checked(m2 isa Vector{Union{Missing,Float64}} && m2[2] === missing,
+        "typed float materialize failed")
+    f4, c4 = fromjulia("strs", ["a", "", missing])
+    checked(getvalue(Union{Missing,String}, f4, c4, 1) == "a",
+        "typed string failed")
+    f5, c5 = fromjulia("lists", [Int64[1, 2], Int64[3], Int64[]])
+    m5 = materialize(Vector{Int64}, f5, c5)
+    checked(m5 isa Vector{Vector{Int64}} && m5[1] == Int64[1, 2],
+        "typed list materialize failed")
+    saf, sad = fromjulia("a", Int64[7, 8])
+    sbf, sbd = fromjulia("b", ["x", "y"])
+    sf = Field("st", StructType(); nullable=false, children=[saf, sbf])
+    sd = AC.ArrayData(StructType(), 2, [BufferSlice()];
+        children=[sad, sbd], nullcount=0)
+    sv = getvalue(NamedTuple{(:a, :b),Tuple{Int64,String}}, sf, sd, 2)
+    checked(sv === (a=Int64(8), b="y"), "typed struct failed")
+    df, dd = AC.fromjulia_dict("d", ["lo", "hi"], [0, 1, missing, 0])
+    checked(getvalue(Union{Missing,String}, df, dd, 2) == "hi",
+        "typed dictionary failed")
+    # The claim is exact: a mismatched static type refuses, never converts.
+    caught = false
+    try
+        getvalue(Int32, f1, c1, 1)
+    catch e
+        caught = e isa ArgumentError
+    end
+    checked(caught, "typed mismatch accepted")
+    caught = false
+    try
+        getvalue(Float64, f2, c2, 2)
+    catch e
+        caught = e isa ArgumentError
+    end
+    checked(caught, "typed null under non-missing claim accepted")
+    return nothing
+end
+
 function exercise_validation_errors()::Nothing
     t = IntType(64, true)
     f = Field("x", t)
@@ -196,6 +248,7 @@ function run_trim_workload()::Nothing
         rm(dir)
     end
     exercise_values()
+    exercise_typed_values()
     exercise_validation_errors()
     exercise_cdata()
     return nothing

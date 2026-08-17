@@ -1314,6 +1314,63 @@ end
     end
 end
 
+    @testset "typed element access (static schemas)" begin
+        f, d = fromjulia("x", Int64[1, 2, 3])
+        @test getvalue(Int64, f, d, 2) === Int64(2)
+        @test materialize(Int64, f, d) == Int64[1, 2, 3]
+        @test materialize(Int64, f, d) isa Vector{Int64}
+        @test getvalue(Any, f, d, 1) === Int64(1)   # dynamic delegation
+        @test_throws BoundsError getvalue(Int64, f, d, 4)
+        # exact-match discipline: no conversion, no widening
+        @test_throws ArgumentError getvalue(Int32, f, d, 1)
+        @test_throws ArgumentError getvalue(Integer, f, d, 1)
+        fm, dm = fromjulia("y", [1.5, missing])
+        @test getvalue(Union{Missing,Float64}, fm, dm, 2) === missing
+        @test isequal(materialize(Union{Missing,Float64}, fm, dm),
+            [1.5, missing])
+        @test_throws ArgumentError getvalue(Float64, fm, dm, 2)
+        fs, ds = fromjulia("s", ["a", missing])
+        @test getvalue(Union{Missing,String}, fs, ds, 1) == "a"
+        fb, db = fromjulia("b", [true, false])
+        @test materialize(Bool, fb, db) == [true, false]
+        # lists recurse the claim
+        fl, dl = fromjulia("l", [Int64[1, 2], Int64[]])
+        @test getvalue(Vector{Int64}, fl, dl, 1) == [1, 2]
+        @test materialize(Vector{Int64}, fl, dl) isa Vector{Vector{Int64}}
+        @test_throws ArgumentError getvalue(Vector{Float64}, fl, dl, 1)
+        fn, dn = fromjulia("ln", [[1.5, missing], missing])
+        @test isequal(getvalue(
+            Union{Missing,Vector{Union{Missing,Float64}}}, fn, dn, 1),
+            [1.5, missing])
+        @test getvalue(
+            Union{Missing,Vector{Union{Missing,Float64}}}, fn, dn, 2) ===
+            missing
+        # structs: Vector{Pair} row or a NamedTuple claim (names must match)
+        saf, sad = fromjulia("a", Int64[7, 8])
+        sbf, sbd = fromjulia("b", ["x", "y"])
+        sf = Field("st", StructType(); nullable=false, children=[saf, sbf])
+        sd = AC.ArrayData(StructType(), 2, [BufferSlice()];
+            children=[sad, sbd], nullcount=0)
+        NT = NamedTuple{(:a, :b),Tuple{Int64,String}}
+        @test getvalue(NT, sf, sd, 2) === (a=Int64(8), b="y")
+        @test materialize(NT, sf, sd) isa Vector{NT}
+        @test getvalue(Vector{Pair{String,Any}}, sf, sd, 1) ==
+              ["a" => 7, "b" => "x"]
+        WRONGNAME = NamedTuple{(:a, :c),Tuple{Int64,String}}
+        @test_throws ArgumentError getvalue(WRONGNAME, sf, sd, 1)
+        WRONGTYPE = NamedTuple{(:a, :b),Tuple{Int32,String}}
+        @test_throws ArgumentError getvalue(WRONGTYPE, sf, sd, 1)
+        # dictionary reads recurse into the pool
+        df, dd = AC.fromjulia_dict("d", ["lo", "hi"], [0, 1, missing])
+        @test getvalue(Union{Missing,String}, df, dd, 2) == "hi"
+        @test getvalue(Union{Missing,String}, df, dd, 3) === missing
+        # typed == dynamic on every covered layout
+        for (ff, cc, T) in ((f, d, Int64), (fm, dm, Union{Missing,Float64}),
+            (fs, ds, Union{Missing,String}), (fl, dl, Vector{Int64}),
+            (df, dd, Union{Missing,String}))
+            @test isequal(materialize(T, ff, cc), materialize(ff, cc))
+        end
+    end
 end # ArrowCore testset
 
 # The required standalone command commonly starts Julia with one thread.

@@ -1788,6 +1788,14 @@ juliatype(t::TimeType) = t.bits == 32 ? Int32 : Int64
 juliatype(::Utf8Type) = String
 juliatype(::BinaryType) = Vector{UInt8}
 juliatype(t::FixedSizeBinaryType) = Vector{UInt8}
+juliatype(t::ViewType) = t.utf8 ? String : Vector{UInt8}
+juliatype(t::DecimalType) = t.bits == 32 ? Int32 :
+    t.bits == 64 ? Int64 : Vector{UInt8}
+juliatype(t::IntervalType) = t.unit == YEAR_MONTH ? Int32 :
+    t.unit == DAY_TIME ? NamedTuple{(:days, :millis),Tuple{Int32,Int32}} :
+    NamedTuple{(:months, :days, :nanos),Tuple{Int32,Int32,Int64}}
+juliatype(::StructType) = Vector{Pair{String,Any}}
+juliatype(::MapType) = Vector{Pair{Any,Any}}
 
 @inline function _load_int(b::BufferSlice, t::IntType, byteoff::Int64)::Int64
     # Literal load widths avoid a runtime DataType in the raw-load path, which
@@ -2140,6 +2148,213 @@ function _materialize_loop(t::T, f::Field, d::ArrayData) where {T<:ArrowType}
     # 2.x users expect) is the facade's typed-view work, and the runtime
     # narrow is trim-hostile. Tests compare with ==/isequal, which is
     # eltype-agnostic.
+    return out
+end
+
+# ---------------------------------------------------------------------------
+# Typed element access: the caller asserts the element domain (review
+# follow-up R5). With a concrete static schema at the call site every load
+# resolves statically — the trim-compile contract dynamic access cannot
+# offer. The type is a CLAIM about the same value domain the dynamic
+# accessors return (storage integers for temporal, `Vector{Pair}` rows for
+# struct/map): the read produces exactly that type or refuses with a clear
+# error. `Any` is the dynamic path unchanged.
+# ---------------------------------------------------------------------------
+
+"""
+    getvalue(::Type{T}, field, data, i) -> T
+    materialize(::Type{T}, field, data) -> Vector{T}
+
+Statically typed element access: `T` asserts the element domain (what the
+dynamic accessors return for this layout — see `juliatype`), with
+`Missing <: T` required to admit nulls. Composites recurse: a `List<Int64>`
+column reads as `Vector{Vector{Int64}}`, and a `Struct` column may read as
+a `NamedTuple` row type whose names match the child fields in order.
+Mismatches refuse with `ArgumentError` — values are never converted.
+`T === Any` delegates to the dynamic path.
+"""
+function getvalue(::Type{T}, f::Field, d::ArrayData, i::Integer) where {T}
+    T === Any && return getvalue(f, d, i)
+    1 <= i <= d.len || throw(BoundsError(d, i))
+    return _typedvalue_of(T, d.type, f, d, Int64(i))::T
+end
+
+function materialize(::Type{T}, f::Field, d::ArrayData) where {T}
+    T === Any && return materialize(f, d)
+    return _typedmaterialize_of(T, d.type, f, d)::Vector{T}
+end
+
+# The message names the layout via `nameof` (generic struct/type `show` is
+# trim-hostile); `juliatype(t)` tells a caller the exact expected claim.
+@noinline _typedrefuse(::Type{E}, t::ArrowType, f::Field) where {E} =
+    throw(ArgumentError("field $(f.name) materializes " *
+        "$(string(nameof(typeof(t))))-layout values; the claimed static " *
+        "element type does not match"))
+@noinline _typednullrefuse(f::Field) =
+    throw(ArgumentError("field $(f.name) holds a null but the static " *
+        "element type does not admit missing"))
+@inline _typedmissing(::Type{T}, f::Field) where {T} =
+    Missing <: T ? missing : _typednullrefuse(f)
+
+# The same closed-set ladder as `_value_of`, with the claimed type threaded.
+@inline function _typedvalue_of(::Type{T}, t::ArrowType, f::Field,
+    d::ArrayData, i::Int64) where {T}
+    t isa IntType && return _typedvalue(T, t, f, d, i)
+    t isa FloatType && return _typedvalue(T, t, f, d, i)
+    t isa Utf8Type && return _typedvalue(T, t, f, d, i)
+    t isa BoolType && return _typedvalue(T, t, f, d, i)
+    t isa ListType && return _typedvalue(T, t, f, d, i)
+    t isa StructType && return _typedvalue(T, t, f, d, i)
+    t isa DictionaryType && return _typedvalue(T, t, f, d, i)
+    t isa TimestampType && return _typedvalue(T, t, f, d, i)
+    t isa DateType && return _typedvalue(T, t, f, d, i)
+    t isa TimeType && return _typedvalue(T, t, f, d, i)
+    t isa DurationType && return _typedvalue(T, t, f, d, i)
+    t isa BinaryType && return _typedvalue(T, t, f, d, i)
+    t isa FixedSizeBinaryType && return _typedvalue(T, t, f, d, i)
+    t isa FixedSizeListType && return _typedvalue(T, t, f, d, i)
+    t isa MapType && return _typedvalue(T, t, f, d, i)
+    t isa UnionType && return _typedvalue(T, t, f, d, i)
+    t isa DecimalType && return _typedvalue(T, t, f, d, i)
+    t isa IntervalType && return _typedvalue(T, t, f, d, i)
+    t isa NullType && return _typedvalue(T, t, f, d, i)
+    t isa ViewType && return _typedvalue(T, t, f, d, i)
+    t isa ListViewType && return _typedvalue(T, t, f, d, i)
+    t isa RunEndEncodedType && return _typedvalue(T, t, f, d, i)
+    throw(ArgumentError("unregistered ArrowType"))
+end
+
+# Closed scalar leafs: the claim must equal the layout's `juliatype`
+# exactly; the audited dynamic extraction runs and the assert makes the
+# result statically typed (and free when the claim is right).
+function _typedvalue(::Type{T},
+    t::Union{IntType,FloatType,BoolType,Utf8Type,BinaryType,
+        FixedSizeBinaryType,TimestampType,DateType,TimeType,DurationType,
+        ViewType,DecimalType,IntervalType,MapType},
+    f::Field, d::ArrayData, i::Int64) where {T}
+    isvalid_at(d, i) || return _typedmissing(T, f)
+    E = Base.nonmissingtype(T)
+    E === juliatype(t) || _typedrefuse(E, t, f)
+    return _value(t, f, d, i)::E
+end
+
+function _typedvalue(::Type{T}, t::Union{ListType,ListViewType}, f::Field,
+    d::ArrayData, i::Int64) where {T}
+    isvalid_at(d, i) || return _typedmissing(T, f)
+    E = Base.nonmissingtype(T)
+    E <: Vector || _typedrefuse(E, t, f)
+    if t isa ListType
+        lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth == 8)
+        off = lo
+        n = hi - lo
+    else
+        off, n = _listview_range(t, d, i)
+        (off >= 0 && n >= 0) ||
+            throw(ValidationError("list-view offset and size must be non-negative"))
+    end
+    child, cf = d.children[1], f.children[1]
+    CE = eltype(E)
+    out = Vector{CE}(undef, Int(n))
+    for k = 1:Int(n)
+        out[k] = _typedvalue_of(CE, child.type, cf, child,
+            checked_add(off, Int64(k)))
+    end
+    return out
+end
+
+function _typedvalue(::Type{T}, t::FixedSizeListType, f::Field,
+    d::ArrayData, i::Int64) where {T}
+    isvalid_at(d, i) || return _typedmissing(T, f)
+    E = Base.nonmissingtype(T)
+    E <: Vector || _typedrefuse(E, t, f)
+    child, cf = d.children[1], f.children[1]
+    base = _slotbyteoff(d, i, t.listsize)
+    CE = eltype(E)
+    out = Vector{CE}(undef, t.listsize)
+    for j = 1:t.listsize
+        out[j] = _typedvalue_of(CE, child.type, cf, child,
+            checked_add(base, Int64(j)))
+    end
+    return out
+end
+
+function _typedvalue(::Type{T}, t::StructType, f::Field, d::ArrayData,
+    i::Int64) where {T}
+    isvalid_at(d, i) || return _typedmissing(T, f)
+    E = Base.nonmissingtype(T)
+    E === Vector{Pair{String,Any}} && return _value(t, f, d, i)::E
+    E <: NamedTuple || _typedrefuse(E, t, f)
+    names = fieldnames(E)
+    length(names) == length(f.children) || _typedrefuse(E, t, f)
+    childindex = checked_add(d.offset, i)
+    vals = ntuple(Val(fieldcount(E))) do j
+        String(names[j]) == f.children[j].name || _typedrefuse(E, t, f)
+        _typedvalue_of(fieldtype(E, j), d.children[j].type, f.children[j],
+            d.children[j], childindex)
+    end
+    return E(vals)
+end
+
+function _typedvalue(::Type{T}, t::DictionaryType, f::Field, d::ArrayData,
+    i::Int64) where {T}
+    isvalid_at(d, i) || return _typedmissing(T, f)
+    w = primwidth(t.indextype)
+    idx = _load_int(rolebuffer(d, DATA), t.indextype, _slotbyteoff(d, i, w))
+    dict = d.dictionary
+    dict === nothing &&
+        throw(ValidationError("dictionary-encoded array without a dictionary"))
+    vf = dictvaluefield(f, t)
+    return _typedvalue_of(T, dict.type, vf, dict,
+        checked_add(Int64(idx), Int64(1)))
+end
+
+_typedvalue(::Type{T}, t::RunEndEncodedType, f::Field, d::ArrayData,
+    i::Int64) where {T} =
+    _typedvalue_of(T, d.children[2].type, f.children[2], d.children[2],
+        _ree_runindex(d, i))
+
+_typedvalue(::Type{T}, ::NullType, f::Field, ::ArrayData, ::Int64) where {T} =
+    _typedmissing(T, f)
+
+# Union rows take the WINNING child's runtime type: no static claim can
+# hold across children, so only the dynamic path reads unions.
+_typedvalue(::Type{T}, t::UnionType, f::Field, ::ArrayData,
+    ::Int64) where {T} =
+    _typedrefuse(Base.nonmissingtype(T), t, f)
+
+@inline function _typedmaterialize_of(::Type{T}, t::ArrowType, f::Field,
+    d::ArrayData) where {T}
+    t isa IntType && return _typedmaterialize_loop(T, t, f, d)
+    t isa FloatType && return _typedmaterialize_loop(T, t, f, d)
+    t isa Utf8Type && return _typedmaterialize_loop(T, t, f, d)
+    t isa BoolType && return _typedmaterialize_loop(T, t, f, d)
+    t isa ListType && return _typedmaterialize_loop(T, t, f, d)
+    t isa StructType && return _typedmaterialize_loop(T, t, f, d)
+    t isa DictionaryType && return _typedmaterialize_loop(T, t, f, d)
+    t isa TimestampType && return _typedmaterialize_loop(T, t, f, d)
+    t isa DateType && return _typedmaterialize_loop(T, t, f, d)
+    t isa TimeType && return _typedmaterialize_loop(T, t, f, d)
+    t isa DurationType && return _typedmaterialize_loop(T, t, f, d)
+    t isa BinaryType && return _typedmaterialize_loop(T, t, f, d)
+    t isa FixedSizeBinaryType && return _typedmaterialize_loop(T, t, f, d)
+    t isa FixedSizeListType && return _typedmaterialize_loop(T, t, f, d)
+    t isa MapType && return _typedmaterialize_loop(T, t, f, d)
+    t isa UnionType && return _typedmaterialize_loop(T, t, f, d)
+    t isa DecimalType && return _typedmaterialize_loop(T, t, f, d)
+    t isa IntervalType && return _typedmaterialize_loop(T, t, f, d)
+    t isa NullType && return _typedmaterialize_loop(T, t, f, d)
+    t isa ViewType && return _typedmaterialize_loop(T, t, f, d)
+    t isa ListViewType && return _typedmaterialize_loop(T, t, f, d)
+    t isa RunEndEncodedType && return _typedmaterialize_loop(T, t, f, d)
+    throw(ArgumentError("unregistered ArrowType"))
+end
+
+function _typedmaterialize_loop(::Type{T}, t::TT, f::Field,
+    d::ArrayData) where {T,TT<:ArrowType}
+    out = Vector{T}(undef, d.len)
+    for i = 1:d.len
+        out[i] = _typedvalue(T, t, f, d, Int64(i))
+    end
     return out
 end
 
