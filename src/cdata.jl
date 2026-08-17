@@ -578,6 +578,31 @@ function _malloc!(root::ExportedRoot, n::Integer,
     return Ptr{Cvoid}(p)
 end
 
+"""
+Encode field metadata per the C data interface: int32 pair count, then
+per pair an int32 key length, key bytes, int32 value length, value bytes
+(native endian, not NUL-terminated). NULL when there is no metadata.
+"""
+function _cmetadata!(root::ExportedRoot,
+    metadata::Union{Nothing,AC.FrozenVector{Pair{String,String}}})::Ptr{UInt8}
+    metadata === nothing && return Ptr{UInt8}(C_NULL)
+    n = length(metadata)
+    n == 0 && return Ptr{UInt8}(C_NULL)
+    buf = UInt8[]
+    append!(buf, reinterpret(UInt8, Int32[Int32(n)]))
+    for kv in metadata
+        k = first(kv)
+        v = last(kv)
+        append!(buf, reinterpret(UInt8, Int32[Int32(sizeof(k))]))
+        append!(buf, codeunits(k))
+        append!(buf, reinterpret(UInt8, Int32[Int32(sizeof(v))]))
+        append!(buf, codeunits(v))
+    end
+    p = Ptr{UInt8}(_malloc!(root, length(buf)))
+    GC.@preserve buf unsafe_copyto!(p, pointer(buf), length(buf))
+    return p
+end
+
 function _cstring!(root::ExportedRoot, s::AbstractString)
     isvalid(s) || throw(ValidationError("C Data strings must be valid UTF-8"))
     occursin('\0', s) &&
@@ -628,7 +653,7 @@ function _export_schema!(root::ExportedRoot, f::Field,
     unsafe_store!(p, CArrowSchema(
         _cstring!(root, formatstring_of(f.type)),
         _cstring!(root, f.name),
-        Ptr{UInt8}(C_NULL),
+        _cmetadata!(root, f.metadata),
         flags, nchildren, childptrs, dict,
         release, control))
     root.schema_topology[control] = (canonical_children, dict)
@@ -1127,8 +1152,21 @@ function _release_c_array!(ap::Ptr{CArrowArray}, arr::CArrowArray)
     return nothing
 end
 
+# Longest C string a schema may carry. Format strings are tens of bytes;
+# names and metadata keys are human-scale. The cap converts a missing NUL
+# terminator from an unbounded memory scan into a clean refusal (adopted
+# from samtalki's #607 hardening).
+const CSTRING_SCAN_LIMIT = Int64(1) << 20
+
 function _import_cstring(p::Ptr{UInt8}, what::AbstractString)
-    s = unsafe_string(p)
+    n = Int64(0)
+    while unsafe_load(p + n) != 0x00
+        n += 1
+        n > CSTRING_SCAN_LIMIT && throw(ValidationError(
+            "C Data $what exceeds $(CSTRING_SCAN_LIMIT) bytes without a " *
+            "NUL terminator"))
+    end
+    s = unsafe_string(p, n)
     isvalid(s) || throw(ValidationError("C Data $what is not valid UTF-8"))
     return s
 end
@@ -1146,11 +1184,36 @@ function _validate_schema_flags(sch::CArrowSchema, fmt::AbstractString)
     return nothing
 end
 
+"Parse a C metadata blob: the count and lengths are producer-declared
+(the same trust as every other C Data pointer), but negative values
+refuse — they would wrap the walk."
+function _import_cmetadata(p::Ptr{UInt8})
+    p == C_NULL && return nothing
+    n = unsafe_load(Ptr{Int32}(p))
+    n < 0 && throw(ValidationError("C schema metadata declares a negative pair count"))
+    n == 0 && return nothing
+    off = Int64(4)
+    out = Pair{String,String}[]
+    for _ = 1:n
+        klen = unsafe_load(Ptr{Int32}(p + off))
+        klen < 0 && throw(ValidationError("C schema metadata declares a negative key length"))
+        k = unsafe_string(p + off + 4, klen)
+        off += 4 + Int64(klen)
+        vlen = unsafe_load(Ptr{Int32}(p + off))
+        vlen < 0 && throw(ValidationError("C schema metadata declares a negative value length"))
+        v = unsafe_string(p + off + 4, vlen)
+        off += 4 + Int64(vlen)
+        push!(out, k => v)
+    end
+    return out
+end
+
 function _import_field(sch::CArrowSchema)::Field
     fmt = _import_cstring(sch.format, "format")
     _validate_schema_flags(sch, fmt)
     name = sch.name == C_NULL ? "" : _import_cstring(sch.name, "field name")
     nullable = (sch.flags & ARROW_FLAG_NULLABLE) != 0
+    meta = _import_cmetadata(sch.metadata)
     t = parseformat(fmt, sch.flags)
 
     # Check the schema shape before indexing any recursively-created child.
@@ -1173,10 +1236,18 @@ function _import_field(sch::CArrowSchema)::Field
         isempty(children) ||
             throw(ValidationError("dictionary index schema must not have children"))
         ordered = (sch.flags & ARROW_FLAG_DICTIONARY_ORDERED) != 0
-        return Field(name, DictionaryType(t, vf.type, ordered);
+        # Branch on the metadata's presence: a Union-typed keyword makes
+        # the kwcall tuple imprecise, which trim cannot resolve.
+        meta === nothing && return Field(name,
+            DictionaryType(t, vf.type, ordered);
             nullable=nullable, children=vf.children)
+        return Field(name, DictionaryType(t, vf.type, ordered);
+            nullable=nullable, metadata=meta, children=vf.children)
     end
-    return Field(name, t; nullable=nullable, children=children)
+    meta === nothing &&
+        return Field(name, t; nullable=nullable, children=children)
+    return Field(name, t; nullable=nullable, metadata=meta,
+        children=children)
 end
 
 """

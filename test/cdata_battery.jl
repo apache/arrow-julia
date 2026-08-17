@@ -1268,6 +1268,51 @@ function cdata_battery()
     @assert _registry_count() == sbefore
     println("zero-batch streams, double import, and release edges hold ✓")
 
+    # Field metadata crosses the C boundary (the C data interface blob:
+    # int32 pair count, length-prefixed keys and values), recursively
+    # through children and dictionary value fields; absent metadata stays
+    # NULL and imports as nothing.
+    mleaf = Field("item", IntType(64, true); nullable=false,
+        metadata=["lk" => "lv"])
+    _, mld = fromjulia("l", [Int64[1, 2], Int64[3]])
+    mlist = Field("l", ListType(false); nullable=false,
+        metadata=["k" => "v", "empty" => ""], children=[mleaf])
+    msp, map_ = to_c_data(mlist, mld)
+    mf2, mld2 = from_c_data(msp, map_)
+    @assert collect(mf2.metadata) == ["k" => "v", "empty" => ""]
+    @assert collect(mf2.children[1].metadata) == ["lk" => "lv"]
+    @assert getvalue(mf2, mld2, 1) == Any[1, 2]
+    close!(mld2.buffers[2].region::OwnerRegion)
+    reap!()
+    dvf, dvd = AC.fromjulia_dict("d", ["lo", "hi"], [0, 1, missing])
+    dmf = Field("d", dvf.type; nullable=dvf.nullable,
+        metadata=["dk" => "dv"], children=collect(Field, dvf.children))
+    dsp, dap = to_c_data(dmf, dvd)
+    df2, dd2 = from_c_data(dsp, dap)
+    @assert collect(df2.metadata) == ["dk" => "dv"]
+    @assert getvalue(df2, dd2, 2) == "hi"
+    close!(dd2.buffers[2].region::OwnerRegion)
+    reap!()
+    pf, pd = fromjulia("plain", Int64[1])
+    psp, pap = to_c_data(pf, pd)
+    pf2, pd2 = from_c_data(psp, pap)
+    @assert pf2.metadata === nothing
+    close!(pd2.buffers[2].region::OwnerRegion)
+    reap!()
+    # Hostile blobs refuse: negative counts and lengths would wrap the walk.
+    for negblob in (reinterpret(UInt8, Int32[-1]),
+        vcat(reinterpret(UInt8, Int32[1]), reinterpret(UInt8, Int32[-5])))
+        blob = collect(negblob)
+        caught = try
+            GC.@preserve blob Arrow._import_cmetadata(pointer(blob))
+            false
+        catch e
+            e isa ValidationError
+        end
+        @assert caught
+    end
+    println("field metadata crosses the C boundary ✓")
+
     childscript = joinpath(@__DIR__, "cdata_stress_child.jl")
     stresscmd = `$(Base.julia_cmd()) --startup-file=no --threads=4 --project=$(Base.active_project()) $childscript`
     success(stresscmd) || error("threaded C Data stress failed")

@@ -88,11 +88,16 @@ function exercise_mmap(dir::String)::Nothing
 end
 
 function exercise_cdata()::Nothing
-    f, d = fromjulia("xs", Int64[1, 2, 3])
+    f0, d = fromjulia("xs", Int64[1, 2, 3])
+    f = Field("xs", f0.type; nullable=f0.nullable,
+        metadata=["mk" => "mv"], children=Field[])
     sp, ap = to_c_data(f, d)
     f2, d2 = from_c_data(sp, ap)
     validate_semantic(f2, d2)
     checked(getvalue(f2, d2, 3) === Int64(3), "cdata round-trip value failed")
+    m2 = f2.metadata
+    checked(m2 !== nothing && length(m2) == 1 && first(m2[1]) == "mk" &&
+        last(m2[1]) == "mv", "cdata metadata round-trip failed")
     # The R5 workflow verbatim: a column imported over the C seam reads
     # through a caller-supplied static type, fully resolved.
     tm = materialize(Int64, f2, d2)
