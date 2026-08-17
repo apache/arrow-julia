@@ -302,6 +302,123 @@ end
         @test collect(first.(DataAPI.colmetadatakeys(t))) == [:x]
     end
 
+    @testset "temporal scans preserve cross-type predicate semantics" begin
+        data = (x=Int64[1, 2, 3],
+            d32=[Date(1970, 1, 1), Date(1970, 1, 2), Date(1970, 1, 3)],
+            ts=[DateTime(2020, 1, 1), DateTime(2020, 1, 2), DateTime(2020, 1, 3)])
+        fio = IOBuffer(); Arrow.write(fio, data); fb = take!(fio)
+        sio = IOBuffer(); Arrow.write(sio, data; file=false); sb = take!(sio)
+        cases = [
+            # Date32 vs midnight DateTime: cross-type equality holds
+            Tables.Scan(select=(:x,), filter=Tables.coleq(Tables.col(:d32),
+                DateTime(1970, 1, 2))),
+            # Timestamp vs Date
+            Tables.Scan(select=(:x,), filter=Tables.coleq(Tables.col(:ts),
+                Date(2020, 1, 2))),
+            # raw integer vs a temporal column: never equal in public domain
+            Tables.Scan(select=(:x,), filter=Tables.coleq(Tables.col(:d32), 1)),
+            # non-midnight DateTime vs Date32: no exact representation
+            Tables.Scan(select=(:x,), filter=Tables.coleq(Tables.col(:d32),
+                DateTime(1970, 1, 2, 12))),
+        ]
+        for scan in cases
+            want = Tables.finish(data, scan)
+            for bytes in (fb, sb)
+                got = Arrow.Table(bytes; scan=scan)
+                @test isequal(got.x, want.x)
+            end
+        end
+    end
+
+    @testset "retained rewrite is schema identity" begin
+        # Non-nullable temporal descriptors stay non-nullable; Date64 works.
+        vals = Int64[0, 86_400_000]
+        f64, _ = Arrow.AC.fromjulia("d", vals)
+        t64 = Arrow.AC.DateType(Arrow.AC.MILLISECOND_DATE)
+        d64 = Arrow.AC._arraydata(t64, 2,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(vals)], 0,
+            Arrow.AC.ArrayData[], nothing, nothing, 0)
+        fld = Arrow.AC.Field("d", t64; nullable=false)
+        sch = Arrow.AC.Schema([fld])
+        bytes = Arrow.writestream(sch,
+            [Arrow.AC.RecordBatch(sch, [d64], 2)])
+        t = Arrow.Table(bytes)
+        @test t.d == [DateTime(1970, 1, 1), DateTime(1970, 1, 2)]
+        io = IOBuffer(); Arrow.write(io, t; file=false)
+        rt = getfield(Arrow.Table(take!(io)), :schema)
+        @test rt.fields[1].type isa Arrow.AC.DateType
+        @test rt.fields[1].type.unit == Arrow.AC.MILLISECOND_DATE
+        @test rt.fields[1].nullable == false
+        # Retained dictionary identity: index width and ordered survive.
+        pool = ["a", "b"]
+        pf, pd = Arrow.AC.fromjulia("d", pool)
+        dt = Arrow.AC.DictionaryType(Arrow.AC.IntType(8, true), pf.type, true)
+        idx = Int8[0, 1, 0]
+        dd = Arrow.AC.ArrayData(dt, 3,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(idx)];
+            dictionary=pd, nullcount=0)
+        df = Arrow.AC.Field("d", dt; nullable=false)
+        dsch = Arrow.AC.Schema([df])
+        dbytes = Arrow.writestream(dsch,
+            [Arrow.AC.RecordBatch(dsch, [dd], 3)])
+        dt2 = Arrow.Table(dbytes)
+        io2 = IOBuffer(); Arrow.write(io2, dt2; file=false)
+        rsch = getfield(Arrow.Table(take!(io2)), :schema)
+        rdt = rsch.fields[1].type
+        @test rdt isa Arrow.AC.DictionaryType
+        @test rdt.indextype.bits == 8 && rdt.ordered == true
+        @test rsch.fields[1].nullable == false
+    end
+
+    @testset "replaced facade columns are refused" begin
+        io = IOBuffer()
+        Arrow.write(io, (d=[Date(2024, 1, 1)], p=Arrow.DictEncode(["x"])))
+        t = Arrow.Table(take!(io))
+        broken = Arrow.Table(getfield(t, :names),
+            AbstractVector[Int64[100], Int64[7]], getfield(t, :lookup),
+            getfield(t, :schema), Arrow.AC.OwnerRegion[], 1)
+        io2 = IOBuffer()
+        @test_throws ArgumentError Arrow.write(io2, broken; file=false)
+    end
+
+    @testset "type overrides and renamed schemas" begin
+        io = IOBuffer()
+        Arrow.write(io, (x=Union{Missing,Int64}[1, missing],
+            d=[Date(2024, 1, 1), Date(2024, 1, 2)]))
+        fb = take!(io)
+        t = Arrow.Table(fb; scan=Tables.Scan(
+            select=(:x => Union{Missing,Float64}, :d => Date)))
+        @test isequal(t.x, Union{Missing,Float64}[1.0, missing])
+        @test t.d == [Date(2024, 1, 1), Date(2024, 1, 2)]
+        # a renamed output binds ITS OWN field in the stored schema
+        tr = Arrow.Table(fb; scan=Tables.Scan(select=(:d => :when,)))
+        rsch = getfield(tr, :schema)
+        @test length(rsch.fields) == 1
+        @test rsch.fields[1].name == "when"
+        @test rsch.fields[1].type isa Arrow.AC.DateType
+        io3 = IOBuffer()
+        Arrow.write(io3, tr; file=false)
+        back = getfield(Arrow.Table(take!(io3)), :schema)
+        @test back.fields[1].type isa Arrow.AC.DateType
+    end
+
+    @testset "empty projections keep row counts" begin
+        io = IOBuffer()
+        Arrow.write(io, (x=collect(Int64, 1:5),); file=false)
+        t = Arrow.Table(take!(io); scan=Tables.Scan(select=(),
+            filter=Tables.col(:x) > 2))
+        @test isempty(Tables.columnnames(t))
+        @test Tables.rowcount(t) == 3
+    end
+
+    @testset "DataAPI missing columns are errors" begin
+        io = IOBuffer()
+        Arrow.write(io, (x=Int64[1],); file=false)
+        t = Arrow.Table(take!(io))
+        @test_throws ArgumentError DataAPI.colmetadatakeys(t, :nope)
+        @test_throws ArgumentError DataAPI.colmetadata(t, :nope, "k")
+    end
+
     @testset "errors are clean" begin
         @test_throws ArgumentError Arrow.write(IOBuffer(),
             Tables.partitioner(NamedTuple[]))

@@ -101,7 +101,11 @@ function _schemafield(t::Table, col::Symbol)
     i = findfirst(f -> f.name == String(col), collect(sch.fields))
     return i === nothing ? nothing : sch.fields[i]
 end
-_colsymbol(t::Table, col::Symbol) = col
+function _colsymbol(t::Table, col::Symbol)
+    haskey(getfield(t, :lookup), col) ||
+        throw(ArgumentError("no column $(repr(col)) in this table"))
+    return col
+end
 _colsymbol(t::Table, col::Base.Int) = getfield(t, :names)[col]
 function DataAPI.colmetadatakeys(t::Table, col::Union{Symbol,Base.Int})
     f = _schemafield(t, _colsymbol(t, col))
@@ -216,44 +220,79 @@ end
 # stream paths share one value domain; conversion back to public types then
 # happens exactly once, on the scan OUTPUT (rename-aware via Tables.bind).
 
+# Lowering returns (ok, value): ok=false means the literal has NO exact,
+# semantics-preserving storage representation for this field (cross-type
+# inexactness, wrong type entirely) — the caller must then evaluate the
+# whole filter in the PUBLIC domain instead of pushing it down. There is no
+# pass-through: an unlowered literal comparing "equal" to raw storage would
+# change predicate semantics.
 function _storagevalue(t::AC.ArrowType, v)
     t isa AC.DictionaryType && return _storagevalue(t.valuetype, v)
-    if t isa AC.DateType && v isa Dates.Date
-        t.unit == AC.DAY && return Int32(Dates.value(v) - _EPOCH_DAYS)
-        return Int64(Dates.value(Dates.DateTime(v)) - Dates.UNIXEPOCH)
+    if t isa AC.DateType
+        if v isa Dates.Date
+            t.unit == AC.DAY &&
+                return true, Int32(Dates.value(v) - _EPOCH_DAYS)
+            return true, Int64(Dates.value(Dates.DateTime(v)) -
+                Dates.UNIXEPOCH)
+        elseif v isa Dates.DateTime
+            if t.unit == AC.DAY
+                # Only a midnight DateTime equals a Date32 value exactly.
+                v == Dates.DateTime(Dates.Date(v)) || return false, v
+                return true, Int32(Dates.value(Dates.Date(v)) - _EPOCH_DAYS)
+            end
+            return true, Int64(Dates.value(v) - Dates.UNIXEPOCH)
+        end
+        return false, v
     end
-    if v isa Dates.DateTime
-        ms = Int64(Dates.value(v) - Dates.UNIXEPOCH)
-        t isa AC.DateType && t.unit == AC.MILLISECOND && return ms
-        if t isa AC.TimestampType
-            t.unit == AC.MILLISECOND && return ms
-            t.unit == AC.SECOND && return _exactdiv(ms, 1_000, v, "SECOND")
-            t.unit == AC.MICROSECOND && return ms * Int64(1_000)
-            return ms * Int64(1_000_000)
+    if t isa AC.TimestampType
+        dt = v isa Dates.DateTime ? v :
+            v isa Dates.Date ? Dates.DateTime(v) : nothing
+        dt === nothing && return false, v
+        ms = Int64(Dates.value(dt) - Dates.UNIXEPOCH)
+        t.unit == AC.MILLISECOND && return true, ms
+        t.unit == AC.SECOND && return _exactdiv(ms, 1_000)
+        try
+            t.unit == AC.MICROSECOND &&
+                return true, Base.Checked.checked_mul(ms, Int64(1_000))
+            return true, Base.Checked.checked_mul(ms, Int64(1_000_000))
+        catch e
+            e isa OverflowError && return false, v
+            rethrow()
         end
     end
-    if t isa AC.TimeType && v isa Dates.Time
+    if t isa AC.TimeType
+        v isa Dates.Time || return false, v
         ns = Int64(Dates.value(v))
-        t.unit == AC.NANOSECOND && return ns
-        t.unit == AC.MICROSECOND && return _exactdiv(ns, 1_000, v, "MICROSECOND")
-        t.unit == AC.MILLISECOND &&
-            return _exactdiv(ns, 1_000_000, v, "MILLISECOND")
-        return _exactdiv(ns, 1_000_000_000, v, "SECOND")
+        t.unit == AC.NANOSECOND && return true, ns
+        t.unit == AC.MICROSECOND && return _exactdiv(ns, 1_000)
+        t.unit == AC.MILLISECOND && return _exactdiv(ns, 1_000_000)
+        return _exactdiv(ns, 1_000_000_000)
     end
-    if t isa AC.DurationType && v isa Dates.Period
+    if t isa AC.DurationType
+        v isa Dates.Period || return false, v
         target = t.unit == AC.SECOND ? Dates.Second :
             t.unit == AC.MILLISECOND ? Dates.Millisecond :
             t.unit == AC.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
-        return Int64(Dates.value(convert(target, v)))
+        try
+            return true, Int64(Dates.value(convert(target, v)))
+        catch e
+            e isa InexactError && return false, v
+            rethrow()
+        end
     end
-    return v
+    # Non-temporal fields compare in their storage (== public) domain, but a
+    # temporal-typed PUBLIC literal against them is incompatible.
+    istemporalfield = false
+    if v isa Dates.Date || v isa Dates.DateTime || v isa Dates.Time ||
+       v isa Dates.Period
+        return false, v
+    end
+    return true, v
 end
 
-function _exactdiv(x::Int64, d::Integer, v, unit::String)
+_exactdiv(x::Int64, d::Integer) = begin
     q, r = divrem(x, Int64(d))
-    r == 0 || throw(ArgumentError(
-        "filter literal $v is not representable in the column's $unit unit"))
-    return q
+    r == 0 ? (true, q) : (false, x)
 end
 
 function _fieldfor(fields, ref, names)
@@ -262,34 +301,55 @@ function _fieldfor(fields, ref, names)
     return i === nothing ? nothing : fields[i]
 end
 
-function _lowerexpr(e, fields, names)
+function _lowerexpr(e, fields, names, ok::Base.RefValue{Bool})
     e === nothing && return nothing
     if e isa Tables.Cmp
         f = _fieldfor(fields, e.lhs.ref, names)
         f === nothing && return e
-        return Tables.Cmp(e.op, e.lhs, _storagevalue(f.type, e.rhs))
+        good, v = _storagevalue(f.type, e.rhs)
+        good || (ok[] = false)
+        return Tables.Cmp(e.op, e.lhs, v)
     elseif e isa Tables.In
         f = _fieldfor(fields, e.lhs.ref, names)
         f === nothing && return e
-        return Tables.In(e.lhs,
-            Tuple(_storagevalue(f.type, v) for v in e.values))
+        vals = Any[]
+        for x in e.values
+            good, v = _storagevalue(f.type, x)
+            good || (ok[] = false)
+            push!(vals, v)
+        end
+        return Tables.In(e.lhs, Tuple(vals))
     elseif e isa Tables.AndExpr
         return Tables.AndExpr(
-            Tables.ScanExpr[_lowerexpr(a, fields, names) for a in e.args])
+            Tables.ScanExpr[_lowerexpr(a, fields, names, ok) for a in e.args])
     elseif e isa Tables.OrExpr
         return Tables.OrExpr(
-            Tables.ScanExpr[_lowerexpr(a, fields, names) for a in e.args])
+            Tables.ScanExpr[_lowerexpr(a, fields, names, ok) for a in e.args])
     elseif e isa Tables.NotExpr
-        return Tables.NotExpr(_lowerexpr(e.arg, fields, names))
+        return Tables.NotExpr(_lowerexpr(e.arg, fields, names, ok))
     end
     return e
 end
 
+"""
+Lower a scan for storage-domain pushdown. Returns `(pushscan, pushable)`:
+when any filter literal has no exact storage representation, or the bound
+output selects zero columns (the row count would be lost), pushable=false
+and the caller evaluates the ORIGINAL scan over the converted public table.
+Type overrides are ALWAYS stripped from the pushdown copy — they are public-
+domain conversions and run after facade conversion.
+"""
 function _lowerscan(scan::Tables.Scan, fields)
-    scan.filter === nothing && return scan
     names = Symbol[Symbol(f.name) for f in fields]
-    return Tables.Scan(scan.select, _lowerexpr(scan.filter, fields, names),
-        scan.limit, scan.offset, scan.validate)
+    b = Tables.bind(scan, names)
+    isempty(b.columns) && !isempty(fields) && return scan, false
+    ok = Ref(true)
+    lowered = _lowerexpr(scan.filter, fields, names, ok)
+    ok[] || return scan, false
+    pushselect = Tables.SelectItem[Tables.SelectItem(names[c.index], nothing,
+        c.name == names[c.index] ? nothing : c.name) for c in b.columns]
+    return Tables.Scan(pushselect, lowered, scan.limit, scan.offset,
+        scan.validate), true
 end
 
 # --- source opening ---------------------------------------------------------
@@ -341,24 +401,60 @@ function Table(source; scan::Union{Nothing,Tables.Scan}=nothing,
         # exactly-once output conversion, and DataAPI metadata all need it.
         sch, rfields = rangedschema(rf)
         theScan = scan === nothing ? Tables.Scan() : scan
-        got = Tables.scan(rf, _lowerscan(theScan, rfields))
-        return _wrapscanned(got, sch, rfields, theScan)
+        pushscan, pushable = _lowerscan(theScan, rfields)
+        if pushable
+            got = Tables.scan(rf, pushscan)
+            return _wrapscanned(got, sch, rfields, theScan)
+        end
+        full = _wrapscanned(Tables.scan(rf, Tables.Scan()), sch, rfields,
+            Tables.Scan())
+        return _publicscan(full, sch, rfields, theScan, AC.OwnerRegion[])
     end
     src = _opensource(source; mmap=mmap)
     regions = _sourceregions(src)
     fields = _corefields(src)
-    if scan !== nothing && src isa ArrowFile
-        got = Tables.scan(src, _lowerscan(scan, fields))
-        return _wrapscanned(got, src.schema, fields, scan; regions=regions)
-    end
     scan === nothing && return _materialize_table(src, regions)
-    # Stream format: decode RAW columns, scan in the storage domain, then
-    # convert the output once — the same value domain as the pushdown paths.
-    names = Symbol[Symbol(f.name) for f in fields]
-    raw = NamedTuple{Tuple(names)}(Tuple(_rawcolumn(src, i)
-        for i = 1:length(fields)))
-    got = Tables.finish(raw, _lowerscan(scan, fields))
-    return _wrapscanned(got, _tableschema(src), fields, scan; regions=regions)
+    # Zero-field sources carry their row count on the Table itself; the raw
+    # scan path would lose it inside an empty NamedTuple.
+    isempty(fields) && return _publicscan(_materialize_table(src, regions),
+        _tableschema(src), fields, scan, regions)
+    pushscan, pushable = _lowerscan(scan, fields)
+    if pushable
+        if src isa ArrowFile
+            got = Tables.scan(src, pushscan)
+        else
+            # Stream format: decode RAW columns and scan in the storage
+            # domain — the same value domain as the pushdown paths.
+            names = Symbol[Symbol(f.name) for f in fields]
+            raw = NamedTuple{Tuple(names)}(Tuple(_rawcolumn(src, i)
+                for i = 1:length(fields)))
+            got = Tables.finish(raw, pushscan)
+        end
+        return _wrapscanned(got, _tableschema(src), fields, scan;
+            regions=regions)
+    end
+    # Unpushable scans (unrepresentable literals, empty projections)
+    # evaluate the ORIGINAL scan over the fully converted public table —
+    # correctness first; these are rare shapes.
+    return _publicscan(_materialize_table(src, regions), _tableschema(src),
+        fields, scan, regions)
+end
+
+"Evaluate a scan in the PUBLIC value domain over a converted Table."
+function _publicscan(full::Table, schema, sourcefields, scan, regions)
+    # Row count survives an empty projection: window+filter first over the
+    # full column set, then project.
+    counted = Tables.finish(full,
+        Tables.Scan(nothing, scan.filter, scan.limit, scan.offset,
+            scan.validate))
+    n = Base.Int(Tables.rowcount(Tables.columns(counted)))
+    got = Tables.finish(counted,
+        Tables.Scan(scan.select, nothing, nothing, 0, scan.validate))
+    cols = Tables.columns(got)
+    names = collect(Symbol, Tables.columnnames(cols))
+    columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
+    bound = _boundschema(schema, sourcefields, scan)
+    return _table(names, columns, bound, AC.OwnerRegion[regions...], n)
 end
 
 _corefields(s::IPCStream) = collect(AC.Field, s.corefields)
@@ -392,28 +488,47 @@ function _materialize_table(src::ArrowFile, regions)
     return _table(names, cols, src.schema, regions, nrows)
 end
 
+"The OUTPUT schema of a scan: bound source fields under their output names."
+function _boundschema(schema, sourcefields, scan)
+    (schema === nothing || scan === nothing) && return schema
+    b = Tables.bind(scan, Symbol[Symbol(f.name) for f in sourcefields])
+    outfields = AC.Field[]
+    for bc in b.columns
+        f = sourcefields[bc.index]
+        push!(outfields, AC.Field(String(bc.name), f.type;
+            nullable=f.nullable,
+            metadata=f.metadata === nothing ? nothing :
+                collect(Pair{String,String}, f.metadata),
+            children=collect(AC.Field, f.children)))
+    end
+    return AC.Schema(outfields; metadata=schema.metadata === nothing ?
+        nothing : collect(Pair{String,String}, schema.metadata))
+end
+
 "Wrap a scan output (storage-domain columns) into a Table, converting once."
 function _wrapscanned(got, schema, sourcefields, scan;
     regions=AC.OwnerRegion[])
     cols = Tables.columns(got)
     names = collect(Symbol, Tables.columnnames(cols))
     columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
-    # The bound selection maps each OUTPUT column to its SOURCE field —
-    # renames and positional references included — so conversion and the
-    # public eltype are schema-driven even for renamed output.
     if scan !== nothing && !isempty(sourcefields)
         b = Tables.bind(scan, Symbol[Symbol(f.name) for f in sourcefields])
+        length(b.columns) == length(columns) || throw(AssertionError(
+            "scan output width $(length(columns)) does not match its bound " *
+            "selection $(length(b.columns))"))
         for (i, bc) in enumerate(b.columns)
-            i <= length(columns) || break
             f = sourcefields[bc.index]
             converted = _postconvert(f.type, columns[i])
+            # Public type overrides run HERE, after facade conversion —
+            # they are public-domain requests, never storage casts.
             T = bc.type === nothing ? _facadeeltype(f) : bc.type
             columns[i] = T === Any ? map(identity, converted) :
                 collect(T, converted)
         end
     end
     nrows = isempty(columns) ? _scanrowcount(got) : length(columns[1])
-    return _table(names, columns, schema, AC.OwnerRegion[regions...], nrows)
+    bound = _boundschema(schema, sourcefields, scan)
+    return _table(names, columns, bound, AC.OwnerRegion[regions...], nrows)
 end
 
 _scanrowcount(got) = Base.Int(Tables.rowcount(Tables.columns(got)))
