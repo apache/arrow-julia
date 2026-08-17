@@ -1410,6 +1410,29 @@ end
             NamedTuple{(:a, :b),Tuple{Int64,String}}}
         @test_throws ArgumentError getvalue(UNT, hf, hd, 1)
         @test_throws ArgumentError materialize(UNT, hf, hd)
+        # Bulk extraction trusts the BITMAP, never a caller-supplied
+        # null-count cache (the typed path serves unvalidated data).
+        bmp = AC._bitmapbuffer([true, false, true])
+        hd = AC.ArrayData(IntType(64, true), 3,
+            [bmp, AC._databuffer(Int64[10, 20, 30])]; nullcount=0)
+        hfb = Field("h", IntType(64, true); nullable=true)
+        @test isequal(materialize(Union{Missing,Int64}, hfb, hd),
+            [10, missing, 30])
+        @test_throws ArgumentError materialize(Int64, hfb, hd)
+        # Hostile validity geometry stays a BoundsError, exactly like the
+        # per-element path.
+        short = AC.ArrayData(IntType(8, true), 9,
+            [BufferSlice(AC.heapregion(UInt8[0xff]), 0, 1),
+             AC._databuffer(Int8.(1:9))]; nullcount=0)
+        sf9 = Field("s", IntType(8, true); nullable=true)
+        @test_throws BoundsError materialize(Union{Missing,Int8}, sf9, short)
+        # Invalid widths (juliatype 64-bit fallback) refuse instead of
+        # copying at the claim's width or asserting a mistyped load.
+        i24 = AC.ArrayData(IntType(24, true), 2,
+            [BufferSlice(), AC._databuffer(UInt8[8, 0, 0, 7, 0, 0])])
+        f24 = Field("x", IntType(24, true); nullable=false)
+        @test_throws ArgumentError materialize(Int64, f24, i24)
+        @test_throws ArgumentError getvalue(Int64, f24, i24, 1)
         # Fresh-process allocation: the typed hot loop must reach steady
         # state without compiler-introspection priming (a separate process
         # so this suite's own inference cannot mask a regression).

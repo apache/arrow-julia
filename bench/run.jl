@@ -44,6 +44,13 @@ function main(workdir::String)
     repo = dirname(here)
     legs = Tuple{String,String}[]
 
+    # The 2.x leg resolves from the registry, pinned by env2x's compat:
+    # instantiate it up front so the one-command invocation works from a
+    # clean checkout (no manifest is committed).
+    run(`$(Base.julia_cmd()) --startup-file=no
+         --project=$(joinpath(here, "env2x"))
+         -e "using Pkg; Pkg.instantiate()"`)
+
     rewriteout = joinpath(workdir, "rewrite.jsonl")
     _runleg(`$(Base.julia_cmd()) --startup-file=no --project=$repo
              $(joinpath(here, "bench_rewrite.jl")) $workdir`, rewriteout)
@@ -56,9 +63,13 @@ function main(workdir::String)
     push!(legs, ("arrow2x", out2x))
 
     pyout = joinpath(workdir, "pyarrow.jsonl")
-    havedocker = success(pipeline(
-        `docker image inspect arrow-conformance-oracle:latest`;
-        stdout=devnull, stderr=devnull))
+    havedocker = Sys.which("docker") !== nothing && try
+        success(pipeline(
+            `docker image inspect arrow-conformance-oracle:latest`;
+            stdout=devnull, stderr=devnull))
+    catch
+        false
+    end
     if havedocker
         _runleg(`docker run --rm -v $workdir:/bench -v $here:/src
                  arrow-conformance-oracle:latest
@@ -74,11 +85,28 @@ function main(workdir::String)
     for (_, file) in legs, line in eachline(file)
         isempty(strip(line)) && continue
         g(k) = match(Regex("\"$k\":\"?([^\",}]+)"), line).captures[1]
-        results[(g("impl"), g("workload"), g("op"))] =
+        key = (g("impl"), g("workload"), g("op"))
+        haskey(results, key) &&
+            error("duplicate benchmark record for $key")
+        results[key] =
             (parse(Float64, g("seconds")), parse(Int64, g("bytes")))
     end
-
+    # A leg that exits 0 with partial output must refuse, not print a
+    # plausible table.
     impls = [name for (name, _) in legs]
+    for impl in impls,
+        wl in ("primitive", "nullable", "strings", "lists", "dictpool"),
+        op in ("write", "read")
+        haskey(results, (impl, wl, op)) ||
+            error("missing benchmark record for $((impl, wl, op))")
+    end
+
+    println()
+    println("READ ROWS ARE NOT LIKE-FOR-LIKE: rewrite = validate + fully")
+    println("materialized Julia Vectors; arrow2x = lazy wrap + ONE")
+    println("top-level copy() per column (nested lists stay Arrow-backed");
+    println("views); pyarrow = memory-mapped wrap only, all per-element")
+    println("work deferred. Write rows are like-for-like.")
     println()
     println("| workload | op | " * join(impls, " | ") * " | MB/s (" *
             join(impls, " / ") * ") |")

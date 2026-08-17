@@ -61,9 +61,11 @@ def wl_lists():
 
 
 def wl_dictpool():
+    # Plain strings: dictionary_encode runs INSIDE the write timer so all
+    # three legs time pool construction + dictionary write.
     n = ROWS_DICT
-    vals = pa.array("cat-%d" % (i % 32) for i in range(1, n + 1))
-    return pa.table({"d": vals.dictionary_encode()})
+    return pa.table({"d": pa.array("cat-%d" % (i % 32)
+                                   for i in range(1, n + 1))})
 
 
 WORKLOADS = [
@@ -92,8 +94,12 @@ def main(outdir):
         path = os.path.join(outdir, "pyarrow-%s.arrow" % name)
 
         def write():
-            with ipc.new_file(path, tbl.schema) as w:
-                w.write_table(tbl)
+            out = tbl
+            if name == "dictpool":
+                out = pa.table({"d": tbl["d"].combine_chunks()
+                                .dictionary_encode()})
+            with ipc.new_file(path, out.schema) as w:
+                w.write_table(out)
 
         twrite = bench(write)
         size = os.path.getsize(path)

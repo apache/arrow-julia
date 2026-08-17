@@ -2407,6 +2407,12 @@ function _typedvalue(::Type{T},
     isvalid_at(d, i) || return _typedmissing(T, f)
     E = Base.nonmissingtype(T)
     E === juliatype(t) || _typedrefuse(E, _layoutname(t), f)
+    # Invalid int/float widths fall through juliatype's 64-bit fallback:
+    # refuse them here (managed, fails closed) rather than let the raw
+    # extraction's own width ladder produce a mistyped value.
+    (t isa IntType || t isa FloatType) &&
+        primwidth(t) != Int64(sizeof(E)) &&
+        _typedrefuse(E, _layoutname(t), f)
     return _value(t, f, d, i)::E
 end
 
@@ -2549,8 +2555,13 @@ function _bulkmaterialize(::Type{T},
     E = Base.nonmissingtype(T)
     isbitstype(E) || return nothing
     E === juliatype(t) || return nothing
-    n = d.len
     w = Int64(sizeof(E))
+    # The claim's byte size must equal the DESCRIPTOR's layout width: an
+    # invalid 24-bit descriptor falls through juliatype's fallback to a
+    # 64-bit Julia type, and copying at the claim's width would misread —
+    # such descriptors take the element loop (and validation refuses them).
+    primwidth(t) == w || return nothing
+    n = d.len
     # The typed path serves unvalidated data too: subslice re-checks the
     # extraction window against the buffer's declared bounds.
     src = subslice(rolebuffer(d, DATA), checked_mul(d.offset, w),
@@ -2562,14 +2573,21 @@ function _bulkmaterialize(::Type{T},
                 Int(src.len))
         end
     end
-    nc = nullcount(d)
+    # The BITMAP is the validity authority, exactly as per-element access:
+    # a caller-supplied null-count cache is only certified after semantic
+    # validation, and this path explicitly serves unvalidated data.
+    v = validitybuffer(d)
     if !(Missing <: T)
-        nc == 0 || _typednullrefuse(f)
+        if !isempty_buffer(v)
+            for i = 1:n
+                isvalid_at(d, Int64(i)) || _typednullrefuse(f)
+            end
+        end
         return vals
     end
     out = Vector{T}(undef, n)
     copyto!(out, vals)
-    nc == 0 && return out
+    isempty_buffer(v) && return out
     for i = 1:n
         isvalid_at(d, Int64(i)) || (out[i] = missing)
     end

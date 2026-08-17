@@ -894,6 +894,41 @@ end
             file=false)
     end
 
+    @testset "typed read routing serves every valid layout" begin
+        # NullType columns (claim = Missing) and homogeneous unions (claim
+        # joins to a concrete type Core refuses) must ride the dynamic
+        # path — round-51 regressions.
+        nd = Arrow.AC.ArrayData(Arrow.AC.NullType(), 2,
+            Arrow.AC.BufferSlice[]; nullcount=2)
+        nf = Arrow.AC.Field("n", Arrow.AC.NullType(); nullable=true)
+        nsch = Arrow.AC.Schema([nf])
+        nb = Arrow.writestream(nsch,
+            [Arrow.AC.RecordBatch(nsch, Arrow.AC.ArrayData[nd], 2)])
+        @test isequal(Arrow.Table(nb).n, [missing, missing])
+        tid = Arrow.AC._databuffer(Int8[0, 1])
+        ua = Arrow.AC.ArrayData(Arrow.AC.IntType(64, true), 2,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int64[10, 20])])
+        ub_ = Arrow.AC.ArrayData(Arrow.AC.IntType(64, true), 2,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int64[30, 40])])
+        uud = Arrow.AC.ArrayData(Arrow.AC.UnionType(Arrow.AC.SparseMode,
+            Int8[0, 1]), 2, [tid]; children=[ua, ub_], nullcount=0)
+        uf = Arrow.AC.Field("u", Arrow.AC.UnionType(Arrow.AC.SparseMode,
+            Int8[0, 1]); nullable=false,
+            children=[Arrow.AC.Field("a", Arrow.AC.IntType(64, true);
+                nullable=false),
+                Arrow.AC.Field("b", Arrow.AC.IntType(64, true);
+                    nullable=false)])
+        usch = Arrow.AC.Schema([uf])
+        ubz = Arrow.writestream(usch,
+            [Arrow.AC.RecordBatch(usch, Arrow.AC.ArrayData[uud], 2)])
+        @test Arrow.Table(ubz).u == [10, 40]
+        # Dictionary- and REE-wrapped unions route dynamic too.
+        @test !Arrow._typedroutable(Arrow.AC.Field("r",
+            Arrow.AC.RunEndEncodedType(); nullable=false,
+            children=[Arrow.AC.Field("run_ends",
+                Arrow.AC.IntType(32, true); nullable=false), uf]))
+    end
+
     @testset "errors are clean" begin
         @test_throws ArgumentError Arrow.write(IOBuffer(),
             Tables.partitioner(NamedTuple[]))

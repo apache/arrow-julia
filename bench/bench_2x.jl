@@ -15,8 +15,10 @@
 # limitations under the License.
 
 # Arrow.jl 2.x serialize/deserialize timing (run under bench/env2x).
-# Same protocol as bench_rewrite.jl; 2.x reads materialize each column
-# via copy() so both implementations pay full materialization.
+# Same protocol as bench_rewrite.jl. 2.x reads are its idiomatic lazy
+# wrap plus ONE top-level copy() per column — nested list elements stay
+# Arrow-backed views, so this is NOT full materialization; the driver
+# prints that caveat with every report.
 # Usage: julia --project=bench/env2x bench/bench_2x.jl <outdir>
 
 using Arrow, Tables

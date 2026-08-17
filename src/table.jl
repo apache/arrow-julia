@@ -217,10 +217,27 @@ _facadeeltype(f::AC.Field) = f.nullable ?
 # typed, so they stay on the dynamic path.
 function _closedclaim(::Type{T}) where {T}
     T === Any && return false
+    # NullType columns claim Missing (nonmissingtype gives BOTTOM, which
+    # subtypes Vector and has no eltype): the dynamic path serves them.
+    T === Missing && return false
     NT = Base.nonmissingtype(T)
+    NT === Union{} && return false
     NT <: Vector && return _closedclaim(eltype(NT))
     NT <: Pair && return false
     return isconcretetype(NT)
+end
+
+# The claim alone cannot see a union: a homogeneous union JOINS to a
+# concrete Julia type, but Core refuses every typed union read — the
+# route must inspect the descriptor through the transparent wrappers.
+function _typedroutable(f::AC.Field)
+    t = f.type
+    t isa AC.UnionType && return false
+    t isa AC.DictionaryType &&
+        return _typedroutable(AC.dictvaluefield(f, t))
+    (t isa AC.RunEndEncodedType && length(f.children) == 2) &&
+        return _typedroutable(f.children[2])
+    return true
 end
 
 """
@@ -232,7 +249,7 @@ facade's Dates conversion happens after, in `_postconvert`.
 """
 function _batchcolumn(f::AC.Field, d::AC.ArrayData)
     T = _declaredeltype(f, false)
-    _closedclaim(T) || return AC.materialize(f, d)
+    (_closedclaim(T) && _typedroutable(f)) || return AC.materialize(f, d)
     return AC.materialize(T, f, d)
 end
 
