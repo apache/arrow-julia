@@ -1288,10 +1288,32 @@ function cdata_battery()
     dmf = Field("d", dvf.type; nullable=dvf.nullable,
         metadata=["dk" => "dv"], children=collect(Field, dvf.children))
     dsp, dap = to_c_data(dmf, dvd)
+    # Dictionary field metadata rides the DEPENDENT value node (the C++
+    # bridge convention): wrapper NULL, value node populated.
+    dsch = unsafe_load(dsp)
+    @assert dsch.metadata == C_NULL
+    @assert unsafe_load(dsch.dictionary).metadata != C_NULL
     df2, dd2 = from_c_data(dsp, dap)
     @assert collect(df2.metadata) == ["dk" => "dv"]
     @assert getvalue(df2, dd2, 2) == "hi"
     close!(dd2.buffers[2].region::OwnerRegion)
+    reap!()
+    # A foreign producer annotating BOTH nodes loses no pair on import:
+    # wrapper pairs first, then the dependent node's.
+    wsp, wap = to_c_data(dmf, dvd)
+    wsch0 = unsafe_load(wsp)
+    wblob = vcat(reinterpret(UInt8, Int32[1]),
+        reinterpret(UInt8, Int32[2]), codeunits("wk"),
+        reinterpret(UInt8, Int32[2]), codeunits("wv"))
+    wsch = GC.@preserve wblob CArrowSchema(wsch0.format, wsch0.name,
+        pointer(wblob), wsch0.flags, wsch0.n_children, wsch0.children,
+        wsch0.dictionary, wsch0.release, wsch0.private_data)
+    wref = Ref(wsch)
+    wf2, wd2 = GC.@preserve wblob wref begin
+        from_c_data(Base.unsafe_convert(Ptr{CArrowSchema}, wref), wap)
+    end
+    @assert collect(wf2.metadata) == ["wk" => "wv", "dk" => "dv"]
+    close!(wd2.buffers[2].region::OwnerRegion)
     reap!()
     pf, pd = fromjulia("plain", Int64[1])
     psp, pap = to_c_data(pf, pd)
@@ -1311,6 +1333,9 @@ function cdata_battery()
         end
         @assert caught
     end
+    guardscript = joinpath(@__DIR__, "cstring_guard_child.jl")
+    guardcmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $guardscript`
+    success(guardcmd) || error("C-string guard-page child failed")
     println("field metadata crosses the C boundary ✓")
 
     childscript = joinpath(@__DIR__, "cdata_stress_child.jl")

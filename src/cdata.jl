@@ -642,7 +642,15 @@ function _export_schema!(root::ExportedRoot, f::Field,
     end
     dict = Ptr{CArrowSchema}(C_NULL)
     if f.type isa DictionaryType
-        dict = _export_schema!(root, AC.dictvaluefield(f, f.type), release)
+        # The single Core/IPC metadata slot describes the VALUE type, so it
+        # rides the dependent value node, as the C++ bridge does for
+        # dictionary extension values; the wrapper node carries none.
+        vf0 = AC.dictvaluefield(f, f.type)
+        vf = f.metadata === nothing ? vf0 :
+            Field(vf0.name, vf0.type; nullable=vf0.nullable,
+                metadata=collect(Pair{String,String}, f.metadata),
+                children=collect(Field, vf0.children))
+        dict = _export_schema!(root, vf, release)
     end
     flags = f.nullable ? ARROW_FLAG_NULLABLE : Int64(0)
     f.type isa DictionaryType && f.type.ordered &&
@@ -653,7 +661,7 @@ function _export_schema!(root::ExportedRoot, f::Field,
     unsafe_store!(p, CArrowSchema(
         _cstring!(root, formatstring_of(f.type)),
         _cstring!(root, f.name),
-        _cmetadata!(root, f.metadata),
+        _cmetadata!(root, f.type isa DictionaryType ? nothing : f.metadata),
         flags, nchildren, childptrs, dict,
         release, control))
     root.schema_topology[control] = (canonical_children, dict)
@@ -1159,12 +1167,17 @@ end
 const CSTRING_SCAN_LIMIT = Int64(1) << 20
 
 function _import_cstring(p::Ptr{UInt8}, what::AbstractString)
+    # The limit is enforced BEFORE every dereference: the scan window is
+    # exactly CSTRING_SCAN_LIMIT bytes, so the NUL must fall inside it
+    # (maximum payload is the limit minus one) and byte limit+1 is never
+    # touched — a guard page there must produce this refusal, not SIGBUS.
     n = Int64(0)
-    while unsafe_load(p + n) != 0x00
+    while true
+        n >= CSTRING_SCAN_LIMIT && throw(ValidationError(
+            "C Data $what has no NUL terminator within " *
+            "$(CSTRING_SCAN_LIMIT) bytes"))
+        unsafe_load(p + n) == 0x00 && break
         n += 1
-        n > CSTRING_SCAN_LIMIT && throw(ValidationError(
-            "C Data $what exceeds $(CSTRING_SCAN_LIMIT) bytes without a " *
-            "NUL terminator"))
     end
     s = unsafe_string(p, n)
     isvalid(s) || throw(ValidationError("C Data $what is not valid UTF-8"))
@@ -1236,13 +1249,22 @@ function _import_field(sch::CArrowSchema)::Field
         isempty(children) ||
             throw(ValidationError("dictionary index schema must not have children"))
         ordered = (sch.flags & ARROW_FLAG_DICTIONARY_ORDERED) != 0
+        # The value node's metadata joins the wrapper's (wrapper pairs
+        # first; duplicate keys are legal): Core's one slot cannot express
+        # the two-node attribution, but no pair is lost.
+        vmeta = vf.metadata
+        dmeta = meta === nothing ?
+            (vmeta === nothing ? nothing :
+             collect(Pair{String,String}, vmeta)) :
+            (vmeta === nothing ? meta :
+             vcat(meta, collect(Pair{String,String}, vmeta)))
         # Branch on the metadata's presence: a Union-typed keyword makes
         # the kwcall tuple imprecise, which trim cannot resolve.
-        meta === nothing && return Field(name,
+        dmeta === nothing && return Field(name,
             DictionaryType(t, vf.type, ordered);
             nullable=nullable, children=vf.children)
         return Field(name, DictionaryType(t, vf.type, ordered);
-            nullable=nullable, metadata=meta, children=vf.children)
+            nullable=nullable, metadata=dmeta, children=vf.children)
     end
     meta === nothing &&
         return Field(name, t; nullable=nullable, children=children)
