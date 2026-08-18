@@ -95,7 +95,7 @@ export OwnerRegion, BufferSlice, heapregion, mmapregion, close!, ReleaseCell,
     LayoutSpec, layoutspec, BufferRole,
     validate_structural, validate_semantic, validate_full, ValidationError,
     nullcount, getvalue, materialize,
-    fromjulia, batch
+    fromjulia, fromcompactviews, batch
 
 # ---------------------------------------------------------------------------
 # §1 Memory: regions as GC anchors (constrained model)
@@ -2752,6 +2752,88 @@ function fromjulia_dict(name, pool::Vector, indices0::Vector)
     return Field(name, t; nullable=nc > 0, children=vf.children),
     ArrayData(t, length(indices0), [_bitmapbuffer(present), _databuffer(inds)];
         dictionary=vd, nullcount=nc)
+end
+
+"""
+    fromcompactviews(name, payloads::Vector{P}, buf, extra; nullable=true) -> (Field, ArrayData)
+
+Build a Utf8View column from "inline-else-view" 16-byte string payloads — the
+representation the CSV kernel's `CompactString` columns use. `P` is any
+16-byte isbits type; each entry is read as two `UInt64` words `(a, b)`:
+
+    a  bits 0..31   content length as Int32 (-1 = null)
+       bits 32..63  content bytes 1..4 (the full bytes when the length is
+                    ≤ 12; the four-byte PREFIX when it is longer)
+    b  length ≤ 12  content bytes 5..12, zero-padded
+       length > 12  Int64 byte position (1-based) of the content: positive
+                    into `buf`, negative into `extra`
+
+An inline entry is byte-identical to Arrow's view entry and copies verbatim.
+A long entry keeps its length and prefix and has its second word rewritten to
+Arrow's `(int32 buffer index, int32 offset)`. A null entry becomes a canonical
+zero-length entry with its validity bit cleared. `buf` and `extra` become the
+column's variadic data buffers 0 and 1 without copying (`extra` only when it
+is nonempty); the 16·n-byte views buffer is the one fresh allocation. The
+scoped-borrow rule of every zero-copy wrap applies to `buf` and `extra`.
+
+Long entries whose position or extent escapes their buffer, or whose offset
+does not fit Arrow's `Int32`, are refused with `ArgumentError` — the result
+is otherwise handed back unvalidated, like every builder here.
+"""
+function fromcompactviews(name, payloads::Vector{P}, buf::Vector{UInt8},
+    extra::Vector{UInt8}; nullable::Bool=true) where {P}
+    isbitstype(P) && sizeof(P) == 16 ||
+        throw(ArgumentError("compact view payloads must be a 16-byte isbits type"))
+    # The entry words are VALUES (assembled by shifts); Arrow's byte layout
+    # is what those values spell out on a little-endian host, and Core reads
+    # view entries host-natively.
+    _native_endianness() == LittleEndian ||
+        throw(ArgumentError("fromcompactviews requires a little-endian host"))
+    n = length(payloads)
+    hasextra = !isempty(extra)
+    words = Vector{UInt64}(undef, 2 * n)
+    present = Vector{Bool}(undef, n)
+    nnull = 0
+    GC.@preserve payloads begin
+        src = Ptr{UInt64}(pointer(payloads))
+        for i = 1:n
+            a = unsafe_load(src, 2 * i - 1)
+            b = unsafe_load(src, 2 * i)
+            len = reinterpret(Int32, a % UInt32)
+            if len < 0
+                present[i] = false
+                nnull += 1
+                words[2 * i - 1] = zero(UInt64)
+                words[2 * i] = zero(UInt64)
+                continue
+            end
+            present[i] = true
+            if len <= VIEW_INLINE_MAX
+                words[2 * i - 1] = a
+                words[2 * i] = b
+                continue
+            end
+            pos = reinterpret(Int64, b)
+            pos != 0 || throw(ArgumentError(
+                "compact view entry $i: long content has no position"))
+            bufidx = pos < 0 ? Int32(1) : Int32(0)
+            bufidx == 0 || hasextra || throw(ArgumentError(
+                "compact view entry $i references the extra buffer, which is empty"))
+            pos0 = abs(pos) - 1
+            datalen = bufidx == 0 ? length(buf) : length(extra)
+            checked_add(pos0, Int64(len)) <= datalen || throw(ArgumentError(
+                "compact view entry $i: content [$pos0, $len) escapes buffer $bufidx"))
+            pos0 <= typemax(Int32) || throw(ArgumentError(
+                "compact view entry $i: offset $pos0 does not fit an Int32 view offset"))
+            words[2 * i - 1] = a
+            words[2 * i] = UInt64(bufidx % UInt32) | (UInt64(pos0 % UInt32) << 32)
+        end
+    end
+    t = ViewType(true)
+    buffers = BufferSlice[_bitmapbuffer(present), _databuffer(words), _databuffer(buf)]
+    hasextra && push!(buffers, _databuffer(extra))
+    return Field(name, t; nullable=nullable),
+    ArrayData(t, n, buffers; nullcount=nnull)
 end
 
 # ---------------------------------------------------------------------------

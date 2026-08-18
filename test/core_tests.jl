@@ -727,6 +727,106 @@ end
         @test validate_semantic(llvf, llvd) === llvd
         @test getvalue(llvf, llvd, 1) == [2, 3]
     end
+
+    @testset "fromcompactviews: CompactString payloads → Utf8View, zero-copy data" begin
+        # A local encoder of the CSV kernel's 16-byte "inline-else-view"
+        # payload (length | first 4 bytes, then bytes 5..12 or a signed
+        # 1-based position: positive → buf, negative → extra). Any 16-byte
+        # isbits type is accepted; the kernel's is a two-field struct.
+        struct CompactPayload
+            a::UInt64
+            b::UInt64
+        end
+        function inlineentry(bytes::Vector{UInt8})
+            len = length(bytes)
+            a = UInt64(len % UInt32)
+            b = zero(UInt64)
+            for i = 1:min(len, 4)
+                a |= UInt64(bytes[i]) << (32 + 8 * (i - 1))
+            end
+            for i = 5:len
+                b |= UInt64(bytes[i]) << (8 * (i - 5))
+            end
+            return CompactPayload(a, b)
+        end
+        function viewentry(data::Vector{UInt8}, pos1::Int, len::Int, sign::Int)
+            a = UInt64(len % UInt32)
+            for i = 1:4
+                a |= UInt64(data[pos1 + i - 1]) << (32 + 8 * (i - 1))
+            end
+            return CompactPayload(a, reinterpret(UInt64, Int64(sign * pos1)))
+        end
+        nullentry() = CompactPayload(UInt64(0xffffffff), zero(UInt64))
+
+        # buf: a "CSV input" with fields at known positions; extra: one
+        # unescaped-at-parse-time long value.
+        buf = collect(codeunits("id,name\n1,\"\"\n2,abcd\n3,twelve-bytes\n4,thirteen-byte\n5,a much longer value here\n"))
+        long1 = findfirst(codeunits("thirteen-byte"), buf)
+        long2 = findfirst(codeunits("a much longer value here"), buf)
+        extra = collect(codeunits("she said \"hi\" and left"))
+        payloads = CompactPayload[
+            inlineentry(UInt8[]),                                    # ""  (len 0)
+            inlineentry(collect(codeunits("abcd"))),                 # len 4 (a only)
+            inlineentry(collect(codeunits("twelve-bytes"))),         # len 12 (inline max)
+            viewentry(buf, first(long1), 13, +1),                    # first long: buf
+            nullentry(),                                             # missing
+            viewentry(buf, first(long2), 24, +1),                    # long: buf
+            viewentry(extra, 1, length(extra), -1),                  # long: extra
+        ]
+        f, d = fromcompactviews("s", payloads, buf, extra)
+        @test f.type == ViewType(true)
+        @test f.nullable
+        @test length(d) == 7
+        @test nullcount(d) == 1
+        @test validate_full(f, d) === d          # geometry, prefixes, UTF-8
+        @test isequal(materialize(f, d),
+            ["", "abcd", "twelve-bytes", "thirteen-byte", missing,
+             "a much longer value here", "she said \"hi\" and left"])
+        # the data buffers are the caller's vectors, not copies
+        @test d.buffers[3].region.root === buf
+        @test d.buffers[4].region.root === extra
+        # inline entries copied verbatim; long entries rewritten to (bufidx, off0)
+        views = d.buffers[2]
+        @test AC.loadat(views, UInt64, Int64(16)) == payloads[2].a
+        @test AC.loadat(views, UInt64, Int64(24)) == payloads[2].b
+        @test AC.loadat(views, Int32, Int64(16 * 3 + 8)) == Int32(0)          # buf
+        @test AC.loadat(views, Int32, Int64(16 * 3 + 12)) == Int32(first(long1) - 1)
+        @test AC.loadat(views, Int32, Int64(16 * 6 + 8)) == Int32(1)          # extra
+        @test AC.loadat(views, Int32, Int64(16 * 6 + 12)) == Int32(0)
+        # null slot is a canonical zero entry
+        @test AC.loadat(views, UInt64, Int64(16 * 4)) == 0
+        @test AC.loadat(views, UInt64, Int64(16 * 4 + 8)) == 0
+
+        # the column crosses both adapters as an ordinary Utf8View
+        sch = Schema(Field[f])
+        b = AC.RecordBatch(sch, ArrayData[d], 7)
+        s = Arrow.readstream(Arrow.writestream(sch, AC.RecordBatch[b]))
+        @test isequal(materialize(s.schema.fields[1], s.batches[1].columns[1]),
+            materialize(f, d))
+        sp, ap = Arrow.to_c_data(f, d)
+        f2, d2 = Arrow.from_c_data(sp, ap)
+        @test isequal(materialize(f2, d2), materialize(f, d))
+        Arrow.release!(d2.owner::Arrow.ForeignOwner)
+        Arrow.reap!()
+
+        # no nulls, no extra: two data-less-extra buffers, empty bitmap
+        f0, d0 = fromcompactviews("t", payloads[[2, 3]], buf, UInt8[]; nullable=false)
+        @test !f0.nullable
+        @test length(d0.buffers) == 3
+        @test AC.isempty_buffer(d0.buffers[1])
+        @test validate_full(f0, d0) === d0
+        @test materialize(f0, d0) == ["abcd", "twelve-bytes"]
+
+        # refusals: extra referenced but absent, escaping content, zero
+        # position, wrong payload width, non-isbits payloads
+        @test_throws ArgumentError fromcompactviews("t", payloads[[7]], buf, UInt8[])
+        @test_throws ArgumentError fromcompactviews("t",
+            [viewentry(buf, first(long2), 24 + 100, +1)], buf, extra)
+        @test_throws ArgumentError fromcompactviews("t",
+            [CompactPayload(UInt64(13), zero(UInt64))], buf, extra)
+        @test_throws ArgumentError fromcompactviews("t", UInt64[1, 2], buf, extra)
+        @test_throws ArgumentError fromcompactviews("t", Any[1], buf, extra)
+    end
 end
 
 @testset "staged validation rejects corrupt metadata" begin
