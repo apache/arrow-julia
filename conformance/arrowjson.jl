@@ -207,7 +207,7 @@ end
 
 _decimalint(s, bits) = bits == 32 ? Int32(parse(Int128, s)) :
     bits == 64 ? Int64(parse(Int128, s)) :
-    bits == 128 ? parse(Int128, s) : error("decimal256 values are outside this prove-out")
+    bits == 128 ? parse(Int128, s) : error("decimal256 values are not implemented")
 
 """
 Build one Core `ArrayData` from a JSON column. `f` supplies the layout;
@@ -386,7 +386,7 @@ function tojsoncolumn(f::Field, d::ArrayData)
             t.bits == 32 ? _rawvals(d, Float32) : _rawvals(d, Float64)
     elseif t isa DecimalType
         vals = t.bits == 32 ? _rawvals(d, Int32) : t.bits == 64 ? _rawvals(d, Int64) :
-            t.bits == 128 ? _rawvals(d, Int128) : error("decimal256 is outside this prove-out")
+            t.bits == 128 ? _rawvals(d, Int128) : error("decimal256 is not implemented")
         col["DATA"] = string.(vals)
     elseif t isa DateType
         col["DATA"] = t.unit == AC.DAY ? _rawvals(d, Int32) : string.(_rawvals(d, Int64))

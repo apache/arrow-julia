@@ -17,13 +17,11 @@
   under the License.
 -->
 
-> **This is the Arrow.jl 3.0 development branch.** The 2.x implementation
-> has been replaced by a ground-up rewrite; the last 2.x release lives on
-> its release tags. The user-facing API (`Arrow.Table`, `Arrow.Stream`,
-> writers and builders) is the rewrite's next arc — until it lands, this
-> branch is engine + adapters, exercised by the test batteries, the
-> apache/arrow-testing conformance corpus, and a pyarrow/nanoarrow oracle
-> suite.
+> **This is the Arrow.jl 3.0 development branch.** The last 2.x release
+> lives on its release tags. `Arrow.Table`, `Arrow.Stream`, and
+> `Arrow.write` are the public surface; the engine beneath them is
+> exercised by the test batteries, the apache/arrow-testing conformance
+> corpus, and the pyarrow/nanoarrow oracle suites.
 
 This is a pure Julia implementation of the
 [Apache Arrow](https://arrow.apache.org) data standard.
@@ -38,17 +36,21 @@ This is a pure Julia implementation of the
   `tools/fbsgen.jl`.
 - `src/ipc_read.jl`, `src/ipc_write.jl` — the IPC stream and file
   formats: framing, resource limits, compression, dictionary lifecycles.
-- `src/cdata.jl` — the C data interface, import and export.
+- `src/cdata.jl` — the C data and C stream interfaces, import and export.
 - `src/scan.jl` — `Tables.Scan` pushdown over byte ranges plus
   footer-carried statistics pruning.
-- `test/` — core unit tests, the four adapter acceptance batteries, the
-  frozen 2.x-written compatibility fixtures (`test/fixtures2x/`), and the
-  `--trim=safe` compile gate.
+- `src/table.jl`, `src/write.jl` — the public facade: `Arrow.Table`,
+  `Arrow.Stream`, `Arrow.write`, `close!`.
+- `bench/` — the serialize/deserialize benchmark harness (this package,
+  Arrow.jl 2.x, PyArrow) over identical workloads.
+- `test/` — core unit tests, the facade tests, the four adapter acceptance
+  batteries, the frozen 2.x-written compatibility fixtures
+  (`test/fixtures2x/`), and the `--trim=safe` compile gate.
 - `conformance/` — the arrow-testing gold-corpus runner, the integration
   JSON implementation, the pyarrow/nanoarrow IPC oracle round-trip suite,
   and the in-process pyarrow C Data / C Stream oracle.
-- `docs/dev/` — the engine design document and the codex review record of
-  the rewrite (rounds 1–28 so far).
+- `docs/dev/` — the engine design document, the scan/ranged-fetch design
+  notes, the FlatBuffers/C-data research notes, and the review record.
 
 The design rationale for every layer is `docs/dev/core-README.md`.
 

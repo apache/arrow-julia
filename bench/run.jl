@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Serialize/deserialize benchmark driver (review R12): Arrow.jl 3.0 vs
+# Serialize/deserialize benchmark driver: Arrow.jl 3.0 vs
 # Arrow.jl 2.x vs PyArrow over identical logical workloads.
 #
 #   julia --project=. bench/run.jl [workdir]

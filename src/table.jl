@@ -18,12 +18,12 @@
 # The read facade: Arrow IPC -> Tables.jl columns.
 #
 # `Arrow.Table` materializes the selected columns into plain Julia vectors
-# (the zero-copy typed-view layer, ViewPlan, is designed but deliberately
-# deferred until the benchmark suite justifies its composite-eltype choice;
-# it will slot in behind this same API). `Arrow.Stream` iterates record
-# batches as one Table each. Scan pushdown routes through the ranged-scan
-# adapter: on the file format, column pruning, statistics-based batch
-# pruning, and window consumption all happen before decode.
+# (closed fixed-width claims through Core's bulk typed path, everything else
+# through the dynamic accessors); there is no lazy typed-view layer.
+# `Arrow.Stream` iterates record batches as one Table each. Scan pushdown
+# routes through the ranged-scan adapter: on the file format, column
+# pruning, statistics-based batch pruning, and window consumption all happen
+# before decode.
 # =============================================================================
 
 """

@@ -215,7 +215,7 @@ function ipc_write_battery()
     println("schema-only writers validate names, metadata, endianness, and REE children ✓")
 
     # A Field object is one writer-side dictionary-id key. Reusing that exact
-    # object at two positions used to collapse two distinct pools onto one id.
+    # object at two positions must not collapse two distinct pools onto one id.
     aliasfield, aliasdata1 = AC.fromjulia_dict("d", ["a", "b"], [0, 1])
     _, aliasdata2 = AC.fromjulia_dict("d", ["x", "y"], [0, 1])
     aliasschema = Schema(Field[aliasfield, aliasfield])
@@ -262,7 +262,7 @@ function ipc_write_battery()
 
     # One id names ONE pool within a record batch: a caller id table mapping
     # two fields to one id with DIFFERENT pools would decode both fields
-    # through whichever pool was emitted last (round-24 finding).
+    # through whichever pool was emitted last.
     skewf1, skewd1 = AC.fromjulia_dict("s1", ["a"], [0])
     skewf2, skewd2 = AC.fromjulia_dict("s2", ["b"], [0])
     skewids = IdDict{Field,Int64}(skewf1 => Int64(7), skewf2 => Int64(7))
@@ -620,8 +620,8 @@ function ipc_write_battery()
     println("file magic, footer, and block extents are verified ✓")
 
     # ---- Format 1.3/1.4 layouts: views and run-end encoding ------------
-    # 2.x cannot write these (and misreads ListView per the report), so the
-    # acceptance is self round-trip on both formats plus wire-shape checks:
+    # No 2.x-written fixture exists for these layouts, so the acceptance is
+    # self round-trip on both formats plus wire-shape checks:
     # the variadicBufferCounts vector, the late type tags, and the buffer
     # accounting that skewed nothing after them.
     viewentry(len, rest) = vcat(reinterpret(UInt8, Int32[Int32(len)]), rest,

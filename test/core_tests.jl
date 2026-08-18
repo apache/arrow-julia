@@ -182,7 +182,7 @@ end
     end
     @test_throws ArgumentError layoutspec(UnregisteredArrowType())
     @test_throws ArgumentError AC._validate_descriptor(UnregisteredArrowType())
-    # two timestamps with different timezones: same Julia type (the #503 fix)
+    # two timestamps with different timezones: same Julia type
     @test typeof(TimestampType(AC.SECOND, "America/Denver")) ==
           typeof(TimestampType(AC.NANOSECOND, nothing))
 
@@ -361,7 +361,7 @@ end
         f, d = AC.fromjulia_struct("st", (a=Int64[1, 2], b=["x", "y"]))
         validate_structural(f, d)
         # Core struct scalars are ordered name=>value pairs; the NamedTuple
-        # surface is facade work (report §14.2).
+        # surface is the facade's (or a static claim through getvalue(::Type{T}, ...)).
         @test materialize(f, d) ==
               [["a" => 1, "b" => "x"], ["a" => 2, "b" => "y"]]
     end
@@ -510,7 +510,7 @@ end
         @test getvalue(f, d, 1) == (months=1, days=2, nanos=3)
     end
 
-    @testset "decimal32/64 read at the right width (the 2.x misread)" begin
+    @testset "decimal32/64 read at the right width" begin
         for (bits, T) in ((32, Int32), (64, Int64))
             t = DecimalType(9, 2, bits)
             vals = T[12345, -678]

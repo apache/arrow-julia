@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Shared workload definitions for the serialize/deserialize benchmarks
-# (review R12). Deterministic arithmetic data — every implementation
+# Shared workload definitions for the serialize/deserialize benchmarks.
+# Deterministic arithmetic data — every implementation
 # builds the same logical tables, so file sizes and work agree.
 
 const BENCH_ROWS_PRIMITIVE = 10_000_000

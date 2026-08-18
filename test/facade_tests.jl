@@ -897,7 +897,7 @@ end
     @testset "typed read routing serves every valid layout" begin
         # NullType columns (claim = Missing) and homogeneous unions (claim
         # joins to a concrete type Core refuses) must ride the dynamic
-        # path — round-51 regressions.
+        # path.
         nd = Arrow.AC.ArrayData(Arrow.AC.NullType(), 2,
             Arrow.AC.BufferSlice[]; nullcount=2)
         nf = Arrow.AC.Field("n", Arrow.AC.NullType(); nullable=true)

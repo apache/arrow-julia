@@ -17,7 +17,7 @@
 # PyArrow serialize/deserialize timing over the same logical workloads.
 # Reads are pyarrow-idiomatic (memory-mapped read_all): pyarrow defers
 # per-element materialization, so its read numbers measure wrapping, not
-# element conversion — the report states this asymmetry.
+# element conversion — the driver's report states this asymmetry.
 # Usage: python3 bench_pyarrow.py <outdir>
 
 import sys, time, os

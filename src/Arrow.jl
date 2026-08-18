@@ -15,9 +15,15 @@
 # limitations under the License.
 
 """
-    Arrow.jl 3.0 — a ground-up rewrite of the Apache Arrow implementation.
+    Arrow.jl — a pure Julia implementation of the Apache Arrow columnar format.
 
-The engine layering (docs/dev/core-README.md documents each layer in depth):
+Public surface: `Arrow.Table` and `Arrow.Stream` read the IPC stream and
+file formats (paths, `IO`, byte vectors, or a `RangedFile` over a byte-range
+fetcher) as Tables.jl tables, with `Tables.Scan` pushdown; `Arrow.write`
+writes any Tables.jl source; `close!` releases mapped or foreign storage
+deterministically.
+
+Layering (docs/dev/core-README.md documents each layer in depth):
 
 - `ArrowCore` (private): ownership regions, layout registry, `ArrayData`,
   staged validation, accessors — the trim-friendly, dependency-free core.
@@ -26,16 +32,16 @@ The engine layering (docs/dev/core-README.md documents each layer in depth):
   `tools/fbsgen.jl`) over the vendored `FlatBuffers` runtime.
 - IPC adapters (`ipc_read.jl`, `ipc_write.jl`): stream and file formats,
   framing, resource limits, compression, dictionary lifecycles.
-- `cdata.jl`: the C data interface, import and export, with lifecycle
-  accounting.
+- `cdata.jl`: the C data and C stream interfaces, import and export, with
+  lifecycle accounting.
 - `scan.jl`: `Tables.Scan` pushdown over byte ranges plus footer-carried
   statistics pruning.
+- `table.jl`, `write.jl`: the facade over the adapters.
 
-The user-facing facade (`Arrow.Table`, `Arrow.Stream`, builders, ViewPlan)
-is the next arc of the rewrite; until it lands, the adapter entry points
-(`readstream`, `writestream`, `readfile`, `writefile`) are the surface,
-exercised by the test batteries, the arrow-testing conformance corpus, and
-the pyarrow/nanoarrow oracle suite under `conformance/`.
+The adapter entry points (`readstream`, `writestream`, `readfile`,
+`writefile`, `to_c_data`, `from_c_data`, `export_stream!`, `from_c_stream`)
+are exercised directly by the test batteries, the arrow-testing conformance
+corpus, and the pyarrow/nanoarrow oracle suites under `conformance/`.
 """
 module Arrow
 

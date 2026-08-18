@@ -15,43 +15,29 @@
 # limitations under the License.
 
 # =============================================================================
-# PROVE-OUT: the IPC WRITE half of the adapter, over the same ArrowCore.
+# The IPC writer, plus the file-format reader (`readfile`), over ArrowCore.
 #
-# Run with the repo project (the reader example supplies framing, the
-# verifier, the metadata mapping, and 2.x for interop fixtures):
-#
-#     julia --project=. src/ipc_write.jl
-#
-# What this demonstrates, mapped to the redesign report:
-#
-#   * §9 "batch encode is the inverse, one implementation": ONE generic
+#   * Batch encode is the inverse of decode, one implementation: ONE generic
 #     `encodefield!` walks the SAME `layoutspec` registry the decoder walks —
 #     node, registry buffers in registry order, children in declared order.
 #     There are no per-layout write methods to skew against the read side.
 #
-#   * §9 "dictionary state machine, replacement-on-change": each batch's
-#     pools are captured by identity. A dictionary batch is emitted before
-#     the first record batch that references its id and again ONLY when a
-#     later batch's pool for that id is a different snapshot. Replacement
-#     streams declare Feature.DICTIONARY_REPLACEMENT in the schema.
+#   * Dictionary state machine, replacement-on-change: each batch's pools
+#     are captured by identity. A dictionary batch is emitted before the
+#     first record batch that references its id and again ONLY when a later
+#     batch's pool for that id is a different snapshot. Replacement streams
+#     declare Feature.DICTIONARY_REPLACEMENT in the schema.
 #
-#   * §9 "compression at encode": per-buffer LZ4_FRAME/ZSTD with the Int64
+#   * Compression at encode: per-buffer LZ4_FRAME/ZSTD with the Int64
 #     uncompressed-length prefix, the `-1` stored-raw fallback when
 #     compression does not help, codec objects owned per writer and
 #     explicitly finalized. Compressed streams declare Feature.COMPRESSED_BODY
-#     (2.x omits the declaration; the read side accepts both).
+#     (Arrow.jl 2.x streams omit the declaration; the read side accepts both).
 #
-#   * File format = stream framing + a Block index + a Footer (§9): the
-#     writer isolates footer bookkeeping from generic message writing;
-#     `readfile` exposes the footer's record-batch index as a lazy
-#     random-access handle (`length`/`getindex`) over one borrowed or mmapped
-#     region — the report's `ArrowFile` shape (#353/#434).
-#
-# Acceptance at the bottom: representative bytes written here are read back
-# by BOTH this adapter's reader and by today's Arrow.jl 2.x,
-# element-for-element. Custom union ids are verified through Core because
-# 2.x indexes children by id instead of the schema's id-to-child mapping.
-# Adversarial writer-refusal and file-index cases cover the boundaries.
+#   * File format = stream framing + a Block index + a Footer: the writer
+#     isolates footer bookkeeping from generic message writing; `readfile`
+#     exposes the footer's record-batch index as a lazy random-access handle
+#     (`length`/`getindex`) over one borrowed or mmapped region.
 # =============================================================================
 
 # TranscodingStreams is a direct dependency; both codecs share its one
@@ -406,7 +392,7 @@ function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
     AC.typeequal(t, d.type) ||
         throw(ValidationError("column data type does not match its schema field"))
     d.offset == 0 ||
-        throw(ValidationError("IPC encode of offset array views is outside this prove-out; materialize first"))
+        throw(ValidationError("IPC encode of sliced (nonzero-offset) arrays is not supported; materialize first"))
     push!(c.nodes, (d.len, AC.nullcount(d)))
     spec = layoutspec(t)
     if spec.variadic
@@ -526,14 +512,14 @@ const CODEC_NAMES = Dict{Symbol,Int8}(:none => CODEC_NONE,
 
 function _requirelittleendian(host_endian_bom::UInt32=Base.ENDIAN_BOM)
     host_endian_bom == UInt32(0x04030201) ||
-        throw(ValidationError("this prove-out requires a little-endian host"))
+        throw(ValidationError("the IPC writer requires a little-endian host"))
     return nothing
 end
 
 """
 Assign one IPC dictionary id per dictionary-typed field, depth-first over the
-schema — the writer-side half of the adapter id table (report §9: ids are
-adapter bookkeeping; Core fields never carry them).
+schema — the writer-side half of the adapter id table (ids are adapter
+bookkeeping; Core fields never carry them).
 """
 function assigndictids(fields, given::IdDict{Field,Int64}=IdDict{Field,Int64}())
     # `given` lets a caller preserve ids from a source (a reader's table): two
@@ -650,7 +636,7 @@ end
 """
 Which features must the schema declare for these batches? Replacement is
 detected by pool-identity change per id across the batch sequence
-(replacement-on-change, report §9); compression declares COMPRESSED_BODY.
+(replacement-on-change); compression declares COMPRESSED_BODY.
 """
 function _streamfeatures(sch::Schema, batches, ids::IdDict{Field,Int64},
     codec::Int8)
@@ -929,8 +915,8 @@ end
 """
     ArrowFile
 
-The footer's record-batch index as a random-access handle (report §9,
-the #353/#434 shape): `length(file)` batches, `file[i]` decodes batch `i` on
+The footer's record-batch index as a random-access handle:
+`length(file)` batches, `file[i]` decodes batch `i` on
 demand — nothing is decoded at open beyond the schema and the dictionary
 batches every record shares. Each `getindex` decodes fresh from the mapped
 bytes with its own allocation budget and codec contexts; the handle itself
@@ -1269,7 +1255,7 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
     metaschema = footer.schema
     metaschema === nothing ||
         (something(metaschema.endianness, Meta.Endianness.Little) == Meta.Endianness.Little ||
-        throw(ValidationError("big-endian IPC requires normalization, which is outside this prove-out")))
+        throw(ValidationError("big-endian IPC is not supported (no endianness normalization)")))
     metaschema === nothing &&
         throw(ValidationError("file footer carries no schema"))
     # Validate the leading schema and indexed messages against the Footer
@@ -1314,7 +1300,7 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
             header isa Meta.DictionaryBatch ||
                 throw(ValidationError("footer dictionary block is not a dictionary batch"))
             header.isDelta &&
-                throw(ValidationError("delta dictionaries are outside this prove-out"))
+                throw(ValidationError("delta dictionaries are not supported"))
             haskey(dictids, header.id) ||
                 throw(ValidationError("dictionary batch has unknown id $(header.id)"))
             haskey(dicts, header.id) &&

@@ -59,7 +59,7 @@ function _writecolumn(name::String, v::AbstractVector)
             x -> Int64(Dates.value(x)))
     elseif T <: NamedTuple
         any(ismissing, v) && throw(ArgumentError(
-            "missing struct slots are not yet supported by the writer " *
+            "missing struct slots are not supported by the writer " *
             "(column $name); wrap fields as nullable children instead"))
         cols = NamedTuple{fieldnames(T)}(Tuple([getfield(x, k) for x in v]
             for k in fieldnames(T)))

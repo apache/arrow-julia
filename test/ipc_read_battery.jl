@@ -84,8 +84,8 @@ function ipc_read_battery()
         bools=Any[true, false, true, missing, false],
         strs=Any["hey", "", missing, "αβ∀", "last"],
         lists=Any[[1, 2], Int64[], [3], missing, [4, 5, 6]],
-        # Core struct scalars are ordered pairs (report §14.2); the writer
-        # side above still feeds 2.x NamedTuples.
+        # Core struct scalars are ordered pairs; the 2.x-written fixture
+        # above was fed NamedTuples.
         structs=Any[["a" => 1, "b" => "x"], ["a" => 2, "b" => "y"],
             ["a" => 3, "b" => "z"], ["a" => 4, "b" => "w"], ["a" => 5, "b" => "v"]],
         dict=Any["lo", "hi", "lo", missing, "hi"],
@@ -322,11 +322,11 @@ function ipc_read_battery()
             max_metadata_objects=1_000)))
     println("logical metadata expansion and repeated strings are budgeted ✓")
 
-    # Truncation semantics, both halves of the report's append rule:
+    # Truncation semantics, both halves of the append rule:
     # (a) losing only the 8-byte EOS block = boundary truncation, ACCEPTED
     #     (the stream ends after its last complete message);
     # (b) losing bytes of a message body = corruption, a clean framing error
-    #     — never a silent empty/short stream (the 2.x behavior) and never
+    #     — never a silent empty/short stream and never
     #     an aliased read.
     boundary = readstream(bytes[1:(end - 8)])
     @assert length(boundary.batches) == 2

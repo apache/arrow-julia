@@ -17,20 +17,19 @@
 """
     ArrowCore
 
-Prove-out of the runtime-tagged, C-data-shaped core proposed in the Arrow.jl
-redesign report (Arrow-redesign-report.md, §9). Standalone: depends only on
-Base and the Mmap standard library. The existing package is untouched;
-`src/` shows how the IPC and C-data adapters sit on top of this
-module.
+The runtime-tagged, C-data-shaped core of Arrow.jl. It depends only on Base
+and the Mmap standard library; the IPC, C-data, scan, and facade layers in
+`src/` sit on top of it.
 
-Design rules this module is built to demonstrate:
+Design rules:
 
 1. One physical data model. `ArrayData` = layout + buffers + children +
    dictionary, mirroring the Arrow C data interface's `ArrowArray`. Logical
    type parameters such as timezone and precision/scale are fields on
    `ArrowType` descriptors. Names and nullability are fields on `Field`.
-   None parameterize the Core storage types. Struct materialization always
-   returns `Vector{Pair{String,Any}}`; a typed facade remains separate work.
+   None parameterize the Core storage types. Struct materialization returns
+   `Vector{Pair{String,Any}}` on the dynamic path; static element types are
+   the caller's claim through `getvalue(::Type{T}, ...)`/`materialize(::Type{T}, ...)`.
 
 2. Memory validity is GC reachability, plus one revocation bit. Every
    buffer is a `BufferSlice` into an `OwnerRegion` — a (pointer, length,
@@ -40,41 +39,37 @@ Design rules this module is built to demonstrate:
    runs the release action (mmap unmap, foreign release callback) exactly
    once, and later access is a clean error. Slices are bounds-checked
    against the region at construction; loads are a final bounds check, one
-   monotonic closed-flag load, and the raw read. Foreign extents remain
-   trusted declarations, and mapped files remain exposed to external
-   changes.
+   monotonic closed-flag load, and the raw read. Foreign extents are
+   trusted declarations, and mapped files are exposed to external changes.
 
 3. One structural layout registry. `layoutspec(type)` returns the buffer
    roles / child arity / offset width for each of the format-1.5 layouts.
    Generic code (buffer walking, structural validation, the IPC adapter's
-   node/buffer accounting in src/ipc_read.jl) is driven by the
-   registry; per-layout SEMANTICS (element access, semantic validation) are
-   ordinary methods grouped per layout below. Adding a layout means one
-   registry entry plus bounded method groups in the layers that support it.
+   node/buffer accounting in src/ipc_read.jl) is driven by the registry;
+   per-layout SEMANTICS (element access, semantic validation) are ordinary
+   methods grouped per layout below. Adding a layout means one registry
+   entry plus bounded method groups in the layers that support it.
 
-4. Validation is staged (report §9): structural checks here are O(buffers)
-   and run at construction/adaptation time. Data-intrinsic semantic checks
-   are O(n) when an adapter or caller requests them; a successful result is
-   cached. Benign concurrent callers may repeat the same scan.
-   Field-dependent dictionary contracts run on every validation call.
-   Advisory contracts — Field.nullable enforcement, Date64 day
-   divisibility, time-of-day range, decimal precision, and body UTF-8 —
-   are opt-in via `validate_full`: the ecosystem's gold files violate them
-   and the reference implementation reads those files.
-   Framing-stage checks (checked spans, metadata verification, and resource
-   limits before metadata-directed allocation) belong to the adapters and
-   are exercised in the IPC example.
+4. Validation is staged: structural checks are O(buffers) and run at
+   construction/adaptation time. Data-intrinsic semantic checks are O(n)
+   when an adapter or caller requests them; a successful result is cached.
+   Benign concurrent callers may repeat the same scan. Field-dependent
+   dictionary contracts run on every validation call. Advisory contracts —
+   Field.nullable enforcement, Date64 day divisibility, time-of-day range,
+   decimal precision, and body UTF-8 — are opt-in via `validate_full`: the
+   ecosystem's gold files violate them and the reference implementation
+   reads those files. Framing-stage checks (checked spans, metadata
+   verification, resource limits before metadata-directed allocation)
+   belong to the adapters.
 
 The registry, staged validation, element access, and materialization cover
-the mapped format-1.5 layouts, including binary views, list views, and
-run-end encoding. `validate_full` additionally enforces canonical
-bit-packed form (zeroed trailing bits and padding); on-wire buffer padding
-is a writer guarantee, not a reader requirement — the spec permits unpadded
-buffers and this reader accepts them. Core has no codec dependency; the
-IPC adapter implements compression.
-There is no Tables.jl integration or `ViewPlan` — bulk access here uses a
-plain function barrier (`materialize`) to demonstrate the pattern the facade
-will formalize.
+every format-1.5 layout, including binary views, list views, and run-end
+encoding. `validate_full` additionally enforces canonical bit-packed form
+(zeroed trailing bits and padding); on-wire buffer padding is a writer
+guarantee, not a reader requirement — the spec permits unpadded buffers and
+this reader accepts them. Core has no codec dependency; the IPC adapter
+implements compression. Bulk access uses a plain function barrier
+(`materialize`); typed column views are the facade's.
 """
 module ArrowCore
 
@@ -335,9 +330,9 @@ end
 """
 Load a `T` at byte offset `byteoff` (0-based) within the slice. Handles the
 misaligned case with a byte-wise load: alignment is a property of the region
-(the report: Arrow controls only its own allocations; mmap and foreign
-pointers can be anything), so the branch lives here, in one place, instead
-of as a copy workaround scattered through per-type code.
+(Arrow controls only its own allocations; mmap and foreign pointers can be
+anything), so the branch lives here, in one place, instead of as a copy
+workaround scattered through per-type code.
 """
 @inline function loadat(b::BufferSlice, ::Type{T}, byteoff::Int64) where {T}
     # Raw Arrow bytes may only materialize pointer-free values. Loading a
@@ -405,11 +400,10 @@ end
     ArrowType
 
 Abstract supertype of the runtime logical-type descriptors. These are small
-immutable structs whose *fields* carry what today's Arrow.jl puts in Julia
-type parameters (`Timestamp{U,TZ}`, `Decimal{P,S,T}`, ...). Two timestamp
-columns with different timezones have the SAME Julia type here — schema
-diversity costs data, not method instances (fixes the #503 class by
-construction).
+immutable structs whose *fields* carry the logical type parameters
+(timestamp unit and timezone, decimal precision/scale/width, ...). Two
+timestamp columns with different timezones have the SAME Julia type —
+schema diversity costs data, not method instances.
 """
 abstract type ArrowType end
 
@@ -440,7 +434,7 @@ _native_endianness() = Base.ENDIAN_BOM == 0x04030201 ? LittleEndian : BigEndian
 struct NullType <: ArrowType end
 struct BoolType <: ArrowType end
 struct IntType <: ArrowType
-    bits::Int      # 8/16/32/64 — the spec's Int; wider is NOT valid (issue #319)
+    bits::Int      # 8/16/32/64 — the spec's Int; wider is NOT valid
     signed::Bool
 end
 struct FloatType <: ArrowType
@@ -514,9 +508,9 @@ struct RunEndEncodedType <: ArrowType end
 
 One column/child descriptor: name, logical type, nullability, metadata, and
 child fields. Dictionary columns are `DictionaryType` here; the IPC-level
-dictionary *id* is deliberately NOT a Field concern — it is IPC bookkeeping
-and lives in the adapter (report §9: Core dictionaries are object
-references; the id↔dictionary table is the adapter's).
+dictionary *id* is NOT a Field concern — it is IPC bookkeeping and lives in
+the adapter (Core dictionaries are object references; the id↔dictionary
+table is the adapter's).
 """
 struct Field
     name::String
@@ -570,8 +564,7 @@ The STRUCTURAL facts for one physical layout: which buffers it has (in
 order), how many children, its offset width, whether the trailing data
 buffers are variadic (view layouts). This is everything generic code needs
 to walk a layout — and nothing more. Semantics (what the bytes mean, how to
-access element `i`) are per-layout methods, not registry rows (report §8.4:
-"a registry row + one file", not "a row does everything").
+access element `i`) are per-layout methods, not registry rows.
 
 `childcount == -1` means "declared by Field.children" (struct/union);
 `fixedwidth` is bytes-per-element for fixed-stride DATA buffers, 0 when the
@@ -639,7 +632,7 @@ layoutspec(::RunEndEncodedType) = LayoutSpec(BufferRole[], 2, 0, 0, false)
     layoutspec_of(t::ArrowType) -> LayoutSpec
 
 The closed-set dispatch ladder over the runtime descriptors. This is the
-trim-compile story for a runtime-tagged core (report §8.9, §14.2): dispatch
+trim-compile story for a runtime-tagged core: dispatch
 on an abstract-typed field is dynamic, which JuliaC `--trim=safe` rejects —
 but the descriptor set is CLOSED (it is the layout registry), so one
 `isa` ladder devirtualizes every generic call site statically. Multiple
@@ -1007,7 +1000,7 @@ end
 """
     validate_structural(field, data)
 
-Stage-2 validation (report §9): O(buffers), registry-driven, run at
+Stage-2 validation: O(buffers), registry-driven, run at
 construction/adaptation time. Checks buffer arity against the layout, and
 every buffer's byte length against what the logical length requires — with
 checked arithmetic, because these lengths come from untrusted metadata.
@@ -1819,10 +1812,10 @@ end
     getvalue(field, data, i) -> Union{Missing, value}
 
 Read logical element `i` (1-based). Layout dispatch happens on the runtime
-descriptor — one dynamic dispatch per call. This is Core's honest contract
-(report §8.9): scalar access through the erased representation pays a
-boundary cost; `materialize` resolves the layout once and loops through a
-function barrier.
+descriptor — one dynamic dispatch per call. This is Core's honest contract:
+scalar access through the erased representation pays a boundary cost;
+`materialize` resolves the layout once and loops through a function
+barrier.
 """
 function getvalue(f::Field, d::ArrayData, i::Integer)
     1 <= i <= d.len || throw(BoundsError(d, i))
@@ -1880,9 +1873,9 @@ end
 function _value(t::DecimalType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     w = primwidth(t)
-    # 128/256-bit decimals surface as raw native-endian bytes in the prove-out
-    # (BigInt/Int256 conversion is facade work); 32/64 as integers. Core
-    # RecordBatches accept native-endian buffers only.
+    # 128/256-bit decimals surface as raw native-endian bytes (BigInt/Int256
+    # conversion is the facade's); 32/64 as integers. Core RecordBatches
+    # accept native-endian buffers only.
     if t.bits == 32
         return loadat(rolebuffer(d, DATA), Int32, _slotbyteoff(d, i, w))
     elseif t.bits == 64
@@ -1963,7 +1956,7 @@ function _value(t::ListType, f::Field, d::ArrayData, i::Int64)
     child, cf = d.children[1], f.children[1]
     # Explicit Vector{Any}: an Any-first comprehension re-narrows its result
     # at runtime, which is both trim-hostile and wasted work — typed element
-    # containers are the facade's job (report §9 facade).
+    # containers are the facade's job.
     out = Vector{Any}(undef, Int(hi - lo))
     for k = 1:Int(hi - lo)
         out[k] = getvalue(cf, child, checked_add(lo, Int64(k)))
@@ -1987,8 +1980,8 @@ function _value(::StructType, f::Field, d::ArrayData, i::Int64)
     # A NamedTuple carries its names in the TYPE domain, so building one from
     # runtime schema names is intrinsically dynamic (and cannot represent
     # Arrow's duplicate/empty/non-Symbol names at all). The typed NamedTuple
-    # surface is exactly the facade's ViewPlan decision in the report
-    # (§9 facade, §14.2); Core stays concrete and trim-clean.
+    # surface belongs to the facade and to callers' static claims through
+    # `getvalue(::Type{T}, ...)`; Core stays concrete and trim-clean.
     isvalid_at(d, i) || return missing
     childindex = checked_add(d.offset, i)
     n = length(f.children)
@@ -2146,10 +2139,10 @@ function _materialize_loop(t::T, f::Field, d::ArrayData) where {T<:ArrowType}
     for i = 1:d.len
         out[i] = _value(t, f, d, Int64(i))
     end
-    # Vector{Any} by design: result-element typing (and the narrowing pass
-    # 2.x users expect) is the facade's typed-view work, and the runtime
-    # narrow is trim-hostile. Tests compare with ==/isequal, which is
-    # eltype-agnostic.
+    # Vector{Any} by design: result-element typing is the facade's typed-view
+    # work (or the caller's claim through `materialize(::Type{T}, ...)`), and
+    # a runtime narrow is trim-hostile. Tests compare with ==/isequal, which
+    # is eltype-agnostic.
     return out
 end
 
@@ -2377,8 +2370,8 @@ end
     t isa StructType && return _typedvalue(T, t, f, d, i)
     # Wrapper branches keep the claim intact, so they alone can recurse
     # with an UNCHANGED signature: the ::T assert stops that cycle from
-    # widening every other branch to Any in fresh-process inference (the
-    # box codex round 45 measured); the wrapper read itself pays one box.
+    # widening every other branch to Any in fresh-process inference; the
+    # wrapper read itself pays one box.
     t isa DictionaryType && return _typedvalue(T, t, f, d, i)::T
     t isa TimestampType && return _typedvalue(T, t, f, d, i)
     t isa DateType && return _typedvalue(T, t, f, d, i)
@@ -2601,10 +2594,9 @@ end
 # ---------------------------------------------------------------------------
 
 # The write-side counterpart, kept intentionally small: enough construction
-# machinery to exercise every implemented layout without an IPC file in the
-# loop. The real builder layer (append-oriented, byte-budgeted) is facade
-# work; these are the "zero-copy wrap + bitmap build" fast paths the report
-# describes.
+# machinery to build every implemented layout without an IPC file in the
+# loop. These are "zero-copy wrap + bitmap build" fast paths; the
+# append-oriented builder layer is the facade's.
 
 function _bitmapbuffer(present::AbstractVector{Bool})
     any(!, present) || return BufferSlice()   # no nulls -> canonical empty
@@ -2649,7 +2641,7 @@ function fromjulia(name, v::Vector{T}) where {T}
     elseif T <: AbstractVector || T <: Union{Missing,<:AbstractVector}
         return _build_list(name, v)
     else
-        throw(ArgumentError("fromjulia: unsupported element type $T (prove-out scope)"))
+        throw(ArgumentError("fromjulia: unsupported element type $T"))
     end
 end
 
@@ -2724,8 +2716,7 @@ end
 """
     fromjulia_struct(name, nt::NamedTuple) -> (Field, ArrayData)
 
-Build a struct column from equal-length child vectors (no top-level nulls in
-the prove-out builder).
+Build a struct column from equal-length child vectors (no top-level nulls).
 """
 function fromjulia_struct(name, nt::NamedTuple)
     pairs = [fromjulia(String(k), v) for (k, v) in Base.pairs(nt)]
@@ -2843,9 +2834,9 @@ end
 """
     RecordBatch
 
-Schema + equal-length columns: the intended interchange unit in report §9.
-The implemented IPC and C-stream adapters use batches. Future partition
-adapters can use the same boundary; chunked columns remain a facade convenience.
+Schema + equal-length columns: the interchange unit between Core and every
+adapter. The IPC and C-stream adapters produce and consume batches; chunked
+columns are a facade convenience over them.
 """
 struct RecordBatch
     schema::Schema
@@ -2883,11 +2874,10 @@ end
 """
     RecordBatchSource
 
-The shared pull-iteration protocol (report §9): implement
+The shared pull-iteration protocol: implement
 `nextbatch!(src) -> Union{Nothing,RecordBatch}` and `schema(src)`. The IPC
-reader and C-stream importer present this shape. A future facade can use the
-same shape so that a dataset layer or writer need not know which adapter
-produced the stream.
+reader and C-stream importer present this shape, so a writer or dataset
+layer need not know which adapter produced the stream.
 """
 abstract type RecordBatchSource end
 function nextbatch! end

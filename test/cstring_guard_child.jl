@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Guard-page pin for the bounded C-string reader (codex round 48): map
+# Guard-page pin for the bounded C-string reader: map
 # EXACTLY the scan limit of readable non-NUL bytes with a PROT_NONE page
 # immediately after. The reader must refuse with ValidationError; touching
 # byte limit+1 would SIGBUS this child instead.

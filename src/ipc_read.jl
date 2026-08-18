@@ -15,45 +15,28 @@
 # limitations under the License.
 
 # =============================================================================
-# PROVE-OUT: the IPC adapter as a thin peer over ArrowCore.
+# The IPC reader: stream and file formats as a thin peer over ArrowCore.
 #
-# Run with the repo project so the existing package (and its vendored
-# FlatBuffers/Flatbuf metadata bindings) is available:
+#   * Framing: checked spans, the generated FlatBuffers verifier before any
+#     generated getter runs, and explicit resource limits (`Limits` +
+#     `framemessages`) enforced before metadata-directed allocation. The
+#     message body is the decoding AUTHORITY: every wire buffer is first a
+#     checked subslice of its message-body slice, so corrupt metadata cannot
+#     alias the schema message, another batch, or anything else in the file.
+#     Positively compressed buffers are decoded into separate exact-sized
+#     owned regions.
 #
-#     julia --project=. src/ipc_read.jl
+#   * Decoding: ONE generic recursive decoder (`decodefield`) walks nodes and
+#     buffers in the order `layoutspec` declares; variadic layouts carry
+#     their own bounded count handling.
 #
-# What this demonstrates, mapped to the redesign report:
+#   * IPC bookkeeping stays in the adapter: dictionary ids live in an
+#     adapter-side table; Core Fields carry `DictionaryType` object
+#     references and never see an id.
 #
-#   * §9 "IPC adapter": stream framing with checked spans, a bounds verifier
-#     before any generated FlatBuffers getter, and explicit resource limits
-#     (`Limits` + `framemessages`). The message body is the decoding AUTHORITY:
-#     every wire buffer is first a checked subslice of its message-body slice,
-#     so corrupt metadata cannot alias the schema message, another batch, or
-#     anything else in the file. Positively compressed buffers are then
-#     decoded into separate exact-sized owned regions.
-#
-#   * §9 "layout registry": ONE generic recursive decoder (`decodefield`)
-#     replaces the current implementation's per-layout `build` methods with
-#     hand-threaded (nodeidx, bufferidx, varbufferidx) state. Node/buffer order is
-#     derived from `layoutspec` for the fixed-buffer subset used here.
-#     Variadic layouts still need their own bounded count handling.
-#
-#   * §9 "adapter owns IPC bookkeeping": dictionary ids live in an
-#     adapter-side table (`dictionaries::Dict{Int64,...}`); Core Fields
-#     carry `DictionaryType` object references and never see an id.
-#
-#   * The adapter uses metadata bindings REGENERATED from the current
-#     apache/arrow format/*.fbs (tools/fbsgen.jl -> src/metadata/),
-#     over the vendored FlatBuffers runtime, behind a local byte-wise
-#     verifier. The verifier is still a prove-out bridge — the report's
-#     production answer is a generated verifier — but the bindings are now
-#     the spec's shape (features, variadicBufferCounts as [long], type tags
-#     through 26, MONTH_DAY_NANO), so no raw-slot workarounds remain.
-#
-# The acceptance test at the bottom: today's Arrow.jl 2.x WRITES a stream
-# (multi-batch, with nulls, strings, lists, structs, and a dict-encoded
-# column); this adapter reads it back through ArrowCore and the values are
-# compared element-for-element. New core, real bytes, no shims.
+#   * Metadata bindings and the verifier are GENERATED from the vendored
+#     apache/arrow format/*.fbs (tools/fbsgen.jl -> src/metadata/) over the
+#     vendored FlatBuffers runtime.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -61,10 +44,9 @@
 # ---------------------------------------------------------------------------
 
 """
-Resource limits enforced before metadata-directed copying or decode. Small
-fixed Julia containers are created to run the framer itself. Today's reader
-has no equivalent — a hostile length prefix reaches an attacker-sized
-allocation (src/table.jl:804-816).
+Resource limits enforced before metadata-directed copying or decode. Only
+small fixed Julia containers exist before these gates run, so a hostile
+length prefix cannot direct an attacker-sized allocation.
 """
 Base.@kwdef struct Limits
     max_metadata_bytes::Int64 = 16 * 1024 * 1024
@@ -164,7 +146,7 @@ function verify_ipc_metadata(bytes::Vector{UInt8}, limits::Limits,
     # every non-reference field (the version among them), the adapter gates
     # the version, and only then does the reference stage walk the header
     # graph — an unsupported version rejects in constant time instead of
-    # after a full attacker-directed traversal (round-27 finding).
+    # after a full attacker-directed traversal.
     t = _verified(() -> Meta.verifyrootstart_Message(bytes, ctx))
     msg = FB.getrootas(Meta.Message, bytes, 0)
     version = Int16(Int64(msg.version))
@@ -219,7 +201,7 @@ function _framemessages(region::OwnerRegion, limits::Limits,
     # little-endian wire bytes. The explicit argument keeps this ordering
     # testable on the supported little-endian CI host.
     host_endian_bom == UInt32(0x04030201) ||
-        throw(ValidationError("this prove-out requires a little-endian host"))
+        throw(ValidationError("the IPC reader requires a little-endian host"))
     _validatelimits(limits)
     blob = BufferSlice(region, 0, region.len)
     msgs = FramedMessage[]
@@ -481,19 +463,15 @@ end
 # THE generic decoder: registry-driven node/buffer consumption
 # ---------------------------------------------------------------------------
 
-# This function is the headline. The current implementation threads
-# (nodeidx, bufferidx, varbufferidx) by hand through ten `build` methods —
-# an off-by-one in any of them silently shifts every subsequent buffer
-# (the #540 bug class). Here consumption order falls out of `layoutspec`:
-# one field = one node (unless the layout says otherwise) + the registry's
-# buffers in registry order + children in declared order. A mismatch is a
-# thrown error at the *end* of the batch (leftover nodes/buffers), not
-# corruption.
+# Node/buffer consumption order falls out of `layoutspec`: one field = one
+# node (unless the layout says otherwise) + the registry's buffers in
+# registry order + children in declared order. Nothing threads
+# (nodeidx, bufferidx, varbufferidx) by hand per layout, so an off-by-one
+# cannot silently shift every subsequent buffer; a mismatch is a thrown
+# error at the *end* of the batch (leftover nodes/buffers), not corruption.
 
-# Buffer compression (report §9 IPC adapter): one codec context per reader,
-# reused across buffers and explicitly finalized when the reader is done — no
-# global pools (the 2.x design retains one native context per possible thread
-# for process lifetime with no finalization, src/Arrow.jl:83-142).
+# Buffer compression: one codec context per reader, reused across buffers
+# and explicitly finalized when the reader is done — no global pools.
 const CODEC_NONE = Int8(-1)
 const CODEC_LZ4_FRAME = Int8(0)   # Meta.CompressionType.LZ4_FRAME
 const CODEC_ZSTD = Int8(1)        # Meta.CompressionType.ZSTD
@@ -619,9 +597,7 @@ DecodeCursor(nodes, buffers, body, limits::Limits;
 
 The batch's `variadicBufferCounts` as a concrete `Vector{Int64}` (empty when
 the slot is absent). The generated binding reads the spec's `[long]` at
-8-byte width; this accessor exists so every site shares one normalized shape
-— and it is where the vendored 2.x binding's Int32-elements bug was bridged
-before regeneration.
+8-byte width; this accessor exists so every site shares one normalized shape.
 """
 variadiccounts(rb::Meta.RecordBatch) =
     collect(Int64, something(rb.variadicBufferCounts, Int64[]))
@@ -703,10 +679,9 @@ end
 """
 Decode one compressed buffer per the spec: an Int64 uncompressed-length
 prefix, then the compressed payload; a prefix of -1 means the payload is
-stored uncompressed. Every declared size is bounded BEFORE allocation (the
-2.x reader allocates an attacker-controlled Int64 straight from this prefix,
-src/table.jl:804-816), the decompressed size must match the declaration
-exactly, and each decompressed buffer becomes its own exact-sized owned
+stored uncompressed. Every declared size is bounded BEFORE allocation (this
+prefix is attacker-controlled), the decompressed size must match the
+declaration exactly, and each decompressed buffer becomes its own exact-sized owned
 region — the wire mapping is never the backing store of decompressed data.
 """
 function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
@@ -955,8 +930,8 @@ end
 Decode a stream from a borrowed byte vector. Raw batch buffers remain
 zero-copy views of `bytes`; positively compressed buffers become exact-sized
 owned copies. The caller must not mutate or resize `bytes` until the returned
-stream and all batches from it are unreachable. A production IO framer owns
-its backing storage instead of exposing this prove-out borrow contract.
+stream and all batches from it are unreachable (the facade's `Arrow.Table`
+and `Arrow.Stream` own their backing storage and do not expose this borrow).
 `IPCStream` is a single-owner cursor; overlapping `nextbatch!` calls throw
 `ConcurrencyViolationError`.
 """
@@ -976,9 +951,9 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
         throw(ValidationError("schema message must have an empty body"))
     endian = something(metaschema.endianness, Meta.Endianness.Little)
     endian == Meta.Endianness.Little ||
-        throw(ValidationError("big-endian IPC requires normalization, which is outside this prove-out"))
+        throw(ValidationError("big-endian IPC is not supported (no endianness normalization)"))
     dictids = Dict{Int64,Meta.Field}()
-    fielddictids = IdDict{Field,Int64}()   # adapter-side id table (report §9)
+    fielddictids = IdDict{Field,Int64}()   # adapter-side id table
     fields = Field[corefield(f, dictids, fielddictids)
                    for f in something(metaschema.fields, Meta.Field[])]
     foreach(validateschemafield, fields)
@@ -987,7 +962,7 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
         endianness=AC.LittleEndian)
     dicts = Dict{Int64,ArrayData}()
     # One codec context per reader, shared by every compressed batch in the
-    # stream and explicitly finalized on every exit path (report §9).
+    # stream and explicitly finalized on every exit path.
     state = DecodeState(budget)
     validated_dictionaries = AC._ValidatedDictionaries()
     batchslots = Union{Nothing,AC.RecordBatch}[]
@@ -1005,7 +980,7 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
         header = fm.msg.header
         if header isa Meta.DictionaryBatch
             header.isDelta &&
-                throw(ValidationError("delta dictionaries are outside this prove-out"))
+                throw(ValidationError("delta dictionaries are not supported"))
             rb = header.data
             codec = _batchcodec(rb.compression, fm.version)
             haskey(dictids, header.id) ||

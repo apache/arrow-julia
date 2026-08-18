@@ -17,7 +17,7 @@
 # =============================================================================
 # Corpus conformance: the apache/arrow-testing integration gold files.
 #
-#     julia --project=core/conformance conformance/corpus.jl [corpus-dir]
+#     julia --project=conformance conformance/corpus.jl [corpus-dir]
 #
 # For every gold family (a `.json.gz` with sibling `.stream` and
 # `.arrow_file`), run the four checks that make up cross-implementation
@@ -59,13 +59,13 @@ using .ArrowJSON
 const DEFAULT_CORPUS = get(ENV, "ARROW_TESTING_DIR",
     joinpath(homedir(), ".julia", "dev", "arrow-testing"))
 
-# Families this prove-out declares out of scope, with the reason. Everything
+# Families declared out of scope, with the reason. Everything
 # else must pass or it is a failure.
 const SKIP = Dict{String,String}(
-    "1.0.0-bigendian" => "big-endian streams need normalization (declared production work)",
+    "1.0.0-bigendian" => "big-endian streams are not supported (no endianness normalization)",
     "0.14.1" => "pre-1.0 legacy framing (four-byte prefix) is not accepted by design",
     "0.17.1" => "V4 experimental compression marker era; superseded by 2.0.0-compression",
-    "generated_decimal256" => "decimal256 (Int256 storage) is outside this prove-out",
+    "generated_decimal256" => "decimal256 (Int256 storage) is not implemented",
     "generated_extension" => "extension types round-trip as their storage type + metadata; value equality holds but this runner treats the family as informational",
 )
 

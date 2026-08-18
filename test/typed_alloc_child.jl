@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Fresh-process typed-materialization allocation pin (codex round 45): the
+# Fresh-process typed-materialization allocation pin: the
 # recursion architecture must not box per row in a process that never ran
 # compiler introspection — warm-up alone must reach steady state. The
 # bound sits between the intended cost (~80 B/row: the output vector plus
@@ -39,7 +39,7 @@ println("typed alloc ok: $bytes")
 
 # Every NO-CHILD leaf layout must ride the inline fast ladder, not the
 # compiled composite shell: an Interval child pins the non-juliatype-
-# uniform remainder (codex round 46).
+# uniform remainder.
 iv = AC.ArrayData(AC.IntervalType(AC.YEAR_MONTH), 100_000,
     [AC.BufferSlice(), AC._databuffer(collect(Int32, 1:100_000))])
 ivf = AC.Field("iv", AC.IntervalType(AC.YEAR_MONTH); nullable=false)

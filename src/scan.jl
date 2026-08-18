@@ -15,32 +15,25 @@
 # limitations under the License.
 
 # =============================================================================
-# PROVE-OUT: Tables.Scan pushdown over the IPC file adapter
-# (`DESIGN-scan-ranges-trim.md` §1, Stage A), and — further down — the
-# byte-range fetch protocol over the same bound column set (§2).
+# Tables.Scan pushdown over the IPC file adapter, and — further down — the
+# byte-range fetch protocol (`RangedFile`/`RangedSource`) over the same
+# bound column set. Design notes: docs/dev/DESIGN-scan-ranges-trim.md.
 #
-# Run with the repo project, with Tables.jl's `jq/scan` branch dev'ed in:
-#
-#     julia --project=. src/scan.jl
-#
-# Stage-A semantics, exactly as the design specifies:
+# Pushdown semantics: the source consumes what it can PROVE and leaves exact
+# row evaluation to `Tables.finish`.
 #
 #   * the decode set is (selected ∪ filter-referenced) columns — everything
 #     else is SKIPPED by `skipfield!`, a registry walk that consumes the
 #     node/buffer accounting (all buffer-table invariants still checked)
 #     without slicing, decompressing, validating, or materializing anything;
-#   * `limit`/`offset` are consumed EXACTLY when no filter is present:
-#     `RecordBatch.length` is wire metadata, so whole batches outside the
-#     window are never decoded;
+#   * whole batches are pruned by footer-carried statistics (may-contain, so
+#     the filter stays in the residual) and `limit`/`offset` are consumed
+#     EXACTLY when no filter poisons the window: `RecordBatch.length` is
+#     wire metadata, so batches outside the window are never decoded;
 #   * the returned table keeps SOURCE names over the decode set and the
 #     residual keeps `select` and `filter` — `Tables.finish` filters,
 #     projects, renames, and converts. This is the only composition that
 #     stays correct when the filter references unselected columns.
-#
-# The acceptance battery is differential: for every scan,
-# `Tables.scan(file, scan)` must equal `Tables.finish(full_table, scan)`,
-# and corruption probes prove skipped columns and skipped batches are
-# genuinely never decoded.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -51,7 +44,7 @@
 Advance the cursor past one field's node and buffers — the exact traversal
 `decodefield` performs, with every buffer-table invariant still enforced
 (`_buffermeta!`), but no body access: nothing is sliced, decompressed,
-validated, or kept. Over a ranged source (§2), no body range is planned for
+validated, or kept. Over a ranged source, no body range is planned for
 the skipped bytes; tail reads and coalescing may still over-read them.
 """
 function skipfield!(f::Field, c::DecodeCursor)
@@ -529,7 +522,7 @@ function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool})
 end
 
 # ---------------------------------------------------------------------------
-# Tables.apply: Stage A
+# Tables.apply over a whole file
 # ---------------------------------------------------------------------------
 
 """
@@ -568,7 +561,7 @@ _canconsumewindow(scan::Tables.Scan) = scan.offset < typemax(Int) &&
 function Tables.apply(f::ArrowFile, scan::Tables.Scan)
     names = Symbol[Symbol(fld.name) for fld in f.fields]
     allunique(names) || throw(ValidationError(
-        "scan pushdown over duplicate column names is facade work; read the file without a scan"))
+        "scan pushdown over duplicate column names is not supported; read the file without a scan"))
     b = Tables.bind(scan, names)
     if isempty(names)
         # Zero-field sources: consume filter and window HERE — an empty
@@ -596,7 +589,7 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
         else
             Tuple{Int,Int64,Int64}[(i, Int64(0), Int64(-1)) for i = 1:length(f)]
         end
-        # Statistics pruning (design §3): one-sided — a pruned batch is provably
+        # Statistics pruning: one-sided — a pruned batch is provably
         # empty under the filter; the filter itself always stays in the residual.
         keep = trues(length(f))
         if scan.filter !== nothing
@@ -639,13 +632,13 @@ function Tables.apply(f::ArrowFile, scan::Tables.Scan)
 end
 
 # ===========================================================================
-# §2: byte-range reads — RangedSource{F}, the planner, and sparse decode
+# Byte-range reads — RangedSource{F}, the planner, and sparse decode
 # ===========================================================================
 
 """
     RangedSource{F}
 
-The fetcher contract (design §2): `fetch(offset::Int64, len::Int64) ->
+The fetcher contract: `fetch(offset::Int64, len::Int64) ->
 Vector{UInt8}` over a remote or local object of known total `len`, offsets
 0-based. `F` is concrete per instantiation — in a trimmed app the fetch path
 is statically resolvable, which is why this is a parametric functor and not
@@ -758,7 +751,7 @@ end
 Stands in for a contiguous message body when only planned buffer windows
 were fetched. Every declared buffer must resolve inside a fetched span that
 was itself derived from the verified buffer table — the message-body
-authority invariant, sparse (design §2).
+authority invariant, sparse.
 """
 struct SparseBody
     bodylen::Int64
@@ -823,7 +816,7 @@ end
     RangedFile(src::RangedSource; limits, tailbytes=65536, coalesce_gap=262144)
 
 The scan-driven, fetch-minimal file handle: `Tables.apply(rf, scan)` runs
-the design's fetch protocol — tail-first footer, batch windowing from block
+the fetch protocol — tail-first footer, batch windowing from block
 metadata, dictionary bodies only for decode-set ids, and per-buffer body
 ranges for exactly the decode set, coalesced under `coalesce_gap`.
 
@@ -888,7 +881,7 @@ function _rangedfooter(rf::RangedFile, budget::AllocationBudget)
     metaschema === nothing &&
         throw(ValidationError("file footer carries no schema"))
     something(metaschema.endianness, Meta.Endianness.Little) == Meta.Endianness.Little ||
-        throw(ValidationError("big-endian IPC requires normalization, which is outside this prove-out"))
+        throw(ValidationError("big-endian IPC is not supported (no endianness normalization)"))
     dictids = Dict{Int64,Meta.Field}()
     fielddictids = IdDict{Field,Int64}()
     fields = Field[corefield(f, dictids, fielddictids)
@@ -956,7 +949,7 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     metaschema = ft.metaschema
     names = Symbol[Symbol(fld.name) for fld in fields]
     allunique(names) || throw(ValidationError(
-        "scan pushdown over duplicate column names is facade work; read the file without a scan"))
+        "scan pushdown over duplicate column names is not supported; read the file without a scan"))
     b = Tables.bind(scan, names)
     if isempty(names)
         # Zero-field sources: consume filter and window HERE — an empty
@@ -985,7 +978,7 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     # leading schema or optional EOS bytes. A tail request may over-read them.
     _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
 
-    # Statistics pruning happens FIRST (design §3): the stats live in the
+    # Statistics pruning happens FIRST: the stats live in the
     # footer schema's metadata, so pruned batches cause no block-metadata range
     # request. Tail reads may still over-read them. Pruning applies only under
     # a filter, and the window applies only without one, so they never interact.
@@ -1062,7 +1055,7 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
         header isa Meta.DictionaryBatch ||
             throw(ValidationError("footer dictionary block is not a dictionary batch"))
         header.isDelta &&
-            throw(ValidationError("delta dictionaries are outside this prove-out"))
+            throw(ValidationError("delta dictionaries are not supported"))
         haskey(dictids, header.id) ||
             throw(ValidationError("dictionary batch has unknown id $(header.id)"))
         header.id in seenids &&
@@ -1180,7 +1173,7 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
 end
 
 # ===========================================================================
-# §3: per-batch statistics — the official value layout in a footer key
+# Per-batch statistics — the official value layout in a footer key
 # ===========================================================================
 
 

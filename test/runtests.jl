@@ -23,6 +23,6 @@ include("core_tests.jl")
 include("facade_tests.jl")
 
 # The adapter acceptance batteries: assertion-dense scripts over the
-# package's internals. They ran standalone during the prove-out; here they
-# share one module that aliases the package namespace wholesale.
+# package's internals, sharing one module that aliases the package
+# namespace wholesale.
 include("batteries.jl")

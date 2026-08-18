@@ -14,11 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The acceptance batteries exercise the package's internals wholesale (they
-# were the prove-out's standalone example mains). Rather than maintain a
-# hundred-name import list, this module aliases every binding the package
-# defines; the facade arc will replace battery-style access with the public
-# API and per-name imports.
+# The acceptance batteries exercise the package's internals wholesale.
+# Rather than maintain a hundred-name import list, this module aliases every
+# binding the package defines.
 module Batteries
 
 using Test

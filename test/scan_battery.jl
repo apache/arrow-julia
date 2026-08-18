@@ -230,7 +230,7 @@ function _scan_main()
 
     # Buffer-table invariants cannot be weakened by skipping: `skipbuffer!`
     # shares `_buffermeta!` with `takebuffer!` by construction, and for files
-    # the round-15 open-time preflight enforces the same containment and
+    # the open-time preflight enforces the same containment and
     # non-overlap rules before any cursor (selected or skipped) runs at all.
     overlap = copy(filebytes)
     block = readfile(copy(filebytes)).recordblocks[1]

@@ -17,7 +17,7 @@
 # =============================================================================
 # Oracle round-trips: OUR IPC bytes through pyarrow and nanoarrow.
 #
-#     julia --project=core/conformance conformance/oracle.jl [corpus-dir]
+#     julia --project=conformance conformance/oracle.jl [corpus-dir]
 #
 # The gold corpus proves us against files C++ wrote years ago; this suite
 # proves us against implementations running today. The corpus supplies the

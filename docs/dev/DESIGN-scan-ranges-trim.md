@@ -1,11 +1,11 @@
 # Design: Tables.Scan pushdown, cloud byte-range reads, and the trim contract
 
-Status: P1–P3 PROVE-OUT IMPLEMENTED (Aug 14, 2026); P4 remains a production
-proposal. This extends the redesign report's §9 IPC adapter and §14 decision
-rules. The three pieces share one mechanism: **a bound column set drives both
-what gets decoded and what gets fetched, and every request value is plain
-data intended to remain visible to the trim verifier.** Section 4 separates
-that design intent from what the current trim harness actually compiles.
+Implemented in `src/scan.jl` and exposed through the facade
+(`Arrow.Table(source; scan=…)`, `RangedFile`); §5 lists what is and is not
+built. The three pieces share one mechanism: **a bound column set drives
+both what gets decoded and what gets fetched, and every request value is
+plain data intended to remain visible to the trim verifier.** Section 4
+separates that design intent from what the trim harness actually compiles.
 
 ---
 
@@ -34,7 +34,7 @@ select/rename/type items, a closed predicate algebra (`Cmp`/`In`/`IsNull`/
 
 ### The `apply` shape — two stages
 
-**Stage A (adapter-level, near-term).** `Tables.apply` on the file/stream
+**Stage A (adapter-level; what is implemented).** `Tables.apply` on the file/stream
 handles does **IO-and-decode reduction with a full residual**:
 
     apply(f, scan) =
@@ -55,8 +55,8 @@ already-dropped columns. Simple, correct, and captures the dominant win:
 unselected columns cost zero decode and add zero planned body bytes. Tail reads
 and coalescing may still over-read them under §2's explicit policy.
 
-Two refinements the P1 prove-out's differential tests forced (both now
-implemented in `examples/scan_ranges.jl`):
+Two refinements the differential tests forced (both implemented in
+`src/scan.jl`):
 
 - **The residual selection must be RESOLVED, not passed through.** `Not` and
   `Regex` select items re-bound against the reduced output table are wrong
@@ -88,24 +88,23 @@ implemented in `examples/scan_ranges.jl`):
   stays in the residual, so `Tables.finish`/`filtermask` do row evaluation;
   Arrow-side predicate logic first appears as the *interval* ladder for
   statistics pruning (§3). Stream handles keep the default no-push `apply`
-  — the eager prove-out stream has already decoded by the time `apply`
-  runs; stream pushdown belongs to the production incremental framer.
+  — the eager stream reader has already decoded by the time `apply`
+  runs; stream pushdown would need an incremental framer.
 
-**Stage B (facade-level, ViewPlan era).** The facade's `apply` consumes
+**Stage B (facade-level; not implemented).** A facade `apply` that consumes
 everything exactly: per-column masks evaluated through Core accessors (no
-materialization of excluded rows), projection/renames applied at ViewPlan
+materialization of excluded rows), projection/renames applied at column
 construction, `limit`/`offset` composed with exact masks. Residual: empty,
-CSV-kernel style. Stage B subsumes Stage A; Stage A ships first because it
-needs no facade.
+CSV-kernel style. Stage B subsumes Stage A.
 
-Stage B's future row evaluator is a **closed `isa` ladder over the closed
+A Stage B row evaluator would be a **closed `isa` ladder over the closed
 `ScanExpr` set**, walking Core accessors (`isvalid_at` + `_value`)
 column-at-a-time. Stage A implements only `_maypass`, a separate closed ladder
 over statistics values. `Tables.bind` rejects `OpNode` because this adapter
 recognizes none. No closures or `Function` fields are needed.
 
-The P3 statistics fold resolves dictionary indices through the pool before it
-computes logical null/min/max values. A future Stage B row evaluator can test
+The statistics fold resolves dictionary indices through the pool before it
+computes logical null/min/max values. A Stage B row evaluator could test
 equality/membership against each stable pool snapshot once and then compare
 indices; that pool-index optimization is not part of Stage A.
 
@@ -174,7 +173,8 @@ live in extensions:
         # concurrent range GETs (CloudStore does this well) — concurrency
         # stays in the extension, never in Arrow.
 
-- The prove-out entry point is `Tables.scan(RangedFile(source), scan)`. A
+- The entry points are `Tables.scan(RangedFile(source), scan)` and
+  `Arrow.Table(RangedFile(source); scan=…)`. A
   production `readfile(::RangedSource; scan=...)` can make the existing
   whole-buffer and `mmapregion` paths trivial `RangedSource`s
   (fetch = copy/subslice), so ONE reader serves local and remote and the
@@ -219,7 +219,7 @@ Skipped buffer contents remain unvalidated by design.
 Arrow's format has no per-batch statistics on the wire; the ecosystem's
 "statistics schema" standardizes the **value layout** for exchanging
 statistics as Arrow data, but placement in IPC files is not (yet)
-standardized upstream. The prove-out convention is deliberately conservative:
+standardized upstream. This convention is deliberately conservative:
 
 - **Placement (our convention, upgradeable)**: one schema-level custom
   metadata key, e.g. `JuliaArrow:batch_statistics.v1`, carried in the
@@ -232,10 +232,10 @@ standardized upstream. The prove-out convention is deliberately conservative:
   Using the official layout keeps us convention-compatible if upstream
   standardizes placement later — we then emit both keys for a deprecation
   cycle and read either.
-- Writer prove-out: `withstatistics` / `statsfile` eagerly compute the
-  embedded stream for already-encoded batches. A production writer should
-  expose an opt-in `statistics=true` keyword and compute the same fold state
-  during encode; file format only. Append (§ report) must recompute or drop
+- Writer: `withstatistics` / `statsfile` eagerly compute the embedded
+  stream for already-encoded batches. An opt-in `statistics=true` keyword
+  computing the same fold state during encode is not implemented; file
+  format only. An append path would have to recompute or drop
   — dropping with a warning is the honest v1.
 - Reader: prune under `Cmp`/`In`/`IsNull` (and `StrPred` prefix ranges for
   `startswith`) with one-sided may-contain logic — a batch survives unless
@@ -248,7 +248,7 @@ standardized upstream. The prove-out convention is deliberately conservative:
   Float comparisons use the predicate's IEEE operators; any NaN disables
   bounds, and signed zero is not ordered with `isless`. Dictionary folds
   count null pool results as logical nulls.
-- **Trust model, stated plainly (P3 pinned this)**: statistics are
+- **Trust model, stated plainly**: statistics are
   trusted-for-completeness, exactly like Parquet row-group stats. The
   residual re-filter protects one direction only — batches kept by lying
   stats still filter row-exactly. The other direction has no net: stats
@@ -262,33 +262,34 @@ standardized upstream. The prove-out convention is deliberately conservative:
 
 ## 4. The trim contract (staying on the radar, explicitly)
 
-Reaffirmed: **trimmability is a standing production gate, not an aspiration.**
-The current `--trim=safe` harness (0 errors / 0 warnings / binary exit 0)
-compiles `ArrowCore.jl` plus its value-domain workload. It does **not** load
-the repo-project-dependent `examples/scan_ranges.jl`, so it is not yet proof
-that P1/P2/P3 compile under trim. The rules in the README ("Trim-compile
-support") still constrain the production form:
+**Trimmability is a standing production gate, not an aspiration.** The
+`--trim=safe` harness (0 errors / 0 warnings / binary exit 0) compiles
+`ArrowCore` plus its value-domain and typed-value workloads and the C-data
+seams. It does **not** yet compile a scan-and-materialize app, so §1–§3 are
+designed for trim but not yet gated by it. The rules in `core-README.md`
+("Trim-compile support") constrain their form:
 
-- `Tables.Scan` is already trim-aligned by its own charter (no `Function`
-  fields; closed algebra). Our evaluator adds the same closed-set `isa`
-  ladder pattern as `layoutspec_of`; `OpNode` rejection keeps the set
-  closed. `bind` is plain data → plain data.
+- `Tables.Scan` is trim-aligned by its own charter (no `Function` fields;
+  closed algebra). The evaluator uses the same closed-set `isa` ladder
+  pattern as `layoutspec_of`; `OpNode` rejection keeps the set closed.
+  `bind` is plain data → plain data.
 - The range planner is arithmetic over `Int64`s; `RangedSource{F}` is
   concrete in any trimmed app. No dynamic registry, no abstract-typed
   fields on the hot path.
 - **Two-tier public API (mirroring the CSV rewrite)**: the runtime-tagged
   core is inherently trim-safe — descriptors are values, accessors use
   literal load widths, struct scalars are `Vector{Pair{String,Any}}`. So:
-  - **Tier 1 (production trim target)**: the value-domain entry points —
+  - **Tier 1 (trim target)**: the value-domain entry points —
     open/scan/materialize returning value-domain data, plus C-data/stream
-    interop. P4 must add a harness that compiles a scan-and-materialize app at
-    0/0/exit-0 and keep it permanently in CI before this becomes guaranteed.
+    interop and the typed `getvalue(::Type{T}, …)`/`materialize(::Type{T}, …)`
+    path. A harness compiling a scan-and-materialize app at 0/0/exit-0,
+    kept permanently in CI, is what would make the scan half guaranteed.
   - **Tier 2 (dynamic, ergonomic)**: the typed facade (`Arrow.Table`
-    property access, NamedTuple rows, ViewPlan specialization) — explicitly
-    NOT trim-guaranteed, same split the CSV rewrite made.
+    property access, NamedTuple rows) — explicitly NOT trim-guaranteed,
+    the same split the CSV rewrite made.
   - **The known-schema bridge**: `Scan`'s `ref => Type` overrides ARE the
     known-schema declaration. In a trimmed app, a scan with concrete type
-    pins can drive a typed-column path whose element types are statically
+    pins can drive the typed-column path whose element types are statically
     known (`Vector{Int64}`, `Vector{Union{Missing,Float64}}`, …) through
     closed-width branches — "provide a known schema and get typed columns,
     trimmed" falls out of the same plain-data request, no second schema
@@ -296,32 +297,32 @@ support") still constrain the production form:
 
 ---
 
-## 5. Phasing (each phase codex-reviewed per the standing protocol)
+## 5. Status
 
-- **P1 — Scan on the prove-out** — **IMPLEMENTED** (`examples/scan_ranges.jl`):
-  `skipfield!`, `Tables.apply(::ArrowFile, scan)` with Stage-A semantics,
-  exact limit/offset batch skipping, resolved residual selections, and the
-  differential battery with corruption-backed never-decoded proofs.
-- **P2 — RangedSource** — **IMPLEMENTED**: the `RangedSource{F}` contract,
-  `RangedFile` fetch protocol, coalescing planner, `SparseBody` decode
-  (`DecodeCursor{B}`), counting-source proofs (14% of bytes for a narrow
-  column over a 2.3MB file; zero planned body ranges for skipped columns,
+Implemented (`src/scan.jl`, `src/table.jl`):
+
+- **Scan pushdown**: `skipfield!`, `Tables.apply(::ArrowFile, scan)` with
+  Stage-A semantics, exact limit/offset batch skipping, resolved residual
+  selections, zero-field scans, and the differential battery with
+  corruption-backed never-decoded proofs. `Arrow.Table(source; scan=…)`
+  routes through it on file-format and ranged inputs; stream-format inputs
+  scan post-decode with identical results.
+- **RangedSource**: the `RangedSource{F}` contract, the `RangedFile` fetch
+  protocol, the coalescing planner, `SparseBody` decode, and
+  counting-source proofs (zero planned body ranges for skipped columns,
   window-excluded batches, and unneeded dictionary bodies, with exact
   request-log checks under the fixtures' tail/coalescing settings).
-- **P3 — statistics** — **IMPLEMENTED**: `withstatistics`/`statsfile` fold
-  the official statistics value layout into `JuliaArrow:batch_statistics.v1`
-  (footer schema metadata, base64-wrapped IPC stream, one statistics batch
-  per data batch, serialized through this very writer); `_maypass`
-  may-contain pruning wired into both applies (ranged pruning happens
-  before the block-metadata pass, so pruned batches cause no dedicated
-  metadata/body request; configured tail/coalescing may over-read them);
-  acceptance pins exactness, degradation, and both lie directions.
-- **P4 (production)**: `ArrowCloudStoreExt`, Stage B facade `apply`,
-  upstream-placement tracking for statistics.
+- **Statistics**: `withstatistics`/`statsfile` fold the official statistics
+  value layout into `JuliaArrow:batch_statistics.v1` (footer schema
+  metadata, base64-wrapped IPC stream, one statistics batch per data batch,
+  serialized through this writer); `_maypass` may-contain pruning is wired
+  into both applies (ranged pruning happens before the block-metadata pass,
+  so pruned batches cause no dedicated metadata/body request; configured
+  tail/coalescing may over-read them); acceptance pins exactness,
+  degradation, and both lie directions.
 
-Resolved prove-out decisions: Stage A returns a resolved full residual;
-`RangedSource` uses a parametric functor; P3 uses
-`JuliaArrow:batch_statistics.v1`; and the example develops Tables.jl's
-`jq/scan` branch without claiming that branch is a released API. P4 must
-settle the released Tables dependency, cloud extensions, standardized
-statistics placement, Stage B, and the missing scan trim harness.
+Not implemented: a CloudStore/HTTP transport extension (the fetcher
+contract is the extension point), Stage B's exact facade `apply`, an
+encode-time `statistics=true` writer keyword, upstream-placement tracking
+for statistics, and the scan-and-materialize trim harness. Scan pushdown
+depends on Tables.jl's `jq/scan` branch until that API is released.

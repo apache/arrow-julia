@@ -175,9 +175,8 @@ elemtype(t) = t[2:(end - 1)]
 # --- emitter ---------------------------------------------------------------------
 
 lowerfirst(s) = isempty(s) ? s : lowercase(s[1:1]) * s[2:end]
-# Some builder names in the hand-written files strip underscores/camelCase
-# differently; we normalize to lowerFirst(TableName) + CamelCase(field), which
-# matches every name the prove-out actually calls (verified by the rewire).
+# Builder names normalize to lowerFirst(TableName) + CamelCase(field); the
+# adapters call exactly these names.
 camel(s) = join(uppercasefirst.(split(s, '_')))
 
 # Union fields occupy TWO vtable slots (type tag, then value); every emitter

@@ -15,18 +15,11 @@
 # limitations under the License.
 
 # =============================================================================
-# PROVE-OUT: the C data interface adapter over ArrowCore.
+# The C data interface and C stream interface adapter over ArrowCore.
 #
-#     julia --startup-file=no src/cdata.jl
-#
-# The point of the whole Core design is that this adapter is a direct mapping:
-# because `ArrayData` already has the shape of the C `ArrowArray` (buffers +
-# children + dictionary + length/null_count/offset), export is struct
-# filling and import is struct reading — after five stalled attempts to bolt
-# this interface onto the 2.x internals (#178, #179, #561, #594, #603-607),
-# that is the claim this example exists to prove.
-#
-# Lifecycle, mapped to the report (§9 "C-data adapter"):
+# `ArrayData` has the shape of the C `ArrowArray` (buffers + children +
+# dictionary + length/null_count/offset), so export is struct filling and
+# import is struct reading.
 #
 #   * Export: ONE release callback per C structure (never per buffer). A
 #     parent callback releases each child/dictionary that has not been moved;
@@ -34,42 +27,39 @@
 #     callback runs. `private_data` points to a per-node malloc'd,
 #     never-GC-scanned CONTROL BLOCK holding an exactly-once state and the
 #     registry key. The Julia-side owner (which roots the Core columns and
-#     every malloc'd C
-#     struct) stays in a global EXPORT REGISTRY until release — a raw
-#     pointer in private_data roots nothing by itself. The @cfunction
-#     release callback recursively marks the C tree released. Callback
-#     traversal uses producer-owned canonical child/dictionary topology, not
-#     the caller-visible counts and pointer tables. It still reads each
-#     canonical descendant's public release field so conforming moves are
-#     honored. A reaper pass scans for aggregates whose last outstanding node
-#     was released, frees mallocs, and drops the registry root — dropping the
-#     root is what lets the source columns (and, through their OwnerRegion
-#     roots, the actual buffer memory) become collectable again. Prove-out
-#     callback contract: releases for one tree are serialized and run only on
-#     Julia-attached threads. A native foreign-thread, concurrent
-#     trampoline/queue is production adapter work.
+#     every malloc'd C struct) stays in a global EXPORT REGISTRY until
+#     release — a raw pointer in private_data roots nothing by itself. The
+#     @cfunction release callback recursively marks the C tree released.
+#     Callback traversal uses producer-owned canonical child/dictionary
+#     topology, not the caller-visible counts and pointer tables. It still
+#     reads each canonical descendant's public release field so conforming
+#     moves are honored. A reaper pass (`reap!`) scans for aggregates whose
+#     last outstanding node was released, frees mallocs, and drops the
+#     registry root — dropping the root is what lets the source columns (and,
+#     through their OwnerRegion roots, the actual buffer memory) become
+#     collectable again. Callback contract: releases for one tree are
+#     serialized and run only on Julia-attached threads.
 #
 #   * Import: the moved ArrowArray becomes ONE ForeignOwner shared by every
 #     child/dictionary BufferSlice (a single release for the whole tree —
 #     per-buffer owners would double-release). Buffer extents are DECLARED,
-#     not verified: computed from length/offset/layout per the report's
-#     "trusted in-process ABI" rule; offsets buffers are read (bounded by
-#     their computed size) to size the data buffers they govern. Failed
-#     imports release the moved structure exactly once before throwing.
-#     Per spec, moving marks the source released (release = NULL).
-#     Validity is reachability (Core rule 2): every imported region's `root`
-#     is the ForeignOwner, so the producer's memory outlives every slice by
-#     construction. After an EXPLICIT release! the caller must not touch the
-#     tree again — the same post-release undefined behavior the C Data spec
-#     itself imposes. There is no revocation machinery.
+#     not verified: the ABI cannot prove allocation sizes, so extents are
+#     computed from length/offset/layout, and offsets buffers are read
+#     (bounded by their computed size) to size the data buffers they govern.
+#     Failed imports release the moved structure exactly once before
+#     throwing. Per spec, moving marks the source released (release = NULL).
+#     Validity is reachability: every imported region's `root` is the
+#     ForeignOwner, so the producer's memory outlives every slice by
+#     construction. Every region over one import shares one `ReleaseCell`, so
+#     `close!` on any of them revokes all siblings and then runs the
+#     producer's release exactly once; the raw `release!` skips revocation,
+#     and touching the tree after it is the C Data spec's own post-release
+#     undefined behavior.
 #
-# The demo includes a registry-rooting round trip that drops all Julia source
-# references before GC and import. It also exports a Core batch (integer,
-# nullable floating-point, string, and list columns), materializes and compares
-# imported columns, releases and reaps them, and proves that the registry is
-# empty and double release is inert. The final section maps
-# `ArrowArrayStream` in both directions, with one independently-owned export
-# root per result and exception-safe move/release handoffs.
+#   * Streams: `ArrowArrayStream` maps in both directions with one
+#     independently-owned export root per result and exception-safe
+#     move/release handoffs.
+# =============================================================================
 # =============================================================================
 
 
@@ -174,7 +164,7 @@ formatstring(t::DictionaryType) = formatstring(t.indextype)  # per spec: index f
 end
 
 _formaterror(fmt) = throw(ValidationError(
-    "cdata prove-out: unmapped format string \"$fmt\""))
+    "unsupported C format string \"$fmt\""))
 
 function _parseformatint(fmt, s, what; low=0, high=typemax(Int32))
     bytes = codeunits(s)
@@ -1161,8 +1151,7 @@ end
 
 # Longest C string a schema may carry. Format strings are tens of bytes;
 # names and metadata keys are human-scale. The cap converts a missing NUL
-# terminator from an unbounded memory scan into a clean refusal (adopted
-# from samtalki's #607 hardening).
+# terminator from an unbounded memory scan into a clean refusal.
 const CSTRING_SCAN_LIMIT = Int64(1) << 20
 
 function _import_cstring(p::Ptr{UInt8}, what::AbstractString)
@@ -1326,7 +1315,7 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
         elseif role == AC.VIEWS
             AC.checked_mul(total, Int64(16))
         else
-            throw(ValidationError("cdata prove-out: unmapped buffer role $role"))
+            throw(ValidationError("unsupported buffer role $role in C data import"))
         end
         if p == C_NULL
             nbytes == 0 || throw(ValidationError("NULL $role buffer with nonzero required size"))
@@ -1377,12 +1366,11 @@ end
 # C stream interface (ArrowArrayStream): batches over the same two mappings
 # ---------------------------------------------------------------------------
 
-# Execution contract (report §9, v1): stream callbacks call into Julia, so
+# Execution contract: stream callbacks call into Julia, so
 # `get_schema`/`get_next`/`get_last_error`/`release` are legal ONLY from
 # Julia-attached threads, and calls on one stream must not overlap (the C
-# stream spec itself declares the structure not thread-safe). Marshaling to
-# a Julia-owned worker so any-thread callers become legal is production
-# adapter work, not prove-out work.
+# stream spec itself declares the structure not thread-safe). There is no
+# marshaling to a Julia-owned worker for foreign-thread callers.
 
 struct CArrowArrayStream
     get_schema::Ptr{Cvoid}     # int (*)(ArrowArrayStream*, ArrowSchema* out)
