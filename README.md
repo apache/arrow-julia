@@ -45,7 +45,8 @@ This is a pure Julia implementation of the
   frozen 2.x-written compatibility fixtures (`test/fixtures2x/`), and the
   `--trim=safe` compile gate.
 - `conformance/` — the arrow-testing gold-corpus runner, the integration
-  JSON implementation, and the pyarrow/nanoarrow oracle round-trip suite.
+  JSON implementation, the pyarrow/nanoarrow IPC oracle round-trip suite,
+  and the in-process pyarrow C Data / C Stream oracle.
 - `docs/dev/` — the engine design document and the codex review record of
   the rewrite (rounds 1–28 so far).
 
@@ -54,5 +55,8 @@ The design rationale for every layer is `docs/dev/core-README.md`.
 ## Status
 
 Conformance: 275/275 gold-corpus checks pass (36 declared skips);
-170/170 oracle round-trips against pyarrow and nanoarrow (43 skips are
-oracle capability gaps). See `conformance/` to run either.
+170/170 IPC oracle round-trips against pyarrow and nanoarrow (43 skips are
+oracle capability gaps); 141/141 C Data and C Stream interface round-trips
+through an in-process pyarrow over the whole gold matrix (both directions,
+pyarrow-native memory, sliced exports; 9 declared skips). See
+`conformance/` to run any of them.
