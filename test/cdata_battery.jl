@@ -726,8 +726,8 @@ function cdata_battery()
     @assert _registry_count() == before
     println("failed exports leave no registry roots ✓")
 
-    # C strings cannot represent embedded NULs, and Utf8 arrays require
-    # valid UTF-8. Reject both before any export root becomes visible.
+    # C strings cannot represent embedded NULs: reject before any export
+    # root becomes visible.
     badname = Field("embedded\0nul", IntType(64, true); nullable=false)
     @assert try
         to_c_data(badname, md)
@@ -735,19 +735,29 @@ function cdata_battery()
     catch e
         e isa ValidationError
     end
+    @assert _registry_count() == before
+    # Utf8 content is NOT judged at the boundary — the exporter applies the
+    # semantic tier, exactly like the IPC writer. Invalid UTF-8 is what the
+    # opt-in `validate_full` tier catches; the export itself succeeds and the
+    # bytes cross unchanged.
     badutf8type = Utf8Type(false)
     badutf8field = Field("bad-utf8", badutf8type)
     badutf8data = ArrayData(badutf8type, 1,
         [BufferSlice(), AC._databuffer(Int32[0, 1]),
          AC._databuffer(UInt8[0xff])]; nullcount=0)
     @assert try
-        to_c_data(badutf8field, badutf8data)
+        validate_full(badutf8field, badutf8data)
         false
     catch e
         e isa ValidationError
     end
+    sp, ap = to_c_data(badutf8field, badutf8data)
+    rawf, rawd = from_c_data(sp, ap)
+    @assert codeunits(getvalue(rawf, rawd, 1)) == UInt8[0xff]
+    release!(rawd.owner::ForeignOwner)
+    @assert reap!() == 2
     @assert _registry_count() == before
-    println("unrepresentable names and invalid UTF-8 fail before export ✓")
+    println("unrepresentable names fail before export; content policy is opt-in ✓")
 
     # Dictionary values have independent nullability. Ordered state is a C
     # schema flag, and a non-nullable index may select a null pool value.
@@ -941,9 +951,9 @@ function cdata_battery()
     end
     println("malformed public topology cannot corrupt producer cleanup ✓")
 
-    # Imported C names and Utf8 buffers receive the same full validation.
-    # Both failures happen after the array move, so both producer lifetimes
-    # must still be released exactly once.
+    # Imported C names must be valid UTF-8 (they become Field names). The
+    # failure happens after the array move, so both producer lifetimes must
+    # still be released exactly once.
     nf, nd = fromjulia("name", Int64[1])
     sp, ap = to_c_data(nf, nd)
     unsafe_store!(unsafe_load(sp).name, 0xff, 1)
@@ -956,19 +966,24 @@ function cdata_battery()
     @assert reap!() == 2
     @assert _registry_count() == 0
 
+    # Imported Utf8 CONTENT is not judged by the importer (semantic tier, the
+    # IPC reader's default); the opt-in `validate_full` on the returned pair
+    # is where invalid UTF-8 is caught.
     uf, ud = fromjulia("utf8", ["a"])
     sp, ap = to_c_data(uf, ud)
     datap = Ptr{UInt8}(unsafe_load(unsafe_load(ap).buffers, 3))
     unsafe_store!(datap, 0xff, 1)
+    uf2, ud2 = from_c_data(sp, ap)
     @assert try
-        from_c_data(sp, ap)
+        validate_full(uf2, ud2)
         false
     catch e
         e isa ValidationError
     end
+    release!(ud2.owner::ForeignOwner)
     @assert reap!() == 2
     @assert _registry_count() == 0
-    println("invalid imported names and UTF-8 fail with exact cleanup ✓")
+    println("invalid imported names fail with exact cleanup; content policy is opt-in ✓")
 
     # ---- C stream interface --------------------------------------------
 
@@ -1214,13 +1229,14 @@ function cdata_battery()
     @assert _stream_registry_count() == stbefore
     println("C stream export/import round-trips with exact lifecycle ✓")
 
-    # Producer-side failures surface through get_last_error: batch two is
-    # invalid UTF-8, so its get_next reports EINVAL and the importer throws
-    # a ValidationError carrying the producer's message.
+    # Producer-side failures surface through get_last_error: batch two has
+    # non-monotonic offsets (a semantic-tier defect that structural
+    # construction cannot see), so its get_next reports EINVAL and the
+    # importer throws a ValidationError carrying the producer's message.
     okf, okd = fromjulia("s", ["ok"])
     badd = ArrayData(Utf8Type(false), 1,
-        [BufferSlice(), AC._databuffer(Int32[0, 1]),
-         AC._databuffer(UInt8[0xff])]; nullcount=0)
+        [BufferSlice(), AC._databuffer(Int32[1, 0]),
+         AC._databuffer(UInt8[0x61])]; nullcount=0)
     badsch = Schema(Field[okf])
     streamref2 = Ref{CArrowArrayStream}()
     GC.@preserve streamref2 begin
@@ -1235,7 +1251,7 @@ function cdata_battery()
             nextbatch!(s2)
             false
         catch e
-            e isa ValidationError && occursin("UTF-8", e.msg)
+            e isa ValidationError && occursin("monotonic", e.msg)
         end
         @assert caught
         release!(s2)
@@ -1340,6 +1356,41 @@ function cdata_battery()
     guardcmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $guardscript`
     success(guardcmd) || error("C-string guard-page child failed")
     println("field metadata crosses the C boundary ✓")
+
+    # Schema-level metadata rides the C stream's struct-typed schema node
+    # (the C++/pyarrow convention for `schema.metadata`) in both directions.
+    smf, smd = fromjulia("x", Int64[1, 2])
+    smsch = Schema(Field[smf]; metadata=["schema-k" => "schema-v", "dup" => "a",
+        "dup" => "b"])
+    smref = Ref{CArrowArrayStream}()
+    GC.@preserve smref begin
+        smp = Base.unsafe_convert(Ptr{CArrowArrayStream}, smref)
+        export_stream!(smp, smsch, AC.RecordBatch[
+            AC.RecordBatch(smsch, ArrayData[smd], 2)])
+        sms = from_c_stream(smp)
+        @assert collect(sms.schema.metadata) ==
+            ["schema-k" => "schema-v", "dup" => "a", "dup" => "b"]
+        smb = nextbatch!(sms)
+        @assert smb isa AC.RecordBatch
+        @assert collect(smb.schema.metadata) == collect(smsch.metadata)
+        @assert nextbatch!(sms) === nothing
+        release!(sms)
+        release!(smb.columns[1].owner::ForeignOwner)
+    end
+    reap!()
+    # A schema without metadata imports as `nothing`, not an empty list.
+    plainsch = Schema(Field[smf])
+    plainref = Ref{CArrowArrayStream}()
+    GC.@preserve plainref begin
+        plainp = Base.unsafe_convert(Ptr{CArrowArrayStream}, plainref)
+        export_stream!(plainp, plainsch, AC.RecordBatch[])
+        plains = from_c_stream(plainp)
+        @assert plains.schema.metadata === nothing
+        @assert nextbatch!(plains) === nothing
+        release!(plains)
+    end
+    reap!()
+    println("schema metadata crosses the C stream boundary ✓")
 
     childscript = joinpath(@__DIR__, "cdata_stress_child.jl")
     stresscmd = `$(Base.julia_cmd()) --startup-file=no --threads=4 --project=$(Base.active_project()) $childscript`

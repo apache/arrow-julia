@@ -737,6 +737,11 @@ independent C Data lifetimes. Releasing either root recursively marks only
 that structure tree released. Moved descendants defer aggregate cleanup.
 The array root keeps the source ArrayData reachable until it is reaped;
 that reachability is what keeps the exported buffer pointers valid.
+
+The column is validated through the semantic tier before publication —
+the same tier the IPC writer applies. Content policy (`validate_full`:
+UTF-8 well-formedness, the advisory nullability contract, canonical bits)
+is the caller's opt-in, exactly as for IPC.
 """
 function _build_c_data!(sp, skey, ap, akey, f::Field, d::ArrayData,
     arel, srel)
@@ -751,10 +756,8 @@ end
 
 function to_c_data(f::Field, d::ArrayData)
     # Reject mismatched schema/data and malformed buffers before publishing
-    # either independently-owned C root.
-    validate_structural(f, d)
+    # either independently-owned C root (semantic composes structural).
     validate_semantic(f, d)
-    validate_full(f, d)
     arel = @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},))
     srel = @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
     sp = Ref{Ptr{CArrowSchema}}(C_NULL)
@@ -1025,10 +1028,12 @@ bufferptr(a::CArrowArray, i::Int) = unsafe_load(a.buffers, i)
 Import a C-data column. The ArrowArray is moved: it is copied by value and its
 source release is nulled so the producer side cannot double-free. The
 ArrowSchema is parsed and then released in place. Buffer extents are computed
-from length/offset/layout —
-DECLARED extents (report §9): the ABI cannot prove the allocation sizes, so
-this is the trusted-in-process boundary, and validation runs on the declared
-geometry. A failed import releases the moved tree exactly once.
+from length/offset/layout — DECLARED extents: the ABI cannot prove the
+allocation sizes, so this is the trusted-in-process boundary, and validation
+runs on the declared geometry. The imported column passes the semantic tier
+(the same default as the IPC reader); `validate_full` on the returned pair is
+the caller's opt-in for content policy. A failed import releases the moved
+tree exactly once.
 """
 from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}) =
     _from_c_data(sp, ap)
@@ -1053,9 +1058,7 @@ function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray};
             f = _import_field(sch)
             _preflight_array(f, arr)
             d = _import_array(f, arr, owner)
-            validate_structural(f, d)
             validate_semantic(f, d)
-            validate_full(f, d)
             return f, d
         finally
             # The schema lifetime is separate and must end on every path,
@@ -1525,9 +1528,7 @@ function _stream_get_next_impl(sp::Ptr{CArrowArrayStream},
         b = state.batches[state.nextindex]
         d = ArrayData(StructType(), b.nrows, [BufferSlice()];
             children=collect(ArrayData, b.columns), nullcount=0)
-        validate_structural(state.batchfield, d)
         validate_semantic(state.batchfield, d)
-        validate_full(state.batchfield, d)
         arel = @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},))
         shell = Ref{Ptr{CArrowArray}}(C_NULL)
         _publish_stream_result!(Any[d], shell, out, publish!) do root
@@ -1605,8 +1606,10 @@ function _export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
         length(b.columns) == length(sch.fields) ||
             throw(ValidationError("stream batch column count does not match the schema"))
     end
+    # The stream's struct-typed schema node carries the schema-level
+    # metadata (the C++/pyarrow convention for `schema.metadata`).
     batchfield = Field("", StructType(); nullable=false,
-        children=collect(Field, sch.fields))
+        metadata=sch.metadata, children=collect(Field, sch.fields))
     state = ExportedStreamState(batchfield,
         collect(AC.RecordBatch, batches), 1, Ptr{UInt8}(C_NULL))
     get_schema = @cfunction(_stream_get_schema, Cint,
@@ -1793,7 +1796,8 @@ function from_c_stream(sp::Ptr{CArrowArrayStream})
         batchfield.type isa StructType ||
             throw(ValidationError("C stream schema must be a struct-typed batch schema"))
         return ImportedStream(owner, batchfield,
-            Schema(collect(Field, batchfield.children)), false)
+            Schema(collect(Field, batchfield.children);
+                metadata=batchfield.metadata), false)
     catch
         moved ? _release_moved_stream_owner!(owner) : release!(owner)
         rethrow()
@@ -1839,9 +1843,7 @@ function _nextbatch!(s::ImportedStream, ownerfactory)
         _arm_foreign_owner!(batchowner)
         _preflight_array(s.batchfield, arr)
         d0 = _import_array(s.batchfield, arr, batchowner)
-        validate_structural(s.batchfield, d0)
         validate_semantic(s.batchfield, d0)
-        validate_full(s.batchfield, d0)
         d0
     catch
         moved ? _release_moved_owner!(batchowner) : release!(batchowner)

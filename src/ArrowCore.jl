@@ -1151,7 +1151,9 @@ function _validate_structural(f::Field, d::ArrayData,
             throw(ValidationError("REE run ends must be signed int16, int32, or int64"))
         !runfield.nullable ||
             throw(ValidationError("REE run ends must be non-nullable"))
-        declared_nulls == 0 ||
+        # The parent has no validity bitmap, so a positive count is
+        # malformed; unknown (-1) is legal for any layout.
+        declared_nulls <= 0 ||
             throw(ValidationError("REE parent null count must be zero"))
         length(d.children[1]) == length(d.children[2]) ||
             throw(ValidationError("REE run-end and value child lengths must match"))

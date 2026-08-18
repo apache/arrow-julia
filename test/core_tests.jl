@@ -620,6 +620,13 @@ end
         declared = AC.ArrayData(t, 3, BufferSlice[];
             children=[red, nvd], nullcount=2)
         @test_throws ValidationError validate_semantic(nf, declared)
+        # An UNKNOWN parent null count (-1, spec-legal for every layout, and
+        # what a C producer may hand us) is not a declared positive count:
+        # it validates and resolves to the bitmap-less physical zero.
+        unknown = AC.ArrayData(t, 3, BufferSlice[]; children=[red, nvd])
+        @test validate_semantic(nf, unknown) === unknown
+        @test nullcount(unknown) == 0
+        @test isequal(materialize(nf, unknown), [missing, missing, 4])
     end
 
     @testset "view layouts: entries, prefixes, variadic buffers" begin

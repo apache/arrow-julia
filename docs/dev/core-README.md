@@ -279,9 +279,12 @@ names, nullability, and metadata are not a lossless round trip. Foreign
 allocation extents cannot be verified by the ABI and remain trusted
 declarations. The producer must keep declared storage alive and unchanged
 until Core releases it. Import checks the pointer tables, counts, descriptor
-shape, and checked geometry that the ABI does expose. Import and export run
-full UTF-8 validation. Field names that contain an embedded NUL are rejected
-because the C interface uses NUL-terminated strings.
+shape, and checked geometry that the ABI does expose. Import and export
+apply the semantic validation tier — the same default as the IPC reader and
+writer; `validate_full` (UTF-8 content, the advisory nullability contract,
+canonical bits) is the caller's opt-in on either side. Field names that
+contain an embedded NUL are rejected because the C interface uses
+NUL-terminated strings, and imported names must be valid UTF-8.
 The format parser accepts only the specified decimal integer grammar, bounds
 decimal descriptors and union ids before recursive or geometry work, and
 rejects invalid UTF-8 or embedded NULs. Empty offset layouts export and require
