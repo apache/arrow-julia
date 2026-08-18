@@ -1216,12 +1216,12 @@ function _statsschema()
             children=Field[entries])])
 end
 
-_bitmapbytes(bits::AbstractVector{Bool}) = begin
+function _bitmapbytes(bits::AbstractVector{Bool})
     bytes = zeros(UInt8, cld(length(bits), 8))
     for (i, b) in enumerate(bits)
         b && (bytes[1 + (i - 1) ÷ 8] |= UInt8(1) << ((i - 1) % 8))
     end
-    bytes
+    return bytes
 end
 
 function _utf8data(strs::Vector{String})
@@ -1547,9 +1547,9 @@ missing semantics — null rows never satisfy a comparison, so an all-null
 column proves compare/`in_` predicates false.
 """
 function _maypass(e::Tables.ScanExpr, stats, names, rowcount::Union{Missing,Int64})
-    lookup(col) = begin
+    function lookup(col)
         i = Tables._findcol(names, col.ref)
-        i === nothing ? nothing : get(stats, i, nothing)
+        return i === nothing ? nothing : get(stats, i, nothing)
     end
     allnull(s) = s.nullcount !== missing && rowcount !== missing &&
         s.nullcount >= rowcount

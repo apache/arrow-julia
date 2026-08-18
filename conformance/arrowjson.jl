@@ -189,13 +189,13 @@ function _validity(col, n::Int)
     return AC._databuffer(bytes)
 end
 
-_bitmap(vals::AbstractVector{Bool}) = begin
+function _bitmap(vals::AbstractVector{Bool})
     n = length(vals)
     bytes = zeros(UInt8, cld(n, 8))
     for i = 1:n
         vals[i] && (bytes[(i - 1) ÷ 8 + 1] |= UInt8(1) << ((i - 1) % 8))
     end
-    AC._databuffer(bytes)
+    return AC._databuffer(bytes)
 end
 
 function _intdata(t::IntType, data)

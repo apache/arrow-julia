@@ -336,9 +336,9 @@ function _storagevalue(t::AC.ArrowType, v)
     return true, v
 end
 
-_exactdiv(x::Int64, d::Integer) = begin
+function _exactdiv(x::Int64, d::Integer)
     q, r = divrem(x, Int64(d))
-    r == 0 ? (true, q) : (false, x)
+    return r == 0 ? (true, q) : (false, x)
 end
 
 function _fieldfor(fields, ref, names)
@@ -537,9 +537,9 @@ end
 _corefields(s::IPCStream) = collect(AC.Field, s.corefields)
 _corefields(f::ArrowFile) = collect(AC.Field, f.fields)
 
-_rawcolumn(s::IPCStream, i::Base.Int) = begin
+function _rawcolumn(s::IPCStream, i::Base.Int)
     parts = [_batchcolumn(s.corefields[i], b.columns[i]) for b in s.batches]
-    isempty(parts) ? Any[] : reduce(vcat, parts)
+    return isempty(parts) ? Any[] : reduce(vcat, parts)
 end
 
 _tableschema(s::IPCStream) = s.schema
@@ -726,9 +726,9 @@ struct Stream
     regions::Vector{AC.OwnerRegion}
 end
 
-Stream(source; mmap::Bool=true) = begin
+function Stream(source; mmap::Bool=true)
     src = _opensource(source; mmap=mmap)
-    Stream(src, _sourceregions(src))
+    return Stream(src, _sourceregions(src))
 end
 
 AC.close!(s::Stream) = (foreach(AC.close!, getfield(s, :regions)); nothing)

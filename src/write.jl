@@ -481,11 +481,11 @@ function _writebytes(tbl; file::Bool=true, compress::Union{Nothing,Symbol}=nothi
         throw(ArgumentError("table has no partitions; cannot infer a schema"))
     nparts = length(partcols)
     ncols = length(names)
-    retainedfield(j) = begin
+    function retainedfield(j)
         retained === nothing && return nothing
         i = findfirst(f -> f.name == String(names[j]),
             collect(retained.fields))
-        i === nothing ? nothing : retained.fields[i]
+        return i === nothing ? nothing : retained.fields[i]
     end
     # Phase 2: build columns. Dictionary-intent columns (retained
     # DictionaryType or DictEncode input) share ONE pool object across all
