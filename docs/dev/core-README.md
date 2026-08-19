@@ -151,8 +151,8 @@ and reachable Field nullability; it does not check key uniqueness,
 hashability, or ordering — `keysSorted` is a producer declaration.
 Timestamp validation checks the unit domain and timezone-string UTF-8; it
 does not resolve names against a timezone database. `RecordBatch` buffers
-must be host-native endian; an adapter normalizes before constructing a
-batch. Julia vectors wrapped zero-copy by the builders or `heapregion` are
+must be host-native endian (the IPC adapters refuse big-endian input; no
+adapter normalizes). Julia vectors wrapped zero-copy by the builders or `heapregion` are
 scoped borrows: they must not be resized or mutated while their `ArrayData`
 or cached validation results are in use.
 
@@ -297,8 +297,8 @@ callbacks call into Julia, so they are legal only from Julia-attached
 threads and calls on one stream must not overlap (the C stream spec itself
 declares the structure not thread-safe).
 
-The ABI layout gates include 32-bit expectations; the 32-bit branch is
-inspected but exercised only on 64-bit hosts.
+The ABI layout gates include 32-bit expectations; only the 64-bit branch
+is exercised (on the available hosts), the 32-bit branch is inspected.
 
 ### Facade
 

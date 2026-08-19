@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Standalone: `julia --startup-file=no test/runtests.jl`. Stdlib only.
+# Core unit tests: ArrowCore in isolation (Base + Mmap only).
 
 using Test
 
@@ -826,6 +826,14 @@ end
             [CompactPayload(UInt64(13), zero(UInt64))], buf, extra)
         @test_throws ArgumentError fromcompactviews("t", UInt64[1, 2], buf, extra)
         @test_throws ArgumentError fromcompactviews("t", Any[1], buf, extra)
+        # extreme signed positions are the documented ArgumentError, never an
+        # OverflowError out of the position arithmetic
+        for pos in (typemax(Int64), typemin(Int64), typemin(Int64) + 1,
+                    Int64(typemax(Int32)) + 2, -(Int64(typemax(Int32)) + 2))
+            extreme = CompactPayload(UInt64(13) | (UInt64(0x61) << 32),
+                reinterpret(UInt64, pos))
+            @test_throws ArgumentError fromcompactviews("t", [extreme], buf, extra)
+        end
     end
 end
 
@@ -1440,6 +1448,11 @@ end
         @test getvalue(Union{Missing,String}, fs, ds, 1) == "a"
         fb, db = fromjulia("b", [true, false])
         @test materialize(Bool, fb, db) == [true, false]
+        # A plain Vector{Bool} is a NON-nullable column (bit-packed through
+        # the nullable builder, but the declaration is the input's).
+        @test !fb.nullable
+        @test nullcount(db) == 0
+        @test fromjulia("bm", [true, missing])[1].nullable
         # lists recurse the claim
         fl, dl = fromjulia("l", [Int64[1, 2], Int64[]])
         @test getvalue(Vector{Int64}, fl, dl, 1) == [1, 2]

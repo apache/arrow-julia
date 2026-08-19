@@ -127,8 +127,9 @@ sequential — cloud-native access is a file-format feature, stated plainly.
 
 ### The fetch protocol
 
-1. **Tail fetch** (one range request): last `tailbytes` (default 64 KiB).
-   Covers footer-length + magic + the whole Footer in almost every real
+1. **Head + tail fetch** (two range requests): the eight-byte head (magic
+   + padding check) and the last `tailbytes` (default 64 KiB). The tail
+   covers footer-length + magic + the whole Footer in almost every real
    file; if `footerlen + 10 > tailbytes`, one exact follow-up fetch.
    → schema, Block indexes, (§3) statistics — everything pruning needs.
 2. **Statistics prune** from the Footer metadata — zero additional fetches.

@@ -923,7 +923,7 @@ function _zerofieldblockcount(rf::RangedFile, block::NTuple{3,Int64},
         bodylen)
 end
 
-"Schema-only ranged read for the facade (one tail fetch)."
+"Schema-only ranged read for the facade (the head magic + one tail fetch)."
 function rangedschema(rf::RangedFile)
     budget = AllocationBudget(rf.limits.max_total_allocated_bytes)
     ft = _rangedfooter(rf, budget)

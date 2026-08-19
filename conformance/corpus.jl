@@ -46,7 +46,7 @@ using JSON, CodecZlib
 using Arrow
 # The corpus exercises package internals (adapter entry points, Core
 # accessors, metadata types); alias the namespace wholesale, as the test
-# batteries do, until the facade formalizes a public surface.
+# batteries do.
 for n in names(Arrow; all=true)
     sn = String(n)
     (startswith(sn, "#") || n in (:eval, :include, :Arrow, :write, :Table, :Stream)) && continue

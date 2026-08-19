@@ -718,6 +718,17 @@ function _export_array!(root::ExportedRoot, d::ArrayData,
     return p
 end
 
+function _build_c_data!(sp, skey, ap, akey, f::Field, d::ArrayData,
+    arel, srel)
+    _newroot(Any[f]; result_slot=sp, key_slot=skey) do root
+        _export_schema!(root, f, srel)
+    end
+    _newroot(Any[d]; result_slot=ap, key_slot=akey) do root
+        _export_array!(root, d, arel)
+    end
+    return nothing
+end
+
 """
     to_c_data(field, data) -> (Ptr{CArrowSchema}, Ptr{CArrowArray})
 
@@ -733,17 +744,6 @@ the same tier the IPC writer applies. Content policy (`validate_full`:
 UTF-8 well-formedness, the advisory nullability contract, canonical bits)
 is the caller's opt-in, exactly as for IPC.
 """
-function _build_c_data!(sp, skey, ap, akey, f::Field, d::ArrayData,
-    arel, srel)
-    _newroot(Any[f]; result_slot=sp, key_slot=skey) do root
-        _export_schema!(root, f, srel)
-    end
-    _newroot(Any[d]; result_slot=ap, key_slot=akey) do root
-        _export_array!(root, d, arel)
-    end
-    return nothing
-end
-
 function to_c_data(f::Field, d::ArrayData)
     # Reject mismatched schema/data and malformed buffers before publishing
     # either independently-owned C root (semantic composes structural).
@@ -803,8 +803,8 @@ end
     reap!() -> Int
 
 Find fully released exports: free every malloc they own and drop their
-registry roots. In the real adapter this is a background reaper task; the
-example calls it explicitly to keep the demo deterministic.
+registry roots. Cleanup is this explicit scan — there is no background
+reaper task; call it after consumers have released their structures.
 """
 function reap!()
     keys = lock(REGISTRY_LOCK) do
@@ -1583,6 +1583,29 @@ registry root keeps schema fields and batches reachable until `release`;
 every `get_schema`/`get_next` result is its own export root with the same
 lifecycle as `to_c_data` output.
 """
+# Core's structural schema invariants (endianness, UTF-8 names and metadata,
+# valid descriptors) for the whole schema TREE. Stream schemas travel
+# separately from any batch, so both stream directions apply this walk to the
+# schema itself — a zero-batch stream never reaches batch validation.
+function _validate_stream_schema(sch::Schema)
+    AC._validate_schema(sch)
+    for f in sch.fields
+        _validate_stream_field(f)
+    end
+    return nothing
+end
+
+function _validate_stream_field(f::Field)
+    isvalid(f.name) ||
+        throw(ValidationError("field name is not valid UTF-8"))
+    AC._validate_metadata(f.metadata, "field")
+    AC._validate_descriptor_of(f.type)
+    for c in f.children
+        _validate_stream_field(c)
+    end
+    return nothing
+end
+
 export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
     batches::AbstractVector{AC.RecordBatch}) =
     _export_stream!(sp, sch, batches, Libc.malloc, Libc.free, unsafe_store!)
@@ -1590,6 +1613,7 @@ export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
 function _export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
     batches::AbstractVector{AC.RecordBatch}, allocate!, deallocate!, publish!)
     sp == C_NULL && throw(ArgumentError("ArrowArrayStream pointer is NULL"))
+    _validate_stream_schema(sch)
     for b in batches
         length(b.columns) == length(sch.fields) ||
             throw(ValidationError("stream batch column count does not match the schema"))
@@ -1783,9 +1807,10 @@ function from_c_stream(sp::Ptr{CArrowArrayStream})
         end
         batchfield.type isa StructType ||
             throw(ValidationError("C stream schema must be a struct-typed batch schema"))
-        return ImportedStream(owner, batchfield,
-            Schema(collect(Field, batchfield.children);
-                metadata=batchfield.metadata), false)
+        schema = Schema(collect(Field, batchfield.children);
+            metadata=batchfield.metadata)
+        _validate_stream_schema(schema)
+        return ImportedStream(owner, batchfield, schema, false)
     catch
         moved ? _release_moved_stream_owner!(owner) : release!(owner)
         rethrow()

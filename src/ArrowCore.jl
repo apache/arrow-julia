@@ -68,8 +68,9 @@ encoding. `validate_full` additionally enforces canonical bit-packed form
 (zeroed trailing bits and padding); on-wire buffer padding is a writer
 guarantee, not a reader requirement — the spec permits unpadded buffers and
 this reader accepts them. Core has no codec dependency; the IPC adapter
-implements compression. Bulk access uses a plain function barrier
-(`materialize`); typed column views are the facade's.
+implements compression. Bulk access is `materialize` (dynamic, one function
+barrier per layout) and `materialize(::Type{T}, …)` (a static element claim,
+resolved without boxing).
 """
 module ArrowCore
 
@@ -223,7 +224,7 @@ end
     close!(r::OwnerRegion)
 
 Deterministically release the region's backing storage through its
-[`ReleaseCell`](@ref): every region sharing the cell is revoked (later raw
+`ReleaseCell`: every region sharing the cell is revoked (later raw
 access throws `InvalidStateException`) and the cell's release action runs
 exactly once — an mmap region unmaps NOW (the eager path exists for hosts
 where a GC-timed unmap is not enough, deleting a still-mapped file on
@@ -2071,9 +2072,8 @@ _value(::RunEndEncodedType, f::Field, d::ArrayData, i::Int64) =
 """
     materialize(field, data) -> Vector
 
-Bulk conversion to native Julia values — the miniature of the facade's
-ViewPlan idea: resolve the layout ONCE, then run a specialized loop behind a
-function barrier. `_materialize_loop` is generic over the concrete
+Bulk conversion to native Julia values: resolve the layout ONCE, then run
+a specialized loop behind a function barrier. `_materialize_loop` is generic over the concrete
 descriptor type it receives, so the loop body compiles per LAYOUT (a small
 closed set), never per schema.
 """
@@ -2139,16 +2139,16 @@ function _materialize_loop(t::T, f::Field, d::ArrayData) where {T<:ArrowType}
     for i = 1:d.len
         out[i] = _value(t, f, d, Int64(i))
     end
-    # Vector{Any} by design: result-element typing is the facade's typed-view
-    # work (or the caller's claim through `materialize(::Type{T}, ...)`), and
-    # a runtime narrow is trim-hostile. Tests compare with ==/isequal, which
-    # is eltype-agnostic.
+    # Vector{Any} by design: result-element typing is the caller's claim
+    # through `materialize(::Type{T}, ...)` (which the facade uses for closed
+    # claims), and a runtime narrow is trim-hostile. Tests compare with
+    # ==/isequal, which is eltype-agnostic.
     return out
 end
 
 # ---------------------------------------------------------------------------
-# Typed element access: the caller asserts the element domain (review
-# follow-up R5). With a concrete static schema at the call site every load
+# Typed element access: the caller asserts the element domain. With a
+# concrete static schema at the call site every load
 # resolves statically — the trim-compile contract dynamic access cannot
 # offer. The type is a CLAIM about the same value domain the dynamic
 # accessors return (storage integers for temporal, `Vector{Pair}` rows for
@@ -2631,7 +2631,10 @@ function fromjulia(name, v::Vector{T}) where {T}
         return Field(name, t; nullable=false),
         ArrayData(t, length(v), [BufferSlice(), _databuffer(v)]; nullcount=0)
     elseif T == Bool
-        return fromjulia(name, convert(Vector{Union{Bool,Missing}}, v))
+        # Bit-packed through the nullable builder; the DECLARED nullability
+        # is the input's (a plain Vector{Bool} is a non-nullable column).
+        return _build_nullable_primitive(name,
+            convert(Vector{Union{Bool,Missing}}, v); nullable=false)
     elseif T == String
         return _build_strings(name, v)
     elseif T <: Union{Missing,Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64,Float16,Float32,Float64,Bool}
@@ -2645,7 +2648,7 @@ function fromjulia(name, v::Vector{T}) where {T}
     end
 end
 
-function _build_nullable_primitive(name, v::Vector{T}) where {T}
+function _build_nullable_primitive(name, v::Vector{T}; nullable::Bool=true) where {T}
     S = Base.nonmissingtype(T)
     t = arrowtype_for(S)
     present = [x !== missing for x in v]
@@ -2664,7 +2667,7 @@ function _build_nullable_primitive(name, v::Vector{T}) where {T}
     nc = count(!, present)
     # Nullability is the DECLARED element type's, not the observed count's:
     # a Union{Missing,T} column with no missing values is still nullable.
-    return Field(name, t; nullable=true),
+    return Field(name, t; nullable=nullable),
     ArrayData(t, length(v), [validity, data]; nullcount=nc)
 end
 
@@ -2810,12 +2813,16 @@ function fromcompactviews(name, payloads::Vector{P}, buf::Vector{UInt8},
             bufidx = pos < 0 ? Int32(1) : Int32(0)
             bufidx == 0 || hasextra || throw(ArgumentError(
                 "compact view entry $i references the extra buffer, which is empty"))
+            # Bound the magnitude FIRST so the position arithmetic below
+            # cannot overflow (typemin/typemax positions are refused here,
+            # as the documented ArgumentError, not as OverflowError).
+            (pos > -typemax(Int64) && pos < typemax(Int64) &&
+                abs(pos) - 1 <= typemax(Int32)) || throw(ArgumentError(
+                "compact view entry $i: position $pos does not fit an Int32 view offset"))
             pos0 = abs(pos) - 1
             datalen = bufidx == 0 ? length(buf) : length(extra)
-            checked_add(pos0, Int64(len)) <= datalen || throw(ArgumentError(
+            pos0 + Int64(len) <= datalen || throw(ArgumentError(
                 "compact view entry $i: content [$pos0, $len) escapes buffer $bufidx"))
-            pos0 <= typemax(Int32) || throw(ArgumentError(
-                "compact view entry $i: offset $pos0 does not fit an Int32 view offset"))
             words[2 * i - 1] = a
             words[2 * i] = UInt64(bufidx % UInt32) | (UInt64(pos0 % UInt32) << 32)
         end

@@ -258,8 +258,8 @@ function _facadecolumn(f::AC.Field, parts::Vector)
     isempty(parts) && return T === Any ? Any[] : Vector{T}()
     col = length(parts) == 1 ? parts[1] : reduce(vcat, parts)
     converted = _postconvert(f.type, col)
-    # materialize returns Vector{Any} (typed zero-copy views are ViewPlan's,
-    # later); the FIELD decides the public eltype.
+    # Dynamic materialize returns Vector{Any}; the FIELD decides the public
+    # eltype (closed claims never reach this branch — see _batchcolumn).
     return T === Any ? map(identity, converted) : collect(T, converted)
 end
 

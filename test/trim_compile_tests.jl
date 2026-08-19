@@ -22,8 +22,8 @@
 # Run explicitly (needs network on first run to install JuliaC):
 #     julia --startup-file=no test/trim_compile_tests.jl
 #
-# It is intentionally NOT included by test/runtests.jl, which stays
-# stdlib-only and fast.
+# It is intentionally NOT included by test/runtests.jl (it installs JuliaC
+# and compiles a binary; the default suite stays fast).
 
 using Test
 import Pkg

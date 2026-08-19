@@ -34,8 +34,11 @@
 #                          judgment of our export), and exports it back; our
 #                          importer reads pyarrow's structures. Values must
 #                          equal the gold JSON. Proves both directions of the
-#                          C Data interface, including field names, nullability
-#                          and metadata (schema and field level).
+#                          C Data interface, including field names and
+#                          nullability. (Metadata VALUES ride along; exact
+#                          metadata ORDER and duplicate keys are the
+#                          synthetic sentinel's job below — the corpus
+#                          comparison normalizes them away.)
 #   pyarrow-native→ours    pyarrow rebuilds the batch through its OWN IPC
 #                          reader (its allocator, its buffer choices, its
 #                          dictionary memo) and exports that; we import it.
@@ -79,8 +82,10 @@ function _oracle_python()
         if uv !== nothing
             run(`$uv venv --python 3.12 $venv`)
         else
-            py3 = something(Sys.which("python3"), Sys.which("python"),
-                error("no python3 on PATH; set ARROW_CDATA_ORACLE_PYTHON"))
+            py3 = Sys.which("python3")
+            py3 === nothing && (py3 = Sys.which("python"))
+            py3 === nothing &&
+                error("no python3 on PATH; set ARROW_CDATA_ORACLE_PYTHON")
             run(`$py3 -m venv $venv`)
         end
     end
@@ -339,6 +344,68 @@ function runcdatafamily(dir::String, family::String, verdicts::Vector{Verdict})
     return
 end
 
+# Metadata SEQUENCE fidelity: the corpus comparison normalizes metadata (it
+# sorts pairs and the integration JSON collapses duplicate keys into a Dict),
+# so it cannot see order or duplicate-key corruption. This synthetic sentinel
+# compares the ORDERED pair sequences exactly — schema level, a leaf field,
+# a nested child, and a dictionary field — through both the C data path and
+# the C stream path.
+const SENTINEL_META = ["z" => "1", "a" => "2", "z" => "3", "m" => ""]
+
+function _metadata_sentinel!(verdicts::Vector{Verdict})
+    lf, ld = AC.fromjulia("leaf", Int64[1, 2, 3])
+    leaf = AC.Field(lf.name, lf.type; nullable=lf.nullable, metadata=SENTINEL_META)
+    cf, cd = AC.fromjulia("item", Int64[7, 8, 9])
+    child = AC.Field(cf.name, cf.type; nullable=cf.nullable,
+        metadata=reverse(SENTINEL_META))
+    lstf, lstd = AC.fromjulia("lst", [Int64[7], Int64[8], Int64[9]])
+    lst = AC.Field(lstf.name, lstf.type; nullable=lstf.nullable,
+        metadata=SENTINEL_META, children=[child])
+    df0, dd = AC.fromjulia_dict("dict", ["lo", "hi"], [0, 1, 0])
+    dict = AC.Field(df0.name, df0.type; nullable=df0.nullable,
+        metadata=SENTINEL_META, children=collect(AC.Field, df0.children))
+    sch = AC.Schema(AC.Field[leaf, lst, dict]; metadata=reverse(SENTINEL_META))
+    b = AC.RecordBatch(sch, AC.ArrayData[ld, lstd, dd], 3)
+    seqs(schema) = Any[collect(schema.metadata),
+        [collect(f.metadata) for f in schema.fields]...,
+        collect(schema.fields[2].children[1].metadata)]
+    want = seqs(sch)
+    for (check, roundtrip) in (
+        ("metadata sequence (C data)", () -> begin
+            pyb = _to_pyarrow(sch, b)
+            s2, b2 = _from_pyarrow(pyb)
+            PythonCall.pydel!(pyb)
+            _releasebatch!(b2)
+            s2
+        end),
+        ("metadata sequence (C stream)", () -> begin
+            outref = Ref{CAS}(); inref = Ref{CAS}()
+            GC.@preserve outref inref begin
+                outp = Base.unsafe_convert(Ptr{CAS}, outref)
+                Arrow.export_stream!(outp, sch, AC.RecordBatch[b])
+                reader = pa.RecordBatchReader._import_from_c(UInt(outp))
+                inp = Base.unsafe_convert(Ptr{CAS}, inref)
+                reader._export_to_c(UInt(inp))
+                st = Arrow.from_c_stream(inp)
+                got = AC.nextbatch!(st)
+                got === nothing || _releasebatch!(got)
+                Arrow.release!(st)
+                PythonCall.pydel!(reader)
+                st.schema
+            end
+        end))
+        try
+            got = seqs(roundtrip())
+            push!(verdicts, Verdict("(sentinel)", check,
+                got == want ? :pass : :fail,
+                got == want ? "" : "ordered metadata sequences differ: $got vs $want"))
+        catch e
+            push!(verdicts, _errverdict("(sentinel)", check, e))
+        end
+    end
+    return
+end
+
 # The C interfaces carry data, not IPC framing, so a family's JSON is the
 # same test whichever corpus version directory it lives in: run each family
 # once, from the newest directory that has it.
@@ -375,6 +442,7 @@ function runcdataoracle(corpus::String=DEFAULT_CORPUS)
             verdicts[i] = Verdict(v * "/" * vd.family, vd.check, vd.status, vd.detail)
         end
     end
+    _metadata_sentinel!(verdicts)
     # Every structure handed to pyarrow must have come back exactly once.
     PythonCall.GC.gc()
     GC.gc()
