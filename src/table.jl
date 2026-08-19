@@ -694,7 +694,7 @@ _scanrowcount(got) = Base.Int(Tables.rowcount(Tables.columns(got)))
 
 "Convert a column to an override type with Tables.scan's exact rules."
 function _applyoverride(T, col)
-    # finish's no-op rule: a column already accepted by Union{T,Missing}
+    # Tables.scan's no-op rule: a column already accepted by Union{T,Missing}
     # passes through untouched (supertype overrides included).
     eltype(col) <: Union{T,Missing} && return col
     # A REAL conversion preserves the requested target type exactly and
@@ -715,9 +715,13 @@ end
     Arrow.Stream(source; mmap=true)
 
 Iterate an IPC source one record batch at a time; each iteration yields an
-[`Arrow.Table`](@ref) for that batch. Satisfies `Tables.partitions`, so
-`Arrow.write(sink, Arrow.Stream(...))` streams batch-per-batch, and works
-directly with partition-aware sinks.
+[`Arrow.Table`](@ref) for that batch, so a consumer that processes and drops
+batches holds one batch of columns at a time. Satisfies `Tables.partitions`
+(each batch is one partition), so partition-aware sinks — including
+`Arrow.write`, which writes one record batch per partition — see the source
+batch structure. Note that `Arrow.write` itself is whole-buffer: it
+materializes every partition before writing, so it does not by itself bound
+memory for a source larger than RAM.
 """
 struct Stream
     src::Union{IPCStream,ArrowFile}

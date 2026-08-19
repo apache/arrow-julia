@@ -492,6 +492,21 @@ Tables.getcolumn(t::_ScanColumns, i::Int) = getfield(t.columns, i)
 Tables.getcolumn(t::_ScanColumns, name::Symbol) = getproperty(t.columns, name)
 Tables.rowcount(t::_ScanColumns) = t.nrows
 
+# One decoded batch column in the STORAGE domain, typed by its declared
+# element type when that claim closes (the same routing the facade uses:
+# `_batchcolumn`), else the dynamic `Vector{Any}`. Building the empty result
+# from the same rule keeps a column's eltype independent of how many rows a
+# scan kept — a zero-row scan has the schema of a full one.
+_scancolumn(f::Field, d::ArrayData) = _batchcolumn(f, d)
+
+function _joinscanparts(f::Field, parts::Vector)
+    if isempty(parts)
+        T = _declaredeltype(f, false)
+        return (_closedclaim(T) && _typedroutable(f)) ? Vector{T}() : Any[]
+    end
+    return length(parts) == 1 ? parts[1] : reduce(vcat, parts)
+end
+
 function _scantable(names, outcols, nrows::Int)
     table = NamedTuple{Tuple(names)}(outcols)
     return isempty(names) ? _ScanColumns(table, nrows) : table
@@ -552,9 +567,10 @@ function _batchwindow(rowcounts::Vector{Int64}, offset::Int, limit::Union{Nothin
     return window
 end
 
-# The Tables.scan authority forms `offset + 1` and, with a limit,
-# `offset + limit` in Int arithmetic. Keep an overflowing request residual so
-# both sides of the apply/finish contract have the same observable result.
+# The generic executor windows with saturating `min` arithmetic, so a
+# request whose `offset + limit` would overflow Int is still well-defined
+# there. Keeping such a request in the residual (rather than consuming it
+# here) is what keeps the pushed result identical to the executor's.
 _canconsumewindow(scan::Tables.Scan) = scan.offset < typemax(Int) &&
     (scan.limit === nothing || scan.limit <= typemax(Int) - scan.offset)
 
@@ -565,8 +581,8 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
     b = Tables.bind(scan, names)
     if isempty(names)
         # Zero-field sources: consume filter and window HERE — an empty
-        # residual NamedTuple cannot carry a row count through finish. The
-        # header reads share ONE budget: `Limits` documents a cumulative
+        # residual NamedTuple cannot carry a row count through the generic
+        # executor. The header reads share ONE budget: `Limits` documents a cumulative
         # allocation bound per read, exactly as the column path enforces.
         keep = _zerofieldpredicate(scan.filter)
         zfbudget = AllocationBudget(f.limits.max_total_allocated_bytes)
@@ -606,13 +622,12 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
             rblen, cols = _scanbatch(f, i, mask, budget, state)
             outrows = _addscanrows(outrows, take >= 0 ? take : rblen)
             for idx in decodeidx
-                col = materialize(f.fields[idx], cols[idx]::ArrayData)
+                col = _scancolumn(f.fields[idx], cols[idx]::ArrayData)
                 take >= 0 && (col = col[(skip + 1):(skip + take)])
                 push!(parts[idx], col)
             end
         end
-        outcols = Tuple(isempty(parts[idx]) ? Any[] : reduce(vcat, parts[idx])
-                        for idx in decodeidx)
+        outcols = Tuple(_joinscanparts(f.fields[idx], parts[idx]) for idx in decodeidx)
         table = _scantable(names[decodeidx], outcols, outrows)
         # The residual's selection must be RESOLVED against the source schema:
         # the output table carries only the decode set, so re-binding `Not`
@@ -654,7 +669,13 @@ end
 RangedSource(bytes::Vector{UInt8}) =
     RangedSource((off, len) -> bytes[(off + 1):(off + len)], Int64(length(bytes)))
 
-"One result vector per requested `(offset, len)`; override for concurrency."
+"""
+    fetchranges(src::RangedSource, ranges::Vector{NTuple{2,Int64}}) -> Vector{Vector{UInt8}}
+
+One result vector per requested `(offset, len)`, in order. The default
+fetches serially through `src.fetch`; a transport overrides this method to
+issue the planned ranges concurrently.
+"""
 fetchranges(s::RangedSource, ranges::Vector{NTuple{2,Int64}}) =
     Vector{UInt8}[_fetchexact(s, off, len) for (off, len) in ranges]
 
@@ -815,10 +836,11 @@ end
 """
     RangedFile(src::RangedSource; limits, tailbytes=65536, coalesce_gap=262144)
 
-The scan-driven, fetch-minimal file handle: `Tables.scan(rf, scan)` runs
-the fetch protocol — tail-first footer, batch windowing from block
-metadata, dictionary bodies only for decode-set ids, and per-buffer body
-ranges for exactly the decode set, coalesced under `coalesce_gap`.
+The scan-driven, fetch-minimal file handle: `Tables.scan(rf, scan)` (and
+`Arrow.Table(rf; scan=…)`) runs the fetch protocol — the eight-byte head
+magic then the footer from the tail, batch windowing from block metadata,
+dictionary bodies only for decode-set ids, and per-buffer body ranges for
+exactly the decode set, coalesced under `coalesce_gap`.
 
 Trust note, stated loudly: the ranged reader treats the FOOTER as the sole
 schema authority — it does not parse and cross-check the leading schema
@@ -953,8 +975,8 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
     b = Tables.bind(scan, names)
     if isempty(names)
         # Zero-field sources: consume filter and window HERE — an empty
-        # residual NamedTuple cannot carry a row count through finish. The
-        # metadata-only read keeps the column path's trust boundary: the
+        # residual NamedTuple cannot carry a row count through the generic
+        # executor. The metadata-only read keeps the column path's trust boundary: the
         # block index validates first, every touched block passes the full
         # frame checks, and every fetch charges the one cumulative budget.
         _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
@@ -1152,13 +1174,12 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
                 validated, limits, version, mask, state)
             outrows = _addscanrows(outrows, take >= 0 ? take : rowcounts[p])
             for idx in decodeidx
-                col = materialize(fields[idx], cols[idx]::ArrayData)
+                col = _scancolumn(fields[idx], cols[idx]::ArrayData)
                 take >= 0 && (col = col[(skip + 1):(skip + take)])
                 push!(parts[idx], col)
             end
         end
-        outcols = Tuple(isempty(parts[idx]) ? Any[] : reduce(vcat, parts[idx])
-                        for idx in decodeidx)
+        outcols = Tuple(_joinscanparts(fields[idx], parts[idx]) for idx in decodeidx)
         table = _scantable(names[decodeidx], outcols, outrows)
         residualselect = scan.select === nothing ? nothing :
             Tables.SelectItem[Tables.SelectItem(names[c.index], c.type,

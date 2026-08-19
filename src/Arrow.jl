@@ -94,6 +94,16 @@ include("scan.jl")
 include("table.jl")
 include("write.jl")
 
+"""
+    Arrow.nextbatch!(source) -> Union{Nothing, RecordBatch}
+
+Pull the next record batch from a record-batch source — an IPC stream
+(`readstream`), an imported C stream (`from_c_stream`) — or `nothing` at end
+of stream. Sources are single-owner cursors: overlapping calls on one source
+are an error.
+"""
+AC.nextbatch!
+
 export close!
 
 end # module Arrow

@@ -232,12 +232,13 @@ dictionary set, so concurrent reads need no coordination.
 
 ### Scan pushdown and ranged reads
 
-`Tables.apply(::ArrowFile, scan)` decodes only the selected and
+`Tables.scan(::ArrowFile, scan)` (and `Arrow.Table(source; scan=…)`,
+which is the public entry over it) decodes only the selected and
 filter-referenced columns, prunes whole batches through the embedded
 statistics (one-sided: a pruned batch is provably empty; the filter always
 stays in the residual), and consumes `limit`/`offset` exactly when no filter
 poisons the window. Projection, filtering, renames, and type conversions
-are `Tables.finish`'s over the returned residual. `RangedFile` runs the same
+are the generic `Tables.scan` executor's over the returned residual. `RangedFile` runs the same
 plan over a byte-range fetcher: it uses the Footer as its sole schema
 authority, validates the full Block index and the complete metadata plan for
 every statistics-surviving record before requesting a body range, and

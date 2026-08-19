@@ -1573,16 +1573,6 @@ function _stream_release(sp::Ptr{CArrowArrayStream})::Cvoid
     return nothing
 end
 
-"""
-    export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema, batches)
-
-Fill a CALLER-owned ArrowArrayStream struct (the C stream convention: the
-producer fills, the consumer owns the struct storage) streaming `batches` as
-struct-typed arrays whose children are the schema's columns. The stream's
-registry root keeps schema fields and batches reachable until `release`;
-every `get_schema`/`get_next` result is its own export root with the same
-lifecycle as `to_c_data` output.
-"""
 # Core's structural schema invariants (endianness, UTF-8 names and metadata,
 # valid descriptors) for the whole schema TREE. Stream schemas travel
 # separately from any batch, so both stream directions apply this walk to the
@@ -1606,6 +1596,16 @@ function _validate_stream_field(f::Field)
     return nothing
 end
 
+"""
+    export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema, batches)
+
+Fill a CALLER-owned ArrowArrayStream struct (the C stream convention: the
+producer fills, the consumer owns the struct storage) streaming `batches` as
+struct-typed arrays whose children are the schema's columns. The stream's
+registry root keeps schema fields and batches reachable until `release`;
+every `get_schema`/`get_next` result is its own export root with the same
+lifecycle as `to_c_data` output.
+"""
 export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
     batches::AbstractVector{AC.RecordBatch}) =
     _export_stream!(sp, sch, batches, Libc.malloc, Libc.free, unsafe_store!)
@@ -1756,6 +1756,14 @@ mutable struct ImportedStream <: AC.RecordBatchSource
 end
 
 AC.schema(s::ImportedStream) = s.schema
+
+"""
+    release!(s::ImportedStream)
+
+Run the producer's stream release callback exactly once (later calls and the
+GC finalizer are no-ops); batches already pulled keep their own owners and
+stay valid.
+"""
 release!(s::ImportedStream) = release!(s.owner)
 
 function _stream_call_failed(o::StreamOwner, what::AbstractString)

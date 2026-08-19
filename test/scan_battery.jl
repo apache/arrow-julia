@@ -188,6 +188,21 @@ function _scan_main()
     end
     println("differential scans match Tables.scan over the full table ✓")
 
+    # A column's element type is a property of the SCHEMA, not of how many
+    # rows a scan kept: a scan that keeps no rows (limit 0, an offset past
+    # the input, a filter statistics prune to nothing) has exactly the schema
+    # of the full direct scan, on both the file and the ranged handle.
+    fullschema = Tables.schema(Tables.scan(af, Tables.Scan()))
+    for emptyscan in (Tables.Scan(limit=0), Tables.Scan(offset=10_000),
+                      Tables.Scan(filter=Tables.col(:ints) > 10_000))
+        for handle in (af, RangedFile(RangedSource(copy(filebytes))))
+            got = Tables.scan(handle, emptyscan)
+            @assert Tables.rowcount(Tables.columns(got)) == 0
+            @assert Tables.schema(got) == fullschema sprint(show, emptyscan)
+        end
+    end
+    println("empty scans keep the full scan's schema on both handles ✓")
+
     # Residual semantics: window consumption vs filter poisoning.
     _, r1 = _applyscan(af, Tables.Scan(select=(:ints,), offset=4, limit=3))
     @assert r1.limit === nothing && r1.offset == 0 && r1.select !== nothing

@@ -14,8 +14,12 @@ separates that design intent from what the trim harness actually compiles.
 `Tables.Scan` (Tables.jl `jq/scan` branch) is a plain-data scan request —
 select/rename/type items, a closed predicate algebra (`Cmp`/`In`/`IsNull`/
 `StrPred`/`And`/`Or`/`Not`, with `OpNode` as the growth channel), `limit`/
-`offset` — consumed via `apply(source, scan) -> (table, residual)` +
-`finish(table, residual)`. Key contract points this design leans on:
+`offset`. A source accepts a `Scan` as a keyword and pushes down what it
+can while materializing; whatever it cannot push it hands to the generic
+executor `Tables.scan(table, residual)` (Arrow's pushdown is the internal
+`_applyscan(handle, scan) -> (table, residual)`, composed with the executor
+by `Tables.scan(::ArrowFile/::RangedFile, scan)` and by `Arrow.Table(source;
+scan=…)`). Key contract points this design leans on:
 
 - pushed and residual work may **overlap** (inexact pruning keeps the filter
   in the residual);
@@ -30,14 +34,14 @@ select/rename/type items, a closed predicate algebra (`Cmp`/`In`/`IsNull`/
 | `select` | decode only (selected ∪ filter-referenced) columns: a registry-driven `skipfield!` advances the node/buffer cursor past unselected fields without body slicing, content validation, or materialization. Complete node/buffer metadata is still validated first. Nested subtrees skip with their parent; no body range is requested for an unselected dictionary column. | exact as IO/decode reduction (see below for who projects) |
 | `limit`/`offset` | `RecordBatch.length` is wire metadata: whole batches before `offset` and after `offset+limit` are never decoded. Ranged reads still fetch candidate RecordBatch metadata because Footer Blocks have no row counts, but request no body range for excluded batches. Tail reads and configured coalescing may physically over-read otherwise unrequested bytes. | exact when no filter; poisoned by any filter per the contract |
 | `filter` | two tiers: (a) **statistics pruning** — per-batch min/max/null-count, when present (§3 of this doc), prune batches that cannot satisfy the predicate; (b) **mask at materialization** — evaluate the predicate over decoded columns through Core accessors and apply the mask when building output columns. | (a) inexact — filter stays in residual; (b) exact — enables limit pushdown with filters |
-| `types` (`ref => T`) | left in the residual for `finish`'s elementwise convert. Arrow's schema is source-fixed; an override is a conversion request, not a parse seed (unlike CSV). Exception: see §4 — in trim mode the overrides double as the known-schema pin. | residual |
+| `types` (`ref => T`) | left in the residual for the executor's elementwise convert. Arrow's schema is source-fixed; an override is a conversion request, not a parse seed (unlike CSV). Exception: see §4 — in trim mode the overrides double as the known-schema pin. | residual |
 
-### The `apply` shape — two stages
+### The pushdown shape — two stages
 
-**Stage A (adapter-level; what is implemented).** `Tables.apply` on the file/stream
+**Stage A (adapter-level; what is implemented).** `_applyscan` on the file
 handles does **IO-and-decode reduction with a full residual**:
 
-    apply(f, scan) =
+    _applyscan(f, scan) =
       bind against schema names →
       decode set = selected ∪ filtercols (source order, source names) →
       resolve positional filter refs to source names →
@@ -48,9 +52,9 @@ handles does **IO-and-decode reduction with a full residual**:
 where the residual is the original scan minus `limit`/`offset` when those
 were consumed. Critically, when the filter references unselected columns the
 returned table **keeps them under source names and leaves `select` in the
-residual** — `finish` then filters, projects, renames, and converts. This is
-the only correct composition: if the adapter consumed `select` while leaving
-`filter` in the residual, `finish` could not evaluate predicates over
+residual** — the executor then filters, projects, renames, and converts.
+This is the only correct composition: if the adapter consumed `select` while
+leaving `filter` in the residual, the executor could not evaluate predicates over
 already-dropped columns. Simple, correct, and captures the dominant win:
 unselected columns cost zero decode and add zero planned body bytes. Tail reads
 and coalescing may still over-read them under §2's explicit policy.
@@ -75,23 +79,22 @@ Two refinements the differential tests forced (both implemented in
   `typemax(Int)` and rejects a larger one. An offset-only window represents
   `limit=nothing` explicitly; it does not use a finite sentinel that can omit
   later batches.
-- **One apply call has one allocation budget.** Standalone lazy `file[i]`
+- **One scan has one allocation budget.** Standalone lazy `file[i]`
   calls retain their documented per-call budgets. A scan that visits many
   batches shares one budget and codec state across all of its metadata and
   decompression work, matching the ranged operation.
-- **Authority-overflow windows stay residual.** The current `Tables.finish`
-  implementation forms `offset + 1` and `offset + limit` with unchecked
-  `Int` arithmetic. Stage A does not consume a request when either expression
-  would overflow, so the apply/finish equation remains exact until Tables
-  adopts saturating window arithmetic.
+- **Overflowing windows stay residual.** The generic executor windows with
+  saturating `min` arithmetic; Stage A does not consume a request whose
+  `offset + limit` would overflow Int, so the pushed result stays identical
+  to the executor's without duplicating that arithmetic.
 - **Stage A needs no row-level predicate evaluator.** The filter always
-  stays in the residual, so `Tables.finish`/`filtermask` do row evaluation;
+  stays in the residual, so `Tables.scan`/`filtermask` do row evaluation;
   Arrow-side predicate logic first appears as the *interval* ladder for
-  statistics pruning (§3). Stream handles keep the default no-push `apply`
-  — the eager stream reader has already decoded by the time `apply`
-  runs; stream pushdown would need an incremental framer.
+  statistics pruning (§3). Stream-format sources are scanned by the facade
+  after decode — the eager stream reader has already decoded by then;
+  stream pushdown would need an incremental framer.
 
-**Stage B (facade-level; not implemented).** A facade `apply` that consumes
+**Stage B (facade-level; not implemented).** A facade pushdown that consumes
 everything exactly: per-column masks evaluated through Core accessors (no
 materialization of excluded rows), projection/renames applied at column
 construction, `limit`/`offset` composed with exact masks. Residual: empty,
@@ -302,7 +305,7 @@ designed for trim but not yet gated by it. The rules in `core-README.md`
 
 Implemented (`src/scan.jl`, `src/table.jl`):
 
-- **Scan pushdown**: `skipfield!`, `Tables.apply(::ArrowFile, scan)` with
+- **Scan pushdown**: `skipfield!`, `_applyscan(::ArrowFile, scan)` with
   Stage-A semantics, exact limit/offset batch skipping, resolved residual
   selections, zero-field scans, and the differential battery with
   corruption-backed never-decoded proofs. `Arrow.Table(source; scan=…)`
@@ -323,7 +326,7 @@ Implemented (`src/scan.jl`, `src/table.jl`):
   degradation, and both lie directions.
 
 Not implemented: a CloudStore/HTTP transport extension (the fetcher
-contract is the extension point), Stage B's exact facade `apply`, an
+contract is the extension point), Stage B's exact facade pushdown, an
 encode-time `statistics=true` writer keyword, upstream-placement tracking
 for statistics, and the scan-and-materialize trim harness. Scan pushdown
 depends on Tables.jl's `jq/scan` branch until that API is released.

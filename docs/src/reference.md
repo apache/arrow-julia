@@ -21,7 +21,7 @@
 
 # API Reference
 
-## Reading
+## Read
 
 ```@docs
 Arrow.Table
@@ -29,7 +29,7 @@ Arrow.Stream
 Arrow.close!(::Arrow.Table)
 ```
 
-## Writing
+## Write
 
 ```@docs
 Arrow.write
@@ -41,6 +41,7 @@ Arrow.DictEncode
 ```@docs
 Arrow.RangedSource
 Arrow.RangedFile
+Arrow.fetchranges
 ```
 
 ## The C data and C stream interfaces
@@ -50,4 +51,8 @@ Arrow.to_c_data
 Arrow.from_c_data
 Arrow.export_stream!
 Arrow.from_c_stream
+Arrow.nextbatch!
+Arrow.release!(::Arrow.ForeignOwner)
+Arrow.release!(::Arrow.ImportedStream)
+Arrow.reap!
 ```

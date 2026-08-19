@@ -107,9 +107,12 @@ for batch in Arrow.Stream("big.arrow")
 end
 ```
 
-A `Stream` satisfies `Tables.partitions`, so it can be handed directly to a
-partition-aware sink — `Arrow.write(sink, Arrow.Stream(...))` streams the
-input batch by batch without ever holding the whole table.
+A `Stream` satisfies `Tables.partitions` (each batch is one partition), so
+partition-aware sinks see the source's batch structure —
+`Arrow.write(sink, Arrow.Stream(...))` writes one record batch per input
+batch. `Arrow.write` itself materializes every partition before writing (see
+[Writing](@ref)), so bounded-memory processing of a source larger than RAM
+is the consumer's loop over the stream, not a write of it.
 
 ### Metadata
 
@@ -126,10 +129,10 @@ DataAPI.colmetadata(tbl, :a, "key")
 
 ### Type mapping when reading
 
-Reading maps Arrow types to Julia element types by a closed rule over the
-schema (never by inspecting values, so an all-`missing` or zero-row column
-has the same element type as a populated one). A nullable Arrow field maps
-to `Union{Missing, T}`.
+Scalar Arrow types map to Julia element types by a closed rule over the
+schema — never by inspecting values, so an all-`missing` or zero-row scalar
+column has the same element type as a populated one. A nullable Arrow field
+maps to `Union{Missing, T}`.
 
 | Arrow type | Julia element type |
 |---|---|
@@ -147,16 +150,27 @@ to `Union{Missing, T}`.
 | Decimal32/64 | `Int32`/`Int64` (unscaled integer storage) |
 | Decimal128/256 | `Vector{UInt8}` (raw little-endian storage) |
 | Interval | `Int32` (year-month) or a `NamedTuple` (day-time, month-day-nano) |
-| List, LargeList, FixedSizeList, ListView | `Vector{Any}` |
+| Dictionary-encoded scalar | the mapping of the *value* type (indices are resolved) |
+
+Composite and wrapper layouts are read on the dynamic path: each row is
+built as a Julia value and the column's element type is then *narrowed from
+the rows*, so it depends on the data (a zero-row column has element type
+`Any`; an all-`missing` one, `Missing`):
+
+| Arrow type | Row values |
+|---|---|
+| List, LargeList, FixedSizeList, ListView | `Vector{Any}` of the child's values |
 | Struct | `Vector{Pair{String,Any}}` (ordered name => value pairs) |
 | Map | `Vector{Pair{Any,Any}}` |
-| Union | the pairwise join of the children's element types |
-| Dictionary-encoded | the mapping of the *value* type (indices are resolved) |
-| Run-end encoded | the mapping of the *values* child (runs are expanded) |
-| Null | `Missing` |
+| Union | the selected child's value; the column narrows to what appears |
+| Run-end encoded | the *values* child's values (runs are expanded) |
+| Null | `missing` |
 
-Sub-millisecond timestamps stay as raw integers rather than silently
-truncating into `DateTime`; the same rule applies when writing.
+The `Dates` conversions above apply at the top level and through
+dictionary encoding; a temporal type nested under a run-end-encoded or
+union wrapper stays in its raw integer storage. Sub-millisecond timestamps
+stay as raw integers everywhere rather than silently truncating into
+`DateTime`; the same rule applies when writing.
 
 ### Scan pushdown
 
@@ -207,9 +221,9 @@ over HTTP, or from a local file it prefers not to map whole — needs only
 the ranges its scan touches. [`Arrow.RangedSource`](@ref) is that fetcher
 contract: a function `fetch(offset, len) -> Vector{UInt8}` over an object
 of known total length. [`Arrow.RangedFile`](@ref) wraps one with the fetch
-protocol (tail-first footer, batch windowing from the footer's block
-metadata, dictionary bodies only for the columns in play, coalesced body
-ranges for exactly the decoded columns):
+protocol (the eight-byte head magic, then the footer from the tail, batch
+windowing from the footer's block metadata, dictionary bodies only for the
+columns in play, coalesced body ranges for exactly the decoded columns):
 
 ```julia
 src = Arrow.RangedSource(Int64(objectsize)) do offset, len
@@ -243,9 +257,11 @@ Arrow.write("out.arrow", tbl;
 
 Each `Tables.partitions` partition of the source becomes one record batch,
 so `Arrow.write(sink, Arrow.Stream(path))` and
-`Arrow.write(sink, Tables.partitioner(...))` write batch by batch. The
-writer is eager and whole-buffer: batches are encoded and validated in
-memory, then written to the sink once.
+`Arrow.write(sink, Tables.partitioner(...))` preserve batch structure. The
+writer is eager and whole-buffer: every partition is materialized, encoded
+and validated in memory, then the complete IPC bytes are written to the
+sink once — it holds the whole table, so it is not a bounded-memory path
+for sources larger than RAM (there is no incremental writer in 3.0).
 
 `compress` applies per-buffer LZ4 frame or Zstandard compression as
 defined by the IPC specification (buffers that do not shrink are stored
@@ -268,29 +284,39 @@ its dictionary encoding is preserved.
 
 ### Type mapping when writing
 
-Writing maps Julia element types to Arrow types:
+Writing maps Julia element types to Arrow types. The *core* domain — what
+can appear at any nesting depth — is:
 
 | Julia element type | Arrow type |
 |---|---|
 | `Int8`…`Int64`, `UInt8`…`UInt64` | the same-width integer |
 | `Float16/32/64` | the same-width float |
 | `Bool` | Bool |
-| `String` (any `AbstractString`) | Utf8 |
+| `String` | Utf8 |
+| `Vector{T}` for core `T` (including `Vector{UInt8}`) | List of the mapping of `T` |
+| `Union{Missing, T}` for core `T` | the mapping of `T`, nullable |
+
+At the *top level* of a column the facade adds:
+
+| Julia element type | Arrow type |
+|---|---|
+| any other `AbstractString` (e.g. `SubString`) | Utf8 |
 | `Dates.Date` | Date32 |
 | `Dates.DateTime` | Timestamp (millisecond) |
 | `Dates.Time` | Time64 (nanosecond) |
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
-| `Vector{T}` (including `Vector{UInt8}`) | List of the mapping of `T` |
-| `NamedTuple` | Struct (no top-level nulls — wrap fields as nullable children instead) |
-| `Union{Missing, T}` | the mapping of `T`, nullable |
-| `Arrow.DictEncode` | Dictionary of the mapping of the wrapped column |
+| `NamedTuple` whose fields are core columns | Struct (no top-level nulls — wrap fields as nullable children instead) |
+| `Arrow.DictEncode` over a core column | Dictionary of the wrapped mapping |
 
-A column with element type `Any` is narrowed once (recovering list columns
-of a common element type) and refused if it cannot be narrowed to a
-writable type. When the source is an `Arrow.Table` or `Arrow.Stream`, the
-writer *retains* the Arrow schema it was read with — temporal units,
-dictionary encoding, nested list descriptors, nullability, and metadata all
-survive a read/write round trip.
+The top-level conversions do not recurse: a `Vector{Date}` inside a list, a
+`Date` or `SubString` field of a `NamedTuple`, or `DictEncode` over dates
+are refused with an `ArgumentError` naming the element type. A column with
+element type `Any` is narrowed once (recovering list columns of a common
+element type) and refused if it cannot be narrowed to a writable type.
+When the source is an `Arrow.Table` or `Arrow.Stream`, the writer *retains*
+the Arrow schema it was read with — temporal units, dictionary encoding,
+nested list descriptors, nullability, and metadata all survive a read/write
+round trip.
 
 ## Validation
 
@@ -376,7 +402,7 @@ compression, metadata — is the same in spirit, with these differences:
 * **Not present in 3.0**: `Arrow.Writer`/`Arrow.append` (incremental and
   append-to-file writing), multithreaded encoding (`ntasks`), the
   `convert=false` lazy read mode, `Arrow.ToArrow`, and ArrowTypes.jl
-  custom-type serialization (a Julia struct is written as a Struct column
-  of its fields, not as an extension type). Big-endian and delta-dictionary
-  IPC streams are refused.
+  custom-type serialization: a `NamedTuple` column is written as a Struct
+  column of its fields, and other Julia structs are not writable. Big-endian
+  and delta-dictionary IPC streams are refused.
 * **The C data and C stream interfaces** are new.
