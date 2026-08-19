@@ -97,9 +97,8 @@ further iteration cleanly.
 ### `Arrow.Stream`
 
 [`Arrow.Stream`](@ref) iterates a source one record batch at a time; each
-iteration yields an `Arrow.Table` for that batch. This is the tool for
-files larger than memory and for pipelines that process batches
-independently:
+iteration yields an `Arrow.Table` for that batch — the tool for pipelines
+that process batches independently:
 
 ```julia
 for batch in Arrow.Stream("big.arrow")
@@ -110,9 +109,16 @@ end
 A `Stream` satisfies `Tables.partitions` (each batch is one partition), so
 partition-aware sinks see the source's batch structure —
 `Arrow.write(sink, Arrow.Stream(...))` writes one record batch per input
-batch. `Arrow.write` itself materializes every partition before writing (see
-[Writing](@ref)), so bounded-memory processing of a source larger than RAM
-is the consumer's loop over the stream, not a write of it.
+batch.
+
+Memory: only the memory-mapped **file-format** path (the default when you
+pass a path to a file-format source) is lazy — batches are decoded from the
+mapping one at a time, so a consumer's loop over such a `Stream` holds one
+batch of columns at a time (plus the file's dictionaries), and that is the
+way to process a file larger than RAM. A **stream-format** source, and any
+`IO` or byte-vector input, is read to the end and fully decoded when the
+`Stream` is constructed. `Arrow.write` materializes every partition before
+writing (see [Writing](@ref)), so it does not bound memory either.
 
 ### Metadata
 
@@ -307,6 +313,7 @@ At the *top level* of a column the facade adds:
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
 | `NamedTuple` whose fields are core columns | Struct (no top-level nulls — wrap fields as nullable children instead) |
 | `Arrow.DictEncode` over a core column | Dictionary of the wrapped mapping |
+| `ArrowStrings.CompactStringVector` | Utf8View, **zero-copy** — the column's memory is the Arrow array (see below) |
 
 The top-level conversions do not recurse: a `Vector{Date}` inside a list, a
 `Date` or `SubString` field of a `NamedTuple`, or `DictEncode` over dates
@@ -317,6 +324,18 @@ When the source is an `Arrow.Table` or `Arrow.Stream`, the writer *retains*
 the Arrow schema it was read with — temporal units, dictionary encoding,
 nested list descriptors, nullability, and metadata all survive a read/write
 round trip.
+
+### ArrowStrings columns
+
+[ArrowStrings.jl](https://github.com/apache/arrow-julia/tree/main/src/ArrowStrings)
+(a separate package that lives in this repository) defines
+`CompactString`, a 16-byte string value that *is* an Arrow StringView entry
+(inline up to 12 bytes, otherwise a prefix plus buffer index and offset),
+and `CompactStringVector`, a column of them over a set of byte buffers —
+which *is* an Arrow Utf8View array's memory. CSV.jl parses string columns
+into this representation, so `Arrow.write` on such a column wraps its
+payload vector and buffers as the Arrow column without copying or
+materializing a single `String`.
 
 ## Validation
 

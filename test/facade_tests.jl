@@ -25,6 +25,7 @@ using Tables
 using Dates
 import DataAPI
 using Arrow
+using ArrowStrings
 
 const MIXED = (
     ints = Int64[1, 2, 3, 4],
@@ -938,6 +939,147 @@ end
             Tables.partitioner(NamedTuple[]))
         @test_throws ArgumentError Arrow.write(IOBuffer(),
             (st=[(a=1,), missing],))
+    end
+
+    @testset "advisory nullability: nulls under a non-nullable field read" begin
+        # Field nullability is advisory at the reader tier (the semantic
+        # validation IPC applies accepts such data, as the reference
+        # implementation does). A non-nullable field whose batch holds a
+        # null therefore READS, as a missing-capable column, on every
+        # entry: the facade, the facade's scan path, and the direct handle
+        # scan — for primitives and through a run-end-encoded wrapper.
+        AC = Arrow.AC
+        f = AC.Field("x", AC.IntType(64, true); nullable=false)
+        d = AC.ArrayData(AC.IntType(64, true), 2,
+            [AC._databuffer(UInt8[0b10]), AC._databuffer(Int64[0, 7])]; nullcount=1)
+        sch = AC.Schema([f])
+        bytes = Arrow.writefile(sch, AC.RecordBatch[AC.RecordBatch(sch, [d], 2)])
+        @test isequal(Arrow.Table(bytes).x, [missing, 7])
+        @test eltype(Arrow.Table(bytes).x) === Union{Missing,Int64}
+        @test isequal(Arrow.Table(bytes; scan=Tables.Scan()).x, [missing, 7])
+        for handle in (Arrow.readfile(bytes),
+                       Arrow.RangedFile(Arrow.RangedSource(bytes)))
+            got = Tables.scan(handle, Tables.Scan())
+            @test isequal(got.x, [missing, 7])
+            @test eltype(got.x) === Union{Missing,Int64}
+        end
+        rf, rd = AC.fromjulia("run_ends", Int32[1, 2])
+        vf0, vd = AC.fromjulia("values", Union{Missing,Int64}[missing, 7])
+        vf = AC.Field("values", vf0.type; nullable=false)
+        t = AC.RunEndEncodedType()
+        ref = AC.Field("r", t; children=[rf, vf])
+        red = AC.ArrayData(t, 2, AC.BufferSlice[]; children=[rd, vd], nullcount=0)
+        sch2 = AC.Schema([ref])
+        bytes2 = Arrow.writefile(sch2, AC.RecordBatch[AC.RecordBatch(sch2, [red], 2)])
+        @test isequal(Arrow.Table(bytes2).r, [missing, 7])
+        for handle in (Arrow.readfile(bytes2),
+                       Arrow.RangedFile(Arrow.RangedSource(bytes2)))
+            @test isequal(Tables.scan(handle, Tables.Scan()).r, [missing, 7])
+        end
+        # a dictionary column: a null-free pool under a non-nullable field is
+        # Missing-free; a pool holding a null (the schema's one flag cannot
+        # declare it) reads missing-capable
+        df0, dd = AC.fromjulia_dict("d", ["lo", "hi"], [0, 1, 0])
+        df = AC.Field("d", df0.type; nullable=false, children=collect(AC.Field, df0.children))
+        schd = AC.Schema([df])
+        bytesd = Arrow.writefile(schd, AC.RecordBatch[AC.RecordBatch(schd, [dd], 3)])
+        @test Arrow.Table(bytesd).d == ["lo", "hi", "lo"]
+        @test eltype(Arrow.Table(bytesd).d) === String
+        pf0, pd = AC.fromjulia_dict("d", Union{Missing,String}["lo", missing], [0, 1, 0])
+        pf = AC.Field("d", pf0.type; nullable=false, children=collect(AC.Field, pf0.children))
+        schp = AC.Schema([pf])
+        bytesp = Arrow.writefile(schp, AC.RecordBatch[AC.RecordBatch(schp, [pd], 3)])
+        @test isequal(Arrow.Table(bytesp).d, ["lo", missing, "lo"])
+        @test eltype(Arrow.Table(bytesp).d) === Union{Missing,String}
+        # a conforming batch keeps the declared, Missing-free type
+        cf, cd = AC.fromjulia("c", Int64[1, 2])
+        schc = AC.Schema([cf])
+        bytesc = Arrow.writefile(schc, AC.RecordBatch[AC.RecordBatch(schc, [cd], 2)])
+        @test eltype(Arrow.Table(bytesc).c) === Int64
+    end
+
+    @testset "empty column types do not depend on batch structure" begin
+        # A schema-only source and a source with one zero-row batch give
+        # every column the same element type, for the closed scalars and
+        # through the transparent wrappers.
+        AC = Arrow.AC
+        cases = [
+            ("bin", AC.BinaryType(false), () -> AC.ArrayData(AC.BinaryType(false), 0,
+                [AC.BufferSlice(), AC._databuffer(Int32[0]), AC._databuffer(UInt8[])]; nullcount=0), Vector{UInt8}),
+            ("fsb", AC.FixedSizeBinaryType(2), () -> AC.ArrayData(AC.FixedSizeBinaryType(2), 0,
+                [AC.BufferSlice(), AC._databuffer(UInt8[])]; nullcount=0), Vector{UInt8}),
+            ("d128", AC.DecimalType(10, 2, 128), () -> AC.ArrayData(AC.DecimalType(10, 2, 128), 0,
+                [AC.BufferSlice(), AC._databuffer(Int128[])]; nullcount=0), Vector{UInt8}),
+            ("d64", AC.DecimalType(10, 2, 64), () -> AC.ArrayData(AC.DecimalType(10, 2, 64), 0,
+                [AC.BufferSlice(), AC._databuffer(Int64[])]; nullcount=0), Int64),
+            ("iym", AC.IntervalType(AC.YEAR_MONTH), () -> AC.ArrayData(AC.IntervalType(AC.YEAR_MONTH), 0,
+                [AC.BufferSlice(), AC._databuffer(Int32[])]; nullcount=0), Int32),
+            ("imdn", AC.IntervalType(AC.MONTH_DAY_NANO), () -> AC.ArrayData(AC.IntervalType(AC.MONTH_DAY_NANO), 0,
+                [AC.BufferSlice(), AC._databuffer(UInt8[])]; nullcount=0),
+                NamedTuple{(:months, :days, :nanos),Tuple{Int32,Int32,Int64}}),
+        ]
+        for (name, t, mk, want) in cases
+            f = AC.Field(name, t; nullable=false)
+            sch = AC.Schema([f])
+            so = Arrow.Table(Arrow.writefile(sch, AC.RecordBatch[]))
+            zr = Arrow.Table(Arrow.writefile(sch, AC.RecordBatch[AC.RecordBatch(sch, [mk()], 0)]))
+            @test eltype(Tables.getcolumn(so, 1)) === want
+            @test eltype(Tables.getcolumn(zr, 1)) === want
+            @test length(Tables.getcolumn(so, 1)) == 0 == length(Tables.getcolumn(zr, 1))
+        end
+        # transparent REE over Int64: the values child's type, both ways
+        rf, rd = AC.fromjulia("run_ends", Int32[])
+        vf, vd = AC.fromjulia("values", Int64[])
+        t = AC.RunEndEncodedType()
+        ref = AC.Field("r", t; children=[rf, vf])
+        sch = AC.Schema([ref])
+        so = Arrow.Table(Arrow.writefile(sch, AC.RecordBatch[]))
+        red = AC.ArrayData(t, 0, AC.BufferSlice[]; children=[rd, vd], nullcount=0)
+        zr = Arrow.Table(Arrow.writefile(sch, AC.RecordBatch[AC.RecordBatch(sch, [red], 0)]))
+        @test eltype(so.r) === Int64 === eltype(zr.r)
+        # composites: the declared row container, both ways
+        lf, ld = AC.fromjulia("l", Vector{Int64}[])
+        schl = AC.Schema([lf])
+        @test eltype(Arrow.Table(Arrow.writefile(schl, AC.RecordBatch[])).l) === Vector{Any}
+        @test eltype(Arrow.Table(Arrow.writefile(schl, AC.RecordBatch[AC.RecordBatch(schl, [ld], 0)])).l) === Vector{Any}
+    end
+
+    @testset "ArrowStrings columns write as Utf8View, zero-copy" begin
+        # A CompactStringVector's memory IS a Utf8View array: payloads are the
+        # views buffer, its byte buffers the variadic data buffers. Build one
+        # the way the CSV kernel does (inline ≤12, else a view into buffer 0
+        # or the `extra` buffer 1) and check the writer wraps rather than
+        # materializes, the file carries Utf8View, and the facade reads it
+        # back as ordinary Strings.
+        buf = Vector{UInt8}(codeunits("id,s\n1,abcd\n2,thirteen-byte\n3,\n"))
+        extra = Vector{UInt8}(codeunits("she said \"hi\" and left"))
+        long1 = first(findfirst(codeunits("thirteen-byte"), buf))
+        abcd = first(findfirst(codeunits("abcd"), buf))
+        payloads = CompactStringPayload[
+            ArrowStrings.inline_payload(buf, abcd, 4),
+            ArrowStrings.view_payload(buf, long1, 13, 0, long1 - 1),
+            ArrowStrings.PAYLOAD_MISSING,
+            ArrowStrings.view_payload(extra, 1, length(extra), 1, 0),
+        ]
+        col = CompactStringVector{Union{Missing,CompactString}}(payloads, buf, extra)
+        f, d = Arrow._writecolumn("s", col)
+        @test f.type == Arrow.AC.ViewType(true) && f.nullable
+        @test d.buffers[2].region.root === payloads       # views: the payload vector itself
+        @test d.buffers[3].region.root === buf
+        @test d.buffers[4].region.root === extra
+        io = IOBuffer()
+        Arrow.write(io, (id=[1, 2, 3, 4], s=col))
+        bytes = take!(io)
+        @test Arrow.readfile(bytes).schema.fields[2].type == Arrow.AC.ViewType(true)
+        t = Arrow.Table(bytes)
+        @test eltype(t.s) === Union{Missing,String}
+        @test isequal(t.s, ["abcd", "thirteen-byte", missing, "she said \"hi\" and left"])
+        # a non-nullable column declares non-nullable
+        col0 = CompactStringVector{CompactString}(payloads[[1, 2]], buf, extra)
+        f0, _ = Arrow._writecolumn("s", col0)
+        @test !f0.nullable
+        Arrow.write(io, (s=col0,))
+        @test Arrow.Table(take!(io)).s == ["abcd", "thirteen-byte"]
     end
 end
 

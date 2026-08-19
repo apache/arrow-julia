@@ -49,6 +49,7 @@ using Tables
 using EnumX
 import Base64
 import DataAPI
+import ArrowStrings
 import Dates
 import Mmap
 import CodecLz4

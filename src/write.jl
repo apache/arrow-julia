@@ -103,6 +103,14 @@ function _narrowlists(v::AbstractVector)
     return S[x === missing ? missing : convert(Vector{E}, x) for x in w]
 end
 
+# An ArrowStrings column IS Utf8View memory: its payload vector is the views
+# buffer and its byte buffers are the variadic data buffers — no copy, no
+# String materialization; the declared nullability is the column's eltype's.
+function _writecolumn(name::String, v::ArrowStrings.CompactStringVector)
+    return AC.fromcompactviews(name, v.payloads, v.buffers;
+        nullable=eltype(v) >: Missing)
+end
+
 function _writecolumn(name::String, d::DictEncode)
     v = d.data
     pool = unique(skipmissing(v))

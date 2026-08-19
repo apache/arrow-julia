@@ -38,6 +38,8 @@ scope of every layer.
 | `src/cdata.jl` | C data and C stream interfaces both directions: zero-copy ownership, move semantics, exactly-once release, field and schema metadata transport |
 | `src/scan.jl` | `Tables.Scan` pushdown over the file format, sparse byte-range reads (`RangedSource`/`RangedFile`), embedded per-batch statistics |
 | `src/table.jl`, `src/write.jl` | The facade |
+| `src/ArrowStrings/` | ArrowStrings.jl — the shared inline-else-view string representation (`CompactString`, `CompactStringVector` = Utf8View memory); a separate package, registered on its own like ArrowTypes, that Arrow depends on through a `[sources]` path entry until its first release |
+| `src/ArrowTypes/` | ArrowTypes.jl — the custom-type interface package (not used by 3.0 yet) |
 | `test/` | Core unit tests, facade tests, the four adapter acceptance batteries, the frozen 2.x-written fixtures, the `--trim=safe` gate |
 | `conformance/` | The arrow-testing gold-corpus runner, the integration-JSON implementation, the pyarrow/nanoarrow IPC oracle, the in-process pyarrow C Data / C Stream oracle |
 | `bench/` | The serialize/deserialize benchmark harness (this package, Arrow.jl 2.x, PyArrow) |
@@ -50,9 +52,10 @@ scope of every layer.
 ```bash
 julia --project=. -e 'using Pkg; Pkg.test()'                     # core + facade + batteries
 julia --startup-file=no test/trim_compile_tests.jl                # JuliaC --trim=safe gate
-julia --project=conformance conformance/run.jl                    # all conformance suites, in the docker image
-julia --project=conformance conformance/run.jl corpus|oracle|cdata # one suite (gold corpus / IPC bytes through
-                                                                   #   pyarrow+nanoarrow / C Data + C Stream in-process)
+julia --startup-file=no conformance/run.jl               # all conformance suites, in the docker image
+julia --startup-file=no conformance/run.jl corpus        # one suite: the gold corpus …
+julia --startup-file=no conformance/run.jl oracle        # … IPC bytes through pyarrow + nanoarrow …
+julia --startup-file=no conformance/run.jl cdata         # … C Data + C Stream through an in-process pyarrow
 julia --project=. bench/run.jl                                     # benchmarks
 julia tools/fbsgen.jl src/metadata/fbs src/metadata               # regenerate bindings + verifier
 ```
@@ -62,8 +65,11 @@ project environment (the conformance image clones it). The conformance
 suites run inside one docker image (`conformance/Dockerfile`: Julia, a
 Python with pyarrow and nanoarrow that PythonCall binds to, the
 apache/arrow-testing corpus, the Tables branch, a warm depot in a named
-volume) driven by `conformance/run.jl` through Harbor.jl — docker is the only
-host requirement. The C interfaces hand pointers across an in-process
+volume) driven by `conformance/run.jl` through Harbor.jl. The driver
+instantiates its own tiny host environment (`conformance/host/`, Harbor.jl
+only) on first run, so docker — and network for that first run — are the
+only host requirements; `conformance/Project.toml` is the IN-CONTAINER suite
+environment. The C interfaces hand pointers across an in-process
 boundary, which is why the suites run in the container rather than against
 one.
 
@@ -163,11 +169,14 @@ adapter normalizes). Julia vectors wrapped zero-copy by the builders or `heapreg
 scoped borrows: they must not be resized or mutated while their `ArrayData`
 or cached validation results are in use.
 
-`fromcompactviews` builds a Utf8View column from 16-byte
-"inline-else-view" string payloads (the CSV kernel's `CompactString`
-representation): inline entries copy verbatim, long entries get their
-second word rewritten to Arrow's (buffer index, offset), and the two data
-buffers wrap zero-copy.
+`fromcompactviews` wraps a vector of Arrow view entries (ArrowStrings'
+`CompactStringPayload`, or any 16-byte isbits type with that layout) and
+its data buffers as a Utf8View column, zero-copy — the payload vector IS the
+views buffer and every data buffer is retained by identity; only the
+validity bitmap is built, and long-entry geometry (offsets inside their
+buffer, prefixes matching the data) is checked by semantic/full validation,
+not at construction. The facade's `Arrow.write` routes
+`ArrowStrings.CompactStringVector` columns through it.
 
 ### IPC
 

@@ -41,6 +41,10 @@ This is a pure Julia implementation of the
   footer-carried statistics pruning.
 - `src/table.jl`, `src/write.jl` — the public facade: `Arrow.Table`,
   `Arrow.Stream`, `Arrow.write`, `close!`.
+- `src/ArrowStrings/` — ArrowStrings.jl, a separate package (registered on
+  its own, like `src/ArrowTypes/`): the inline-else-view string
+  representation shared with CSV.jl, whose column memory is an Arrow
+  Utf8View array.
 - `bench/` — the serialize/deserialize benchmark harness (this package,
   Arrow.jl 2.x, PyArrow) over identical workloads.
 - `test/` — core unit tests, the facade tests, the four adapter acceptance
@@ -63,4 +67,4 @@ Conformance: 275/275 gold-corpus checks pass (36 declared skips);
 oracle capability gaps); 143/143 C Data and C Stream interface round-trips
 through an in-process pyarrow over the whole gold matrix (both directions,
 pyarrow-native memory, sliced exports; 9 declared skips). Run them all with
-`julia --project=conformance conformance/run.jl`.
+`julia conformance/run.jl` (docker is the only host requirement).

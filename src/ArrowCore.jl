@@ -2749,31 +2749,39 @@ function fromjulia_dict(name, pool::Vector, indices0::Vector)
 end
 
 """
-    fromcompactviews(name, payloads::Vector{P}, buf, extra; nullable=true) -> (Field, ArrayData)
+    fromcompactviews(name, payloads::Vector{P}, buffers::Vector{Vector{UInt8}}; nullable=true) -> (Field, ArrayData)
+    fromcompactviews(name, payloads::Vector{P}, buf, extra; nullable=true)
 
 Wrap a vector of Arrow view entries as a Utf8View column, ZERO-COPY. `P` is
 any 16-byte isbits type whose values are Arrow StringView entries — the
-representation the CSV kernel's `CompactString` columns use:
+representation ArrowStrings' `CompactString` columns use:
 
     bytes 0..3    Int32 content length (-1 marks a null slot)
     bytes 4..15   the content, zero-padded            (length ≤ 12)
     bytes 4..7    the content's 4-byte prefix          (length > 12)
-    bytes 8..11   Int32 buffer index: 0 = `buf`, 1 = `extra`
+    bytes 8..11   Int32 buffer index into `buffers` (0-based)
     bytes 12..15  Int32 0-based byte offset within that buffer
 
-`payloads` becomes the views buffer and `buf`/`extra` the variadic data
-buffers 0 and 1 without copying (`extra` may be empty). The only work is the
-validity bitmap: a slot whose length is negative is null; the spec leaves a
-null slot's entry bytes unspecified, and neither this reader's nor the
-reference implementation's validation reads them. Long-entry geometry
-(offsets inside their buffer, prefixes matching the data) is checked where
-every builder's is — by `validate_semantic`/`validate_full` — not here. The
-scoped-borrow rule of every zero-copy wrap applies to all three vectors.
+`payloads` becomes the views buffer and `buffers` the variadic data buffers,
+in order, without copying (the two-buffer form is `[buf, extra]`; a buffer
+may be empty). The only work is the validity bitmap: a slot whose length is
+negative is null; the spec leaves a null slot's entry bytes unspecified, and
+neither this reader's nor the reference implementation's validation reads
+them. Long-entry geometry (offsets inside their buffer, prefixes matching
+the data) is checked where every builder's is — by
+`validate_semantic`/`validate_full` — not here. The scoped-borrow rule of
+every zero-copy wrap applies to every vector passed in.
 """
-function fromcompactviews(name, payloads::Vector{P}, buf::Vector{UInt8},
-    extra::Vector{UInt8}; nullable::Bool=true) where {P}
+fromcompactviews(name, payloads::Vector{P}, buf::Vector{UInt8},
+    extra::Vector{UInt8}; nullable::Bool=true) where {P} =
+    fromcompactviews(name, payloads, Vector{UInt8}[buf, extra]; nullable=nullable)
+
+function fromcompactviews(name, payloads::Vector{P},
+    buffers::Vector{Vector{UInt8}}; nullable::Bool=true) where {P}
     isbitstype(P) && sizeof(P) == 16 ||
         throw(ArgumentError("compact view payloads must be a 16-byte isbits type"))
+    isempty(buffers) &&
+        throw(ArgumentError("a view column needs at least one data buffer"))
     # The entry words are values assembled by shifts; Arrow's byte layout is
     # what those values spell out on a little-endian host, and Core reads
     # view entries host-natively.
@@ -2791,10 +2799,12 @@ function fromcompactviews(name, payloads::Vector{P}, buf::Vector{UInt8},
         end
     end
     t = ViewType(true)
-    buffers = BufferSlice[_bitmapbuffer(present), _databuffer(payloads),
-        _databuffer(buf), _databuffer(extra)]
+    slices = BufferSlice[_bitmapbuffer(present), _databuffer(payloads)]
+    for b in buffers
+        push!(slices, _databuffer(b))
+    end
     return Field(name, t; nullable=nullable),
-    ArrayData(t, n, buffers; nullcount=nnull)
+    ArrayData(t, n, slices; nullcount=nnull)
 end
 
 # ---------------------------------------------------------------------------
