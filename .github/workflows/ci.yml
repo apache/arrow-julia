@@ -99,6 +99,15 @@ jobs:
         nthreads:
           - 1
           - 2
+        exclude:
+          # `min` resolves each package's own Julia floor (setup-julia's
+          # `project` input below). ArrowTypes declares `julia = "1.0"`, whose
+          # Pkg predates test/Project.toml and has no macOS ARM64 binary, so
+          # its floor cannot run the suite; its `lts` cells are its oldest lane.
+          - pkg:
+              name: ArrowTypes.jl
+              dir: './src/ArrowTypes'
+            version: 'min'
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
