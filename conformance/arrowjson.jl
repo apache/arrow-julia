@@ -222,7 +222,6 @@ end
 _hex(bytes) = uppercase(bytes2hex(bytes))
 _unhex(s::AbstractString) = hex2bytes(s)
 _i64(x) = x isa AbstractString ? parse(Int64, x) : Int64(x)
-_u64(x) = x isa AbstractString ? parse(UInt64, x) : UInt64(x)
 
 function _validity(col, n::Int)
     v = get(col, "VALIDITY", nothing)

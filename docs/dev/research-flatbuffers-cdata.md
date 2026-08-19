@@ -29,19 +29,18 @@ compare against `src/cdata.jl`. Research only — no code changed.
 
 ### 1.1 What we have
 
-Three files, ~580 lines: `src/FlatBuffers/FlatBuffers.jl` (58),
-`builder.jl` (~390), `table.jl` (~120). Provenance: introduced whole in the
+Three files, `src/FlatBuffers/FlatBuffers.jl`, `builder.jl`, `table.jl`.
+Provenance: introduced whole in the
 2020 donation commit (`50e015f` "Pure Julia implementation of apache arrow
 format") as a fresh, trimmed port of the Go runtime — it was **not** forked
 from JuliaData/FlatBuffers.jl's code; the two share only the Go-port
 ancestry. Around it the rewrite adds `src/metadata/VerifierRuntime.jl`
-(261 lines, hand-maintained, schema-blind) and `tools/fbsgen.jl` (~660 lines),
-which regenerates `src/metadata/{Schema,File,Message,Verifier}.jl`.
+(hand-maintained, schema-blind) and `tools/fbsgen.jl`, which regenerates `src/metadata/{Schema,File,Message,Verifier}.jl`.
 
 The rewrite's usage surface is narrow. Read side: `getrootas`, `init`,
 `offset`, `get`, `indirect`, `String`, `Array`, `union`, `vector`/`vectorlen`
 (via generated getters). Write side: `Builder`, `startobject!`/`endobject!`,
-`prependslot!`/`prependoffsetslot!`/`prependstructslot!`,
+`prependslot!`/`prependoffsetslot!`,
 `startvector!`/`endvector!`, `createstring!`, `finish!`, `prep!`, `pad!`,
 `place!`. The vendored runtime carries only what that surface needs.
 
@@ -49,8 +48,8 @@ The rewrite's usage surface is narrow. Read side: `getrootas`, `init`,
 
 Context first: in the rewrite **no generated getter runs on unverified
 bytes**. `verify_ipc_metadata` stages `verifyrootstart_Message` /
-`verifyrootrest_Message` before `FB.getrootas` (`src/ipc_read.jl`,
-comment at ), and `verify_footer` does the same for the file footer
+`verifyrootrest_Message` before `FB.getrootas` (`src/ipc_read.jl`), and
+`verify_footer` does the same for the file footer
 (`src/ipc_write.jl`). The verifier runtime does checked, byte-assembled
 loads with range/alignment/domain/budget proofs
 (`src/metadata/VerifierRuntime.jl`). The list below is therefore what
@@ -105,8 +104,6 @@ without the generated verifier in front:
   fresh `FlatBuffers.Array` → one `unsafe_wrap` array header per property
   access (`table.jl`). Frequency is per-batch (nodes/buffers/fields),
   not per-value, so it is visible but not dominant.
-- **Always-allocated shared-string Dict.** Every `Builder()` allocates a
-  `Dict{String,UOffsetT}` (`builder.jl,56`) that Arrow never uses.
 - Non-issues worth recording: generated tables are concrete immutable structs
   (no abstract fields); `Builder` fields are concrete; getter returns are
   `Union{Nothing,T}` **by design** (absent optional field) and the adapters
@@ -116,12 +113,10 @@ without the generated verifier in front:
 
 Missing vs the FlatBuffers spec: any runtime verifier (Arrow supplies its
 own generated one), size-prefixed roots (`finishsizeprefixed!` /
-size-prefixed `getrootas`), read-side file-identifier check (write-side
-`finishwithfileidentifier` exists, unused), public alignment forcing beyond
-internal `prep!`, `key`/sorted-vector lookup, nested-flatbuffer helpers, any
-object/reflection API. Present but unused by Arrow: shared strings
-(`createsharedstring!`, `builder.jl`), vtable deduplication (used).
-None of the gaps matter for Arrow's three schemas.
+size-prefixed `getrootas`), file identifiers, shared strings, public
+alignment forcing beyond internal `prep!`, `key`/sorted-vector lookup,
+nested-flatbuffer helpers, any object/reflection API. Vtable deduplication
+is present and used. None of the gaps matter for Arrow's three schemas.
 
 ### 1.5 Upstream JuliaData/FlatBuffers.jl today
 
@@ -186,7 +181,7 @@ general-purpose surface Arrow does not need.
 (option iii); do not retrofit FlatBuffers.jl v0.6 (option ii).**
 
 - The whole owned surface — runtime + verifier runtime + generator — is
-  ~1,500 lines, regeneration is mechanical (`tools/fbsgen.jl` exists exactly
+  small, regeneration is mechanical (`tools/fbsgen.jl` exists exactly
   because hand-drift was the bug class), and the verifier budgets
   are security posture the project must control and version with itself.
 - A dependency on an external FlatBuffers package re-couples the metadata hot
@@ -245,8 +240,8 @@ that never trusts consumer-mutated counts, and an explicit
 (`test/cdata_battery.jl`). Import lifecycle: single `ForeignOwner` per
 moved tree, atomic exactly-once release with producer-conformance check
 (release must NULL the release field), declared buffer extents
-from the layout registry, then the full three-stage Core
-validation (`validate_structural`/`semantic`/`full`). Tests
+from the layout registry, then Core's structural and semantic validation
+(`validate_semantic`; `validate_full` is the caller's opt-in). Tests
 include per-ABI struct size/offset gates (64-bit, both 32-bit int64
 alignments; `test/cdata_battery.jl`) and a four-thread re-exec stress
 child (`test/cdata_stress_child.jl`).
@@ -263,11 +258,12 @@ Comparison against samtalki's #607 head (the code most likely to merge):
   the release field; theirs does not.
 - **Post-release semantics.** Theirs: every `getindex` runs inside
   `_with_live` — a ReentrantLock acquire per element — so reads after
-  `release_c_data` throw. Ours: reachability-based validity with documented
-  spec-UB after explicit `release!`, zero per-read overhead. Their
-  gate is a real safety-UX win and a real throughput cost; the right review
-  feedback is to make it optional, and the right 3.0 stance is to consider a
-  checked/debug import mode rather than an always-on lock.
+  `release_c_data` throw. Ours: reachability-based validity; explicit
+  `release!` documents spec-UB afterwards, while `close!` on the import's
+  owner revokes every region through one shared cell that each raw access
+  checks (an atomic load, no lock). Their per-element lock is a real
+  safety-UX win and a real throughput cost; the right review feedback is to
+  make it optional.
 - **Misaligned buffers.** Theirs copies misaligned fixed-width buffers into
   aligned storage (mirroring arrow-rs). Ours stays zero-copy for any
   alignment because `loadat` falls back to an unaligned load per element
@@ -276,17 +272,16 @@ Comparison against samtalki's #607 head (the code most likely to merge):
   theirs resolves eagerly with a word-wise `_count_nulls`, ours defers to
   `ArrayData`'s on-demand atomic `nullcount` (`src/ArrowCore.jl`).
 - **Bounded string imports.** Theirs caps C-string scans at 4096 bytes
-  (`_unsafe_string_bounded`); our `_import_cstring` is an unbounded
-  `unsafe_string` (`cdata.jl`). Within the trusted-ABI rule this is
-  defensible, but the cap converts a missing NUL from a memory scan into a
-  clean error — cheap to adopt.
+  (`_unsafe_string_bounded`); ours caps them at 1 MiB, enforced before
+  every dereference (`CSTRING_SCAN_LIMIT`, `cdata.jl`), so a missing NUL is
+  a clean refusal rather than a memory scan.
 - **Schema metadata.** Their import validates the metadata block's bounds.
-  Ours neither imports (`_import_field` never reads `sch.metadata`) nor
-  exports it (`metadata = C_NULL`, `cdata.jl`) — a genuine functional gap
-  to close in the production adapter.
+  Ours imports it (`_import_cmetadata`, bounds-checked) and exports it
+  (`_cmetadata!`), in both the C data and C stream directions; the C-data
+  battery and the pyarrow oracle exercise both.
 - **Scope.** Ours covers unions, views/list-views, REE, dictionaries, and
   both stream directions with exception-safe move seams enumerated at each
-  boundary (); their landed scope (#607) is
+  boundary; their landed scope (#607) is
   null+primitive, with breadth and export still drafts and streams absent
   everywhere.
 
@@ -302,14 +297,11 @@ map and property-test framing.
 Worth porting (with `Co-authored-by` credit):
 
 1. #606's deterministic malformed-import fuzz corpus and compile-a-C-producer
-   smoke test; the optional **PyArrow capsule round-trip** — we currently
-   have no external-implementation integration test for C-data.
+   smoke test (the PyArrow round-trip exists: `conformance/cdata_oracle.jl`
+   proves both directions, PyArrow-native memory, slices, and C streams).
 2. #594's C `offsetof()` probe alongside our static ABI gates.
-3. #607's bounded C-string reads and metadata-bounds validation; schema
-   `metadata` import/export (our gap, §2.2).
-4. Naming convergence is already free: `from_c_data`/`to_c_data` match; keep
-   `release_c_data`-style user-facing verbs in the facade docs so their users
-   land softly.
+3. Naming: `from_c_data`/`to_c_data` match theirs; the public release verbs
+   are `release!` and `close!`.
 
 Engagement: these are three good-faith contributors who converged on the
 same wall (2.x internals lack an `ArrayData`-shaped core; five stalled

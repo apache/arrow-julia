@@ -51,23 +51,23 @@ function main(workdir::String)
     # The 2.x leg resolves from the registry, pinned by env2x's compat:
     # instantiate it up front so the one-command invocation works from a
     # clean checkout (no manifest is committed).
-    run(`$(Base.julia_cmd()) --startup-file=no
-         --project=$(joinpath(here, "env2x"))
-         -e "using Pkg; Pkg.instantiate()"`)
+    env2x = joinpath(here, "env2x")
+    run(
+        `$(Base.julia_cmd()) --startup-file=no --project=$env2x -e "using Pkg; Pkg.instantiate()"`,
+    )
 
     rewriteout = joinpath(workdir, "rewrite.jsonl")
+    rewritescript = joinpath(here, "bench_rewrite.jl")
     _runleg(
-        `$(Base.julia_cmd()) --startup-file=no --project=$repo
-         $(joinpath(here, "bench_rewrite.jl")) $workdir`,
+        `$(Base.julia_cmd()) --startup-file=no --project=$repo $rewritescript $workdir`,
         rewriteout,
     )
     push!(legs, ("rewrite", rewriteout))
 
     out2x = joinpath(workdir, "arrow2x.jsonl")
+    script2x = joinpath(here, "bench_2x.jl")
     _runleg(
-        `$(Base.julia_cmd()) --startup-file=no
-         --project=$(joinpath(here, "env2x"))
-         $(joinpath(here, "bench_2x.jl")) $workdir`,
+        `$(Base.julia_cmd()) --startup-file=no --project=$env2x $script2x $workdir`,
         out2x,
     )
     push!(legs, ("arrow2x", out2x))
@@ -88,10 +88,10 @@ function main(workdir::String)
             false
         end
     if havedocker
+        image = "arrow-julia-conformance:latest"
+        python = "/opt/pyarrow/bin/python"
         _runleg(
-            `docker run --rm -v $workdir:/bench -v $here:/src
-             arrow-julia-conformance:latest
-             /opt/pyarrow/bin/python /src/bench_pyarrow.py /bench`,
+            `docker run --rm -v $workdir:/bench -v $here:/src $image $python /src/bench_pyarrow.py /bench`,
             pyout,
         )
         push!(legs, ("pyarrow", pyout))

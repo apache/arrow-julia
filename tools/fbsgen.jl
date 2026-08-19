@@ -79,8 +79,6 @@ function _strip_comments(src::String)
     return String(take!(out))
 end
 
-_ident(s) = strip(s)
-
 """
 Parse one .fbs source into ordered declarations. Order is preserved: the
 emitted Julia must define types before their users, and .fbs authors already
