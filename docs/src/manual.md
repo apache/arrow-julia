@@ -239,26 +239,42 @@ files that do not are simply scanned batch by batch.
 The file format is random-access: the footer says where every batch and
 buffer lives, so a reader that can fetch byte ranges — from object storage,
 over HTTP, or from a local file it prefers not to map whole — needs only
-the ranges its scan touches. [`Arrow.RangedSource`](@ref) is that fetcher
-contract: a function `fetch(offset, len) -> Vector{UInt8}` over an object
-of known total length. [`Arrow.RangedFile`](@ref) wraps one with the fetch
-protocol (the eight-byte head magic, then the footer from the tail, batch
-windowing from the footer's block metadata, dictionary bodies only for the
-columns in play, coalesced body ranges for exactly the decoded columns):
+the ranges its scan touches. [`Arrow.AbstractArrowSource`](@ref) is that
+contract: a byte-addressable object of known length, read through
+[`Arrow.sourcelength`](@ref) and [`Arrow.readrange`](@ref). Given one,
+`Arrow.Table` with a scan fetches the footer from one tail read, keeps only
+the batches the footer's statistics and the scan's window allow, fetches
+those batches' metadata, and then fetches exactly the buffers of the
+selected (and filter-referenced) columns, coalesced into a few range reads:
+three rounds of requests, however many columns and batches the file holds.
+
+With [CloudStore.jl](https://github.com/JuliaServices/CloudStore.jl)
+loaded, a `CloudStore.Object` (S3, Azure Blob Storage, GCS) is such a source
+directly, and its planned ranges are requested concurrently:
 
 ```julia
-src = Arrow.RangedSource(Int64(objectsize)) do offset, len
-    fetchbytes(url, offset, len)           # your transport: S3, HTTP, ...
-end
-tbl = Arrow.Table(src; scan = Scan(select = (:id,), filter = col(:day) > 20))
+using Arrow, Tables, CloudStore
+obj = CloudStore.Object(bucket, "events/2024-05.arrow"; credentials)
+tbl = Arrow.Table(obj; scan = Scan(select = (:id,), filter = col(:day) > 20))
 ```
 
-Overriding `Arrow.fetchranges(::RangedSource, ranges)` lets a transport
-issue the planned ranges concurrently; the default fetches them serially.
-`RangedFile(src; tailbytes, coalesce_gap, limits)` tunes the initial tail
-read, how close two ranges must be to merge into one request, and the
-resource limits. Arrow.jl has no HTTP or cloud dependency of its own — a
-transport package only has to construct a `RangedSource`.
+Any other transport is two methods away:
+
+```julia
+struct HTTPSource <: Arrow.AbstractArrowSource
+    url::String
+    length::Int64
+end
+Arrow.sourcelength(s::HTTPSource) = s.length
+Arrow.readrange(s::HTTPSource, offset, len) = fetchbytes(s.url, offset, len)  # a Range GET
+
+tbl = Arrow.Table(HTTPSource(url, objectsize); scan = Scan(select = (:id,)))
+```
+
+Overriding [`Arrow.readranges`](@ref) lets a transport issue the planned
+ranges concurrently; the default reads them one at a time. Without a scan
+the whole object is read; a stream-format object (no footer) is always read
+whole. Arrow.jl has no HTTP or cloud dependency of its own.
 
 ## Writing
 
@@ -437,8 +453,8 @@ compression, metadata — is the same in spirit, with these differences:
   over the mapped bytes; 3.0 materializes columns with concrete element
   types (the mapping tables above), and the source may be released with
   `Arrow.close!` at any time afterward.
-* **Scan pushdown and byte-range reads** (`Tables.Scan`, `RangedSource`,
-  `RangedFile`) are new.
+* **Scan pushdown and byte-range reads** (`Tables.Scan`,
+  `AbstractArrowSource`, the CloudStore.jl extension) are new.
 * **Not present in 3.0**: `Arrow.Writer`/`Arrow.append` (incremental and
   append-to-file writing), multithreaded encoding (`ntasks`), the
   `convert=false` lazy read mode, `Arrow.ToArrow`, and ArrowTypes.jl

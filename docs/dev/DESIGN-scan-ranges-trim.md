@@ -19,9 +19,9 @@
 
 # Design: Tables.Scan pushdown, cloud byte-range reads, and the trim contract
 
-Implemented in `src/scan.jl` and exposed through the facade
-(`Arrow.Table(source; scan=…)`, `RangedFile`); §5 lists what is and is not
-built. The three pieces share one mechanism: **a bound column set drives
+Implemented in `src/scan.jl` and `src/source.jl` and exposed through the
+facade (`Arrow.Table(source; scan=…)` over an `AbstractArrowSource`); §5
+lists what is and is not built. The three pieces share one mechanism: **a bound column set drives
 both what gets decoded and what gets fetched, and every request value is
 plain data intended to remain visible to the trim verifier.** Section 4
 separates that design intent from what the trim harness actually compiles.
@@ -37,7 +37,7 @@ select/rename/type items, a closed predicate algebra (`Cmp`/`In`/`IsNull`/
 can while materializing; whatever it cannot push it hands to the generic
 executor `Tables.scan(table, residual)` (Arrow's pushdown is the internal
 `_applyscan(handle, scan) -> (table, residual)`, composed with the executor
-by `Tables.scan(::ArrowFile/::RangedFile, scan)` and by `Arrow.Table(source;
+by `Tables.scan(::ArrowFile/::SourceFile, scan)` and by `Arrow.Table(source;
 scan=…)`). Key contract points this design leans on:
 
 - pushed and residual work may **overlap** (inexact pruning keeps the filter
@@ -149,11 +149,13 @@ sequential — cloud-native access is a file-format feature, stated plainly.
 
 ### The fetch protocol
 
-1. **Head + tail fetch** (two range requests): the eight-byte head (magic
-   + padding check) and the last `tailbytes` (default 64 KiB). The tail
-   covers footer-length + magic + the whole Footer in almost every real
-   file; if `footerlen + 10 > tailbytes`, one exact follow-up fetch.
+1. **Tail fetch** (one range request, cached on the handle): the last
+   `tailbytes` (default 64 KiB). Its trailing magic decides file vs stream
+   format (a stream object is read whole instead), and it covers
+   footer-length + magic + the whole Footer in almost every real file; if
+   `footerlen + 10 > tailbytes`, one exact follow-up fetch.
    → schema, Block indexes, (§3) statistics — everything pruning needs.
+   The leading magic is not fetched: the Footer is the sole authority.
 2. **Statistics prune** from the Footer metadata — zero additional fetches.
 3. **Block metadata fetches**: dictionary metadata plus
    `(offset, metaDataLength)` for each statistics-surviving record batch,
@@ -173,9 +175,11 @@ sequential — cloud-native access is a file-format feature, stated plainly.
    was itself derived from the verified buffer table"*: same trust story,
    sparse backing.
 
-Request-count model (what actually matters against cloud latency): `1` head
-+ `1` tail (plus one exact Footer follow-up when the tail is too small)
-+ `⌈candidate metadata spans after coalescing⌉` + `⌈coalesced body ranges⌉`.
+Request-count model (what actually matters against cloud latency): `1` tail
+(plus one exact Footer follow-up when the tail is too small)
++ `⌈candidate metadata spans after coalescing⌉` + `⌈coalesced body ranges⌉`
+— three rounds, each one wall-clock round trip when the source issues a
+round's ranges concurrently.
 For a 40-column file reading 3 columns of every batch, this moves roughly
 `3/40` of the body bytes plus metadata. Statistics-pruned batches contribute
 no requested metadata/body range. Coalescing is an explicit over-read policy,
@@ -184,41 +188,39 @@ gap permits it.
 
 ### The interface (no HTTP/CloudStore deps in Arrow)
 
-Arrow defines a minimal fetcher contract and owns the planner; transports
-live in extensions:
+Arrow defines a minimal source contract (`src/source.jl`) and owns the
+planner; transports live in extensions:
 
-    struct RangedSource{F}
-        fetch::F                    # fetch(offset::Int64, len::Int64) -> Vector{UInt8}
-        len::Int64                  # total object length, known up front
-    end
-    fetchranges(s::RangedSource, ranges) -> Vector{Vector{UInt8}}
-        # default: serial map over s.fetch; transports override for
-        # concurrent range GETs (CloudStore does this well) — concurrency
-        # stays in the extension, never in Arrow.
+    abstract type AbstractArrowSource end
+    sourcelength(src)::Integer                  # total object length, known up front
+    readrange(src, offset, len)::Vector{UInt8}  # one exact range, 0-based offset
+    readranges(src, ranges) -> Vector{Vector{UInt8}}
+        # default: serial map over readrange; transports override for
+        # concurrent range GETs — concurrency stays in the extension,
+        # never in Arrow.
 
-- The entry points are `Tables.scan(RangedFile(source), scan)` and
-  `Arrow.Table(RangedFile(source); scan=…)`. A
-  production `readfile(::RangedSource; scan=...)` can make the existing
-  whole-buffer and `mmapregion` paths trivial `RangedSource`s
-  (fetch = copy/subslice), so ONE reader serves local and remote and the
-  differential test is free: sparse fetch ≡ whole-file read, plus
-  fetch-count/byte-count assertions on a counting test source.
-- **Why a parametric functor field and not an abstract type**: dispatch cost
-  is irrelevant (IO-bound), but trim is not — an open abstract type makes
-  `fetch` a dynamic call the verifier cannot resolve; a concrete `F` in a
-  trimmed app is statically known. This is runtime plumbing, not a `Scan`
-  value, so the no-`Function`-fields rule for plain-data requests does not
-  apply to it. If extension ergonomics ever demand an abstract type, the
-  fallback is a closed core ladder plus an open-only-in-extensions split;
-  the functor is simpler and trim-cleaner.
-- Extension shape (not built): an `ArrowCloudStoreExt` loaded with
-  CloudStore.jl would construct `RangedSource`s from S3/Azure objects with
-  concurrent `fetchranges` and object-length discovery (HEAD). An
-  `ArrowHTTPExt` shape is identical. Zero new hard deps either way.
+- The entry point is `Arrow.Table(src; scan=…)`, which builds the internal
+  `SourceFile(src; limits, tailbytes, coalesce_gap)` handle and runs
+  `Tables.scan(sf, scan)`; the source's length is read once, at handle
+  construction, and the tail once per handle. `Arrow.Table(src)` without a
+  scan plans every column; `Arrow.Stream(src)` reads the object whole.
+- The abstract type is a dynamic call under `--trim` for a source type the
+  trimmed app never mentions; an app that names its concrete source type
+  resolves statically. The planner itself is arithmetic over `Int64`s.
+- Extension: `ext/ArrowCloudStoreExt.jl` (loaded with CloudStore.jl) makes
+  a `CloudStore.Object` a source — its known `size` is the length, one
+  range is one HTTP `Range` GET, and `readranges` issues a round's ranges
+  concurrently — and adds `Arrow.Table(::CloudStore.Object; …)` and
+  `Arrow.Stream(::CloudStore.Object; …)`. An HTTP transport is the same two
+  methods. Zero new hard deps.
+- The differential test: sparse fetch ≡ whole-file read, plus
+  request-count/byte-count/range assertions on a counting test source
+  (`test/scan_battery.jl`), and the CloudStore extension end to end against
+  a local S3-compatible server (`test/cloudstore_tests.jl`).
 - Explicitly out of scope v1, documented: caching/prefetch policy beyond
-  coalescing, retries (the fetcher's job), writers over ranges, stream
-  format, mutation detection (ETag pinning is the extension's concern —
-  the fetcher closure can bake in `If-Match`).
+  coalescing, retries (the source's job), writers over ranges, stream
+  format (read whole), mutation detection (ETag pinning is the extension's
+  concern).
 
 The ranged reader deliberately uses the Footer schema as its sole schema
 authority. It does not parse or cross-check the leading schema message or
@@ -297,9 +299,9 @@ designed for trim but not yet gated by it. The rules in `core-README.md`
   closed algebra). The evaluator uses the same closed-set `isa` ladder
   pattern as `layoutspec_of`; `OpNode` rejection keeps the set closed.
   `bind` is plain data → plain data.
-- The range planner is arithmetic over `Int64`s; `RangedSource{F}` is
-  concrete in any trimmed app. No dynamic registry, no abstract-typed
-  fields on the hot path.
+- The range planner is arithmetic over `Int64`s; a trimmed app that names
+  its concrete `AbstractArrowSource` type resolves the source calls
+  statically. No dynamic registry on the hot path.
 - **Two-tier public API (mirroring the CSV rewrite)**: the runtime-tagged
   core is inherently trim-safe — descriptors are values, accessors use
   literal load widths, struct scalars are `Vector{Pair{String,Any}}`. So:
@@ -331,9 +333,9 @@ Implemented (`src/scan.jl`, `src/table.jl`):
   corruption-backed never-decoded proofs. `Arrow.Table(source; scan=…)`
   routes through it on file-format and ranged inputs; stream-format inputs
   scan post-decode with identical results.
-- **RangedSource**: the `RangedSource{F}` contract, the `RangedFile` fetch
-  protocol, the coalescing planner, `SparseBody` decode, and
-  counting-source proofs (zero planned body ranges for skipped columns,
+- **Byte-range sources**: the `AbstractArrowSource` contract, the
+  `SourceFile` fetch protocol, the coalescing planner, `SparseBody` decode,
+  the CloudStore.jl extension, and counting-source proofs (zero planned body ranges for skipped columns,
   window-excluded batches, and unneeded dictionary bodies, with exact
   request-log checks under the fixtures' tail/coalescing settings).
 - **Statistics**: `withstatistics`/`statsfile` fold the official statistics
@@ -345,8 +347,9 @@ Implemented (`src/scan.jl`, `src/table.jl`):
   tail/coalescing may over-read them); acceptance pins exactness,
   degradation, and both lie directions.
 
-Not implemented: a CloudStore/HTTP transport extension (the fetcher
-contract is the extension point), Stage B's exact facade pushdown, an
+Not implemented: an HTTP transport extension (the source contract is the
+extension point; the CloudStore extension is the model), Stage B's exact
+facade pushdown, an
 encode-time `statistics=true` writer keyword, upstream-placement tracking
 for statistics, and the scan-and-materialize trim harness. Scan pushdown
 depends on Tables.jl's `jq/scan` branch until that API is released.

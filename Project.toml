@@ -37,8 +37,15 @@ TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 [sources]
 ArrowStrings = {path = "src/ArrowStrings"}
 
+[weakdeps]
+CloudStore = "3365d9ee-d53b-4a56-812d-5344d5b716d7"
+
+[extensions]
+ArrowCloudStoreExt = "CloudStore"
+
 [compat]
 ArrowStrings = "0.1"
+CloudStore = "1.6"
 CodecLz4 = "0.4"
 DataAPI = "1"
 CodecZstd = "0.8"

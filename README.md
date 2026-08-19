@@ -40,10 +40,15 @@ This is a pure Julia implementation of the
 - `src/ipc_read.jl`, `src/ipc_write.jl` — the IPC stream and file
   formats: framing, resource limits, compression, dictionary lifecycles.
 - `src/cdata.jl` — the C data and C stream interfaces, import and export.
+- `src/source.jl` — the `AbstractArrowSource` interface: what a
+  byte-range-addressable object (cloud storage, HTTP, …) provides so
+  `Arrow.Table` can fetch only the bytes a scan touches.
 - `src/scan.jl` — `Tables.Scan` pushdown over byte ranges plus
   footer-carried statistics pruning.
 - `src/table.jl`, `src/write.jl` — the public facade: `Arrow.Table`,
   `Arrow.Stream`, `Arrow.write`, `close!`.
+- `ext/ArrowCloudStoreExt.jl` — CloudStore.jl objects as sources (S3,
+  Azure Blob Storage, GCS) with concurrent range reads.
 - `src/FlatBuffers/` — the vendored FlatBuffers runtime the generated
   bindings run over.
 - `src/ArrowStrings/` — ArrowStrings.jl, a separate package (to be

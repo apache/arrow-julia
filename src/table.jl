@@ -30,17 +30,20 @@
     Arrow.Table(source; scan=nothing, mmap=true) -> Table
 
 Read Arrow IPC data as Tables.jl columns. `source` is a file path, an `IO`,
-raw bytes (`Vector{UInt8}`), or an `Arrow.RangedSource`/`Arrow.RangedFile`
-(byte-range reads — see their docs). Both IPC formats are accepted: the file
-format (`ARROW1` magic, random access, footer statistics) and the stream
-format. `mmap=true` memory-maps a file-format path instead of reading it
-into memory; it has no effect on the other source kinds.
+raw bytes (`Vector{UInt8}`), or an [`Arrow.AbstractArrowSource`](@ref) — a
+byte-range-addressable object, such as one in cloud storage, read with
+exact range requests. Both IPC formats are accepted: the file format
+(`ARROW1` magic, random access, footer statistics) and the stream format.
+`mmap=true` memory-maps a file-format path instead of reading it into
+memory; it has no effect on the other source kinds.
 
 `scan` is a `Tables.Scan` pushdown request: only the selected and
-filter-referenced columns are decoded, footer statistics prune batches no row of which can match the
-filter, and exact limit/offset windows skip whole batches. On the file
-format (and ranged sources) pruning happens before bytes are fetched or
-decoded; on the stream format the scan is applied after decode.
+filter-referenced columns are decoded, footer statistics prune batches no
+row of which can match the filter, and exact limit/offset windows skip
+whole batches. On the file format pruning happens before bytes are decoded,
+and over an `AbstractArrowSource` before they are even fetched — the footer
+comes from one tail read and only the surviving batches' selected buffers
+are requested; on the stream format the scan is applied after decode.
 
 One exception: a scan that cannot run in the storage domain — a filter
 literal with no exact storage representation (a cross-domain or
@@ -473,6 +476,10 @@ end
 _opensource(io::IO; mmap::Bool=true) = _openbytes(Base.read(io))
 _opensource(bytes::Vector{UInt8}; mmap::Bool=true) = _openbytes(bytes)
 _opensource(src::Union{IPCStream,ArrowFile}; mmap::Bool=true) = src
+# A byte-range source is read whole: iteration is sequential over every
+# batch, so there is nothing for range planning to skip.
+_opensource(src::AbstractArrowSource; mmap::Bool=true) =
+    _openbytes(_wholeobject(SourceFile(src)))
 
 "Distinct owner regions reachable from a source's decoded batches."
 function _sourceregions(s::IPCStream)
@@ -494,18 +501,21 @@ _sourceregions(f::ArrowFile) = AC.OwnerRegion[f.region]
 # --- Table construction ------------------------------------------------------
 
 function Table(source; scan::Union{Nothing,Tables.Scan}=nothing, mmap::Bool=true)
-    if source isa RangedSource || source isa RangedFile
-        rf = source isa RangedSource ? RangedFile(source) : source
-        # One extra tail fetch buys the schema up front: literal lowering,
+    if source isa AbstractArrowSource || source isa SourceFile
+        sf = source isa SourceFile ? source : SourceFile(source)
+        # A stream-format object has no footer to plan from: read it whole
+        # (its tail window is already in hand) and scan after decode.
+        _isfilesource(sf) || return Table(_wholeobject(sf); scan=scan)
+        # The schema up front (from the cached tail): literal lowering,
         # exactly-once output conversion, and DataAPI metadata all need it.
-        sch, rfields = rangedschema(rf)
+        sch, rfields = _sourceschema(sf)
         theScan = scan === nothing ? Tables.Scan() : scan
         if isempty(rfields)
-            # A zero-field object is bytes-tiny; fetch it whole so the row
+            # A zero-field object is bytes-tiny; read it whole so the row
             # count survives the read.
-            bytes = _fetchexact(rf.src, Int64(0), rf.src.len)
+            bytes = _wholeobject(sf)
             return _publicscan(
-                _materialize_table(readfile(bytes; limits=rf.limits), AC.OwnerRegion[]),
+                _materialize_table(readfile(bytes; limits=sf.limits), AC.OwnerRegion[]),
                 sch,
                 rfields,
                 theScan,
@@ -514,10 +524,10 @@ function Table(source; scan::Union{Nothing,Tables.Scan}=nothing, mmap::Bool=true
         end
         pushscan, pushable = _lowerscan(theScan, rfields)
         if pushable
-            got = Tables.scan(rf, pushscan)
+            got = Tables.scan(sf, pushscan)
             return _wrapscanned(got, sch, rfields, theScan)
         end
-        full = _wrapscanned(Tables.scan(rf, Tables.Scan()), sch, rfields, Tables.Scan())
+        full = _wrapscanned(Tables.scan(sf, Tables.Scan()), sch, rfields, Tables.Scan())
         return _publicscan(full, sch, rfields, theScan, AC.OwnerRegion[])
     end
     src = _opensource(source; mmap=mmap)
@@ -792,10 +802,11 @@ end
 """
     Arrow.Stream(source; mmap=true)
 
-Iterate an IPC source (a file path, an `IO`, or a `Vector{UInt8}`) one
-record batch at a time; each iteration yields an [`Arrow.Table`](@ref) for
-that batch. `mmap=true` memory-maps a file-format path instead of reading
-it into memory; it has no effect on the other source kinds. Satisfies `Tables.partitions` (each
+Iterate an IPC source (a file path, an `IO`, a `Vector{UInt8}`, or an
+[`Arrow.AbstractArrowSource`](@ref), which is read whole) one record batch
+at a time; each iteration yields an [`Arrow.Table`](@ref) for that batch.
+`mmap=true` memory-maps a file-format path instead of reading it into
+memory; it has no effect on the other source kinds. Satisfies `Tables.partitions` (each
 batch is one partition), so partition-aware sinks — including `Arrow.write`,
 which writes one record batch per partition — see the source batch structure.
 

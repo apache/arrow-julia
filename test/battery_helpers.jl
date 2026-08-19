@@ -773,9 +773,15 @@ _viewlong(len::Int, prefix::Vector{UInt8}, bufidx::Int, off::Int) = vcat(
 )
 
 # ---------------------------------------------------------------------------
-# Byte-range fetch accounting for the ranged-scan battery: a RangedSource
-# over in-memory bytes that logs every range and byte it is asked for.
+# Byte-range sources over in-memory bytes for the ranged-scan battery: the
+# plain one, and one that logs every range and byte it is asked for.
 # ---------------------------------------------------------------------------
+struct BytesSource <: Arrow.AbstractArrowSource
+    data::Vector{UInt8}
+end
+Arrow.sourcelength(s::BytesSource) = length(s.data)
+Arrow.readrange(s::BytesSource, off, len) = s.data[(off + 1):(off + len)]
+
 mutable struct FetchLog
     requests::Int
     bytes::Int64
@@ -783,15 +789,21 @@ mutable struct FetchLog
 end
 FetchLog() = FetchLog(0, 0, NTuple{2,Int64}[])
 
+struct CountingSource <: Arrow.AbstractArrowSource
+    data::Vector{UInt8}
+    log::FetchLog
+end
+Arrow.sourcelength(s::CountingSource) = length(s.data)
+function Arrow.readrange(s::CountingSource, off, len)
+    s.log.requests += 1
+    s.log.bytes += len
+    push!(s.log.ranges, (off, len))
+    return s.data[(off + 1):(off + len)]
+end
+
 function countingsource(bytes::Vector{UInt8})
     log = FetchLog()
-    fetch = (off, len) -> begin
-        log.requests += 1
-        log.bytes += len
-        push!(log.ranges, (off, len))
-        bytes[(off + 1):(off + len)]
-    end
-    return log, RangedSource(fetch, Int64(length(bytes)))
+    return log, CountingSource(bytes, log)
 end
 
 _fetched(log::FetchLog, pos::Int64) =

@@ -18,9 +18,9 @@
     Arrow.jl — a pure Julia implementation of the Apache Arrow columnar format.
 
 Public surface: `Arrow.Table` reads the IPC stream and file formats (paths,
-`IO`, byte vectors, or a `RangedSource`/`RangedFile` over a byte-range
-fetcher) as Tables.jl tables, with `Tables.Scan` pushdown; `Arrow.Stream`
-iterates a path, `IO`, or byte-vector source one record batch at a time;
+`IO`, byte vectors, or an `AbstractArrowSource` — a byte-range-addressable
+object such as one in cloud storage) as Tables.jl tables, with `Tables.Scan`
+pushdown; `Arrow.Stream` iterates a source one record batch at a time;
 `Arrow.write` writes any Tables.jl source; `close!` releases mapped or
 foreign storage deterministically.
 
@@ -91,6 +91,7 @@ const AC = ArrowCore
 include("ipc_read.jl")
 include("ipc_write.jl")
 include("cdata.jl")
+include("source.jl")
 include("scan.jl")
 
 # The public facade.

@@ -22,6 +22,9 @@ include("core_tests.jl")
 # The public facade (Arrow.Table / Arrow.Stream / Arrow.write).
 include("facade_tests.jl")
 
+# The CloudStore.jl extension against a local S3-compatible server.
+include("cloudstore_tests.jl")
+
 # The adapter acceptance batteries: assertion-dense scripts over the
 # package's internals, sharing one module that aliases the package
 # namespace wholesale.

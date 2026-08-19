@@ -39,9 +39,10 @@ Arrow.DictEncode
 ## Byte-range reads
 
 ```@docs
-Arrow.RangedSource
-Arrow.RangedFile
-Arrow.fetchranges
+Arrow.AbstractArrowSource
+Arrow.sourcelength
+Arrow.readrange
+Arrow.readranges
 ```
 
 ## The C data and C stream interfaces

@@ -16,6 +16,8 @@
 
 [deps]
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+CloudBase = "85eb1798-d7c4-4918-bb13-c944d38e27ed"
+CloudStore = "3365d9ee-d53b-4a56-812d-5344d5b716d7"
 DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 ArrowStrings = "c38d8858-22a2-449e-9eca-ef92ec15f353"

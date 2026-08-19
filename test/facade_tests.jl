@@ -27,6 +27,22 @@ import DataAPI
 using Arrow
 using ArrowStrings
 
+# In-memory byte-range sources: the plain one, and one that meters bytes.
+struct _BytesSource <: Arrow.AbstractArrowSource
+    data::Vector{UInt8}
+end
+Arrow.sourcelength(s::_BytesSource) = length(s.data)
+Arrow.readrange(s::_BytesSource, off, len) = s.data[(off + 1):(off + len)]
+struct _MeteredSource <: Arrow.AbstractArrowSource
+    data::Vector{UInt8}
+    fetched::Base.RefValue{Int64}
+end
+Arrow.sourcelength(s::_MeteredSource) = length(s.data)
+function Arrow.readrange(s::_MeteredSource, off, len)
+    s.fetched[] += len
+    return s.data[(off + 1):(off + len)]
+end
+
 const MIXED = (
     ints=Int64[1, 2, 3, 4],
     floats=[1.5, missing, 3.5, 4.5],
@@ -150,11 +166,8 @@ end
         )
         fb = take!(io)
         fetched = Ref(Int64(0))
-        src = Arrow.RangedSource(
-            (off, len) -> (fetched[] += len; fb[(off + 1):(off + len)]),
-            Int64(length(fb)),
-        )
-        rf = Arrow.RangedFile(src; tailbytes=1024, coalesce_gap=0)
+        src = _MeteredSource(fb, fetched)
+        rf = Arrow.SourceFile(src; tailbytes=1024, coalesce_gap=0)
         t = Arrow.Table(rf; scan=Tables.Scan(select=(:b,), limit=3, offset=1500))
         @test t.b == ["v1501", "v1502", "v1503"]
         # The first batch is skipped entirely and column :a is never fetched.
@@ -270,7 +283,7 @@ end
             metadata=Dict("origin" => "ranged"),
         )
         fb = take!(io)
-        src = Arrow.RangedSource(fb)
+        src = _BytesSource(fb)
         t = Arrow.Table(src)
         @test t.stamp == [DateTime(2020, 5, 5)]
         @test eltype(t.stamp) == Union{Missing,DateTime} || eltype(t.stamp) == DateTime
@@ -562,7 +575,7 @@ end
     @testset "zero-field counts across all paths" begin
         sch = Arrow.AC.Schema(Arrow.AC.Field[])
         bytes = Arrow.writefile(sch, [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 3)])
-        for source in (bytes, Arrow.RangedSource(bytes))
+        for source in (bytes, _BytesSource(bytes))
             t = Arrow.Table(source; scan=Tables.Scan())
             @test Tables.rowcount(t) == 3
             tw = Arrow.Table(source; scan=Tables.Scan(limit=1, offset=1))
@@ -594,11 +607,8 @@ end
             zb;
             scan=Tables.Scan(filter=Tables.coleq(Tables.col(:nope), 1)),
         )
-        # ranged zero-field honors RangedFile limits
-        rfz = Arrow.RangedFile(
-            Arrow.RangedSource(zb);
-            limits=Arrow.Limits(max_array_length=2),
-        )
+        # ranged zero-field honors SourceFile limits
+        rfz = Arrow.SourceFile(_BytesSource(zb); limits=Arrow.Limits(max_array_length=2))
         @test_throws Arrow.AC.ValidationError Arrow.Table(rfz)
     end
 
@@ -707,7 +717,7 @@ end
         )
             got = Tables.scan(af, scan)
             @test Tables.rowcount(Tables.columns(got)) == want
-            rgot = Tables.scan(Arrow.RangedFile(Arrow.RangedSource(zb)), scan)
+            rgot = Tables.scan(Arrow.SourceFile(_BytesSource(zb)), scan)
             @test Tables.rowcount(Tables.columns(rgot)) == want
         end
         # The facade path allocates nothing proportional to a hostile count:
@@ -727,7 +737,7 @@ end
         bad[65:68] .= 0x00
         @test_throws Arrow.AC.ValidationError Arrow.readfile(copy(bad))
         @test_throws Arrow.AC.ValidationError Tables.scan(
-            Arrow.RangedFile(Arrow.RangedSource(copy(bad))),
+            Arrow.SourceFile(_BytesSource(copy(bad))),
             Tables.Scan(),
         )
         # Header reads share ONE cumulative budget, as Limits documents:
@@ -742,7 +752,7 @@ end
             Tables.Scan(),
         )
         @test_throws Arrow.AllocationLimitError Tables.scan(
-            Arrow.RangedFile(Arrow.RangedSource(copy(many)); limits=tight),
+            Arrow.SourceFile(_BytesSource(copy(many)); limits=tight),
             Tables.Scan(),
         )
         # A zero-field schema declares no dictionary ids: a footer listing a
@@ -775,13 +785,13 @@ end
         append!(doctored, Arrow.FILE_MAGIC)
         @test_throws Arrow.AC.ValidationError Arrow.readfile(copy(doctored))
         @test_throws Arrow.AC.ValidationError Tables.scan(
-            Arrow.RangedFile(Arrow.RangedSource(copy(doctored))),
+            Arrow.SourceFile(_BytesSource(copy(doctored))),
             Tables.Scan(),
         )
         # Structural binding is unconditional: an unsupported predicate node
         # rejects even with validate=false, on every facade path.
         zs = Arrow.writestream(sch, [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 3)])
-        for source in (zb, zs, Arrow.RangedSource(zb))
+        for source in (zb, zs, _BytesSource(zb))
             @test_throws ArgumentError Arrow.Table(
                 source;
                 scan=Tables.Scan(filter=Tables.OpNode(:custom, Any[]), validate=false),
@@ -827,8 +837,7 @@ end
             ios = IOBuffer()
             Arrow.write(ios, (l=rows,); file=false)
             sbb = take!(ios)
-            for src in
-                (Arrow.Table(fbb), Arrow.Table(sbb), Arrow.Table(Arrow.RangedSource(fbb)))
+            for src in (Arrow.Table(fbb), Arrow.Table(sbb), Arrow.Table(_BytesSource(fbb)))
                 for file in (true, false)
                     out = IOBuffer()
                     Arrow.write(out, src; file=file)
@@ -1213,7 +1222,7 @@ end
         @test isequal(Arrow.Table(bytes).x, [missing, 7])
         @test eltype(Arrow.Table(bytes).x) === Union{Missing,Int64}
         @test isequal(Arrow.Table(bytes; scan=Tables.Scan()).x, [missing, 7])
-        for handle in (Arrow.readfile(bytes), Arrow.RangedFile(Arrow.RangedSource(bytes)))
+        for handle in (Arrow.readfile(bytes), Arrow.SourceFile(_BytesSource(bytes)))
             got = Tables.scan(handle, Tables.Scan())
             @test isequal(got.x, [missing, 7])
             @test eltype(got.x) === Union{Missing,Int64}
@@ -1227,7 +1236,7 @@ end
         sch2 = AC.Schema([ref])
         bytes2 = Arrow.writefile(sch2, AC.RecordBatch[AC.RecordBatch(sch2, [red], 2)])
         @test isequal(Arrow.Table(bytes2).r, [missing, 7])
-        for handle in (Arrow.readfile(bytes2), Arrow.RangedFile(Arrow.RangedSource(bytes2)))
+        for handle in (Arrow.readfile(bytes2), Arrow.SourceFile(_BytesSource(bytes2)))
             @test isequal(Tables.scan(handle, Tables.Scan()).r, [missing, 7])
         end
         # a dictionary column: a null-free pool under a non-nullable field is

@@ -36,8 +36,10 @@ scope of every layer.
 | `src/ipc_read.jl` | Checked IPC stream framing, resource limits, metadata-to-Core mapping, dictionary state, one registry-driven decoder, per-buffer decompression |
 | `src/ipc_write.jl` | The write half over the same registry: Core-to-metadata mapping, one generic registry-driven encoder, replacement-on-change dictionary batches, per-buffer compression, the file format (Block index + Footer), and the lazy random-access `ArrowFile` reader |
 | `src/cdata.jl` | C data and C stream interfaces both directions: zero-copy ownership, move semantics, exactly-once release, field and schema metadata transport |
-| `src/scan.jl` | `Tables.Scan` pushdown over the file format, sparse byte-range reads (`RangedSource`/`RangedFile`), embedded per-batch statistics |
+| `src/source.jl` | The `AbstractArrowSource` byte-range source interface (`sourcelength`, `readrange`, `readranges`) |
+| `src/scan.jl` | `Tables.Scan` pushdown over the file format, sparse byte-range reads over a source (`SourceFile`), embedded per-batch statistics |
 | `src/table.jl`, `src/write.jl` | The facade |
+| `ext/ArrowCloudStoreExt.jl` | CloudStore.jl objects as sources: HTTP `Range` reads, concurrent per planned range |
 | `src/ArrowStrings/` | ArrowStrings.jl — the shared inline-else-view string representation (`ArrowString`, `ArrowStringVector` = Utf8View memory); a separate package, registered on its own like ArrowTypes, that Arrow depends on through a `[sources]` path entry until its first release |
 | `src/ArrowTypes/` | ArrowTypes.jl — the custom-type interface package (not used by 3.0 yet) |
 | `test/` | Core unit tests, facade tests, the four adapter acceptance batteries, the frozen 2.x-written fixtures, the `--trim=safe` gate |
@@ -247,13 +249,14 @@ filter-referenced columns, prunes whole batches through the embedded
 statistics (one-sided: a pruned batch is provably empty; the filter always
 stays in the residual), and consumes `limit`/`offset` exactly when no filter
 poisons the window. Projection, filtering, renames, and type conversions
-are the generic `Tables.scan` executor's over the returned residual. `RangedFile` runs the same
-plan over a byte-range fetcher: it uses the Footer as its sole schema
-authority, validates the full Block index and the complete metadata plan for
-every statistics-surviving record before requesting a body range, and
-requests per-buffer body ranges for exactly the decode set, coalesced under
-`coalesce_gap`. It does not parse or cross-check the leading schema message
-or the optional EOS marker; tail reads and coalescing may physically
+are the generic `Tables.scan` executor's over the returned residual. `SourceFile` runs the same
+plan over an `AbstractArrowSource`: it uses the Footer (from one cached
+tail read) as its sole schema authority, validates the full Block index and
+the complete metadata plan for every statistics-surviving record before
+requesting a body range, and requests per-buffer body ranges for exactly
+the decode set, coalesced under `coalesce_gap`. It does not fetch the
+leading magic, parse or cross-check the leading schema message, or inspect
+the optional EOS marker; tail reads and coalescing may physically
 over-read any unrequested bytes. Embedded batch statistics use the official
 Arrow statistics value layout under the `JuliaArrow:batch_statistics.v1`
 placement key (placement is scoped out of the upstream spec) and are

@@ -16,8 +16,8 @@
 
 # =============================================================================
 # Tables.Scan pushdown over the IPC file adapter, and — further down — the
-# byte-range fetch protocol (`RangedFile`/`RangedSource`) over the same
-# bound column set. Design notes: docs/dev/DESIGN-scan-ranges-trim.md.
+# byte-range fetch protocol (`SourceFile` over an `AbstractArrowSource`) over
+# the same bound column set. Design notes: docs/dev/DESIGN-scan-ranges-trim.md.
 #
 # Pushdown semantics: the source consumes what it can PROVE and leaves exact
 # row evaluation to `Tables.scan`.
@@ -738,42 +738,89 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
 end
 
 # ===========================================================================
-# Byte-range reads — RangedSource{F}, the planner, and sparse decode
+# Byte-range reads — SourceFile over an AbstractArrowSource, the planner,
+# and sparse decode
 # ===========================================================================
 
 """
-    RangedSource{F}
+    SourceFile(src::AbstractArrowSource; limits, tailbytes=65536, coalesce_gap=262144)
 
-The fetcher contract: `fetch(offset::Int64, len::Int64) ->
-Vector{UInt8}` over a remote or local object of known total `len`, offsets
-0-based. `F` is concrete per instantiation — in a trimmed app the fetch path
-is statically resolvable, which is why this is a parametric functor and not
-an abstract type. A transport (CloudStore, HTTP, …) only needs to construct
-one of these; `fetchranges` has a serial default it may override for
-concurrent range GETs.
+The scan-driven, fetch-minimal file handle over a byte-range source:
+`Tables.scan(sf, scan)` (and `Arrow.Table(src; scan=…)`, which builds one)
+runs the fetch protocol — the footer from one tail read, batch windowing
+from block metadata, dictionary bodies only for decode-set ids, and
+per-buffer body ranges for exactly the decode set, coalesced under
+`coalesce_gap`. The source's length is read once, at construction.
+
+Trust note, stated loudly: the ranged reader treats the FOOTER as the sole
+schema authority — it does not fetch the leading magic, parse and
+cross-check the leading schema message, or inspect the optional EOS marker.
+The tail and coalesced requests may physically over-read unrequested bytes.
+The full Footer Block index and global features/message limit are checked
+up front. Per-record limits stay lazy; every surviving candidate's
+metadata-only plan is validated before any planned body range is requested.
 """
-struct RangedSource{F}
-    fetch::F
+struct SourceFile{S<:AbstractArrowSource}
+    src::S
     len::Int64
+    limits::Limits
+    tailbytes::Int64
+    coalesce_gap::Int64
+    # The last `tailbytes` of the object, read once and reused by every
+    # footer parse and format probe on this handle: `(bytes, tailstart)`.
+    tail::Base.RefValue{Union{Nothing,Tuple{Vector{UInt8},Int64}}}
+end
+function SourceFile(
+    src::AbstractArrowSource;
+    limits::Limits=Limits(),
+    tailbytes::Integer=65536,
+    coalesce_gap::Integer=262144,
+)
+    gap = Int64(coalesce_gap)
+    gap >= 0 || throw(ArgumentError("negative coalesce gap"))
+    len = Int64(sourcelength(src))
+    len >= 0 || throw(ValidationError("source reports a negative length"))
+    return SourceFile(
+        src,
+        len,
+        limits,
+        Int64(max(tailbytes, 32)),
+        gap,
+        Base.RefValue{Union{Nothing,Tuple{Vector{UInt8},Int64}}}(nothing),
+    )
 end
 
-RangedSource(bytes::Vector{UInt8}) =
-    RangedSource((off, len) -> bytes[(off + 1):(off + len)], Int64(length(bytes)))
+# The object's tail window (at most `tailbytes`, the whole object when it is
+# shorter), fetched on first use and cached on the handle.
+function _fetchtail(sf::SourceFile)
+    cached = sf.tail[]
+    cached === nothing || return cached
+    tailstart = max(Int64(0), sf.len - sf.tailbytes)
+    tail = _fetchexact(sf, tailstart, sf.len - tailstart)
+    sf.tail[] = (tail, tailstart)
+    return (tail, tailstart)
+end
 
-"""
-    fetchranges(src::RangedSource, ranges::Vector{NTuple{2,Int64}}) -> Vector{Vector{UInt8}}
+# Whether the object is an IPC FILE (trailing `ARROW1` magic) — a stream
+# object has no footer and is read whole instead of range-planned.
+function _isfilesource(sf::SourceFile)
+    tail, _ = _fetchtail(sf)
+    return length(tail) >= 6 && tail[(end - 5):end] == Vector{UInt8}(FILE_MAGIC)
+end
 
-One result vector per requested `(offset, len)`, in order. The default
-fetches serially through `src.fetch`; a transport overrides this method to
-issue the planned ranges concurrently.
-"""
-fetchranges(s::RangedSource, ranges::Vector{NTuple{2,Int64}}) =
-    Vector{UInt8}[_fetchexact(s, off, len) for (off, len) in ranges]
+# The whole object as bytes, reusing the cached tail for its final window.
+function _wholeobject(sf::SourceFile)
+    tail, tailstart = _fetchtail(sf)
+    tailstart == 0 && return tail
+    return vcat(_fetchexact(sf, Int64(0), tailstart), tail)
+end
 
-function _fetchexact(s::RangedSource, off::Int64, len::Int64)
-    (off >= 0 && len >= 0 && off <= s.len - len) ||
+# One exact range through the source, bounds-checked against the length
+# read at construction and length-checked on return.
+function _fetchexact(sf::SourceFile, off::Int64, len::Int64)
+    (off >= 0 && len >= 0 && off <= sf.len - len) ||
         throw(ValidationError("range fetch [$off, $len] escapes the object"))
-    bytes = s.fetch(off, len)
+    bytes = readrange(sf.src, off, len)
     length(bytes) == len ||
         throw(ValidationError("range fetch returned $(length(bytes)) bytes, expected $len"))
     return bytes
@@ -811,15 +858,17 @@ struct FetchedSpans
 end
 
 function _fetchspans(
-    src::RangedSource,
+    sf::SourceFile,
     ranges::Vector{NTuple{2,Int64}},
     gap::Int64;
     budget::Union{Nothing,AllocationBudget}=nothing,
     what::AbstractString="range fetch",
 )
     spans = _coalesce(ranges, gap)
+    all(s -> s[1] >= 0 && s[2] >= 0 && s[1] <= sf.len - s[2], spans) ||
+        throw(ValidationError("planned range escapes the object"))
     budget === nothing || foreach(s -> _charge!(budget, s[2], what), spans)
-    payloads = fetchranges(src, spans)
+    payloads = readranges(sf.src, spans)
     length(payloads) == length(spans) || throw(
         ValidationError(
             "range fetch returned $(length(payloads)) payloads, expected $(length(spans))",
@@ -919,54 +968,15 @@ function _parseblockmeta(
     return msg, version, header_type
 end
 
-"""
-    RangedFile(src::RangedSource; limits, tailbytes=65536, coalesce_gap=262144)
-
-The scan-driven, fetch-minimal file handle: `Tables.scan(rf, scan)` (and
-`Arrow.Table(rf; scan=…)`) runs the fetch protocol — the eight-byte head
-magic then the footer from the tail, batch windowing from block metadata,
-dictionary bodies only for decode-set ids, and per-buffer body ranges for
-exactly the decode set, coalesced under `coalesce_gap`.
-
-Trust note, stated loudly: the ranged reader treats the FOOTER as the sole
-schema authority — it does not parse and cross-check the leading schema
-message or inspect the optional EOS marker. Head, tail, and coalesced requests
-may physically over-read unrequested bytes. The full Footer Block index and
-global features/message limit are checked up front. Per-record limits stay
-lazy; every surviving candidate's metadata-only plan is validated before any
-planned body range is requested.
-"""
-struct RangedFile{F}
-    src::RangedSource{F}
-    limits::Limits
-    tailbytes::Int64
-    coalesce_gap::Int64
-end
-function RangedFile(
-    src::RangedSource;
-    limits::Limits=Limits(),
-    tailbytes::Integer=65536,
-    coalesce_gap::Integer=262144,
-)
-    gap = Int64(coalesce_gap)
-    gap >= 0 || throw(ArgumentError("negative coalesce gap"))
-    return RangedFile(src, limits, Int64(max(tailbytes, 32)), gap)
-end
-
 "Fetch and verify the ranged footer: schema, fields, blocks, id table."
-function _rangedfooter(rf::RangedFile, budget::AllocationBudget)
-    src = rf.src
-    limits = rf.limits
+function _rangedfooter(sf::SourceFile, budget::AllocationBudget)
+    limits = sf.limits
     _requirelittleendian()
     _validatelimits(limits)
-    L = src.len
+    L = sf.len
     L >= Int64(8 + 8 + 4 + 6) ||
         throw(ValidationError("file is too short to be an IPC file"))
-    head = _fetchexact(src, Int64(0), Int64(8))
-    head[1:6] == Vector{UInt8}(FILE_MAGIC) ||
-        throw(ValidationError("missing leading ARROW1 magic"))
-    tailstart = max(Int64(0), L - rf.tailbytes)
-    tail = _fetchexact(src, tailstart, L - tailstart)
+    tail, tailstart = _fetchtail(sf)
     tail[(end - 5):end] == Vector{UInt8}(FILE_MAGIC) ||
         throw(ValidationError("missing trailing ARROW1 magic"))
     footerlen = Int64(reinterpret(Int32, tail[(end - 9):(end - 6)])[1])
@@ -982,7 +992,7 @@ function _rangedfooter(rf::RangedFile, budget::AllocationBudget)
     footerbytes =
         footerstart >= tailstart ?
         tail[(footerstart - tailstart + 1):(footerstart - tailstart + footerlen)] :
-        _fetchexact(src, footerstart, footerlen)
+        _fetchexact(sf, footerstart, footerlen)
     version, features, dictblocks, recordblocks, reserve =
         verify_footer(footerbytes, limits, budget.left)
     _charge!(budget, reserve, "verified footer expansion")
@@ -1042,7 +1052,7 @@ graph, body-length cross-check), header kind, footer-version agreement,
 and compression rejection.
 """
 function _zerofieldblockcount(
-    rf::RangedFile,
+    sf::SourceFile,
     block::NTuple{3,Int64},
     version::Int16,
     fields::Vector{Field},
@@ -1050,36 +1060,35 @@ function _zerofieldblockcount(
 )
     _, metalen, bodylen = block
     declared = metalen - 8
-    0 < declared <= rf.limits.max_metadata_bytes || throw(
+    0 < declared <= sf.limits.max_metadata_bytes || throw(
         ValidationError(
-            "metadata length $declared outside (0, $(rf.limits.max_metadata_bytes)]",
+            "metadata length $declared outside (0, $(sf.limits.max_metadata_bytes)]",
         ),
     )
-    0 <= bodylen <= rf.limits.max_body_bytes || throw(
-        ValidationError("body length $bodylen outside [0, $(rf.limits.max_body_bytes)]"),
+    0 <= bodylen <= sf.limits.max_body_bytes || throw(
+        ValidationError("body length $bodylen outside [0, $(sf.limits.max_body_bytes)]"),
     )
     _charge!(budget, metalen, "metadata range fetch")
-    payload = _fetchexact(rf.src, block[1], metalen)
-    msg, v, header_type = _parseblockmeta(payload, block, rf.limits, budget)
+    payload = _fetchexact(sf, block[1], metalen)
+    msg, v, header_type = _parseblockmeta(payload, block, sf.limits, budget)
     header_type == UInt8(3) ||
         throw(ValidationError("footer record block is not a record batch"))
     v == version || throw(ValidationError("IPC metadata version changes within the file"))
     rejectexperimentalcompression(msg, v, header_type)
-    return _recordbatchmeta(msg.header::Meta.RecordBatch, fields, rf.limits, bodylen)
+    return _recordbatchmeta(msg.header::Meta.RecordBatch, fields, sf.limits, bodylen)
 end
 
-"Schema-only ranged read for the facade (the head magic + one tail fetch)."
-function rangedschema(rf::RangedFile)
-    budget = AllocationBudget(rf.limits.max_total_allocated_bytes)
-    ft = _rangedfooter(rf, budget)
+"Schema-only ranged read for the facade (one tail fetch)."
+function _sourceschema(sf::SourceFile)
+    budget = AllocationBudget(sf.limits.max_total_allocated_bytes)
+    ft = _rangedfooter(sf, budget)
     return ft.sch, ft.fields
 end
 
-function _applyscan(rf::RangedFile, scan::Tables.Scan)
-    src = rf.src
-    limits = rf.limits
+function _applyscan(sf::SourceFile, scan::Tables.Scan)
+    limits = sf.limits
     budget = AllocationBudget(limits.max_total_allocated_bytes)
-    ft = _rangedfooter(rf, budget)
+    ft = _rangedfooter(sf, budget)
     fields = ft.fields
     dictids = ft.dictids
     fielddictids = ft.fielddictids
@@ -1117,7 +1126,7 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
         keep = _zerofieldpredicate(scan.filter)
         n = _zerofieldwindow(
             (
-                _zerofieldblockcount(rf, block, version, fields, budget) for
+                _zerofieldblockcount(sf, block, version, fields, budget) for
                 block in recordblocks
             ),
             keep,
@@ -1176,9 +1185,9 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
         )
     end
     metaspans = _fetchspans(
-        src,
+        sf,
         NTuple{2,Int64}[(bl[1], bl[2]) for bl in metablocks],
-        rf.coalesce_gap;
+        sf.coalesce_gap;
         budget=budget,
         what="metadata range fetch",
     )
@@ -1261,12 +1270,12 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
     try
         if !isempty(wanted_dict)
             bodyspans = _fetchspans(
-                src,
+                sf,
                 NTuple{2,Int64}[
                     (dictblocks[i][1] + dictblocks[i][2], dictblocks[i][3]) for
                     i in wanted_dict
                 ],
-                rf.coalesce_gap,
+                sf.coalesce_gap,
             )
             for i in wanted_dict
                 block = dictblocks[i]
@@ -1347,7 +1356,7 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
                 NTuple{2,Int64}[(bodystart + off, len) for (off, len) in wants],
             )
         end
-        bodyspans = _fetchspans(src, bodyranges, rf.coalesce_gap)
+        bodyspans = _fetchspans(sf, bodyranges, sf.coalesce_gap)
 
         parts = Dict{Int,Vector{Any}}(idx => Any[] for idx in decodeidx)
         outrows = 0
@@ -1398,7 +1407,7 @@ end
 
 """
     Tables.scan(f::ArrowFile, scan)
-    Tables.scan(rf::RangedFile, scan)
+    Tables.scan(sf::SourceFile, scan)
 
 Scan an Arrow file handle: push down what the file format can prove
 (`_applyscan` — column pruning, statistics batch pruning, exact
@@ -1406,7 +1415,7 @@ limit/offset windows) and hand the residual to the generic `Tables.scan`
 executor, whose semantics the pushdown must agree with. `Arrow.Table(source;
 scan=…)` is the public entry over the same path.
 """
-function Tables.scan(f::Union{ArrowFile,RangedFile}, scan::Tables.Scan)
+function Tables.scan(f::Union{ArrowFile,SourceFile}, scan::Tables.Scan)
     table, residual = _applyscan(f, scan)
     return Tables.scan(table, residual)
 end
