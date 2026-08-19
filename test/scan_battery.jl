@@ -15,7 +15,7 @@
 # limitations under the License.
 
 # ---------------------------------------------------------------------------
-# Acceptance: differential against Tables.finish, plus skip proofs
+# Acceptance: differential against the generic Tables.scan executor, plus skip proofs
 # ---------------------------------------------------------------------------
 
 function _fulltable(f::ArrowFile)
@@ -183,23 +183,23 @@ function _scan_main()
     ]
     for scan in scans
         got = Tables.scan(af, scan)
-        want = Tables.finish(full, scan)
+        want = Tables.scan(full, scan)
         @assert _tables_equal(got, want) sprint(show, scan)
     end
-    println("differential scans match Tables.finish over the full table ✓")
+    println("differential scans match Tables.scan over the full table ✓")
 
     # Residual semantics: window consumption vs filter poisoning.
-    _, r1 = Tables.apply(af, Tables.Scan(select=(:ints,), offset=4, limit=3))
+    _, r1 = _applyscan(af, Tables.Scan(select=(:ints,), offset=4, limit=3))
     @assert r1.limit === nothing && r1.offset == 0 && r1.select !== nothing
-    _, r2 = Tables.apply(af, Tables.Scan(filter=Tables.col(:ints) > 2, limit=2))
+    _, r2 = _applyscan(af, Tables.Scan(filter=Tables.col(:ints) > 2, limit=2))
     @assert r2.limit == 2 && r2.filter !== nothing
     println("limit/offset consume exactly; filters poison the window ✓")
 
-    # Extreme-but-valid windows: Tables.finish saturates, so the whole
+    # Extreme-but-valid windows: Tables.scan saturates, so the whole
     # pipeline agrees on the empty result whether the window is consumed at
     # the source or residualized.
     extreme = Tables.Scan(select=(:ints,), offset=typemax(Int), limit=typemax(Int))
-    extremewant = Tables.finish(full, extreme)
+    extremewant = Tables.scan(full, extreme)
     for sourcefile in (af, RangedFile(RangedSource(filebytes)))
         got = Tables.scan(sourcefile, extreme)
         @assert _tables_equal(got, extremewant)
@@ -255,7 +255,7 @@ function _scan_main()
         [BufferSlice(), AC._databuffer(Int64[7])]; nullcount=0)
     dupbytes = writefile(dupsch, [AC.RecordBatch(dupsch, ArrayData[dupcol(), dupcol()], 1)])
     dupaf = readfile(dupbytes)
-    @assert _rejects(() -> Tables.apply(dupaf, Tables.Scan(select=(1,))))
+    @assert _rejects(() -> _applyscan(dupaf, Tables.Scan(select=(1,))))
     println("duplicate-name scans refuse cleanly (facade boundary) ✓")
 
     # Window row counts are metadata, but they are not trusted until the
@@ -397,7 +397,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     for scan in scans
         log, src = countingsource(filebytes)
         got = Tables.scan(RangedFile(src), scan)
-        want = Tables.finish(full, scan)
+        want = Tables.scan(full, scan)
         @assert _tables_equal(got, want) sprint(show, scan)
     end
     println("ranged reads are differentially equal to whole-file reads ✓")
@@ -530,7 +530,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     logzero, srczero = countingsource(filebytes)
     gotzero = Tables.scan(RangedFile(srczero; coalesce_gap=0),
         Tables.Scan(select=(:ints, :strs)))
-    want = Tables.finish(full, Tables.Scan(select=(:ints, :strs)))
+    want = Tables.scan(full, Tables.Scan(select=(:ints, :strs)))
     @assert _tables_equal(gotbig, want) && _tables_equal(gotzero, want)
     @assert logbig.requests < logzero.requests
     @assert logzero.bytes <= logbig.bytes
@@ -859,14 +859,14 @@ end
         Tables.Scan(filter=Tables.colne(Tables.col(:x), 3)),
     ]
     for scan in prunescans
-        want = Tables.finish(sfull, scan)
+        want = Tables.scan(sfull, scan)
         @assert _tables_equal(Tables.scan(saf, scan), want) sprint(show, scan)
         @assert _tables_equal(
             Tables.scan(RangedFile(RangedSource(copy(sbytes))), scan), want) sprint(show, scan)
     end
     println("pruned scans stay differentially exact (whole-file + ranged) ✓")
 
-    # Float pruning must use the same IEEE operators as Tables.finish.
+    # Float pruning must use the same IEEE operators as Tables.scan.
     fsource = readstream(_fixture2x("float-zero-signs-nan") do
         fio = IOBuffer()
         Arrow.write(fio, Tables.partitioner([
@@ -889,7 +889,7 @@ end
         Tables.Scan(filter=Tables.colne(Tables.col(:x), 0.0)),
         Tables.Scan(filter=Tables.colne(Tables.col(:x), -0.0))]
     for scan in floatscans
-        want = Tables.finish(ffull, scan)
+        want = Tables.scan(ffull, scan)
         @assert _tables_equal(Tables.scan(faf, scan), want)
         @assert _tables_equal(Tables.scan(RangedFile(RangedSource(fbytes)), scan), want)
     end

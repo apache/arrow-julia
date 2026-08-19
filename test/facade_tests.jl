@@ -210,7 +210,7 @@ end
         sio = IOBuffer(); Arrow.write(sio, data; file=false)
         scan = Tables.Scan(filter=Tables.coleq(Tables.col(:date),
             Date(2024, 1, 3)))
-        want = Tables.finish(data, scan)
+        want = Tables.scan(data, scan)
         for bytes in (take!(fio), take!(sio))
             got = Arrow.Table(bytes; scan=scan)
             @test got.x == want.x
@@ -322,7 +322,7 @@ end
                 DateTime(1970, 1, 2, 12))),
         ]
         for scan in cases
-            want = Tables.finish(data, scan)
+            want = Tables.scan(data, scan)
             for bytes in (fb, sb)
                 got = Arrow.Table(bytes; scan=scan)
                 @test isequal(got.x, want.x)
@@ -435,7 +435,7 @@ end
             Tables.Scan(filter=Tables.coleq(Tables.col(:us),
                 DateTime(1970, 1, 1, 0, 0, 1))),
             Tables.Scan(filter=Tables.coleq(Tables.col(:us), 2_000_000)))
-            want = Tables.finish(data, scan)
+            want = Tables.scan(data, scan)
             got = Arrow.Table(bytes; scan=scan)
             @test isequal(got.us, want.us)
         end
@@ -447,7 +447,7 @@ end
             Tables.Scan(filter=Tables.coleq(Tables.col(:d),
                 Date(6_000_000, 1, 1))),
             Tables.Scan(filter=Tables.coleq(Tables.col(:s), Month(1))))
-            want = Tables.finish(pdata, scan)
+            want = Tables.scan(pdata, scan)
             got = Arrow.Table(pb; scan=scan)
             @test Tables.rowcount(got) == Tables.rowcount(Tables.columns(want))
         end
@@ -485,7 +485,7 @@ end
             s=Union{Missing,String}["a", "b"]))
         fb = take!(io)
         # nullable source, no observed missing: supertype/no-op overrides
-        # keep the DECLARED element type, exactly like Tables.finish.
+        # keep the DECLARED element type, exactly like Tables.scan.
         t = Arrow.Table(fb; scan=Tables.Scan(select=(
             :x => Int64, :s => AbstractString)))
         @test eltype(t.x) == Union{Missing,Int64}

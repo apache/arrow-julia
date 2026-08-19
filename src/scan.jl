@@ -20,7 +20,7 @@
 # bound column set. Design notes: docs/dev/DESIGN-scan-ranges-trim.md.
 #
 # Pushdown semantics: the source consumes what it can PROVE and leaves exact
-# row evaluation to `Tables.finish`.
+# row evaluation to `Tables.scan`.
 #
 #   * the decode set is (selected ∪ filter-referenced) columns — everything
 #     else is SKIPPED by `skipfield!`, a registry walk that consumes the
@@ -31,7 +31,7 @@
 #     EXACTLY when no filter poisons the window: `RecordBatch.length` is
 #     wire metadata, so batches outside the window are never decoded;
 #   * the returned table keeps SOURCE names over the decode set and the
-#     residual keeps `select` and `filter` — `Tables.finish` filters,
+#     residual keeps `select` and `filter` — `Tables.scan` filters,
 #     projects, renames, and converts. This is the only composition that
 #     stays correct when the filter references unselected columns.
 # =============================================================================
@@ -522,7 +522,7 @@ function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool})
 end
 
 # ---------------------------------------------------------------------------
-# Tables.apply over a whole file
+# Scan pushdown over a whole file
 # ---------------------------------------------------------------------------
 
 """
@@ -552,13 +552,13 @@ function _batchwindow(rowcounts::Vector{Int64}, offset::Int, limit::Union{Nothin
     return window
 end
 
-# The current Tables.finish authority forms `offset + 1` and, with a limit,
+# The Tables.scan authority forms `offset + 1` and, with a limit,
 # `offset + limit` in Int arithmetic. Keep an overflowing request residual so
 # both sides of the apply/finish contract have the same observable result.
 _canconsumewindow(scan::Tables.Scan) = scan.offset < typemax(Int) &&
     (scan.limit === nothing || scan.limit <= typemax(Int) - scan.offset)
 
-function Tables.apply(f::ArrowFile, scan::Tables.Scan)
+function _applyscan(f::ArrowFile, scan::Tables.Scan)
     names = Symbol[Symbol(fld.name) for fld in f.fields]
     allunique(names) || throw(ValidationError(
         "scan pushdown over duplicate column names is not supported; read the file without a scan"))
@@ -815,7 +815,7 @@ end
 """
     RangedFile(src::RangedSource; limits, tailbytes=65536, coalesce_gap=262144)
 
-The scan-driven, fetch-minimal file handle: `Tables.apply(rf, scan)` runs
+The scan-driven, fetch-minimal file handle: `Tables.scan(rf, scan)` runs
 the fetch protocol — tail-first footer, batch windowing from block
 metadata, dictionary bodies only for decode-set ids, and per-buffer body
 ranges for exactly the decode set, coalesced under `coalesce_gap`.
@@ -930,7 +930,7 @@ function rangedschema(rf::RangedFile)
     return ft.sch, ft.fields
 end
 
-function Tables.apply(rf::RangedFile, scan::Tables.Scan)
+function _applyscan(rf::RangedFile, scan::Tables.Scan)
     src = rf.src
     limits = rf.limits
     budget = AllocationBudget(limits.max_total_allocated_bytes)
@@ -1170,6 +1170,21 @@ function Tables.apply(rf::RangedFile, scan::Tables.Scan)
     finally
         close(state)
     end
+end
+
+"""
+    Tables.scan(f::ArrowFile, scan)
+    Tables.scan(rf::RangedFile, scan)
+
+Scan an Arrow file handle: push down what the file format can prove
+(`_applyscan` — column pruning, statistics batch pruning, exact
+limit/offset windows) and hand the residual to the generic `Tables.scan`
+executor, whose semantics the pushdown must agree with. `Arrow.Table(source;
+scan=…)` is the public entry over the same path.
+"""
+function Tables.scan(f::Union{ArrowFile,RangedFile}, scan::Tables.Scan)
+    table, residual = _applyscan(f, scan)
+    return Tables.scan(table, residual)
 end
 
 # ===========================================================================

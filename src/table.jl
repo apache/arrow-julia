@@ -483,7 +483,7 @@ function Table(source; scan::Union{Nothing,Tables.Scan}=nothing,
             names = Symbol[Symbol(f.name) for f in fields]
             raw = NamedTuple{Tuple(names)}(Tuple(_rawcolumn(src, i)
                 for i = 1:length(fields)))
-            got = Tables.finish(raw, pushscan)
+            got = Tables.scan(raw, pushscan)
         end
         return _wrapscanned(got, _tableschema(src), fields, scan;
             regions=regions)
@@ -498,7 +498,7 @@ end
 "Evaluate a scan in the PUBLIC value domain over a converted Table."
 function _publicscan(full::Table, schema, sourcefields, scan, regions)
     if isempty(Tables.columnnames(full))
-        # No columns can carry the count through Tables.finish. Binding is
+        # No columns can carry the count through Tables.scan. Binding is
         # STRUCTURAL and always runs — unsupported predicate nodes reject
         # regardless of `validate`, exactly as Tables.bind rules; validate
         # only opts out of unmatched column references.
@@ -514,12 +514,10 @@ function _publicscan(full::Table, schema, sourcefields, scan, regions)
 
     # Row count survives an empty projection: window+filter first over the
     # full column set, then project.
-    counted = Tables.finish(full,
-        Tables.Scan(nothing, scan.filter, scan.limit, scan.offset,
-            scan.validate))
+    counted = Tables.scan(full, Tables.Scan(scan; select=nothing))
     n = Base.Int(Tables.rowcount(Tables.columns(counted)))
-    got = Tables.finish(counted,
-        Tables.Scan(scan.select, nothing, nothing, 0, scan.validate))
+    got = Tables.scan(counted,
+        Tables.Scan(scan; filter=nothing, limit=nothing, offset=0))
     cols = Tables.columns(got)
     names = collect(Symbol, Tables.columnnames(cols))
     columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
@@ -678,7 +676,7 @@ function _wrapscanned(got, schema, sourcefields, scan;
             converted = _postconvert(f.type, columns[i])
             # Public type overrides run HERE, after facade conversion —
             # they are public-domain requests, never storage casts, and
-            # they preserve missing exactly as Tables.finish does.
+            # they preserve missing exactly as Tables.scan does.
             T = _facadeeltype(f)
             base = T === Any ? map(identity, converted) :
                 collect(T, converted)
@@ -694,7 +692,7 @@ end
 
 _scanrowcount(got) = Base.Int(Tables.rowcount(Tables.columns(got)))
 
-"Convert a column to an override type with Tables.finish's exact rules."
+"Convert a column to an override type with Tables.scan's exact rules."
 function _applyoverride(T, col)
     # finish's no-op rule: a column already accepted by Union{T,Missing}
     # passes through untouched (supertype overrides included).
