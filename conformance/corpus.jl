@@ -17,7 +17,7 @@
 # =============================================================================
 # Corpus conformance: the apache/arrow-testing integration gold files.
 #
-#     julia --project=conformance conformance/run.jl corpus      # in the conformance image
+#     julia conformance/run.jl corpus      # in the conformance image
 #     julia --project=conformance conformance/corpus.jl [corpus-dir]   # or directly, given a checkout
 #
 # For every gold family (a `.json.gz` with sibling `.stream` and

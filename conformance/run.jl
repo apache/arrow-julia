@@ -17,20 +17,28 @@
 # =============================================================================
 # The conformance driver: run the suites inside the conformance image.
 #
-#     julia --project=conformance conformance/run.jl [suite ...] [--rebuild]
+#     julia conformance/run.jl [suite ...] [--rebuild]
 #
 # Suites: `corpus` (arrow-testing gold files), `oracle` (our IPC bytes
 # through pyarrow and nanoarrow), `cdata` (C Data / C Stream through an
 # in-process pyarrow); no argument runs all three. Docker is the only host
-# requirement: the image (conformance/Dockerfile) carries Julia, the oracle
+# requirement (plus network the first time, to fetch Harbor.jl and build the
+# image): the image (conformance/Dockerfile) carries Julia, the oracle
 # Python, the gold corpus, and Tables.jl's scan branch, and the repository is
 # bind-mounted at /work. The image is built once (`--rebuild` forces it) and
 # a named volume keeps the Julia depot — precompilation caches — between
 # runs. Harbor.jl manages the container; suite output streams live.
 #
+# This script needs no `--project`: it activates and instantiates its own
+# host environment (conformance/host/, Harbor only). conformance/Project.toml
+# is the IN-CONTAINER suite environment and is prepared inside the image.
+#
 # Exit code: 0 iff every requested suite passed.
 # =============================================================================
 
+import Pkg
+Pkg.activate(joinpath(@__DIR__, "host"); io=devnull)
+Pkg.instantiate(; io=devnull)
 using Harbor
 
 const IMAGE = "arrow-julia-conformance:latest"

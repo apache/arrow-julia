@@ -17,7 +17,7 @@
 # =============================================================================
 # Oracle round-trips: OUR IPC bytes through pyarrow and nanoarrow.
 #
-#     julia --project=conformance conformance/run.jl oracle      # in the conformance image
+#     julia conformance/run.jl oracle      # in the conformance image
 #
 # The gold corpus proves us against files C++ wrote years ago; this suite
 # proves us against implementations running today. The corpus supplies the
@@ -52,7 +52,7 @@ include(joinpath(@__DIR__, "corpus.jl"))
 function _oraclepython()
     py = get(ENV, "ARROW_ORACLE_PYTHON", "")
     isempty(py) && error("ARROW_ORACLE_PYTHON is not set: run this suite through " *
-        "`julia --project=conformance conformance/run.jl oracle` (the conformance " *
+        "`julia conformance/run.jl oracle` (the conformance " *
         "image), or point ARROW_ORACLE_PYTHON at a Python with pyarrow and nanoarrow")
     return py
 end

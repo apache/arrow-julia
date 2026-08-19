@@ -18,7 +18,7 @@
 # C Data / C Stream oracle: OUR C-interface structures through pyarrow, in
 # one process, over the whole gold data matrix.
 #
-#     julia --project=conformance conformance/run.jl cdata [corpus-dir]
+#     julia conformance/run.jl cdata [corpus-dir]
 #
 # `oracle.jl` proves our IPC BYTES against pyarrow and nanoarrow. This suite
 # proves our C DATA INTERFACE and C STREAM INTERFACE the same way: pyarrow
@@ -63,7 +63,7 @@
 # that interpreter (PythonCall reads its interpreter at load, so the parent
 # never loads it):
 #
-#     julia --project=conformance conformance/run.jl cdata     # in the image
+#     julia conformance/run.jl cdata     # in the image
 # =============================================================================
 
 const _CDATA_ORACLE_CHILD = "--child"
@@ -73,7 +73,7 @@ const _CDATA_ORACLE_CHILD = "--child"
 function _oracle_python()
     py = get(ENV, "ARROW_CDATA_ORACLE_PYTHON", "")
     isempty(py) && error("ARROW_CDATA_ORACLE_PYTHON is not set: run this suite " *
-        "through `julia --project=conformance conformance/run.jl cdata` (the " *
+        "through `julia conformance/run.jl cdata` (the " *
         "conformance image), or point ARROW_CDATA_ORACLE_PYTHON at a Python with pyarrow")
     return py
 end

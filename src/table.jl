@@ -183,10 +183,9 @@ function _postconvert(t::AC.DurationType, col)
 end
 _postconvert(t::AC.DictionaryType, col) = _postconvert(t.valuetype, col)
 
-# The Julia element type a Field materializes as at the facade — a CLOSED
-# mapping from the descriptor (the schema authority), never from observed
-# values: an all-missing nullable Utf8 column is Vector{Union{Missing,
-# String}}, a zero-row Int64 column is Vector{Int64}.
+# The public element type of the SCALAR layouts the facade converts (Dates)
+# or passes through; `_declaredbasetype` completes it for every layout and
+# `_declaredeltype` is the Field-aware rule the facade materializes with.
 function _facadebasetype(t::AC.ArrowType)
     t isa AC.DateType &&
         return t.unit == AC.DAY ? Dates.Date : Dates.DateTime
@@ -208,8 +207,25 @@ function _facadebasetype(t::AC.ArrowType)
     (t isa AC.ViewType && t.utf8) && return String
     return Any
 end
-_facadeeltype(f::AC.Field) = f.nullable ?
-    Union{Missing,_facadebasetype(f.type)} : _facadebasetype(f.type)
+
+# The public element type of a materialized column: the Field's declared
+# domain (`_declaredeltype(f, true)` — closed for scalars, the row container
+# for composites, transparent through dictionary/REE, the children's join
+# for unions), widened with `Missing` only when the DATA holds nulls a
+# non-nullable declaration did not admit. Field nullability is advisory at
+# the reader tier (the semantic validation IPC applies accepts such data,
+# as the reference implementation does), so those columns READ, as
+# missing-capable, rather than throw. `Any` stays the narrowing path.
+function _publictype(f::AC.Field, col)
+    T = _declaredeltype(f, true)
+    (T === Any || Missing <: T) && return T
+    (eltype(col) >: Missing && any(x -> x === missing, col)) || return T
+    return Union{Missing,T}
+end
+function _publiccolumn(f::AC.Field, converted)
+    T = _publictype(f, converted)
+    return T === Any ? map(identity, converted) : collect(T, converted)
+end
 
 # A claim the R5 typed path resolves without boxing: concrete scalars,
 # their Missing unions, and Vectors thereof. `Vector{Any}` (lists of
@@ -250,17 +266,36 @@ facade's Dates conversion happens after, in `_postconvert`.
 function _batchcolumn(f::AC.Field, d::AC.ArrayData)
     T = _declaredeltype(f, false)
     (_closedclaim(T) && _typedroutable(f)) || return AC.materialize(f, d)
+    # Field nullability is advisory: the batch may hold nulls under a
+    # non-nullable declaration (the semantic tier accepts that, as the
+    # reference implementation does). Admit them in the claim rather than
+    # refuse the read; conforming batches keep the Missing-free fast path.
+    (Missing <: T || !_hasnulls(f, d)) || (T = Union{Missing,T})
     return AC.materialize(T, f, d)
 end
 
+# Whether the typed claim for `f` would meet a null in `d`: physical nulls
+# at this level, plus — through the wrappers the claim is transparent to —
+# the REE values child's and a dictionary pool's.
+function _hasnulls(f::AC.Field, d::AC.ArrayData)
+    t = d.type
+    if t isa AC.RunEndEncodedType && length(d.children) == 2 && length(f.children) == 2
+        return _hasnulls(f.children[2], d.children[2])
+    end
+    if t isa AC.DictionaryType && d.dictionary !== nothing
+        return AC.nullcount(d) > 0 ||
+            _hasnulls(AC.dictvaluefield(f, t), d.dictionary)
+    end
+    return AC.nullcount(d) > 0
+end
+
 function _facadecolumn(f::AC.Field, parts::Vector)
-    T = _facadeeltype(f)
-    isempty(parts) && return T === Any ? Any[] : Vector{T}()
+    if isempty(parts)
+        T = _declaredeltype(f, true)
+        return T === Any ? Any[] : Vector{T}()
+    end
     col = length(parts) == 1 ? parts[1] : reduce(vcat, parts)
-    converted = _postconvert(f.type, col)
-    # Dynamic materialize returns Vector{Any}; the FIELD decides the public
-    # eltype (closed claims never reach this branch — see _batchcolumn).
-    return T === Any ? map(identity, converted) : collect(T, converted)
+    return _publiccolumn(f, _postconvert(f.type, col))
 end
 
 # --- scan value domain -------------------------------------------------------
@@ -594,7 +629,13 @@ function _declaredeltype(f::AC.Field, converted::Bool=true)
         return _declaredeltype(f.children[2], false)
     end
     if t isa AC.DictionaryType
-        D0 = _declaredeltype(AC.dictvaluefield(f, t), converted)
+        # The schema carries ONE nullability flag for a dictionary column;
+        # `dictvaluefield` marks the pool field nullable because the format
+        # cannot say otherwise. That is not a declaration: strip it here and
+        # let a pool that actually holds nulls widen the public type through
+        # the data check (`_publictype`/`_hasnulls`), like any other null a
+        # non-nullable declaration did not admit.
+        D0 = Base.nonmissingtype(_declaredeltype(AC.dictvaluefield(f, t), converted))
         return f.nullable ? Union{Missing,D0} : D0
     end
     if t isa AC.UnionType && !isempty(f.children)
@@ -673,13 +714,10 @@ function _wrapscanned(got, schema, sourcefields, scan;
             "selection $(length(b.columns))"))
         for (i, bc) in enumerate(b.columns)
             f = sourcefields[bc.index]
-            converted = _postconvert(f.type, columns[i])
             # Public type overrides run HERE, after facade conversion —
             # they are public-domain requests, never storage casts, and
             # they preserve missing exactly as Tables.scan does.
-            T = _facadeeltype(f)
-            base = T === Any ? map(identity, converted) :
-                collect(T, converted)
+            base = _publiccolumn(f, _postconvert(f.type, columns[i]))
             push!(precols, base)
             columns[i] = bc.type === nothing ? base :
                 _applyoverride(bc.type, base)
@@ -715,13 +753,18 @@ end
     Arrow.Stream(source; mmap=true)
 
 Iterate an IPC source one record batch at a time; each iteration yields an
-[`Arrow.Table`](@ref) for that batch, so a consumer that processes and drops
-batches holds one batch of columns at a time. Satisfies `Tables.partitions`
-(each batch is one partition), so partition-aware sinks — including
-`Arrow.write`, which writes one record batch per partition — see the source
-batch structure. Note that `Arrow.write` itself is whole-buffer: it
-materializes every partition before writing, so it does not by itself bound
-memory for a source larger than RAM.
+[`Arrow.Table`](@ref) for that batch. Satisfies `Tables.partitions` (each
+batch is one partition), so partition-aware sinks — including `Arrow.write`,
+which writes one record batch per partition — see the source batch structure.
+
+Memory: over a memory-mapped FILE-format path (the default for a path) the
+batches are decoded lazily from the mapping, one per iteration, so a
+consumer that processes and drops batches holds one batch of columns at a
+time (plus the file's dictionaries). Every other source — the STREAM format,
+and any `IO` or byte-vector input — is read to the end and fully decoded
+when the `Stream` is constructed; iteration then only walks the decoded
+batches. `Arrow.write` itself is whole-buffer (it materializes every
+partition before writing), so it does not bound memory either.
 """
 struct Stream
     src::Union{IPCStream,ArrowFile}

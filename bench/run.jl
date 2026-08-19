@@ -64,7 +64,7 @@ function main(workdir::String)
 
     pyout = joinpath(workdir, "pyarrow.jsonl")
     # The pyarrow leg runs the conformance image's oracle interpreter
-    # (build it once with `julia --project=conformance conformance/run.jl`).
+    # (build it once with `julia conformance/run.jl`).
     havedocker = Sys.which("docker") !== nothing && try
         success(pipeline(
             `docker image inspect arrow-julia-conformance:latest`;

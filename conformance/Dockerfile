@@ -63,7 +63,7 @@ ENV ARROW_TESTING_DIR=/opt/arrow-testing \
 # fetches any delta), plus PythonCall precompiled against the oracle Python.
 RUN julia -e 'using Pkg; Pkg.activate("/opt/warm"); \
     Pkg.add(["CodecLz4", "CodecZstd", "DataAPI", "EnumX", "TranscodingStreams", \
-             "JSON", "CodecZlib", "PooledArrays", "PythonCall", "Harbor"]); \
+             "JSON", "CodecZlib", "PooledArrays", "PythonCall"]); \
     Pkg.develop(path="/opt/Tables"); Pkg.precompile()'
 
 # The suite environment is created from the mounted repository's
