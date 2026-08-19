@@ -415,8 +415,10 @@ type descriptors are runtime values, layout dispatch goes through closed
 import/export, and the typed accessors `Arrow.ArrowCore.materialize(::Type{T},
 field, data)`) are statically resolvable. The repository's
 `test/trim_compile_tests.jl` gate holds that at zero verifier errors and
-warnings. The dynamic facade conveniences (property access on `Arrow.Table`,
-`NamedTuple` rows) are not part of that guarantee.
+warnings. Arrow.jl itself supports Julia 1.10 and later; JuliaC's `--trim`
+needs Julia 1.12, so the gate runs only there. The dynamic facade
+conveniences (property access on `Arrow.Table`, `NamedTuple` rows) are not
+part of that guarantee.
 
 ## Differences from Arrow.jl 2.x
 

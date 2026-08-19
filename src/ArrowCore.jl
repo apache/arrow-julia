@@ -244,6 +244,24 @@ function heapregion(v::Vector{T}) where {T}
     return OwnerRegion(Ptr{UInt8}(pointer(v)), sizeof(v); root=v)
 end
 
+# `_mmaproot(arr)`: the object Mmap registered its unmap finalizer on — the
+# array's backing `Memory` from Julia 1.11 (`finalize(arr)` is then a
+# no-op), the array itself before. The release cell targets that object so
+# `close!` truly unmaps now.
+@static if VERSION >= v"1.11"
+    _mmaproot(arr::Vector{UInt8}) = arr.ref.mem
+    function _release_mmap(p::Ptr{Cvoid})::Cvoid
+        finalize(unsafe_pointer_to_objref(p)::Memory{UInt8})
+        return nothing
+    end
+else
+    _mmaproot(arr::Vector{UInt8}) = arr
+    function _release_mmap(p::Ptr{Cvoid})::Cvoid
+        finalize(unsafe_pointer_to_objref(p)::Vector{UInt8})
+        return nothing
+    end
+end
+
 """
     mmapregion(path) -> OwnerRegion
 
@@ -256,11 +274,6 @@ while the region or any cached validation result remains in use: a shared
 mapping cannot keep a semantic certificate valid when another process
 changes its bytes, and truncation can make an in-range load fault.
 """
-function _release_mmap(p::Ptr{Cvoid})::Cvoid
-    finalize(unsafe_pointer_to_objref(p)::Memory{UInt8})
-    return nothing
-end
-
 function mmapregion(path::AbstractString)
     io = open(path, "r")
     arr = try
@@ -270,11 +283,8 @@ function mmapregion(path::AbstractString)
         close(io)
     end
     isempty(arr) && throw(ArgumentError("cannot map empty file: $path"))
-    # The unmap finalizer is registered on the array's backing Memory, not
-    # on the Vector wrapper: `finalize(arr)` would be a no-op. The cell's
-    # release targets the Memory so close! truly unmaps now.
     cell = ReleaseCell(@cfunction(_release_mmap, Cvoid, (Ptr{Cvoid},)),
-        arr.ref.mem)
+        _mmaproot(arr))
     return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr); root=arr,
         cell=cell)
 end
@@ -594,9 +604,21 @@ primwidth(t::IntervalType) =
     t.unit == YEAR_MONTH ? 4 : t.unit == DAY_TIME ? 8 : 16
 primwidth(t::FixedSizeBinaryType) = t.nbytes
 
+# The buffer-role sequences are shared constants: `layoutspec` runs on
+# every buffer-by-role lookup, so a per-call vector would allocate in the
+# element accessors' inner loops.
+const NO_BUFFERS = FrozenVector{BufferRole}(())
+const VALIDITY_ONLY = FrozenVector{BufferRole}((VALIDITY,))
 const VALIDITY_DATA = FrozenVector{BufferRole}((VALIDITY, DATA))
+const VALIDITY_OFFSETS = FrozenVector{BufferRole}((VALIDITY, OFFSETS))
+const VALIDITY_OFFSETS_DATA = FrozenVector{BufferRole}((VALIDITY, OFFSETS, DATA))
+const VALIDITY_VIEWS = FrozenVector{BufferRole}((VALIDITY, VIEWS))
+const VALIDITY_ELEMENT_OFFSETS_SIZES =
+    FrozenVector{BufferRole}((VALIDITY, ELEMENT_OFFSETS, SIZES))
+const TYPE_IDS_ONLY = FrozenVector{BufferRole}((TYPE_IDS,))
+const TYPE_IDS_ELEMENT_OFFSETS = FrozenVector{BufferRole}((TYPE_IDS, ELEMENT_OFFSETS))
 
-layoutspec(::NullType) = LayoutSpec(BufferRole[], 0, 0, 0, false)
+layoutspec(::NullType) = LayoutSpec(NO_BUFFERS, 0, 0, 0, false)
 layoutspec(::BoolType) = LayoutSpec(VALIDITY_DATA, 0, 0, -1, false)
 layoutspec(t::IntType) = LayoutSpec(VALIDITY_DATA, 0, 0, primwidth(t), false)
 layoutspec(t::FloatType) = LayoutSpec(VALIDITY_DATA, 0, 0, primwidth(t), false)
@@ -608,26 +630,26 @@ layoutspec(t::DurationType) = LayoutSpec(VALIDITY_DATA, 0, 0, 8, false)
 layoutspec(t::IntervalType) = LayoutSpec(VALIDITY_DATA, 0, 0, primwidth(t), false)
 layoutspec(t::FixedSizeBinaryType) = LayoutSpec(VALIDITY_DATA, 0, 0, t.nbytes, false)
 layoutspec(t::BinaryType) =
-    LayoutSpec([VALIDITY, OFFSETS, DATA], 0, t.large ? 8 : 4, 0, false)
+    LayoutSpec(VALIDITY_OFFSETS_DATA, 0, t.large ? 8 : 4, 0, false)
 layoutspec(t::Utf8Type) =
-    LayoutSpec([VALIDITY, OFFSETS, DATA], 0, t.large ? 8 : 4, 0, false)
+    LayoutSpec(VALIDITY_OFFSETS_DATA, 0, t.large ? 8 : 4, 0, false)
 layoutspec(t::ListType) =
-    LayoutSpec([VALIDITY, OFFSETS], 1, t.large ? 8 : 4, 0, false)
-layoutspec(::FixedSizeListType) = LayoutSpec([VALIDITY], 1, 0, 0, false)
-layoutspec(::StructType) = LayoutSpec([VALIDITY], -1, 0, 0, false)
-layoutspec(::MapType) = LayoutSpec([VALIDITY, OFFSETS], 1, 4, 0, false)
+    LayoutSpec(VALIDITY_OFFSETS, 1, t.large ? 8 : 4, 0, false)
+layoutspec(::FixedSizeListType) = LayoutSpec(VALIDITY_ONLY, 1, 0, 0, false)
+layoutspec(::StructType) = LayoutSpec(VALIDITY_ONLY, -1, 0, 0, false)
+layoutspec(::MapType) = LayoutSpec(VALIDITY_OFFSETS, 1, 4, 0, false)
 layoutspec(t::UnionType) = t.mode == SparseMode ?
-    LayoutSpec([TYPE_IDS], -1, 0, 0, false) :
-    LayoutSpec([TYPE_IDS, ELEMENT_OFFSETS], -1, 4, 0, false)
+    LayoutSpec(TYPE_IDS_ONLY, -1, 0, 0, false) :
+    LayoutSpec(TYPE_IDS_ELEMENT_OFFSETS, -1, 4, 0, false)
 layoutspec(t::DictionaryType) =
     LayoutSpec(VALIDITY_DATA, 0, 0, primwidth(t.indextype), false)
-layoutspec(::ViewType) = LayoutSpec([VALIDITY, VIEWS], 0, 0, 16, true)
+layoutspec(::ViewType) = LayoutSpec(VALIDITY_VIEWS, 0, 0, 16, true)
 layoutspec(t::ListViewType) =
     # ListView has one offset and one size per parent slot. These are not
     # the length+1 monotone range offsets used by List/Utf8/Binary.
-    LayoutSpec([VALIDITY, ELEMENT_OFFSETS, SIZES], 1, t.large ? 8 : 4, 0, false)
+    LayoutSpec(VALIDITY_ELEMENT_OFFSETS_SIZES, 1, t.large ? 8 : 4, 0, false)
 # REE: no top-level validity; run_ends and values are CHILDREN, not buffers.
-layoutspec(::RunEndEncodedType) = LayoutSpec(BufferRole[], 2, 0, 0, false)
+layoutspec(::RunEndEncodedType) = LayoutSpec(NO_BUFFERS, 2, 0, 0, false)
 
 """
     layoutspec_of(t::ArrowType) -> LayoutSpec

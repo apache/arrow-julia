@@ -99,15 +99,6 @@ jobs:
         nthreads:
           - 1
           - 2
-        exclude:
-          # `min` resolves each package's own Julia floor (setup-julia's
-          # `project` input below). ArrowTypes declares `julia = "1.0"`, whose
-          # Pkg predates test/Project.toml and has no macOS ARM64 binary, so
-          # its floor cannot run the suite; its `lts` cells are its oldest lane.
-          - pkg:
-              name: ArrowTypes.jl
-              dir: './src/ArrowTypes'
-            version: 'min'
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
@@ -124,15 +115,18 @@ jobs:
             ${{ runner.os }}-test-${{ env.cache-name }}-
             ${{ runner.os }}-test-
             ${{ runner.os }}-
-      - uses: julia-actions/julia-buildpkg@v1.6
-        with:
-          project: ${{ matrix.pkg.dir }}
-      - name: Dev local ArrowTypes for Arrow.jl tests
+      # Before the build: ArrowStrings is unregistered and Julia 1.10's Pkg
+      # does not read the `[sources]` entry that points at it, so the
+      # resolve would fail without the develop.
+      - name: Dev local ArrowTypes and ArrowStrings for Arrow.jl tests
         if: matrix.pkg.name == 'Arrow.jl'
         shell: julia --project=. {0}
         run: |
           using Pkg
-          Pkg.develop(PackageSpec(path="src/ArrowTypes"))
+          Pkg.develop([PackageSpec(path="src/ArrowTypes"), PackageSpec(path="src/ArrowStrings")])
+      - uses: julia-actions/julia-buildpkg@v1.6
+        with:
+          project: ${{ matrix.pkg.dir }}
       - uses: julia-actions/julia-runtest@v1
         env:
           JULIA_NUM_THREADS: ${{ matrix.nthreads }}

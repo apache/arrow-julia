@@ -303,16 +303,16 @@ end
         @test released[] == 1
 
         # An mmap-backed region actually unmaps NOW: the release targets the
-        # backing Memory (where Mmap registers the unmap finalizer), and the
-        # observer proves it ran — rm() alone would not, since POSIX happily
-        # unlinks mapped files.
+        # object Mmap registered the unmap finalizer on (`_mmaproot`), and
+        # the observer proves it ran — rm() alone would not, since POSIX
+        # happily unlinks mapped files.
         path, io = mktemp()
         write(io, zeros(UInt8, 64)); close(io)
         mr = mmapregion(path)
         mslice = BufferSlice(mr, 0, mr.len)
         @test AC.loadat(mslice, UInt8, Int64(0)) == 0x00
         unmapped = Ref(false)
-        finalizer(_ -> unmapped[] = true, (mr.root::Vector{UInt8}).ref.mem)
+        finalizer(_ -> unmapped[] = true, AC._mmaproot(mr.root::Vector{UInt8}))
         close!(mr)
         @test unmapped[]
         @test_throws InvalidStateException AC.loadat(mslice, UInt8, Int64(0))

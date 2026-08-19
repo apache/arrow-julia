@@ -17,9 +17,9 @@
 # Fresh-process typed-materialization allocation pin: the
 # recursion architecture must not box per row in a process that never ran
 # compiler introspection — warm-up alone must reach steady state. The
-# bound sits between the intended cost (~80 B/row: the output vector plus
-# the pre-existing struct validity lookup) and the boxed regression
-# (~240 B/row).
+# bound sits between the intended cost (the output vector, 16 B/row; Julia
+# 1.10's inference adds ~32 B/row of leaf-load boxing) and the boxed
+# regression (~200 B/row).
 using Arrow
 const AC = Arrow.ArrowCore
 
