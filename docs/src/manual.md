@@ -1,4 +1,6 @@
-```@raw html
+```@meta
+CurrentModule = Arrow
+```
 <!---
   Licensed to the Apache Software Foundation (ASF) under one
   or more contributor license agreements.  See the NOTICE file
@@ -17,231 +19,364 @@
   specific language governing permissions and limitations
   under the License.
 -->
-```
 
 # User Manual
 
-The goal of this documentation is to provide a brief introduction to the arrow data format, then provide a walk-through of the functionality provided in the Arrow.jl Julia package, with an aim to expose a little of the machinery "under the hood" to help explain how things work and how that influences real-world use-cases for the arrow data format.
-
-The best place to learn about the Apache arrow project is [the website itself](https://arrow.apache.org/), specifically the data format [specification](https://arrow.apache.org/docs/format/Columnar.html). Put briefly, the arrow project provides a formal specification for how columnar, "table" data can be laid out efficiently in memory to standardize and maximize the ability to share data across languages/platforms. In the current [apache/arrow GitHub repository](https://github.com/apache/arrow), language implementations exist for C++, Java, Go, Javascript, Rust, to name a few. Other database vendors and data processing frameworks/applications have also built support for the arrow format, allowing for a wide breadth of possibility for applications to "speak the data language" of arrow.
-
-The [Arrow.jl](https://github.com/apache/arrow-julia) Julia package is another implementation, allowing the ability to both read and write data in the arrow format. As a data format, arrow specifies an exact memory layout to be used for columnar table data, and as such, "reading" involves custom Julia objects ([`Arrow.Table`](@ref) and [`Arrow.Stream`](@ref)), which read the *metadata* of an "arrow memory blob", then *wrap* the array data contained therein, having learned the type and size, amongst other properties, from the metadata. Let's take a closer look at what this "reading" of arrow memory really means/looks like.
-
-## Support for generic path-like types
-
-Arrow.jl attempts to support any path-like type wherever a function takes a path as an argument. The Arrow.jl API should generically work as long as the type supports:
-
-- `Base.open(path, mode)::I where I <: IO`
-
-When a custom `IO` subtype is returned (`I`) then the following methods also need to be defined:
-
-- `Base.read(io::I, ::Type{UInt8})` or `Base.read(io::I)`
-- `Base.write(io::I, x)`
-
-## Reading arrow data
-
-After installing the Arrow.jl Julia package (via `] add Arrow`), and if you have some arrow data, let's say a file named `data.arrow` generated from the [`pyarrow`](https://arrow.apache.org/docs/python/) library (a Python library for interfacing with arrow data), you can then read that arrow data into a Julia session by doing:
+[Apache Arrow](https://arrow.apache.org) specifies a columnar memory layout
+and an interprocess (IPC) serialization format for it, so that table data
+can be shared across languages and processes without conversion. Arrow.jl
+is a pure Julia implementation of that
+[specification](https://arrow.apache.org/docs/format/Columnar.html): it
+reads and writes the IPC stream and file formats, exchanges in-memory data
+with other implementations through the C data and C stream interfaces, and
+presents everything to Julia through the [Tables.jl](https://tables.juliadata.org)
+interface.
 
 ```julia
-using Arrow
+using Arrow, Tables
 
-table = Arrow.Table("data.arrow")
+Arrow.write("data.arrow", (a = [1, 2, 3], b = ["x", "y", missing]))
+tbl = Arrow.Table("data.arrow")
+tbl.a            # Vector{Int64}
+tbl.b            # Vector{Union{Missing, String}}
 ```
+
+## Reading
 
 ### `Arrow.Table`
 
-The type of `table` in this example will be an `Arrow.Table`. When "reading" the arrow data, `Arrow.Table` first ["mmapped"](https://en.wikipedia.org/wiki/Mmap) the `data.arrow` file, which is an important technique for dealing with data larger than available RAM on a system. By "mmapping" a file, the OS doesn't actually load the entire file contents into RAM at the same time, but file contents are "swapped" into RAM as different regions of a file are requested. Once "mmapped", `Arrow.Table` then inspected the metadata in the file to determine the number of columns, their names and types, at which byte offset each column begins in the file data, and even how many "batches" are included in this file (arrow tables may be partitioned into one or more "record batches" each containing portions of the data). Armed with all the appropriate metadata, `Arrow.Table` then created custom array objects ([`Arrow.ArrowVector`](@ref)), which act as "views" into the raw arrow memory bytes. This is a significant point in that no extra memory is allocated for "data" when reading arrow data. This is in contrast to if we wanted to read data from a csv file as columns into Julia structures; we would need to allocate those array structures ourselves, then parse the file, "filling in" each element of the array with the data we parsed from the file. Arrow data, on the other hand, is *already laid out in memory or on disk* in a binary format, and as long as we have the metadata to interpret the raw bytes, we can figure out whether to treat those bytes as a `Vector{Float64}`, etc. A sample of the kinds of arrow array types you might see when deserializing arrow data, include:
-
-* [`Arrow.Primitive`](@ref): the most common array type for simple, fixed-size elements like integers, floats, time types, and decimals
-* [`Arrow.List`](@ref): an array type where its own elements are also arrays of some kind, like string columns, where each element can be thought of as an array of characters
-* [`Arrow.FixedSizeList`](@ref): similar to the `List` type, but where each array element has a fixed number of elements itself; you can think of this like a `Vector{NTuple{N, T}}`, where `N` is the fixed-size width
-* [`Arrow.Map`](@ref): an array type where each element is like a Julia `Dict`; a list of key value pairs like a `Vector{Dict}`
-* [`Arrow.Struct`](@ref): an array type where each element is an instance of a custom struct, i.e. an ordered collection of named & typed fields, kind of like a `Vector{NamedTuple}`
-* [`Arrow.DenseUnion`](@ref): an array type where elements may be of several different types, stored compactly; can be thought of like `Vector{Union{A, B}}`
-* [`Arrow.SparseUnion`](@ref): another array type where elements may be of several different types, but stored as if made up of identically lengthed child arrays for each possible type (less memory efficient than `DenseUnion`)
-* [`Arrow.DictEncoded`](@ref): a special array type where values are "dictionary encoded", meaning the list of unique, possible values for an array are stored internally in an "encoding pool", whereas each stored element of the array is just an integer "code" to index into the encoding pool for the actual value.
-
-And while these custom array types do subtype `AbstractArray`, there is no current support for `setindex!`. Remember, these arrays are "views" into the raw arrow bytes, so for array types other than `Arrow.Primitive`, it gets pretty tricky to allow manipulating those raw arrow bytes. Nevetheless, it's as simple as calling `copy(x)` where `x` is any `ArrowVector` type, and a normal Julia `Vector` type will be fully materialized (which would then allow mutating/manipulating values).
-
-So, what can you do with an `Arrow.Table` full of data? Quite a bit actually!
-
-Because `Arrow.Table` implements the [Tables.jl](https://juliadata.github.io/Tables.jl/stable/) interface, it opens up a world of integrations for using arrow data. A few examples include:
-
-* `df = DataFrame(Arrow.Table(file))`: Build a [`DataFrame`](https://juliadata.github.io/DataFrames.jl/stable/), using the arrow vectors themselves; this allows utilizing a host of DataFrames.jl functionality directly on arrow data; grouping, joining, selecting, etc.
-* `df = copy(DataFrame(Arrow.Table(file)))`: Build a [`DataFrame`](https://juliadata.github.io/DataFrames.jl/stable/), where the columns are regular in-memory vectors (specifically, `Base.Vector`s and/or `PooledVector`s). This requires that you have enough memory to load the entire `DataFrame` into memory.
-* `Tables.datavaluerows(Arrow.Table(file)) |> @map(...) |> @filter(...) |> DataFrame`: use [`Query.jl`'s](https://www.queryverse.org/Query.jl/stable/standalonequerycommands/) row-processing utilities to map, group, filter, mutate, etc. directly over arrow data.
-* `Arrow.Table(file) |> SQLite.load!(db, "arrow_table")`: load arrow data directly into an sqlite database/table, where sql queries can be executed on the data
-* `Arrow.Table(file) |> CSV.write("arrow.csv")`: write arrow data out to a csv file
-
-A full list of Julia packages leveraging the Tables.jl inteface can be found [here](https://github.com/JuliaData/Tables.jl/blob/master/INTEGRATIONS.md).
-
-Apart from letting other packages have all the fun, an `Arrow.Table` itself can be plenty useful. For example, with `tbl = Arrow.Table(file)`:
-* `tbl[1]`: retrieve the first column via indexing; the number of columns can be queried via `length(tbl)`
-* `tbl[:col1]` or `tbl.col1`: retrieve the column named `col1`, either via indexing with the column name given as a `Symbol`, or via "dot-access"
-* `for col in tbl`: iterate through columns in the table
-* `AbstractDict` methods like `haskey(tbl, :col1)`, `get(tbl, :col1, nothing)`, `keys(tbl)`, or `values(tbl)`
-
-### Arrow types
-
-In the arrow data format, specific logical types are supported, a list of which can be found [here](https://arrow.apache.org/docs/status.html#data-types). These include booleans, integers of various bit widths, floats, decimals, time types, and binary/string. While most of these map naturally to types builtin to Julia itself, there are a few cases where the definitions are slightly different, and in these cases, by default, they are converted to more "friendly" Julia types (this auto conversion can be avoided by passing `convert=false` to `Arrow.Table`, like `Arrow.Table(file; convert=false)`). Examples of arrow to julia type mappings include:
-
-* `Date`, `Time`, `Timestamp`, and `Duration` all have natural Julia defintions in `Dates.Date`, `Dates.Time`, `TimeZones.ZonedDateTime`, and `Dates.Period` subtypes, respectively.
-* `Char` and `Symbol` Julia types are mapped to arrow string types, with additional metadata of the original Julia type; this allows deserializing directly to `Char` and `Symbol` in Julia, while other language implementations will see these columns as just strings
-* Similarly to the above, the `UUID` Julia type is mapped to a 128-bit `FixedSizeBinary` arrow type.
-* `Decimal128` and `Decimal256` have no corresponding builtin Julia types, so they're deserialized using a compatible type definition in Arrow.jl itself: `Arrow.Decimal`
-
-
-Note that when `convert=false` is passed, data will be returned in Arrow.jl-defined types that exactly match the arrow definitions of those types; the authoritative source for how each type represents its data can be found in the arrow [`Schema.fbs`](https://github.com/apache/arrow/blob/master/format/Schema.fbs) file.
-
-One note on performance: when writing `TimeZones.ZonedDateTime` columns to the arrow format (via `Arrow.write`), it is preferrable to "wrap" the columns in `Arrow.ToTimestamp(col)`, as long
-as the column has `ZonedDateTime` elements that all share a common timezone. This ensures the writing process can know "upfront" which timezone will be encoded and is thus much more
-efficient and performant.
-
-#### Custom types
-
-To support writing your custom Julia struct, Arrow.jl utilizes the format's mechanism for "extension types" by allowing the storing of Julia type name and metadata in the field metadata. To "hook in" to this machinery, custom types can utilize the interface methods defined in the `Arrow.ArrowTypes` submodule. For example:
+[`Arrow.Table`](@ref) reads an IPC source into columns. The source may be a
+file path, an `IO`, a `Vector{UInt8}` of IPC bytes, or a byte-range fetcher
+([Reading remote and partial files](@ref)). Both IPC formats are accepted
+and detected automatically: the *file* format (`ARROW1` magic, random
+access, optional footer statistics) and the *stream* format.
 
 ```julia
-using Arrow
-
-struct Person
-    id::Int
-    name::String
-end
-
-# overload interface method for custom type Person; return a symbol as the "name"
-# this instructs Arrow.write what "label" to include with a column with this custom type
-const NAME = Symbol("JuliaLang.MyPackage.Person")
-ArrowTypes.arrowname(::Type{Person}) = NAME
-# overload JuliaType on `Val{NAME}`, which is like a dispatchable string
-# return our custom *type* Person; this enables Arrow.Table to know how the "label"
-# on a custom column should be mapped to a Julia type and deserialized
-ArrowTypes.JuliaType(::Val{NAME}) = Person
-
-table = (col1=[Person(1, "Bob"), Person(2, "Jane")],)
-io = IOBuffer()
-Arrow.write(io, table)
-seekstart(io)
-table2 = Arrow.Table(io)
+tbl = Arrow.Table("data.arrow")           # a path: memory-mapped file
+tbl = Arrow.Table(io)                      # an IO: read to the end
+tbl = Arrow.Table(bytes)                   # IPC bytes already in memory
 ```
 
-In this example, we're writing our `table`, which is a NamedTuple with one column named `col1`, which has two
-elements which are instances of our custom `Person` struct. We overload `Arrowtypes.arrowname` so that
-Arrow.jl knows how to serialize our `Person` struct. We then overload `ArrowTypes.JuliaType` so the deserialization process knows how to map from our type label back to our `Person` struct type. We can then write our data in the arrow format to an in-memory `IOBuffer`, then read the table back in using `Arrow.Table`.
-The table we get back will be an `Arrow.Table`, with a single `Arrow.Struct` column with element type `Person`.
-
-Note that without calling `Arrowtypes.JuliaType`, we may get into a weird limbo state where we've written
-our table with `Person` structs out as a table, but when reading back in, Arrow.jl doesn't know what a `Person` is;
-deserialization won't fail, but we'll just get a `Namedtuple{(:id, :name), Tuple{Int, String}}` back instead of `Person`.
-
-While this example is very simple, it shows the basics to allow a custom type to be serialized/deserialized. But the `ArrowTypes` module offers even more powerful functionality for "hooking" non-native arrow types into the serialization/deserialization processes. Let's walk through a couple more examples; if you've had enough custom type shenanigans, feel free to skip to the next section.
-
-Let's take a look at how Arrow.jl allows serializing the `nothing` value, which is often referred to as the "software engineer's NULL" in Julia. While Arrow.jl treats `missing` as the default arrow NULL value, `nothing` is pretty similar, but we'd still like to treat it separately if possible. Here's how we enable serialization/deserialization in the `ArrowTypes` module:
+`Arrow.Table` satisfies the Tables.jl columns interface, so it works with
+every Tables.jl-aware sink and consumer:
 
 ```julia
-ArrowTypes.ArrowKind(::Type{Nothing}) = ArrowTypes.NullKind()
-ArrowTypes.ArrowType(::Type{Nothing}) = Missing
-ArrowTypes.toarrow(::Nothing) = missing
-const NOTHING = Symbol("JuliaLang.Nothing")
-ArrowTypes.arrowname(::Type{Nothing}) = NOTHING
-ArrowTypes.JuliaType(::Val{NOTHING}) = Nothing
-ArrowTypes.fromarrow(::Type{Nothing}, ::Missing) = nothing
+Tables.columnnames(tbl)                    # (:a, :b)
+Tables.schema(tbl)
+tbl.a                                      # property access = a column
+Tables.getcolumn(tbl, :b)
+length(tbl)                                # number of rows
+DataFrame(tbl)                             # any Tables.jl sink
 ```
 
-Let's walk through what's going on here, line-by-line:
-  * `ArrowKind` overload: `ArrowKind`s are generic "categories" of types supported by the arrow format, like `PrimitiveKind`, `ListKind`, etc. They each correspond to a different data layout strategy supported in the arrow format. Here, we define `nothing`'s kind to be `NullKind`, which means no actual memory is needed for storage, it's strictly a "metadata" type where we store the type and # of elements. In our `Person` example, we didn't need to overload this since types declared like `struct T` or `mutable struct T` are defined as `ArrowTypes.StructKind` by default
-  * `ArrowType` overload: here we're signaling that our type (`Nothing`) maps to the natively supported arrow type of `Missing`; this is important for the serializer so it knows which arrow type it will be serializing. Again, we didn't need to overload this for `Person` since the serializer knows how to serialize custom structs automatically by using reflection methods like `fieldnames(T)` and `getfield(x, i)`.
-  * `ArrowTypes.toarrow` overload: this is a sister method to `ArrowType`; we said our type will map to the `Missing` arrow type, so here we actually define ___how___ it converts to the arrow type; and in this case, it just returns `missing`. This is yet another method that didn't show up for `Person`; why? Well, as we noted in `ArrowType`, the serializer already knows how to serialize custom structs by using all their fields; if, for some reason, we wanted to omit some fields or otherwise transform things, then we could define corresponding `ArrowType` and `toarrow` methods
-  * `arrowname` overload: similar to our `Person` example, we need to instruct the serializer how to label our custom type in the arrow type metadata; here we give it the symbol `Symbol("JuliaLang.Nothing")`. Note that while this will ultimately allow us to disambiguate `nothing` from `missing` when reading arrow data, if we pass this data to other language implementations, they will only treat the data as `missing` since they (probably) won't know how to "understand" the `JuliaLang.Nothing` type label
-  * `JuliaType` overload: again, like our `Person` example, we instruct the deserializer that when it encounters the `JuliaLang.Nothing` type label, it should treat those values as `Nothing` type.
-  * And finally, `fromarrow` overload: this allows specifying how the native-arrow data should be converted back to our custom type. `fromarrow(T, x...)` by default will call `T(x...)`, which is why we didn't need this overload for `Person`, but in this example, `Nothing(missing)` won't work, so we define our own custom conversion.
+Columns are **materialized**: each column is a plain Julia `Vector` with a
+concrete element type determined by the Arrow schema (see [Type
+mapping when reading](@ref)). A `Table` therefore does not borrow the source bytes after
+it is constructed, and its columns behave like any other Julia vectors.
 
-Let's run through one more complex example, just for fun and to really see how far the system can be pushed:
+### Memory mapping and `close!`
+
+A file path is memory-mapped by default (`mmap=true`), so reading a large
+file does not copy it into RAM up front; pass `mmap=false` to read the file
+into memory instead. A memory map is released when the last reference to it
+is garbage collected. To release it deterministically — required on Windows
+before a still-mapped file can be deleted, and useful anywhere for prompt
+resource release — call [`Arrow.close!`](@ref):
 
 ```julia
-using Intervals
-table = (col = [
-    Interval{Closed,Unbounded}(1,nothing),
-],)
-const NAME = Symbol("JuliaLang.Intervals.Interval")
-ArrowTypes.arrowname(::Type{Interval{T, L, R}}) where {T, L, R} = NAME
-const LOOKUP = Dict(
-    "Closed" => Closed,
-    "Unbounded" => Unbounded
-)
-ArrowTypes.arrowmetadata(::Type{Interval{T, L, R}}) where {T, L, R} = string(L, ".", R)
-function ArrowTypes.JuliaType(::Val{NAME}, ::Type{NamedTuple{names, types}}, meta) where {names, types}
-    L, R = split(meta, ".")
-    return Interval{fieldtype(types, 1), LOOKUP[L], LOOKUP[R]}
-end
-ArrowTypes.fromarrow(::Type{Interval{T, L, R}}, first, last) where {T, L, R} = Interval{L, R}(first, R == Unbounded ? nothing : last)
-io = Arrow.tobuffer(table)
-tbl = Arrow.Table(io)
+tbl = Arrow.Table("data.arrow")
+# ... use tbl ...
+Arrow.close!(tbl)                          # unmaps NOW; tbl's columns remain usable
+rm("data.arrow")
 ```
 
-Again, let's break down what's going on here:
-  * Here we're trying to save an `Interval` type in the arrow format; this type is unique in that it has two type parameters (`Closed` and `Unbounded`) that are not inferred/based on fields, but are just "type tags" on the type itself
-  * Note that we define a generic `arrowname` method on all `Interval`s, regardless of type parameters. We just want to let arrow know which general type we're dealing with here
-  * Next we use a new method `ArrowTypes.arrowmetadata` to encode the two non-field-based type parameters as a string with a dot delimiter; we encode this information here because remember, we have to match our `arrowname` Symbol typename in our `JuliaType(::Val(name))` definition in order to dispatch correctly; if we encoded the type parameters in `arrowname`, we would need separate `arrowname` definitions for each unique combination of those two type parameters, and corresponding `JuliaType` definitions for each as well; yuck. Instead, we let `arrowname` be generic to our type, and store the type parameters *for this specific column* using `arrowmetadata`
-  * Now in `JuliaType`, note we're using the 3-argument overload; we want the `NamedTuple` type that is the native arrow type our `Interval` is being serialized as; we use this to retrieve the 1st type parameter for our `Interval`, which is simply the type of the two `first` and `last` fields. Then we use the 3rd argument, which is whatever string we returned from `arrowmetadata`. We call `L, R = split(meta, ".")` to parse the two type parameters (in this case `Closed` and `Unbounded`), then do a lookup on those strings from a predefined `LOOKUP` Dict that matches the type parameter name as string to the actual type. We then have all the information to recreate the full `Interval` type. Neat!
-  * The one final wrinkle is in our `fromarrow` method; `Interval`s that are `Unbounded`, actually take `nothing` as the 2nd argument. So letting the default `fromarrow` definition call `Interval{T, L, R}(first, last)`, where `first` and `last` are both integers isn't going to work. Instead, we check if the `R` type parameter is `Unbounded` and if so, pass `nothing` as the 2nd arg, otherwise we can pass `last`.
-
-This stuff can definitely make your eyes glaze over if you stare at it long enough. As always, don't hesitate to reach out for quick questions on the [#data](https://julialang.slack.com/messages/data/) slack channel, or [open a new issue](https://github.com/apache/arrow-julia/issues/new) detailing what you're trying to do.
+`close!` is idempotent. Because a `Table`'s columns are copies, a closed
+`Table` remains fully usable; a closed [`Arrow.Stream`](@ref) refuses
+further iteration cleanly.
 
 ### `Arrow.Stream`
 
-In addition to `Arrow.Table`, the Arrow.jl package also provides `Arrow.Stream` for processing arrow data. While `Arrow.Table` will iterate all record batches in an arrow file/stream, concatenating columns, `Arrow.Stream` provides a way to *iterate* through record batches, one at a time. Each iteration yields an `Arrow.Table` instance, with columns/data for a single record batch. This allows, if so desired, "batch processing" of arrow data, one record batch at a time, instead of creating a single long table via `Arrow.Table`.
+[`Arrow.Stream`](@ref) iterates a source one record batch at a time; each
+iteration yields an `Arrow.Table` for that batch. This is the tool for
+files larger than memory and for pipelines that process batches
+independently:
 
-### Custom application metadata
+```julia
+for batch in Arrow.Stream("big.arrow")
+    process(batch)                         # batch isa Arrow.Table
+end
+```
 
-The Arrow format allows data producers to [attach custom metadata](https://arrow.apache.org/docs/format/Columnar.html#custom-application-metadata) to various Arrow objects.
+A `Stream` satisfies `Tables.partitions`, so it can be handed directly to a
+partition-aware sink — `Arrow.write(sink, Arrow.Stream(...))` streams the
+input batch by batch without ever holding the whole table.
 
-Arrow.jl provides a convenient accessor for this metadata via [`Arrow.getmetadata`](@ref). `Arrow.getmetadata(t::Arrow.Table)` will return an immutable `AbstractDict{String,String}` that represents the [`custom_metadata` of the table's associated `Schema`](https://github.com/apache/arrow/blob/85d8175ea24b4dd99f108a673e9b63996d4f88cc/format/Schema.fbs#L515) (or `nothing` if no such metadata exists), while `Arrow.getmetadata(c::Arrow.ArrowVector)` will return a similar representation of [the column's associated `Field` `custom_metadata`](https://github.com/apache/arrow/blob/85d8175ea24b4dd99f108a673e9b63996d4f88cc/format/Schema.fbs#L480) (or `nothing` if no such metadata exists).
+### Metadata
 
-To attach custom schema/column metadata to Arrow tables at serialization time, see the `metadata` and `colmetadata` keyword arguments to [`Arrow.write`](@ref).
+Schema-level and per-column key/value metadata carried in the IPC schema is
+readable through the [DataAPI.jl](https://github.com/JuliaData/DataAPI.jl)
+metadata interface:
 
-## Writing arrow data
+```julia
+DataAPI.metadatakeys(tbl)
+DataAPI.metadata(tbl, "key")
+DataAPI.colmetadatakeys(tbl, :a)
+DataAPI.colmetadata(tbl, :a, "key")
+```
 
-Ok, so that's a pretty good rundown of *reading* arrow data, but how do you *produce* arrow data? Enter `Arrow.write`.
+### Type mapping when reading
+
+Reading maps Arrow types to Julia element types by a closed rule over the
+schema (never by inspecting values, so an all-`missing` or zero-row column
+has the same element type as a populated one). A nullable Arrow field maps
+to `Union{Missing, T}`.
+
+| Arrow type | Julia element type |
+|---|---|
+| Int8…Int64, UInt8…UInt64 | the same-width `Integer` |
+| Float16/32/64 | `Float16`/`Float32`/`Float64` |
+| Bool | `Bool` |
+| Utf8, LargeUtf8, Utf8View | `String` |
+| Binary, LargeBinary, BinaryView, FixedSizeBinary | `Vector{UInt8}` |
+| Date32 | `Dates.Date` |
+| Date64 | `Dates.DateTime` |
+| Timestamp (second, millisecond) | `Dates.DateTime` |
+| Timestamp (microsecond, nanosecond) | `Int64` (raw storage — `DateTime` cannot represent it) |
+| Time32/Time64 | `Dates.Time` |
+| Duration | `Dates.Second`/`Millisecond`/`Microsecond`/`Nanosecond` by unit |
+| Decimal32/64 | `Int32`/`Int64` (unscaled integer storage) |
+| Decimal128/256 | `Vector{UInt8}` (raw little-endian storage) |
+| Interval | `Int32` (year-month) or a `NamedTuple` (day-time, month-day-nano) |
+| List, LargeList, FixedSizeList, ListView | `Vector{Any}` |
+| Struct | `Vector{Pair{String,Any}}` (ordered name => value pairs) |
+| Map | `Vector{Pair{Any,Any}}` |
+| Union | the pairwise join of the children's element types |
+| Dictionary-encoded | the mapping of the *value* type (indices are resolved) |
+| Run-end encoded | the mapping of the *values* child (runs are expanded) |
+| Null | `Missing` |
+
+Sub-millisecond timestamps stay as raw integers rather than silently
+truncating into `DateTime`; the same rule applies when writing.
+
+### Scan pushdown
+
+`Arrow.Table` accepts a `Tables.Scan` — a plain-data description of which
+columns to keep, which rows qualify, and how many — and pushes it down into
+the reader:
+
+```julia
+using Tables: Scan, col, coleq, in_, isnull
+
+scan = Scan(select = (:id, :amount),
+            filter = (col(:amount) > 100) & !isnull(col(:id)),
+            limit = 1_000)
+tbl = Arrow.Table("orders.arrow"; scan = scan)
+```
+
+* `select`: a reference or tuple of select items (`ref`, `ref => name`,
+  `ref => Type`, `ref => Type => name`; refs are `Symbol`, `String`, `Int`,
+  `Regex`, `Tables.Not`, `Tables.All`). Only the selected columns (and the
+  columns the filter references) are decoded; everything else is skipped
+  without being sliced, decompressed, or validated.
+* `filter`: an expression over `Tables.col` — comparisons against literals
+  (`>`, `>=`, `<`, `<=`, `coleq`, `colne`), `in_`, `isnull`, string
+  predicates, combined with `&`, `|`, `!`. A row is kept iff the predicate
+  is exactly `true` (`missing` excludes, SQL-style).
+* `limit`/`offset`: applied to qualifying rows.
+
+On the file format, batches whose footer statistics prove no row can match
+the filter are never fetched or decoded, and exact `limit`/`offset` windows
+skip whole batches when there is no filter. On the stream format the scan is
+applied after decode with identical results. A scan whose filter literal has
+no exact storage representation (a cross-domain or out-of-range value), or
+whose projection is empty (`select = ()`), falls back to reading the whole
+source and evaluating over the converted public values.
+
+Batch pruning uses per-batch statistics (row count, null count, min, max
+per column) carried in the file's footer schema metadata under the key
+`JuliaArrow:batch_statistics.v1`, in the value layout of the Arrow
+project's statistics schema — other readers see ordinary metadata.
+[`Arrow.write`](@ref) does not embed them; files that carry them prune,
+files that do not are simply scanned batch by batch.
+
+### Reading remote and partial files
+
+The file format is random-access: the footer says where every batch and
+buffer lives, so a reader that can fetch byte ranges — from object storage,
+over HTTP, or from a local file it prefers not to map whole — needs only
+the ranges its scan touches. [`Arrow.RangedSource`](@ref) is that fetcher
+contract: a function `fetch(offset, len) -> Vector{UInt8}` over an object
+of known total length. [`Arrow.RangedFile`](@ref) wraps one with the fetch
+protocol (tail-first footer, batch windowing from the footer's block
+metadata, dictionary bodies only for the columns in play, coalesced body
+ranges for exactly the decoded columns):
+
+```julia
+src = Arrow.RangedSource(Int64(objectsize)) do offset, len
+    fetchbytes(url, offset, len)           # your transport: S3, HTTP, ...
+end
+tbl = Arrow.Table(src; scan = Scan(select = (:id,), filter = col(:day) > 20))
+```
+
+Overriding `Arrow.fetchranges(::RangedSource, ranges)` lets a transport
+issue the planned ranges concurrently; the default fetches them serially.
+`RangedFile(src; tailbytes, coalesce_gap, limits)` tunes the initial tail
+read, how close two ranges must be to merge into one request, and the
+resource limits. Arrow.jl has no HTTP or cloud dependency of its own — a
+transport package only has to construct a `RangedSource`.
+
+## Writing
 
 ### `Arrow.write`
 
-With `Arrow.write`, you provide either an `io::IO` argument or a [`file_path`](#support-for-generic-path-like-types) to write the arrow data to, as well as a Tables.jl-compatible source that contains the data to be written.
-
-What are some examples of Tables.jl-compatible sources? A few examples include:
-* `Arrow.write(io, df::DataFrame)`: A `DataFrame` is a collection of indexable columns
-* `Arrow.write(io, CSV.File(file))`: read data from a csv file and write out to arrow format
-* `Arrow.write(io, DBInterface.execute(db, sql_query))`: Execute an SQL query against a database via the [`DBInterface.jl`](https://github.com/JuliaDatabases/DBInterface.jl) interface, and write the query resultset out directly in the arrow format. Packages that implement DBInterface include [SQLite.jl](https://juliadatabases.github.io/SQLite.jl/stable/), [MySQL.jl](https://juliadatabases.github.io/MySQL.jl/dev/), and [ODBC.jl](http://juliadatabases.github.io/ODBC.jl/latest/).
-* `df |> @map(...) |> Arrow.write(io)`: Write the results of a [Query.jl](https://www.queryverse.org/Query.jl/stable/) chain of operations directly out as arrow data
-* `jsontable(json) |> Arrow.write(io)`: Treat a json array of objects or object of arrays as a "table" and write it out as arrow data using the [JSONTables.jl](https://github.com/JuliaData/JSONTables.jl) package
-* `Arrow.write(io, (col1=data1, col2=data2, ...))`: a `NamedTuple` of `AbstractVector`s or an `AbstractVector` of `NamedTuple`s are both considered tables by default, so they can be quickly constructed for easy writing of arrow data if you already have columns of data
-
-And these are just a few examples of the numerous [integrations](https://github.com/JuliaData/Tables.jl/blob/master/INTEGRATIONS.md).
-
-In addition to just writing out a single "table" of data as a single arrow record batch, `Arrow.write` also supports writing out multiple record batches when the input supports the `Tables.partitions` functionality. One immediate, though perhaps not incredibly useful example, is `Arrow.Stream`. `Arrow.Stream` implements `Tables.partitions` in that it iterates "tables" (specifically `Arrow.Table`), and as such, `Arrow.write` will iterate an `Arrow.Stream`, and write out each `Arrow.Table` as a separate record batch. Another important point for why this example works is because an `Arrow.Stream` iterates `Arrow.Table`s that all have the same schema. This is important because when writing arrow data, a "schema" message is always written first, with all subsequent record batches written with data matching the initial schema.
-
-In addition to inputs that support `Tables.partitions`, note that the Tables.jl itself provides the `Tables.partitioner` function, which allows providing your own separate instances of similarly-schema-ed tables as "partitions", like:
+[`Arrow.write`](@ref) writes any Tables.jl-compatible source to a path or
+an `IO`:
 
 ```julia
-# treat 2 separate NamedTuples of vectors with same schema as 1 table, 2 partitions
-tbl_parts = Tables.partitioner([(col1=data1, col2=data2), (col1=data3, col2=data4)])
-Arrow.write(io, tbl_parts)
-
-# treat an array of csv files with same schema where each file is a partition
-# in this form, a function `CSV.File` is applied to each element of 2nd argument
-csv_parts = Tables.partitioner(CSV.File, csv_files)
-Arrow.write(io, csv_parts)
+Arrow.write("out.arrow", tbl)              # file format (ARROW1 + footer)
+Arrow.write(io, tbl; file = false)          # stream format
+Arrow.write("out.arrow", tbl; compress = :zstd)     # or :lz4
+Arrow.write("out.arrow", tbl;
+    metadata = ["source" => "sensor-7"],
+    colmetadata = Dict(:temp => ["unit" => "C"]))
 ```
 
-### `Arrow.Writer`
+Each `Tables.partitions` partition of the source becomes one record batch,
+so `Arrow.write(sink, Arrow.Stream(path))` and
+`Arrow.write(sink, Tables.partitioner(...))` write batch by batch. The
+writer is eager and whole-buffer: batches are encoded and validated in
+memory, then written to the sink once.
 
-With `Arrow.Writer`, you instantiate an `Arrow.Writer` object, write sources using it, and then close it.  This allows for incrmental writes to the same sink.  It is similar to `Arrow.append` without having to close and re-open the sink in between writes and without the limitation of only supporting the IPC stream format.
+`compress` applies per-buffer LZ4 frame or Zstandard compression as
+defined by the IPC specification (buffers that do not shrink are stored
+raw). Compressed files are readable by every implementation that supports
+IPC compression.
 
-### Multithreaded writing
+### Dictionary encoding
 
-By default, `Arrow.write` will use multiple threads to write multiple
-record batches simultaneously (e.g. if julia is started with `julia -t 8` or the `JULIA_NUM_THREADS` environment variable is set). The number of concurrent tasks to use when writing can be controlled by passing the `ntasks` keyword argument to `Arrow.write`. Passing `ntasks=1` avoids any multithreading when writing.
+Wrap a column in [`Arrow.DictEncode`](@ref) to write it dictionary-encoded
+(a pool of unique values plus integer indices), which is what a
+categorical or low-cardinality string column wants:
 
-### Compression
+```julia
+Arrow.write("out.arrow", (region = Arrow.DictEncode(regions), sales = sales))
+```
 
-Compression is supported when writing via the `compress` keyword argument. Possible values include `:lz4`, `:zstd`, or your own initialized `LZ4FrameCompressor` or `ZstdCompressor` objects; will cause all buffers in each record batch to use the respective compression encoding or compressor.
+Reading a dictionary-encoded column resolves the indices: the column comes
+back as its value type. When a `Table` read from Arrow is written again,
+its dictionary encoding is preserved.
+
+### Type mapping when writing
+
+Writing maps Julia element types to Arrow types:
+
+| Julia element type | Arrow type |
+|---|---|
+| `Int8`…`Int64`, `UInt8`…`UInt64` | the same-width integer |
+| `Float16/32/64` | the same-width float |
+| `Bool` | Bool |
+| `String` (any `AbstractString`) | Utf8 |
+| `Dates.Date` | Date32 |
+| `Dates.DateTime` | Timestamp (millisecond) |
+| `Dates.Time` | Time64 (nanosecond) |
+| `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
+| `Vector{T}` (including `Vector{UInt8}`) | List of the mapping of `T` |
+| `NamedTuple` | Struct (no top-level nulls — wrap fields as nullable children instead) |
+| `Union{Missing, T}` | the mapping of `T`, nullable |
+| `Arrow.DictEncode` | Dictionary of the mapping of the wrapped column |
+
+A column with element type `Any` is narrowed once (recovering list columns
+of a common element type) and refused if it cannot be narrowed to a
+writable type. When the source is an `Arrow.Table` or `Arrow.Stream`, the
+writer *retains* the Arrow schema it was read with — temporal units,
+dictionary encoding, nested list descriptors, nullability, and metadata all
+survive a read/write round trip.
+
+## Validation
+
+Every batch is validated before it is exposed by a read or emitted by a
+write: buffer arity and byte lengths against the schema (structural), and
+offset monotonicity, dictionary index domains, union type ids and the other
+data-intrinsic invariants (semantic). Metadata is verified by a generated
+FlatBuffers shape verifier before any of it is used, and resource limits
+(metadata size, body size, allocation budget, nesting depth) are enforced
+before any metadata-directed allocation, so a corrupt or hostile file
+produces a clean `ValidationError` rather than a crash or an unbounded
+allocation.
+
+Content-policy checks that the reference implementation treats as
+advisory — UTF-8 well-formedness of string bytes, the `nullable=false`
+declaration on a field, canonical zero padding of bitmaps — are not
+enforced by default, matching the behavior of the other Arrow
+implementations on the ecosystem's own conformance files.
+
+## The C data interface
+
+Arrow's [C data interface](https://arrow.apache.org/docs/format/CDataInterface.html)
+and [C stream interface](https://arrow.apache.org/docs/format/CStreamInterface.html)
+move columns and record batches between implementations in the same
+process without copying: a pair of C structs (`ArrowSchema`, `ArrowArray`)
+or a stream struct (`ArrowArrayStream`) is filled by a producer and read by
+a consumer, and ownership is transferred with a release callback.
+
+Arrow.jl exposes both interfaces at the level of the engine's column
+representation (a `Field` describing the type and an `ArrayData` holding
+the buffers), which every Julia column read by `Arrow.Table` is built from:
+
+* `Arrow.to_c_data(field, data) -> (schemaptr, arrayptr)` exports one
+  column; the structs stay valid until the consumer calls their `release`
+  callbacks, and `Arrow.reap!()` reclaims the export bookkeeping afterward.
+* `Arrow.from_c_data(schemaptr, arrayptr) -> (field, data)` imports one
+  column, *moving* the array (its source `release` is nulled, as the spec
+  requires). The imported buffers stay valid as long as the returned data is
+  reachable; `Arrow.close!` on any imported buffer, or `Arrow.release!` on
+  the import's owner, runs the producer's release callback exactly once.
+* `Arrow.export_stream!(streamptr, schema, batches)` fills a caller-owned
+  `ArrowArrayStream`; `Arrow.from_c_stream(streamptr)` imports one and
+  yields record batches through `Arrow.nextbatch!`.
+
+For example, handing a column to PyArrow in-process through PythonCall:
+
+```julia
+using Arrow, PythonCall
+pa = pyimport("pyarrow")
+
+f, d = Arrow.ArrowCore.fromjulia("x", [1, 2, missing, 4])
+sp, ap = Arrow.to_c_data(f, d)
+pyarr = pa.Array._import_from_c(UInt(ap), UInt(sp))     # PyArrow now owns the structs
+pyarr.to_pylist()                                        # [1, 2, None, 4]
+```
+
+The conformance suite under `conformance/` round-trips every layout the
+format defines through PyArrow over exactly this path, in both directions.
+
+## Compiling with JuliaC `--trim`
+
+Arrow.jl's engine is designed to compile under JuliaC's `--trim=safe`:
+type descriptors are runtime values, layout dispatch goes through closed
+`isa` ladders, and the value-domain entry points (reading, C data
+import/export, and the typed accessors `Arrow.ArrowCore.materialize(::Type{T},
+field, data)`) are statically resolvable. The repository's
+`test/trim_compile_tests.jl` gate holds that at zero verifier errors and
+warnings. The dynamic facade conveniences (property access on `Arrow.Table`,
+`NamedTuple` rows) are not part of that guarantee.
+
+## Differences from Arrow.jl 2.x
+
+Arrow.jl 3.0 is a new implementation. The everyday surface — `Arrow.Table`,
+`Arrow.Stream`, `Arrow.write`, `Arrow.DictEncode`, Tables.jl integration,
+compression, metadata — is the same in spirit, with these differences:
+
+* **Columns are plain `Vector`s.** 2.x returned lazy `ArrowVector` views
+  over the mapped bytes; 3.0 materializes columns with concrete element
+  types (the mapping tables above), and the source may be released with
+  `Arrow.close!` at any time afterward.
+* **Scan pushdown and byte-range reads** (`Tables.Scan`, `RangedSource`,
+  `RangedFile`) are new.
+* **Not present in 3.0**: `Arrow.Writer`/`Arrow.append` (incremental and
+  append-to-file writing), multithreaded encoding (`ntasks`), the
+  `convert=false` lazy read mode, `Arrow.ToArrow`, and ArrowTypes.jl
+  custom-type serialization (a Julia struct is written as a Struct column
+  of its fields, not as an extension type). Big-endian and delta-dictionary
+  IPC streams are refused.
+* **The C data and C stream interfaces** are new.

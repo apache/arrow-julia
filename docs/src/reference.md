@@ -21,15 +21,33 @@
 
 # API Reference
 
-```@autodocs
-Modules = [Arrow]
-Order   = [:type, :function]
+## Reading
+
+```@docs
+Arrow.Table
+Arrow.Stream
+Arrow.close!(::Arrow.Table)
 ```
 
-## Internals: `Arrow.FlatBuffers`
+## Writing
 
-The `FlatBuffers` module is not part of Arrow.jl's public API, and these functions may change without notice.
+```@docs
+Arrow.write
+Arrow.DictEncode
+```
 
-```@autodocs
-Modules = [Arrow.FlatBuffers]
+## Byte-range reads
+
+```@docs
+Arrow.RangedSource
+Arrow.RangedFile
+```
+
+## The C data and C stream interfaces
+
+```@docs
+Arrow.to_c_data
+Arrow.from_c_data
+Arrow.export_stream!
+Arrow.from_c_stream
 ```

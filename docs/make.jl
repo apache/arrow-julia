@@ -22,6 +22,10 @@ makedocs(;
     modules=[Arrow],
     repo=Remotes.GitHub("apache", "arrow-julia"),
     sitename="Arrow.jl",
+    # The reference page documents the public surface explicitly; internal
+    # helpers carry docstrings for maintainers and are not part of the site.
+    checkdocs=:exports,
+    checkdocs_ignored_modules=[Arrow.ArrowCore, Arrow.FlatBuffers, Arrow.Meta],
     format=Documenter.HTML(;
         prettyurls=get(ENV, "CI", "false") == "true",
         canonical="https://arrow.apache.org/julia/",
