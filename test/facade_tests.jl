@@ -93,7 +93,7 @@ end
 Arrow.sourcelength(s::_WrongTypeSource) = length(s.data)
 Arrow.readrange(s::_WrongTypeSource, off, len) = String(s.data[(off + 1):(off + len)])
 struct _BadLengthSource <: Arrow.AbstractArrowSource
-    reported::Integer
+    reported::Any
 end
 Arrow.sourcelength(s::_BadLengthSource) = s.reported
 Arrow.readrange(s::_BadLengthSource, off, len) = zeros(UInt8, len)
@@ -282,7 +282,15 @@ end
                 scan=Tables.Scan(select=(:a,)),
             )
         end
-        for reported in (-1, Int128(typemax(Int64)) + 1, Int128(typemin(Int64)) - 1)
+        for reported in (
+            -1,
+            Int128(typemax(Int64)) + 1,
+            Int128(typemin(Int64)) - 1,
+            3402.0,
+            1.5,
+            "3402",
+            nothing,
+        )
             @test_throws Arrow.AC.ValidationError Arrow.Table(_BadLengthSource(reported))
         end
     end

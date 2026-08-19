@@ -48,7 +48,7 @@ This is a pure Julia implementation of the
 - `src/table.jl`, `src/write.jl` — the public facade: `Arrow.Table`,
   `Arrow.Stream`, `Arrow.write`, `close!`.
 - `ext/ArrowCloudStoreExt.jl` — CloudStore.jl objects as sources (S3,
-  Azure Blob Storage, GCS) with concurrent range reads.
+  Azure Blob Storage) with concurrent range reads.
 - `src/FlatBuffers/` — the vendored FlatBuffers runtime the generated
   bindings run over.
 - `src/ArrowStrings/` — ArrowStrings.jl, a separate package (to be

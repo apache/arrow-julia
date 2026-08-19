@@ -16,7 +16,7 @@
 
 # CloudStore.jl objects as Arrow byte-range sources: `Arrow.Table(obj;
 # scan=…)` reads only the selected columns' bytes from S3, Azure Blob
-# Storage, or GCS through HTTP `Range` requests.
+# Storage through HTTP `Range` requests.
 module ArrowCloudStoreExt
 
 using Arrow

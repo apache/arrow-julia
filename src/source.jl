@@ -60,7 +60,7 @@ tbl = Arrow.Table(BytesSource(bytes); scan=Tables.Scan(select=(:a, :b)))
 
 The `CloudStore.jl` extension makes a `CloudStore.Object` a source, so
 `Arrow.Table(CloudStore.Object(bucket, key); scan=…)` reads just the needed
-column bytes from S3, Azure Blob Storage, or GCS. Stream-format objects have
+column bytes from S3 or Azure Blob Storage. Stream-format objects have
 no footer and are read whole.
 """
 abstract type AbstractArrowSource end

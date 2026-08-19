@@ -782,8 +782,8 @@ function SourceFile(
     gap = Int64(coalesce_gap)
     gap >= 0 || throw(ArgumentError("negative coalesce gap"))
     reported = sourcelength(src)
-    (reported >= 0 && reported <= typemax(Int64)) ||
-        throw(ValidationError("source reports an invalid length $reported"))
+    (reported isa Integer && reported >= 0 && reported <= typemax(Int64)) ||
+        throw(ValidationError("source reports an invalid length $(repr(reported))"))
     return SourceFile(
         src,
         Int64(reported),
@@ -916,19 +916,35 @@ function _readspans(sf::SourceFile, spans::Vector{NTuple{2,Int64}})
         end
         return results
     end
-    next = Threads.Atomic{Int}(1)
+    queue = _SpanQueue(0)
     try
         @sync for _ = 1:k
-            Threads.@spawn while true
-                i = Threads.atomic_add!(next, 1)
-                i > n && break
-                results[i] = _fetchexact(sf, spans[i][1], spans[i][2])
-            end
+            errormonitor(Threads.@spawn _readworker!(results, sf, spans, queue))
         end
     catch e
         rethrow(_firstcause(e))
     end
     return results
+end
+
+# The shared request counter of one round's worker pool.
+mutable struct _SpanQueue
+    @atomic next::Int
+end
+
+# One worker: claim the next request index, read it into its slot, repeat.
+function _readworker!(
+    results::Vector{Vector{UInt8}},
+    sf::SourceFile,
+    spans::Vector{NTuple{2,Int64}},
+    queue::_SpanQueue,
+)
+    n = length(spans)
+    while true
+        i = @atomic queue.next += 1
+        i > n && return nothing
+        results[i] = _fetchexact(sf, spans[i][1], spans[i][2])
+    end
 end
 
 # The underlying exception of a failed worker task (`@sync` wraps it).

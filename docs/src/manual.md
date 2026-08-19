@@ -249,7 +249,7 @@ selected (and filter-referenced) columns, coalesced into a few range reads:
 three rounds of requests, however many columns and batches the file holds.
 
 With [CloudStore.jl](https://github.com/JuliaServices/CloudStore.jl)
-loaded, a `CloudStore.Object` (S3, Azure Blob Storage, GCS) is such a source
+loaded, a `CloudStore.Object` (S3 or Azure Blob Storage) is such a source
 directly, and its planned ranges are requested concurrently:
 
 ```julia
