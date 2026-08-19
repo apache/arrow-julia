@@ -38,7 +38,7 @@ scope of every layer.
 | `src/cdata.jl` | C data and C stream interfaces both directions: zero-copy ownership, move semantics, exactly-once release, field and schema metadata transport |
 | `src/scan.jl` | `Tables.Scan` pushdown over the file format, sparse byte-range reads (`RangedSource`/`RangedFile`), embedded per-batch statistics |
 | `src/table.jl`, `src/write.jl` | The facade |
-| `src/ArrowStrings/` | ArrowStrings.jl — the shared inline-else-view string representation (`CompactString`, `CompactStringVector` = Utf8View memory); a separate package, registered on its own like ArrowTypes, that Arrow depends on through a `[sources]` path entry until its first release |
+| `src/ArrowStrings/` | ArrowStrings.jl — the shared inline-else-view string representation (`ArrowString`, `ArrowStringVector` = Utf8View memory); a separate package, registered on its own like ArrowTypes, that Arrow depends on through a `[sources]` path entry until its first release |
 | `src/ArrowTypes/` | ArrowTypes.jl — the custom-type interface package (not used by 3.0 yet) |
 | `test/` | Core unit tests, facade tests, the four adapter acceptance batteries, the frozen 2.x-written fixtures, the `--trim=safe` gate |
 | `conformance/` | The arrow-testing gold-corpus runner, the integration-JSON implementation, the pyarrow/nanoarrow IPC oracle, the in-process pyarrow C Data / C Stream oracle |
@@ -169,14 +169,14 @@ adapter normalizes). Julia vectors wrapped zero-copy by the builders or `heapreg
 scoped borrows: they must not be resized or mutated while their `ArrayData`
 or cached validation results are in use.
 
-`fromcompactviews` wraps a vector of Arrow view entries (ArrowStrings'
-`CompactStringPayload`, or any 16-byte isbits type with that layout) and
+`fromviewentries` wraps a vector of Arrow view entries (ArrowStrings'
+`ArrowStringPayload`, or any 16-byte isbits type with that layout) and
 its data buffers as a Utf8View column, zero-copy — the payload vector IS the
 views buffer and every data buffer is retained by identity; only the
 validity bitmap is built, and long-entry geometry (offsets inside their
 buffer, prefixes matching the data) is checked by semantic/full validation,
 not at construction. The facade's `Arrow.write` routes
-`ArrowStrings.CompactStringVector` columns through it.
+`ArrowStrings.ArrowStringVector` columns through it.
 
 ### IPC
 

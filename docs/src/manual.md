@@ -320,7 +320,7 @@ At the *top level* of a column the facade adds:
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
 | `NamedTuple` whose fields are core columns | Struct (no top-level nulls — wrap fields as nullable children instead) |
 | `Arrow.DictEncode` over a core column | Dictionary of the wrapped mapping |
-| `ArrowStrings.CompactStringVector` | Utf8View, **zero-copy** — the column's memory is the Arrow array (see below) |
+| `ArrowStrings.ArrowStringVector` | Utf8View, **zero-copy** — the column's memory is the Arrow array (see below) |
 
 The top-level conversions do not recurse: a `Vector{Date}` inside a list, a
 `Date` or `SubString` field of a `NamedTuple`, or `DictEncode` over dates
@@ -336,9 +336,9 @@ round trip.
 
 [ArrowStrings.jl](https://github.com/apache/arrow-julia/tree/main/src/ArrowStrings)
 (a separate package that lives in this repository) defines
-`CompactString`, a 16-byte string value that *is* an Arrow StringView entry
+`ArrowString`, a 16-byte string value that *is* an Arrow StringView entry
 (inline up to 12 bytes, otherwise a prefix plus buffer index and offset),
-and `CompactStringVector`, a column of them over a set of byte buffers —
+and `ArrowStringVector`, a column of them over a set of byte buffers —
 which *is* an Arrow Utf8View array's memory. CSV.jl parses string columns
 into this representation, so `Arrow.write` on such a column wraps its
 payload vector and buffers as the Arrow column without copying or

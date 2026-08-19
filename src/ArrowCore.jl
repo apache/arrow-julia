@@ -91,7 +91,7 @@ export OwnerRegion, BufferSlice, heapregion, mmapregion, close!, ReleaseCell,
     LayoutSpec, layoutspec, BufferRole,
     validate_structural, validate_semantic, validate_full, ValidationError,
     nullcount, getvalue, materialize,
-    fromjulia, fromcompactviews, batch
+    fromjulia, fromviewentries, batch
 
 # ---------------------------------------------------------------------------
 # §1 Memory: regions as GC anchors (constrained model)
@@ -2749,12 +2749,12 @@ function fromjulia_dict(name, pool::Vector, indices0::Vector)
 end
 
 """
-    fromcompactviews(name, payloads::Vector{P}, buffers::Vector{Vector{UInt8}}; nullable=true) -> (Field, ArrayData)
-    fromcompactviews(name, payloads::Vector{P}, buf, extra; nullable=true)
+    fromviewentries(name, payloads::Vector{P}, buffers::Vector{Vector{UInt8}}; nullable=true) -> (Field, ArrayData)
+    fromviewentries(name, payloads::Vector{P}, buf, extra; nullable=true)
 
 Wrap a vector of Arrow view entries as a Utf8View column, ZERO-COPY. `P` is
 any 16-byte isbits type whose values are Arrow StringView entries — the
-representation ArrowStrings' `CompactString` columns use:
+representation ArrowStrings' `ArrowString` columns use:
 
     bytes 0..3    Int32 content length (-1 marks a null slot)
     bytes 4..15   the content, zero-padded            (length ≤ 12)
@@ -2772,21 +2772,21 @@ the data) is checked where every builder's is — by
 `validate_semantic`/`validate_full` — not here. The scoped-borrow rule of
 every zero-copy wrap applies to every vector passed in.
 """
-fromcompactviews(name, payloads::Vector{P}, buf::Vector{UInt8},
+fromviewentries(name, payloads::Vector{P}, buf::Vector{UInt8},
     extra::Vector{UInt8}; nullable::Bool=true) where {P} =
-    fromcompactviews(name, payloads, Vector{UInt8}[buf, extra]; nullable=nullable)
+    fromviewentries(name, payloads, Vector{UInt8}[buf, extra]; nullable=nullable)
 
-function fromcompactviews(name, payloads::Vector{P},
+function fromviewentries(name, payloads::Vector{P},
     buffers::Vector{Vector{UInt8}}; nullable::Bool=true) where {P}
     isbitstype(P) && sizeof(P) == 16 ||
-        throw(ArgumentError("compact view payloads must be a 16-byte isbits type"))
+        throw(ArgumentError("view-entry payloads must be a 16-byte isbits type"))
     # `buffers` may be empty: an all-inline column has zero variadic data
     # buffers, which the format allows.
     # The entry words are values assembled by shifts; Arrow's byte layout is
     # what those values spell out on a little-endian host, and Core reads
     # view entries host-natively.
     _native_endianness() == LittleEndian ||
-        throw(ArgumentError("fromcompactviews requires a little-endian host"))
+        throw(ArgumentError("fromviewentries requires a little-endian host"))
     n = length(payloads)
     present = Vector{Bool}(undef, n)
     nnull = 0

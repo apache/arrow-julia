@@ -1045,7 +1045,7 @@ end
     end
 
     @testset "ArrowStrings columns write as Utf8View, zero-copy" begin
-        # A CompactStringVector's memory IS a Utf8View array: payloads are the
+        # A ArrowStringVector's memory IS a Utf8View array: payloads are the
         # views buffer, its byte buffers the variadic data buffers. Build one
         # the way the CSV kernel does (inline ≤12, else a view into buffer 0
         # or the `extra` buffer 1) and check the writer wraps rather than
@@ -1055,13 +1055,13 @@ end
         extra = Vector{UInt8}(codeunits("she said \"hi\" and left"))
         long1 = first(findfirst(codeunits("thirteen-byte"), buf))
         abcd = first(findfirst(codeunits("abcd"), buf))
-        payloads = CompactStringPayload[
+        payloads = ArrowStringPayload[
             ArrowStrings.inline_payload(buf, abcd, 4),
             ArrowStrings.view_payload(buf, long1, 13, 0, long1 - 1),
             ArrowStrings.PAYLOAD_MISSING,
             ArrowStrings.view_payload(extra, 1, length(extra), 1, 0),
         ]
-        col = CompactStringVector{Union{Missing,CompactString}}(payloads, buf, extra)
+        col = ArrowStringVector{Union{Missing,ArrowString}}(payloads, buf, extra)
         f, d = Arrow._writecolumn("s", col)
         @test f.type == Arrow.AC.ViewType(true) && f.nullable
         @test d.buffers[2].region.root === payloads       # views: the payload vector itself
@@ -1075,7 +1075,7 @@ end
         @test eltype(t.s) === Union{Missing,String}
         @test isequal(t.s, ["abcd", "thirteen-byte", missing, "she said \"hi\" and left"])
         # a non-nullable column declares non-nullable
-        col0 = CompactStringVector{CompactString}(payloads[[1, 2]], buf, extra)
+        col0 = ArrowStringVector{ArrowString}(payloads[[1, 2]], buf, extra)
         f0, _ = Arrow._writecolumn("s", col0)
         @test !f0.nullable
         Arrow.write(io, (s=col0,))
@@ -1083,7 +1083,7 @@ end
         # an all-inline column may have ZERO data buffers — the format allows
         # a Utf8View with no variadic buffers, and the wire carries exactly
         # the fixed validity + views pair
-        inl = CompactStringVector{CompactString}(
+        inl = ArrowStringVector{ArrowString}(
             [ArrowStrings.inline_payload(buf, abcd, 4),
              ArrowStrings.inline_payload(buf, abcd, 2)], Vector{Vector{UInt8}}())
         fi, di = Arrow._writecolumn("s", inl)

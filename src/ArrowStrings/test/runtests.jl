@@ -21,14 +21,14 @@ const AS = ArrowStrings
 
 # --- helpers (top-level so allocation probes measure the loop, not closures) --
 
-function csfrombytes(bytes::Vector{UInt8})
+function asfrombytes(bytes::Vector{UInt8})
     n = length(bytes)
-    n <= AS.INLINE_MAX && return CompactString(AS.inline_payload(bytes, 1, n), AS.EMPTY_BYTES)
-    return CompactString(AS.view_payload(bytes, 1, n, 0, 0), bytes)
+    n <= AS.INLINE_MAX && return ArrowString(AS.inline_payload(bytes, 1, n), AS.EMPTY_BYTES)
+    return ArrowString(AS.view_payload(bytes, 1, n, 0, 0), bytes)
 end
 
-function csscratchbytes(s::CompactString)
-    r = Ref(AS._cs_scratch(s))
+function asscratchbytes(s::ArrowString)
+    r = Ref(AS._payload_scratch(s))
     out = Vector{UInt8}(undef, 16)
     GC.@preserve r begin
         p = Ptr{UInt8}(Base.unsafe_convert(Ptr{Tuple{UInt64, UInt64}}, r))
@@ -37,14 +37,14 @@ function csscratchbytes(s::CompactString)
     return out
 end
 
-function foldcshash(v, h::UInt)
+function foldashash(v, h::UInt)
     @inbounds for x in v
         h = hash(x, h)
     end
     return h
 end
 
-function foldcscmp(v)
+function foldascmp(v)
     s = 0
     @inbounds for i in 2:length(v)
         s += cmp(v[i - 1], v[i]) + (v[i - 1] == v[i])
@@ -52,7 +52,7 @@ function foldcscmp(v)
     return s
 end
 
-function sumncodeunits(c::CompactStringVector{CompactString})
+function sumncodeunits(c::ArrowStringVector{ArrowString})
     t = 0
     for i in eachindex(c)
         t += ncodeunits(c[i])
@@ -63,16 +63,16 @@ end
 # Allocation is measured INSIDE type-stable top-level functions: an
 # `@allocated` in testset scope can charge the closure's own boxing (16
 # bytes on Julia 1.10) to the kernel it is measuring.
-allocated_hash(v::Vector{CompactString}) = @allocated(foldcshash(v, UInt(9)))
-allocated_cmp(v::Vector{CompactString}) = @allocated(foldcscmp(v))
-allocated_access(c::CompactStringVector{CompactString}) = @allocated(sumncodeunits(c))
+allocated_hash(v::Vector{ArrowString}) = @allocated(foldashash(v, UInt(9)))
+allocated_cmp(v::Vector{ArrowString}) = @allocated(foldascmp(v))
+allocated_access(c::ArrowStringVector{ArrowString}) = @allocated(sumncodeunits(c))
 
 # A column from Strings, laid out the CSV way: inline when it fits, else a
 # view into buffer 0 (`buf`), or into buffer 1 (`extra`) when `inextra(i)`.
 function column(strings::Vector; inextra = i -> false)
     buf = UInt8[]
     extra = UInt8[]
-    payloads = CompactStringPayload[]
+    payloads = ArrowStringPayload[]
     for (i, s) in enumerate(strings)
         if s === missing
             push!(payloads, AS.PAYLOAD_MISSING)
@@ -89,8 +89,8 @@ function column(strings::Vector; inextra = i -> false)
             push!(payloads, AS.view_payload(target, off0 + 1, n, inextra(i) ? 1 : 0, off0))
         end
     end
-    ELT = any(ismissing, strings) ? Union{Missing, CompactString} : CompactString
-    return CompactStringVector{ELT}(payloads, buf, extra)
+    ELT = any(ismissing, strings) ? Union{Missing, ArrowString} : ArrowString
+    return ArrowStringVector{ELT}(payloads, buf, extra)
 end
 
 @testset "ArrowStrings" begin
@@ -102,7 +102,7 @@ end
     @test words[1:4] == reinterpret(UInt8, Int32[5])
     @test words[5:9] == codeunits("hello")
     @test all(iszero, words[10:16])
-    @test AS.cslen(p) == 5
+    @test AS.payloadlength(p) == 5
     # view: bytes 0..3 length, 4..7 prefix, 8..11 buffer index, 12..15 offset
     data = Vector{UInt8}(codeunits("xxthirteen-bytesyy"))
     q = AS.view_payload(data, 3, 13, 1, 2)
@@ -111,21 +111,21 @@ end
     @test words[5:8] == codeunits("thir")
     @test words[9:12] == reinterpret(UInt8, Int32[1])
     @test words[13:16] == reinterpret(UInt8, Int32[2])
-    @test AS.cslen(q) == 13 && AS.csbufidx(q) == 1 && AS.csoffset(q) == 2 && AS.cspos(q) == 3
+    @test AS.payloadlength(q) == 13 && AS.payloadbufidx(q) == 1 && AS.payloadoffset(q) == 2 && AS.payloadpos(q) == 3
     # missing
-    @test AS.cslen(AS.PAYLOAD_MISSING) == -1
+    @test AS.payloadlength(AS.PAYLOAD_MISSING) == -1
     # rebase moves the offset only
     r = AS.rebase_payload(q, 100)
-    @test AS.csbufidx(r) == 1 && AS.csoffset(r) == 102 && r.a == q.a
+    @test AS.payloadbufidx(r) == 1 && AS.payloadoffset(r) == 102 && r.a == q.a
     # words that do not fit Arrow's Int32 refuse; the boundaries are accepted
     @test_throws ArgumentError AS.view_payload(data, 3, 13, 0, Int64(typemax(Int32)) + 1)
     @test_throws ArgumentError AS.view_payload(data, 3, 13, -1, 0)
     @test_throws ArgumentError AS.rebase_payload(q, Int64(typemax(Int32)))
-    @test AS.csoffset(AS.view_payload(data, 3, 13, 0, Int64(typemax(Int32)))) == typemax(Int32)
-    @test AS.csbufidx(AS.view_payload(data, 3, 13, Int64(typemax(Int32)), 0)) == typemax(Int32)
+    @test AS.payloadoffset(AS.view_payload(data, 3, 13, 0, Int64(typemax(Int32)))) == typemax(Int32)
+    @test AS.payloadbufidx(AS.view_payload(data, 3, 13, Int64(typemax(Int32)), 0)) == typemax(Int32)
     # ... and so does a length outside (12, typemax(Int32)] — an oversized
     # length would otherwise wrap into the null marker
-    @test AS.cslen(AS.view_payload(data, 3, Int(typemax(Int32)), 0, 0)) == typemax(Int32)
+    @test AS.payloadlength(AS.view_payload(data, 3, Int(typemax(Int32)), 0, 0)) == typemax(Int32)
     @test_throws ArgumentError AS.view_payload(data, 3, Int(typemax(Int32)) + 1, 0, 0)
     @test_throws ArgumentError AS.view_payload(data, 3, 12, 0, 0)
     @test_throws ArgumentError AS.view_payload(data, 3, -1, 0, 0)
@@ -142,10 +142,10 @@ end
     end
 end
 
-@testset "CompactString: equality, hashing, ordering agree with String" begin
+@testset "ArrowString: equality, hashing, ordering agree with String" begin
     # inline/view boundary: 12 bytes inline, 13 views the buffer
     col = column(["x"^12, "y"^13])
-    @test col isa CompactStringVector{CompactString}
+    @test col isa ArrowStringVector{ArrowString}
     @test col[1] == "x"^12 && col[2] == "y"^13
     @test ncodeunits(col[1]) == 12 && ncodeunits(col[2]) == 13
     @test String(col[1]) == "x"^12 && String(col[2]) == "y"^13
@@ -164,16 +164,16 @@ end
     pattern = UInt8[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
                     0xff, 0xff, 0xff, 0xff, 0x80, 0xc0, 0x7f, 0x41, 0xfe]
     strings = String[]
-    payloads = CompactString[]
+    payloads = ArrowString[]
     for n in 0:255
         bytes = UInt8[xor(pattern[mod1(i, length(pattern))], UInt8(i % 251)) for i in 1:n]
         push!(strings, String(copy(bytes)))
         if n <= AS.INLINE_MAX
-            push!(payloads, CompactString(AS.inline_payload(bytes, 1, n), AS.EMPTY_BYTES))
+            push!(payloads, ArrowString(AS.inline_payload(bytes, 1, n), AS.EMPTY_BYTES))
         else
             data = vcat(UInt8[0x11], bytes, UInt8[0x22])
             bufidx = isodd(n) ? 1 : 0
-            push!(payloads, CompactString(AS.view_payload(data, 2, n, bufidx, 1), data))
+            push!(payloads, ArrowString(AS.view_payload(data, 2, n, bufidx, 1), data))
         end
     end
     seeds = UInt[0, 1, 7, typemax(UInt), 0x0123456789abcdef]
@@ -183,7 +183,7 @@ end
               collect(codeunits(strings[i])) for i in eachindex(payloads))
     @test all(begin
         n = ncodeunits(payloads[i])
-        bytes = csscratchbytes(payloads[i])
+        bytes = asscratchbytes(payloads[i])
         bytes[1:n] == collect(codeunits(strings[i])) &&
             all(iszero, bytes[(n + 1):end])
     end for i in 1:(AS.INLINE_MAX + 1))
@@ -196,7 +196,7 @@ end
               for i in eachindex(payloads), j in eachindex(payloads))
     @test sortperm(payloads) == sortperm(strings)
     valid = ["a", "abcdefgh1234", "abcdefgh12345", "α", "漢字", "z"^40, "a\0b"]
-    validcs = [csfrombytes(Vector{UInt8}(codeunits(s))) for s in valid]
+    validcs = [asfrombytes(Vector{UInt8}(codeunits(s))) for s in valid]
     substrings = [SubString("!" * s * "?", 2,
                             prevind("!" * s * "?", lastindex("!" * s * "?"))) for s in valid]
     @test all(cmp(validcs[i], substrings[j]) == cmp(valid[i], String(substrings[j])) &&
@@ -211,21 +211,21 @@ end
     allocated_cmp(payloads)
     @test allocated_cmp(payloads) == 0
     # Symbol, promotion, print
-    @test Symbol(csfrombytes(Vector{UInt8}(codeunits("αβγδεζηθικλμ")))) == :αβγδεζηθικλμ
-    @test promote_type(CompactString, String) === String
+    @test Symbol(asfrombytes(Vector{UInt8}(codeunits("αβγδεζηθικλμ")))) == :αβγδεζηθικλμ
+    @test promote_type(ArrowString, String) === String
     io = IOBuffer()
     print(io, col[2])
     @test String(take!(io)) == "y"^13
     @test convert(String, col[1]) == "x"^12
 end
 
-@testset "CompactString: iteration and character indexing match String" begin
+@testset "ArrowString: iteration and character indexing match String" begin
     rng = MersenneTwister(99)
     for _ in 1:200
         n = rand(rng, 0:24)
         bytes = rand(rng, UInt8, n)
         s = String(copy(bytes))
-        v = csfrombytes(copy(bytes))
+        v = asfrombytes(copy(bytes))
         @test collect(v) == collect(s)
         @test v == s && hash(v) == hash(s)
         @test length(v) == length(s)
@@ -244,7 +244,7 @@ end
     end
     for bytes in invalidcases
         s = String(copy(bytes))
-        v = csfrombytes(copy(bytes))
+        v = asfrombytes(copy(bytes))
         @test collect(eachindex(v)) == collect(eachindex(s))
         @test lastindex(v) == lastindex(s)
         for i in 0:(length(bytes) + 1)
@@ -261,16 +261,16 @@ end
     end
 end
 
-@testset "CompactStringVector: buffers, missing, materialize, allocation" begin
+@testset "ArrowStringVector: buffers, missing, materialize, allocation" begin
     strings = ["value$(i)_" * "p"^(i % 20) for i in 1:1000]
     col = column(strings; inextra = i -> i % 3 == 0)
-    @test col isa CompactStringVector{CompactString}
+    @test col isa ArrowStringVector{ArrowString}
     @test length(col) == 1000 && length(col.buffers) == 2
     @test collect(String, col) == strings
     # long values landed in the buffer their index says
     for (i, s) in enumerate(strings)
         ncodeunits(s) > AS.INLINE_MAX || continue
-        @test AS.csbufidx(col.payloads[i]) == (i % 3 == 0 ? 1 : 0)
+        @test AS.payloadbufidx(col.payloads[i]) == (i % 3 == 0 ? 1 : 0)
     end
     allocated_access(col)
     @test allocated_access(col) == 0
@@ -279,32 +279,32 @@ end
 
     withmissing = Any["a", missing, "twelve-bytes", "a much longer value", missing]
     mcol = column(withmissing; inextra = i -> i == 4)
-    @test mcol isa CompactStringVector{Union{Missing, CompactString}}
+    @test mcol isa ArrowStringVector{Union{Missing, ArrowString}}
     @test isequal(collect(mcol), withmissing)
     @test AS.materialize(mcol) isa Vector{Union{String, Missing}}
     @test isequal(AS.materialize(mcol), withmissing)
-    @test eltype(mcol) === Union{Missing, CompactString}
+    @test eltype(mcol) === Union{Missing, ArrowString}
 
     # N buffers: an Arrow Utf8View column may spread views over any number of
     # data buffers; the buffer index selects among them
     b0 = Vector{UInt8}(codeunits("--first-buffer-value--"))
     b1 = Vector{UInt8}(codeunits("second-buffer-value!!"))
     b2 = Vector{UInt8}(codeunits("xxthird buffer, longer value"))
-    payloads = CompactStringPayload[
+    payloads = ArrowStringPayload[
         AS.view_payload(b0, 3, 18, 0, 2),
         AS.view_payload(b1, 1, 19, 1, 0),
         AS.view_payload(b2, 3, 26, 2, 2),
         AS.inline_payload(b1, 1, 6),
     ]
-    ncol = CompactStringVector{CompactString}(payloads, Vector{UInt8}[b0, b1, b2])
+    ncol = ArrowStringVector{ArrowString}(payloads, Vector{UInt8}[b0, b1, b2])
     @test collect(String, ncol) == ["first-buffer-value", "second-buffer-value", "third buffer, longer value", "second"]
     # a payload naming a buffer the column does not have is a clean error
-    bad = CompactStringVector{CompactString}([AS.view_payload(b0, 3, 18, 7, 2)], Vector{UInt8}[b0])
+    bad = ArrowStringVector{ArrowString}([AS.view_payload(b0, 3, 18, 7, 2)], Vector{UInt8}[b0])
     @test_throws BoundsError bad[1]
     # rebase: appending one buffer to another re-points its entries
     combined = vcat(b0, b1)
     rebased = AS.rebase_payload(payloads[2], length(b0))
-    @test String(CompactString(rebased, combined)) == "second-buffer-value"
+    @test String(ArrowString(rebased, combined)) == "second-buffer-value"
 end
 
 end

@@ -730,12 +730,12 @@ end
         @test getvalue(llvf, llvd, 1) == [2, 3]
     end
 
-    @testset "fromcompactviews: CompactString payloads → Utf8View, zero-copy" begin
-        # A local encoder of the CSV kernel's 16-byte payload, which IS an
-        # Arrow view entry: length | first 4 bytes, then bytes 5..12 (≤12) or
-        # (Int32 buffer index, Int32 0-based offset). Any 16-byte isbits type
-        # is accepted; the kernel's is a two-field struct.
-        struct CompactPayload
+    @testset "fromviewentries: ArrowString payloads → Utf8View, zero-copy" begin
+        # A local encoder of the ArrowStrings payload (Core cannot depend on
+        # the package), which IS an Arrow view entry: length | first 4 bytes,
+        # then bytes 5..12 (≤12) or (Int32 buffer index, Int32 0-based
+        # offset). Any 16-byte isbits type is accepted.
+        struct ViewEntry
             a::UInt64
             b::UInt64
         end
@@ -749,17 +749,17 @@ end
             for i = 5:len
                 b |= UInt64(bytes[i]) << (8 * (i - 5))
             end
-            return CompactPayload(a, b)
+            return ViewEntry(a, b)
         end
         function viewentry(data::Vector{UInt8}, pos1::Int, len::Int, bufidx::Int)
             a = UInt64(len % UInt32)
             for i = 1:4
                 a |= UInt64(data[pos1 + i - 1]) << (32 + 8 * (i - 1))
             end
-            return CompactPayload(a,
+            return ViewEntry(a,
                 UInt64(bufidx % UInt32) | (UInt64((pos1 - 1) % UInt32) << 32))
         end
-        nullentry() = CompactPayload(UInt64(0xffffffff), zero(UInt64))
+        nullentry() = ViewEntry(UInt64(0xffffffff), zero(UInt64))
 
         # buf: a "CSV input" with fields at known positions; extra: one
         # unescaped-at-parse-time long value.
@@ -767,7 +767,7 @@ end
         long1 = findfirst(codeunits("thirteen-byte"), buf)
         long2 = findfirst(codeunits("a much longer value here"), buf)
         extra = collect(codeunits("she said \"hi\" and left"))
-        payloads = CompactPayload[
+        payloads = ViewEntry[
             inlineentry(UInt8[]),                                    # ""  (len 0)
             inlineentry(collect(codeunits("abcd"))),                 # len 4 (a only)
             inlineentry(collect(codeunits("twelve-bytes"))),         # len 12 (inline max)
@@ -776,7 +776,7 @@ end
             viewentry(buf, first(long2), 24, 0),                     # long: buf
             viewentry(extra, 1, length(extra), 1),                   # long: extra
         ]
-        f, d = fromcompactviews("s", payloads, buf, extra)
+        f, d = fromviewentries("s", payloads, buf, extra)
         @test f.type == ViewType(true)
         @test f.nullable
         @test length(d) == 7
@@ -807,7 +807,7 @@ end
 
         # no nulls, empty extra: the empty bitmap and an empty second data
         # buffer (buffer index 1 always means `extra`)
-        f0, d0 = fromcompactviews("t", payloads[[2, 3]], buf, UInt8[]; nullable=false)
+        f0, d0 = fromviewentries("t", payloads[[2, 3]], buf, UInt8[]; nullable=false)
         @test !f0.nullable
         @test length(d0.buffers) == 4
         @test AC.isempty_buffer(d0.buffers[1])
@@ -823,15 +823,15 @@ end
         # malformed long entries construct (a wrap makes no promises about
         # content) and refuse where every builder's output does: validation
         for bad in (viewentry(extra, 1, length(extra), 1) => UInt8[],  # extra referenced but empty
-                    CompactPayload(payloads[6].a,
+                    ViewEntry(payloads[6].a,
                         UInt64(0) | (UInt64(length(buf) - 3) << 32)) => extra,   # escapes buf
-                    CompactPayload(payloads[6].a, UInt64(7)) => extra)            # buffer index 7
-            fb, db = fromcompactviews("t", [bad.first], buf, bad.second)
+                    ViewEntry(payloads[6].a, UInt64(7)) => extra)            # buffer index 7
+            fb, db = fromviewentries("t", [bad.first], buf, bad.second)
             @test_throws ValidationError validate_semantic(fb, db)
         end
         # wrong payload width and non-isbits payloads are constructor errors
-        @test_throws ArgumentError fromcompactviews("t", UInt64[1, 2], buf, extra)
-        @test_throws ArgumentError fromcompactviews("t", Any[1], buf, extra)
+        @test_throws ArgumentError fromviewentries("t", UInt64[1, 2], buf, extra)
+        @test_throws ArgumentError fromviewentries("t", Any[1], buf, extra)
     end
 end
 

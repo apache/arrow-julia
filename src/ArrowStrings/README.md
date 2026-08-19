@@ -24,17 +24,17 @@ kept as its own package (registered separately, like `ArrowTypes.jl`, from
 this subdirectory of the arrow-julia repository) so that either package can
 depend on it without depending on the other.
 
-* `CompactString <: AbstractString` — a 16-byte string value that **is** an
+* `ArrowString <: AbstractString` — a 16-byte string value that **is** an
   Arrow StringView entry: strings of up to 12 bytes are stored inline;
   longer strings are a 4-byte prefix plus `(Int32 buffer index, Int32
   offset)` into a byte buffer. Byte access, `==`, `cmp`/`isless`, `hash`,
   and iteration never allocate and agree with `String`; `String(s)` copies
   out.
-* `CompactStringVector{ELT}` — a column of them: a payload vector plus the
+* `ArrowStringVector{ELT}` — a column of them: a payload vector plus the
   byte buffers the views point into. That is an Arrow Utf8View array's
   memory (views buffer + variadic data buffers), so a column crosses to
   Arrow — and an Arrow Utf8View column comes back — without copying.
-  `ELT` is `CompactString` or `Union{Missing, CompactString}`; `getindex`
+  `ELT` is `ArrowString` or `Union{Missing, ArrowString}`; `getindex`
   allocates nothing; `materialize` copies out to `Vector{String}`.
 
 Everything depends only on Base and is concrete-typed, so it compiles under
@@ -45,6 +45,6 @@ using ArrowStrings
 buf = Vector{UInt8}(codeunits("id,name\n1,abcd\n2,a much longer value\n"))
 payloads = [ArrowStrings.inline_payload(buf, 11, 4),
             ArrowStrings.view_payload(buf, 18, 19, 0, 17)]
-col = CompactStringVector{CompactString}(payloads, buf, UInt8[])
+col = ArrowStringVector{ArrowString}(payloads, buf, UInt8[])
 col[2] == "a much longer value"     # true, no allocation
 ```
