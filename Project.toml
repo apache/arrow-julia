@@ -32,10 +32,13 @@ Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 
 # ArrowStrings lives in this repository (src/ArrowStrings) and is registered
-# separately, like ArrowTypes; until its first release resolves from the
-# registry, the source entry points at the subdirectory.
+# separately, like ArrowTypes; the source entry resolves it from the
+# subdirectory. `Tables.Scan` is not in a Tables.jl release yet, so Tables
+# resolves from its `jq/scan` branch. Pkg reads `[sources]` from Julia 1.11;
+# on 1.10 the CI workflow adds both explicitly.
 [sources]
 ArrowStrings = {path = "src/ArrowStrings"}
+Tables = {url = "https://github.com/JuliaData/Tables.jl", rev = "jq/scan"}
 
 [weakdeps]
 CloudStore = "3365d9ee-d53b-4a56-812d-5344d5b716d7"
