@@ -36,7 +36,7 @@ scope of every layer.
 | `src/ipc_read.jl` | Checked IPC stream framing, resource limits, metadata-to-Core mapping, dictionary state, one registry-driven decoder, per-buffer decompression |
 | `src/ipc_write.jl` | The write half over the same registry: Core-to-metadata mapping, one generic registry-driven encoder, replacement-on-change dictionary batches, per-buffer compression, the file format (Block index + Footer), and the lazy random-access `ArrowFile` reader |
 | `src/cdata.jl` | C data and C stream interfaces both directions: zero-copy ownership, move semantics, exactly-once release, field and schema metadata transport |
-| `src/source.jl` | The `AbstractArrowSource` byte-range source interface (`sourcelength`, `readrange`, `readranges`) |
+| `src/source.jl` | The `AbstractArrowSource` byte-range source interface (`sourcelength`, `readrange`, `concurrentreads`) |
 | `src/scan.jl` | `Tables.Scan` pushdown over the file format, sparse byte-range reads over a source (`SourceFile`), embedded per-batch statistics |
 | `src/table.jl`, `src/write.jl` | The facade |
 | `ext/ArrowCloudStoreExt.jl` | CloudStore.jl objects as sources: HTTP `Range` reads, concurrent per planned range |

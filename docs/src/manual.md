@@ -271,10 +271,12 @@ Arrow.readrange(s::HTTPSource, offset, len) = fetchbytes(s.url, offset, len)  # 
 tbl = Arrow.Table(HTTPSource(url, objectsize); scan = Scan(select = (:id,)))
 ```
 
-Overriding [`Arrow.readranges`](@ref) lets a transport issue the planned
-ranges concurrently; the default reads them one at a time. Without a scan
-the whole object is read; a stream-format object (no footer) is always read
-whole. Arrow.jl has no HTTP or cloud dependency of its own.
+Overriding [`Arrow.concurrentreads`](@ref) lets Arrow issue a round's
+planned ranges concurrently through `readrange` (up to that many at a
+time, results placed by request); the default reads them one at a time.
+Without a scan the whole object is read, as is a stream-format object (no
+footer) and a scan that cannot be pushed down. Arrow.jl has no HTTP or
+cloud dependency of its own.
 
 ## Writing
 

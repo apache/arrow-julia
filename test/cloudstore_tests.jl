@@ -44,13 +44,12 @@ using CloudBase.CloudTest: Minio
         CloudStore.put(bucket, "t.arrows", streambytes; credentials=credentials)
         obj = CloudStore.Object(bucket, "t.arrow"; credentials=credentials)
         @test Arrow.sourcelength(ext.CloudObjectSource(obj)) == length(filebytes)
-        # one range, and the batched form, byte-exact against the object
+        # one range, byte-exact against the object; a bounded concurrency
         src = ext.CloudObjectSource(obj)
         @test Arrow.readrange(src, 8, 16) == filebytes[9:24]
-        @test Arrow.readranges(
-            src,
-            NTuple{2,Int64}[(0, 6), (100, 50), (length(filebytes) - 6, 6)],
-        ) == [filebytes[1:6], filebytes[101:150], filebytes[(end - 5):end]]
+        @test Arrow.readrange(src, length(filebytes) - 6, 6) == filebytes[(end - 5):end]
+        @test Arrow.readrange(src, 0, 0) == UInt8[]
+        @test Arrow.concurrentreads(src) == ext.CONCURRENT_RANGE_READS > 1
         # a projected, windowed scan over the object
         t = Arrow.Table(obj; scan=Tables.Scan(select=(:b,), limit=3, offset=1500))
         @test Tables.columnnames(t) == [:b]
@@ -68,6 +67,15 @@ using CloudBase.CloudTest: Minio
         @test st.a == mem.a && st.b == mem.b
         @test [length(batch.a) for batch in Arrow.Stream(sobj)] == [1000, 1000]
         @test [length(batch.a) for batch in Arrow.Stream(obj)] == [1000, 1000]
+        # A handle is pinned to the object version it was made from: after the
+        # key is overwritten, its next range read fails (If-Match) rather than
+        # mixing bytes of two versions across request rounds.
+        stale = ext.CloudObjectSource(obj)
+        CloudStore.put(bucket, "t.arrow", streambytes; credentials=credentials)
+        @test_throws Exception Arrow.readrange(stale, 8, 16)
+        @test_throws Exception Arrow.Table(obj; scan=Tables.Scan(select=(:a,)))
+        fresh = CloudStore.Object(bucket, "t.arrow"; credentials=credentials)
+        @test Arrow.Table(fresh).a == mem.a
     end
 end
 

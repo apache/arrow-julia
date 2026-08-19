@@ -603,14 +603,18 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
 
     # Coalescing: an infinite gap merges every body range into one request;
     # a zero gap issues more, smaller requests; both agree with the truth.
+    # (A small tail window, so the ranges are planned rather than served
+    # from the cached tail.)
     logbig, srcbig = countingsource(filebytes)
     gotbig = Tables.scan(
-        SourceFile(srcbig; coalesce_gap=typemax(Int32)),
+        SourceFile(srcbig; tailbytes=256, coalesce_gap=typemax(Int32)),
         Tables.Scan(select=(:ints, :strs)),
     )
     logzero, srczero = countingsource(filebytes)
-    gotzero =
-        Tables.scan(SourceFile(srczero; coalesce_gap=0), Tables.Scan(select=(:ints, :strs)))
+    gotzero = Tables.scan(
+        SourceFile(srczero; tailbytes=256, coalesce_gap=0),
+        Tables.Scan(select=(:ints, :strs)),
+    )
     want = Tables.scan(full, Tables.Scan(select=(:ints, :strs)))
     @assert _tables_equal(gotbig, want) && _tables_equal(gotzero, want)
     @assert logbig.requests < logzero.requests

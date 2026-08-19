@@ -49,9 +49,10 @@ One exception: a scan that cannot run in the storage domain — a filter
 literal with no exact storage representation (a cross-domain or
 out-of-range value), or an empty projection (`select=()`), whose row count
 only the full read can carry — falls back to reading the whole source and
-evaluating over the converted public values. Over a ranged source that
-fallback fetches the entire object, as does reading a zero-field source;
-plan remote filters in each column's public value domain.
+evaluating over the converted public values. An `AbstractArrowSource` is
+read whole in that fallback, as it is without a scan, for a zero-field
+file, and for a stream-format object; plan remote filters in each column's
+public value domain.
 
 Columns are materialized (plain `Vector`s): the returned table does not
 borrow the source bytes, and [`Arrow.close!`](@ref) may be called at any
@@ -462,8 +463,9 @@ const _FILE_MAGIC = b"ARROW1"
 
 _isfilebytes(bytes::Vector{UInt8}) = length(bytes) >= 6 && view(bytes, 1:6) == _FILE_MAGIC
 
-function _openbytes(bytes::Vector{UInt8})
-    return _isfilebytes(bytes) ? readfile(bytes) : readstream(bytes)
+function _openbytes(bytes::Vector{UInt8}; limits::Limits=Limits())
+    return _isfilebytes(bytes) ? readfile(bytes; limits=limits) :
+           readstream(bytes; limits=limits)
 end
 
 function _opensource(path::AbstractString; mmap::Bool=true)
@@ -503,34 +505,30 @@ _sourceregions(f::ArrowFile) = AC.OwnerRegion[f.region]
 function Table(source; scan::Union{Nothing,Tables.Scan}=nothing, mmap::Bool=true)
     if source isa AbstractArrowSource || source isa SourceFile
         sf = source isa SourceFile ? source : SourceFile(source)
-        # A stream-format object has no footer to plan from: read it whole
-        # (its tail window is already in hand) and scan after decode.
-        _isfilesource(sf) || return Table(_wholeobject(sf); scan=scan)
-        # The schema up front (from the cached tail): literal lowering,
-        # exactly-once output conversion, and DataAPI metadata all need it.
-        sch, rfields = _sourceschema(sf)
-        theScan = scan === nothing ? Tables.Scan() : scan
-        if isempty(rfields)
-            # A zero-field object is bytes-tiny; read it whole so the row
-            # count survives the read.
-            bytes = _wholeobject(sf)
-            return _publicscan(
-                _materialize_table(readfile(bytes; limits=sf.limits), AC.OwnerRegion[]),
-                sch,
-                rfields,
-                theScan,
-                AC.OwnerRegion[],
-            )
+        # Range planning pays off only for a pushable scan over a file-format
+        # object with columns. With a scan the schema comes up front from
+        # the cached tail: literal lowering, exactly-once output conversion,
+        # and DataAPI metadata all need it.
+        if scan !== nothing && _isfilesource(sf)
+            sch, rfields = _sourceschema(sf)
+            if !isempty(rfields)
+                pushscan, pushable = _lowerscan(scan, rfields)
+                pushable &&
+                    return _wrapscanned(Tables.scan(sf, pushscan), sch, rfields, scan)
+            end
         end
-        pushscan, pushable = _lowerscan(theScan, rfields)
-        if pushable
-            got = Tables.scan(sf, pushscan)
-            return _wrapscanned(got, sch, rfields, theScan)
-        end
-        full = _wrapscanned(Tables.scan(sf, Tables.Scan()), sch, rfields, Tables.Scan())
-        return _publicscan(full, sch, rfields, theScan, AC.OwnerRegion[])
+        # No scan, a stream-format object (no footer to plan from), a
+        # zero-field file (bytes-tiny; the whole read carries its row count),
+        # or a scan that cannot be pushed down: read the object whole — its
+        # tail window is already in hand — and proceed as with bytes.
+        return _tablefrom(_openbytes(_wholeobject(sf); limits=sf.limits), scan)
     end
-    src = _opensource(source; mmap=mmap)
+    return _tablefrom(_opensource(source; mmap=mmap), scan)
+end
+
+# A Table from an opened IPC source: the whole thing, or a scan pushed
+# where the format can prove it and evaluated over the rest.
+function _tablefrom(src::Union{IPCStream,ArrowFile}, scan::Union{Nothing,Tables.Scan})
     regions = _sourceregions(src)
     fields = _corefields(src)
     scan === nothing && return _materialize_table(src, regions)

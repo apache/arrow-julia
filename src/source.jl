@@ -38,11 +38,15 @@ An implementation defines two methods:
 
 and may override
 
-    Arrow.readranges(src, ranges::Vector{NTuple{2,Int64}}) -> Vector{Vector{UInt8}}
+    Arrow.concurrentreads(src)::Int                   # default 1
 
-whose default reads the planned `(offset, len)` ranges one at a time through
-`readrange`; a transport that can issue them concurrently should. Every
-returned vector must have exactly the requested length.
+to let Arrow issue the planned ranges of one round through `readrange`
+concurrently, at most that many at a time (Arrow places each result by its
+request, so completion order never matters). Every returned vector must have
+exactly the requested length; Arrow validates lengths and offsets and
+refuses violations with a `ValidationError`, but the source is trusted to
+return the bytes that live at the requested range — Arrow cannot
+authenticate them.
 
 ```julia
 struct BytesSource <: Arrow.AbstractArrowSource
@@ -77,11 +81,12 @@ elements. Required of every implementation.
 function readrange end
 
 """
-    Arrow.readranges(src::AbstractArrowSource, ranges::Vector{NTuple{2,Int64}}) -> Vector{Vector{UInt8}}
+    Arrow.concurrentreads(src::AbstractArrowSource) -> Int
 
-One result per requested `(offset, len)`, in order. The default reads them
-serially through [`Arrow.readrange`](@ref); a transport overrides this to
-issue the planned ranges concurrently.
+How many [`Arrow.readrange`](@ref) calls Arrow may have in flight at once
+when it fetches the planned ranges of one round. The default, `1`, reads
+them one at a time; a transport whose requests are independent (HTTP range
+GETs) returns a bound suited to it. Arrow runs a worker pool of that size
+and stores every result by request index.
 """
-readranges(src::AbstractArrowSource, ranges::Vector{NTuple{2,Int64}}) =
-    Vector{UInt8}[readrange(src, off, len) for (off, len) in ranges]
+concurrentreads(::AbstractArrowSource) = 1

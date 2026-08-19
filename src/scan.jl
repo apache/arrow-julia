@@ -769,6 +769,9 @@ struct SourceFile{S<:AbstractArrowSource}
     # The last `tailbytes` of the object, read once and reused by every
     # footer parse and format probe on this handle: `(bytes, tailstart)`.
     tail::Base.RefValue{Union{Nothing,Tuple{Vector{UInt8},Int64}}}
+    # A Footer that did not fit in the tail window, read once as
+    # `(footerstart, bytes)` and reused by every footer parse on this handle.
+    footer::Base.RefValue{Union{Nothing,Tuple{Int64,Vector{UInt8}}}}
 end
 function SourceFile(
     src::AbstractArrowSource;
@@ -778,15 +781,17 @@ function SourceFile(
 )
     gap = Int64(coalesce_gap)
     gap >= 0 || throw(ArgumentError("negative coalesce gap"))
-    len = Int64(sourcelength(src))
-    len >= 0 || throw(ValidationError("source reports a negative length"))
+    reported = sourcelength(src)
+    (reported >= 0 && reported <= typemax(Int64)) ||
+        throw(ValidationError("source reports an invalid length $reported"))
     return SourceFile(
         src,
-        len,
+        Int64(reported),
         limits,
         Int64(max(tailbytes, 32)),
         gap,
         Base.RefValue{Union{Nothing,Tuple{Vector{UInt8},Int64}}}(nothing),
+        Base.RefValue{Union{Nothing,Tuple{Int64,Vector{UInt8}}}}(nothing),
     )
 end
 
@@ -799,6 +804,18 @@ function _fetchtail(sf::SourceFile)
     tail = _fetchexact(sf, tailstart, sf.len - tailstart)
     sf.tail[] = (tail, tailstart)
     return (tail, tailstart)
+end
+
+# A Footer that escapes the tail window: one exact read, cached on the handle
+# so the schema pass and the scan pass share it.
+function _fetchfooter(sf::SourceFile, footerstart::Int64, footerlen::Int64)
+    cached = sf.footer[]
+    if cached !== nothing && cached[1] == footerstart && length(cached[2]) == footerlen
+        return cached[2]
+    end
+    bytes = _fetchexact(sf, footerstart, footerlen)
+    sf.footer[] = (footerstart, bytes)
+    return bytes
 end
 
 # Whether the object is an IPC FILE (trailing `ARROW1` magic) — a stream
@@ -816,11 +833,22 @@ function _wholeobject(sf::SourceFile)
 end
 
 # One exact range through the source, bounds-checked against the length
-# read at construction and length-checked on return.
+# read at construction and length-checked on return; a range the cached
+# tail window already covers is served from it without a request.
 function _fetchexact(sf::SourceFile, off::Int64, len::Int64)
     (off >= 0 && len >= 0 && off <= sf.len - len) ||
         throw(ValidationError("range fetch [$off, $len] escapes the object"))
-    bytes = readrange(sf.src, off, len)
+    cached = sf.tail[]
+    if cached !== nothing
+        tail, tailstart = cached
+        if off >= tailstart && off + len <= tailstart + length(tail)
+            return tail[(off - tailstart + 1):(off - tailstart + len)]
+        end
+    end
+    got = readrange(sf.src, off, len)
+    got isa AbstractVector{UInt8} ||
+        throw(ValidationError("readrange must return a Vector{UInt8}, got $(typeof(got))"))
+    bytes = got isa Vector{UInt8} ? got : Vector{UInt8}(got)
     length(bytes) == len ||
         throw(ValidationError("range fetch returned $(length(bytes)) bytes, expected $len"))
     return bytes
@@ -834,7 +862,7 @@ function _coalesce(ranges::Vector{NTuple{2,Int64}}, gap::Int64)
     isempty(ranges) && return NTuple{2,Int64}[]
     gap >= 0 || throw(ArgumentError("negative coalesce gap"))
     all(r -> r[1] >= 0 && r[2] >= 0, ranges) ||
-        throw(ArgumentError("negative range offset or length"))
+        throw(ValidationError("negative range offset or length"))
     sorted = sort(ranges)
     out = NTuple{2,Int64}[sorted[1]]
     for (off, len) in Iterators.drop(sorted, 1)
@@ -868,19 +896,46 @@ function _fetchspans(
     all(s -> s[1] >= 0 && s[2] >= 0 && s[1] <= sf.len - s[2], spans) ||
         throw(ValidationError("planned range escapes the object"))
     budget === nothing || foreach(s -> _charge!(budget, s[2], what), spans)
-    payloads = readranges(sf.src, spans)
-    length(payloads) == length(spans) || throw(
-        ValidationError(
-            "range fetch returned $(length(payloads)) payloads, expected $(length(spans))",
-        ),
-    )
-    for (payload, (_, len)) in zip(payloads, spans)
-        length(payload) == len || throw(
-            ValidationError("range fetch returned $(length(payload)) bytes, expected $len"),
-        )
-    end
+    payloads = _readspans(sf, spans)
     slices = BufferSlice[BufferSlice(heapregion(p), 0, length(p)) for p in payloads]
     return FetchedSpans(Int64[s[1] for s in spans], Int64[s[2] for s in spans], slices)
+end
+
+# Read one round's spans through the source, each length-checked, every
+# result stored by its request index: serially, or through a worker pool of
+# `concurrentreads(src)` tasks pulling requests off one counter — so a
+# source's completion order can never permute payloads, and the number of
+# reads in flight is bounded whatever the span count.
+function _readspans(sf::SourceFile, spans::Vector{NTuple{2,Int64}})
+    n = length(spans)
+    results = Vector{Vector{UInt8}}(undef, n)
+    k = min(n, max(1, Int(concurrentreads(sf.src))))
+    if k <= 1
+        for i = 1:n
+            results[i] = _fetchexact(sf, spans[i][1], spans[i][2])
+        end
+        return results
+    end
+    next = Threads.Atomic{Int}(1)
+    try
+        @sync for _ = 1:k
+            Threads.@spawn while true
+                i = Threads.atomic_add!(next, 1)
+                i > n && break
+                results[i] = _fetchexact(sf, spans[i][1], spans[i][2])
+            end
+        end
+    catch e
+        rethrow(_firstcause(e))
+    end
+    return results
+end
+
+# The underlying exception of a failed worker task (`@sync` wraps it).
+function _firstcause(e)
+    e isa CompositeException && !isempty(e) && return _firstcause(first(e))
+    e isa TaskFailedException && return _firstcause(e.task.result)
+    return e
 end
 
 function _spanslice(fs::FetchedSpans, off::Int64, len::Int64)
@@ -992,7 +1047,7 @@ function _rangedfooter(sf::SourceFile, budget::AllocationBudget)
     footerbytes =
         footerstart >= tailstart ?
         tail[(footerstart - tailstart + 1):(footerstart - tailstart + footerlen)] :
-        _fetchexact(sf, footerstart, footerlen)
+        _fetchfooter(sf, footerstart, footerlen)
     version, features, dictblocks, recordblocks, reserve =
         verify_footer(footerbytes, limits, budget.left)
     _charge!(budget, reserve, "verified footer expansion")
@@ -1266,17 +1321,55 @@ function _applyscan(sf::SourceFile, scan::Tables.Scan)
             "record batch references dictionary id $(first(missingids)) before its dictionary batch",
         ),
     )
+    # One body round: the selected dictionary bodies and the selected record
+    # buffers are planned together and fetched in a single pass; the
+    # dictionaries decode first from the shared spans.
+    bodyranges = NTuple{2,Int64}[
+        (dictblocks[i][1] + dictblocks[i][2], dictblocks[i][3]) for i in wanted_dict
+    ]
+    for (p, _, _) in window
+        block = recordblocks[recidxs[p]]
+        header = headers[p]
+        buffers = something(header.buffers, Meta.Buffer[])
+        variadics = variadiccounts(header)
+        varidx = Ref(1)
+        wants = NTuple{2,Int64}[]
+        bufidx = 1
+        for (j, fld) in enumerate(fields)
+            span64 = _bufferspan(fld, variadics, varidx)
+            span64 <= typemax(Int) || throw(
+                ValidationError("field buffer span $span64 exceeds the host index range"),
+            )
+            span = Int(span64)
+            if mask[j]
+                for k = bufidx:(bufidx + span - 1)
+                    k <= length(buffers) || throw(
+                        ValidationError(
+                            "metadata declares fewer buffers than the schema requires",
+                        ),
+                    )
+                    buf = buffers[k]
+                    len = Int64(buf.length)
+                    off = Int64(buf.offset)
+                    (off >= 0 && len >= 0 && AC.checked_add(off, len) <= block[3]) || throw(
+                        ValidationError(
+                            "batch buffer [$off, $len] escapes its message body",
+                        ),
+                    )
+                    len == 0 && continue
+                    push!(wants, (off, len))
+                end
+            end
+            bufidx += span
+        end
+        bodystart = block[1] + block[2]
+        append!(bodyranges, NTuple{2,Int64}[(bodystart + off, len) for (off, len) in wants])
+    end
+    bodyspans = _fetchspans(sf, bodyranges, sf.coalesce_gap)
+
     state = DecodeState(budget)
     try
         if !isempty(wanted_dict)
-            bodyspans = _fetchspans(
-                sf,
-                NTuple{2,Int64}[
-                    (dictblocks[i][1] + dictblocks[i][2], dictblocks[i][3]) for
-                    i in wanted_dict
-                ],
-                sf.coalesce_gap,
-            )
             for i in wanted_dict
                 block = dictblocks[i]
                 msg, v = blockmeta[i]
@@ -1308,55 +1401,6 @@ function _applyscan(sf::SourceFile, scan::Tables.Scan)
                 dicts[header.id] = decoded
             end
         end
-
-        bodyranges = NTuple{2,Int64}[]
-        blockwants = Dict{Int,Vector{NTuple{2,Int64}}}()
-        for (p, _, _) in window
-            block = recordblocks[recidxs[p]]
-            header = headers[p]
-            buffers = something(header.buffers, Meta.Buffer[])
-            variadics = variadiccounts(header)
-            varidx = Ref(1)
-            wants = NTuple{2,Int64}[]
-            bufidx = 1
-            for (j, fld) in enumerate(fields)
-                span64 = _bufferspan(fld, variadics, varidx)
-                span64 <= typemax(Int) || throw(
-                    ValidationError(
-                        "field buffer span $span64 exceeds the host index range",
-                    ),
-                )
-                span = Int(span64)
-                if mask[j]
-                    for k = bufidx:(bufidx + span - 1)
-                        k <= length(buffers) || throw(
-                            ValidationError(
-                                "metadata declares fewer buffers than the schema requires",
-                            ),
-                        )
-                        buf = buffers[k]
-                        len = Int64(buf.length)
-                        off = Int64(buf.offset)
-                        (off >= 0 && len >= 0 && AC.checked_add(off, len) <= block[3]) ||
-                            throw(
-                                ValidationError(
-                                    "batch buffer [$off, $len] escapes its message body",
-                                ),
-                            )
-                        len == 0 && continue
-                        push!(wants, (off, len))
-                    end
-                end
-                bufidx += span
-            end
-            blockwants[p] = wants
-            bodystart = block[1] + block[2]
-            append!(
-                bodyranges,
-                NTuple{2,Int64}[(bodystart + off, len) for (off, len) in wants],
-            )
-        end
-        bodyspans = _fetchspans(sf, bodyranges, sf.coalesce_gap)
 
         parts = Dict{Int,Vector{Any}}(idx => Any[] for idx in decodeidx)
         outrows = 0

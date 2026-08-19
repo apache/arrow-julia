@@ -42,7 +42,7 @@ Arrow.DictEncode
 Arrow.AbstractArrowSource
 Arrow.sourcelength
 Arrow.readrange
-Arrow.readranges
+Arrow.concurrentreads
 ```
 
 ## The C data and C stream interfaces

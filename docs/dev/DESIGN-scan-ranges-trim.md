@@ -153,7 +153,7 @@ sequential — cloud-native access is a file-format feature, stated plainly.
    `tailbytes` (default 64 KiB). Its trailing magic decides file vs stream
    format (a stream object is read whole instead), and it covers
    footer-length + magic + the whole Footer in almost every real file; if
-   `footerlen + 10 > tailbytes`, one exact follow-up fetch.
+   `footerlen + 10 > tailbytes`, one exact follow-up fetch (also cached).
    → schema, Block indexes, (§3) statistics — everything pruning needs.
    The leading magic is not fetched: the Footer is the sole authority.
 2. **Statistics prune** from the Footer metadata — zero additional fetches.
@@ -168,9 +168,11 @@ sequential — cloud-native access is a file-format feature, stated plainly.
    ranges → **coalesce** ranges with gaps below `coalesce_gap` (default
    ~256 KiB — a gap fetch is usually cheaper than a request round-trip;
    both knobs are options, not constants).
-5. **Body fetches**: each coalesced range lands in its own owned heap
-   region. Decode resolves each declared buffer `(offset, len)` to its
-   containing fetched range and subslices — the message-body-authority
+5. **Body fetches** — the selected dictionary bodies and the selected record
+   buffers in ONE round: each coalesced range lands in its own owned heap
+   region; the dictionaries decode first from the shared spans. Decode
+   resolves each declared buffer `(offset, len)` to its containing fetched
+   range and subslices — the message-body-authority
    invariant becomes *"every buffer must fall inside a fetched range that
    was itself derived from the verified buffer table"*: same trust story,
    sparse backing.
@@ -194,23 +196,26 @@ planner; transports live in extensions:
     abstract type AbstractArrowSource end
     sourcelength(src)::Integer                  # total object length, known up front
     readrange(src, offset, len)::Vector{UInt8}  # one exact range, 0-based offset
-    readranges(src, ranges) -> Vector{Vector{UInt8}}
-        # default: serial map over readrange; transports override for
-        # concurrent range GETs — concurrency stays in the extension,
-        # never in Arrow.
+    concurrentreads(src)::Int                   # default 1
+        # Arrow reads a round's planned ranges through readrange with a
+        # worker pool of that size, storing every result by request index —
+        # a source's completion order can never permute payloads, and the
+        # reads in flight are bounded whatever the span count.
 
 - The entry point is `Arrow.Table(src; scan=…)`, which builds the internal
   `SourceFile(src; limits, tailbytes, coalesce_gap)` handle and runs
   `Tables.scan(sf, scan)`; the source's length is read once, at handle
   construction, and the tail once per handle. `Arrow.Table(src)` without a
-  scan plans every column; `Arrow.Stream(src)` reads the object whole.
+  scan, with a scan that cannot be pushed down, over a zero-field file, or
+  over a stream-format object reads the object whole (one request beyond
+  the cached tail), as does `Arrow.Stream(src)`.
 - The abstract type is a dynamic call under `--trim` for a source type the
   trimmed app never mentions; an app that names its concrete source type
   resolves statically. The planner itself is arithmetic over `Int64`s.
 - Extension: `ext/ArrowCloudStoreExt.jl` (loaded with CloudStore.jl) makes
   a `CloudStore.Object` a source — its known `size` is the length, one
-  range is one HTTP `Range` GET, and `readranges` issues a round's ranges
-  concurrently — and adds `Arrow.Table(::CloudStore.Object; …)` and
+  range is one HTTP `Range` GET pinned to the object's ETag with
+  `If-Match`, and `concurrentreads` is 16 — and adds `Arrow.Table(::CloudStore.Object; …)` and
   `Arrow.Stream(::CloudStore.Object; …)`. An HTTP transport is the same two
   methods. Zero new hard deps.
 - The differential test: sparse fetch ≡ whole-file read, plus

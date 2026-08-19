@@ -26,39 +26,46 @@ using CloudStore: CloudStore, Object
     CloudObjectSource(obj::CloudStore.Object) <: Arrow.AbstractArrowSource
 
 A `CloudStore.Object` as an [`Arrow.AbstractArrowSource`](@ref): the length
-is the object's known size, one range is one HTTP `Range` GET, and the
-planned ranges of a scan are fetched concurrently. `Arrow.Table(obj; …)` and
-`Arrow.Stream(obj; …)` construct one implicitly.
+is the object's known size, one range is one HTTP `Range` GET pinned to the
+object's ETag with `If-Match` (an overwritten key fails the read instead of
+mixing versions across requests), and Arrow issues up to
+`CONCURRENT_RANGE_READS` of a round's ranges at once. `Arrow.Table(obj; …)`
+and `Arrow.Stream(obj; …)` construct one implicitly.
 """
 struct CloudObjectSource{O<:Object} <: Arrow.AbstractArrowSource
     obj::O
 end
 
+# Independent HTTP range GETs are latency-bound, so a round's requests are
+# worth overlapping; the bound keeps a fragmented object from becoming a
+# request storm.
+const CONCURRENT_RANGE_READS = 16
+
 Arrow.sourcelength(s::CloudObjectSource) = Int64(s.obj.size)
+Arrow.concurrentreads(::CloudObjectSource) = CONCURRENT_RANGE_READS
+
+# The object's ETag as an `If-Match` value (the header wants it quoted).
+function _ifmatch(etag::AbstractString)
+    isempty(etag) && return nothing
+    return startswith(etag, '"') ? String(etag) : string('"', etag, '"')
+end
 
 function Arrow.readrange(s::CloudObjectSource, off, len)
     len == 0 && return UInt8[]
     last = off + len - 1
     obj = s.obj
+    headers = ["Range" => "bytes=$(off)-$(last)"]
+    etag = _ifmatch(obj.eTag)
+    etag === nothing || push!(headers, "If-Match" => etag)
     bytes = CloudStore.get(
         obj.store,
         obj.key;
         credentials=obj.credentials,
-        headers=["Range" => "bytes=$(off)-$(last)"],
+        headers=headers,
         allowMultipart=false,
         objectMaxSize=Int(len),
     )
     return bytes isa Vector{UInt8} ? bytes : Vector{UInt8}(bytes)
-end
-
-# One task per planned range: the requests are independent GETs, and the
-# planner has already coalesced neighbours, so the remaining ranges are
-# worth issuing at once.
-function Arrow.readranges(s::CloudObjectSource, ranges::Vector{NTuple{2,Int64}})
-    length(ranges) <= 1 &&
-        return Vector{UInt8}[Arrow.readrange(s, off, len) for (off, len) in ranges]
-    tasks = [Threads.@spawn Arrow.readrange(s, off, len) for (off, len) in ranges]
-    return Vector{UInt8}[fetch(t)::Vector{UInt8} for t in tasks]
 end
 
 Arrow.Table(obj::Object; kw...) = Arrow.Table(CloudObjectSource(obj); kw...)

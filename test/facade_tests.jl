@@ -42,6 +42,61 @@ function Arrow.readrange(s::_MeteredSource, off, len)
     s.fetched[] += len
     return s.data[(off + 1):(off + len)]
 end
+# A source that logs every request, and a concurrent one whose reads finish
+# in reverse request order (the last-issued read of a round completes first)
+# while a counter records the most reads ever in flight.
+struct _LoggingSource <: Arrow.AbstractArrowSource
+    data::Vector{UInt8}
+    requests::Vector{NTuple{2,Int64}}
+end
+Arrow.sourcelength(s::_LoggingSource) = length(s.data)
+function Arrow.readrange(s::_LoggingSource, off, len)
+    push!(s.requests, (Int64(off), Int64(len)))
+    return s.data[(off + 1):(off + len)]
+end
+mutable struct _ConcurrentSource <: Arrow.AbstractArrowSource
+    const data::Vector{UInt8}
+    const limit::Int
+    @atomic inflight::Int
+    @atomic peak::Int
+    @atomic issued::Int
+end
+_ConcurrentSource(data, limit) = _ConcurrentSource(data, limit, 0, 0, 0)
+Arrow.sourcelength(s::_ConcurrentSource) = length(s.data)
+Arrow.concurrentreads(s::_ConcurrentSource) = s.limit
+function Arrow.readrange(s::_ConcurrentSource, off, len)
+    n = @atomic s.inflight += 1
+    while true
+        p = @atomic s.peak
+        (n <= p || (@atomicreplace s.peak p => n).success) && break
+    end
+    order = @atomic s.issued += 1
+    # Later requests of a round return sooner: results must land by request.
+    sleep(0.002 * max(0, s.limit - (order % s.limit)))
+    @atomic s.inflight -= 1
+    return s.data[(off + 1):(off + len)]
+end
+# Sources that violate the contract in each way the reader must refuse.
+struct _ShortSource <: Arrow.AbstractArrowSource
+    data::Vector{UInt8}
+end
+Arrow.sourcelength(s::_ShortSource) = length(s.data)
+Arrow.readrange(s::_ShortSource, off, len) = s.data[(off + 1):(off + max(0, len - 1))]
+struct _LongSource <: Arrow.AbstractArrowSource
+    data::Vector{UInt8}
+end
+Arrow.sourcelength(s::_LongSource) = length(s.data)
+Arrow.readrange(s::_LongSource, off, len) = vcat(s.data[(off + 1):(off + len)], 0x00)
+struct _WrongTypeSource <: Arrow.AbstractArrowSource
+    data::Vector{UInt8}
+end
+Arrow.sourcelength(s::_WrongTypeSource) = length(s.data)
+Arrow.readrange(s::_WrongTypeSource, off, len) = String(s.data[(off + 1):(off + len)])
+struct _BadLengthSource <: Arrow.AbstractArrowSource
+    reported::Integer
+end
+Arrow.sourcelength(s::_BadLengthSource) = s.reported
+Arrow.readrange(s::_BadLengthSource, off, len) = zeros(UInt8, len)
 
 const MIXED = (
     ints=Int64[1, 2, 3, 4],
@@ -172,6 +227,64 @@ end
         @test t.b == ["v1501", "v1502", "v1503"]
         # The first batch is skipped entirely and column :a is never fetched.
         @test fetched[] < length(fb) ÷ 2
+
+        # Request rounds through the public path over an object larger than
+        # the tail window: a pushable scan is the tail, the surviving batch's
+        # metadata, then the selected buffers (three rounds; here one request
+        # each with coalescing), the tail read exactly once; ranges inside the
+        # cached tail window are served from it without a request.
+        wide = [string("v", i, "-", repeat("x", 60)) for i = 1:2000]
+        wio = IOBuffer()
+        Arrow.write(
+            wio,
+            Tables.partitioner([
+                (a=collect(Int64, 1:1000), b=wide[1:1000]),
+                (a=collect(Int64, 1001:2000), b=wide[1001:2000]),
+            ]),
+        )
+        wb = take!(wio)
+        @test length(wb) > 65536
+        log = _LoggingSource(wb, NTuple{2,Int64}[])
+        t2 = Arrow.Table(log; scan=Tables.Scan(select=(:a,), filter=Tables.col(:a) < 10))
+        @test t2.a == collect(1:9)
+        tailreq = (Int64(length(wb) - 65536), Int64(65536))
+        @test count(==(tailreq), log.requests) == 1
+        @test length(log.requests) == 3
+        # An object no larger than the tail window is entirely in hand after
+        # the tail read: every planned range is served from it.
+        small = _LoggingSource(fb, NTuple{2,Int64}[])
+        t3 = Arrow.Table(small; scan=Tables.Scan(select=(:a,), limit=3, offset=1500))
+        @test t3.a == [1501, 1502, 1503]
+        @test small.requests == [(Int64(0), Int64(length(fb)))]
+        # No scan (and any unpushable scan): the object is read whole — the
+        # cached tail plus the prefix, two requests, no planning.
+        empty!(log.requests)
+        tw = Arrow.Table(log)
+        @test tw.a == 1:2000 && length(log.requests) == 2
+        @test sum(last, log.requests) == length(wb)
+        empty!(log.requests)
+        tz = Arrow.Table(log; scan=Tables.Scan(select=()))
+        @test length(tz) == 2000 && length(log.requests) == 2
+
+        # Concurrent reads: bounded by the source's limit, results placed by
+        # request even though later requests complete first.
+        cs = _ConcurrentSource(fb, 3)
+        cf = Arrow.SourceFile(cs; tailbytes=1024, coalesce_gap=0)
+        tc = Arrow.Table(cf; scan=Tables.Scan(select=(:a, :b)))
+        @test tc.a == 1:2000 && tc.b == [string("v", i) for i = 1:2000]
+        @test 1 < (@atomic cs.peak) <= 3
+
+        # Contract violations fail closed with ValidationError, never a
+        # wrong table or a stray error type.
+        for bad in (_ShortSource(fb), _LongSource(fb), _WrongTypeSource(fb))
+            @test_throws Arrow.AC.ValidationError Arrow.Table(
+                bad;
+                scan=Tables.Scan(select=(:a,)),
+            )
+        end
+        for reported in (-1, Int128(typemax(Int64)) + 1, Int128(typemin(Int64)) - 1)
+            @test_throws Arrow.AC.ValidationError Arrow.Table(_BadLengthSource(reported))
+        end
     end
 
     @testset "mmap path and close!" begin
