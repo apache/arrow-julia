@@ -49,7 +49,8 @@ using Arrow
 # batteries do.
 for n in names(Arrow; all=true)
     sn = String(n)
-    (startswith(sn, "#") || n in (:eval, :include, :Arrow, :write, :Table, :Stream)) && continue
+    (startswith(sn, "#") || n in (:eval, :include, :Arrow, :write, :Table, :Stream)) &&
+        continue
     isdefined(Arrow, n) || continue
     @eval const $n = Arrow.$n
 end
@@ -71,7 +72,8 @@ const SKIP = Dict{String,String}(
 
 # --- value-level comparison -----------------------------------------------------
 
-_num(x) = x isa AbstractString ? (tryparse(Int128, x) === nothing ? x : parse(Int128, x)) :
+_num(x) =
+    x isa AbstractString ? (tryparse(Int128, x) === nothing ? x : parse(Int128, x)) :
     x isa Integer ? Int128(x) : x
 
 function _eq(a, b, path::String, diffs::Vector{String})
@@ -80,11 +82,14 @@ function _eq(a, b, path::String, diffs::Vector{String})
         # writers may omit empty/absent optional keys
         for k in union(ka, kb)
             va, vb = get(a, k, nothing), get(b, k, nothing)
-            (va === nothing || va == Any[] || va == false) && (vb === nothing || vb == Any[] || vb == false) && continue
+            (va === nothing || va == Any[] || va == false) &&
+                (vb === nothing || vb == Any[] || vb == false) &&
+                continue
             _eq(va, vb, path * "." * String(k), diffs)
         end
     elseif a isa AbstractVector && b isa AbstractVector
-        length(a) == length(b) || (push!(diffs, "$path: length $(length(a)) vs $(length(b))"); return)
+        length(a) == length(b) ||
+            (push!(diffs, "$path: length $(length(a)) vs $(length(b))"); return)
         for (i, (x, y)) in enumerate(zip(a, b))
             _eq(x, y, path * "[$i]", diffs)
             length(diffs) > 20 && return
@@ -95,8 +100,7 @@ function _eq(a, b, path::String, diffs::Vector{String})
         # their physical precision by _normalize! first, which is what makes
         # exact comparison correct across writers' decimal choices.
         fa, fb = Float64(_num(a)), Float64(_num(b))
-        (isnan(fa) && isnan(fb)) || fa == fb ||
-            push!(diffs, "$path: $a vs $b")
+        (isnan(fa) && isnan(fb)) || fa == fb || push!(diffs, "$path: $a vs $b")
     elseif a isa Bool || b isa Bool
         Bool(a) == Bool(b) || push!(diffs, "$path: $a vs $b")
     else
@@ -116,8 +120,9 @@ function _normalize!(doc::AbstractDict)
     # (3 ids) while its gold stream and file carry one pool per field (5 ids).
     # Canonicalize both documents to one pool entry per dictionary-typed
     # field position, ids assigned in depth-first schema order.
-    pools = Dict{Int64,Any}(Int64(d["id"]) => d["data"]
-        for d in get(doc, "dictionaries", Any[]))
+    pools = Dict{Int64,Any}(
+        Int64(d["id"]) => d["data"] for d in get(doc, "dictionaries", Any[])
+    )
     newdicts = Any[]
     function renumber!(f)
         f isa AbstractDict || return
@@ -126,8 +131,10 @@ function _normalize!(doc::AbstractDict)
             oldid = Int64(d["id"])
             newid = length(newdicts)
             d["id"] = newid
-            push!(newdicts, Dict{String,Any}("id" => newid,
-                "data" => deepcopy(pools[oldid])))
+            push!(
+                newdicts,
+                Dict{String,Any}("id" => newid, "data" => deepcopy(pools[oldid])),
+            )
         end
         foreach(renumber!, get(f, "children", Any[]))
     end
@@ -146,7 +153,8 @@ function _normalize!(doc::AbstractDict)
     # decimals do not lift to the same Float64s ours do; canonicalize every
     # sub-double column through its physical precision so the comparison can
     # be EXACT for all floats.
-    canonfloat(precision, v) = !(v isa Real) ? v :
+    canonfloat(precision, v) =
+        !(v isa Real) ? v :
         precision == "HALF" ? Float64(Float16(Float64(v))) :
         precision == "SINGLE" ? Float64(Float32(Float64(v))) : Float64(v)
     function normfloatcols!(f, col)
@@ -177,8 +185,10 @@ function _normalize!(doc::AbstractDict)
         f isa AbstractDict || return
         if get(f, "dictionary", nothing) isa AbstractDict
             poolindex[] += 1
-            valuefield = Dict{String,Any}("type" => get(f, "type", Dict()),
-                "children" => get(f, "children", Any[]))
+            valuefield = Dict{String,Any}(
+                "type" => get(f, "type", Dict()),
+                "children" => get(f, "children", Any[]),
+            )
             for pc in pools[poolindex[]]["data"]["columns"]
                 normfloatcols!(valuefield, pc)
             end
@@ -216,7 +226,8 @@ function _normalize!(doc::AbstractDict)
                     end
                 end
             end
-            haskey(c, "children") && haskey(f, "children") &&
+            haskey(c, "children") &&
+                haskey(f, "children") &&
                 normmapcols!(c["children"], f["children"])
         end
     end
@@ -227,7 +238,8 @@ function _normalize!(doc::AbstractDict)
     function normmeta!(x)
         if x isa AbstractDict
             if haskey(x, "metadata") && x["metadata"] isa AbstractVector
-                x["metadata"] = sort(x["metadata"]; by=kv -> (String(kv["key"]), String(kv["value"])))
+                x["metadata"] =
+                    sort(x["metadata"]; by=kv -> (String(kv["key"]), String(kv["value"])))
             end
             foreach(normmeta!, values(x))
         elseif x isa AbstractVector
@@ -268,12 +280,14 @@ function masknulls!(col::AbstractDict)
     if haskey(col, "VALIDITY") && haskey(col, "DATA") && col["DATA"] isa AbstractVector
         v = col["VALIDITY"]
         d = col["DATA"]
-        col["DATA"] = Any[(i <= length(v) && v[i] == 0) ? nothing : d[i] for i in eachindex(d)]
+        col["DATA"] =
+            Any[(i <= length(v) && v[i] == 0) ? nothing : d[i] for i in eachindex(d)]
     end
     if haskey(col, "VALIDITY") && haskey(col, "VIEWS")
         v = col["VALIDITY"]
         vs = col["VIEWS"]
-        col["VIEWS"] = Any[(i <= length(v) && v[i] == 0) ? nothing : vs[i] for i in eachindex(vs)]
+        col["VIEWS"] =
+            Any[(i <= length(v) && v[i] == 0) ? nothing : vs[i] for i in eachindex(vs)]
     end
     for c in get(col, "children", Any[])
         masknulls!(c)
@@ -332,55 +346,99 @@ function runfamily(dir::String, family::String, verdicts::Vector{Verdict})
         sch, batches, dictids = ArrowJSON.fromjson(gold)
         back = ArrowJSON.tojson(sch, batches; dictids=dictids)
         diffs = docsequal(masknulls!(deepcopy(back), Val(:doc)), goldmasked)
-        push!(verdicts, Verdict(family, check, isempty(diffs) ? :pass : :fail,
-            isempty(diffs) ? "" : first(diffs)))
+        push!(
+            verdicts,
+            Verdict(
+                family,
+                check,
+                isempty(diffs) ? :pass : :fail,
+                isempty(diffs) ? "" : first(diffs),
+            ),
+        )
     catch e
-        push!(verdicts, Verdict(family, check, :fail, sprint(showerror, e)[1:min(end, 200)]))
+        push!(
+            verdicts,
+            Verdict(family, check, :fail, sprint(showerror, e)[1:min(end, 200)]),
+        )
     end
     # 2. gold stream -> JSON ; 3. gold file -> JSON
     for (check, path, reader) in (
         ("gold stream→json", joinpath(dir, family * ".stream"), _stream_to_json),
-        ("gold file→json", joinpath(dir, family * ".arrow_file"), _file_to_json))
-        isfile(path) || (push!(verdicts, Verdict(family, check, :skip, "no gold file")); continue)
+        ("gold file→json", joinpath(dir, family * ".arrow_file"), _file_to_json),
+    )
+        isfile(path) ||
+            (push!(verdicts, Verdict(family, check, :skip, "no gold file")); continue)
         try
             got = reader(read(path))
             diffs = docsequal(masknulls!(deepcopy(got), Val(:doc)), goldmasked)
-            push!(verdicts, Verdict(family, check, isempty(diffs) ? :pass : :fail,
-                isempty(diffs) ? "" : first(diffs)))
+            push!(
+                verdicts,
+                Verdict(
+                    family,
+                    check,
+                    isempty(diffs) ? :pass : :fail,
+                    isempty(diffs) ? "" : first(diffs),
+                ),
+            )
         catch e
-            push!(verdicts, Verdict(family, check, :fail, sprint(showerror, e)[1:min(end, 200)]))
+            push!(
+                verdicts,
+                Verdict(family, check, :fail, sprint(showerror, e)[1:min(end, 200)]),
+            )
         end
     end
     # 4. JSON -> our IPC (stream + file) -> our reader -> JSON vs gold
     for (check, writer, reader) in (
-        ("json→our stream→json", (s, b, ids) -> writestream(s, b; dictids=ids), _stream_to_json),
-        ("json→our file→json", (s, b, ids) -> writefile(s, b; dictids=ids), _file_to_json))
+        (
+            "json→our stream→json",
+            (s, b, ids) -> writestream(s, b; dictids=ids),
+            _stream_to_json,
+        ),
+        ("json→our file→json", (s, b, ids) -> writefile(s, b; dictids=ids), _file_to_json),
+    )
         try
             sch, batches, dictids = ArrowJSON.fromjson(gold)
             bytes = writer(sch, batches, dictids)
             got = reader(bytes)
             diffs = docsequal(masknulls!(deepcopy(got), Val(:doc)), goldmasked)
-            push!(verdicts, Verdict(family, check, isempty(diffs) ? :pass : :fail,
-                isempty(diffs) ? "" : first(diffs)))
+            push!(
+                verdicts,
+                Verdict(
+                    family,
+                    check,
+                    isempty(diffs) ? :pass : :fail,
+                    isempty(diffs) ? "" : first(diffs),
+                ),
+            )
         catch e
-            push!(verdicts, Verdict(family, check, :fail, sprint(showerror, e)[1:min(end, 200)]))
+            push!(
+                verdicts,
+                Verdict(family, check, :fail, sprint(showerror, e)[1:min(end, 200)]),
+            )
         end
     end
     return
 end
 
 function runcorpus(corpus::String=DEFAULT_CORPUS; versions=nothing)
-    isempty(corpus) && error("ARROW_TESTING_DIR is not set: run this suite " *
-        "through `julia conformance/run.jl corpus`")
+    isempty(corpus) && error(
+        "ARROW_TESTING_DIR is not set: run this suite " *
+        "through `julia conformance/run.jl corpus`",
+    )
     root = joinpath(corpus, "data", "arrow-ipc-stream", "integration")
     isdir(root) || error("corpus not found at $root (set ARROW_TESTING_DIR)")
     verdicts = Verdict[]
-    vdirs = versions === nothing ?
-        filter(d -> isdir(joinpath(root, d)), readdir(root)) : versions
+    vdirs =
+        versions === nothing ? filter(d -> isdir(joinpath(root, d)), readdir(root)) :
+        versions
     for v in sort(vdirs)
         dir = joinpath(root, v)
-        families = sort!(unique!([replace(f, r"\.json\.gz$" => "")
-            for f in readdir(dir) if endswith(f, ".json.gz")]))
+        families = sort!(
+            unique!([
+                replace(f, r"\.json\.gz$" => "") for
+                f in readdir(dir) if endswith(f, ".json.gz")
+            ]),
+        )
         for fam in families
             before = length(verdicts)
             runfamily(dir, fam, verdicts)

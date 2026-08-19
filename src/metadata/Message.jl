@@ -78,7 +78,8 @@ struct RecordBatch <: FlatBuffers.Table
     pos::Base.Int
 end
 
-Base.propertynames(x::RecordBatch) = (:length, :nodes, :buffers, :compression, :variadicBufferCounts)
+Base.propertynames(x::RecordBatch) =
+    (:length, :nodes, :buffers, :compression, :variadicBufferCounts)
 
 function Base.getproperty(x::RecordBatch, field::Symbol)
     if field === :length
@@ -123,8 +124,10 @@ recordBatchStartBuffersVector(b::FlatBuffers.Builder, numelems) =
     FlatBuffers.startvector!(b, 16, numelems, 8)
 recordBatchAddCompression(b::FlatBuffers.Builder, compression::FlatBuffers.UOffsetT) =
     FlatBuffers.prependoffsetslot!(b, 3, compression, 0)
-recordBatchAddVariadicBufferCounts(b::FlatBuffers.Builder, variadicBufferCounts::FlatBuffers.UOffsetT) =
-    FlatBuffers.prependoffsetslot!(b, 4, variadicBufferCounts, 0)
+recordBatchAddVariadicBufferCounts(
+    b::FlatBuffers.Builder,
+    variadicBufferCounts::FlatBuffers.UOffsetT,
+) = FlatBuffers.prependoffsetslot!(b, 4, variadicBufferCounts, 0)
 recordBatchStartVariadicBufferCountsVector(b::FlatBuffers.Builder, numelems) =
     FlatBuffers.startvector!(b, 8, numelems, 8)
 recordBatchEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
@@ -233,4 +236,3 @@ messageAddCustomMetadata(b::FlatBuffers.Builder, custom_metadata::FlatBuffers.UO
 messageStartCustomMetadataVector(b::FlatBuffers.Builder, numelems) =
     FlatBuffers.startvector!(b, 4, numelems, 4)
 messageEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
-

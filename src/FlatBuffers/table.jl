@@ -67,7 +67,6 @@ function Base.String(t::Table, off)
     return unsafe_string(pointer(bytes(t), start + 1), len)
 end
 
-
 """
 `vectorlen` retrieves the length of the vector whose offset is stored at
 `off` in this object.

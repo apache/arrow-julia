@@ -56,30 +56,44 @@ function main(workdir::String)
          -e "using Pkg; Pkg.instantiate()"`)
 
     rewriteout = joinpath(workdir, "rewrite.jsonl")
-    _runleg(`$(Base.julia_cmd()) --startup-file=no --project=$repo
-             $(joinpath(here, "bench_rewrite.jl")) $workdir`, rewriteout)
+    _runleg(
+        `$(Base.julia_cmd()) --startup-file=no --project=$repo
+         $(joinpath(here, "bench_rewrite.jl")) $workdir`,
+        rewriteout,
+    )
     push!(legs, ("rewrite", rewriteout))
 
     out2x = joinpath(workdir, "arrow2x.jsonl")
-    _runleg(`$(Base.julia_cmd()) --startup-file=no
-             --project=$(joinpath(here, "env2x"))
-             $(joinpath(here, "bench_2x.jl")) $workdir`, out2x)
+    _runleg(
+        `$(Base.julia_cmd()) --startup-file=no
+         --project=$(joinpath(here, "env2x"))
+         $(joinpath(here, "bench_2x.jl")) $workdir`,
+        out2x,
+    )
     push!(legs, ("arrow2x", out2x))
 
     pyout = joinpath(workdir, "pyarrow.jsonl")
     # The pyarrow leg runs the conformance image's oracle interpreter
     # (build it once with `julia conformance/run.jl`).
-    havedocker = Sys.which("docker") !== nothing && try
-        success(pipeline(
-            `docker image inspect arrow-julia-conformance:latest`;
-            stdout=devnull, stderr=devnull))
-    catch
-        false
-    end
+    havedocker =
+        Sys.which("docker") !== nothing && try
+            success(
+                pipeline(
+                    `docker image inspect arrow-julia-conformance:latest`;
+                    stdout=devnull,
+                    stderr=devnull,
+                ),
+            )
+        catch
+            false
+        end
     if havedocker
-        _runleg(`docker run --rm -v $workdir:/bench -v $here:/src
-                 arrow-julia-conformance:latest
-                 /opt/pyarrow/bin/python /src/bench_pyarrow.py /bench`, pyout)
+        _runleg(
+            `docker run --rm -v $workdir:/bench -v $here:/src
+             arrow-julia-conformance:latest
+             /opt/pyarrow/bin/python /src/bench_pyarrow.py /bench`,
+            pyout,
+        )
         push!(legs, ("pyarrow", pyout))
     else
         println("(pyarrow leg skipped: conformance docker image not available)")
@@ -92,10 +106,8 @@ function main(workdir::String)
         isempty(strip(line)) && continue
         g(k) = match(Regex("\"$k\":\"?([^\",}]+)"), line).captures[1]
         key = (g("impl"), g("workload"), g("op"))
-        haskey(results, key) &&
-            error("duplicate benchmark record for $key")
-        results[key] =
-            (parse(Float64, g("seconds")), parse(Int64, g("bytes")))
+        haskey(results, key) && error("duplicate benchmark record for $key")
+        results[key] = (parse(Float64, g("seconds")), parse(Int64, g("bytes")))
     end
     # A leg that exits 0 with partial output must refuse, not print a
     # plausible table.
@@ -108,22 +120,33 @@ function main(workdir::String)
     println()
     println("READ ROWS ARE NOT LIKE-FOR-LIKE: rewrite = validate + fully")
     println("materialized Julia Vectors; arrow2x = lazy wrap + ONE")
-    println("top-level copy() per column (nested lists stay Arrow-backed");
+    println("top-level copy() per column (nested lists stay Arrow-backed")
     println("views); pyarrow = memory-mapped wrap only, all per-element")
     println("work deferred. Write rows are like-for-like.")
     println()
-    println("| workload | op | " * join(impls, " | ") * " | MB/s (" *
-            join(impls, " / ") * ") |")
+    println(
+        "| workload | op | " *
+        join(impls, " | ") *
+        " | MB/s (" *
+        join(impls, " / ") *
+        ") |",
+    )
     println("|---|---|" * repeat("---|", length(impls) + 1))
     for wl in WORKLOAD_NAMES, op in ("write", "read")
         secs = [get(results, (impl, wl, op), (NaN, 0))[1] for impl in impls]
-        mbs = [begin
-            s, b = get(results, (impl, wl, op), (NaN, 0))
-            isnan(s) ? "-" : string(round(b / s / 1e6; digits=0))
-        end for impl in impls]
-        println("| $wl | $op | " *
-                join([isnan(s) ? "-" : string(round(s; digits=4)) for s in secs], " | ") *
-                " | " * join(mbs, " / ") * " |")
+        mbs = [
+            begin
+                s, b = get(results, (impl, wl, op), (NaN, 0))
+                isnan(s) ? "-" : string(round(b / s / 1e6; digits=0))
+            end for impl in impls
+        ]
+        println(
+            "| $wl | $op | " *
+            join([isnan(s) ? "-" : string(round(s; digits=4)) for s in secs], " | ") *
+            " | " *
+            join(mbs, " / ") *
+            " |",
+        )
     end
 end
 

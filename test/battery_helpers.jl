@@ -31,8 +31,10 @@ function _fixture2x(write2x::F, name::String) where {F}
         write(path, bytes)
         return bytes
     end
-    isfile(path) || error("missing 2.x fixture $name — regenerate against " *
-        "a 2.x checkout with ARROW_FIXTURE_MODE=record")
+    isfile(path) || error(
+        "missing 2.x fixture $name — regenerate against " *
+        "a 2.x checkout with ARROW_FIXTURE_MODE=record",
+    )
     return read(path)
 end
 
@@ -80,8 +82,10 @@ function _frameinfo(bytes::Vector{UInt8})
         _vu32(bytes, pos) == CONTINUATION || throw(ValidationError("bad test frame"))
         metalen = Int64(_vi32(bytes, pos + 4))
         if metalen == 0
-            push!(info, (kind=UInt8(0), frame=(pos + 1):(pos + 8),
-                metadata=Int64(0):Int64(-1)))
+            push!(
+                info,
+                (kind=UInt8(0), frame=(pos + 1):(pos + 8), metadata=Int64(0):Int64(-1)),
+            )
             break
         end
         metastart = pos + 8
@@ -91,8 +95,14 @@ function _frameinfo(bytes::Vector{UInt8})
         bp = _vfield(msg, 3, 8)
         bodylen = bp === nothing ? Int64(0) : _vi64(meta, bp)
         frameend = AC.checked_add(AC.checked_add(metastart, metalen), bodylen)
-        push!(info, (kind=kind, frame=(pos + 1):frameend,
-            metadata=(metastart + 1):(metastart + metalen)))
+        push!(
+            info,
+            (
+                kind=kind,
+                frame=(pos + 1):frameend,
+                metadata=(metastart + 1):(metastart + metalen),
+            ),
+        )
         pos = frameend
     end
     return info
@@ -106,8 +116,7 @@ function _mutatemessage!(bytes::Vector{UInt8}, index::Int, f)
     copyto!(bytes, first(frame.metadata), meta, 1, length(meta))
     return bytes
 end
-_mutatemessage!(f, bytes::Vector{UInt8}, index::Int) =
-    _mutatemessage!(bytes, index, f)
+_mutatemessage!(f, bytes::Vector{UInt8}, index::Int) = _mutatemessage!(bytes, index, f)
 
 function _headertable(meta::Vector{UInt8}, msg::_VTable)
     return _vtable(meta, _vref(msg, 2; required=true))
@@ -126,13 +135,17 @@ function _compressed_wire(payload::Vector{UInt8}, declared::Int64)
     return vcat(collect(reinterpret(UInt8, [declared])), payload)
 end
 
-function _decode_fixture(codec::Int8, payload::Vector{UInt8}, declared::Int64;
-    budget::Int64=max(declared, Int64(0)))
+function _decode_fixture(
+    codec::Int8,
+    payload::Vector{UInt8},
+    declared::Int64;
+    budget::Int64=max(declared, Int64(0)),
+)
     bytes = _compressed_wire(payload, declared)
     wire = BufferSlice(heapregion(bytes), 0, length(bytes))
     state = DecodeState(AllocationBudget(budget))
-    cursor = DecodeCursor(nothing, nothing, BufferSlice(), Limits();
-        codec=codec, state=state)
+    cursor =
+        DecodeCursor(nothing, nothing, BufferSlice(), Limits(); codec=codec, state=state)
     try
         return AC.slicebytes(_decompressbuffer!(cursor, wire))
     finally
@@ -164,8 +177,7 @@ function _schema_stream_from_field!(b, field; features::Vector{Int64}=Int64[])
     meta = collect(FB.finishedbytes(b))
     resize!(meta, 8cld(length(meta), 8))
     out = UInt8[]
-    append!(out, reinterpret(UInt8,
-        UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
+    append!(out, reinterpret(UInt8, UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
     append!(out, meta)
     append!(out, reinterpret(UInt8, UInt32[UInt32(CONTINUATION), 0]))
     return out
@@ -235,8 +247,7 @@ function _dictionary_schema_frame_with_replacement(id::Int64)
     meta = collect(FB.finishedbytes(b))
     append!(meta, zeros(UInt8, mod(-length(meta), 8)))
     frame = UInt8[]
-    append!(frame, reinterpret(UInt8,
-        UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
+    append!(frame, reinterpret(UInt8, UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
     append!(frame, meta)
     return frame
 end
@@ -245,14 +256,12 @@ function _dictionary_replacement_stream()
     id = Int64(7)
     firstbytes = _fixture2x("dict-replacement-first") do
         firstio = IOBuffer()
-        Arrow.write(firstio,
-            (d=Arrow.DictEncode(["aa", "bb", "aa"], id),); file=false)
+        Arrow.write(firstio, (d=Arrow.DictEncode(["aa", "bb", "aa"], id),); file=false)
         take!(firstio)
     end
     secondbytes = _fixture2x("dict-replacement-second") do
         secondio = IOBuffer()
-        Arrow.write(secondio,
-            (d=Arrow.DictEncode(["xx", "yy", "xx"], id),); file=false)
+        Arrow.write(secondio, (d=Arrow.DictEncode(["xx", "yy", "xx"], id),); file=false)
         take!(secondio)
     end
     firstframes = _frameinfo(firstbytes)
@@ -313,10 +322,8 @@ function _experimental_v4_stream(value::Int64)
     FB.finish!(b, msg)
     meta = collect(FB.finishedbytes(b))
     append!(meta, zeros(UInt8, mod(-length(meta), 8)))
-    prefix = collect(reinterpret(UInt8,
-        UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
-    eos = collect(reinterpret(UInt8,
-        UInt32[UInt32(CONTINUATION), UInt32(0)]))
+    prefix = collect(reinterpret(UInt8, UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
+    eos = collect(reinterpret(UInt8, UInt32[UInt32(CONTINUATION), UInt32(0)]))
     return vcat(schema, prefix, meta, body, eos)
 end
 
@@ -385,8 +392,7 @@ function _shared_name_stream(nfields::Int, namesize::Int)
     meta = collect(FB.finishedbytes(b))
     resize!(meta, 8cld(length(meta), 8))
     out = UInt8[]
-    append!(out, reinterpret(UInt8,
-        UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
+    append!(out, reinterpret(UInt8, UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
     append!(out, meta)
     append!(out, reinterpret(UInt8, UInt32[UInt32(CONTINUATION), 0]))
     return out
@@ -459,8 +465,7 @@ function _misaligned_empty_buffers_stream()
 
     out = UInt8[]
     append!(out, bytes[frames[schemaidx].frame])
-    append!(out, reinterpret(UInt8,
-        UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
+    append!(out, reinterpret(UInt8, UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
     append!(out, meta)
     append!(out, bytes[frames[eosidx].frame])
     return out
@@ -526,8 +531,7 @@ function _metadata_value_stream(explicit_empty::Bool)
     meta = collect(FB.finishedbytes(b))
     resize!(meta, 8cld(length(meta), 8))
     out = UInt8[]
-    append!(out, reinterpret(UInt8,
-        UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
+    append!(out, reinterpret(UInt8, UInt32[UInt32(CONTINUATION), UInt32(length(meta))]))
     append!(out, meta)
     append!(out, reinterpret(UInt8, UInt32[UInt32(CONTINUATION), 0]))
     return out
@@ -551,15 +555,23 @@ end
 # pointer stored in a const is serialized into the precompile cache and is
 # garbage when the package reloads. The static @cfunction form is cheap at
 # runtime (it returns the session's cached trampoline).
-test_conforming_release() =
-    @cfunction(_test_conforming_release, Cvoid, (Ptr{CArrowArray},))
+test_conforming_release() = @cfunction(_test_conforming_release, Cvoid, (Ptr{CArrowArray},))
 test_nonconforming_release() =
     @cfunction(_test_nonconforming_release, Cvoid, (Ptr{CArrowArray},))
 
 function _test_c_array(release::Ptr{Cvoid})
-    return CArrowArray(0, 0, 0, 0, 0, Ptr{Ptr{Cvoid}}(C_NULL),
-        Ptr{Ptr{CArrowArray}}(C_NULL), Ptr{CArrowArray}(C_NULL), release,
-        Ptr{Cvoid}(C_NULL))
+    return CArrowArray(
+        0,
+        0,
+        0,
+        0,
+        0,
+        Ptr{Ptr{Cvoid}}(C_NULL),
+        Ptr{Ptr{CArrowArray}}(C_NULL),
+        Ptr{CArrowArray}(C_NULL),
+        release,
+        Ptr{Cvoid}(C_NULL),
+    )
 end
 
 # ---------------------------------------------------------------------------
@@ -608,8 +620,13 @@ function _expect_invalid_dictionary_topology!(mutate)
     vf, vd = fromjulia("values", ["x"])
     t = DictionaryType(IntType(32, true), vf.type, false)
     f = Field("bad-dictionary", t; nullable=false, children=vf.children)
-    d = ArrayData(t, 1, [BufferSlice(), AC._databuffer(Int32[0])];
-        dictionary=vd, nullcount=0)
+    d = ArrayData(
+        t,
+        1,
+        [BufferSlice(), AC._databuffer(Int32[0])];
+        dictionary=vd,
+        nullcount=0,
+    )
     before = _registry_count()
     sp, ap = to_c_data(f, d)
     mutate(sp, ap)
@@ -696,8 +713,9 @@ function _threaded_cdata_stress()
             increment!(done)
         end
     end) for worker = 1:workers]
-    reapers = [errormonitor(Threads.@spawn _stress_reaper(
-        ready, start, done, workers)) for _ = 1:3]
+    reapers = [
+        errormonitor(Threads.@spawn _stress_reaper(ready, start, done, workers)) for _ = 1:3
+    ]
     while ready[] != length(releasers) + length(reapers)
         yield()
     end
@@ -748,9 +766,11 @@ end
 # Test-support: one 16-byte view entry (inline / out-of-line forms).
 _viewentry(len::Int, rest::Vector{UInt8}) =
     vcat(reinterpret(UInt8, Int32[Int32(len)]), rest, zeros(UInt8, 12 - length(rest)))
-_viewlong(len::Int, prefix::Vector{UInt8}, bufidx::Int, off::Int) =
-    vcat(reinterpret(UInt8, Int32[Int32(len)]), prefix,
-         reinterpret(UInt8, Int32[Int32(bufidx), Int32(off)]))
+_viewlong(len::Int, prefix::Vector{UInt8}, bufidx::Int, off::Int) = vcat(
+    reinterpret(UInt8, Int32[Int32(len)]),
+    prefix,
+    reinterpret(UInt8, Int32[Int32(bufidx), Int32(off)]),
+)
 
 # ---------------------------------------------------------------------------
 # Byte-range fetch accounting for the ranged-scan battery: a RangedSource
@@ -776,4 +796,3 @@ end
 
 _fetched(log::FetchLog, pos::Int64) =
     any(off <= pos < off + len for (off, len) in log.ranges)
-

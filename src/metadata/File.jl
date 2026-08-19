@@ -22,7 +22,8 @@ struct Footer <: FlatBuffers.Table
     pos::Base.Int
 end
 
-Base.propertynames(x::Footer) = (:version, :schema, :dictionaries, :recordBatches, :custom_metadata)
+Base.propertynames(x::Footer) =
+    (:version, :schema, :dictionaries, :recordBatches, :custom_metadata)
 
 function Base.getproperty(x::Footer, field::Symbol)
     if field === :version
@@ -93,7 +94,12 @@ function Base.getproperty(x::Block, field::Symbol)
     return nothing
 end
 
-function createBlock(b::FlatBuffers.Builder, offset::Int64, metaDataLength::Int32, bodyLength::Int64)
+function createBlock(
+    b::FlatBuffers.Builder,
+    offset::Int64,
+    metaDataLength::Int32,
+    bodyLength::Int64,
+)
     FlatBuffers.prep!(b, 8, 24)
     prepend!(b, bodyLength)
     FlatBuffers.pad!(b, 4)
@@ -101,4 +107,3 @@ function createBlock(b::FlatBuffers.Builder, offset::Int64, metaDataLength::Int3
     prepend!(b, offset)
     return FlatBuffers.offset(b)
 end
-

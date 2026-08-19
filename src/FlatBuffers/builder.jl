@@ -52,7 +52,6 @@ Builder(size=0) = Builder(
     false,
 )
 
-
 Base.write(sink::Builder, o, x::Union{Bool,UInt8}) = sink.bytes[o + 1] = UInt8(x)
 function Base.write(sink::Builder, off, x::T) where {T}
     off += 1

@@ -40,28 +40,43 @@ Base.getindex(d::DictEncode, i::Int) = d.data[i]
 function _writecolumn(name::String, v::AbstractVector)
     T = Base.nonmissingtype(eltype(v))
     if T <: Dates.Date
-        return _temporalcolumn(name, v, AC.DateType(AC.DAY),
-            x -> Int32(Dates.value(x) - _EPOCH_DAYS))
+        return _temporalcolumn(
+            name,
+            v,
+            AC.DateType(AC.DAY),
+            x -> Int32(Dates.value(x) - _EPOCH_DAYS),
+        )
     elseif T <: Dates.DateTime
-        return _temporalcolumn(name, v,
+        return _temporalcolumn(
+            name,
+            v,
             AC.TimestampType(AC.MILLISECOND, nothing),
-            x -> Int64(Dates.value(x) - Dates.UNIXEPOCH))
+            x -> Int64(Dates.value(x) - Dates.UNIXEPOCH),
+        )
     elseif T <: Dates.Time
-        return _temporalcolumn(name, v, AC.TimeType(AC.NANOSECOND, 64),
-            x -> Int64(Dates.value(x)))
-    elseif T <: Dates.Period && T <: Union{Dates.Second,Dates.Millisecond,
-        Dates.Microsecond,Dates.Nanosecond}
-        unit = T <: Dates.Second ? AC.SECOND :
+        return _temporalcolumn(
+            name,
+            v,
+            AC.TimeType(AC.NANOSECOND, 64),
+            x -> Int64(Dates.value(x)),
+        )
+    elseif T <: Dates.Period &&
+           T <: Union{Dates.Second,Dates.Millisecond,Dates.Microsecond,Dates.Nanosecond}
+        unit =
+            T <: Dates.Second ? AC.SECOND :
             T <: Dates.Millisecond ? AC.MILLISECOND :
             T <: Dates.Microsecond ? AC.MICROSECOND : AC.NANOSECOND
-        return _temporalcolumn(name, v, AC.DurationType(unit),
-            x -> Int64(Dates.value(x)))
+        return _temporalcolumn(name, v, AC.DurationType(unit), x -> Int64(Dates.value(x)))
     elseif T <: NamedTuple
-        any(ismissing, v) && throw(ArgumentError(
-            "missing struct slots are not supported by the writer " *
-            "(column $name); wrap fields as nullable children instead"))
-        cols = NamedTuple{fieldnames(T)}(Tuple([getfield(x, k) for x in v]
-            for k in fieldnames(T)))
+        any(ismissing, v) && throw(
+            ArgumentError(
+                "missing struct slots are not supported by the writer " *
+                "(column $name); wrap fields as nullable children instead",
+            ),
+        )
+        cols = NamedTuple{fieldnames(T)}(
+            Tuple([getfield(x, k) for x in v] for k in fieldnames(T)),
+        )
         return AC.fromjulia_struct(name, cols)
     elseif T <: AbstractString && T != String
         return AC.fromjulia(name, _missings_to(String, v))
@@ -71,10 +86,12 @@ function _writecolumn(name::String, v::AbstractVector)
         # element-wise, empties adopt the joined element type).
         w = _narrowlists(v)
         NW = Base.nonmissingtype(eltype(w))
-        (NW === Any || (NW <: AbstractVector && eltype(NW) === Any)) &&
-            throw(ArgumentError(
-            "column $name has element type Any and cannot be narrowed to " *
-            "a writable Arrow column; give it a concrete element type"))
+        (NW === Any || (NW <: AbstractVector && eltype(NW) === Any)) && throw(
+            ArgumentError(
+                "column $name has element type Any and cannot be narrowed to " *
+                "a writable Arrow column; give it a concrete element type",
+            ),
+        )
         return _writecolumn(name, w)
     else
         return AC.fromjulia(name, _plainvector(v))
@@ -106,16 +123,14 @@ end
 # buffer and its byte buffers are the variadic data buffers — no copy, no
 # String materialization; the declared nullability is the column's eltype's.
 function _writecolumn(name::String, v::ArrowStrings.ArrowStringVector)
-    return AC.fromviewentries(name, v.payloads, v.buffers;
-        nullable=eltype(v) >: Missing)
+    return AC.fromviewentries(name, v.payloads, v.buffers; nullable=eltype(v) >: Missing)
 end
 
 function _writecolumn(name::String, d::DictEncode)
     v = d.data
     pool = unique(skipmissing(v))
     lookup = Dict{Any,Int32}(x => Int32(i - 1) for (i, x) in enumerate(pool))
-    indices = Union{Missing,Int32}[x === missing ? missing : lookup[x]
-                                   for x in v]
+    indices = Union{Missing,Int32}[x === missing ? missing : lookup[x] for x in v]
     return AC.fromjulia_dict(name, collect(pool), indices)
 end
 
@@ -129,15 +144,17 @@ function _plainvector(v::AbstractVector)
 end
 
 _missings_to(::Type{S}, v) where {S} =
-    eltype(v) >: Missing ?
-    Union{Missing,S}[x === missing ? missing : S(x) for x in v] :
+    eltype(v) >: Missing ? Union{Missing,S}[x === missing ? missing : S(x) for x in v] :
     S[S(x) for x in v]
 
 "Temporal column: convert values to storage integers, keep the validity."
-function _temporalcolumn(name::String, v::AbstractVector, t::AC.ArrowType,
-    tostorage::F) where {F}
-    storage = Union{Missing,Int64}[x === missing ? missing :
-                                   Int64(tostorage(x)) for x in v]
+function _temporalcolumn(
+    name::String,
+    v::AbstractVector,
+    t::AC.ArrowType,
+    tostorage::F,
+) where {F}
+    storage = Union{Missing,Int64}[x === missing ? missing : Int64(tostorage(x)) for x in v]
     f0, d0 = AC.fromjulia(name, storage)
     # Rebuild under the temporal descriptor with the storage width it
     # declares (Date32 narrows to Int32 storage).
@@ -150,8 +167,16 @@ function _temporalcolumn(name::String, v::AbstractVector, t::AC.ArrowType,
         end
         buffers = [d0.buffers[1], AC._databuffer(narrow)]
     end
-    d = AC._arraydata(t, d0.len, buffers, 0, AC.ArrayData[], nothing,
-        d0.owner, AC.nullcount(d0))
+    d = AC._arraydata(
+        t,
+        d0.len,
+        buffers,
+        0,
+        AC.ArrayData[],
+        nothing,
+        d0.owner,
+        AC.nullcount(d0),
+    )
     return AC.Field(name, t; nullable=eltype(v) >: Missing), d
 end
 
@@ -166,10 +191,13 @@ function _retainedstorage(t::AC.ArrowType, v::AbstractVector, name::String)
             push!(out, missing)
         else
             ok, sv = _storagevalue(t, x)
-            ok && sv isa Integer || throw(ArgumentError(
-                "column $name holds $(typeof(x)) values that do not match " *
-                "its retained Arrow type $(repr(t)); the column was " *
-                "replaced with incompatible data"))
+            ok && sv isa Integer || throw(
+                ArgumentError(
+                    "column $name holds $(typeof(x)) values that do not match " *
+                    "its retained Arrow type $(repr(t)); the column was " *
+                    "replaced with incompatible data",
+                ),
+            )
             push!(out, Int64(sv))
         end
     end
@@ -185,19 +213,30 @@ function _writecolumn(f::AC.Field, v::AbstractVector)
     Fp = _facadebasetype(t)
     if Fp !== Any
         NT = Base.nonmissingtype(eltype(v))
-        NT <: Fp || NT === Union{} || throw(ArgumentError(
-            "column $(f.name) holds $(NT) values, but its retained Arrow " *
-            "type $(repr(t)) materializes as $(Fp); the column was " *
-            "replaced with incompatible data"))
-        eltype(v) >: Missing && !f.nullable && throw(ArgumentError(
-            "column $(f.name) may hold missing values but its retained " *
-            "field is non-nullable"))
+        NT <: Fp ||
+            NT === Union{} ||
+            throw(
+                ArgumentError(
+                    "column $(f.name) holds $(NT) values, but its retained Arrow " *
+                    "type $(repr(t)) materializes as $(Fp); the column was " *
+                    "replaced with incompatible data",
+                ),
+            )
+        eltype(v) >: Missing &&
+            !f.nullable &&
+            throw(
+                ArgumentError(
+                    "column $(f.name) may hold missing values but its retained " *
+                    "field is non-nullable",
+                ),
+            )
     end
-    if t isa AC.DateType || t isa AC.TimestampType || t isa AC.TimeType ||
+    if t isa AC.DateType ||
+       t isa AC.TimestampType ||
+       t isa AC.TimeType ||
        t isa AC.DurationType
         if Fp === Int64
-            storage = Union{Missing,Int64}[x === missing ? missing : Int64(x)
-                                           for x in v]
+            storage = Union{Missing,Int64}[x === missing ? missing : Int64(x) for x in v]
         else
             storage = _retainedstorage(t, v, f.name)
         end
@@ -219,16 +258,29 @@ function _writecolumn(f::AC.Field, v::AbstractVector)
     # fields (names, nullability, metadata) and each level's list width.
     fn, dn = _writecolumn(f.name, v)
     t isa AC.ListType && return _imposelist(f, fn, dn, f.name)
-    AC.typeequal(fn.type, t) || throw(ArgumentError(
-        "column $(f.name) no longer matches its retained Arrow type " *
-        "$(repr(t)); it now maps to $(repr(fn.type))"))
-    fn.nullable && !f.nullable && AC.nullcount(dn) > 0 && throw(ArgumentError(
-        "column $(f.name) holds missing values but its retained field is " *
-        "non-nullable"))
-    rebuilt = AC.Field(f.name, fn.type; nullable=f.nullable,
+    AC.typeequal(fn.type, t) || throw(
+        ArgumentError(
+            "column $(f.name) no longer matches its retained Arrow type " *
+            "$(repr(t)); it now maps to $(repr(fn.type))",
+        ),
+    )
+    fn.nullable &&
+        !f.nullable &&
+        AC.nullcount(dn) > 0 &&
+        throw(
+            ArgumentError(
+                "column $(f.name) holds missing values but its retained field is " *
+                "non-nullable",
+            ),
+        )
+    rebuilt = AC.Field(
+        f.name,
+        fn.type;
+        nullable=f.nullable,
         metadata=f.metadata === nothing ? nothing :
-            collect(Pair{String,String}, f.metadata),
-        children=collect(AC.Field, fn.children))
+                 collect(Pair{String,String}, f.metadata),
+        children=collect(AC.Field, fn.children),
+    )
     return rebuilt, dn
 end
 
@@ -240,48 +292,87 @@ large list rebuilds its offsets at the declared width); the natural side
 supplies the values, untouched. Nulls under a non-nullable retained level
 refuse, exactly like the flat retained gate.
 """
-function _imposelist(rf::AC.Field, nf::AC.Field, nd::AC.ArrayData,
-    colname::String)
+function _imposelist(rf::AC.Field, nf::AC.Field, nd::AC.ArrayData, colname::String)
     rt = rf.type
     nt = nf.type
     if rt isa AC.ListType
-        (nt isa AC.ListType && length(rf.children) == 1 &&
-         length(nf.children) == 1) || throw(ArgumentError(
-            "column $colname no longer matches its retained Arrow type " *
-            "$(repr(rt)); it now maps to $(repr(nt))"))
-        cf, cd = _imposelist(rf.children[1], nf.children[1], nd.children[1],
-            colname)
+        (nt isa AC.ListType && length(rf.children) == 1 && length(nf.children) == 1) ||
+            throw(
+                ArgumentError(
+                    "column $colname no longer matches its retained Arrow type " *
+                    "$(repr(rt)); it now maps to $(repr(nt))",
+                ),
+            )
+        cf, cd = _imposelist(rf.children[1], nf.children[1], nd.children[1], colname)
         buffers = nd.buffers
         if rt.large != nt.large
-            nt.large && throw(ArgumentError(
-                "column $colname no longer matches its retained Arrow " *
-                "type $(repr(rt)); it now maps to $(repr(nt))"))
+            nt.large && throw(
+                ArgumentError(
+                    "column $colname no longer matches its retained Arrow " *
+                    "type $(repr(rt)); it now maps to $(repr(nt))",
+                ),
+            )
             nentries = nd.offset + nd.len + 1
-            small = reinterpret(Int32, copy(AC.slicebytes(AC.subslice(
-                nd.buffers[2], Int64(0), Int64(4) * nentries))))
+            small = reinterpret(
+                Int32,
+                copy(
+                    AC.slicebytes(
+                        AC.subslice(nd.buffers[2], Int64(0), Int64(4) * nentries),
+                    ),
+                ),
+            )
             buffers = [nd.buffers[1], AC._databuffer(collect(Int64, small))]
         end
-        AC.nullcount(nd) > 0 && !rf.nullable && throw(ArgumentError(
-            "column $colname holds missing values but its retained field " *
-            "is non-nullable"))
-        d = AC._arraydata(rt, nd.len, buffers, nd.offset, AC.ArrayData[cd],
-            nothing, nd.owner, AC.nullcount(nd))
-        fld = AC.Field(rf.name, rt; nullable=rf.nullable,
+        AC.nullcount(nd) > 0 &&
+            !rf.nullable &&
+            throw(
+                ArgumentError(
+                    "column $colname holds missing values but its retained field " *
+                    "is non-nullable",
+                ),
+            )
+        d = AC._arraydata(
+            rt,
+            nd.len,
+            buffers,
+            nd.offset,
+            AC.ArrayData[cd],
+            nothing,
+            nd.owner,
+            AC.nullcount(nd),
+        )
+        fld = AC.Field(
+            rf.name,
+            rt;
+            nullable=rf.nullable,
             metadata=rf.metadata === nothing ? nothing :
-                collect(Pair{String,String}, rf.metadata),
-            children=AC.Field[cf])
+                     collect(Pair{String,String}, rf.metadata),
+            children=AC.Field[cf],
+        )
         return fld, d
     end
-    AC.typeequal(nt, rt) || throw(ArgumentError(
-        "column $colname no longer matches its retained Arrow type " *
-        "$(repr(rt)); it now maps to $(repr(nt))"))
-    AC.nullcount(nd) > 0 && !rf.nullable && throw(ArgumentError(
-        "column $colname holds missing values but its retained field " *
-        "is non-nullable"))
-    fld = AC.Field(rf.name, rt; nullable=rf.nullable,
+    AC.typeequal(nt, rt) || throw(
+        ArgumentError(
+            "column $colname no longer matches its retained Arrow type " *
+            "$(repr(rt)); it now maps to $(repr(nt))",
+        ),
+    )
+    AC.nullcount(nd) > 0 &&
+        !rf.nullable &&
+        throw(
+            ArgumentError(
+                "column $colname holds missing values but its retained field " *
+                "is non-nullable",
+            ),
+        )
+    fld = AC.Field(
+        rf.name,
+        rt;
+        nullable=rf.nullable,
         metadata=rf.metadata === nothing ? nothing :
-            collect(Pair{String,String}, rf.metadata),
-        children=collect(AC.Field, nf.children))
+                 collect(Pair{String,String}, rf.metadata),
+        children=collect(AC.Field, nf.children),
+    )
     return fld, nd
 end
 
@@ -300,8 +391,13 @@ function _retainedlisteltype(c::AC.Field)
         inner === nothing && return nothing
         return c.nullable ? Union{Missing,Vector{inner}} : Vector{inner}
     end
-    (t isa AC.DateType || t isa AC.TimestampType || t isa AC.TimeType ||
-        t isa AC.DurationType || t isa AC.DictionaryType) && return nothing
+    (
+        t isa AC.DateType ||
+        t isa AC.TimestampType ||
+        t isa AC.TimeType ||
+        t isa AC.DurationType ||
+        t isa AC.DictionaryType
+    ) && return nothing
     E0 = _facadebasetype(t)
     E0 === Any && return nothing
     return c.nullable ? Union{Missing,E0} : E0
@@ -325,17 +421,23 @@ end
 
 function _retypevalue(::Type{T}, x, f::AC.Field) where {T}
     if x === missing
-        Missing <: T || throw(ArgumentError(
-            "column $(f.name) holds missing elements but its retained " *
-            "list child is non-nullable"))
+        Missing <: T || throw(
+            ArgumentError(
+                "column $(f.name) holds missing elements but its retained " *
+                "list child is non-nullable",
+            ),
+        )
         return missing
     end
     NT = Base.nonmissingtype(T)
     if NT <: AbstractVector
-        x isa AbstractVector || throw(ArgumentError(
-            "column $(f.name) holds $(typeof(x)) values, but its retained " *
-            "Arrow type $(repr(f.type)) materializes as vectors; the " *
-            "column was replaced with incompatible data"))
+        x isa AbstractVector || throw(
+            ArgumentError(
+                "column $(f.name) holds $(typeof(x)) values, but its retained " *
+                "Arrow type $(repr(f.type)) materializes as vectors; the " *
+                "column was replaced with incompatible data",
+            ),
+        )
         E = eltype(NT)
         w = Vector{E}(undef, length(x))
         i = 0
@@ -345,19 +447,27 @@ function _retypevalue(::Type{T}, x, f::AC.Field) where {T}
         end
         return w
     end
-    x isa NT || throw(ArgumentError(
-        "column $(f.name) holds $(typeof(x)) elements that do not match " *
-        "its retained list element type $(NT); the column was replaced " *
-        "with incompatible data"))
+    x isa NT || throw(
+        ArgumentError(
+            "column $(f.name) holds $(typeof(x)) elements that do not match " *
+            "its retained list element type $(NT); the column was replaced " *
+            "with incompatible data",
+        ),
+    )
     return x
 end
 
 function _rebuildtemporal(f::AC.Field, storage, n)
     t = f.type
     nmissing = count(x -> x === missing, storage)
-    nmissing > 0 && !f.nullable && throw(ArgumentError(
-        "column $(f.name) holds missing values but its retained field is " *
-        "non-nullable"))
+    nmissing > 0 &&
+        !f.nullable &&
+        throw(
+            ArgumentError(
+                "column $(f.name) holds missing values but its retained field is " *
+                "non-nullable",
+            ),
+        )
     f0, d0 = AC.fromjulia("x", storage)
     width = AC.primwidth(t)
     buffers = d0.buffers
@@ -368,11 +478,23 @@ function _rebuildtemporal(f::AC.Field, storage, n)
         end
         buffers = [d0.buffers[1], AC._databuffer(narrow)]
     end
-    d = AC._arraydata(t, d0.len, buffers, 0, AC.ArrayData[], nothing,
-        d0.owner, AC.nullcount(d0))
-    fld = AC.Field(f.name, t; nullable=f.nullable,
+    d = AC._arraydata(
+        t,
+        d0.len,
+        buffers,
+        0,
+        AC.ArrayData[],
+        nothing,
+        d0.owner,
+        AC.nullcount(d0),
+    )
+    fld = AC.Field(
+        f.name,
+        t;
+        nullable=f.nullable,
         metadata=f.metadata === nothing ? nothing :
-            collect(Pair{String,String}, f.metadata))
+                 collect(Pair{String,String}, f.metadata),
+    )
     return fld, d
 end
 
@@ -416,33 +538,51 @@ function _dictbatch(fld::AC.Field, indices::Vector, pool_d::AC.ArrayData)
     present = [x !== missing for x in indices]
     inds = IT[x === missing ? zero(IT) : IT(x) for x in indices]
     nc = count(!, present)
-    d = AC.ArrayData(t, length(indices),
+    d = AC.ArrayData(
+        t,
+        length(indices),
         [AC._bitmapbuffer(present), AC._databuffer(inds)];
-        dictionary=pool_d, nullcount=nc)
+        dictionary=pool_d,
+        nullcount=nc,
+    )
     return d
 end
 
 "Field + first-batch data for a dictionary column under a RETAINED type."
-function _retaineddict(rf::AC.Field, pool::Vector, firstidx::Vector,
-    name::String)
+function _retaineddict(rf::AC.Field, pool::Vector, firstidx::Vector, name::String)
     t = rf.type::AC.DictionaryType
     vf, vd = AC.fromjulia(name, pool)
-    AC.typeequal(vf.type, t.valuetype) || throw(ArgumentError(
-        "column $name pool maps to $(summary(vf.type)) but the retained " *
-        "dictionary value type is $(summary(t.valuetype))"))
+    AC.typeequal(vf.type, t.valuetype) || throw(
+        ArgumentError(
+            "column $name pool maps to $(summary(vf.type)) but the retained " *
+            "dictionary value type is $(summary(t.valuetype))",
+        ),
+    )
     IT = AC.juliatype(t.indextype)
-    length(pool) - 1 <= typemax(IT) || throw(ArgumentError(
-        "column $name pool of $(length(pool)) values exceeds the retained " *
-        "$(summary(t.indextype)) index range"))
-    fld = AC.Field(name, t; nullable=rf.nullable,
+    length(pool) - 1 <= typemax(IT) || throw(
+        ArgumentError(
+            "column $name pool of $(length(pool)) values exceeds the retained " *
+            "$(summary(t.indextype)) index range",
+        ),
+    )
+    fld = AC.Field(
+        name,
+        t;
+        nullable=rf.nullable,
         metadata=rf.metadata === nothing ? nothing :
-            collect(Pair{String,String}, rf.metadata),
-        children=collect(AC.Field, vf.children))
+                 collect(Pair{String,String}, rf.metadata),
+        children=collect(AC.Field, vf.children),
+    )
     return fld, _dictbatch(fld, firstidx, vd)
 end
 
-function _writebytes(tbl; file::Bool=true, compress::Union{Nothing,Symbol}=nothing,
-    metadata=nothing, colmetadata=nothing)
+function _writebytes(
+    tbl;
+    file::Bool=true,
+    compress::Union{Nothing,Symbol}=nothing,
+    metadata=nothing,
+    colmetadata=nothing,
+)
     retained = _retainedschema(tbl)
     # Phase 1: materialize every partition's columns (this writer is eager),
     # validating name/order agreement — a drift here would silently bind
@@ -456,13 +596,15 @@ function _writebytes(tbl; file::Bool=true, compress::Union{Nothing,Symbol}=nothi
         if isempty(partcols)
             names = pnames
         else
-            pnames == names || throw(ArgumentError(
-                "partition $(length(partcols) + 1) column names $(pnames) " *
-                "do not match the first partition's $(names) (same names, " *
-                "same order); reorder or rename the partition's columns"))
+            pnames == names || throw(
+                ArgumentError(
+                    "partition $(length(partcols) + 1) column names $(pnames) " *
+                    "do not match the first partition's $(names) (same names, " *
+                    "same order); reorder or rename the partition's columns",
+                ),
+            )
         end
-        push!(partcols, AbstractVector[Tables.getcolumn(cols, nm)
-                                       for nm in pnames])
+        push!(partcols, AbstractVector[Tables.getcolumn(cols, nm) for nm in pnames])
         n = Int(Tables.rowcount(cols))
         if n == 0 && isempty(pnames)
             n = max(n, Int(Tables.rowcount(part)))
@@ -475,8 +617,7 @@ function _writebytes(tbl; file::Bool=true, compress::Union{Nothing,Symbol}=nothi
     ncols = length(names)
     function retainedfield(j)
         retained === nothing && return nothing
-        i = findfirst(f -> f.name == String(names[j]),
-            collect(retained.fields))
+        i = findfirst(f -> f.name == String(names[j]), collect(retained.fields))
         return i === nothing ? nothing : retained.fields[i]
     end
     # Phase 2: build columns. Dictionary-intent columns (retained
@@ -487,68 +628,83 @@ function _writebytes(tbl; file::Bool=true, compress::Union{Nothing,Symbol}=nothi
     coldata = [Vector{AC.ArrayData}(undef, nparts) for _ = 1:ncols]
     for j = 1:ncols
         rf = retainedfield(j)
-        dictintent = (rf !== nothing && rf.type isa AC.DictionaryType) ||
+        dictintent =
+            (rf !== nothing && rf.type isa AC.DictionaryType) ||
             any(partcols[k][j] isa DictEncode for k = 1:nparts)
         if dictintent
-            vals = [partcols[k][j] isa DictEncode ?
-                    (partcols[k][j]::DictEncode).data : partcols[k][j]
-                    for k = 1:nparts]
+            vals = [
+                partcols[k][j] isa DictEncode ? (partcols[k][j]::DictEncode).data :
+                partcols[k][j] for k = 1:nparts
+            ]
             if rf !== nothing
                 Fv = _facadebasetype(rf.type)
                 for k = 1:nparts
                     NT = Base.nonmissingtype(eltype(vals[k]))
-                    Fv !== Any && !(NT <: Fv) && NT !== Union{} &&
-                        throw(ArgumentError(
-                        "column $(names[j]) holds $(NT) values, but its " *
-                        "retained dictionary materializes as $(Fv); the " *
-                        "column was replaced with incompatible data"))
-                    eltype(vals[k]) >: Missing && !rf.nullable &&
-                        throw(ArgumentError(
-                        "column $(names[j]) may hold missing values but " *
-                        "its retained dictionary field is non-nullable"))
+                    Fv !== Any &&
+                        !(NT <: Fv) &&
+                        NT !== Union{} &&
+                        throw(
+                            ArgumentError(
+                                "column $(names[j]) holds $(NT) values, but its " *
+                                "retained dictionary materializes as $(Fv); the " *
+                                "column was replaced with incompatible data",
+                            ),
+                        )
+                    eltype(vals[k]) >: Missing &&
+                        !rf.nullable &&
+                        throw(
+                            ArgumentError(
+                                "column $(names[j]) may hold missing values but " *
+                                "its retained dictionary field is non-nullable",
+                            ),
+                        )
                 end
             end
             pool = unique(x for k = 1:nparts for x in skipmissing(vals[k]))
-            lookup = Dict{Any,Int32}(x => Int32(i - 1)
-                                     for (i, x) in enumerate(pool))
-            firstidx = Union{Missing,Int32}[x === missing ? missing :
-                lookup[x] for x in vals[1]]
+            lookup = Dict{Any,Int32}(x => Int32(i - 1) for (i, x) in enumerate(pool))
+            firstidx =
+                Union{Missing,Int32}[x === missing ? missing : lookup[x] for x in vals[1]]
             if rf === nothing
-                fld, d1 = AC.fromjulia_dict(String(names[j]), collect(pool),
-                    firstidx)
+                fld, d1 = AC.fromjulia_dict(String(names[j]), collect(pool), firstidx)
             else
-                fld, d1 = _retaineddict(rf, collect(pool), firstidx,
-                    String(names[j]))
+                fld, d1 = _retaineddict(rf, collect(pool), firstidx, String(names[j]))
             end
             fields[j] = fld
             coldata[j][1] = d1
             pool_d = d1.dictionary::AC.ArrayData
             for k = 2:nparts
-                idx = Union{Missing,Int32}[x === missing ? missing :
-                    lookup[x] for x in vals[k]]
+                idx = Union{Missing,Int32}[
+                    x === missing ? missing : lookup[x] for x in vals[k]
+                ]
                 coldata[j][k] = _dictbatch(fld, idx, pool_d)
             end
         else
             local firstfield::AC.Field
             for k = 1:nparts
-                fk, dk = rf === nothing ?
-                    _writecolumn(String(names[j]), partcols[k][j]) :
+                fk, dk =
+                    rf === nothing ? _writecolumn(String(names[j]), partcols[k][j]) :
                     _writecolumn(rf, partcols[k][j])
                 if k == 1
                     firstfield = fk
                 else
-                    AC.typeequal(fk.type, firstfield.type) ||
-                        throw(ArgumentError(
-                        "partition $k column $(names[j]) maps to Arrow " *
-                        "type $(repr(fk.type)), but the first partition " *
-                        "declared $(repr(firstfield.type)); make the " *
-                        "column types agree across partitions"))
-                    fk.nullable && !firstfield.nullable &&
-                        throw(ArgumentError(
-                        "partition $k column $(names[j]) is nullable but " *
-                        "the first partition declared it non-nullable; " *
-                        "make the first partition's column eltype " *
-                        "Union{Missing,T} to widen the schema"))
+                    AC.typeequal(fk.type, firstfield.type) || throw(
+                        ArgumentError(
+                            "partition $k column $(names[j]) maps to Arrow " *
+                            "type $(repr(fk.type)), but the first partition " *
+                            "declared $(repr(firstfield.type)); make the " *
+                            "column types agree across partitions",
+                        ),
+                    )
+                    fk.nullable &&
+                        !firstfield.nullable &&
+                        throw(
+                            ArgumentError(
+                                "partition $k column $(names[j]) is nullable but " *
+                                "the first partition declared it non-nullable; " *
+                                "make the first partition's column eltype " *
+                                "Union{Missing,T} to widen the schema",
+                            ),
+                        )
                 end
                 coldata[j][k] = dk
             end
@@ -556,17 +712,20 @@ function _writebytes(tbl; file::Bool=true, compress::Union{Nothing,Symbol}=nothi
         end
     end
     outfields = AC.Field[_withcolmeta(fields[j], colmetadata) for j = 1:ncols]
-    schmeta = metadata !== nothing ? _metapairs(metadata) :
-        (retained === nothing || retained.metadata === nothing ? nothing :
-         collect(Pair{String,String}, retained.metadata))
+    schmeta =
+        metadata !== nothing ? _metapairs(metadata) :
+        (
+            retained === nothing || retained.metadata === nothing ? nothing :
+            collect(Pair{String,String}, retained.metadata)
+        )
     sch = AC.Schema(outfields; metadata=schmeta)
     batches = AC.RecordBatch[
-        AC.RecordBatch(sch,
-            AC.ArrayData[coldata[j][k] for j = 1:ncols], rowcounts[k])
-        for k = 1:nparts]
+        AC.RecordBatch(sch, AC.ArrayData[coldata[j][k] for j = 1:ncols], rowcounts[k])
+        for k = 1:nparts
+    ]
     codec = compress === nothing ? :none : compress
     return file ? writefile(sch, batches; compress=codec) :
-        writestream(sch, batches; compress=codec)
+           writestream(sch, batches; compress=codec)
 end
 
 _metapairs(::Nothing) = nothing
@@ -576,6 +735,11 @@ _withcolmeta(f::AC.Field, ::Nothing) = f
 function _withcolmeta(f::AC.Field, colmetadata)
     cm = get(Dict(colmetadata), Symbol(f.name), nothing)
     cm === nothing && return f
-    return AC.Field(f.name, f.type; nullable=f.nullable,
-        metadata=_metapairs(cm), children=collect(AC.Field, f.children))
+    return AC.Field(
+        f.name,
+        f.type;
+        nullable=f.nullable,
+        metadata=_metapairs(cm),
+        children=collect(AC.Field, f.children),
+    )
 end

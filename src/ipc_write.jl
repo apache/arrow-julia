@@ -86,7 +86,8 @@ end
 # Metadata building: Core descriptors -> Meta tables (inverse of `coretype`)
 # ---------------------------------------------------------------------------
 
-_metatimeunit(u) = u == AC.SECOND ? Meta.TimeUnit.SECOND :
+_metatimeunit(u) =
+    u == AC.SECOND ? Meta.TimeUnit.SECOND :
     u == AC.MILLISECOND ? Meta.TimeUnit.MILLISECOND :
     u == AC.MICROSECOND ? Meta.TimeUnit.MICROSECOND : Meta.TimeUnit.NANOSECOND
 
@@ -104,8 +105,11 @@ function metatype!(b::FB.Builder, t::ArrowType)
         return Meta.Int, Meta.intEnd(b)
     elseif t isa FloatType
         Meta.floatingPointStart(b)
-        Meta.floatingPointAddPrecision(b, t.bits == 16 ? Meta.Precision.HALF :
-            t.bits == 32 ? Meta.Precision.SINGLE : Meta.Precision.DOUBLE)
+        Meta.floatingPointAddPrecision(
+            b,
+            t.bits == 16 ? Meta.Precision.HALF :
+            t.bits == 32 ? Meta.Precision.SINGLE : Meta.Precision.DOUBLE,
+        )
         return Meta.FloatingPoint, Meta.floatingPointEnd(b)
     elseif t isa BoolType
         Meta.boolStart(b)
@@ -148,8 +152,10 @@ function metatype!(b::FB.Builder, t::ArrowType)
         return Meta.Map, Meta.mapEnd(b)
     elseif t isa DateType
         Meta.dateStart(b)
-        Meta.dateAddUnit(b, t.unit == AC.DAY ? Meta.DateUnit.DAY :
-            Meta.DateUnit.MILLISECOND)
+        Meta.dateAddUnit(
+            b,
+            t.unit == AC.DAY ? Meta.DateUnit.DAY : Meta.DateUnit.MILLISECOND,
+        )
         return Meta.Date, Meta.dateEnd(b)
     elseif t isa TimeType
         Meta.timeStart(b)
@@ -157,8 +163,7 @@ function metatype!(b::FB.Builder, t::ArrowType)
         Meta.timeAddBitWidth(b, Int32(t.bits))
         return Meta.Time, Meta.timeEnd(b)
     elseif t isa TimestampType
-        tz = t.timezone === nothing ? FB.UOffsetT(0) :
-            FB.createstring!(b, t.timezone)
+        tz = t.timezone === nothing ? FB.UOffsetT(0) : FB.createstring!(b, t.timezone)
         Meta.timestampStart(b)
         Meta.timestampAddUnit(b, _metatimeunit(t.unit))
         tz == 0 || Meta.timestampAddTimezone(b, tz)
@@ -175,17 +180,22 @@ function metatype!(b::FB.Builder, t::ArrowType)
         return Meta.Decimal, Meta.decimalEnd(b)
     elseif t isa IntervalType
         Meta.intervalStart(b)
-        Meta.intervalAddUnit(b, t.unit == AC.YEAR_MONTH ? Meta.IntervalUnit.YEAR_MONTH :
+        Meta.intervalAddUnit(
+            b,
+            t.unit == AC.YEAR_MONTH ? Meta.IntervalUnit.YEAR_MONTH :
             t.unit == AC.DAY_TIME ? Meta.IntervalUnit.DAY_TIME :
-            Meta.IntervalUnit.MONTH_DAY_NANO)
+            Meta.IntervalUnit.MONTH_DAY_NANO,
+        )
         return Meta.Interval, Meta.intervalEnd(b)
     elseif t isa UnionType
         Meta.unionStartTypeIdsVector(b, length(t.typeids))
         foreach(x -> FB.prepend!(b, Int32(x)), Iterators.reverse(t.typeids))
         idvec = FB.endvector!(b, length(t.typeids))
         Meta.unionStart(b)
-        Meta.unionAddMode(b, t.mode == AC.DenseMode ? Meta.UnionMode.Dense :
-            Meta.UnionMode.Sparse)
+        Meta.unionAddMode(
+            b,
+            t.mode == AC.DenseMode ? Meta.UnionMode.Dense : Meta.UnionMode.Sparse,
+        )
         Meta.unionAddTypeIds(b, idvec)
         return Meta.Union, Meta.unionEnd(b)
     elseif t isa ViewType
@@ -209,8 +219,11 @@ function metatype!(b::FB.Builder, t::ArrowType)
         Meta.nullStart(b)
         return Meta.Null, Meta.nullEnd(b)
     else
-        throw(ValidationError("IPC writer does not map descriptor " *
-            "$(AC.descriptorname(t))"))
+        throw(
+            ValidationError(
+                "IPC writer does not map descriptor " * "$(AC.descriptorname(t))",
+            ),
+        )
     end
 end
 
@@ -287,8 +300,12 @@ function _finishmessage!(out::Vector{UInt8}, b::FB.Builder, msg, body::Vector{UI
     return out
 end
 
-function _metaschema!(b::FB.Builder, sch::Schema,
-    fielddictids::IdDict{Field,Int64}, features::Vector{Int64})
+function _metaschema!(
+    b::FB.Builder,
+    sch::Schema,
+    fielddictids::IdDict{Field,Int64},
+    features::Vector{Int64},
+)
     fields = FB.UOffsetT[metafield!(b, f, fielddictids) for f in sch.fields]
     Meta.schemaStartFieldsVector(b, length(fields))
     foreach(x -> FB.prependoffset!(b, x), Iterators.reverse(fields))
@@ -308,8 +325,12 @@ function _metaschema!(b::FB.Builder, sch::Schema,
     return Meta.schemaEnd(b)
 end
 
-function _schemamessage!(out::Vector{UInt8}, sch::Schema,
-    fielddictids::IdDict{Field,Int64}, features::Vector{Int64})
+function _schemamessage!(
+    out::Vector{UInt8},
+    sch::Schema,
+    fielddictids::IdDict{Field,Int64},
+    features::Vector{Int64},
+)
     b = FB.Builder(1024)
     schoff = _metaschema!(b, sch, fielddictids, features)
     Meta.messageStart(b)
@@ -332,8 +353,7 @@ mutable struct EncodeCursor
     variadics::Vector{Int64}             # per view field, depth-first order
 end
 EncodeCursor(codec::Int8, state::Union{Nothing,EncodeState}) =
-    EncodeCursor(NTuple{2,Int64}[], NTuple{2,Int64}[], UInt8[], codec, state,
-        Int64[])
+    EncodeCursor(NTuple{2,Int64}[], NTuple{2,Int64}[], UInt8[], codec, state, Int64[])
 
 function _compressbytes(state::EncodeState, codec::Int8, raw::Vector{UInt8})
     codec == CODEC_LZ4_FRAME && return transcode(_lz4c!(state), raw)
@@ -389,8 +409,11 @@ function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
     t = f.type
     AC.typeequal(t, d.type) ||
         throw(ValidationError("column data type does not match its schema field"))
-    d.offset == 0 ||
-        throw(ValidationError("IPC encode of sliced (nonzero-offset) arrays is not supported; materialize first"))
+    d.offset == 0 || throw(
+        ValidationError(
+            "IPC encode of sliced (nonzero-offset) arrays is not supported; materialize first",
+        ),
+    )
     push!(c.nodes, (d.len, AC.nullcount(d)))
     spec = layoutspec(t)
     if spec.variadic
@@ -425,8 +448,7 @@ function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
         throw(ValidationError("column child count does not match its schema field"))
     if t isa UnionType && t.mode == AC.SparseMode
         all(child -> child.len == d.len, d.children) ||
-            throw(ValidationError(
-                "IPC sparse-union children must equal the union length"))
+            throw(ValidationError("IPC sparse-union children must equal the union length"))
     end
     for i = 1:nchildren
         encodefield!(c, f.children[i], d.children[i])
@@ -448,8 +470,11 @@ function _batchheader!(b::FB.Builder, c::EncodeCursor, nrows::Int64)
     compression = FB.UOffsetT(0)
     if c.codec != CODEC_NONE
         Meta.bodyCompressionStart(b)
-        Meta.bodyCompressionAddCodec(b, c.codec == CODEC_LZ4_FRAME ?
-            Meta.CompressionType.LZ4_FRAME : Meta.CompressionType.ZSTD)
+        Meta.bodyCompressionAddCodec(
+            b,
+            c.codec == CODEC_LZ4_FRAME ? Meta.CompressionType.LZ4_FRAME :
+            Meta.CompressionType.ZSTD,
+        )
         compression = Meta.bodyCompressionEnd(b)
     end
     varvec = FB.UOffsetT(0)
@@ -467,8 +492,13 @@ function _batchheader!(b::FB.Builder, c::EncodeCursor, nrows::Int64)
     return Meta.recordBatchEnd(b)
 end
 
-function _recordmessage!(out::Vector{UInt8}, batch::AC.RecordBatch,
-    fields, codec::Int8, state::Union{Nothing,EncodeState})
+function _recordmessage!(
+    out::Vector{UInt8},
+    batch::AC.RecordBatch,
+    fields,
+    codec::Int8,
+    state::Union{Nothing,EncodeState},
+)
     c = EncodeCursor(codec, state)
     for (f, col) in zip(fields, batch.columns)
         encodefield!(c, f, col)
@@ -483,8 +513,14 @@ function _recordmessage!(out::Vector{UInt8}, batch::AC.RecordBatch,
     return _finishmessage!(out, b, Meta.messageEnd(b), c.body)
 end
 
-function _dictionarymessage!(out::Vector{UInt8}, id::Int64, vf::Field,
-    pool::ArrayData, codec::Int8, state::Union{Nothing,EncodeState})
+function _dictionarymessage!(
+    out::Vector{UInt8},
+    id::Int64,
+    vf::Field,
+    pool::ArrayData,
+    codec::Int8,
+    state::Union{Nothing,EncodeState},
+)
     c = EncodeCursor(codec, state)
     encodefield!(c, vf, pool)
     b = FB.Builder(1024)
@@ -505,8 +541,8 @@ end
 # Stream writer driver
 # ---------------------------------------------------------------------------
 
-const CODEC_NAMES = Dict{Symbol,Int8}(:none => CODEC_NONE,
-    :lz4 => CODEC_LZ4_FRAME, :zstd => CODEC_ZSTD)
+const CODEC_NAMES =
+    Dict{Symbol,Int8}(:none => CODEC_NONE, :lz4 => CODEC_LZ4_FRAME, :zstd => CODEC_ZSTD)
 
 function _requirelittleendian(host_endian_bom::UInt32=Base.ENDIAN_BOM)
     host_endian_bom == UInt32(0x04030201) ||
@@ -531,16 +567,19 @@ function assigndictids(fields, given::IdDict{Field,Int64}=IdDict{Field,Int64}())
     next = Ref(Int64(0))
     function freshid()
         while next[] in used
-            next[] < typemax(Int64) || throw(ValidationError(
-                "IPC dictionary id space is exhausted"))
+            next[] < typemax(Int64) ||
+                throw(ValidationError("IPC dictionary id space is exhausted"))
             next[] += 1
         end
         push!(used, next[])
         return next[]
     end
     function walk(f::Field)
-        haskey(seen, f) && throw(ValidationError(
-            "IPC writer schema reuses one Field object in multiple positions"))
+        haskey(seen, f) && throw(
+            ValidationError(
+                "IPC writer schema reuses one Field object in multiple positions",
+            ),
+        )
         seen[f] = nothing
         if f.type isa DictionaryType && !haskey(ids, f)
             ids[f] = freshid()
@@ -593,8 +632,7 @@ end
 function _validatewriterschema(sch::Schema)
     AC._validate_schema(sch)
     function walk(f::Field)
-        isvalid(f.name) ||
-            throw(ValidationError("field name is not valid UTF-8"))
+        isvalid(f.name) || throw(ValidationError("field name is not valid UTF-8"))
         AC._validate_metadata(f.metadata, "field")
         foreach(walk, f.children)
         return nothing
@@ -617,9 +655,13 @@ function _validatewriterbatches(sch::Schema, batches, ids::IdDict{Field,Int64})
             # intra-batch pool change is not temporal replacement — it would
             # silently retarget the earlier field to the later pool.
             id = ids[f]
-            haskey(current, id) && current[id] !== pool &&
-                throw(ValidationError(
-                    "dictionary id $id carries two different pools in one record batch"))
+            haskey(current, id) &&
+                current[id] !== pool &&
+                throw(
+                    ValidationError(
+                        "dictionary id $id carries two different pools in one record batch",
+                    ),
+                )
             current[id] = pool
             validate_semantic(AC.dictvaluefield(f, f.type::DictionaryType), pool)
             validated[pool] = nothing
@@ -636,8 +678,7 @@ Which features must the schema declare for these batches? Replacement is
 detected by pool-identity change per id across the batch sequence
 (replacement-on-change); compression declares COMPRESSED_BODY.
 """
-function _streamfeatures(sch::Schema, batches, ids::IdDict{Field,Int64},
-    codec::Int8)
+function _streamfeatures(sch::Schema, batches, ids::IdDict{Field,Int64}, codec::Int8)
     features = Int64[]
     current = Dict{Int64,ArrayData}()
     replacement = false
@@ -650,8 +691,7 @@ function _streamfeatures(sch::Schema, batches, ids::IdDict{Field,Int64},
         end
     end
     replacement && push!(features, Int64(1))   # Feature.DICTIONARY_REPLACEMENT
-    isempty(batches) || codec == CODEC_NONE ||
-        push!(features, Int64(2))  # Feature.COMPRESSED_BODY
+    isempty(batches) || codec == CODEC_NONE || push!(features, Int64(2))  # Feature.COMPRESSED_BODY
     return features
 end
 
@@ -664,8 +704,12 @@ pool-identity change), record batches, end-of-stream marker. Every column is
 semantically validated before any of its bytes are emitted — the writer
 refuses to publish data Core would refuse to read.
 """
-function writestream(sch::Schema, batches::AbstractVector{AC.RecordBatch};
-    compress::Symbol=:none, dictids::IdDict{Field,Int64}=IdDict{Field,Int64}())
+function writestream(
+    sch::Schema,
+    batches::AbstractVector{AC.RecordBatch};
+    compress::Symbol=:none,
+    dictids::IdDict{Field,Int64}=IdDict{Field,Int64}(),
+)
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
         throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
@@ -682,8 +726,7 @@ function writestream(sch::Schema, batches::AbstractVector{AC.RecordBatch};
     out = UInt8[]
     state = codec == CODEC_NONE ? nothing : EncodeState()
     try
-        _schemamessage!(out, sch, fielddictids,
-            _streamfeatures(sch, batches, ids, codec))
+        _schemamessage!(out, sch, fielddictids, _streamfeatures(sch, batches, ids, codec))
         current = Dict{Int64,ArrayData}()
         for batch in batches
             for (f, pool) in dictionarypools(sch.fields, batch.columns)
@@ -721,8 +764,12 @@ isolated here; message writing is the stream code above. The file format
 carries exactly one dictionary batch per id, so batches whose pools change
 identity are a clean refusal (the stream format handles replacement).
 """
-function writefile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
-    compress::Symbol=:none, dictids::IdDict{Field,Int64}=IdDict{Field,Int64}())
+function writefile(
+    sch::Schema,
+    batches::AbstractVector{AC.RecordBatch};
+    compress::Symbol=:none,
+    dictids::IdDict{Field,Int64}=IdDict{Field,Int64}(),
+)
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
         throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
@@ -730,9 +777,12 @@ function writefile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
     _checkbatches(sch, batches)
     _validatewriterschema(sch)
     ids = assigndictids(sch.fields, dictids)
-    isempty(_streamfeatures(sch, batches, ids, CODEC_NONE)) ||
-        throw(ValidationError("the IPC file format carries one dictionary batch per id; " *
-            "changing pools require the stream format"))
+    isempty(_streamfeatures(sch, batches, ids, CODEC_NONE)) || throw(
+        ValidationError(
+            "the IPC file format carries one dictionary batch per id; " *
+            "changing pools require the stream format",
+        ),
+    )
     fielddictids = IdDict{Field,Int64}(ids)
     # Same shared-id contract as the stream writer: compatible value schemas,
     # one nested id topology, one pool per id within each batch.
@@ -753,8 +803,8 @@ function writefile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
             emit!()
             # metaDataLength spans prefix + metadata (up to the body start).
             total = Int64(length(out)) - offset
-            metalen = Int64(8) + Int64(reinterpret(UInt32,
-                out[(offset + 5):(offset + 8)])[1])
+            metalen =
+                Int64(8) + Int64(reinterpret(UInt32, out[(offset + 5):(offset + 8)])[1])
             push!(blocks, (offset, metalen, total - metalen))
             return nothing
         end
@@ -764,11 +814,15 @@ function writefile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
                 id in emitted && continue
                 push!(emitted, id)
                 vf = AC.dictvaluefield(f, f.type::DictionaryType)
-                block!(dictblocks,
-                    () -> _dictionarymessage!(out, id, vf, pool, codec, state))
+                block!(
+                    dictblocks,
+                    () -> _dictionarymessage!(out, id, vf, pool, codec, state),
+                )
             end
-            block!(recordblocks,
-                () -> _recordmessage!(out, batch, sch.fields, codec, state))
+            block!(
+                recordblocks,
+                () -> _recordmessage!(out, batch, sch.fields, codec, state),
+            )
         end
         append!(out, reinterpret(UInt8, UInt32[CONTINUATION, UInt32(0)]))
         # Footer: schema again, then the two Block struct-vectors.
@@ -807,17 +861,22 @@ writefile(s::IPCStream; compress::Symbol=:none) =
 # File reader: footer verification + lazy random-access batch handle
 # ---------------------------------------------------------------------------
 
-_blocktuples(blocks) = blocks === nothing ? NTuple{3,Int64}[] :
-    NTuple{3,Int64}[(Int64(b.offset), Int64(b.metaDataLength), Int64(b.bodyLength))
-                    for b in blocks]
+_blocktuples(blocks) =
+    blocks === nothing ? NTuple{3,Int64}[] :
+    NTuple{3,Int64}[
+        (Int64(b.offset), Int64(b.metaDataLength), Int64(b.bodyLength)) for b in blocks
+    ]
 
 """
 Footer verification, same wrapper role as `verify_ipc_metadata`: the
 generated walker bounds the whole table graph, then the verified getters
 supply the Block indexes.
 """
-function verify_footer(bytes::Vector{UInt8}, limits::Limits,
-    reserve_limit::Int64=limits.max_total_allocated_bytes)
+function verify_footer(
+    bytes::Vector{UInt8},
+    limits::Limits,
+    reserve_limit::Int64=limits.max_total_allocated_bytes,
+)
     ctx = _verifyctx(limits, reserve_limit)
     # Staged like verify_ipc_metadata: version gates between the inline and
     # reference stages, so an unsupported footer rejects in constant time.
@@ -828,8 +887,11 @@ function verify_footer(bytes::Vector{UInt8}, limits::Limits,
         _vfail("unsupported footer version $version (only V4/V5 are accepted)")
     _verified(() -> Meta.verifyrootrest_Footer(t, ctx))
     features = _schemafeatures(footer.schema::Meta.Schema, version)
-    return version, features, _blocktuples(footer.dictionaries),
-        _blocktuples(footer.recordBatches), ctx.reserved
+    return version,
+    features,
+    _blocktuples(footer.dictionaries),
+    _blocktuples(footer.recordBatches),
+    ctx.reserved
 end
 
 function _metadataequal(a, b)
@@ -844,17 +906,21 @@ function _metadataequal(a, b)
 end
 
 function _fieldequal(a::Field, b::Field)
-    a.name == b.name && a.nullable == b.nullable &&
-        AC.typeequal(a.type, b.type) && a.metadata == b.metadata &&
-        length(a.children) == length(b.children) || return false
+    a.name == b.name &&
+    a.nullable == b.nullable &&
+    AC.typeequal(a.type, b.type) &&
+    a.metadata == b.metadata &&
+    length(a.children) == length(b.children) || return false
     return all(_fieldequal(x, y) for (x, y) in zip(a.children, b.children))
 end
 
 function _schemaside(metaschema::Meta.Schema)
     dictids = Dict{Int64,Meta.Field}()
     fielddictids = IdDict{Field,Int64}()
-    fields = Field[corefield(f, dictids, fielddictids)
-        for f in something(metaschema.fields, Meta.Field[])]
+    fields = Field[
+        corefield(f, dictids, fielddictids) for
+        f in something(metaschema.fields, Meta.Field[])
+    ]
     foreach(validateschemafield, fields)
     valueschemas = validatedictionaryids(fields, fielddictids)
     length(valueschemas) == length(dictids) ||
@@ -872,18 +938,16 @@ function _fieldwireequal(a::Meta.Field, b::Meta.Field)
     achildren = something(a.children, Meta.Field[])
     bchildren = something(b.children, Meta.Field[])
     length(achildren) == length(bchildren) || return false
-    return all(_fieldwireequal(x, y)
-        for (x, y) in zip(achildren, bchildren))
+    return all(_fieldwireequal(x, y) for (x, y) in zip(achildren, bchildren))
 end
 
 function _schemaequal(a::Meta.Schema, b::Meta.Schema)
     something(a.endianness, Meta.Endianness.Little) ==
-        something(b.endianness, Meta.Endianness.Little) || return false
+    something(b.endianness, Meta.Endianness.Little) || return false
     ametafields = something(a.fields, Meta.Field[])
     bmetafields = something(b.fields, Meta.Field[])
     length(ametafields) == length(bmetafields) || return false
-    all(_fieldwireequal(x, y)
-        for (x, y) in zip(ametafields, bmetafields)) || return false
+    all(_fieldwireequal(x, y) for (x, y) in zip(ametafields, bmetafields)) || return false
     afields = _schemaside(a)
     bfields = _schemaside(b)
     length(afields) == length(bfields) || return false
@@ -892,8 +956,12 @@ function _schemaequal(a::Meta.Schema, b::Meta.Schema)
     return true
 end
 
-function _fileschema(region::OwnerRegion, footerstart::Int64, limits::Limits,
-    budget::AllocationBudget)
+function _fileschema(
+    region::OwnerRegion,
+    footerstart::Int64,
+    limits::Limits,
+    budget::AllocationBudget,
+)
     blob = BufferSlice(region, 0, region.len)
     AC.loadat(blob, UInt32, Int64(8)) == CONTINUATION ||
         throw(ValidationError("file data section does not start with an IPC message"))
@@ -903,8 +971,7 @@ function _fileschema(region::OwnerRegion, footerstart::Int64, limits::Limits,
     declared % 8 == 0 ||
         throw(ValidationError("file schema metadata is not 8-byte aligned"))
     metalen = AC.checked_add(Int64(8), declared)
-    fm = _blockmessage(region, (Int64(8), metalen, Int64(0)), footerstart,
-        limits, budget)
+    fm = _blockmessage(region, (Int64(8), metalen, Int64(0)), footerstart, limits, budget)
     fm.header_type == UInt8(1) && fm.msg.header isa Meta.Schema ||
         throw(ValidationError("file data section does not start with a schema"))
     return fm, AC.checked_add(Int64(8), metalen)
@@ -952,13 +1019,11 @@ function _blockextent(block::NTuple{3,Int64}, dataend::Int64)
     bodylen % 8 == 0 ||
         throw(ValidationError("footer block body length is not 8-byte aligned"))
     frameend = AC.checked_add(AC.checked_add(offset, metalen), bodylen)
-    frameend <= dataend ||
-        throw(ValidationError("footer block escapes the data section"))
+    frameend <= dataend || throw(ValidationError("footer block escapes the data section"))
     return offset, frameend
 end
 
-function _validateblockindex(dictblocks, recordblocks, dataend::Int64;
-    datastart::Int64=0)
+function _validateblockindex(dictblocks, recordblocks, dataend::Int64; datastart::Int64=0)
     extents = Tuple{Int64,Int64}[]
     indexedend = datastart
     for block in Iterators.flatten((dictblocks, recordblocks))
@@ -980,15 +1045,13 @@ end
 # src/metadata/VerifierRuntime.jl (`_vtable`/`_vfield`/`_vref`/`_vvector`/
 # `_vrange`) over a `BufferSlice` source with block-specific diagnostics; the
 # two must change in lockstep.
-function _blockrange(b::BufferSlice, pos::Int64, len::Int64,
-    what::AbstractString)
+function _blockrange(b::BufferSlice, pos::Int64, len::Int64, what::AbstractString)
     (pos >= 0 && len >= 0 && len <= b.len && pos <= b.len - len) ||
         throw(ValidationError("$what escapes block metadata"))
     return nothing
 end
 
-function _blockload(b::BufferSlice, ::Type{T}, pos::Int64,
-    what::AbstractString) where {T}
+function _blockload(b::BufferSlice, ::Type{T}, pos::Int64, what::AbstractString) where {T}
     _blockrange(b, pos, Int64(sizeof(T)), what)
     return AC.loadat(b, T, pos)
 end
@@ -1035,18 +1098,21 @@ function _blocktable(metadata::BufferSlice, pos::Int64, what::AbstractString)
     vpos = _blocksub(pos, back, what)
     vpos % 2 == 0 || throw(ValidationError("$what vtable is misaligned"))
     vlen = Int64(_blockload(metadata, UInt16, vpos, what))
-    olen = Int64(_blockload(metadata, UInt16,
-        _blockadd(vpos, Int64(2), what), what))
-    vlen >= 4 && iseven(vlen) ||
-        throw(ValidationError("invalid $what vtable length $vlen"))
+    olen = Int64(_blockload(metadata, UInt16, _blockadd(vpos, Int64(2), what), what))
+    vlen >= 4 && iseven(vlen) || throw(ValidationError("invalid $what vtable length $vlen"))
     olen >= 4 || throw(ValidationError("invalid $what object length $olen"))
     _blockrange(metadata, vpos, vlen, what)
     _blockrange(metadata, pos, olen, what)
     return _BlockTable(metadata, pos, vpos, vlen, olen)
 end
 
-function _blockfield(t::_BlockTable, slot::Int, width::Int,
-    what::AbstractString; required::Bool=false)
+function _blockfield(
+    t::_BlockTable,
+    slot::Int,
+    width::Int,
+    what::AbstractString;
+    required::Bool=false,
+)
     entryoff = Int64(4 + 2slot)
     if entryoff > t.vlen - 2
         required && throw(ValidationError("required $what is absent"))
@@ -1061,14 +1127,12 @@ function _blockfield(t::_BlockTable, slot::Int, width::Int,
     (off >= 4 && width <= t.olen && off <= t.olen - width) ||
         throw(ValidationError("$what exceeds its table object"))
     pos = _blockadd(t.pos, off, what)
-    width > 1 && pos % min(width, 8) != 0 &&
-        throw(ValidationError("$what is misaligned"))
+    width > 1 && pos % min(width, 8) != 0 && throw(ValidationError("$what is misaligned"))
     _blockrange(t.metadata, pos, Int64(width), what)
     return pos
 end
 
-function _blockref(t::_BlockTable, slot::Int, what::AbstractString;
-    required::Bool=false)
+function _blockref(t::_BlockTable, slot::Int, what::AbstractString; required::Bool=false)
     pos = _blockfield(t, slot, 4, what; required=required)
     pos === nothing && return nothing
     rel = Int64(_blockload(t.metadata, UInt32, pos, what))
@@ -1078,8 +1142,7 @@ function _blockref(t::_BlockTable, slot::Int, what::AbstractString;
     return target
 end
 
-function _blockvector(t::_BlockTable, slot::Int, elemsize::Int,
-    what::AbstractString)
+function _blockvector(t::_BlockTable, slot::Int, elemsize::Int, what::AbstractString)
     pos = _blockref(t, slot, what)
     pos === nothing && return nothing
     pos % 4 == 0 || throw(ValidationError("$what length is misaligned"))
@@ -1087,7 +1150,9 @@ function _blockvector(t::_BlockTable, slot::Int, elemsize::Int,
     start = _blockadd(pos, Int64(4), what)
     bytes = _blockmul(n, Int64(elemsize), what)
     _blockrange(t.metadata, start, bytes, what)
-    n > 0 && elemsize > 1 && start % min(elemsize, 8) != 0 &&
+    n > 0 &&
+        elemsize > 1 &&
+        start % min(elemsize, 8) != 0 &&
         throw(ValidationError("$what data is misaligned"))
     return start, n
 end
@@ -1103,7 +1168,8 @@ function _blockmessagebatch(metadata::BufferSlice)
     root >= 4 || throw(ValidationError("invalid block message root offset"))
     msg = _blocktable(metadata, root, "block message table")
     bodypos = _blockfield(msg, 3, 8, "message body-length slot")
-    bodylen = bodypos === nothing ? Int64(0) :
+    bodylen =
+        bodypos === nothing ? Int64(0) :
         _blockload(metadata, Int64, bodypos, "message body-length slot")
     headerpos = _blockfield(msg, 1, 1, "message header type"; required=true)
     headertype = _blockload(metadata, UInt8, headerpos, "message header type")
@@ -1115,8 +1181,7 @@ function _blockmessagebatch(metadata::BufferSlice)
     elseif headertype == UInt8(3) # RecordBatch
         header
     else
-        throw(ValidationError(
-            "footer block has unsupported message header type $headertype"))
+        throw(ValidationError("footer block has unsupported message header type $headertype"))
     end
     return bodylen, headertype, batch
 end
@@ -1127,13 +1192,18 @@ function _verifyblockbuffers(batch::_BlockTable, bodylen::Int64)
     start, n = buffers
     last_nonempty_end = Int64(0)
     for i = Int64(0):(n - 1)
-        base = _blockadd(start, _blockmul(i, Int64(16),
-            "record-batch buffer position"), "record-batch buffer position")
-        offset = _blockload(batch.metadata, Int64, base,
-            "record-batch buffer offset")
-        len = _blockload(batch.metadata, Int64,
+        base = _blockadd(
+            start,
+            _blockmul(i, Int64(16), "record-batch buffer position"),
+            "record-batch buffer position",
+        )
+        offset = _blockload(batch.metadata, Int64, base, "record-batch buffer offset")
+        len = _blockload(
+            batch.metadata,
+            Int64,
             _blockadd(base, Int64(8), "record-batch buffer length"),
-            "record-batch buffer length")
+            "record-batch buffer length",
+        )
         offset >= 0 || throw(ValidationError("negative batch buffer offset $offset"))
         len >= 0 || throw(ValidationError("negative batch buffer length $len"))
         offset % 8 == 0 ||
@@ -1150,30 +1220,35 @@ function _verifyblockbuffers(batch::_BlockTable, bodylen::Int64)
     return nothing
 end
 
-function _verifyblockframe(blob::BufferSlice, block::NTuple{3,Int64},
-    expectedheadertype::UInt8)
+function _verifyblockframe(
+    blob::BufferSlice,
+    block::NTuple{3,Int64},
+    expectedheadertype::UInt8,
+)
     offset, metalen, bodylen = block
     AC.loadat(blob, UInt32, offset) == CONTINUATION ||
         throw(ValidationError("footer block does not point at a message"))
     declared = Int64(AC.loadat(blob, Int32, offset + 4))
     declared == metalen - 8 ||
-        throw(ValidationError(
-            "footer block metadata length does not match the message"))
+        throw(ValidationError("footer block metadata length does not match the message"))
     metadata = AC.subslice(blob, offset + 8, declared)
     messagebodylen, headertype, batch = _blockmessagebatch(metadata)
     messagebodylen == bodylen ||
-        throw(ValidationError(
-            "footer block body length does not match the message"))
+        throw(ValidationError("footer block body length does not match the message"))
     headertype == expectedheadertype ||
         throw(ValidationError("footer block has the wrong message header type"))
     _verifyblockbuffers(batch, bodylen)
     return nothing
 end
 
-function _verifyblockframes(blob::BufferSlice, dictblocks, recordblocks,
-    dataend::Int64; datastart::Int64=0)
-    indexedend = _validateblockindex(dictblocks, recordblocks, dataend;
-        datastart=datastart)
+function _verifyblockframes(
+    blob::BufferSlice,
+    dictblocks,
+    recordblocks,
+    dataend::Int64;
+    datastart::Int64=0,
+)
+    indexedend = _validateblockindex(dictblocks, recordblocks, dataend; datastart=datastart)
     foreach(block -> _verifyblockframe(blob, block, UInt8(2)), dictblocks)
     foreach(block -> _verifyblockframe(blob, block, UInt8(3)), recordblocks)
     return indexedend
@@ -1183,8 +1258,13 @@ end
 Frame and verify the single message a Block points at, against the block's
 own declared extents and the enclosing region.
 """
-function _blockmessage(region::OwnerRegion, block::NTuple{3,Int64},
-    dataend::Int64, limits::Limits, budget::AllocationBudget)
+function _blockmessage(
+    region::OwnerRegion,
+    block::NTuple{3,Int64},
+    dataend::Int64,
+    limits::Limits,
+    budget::AllocationBudget,
+)
     offset, _ = _blockextent(block, dataend)
     _, metalen, bodylen = block
     blob = BufferSlice(region, 0, region.len)
@@ -1193,8 +1273,11 @@ function _blockmessage(region::OwnerRegion, block::NTuple{3,Int64},
     declared = Int64(AC.loadat(blob, Int32, offset + 4))
     declared == metalen - 8 ||
         throw(ValidationError("footer block metadata length does not match the message"))
-    0 < declared <= limits.max_metadata_bytes ||
-        throw(ValidationError("metadata length $declared outside (0, $(limits.max_metadata_bytes)]"))
+    0 < declared <= limits.max_metadata_bytes || throw(
+        ValidationError(
+            "metadata length $declared outside (0, $(limits.max_metadata_bytes)]",
+        ),
+    )
     0 <= bodylen <= limits.max_body_bytes ||
         throw(ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"))
     _charge!(budget, declared, "metadata allocation")
@@ -1205,8 +1288,13 @@ function _blockmessage(region::OwnerRegion, block::NTuple{3,Int64},
     msg = FB.getrootas(Meta.Message, metabytes, 0)
     Int64(msg.bodyLength) == bodylen ||
         throw(ValidationError("footer block body length does not match the message"))
-    return FramedMessage(msg, AC.subslice(blob, offset + metalen, bodylen),
-        version, header_type, features)
+    return FramedMessage(
+        msg,
+        AC.subslice(blob, offset + metalen, bodylen),
+        version,
+        header_type,
+        features,
+    )
 end
 
 """
@@ -1228,8 +1316,7 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
     _validatelimits(limits)
     blob = BufferSlice(region, 0, region.len)
     minlen = Int64(8 + 8 + 4 + 6)
-    region.len >= minlen ||
-        throw(ValidationError("file is too short to be an IPC file"))
+    region.len >= minlen || throw(ValidationError("file is too short to be an IPC file"))
     for (i, byte) in enumerate(FILE_MAGIC)
         AC.loadat(blob, UInt8, Int64(i - 1)) == byte ||
             throw(ValidationError("missing leading ARROW1 magic"))
@@ -1237,30 +1324,38 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
             throw(ValidationError("missing trailing ARROW1 magic"))
     end
     footerlen = Int64(AC.loadat(blob, Int32, region.len - 10))
-    0 < footerlen <= limits.max_metadata_bytes ||
-        throw(ValidationError("footer length $footerlen outside (0, $(limits.max_metadata_bytes)]"))
+    0 < footerlen <= limits.max_metadata_bytes || throw(
+        ValidationError(
+            "footer length $footerlen outside (0, $(limits.max_metadata_bytes)]",
+        ),
+    )
     footerstart = region.len - 10 - footerlen
-    footerstart >= 8 ||
-        throw(ValidationError("footer escapes the file"))
+    footerstart >= 8 || throw(ValidationError("footer escapes the file"))
     budget = AllocationBudget(limits.max_total_allocated_bytes)
     _charge!(budget, footerlen, "footer allocation")
     footerbytes = AC.slicebytes(AC.subslice(blob, footerstart, footerlen))
     version, features, dictblocks, recordblocks, reserve =
         verify_footer(footerbytes, limits, budget.left)
     _charge!(budget, reserve, "verified footer expansion")
-    Int64(1) in features && throw(ValidationError(
-        "dictionary replacement is forbidden in the IPC file format"))
-    nmessages = AC.checked_add(Int64(1),
-        AC.checked_add(Int64(length(dictblocks)), Int64(length(recordblocks))))
+    Int64(1) in features &&
+        throw(ValidationError("dictionary replacement is forbidden in the IPC file format"))
+    nmessages = AC.checked_add(
+        Int64(1),
+        AC.checked_add(Int64(length(dictblocks)), Int64(length(recordblocks))),
+    )
     nmessages <= limits.max_messages ||
         throw(ValidationError("message count exceeds limit"))
     footer = FB.getrootas(Meta.Footer, footerbytes, 0)
     metaschema = footer.schema
-    metaschema === nothing ||
-        (something(metaschema.endianness, Meta.Endianness.Little) == Meta.Endianness.Little ||
-        throw(ValidationError("big-endian IPC is not supported (no endianness normalization)")))
-    metaschema === nothing &&
-        throw(ValidationError("file footer carries no schema"))
+    metaschema === nothing || (
+        something(metaschema.endianness, Meta.Endianness.Little) ==
+        Meta.Endianness.Little || throw(
+            ValidationError(
+                "big-endian IPC is not supported (no endianness normalization)",
+            ),
+        )
+    )
+    metaschema === nothing && throw(ValidationError("file footer carries no schema"))
     # Validate the leading schema and indexed messages against the Footer
     # boundary first. Only then can the final eight bytes be classified as an
     # optional EOS marker: a no-EOS file may end its last data buffer with the
@@ -1274,22 +1369,27 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
         throw(ValidationError("file schema and footer schema differ"))
     _metadataequal(schemafm.msg.custom_metadata, footer.custom_metadata) ||
         throw(ValidationError("file schema and footer custom metadata differ"))
-    indexedend = _verifyblockframes(blob, dictblocks, recordblocks, footerstart;
-        datastart=schemaend)
-    haseos = footerstart - indexedend >= 8 &&
+    indexedend =
+        _verifyblockframes(blob, dictblocks, recordblocks, footerstart; datastart=schemaend)
+    haseos =
+        footerstart - indexedend >= 8 &&
         AC.loadat(blob, UInt32, footerstart - 8) == CONTINUATION &&
         AC.loadat(blob, UInt32, footerstart - 4) == UInt32(0)
     dataend = haseos ? footerstart - 8 : footerstart
-    _validateblockindex(dictblocks, recordblocks, dataend;
-        datastart=schemaend)
+    _validateblockindex(dictblocks, recordblocks, dataend; datastart=schemaend)
     dictids = Dict{Int64,Meta.Field}()
     fielddictids = IdDict{Field,Int64}()
-    fields = Field[corefield(f, dictids, fielddictids)
-                   for f in something(metaschema.fields, Meta.Field[])]
+    fields = Field[
+        corefield(f, dictids, fielddictids) for
+        f in something(metaschema.fields, Meta.Field[])
+    ]
     foreach(validateschemafield, fields)
     dictvaluefields = validatedictionaryids(fields, fielddictids)
-    sch = Schema(fields; metadata=coremetadata(metaschema.custom_metadata),
-        endianness=AC.LittleEndian)
+    sch = Schema(
+        fields;
+        metadata=coremetadata(metaschema.custom_metadata),
+        endianness=AC.LittleEndian,
+    )
     dicts = Dict{Int64,ArrayData}()
     validated = AC._ValidatedDictionaries()
     state = DecodeState(budget)
@@ -1302,33 +1402,52 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
             header = fm.msg.header
             header isa Meta.DictionaryBatch ||
                 throw(ValidationError("footer dictionary block is not a dictionary batch"))
-            header.isDelta &&
-                throw(ValidationError("delta dictionaries are not supported"))
+            header.isDelta && throw(ValidationError("delta dictionaries are not supported"))
             haskey(dictids, header.id) ||
                 throw(ValidationError("dictionary batch has unknown id $(header.id)"))
-            haskey(dicts, header.id) &&
-                throw(ValidationError("the file format carries one dictionary batch per id"))
+            haskey(dicts, header.id) && throw(
+                ValidationError("the file format carries one dictionary batch per id"),
+            )
             rb = header.data
             codec = _batchcodec(rb.compression, fm.version)
             vf = dictvaluefields[header.id]
             rblen = something(rb.length, Int64(0))
             0 <= rblen <= limits.max_array_length ||
                 throw(ValidationError("dictionary batch length $rblen exceeds limit"))
-            cursor = DecodeCursor(rb.nodes, rb.buffers, fm.body, limits;
-                codec=codec, state=state, variadics=variadiccounts(rb))
+            cursor = DecodeCursor(
+                rb.nodes,
+                rb.buffers,
+                fm.body,
+                limits;
+                codec=codec,
+                state=state,
+                variadics=variadiccounts(rb),
+            )
             decoded = decodefield(vf, cursor, dicts, fielddictids)
             finishcursor!(cursor)
-            decoded.len == rblen ||
-                throw(ValidationError("dictionary RecordBatch length does not match its field node"))
+            decoded.len == rblen || throw(
+                ValidationError(
+                    "dictionary RecordBatch length does not match its field node",
+                ),
+            )
             validate_semantic(vf, decoded)
             validated[decoded] = nothing
             dicts[header.id] = decoded
         end
         # Every id a record batch may reference must be resolvable now unless
         # that batch proves all-null use — checked per batch at decode.
-        return ArrowFile(region, sch, AC.FrozenVector{Field}(fields),
-            fielddictids, dicts, validated, recordblocks, dataend, limits,
-            version)
+        return ArrowFile(
+            region,
+            sch,
+            AC.FrozenVector{Field}(fields),
+            fielddictids,
+            dicts,
+            validated,
+            recordblocks,
+            dataend,
+            limits,
+            version,
+        )
     finally
         close(state)
     end
@@ -1343,17 +1462,27 @@ function Base.getindex(f::ArrowFile, i::Integer)
     rejectexperimentalcompression(fm)
     fm.msg.header isa Meta.RecordBatch ||
         throw(ValidationError("footer record block is not a record batch"))
-    for id in missingdicts(f.fields, fm.msg.header.nodes, f.dictionaries,
-        f.fielddictids)
-        throw(ValidationError("record batch references dictionary id $id " *
-            "with no dictionary batch in the file"))
+    for id in missingdicts(f.fields, fm.msg.header.nodes, f.dictionaries, f.fielddictids)
+        throw(
+            ValidationError(
+                "record batch references dictionary id $id " *
+                "with no dictionary batch in the file",
+            ),
+        )
     end
     state = DecodeState(budget)
     try
-        return decoderecord(fm, f.fields, f.schema, f.dictionaries,
-            f.fielddictids, f.limits, f.validated, state)
+        return decoderecord(
+            fm,
+            f.fields,
+            f.schema,
+            f.dictionaries,
+            f.fielddictids,
+            f.limits,
+            f.validated,
+            state,
+        )
     finally
         close(state)
     end
 end
-

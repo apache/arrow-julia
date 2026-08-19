@@ -30,15 +30,22 @@ const MAP_ANON = Sys.isapple() ? Cint(0x1000) : Cint(0x20)
 limit = Int(Arrow.CSTRING_SCAN_LIMIT)
 page = Int(ccall(:getpagesize, Cint, ()))
 total = limit + page
-p = ccall(:mmap, Ptr{UInt8},
+p = ccall(
+    :mmap,
+    Ptr{UInt8},
     (Ptr{Cvoid}, Csize_t, Cint, Cint, Cint, Int64),
-    C_NULL, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0)
+    C_NULL,
+    total,
+    PROT_READ | PROT_WRITE,
+    MAP_PRIVATE | MAP_ANON,
+    -1,
+    0,
+)
 p == Ptr{UInt8}(-1) && error("mmap failed")
 for i = 1:limit
     unsafe_store!(p, 0x41, i)
 end
-rc = ccall(:mprotect, Cint, (Ptr{Cvoid}, Csize_t, Cint),
-    p + limit, page, PROT_NONE)
+rc = ccall(:mprotect, Cint, (Ptr{Cvoid}, Csize_t, Cint), p + limit, page, PROT_NONE)
 rc == 0 || error("mprotect failed")
 
 caught = try

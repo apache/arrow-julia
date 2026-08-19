@@ -30,8 +30,9 @@ function ipc_read_battery()
 
     emptybuffers = readstream(_misaligned_empty_buffers_stream())
     @assert emptybuffers.batches[1].nrows == 0
-    @assert isempty(materialize(emptybuffers.schema.fields[1],
-        emptybuffers.batches[1].columns[1]))
+    @assert isempty(
+        materialize(emptybuffers.schema.fields[1], emptybuffers.batches[1].columns[1]),
+    )
     println("empty struct vectors need no nominal element alignment ✓")
 
     @assert _rejects(() -> readstream(_misaligned_empty_children_stream()))
@@ -69,8 +70,13 @@ function ipc_read_battery()
         lists=Any[[1, 2], Int64[], [3], missing, [4, 5, 6]],
         # Core struct scalars are ordered pairs; the 2.x-written fixture
         # above was fed NamedTuples.
-        structs=Any[["a" => 1, "b" => "x"], ["a" => 2, "b" => "y"],
-            ["a" => 3, "b" => "z"], ["a" => 4, "b" => "w"], ["a" => 5, "b" => "v"]],
+        structs=Any[
+            ["a" => 1, "b" => "x"],
+            ["a" => 2, "b" => "y"],
+            ["a" => 3, "b" => "z"],
+            ["a" => 4, "b" => "w"],
+            ["a" => 5, "b" => "v"],
+        ],
         dict=Any["lo", "hi", "lo", missing, "hi"],
     )
     for b in stream.batches
@@ -91,8 +97,12 @@ function ipc_read_battery()
         cbytes = _fixture2x("mixed-two-partitions-$(codecname)") do
             cio = IOBuffer()
             cwritetable = merge(expected, (dict=Arrow.DictEncode(expected.dict),))
-            Arrow.write(cio, Tables.partitioner([cwritetable, cwritetable]);
-                file=false, compress=kw)
+            Arrow.write(
+                cio,
+                Tables.partitioner([cwritetable, cwritetable]);
+                file=false,
+                compress=kw,
+            )
             take!(cio)
         end
         cstream = readstream(cbytes)
@@ -129,13 +139,15 @@ function ipc_read_battery()
         end
         # (a) a hostile declared length is rejected BEFORE any allocation
         lying = copy(cbytes)
-        lying[prefixpos+1:prefixpos+8] .= reinterpret(UInt8, [Int64(2)^61])
+        lying[(prefixpos + 1):(prefixpos + 8)] .= reinterpret(UInt8, [Int64(2)^61])
         @assert _rejects(() -> readstream(lying))
-        println("$(codecname): hostile decompressed-length prefix rejected before allocation ✓")
+        println(
+            "$(codecname): hostile decompressed-length prefix rejected before allocation ✓",
+        )
         # (b) a prefix that understates the payload is a mismatch error, not
         # silent truncation
         short = copy(cbytes)
-        short[prefixpos+1:prefixpos+8] .= reinterpret(UInt8, [Int64(1)])
+        short[(prefixpos + 1):(prefixpos + 8)] .= reinterpret(UInt8, [Int64(1)])
         @assert _rejects(() -> readstream(short))
         println("$(codecname): declared/actual decompressed-size mismatch rejected ✓")
     end
@@ -151,22 +163,18 @@ function ipc_read_battery()
         oneframe = transcode(compressor, UInt8[0x41])
         @assert _rejects(() -> _decode_fixture(codec, oneframe, 0))
         @assert _rejects(() -> _decode_fixture(codec, UInt8[], 0))
-        @assert _decode_fixture(codec, UInt8[0x41, 0x42], -1) ==
-            UInt8[0x41, 0x42]
+        @assert _decode_fixture(codec, UInt8[0x41, 0x42], -1) == UInt8[0x41, 0x42]
 
         bomb = transcode(compressor, zeros(UInt8, 1024 * 1024))
         @assert _rejects(() -> _decode_fixture(codec, bomb, 1; budget=1))
         if codec == CODEC_LZ4_FRAME
             for n = 1:3
-                @assert _rejects(() ->
-                    _decode_fixture(codec, emptyframe[1:(end - n)], 0))
+                @assert _rejects(() -> _decode_fixture(codec, emptyframe[1:(end - n)], 0))
             end
             second = transcode(compressor, UInt8[0x42])
-            @assert _rejects(() ->
-                _decode_fixture(codec, vcat(oneframe, second), 2))
+            @assert _rejects(() -> _decode_fixture(codec, vcat(oneframe, second), 2))
         else
-            @assert _rejects(() ->
-                _decode_fixture(codec, oneframe[1:(end - 1)], 1))
+            @assert _rejects(() -> _decode_fixture(codec, oneframe[1:(end - 1)], 1))
         end
         println("$(codecname): empty, truncated, and bounded-output frames are checked ✓")
     end
@@ -177,8 +185,14 @@ function ipc_read_battery()
     badstate = DecodeState(AllocationBudget(0))
     badbytes = _compressed_wire(UInt8[0x01, 0x02, 0x03], 0)
     badwire = BufferSlice(heapregion(badbytes), 0, length(badbytes))
-    badcursor = DecodeCursor(nothing, nothing, BufferSlice(), Limits();
-        codec=CODEC_LZ4_FRAME, state=badstate)
+    badcursor = DecodeCursor(
+        nothing,
+        nothing,
+        BufferSlice(),
+        Limits();
+        codec=CODEC_LZ4_FRAME,
+        state=badstate,
+    )
     try
         @assert _rejects(() -> _decompressbuffer!(badcursor, badwire))
         @assert badstate.lz4 != C_NULL
@@ -199,12 +213,16 @@ function ipc_read_battery()
     simpleframes = _frameinfo(simplebytes)
     standardschema = _int64_schema_stream(Int64[2])
     resize!(standardschema, length(standardschema) - 8)
-    standardbytes = vcat(standardschema,
+    standardbytes = vcat(
+        standardschema,
         simplebytes[only(f.frame for f in simpleframes if f.kind == UInt8(3))],
-        simplebytes[only(f.frame for f in simpleframes if f.kind == UInt8(0))])
+        simplebytes[only(f.frame for f in simpleframes if f.kind == UInt8(0))],
+    )
     standardstream = readstream(standardbytes)
-    @assert materialize(standardstream.schema.fields[1],
-        standardstream.batches[1].columns[1]) == Any[1, 2, 3]
+    @assert materialize(
+        standardstream.schema.fields[1],
+        standardstream.batches[1].columns[1],
+    ) == Any[1, 2, 3]
 
     v4compressed = copy(simplebytes)
     for (i, frame) in pairs(simpleframes)
@@ -228,8 +246,7 @@ function ipc_read_battery()
     @assert length(readstream(onebytes; limits=aggregate_limit).batches) == 1
     twobytes = _fixture2x("large-zeros-zstd-two-partitions") do
         twoio = IOBuffer()
-        Arrow.write(twoio, Tables.partitioner([large, large]);
-            file=false, compress=:zstd)
+        Arrow.write(twoio, Tables.partitioner([large, large]); file=false, compress=:zstd)
         take!(twoio)
     end
     @assert _rejects(() -> readstream(twobytes; limits=aggregate_limit))
@@ -242,8 +259,9 @@ function ipc_read_battery()
             take!(emptyio)
         end
         emptystream = readstream(emptycompressed)
-        @assert isempty(materialize(emptystream.schema.fields[1],
-            emptystream.batches[1].columns[1]))
+        @assert isempty(
+            materialize(emptystream.schema.fields[1], emptystream.batches[1].columns[1]),
+        )
     end
     println("zero-byte compressed buffers may omit the prefix ✓")
 
@@ -258,8 +276,9 @@ function ipc_read_battery()
         take!(baddecimalio)
     end
     baddec = readstream(baddecbytes)
-    @assert _rejects(() -> AC.validate_full(baddec.schema.fields[1],
-        baddec.batches[1].columns[1]))
+    @assert _rejects(
+        () -> AC.validate_full(baddec.schema.fields[1], baddec.batches[1].columns[1]),
+    )
     println("decimal coefficients outside declared precision are validate_full's ✓")
 
     pulled = readstream(bytes)
@@ -278,24 +297,23 @@ function ipc_read_battery()
     end
     @assert caught
     println("stage-1 resource limits reject oversized bodies ✓")
-    @assert _rejects(() -> readstream(bytes;
-        limits=Limits(max_buffer_bytes=1)))
-    @assert _rejects(() -> readstream(bytes;
-        limits=Limits(max_total_allocated_bytes=1)))
+    @assert _rejects(() -> readstream(bytes; limits=Limits(max_buffer_bytes=1)))
+    @assert _rejects(() -> readstream(bytes; limits=Limits(max_total_allocated_bytes=1)))
     nmessages = length(framemessages(heapregion(bytes)))
-    @assert length(readstream(bytes;
-        limits=Limits(max_messages=nmessages)).batches) == 2
+    @assert length(readstream(bytes; limits=Limits(max_messages=nmessages)).batches) == 2
     println("buffer, allocation, and exact message-count limits work ✓")
 
     # Legal FlatBuffer aliasing must not amplify a small metadata message
     # into an unbounded Core schema or repeated large String copies.
     aliased = _aliased_field_stream(14)
-    @assert _rejects(() -> readstream(aliased;
-        limits=Limits(max_metadata_objects=100)))
+    @assert _rejects(() -> readstream(aliased; limits=Limits(max_metadata_objects=100)))
     sharedname = _shared_name_stream(10, 50_000)
-    @assert _rejects(() -> readstream(sharedname;
-        limits=Limits(max_total_allocated_bytes=200_000,
-            max_metadata_objects=1_000)))
+    @assert _rejects(
+        () -> readstream(
+            sharedname;
+            limits=Limits(max_total_allocated_bytes=200_000, max_metadata_objects=1_000),
+        ),
+    )
     println("logical metadata expansion and repeated strings are budgeted ✓")
 
     # Truncation semantics, both halves of the append rule:
@@ -335,8 +353,9 @@ function ipc_read_battery()
         vecp = _vref(schema, 1; required=true)
         _write_u32!(meta, vecp, UInt32(1_000_001))
     end
-    @assert _rejects(() -> readstream(corrupt;
-        limits=Limits(max_metadata_objects=1_000_000)))
+    @assert _rejects(
+        () -> readstream(corrupt; limits=Limits(max_metadata_objects=1_000_000)),
+    )
 
     oldversion = copy(bytes)
     _mutatemessage!(oldversion, 1) do meta, msg
@@ -461,9 +480,11 @@ function ipc_read_battery()
     # schema declares DICTIONARY_REPLACEMENT in its features vector.
     dictidx === nothing && error("acceptance stream has no dictionary batch")
     spans = _frameinfo(bytes)
-    duplicate = vcat(bytes[1:last(spans[dictidx].frame)],
+    duplicate = vcat(
+        bytes[1:last(spans[dictidx].frame)],
         bytes[spans[dictidx].frame],
-        bytes[(last(spans[dictidx].frame) + 1):end])
+        bytes[(last(spans[dictidx].frame) + 1):end],
+    )
     @assert _rejects(() -> readstream(duplicate))
 
     replaced = readstream(_dictionary_replacement_stream())
@@ -472,28 +493,34 @@ function ipc_read_battery()
     @assert materialize(df, replaced.batches[1].columns[1]) == ["aa", "bb", "aa"]
     @assert materialize(df, replaced.batches[2].columns[1]) == ["xx", "yy", "xx"]
     @assert replaced.batches[1].columns[1].dictionary !==
-        replaced.batches[2].columns[1].dictionary
+            replaced.batches[2].columns[1].dictionary
     println("dictionary replacement is feature-gated and snapshots stay immutable ✓")
 
     nestedvals = [[Int64(1), 2], [3]]
     sharedbytes = _fixture2x("shared-nested-dict") do
         sharedio = IOBuffer()
-        Arrow.write(sharedio,
+        Arrow.write(
+            sharedio,
             (a=Arrow.DictEncode(nestedvals, 7), b=Arrow.DictEncode(nestedvals, 7));
-            file=false)
+            file=false,
+        )
         take!(sharedio)
     end
     sharedstream = readstream(sharedbytes)
     for i = 1:2
-        @assert materialize(sharedstream.schema.fields[i],
-            sharedstream.batches[1].columns[i]) == nestedvals
+        @assert materialize(
+            sharedstream.schema.fields[i],
+            sharedstream.batches[1].columns[i],
+        ) == nestedvals
     end
     sharedcols = sharedstream.batches[1].columns
     @assert sharedcols[1].dictionary === sharedcols[2].dictionary
     sharedpool = sharedcols[1].dictionary
     sharedtype = sharedstream.schema.fields[1].type::DictionaryType
-    validate_semantic(AC.dictvaluefield(sharedstream.schema.fields[1], sharedtype),
-        sharedpool)
+    validate_semantic(
+        AC.dictvaluefield(sharedstream.schema.fields[1], sharedtype),
+        sharedpool,
+    )
     sharedvalidated = AC._ValidatedDictionaries(sharedpool => nothing)
     validaterecordcolumns(sharedstream.schema.fields, sharedcols, sharedvalidated)
     @assert length(sharedvalidated) == 1
@@ -519,8 +546,8 @@ function ipc_read_battery()
         error("dictionary fixture has no dictionary field")
     end
     poolstream = readstream(poolbytes)
-    @assert materialize(poolstream.schema.fields[1],
-        poolstream.batches[1].columns[1]) == ["x"]
+    @assert materialize(poolstream.schema.fields[1], poolstream.batches[1].columns[1]) ==
+            ["x"]
     println("dictionary pool nullability is independent from index fields ✓")
 
     nullvalues = Union{Missing,String}[missing, missing]
@@ -536,13 +563,17 @@ function ipc_read_battery()
     neos = findfirst(x -> x.kind == 0, nullframes)
     all(x -> x !== nothing, (nschema, ndict, nrecord, neos)) ||
         error("all-null dictionary fixture has unexpected framing")
-    reordered = vcat(nullbytes[nullframes[nschema].frame],
+    reordered = vcat(
+        nullbytes[nullframes[nschema].frame],
         nullbytes[nullframes[nrecord].frame],
         nullbytes[nullframes[ndict].frame],
-        nullbytes[nullframes[neos].frame])
+        nullbytes[nullframes[neos].frame],
+    )
     nullstream = readstream(reordered)
-    @assert isequal(materialize(nullstream.schema.fields[1],
-        nullstream.batches[1].columns[1]), nullvalues)
+    @assert isequal(
+        materialize(nullstream.schema.fields[1], nullstream.batches[1].columns[1]),
+        nullvalues,
+    )
     println("all-null dictionary references may precede their dictionary ✓")
 
     # The 2.x writer omits Map.keysSorted when false. The generated getter
@@ -592,8 +623,7 @@ function ipc_read_battery()
         rb = _headertable(meta, msg)
         _write_i64!(meta, _vfield(rb, 0, 8; required=true), typemax(Int64))
     end
-    @assert _rejects(() -> readstream(toolong;
-        limits=Limits(max_array_length=1)))
+    @assert _rejects(() -> readstream(toolong; limits=Limits(max_array_length=1)))
     println("zero-column batches retain their explicit row count ✓")
 
     emptyrecordbytes = _fixture2x("int64-empty") do
@@ -603,8 +633,12 @@ function ipc_read_battery()
     end
     emptyrecordstream = readstream(emptyrecordbytes)
     @assert emptyrecordstream.batches[1].nrows == 0
-    @assert isempty(materialize(emptyrecordstream.schema.fields[1],
-        emptyrecordstream.batches[1].columns[1]))
+    @assert isempty(
+        materialize(
+            emptyrecordstream.schema.fields[1],
+            emptyrecordstream.batches[1].columns[1],
+        ),
+    )
 
     emptydictbytes = _fixture2x("empty-dict") do
         emptydictio = IOBuffer()
@@ -613,15 +647,23 @@ function ipc_read_battery()
     end
     emptydictstream = readstream(emptydictbytes)
     @assert emptydictstream.batches[1].nrows == 0
-    @assert isempty(materialize(emptydictstream.schema.fields[1],
-        emptydictstream.batches[1].columns[1]))
+    @assert isempty(
+        materialize(
+            emptydictstream.schema.fields[1],
+            emptydictstream.batches[1].columns[1],
+        ),
+    )
     println("omitted zero-length record and dictionary lengths use defaults ✓")
 
     metabytes2x = _fixture2x("schema-field-metadata") do
         metaio = IOBuffer()
-        Arrow.write(metaio, (x=Int64[1],); file=false,
+        Arrow.write(
+            metaio,
+            (x=Int64[1],);
+            file=false,
             metadata=Dict("owner" => "jacob"),
-            colmetadata=Dict(:x => Dict("unit" => "count")))
+            colmetadata=Dict(:x => Dict("unit" => "count")),
+        )
         take!(metaio)
     end
     metastream = readstream(metabytes2x)
@@ -631,4 +673,3 @@ function ipc_read_battery()
     println()
     println("IPC framing, verification, decoding, and adversarial checks passed.")
 end
-

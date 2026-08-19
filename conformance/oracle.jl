@@ -53,9 +53,11 @@ include(joinpath(@__DIR__, "corpus.jl"))
 # The conformance image sets it; on a host, point it at any such interpreter.
 function _oraclepython()
     py = get(ENV, "ARROW_ORACLE_PYTHON", "")
-    isempty(py) && error("ARROW_ORACLE_PYTHON is not set: run this suite through " *
+    isempty(py) && error(
+        "ARROW_ORACLE_PYTHON is not set: run this suite through " *
         "`julia conformance/run.jl oracle` (the conformance " *
-        "image), or point ARROW_ORACLE_PYTHON at a Python with pyarrow and nanoarrow")
+        "image), or point ARROW_ORACLE_PYTHON at a Python with pyarrow and nanoarrow",
+    )
     return py
 end
 
@@ -169,22 +171,29 @@ function preparecases(corpus::String, workdir::String)
     skips = Tuple{String,String}[]
     for v in sort(filter(d -> isdir(joinpath(root, d)), readdir(root)))
         dir = joinpath(root, v)
-        families = sort!(unique!([replace(f, r"\.json\.gz$" => "")
-            for f in readdir(dir) if endswith(f, ".json.gz")]))
+        families = sort!(
+            unique!([
+                replace(f, r"\.json\.gz$" => "") for
+                f in readdir(dir) if endswith(f, ".json.gz")
+            ]),
+        )
         for fam in families
             why = get(SKIP, fam, get(SKIP, v, ""))
             isempty(why) || (push!(skips, (v * "/" * fam, why)); continue)
             goldpath = joinpath(dir, fam * ".json.gz")
             sch, batches, dictids = ArrowJSON.fromjson(_readjson(goldpath))
-            variants = fam == "generated_primitive" ?
-                (:none, :lz4, :zstd) : (:none,)
+            variants = fam == "generated_primitive" ? (:none, :lz4, :zstd) : (:none,)
             for compress in variants
                 suffix = compress == :none ? "" : "+" * String(compress)
                 name = v * "__" * fam * suffix
-                write(joinpath(casedir, name * ".stream"),
-                    writestream(sch, batches; compress=compress, dictids=dictids))
-                write(joinpath(casedir, name * ".arrow"),
-                    writefile(sch, batches; compress=compress, dictids=dictids))
+                write(
+                    joinpath(casedir, name * ".stream"),
+                    writestream(sch, batches; compress=compress, dictids=dictids),
+                )
+                write(
+                    joinpath(casedir, name * ".arrow"),
+                    writefile(sch, batches; compress=compress, dictids=dictids),
+                )
                 push!(cases, OracleCase(name, v * "/" * fam * suffix, goldpath))
             end
         end
@@ -218,22 +227,37 @@ const ORACLE_CHECKS = (
 # whitelisted by check, case, and error text. Anything else — including a
 # feature error on a case not listed here — is a failure to investigate.
 const ORACLE_EXPECTED_GAPS = (
-    ("nanoarrow_stream", n -> endswith(n, "+lz4") || endswith(n, "+zstd"),
-        "unsupported feature COMPRESSED_BODY"),
-    ("nanoarrow_stream", n -> occursin("generated_binary_view", n),
-        "BinaryView not yet supported"),
-    ("nanoarrow_stream", n -> occursin("generated_list_view", n),
-        "ListView/LargeListView not yet supported"),
-    ("nanoarrow_stream", n -> occursin("generated_run_end_encoded", n),
-        "RunEndEncoded not yet supported"),
+    (
+        "nanoarrow_stream",
+        n -> endswith(n, "+lz4") || endswith(n, "+zstd"),
+        "unsupported feature COMPRESSED_BODY",
+    ),
+    (
+        "nanoarrow_stream",
+        n -> occursin("generated_binary_view", n),
+        "BinaryView not yet supported",
+    ),
+    (
+        "nanoarrow_stream",
+        n -> occursin("generated_list_view", n),
+        "ListView/LargeListView not yet supported",
+    ),
+    (
+        "nanoarrow_stream",
+        n -> occursin("generated_run_end_encoded", n),
+        "RunEndEncoded not yet supported",
+    ),
 )
 
-_expectedgap(key::String, name::String, status::String) =
-    any(k == key && pred(name) && occursin(text, status)
-        for (k, pred, text) in ORACLE_EXPECTED_GAPS)
+_expectedgap(key::String, name::String, status::String) = any(
+    k == key && pred(name) && occursin(text, status) for
+    (k, pred, text) in ORACLE_EXPECTED_GAPS
+)
 
-function runoracle(corpus::String=DEFAULT_CORPUS;
-    workdir::String=get(ENV, "ORACLE_WORKDIR", mktempdir(prefix="arrow-oracle-")))
+function runoracle(
+    corpus::String=DEFAULT_CORPUS;
+    workdir::String=get(ENV, "ORACLE_WORKDIR", mktempdir(prefix="arrow-oracle-")),
+)
     cases, skips = preparecases(corpus, workdir)
     println("oracle: ", length(cases), " cases prepared in ", workdir)
     results = runoracles(workdir)
@@ -259,20 +283,34 @@ function compareresults(cases::Vector{OracleCase}, skips, results, workdir::Stri
                 # "skip: ..." comes only from the driver's import-failure
                 # path (no nanoarrow wheel); feature errors skip only via
                 # the explicit whitelist.
-                kind = startswith(status, "skip") ||
-                    _expectedgap(key, case.name, status) ? :skip : :fail
+                kind =
+                    startswith(status, "skip") || _expectedgap(key, case.name, status) ?
+                    :skip : :fail
                 push!(verdicts, Verdict(case.label, check, kind, status))
                 continue
             end
             try
                 got = reader(read(joinpath(workdir, "out", case.name * suffix)))
                 diffs = docsequal(masknulls!(deepcopy(got), Val(:doc)), goldmasked)
-                push!(verdicts, Verdict(case.label, check,
-                    isempty(diffs) ? :pass : :fail,
-                    isempty(diffs) ? "" : first(diffs)))
+                push!(
+                    verdicts,
+                    Verdict(
+                        case.label,
+                        check,
+                        isempty(diffs) ? :pass : :fail,
+                        isempty(diffs) ? "" : first(diffs),
+                    ),
+                )
             catch e
-                push!(verdicts, Verdict(case.label, check, :fail,
-                    sprint(showerror, e)[1:min(end, 200)]))
+                push!(
+                    verdicts,
+                    Verdict(
+                        case.label,
+                        check,
+                        :fail,
+                        sprint(showerror, e)[1:min(end, 200)],
+                    ),
+                )
             end
         end
     end
@@ -283,9 +321,20 @@ function oraclereport(verdicts::Vector{Verdict}, results; io=stdout)
     npass = count(v -> v.status == :pass, verdicts)
     nfail = count(v -> v.status == :fail, verdicts)
     nskip = count(v -> v.status == :skip, verdicts)
-    println(io, "oracle round-trips (pyarrow ", get(results, "pyarrow", "?"),
-        ", nanoarrow ", get(results, "nanoarrow", "?"), "): ",
-        npass, " pass, ", nfail, " fail, ", nskip, " skip")
+    println(
+        io,
+        "oracle round-trips (pyarrow ",
+        get(results, "pyarrow", "?"),
+        ", nanoarrow ",
+        get(results, "nanoarrow", "?"),
+        "): ",
+        npass,
+        " pass, ",
+        nfail,
+        " fail, ",
+        nskip,
+        " skip",
+    )
     println(io)
     for v in verdicts
         v.status == :pass && continue

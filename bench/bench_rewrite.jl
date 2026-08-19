@@ -37,8 +37,10 @@ function main(outdir::String)
             Arrow.close!(t)
         end
         for (op, secs) in (("write", twrite), ("read", tread))
-            println("{\"impl\":\"rewrite\",\"workload\":\"$name\"," *
-                    "\"op\":\"$op\",\"seconds\":$secs,\"bytes\":$sz}")
+            println(
+                "{\"impl\":\"rewrite\",\"workload\":\"$name\"," *
+                "\"op\":\"$op\",\"seconds\":$secs,\"bytes\":$sz}",
+            )
         end
     end
 end

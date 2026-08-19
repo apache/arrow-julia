@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 # Alias every Arrow and ArrowCore binding into the including module so the
 # batteries read as they were written: unqualified names. `names(all=true)`
 # covers Arrow's own bindings; ArrowCore's exported names reach Arrow through
@@ -22,7 +21,8 @@
 # and the facade names the batteries never use unqualified.
 for n in union(names(Arrow; all=true), names(Arrow.ArrowCore))
     sn = String(n)
-    (startswith(sn, "#") || n in (:eval, :include, :Arrow, :write, :Table, :Stream)) && continue
+    (startswith(sn, "#") || n in (:eval, :include, :Arrow, :write, :Table, :Stream)) &&
+        continue
     isdefined(Arrow, n) || continue
     @eval const $n = Arrow.$n
 end

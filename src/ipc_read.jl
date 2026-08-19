@@ -114,9 +114,11 @@ const _vi64 = Meta._vi64
 
 _vfail(msg) = throw(ValidationError("invalid IPC FlatBuffer: $msg"))
 
-_verifyctx(limits::Limits, reserve_limit::Int64) =
-    Meta.VerifyContext(Int64(limits.max_metadata_objects),
-        limits.max_nesting_depth, reserve_limit)
+_verifyctx(limits::Limits, reserve_limit::Int64) = Meta.VerifyContext(
+    Int64(limits.max_metadata_objects),
+    limits.max_nesting_depth,
+    reserve_limit,
+)
 
 # Translate the metadata module's verifier exceptions into the adapter's
 # error vocabulary at the wrapper boundary.
@@ -133,13 +135,17 @@ end
 function _schemafeatures(sch::Meta.Schema, version::Int16)
     fv = sch.features
     features = fv === nothing ? Int64[] : Int64[Int64(x) for x in fv]
-    version == Int16(3) && !isempty(features) &&
+    version == Int16(3) &&
+        !isempty(features) &&
         _vfail("schema features require metadata V5")
     return features
 end
 
-function verify_ipc_metadata(bytes::Vector{UInt8}, limits::Limits,
-    reserve_limit::Int64=limits.max_total_allocated_bytes)
+function verify_ipc_metadata(
+    bytes::Vector{UInt8},
+    limits::Limits,
+    reserve_limit::Int64=limits.max_total_allocated_bytes,
+)
     ctx = _verifyctx(limits, reserve_limit)
     # STAGED root verification: the inline stage proves the table shell and
     # every non-reference field (the version among them), the adapter gates
@@ -155,10 +161,10 @@ function verify_ipc_metadata(bytes::Vector{UInt8}, limits::Limits,
     # The verifier proved header presence and rejected union members outside
     # the generated schemas (the Tensor family), so this dispatch is total.
     header = msg.header
-    header_type = header isa Meta.Schema ? UInt8(1) :
+    header_type =
+        header isa Meta.Schema ? UInt8(1) :
         header isa Meta.DictionaryBatch ? UInt8(2) :
-        header isa Meta.RecordBatch ? UInt8(3) :
-        _vfail("unsupported message header tag")
+        header isa Meta.RecordBatch ? UInt8(3) : _vfail("unsupported message header tag")
     features = header isa Meta.Schema ? _schemafeatures(header, version) : Int64[]
     return version, header_type, features, ctx.reserved
 end
@@ -172,9 +178,12 @@ region's real extent before metadata-directed decode allocation. A truncated
 prefix, metadata block, or body throws. EOF exactly after a complete message
 is the intentional missing-EOS boundary case and is accepted.
 """
-framemessages(region::OwnerRegion, limits::Limits=Limits()) =
-    _framemessages(region, limits, Base.ENDIAN_BOM,
-        AllocationBudget(limits.max_total_allocated_bytes))
+framemessages(region::OwnerRegion, limits::Limits=Limits()) = _framemessages(
+    region,
+    limits,
+    Base.ENDIAN_BOM,
+    AllocationBudget(limits.max_total_allocated_bytes),
+)
 
 function _validatelimits(limits::Limits)
     limits.max_metadata_bytes >= 0 || throw(ArgumentError("negative metadata limit"))
@@ -190,9 +199,12 @@ function _validatelimits(limits::Limits)
     return nothing
 end
 
-function _framemessages(region::OwnerRegion, limits::Limits,
+function _framemessages(
+    region::OwnerRegion,
+    limits::Limits,
     host_endian_bom::UInt32,
-    budget::AllocationBudget=AllocationBudget(limits.max_total_allocated_bytes))
+    budget::AllocationBudget=AllocationBudget(limits.max_total_allocated_bytes),
+)
     # The generated FlatBuffers bindings use native-endian scalar
     # loads. Reject an unsupported host before any generated getter sees the
     # little-endian wire bytes. The explicit argument keeps this ordering
@@ -204,8 +216,7 @@ function _framemessages(region::OwnerRegion, limits::Limits,
     msgs = FramedMessage[]
     pos = Int64(0)   # 0-based byte position within the blob
     while pos < blob.len
-        blob.len - pos >= 8 ||
-            throw(ValidationError("truncated IPC prefix at byte $pos"))
+        blob.len - pos >= 8 || throw(ValidationError("truncated IPC prefix at byte $pos"))
         pos % 8 == 0 || throw(ValidationError("IPC message is not 8-byte aligned"))
         cont = AC.loadat(blob, UInt32, pos)
         cont == CONTINUATION ||
@@ -218,8 +229,11 @@ function _framemessages(region::OwnerRegion, limits::Limits,
         end
         length(msgs) < limits.max_messages ||
             throw(ValidationError("message count exceeds limit"))
-        0 < metalen <= limits.max_metadata_bytes ||
-            throw(ValidationError("metadata length $metalen outside (0, $(limits.max_metadata_bytes)]"))
+        0 < metalen <= limits.max_metadata_bytes || throw(
+            ValidationError(
+                "metadata length $metalen outside (0, $(limits.max_metadata_bytes)]",
+            ),
+        )
         metalen % 8 == 0 ||
             throw(ValidationError("metadata length $metalen is not 8-byte aligned"))
         metastart = AC.checked_add(pos, Int64(8))
@@ -235,16 +249,25 @@ function _framemessages(region::OwnerRegion, limits::Limits,
         # table/vector/string graph it may visit.
         msg = FB.getrootas(Meta.Message, metabytes, 0)
         bodylen = Int64(msg.bodyLength)
-        0 <= bodylen <= limits.max_body_bytes ||
-            throw(ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"))
+        0 <= bodylen <= limits.max_body_bytes || throw(
+            ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"),
+        )
         bodylen % 8 == 0 ||
             throw(ValidationError("body length $bodylen is not 8-byte aligned"))
         bodystart = bodyguess
         bodyend = AC.checked_add(bodystart, bodylen)
         bodyend <= blob.len ||
             throw(ValidationError("truncated body: need $bodylen bytes at $bodystart"))
-        push!(msgs, FramedMessage(msg, AC.subslice(blob, bodystart, bodylen),
-            version, header_type, features))
+        push!(
+            msgs,
+            FramedMessage(
+                msg,
+                AC.subslice(blob, bodystart, bodylen),
+                version,
+                header_type,
+                features,
+            ),
+        )
         pos = bodyend
     end
     return msgs
@@ -262,8 +285,10 @@ function coretype(t)::ArrowType
     if t isa Meta.Int
         IntType(Int(t.bitWidth), t.is_signed)
     elseif t isa Meta.FloatingPoint
-        FloatType(t.precision == Meta.Precision.HALF ? 16 :
-                  t.precision == Meta.Precision.SINGLE ? 32 : 64)
+        FloatType(
+            t.precision == Meta.Precision.HALF ? 16 :
+            t.precision == Meta.Precision.SINGLE ? 32 : 64,
+        )
     elseif t isa Meta.Bool
         BoolType()
     elseif t isa Meta.Utf8
@@ -298,8 +323,10 @@ function coretype(t)::ArrowType
     elseif t isa Meta.Decimal
         DecimalType(Int(t.precision), Int(t.scale), Int(t.bitWidth))
     elseif t isa Meta.Interval
-        IntervalType(t.unit == Meta.IntervalUnit.YEAR_MONTH ? AC.YEAR_MONTH :
-            t.unit == Meta.IntervalUnit.DAY_TIME ? AC.DAY_TIME : AC.MONTH_DAY_NANO)
+        IntervalType(
+            t.unit == Meta.IntervalUnit.YEAR_MONTH ? AC.YEAR_MONTH :
+            t.unit == Meta.IntervalUnit.DAY_TIME ? AC.DAY_TIME : AC.MONTH_DAY_NANO,
+        )
     elseif t isa Meta.Utf8View
         ViewType(true)
     elseif t isa Meta.BinaryView
@@ -327,8 +354,7 @@ function _coremetatype(mt, children::Vector{Field})::ArrowType
     mode = mt.mode == Meta.UnionMode.Dense ? AC.DenseMode : AC.SparseMode
     ids = mt.typeIds
     nchildren = length(children)
-    nchildren <= 128 ||
-        throw(ValidationError("a union cannot have more than 128 children"))
+    nchildren <= 128 || throw(ValidationError("a union cannot have more than 128 children"))
     if ids === nothing
         return UnionType(mode, Int8[Int8(i) for i = 0:(nchildren - 1)])
     end
@@ -342,7 +368,8 @@ function _coremetatype(mt, children::Vector{Field})::ArrowType
     return UnionType(mode, coreids)
 end
 
-timeunit(u) = u == Meta.TimeUnit.SECOND ? AC.SECOND :
+timeunit(u) =
+    u == Meta.TimeUnit.SECOND ? AC.SECOND :
     u == Meta.TimeUnit.MILLISECOND ? AC.MILLISECOND :
     u == Meta.TimeUnit.MICROSECOND ? AC.MICROSECOND : AC.NANOSECOND
 
@@ -356,14 +383,23 @@ Convert a metadata Field to a Core Field. Dictionary-encoded fields become
 `DictionaryType` here; the IPC dictionary id is recorded in the adapter's
 side table (`dictids`), NOT on the Core field — Core never learns about ids.
 """
-function corefield(f::Meta.Field, dictids::Dict{Int64,Meta.Field},
-    fielddictids::IdDict{Field,Int64})
-    children = Field[corefield(c, dictids, fielddictids)
-                     for c in something(f.children, Meta.Field[])]
+function corefield(
+    f::Meta.Field,
+    dictids::Dict{Int64,Meta.Field},
+    fielddictids::IdDict{Field,Int64},
+)
+    children = Field[
+        corefield(c, dictids, fielddictids) for c in something(f.children, Meta.Field[])
+    ]
     t = _coremetatype(f.type, children)
     if f.dictionary === nothing
-        return Field(String(something(f.name, "")), t, f.nullable,
-            coremetadata(f.custom_metadata), children)
+        return Field(
+            String(something(f.name, "")),
+            t,
+            f.nullable,
+            coremetadata(f.custom_metadata),
+            children,
+        )
     end
     # Nested dictionary encoding (a dictionary field whose VALUE type has
     # dictionary-encoded children) is spec-legal and present in the
@@ -372,10 +408,16 @@ function corefield(f::Meta.Field, dictids::Dict{Int64,Meta.Field},
     # with the live pool table, so inner pools resolve as long as batches
     # arrive in dependency order — which the IPC spec requires.
     dictids[f.dictionary.id] = f
-    idxt = f.dictionary.indexType === nothing ? IntType(32, true) :
+    idxt =
+        f.dictionary.indexType === nothing ? IntType(32, true) :
         coretype(f.dictionary.indexType)::IntType
-    cf = Field(String(something(f.name, "")), DictionaryType(idxt, t, f.dictionary.isOrdered),
-        f.nullable, coremetadata(f.custom_metadata), children)
+    cf = Field(
+        String(something(f.name, "")),
+        DictionaryType(idxt, t, f.dictionary.isOrdered),
+        f.nullable,
+        coremetadata(f.custom_metadata),
+        children,
+    )
     # Identity-keyed: safe for duplicate column names and nested dict fields
     # (name matching would be neither).
     fielddictids[cf] = f.dictionary.id
@@ -386,23 +428,26 @@ function validatedictionaryids(fields, fielddictids::IdDict{Field,Int64})
     seen = Dict{Int64,Field}()
     compatible(a::Field, b::Field; compare_name::Bool=false) =
         (!compare_name || a.name == b.name) &&
-        AC.typeequal(a.type, b.type) && a.nullable == b.nullable &&
+        AC.typeequal(a.type, b.type) &&
+        a.nullable == b.nullable &&
         # One id resolves ONE pool, so repeated ids must agree on the whole
         # nested dictionary-id topology: compatible value schemas whose
         # nested fields carry DIFFERENT wire ids would decode the second
         # field through pools its schema never declared.
         (!(a.type isa DictionaryType) || fielddictids[a] == fielddictids[b]) &&
         length(a.children) == length(b.children) &&
-        all(compatible(x, y; compare_name=true)
-            for (x, y) in zip(a.children, b.children))
+        all(compatible(x, y; compare_name=true) for (x, y) in zip(a.children, b.children))
     function walk(f::Field)
         if f.type isa DictionaryType
             id = fielddictids[f]
             vf = AC.dictvaluefield(f, f.type)
             if haskey(seen, id)
                 old = seen[id]
-                compatible(old, vf) ||
-                    throw(ValidationError("dictionary id $id is shared by incompatible value schemas"))
+                compatible(old, vf) || throw(
+                    ValidationError(
+                        "dictionary id $id is shared by incompatible value schemas",
+                    ),
+                )
             else
                 seen[id] = vf
                 # A pool's value schema may itself hold dictionary-encoded
@@ -426,8 +471,11 @@ function validateschemafield(f::Field)
     end
     spec = layoutspec(f.type)
     expected = spec.childcount == -1 ? length(f.children) : spec.childcount
-    length(f.children) == expected ||
-        throw(ValidationError("$(typeof(f.type)) schema expects $expected children, got $(length(f.children))"))
+    length(f.children) == expected || throw(
+        ValidationError(
+            "$(typeof(f.type)) schema expects $expected children, got $(length(f.children))",
+        ),
+    )
     if f.type isa UnionType
         length(f.type.typeids) == length(f.children) ||
             throw(ValidationError("union type-id count must equal child count"))
@@ -437,16 +485,20 @@ function validateschemafield(f::Field)
             throw(ValidationError("union type ids must be in [0, 127]"))
     elseif f.type isa MapType
         entries = f.children[1]
-        entries.type isa StructType && !entries.nullable &&
-            length(entries.children) == 2 && !entries.children[1].nullable ||
+        entries.type isa StructType &&
+        !entries.nullable &&
+        length(entries.children) == 2 &&
+        !entries.children[1].nullable ||
             throw(ValidationError("invalid map entries/key schema"))
     elseif f.type isa RunEndEncodedType
         length(f.children) == 2 || throw(ValidationError("REE requires two children"))
         run, values = f.children
-        run.name == "run_ends" && values.name == "values" &&
-            run.type isa IntType && run.type.signed && run.type.bits in (16, 32, 64) &&
-            !run.nullable ||
-            throw(ValidationError("invalid run-end encoded schema"))
+        run.name == "run_ends" &&
+        values.name == "values" &&
+        run.type isa IntType &&
+        run.type.signed &&
+        run.type.bits in (16, 32, 64) &&
+        !run.nullable || throw(ValidationError("invalid run-end encoded schema"))
     end
     foreach(validateschemafield, f.children)
     return f
@@ -475,8 +527,8 @@ mutable struct DecodeState
     budget::AllocationBudget
 end
 
-DecodeState(budget::AllocationBudget) = DecodeState(
-    Ptr{CLZ4.LZ4F_dctx}(C_NULL), Ptr{ZSTD.ZSTD_DCtx}(C_NULL), budget)
+DecodeState(budget::AllocationBudget) =
+    DecodeState(Ptr{CLZ4.LZ4F_dctx}(C_NULL), Ptr{ZSTD.ZSTD_DCtx}(C_NULL), budget)
 
 function _lz4ctx!(state::DecodeState)
     state.lz4 != C_NULL && return state.lz4
@@ -507,8 +559,13 @@ function Base.close(state::DecodeState)
     return nothing
 end
 
-function _decode_lz4!(state::DecodeState, src::Ptr{UInt8}, srclen::Int64,
-    out::Vector{UInt8}, declared::Int64)
+function _decode_lz4!(
+    state::DecodeState,
+    src::Ptr{UInt8},
+    srclen::Int64,
+    out::Vector{UInt8},
+    declared::Int64,
+)
     ctx = _lz4ctx!(state)
     CLZ4.LZ4F_resetDecompressionContext(ctx)
     inpos = Int64(0)
@@ -520,34 +577,50 @@ function _decode_lz4!(state::DecodeState, src::Ptr{UInt8}, srclen::Int64,
         # an empty frame or the footer after the last output byte without a
         # second allocation.
         dst = outpos == declared ? Ptr{UInt8}(C_NULL) : pointer(out) + outpos
-        hint = CLZ4.LZ4F_decompress(ctx, dst, outsize,
-            src + inpos, insize, C_NULL)
+        hint = CLZ4.LZ4F_decompress(ctx, dst, outsize, src + inpos, insize, C_NULL)
         inpos += Int64(insize[])
         outpos += Int64(outsize[])
         if hint == 0
-            inpos == srclen || throw(ValidationError(
-                "LZ4 buffer contains trailing bytes or multiple frames"))
-            outpos == declared || throw(ValidationError(
-                "LZ4 output length $outpos does not match declared $declared"))
+            inpos == srclen || throw(
+                ValidationError("LZ4 buffer contains trailing bytes or multiple frames"),
+            )
+            outpos == declared || throw(
+                ValidationError(
+                    "LZ4 output length $outpos does not match declared $declared",
+                ),
+            )
             return nothing
         end
         inpos < srclen || throw(ValidationError("truncated LZ4 frame"))
-        (insize[] != 0 || outsize[] != 0) || throw(ValidationError(
-            "LZ4 output exceeds declared length $declared"))
+        (insize[] != 0 || outsize[] != 0) ||
+            throw(ValidationError("LZ4 output exceeds declared length $declared"))
     end
 end
 
-function _decode_zstd!(state::DecodeState, src::Ptr{UInt8}, srclen::Int64,
-    out::Vector{UInt8}, declared::Int64)
+function _decode_zstd!(
+    state::DecodeState,
+    src::Ptr{UInt8},
+    srclen::Int64,
+    out::Vector{UInt8},
+    declared::Int64,
+)
     dst = declared == 0 ? Ptr{UInt8}(C_NULL) : pointer(out)
-    got = ZSTD.ZSTD_decompressDCtx(_zstdctx!(state), dst, Csize_t(declared),
-        src, Csize_t(srclen))
+    got = ZSTD.ZSTD_decompressDCtx(
+        _zstdctx!(state),
+        dst,
+        Csize_t(declared),
+        src,
+        Csize_t(srclen),
+    )
     if ZSTD.ZSTD_isError(got) != 0
         msg = unsafe_string(ZSTD.ZSTD_getErrorName(got))
         throw(ValidationError("ZSTD decompression failed: $msg"))
     end
-    Int64(got) == declared || throw(ValidationError(
-        "ZSTD output length $(Int64(got)) does not match declared $declared"))
+    Int64(got) == declared || throw(
+        ValidationError(
+            "ZSTD output length $(Int64(got)) does not match declared $declared",
+        ),
+    )
     return nothing
 end
 
@@ -574,16 +647,30 @@ mutable struct DecodeCursor{B}
 end
 
 "Resolve one declared buffer window against the message body."
-_bodyslice(body::BufferSlice, offset::Int64, len::Int64) =
-    AC.subslice(body, offset, len)
+_bodyslice(body::BufferSlice, offset::Int64, len::Int64) = AC.subslice(body, offset, len)
 
-DecodeCursor(nodes, buffers, body, limits::Limits;
-    codec::Int8=CODEC_NONE, state::Union{Nothing,DecodeState}=nothing,
-    variadics=nothing) =
-    DecodeCursor(something(nodes, Meta.FieldNode[]),
-        something(buffers, Meta.Buffer[]), body,
-        limits.max_buffer_bytes, limits.max_array_length, 1, 1, 0,
-        codec, state, something(variadics, Int64[]), 1)
+DecodeCursor(
+    nodes,
+    buffers,
+    body,
+    limits::Limits;
+    codec::Int8=CODEC_NONE,
+    state::Union{Nothing,DecodeState}=nothing,
+    variadics=nothing,
+) = DecodeCursor(
+    something(nodes, Meta.FieldNode[]),
+    something(buffers, Meta.Buffer[]),
+    body,
+    limits.max_buffer_bytes,
+    limits.max_array_length,
+    1,
+    1,
+    0,
+    codec,
+    state,
+    something(variadics, Int64[]),
+    1,
+)
 
 """
     variadiccounts(rb::Meta.RecordBatch) -> Vector{Int64}
@@ -597,8 +684,11 @@ variadiccounts(rb::Meta.RecordBatch) =
 
 "One variadic-buffer count, in depth-first view-field order (format 1.4)."
 function takevariadic!(c::DecodeCursor)
-    c.varidx <= length(c.variadics) ||
-        throw(ValidationError("metadata declares fewer variadic buffer counts than the schema requires"))
+    c.varidx <= length(c.variadics) || throw(
+        ValidationError(
+            "metadata declares fewer variadic buffer counts than the schema requires",
+        ),
+    )
     n = c.variadics[c.varidx]
     c.varidx += 1
     0 <= n <= length(c.buffers) ||
@@ -607,8 +697,9 @@ function takevariadic!(c::DecodeCursor)
 end
 
 function takenode!(c::DecodeCursor)
-    c.nodeidx <= length(c.nodes) ||
-        throw(ValidationError("metadata declares fewer field nodes than the schema requires"))
+    c.nodeidx <= length(c.nodes) || throw(
+        ValidationError("metadata declares fewer field nodes than the schema requires"),
+    )
     n = c.nodes[c.nodeidx]
     c.nodeidx += 1
     0 <= n.length <= c.max_array_length ||
@@ -678,12 +769,14 @@ declaration exactly, and each decompressed buffer becomes its own exact-sized ow
 region — the wire mapping is never the backing store of decompressed data.
 """
 function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
-    wire.len >= 8 ||
-        throw(ValidationError("compressed buffer of $(wire.len) bytes lacks its length prefix"))
+    wire.len >= 8 || throw(
+        ValidationError("compressed buffer of $(wire.len) bytes lacks its length prefix"),
+    )
     declared = AC.loadat(wire, Int64, Int64(0))
     declared == -1 && return AC.subslice(wire, 8, wire.len - 8)  # stored raw
-    0 <= declared <= c.max_buffer_bytes ||
-        throw(ValidationError("declared decompressed length $declared exceeds the buffer limit"))
+    0 <= declared <= c.max_buffer_bytes || throw(
+        ValidationError("declared decompressed length $declared exceeds the buffer limit"),
+    )
     declared <= typemax(Int) ||
         throw(ValidationError("declared decompressed buffer is not addressable"))
     payloadlen = wire.len - 8
@@ -729,21 +822,29 @@ function finishcursor!(c::DecodeCursor)
     return nothing
 end
 
-function missingdicts(fields, nodes, dicts::Dict{Int64,ArrayData},
-    fielddictids::IdDict{Field,Int64})
+function missingdicts(
+    fields,
+    nodes,
+    dicts::Dict{Int64,ArrayData},
+    fielddictids::IdDict{Field,Int64},
+)
     ns = something(nodes, Meta.FieldNode[])
     idx = Ref(1)
     missing = Set{Int64}()
     function walk(f::Field)
-        idx[] <= length(ns) ||
-            throw(ValidationError("metadata declares fewer field nodes than the schema requires"))
+        idx[] <= length(ns) || throw(
+            ValidationError("metadata declares fewer field nodes than the schema requires"),
+        )
         node = ns[idx[]]
         idx[] += 1
         if f.type isa DictionaryType
             id = fielddictids[f]
             if !haskey(dicts, id)
-                node.length >= 0 && node.null_count == node.length ||
-                    throw(ValidationError("record batch uses undefined dictionary id $id for a non-null slot"))
+                node.length >= 0 && node.null_count == node.length || throw(
+                    ValidationError(
+                        "record batch uses undefined dictionary id $id for a non-null slot",
+                    ),
+                )
                 push!(missing, id)
             end
             return
@@ -766,8 +867,12 @@ included.
 Dictionary-encoded columns consume the INDEX layout's buffers (validity +
 indices) and resolve their values through the adapter's dictionary table.
 """
-function decodefield(f::Field, c::DecodeCursor, dicts::Dict{Int64,ArrayData},
-    fielddictids::IdDict{Field,Int64})
+function decodefield(
+    f::Field,
+    c::DecodeCursor,
+    dicts::Dict{Int64,ArrayData},
+    fielddictids::IdDict{Field,Int64},
+)
     t = f.type
     node = takenode!(c)
     spec = layoutspec(t)
@@ -785,20 +890,26 @@ function decodefield(f::Field, c::DecodeCursor, dicts::Dict{Int64,ArrayData},
         # (the oracle suite caught us refusing nanoarrow's bytes). A PARTIAL
         # offsets buffer — nonempty but short of one slot — is still
         # malformed framing.
-        if role == AC.OFFSETS && node.length == 0 &&
-            0 < buffer.len < spec.offsetwidth
-            throw(ValidationError(
-                "IPC offsets buffer is shorter than one offset slot"))
+        if role == AC.OFFSETS && node.length == 0 && 0 < buffer.len < spec.offsetwidth
+            throw(ValidationError("IPC offsets buffer is shorter than one offset slot"))
         end
     end
     children = ArrayData[]
     if t isa DictionaryType
         # Index buffers were just consumed; values come from the side table.
         id = fielddictids[f]
-        haskey(dicts, id) ||
-            throw(ValidationError("record batch references dictionary id $id before its dictionary batch"))
-        return ArrayData(t, node.length, buffers; dictionary=dicts[id],
-            nullcount=node.null_count)
+        haskey(dicts, id) || throw(
+            ValidationError(
+                "record batch references dictionary id $id before its dictionary batch",
+            ),
+        )
+        return ArrayData(
+            t,
+            node.length,
+            buffers;
+            dictionary=dicts[id],
+            nullcount=node.null_count,
+        )
     end
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     for i = 1:nchildren
@@ -806,15 +917,16 @@ function decodefield(f::Field, c::DecodeCursor, dicts::Dict{Int64,ArrayData},
     end
     if t isa UnionType && t.mode == AC.SparseMode
         all(child -> child.len == node.length, children) ||
-            throw(ValidationError(
-                "IPC sparse-union children must equal the union length"))
+            throw(ValidationError("IPC sparse-union children must equal the union length"))
     end
-    return ArrayData(t, node.length, buffers; children=children,
-        nullcount=node.null_count)
+    return ArrayData(t, node.length, buffers; children=children, nullcount=node.null_count)
 end
 
-function validaterecordcolumns(fields, cols,
-    validated_dictionaries::AC._ValidatedDictionaries)
+function validaterecordcolumns(
+    fields,
+    cols,
+    validated_dictionaries::AC._ValidatedDictionaries,
+)
     for (f, col) in zip(fields, cols)
         # One IPC dictionary id can back many fields. Compatible value
         # schemas were proved when the stream schema was built. Each immutable
@@ -826,16 +938,30 @@ function validaterecordcolumns(fields, cols,
     return validated_dictionaries
 end
 
-function decoderecord(fm::FramedMessage, fields, sch::Schema,
-    dicts::Dict{Int64,ArrayData}, fielddictids::IdDict{Field,Int64},
-    limits::Limits, validated_dictionaries, state::DecodeState)
+function decoderecord(
+    fm::FramedMessage,
+    fields,
+    sch::Schema,
+    dicts::Dict{Int64,ArrayData},
+    fielddictids::IdDict{Field,Int64},
+    limits::Limits,
+    validated_dictionaries,
+    state::DecodeState,
+)
     header = fm.msg.header::Meta.RecordBatch
     codec = _batchcodec(header.compression, fm.version)
     rblen = something(header.length, Int64(0))
     0 <= rblen <= limits.max_array_length ||
         throw(ValidationError("record batch length $rblen exceeds limit"))
-    cursor = DecodeCursor(header.nodes, header.buffers, fm.body, limits;
-        codec=codec, state=state, variadics=variadiccounts(header))
+    cursor = DecodeCursor(
+        header.nodes,
+        header.buffers,
+        fm.body,
+        limits;
+        codec=codec,
+        state=state,
+        variadics=variadiccounts(header),
+    )
     cols = ArrayData[decodefield(f, cursor, dicts, fielddictids) for f in fields]
     finishcursor!(cursor)
     validaterecordcolumns(fields, cols, validated_dictionaries)
@@ -844,17 +970,22 @@ function decoderecord(fm::FramedMessage, fields, sch::Schema,
     return AC.RecordBatch(sch, cols, rblen, validated_dictionaries)
 end
 
-function rejectexperimentalcompression(msg::Meta.Message, version::Int16,
-    header_type::UInt8)
+function rejectexperimentalcompression(
+    msg::Meta.Message,
+    version::Int16,
+    header_type::UInt8,
+)
     version == Int16(3) || return nothing # V4
     header_type in (UInt8(2), UInt8(3)) || return nothing
     metadata = msg.custom_metadata
     metadata === nothing && return nothing
-    any(kv -> kv.key == EXPERIMENTAL_COMPRESSION_KEY, metadata) &&
-        throw(ValidationError(
+    any(kv -> kv.key == EXPERIMENTAL_COMPRESSION_KEY, metadata) && throw(
+        ValidationError(
             "pre-1.0 experimental V4 IPC compression (the " *
             "ARROW:experimental_compression metadata convention, superseded " *
-            "by V5 BodyCompression in 2020) is not supported"))
+            "by V5 BodyCompression in 2020) is not supported",
+        ),
+    )
     return nothing
 end
 rejectexperimentalcompression(fm::FramedMessage) =
@@ -886,8 +1017,11 @@ function AC.nextbatch!(s::IPCStream)
     # (fail closed, no duplicated or skipped batches) and is released on
     # every exit path.
     _, ok = @atomicreplace s.pulling false => true
-    ok || throw(Base.ConcurrencyViolationError(
-        "IPCStream supports only one active nextbatch! call"))
+    ok || throw(
+        Base.ConcurrencyViolationError(
+            "IPCStream supports only one active nextbatch! call",
+        ),
+    )
     try
         i = s.nextindex
         i > length(s.batches) && return nothing
@@ -905,8 +1039,7 @@ subset this adapter supports: BUFFER-method LZ4_FRAME or ZSTD.
 """
 function _batchcodec(compression, version::Int16)::Int8
     compression === nothing && return CODEC_NONE
-    version == Int16(4) || throw(ValidationError(
-        "BodyCompression requires metadata V5"))
+    version == Int16(4) || throw(ValidationError("BodyCompression requires metadata V5"))
     method = something(compression.method, Meta.BodyCompressionMethod.BUFFER)
     method == Meta.BodyCompressionMethod.BUFFER ||
         throw(ValidationError("unsupported body-compression method $method"))
@@ -942,16 +1075,22 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
     msgs[1].body.len == 0 ||
         throw(ValidationError("schema message must have an empty body"))
     endian = something(metaschema.endianness, Meta.Endianness.Little)
-    endian == Meta.Endianness.Little ||
-        throw(ValidationError("big-endian IPC is not supported (no endianness normalization)"))
+    endian == Meta.Endianness.Little || throw(
+        ValidationError("big-endian IPC is not supported (no endianness normalization)"),
+    )
     dictids = Dict{Int64,Meta.Field}()
     fielddictids = IdDict{Field,Int64}()   # adapter-side id table
-    fields = Field[corefield(f, dictids, fielddictids)
-                   for f in something(metaschema.fields, Meta.Field[])]
+    fields = Field[
+        corefield(f, dictids, fielddictids) for
+        f in something(metaschema.fields, Meta.Field[])
+    ]
     foreach(validateschemafield, fields)
     dictvaluefields = validatedictionaryids(fields, fielddictids)
-    sch = Schema(fields; metadata=coremetadata(metaschema.custom_metadata),
-        endianness=AC.LittleEndian)
+    sch = Schema(
+        fields;
+        metadata=coremetadata(metaschema.custom_metadata),
+        endianness=AC.LittleEndian,
+    )
     dicts = Dict{Int64,ArrayData}()
     # One codec context per reader, shared by every compressed batch in the
     # stream and explicitly finalized on every exit path.
@@ -963,91 +1102,127 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
     schemaversion = msgs[1].version
     try
         for fm in msgs[2:end]
-        fm.version == schemaversion ||
-            throw(ValidationError("IPC metadata version changes within the stream"))
-        # Arrow 0.17 V4 streams signaled buffer compression on the Message,
-        # before RecordBatch.compression existed. Reject that legacy marker
-        # before treating its length-prefixed compressed buffers as raw data.
-        rejectexperimentalcompression(fm)
-        header = fm.msg.header
-        if header isa Meta.DictionaryBatch
-            header.isDelta &&
-                throw(ValidationError("delta dictionaries are not supported"))
-            rb = header.data
-            codec = _batchcodec(rb.compression, fm.version)
-            haskey(dictids, header.id) ||
-                throw(ValidationError("dictionary batch has unknown id $(header.id)"))
-            replacement = haskey(dicts, header.id)
-            if replacement && !(1 in features)
-                throw(ValidationError("dictionary replacement used without required schema feature"))
-            end
-            # A dictionary batch's payload is a one-column record batch of
-            # the VALUE type; decode it with the same generic decoder. The
-            # value field is the metadata field minus its dictionary tag.
-            # Dictionary value schemas are built once from the Core schema.
-            # Reusing them avoids repeated metadata-string/container
-            # allocation on dictionary replacement messages. Pool
-            # nullability is independent from the encoded index field.
-            haskey(dictvaluefields, header.id) ||
-                throw(ValidationError("dictionary batch has unknown id $(header.id)"))
-            vf = dictvaluefields[header.id]
-            rblen = something(rb.length, Int64(0))
-            0 <= rblen <= limits.max_array_length ||
-                throw(ValidationError("dictionary batch length $rblen exceeds limit"))
-            cursor = DecodeCursor(rb.nodes, rb.buffers, fm.body, limits;
-                codec=codec, state=state, variadics=variadiccounts(rb))
-            decoded = decodefield(vf, cursor, dicts, fielddictids)
-            finishcursor!(cursor)
-            decoded.len == rblen ||
-                throw(ValidationError("dictionary RecordBatch length does not match its field node"))
-            # Certify the entire immutable pool snapshot before publication.
-            # Later record validation may then skip every recursive stage for
-            # this exact identity. Replacements decode to a new identity and
-            # must earn their own certificate here.
-            validate_semantic(vf, decoded)
-            validated_dictionaries[decoded] = nothing
-            dicts[header.id] = decoded
-
-            # The IPC spec permits an all-null dictionary column before its
-            # first DictionaryBatch. Resolve only the missing dictionary;
-            # preserve every dictionary snapshot already visible at the
-            # record's wire position.
-            if !replacement
-                stillpending = PendingRecord[]
-                for p in pending
-                    if header.id in p.missing
-                        p.dictionaries[header.id] = decoded
-                        delete!(p.missing, header.id)
-                    end
-                    if isempty(p.missing)
-                        batchslots[p.slot] = decoderecord(p.fm, fields, sch,
-                            p.dictionaries, fielddictids, limits,
-                            validated_dictionaries, state)
-                    else
-                        push!(stillpending, p)
-                    end
+            fm.version == schemaversion ||
+                throw(ValidationError("IPC metadata version changes within the stream"))
+            # Arrow 0.17 V4 streams signaled buffer compression on the Message,
+            # before RecordBatch.compression existed. Reject that legacy marker
+            # before treating its length-prefixed compressed buffers as raw data.
+            rejectexperimentalcompression(fm)
+            header = fm.msg.header
+            if header isa Meta.DictionaryBatch
+                header.isDelta &&
+                    throw(ValidationError("delta dictionaries are not supported"))
+                rb = header.data
+                codec = _batchcodec(rb.compression, fm.version)
+                haskey(dictids, header.id) ||
+                    throw(ValidationError("dictionary batch has unknown id $(header.id)"))
+                replacement = haskey(dicts, header.id)
+                if replacement && !(1 in features)
+                    throw(
+                        ValidationError(
+                            "dictionary replacement used without required schema feature",
+                        ),
+                    )
                 end
-                pending = stillpending
-            end
-        elseif header isa Meta.RecordBatch
-            missing = missingdicts(fields, header.nodes, dicts, fielddictids)
-            push!(batchslots, nothing)
-            slot = length(batchslots)
-            if isempty(missing)
-                batchslots[slot] = decoderecord(fm, fields, sch, dicts,
-                    fielddictids, limits, validated_dictionaries, state)
+                # A dictionary batch's payload is a one-column record batch of
+                # the VALUE type; decode it with the same generic decoder. The
+                # value field is the metadata field minus its dictionary tag.
+                # Dictionary value schemas are built once from the Core schema.
+                # Reusing them avoids repeated metadata-string/container
+                # allocation on dictionary replacement messages. Pool
+                # nullability is independent from the encoded index field.
+                haskey(dictvaluefields, header.id) ||
+                    throw(ValidationError("dictionary batch has unknown id $(header.id)"))
+                vf = dictvaluefields[header.id]
+                rblen = something(rb.length, Int64(0))
+                0 <= rblen <= limits.max_array_length ||
+                    throw(ValidationError("dictionary batch length $rblen exceeds limit"))
+                cursor = DecodeCursor(
+                    rb.nodes,
+                    rb.buffers,
+                    fm.body,
+                    limits;
+                    codec=codec,
+                    state=state,
+                    variadics=variadiccounts(rb),
+                )
+                decoded = decodefield(vf, cursor, dicts, fielddictids)
+                finishcursor!(cursor)
+                decoded.len == rblen || throw(
+                    ValidationError(
+                        "dictionary RecordBatch length does not match its field node",
+                    ),
+                )
+                # Certify the entire immutable pool snapshot before publication.
+                # Later record validation may then skip every recursive stage for
+                # this exact identity. Replacements decode to a new identity and
+                # must earn their own certificate here.
+                validate_semantic(vf, decoded)
+                validated_dictionaries[decoded] = nothing
+                dicts[header.id] = decoded
+
+                # The IPC spec permits an all-null dictionary column before its
+                # first DictionaryBatch. Resolve only the missing dictionary;
+                # preserve every dictionary snapshot already visible at the
+                # record's wire position.
+                if !replacement
+                    stillpending = PendingRecord[]
+                    for p in pending
+                        if header.id in p.missing
+                            p.dictionaries[header.id] = decoded
+                            delete!(p.missing, header.id)
+                        end
+                        if isempty(p.missing)
+                            batchslots[p.slot] = decoderecord(
+                                p.fm,
+                                fields,
+                                sch,
+                                p.dictionaries,
+                                fielddictids,
+                                limits,
+                                validated_dictionaries,
+                                state,
+                            )
+                        else
+                            push!(stillpending, p)
+                        end
+                    end
+                    pending = stillpending
+                end
+            elseif header isa Meta.RecordBatch
+                missing = missingdicts(fields, header.nodes, dicts, fielddictids)
+                push!(batchslots, nothing)
+                slot = length(batchslots)
+                if isempty(missing)
+                    batchslots[slot] = decoderecord(
+                        fm,
+                        fields,
+                        sch,
+                        dicts,
+                        fielddictids,
+                        limits,
+                        validated_dictionaries,
+                        state,
+                    )
+                else
+                    push!(pending, PendingRecord(fm, copy(dicts), missing, slot))
+                end
             else
-                push!(pending, PendingRecord(fm, copy(dicts), missing, slot))
+                throw(ValidationError("unsupported IPC message header $(typeof(header))"))
             end
-        else
-            throw(ValidationError("unsupported IPC message header $(typeof(header))"))
         end
-    end
-        isempty(pending) ||
-            throw(ValidationError("stream ended before required dictionary batches arrived"))
+        isempty(pending) || throw(
+            ValidationError("stream ended before required dictionary batches arrived"),
+        )
         batches = AC.RecordBatch[b::AC.RecordBatch for b in batchslots]
-        return IPCStream(sch, AC.FrozenVector{Field}(fields), batches, 1, false,
-            fielddictids)
+        return IPCStream(
+            sch,
+            AC.FrozenVector{Field}(fields),
+            batches,
+            1,
+            false,
+            fielddictids,
+        )
     finally
         close(state)
     end

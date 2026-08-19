@@ -587,8 +587,10 @@ dictionaryEncodingAddIndexType(b::FlatBuffers.Builder, indexType::FlatBuffers.UO
     FlatBuffers.prependoffsetslot!(b, 1, indexType, 0)
 dictionaryEncodingAddIsOrdered(b::FlatBuffers.Builder, isOrdered::Base.Bool) =
     FlatBuffers.prependslot!(b, 2, isOrdered, false)
-dictionaryEncodingAddDictionaryKind(b::FlatBuffers.Builder, dictionaryKind::DictionaryKind.T) =
-    FlatBuffers.prependslot!(b, 3, dictionaryKind, 0)
+dictionaryEncodingAddDictionaryKind(
+    b::FlatBuffers.Builder,
+    dictionaryKind::DictionaryKind.T,
+) = FlatBuffers.prependslot!(b, 3, dictionaryKind, 0)
 dictionaryEncodingEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
 
 struct Field <: FlatBuffers.Table
@@ -596,7 +598,8 @@ struct Field <: FlatBuffers.Table
     pos::Base.Int
 end
 
-Base.propertynames(x::Field) = (:name, :nullable, :type, :dictionary, :children, :custom_metadata)
+Base.propertynames(x::Field) =
+    (:name, :nullable, :type, :dictionary, :children, :custom_metadata)
 
 function Base.getproperty(x::Field, field::Symbol)
     if field === :name
@@ -731,4 +734,3 @@ schemaAddFeatures(b::FlatBuffers.Builder, features::FlatBuffers.UOffsetT) =
 schemaStartFeaturesVector(b::FlatBuffers.Builder, numelems) =
     FlatBuffers.startvector!(b, 8, numelems, 8)
 schemaEnd(b::FlatBuffers.Builder) = FlatBuffers.endobject!(b)
-

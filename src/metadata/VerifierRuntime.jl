@@ -74,8 +74,11 @@ function _vcharge!(ctx::VerifyContext, bytes::Int64, what::AbstractString)
         e isa OverflowError || rethrow()
         _vfail("allocation charge overflow for $what")
     end
-    ctx.reserved <= ctx.reserve_limit || throw(VerifyBudgetError(
-        "metadata-directed allocation budget exceeded while visiting $what"))
+    ctx.reserved <= ctx.reserve_limit || throw(
+        VerifyBudgetError(
+            "metadata-directed allocation budget exceeded while visiting $what",
+        ),
+    )
     return nothing
 end
 
@@ -90,8 +93,7 @@ function _vvisit!(ctx::VerifyContext, what::AbstractString)
         e isa OverflowError || rethrow()
         _vfail("metadata object count overflow")
     end
-    ctx.objects <= ctx.max_objects ||
-        _vfail("metadata object count exceeds limit")
+    ctx.objects <= ctx.max_objects || _vfail("metadata object count exceeds limit")
     _vcharge!(ctx, METADATA_OBJECT_RESERVE, what)
     return nothing
 end
@@ -104,13 +106,11 @@ function _vcount!(ctx::VerifyContext, n::Int64, what::AbstractString)
         e isa OverflowError || rethrow()
         _vfail("metadata object count overflow")
     end
-    ctx.objects <= ctx.max_objects ||
-        _vfail("metadata object count exceeds limit")
+    ctx.objects <= ctx.max_objects || _vfail("metadata object count exceeds limit")
     return nothing
 end
 
-function _vrange(bytes::Vector{UInt8}, pos::Int64, len::Int64,
-    what::AbstractString)
+function _vrange(bytes::Vector{UInt8}, pos::Int64, len::Int64, what::AbstractString)
     (pos >= 0 && len >= 0 && len <= length(bytes) && pos <= length(bytes) - len) ||
         _vfail("$what is outside metadata")
     return pos
@@ -169,8 +169,7 @@ function _vfield(t::VTable, slot::Base.Int, width::Base.Int=1; required::Base.Bo
     off >= 4 && off + width <= t.olen || _vfail("table slot $slot exceeds object")
     p = t.pos + off
     _vrange(t.bytes, p, Int64(width), "table slot $slot")
-    width > 1 && p % min(width, 8) != 0 &&
-        _vfail("table slot $slot is misaligned")
+    width > 1 && p % min(width, 8) != 0 && _vfail("table slot $slot is misaligned")
     return p
 end
 
@@ -198,8 +197,7 @@ function _venum(t::VTable, slot::Base.Int, width::Base.Int, valid)
     return nothing
 end
 
-function _vstring(t::VTable, slot::Base.Int, ctx::VerifyContext;
-    required::Base.Bool=false)
+function _vstring(t::VTable, slot::Base.Int, ctx::VerifyContext; required::Base.Bool=false)
     p = _vref(t, slot; required=required)
     p === nothing && return nothing
     p % 4 == 0 || _vfail("string length is misaligned")
@@ -214,27 +212,45 @@ function _vstring(t::VTable, slot::Base.Int, ctx::VerifyContext;
     return nothing
 end
 
-function _vvector(t::VTable, slot::Base.Int, elemsize::Base.Int,
-    ctx::VerifyContext=VerifyContext(); required::Base.Bool=false)
+function _vvector(
+    t::VTable,
+    slot::Base.Int,
+    elemsize::Base.Int,
+    ctx::VerifyContext=VerifyContext();
+    required::Base.Bool=false,
+)
     p = _vref(t, slot; required=required)
     p === nothing && return nothing
     _vrange(t.bytes, p, Int64(4), "vector length")
     p % 4 == 0 || _vfail("vector length is misaligned")
     n = Int64(_vu32(t.bytes, p))
-    n <= ctx.max_objects ||
-        _vfail("vector count $n exceeds metadata object limit")
+    n <= ctx.max_objects || _vfail("vector count $n exceeds metadata object limit")
     _vcount!(ctx, n, "vector entries")
     start = checked_add(p, Int64(4))
     _vrange(t.bytes, start, checked_mul(n, Int64(elemsize)), "vector data")
-    n > 0 && elemsize > 1 && start % min(elemsize, 8) != 0 &&
+    n > 0 &&
+        elemsize > 1 &&
+        start % min(elemsize, 8) != 0 &&
         _vfail("vector data is misaligned")
-    _vcharge!(ctx, checked_add(METADATA_VECTOR_BASE_RESERVE,
-        checked_mul(n, METADATA_VECTOR_ELEMENT_RESERVE)), "vector")
+    _vcharge!(
+        ctx,
+        checked_add(
+            METADATA_VECTOR_BASE_RESERVE,
+            checked_mul(n, METADATA_VECTOR_ELEMENT_RESERVE),
+        ),
+        "vector",
+    )
     return start, Base.Int(n)
 end
 
-function _vtablevector(t::VTable, slot::Base.Int, verifyone::F,
-    ctx::VerifyContext, depth::Base.Int; required::Base.Bool=false) where {F}
+function _vtablevector(
+    t::VTable,
+    slot::Base.Int,
+    verifyone::F,
+    ctx::VerifyContext,
+    depth::Base.Int;
+    required::Base.Bool=false,
+) where {F}
     vec = _vvector(t, slot, 4, ctx; required=required)
     vec === nothing && return 0
     start, n = vec
@@ -248,8 +264,15 @@ function _vtablevector(t::VTable, slot::Base.Int, verifyone::F,
 end
 
 # Every element of an enum-typed vector must sit in the declared domain.
-function _venumvector(t::VTable, slot::Base.Int, elemsize::Base.Int, valid,
-    ctx::VerifyContext, what::AbstractString; required::Base.Bool=false)
+function _venumvector(
+    t::VTable,
+    slot::Base.Int,
+    elemsize::Base.Int,
+    valid,
+    ctx::VerifyContext,
+    what::AbstractString;
+    required::Base.Bool=false,
+)
     vec = _vvector(t, slot, elemsize, ctx; required=required)
     vec === nothing && return nothing
     start, n = vec

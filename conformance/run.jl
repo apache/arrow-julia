@@ -51,8 +51,8 @@ const SUITES = Dict(
 )
 const SUITE_ORDER = ["corpus", "oracle", "cdata"]
 
-_haveimage() = success(pipeline(`docker image inspect $IMAGE`;
-    stdout=devnull, stderr=devnull))
+_haveimage() =
+    success(pipeline(`docker image inspect $IMAGE`; stdout=devnull, stderr=devnull))
 
 function buildimage()
     println("conformance: building $IMAGE (once; --rebuild forces)")
@@ -73,29 +73,44 @@ function main(args)
     requested = filter(a -> a != "--rebuild", args)
     isempty(requested) && (requested = SUITE_ORDER)
     for s in requested
-        haskey(SUITES, s) || error("unknown suite $(repr(s)); choose from $(join(SUITE_ORDER, ", "))")
+        haskey(SUITES, s) ||
+            error("unknown suite $(repr(s)); choose from $(join(SUITE_ORDER, ", "))")
     end
     (rebuild || !_haveimage()) && buildimage()
 
-    container = Harbor.run!(IMAGE; command=["sleep", "infinity"], detach=true,
-        volumes=Dict("/work" => REPO, "/opt/julia-depot" => DEPOT_VOLUME))
+    container = Harbor.run!(
+        IMAGE;
+        command=["sleep", "infinity"],
+        detach=true,
+        volumes=Dict("/work" => REPO, "/opt/julia-depot" => DEPOT_VOLUME),
+    )
     results = Dict{String,Int}()
     try
         # The suite environment: the repository's conformance project with
         # the mounted checkout and the image's Tables branch developed in.
         # Cheap when the depot volume is warm; fetches only what changed.
         println("conformance: preparing the suite environment")
-        rc = execstream(container, ["julia", "--project=/opt/env", "--startup-file=no", "-e",
-            """using Pkg
-               cp("/work/conformance/Project.toml", "/opt/env/Project.toml"; force=true)
-               Pkg.develop(path="/work"); Pkg.develop(path="/opt/Tables")
-               Pkg.instantiate(); Pkg.precompile()"""])
+        rc = execstream(
+            container,
+            [
+                "julia",
+                "--project=/opt/env",
+                "--startup-file=no",
+                "-e",
+                """using Pkg
+                   cp("/work/conformance/Project.toml", "/opt/env/Project.toml"; force=true)
+                   Pkg.develop(path="/work"); Pkg.develop(path="/opt/Tables")
+                   Pkg.instantiate(); Pkg.precompile()""",
+            ],
+        )
         rc == 0 || error("suite environment preparation failed (exit $rc)")
         for s in requested
             println()
             println("conformance: ===== $s =====")
-            results[s] = execstream(container,
-                ["julia", "--project=/opt/env", "--startup-file=no", SUITES[s]])
+            results[s] = execstream(
+                container,
+                ["julia", "--project=/opt/env", "--startup-file=no", SUITES[s]],
+            )
         end
     finally
         Harbor.cleanup!(container)

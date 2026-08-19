@@ -117,15 +117,25 @@ function parsefbs(src::String)
                 s = strip(stmt)
                 isempty(s) && continue
                 s = replace(s, r"\[\s+" => "[", r"\s+\]" => "]")   # `[ int ]` -> `[int]`
-                fm = match(r"^(\w+)\s*:\s*(\[?[\w.]+\]?)\s*(?:=\s*([^\s(]+))?\s*(\([^)]*\))?$", s)
+                fm = match(
+                    r"^(\w+)\s*:\s*(\[?[\w.]+\]?)\s*(?:=\s*([^\s(]+))?\s*(\([^)]*\))?$",
+                    s,
+                )
                 fm === nothing && error("cannot parse field '$s' in $name")
                 fname, ftype, fdefault, attrs = fm.captures
                 # Message.fbs qualifies cross-file types
                 # (`org.apache.arrow.flatbuf.MetadataVersion`); all three
                 # schemas share one Julia module, so keep the leaf name.
                 ftype = replace(ftype, r"[\w.]*\.(\w+)" => s"\1")
-                push!(fields, FbsField(fname, ftype, fdefault,
-                    attrs !== nothing && occursin("deprecated", attrs)))
+                push!(
+                    fields,
+                    FbsField(
+                        fname,
+                        ftype,
+                        fdefault,
+                        attrs !== nothing && occursin("deprecated", attrs),
+                    ),
+                )
             end
             push!(decls, FbsTable(name, kind == "struct", fields))
         else
@@ -142,8 +152,15 @@ function parsefbs(src::String)
                 push!(members, em.captures[1] => v)
                 next = v + 1
             end
-            push!(decls, FbsEnum(name, something(base, kind == "union" ? "ubyte" : "int"),
-                members, kind == "union"))
+            push!(
+                decls,
+                FbsEnum(
+                    name,
+                    something(base, kind == "union" ? "ubyte" : "int"),
+                    members,
+                    kind == "union",
+                ),
+            )
         end
     end
     return decls
@@ -152,14 +169,28 @@ end
 # --- type mapping -----------------------------------------------------------------
 
 const SCALARS = Dict(
-    "bool" => ("Base.Bool", 1), "byte" => ("Int8", 1), "ubyte" => ("UInt8", 1),
-    "short" => ("Int16", 2), "ushort" => ("UInt16", 2), "int" => ("Int32", 4),
-    "uint" => ("UInt32", 4), "long" => ("Int64", 8), "ulong" => ("UInt64", 8),
-    "float" => ("Float32", 4), "double" => ("Float64", 8),
-    "int8" => ("Int8", 1), "uint8" => ("UInt8", 1), "int16" => ("Int16", 2),
-    "uint16" => ("UInt16", 2), "int32" => ("Int32", 4), "uint32" => ("UInt32", 4),
-    "int64" => ("Int64", 8), "uint64" => ("UInt64", 8),
-    "float32" => ("Float32", 4), "float64" => ("Float64", 8))
+    "bool" => ("Base.Bool", 1),
+    "byte" => ("Int8", 1),
+    "ubyte" => ("UInt8", 1),
+    "short" => ("Int16", 2),
+    "ushort" => ("UInt16", 2),
+    "int" => ("Int32", 4),
+    "uint" => ("UInt32", 4),
+    "long" => ("Int64", 8),
+    "ulong" => ("UInt64", 8),
+    "float" => ("Float32", 4),
+    "double" => ("Float64", 8),
+    "int8" => ("Int8", 1),
+    "uint8" => ("UInt8", 1),
+    "int16" => ("Int16", 2),
+    "uint16" => ("UInt16", 2),
+    "int32" => ("Int32", 4),
+    "uint32" => ("UInt32", 4),
+    "int64" => ("Int64", 8),
+    "uint64" => ("UInt64", 8),
+    "float32" => ("Float32", 4),
+    "float64" => ("Float64", 8),
+)
 
 # Public name choices for Base/Core collisions.
 const RENAMES = Dict("Struct_" => "Struct")
@@ -224,8 +255,7 @@ const REQUIRED = Dict(
     "Footer" => ("schema",),
     "KeyValue" => ("key", "value"),
 )
-isrequired(tname::String, fname::String) =
-    fname in get(REQUIRED, tname, ())
+isrequired(tname::String, fname::String) = fname in get(REQUIRED, tname, ())
 
 function emit(decls, io::IO; alldecls=decls)
     # Name resolution spans every generated schema (Message.fbs references
@@ -302,15 +332,27 @@ function emitstruct(io::IO, d::FbsTable)
     total = cld(off, maxalign) * maxalign
     println(io, "FlatBuffers.structsizeof(::Base.Type{", name, "}) = ", total)
     println(io)
-    println(io, "Base.propertynames(x::", name, ") = (",
-        join((":" * f for (f, _, _) in layout), ", "), length(layout) == 1 ? ",)" : ")")
+    println(
+        io,
+        "Base.propertynames(x::",
+        name,
+        ") = (",
+        join((":" * f for (f, _, _) in layout), ", "),
+        length(layout) == 1 ? ",)" : ")",
+    )
     println(io)
     println(io, "function Base.getproperty(x::", name, ", field::Symbol)")
     firstbranch = true
     for (f, jt, o) in layout
         println(io, "    ", firstbranch ? "if" : "elseif", " field === :", f)
-        println(io, "        return FlatBuffers.get(x, FlatBuffers.pos(x)",
-            o == 0 ? "" : " + $o", ", ", jt, ")")
+        println(
+            io,
+            "        return FlatBuffers.get(x, FlatBuffers.pos(x)",
+            o == 0 ? "" : " + $o",
+            ", ",
+            jt,
+            ")",
+        )
         firstbranch = false
     end
     println(io, "    end")
@@ -344,8 +386,14 @@ function emittable(io::IO, d::FbsTable, enums, tables)
     println(io)
     slots, slotof = slotmap(d, enums)
     props = [f.name for f in d.fields if !f.deprecated]
-    println(io, "Base.propertynames(x::", name, ") = (",
-        join((":" * p for p in props), ", "), length(props) == 1 ? ",)" : ")")
+    println(
+        io,
+        "Base.propertynames(x::",
+        name,
+        ") = (",
+        join((":" * p for p in props), ", "),
+        length(props) == 1 ? ",)" : ")",
+    )
     println(io)
     if !isempty(props)
         println(io, "function Base.getproperty(x::", name, ", field::Symbol)")
@@ -361,24 +409,42 @@ function emittable(io::IO, d::FbsTable, enums, tables)
                 tvo = 4 + 2 * slotof[f.name * "_type"]
                 println(io, "        o = FlatBuffers.offset(x, ", tvo, ")")
                 println(io, "        if o != 0")
-                println(io, "            T = ", t, "(FlatBuffers.get(x, o + FlatBuffers.pos(x), UInt8))")
+                println(
+                    io,
+                    "            T = ",
+                    t,
+                    "(FlatBuffers.get(x, o + FlatBuffers.pos(x), UInt8))",
+                )
                 println(io, "            o = FlatBuffers.offset(x, ", vo, ")")
                 println(io, "            pos = FlatBuffers.union(x, o)")
                 println(io, "            if o != 0")
-                println(io, "                return FlatBuffers.init(T, FlatBuffers.bytes(x), pos)")
+                println(
+                    io,
+                    "                return FlatBuffers.init(T, FlatBuffers.bytes(x), pos)",
+                )
                 println(io, "            end")
                 println(io, "        end")
             elseif haskey(enums, t)
                 e = enums[t]
                 println(io, "        o = FlatBuffers.offset(x, ", vo, ")")
-                println(io, "        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), ", t, ".T)")
+                println(
+                    io,
+                    "        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), ",
+                    t,
+                    ".T)",
+                )
                 # default: explicit or first member
                 dv = f.default === nothing ? e.members[1].first : f.default
                 println(io, "        return ", t, ".", dv)
             elseif haskey(SCALARS, t)
                 jt = SCALARS[t][1]
                 println(io, "        o = FlatBuffers.offset(x, ", vo, ")")
-                println(io, "        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), ", jt, ")")
+                println(
+                    io,
+                    "        o != 0 && return FlatBuffers.get(x, o + FlatBuffers.pos(x), ",
+                    jt,
+                    ")",
+                )
                 if f.default !== nothing
                     dv = f.default
                     println(io, "        return ", jt == "Base.Bool" ? dv : "$jt($dv)")
@@ -392,7 +458,8 @@ function emittable(io::IO, d::FbsTable, enums, tables)
                 println(io, "        o != 0 && return String(x, o + FlatBuffers.pos(x))")
             elseif isvector(t)
                 et = elemtype(t)
-                jt = haskey(SCALARS, et) ? SCALARS[et][1] :
+                jt =
+                    haskey(SCALARS, et) ? SCALARS[et][1] :
                     haskey(enums, et) ? et * ".T" : jlname(et)
                 println(io, "        o = FlatBuffers.offset(x, ", vo, ")")
                 println(io, "        if o != 0")
@@ -401,8 +468,16 @@ function emittable(io::IO, d::FbsTable, enums, tables)
             else # table reference
                 println(io, "        o = FlatBuffers.offset(x, ", vo, ")")
                 println(io, "        if o != 0")
-                println(io, "            y = FlatBuffers.indirect(x, o + FlatBuffers.pos(x))")
-                println(io, "            return FlatBuffers.init(", jlname(t), ", FlatBuffers.bytes(x), y)")
+                println(
+                    io,
+                    "            y = FlatBuffers.indirect(x, o + FlatBuffers.pos(x))",
+                )
+                println(
+                    io,
+                    "            return FlatBuffers.init(",
+                    jlname(t),
+                    ", FlatBuffers.bytes(x), y)",
+                )
                 println(io, "        end")
             end
         end
@@ -412,7 +487,13 @@ function emittable(io::IO, d::FbsTable, enums, tables)
         println(io)
     end
     # builders
-    println(io, lname, "Start(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, ", length(slots), ")")
+    println(
+        io,
+        lname,
+        "Start(b::FlatBuffers.Builder) = FlatBuffers.startobject!(b, ",
+        length(slots),
+        ")",
+    )
     for f in d.fields
         f.deprecated && continue
         t = f.type
@@ -420,10 +501,31 @@ function emittable(io::IO, d::FbsTable, enums, tables)
         slot = slotof[f.name]
         if haskey(enums, t) && enums[t].isunion
             tslot = slotof[f.name * "_type"]
-            println(io, lname, "Add", fc, "Type(b::FlatBuffers.Builder, ::Core.Type{T}) where {T} =")
+            println(
+                io,
+                lname,
+                "Add",
+                fc,
+                "Type(b::FlatBuffers.Builder, ::Core.Type{T}) where {T} =",
+            )
             println(io, "    FlatBuffers.prependslot!(b, ", tslot, ", ", t, "(T), 0)")
-            println(io, lname, "Add", fc, "(b::FlatBuffers.Builder, ", f.name, "::FlatBuffers.UOffsetT) =")
-            println(io, "    FlatBuffers.prependoffsetslot!(b, ", slot, ", ", f.name, ", 0)")
+            println(
+                io,
+                lname,
+                "Add",
+                fc,
+                "(b::FlatBuffers.Builder, ",
+                f.name,
+                "::FlatBuffers.UOffsetT) =",
+            )
+            println(
+                io,
+                "    FlatBuffers.prependoffsetslot!(b, ",
+                slot,
+                ", ",
+                f.name,
+                ", 0)",
+            )
         elseif haskey(enums, t)
             e = enums[t]
             # The runtime compares `x != T(default)`, so the default is the
@@ -431,16 +533,69 @@ function emittable(io::IO, d::FbsTable, enums, tables)
             # the enum instance itself.
             dname = f.default === nothing ? e.members[1].first : f.default
             dval = something(findfirst(m -> m.first == dname, e.members), 1)
-            println(io, lname, "Add", fc, "(b::FlatBuffers.Builder, ", f.name, "::", t, ".T) =")
-            println(io, "    FlatBuffers.prependslot!(b, ", slot, ", ", f.name, ", ", e.members[dval].second, ")")
+            println(
+                io,
+                lname,
+                "Add",
+                fc,
+                "(b::FlatBuffers.Builder, ",
+                f.name,
+                "::",
+                t,
+                ".T) =",
+            )
+            println(
+                io,
+                "    FlatBuffers.prependslot!(b, ",
+                slot,
+                ", ",
+                f.name,
+                ", ",
+                e.members[dval].second,
+                ")",
+            )
         elseif haskey(SCALARS, t)
             jt = SCALARS[t][1]
             dv = f.default === nothing ? (jt == "Base.Bool" ? "false" : "0") : f.default
-            println(io, lname, "Add", fc, "(b::FlatBuffers.Builder, ", f.name, "::", jt, ") =")
-            println(io, "    FlatBuffers.prependslot!(b, ", slot, ", ", f.name, ", ", dv, ")")
+            println(
+                io,
+                lname,
+                "Add",
+                fc,
+                "(b::FlatBuffers.Builder, ",
+                f.name,
+                "::",
+                jt,
+                ") =",
+            )
+            println(
+                io,
+                "    FlatBuffers.prependslot!(b, ",
+                slot,
+                ", ",
+                f.name,
+                ", ",
+                dv,
+                ")",
+            )
         else # string / vector / table: offset slot
-            println(io, lname, "Add", fc, "(b::FlatBuffers.Builder, ", f.name, "::FlatBuffers.UOffsetT) =")
-            println(io, "    FlatBuffers.prependoffsetslot!(b, ", slot, ", ", f.name, ", 0)")
+            println(
+                io,
+                lname,
+                "Add",
+                fc,
+                "(b::FlatBuffers.Builder, ",
+                f.name,
+                "::FlatBuffers.UOffsetT) =",
+            )
+            println(
+                io,
+                "    FlatBuffers.prependoffsetslot!(b, ",
+                slot,
+                ", ",
+                f.name,
+                ", 0)",
+            )
             if isvector(t)
                 et = elemtype(t)
                 esz, ealign = if haskey(SCALARS, et)
@@ -450,14 +605,31 @@ function emittable(io::IO, d::FbsTable, enums, tables)
                 elseif haskey(tables, et) && tables[et].isstruct
                     st = tables[et]
                     szs = [SCALARS[ff.type][2] for ff in st.fields]
-                    off = 0; ma = 1
-                    for s in szs; off = cld(off, s) * s + s; ma = max(ma, s); end
+                    off = 0
+                    ma = 1
+                    for s in szs
+                        off = cld(off, s) * s + s
+                        ma = max(ma, s)
+                    end
                     (cld(off, ma) * ma, ma)
                 else
                     (4, 4)
                 end
-                println(io, lname, "Start", fc, "Vector(b::FlatBuffers.Builder, numelems) =")
-                println(io, "    FlatBuffers.startvector!(b, ", esz, ", numelems, ", ealign, ")")
+                println(
+                    io,
+                    lname,
+                    "Start",
+                    fc,
+                    "Vector(b::FlatBuffers.Builder, numelems) =",
+                )
+                println(
+                    io,
+                    "    FlatBuffers.startvector!(b, ",
+                    esz,
+                    ", numelems, ",
+                    ealign,
+                    ")",
+                )
             end
         end
     end
@@ -508,23 +680,48 @@ function emitverifier(io::IO, alldecls)
                 tslot = slotof[f.name * "_type"]
                 println(refs, "    tagp = _vfield(t, ", tslot, ", 1", reqkw, ")")
                 println(refs, "    tag = tagp === nothing ? 0x00 : _vu8(bytes, tagp)")
-                req && println(refs,
-                    "    tag != 0x00 || _vfail(\"", label, " union tag is required\")")
+                req && println(
+                    refs,
+                    "    tag != 0x00 || _vfail(\"",
+                    label,
+                    " union tag is required\")",
+                )
                 println(refs, "    valp = _vref(t, ", slot, reqkw, ")")
                 println(refs, "    if tag == 0x00")
                 println(refs, "        valp === nothing ||")
-                println(refs, "            _vfail(\"", label, " union has a value but no tag\")")
+                println(
+                    refs,
+                    "            _vfail(\"",
+                    label,
+                    " union has a value but no tag\")",
+                )
                 firstmember = true
                 for (mname, v) in e.members
                     mname == "NONE" && continue
                     println(refs, "    elseif tag == 0x", string(v, base=16, pad=2))
                     if haskey(tables, mname) && !tables[mname].isstruct
                         println(refs, "        valp === nothing &&")
-                        println(refs, "            _vfail(\"", label, " union has a tag but no value\")")
-                        println(refs, "        verify_", jlname(mname), "(bytes, valp, ctx, depth + 1)")
+                        println(
+                            refs,
+                            "            _vfail(\"",
+                            label,
+                            " union has a tag but no value\")",
+                        )
+                        println(
+                            refs,
+                            "        verify_",
+                            jlname(mname),
+                            "(bytes, valp, ctx, depth + 1)",
+                        )
                     else
-                        println(refs, "        _vfail(\"", label, " union member ", mname,
-                            " is outside the generated schemas\")")
+                        println(
+                            refs,
+                            "        _vfail(\"",
+                            label,
+                            " union member ",
+                            mname,
+                            " is outside the generated schemas\")",
+                        )
                     end
                     firstmember = false
                 end
@@ -533,8 +730,16 @@ function emitverifier(io::IO, alldecls)
                 println(refs, "    end")
             elseif haskey(enums, t)
                 e = enums[t]
-                println(inline, "    _venum(t, ", slot, ", ", SCALARS[e.basetype][2],
-                    ", ", domain(e), ")")
+                println(
+                    inline,
+                    "    _venum(t, ",
+                    slot,
+                    ", ",
+                    SCALARS[e.basetype][2],
+                    ", ",
+                    domain(e),
+                    ")",
+                )
             elseif t == "bool"
                 println(inline, "    _vbool(t, ", slot, ")")
             elseif haskey(SCALARS, t)
@@ -545,69 +750,159 @@ function emitverifier(io::IO, alldecls)
                 et = elemtype(t)
                 if haskey(enums, et) && !enums[et].isunion
                     e = enums[et]
-                    println(refs, "    _venumvector(t, ", slot, ", ",
-                        SCALARS[e.basetype][2], ", ", domain(e),
-                        ", ctx, \"", label, "\"", reqkw, ")")
+                    println(
+                        refs,
+                        "    _venumvector(t, ",
+                        slot,
+                        ", ",
+                        SCALARS[e.basetype][2],
+                        ", ",
+                        domain(e),
+                        ", ctx, \"",
+                        label,
+                        "\"",
+                        reqkw,
+                        ")",
+                    )
                 elseif haskey(SCALARS, et)
-                    println(refs, "    _vvector(t, ", slot, ", ", SCALARS[et][2],
-                        ", ctx", reqkw, ")")
+                    println(
+                        refs,
+                        "    _vvector(t, ",
+                        slot,
+                        ", ",
+                        SCALARS[et][2],
+                        ", ctx",
+                        reqkw,
+                        ")",
+                    )
                 elseif haskey(tables, et) && tables[et].isstruct
-                    println(refs, "    _vvector(t, ", slot, ", ",
-                        structsize(tables[et]), ", ctx", reqkw, ")")
+                    println(
+                        refs,
+                        "    _vvector(t, ",
+                        slot,
+                        ", ",
+                        structsize(tables[et]),
+                        ", ctx",
+                        reqkw,
+                        ")",
+                    )
                 elseif haskey(tables, et)
-                    println(refs, "    _vtablevector(t, ", slot, ", verify_",
-                        jlname(et), ", ctx, depth", reqkw, ")")
+                    println(
+                        refs,
+                        "    _vtablevector(t, ",
+                        slot,
+                        ", verify_",
+                        jlname(et),
+                        ", ctx, depth",
+                        reqkw,
+                        ")",
+                    )
                 else
-                    error("verifier: unsupported vector element '$et' in $(d.name).$(f.name)")
+                    error(
+                        "verifier: unsupported vector element '$et' in $(d.name).$(f.name)",
+                    )
                 end
             elseif haskey(tables, t) && tables[t].isstruct
-                println(inline, "    _vfield(t, ", slot, ", ", structsize(tables[t]), reqkw, ")")
+                println(
+                    inline,
+                    "    _vfield(t, ",
+                    slot,
+                    ", ",
+                    structsize(tables[t]),
+                    reqkw,
+                    ")",
+                )
             elseif haskey(tables, t)
                 println(refs, "    p = _vref(t, ", slot, reqkw, ")")
-                println(refs, "    p === nothing || verify_", jlname(t),
-                    "(bytes, p, ctx, depth + 1)")
+                println(
+                    refs,
+                    "    p === nothing || verify_",
+                    jlname(t),
+                    "(bytes, p, ctx, depth + 1)",
+                )
             else
                 error("verifier: unsupported field type '$t' in $(d.name).$(f.name)")
             end
         end
-        println(io, "function verifyinline_", name,
-            "(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)")
+        println(
+            io,
+            "function verifyinline_",
+            name,
+            "(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)",
+        )
         println(io, "    t = _vtable(bytes, pos)")
         println(io, "    _vvisit!(ctx, \"", name, "\")")
-        println(io, "    depth <= ctx.maxdepth || _vfail(\"metadata nesting exceeds limit\")")
+        println(
+            io,
+            "    depth <= ctx.maxdepth || _vfail(\"metadata nesting exceeds limit\")",
+        )
         print(io, String(take!(inline)))
         println(io, "    return t")
         println(io, "end")
         println(io)
-        println(io, "function verifyrefs_", name,
-            "(t::VTable, ctx::VerifyContext, depth::Base.Int)")
+        println(
+            io,
+            "function verifyrefs_",
+            name,
+            "(t::VTable, ctx::VerifyContext, depth::Base.Int)",
+        )
         println(io, "    bytes = t.bytes")
         print(io, String(take!(refs)))
         println(io, "    return nothing")
         println(io, "end")
         println(io)
-        println(io, "function verify_", name,
-            "(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)")
-        println(io, "    verifyrefs_", name,
-            "(verifyinline_", name, "(bytes, pos, ctx, depth), ctx, depth)")
+        println(
+            io,
+            "function verify_",
+            name,
+            "(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)",
+        )
+        println(
+            io,
+            "    verifyrefs_",
+            name,
+            "(verifyinline_",
+            name,
+            "(bytes, pos, ctx, depth), ctx, depth)",
+        )
         println(io, "    return nothing")
         println(io, "end")
         println(io)
-        println(io, "function verifyrootstart_", name,
-            "(bytes::Vector{UInt8}, ctx::VerifyContext)")
+        println(
+            io,
+            "function verifyrootstart_",
+            name,
+            "(bytes::Vector{UInt8}, ctx::VerifyContext)",
+        )
         println(io, "    length(bytes) >= 4 || _vfail(\"missing root offset\")")
         println(io, "    root = Int64(_vu32(bytes, Int64(0)))")
         println(io, "    root >= 4 || _vfail(\"invalid root offset\")")
         println(io, "    return verifyinline_", name, "(bytes, root, ctx, 0)")
         println(io, "end")
         println(io)
-        println(io, "verifyrootrest_", name,
-            "(t::VTable, ctx::VerifyContext) = verifyrefs_", name, "(t, ctx, 0)")
+        println(
+            io,
+            "verifyrootrest_",
+            name,
+            "(t::VTable, ctx::VerifyContext) = verifyrefs_",
+            name,
+            "(t, ctx, 0)",
+        )
         println(io)
-        println(io, "function verifyroot_", name,
-            "(bytes::Vector{UInt8}, ctx::VerifyContext)")
-        println(io, "    verifyrootrest_", name,
-            "(verifyrootstart_", name, "(bytes, ctx), ctx)")
+        println(
+            io,
+            "function verifyroot_",
+            name,
+            "(bytes::Vector{UInt8}, ctx::VerifyContext)",
+        )
+        println(
+            io,
+            "    verifyrootrest_",
+            name,
+            "(verifyrootstart_",
+            name,
+            "(bytes, ctx), ctx)",
+        )
         println(io, "    return nothing")
         println(io, "end")
         println(io)

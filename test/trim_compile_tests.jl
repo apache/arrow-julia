@@ -29,15 +29,17 @@ using Test
 import Pkg
 
 const _TRIM_SUPPORTED = VERSION >= v"1.12.0-rc1"
-const _JULIAC_ENTRYPOINT_EXPR =
-    "using JuliaC; if isdefined(JuliaC, :main); JuliaC.main(ARGS); else JuliaC._main_cli(ARGS); end"
+const _JULIAC_ENTRYPOINT_EXPR = "using JuliaC; if isdefined(JuliaC, :main); JuliaC.main(ARGS); else JuliaC._main_cli(ARGS); end"
 const _TRIM_COMPILE_TIMEOUT_S = 600.0
 const _TRIM_RUN_TIMEOUT_S = 60.0
 
 function _prepare_trim_project(trim_project::String)::Nothing
     mkpath(trim_project)
-    cp(joinpath(@__DIR__, "trim", "Project.toml"),
-        joinpath(trim_project, "Project.toml"); force=true)
+    cp(
+        joinpath(@__DIR__, "trim", "Project.toml"),
+        joinpath(trim_project, "Project.toml");
+        force=true,
+    )
     original_project = Base.active_project()
     try
         Pkg.activate(trim_project)
@@ -109,9 +111,11 @@ end
                     --output-exe arrowcore_trim --project=$trim_project
                     --experimental --trim=safe $script_path`
                 println("[trim] compile START")
-                exit_code, output, timed_out =
-                    _run_with_timeout(cmd; timeout_s=_TRIM_COMPILE_TIMEOUT_S,
-                        label="compile")
+                exit_code, output, timed_out = _run_with_timeout(
+                    cmd;
+                    timeout_s=_TRIM_COMPILE_TIMEOUT_S,
+                    label="compile",
+                )
                 timed_out && error("trim compile timed out\n$output")
                 errors, warnings = _count_verifier_messages(output)
                 if errors > 0 || warnings > 0 || exit_code != 0
@@ -124,9 +128,11 @@ end
                 @test exit_code == 0
                 binpath = abspath("arrowcore_trim")
                 @test isfile(binpath)
-                run_exit, run_output, run_timed_out =
-                    _run_with_timeout(`$binpath`; timeout_s=_TRIM_RUN_TIMEOUT_S,
-                        label="run")
+                run_exit, run_output, run_timed_out = _run_with_timeout(
+                    `$binpath`;
+                    timeout_s=_TRIM_RUN_TIMEOUT_S,
+                    label="run",
+                )
                 run_timed_out && error("trim executable timed out\n$run_output")
                 if run_exit != 0
                     println("---- trim executable output ----")

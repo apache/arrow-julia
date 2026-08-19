@@ -64,9 +64,10 @@ const CZSTD = CodecZstd
 const ZSTD = CZSTD.LibZstd
 const TS = TranscodingStreams
 
-isdefined(Tables, :Scan) ||
-    error("Arrow 3.0's scan support needs Tables.jl's `Tables.Scan` " *
-          "interface; upgrade Tables.jl (or dev the `jq/scan` branch)")
+isdefined(Tables, :Scan) || error(
+    "Arrow 3.0's scan support needs Tables.jl's `Tables.Scan` " *
+    "interface; upgrade Tables.jl (or dev the `jq/scan` branch)",
+)
 
 include(joinpath("FlatBuffers", "FlatBuffers.jl"))
 const FB = FlatBuffers
@@ -74,13 +75,13 @@ const FB = FlatBuffers
 # Generated metadata bindings + shape verifier (regenerate with
 # `julia tools/fbsgen.jl src/metadata/fbs src/metadata`).
 module Meta
-    using EnumX
-    using ..FlatBuffers
-    include(joinpath("metadata", "Schema.jl"))
-    include(joinpath("metadata", "File.jl"))
-    include(joinpath("metadata", "Message.jl"))
-    include(joinpath("metadata", "VerifierRuntime.jl"))
-    include(joinpath("metadata", "Verifier.jl"))
+using EnumX
+using ..FlatBuffers
+include(joinpath("metadata", "Schema.jl"))
+include(joinpath("metadata", "File.jl"))
+include(joinpath("metadata", "Message.jl"))
+include(joinpath("metadata", "VerifierRuntime.jl"))
+include(joinpath("metadata", "Verifier.jl"))
 end
 
 include("ArrowCore.jl")

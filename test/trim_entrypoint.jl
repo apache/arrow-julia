@@ -45,8 +45,7 @@ function exercise_regions()::Nothing
     # exists to exercise.
     checked(r.root === v, "heap region root identity failed")
     bytes = UInt8[0x7f]
-    fr = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1;
-        root=bytes)
+    fr = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1; root=bytes)
     fb = BufferSlice(fr, 0, 1)
     checked(AC.loadat(fb, UInt8, Int64(0)) == 0x7f, "rooted raw load failed")
     # Each raw load retains its final bounds check in the constrained model.
@@ -72,8 +71,10 @@ function exercise_mmap(dir::String)::Nothing
     b = BufferSlice(r, 0, 8)
     checked(AC.loadat(b, UInt32, Int64(4)) == 0x88776655, "mmap load failed")
     root = r.root
-    checked(root isa Vector{UInt8} && length(root) == 8,
-        "mmap region root is not the stdlib-mapped array")
+    checked(
+        root isa Vector{UInt8} && length(root) == 8,
+        "mmap region root is not the stdlib-mapped array",
+    )
     # Deterministic release: close! unmaps NOW (the Windows delete-a-mapped-
     # file case) and later access is a clean error, not a fault.
     close!(r)
@@ -89,20 +90,26 @@ end
 
 function exercise_cdata()::Nothing
     f0, d = fromjulia("xs", Int64[1, 2, 3])
-    f = Field("xs", f0.type; nullable=f0.nullable,
-        metadata=["mk" => "mv"], children=Field[])
+    f = Field(
+        "xs",
+        f0.type;
+        nullable=f0.nullable,
+        metadata=["mk" => "mv"],
+        children=Field[],
+    )
     sp, ap = to_c_data(f, d)
     f2, d2 = from_c_data(sp, ap)
     validate_semantic(f2, d2)
     checked(getvalue(f2, d2, 3) === Int64(3), "cdata round-trip value failed")
     m2 = f2.metadata
-    checked(m2 !== nothing && length(m2) == 1 && first(m2[1]) == "mk" &&
-        last(m2[1]) == "mv", "cdata metadata round-trip failed")
+    checked(
+        m2 !== nothing && length(m2) == 1 && first(m2[1]) == "mk" && last(m2[1]) == "mv",
+        "cdata metadata round-trip failed",
+    )
     # A column imported over the C seam reads through a caller-supplied
     # static type, fully resolved.
     tm = materialize(Int64, f2, d2)
-    checked(tm isa Vector{Int64} && tm == Int64[1, 2, 3],
-        "cdata typed materialize failed")
+    checked(tm isa Vector{Int64} && tm == Int64[1, 2, 3], "cdata typed materialize failed")
     checked(nullcount(d2) == 0, "cdata round-trip nullcount failed")
     # close! on the imported region runs the foreign release callback now;
     # the export registry must be empty once the consumer releases.
@@ -150,12 +157,10 @@ function exercise_values()::Nothing
     saf, sad = fromjulia("a", Int64[7, 8])
     sbf, sbd = fromjulia("b", ["x", "y"])
     sf = Field("st", StructType(); nullable=false, children=[saf, sbf])
-    sd = AC.ArrayData(StructType(), 2, [BufferSlice()];
-        children=[sad, sbd], nullcount=0)
+    sd = AC.ArrayData(StructType(), 2, [BufferSlice()]; children=[sad, sbd], nullcount=0)
     validate_structural(sf, sd)
     sv = getvalue(sf, sd, 2)
-    checked(sv isa Vector{Pair{String,Any}} && length(sv) == 2,
-        "struct getvalue failed")
+    checked(sv isa Vector{Pair{String,Any}} && length(sv) == 2, "struct getvalue failed")
     df, dd = AC.fromjulia_dict("d", ["lo", "hi"], [0, 1, missing, 0])
     validate_structural(df, dd)
     validate_semantic(df, dd)
@@ -170,29 +175,29 @@ function exercise_typed_values()::Nothing
     f1, c1 = fromjulia("xs", Int64[1, 2, 3])
     checked(getvalue(Int64, f1, c1, 2) === Int64(2), "typed int failed")
     m1 = materialize(Int64, f1, c1)
-    checked(m1 isa Vector{Int64} && m1[3] === Int64(3),
-        "typed int materialize failed")
+    checked(m1 isa Vector{Int64} && m1[3] === Int64(3), "typed int materialize failed")
     f2, c2 = fromjulia("ys", [1.5, missing, 3.5])
     m2 = materialize(Union{Missing,Float64}, f2, c2)
-    checked(m2 isa Vector{Union{Missing,Float64}} && m2[2] === missing,
-        "typed float materialize failed")
+    checked(
+        m2 isa Vector{Union{Missing,Float64}} && m2[2] === missing,
+        "typed float materialize failed",
+    )
     f4, c4 = fromjulia("strs", ["a", "", missing])
-    checked(getvalue(Union{Missing,String}, f4, c4, 1) == "a",
-        "typed string failed")
+    checked(getvalue(Union{Missing,String}, f4, c4, 1) == "a", "typed string failed")
     f5, c5 = fromjulia("lists", [Int64[1, 2], Int64[3], Int64[]])
     m5 = materialize(Vector{Int64}, f5, c5)
-    checked(m5 isa Vector{Vector{Int64}} && m5[1] == Int64[1, 2],
-        "typed list materialize failed")
+    checked(
+        m5 isa Vector{Vector{Int64}} && m5[1] == Int64[1, 2],
+        "typed list materialize failed",
+    )
     saf, sad = fromjulia("a", Int64[7, 8])
     sbf, sbd = fromjulia("b", ["x", "y"])
     sf = Field("st", StructType(); nullable=false, children=[saf, sbf])
-    sd = AC.ArrayData(StructType(), 2, [BufferSlice()];
-        children=[sad, sbd], nullcount=0)
+    sd = AC.ArrayData(StructType(), 2, [BufferSlice()]; children=[sad, sbd], nullcount=0)
     sv = getvalue(NamedTuple{(:a, :b),Tuple{Int64,String}}, sf, sd, 2)
     checked(sv === (a=Int64(8), b="y"), "typed struct failed")
     df, dd = AC.fromjulia_dict("d", ["lo", "hi"], [0, 1, missing, 0])
-    checked(getvalue(Union{Missing,String}, df, dd, 2) == "hi",
-        "typed dictionary failed")
+    checked(getvalue(Union{Missing,String}, df, dd, 2) == "hi", "typed dictionary failed")
     # Four HETEROGENEOUS NamedTuple fields, both entry points: ntuple
     # closures erase per-field types at this arity — the unrolled struct
     # row must stay fully resolved.
@@ -200,17 +205,22 @@ function exercise_typed_values()::Nothing
     h2f, h2d = fromjulia("b", [1.5, 2.5])
     h3f, h3d = fromjulia("c", ["x", "y"])
     h4f, h4d = fromjulia("flag", [true, false])
-    hf = Field("st4", StructType(); nullable=false,
-        children=[h1f, h2f, h3f, h4f])
-    hd = AC.ArrayData(StructType(), 2, [BufferSlice()];
-        children=[h1d, h2d, h3d, h4d], nullcount=0)
+    hf = Field("st4", StructType(); nullable=false, children=[h1f, h2f, h3f, h4f])
+    hd = AC.ArrayData(
+        StructType(),
+        2,
+        [BufferSlice()];
+        children=[h1d, h2d, h3d, h4d],
+        nullcount=0,
+    )
     NT4 = NamedTuple{(:a, :b, :c, :flag),Tuple{Int64,Float64,String,Bool}}
     hv = getvalue(NT4, hf, hd, 2)
-    checked(hv === (a=Int64(2), b=2.5, c="y", flag=false),
-        "typed 4-field struct getvalue failed")
+    checked(
+        hv === (a=Int64(2), b=2.5, c="y", flag=false),
+        "typed 4-field struct getvalue failed",
+    )
     hm = materialize(NT4, hf, hd)
-    checked(hm isa Vector{NT4} && hm[1].c == "x",
-        "typed 4-field struct materialize failed")
+    checked(hm isa Vector{NT4} && hm[1].c == "x", "typed 4-field struct materialize failed")
     # The claim is exact: a mismatched static type refuses, never converts.
     caught = false
     try

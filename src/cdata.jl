@@ -61,7 +61,6 @@
 #     move/release handoffs.
 # =============================================================================
 
-
 # ---------------------------------------------------------------------------
 # ABI structs (field-exact per https://arrow.apache.org/docs/format/CDataInterface.html)
 # ---------------------------------------------------------------------------
@@ -94,19 +93,20 @@ end
 const ARROW_FLAG_NULLABLE = Int64(2)
 const ARROW_FLAG_DICTIONARY_ORDERED = Int64(1)
 const ARROW_FLAG_MAP_KEYS_SORTED = Int64(4)
-const ARROW_FLAG_ALL_SUPPORTED = ARROW_FLAG_NULLABLE |
-    ARROW_FLAG_DICTIONARY_ORDERED | ARROW_FLAG_MAP_KEYS_SORTED
+const ARROW_FLAG_ALL_SUPPORTED =
+    ARROW_FLAG_NULLABLE | ARROW_FLAG_DICTIONARY_ORDERED | ARROW_FLAG_MAP_KEYS_SORTED
 
 # ---------------------------------------------------------------------------
 # Format strings <-> Core descriptors (parity with Core's accessor set)
 # ---------------------------------------------------------------------------
 
-_tuchar(u) = u == AC.SECOND ? "s" : u == AC.MILLISECOND ? "m" :
-    u == AC.MICROSECOND ? "u" : "n"
+_tuchar(u) =
+    u == AC.SECOND ? "s" : u == AC.MILLISECOND ? "m" : u == AC.MICROSECOND ? "u" : "n"
 
-formatstring(t::IntType) =
-    (t.signed ? Dict(8 => "c", 16 => "s", 32 => "i", 64 => "l") :
-     Dict(8 => "C", 16 => "S", 32 => "I", 64 => "L"))[t.bits]
+formatstring(t::IntType) = (
+    t.signed ? Dict(8 => "c", 16 => "s", 32 => "i", 64 => "l") :
+    Dict(8 => "C", 16 => "S", 32 => "I", 64 => "L")
+)[t.bits]
 formatstring(t::FloatType) = Dict(16 => "e", 32 => "f", 64 => "g")[t.bits]
 formatstring(::BoolType) = "b"
 formatstring(::NullType) = "n"
@@ -114,15 +114,13 @@ formatstring(t::Utf8Type) = t.large ? "U" : "u"
 formatstring(t::BinaryType) = t.large ? "Z" : "z"
 formatstring(t::FixedSizeBinaryType) = "w:$(t.nbytes)"
 formatstring(t::DecimalType) =
-    t.bits == 128 ? "d:$(t.precision),$(t.scale)" :
-    "d:$(t.precision),$(t.scale),$(t.bits)"
+    t.bits == 128 ? "d:$(t.precision),$(t.scale)" : "d:$(t.precision),$(t.scale),$(t.bits)"
 formatstring(t::DateType) = t.unit == AC.DAY ? "tdD" : "tdm"
 formatstring(t::TimeType) = "tt" * _tuchar(t.unit)
-formatstring(t::TimestampType) =
-    "ts" * _tuchar(t.unit) * ":" * something(t.timezone, "")
+formatstring(t::TimestampType) = "ts" * _tuchar(t.unit) * ":" * something(t.timezone, "")
 formatstring(t::DurationType) = "tD" * _tuchar(t.unit)
-formatstring(t::IntervalType) = t.unit == AC.YEAR_MONTH ? "tiM" :
-    t.unit == AC.DAY_TIME ? "tiD" : "tin"
+formatstring(t::IntervalType) =
+    t.unit == AC.YEAR_MONTH ? "tiM" : t.unit == AC.DAY_TIME ? "tiD" : "tin"
 formatstring(t::ListType) = t.large ? "+L" : "+l"
 formatstring(t::FixedSizeListType) = "+w:$(t.listsize)"
 formatstring(::StructType) = "+s"
@@ -162,17 +160,14 @@ formatstring(::RunEndEncodedType) = "+r"
     throw(ArgumentError("unregistered ArrowType"))
 end
 
-_formaterror(fmt) = throw(ValidationError(
-    "unsupported C format string \"$fmt\""))
+_formaterror(fmt) = throw(ValidationError("unsupported C format string \"$fmt\""))
 
 function _parseformatint(fmt, s, what; low=0, high=typemax(Int32))
     bytes = codeunits(s)
-    isempty(bytes) &&
-        throw(ValidationError("invalid $what in C format string \"$fmt\""))
+    isempty(bytes) && throw(ValidationError("invalid $what in C format string \"$fmt\""))
     firstdigit = 1
     if bytes[1] == UInt8('-')
-        low < 0 ||
-            throw(ValidationError("invalid $what in C format string \"$fmt\""))
+        low < 0 || throw(ValidationError("invalid $what in C format string \"$fmt\""))
         length(bytes) > 1 ||
             throw(ValidationError("invalid $what in C format string \"$fmt\""))
         firstdigit = 2
@@ -187,10 +182,10 @@ function _parseformatint(fmt, s, what; low=0, high=typemax(Int32))
     return Int(n)
 end
 
-_parsetimeunit(fmt, c) = c == UInt8('s') ? AC.SECOND :
+_parsetimeunit(fmt, c) =
+    c == UInt8('s') ? AC.SECOND :
     c == UInt8('m') ? AC.MILLISECOND :
-    c == UInt8('u') ? AC.MICROSECOND :
-    c == UInt8('n') ? AC.NANOSECOND : _formaterror(fmt)
+    c == UInt8('u') ? AC.MICROSECOND : c == UInt8('n') ? AC.NANOSECOND : _formaterror(fmt)
 
 function _parseunionids(fmt, body)
     ids = Int8[]
@@ -213,14 +208,12 @@ function _parseunionids(fmt, body)
         if UInt8('0') <= b <= UInt8('9')
             have_digit = true
             value = 10 * value + Int(b - UInt8('0'))
-            value <= 127 ||
-                throw(ValidationError("union type ids must be in [0, 127]"))
+            value <= 127 || throw(ValidationError("union type ids must be in [0, 127]"))
         elseif b == UInt8(',')
             have_digit ||
                 throw(ValidationError("invalid union type id in C format string \"$fmt\""))
             bit = UInt128(1) << value
-            seen & bit == 0 ||
-                throw(ValidationError("union type ids must be unique"))
+            seen & bit == 0 || throw(ValidationError("union type ids must be unique"))
             push!(ids, Int8(value))
             seen |= bit
             value = 0
@@ -265,17 +258,25 @@ function parseformat(fmt::AbstractString, flags::Int64=0)::ArrowType
     fmt == "tiM" && return IntervalType(AC.YEAR_MONTH)
     fmt == "tiD" && return IntervalType(AC.DAY_TIME)
     fmt == "tin" && return IntervalType(AC.MONTH_DAY_NANO)
-    m = Dict("c" => (8, true), "C" => (8, false), "s" => (16, true), "S" => (16, false),
-        "i" => (32, true), "I" => (32, false), "l" => (64, true), "L" => (64, false))
+    m = Dict(
+        "c" => (8, true),
+        "C" => (8, false),
+        "s" => (16, true),
+        "S" => (16, false),
+        "i" => (32, true),
+        "I" => (32, false),
+        "l" => (64, true),
+        "L" => (64, false),
+    )
     haskey(m, fmt) && return IntType(m[fmt]...)
     if ncodeunits(fmt) == 3 && startswith(fmt, "tt")
         u = _parsetimeunit(fmt, codeunit(fmt, 3))
         return TimeType(u, u == AC.SECOND || u == AC.MILLISECOND ? 32 : 64)
     end
-    ncodeunits(fmt) == 3 && startswith(fmt, "tD") &&
+    ncodeunits(fmt) == 3 &&
+        startswith(fmt, "tD") &&
         return DurationType(_parsetimeunit(fmt, codeunit(fmt, 3)))
-    if startswith(fmt, "ts") && ncodeunits(fmt) >= 4 &&
-        codeunit(fmt, 4) == UInt8(':')
+    if startswith(fmt, "ts") && ncodeunits(fmt) >= 4 && codeunit(fmt, 4) == UInt8(':')
         u = _parsetimeunit(fmt, codeunit(fmt, 3))
         tz = SubString(fmt, 5)
         return TimestampType(u, isempty(tz) ? nothing : String(tz))
@@ -291,10 +292,9 @@ function parseformat(fmt::AbstractString, flags::Int64=0)::ArrowType
         2 <= length(parts) <= 3 ||
             throw(ValidationError("invalid decimal C format string \"$fmt\""))
         precision = _parseformatint(fmt, parts[1], "decimal precision")
-        scale = _parseformatint(fmt, parts[2], "decimal scale";
-            low=typemin(Int32))
-        bits = length(parts) == 3 ?
-            _parseformatint(fmt, parts[3], "decimal bit width") : 128
+        scale = _parseformatint(fmt, parts[2], "decimal scale"; low=typemin(Int32))
+        bits =
+            length(parts) == 3 ? _parseformatint(fmt, parts[3], "decimal bit width") : 128
         t = DecimalType(precision, scale, bits)
         AC._validate_descriptor(t)
         return t
@@ -486,7 +486,11 @@ end
 
 function _release_array(a::Ptr{CArrowArray})
     committed_slot = Ref(false)
-    claimed_slot = Ref{Union{Nothing,Tuple{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}}}(nothing)
+    claimed_slot = Ref{
+        Union{Nothing,Tuple{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}},
+    }(
+        nothing,
+    )
     try
         claimed = _claim_array_node(a, claimed_slot)
         claimed === nothing && return nothing
@@ -508,7 +512,11 @@ end
 
 function _release_schema(s::Ptr{CArrowSchema})
     committed_slot = Ref(false)
-    claimed_slot = Ref{Union{Nothing,Tuple{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}}}(nothing)
+    claimed_slot = Ref{
+        Union{Nothing,Tuple{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}},
+    }(
+        nothing,
+    )
     try
         claimed = _claim_schema_node(s, claimed_slot)
         claimed === nothing && return nothing
@@ -534,8 +542,12 @@ end
 end
 _store_field!(p, name::Symbol, v) = _store_field!(p, Val(name), v)
 
-function _malloc!(root::ExportedRoot, n::Integer,
-    register! = push!, deallocate! = Libc.free)
+function _malloc!(
+    root::ExportedRoot,
+    n::Integer,
+    (register!)=push!,
+    (deallocate!)=Libc.free,
+)
     n >= 0 || throw(ArgumentError("negative export allocation size"))
     n64 = Int64(n)
     # Reserve the ledger slot before acquiring native memory. After malloc,
@@ -555,8 +567,7 @@ function _malloc!(root::ExportedRoot, n::Integer,
             if length(root.mallocs) == oldlen
                 deallocate!(p)
                 owned = false
-            elseif length(root.mallocs) == oldlen + 1 &&
-                    root.mallocs[end] == p
+            elseif length(root.mallocs) == oldlen + 1 && root.mallocs[end] == p
                 owned = false
             else
                 error("export malloc registration left an invalid ledger state")
@@ -572,8 +583,10 @@ Encode field metadata per the C data interface: int32 pair count, then
 per pair an int32 key length, key bytes, int32 value length, value bytes
 (native endian, not NUL-terminated). NULL when there is no metadata.
 """
-function _cmetadata!(root::ExportedRoot,
-    metadata::Union{Nothing,AC.FrozenVector{Pair{String,String}}})::Ptr{UInt8}
+function _cmetadata!(
+    root::ExportedRoot,
+    metadata::Union{Nothing,AC.FrozenVector{Pair{String,String}}},
+)::Ptr{UInt8}
     metadata === nothing && return Ptr{UInt8}(C_NULL)
     n = length(metadata)
     n == 0 && return Ptr{UInt8}(C_NULL)
@@ -613,16 +626,20 @@ function _newcontrol!(root::ExportedRoot)
     return control
 end
 
-function _export_schema!(root::ExportedRoot, f::Field,
-    release::Ptr{Cvoid})::Ptr{CArrowSchema}
+function _export_schema!(
+    root::ExportedRoot,
+    f::Field,
+    release::Ptr{Cvoid},
+)::Ptr{CArrowSchema}
     p = Ptr{CArrowSchema}(_malloc!(root, sizeof(CArrowSchema)))
     childfields = f.type isa DictionaryType ? Field[] : f.children
     nchildren = length(childfields)
     canonical_children = Ptr{CArrowSchema}[]
     childptrs = Ptr{Ptr{CArrowSchema}}(C_NULL)
     if nchildren > 0
-        childptrs = Ptr{Ptr{CArrowSchema}}(_malloc!(root,
-            AC.checked_mul(Int64(nchildren), Int64(sizeof(Ptr)))))
+        childptrs = Ptr{Ptr{CArrowSchema}}(
+            _malloc!(root, AC.checked_mul(Int64(nchildren), Int64(sizeof(Ptr)))),
+        )
         for (i, cf) in enumerate(childfields)
             child = _export_schema!(root, cf, release)
             push!(canonical_children, child)
@@ -634,27 +651,36 @@ function _export_schema!(root::ExportedRoot, f::Field,
         dict = _export_schema!(root, AC.dictvaluefield(f, f.type), release)
     end
     flags = f.nullable ? ARROW_FLAG_NULLABLE : Int64(0)
-    f.type isa DictionaryType && f.type.ordered &&
-        (flags |= ARROW_FLAG_DICTIONARY_ORDERED)
-    f.type isa MapType && f.type.keyssorted &&
-        (flags |= ARROW_FLAG_MAP_KEYS_SORTED)
+    f.type isa DictionaryType && f.type.ordered && (flags |= ARROW_FLAG_DICTIONARY_ORDERED)
+    f.type isa MapType && f.type.keyssorted && (flags |= ARROW_FLAG_MAP_KEYS_SORTED)
     control = _newcontrol!(root)
-    unsafe_store!(p, CArrowSchema(
-        _cstring!(root, formatstring_of(f.type)),
-        _cstring!(root, f.name),
-        # Field metadata rides the OUTER node for every field, dictionary
-        # wrappers included — the C++ bridge exports field.metadata() on
-        # the wrapper and only TYPE metadata (extensions) on the dependent
-        # value node, and PyArrow imports only the wrapper's pairs.
-        _cmetadata!(root, f.metadata),
-        flags, nchildren, childptrs, dict,
-        release, control))
+    unsafe_store!(
+        p,
+        CArrowSchema(
+            _cstring!(root, formatstring_of(f.type)),
+            _cstring!(root, f.name),
+            # Field metadata rides the OUTER node for every field, dictionary
+            # wrappers included — the C++ bridge exports field.metadata() on
+            # the wrapper and only TYPE metadata (extensions) on the dependent
+            # value node, and PyArrow imports only the wrapper's pairs.
+            _cmetadata!(root, f.metadata),
+            flags,
+            nchildren,
+            childptrs,
+            dict,
+            release,
+            control,
+        ),
+    )
     root.schema_topology[control] = (canonical_children, dict)
     return p
 end
 
-function _export_array!(root::ExportedRoot, d::ArrayData,
-    release::Ptr{Cvoid})::Ptr{CArrowArray}
+function _export_array!(
+    root::ExportedRoot,
+    d::ArrayData,
+    release::Ptr{Cvoid},
+)::Ptr{CArrowArray}
     p = Ptr{CArrowArray}(_malloc!(root, sizeof(CArrowArray)))
     spec = AC.layoutspec_of(d.type)
     ncore = length(d.buffers)
@@ -663,33 +689,34 @@ function _export_array!(root::ExportedRoot, d::ArrayData,
     # toward n_buffers here and nowhere else in the format.
     nvariadic = spec.variadic ? ncore - length(spec.buffers) : 0
     nbuf = spec.variadic ? ncore + 1 : ncore
-    bufptrs = Ptr{Ptr{Cvoid}}(_malloc!(root,
-        AC.checked_mul(Int64(max(nbuf, 1)), Int64(sizeof(Ptr)))))
+    bufptrs = Ptr{Ptr{Cvoid}}(
+        _malloc!(root, AC.checked_mul(Int64(max(nbuf, 1)), Int64(sizeof(Ptr)))),
+    )
     for (i, b) in enumerate(d.buffers)
         role = i <= length(spec.buffers) ? spec.buffers[i] : AC.DATA
-        bufferp = if role == AC.OFFSETS && d.len == 0 && d.offset == 0 &&
-            AC.isempty_buffer(b)
-            # Core's canonical empty representation omits this otherwise
-            # unused allocation. C Data still exposes the Columnar
-            # length+1 offsets buffer, so root one terminal zero in the
-            # export aggregate without changing the Core array.
-            zerop = Ptr{UInt8}(_malloc!(root, spec.offsetwidth))
-            for j = 1:spec.offsetwidth
-                unsafe_store!(zerop, UInt8(0), j)
+        bufferp =
+            if role == AC.OFFSETS && d.len == 0 && d.offset == 0 && AC.isempty_buffer(b)
+                # Core's canonical empty representation omits this otherwise
+                # unused allocation. C Data still exposes the Columnar
+                # length+1 offsets buffer, so root one terminal zero in the
+                # export aggregate without changing the Core array.
+                zerop = Ptr{UInt8}(_malloc!(root, spec.offsetwidth))
+                for j = 1:spec.offsetwidth
+                    unsafe_store!(zerop, UInt8(0), j)
+                end
+                Ptr{Cvoid}(zerop)
+            elseif AC.isempty_buffer(b)
+                # An absent validity bitmap, or any actual zero-byte buffer, is
+                # represented by a NULL pointer.
+                Ptr{Cvoid}(C_NULL)
+            else
+                Ptr{Cvoid}(AC.sliceptr(b))
             end
-            Ptr{Cvoid}(zerop)
-        elseif AC.isempty_buffer(b)
-            # An absent validity bitmap, or any actual zero-byte buffer, is
-            # represented by a NULL pointer.
-            Ptr{Cvoid}(C_NULL)
-        else
-            Ptr{Cvoid}(AC.sliceptr(b))
-        end
         unsafe_store!(bufptrs, bufferp, i)
     end
     if spec.variadic
-        sizesp = Ptr{Int64}(_malloc!(root,
-            AC.checked_mul(Int64(max(nvariadic, 1)), Int64(8))))
+        sizesp =
+            Ptr{Int64}(_malloc!(root, AC.checked_mul(Int64(max(nvariadic, 1)), Int64(8))))
         for k = 1:nvariadic
             unsafe_store!(sizesp, d.buffers[length(spec.buffers) + k].len, k)
         end
@@ -699,26 +726,39 @@ function _export_array!(root::ExportedRoot, d::ArrayData,
     canonical_children = Ptr{CArrowArray}[]
     childptrs = Ptr{Ptr{CArrowArray}}(C_NULL)
     if nchildren > 0
-        childptrs = Ptr{Ptr{CArrowArray}}(_malloc!(root,
-            AC.checked_mul(Int64(nchildren), Int64(sizeof(Ptr)))))
+        childptrs = Ptr{Ptr{CArrowArray}}(
+            _malloc!(root, AC.checked_mul(Int64(nchildren), Int64(sizeof(Ptr)))),
+        )
         for (i, c) in enumerate(d.children)
             child = _export_array!(root, c, release)
             push!(canonical_children, child)
             unsafe_store!(childptrs, child, i)
         end
     end
-    dict = d.dictionary === nothing ? Ptr{CArrowArray}(C_NULL) :
+    dict =
+        d.dictionary === nothing ? Ptr{CArrowArray}(C_NULL) :
         _export_array!(root, d.dictionary, release)
     control = _newcontrol!(root)
-    unsafe_store!(p, CArrowArray(d.len, nullcount(d), d.offset, nbuf,
-        nchildren, bufptrs, childptrs, dict,
-        release, control))
+    unsafe_store!(
+        p,
+        CArrowArray(
+            d.len,
+            nullcount(d),
+            d.offset,
+            nbuf,
+            nchildren,
+            bufptrs,
+            childptrs,
+            dict,
+            release,
+            control,
+        ),
+    )
     root.array_topology[control] = (canonical_children, dict)
     return p
 end
 
-function _build_c_data!(sp, skey, ap, akey, f::Field, d::ArrayData,
-    arel, srel)
+function _build_c_data!(sp, skey, ap, akey, f::Field, d::ArrayData, arel, srel)
     _newroot(Any[f]; result_slot=sp, key_slot=skey) do root
         _export_schema!(root, f, srel)
     end
@@ -844,8 +884,7 @@ function _cleanup_export_slots!(sp, skey, ap, akey)
     return nothing
 end
 
-function _newroot(build, roots::Vector{Any};
-    result_slot=nothing, key_slot=nothing)
+function _newroot(build, roots::Vector{Any}; result_slot=nothing, key_slot=nothing)
     # key and root are single-assignment BEFORE the try: reassignment of a
     # closure-captured local boxes it, which the trim verifier rejects.
     # Nothing before the try owns native memory, so there is nothing to
@@ -853,9 +892,14 @@ function _newroot(build, roots::Vector{Any};
     key = lock(REGISTRY_LOCK) do
         NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
     end
-    root = ExportedRoot(roots, Ptr{Cvoid}[], key, 0,
+    root = ExportedRoot(
+        roots,
+        Ptr{Cvoid}[],
+        key,
+        0,
         Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}(),
-        Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}())::ExportedRoot
+        Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}(),
+    )::ExportedRoot
     try
         # The pointer cannot escape before `build` returns. Keep the root
         # private until then: publishing it with `remaining == 0` would let a
@@ -904,8 +948,8 @@ set, remains the owner.
 """
 mutable struct ForeignOwner
     const arrayblock::Ptr{CArrowArray} # malloc'd copy of the moved struct: a
-                                       # stable native address for the
-                                       # producer's release callback
+    # stable native address for the
+    # producer's release callback
     const producer_release::Ptr{Cvoid} # the moved struct's real callback
     @atomic released::Bool             # one swap picks the single releaser
     # ONE revocation cell for every OwnerRegion built over this import: the
@@ -919,8 +963,7 @@ mutable struct ForeignOwner
         block == C_NULL && throw(OutOfMemoryError())
         p = Ptr{CArrowArray}(block)
         slot = Ref{Any}(nothing)
-        cell = AC.ReleaseCell(
-            @cfunction(_release_owner_action, Cvoid, (Ptr{Cvoid},)), slot)
+        cell = AC.ReleaseCell(@cfunction(_release_owner_action, Cvoid, (Ptr{Cvoid},)), slot)
         o = try
             unsafe_store!(p, arr)
             _store_field!(p, Val(:release), Ptr{Cvoid}(C_NULL))  # inert until armed
@@ -1003,9 +1046,10 @@ function _release_foreign_owner!(o::ForeignOwner, deallocate!)
         cb = unsafe_load(o.arrayblock).release
         if cb != C_NULL
             ccall(cb, Cvoid, (Ptr{CArrowArray},), o.arrayblock)
-            unsafe_load(o.arrayblock).release == C_NULL ||
-                (deallocate!(o.arrayblock);
-                    error("C Data producer release did not mark the structure released"))
+            unsafe_load(o.arrayblock).release == C_NULL || (
+                deallocate!(o.arrayblock);
+                error("C Data producer release did not mark the structure released")
+            )
         end
         deallocate!(o.arrayblock)
     end
@@ -1030,11 +1074,13 @@ runs on the declared geometry. The imported column passes the semantic tier
 the caller's opt-in for content policy. A failed import releases the moved
 tree exactly once.
 """
-from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}) =
-    _from_c_data(sp, ap)
+from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}) = _from_c_data(sp, ap)
 
-function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray};
-    ownerfactory=ForeignOwner)
+function _from_c_data(
+    sp::Ptr{CArrowSchema},
+    ap::Ptr{CArrowArray};
+    ownerfactory=ForeignOwner,
+)
     sp == C_NULL && throw(ArgumentError("ArrowSchema pointer is NULL"))
     ap == C_NULL && throw(ArgumentError("ArrowArray pointer is NULL"))
     sch = unsafe_load(sp)
@@ -1064,7 +1110,8 @@ function _from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray};
         # Before the move, the caller's source remains the owner. After the
         # move, this local copy must release exactly once even when finalizer
         # registration or later validation failed.
-        owner !== nothing && unsafe_load(ap).release == C_NULL &&
+        owner !== nothing &&
+            unsafe_load(ap).release == C_NULL &&
             _release_moved_owner!(owner)
         rethrow()
     end
@@ -1077,7 +1124,8 @@ function _preflight_schema(sch::CArrowSchema, depth::Int=0)
     sch.n_children >= 0 || throw(ValidationError("negative C schema child count"))
     sch.n_children <= 1_000_000 ||
         throw(ValidationError("C schema child count exceeds import limit"))
-    sch.n_children == 0 || sch.children != C_NULL ||
+    sch.n_children == 0 ||
+        sch.children != C_NULL ||
         throw(ValidationError("C schema child table is NULL"))
     for i = 1:sch.n_children
         childptr = unsafe_load(sch.children, i)
@@ -1100,9 +1148,11 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
         throw(ValidationError("invalid C array null count $(arr.null_count)"))
     arr.n_buffers >= 0 || throw(ValidationError("negative C array buffer count"))
     arr.n_children >= 0 || throw(ValidationError("negative C array child count"))
-    arr.n_buffers == 0 || arr.buffers != C_NULL ||
+    arr.n_buffers == 0 ||
+        arr.buffers != C_NULL ||
         throw(ValidationError("C array buffer table is NULL"))
-    arr.n_children == 0 || arr.children != C_NULL ||
+    arr.n_children == 0 ||
+        arr.children != C_NULL ||
         throw(ValidationError("C array child table is NULL"))
 
     spec = AC.layoutspec_of(f.type)
@@ -1110,15 +1160,24 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
     if spec.variadic
         # validity + views + N variadic data buffers + the trailing int64
         # sizes buffer: at least the fixed pair plus the sizes buffer.
-        Int64(arr.n_buffers) >= expected_buffers + 1 ||
-            throw(ValidationError("view layout $(typeof(f.type)) requires at least $(expected_buffers + 1) buffers, producer sent $(arr.n_buffers)"))
+        Int64(arr.n_buffers) >= expected_buffers + 1 || throw(
+            ValidationError(
+                "view layout $(typeof(f.type)) requires at least $(expected_buffers + 1) buffers, producer sent $(arr.n_buffers)",
+            ),
+        )
     else
-        Int64(arr.n_buffers) == expected_buffers ||
-            throw(ValidationError("layout $(typeof(f.type)) declares $expected_buffers buffers, producer sent $(arr.n_buffers)"))
+        Int64(arr.n_buffers) == expected_buffers || throw(
+            ValidationError(
+                "layout $(typeof(f.type)) declares $expected_buffers buffers, producer sent $(arr.n_buffers)",
+            ),
+        )
     end
     expected_children = spec.childcount == -1 ? length(f.children) : spec.childcount
-    Int64(arr.n_children) == expected_children ||
-        throw(ValidationError("layout $(typeof(f.type)) declares $expected_children children, producer sent $(arr.n_children)"))
+    Int64(arr.n_children) == expected_children || throw(
+        ValidationError(
+            "layout $(typeof(f.type)) declares $expected_children children, producer sent $(arr.n_children)",
+        ),
+    )
 
     for i = 1:arr.n_children
         childptr = unsafe_load(arr.children, i)
@@ -1130,8 +1189,11 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
     if f.type isa DictionaryType
         arr.dictionary != C_NULL ||
             throw(ValidationError("dictionary C array has no dictionary values"))
-        _preflight_array(AC.dictvaluefield(f, f.type),
-            unsafe_load(arr.dictionary), depth + 1)
+        _preflight_array(
+            AC.dictvaluefield(f, f.type),
+            unsafe_load(arr.dictionary),
+            depth + 1,
+        )
     elseif arr.dictionary != C_NULL
         throw(ValidationError("non-dictionary C array has dictionary values"))
     end
@@ -1166,9 +1228,12 @@ function _import_cstring(p::Ptr{UInt8}, what::AbstractString)
     # touched — a guard page there must produce this refusal, not SIGBUS.
     n = Int64(0)
     while true
-        n >= CSTRING_SCAN_LIMIT && throw(ValidationError(
-            "C Data $what has no NUL terminator within " *
-            "$(CSTRING_SCAN_LIMIT) bytes"))
+        n >= CSTRING_SCAN_LIMIT && throw(
+            ValidationError(
+                "C Data $what has no NUL terminator within " *
+                "$(CSTRING_SCAN_LIMIT) bytes",
+            ),
+        )
         unsafe_load(p + n) == 0x00 && break
         n += 1
     end
@@ -1180,13 +1245,10 @@ end
 function _validate_schema_flags(sch::CArrowSchema, fmt::AbstractString)
     sch.flags & ~ARROW_FLAG_ALL_SUPPORTED == 0 ||
         throw(ValidationError("C schema contains unsupported flag bits"))
-    (sch.flags & ARROW_FLAG_DICTIONARY_ORDERED == 0 ||
-        sch.dictionary != C_NULL) ||
-        throw(ValidationError(
-            "ARROW_FLAG_DICTIONARY_ORDERED requires a dictionary schema"))
+    (sch.flags & ARROW_FLAG_DICTIONARY_ORDERED == 0 || sch.dictionary != C_NULL) ||
+        throw(ValidationError("ARROW_FLAG_DICTIONARY_ORDERED requires a dictionary schema"))
     (sch.flags & ARROW_FLAG_MAP_KEYS_SORTED == 0 || fmt == "+m") ||
-        throw(ValidationError(
-            "ARROW_FLAG_MAP_KEYS_SORTED requires a map schema"))
+        throw(ValidationError("ARROW_FLAG_MAP_KEYS_SORTED requires a map schema"))
     return nothing
 end
 
@@ -1202,11 +1264,13 @@ function _import_cmetadata(p::Ptr{UInt8})
     out = Pair{String,String}[]
     for _ = 1:n
         klen = unsafe_load(Ptr{Int32}(p + off))
-        klen < 0 && throw(ValidationError("C schema metadata declares a negative key length"))
+        klen < 0 &&
+            throw(ValidationError("C schema metadata declares a negative key length"))
         k = unsafe_string(p + off + 4, klen)
         off += 4 + Int64(klen)
         vlen = unsafe_load(Ptr{Int32}(p + off))
-        vlen < 0 && throw(ValidationError("C schema metadata declares a negative value length"))
+        vlen < 0 &&
+            throw(ValidationError("C schema metadata declares a negative value length"))
         v = unsafe_string(p + off + 4, vlen)
         off += 4 + Int64(vlen)
         push!(out, k => v)
@@ -1227,10 +1291,19 @@ function _import_field(sch::CArrowSchema)::Field
     spec = AC.layoutspec_of(t)
     expected_children = spec.childcount
     if expected_children >= 0 && sch.n_children != expected_children
-        throw(ValidationError("C schema for $(typeof(t)) declares $(sch.n_children) children; expected $expected_children"))
+        throw(
+            ValidationError(
+                "C schema for $(typeof(t)) declares $(sch.n_children) children; expected $expected_children",
+            ),
+        )
     end
-    t isa UnionType && length(t.typeids) != sch.n_children &&
-        throw(ValidationError("union format declares $(length(t.typeids)) type ids for $(sch.n_children) children"))
+    t isa UnionType &&
+        length(t.typeids) != sch.n_children &&
+        throw(
+            ValidationError(
+                "union format declares $(length(t.typeids)) type ids for $(sch.n_children) children",
+            ),
+        )
 
     children = Field[]
     for i = 1:sch.n_children
@@ -1238,7 +1311,8 @@ function _import_field(sch::CArrowSchema)::Field
     end
     if sch.dictionary != C_NULL
         vf = _import_field(unsafe_load(sch.dictionary))
-        t isa IntType || throw(ValidationError("dictionary index format must be an integer"))
+        t isa IntType ||
+            throw(ValidationError("dictionary index format must be an integer"))
         isempty(children) ||
             throw(ValidationError("dictionary index schema must not have children"))
         ordered = (sch.flags & ARROW_FLAG_DICTIONARY_ORDERED) != 0
@@ -1246,23 +1320,28 @@ function _import_field(sch::CArrowSchema)::Field
         # first; duplicate keys are legal): Core's one slot cannot express
         # the two-node attribution, but no pair is lost.
         vmeta = vf.metadata
-        dmeta = meta === nothing ?
-            (vmeta === nothing ? nothing :
-             collect(Pair{String,String}, vmeta)) :
-            (vmeta === nothing ? meta :
-             vcat(meta, collect(Pair{String,String}, vmeta)))
+        dmeta =
+            meta === nothing ?
+            (vmeta === nothing ? nothing : collect(Pair{String,String}, vmeta)) :
+            (vmeta === nothing ? meta : vcat(meta, collect(Pair{String,String}, vmeta)))
         # Branch on the metadata's presence: a Union-typed keyword makes
         # the kwcall tuple imprecise, which trim cannot resolve.
-        dmeta === nothing && return Field(name,
+        dmeta === nothing && return Field(
+            name,
             DictionaryType(t, vf.type, ordered);
-            nullable=nullable, children=vf.children)
-        return Field(name, DictionaryType(t, vf.type, ordered);
-            nullable=nullable, metadata=dmeta, children=vf.children)
+            nullable=nullable,
+            children=vf.children,
+        )
+        return Field(
+            name,
+            DictionaryType(t, vf.type, ordered);
+            nullable=nullable,
+            metadata=dmeta,
+            children=vf.children,
+        )
     end
-    meta === nothing &&
-        return Field(name, t; nullable=nullable, children=children)
-    return Field(name, t; nullable=nullable, metadata=meta,
-        children=children)
+    meta === nothing && return Field(name, t; nullable=nullable, children=children)
+    return Field(name, t; nullable=nullable, metadata=meta, children=children)
 end
 
 """
@@ -1281,12 +1360,13 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
     for (i, role) in enumerate(spec.buffers)
         p = bufferptr(arr, i)
         nbytes = if role == AC.VALIDITY
-            p == C_NULL && total > 0 && arr.null_count != 0 &&
+            p == C_NULL &&
+                total > 0 &&
+                arr.null_count != 0 &&
                 throw(ValidationError("NULL validity buffer requires null_count == 0"))
             p == C_NULL ? Int64(0) : AC.expected_validity_bytes(total)
         elseif role == AC.OFFSETS
-            AC.checked_mul(AC.checked_add(total, Int64(1)),
-                Int64(spec.offsetwidth))
+            AC.checked_mul(AC.checked_add(total, Int64(1)), Int64(spec.offsetwidth))
         elseif role == AC.DATA
             if spec.fixedwidth > 0
                 AC.checked_mul(total, Int64(spec.fixedwidth))
@@ -1299,11 +1379,9 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
                     Int64(0)
                 else
                     finaloffset = if spec.offsetwidth == 8
-                        AC.loadat(offsets_slice, Int64,
-                            AC.checked_mul(total, Int64(8)))
+                        AC.loadat(offsets_slice, Int64, AC.checked_mul(total, Int64(8)))
                     else
-                        Int64(AC.loadat(offsets_slice, Int32,
-                            AC.checked_mul(total, Int64(4))))
+                        Int64(AC.loadat(offsets_slice, Int32, AC.checked_mul(total, Int64(4))))
                     end
                     finaloffset >= 0 ||
                         throw(ValidationError("negative final offset $finaloffset"))
@@ -1323,7 +1401,8 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
             throw(ValidationError("unsupported buffer role $role in C data import"))
         end
         if p == C_NULL
-            nbytes == 0 || throw(ValidationError("NULL $role buffer with nonzero required size"))
+            nbytes == 0 ||
+                throw(ValidationError("NULL $role buffer with nonzero required size"))
             push!(buffers, BufferSlice())
         else
             region = OwnerRegion(Ptr{UInt8}(p), nbytes; root=owner, cell=owner.cell)
@@ -1338,14 +1417,17 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
         nfixed = length(spec.buffers)
         nvariadic = Int(arr.n_buffers) - nfixed - 1
         sizesp = Ptr{Int64}(bufferptr(arr, Int(arr.n_buffers)))
-        (nvariadic == 0 || sizesp != C_NULL) ||
-            throw(ValidationError("view array with variadic buffers has a NULL sizes buffer"))
+        (nvariadic == 0 || sizesp != C_NULL) || throw(
+            ValidationError("view array with variadic buffers has a NULL sizes buffer"),
+        )
         for k = 1:nvariadic
             len = unsafe_load(sizesp, k)
             len >= 0 || throw(ValidationError("negative variadic buffer length $len"))
             p = bufferptr(arr, nfixed + k)
             if p == C_NULL
-                len == 0 || throw(ValidationError("NULL variadic buffer with nonzero declared length"))
+                len == 0 || throw(
+                    ValidationError("NULL variadic buffer with nonzero declared length"),
+                )
                 push!(buffers, BufferSlice())
             else
                 region = OwnerRegion(Ptr{UInt8}(p), len; root=owner, cell=owner.cell)
@@ -1360,11 +1442,20 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
     end
     dict = nothing
     if arr.dictionary != C_NULL
-        t isa DictionaryType || throw(ValidationError("dictionary array on a non-dictionary field"))
+        t isa DictionaryType ||
+            throw(ValidationError("dictionary array on a non-dictionary field"))
         dict = _import_array(AC.dictvaluefield(f, t), unsafe_load(arr.dictionary), owner)
     end
-    return AC._arraydata(t, arr.length, buffers, arr.offset, children,
-        dict, owner, arr.null_count)
+    return AC._arraydata(
+        t,
+        arr.length,
+        buffers,
+        arr.offset,
+        children,
+        dict,
+        owner,
+        arr.null_count,
+    )
 end
 
 # ---------------------------------------------------------------------------
@@ -1408,8 +1499,12 @@ function _stream_state(sp::Ptr{CArrowArrayStream})
     return state, control
 end
 
-function _set_stream_error!(state::ExportedStreamState, msg::AbstractString,
-    allocate! = Libc.malloc, deallocate! = Libc.free)
+function _set_stream_error!(
+    state::ExportedStreamState,
+    msg::AbstractString,
+    (allocate!)=Libc.malloc,
+    (deallocate!)=Libc.free,
+)
     # The prior pointer expires at the next stream operation even if building
     # its replacement fails. Clear it first so malloc failure cannot report a
     # stale error from an earlier operation.
@@ -1452,8 +1547,7 @@ function _set_stream_exception!(state::ExportedStreamState, e)
     return nothing
 end
 
-function _publish_stream_result!(build, roots::Vector{Any}, result_slot,
-    out, publish!)
+function _publish_stream_result!(build, roots::Vector{Any}, result_slot, out, publish!)
     key_slot = Ref{Int64}(0)
     committed = false
     try
@@ -1477,8 +1571,11 @@ function _publish_stream_result!(build, roots::Vector{Any}, result_slot,
     return nothing
 end
 
-function _stream_get_schema_impl(sp::Ptr{CArrowArrayStream},
-    out::Ptr{CArrowSchema}, publish!)::Cint
+function _stream_get_schema_impl(
+    sp::Ptr{CArrowArrayStream},
+    out::Ptr{CArrowSchema},
+    publish!,
+)::Cint
     state = nothing
     try
         sp == C_NULL && return EINVAL
@@ -1487,8 +1584,7 @@ function _stream_get_schema_impl(sp::Ptr{CArrowArrayStream},
         out == C_NULL && throw(ArgumentError("ArrowSchema output pointer is NULL"))
         srel = @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
         shell = Ref{Ptr{CArrowSchema}}(C_NULL)
-        _publish_stream_result!(Any[state.batchfield], shell, out,
-            publish!) do root
+        _publish_stream_result!(Any[state.batchfield], shell, out, publish!) do root
             _export_schema!(root, state.batchfield, srel)
         end
         return Cint(0)
@@ -1498,12 +1594,14 @@ function _stream_get_schema_impl(sp::Ptr{CArrowArrayStream},
     end
 end
 
-_stream_get_schema(sp::Ptr{CArrowArrayStream},
-    out::Ptr{CArrowSchema})::Cint =
+_stream_get_schema(sp::Ptr{CArrowArrayStream}, out::Ptr{CArrowSchema})::Cint =
     _stream_get_schema_impl(sp, out, unsafe_store!)
 
-function _stream_get_next_impl(sp::Ptr{CArrowArrayStream},
-    out::Ptr{CArrowArray}, publish!)::Cint
+function _stream_get_next_impl(
+    sp::Ptr{CArrowArrayStream},
+    out::Ptr{CArrowArray},
+    publish!,
+)::Cint
     state = nothing
     try
         sp == C_NULL && return EINVAL
@@ -1512,15 +1610,31 @@ function _stream_get_next_impl(sp::Ptr{CArrowArrayStream},
         out == C_NULL && throw(ArgumentError("ArrowArray output pointer is NULL"))
         if state.nextindex > length(state.batches)
             # End of stream: a released (NULL-release) struct, per spec.
-            publish!(out, CArrowArray(0, 0, 0, 0, 0,
-                Ptr{Ptr{Cvoid}}(C_NULL), Ptr{Ptr{CArrowArray}}(C_NULL),
-                Ptr{CArrowArray}(C_NULL), Ptr{Cvoid}(C_NULL),
-                Ptr{Cvoid}(C_NULL)))
+            publish!(
+                out,
+                CArrowArray(
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Ptr{Ptr{Cvoid}}(C_NULL),
+                    Ptr{Ptr{CArrowArray}}(C_NULL),
+                    Ptr{CArrowArray}(C_NULL),
+                    Ptr{Cvoid}(C_NULL),
+                    Ptr{Cvoid}(C_NULL),
+                ),
+            )
             return Cint(0)
         end
         b = state.batches[state.nextindex]
-        d = ArrayData(StructType(), b.nrows, [BufferSlice()];
-            children=collect(ArrayData, b.columns), nullcount=0)
+        d = ArrayData(
+            StructType(),
+            b.nrows,
+            [BufferSlice()];
+            children=collect(ArrayData, b.columns),
+            nullcount=0,
+        )
         validate_semantic(state.batchfield, d)
         arel = @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},))
         shell = Ref{Ptr{CArrowArray}}(C_NULL)
@@ -1535,8 +1649,7 @@ function _stream_get_next_impl(sp::Ptr{CArrowArrayStream},
     end
 end
 
-_stream_get_next(sp::Ptr{CArrowArrayStream},
-    out::Ptr{CArrowArray})::Cint =
+_stream_get_next(sp::Ptr{CArrowArrayStream}, out::Ptr{CArrowArray})::Cint =
     _stream_get_next_impl(sp, out, unsafe_store!)
 
 function _stream_get_last_error(sp::Ptr{CArrowArrayStream})::Ptr{UInt8}
@@ -1591,8 +1704,7 @@ function _validate_stream_schema(sch::Schema)
 end
 
 function _validate_stream_field(f::Field)
-    isvalid(f.name) ||
-        throw(ValidationError("field name is not valid UTF-8"))
+    isvalid(f.name) || throw(ValidationError("field name is not valid UTF-8"))
     AC._validate_metadata(f.metadata, "field")
     AC._validate_descriptor_of(f.type)
     for c in f.children
@@ -1611,12 +1723,20 @@ registry root keeps schema fields and batches reachable until `release`;
 every `get_schema`/`get_next` result is its own export root with the same
 lifecycle as `to_c_data` output.
 """
-export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
-    batches::AbstractVector{AC.RecordBatch}) =
-    _export_stream!(sp, sch, batches, Libc.malloc, Libc.free, unsafe_store!)
+export_stream!(
+    sp::Ptr{CArrowArrayStream},
+    sch::Schema,
+    batches::AbstractVector{AC.RecordBatch},
+) = _export_stream!(sp, sch, batches, Libc.malloc, Libc.free, unsafe_store!)
 
-function _export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
-    batches::AbstractVector{AC.RecordBatch}, allocate!, deallocate!, publish!)
+function _export_stream!(
+    sp::Ptr{CArrowArrayStream},
+    sch::Schema,
+    batches::AbstractVector{AC.RecordBatch},
+    allocate!,
+    deallocate!,
+    publish!,
+)
     sp == C_NULL && throw(ArgumentError("ArrowArrayStream pointer is NULL"))
     _validate_stream_schema(sch)
     for b in batches
@@ -1625,16 +1745,25 @@ function _export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
     end
     # The stream's struct-typed schema node carries the schema-level
     # metadata (the C++/pyarrow convention for `schema.metadata`).
-    batchfield = Field("", StructType(); nullable=false,
-        metadata=sch.metadata, children=collect(Field, sch.fields))
-    state = ExportedStreamState(batchfield,
-        collect(AC.RecordBatch, batches), 1, Ptr{UInt8}(C_NULL))
-    get_schema = @cfunction(_stream_get_schema, Cint,
-        (Ptr{CArrowArrayStream}, Ptr{CArrowSchema}))
-    get_next = @cfunction(_stream_get_next, Cint,
-        (Ptr{CArrowArrayStream}, Ptr{CArrowArray}))
-    get_last_error = @cfunction(_stream_get_last_error, Ptr{UInt8},
-        (Ptr{CArrowArrayStream},))
+    batchfield = Field(
+        "",
+        StructType();
+        nullable=false,
+        metadata=sch.metadata,
+        children=collect(Field, sch.fields),
+    )
+    state = ExportedStreamState(
+        batchfield,
+        collect(AC.RecordBatch, batches),
+        1,
+        Ptr{UInt8}(C_NULL),
+    )
+    get_schema =
+        @cfunction(_stream_get_schema, Cint, (Ptr{CArrowArrayStream}, Ptr{CArrowSchema}))
+    get_next =
+        @cfunction(_stream_get_next, Cint, (Ptr{CArrowArrayStream}, Ptr{CArrowArray}))
+    get_last_error =
+        @cfunction(_stream_get_last_error, Ptr{UInt8}, (Ptr{CArrowArrayStream},))
     release = @cfunction(_stream_release, Cvoid, (Ptr{CArrowArrayStream},))
     control = Ptr{Cvoid}(C_NULL)
     key = Int64(0)
@@ -1651,14 +1780,15 @@ function _export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema,
         lock(REGISTRY_LOCK) do
             STREAM_REGISTRY[key] = state
         end
-        publish!(sp, CArrowArrayStream(get_schema, get_next, get_last_error,
-            release, control))
+        publish!(
+            sp,
+            CArrowArrayStream(get_schema, get_next, get_last_error, release, control),
+        )
         return sp
     catch
         if havekey
             lock(REGISTRY_LOCK) do
-                get(STREAM_REGISTRY, key, nothing) === state &&
-                    pop!(STREAM_REGISTRY, key)
+                get(STREAM_REGISTRY, key, nothing) === state && pop!(STREAM_REGISTRY, key)
             end
         end
         errorp = state.lasterror
@@ -1742,9 +1872,10 @@ function release!(o::StreamOwner)
         cb = unsafe_load(o.block).release
         if cb != C_NULL
             ccall(cb, Cvoid, (Ptr{CArrowArrayStream},), o.block)
-            unsafe_load(o.block).release == C_NULL ||
-                (Libc.free(o.block);
-                    error("C stream producer release did not mark the structure released"))
+            unsafe_load(o.block).release == C_NULL || (
+                Libc.free(o.block);
+                error("C stream producer release did not mark the structure released")
+            )
         end
         Libc.free(o.block)
     end
@@ -1801,23 +1932,38 @@ convention; its fields become the imported `Schema`.
 function from_c_stream(sp::Ptr{CArrowArrayStream})
     sp == C_NULL && throw(ArgumentError("ArrowArrayStream pointer is NULL"))
     stream = unsafe_load(sp)
-    stream.release == C_NULL &&
-        throw(ArgumentError("cannot import a released stream"))
-    (stream.get_schema == C_NULL || stream.get_next == C_NULL ||
-        stream.get_last_error == C_NULL) &&
-        throw(ArgumentError("C stream is missing required callbacks"))
+    stream.release == C_NULL && throw(ArgumentError("cannot import a released stream"))
+    (
+        stream.get_schema == C_NULL ||
+        stream.get_next == C_NULL ||
+        stream.get_last_error == C_NULL
+    ) && throw(ArgumentError("C stream is missing required callbacks"))
     owner = StreamOwner(stream)
     moved = false
     try
         _store_field!(sp, Val(:release), Ptr{Cvoid}(C_NULL)) # the move commit
         moved = true
         _arm_stream_owner!(owner)
-        out = Ref(CArrowSchema(Ptr{UInt8}(C_NULL), Ptr{UInt8}(C_NULL),
-            Ptr{UInt8}(C_NULL), 0, 0, Ptr{Ptr{CArrowSchema}}(C_NULL),
-            Ptr{CArrowSchema}(C_NULL), Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL)))
-        status = GC.@preserve owner out ccall(unsafe_load(owner.block).get_schema,
-            Cint, (Ptr{CArrowArrayStream}, Ptr{CArrowSchema}),
-            owner.block, Base.unsafe_convert(Ptr{CArrowSchema}, out))
+        out = Ref(
+            CArrowSchema(
+                Ptr{UInt8}(C_NULL),
+                Ptr{UInt8}(C_NULL),
+                Ptr{UInt8}(C_NULL),
+                0,
+                0,
+                Ptr{Ptr{CArrowSchema}}(C_NULL),
+                Ptr{CArrowSchema}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+            ),
+        )
+        status = GC.@preserve owner out ccall(
+            unsafe_load(owner.block).get_schema,
+            Cint,
+            (Ptr{CArrowArrayStream}, Ptr{CArrowSchema}),
+            owner.block,
+            Base.unsafe_convert(Ptr{CArrowSchema}, out),
+        )
         status == 0 || _stream_call_failed(owner, "get_schema")
         sch = out[]
         batchfield = GC.@preserve out try
@@ -1828,8 +1974,7 @@ function from_c_stream(sp::Ptr{CArrowArrayStream})
         end
         batchfield.type isa StructType ||
             throw(ValidationError("C stream schema must be a struct-typed batch schema"))
-        schema = Schema(collect(Field, batchfield.children);
-            metadata=batchfield.metadata)
+        schema = Schema(collect(Field, batchfield.children); metadata=batchfield.metadata)
         _validate_stream_schema(schema)
         return ImportedStream(owner, batchfield, schema, false)
     catch
@@ -1843,15 +1988,29 @@ AC.nextbatch!(s::ImportedStream) = _nextbatch!(s, ForeignOwner)
 function _nextbatch!(s::ImportedStream, ownerfactory)
     # Fail closed on a released stream even when it already ended naturally:
     # release terminates the consumer contract, not just the batch supply.
-    (@atomic s.owner.released) &&
-        throw(ArgumentError("cannot pull from a released stream"))
+    (@atomic s.owner.released) && throw(ArgumentError("cannot pull from a released stream"))
     s.done && return nothing
-    out = Ref(CArrowArray(0, 0, 0, 0, 0, Ptr{Ptr{Cvoid}}(C_NULL),
-        Ptr{Ptr{CArrowArray}}(C_NULL), Ptr{CArrowArray}(C_NULL),
-        Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL)))
-    status = GC.@preserve s out ccall(unsafe_load(s.owner.block).get_next,
-        Cint, (Ptr{CArrowArrayStream}, Ptr{CArrowArray}),
-        s.owner.block, Base.unsafe_convert(Ptr{CArrowArray}, out))
+    out = Ref(
+        CArrowArray(
+            0,
+            0,
+            0,
+            0,
+            0,
+            Ptr{Ptr{Cvoid}}(C_NULL),
+            Ptr{Ptr{CArrowArray}}(C_NULL),
+            Ptr{CArrowArray}(C_NULL),
+            Ptr{Cvoid}(C_NULL),
+            Ptr{Cvoid}(C_NULL),
+        ),
+    )
+    status = GC.@preserve s out ccall(
+        unsafe_load(s.owner.block).get_next,
+        Cint,
+        (Ptr{CArrowArrayStream}, Ptr{CArrowArray}),
+        s.owner.block,
+        Base.unsafe_convert(Ptr{CArrowArray}, out),
+    )
     status == 0 || _stream_call_failed(s.owner, "get_next")
     arr = out[]
     if arr.release == C_NULL
@@ -1864,15 +2023,16 @@ function _nextbatch!(s::ImportedStream, ownerfactory)
     batchowner = try
         ownerfactory(arr)::ForeignOwner
     catch
-        GC.@preserve out _release_c_array!(
-            Base.unsafe_convert(Ptr{CArrowArray}, out), arr)
+        GC.@preserve out _release_c_array!(Base.unsafe_convert(Ptr{CArrowArray}, out), arr)
         rethrow()
     end
     moved = false
     d = try
         GC.@preserve out _store_field!(
-            Base.unsafe_convert(Ptr{CArrowArray}, out), :release,
-            Ptr{Cvoid}(C_NULL))
+            Base.unsafe_convert(Ptr{CArrowArray}, out),
+            :release,
+            Ptr{Cvoid}(C_NULL),
+        )
         moved = true
         _arm_foreign_owner!(batchowner)
         _preflight_array(s.batchfield, arr)

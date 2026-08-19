@@ -23,14 +23,18 @@ function cdata_battery()
     elseif Sys.WORD_SIZE == 32
         if Base.datatype_alignment(Int64) == 4 # i686 SysV ABI
             @assert sizeof(CArrowSchema) == 44
-            @assert fieldoffset.(Ref(CArrowSchema), 1:9) == [0, 4, 8, 12, 20, 28, 32, 36, 40]
+            @assert fieldoffset.(Ref(CArrowSchema), 1:9) ==
+                    [0, 4, 8, 12, 20, 28, 32, 36, 40]
             @assert sizeof(CArrowArray) == 60
-            @assert fieldoffset.(Ref(CArrowArray), 1:10) == [0, 8, 16, 24, 32, 40, 44, 48, 52, 56]
+            @assert fieldoffset.(Ref(CArrowArray), 1:10) ==
+                    [0, 8, 16, 24, 32, 40, 44, 48, 52, 56]
         else # 32-bit ABIs that align int64_t to 8 bytes
             @assert sizeof(CArrowSchema) == 48
-            @assert fieldoffset.(Ref(CArrowSchema), 1:9) == [0, 4, 8, 16, 24, 32, 36, 40, 44]
+            @assert fieldoffset.(Ref(CArrowSchema), 1:9) ==
+                    [0, 4, 8, 16, 24, 32, 36, 40, 44]
             @assert sizeof(CArrowArray) == 64
-            @assert fieldoffset.(Ref(CArrowArray), 1:10) == [0, 8, 16, 24, 32, 40, 44, 48, 52, 56]
+            @assert fieldoffset.(Ref(CArrowArray), 1:10) ==
+                    [0, 8, 16, 24, 32, 40, 44, 48, 52, 56]
         end
     else
         error("unsupported pointer width $(Sys.WORD_SIZE)")
@@ -64,17 +68,19 @@ function cdata_battery()
     deallocations = Ref(0)
     @assert try
         _newroot(Any[]) do root
-            _malloc!(root, 64,
+            _malloc!(
+                root,
+                64,
                 (_ledger, _p) -> error("injected malloc registration failure"),
                 p -> begin
                     deallocations[] += 1
                     Libc.free(p)
-                end)
+                end,
+            )
         end
         false
     catch e
-        e isa ErrorException &&
-            e.msg == "injected malloc registration failure"
+        e isa ErrorException && e.msg == "injected malloc registration failure"
     end
     @assert deallocations[] == 1
     @assert _registry_count() == before
@@ -84,17 +90,19 @@ function cdata_battery()
     innerdeallocations = Ref(0)
     @assert try
         _newroot(Any[]) do root
-            _malloc!(root, 64,
+            _malloc!(
+                root,
+                64,
                 (ledger, p) -> begin
                     push!(ledger, p)
                     error("injected post-registration failure")
                 end,
-                _ -> (innerdeallocations[] += 1))
+                _ -> (innerdeallocations[] += 1),
+            )
         end
         false
     catch e
-        e isa ErrorException &&
-            e.msg == "injected post-registration failure"
+        e isa ErrorException && e.msg == "injected post-registration failure"
     end
     @assert innerdeallocations[] == 0
     @assert _registry_count() == before
@@ -109,8 +117,16 @@ function cdata_battery()
     skey_slot = Ref{Int64}(0)
     ap_slot = Ref{Ptr{CArrowArray}}(C_NULL)
     akey_slot = Ref{Int64}(0)
-    _build_c_data!(sp_slot, skey_slot, ap_slot, akey_slot,
-        handofff, handoffd, handoff_arel, handoff_srel)
+    _build_c_data!(
+        sp_slot,
+        skey_slot,
+        ap_slot,
+        akey_slot,
+        handofff,
+        handoffd,
+        handoff_arel,
+        handoff_srel,
+    )
     _cleanup_export_slots!(sp_slot, skey_slot, ap_slot, akey_slot)
     @assert sp_slot[] == C_NULL && ap_slot[] == C_NULL
     @assert skey_slot[] == 0 && akey_slot[] == 0
@@ -216,118 +232,290 @@ function cdata_battery()
     tsnulls = TimestampType(AC.MICROSECOND, "UTC")
     nestedirf, nestedird = fromjulia("run_ends", Int32[1, 2])
     nestedivf, nestedivd = fromjulia("values", Int64[10, 20])
-    nestedinnerf = Field("values", RunEndEncodedType();
-        children=[nestedirf, nestedivf])
-    nestedinnerd = ArrayData(RunEndEncodedType(), 2, BufferSlice[];
-        children=[nestedird, nestedivd], nullcount=0)
+    nestedinnerf = Field("values", RunEndEncodedType(); children=[nestedirf, nestedivf])
+    nestedinnerd = ArrayData(
+        RunEndEncodedType(),
+        2,
+        BufferSlice[];
+        children=[nestedird, nestedivd],
+        nullcount=0,
+    )
     nestedorf, nestedord = fromjulia("run_ends", Int32[2, 4])
     paritycases = Tuple{Field,ArrayData}[
-        (Field("dec128", DecimalType(38, 10, 128)),
-            ArrayData(DecimalType(38, 10, 128), 2,
-                [BufferSlice(), AC._databuffer(Int128[123, -456])]; nullcount=0)),
-        (Field("dec32", DecimalType(9, 2, 32)),
-            ArrayData(DecimalType(9, 2, 32), 2,
-                [BufferSlice(), AC._databuffer(Int32[1234, -5678])]; nullcount=0)),
-        (Field("date32", DateType(AC.DAY)),
-            ArrayData(DateType(AC.DAY), 2,
-                [BufferSlice(), AC._databuffer(Int32[0, 19000])]; nullcount=0)),
-        (Field("date64", DateType(AC.MILLISECOND_DATE)),
-            ArrayData(DateType(AC.MILLISECOND_DATE), 2,
-                [BufferSlice(), AC._databuffer(Int64[0, 86_400_000])]; nullcount=0)),
-        (Field("time32s", TimeType(AC.SECOND, 32)),
-            ArrayData(TimeType(AC.SECOND, 32), 2,
-                [BufferSlice(), AC._databuffer(Int32[0, 86_399])]; nullcount=0)),
-        (Field("time64n", TimeType(AC.NANOSECOND, 64)),
-            ArrayData(TimeType(AC.NANOSECOND, 64), 2,
-                [BufferSlice(), AC._databuffer(Int64[0, 12_345])]; nullcount=0)),
-        (Field("ts-utc", tsnulls),
-            ArrayData(tsnulls, 3,
+        (
+            Field("dec128", DecimalType(38, 10, 128)),
+            ArrayData(
+                DecimalType(38, 10, 128),
+                2,
+                [BufferSlice(), AC._databuffer(Int128[123, -456])];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("dec32", DecimalType(9, 2, 32)),
+            ArrayData(
+                DecimalType(9, 2, 32),
+                2,
+                [BufferSlice(), AC._databuffer(Int32[1234, -5678])];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("date32", DateType(AC.DAY)),
+            ArrayData(
+                DateType(AC.DAY),
+                2,
+                [BufferSlice(), AC._databuffer(Int32[0, 19000])];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("date64", DateType(AC.MILLISECOND_DATE)),
+            ArrayData(
+                DateType(AC.MILLISECOND_DATE),
+                2,
+                [BufferSlice(), AC._databuffer(Int64[0, 86_400_000])];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("time32s", TimeType(AC.SECOND, 32)),
+            ArrayData(
+                TimeType(AC.SECOND, 32),
+                2,
+                [BufferSlice(), AC._databuffer(Int32[0, 86_399])];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("time64n", TimeType(AC.NANOSECOND, 64)),
+            ArrayData(
+                TimeType(AC.NANOSECOND, 64),
+                2,
+                [BufferSlice(), AC._databuffer(Int64[0, 12_345])];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("ts-utc", tsnulls),
+            ArrayData(
+                tsnulls,
+                3,
                 [AC._databuffer(UInt8[0x05]), AC._databuffer(Int64[7, 0, 9])];
-                nullcount=1)),
-        (Field("ts-naive", TimestampType(AC.SECOND, nothing)),
-            ArrayData(TimestampType(AC.SECOND, nothing), 1,
-                [BufferSlice(), AC._databuffer(Int64[42])]; nullcount=0)),
-        (Field("dur", DurationType(AC.MILLISECOND)),
-            ArrayData(DurationType(AC.MILLISECOND), 2,
-                [BufferSlice(), AC._databuffer(Int64[5, -5])]; nullcount=0)),
-        (Field("iym", IntervalType(AC.YEAR_MONTH)),
-            ArrayData(IntervalType(AC.YEAR_MONTH), 2,
-                [BufferSlice(), AC._databuffer(Int32[12, -1])]; nullcount=0)),
-        (Field("idt", IntervalType(AC.DAY_TIME)),
-            ArrayData(IntervalType(AC.DAY_TIME), 2,
-                [BufferSlice(), AC._databuffer(Int32[1, 2, 3, 4])]; nullcount=0)),
-        (Field("imdn", IntervalType(AC.MONTH_DAY_NANO)),
-            ArrayData(IntervalType(AC.MONTH_DAY_NANO), 1,
-                [BufferSlice(), AC._databuffer(
-                    vcat(reinterpret(UInt8, Int32[1, 2]),
-                        reinterpret(UInt8, Int64[3])))]; nullcount=0)),
-        (Field("fsb", FixedSizeBinaryType(3)),
-            ArrayData(FixedSizeBinaryType(3), 2,
-                [BufferSlice(), AC._databuffer(collect(codeunits("abcdef")))]; nullcount=0)),
-        (Field("fsl", FixedSizeListType(2); children=[fslu]),
-            ArrayData(FixedSizeListType(2), 2, [BufferSlice()];
+                nullcount=1,
+            ),
+        ),
+        (
+            Field("ts-naive", TimestampType(AC.SECOND, nothing)),
+            ArrayData(
+                TimestampType(AC.SECOND, nothing),
+                1,
+                [BufferSlice(), AC._databuffer(Int64[42])];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("dur", DurationType(AC.MILLISECOND)),
+            ArrayData(
+                DurationType(AC.MILLISECOND),
+                2,
+                [BufferSlice(), AC._databuffer(Int64[5, -5])];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("iym", IntervalType(AC.YEAR_MONTH)),
+            ArrayData(
+                IntervalType(AC.YEAR_MONTH),
+                2,
+                [BufferSlice(), AC._databuffer(Int32[12, -1])];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("idt", IntervalType(AC.DAY_TIME)),
+            ArrayData(
+                IntervalType(AC.DAY_TIME),
+                2,
+                [BufferSlice(), AC._databuffer(Int32[1, 2, 3, 4])];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("imdn", IntervalType(AC.MONTH_DAY_NANO)),
+            ArrayData(
+                IntervalType(AC.MONTH_DAY_NANO),
+                1,
+                [
+                    BufferSlice(),
+                    AC._databuffer(
+                        vcat(reinterpret(UInt8, Int32[1, 2]), reinterpret(UInt8, Int64[3])),
+                    ),
+                ];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("fsb", FixedSizeBinaryType(3)),
+            ArrayData(
+                FixedSizeBinaryType(3),
+                2,
+                [BufferSlice(), AC._databuffer(collect(codeunits("abcdef")))];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("fsl", FixedSizeListType(2); children=[fslu]),
+            ArrayData(
+                FixedSizeListType(2),
+                2,
+                [BufferSlice()];
                 children=[fromjulia("fsl-child", Int64[1, 2, 3, 4])[2]],
-                nullcount=0)),
-        (Field("lu", Utf8Type(true)),
-            ArrayData(Utf8Type(true), 2,
-                [BufferSlice(), AC._databuffer(Int64[0, 1, 3]),
-                 AC._databuffer(collect(codeunits("abc")))]; nullcount=0)),
-        (Field("lz", BinaryType(true)),
-            ArrayData(BinaryType(true), 2,
-                [BufferSlice(), AC._databuffer(Int64[0, 2, 3]),
-                 AC._databuffer(UInt8[0x01, 0x02, 0x03])]; nullcount=0)),
-        (Field("ll", ListType(true); children=[fslu]),
-            ArrayData(ListType(true), 2,
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("lu", Utf8Type(true)),
+            ArrayData(
+                Utf8Type(true),
+                2,
+                [
+                    BufferSlice(),
+                    AC._databuffer(Int64[0, 1, 3]),
+                    AC._databuffer(collect(codeunits("abc"))),
+                ];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("lz", BinaryType(true)),
+            ArrayData(
+                BinaryType(true),
+                2,
+                [
+                    BufferSlice(),
+                    AC._databuffer(Int64[0, 2, 3]),
+                    AC._databuffer(UInt8[0x01, 0x02, 0x03]),
+                ];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("ll", ListType(true); children=[fslu]),
+            ArrayData(
+                ListType(true),
+                2,
                 [BufferSlice(), AC._databuffer(Int64[0, 2, 4])];
                 children=[fromjulia("fsl-child", Int64[1, 2, 3, 4])[2]],
-                nullcount=0)),
-        (Field("su", sut; nullable=false, children=[sui, sus]),
-            ArrayData(sut, 3, [AC._databuffer(Int8[0, 1, 0])];
-                children=[sud, susd], nullcount=0)),
-        (Field("du", dut; nullable=false, children=[dui, dus]),
-            ArrayData(dut, 3,
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("su", sut; nullable=false, children=[sui, sus]),
+            ArrayData(
+                sut,
+                3,
+                [AC._databuffer(Int8[0, 1, 0])];
+                children=[sud, susd],
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("du", dut; nullable=false, children=[dui, dus]),
+            ArrayData(
+                dut,
+                3,
                 [AC._databuffer(Int8[0, 1, 0]), AC._databuffer(Int32[0, 0, 1])];
-                children=[duid, dusd], nullcount=0)),
-        (Field("nulls", NullType()),
-            ArrayData(NullType(), 3, BufferSlice[]; nullcount=3)),
+                children=[duid, dusd],
+                nullcount=0,
+            ),
+        ),
+        (Field("nulls", NullType()), ArrayData(NullType(), 3, BufferSlice[]; nullcount=3)),
         # format 1.3/1.4: views (with the C-only trailing sizes buffer),
         # list-views (per-slot offsets+sizes, unordered/overlapping), REE
-        (Field("vu", ViewType(true); nullable=true),
-            ArrayData(ViewType(true), 3,
-                [AC._databuffer(UInt8[0x05]),
-                 AC._databuffer(vcat(
-                    _viewentry(3, collect(codeunits("abc"))),
-                    _viewlong(25, collect(codeunits("firs")), 0, 0),
-                    _viewlong(26, collect(codeunits("seco")), 1, 0))),
-                 AC._databuffer(collect(codeunits("first-out-of-line-payload"))),
-                 AC._databuffer(collect(codeunits("second-buffer-payload-here")))];
-                nullcount=1)),
-        (Field("vz", ViewType(false)),
-            ArrayData(ViewType(false), 1,
+        (
+            Field("vu", ViewType(true); nullable=true),
+            ArrayData(
+                ViewType(true),
+                3,
+                [
+                    AC._databuffer(UInt8[0x05]),
+                    AC._databuffer(
+                        vcat(
+                            _viewentry(3, collect(codeunits("abc"))),
+                            _viewlong(25, collect(codeunits("firs")), 0, 0),
+                            _viewlong(26, collect(codeunits("seco")), 1, 0),
+                        ),
+                    ),
+                    AC._databuffer(collect(codeunits("first-out-of-line-payload"))),
+                    AC._databuffer(collect(codeunits("second-buffer-payload-here"))),
+                ];
+                nullcount=1,
+            ),
+        ),
+        (
+            Field("vz", ViewType(false)),
+            ArrayData(
+                ViewType(false),
+                1,
                 [BufferSlice(), AC._databuffer(_viewentry(2, UInt8[0xff, 0x00]))];
-                nullcount=0)),
-        (Field("lv", ListViewType(false); children=[fslu]),
-            ArrayData(ListViewType(false), 3,
-                [BufferSlice(), AC._databuffer(Int32[2, 0, 0]),
-                 AC._databuffer(Int32[2, 2, 4])];
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("lv", ListViewType(false); children=[fslu]),
+            ArrayData(
+                ListViewType(false),
+                3,
+                [
+                    BufferSlice(),
+                    AC._databuffer(Int32[2, 0, 0]),
+                    AC._databuffer(Int32[2, 2, 4]),
+                ];
                 children=[fromjulia("fsl-child", Int64[1, 2, 3, 4])[2]],
-                nullcount=0)),
-        (Field("Lv", ListViewType(true); children=[fslu]),
-            ArrayData(ListViewType(true), 1,
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("Lv", ListViewType(true); children=[fslu]),
+            ArrayData(
+                ListViewType(true),
+                1,
                 [BufferSlice(), AC._databuffer(Int64[1]), AC._databuffer(Int64[3])];
                 children=[fromjulia("fsl-child", Int64[1, 2, 3, 4])[2]],
-                nullcount=0)),
-        (Field("ree", RunEndEncodedType(); children=[
-                Field("run_ends", IntType(32, true); nullable=false),
-                Field("values", Utf8Type(false); nullable=true)]),
-            ArrayData(RunEndEncodedType(), 4, BufferSlice[];
-                children=[fromjulia("run_ends", Int32[2, 3, 4])[2],
-                          fromjulia("values", Union{Missing,String}["x", missing, "z"])[2]],
-                nullcount=0)),
-        (Field("nested-ree", RunEndEncodedType();
-                children=[nestedorf, nestedinnerf]),
-            ArrayData(RunEndEncodedType(), 4, BufferSlice[];
-                children=[nestedord, nestedinnerd], nullcount=0)),
+                nullcount=0,
+            ),
+        ),
+        (
+            Field(
+                "ree",
+                RunEndEncodedType();
+                children=[
+                    Field("run_ends", IntType(32, true); nullable=false),
+                    Field("values", Utf8Type(false); nullable=true),
+                ],
+            ),
+            ArrayData(
+                RunEndEncodedType(),
+                4,
+                BufferSlice[];
+                children=[
+                    fromjulia("run_ends", Int32[2, 3, 4])[2],
+                    fromjulia("values", Union{Missing,String}["x", missing, "z"])[2],
+                ],
+                nullcount=0,
+            ),
+        ),
+        (
+            Field("nested-ree", RunEndEncodedType(); children=[nestedorf, nestedinnerf]),
+            ArrayData(
+                RunEndEncodedType(),
+                4,
+                BufferSlice[];
+                children=[nestedord, nestedinnerd],
+                nullcount=0,
+            ),
+        ),
     ]
     for (f, d) in paritycases
         want = collect(Any, materialize(f, d))
@@ -356,17 +544,40 @@ function cdata_battery()
     @assert parseformat("vz") == ViewType(false) && formatstring(ViewType(false)) == "vz"
     @assert parseformat("+vl") == ListViewType(false)
     @assert parseformat("+vL") == ListViewType(true) &&
-        formatstring(ListViewType(true)) == "+vL"
+            formatstring(ListViewType(true)) == "+vL"
     @assert parseformat("+r") == RunEndEncodedType() &&
-        formatstring(RunEndEncodedType()) == "+r"
+            formatstring(RunEndEncodedType()) == "+r"
     badformats = String[
-        "v", "vx", "+v", "+vx", "+rr", "d:x", "w:", "tsq:",
-        "tsé:", "ts💣:", "tsu:UTC\0hidden",
-        "w: 1", "w:1 ", "w:+1", "w:0x10", "+w: 2",
-        "d: 1,0", "d:1, 0", "d:+1,+0", "d:0x9,0x2,0x20",
-        "d:0,0", "d:39,0", "d:1,0,1", "d:77,0,256",
-        "+ud:200", "+ud:0,0", "+ud: 0,1", "+us:+1",
-        "+ud:0x0,0x1", "+ud:" * join(0:128, ","),
+        "v",
+        "vx",
+        "+v",
+        "+vx",
+        "+rr",
+        "d:x",
+        "w:",
+        "tsq:",
+        "tsé:",
+        "ts💣:",
+        "tsu:UTC\0hidden",
+        "w: 1",
+        "w:1 ",
+        "w:+1",
+        "w:0x10",
+        "+w: 2",
+        "d: 1,0",
+        "d:1, 0",
+        "d:+1,+0",
+        "d:0x9,0x2,0x20",
+        "d:0,0",
+        "d:39,0",
+        "d:1,0,1",
+        "d:77,0,256",
+        "+ud:200",
+        "+ud:0,0",
+        "+ud: 0,1",
+        "+us:+1",
+        "+ud:0x0,0x1",
+        "+ud:" * join(0:128, ","),
     ]
     push!(badformats, String(UInt8[0x74, 0x73, 0x75, 0x3a, 0xff]))
     for bad in badformats
@@ -385,29 +596,57 @@ function cdata_battery()
     emptyitemf, emptyitemd = fromjulia("item", Int64[])
     emptyoffsetcases = Tuple{Field,ArrayData}[]
     for t in (Utf8Type(false), Utf8Type(true), BinaryType(false), BinaryType(true))
-        push!(emptyoffsetcases, (Field("empty", t),
-            ArrayData(t, 0, [BufferSlice(), BufferSlice(), BufferSlice()];
-                nullcount=0)))
+        push!(
+            emptyoffsetcases,
+            (
+                Field("empty", t),
+                ArrayData(t, 0, [BufferSlice(), BufferSlice(), BufferSlice()]; nullcount=0),
+            ),
+        )
     end
     for t in (ListType(false), ListType(true))
-        push!(emptyoffsetcases, (Field("empty-list", t; children=[emptyitemf]),
-            ArrayData(t, 0, [BufferSlice(), BufferSlice()];
-                children=[emptyitemd], nullcount=0)))
+        push!(
+            emptyoffsetcases,
+            (
+                Field("empty-list", t; children=[emptyitemf]),
+                ArrayData(
+                    t,
+                    0,
+                    [BufferSlice(), BufferSlice()];
+                    children=[emptyitemd],
+                    nullcount=0,
+                ),
+            ),
+        )
     end
     emptykeyt = Utf8Type(false)
     emptykeyf = Field("key", emptykeyt; nullable=false)
-    emptykeyd = ArrayData(emptykeyt, 0,
-        [BufferSlice(), BufferSlice(), BufferSlice()]; nullcount=0)
+    emptykeyd =
+        ArrayData(emptykeyt, 0, [BufferSlice(), BufferSlice(), BufferSlice()]; nullcount=0)
     emptyvaluef, emptyvalued = fromjulia("value", Int64[])
-    emptyentriesf = Field("entries", StructType(); nullable=false,
-        children=[emptykeyf, emptyvaluef])
-    emptyentriesd = ArrayData(StructType(), 0, [BufferSlice()];
-        children=[emptykeyd, emptyvalued], nullcount=0)
+    emptyentriesf =
+        Field("entries", StructType(); nullable=false, children=[emptykeyf, emptyvaluef])
+    emptyentriesd = ArrayData(
+        StructType(),
+        0,
+        [BufferSlice()];
+        children=[emptykeyd, emptyvalued],
+        nullcount=0,
+    )
     emptymapt = MapType(false)
-    push!(emptyoffsetcases, (Field("empty-map", emptymapt;
-        children=[emptyentriesf]),
-        ArrayData(emptymapt, 0, [BufferSlice(), BufferSlice()];
-            children=[emptyentriesd], nullcount=0)))
+    push!(
+        emptyoffsetcases,
+        (
+            Field("empty-map", emptymapt; children=[emptyentriesf]),
+            ArrayData(
+                emptymapt,
+                0,
+                [BufferSlice(), BufferSlice()];
+                children=[emptyentriesd],
+                nullcount=0,
+            ),
+        ),
+    )
     for (f, d) in emptyoffsetcases
         spec = layoutspec(f.type)
         oi = findfirst(==(AC.OFFSETS), spec.buffers)::Int
@@ -416,9 +655,8 @@ function cdata_battery()
         offsetp = Ptr{UInt8}(unsafe_load(arr.buffers, oi))
         @assert offsetp != C_NULL
         GC.gc(true)
-        @assert spec.offsetwidth == 4 ?
-            unsafe_load(Ptr{Int32}(offsetp)) == 0 :
-            unsafe_load(Ptr{Int64}(offsetp)) == 0
+        @assert spec.offsetwidth == 4 ? unsafe_load(Ptr{Int32}(offsetp)) == 0 :
+                unsafe_load(Ptr{Int64}(offsetp)) == 0
         f2, d2 = from_c_data(sp, ap)
         @assert d2.buffers[oi].len == spec.offsetwidth
         @assert isempty(materialize(f2, d2))
@@ -428,8 +666,12 @@ function cdata_battery()
     println("empty C Data offset layouts export one rooted terminal zero ✓")
 
     nullf = Field("null-empty", Utf8Type(false))
-    nulld = ArrayData(Utf8Type(false), 0,
-        [BufferSlice(), BufferSlice(), BufferSlice()]; nullcount=0)
+    nulld = ArrayData(
+        Utf8Type(false),
+        0,
+        [BufferSlice(), BufferSlice(), BufferSlice()];
+        nullcount=0,
+    )
     sp, ap = to_c_data(nullf, nulld)
     unsafe_store!(unsafe_load(ap).buffers, Ptr{Cvoid}(C_NULL), 2)
     @assert try
@@ -459,8 +701,13 @@ function cdata_battery()
     @assert reap!() == 2
 
     earlyunionf = Field("early-union", sut; children=[sui, sus])
-    earlyuniond = ArrayData(sut, 3, [AC._databuffer(Int8[0, 1, 0])];
-        children=[sud, susd], nullcount=0)
+    earlyuniond = ArrayData(
+        sut,
+        3,
+        [AC._databuffer(Int8[0, 1, 0])];
+        children=[sud, susd],
+        nullcount=0,
+    )
     sp, ap = to_c_data(earlyunionf, earlyuniond)
     shortunion = "+us:0"
     badchild = "not-a-format"
@@ -508,20 +755,16 @@ function cdata_battery()
     @assert reap!() == 2
     println("moved (released) source cannot be imported twice ✓")
 
-
-
     # Schema cleanup is installed before owner construction. If construction
     # fails, the array remains with its source while the schema is released.
     cf, cd = fromjulia("owner-construction", Int64[1])
     cbefore = _registry_count()
     sp, ap = to_c_data(cf, cd)
     @assert try
-        _from_c_data(sp, ap;
-            ownerfactory=_ -> error("injected owner construction failure"))
+        _from_c_data(sp, ap; ownerfactory=_ -> error("injected owner construction failure"))
         false
     catch e
-        e isa ErrorException &&
-            e.msg == "injected owner construction failure"
+        e isa ErrorException && e.msg == "injected owner construction failure"
     end
     @assert unsafe_load(sp).release == C_NULL
     @assert unsafe_load(ap).release != C_NULL
@@ -548,8 +791,7 @@ function cdata_battery()
         ForeignOwner(unsafe_load(ap), failing_registrar)
         false
     catch e
-        e isa ErrorException &&
-            e.msg == "injected post-registration failure"
+        e isa ErrorException && e.msg == "injected post-registration failure"
     end
     failed_owner = captured_owner[]::ForeignOwner
     @assert (@atomic failed_owner.released)
@@ -567,8 +809,7 @@ function cdata_battery()
     # reports the conformance error, and leaves every later release inert.
     before_calls = TEST_NONCONFORMING_RELEASES[]
     deallocations = Ref(0)
-    nonconforming_owner =
-        ForeignOwner(_test_c_array(test_nonconforming_release()))
+    nonconforming_owner = ForeignOwner(_test_c_array(test_nonconforming_release()))
     _arm_foreign_owner!(nonconforming_owner)
     @assert try
         _release_foreign_owner!(nonconforming_owner, p -> begin
@@ -588,8 +829,7 @@ function cdata_battery()
     # Explicit `finalize` exercises the registered finalizer's error path.
     # Julia reports finalizer errors instead of throwing them to this caller,
     # so suppress the expected diagnostic and verify the durable state.
-    finalizer_error_owner =
-        ForeignOwner(_test_c_array(test_nonconforming_release()))
+    finalizer_error_owner = ForeignOwner(_test_c_array(test_nonconforming_release()))
     _arm_foreign_owner!(finalizer_error_owner)
     redirect_stderr(devnull) do
         finalize(finalizer_error_owner)
@@ -679,8 +919,7 @@ function cdata_battery()
     # stay NULL, and a later explicit call can resume safely.
     retryf, retryd = fromjulia("child", Int64[1])
     retrysf = Field("parent", StructType(); children=[retryf])
-    retrysd = ArrayData(StructType(), 1, [BufferSlice()];
-        children=[retryd], nullcount=0)
+    retrysd = ArrayData(StructType(), 1, [BufferSlice()]; children=[retryd], nullcount=0)
     sp, ap = to_c_data(retrysf, retrysd)
     parentcontrol = unsafe_load(ap).private_data
     childp = unsafe_load(unsafe_load(ap).children, 1)
@@ -714,8 +953,7 @@ function cdata_battery()
     catch e
         e isa ValidationError
     end
-    short = ArrayData(IntType(64, true), 10,
-        [AC._databuffer(UInt8[0xff]), BufferSlice()])
+    short = ArrayData(IntType(64, true), 10, [AC._databuffer(UInt8[0xff]), BufferSlice()])
     @assert try
         to_c_data(Field("short", IntType(64, true)), short)
         false
@@ -741,9 +979,12 @@ function cdata_battery()
     # bytes cross unchanged.
     badutf8type = Utf8Type(false)
     badutf8field = Field("bad-utf8", badutf8type)
-    badutf8data = ArrayData(badutf8type, 1,
-        [BufferSlice(), AC._databuffer(Int32[0, 1]),
-         AC._databuffer(UInt8[0xff])]; nullcount=0)
+    badutf8data = ArrayData(
+        badutf8type,
+        1,
+        [BufferSlice(), AC._databuffer(Int32[0, 1]), AC._databuffer(UInt8[0xff])];
+        nullcount=0,
+    )
     @assert try
         validate_full(badutf8field, badutf8data)
         false
@@ -763,9 +1004,13 @@ function cdata_battery()
     vf, vd = fromjulia("dict", Union{Missing,String}[missing, "x"])
     dt = DictionaryType(IntType(32, true), vf.type, true)
     df = Field("dict", dt; nullable=false, children=vf.children)
-    dd = ArrayData(dt, 2,
+    dd = ArrayData(
+        dt,
+        2,
         [BufferSlice(), AC._databuffer(Int32[0, 1])];
-        dictionary=vd, nullcount=0)
+        dictionary=vd,
+        nullcount=0,
+    )
     sp, ap = to_c_data(df, dd)
     @assert (unsafe_load(sp).flags & ARROW_FLAG_DICTIONARY_ORDERED) != 0
     df2, dd2 = from_c_data(sp, ap)
@@ -788,7 +1033,8 @@ function cdata_battery()
     GC.@preserve smoved amoved begin
         movedf, movedd = from_c_data(
             Base.unsafe_convert(Ptr{CArrowSchema}, smoved),
-            Base.unsafe_convert(Ptr{CArrowArray}, amoved))
+            Base.unsafe_convert(Ptr{CArrowArray}, amoved),
+        )
         @assert isequal(materialize(movedf, movedd), [missing, "x"])
         release!(movedd.owner::ForeignOwner)
     end
@@ -797,15 +1043,17 @@ function cdata_battery()
 
     kf, kd = fromjulia("key", ["a"])
     mvf, mvd = fromjulia("value", Int64[7])
-    entriesf = Field("entries", StructType(); nullable=false,
-        children=[kf, mvf])
-    entriesd = ArrayData(StructType(), 1, [BufferSlice()];
-        children=[kd, mvd], nullcount=0)
+    entriesf = Field("entries", StructType(); nullable=false, children=[kf, mvf])
+    entriesd = ArrayData(StructType(), 1, [BufferSlice()]; children=[kd, mvd], nullcount=0)
     mt = MapType(true)
     mapf = Field("map", mt; children=[entriesf])
-    mapd = ArrayData(mt, 1,
+    mapd = ArrayData(
+        mt,
+        1,
         [BufferSlice(), AC._databuffer(Int32[0, 1])];
-        children=[entriesd], nullcount=0)
+        children=[entriesd],
+        nullcount=0,
+    )
     sp, ap = to_c_data(mapf, mapd)
     @assert (unsafe_load(sp).flags & ARROW_FLAG_MAP_KEYS_SORTED) != 0
     mapf2, mapd2 = from_c_data(sp, ap)
@@ -830,7 +1078,8 @@ function cdata_battery()
     GC.@preserve smoved amoved begin
         movedf, movedd = from_c_data(
             Base.unsafe_convert(Ptr{CArrowSchema}, smoved),
-            Base.unsafe_convert(Ptr{CArrowArray}, amoved))
+            Base.unsafe_convert(Ptr{CArrowArray}, amoved),
+        )
         @assert materialize(movedf, movedd) == [["key" => "a", "value" => 7]]
         release!(movedd.owner::ForeignOwner)
     end
@@ -842,8 +1091,7 @@ function cdata_battery()
     af, ad = fromjulia("a", Int64[1, 2])
     bf, bd = fromjulia("b", Int64[3, 4])
     sf = Field("s", StructType(); children=[af, bf])
-    sd = ArrayData(StructType(), 2, [BufferSlice()];
-        children=[ad, bd], nullcount=0)
+    sd = ArrayData(StructType(), 2, [BufferSlice()]; children=[ad, bd], nullcount=0)
     sp, ap = to_c_data(sf, sd)
     smoved = Ref{CArrowSchema}[]
     amoved = Ref{CArrowArray}[]
@@ -862,7 +1110,8 @@ function cdata_battery()
         GC.@preserve smoved amoved begin
             movedf, movedd = from_c_data(
                 Base.unsafe_convert(Ptr{CArrowSchema}, smoved[i]),
-                Base.unsafe_convert(Ptr{CArrowArray}, amoved[i]))
+                Base.unsafe_convert(Ptr{CArrowArray}, amoved[i]),
+            )
             @assert materialize(movedf, movedd) == expected_values
             release!(movedd.owner::ForeignOwner)
         end
@@ -1010,8 +1259,14 @@ function cdata_battery()
         GC.@preserve streamtxnref begin
             streamtxnp = Base.unsafe_convert(Ptr{CArrowArrayStream}, streamtxnref)
             @assert try
-                _export_stream!(streamtxnp, b1.schema, AC.RecordBatch[],
-                    Libc.malloc, stream_deallocate!, unsafe_store!)
+                _export_stream!(
+                    streamtxnp,
+                    b1.schema,
+                    AC.RecordBatch[],
+                    Libc.malloc,
+                    stream_deallocate!,
+                    unsafe_store!,
+                )
                 false
             catch e
                 e isa OverflowError
@@ -1026,13 +1281,17 @@ function cdata_battery()
     GC.@preserve streamtxnref begin
         streamtxnp = Base.unsafe_convert(Ptr{CArrowArrayStream}, streamtxnref)
         @assert try
-            _export_stream!(streamtxnp, b1.schema, AC.RecordBatch[],
-                Libc.malloc, stream_deallocate!,
-                (_p, _stream) -> error("injected stream publication failure"))
+            _export_stream!(
+                streamtxnp,
+                b1.schema,
+                AC.RecordBatch[],
+                Libc.malloc,
+                stream_deallocate!,
+                (_p, _stream) -> error("injected stream publication failure"),
+            )
             false
         catch e
-            e isa ErrorException &&
-                e.msg == "injected stream publication failure"
+            e isa ErrorException && e.msg == "injected stream publication failure"
         end
     end
     @assert stream_deallocations[] == 1
@@ -1044,14 +1303,35 @@ function cdata_battery()
     # nothing: discard the unpublished root immediately. A failed get_next
     # must also leave the batch available for a later retry.
     resulttxnref = Ref{CArrowArrayStream}()
-    schemaout = Ref(CArrowSchema(Ptr{UInt8}(C_NULL), Ptr{UInt8}(C_NULL),
-        Ptr{UInt8}(C_NULL), 0, 0, Ptr{Ptr{CArrowSchema}}(C_NULL),
-        Ptr{CArrowSchema}(C_NULL), Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL)))
-    arrayout = Ref(CArrowArray(0, 0, 0, 0, 0,
-        Ptr{Ptr{Cvoid}}(C_NULL), Ptr{Ptr{CArrowArray}}(C_NULL),
-        Ptr{CArrowArray}(C_NULL), Ptr{Cvoid}(C_NULL), Ptr{Cvoid}(C_NULL)))
-    fail_result_publish! = (_out, _result) ->
-        error("injected stream result publication failure")
+    schemaout = Ref(
+        CArrowSchema(
+            Ptr{UInt8}(C_NULL),
+            Ptr{UInt8}(C_NULL),
+            Ptr{UInt8}(C_NULL),
+            0,
+            0,
+            Ptr{Ptr{CArrowSchema}}(C_NULL),
+            Ptr{CArrowSchema}(C_NULL),
+            Ptr{Cvoid}(C_NULL),
+            Ptr{Cvoid}(C_NULL),
+        ),
+    )
+    arrayout = Ref(
+        CArrowArray(
+            0,
+            0,
+            0,
+            0,
+            0,
+            Ptr{Ptr{Cvoid}}(C_NULL),
+            Ptr{Ptr{CArrowArray}}(C_NULL),
+            Ptr{CArrowArray}(C_NULL),
+            Ptr{Cvoid}(C_NULL),
+            Ptr{Cvoid}(C_NULL),
+        ),
+    )
+    fail_result_publish! =
+        (_out, _result) -> error("injected stream result publication failure")
     GC.@preserve resulttxnref schemaout arrayout begin
         resulttxnp = Base.unsafe_convert(Ptr{CArrowArrayStream}, resulttxnref)
         schemaoutp = Base.unsafe_convert(Ptr{CArrowSchema}, schemaout)
@@ -1060,18 +1340,16 @@ function cdata_battery()
         resultstate, _ = _stream_state(resulttxnp)
         resultroots = _registry_count()
 
-        @assert _stream_get_schema_impl(resulttxnp, schemaoutp,
-            fail_result_publish!) == EINVAL
+        @assert _stream_get_schema_impl(resulttxnp, schemaoutp, fail_result_publish!) ==
+                EINVAL
         @assert _registry_count() == resultroots
 
         @assert resultstate.nextindex == 1
-        @assert _stream_get_next_impl(resulttxnp, arrayoutp,
-            fail_result_publish!) == EINVAL
+        @assert _stream_get_next_impl(resulttxnp, arrayoutp, fail_result_publish!) == EINVAL
         @assert _registry_count() == resultroots
         @assert resultstate.nextindex == 1
 
-        @assert _stream_get_next_impl(resulttxnp, arrayoutp,
-            unsafe_store!) == 0
+        @assert _stream_get_next_impl(resulttxnp, arrayoutp, unsafe_store!) == 0
         @assert arrayout[].release != C_NULL
         @assert arrayout[].length == b1.nrows
         @assert resultstate.nextindex == 2
@@ -1096,24 +1374,43 @@ function cdata_battery()
         callbackstate, _ = _stream_state(callbackp)
         _set_stream_error!(callbackstate, "old error")
         @assert callbackstate.lasterror != C_NULL
-        _set_stream_error!(callbackstate, "new error",
-            _ -> Ptr{Cvoid}(C_NULL), Libc.free)
+        _set_stream_error!(callbackstate, "new error", _ -> Ptr{Cvoid}(C_NULL), Libc.free)
         @assert callbackstate.lasterror == C_NULL
         callbacks = callbackref[]
-        @assert ccall(callbacks.get_schema, Cint,
+        @assert ccall(
+            callbacks.get_schema,
+            Cint,
             (Ptr{CArrowArrayStream}, Ptr{CArrowSchema}),
-            callbackp, Ptr{CArrowSchema}(C_NULL)) == EINVAL
-        errorp = ccall(callbacks.get_last_error, Ptr{UInt8},
-            (Ptr{CArrowArrayStream},), callbackp)
+            callbackp,
+            Ptr{CArrowSchema}(C_NULL),
+        ) == EINVAL
+        errorp = ccall(
+            callbacks.get_last_error,
+            Ptr{UInt8},
+            (Ptr{CArrowArrayStream},),
+            callbackp,
+        )
         @assert errorp != C_NULL
         @assert occursin("output pointer is NULL", unsafe_string(errorp))
-        @assert ccall(callbacks.get_next, Cint,
+        @assert ccall(
+            callbacks.get_next,
+            Cint,
             (Ptr{CArrowArrayStream}, Ptr{CArrowArray}),
-            callbackp, Ptr{CArrowArray}(C_NULL)) == EINVAL
-        @assert ccall(callbacks.get_last_error, Ptr{UInt8},
-            (Ptr{CArrowArrayStream},), Ptr{CArrowArrayStream}(C_NULL)) == C_NULL
-        ccall(callbacks.release, Cvoid, (Ptr{CArrowArrayStream},),
-            Ptr{CArrowArrayStream}(C_NULL))
+            callbackp,
+            Ptr{CArrowArray}(C_NULL),
+        ) == EINVAL
+        @assert ccall(
+            callbacks.get_last_error,
+            Ptr{UInt8},
+            (Ptr{CArrowArrayStream},),
+            Ptr{CArrowArrayStream}(C_NULL),
+        ) == C_NULL
+        ccall(
+            callbacks.release,
+            Cvoid,
+            (Ptr{CArrowArrayStream},),
+            Ptr{CArrowArrayStream}(C_NULL),
+        )
         _store_field!(callbackp, :get_last_error, Ptr{Cvoid}(C_NULL))
         @assert try
             from_c_stream(callbackp)
@@ -1134,11 +1431,12 @@ function cdata_battery()
         ownerfailp = Base.unsafe_convert(Ptr{CArrowArrayStream}, ownerfailref)
         export_stream!(ownerfailp, b1.schema, AC.RecordBatch[])
         captured_stream_owner = Ref{Any}(nothing)
-        stream_failing_registrar = (f, o) -> begin
-            captured_stream_owner[] = o
-            finalizer(f, o)
-            error("injected stream finalizer registration failure")
-        end
+        stream_failing_registrar =
+            (f, o) -> begin
+                captured_stream_owner[] = o
+                finalizer(f, o)
+                error("injected stream finalizer registration failure")
+            end
         @assert try
             StreamOwner(ownerfailref[], stream_failing_registrar)
             false
@@ -1167,11 +1465,15 @@ function cdata_battery()
         export_stream!(batchfailp, b1.schema, AC.RecordBatch[b1])
         batchfailstream = from_c_stream(batchfailp)
         captured_batch_owner = Ref{Any}(nothing)
-        batch_owner_factory = arr -> ForeignOwner(arr, (f, o) -> begin
-            captured_batch_owner[] = o
-            finalizer(f, o)
-            error("injected batch-owner finalizer registration failure")
-        end)
+        batch_owner_factory =
+            arr -> ForeignOwner(
+                arr,
+                (f, o) -> begin
+                    captured_batch_owner[] = o
+                    finalizer(f, o)
+                    error("injected batch-owner finalizer registration failure")
+                end,
+            )
         @assert try
             _nextbatch!(batchfailstream, batch_owner_factory)
             false
@@ -1205,9 +1507,10 @@ function cdata_battery()
             @assert got isa AC.RecordBatch
             @assert got.nrows == source.nrows
             for (i, f) in enumerate(s.schema.fields)
-                @assert isequal(collect(Any, materialize(f, got.columns[i])),
-                    collect(Any, materialize(source.schema.fields[i],
-                        source.columns[i]))) f.name
+                @assert isequal(
+                    collect(Any, materialize(f, got.columns[i])),
+                    collect(Any, materialize(source.schema.fields[i], source.columns[i])),
+                ) f.name
             end
             push!(owners, got.columns[1].owner::ForeignOwner)
         end
@@ -1233,16 +1536,24 @@ function cdata_battery()
     # construction cannot see), so its get_next reports EINVAL and the
     # importer throws a ValidationError carrying the producer's message.
     okf, okd = fromjulia("s", ["ok"])
-    badd = ArrayData(Utf8Type(false), 1,
-        [BufferSlice(), AC._databuffer(Int32[1, 0]),
-         AC._databuffer(UInt8[0x61])]; nullcount=0)
+    badd = ArrayData(
+        Utf8Type(false),
+        1,
+        [BufferSlice(), AC._databuffer(Int32[1, 0]), AC._databuffer(UInt8[0x61])];
+        nullcount=0,
+    )
     badsch = Schema(Field[okf])
     streamref2 = Ref{CArrowArrayStream}()
     GC.@preserve streamref2 begin
         spp2 = Base.unsafe_convert(Ptr{CArrowArrayStream}, streamref2)
-        export_stream!(spp2, badsch, AC.RecordBatch[
-            AC.RecordBatch(badsch, ArrayData[okd], 1),
-            AC.RecordBatch(badsch, ArrayData[badd], 1)])
+        export_stream!(
+            spp2,
+            badsch,
+            AC.RecordBatch[
+                AC.RecordBatch(badsch, ArrayData[okd], 1),
+                AC.RecordBatch(badsch, ArrayData[badd], 1),
+            ],
+        )
         s2 = from_c_stream(spp2)
         first = nextbatch!(s2)
         @assert first isa AC.RecordBatch
@@ -1287,11 +1598,15 @@ function cdata_battery()
     # int32 pair count, length-prefixed keys and values), recursively
     # through children and dictionary value fields; absent metadata stays
     # NULL and imports as nothing.
-    mleaf = Field("item", IntType(64, true); nullable=false,
-        metadata=["lk" => "lv"])
+    mleaf = Field("item", IntType(64, true); nullable=false, metadata=["lk" => "lv"])
     _, mld = fromjulia("l", [Int64[1, 2], Int64[3]])
-    mlist = Field("l", ListType(false); nullable=false,
-        metadata=["k" => "v", "empty" => ""], children=[mleaf])
+    mlist = Field(
+        "l",
+        ListType(false);
+        nullable=false,
+        metadata=["k" => "v", "empty" => ""],
+        children=[mleaf],
+    )
     msp, map_ = to_c_data(mlist, mld)
     mf2, mld2 = from_c_data(msp, map_)
     @assert collect(mf2.metadata) == ["k" => "v", "empty" => ""]
@@ -1300,8 +1615,13 @@ function cdata_battery()
     close!(mld2.buffers[2].region::OwnerRegion)
     reap!()
     dvf, dvd = AC.fromjulia_dict("d", ["lo", "hi"], [0, 1, missing])
-    dmf = Field("d", dvf.type; nullable=dvf.nullable,
-        metadata=["dk" => "dv"], children=collect(Field, dvf.children))
+    dmf = Field(
+        "d",
+        dvf.type;
+        nullable=dvf.nullable,
+        metadata=["dk" => "dv"],
+        children=collect(Field, dvf.children),
+    )
     dsp, dap = to_c_data(dmf, dvd)
     # Dictionary field metadata rides the OUTER wrapper node (the C++
     # bridge exports field metadata there; PyArrow imports only the
@@ -1320,14 +1640,28 @@ function cdata_battery()
     wsp, wap = to_c_data(dmf, dvd)
     wsch0 = unsafe_load(wsp)
     vsch0 = unsafe_load(wsch0.dictionary)
-    wblob = vcat(reinterpret(UInt8, Int32[1]),
-        reinterpret(UInt8, Int32[2]), codeunits("vk"),
-        reinterpret(UInt8, Int32[2]), codeunits("vv"))
+    wblob = vcat(
+        reinterpret(UInt8, Int32[1]),
+        reinterpret(UInt8, Int32[2]),
+        codeunits("vk"),
+        reinterpret(UInt8, Int32[2]),
+        codeunits("vv"),
+    )
     GC.@preserve wblob begin
-        unsafe_store!(wsch0.dictionary, CArrowSchema(vsch0.format,
-            vsch0.name, pointer(wblob), vsch0.flags, vsch0.n_children,
-            vsch0.children, vsch0.dictionary, vsch0.release,
-            vsch0.private_data))
+        unsafe_store!(
+            wsch0.dictionary,
+            CArrowSchema(
+                vsch0.format,
+                vsch0.name,
+                pointer(wblob),
+                vsch0.flags,
+                vsch0.n_children,
+                vsch0.children,
+                vsch0.dictionary,
+                vsch0.release,
+                vsch0.private_data,
+            ),
+        )
         wf2, wd2 = from_c_data(wsp, wap)
         @assert collect(wf2.metadata) == ["dk" => "dv", "vk" => "vv"]
         close!(wd2.buffers[2].region::OwnerRegion)
@@ -1340,8 +1674,10 @@ function cdata_battery()
     close!(pd2.buffers[2].region::OwnerRegion)
     reap!()
     # Hostile blobs refuse: negative counts and lengths would wrap the walk.
-    for negblob in (reinterpret(UInt8, Int32[-1]),
-        vcat(reinterpret(UInt8, Int32[1]), reinterpret(UInt8, Int32[-5])))
+    for negblob in (
+        reinterpret(UInt8, Int32[-1]),
+        vcat(reinterpret(UInt8, Int32[1]), reinterpret(UInt8, Int32[-5])),
+    )
         blob = collect(negblob)
         caught = try
             GC.@preserve blob Arrow._import_cmetadata(pointer(blob))
@@ -1359,16 +1695,15 @@ function cdata_battery()
     # Schema-level metadata rides the C stream's struct-typed schema node
     # (the C++/pyarrow convention for `schema.metadata`) in both directions.
     smf, smd = fromjulia("x", Int64[1, 2])
-    smsch = Schema(Field[smf]; metadata=["schema-k" => "schema-v", "dup" => "a",
-        "dup" => "b"])
+    smsch =
+        Schema(Field[smf]; metadata=["schema-k" => "schema-v", "dup" => "a", "dup" => "b"])
     smref = Ref{CArrowArrayStream}()
     GC.@preserve smref begin
         smp = Base.unsafe_convert(Ptr{CArrowArrayStream}, smref)
-        export_stream!(smp, smsch, AC.RecordBatch[
-            AC.RecordBatch(smsch, ArrayData[smd], 2)])
+        export_stream!(smp, smsch, AC.RecordBatch[AC.RecordBatch(smsch, ArrayData[smd], 2)])
         sms = from_c_stream(smp)
         @assert collect(sms.schema.metadata) ==
-            ["schema-k" => "schema-v", "dup" => "a", "dup" => "b"]
+                ["schema-k" => "schema-v", "dup" => "a", "dup" => "b"]
         smb = nextbatch!(sms)
         @assert smb isa AC.RecordBatch
         @assert collect(smb.schema.metadata) == collect(smsch.metadata)
@@ -1396,10 +1731,11 @@ function cdata_battery()
     # registry root); import refuses after the schema move and releases the
     # moved stream exactly once.
     badkey = String([0xff])
-    for badsch in (Schema(Field[smf]; metadata=[badkey => "v"]),
-                   Schema(Field[smf]; metadata=["k" => badkey]),
-                   Schema(Field[Field("x", IntType(64, true);
-                       metadata=["k" => badkey])]))
+    for badsch in (
+        Schema(Field[smf]; metadata=[badkey => "v"]),
+        Schema(Field[smf]; metadata=["k" => badkey]),
+        Schema(Field[Field("x", IntType(64, true); metadata=["k" => badkey])]),
+    )
         badref = Ref{CArrowArrayStream}()
         GC.@preserve badref begin
             badp = Base.unsafe_convert(Ptr{CArrowArrayStream}, badref)

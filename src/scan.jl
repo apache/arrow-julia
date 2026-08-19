@@ -81,24 +81,24 @@ View fields consume their declared variadic count on top of the fixed
 registry pair, so the walk carries the batch's variadic-count cursor in
 depth-first order (the same order the decode cursor consumes it).
 """
-function _bufferspan(f::Field, variadics::AbstractVector{Int64},
-    varidx::Base.RefValue{Int})
+function _bufferspan(f::Field, variadics::AbstractVector{Int64}, varidx::Base.RefValue{Int})
     spec = layoutspec(f.type)
     n = Int64(length(spec.buffers))
     if spec.variadic
-        varidx[] <= length(variadics) || throw(ValidationError(
-            "metadata declares fewer variadic buffer counts than the schema requires"))
+        varidx[] <= length(variadics) || throw(
+            ValidationError(
+                "metadata declares fewer variadic buffer counts than the schema requires",
+            ),
+        )
         vc = variadics[varidx[]]
         varidx[] += 1
-        vc >= 0 || throw(ValidationError(
-            "variadic buffer count $vc is invalid"))
+        vc >= 0 || throw(ValidationError("variadic buffer count $vc is invalid"))
         n = _planadd(n, vc, "buffer span")
     end
     f.type isa DictionaryType && return n
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     for i = 1:nchildren
-        n = _planadd(n, _bufferspan(f.children[i], variadics, varidx),
-            "buffer span")
+        n = _planadd(n, _bufferspan(f.children[i], variadics, varidx), "buffer span")
     end
     return n
 end
@@ -109,21 +109,21 @@ window or a buffer table may drive a range fetch. This is the metadata-only
 half of the decode cursor: exact node/buffer counts, every node invariant,
 top-level row-count agreement, and every buffer's geometry.
 """
-function _recordbatchmeta(header::Meta.RecordBatch, fields, limits::Limits,
-    bodylen::Int64)
+function _recordbatchmeta(header::Meta.RecordBatch, fields, limits::Limits, bodylen::Int64)
     rblen = something(header.length, Int64(0))
     0 <= rblen <= limits.max_array_length ||
         throw(ValidationError("record batch length $rblen exceeds limit"))
 
     nodes = something(header.nodes, Meta.FieldNode[])
     expectednodes = sum(_fieldnodespan(f) for f in fields; init=0)
-    length(nodes) == expectednodes || throw(ValidationError(
-        "field-node count does not match the schema"))
+    length(nodes) == expectednodes ||
+        throw(ValidationError("field-node count does not match the schema"))
     nodeidx = 1
     for f in fields
         node = nodes[nodeidx]
-        node.length == rblen || throw(ValidationError(
-            "RecordBatch length does not match top-level field nodes"))
+        node.length == rblen || throw(
+            ValidationError("RecordBatch length does not match top-level field nodes"),
+        )
         nodeidx += _fieldnodespan(f)
     end
     for node in nodes
@@ -138,11 +138,14 @@ function _recordbatchmeta(header::Meta.RecordBatch, fields, limits::Limits,
     varidx = Ref(1)
     expectedbuffers = Int64(0)
     for f in fields
-        expectedbuffers = _planadd(expectedbuffers,
-            _bufferspan(f, variadics, varidx), "record-batch buffer span")
+        expectedbuffers = _planadd(
+            expectedbuffers,
+            _bufferspan(f, variadics, varidx),
+            "record-batch buffer span",
+        )
     end
-    varidx[] == length(variadics) + 1 || throw(ValidationError(
-        "unconsumed variadic buffer counts: schema/batch mismatch"))
+    varidx[] == length(variadics) + 1 ||
+        throw(ValidationError("unconsumed variadic buffer counts: schema/batch mismatch"))
     length(buffers) == expectedbuffers ||
         throw(ValidationError("buffer count does not match the schema"))
     last_nonempty_end = Int64(0)
@@ -150,8 +153,8 @@ function _recordbatchmeta(header::Meta.RecordBatch, fields, limits::Limits,
         offset = Int64(b.offset)
         len = Int64(b.length)
         offset >= 0 || throw(ValidationError("negative batch buffer offset $offset"))
-        offset % 8 == 0 || throw(ValidationError(
-            "batch buffer offset $offset is not 8-byte aligned"))
+        offset % 8 == 0 ||
+            throw(ValidationError("batch buffer offset $offset is not 8-byte aligned"))
         0 <= len <= limits.max_buffer_bytes ||
             throw(ValidationError("batch buffer length $len exceeds limit"))
         bufferend = try
@@ -160,11 +163,11 @@ function _recordbatchmeta(header::Meta.RecordBatch, fields, limits::Limits,
             e isa OverflowError || rethrow()
             throw(ValidationError("batch buffer end overflows"))
         end
-        bufferend <= bodylen || throw(ValidationError(
-            "batch buffer [$offset, $len] escapes its message body"))
+        bufferend <= bodylen ||
+            throw(ValidationError("batch buffer [$offset, $len] escapes its message body"))
         if len > 0
-            offset >= last_nonempty_end || throw(ValidationError(
-                "batch buffers overlap or move backwards"))
+            offset >= last_nonempty_end ||
+                throw(ValidationError("batch buffers overlap or move backwards"))
             last_nonempty_end = bufferend
         end
     end
@@ -194,8 +197,8 @@ function _planminbytes(role, spec, node, len::Int64)
         len == 0 && node.null_count == 0 && return Int64(0)
         return node.length ÷ 8 + (node.length % 8 == 0 ? 0 : 1)
     elseif role == AC.DATA
-        spec.fixedwidth > 0 && return _planmul(
-            node.length, Int64(spec.fixedwidth), "planned data-buffer size")
+        spec.fixedwidth > 0 &&
+            return _planmul(node.length, Int64(spec.fixedwidth), "planned data-buffer size")
         if spec.fixedwidth == -1
             return node.length ÷ 8 + (node.length % 8 == 0 ? 0 : 1)
         end
@@ -204,8 +207,7 @@ function _planminbytes(role, spec, node, len::Int64)
         count = _planadd(node.length, Int64(1), "planned offset count")
         return _planmul(count, Int64(spec.offsetwidth), "planned offsets-buffer size")
     elseif role == AC.ELEMENT_OFFSETS || role == AC.SIZES
-        return _planmul(node.length, Int64(spec.offsetwidth),
-            "planned element-buffer size")
+        return _planmul(node.length, Int64(spec.offsetwidth), "planned element-buffer size")
     elseif role == AC.TYPE_IDS
         return node.length
     elseif role == AC.VIEWS
@@ -218,11 +220,11 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
     node = takenode!(c)
     t = f.type
     if t isa NullType
-        node.null_count == node.length || throw(ValidationError(
-            "Null field-node null count must equal its length"))
+        node.null_count == node.length ||
+            throw(ValidationError("Null field-node null count must equal its length"))
     elseif t isa UnionType
-        node.null_count == 0 || throw(ValidationError(
-            "Union field-node null count must be zero"))
+        node.null_count == 0 ||
+            throw(ValidationError("Union field-node null count must be zero"))
     end
     # Field.nullable is advisory (enforced only by the opt-in validate_full
     # tier), so a planned scan makes no nullability judgment here — the same
@@ -232,14 +234,23 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
         _, len = _buffermeta!(c)
         if codec == CODEC_NONE || len == 0
             need = _planminbytes(role, spec, node, len)
-            len >= need || throw(ValidationError(
-                "planned buffer length $len is smaller than required $need"))
+            len >= need || throw(
+                ValidationError(
+                    "planned buffer length $len is smaller than required $need",
+                ),
+            )
         else
-            len >= 8 || throw(ValidationError(
-                "compressed buffer of $len bytes lacks its length prefix"))
+            len >= 8 || throw(
+                ValidationError("compressed buffer of $len bytes lacks its length prefix"),
+            )
             need = _planminbytes(role, spec, node, Int64(0))
-            need > 0 && len == 8 && throw(ValidationError(
-                "compressed planned buffer requires a nonempty payload"))
+            need > 0 &&
+                len == 8 &&
+                throw(
+                    ValidationError(
+                        "compressed planned buffer requires a nonempty payload",
+                    ),
+                )
         end
     end
     if spec.variadic
@@ -248,48 +259,71 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
         # compression, the prefix rule are the plannable invariants.
         for _ = 1:takevariadic!(c)
             _, len = _buffermeta!(c)
-            codec == CODEC_NONE || len == 0 || len >= 8 || throw(ValidationError(
-                "compressed buffer of $len bytes lacks its length prefix"))
+            codec == CODEC_NONE ||
+                len == 0 ||
+                len >= 8 ||
+                throw(
+                    ValidationError(
+                        "compressed buffer of $len bytes lacks its length prefix",
+                    ),
+                )
         end
     end
     f.type isa DictionaryType && return node.length
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     childlens = Int64[]
-    fslextent = t isa FixedSizeListType ? _planmul(node.length,
-        Int64(t.listsize), "fixed-size-list child length") : Int64(0)
+    fslextent =
+        t isa FixedSizeListType ?
+        _planmul(node.length, Int64(t.listsize), "fixed-size-list child length") : Int64(0)
     for i = 1:nchildren
         push!(childlens, _validateplannedfield!(f.children[i], c, codec))
     end
     if t isa FixedSizeListType
-        childlens[1] >= fslextent || throw(ValidationError(
-            "fixed-size-list child is shorter than its parent extent"))
+        childlens[1] >= fslextent || throw(
+            ValidationError("fixed-size-list child is shorter than its parent extent"),
+        )
     elseif t isa StructType
-        all(>=(node.length), childlens) || throw(ValidationError(
-            "struct child is shorter than its parent extent"))
+        all(>=(node.length), childlens) ||
+            throw(ValidationError("struct child is shorter than its parent extent"))
     elseif t isa UnionType && t.mode == AC.SparseMode
-        all(==(node.length), childlens) || throw(ValidationError(
-            "sparse-union child length does not equal its parent length"))
+        all(==(node.length), childlens) || throw(
+            ValidationError("sparse-union child length does not equal its parent length"),
+        )
     elseif t isa RunEndEncodedType
-        node.null_count == 0 || throw(ValidationError(
-            "REE parent null count must be zero"))
-        childlens[1] == childlens[2] || throw(ValidationError(
-            "REE run-end and value child lengths must match"))
-        node.length == 0 || childlens[1] > 0 || throw(ValidationError(
-            "a nonempty REE array requires at least one physical run"))
+        node.null_count == 0 || throw(ValidationError("REE parent null count must be zero"))
+        childlens[1] == childlens[2] ||
+            throw(ValidationError("REE run-end and value child lengths must match"))
+        node.length == 0 ||
+            childlens[1] > 0 ||
+            throw(
+                ValidationError("a nonempty REE array requires at least one physical run"),
+            )
         runtype = f.children[1].type::IntType
-        maxrunend = runtype.bits == 16 ? Int64(typemax(Int16)) :
+        maxrunend =
+            runtype.bits == 16 ? Int64(typemax(Int16)) :
             runtype.bits == 32 ? Int64(typemax(Int32)) : typemax(Int64)
-        node.length <= maxrunend || throw(ValidationError(
-            "REE logical extent exceeds its run-end range"))
+        node.length <= maxrunend ||
+            throw(ValidationError("REE logical extent exceeds its run-end range"))
     end
     return node.length
 end
 
 "Validate every metadata-only invariant for the subtrees whose bodies are planned."
-function _validatebodyplan(header::Meta.RecordBatch, fields, limits::Limits,
-    codec::Int8, mask::AbstractVector{Bool})
-    cursor = DecodeCursor(header.nodes, header.buffers, BufferSlice(), limits;
-        codec=codec, variadics=variadiccounts(header))
+function _validatebodyplan(
+    header::Meta.RecordBatch,
+    fields,
+    limits::Limits,
+    codec::Int8,
+    mask::AbstractVector{Bool},
+)
+    cursor = DecodeCursor(
+        header.nodes,
+        header.buffers,
+        BufferSlice(),
+        limits;
+        codec=codec,
+        variadics=variadiccounts(header),
+    )
     for (j, f) in enumerate(fields)
         mask[j] ? _validateplannedfield!(f, cursor, codec) : skipfield!(f, cursor)
     end
@@ -306,16 +340,20 @@ function _scanmissingdicts(fields, nodes, dicts, fielddictids, mask::AbstractVec
     ns = something(nodes, Meta.FieldNode[])
     idx = Ref(1)
     function walk(f::Field, decoded::Bool)
-        idx[] <= length(ns) ||
-            throw(ValidationError("metadata declares fewer field nodes than the schema requires"))
+        idx[] <= length(ns) || throw(
+            ValidationError("metadata declares fewer field nodes than the schema requires"),
+        )
         node = ns[idx[]]
         idx[] += 1
         if f.type isa DictionaryType
             decoded || return
             id = fielddictids[f]
             if !haskey(dicts, id)
-                node.length >= 0 && node.null_count == node.length ||
-                    throw(ValidationError("record batch uses undefined dictionary id $id for a non-null slot"))
+                node.length >= 0 && node.null_count == node.length || throw(
+                    ValidationError(
+                        "record batch uses undefined dictionary id $id for a non-null slot",
+                    ),
+                )
             end
             return
         end
@@ -346,8 +384,8 @@ function _batchrows(f::ArrowFile, i::Int, budget::AllocationBudget)
     return _recordbatchmeta(fm.msg.header, f.fields, f.limits, fm.body.len)
 end
 
-_batchrows(f::ArrowFile, i::Int) = _batchrows(f, i,
-    AllocationBudget(f.limits.max_total_allocated_bytes))
+_batchrows(f::ArrowFile, i::Int) =
+    _batchrows(f, i, AllocationBudget(f.limits.max_total_allocated_bytes))
 
 """
 The masked-decode core shared by the in-memory and ranged paths: masked-in
@@ -355,10 +393,19 @@ fields decode and validate exactly as `getindex`; masked-out fields advance
 through `skipfield!`. The cursor must still finish clean — a skewed batch
 fails identically either way. `body` is a `BufferSlice` or a `SparseBody`.
 """
-function _maskedrecord(msg::Meta.Message, version::Int16, body,
-    fields, dicts, fielddictids, validated, limits::Limits,
-    schemaversion::Int16, mask::AbstractVector{Bool},
-    state::DecodeState)
+function _maskedrecord(
+    msg::Meta.Message,
+    version::Int16,
+    body,
+    fields,
+    dicts,
+    fielddictids,
+    validated,
+    limits::Limits,
+    schemaversion::Int16,
+    mask::AbstractVector{Bool},
+    state::DecodeState,
+)
     version == schemaversion ||
         throw(ValidationError("IPC metadata version changes within the file"))
     rejectexperimentalcompression(msg, version, UInt8(3))
@@ -366,11 +413,22 @@ function _maskedrecord(msg::Meta.Message, version::Int16, body,
     header isa Meta.RecordBatch ||
         throw(ValidationError("footer record block is not a record batch"))
     codec = _batchcodec(header.compression, version)
-    rblen = _recordbatchmeta(header, fields, limits,
-        body isa BufferSlice ? body.len : body.bodylen)
+    rblen = _recordbatchmeta(
+        header,
+        fields,
+        limits,
+        body isa BufferSlice ? body.len : body.bodylen,
+    )
     _scanmissingdicts(fields, header.nodes, dicts, fielddictids, mask)
-    cursor = DecodeCursor(header.nodes, header.buffers, body, limits;
-        codec=codec, state=state, variadics=variadiccounts(header))
+    cursor = DecodeCursor(
+        header.nodes,
+        header.buffers,
+        body,
+        limits;
+        codec=codec,
+        state=state,
+        variadics=variadiccounts(header),
+    )
     cols = Vector{Union{Nothing,ArrayData}}(nothing, length(fields))
     for (j, fld) in enumerate(fields)
         if mask[j]
@@ -384,8 +442,9 @@ function _maskedrecord(msg::Meta.Message, version::Int16, body,
         col = cols[j]
         col === nothing && continue
         AC._validate_semantic(fld, col, validated)
-        col.len == rblen ||
-            throw(ValidationError("RecordBatch length does not match top-level field nodes"))
+        col.len == rblen || throw(
+            ValidationError("RecordBatch length does not match top-level field nodes"),
+        )
     end
     return rblen, cols
 end
@@ -465,16 +524,15 @@ end
 "Resolve positional filter references once, against the source schema."
 _resolvefilter(::Nothing, names) = nothing
 function _resolvefilter(e::Tables.ScanExpr, names)
-    col(c) = c.ref isa Int && 1 <= c.ref <= length(names) ?
-        Tables.Col(names[c.ref]) : c
+    col(c) = c.ref isa Int && 1 <= c.ref <= length(names) ? Tables.Col(names[c.ref]) : c
     e isa Tables.Cmp && return Tables.Cmp(e.op, col(e.lhs), e.rhs)
     e isa Tables.In && return Tables.In(col(e.lhs), e.values)
     e isa Tables.IsNull && return Tables.IsNull(col(e.lhs), e.negated)
     e isa Tables.StrPred && return Tables.StrPred(e.kind, col(e.lhs), e.s)
-    e isa Tables.AndExpr && return Tables.AndExpr(
-        Tables.ScanExpr[_resolvefilter(a, names) for a in e.args])
-    e isa Tables.OrExpr && return Tables.OrExpr(
-        Tables.ScanExpr[_resolvefilter(a, names) for a in e.args])
+    e isa Tables.AndExpr &&
+        return Tables.AndExpr(Tables.ScanExpr[_resolvefilter(a, names) for a in e.args])
+    e isa Tables.OrExpr &&
+        return Tables.OrExpr(Tables.ScanExpr[_resolvefilter(a, names) for a in e.args])
     e isa Tables.NotExpr && return Tables.NotExpr(_resolvefilter(e.arg, names))
     return e
 end
@@ -518,12 +576,27 @@ function _addscanrows(total::Int, rows::Int64)
     return total + Int(rows)
 end
 
-function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool},
-    budget::AllocationBudget, state::DecodeState)
+function _scanbatch(
+    f::ArrowFile,
+    i::Int,
+    mask::AbstractVector{Bool},
+    budget::AllocationBudget,
+    state::DecodeState,
+)
     fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
-    return _maskedrecord(fm.msg, fm.version, fm.body, f.fields,
-        f.dictionaries, f.fielddictids, f.validated, f.limits,
-        f.schemaversion, mask, state)
+    return _maskedrecord(
+        fm.msg,
+        fm.version,
+        fm.body,
+        f.fields,
+        f.dictionaries,
+        f.fielddictids,
+        f.validated,
+        f.limits,
+        f.schemaversion,
+        mask,
+        state,
+    )
 end
 
 # ---------------------------------------------------------------------------
@@ -546,8 +619,8 @@ function _batchwindow(rowcounts::Vector{Int64}, offset::Int, limit::Union{Nothin
             remaining_skip -= rows
             continue
         end
-        take = unlimited ? rows - remaining_skip :
-            min(rows - remaining_skip, remaining_take)
+        take =
+            unlimited ? rows - remaining_skip : min(rows - remaining_skip, remaining_take)
         push!(window, (i, remaining_skip, take))
         if !unlimited
             remaining_take -= take
@@ -561,13 +634,17 @@ end
 # request whose `offset + limit` would overflow Int is still well-defined
 # there. Keeping such a request in the residual (rather than consuming it
 # here) is what keeps the pushed result identical to the executor's.
-_canconsumewindow(scan::Tables.Scan) = scan.offset < typemax(Int) &&
+_canconsumewindow(scan::Tables.Scan) =
+    scan.offset < typemax(Int) &&
     (scan.limit === nothing || scan.limit <= typemax(Int) - scan.offset)
 
 function _applyscan(f::ArrowFile, scan::Tables.Scan)
     names = Symbol[Symbol(fld.name) for fld in f.fields]
-    allunique(names) || throw(ValidationError(
-        "scan pushdown over duplicate column names is not supported; read the file without a scan"))
+    allunique(names) || throw(
+        ValidationError(
+            "scan pushdown over duplicate column names is not supported; read the file without a scan",
+        ),
+    )
     b = Tables.bind(scan, names)
     if isempty(names)
         # Zero-field sources: consume filter and window HERE — an empty
@@ -576,10 +653,14 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
         # allocation bound per read, exactly as the column path enforces.
         keep = _zerofieldpredicate(scan.filter)
         zfbudget = AllocationBudget(f.limits.max_total_allocated_bytes)
-        n = _zerofieldwindow((_batchrows(f, i, zfbudget) for i = 1:length(f)),
-            keep, scan.limit, scan.offset)
+        n = _zerofieldwindow(
+            (_batchrows(f, i, zfbudget) for i = 1:length(f)),
+            keep,
+            scan.limit,
+            scan.offset,
+        )
         return _scantable(Symbol[], (), Int(n)),
-            Tables.Scan(nothing, nothing, nothing, 0, scan.validate)
+        Tables.Scan(nothing, nothing, nothing, 0, scan.validate)
     end
     decodeidx = sort!(unique!(vcat(Int[c.index for c in b.columns], copy(b.filtercols))))
     mask = falses(length(names))
@@ -587,11 +668,16 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
     budget = AllocationBudget(f.limits.max_total_allocated_bytes)
     state = DecodeState(budget)
     try
-        consumed = scan.filter === nothing && _canconsumewindow(scan) &&
+        consumed =
+            scan.filter === nothing &&
+            _canconsumewindow(scan) &&
             (scan.limit !== nothing || scan.offset > 0)
         window = if consumed
-            _batchwindow(Int64[_batchrows(f, i, budget) for i = 1:length(f)],
-                scan.offset, scan.limit)
+            _batchwindow(
+                Int64[_batchrows(f, i, budget) for i = 1:length(f)],
+                scan.offset,
+                scan.limit,
+            )
         else
             Tuple{Int,Int64,Int64}[(i, Int64(0), Int64(-1)) for i = 1:length(f)]
         end
@@ -599,11 +685,19 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
         # empty under the filter; the filter itself always stays in the residual.
         keep = trues(length(f))
         if scan.filter !== nothing
-            stats = _readstats(f.schema.metadata, length(f), f.fields;
-                limits=f.limits, budget=budget)
-            stats === nothing ||
-                (keep = Bool[_maypass(scan.filter, stats[i].cols, names, stats[i].rows)
-                             for i = 1:length(f)])
+            stats = _readstats(
+                f.schema.metadata,
+                length(f),
+                f.fields;
+                limits=f.limits,
+                budget=budget,
+            )
+            stats === nothing || (
+                keep = Bool[
+                    _maypass(scan.filter, stats[i].cols, names, stats[i].rows) for
+                    i = 1:length(f)
+                ]
+            )
         end
         parts = Dict{Int,Vector{Any}}(idx => Any[] for idx in decodeidx)
         outrows = 0
@@ -624,13 +718,20 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
         # (whose excluded names are gone) or a `Regex` (which could over-match a
         # filter-only column) against it would be wrong. Bound columns become
         # concrete source-name items carrying their renames and type overrides.
-        residualselect = scan.select === nothing ? nothing :
-            Tables.SelectItem[Tables.SelectItem(names[c.index], c.type,
-                c.name == names[c.index] ? nothing : c.name) for c in b.columns]
+        residualselect =
+            scan.select === nothing ? nothing :
+            Tables.SelectItem[
+                Tables.SelectItem(
+                    names[c.index],
+                    c.type,
+                    c.name == names[c.index] ? nothing : c.name,
+                ) for c in b.columns
+            ]
         limit = consumed ? nothing : scan.limit
         offset = consumed ? 0 : scan.offset
         residualfilter = _resolvefilter(scan.filter, names)
-        return table, Tables.Scan(residualselect, residualfilter, limit, offset, scan.validate)
+        return table,
+        Tables.Scan(residualselect, residualfilter, limit, offset, scan.validate)
     finally
         close(state)
     end
@@ -709,17 +810,25 @@ struct FetchedSpans
     slices::Vector{BufferSlice}
 end
 
-function _fetchspans(src::RangedSource, ranges::Vector{NTuple{2,Int64}}, gap::Int64;
+function _fetchspans(
+    src::RangedSource,
+    ranges::Vector{NTuple{2,Int64}},
+    gap::Int64;
     budget::Union{Nothing,AllocationBudget}=nothing,
-    what::AbstractString="range fetch")
+    what::AbstractString="range fetch",
+)
     spans = _coalesce(ranges, gap)
     budget === nothing || foreach(s -> _charge!(budget, s[2], what), spans)
     payloads = fetchranges(src, spans)
-    length(payloads) == length(spans) || throw(ValidationError(
-        "range fetch returned $(length(payloads)) payloads, expected $(length(spans))"))
+    length(payloads) == length(spans) || throw(
+        ValidationError(
+            "range fetch returned $(length(payloads)) payloads, expected $(length(spans))",
+        ),
+    )
     for (payload, (_, len)) in zip(payloads, spans)
-        length(payload) == len || throw(ValidationError(
-            "range fetch returned $(length(payload)) bytes, expected $len"))
+        length(payload) == len || throw(
+            ValidationError("range fetch returned $(length(payload)) bytes, expected $len"),
+        )
     end
     slices = BufferSlice[BufferSlice(heapregion(p), 0, length(p)) for p in payloads]
     return FetchedSpans(Int64[s[1] for s in spans], Int64[s[2] for s in spans], slices)
@@ -728,9 +837,11 @@ end
 function _spanslice(fs::FetchedSpans, off::Int64, len::Int64)
     len == 0 && return BufferSlice()
     i = searchsortedlast(fs.starts, off)
-    (i >= 1 && off >= fs.starts[i] &&
-     AC.checked_add(off, len) <= AC.checked_add(fs.starts[i], fs.lens[i])) ||
-        throw(ValidationError("required bytes [$off, $len] were not fetched"))
+    (
+        i >= 1 &&
+        off >= fs.starts[i] &&
+        AC.checked_add(off, len) <= AC.checked_add(fs.starts[i], fs.lens[i])
+    ) || throw(ValidationError("required bytes [$off, $len] were not fetched"))
     return AC.subslice(fs.slices[i], off - fs.starts[i], len)
 end
 
@@ -776,8 +887,12 @@ Parse and verify one fetched block-metadata payload the way `_blockmessage`
 does over a region: framing prefix, verified flatbuffer graph, declared
 body length against the Block tuple.
 """
-function _parseblockmeta(bytes::Vector{UInt8}, block::NTuple{3,Int64},
-    limits::Limits, budget::AllocationBudget)
+function _parseblockmeta(
+    bytes::Vector{UInt8},
+    block::NTuple{3,Int64},
+    limits::Limits,
+    budget::AllocationBudget,
+)
     offset, metalen, bodylen = block
     length(bytes) == metalen ||
         throw(ValidationError("footer block metadata fetch length mismatch"))
@@ -787,10 +902,13 @@ function _parseblockmeta(bytes::Vector{UInt8}, block::NTuple{3,Int64},
     declared = Int64(reinterpret(Int32, bytes[5:8])[1])
     declared == metalen - 8 ||
         throw(ValidationError("footer block metadata length does not match the message"))
-    0 < declared <= limits.max_metadata_bytes || throw(ValidationError(
-        "metadata length $declared outside (0, $(limits.max_metadata_bytes)]"))
-    0 <= bodylen <= limits.max_body_bytes || throw(ValidationError(
-        "body length $bodylen outside [0, $(limits.max_body_bytes)]"))
+    0 < declared <= limits.max_metadata_bytes || throw(
+        ValidationError(
+            "metadata length $declared outside (0, $(limits.max_metadata_bytes)]",
+        ),
+    )
+    0 <= bodylen <= limits.max_body_bytes ||
+        throw(ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"))
     _charge!(budget, declared, "metadata allocation")
     metabytes = bytes[9:end]
     version, header_type, _, reserve = verify_ipc_metadata(metabytes, limits, budget.left)
@@ -824,8 +942,12 @@ struct RangedFile{F}
     tailbytes::Int64
     coalesce_gap::Int64
 end
-function RangedFile(src::RangedSource; limits::Limits=Limits(),
-    tailbytes::Integer=65536, coalesce_gap::Integer=262144)
+function RangedFile(
+    src::RangedSource;
+    limits::Limits=Limits(),
+    tailbytes::Integer=65536,
+    coalesce_gap::Integer=262144,
+)
     gap = Int64(coalesce_gap)
     gap >= 0 || throw(ArgumentError("negative coalesce gap"))
     return RangedFile(src, limits, Int64(max(tailbytes, 32)), gap)
@@ -848,41 +970,67 @@ function _rangedfooter(rf::RangedFile, budget::AllocationBudget)
     tail[(end - 5):end] == Vector{UInt8}(FILE_MAGIC) ||
         throw(ValidationError("missing trailing ARROW1 magic"))
     footerlen = Int64(reinterpret(Int32, tail[(end - 9):(end - 6)])[1])
-    0 < footerlen <= limits.max_metadata_bytes ||
-        throw(ValidationError("footer length $footerlen outside (0, $(limits.max_metadata_bytes)]"))
+    0 < footerlen <= limits.max_metadata_bytes || throw(
+        ValidationError(
+            "footer length $footerlen outside (0, $(limits.max_metadata_bytes)]",
+        ),
+    )
     footerstart = L - 10 - footerlen
     footerstart >= 8 || throw(ValidationError("footer escapes the file"))
 
     _charge!(budget, footerlen, "footer allocation")
-    footerbytes = footerstart >= tailstart ?
+    footerbytes =
+        footerstart >= tailstart ?
         tail[(footerstart - tailstart + 1):(footerstart - tailstart + footerlen)] :
         _fetchexact(src, footerstart, footerlen)
     version, features, dictblocks, recordblocks, reserve =
         verify_footer(footerbytes, limits, budget.left)
     _charge!(budget, reserve, "verified footer expansion")
-    Int64(1) in features && throw(ValidationError(
-        "dictionary replacement is forbidden in the IPC file format"))
-    nmessages = AC.checked_add(Int64(1),
-        AC.checked_add(Int64(length(dictblocks)), Int64(length(recordblocks))))
+    Int64(1) in features &&
+        throw(ValidationError("dictionary replacement is forbidden in the IPC file format"))
+    nmessages = AC.checked_add(
+        Int64(1),
+        AC.checked_add(Int64(length(dictblocks)), Int64(length(recordblocks))),
+    )
     nmessages <= limits.max_messages ||
         throw(ValidationError("message count exceeds limit"))
     footer = FB.getrootas(Meta.Footer, footerbytes, 0)
     metaschema = footer.schema
-    metaschema === nothing &&
-        throw(ValidationError("file footer carries no schema"))
+    metaschema === nothing && throw(ValidationError("file footer carries no schema"))
     something(metaschema.endianness, Meta.Endianness.Little) == Meta.Endianness.Little ||
-        throw(ValidationError("big-endian IPC is not supported (no endianness normalization)"))
+        throw(
+            ValidationError(
+                "big-endian IPC is not supported (no endianness normalization)",
+            ),
+        )
     dictids = Dict{Int64,Meta.Field}()
     fielddictids = IdDict{Field,Int64}()
-    fields = Field[corefield(f, dictids, fielddictids)
-                   for f in something(metaschema.fields, Meta.Field[])]
+    fields = Field[
+        corefield(f, dictids, fielddictids) for
+        f in something(metaschema.fields, Meta.Field[])
+    ]
     foreach(validateschemafield, fields)
     dictvaluefields = validatedictionaryids(fields, fielddictids)
-    sch = Schema(fields; metadata=coremetadata(metaschema.custom_metadata),
-        endianness=AC.LittleEndian)
-    return (; sch, fields, dictids, fielddictids, dictvaluefields, version,
-        features, dictblocks, recordblocks, footerstart, tail, tailstart,
-        metaschema)
+    sch = Schema(
+        fields;
+        metadata=coremetadata(metaschema.custom_metadata),
+        endianness=AC.LittleEndian,
+    )
+    return (;
+        sch,
+        fields,
+        dictids,
+        fielddictids,
+        dictvaluefields,
+        version,
+        features,
+        dictblocks,
+        recordblocks,
+        footerstart,
+        tail,
+        tailstart,
+        metaschema,
+    )
 end
 
 """
@@ -893,24 +1041,31 @@ the fetch, the fetch and parse charged to the caller's cumulative budget,
 graph, body-length cross-check), header kind, footer-version agreement,
 and compression rejection.
 """
-function _zerofieldblockcount(rf::RangedFile, block::NTuple{3,Int64},
-    version::Int16, fields::Vector{Field}, budget::AllocationBudget)
+function _zerofieldblockcount(
+    rf::RangedFile,
+    block::NTuple{3,Int64},
+    version::Int16,
+    fields::Vector{Field},
+    budget::AllocationBudget,
+)
     _, metalen, bodylen = block
     declared = metalen - 8
-    0 < declared <= rf.limits.max_metadata_bytes || throw(ValidationError(
-        "metadata length $declared outside (0, $(rf.limits.max_metadata_bytes)]"))
-    0 <= bodylen <= rf.limits.max_body_bytes || throw(ValidationError(
-        "body length $bodylen outside [0, $(rf.limits.max_body_bytes)]"))
+    0 < declared <= rf.limits.max_metadata_bytes || throw(
+        ValidationError(
+            "metadata length $declared outside (0, $(rf.limits.max_metadata_bytes)]",
+        ),
+    )
+    0 <= bodylen <= rf.limits.max_body_bytes || throw(
+        ValidationError("body length $bodylen outside [0, $(rf.limits.max_body_bytes)]"),
+    )
     _charge!(budget, metalen, "metadata range fetch")
     payload = _fetchexact(rf.src, block[1], metalen)
     msg, v, header_type = _parseblockmeta(payload, block, rf.limits, budget)
     header_type == UInt8(3) ||
         throw(ValidationError("footer record block is not a record batch"))
-    v == version ||
-        throw(ValidationError("IPC metadata version changes within the file"))
+    v == version || throw(ValidationError("IPC metadata version changes within the file"))
     rejectexperimentalcompression(msg, v, header_type)
-    return _recordbatchmeta(msg.header::Meta.RecordBatch, fields, rf.limits,
-        bodylen)
+    return _recordbatchmeta(msg.header::Meta.RecordBatch, fields, rf.limits, bodylen)
 end
 
 "Schema-only ranged read for the facade (the head magic + one tail fetch)."
@@ -938,8 +1093,11 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
     tailstart = ft.tailstart
     metaschema = ft.metaschema
     names = Symbol[Symbol(fld.name) for fld in fields]
-    allunique(names) || throw(ValidationError(
-        "scan pushdown over duplicate column names is not supported; read the file without a scan"))
+    allunique(names) || throw(
+        ValidationError(
+            "scan pushdown over duplicate column names is not supported; read the file without a scan",
+        ),
+    )
     b = Tables.bind(scan, names)
     if isempty(names)
         # Zero-field sources: consume filter and window HERE — an empty
@@ -951,14 +1109,23 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
         # A zero-field schema declares no dictionary ids, so every indexed
         # dictionary block is orphaned — the same rejection the id-membership
         # check produces on the column path and in the full reader.
-        isempty(dictblocks) || throw(ValidationError(
-            "dictionary batch has no declaring field in a zero-field schema"))
+        isempty(dictblocks) || throw(
+            ValidationError(
+                "dictionary batch has no declaring field in a zero-field schema",
+            ),
+        )
         keep = _zerofieldpredicate(scan.filter)
         n = _zerofieldwindow(
-            (_zerofieldblockcount(rf, block, version, fields, budget)
-             for block in recordblocks), keep, scan.limit, scan.offset)
+            (
+                _zerofieldblockcount(rf, block, version, fields, budget) for
+                block in recordblocks
+            ),
+            keep,
+            scan.limit,
+            scan.offset,
+        )
         return _scantable(Symbol[], (), Int(n)),
-            Tables.Scan(nothing, nothing, nothing, 0, scan.validate)
+        Tables.Scan(nothing, nothing, nothing, 0, scan.validate)
     end
     decodeidx = sort!(unique!(vcat(Int[c.index for c in b.columns], copy(b.filtercols))))
     mask = falses(length(names))
@@ -975,11 +1142,18 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
     nrec = length(recordblocks)
     keep = trues(nrec)
     if scan.filter !== nothing
-        stats = _readstats(coremetadata(metaschema.custom_metadata), nrec, fields;
-            limits=limits, budget=budget)
-        stats === nothing ||
-            (keep = Bool[_maypass(scan.filter, stats[i].cols, names, stats[i].rows)
-                         for i = 1:nrec])
+        stats = _readstats(
+            coremetadata(metaschema.custom_metadata),
+            nrec,
+            fields;
+            limits=limits,
+            budget=budget,
+        )
+        stats === nothing || (
+            keep = Bool[
+                _maypass(scan.filter, stats[i].cols, names, stats[i].rows) for i = 1:nrec
+            ]
+        )
     end
     recidxs = Int[i for i = 1:nrec if keep[i]]
 
@@ -992,29 +1166,38 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
     for block in metablocks
         _, metalen, bodylen = block
         declared = metalen - 8
-        0 < declared <= limits.max_metadata_bytes || throw(ValidationError(
-            "metadata length $declared outside (0, $(limits.max_metadata_bytes)]"))
-        0 <= bodylen <= limits.max_body_bytes || throw(ValidationError(
-            "body length $bodylen outside [0, $(limits.max_body_bytes)]"))
+        0 < declared <= limits.max_metadata_bytes || throw(
+            ValidationError(
+                "metadata length $declared outside (0, $(limits.max_metadata_bytes)]",
+            ),
+        )
+        0 <= bodylen <= limits.max_body_bytes || throw(
+            ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"),
+        )
     end
-    metaspans = _fetchspans(src,
-        NTuple{2,Int64}[(bl[1], bl[2]) for bl in metablocks], rf.coalesce_gap;
-        budget=budget, what="metadata range fetch")
+    metaspans = _fetchspans(
+        src,
+        NTuple{2,Int64}[(bl[1], bl[2]) for bl in metablocks],
+        rf.coalesce_gap;
+        budget=budget,
+        what="metadata range fetch",
+    )
     blockmeta = Vector{Tuple{Meta.Message,Int16}}(undef, length(metablocks))
     for (i, block) in enumerate(metablocks)
         payload = AC.slicebytes(_spanslice(metaspans, block[1], block[2]))
         msg, v, header_type = _parseblockmeta(payload, block, limits, budget)
         expected_dict = i <= length(dictblocks)
-        (expected_dict ? header_type == UInt8(2) : header_type == UInt8(3)) ||
-            throw(ValidationError(expected_dict ?
-                "footer dictionary block is not a dictionary batch" :
-                "footer record block is not a record batch"))
+        (expected_dict ? header_type == UInt8(2) : header_type == UInt8(3)) || throw(
+            ValidationError(
+                expected_dict ? "footer dictionary block is not a dictionary batch" :
+                "footer record block is not a record batch",
+            ),
+        )
         v == version ||
             throw(ValidationError("IPC metadata version changes within the file"))
         rejectexperimentalcompression(msg, v, header_type)
         if !expected_dict
-            _recordbatchmeta(msg.header::Meta.RecordBatch, fields, limits,
-                block[3])
+            _recordbatchmeta(msg.header::Meta.RecordBatch, fields, limits, block[3])
         end
         blockmeta[i] = (msg, v)
     end
@@ -1022,19 +1205,23 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
     # RecordBatch lengths live in block metadata, not the Footer. The metadata
     # pass above is required before limit/offset can choose body ranges.
     nsurv = length(recidxs)
-    headers = [blockmeta[length(dictblocks) + p][1].header::Meta.RecordBatch
-               for p = 1:nsurv]
-    rowcounts = Int64[_recordbatchmeta(h, fields, limits,
-        recordblocks[recidxs[p]][3]) for (p, h) in enumerate(headers)]
-    consumed = scan.filter === nothing && _canconsumewindow(scan) &&
+    headers =
+        [blockmeta[length(dictblocks) + p][1].header::Meta.RecordBatch for p = 1:nsurv]
+    rowcounts = Int64[
+        _recordbatchmeta(h, fields, limits, recordblocks[recidxs[p]][3]) for
+        (p, h) in enumerate(headers)
+    ]
+    consumed =
+        scan.filter === nothing &&
+        _canconsumewindow(scan) &&
         (scan.limit !== nothing || scan.offset > 0)
-    window = consumed ? _batchwindow(rowcounts, scan.offset, scan.limit) :
+    window =
+        consumed ? _batchwindow(rowcounts, scan.offset, scan.limit) :
         Tuple{Int,Int64,Int64}[(p, Int64(0), Int64(-1)) for p = 1:nsurv]
 
     # Decode-set dictionaries: whole bodies, coalesced; everything else is
     # metadata-only forever.
-    needed = isempty(window) ? Set{Int64}() :
-        _neededdictids(fields, fielddictids, mask)
+    needed = isempty(window) ? Set{Int64}() : _neededdictids(fields, fielddictids, mask)
     dicts = Dict{Int64,ArrayData}()
     validated = AC._ValidatedDictionaries()
     seenids = Set{Int64}()
@@ -1044,8 +1231,7 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
         header = msg.header
         header isa Meta.DictionaryBatch ||
             throw(ValidationError("footer dictionary block is not a dictionary batch"))
-        header.isDelta &&
-            throw(ValidationError("delta dictionaries are not supported"))
+        header.isDelta && throw(ValidationError("delta dictionaries are not supported"))
         haskey(dictids, header.id) ||
             throw(ValidationError("dictionary batch has unknown id $(header.id)"))
         header.id in seenids &&
@@ -1066,14 +1252,22 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
         _validatebodyplan(headers[p], fields, limits, codec, mask)
     end
     missingids = setdiff(needed, seenids)
-    isempty(missingids) || throw(ValidationError(
-        "record batch references dictionary id $(first(missingids)) before its dictionary batch"))
+    isempty(missingids) || throw(
+        ValidationError(
+            "record batch references dictionary id $(first(missingids)) before its dictionary batch",
+        ),
+    )
     state = DecodeState(budget)
     try
         if !isempty(wanted_dict)
-            bodyspans = _fetchspans(src,
-                NTuple{2,Int64}[(dictblocks[i][1] + dictblocks[i][2], dictblocks[i][3])
-                                for i in wanted_dict], rf.coalesce_gap)
+            bodyspans = _fetchspans(
+                src,
+                NTuple{2,Int64}[
+                    (dictblocks[i][1] + dictblocks[i][2], dictblocks[i][3]) for
+                    i in wanted_dict
+                ],
+                rf.coalesce_gap,
+            )
             for i in wanted_dict
                 block = dictblocks[i]
                 msg, v = blockmeta[i]
@@ -1084,12 +1278,22 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
                 vf = dictvaluefields[header.id]
                 rblen = _recordbatchmeta(rb, (vf,), limits, block[3])
                 body = _spanslice(bodyspans, block[1] + block[2], block[3])
-                cursor = DecodeCursor(rb.nodes, rb.buffers, body, limits;
-                    codec=codec, state=state, variadics=variadiccounts(rb))
+                cursor = DecodeCursor(
+                    rb.nodes,
+                    rb.buffers,
+                    body,
+                    limits;
+                    codec=codec,
+                    state=state,
+                    variadics=variadiccounts(rb),
+                )
                 decoded = decodefield(vf, cursor, dicts, fielddictids)
                 finishcursor!(cursor)
-                decoded.len == rblen ||
-                    throw(ValidationError("dictionary RecordBatch length does not match its field node"))
+                decoded.len == rblen || throw(
+                    ValidationError(
+                        "dictionary RecordBatch length does not match its field node",
+                    ),
+                )
                 validate_semantic(vf, decoded)
                 validated[decoded] = nothing
                 dicts[header.id] = decoded
@@ -1108,18 +1312,28 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
             bufidx = 1
             for (j, fld) in enumerate(fields)
                 span64 = _bufferspan(fld, variadics, varidx)
-                span64 <= typemax(Int) || throw(ValidationError(
-                    "field buffer span $span64 exceeds the host index range"))
+                span64 <= typemax(Int) || throw(
+                    ValidationError(
+                        "field buffer span $span64 exceeds the host index range",
+                    ),
+                )
                 span = Int(span64)
                 if mask[j]
                     for k = bufidx:(bufidx + span - 1)
-                        k <= length(buffers) ||
-                            throw(ValidationError("metadata declares fewer buffers than the schema requires"))
+                        k <= length(buffers) || throw(
+                            ValidationError(
+                                "metadata declares fewer buffers than the schema requires",
+                            ),
+                        )
                         buf = buffers[k]
                         len = Int64(buf.length)
                         off = Int64(buf.offset)
                         (off >= 0 && len >= 0 && AC.checked_add(off, len) <= block[3]) ||
-                            throw(ValidationError("batch buffer [$off, $len] escapes its message body"))
+                            throw(
+                                ValidationError(
+                                    "batch buffer [$off, $len] escapes its message body",
+                                ),
+                            )
                         len == 0 && continue
                         push!(wants, (off, len))
                     end
@@ -1128,7 +1342,10 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
             end
             blockwants[p] = wants
             bodystart = block[1] + block[2]
-            append!(bodyranges, NTuple{2,Int64}[(bodystart + off, len) for (off, len) in wants])
+            append!(
+                bodyranges,
+                NTuple{2,Int64}[(bodystart + off, len) for (off, len) in wants],
+            )
         end
         bodyspans = _fetchspans(src, bodyranges, rf.coalesce_gap)
 
@@ -1138,8 +1355,19 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
             block = recordblocks[recidxs[p]]
             msg, v = blockmeta[length(dictblocks) + p]
             body = SparseBody(block[3], block[1] + block[2], bodyspans)
-            _, cols = _maskedrecord(msg, v, body, fields, dicts, fielddictids,
-                validated, limits, version, mask, state)
+            _, cols = _maskedrecord(
+                msg,
+                v,
+                body,
+                fields,
+                dicts,
+                fielddictids,
+                validated,
+                limits,
+                version,
+                mask,
+                state,
+            )
             outrows = _addscanrows(outrows, take >= 0 ? take : rowcounts[p])
             for idx in decodeidx
                 col = _scancolumn(fields[idx], cols[idx]::ArrayData)
@@ -1149,13 +1377,20 @@ function _applyscan(rf::RangedFile, scan::Tables.Scan)
         end
         outcols = Tuple(_joinscanparts(fields[idx], parts[idx]) for idx in decodeidx)
         table = _scantable(names[decodeidx], outcols, outrows)
-        residualselect = scan.select === nothing ? nothing :
-            Tables.SelectItem[Tables.SelectItem(names[c.index], c.type,
-                c.name == names[c.index] ? nothing : c.name) for c in b.columns]
+        residualselect =
+            scan.select === nothing ? nothing :
+            Tables.SelectItem[
+                Tables.SelectItem(
+                    names[c.index],
+                    c.type,
+                    c.name == names[c.index] ? nothing : c.name,
+                ) for c in b.columns
+            ]
         limit = consumed ? nothing : scan.limit
         offset = consumed ? 0 : scan.offset
         residualfilter = _resolvefilter(scan.filter, names)
-        return table, Tables.Scan(residualselect, residualfilter, limit, offset, scan.validate)
+        return table,
+        Tables.Scan(residualselect, residualfilter, limit, offset, scan.validate)
     finally
         close(state)
     end
@@ -1180,7 +1415,6 @@ end
 # Per-batch statistics — the official value layout in a footer key
 # ===========================================================================
 
-
 # Placement is OUR convention (the statistics-schema spec's non-goals
 # explicitly exclude placement); the VALUE layout is the official one:
 #     struct<column: int32, statistics:
@@ -1196,20 +1430,30 @@ const STATS_MAX = "ARROW:max_value:exact"
 const STATS_KEYPOOL = [STATS_ROW_COUNT, STATS_NULL_COUNT, STATS_MIN, STATS_MAX]
 
 function _statsschema()
-    key = Field("key", DictionaryType(IntType(32, true), Utf8Type(false), false);
-        nullable=false, children=Field[])
-    value = Field("value", UnionType(AC.DenseMode, Int8[0, 1, 2, 3]);
-        nullable=false, children=Field[
+    key = Field(
+        "key",
+        DictionaryType(IntType(32, true), Utf8Type(false), false);
+        nullable=false,
+        children=Field[],
+    )
+    value = Field(
+        "value",
+        UnionType(AC.DenseMode, Int8[0, 1, 2, 3]);
+        nullable=false,
+        children=Field[
             Field("i64", IntType(64, true); nullable=false),
             Field("f64", FloatType(64); nullable=false),
             Field("str", Utf8Type(false); nullable=false),
-            Field("bool", BoolType(); nullable=false)])
-    entries = Field("entries", StructType(); nullable=false,
-        children=Field[key, value])
-    return Schema(Field[
-        Field("column", IntType(32, true); nullable=true),
-        Field("statistics", MapType(false); nullable=false,
-            children=Field[entries])])
+            Field("bool", BoolType(); nullable=false),
+        ],
+    )
+    entries = Field("entries", StructType(); nullable=false, children=Field[key, value])
+    return Schema(
+        Field[
+            Field("column", IntType(32, true); nullable=true),
+            Field("statistics", MapType(false); nullable=false, children=Field[entries]),
+        ],
+    )
 end
 
 function _bitmapbytes(bits::AbstractVector{Bool})
@@ -1227,9 +1471,12 @@ function _utf8data(strs::Vector{String})
         append!(bytes, codeunits(s))
         push!(offsets, Int32(length(bytes)))
     end
-    return ArrayData(Utf8Type(false), length(strs),
+    return ArrayData(
+        Utf8Type(false),
+        length(strs),
         [BufferSlice(), AC._databuffer(offsets), AC._databuffer(bytes)];
-        nullcount=0)
+        nullcount=0,
+    )
 end
 
 """
@@ -1260,10 +1507,15 @@ function _statfold(f::Field, d::ArrayData)
     else
         AC.nullcount(d)
     end
-    supported = stat isa IntType ? (stat.signed || stat.bits < 64) :
-        stat isa FloatType || stat isa BoolType || stat isa Utf8Type ||
+    supported =
+        stat isa IntType ? (stat.signed || stat.bits < 64) :
+        stat isa FloatType ||
+        stat isa BoolType ||
+        stat isa Utf8Type ||
         (stat isa ViewType && stat.utf8) ||
-        stat isa DateType || stat isa TimeType || stat isa TimestampType ||
+        stat isa DateType ||
+        stat isa TimeType ||
+        stat isa TimestampType ||
         stat isa DurationType
     supported || return nc, nothing, nothing
     lo = hi = nothing
@@ -1287,21 +1539,29 @@ function _statfold(f::Field, d::ArrayData)
             isless(hi, v) && (hi = v)
         end
     end
-    _statnorm(v) = v isa Bool ? v : v isa AbstractString ? String(v) :
-        v isa AbstractFloat ? Float64(v) : Int64(v)
-    return nc, lo === nothing || hasnan ? nothing : _statnorm(lo),
-        hi === nothing || hasnan ? nothing : _statnorm(hi)
+    _statnorm(v) =
+        v isa Bool ? v :
+        v isa AbstractString ? String(v) : v isa AbstractFloat ? Float64(v) : Int64(v)
+    return nc,
+    lo === nothing || hasnan ? nothing : _statnorm(lo),
+    hi === nothing || hasnan ? nothing : _statnorm(hi)
 end
 
 "One statistics record batch (the official layout) for one data batch."
-function _statsbatch(statssch::Schema, nrows::Int64,
-    colstats::Vector{Tuple{Int,Int64,Any,Any}})
+function _statsbatch(
+    statssch::Schema,
+    nrows::Int64,
+    colstats::Vector{Tuple{Int,Int64,Any,Any}},
+)
     rows = 1 + length(colstats)               # batch-level row + per-column rows
     colvalid = vcat(false, trues(length(colstats)))
     colvals = vcat(Int32(0), Int32[Int32(c[1] - 1) for c in colstats])
-    columndata = ArrayData(IntType(32, true), rows,
+    columndata = ArrayData(
+        IntType(32, true),
+        rows,
         [AC._databuffer(_bitmapbytes(colvalid)), AC._databuffer(colvals)];
-        nullcount=1)
+        nullcount=1,
+    )
     keyidx = Int32[]
     typeids = Int8[]
     offsets = Int32[]
@@ -1313,13 +1573,21 @@ function _statsbatch(statssch::Schema, nrows::Int64,
     function pushstat!(key::String, v)
         push!(keyidx, Int32(findfirst(==(key), STATS_KEYPOOL) - 1))
         if v isa Bool
-            push!(typeids, Int8(3)); push!(offsets, Int32(length(bools))); push!(bools, v)
+            push!(typeids, Int8(3))
+            push!(offsets, Int32(length(bools)))
+            push!(bools, v)
         elseif v isa String
-            push!(typeids, Int8(2)); push!(offsets, Int32(length(strs))); push!(strs, v)
+            push!(typeids, Int8(2))
+            push!(offsets, Int32(length(strs)))
+            push!(strs, v)
         elseif v isa Float64
-            push!(typeids, Int8(1)); push!(offsets, Int32(length(f64s))); push!(f64s, v)
+            push!(typeids, Int8(1))
+            push!(offsets, Int32(length(f64s)))
+            push!(f64s, v)
         else
-            push!(typeids, Int8(0)); push!(offsets, Int32(length(i64s))); push!(i64s, Int64(v))
+            push!(typeids, Int8(0))
+            push!(offsets, Int32(length(i64s)))
+            push!(i64s, Int64(v))
         end
         return nothing
     end
@@ -1333,24 +1601,55 @@ function _statsbatch(statssch::Schema, nrows::Int64,
     end
     nentries = length(keyidx)
     pool = _utf8data(String.(STATS_KEYPOOL))
-    keydata = ArrayData(DictionaryType(IntType(32, true), Utf8Type(false), false),
-        nentries, [BufferSlice(), AC._databuffer(keyidx)];
-        dictionary=pool, nullcount=0)
-    booldata = ArrayData(BoolType(), length(bools),
-        [BufferSlice(), AC._databuffer(_bitmapbytes(bools))]; nullcount=0)
-    valuedata = ArrayData(UnionType(AC.DenseMode, Int8[0, 1, 2, 3]), nentries,
+    keydata = ArrayData(
+        DictionaryType(IntType(32, true), Utf8Type(false), false),
+        nentries,
+        [BufferSlice(), AC._databuffer(keyidx)];
+        dictionary=pool,
+        nullcount=0,
+    )
+    booldata = ArrayData(
+        BoolType(),
+        length(bools),
+        [BufferSlice(), AC._databuffer(_bitmapbytes(bools))];
+        nullcount=0,
+    )
+    valuedata = ArrayData(
+        UnionType(AC.DenseMode, Int8[0, 1, 2, 3]),
+        nentries,
         [AC._databuffer(typeids), AC._databuffer(offsets)];
-        children=[ArrayData(IntType(64, true), length(i64s),
-                [BufferSlice(), AC._databuffer(i64s)]; nullcount=0),
-            ArrayData(FloatType(64), length(f64s),
-                [BufferSlice(), AC._databuffer(f64s)]; nullcount=0),
-            _utf8data(strs), booldata],
-        nullcount=0)
-    entriesdata = ArrayData(StructType(), nentries, [BufferSlice()];
-        children=[keydata, valuedata], nullcount=0)
-    mapdata = ArrayData(MapType(false), rows,
+        children=[
+            ArrayData(
+                IntType(64, true),
+                length(i64s),
+                [BufferSlice(), AC._databuffer(i64s)];
+                nullcount=0,
+            ),
+            ArrayData(
+                FloatType(64),
+                length(f64s),
+                [BufferSlice(), AC._databuffer(f64s)];
+                nullcount=0,
+            ),
+            _utf8data(strs),
+            booldata,
+        ],
+        nullcount=0,
+    )
+    entriesdata = ArrayData(
+        StructType(),
+        nentries,
+        [BufferSlice()];
+        children=[keydata, valuedata],
+        nullcount=0,
+    )
+    mapdata = ArrayData(
+        MapType(false),
+        rows,
         [BufferSlice(), AC._databuffer(mapoffsets)];
-        children=[entriesdata], nullcount=0)
+        children=[entriesdata],
+        nullcount=0,
+    )
     return AC.RecordBatch(statssch, ArrayData[columndata, mapdata], rows)
 end
 
@@ -1380,8 +1679,7 @@ function withstatistics(sch::Schema, batches::AbstractVector{AC.RecordBatch})
     blob = Base64.base64encode(writestream(statssch, statsbatches))
     metadata = Dict{String,String}(something(sch.metadata, Dict{String,String}()))
     metadata[STATS_KEY] = blob
-    return Schema(collect(Field, sch.fields); metadata=metadata,
-        endianness=sch.endianness)
+    return Schema(collect(Field, sch.fields); metadata=metadata, endianness=sch.endianness)
 end
 
 "Validate the canonical outer statistics-schema shape before using values."
@@ -1390,31 +1688,38 @@ function _validatestatsschema(sch::Schema)
         throw(ArgumentError("statistics schema must have two fields"))
     column, statistics = sch.fields
     ct = column.type
-    column.name == "column" && column.nullable && ct isa IntType &&
-        ct.bits == 32 && ct.signed && isempty(column.children) ||
+    column.name == "column" &&
+    column.nullable &&
+    ct isa IntType &&
+    ct.bits == 32 &&
+    ct.signed &&
+    isempty(column.children) ||
         throw(ArgumentError("statistics column field is not nullable int32"))
-    statistics.name == "statistics" && !statistics.nullable &&
-        statistics.type isa MapType && length(statistics.children) == 1 ||
+    statistics.name == "statistics" &&
+    !statistics.nullable &&
+    statistics.type isa MapType &&
+    length(statistics.children) == 1 ||
         throw(ArgumentError("statistics field is not a non-null map"))
     entries = statistics.children[1]
-    !entries.nullable && entries.type isa StructType &&
-        length(entries.children) == 2 ||
+    !entries.nullable && entries.type isa StructType && length(entries.children) == 2 ||
         throw(ArgumentError("statistics map entries are not a non-null key/value struct"))
     key, value = entries.children
     kt = key.type
-    !key.nullable && kt isa DictionaryType && kt.indextype.bits == 32 &&
-        kt.indextype.signed && kt.valuetype isa Utf8Type &&
-        !kt.valuetype.large && isempty(key.children) ||
+    !key.nullable &&
+    kt isa DictionaryType &&
+    kt.indextype.bits == 32 &&
+    kt.indextype.signed &&
+    kt.valuetype isa Utf8Type &&
+    !kt.valuetype.large &&
+    isempty(key.children) ||
         throw(ArgumentError("statistics keys are not non-null dictionary<utf8, int32>"))
-    !value.nullable && value.type isa UnionType &&
-        value.type.mode == AC.DenseMode ||
+    !value.nullable && value.type isa UnionType && value.type.mode == AC.DenseMode ||
         throw(ArgumentError("statistics values are not a non-null dense union"))
     return nothing
 end
 
 "Write a statistics-carrying Arrow file: `writefile(withstatistics(sch, batches), batches)`."
-statsfile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
-    compress::Symbol=:none) =
+statsfile(sch::Schema, batches::AbstractVector{AC.RecordBatch}; compress::Symbol=:none) =
     writefile(withstatistics(sch, batches), batches; compress=compress)
 
 # ---- read + prune ---------------------------------------------------------
@@ -1426,13 +1731,18 @@ pruning). Exhausting the caller's cumulative allocation budget still throws.
 Returns per-batch `Dict{Int,...}` column stats (1-based top-level indices)
 with `missing` bounds where absent.
 """
-function _readstats(metadata, nbatches::Int, datafields=nothing;
-    limits::Limits=Limits(), budget::Union{Nothing,AllocationBudget}=nothing)
+function _readstats(
+    metadata,
+    nbatches::Int,
+    datafields=nothing;
+    limits::Limits=Limits(),
+    budget::Union{Nothing,AllocationBudget}=nothing,
+)
     metadata === nothing && return nothing
     blob = get(Dict(metadata), STATS_KEY, nothing)
     blob === nothing && return nothing
-    localbudget = budget === nothing ?
-        AllocationBudget(limits.max_total_allocated_bytes) : budget
+    localbudget =
+        budget === nothing ? AllocationBudget(limits.max_total_allocated_bytes) : budget
     try
         encodedbytes = Int64(ncodeunits(blob))
         maxdecoded = AC.checked_mul(cld(encodedbytes, Int64(4)), Int64(3))
@@ -1458,15 +1768,20 @@ function _readstats(metadata, nbatches::Int, datafields=nothing;
             length(cols) == length(maps) ||
                 throw(ArgumentError("statistics columns have different lengths"))
             rows = missing
-            d = Dict{Int,NamedTuple{(:nullcount, :min, :max),
-                Tuple{Union{Missing,Int64},Any,Any}}}()
+            d = Dict{
+                Int,
+                NamedTuple{(:nullcount, :min, :max),Tuple{Union{Missing,Int64},Any,Any}},
+            }()
             for (colref, pairs) in zip(cols, maps)
                 stats = Dict{String,Any}(String(k) => v for (k, v) in pairs)
                 if colref === missing
                     rc = get(stats, STATS_ROW_COUNT, missing)
                     if rc !== missing
-                        rc isa Int64 && rc >= 0 || throw(ArgumentError(
-                            "statistics row count must be a nonnegative Int64"))
+                        rc isa Int64 && rc >= 0 || throw(
+                            ArgumentError(
+                                "statistics row count must be a nonnegative Int64",
+                            ),
+                        )
                         rows = rc
                     end
                     continue
@@ -1478,19 +1793,23 @@ function _readstats(metadata, nbatches::Int, datafields=nothing;
                 top = if datafields === nothing
                     wire + 1
                 else
-                    wire < totalnodes ||
-                        throw(ArgumentError("statistics column index exceeds the schema"))
+                    wire < totalnodes || throw(
+                        ArgumentError("statistics column index exceeds the schema"),
+                    )
                     get(wiretotop, wire, nothing)
                 end
                 top === nothing && continue  # valid nested-field statistics
                 nc = get(stats, STATS_NULL_COUNT, missing)
                 if nc !== missing
-                    nc isa Int64 && nc >= 0 || throw(ArgumentError(
-                        "statistics null count must be a nonnegative Int64"))
+                    nc isa Int64 && nc >= 0 || throw(
+                        ArgumentError("statistics null count must be a nonnegative Int64"),
+                    )
                 end
-                d[top] = (nullcount=nc,
+                d[top] = (
+                    nullcount=nc,
                     min=get(stats, STATS_MIN, missing),
-                    max=get(stats, STATS_MAX, missing))
+                    max=get(stats, STATS_MAX, missing),
+                )
             end
             if rows !== missing
                 all(s -> s.nullcount === missing || s.nullcount <= rows, values(d)) ||
@@ -1548,9 +1867,10 @@ function _maypass(e::Tables.ScanExpr, stats, names, rowcount::Union{Missing,Int6
         i = Tables._findcol(names, col.ref)
         return i === nothing ? nothing : get(stats, i, nothing)
     end
-    allnull(s) = s.nullcount !== missing && rowcount !== missing &&
-        s.nullcount >= rowcount
-    unknownbounds(s) = s.min === missing || s.max === missing ||
+    allnull(s) = s.nullcount !== missing && rowcount !== missing && s.nullcount >= rowcount
+    unknownbounds(s) =
+        s.min === missing ||
+        s.max === missing ||
         (s.min isa AbstractFloat && isnan(s.min)) ||
         (s.max isa AbstractFloat && isnan(s.max))
     if e isa Tables.Cmp
@@ -1559,13 +1879,11 @@ function _maypass(e::Tables.ScanExpr, stats, names, rowcount::Union{Missing,Int6
         allnull(s) && return false
         unknownbounds(s) && return true
         v = e.rhs
-        e.op == Tables.OP_EQ &&
-            return _statcmp(>=, v, s.min) && _statcmp(>=, s.max, v)
+        e.op == Tables.OP_EQ && return _statcmp(>=, v, s.min) && _statcmp(>=, s.max, v)
         # NE prunes only a provably constant batch equal to the literal:
         # min == max == v. Anything weaker (including any NaN, where the
         # equalities are false) must fetch.
-        e.op == Tables.OP_NE &&
-            return !(_stateq(s.min, v) && _stateq(s.max, v))
+        e.op == Tables.OP_NE && return !(_stateq(s.min, v) && _stateq(s.max, v))
         e.op == Tables.OP_LT && return _statcmp(<, s.min, v)
         e.op == Tables.OP_LE && return _statcmp(<=, s.min, v)
         e.op == Tables.OP_GT && return _statcmp(>, s.max, v)
@@ -1576,8 +1894,7 @@ function _maypass(e::Tables.ScanExpr, stats, names, rowcount::Union{Missing,Int6
         s === nothing && return true
         allnull(s) && return false
         unknownbounds(s) && return true
-        return any(_statcmp(>=, v, s.min) && _statcmp(>=, s.max, v)
-                   for v in e.values)
+        return any(_statcmp(>=, v, s.min) && _statcmp(>=, s.max, v) for v in e.values)
     elseif e isa Tables.IsNull
         s = lookup(e.lhs)
         s === nothing && return true
@@ -1610,4 +1927,3 @@ function _maypass(e::Tables.ScanExpr, stats, names, rowcount::Union{Missing,Int6
     end
     return true    # AlwaysTrue, OpNode, unknown growth: never prune
 end
-

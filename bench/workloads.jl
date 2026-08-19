@@ -25,10 +25,7 @@ const BENCH_ROWS_DICT = 2_000_000
 
 function workload_primitive()
     n = BENCH_ROWS_PRIMITIVE
-    return (
-        a=collect(Int64, 1:n),
-        b=collect(Float64, 1:n),
-    )
+    return (a=collect(Int64, 1:n), b=collect(Float64, 1:n))
 end
 
 function workload_nullable()

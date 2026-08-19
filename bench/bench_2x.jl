@@ -37,8 +37,10 @@ function main(outdir::String)
             end
         end
         for (op, secs) in (("write", twrite), ("read", tread))
-            println("{\"impl\":\"arrow2x\",\"workload\":\"$name\"," *
-                    "\"op\":\"$op\",\"seconds\":$secs,\"bytes\":$sz}")
+            println(
+                "{\"impl\":\"arrow2x\",\"workload\":\"$name\"," *
+                "\"op\":\"$op\",\"seconds\":$secs,\"bytes\":$sz}",
+            )
         end
     end
 end
