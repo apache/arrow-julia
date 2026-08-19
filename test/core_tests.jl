@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Core unit tests: ArrowCore in isolation (Base + Mmap only).
+# Core unit tests: ArrowCore's regions, descriptors, layouts, validation,
+# accessors, and builders — plus the two adapter seams the builders feed
+# (IPC write/read and C data export/import) where a Core column must cross.
 
 using Test
 
@@ -728,11 +730,11 @@ end
         @test getvalue(llvf, llvd, 1) == [2, 3]
     end
 
-    @testset "fromcompactviews: CompactString payloads → Utf8View, zero-copy data" begin
-        # A local encoder of the CSV kernel's 16-byte "inline-else-view"
-        # payload (length | first 4 bytes, then bytes 5..12 or a signed
-        # 1-based position: positive → buf, negative → extra). Any 16-byte
-        # isbits type is accepted; the kernel's is a two-field struct.
+    @testset "fromcompactviews: CompactString payloads → Utf8View, zero-copy" begin
+        # A local encoder of the CSV kernel's 16-byte payload, which IS an
+        # Arrow view entry: length | first 4 bytes, then bytes 5..12 (≤12) or
+        # (Int32 buffer index, Int32 0-based offset). Any 16-byte isbits type
+        # is accepted; the kernel's is a two-field struct.
         struct CompactPayload
             a::UInt64
             b::UInt64
@@ -749,12 +751,13 @@ end
             end
             return CompactPayload(a, b)
         end
-        function viewentry(data::Vector{UInt8}, pos1::Int, len::Int, sign::Int)
+        function viewentry(data::Vector{UInt8}, pos1::Int, len::Int, bufidx::Int)
             a = UInt64(len % UInt32)
             for i = 1:4
                 a |= UInt64(data[pos1 + i - 1]) << (32 + 8 * (i - 1))
             end
-            return CompactPayload(a, reinterpret(UInt64, Int64(sign * pos1)))
+            return CompactPayload(a,
+                UInt64(bufidx % UInt32) | (UInt64((pos1 - 1) % UInt32) << 32))
         end
         nullentry() = CompactPayload(UInt64(0xffffffff), zero(UInt64))
 
@@ -768,10 +771,10 @@ end
             inlineentry(UInt8[]),                                    # ""  (len 0)
             inlineentry(collect(codeunits("abcd"))),                 # len 4 (a only)
             inlineentry(collect(codeunits("twelve-bytes"))),         # len 12 (inline max)
-            viewentry(buf, first(long1), 13, +1),                    # first long: buf
+            viewentry(buf, first(long1), 13, 0),                     # first long: buf
             nullentry(),                                             # missing
-            viewentry(buf, first(long2), 24, +1),                    # long: buf
-            viewentry(extra, 1, length(extra), -1),                  # long: extra
+            viewentry(buf, first(long2), 24, 0),                     # long: buf
+            viewentry(extra, 1, length(extra), 1),                   # long: extra
         ]
         f, d = fromcompactviews("s", payloads, buf, extra)
         @test f.type == ViewType(true)
@@ -782,20 +785,13 @@ end
         @test isequal(materialize(f, d),
             ["", "abcd", "twelve-bytes", "thirteen-byte", missing,
              "a much longer value here", "she said \"hi\" and left"])
-        # the data buffers are the caller's vectors, not copies
+        # ZERO-COPY: the views buffer IS the payload vector, and the data
+        # buffers are the caller's vectors — none of the three is copied
+        @test d.buffers[2].region.root === payloads
         @test d.buffers[3].region.root === buf
         @test d.buffers[4].region.root === extra
-        # inline entries copied verbatim; long entries rewritten to (bufidx, off0)
-        views = d.buffers[2]
-        @test AC.loadat(views, UInt64, Int64(16)) == payloads[2].a
-        @test AC.loadat(views, UInt64, Int64(24)) == payloads[2].b
-        @test AC.loadat(views, Int32, Int64(16 * 3 + 8)) == Int32(0)          # buf
-        @test AC.loadat(views, Int32, Int64(16 * 3 + 12)) == Int32(first(long1) - 1)
-        @test AC.loadat(views, Int32, Int64(16 * 6 + 8)) == Int32(1)          # extra
-        @test AC.loadat(views, Int32, Int64(16 * 6 + 12)) == Int32(0)
-        # null slot is a canonical zero entry
-        @test AC.loadat(views, UInt64, Int64(16 * 4)) == 0
-        @test AC.loadat(views, UInt64, Int64(16 * 4 + 8)) == 0
+        # the null slot's entry bytes are left as they are (spec: unspecified)
+        @test AC.loadat(d.buffers[2], Int32, Int64(16 * 4)) == Int32(-1)
 
         # the column crosses both adapters as an ordinary Utf8View
         sch = Schema(Field[f])
@@ -809,31 +805,33 @@ end
         Arrow.release!(d2.owner::Arrow.ForeignOwner)
         Arrow.reap!()
 
-        # no nulls, no extra: two data-less-extra buffers, empty bitmap
+        # no nulls, empty extra: the empty bitmap and an empty second data
+        # buffer (buffer index 1 always means `extra`)
         f0, d0 = fromcompactviews("t", payloads[[2, 3]], buf, UInt8[]; nullable=false)
         @test !f0.nullable
-        @test length(d0.buffers) == 3
+        @test length(d0.buffers) == 4
         @test AC.isempty_buffer(d0.buffers[1])
         @test validate_full(f0, d0) === d0
         @test materialize(f0, d0) == ["abcd", "twelve-bytes"]
+        # ... and it too crosses the C boundary (an empty variadic buffer)
+        sp0, ap0 = Arrow.to_c_data(f0, d0)
+        f0b, d0b = Arrow.from_c_data(sp0, ap0)
+        @test materialize(f0b, d0b) == ["abcd", "twelve-bytes"]
+        Arrow.release!(d0b.owner::Arrow.ForeignOwner)
+        Arrow.reap!()
 
-        # refusals: extra referenced but absent, escaping content, zero
-        # position, wrong payload width, non-isbits payloads
-        @test_throws ArgumentError fromcompactviews("t", payloads[[7]], buf, UInt8[])
-        @test_throws ArgumentError fromcompactviews("t",
-            [viewentry(buf, first(long2), 24 + 100, +1)], buf, extra)
-        @test_throws ArgumentError fromcompactviews("t",
-            [CompactPayload(UInt64(13), zero(UInt64))], buf, extra)
+        # malformed long entries construct (a wrap makes no promises about
+        # content) and refuse where every builder's output does: validation
+        for bad in (viewentry(extra, 1, length(extra), 1) => UInt8[],  # extra referenced but empty
+                    CompactPayload(payloads[6].a,
+                        UInt64(0) | (UInt64(length(buf) - 3) << 32)) => extra,   # escapes buf
+                    CompactPayload(payloads[6].a, UInt64(7)) => extra)            # buffer index 7
+            fb, db = fromcompactviews("t", [bad.first], buf, bad.second)
+            @test_throws ValidationError validate_semantic(fb, db)
+        end
+        # wrong payload width and non-isbits payloads are constructor errors
         @test_throws ArgumentError fromcompactviews("t", UInt64[1, 2], buf, extra)
         @test_throws ArgumentError fromcompactviews("t", Any[1], buf, extra)
-        # extreme signed positions are the documented ArgumentError, never an
-        # OverflowError out of the position arithmetic
-        for pos in (typemax(Int64), typemin(Int64), typemin(Int64) + 1,
-                    Int64(typemax(Int32)) + 2, -(Int64(typemax(Int32)) + 2))
-            extreme = CompactPayload(UInt64(13) | (UInt64(0x61) << 32),
-                reinterpret(UInt64, pos))
-            @test_throws ArgumentError fromcompactviews("t", [extreme], buf, extra)
-        end
     end
 end
 

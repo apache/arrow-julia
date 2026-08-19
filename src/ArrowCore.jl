@@ -1897,7 +1897,7 @@ function _value(t::IntervalType, f::Field, d::ArrayData, i::Int64)
         off = _slotbyteoff(d, i, 8)
         return (days=loadat(b, Int32, off),
             millis=loadat(b, Int32, checked_add(off, Int64(4))))
-    else # MONTH_DAY_NANO — the unit today's Arrow.jl cannot even parse
+    else # MONTH_DAY_NANO
         off = _slotbyteoff(d, i, 16)
         return (months=loadat(b, Int32, off),
             days=loadat(b, Int32, checked_add(off, Int64(4))),
@@ -2751,85 +2751,48 @@ end
 """
     fromcompactviews(name, payloads::Vector{P}, buf, extra; nullable=true) -> (Field, ArrayData)
 
-Build a Utf8View column from "inline-else-view" 16-byte string payloads — the
-representation the CSV kernel's `CompactString` columns use. `P` is any
-16-byte isbits type; each entry is read as two `UInt64` words `(a, b)`:
+Wrap a vector of Arrow view entries as a Utf8View column, ZERO-COPY. `P` is
+any 16-byte isbits type whose values are Arrow StringView entries — the
+representation the CSV kernel's `CompactString` columns use:
 
-    a  bits 0..31   content length as Int32 (-1 = null)
-       bits 32..63  content bytes 1..4 (the full bytes when the length is
-                    ≤ 12; the four-byte PREFIX when it is longer)
-    b  length ≤ 12  content bytes 5..12, zero-padded
-       length > 12  Int64 byte position (1-based) of the content: positive
-                    into `buf`, negative into `extra`
+    bytes 0..3    Int32 content length (-1 marks a null slot)
+    bytes 4..15   the content, zero-padded            (length ≤ 12)
+    bytes 4..7    the content's 4-byte prefix          (length > 12)
+    bytes 8..11   Int32 buffer index: 0 = `buf`, 1 = `extra`
+    bytes 12..15  Int32 0-based byte offset within that buffer
 
-An inline entry is byte-identical to Arrow's view entry and copies verbatim.
-A long entry keeps its length and prefix and has its second word rewritten to
-Arrow's `(int32 buffer index, int32 offset)`. A null entry becomes a canonical
-zero-length entry with its validity bit cleared. `buf` and `extra` become the
-column's variadic data buffers 0 and 1 without copying (`extra` only when it
-is nonempty); the 16·n-byte views buffer is the one fresh allocation. The
-scoped-borrow rule of every zero-copy wrap applies to `buf` and `extra`.
-
-Long entries whose position or extent escapes their buffer, or whose offset
-does not fit Arrow's `Int32`, are refused with `ArgumentError` — the result
-is otherwise handed back unvalidated, like every builder here.
+`payloads` becomes the views buffer and `buf`/`extra` the variadic data
+buffers 0 and 1 without copying (`extra` may be empty). The only work is the
+validity bitmap: a slot whose length is negative is null; the spec leaves a
+null slot's entry bytes unspecified, and neither this reader's nor the
+reference implementation's validation reads them. Long-entry geometry
+(offsets inside their buffer, prefixes matching the data) is checked where
+every builder's is — by `validate_semantic`/`validate_full` — not here. The
+scoped-borrow rule of every zero-copy wrap applies to all three vectors.
 """
 function fromcompactviews(name, payloads::Vector{P}, buf::Vector{UInt8},
     extra::Vector{UInt8}; nullable::Bool=true) where {P}
     isbitstype(P) && sizeof(P) == 16 ||
         throw(ArgumentError("compact view payloads must be a 16-byte isbits type"))
-    # The entry words are VALUES (assembled by shifts); Arrow's byte layout
-    # is what those values spell out on a little-endian host, and Core reads
+    # The entry words are values assembled by shifts; Arrow's byte layout is
+    # what those values spell out on a little-endian host, and Core reads
     # view entries host-natively.
     _native_endianness() == LittleEndian ||
         throw(ArgumentError("fromcompactviews requires a little-endian host"))
     n = length(payloads)
-    hasextra = !isempty(extra)
-    words = Vector{UInt64}(undef, 2 * n)
     present = Vector{Bool}(undef, n)
     nnull = 0
     GC.@preserve payloads begin
-        src = Ptr{UInt64}(pointer(payloads))
+        src = Ptr{Int32}(pointer(payloads))
         for i = 1:n
-            a = unsafe_load(src, 2 * i - 1)
-            b = unsafe_load(src, 2 * i)
-            len = reinterpret(Int32, a % UInt32)
-            if len < 0
-                present[i] = false
-                nnull += 1
-                words[2 * i - 1] = zero(UInt64)
-                words[2 * i] = zero(UInt64)
-                continue
-            end
-            present[i] = true
-            if len <= VIEW_INLINE_MAX
-                words[2 * i - 1] = a
-                words[2 * i] = b
-                continue
-            end
-            pos = reinterpret(Int64, b)
-            pos != 0 || throw(ArgumentError(
-                "compact view entry $i: long content has no position"))
-            bufidx = pos < 0 ? Int32(1) : Int32(0)
-            bufidx == 0 || hasextra || throw(ArgumentError(
-                "compact view entry $i references the extra buffer, which is empty"))
-            # Bound the magnitude FIRST so the position arithmetic below
-            # cannot overflow (typemin/typemax positions are refused here,
-            # as the documented ArgumentError, not as OverflowError).
-            (pos > -typemax(Int64) && pos < typemax(Int64) &&
-                abs(pos) - 1 <= typemax(Int32)) || throw(ArgumentError(
-                "compact view entry $i: position $pos does not fit an Int32 view offset"))
-            pos0 = abs(pos) - 1
-            datalen = bufidx == 0 ? length(buf) : length(extra)
-            pos0 + Int64(len) <= datalen || throw(ArgumentError(
-                "compact view entry $i: content [$pos0, $len) escapes buffer $bufidx"))
-            words[2 * i - 1] = a
-            words[2 * i] = UInt64(bufidx % UInt32) | (UInt64(pos0 % UInt32) << 32)
+            ok = unsafe_load(src, 4 * i - 3) >= 0     # entry i's length word
+            present[i] = ok
+            nnull += !ok
         end
     end
     t = ViewType(true)
-    buffers = BufferSlice[_bitmapbuffer(present), _databuffer(words), _databuffer(buf)]
-    hasextra && push!(buffers, _databuffer(extra))
+    buffers = BufferSlice[_bitmapbuffer(present), _databuffer(payloads),
+        _databuffer(buf), _databuffer(extra)]
     return Field(name, t; nullable=nullable),
     ArrayData(t, n, buffers; nullcount=nnull)
 end
