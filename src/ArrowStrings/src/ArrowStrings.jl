@@ -87,6 +87,8 @@ bytes branch-free; the byte-loop fallback only runs within 11 bytes of the
 buffer's end (loads must not read past it).
 """
 @inline function inline_payload(src::Vector{UInt8}, pos::Int, len::Int)
+    0 <= len <= INLINE_MAX ||
+        throw(ArgumentError("inline_payload: length $len is not in 0:$INLINE_MAX"))
     if pos + 11 <= length(src)
         GC.@preserve src begin
             p = pointer(src, pos)
@@ -115,11 +117,14 @@ end
 The payload of a view: `len` (> 12) bytes whose content sits at 1-based
 `srcpos` in `src` (where the 4-byte prefix is read from) and is addressed by
 the entry's Arrow words — buffer index `bufidx` and 0-based byte `offset0`
-within that buffer. Refuses words that do not fit Arrow's Int32 (buffers must
-stay under 2 GiB).
+within that buffer. Refuses a length or word that does not fit Arrow's
+Int32 (buffers must stay under 2 GiB) — an oversized length would otherwise
+wrap into the null marker.
 """
 @inline function view_payload(src::Vector{UInt8}, srcpos::Int, len::Int,
                               bufidx::Integer, offset0::Integer)
+    INLINE_MAX < len <= typemax(Int32) ||
+        throw(ArgumentError("view_payload: length $len is not in $(INLINE_MAX + 1):$(typemax(Int32))"))
     (0 <= offset0 <= typemax(Int32) && 0 <= bufidx <= typemax(Int32)) ||
         throw(ArgumentError("CompactString view (buffer $bufidx, offset $offset0) " *
                             "does not fit Arrow's Int32 view words; buffers must stay under 2 GiB"))

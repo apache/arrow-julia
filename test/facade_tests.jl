@@ -1080,6 +1080,20 @@ end
         @test !f0.nullable
         Arrow.write(io, (s=col0,))
         @test Arrow.Table(take!(io)).s == ["abcd", "thirteen-byte"]
+        # an all-inline column may have ZERO data buffers — the format allows
+        # a Utf8View with no variadic buffers, and the wire carries exactly
+        # the fixed validity + views pair
+        inl = CompactStringVector{CompactString}(
+            [ArrowStrings.inline_payload(buf, abcd, 4),
+             ArrowStrings.inline_payload(buf, abcd, 2)], Vector{Vector{UInt8}}())
+        fi, di = Arrow._writecolumn("s", inl)
+        @test length(di.buffers) == 2
+        Arrow.write(io, (s=inl,))
+        bytes0 = take!(io)
+        @test Arrow.Table(bytes0).s == ["abcd", "ab"]
+        af = Arrow.readfile(bytes0)
+        @test af.schema.fields[1].type == Arrow.AC.ViewType(true)
+        @test length(af[1].columns[1].buffers) == 2         # no variadic buffers on the wire
     end
 end
 

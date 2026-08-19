@@ -60,6 +60,13 @@ function sumncodeunits(c::CompactStringVector{CompactString})
     return t
 end
 
+# Allocation is measured INSIDE type-stable top-level functions: an
+# `@allocated` in testset scope can charge the closure's own boxing (16
+# bytes on Julia 1.10) to the kernel it is measuring.
+allocated_hash(v::Vector{CompactString}) = @allocated(foldcshash(v, UInt(9)))
+allocated_cmp(v::Vector{CompactString}) = @allocated(foldcscmp(v))
+allocated_access(c::CompactStringVector{CompactString}) = @allocated(sumncodeunits(c))
+
 # A column from Strings, laid out the CSV way: inline when it fits, else a
 # view into buffer 0 (`buf`), or into buffer 1 (`extra`) when `inextra(i)`.
 function column(strings::Vector; inextra = i -> false)
@@ -110,10 +117,20 @@ end
     # rebase moves the offset only
     r = AS.rebase_payload(q, 100)
     @test AS.csbufidx(r) == 1 && AS.csoffset(r) == 102 && r.a == q.a
-    # words that do not fit Arrow's Int32 refuse
+    # words that do not fit Arrow's Int32 refuse; the boundaries are accepted
     @test_throws ArgumentError AS.view_payload(data, 3, 13, 0, Int64(typemax(Int32)) + 1)
     @test_throws ArgumentError AS.view_payload(data, 3, 13, -1, 0)
     @test_throws ArgumentError AS.rebase_payload(q, Int64(typemax(Int32)))
+    @test AS.csoffset(AS.view_payload(data, 3, 13, 0, Int64(typemax(Int32)))) == typemax(Int32)
+    @test AS.csbufidx(AS.view_payload(data, 3, 13, Int64(typemax(Int32)), 0)) == typemax(Int32)
+    # ... and so does a length outside (12, typemax(Int32)] — an oversized
+    # length would otherwise wrap into the null marker
+    @test AS.cslen(AS.view_payload(data, 3, Int(typemax(Int32)), 0, 0)) == typemax(Int32)
+    @test_throws ArgumentError AS.view_payload(data, 3, Int(typemax(Int32)) + 1, 0, 0)
+    @test_throws ArgumentError AS.view_payload(data, 3, 12, 0, 0)
+    @test_throws ArgumentError AS.view_payload(data, 3, -1, 0, 0)
+    @test_throws ArgumentError AS.inline_payload(data, 1, 13)
+    @test_throws ArgumentError AS.inline_payload(data, 1, -1)
     # the byte-loop inline fallback (near the end of the buffer) agrees with
     # the two-load fast path
     long = Vector{UInt8}(codeunits("abcdefghijklmnopqrstuvwxyz"))
@@ -189,10 +206,10 @@ end
     @test isless(first(validcs), missing) == isless(first(valid), missing)
     @test isless(missing, first(validcs)) == isless(missing, first(valid))
     # hashing and comparing across every inline/view mix never allocates
-    foldcshash(payloads, UInt(9))
-    @test @allocated(foldcshash(payloads, UInt(9))) == 0
-    foldcscmp(payloads)
-    @test @allocated(foldcscmp(payloads)) == 0
+    allocated_hash(payloads)
+    @test allocated_hash(payloads) == 0
+    allocated_cmp(payloads)
+    @test allocated_cmp(payloads) == 0
     # Symbol, promotion, print
     @test Symbol(csfrombytes(Vector{UInt8}(codeunits("αβγδεζηθικλμ")))) == :αβγδεζηθικλμ
     @test promote_type(CompactString, String) === String
@@ -255,8 +272,8 @@ end
         ncodeunits(s) > AS.INLINE_MAX || continue
         @test AS.csbufidx(col.payloads[i]) == (i % 3 == 0 ? 1 : 0)
     end
-    sumncodeunits(col)
-    @test @allocated(sumncodeunits(col)) == 0
+    allocated_access(col)
+    @test allocated_access(col) == 0
     m = AS.materialize(col)
     @test m isa Vector{String} && m == strings
 

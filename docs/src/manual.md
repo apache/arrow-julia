@@ -112,13 +112,16 @@ partition-aware sinks see the source's batch structure —
 batch.
 
 Memory: only the memory-mapped **file-format** path (the default when you
-pass a path to a file-format source) is lazy — batches are decoded from the
-mapping one at a time, so a consumer's loop over such a `Stream` holds one
-batch of columns at a time (plus the file's dictionaries), and that is the
-way to process a file larger than RAM. A **stream-format** source, and any
-`IO` or byte-vector input, is read to the end and fully decoded when the
-`Stream` is constructed. `Arrow.write` materializes every partition before
-writing (see [Writing](@ref)), so it does not bound memory either.
+pass a path to a file-format source) avoids holding the whole source —
+batches are decoded from the mapping one at a time, so a consumer's loop
+over such a `Stream` holds one batch of columns at a time (plus the file's
+dictionaries), and that is the way to process a file larger than RAM. A
+**stream-format** source is read to the end and every batch is decoded when
+the `Stream` is constructed. A file-format `IO` or byte-vector input is
+also read to the end (the whole source is held in memory), but its record
+batches are still decoded lazily, one per iteration. `Arrow.write`
+materializes every partition before writing (see [Writing](@ref)), so it
+does not bound memory either.
 
 ### Metadata
 
@@ -158,25 +161,29 @@ maps to `Union{Missing, T}`.
 | Interval | `Int32` (year-month) or a `NamedTuple` (day-time, month-day-nano) |
 | Dictionary-encoded scalar | the mapping of the *value* type (indices are resolved) |
 
-Composite and wrapper layouts are read on the dynamic path: each row is
-built as a Julia value and the column's element type is then *narrowed from
-the rows*, so it depends on the data (a zero-row column has element type
-`Any`; an all-`missing` one, `Missing`):
+Composite and wrapper layouts are read on the dynamic path (each row is
+built as a Julia value), and their column element type is likewise derived
+from the schema — the declared row container — so it too is the same for a
+zero-row, an all-`missing`, and a populated column:
 
-| Arrow type | Row values |
+| Arrow type | Element type |
 |---|---|
-| List, LargeList, FixedSizeList, ListView | `Vector{Any}` of the child's values |
-| Struct | `Vector{Pair{String,Any}}` (ordered name => value pairs) |
+| List, LargeList, FixedSizeList, ListView | `Vector{Any}` (rows are vectors of the child's values) |
+| Struct | `Vector{Pair{String,Any}}` (rows are ordered name => value pairs) |
 | Map | `Vector{Pair{Any,Any}}` |
-| Union | the selected child's value; the column narrows to what appears |
-| Run-end encoded | the *values* child's values (runs are expanded) |
-| Null | `missing` |
+| Union | the join of the children's element types when it is concrete (a homogeneous union reads as that type); otherwise `Any`, narrowed from the rows |
+| Run-end encoded | the *values* child's element type (runs are expanded) |
+| Null | `Missing` |
 
-The `Dates` conversions above apply at the top level and through
-dictionary encoding; a temporal type nested under a run-end-encoded or
-union wrapper stays in its raw integer storage. Sub-millisecond timestamps
-stay as raw integers everywhere rather than silently truncating into
-`DateTime`; the same rule applies when writing.
+Two refinements. The `Dates` conversions above apply at the top level and
+through dictionary encoding; a temporal type nested under a run-end-encoded
+or union wrapper stays in its raw integer storage. And field nullability is
+*advisory* in Arrow (the reference implementation and the conformance
+corpus accept a null under a `nullable=false` field), so a column that
+holds a null its field did not declare reads as `Union{Missing, T}` rather
+than failing; a conforming column keeps its declared, `Missing`-free type.
+Sub-millisecond timestamps stay as raw integers everywhere rather than
+silently truncating into `DateTime`; the same rule applies when writing.
 
 ### Scan pushdown
 

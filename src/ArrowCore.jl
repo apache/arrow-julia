@@ -2764,7 +2764,7 @@ representation ArrowStrings' `CompactString` columns use:
 
 `payloads` becomes the views buffer and `buffers` the variadic data buffers,
 in order, without copying (the two-buffer form is `[buf, extra]`; a buffer
-may be empty). The only work is the validity bitmap: a slot whose length is
+may be empty, and an all-inline column may have none at all). The only work is the validity bitmap: a slot whose length is
 negative is null; the spec leaves a null slot's entry bytes unspecified, and
 neither this reader's nor the reference implementation's validation reads
 them. Long-entry geometry (offsets inside their buffer, prefixes matching
@@ -2780,8 +2780,8 @@ function fromcompactviews(name, payloads::Vector{P},
     buffers::Vector{Vector{UInt8}}; nullable::Bool=true) where {P}
     isbitstype(P) && sizeof(P) == 16 ||
         throw(ArgumentError("compact view payloads must be a 16-byte isbits type"))
-    isempty(buffers) &&
-        throw(ArgumentError("a view column needs at least one data buffer"))
+    # `buffers` may be empty: an all-inline column has zero variadic data
+    # buffers, which the format allows.
     # The entry words are values assembled by shifts; Arrow's byte layout is
     # what those values spell out on a little-endian host, and Core reads
     # view entries host-natively.

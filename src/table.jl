@@ -760,11 +760,13 @@ which writes one record batch per partition — see the source batch structure.
 Memory: over a memory-mapped FILE-format path (the default for a path) the
 batches are decoded lazily from the mapping, one per iteration, so a
 consumer that processes and drops batches holds one batch of columns at a
-time (plus the file's dictionaries). Every other source — the STREAM format,
-and any `IO` or byte-vector input — is read to the end and fully decoded
-when the `Stream` is constructed; iteration then only walks the decoded
-batches. `Arrow.write` itself is whole-buffer (it materializes every
-partition before writing), so it does not bound memory either.
+time (plus the file's dictionaries) — the path for a file larger than RAM.
+A STREAM-format source is read to the end and every batch is decoded when
+the `Stream` is constructed. A file-format `IO` or byte-vector input is read
+to the end too (the whole source stays in memory) but its record batches
+still decode lazily, one per iteration. `Arrow.write` itself is whole-buffer
+(it materializes every partition before writing), so it does not bound
+memory either.
 """
 struct Stream
     src::Union{IPCStream,ArrowFile}
