@@ -161,10 +161,15 @@ maps to `Union{Missing, T}`.
 | Interval | `Int32` (year-month) or a `NamedTuple` (day-time, month-day-nano) |
 | Dictionary-encoded scalar | the mapping of the *value* type (indices are resolved) |
 
-Composite and wrapper layouts are read on the dynamic path (each row is
-built as a Julia value), and their column element type is likewise derived
-from the schema — the declared row container — so it too is the same for a
-zero-row, an all-`missing`, and a populated column:
+Composite layouts (list, struct, map, union) are read on the dynamic path
+(each row is built as a Julia value), and their column element type is
+derived from the schema — the declared row container — so it too is the
+same for a zero-row, an all-`missing`, and a populated column, with two
+exceptions: the heterogeneous-union case in the Union row, and nulls the
+field did not declare (below). The two wrapper layouts are transparent:
+a dictionary-encoded or run-end-encoded column takes the route and the
+element type of its value child (a closed scalar child keeps the typed
+path):
 
 | Arrow type | Element type |
 |---|---|

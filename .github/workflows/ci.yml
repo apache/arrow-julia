@@ -104,6 +104,7 @@ jobs:
       - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
+          project: ${{ matrix.pkg.dir }}
       - uses: actions/cache@v6
         env:
           cache-name: cache-artifacts
