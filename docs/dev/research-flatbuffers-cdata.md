@@ -32,25 +32,30 @@ compare against `src/cdata.jl`. Research only — no code changed.
 Three files, `src/FlatBuffers/FlatBuffers.jl`, `builder.jl`, `table.jl`.
 Provenance: introduced whole in the
 2020 donation commit (`50e015f` "Pure Julia implementation of apache arrow
-format") as a fresh, trimmed port of the Go runtime — it was **not** forked
-from JuliaData/FlatBuffers.jl's code; the two share only the Go-port
-ancestry. Around it the rewrite adds `src/metadata/VerifierRuntime.jl`
+format"), a trimmed Go-style runtime whose low-level builder code (`prep!`,
+`place!`, vector/string construction, offset insertion, the vtable writer)
+is nearly verbatim from a pre-donation JuliaData/FlatBuffers.jl snapshot;
+the high-level reflection and table APIs are where the two differ. Around
+it the rewrite adds `src/metadata/VerifierRuntime.jl`
 (hand-maintained, schema-blind) and `tools/fbsgen.jl`, which regenerates `src/metadata/{Schema,File,Message,Verifier}.jl`.
 
-The rewrite's usage surface is narrow. Read side: `getrootas`, `init`,
-`offset`, `get`, `indirect`, `String`, `Array`, `union`, `vector`/`vectorlen`
-(via generated getters). Write side: `Builder`, `startobject!`/`endobject!`,
-`prependslot!`/`prependoffsetslot!`,
-`startvector!`/`endvector!`, `createstring!`, `finish!`, `prep!`, `pad!`,
-`place!`. The vendored runtime carries only what that surface needs.
+The rewrite's usage surface is narrow. Read side: `Table`, `Struct`,
+`getrootas`, `init`, `bytes`, `pos`, `offset`, `get`, `indirect`, `String`,
+`Array`, `union`, `vector`/`vectorlen`, `structsizeof`, `UOffsetT` (via
+generated getters). Write side: `Builder`, `startobject!`/`endobject!`,
+`prependslot!`/`prependoffsetslot!`, `prepend!`/`prependoffset!`,
+`startvector!`/`endvector!`, `createstring!`, `finish!`, `finishedbytes`,
+`prep!`, `pad!`, `place!`, `offset(::Builder)`. The vendored runtime carries
+only what that surface needs.
 
 ### 1.2 Correctness hazards (standalone)
 
 Context first: in the rewrite **no generated getter runs on unverified
-bytes**. `verify_ipc_metadata` stages `verifyrootstart_Message` /
-`verifyrootrest_Message` before `FB.getrootas` (`src/ipc_read.jl`), and
-`verify_footer` does the same for the file footer
-(`src/ipc_write.jl`). The verifier runtime does checked, byte-assembled
+bytes**. `verify_ipc_metadata` runs `verifyrootstart_Message` (the table
+shell and every inline field), then `FB.getrootas` for the verified inline
+`version` getter and the version gate, then `verifyrootrest_Message` (the
+reference graph) before any header getter (`src/ipc_read.jl`); `verify_footer`
+stages the file footer the same way (`src/ipc_write.jl`). The verifier runtime does checked, byte-assembled
 loads with range/alignment/domain/budget proofs
 (`src/metadata/VerifierRuntime.jl`). The list below is therefore what
 the runtime lacks **on its own** — relevant only if it were ever reused
@@ -80,9 +85,10 @@ without the generated verifier in front:
   runtime deliberately computes everything in explicit `Int64` with
   `checked_add`/`checked_sub`/`checked_mul` and subtraction-form range checks.
 - **Builder-side widths.** `Builder.head::UOffsetT` (UInt32) caps builders at
-  4 GiB; `createstring!`'s `b.head -= l` (`builder.jl`) would wrap if
-  `place!`/copy ever ran without a preceding `prep!` (correct usage prevents
-  it; nothing enforces it).
+  4 GiB; `createstring!` calls `prep!` before moving `head`, and a `head`
+  underflow throws `InexactError` on 64-bit hosts rather than wrapping, but
+  a raw `place!` still has an unenforced space contract (correct usage
+  prevents it; nothing enforces it).
 - **Host-endian reads.** The write path is explicitly little-endian
   (byte-shift loop, `builder.jl`) but reads are native-endian
   (`unsafe_load`; `vtableEqual` assembles its `VOffsetT`s little-endian
@@ -131,9 +137,9 @@ is present and used. None of the gaps matter for Arrow's three schemas.
   `@UNION`/`@with_kw` macros, `slot_offsets(T)`, `default(T)`,
   `deserialize(io, T)`; internals (`src/internals.jl`) still read **every
   scalar through `read(IOBuffer(view(...)), T)`** — an allocation per load.
-  Our vendored copy replaced exactly this model in 2020. Divergence is total;
-  there is no code to merge in either direction, only a wholesale
-  replacement.
+  Our vendored copy replaced exactly this model in 2020. The high-level
+  designs have nothing to merge in either direction — only the low-level
+  builder code is shared — so the path is a wholesale replacement.
 - Would upstream accept a modernization? It is a JuliaData package and the
   original author is this project's maintainer, so acceptance is not the
   obstacle. The obstacle is that "upstreaming" means shipping a breaking
@@ -145,8 +151,9 @@ is present and used. None of the gaps matter for Arrow's three schemas.
 What it already does (`tools/fbsgen.jl`): `table`/`struct`/`enum`
 (explicit values)/`union`, scalars, vectors, string/table refs, scalar and
 enum defaults, `(deprecated)`, comment stripping, cross-file type references
-by leaf name, Arrow's Base-name collisions via `RENAMES`, a hand-injected
-`REQUIRED` set (because Arrow's .fbs declares no `(required)`), and — the distinctive part — a **generated
+by leaf name, Arrow's Base-name collisions (`Struct_ => Struct` via
+`RENAMES`; `Bool`/`Int`/`Type` through scalar qualification and a
+module-local generic), a hand-injected `REQUIRED` set (because Arrow's .fbs declares no `(required)`), and — the distinctive part — a **generated
 shape verifier** per table with a root start/rest split for constant-time
 policy gating over the schema-blind runtime.
 
@@ -202,8 +209,7 @@ general-purpose surface Arrow does not need.
 
 Tracking issue: **#184 "Support C data interface"** (open). Three
 independent efforts, all against the 2.x internals — which is why each
-re-derives lifecycle machinery the Core rewrite gets structurally
-(`src/cdata.jl`'s header states this claim and already cites #178, #179, #561, #594, #603-607).
+re-derives lifecycle machinery the Core rewrite gets structurally.
 
 ### 2.1 Inventory
 
@@ -251,10 +257,10 @@ Comparison against samtalki's #607 head (the code most likely to merge):
 - **Ownership container.** Theirs: one `CDataOwner` holding *both* moved
   structs in Julia `Ref`s, releasing schema and array together at owner
   release, exactly-once via `released::Bool` under a `ReentrantLock`, with a
-  trylock-retry GC finalizer. Ours: schema released **immediately after
-  parsing** — the producer's schema obligation ends at import —
-  and the array copy lives in malloc'd memory with an atomic-swap
-  exactly-once. Ours additionally verifies the producer nulled
+  trylock-retry GC finalizer. Ours: the schema is released **before the
+  import returns** (after the array is imported and validated; the
+  producer's schema obligation ends at import) and the array copy lives in
+  malloc'd memory with an atomic-swap exactly-once. Ours additionally verifies the producer nulled
   the release field; theirs does not.
 - **Post-release semantics.** Theirs: every `getindex` runs inside
   `_with_live` — a ReentrantLock acquire per element — so reads after
@@ -269,16 +275,19 @@ Comparison against samtalki's #607 head (the code most likely to merge):
   alignment because `loadat` falls back to an unaligned load per element
   (`src/ArrowCore.jl`).
 - **`null_count == -1`.** Equivalent policy (bitmap required when unknown);
-  theirs resolves eagerly with a word-wise `_count_nulls`, ours defers to
-  `ArrayData`'s on-demand atomic `nullcount` (`src/ArrowCore.jl`).
+  both count eagerly — theirs with a word-wise `_count_nulls`, ours in the
+  semantic validation import runs, which stores the count in `ArrayData`'s
+  atomic `nullcount` cache (`src/ArrowCore.jl`).
 - **Bounded string imports.** Theirs caps C-string scans at 4096 bytes
   (`_unsafe_string_bounded`); ours caps them at 1 MiB, enforced before
   every dereference (`CSTRING_SCAN_LIMIT`, `cdata.jl`), so a missing NUL is
   a clean refusal rather than a memory scan.
-- **Schema metadata.** Their import validates the metadata block's bounds.
-  Ours imports it (`_import_cmetadata`, bounds-checked) and exports it
-  (`_cmetadata!`), in both the C data and C stream directions; the C-data
-  battery and the pyarrow oracle exercise both.
+- **Schema metadata.** Their landed code carries the metadata pointer
+  through the schema move without parsing it. Ours imports it
+  (`_import_cmetadata`, trusting the producer-declared counts and lengths
+  under the trusted-ABI rule) and exports it (`_cmetadata!`), in both the C
+  data and C stream directions; the C-data battery and the pyarrow oracle
+  exercise both.
 - **Scope.** Ours covers unions, views/list-views, REE, dictionaries, and
   both stream directions with exception-safe move seams enumerated at each
   boundary; their landed scope (#607) is
@@ -304,8 +313,7 @@ Worth porting (with `Co-authored-by` credit):
    are `release!` and `close!`.
 
 Engagement: these are three good-faith contributors who converged on the
-same wall (2.x internals lack an `ArrayData`-shaped core; five stalled
-attempts, `cdata.jl`). Concretely: (a) comment on #607/#603 with the
+same wall (2.x internals lack an `ArrayData`-shaped core). Concretely: (a) comment on #607/#603 with the
 3.0 plan before it merges redundant machinery, raising the per-getindex lock
 and deferred-schema-release points as review feedback; (b) invite samtalki
 and kou to review 3.0's `src/cdata.jl` lifecycle design; (c) credit all
