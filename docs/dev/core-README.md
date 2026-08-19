@@ -50,15 +50,22 @@ scope of every layer.
 ```bash
 julia --project=. -e 'using Pkg; Pkg.test()'                     # core + facade + batteries
 julia --startup-file=no test/trim_compile_tests.jl                # JuliaC --trim=safe gate
-julia --project=conformance conformance/corpus.jl                  # arrow-testing gold corpus
-julia --project=conformance conformance/oracle.jl                  # IPC bytes through pyarrow + nanoarrow (docker)
-julia --project=conformance conformance/cdata_oracle.jl            # C Data / C Stream through in-process pyarrow
+julia --project=conformance conformance/run.jl                    # all conformance suites, in the docker image
+julia --project=conformance conformance/run.jl corpus|oracle|cdata # one suite (gold corpus / IPC bytes through
+                                                                   #   pyarrow+nanoarrow / C Data + C Stream in-process)
 julia --project=. bench/run.jl                                     # benchmarks
 julia tools/fbsgen.jl src/metadata/fbs src/metadata               # regenerate bindings + verifier
 ```
 
 `Tables.Scan` pushdown needs Tables.jl's `jq/scan` branch developed into the
-project and conformance environments.
+project environment (the conformance image clones it). The conformance
+suites run inside one docker image (`conformance/Dockerfile`: Julia, a
+Python with pyarrow and nanoarrow that PythonCall binds to, the
+apache/arrow-testing corpus, the Tables branch, a warm depot in a named
+volume) driven by `conformance/run.jl` through Harbor.jl — docker is the only
+host requirement. The C interfaces hand pointers across an in-process
+boundary, which is why the suites run in the container rather than against
+one.
 
 ## Design in one table
 

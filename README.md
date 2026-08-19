@@ -48,7 +48,9 @@ This is a pure Julia implementation of the
   (`test/fixtures2x/`), and the `--trim=safe` compile gate.
 - `conformance/` — the arrow-testing gold-corpus runner, the integration
   JSON implementation, the pyarrow/nanoarrow IPC oracle round-trip suite,
-  and the in-process pyarrow C Data / C Stream oracle.
+  and the in-process pyarrow C Data / C Stream oracle — all run inside one
+  docker image by `conformance/run.jl` (Harbor.jl); docker is the only
+  host requirement.
 - `docs/dev/` — the engine design document, the scan/ranged-fetch design
   notes, the FlatBuffers/C-data research notes, and the review record.
 
@@ -58,7 +60,7 @@ The design rationale for every layer is `docs/dev/core-README.md`.
 
 Conformance: 275/275 gold-corpus checks pass (36 declared skips);
 170/170 IPC oracle round-trips against pyarrow and nanoarrow (43 skips are
-oracle capability gaps); 141/141 C Data and C Stream interface round-trips
+oracle capability gaps); 143/143 C Data and C Stream interface round-trips
 through an in-process pyarrow over the whole gold matrix (both directions,
-pyarrow-native memory, sliced exports; 9 declared skips). See
-`conformance/` to run any of them.
+pyarrow-native memory, sliced exports; 9 declared skips). Run them all with
+`julia --project=conformance conformance/run.jl`.

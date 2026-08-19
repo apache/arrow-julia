@@ -18,7 +18,7 @@
 # C Data / C Stream oracle: OUR C-interface structures through pyarrow, in
 # one process, over the whole gold data matrix.
 #
-#     julia --project=conformance conformance/cdata_oracle.jl [corpus-dir]
+#     julia --project=conformance conformance/run.jl cdata [corpus-dir]
 #
 # `oracle.jl` proves our IPC BYTES against pyarrow and nanoarrow. This suite
 # proves our C DATA INTERFACE and C STREAM INTERFACE the same way: pyarrow
@@ -57,12 +57,13 @@
 # The suite ends by draining the export registries: every C structure handed
 # to pyarrow must have been released back exactly once.
 #
-# Python setup is automatic: a venv with pyarrow is created on first run under
-# ARROW_CDATA_ORACLE_VENV (default ~/.cache/arrow-julia/cdata-oracle-venv)
-# via `uv` when available (else `python3 -m venv` + pip). Point
-# ARROW_CDATA_ORACLE_PYTHON at any interpreter that already has pyarrow to
-# skip that. The parent process only prepares the environment and re-launches
-# this file as a child with PythonCall bound to that interpreter.
+# The interpreter is ARROW_CDATA_ORACLE_PYTHON — a Python with pyarrow
+# importable; the conformance image (conformance/Dockerfile) sets it. The
+# parent process re-launches this file as a child with PythonCall bound to
+# that interpreter (PythonCall reads its interpreter at load, so the parent
+# never loads it):
+#
+#     julia --project=conformance conformance/run.jl cdata     # in the image
 # =============================================================================
 
 const _CDATA_ORACLE_CHILD = "--child"
@@ -70,35 +71,10 @@ const _CDATA_ORACLE_CHILD = "--child"
 # --- parent: environment preparation + relaunch ------------------------------
 
 function _oracle_python()
-    explicit = get(ENV, "ARROW_CDATA_ORACLE_PYTHON", "")
-    isempty(explicit) || return explicit
-    venv = get(ENV, "ARROW_CDATA_ORACLE_VENV",
-        joinpath(homedir(), ".cache", "arrow-julia", "cdata-oracle-venv"))
-    py = joinpath(venv, Sys.iswindows() ? "Scripts" : "bin",
-        Sys.iswindows() ? "python.exe" : "python")
-    if !isfile(py)
-        mkpath(dirname(venv))
-        uv = Sys.which("uv")
-        if uv !== nothing
-            run(`$uv venv --python 3.12 $venv`)
-        else
-            py3 = Sys.which("python3")
-            py3 === nothing && (py3 = Sys.which("python"))
-            py3 === nothing &&
-                error("no python3 on PATH; set ARROW_CDATA_ORACLE_PYTHON")
-            run(`$py3 -m venv $venv`)
-        end
-    end
-    haspyarrow = success(pipeline(`$py -c "import pyarrow"`;
-        stdout=devnull, stderr=devnull))
-    if !haspyarrow
-        uv = Sys.which("uv")
-        if uv !== nothing
-            run(`$uv pip install --python $py pyarrow`)
-        else
-            run(`$py -m pip install pyarrow`)
-        end
-    end
+    py = get(ENV, "ARROW_CDATA_ORACLE_PYTHON", "")
+    isempty(py) && error("ARROW_CDATA_ORACLE_PYTHON is not set: run this suite " *
+        "through `julia --project=conformance conformance/run.jl cdata` (the " *
+        "conformance image), or point ARROW_CDATA_ORACLE_PYTHON at a Python with pyarrow")
     return py
 end
 

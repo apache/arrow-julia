@@ -17,13 +17,13 @@
 # =============================================================================
 # Oracle round-trips: OUR IPC bytes through pyarrow and nanoarrow.
 #
-#     julia --project=conformance conformance/oracle.jl [corpus-dir]
+#     julia --project=conformance conformance/run.jl oracle      # in the conformance image
 #
 # The gold corpus proves us against files C++ wrote years ago; this suite
 # proves us against implementations running today. The corpus supplies the
-# data matrix (every layout the format defines), Harbor.jl supplies the
-# oracles (a python container with pyarrow + nanoarrow), and for every gold
-# family we run:
+# data matrix (every layout the format defines), the conformance image
+# (conformance/Dockerfile) supplies the oracles — a Python with pyarrow and
+# nanoarrow named by ARROW_ORACLE_PYTHON — and for every gold family we run:
 #
 #   ours→pyarrow stream   parse the gold JSON into Core, write OUR stream
 #                         bytes; pyarrow reads them, full-validates, and
@@ -46,13 +46,16 @@
 # =============================================================================
 
 include(joinpath(@__DIR__, "corpus.jl"))
-using Harbor
 
-const ORACLE_BASE_IMAGE = "python:3.12-slim"
-const ORACLE_PACKAGES = ["pyarrow", "nanoarrow"]
-# After the first successful package install the prepared container is
-# committed under this tag, so later runs are fast and offline.
-const ORACLE_IMAGE = "arrow-conformance-oracle:latest"
+# The oracle interpreter: a Python with pyarrow (and nanoarrow) importable.
+# The conformance image sets it; on a host, point it at any such interpreter.
+function _oraclepython()
+    py = get(ENV, "ARROW_ORACLE_PYTHON", "")
+    isempty(py) && error("ARROW_ORACLE_PYTHON is not set: run this suite through " *
+        "`julia --project=conformance conformance/run.jl oracle` (the conformance " *
+        "image), or point ARROW_ORACLE_PYTHON at a Python with pyarrow and nanoarrow")
+    return py
+end
 
 # The in-container driver. One process over all cases: reads each of our
 # streams/files, validates fully, and writes the return bytes plus a
@@ -191,49 +194,15 @@ function preparecases(corpus::String, workdir::String)
 end
 
 """
-Best-effort host-side wheel download into workdir/wheels: the host's network
-is typically much faster than the container VM's, and it makes the container
-prepare step (nearly) offline. Returns true if wheels are ready.
-"""
-function preparewheels(workdir::String)
-    wheeldir = joinpath(workdir, "wheels")
-    isdir(wheeldir) && !isempty(readdir(wheeldir)) && return true
-    mkpath(wheeldir)
-    arch = Sys.ARCH == :aarch64 ? "manylinux2014_aarch64" : "manylinux2014_x86_64"
-    cmd = `python3 -m pip download --quiet --only-binary=:all: --platform $arch --python-version 3.12 --dest $wheeldir $ORACLE_PACKAGES`
-    ok = success(pipeline(cmd; stdout=devnull, stderr=devnull))
-    return ok && !isempty(readdir(wheeldir))
-end
-
-"""
-Run the python driver against workdir in a Harbor-managed container and
-return the parsed results.json.
+Run the python driver over workdir with the oracle interpreter and return
+the parsed results.json (an oracle refusing our bytes is a finding, not a
+crash: the driver records per-case statuses and exits 0).
 """
 function runoracles(workdir::String)
-    write(joinpath(workdir, "driver.py"), PYDRIVER)
-    havecache = success(pipeline(`docker image inspect $ORACLE_IMAGE`;
-        stdout=devnull, stderr=devnull))
-    havewheels = havecache ? false : preparewheels(workdir)
-    container = Harbor.run!(havecache ? ORACLE_IMAGE : ORACLE_BASE_IMAGE;
-        command=["sleep", "infinity"], volumes=Dict("/work" => workdir),
-        detach=true)
-    try
-        if !havecache
-            install = ["python", "-m", "pip", "install", "--quiet",
-                "--disable-pip-version-check"]
-            havewheels && append!(install,
-                ["--no-index", "--find-links", "/work/wheels"])
-            Harbor.exec(container, vcat(install, ORACLE_PACKAGES))
-            try   # best-effort cache; a failed commit only costs the next run
-                Base.run(pipeline(`docker commit $(container.id) $ORACLE_IMAGE`;
-                    stdout=devnull, stderr=devnull))
-            catch
-            end
-        end
-        println(Harbor.exec(container, ["python", "/work/driver.py", "/work"]))
-    finally
-        Harbor.cleanup!(container)
-    end
+    driver = joinpath(workdir, "driver.py")
+    write(driver, PYDRIVER)
+    py = _oraclepython()
+    Base.run(`$py $driver $workdir`)
     return JSON.parsefile(joinpath(workdir, "results.json"))
 end
 

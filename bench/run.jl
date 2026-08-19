@@ -20,8 +20,8 @@
 #   julia --project=. bench/run.jl [workdir]
 #
 # Legs run in their own processes (2.x under bench/env2x; PyArrow inside
-# the conformance oracle image when docker is available — skipped
-# cleanly otherwise). Results print as a markdown table of seconds and
+# the conformance image when docker is available — skipped cleanly
+# otherwise). Results print as a markdown table of seconds and
 # throughput.
 #
 # READ SEMANTICS DIFFER BY DESIGN, so read rows are not like-for-like:
@@ -63,20 +63,22 @@ function main(workdir::String)
     push!(legs, ("arrow2x", out2x))
 
     pyout = joinpath(workdir, "pyarrow.jsonl")
+    # The pyarrow leg runs the conformance image's oracle interpreter
+    # (build it once with `julia --project=conformance conformance/run.jl`).
     havedocker = Sys.which("docker") !== nothing && try
         success(pipeline(
-            `docker image inspect arrow-conformance-oracle:latest`;
+            `docker image inspect arrow-julia-conformance:latest`;
             stdout=devnull, stderr=devnull))
     catch
         false
     end
     if havedocker
         _runleg(`docker run --rm -v $workdir:/bench -v $here:/src
-                 arrow-conformance-oracle:latest
-                 python3 /src/bench_pyarrow.py /bench`, pyout)
+                 arrow-julia-conformance:latest
+                 /opt/pyarrow/bin/python /src/bench_pyarrow.py /bench`, pyout)
         push!(legs, ("pyarrow", pyout))
     else
-        println("(pyarrow leg skipped: oracle docker image not available)")
+        println("(pyarrow leg skipped: conformance docker image not available)")
     end
 
     # Minimal JSONL field extraction; the emitters write flat one-line
