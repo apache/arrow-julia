@@ -30,12 +30,11 @@
 Mark a column for dictionary encoding: the writer builds a pool of the
 column's unique values and encodes slots as indices into it.
 """
-struct DictEncode{V<:AbstractVector} <: AbstractVector{Any}
+struct DictEncode{T,V<:AbstractVector{T}} <: AbstractVector{T}
     data::V
 end
 Base.size(d::DictEncode) = size(d.data)
-Base.getindex(d::DictEncode, i::Base.Int) = d.data[i]
-Base.eltype(::Type{DictEncode{V}}) where {V} = eltype(V)
+Base.getindex(d::DictEncode, i::Int) = d.data[i]
 
 "One (Field, ArrayData) column from a Julia vector, facade conversions included."
 function _writecolumn(name::String, v::AbstractVector)
@@ -291,7 +290,7 @@ The DECLARED Julia value type of a retained list child, when the facade
 materializes it faithfully: primitives and strings resolve, nested lists
 recurse, and everything else returns `nothing` (temporal children stay raw
 storage integers at the facade; other composites have no closed mapping) —
-the caller then keeps natural inference, the pre-retype behavior.
+the caller then keeps natural inference.
 """
 function _retainedlisteltype(c::AC.Field)
     t = c.type
@@ -377,21 +376,6 @@ function _rebuildtemporal(f::AC.Field, storage, n)
     return fld, d
 end
 
-function _writecolumn(f::AC.Field, v::AbstractVector,
-    pool::Vector, lookup::Dict)
-    t = f.type::AC.DictionaryType
-    indices = Union{Missing,Int32}[x === missing ? missing : lookup[x]
-                                   for x in v]
-    fn, dn = AC.fromjulia_dict(f.name, pool, indices)
-    AC.typeequal(fn.type, t) || throw(ArgumentError(
-        "column $(f.name) no longer matches its retained dictionary type"))
-    fld = AC.Field(f.name, t; nullable=f.nullable,
-        metadata=f.metadata === nothing ? nothing :
-            collect(Pair{String,String}, f.metadata),
-        children=collect(AC.Field, fn.children))
-    return fld, dn
-end
-
 """
     Arrow.write(sink, table; file=true, compress=nothing,
                 metadata=nothing, colmetadata=nothing)
@@ -465,7 +449,7 @@ function _writebytes(tbl; file::Bool=true, compress::Union{Nothing,Symbol}=nothi
     # data to the wrong fields.
     names = Symbol[]
     partcols = Vector{AbstractVector}[]
-    rowcounts = Base.Int[]
+    rowcounts = Int[]
     for part in Tables.partitions(tbl)
         cols = Tables.columns(part)
         pnames = collect(Symbol, Tables.columnnames(cols))
@@ -479,9 +463,9 @@ function _writebytes(tbl; file::Bool=true, compress::Union{Nothing,Symbol}=nothi
         end
         push!(partcols, AbstractVector[Tables.getcolumn(cols, nm)
                                        for nm in pnames])
-        n = Base.Int(Tables.rowcount(cols))
+        n = Int(Tables.rowcount(cols))
         if n == 0 && isempty(pnames)
-            n = max(n, Base.Int(Tables.rowcount(part)))
+            n = max(n, Int(Tables.rowcount(part)))
         end
         push!(rowcounts, n)
     end

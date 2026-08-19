@@ -38,6 +38,10 @@ function _runleg(cmd::Cmd, out::String)
     return nothing
 end
 
+# The workload names each leg must report (bench/workloads.jl owns their
+# definitions; the driver cannot include that file — it references Arrow).
+const WORKLOAD_NAMES = ("primitive", "nullable", "strings", "lists", "dictpool")
+
 function main(workdir::String)
     mkpath(workdir)
     here = @__DIR__
@@ -96,9 +100,7 @@ function main(workdir::String)
     # A leg that exits 0 with partial output must refuse, not print a
     # plausible table.
     impls = [name for (name, _) in legs]
-    for impl in impls,
-        wl in ("primitive", "nullable", "strings", "lists", "dictpool"),
-        op in ("write", "read")
+    for impl in impls, wl in WORKLOAD_NAMES, op in ("write", "read")
         haskey(results, (impl, wl, op)) ||
             error("missing benchmark record for $((impl, wl, op))")
     end
@@ -113,8 +115,7 @@ function main(workdir::String)
     println("| workload | op | " * join(impls, " | ") * " | MB/s (" *
             join(impls, " / ") * ") |")
     println("|---|---|" * repeat("---|", length(impls) + 1))
-    for (wl, _) in (("primitive", 0), ("nullable", 0), ("strings", 0),
-        ("lists", 0), ("dictpool", 0)), op in ("write", "read")
+    for wl in WORKLOAD_NAMES, op in ("write", "read")
         secs = [get(results, (impl, wl, op), (NaN, 0))[1] for impl in impls]
         mbs = [begin
             s, b = get(results, (impl, wl, op), (NaN, 0))
@@ -126,4 +127,4 @@ function main(workdir::String)
     end
 end
 
-main(isempty(ARGS) ? mktempdir() : ARGS[1])
+main(isempty(ARGS) ? mktempdir() : abspath(ARGS[1]))

@@ -17,13 +17,15 @@
 """
     Arrow.jl — a pure Julia implementation of the Apache Arrow columnar format.
 
-Public surface: `Arrow.Table` and `Arrow.Stream` read the IPC stream and
-file formats (paths, `IO`, byte vectors, or a `RangedFile` over a byte-range
-fetcher) as Tables.jl tables, with `Tables.Scan` pushdown; `Arrow.write`
-writes any Tables.jl source; `close!` releases mapped or foreign storage
-deterministically.
+Public surface: `Arrow.Table` reads the IPC stream and file formats (paths,
+`IO`, byte vectors, or a `RangedSource`/`RangedFile` over a byte-range
+fetcher) as Tables.jl tables, with `Tables.Scan` pushdown; `Arrow.Stream`
+iterates a path, `IO`, or byte-vector source one record batch at a time;
+`Arrow.write` writes any Tables.jl source; `close!` releases mapped or
+foreign storage deterministically.
 
-Layering (docs/dev/core-README.md documents each layer in depth):
+Layering ([docs/dev/core-README.md](https://github.com/apache/arrow-julia/blob/main/docs/dev/core-README.md)
+documents each layer in depth):
 
 - `ArrowCore` (private): ownership regions, layout registry, `ArrayData`,
   staged validation, accessors — the trim-friendly, dependency-free core.
@@ -46,7 +48,6 @@ corpus, and the pyarrow/nanoarrow oracle suites under `conformance/`.
 module Arrow
 
 using Tables
-using EnumX
 import Base64
 import DataAPI
 import ArrowStrings
@@ -104,6 +105,14 @@ of stream. Sources are single-owner cursors: overlapping calls on one source
 are an error.
 """
 AC.nextbatch!
+
+"""
+    Arrow.ValidationError
+
+Thrown by every validation tier — structural, semantic, and the opt-in
+`validate_full` — when a descriptor or array violates the Arrow format.
+"""
+AC.ValidationError
 
 export close!
 

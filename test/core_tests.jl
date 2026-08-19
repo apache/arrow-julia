@@ -216,8 +216,8 @@ end
         metadata=("not a pair",))
 
     # ListView offsets are per-slot and may be unordered; view data buffers
-    # are variadic after the fixed validity/views pair. Both now validate
-    # and read end-to-end.
+    # are variadic after the fixed validity/views pair. Both validate and
+    # read end-to-end.
     cf, cd = fromjulia("item", Int64[1, 2, 3])
     lvt = ListViewType(false)
     lvf = Field("lv", lvt; children=[cf])
@@ -503,7 +503,7 @@ end
         @test materialize(f, d) == [10, "y", 30]
     end
 
-    @testset "interval MONTH_DAY_NANO (the unit 2.x cannot parse)" begin
+    @testset "interval MONTH_DAY_NANO" begin
         t = IntervalType(AC.MONTH_DAY_NANO)
         raw = vcat(reinterpret(UInt8, Int32[1, 2]), reinterpret(UInt8, Int64[3]))
         f = Field("iv", t; nullable=false)
@@ -632,7 +632,8 @@ end
     end
 
     @testset "view layouts: entries, prefixes, variadic buffers" begin
-        # helper: build one 16-byte view entry
+        # helper: build one 16-byte view entry (mirrors the batteries'
+        # `_viewentry`/`_viewlong`; this suite does not load those helpers)
         entry(len::Int, rest::Vector{UInt8}) =
             vcat(reinterpret(UInt8, Int32[Int32(len)]), rest,
                  zeros(UInt8, 12 - length(rest)))
@@ -1193,7 +1194,7 @@ end
     end
 
     # These pin the MASKING rules of the nullability walk (a null parent hides
-    # non-nullable child slots), which now runs in the validate_full tier.
+    # non-nullable child slots), which runs in the validate_full tier.
     @testset "parent nulls mask hidden non-nullable child slots" begin
         cf = Field("x", IntType(64, true); nullable=false)
         cd = AC.ArrayData(cf.type, 2,
@@ -1564,12 +1565,13 @@ end
         # Fresh-process allocation: the typed hot loop must reach steady
         # state without compiler-introspection priming (a separate process
         # so this suite's own inference cannot mask a regression).
-        run(`$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $(joinpath(@__DIR__, "typed_alloc_child.jl"))`)
-        @test true
+        @test success(`$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $(joinpath(@__DIR__, "typed_alloc_child.jl"))`)
+    end
+
+    # The suite commonly starts Julia with one thread. Run the memory-order
+    # stress in a small four-thread child so this gate tests real OS-thread
+    # interleavings on every invocation.
+    @testset "threaded stress child" begin
+        @test success(`$(Base.julia_cmd()) --startup-file=no --threads=4 --project=$(Base.active_project()) $(joinpath(@__DIR__, "threaded_stress.jl"))`)
     end
 end # ArrowCore testset
-
-# The required standalone command commonly starts Julia with one thread.
-# Run the memory-order stress in a small four-thread child so this gate tests
-# real OS-thread interleavings on every invocation.
-run(`$(Base.julia_cmd()) --startup-file=no --threads=4 $(joinpath(@__DIR__, "threaded_stress.jl"))`)

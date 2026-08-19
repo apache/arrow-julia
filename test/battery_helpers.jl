@@ -22,9 +22,9 @@
 # the default replay mode never executes the closure — it reads the frozen
 # file, so the closures may reference APIs that no longer exist.
 # ---------------------------------------------------------------------------
-const FIXTURES2X_DIR = Ref(joinpath(@__DIR__, "fixtures2x"))
+const FIXTURES2X_DIR = joinpath(@__DIR__, "fixtures2x")
 function _fixture2x(write2x::F, name::String) where {F}
-    path = joinpath(FIXTURES2X_DIR[], name * ".arrowbytes")
+    path = joinpath(FIXTURES2X_DIR, name * ".arrowbytes")
     if get(ENV, "ARROW_FIXTURE_MODE", "") == "record"
         bytes = write2x()::Vector{UInt8}
         mkpath(dirname(path))
@@ -34,6 +34,27 @@ function _fixture2x(write2x::F, name::String) where {F}
     isfile(path) || error("missing 2.x fixture $name — regenerate against " *
         "a 2.x checkout with ARROW_FIXTURE_MODE=record")
     return read(path)
+end
+
+# The mixed-layout table three batteries share, and its frozen 2.x-written
+# two-partition stream (two record batches plus dictionary batches).
+const MIXED_EXPECTED = (
+    ints=Int64[1, 2, 3, 4, 5],
+    floats=[1.5, missing, 3.5, missing, 5.5],
+    bools=[true, false, true, missing, false],
+    strs=["hey", "", missing, "αβ∀", "last"],
+    lists=[[1, 2], Int64[], [3], missing, [4, 5, 6]],
+    structs=[(a=1, b="x"), (a=2, b="y"), (a=3, b="z"), (a=4, b="w"), (a=5, b="v")],
+    dict=["lo", "hi", "lo", missing, "hi"],
+)
+function _mixed_two_partitions_bytes()
+    expected = MIXED_EXPECTED
+    return _fixture2x("mixed-two-partitions") do
+        io = IOBuffer()
+        writetable = merge(expected, (dict=Arrow.DictEncode(expected.dict),))
+        Arrow.write(io, Tables.partitioner([writetable, writetable]); file=false)
+        take!(io)
+    end
 end
 
 # Test-support helpers for exact, length-preserving metadata mutations. They
@@ -92,11 +113,13 @@ function _headertable(meta::Vector{UInt8}, msg::_VTable)
     return _vtable(meta, _vref(msg, 2; required=true))
 end
 
-_rejects(f) = try
-    f()
-    false
-catch e
-    e isa Union{ValidationError,AllocationLimitError}
+function _rejects(f)
+    try
+        f()
+        false
+    catch e
+        e isa Union{ValidationError,AllocationLimitError}
+    end
 end
 
 function _compressed_wire(payload::Vector{UInt8}, declared::Int64)
@@ -410,8 +433,8 @@ function _misaligned_empty_buffers_stream()
     # length, not for an element that does not exist. Official Arrow
     # integration streams therefore contain empty vectors of 16-byte Buffer
     # structs whose nominal element area is four-byte aligned. Relocate the
-    # empty buffers vector from a 2.x-written zero-row Null batch to reproduce
-    # that valid encoding without carrying a binary fixture in this example.
+    # empty buffers vector of the frozen zero-row Null batch to reproduce
+    # that valid encoding.
     bytes = _fixture2x("null-column-zero-rows") do
         io = IOBuffer()
         Arrow.write(io, (x=Missing[],); file=false)
@@ -455,9 +478,7 @@ function _misaligned_empty_children_stream()
         _vu32(meta, vector) == 0 || error("fixture has nonempty children")
         # Retarget the children reference one byte early: the length word
         # then sits at a position that is not 4-aligned, which the verifier
-        # must reject before any generated getter dereferences it. (An older
-        # form of this fixture also required zero padding there — a layout
-        # accident of the previous builder, not part of the property.)
+        # must reject before any generated getter dereferences it.
         vector % 4 == 0 || error("fixture vector was not aligned to begin with")
         _write_u32!(meta, slot, UInt32(_vu32(meta, slot) - 1))
     end
@@ -721,7 +742,6 @@ function _threaded_cdata_stress()
     for owner in owners
         @assert (@atomic owner.released)
     end
-    println("threaded registry reaping and foreign-owner release passed ✓")
     return nothing
 end
 
@@ -731,4 +751,29 @@ _viewentry(len::Int, rest::Vector{UInt8}) =
 _viewlong(len::Int, prefix::Vector{UInt8}, bufidx::Int, off::Int) =
     vcat(reinterpret(UInt8, Int32[Int32(len)]), prefix,
          reinterpret(UInt8, Int32[Int32(bufidx), Int32(off)]))
+
+# ---------------------------------------------------------------------------
+# Byte-range fetch accounting for the ranged-scan battery: a RangedSource
+# over in-memory bytes that logs every range and byte it is asked for.
+# ---------------------------------------------------------------------------
+mutable struct FetchLog
+    requests::Int
+    bytes::Int64
+    ranges::Vector{NTuple{2,Int64}}
+end
+FetchLog() = FetchLog(0, 0, NTuple{2,Int64}[])
+
+function countingsource(bytes::Vector{UInt8})
+    log = FetchLog()
+    fetch = (off, len) -> begin
+        log.requests += 1
+        log.bytes += len
+        push!(log.ranges, (off, len))
+        bytes[(off + 1):(off + len)]
+    end
+    return log, RangedSource(fetch, Int64(length(bytes)))
+end
+
+_fetched(log::FetchLog, pos::Int64) =
+    any(off <= pos < off + len for (off, len) in log.ranges)
 

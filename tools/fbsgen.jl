@@ -15,28 +15,24 @@
 # limitations under the License.
 
 # =============================================================================
-# fbsgen.jl — regenerate the FlatBuffers metadata bindings from the Arrow
-# format's .fbs files, in the exact idiom of the vendored hand-written
-# bindings (src/metadata/*.jl) over the vendored src/FlatBuffers runtime.
+# fbsgen.jl — generate the FlatBuffers metadata bindings and shape verifier
+# (src/metadata/{Schema,File,Message,Verifier}.jl) from the Arrow format's
+# .fbs files, over the vendored src/FlatBuffers runtime.
 #
 #     julia tools/fbsgen.jl <fbs-dir> <out-dir>
 #
-# The vendored bindings were hand-written against a 2020-era schema and have
-# accumulated eight known drifts from the current spec (variadicBufferCounts
-# typed as Int32 instead of [long]; the Type tag table stopping at 21;
-# Schema.features missing; IntervalUnit lacking MONTH_DAY_NANO; Decimal
-# bitWidth default; RecordBatch four slots; DictionaryKind missing; the
-# `largUtf8Start` typo). Hand-patching those is exactly the bug class that
-# produced them. This tool makes regeneration mechanical: parse the schema,
-# emit bindings, diff. Rerun whenever format/*.fbs moves.
+# Regeneration is mechanical: parse the schema, emit bindings, diff. Rerun
+# whenever the vendored src/metadata/fbs/*.fbs are updated, then run
+# JuliaFormatter over the output (the repository's format check covers the
+# generated files).
 #
 # Scope: the subset of the FlatBuffers IDL that Arrow's three schemas use —
 # `table`, `struct`, `enum` (with explicit values), `union`, scalar and
 # vector fields, table/string references, defaults, `(deprecated)`, and
 # `namespace`/`root_type` (ignored). Comments become nothing; the .fbs is the
 # documentation. Julia name collisions with Base/Core (`Int`, `Bool`, `Type`,
-# `Struct_`) are resolved exactly as the hand-written bindings resolved them
-# so existing user code (`Meta.Int`, `Meta.Bool`, `Meta.Struct`) keeps working.
+# `Struct_`) are resolved so user code (`Meta.Int`, `Meta.Bool`,
+# `Meta.Struct`) works.
 # =============================================================================
 
 module FbsGen
@@ -165,7 +161,7 @@ const SCALARS = Dict(
     "int64" => ("Int64", 8), "uint64" => ("UInt64", 8),
     "float32" => ("Float32", 4), "float64" => ("Float64", 8))
 
-# The hand-written bindings' name choices, kept for source compatibility.
+# Public name choices for Base/Core collisions.
 const RENAMES = Dict("Struct_" => "Struct")
 jlname(n::AbstractString) = get(RENAMES, String(n), String(n))
 
@@ -248,16 +244,16 @@ function emit(decls, io::IO; alldecls=decls)
             println(io, join(("$(m.first)=$(m.second)" for m in d.members), " "))
             println(io)
         elseif d isa FbsEnum && d.isunion
-            # Tag -> type and type -> tag ladders, matching the hand-written
-            # `Type(b::UInt8)`/`Type(::Base.Type{T})` and `MessageHeader` shape.
+            # Tag -> type and type -> tag ladders for the union
+            # (`Type(b::UInt8)`/`Type(::Base.Type{T})`, `MessageHeader`).
             # A bare `function X end` first creates a MODULE-LOCAL generic, so
             # a union named `Type` shadows `Base.Type` instead of extending it.
             println(io, "function ", d.name, " end")
             println(io)
             # Members whose tables come from schemas we do not generate
             # (Tensor/SparseTensor live in Tensor.fbs) are emitted as comments
-            # — the same choice the hand-written bindings made — so the ladder
-            # neither references undefined names nor silently drops the tag.
+            # so the ladder neither references undefined names nor silently
+            # drops the tag.
             known(m) = haskey(tables, m) || haskey(enums, m)
             println(io, "function ", d.name, "(b::UInt8)")
             for (mname, v) in d.members
@@ -476,8 +472,8 @@ end
 # declarations), string bounds/NUL/UTF-8, vector bounds with element sizes
 # (struct sizes computed from their layout), table recursion with depth and
 # object accounting, and COMPLETE union dispatch — the tag ladder is the
-# schema's member list, so it can never stop short the way a hand-written
-# table did. Members whose tables live outside the generated schemas
+# schema's member list, so it cannot stop short. Members whose tables live
+# outside the generated schemas
 # (Tensor family) fail closed by name.
 
 function emitverifier(io::IO, alldecls)
@@ -658,22 +654,6 @@ function generate(fbsdir::AbstractString, outdir::AbstractString)
     emitverifier(vio, alldecls)
     write(joinpath(outdir, "Verifier.jl"), take!(vio))
     println("generated Verifier.jl")
-    write(joinpath(outdir, "Flatbuf.jl"), replace(HEADER, "{name}" => "*") * """
-module Flatbuf
-
-using EnumX
-using ..FlatBuffers
-
-include("Schema.jl")
-include("File.jl")
-include("Message.jl")
-# Hand-maintained, schema-independent verifier runtime; the generated
-# walkers in Verifier.jl call into it.
-include("VerifierRuntime.jl")
-include("Verifier.jl")
-
-end # module
-""")
     return nothing
 end
 

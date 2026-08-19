@@ -20,9 +20,10 @@
 # ArrowStrings.jl
 
 The inline-else-view string representation shared by Arrow.jl and CSV.jl,
-kept as its own package (registered separately, like `ArrowTypes.jl`, from
-this subdirectory of the arrow-julia repository) so that either package can
-depend on it without depending on the other.
+kept as its own package (to be registered separately, like `ArrowTypes.jl`,
+from this subdirectory of the arrow-julia repository; until its first release
+Arrow.jl resolves it through a `[sources]` path entry) so that either package
+can depend on it without depending on the other.
 
 * `ArrowString <: AbstractString` — a 16-byte string value that **is** an
   Arrow StringView entry: strings of up to 12 bytes are stored inline;
@@ -35,7 +36,8 @@ depend on it without depending on the other.
   memory (views buffer + variadic data buffers), so a column crosses to
   Arrow — and an Arrow Utf8View column comes back — without copying.
   `ELT` is `ArrowString` or `Union{Missing, ArrowString}`; `getindex`
-  allocates nothing; `materialize` copies out to `Vector{String}`.
+  allocates nothing; `materialize` copies out to `Vector{String}` (or
+  `Vector{Union{String,Missing}}` for the nullable `ELT`).
 
 Everything depends only on Base and is concrete-typed, so it compiles under
 JuliaC `--trim`. Buffers must stay under 2 GiB (Arrow's `Int32` view words).

@@ -94,10 +94,8 @@ end
 @testset "ArrowCore trim compile" begin
     if !_TRIM_SUPPORTED
         println("[trim] skip: JuliaC --trim requires Julia >= 1.12")
-        @test true
     elseif Sys.iswindows()
         println("[trim] skip Windows: JuliaC trim compilation stalls on Windows CI")
-        @test true
     else
         script_path = joinpath(@__DIR__, "trim_entrypoint.jl")
         @test isfile(script_path)

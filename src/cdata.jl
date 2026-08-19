@@ -60,7 +60,6 @@
 #     independently-owned export root per result and exception-safe
 #     move/release handoffs.
 # =============================================================================
-# =============================================================================
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +132,6 @@ formatstring(t::UnionType) =
 formatstring(t::ViewType) = t.utf8 ? "vu" : "vz"
 formatstring(t::ListViewType) = t.large ? "+vL" : "+vl"
 formatstring(::RunEndEncodedType) = "+r"
-formatstring(t::DictionaryType) = formatstring(t.indextype)  # per spec: index format; values on schema.dictionary
 
 # Closed-set ladder (same devirtualization story as AC.layoutspec_of): the
 # export walk reaches this with an abstract-typed Field slot.
@@ -159,6 +157,7 @@ formatstring(t::DictionaryType) = formatstring(t.indextype)  # per spec: index f
     t isa ViewType && return formatstring(t)
     t isa ListViewType && return formatstring(t)
     t isa RunEndEncodedType && return formatstring(t)
+    # per spec: the index format on the node; values on schema.dictionary
     t isa DictionaryType && return formatstring_of(t.indextype)
     throw(ArgumentError("unregistered ArrowType"))
 end
@@ -882,6 +881,14 @@ end
 # Import: C structs -> Core, one ForeignOwner per moved tree
 # ---------------------------------------------------------------------------
 
+# ReleaseCell action: routes cell revocation through release!(::ForeignOwner).
+function _release_owner_action(p::Ptr{Cvoid})::Cvoid
+    slot = unsafe_pointer_to_objref(p)::Base.RefValue{Any}
+    x = slot[]
+    x === nothing || release!(x)
+    return nothing
+end
+
 """
 One owner for one MOVED ArrowArray tree. All BufferSlices from the whole
 tree (children, dictionary) use regions whose `root` is this object, so the
@@ -895,13 +902,6 @@ failure between construction and the move commit therefore frees just our
 copy and never calls the producer — the source, whose release field is still
 set, remains the owner.
 """
-function _release_owner_action(p::Ptr{Cvoid})::Cvoid
-    slot = unsafe_pointer_to_objref(p)::Base.RefValue{Any}
-    x = slot[]
-    x === nothing || release!(x)
-    return nothing
-end
-
 mutable struct ForeignOwner
     const arrayblock::Ptr{CArrowArray} # malloc'd copy of the moved struct: a
                                        # stable native address for the
@@ -986,11 +986,15 @@ finalizer error.
 """
 release!(o::ForeignOwner) = _release_foreign_owner!(o, Libc.free)
 
-# close!(o::ForeignOwner): deterministically release an imported C-data
-# tree through its shared revocation cell — every OwnerRegion built over
-# the import is revoked, then the producer's release callback runs exactly
-# once. The entry point for imports whose arrays are empty and carry no
-# region at all (ArrayData.owner is then the only handle on the lifetime).
+"""
+    close!(owner::ForeignOwner)
+
+Deterministically release an imported C-data tree through its shared
+revocation cell: every `OwnerRegion` built over the import is revoked, then
+the producer's release callback runs exactly once. The entry point for
+imports whose arrays are empty and carry no region at all (`ArrayData.owner`
+is then the only handle on the lifetime).
+"""
 AC.close!(o::ForeignOwner) = AC.close!(o.cell)
 
 function _release_foreign_owner!(o::ForeignOwner, deallocate!)
@@ -1008,8 +1012,9 @@ function _release_foreign_owner!(o::ForeignOwner, deallocate!)
     return nothing
 end
 
-"Read child/dictionary struct pointers out of a CArrowArray."
+"Load child `i`'s CArrowArray by value out of a parent's children table."
 childat(a::CArrowArray, i::Int) = unsafe_load(unsafe_load(a.children, i))
+"Load buffer pointer `i` out of a CArrowArray's buffer table."
 bufferptr(a::CArrowArray, i::Int) = unsafe_load(a.buffers, i)
 
 """
@@ -1723,6 +1728,14 @@ function _release_moved_stream_owner!(o::StreamOwner)
     return nothing
 end
 
+"""
+    release!(o::StreamOwner)
+
+Run the moved stream's producer release callback on the malloc'd struct
+copy, check that the producer nulled the copy's release field, and free the
+copy. Exactly-once: one atomic swap picks the single releaser between
+explicit calls and the GC finalizer.
+"""
 function release!(o::StreamOwner)
     @atomicswap(o.released = true) && return nothing
     GC.@preserve o begin

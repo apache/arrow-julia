@@ -70,7 +70,7 @@ guarantee, not a reader requirement — the spec permits unpadded buffers and
 this reader accepts them. Core has no codec dependency; the IPC adapter
 implements compression. Bulk access is `materialize` (dynamic, one function
 barrier per layout) and `materialize(::Type{T}, …)` (a static element claim,
-resolved without boxing).
+resolved without boxing except at the dictionary/run-end wrapper edge).
 """
 module ArrowCore
 
@@ -114,14 +114,14 @@ export OwnerRegion, BufferSlice, heapregion, mmapregion, close!, ReleaseCell,
 #   * External-truncation protection: a shared mapping's pages can vanish
 #     under any implementation. Same exposure as every mmap-based reader.
 
-"An atomic counter (observation/exactly-once bookkeeping for adapters and tests)."
+"An atomic counter for the test suite's exactly-once release bookkeeping."
 mutable struct ReleaseCounter
     @atomic n::Int
 end
 ReleaseCounter() = ReleaseCounter(0)
 Base.getindex(c::ReleaseCounter) = @atomic c.n
 # CAS loop rather than `@atomic c.n += 1`: the atomic read-modify-write
-# builtin is not yet implemented in JuliaC's trim verifier, while
+# builtin is not implemented in JuliaC's trim verifier, while
 # compare-and-swap is; contention here is negligible.
 function increment!(c::ReleaseCounter)
     while true
@@ -384,7 +384,7 @@ end
 @inline reinterpret_bytes(::Type{T}, bytes::NTuple{N,UInt8}) where {T,N} =
     reinterpret(T, bytes)
 
-"Copy the slice into a fresh `Vector{UInt8}` (used by materialize/tests)."
+"Copy the slice into a fresh `Vector{UInt8}`."
 function slicebytes(b::BufferSlice)
     b.len == 0 && return UInt8[]
     b.region === nothing && throw(ArgumentError("empty buffer has no data"))
@@ -442,56 +442,74 @@ Base.IndexStyle(::Type{<:FrozenVector}) = IndexLinear()
 @enum Endianness::UInt8 LittleEndian BigEndian
 _native_endianness() = Base.ENDIAN_BOM == 0x04030201 ? LittleEndian : BigEndian
 
+"Null: every slot null; no buffers."
 struct NullType <: ArrowType end
+"Boolean: bit-packed values."
 struct BoolType <: ArrowType end
+"Integer of `bits` width, `signed` or not."
 struct IntType <: ArrowType
     bits::Int      # 8/16/32/64 — the spec's Int; wider is NOT valid
     signed::Bool
 end
+"IEEE floating point of `bits` width (16/32/64)."
 struct FloatType <: ArrowType
     bits::Int      # 16/32/64
 end
+"Decimal of `precision` digits and `scale`, stored in `bits` (32/64/128/256)."
 struct DecimalType <: ArrowType
     precision::Int
     scale::Int
     bits::Int      # 32/64/128/256 (format 1.5)
 end
+"Fixed-width binary of `nbytes` per slot."
 struct FixedSizeBinaryType <: ArrowType
     nbytes::Int
 end
+"Variable-length binary; `large` selects Int64 offsets."
 struct BinaryType <: ArrowType
     large::Bool    # Int64 offsets when true
 end
+"UTF-8 string; `large` selects Int64 offsets."
 struct Utf8Type <: ArrowType
     large::Bool
 end
+"Date in days (Int32) or milliseconds (Int64) since the epoch."
 struct DateType <: ArrowType
     unit::DateUnit # DAY => Int32 storage, MILLISECOND => Int64
 end
+"Time of day in `unit`, stored in `bits` (32 for s/ms, 64 for us/ns)."
 struct TimeType <: ArrowType
     unit::TimeUnit
     bits::Int      # 32 (s/ms) or 64 (us/ns)
 end
+"Timestamp in `unit` since the epoch, with an optional `timezone`."
 struct TimestampType <: ArrowType
     unit::TimeUnit
     timezone::Union{Nothing,String}   # a VALUE — one method instance total
 end
+"Elapsed time in `unit`, Int64 storage."
 struct DurationType <: ArrowType
     unit::TimeUnit
 end
+"Calendar interval in `unit` (year-month, day-time, or month-day-nano)."
 struct IntervalType <: ArrowType
     unit::IntervalUnit                # includes MONTH_DAY_NANO (format 1.2)
 end
+"Variable-length list; `large` selects Int64 offsets."
 struct ListType <: ArrowType
     large::Bool
 end
+"List of exactly `listsize` child slots per parent slot."
 struct FixedSizeListType <: ArrowType
     listsize::Int
 end
+"Struct: named children declared by `Field.children`."
 struct StructType <: ArrowType end
+"Map: a list of key/value struct entries; `keyssorted` per entry."
 struct MapType <: ArrowType
     keyssorted::Bool
 end
+"Union in sparse or dense `mode` over the children's declared `typeids`."
 struct UnionType <: ArrowType
     mode::UnionMode
     typeids::FrozenVector{Int8}       # declared type-id domain, child order
@@ -550,6 +568,12 @@ Field(name, type; nullable=true, metadata=nothing, children=()) =
 Field(name::AbstractString, type::ArrowType, nullable, metadata, children) =
     Field(name, type; nullable=nullable, metadata=metadata, children=children)
 
+"""
+    Schema
+
+An ordered set of top-level `Field`s plus optional schema-level metadata:
+the shape of every record batch that carries it.
+"""
 struct Schema
     fields::FrozenVector{Field}
     metadata::Union{Nothing,FrozenVector{Pair{String,String}}}
@@ -566,6 +590,7 @@ Schema(fields; metadata=nothing, endianness=_native_endianness()) =
 # ELEMENT_OFFSETS are per-element child positions (len entries — dense union).
 # The distinction is structural, so it lives in the registry, not in
 # per-layout special cases inside the validator.
+"The role of one buffer in a layout's buffer sequence (see `LayoutSpec`)."
 @enum BufferRole::UInt8 VALIDITY DATA OFFSETS ELEMENT_OFFSETS SIZES VIEWS TYPE_IDS
 
 """
@@ -618,6 +643,13 @@ const VALIDITY_ELEMENT_OFFSETS_SIZES =
 const TYPE_IDS_ONLY = FrozenVector{BufferRole}((TYPE_IDS,))
 const TYPE_IDS_ELEMENT_OFFSETS = FrozenVector{BufferRole}((TYPE_IDS, ELEMENT_OFFSETS))
 
+"""
+    layoutspec(t::ArrowType) -> LayoutSpec
+
+The structural facts of `t`'s physical layout: one method per descriptor
+type (the registry's extension point); generic code reaches it through the
+closed-set ladder `layoutspec_of`.
+"""
 layoutspec(::NullType) = LayoutSpec(NO_BUFFERS, 0, 0, 0, false)
 layoutspec(::BoolType) = LayoutSpec(VALIDITY_DATA, 0, 0, -1, false)
 layoutspec(t::IntType) = LayoutSpec(VALIDITY_DATA, 0, 0, primwidth(t), false)
@@ -765,7 +797,7 @@ const _ValidatedDictionaries = IdDict{ArrayData,Nothing}
 function rolebuffer(d::ArrayData, role::BufferRole)
     spec = layoutspec_of(d.type)
     idx = findfirst(==(role), spec.buffers)
-    idx === nothing && throw(ArgumentError("layout $(typeof(d.type)) has no $role buffer"))
+    idx === nothing && throw(ArgumentError("layout $(descriptorname(d.type)) has no $role buffer"))
     return d.buffers[idx]
 end
 
@@ -918,8 +950,6 @@ _validate_descriptor(::ViewType) = nothing
 _validate_descriptor(::ListViewType) = nothing
 _validate_descriptor(::RunEndEncodedType) = nothing
 _validate_descriptor(::Any) = throw(ArgumentError("unregistered ArrowType"))
-_value(::Any, ::Field, ::ArrayData, ::Int64) =
-    throw(ArgumentError("unregistered ArrowType"))
 
 @inline function _validate_descriptor_of(t::ArrowType)
     t isa IntType && return _validate_descriptor(t)
@@ -972,14 +1002,13 @@ function _validate_descriptor(t::TimeType)
     valid || throw(ValidationError("time unit $(t.unit) is incompatible with $(t.bits)-bit storage"))
     return nothing
 end
-_validate_descriptor(t::TimestampType) =
-    begin
-        t.unit in (SECOND, MILLISECOND, MICROSECOND, NANOSECOND) ||
-            throw(ValidationError("invalid Arrow timestamp unit $(repr(t.unit))"))
-        (t.timezone === nothing || isvalid(t.timezone)) ||
-            throw(ValidationError("timestamp timezone is not valid UTF-8"))
-        nothing
-    end
+function _validate_descriptor(t::TimestampType)
+    t.unit in (SECOND, MILLISECOND, MICROSECOND, NANOSECOND) ||
+        throw(ValidationError("invalid Arrow timestamp unit $(repr(t.unit))"))
+    (t.timezone === nothing || isvalid(t.timezone)) ||
+        throw(ValidationError("timestamp timezone is not valid UTF-8"))
+    return nothing
+end
 _validate_descriptor(t::DurationType) =
     t.unit in (SECOND, MILLISECOND, MICROSECOND, NANOSECOND) ||
         throw(ValidationError("invalid Arrow duration unit $(repr(t.unit))"))
@@ -1103,10 +1132,10 @@ function _validate_structural(f::Field, d::ArrayData,
     expected_children = spec.childcount == -1 ? length(f.children) : spec.childcount
     if !(d.type isa DictionaryType)
         length(f.children) == expected_children ||
-            throw(ValidationError("$(typeof(d.type)): expected $expected_children child fields, got $(length(f.children))"))
+            throw(ValidationError("$(descriptorname(d.type)): expected $expected_children child fields, got $(length(f.children))"))
     end
     length(d.children) == expected_children ||
-        throw(ValidationError("$(typeof(d.type)): expected $expected_children children, got $(length(d.children))"))
+        throw(ValidationError("$(descriptorname(d.type)): expected $expected_children children, got $(length(d.children))"))
     for (cf, cd) in zip(childfields(f), d.children)
         _validate_structural(cf, cd, validated_dictionaries)
     end
@@ -1195,18 +1224,15 @@ dictvaluefield(f::Field, t::DictionaryType) =
 
 const MILLISECONDS_PER_DAY = Int64(86_400_000)
 
-_validate_temporal_values(::ArrowType, ::ArrayData) = nothing
-
 # Date64 whole-day divisibility and Decimal precision are ADVISORY in
 # practice: the spec phrases Date64 as "evenly divisible by 86400000" and
 # precision as "total number of decimal digits", but the reference C++
 # implementation neither enforces them on read nor honors them on write — the
 # apache/arrow-testing gold corpus itself carries Date64 values off day
 # boundaries and decimal(3,2) values with five digits. Rejecting those in
-# `validate_semantic` made a conforming reader refuse canonical data, so both
-# checks live in the opt-in `validate_full` tier (`_validate_full_content`),
-# where strict callers can still demand them.
-_validate_advisory_values(::ArrowType, ::ArrayData) = nothing
+# `validate_semantic` would make a conforming reader refuse canonical data,
+# so both checks live in the opt-in `validate_full` tier
+# (`_validate_full_content`), where strict callers can still demand them.
 function _validate_advisory_values(t::DateType, d::ArrayData)
     t.unit == MILLISECOND_DATE || return nothing
     data = rolebuffer(d, DATA)
@@ -1339,7 +1365,7 @@ function _validate_semantic(f::Field, d::ArrayData,
 end
 
 function _validate_semantic_intrinsic(f::Field, d::ArrayData,
-    validated_dictionaries::Union{Nothing,_ValidatedDictionaries}=nothing)
+    validated_dictionaries::Union{Nothing,_ValidatedDictionaries})
     t = d.type
     if !(@atomic :monotonic d.semachecked)
         spec = layoutspec_of(t)
@@ -1397,7 +1423,6 @@ function _validate_semantic_intrinsic(f::Field, d::ArrayData,
         t isa ViewType && _validate_view_values(t, d)
         t isa ListViewType && _validate_listview_values(t, d)
         t isa RunEndEncodedType && _validate_ree_values(d)
-        _validate_temporal_values(t, d)
         actual_nulls = _count_nulls(d)
         declared_nulls = @atomic :monotonic d.nullcount
         if declared_nulls >= 0 && declared_nulls != actual_nulls
@@ -1501,25 +1526,20 @@ Semantic checks for run-end encoding: a signed 16/32/64-bit run-ends child
 with no nulls, equal-length children (one value per run), run ends positive
 and strictly ascending, and the last run end covering every logical slot
 (`>= offset + length` — equality holds for unsliced arrays). The REE parent
-has no validity bitmap and its null count field is always 0; logical nulls
-live in the values child's runs.
+has no validity bitmap and its null count field is zero or the unknown
+sentinel `-1`; logical nulls live in the values child's runs. The structural
+stage has already established the run-ends descriptor (signed 16/32/64-bit),
+the equal child lengths, and the parent null count.
 """
 function _validate_ree_values(d::ArrayData)
     runs, values = d.children[1], d.children[2]
-    rt = runs.type
-    rt isa IntType && rt.signed && rt.bits in (16, 32, 64) ||
-        throw(ValidationError("run-ends child must be a signed 16/32/64-bit integer"))
-    runs.len == values.len ||
-        throw(ValidationError("run-ends and values children must have equal length"))
     nullcount(runs) == 0 || throw(ValidationError("a run end cannot be null"))
-    declared = @atomic :monotonic d.nullcount
-    declared > 0 && throw(ValidationError("the REE parent null count field is always 0"))
     total = checked_add(d.offset, d.len)
     data = rolebuffer(runs, DATA)
-    # The typeassert re-concretizes after the `||`-condition check above —
+    # The typeassert re-concretizes the structurally established descriptor —
     # without it `primwidth`/`_load_int` see `ArrowType` and the trim
     # verifier reports unresolved calls.
-    rti = rt::IntType
+    rti = runs.type::IntType
     w = primwidth(rti)
     prev = Int64(0)
     for i = 1:runs.len
@@ -1683,7 +1703,7 @@ end
 # walk (`_validate_field_contract_at`) runs in the opt-in `validate_full`
 # tier for callers who want the declaration enforced.
 function _validate_field_contracts(f::Field, d::ArrayData,
-    validated_dictionaries::Union{Nothing,_ValidatedDictionaries}=nothing)
+    validated_dictionaries::Union{Nothing,_ValidatedDictionaries})
     _validate_dictionary_contracts(f, d, validated_dictionaries)
     return nothing
 end
@@ -1834,8 +1854,9 @@ end
 """
     getvalue(field, data, i) -> Union{Missing, value}
 
-Read logical element `i` (1-based). Layout dispatch happens on the runtime
-descriptor — one dynamic dispatch per call. This is Core's honest contract:
+Read logical element `i` (1-based). Layout dispatch is the closed-set `isa`
+ladder over the runtime descriptor — a type-test chain per call, not a
+dynamic dispatch. This is Core's honest contract:
 scalar access through the erased representation pays a boundary cost;
 `materialize` resolves the layout once and loops through a function
 barrier.
@@ -1844,6 +1865,9 @@ function getvalue(f::Field, d::ArrayData, i::Integer)
     1 <= i <= d.len || throw(BoundsError(d, i))
     return _value_of(d.type, f, d, Int64(i))
 end
+
+_value(::Any, ::Field, ::ArrayData, ::Int64) =
+    throw(ArgumentError("unregistered ArrowType"))
 
 # -- primitives -------------------------------------------------------------
 
@@ -1990,7 +2014,7 @@ end
 function _value(t::FixedSizeListType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     child, cf = d.children[1], f.children[1]
-    base = _slotbyteoff(d, i, t.listsize)
+    base = checked_mul(_slotindex0(d, i), Int64(t.listsize))
     out = Vector{Any}(undef, t.listsize)
     for j = 1:t.listsize
         out[j] = getvalue(cf, child, checked_add(base, Int64(j)))
@@ -2188,11 +2212,10 @@ end
 
 """
     getvalue(::Type{T}, field, data, i) -> T
-    materialize(::Type{T}, field, data) -> Vector{T}
 
 Statically typed element access: `T` asserts the element domain (what the
-dynamic accessors return for this layout — see `juliatype`), with
-`Missing <: T` required to admit nulls. The claim checks against the
+dynamic accessors return for this layout — see `juliatype` for the leaf
+layouts), with `Missing <: T` required to admit nulls. The claim checks against the
 DESCRIPTOR up front — an empty or all-null column certifies nothing.
 Composites recurse: a `List<Int64>` column reads as
 `Vector{Vector{Int64}}`, and a `Struct` column may read as a `NamedTuple`
@@ -2207,6 +2230,13 @@ function getvalue(::Type{T}, f::Field, d::ArrayData, i::Integer) where {T}
     return _typedvalue_of(T, d.type, f, d, Int64(i))::T
 end
 
+"""
+    materialize(::Type{T}, field, data) -> Vector{T}
+
+The bulk form of the typed [`getvalue`](@ref): every element under the
+static claim `T` (see `getvalue(::Type{T}, field, data, i)` for the claim
+rules), through one typed loop per layout.
+"""
 function materialize(::Type{T}, f::Field, d::ArrayData) where {T}
     T === Any && return materialize(f, d)
     _checkclaim(T, f, d)
@@ -2321,7 +2351,8 @@ end
     end
 end
 
-# Closed-set ladder for the preflight's scalar leafs (an abstract
+# Closed-set ladder for the preflight's leaf claims — scalars plus the
+# `Map` row vector (an abstract
 # `juliatype(t::ArrowType)` call would defeat trim resolution).
 @inline function _juliatype_of(t::ArrowType)
     t isa IntType && return juliatype(t)
@@ -2338,7 +2369,6 @@ end
     t isa DecimalType && return juliatype(t)
     t isa IntervalType && return juliatype(t)
     t isa MapType && return juliatype(t)
-    t isa StructType && return juliatype(t)
     throw(ArgumentError("unregistered ArrowType"))
 end
 
@@ -2413,7 +2443,8 @@ end
     throw(ArgumentError("unregistered ArrowType"))
 end
 
-# Closed scalar leafs: the claim must equal the layout's `juliatype`
+# Closed leaf claims (scalars plus the `Map` row vector): the claim must
+# equal the layout's `juliatype`
 # exactly; the audited dynamic extraction runs and the assert makes the
 # result statically typed (and free when the claim is right).
 function _typedvalue(::Type{T},
@@ -2462,7 +2493,7 @@ function _typedvalue(::Type{T}, t::FixedSizeListType, f::Field,
     E = Base.nonmissingtype(T)
     E <: Vector || _typedrefuse(E, _layoutname(t), f)
     child, cf = d.children[1], f.children[1]
-    base = _slotbyteoff(d, i, t.listsize)
+    base = checked_mul(_slotindex0(d, i), Int64(t.listsize))
     CE = eltype(E)
     out = Vector{CE}(undef, t.listsize)
     for j = 1:t.listsize
@@ -2637,15 +2668,14 @@ arrowtype_for(::Type{T}) where {T<:Unsigned} = IntType(8 * sizeof(T), false)
 arrowtype_for(::Type{Float16}) = FloatType(16)
 arrowtype_for(::Type{Float32}) = FloatType(32)
 arrowtype_for(::Type{Float64}) = FloatType(64)
-arrowtype_for(::Type{String}) = Utf8Type(false)
 
 """
     fromjulia(name, v) -> (Field, ArrayData)
 
-Adapt a Julia vector to Core form. `Vector{T}` for fixed-width isbits `T` is
-a ZERO-COPY wrap (the vector becomes the region's root; scoped-borrow
-contract: don't resize/mutate while in use). `Union{T,Missing}` and String
-inputs build fresh buffers.
+Adapt a Julia vector to Core form. `Vector{T}` for fixed-width isbits `T`
+other than `Bool` is a ZERO-COPY wrap (the vector becomes the region's root;
+scoped-borrow contract: don't resize/mutate while in use). `Bool`
+(bit-packed), `Union{T,Missing}`, and String inputs build fresh buffers.
 """
 function fromjulia(name, v::Vector{T}) where {T}
     if T <: Union{Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64,Float16,Float32,Float64}
@@ -2733,7 +2763,7 @@ function _build_list(name, v::Vector)
     cf, cd = fromjulia("item", collect(flat))
     nc = count(!, present)
     t = ListType(false)
-    return Field(name, t; nullable=nc > 0, children=[cf]),
+    return Field(name, t; nullable=eltype(v) >: Missing, children=[cf]),
     ArrayData(t, length(v), [_bitmapbuffer(present), _databuffer(offsets)];
         children=[cd], nullcount=nc)
 end
@@ -2778,7 +2808,7 @@ Wrap a vector of Arrow view entries as a Utf8View column, ZERO-COPY. `P` is
 any 16-byte isbits type whose values are Arrow StringView entries — the
 representation ArrowStrings' `ArrowString` columns use:
 
-    bytes 0..3    Int32 content length (-1 marks a null slot)
+    bytes 0..3    Int32 content length (negative marks a null slot)
     bytes 4..15   the content, zero-padded            (length ≤ 12)
     bytes 4..7    the content's 4-byte prefix          (length > 12)
     bytes 8..11   Int32 buffer index into `buffers` (0-based)
@@ -2850,12 +2880,12 @@ struct RecordBatch
         cols = FrozenVector{ArrayData}(columns)
         n = Int64(nrows)
         n >= 0 || throw(ArgumentError("negative row count"))
+        length(schema.fields) == length(cols) ||
+            throw(ArgumentError("schema/column count mismatch"))
         for (f, c) in zip(schema.fields, cols)
             length(c) == n || throw(ArgumentError("unequal column lengths"))
             _validate_structural(f, c, validated_dictionaries)
         end
-        length(schema.fields) == length(cols) ||
-            throw(ArgumentError("schema/column count mismatch"))
         return new(schema, cols, n)
     end
 end
@@ -2866,11 +2896,7 @@ RecordBatch(schema::Schema, columns) =
 function batch(nt::NamedTuple)
     pairs = [fromjulia(String(k), v) for (k, v) in Base.pairs(nt)]
     sch = Schema([p[1] for p in pairs])
-    b = RecordBatch(sch, [p[2] for p in pairs])
-    for (f, c) in zip(sch.fields, b.columns)
-        validate_structural(f, c)
-    end
-    return b
+    return RecordBatch(sch, [p[2] for p in pairs])
 end
 
 """

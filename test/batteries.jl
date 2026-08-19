@@ -25,14 +25,7 @@ using PooledArrays
 import Base64
 using Arrow
 
-# names(all=true) covers Arrow's own bindings; ArrowCore's exported names
-# reach Arrow through `using` and need listing explicitly.
-for n in union(names(Arrow; all=true), names(Arrow.ArrowCore))
-    sn = String(n)
-    (startswith(sn, "#") || n in (:eval, :include, :Arrow, :write, :Table, :Stream)) && continue
-    isdefined(Arrow, n) || continue
-    @eval const $n = Arrow.$n
-end
+include("battery_prelude.jl")
 
 include("battery_helpers.jl")
 include("ipc_read_battery.jl")
@@ -40,21 +33,21 @@ include("ipc_write_battery.jl")
 include("cdata_battery.jl")
 include("scan_battery.jl")
 
+# The batteries signal failure by throwing; a testset that completes is the
+# pass.
 @testset "IPC read acceptance" begin
     ipc_read_battery()
-    @test true
 end
 @testset "IPC write acceptance" begin
     ipc_write_battery()
-    @test true
 end
 @testset "C data acceptance" begin
     cdata_battery()
-    @test true
 end
-@testset "Ranged scan acceptance" begin
-    _scan_main()
-    @test true
+@testset "Scan acceptance" begin
+    _stats_main()
+    filebytes, af, full = _scan_main()
+    _ranged_main(filebytes, af, full)
 end
 
 end # module Batteries

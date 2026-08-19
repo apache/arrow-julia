@@ -15,7 +15,7 @@
 # limitations under the License.
 
 """
-The ArrowTypes module provides the [`ArrowTypes.Arrowtype`](@ref) interface trait that objects can define
+The ArrowTypes module provides the [`ArrowTypes.ArrowKind`](@ref) interface trait that objects can define
 in order to signal how they should be serialized in the arrow format.
 """
 module ArrowTypes
@@ -41,12 +41,12 @@ export ArrowKind,
 """
     ArrowTypes.ArrowKind(T)
 
-For a give type `T`, define it's "arrow type kind", or the general category of arrow types it should be treated as. Must be one of:
+For a given type `T`, define its "arrow type kind", or the general category of arrow types it should be treated as. Must be one of:
   * [`ArrowTypes.NullKind`](@ref): `Missing` is the only type defined as `NullKind`
-  * [`ArrowTypes.PrimitiveKind`](@ref): `<:Integer`, `<:AbstractFloat`, along with `Arrow.Decimal`, and the various `Arrow.ArrowTimeType` subtypes
+  * [`ArrowTypes.PrimitiveKind`](@ref): `<:Integer`, `<:AbstractFloat`, along with decimal and temporal types
   * [`ArrowTypes.BoolKind`](@ref): only `Bool`
   * [`ArrowTypes.ListKind`](@ref): any `AbstractString` or `AbstractArray`
-  * [`ArrowTypes.FixedSizeList`](@ref): `NTuple{N, T}`
+  * [`ArrowTypes.FixedSizeListKind`](@ref): `NTuple{N, T}`
   * [`ArrowTypes.MapKind`](@ref): any `AbstractDict`
   * [`ArrowTypes.StructKind`](@ref): any `NamedTuple` or plain struct (mutable or otherwise)
   * [`ArrowTypes.UnionKind`](@ref): any `Union`
@@ -150,7 +150,7 @@ The use of `Val(Symbol(...))` is to allow overloading a method on a specific log
 their custom type based on what was serialized. The 3rd argument `arrowmetadata` is any metadata that was stored when the logical
 type was serialized as the result of calling `ArrowTypes.arrowmetadata(T)`. Note the 2nd and 3rd arguments are optional when
 overloading if unneeded.
-When defining [`ArrowTypes.arrowname`](@ref) and `ArrowTypes.JuliaType`, you may also want to implement [`ArrowTypes.fromarrow`]
+When defining [`ArrowTypes.arrowname`](@ref) and `ArrowTypes.JuliaType`, you may also want to implement [`ArrowTypes.fromarrow`](@ref)
 in order to customize how a custom type `T` should be constructed from the native arrow data type. See its docs for more details.
 """
 function JuliaType end
@@ -225,7 +225,7 @@ isstringtype(::ListKind{stringtype}) where {stringtype} = stringtype
 isstringtype(::Type{ListKind{stringtype}}) where {stringtype} = stringtype
 
 ArrowKind(::Type{<:AbstractString}) = ListKind{true}()
-# Treate Base.CodeUnits as Binary arrow type
+# Treat Base.CodeUnits as a Binary arrow type
 ArrowKind(::Type{<:Base.CodeUnits}) = ListKind{true}()
 
 fromarrow(::Type{T}, ptr::Ptr{UInt8}, len::Int) where {T} =
@@ -392,7 +392,13 @@ function promoteunion(T, S)
     return isabstracttype(new) ? Union{T,S} : new
 end
 
-# lazily call toarrow(x) on getindex for each x in data
+"""
+    ArrowTypes.ToArrow(x) -> AbstractVector
+
+A lazy view over `x` that applies [`ArrowTypes.toarrow`](@ref) on `getindex`,
+with a concrete element type. Returns `x` itself when its element type is
+already a concrete natively supported arrow type indexed from 1.
+"""
 struct ToArrow{T,A} <: AbstractVector{T}
     data::A
 end

@@ -14,8 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-const fileIdentifierLength = 4
-
 """
 Scalar
 A Union of the Julia types `T <: Number` that are allowed in FlatBuffers schema
@@ -39,7 +37,6 @@ mutable struct Builder
     head::UOffsetT
     nested::Bool
     finished::Bool
-    sharedstrings::Dict{String,UOffsetT}
 end
 
 bytes(b::Builder) = getfield(b, :bytes)
@@ -53,7 +50,6 @@ Builder(size=0) = Builder(
     UOffsetT(size),
     false,
     false,
-    Dict{String,UOffsetT}(),
 )
 
 
@@ -135,7 +131,8 @@ function writevtable!(b::Builder)
 
         metadata = VtableMetadataFields * sizeof(VOffsetT)
         vt2End = vt2Start + vt2Len
-        vt2 = view(b.bytes, (vt2Start + metadata + 1):vt2End) #TODO: might need a +1 on the start of range here
+        # The field entries only (past the two metadata VOffsetTs).
+        vt2 = view(b.bytes, (vt2Start + metadata + 1):vt2End)
 
         # Compare the other vtable to the one under consideration.
         # If they are equal, store the offset and break:
@@ -283,12 +280,6 @@ function endvector!(b::Builder, vectorNumElems)
     return offset(b)
 end
 
-function createsharedstring!(b::Builder, s::AbstractString)
-    get!(b.sharedstrings, s) do
-        createstring!(b, s)
-    end
-end
-
 """
 `createstring!` writes a null-terminated string as a vector.
 """
@@ -305,8 +296,6 @@ function createstring!(b::Builder, s::Union{AbstractString,AbstractVector{UInt8}
     copyto!(b.bytes, b.head + 1, s, 1, l)
     return endvector!(b, sizeof(s))
 end
-
-createbytevector(b::Builder, v) = createstring!(b, v)
 
 function assertnested(b::Builder)
     # If you get this assert, you're in an object while trying to write
@@ -350,26 +339,10 @@ end
 If value `x` equals default `d`, then the slot will be set to zero and no
 other data will be written.
 """
-function prependslot!(b::Builder, o::Int, x::T, d, sh=false) where {T<:Scalar}
+function prependslot!(b::Builder, o::Int, x::T, d) where {T<:Scalar}
     if x != T(d)
         prepend!(b, x)
         slot!(b, o)
-    end
-    return
-end
-
-"""
-`prependstructslot!` prepends a struct onto the object at vtable slot `o`.
-Structs are stored inline, so nothing additional is being added.
-In generated code, `d` is always 0.
-"""
-function prependstructslot!(b::Builder, voffset, x, d)
-    if x != d
-        assertnested(b)
-        if x != offset(b)
-            throw(ArgumentError("inline data write outside of object"))
-        end
-        slot!(b, voffset)
     end
     return
 end
@@ -379,23 +352,6 @@ end
 """
 function slot!(b::Builder, slotnum)
     b.vtable[slotnum + 1] = offset(b)
-end
-
-# FinishWithFileIdentifier finalizes a buffer, pointing to the given `rootTable`.
-# as well as applys a file identifier
-function finishwithfileidentifier(b::Builder, rootTable, fid)
-    if length(fid) != fileIdentifierLength
-        error("incorrect file identifier length")
-    end
-    # In order to add a file identifier to the flatbuffer message, we need
-    # to prepare an alignment and file identifier length
-    prep!(b, b.minalign, sizeof(Int32) + fileIdentifierLength)
-    for i = fileIdentifierLength:-1:1
-        # place the file identifier
-        place!(b, fid[i])
-    end
-    # finish
-    finish!(b, rootTable)
 end
 
 """

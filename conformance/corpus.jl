@@ -18,7 +18,6 @@
 # Corpus conformance: the apache/arrow-testing integration gold files.
 #
 #     julia conformance/run.jl corpus      # in the conformance image
-#     julia --project=conformance conformance/corpus.jl [corpus-dir]   # or directly, given a checkout
 #
 # For every gold family (a `.json.gz` with sibling `.stream` and
 # `.arrow_file`), run the four checks that make up cross-implementation
@@ -57,8 +56,8 @@ end
 include(joinpath(@__DIR__, "arrowjson.jl"))
 using .ArrowJSON
 
-const DEFAULT_CORPUS = get(ENV, "ARROW_TESTING_DIR",
-    joinpath(homedir(), ".julia", "dev", "arrow-testing"))
+# The image sets ARROW_TESTING_DIR; every suite defaults its corpus to it.
+const DEFAULT_CORPUS = get(ENV, "ARROW_TESTING_DIR", "")
 
 # Families declared out of scope, with the reason. Everything
 # else must pass or it is a failure.
@@ -371,6 +370,8 @@ function runfamily(dir::String, family::String, verdicts::Vector{Verdict})
 end
 
 function runcorpus(corpus::String=DEFAULT_CORPUS; versions=nothing)
+    isempty(corpus) && error("ARROW_TESTING_DIR is not set: run this suite " *
+        "through `julia conformance/run.jl corpus`")
     root = joinpath(corpus, "data", "arrow-ipc-stream", "integration")
     isdir(root) || error("corpus not found at $root (set ARROW_TESTING_DIR)")
     verdicts = Verdict[]

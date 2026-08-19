@@ -33,6 +33,8 @@
 #
 #     docker build -t arrow-julia-conformance:latest -f conformance/Dockerfile conformance/
 
+# Julia 1.12: the version the conformance results are quoted against (and the
+# floor for --trim); the package itself supports 1.10+.
 FROM julia:1.12-bookworm
 
 # python3-dev brings the shared libpython that PythonCall embeds; Debian's
@@ -56,6 +58,8 @@ ENV ARROW_TESTING_DIR=/opt/arrow-testing \
     JULIA_CONDAPKG_BACKEND=Null \
     JULIA_DEPOT_PATH=/opt/julia-depot \
     JULIA_PROJECT=/opt/env
+# JULIA_PROJECT serves interactive `docker exec ... julia`; the driver passes
+# --project explicitly.
 
 # Warm the depot: every registered dependency the package and the conformance
 # environment resolve to (keep in step with Project.toml and
@@ -63,7 +67,7 @@ ENV ARROW_TESTING_DIR=/opt/arrow-testing \
 # fetches any delta), plus PythonCall precompiled against the oracle Python.
 RUN julia -e 'using Pkg; Pkg.activate("/opt/warm"); \
     Pkg.add(["CodecLz4", "CodecZstd", "DataAPI", "EnumX", "TranscodingStreams", \
-             "JSON", "CodecZlib", "PooledArrays", "PythonCall"]); \
+             "JSON", "CodecZlib", "PythonCall"]); \
     Pkg.develop(path="/opt/Tables"); Pkg.precompile()'
 
 # The suite environment is created from the mounted repository's
@@ -71,4 +75,5 @@ RUN julia -e 'using Pkg; Pkg.activate("/opt/warm"); \
 # /opt/Tables into it), so a Manifest never lives in the repository checkout.
 RUN mkdir -p /opt/env /work
 WORKDIR /work
-CMD ["julia", "--version"]
+# The driver keeps its container alive the same way.
+CMD ["sleep", "infinity"]

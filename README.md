@@ -18,10 +18,13 @@
 -->
 
 > **This is the Arrow.jl 3.0 development branch.** The last 2.x release
-> lives on its release tags. `Arrow.Table`, `Arrow.Stream`, and
-> `Arrow.write` are the public surface; the engine beneath them is
-> exercised by the test batteries, the apache/arrow-testing conformance
-> corpus, and the pyarrow/nanoarrow oracle suites.
+> lives on its release tags. `Arrow.Table`, `Arrow.Stream`, `Arrow.write`,
+> `Arrow.close!`, the byte-range readers and the C data / C stream entry
+> points are the public surface (see `docs/src/reference.md`); the engine
+> beneath them is exercised by the test batteries, the apache/arrow-testing
+> conformance corpus, and the pyarrow/nanoarrow oracle suites. Until
+> `Tables.Scan` ships in a Tables.jl release, this branch needs Tables.jl's
+> `jq/scan` branch: `Pkg.add(url="https://github.com/JuliaData/Tables.jl", rev="jq/scan")`.
 
 This is a pure Julia implementation of the
 [Apache Arrow](https://arrow.apache.org) data standard.
@@ -41,10 +44,13 @@ This is a pure Julia implementation of the
   footer-carried statistics pruning.
 - `src/table.jl`, `src/write.jl` — the public facade: `Arrow.Table`,
   `Arrow.Stream`, `Arrow.write`, `close!`.
-- `src/ArrowStrings/` — ArrowStrings.jl, a separate package (registered on
-  its own, like `src/ArrowTypes/`): the inline-else-view string
-  representation shared with CSV.jl, whose column memory is an Arrow
-  Utf8View array.
+- `src/FlatBuffers/` — the vendored FlatBuffers runtime the generated
+  bindings run over.
+- `src/ArrowStrings/` — ArrowStrings.jl, a separate package (to be
+  registered on its own, like `src/ArrowTypes/`; until its first release
+  Arrow depends on it through the `[sources]` path entry in `Project.toml`):
+  the inline-else-view string representation shared with CSV.jl, whose
+  column memory is an Arrow Utf8View array.
 - `bench/` — the serialize/deserialize benchmark harness (this package,
   Arrow.jl 2.x, PyArrow) over identical workloads.
 - `test/` — core unit tests, the facade tests, the four adapter acceptance
@@ -54,7 +60,9 @@ This is a pure Julia implementation of the
   JSON implementation, the pyarrow/nanoarrow IPC oracle round-trip suite,
   and the in-process pyarrow C Data / C Stream oracle — all run inside one
   docker image by `conformance/run.jl` (Harbor.jl); docker is the only
-  host requirement.
+  host requirement (plus network on the first run, to fetch Harbor.jl and
+  build the image).
+- `docs/src/` — the published user manual and API reference (`docs/make.jl`).
 - `docs/dev/` — the engine design document, the scan/ranged-fetch design
   notes, the FlatBuffers/C-data research notes, and the review record.
 
@@ -67,4 +75,5 @@ Conformance: 275/275 gold-corpus checks pass (36 declared skips);
 oracle capability gaps); 143/143 C Data and C Stream interface round-trips
 through an in-process pyarrow over the whole gold matrix (both directions,
 pyarrow-native memory, sliced exports; 9 declared skips). Run them all with
-`julia conformance/run.jl` (docker is the only host requirement).
+`julia conformance/run.jl` (docker is the only host requirement, plus
+network on the first run).

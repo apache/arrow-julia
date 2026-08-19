@@ -18,7 +18,7 @@
 # C Data / C Stream oracle: OUR C-interface structures through pyarrow, in
 # one process, over the whole gold data matrix.
 #
-#     julia conformance/run.jl cdata [corpus-dir]
+#     julia conformance/run.jl cdata
 #
 # `oracle.jl` proves our IPC BYTES against pyarrow and nanoarrow. This suite
 # proves our C DATA INTERFACE and C STREAM INTERFACE the same way: pyarrow
@@ -61,9 +61,7 @@
 # importable; the conformance image (conformance/Dockerfile) sets it. The
 # parent process re-launches this file as a child with PythonCall bound to
 # that interpreter (PythonCall reads its interpreter at load, so the parent
-# never loads it):
-#
-#     julia conformance/run.jl cdata     # in the image
+# never loads it).
 # =============================================================================
 
 const _CDATA_ORACLE_CHILD = "--child"
@@ -89,16 +87,6 @@ function _oracle_parent(args)
         --startup-file=no $(@__FILE__) $_CDATA_ORACLE_CHILD $args`
     proc = run(ignorestatus(setenv(cmd, env)))
     exit(proc.exitcode)
-end
-
-# --- child: the suite ---------------------------------------------------------
-
-function _oracle_child(args)
-    @eval begin
-        using PythonCall
-        include(joinpath(@__DIR__, "corpus.jl"))
-    end
-    Base.invokelatest(_run_cdata_oracle, args)
 end
 
 function _run_cdata_oracle(args)

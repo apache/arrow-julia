@@ -58,7 +58,7 @@ _timeunit(s) = s == "SECOND" ? AC.SECOND : s == "MILLISECOND" ? AC.MILLISECOND :
 _timeunitname(u) = u == AC.SECOND ? "SECOND" : u == AC.MILLISECOND ? "MILLISECOND" :
     u == AC.MICROSECOND ? "MICROSECOND" : "NANOSECOND"
 
-function fromjsontype(t::AbstractDict, children::Vector{Field})::ArrowType
+function fromjsontype(t::AbstractDict)::ArrowType
     n = t["name"]
     n == "null" && return NullType()
     n == "bool" && return BoolType()
@@ -143,11 +143,11 @@ Parse one JSON field into a Core `Field`. Dictionary-encoded fields become
 """
 function fromjsonfield(f::AbstractDict, dictids::IdDict{Field,Int64})::Field
     children = Field[fromjsonfield(c, dictids) for c in get(f, "children", Any[])]
-    t = fromjsontype(f["type"], children)
+    t = fromjsontype(f["type"])
     meta = _metadict(get(f, "metadata", nothing))
     if haskey(f, "dictionary")
         d = f["dictionary"]
-        idx = fromjsontype(d["indexType"], Field[])::IntType
+        idx = fromjsontype(d["indexType"])::IntType
         cf = Field(String(f["name"]), DictionaryType(idx, t, Bool(get(d, "isOrdered", false)));
             nullable=Bool(f["nullable"]), metadata=meta, children=children)
         dictids[cf] = Int64(d["id"])

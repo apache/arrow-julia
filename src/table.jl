@@ -18,7 +18,7 @@
 # The read facade: Arrow IPC -> Tables.jl columns.
 #
 # `Arrow.Table` materializes the selected columns into plain Julia vectors
-# (closed fixed-width claims through Core's bulk typed path, everything else
+# (closed element-type claims through Core's bulk typed path, everything else
 # through the dynamic accessors); there is no lazy typed-view layer.
 # `Arrow.Stream` iterates record batches as one Table each. Scan pushdown
 # routes through the ranged-scan adapter: on the file format, column
@@ -30,12 +30,14 @@
     Arrow.Table(source; scan=nothing, mmap=true) -> Table
 
 Read Arrow IPC data as Tables.jl columns. `source` is a file path, an `IO`,
-raw bytes (`Vector{UInt8}`), or an `Arrow.RangedSource` (byte-range reads —
-see its docs). Both IPC formats are accepted: the file format (`ARROW1`
-magic, random access, footer statistics) and the stream format.
+raw bytes (`Vector{UInt8}`), or an `Arrow.RangedSource`/`Arrow.RangedFile`
+(byte-range reads — see their docs). Both IPC formats are accepted: the file
+format (`ARROW1` magic, random access, footer statistics) and the stream
+format. `mmap=true` memory-maps a file-format path instead of reading it
+into memory; it has no effect on the other source kinds.
 
-`scan` is a `Tables.Scan` pushdown request: selected columns are the only
-ones decoded, footer statistics prune batches no row of which can match the
+`scan` is a `Tables.Scan` pushdown request: only the selected and
+filter-referenced columns are decoded, footer statistics prune batches no row of which can match the
 filter, and exact limit/offset windows skip whole batches. On the file
 format (and ranged sources) pruning happens before bytes are fetched or
 decoded; on the stream format the scan is applied after decode.
@@ -56,23 +58,23 @@ on Windows before deleting a mapped file.
 struct Table <: Tables.AbstractColumns
     names::Vector{Symbol}
     columns::Vector{AbstractVector}
-    lookup::Dict{Symbol,Base.Int}
+    lookup::Dict{Symbol,Int}
     schema::Union{Nothing,AC.Schema}
     regions::Vector{AC.OwnerRegion}
-    nrows::Base.Int   # authoritative even with zero columns
+    nrows::Int   # authoritative even with zero columns
 end
 
 function _table(names::Vector{Symbol}, columns::Vector{AbstractVector},
     schema, regions, nrows::Integer)
-    lookup = Dict{Symbol,Base.Int}(nm => i for (i, nm) in enumerate(names))
-    return Table(names, columns, lookup, schema, regions, Base.Int(nrows))
+    lookup = Dict{Symbol,Int}(nm => i for (i, nm) in enumerate(names))
+    return Table(names, columns, lookup, schema, regions, Int(nrows))
 end
 
 Tables.istable(::Type{Table}) = true
 Tables.columnaccess(::Type{Table}) = true
 Tables.columns(t::Table) = t
 Tables.columnnames(t::Table) = getfield(t, :names)
-Tables.getcolumn(t::Table, i::Base.Int) = getfield(t, :columns)[i]
+Tables.getcolumn(t::Table, i::Int) = getfield(t, :columns)[i]
 Tables.getcolumn(t::Table, nm::Symbol) =
     getfield(t, :columns)[getfield(t, :lookup)[nm]]
 Tables.schema(t::Table) = Tables.Schema(getfield(t, :names),
@@ -114,8 +116,8 @@ function _colsymbol(t::Table, col::Symbol)
         throw(ArgumentError("no column $(repr(col)) in this table"))
     return col
 end
-_colsymbol(t::Table, col::Base.Int) = getfield(t, :names)[col]
-function DataAPI.colmetadatakeys(t::Table, col::Union{Symbol,Base.Int})
+_colsymbol(t::Table, col::Int) = getfield(t, :names)[col]
+function DataAPI.colmetadatakeys(t::Table, col::Union{Symbol,Int})
     f = _schemafield(t, _colsymbol(t, col))
     (f === nothing || f.metadata === nothing) && return ()
     return (String(first(kv)) for kv in f.metadata)
@@ -123,7 +125,7 @@ end
 DataAPI.colmetadatakeys(t::Table) =
     (nm => DataAPI.colmetadatakeys(t, nm) for nm in getfield(t, :names)
      if !isempty(DataAPI.colmetadatakeys(t, nm)))
-function DataAPI.colmetadata(t::Table, col::Union{Symbol,Base.Int},
+function DataAPI.colmetadata(t::Table, col::Union{Symbol,Int},
     key::AbstractString, default=_NO_DEFAULT; style::Bool=false)
     f = _schemafield(t, _colsymbol(t, col))
     if f !== nothing && f.metadata !== nothing
@@ -227,7 +229,7 @@ function _publiccolumn(f::AC.Field, converted)
     return T === Any ? map(identity, converted) : collect(T, converted)
 end
 
-# A claim the R5 typed path resolves without boxing: concrete scalars,
+# A claim the typed path resolves without boxing: concrete scalars,
 # their Missing unions, and Vectors thereof. `Vector{Any}` (lists of
 # unresolved children) and the `Vector{Pair}` composite rows gain nothing
 # typed, so they stay on the dynamic path.
@@ -377,7 +379,7 @@ function _exactdiv(x::Int64, d::Integer)
 end
 
 function _fieldfor(fields, ref, names)
-    ref isa Base.Int && 1 <= ref <= length(fields) && return fields[ref]
+    ref isa Int && 1 <= ref <= length(fields) && return fields[ref]
     i = findfirst(==(Symbol(ref)), names)
     return i === nothing ? nothing : fields[i]
 end
@@ -541,7 +543,7 @@ function _publicscan(full::Table, schema, sourcefields, scan, regions)
         # Row-invariant predicate, evaluated ONCE — no mask or index vector
         # may be allocated from an untrusted row count.
         keep = _zerofieldpredicate(scan.filter)
-        n1 = Base.Int(_zerofieldcount(Int64(Tables.rowcount(full)), keep,
+        n1 = Int(_zerofieldcount(Int64(Tables.rowcount(full)), keep,
             scan.limit, scan.offset))
         return _table(Symbol[], AbstractVector[], schema,
             AC.OwnerRegion[regions...], n1)
@@ -550,7 +552,7 @@ function _publicscan(full::Table, schema, sourcefields, scan, regions)
     # Row count survives an empty projection: window+filter first over the
     # full column set, then project.
     counted = Tables.scan(full, Tables.Scan(scan; select=nothing))
-    n = Base.Int(Tables.rowcount(Tables.columns(counted)))
+    n = Int(Tables.rowcount(Tables.columns(counted)))
     got = Tables.scan(counted,
         Tables.Scan(scan; filter=nothing, limit=nothing, offset=0))
     cols = Tables.columns(got)
@@ -570,7 +572,7 @@ end
 _corefields(s::IPCStream) = collect(AC.Field, s.corefields)
 _corefields(f::ArrowFile) = collect(AC.Field, f.fields)
 
-function _rawcolumn(s::IPCStream, i::Base.Int)
+function _rawcolumn(s::IPCStream, i::Int)
     parts = [_batchcolumn(s.corefields[i], b.columns[i]) for b in s.batches]
     return isempty(parts) ? Any[] : reduce(vcat, parts)
 end
@@ -583,7 +585,7 @@ function _materialize_table(src::IPCStream, regions)
     cols = AbstractVector[
         _facadecolumn(f, [_batchcolumn(f, b.columns[i]) for b in src.batches])
         for (i, f) in enumerate(src.corefields)]
-    nrows = sum(Base.Int(b.nrows) for b in src.batches; init=0)
+    nrows = sum(Int(b.nrows) for b in src.batches; init=0)
     return _table(names, cols, src.schema, regions, nrows)
 end
 
@@ -594,17 +596,10 @@ function _materialize_table(src::ArrowFile, regions)
     cols = AbstractVector[
         _facadecolumn(f, [_batchcolumn(f, b.columns[i]) for b in batches])
         for (i, f) in enumerate(src.fields)]
-    nrows = sum(Base.Int(b.nrows) for b in batches; init=0)
+    nrows = sum(Int(b.nrows) for b in batches; init=0)
     return _table(names, cols, src.schema, regions, nrows)
 end
 
-"""
-The OUTPUT schema of a scan: bound source fields under their output names.
-`precols` supplies each output's pre-override (facade-narrowed) column, so
-override keep/drop follows the SAME actual-subtype decision the conversion
-made: a no-op override keeps its retained field; a real conversion drops it
-(a later rewrite re-infers the column).
-"""
 # The eltype the keep/drop decision uses for an EMPTY pre-override column:
 # the descriptor's declared facade type. Composites materialize rows as
 # vectors (their eltype accident is `Any[]` when no rows exist), so the
@@ -680,6 +675,13 @@ _declaredbasetype(t::AC.ArrowType) =
     t isa AC.DictionaryType ? _declaredbasetype(t.valuetype) :
     _facadebasetype(t)
 
+"""
+The OUTPUT schema of a scan: bound source fields under their output names.
+`precols` supplies each output's pre-override (facade-narrowed) column, so
+override keep/drop follows the SAME actual-subtype decision the conversion
+made: a no-op override keeps its retained field; a real conversion drops it
+(a later rewrite re-infers the column).
+"""
 function _boundschema(schema, sourcefields, scan, precols)
     (schema === nothing || scan === nothing) && return schema
     b = Tables.bind(scan, Symbol[Symbol(f.name) for f in sourcefields])
@@ -728,7 +730,7 @@ function _wrapscanned(got, schema, sourcefields, scan;
     return _table(names, columns, bound, AC.OwnerRegion[regions...], nrows)
 end
 
-_scanrowcount(got) = Base.Int(Tables.rowcount(Tables.columns(got)))
+_scanrowcount(got) = Int(Tables.rowcount(Tables.columns(got)))
 
 "Convert a column to an override type with Tables.scan's exact rules."
 function _applyoverride(T, col)
@@ -752,8 +754,10 @@ end
 """
     Arrow.Stream(source; mmap=true)
 
-Iterate an IPC source one record batch at a time; each iteration yields an
-[`Arrow.Table`](@ref) for that batch. Satisfies `Tables.partitions` (each
+Iterate an IPC source (a file path, an `IO`, or a `Vector{UInt8}`) one
+record batch at a time; each iteration yields an [`Arrow.Table`](@ref) for
+that batch. `mmap=true` memory-maps a file-format path instead of reading
+it into memory; it has no effect on the other source kinds. Satisfies `Tables.partitions` (each
 batch is one partition), so partition-aware sinks — including `Arrow.write`,
 which writes one record batch per partition — see the source batch structure.
 
@@ -790,7 +794,7 @@ _batchfields(f::ArrowFile) = f.fields
 Base.length(s::Stream) = _nbatches(s.src)
 Base.eltype(::Type{Stream}) = Table
 
-function Base.iterate(s::Stream, i::Base.Int=1)
+function Base.iterate(s::Stream, i::Int=1)
     i > _nbatches(s.src) && return nothing
     b = _batch(s.src, i)
     fields = _batchfields(s.src)
@@ -798,7 +802,7 @@ function Base.iterate(s::Stream, i::Base.Int=1)
     cols = AbstractVector[_facadecolumn(f, [_batchcolumn(f, b.columns[j])])
                           for (j, f) in enumerate(fields)]
     return _table(names, cols, _tableschema(s.src), s.regions,
-        Base.Int(b.nrows)), i + 1
+        Int(b.nrows)), i + 1
 end
 
 Tables.partitions(s::Stream) = s

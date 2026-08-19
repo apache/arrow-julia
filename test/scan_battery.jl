@@ -143,21 +143,8 @@ function _legacyv4file()
 end
 
 function _scan_main()
-    expected = (
-        ints=Int64[1, 2, 3, 4, 5],
-        floats=[1.5, missing, 3.5, missing, 5.5],
-        bools=[true, false, true, missing, false],
-        strs=["hey", "", missing, "αβ∀", "last"],
-        lists=[[1, 2], Int64[], [3], missing, [4, 5, 6]],
-        structs=[(a=1, b="x"), (a=2, b="y"), (a=3, b="z"), (a=4, b="w"), (a=5, b="v")],
-        dict=["lo", "hi", "lo", missing, "hi"],
-    )
-    source = readstream(_fixture2x("mixed-two-partitions") do
-        io = IOBuffer()
-        writetable = merge(expected, (dict=Arrow.DictEncode(expected.dict),))
-        Arrow.write(io, Tables.partitioner([writetable, writetable]); file=false)
-        take!(io)
-    end)
+    expected = MIXED_EXPECTED
+    source = readstream(_mixed_two_partitions_bytes())
     filebytes = writefile(source)
     af = readfile(copy(filebytes))
     full = _fulltable(af)
@@ -494,11 +481,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     # when the dictionary values use a view layout, including the legal zero
     # count for an all-inline pool. A following plain field pins record-batch
     # alignment after the dictionary is installed.
-    scanviewentry(s) = let bytes = collect(codeunits(s))
-        @assert length(bytes) <= 12
-        vcat(reinterpret(UInt8, Int32[Int32(length(bytes))]), bytes,
-            zeros(UInt8, 12 - length(bytes)))
-    end
+    scanviewentry(s) = _viewentry(ncodeunits(s), collect(codeunits(s)))
     dvt = ViewType(true)
     dvpool = ArrayData(dvt, 2,
         [BufferSlice(), AC._databuffer(vcat(
@@ -824,8 +807,7 @@ end
     saf = readfile(copy(sbytes))
     sfull = _fulltable(saf)
 
-    # The statistics blob is itself a valid stream this reader accepts, and
-    # a file carrying it stays readable by this reader AND Arrow.jl 2.x.
+    # The statistics blob is itself a valid stream this reader accepts.
     stats = _readstats(saf.schema.metadata, 2, saf.fields)
     @assert stats !== nothing
     @assert stats[1].rows == 5 && stats[2].rows == 5

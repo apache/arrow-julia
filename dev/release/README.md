@@ -103,6 +103,14 @@ If ArrowTypes is also registered, we also need to post a comment on the commit w
 @JuliaRegistrator register subdir=src/ArrowTypes
 ```
 
+ArrowStrings must be registered before Arrow can resolve from the registry
+(Arrow depends on it; the `[sources]` entry in `Project.toml` only serves
+checkouts of this repository):
+
+```markdown
+@JuliaRegistrator register subdir=src/ArrowStrings
+```
+
 ### Verify
 
 We have a script to verify a RC.

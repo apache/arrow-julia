@@ -98,8 +98,8 @@ function exercise_cdata()::Nothing
     m2 = f2.metadata
     checked(m2 !== nothing && length(m2) == 1 && first(m2[1]) == "mk" &&
         last(m2[1]) == "mv", "cdata metadata round-trip failed")
-    # The R5 workflow verbatim: a column imported over the C seam reads
-    # through a caller-supplied static type, fully resolved.
+    # A column imported over the C seam reads through a caller-supplied
+    # static type, fully resolved.
     tm = materialize(Int64, f2, d2)
     checked(tm isa Vector{Int64} && tm == Int64[1, 2, 3],
         "cdata typed materialize failed")
@@ -165,8 +165,8 @@ function exercise_values()::Nothing
 end
 
 function exercise_typed_values()::Nothing
-    # The R5 contract: a caller-supplied static schema makes element access
-    # fully resolvable — concrete claims at every call site below.
+    # A caller-supplied static schema makes element access fully
+    # resolvable — concrete claims at every call site below.
     f1, c1 = fromjulia("xs", Int64[1, 2, 3])
     checked(getvalue(Int64, f1, c1, 2) === Int64(2), "typed int failed")
     m1 = materialize(Int64, f1, c1)

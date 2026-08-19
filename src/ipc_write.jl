@@ -31,8 +31,8 @@
 #   * Compression at encode: per-buffer LZ4_FRAME/ZSTD with the Int64
 #     uncompressed-length prefix, the `-1` stored-raw fallback when
 #     compression does not help, codec objects owned per writer and
-#     explicitly finalized. Compressed streams declare Feature.COMPRESSED_BODY
-#     (Arrow.jl 2.x streams omit the declaration; the read side accepts both).
+#     explicitly finalized. Compressed streams declare Feature.COMPRESSED_BODY;
+#     the reader accepts compressed batches with or without the declaration.
 #
 #   * File format = stream framing + a Block index + a Footer: the writer
 #     isolates footer bookkeeping from generic message writing; `readfile`
@@ -40,11 +40,9 @@
 #     (`length`/`getindex`) over one borrowed or mmapped region.
 # =============================================================================
 
-# TranscodingStreams is a direct dependency; both codecs share its one
-# streams API.
-
 # ---------------------------------------------------------------------------
-# Encode-side codec state: per-writer objects, explicitly finalized
+# Encode-side codec state: per-writer objects, explicitly finalized (both
+# codecs share TranscodingStreams' one streams API)
 # ---------------------------------------------------------------------------
 
 mutable struct EncodeState
@@ -941,8 +939,8 @@ Base.length(f::ArrowFile) = length(f.recordblocks)
 AC.schema(f::ArrowFile) = f.schema
 
 """
-Frame and verify the single message a Block points at, against the block's
-own declared extents and the enclosing region.
+Range-check one Footer Block's declared extents against the data section and
+return its `(offset, frameend)` span.
 """
 function _blockextent(block::NTuple{3,Int64}, dataend::Int64)
     offset, metalen, bodylen = block
@@ -978,6 +976,10 @@ function _validateblockindex(dictblocks, recordblocks, dataend::Int64;
     return indexedend
 end
 
+# The `_block*` traversal below mirrors the schema-blind vtable primitives of
+# src/metadata/VerifierRuntime.jl (`_vtable`/`_vfield`/`_vref`/`_vvector`/
+# `_vrange`) over a `BufferSlice` source with block-specific diagnostics; the
+# two must change in lockstep.
 function _blockrange(b::BufferSlice, pos::Int64, len::Int64,
     what::AbstractString)
     (pos >= 0 && len >= 0 && len <= b.len && pos <= b.len - len) ||
@@ -1119,9 +1121,6 @@ function _blockmessagebatch(metadata::BufferSlice)
     return bodylen, headertype, batch
 end
 
-_blockmessagebodylength(metadata::BufferSlice) =
-    first(_blockmessagebatch(metadata))
-
 function _verifyblockbuffers(batch::_BlockTable, bodylen::Int64)
     buffers = _blockvector(batch, 2, 16, "record-batch buffer vector")
     buffers === nothing && return nothing
@@ -1180,6 +1179,10 @@ function _verifyblockframes(blob::BufferSlice, dictblocks, recordblocks,
     return indexedend
 end
 
+"""
+Frame and verify the single message a Block points at, against the block's
+own declared extents and the enclosing region.
+"""
 function _blockmessage(region::OwnerRegion, block::NTuple{3,Int64},
     dataend::Int64, limits::Limits, budget::AllocationBudget)
     offset, _ = _blockextent(block, dataend)

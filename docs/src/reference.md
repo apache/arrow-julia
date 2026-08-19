@@ -51,8 +51,16 @@ Arrow.to_c_data
 Arrow.from_c_data
 Arrow.export_stream!
 Arrow.from_c_stream
+Arrow.ImportedStream
 Arrow.nextbatch!
 Arrow.release!(::Arrow.ForeignOwner)
 Arrow.release!(::Arrow.ImportedStream)
+Arrow.close!(::Arrow.ForeignOwner)
 Arrow.reap!
+```
+
+## Errors
+
+```@docs
+Arrow.ValidationError
 ```

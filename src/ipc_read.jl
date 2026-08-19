@@ -108,7 +108,6 @@ const _vref = Meta._vref
 const _vvector = Meta._vvector
 const _vrange = Meta._vrange
 const _vu8 = Meta._vu8
-const _vu16 = Meta._vu16
 const _vu32 = Meta._vu32
 const _vi32 = Meta._vi32
 const _vi64 = Meta._vi64
@@ -170,10 +169,8 @@ end
 Walk the IPC stream framing (continuation marker, metadata length, metadata
 flatbuffer, body), checking every declared length against the limits and the
 region's real extent before metadata-directed decode allocation. A truncated
-prefix, metadata block, or body is an error here — not a silent early return
-(the current framer returns `nothing` on truncation, src/table.jl:679-708) and
-not a segfault three batches later. EOF exactly after a complete message is
-the intentional missing-EOS boundary case and is accepted.
+prefix, metadata block, or body throws. EOF exactly after a complete message
+is the intentional missing-EOS boundary case and is accepted.
 """
 framemessages(region::OwnerRegion, limits::Limits=Limits()) =
     _framemessages(region, limits, Base.ENDIAN_BOM,
@@ -196,7 +193,7 @@ end
 function _framemessages(region::OwnerRegion, limits::Limits,
     host_endian_bom::UInt32,
     budget::AllocationBudget=AllocationBudget(limits.max_total_allocated_bytes))
-    # The borrowed generated FlatBuffers bindings use native-endian scalar
+    # The generated FlatBuffers bindings use native-endian scalar
     # loads. Reject an unsupported host before any generated getter sees the
     # little-endian wire bytes. The explicit argument keeps this ordering
     # testable on the supported little-endian CI host.
@@ -257,10 +254,9 @@ end
 # Metadata mapping: Meta.* type structs -> Core runtime descriptors
 # ---------------------------------------------------------------------------
 
-# One value-level mapping table. Compare src/eltypes.jl, where this
-# relationship is 22 `juliaeltype` + 21 `arrowtype` methods entangled with
-# Julia-type conversion; here it is one function per direction on runtime
-# values, and Julia conversion is someone else's (the facade's) concern.
+# One value-level mapping table: one function per direction over runtime
+# descriptors. Julia-type conversion is the facade's concern, not this
+# adapter's.
 
 function coretype(t)::ArrowType
     if t isa Meta.Int
@@ -354,9 +350,6 @@ function coremetadata(kvs)
     kvs === nothing && return nothing
     return Dict(String(kv.key) => String(something(kv.value, "")) for kv in kvs)
 end
-
-_containsdictionary(f::Field) =
-    f.type isa DictionaryType || any(_containsdictionary, f.children)
 
 """
 Convert a metadata Field to a Core Field. Dictionary-encoded fields become
@@ -559,7 +552,7 @@ function _decode_zstd!(state::DecodeState, src::Ptr{UInt8}, srclen::Int64,
 end
 
 # `B` is the body representation: a contiguous `BufferSlice` for in-memory
-# and mmapped messages, or a sparse body (scan_ranges.jl) whose fetched
+# and mmapped messages, or a sparse body (scan.jl) whose fetched
 # spans stand in for the contiguous message body. `_bodyslice` is the one
 # seam between them; the parameter keeps the cursor concrete per use.
 mutable struct DecodeCursor{B}
@@ -766,9 +759,10 @@ function missingdicts(fields, nodes, dicts::Dict{Int64,ArrayData},
 end
 
 """
-    decodefield(field, cursor, dictionaries) -> ArrayData
+    decodefield(field, cursor, dictionaries, fielddictids) -> ArrayData
 
-Generic over the mapped, non-variadic layouts in this adapter.
+Generic over every mapped layout in this adapter, variadic (view) layouts
+included.
 Dictionary-encoded columns consume the INDEX layout's buffers (validity +
 indices) and resolve their values through the adapter's dictionary table.
 """
@@ -878,8 +872,6 @@ mutable struct IPCStream <: AC.RecordBatchSource
     @atomic pulling::Bool
     fielddictids::IdDict{Field,Int64}   # adapter-side id table (shared ids preserved)
 end
-IPCStream(sch, fields, batches, nextindex, pulling) =
-    IPCStream(sch, fields, batches, nextindex, pulling, IdDict{Field,Int64}())
 
 mutable struct PendingRecord
     fm::FramedMessage

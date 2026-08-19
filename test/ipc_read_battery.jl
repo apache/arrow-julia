@@ -42,27 +42,10 @@ function ipc_read_battery()
     @assert _rejects(() -> readstream(_metadata_value_stream(false)))
     println("metadata values are present, including explicit empty strings ✓")
 
-    expected = (
-        ints=Int64[1, 2, 3, 4, 5],
-        floats=[1.5, missing, 3.5, missing, 5.5],
-        bools=[true, false, true, missing, false],
-        strs=["hey", "", missing, "αβ∀", "last"],
-        lists=[[1, 2], Int64[], [3], missing, [4, 5, 6]],
-        structs=[(a=1, b="x"), (a=2, b="y"), (a=3, b="z"), (a=4, b="w"), (a=5, b="v")],
-        dict=["lo", "hi", "lo", missing, "hi"],
-    )
-    # Two partitions -> two record batches (plus dictionary batches).
-    bytes = _fixture2x("mixed-two-partitions") do
-        io = IOBuffer()
-        writetable = merge(expected, (dict=Arrow.DictEncode(expected.dict),))
-        Arrow.write(io, Tables.partitioner([writetable, writetable]); file=false)
-        take!(io)
-    end
-    println("2.x-written stream: $(length(bytes)) bytes")
+    expected = MIXED_EXPECTED
+    bytes = _mixed_two_partitions_bytes()
 
     stream = readstream(bytes)
-    println("decoded: $(length(stream.batches)) record batches, " *
-            "$(length(stream.schema.fields)) columns")
     @assert length(stream.batches) == 2
 
     dictpos = findfirst(f -> f.type isa DictionaryType, stream.schema.fields)
@@ -285,14 +268,7 @@ function ipc_read_battery()
     @assert nextbatch!(pulled) === nothing
     println("RecordBatchSource pull protocol works ✓")
 
-    println("pull claim releases on every exit path ✓")
-
-    reporoot = normpath(joinpath(@__DIR__, "..", ".."))
-    stresscmd = `$(Base.julia_cmd()) --startup-file=no --threads=4 --project=$reporoot $(abspath(@__FILE__))`
-    run(addenv(stresscmd, "ARROWCORE_IPC_CURSOR_STRESS" => "1"))
-    println("concurrent IPC pulls fail closed without duplicate batches ✓")
-
-    # Framing limits actually bite: a 1KB body cap must reject this stream
+    # Framing limits actually bite: a 16-byte body cap rejects this stream
     # BEFORE any decode work happens.
     caught = try
         readstream(bytes; limits=Limits(max_body_bytes=16))

@@ -334,7 +334,6 @@ end
     @testset "retained rewrite is schema identity" begin
         # Non-nullable temporal descriptors stay non-nullable; Date64 works.
         vals = Int64[0, 86_400_000]
-        f64, _ = Arrow.AC.fromjulia("d", vals)
         t64 = Arrow.AC.DateType(Arrow.AC.MILLISECOND_DATE)
         d64 = Arrow.AC._arraydata(t64, 2,
             [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(vals)], 0,
@@ -427,7 +426,7 @@ end
         f, d = Arrow.AC.fromjulia("us", us)
         t_us = Arrow.AC.TimestampType(Arrow.AC.MICROSECOND, nothing)
         d_us = Arrow.AC._arraydata(t_us, 2, d.buffers, 0,
-            Arrow.AC.ArrayData[], nothing, nothing, 2 - 2)
+            Arrow.AC.ArrayData[], nothing, nothing, 0)
         sch = Arrow.AC.Schema([Arrow.AC.Field("us", t_us; nullable=true)])
         bytes = Arrow.writestream(sch,
             [Arrow.AC.RecordBatch(sch, [d_us], 2)])
@@ -534,8 +533,7 @@ end
         dbytes = Arrow.writestream(dsch,
             [Arrow.AC.RecordBatch(dsch, [dd], 1)])
         td = Arrow.Table(dbytes)
-        cols = AbstractVector[Union{Missing,String}["a", missing][1:1]]
-        cols[1] = Union{Missing,String}[missing]
+        cols = AbstractVector[Union{Missing,String}[missing]]
         brokend = Arrow.Table(getfield(td, :names), cols,
             getfield(td, :lookup), getfield(td, :schema),
             Arrow.AC.OwnerRegion[], 1)

@@ -30,7 +30,9 @@ is a pure Julia implementation of that
 reads and writes the IPC stream and file formats, exchanges in-memory data
 with other implementations through the C data and C stream interfaces, and
 presents everything to Julia through the [Tables.jl](https://tables.juliadata.org)
-interface.
+interface. Until `Tables.Scan` ships in a Tables.jl release, Arrow.jl 3.0
+needs Tables.jl's `jq/scan` branch:
+`Pkg.add(url="https://github.com/JuliaData/Tables.jl", rev="jq/scan")`.
 
 ```julia
 using Arrow, Tables
@@ -52,7 +54,7 @@ and detected automatically: the *file* format (`ARROW1` magic, random
 access, optional footer statistics) and the *stream* format.
 
 ```julia
-tbl = Arrow.Table("data.arrow")           # a path: memory-mapped file
+tbl = Arrow.Table("data.arrow")           # a file-format path: memory-mapped
 tbl = Arrow.Table(io)                      # an IO: read to the end
 tbl = Arrow.Table(bytes)                   # IPC bytes already in memory
 ```
@@ -61,7 +63,7 @@ tbl = Arrow.Table(bytes)                   # IPC bytes already in memory
 every Tables.jl-aware sink and consumer:
 
 ```julia
-Tables.columnnames(tbl)                    # (:a, :b)
+Tables.columnnames(tbl)                    # [:a, :b]
 Tables.schema(tbl)
 tbl.a                                      # property access = a column
 Tables.getcolumn(tbl, :b)
@@ -76,9 +78,10 @@ it is constructed, and its columns behave like any other Julia vectors.
 
 ### Memory mapping and `close!`
 
-A file path is memory-mapped by default (`mmap=true`), so reading a large
-file does not copy it into RAM up front; pass `mmap=false` to read the file
-into memory instead. A memory map is released when the last reference to it
+A path to a file-format source is memory-mapped by default (`mmap=true`), so
+reading a large file does not copy it into RAM up front; pass `mmap=false`
+to read it into memory instead (a stream-format path is always read into
+memory). A memory map is released when the last reference to it
 is garbage collected. To release it deterministically — required on Windows
 before a still-mapped file can be deleted, and useful anywhere for prompt
 resource release — call [`Arrow.close!`](@ref):
@@ -157,7 +160,7 @@ maps to `Union{Missing, T}`.
 | Time32/Time64 | `Dates.Time` |
 | Duration | `Dates.Second`/`Millisecond`/`Microsecond`/`Nanosecond` by unit |
 | Decimal32/64 | `Int32`/`Int64` (unscaled integer storage) |
-| Decimal128/256 | `Vector{UInt8}` (raw little-endian storage) |
+| Decimal128/256 | `Vector{UInt8}` (raw native-endian storage) |
 | Interval | `Int32` (year-month) or a `NamedTuple` (day-time, month-day-nano) |
 | Dictionary-encoded scalar | the mapping of the *value* type (indices are resolved) |
 
@@ -173,7 +176,7 @@ path):
 
 | Arrow type | Element type |
 |---|---|
-| List, LargeList, FixedSizeList, ListView | `Vector{Any}` (rows are vectors of the child's values) |
+| List, LargeList, FixedSizeList, ListView, LargeListView | `Vector{Any}` (rows are vectors of the child's values) |
 | Struct | `Vector{Pair{String,Any}}` (rows are ordered name => value pairs) |
 | Map | `Vector{Pair{Any,Any}}` |
 | Union | the join of the children's element types when it is concrete (a homogeneous union reads as that type); otherwise `Any`, narrowed from the rows |
@@ -378,7 +381,10 @@ a consumer, and ownership is transferred with a release callback.
 
 Arrow.jl exposes both interfaces at the level of the engine's column
 representation (a `Field` describing the type and an `ArrayData` holding
-the buffers), which every Julia column read by `Arrow.Table` is built from:
+the buffers), which every Julia column read by `Arrow.Table` is built from.
+Those types, and the `Arrow.ArrowCore.fromjulia` builder used below to make
+one, are the engine's currency: they are the argument and return types of
+this API but are not otherwise part of the public surface.
 
 * `Arrow.to_c_data(field, data) -> (schemaptr, arrayptr)` exports one
   column; the structs stay valid until the consumer calls their `release`
@@ -386,8 +392,9 @@ the buffers), which every Julia column read by `Arrow.Table` is built from:
 * `Arrow.from_c_data(schemaptr, arrayptr) -> (field, data)` imports one
   column, *moving* the array (its source `release` is nulled, as the spec
   requires). The imported buffers stay valid as long as the returned data is
-  reachable; `Arrow.close!` on any imported buffer, or `Arrow.release!` on
-  the import's owner, runs the producer's release callback exactly once.
+  reachable; `Arrow.close!` on the owner region behind any imported buffer
+  (`buffer.region`), or `Arrow.release!` on the import's `ForeignOwner`,
+  runs the producer's release callback exactly once.
 * `Arrow.export_stream!(streamptr, schema, batches)` fills a caller-owned
   `ArrowArrayStream`; `Arrow.from_c_stream(streamptr)` imports one and
   yields record batches through `Arrow.nextbatch!`.

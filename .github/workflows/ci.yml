@@ -90,7 +90,7 @@ jobs:
             dir: './src/ArrowStrings'
         version:
           - 'min'
-          - 'lts'
+          - '1.11'
           - '1' # automatically expands to the latest stable 1.x release of Julia
           - 'pre' # expands to latest alpha, beta or RC, if available, otherwise same as `1`
         os:
@@ -118,12 +118,12 @@ jobs:
       # Before the build: ArrowStrings is unregistered and Julia 1.10's Pkg
       # does not read the `[sources]` entry that points at it, so the
       # resolve would fail without the develop.
-      - name: Dev local ArrowTypes and ArrowStrings for Arrow.jl tests
+      - name: Dev local ArrowStrings for Arrow.jl tests
         if: matrix.pkg.name == 'Arrow.jl'
         shell: julia --project=. {0}
         run: |
           using Pkg
-          Pkg.develop([PackageSpec(path="src/ArrowTypes"), PackageSpec(path="src/ArrowStrings")])
+          Pkg.develop(PackageSpec(path="src/ArrowStrings"))
       - uses: julia-actions/julia-buildpkg@v1.6
         with:
           project: ${{ matrix.pkg.dir }}

@@ -526,16 +526,6 @@ function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool},
         f.schemaversion, mask, state)
 end
 
-function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool})
-    budget = AllocationBudget(f.limits.max_total_allocated_bytes)
-    state = DecodeState(budget)
-    try
-        return _scanbatch(f, i, mask, budget, state)
-    finally
-        close(state)
-    end
-end
-
 # ---------------------------------------------------------------------------
 # Scan pushdown over a whole file
 # ---------------------------------------------------------------------------
@@ -657,9 +647,9 @@ The fetcher contract: `fetch(offset::Int64, len::Int64) ->
 Vector{UInt8}` over a remote or local object of known total `len`, offsets
 0-based. `F` is concrete per instantiation — in a trimmed app the fetch path
 is statically resolvable, which is why this is a parametric functor and not
-an abstract type. Transports (CloudStore, HTTP) live in extensions and only
-need to construct one of these; `fetchranges` has a serial default they
-override for concurrent range GETs.
+an abstract type. A transport (CloudStore, HTTP, …) only needs to construct
+one of these; `fetchranges` has a serial default it may override for
+concurrent range GETs.
 """
 struct RangedSource{F}
     fetch::F
@@ -687,28 +677,6 @@ function _fetchexact(s::RangedSource, off::Int64, len::Int64)
         throw(ValidationError("range fetch returned $(length(bytes)) bytes, expected $len"))
     return bytes
 end
-
-"Fetch accounting for the differential tests: every range, every byte."
-mutable struct FetchLog
-    requests::Int
-    bytes::Int64
-    ranges::Vector{NTuple{2,Int64}}
-end
-FetchLog() = FetchLog(0, 0, NTuple{2,Int64}[])
-
-function countingsource(bytes::Vector{UInt8})
-    log = FetchLog()
-    fetch = (off, len) -> begin
-        log.requests += 1
-        log.bytes += len
-        push!(log.ranges, (off, len))
-        bytes[(off + 1):(off + len)]
-    end
-    return log, RangedSource(fetch, Int64(length(bytes)))
-end
-
-_fetched(log::FetchLog, pos::Int64) =
-    any(off <= pos < off + len for (off, len) in log.ranges)
 
 """
 Merge sorted ranges whose gap is at most `gap`: a small over-read is usually
@@ -1219,8 +1187,7 @@ end
 #            map<dictionary<utf8, int32>, dense_union<int64,float64,utf8,bool>>>
 # serialized as one embedded IPC stream with one statistics record batch per
 # data record batch, base64-wrapped into schema-level custom metadata so the
-# tail fetch alone powers pruning. Upgradeable: if upstream ever
-# standardizes placement, we emit both keys through a deprecation cycle.
+# tail fetch alone powers pruning.
 const STATS_KEY = "JuliaArrow:batch_statistics.v1"
 const STATS_ROW_COUNT = "ARROW:row_count:exact"
 const STATS_NULL_COUNT = "ARROW:null_count:exact"
@@ -1403,7 +1370,7 @@ function withstatistics(sch::Schema, batches::AbstractVector{AC.RecordBatch})
     for batch in batches
         colstats = Tuple{Int,Int64,Any,Any}[]
         fieldref = 1  # official zero-based FieldNode index, plus one for _statsbatch
-        for (j, (f, col)) in enumerate(zip(sch.fields, batch.columns))
+        for (f, col) in zip(sch.fields, batch.columns)
             nc, lo, hi = _statfold(f, col)
             push!(colstats, (fieldref, nc, lo, hi))
             fieldref += _fieldnodespan(f)
@@ -1445,6 +1412,7 @@ function _validatestatsschema(sch::Schema)
     return nothing
 end
 
+"Write a statistics-carrying Arrow file: `writefile(withstatistics(sch, batches), batches)`."
 statsfile(sch::Schema, batches::AbstractVector{AC.RecordBatch};
     compress::Symbol=:none) =
     writefile(withstatistics(sch, batches), batches; compress=compress)

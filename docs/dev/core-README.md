@@ -109,8 +109,8 @@ with no eager action (running a borrowed object's finalizers is not ours to
 do). `close!` is idempotent and is not a data-race shield for accesses
 concurrent WITH the close — quiescing readers first is the caller's
 contract, as with `Base.close` on a shared IO. Every buffer imported from
-one C-data tree shares one cell, so closing any of them revokes all
-siblings before the single producer release.
+one C-data tree is backed by regions sharing one cell, so closing any of
+those regions revokes all siblings before the single producer release.
 
 What the model does not do: nothing prevents external writes to or
 truncation of a mapped file while the mapping or cached validation results

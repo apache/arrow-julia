@@ -23,7 +23,9 @@
 # proves us against implementations running today. The corpus supplies the
 # data matrix (every layout the format defines), the conformance image
 # (conformance/Dockerfile) supplies the oracles — a Python with pyarrow and
-# nanoarrow named by ARROW_ORACLE_PYTHON — and for every gold family we run:
+# nanoarrow named by ARROW_ORACLE_PYTHON (ORACLE_WORKDIR keeps the generated
+# cases and oracle output in a fixed directory instead of a temp dir) — and
+# for every gold family we run:
 #
 #   ours→pyarrow stream   parse the gold JSON into Core, write OUR stream
 #                         bytes; pyarrow reads them, full-validates, and

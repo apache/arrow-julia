@@ -85,7 +85,7 @@ function main(args)
         # the mounted checkout and the image's Tables branch developed in.
         # Cheap when the depot volume is warm; fetches only what changed.
         println("conformance: preparing the suite environment")
-        rc = execstream(container, ["julia", "--project=/opt/env", "-e",
+        rc = execstream(container, ["julia", "--project=/opt/env", "--startup-file=no", "-e",
             """using Pkg
                cp("/work/conformance/Project.toml", "/opt/env/Project.toml"; force=true)
                Pkg.develop(path="/work"); Pkg.develop(path="/opt/Tables")

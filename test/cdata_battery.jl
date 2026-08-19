@@ -177,7 +177,6 @@ function cdata_battery()
     println("export → import round-trip for $(length(imported)) columns ✓")
     nlive = _registry_count()
     @assert nlive == 2 * length(imported)
-    println("live exports rooted in registry: $nlive")
 
     # Consumer-side release: drop the imported columns (their ForeignOwners'
     # release calls the exported arrays' release callbacks), then reap.

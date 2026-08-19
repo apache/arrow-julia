@@ -78,8 +78,8 @@ already-dropped columns. Simple, correct, and captures the dominant win:
 unselected columns cost zero decode and add zero planned body bytes. Tail reads
 and coalescing may still over-read them under §2's explicit policy.
 
-Two refinements the differential tests forced (both implemented in
-`src/scan.jl`):
+Six properties the residual/window composition must hold (all implemented
+in `src/scan.jl`):
 
 - **The residual selection must be RESOLVED, not passed through.** `Not` and
   `Regex` select items re-bound against the reduced output table are wrong
@@ -187,7 +187,7 @@ gap permits it.
 Arrow defines a minimal fetcher contract and owns the planner; transports
 live in extensions:
 
-    struct RangedSource{F}          # name bikesheddable
+    struct RangedSource{F}
         fetch::F                    # fetch(offset::Int64, len::Int64) -> Vector{UInt8}
         len::Int64                  # total object length, known up front
     end
@@ -208,13 +208,13 @@ live in extensions:
   `fetch` a dynamic call the verifier cannot resolve; a concrete `F` in a
   trimmed app is statically known. This is runtime plumbing, not a `Scan`
   value, so the no-`Function`-fields rule for plain-data requests does not
-  apply to it. (Decision point for Jacob: if extension ergonomics ever
-  demand an abstract type, a closed core ladder + open-only-in-extensions
-  split is the fallback; the functor is simpler and trim-cleaner.)
-- Extension: `ArrowCloudStoreExt` (loaded with CloudStore.jl) provides
-  constructors from S3/Azure objects → `RangedSource` with concurrent
-  `fetchranges` and object-length discovery (HEAD). An `ArrowHTTPExt` shape
-  is identical if ever wanted. Zero new hard deps.
+  apply to it. If extension ergonomics ever demand an abstract type, the
+  fallback is a closed core ladder plus an open-only-in-extensions split;
+  the functor is simpler and trim-cleaner.
+- Extension shape (not built): an `ArrowCloudStoreExt` loaded with
+  CloudStore.jl would construct `RangedSource`s from S3/Azure objects with
+  concurrent `fetchranges` and object-length discovery (HEAD). An
+  `ArrowHTTPExt` shape is identical. Zero new hard deps either way.
 - Explicitly out of scope v1, documented: caching/prefetch policy beyond
   coalescing, retries (the fetcher's job), writers over ranges, stream
   format, mutation detection (ETag pinning is the extension's concern —
@@ -249,8 +249,9 @@ standardized upstream. This convention is deliberately conservative:
   **Footer's** schema copy so the tail fetch alone powers pruning.
 - **Value layout**: follow the official statistics-schema array layout,
   serialized as one embedded IPC stream (statistics ARE Arrow data); per
-  record batch × flattened RecordBatch FieldNode index: min, max,
-  null_count, distinct_count-if-known. Top-level fields after nested fields
+  record batch × flattened RecordBatch FieldNode index: row_count,
+  null_count, min, max (the `ARROW:*:exact` keys). Top-level fields after
+  nested fields
   therefore do not use their top-level ordinal as the `column` value.
   Using the official layout keeps us convention-compatible if upstream
   standardizes placement later — we then emit both keys for a deprecation

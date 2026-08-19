@@ -19,16 +19,9 @@
 module CdataStressChild
 
 using Test
-using Tables
-import Base64
 using Arrow
 
-for n in union(names(Arrow; all=true), names(Arrow.ArrowCore))
-    sn = String(n)
-    (startswith(sn, "#") || n in (:eval, :include, :Arrow, :write, :Table, :Stream)) && continue
-    isdefined(Arrow, n) || continue
-    @eval const $n = Arrow.$n
-end
+include("battery_prelude.jl")
 
 include("battery_helpers.jl")
 include("cdata_battery.jl")

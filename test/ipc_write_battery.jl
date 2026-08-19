@@ -15,7 +15,8 @@
 # limitations under the License.
 
 # ---------------------------------------------------------------------------
-# Acceptance: this writer's bytes, read by Core AND by Arrow.jl 2.x
+# Acceptance: this writer's bytes read back by Core; 2.x-written fixtures
+# read by Core.
 # ---------------------------------------------------------------------------
 
 """
@@ -57,21 +58,8 @@ end
 function ipc_write_battery()
     # The same fixture table the read acceptance uses: 2.x writes it, Core
     # decodes it, and from here on the WRITER is the system under test.
-    expected = (
-        ints=Int64[1, 2, 3, 4, 5],
-        floats=[1.5, missing, 3.5, missing, 5.5],
-        bools=[true, false, true, missing, false],
-        strs=["hey", "", missing, "αβ∀", "last"],
-        lists=[[1, 2], Int64[], [3], missing, [4, 5, 6]],
-        structs=[(a=1, b="x"), (a=2, b="y"), (a=3, b="z"), (a=4, b="w"), (a=5, b="v")],
-        dict=["lo", "hi", "lo", missing, "hi"],
-    )
-    source = readstream(_fixture2x("mixed-two-partitions") do
-        io = IOBuffer()
-        writetable = merge(expected, (dict=Arrow.DictEncode(expected.dict),))
-        Arrow.write(io, Tables.partitioner([writetable, writetable]); file=false)
-        take!(io)
-    end)
+    expected = MIXED_EXPECTED
+    source = readstream(_mixed_two_partitions_bytes())
 
     # Stream round-trip: our writer -> our reader.
     bytes = writestream(source)
@@ -296,10 +284,9 @@ function ipc_write_battery()
     @assert length(Set(values(wrapids))) == 3
     println("shared dictionary ids: one pool per batch, one nested topology, no id wrap ✓")
 
-    # Unions, both modes: 2.x writes them, Core reads and re-encodes them,
-    # and 2.x reads this writer's bytes back. The mapped set now matches
-    # Core's accessor coverage; the self-round-trips below cover the newer
-    # view layouts and REE that Arrow.jl 2.x cannot yet emit.
+    # Unions, both modes: 2.x writes them, Core reads and re-encodes them.
+    # The mapped set matches Core's accessor coverage; the self-round-trips
+    # below cover the view layouts and REE that Arrow.jl 2.x does not emit.
     sparsebytes = UInt8[]
     for (modename, dense) in (("dense", true), ("sparse", false))
         usource = readstream(_fixture2x("union-$(modename)") do
@@ -624,18 +611,13 @@ function ipc_write_battery()
     # self round-trip on both formats plus wire-shape checks:
     # the variadicBufferCounts vector, the late type tags, and the buffer
     # accounting that skewed nothing after them.
-    viewentry(len, rest) = vcat(reinterpret(UInt8, Int32[Int32(len)]), rest,
-        zeros(UInt8, 12 - length(rest)))
-    viewlong(len, prefix, bufidx, off) =
-        vcat(reinterpret(UInt8, Int32[Int32(len)]), prefix,
-             reinterpret(UInt8, Int32[Int32(bufidx), Int32(off)]))
     payload1 = collect(codeunits("first-out-of-line-payload"))
     payload2 = collect(codeunits("second-buffer-payload-here"))
     views = vcat(
-        viewentry(3, collect(codeunits("abc"))),
-        viewlong(25, payload1[1:4], 0, 0),
-        viewlong(26, payload2[1:4], 1, 0),
-        viewentry(0, UInt8[]))
+        _viewentry(3, collect(codeunits("abc"))),
+        _viewlong(25, payload1[1:4], 0, 0),
+        _viewlong(26, payload2[1:4], 1, 0),
+        _viewentry(0, UInt8[]))
     vt = ViewType(true)
     vf = Field("v", vt; nullable=true)
     vd = ArrayData(vt, 4,
@@ -654,8 +636,8 @@ function ipc_write_battery()
     rd = ArrayData(rt, 4, BufferSlice[]; children=[red, rvd], nullcount=0)
     nvv = ArrayData(vt, 2,
         [BufferSlice(), AC._databuffer(vcat(
-            viewentry(1, collect(codeunits("p"))),
-            viewentry(1, collect(codeunits("q")))))]; nullcount=0)
+            _viewentry(1, collect(codeunits("p"))),
+            _viewentry(1, collect(codeunits("q")))))]; nullcount=0)
     nvf = Field("values", vt; nullable=false)
     nirf, nird = fromjulia("run_ends", Int32[1, 2])
     nif = Field("values", rt; children=[nirf, nvf])
@@ -664,8 +646,8 @@ function ipc_write_battery()
     nf = Field("nested", rt; children=[norf, nif])
     nd = ArrayData(rt, 4, BufferSlice[]; children=[nord, nid], nullcount=0)
     # 64-bit-offset utf8/binary: the only IPC path exercising the LargeUtf8/
-    # LargeBinary metadata tables (the vendored typo `largUtf8Start` hid
-    # here undetected until regeneration).
+    # LargeBinary metadata tables — the only coverage of those generated
+    # builders.
     luf = Field("lu", Utf8Type(true); nullable=false)
     lud = ArrayData(Utf8Type(true), 4,
         [BufferSlice(), AC._databuffer(Int64[0, 1, 1, 3, 6]),
@@ -715,8 +697,8 @@ function ipc_write_battery()
     # A view column with ZERO variadic buffers (all inline) is legal and
     # round-trips with an explicit 0 count.
     inl = ArrayData(vt, 2,
-        [BufferSlice(), AC._databuffer(vcat(viewentry(2, collect(codeunits("hi"))),
-                                            viewentry(1, collect(codeunits("!")))))];
+        [BufferSlice(), AC._databuffer(vcat(_viewentry(2, collect(codeunits("hi"))),
+                                            _viewentry(1, collect(codeunits("!")))))];
         nullcount=0)
     inlsch = Schema(Field[Field("v", vt)])
     inlstream = readstream(writestream(inlsch, [AC.RecordBatch(inlsch, ArrayData[inl], 2)]))

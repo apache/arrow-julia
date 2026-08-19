@@ -29,13 +29,13 @@ compare against `src/cdata.jl`. Research only — no code changed.
 
 ### 1.1 What we have
 
-Three files, 682 lines: `src/FlatBuffers/FlatBuffers.jl` (58),
-`builder.jl` (448), `table.jl` (176). Provenance: introduced whole in the
+Three files, ~580 lines: `src/FlatBuffers/FlatBuffers.jl` (58),
+`builder.jl` (~390), `table.jl` (~120). Provenance: introduced whole in the
 2020 donation commit (`50e015f` "Pure Julia implementation of apache arrow
 format") as a fresh, trimmed port of the Go runtime — it was **not** forked
 from JuliaData/FlatBuffers.jl's code; the two share only the Go-port
 ancestry. Around it the rewrite adds `src/metadata/VerifierRuntime.jl`
-(261 lines, hand-maintained, schema-blind) and `tools/fbsgen.jl` (686 lines),
+(261 lines, hand-maintained, schema-blind) and `tools/fbsgen.jl` (~660 lines),
 which regenerates `src/metadata/{Schema,File,Message,Verifier}.jl`.
 
 The rewrite's usage surface is narrow. Read side: `getrootas`, `init`,
@@ -43,83 +43,70 @@ The rewrite's usage surface is narrow. Read side: `getrootas`, `init`,
 (via generated getters). Write side: `Builder`, `startobject!`/`endobject!`,
 `prependslot!`/`prependoffsetslot!`/`prependstructslot!`,
 `startvector!`/`endvector!`, `createstring!`, `finish!`, `prep!`, `pad!`,
-`place!`. Zero call sites outside the runtime for: `getslot`,
-`getoffsetslot`, `bytevector`, `createsharedstring!`,
-`finishwithfileidentifier`, `reset!`, `union!`, `getvalue`.
+`place!`. The vendored runtime carries only what that surface needs.
 
 ### 1.2 Correctness hazards (standalone)
 
 Context first: in the rewrite **no generated getter runs on unverified
 bytes**. `verify_ipc_metadata` stages `verifyrootstart_Message` /
-`verifyrootrest_Message` before `FB.getrootas` (`src/ipc_read.jl:164-183`,
-comment at `:256-258`), and `verify_footer` does the same for the file footer
-(`src/ipc_write.jl:834-848`). The verifier runtime does checked, byte-assembled
+`verifyrootrest_Message` before `FB.getrootas` (`src/ipc_read.jl`,
+comment at ), and `verify_footer` does the same for the file footer
+(`src/ipc_write.jl`). The verifier runtime does checked, byte-assembled
 loads with range/alignment/domain/budget proofs
-(`src/metadata/VerifierRuntime.jl:112-234`). The list below is therefore what
+(`src/metadata/VerifierRuntime.jl`). The list below is therefore what
 the runtime lacks **on its own** — relevant only if it were ever reused
 without the generated verifier in front:
 
 - **Unchecked scalar loads.** `readbuffer` is a raw `unsafe_load` at
-  `pointer(t, pos+1)` with no bounds check (`FlatBuffers.jl:34-39`); the
-  `Bool` overload uses `@inbounds` indexing (`:29-32`) and tests `b === 0x01`,
+  `pointer(t, pos+1)` with no bounds check (`FlatBuffers.jl`); the
+  `Bool` overload uses `@inbounds` indexing and tests `b === 0x01`,
   so a byte of `0x02` silently reads as `false` (the verifier's `_vbool`
   restricts the domain to `{0x00,0x01}` first).
 - **Wire-controlled string length.** `Base.String(t::Table, off)` calls
   `unsafe_string(pointer(...), len)` with `len` read from the buffer
-  (`table.jl:68-73`) — an arbitrary out-of-bounds read standalone.
+  (`table.jl`) — an arbitrary out-of-bounds read standalone.
 - **Wire-controlled vector wrap.** `Array{T}` does
   `unsafe_wrap(Base.Array, ptr, vectorlen(t, off))` with no check that
   `len * sizeof(S)` fits the buffer, and no alignment check for `S`
-  (`table.jl:109-115`). The verifier proves both (bounds and
-  `start % min(elemsize, 8) == 0`, `VerifierRuntime.jl:228-230`) before any
+  (`table.jl`). The verifier proves both (bounds and
+  `start % min(elemsize, 8) == 0`, `VerifierRuntime.jl`) before any
   getter constructs the wrap. GC-rooting is correct: the wrap aliases
   `bytes(t)` and the `Array` struct keeps `_tab` (hence the bytes) reachable.
 - **Unchecked offset math.** `offset()` subtracts a wire `SOffsetT` from
-  `pos` with no range check (`table.jl:55-59`); `indirect` adds a wire
-  `UOffsetT` (`:62`); `getrootas` trusts the root offset (`:41-42`). On
+  `pos` with no range check (`table.jl`); `indirect` adds a wire
+  `UOffsetT`; `getrootas` trusts the root offset. On
   64-bit hosts the promotions land in `Int64` so there is no silent wraparound,
   only OOB positions; on 32-bit hosts (`pos::Base.Int` = `Int32` in the
   generated tables) a hostile `UOffsetT ≥ 2^31` can overflow. The verifier
   runtime deliberately computes everything in explicit `Int64` with
   `checked_add`/`checked_sub`/`checked_mul` and subtraction-form range checks.
 - **Builder-side widths.** `Builder.head::UOffsetT` (UInt32) caps builders at
-  4 GiB; `createstring!`'s `b.head -= l` (`builder.jl:315`) would wrap if
+  4 GiB; `createstring!`'s `b.head -= l` (`builder.jl`) would wrap if
   `place!`/copy ever ran without a preceding `prep!` (correct usage prevents
   it; nothing enforces it).
 - **Host-endian reads.** The write path is explicitly little-endian
-  (byte-shift loop, `builder.jl:72-77`) but reads are native-endian
-  (`unsafe_load`; `read(IOBuffer, ...)` in `vtableEqual`). The runtime is
-  correct only on LE hosts — which is every supported Julia platform, but
-  worth stating.
-- **Latent bugs in dead code.** `reset!` calls undefined `emtpy!`
-  (`builder.jl:62`) and would error on first use; `union!` mutates
-  `t2.pos`/`t2.bytes` (`table.jl:144-149`) but fbsgen-generated tables are
-  immutable structs, so it would throw; `bytevector`'s view end is
-  `start + len + 1` — one byte long (`table.jl:79`). All three are unused in
-  the rewrite; delete or fix when next touching the runtime.
+  (byte-shift loop, `builder.jl`) but reads are native-endian
+  (`unsafe_load`; `vtableEqual` assembles its `VOffsetT`s little-endian
+  explicitly). The runtime is correct only on LE hosts — which is every
+  supported Julia platform, but worth stating.
 
 ### 1.3 Performance issues
 
-- **`vtableEqual` allocates per slot.** Each comparison reads a `VOffsetT`
-  via `read(IOBuffer(view(...)), VOffsetT)` (`builder.jl:429-431`), inside a
-  loop over candidate vtables (`:141-157`) — an allocation per slot per
-  candidate, on every `endobject!`. This is the clearest write-path win:
-  replace with `readbuffer`.
 - **Buffer growth is exact-fit.** `prep!` grows by prepending exactly
   `totalsize` zero bytes via a temporary `zeros(UInt8, totalsize)`
-  (`builder.jl:238-244`) — no exponential reserve; it leans entirely on
+  (`builder.jl`) — no exponential reserve; it leans entirely on
   `Vector`'s amortized beginning-growth and pays one temp allocation per
   growth.
 - **Byte-at-a-time writes.** `pad!` runs a closure per zero byte
-  (`builder.jl:219`); `Base.write(::Builder, off, x)` is a shift-and-store
-  loop with a bounds-checked `setindex!` per byte (`:71-77`) despite
+  (`builder.jl`); `Base.write(::Builder, off, x)` is a shift-and-store
+  loop with a bounds-checked `setindex!` per byte despite
   `place!`'s "without checking for space" contract.
 - **Per-access wrap allocation.** Every generated vector getter constructs a
   fresh `FlatBuffers.Array` → one `unsafe_wrap` array header per property
-  access (`table.jl:109-115`). Frequency is per-batch (nodes/buffers/fields),
+  access (`table.jl`). Frequency is per-batch (nodes/buffers/fields),
   not per-value, so it is visible but not dominant.
 - **Always-allocated shared-string Dict.** Every `Builder()` allocates a
-  `Dict{String,UOffsetT}` (`builder.jl:42,56`) that Arrow never uses.
+  `Dict{String,UOffsetT}` (`builder.jl,56`) that Arrow never uses.
 - Non-issues worth recording: generated tables are concrete immutable structs
   (no abstract fields); `Builder` fields are concrete; getter returns are
   `Union{Nothing,T}` **by design** (absent optional field) and the adapters
@@ -133,7 +120,7 @@ size-prefixed `getrootas`), read-side file-identifier check (write-side
 `finishwithfileidentifier` exists, unused), public alignment forcing beyond
 internal `prep!`, `key`/sorted-vector lookup, nested-flatbuffer helpers, any
 object/reflection API. Present but unused by Arrow: shared strings
-(`createsharedstring!`, `builder.jl:297-301`), vtable deduplication (used).
+(`createsharedstring!`, `builder.jl`), vtable deduplication (used).
 None of the gaps matter for Arrow's three schemas.
 
 ### 1.5 Upstream JuliaData/FlatBuffers.jl today
@@ -160,32 +147,31 @@ None of the gaps matter for Arrow's three schemas.
 
 ### 1.6 Could fbsgen.jl generalize into a flatc-for-Julia?
 
-What it already does (`tools/fbsgen.jl:33-40`): `table`/`struct`/`enum`
+What it already does (`tools/fbsgen.jl`): `table`/`struct`/`enum`
 (explicit values)/`union`, scalars, vectors, string/table refs, scalar and
 enum defaults, `(deprecated)`, comment stripping, cross-file type references
-by leaf name (`:126-130`), Arrow's Base-name collisions via `RENAMES`
-(`:169-170`), a hand-injected `REQUIRED` set (`:224-231`, because Arrow's
-.fbs declares no `(required)`), and — the distinctive part — a **generated
+by leaf name, Arrow's Base-name collisions via `RENAMES`, a hand-injected
+`REQUIRED` set (because Arrow's .fbs declares no `(required)`), and — the distinctive part — a **generated
 shape verifier** per table with a root start/rest split for constant-time
-policy gating (`:484-619`) over the schema-blind runtime.
+policy gating over the schema-blind runtime.
 
 To be a general tool it would additionally need:
 
 - **Attributes**: `id` (field reordering — `slotmap` assumes declaration
-  order, `:185-197`; the attrs capture group is parsed but only
-  `deprecated` is consulted, `:124-132`), `required`, `key`, `force_align`,
+  order; the attrs capture group is parsed but only
+  `deprecated` is consulted), `required`, `key`, `force_align`,
   `bit_flags`, `nested_flatbuffer`.
-- **Namespaces as modules** (currently stripped, `:97-98`; cross-namespace
+- **Namespaces as modules** (currently stripped; cross-namespace
   name collisions would break) and real `include` resolution (`generate()`
-  hardcodes `("Schema", "File", "Message")`, `:646`).
+  hardcodes `("Schema", "File", "Message")`).
 - **More IDL**: optional scalars (`= null`), fixed-size struct arrays
-  (`[T:N]`), struct-in-struct (`structsize` assumes scalar fields, `:199-209`),
+  (`[T:N]`), struct-in-struct (`structsize` assumes scalar fields),
   unions of strings/structs, vectors of unions, `file_identifier`/
   `file_extension` surfacing, `rpc_service` (skippable), a real tokenizer in
   place of the regex parser.
 - **Runtime additions**: size-prefixed roots, identifier check, and
   parameterization of the verifier's Arrow-specific budget constants
-  (`VerifierRuntime.jl:64-67`) and staging policy.
+  (`VerifierRuntime.jl`) and staging policy.
 - **A conformance corpus** against flatc golden binaries (monster_test.fbs)
   — the only credible correctness story for a generator.
 
@@ -200,20 +186,19 @@ general-purpose surface Arrow does not need.
 (option iii); do not retrofit FlatBuffers.jl v0.6 (option ii).**
 
 - The whole owned surface — runtime + verifier runtime + generator — is
-  ~1,630 lines, regeneration is mechanical (`tools/fbsgen.jl` exists exactly
-  because hand-drift was the bug class, `:24-31`), and the verifier budgets
+  ~1,500 lines, regeneration is mechanical (`tools/fbsgen.jl` exists exactly
+  because hand-drift was the bug class), and the verifier budgets
   are security posture the project must control and version with itself.
 - A dependency on an external FlatBuffers package re-couples the metadata hot
   path to another release cadence and supply chain — the opposite direction
-  from the rounds 29-30 dependency-trimming work.
+  from this package's dependency-trimming posture.
 - Option ii is strictly worse than iii: same engineering as a new package
   plus a breaking transition imposed on the dormant package's dependents.
 - If community demand materializes, extract as **FlatBuffersGen.jl** with the
   1.6 list as the roadmap; Arrow should keep vendoring its *generated output*
   regardless (no build-time codegen), so migration risk to Arrow is low and
   deferrable.
-- Independent of that decision, three cheap in-repo cleanups: fix or delete
-  `reset!`/`union!`/`bytevector` (§1.2), de-IOBuffer `vtableEqual`, and batch
+- Independent of that decision, one cheap in-repo cleanup remains: batch
   `pad!`/`write` (§1.3).
 
 ---
@@ -223,8 +208,7 @@ general-purpose surface Arrow does not need.
 Tracking issue: **#184 "Support C data interface"** (open). Three
 independent efforts, all against the 2.x internals — which is why each
 re-derives lifecycle machinery the Core rewrite gets structurally
-(`src/cdata.jl:22-27` states this as the prove-out's claim, and its header
-already cites #178, #179, #561, #594, #603-607).
+(`src/cdata.jl`'s header states this claim and already cites #178, #179, #561, #594, #603-607).
 
 ### 2.1 Inventory
 
@@ -248,23 +232,23 @@ co-authors** on every PR in the stack. None of the three efforts includes
 
 ### 2.2 API and lifecycle vs our `src/cdata.jl`
 
-Ours (included in the facade at `src/Arrow.jl:82`): `parseformat`
-(`cdata.jl:223`), `to_c_data(f::Field, d::ArrayData) -> (Ptr{CArrowSchema},
-Ptr{CArrowArray})` with independent schema/array roots (`:684-720`),
-`from_c_data(sp, ap) -> (Field, ArrayData)` (`:952`),
-`export_stream!(sp, sch, batches)` (`:1457`) and `from_c_stream(sp) ->
-ImportedStream <: AC.RecordBatchSource` (`:1625`). Export lifecycle: one
+Ours (included in the facade at `src/Arrow.jl`): `parseformat`
+(`cdata.jl`), `to_c_data(f::Field, d::ArrayData) -> (Ptr{CArrowSchema},
+Ptr{CArrowArray})` with independent schema/array roots,
+`from_c_data(sp, ap) -> (Field, ArrayData)`,
+`export_stream!(sp, sch, batches)` and `from_c_stream(sp) ->
+ImportedStream <: AC.RecordBatchSource`. Export lifecycle: one
 release callback per structure, malloc'd per-node control blocks, an
 `EXPORT_REGISTRY` of `ExportedRoot`s, canonical-topology release traversal
-that never trusts consumer-mutated counts (`:412-468`), and an explicit
-`reap!()` (`:759`) with a tested in-progress-export/reaper race
-(`test/cdata_battery.jl:41-60`). Import lifecycle: single `ForeignOwner` per
+that never trusts consumer-mutated counts, and an explicit
+`reap!()` with a tested in-progress-export/reaper race
+(`test/cdata_battery.jl`). Import lifecycle: single `ForeignOwner` per
 moved tree, atomic exactly-once release with producer-conformance check
-(release must NULL the release field, `:928-930`), declared buffer extents
-from the layout registry (`:1137-1231`), then the full three-stage Core
-validation (`validate_structural`/`semantic`/`full`, `:975-977`). Tests
+(release must NULL the release field), declared buffer extents
+from the layout registry, then the full three-stage Core
+validation (`validate_structural`/`semantic`/`full`). Tests
 include per-ABI struct size/offset gates (64-bit, both 32-bit int64
-alignments; `test/cdata_battery.jl:18-38`) and a four-thread re-exec stress
+alignments; `test/cdata_battery.jl`) and a four-thread re-exec stress
 child (`test/cdata_stress_child.jl`).
 
 Comparison against samtalki's #607 head (the code most likely to merge):
@@ -273,36 +257,36 @@ Comparison against samtalki's #607 head (the code most likely to merge):
   structs in Julia `Ref`s, releasing schema and array together at owner
   release, exactly-once via `released::Bool` under a `ReentrantLock`, with a
   trylock-retry GC finalizer. Ours: schema released **immediately after
-  parsing** (`:979-983`) — the producer's schema obligation ends at import —
+  parsing** — the producer's schema obligation ends at import —
   and the array copy lives in malloc'd memory with an atomic-swap
-  exactly-once (`:922-935`). Ours additionally verifies the producer nulled
+  exactly-once. Ours additionally verifies the producer nulled
   the release field; theirs does not.
 - **Post-release semantics.** Theirs: every `getindex` runs inside
   `_with_live` — a ReentrantLock acquire per element — so reads after
   `release_c_data` throw. Ours: reachability-based validity with documented
-  spec-UB after explicit `release!` (`:60-64`), zero per-read overhead. Their
+  spec-UB after explicit `release!`, zero per-read overhead. Their
   gate is a real safety-UX win and a real throughput cost; the right review
   feedback is to make it optional, and the right 3.0 stance is to consider a
   checked/debug import mode rather than an always-on lock.
 - **Misaligned buffers.** Theirs copies misaligned fixed-width buffers into
   aligned storage (mirroring arrow-rs). Ours stays zero-copy for any
   alignment because `loadat` falls back to an unaligned load per element
-  (`src/ArrowCore.jl:325-332`).
+  (`src/ArrowCore.jl`).
 - **`null_count == -1`.** Equivalent policy (bitmap required when unknown);
   theirs resolves eagerly with a word-wise `_count_nulls`, ours defers to
-  `ArrayData`'s on-demand atomic `nullcount` (`src/ArrowCore.jl:669`).
+  `ArrayData`'s on-demand atomic `nullcount` (`src/ArrowCore.jl`).
 - **Bounded string imports.** Theirs caps C-string scans at 4096 bytes
   (`_unsafe_string_bounded`); our `_import_cstring` is an unbounded
-  `unsafe_string` (`cdata.jl:1078-1082`). Within the trusted-ABI rule this is
+  `unsafe_string` (`cdata.jl`). Within the trusted-ABI rule this is
   defensible, but the cap converts a missing NUL from a memory scan into a
   clean error — cheap to adopt.
 - **Schema metadata.** Their import validates the metadata block's bounds.
   Ours neither imports (`_import_field` never reads `sch.metadata`) nor
-  exports it (`metadata = C_NULL`, `cdata.jl:631`) — a genuine functional gap
+  exports it (`metadata = C_NULL`, `cdata.jl`) — a genuine functional gap
   to close in the production adapter.
 - **Scope.** Ours covers unions, views/list-views, REE, dictionaries, and
   both stream directions with exception-safe move seams enumerated at each
-  boundary (`:963-991`, `:1633-1660`); their landed scope (#607) is
+  boundary (); their landed scope (#607) is
   null+primitive, with breadth and export still drafts and streams absent
   everywhere.
 
@@ -329,7 +313,7 @@ Worth porting (with `Co-authored-by` credit):
 
 Engagement: these are three good-faith contributors who converged on the
 same wall (2.x internals lack an `ArrayData`-shaped core; five stalled
-attempts, `cdata.jl:24-27`). Concretely: (a) comment on #607/#603 with the
+attempts, `cdata.jl`). Concretely: (a) comment on #607/#603 with the
 3.0 plan before it merges redundant machinery, raising the per-getindex lock
 and deferred-schema-release points as review feedback; (b) invite samtalki
 and kou to review 3.0's `src/cdata.jl` lifecycle design; (c) credit all

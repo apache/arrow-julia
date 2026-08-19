@@ -44,7 +44,7 @@ never allocate; `String(s)` copies out; `materialize(v)` copies a whole
 column out to `Vector{String}`. Everything here depends only on Base and is
 concrete-typed throughout, so it compiles under JuliaC `--trim`.
 
-Lifetime: a `ArrowString` view pins its buffer (`data`), and a
+Lifetime: an `ArrowString` view pins its buffer (`data`), and a
 `ArrowStringVector` pins all of its buffers, exactly like any zero-copy
 string view; a consumer that must outlive the source materializes.
 """
@@ -312,7 +312,7 @@ Base.isless(x::ArrowString, y::ArrowString) = cmp(x, y) < 0
 Base.isless(x::ArrowString, y::Union{String, SubString{String}}) = cmp(x, y) < 0
 Base.isless(y::Union{String, SubString{String}}, x::ArrowString) = cmp(y, x) < 0
 
-# hash contract: hash(cs) == hash(String(cs)) — ArrowStrings are Dict keys
+# hash contract: hash(s) == hash(String(s)) — ArrowStrings are Dict keys
 # next to Strings. Base hashes a String's bytes through one C routine; we run
 # the same routine over the bytes we already have: the retained buffer for
 # views, a stack copy of the payload words for inline strings. No String
@@ -384,7 +384,7 @@ Base.print(io::IO, s::ArrowString) = (write(io, s); nothing)
 A string column: one payload per element and the byte buffers that view
 payloads point into (`buffers[bufidx + 1]` for an entry's buffer index).
 `ELT` is `ArrowString` for a column with no missing values, or
-`Union{Missing, ArrowString}`. `getindex` returns a `ArrowString` (or
+`Union{Missing, ArrowString}`. `getindex` returns an `ArrowString` (or
 `missing`) with NO allocation; `materialize` copies out to `Vector{String}`.
 
 This is an Arrow Utf8View array's memory: `payloads` is its views buffer and

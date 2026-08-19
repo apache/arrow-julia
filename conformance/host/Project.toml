@@ -20,3 +20,7 @@
 # in-container suite environment.)
 [deps]
 Harbor = "af79dbb9-1a80-47ad-8928-192a4af69376"
+
+[compat]
+Harbor = "1.1"
+julia = "1.10"
