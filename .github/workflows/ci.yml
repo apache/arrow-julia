@@ -99,6 +99,14 @@ jobs:
         nthreads:
           - 1
           - 2
+        exclude:
+          # ArrowTypes supports Julia 1.0, but Julia 1.0 has no Apple Silicon
+          # macOS binary. Keep its minimum-version coverage on Ubuntu.
+          - pkg:
+              name: ArrowTypes.jl
+              dir: './src/ArrowTypes'
+            version: 'min'
+            os: macos-latest
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
