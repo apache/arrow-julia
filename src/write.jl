@@ -39,7 +39,18 @@ Base.getindex(d::DictEncode, i::Int) = d.data[i]
 "One (Field, ArrayData) column from a Julia vector, facade conversions included."
 function _writecolumn(name::String, v::AbstractVector)
     T = Base.nonmissingtype(eltype(v))
-    if T <: Dates.Date
+    if eltype(v) === Missing
+        t = AC.NullType()
+        return AC.Field(name, t; nullable=true),
+        AC.ArrayData(t, length(v), AC.BufferSlice[]; nullcount=length(v))
+    elseif T === Union{}
+        throw(
+            ArgumentError(
+                "column $name has bottom element type Union{} and cannot infer " *
+                "an Arrow type; give the empty column a declared element type",
+            ),
+        )
+    elseif T <: Dates.Date
         return _temporalcolumn(
             name,
             v,
@@ -74,8 +85,31 @@ function _writecolumn(name::String, v::AbstractVector)
                 "(column $name); wrap fields as nullable children instead",
             ),
         )
+        isconcretetype(T) || throw(
+            ArgumentError(
+                "column $name has abstract NamedTuple element type; give it a " *
+                "concrete NamedTuple type with declared field names and types",
+            ),
+        )
+        if fieldcount(T) == 0
+            t = AC.StructType()
+            return AC.Field(name, t; nullable=false, children=AC.Field[]),
+            AC.ArrayData(
+                t,
+                length(v),
+                [AC.BufferSlice()];
+                children=AC.ArrayData[],
+                nullcount=0,
+            )
+        end
+        # Preserve the declared child types. A value-narrowing comprehension
+        # turns an empty child into `Any[]` and an all-missing nullable child
+        # into `Missing[]`, so neither can recover its Arrow descriptor.
         cols = NamedTuple{fieldnames(T)}(
-            Tuple([getfield(x, k) for x in v] for k in fieldnames(T)),
+            ntuple(
+                i -> collect(fieldtype(T, i), (getfield(x, i) for x in v)),
+                fieldcount(T),
+            ),
         )
         return AC.fromjulia_struct(name, cols)
     elseif T <: AbstractString && T != String
@@ -204,9 +238,540 @@ function _retainedstorage(t::AC.ArrowType, v::AbstractVector, name::String)
     return out
 end
 
+_fieldmetadata(f::AC.Field) =
+    f.metadata === nothing ? nothing : collect(Pair{String,String}, f.metadata)
+
+function _retainedfield(f::AC.Field; children=collect(AC.Field, f.children))
+    return AC.Field(
+        f.name,
+        f.type;
+        nullable=f.nullable,
+        metadata=_fieldmetadata(f),
+        children=children,
+    )
+end
+
+function _retainedvalidity(f::AC.Field, v::AbstractVector)
+    present = Bool[x !== missing for x in v]
+    any(!, present) &&
+        !f.nullable &&
+        throw(
+            ArgumentError(
+                "column $(f.name) holds missing values but its retained field is non-nullable",
+            ),
+        )
+    return present
+end
+
+function _retainedvarbytes(f::AC.Field, v::AbstractVector)
+    t = f.type::Union{AC.Utf8Type,AC.BinaryType}
+    present = _retainedvalidity(f, v)
+    Offset = t.large ? Int64 : Int32
+    offsets = Vector{Offset}(undef, length(v) + 1)
+    offsets[1] = zero(Offset)
+    data = UInt8[]
+    for (i, x) in enumerate(v)
+        if x !== missing
+            bytes = if t isa AC.Utf8Type
+                x isa AbstractString ||
+                    throw(ArgumentError("column $(f.name) must contain string values"))
+                codeunits(x)
+            else
+                x isa AbstractVector{UInt8} || throw(
+                    ArgumentError("column $(f.name) must contain byte-vector values"),
+                )
+                x
+            end
+            length(data) <= typemax(Offset) - length(bytes) || throw(
+                ArgumentError("column $(f.name) data exceeds its retained offset width"),
+            )
+            append!(data, bytes)
+        end
+        offsets[i + 1] = Offset(length(data))
+    end
+    databuf = isempty(data) ? AC.BufferSlice() : AC._databuffer(data)
+    d = AC.ArrayData(
+        t,
+        length(v),
+        [AC._bitmapbuffer(present), AC._databuffer(offsets), databuf];
+        nullcount=count(!, present),
+    )
+    return _retainedfield(f), d
+end
+
+function _retainedview(f::AC.Field, v::AbstractVector)
+    t = f.type::AC.ViewType
+    present = _retainedvalidity(f, v)
+    payloads = Vector{ArrowStrings.ArrowStringPayload}(undef, length(v))
+    data = UInt8[]
+    for (i, x) in enumerate(v)
+        if x === missing
+            payloads[i] = ArrowStrings.PAYLOAD_MISSING
+            continue
+        end
+        bytes = if t.utf8
+            x isa AbstractString ||
+                throw(ArgumentError("column $(f.name) must contain string values"))
+            codeunits(x)
+        else
+            x isa AbstractVector{UInt8} ||
+                throw(ArgumentError("column $(f.name) must contain byte-vector values"))
+            x
+        end
+        n = length(bytes)
+        if n <= ArrowStrings.INLINE_MAX
+            payloads[i] = ArrowStrings.inline_payload(bytes, 1, n)
+        else
+            length(data) <= typemax(Int32) - n || throw(
+                ArgumentError("column $(f.name) view data exceeds the Int32 offset range"),
+            )
+            off = length(data)
+            append!(data, bytes)
+            payloads[i] = ArrowStrings.view_payload(data, off + 1, n, 0, off)
+        end
+    end
+    buffers = AC.BufferSlice[AC._bitmapbuffer(present), AC._databuffer(payloads)]
+    isempty(data) || push!(buffers, AC._databuffer(data))
+    d = AC.ArrayData(t, length(v), buffers; nullcount=count(!, present))
+    return _retainedfield(f), d
+end
+
+function _retainedfixedbytes(f::AC.Field, v::AbstractVector)
+    t = f.type::AC.FixedSizeBinaryType
+    present = _retainedvalidity(f, v)
+    data = zeros(UInt8, Base.checked_mul(length(v), t.nbytes))
+    for (i, x) in enumerate(v)
+        x === missing && continue
+        x isa AbstractVector{UInt8} ||
+            throw(ArgumentError("column $(f.name) must contain byte-vector values"))
+        length(x) == t.nbytes || throw(
+            ArgumentError(
+                "column $(f.name) fixed-size value $i has $(length(x)) bytes; " *
+                "expected $(t.nbytes)",
+            ),
+        )
+        copyto!(data, (i - 1) * t.nbytes + 1, x, 1, t.nbytes)
+    end
+    d = AC.ArrayData(
+        t,
+        length(v),
+        [AC._bitmapbuffer(present), AC._databuffer(data)];
+        nullcount=count(!, present),
+    )
+    return _retainedfield(f), d
+end
+
+function _retaineddecimal(f::AC.Field, v::AbstractVector)
+    t = f.type::AC.DecimalType
+    present = _retainedvalidity(f, v)
+    if t.bits == 32 || t.bits == 64
+        T = t.bits == 32 ? Int32 : Int64
+        values = Vector{T}(undef, length(v))
+        for (i, x) in enumerate(v)
+            x === missing ||
+                x isa T ||
+                throw(
+                    ArgumentError(
+                        "column $(f.name) must contain $T decimal storage values",
+                    ),
+                )
+            values[i] = x === missing ? zero(T) : x
+        end
+        databuf = AC._databuffer(values)
+    else
+        width = AC.primwidth(t)
+        values = zeros(UInt8, Base.checked_mul(length(v), width))
+        for (i, x) in enumerate(v)
+            x === missing && continue
+            x isa AbstractVector{UInt8} || throw(
+                ArgumentError("column $(f.name) must contain byte-vector decimal values"),
+            )
+            length(x) == width || throw(
+                ArgumentError(
+                    "column $(f.name) decimal value $i has $(length(x)) bytes; " *
+                    "expected $width",
+                ),
+            )
+            copyto!(values, (i - 1) * width + 1, x, 1, width)
+        end
+        databuf = AC._databuffer(values)
+    end
+    d = AC.ArrayData(
+        t,
+        length(v),
+        [AC._bitmapbuffer(present), databuf];
+        nullcount=count(!, present),
+    )
+    return _retainedfield(f), d
+end
+
+function _retainedinterval(f::AC.Field, v::AbstractVector)
+    t = f.type::AC.IntervalType
+    present = _retainedvalidity(f, v)
+    if t.unit == AC.YEAR_MONTH
+        values = Int32[
+            x === missing ? Int32(0) :
+            x isa Int32 ? x :
+            throw(ArgumentError("column $(f.name) must contain Int32 intervals")) for
+            x in v
+        ]
+    elseif t.unit == AC.DAY_TIME
+        T = NamedTuple{(:days, :millis),Tuple{Int32,Int32}}
+        values = T[
+            x === missing ? T((0, 0)) :
+            x isa T ? x :
+            throw(ArgumentError("column $(f.name) must contain $T intervals")) for
+            x in v
+        ]
+    else
+        T = NamedTuple{(:months, :days, :nanos),Tuple{Int32,Int32,Int64}}
+        values = T[
+            x === missing ? T((0, 0, 0)) :
+            x isa T ? x :
+            throw(ArgumentError("column $(f.name) must contain $T intervals")) for
+            x in v
+        ]
+    end
+    d = AC.ArrayData(
+        t,
+        length(v),
+        [AC._bitmapbuffer(present), AC._databuffer(values)];
+        nullcount=count(!, present),
+    )
+    return _retainedfield(f), d
+end
+
+function _retainedtypedvalues(f::AC.Field, values; converted::Bool)
+    T = _declaredeltype(f, converted)
+    T === Any && return Any[x for x in values]
+    out = Vector{T}(undef, length(values))
+    for (i, x) in enumerate(values)
+        x isa T || throw(
+            ArgumentError(
+                "column $(f.name) holds $(typeof(x)) values that do not match " *
+                "its retained Arrow type $(repr(f.type))",
+            ),
+        )
+        out[i] = x
+    end
+    return out
+end
+
+"A physical child value hidden by a null composite parent."
+function _retainedplaceholder(f::AC.Field)
+    f.nullable && return missing
+    t = f.type
+    t isa AC.NullType && return missing
+    t isa Union{
+        AC.IntType,
+        AC.FloatType,
+        AC.DateType,
+        AC.TimeType,
+        AC.TimestampType,
+        AC.DurationType,
+    } && return zero(AC.juliatype(t))
+    t isa AC.BoolType && return false
+    t isa AC.Utf8Type && return ""
+    t isa AC.BinaryType && return UInt8[]
+    t isa AC.FixedSizeBinaryType && return zeros(UInt8, t.nbytes)
+    t isa AC.ViewType && return t.utf8 ? "" : UInt8[]
+    if t isa AC.DecimalType
+        return t.bits == 32 ? Int32(0) :
+               t.bits == 64 ? Int64(0) : zeros(UInt8, AC.primwidth(t))
+    end
+    if t isa AC.IntervalType
+        return t.unit == AC.YEAR_MONTH ? Int32(0) :
+               t.unit == AC.DAY_TIME ? (days=Int32(0), millis=Int32(0)) :
+               (months=Int32(0), days=Int32(0), nanos=Int64(0))
+    end
+    t isa Union{AC.ListType,AC.ListViewType} && return Any[]
+    if t isa AC.FixedSizeListType
+        length(f.children) == 1 ||
+            throw(ArgumentError("retained fixed-size list $(f.name) needs one child"))
+        return Any[_retainedplaceholder(f.children[1]) for _ = 1:t.listsize]
+    end
+    if t isa AC.StructType
+        return Pair{String,Any}[
+            child.name => _retainedplaceholder(child) for child in f.children
+        ]
+    end
+    t isa AC.MapType && return Pair{Any,Any}[]
+    if t isa AC.RunEndEncodedType
+        length(f.children) == 2 || throw(
+            ArgumentError("retained run-end encoded field $(f.name) needs two children"),
+        )
+        return _retainedplaceholder(f.children[2])
+    end
+    throw(
+        ArgumentError(
+            "cannot synthesize hidden child data for retained $(AC.descriptorname(t)) " *
+            "field $(f.name)",
+        ),
+    )
+end
+
+"Write values materialized inside a composite, where temporal values stay raw."
+function _retainedchildcolumn(f::AC.Field, values)
+    v = _retainedtypedvalues(f, values; converted=false)
+    t = f.type
+    if t isa AC.DateType ||
+       t isa AC.TimestampType ||
+       t isa AC.TimeType ||
+       t isa AC.DurationType
+        storage = Union{Missing,Int64}[x === missing ? missing : Int64(x) for x in v]
+        return _rebuildtemporal(f, storage, length(v))
+    end
+    t isa AC.DictionaryType && throw(
+        ArgumentError(
+            "nested retained dictionary field $(f.name) cannot be reconstructed " *
+            "after facade materialization because its pool is unavailable",
+        ),
+    )
+    return _writecolumn(f, v)
+end
+
+function _retainedlist(f::AC.Field, v::AbstractVector)
+    t = f.type::Union{AC.ListType,AC.ListViewType,AC.FixedSizeListType}
+    length(f.children) == 1 ||
+        throw(ArgumentError("column $(f.name) retained list descriptor needs one child"))
+    present = _retainedvalidity(f, v)
+    flat = Any[]
+    if t isa AC.ListType
+        Offset = t.large ? Int64 : Int32
+        offsets = Vector{Offset}(undef, length(v) + 1)
+        offsets[1] = zero(Offset)
+        for (i, row) in enumerate(v)
+            if row !== missing
+                row isa AbstractVector || throw(
+                    ArgumentError("column $(f.name) retained list rows must be vectors"),
+                )
+                length(flat) <= typemax(Offset) - length(row) || throw(
+                    ArgumentError(
+                        "column $(f.name) child data exceeds its retained offset width",
+                    ),
+                )
+                append!(flat, row)
+            end
+            offsets[i + 1] = Offset(length(flat))
+        end
+        buffers = AC.BufferSlice[AC._bitmapbuffer(present), AC._databuffer(offsets)]
+    elseif t isa AC.ListViewType
+        Offset = t.large ? Int64 : Int32
+        offsets = Vector{Offset}(undef, length(v))
+        sizes = Vector{Offset}(undef, length(v))
+        for (i, row) in enumerate(v)
+            if row === missing
+                offsets[i] = zero(Offset)
+                sizes[i] = zero(Offset)
+                continue
+            end
+            row isa AbstractVector || throw(
+                ArgumentError("column $(f.name) retained list-view rows must be vectors"),
+            )
+            length(flat) <= typemax(Offset) - length(row) || throw(
+                ArgumentError(
+                    "column $(f.name) child data exceeds its retained offset width",
+                ),
+            )
+            offsets[i] = Offset(length(flat))
+            sizes[i] = Offset(length(row))
+            append!(flat, row)
+        end
+        buffers = AC.BufferSlice[
+            AC._bitmapbuffer(present),
+            AC._databuffer(offsets),
+            AC._databuffer(sizes),
+        ]
+    else
+        for row in v
+            if row === missing
+                append!(flat, (_retainedplaceholder(f.children[1]) for _ = 1:t.listsize))
+                continue
+            end
+            row isa AbstractVector || throw(
+                ArgumentError(
+                    "column $(f.name) retained fixed-size list rows must be vectors",
+                ),
+            )
+            length(row) == t.listsize || throw(
+                ArgumentError(
+                    "column $(f.name) fixed-size list row has $(length(row)) " *
+                    "values; expected $(t.listsize)",
+                ),
+            )
+            append!(flat, row)
+        end
+        buffers = AC.BufferSlice[AC._bitmapbuffer(present)]
+    end
+    childfield, childdata = _retainedchildcolumn(f.children[1], flat)
+    d = AC.ArrayData(
+        t,
+        length(v),
+        buffers;
+        children=AC.ArrayData[childdata],
+        nullcount=count(!, present),
+    )
+    return _retainedfield(f; children=AC.Field[childfield]), d
+end
+
+function _retainedstruct(f::AC.Field, v::AbstractVector)
+    t = f.type::AC.StructType
+    present = _retainedvalidity(f, v)
+    nchildren = length(f.children)
+    childvalues = [Any[] for _ = 1:nchildren]
+    for row in v
+        if row === missing
+            for j = 1:nchildren
+                push!(childvalues[j], _retainedplaceholder(f.children[j]))
+            end
+            continue
+        end
+        row isa AbstractVector || throw(
+            ArgumentError(
+                "column $(f.name) retained struct rows must be ordered Pair vectors",
+            ),
+        )
+        length(row) == nchildren || throw(
+            ArgumentError(
+                "column $(f.name) retained struct row has $(length(row)) fields; " *
+                "expected $nchildren",
+            ),
+        )
+        for j = 1:nchildren
+            kv = row[j]
+            kv isa Pair || throw(
+                ArgumentError("column $(f.name) retained struct rows must contain Pairs"),
+            )
+            first(kv) == f.children[j].name || throw(
+                ArgumentError(
+                    "column $(f.name) retained struct child $j is named " *
+                    "$(repr(first(kv))); expected $(repr(f.children[j].name))",
+                ),
+            )
+            push!(childvalues[j], last(kv))
+        end
+    end
+    children = AC.ArrayData[]
+    childfields = AC.Field[]
+    for j = 1:nchildren
+        cf, cd = _retainedchildcolumn(f.children[j], childvalues[j])
+        push!(childfields, cf)
+        push!(children, cd)
+    end
+    d = AC.ArrayData(
+        t,
+        length(v),
+        [AC._bitmapbuffer(present)];
+        children=children,
+        nullcount=count(!, present),
+    )
+    return _retainedfield(f; children=childfields), d
+end
+
+function _retainedmap(f::AC.Field, v::AbstractVector)
+    t = f.type::AC.MapType
+    length(f.children) == 1 || throw(
+        ArgumentError("column $(f.name) retained map descriptor needs one entries child"),
+    )
+    entries = f.children[1]
+    entries.type isa AC.StructType && length(entries.children) == 2 ||
+        throw(ArgumentError("column $(f.name) retained map entries descriptor is invalid"))
+    present = _retainedvalidity(f, v)
+    offsets = Vector{Int32}(undef, length(v) + 1)
+    offsets[1] = 0
+    keys = Any[]
+    values = Any[]
+    for (i, row) in enumerate(v)
+        if row !== missing
+            row isa AbstractVector || throw(
+                ArgumentError("column $(f.name) retained map rows must be Pair vectors"),
+            )
+            length(keys) <= typemax(Int32) - length(row) || throw(
+                ArgumentError("column $(f.name) map entries exceed the Int32 offset range"),
+            )
+            for kv in row
+                kv isa Pair || throw(
+                    ArgumentError("column $(f.name) retained map rows must contain Pairs"),
+                )
+                push!(keys, first(kv))
+                push!(values, last(kv))
+            end
+        end
+        offsets[i + 1] = Int32(length(keys))
+    end
+    keyfield, keydata = _retainedchildcolumn(entries.children[1], keys)
+    valuefield, valuedata = _retainedchildcolumn(entries.children[2], values)
+    entriesfield = _retainedfield(entries; children=AC.Field[keyfield, valuefield])
+    entriesdata = AC.ArrayData(
+        entries.type,
+        length(keys),
+        [AC.BufferSlice()];
+        children=AC.ArrayData[keydata, valuedata],
+        nullcount=0,
+    )
+    d = AC.ArrayData(
+        t,
+        length(v),
+        [AC._bitmapbuffer(present), AC._databuffer(offsets)];
+        children=[entriesdata],
+        nullcount=count(!, present),
+    )
+    return _retainedfield(f; children=AC.Field[entriesfield]), d
+end
+
+function _retainedree(f::AC.Field, v::AbstractVector)
+    t = f.type::AC.RunEndEncodedType
+    length(f.children) == 2 ||
+        throw(ArgumentError("column $(f.name) retained REE descriptor needs two children"))
+    runfield, valuefield = f.children
+    runtype = runfield.type
+    runtype isa AC.IntType ||
+        throw(ArgumentError("column $(f.name) retained REE run ends must be integers"))
+    RT = AC.juliatype(runtype)
+    length(v) <= typemax(RT) ||
+        throw(ArgumentError("column $(f.name) length exceeds its retained run-end type"))
+    runends = RT[]
+    runvalues = Any[]
+    for (i, x) in enumerate(v)
+        if isempty(runvalues) || !isequal(x, last(runvalues))
+            push!(runvalues, x)
+            push!(runends, RT(i))
+        else
+            runends[end] = RT(i)
+        end
+    end
+    rebuiltrunfield, runenddata = _writecolumn(runfield, runends)
+    rebuiltvaluefield, valuedata = _retainedchildcolumn(valuefield, runvalues)
+    d = AC.ArrayData(
+        t,
+        length(v),
+        AC.BufferSlice[];
+        children=AC.ArrayData[runenddata, valuedata],
+        nullcount=0,
+    )
+    return _retainedfield(f; children=AC.Field[rebuiltrunfield, rebuiltvaluefield]), d
+end
+
 "Build one column under a retained Field: descriptor, nullability, metadata."
 function _writecolumn(f::AC.Field, v::AbstractVector)
     t = f.type
+    if t isa AC.NullType
+        eltype(v) === Missing || throw(
+            ArgumentError(
+                "column $(f.name) no longer matches its retained Arrow NullType; " *
+                "give it a Missing element type",
+            ),
+        )
+        d = AC.ArrayData(t, length(v), AC.BufferSlice[]; nullcount=length(v))
+        return AC.Field(
+            f.name,
+            t;
+            nullable=f.nullable,
+            metadata=f.metadata === nothing ? nothing :
+                     collect(Pair{String,String}, f.metadata),
+        ),
+        d
+    end
     # Identity FIRST, for every retained field with a known facade type:
     # a replaced column is rejected on its declared element type before any
     # value is read.
@@ -242,22 +807,28 @@ function _writecolumn(f::AC.Field, v::AbstractVector)
         end
         return _rebuildtemporal(f, storage, length(v))
     end
-    # List fields: the retained CHILD descriptor supplies the element type
-    # observation cannot — zero-row, all-empty, and nested list columns have
-    # no values to observe. Unresolvable children (temporal storage,
-    # composites without a closed facade mapping) fall back to natural
-    # inference unchanged.
-    if t isa AC.ListType && length(f.children) == 1
-        E = _retainedlisteltype(f.children[1])
-        E === nothing || (v = _retypelist(f, v, E))
-    end
+    t isa Union{AC.Utf8Type,AC.BinaryType} && return _retainedvarbytes(f, v)
+    t isa AC.ViewType && return _retainedview(f, v)
+    t isa AC.FixedSizeBinaryType && return _retainedfixedbytes(f, v)
+    t isa AC.DecimalType && return _retaineddecimal(f, v)
+    t isa AC.IntervalType && return _retainedinterval(f, v)
+    t isa Union{AC.ListType,AC.ListViewType,AC.FixedSizeListType} &&
+        return _retainedlist(f, v)
+    t isa AC.StructType && return _retainedstruct(f, v)
+    t isa AC.MapType && return _retainedmap(f, v)
+    t isa AC.RunEndEncodedType && return _retainedree(f, v)
+    t isa AC.UnionType && throw(
+        ArgumentError(
+            "column $(f.name) has a retained UnionType whose child type ids " *
+            "cannot be recovered from materialized facade values",
+        ),
+    )
     # Non-temporal: build naturally, then impose the retained descriptor —
     # types must agree and nullability comes from the RETAINED field (values
     # holding missing under a non-nullable field are a replacement error).
     # List fields impose RECURSIVELY: retained identity includes the child
     # fields (names, nullability, metadata) and each level's list width.
     fn, dn = _writecolumn(f.name, v)
-    t isa AC.ListType && return _imposelist(f, fn, dn, f.name)
     AC.typeequal(fn.type, t) || throw(
         ArgumentError(
             "column $(f.name) no longer matches its retained Arrow type " *
@@ -282,179 +853,6 @@ function _writecolumn(f::AC.Field, v::AbstractVector)
         children=collect(AC.Field, fn.children),
     )
     return rebuilt, dn
-end
-
-"""
-Impose a retained list descriptor TREE onto a naturally built column: the
-retained side supplies names, nullability, metadata, and list width at
-every level (the natural builder always emits small lists — a retained
-large list rebuilds its offsets at the declared width); the natural side
-supplies the values, untouched. Nulls under a non-nullable retained level
-refuse, exactly like the flat retained gate.
-"""
-function _imposelist(rf::AC.Field, nf::AC.Field, nd::AC.ArrayData, colname::String)
-    rt = rf.type
-    nt = nf.type
-    if rt isa AC.ListType
-        (nt isa AC.ListType && length(rf.children) == 1 && length(nf.children) == 1) ||
-            throw(
-                ArgumentError(
-                    "column $colname no longer matches its retained Arrow type " *
-                    "$(repr(rt)); it now maps to $(repr(nt))",
-                ),
-            )
-        cf, cd = _imposelist(rf.children[1], nf.children[1], nd.children[1], colname)
-        buffers = nd.buffers
-        if rt.large != nt.large
-            nt.large && throw(
-                ArgumentError(
-                    "column $colname no longer matches its retained Arrow " *
-                    "type $(repr(rt)); it now maps to $(repr(nt))",
-                ),
-            )
-            nentries = nd.offset + nd.len + 1
-            small = reinterpret(
-                Int32,
-                copy(
-                    AC.slicebytes(
-                        AC.subslice(nd.buffers[2], Int64(0), Int64(4) * nentries),
-                    ),
-                ),
-            )
-            buffers = [nd.buffers[1], AC._databuffer(collect(Int64, small))]
-        end
-        AC.nullcount(nd) > 0 &&
-            !rf.nullable &&
-            throw(
-                ArgumentError(
-                    "column $colname holds missing values but its retained field " *
-                    "is non-nullable",
-                ),
-            )
-        d = AC._arraydata(
-            rt,
-            nd.len,
-            buffers,
-            nd.offset,
-            AC.ArrayData[cd],
-            nothing,
-            nd.owner,
-            AC.nullcount(nd),
-        )
-        fld = AC.Field(
-            rf.name,
-            rt;
-            nullable=rf.nullable,
-            metadata=rf.metadata === nothing ? nothing :
-                     collect(Pair{String,String}, rf.metadata),
-            children=AC.Field[cf],
-        )
-        return fld, d
-    end
-    AC.typeequal(nt, rt) || throw(
-        ArgumentError(
-            "column $colname no longer matches its retained Arrow type " *
-            "$(repr(rt)); it now maps to $(repr(nt))",
-        ),
-    )
-    AC.nullcount(nd) > 0 &&
-        !rf.nullable &&
-        throw(
-            ArgumentError(
-                "column $colname holds missing values but its retained field " *
-                "is non-nullable",
-            ),
-        )
-    fld = AC.Field(
-        rf.name,
-        rt;
-        nullable=rf.nullable,
-        metadata=rf.metadata === nothing ? nothing :
-                 collect(Pair{String,String}, rf.metadata),
-        children=collect(AC.Field, nf.children),
-    )
-    return fld, nd
-end
-
-"""
-The DECLARED Julia value type of a retained list child, when the facade
-materializes it faithfully: primitives and strings resolve, nested lists
-recurse, and everything else returns `nothing` (temporal children stay raw
-storage integers at the facade; other composites have no closed mapping) —
-the caller then keeps natural inference.
-"""
-function _retainedlisteltype(c::AC.Field)
-    t = c.type
-    if t isa AC.ListType
-        length(c.children) == 1 || return nothing
-        inner = _retainedlisteltype(c.children[1])
-        inner === nothing && return nothing
-        return c.nullable ? Union{Missing,Vector{inner}} : Vector{inner}
-    end
-    (
-        t isa AC.DateType ||
-        t isa AC.TimestampType ||
-        t isa AC.TimeType ||
-        t isa AC.DurationType ||
-        t isa AC.DictionaryType
-    ) && return nothing
-    E0 = _facadebasetype(t)
-    E0 === Any && return nothing
-    return c.nullable ? Union{Missing,E0} : E0
-end
-
-"""
-Retype list rows to the retained child element type — IDENTITY-strict at
-every depth, like the scalar retained gate: values must already BE the
-declared element type (a replaced column must refuse, never coerce — a
-`convert` would silently turn a replacement `true` into `Int64(1)`).
-Structure recovers (Any-eltyped rows retype), values never change.
-"""
-function _retypelist(f::AC.Field, v::AbstractVector, ::Type{E}) where {E}
-    S = eltype(v) >: Missing ? Union{Missing,Vector{E}} : Vector{E}
-    out = Vector{S}(undef, length(v))
-    for (i, x) in enumerate(v)
-        out[i] = x === missing ? missing : _retypevalue(Vector{E}, x, f)
-    end
-    return out
-end
-
-function _retypevalue(::Type{T}, x, f::AC.Field) where {T}
-    if x === missing
-        Missing <: T || throw(
-            ArgumentError(
-                "column $(f.name) holds missing elements but its retained " *
-                "list child is non-nullable",
-            ),
-        )
-        return missing
-    end
-    NT = Base.nonmissingtype(T)
-    if NT <: AbstractVector
-        x isa AbstractVector || throw(
-            ArgumentError(
-                "column $(f.name) holds $(typeof(x)) values, but its retained " *
-                "Arrow type $(repr(f.type)) materializes as vectors; the " *
-                "column was replaced with incompatible data",
-            ),
-        )
-        E = eltype(NT)
-        w = Vector{E}(undef, length(x))
-        i = 0
-        for elt in x
-            i += 1
-            w[i] = _retypevalue(E, elt, f)
-        end
-        return w
-    end
-    x isa NT || throw(
-        ArgumentError(
-            "column $(f.name) holds $(typeof(x)) elements that do not match " *
-            "its retained list element type $(NT); the column was replaced " *
-            "with incompatible data",
-        ),
-    )
-    return x
 end
 
 function _rebuildtemporal(f::AC.Field, storage, n)
@@ -531,6 +929,72 @@ _retainedschema(t::Table) = getfield(t, :schema)
 _retainedschema(s::Stream) = _tableschema(getfield(s, :src))
 _retainedschema(::Any) = nothing
 
+"Dictionary pools retained by one facade partition, in column order."
+_partitiondictpools(t::Table) = getfield(t, :retainedpools)
+_partitiondictpools(::Any) = nothing
+
+"Merge retained dictionary snapshots without changing the first pool's order."
+function _mergeddictpool(partpools, j::Int)
+    hints =
+        Any[pools[j] for pools in partpools if pools !== nothing && pools[j] !== nothing]
+    isempty(hints) && return nothing
+    out = collect(first(hints))
+    for pool in Iterators.drop(hints, 1), x in pool
+        any(y -> isequal(y, x), out) || push!(out, x)
+    end
+    return out
+end
+
+"Declared common value type for a newly inferred dictionary pool."
+function _dictvaluetype(vals)
+    T = Union{}
+    for v in vals
+        V = Base.nonmissingtype(eltype(v))
+        V === Union{} || (T = typejoin(T, V))
+    end
+    return T
+end
+
+"One value pool: keep a retained prefix exactly and append new categories."
+function _dictionarypool(vals, retainedpool)
+    if retainedpool === nothing
+        T = _dictvaluetype(vals)
+        T === Union{} && throw(
+            ArgumentError(
+                "cannot infer a dictionary value type from empty or all-missing columns",
+            ),
+        )
+        pool = Vector{T}()
+    else
+        pool = collect(retainedpool)
+    end
+    seen = Dict{Any,Nothing}()
+    for x in pool
+        x === missing || haskey(seen, x) || (seen[x] = nothing)
+    end
+    for v in vals, x in v
+        if x !== missing && !haskey(seen, x)
+            push!(pool, x)
+            seen[x] = nothing
+        end
+    end
+    return pool
+end
+
+"First pool position for each non-null value; duplicate categories stay intact."
+function _dictionarylookup(pool)
+    lookup = Dict{Any,Int64}()
+    for (i, x) in enumerate(pool)
+        x === missing || haskey(lookup, x) || (lookup[x] = Int64(i - 1))
+    end
+    return lookup
+end
+
+_dictionaryindices(v, lookup, missingindex=nothing) = Union{Missing,Int64}[
+    x === missing ? (missingindex === nothing ? missing : missingindex) : lookup[x] for
+    x in v
+]
+
 "One shared-pool dictionary batch: identical pool OBJECT across batches."
 function _dictbatch(fld::AC.Field, indices::Vector, pool_d::AC.ArrayData)
     t = fld.type::AC.DictionaryType
@@ -551,7 +1015,8 @@ end
 "Field + first-batch data for a dictionary column under a RETAINED type."
 function _retaineddict(rf::AC.Field, pool::Vector, firstidx::Vector, name::String)
     t = rf.type::AC.DictionaryType
-    vf, vd = AC.fromjulia(name, pool)
+    valuefield = AC.dictvaluefield(rf, t)
+    vf, vd = _writecolumn(valuefield, pool)
     AC.typeequal(vf.type, t.valuetype) || throw(
         ArgumentError(
             "column $name pool maps to $(summary(vf.type)) but the retained " *
@@ -589,6 +1054,7 @@ function _writebytes(
     # data to the wrong fields.
     names = Symbol[]
     partcols = Vector{AbstractVector}[]
+    partpools = Any[]
     rowcounts = Int[]
     for part in Tables.partitions(tbl)
         cols = Tables.columns(part)
@@ -604,7 +1070,21 @@ function _writebytes(
                 ),
             )
         end
-        push!(partcols, AbstractVector[Tables.getcolumn(cols, nm) for nm in pnames])
+        # Arrow permits duplicate field names. Tables.getcolumn(cols, name)
+        # cannot distinguish them, so bind every partition by position.
+        push!(
+            partcols,
+            AbstractVector[Tables.getcolumn(cols, j) for j in eachindex(pnames)],
+        )
+        pools = _partitiondictpools(part)
+        pools !== nothing &&
+            length(pools) != length(pnames) &&
+            throw(
+                ArgumentError(
+                    "retained dictionary pool count does not match partition width",
+                ),
+            )
+        push!(partpools, pools)
         n = Int(Tables.rowcount(cols))
         if n == 0 && isempty(pnames)
             n = max(n, Int(Tables.rowcount(part)))
@@ -615,10 +1095,16 @@ function _writebytes(
         throw(ArgumentError("table has no partitions; cannot infer a schema"))
     nparts = length(partcols)
     ncols = length(names)
+    retainedaligned =
+        retained !== nothing &&
+        length(retained.fields) == ncols &&
+        all(j -> retained.fields[j].name == String(names[j]), 1:ncols)
     function retainedfield(j)
         retained === nothing && return nothing
-        i = findfirst(f -> f.name == String(names[j]), collect(retained.fields))
-        return i === nothing ? nothing : retained.fields[i]
+        retainedaligned && return retained.fields[j]
+        count(==(names[j]), names) == 1 || return nothing
+        matches = findall(f -> f.name == String(names[j]), collect(retained.fields))
+        return length(matches) == 1 ? retained.fields[only(matches)] : nothing
     end
     # Phase 2: build columns. Dictionary-intent columns (retained
     # DictionaryType or DictEncode input) share ONE pool object across all
@@ -636,6 +1122,7 @@ function _writebytes(
                 partcols[k][j] isa DictEncode ? (partcols[k][j]::DictEncode).data :
                 partcols[k][j] for k = 1:nparts
             ]
+            poolhint = _mergeddictpool(partpools, j)
             if rf !== nothing
                 Fv = _facadebasetype(rf.type)
                 for k = 1:nparts
@@ -650,8 +1137,12 @@ function _writebytes(
                                 "column was replaced with incompatible data",
                             ),
                         )
+                    # A non-nullable dictionary may still materialize missing
+                    # through a valid index into a null pool entry. The
+                    # retained pool lets us preserve that distinction.
                     eltype(vals[k]) >: Missing &&
                         !rf.nullable &&
+                        (poolhint === nothing || !any(ismissing, poolhint)) &&
                         throw(
                             ArgumentError(
                                 "column $(names[j]) may hold missing values but " *
@@ -660,22 +1151,36 @@ function _writebytes(
                         )
                 end
             end
-            pool = unique(x for k = 1:nparts for x in skipmissing(vals[k]))
-            lookup = Dict{Any,Int32}(x => Int32(i - 1) for (i, x) in enumerate(pool))
-            firstidx =
-                Union{Missing,Int32}[x === missing ? missing : lookup[x] for x in vals[1]]
+            rf !== nothing &&
+                (rf.type::AC.DictionaryType).ordered &&
+                poolhint === nothing &&
+                throw(
+                    ArgumentError(
+                        "column $(names[j]) has an ordered retained dictionary, " *
+                        "but its original category pool is unavailable",
+                    ),
+                )
+            pool = _dictionarypool(vals, poolhint)
+            lookup = _dictionarylookup(pool)
+            missingindex =
+                rf !== nothing && !rf.nullable ? findfirst(ismissing, pool) : nothing
+            missingindex === nothing || (missingindex = Int64(missingindex - 1))
+            firstidx = _dictionaryindices(vals[1], lookup, missingindex)
             if rf === nothing
-                fld, d1 = AC.fromjulia_dict(String(names[j]), collect(pool), firstidx)
+                length(pool) - 1 <= typemax(Int32) || throw(
+                    ArgumentError(
+                        "column $(names[j]) dictionary exceeds the Int32 index range",
+                    ),
+                )
+                fld, d1 = AC.fromjulia_dict(String(names[j]), pool, firstidx)
             else
-                fld, d1 = _retaineddict(rf, collect(pool), firstidx, String(names[j]))
+                fld, d1 = _retaineddict(rf, pool, firstidx, String(names[j]))
             end
             fields[j] = fld
             coldata[j][1] = d1
             pool_d = d1.dictionary::AC.ArrayData
             for k = 2:nparts
-                idx = Union{Missing,Int32}[
-                    x === missing ? missing : lookup[x] for x in vals[k]
-                ]
+                idx = _dictionaryindices(vals[k], lookup, missingindex)
                 coldata[j][k] = _dictbatch(fld, idx, pool_d)
             end
         else
@@ -729,7 +1234,15 @@ function _writebytes(
 end
 
 _metapairs(::Nothing) = nothing
-_metapairs(m) = [String(k) => String(v) for (k, v) in Base.pairs(Dict(m))]
+function _metapairs(m)
+    entries = m isa AbstractDict || m isa NamedTuple ? Base.pairs(m) : m
+    out = Pair{String,String}[]
+    for kv in entries
+        kv isa Pair || throw(ArgumentError("metadata sequences must contain Pair values"))
+        push!(out, String(first(kv)) => String(last(kv)))
+    end
+    return out
+end
 
 _withcolmeta(f::AC.Field, ::Nothing) = f
 function _withcolmeta(f::AC.Field, colmetadata)

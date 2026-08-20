@@ -19,11 +19,11 @@
 
 # ArrowStrings.jl
 
-The inline-else-view string representation shared by Arrow.jl and CSV.jl,
-kept as its own package (to be registered separately, like `ArrowTypes.jl`,
-from this subdirectory of the arrow-julia repository; until its first release
-Arrow.jl resolves it through a `[sources]` path entry) so that either package
-can depend on it without depending on the other.
+An inline-else-view string representation designed for Arrow.jl and compatible
+parsers. It is a separate package, registered from this subdirectory like
+`ArrowTypes.jl`, so producers and consumers can use the representation without
+depending on each other. Until its first release, Arrow.jl resolves it through
+a `[sources]` path entry.
 
 * `ArrowString <: AbstractString` — a 16-byte string value that **is** an
   Arrow StringView entry: strings of up to 12 bytes are stored inline;
@@ -33,14 +33,16 @@ can depend on it without depending on the other.
   out.
 * `ArrowStringVector{ELT}` — a column of them: a payload vector plus the
   byte buffers the views point into. That is an Arrow Utf8View array's
-  memory (views buffer + variadic data buffers), so a column crosses to
-  Arrow — and an Arrow Utf8View column comes back — without copying.
+  memory (views buffer + variadic data buffers), so Arrow.jl can write the
+  column without repacking its payloads or data buffers.
   `ELT` is `ArrowString` or `Union{Missing, ArrowString}`; `getindex`
   allocates nothing; `materialize` copies out to `Vector{String}` (or
   `Vector{Union{String,Missing}}` for the nullable `ELT`).
 
 Everything depends only on Base and is concrete-typed, so it compiles under
 JuliaC `--trim`. Buffers must stay under 2 GiB (Arrow's `Int32` view words).
+Construction validates payload geometry and prefixes. Do not resize or mutate
+the payload vector or any referenced buffer while a column is in use.
 
 ```julia
 using ArrowStrings
@@ -50,3 +52,8 @@ payloads = [ArrowStrings.inline_payload(buf, 11, 4),
 col = ArrowStringVector{ArrowString}(payloads, buf, UInt8[])
 col[2] == "a much longer value"     # true, no allocation
 ```
+
+The Arrow 3.0 rewrite and this package used Anthropic Claude Code and OpenAI
+Codex for code generation, test generation, and review. Apache Arrow
+maintainers remain responsible for understanding, reviewing, testing, and
+approving the code and each release.

@@ -47,7 +47,7 @@ scope of every layer.
 | `bench/` | The serialize/deserialize benchmark harness (this package, Arrow.jl 2.x, PyArrow) |
 | `docs/dev/DESIGN-scan-ranges-trim.md` | The scan pushdown, ranged-fetch, and statistics design |
 | `docs/dev/research-flatbuffers-cdata.md` | Research notes: the vendored FlatBuffers runtime vs FlatBuffers.jl; the C-data pull requests |
-| `docs/dev/REVIEW-codex-r*.md` | The adversarial review record |
+| `test/`, `conformance/` | Unit, property, compatibility, conformance, and external-oracle checks |
 
 ## Run it
 
@@ -62,11 +62,11 @@ julia --project=. bench/run.jl                                     # benchmarks
 julia tools/fbsgen.jl src/metadata/fbs src/metadata               # regenerate bindings + verifier
 ```
 
-`Tables.Scan` pushdown needs Tables.jl's `jq/scan` branch developed into the
-project environment (the conformance image clones it). The conformance
+`Tables.Scan` pushdown needs the Tables.jl revision pinned in `Project.toml`
+developed into the project environment (the conformance image clones it). The conformance
 suites run inside one docker image (`conformance/Dockerfile`: Julia, a
 Python with pyarrow and nanoarrow that PythonCall binds to, the
-apache/arrow-testing corpus, the Tables branch, a warm depot in a named
+apache/arrow-testing corpus, the pinned Tables revision, a warm depot in a named
 volume) driven by `conformance/run.jl` through Harbor.jl. The driver
 instantiates its own tiny host environment (`conformance/host/`, Harbor.jl
 only) on first run, so docker — and network for that first run — are the
@@ -212,8 +212,9 @@ mutate or resize the vector while the stream or its batches live.
 `ConcurrencyViolationError`. `max_total_allocated_bytes` is one
 reader-wide, conservative budget for metadata copies, metadata-directed
 Julia containers, and decompressed outputs; it is not a measurement of
-every Julia allocation. Schema and Field metadata are copied into
-dictionaries, so duplicate keys and original ordering are not lossless.
+every Julia allocation. Schema and Field metadata stay as ordered pair
+vectors, so duplicate keys and their original order survive IPC reads and
+rewrites.
 
 The writer covers the same layouts with one registry-driven encoder, the
 declared inverse of `decodefield`. It writes V5 stream bytes and the file
@@ -329,11 +330,15 @@ directions, with sub-millisecond timestamps staying raw integers rather than
 silently truncating). `Arrow.Stream` iterates record batches as one Table
 each. `Arrow.write` accepts any Tables.jl source (partitions become record
 batches), `DictEncode` marks a column for pooling, retained-schema rewrites
-of a `Table`/`Stream` preserve temporal units, dictionary encoding, nested
-list descriptors, nullability, and metadata, and multi-partition dictionary
-columns share one pool object. DataAPI metadata reads through. There is no
-lazy typed-view layer, no parallel writer pipeline, no append-as-resume, and
-no ArrowTypes integration.
+of a `Table`/`Stream` recursively preserve every descriptor that materialized
+values can reconstruct, plus nullability and ordered metadata. Top-level
+dictionary pools retain order, unused and duplicate entries, null entries,
+and index width; multi-partition dictionary columns share one pool object.
+Union routing and nested dictionary pools are no longer present after facade
+materialization, so those retained rewrites fail closed. View buffer topology,
+ListView overlap, and exact run segmentation rebuild canonically. DataAPI
+metadata reads through. There is no lazy typed-view layer, no parallel writer
+pipeline, no append-as-resume, and no ArrowTypes integration.
 
 ## Trim-compile support (JuliaC `--trim=safe`)
 

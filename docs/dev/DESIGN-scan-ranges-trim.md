@@ -30,7 +30,8 @@ separates that design intent from what the trim harness actually compiles.
 
 ## 1. Tables.Scan support
 
-`Tables.Scan` (Tables.jl `jq/scan` branch) is a plain-data scan request —
+`Tables.Scan` (from the Tables.jl revision pinned in `Project.toml` until its
+first release) is a plain-data scan request —
 select/rename/type items, a closed predicate algebra (`Cmp`/`In`/`IsNull`/
 `StrPred`/`And`/`Or`/`Not`, with `OpNode` as the growth channel), `limit`/
 `offset`. A source accepts a `Scan` as a keyword and pushes down what it
@@ -61,9 +62,8 @@ scan=…)`). Key contract points this design leans on:
 handles does **IO-and-decode reduction with a full residual**:
 
     _applyscan(f, scan) =
-      bind against schema names →
+      resolve against schema names →
       decode set = selected ∪ filtercols (source order, source names) →
-      resolve positional filter refs to source names →
       batch set = limit/offset window (when filter === nothing),
                   ∩ stats-surviving batches (when stats present) →
       return (table over decode set, residual)
@@ -122,7 +122,7 @@ CSV-kernel style. Stage B subsumes Stage A.
 A Stage B row evaluator would be a **closed `isa` ladder over the closed
 `ScanExpr` set**, walking Core accessors (`isvalid_at` + `_value`)
 column-at-a-time. Stage A implements only `_maypass`, a separate closed ladder
-over statistics values. `Tables.bind` rejects `OpNode` because this adapter
+over statistics values. `Tables.resolve` rejects `OpNode` because this adapter
 recognizes none. No closures or `Function` fields are needed.
 
 The statistics fold resolves dictionary indices through the pool before it
@@ -303,7 +303,7 @@ designed for trim but not yet gated by it. The rules in `core-README.md`
 - `Tables.Scan` is trim-aligned by its own charter (no `Function` fields;
   closed algebra). The evaluator uses the same closed-set `isa` ladder
   pattern as `layoutspec_of`; `OpNode` rejection keeps the set closed.
-  `bind` is plain data → plain data.
+  `resolve` is plain data → plain data.
 - The range planner is arithmetic over `Int64`s; a trimmed app that names
   its concrete `AbstractArrowSource` type resolves the source calls
   statically. No dynamic registry on the hot path.
@@ -357,4 +357,5 @@ extension point; the CloudStore extension is the model), Stage B's exact
 facade pushdown, an
 encode-time `statistics=true` writer keyword, upstream-placement tracking
 for statistics, and the scan-and-materialize trim harness. Scan pushdown
-depends on Tables.jl's `jq/scan` branch until that API is released.
+depends on the pinned Tables.jl development revision until that API is
+released.

@@ -66,7 +66,53 @@ struct Table <: Tables.AbstractColumns
     schema::Union{Nothing,AC.Schema}
     regions::Vector{AC.OwnerRegion}
     nrows::Int   # authoritative even with zero columns
+    # Original dictionary pools, in column order, when the facade read had
+    # enough information to retain them. This is intentionally separate from
+    # `schema`: ordered dictionary semantics live in the pool order, not in
+    # the DictionaryType descriptor alone.
+    retainedpools::Vector{Any}
 end
+
+# Preserve the pre-3.0-development six-argument construction shape used by
+# downstream tests and code that replaces a materialized column deliberately.
+Table(names, columns, lookup, schema, regions, nrows) = Table(
+    names,
+    columns,
+    _namelookup(names),
+    schema,
+    regions,
+    nrows,
+    Any[nothing for _ in names],
+)
+
+function _namelookup(names)
+    lookup = Dict{Symbol,Int}()
+    for (i, nm) in enumerate(names)
+        lookup[nm] = haskey(lookup, nm) ? 0 : i
+    end
+    return lookup
+end
+
+function _columnindex(t::Table, nm::Symbol)
+    i = get(getfield(t, :lookup), nm, -1)
+    i == -1 && throw(ArgumentError("no column $(repr(nm)) in this table"))
+    i == 0 && throw(
+        ArgumentError("column name $(repr(nm)) is ambiguous; use positional column access"),
+    )
+    return i
+end
+
+function _fieldsymbol(name::AbstractString)
+    occursin('\0', name) && throw(
+        AC.ValidationError(
+            "field name contains an embedded NUL and cannot be represented " *
+            "as a Tables.jl column Symbol",
+        ),
+    )
+    return Symbol(name)
+end
+
+_fieldnamesymbols(fields) = Symbol[_fieldsymbol(f.name) for f in fields]
 
 function _table(
     names::Vector{Symbol},
@@ -74,9 +120,12 @@ function _table(
     schema,
     regions,
     nrows::Integer,
+    retainedpools=Any[nothing for _ in names],
 )
-    lookup = Dict{Symbol,Int}(nm => i for (i, nm) in enumerate(names))
-    return Table(names, columns, lookup, schema, regions, Int(nrows))
+    length(retainedpools) == length(names) ||
+        throw(ArgumentError("retained dictionary pool count does not match column count"))
+    lookup = _namelookup(names)
+    return Table(names, columns, lookup, schema, regions, Int(nrows), Any[retainedpools...])
 end
 
 Tables.istable(::Type{Table}) = true
@@ -84,7 +133,7 @@ Tables.columnaccess(::Type{Table}) = true
 Tables.columns(t::Table) = t
 Tables.columnnames(t::Table) = getfield(t, :names)
 Tables.getcolumn(t::Table, i::Int) = getfield(t, :columns)[i]
-Tables.getcolumn(t::Table, nm::Symbol) = getfield(t, :columns)[getfield(t, :lookup)[nm]]
+Tables.getcolumn(t::Table, nm::Symbol) = getfield(t, :columns)[_columnindex(t, nm)]
 Tables.schema(t::Table) =
     Tables.Schema(getfield(t, :names), [eltype(c) for c in getfield(t, :columns)])
 Base.propertynames(t::Table) = getfield(t, :names)
@@ -117,27 +166,42 @@ function DataAPI.metadata(
     default === _NO_DEFAULT && throw(KeyError(key))
     return style ? (default, :default) : default
 end
-function _schemafield(t::Table, col::Symbol)
+function _schemafield(t::Table, col::Int)
+    names = getfield(t, :names)
+    checkbounds(names, col)
     sch = getfield(t, :schema)
     sch === nothing && return nothing
-    i = findfirst(f -> f.name == String(col), collect(sch.fields))
+    fields = sch.fields
+    # An ordinary facade read retains one field per output column in the same
+    # order. Position is the only unambiguous identity when Arrow legally
+    # carries duplicate field names.
+    if length(fields) == length(names) &&
+       all(i -> fields[i].name == String(names[i]), eachindex(names))
+        return fields[col]
+    end
+    # A real Tables.Scan type conversion drops that column's retained field,
+    # so its schema can be an ordered subset. Name lookup remains safe only
+    # when the output name itself is unique.
+    nm = names[col]
+    count(==(nm), names) == 1 || return nothing
+    i = findfirst(f -> f.name == String(nm), collect(fields))
     return i === nothing ? nothing : sch.fields[i]
 end
-function _colsymbol(t::Table, col::Symbol)
-    haskey(getfield(t, :lookup), col) ||
-        throw(ArgumentError("no column $(repr(col)) in this table"))
-    return col
+function _schemafield(t::Table, col::Symbol)
+    return _schemafield(t, _columnindex(t, col))
 end
-_colsymbol(t::Table, col::Int) = getfield(t, :names)[col]
 function DataAPI.colmetadatakeys(t::Table, col::Union{Symbol,Int})
-    f = _schemafield(t, _colsymbol(t, col))
+    c = col isa Symbol ? _columnindex(t, col) : col
+    f = _schemafield(t, c)
     (f === nothing || f.metadata === nothing) && return ()
     return (String(first(kv)) for kv in f.metadata)
 end
-DataAPI.colmetadatakeys(t::Table) = (
-    nm => DataAPI.colmetadatakeys(t, nm) for
-    nm in getfield(t, :names) if !isempty(DataAPI.colmetadatakeys(t, nm))
-)
+function DataAPI.colmetadatakeys(t::Table)
+    return (
+        nm => keys for (i, nm) in enumerate(getfield(t, :names)) for
+        keys in (DataAPI.colmetadatakeys(t, i),) if !isempty(keys)
+    )
+end
 function DataAPI.colmetadata(
     t::Table,
     col::Union{Symbol,Int},
@@ -145,7 +209,8 @@ function DataAPI.colmetadata(
     default=_NO_DEFAULT;
     style::Bool=false,
 )
-    f = _schemafield(t, _colsymbol(t, col))
+    c = col isa Symbol ? _columnindex(t, col) : col
+    f = _schemafield(t, c)
     if f !== nothing && f.metadata !== nothing
         for kv in f.metadata
             first(kv) == key && return style ? (last(kv), :default) : last(kv)
@@ -320,7 +385,7 @@ end
 # filter literals arrive in public Julia types. Lower every literal to the
 # referenced field's storage domain BEFORE the scan, so file, ranged, and
 # stream paths share one value domain; conversion back to public types then
-# happens exactly once, on the scan OUTPUT (rename-aware via Tables.bind).
+# happens exactly once, on the scan OUTPUT (rename-aware via Tables.resolve).
 
 # Lowering returns (ok, value): ok=false means the literal has NO exact,
 # semantics-preserving storage representation for this field (cross-type
@@ -441,11 +506,11 @@ Type overrides are ALWAYS stripped from the pushdown copy — they are public-
 domain conversions and run after facade conversion.
 """
 function _lowerscan(scan::Tables.Scan, fields)
-    names = Symbol[Symbol(f.name) for f in fields]
-    b = Tables.bind(scan, names)
+    names = _fieldnamesymbols(fields)
+    b = Tables.resolve(scan, names)
     isempty(b.columns) && !isempty(fields) && return scan, false
     ok = Ref(true)
-    lowered = _lowerexpr(scan.filter, fields, names, ok)
+    lowered = _lowerexpr(b.filter, fields, names, ok)
     ok[] || return scan, false
     pushselect = Tables.SelectItem[
         Tables.SelectItem(
@@ -548,7 +613,7 @@ function _tablefrom(src::Union{IPCStream,ArrowFile}, scan::Union{Nothing,Tables.
         else
             # Stream format: decode RAW columns and scan in the storage
             # domain — the same value domain as the pushdown paths.
-            names = Symbol[Symbol(f.name) for f in fields]
+            names = _fieldnamesymbols(fields)
             raw =
                 NamedTuple{Tuple(names)}(Tuple(_rawcolumn(src, i) for i = 1:length(fields)))
             got = Tables.scan(raw, pushscan)
@@ -572,12 +637,12 @@ function _publicscan(full::Table, schema, sourcefields, scan, regions)
     if isempty(Tables.columnnames(full))
         # No columns can carry the count through Tables.scan. Binding is
         # STRUCTURAL and always runs — unsupported predicate nodes reject
-        # regardless of `validate`, exactly as Tables.bind rules; validate
+        # regardless of `validate`, exactly as Tables.resolve rules; validate
         # only opts out of unmatched column references.
-        Tables.bind(scan, Symbol[])
+        b = Tables.resolve(scan, Symbol[])
         # Row-invariant predicate, evaluated ONCE — no mask or index vector
         # may be allocated from an untrusted row count.
-        keep = _zerofieldpredicate(scan.filter)
+        keep = _zerofieldpredicate(b.filter)
         n1 = Int(
             _zerofieldcount(Int64(Tables.rowcount(full)), keep, scan.limit, scan.offset),
         )
@@ -594,8 +659,8 @@ function _publicscan(full::Table, schema, sourcefields, scan, regions)
     columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
     precols = AbstractVector[]
     if !isempty(sourcefields)
-        srcnames = Symbol[Symbol(f.name) for f in sourcefields]
-        b = Tables.bind(scan, srcnames)
+        srcnames = _fieldnamesymbols(sourcefields)
+        b = Tables.resolve(scan, srcnames)
         precols =
             AbstractVector[Tables.getcolumn(full, srcnames[bc.index]) for bc in b.columns]
     end
@@ -614,18 +679,43 @@ end
 _tableschema(s::IPCStream) = s.schema
 _tableschema(f::ArrowFile) = f.schema
 
+"Retain one top-level dictionary's category order across pool snapshots."
+function _retaineddictpool(f::AC.Field, batches, i::Int)
+    t = f.type
+    t isa AC.DictionaryType || return nothing
+    vf = AC.dictvaluefield(f, t)
+    isempty(batches) && return _facadecolumn(vf, Any[])
+    pools = AbstractVector[
+        _facadecolumn(vf, [_batchcolumn(vf, b.columns[i].dictionary::AC.ArrayData)]) for
+        b in batches
+    ]
+    # Preserve the first pool byte-for-byte at the value level, including
+    # unused and duplicate entries. Replacement pools can add categories; add
+    # only values not already represented so the first pool's categorical
+    # order remains authoritative.
+    out = collect(first(pools))
+    for pool in Iterators.drop(pools, 1), x in pool
+        any(y -> isequal(y, x), out) || push!(out, x)
+    end
+    return out
+end
+
+_retaineddictpools(fields, batches) =
+    Any[_retaineddictpool(f, batches, i) for (i, f) in enumerate(fields)]
+
 function _materialize_table(src::IPCStream, regions)
-    names = Symbol[Symbol(f.name) for f in src.schema.fields]
+    names = _fieldnamesymbols(src.schema.fields)
     cols = AbstractVector[
         _facadecolumn(f, [_batchcolumn(f, b.columns[i]) for b in src.batches]) for
         (i, f) in enumerate(src.corefields)
     ]
     nrows = sum(Int(b.nrows) for b in src.batches; init=0)
-    return _table(names, cols, src.schema, regions, nrows)
+    pools = _retaineddictpools(src.corefields, src.batches)
+    return _table(names, cols, src.schema, regions, nrows, pools)
 end
 
 function _materialize_table(src::ArrowFile, regions)
-    names = Symbol[Symbol(f.name) for f in src.schema.fields]
+    names = _fieldnamesymbols(src.schema.fields)
     nb = length(src)
     batches = [src[i] for i = 1:nb]
     cols = AbstractVector[
@@ -633,7 +723,8 @@ function _materialize_table(src::ArrowFile, regions)
         (i, f) in enumerate(src.fields)
     ]
     nrows = sum(Int(b.nrows) for b in batches; init=0)
-    return _table(names, cols, src.schema, regions, nrows)
+    pools = _retaineddictpools(src.fields, batches)
+    return _table(names, cols, src.schema, regions, nrows, pools)
 end
 
 # The eltype the keep/drop decision uses for an EMPTY pre-override column:
@@ -720,7 +811,7 @@ made: a no-op override keeps its retained field; a real conversion drops it
 """
 function _boundschema(schema, sourcefields, scan, precols)
     (schema === nothing || scan === nothing) && return schema
-    b = Tables.bind(scan, Symbol[Symbol(f.name) for f in sourcefields])
+    b = Tables.resolve(scan, _fieldnamesymbols(sourcefields))
     outfields = AC.Field[]
     for (i, bc) in enumerate(b.columns)
         f = sourcefields[bc.index]
@@ -754,7 +845,7 @@ function _wrapscanned(got, schema, sourcefields, scan; regions=AC.OwnerRegion[])
     columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
     precols = AbstractVector[]
     if scan !== nothing && !isempty(sourcefields)
-        b = Tables.bind(scan, Symbol[Symbol(f.name) for f in sourcefields])
+        b = Tables.resolve(scan, _fieldnamesymbols(sourcefields))
         length(b.columns) == length(columns) || throw(
             AssertionError(
                 "scan output width $(length(columns)) does not match its bound " *
@@ -845,11 +936,12 @@ function Base.iterate(s::Stream, i::Int=1)
     i > _nbatches(s.src) && return nothing
     b = _batch(s.src, i)
     fields = _batchfields(s.src)
-    names = Symbol[Symbol(f.name) for f in fields]
+    names = _fieldnamesymbols(fields)
     cols = AbstractVector[
         _facadecolumn(f, [_batchcolumn(f, b.columns[j])]) for (j, f) in enumerate(fields)
     ]
-    return _table(names, cols, _tableschema(s.src), s.regions, Int(b.nrows)), i + 1
+    pools = _retaineddictpools(fields, [b])
+    return _table(names, cols, _tableschema(s.src), s.regions, Int(b.nrows), pools), i + 1
 end
 
 Tables.partitions(s::Stream) = s

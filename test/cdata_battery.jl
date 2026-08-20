@@ -1483,6 +1483,8 @@ function cdata_battery()
         end
         failed_batch_owner = captured_batch_owner[]::ForeignOwner
         @assert (@atomic failed_batch_owner.released)
+        @assert !(@atomic batchfailstream.pulling)
+        @assert nextbatch!(batchfailstream) === nothing
         finalize(failed_batch_owner)
         release!(failed_batch_owner)
         release!(batchfailstream)
@@ -1491,6 +1493,47 @@ function cdata_battery()
     @assert _registry_count() == sbefore
     @assert _stream_registry_count() == stbefore
     println("failed pulled-batch owner handoff releases its live result ✓")
+
+    # Hold one public pull inside owner construction. A second public pull
+    # and release must fail immediately, without touching the producer. Once
+    # unblocked, the first pull completes and the stream remains usable.
+    overlapref = Ref{CArrowArrayStream}()
+    GC.@preserve overlapref begin
+        overlapp = Base.unsafe_convert(Ptr{CArrowArrayStream}, overlapref)
+        export_stream!(overlapp, b1.schema, AC.RecordBatch[b1])
+        overlapstream = from_c_stream(overlapp)
+        entered = Channel{Nothing}(1)
+        resume = Channel{Nothing}(1)
+        blockingfactory = arr -> begin
+            put!(entered, nothing)
+            take!(resume)
+            ForeignOwner(arr)
+        end
+        firstpull = @async _nextbatch!(overlapstream, blockingfactory)
+        take!(entered)
+        @assert try
+            nextbatch!(overlapstream)
+            false
+        catch e
+            e isa Base.ConcurrencyViolationError
+        end
+        @assert try
+            release!(overlapstream)
+            false
+        catch e
+            e isa Base.ConcurrencyViolationError
+        end
+        put!(resume, nothing)
+        overlapbatch = fetch(firstpull)
+        @assert overlapbatch isa AC.RecordBatch
+        @assert nextbatch!(overlapstream) === nothing
+        release!(overlapbatch.columns[1].owner::ForeignOwner)
+        release!(overlapstream)
+    end
+    @assert reap!() == 2                    # schema result + pulled batch result
+    @assert _registry_count() == sbefore
+    @assert _stream_registry_count() == stbefore
+    println("overlapping imported-stream calls fail and the cursor recovers ✓")
 
     streamref = Ref{CArrowArrayStream}()
     GC.@preserve streamref begin
@@ -1687,9 +1730,13 @@ function cdata_battery()
         end
         @assert caught
     end
-    guardscript = joinpath(@__DIR__, "cstring_guard_child.jl")
-    guardcmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $guardscript`
-    success(guardcmd) || error("C-string guard-page child failed")
+    if Sys.iswindows()
+        println("C-string POSIX guard-page child skipped on Windows ✓")
+    else
+        guardscript = joinpath(@__DIR__, "cstring_guard_child.jl")
+        guardcmd = `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $guardscript`
+        success(guardcmd) || error("C-string guard-page child failed")
+    end
     println("field metadata crosses the C boundary ✓")
 
     # Schema-level metadata rides the C stream's struct-typed schema node

@@ -47,11 +47,27 @@ Arrow.concurrentreads
 
 ## The C data and C stream interfaces
 
+The low-level value and ABI types are public but not exported.
+
+```@docs
+Arrow.Field
+Arrow.Schema
+Arrow.ArrayData
+Arrow.RecordBatch
+Arrow.fromjulia
+Arrow.batch
+Arrow.materialize
+Arrow.CArrowSchema
+Arrow.CArrowArray
+Arrow.CArrowArrayStream
+```
+
 ```@docs
 Arrow.to_c_data
 Arrow.from_c_data
 Arrow.export_stream!
 Arrow.from_c_stream
+Arrow.ForeignOwner
 Arrow.ImportedStream
 Arrow.nextbatch!
 Arrow.release!(::Arrow.ForeignOwner)

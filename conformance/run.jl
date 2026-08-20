@@ -24,7 +24,7 @@
 # in-process pyarrow); no argument runs all three. Docker is the only host
 # requirement (plus network the first time, to fetch Harbor.jl and build the
 # image): the image (conformance/Dockerfile) carries Julia, the oracle
-# Python, the gold corpus, and Tables.jl's scan branch, and the repository is
+# Python, the gold corpus, and the pinned Tables.jl scan revision, and the repository is
 # bind-mounted at /work. The image is built once (`--rebuild` forces it) and
 # a named volume keeps the Julia depot — precompilation caches — between
 # runs. Harbor.jl manages the container; suite output streams live.
@@ -87,7 +87,7 @@ function main(args)
     results = Dict{String,Int}()
     try
         # The suite environment: the repository's conformance project with
-        # the mounted checkout and the image's Tables branch developed in.
+        # the mounted checkout and the image's pinned Tables revision developed in.
         # Cheap when the depot volume is warm; fetches only what changed.
         println("conformance: preparing the suite environment")
         rc = execstream(
@@ -99,7 +99,11 @@ function main(args)
                 "-e",
                 """using Pkg
                    cp("/work/conformance/Project.toml", "/opt/env/Project.toml"; force=true)
-                   Pkg.develop(path="/work"); Pkg.develop(path="/opt/Tables")
+                   Pkg.develop([
+                       PackageSpec(path="/work/src/ArrowStrings"),
+                       PackageSpec(path="/work"),
+                       PackageSpec(path="/opt/Tables"),
+                   ])
                    Pkg.instantiate(); Pkg.precompile()""",
             ],
         )

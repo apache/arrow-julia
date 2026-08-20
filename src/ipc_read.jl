@@ -375,7 +375,9 @@ timeunit(u) =
 
 function coremetadata(kvs)
     kvs === nothing && return nothing
-    return Dict(String(kv.key) => String(something(kv.value, "")) for kv in kvs)
+    return Pair{String,String}[
+        String(kv.key) => String(something(kv.value, "")) for kv in kvs
+    ]
 end
 
 """

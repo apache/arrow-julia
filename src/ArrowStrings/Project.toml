@@ -18,7 +18,7 @@
 name = "ArrowStrings"
 uuid = "c38d8858-22a2-449e-9eca-ef92ec15f353"
 authors = ["quinnj <quinn.jacobd@gmail.com>"]
-version = "0.1.0"
+version = "1.0.0"
 
 [compat]
 julia = "1.10"

@@ -2911,7 +2911,15 @@ scoped-borrow contract: don't resize/mutate while in use). `Bool`
 (bit-packed), `Union{T,Missing}`, and String inputs build fresh buffers.
 """
 function fromjulia(name, v::Vector{T}) where {T}
-    if T <: Union{Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64,Float16,Float32,Float64}
+    if T === Union{}
+        throw(
+            ArgumentError(
+                "fromjulia: bottom element type Union{} has no Arrow type; " *
+                "give the empty vector a declared element type",
+            ),
+        )
+    elseif T <:
+           Union{Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64,Float16,Float32,Float64}
         t = arrowtype_for(T)
         return Field(name, t; nullable=false),
         ArrayData(t, length(v), [BufferSlice(), _databuffer(v)]; nullcount=0)
@@ -2952,6 +2960,11 @@ end
 
 function _build_nullable_primitive(name, v::Vector{T}; nullable::Bool=true) where {T}
     S = Base.nonmissingtype(T)
+    if S === Union{}
+        t = NullType()
+        return Field(name, t; nullable=true),
+        ArrayData(t, length(v), BufferSlice[]; nullcount=length(v))
+    end
     t = arrowtype_for(S)
     present = [x !== missing for x in v]
     validity = _bitmapbuffer(present)
@@ -3167,7 +3180,7 @@ end
 RecordBatch(schema::Schema, columns) =
     RecordBatch(schema, columns, isempty(columns) ? 0 : length(first(columns)))
 
-"Build a batch from a NamedTuple of Julia vectors (test/example convenience)."
+"Build a low-level `RecordBatch` from a `NamedTuple` of Julia vectors."
 function batch(nt::NamedTuple)
     pairs = [fromjulia(String(k), v) for (k, v) in Base.pairs(nt)]
     sch = Schema([p[1] for p in pairs])

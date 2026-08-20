@@ -15,12 +15,21 @@
 # limitations under the License.
 
 using Test
+using Aqua
+using Arrow
+using Pkg
 
 # Core unit tests (ArrowCore in isolation).
 include("core_tests.jl")
 
 # The public facade (Arrow.Table / Arrow.Stream / Arrow.write).
 include("facade_tests.jl")
+
+# Seeded end-to-end properties over public IPC paths.
+include("property_tests.jl")
+
+# Release-blocking regressions found during the 3.0 rewrite audit.
+include("rewrite_regressions.jl")
 
 # The CloudStore.jl extension against a local S3-compatible server.
 include("cloudstore_tests.jl")
@@ -29,3 +38,12 @@ include("cloudstore_tests.jl")
 # package's internals, sharing one module that aliases the package
 # namespace wholesale.
 include("batteries.jl")
+
+# Package hygiene: compat bounds, stale dependencies, ambiguities, exports,
+# and unbound type parameters.
+const ROOT_PROJECT = Pkg.TOML.parsefile(joinpath(pkgdir(Arrow), "Project.toml"))
+const HAS_TABLES_SOURCE_OVERRIDE =
+    haskey(get(ROOT_PROJECT, "sources", Dict{String,Any}()), "Tables")
+# TODO: Removing the temporary Tables source override after Tables.Scan is
+# released automatically re-enables this check on Julia 1.10.
+Aqua.test_all(Arrow; persistent_tasks=(!(VERSION < v"1.11" && HAS_TABLES_SOURCE_OVERRIDE)))

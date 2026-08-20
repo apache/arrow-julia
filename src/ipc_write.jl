@@ -229,7 +229,9 @@ end
 
 function _metakeyvalues!(b::FB.Builder, metadata)
     metadata === nothing && return FB.UOffsetT(0)
-    pairs = sort!(collect(metadata); by=first)
+    # Core metadata is an ordered Pair sequence. Preserve both that order and
+    # duplicate keys; callers that want canonical ordering can supply it.
+    pairs = collect(metadata)
     kvs = FB.UOffsetT[]
     for (k, v) in pairs
         key = FB.createstring!(b, k)

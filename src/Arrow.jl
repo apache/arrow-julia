@@ -66,7 +66,8 @@ const TS = TranscodingStreams
 
 isdefined(Tables, :Scan) || error(
     "Arrow 3.0's scan support needs Tables.jl's `Tables.Scan` " *
-    "interface; upgrade Tables.jl (or dev the `jq/scan` branch)",
+    "interface; upgrade Tables.jl or use the pinned development revision " *
+    "from Arrow.jl's Project.toml",
 )
 
 include(joinpath("FlatBuffers", "FlatBuffers.jl"))
@@ -98,6 +99,57 @@ include("scan.jl")
 include("table.jl")
 include("write.jl")
 
+@doc """
+    Arrow.Field
+
+A low-level Arrow column descriptor used by the C data interface. Obtain a
+field with [`Arrow.fromjulia`](@ref) or [`Arrow.from_c_data`](@ref).
+""" Field
+
+@doc """
+    Arrow.Schema
+
+A low-level ordered collection of [`Arrow.Field`](@ref) values plus optional
+schema metadata. The C stream interface uses it to describe each batch.
+""" Schema
+
+@doc """
+    Arrow.ArrayData
+
+A low-level Arrow array: buffers, children, an optional dictionary, and a
+logical length. Obtain it with [`Arrow.fromjulia`](@ref) or
+[`Arrow.from_c_data`](@ref), and convert it with [`Arrow.materialize`](@ref).
+""" ArrayData
+
+@doc """
+    Arrow.RecordBatch
+
+A low-level [`Arrow.Schema`](@ref) and an equal-length `Arrow.ArrayData`
+column for each field. [`Arrow.batch`](@ref) builds one from Julia vectors.
+""" RecordBatch
+
+@doc """
+    Arrow.fromjulia(name, values) -> (Arrow.Field, Arrow.ArrayData)
+
+Build the low-level C-interchange representation of one supported Julia
+vector. Do not resize or mutate zero-copy input buffers while the result is in
+use.
+""" fromjulia
+
+@doc """
+    Arrow.batch(columns::NamedTuple) -> Arrow.RecordBatch
+
+Build a low-level record batch from a named tuple of supported Julia vectors.
+""" batch
+
+@doc """
+    Arrow.materialize(field, data) -> Vector
+    Arrow.materialize(T, field, data) -> Vector{T}
+
+Convert low-level `Arrow.ArrayData` to native Julia values. The typed form
+checks that `T` agrees with the Arrow descriptor before conversion.
+""" materialize
+
 """
     Arrow.nextbatch!(source) -> Union{Nothing, RecordBatch}
 
@@ -115,6 +167,46 @@ Thrown by every validation tier — structural, semantic, and the opt-in
 `validate_full` — when a descriptor or array violates the Arrow format.
 """
 AC.ValidationError
+
+# Julia 1.11 added `public`. Keep the source parseable on the supported
+# Julia 1.10 floor while giving tooling an exact, non-exporting API boundary
+# on newer Julia versions.
+@static if VERSION >= v"1.11"
+    Core.eval(
+        @__MODULE__,
+        Expr(
+            :public,
+            :Table,
+            :Stream,
+            :write,
+            :DictEncode,
+            :AbstractArrowSource,
+            :sourcelength,
+            :readrange,
+            :concurrentreads,
+            :Field,
+            :Schema,
+            :ArrayData,
+            :RecordBatch,
+            :fromjulia,
+            :batch,
+            :materialize,
+            :CArrowSchema,
+            :CArrowArray,
+            :CArrowArrayStream,
+            :to_c_data,
+            :from_c_data,
+            :export_stream!,
+            :from_c_stream,
+            :ForeignOwner,
+            :ImportedStream,
+            :nextbatch!,
+            :release!,
+            :reap!,
+            :ValidationError,
+        ),
+    )
+end
 
 export close!
 

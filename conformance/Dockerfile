@@ -23,7 +23,7 @@
 #   * A Python with pyarrow and nanoarrow — the oracles. PythonCall binds to
 #     it (JULIA_PYTHONCALL_EXE; the CondaPkg backend is disabled).
 #   * The apache/arrow-testing gold corpus.
-#   * Tables.jl's `jq/scan` branch (until Tables.Scan is released).
+#   * The reviewed Tables.jl scan commit (until Tables.Scan is released).
 #   * A warm Julia depot with the registered dependencies, in a named volume
 #     at run time so precompilation caches survive between runs.
 #
@@ -33,9 +33,17 @@
 #
 #     docker build -t arrow-julia-conformance:latest -f conformance/Dockerfile conformance/
 
-# Julia 1.12: the version the conformance results are quoted against (and the
-# floor for --trim); the package itself supports 1.10+.
-FROM julia:1.12-bookworm
+# Pinned direct tool and corpus revisions make conformance runs repeatable
+# against those inputs. The base-image digest, apt packages, and transitive
+# Julia/Python dependencies are not fully locked. The package itself supports
+# Julia 1.10 and later; Julia 1.12 is also the trim-test floor.
+FROM julia:1.12.6-bookworm
+
+ARG PIP_VERSION=26.2.1
+ARG PYARROW_VERSION=25.0.1
+ARG NANOARROW_VERSION=0.9.0
+ARG ARROW_TESTING_REV=9ff285c88565f0f6abc855918c6a342e70e4909c
+ARG TABLES_REV=64268c6a316e380cc3da26965f440a5433ebc1f7
 
 # python3-dev brings the shared libpython that PythonCall embeds; Debian's
 # interpreter binary is statically linked and does not ship it otherwise.
@@ -45,11 +53,18 @@ RUN apt-get update \
 
 # The oracle interpreter. A venv keeps the Debian system Python untouched.
 RUN python3 -m venv /opt/pyarrow \
- && /opt/pyarrow/bin/pip install --no-cache-dir --upgrade pip \
- && /opt/pyarrow/bin/pip install --no-cache-dir pyarrow nanoarrow
+ && /opt/pyarrow/bin/pip install --no-cache-dir "pip==${PIP_VERSION}" \
+ && /opt/pyarrow/bin/pip install --no-cache-dir \
+      "pyarrow==${PYARROW_VERSION}" "nanoarrow==${NANOARROW_VERSION}"
 
-RUN git clone --depth 1 https://github.com/apache/arrow-testing.git /opt/arrow-testing \
- && git clone --depth 1 --branch jq/scan https://github.com/JuliaData/Tables.jl.git /opt/Tables
+RUN git init /opt/arrow-testing \
+ && git -C /opt/arrow-testing remote add origin https://github.com/apache/arrow-testing.git \
+ && git -C /opt/arrow-testing fetch --depth 1 origin "${ARROW_TESTING_REV}" \
+ && git -C /opt/arrow-testing checkout --detach FETCH_HEAD \
+ && git init /opt/Tables \
+ && git -C /opt/Tables remote add origin https://github.com/JuliaData/Tables.jl.git \
+ && git -C /opt/Tables fetch --depth 1 origin "${TABLES_REV}" \
+ && git -C /opt/Tables checkout --detach FETCH_HEAD
 
 ENV ARROW_TESTING_DIR=/opt/arrow-testing \
     ARROW_ORACLE_PYTHON=/opt/pyarrow/bin/python \
@@ -66,8 +81,14 @@ ENV ARROW_TESTING_DIR=/opt/arrow-testing \
 # conformance/Project.toml — the run-time instantiate is authoritative and
 # fetches any delta), plus PythonCall precompiled against the oracle Python.
 RUN julia -e 'using Pkg; Pkg.activate("/opt/warm"); \
-    Pkg.add(["CodecLz4", "CodecZstd", "DataAPI", "EnumX", "TranscodingStreams", \
-             "JSON", "CodecZlib", "PythonCall"]); \
+    Pkg.add([PackageSpec(name="CodecLz4", version="0.4.6"), \
+             PackageSpec(name="CodecZstd", version="0.8.7"), \
+             PackageSpec(name="DataAPI", version="1.16.0"), \
+             PackageSpec(name="EnumX", version="1.0.7"), \
+             PackageSpec(name="TranscodingStreams", version="0.11.3"), \
+             PackageSpec(name="JSON", version="1.7.1"), \
+             PackageSpec(name="CodecZlib", version="0.7.9"), \
+             PackageSpec(name="PythonCall", version="0.9.35")]); \
     Pkg.develop(path="/opt/Tables"); Pkg.precompile()'
 
 # The suite environment is created from the mounted repository's

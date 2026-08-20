@@ -521,22 +521,6 @@ function _zerofieldwindow(counts, keep, limit, offset)
     return n
 end
 
-"Resolve positional filter references once, against the source schema."
-_resolvefilter(::Nothing, names) = nothing
-function _resolvefilter(e::Tables.ScanExpr, names)
-    col(c) = c.ref isa Int && 1 <= c.ref <= length(names) ? Tables.Col(names[c.ref]) : c
-    e isa Tables.Cmp && return Tables.Cmp(e.op, col(e.lhs), e.rhs)
-    e isa Tables.In && return Tables.In(col(e.lhs), e.values)
-    e isa Tables.IsNull && return Tables.IsNull(col(e.lhs), e.negated)
-    e isa Tables.StrPred && return Tables.StrPred(e.kind, col(e.lhs), e.s)
-    e isa Tables.AndExpr &&
-        return Tables.AndExpr(Tables.ScanExpr[_resolvefilter(a, names) for a in e.args])
-    e isa Tables.OrExpr &&
-        return Tables.OrExpr(Tables.ScanExpr[_resolvefilter(a, names) for a in e.args])
-    e isa Tables.NotExpr && return Tables.NotExpr(_resolvefilter(e.arg, names))
-    return e
-end
-
 "Column table that preserves a row count when there are no columns."
 struct _ScanColumns{T}
     columns::T
@@ -639,19 +623,19 @@ _canconsumewindow(scan::Tables.Scan) =
     (scan.limit === nothing || scan.limit <= typemax(Int) - scan.offset)
 
 function _applyscan(f::ArrowFile, scan::Tables.Scan)
-    names = Symbol[Symbol(fld.name) for fld in f.fields]
+    names = _fieldnamesymbols(f.fields)
     allunique(names) || throw(
         ValidationError(
             "scan pushdown over duplicate column names is not supported; read the file without a scan",
         ),
     )
-    b = Tables.bind(scan, names)
+    b = Tables.resolve(scan, names)
     if isempty(names)
         # Zero-field sources: consume filter and window HERE — an empty
         # residual NamedTuple cannot carry a row count through the generic
         # executor. The header reads share ONE budget: `Limits` documents a cumulative
         # allocation bound per read, exactly as the column path enforces.
-        keep = _zerofieldpredicate(scan.filter)
+        keep = _zerofieldpredicate(b.filter)
         zfbudget = AllocationBudget(f.limits.max_total_allocated_bytes)
         n = _zerofieldwindow(
             (_batchrows(f, i, zfbudget) for i = 1:length(f)),
@@ -684,7 +668,7 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
         # Statistics pruning: one-sided — a pruned batch is provably
         # empty under the filter; the filter itself always stays in the residual.
         keep = trues(length(f))
-        if scan.filter !== nothing
+        if b.filter !== nothing
             stats = _readstats(
                 f.schema.metadata,
                 length(f),
@@ -694,7 +678,7 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
             )
             stats === nothing || (
                 keep = Bool[
-                    _maypass(scan.filter, stats[i].cols, names, stats[i].rows) for
+                    _maypass(b.filter, stats[i].cols, names, stats[i].rows) for
                     i = 1:length(f)
                 ]
             )
@@ -729,9 +713,7 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
             ]
         limit = consumed ? nothing : scan.limit
         offset = consumed ? 0 : scan.offset
-        residualfilter = _resolvefilter(scan.filter, names)
-        return table,
-        Tables.Scan(residualselect, residualfilter, limit, offset, scan.validate)
+        return table, Tables.Scan(residualselect, b.filter, limit, offset, scan.validate)
     finally
         close(state)
     end
@@ -1172,13 +1154,13 @@ function _applyscan(sf::SourceFile, scan::Tables.Scan)
     tail = ft.tail
     tailstart = ft.tailstart
     metaschema = ft.metaschema
-    names = Symbol[Symbol(fld.name) for fld in fields]
+    names = _fieldnamesymbols(fields)
     allunique(names) || throw(
         ValidationError(
             "scan pushdown over duplicate column names is not supported; read the file without a scan",
         ),
     )
-    b = Tables.bind(scan, names)
+    b = Tables.resolve(scan, names)
     if isempty(names)
         # Zero-field sources: consume filter and window HERE — an empty
         # residual NamedTuple cannot carry a row count through the generic
@@ -1194,7 +1176,7 @@ function _applyscan(sf::SourceFile, scan::Tables.Scan)
                 "dictionary batch has no declaring field in a zero-field schema",
             ),
         )
-        keep = _zerofieldpredicate(scan.filter)
+        keep = _zerofieldpredicate(b.filter)
         n = _zerofieldwindow(
             (
                 _zerofieldblockcount(sf, block, version, fields, budget) for
@@ -1221,7 +1203,7 @@ function _applyscan(sf::SourceFile, scan::Tables.Scan)
     # a filter, and the window applies only without one, so they never interact.
     nrec = length(recordblocks)
     keep = trues(nrec)
-    if scan.filter !== nothing
+    if b.filter !== nothing
         stats = _readstats(
             coremetadata(metaschema.custom_metadata),
             nrec,
@@ -1231,7 +1213,7 @@ function _applyscan(sf::SourceFile, scan::Tables.Scan)
         )
         stats === nothing || (
             keep = Bool[
-                _maypass(scan.filter, stats[i].cols, names, stats[i].rows) for i = 1:nrec
+                _maypass(b.filter, stats[i].cols, names, stats[i].rows) for i = 1:nrec
             ]
         )
     end
@@ -1457,9 +1439,7 @@ function _applyscan(sf::SourceFile, scan::Tables.Scan)
             ]
         limit = consumed ? nothing : scan.limit
         offset = consumed ? 0 : scan.offset
-        residualfilter = _resolvefilter(scan.filter, names)
-        return table,
-        Tables.Scan(residualselect, residualfilter, limit, offset, scan.validate)
+        return table, Tables.Scan(residualselect, b.filter, limit, offset, scan.validate)
     finally
         close(state)
     end
@@ -1746,8 +1726,15 @@ function withstatistics(sch::Schema, batches::AbstractVector{AC.RecordBatch})
         push!(statsbatches, _statsbatch(statssch, batch.nrows, colstats))
     end
     blob = Base64.base64encode(writestream(statssch, statsbatches))
-    metadata = Dict{String,String}(something(sch.metadata, Dict{String,String}()))
-    metadata[STATS_KEY] = blob
+    # Replace only this private placement key. Keep every other metadata pair,
+    # including duplicate keys and its original order.
+    metadata = Pair{String,String}[]
+    if sch.metadata !== nothing
+        for kv in sch.metadata
+            first(kv) == STATS_KEY || push!(metadata, String(first(kv)) => String(last(kv)))
+        end
+    end
+    push!(metadata, STATS_KEY => blob)
     return Schema(collect(Field, sch.fields); metadata=metadata, endianness=sch.endianness)
 end
 
@@ -1808,7 +1795,10 @@ function _readstats(
     budget::Union{Nothing,AllocationBudget}=nothing,
 )
     metadata === nothing && return nothing
-    blob = get(Dict(metadata), STATS_KEY, nothing)
+    blob = nothing
+    for kv in metadata
+        first(kv) == STATS_KEY && (blob = last(kv))
+    end
     blob === nothing && return nothing
     localbudget =
         budget === nothing ? AllocationBudget(limits.max_total_allocated_bytes) : budget
@@ -1929,11 +1919,18 @@ One-sided may-contain evaluation of a scan predicate against one batch's
 column statistics: `false` means PROVABLY no row qualifies (prune); `true`
 means fetch and let the residual filter decide. Comparisons follow SQL
 missing semantics — null rows never satisfy a comparison, so an all-null
-column proves compare/`in_` predicates false.
+column proves comparison/`colin` predicates false.
 """
 function _maypass(e::Tables.ScanExpr, stats, names, rowcount::Union{Missing,Int64})
     function lookup(col)
-        i = Tables._findcol(names, col.ref)
+        ref = col.ref
+        i = if ref isa Int
+            1 <= ref <= length(names) ? ref : nothing
+        elseif ref isa String
+            findfirst(nm -> String(nm) == ref, names)
+        else
+            findfirst(==(ref), names)
+        end
         return i === nothing ? nothing : get(stats, i, nothing)
     end
     allnull(s) = s.nullcount !== missing && rowcount !== missing && s.nullcount >= rowcount

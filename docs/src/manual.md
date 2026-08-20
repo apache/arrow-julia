@@ -31,11 +31,16 @@ reads and writes the IPC stream and file formats, exchanges in-memory data
 with other implementations through the C data and C stream interfaces, and
 presents everything to Julia through the [Tables.jl](https://tables.juliadata.org)
 interface. Until `Tables.Scan` ships in a Tables.jl release, Arrow.jl 3.0
-needs Tables.jl's `jq/scan` branch:
-`Pkg.add(url="https://github.com/JuliaData/Tables.jl", rev="jq/scan")`.
+needs the pinned Tables.jl development revision:
 
 ```julia
-using Arrow, Tables
+import Pkg
+Pkg.add(url="https://github.com/JuliaData/Tables.jl",
+        rev="64268c6a316e380cc3da26965f440a5433ebc1f7")
+```
+
+```julia
+using Arrow, Tables, DataAPI
 
 Arrow.write("data.arrow", (a = [1, 2, 3], b = ["x", "y", missing]))
 tbl = Arrow.Table("data.arrow")
@@ -68,8 +73,9 @@ Tables.schema(tbl)
 tbl.a                                      # property access = a column
 Tables.getcolumn(tbl, :b)
 length(tbl)                                # number of rows
-DataFrame(tbl)                             # any Tables.jl sink
 ```
+
+Pass `tbl` directly to any Tables.jl-compatible sink.
 
 Columns are **materialized**: each column is a plain Julia `Vector` with a
 concrete element type determined by the Arrow schema (see [Type
@@ -123,8 +129,8 @@ dictionaries), and that is the way to process a file larger than RAM. A
 the `Stream` is constructed. A file-format `IO` or byte-vector input is
 also read to the end (the whole source is held in memory), but its record
 batches are still decoded lazily, one per iteration. `Arrow.write`
-materializes every partition before writing (see [Writing](@ref)), so it
-does not bound memory either.
+materializes every partition before writing (see
+[Writing](@ref "manual-writing")), so it does not bound memory either.
 
 ### Metadata
 
@@ -137,6 +143,17 @@ DataAPI.metadatakeys(tbl)
 DataAPI.metadata(tbl, "key")
 DataAPI.colmetadatakeys(tbl, :a)
 DataAPI.colmetadata(tbl, :a, "key")
+```
+
+Arrow IPC permits duplicate field names. Use integer column positions for
+such a table. Name-based property access, `Tables.getcolumn`, and DataAPI
+column metadata access are ambiguous and throw an `ArgumentError`. Scan
+pushdown also refuses duplicate names. Positional access preserves every
+column and its metadata:
+
+```julia
+Tables.getcolumn(tbl, 1)
+DataAPI.colmetadata(tbl, 1, "key")
 ```
 
 ### Type mapping when reading
@@ -200,7 +217,7 @@ columns to keep, which rows qualify, and how many — and pushes it down into
 the reader:
 
 ```julia
-using Tables: Scan, col, coleq, in_, isnull
+using Tables: Scan, col, colcmp, colin, isnull
 
 scan = Scan(select = (:id, :amount),
             filter = (col(:amount) > 100) & !isnull(col(:id)),
@@ -214,7 +231,7 @@ tbl = Arrow.Table("orders.arrow"; scan = scan)
   columns the filter references) are decoded; everything else is skipped
   without being sliced, decompressed, or validated.
 * `filter`: an expression over `Tables.col` — comparisons against literals
-  (`>`, `>=`, `<`, `<=`, `coleq`, `colne`), `in_`, `isnull`, string
+  (`>`, `>=`, `<`, `<=`, `colcmp`), `colin`, `isnull`, string
   predicates, combined with `&`, `|`, `!`. A row is kept iff the predicate
   is exactly `true` (`missing` excludes, SQL-style).
 * `limit`/`offset`: applied to qualifying rows.
@@ -278,7 +295,7 @@ Without a scan the whole object is read, as is a stream-format object (no
 footer) and a scan that cannot be pushed down. Arrow.jl has no HTTP or
 cloud dependency of its own.
 
-## Writing
+## [Writing](@id manual-writing)
 
 ### `Arrow.write`
 
@@ -334,6 +351,7 @@ can appear at any nesting depth — is:
 | `String` | Utf8 |
 | `Vector{T}` for core `T` (including `Vector{UInt8}`) | List of the mapping of `T` |
 | `Union{Missing, T}` for core `T` | the mapping of `T`, nullable |
+| `Missing` | Null |
 
 At the *top level* of a column the facade adds:
 
@@ -353,10 +371,21 @@ The top-level conversions do not recurse: a `Vector{Date}` inside a list, a
 are refused with an `ArgumentError` naming the element type. A column with
 element type `Any` is narrowed once (recovering list columns of a common
 element type) and refused if it cannot be narrowed to a writable type.
-When the source is an `Arrow.Table` or `Arrow.Stream`, the writer *retains*
-the Arrow schema it was read with — temporal units, dictionary encoding,
-nested list descriptors, nullability, and metadata all survive a read/write
-round trip.
+When the source is an `Arrow.Table` or `Arrow.Stream`, the writer retains the
+compatible Arrow descriptor tree. Temporal units, byte and list widths,
+Struct, Map, Run-End Encoding, nullability, field metadata, schema metadata,
+and top-level dictionary index types and category order survive a read/write
+round trip. Buffer sharing, overlapping ListView ranges, and exact run
+segmentation are rebuilt into a canonical form without changing logical
+values.
+
+Two layouts lose information when the facade materializes them. Union child
+type IDs and offsets are not present in the Julia values, and a nested
+dictionary's pool is not retained. Writing either case from a materialized
+`Table` fails with a clear `ArgumentError` instead of changing its meaning.
+Top-level dictionaries, including dictionaries of composite values, are
+retained on a full read. A scan result may not carry the hidden source pool;
+an ordered dictionary then fails instead of inventing category order.
 
 ### ArrowStrings columns
 
@@ -365,10 +394,10 @@ round trip.
 `ArrowString`, a 16-byte string value that *is* an Arrow StringView entry
 (inline up to 12 bytes, otherwise a prefix plus buffer index and offset),
 and `ArrowStringVector`, a column of them over a set of byte buffers —
-which *is* an Arrow Utf8View array's memory. CSV.jl parses string columns
-into this representation, so `Arrow.write` on such a column wraps its
-payload vector and buffers as the Arrow column without copying or
-materializing a single `String`.
+which *is* an Arrow Utf8View array's memory. A parser or other producer can
+build this representation directly. `Arrow.write` then wraps its payload
+vector and buffers as the Arrow column without repacking them or
+materializing a `String`.
 
 ## Validation
 
@@ -397,12 +426,12 @@ process without copying: a pair of C structs (`ArrowSchema`, `ArrowArray`)
 or a stream struct (`ArrowArrayStream`) is filled by a producer and read by
 a consumer, and ownership is transferred with a release callback.
 
-Arrow.jl exposes both interfaces at the level of the engine's column
-representation (a `Field` describing the type and an `ArrayData` holding
-the buffers), which every Julia column read by `Arrow.Table` is built from.
-Those types, and the `Arrow.ArrowCore.fromjulia` builder used below to make
-one, are the engine's currency: they are the argument and return types of
-this API but are not otherwise part of the public surface.
+Arrow.jl exposes a low-level interface over `Arrow.Field`, `Arrow.ArrayData`,
+`Arrow.Schema`, and `Arrow.RecordBatch`. These names and the exact ABI structs
+`Arrow.CArrowSchema`, `Arrow.CArrowArray`, and `Arrow.CArrowArrayStream` are
+public but not exported. Qualify them with `Arrow.`. `Arrow.fromjulia` and
+`Arrow.batch` build engine values from Julia columns, and `Arrow.materialize`
+converts imported column data back to a Julia vector.
 
 * `Arrow.to_c_data(field, data) -> (schemaptr, arrayptr)` exports one
   column; the structs stay valid until the consumer calls their `release`
@@ -423,14 +452,16 @@ For example, handing a column to PyArrow in-process through PythonCall:
 using Arrow, PythonCall
 pa = pyimport("pyarrow")
 
-f, d = Arrow.ArrowCore.fromjulia("x", [1, 2, missing, 4])
+f, d = Arrow.fromjulia("x", [1, 2, missing, 4])
 sp, ap = Arrow.to_c_data(f, d)
 pyarr = pa.Array._import_from_c(UInt(ap), UInt(sp))     # PyArrow now owns the structs
 pyarr.to_pylist()                                        # [1, 2, None, 4]
 ```
 
-The conformance suite under `conformance/` round-trips every layout the
-format defines through PyArrow over exactly this path, in both directions.
+The conformance suite under `conformance/` round-trips the supported layout
+families through PyArrow over this path in both directions. It records
+explicit skips for invalid fixtures, layouts an external oracle cannot
+construct or import, and features that Arrow.jl intentionally rejects.
 
 ## Compiling with JuliaC `--trim`
 
@@ -445,22 +476,7 @@ needs Julia 1.12, so the gate runs only there. The dynamic facade
 conveniences (property access on `Arrow.Table`, `NamedTuple` rows) are not
 part of that guarantee.
 
-## Differences from Arrow.jl 2.x
+## Updating from Arrow.jl 2.x
 
-Arrow.jl 3.0 is a new implementation. The everyday surface — `Arrow.Table`,
-`Arrow.Stream`, `Arrow.write`, `Arrow.DictEncode`, Tables.jl integration,
-compression, metadata — is the same in spirit, with these differences:
-
-* **Columns are plain `Vector`s.** 2.x returned lazy `ArrowVector` views
-  over the mapped bytes; 3.0 materializes columns with concrete element
-  types (the mapping tables above), and the source may be released with
-  `Arrow.close!` at any time afterward.
-* **Scan pushdown and byte-range reads** (`Tables.Scan`,
-  `AbstractArrowSource`, the CloudStore.jl extension) are new.
-* **Not present in 3.0**: `Arrow.Writer`/`Arrow.append` (incremental and
-  append-to-file writing), multithreaded encoding (`ntasks`), the
-  `convert=false` lazy read mode, `Arrow.ToArrow`, and ArrowTypes.jl
-  custom-type serialization: a `NamedTuple` column is written as a Struct
-  column of its fields, and other Julia structs are not writable. Big-endian
-  and delta-dictionary IPC streams are refused.
-* **The C data and C stream interfaces** are new.
+Arrow.jl 3.0 changes the storage model and removes some advanced Arrow 2.x
+write features. Read [Migrating from Arrow.jl 2.x](@ref) before you update.

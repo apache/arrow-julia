@@ -392,6 +392,12 @@ end
             )
             @test uf.children[1].type == IntType(8, false)
             @test isequal(materialize(uf, ud), [missing, missing])
+
+            nf, nd = fromjulia("null-list", [Missing[missing, missing], Missing[]])
+            @test nf.children[1].type isa NullType
+            @test nf.children[1].nullable
+            @test isequal(materialize(nf, nd), [Missing[missing, missing], Missing[]])
+            @test_throws ArgumentError fromjulia("bottom", Union{}[])
         end
 
         @testset "struct" begin

@@ -192,7 +192,7 @@ end
         fb = take!(io)
         t = Arrow.Table(
             fb;
-            scan=Tables.Scan(select=(:y,), filter=Tables.coleq(Tables.col(:x), 42)),
+            scan=Tables.Scan(select=(:y,), filter=Tables.colcmp(==, Tables.col(:x), 42)),
         )
         @test Tables.columnnames(t) == [:y]
         @test t.y == ["42"]
@@ -201,7 +201,7 @@ end
         Arrow.write(io2, (x=collect(Int64, 1:100), y=string.(1:100)); file=false)
         t2 = Arrow.Table(
             take!(io2);
-            scan=Tables.Scan(select=(:y,), filter=Tables.coleq(Tables.col(:x), 42)),
+            scan=Tables.Scan(select=(:y,), filter=Tables.colcmp(==, Tables.col(:x), 42)),
         )
         @test t2.y == ["42"]
         # Renames land as output names.
@@ -363,7 +363,7 @@ end
         io3 = IOBuffer()
         Arrow.write(io3, (x=Int64[1],); file=false)
         b3 = take!(io3)
-        t3 = Arrow.Table(b3; scan=Tables.Scan(filter=Tables.coleq(Tables.col(:x), 99)))
+        t3 = Arrow.Table(b3; scan=Tables.Scan(filter=Tables.colcmp(==, Tables.col(:x), 99)))
         @test eltype(t3.x) == Int64 && isempty(t3.x)
     end
 
@@ -381,7 +381,7 @@ end
         Arrow.write(fio, data)
         sio = IOBuffer()
         Arrow.write(sio, data; file=false)
-        scan = Tables.Scan(filter=Tables.coleq(Tables.col(:date), Date(2024, 1, 3)))
+        scan = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:date), Date(2024, 1, 3)))
         want = Tables.scan(data, scan)
         for bytes in (take!(fio), take!(sio))
             got = Arrow.Table(bytes; scan=scan)
@@ -503,19 +503,19 @@ end
             # Date32 vs midnight DateTime: cross-type equality holds
             Tables.Scan(
                 select=(:x,),
-                filter=Tables.coleq(Tables.col(:d32), DateTime(1970, 1, 2)),
+                filter=Tables.colcmp(==, Tables.col(:d32), DateTime(1970, 1, 2)),
             ),
             # Timestamp vs Date
             Tables.Scan(
                 select=(:x,),
-                filter=Tables.coleq(Tables.col(:ts), Date(2020, 1, 2)),
+                filter=Tables.colcmp(==, Tables.col(:ts), Date(2020, 1, 2)),
             ),
             # raw integer vs a temporal column: never equal in public domain
-            Tables.Scan(select=(:x,), filter=Tables.coleq(Tables.col(:d32), 1)),
+            Tables.Scan(select=(:x,), filter=Tables.colcmp(==, Tables.col(:d32), 1)),
             # non-midnight DateTime vs Date32: no exact representation
             Tables.Scan(
                 select=(:x,),
-                filter=Tables.coleq(Tables.col(:d32), DateTime(1970, 1, 2, 12)),
+                filter=Tables.colcmp(==, Tables.col(:d32), DateTime(1970, 1, 2, 12)),
             ),
         ]
         for scan in cases
@@ -655,9 +655,9 @@ end
         data = (us=us,)
         for scan in (
             Tables.Scan(
-                filter=Tables.coleq(Tables.col(:us), DateTime(1970, 1, 1, 0, 0, 1)),
+                filter=Tables.colcmp(==, Tables.col(:us), DateTime(1970, 1, 1, 0, 0, 1)),
             ),
-            Tables.Scan(filter=Tables.coleq(Tables.col(:us), 2_000_000)),
+            Tables.Scan(filter=Tables.colcmp(==, Tables.col(:us), 2_000_000)),
         )
             want = Tables.scan(data, scan)
             got = Arrow.Table(bytes; scan=scan)
@@ -670,8 +670,8 @@ end
         Arrow.write(io, pdata)
         pb = take!(io)
         for scan in (
-            Tables.Scan(filter=Tables.coleq(Tables.col(:d), Date(6_000_000, 1, 1))),
-            Tables.Scan(filter=Tables.coleq(Tables.col(:s), Month(1))),
+            Tables.Scan(filter=Tables.colcmp(==, Tables.col(:d), Date(6_000_000, 1, 1))),
+            Tables.Scan(filter=Tables.colcmp(==, Tables.col(:s), Month(1))),
         )
             want = Tables.scan(pdata, scan)
             got = Arrow.Table(pb; scan=scan)
@@ -721,12 +721,15 @@ end
         zb = Arrow.writefile(sch, [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 3)])
         tz = Arrow.Table(
             zb;
-            scan=Tables.Scan(filter=Tables.coleq(Tables.col(:nope), 1), validate=false),
+            scan=Tables.Scan(
+                filter=Tables.colcmp(==, Tables.col(:nope), 1),
+                validate=false,
+            ),
         )
         @test Tables.rowcount(tz) == 0
         @test_throws ArgumentError Arrow.Table(
             zb;
-            scan=Tables.Scan(filter=Tables.coleq(Tables.col(:nope), 1)),
+            scan=Tables.Scan(filter=Tables.colcmp(==, Tables.col(:nope), 1)),
         )
         # ranged zero-field honors SourceFile limits
         rfz = Arrow.SourceFile(_BytesSource(zb); limits=Arrow.Limits(max_array_length=2))

@@ -65,6 +65,12 @@
 # ABI structs (field-exact per https://arrow.apache.org/docs/format/CDataInterface.html)
 # ---------------------------------------------------------------------------
 
+"""
+    CArrowSchema
+
+The field-exact Julia representation of the Arrow C data interface's
+`ArrowSchema` ABI struct.
+"""
 struct CArrowSchema
     format::Ptr{UInt8}
     name::Ptr{UInt8}
@@ -77,6 +83,12 @@ struct CArrowSchema
     private_data::Ptr{Cvoid}
 end
 
+"""
+    CArrowArray
+
+The field-exact Julia representation of the Arrow C data interface's
+`ArrowArray` ABI struct.
+"""
 struct CArrowArray
     length::Int64
     null_count::Int64
@@ -1468,6 +1480,12 @@ end
 # stream spec itself declares the structure not thread-safe). There is no
 # marshaling to a Julia-owned worker for foreign-thread callers.
 
+"""
+    CArrowArrayStream
+
+The field-exact Julia representation of the Arrow C stream interface's
+`ArrowArrayStream` ABI struct.
+"""
 struct CArrowArrayStream
     get_schema::Ptr{Cvoid}     # int (*)(ArrowArrayStream*, ArrowSchema* out)
     get_next::Ptr{Cvoid}       # int (*)(ArrowArrayStream*, ArrowArray* out)
@@ -1858,14 +1876,10 @@ function _release_moved_stream_owner!(o::StreamOwner)
     return nothing
 end
 
-"""
-    release!(o::StreamOwner)
-
-Run the moved stream's producer release callback on the malloc'd struct
-copy, check that the producer nulled the copy's release field, and free the
-copy. Exactly-once: one atomic swap picks the single releaser between
-explicit calls and the GC finalizer.
-"""
+# Run the moved stream's producer release callback on the malloc'd struct
+# copy, check that the producer nulled the copy's release field, and free the
+# copy. Exactly one atomic swap picks the single releaser between explicit
+# calls and the GC finalizer.
 function release!(o::StreamOwner)
     @atomicswap(o.released = true) && return nothing
     GC.@preserve o begin
@@ -1897,9 +1911,25 @@ mutable struct ImportedStream <: AC.RecordBatchSource
     const batchfield::Field
     const schema::Schema
     done::Bool
+    @atomic pulling::Bool
 end
 
+ImportedStream(owner, batchfield, schema, done) =
+    ImportedStream(owner, batchfield, schema, done, false)
+
 AC.schema(s::ImportedStream) = s.schema
+
+function _claimstreamcall!(s::ImportedStream)
+    _, ok = @atomicreplace s.pulling false => true
+    ok || throw(
+        Base.ConcurrencyViolationError(
+            "ImportedStream supports only one active stream call",
+        ),
+    )
+    return nothing
+end
+
+_finishstreamcall!(s::ImportedStream) = (@atomic :release s.pulling = false)
 
 """
     release!(s::ImportedStream)
@@ -1908,7 +1938,14 @@ Run the producer's stream release callback exactly once (later calls and the
 GC finalizer are no-ops); batches already pulled keep their own owners and
 stay valid.
 """
-release!(s::ImportedStream) = release!(s.owner)
+function release!(s::ImportedStream)
+    _claimstreamcall!(s)
+    try
+        return release!(s.owner)
+    finally
+        _finishstreamcall!(s)
+    end
+end
 
 function _stream_call_failed(o::StreamOwner, what::AbstractString)
     msg = "C stream $what failed"
@@ -1986,62 +2023,71 @@ end
 AC.nextbatch!(s::ImportedStream) = _nextbatch!(s, ForeignOwner)
 
 function _nextbatch!(s::ImportedStream, ownerfactory)
-    # Fail closed on a released stream even when it already ended naturally:
-    # release terminates the consumer contract, not just the batch supply.
-    (@atomic s.owner.released) && throw(ArgumentError("cannot pull from a released stream"))
-    s.done && return nothing
-    out = Ref(
-        CArrowArray(
-            0,
-            0,
-            0,
-            0,
-            0,
-            Ptr{Ptr{Cvoid}}(C_NULL),
-            Ptr{Ptr{CArrowArray}}(C_NULL),
-            Ptr{CArrowArray}(C_NULL),
-            Ptr{Cvoid}(C_NULL),
-            Ptr{Cvoid}(C_NULL),
-        ),
-    )
-    status = GC.@preserve s out ccall(
-        unsafe_load(s.owner.block).get_next,
-        Cint,
-        (Ptr{CArrowArrayStream}, Ptr{CArrowArray}),
-        s.owner.block,
-        Base.unsafe_convert(Ptr{CArrowArray}, out),
-    )
-    status == 0 || _stream_call_failed(s.owner, "get_next")
-    arr = out[]
-    if arr.release == C_NULL
-        s.done = true
-        return nothing
-    end
-    # The producer filled consumer-owned storage. Build an inert destination
-    # owner first. If that construction fails, the live source slot still owns
-    # the result and must release it. Then null the source and arm the copy.
-    batchowner = try
-        ownerfactory(arr)::ForeignOwner
-    catch
-        GC.@preserve out _release_c_array!(Base.unsafe_convert(Ptr{CArrowArray}, out), arr)
-        rethrow()
-    end
-    moved = false
-    d = try
-        GC.@preserve out _store_field!(
-            Base.unsafe_convert(Ptr{CArrowArray}, out),
-            :release,
-            Ptr{Cvoid}(C_NULL),
+    _claimstreamcall!(s)
+    try
+        # Fail closed on a released stream even when it already ended naturally:
+        # release terminates the consumer contract, not just the batch supply.
+        (@atomic s.owner.released) &&
+            throw(ArgumentError("cannot pull from a released stream"))
+        s.done && return nothing
+        out = Ref(
+            CArrowArray(
+                0,
+                0,
+                0,
+                0,
+                0,
+                Ptr{Ptr{Cvoid}}(C_NULL),
+                Ptr{Ptr{CArrowArray}}(C_NULL),
+                Ptr{CArrowArray}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+            ),
         )
-        moved = true
-        _arm_foreign_owner!(batchowner)
-        _preflight_array(s.batchfield, arr)
-        d0 = _import_array(s.batchfield, arr, batchowner)
-        validate_semantic(s.batchfield, d0)
-        d0
-    catch
-        moved ? _release_moved_owner!(batchowner) : release!(batchowner)
-        rethrow()
+        status = GC.@preserve s out ccall(
+            unsafe_load(s.owner.block).get_next,
+            Cint,
+            (Ptr{CArrowArrayStream}, Ptr{CArrowArray}),
+            s.owner.block,
+            Base.unsafe_convert(Ptr{CArrowArray}, out),
+        )
+        status == 0 || _stream_call_failed(s.owner, "get_next")
+        arr = out[]
+        if arr.release == C_NULL
+            s.done = true
+            return nothing
+        end
+        # The producer filled consumer-owned storage. Build an inert destination
+        # owner first. If that construction fails, the live source slot still owns
+        # the result and must release it. Then null the source and arm the copy.
+        batchowner = try
+            ownerfactory(arr)::ForeignOwner
+        catch
+            GC.@preserve out _release_c_array!(
+                Base.unsafe_convert(Ptr{CArrowArray}, out),
+                arr,
+            )
+            rethrow()
+        end
+        moved = false
+        d = try
+            GC.@preserve out _store_field!(
+                Base.unsafe_convert(Ptr{CArrowArray}, out),
+                :release,
+                Ptr{Cvoid}(C_NULL),
+            )
+            moved = true
+            _arm_foreign_owner!(batchowner)
+            _preflight_array(s.batchfield, arr)
+            d0 = _import_array(s.batchfield, arr, batchowner)
+            validate_semantic(s.batchfield, d0)
+            d0
+        catch
+            moved ? _release_moved_owner!(batchowner) : release!(batchowner)
+            rethrow()
+        end
+        return AC.RecordBatch(s.schema, collect(ArrayData, d.children), d.len)
+    finally
+        _finishstreamcall!(s)
     end
-    return AC.RecordBatch(s.schema, collect(ArrayData, d.children), d.len)
 end

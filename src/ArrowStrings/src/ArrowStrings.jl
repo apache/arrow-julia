@@ -18,12 +18,11 @@
 """
     ArrowStrings
 
-The inline-else-view string representation shared by Arrow.jl and CSV.jl:
+An inline-else-view string representation for Arrow.jl and compatible parsers:
 `ArrowString`, a 16-byte string value that IS an Arrow StringView entry, and
 `ArrowStringVector`, a column of them over a set of byte buffers that IS an
-Arrow Utf8View array's memory. A CSV column parsed into this representation
-becomes an Arrow column without copying, and an Arrow Utf8View column comes
-back the same way.
+Arrow Utf8View array's memory. A column parsed into this representation can be
+written as an Arrow column without repacking its payloads or data buffers.
 
 Every string is one 16-byte payload (`ArrowStringPayload`, two `UInt64`
 words `a` and `b`, packed by explicit shifts so the layout is
@@ -52,6 +51,27 @@ module ArrowStrings
 
 export ArrowString, ArrowStringVector, ArrowStringPayload
 
+# Keep builders and payload accessors namespaced. Julia 1.11 tooling can still
+# distinguish this supported surface from the package's private fast paths.
+@static if VERSION >= v"1.11"
+    Core.eval(
+        @__MODULE__,
+        Expr(
+            :public,
+            :inline_payload,
+            :view_payload,
+            :rebase_payload,
+            :payloadlength,
+            :payloadbufidx,
+            :payloadoffset,
+            :payloadpos,
+            :materialize,
+            :PAYLOAD_MISSING,
+            :INLINE_MAX,
+        ),
+    )
+end
+
 """
     ArrowStringPayload
 
@@ -79,27 +99,23 @@ const EMPTY_BYTES = UInt8[]
     UInt64(bufidx % UInt32) | (UInt64(offset0 % UInt32) << 32)
 
 """
-    inline_payload(src::Vector{UInt8}, pos::Int, len::Int) -> ArrowStringPayload
+    inline_payload(src::AbstractVector{UInt8}, pos::Int, len::Int) -> ArrowStringPayload
 
 The payload of the `len` (≤ 12) bytes of `src` starting at 1-based `pos`,
 stored inline. Two overlapping little-endian loads gather up to 12 content
 bytes branch-free; the byte-loop fallback only runs within 11 bytes of the
-buffer's end (loads must not read past it).
+buffer's end. The requested byte range is checked before either path reads it.
+`src` must use one-based indexing.
 """
-@inline function inline_payload(src::Vector{UInt8}, pos::Int, len::Int)
-    0 <= len <= INLINE_MAX ||
-        throw(ArgumentError("inline_payload: length $len is not in 0:$INLINE_MAX"))
-    if pos + 11 <= length(src)
-        GC.@preserve src begin
-            p = pointer(src, pos)
-            lo = ltoh(unsafe_load(Ptr{UInt64}(p)))           # content bytes 1..8
-            hi = ltoh(unsafe_load(Ptr{UInt64}(p + 4)))       # content bytes 5..12
-        end
-        m4 = len >= 4 ? 0x00000000ffffffff : (UInt64(1) << (8 * len)) - 1
-        nb = max(len - 4, 0)
-        m8 = nb >= 8 ? typemax(UInt64) : (UInt64(1) << (8 * nb)) - 1
-        return ArrowStringPayload(UInt64(len % UInt32) | ((lo & m4) << 32), hi & m8)
-    end
+@inline function _checkrange(src::AbstractVector, pos::Int, len::Int, label::String)
+    Base.require_one_based_indexing(src)
+    n = length(src)
+    (1 <= pos <= n + 1 && len <= n - pos + 1) ||
+        throw(BoundsError("$label: range starts at $pos with length $len in $n bytes"))
+    return nothing
+end
+
+@inline function _inline_payload_loop(src::AbstractVector{UInt8}, pos::Int, len::Int)
     a = UInt64(len % UInt32)
     b = zero(UInt64)
     @inbounds for i = 1:min(len, 4)
@@ -111,18 +127,42 @@ buffer's end (loads must not read past it).
     return ArrowStringPayload(a, b)
 end
 
-"""
-    view_payload(src::Vector{UInt8}, srcpos::Int, len::Int, bufidx, offset0) -> ArrowStringPayload
+@inline function inline_payload(src::AbstractVector{UInt8}, pos::Int, len::Int)
+    0 <= len <= INLINE_MAX ||
+        throw(ArgumentError("inline_payload: length $len is not in 0:$INLINE_MAX"))
+    _checkrange(src, pos, len, "inline_payload")
+    return _inline_payload_loop(src, pos, len)
+end
 
-The payload of a view: `len` (> 12) bytes whose content sits at 1-based
-`srcpos` in `src` (where the 4-byte prefix is read from) and is addressed by
-the entry's Arrow words — buffer index `bufidx` and 0-based byte `offset0`
-within that buffer. Refuses a length or word that does not fit Arrow's
-Int32 (buffers must stay under 2 GiB) — an oversized length would otherwise
-wrap into the null marker.
+@inline function inline_payload(src::Vector{UInt8}, pos::Int, len::Int)
+    0 <= len <= INLINE_MAX ||
+        throw(ArgumentError("inline_payload: length $len is not in 0:$INLINE_MAX"))
+    _checkrange(src, pos, len, "inline_payload")
+    if pos <= length(src) - 11
+        GC.@preserve src begin
+            p = pointer(src, pos)
+            lo = ltoh(unsafe_load(Ptr{UInt64}(p)))           # content bytes 1..8
+            hi = ltoh(unsafe_load(Ptr{UInt64}(p + 4)))       # content bytes 5..12
+        end
+        m4 = len >= 4 ? 0x00000000ffffffff : (UInt64(1) << (8 * len)) - 1
+        nb = max(len - 4, 0)
+        m8 = nb >= 8 ? typemax(UInt64) : (UInt64(1) << (8 * nb)) - 1
+        return ArrowStringPayload(UInt64(len % UInt32) | ((lo & m4) << 32), hi & m8)
+    end
+    return _inline_payload_loop(src, pos, len)
+end
+
+"""
+    view_payload(src::AbstractVector{UInt8}, srcpos::Int, len::Int, bufidx, offset0) -> ArrowStringPayload
+
+The payload of a view. The first four content bytes sit at 1-based `srcpos`
+in `src`; the complete `len` (> 12) bytes are addressed by buffer index
+`bufidx` and 0-based byte `offset0`. The prefix range is checked. A length or
+word that does not fit Arrow's Int32 is refused because an oversized value
+would wrap into the null marker. `src` must use one-based indexing.
 """
 @inline function view_payload(
-    src::Vector{UInt8},
+    src::AbstractVector{UInt8},
     srcpos::Int,
     len::Int,
     bufidx::Integer,
@@ -139,8 +179,10 @@ wrap into the null marker.
             "does not fit Arrow's Int32 view words; buffers must stay under 2 GiB",
         ),
     )
-    GC.@preserve src begin
-        pre = ltoh(unsafe_load(Ptr{UInt32}(pointer(src, srcpos))))
+    _checkrange(src, srcpos, 4, "view_payload")
+    pre = zero(UInt32)
+    @inbounds for i = 0:3
+        pre |= UInt32(src[srcpos + i]) << (8 * i)
     end
     a = UInt64(len % UInt32) | (UInt64(pre) << 32)
     return ArrowStringPayload(a, _viewword(bufidx, offset0))
@@ -153,7 +195,18 @@ The same view entry re-pointed `base` bytes further into its buffer — what
 concatenating buffers (a chunk's buffer appended to a column's) needs.
 """
 @inline function rebase_payload(p::ArrowStringPayload, base::Integer)
-    off = Int(payloadoffset(p)) + Int(base)
+    payloadlength(p) > INLINE_MAX ||
+        throw(ArgumentError("rebase_payload requires an out-of-line view payload"))
+    shift = try
+        Int(base)
+    catch
+        throw(ArgumentError("ArrowString view offset adjustment $base does not fit Int"))
+    end
+    off = try
+        Base.checked_add(Int(payloadoffset(p)), shift)
+    catch
+        throw(ArgumentError("rebased ArrowString view offset overflow"))
+    end
     0 <= off <= typemax(Int32) || throw(
         ArgumentError(
             "rebased ArrowString view offset $off does not fit " *
@@ -161,6 +214,45 @@ concatenating buffers (a chunk's buffer appended to a column's) needs.
         ),
     )
     return ArrowStringPayload(p.a, _viewword(payloadbufidx(p), off))
+end
+
+@inline _inlinebyte(p::ArrowStringPayload, i::Int) =
+    i <= 4 ? (p.a >> (32 + 8 * (i - 1))) % UInt8 : (p.b >> (8 * (i - 5))) % UInt8
+
+function _validate_payload(
+    p::ArrowStringPayload,
+    data::Vector{UInt8};
+    missingok::Bool=false,
+)
+    len = payloadlength(p)
+    if len < 0
+        missingok && p == PAYLOAD_MISSING ||
+            throw(ArgumentError("invalid missing ArrowString payload"))
+        return nothing
+    end
+    if len <= INLINE_MAX
+        for i = (Int(len) + 1):INLINE_MAX
+            iszero(_inlinebyte(p, i)) ||
+                throw(ArgumentError("inline ArrowString payload has nonzero padding"))
+        end
+        return nothing
+    end
+    off = Int(payloadoffset(p))
+    0 <= off <= length(data) || throw(
+        ArgumentError(
+            "ArrowString view offset $off is outside a $(length(data))-byte buffer",
+        ),
+    )
+    Int(len) <= length(data) - off || throw(
+        ArgumentError(
+            "ArrowString view of length $len at offset $off escapes a $(length(data))-byte buffer",
+        ),
+    )
+    @inbounds for i = 0:3
+        _inlinebyte(p, i + 1) == data[off + i + 1] ||
+            throw(ArgumentError("ArrowString view prefix does not match its data buffer"))
+    end
+    return nothing
 end
 
 """
@@ -175,7 +267,16 @@ bytes or the retained buffer. Hashing and ordering agree with `String`.
 struct ArrowString <: AbstractString
     p::ArrowStringPayload
     data::Vector{UInt8}    # dereferenced only when the payload is a view
+    function ArrowString(p::ArrowStringPayload, data::Vector{UInt8})
+        _validate_payload(p, data)
+        return new(p, data)
+    end
+    ArrowString(p::ArrowStringPayload, data::Vector{UInt8}, ::Val{:unchecked}) =
+        new(p, data)
 end
+
+@inline _unchecked_arrowstring(p::ArrowStringPayload, data::Vector{UInt8}) =
+    ArrowString(p, data, Val(:unchecked))
 
 Base.ncodeunits(s::ArrowString) = Int(payloadlength(s.p))
 Base.codeunit(::ArrowString) = UInt8
@@ -417,15 +518,47 @@ payloads point into (`buffers[bufidx + 1]` for an entry's buffer index).
 `Union{Missing, ArrowString}`. `getindex` returns an `ArrowString` (or
 `missing`) with NO allocation; `materialize` copies out to `Vector{String}`.
 
+Construction validates every payload, including missing markers, inline
+padding, buffer indices, byte ranges, and long-string prefixes. This makes
+later zero-copy access safe. Do not resize or mutate the payload vector or any
+buffer while the column is in use.
+
 This is an Arrow Utf8View array's memory: `payloads` is its views buffer and
-`buffers` its variadic data buffers, so the column crosses to Arrow (and an
-Arrow Utf8View column comes back) without copying. The two-buffer
-constructor is the CSV shape: buffer 0 the input, buffer 1 the column's
-`extra` buffer of unescaped values.
+`buffers` its variadic data buffers, so Arrow.jl can write the column without
+repacking either one. The two-buffer constructor is the CSV shape: buffer 0
+the input, buffer 1 the column's `extra` buffer of unescaped values.
 """
 struct ArrowStringVector{ELT} <: AbstractVector{ELT}
     payloads::Vector{ArrowStringPayload}
     buffers::Vector{Vector{UInt8}}
+    function ArrowStringVector{ELT}(
+        payloads::Vector{ArrowStringPayload},
+        buffers::Vector{Vector{UInt8}},
+    ) where {ELT}
+        (ELT === ArrowString || ELT === Union{Missing,ArrowString}) || throw(
+            ArgumentError(
+                "ArrowStringVector element type must be ArrowString or Union{Missing,ArrowString}",
+            ),
+        )
+        missingok = Missing <: ELT
+        for p in payloads
+            len = payloadlength(p)
+            if len < 0
+                _validate_payload(p, EMPTY_BYTES; missingok=missingok)
+            elseif len <= INLINE_MAX
+                _validate_payload(p, EMPTY_BYTES)
+            else
+                bufidx = Int(payloadbufidx(p))
+                0 <= bufidx < length(buffers) || throw(
+                    ArgumentError(
+                        "ArrowString view buffer index $bufidx is outside 0:$(length(buffers) - 1)",
+                    ),
+                )
+                _validate_payload(p, buffers[bufidx + 1])
+            end
+        end
+        return new{ELT}(payloads, buffers)
+    end
 end
 ArrowStringVector{ELT}(
     payloads::Vector{ArrowStringPayload},
@@ -442,8 +575,8 @@ Base.@propagate_inbounds @inline function Base.getindex(
     @inbounds p = v.payloads[i]
     len = payloadlength(p)
     len < 0 && return missing
-    len <= INLINE_MAX && return ArrowString(p, EMPTY_BYTES)
-    return ArrowString(p, v.buffers[payloadbufidx(p) + 1])
+    len <= INLINE_MAX && return _unchecked_arrowstring(p, EMPTY_BYTES)
+    return _unchecked_arrowstring(p, v.buffers[payloadbufidx(p) + 1])
 end
 # All-present columns skip the missing branch entirely — the concrete return
 # type is what lets access compile down to zero allocations.
@@ -454,8 +587,8 @@ Base.@propagate_inbounds @inline function Base.getindex(
     @boundscheck checkbounds(v.payloads, i)
     @inbounds p = v.payloads[i]
     len = payloadlength(p)
-    len <= INLINE_MAX && return ArrowString(p, EMPTY_BYTES)
-    return ArrowString(p, v.buffers[payloadbufidx(p) + 1])
+    len <= INLINE_MAX && return _unchecked_arrowstring(p, EMPTY_BYTES)
+    return _unchecked_arrowstring(p, v.buffers[payloadbufidx(p) + 1])
 end
 
 """

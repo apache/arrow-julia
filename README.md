@@ -17,68 +17,90 @@
   under the License.
 -->
 
-> **This is the Arrow.jl 3.0 development branch.** The last 2.x release
-> lives on its release tags. `Arrow.Table`, `Arrow.Stream`, `Arrow.write`,
-> `Arrow.close!`, the byte-range readers and the C data / C stream entry
-> points are the public surface (see `docs/src/reference.md`); the engine
-> beneath them is exercised by the test batteries, the apache/arrow-testing
-> conformance corpus, and the pyarrow/nanoarrow oracle suites. Until
-> `Tables.Scan` ships in a Tables.jl release, this branch needs Tables.jl's
-> `jq/scan` branch: `Pkg.add(url="https://github.com/JuliaData/Tables.jl", rev="jq/scan")`.
+# Arrow.jl
 
-This is a pure Julia implementation of the
-[Apache Arrow](https://arrow.apache.org) data standard.
+[![Documentation](https://img.shields.io/badge/docs-latest-blue?logo=julia)](https://arrow.apache.org/julia/)
+[![CI](https://github.com/apache/arrow-julia/actions/workflows/ci.yml/badge.svg)](https://github.com/apache/arrow-julia/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/apache/arrow-julia/branch/main/graph/badge.svg)](https://codecov.io/gh/apache/arrow-julia)
 
-## Layout
+Arrow.jl is a pure Julia implementation of the
+[Apache Arrow](https://arrow.apache.org) columnar data standard. It reads and
+writes Arrow IPC files and streams. It also supports the Arrow C data and C
+stream interfaces, Tables.jl, compressed buffers, and selective byte-range
+reads.
 
-- `src/ArrowCore.jl` — the private core: ownership regions, layout
-  registry, `ArrayData`, staged validation, accessors. Dependency-free and
-  trim-friendly.
-- `src/metadata/` — FlatBuffers metadata bindings and shape verifier,
-  both GENERATED from the vendored spec schemas (`src/metadata/fbs/`) by
-  `tools/fbsgen.jl`.
-- `src/ipc_read.jl`, `src/ipc_write.jl` — the IPC stream and file
-  formats: framing, resource limits, compression, dictionary lifecycles.
-- `src/cdata.jl` — the C data and C stream interfaces, import and export.
-- `src/source.jl` — the `AbstractArrowSource` interface: what a
-  byte-range-addressable object (cloud storage, HTTP, …) provides so
-  `Arrow.Table` can fetch only the bytes a scan touches.
-- `src/scan.jl` — `Tables.Scan` pushdown over byte ranges plus
-  footer-carried statistics pruning.
-- `src/table.jl`, `src/write.jl` — the public facade: `Arrow.Table`,
-  `Arrow.Stream`, `Arrow.write`, `close!`.
-- `ext/ArrowCloudStoreExt.jl` — CloudStore.jl objects as sources (S3,
-  Azure Blob Storage) with concurrent range reads.
-- `src/FlatBuffers/` — the vendored FlatBuffers runtime the generated
-  bindings run over.
-- `src/ArrowStrings/` — ArrowStrings.jl, a separate package (to be
-  registered on its own, like `src/ArrowTypes/`; until its first release
-  Arrow depends on it through the `[sources]` path entry in `Project.toml`):
-  the inline-else-view string representation shared with CSV.jl, whose
-  column memory is an Arrow Utf8View array.
-- `bench/` — the serialize/deserialize benchmark harness (this package,
-  Arrow.jl 2.x, PyArrow) over identical workloads.
-- `test/` — core unit tests, the facade tests, the four adapter acceptance
-  batteries, the frozen 2.x-written compatibility fixtures
-  (`test/fixtures2x/`), and the `--trim=safe` compile gate.
-- `conformance/` — the arrow-testing gold-corpus runner, the integration
-  JSON implementation, the pyarrow/nanoarrow IPC oracle round-trip suite,
-  and the in-process pyarrow C Data / C Stream oracle — all run inside one
-  docker image by `conformance/run.jl` (Harbor.jl); docker is the only
-  host requirement (plus network on the first run, to fetch Harbor.jl and
-  build the image).
-- `docs/src/` — the published user manual and API reference (`docs/make.jl`).
-- `docs/dev/` — the engine design document, the scan/ranged-fetch design
-  notes, the FlatBuffers/C-data research notes, and the review record.
+> [!IMPORTANT]
+> This is the Arrow.jl 3.0 development branch. Arrow 3.0 is not registered
+> yet. It requires a Tables.jl release that contains `Tables.Scan` and the
+> first registered ArrowStrings.jl release. Until then, a checkout must use
+> the local `src/ArrowStrings` package and the pinned Tables.jl development
+> commit shown below.
 
-The design rationale for every layer is `docs/dev/core-README.md`.
+## Installation
 
-## Status
+Install the latest registered release from the Julia REPL:
 
-Conformance: 275/275 gold-corpus checks pass (36 declared skips);
-170/170 IPC oracle round-trips against pyarrow and nanoarrow (43 skips are
-oracle capability gaps); 143/143 C Data and C Stream interface round-trips
-through an in-process pyarrow over the whole gold matrix (both directions,
-pyarrow-native memory, sliced exports; 9 declared skips). Run them all with
-`julia conformance/run.jl` (docker is the only host requirement, plus
-network on the first run).
+```julia
+import Pkg
+Pkg.add("Arrow")
+```
+
+## Quick start
+
+```julia
+using Arrow, Tables
+
+data = (id = [1, 2, 3], name = ["Ada", "Babbage", missing])
+Arrow.write("data.arrow", data)
+
+table = Arrow.Table("data.arrow")
+Tables.columnnames(table) # [:id, :name]
+collect(table.name) == ["Ada", "Babbage", missing] # true
+```
+
+`Arrow.Table` accepts a path, an `IO`, IPC bytes, or an
+`Arrow.AbstractArrowSource`. `Arrow.Stream` reads one record batch at a time.
+`Arrow.write` accepts any Tables.jl source.
+
+Arrow 3.0 includes:
+
+- IPC file and stream reads and writes.
+- LZ4 frame and Zstandard buffer compression.
+- Dictionary encoding.
+- `Tables.Scan` projection, filter, limit, and offset pushdown.
+- Sparse byte-range reads, including a CloudStore.jl extension.
+- Arrow C data and C stream import and export.
+- Structural, semantic, and optional full-content validation.
+
+Arrow 3.0 is a breaking rewrite. Read the
+[migration guide](docs/src/migration.md) before you update from Arrow 2.x.
+See the [changelog](CHANGELOG.md) for the full release summary. The
+[user manual](https://arrow.apache.org/julia/) and
+[API reference](docs/src/reference.md) describe the supported public API.
+
+## Development
+
+In a checkout of this branch, prepare the two temporary development
+dependencies and run the tests:
+
+```julia
+import Pkg
+Pkg.activate(".")
+Pkg.develop(path="src/ArrowStrings")
+Pkg.add(url="https://github.com/JuliaData/Tables.jl",
+        rev="64268c6a316e380cc3da26965f440a5433ebc1f7")
+Pkg.test()
+```
+
+The repository also has Apache Arrow gold-corpus checks, PyArrow and
+Nanoarrow IPC oracle checks, and PyArrow C interface checks. Run all of them
+with `julia conformance/run.jl`. Docker and network access for the first image
+build are required.
+
+The Arrow 3.0 rewrite used Anthropic Claude Code and OpenAI Codex for code
+generation, test generation, and review. Apache Arrow maintainers remain
+responsible for understanding, reviewing, testing, and approving the code and
+each release.
+
+See [the engine design](docs/dev/core-README.md) for the source layout and
+internal contracts.

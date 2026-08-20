@@ -22,5 +22,5 @@
 Harbor = "af79dbb9-1a80-47ad-8928-192a4af69376"
 
 [compat]
-Harbor = "1.1"
+Harbor = "=1.1.0"
 julia = "1.10"

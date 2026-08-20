@@ -124,7 +124,7 @@ jobs:
         run: |
           using Pkg
           Pkg.develop(PackageSpec(path="src/ArrowStrings"))
-          Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="jq/scan"))
+          Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="64268c6a316e380cc3da26965f440a5433ebc1f7"))
       - uses: julia-actions/julia-buildpkg@v1.6
         with:
           project: ${{ matrix.pkg.dir }}
@@ -171,11 +171,67 @@ jobs:
         run: |
           using Pkg;
           Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowTypes"), PackageSpec(path="src/ArrowStrings")])
-          Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="jq/scan"))
+          Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="64268c6a316e380cc3da26965f440a5433ebc1f7"))
       - name: Run monorepo tests
         continue-on-error: false
         run: >
           julia --color=yes --project=monorepo -e 'using Pkg; Pkg.test("Arrow")'
+  test_windows:
+    name: ${{ matrix.pkg.name }} - Julia latest - Windows - 2 threads
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg:
+          - name: Arrow.jl
+            dir: '.'
+          - name: ArrowTypes.jl
+            dir: './src/ArrowTypes'
+          - name: ArrowStrings.jl
+            dir: './src/ArrowStrings'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+          project: ${{ matrix.pkg.dir }}
+      - uses: actions/cache@v6
+        with:
+          path: ~/.julia/artifacts
+          key: windows-test-${{ hashFiles('**/Project.toml') }}
+          restore-keys: windows-test-
+      - name: Prepare Arrow.jl development dependencies
+        if: matrix.pkg.name == 'Arrow.jl'
+        shell: julia --project=. {0}
+        run: |
+          using Pkg
+          Pkg.develop(PackageSpec(path="src/ArrowStrings"))
+          Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="64268c6a316e380cc3da26965f440a5433ebc1f7"))
+      - uses: julia-actions/julia-buildpkg@v1.6
+        with:
+          project: ${{ matrix.pkg.dir }}
+      - uses: julia-actions/julia-runtest@v1
+        env:
+          JULIA_NUM_THREADS: 2
+        with:
+          project: ${{ matrix.pkg.dir }}
+  trim:
+    name: ArrowCore JuliaC trim-safe compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12.6'
+      - uses: actions/cache@v6
+        with:
+          path: ~/.julia/artifacts
+          key: trim-${{ runner.os }}-${{ hashFiles('test/trim/Project.toml') }}
+          restore-keys: trim-${{ runner.os }}-
+      - name: Compile and run the trim-safe ArrowCore workload
+        run: julia --startup-file=no --history-file=no test/trim_compile_tests.jl
   docs:
     name: Documentation
     runs-on: ubuntu-latest
@@ -185,14 +241,14 @@ jobs:
       - uses: julia-actions/setup-julia@v3
         with:
           version: '1'
-      - name: Dev local ArrowStrings and the Tables scan branch for the docs
+      - name: Prepare Arrow.jl development dependencies for the docs
         shell: julia --project=docs {0}
         run: |
           using Pkg
           Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowStrings")])
-          Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="jq/scan"))
-      - uses: julia-actions/julia-buildpkg@latest
-      - uses: julia-actions/julia-docdeploy@latest
+          Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="64268c6a316e380cc3da26965f440a5433ebc1f7"))
+      - uses: julia-actions/julia-buildpkg@v1.7.0
+      - uses: julia-actions/julia-docdeploy@v1.3.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
@@ -203,11 +259,9 @@ jobs:
       - uses: julia-actions/setup-julia@v3
       - uses: actions/checkout@v7
       - name: Install JuliaFormatter and format
-        # This will use the latest version by default but you can set the version like so:
-        # julia  -e 'using Pkg; Pkg.add(PackageSpec(name="JuliaFormatter", version="0.13.0"))'
         run: |
-          julia  -e 'using Pkg; Pkg.add(PackageSpec(name="JuliaFormatter"))'
-          julia  -e 'using JuliaFormatter; format(".", verbose=true)'
+          julia -e 'using Pkg; Pkg.add(PackageSpec(name="JuliaFormatter", version="2.12.4"))'
+          julia -e 'using JuliaFormatter; format(".", verbose=true)'
       - name: Format check
         run: |
           julia -e '

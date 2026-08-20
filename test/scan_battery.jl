@@ -177,9 +177,13 @@ function _scan_main()
         Tables.Scan(offset=10),
         Tables.Scan(select=(:ints => Float64,)),
         Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2),
-        Tables.Scan(filter=Tables.in_(Tables.col(:strs), ("hey", "last"))),
-        Tables.Scan(select=(:strs, :lists), filter=Tables.coleq(Tables.col(3), true)),
-        Tables.Scan(select=(:strs => :ints,), filter=Tables.coleq(Tables.col(4), "hey")),
+        Tables.Scan(filter=Tables.colin(Tables.col(:strs), ("hey", "last"))),
+        Tables.Scan(filter=Tables.colin(Tables.col(:strs), (missing,))),
+        Tables.Scan(select=(:strs, :lists), filter=Tables.colcmp(==, Tables.col(3), true)),
+        Tables.Scan(
+            select=(:strs => :ints,),
+            filter=Tables.colcmp(==, Tables.col(4), "hey"),
+        ),
     ]
     for scan in scans
         got = Tables.scan(af, scan)
@@ -441,7 +445,8 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         Tables.Scan(select=(:floats,), filter=Tables.col(:ints) > 2),
         Tables.Scan(offset=4, limit=3),
         Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2),
-        Tables.Scan(select=(:strs, :lists), filter=Tables.coleq(Tables.col(3), true)),
+        Tables.Scan(filter=Tables.colin(Tables.col(:strs), (missing,))),
+        Tables.Scan(select=(:strs, :lists), filter=Tables.colcmp(==, Tables.col(3), true)),
     ]
     for scan in scans
         log, src = countingsource(filebytes)
@@ -1084,11 +1089,11 @@ end
         Tables.Scan(filter=Tables.col(:x) > 7),
         Tables.Scan(select=(:s,), filter=Tables.col(:x) <= 3),
         Tables.Scan(filter=Tables.col(:x) > 100),
-        Tables.Scan(filter=Tables.in_(Tables.col(:x), (2, 4))),
+        Tables.Scan(filter=Tables.colin(Tables.col(:x), (2, 4))),
         Tables.Scan(filter=Tables.isnull(Tables.col(:x))),
         Tables.Scan(filter=Tables.startswith(Tables.col(:s), "i")),
         Tables.Scan(filter=(Tables.col(:x) > 2) & (Tables.col(:x) < 9)),
-        Tables.Scan(filter=Tables.colne(Tables.col(:x), 3)),
+        Tables.Scan(filter=Tables.colcmp(!=, Tables.col(:x), 3)),
     ]
     for scan in prunescans
         want = Tables.scan(sfull, scan)
@@ -1120,15 +1125,15 @@ end
     faf = readfile(copy(fbytes))
     ffull = _fulltable(faf)
     floatscans = Tables.Scan[
-        Tables.Scan(filter=Tables.coleq(Tables.col(:x), -0.0)),
+        Tables.Scan(filter=Tables.colcmp(==, Tables.col(:x), -0.0)),
         Tables.Scan(filter=Tables.col(:x) <= -0.0),
         Tables.Scan(filter=Tables.col(:x) >= 0.0),
-        Tables.Scan(filter=Tables.in_(Tables.col(:x), (-0.0,))),
-        Tables.Scan(filter=Tables.colne(Tables.col(:x), NaN)),
+        Tables.Scan(filter=Tables.colin(Tables.col(:x), (-0.0,))),
+        Tables.Scan(filter=Tables.colcmp(!=, Tables.col(:x), NaN)),
         # OP_NE pruning: a constant batch equal to the literal is the ONLY
         # provably prunable case; mixed batches and NaN stats must fetch.
-        Tables.Scan(filter=Tables.colne(Tables.col(:x), 0.0)),
-        Tables.Scan(filter=Tables.colne(Tables.col(:x), -0.0)),
+        Tables.Scan(filter=Tables.colcmp(!=, Tables.col(:x), 0.0)),
+        Tables.Scan(filter=Tables.colcmp(!=, Tables.col(:x), -0.0)),
     ]
     for scan in floatscans
         want = Tables.scan(ffull, scan)
@@ -1348,7 +1353,10 @@ end
             SourceFile(BytesSource(hugebytes); limits=tight),
         )
             rejected = try
-                Tables.scan(sourcefile, Tables.Scan(filter=Tables.coleq(Tables.col(:s), "x")))
+                Tables.scan(
+                    sourcefile,
+                    Tables.Scan(filter=Tables.colcmp(==, Tables.col(:s), "x")),
+                )
                 false
             catch e
                 e isa AllocationLimitError

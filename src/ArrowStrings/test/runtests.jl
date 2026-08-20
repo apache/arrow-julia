@@ -21,6 +21,17 @@ const AS = ArrowStrings
 
 # --- helpers (top-level so allocation probes measure the loop, not closures) --
 
+struct ZeroBasedBytes <: AbstractVector{UInt8}
+    data::Vector{UInt8}
+end
+Base.size(v::ZeroBasedBytes) = size(v.data)
+Base.axes(v::ZeroBasedBytes) = (0:(length(v.data) - 1),)
+Base.IndexStyle(::Type{ZeroBasedBytes}) = IndexLinear()
+function Base.getindex(v::ZeroBasedBytes, i::Int)
+    checkbounds(v, i)
+    return v.data[i + 1]
+end
+
 function asfrombytes(bytes::Vector{UInt8})
     n = length(bytes)
     n <= AS.INLINE_MAX && return ArrowString(AS.inline_payload(bytes, 1, n), AS.EMPTY_BYTES)
@@ -142,6 +153,20 @@ end
         @test_throws ArgumentError AS.view_payload(data, 3, -1, 0, 0)
         @test_throws ArgumentError AS.inline_payload(data, 1, 13)
         @test_throws ArgumentError AS.inline_payload(data, 1, -1)
+        @test AS.payloadlength(AS.inline_payload(UInt8[], 1, 0)) == 0
+        @test_throws BoundsError AS.inline_payload(UInt8[], 0, 0)
+        @test_throws BoundsError AS.inline_payload(UInt8[], 2, 0)
+        @test_throws BoundsError AS.inline_payload(UInt8[], 1, 1)
+        @test_throws BoundsError AS.inline_payload(data, length(data), 2)
+        @test_throws BoundsError AS.view_payload(data, 0, 13, 0, 0)
+        @test_throws BoundsError AS.view_payload(data, length(data) - 2, 13, 0, 0)
+        zero_based = ZeroBasedBytes(copy(data))
+        @test_throws ArgumentError AS.inline_payload(zero_based, 1, 4)
+        @test_throws ArgumentError AS.inline_payload(zero_based, 0, 4)
+        @test_throws ArgumentError AS.view_payload(zero_based, 1, 13, 0, 0)
+        @test_throws ArgumentError AS.view_payload(zero_based, 0, 13, 0, 0)
+        @test_throws ArgumentError AS.rebase_payload(p, 1)
+        @test_throws ArgumentError AS.rebase_payload(AS.PAYLOAD_MISSING, 1)
         # the byte-loop inline fallback (near the end of the buffer) agrees with
         # the two-load fast path
         long = Vector{UInt8}(codeunits("abcdefghijklmnopqrstuvwxyz"))
@@ -350,12 +375,38 @@ end
             "third buffer, longer value",
             "second",
         ]
-        # a payload naming a buffer the column does not have is a clean error
-        bad = ArrowStringVector{ArrowString}(
+        # Construction rejects every geometry that could make later
+        # zero-copy access leave a buffer.
+        @test_throws ArgumentError ArrowStringVector{ArrowString}(
             [AS.view_payload(b0, 3, 18, 7, 2)],
             Vector{UInt8}[b0],
         )
-        @test_throws BoundsError bad[1]
+        @test_throws ArgumentError ArrowStringVector{ArrowString}(
+            [AS.view_payload(b0, 3, 18, 0, 100)],
+            Vector{UInt8}[b0],
+        )
+        @test_throws ArgumentError ArrowStringVector{ArrowString}(
+            [AS.PAYLOAD_MISSING],
+            Vector{UInt8}[],
+        )
+        @test_throws ArgumentError ArrowStringVector{Int}(
+            ArrowStringPayload[],
+            Vector{UInt8}[],
+        )
+        badmissing = ArrowStringPayload(UInt64(0xfffffffe), zero(UInt64))
+        @test_throws ArgumentError ArrowStringVector{Union{Missing,ArrowString}}(
+            [badmissing],
+            Vector{UInt8}[],
+        )
+        badprefix = ArrowStringPayload(payloads[1].a ⊻ (UInt64(1) << 32), payloads[1].b)
+        @test_throws ArgumentError ArrowStringVector{ArrowString}(
+            [badprefix],
+            Vector{UInt8}[b0],
+        )
+        short = AS.inline_payload(b1, 1, 5)
+        badpadding = ArrowStringPayload(short.a, short.b | (UInt64(1) << 8))
+        @test_throws ArgumentError ArrowString(badpadding, AS.EMPTY_BYTES)
+        @test_throws ArgumentError ArrowString(AS.view_payload(b0, 3, 18, 0, 100), b0)
         # rebase: appending one buffer to another re-points its entries
         combined = vcat(b0, b1)
         rebased = AS.rebase_payload(payloads[2], length(b0))
