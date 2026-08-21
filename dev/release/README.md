@@ -29,14 +29,15 @@
      prerelease suffix such as `-DEV`.
   4. Prepare the signed source RC and run the Apache vote.
   5. After the vote passes, publish the approved Apache source release.
-  6. Register ArrowTypes.jl and ArrowStrings.jl. These registrations can start
-     together. Wait for the ArrowStrings.jl General registry PR to merge.
+  6. Register ArrowTypes.jl 2.4.0 and ArrowStrings.jl 1.0.0. These two
+     independent registrations may start together. Wait for both General
+     registry PRs to merge and verify clean registry installs.
   7. Register Arrow.jl 3.0 with breaking-change release notes.
 
-ArrowStrings.jl is part of this ASF source tree. Do not register it in General
-before the PMC approves the source RC. General registration makes the package
-available outside the Apache Arrow development community and is therefore a
-release action under ASF policy.
+ArrowTypes.jl and ArrowStrings.jl are part of this ASF source tree. Do not
+register either version in General before the PMC approves the source RC.
+General registration makes a package available outside the Apache Arrow
+development community and is therefore a release action under ASF policy.
 
 ### Prepare RC and vote
 
@@ -53,12 +54,14 @@ Before making an RC, confirm all of the following:
   * Every subpackage that will be distributed has its own complete
     `LICENSE.md` and `NOTICE` files. A General subdirectory package does not
     include the repository-root copies.
-  * ArrowTypes.jl has its final package version. This RC includes ArrowTypes.jl
-    2.4.0, which follows the registered 2.3.0 release.
-  * ArrowStrings.jl passes General/RegistryCI preflight checks for its name,
-    license, installation, loading, dependencies, and compatibility bounds.
-    Fix any source problem before the vote; an approved source archive cannot
-    be changed in place.
+  * ArrowTypes.jl has its final `2.4.0` package version. Arrow.jl uses the
+    stable ArrowTypes.jl 2.x interface, so the root compat remains
+    `ArrowTypes = "2"`. The repository `[sources]` entry and RC verifier use
+    the exact 2.4.0 source included in the archive for release validation.
+  * ArrowTypes.jl and ArrowStrings.jl pass General/RegistryCI preflight checks
+    for their names, licenses, installation, loading, dependencies, and
+    compatibility bounds. Fix any source problem before the vote; an approved
+    source archive cannot be changed in place.
   * Every required CI job and the full conformance workflow passed on the exact
     commit proposed for the RC. Use a manual conformance dispatch if the commit
     did not run through a pull request.
@@ -178,18 +181,29 @@ pages or sending release announcements. This gives the ASF mirrors time to
 synchronize.
 
 The Julia General registrations must use the exact commit approved by the PMC.
-Register the packages in the order below. The ArrowTypes.jl and ArrowStrings.jl
-comments may be posted together because neither registration depends on the
-other.
+Register and verify the packages below. ArrowTypes.jl and ArrowStrings.jl are
+independent, so their comments may be posted together. Do not post the Arrow.jl
+comment until both General PRs have merged and both packages install from a
+clean registry environment.
 
-#### 1. Register ArrowTypes.jl if its version changed
+#### 1. Register ArrowTypes.jl 2.4.0
 
-Arrow.jl 3.0 does not depend on ArrowTypes.jl. This registration is optional,
-but a changed version in `src/ArrowTypes/Project.toml` must either be registered
-or reverted before the RC. Post this comment on the approved release commit:
+This source release contains the changed ArrowTypes.jl 2.4.0 package, so its
+registration is mandatory. Arrow.jl 3.0 accepts the stable ArrowTypes.jl 2.x
+interface; 2.4.0 is a release artifact and sequencing gate, not the root
+package's runtime compatibility floor. Post this comment on the approved
+release commit:
 
 ```markdown
 @JuliaRegistrator register subdir=src/ArrowTypes
+```
+
+Wait for the General PR to merge. Then verify from a clean environment:
+
+```julia
+import Pkg
+Pkg.add(Pkg.PackageSpec(name="ArrowTypes", version=v"2.4.0"))
+import ArrowTypes
 ```
 
 #### 2. Register ArrowStrings.jl 1.0.0
@@ -202,8 +216,15 @@ Post this comment on the approved release commit:
 
 ArrowStrings.jl is a new package. General currently applies a three-day review
 period to new packages. Wait for its General PR to merge. Then verify from a
-clean environment that `Pkg.add("ArrowStrings")` and `import ArrowStrings`
-succeed. Do not trigger the Arrow.jl registration before this step completes.
+clean environment:
+
+```julia
+import Pkg
+Pkg.add(Pkg.PackageSpec(name="ArrowStrings", version=v"1.0.0"))
+import ArrowStrings
+```
+
+Do not trigger the Arrow.jl registration before this step completes.
 If a maintainer comments on the General PR, include `[noblock]` where
 appropriate so that the maintainer's own comment does not stop AutoMerge.
 
@@ -226,8 +247,10 @@ Release notes:
 - `Arrow.write(io, table)` now writes the IPC file format by default. Pass
   `file=false` for the stream format.
 - Incremental writing (`Arrow.Writer` and `Arrow.append`), `convert=false`,
-  multithreaded encoding, and ArrowTypes.jl custom-type serialization are not
-  available in 3.0.
+  and multithreaded encoding are not available in 3.0.
+- `ArrowTypes` is no longer exported. Import ArrowTypes.jl directly when
+  defining a mapping. Arrow 3.0 still applies ArrowTypes.jl mappings
+  automatically to top-level and nested values.
 - Read the 3.0 migration guide before updating:
   https://github.com/apache/arrow-julia/blob/main/docs/src/migration.md
 ```

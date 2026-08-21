@@ -36,8 +36,8 @@ end
 Base.size(d::DictEncode) = size(d.data)
 Base.getindex(d::DictEncode, i::Int) = d.data[i]
 
-"One (Field, ArrayData) column from a Julia vector, facade conversions included."
-function _writecolumn(name::String, v::AbstractVector)
+"One native (Field, ArrayData) column from a Julia vector, facade conversions included."
+function _writecolumn_native(name::String, v::AbstractVector)
     T = Base.nonmissingtype(eltype(v))
     if eltype(v) === Missing
         t = AC.NullType()
@@ -132,6 +132,12 @@ function _writecolumn(name::String, v::AbstractVector)
     end
 end
 
+"One (Field, ArrayData) column, including the ArrowTypes compatibility adapter."
+function _writecolumn(name::String, v::AbstractVector)
+    return _arrowtypes_needs(v) ? _arrowtypes_writecolumn(name, v) :
+           _writecolumn_native(name, v)
+end
+
 "Narrow an Any-eltype column, recovering list-of-T structure when present."
 function _narrowlists(v::AbstractVector)
     w = map(x -> x isa AbstractVector ? map(identity, x) : x, v)
@@ -165,7 +171,7 @@ function _writecolumn(name::String, d::DictEncode)
     pool = unique(skipmissing(v))
     lookup = Dict{Any,Int32}(x => Int32(i - 1) for (i, x) in enumerate(pool))
     indices = Union{Missing,Int32}[x === missing ? missing : lookup[x] for x in v]
-    return AC.fromjulia_dict(name, collect(pool), indices)
+    return _newdictcolumn(name, collect(pool), indices; nullable=Missing <: eltype(v))
 end
 
 # Days from Julia's Date epoch (0000-12-31) to the Arrow epoch (1970-01-01).
@@ -214,6 +220,8 @@ function _temporalcolumn(
     return AC.Field(name, t; nullable=eltype(v) >: Missing), d
 end
 
+include("arrowtypes_write.jl")
+
 # --- retained-schema rewrite (facade Table/Stream round-trips) --------------
 
 "Storage integers for a public column under a RETAINED temporal descriptor."
@@ -240,6 +248,66 @@ end
 
 _fieldmetadata(f::AC.Field) =
     f.metadata === nothing ? nothing : collect(Pair{String,String}, f.metadata)
+
+"Enforce the first partition's complete recursive Field contract."
+function _checkpartitionfield(
+    expected::AC.Field,
+    actual::AC.Field,
+    partition::Int,
+    column::Symbol;
+    path::String=String(column),
+)
+    expected.name == actual.name || throw(
+        ArgumentError(
+            "partition $partition column $column has child name $(repr(actual.name)) " *
+            "at $path, but the first partition declared $(repr(expected.name))",
+        ),
+    )
+    AC.typeequal(expected.type, actual.type) || throw(
+        ArgumentError(
+            "partition $partition column $column maps $path to Arrow type " *
+            "$(repr(actual.type)), but the first partition declared " *
+            "$(repr(expected.type)); make the column types agree across partitions",
+        ),
+    )
+    expectedmeta =
+        expected.metadata === nothing ? Pair{String,String}[] :
+        collect(Pair{String,String}, expected.metadata)
+    actualmeta =
+        actual.metadata === nothing ? Pair{String,String}[] :
+        collect(Pair{String,String}, actual.metadata)
+    expectedmeta == actualmeta || throw(
+        ArgumentError(
+            "partition $partition column $column has different ordered metadata " *
+            "at $path; the first partition declared $(repr(expectedmeta)), but " *
+            "this partition declared $(repr(actualmeta))",
+        ),
+    )
+    actual.nullable &&
+        !expected.nullable &&
+        throw(
+            ArgumentError(
+                "partition $partition column $column is nullable at $path, but " *
+                "the first partition declared it non-nullable; make the first " *
+                "partition's corresponding element type admit Missing to widen " *
+                "the schema",
+            ),
+        )
+    length(expected.children) == length(actual.children) || throw(
+        ArgumentError(
+            "partition $partition column $column has $(length(actual.children)) " *
+            "children at $path, but the first partition declared " *
+            "$(length(expected.children))",
+        ),
+    )
+    for i in eachindex(expected.children)
+        expectedchild = expected.children[i]
+        actualchild = actual.children[i]
+        childpath = "$path.$(expectedchild.name)[$i]"
+        _checkpartitionfield(expectedchild, actualchild, partition, column; path=childpath)
+    end
+    return nothing
+end
 
 function _retainedfield(f::AC.Field; children=collect(AC.Field, f.children))
     return AC.Field(
@@ -512,6 +580,8 @@ end
 
 "Write values materialized inside a composite, where temporal values stay raw."
 function _retainedchildcolumn(f::AC.Field, values)
+    lowered = _arrowtypesretainedcolumn(f, values)
+    lowered === values || return _writecolumn(f, lowered)
     v = _retainedtypedvalues(f, values; converted=false)
     t = f.type
     if t isa AC.DateType ||
@@ -754,6 +824,7 @@ end
 
 "Build one column under a retained Field: descriptor, nullability, metadata."
 function _writecolumn(f::AC.Field, v::AbstractVector)
+    v = _arrowtypesretainedcolumn(f, v)
     t = f.type
     if t isa AC.NullType
         eltype(v) === Missing || throw(
@@ -1122,6 +1193,14 @@ function _writebytes(
                 partcols[k][j] isa DictEncode ? (partcols[k][j]::DictEncode).data :
                 partcols[k][j] for k = 1:nparts
             ]
+            rf === nothing || (vals = [_arrowtypesretainedcolumn(rf, v) for v in vals])
+            if rf === nothing
+                valuefield, _ = _writecolumn(String(names[j]), vals[1])
+                for k = 2:nparts
+                    partitionfield, _ = _writecolumn(String(names[j]), vals[k])
+                    _checkpartitionfield(valuefield, partitionfield, k, names[j])
+                end
+            end
             poolhint = _mergeddictpool(partpools, j)
             if rf !== nothing
                 Fv = _facadebasetype(rf.type)
@@ -1172,7 +1251,12 @@ function _writebytes(
                         "column $(names[j]) dictionary exceeds the Int32 index range",
                     ),
                 )
-                fld, d1 = AC.fromjulia_dict(String(names[j]), pool, firstidx)
+                fld, d1 = _newdictcolumn(
+                    String(names[j]),
+                    pool,
+                    firstidx;
+                    nullable=Missing <: eltype(vals[1]),
+                )
             else
                 fld, d1 = _retaineddict(rf, pool, firstidx, String(names[j]))
             end
@@ -1192,24 +1276,7 @@ function _writebytes(
                 if k == 1
                     firstfield = fk
                 else
-                    AC.typeequal(fk.type, firstfield.type) || throw(
-                        ArgumentError(
-                            "partition $k column $(names[j]) maps to Arrow " *
-                            "type $(repr(fk.type)), but the first partition " *
-                            "declared $(repr(firstfield.type)); make the " *
-                            "column types agree across partitions",
-                        ),
-                    )
-                    fk.nullable &&
-                        !firstfield.nullable &&
-                        throw(
-                            ArgumentError(
-                                "partition $k column $(names[j]) is nullable but " *
-                                "the first partition declared it non-nullable; " *
-                                "make the first partition's column eltype " *
-                                "Union{Missing,T} to widen the schema",
-                            ),
-                        )
+                    _checkpartitionfield(firstfield, fk, k, names[j])
                 end
                 coldata[j][k] = dk
             end
@@ -1248,11 +1315,17 @@ _withcolmeta(f::AC.Field, ::Nothing) = f
 function _withcolmeta(f::AC.Field, colmetadata)
     cm = get(Dict(colmetadata), Symbol(f.name), nothing)
     cm === nothing && return f
+    # Explicit application metadata augments retained/extension metadata.
+    # A generated ArrowTypes label is authoritative for the values that were
+    # lowered; accepting a conflicting explicit label would make them decode
+    # as a different logical type.
+    merged =
+        _mergemetapairs(_arrowtypesfieldmetadata(f), _metapairs(cm); protectextension=true)
     return AC.Field(
         f.name,
         f.type;
         nullable=f.nullable,
-        metadata=_metapairs(cm),
+        metadata=merged,
         children=collect(AC.Field, f.children),
     )
 end

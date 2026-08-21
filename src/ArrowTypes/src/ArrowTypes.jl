@@ -15,8 +15,10 @@
 # limitations under the License.
 
 """
-The ArrowTypes module provides the [`ArrowTypes.ArrowKind`](@ref) interface trait that objects can define
-in order to signal how they should be serialized in the arrow format.
+The ArrowTypes module defines traits and hooks that packages can implement to
+describe how their Julia types map to the Arrow format. Arrow consumers,
+including Arrow.jl 2.x and 3.x, use this interface without requiring the
+package that owns a custom type to depend on Arrow.jl.
 """
 module ArrowTypes
 
@@ -52,13 +54,14 @@ For a given type `T`, define its "arrow type kind", or the general category of a
   * [`ArrowTypes.UnionKind`](@ref): any `Union`
   * [`ArrowTypes.DictEncodedKind`](@ref): array types that implement the `DataAPI.refpool` interface
 
-The list of `ArrowKind`s listed above translate to different ways to physically store data as supported by the arrow data format.
-See the docs for each for an idea of whether they might be an appropriate fit for a custom type.
-Note that custom types need to satisfy any additional "interface methods" as required by the various `ArrowKind`
-types. By default, if a type in julia is declared like `primitive type ...` it is considered a `PrimitiveKind`
-and if `struct` or `mutable struct` it's considered a `StructKind`. Also note that types will rarely need to define `ArrowKind`;
-much more common is to define `ArrowType(T)` and `toarrow(x::T)` to transform `T` to a natively supported arrow type, which will
-already have its `ArrowKind` defined.
+The `ArrowKind`s describe general Arrow storage categories. Each consumer
+decides which categories, layouts, and extra interface methods it supports.
+By default, a Julia `primitive type` is a `PrimitiveKind`, and a `struct` or
+`mutable struct` is a `StructKind`. Types rarely need to define `ArrowKind`.
+It is more common to define `ArrowType(T)` and `toarrow(x::T)` to lower `T` to
+a natively supported Arrow type, which already has an `ArrowKind`. In
+particular, an `ArrowKind` override alone does not select an arbitrary physical
+layout in Arrow.jl 3.x.
 """
 abstract type ArrowKind end
 
@@ -72,9 +75,10 @@ Interface method to define the natively supported arrow type `S` that a given ty
 Useful when a custom type wants a "serialization hook" or otherwise needs to be transformed/converted into a natively
 supported arrow type for serialization. If a type defines `ArrowType`, it must also define a corresponding
 [`ArrowTypes.toarrow(x::T)`](@ref) method which does the actual conversion from `T` to `S`.
-Note that custom structs defined like `struct T` or `mutable struct T` are natively supported in serialization, so unless
-_additional_ transformation/customization is desired, a custom type `T` can serialize with no `ArrowType` definition (by default,
-each field of a struct is serialized, using the results of `fieldnames(T)` and `getfield(x, i)`).
+Some consumers can serialize plain structs by discovering their fields. Check
+the consumer's supported write types. Arrow.jl 3.x supports a plain concrete
+struct when its fields can be lowered to supported storage. Define `ArrowType`
+and `toarrow` when a custom type needs a different storage representation.
 Note that defining these methods only deal with custom _serialization_ to the arrow format; to be able to _deserialize_ custom
 types at all, see the docs for [`ArrowTypes.arrowname`](@ref), [`ArrowTypes.arrowmetadata`](@ref), [`ArrowTypes.JuliaType`](@ref),
 and [`ArrowTypes.fromarrow`](@ref).

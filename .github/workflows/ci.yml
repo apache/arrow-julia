@@ -123,15 +123,16 @@ jobs:
             ${{ runner.os }}-test-${{ env.cache-name }}-
             ${{ runner.os }}-test-
             ${{ runner.os }}-
-      # Before the build: ArrowStrings is unregistered and Tables.Scan is
+      # Before the build: ArrowStrings is unregistered, ArrowTypes 2.4 is in
+      # this monorepo, and Tables.Scan is
       # unreleased; Julia 1.10's Pkg does not read the `[sources]` entries
       # that point at them, so the resolve would fail without this step.
-      - name: Dev local ArrowStrings and the Tables scan branch for Arrow.jl tests
+      - name: Dev local subpackages and the Tables scan branch for Arrow.jl tests
         if: matrix.pkg.name == 'Arrow.jl'
         shell: julia --project=. {0}
         run: |
           using Pkg
-          Pkg.develop(PackageSpec(path="src/ArrowStrings"))
+          Pkg.develop([PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")])
           Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="64268c6a316e380cc3da26965f440a5433ebc1f7"))
       - uses: julia-actions/julia-buildpkg@v1.6
         with:
@@ -223,7 +224,7 @@ jobs:
         shell: julia --project=. {0}
         run: |
           using Pkg
-          Pkg.develop(PackageSpec(path="src/ArrowStrings"))
+          Pkg.develop([PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")])
           Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="64268c6a316e380cc3da26965f440a5433ebc1f7"))
       - uses: julia-actions/julia-buildpkg@v1.6
         with:
@@ -262,7 +263,7 @@ jobs:
         shell: julia --project=docs {0}
         run: |
           using Pkg
-          Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowStrings")])
+          Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")])
           Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="64268c6a316e380cc3da26965f440a5433ebc1f7"))
       - uses: julia-actions/julia-buildpkg@v1.7.0
       - uses: julia-actions/julia-docdeploy@v1.3.1

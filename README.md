@@ -33,8 +33,8 @@ reads.
 > This is the Arrow.jl 3.0 development branch. Arrow 3.0 is not registered
 > yet. It requires a Tables.jl release that contains `Tables.Scan` and the
 > first registered ArrowStrings.jl release. Until then, a checkout must use
-> the local `src/ArrowStrings` package and the pinned Tables.jl development
-> commit shown below.
+> the local `src/ArrowStrings` and `src/ArrowTypes` packages and the pinned
+> Tables.jl development commit shown below.
 
 ## Installation
 
@@ -70,6 +70,7 @@ Arrow 3.0 includes:
 - `Tables.Scan` projection, filter, limit, and offset pushdown.
 - Sparse byte-range reads, including a CloudStore.jl extension.
 - Arrow C data and C stream import and export.
+- Recursive ArrowTypes.jl mappings for custom and extension types.
 - Structural, semantic, and optional full-content validation.
 
 Arrow 3.0 is a breaking rewrite. Read the
@@ -80,13 +81,14 @@ See the [changelog](CHANGELOG.md) for the full release summary. The
 
 ## Development
 
-In a checkout of this branch, prepare the two temporary development
-dependencies and run the tests:
+In a checkout of this branch, prepare the local subpackages and the temporary
+Tables.jl dependency, then run the tests:
 
 ```julia
 import Pkg
 Pkg.activate(".")
 Pkg.develop(path="src/ArrowStrings")
+Pkg.develop(path="src/ArrowTypes")
 Pkg.add(url="https://github.com/JuliaData/Tables.jl",
         rev="64268c6a316e380cc3da26965f440a5433ebc1f7")
 Pkg.test()

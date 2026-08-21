@@ -29,9 +29,10 @@ features changed.
 
 ## Requirements
 
-Arrow 3.0 requires Julia 1.10 or later. It also requires the first Tables.jl
-release that provides `Tables.Scan` and ArrowStrings.jl 1.0. The development
-branch uses temporary source overrides until those releases are registered.
+Arrow 3.0 requires Julia 1.10 or later and ArrowTypes.jl 2.x. It also requires
+the first Tables.jl release that provides `Tables.Scan` and ArrowStrings.jl
+1.0. The development branch uses temporary source overrides until those
+releases are registered.
 
 ## Materialized columns
 
@@ -85,8 +86,8 @@ not provide these Arrow 2.x features:
 | `table |> Arrow.write(sink)` | Call `Arrow.write(sink, table)`. The curried write form was removed. |
 | `Arrow.tobuffer(table)` | Write to an `IOBuffer`, then call `take!`. See below. |
 | `ntasks` | Remove the keyword. Encoding is not task-parallel in 3.0. |
-| `Arrow.ToArrow` | Convert the column to a supported Julia element type before writing. |
-| ArrowTypes.jl custom types | Convert the values before writing. Arrow 3.0 does not consume the ArrowTypes interface. |
+| `Arrow.ToArrow` | Import `ArrowTypes.ToArrow` directly when an explicit lazy conversion view is needed. Normal writes apply the mapping automatically. |
+| `Arrow.ArrowTypes` or an exported `ArrowTypes` name | Use `import ArrowTypes` for new code. The qualified `Arrow.ArrowTypes` binding remains for compatibility, but it is not exported. |
 
 The output default for an `IO` changed. Arrow 2.x wrote the stream format to
 an `IO` by default. Arrow 3.0 uses `file=true` for both paths and `IO` sinks.
@@ -108,33 +109,62 @@ is no longer supported. The Arrow 2.x `alignment`, `dictencode`,
 writer keywords were removed. Wrap only the columns that need dictionary
 encoding in [`Arrow.DictEncode`](@ref).
 
-For example, convert a custom type to a supported storage column explicitly:
+Arrow 3.0 again consumes the ArrowTypes.jl mapping interface. Package authors
+should depend on and import ArrowTypes.jl directly. Define `ArrowType` and
+`toarrow` to lower a custom value to supported storage. Add an extension name
+and the read hooks when the logical type must round-trip:
 
 ```julia
+import ArrowTypes
+
 struct AccountID
     value::Int64
 end
 
-ids = AccountID.(1:3)
-Arrow.write("accounts.arrow", (id = getfield.(ids, :value),))
+const ACCOUNT_ID = Symbol("JuliaLang.Example.AccountID")
+
+ArrowTypes.ArrowType(::Type{AccountID}) = Int64
+ArrowTypes.toarrow(id::AccountID) = id.value
+ArrowTypes.arrowname(::Type{AccountID}) = ACCOUNT_ID
+ArrowTypes.JuliaType(::Val{ACCOUNT_ID}, ::Type{Int64}, metadata) = AccountID
+ArrowTypes.fromarrow(::Type{AccountID}, value::Int64) = AccountID(value)
+
+Arrow.write("accounts.arrow", (id = AccountID.(1:3),))
+table = Arrow.Table("accounts.arrow")
+getfield.(table.id, :value) == [1, 2, 3] # true
 ```
 
+The lowering and restoration apply recursively to top-level values and values
+nested in lists, tuples and fixed-size lists, structs, maps,
+dictionary-encoded values, and freshly synthesized heterogeneous Unions.
+Arrow writes `arrowname` and `arrowmetadata` as standard extension metadata.
+On read, it uses `JuliaType` and then `fromarrow` or `fromarrowstruct`. If the
+current process has no mapping for an extension name, Arrow warns and returns
+the ordinary storage values instead.
+Defining `ArrowKind` alone is not a supported way to select an Arrow 3.0
+physical layout. Use the `ArrowType` and `toarrow` lowering interface.
+
 [`Arrow.DictEncode`](@ref) remains the opt-in wrapper for a newly written
-dictionary-encoded column.
+dictionary-encoded column. Its pool values use the same recursive ArrowTypes.jl
+mapping. A fully read top-level dictionary also retains its pool for rewrite.
 
 ## Supported write types
 
 The writer accepts fixed-width integers and floats, `Bool`, strings, supported
-`Dates` values, lists of supported core values, and top-level `NamedTuple`
-struct columns. See [Type mapping when writing](@ref) for the complete table.
+`Dates` values, lists of supported core values, top-level `NamedTuple` struct
+columns, and fresh heterogeneous Julia Union columns whose members are
+writable at that nesting depth. Fresh heterogeneous Unions use the canonical
+dense Arrow Union layout. See [Type mapping when writing](@ref) for the
+complete table.
 
-Arrow 3.0 does not write an arbitrary Julia struct by discovering its fields.
-Convert it to a `NamedTuple` or to separate columns first.
-
-ArrowTypes.jl mappings, including `ArrowType`, `toarrow`, `arrowname`, and
-`fromarrow`, are not consulted. `Arrow.ToTimestamp` was also removed. Convert
-zoned or custom values to one of the documented write types before calling
-`Arrow.write`.
+A plain concrete struct whose fields are supported can use ArrowTypes.jl's
+default `StructKind` mapping. Without extension hooks, it reads back as
+ordinary Struct storage rather than the original Julia type. To select a
+different stable representation, map the struct to a supported storage type
+with `ArrowTypes.ArrowType` and `ArrowTypes.toarrow`, or convert it to a
+`NamedTuple` or separate columns. An `ArrowKind` override alone does not select
+an arbitrary Arrow 3.0 physical layout. `Arrow.ToTimestamp` was removed; define
+an ArrowTypes.jl lowering or convert zoned values before writing.
 
 ## Schema retention
 
@@ -145,13 +175,17 @@ metadata, schema metadata, and top-level dictionary index types and category
 order. A column that was replaced with an incompatible Julia type is rejected
 instead of being silently written under the old schema.
 
-Materialization discards Union routing and nested dictionary pools. A retained
-Union or nested Dictionary therefore fails clearly when rewritten. Top-level
-dictionaries of scalar or composite values are supported after a full read. A
-scan result can lack the hidden source pool, so an ordered dictionary from such
-a result also fails clearly. Exact buffer sharing, overlapping ListView ranges,
-and Run-End Encoding segmentation are not retained; the writer emits a
-canonical layout with the same logical values and schema type.
+A fresh Julia column with a heterogeneous declared `Union` element type is
+synthesized as a canonical dense Arrow Union. Materialization of an existing
+Arrow Union discards its child type IDs and offsets. A retained Union therefore
+still fails clearly when rewritten from an `Arrow.Table`; the writer does not
+invent new routing under the retained schema. A retained nested Dictionary
+also fails because its pool is lost. Top-level dictionaries of scalar or
+composite values are supported after a full read. A scan result can lack the
+hidden source pool, so an ordered dictionary from such a result also fails
+clearly. Exact buffer sharing, overlapping ListView ranges, and Run-End
+Encoding segmentation are not retained; the writer emits a canonical layout
+with the same logical values and schema type.
 
 ## Names and imports
 
@@ -164,8 +198,9 @@ table = Arrow.Table("data.arrow")
 Arrow.write("copy.arrow", table)
 ```
 
-`ArrowTypes` is no longer re-exported. Import ArrowTypes.jl directly if other
-code still uses that package.
+`ArrowTypes` is no longer exported. Import ArrowTypes.jl directly when
+defining mappings. `Arrow.ArrowTypes` remains available as a qualified
+compatibility binding.
 
 `Arrow.getmetadata` was removed. Arrow 3.0 uses DataAPI.jl metadata methods:
 
@@ -182,6 +217,10 @@ DataAPI.colmetadata(table, :column, "key")
 Arrow 3.0 adds:
 
 - `Tables.Scan` pushdown for projection, filters, limits, and offsets.
+- Recursive ArrowTypes.jl custom and extension-type mappings. Filters over a
+  field that contains a registered logical type at any depth evaluate over the
+  public materialized values because the interface does not require its
+  storage lowering to preserve Julia comparison semantics.
 - Sparse byte-range reads through [`Arrow.AbstractArrowSource`](@ref).
 - A CloudStore.jl extension for object storage.
 - Arrow C data and C stream import and export.

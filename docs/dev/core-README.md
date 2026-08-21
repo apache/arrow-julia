@@ -41,7 +41,7 @@ scope of every layer.
 | `src/table.jl`, `src/write.jl` | The facade |
 | `ext/ArrowCloudStoreExt.jl` | CloudStore.jl objects as sources: HTTP `Range` reads, concurrent per planned range |
 | `src/ArrowStrings/` | ArrowStrings.jl — the shared inline-else-view string representation (`ArrowString`, `ArrowStringVector` = Utf8View memory); a separate package, registered on its own like ArrowTypes, that Arrow depends on through a `[sources]` path entry until its first release |
-| `src/ArrowTypes/` | ArrowTypes.jl — the custom-type interface package (not used by 3.0 yet) |
+| `src/ArrowTypes/` | ArrowTypes.jl — the separate custom-type interface package; the facade applies its lowering and extension hooks recursively |
 | `test/` | Core unit tests, facade tests, the four adapter acceptance batteries, the frozen 2.x-written fixtures, the `--trim=safe` gate |
 | `conformance/` | The arrow-testing gold-corpus runner, the integration-JSON implementation, the pyarrow/nanoarrow IPC oracle, the in-process pyarrow C Data / C Stream oracle |
 | `bench/` | The serialize/deserialize benchmark harness (this package, Arrow.jl 2.x, PyArrow) |
@@ -337,8 +337,9 @@ and index width; multi-partition dictionary columns share one pool object.
 Union routing and nested dictionary pools are no longer present after facade
 materialization, so those retained rewrites fail closed. View buffer topology,
 ListView overlap, and exact run segmentation rebuild canonically. DataAPI
-metadata reads through. There is no lazy typed-view layer, no parallel writer
-pipeline, no append-as-resume, and no ArrowTypes integration.
+metadata reads through. The facade applies ArrowTypes.jl lowering and extension
+restoration recursively to top-level and nested values. There is no lazy
+typed-view layer, no parallel writer pipeline, and no append-as-resume.
 
 ## Trim-compile support (JuliaC `--trim=safe`)
 

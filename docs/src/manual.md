@@ -200,7 +200,9 @@ path):
 | Run-end encoded | the *values* child's element type (runs are expanded) |
 | Null | `Missing` |
 
-Two refinements. The `Dates` conversions above apply at the top level and
+Three refinements. A list-family field with a registered ArrowTypes.jl child
+uses a row vector with that restored child element type; this is the same for
+a zero-row and a populated column. The `Dates` conversions above apply at the top level and
 through dictionary encoding; a temporal type nested under a run-end-encoded
 or union wrapper stays in its raw integer storage. And field nullability is
 *advisory* in Arrow (the reference implementation and the conformance
@@ -243,6 +245,12 @@ applied after decode with identical results. A scan whose filter literal has
 no exact storage representation (a cross-domain or out-of-range value), or
 whose projection is empty (`select = ()`), falls back to reading the whole
 source and evaluating over the converted public values.
+
+Filters over a field that contains a registered ArrowTypes.jl extension value
+at any depth are evaluated over the restored public values. The ArrowTypes
+interface does not require `toarrow` to preserve Julia comparison semantics,
+so lowering an arbitrary custom literal for physical pushdown would be
+incorrect. Projection and the other scan operations still apply normally.
 
 Batch pruning uses per-batch statistics (row count, null count, min, max
 per column) carried in the file's footer schema metadata under the key
@@ -351,7 +359,13 @@ can appear at any nesting depth — is:
 | `String` | Utf8 |
 | `Vector{T}` for core `T` (including `Vector{UInt8}`) | List of the mapping of `T` |
 | `Union{Missing, T}` for core `T` | the mapping of `T`, nullable |
+| `Union{T1, T2, ...}` with two or more non-`Missing` writable member types | canonical dense Union with one child per declared member type |
 | `Missing` | Null |
+
+The dense Union mapping applies to freshly supplied Julia data. Each member
+uses the same recursive core or ArrowTypes.jl mapping that it would use at
+that nesting depth. A `Missing` member is represented by a Null child. A
+Union may have at most 128 declared members.
 
 At the *top level* of a column the facade adds:
 
@@ -363,14 +377,15 @@ At the *top level* of a column the facade adds:
 | `Dates.Time` | Time64 (nanosecond) |
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
 | `NamedTuple` whose fields are core columns | Struct (no top-level nulls — wrap fields as nullable children instead) |
-| `Arrow.DictEncode` over a core column | Dictionary of the wrapped mapping |
+| `Arrow.DictEncode` over a writable column | Dictionary of the recursive mapping of its values |
 | `ArrowStrings.ArrowStringVector` | Utf8View, **zero-copy** — the column's memory is the Arrow array (see below) |
 
-The top-level conversions do not recurse: a `Vector{Date}` inside a list, a
-`Date` or `SubString` field of a `NamedTuple`, or `DictEncode` over dates
-are refused with an `ArgumentError` naming the element type. A column with
-element type `Any` is narrowed once (recovering list columns of a common
-element type) and refused if it cannot be narrowed to a writable type.
+These native facade conversions do not recurse: a `Vector{Date}` inside a
+list, a `Date` or `SubString` field of a `NamedTuple`, or `DictEncode` over
+dates are refused with an `ArgumentError` naming the element type. The
+ArrowTypes.jl mappings described below do recurse. A column with element type
+`Any` is narrowed once (recovering list columns of a common element type) and
+refused if it cannot be narrowed to a writable type.
 When the source is an `Arrow.Table` or `Arrow.Stream`, the writer retains the
 compatible Arrow descriptor tree. Temporal units, byte and list widths,
 Struct, Map, Run-End Encoding, nullability, field metadata, schema metadata,
@@ -379,13 +394,63 @@ round trip. Buffer sharing, overlapping ListView ranges, and exact run
 segmentation are rebuilt into a canonical form without changing logical
 values.
 
-Two layouts lose information when the facade materializes them. Union child
-type IDs and offsets are not present in the Julia values, and a nested
-dictionary's pool is not retained. Writing either case from a materialized
-`Table` fails with a clear `ArgumentError` instead of changing its meaning.
-Top-level dictionaries, including dictionaries of composite values, are
-retained on a full read. A scan result may not carry the hidden source pool;
-an ordered dictionary then fails instead of inventing category order.
+A fresh Julia column with a heterogeneous declared `Union` element type is
+synthesized as a canonical dense Arrow Union. This is distinct from rewriting
+a retained Union. Once an Arrow Union is materialized, its original child type
+IDs and offsets are no longer present in the Julia values. Writing that
+retained Union from an `Arrow.Table` fails with a clear `ArgumentError` instead
+of inventing new routing under the old schema. A nested dictionary has the
+same fail-closed rule because its pool is not retained. Top-level dictionaries,
+including dictionaries of composite values, are retained on a full read. A
+scan result may not carry the hidden source pool; an ordered dictionary then
+fails instead of inventing category order.
+
+### Custom and extension types
+
+Arrow 3.0 applies [ArrowTypes.jl](https://github.com/apache/arrow-julia/tree/main/src/ArrowTypes)
+mappings automatically. Import ArrowTypes.jl directly and declare it as a
+dependency of the package that owns the custom type. `Arrow.ArrowTypes`
+remains available as a qualified compatibility binding, but `ArrowTypes` is
+not exported from Arrow.jl.
+
+Define `ArrowType` and `toarrow` to lower a custom value to a supported storage
+type. Define an extension name and the read hooks when the logical type must
+round-trip:
+
+```julia
+import ArrowTypes
+
+struct AccountID
+    value::Int64
+end
+
+const ACCOUNT_ID = Symbol("JuliaLang.Example.AccountID")
+
+ArrowTypes.ArrowType(::Type{AccountID}) = Int64
+ArrowTypes.toarrow(id::AccountID) = id.value
+ArrowTypes.arrowname(::Type{AccountID}) = ACCOUNT_ID
+ArrowTypes.JuliaType(::Val{ACCOUNT_ID}, ::Type{Int64}, metadata) = AccountID
+ArrowTypes.fromarrow(::Type{AccountID}, value::Int64) = AccountID(value)
+
+io = IOBuffer()
+Arrow.write(io, (id = AccountID.(1:3),); file = false)
+table = Arrow.Table(take!(io))
+getfield.(table.id, :value) == [1, 2, 3] # true
+```
+
+Arrow applies `ArrowType` and `toarrow` recursively to top-level values and to
+values nested in lists, tuples and fixed-size lists, structs, maps,
+dictionary-encoded values, and freshly synthesized heterogeneous Unions. It
+writes `arrowname` and `arrowmetadata` as standard extension metadata. On read,
+it resolves the logical type with `JuliaType` and restores each value with
+`fromarrow` or `fromarrowstruct`.
+When an extension name has no registered mapping in the current process,
+Arrow warns and returns its ordinary storage values. A plain concrete struct
+whose fields are supported can use ArrowTypes.jl's default `StructKind`
+mapping; without extension hooks, it reads back as ordinary Struct storage.
+Use the lowering interface to select a different stable storage
+representation. An `ArrowKind` override alone does not select an arbitrary
+Arrow 3.0 physical layout.
 
 ### ArrowStrings columns
 

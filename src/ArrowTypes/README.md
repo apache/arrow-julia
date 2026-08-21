@@ -25,7 +25,8 @@ subdirectory of the arrow-julia repository) so that packages can declare
 how their types map to Arrow without depending on Arrow.jl itself.
 
 * `ArrowTypes.ArrowKind(T)` — the general category of Arrow type a Julia
-  type is treated as (`PrimitiveKind`, `ListKind`, `StructKind`, …).
+  type is treated as (`PrimitiveKind`, `ListKind`, `StructKind`, …). A
+  consumer decides which categories and layouts it supports.
 * `ArrowTypes.ArrowType(T)` / `ArrowTypes.toarrow(x)` — the natively
   supported type a value is converted to for serialization.
 * `ArrowTypes.arrowname(T)`, `ArrowTypes.arrowmetadata(T)`,
@@ -33,5 +34,9 @@ how their types map to Arrow without depending on Arrow.jl itself.
   the round trip back to the custom type through Arrow extension-type
   metadata.
 
-Arrow.jl 2.x consumes this interface; Arrow.jl 3.0 does not depend on it.
-See the docstrings of the functions above for the contract.
+Arrow.jl 2.x and 3.x consume this stable 2.x interface. Arrow.jl 3.x applies
+`ArrowType` and `toarrow` recursively for custom values; defining `ArrowKind`
+alone does not select an arbitrary Arrow.jl 3.x physical layout. Packages that
+own custom types should depend on and import ArrowTypes.jl directly. Arrow.jl
+keeps `Arrow.ArrowTypes` as a qualified compatibility binding, but does not
+export it. See the docstrings of the functions above for the contract.

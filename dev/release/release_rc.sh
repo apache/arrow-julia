@@ -78,6 +78,39 @@ if [ ${RELEASE_VALIDATE} -gt 0 ]; then
     echo "ArrowTypes Project.toml must contain a final X.Y.Z version."
     exit 1
   fi
+  if [ "${version}" = "3.0.0" ]; then
+    if [ "${arrow_types_version}" != "2.4.0" ]; then
+      echo "Arrow.jl 3.0.0 RCs must include ArrowTypes.jl 2.4.0."
+      exit 1
+    fi
+    if ! awk '
+      /^\[deps\]$/ { in_deps = 1; next }
+      /^\[/ { in_deps = 0 }
+      in_deps && /^ArrowTypes[[:space:]]*=[[:space:]]*"31f734f8-188a-4ce0-8406-c8a06bd891cd"[[:space:]]*$/ { found = 1 }
+      END { exit(found ? 0 : 1) }
+    ' Project.toml; then
+      echo "Arrow.jl 3.0.0 must depend on ArrowTypes.jl."
+      exit 1
+    fi
+    if ! awk '
+      /^\[compat\]$/ { in_compat = 1; next }
+      /^\[/ { in_compat = 0 }
+      in_compat && /^ArrowTypes[[:space:]]*=[[:space:]]*"2"[[:space:]]*$/ { found = 1 }
+      END { exit(found ? 0 : 1) }
+    ' Project.toml; then
+      echo "Arrow.jl 3.0.0 must keep ArrowTypes.jl compat at the stable 2.x interface."
+      exit 1
+    fi
+    if ! awk '
+      /^\[sources\]$/ { in_sources = 1; next }
+      /^\[/ { in_sources = 0 }
+      in_sources && /^ArrowTypes[[:space:]]*=/ && /path[[:space:]]*=[[:space:]]*"src\/ArrowTypes"/ { found = 1 }
+      END { exit(found ? 0 : 1) }
+    ' Project.toml; then
+      echo "Arrow.jl 3.0.0 RCs must test the included src/ArrowTypes 2.4.0 source."
+      exit 1
+    fi
+  fi
   if awk '
     /^\[sources\]$/ { in_sources = 1; next }
     /^\[/ { in_sources = 0 }
@@ -171,8 +204,8 @@ Apache Arrow Julia version ${version}.
 
 The source archive contains Arrow.jl ${version}, ArrowStrings.jl
 ${arrow_strings_version}, and ArrowTypes.jl ${arrow_types_version}. After PMC
-approval, these packages will be registered separately in Julia's General
-registry from this exact source commit.
+approval, ArrowTypes.jl and ArrowStrings.jl, then Arrow.jl, will be registered
+separately in Julia's General registry from this exact source commit.
 
 This release candidate is based on commit:
 ${rc_hash} [1]

@@ -18,6 +18,7 @@
 [deps]
 Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
 ArrowStrings = "c38d8858-22a2-449e-9eca-ef92ec15f353"
+ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
 CodecLz4 = "5ba52731-8f18-5e0d-9241-30f10d1ec561"
 CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
 CodecZstd = "6b39b394-51ab-5f42-8807-6242bab2b4c2"
@@ -30,6 +31,7 @@ TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 
 [compat]
 ArrowStrings = "=1.0.0"
+ArrowTypes = "=2.4.0"
 CodecLz4 = "=0.4.6"
 CodecZlib = "=0.7.9"
 CodecZstd = "=0.8.7"

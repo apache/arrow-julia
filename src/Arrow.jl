@@ -38,7 +38,8 @@ documents each layer in depth):
   lifecycle accounting.
 - `scan.jl`: `Tables.Scan` pushdown over byte ranges plus footer-carried
   statistics pruning.
-- `table.jl`, `write.jl`: the facade over the adapters.
+- `table.jl`, `write.jl`: the facade over the adapters, including recursive
+  ArrowTypes.jl lowering and lifting for Julia extension types.
 
 The adapter entry points (`readstream`, `writestream`, `readfile`,
 `writefile`, `to_c_data`, `from_c_data`, `export_stream!`, `from_c_stream`)
@@ -51,6 +52,7 @@ using Tables
 import Base64
 import DataAPI
 import ArrowStrings
+import ArrowTypes
 import Dates
 import Mmap
 import CodecLz4
@@ -94,6 +96,7 @@ include("ipc_write.jl")
 include("cdata.jl")
 include("source.jl")
 include("scan.jl")
+include("arrowtypes.jl")
 
 # The public facade.
 include("table.jl")

@@ -347,6 +347,10 @@ path. The claim is the RAW domain (`_declaredeltype(f, false)`): the
 facade's Dates conversion happens after, in `_postconvert`.
 """
 function _batchcolumn(f::AC.Field, d::AC.ArrayData)
+    if _hasarrowtypesextension(f)
+        routed = _arrowtypesroutedcolumn(f, d)
+        routed === nothing || return routed
+    end
     T = _declaredeltype(f, false)
     (_closedclaim(T) && _typedroutable(f)) || return AC.materialize(f, d)
     # Field nullability is advisory: the batch may hold nulls under a
@@ -373,19 +377,26 @@ end
 
 function _facadecolumn(f::AC.Field, parts::Vector)
     if isempty(parts)
-        T = _declaredeltype(f, true)
+        T =
+            _hasarrowtypesextension(f) ?
+            _arrowtypespubliceltype(_ArrowTypesReadContext(), f) : _declaredeltype(f, true)
         return T === Any ? Any[] : Vector{T}()
     end
     col = length(parts) == 1 ? parts[1] : reduce(vcat, parts)
-    return _publiccolumn(f, _postconvert(f.type, col))
+    return _facadefromraw(f, col)
 end
+
+_facadefromraw(f::AC.Field, col::AbstractVector) =
+    _hasarrowtypesextension(f) ? _arrowtypescolumn(f, col) :
+    _publiccolumn(f, _postconvert(f.type, col))
 
 # --- scan value domain -------------------------------------------------------
 # Pushdown and residual filtering run over PHYSICAL storage values; facade
-# filter literals arrive in public Julia types. Lower every literal to the
-# referenced field's storage domain BEFORE the scan, so file, ranged, and
-# stream paths share one value domain; conversion back to public types then
-# happens exactly once, on the scan OUTPUT (rename-aware via Tables.resolve).
+# filter literals arrive in public Julia types. Lower native literals to the
+# referenced field's storage domain before the scan when that preserves
+# semantics. Registered logical extensions fall back to the public domain.
+# Conversion back to public types happens exactly once on the scan output
+# (rename-aware via Tables.resolve).
 
 # Lowering returns (ok, value): ok=false means the literal has NO exact,
 # semantics-preserving storage representation for this field (cross-type
@@ -454,6 +465,17 @@ function _storagevalue(t::AC.ArrowType, v)
     return true, v
 end
 
+function _storagevalue(f::AC.Field, v)
+    _hasarrowtypesextension(f) || return _storagevalue(f.type, v)
+    # ArrowTypes does not require `toarrow` to preserve Julia comparison
+    # semantics. A logical type may, for example, compare by an equivalence
+    # class while storing one concrete identifier. Evaluate every registered
+    # extension filter, including one nested below an unmarked container, over
+    # the restored public values unless a future interface provides an
+    # explicit comparison-preserving trait.
+    return false, v
+end
+
 function _exactdiv(x::Int64, d::Integer)
     q, r = divrem(x, Int64(d))
     return r == 0 ? (true, q) : (false, x)
@@ -470,7 +492,7 @@ function _lowerexpr(e, fields, names, ok::Base.RefValue{Bool})
     if e isa Tables.Cmp
         f = _fieldfor(fields, e.lhs.ref, names)
         f === nothing && return e
-        good, v = _storagevalue(f.type, e.rhs)
+        good, v = _storagevalue(f, e.rhs)
         good || (ok[] = false)
         return Tables.Cmp(e.op, e.lhs, v)
     elseif e isa Tables.In
@@ -478,11 +500,15 @@ function _lowerexpr(e, fields, names, ok::Base.RefValue{Bool})
         f === nothing && return e
         vals = Any[]
         for x in e.values
-            good, v = _storagevalue(f.type, x)
+            good, v = _storagevalue(f, x)
             good || (ok[] = false)
             push!(vals, v)
         end
         return Tables.In(e.lhs, Tuple(vals))
+    elseif e isa Union{Tables.IsNull,Tables.StrPred}
+        f = _fieldfor(fields, e.lhs.ref, names)
+        f !== nothing && _hasarrowtypesextension(f) && (ok[] = false)
+        return e
     elseif e isa Tables.AndExpr
         return Tables.AndExpr(
             Tables.ScanExpr[_lowerexpr(a, fields, names, ok) for a in e.args],
@@ -857,7 +883,7 @@ function _wrapscanned(got, schema, sourcefields, scan; regions=AC.OwnerRegion[])
             # Public type overrides run HERE, after facade conversion —
             # they are public-domain requests, never storage casts, and
             # they preserve missing exactly as Tables.scan does.
-            base = _publiccolumn(f, _postconvert(f.type, columns[i]))
+            base = _facadefromraw(f, columns[i])
             push!(precols, base)
             columns[i] = bc.type === nothing ? base : _applyoverride(bc.type, base)
         end

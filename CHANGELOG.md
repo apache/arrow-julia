@@ -46,18 +46,21 @@ writer, validation, scan, and C interface engines.
   `largelists`, and `maxdepth` writer keywords were removed.
 - The `compress` keyword accepts `nothing`, `:lz4`, or `:zstd`; initialized
   compressor objects are no longer accepted.
-- `Arrow.ToArrow` and ArrowTypes.jl custom-type serialization are not supported
-  by Arrow 3.0. Convert custom values to supported Julia column types before
-  writing them.
-- ArrowTypes.jl is no longer re-exported or used by Arrow.jl 3.0.
+- The `Arrow.ToArrow` compatibility binding was removed. Import
+  `ArrowTypes.ToArrow` directly when an explicit lazy conversion view is
+  needed. Normal writes apply `ArrowTypes.ArrowType` and `ArrowTypes.toarrow`
+  automatically.
+- `ArrowTypes` is no longer exported. Import ArrowTypes.jl directly when
+  defining a custom mapping. `Arrow.ArrowTypes` remains available as a
+  qualified compatibility binding.
 - `Arrow.getmetadata` was replaced by the DataAPI.jl metadata interface.
 - The package now has a narrow export surface. Use names such as
   `Arrow.Table`, `Arrow.Stream`, `Arrow.write`, and `Arrow.DictEncode` through
   the `Arrow` namespace. Only `close!` is exported.
 - Big-endian IPC and delta-dictionary messages are rejected.
-- Arrow 3.0 requires a Tables.jl release that provides `Tables.Scan` and the
-  ArrowStrings.jl 1.0 release. The final Tables.jl lower compat bound will be
-  set after that Tables.jl release is registered.
+- Arrow 3.0 requires ArrowTypes.jl 2.x, a Tables.jl release that provides
+  `Tables.Scan`, and the ArrowStrings.jl 1.0 release. The final Tables.jl lower
+  compat bound will be set after that Tables.jl release is registered.
 
 ### Added
 
@@ -68,6 +71,13 @@ writer, validation, scan, and C interface engines.
 - Arrow C data and C stream import and export.
 - Arrow StringView and BinaryView support. ArrowStrings.jl provides a reusable
   zero-copy StringView representation for Arrow.jl and compatible producers.
+- Fresh Julia columns with a heterogeneous declared `Union` element type are
+  synthesized as canonical dense Arrow Union arrays. Each child uses the
+  recursive core or ArrowTypes.jl mapping supported at that nesting depth.
+- Recursive ArrowTypes.jl custom-type lowering and extension-type restoration
+  for top-level values and values nested in lists, tuples and fixed-size lists,
+  structs, maps, dictionary-encoded values, and freshly synthesized
+  heterogeneous Unions.
 - Structural, semantic, and optional full-content validation tiers.
 - Resource limits for untrusted IPC metadata and buffers.
 - Apache Arrow gold-corpus tests, external IPC oracle tests, C interface oracle
@@ -81,6 +91,17 @@ writer, validation, scan, and C interface engines.
 - A table read from Arrow retains compatible schema details when it is written
   again, including temporal units, dictionary encoding and category order,
   list widths, composite descriptors, nullability, and ordered duplicate
-  metadata. Retained Unions and nested Dictionaries fail clearly because
-  facade materialization discards their routing or pool data.
+  metadata. Fresh heterogeneous Julia Union columns can be synthesized, but a
+  retained Union still fails clearly after facade materialization discards its
+  original routing. Nested Dictionaries fail clearly after their pool data is
+  lost.
 - Writing is validated before bytes are published to the output sink.
+- Custom values are lowered recursively through `ArrowTypes.ArrowType` and
+  `ArrowTypes.toarrow`. Extension names and metadata are written, and reads use
+  `ArrowTypes.JuliaType`, `ArrowTypes.fromarrow`, and
+  `ArrowTypes.fromarrowstruct` to restore registered logical types. An unknown
+  extension name warns and returns its storage value.
+- Scan filters over fields that contain registered ArrowTypes.jl logical types
+  at any depth evaluate over the public materialized values. The mapping
+  interface does not require storage lowering to preserve Julia comparison
+  semantics.

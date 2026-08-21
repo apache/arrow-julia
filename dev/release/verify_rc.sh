@@ -189,8 +189,8 @@ test_source_distribution() {
   pushd src/ArrowStrings
   julia --project -e 'import Pkg; Pkg.build(); Pkg.test()'
   popd
-  # Dev local ArrowStrings to use the version from this release, not from registry
-  julia --project -e 'import Pkg; Pkg.develop(path="src/ArrowStrings"); Pkg.build(); Pkg.test()'
+  # Test the root against both subpackage sources in this approved archive.
+  julia --project -e 'import Pkg; Pkg.develop(path="src/ArrowStrings"); Pkg.develop(path="src/ArrowTypes"); Pkg.build(); Pkg.test()'
 }
 
 VERIFY_SUCCESS=no

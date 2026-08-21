@@ -25,6 +25,9 @@ include("core_tests.jl")
 # The public facade (Arrow.Table / Arrow.Stream / Arrow.write).
 include("facade_tests.jl")
 
+# ArrowTypes logical-type lowering, extension metadata, and lifting.
+include("arrowtypes_compat_tests.jl")
+
 # Seeded end-to-end properties over public IPC paths.
 include("property_tests.jl")
 

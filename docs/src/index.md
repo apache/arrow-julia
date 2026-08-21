@@ -25,7 +25,8 @@ A pure Julia implementation of the [Apache Arrow](https://arrow.apache.org)
 columnar format: the IPC stream and file formats (read and write, with
 memory-mapped and byte-range reads, scan pushdown, and compression), the C
 data and C stream interfaces for in-process exchange with other
-implementations, and Tables.jl integration throughout.
+implementations, recursive ArrowTypes.jl mappings for custom values, and
+Tables.jl integration throughout.
 
 ```julia
 using Arrow
