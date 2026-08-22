@@ -34,7 +34,7 @@ function main(outdir::String)
             for nm in Tables.columnnames(t)
                 length(Tables.getcolumn(t, nm))
             end
-            Arrow.close!(t)
+            Arrow.release!(t)
         end
         for (op, secs) in (("write", twrite), ("read", tread))
             println(

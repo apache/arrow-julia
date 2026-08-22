@@ -138,7 +138,7 @@ end
             ArrowStrings.inline_payload(raw, 1, 5),
             ArrowStrings.view_payload(raw, 7, 13, 0, 6),
         ]
-        strings = ArrowStringVector{ArrowString}(payloads, [raw])
+        strings = StringVector{ArrowString}(payloads, [raw])
         io = IOBuffer()
         Arrow.write(io, (s=strings,); file=false)
         viewbytes = take!(io)

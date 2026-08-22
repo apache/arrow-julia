@@ -55,7 +55,7 @@ file, and for a stream-format object; plan remote filters in each column's
 public value domain.
 
 Columns are materialized (plain `Vector`s): the returned table does not
-borrow the source bytes, and [`Arrow.close!`](@ref) may be called at any
+borrow the source bytes, and [`Arrow.release!`](@ref) may be called at any
 time afterward to release a memory-mapped file deterministically — do this
 on Windows before deleting a mapped file.
 """
@@ -221,15 +221,15 @@ function DataAPI.colmetadata(
 end
 
 """
-    Arrow.close!(t::Union{Table,Stream})
+    Arrow.release!(t::Union{Table,Stream})
 
 Deterministically release the source regions behind a read (a memory map
 unmaps NOW; imported foreign buffers run their release callbacks). `Table`
 columns are materialized copies, so a closed `Table` remains fully usable;
 a closed `Stream` refuses further iteration cleanly. Idempotent.
 """
-function AC.close!(t::Table)
-    foreach(AC.close!, getfield(t, :regions))
+function AC.release!(t::Table)
+    foreach(AC.release!, getfield(t, :regions))
     return nothing
 end
 
@@ -946,7 +946,10 @@ function Stream(source; mmap::Bool=true)
     return Stream(src, _sourceregions(src))
 end
 
-AC.close!(s::Stream) = (foreach(AC.close!, getfield(s, :regions)); nothing)
+function AC.release!(s::Stream)
+    foreach(AC.release!, getfield(s, :regions))
+    return nothing
+end
 
 _nbatches(s::IPCStream) = length(s.batches)
 _nbatches(f::ArrowFile) = length(f)

@@ -63,7 +63,7 @@ function foldascmp(v)
     return s
 end
 
-function sumncodeunits(c::ArrowStringVector{ArrowString})
+function sumncodeunits(c::StringVector{ArrowString})
     t = 0
     for i in eachindex(c)
         t += ncodeunits(c[i])
@@ -76,7 +76,7 @@ end
 # bytes on Julia 1.10) to the kernel it is measuring.
 allocated_hash(v::Vector{ArrowString}) = @allocated(foldashash(v, UInt(9)))
 allocated_cmp(v::Vector{ArrowString}) = @allocated(foldascmp(v))
-allocated_access(c::ArrowStringVector{ArrowString}) = @allocated(sumncodeunits(c))
+allocated_access(c::StringVector{ArrowString}) = @allocated(sumncodeunits(c))
 
 # A column from Strings, laid out the CSV way: inline when it fits, else a
 # view into buffer 0 (`buf`), or into buffer 1 (`extra`) when `inextra(i)`.
@@ -101,7 +101,7 @@ function column(strings::Vector; inextra=i -> false)
         end
     end
     ELT = any(ismissing, strings) ? Union{Missing,ArrowString} : ArrowString
-    return ArrowStringVector{ELT}(payloads, buf, extra)
+    return StringVector{ELT}(payloads, buf, extra)
 end
 
 @testset "ArrowStrings" begin
@@ -181,7 +181,7 @@ end
     @testset "ArrowString: equality, hashing, ordering agree with String" begin
         # inline/view boundary: 12 bytes inline, 13 views the buffer
         col = column(["x"^12, "y"^13])
-        @test col isa ArrowStringVector{ArrowString}
+        @test col isa StringVector{ArrowString}
         @test col[1] == "x"^12 && col[2] == "y"^13
         @test ncodeunits(col[1]) == 12 && ncodeunits(col[2]) == 13
         @test String(col[1]) == "x"^12 && String(col[2]) == "y"^13
@@ -333,10 +333,10 @@ end
         end
     end
 
-    @testset "ArrowStringVector: buffers, missing, materialize, allocation" begin
+    @testset "StringVector: buffers, missing, materialize, allocation" begin
         strings = ["value$(i)_" * "p"^(i % 20) for i = 1:1000]
         col = column(strings; inextra=i -> i % 3 == 0)
-        @test col isa ArrowStringVector{ArrowString}
+        @test col isa StringVector{ArrowString}
         @test length(col) == 1000 && length(col.buffers) == 2
         @test collect(String, col) == strings
         # long values landed in the buffer their index says
@@ -351,7 +351,7 @@ end
 
         withmissing = Any["a", missing, "twelve-bytes", "a much longer value", missing]
         mcol = column(withmissing; inextra=i -> i == 4)
-        @test mcol isa ArrowStringVector{Union{Missing,ArrowString}}
+        @test mcol isa StringVector{Union{Missing,ArrowString}}
         @test isequal(collect(mcol), withmissing)
         @test AS.materialize(mcol) isa Vector{Union{String,Missing}}
         @test isequal(AS.materialize(mcol), withmissing)
@@ -368,7 +368,7 @@ end
             AS.view_payload(b2, 3, 26, 2, 2),
             AS.inline_payload(b1, 1, 6),
         ]
-        ncol = ArrowStringVector{ArrowString}(payloads, Vector{UInt8}[b0, b1, b2])
+        ncol = StringVector{ArrowString}(payloads, Vector{UInt8}[b0, b1, b2])
         @test collect(String, ncol) == [
             "first-buffer-value",
             "second-buffer-value",
@@ -377,32 +377,26 @@ end
         ]
         # Construction rejects every geometry that could make later
         # zero-copy access leave a buffer.
-        @test_throws ArgumentError ArrowStringVector{ArrowString}(
+        @test_throws ArgumentError StringVector{ArrowString}(
             [AS.view_payload(b0, 3, 18, 7, 2)],
             Vector{UInt8}[b0],
         )
-        @test_throws ArgumentError ArrowStringVector{ArrowString}(
+        @test_throws ArgumentError StringVector{ArrowString}(
             [AS.view_payload(b0, 3, 18, 0, 100)],
             Vector{UInt8}[b0],
         )
-        @test_throws ArgumentError ArrowStringVector{ArrowString}(
+        @test_throws ArgumentError StringVector{ArrowString}(
             [AS.PAYLOAD_MISSING],
             Vector{UInt8}[],
         )
-        @test_throws ArgumentError ArrowStringVector{Int}(
-            ArrowStringPayload[],
-            Vector{UInt8}[],
-        )
+        @test_throws ArgumentError StringVector{Int}(ArrowStringPayload[], Vector{UInt8}[])
         badmissing = ArrowStringPayload(UInt64(0xfffffffe), zero(UInt64))
-        @test_throws ArgumentError ArrowStringVector{Union{Missing,ArrowString}}(
+        @test_throws ArgumentError StringVector{Union{Missing,ArrowString}}(
             [badmissing],
             Vector{UInt8}[],
         )
         badprefix = ArrowStringPayload(payloads[1].a ⊻ (UInt64(1) << 32), payloads[1].b)
-        @test_throws ArgumentError ArrowStringVector{ArrowString}(
-            [badprefix],
-            Vector{UInt8}[b0],
-        )
+        @test_throws ArgumentError StringVector{ArrowString}([badprefix], Vector{UInt8}[b0])
         short = AS.inline_payload(b1, 1, 5)
         badpadding = ArrowStringPayload(short.a, short.b | (UInt64(1) << 8))
         @test_throws ArgumentError ArrowString(badpadding, AS.EMPTY_BYTES)

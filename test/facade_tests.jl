@@ -146,7 +146,7 @@ end
         @test_throws KeyError DataAPI.metadata(t, "absent")
         # Materialized columns survive deterministic release; the mapping
         # is gone, so the file is deletable everywhere (the Windows case).
-        Arrow.close!(t)
+        Arrow.release!(t)
         @test t.ints == MIXED.ints
         rm(path)
     end
@@ -295,12 +295,12 @@ end
         end
     end
 
-    @testset "mmap path and close!" begin
+    @testset "mmap path and release!" begin
         path = tempname()
         Arrow.write(path, (x=collect(Int64, 1:10),))
         t = Arrow.Table(path)   # mmap by default for ARROW1 files
         @test t.x == 1:10
-        Arrow.close!(t)
+        Arrow.release!(t)
         rm(path)                # deletable post-close on every platform
         @test t.x == 1:10
     end
@@ -1502,7 +1502,7 @@ end
     end
 
     @testset "ArrowStrings columns write as Utf8View, zero-copy" begin
-        # A ArrowStringVector's memory IS a Utf8View array: payloads are the
+        # A StringVector's memory IS a Utf8View array: payloads are the
         # views buffer, its byte buffers the variadic data buffers. Build one
         # the way the CSV kernel does (inline ≤12, else a view into buffer 0
         # or the `extra` buffer 1) and check the writer wraps rather than
@@ -1518,7 +1518,7 @@ end
             ArrowStrings.PAYLOAD_MISSING,
             ArrowStrings.view_payload(extra, 1, length(extra), 1, 0),
         ]
-        col = ArrowStringVector{Union{Missing,ArrowString}}(payloads, buf, extra)
+        col = StringVector{Union{Missing,ArrowString}}(payloads, buf, extra)
         f, d = Arrow._writecolumn("s", col)
         @test f.type == Arrow.AC.ViewType(true) && f.nullable
         @test d.buffers[2].region.root === payloads       # views: the payload vector itself
@@ -1532,7 +1532,7 @@ end
         @test eltype(t.s) === Union{Missing,String}
         @test isequal(t.s, ["abcd", "thirteen-byte", missing, "she said \"hi\" and left"])
         # a non-nullable column declares non-nullable
-        col0 = ArrowStringVector{ArrowString}(payloads[[1, 2]], buf, extra)
+        col0 = StringVector{ArrowString}(payloads[[1, 2]], buf, extra)
         f0, _ = Arrow._writecolumn("s", col0)
         @test !f0.nullable
         Arrow.write(io, (s=col0,))
@@ -1540,7 +1540,7 @@ end
         # an all-inline column may have ZERO data buffers — the format allows
         # a Utf8View with no variadic buffers, and the wire carries exactly
         # the fixed validity + views pair
-        inl = ArrowStringVector{ArrowString}(
+        inl = StringVector{ArrowString}(
             [
                 ArrowStrings.inline_payload(buf, abcd, 4),
                 ArrowStrings.inline_payload(buf, abcd, 2),

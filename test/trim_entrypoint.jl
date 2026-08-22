@@ -22,6 +22,7 @@
 
 include(joinpath(@__DIR__, "..", "src", "ArrowCore.jl"))
 using .ArrowCore
+import .ArrowCore: release!
 const AC = ArrowCore
 # The C data interface is part of the trim-safe surface: a trimmed binary
 # that moves columns across the C seams is the canonical embedding use.
@@ -75,16 +76,16 @@ function exercise_mmap(dir::String)::Nothing
         root isa Vector{UInt8} && length(root) == 8,
         "mmap region root is not the stdlib-mapped array",
     )
-    # Deterministic release: close! unmaps NOW (the Windows delete-a-mapped-
+    # Deterministic release: release! unmaps NOW (the Windows delete-a-mapped-
     # file case) and later access is a clean error, not a fault.
-    close!(r)
+    release!(r)
     caught = false
     try
         AC.loadat(b, UInt32, Int64(4))
     catch e
         caught = e isa InvalidStateException
     end
-    checked(caught, "use after close! accepted")
+    checked(caught, "use after release! accepted")
     return nothing
 end
 
@@ -111,9 +112,9 @@ function exercise_cdata()::Nothing
     tm = materialize(Int64, f2, d2)
     checked(tm isa Vector{Int64} && tm == Int64[1, 2, 3], "cdata typed materialize failed")
     checked(nullcount(d2) == 0, "cdata round-trip nullcount failed")
-    # close! on the imported region runs the foreign release callback now;
+    # release! on the imported region runs the foreign release callback now;
     # the export registry must be empty once the consumer releases.
-    close!(d2.buffers[2].region::OwnerRegion)
+    release!(d2.buffers[2].region::OwnerRegion)
     caught = false
     try
         getvalue(f2, d2, 1)

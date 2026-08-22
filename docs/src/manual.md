@@ -82,7 +82,7 @@ concrete element type determined by the Arrow schema (see [Type
 mapping when reading](@ref)). A `Table` therefore does not borrow the source bytes after
 it is constructed, and its columns behave like any other Julia vectors.
 
-### Memory mapping and `close!`
+### Memory mapping and `release!`
 
 A path to a file-format source is memory-mapped by default (`mmap=true`), so
 reading a large file does not copy it into RAM up front; pass `mmap=false`
@@ -90,16 +90,16 @@ to read it into memory instead (a stream-format path is always read into
 memory). A memory map is released when the last reference to it
 is garbage collected. To release it deterministically — required on Windows
 before a still-mapped file can be deleted, and useful anywhere for prompt
-resource release — call [`Arrow.close!`](@ref):
+resource release — call [`Arrow.release!`](@ref):
 
 ```julia
 tbl = Arrow.Table("data.arrow")
 # ... use tbl ...
-Arrow.close!(tbl)                          # unmaps NOW; tbl's columns remain usable
+Arrow.release!(tbl)                          # unmaps NOW; tbl's columns remain usable
 rm("data.arrow")
 ```
 
-`close!` is idempotent. Because a `Table`'s columns are copies, a closed
+`release!` is idempotent. Because a `Table`'s columns are copies, a closed
 `Table` remains fully usable; a closed [`Arrow.Stream`](@ref) refuses
 further iteration cleanly.
 
@@ -378,7 +378,7 @@ At the *top level* of a column the facade adds:
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
 | `NamedTuple` whose fields are core columns | Struct (no top-level nulls — wrap fields as nullable children instead) |
 | `Arrow.DictEncode` over a writable column | Dictionary of the recursive mapping of its values |
-| `ArrowStrings.ArrowStringVector` | Utf8View, **zero-copy** — the column's memory is the Arrow array (see below) |
+| `ArrowStrings.StringVector` | Utf8View, **zero-copy** — the column's memory is the Arrow array (see below) |
 
 These native facade conversions do not recurse: a `Vector{Date}` inside a
 list, a `Date` or `SubString` field of a `NamedTuple`, or `DictEncode` over
@@ -458,7 +458,7 @@ Arrow 3.0 physical layout.
 (a separate package that lives in this repository) defines
 `ArrowString`, a 16-byte string value that *is* an Arrow StringView entry
 (inline up to 12 bytes, otherwise a prefix plus buffer index and offset),
-and `ArrowStringVector`, a column of them over a set of byte buffers —
+and `StringVector`, a column of them over a set of byte buffers —
 which *is* an Arrow Utf8View array's memory. A parser or other producer can
 build this representation directly. `Arrow.write` then wraps its payload
 vector and buffers as the Arrow column without repacking them or
@@ -504,7 +504,7 @@ converts imported column data back to a Julia vector.
 * `Arrow.from_c_data(schemaptr, arrayptr) -> (field, data)` imports one
   column, *moving* the array (its source `release` is nulled, as the spec
   requires). The imported buffers stay valid as long as the returned data is
-  reachable; `Arrow.close!` on the owner region behind any imported buffer
+  reachable; `Arrow.release!` on the owner region behind any imported buffer
   (`buffer.region`), or `Arrow.release!` on the import's `ForeignOwner`,
   runs the producer's release callback exactly once.
 * `Arrow.export_stream!(streamptr, schema, batches)` fills a caller-owned

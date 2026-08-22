@@ -209,15 +209,24 @@ function cdata_battery()
     @assert reap!() == 0
     println("double release is exactly-once ✓")
 
-    # Explicit owner release is one call for the whole imported tree — no
-    # per-buffer close exists. What it does NOT do is revoke access: touching
-    # a slice after an explicit release! is undefined behavior, exactly the
-    # post-release rule the C Data spec imposes on its own consumers. The
-    # checkable contract is the exactly-once flag every owner carries.
-    for (_, d2) in imported
+    # Explicit owner release is one call for the whole imported tree. It
+    # revokes every region over the import first, so touching a slice after
+    # it is a clean InvalidStateException rather than the C Data spec's
+    # post-release undefined behavior; the exactly-once flag every owner
+    # carries records the producer release.
+    for (f2, d2) in imported
         @assert (@atomic (d2.owner::ForeignOwner).released)
+        isempty(d2.buffers) && continue
+        slice = d2.buffers[end]
+        slice.region === nothing && continue
+        @assert try
+            AC.loadat(slice, UInt8, Int64(0))
+            false
+        catch e
+            e isa InvalidStateException
+        end
     end
-    println("released owners are flagged; post-release access is out of contract ✓")
+    println("released owners are flagged and revoked ✓")
 
     # Format parity with Core's accessor set: every mapped descriptor
     # round-trips its format string, declared geometry, and values through
@@ -1655,7 +1664,7 @@ function cdata_battery()
     @assert collect(mf2.metadata) == ["k" => "v", "empty" => ""]
     @assert collect(mf2.children[1].metadata) == ["lk" => "lv"]
     @assert getvalue(mf2, mld2, 1) == Any[1, 2]
-    close!(mld2.buffers[2].region::OwnerRegion)
+    release!(mld2.buffers[2].region::OwnerRegion)
     reap!()
     dvf, dvd = AC.fromjulia_dict("d", ["lo", "hi"], [0, 1, missing])
     dmf = Field(
@@ -1675,7 +1684,7 @@ function cdata_battery()
     df2, dd2 = from_c_data(dsp, dap)
     @assert collect(df2.metadata) == ["dk" => "dv"]
     @assert getvalue(df2, dd2, 2) == "hi"
-    close!(dd2.buffers[2].region::OwnerRegion)
+    release!(dd2.buffers[2].region::OwnerRegion)
     reap!()
     # A foreign producer annotating the DEPENDENT node too (extension-type
     # metadata is legal there) loses no pair on import: wrapper pairs
@@ -1707,14 +1716,14 @@ function cdata_battery()
         )
         wf2, wd2 = from_c_data(wsp, wap)
         @assert collect(wf2.metadata) == ["dk" => "dv", "vk" => "vv"]
-        close!(wd2.buffers[2].region::OwnerRegion)
+        release!(wd2.buffers[2].region::OwnerRegion)
         reap!()
     end
     pf, pd = fromjulia("plain", Int64[1])
     psp, pap = to_c_data(pf, pd)
     pf2, pd2 = from_c_data(psp, pap)
     @assert pf2.metadata === nothing
-    close!(pd2.buffers[2].region::OwnerRegion)
+    release!(pd2.buffers[2].region::OwnerRegion)
     reap!()
     # Hostile blobs refuse: negative counts and lengths would wrap the walk.
     for negblob in (

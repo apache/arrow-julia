@@ -20,7 +20,7 @@
 
 An inline-else-view string representation for Arrow.jl and compatible parsers:
 `ArrowString`, a 16-byte string value that IS an Arrow StringView entry, and
-`ArrowStringVector`, a column of them over a set of byte buffers that IS an
+`StringVector`, a column of them over a set of byte buffers that IS an
 Arrow Utf8View array's memory. A column parsed into this representation can be
 written as an Arrow column without repacking its payloads or data buffers.
 
@@ -44,12 +44,12 @@ column out to `Vector{String}`. Everything here depends only on Base and is
 concrete-typed throughout, so it compiles under JuliaC `--trim`.
 
 Lifetime: an `ArrowString` view pins its buffer (`data`), and a
-`ArrowStringVector` pins all of its buffers, exactly like any zero-copy
+`StringVector` pins all of its buffers, exactly like any zero-copy
 string view; a consumer that must outlive the source materializes.
 """
 module ArrowStrings
 
-export ArrowString, ArrowStringVector, ArrowStringPayload
+export ArrowString, StringVector, ArrowStringPayload
 
 # Keep builders and payload accessors namespaced. Julia 1.11 tooling can still
 # distinguish this supported surface from the package's private fast paths.
@@ -509,8 +509,8 @@ end
 Base.print(io::IO, s::ArrowString) = (write(io, s); nothing)
 
 """
-    ArrowStringVector{ELT}(payloads, buffers::Vector{Vector{UInt8}})
-    ArrowStringVector{ELT}(payloads, buf::Vector{UInt8}, extra::Vector{UInt8})
+    StringVector{ELT}(payloads, buffers::Vector{Vector{UInt8}})
+    StringVector{ELT}(payloads, buf::Vector{UInt8}, extra::Vector{UInt8})
 
 A string column: one payload per element and the byte buffers that view
 payloads point into (`buffers[bufidx + 1]` for an entry's buffer index).
@@ -528,16 +528,16 @@ This is an Arrow Utf8View array's memory: `payloads` is its views buffer and
 repacking either one. The two-buffer constructor is the CSV shape: buffer 0
 the input, buffer 1 the column's `extra` buffer of unescaped values.
 """
-struct ArrowStringVector{ELT} <: AbstractVector{ELT}
+struct StringVector{ELT} <: AbstractVector{ELT}
     payloads::Vector{ArrowStringPayload}
     buffers::Vector{Vector{UInt8}}
-    function ArrowStringVector{ELT}(
+    function StringVector{ELT}(
         payloads::Vector{ArrowStringPayload},
         buffers::Vector{Vector{UInt8}},
     ) where {ELT}
         (ELT === ArrowString || ELT === Union{Missing,ArrowString}) || throw(
             ArgumentError(
-                "ArrowStringVector element type must be ArrowString or Union{Missing,ArrowString}",
+                "StringVector element type must be ArrowString or Union{Missing,ArrowString}",
             ),
         )
         missingok = Missing <: ELT
@@ -560,15 +560,19 @@ struct ArrowStringVector{ELT} <: AbstractVector{ELT}
         return new{ELT}(payloads, buffers)
     end
 end
-ArrowStringVector{ELT}(
+function StringVector{ELT}(
     payloads::Vector{ArrowStringPayload},
     buf::Vector{UInt8},
     extra::Vector{UInt8},
-) where {ELT} = ArrowStringVector{ELT}(payloads, Vector{UInt8}[buf, extra])
+) where {ELT}
+    return StringVector{ELT}(payloads, Vector{UInt8}[buf, extra])
+end
 
-Base.size(v::ArrowStringVector) = size(v.payloads)
+function Base.size(v::StringVector)
+    return size(v.payloads)
+end
 Base.@propagate_inbounds @inline function Base.getindex(
-    v::ArrowStringVector{ELT},
+    v::StringVector{ELT},
     i::Int,
 ) where {ELT}
     @boundscheck checkbounds(v.payloads, i)
@@ -581,7 +585,7 @@ end
 # All-present columns skip the missing branch entirely — the concrete return
 # type is what lets access compile down to zero allocations.
 Base.@propagate_inbounds @inline function Base.getindex(
-    v::ArrowStringVector{ArrowString},
+    v::StringVector{ArrowString},
     i::Int,
 )
     @boundscheck checkbounds(v.payloads, i)
@@ -592,12 +596,12 @@ Base.@propagate_inbounds @inline function Base.getindex(
 end
 
 """
-    materialize(v::ArrowStringVector) -> Vector{String} or Vector{Union{String,Missing}}
+    materialize(v::StringVector) -> Vector{String} or Vector{Union{String,Missing}}
 
 Copy every element out to a plain `String`, detaching the result from the
 column's buffers.
 """
-function materialize(v::ArrowStringVector{ELT}) where {ELT}
+function materialize(v::StringVector{ELT}) where {ELT}
     out = Vector{ELT === ArrowString ? String : Union{String,Missing}}(undef, length(v))
     scratch = Vector{UInt8}(undef, 16)   # inline payloads reconstruct via two word stores
     GC.@preserve scratch begin

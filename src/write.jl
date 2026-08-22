@@ -162,7 +162,7 @@ end
 # An ArrowStrings column IS Utf8View memory: its payload vector is the views
 # buffer and its byte buffers are the variadic data buffers — no copy, no
 # String materialization; the declared nullability is the column's eltype's.
-function _writecolumn(name::String, v::ArrowStrings.ArrowStringVector)
+function _writecolumn(name::String, v::ArrowStrings.StringVector)
     return AC.fromviewentries(name, v.payloads, v.buffers; nullable=eltype(v) >: Missing)
 end
 

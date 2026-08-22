@@ -292,22 +292,22 @@ end
             @test isequal(materialize(f, d), vals)
         end
 
-        @testset "close! releases deterministically" begin
+        @testset "release! releases deterministically" begin
             f, d = fromjulia("x", Int64[1, 2, 3])
             buf = d.buffers[2]
             @test AC.loadat(buf, Int64, Int64(0)) == 1
             r = buf.region::OwnerRegion
-            # A heap region is a BORROW: close! revokes but must not run the
+            # A heap region is a BORROW: release! revokes but must not run the
             # caller's own finalizers on the borrowed vector.
             borrowed = r.root::Vector{Int64}
             callerfin = Ref(false)
             finalizer(_ -> callerfin[] = true, borrowed)
-            close!(r)
+            release!(r)
             @test !callerfin[]
             @test_throws InvalidStateException AC.loadat(buf, Int64, Int64(0))
             @test_throws InvalidStateException AC.slicebytes(buf)
             @test_throws InvalidStateException materialize(f, d)
-            close!(r)   # idempotent
+            release!(r)   # idempotent
             GC.@preserve borrowed nothing
 
             # Regions sharing one ReleaseCell are revoked together and the
@@ -319,10 +319,10 @@ end
             rb = GC.@preserve v2 OwnerRegion(pointer(v2), 2; root=v2, cell=cell)
             sa, sb = BufferSlice(ra, 0, 2), BufferSlice(rb, 0, 2)
             @test AC.loadat(sb, UInt8, Int64(0)) == 0x03
-            close!(ra)
+            release!(ra)
             @test_throws InvalidStateException AC.loadat(sa, UInt8, Int64(0))
             @test_throws InvalidStateException AC.loadat(sb, UInt8, Int64(0))
-            close!(rb)
+            release!(rb)
             @test released[] == 1
 
             # An mmap-backed region actually unmaps NOW: the release targets the
@@ -337,7 +337,7 @@ end
             @test AC.loadat(mslice, UInt8, Int64(0)) == 0x00
             unmapped = Ref(false)
             finalizer(_ -> unmapped[] = true, AC._mmaproot(mr.root::Vector{UInt8}))
-            close!(mr)
+            release!(mr)
             @test unmapped[]
             @test_throws InvalidStateException AC.loadat(mslice, UInt8, Int64(0))
             rm(path)

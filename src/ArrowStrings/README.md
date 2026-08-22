@@ -31,7 +31,7 @@ a `[sources]` path entry.
   offset)` into a byte buffer. Byte access, `==`, `cmp`/`isless`, `hash`,
   and iteration never allocate and agree with `String`; `String(s)` copies
   out.
-* `ArrowStringVector{ELT}` — a column of them: a payload vector plus the
+* `StringVector{ELT}` — a column of them: a payload vector plus the
   byte buffers the views point into. That is an Arrow Utf8View array's
   memory (views buffer + variadic data buffers), so Arrow.jl can write the
   column without repacking its payloads or data buffers.
@@ -49,7 +49,7 @@ using ArrowStrings
 buf = Vector{UInt8}(codeunits("id,name\n1,abcd\n2,a much longer value\n"))
 payloads = [ArrowStrings.inline_payload(buf, 11, 4),
             ArrowStrings.view_payload(buf, 18, 19, 0, 17)]
-col = ArrowStringVector{ArrowString}(payloads, buf, UInt8[])
+col = StringVector{ArrowString}(payloads, buf, UInt8[])
 col[2] == "a much longer value"     # true, no allocation
 ```
 

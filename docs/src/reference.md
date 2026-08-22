@@ -26,7 +26,7 @@
 ```@docs
 Arrow.Table
 Arrow.Stream
-Arrow.close!(::Arrow.Table)
+Arrow.release!(::Arrow.Table)
 ```
 
 ## Write
@@ -72,7 +72,6 @@ Arrow.ImportedStream
 Arrow.nextbatch!
 Arrow.release!(::Arrow.ForeignOwner)
 Arrow.release!(::Arrow.ImportedStream)
-Arrow.close!(::Arrow.ForeignOwner)
 Arrow.reap!
 ```
 

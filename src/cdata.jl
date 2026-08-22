@@ -51,10 +51,9 @@
 #     Validity is reachability: every imported region's `root` is the
 #     ForeignOwner, so the producer's memory outlives every slice by
 #     construction. Every region over one import shares one `ReleaseCell`, so
-#     `close!` on any of them revokes all siblings and then runs the
-#     producer's release exactly once; the raw `release!` skips revocation,
-#     and touching the tree after it is the C Data spec's own post-release
-#     undefined behavior.
+#     `release!` on the owner or on any of its regions revokes all siblings
+#     (later access is a clean `InvalidStateException`) and then runs the
+#     producer's release exactly once.
 #
 #   * Streams: `ArrowArrayStream` maps in both directions with one
 #     independently-owned export root per result and exception-safe
@@ -937,11 +936,12 @@ end
 # Import: C structs -> Core, one ForeignOwner per moved tree
 # ---------------------------------------------------------------------------
 
-# ReleaseCell action: routes cell revocation through release!(::ForeignOwner).
+# ReleaseCell action: the producer release, run once the cell has revoked
+# every region over the import.
 function _release_owner_action(p::Ptr{Cvoid})::Cvoid
     slot = unsafe_pointer_to_objref(p)::Base.RefValue{Any}
     x = slot[]
-    x === nothing || release!(x)
+    x === nothing || _release_foreign_owner!(x::ForeignOwner, Libc.free)
     return nothing
 end
 
@@ -967,8 +967,8 @@ mutable struct ForeignOwner
     # ONE revocation cell for every OwnerRegion built over this import: the
     # producer's release frees the whole tree at once, so closing any
     # imported buffer must revoke all of its siblings first (they share this
-    # lifetime). The cell's release action routes through `release!`, which
-    # stays exactly-once against the GC-finalizer path.
+    # lifetime). `release!` revokes through the cell, whose action runs the
+    # producer release — exactly-once against the GC-finalizer path.
     const cell::AC.ReleaseCell
     function ForeignOwner(arr::CArrowArray, registerfinalizer)
         block = Libc.malloc(sizeof(CArrowArray))
@@ -1030,27 +1030,21 @@ end
 """
     release!(owner::ForeignOwner)
 
-Run the producer's release callback (if armed) on the malloc'd struct copy,
-check the producer nulled the copy's release field (the C Data conformance
-rule), and free the copy. Exactly-once: a single atomic swap picks the one
-releaser between explicit calls and the GC finalizer; later calls return
-immediately. After an explicit release, touching any slice imported from
-this tree is undefined behavior — the C Data spec's own post-release rule.
-A conformance failure throws; from the finalizer path Julia reports it as a
-finalizer error.
+Deterministically release an imported C-data tree: every `OwnerRegion`
+built over the import is revoked through the shared cell (later access is
+an `InvalidStateException`), then the producer's release callback (if
+armed) runs on the malloc'd struct copy, the copy's release field is
+checked to have been nulled (the C Data conformance rule), and the copy is
+freed. Exactly-once: a single atomic swap picks the one releaser between
+explicit calls and the GC finalizer; later calls return immediately. The
+entry point for imports whose arrays are empty and carry no region at all
+(`ArrayData.owner` is then the only handle on the lifetime). A conformance
+failure throws; from the finalizer path Julia reports it as a finalizer
+error.
 """
-release!(o::ForeignOwner) = _release_foreign_owner!(o, Libc.free)
-
-"""
-    close!(owner::ForeignOwner)
-
-Deterministically release an imported C-data tree through its shared
-revocation cell: every `OwnerRegion` built over the import is revoked, then
-the producer's release callback runs exactly once. The entry point for
-imports whose arrays are empty and carry no region at all (`ArrayData.owner`
-is then the only handle on the lifetime).
-"""
-AC.close!(o::ForeignOwner) = AC.close!(o.cell)
+function release!(o::ForeignOwner)
+    return release!(o.cell)
+end
 
 function _release_foreign_owner!(o::ForeignOwner, deallocate!)
     @atomicswap(o.released = true) && return nothing

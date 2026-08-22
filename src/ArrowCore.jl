@@ -34,8 +34,8 @@ Design rules:
 2. Memory validity is GC reachability, plus one revocation bit. Every
    buffer is a `BufferSlice` into an `OwnerRegion` — a (pointer, length,
    alignment, root, cell) record whose `root` anchors the backing storage
-   and whose `ReleaseCell` supports `close!`: regions sharing one
-   underlying lifetime share one cell, so a close revokes every sibling and
+   and whose `ReleaseCell` supports `release!`: regions sharing one
+   underlying lifetime share one cell, so a release revokes every sibling and
    runs the release action (mmap unmap, foreign release callback) exactly
    once, and later access is a clean error. Slices are bounds-checked
    against the region at construction; loads are a final bounds check, one
@@ -84,7 +84,7 @@ export OwnerRegion,
     BufferSlice,
     heapregion,
     mmapregion,
-    close!,
+    release!,
     ReleaseCell,
     ReleaseCounter,
     increment!,
@@ -140,13 +140,13 @@ export OwnerRegion,
 # whatever keeps the memory alive (the wrapped Julia array, the Mmap-stdlib
 # array, a C-data adapter's owner object); views hold their region, the
 # region holds its root, so memory a view can reach is memory that is
-# valid. `close!` is the deterministic release path on top: one
+# valid. `release!` is the deterministic release path on top: one
 # `ReleaseCell` per underlying lifetime revokes every region over it and
 # runs the eager release action exactly once (unmap now; run the foreign
-# release now), turning use-after-close into `InvalidStateException`
+# release now), turning use-after-release into `InvalidStateException`
 # instead of undefined behavior. What stays out of scope, so the contract
 # is informed:
-#   * Data-race shielding for loads concurrent WITH close!: quiescing
+#   * Data-race shielding for loads concurrent WITH release!: quiescing
 #     readers first is the caller's contract, as with `Base.close` on a
 #     shared IO. Loads take no locks.
 #   * External-truncation protection: a shared mapping's pages can vanish
@@ -196,15 +196,15 @@ ReleaseCell(action::Ptr{Cvoid}, arg) = ReleaseCell(false, action, arg)
 ReleaseCell() = ReleaseCell(false, Ptr{Cvoid}(C_NULL), nothing)
 
 """
-    close!(cell::ReleaseCell)
+    release!(cell::ReleaseCell)
 
 Revoke every region sharing the cell — later raw access throws
 `InvalidStateException` — and run the cell's release action exactly once.
-Idempotent. Not a data-race shield for accesses concurrent WITH the close;
+Idempotent. Not a data-race shield for accesses concurrent WITH the release;
 quiescing readers first is the caller's contract, as with `Base.close` on
 a shared IO.
 """
-function close!(cell::ReleaseCell)
+function release!(cell::ReleaseCell)
     (@atomicswap :acquire_release cell.closed = true) && return nothing
     if cell.action != C_NULL
         arg = cell.arg
@@ -219,7 +219,7 @@ end
 One contiguous memory region, the object that keeps it alive, and the
 [`ReleaseCell`](@ref) that can revoke it. The region is valid while it is
 reachable — `root` anchors the backing storage (a borrowed Julia array, the
-Mmap-stdlib array, or an adapter's owner object) — or until `close!` runs
+Mmap-stdlib array, or an adapter's owner object) — or until `release!` runs
 its cell's release action, after which every raw access through `sliceptr`
 throws. Slices reject geometry outside the declared `len` at construction;
 loads retain a final bounds check before the raw read.
@@ -262,7 +262,7 @@ struct OwnerRegion
 end
 
 """
-    close!(r::OwnerRegion)
+    release!(r::OwnerRegion)
 
 Deterministically release the region's backing storage through its
 `ReleaseCell`: every region sharing the cell is revoked (later raw
@@ -273,7 +273,9 @@ Windows being the canonical case); an imported C-data tree runs the
 producer's release callback; a borrowed heap region is revoked with no
 eager action. Idempotent.
 """
-close!(r::OwnerRegion) = close!(r.cell)
+function release!(r::OwnerRegion)
+    return release!(r.cell)
+end
 
 """
     heapregion(v::Vector{T}) -> OwnerRegion
@@ -288,7 +290,7 @@ end
 # `_mmaproot(arr)`: the object Mmap registered its unmap finalizer on — the
 # array's backing `Memory` from Julia 1.11 (`finalize(arr)` is then a
 # no-op), the array itself before. The release cell targets that object so
-# `close!` truly unmaps now.
+# `release!` truly unmaps now.
 @static if VERSION >= v"1.11"
     _mmaproot(arr::Vector{UInt8}) = arr.ref.mem
     function _release_mmap(p::Ptr{Cvoid})::Cvoid
@@ -364,7 +366,7 @@ isempty_buffer(b::BufferSlice) = b.len == 0
     b.region === nothing && return Ptr{UInt8}(0)
     r = b.region::OwnerRegion
     (@atomic :monotonic r.cell.closed) &&
-        throw(InvalidStateException("the backing region was released by close!", :closed))
+        throw(InvalidStateException("the backing region was released", :closed))
     return r.ptr + b.offset
 end
 

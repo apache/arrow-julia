@@ -40,7 +40,7 @@ scope of every layer.
 | `src/scan.jl` | `Tables.Scan` pushdown over the file format, sparse byte-range reads over a source (`SourceFile`), embedded per-batch statistics |
 | `src/table.jl`, `src/write.jl` | The facade |
 | `ext/ArrowCloudStoreExt.jl` | CloudStore.jl objects as sources: HTTP `Range` reads, concurrent per planned range |
-| `src/ArrowStrings/` | ArrowStrings.jl — the shared inline-else-view string representation (`ArrowString`, `ArrowStringVector` = Utf8View memory); a separate package, registered on its own like ArrowTypes, that Arrow depends on through a `[sources]` path entry until its first release |
+| `src/ArrowStrings/` | ArrowStrings.jl — the shared inline-else-view string representation (`ArrowString`, `StringVector` = Utf8View memory); a separate package, registered on its own like ArrowTypes, that Arrow depends on through a `[sources]` path entry until its first release |
 | `src/ArrowTypes/` | ArrowTypes.jl — the separate custom-type interface package; the facade applies its lowering and extension hooks recursively |
 | `test/` | Core unit tests, facade tests, the four adapter acceptance batteries, the frozen 2.x-written fixtures, the `--trim=safe` gate |
 | `conformance/` | The arrow-testing gold-corpus runner, the integration-JSON implementation, the pyarrow/nanoarrow IPC oracle, the in-process pyarrow C Data / C Stream oracle |
@@ -101,14 +101,14 @@ region over one underlying lifetime. Loads are a bounds check, one monotonic
 closed-flag load, and the raw read — no lock, no guard, no state machine on
 the hot path.
 
-`close!` is the deterministic release: it revokes every region sharing the
+`release!` is the deterministic release: it revokes every region sharing the
 cell (later raw access throws `InvalidStateException`) and then runs the
 cell's release action exactly once. An mmap region unmaps NOW (the eager
 path exists for hosts where a GC-timed unmap is not enough — deleting a
 still-mapped file on Windows being the canonical case); an imported C-data
 tree runs the producer's release callback; a borrowed heap region is revoked
 with no eager action (running a borrowed object's finalizers is not ours to
-do). `close!` is idempotent and is not a data-race shield for accesses
+do). `release!` is idempotent and is not a data-race shield for accesses
 concurrent WITH the close — quiescing readers first is the caller's
 contract, as with `Base.close` on a shared IO. Every buffer imported from
 one C-data tree is backed by regions sharing one cell, so closing any of
@@ -117,7 +117,7 @@ those regions revokes all siblings before the single producer release.
 What the model does not do: nothing prevents external writes to or
 truncation of a mapped file while the mapping or cached validation results
 are in use (no userspace scheme can). On systems that prohibit deleting an
-active mapping, `close!` (or collection) must complete before the path can
+active mapping, `release!` (or collection) must complete before the path can
 be deleted.
 
 Exactly-once release lives in the adapters' owners: the C-data
@@ -178,7 +178,7 @@ views buffer and every data buffer is retained by identity; only the
 validity bitmap is built, and long-entry geometry (offsets inside their
 buffer, prefixes matching the data) is checked by semantic/full validation,
 not at construction. The facade's `Arrow.write` routes
-`ArrowStrings.ArrowStringVector` columns through it.
+`ArrowStrings.StringVector` columns through it.
 
 ### IPC
 

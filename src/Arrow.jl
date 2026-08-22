@@ -21,7 +21,7 @@ Public surface: `Arrow.Table` reads the IPC stream and file formats (paths,
 `IO`, byte vectors, or an `AbstractArrowSource` — a byte-range-addressable
 object such as one in cloud storage) as Tables.jl tables, with `Tables.Scan`
 pushdown; `Arrow.Stream` iterates a source one record batch at a time;
-`Arrow.write` writes any Tables.jl source; `close!` releases mapped or
+`Arrow.write` writes any Tables.jl source; `release!` releases mapped or
 foreign storage deterministically.
 
 Layering ([docs/dev/core-README.md](https://github.com/apache/arrow-julia/blob/main/docs/dev/core-README.md)
@@ -89,6 +89,7 @@ end
 
 include("ArrowCore.jl")
 using .ArrowCore
+import .ArrowCore: release!
 const AC = ArrowCore
 
 include("ipc_read.jl")
@@ -204,13 +205,12 @@ AC.ValidationError
             :ForeignOwner,
             :ImportedStream,
             :nextbatch!,
-            :release!,
             :reap!,
             :ValidationError,
         ),
     )
 end
 
-export close!
+export release!
 
 end # module Arrow

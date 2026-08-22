@@ -61,12 +61,12 @@ when needed. Read independent IPC sources separately and combine their tables
 with a Tables.jl-aware consumer.
 
 The source can still be memory-mapped while it is read. The returned columns
-do not borrow the map. Call [`Arrow.close!`](@ref) when you need to release a
+do not borrow the map. Call [`Arrow.release!`](@ref) when you need to release a
 mapped file at a known time:
 
 ```julia
 table = Arrow.Table("data.arrow")
-Arrow.close!(table)
+Arrow.release!(table)
 rm("data.arrow")
 
 # The materialized columns are still valid.

@@ -56,7 +56,7 @@ writer, validation, scan, and C interface engines.
 - `Arrow.getmetadata` was replaced by the DataAPI.jl metadata interface.
 - The package now has a narrow export surface. Use names such as
   `Arrow.Table`, `Arrow.Stream`, `Arrow.write`, and `Arrow.DictEncode` through
-  the `Arrow` namespace. Only `close!` is exported.
+  the `Arrow` namespace. Only `release!` is exported.
 - Big-endian IPC and delta-dictionary messages are rejected.
 - Arrow 3.0 requires ArrowTypes.jl 2.x, a Tables.jl release that provides
   `Tables.Scan`, and the ArrowStrings.jl 1.0 release. The final Tables.jl lower
@@ -86,7 +86,7 @@ writer, validation, scan, and C interface engines.
 ### Changed
 
 - `Arrow.Stream` yields materialized `Arrow.Table` batches.
-- A file-format path is memory-mapped by default. Call `Arrow.close!` to release
+- A file-format path is memory-mapped by default. Call `Arrow.release!` to release
   the map at a known time. Materialized table columns remain usable afterward.
 - A table read from Arrow retains compatible schema details when it is written
   again, including temporal units, dictionary encoding and category order,
