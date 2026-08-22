@@ -48,9 +48,8 @@ function workload_lists()
 end
 
 function workload_dictpool()
-    # DictEncode exists under the same name in 2.x and 3.0: both legs time
-    # pool construction + dictionary write from plain strings, matching the
-    # PyArrow leg's timed dictionary_encode + write.
+    # The leg times pool construction + dictionary write from plain
+    # strings, matching the PyArrow leg's timed dictionary_encode + write.
     n = BENCH_ROWS_DICT
     return (d=Arrow.DictEncode([string("cat-", i % 32) for i = 1:n]),)
 end

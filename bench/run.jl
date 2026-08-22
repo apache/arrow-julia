@@ -14,20 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Serialize/deserialize benchmark driver: Arrow.jl 3.0 vs
-# Arrow.jl 2.x vs PyArrow over identical logical workloads.
+# Serialize/deserialize benchmark driver: Arrow.jl vs PyArrow over
+# identical logical workloads.
 #
 #   julia --project=. bench/run.jl [workdir]
 #
-# Legs run in their own processes (2.x under bench/env2x; PyArrow inside
-# the conformance image when docker is available — skipped cleanly
-# otherwise). Results print as a markdown table of seconds and
-# throughput.
+# Legs run in their own processes (PyArrow inside the conformance image
+# when docker is available — skipped cleanly otherwise). Results print as
+# a markdown table of seconds and throughput.
 #
 # READ SEMANTICS DIFFER BY DESIGN, so read rows are not like-for-like:
 #   rewrite  = full structural+semantic validation + materialized Julia
 #              Vectors (the facade contract)
-#   arrow2x  = lazy zero-copy wrap + one copy() per column, no validation
 #   pyarrow  = memory-mapped wrap only; per-element work is deferred
 # Write rows ARE like-for-like: table in memory -> IPC file on disk.
 
@@ -48,14 +46,6 @@ function main(workdir::String)
     repo = dirname(here)
     legs = Tuple{String,String}[]
 
-    # The 2.x leg resolves from the registry, pinned by env2x's compat:
-    # instantiate it up front so the one-command invocation works from a
-    # clean checkout (no manifest is committed).
-    env2x = joinpath(here, "env2x")
-    run(
-        `$(Base.julia_cmd()) --startup-file=no --project=$env2x -e "using Pkg; Pkg.instantiate()"`,
-    )
-
     rewriteout = joinpath(workdir, "rewrite.jsonl")
     rewritescript = joinpath(here, "bench_rewrite.jl")
     _runleg(
@@ -63,14 +53,6 @@ function main(workdir::String)
         rewriteout,
     )
     push!(legs, ("rewrite", rewriteout))
-
-    out2x = joinpath(workdir, "arrow2x.jsonl")
-    script2x = joinpath(here, "bench_2x.jl")
-    _runleg(
-        `$(Base.julia_cmd()) --startup-file=no --project=$env2x $script2x $workdir`,
-        out2x,
-    )
-    push!(legs, ("arrow2x", out2x))
 
     pyout = joinpath(workdir, "pyarrow.jsonl")
     # The pyarrow leg runs the conformance image's oracle interpreter
@@ -119,10 +101,8 @@ function main(workdir::String)
 
     println()
     println("READ ROWS ARE NOT LIKE-FOR-LIKE: rewrite = validate + fully")
-    println("materialized Julia Vectors; arrow2x = lazy wrap + ONE")
-    println("top-level copy() per column (nested lists stay Arrow-backed")
-    println("views); pyarrow = memory-mapped wrap only, all per-element")
-    println("work deferred. Write rows are like-for-like.")
+    println("materialized Julia Vectors; pyarrow = memory-mapped wrap only,")
+    println("all per-element work deferred. Write rows are like-for-like.")
     println()
     println(
         "| workload | op | " *

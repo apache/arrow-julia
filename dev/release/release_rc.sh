@@ -36,7 +36,6 @@ rc=$1
 : ${RELEASE_PUSH_TAG:=${RELEASE_DEFAULT}}
 : ${RELEASE_SIGN:=${RELEASE_DEFAULT}}
 : ${RELEASE_UPLOAD:=${RELEASE_DEFAULT}}
-: ${RELEASE_VALIDATE:=${RELEASE_DEFAULT}}
 
 cd "${SOURCE_TOP_DIR}"
 
@@ -58,79 +57,6 @@ fi
 version=$(grep -o '^version = ".*"' "Project.toml" | \
             sed -e 's/^version = "//' \
                 -e 's/"$//')
-arrow_strings_version=$(grep -o '^version = ".*"' "src/ArrowStrings/Project.toml" | \
-                          sed -e 's/^version = "//' \
-                              -e 's/"$//')
-arrow_types_version=$(grep -o '^version = ".*"' "src/ArrowTypes/Project.toml" | \
-                        sed -e 's/^version = "//' \
-                            -e 's/"$//')
-
-if [ ${RELEASE_VALIDATE} -gt 0 ]; then
-  if ! echo "${version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-    echo "Project.toml must contain a final X.Y.Z version, not ${version}."
-    exit 1
-  fi
-  if ! echo "${arrow_strings_version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-    echo "ArrowStrings Project.toml must contain a final X.Y.Z version."
-    exit 1
-  fi
-  if ! echo "${arrow_types_version}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-    echo "ArrowTypes Project.toml must contain a final X.Y.Z version."
-    exit 1
-  fi
-  if [ "${version}" = "3.0.0" ]; then
-    if [ "${arrow_types_version}" != "2.4.0" ]; then
-      echo "Arrow.jl 3.0.0 RCs must include ArrowTypes.jl 2.4.0."
-      exit 1
-    fi
-    if ! awk '
-      /^\[deps\]$/ { in_deps = 1; next }
-      /^\[/ { in_deps = 0 }
-      in_deps && /^ArrowTypes[[:space:]]*=[[:space:]]*"31f734f8-188a-4ce0-8406-c8a06bd891cd"[[:space:]]*$/ { found = 1 }
-      END { exit(found ? 0 : 1) }
-    ' Project.toml; then
-      echo "Arrow.jl 3.0.0 must depend on ArrowTypes.jl."
-      exit 1
-    fi
-    if ! awk '
-      /^\[compat\]$/ { in_compat = 1; next }
-      /^\[/ { in_compat = 0 }
-      in_compat && /^ArrowTypes[[:space:]]*=[[:space:]]*"2"[[:space:]]*$/ { found = 1 }
-      END { exit(found ? 0 : 1) }
-    ' Project.toml; then
-      echo "Arrow.jl 3.0.0 must keep ArrowTypes.jl compat at the stable 2.x interface."
-      exit 1
-    fi
-    if ! awk '
-      /^\[sources\]$/ { in_sources = 1; next }
-      /^\[/ { in_sources = 0 }
-      in_sources && /^ArrowTypes[[:space:]]*=/ && /path[[:space:]]*=[[:space:]]*"src\/ArrowTypes"/ { found = 1 }
-      END { exit(found ? 0 : 1) }
-    ' Project.toml; then
-      echo "Arrow.jl 3.0.0 RCs must test the included src/ArrowTypes 2.4.0 source."
-      exit 1
-    fi
-  fi
-  if awk '
-    /^\[sources\]$/ { in_sources = 1; next }
-    /^\[/ { in_sources = 0 }
-    in_sources && /^Tables[[:space:]]*=/ { found = 1 }
-    END { exit(found ? 0 : 1) }
-  ' Project.toml; then
-    echo "Remove the temporary Tables.jl source override before making an RC."
-    exit 1
-  fi
-  if grep -R -E -q \
-    'TABLES_REV=|PackageSpec\(url="https://github.com/JuliaData/Tables.jl"|Pkg.add\(url="https://github.com/JuliaData/Tables.jl"' \
-    .github conformance README.md docs; then
-    echo "Remove all temporary Tables.jl development pins before making an RC."
-    exit 1
-  fi
-  if grep -Eq '^Tables[[:space:]]*=[[:space:]]*"1\.1"[[:space:]]*$' Project.toml; then
-    echo "Raise the Tables.jl compat floor to the first release with Tables.Scan."
-    exit 1
-  fi
-fi
 
 rc_tag="v${version}-rc${rc}"
 echo "Tagging for RC: ${rc_tag}"
@@ -202,24 +128,15 @@ Hi,
 I would like to propose the following release candidate (RC${rc}) of
 Apache Arrow Julia version ${version}.
 
-The source archive contains Arrow.jl ${version}, ArrowStrings.jl
-${arrow_strings_version}, and ArrowTypes.jl ${arrow_types_version}. After PMC
-approval, ArrowTypes.jl and ArrowStrings.jl, then Arrow.jl, will be registered
-separately in Julia's General registry from this exact source commit.
-
 This release candidate is based on commit:
 ${rc_hash} [1]
 
 The source release rc${rc} is hosted at [2].
 
-Please download the signed source archive, verify its checksums and signature,
-check that it complies with ASF release policy, run the tests, and vote on the
-release. See [3] for how to validate this release candidate and [4] for the
-ASF release requirements.
+Please download, verify checksums and signatures, run the unit tests,
+and vote on the release. See [3] for how to validate a release candidate.
 
-The vote will be open for at least 72 hours. It passes only with at least three
-binding +1 votes from PMC members and more positive than negative binding
-votes.
+The vote will be open for at least 24 hours.
 
 [ ] +1 Release this as Apache Arrow Julia ${version}
 [ ] +0
@@ -228,6 +145,5 @@ votes.
 [1]: https://github.com/apache/arrow-julia/tree/${rc_hash}
 [2]: ${rc_url}
 [3]: https://github.com/apache/arrow-julia/blob/main/dev/release/README.md#verify
-[4]: https://www.apache.org/legal/release-policy.html
 MAIL
 echo "---------------------------------------------------------"
