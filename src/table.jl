@@ -39,11 +39,15 @@ memory; it has no effect on the other source kinds.
 
 `scan` is a `Tables.Scan` pushdown request: only the selected and
 filter-referenced columns are decoded, footer statistics prune batches no
-row of which can match the filter, and exact limit/offset windows skip
-whole batches. On the file format pruning happens before bytes are decoded,
-and over an `AbstractArrowSource` before they are even fetched — the footer
-comes from one tail read and only the surviving batches' selected buffers
-are requested; on the stream format the scan is applied after decode.
+row of which can match the filter, the filter is evaluated batch by batch,
+and `limit`/`offset` are composed exactly over the qualifying rows —
+without a filter whole batches outside the window are never decoded, with
+one decoding stops as soon as the window is full. Over an
+`AbstractArrowSource` the footer comes from one tail read, statistics and the
+unfiltered window prune batches before any body bytes are requested, the
+surviving batches' selected buffers are fetched in one round, and a filtered
+limit then stops decoding (not fetching); on the stream format the scan is
+applied after decode.
 
 One exception: a scan that cannot run in the storage domain — a filter
 literal with no exact storage representation (a cross-domain or

@@ -44,9 +44,8 @@ scope of every layer.
 | `src/ArrowTypes/` | ArrowTypes.jl — the separate custom-type interface package; the facade applies its lowering and extension hooks recursively |
 | `test/` | Core unit tests, facade tests, the four adapter acceptance batteries, the frozen 2.x-written fixtures, the `--trim=safe` gate |
 | `conformance/` | The arrow-testing gold-corpus runner, the integration-JSON implementation, the pyarrow/nanoarrow IPC oracle, the in-process pyarrow C Data / C Stream oracle |
-| `bench/` | The serialize/deserialize benchmark harness (this package, Arrow.jl 2.x, PyArrow) |
+| `bench/` | The serialize/deserialize benchmark harness (this package and PyArrow) |
 | `docs/dev/DESIGN-scan-ranges-trim.md` | The scan pushdown, ranged-fetch, and statistics design |
-| `docs/dev/research-flatbuffers-cdata.md` | Research notes: the vendored FlatBuffers runtime vs FlatBuffers.jl; the C-data pull requests |
 | `test/`, `conformance/` | Unit, property, compatibility, conformance, and external-oracle checks |
 
 ## Run it
@@ -112,7 +111,8 @@ do). `release!` is idempotent and is not a data-race shield for accesses
 concurrent WITH the close — quiescing readers first is the caller's
 contract, as with `Base.close` on a shared IO. Every buffer imported from
 one C-data tree is backed by regions sharing one cell, so closing any of
-those regions revokes all siblings before the single producer release.
+those regions, or `release!` on the import's owner, revokes all siblings
+before the single producer release.
 
 What the model does not do: nothing prevents external writes to or
 truncation of a mapped file while the mapping or cached validation results
@@ -247,10 +247,14 @@ dictionary set, so concurrent reads need no coordination.
 `Tables.scan(::ArrowFile, scan)` (and `Arrow.Table(source; scan=…)`,
 which is the public entry over it) decodes only the selected and
 filter-referenced columns, prunes whole batches through the embedded
-statistics (one-sided: a pruned batch is provably empty; the filter always
-stays in the residual), and consumes `limit`/`offset` exactly when no filter
-poisons the window. Projection, filtering, renames, and type conversions
-are the generic `Tables.scan` executor's over the returned residual. `SourceFile` runs the same
+statistics (one-sided: a pruned batch is provably empty), and consumes the
+scan exactly: without a filter `limit`/`offset` are metadata arithmetic and
+batches outside the window are never decoded; with one the `_ScanSink`
+evaluates the filter per batch through the generic evaluator
+(`Tables.filtermask`), composes the window over the qualifying rows, and
+stops decoding once it is full. Projection and renames are applied at
+column construction; only type conversions are the generic `Tables.scan`
+executor's over the residual. `SourceFile` runs the same
 plan over an `AbstractArrowSource`: it uses the Footer (from one cached
 tail read) as its sole schema authority, validates the full Block index and
 the complete metadata plan for every statistics-surviving record before
@@ -391,17 +395,6 @@ validation errors. The rules that keep a runtime-tagged core there:
   cleanup registry parks the trimmed runtime's scheduler.
 - Heterogeneous NamedTuple ingestion (`batch(nt)`, `fromjulia_struct`) is
   runtime-schema builder work outside the trim-safe surface.
-
-## Interruption contract
-
-Asynchronous interruption (SIGINT / `InterruptException`, task cancellation)
-is explicitly **out of contract**, matching ecosystem practice — Base itself
-does not make arbitrary code async-exception-atomic. Ordinary exception
-safety (error paths clean up; adapter release is exactly-once) **is** in
-contract and tested. `Threads.Atomic` boxes appear nowhere; the atomics are
-the two `ArrayData` validation caches, the `ReleaseCell` closed flag, the
-`ReleaseCounter` test utility, one pull-claim flag on `IPCStream`, and one
-exactly-once flag on each of `ForeignOwner` and `StreamOwner`.
 
 ## Compression
 

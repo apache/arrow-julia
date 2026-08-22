@@ -19,21 +19,21 @@
 # byte-range fetch protocol (`SourceFile` over an `AbstractArrowSource`) over
 # the same bound column set. Design notes: docs/dev/DESIGN-scan-ranges-trim.md.
 #
-# Pushdown semantics: the source consumes what it can PROVE and leaves exact
-# row evaluation to `Tables.scan`.
+# Pushdown semantics: the source consumes the whole scan exactly, batch by
+# batch, and leaves only type overrides to `Tables.scan`.
 #
 #   * the decode set is (selected ∪ filter-referenced) columns — everything
 #     else is SKIPPED by `skipfield!`, a registry walk that consumes the
 #     node/buffer accounting (all buffer-table invariants still checked)
 #     without slicing, decompressing, validating, or materializing anything;
-#   * whole batches are pruned by footer-carried statistics (may-contain, so
-#     the filter stays in the residual) and `limit`/`offset` are consumed
-#     EXACTLY when no filter poisons the window: `RecordBatch.length` is
-#     wire metadata, so batches outside the window are never decoded;
-#   * the returned table keeps SOURCE names over the decode set and the
-#     residual keeps `select` and `filter` — `Tables.scan` filters,
-#     projects, renames, and converts. This is the only composition that
-#     stays correct when the filter references unselected columns.
+#   * whole batches are pruned by footer-carried statistics (may-contain);
+#     without a filter `limit`/`offset` are metadata arithmetic —
+#     `RecordBatch.length` is wire metadata, so batches outside the window
+#     are never decoded; with a filter the `_ScanSink` evaluates it per
+#     batch through the generic evaluator, composes the window over the
+#     qualifying rows, and stops decoding once the window is full;
+#   * the returned table holds the selected columns' surviving rows under
+#     their output names, in selection order.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -614,13 +614,112 @@ function _batchwindow(rowcounts::Vector{Int64}, offset::Int, limit::Union{Nothin
     return window
 end
 
-# The generic executor windows with saturating `min` arithmetic, so a
-# request whose `offset + limit` would overflow Int is still well-defined
-# there. Keeping such a request in the residual (rather than consuming it
-# here) is what keeps the pushed result identical to the executor's.
-_canconsumewindow(scan::Tables.Scan) =
-    scan.offset < typemax(Int) &&
-    (scan.limit === nothing || scan.limit <= typemax(Int) - scan.offset)
+"""
+The exact consumer of a bound scan, one decoded batch at a time: the filter
+is evaluated over the batch's decoded columns by the generic evaluator
+(`Tables.filtermask` — the same three-valued semantics the executor has),
+`offset`/`limit` are composed over qualifying rows with saturating
+arithmetic (the executor's rule) and stop the scan the moment the window is
+full, and only the selected columns' surviving rows are kept, in selection
+order under their output names. Without a filter the caller's metadata
+window (`_batchwindow`) already names the rows, so a batch outside it is
+never decoded. Nothing is left for the executor except type overrides.
+"""
+mutable struct _ScanSink
+    const names::Vector{Symbol}
+    const fields::Vector{Field}
+    const columns::Vector{Tables.BoundColumn}
+    const decodeidx::Vector{Int}
+    const bound::Tables.BoundScan
+    const parts::Vector{Vector{Any}}
+    outrows::Int
+    remaining_skip::Int64
+    remaining_take::Int64   # -1 = unlimited
+end
+
+function _ScanSink(scan::Tables.Scan, b::Tables.BoundScan, names::Vector{Symbol}, fields)
+    decodeidx = sort!(unique!(vcat(Int[c.index for c in b.columns], copy(b.filtercols))))
+    # With a filter the window composes over qualifying rows here; without
+    # one the metadata window has already applied it.
+    filtered = b.filter !== nothing
+    skip = filtered ? Int64(scan.offset) : Int64(0)
+    take = filtered && scan.limit !== nothing ? Int64(scan.limit) : Int64(-1)
+    return _ScanSink(
+        names,
+        collect(Field, fields),
+        b.columns,
+        decodeidx,
+        b,
+        Vector{Any}[Any[] for _ in b.columns],
+        0,
+        skip,
+        take,
+    )
+end
+
+# Whether the sink still accepts rows: a filled limit ends the scan before
+# the next batch is decoded.
+function _sinkopen(sink::_ScanSink)
+    return sink.remaining_take != 0
+end
+
+# The rows of one batch the scan keeps: the caller's metadata window when
+# there is no filter, else the qualifying rows after this batch's share of
+# the offset/limit. A filter that references no decoded column is
+# row-invariant and evaluates once.
+function _sinkrows(sink::_ScanSink, decoded, rblen::Int64, skip::Int64, take::Int64)
+    if sink.bound.filter === nothing
+        take >= 0 || return 1:Int(rblen)
+        return (Int(skip) + 1):(Int(skip) + Int(take))
+    end
+    if isempty(sink.decodeidx)
+        qualifying =
+            _zerofieldpredicate(sink.bound.filter) === true ? (1:Int(rblen)) : (1:0)
+    else
+        raw = NamedTuple{Tuple(sink.names[sink.decodeidx])}(
+            Tuple(decoded[idx] for idx in sink.decodeidx),
+        )
+        qualifying = findall(Tables.filtermask(sink.bound, raw))
+    end
+    skipped = min(sink.remaining_skip, Int64(length(qualifying)))
+    sink.remaining_skip -= skipped
+    available = Int64(length(qualifying)) - skipped
+    taken = sink.remaining_take < 0 ? available : min(sink.remaining_take, available)
+    sink.remaining_take < 0 || (sink.remaining_take -= taken)
+    return qualifying[(Int(skipped) + 1):(Int(skipped) + Int(taken))]
+end
+
+# Consume one decoded batch (`cols` holds the decode set's ArrayData): each
+# decode-set column materializes once in the storage domain, the kept rows
+# are chosen, and every output column keeps its slice of them.
+function _consumebatch!(sink::_ScanSink, cols, rblen::Int64, skip::Int64, take::Int64)
+    decoded = Dict{Int,AbstractVector}()
+    for idx in sink.decodeidx
+        decoded[idx] = _scancolumn(sink.fields[idx], cols[idx]::ArrayData)
+    end
+    rows = _sinkrows(sink, decoded, rblen, skip, take)
+    sink.outrows = _addscanrows(sink.outrows, Int64(length(rows)))
+    for (k, c) in enumerate(sink.columns)
+        push!(sink.parts[k], decoded[c.index][rows])
+    end
+    return nothing
+end
+
+# The consumed scan's result: the output table in selection order, and the
+# residual the executor still owns — only the type overrides, if any.
+function _sinkresult(sink::_ScanSink, scan::Tables.Scan)
+    outnames = Symbol[c.name for c in sink.columns]
+    outcols = Tuple(
+        _joinscanparts(sink.fields[c.index], sink.parts[k]) for
+        (k, c) in enumerate(sink.columns)
+    )
+    table = _scantable(outnames, outcols, sink.outrows)
+    any(c.type !== nothing for c in sink.columns) ||
+        return table, Tables.Scan(; validate=scan.validate)
+    residualselect =
+        Tables.SelectItem[Tables.SelectItem(c.name, c.type, nothing) for c in sink.columns]
+    return table, Tables.Scan(residualselect, nothing, nothing, 0, scan.validate)
+end
 
 function _applyscan(f::ArrowFile, scan::Tables.Scan)
     names = _fieldnamesymbols(f.fields)
@@ -643,20 +742,19 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
             scan.limit,
             scan.offset,
         )
-        return _scantable(Symbol[], (), Int(n)),
-        Tables.Scan(nothing, nothing, nothing, 0, scan.validate)
+        return _scantable(Symbol[], (), Int(n)), Tables.Scan(; validate=scan.validate)
     end
-    decodeidx = sort!(unique!(vcat(Int[c.index for c in b.columns], copy(b.filtercols))))
+    sink = _ScanSink(scan, b, names, f.fields)
     mask = falses(length(names))
-    mask[decodeidx] .= true
+    mask[sink.decodeidx] .= true
     budget = AllocationBudget(f.limits.max_total_allocated_bytes)
     state = DecodeState(budget)
     try
-        consumed =
-            scan.filter === nothing &&
-            _canconsumewindow(scan) &&
-            (scan.limit !== nothing || scan.offset > 0)
-        window = if consumed
+        # Without a filter the window is metadata arithmetic: batches outside
+        # it are never decoded. With one, the sink composes it over
+        # qualifying rows as batches decode.
+        windowed = scan.filter === nothing && (scan.limit !== nothing || scan.offset > 0)
+        window = if windowed
             _batchwindow(
                 Int64[_batchrows(f, i, budget) for i = 1:length(f)],
                 scan.offset,
@@ -665,8 +763,8 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
         else
             Tuple{Int,Int64,Int64}[(i, Int64(0), Int64(-1)) for i = 1:length(f)]
         end
-        # Statistics pruning: one-sided — a pruned batch is provably
-        # empty under the filter; the filter itself always stays in the residual.
+        # Statistics pruning: one-sided — a pruned batch is provably empty
+        # under the filter; the rows of the rest are decided by the sink.
         keep = trues(length(f))
         if b.filter !== nothing
             stats = _readstats(
@@ -683,37 +781,13 @@ function _applyscan(f::ArrowFile, scan::Tables.Scan)
                 ]
             )
         end
-        parts = Dict{Int,Vector{Any}}(idx => Any[] for idx in decodeidx)
-        outrows = 0
         for (i, skip, take) in window
+            _sinkopen(sink) || break
             keep[i] || continue
             rblen, cols = _scanbatch(f, i, mask, budget, state)
-            outrows = _addscanrows(outrows, take >= 0 ? take : rblen)
-            for idx in decodeidx
-                col = _scancolumn(f.fields[idx], cols[idx]::ArrayData)
-                take >= 0 && (col = col[(skip + 1):(skip + take)])
-                push!(parts[idx], col)
-            end
+            _consumebatch!(sink, cols, rblen, skip, take)
         end
-        outcols = Tuple(_joinscanparts(f.fields[idx], parts[idx]) for idx in decodeidx)
-        table = _scantable(names[decodeidx], outcols, outrows)
-        # The residual's selection must be RESOLVED against the source schema:
-        # the output table carries only the decode set, so re-binding `Not`
-        # (whose excluded names are gone) or a `Regex` (which could over-match a
-        # filter-only column) against it would be wrong. Bound columns become
-        # concrete source-name items carrying their renames and type overrides.
-        residualselect =
-            scan.select === nothing ? nothing :
-            Tables.SelectItem[
-                Tables.SelectItem(
-                    names[c.index],
-                    c.type,
-                    c.name == names[c.index] ? nothing : c.name,
-                ) for c in b.columns
-            ]
-        limit = consumed ? nothing : scan.limit
-        offset = consumed ? 0 : scan.offset
-        return table, Tables.Scan(residualselect, b.filter, limit, offset, scan.validate)
+        return _sinkresult(sink, scan)
     finally
         close(state)
     end
@@ -1186,10 +1260,10 @@ function _applyscan(sf::SourceFile, scan::Tables.Scan)
             scan.limit,
             scan.offset,
         )
-        return _scantable(Symbol[], (), Int(n)),
-        Tables.Scan(nothing, nothing, nothing, 0, scan.validate)
+        return _scantable(Symbol[], (), Int(n)), Tables.Scan(; validate=scan.validate)
     end
-    decodeidx = sort!(unique!(vcat(Int[c.index for c in b.columns], copy(b.filtercols))))
+    sink = _ScanSink(scan, b, names, fields)
+    decodeidx = sink.decodeidx
     mask = falses(length(names))
     mask[decodeidx] .= true
 
@@ -1273,12 +1347,9 @@ function _applyscan(sf::SourceFile, scan::Tables.Scan)
         _recordbatchmeta(h, fields, limits, recordblocks[recidxs[p]][3]) for
         (p, h) in enumerate(headers)
     ]
-    consumed =
-        scan.filter === nothing &&
-        _canconsumewindow(scan) &&
-        (scan.limit !== nothing || scan.offset > 0)
+    windowed = scan.filter === nothing && (scan.limit !== nothing || scan.offset > 0)
     window =
-        consumed ? _batchwindow(rowcounts, scan.offset, scan.limit) :
+        windowed ? _batchwindow(rowcounts, scan.offset, scan.limit) :
         Tuple{Int,Int64,Int64}[(p, Int64(0), Int64(-1)) for p = 1:nsurv]
 
     # Decode-set dictionaries: whole bodies, coalesced; everything else is
@@ -1400,13 +1471,12 @@ function _applyscan(sf::SourceFile, scan::Tables.Scan)
             end
         end
 
-        parts = Dict{Int,Vector{Any}}(idx => Any[] for idx in decodeidx)
-        outrows = 0
         for (p, skip, take) in window
+            _sinkopen(sink) || break
             block = recordblocks[recidxs[p]]
             msg, v = blockmeta[length(dictblocks) + p]
             body = SparseBody(block[3], block[1] + block[2], bodyspans)
-            _, cols = _maskedrecord(
+            rblen, cols = _maskedrecord(
                 msg,
                 v,
                 body,
@@ -1419,27 +1489,9 @@ function _applyscan(sf::SourceFile, scan::Tables.Scan)
                 mask,
                 state,
             )
-            outrows = _addscanrows(outrows, take >= 0 ? take : rowcounts[p])
-            for idx in decodeidx
-                col = _scancolumn(fields[idx], cols[idx]::ArrayData)
-                take >= 0 && (col = col[(skip + 1):(skip + take)])
-                push!(parts[idx], col)
-            end
+            _consumebatch!(sink, cols, rblen, skip, take)
         end
-        outcols = Tuple(_joinscanparts(fields[idx], parts[idx]) for idx in decodeidx)
-        table = _scantable(names[decodeidx], outcols, outrows)
-        residualselect =
-            scan.select === nothing ? nothing :
-            Tables.SelectItem[
-                Tables.SelectItem(
-                    names[c.index],
-                    c.type,
-                    c.name == names[c.index] ? nothing : c.name,
-                ) for c in b.columns
-            ]
-        limit = consumed ? nothing : scan.limit
-        offset = consumed ? 0 : scan.offset
-        return table, Tables.Scan(residualselect, b.filter, limit, offset, scan.validate)
+        return _sinkresult(sink, scan)
     finally
         close(state)
     end
@@ -1449,11 +1501,13 @@ end
     Tables.scan(f::ArrowFile, scan)
     Tables.scan(sf::SourceFile, scan)
 
-Scan an Arrow file handle: push down what the file format can prove
-(`_applyscan` — column pruning, statistics batch pruning, exact
-limit/offset windows) and hand the residual to the generic `Tables.scan`
-executor, whose semantics the pushdown must agree with. `Arrow.Table(source;
-scan=…)` is the public entry over the same path.
+Scan an Arrow file handle: `_applyscan` decodes only the selected and
+filter-referenced columns of the batches the footer statistics and the
+window admit, evaluates the filter per batch, composes `offset`/`limit`
+exactly (stopping as soon as the window is full), and builds the selected
+columns under their output names; only type overrides remain for the
+generic `Tables.scan` executor, whose semantics the pushdown agrees with.
+`Arrow.Table(source; scan=…)` is the public entry over the same path.
 """
 function Tables.scan(f::Union{ArrowFile,SourceFile}, scan::Tables.Scan)
     table, residual = _applyscan(f, scan)

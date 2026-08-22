@@ -27,9 +27,10 @@ A byte-addressable object of known length — an object in cloud storage, an
 HTTP resource, an in-memory buffer — that [`Arrow.Table`](@ref) reads with
 exact byte-range requests instead of downloading whole. With a
 `Tables.Scan`, the file-format footer is fetched from the tail, the record
-batches are pruned by the footer's statistics and the scan's window, and only
-the buffers of the selected (and filter-referenced) columns are requested,
-coalesced into a few range reads.
+batches are pruned by the footer's statistics and (without a filter) the
+scan's window, and only the surviving batches' buffers of the selected (and
+filter-referenced) columns are requested, coalesced into a few range reads
+made in one round; a filtered limit stops decoding, not fetching.
 
 An implementation defines two methods:
 

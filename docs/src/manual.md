@@ -99,8 +99,8 @@ Arrow.release!(tbl)                          # unmaps NOW; tbl's columns remain 
 rm("data.arrow")
 ```
 
-`release!` is idempotent. Because a `Table`'s columns are copies, a closed
-`Table` remains fully usable; a closed [`Arrow.Stream`](@ref) refuses
+`release!` is idempotent. Because a `Table`'s columns are copies, a released
+`Table` remains fully usable; a released [`Arrow.Stream`](@ref) refuses
 further iteration cleanly.
 
 ### `Arrow.Stream`
@@ -239,12 +239,14 @@ tbl = Arrow.Table("orders.arrow"; scan = scan)
 * `limit`/`offset`: applied to qualifying rows.
 
 On the file format, batches whose footer statistics prove no row can match
-the filter are never fetched or decoded, and exact `limit`/`offset` windows
-skip whole batches when there is no filter. On the stream format the scan is
-applied after decode with identical results. A scan whose filter literal has
-no exact storage representation (a cross-domain or out-of-range value), or
-whose projection is empty (`select = ()`), falls back to reading the whole
-source and evaluating over the converted public values.
+the filter are never fetched or decoded; the filter is evaluated batch by
+batch and `limit`/`offset` compose exactly over the qualifying rows, so
+without a filter whole batches outside the window are never decoded, and
+with one decoding stops as soon as the window is full. On the stream format
+the scan is applied after decode with identical results. A scan whose filter
+literal has no exact storage representation (a cross-domain or out-of-range
+value), or whose projection is empty (`select = ()`), falls back to reading
+the whole source and evaluating over the converted public values.
 
 Filters over a field that contains a registered ArrowTypes.jl extension value
 at any depth are evaluated over the restored public values. The ArrowTypes
@@ -504,9 +506,9 @@ converts imported column data back to a Julia vector.
 * `Arrow.from_c_data(schemaptr, arrayptr) -> (field, data)` imports one
   column, *moving* the array (its source `release` is nulled, as the spec
   requires). The imported buffers stay valid as long as the returned data is
-  reachable; `Arrow.release!` on the owner region behind any imported buffer
-  (`buffer.region`), or `Arrow.release!` on the import's `ForeignOwner`,
-  runs the producer's release callback exactly once.
+  reachable; `Arrow.release!` on the import's `ForeignOwner` (or on the
+  owner region behind any imported buffer, `buffer.region`) revokes every
+  imported buffer and runs the producer's release callback exactly once.
 * `Arrow.export_stream!(streamptr, schema, batches)` fills a caller-owned
   `ArrowArrayStream`; `Arrow.from_c_stream(streamptr)` imports one and
   yields record batches through `Arrow.nextbatch!`.

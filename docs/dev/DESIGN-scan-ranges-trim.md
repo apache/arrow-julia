@@ -41,10 +41,9 @@ executor `Tables.scan(table, residual)` (Arrow's pushdown is the internal
 by `Tables.scan(::ArrowFile/::SourceFile, scan)` and by `Arrow.Table(source;
 scan=…)`). Key contract points this design leans on:
 
-- pushed and residual work may **overlap** (inexact pruning keeps the filter
-  in the residual);
-- `limit`/`offset` may be consumed **only** when every applied filter was
-  exact;
+- a pushed result must equal the executor's over the same scan, row for
+  row (the differential battery pins this);
+- `limit`/`offset` may be consumed **only** over exactly filtered rows;
 - no `Function` fields anywhere — the algebra is closed and value-only.
 
 ### What Arrow can push, by axis
@@ -52,83 +51,69 @@ scan=…)`). Key contract points this design leans on:
 | Axis | Mechanism | Exactness |
 |---|---|---|
 | `select` | decode only (selected ∪ filter-referenced) columns: a registry-driven `skipfield!` advances the node/buffer cursor past unselected fields without body slicing, content validation, or materialization. Complete node/buffer metadata is still validated first. Nested subtrees skip with their parent; no body range is requested for an unselected dictionary column. | exact as IO/decode reduction (see below for who projects) |
-| `limit`/`offset` | `RecordBatch.length` is wire metadata: whole batches before `offset` and after `offset+limit` are never decoded. Ranged reads still fetch candidate RecordBatch metadata because Footer Blocks have no row counts, but request no body range for excluded batches. Tail reads and configured coalescing may physically over-read otherwise unrequested bytes. | exact when no filter; poisoned by any filter per the contract |
-| `filter` | Per-batch min/max/null-count statistics may prune batches that cannot match. Surviving rows are evaluated by the generic `Tables.scan` executor over decoded columns; scans that cannot be lowered safely are evaluated over facade-converted public values. | Statistics pruning is inexact and leaves the filter in the residual; residual row evaluation is exact. |
+| `limit`/`offset` | Without a filter `RecordBatch.length` is wire metadata: whole batches before `offset` and after `offset+limit` are never decoded (ranged reads still fetch candidate RecordBatch metadata because Footer Blocks have no row counts, but request no body range for excluded batches). With a filter the window composes over the qualifying rows of each decoded batch and decoding stops once it is full. Tail reads and configured coalescing may physically over-read otherwise unrequested bytes. | exact |
+| `filter` | two tiers: (a) **statistics pruning** — per-batch min/max/null-count, when present (§3 of this doc), prune batches that cannot satisfy the predicate; (b) **mask at materialization** — evaluate the predicate over each batch's decoded columns with the generic evaluator (`Tables.filtermask`) and keep only the qualifying rows when building output columns. | (a) inexact — a pruned batch is provably empty; (b) exact — enables limit/offset pushdown with filters |
 | `types` (`ref => T`) | left in the residual for the executor's elementwise convert. Arrow's schema is source-fixed; an override is a conversion request, not a parse seed (unlike CSV). Exception: see §4 — in trim mode the overrides double as the known-schema pin. | residual |
 
-### The pushdown shape — two stages
+### The pushdown shape
 
-**Stage A (adapter-level; what is implemented).** `_applyscan` on the file
-handles does **IO-and-decode reduction with a full residual**:
+`_applyscan` on the file handles consumes the whole scan exactly:
 
     _applyscan(f, scan) =
       resolve against schema names →
       decode set = selected ∪ filtercols (source order, source names) →
-      batch set = limit/offset window (when filter === nothing),
-                  ∩ stats-surviving batches (when stats present) →
-      return (table over decode set, residual)
+      resolve positional filter refs to source names →
+      batch set = limit/offset window from wire row counts (no filter),
+                  ∩ stats-surviving batches (filter present, stats present) →
+      per decoded batch (`_ScanSink`):
+        materialize the decode set in the storage domain →
+        rows = filter ? qualifying rows after this batch's share of
+                        offset/limit (saturating, the executor's rule)
+                      : the metadata window's rows →
+        keep each selected column's rows, in selection order, under its
+        output name; stop decoding once the window is full →
+      return (table over the selection, residual = type overrides only)
 
-where the residual is the original scan minus `limit`/`offset` when those
-were consumed. Critically, when the filter references unselected columns the
-returned table **keeps them under source names and leaves `select` in the
-residual** — the executor then filters, projects, renames, and converts.
-This is the only correct composition: if the adapter consumed `select` while
-leaving `filter` in the residual, the executor could not evaluate predicates over
-already-dropped columns. Simple, correct, and captures the dominant win:
-unselected columns cost zero decode and add zero planned body bytes. Tail reads
-and coalescing may still over-read them under §2's explicit policy.
+The filter is evaluated by the generic evaluator (`Tables.filtermask`) over
+the batch's decoded columns, so Arrow's pushdown and the executor share one
+three-valued semantics by construction (a `missing` predicate excludes the
+row). Unselected columns cost zero decode and add zero planned body bytes.
+Tail reads and coalescing may still over-read them under §2's explicit
+policy.
 
-Six properties the residual/window composition must hold (all implemented
-in `src/scan.jl`):
+Properties the composition holds (all implemented in `src/scan.jl`):
 
-- **The residual selection must be RESOLVED, not passed through.** `Not` and
-  `Regex` select items re-bound against the reduced output table are wrong
-  (`Not(:x)`'s excluded name no longer exists; a regex can over-match a
-  filter-only column). The residual carries the bound columns as concrete
-  source-name items with their renames and type overrides attached.
-- **The residual filter must resolve positional references too.** A bound
-  `col(3)` means source column 3. Re-binding that integer against the reduced
-  decode-set table can select a different column or fail. Matched integer
-  references therefore become source-name references in the residual.
+- **Positional filter references resolve to source names** before
+  evaluation (`Tables.resolve` normalizes them): a bound `col(3)` means
+  source column 3, and the decode-set table the evaluator sees carries
+  source names.
 - **Wire row counts are trusted only after metadata validation.** Before a
   `RecordBatch.length` drives a window, it is range-checked and matched to
   every top-level FieldNode length. Exact node/buffer counts and buffer
   geometry are also checked from metadata alone. Aggregate scan row counts
-  must fit Tables' `Int` row-count API: Stage A accepts a planned result through
-  `typemax(Int)` and rejects a larger one. An offset-only window represents
-  `limit=nothing` explicitly; it does not use a finite sentinel that can omit
-  later batches.
-- **One scan has one allocation budget.** Standalone lazy `file[i]`
-  calls retain their documented per-call budgets. A scan that visits many
-  batches shares one budget and codec state across all of its metadata and
+  must fit Tables' `Int` row-count API: a planned result through
+  `typemax(Int)` is accepted and a larger one rejected. An offset-only
+  window represents `limit=nothing` explicitly; it does not use a finite
+  sentinel that can omit later batches.
+- **One scan has one allocation budget.** Standalone lazy `file[i]` calls
+  retain their documented per-call budgets. A scan that visits many batches
+  shares one budget and codec state across all of its metadata and
   decompression work, matching the ranged operation.
-- **Overflowing windows stay residual.** The generic executor windows with
-  saturating `min` arithmetic; Stage A does not consume a request whose
-  `offset + limit` would overflow Int, so the pushed result stays identical
-  to the executor's without duplicating that arithmetic.
-- **Stage A needs no row-level predicate evaluator.** The filter always
-  stays in the residual, so `Tables.scan`/`filtermask` do row evaluation;
-  Arrow-side predicate logic first appears as the *interval* ladder for
-  statistics pruning (§3). Stream-format sources are scanned by the facade
-  after decode — the eager stream reader has already decoded by then;
-  stream pushdown would need an incremental framer.
-
-**Stage B (facade-level; not implemented).** A facade pushdown that consumes
-everything exactly: per-column masks evaluated through Core accessors (no
-materialization of excluded rows), projection/renames applied at column
-construction, `limit`/`offset` composed with exact masks. Residual: empty,
-CSV-kernel style. Stage B subsumes Stage A.
-
-A Stage B row evaluator would be a **closed `isa` ladder over the closed
-`ScanExpr` set**, walking Core accessors (`isvalid_at` + `_value`)
-column-at-a-time. Stage A implements only `_maypass`, a separate closed ladder
-over statistics values. `Tables.resolve` rejects `OpNode` because this adapter
-recognizes none. No closures or `Function` fields are needed.
+- **Windows saturate.** `offset`/`limit` compose with `min` arithmetic over
+  row counts, as the executor does, so `offset + limit` never overflows.
+- **Type overrides stay residual.** Arrow's schema is source-fixed; an
+  override is an elementwise conversion request the executor performs over
+  the built columns (the facade applies its own public-type overrides
+  after conversion instead).
+- **Zero-field sources** consume filter and window from row counts alone
+  (`_zerofieldwindow`): a row-invariant predicate evaluates once, and no
+  per-row mask is allocated from an untrusted row count.
 
 The statistics fold resolves dictionary indices through the pool before it
-computes logical null/min/max values. A Stage B row evaluator could test
-equality/membership against each stable pool snapshot once and then compare
-indices; that pool-index optimization is not part of Stage A.
+computes logical null/min/max values; the row evaluator compares decoded
+values. Stream-format sources are scanned by the facade after decode — the
+eager stream reader has already decoded by then; stream pushdown would need
+an incremental framer.
 
 ---
 
@@ -332,10 +317,11 @@ designed for trim but not yet gated by it. The rules in `core-README.md`
 
 Implemented (`src/scan.jl`, `src/table.jl`):
 
-- **Scan pushdown**: `skipfield!`, `_applyscan(::ArrowFile, scan)` with
-  Stage-A semantics, exact limit/offset batch skipping, resolved residual
-  selections, zero-field scans, and the differential battery with
-  corruption-backed never-decoded proofs. `Arrow.Table(source; scan=…)`
+- **Scan pushdown**: `skipfield!`, `_applyscan(::ArrowFile, scan)` consuming
+  the scan exactly through `_ScanSink` (per-batch filter evaluation,
+  composed limit/offset with early stop, selection and renames at column
+  construction; type overrides residual), zero-field scans, and the
+  differential battery with corruption-backed never-decoded proofs. `Arrow.Table(source; scan=…)`
   routes through it on file-format and ranged inputs; stream-format inputs
   scan post-decode with identical results.
 - **Byte-range sources**: the `AbstractArrowSource` contract, the
@@ -353,9 +339,8 @@ Implemented (`src/scan.jl`, `src/table.jl`):
   degradation, and both lie directions.
 
 Not implemented: an HTTP transport extension (the source contract is the
-extension point; the CloudStore extension is the model), Stage B's exact
-facade pushdown, an
-encode-time `statistics=true` writer keyword, upstream-placement tracking
+extension point; the CloudStore extension is the model), an encode-time
+`statistics=true` writer keyword, upstream-placement tracking
 for statistics, and the scan-and-materialize trim harness. Scan pushdown
 depends on the pinned Tables.jl development revision until that API is
 released.

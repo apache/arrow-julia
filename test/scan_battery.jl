@@ -210,16 +210,26 @@ function _scan_main()
     end
     println("empty scans keep the full scan's schema on both handles ✓")
 
-    # Residual semantics: window consumption vs filter poisoning.
-    _, r1 = _applyscan(af, Tables.Scan(select=(:ints,), offset=4, limit=3))
-    @assert r1.limit === nothing && r1.offset == 0 && r1.select !== nothing
-    _, r2 = _applyscan(af, Tables.Scan(filter=Tables.col(:ints) > 2, limit=2))
-    @assert r2.limit == 2 && r2.filter !== nothing
-    println("limit/offset consume exactly; filters poison the window ✓")
+    # Residual semantics: the scan is consumed exactly — selection, renames,
+    # filter, and window — and only type overrides stay for the executor.
+    function identity(s)
+        return s.filter === nothing &&
+               s.limit === nothing &&
+               s.offset == 0 &&
+               s.select === nothing
+    end
+    t1, r1 = _applyscan(af, Tables.Scan(select=(:ints => :i,), offset=4, limit=3))
+    @assert identity(r1) && Tables.columnnames(t1) == (:i,) && length(t1.i) == 3
+    t2, r2 =
+        _applyscan(af, Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2))
+    @assert identity(r2) && t2.ints == [3, 4]
+    _, r3 = _applyscan(af, Tables.Scan(select=(:ints => Float64,)))
+    @assert r3.filter === nothing && r3.limit === nothing && r3.offset == 0
+    @assert length(r3.select) == 1 && r3.select[1].type === Float64
+    println("the scan is consumed exactly; only type overrides remain residual ✓")
 
-    # Extreme-but-valid windows: Tables.scan saturates, so the whole
-    # pipeline agrees on the empty result whether the window is consumed at
-    # the source or residualized.
+    # Extreme-but-valid windows: the sink saturates like Tables.scan, so the
+    # whole pipeline agrees on the empty result.
     extreme = Tables.Scan(select=(:ints,), offset=typemax(Int), limit=typemax(Int))
     extremewant = Tables.scan(full, extreme)
     for sourcefile in (af, SourceFile(BytesSource(filebytes)))
@@ -246,6 +256,13 @@ function _scan_main()
     # Skip proof 2 (batches): the same corruption sits in batch 2; a window
     # ending inside batch 1 never decodes batch 2 even when selecting strs.
     got = Tables.scan(caf, Tables.Scan(select=(:strs,), limit=5))
+    # A filter keeps the window in the sink: the window fills inside batch 1,
+    # so batch 2 is never decoded either.
+    gotf = Tables.scan(
+        caf,
+        Tables.Scan(select=(:strs,), filter=Tables.col(:ints) > 0, limit=5),
+    )
+    @assert length(gotf.strs) == 5
     @assert isequal(collect(Any, got.strs), collect(Any, full.strs[1:5]))
     @assert _rejects(() -> Tables.scan(caf, Tables.Scan(select=(:strs,), limit=6)))
     println("window-excluded batches are never decoded ✓")
@@ -429,7 +446,7 @@ function _scan_main()
     println("unaddressable cumulative row counts fail closed ✓")
 
     println()
-    println("Tables.Scan Stage-A pushdown checks passed.")
+    println("Tables.Scan pushdown checks passed.")
     return filebytes, af, full
 end
 
