@@ -49,12 +49,14 @@ surviving batches' selected buffers are fetched in one round, and a filtered
 limit then stops decoding (not fetching); on the stream format the scan is
 applied after decode.
 
-One exception: a scan that cannot run in the storage domain — a filter
-literal with no exact storage representation (a cross-domain or
-out-of-range value), or an empty projection (`select=()`), whose row count
-only the full read can carry — falls back to reading the whole source and
-evaluating over the converted public values. An `AbstractArrowSource` is
-read whole in that fallback, as it is without a scan, for a zero-field
+One exception: a filter literal with no exact storage-domain representation
+(a cross-domain or out-of-range value) falls back to reading the whole source
+and evaluating the scan over public-domain values. So does a custom temporal
+membership object that Arrow cannot transform without changing its `in`
+semantics; Tuple and Array membership lower exactly, as do Set members already
+in the column's canonical public type. Empty projections still use range
+planning and preserve their row count without fetching output column bodies.
+An `AbstractArrowSource` is also read whole without a scan, for a zero-field
 file, and for a stream-format object; plan remote filters in each column's
 public value domain.
 
@@ -344,17 +346,11 @@ function _typedroutable(f::AC.Field)
 end
 
 """
-Materialize one batch column for the facade: through the TYPED element
-path when the field's raw storage domain is closed (no per-element
-boxing — the benchmark-dominant cost of facade reads), else the dynamic
-path. The claim is the RAW domain (`_declaredeltype(f, false)`): the
-facade's Dates conversion happens after, in `_postconvert`.
+Materialize one batch column in the storage domain: through the typed element
+path when its raw domain is closed, else through Core's dynamic path. This
+never emits the private ArrowTypes Union routing markers.
 """
-function _batchcolumn(f::AC.Field, d::AC.ArrayData)
-    if _hasarrowtypesextension(f)
-        routed = _arrowtypesroutedcolumn(f, d)
-        routed === nothing || return routed
-    end
+function _storagebatchcolumn(f::AC.Field, d::AC.ArrayData)
     T = _declaredeltype(f, false)
     (_closedclaim(T) && _typedroutable(f)) || return AC.materialize(f, d)
     # Field nullability is advisory: the batch may hold nulls under a
@@ -363,6 +359,15 @@ function _batchcolumn(f::AC.Field, d::AC.ArrayData)
     # refuse the read; conforming batches keep the Missing-free fast path.
     (Missing <: T || !_hasnulls(f, d)) || (T = Union{Missing,T})
     return AC.materialize(T, f, d)
+end
+
+"Materialize for the facade, retaining an ArrowTypes Union route when needed."
+function _batchcolumn(f::AC.Field, d::AC.ArrayData)
+    if _hasarrowtypesextension(f)
+        routed = _arrowtypesroutedcolumn(f, d)
+        routed === nothing || return routed
+    end
+    return _storagebatchcolumn(f, d)
 end
 
 # Whether the typed claim for `f` would meet a null in `d`: physical nulls
@@ -394,190 +399,6 @@ _facadefromraw(f::AC.Field, col::AbstractVector) =
     _hasarrowtypesextension(f) ? _arrowtypescolumn(f, col) :
     _publiccolumn(f, _postconvert(f.type, col))
 
-# --- scan value domain -------------------------------------------------------
-# Pushdown and residual filtering run over PHYSICAL storage values; facade
-# filter literals arrive in public Julia types. Lower native literals to the
-# referenced field's storage domain before the scan when that preserves
-# semantics. Registered logical extensions fall back to the public domain.
-# Conversion back to public types happens exactly once on the scan output
-# (rename-aware via Tables.resolve).
-
-# Lowering returns (ok, value): ok=false means the literal has NO exact,
-# semantics-preserving storage representation for this field (cross-type
-# inexactness, wrong type entirely) — the caller must then evaluate the
-# whole filter in the PUBLIC domain instead of pushing it down. There is no
-# pass-through: an unlowered literal comparing "equal" to raw storage would
-# change predicate semantics.
-function _storagevalue(t::AC.ArrowType, v)
-    t isa AC.DictionaryType && return _storagevalue(t.valuetype, v)
-    istemporal =
-        t isa AC.DateType ||
-        t isa AC.TimestampType ||
-        t isa AC.TimeType ||
-        t isa AC.DurationType
-    if istemporal
-        # The contract is the FACADE comparison domain, not physical
-        # representability: a literal lowers only when public-domain
-        # comparison against this column's facade values could succeed.
-        F = _facadebasetype(t)
-        try
-            if F === Int64
-                # Raw-integer facade (sub-millisecond timestamps): only
-                # integer literals compare in public; temporal literals are
-                # never equal to Int64 values.
-                v isa Integer && return true, Int64(v)
-                return false, v
-            elseif F === Dates.Date
-                v isa Dates.Date && return true, Int32(Dates.value(v) - _EPOCH_DAYS)
-                if v isa Dates.DateTime
-                    v == Dates.DateTime(Dates.Date(v)) || return false, v
-                    return true, Int32(Dates.value(Dates.Date(v)) - _EPOCH_DAYS)
-                end
-                return false, v
-            elseif F === Dates.DateTime
-                dt =
-                    v isa Dates.DateTime ? v :
-                    v isa Dates.Date ? Dates.DateTime(v) : nothing
-                dt === nothing && return false, v
-                ms = Int64(Dates.value(dt) - Dates.UNIXEPOCH)
-                t isa AC.DateType && return true, ms       # Date64
-                t.unit == AC.MILLISECOND && return true, ms
-                return _exactdiv(ms, 1_000)                # SECOND
-            elseif F === Dates.Time
-                v isa Dates.Time || return false, v
-                ns = Int64(Dates.value(v))
-                t.unit == AC.NANOSECOND && return true, ns
-                t.unit == AC.MICROSECOND && return _exactdiv(ns, 1_000)
-                t.unit == AC.MILLISECOND && return _exactdiv(ns, 1_000_000)
-                return _exactdiv(ns, 1_000_000_000)
-            elseif F <: Dates.Period
-                v isa Dates.Period || return false, v
-                return true, Int64(Dates.value(convert(F, v)))
-            end
-        catch
-            # Any conversion failure — range, inexactness, no method — means
-            # the literal has no representation here; take the fallback.
-            return false, v
-        end
-        return false, v
-    end
-    # Non-temporal fields compare in their storage (== public) domain, but a
-    # temporal-typed public literal against them is incompatible.
-    if v isa Dates.Date || v isa Dates.DateTime || v isa Dates.Time || v isa Dates.Period
-        return false, v
-    end
-    return true, v
-end
-
-function _storagevalue(f::AC.Field, v)
-    _hasarrowtypesextension(f) || return _storagevalue(f.type, v)
-    # ArrowTypes does not require `toarrow` to preserve Julia comparison
-    # semantics. A logical type may, for example, compare by an equivalence
-    # class while storing one concrete identifier. Evaluate every registered
-    # extension filter, including one nested below an unmarked container, over
-    # the restored public values unless a future interface provides an
-    # explicit comparison-preserving trait.
-    return false, v
-end
-
-function _exactdiv(x::Int64, d::Integer)
-    q, r = divrem(x, Int64(d))
-    return r == 0 ? (true, q) : (false, x)
-end
-
-function _fieldfor(fields, ref, names)
-    ref isa Int && 1 <= ref <= length(fields) && return fields[ref]
-    i = findfirst(==(Symbol(ref)), names)
-    return i === nothing ? nothing : fields[i]
-end
-
-function _lowerexpr(e, fields, names, ok::Base.RefValue{Bool})
-    e === nothing && return nothing
-    if e isa Tables.Cmp
-        f = _fieldfor(fields, e.lhs.ref, names)
-        f === nothing && return e
-        good, v = _storagevalue(f, e.rhs)
-        good || (ok[] = false)
-        return Tables.Cmp(e.op, e.lhs, v)
-    elseif e isa Tables.In
-        f = _fieldfor(fields, e.lhs.ref, names)
-        f === nothing && return e
-        vals = Any[]
-        for x in e.values
-            good, v = _storagevalue(f, x)
-            good || (ok[] = false)
-            push!(vals, v)
-        end
-        return Tables.In(e.lhs, Tuple(vals))
-    elseif e isa Union{Tables.IsNull,Tables.StrPred}
-        f = _fieldfor(fields, e.lhs.ref, names)
-        f !== nothing && _hasarrowtypesextension(f) && (ok[] = false)
-        return e
-    elseif e isa Tables.AndExpr
-        return Tables.AndExpr(
-            Tables.ScanExpr[_lowerexpr(a, fields, names, ok) for a in e.args],
-        )
-    elseif e isa Tables.OrExpr
-        return Tables.OrExpr(
-            Tables.ScanExpr[_lowerexpr(a, fields, names, ok) for a in e.args],
-        )
-    elseif e isa Tables.NotExpr
-        return Tables.NotExpr(_lowerexpr(e.arg, fields, names, ok))
-    end
-    return e
-end
-
-"""
-Lower a scan for storage-domain pushdown. Returns `(pushscan, pushable)`:
-when any filter literal has no exact storage representation, or the bound
-output selects zero columns (the row count would be lost), pushable=false
-and the caller evaluates the ORIGINAL scan over the converted public table.
-Type overrides are ALWAYS stripped from the pushdown copy — they are public-
-domain conversions and run after facade conversion.
-"""
-function _lowerscan(scan::Tables.Scan, fields)
-    names = _fieldnamesymbols(fields)
-    b = Tables.resolve(scan, names)
-    isempty(b.columns) && !isempty(fields) && return scan, false
-    ok = Ref(true)
-    lowered = _lowerexpr(b.filter, fields, names, ok)
-    ok[] || return scan, false
-    pushselect = Tables.SelectItem[
-        Tables.SelectItem(
-            names[c.index],
-            nothing,
-            c.name == names[c.index] ? nothing : c.name,
-        ) for c in b.columns
-    ]
-    return Tables.Scan(pushselect, lowered, scan.limit, scan.offset, scan.validate), true
-end
-
-# --- source opening ---------------------------------------------------------
-
-const _FILE_MAGIC = b"ARROW1"
-
-_isfilebytes(bytes::Vector{UInt8}) = length(bytes) >= 6 && view(bytes, 1:6) == _FILE_MAGIC
-
-function _openbytes(bytes::Vector{UInt8}; limits::Limits=Limits())
-    return _isfilebytes(bytes) ? readfile(bytes; limits=limits) :
-           readstream(bytes; limits=limits)
-end
-
-function _opensource(path::AbstractString; mmap::Bool=true)
-    magic = open(io -> Base.read(io, 6), path)
-    if magic == _FILE_MAGIC && mmap
-        return readfile(mmapregion(path))
-    end
-    return _openbytes(Base.read(path))
-end
-_opensource(io::IO; mmap::Bool=true) = _openbytes(Base.read(io))
-_opensource(bytes::Vector{UInt8}; mmap::Bool=true) = _openbytes(bytes)
-_opensource(src::Union{IPCStream,ArrowFile}; mmap::Bool=true) = src
-# A byte-range source is read whole: iteration is sequential over every
-# batch, so there is nothing for range planning to skip.
-_opensource(src::AbstractArrowSource; mmap::Bool=true) =
-    _openbytes(_wholeobject(SourceFile(src)))
-
 "Distinct owner regions reachable from a source's decoded batches."
 function _sourceregions(s::IPCStream)
     seen = IdDict{AC.OwnerRegion,Nothing}()
@@ -595,116 +416,140 @@ function _sourceregions(s::IPCStream)
 end
 _sourceregions(f::ArrowFile) = AC.OwnerRegion[f.region]
 
+# The private scan-plan module is included at the facade conversion seam.
+# It owns binding, lowering, execution, projection, and output schema.
+include("scan.jl")
+
+# --- source opening ---------------------------------------------------------
+
+const _FILE_MAGIC = b"ARROW1"
+
+_isfilebytes(bytes::Vector{UInt8}) = length(bytes) >= 6 && view(bytes, 1:6) == _FILE_MAGIC
+
+function _openbytes(
+    bytes::Vector{UInt8};
+    limits::Limits=Limits(),
+    budget::Union{Nothing,AllocationBudget}=nothing,
+)
+    if budget === nothing
+        return _isfilebytes(bytes) ? readfile(bytes; limits=limits) :
+               readstream(bytes; limits=limits)
+    end
+    return _isfilebytes(bytes) ? _readfile(heapregion(bytes), limits, budget) :
+           _readstream(bytes, limits, budget)
+end
+
+function _opensource(
+    path::AbstractString;
+    mmap::Bool=true,
+    budget::Union{Nothing,AllocationBudget}=nothing,
+)
+    limits = Limits()
+    magic = open(io -> Base.read(io, 6), path)
+    if magic == _FILE_MAGIC && mmap
+        region = mmapregion(path)
+        return budget === nothing ? readfile(region; limits=limits) :
+               _readfile(region, limits, budget)
+    end
+    return _openbytes(Base.read(path); limits=limits, budget=budget)
+end
+_opensource(io::IO; mmap::Bool=true, budget=nothing) =
+    _openbytes(Base.read(io); budget=budget)
+_opensource(bytes::Vector{UInt8}; mmap::Bool=true, budget=nothing) =
+    _openbytes(bytes; budget=budget)
+_opensource(src::Union{IPCStream,ArrowFile}; mmap::Bool=true, budget=nothing) = src
+# A byte-range source is read whole: iteration is sequential over every
+# batch, so there is nothing for range planning to skip.
+_opensource(src::AbstractArrowSource; mmap::Bool=true) =
+    _openbytes(_wholeobject(SourceFile(src)))
+
 # --- Table construction ------------------------------------------------------
 
 function Table(source; scan::Union{Nothing,Tables.Scan}=nothing, mmap::Bool=true)
     if source isa AbstractArrowSource || source isa SourceFile
         sf = source isa SourceFile ? source : SourceFile(source)
+        if scan === nothing
+            return _tablefrom(_openbytes(_wholeobject(sf); limits=sf.limits), nothing)
+        end
+        _requirelittleendian()
+        _validatelimits(sf.limits)
+        budget = AllocationBudget(sf.limits.max_total_allocated_bytes)
         # Range planning pays off only for a pushable scan over a file-format
         # object with columns. With a scan the schema comes up front from
         # the cached tail: literal lowering, exactly-once output conversion,
         # and DataAPI metadata all need it.
-        if scan !== nothing && _isfilesource(sf)
-            sch, rfields = _sourceschema(sf)
-            if !isempty(rfields)
-                pushscan, pushable = _lowerscan(scan, rfields)
-                pushable &&
-                    return _wrapscanned(Tables.scan(sf, pushscan), sch, rfields, scan)
+        if _isfilesource(sf, budget)
+            ft = _rangedfooter(sf, budget)
+            plan = _ScanPlan(scan, ft.fields)
+            if !isempty(ft.fields) && plan.storage !== nothing
+                return _applyfacadescan(sf, plan, ft, budget)
             end
+            # A public-domain fallback still reuses the scan plan compiled
+            # from the Footer schema after the object is read in full. Keep
+            # the same budget through whole-object assembly, parsing, and
+            # lazy batch materialization.
+            opened = _openbytes(_wholeobject(sf, budget); limits=sf.limits, budget=budget)
+            return _tablefrom(opened, plan, budget)
         end
-        # No scan, a stream-format object (no footer to plan from), a
-        # zero-field file (bytes-tiny; the whole read carries its row count),
-        # or a scan that cannot be pushed down: read the object whole — its
-        # tail window is already in hand — and proceed as with bytes.
-        return _tablefrom(_openbytes(_wholeobject(sf); limits=sf.limits), scan)
+        # A stream-format object has no Footer to plan from. Read it whole,
+        # without resetting the budget used by the format probe, then execute
+        # the scan over its decoded columns.
+        opened = _openbytes(_wholeobject(sf, budget); limits=sf.limits, budget=budget)
+        return _tablefrom(opened, scan, budget)
     end
-    return _tablefrom(_opensource(source; mmap=mmap), scan)
+    scan === nothing && return _tablefrom(_opensource(source; mmap=mmap), nothing)
+    limits = source isa ArrowFile ? source.limits : Limits()
+    budget = AllocationBudget(limits.max_total_allocated_bytes)
+    opened = _opensource(source; mmap=mmap, budget=budget)
+    return _tablefrom(opened, scan, budget)
 end
 
 # A Table from an opened IPC source: the whole thing, or a scan pushed
 # where the format can prove it and evaluated over the rest.
-function _tablefrom(src::Union{IPCStream,ArrowFile}, scan::Union{Nothing,Tables.Scan})
+function _tablefrom(
+    src::Union{IPCStream,ArrowFile},
+    scan::Union{Nothing,Tables.Scan},
+    budget::Union{Nothing,AllocationBudget}=nothing,
+)
     regions = _sourceregions(src)
     fields = _corefields(src)
     scan === nothing && return _materialize_table(src, regions)
+    return _tablefrom(src, _ScanPlan(scan, fields), regions, fields, budget)
+end
+
+function _tablefrom(
+    src::Union{IPCStream,ArrowFile},
+    plan::_ScanPlan,
+    budget::Union{Nothing,AllocationBudget}=nothing,
+)
+    return _tablefrom(src, plan, _sourceregions(src), _corefields(src), budget)
+end
+
+function _tablefrom(src, plan::_ScanPlan, regions, fields, budget)
     # Zero-field sources carry their row count on the Table itself; the raw
     # scan path would lose it inside an empty NamedTuple.
     isempty(fields) && return _publicscan(
-        _materialize_table(src, regions),
+        _materialize_table(src, regions, budget),
         _tableschema(src),
         fields,
-        scan,
+        plan,
         regions,
     )
-    pushscan, pushable = _lowerscan(scan, fields)
-    if pushable
-        if src isa ArrowFile
-            got = Tables.scan(src, pushscan)
-        else
-            # Stream format: decode RAW columns and scan in the storage
-            # domain — the same value domain as the pushdown paths.
-            names = _fieldnamesymbols(fields)
-            raw =
-                NamedTuple{Tuple(names)}(Tuple(_rawcolumn(src, i) for i = 1:length(fields)))
-            got = Tables.scan(raw, pushscan)
-        end
-        return _wrapscanned(got, _tableschema(src), fields, scan; regions=regions)
-    end
-    # Unpushable scans (unrepresentable literals, empty projections)
-    # evaluate the ORIGINAL scan over the fully converted public table —
+    plan.storage !== nothing && return _applyfacadescan(src, plan, budget)
+    # A scan with an unrepresentable storage-domain literal evaluates its
+    # public-domain plan over the fully converted table —
     # correctness first; these are rare shapes.
     return _publicscan(
-        _materialize_table(src, regions),
+        _materialize_table(src, regions, budget),
         _tableschema(src),
         fields,
-        scan,
+        plan,
         regions,
     )
-end
-
-"Evaluate a scan in the PUBLIC value domain over a converted Table."
-function _publicscan(full::Table, schema, sourcefields, scan, regions)
-    if isempty(Tables.columnnames(full))
-        # No columns can carry the count through Tables.scan. Binding is
-        # STRUCTURAL and always runs — unsupported predicate nodes reject
-        # regardless of `validate`, exactly as Tables.resolve rules; validate
-        # only opts out of unmatched column references.
-        b = Tables.resolve(scan, Symbol[])
-        # Row-invariant predicate, evaluated ONCE — no mask or index vector
-        # may be allocated from an untrusted row count.
-        keep = _zerofieldpredicate(b.filter)
-        n1 = Int(
-            _zerofieldcount(Int64(Tables.rowcount(full)), keep, scan.limit, scan.offset),
-        )
-        return _table(Symbol[], AbstractVector[], schema, AC.OwnerRegion[regions...], n1)
-    end
-
-    # Row count survives an empty projection: window+filter first over the
-    # full column set, then project.
-    counted = Tables.scan(full, Tables.Scan(scan; select=nothing))
-    n = Int(Tables.rowcount(Tables.columns(counted)))
-    got = Tables.scan(counted, Tables.Scan(scan; filter=nothing, limit=nothing, offset=0))
-    cols = Tables.columns(got)
-    names = collect(Symbol, Tables.columnnames(cols))
-    columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
-    precols = AbstractVector[]
-    if !isempty(sourcefields)
-        srcnames = _fieldnamesymbols(sourcefields)
-        b = Tables.resolve(scan, srcnames)
-        precols =
-            AbstractVector[Tables.getcolumn(full, srcnames[bc.index]) for bc in b.columns]
-    end
-    bound = _boundschema(schema, sourcefields, scan, precols)
-    return _table(names, columns, bound, AC.OwnerRegion[regions...], n)
 end
 
 _corefields(s::IPCStream) = collect(AC.Field, s.corefields)
 _corefields(f::ArrowFile) = collect(AC.Field, f.fields)
-
-function _rawcolumn(s::IPCStream, i::Int)
-    parts = [_batchcolumn(s.corefields[i], b.columns[i]) for b in s.batches]
-    return isempty(parts) ? Any[] : reduce(vcat, parts)
-end
 
 _tableschema(s::IPCStream) = s.schema
 _tableschema(f::ArrowFile) = f.schema
@@ -733,7 +578,7 @@ end
 _retaineddictpools(fields, batches) =
     Any[_retaineddictpool(f, batches, i) for (i, f) in enumerate(fields)]
 
-function _materialize_table(src::IPCStream, regions)
+function _materialize_table(src::IPCStream, regions, budget=nothing)
     names = _fieldnamesymbols(src.schema.fields)
     cols = AbstractVector[
         _facadecolumn(f, [_batchcolumn(f, b.columns[i]) for b in src.batches]) for
@@ -744,10 +589,19 @@ function _materialize_table(src::IPCStream, regions)
     return _table(names, cols, src.schema, regions, nrows, pools)
 end
 
-function _materialize_table(src::ArrowFile, regions)
+function _materialize_table(src::ArrowFile, regions, budget=nothing)
     names = _fieldnamesymbols(src.schema.fields)
     nb = length(src)
-    batches = [src[i] for i = 1:nb]
+    batches = if budget === nothing
+        [src[i] for i = 1:nb]
+    else
+        state = DecodeState(budget)
+        try
+            [_filebatch(src, i, state) for i = 1:nb]
+        finally
+            close(state)
+        end
+    end
     cols = AbstractVector[
         _facadecolumn(f, [_batchcolumn(f, b.columns[i]) for b in batches]) for
         (i, f) in enumerate(src.fields)
@@ -831,90 +685,6 @@ _declaredbasetype(t::AC.ArrowType) =
         t.unit == AC.DAY_TIME ? NamedTuple{(:days, :millis),Tuple{Int32,Int32}} :
         NamedTuple{(:months, :days, :nanos),Tuple{Int32,Int32,Int64}}
     ) : t isa AC.DictionaryType ? _declaredbasetype(t.valuetype) : _facadebasetype(t)
-
-"""
-The OUTPUT schema of a scan: bound source fields under their output names.
-`precols` supplies each output's pre-override (facade-narrowed) column, so
-override keep/drop follows the SAME actual-subtype decision the conversion
-made: a no-op override keeps its retained field; a real conversion drops it
-(a later rewrite re-infers the column).
-"""
-function _boundschema(schema, sourcefields, scan, precols)
-    (schema === nothing || scan === nothing) && return schema
-    b = Tables.resolve(scan, _fieldnamesymbols(sourcefields))
-    outfields = AC.Field[]
-    for (i, bc) in enumerate(b.columns)
-        f = sourcefields[bc.index]
-        if bc.type !== nothing && i <= length(precols)
-            D = isempty(precols[i]) ? _declaredeltype(f) : eltype(precols[i])
-            D <: Union{bc.type,Missing} || continue
-        end
-        push!(
-            outfields,
-            AC.Field(
-                String(bc.name),
-                f.type;
-                nullable=f.nullable,
-                metadata=f.metadata === nothing ? nothing :
-                         collect(Pair{String,String}, f.metadata),
-                children=collect(AC.Field, f.children),
-            ),
-        )
-    end
-    return AC.Schema(
-        outfields;
-        metadata=schema.metadata === nothing ? nothing :
-                 collect(Pair{String,String}, schema.metadata),
-    )
-end
-
-"Wrap a scan output (storage-domain columns) into a Table, converting once."
-function _wrapscanned(got, schema, sourcefields, scan; regions=AC.OwnerRegion[])
-    cols = Tables.columns(got)
-    names = collect(Symbol, Tables.columnnames(cols))
-    columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
-    precols = AbstractVector[]
-    if scan !== nothing && !isempty(sourcefields)
-        b = Tables.resolve(scan, _fieldnamesymbols(sourcefields))
-        length(b.columns) == length(columns) || throw(
-            AssertionError(
-                "scan output width $(length(columns)) does not match its bound " *
-                "selection $(length(b.columns))",
-            ),
-        )
-        for (i, bc) in enumerate(b.columns)
-            f = sourcefields[bc.index]
-            # Public type overrides run HERE, after facade conversion —
-            # they are public-domain requests, never storage casts, and
-            # they preserve missing exactly as Tables.scan does.
-            base = _facadefromraw(f, columns[i])
-            push!(precols, base)
-            columns[i] = bc.type === nothing ? base : _applyoverride(bc.type, base)
-        end
-    end
-    nrows = isempty(columns) ? _scanrowcount(got) : length(columns[1])
-    bound = _boundschema(schema, sourcefields, scan, precols)
-    return _table(names, columns, bound, AC.OwnerRegion[regions...], nrows)
-end
-
-_scanrowcount(got) = Int(Tables.rowcount(Tables.columns(got)))
-
-"Convert a column to an override type with Tables.scan's exact rules."
-function _applyoverride(T, col)
-    # Tables.scan's no-op rule: a column already accepted by Union{T,Missing}
-    # passes through untouched (supertype overrides included).
-    eltype(col) <: Union{T,Missing} && return col
-    # A REAL conversion preserves the requested target type exactly and
-    # widens with Missing only for OBSERVED missing values — the
-    # authority's rule, opposite of declared-nullability.
-    TN = Base.nonmissingtype(T)
-    hasmissing = any(x -> x === missing, col)
-    if T >: Missing || hasmissing
-        S = T >: Missing ? T : Union{Missing,TN}
-        return S[x === missing ? missing : convert(TN, x) for x in col]
-    end
-    return TN[convert(TN, x) for x in col]
-end
 
 # --- Stream ------------------------------------------------------------------
 

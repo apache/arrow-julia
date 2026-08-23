@@ -21,6 +21,12 @@ using Dates
 using Tables
 using UUIDs
 
+struct ArrowTypesTestBytesSource <: Arrow.AbstractArrowSource
+    data::Vector{UInt8}
+end
+Arrow.sourcelength(s::ArrowTypesTestBytesSource) = length(s.data)
+Arrow.readrange(s::ArrowTypesTestBytesSource, off, len) = s.data[(off + 1):(off + len)]
+
 struct ArrowTypesTestID
     value::Int64
 end
@@ -612,6 +618,44 @@ end
                 String(ARROWTYPES_TEST_ID_NAME),
                 String(ARROWTYPES_TEST_ALTERNATE_ID_NAME),
             ])
+        end
+
+        # A facade scan must retain the dense-Union child id until ArrowTypes
+        # lifting consumes it. Both children use Int64 storage, so materializing
+        # an ordinary storage column here would erase their logical identity.
+        filebytes = Arrow.writefile(schema, [batch])
+        streambytes = Arrow.writestream(schema, [batch])
+        sources = (
+            () -> copy(filebytes),
+            () -> Arrow.SourceFile(
+                ArrowTypesTestBytesSource(copy(filebytes));
+                tailbytes=32,
+            ),
+            () -> ArrowTypesTestBytesSource(copy(streambytes)),
+        )
+        pushed = Tables.Scan(select=(:value => :routed,), offset=1, limit=2)
+        for makesource in sources
+            table = Arrow.Table(makesource(); scan=pushed)
+            wanted = expected[2:3]
+            @test collect(Tables.columnnames(table)) == [:routed]
+            @test table.routed == wanted
+            @test typeof.(table.routed) == typeof.(wanted)
+            outfield = only(getfield(table, :schema).fields)
+            @test outfield.name == "routed"
+            @test outfield.type.typeids == Int8[0, 1]
+            @test getfield.(outfield.children, :name) == ["", ""]
+        end
+
+        # A predicate over a logical child cannot lower to the shared Int64
+        # storage domain. It must execute after the same facade conversion.
+        publicfilter = Tables.Scan(
+            select=(:value,),
+            filter=Tables.colcmp(==, Tables.col(:value), ArrowTypesTestID(3)),
+        )
+        for makesource in sources
+            table = Arrow.Table(makesource(); scan=publicfilter)
+            @test table.value == [ArrowTypesTestID(3)]
+            @test typeof.(table.value) == [ArrowTypesTestID]
         end
     end
 

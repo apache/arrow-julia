@@ -245,8 +245,13 @@ without a filter whole batches outside the window are never decoded, and
 with one decoding stops as soon as the window is full. On the stream format
 the scan is applied after decode with identical results. A scan whose filter
 literal has no exact storage representation (a cross-domain or out-of-range
-value), or whose projection is empty (`select = ()`), falls back to reading
-the whole source and evaluating over the converted public values.
+value) falls back to reading the whole source and evaluating over the
+converted public values. Temporal membership lowers for Tuple and Array
+values. Set members lower only when they already have the column's canonical
+public type, which preserves `isequal` and hashing. A custom membership object
+falls back because Arrow cannot transform it without changing its `in`
+semantics. An empty projection (`select = ()`) stays on the ranged path. It
+preserves the selected row count without fetching output column bodies.
 
 Filters over a field that contains a registered ArrowTypes.jl extension value
 at any depth are evaluated over the restored public values. The ArrowTypes

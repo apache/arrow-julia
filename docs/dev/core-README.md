@@ -37,8 +37,8 @@ scope of every layer.
 | `src/ipc_write.jl` | The write half over the same registry: Core-to-metadata mapping, one generic registry-driven encoder, replacement-on-change dictionary batches, per-buffer compression, the file format (Block index + Footer), and the lazy random-access `ArrowFile` reader |
 | `src/cdata.jl` | C data and C stream interfaces both directions: zero-copy ownership, move semantics, exactly-once release, field and schema metadata transport |
 | `src/source.jl` | The `AbstractArrowSource` byte-range source interface (`sourcelength`, `readrange`, `concurrentreads`) |
-| `src/scan.jl` | `Tables.Scan` pushdown over the file format, sparse byte-range reads over a source (`SourceFile`), embedded per-batch statistics |
-| `src/table.jl`, `src/write.jl` | The facade |
+| `src/scan.jl` | The private scan-plan module: one-time binding and lowering, exact execution and schema projection, sparse byte-range reads over `SourceFile`, and embedded per-batch statistics. `table.jl` includes it at the public-column conversion seam. |
+| `src/table.jl`, `src/write.jl` | The read and write facades |
 | `ext/ArrowCloudStoreExt.jl` | CloudStore.jl objects as sources: HTTP `Range` reads, concurrent per planned range |
 | `src/ArrowStrings/` | ArrowStrings.jl — the shared inline-else-view string representation (`ArrowString`, `StringVector` = Utf8View memory); a separate package, registered on its own like ArrowTypes, that Arrow depends on through a `[sources]` path entry until its first release |
 | `src/ArrowTypes/` | ArrowTypes.jl — the separate custom-type interface package; the facade applies its lowering and extension hooks recursively |
@@ -244,18 +244,25 @@ dictionary set, so concurrent reads need no coordination.
 
 ### Scan pushdown and ranged reads
 
-`Tables.scan(::ArrowFile, scan)` (and `Arrow.Table(source; scan=…)`,
-which is the public entry over it) decodes only the selected and
-filter-referenced columns, prunes whole batches through the embedded
-statistics (one-sided: a pruned batch is provably empty), and consumes the
+`Tables.scan(::ArrowFile, scan)` and file/ranged `Arrow.Table(source; scan=…)`
+share the same batch kernel through separate closed direct and facade
+operations. They decode only the selected and filter-referenced columns,
+prune whole batches through the embedded statistics (one-sided: a pruned
+batch is provably empty), and consume the
 scan exactly: without a filter `limit`/`offset` are metadata arithmetic and
 batches outside the window are never decoded; with one the `_ScanSink`
 evaluates the filter per batch through the generic evaluator
 (`Tables.filtermask`), composes the window over the qualifying rows, and
-stops decoding once it is full. Projection and renames are applied at
-column construction; only type conversions are the generic `Tables.scan`
-executor's over the residual. `SourceFile` runs the same
-plan over an `AbstractArrowSource`: it uses the Footer (from one cached
+stops decoding once it is full. Each request is resolved once. Projection
+and renames are applied at column construction. Direct handle scans apply
+type overrides in the storage domain. The facade applies them after public
+conversion. The direct `_applyscan` seam is storage-only. The facade's
+`_applyfacadescan` operation owns route-aware ArrowTypes Union materialization,
+public conversion, and wrapping, so its private child markers cannot cross
+back into `table.jl`. Stream facade scans keep the same route local but use
+`_executeplan` after decode. `SourceFile` runs the same plan over an
+`AbstractArrowSource`:
+it uses the Footer (from one cached
 tail read) as its sole schema authority, validates the full Block index and
 the complete metadata plan for every statistics-surviving record before
 requesting a body range, and requests per-buffer body ranges for exactly

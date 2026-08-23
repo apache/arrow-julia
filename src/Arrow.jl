@@ -96,10 +96,10 @@ include("ipc_read.jl")
 include("ipc_write.jl")
 include("cdata.jl")
 include("source.jl")
-include("scan.jl")
 include("arrowtypes.jl")
 
-# The public facade.
+# The public facade. `table.jl` includes the private scan-plan module after
+# its column-conversion seam is defined.
 include("table.jl")
 include("write.jl")
 

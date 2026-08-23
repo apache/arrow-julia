@@ -34,17 +34,19 @@ separates that design intent from what the trim harness actually compiles.
 first release) is a plain-data scan request —
 select/rename/type items, a closed predicate algebra (`Cmp`/`In`/`IsNull`/
 `StrPred`/`And`/`Or`/`Not`, with `OpNode` as the growth channel), `limit`/
-`offset`. A source accepts a `Scan` as a keyword and pushes down what it
-can while materializing; whatever it cannot push it hands to the generic
-executor `Tables.scan(table, residual)` (Arrow's pushdown is the internal
-`_applyscan(handle, scan) -> (table, residual)`, composed with the executor
-by `Tables.scan(::ArrowFile/::SourceFile, scan)` and by `Arrow.Table(source;
-scan=…)`). Key contract points this design leans on:
+`offset`. A source accepts a `Scan` as a keyword and pushes down what it can
+while materializing. Arrow resolves each request once against the source
+schema. Direct handles pass the bound request to the storage-only
+`_applyscan(handle, bound)`. The public facade passes the complete plan to
+`_applyfacadescan`, which owns route-aware materialization, public conversion,
+and result wrapping as one operation. Key contract points this design leans
+on:
 
 - a pushed result must equal the executor's over the same scan, row for
   row (the differential battery pins this);
 - `limit`/`offset` may be consumed **only** over exactly filtered rows;
-- no `Function` fields anywhere — the algebra is closed and value-only.
+- no `Function` values in `Scan` or predicate data — the request algebra is
+  closed and value-only.
 
 ### What Arrow can push, by axis
 
@@ -53,26 +55,61 @@ scan=…)`). Key contract points this design leans on:
 | `select` | decode only (selected ∪ filter-referenced) columns: a registry-driven `skipfield!` advances the node/buffer cursor past unselected fields without body slicing, content validation, or materialization. Complete node/buffer metadata is still validated first. Nested subtrees skip with their parent; no body range is requested for an unselected dictionary column. | exact as IO/decode reduction (see below for who projects) |
 | `limit`/`offset` | Without a filter `RecordBatch.length` is wire metadata: whole batches before `offset` and after `offset+limit` are never decoded (ranged reads still fetch candidate RecordBatch metadata because Footer Blocks have no row counts, but request no body range for excluded batches). With a filter the window composes over the qualifying rows of each decoded batch and decoding stops once it is full. Tail reads and configured coalescing may physically over-read otherwise unrequested bytes. | exact |
 | `filter` | two tiers: (a) **statistics pruning** — per-batch min/max/null-count, when present (§3 of this doc), prune batches that cannot satisfy the predicate; (b) **mask at materialization** — evaluate the predicate over each batch's decoded columns with the generic evaluator (`Tables.filtermask`) and keep only the qualifying rows when building output columns. | (a) inexact — a pruned batch is provably empty; (b) exact — enables limit/offset pushdown with filters |
-| `types` (`ref => T`) | left in the residual for the executor's elementwise convert. Arrow's schema is source-fixed; an override is a conversion request, not a parse seed (unlike CSV). Exception: see §4 — in trim mode the overrides double as the known-schema pin. | residual |
+| `types` (`ref => T`) | An elementwise conversion request, not a parse seed. Direct handle scans apply it to storage-domain columns. The facade applies it after ArrowTypes and native public conversion. See §4 for the known-schema role in trim mode. | exact |
 
 ### The pushdown shape
 
-`_applyscan` on the file handles consumes the whole scan exactly:
+`_ScanPlan` resolves a facade request once. It keeps the public-domain bound
+plan and, when every filter literal has an exact storage representation, one
+lowered storage-domain bound plan. `_runboundscan` is the private batch kernel.
+`_applyscan` closes it over ordinary storage materialization for direct
+handles. File and ranged `_applyfacadescan` methods close it over facade
+routing. The stream method routes decoded columns and uses `_executeplan`.
+Every facade method consumes its private route markers before returning:
 
-    _applyscan(f, scan) =
-      resolve against schema names →
+    plan(scan, fields) =
+      resolve once against schema names →
+      lower filter literals exactly for storage, or mark public fallback →
+      strip public type overrides from the storage plan
+
+    Temporal `In` values lower for Tuple and Array containers. Set members
+    lower only from the field's canonical public type, preserving `isequal`
+    and hashing. Custom membership objects stay intact and force
+    public-domain fallback.
+
+Tables.jl does not yet expose execution for an existing `BoundScan`.
+`_executeplan` is the narrow local adapter for public and stream fallback. It
+uses Tables.jl's predicate and allocation seams and is pinned to the generic
+executor by the differential battery; it avoids reconstructing and resolving a
+second `Scan`.
+
+    _runboundscan(f, bound, materializecolumn) =
       decode set = selected ∪ filtercols (source order, source names) →
-      resolve positional filter refs to source names →
       batch set = limit/offset window from wire row counts (no filter),
                   ∩ stats-surviving batches (filter present, stats present) →
       per decoded batch (`_ScanSink`):
-        materialize the decode set in the storage domain →
+        materialize the decode set through the operation's fixed policy →
         rows = filter ? qualifying rows after this batch's share of
                         offset/limit (saturating, the executor's rule)
                       : the metadata window's rows →
         keep each selected column's rows, in selection order, under its
         output name; stop decoding once the window is full →
-      return (table over the selection, residual = type overrides only)
+      return table over the selection
+
+    _applyscan(handle, bound) =
+      _runboundscan(handle, bound, storage materializer)
+
+    _applyfacadescan(file-or-ranged-source, plan) =
+      assert plan.storage has no public type overrides →
+      _runboundscan(source, plan.storage, route-aware materializer) →
+      lift ArrowTypes routes and native public values →
+      apply plan.public type overrides and wrap the public Table
+
+    _applyfacadescan(stream, plan) =
+      assert plan.storage has no public type overrides →
+      materialize route-aware columns after stream decode →
+      _executeplan(columns, plan.storage) →
+      lift routes, apply plan.public overrides, and wrap the public Table
 
 The filter is evaluated by the generic evaluator (`Tables.filtermask`) over
 the batch's decoded columns, so Arrow's pushdown and the executor share one
@@ -97,17 +134,25 @@ Properties the composition holds (all implemented in `src/scan.jl`):
   sentinel that can omit later batches.
 - **One scan has one allocation budget.** Standalone lazy `file[i]` calls
   retain their documented per-call budgets. A scan that visits many batches
-  shares one budget and codec state across all of its metadata and
-  decompression work, matching the ranged operation.
+  shares one budget and codec state across footer work, metadata, fetched
+  range payloads, decompression, and any full-object public-domain fallback.
 - **Windows saturate.** `offset`/`limit` compose with `min` arithmetic over
   row counts, as the executor does, so `offset + limit` never overflows.
-- **Type overrides stay residual.** Arrow's schema is source-fixed; an
-  override is an elementwise conversion request the executor performs over
-  the built columns (the facade applies its own public-type overrides
-  after conversion instead).
+- **Type overrides run once in the correct value domain.** Direct handle
+  scans apply them to storage-domain columns. The facade keeps them out of
+  its storage plan and applies them after public conversion.
+- **Private Union routes stay local.** Direct `_applyscan` cannot select the
+  ArrowTypes route-aware materializer. `_applyfacadescan` creates and consumes
+  identical-storage Union child markers inside one operation, before a result
+  crosses back into `table.jl`.
 - **Zero-field sources** consume filter and window from row counts alone
   (`_zerofieldwindow`): a row-invariant predicate evaluates once, and no
   per-row mask is allocated from an untrusted row count.
+- **Advisory nullability does not weaken the skip boundary.** The reader
+  admits nulls under `nullable=false`; `validate_full` rejects them. If such
+  a null exists only in an unread batch, it does not widen the selected
+  result's concrete Julia vector type. Row values and conforming schemas
+  still match the generic executor exactly.
 
 The statistics fold resolves dictionary indices through the pool before it
 computes logical null/min/max values; the row evaluator compares decoded
@@ -255,8 +300,8 @@ standardized upstream. This convention is deliberately conservative:
   — dropping with a warning is the honest v1.
 - Reader: prune under `Cmp`/`In`/`IsNull` (and `StrPred` prefix ranges for
   `startswith`) with one-sided may-contain logic — a batch survives unless
-  the predicate is provably false for ALL rows; the filter always stays in
-  the residual (pruning is inexact by design). Missing or MALFORMED
+  the predicate is provably false for ALL rows; the exact row filter always
+  runs after pruning (pruning is inexact by design). Missing or MALFORMED
   statistics degrade to "no pruning", never to an error. The embedded
   stream and Base64 output share the enclosing scan allocation budget;
   exhausting that cumulative caller limit remains a scan error instead of
@@ -265,9 +310,9 @@ standardized upstream. This convention is deliberately conservative:
   bounds, and signed zero is not ordered with `isless`. Dictionary folds
   count null pool results as logical nulls.
 - **Trust model, stated plainly**: statistics are
-  trusted-for-completeness, exactly like Parquet row-group stats. The
-  residual re-filter protects one direction only — batches kept by lying
-  stats still filter row-exactly. The other direction has no net: stats
+  trusted-for-completeness, exactly like Parquet row-group stats. The exact
+  row filter protects one direction only — batches kept by lying stats still
+  filter row-exactly. The other direction has no net: stats
   that under-report a range cause false EXCLUSION. Excluded batches are not
   decoded and cause no dedicated metadata/body range request, so their
   qualifying rows are silently lost. Tail/coalescing over-read does not restore
@@ -317,13 +362,17 @@ designed for trim but not yet gated by it. The rules in `core-README.md`
 
 Implemented (`src/scan.jl`, `src/table.jl`):
 
-- **Scan pushdown**: `skipfield!`, `_applyscan(::ArrowFile, scan)` consuming
-  the scan exactly through `_ScanSink` (per-batch filter evaluation,
-  composed limit/offset with early stop, selection and renames at column
-  construction; type overrides residual), zero-field scans, and the
+- **Scan pushdown**: `skipfield!`, one `_ScanPlan` compilation per facade
+  request, storage-only `_applyscan(::ArrowFile, bound)`, and the closed
+  file/ranged `_applyfacadescan(source, plan)` route consuming the bound scan
+  exactly through `_ScanSink` (per-batch filter evaluation, composed
+  limit/offset with early stop, selection, renames, direct-handle type
+  overrides at column construction, and facade conversion before return),
+  zero-field scans, and the
   differential battery with corruption-backed never-decoded proofs. `Arrow.Table(source; scan=…)`
   routes through it on file-format and ranged inputs; stream-format inputs
-  scan post-decode with identical results.
+  route inside their facade operation and scan post-decode with identical
+  results.
 - **Byte-range sources**: the `AbstractArrowSource` contract, the
   `SourceFile` fetch protocol, the coalescing planner, `SparseBody` decode,
   the CloudStore.jl extension, and counting-source proofs (zero planned body ranges for skipped columns,

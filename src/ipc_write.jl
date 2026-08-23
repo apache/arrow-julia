@@ -1311,9 +1311,12 @@ dictionary ids and delta dictionaries are format errors here — the file
 format carries exactly one dictionary batch per id.
 """
 readfile(bytes::Vector{UInt8}; limits::Limits=Limits()) =
-    readfile(heapregion(bytes); limits=limits)
+    _readfile(heapregion(bytes), limits, AllocationBudget(limits.max_total_allocated_bytes))
 
-function readfile(region::OwnerRegion; limits::Limits=Limits())
+readfile(region::OwnerRegion; limits::Limits=Limits()) =
+    _readfile(region, limits, AllocationBudget(limits.max_total_allocated_bytes))
+
+function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget)
     _requirelittleendian()
     _validatelimits(limits)
     blob = BufferSlice(region, 0, region.len)
@@ -1333,7 +1336,6 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
     )
     footerstart = region.len - 10 - footerlen
     footerstart >= 8 || throw(ValidationError("footer escapes the file"))
-    budget = AllocationBudget(limits.max_total_allocated_bytes)
     _charge!(budget, footerlen, "footer allocation")
     footerbytes = AC.slicebytes(AC.subslice(blob, footerstart, footerlen))
     version, features, dictblocks, recordblocks, reserve =
@@ -1455,10 +1457,9 @@ function readfile(region::OwnerRegion; limits::Limits=Limits())
     end
 end
 
-function Base.getindex(f::ArrowFile, i::Integer)
+function _filebatch(f::ArrowFile, i::Integer, state::DecodeState)
     1 <= i <= length(f.recordblocks) || throw(BoundsError(f, i))
-    budget = AllocationBudget(f.limits.max_total_allocated_bytes)
-    fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
+    fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, state.budget)
     fm.version == f.schemaversion ||
         throw(ValidationError("IPC metadata version changes within the file"))
     rejectexperimentalcompression(fm)
@@ -1472,18 +1473,23 @@ function Base.getindex(f::ArrowFile, i::Integer)
             ),
         )
     end
+    return decoderecord(
+        fm,
+        f.fields,
+        f.schema,
+        f.dictionaries,
+        f.fielddictids,
+        f.limits,
+        f.validated,
+        state,
+    )
+end
+
+function Base.getindex(f::ArrowFile, i::Integer)
+    budget = AllocationBudget(f.limits.max_total_allocated_bytes)
     state = DecodeState(budget)
     try
-        return decoderecord(
-            fm,
-            f.fields,
-            f.schema,
-            f.dictionaries,
-            f.fielddictids,
-            f.limits,
-            f.validated,
-            state,
-        )
+        return _filebatch(f, i, state)
     finally
         close(state)
     end

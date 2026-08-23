@@ -18,12 +18,70 @@
 # Acceptance: differential against the generic Tables.scan executor, plus skip proofs
 # ---------------------------------------------------------------------------
 
+struct _ScanOverrideValue
+    value::Int64
+end
+Base.convert(::Type{_ScanOverrideValue}, x::Integer) = _ScanOverrideValue(Int64(x))
+
+struct _ScanDomain
+    value::Int64
+end
+Base.in(x::Integer, d::_ScanDomain) = x == d.value
+
+struct _OddDomain end
+Base.:(==)(x::Integer, ::_OddDomain) = isodd(x)
+Base.:(>=)(::_OddDomain, ::Integer) = false
+Base.:(>=)(::Integer, ::_OddDomain) = false
+
+mutable struct _ScanOverrideVector{T} <: AbstractVector{T}
+    values::Vector{T}
+end
+_ScanOverrideVector{T}(::UndefInitializer, n::Integer) where {T} =
+    _ScanOverrideVector{T}(Vector{T}(undef, n))
+Base.size(v::_ScanOverrideVector) = size(v.values)
+Base.getindex(v::_ScanOverrideVector, i::Int) = v.values[i]
+Base.setindex!(v::_ScanOverrideVector, x, i::Int) = (v.values[i] = x)
+Arrow.DataAPI.defaultarray(::Type{_ScanOverrideValue}, _) =
+    _ScanOverrideVector{_ScanOverrideValue}
+
+function _rangeintersects(a::NTuple{2,Int64}, b::NTuple{2,Int64})
+    a[2] == 0 && return false
+    b[2] == 0 && return false
+    return a[1] < b[1] + b[2] && b[1] < a[1] + a[2]
+end
+
+_requestintersects(log::FetchLog, span::NTuple{2,Int64}) =
+    any(request -> _rangeintersects(request, span), log.ranges)
+
+function _footerblocks(bytes::Vector{UInt8})
+    footerlen = Int64(reinterpret(Int32, bytes[(end - 9):(end - 6)])[1])
+    footerbytes = bytes[(end - 9 - footerlen):(end - 10)]
+    _, _, dictionaries, records, _ = verify_footer(footerbytes, Limits())
+    return dictionaries, records
+end
+
+_bodyrange(block::NTuple{3,Int64}) = (block[1] + block[2], block[3])
+
+function _recordbufferranges(bytes::Vector{UInt8}, i::Int)
+    file = readfile(copy(bytes))
+    block = file.recordblocks[i]
+    budget = AllocationBudget(file.limits.max_total_allocated_bytes)
+    fm = _blockmessage(heapregion(copy(bytes)), block, file.dataend, file.limits, budget)
+    header = fm.msg.header::Meta.RecordBatch
+    bodystart = block[1] + block[2]
+    return NTuple{2,Int64}[
+        (bodystart + Int64(buffer.offset), Int64(buffer.length)) for
+        buffer in header.buffers
+    ]
+end
+
 function _fulltable(f::ArrowFile)
     names = Tuple(Symbol(fld.name) for fld in f.fields)
     if isempty(names)
         nrows = 0
+        budget = AllocationBudget(f.limits.max_total_allocated_bytes)
         for i = 1:length(f)
-            nrows = _addscanrows(nrows, _batchrows(f, i))
+            nrows = _addscanrows(nrows, _batchrows(f, i, budget))
         end
         return _ScanColumns(NamedTuple(), nrows)
     end
@@ -166,6 +224,8 @@ function _scan_main()
         Tables.Scan(),
         Tables.Scan(select=(:ints, :strs)),
         Tables.Scan(select=(:strs => :s2, :ints)),
+        Tables.Scan(select=()),
+        Tables.Scan(select=(), filter=Tables.col(:ints) > 2),
         Tables.Scan(select=(r"s",)),
         Tables.Scan(select=(Tables.Not(:dict),)),
         Tables.Scan(filter=Tables.col(:ints) > 2),
@@ -192,6 +252,98 @@ function _scan_main()
     end
     println("differential scans match Tables.scan over the full table ✓")
 
+    # Membership keeps the caller's collection semantics through facade
+    # planning. Sets use `isequal`, so they match NaN and distinguish signed
+    # zero; rebuilding them as tuples would change both results.
+    specialio = IOBuffer()
+    Arrow.write(specialio, (x=[NaN, 0.0, -0.0], id=Int64[1, 2, 3]))
+    specialbytes = take!(specialio)
+    specialfull = Arrow.Table(copy(specialbytes))
+    for (values, expectedids) in ((Set([NaN]), [1]), (Set([0.0]), [2]))
+        scan = Tables.Scan(select=(:id,), filter=Tables.colin(Tables.col(:x), values))
+        reference = Tables.scan(specialfull, scan)
+        @assert reference.id == expectedids
+        for source in
+            (copy(specialbytes), SourceFile(BytesSource(copy(specialbytes)); tailbytes=32))
+            @assert Arrow.Table(source; scan=scan).id == expectedids
+        end
+    end
+    println("facade membership preserves Set NaN and signed-zero semantics ✓")
+
+    # Membership objects need not be iterable. Planning must pass them to
+    # their custom `in` method unchanged.
+    domainscan =
+        Tables.Scan(select=(:id,), filter=Tables.colin(Tables.col(:id), _ScanDomain(2)))
+    @assert Tables.scan(specialfull, domainscan).id == [2]
+    for source in
+        (copy(specialbytes), SourceFile(BytesSource(copy(specialbytes)); tailbytes=32))
+        @assert Arrow.Table(source; scan=domainscan).id == [2]
+    end
+    println("facade membership preserves custom non-iterable domains ✓")
+
+    # Nullability is advisory at the reader tier. A window does not inspect an
+    # unread violating batch merely to widen the selected vector. Conforming
+    # batches still match the generic executor's value and schema exactly.
+    nonnullable = Field("x", IntType(64, true); nullable=false)
+    nn_schema = Schema([nonnullable])
+    firstdata = ArrayData(
+        IntType(64, true),
+        2,
+        [BufferSlice(), AC._databuffer(Int64[1, 2])];
+        nullcount=0,
+    )
+    violatingdata = ArrayData(
+        IntType(64, true),
+        2,
+        [AC._databuffer(UInt8[0b10]), AC._databuffer(Int64[0, 3])];
+        nullcount=1,
+    )
+    conformingdata = ArrayData(
+        IntType(64, true),
+        2,
+        [BufferSlice(), AC._databuffer(Int64[3, 4])];
+        nullcount=0,
+    )
+    function windowresults(bytes)
+        scan = Tables.Scan(limit=2)
+        return Any[
+            Tables.scan(readfile(copy(bytes)), scan),
+            Tables.scan(SourceFile(BytesSource(copy(bytes)); tailbytes=32), scan),
+            Arrow.Table(copy(bytes); scan=scan),
+            Arrow.Table(SourceFile(BytesSource(copy(bytes)); tailbytes=32); scan=scan),
+        ]
+    end
+    violatingbytes = writefile(
+        nn_schema,
+        [
+            AC.RecordBatch(nn_schema, [firstdata], 2),
+            AC.RecordBatch(nn_schema, [violatingdata], 2),
+        ],
+    )
+    violatingfull = Arrow.Table(copy(violatingbytes))
+    violatingreference = Tables.scan(violatingfull, Tables.Scan(limit=2))
+    @assert violatingreference.x == [1, 2]
+    @assert eltype(violatingreference.x) === Union{Missing,Int64}
+    for got in windowresults(violatingbytes)
+        @assert got.x == [1, 2]
+        @assert eltype(got.x) === Int64
+    end
+
+    conformingbytes = writefile(
+        nn_schema,
+        [
+            AC.RecordBatch(nn_schema, [firstdata], 2),
+            AC.RecordBatch(nn_schema, [conformingdata], 2),
+        ],
+    )
+    conformingreference =
+        Tables.scan(Arrow.Table(copy(conformingbytes)), Tables.Scan(limit=2))
+    for got in windowresults(conformingbytes)
+        @assert _tables_equal(got, conformingreference)
+        @assert Tables.schema(got) == Tables.schema(conformingreference)
+    end
+    println("windowed nullability keeps the skip boundary and conforming schema parity ✓")
+
     # A column's element type is a property of the SCHEMA, not of how many
     # rows a scan kept: a scan that keeps no rows (limit 0, an offset past
     # the input, a filter statistics prune to nothing) has exactly the schema
@@ -210,23 +362,75 @@ function _scan_main()
     end
     println("empty scans keep the full scan's schema on both handles ✓")
 
-    # Residual semantics: the scan is consumed exactly — selection, renames,
-    # filter, and window — and only type overrides stay for the executor.
-    function identity(s)
-        return s.filter === nothing &&
-               s.limit === nothing &&
-               s.offset == 0 &&
-               s.select === nothing
+    # The bound scan is consumed exactly: selection, renames, filter, window,
+    # and storage-domain type overrides all cross the direct handle interface
+    # once, with no reconstructed residual.
+    t1 = Tables.scan(af, Tables.Scan(select=(:ints => :i,), offset=4, limit=3))
+    @assert Tables.columnnames(t1) == (:i,) && length(t1.i) == 3
+    t2 =
+        Tables.scan(af, Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2))
+    @assert t2.ints == [3, 4]
+    t3 = Tables.scan(af, Tables.Scan(select=(:ints => Float64,)))
+    @assert eltype(t3.ints) === Float64 && t3.ints == Float64.(full.ints)
+    println("the bound scan is consumed exactly, including type overrides ✓")
+
+    # Type overrides use Tables.jl's allocation seam. This is observable for
+    # scalar types that choose a custom default column container.
+    containerscan = Tables.Scan(select=(:ints => _ScanOverrideValue,))
+    reference = Tables.scan(full, containerscan).ints
+    @assert reference isa _ScanOverrideVector{_ScanOverrideValue}
+    for handle in (af, SourceFile(BytesSource(copy(filebytes))))
+        overridden = Tables.scan(handle, containerscan).ints
+        @assert typeof(overridden) === typeof(reference)
+        @assert getfield.(overridden, :value) == collect(Int64, full.ints)
     end
-    t1, r1 = _applyscan(af, Tables.Scan(select=(:ints => :i,), offset=4, limit=3))
-    @assert identity(r1) && Tables.columnnames(t1) == (:i,) && length(t1.i) == 3
-    t2, r2 =
-        _applyscan(af, Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2))
-    @assert identity(r2) && t2.ints == [3, 4]
-    _, r3 = _applyscan(af, Tables.Scan(select=(:ints => Float64,)))
-    @assert r3.filter === nothing && r3.limit === nothing && r3.offset == 0
-    @assert length(r3.select) == 1 && r3.select[1].type === Float64
-    println("the scan is consumed exactly; only type overrides remain residual ✓")
+    println("direct type overrides honor Tables.allocatecolumn ✓")
+
+    # Direct handles expose storage values, never the private Union route
+    # markers that the facade uses to lift identical ArrowTypes children.
+    uniontype = UnionType(AC.DenseMode, Int8[0, 1])
+    extensionmeta(name) = Pair{String,String}[
+        "ARROW:extension:name" => name,
+        "ARROW:extension:metadata" => "",
+    ]
+    child1 = Field(
+        "a",
+        IntType(64, true);
+        nullable=false,
+        metadata=extensionmeta("JuliaLang.ScanChildA"),
+    )
+    child2 = Field(
+        "b",
+        IntType(64, true);
+        nullable=false,
+        metadata=extensionmeta("JuliaLang.ScanChildB"),
+    )
+    _, data1 = fromjulia("a", Int64[11])
+    _, data2 = fromjulia("b", Int64[22])
+    unionfield = Field("u", uniontype; nullable=false, children=[child1, child2])
+    uniondata = ArrayData(
+        uniontype,
+        2,
+        [AC._databuffer(Int8[0, 1]), AC._databuffer(Int32[0, 0])];
+        children=[data1, data2],
+        nullcount=0,
+    )
+    unionschema = Schema([unionfield])
+    unionbytes = writefile(unionschema, [AC.RecordBatch(unionschema, [uniondata], 2)])
+    for handle in (
+        readfile(copy(unionbytes)),
+        SourceFile(BytesSource(copy(unionbytes)); tailbytes=32),
+    )
+        raw = Tables.scan(handle, Tables.Scan()).u
+        @assert raw == Any[11, 22]
+        @assert !any(x -> x isa _ArrowTypesRoutedUnion, raw)
+        filtered =
+            Tables.scan(handle, Tables.Scan(filter=Tables.colcmp(==, Tables.col(:u), 11))).u
+        @assert filtered == Any[11]
+        converted = Tables.scan(handle, Tables.Scan(select=(:u => Float64,))).u
+        @assert converted == [11.0, 22.0]
+    end
+    println("direct scans keep ArrowTypes Union routing private ✓")
 
     # Extreme-but-valid windows: the sink saturates like Tables.scan, so the
     # whole pipeline agrees on the empty result.
@@ -300,7 +504,7 @@ function _scan_main()
     )
     dupbytes = writefile(dupsch, [AC.RecordBatch(dupsch, ArrayData[dupcol(), dupcol()], 1)])
     dupaf = readfile(dupbytes)
-    @assert _rejects(() -> _applyscan(dupaf, Tables.Scan(select=(1,))))
+    @assert _rejects(() -> Tables.scan(dupaf, Tables.Scan(select=(1,))))
     println("duplicate-name scans refuse cleanly (facade boundary) ✓")
 
     # Window row counts are metadata, but they are not trusted until the
@@ -457,6 +661,8 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         Tables.Scan(),
         Tables.Scan(select=(:ints, :strs)),
         Tables.Scan(select=(:strs => :s2,)),
+        Tables.Scan(select=()),
+        Tables.Scan(select=(), filter=Tables.col(:ints) > 2),
         Tables.Scan(select=(Tables.Not(:dict),)),
         Tables.Scan(select=(:dict,)),
         Tables.Scan(select=(:floats,), filter=Tables.col(:ints) > 2),
@@ -472,6 +678,72 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         @assert _tables_equal(got, want) sprint(show, scan)
     end
     println("ranged reads are differentially equal to whole-file reads ✓")
+
+    # Empty projections keep their row count without requesting a record or
+    # dictionary body. A filtered empty projection requests only its filter
+    # column's buffers. A 32-byte tail and zero gap make every body request
+    # exact and observable in the log.
+    dictionaryblocks, recordblocks = _footerblocks(filebytes)
+    bodyranges = vcat(_bodyrange.(dictionaryblocks), _bodyrange.(recordblocks))
+    emptylog, emptysource = countingsource(filebytes)
+    emptygot = Tables.scan(
+        SourceFile(emptysource; tailbytes=32, coalesce_gap=0),
+        Tables.Scan(select=()),
+    )
+    @assert isempty(Tables.columnnames(emptygot))
+    @assert Tables.rowcount(Tables.columns(emptygot)) ==
+            Tables.rowcount(Tables.columns(full))
+    @assert !any(span -> _requestintersects(emptylog, span), bodyranges)
+
+    filteredlog, filteredsource = countingsource(filebytes)
+    filteredscan = Tables.Scan(select=(), filter=Tables.col(:ints) > 2)
+    filteredgot =
+        Tables.scan(SourceFile(filteredsource; tailbytes=32, coalesce_gap=0), filteredscan)
+    @assert _tables_equal(filteredgot, Tables.scan(full, filteredscan))
+    for i = 1:length(recordblocks)
+        buffers = _recordbufferranges(filebytes, i)
+        @assert length(buffers) >= 2
+        @assert _requestintersects(filteredlog, buffers[2])
+        @assert !any(span -> _requestintersects(filteredlog, span), buffers[3:end])
+    end
+    @assert !any(
+        span -> _requestintersects(filteredlog, span),
+        _bodyrange.(dictionaryblocks),
+    )
+    println("empty projections request no output-column body ranges ✓")
+
+    # Standard temporal membership containers lower without changing their
+    # `in` semantics, so a remote Date filter stays on the ranged path.
+    dateio = IOBuffer()
+    dates = Arrow.Dates.Date(2024, 1, 1) .+ Arrow.Dates.Day.(0:9_999)
+    Arrow.write(dateio, (d=dates, fat=fill(repeat("x", 128), length(dates))))
+    datebytes = take!(dateio)
+    datescan = Tables.Scan(
+        select=(),
+        filter=Tables.colin(Tables.col(:d), Set([Arrow.Dates.Date(2024, 3, 1)])),
+    )
+    datelog, datesource = countingsource(datebytes)
+    dategot =
+        Arrow.Table(SourceFile(datesource; tailbytes=32, coalesce_gap=0); scan=datescan)
+    datewant = Tables.scan(Arrow.Table(copy(datebytes)), datescan)
+    @assert _tables_equal(dategot, datewant)
+    @assert Tables.rowcount(Tables.columns(dategot)) == 1
+    @assert sum(last, datelog.ranges) < length(datebytes) ÷ 2
+
+    # Tuple membership uses `==`, while Set uses `isequal` plus hashing.
+    # Date and midnight DateTime compare equal but are distinct Set keys.
+    datetime = Arrow.Dates.DateTime(2024, 3, 1)
+    for (values, expectedrows) in ((Set([datetime]), 0), ((datetime,), 1))
+        scan = Tables.Scan(select=(), filter=Tables.colin(Tables.col(:d), values))
+        reference = Tables.scan(Arrow.Table(copy(datebytes)), scan)
+        got = Arrow.Table(
+            SourceFile(BytesSource(copy(datebytes)); tailbytes=32, coalesce_gap=0);
+            scan=scan,
+        )
+        @assert _tables_equal(got, reference)
+        @assert Tables.rowcount(Tables.columns(got)) == expectedrows
+    end
+    println("temporal membership preserves container semantics and safe range plans ✓")
 
     # Byte accounting needs bodies that dwarf metadata: a two-column file
     # where the fat column is ~7× the narrow one. Selecting the narrow
@@ -543,10 +815,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     # A dictionary body gets a planned range only when its column is in the
     # decode set. The zero-gap fixture also checks the observed request spans.
     dictblock = let
-        # dict block extents via the footer: re-derive from the file bytes
-        footerlen = Int64(reinterpret(Int32, filebytes[(end - 9):(end - 6)])[1])
-        fb = filebytes[(end - 9 - footerlen):(end - 10)]
-        _, _, dblocks, _, _ = verify_footer(fb, Limits())
+        dblocks, _ = _footerblocks(filebytes)
         @assert length(dblocks) == 1
         dblocks[1]
     end
@@ -659,6 +928,24 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     gott = Tables.scan(SourceFile(srct; tailbytes=32), Tables.Scan(select=(:ints,)))
     @assert isequal(collect(Any, gott.ints), collect(Any, full.ints))
     println("undersized tails recover with one exact footer fetch ✓")
+
+    # Retained tail/Footer payloads cost no new allocation on a later scan.
+    # The verifier's own expansion charges still apply on every parse.
+    cachelog, cachesource = countingsource(filebytes)
+    cachefile = SourceFile(cachesource; tailbytes=32)
+    cachecap = Limits().max_total_allocated_bytes
+    firstbudget = AllocationBudget(cachecap)
+    _rangedfooter(cachefile, firstbudget)
+    firstrequests = length(cachelog.ranges)
+    secondbudget = AllocationBudget(cachecap)
+    _rangedfooter(cachefile, secondbudget)
+    footerlen = Int64(reinterpret(Int32, filebytes[(end - 9):(end - 6)])[1])
+    footerstart = Int64(length(filebytes)) - 10 - footerlen
+    tailstart = Int64(length(filebytes)) - 32
+    cachedfooterbytes = footerstart < tailstart ? footerlen : Int64(0)
+    @assert (cachecap - firstbudget.left) - (cachecap - secondbudget.left) ==
+            32 + cachedfooterbytes
+    @assert length(cachelog.ranges) == firstrequests
 
     # Compressed files range-read identically (per-buffer frames are
     # self-contained behind their prefixes).
@@ -1031,6 +1318,60 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
             Tables.Scan(select=(:x,)),
         ),
     )
+
+    # The first scan owns a newly fetched tail too. A large tail must not sit
+    # outside the cumulative budget, even when an empty projection needs no
+    # record body.
+    tailio = IOBuffer()
+    Arrow.write(tailio, (x=collect(Int64, 1:5_000),))
+    tailfilebytes = take!(tailio)
+    taillog, tailsource = countingsource(tailfilebytes)
+    tailtight = Limits(max_total_allocated_bytes=32_000)
+    tailerror = try
+        Tables.scan(
+            SourceFile(tailsource; limits=tailtight, tailbytes=length(tailfilebytes)),
+            Tables.Scan(select=()),
+        )
+        nothing
+    catch e
+        e
+    end
+    @assert tailerror isa AllocationLimitError
+    @assert occursin("tail range fetch", sprint(showerror, tailerror))
+    @assert isempty(taillog.ranges)
+
+    # An unlowerable remote filter first reads the Footer, then falls back to
+    # public-domain evaluation over the whole object. Those phases share one
+    # cumulative budget. The opened file fits the materialization allowance
+    # alone; the remote path must also account for its prior Footer and object
+    # copy work, so the same allowance refuses.
+    publicio = IOBuffer()
+    Arrow.write(
+        publicio,
+        (d=fill(Arrow.Dates.Date(2024, 1, 1), 10_000), x=zeros(Int64, 10_000));
+        compress=:zstd,
+    )
+    publicbytes = take!(publicio)
+    publicscan = Tables.Scan(
+        select=(),
+        filter=Tables.colcmp(==, Tables.col(:d), Arrow.Dates.Month(1)),
+    )
+    publiclimits = Limits(max_total_allocated_bytes=160_000)
+    opened = readfile(copy(publicbytes); limits=publiclimits)
+    @assert Tables.rowcount(Arrow.Table(opened; scan=publicscan)) == 0
+    publicerror = try
+        Arrow.Table(
+            SourceFile(BytesSource(publicbytes); limits=publiclimits, tailbytes=32);
+            scan=publicscan,
+        )
+        nothing
+    catch e
+        e
+    end
+    @assert publicerror isa AllocationLimitError
+    @assert Tables.rowcount(
+        Arrow.Table(SourceFile(BytesSource(publicbytes); tailbytes=32); scan=publicscan),
+    ) == 0
     println("range limits and scan-wide allocation budgets fail before overuse ✓")
 
     println()
@@ -1057,6 +1398,21 @@ end
     @assert stats[1].rows == 5 && stats[2].rows == 5
     @assert stats[1].cols[1].min == 1 && stats[1].cols[1].max == 5
     @assert stats[2].cols[2].min == "fig" && stats[2].cols[2].max == "jam"
+
+    # Stats are not proof about a caller's custom equality or membership
+    # domain. Both direct handles must keep the batch for exact row filtering.
+    oddscan =
+        Tables.Scan(select=(:x,), filter=Tables.colcmp(==, Tables.col(:x), _OddDomain()))
+    domainscan =
+        Tables.Scan(select=(:x,), filter=Tables.colin(Tables.col(:x), _ScanDomain(2)))
+    for scan in (oddscan, domainscan)
+        want = Tables.scan(sfull, scan)
+        for handle in (saf, SourceFile(BytesSource(copy(sbytes)); tailbytes=32))
+            @assert _tables_equal(Tables.scan(handle, scan), want)
+        end
+    end
+    @assert Tables.scan(sfull, oddscan).x == [1, 3, 5, 7, 9]
+    @assert Tables.scan(sfull, domainscan).x == [2]
     # Statistics ride in schema metadata, so readers that do not know them
     # are unaffected — the oracle proves pyarrow reads stats-carrying files.
     println("statistics round-trip the official value layout ✓")

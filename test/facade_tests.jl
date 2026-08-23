@@ -256,15 +256,40 @@ end
         t3 = Arrow.Table(small; scan=Tables.Scan(select=(:a,), limit=3, offset=1500))
         @test t3.a == [1501, 1502, 1503]
         @test small.requests == [(Int64(0), Int64(length(fb)))]
-        # No scan (and any unpushable scan): the object is read whole — the
-        # cached tail plus the prefix, two requests, no planning.
+        # No scan reads the object whole: the cached tail plus the prefix,
+        # two requests and no range planning.
         empty!(log.requests)
         tw = Arrow.Table(log)
         @test tw.a == 1:2000 && length(log.requests) == 2
         @test sum(last, log.requests) == length(wb)
-        empty!(log.requests)
-        tz = Arrow.Table(log; scan=Tables.Scan(select=()))
-        @test length(tz) == 2000 && length(log.requests) == 2
+
+        # An empty projection still uses the ranged path. The result keeps its
+        # row count and transfers much less than the whole object. The scan
+        # battery checks the exact no-body request plan.
+        emptyfetched = Ref(Int64(0))
+        emptyfile = Arrow.SourceFile(
+            _MeteredSource(wb, emptyfetched);
+            tailbytes=1024,
+            coalesce_gap=0,
+        )
+        tz = Arrow.Table(emptyfile; scan=Tables.Scan(select=()))
+        @test isempty(Tables.columnnames(tz))
+        @test Tables.rowcount(tz) == 2000
+        @test emptyfetched[] < length(wb) ÷ 2
+
+        # A filtered empty projection remains range-efficient. The scan
+        # battery checks that only the filter buffers are requested.
+        filterfetched = Ref(Int64(0))
+        filterfile = Arrow.SourceFile(
+            _MeteredSource(wb, filterfetched);
+            tailbytes=1024,
+            coalesce_gap=0,
+        )
+        tf =
+            Arrow.Table(filterfile; scan=Tables.Scan(select=(), filter=Tables.col(:a) < 10))
+        @test isempty(Tables.columnnames(tf))
+        @test Tables.rowcount(tf) == 9
+        @test filterfetched[] < length(wb) ÷ 2
 
         # Concurrent reads: bounded by the source's limit, results placed by
         # request even though later requests complete first.
