@@ -847,6 +847,24 @@ end
 
 _isfilebytes(bytes::Vector{UInt8}) = length(bytes) >= 6 && view(bytes, 1:6) == _FILE_MAGIC
 
+# A successful ArrowFile adopts the mapped region. Before that handoff, this
+# layer owns the region and must release it if validation or parsing fails.
+# This is observable on Windows, where an unreleased mapping prevents the
+# source file from being deleted.
+function _readmappedfile(
+    region::AC.OwnerRegion,
+    limits::Limits,
+    budget::Union{Nothing,AllocationBudget},
+)
+    try
+        return budget === nothing ? readfile(region; limits=limits) :
+               _readfile(region, limits, budget)
+    catch
+        AC.release!(region)
+        rethrow()
+    end
+end
+
 function _openbytes(
     bytes::Vector{UInt8};
     limits::Limits=Limits(),
@@ -873,8 +891,7 @@ function _opensource(
             # Probe and map the same open file. A replacement of `path`
             # between those steps cannot redirect the read to another inode.
             region = AC._mmapregion(io, path)
-            return budget === nothing ? readfile(region; limits=limits) :
-                   _readfile(region, limits, budget)
+            return _readmappedfile(region, limits, budget)
         end
         reported = stat(io).size
         (reported isa Integer && 0 <= reported <= typemax(Int)) ||

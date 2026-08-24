@@ -831,12 +831,29 @@ end
 
     @testset "mmap path and release!" begin
         path = tempname()
-        Arrow.write(path, (x=collect(Int64, 1:10),))
-        t = Arrow.Table(path)   # mmap by default for ARROW1 files
-        @test t.x == 1:10
-        Arrow.release!(t)
-        rm(path)                # deletable post-close on every platform
-        @test t.x == 1:10
+        try
+            Arrow.write(path, (x=collect(Int64, 1:10),))
+
+            # Before parsing succeeds, the path reader owns the map. A parse
+            # error must revoke it instead of leaving the source file locked.
+            region = Arrow.AC.mmapregion(path)
+            @test_throws Arrow.AC.ValidationError Arrow._readmappedfile(
+                region,
+                Arrow.Limits(max_metadata_bytes=0),
+                nothing,
+            )
+            @test_throws InvalidStateException Arrow.AC.sliceptr(
+                Arrow.AC.BufferSlice(region, 0, 1),
+            )
+
+            t = Arrow.Table(path)   # mmap by default for ARROW1 files
+            @test t.x == 1:10
+            Arrow.release!(t)
+            rm(path)                # deletable post-close on every platform
+            @test t.x == 1:10
+        finally
+            ispath(path) && rm(path)
+        end
     end
 
     @testset "substrings and generic vectors convert" begin
