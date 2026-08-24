@@ -40,4 +40,22 @@ const AC = ArrowCore
         @test (@atomic d.nullcount) == expected
         @test (@atomic d.semachecked)
     end
+
+    @testset "concurrent allocation budget" begin
+        limit = 100_000
+        budget = Arrow.AllocationBudget(limit)
+        successes = Threads.Atomic{Int}(0)
+        @sync for _ = 1:Threads.nthreads()
+            Threads.@spawn for _ = 1:limit
+                try
+                    Arrow._charge!(budget, Int64(1), "threaded budget probe")
+                    Threads.atomic_add!(successes, 1)
+                catch e
+                    e isa Arrow.AllocationLimitError || rethrow()
+                end
+            end
+        end
+        @test successes[] == limit
+        @test Arrow._remaining(budget) == 0
+    end
 end

@@ -194,6 +194,31 @@ jobs:
         continue-on-error: false
         run: >
           julia --color=yes --project=monorepo -e 'using Pkg; Pkg.test("Arrow")'
+  test_min_arrowtypes:
+    name: Arrow.jl - ArrowTypes 2.0 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.10'
+          project: '.'
+      - uses: actions/cache@v6
+        with:
+          path: ~/.julia/artifacts
+          key: min-arrowtypes-${{ runner.os }}-${{ hashFiles('Project.toml') }}
+          restore-keys: min-arrowtypes-${{ runner.os }}-
+      - name: Resolve the minimum supported ArrowTypes version
+        shell: julia --project=. {0}
+        run: |
+          using Pkg
+          Pkg.develop(PackageSpec(path="src/ArrowStrings"))
+          Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="64268c6a316e380cc3da26965f440a5433ebc1f7"))
+          Pkg.add(PackageSpec(name="ArrowTypes", version=v"2.0.0"))
+          Pkg.pin(PackageSpec(name="ArrowTypes"))
+      - name: Test custom-type file and stream round trips
+        run: julia --startup-file=no --history-file=no --project=. test/min_arrowtypes_compat.jl
   test_windows:
     name: ${{ matrix.pkg.name }} - Julia latest - Windows - 2 threads
     runs-on: windows-latest
@@ -235,7 +260,7 @@ jobs:
         with:
           project: ${{ matrix.pkg.dir }}
   trim:
-    name: ArrowCore JuliaC trim-safe compile
+    name: ArrowCore and ArrowStrings JuliaC trim-safe compile
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -248,7 +273,7 @@ jobs:
           path: ~/.julia/artifacts
           key: trim-${{ runner.os }}-${{ hashFiles('test/trim/Project.toml') }}
           restore-keys: trim-${{ runner.os }}-
-      - name: Compile and run the trim-safe ArrowCore workload
+      - name: Compile and run the trim-safe ArrowCore and ArrowStrings workload
         run: julia --startup-file=no --history-file=no test/trim_compile_tests.jl
   docs:
     name: Documentation

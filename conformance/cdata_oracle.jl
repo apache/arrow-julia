@@ -64,7 +64,24 @@
 # never loads it).
 # =============================================================================
 
+import Arrow
+
+if !isdefined(@__MODULE__, :ConformanceSupport)
+    include(joinpath(@__DIR__, "ConformanceSupport.jl"))
+end
+using .ConformanceSupport:
+    ArrowJSON,
+    DEFAULT_CORPUS,
+    Verdict,
+    corebatchdiffs,
+    documentcheck,
+    errorverdict,
+    readjson
+
+const AC = Arrow.ArrowCore
+
 const _CDATA_ORACLE_CHILD = "--child"
+const _CDATA_ORACLE_STANDALONE = abspath(PROGRAM_FILE) == abspath(@__FILE__)
 
 # --- parent: environment preparation + relaunch ------------------------------
 
@@ -94,7 +111,7 @@ end
 function _run_cdata_oracle(args)
     corpus = isempty(args) ? DEFAULT_CORPUS : args[1]
     verdicts = runcdataoracle(corpus)
-    nfail = report(verdicts)
+    nfail = ConformanceSupport.report("C Data / C Stream oracle", verdicts)
     println()
     println("PASS families by check:")
     for check in unique(v.check for v in verdicts if v.check != "all")
@@ -105,22 +122,15 @@ function _run_cdata_oracle(args)
     exit(nfail == 0 ? 0 : 1)
 end
 
-# Everything below is only defined in the child (PythonCall + corpus loaded).
-if length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
+# Everything below is only defined in the PythonCall child.
+if _CDATA_ORACLE_STANDALONE && length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
     using PythonCall
-    include(joinpath(@__DIR__, "corpus.jl"))
 
     const pa = pyimport("pyarrow")
     const paipc = pyimport("pyarrow.ipc")
     const CS = Arrow.CArrowSchema
     const CA = Arrow.CArrowArray
     const CAS = Arrow.CArrowArrayStream
-
-    # Families this suite declares out of scope, with the reason. Everything
-    # else must pass or it is a failure.
-    const CDATA_SKIP = Dict{String,String}(
-        "generated_decimal256" => "decimal256 (Int256 storage) is not implemented",
-    )
 
     # One RecordBatch is one struct-typed column: the schema-level metadata rides
     # the struct Field, the fields are its children, the columns its child arrays.
@@ -187,47 +197,12 @@ if length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
         return r.read_next_batch()
     end
 
-    # Our own logical slice of a batch: every column re-windowed by offset.
-    function _sliceours(sch::AC.Schema, b::AC.RecordBatch, off::Integer, len::Integer)
-        cols = AC.ArrayData[
-            AC.ArrayData(
-                c.type,
-                len,
-                collect(AC.BufferSlice, c.buffers);
-                offset=c.offset + off,
-                children=collect(AC.ArrayData, c.children),
-                dictionary=c.dictionary,
-            ) for c in b.columns
-        ]
-        return AC.RecordBatch(sch, cols, len)
-    end
-
     _releasebatch!(b::AC.RecordBatch) =
         isempty(b.columns) || Arrow.release!(b.columns[1].owner::Arrow.ForeignOwner)
 
-    _verdict(fam, check, diffs) = Verdict(
-        fam,
-        check,
-        isempty(diffs) ? :pass : :fail,
-        isempty(diffs) ? "" : first(diffs),
-    )
-
-    _errverdict(fam, check, e) =
-        Verdict(fam, check, :fail, sprint(showerror, e)[1:min(end, 200)])
-
-    function _compare(sch2, b2s, goldmasked)
-        back = ArrowJSON.tojson(sch2, b2s)
-        return docsequal(masknulls!(deepcopy(back), Val(:doc)), goldmasked)
-    end
-
     function runcdatafamily(dir::String, family::String, verdicts::Vector{Verdict})
-        if haskey(CDATA_SKIP, family)
-            push!(verdicts, Verdict(family, "all", :skip, CDATA_SKIP[family]))
-            return
-        end
-        gold = _readjson(joinpath(dir, family * ".json.gz"))
-        goldmasked = masknulls!(deepcopy(gold), Val(:doc))
-        sch, batches, dictids = ArrowJSON.fromjson(gold)
+        gold = readjson(joinpath(dir, family * ".json.gz"))
+        sch, batches, _ = ArrowJSON.fromjson(gold)
 
         # 1. ours → pyarrow (validate full) → ours ; 2. pyarrow-native → ours
         check1 = "ours→pyarrow(C)→ours"
@@ -242,8 +217,8 @@ if length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
             try
                 pyb = _to_pyarrow(sch, b)
             catch e
-                ok1 && push!(verdicts, _errverdict(family, check1, e))
-                ok2 && push!(verdicts, _errverdict(family, check2, e))
+                ok1 && push!(verdicts, errorverdict(family, check1, e))
+                ok2 && push!(verdicts, errorverdict(family, check2, e))
                 ok1 = ok2 = false
                 break
             end
@@ -252,7 +227,7 @@ if length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
                     sch1, b1 = _from_pyarrow(pyb)
                     push!(b1s, b1)
                 catch e
-                    push!(verdicts, _errverdict(family, check1, e))
+                    push!(verdicts, errorverdict(family, check1, e))
                     ok1 = false
                 end
             end
@@ -263,14 +238,18 @@ if length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
                     push!(b2s, b2)
                     PythonCall.pydel!(native)
                 catch e
-                    push!(verdicts, _errverdict(family, check2, e))
+                    push!(verdicts, errorverdict(family, check2, e))
                     ok2 = false
                 end
             end
             PythonCall.pydel!(pyb)
         end
-        ok1 && push!(verdicts, _verdict(family, check1, _compare(sch1, b1s, goldmasked)))
-        ok2 && push!(verdicts, _verdict(family, check2, _compare(sch2, b2s, goldmasked)))
+        ok1 && push!(verdicts, documentcheck(family, check1, gold) do
+            ArrowJSON.tojson(sch1, b1s)
+        end)
+        ok2 && push!(verdicts, documentcheck(family, check2, gold) do
+            ArrowJSON.tojson(sch2, b2s)
+        end)
         foreach(_releasebatch!, b1s)
         foreach(_releasebatch!, b2s)
 
@@ -289,18 +268,21 @@ if length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
                     schs, bs = _from_pyarrow(sliced)
                     PythonCall.pydel!(sliced)
                     PythonCall.pydel!(pyb)
-                    want = ArrowJSON.tojson(sch, [_sliceours(sch, b, off, len)])
-                    got = ArrowJSON.tojson(schs, [bs])
-                    append!(
-                        diffs,
-                        docsequal(masknulls!(got, Val(:doc)), masknulls!(want, Val(:doc))),
-                    )
+                    append!(diffs, corebatchdiffs(bs, b; expectedoffset=off, rows=len))
                     _releasebatch!(bs)
                     isempty(diffs) || break
                 end
-                push!(verdicts, _verdict(family, check3, diffs))
+                push!(
+                    verdicts,
+                    Verdict(
+                        family,
+                        check3,
+                        isempty(diffs) ? :pass : :fail,
+                        isempty(diffs) ? "" : first(diffs),
+                    ),
+                )
             catch e
-                push!(verdicts, _errverdict(family, check3, e))
+                push!(verdicts, errorverdict(family, check3, e))
             end
         end
 
@@ -326,10 +308,12 @@ if length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
                 PythonCall.pydel!(reader)
                 s.schema, got
             end
-            push!(verdicts, _verdict(family, check4, _compare(sch4, b4s, goldmasked)))
+            push!(verdicts, documentcheck(family, check4, gold) do
+                ArrowJSON.tojson(sch4, b4s)
+            end)
             foreach(_releasebatch!, b4s)
         catch e
-            push!(verdicts, _errverdict(family, check4, e))
+            push!(verdicts, errorverdict(family, check4, e))
         end
         return
     end
@@ -418,7 +402,7 @@ if length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
                     ),
                 )
             catch e
-                push!(verdicts, _errverdict("(sentinel)", check, e))
+                push!(verdicts, errorverdict("(sentinel)", check, e))
             end
         end
         return
@@ -465,6 +449,8 @@ if length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
                 verdicts[i] = Verdict(v * "/" * vd.family, vd.check, vd.status, vd.detail)
             end
         end
+        isempty(verdicts) &&
+            error("arrow-testing corpus contains no runnable C Data families under $root")
         _metadata_sentinel!(verdicts)
         # Every structure handed to pyarrow must have come back exactly once.
         PythonCall.GC.gc()
@@ -485,7 +471,7 @@ if length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
     end
 end # child definitions
 
-if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+if _CDATA_ORACLE_STANDALONE
     if length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHILD
         _run_cdata_oracle(ARGS[2:end])
     else

@@ -37,18 +37,29 @@ scope of every layer.
 | `src/ipc_write.jl` | The write half over the same registry: Core-to-metadata mapping, one generic registry-driven encoder, replacement-on-change dictionary batches, per-buffer compression, the file format (Block index + Footer), and the lazy random-access `ArrowFile` reader |
 | `src/cdata.jl` | C data and C stream interfaces both directions: zero-copy ownership, move semantics, exactly-once release, field and schema metadata transport |
 | `src/source.jl` | The `AbstractArrowSource` byte-range source interface (`sourcelength`, `readrange`, `concurrentreads`) |
-| `src/scan.jl` | The private scan-plan module: one-time binding and lowering, exact execution and schema projection, sparse byte-range reads over `SourceFile`, and embedded per-batch statistics. `table.jl` includes it at the public-column conversion seam. |
-| `src/table.jl`, `src/write.jl` | The read and write facades |
+| `src/scan.jl` | The private scan-plan module: one-time binding and lowering, exact execution and schema projection, sparse byte-range reads over `SourceFile`, and embedded per-batch statistics. `table.jl` includes it at the public/storage type seam. |
+| `src/table.jl` | The read facade, including the shared public/storage type seam used by scan lowering and retained construction |
+| `src/columnconstruction.jl` | The deep column-construction module: fresh inference, retained-schema reconstruction, recursive ArrowTypes lowering, shared dictionary pools, partition agreement, and field metadata behind `_constructcolumn` |
+| `src/write.jl` | The write facade: partition binding, retained-field alignment, schema and batch assembly, compression selection, and IPC emission |
 | `ext/ArrowCloudStoreExt.jl` | CloudStore.jl objects as sources: HTTP `Range` reads, concurrent per planned range |
 | `src/ArrowStrings/` | ArrowStrings.jl — the shared inline-else-view string representation (`ArrowString`, `StringVector` = Utf8View memory); a separate package, registered on its own like ArrowTypes, that Arrow depends on through a `[sources]` path entry until its first release |
 | `src/ArrowTypes/` | ArrowTypes.jl — the separate custom-type interface package; the facade applies its lowering and extension hooks recursively |
-| `test/` | Core unit tests, facade tests, the four adapter acceptance batteries, the frozen 2.x-written fixtures, the `--trim=safe` gate |
-| `conformance/` | The arrow-testing gold-corpus runner, the integration-JSON implementation, the pyarrow/nanoarrow IPC oracle, the in-process pyarrow C Data / C Stream oracle |
+| `test/support/AcceptanceSupport.jl` | One explicit private dependency seam for the four stable adapter acceptance suites; the C Data stress child uses its own narrow support module |
+| `test/support/SeededFuzz.jl` | Version-stable differential, layout-family, ranged-read, statistics-pruning, and bounded mutation fuzzing with exact replay artifacts |
+| `test/` | Core and facade tests, ArrowTypes compatibility, support contracts, the four adapter acceptance batteries, frozen 2.x-written fixtures, and the `--trim=safe` gate |
+| `conformance/ConformanceSupport.jl` | Strict integration-JSON shape validation, logical-value canonicalization and comparison, skip policy, verdict construction, and reporting shared by every conformance adapter |
+| `conformance/` | The arrow-testing gold-corpus runner, the integration-JSON implementation, the pyarrow/nanoarrow IPC oracle, and the in-process pyarrow C Data / C Stream oracle |
 | `bench/` | The serialize/deserialize benchmark harness (this package and PyArrow) |
 | `docs/dev/DESIGN-scan-ranges-trim.md` | The scan pushdown, ranged-fetch, and statistics design |
-| `test/`, `conformance/` | Unit, property, compatibility, conformance, and external-oracle checks |
 
 ## Run it
+
+On Julia 1.10, prepare a fresh checkout once before you run the commands below.
+Julia 1.10 does not read the repository's `[sources]` entries.
+
+```bash
+julia --project=. -e 'using Pkg; Pkg.develop([PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")]); Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="64268c6a316e380cc3da26965f440a5433ebc1f7"))'
+```
 
 ```bash
 julia --project=. -e 'using Pkg; Pkg.test()'                     # core + facade + batteries
@@ -57,9 +68,25 @@ julia --startup-file=no conformance/run.jl               # all conformance suite
 julia --startup-file=no conformance/run.jl corpus        # one suite: the gold corpus …
 julia --startup-file=no conformance/run.jl oracle        # … IPC bytes through pyarrow + nanoarrow …
 julia --startup-file=no conformance/run.jl cdata         # … C Data + C Stream through an in-process pyarrow
+julia --project=. test/fuzz.jl --cases 16 --mutations 64         # deterministic PR-sized fuzz suite
+julia --project=. test/fuzz.jl --cases 512 --mutations 20000 --determinism-every 256 --repro-dir fuzz-reproductions  # extended suite
 julia --project=. bench/run.jl                                     # benchmarks
 julia tools/fbsgen.jl src/metadata/fbs src/metadata               # regenerate bindings + verifier
 ```
+
+For a chosen master seed, a fixed SplitMix64 stream derives every case. The
+master seed and case index identify the same input on every supported Julia
+version. PR tests and manual runs default to one fixed seed. Each scheduled run
+uses its workflow run ID as a new reproducible seed. Active-case artifacts are
+written before parser work. They record both seeds, the source revision, exact
+generated and saved-byte commands, and the active Project and Manifest with a
+restore command. Mutation replays compare two full outcomes. The scheduled
+workflow also repeats the first complete mutation-route sweep and every 256th
+later mutation. It stops the fuzz process before the job timeout, then uploads
+the active artifacts even for a hang or forced stop. After download, run the
+artifact's `replay.sh` with a clean Arrow.jl checkout path. The wrapper resolves
+its own artifact directory, temporarily installs and instantiates the recorded
+Project and Manifest, runs the replay, and restores the checkout files.
 
 `Tables.Scan` pushdown needs the Tables.jl revision pinned in `Project.toml`
 developed into the project environment (the conformance image clones it). The conformance
@@ -145,7 +172,8 @@ and null arrays. Logical parent offsets and nested slices are supported.
 
 Struct scalars on the dynamic path are ordered `Vector{Pair{String,Any}}`,
 so names stay in the value domain and duplicate, empty, or
-non-Symbol-compatible names are representable. The typed path
+non-Symbol-compatible names are representable. Core keeps every schema field
+and child name as a `String`; it does not intern schema names. The typed path
 (`getvalue(::Type{T}, field, data, i)`, `materialize(::Type{T}, field,
 data)`) is a caller-asserted element domain: exact match only (no
 conversion; `Missing <: T` admits nulls; `Any` is the dynamic path),
@@ -211,8 +239,12 @@ mutate or resize the vector while the stream or its batches live.
 `IPCStream` is a single-owner cursor — overlapping `nextbatch!` calls throw
 `ConcurrencyViolationError`. `max_total_allocated_bytes` is one
 reader-wide, conservative budget for metadata copies, metadata-directed
-Julia containers, and decompressed outputs; it is not a measurement of
-every Julia allocation. Schema and Field metadata stay as ordered pair
+Julia containers, decompressed outputs, Core materialization, ArrowTypes
+route containers, and facade copies. `IPCStream` carries the remaining budget
+into `Arrow.Table` and `Arrow.Stream`; it is not a measurement of custom user
+hook allocations or every Julia allocation. Package-owned vector reserves
+include conservative backing capacity because Julia can round the requested
+payload to a larger allocation class. Schema and Field metadata stay as ordered pair
 vectors, so duplicate keys and their original order survive IPC reads and
 rewrites.
 
@@ -262,9 +294,10 @@ public conversion, and wrapping, so its private child markers cannot cross
 back into `table.jl`. Stream facade scans keep the same route local but use
 `_executeplan` after decode. `SourceFile` runs the same plan over an
 `AbstractArrowSource`:
-it uses the Footer (from one cached
-tail read) as its sole schema authority, validates the full Block index and
-the complete metadata plan for every statistics-surviving record before
+it uses the Footer (normally from one cached tail read, with one exact cached
+follow-up when the Footer escapes that window) as its sole schema authority,
+validates the full Block index and the complete metadata plan for every
+statistics-surviving record before
 requesting a body range, and requests per-buffer body ranges for exactly
 the decode set, coalesced under `coalesce_gap`. It does not fetch the
 leading magic, parse or cross-check the leading schema message, or inspect
@@ -345,12 +378,77 @@ of a `Table`/`Stream` recursively preserve every descriptor that materialized
 values can reconstruct, plus nullability and ordered metadata. Top-level
 dictionary pools retain order, unused and duplicate entries, null entries,
 and index width; multi-partition dictionary columns share one pool object.
-Union routing and nested dictionary pools are no longer present after facade
-materialization, so those retained rewrites fail closed. View buffer topology,
-ListView overlap, and exact run segmentation rebuild canonically. DataAPI
-metadata reads through. The facade applies ArrowTypes.jl lowering and extension
-restoration recursively to top-level and nested values. There is no lazy
-typed-view layer, no parallel writer pipeline, and no append-as-resume.
+Unregistered Union routing and nested dictionary pools are no longer present
+after facade materialization, so those retained rewrites fail closed.
+Registered ArrowTypes.jl public-domain values keep writer-side type evidence and can
+reconstruct retained Union routing, including retained dense or sparse mode and
+type IDs. Sparse children receive canonical hidden placeholders outside their
+active rows. An abstract registered target accepts an extensionless concrete
+subtype or one with the retained parent identity; a different explicit identity
+fails closed. A nullable Dictionary<Null> with an unknown extension also fails
+closed because materialized `missing` values cannot retain the difference
+between a valid null-pool index and a null index. View buffer
+topology, ListView overlap, and exact run segmentation rebuild canonically.
+DataAPI metadata reads through. The facade applies ArrowTypes.jl lowering and
+extension restoration recursively to top-level and nested values. There is no
+lazy typed-view layer, no parallel writer pipeline, and no append-as-resume.
+One column-scoped construction context caches `ArrowType` per Julia type,
+extension shape and Union decomposition per Julia type, runtime Union branch
+routes, and `JuliaType` per retained `Field`.
+Tables column names are the explicit process-global `Symbol` boundary. Before
+interning any novel top-level name, the facade preflights the complete schema:
+4096 UTF-8 bytes per name, at most 65,536 novel names per table
+materialization, and at most 1 MiB of novel-name bytes in total. Failure occurs
+before partial interning. Nested Core names remain strings.
+On the ordinary resolved paths, `toarrow` runs once for each value that reaches
+lowering; dictionary categories are pooled before they are lowered. The
+ArrowTypes 2.x fallback for an unresolved all-missing abstract storage type is
+kept for compatibility. Recursive custom schemas and value containers, and
+custom mapping nesting beyond 64 levels, fail with `ArgumentError`.
+Fresh unresolved abstract declarations collect concrete subtype evidence once
+for the complete column. This preserves subtype extensions and uses an explicit
+bounded Union when the observed subtype Fields differ.
+Declared writer Unions have at most 32 branches. Runtime writer or storage
+inference has at most 8 distinct types across the complete column. This covers
+abstract ArrowTypes storage, abstract or `Any` dictionary values, and abstract
+retained ArrowTypes targets. The lower inferred limit bounds per-type trait and
+candidate compilation; an explicit declared Union remains the schema authority
+for wider intentional type sets.
+Fixed-size-list storage signatures are exact through arity 1024. Larger
+descriptors use compact `Tuple{Vararg{T}}` signatures so logical type resolution
+cannot allocate in proportion to an untrusted list size. Extension Struct
+signatures are exact through 1024 children only when child names are unique,
+contain no embedded NUL, already exist as Julia `Symbol`s, are at most 4096
+UTF-8 bytes each, and use at most 64 KiB in total. Otherwise the labelled Struct
+remains unknown and materializes as ordered `Pair` storage. The bounded
+ArrowTypes.jl Tuple compatibility exception may intern names only when the
+complete child sequence is exactly `"1"`, `"2"`, …, `string(N)` for
+`N ≤ 1024`; it can therefore add only `Symbol("1")` through `Symbol("1024")`.
+Unknown extension labels return before preflight. Arbitrary or partly positional
+Struct names never take this exception.
+Unknown extension labels are probed with a non-interning Julia symbol lookup;
+only an existing symbol can reach `JuliaType(Val(...))`. Unsupported-extension
+warnings are deduplicated by the complete label. Each table materialization
+emits at most one warning for each of 16 distinct labels, then one suppression
+notice for further distinct labels. A warning displays at most 128 UTF-8 bytes
+of its label. The built-in `JuliaLang.Symbol` mapping likewise rejects a storage
+string that is not already interned, rather than growing process-global symbol
+state from input.
+Writer-side `ArrowType` results are checked at the trait cache boundary. A
+returned concrete tuple above arity 1024 is rejected before downstream writer
+specialization, including the default mapping for a tuple value. A custom trait
+method itself is trusted Julia code.
+Hidden retained composite data is built from Field plus length. Null-only
+fixed-size lists recurse without per-slot Julia placeholders, including wholly
+or partly inactive sparse-Union children.
+
+Retained descriptor matching recognizes only storage families whose builders
+can enforce the original schema exactly. These include sequence layouts,
+opaque binary and wide-decimal byte storage, interval NamedTuple storage, and
+compatible temporal units. The retained builders enforce fixed widths, list
+sizes, interval shapes, exact temporal conversion, and sorted Map claims.
+Concrete declared element types remain planning evidence when a column is empty
+or contains only missing values.
 
 ## Trim-compile support (JuliaC `--trim=safe`)
 
@@ -359,7 +457,9 @@ JuliaC's `--trim=safe` and requires **zero verifier errors, zero verifier
 warnings, and a produced binary that runs to exit 0**. The workload covers
 regions, mmap, C-data export/import/release, dynamic values, typed values
 (a `from_c_data` → `materialize(Int64, …)` scenario among them), and
-validation errors. The rules that keep a runtime-tagged core there:
+validation errors. It also covers ArrowStrings construction, inline and view
+access, missing values, comparison, and materialization. The rules that keep a
+runtime-tagged core there:
 
 - **Closed-set dispatch ladders.** Dispatch on an abstract-typed field is
   dynamic; the descriptor set is closed (it IS the layout registry), so

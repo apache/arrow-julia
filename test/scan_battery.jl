@@ -28,6 +28,11 @@ struct _ScanDomain
 end
 Base.in(x::Integer, d::_ScanDomain) = x == d.value
 
+struct _DateScanDomain
+    value::Arrow.Dates.Date
+end
+Base.in(x::Arrow.Dates.Date, d::_DateScanDomain) = x == d.value
+
 struct _OddDomain end
 Base.:(==)(x::Integer, ::_OddDomain) = isodd(x)
 Base.:(>=)(::_OddDomain, ::Integer) = false
@@ -94,18 +99,54 @@ function _fulltable(f::ArrowFile)
     return NamedTuple{names}(cols)
 end
 
-function _tables_equal(a, b)
+function _tables_values_equal(a, b)
     ca, cb = Tables.columns(a), Tables.columns(b)
     Tables.rowcount(ca) == Tables.rowcount(cb) || return false
     na, nb = Tables.columnnames(ca), Tables.columnnames(cb)
     collect(na) == collect(nb) || return false
     for n in na
-        isequal(
-            collect(Any, Tables.getcolumn(ca, n)),
-            collect(Any, Tables.getcolumn(cb, n)),
-        ) || return false
+        cola = Tables.getcolumn(ca, n)
+        colb = Tables.getcolumn(cb, n)
+        isequal(collect(Any, cola), collect(Any, colb)) || return false
     end
     return true
+end
+
+function _tables_equal(a, b)
+    _tables_values_equal(a, b) || return false
+    ca, cb = Tables.columns(a), Tables.columns(b)
+    _schemas_equal(Tables.schema(ca), Tables.schema(cb)) || return false
+    return all(
+        eltype(Tables.getcolumn(ca, n)) == eltype(Tables.getcolumn(cb, n)) for
+        n in Tables.columnnames(ca)
+    )
+end
+
+function _schemas_equal(a, b)
+    (a === nothing || b === nothing) && return a === b
+    return collect(a.names) == collect(b.names) && collect(a.types) == collect(b.types)
+end
+
+const _MIXED_SCAN_ELTYPES = (
+    Int64,
+    Union{Missing,Float64},
+    Union{Missing,Bool},
+    Union{Missing,String},
+    Any,
+    Any,
+    Union{Missing,String},
+)
+
+function _assert_mixed_scan_types(table, scan::Tables.Scan)
+    names = collect(Symbol, keys(MIXED_EXPECTED))
+    bound = Tables.resolve(scan, names)
+    gotnames = collect(Symbol, Tables.columnnames(table))
+    @assert gotnames == Symbol[column.name for column in bound.columns]
+    for (output, column) in enumerate(bound.columns)
+        expected = column.type === nothing ? _MIXED_SCAN_ELTYPES[column.index] : column.type
+        @assert eltype(Tables.getcolumn(table, output)) === expected
+    end
+    return nothing
 end
 
 "Body byte range of buffer number `bufindex` (1-based) of record batch `i`."
@@ -214,6 +255,7 @@ function _legacyv4file()
 end
 
 function _scan_main()
+    @assert !_tables_equal((x=Any[1],), (x=Int64[1],))
     expected = MIXED_EXPECTED
     source = readstream(_mixed_two_partitions_bytes())
     filebytes = writefile(source)
@@ -248,7 +290,8 @@ function _scan_main()
     for scan in scans
         got = Tables.scan(af, scan)
         want = Tables.scan(full, scan)
-        @assert _tables_equal(got, want) sprint(show, scan)
+        @assert _tables_values_equal(got, want) sprint(show, scan)
+        _assert_mixed_scan_types(got, scan)
     end
     println("differential scans match Tables.scan over the full table ✓")
 
@@ -340,14 +383,15 @@ function _scan_main()
         Tables.scan(Arrow.Table(copy(conformingbytes)), Tables.Scan(limit=2))
     for got in windowresults(conformingbytes)
         @assert _tables_equal(got, conformingreference)
-        @assert Tables.schema(got) == Tables.schema(conformingreference)
+        @assert _schemas_equal(Tables.schema(got), Tables.schema(conformingreference))
     end
     println("windowed nullability keeps the skip boundary and conforming schema parity ✓")
 
     # A column's element type is a property of the SCHEMA, not of how many
-    # rows a scan kept: a scan that keeps no rows (limit 0, an offset past
-    # the input, a filter statistics prune to nothing) has exactly the schema
-    # of the full direct scan, on both the file and the ranged handle.
+    # rows a scan kept: a zero limit, an offset past the input, and a decoded
+    # filter that keeps nothing have exactly the schema of the full direct
+    # scan, on both the file and the ranged handle. `_stats_predicate_checks`
+    # separately proves the true no-decode statistics-pruned route.
     fullschema = Tables.schema(Tables.scan(af, Tables.Scan()))
     for emptyscan in (
         Tables.Scan(limit=0),
@@ -357,16 +401,54 @@ function _scan_main()
         for handle in (af, SourceFile(BytesSource(copy(filebytes))))
             got = Tables.scan(handle, emptyscan)
             @assert Tables.rowcount(Tables.columns(got)) == 0
-            @assert Tables.schema(got) == fullschema sprint(show, emptyscan)
+            @assert _schemas_equal(Tables.schema(got), fullschema) sprint(show, emptyscan)
         end
     end
     println("empty scans keep the full scan's schema on both handles ✓")
+
+    # The zero-part join and decoded-batch path share one storage-claim rule.
+    # Pin the routes that are easiest to misclassify: closed byte containers,
+    # dynamic Null, Union, and transparent Dictionary/REE wrappers.
+    emptyuniontype = UnionType(AC.DenseMode, Int8[0])
+    emptyunionchild = Field("value", IntType(64, true); nullable=false)
+    emptyunionfield =
+        Field("union", emptyuniontype; nullable=false, children=[emptyunionchild])
+    emptyrunends = Field("run_ends", IntType(32, true); nullable=false)
+    routeclaims = (
+        Field("binary", BinaryType(false); nullable=false) => Vector{UInt8},
+        Field("decimal", DecimalType(10, 2, 128); nullable=false) => Vector{UInt8},
+        Field("null", NullType(); nullable=true) => Any,
+        emptyunionfield => Any,
+        Field(
+            "dictionary_union",
+            DictionaryType(IntType(32, true), emptyuniontype, false);
+            nullable=true,
+            children=[emptyunionchild],
+        ) => Any,
+        Field(
+            "ree_union",
+            RunEndEncodedType();
+            nullable=false,
+            children=[emptyrunends, emptyunionfield],
+        ) => Any,
+        Field(
+            "ree_int",
+            RunEndEncodedType();
+            nullable=false,
+            children=[emptyrunends, emptyunionchild],
+        ) => Int64,
+    )
+    for (field, expectedtype) in routeclaims
+        @assert _storageelementclaim(field) === expectedtype
+        @assert eltype(_joinscanparts(field, Any[])) === expectedtype
+    end
+    println("zero-part joins share the decoded storage-route claims ✓")
 
     # The bound scan is consumed exactly: selection, renames, filter, window,
     # and storage-domain type overrides all cross the direct handle interface
     # once, with no reconstructed residual.
     t1 = Tables.scan(af, Tables.Scan(select=(:ints => :i,), offset=4, limit=3))
-    @assert Tables.columnnames(t1) == (:i,) && length(t1.i) == 3
+    @assert collect(Tables.columnnames(t1)) == [:i] && length(t1.i) == 3
     t2 =
         Tables.scan(af, Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2))
     @assert t2.ints == [3, 4]
@@ -438,7 +520,8 @@ function _scan_main()
     extremewant = Tables.scan(full, extreme)
     for sourcefile in (af, SourceFile(BytesSource(filebytes)))
         got = Tables.scan(sourcefile, extreme)
-        @assert _tables_equal(got, extremewant)
+        @assert _tables_values_equal(got, extremewant)
+        _assert_mixed_scan_types(got, extreme)
         @assert length(Tables.getcolumn(Tables.columns(got), 1)) == 0
     end
     println("extreme scan windows saturate to the empty result ✓")
@@ -675,7 +758,8 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         log, src = countingsource(filebytes)
         got = Tables.scan(SourceFile(src), scan)
         want = Tables.scan(full, scan)
-        @assert _tables_equal(got, want) sprint(show, scan)
+        @assert _tables_values_equal(got, want) sprint(show, scan)
+        _assert_mixed_scan_types(got, scan)
     end
     println("ranged reads are differentially equal to whole-file reads ✓")
 
@@ -699,7 +783,8 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     filteredscan = Tables.Scan(select=(), filter=Tables.col(:ints) > 2)
     filteredgot =
         Tables.scan(SourceFile(filteredsource; tailbytes=32, coalesce_gap=0), filteredscan)
-    @assert _tables_equal(filteredgot, Tables.scan(full, filteredscan))
+    @assert _tables_values_equal(filteredgot, Tables.scan(full, filteredscan))
+    _assert_mixed_scan_types(filteredgot, filteredscan)
     for i = 1:length(recordblocks)
         buffers = _recordbufferranges(filebytes, i)
         @assert length(buffers) >= 2
@@ -718,32 +803,150 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     dates = Arrow.Dates.Date(2024, 1, 1) .+ Arrow.Dates.Day.(0:9_999)
     Arrow.write(dateio, (d=dates, fat=fill(repeat("x", 128), length(dates))))
     datebytes = take!(dateio)
-    datescan = Tables.Scan(
-        select=(),
-        filter=Tables.colin(Tables.col(:d), Set([Arrow.Dates.Date(2024, 3, 1)])),
-    )
+    targetdate = Arrow.Dates.Date(2024, 3, 1)
+    datescan =
+        Tables.Scan(select=(:d,), filter=Tables.colin(Tables.col(:d), Set([targetdate])))
+    datefull = Arrow.Table(copy(datebytes))
+    datefield = getfield(datefull, :schema).fields[1]
+    @assert Arrow._ScanPlan(datescan, [datefield]).storage !== nothing
     datelog, datesource = countingsource(datebytes)
     dategot =
         Arrow.Table(SourceFile(datesource; tailbytes=32, coalesce_gap=0); scan=datescan)
-    datewant = Tables.scan(Arrow.Table(copy(datebytes)), datescan)
+    datewant = Tables.scan(datefull, datescan)
     @assert _tables_equal(dategot, datewant)
-    @assert Tables.rowcount(Tables.columns(dategot)) == 1
+    @assert dategot.d == [targetdate]
     @assert sum(last, datelog.ranges) < length(datebytes) ÷ 2
 
     # Tuple membership uses `==`, while Set uses `isequal` plus hashing.
     # Date and midnight DateTime compare equal but are distinct Set keys.
     datetime = Arrow.Dates.DateTime(2024, 3, 1)
     for (values, expectedrows) in ((Set([datetime]), 0), ((datetime,), 1))
-        scan = Tables.Scan(select=(), filter=Tables.colin(Tables.col(:d), values))
-        reference = Tables.scan(Arrow.Table(copy(datebytes)), scan)
+        scan = Tables.Scan(select=(:d,), filter=Tables.colin(Tables.col(:d), values))
+        plan = Arrow._ScanPlan(scan, [datefield])
+        @assert (plan.storage !== nothing) == (values isa Tuple)
+        reference = Tables.scan(datefull, scan)
         got = Arrow.Table(
             SourceFile(BytesSource(copy(datebytes)); tailbytes=32, coalesce_gap=0);
             scan=scan,
         )
         @assert _tables_equal(got, reference)
-        @assert Tables.rowcount(Tables.columns(got)) == expectedrows
+        @assert got.d == (expectedrows == 0 ? Arrow.Dates.Date[] : [targetdate])
+    end
+
+    # A custom temporal membership object is not iterable. It must force the
+    # complete filter to the public plan without changing its `in` method.
+    domainscan = Tables.Scan(
+        select=(:d,),
+        filter=Tables.colin(Tables.col(:d), _DateScanDomain(targetdate)),
+    )
+    @assert Arrow._ScanPlan(domainscan, [datefield]).storage === nothing
+    domainreference = Tables.scan(datefull, domainscan)
+    for source in (copy(datebytes), SourceFile(BytesSource(copy(datebytes)); tailbytes=32))
+        got = Arrow.Table(source; scan=domainscan)
+        @assert _tables_equal(got, domainreference)
+        @assert got.d == [targetdate]
+    end
+
+    # Missing inside a standard membership container also forces a public
+    # plan. Exercise it below negation and composition so three-valued
+    # membership cannot be simplified to plain false.
+    nullableio = IOBuffer()
+    nullable_dates = Union{Missing,Arrow.Dates.Date}[
+        Arrow.Dates.Date(2024, 1, 1),
+        missing,
+        Arrow.Dates.Date(2024, 1, 3),
+    ]
+    Arrow.write(nullableio, (id=Int64[1, 2, 3], d=nullable_dates))
+    nullablebytes = take!(nullableio)
+    nullablefull = Arrow.Table(copy(nullablebytes))
+    nullablefield = getfield(nullablefull, :schema).fields[2]
+    membership = Tables.colin(Tables.col(:d), (Arrow.Dates.Date(2024, 1, 1), missing))
+    arraymembership = Tables.colin(
+        Tables.col(:d),
+        Union{Missing,Arrow.Dates.Date}[Arrow.Dates.Date(2024, 1, 3), missing],
+    )
+    for (filter, expected) in (
+        (!membership | Tables.isnull(Tables.col(:d)), Int64[2]),
+        (arraymembership & !Tables.isnull(Tables.col(:d)), Int64[3]),
+    )
+        scan = Tables.Scan(select=(:id,), filter=filter)
+        @assert Arrow._ScanPlan(scan, [getfield(nullablefull, :schema).fields...]).storage ===
+                nothing
+        reference = Tables.scan(nullablefull, scan)
+        @assert reference.id == expected
+        for source in (
+            copy(nullablebytes),
+            SourceFile(BytesSource(copy(nullablebytes)); tailbytes=32),
+        )
+            @assert Arrow.Table(source; scan=scan).id == expected
+        end
     end
     println("temporal membership preserves container semantics and safe range plans ✓")
+
+    # Dictionary wrappers recurse into their temporal value descriptor during
+    # planning. Exact Date membership lowers. Aliasing Timestamp(seconds) and
+    # fine-unit Duration membership stay in the public domain.
+    function temporaldictionary(t, pool, indices)
+        pooldata = Arrow.AC.ArrayData(
+            t,
+            length(pool),
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(pool)];
+            nullcount=0,
+        )
+        dicttype = Arrow.AC.DictionaryType(Arrow.AC.IntType(32, true), t, false)
+        field = Arrow.AC.Field("v", dicttype; nullable=false)
+        data = Arrow.AC.ArrayData(
+            dicttype,
+            length(indices),
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int32.(indices))];
+            dictionary=pooldata,
+            nullcount=0,
+        )
+        schema = Arrow.AC.Schema([field])
+        batch = Arrow.AC.RecordBatch(schema, [data], length(indices))
+        return field, Arrow.writefile(schema, [batch])
+    end
+    dictionarycases = (
+        (
+            Arrow.AC.DateType(Arrow.AC.DAY),
+            Int32[0, 1, 2],
+            Int32[0, 1, 2, 1],
+            (Arrow.Dates.Date(1970, 1, 2),),
+            true,
+            Arrow.Dates.Date[Arrow.Dates.Date(1970, 1, 2), Arrow.Dates.Date(1970, 1, 2)],
+        ),
+        (
+            Arrow.AC.TimestampType(Arrow.AC.SECOND, nothing),
+            Int64[0, Int64(1) << 61],
+            Int32[0, 1],
+            (Arrow.Dates.DateTime(1970, 1, 1),),
+            false,
+            Arrow.Dates.DateTime[
+                Arrow.Dates.DateTime(1970, 1, 1),
+                Arrow.Dates.DateTime(1970, 1, 1),
+            ],
+        ),
+        (
+            Arrow.AC.DurationType(Arrow.AC.SECOND),
+            Int64[60],
+            Int32[0],
+            (Arrow.Dates.Millisecond(60_000),),
+            false,
+            Arrow.Dates.Second[Arrow.Dates.Second(60)],
+        ),
+    )
+    for (type, pool, indices, values, lowered, expected) in dictionarycases
+        field, bytes = temporaldictionary(type, pool, indices)
+        scan = Tables.Scan(select=(:v,), filter=Tables.colin(Tables.col(:v), values))
+        @assert (Arrow._ScanPlan(scan, [field]).storage !== nothing) == lowered
+        dictionaryfull = Arrow.Table(copy(bytes))
+        reference = Tables.scan(dictionaryfull, scan)
+        @assert reference.v == expected
+        for source in (copy(bytes), SourceFile(BytesSource(copy(bytes)); tailbytes=32))
+            @assert Arrow.Table(source; scan=scan).v == expected
+        end
+    end
+    println("temporal dictionary scans preserve pushdown and fallback semantics ✓")
 
     # Byte accounting needs bodies that dwarf metadata: a two-column file
     # where the fat column is ~7× the narrow one. Selecting the narrow
@@ -907,7 +1110,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         Tables.Scan(select=(:ints, :strs)),
     )
     want = Tables.scan(full, Tables.Scan(select=(:ints, :strs)))
-    @assert _tables_equal(gotbig, want) && _tables_equal(gotzero, want)
+    @assert _tables_values_equal(gotbig, want) && _tables_values_equal(gotzero, want)
+    _assert_mixed_scan_types(gotbig, Tables.Scan(select=(:ints, :strs)))
+    _assert_mixed_scan_types(gotzero, Tables.Scan(select=(:ints, :strs)))
     @assert logbig.requests < logzero.requests
     @assert logzero.bytes <= logbig.bytes
     @assert _coalesce(NTuple{2,Int64}[(0, 8), (16, 8)], typemax(Int64)) ==
@@ -942,9 +1147,12 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     footerlen = Int64(reinterpret(Int32, filebytes[(end - 9):(end - 6)])[1])
     footerstart = Int64(length(filebytes)) - 10 - footerlen
     tailstart = Int64(length(filebytes)) - 32
-    cachedfooterbytes = footerstart < tailstart ? footerlen : Int64(0)
-    @assert (cachecap - firstbudget.left) - (cachecap - secondbudget.left) ==
-            32 + cachedfooterbytes
+    cachedallocation = AC._materializedvectorbytes(UInt8, 32)
+    footerstart < tailstart &&
+        (cachedallocation += AC._materializedvectorbytes(UInt8, footerlen))
+    firstused = cachecap - _remaining(firstbudget)
+    secondused = cachecap - _remaining(secondbudget)
+    @assert firstused - secondused == cachedallocation
     @assert length(cachelog.ranges) == firstrequests
 
     # Compressed files range-read identically (per-buffer frames are
@@ -1043,7 +1251,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         validfile.limits,
         validcodec,
         Bool[true],
-    ) === nothing
+    ) == 2
 
     structbytes = writefile(
         readstream(
@@ -1091,7 +1299,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         structfile.limits,
         structcodec,
         Bool[true],
-    ) === nothing
+    ) == 2
 
     emptylistbytes = writefile(readstream(_fixture2x("empty-string-list") do
         emptylistio = IOBuffer()
@@ -1356,7 +1564,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         select=(),
         filter=Tables.colcmp(==, Tables.col(:d), Arrow.Dates.Month(1)),
     )
-    publiclimits = Limits(max_total_allocated_bytes=160_000)
+    publiclimits = Limits(max_total_allocated_bytes=1_060_000)
     opened = readfile(copy(publicbytes); limits=publiclimits)
     @assert Tables.rowcount(Arrow.Table(opened; scan=publicscan)) == 0
     publicerror = try
@@ -1399,6 +1607,27 @@ end
     @assert stats[1].cols[1].min == 1 && stats[1].cols[1].max == 5
     @assert stats[2].cols[2].min == "fig" && stats[2].cols[2].max == "jam"
 
+    # The statistics reader consumes one deterministic cumulative budget.
+    # Pin its exact boundary without a maintenance-prone hard-coded byte
+    # count: first measure the shared ledger, then replay at N and N - 1.
+    probe_limit = Int64(1_000_000_000)
+    probe = AllocationBudget(probe_limit)
+    @assert _readstats(saf.schema.metadata, 2, saf.fields; budget=probe) !== nothing
+    needed = probe_limit - _remaining(probe)
+    @assert needed > 0
+    exact = AllocationBudget(needed)
+    @assert _readstats(saf.schema.metadata, 2, saf.fields; budget=exact) !== nothing
+    @assert _remaining(exact) == 0
+    short = AllocationBudget(needed - 1)
+    rejected = try
+        _readstats(saf.schema.metadata, 2, saf.fields; budget=short)
+        false
+    catch e
+        e isa AllocationLimitError || rethrow()
+        true
+    end
+    @assert rejected
+
     # Stats are not proof about a caller's custom equality or membership
     # domain. Both direct handles must keep the batch for exact row filtering.
     oddscan =
@@ -1408,13 +1637,20 @@ end
     for scan in (oddscan, domainscan)
         want = Tables.scan(sfull, scan)
         for handle in (saf, SourceFile(BytesSource(copy(sbytes)); tailbytes=32))
-            @assert _tables_equal(Tables.scan(handle, scan), want)
+            got = Tables.scan(handle, scan)
+            @assert Tables.rowcount(got) == Tables.rowcount(want)
+            @assert collect(Tables.columnnames(got)) ==
+                    collect(Tables.columnnames(want)) ==
+                    [:x]
+            @assert got.x == want.x
+            @assert eltype(got.x) === Int64
         end
     end
     @assert Tables.scan(sfull, oddscan).x == [1, 3, 5, 7, 9]
     @assert Tables.scan(sfull, domainscan).x == [2]
     # Statistics ride in schema metadata, so readers that do not know them
-    # are unaffected — the oracle proves pyarrow reads stats-carrying files.
+    # are unaffected. The targeted +stats oracle case proves that pyarrow
+    # reads a statistics-carrying file and preserves its values.
     println("statistics round-trip the official value layout ✓")
 
     return source, sbytes, saf, sfull
@@ -1456,7 +1692,7 @@ end
     return nestedstats
 end
 
-@noinline function _stats_predicate_checks(sbytes, saf, sfull)
+@noinline function _stats_predicate_checks(source, sbytes, saf, sfull)
     # Differential correctness with pruning active, whole-file and ranged.
     prunescans = Tables.Scan[
         Tables.Scan(filter=Tables.col(:x) > 7),
@@ -1470,13 +1706,37 @@ end
     ]
     for scan in prunescans
         want = Tables.scan(sfull, scan)
-        @assert _tables_equal(Tables.scan(saf, scan), want) sprint(show, scan)
-        @assert _tables_equal(
+        for got in (
+            Tables.scan(saf, scan),
             Tables.scan(SourceFile(BytesSource(copy(sbytes))), scan),
-            want,
-        ) sprint(show, scan)
+        )
+            @assert _tables_values_equal(got, want) sprint(show, scan)
+            for name in Tables.columnnames(got)
+                @assert eltype(Tables.getcolumn(got, name)) ===
+                        (name === :x ? Int64 : String)
+            end
+        end
     end
     println("pruned scans stay differentially exact (whole-file + ranged) ✓")
+
+    # This is a true zero-part join: footer statistics reject every batch
+    # before its metadata or body is fetched. Its schema must equal both the
+    # decoded-empty reference and the full direct scan.
+    emptyscan = Tables.Scan(filter=Tables.col(:x) > 100)
+    fullschema = Tables.schema(Tables.scan(saf, Tables.Scan()))
+    decodedempty =
+        Tables.scan(readfile(writefile(source.schema, source.batches)), emptyscan)
+    @assert _schemas_equal(Tables.schema(decodedempty), fullschema)
+    prunedempty = Tables.scan(saf, emptyscan)
+    @assert _schemas_equal(Tables.schema(prunedempty), fullschema)
+    logempty, srcempty = countingsource(sbytes)
+    rangedempty = Tables.scan(SourceFile(srcempty; tailbytes=32, coalesce_gap=0), emptyscan)
+    @assert _schemas_equal(Tables.schema(rangedempty), fullschema)
+    @assert all(
+        !_requestintersects(logempty, (block[1], block[2] + block[3])) for
+        block in saf.recordblocks
+    )
+    println("stats-pruned empty scans fetch no batch and keep decoded schema parity ✓")
 
     # Float pruning must use the same IEEE operators as Tables.scan.
     fsource = readstream(
@@ -1510,8 +1770,11 @@ end
     ]
     for scan in floatscans
         want = Tables.scan(ffull, scan)
-        @assert _tables_equal(Tables.scan(faf, scan), want)
-        @assert _tables_equal(Tables.scan(SourceFile(BytesSource(fbytes)), scan), want)
+        for got in
+            (Tables.scan(faf, scan), Tables.scan(SourceFile(BytesSource(fbytes)), scan))
+            @assert _tables_values_equal(got, want)
+            @assert eltype(got.x) === Float64
+        end
     end
     println("float pruning preserves signed-zero and NaN predicate semantics ✓")
 
@@ -1786,7 +2049,7 @@ end
 function _stats_main()
     source, sbytes, saf, sfull = _stats_base_fixture()
     nestedstats = _stats_fieldnode_check(source)
-    _stats_predicate_checks(sbytes, saf, sfull)
+    _stats_predicate_checks(source, sbytes, saf, sfull)
     _stats_limit_and_decode_checks(source, sbytes)
     _stats_malformed_checks(source, saf, nestedstats)
     _stats_trust_checks(source)

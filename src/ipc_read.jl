@@ -44,37 +44,235 @@
 # ---------------------------------------------------------------------------
 
 """
-Resource limits enforced before metadata-directed copying or decode. Only
-small fixed Julia containers exist before these gates run, so a hostile
-length prefix cannot direct an attacker-sized allocation.
+    Arrow.Limits(; keyword arguments...)
+
+Resource limits for an Arrow IPC reader. The reader checks metadata, message
+bodies, individual buffers, message and metadata-object counts, nesting depth,
+array lengths, cumulative package-controlled allocation, and concurrent range
+reads before the corresponding work can exceed these bounds.
+
+The defaults are 16 MiB of metadata per message, 2 GiB per body and buffer,
+256 MiB of cumulative allocation, 1,000,000 messages and metadata objects,
+nesting depth 64, array length 1,000,000,000, and 64 concurrent range reads.
+The corresponding keyword names are `max_metadata_bytes`, `max_body_bytes`,
+`max_buffer_bytes`, `max_total_allocated_bytes`, `max_messages`,
+`max_metadata_objects`, `max_nesting_depth`, `max_array_length`, and
+`max_concurrent_reads`.
+
+Pass a `Limits` value as the `limits` keyword to [`Arrow.Table`](@ref) or
+[`Arrow.Stream`](@ref).
 """
 Base.@kwdef struct Limits
     max_metadata_bytes::Int64 = 16 * 1024 * 1024
-    max_body_bytes::Int64 = 2 * 1024 * 1024 * 1024
-    max_buffer_bytes::Int64 = 2 * 1024 * 1024 * 1024
+    max_body_bytes::Int64 = Int64(2) * 1024 * 1024 * 1024
+    max_buffer_bytes::Int64 = Int64(2) * 1024 * 1024 * 1024
     max_total_allocated_bytes::Int64 = 256 * 1024 * 1024
     max_messages::Int = 1_000_000
     max_metadata_objects::Int = 1_000_000
     max_nesting_depth::Int = 64
     max_array_length::Int64 = 1_000_000_000
+    max_concurrent_reads::Int = 64
 end
 
 mutable struct AllocationBudget
     left::Int64
+    limit::Int64
+    lock::ReentrantLock
 end
 
-"A caller-supplied cumulative allocation limit was exhausted."
+function AllocationBudget(limit::Integer)
+    value = Int64(limit)
+    value >= 0 || throw(ArgumentError("allocation budget must be nonnegative"))
+    return AllocationBudget(value, value, ReentrantLock())
+end
+
+"""
+    Arrow.AllocationLimitError
+
+Thrown when a reader exhausts `Limits.max_total_allocated_bytes`. This budget
+covers package-controlled fetch, decode, scan, ArrowTypes, and facade
+materialization allocations for one read.
+"""
 struct AllocationLimitError <: Exception
     msg::String
 end
 Base.showerror(io::IO, e::AllocationLimitError) = print(io, e.msg)
 
-function _charge!(budget::AllocationBudget, amount::Int64, what::AbstractString)
+function _charge_unlocked!(budget::AllocationBudget, amount::Int64, what::AbstractString)
     amount >= 0 || throw(ArgumentError("negative allocation charge"))
     amount <= budget.left ||
         throw(AllocationLimitError("$what exceeds the reader allocation budget"))
     budget.left -= amount
     return nothing
+end
+
+function _charge!(budget::AllocationBudget, amount::Int64, what::AbstractString)
+    lock(budget.lock)
+    try
+        return _charge_unlocked!(budget, amount, what)
+    finally
+        unlock(budget.lock)
+    end
+end
+
+function _refund!(budget::AllocationBudget, amount::Int64)
+    amount >= 0 || throw(ArgumentError("negative allocation refund"))
+    lock(budget.lock)
+    try
+        refunded = Base.Checked.checked_add(budget.left, amount)
+        refunded <= budget.limit ||
+            throw(ArgumentError("allocation refund exceeds the charged total"))
+        budget.left = refunded
+        return nothing
+    finally
+        unlock(budget.lock)
+    end
+end
+
+function _remaining(budget::AllocationBudget)
+    lock(budget.lock)
+    try
+        return budget.left
+    finally
+        unlock(budget.lock)
+    end
+end
+
+AC._charge_materialization!(budget::AllocationBudget, amount::Int64, what::AbstractString) =
+    _charge!(budget, amount, what)
+AC._materialization_remaining(budget::AllocationBudget) = _remaining(budget)
+AC._materialization_limit_exceeded!(::AllocationBudget, what::AbstractString) =
+    throw(AllocationLimitError("$what exceeds the reader allocation budget"))
+
+function _verify_ipc_metadata_budgeted(
+    metabytes::Vector{UInt8},
+    limits::Limits,
+    budget::AllocationBudget,
+)
+    lock(budget.lock)
+    try
+        result = verify_ipc_metadata(metabytes, limits, budget.left)
+        _charge_unlocked!(budget, result[4], "verified metadata expansion")
+        return result
+    finally
+        unlock(budget.lock)
+    end
+end
+
+function _verify_footer_budgeted(
+    footerbytes::Vector{UInt8},
+    limits::Limits,
+    budget::AllocationBudget,
+)
+    lock(budget.lock)
+    try
+        result = verify_footer(footerbytes, limits, budget.left)
+        _charge_unlocked!(budget, result[5], "verified footer expansion")
+        return result
+    finally
+        unlock(budget.lock)
+    end
+end
+
+@inline function _chargevector!(
+    budget::Union{Nothing,AllocationBudget},
+    ::Type{T},
+    n::Integer,
+    what::AbstractString,
+) where {T}
+    budget === nothing || _charge!(budget, AC._materializedvectorbytes(T, n), what)
+    return nothing
+end
+
+@inline function _chargebitvector!(
+    budget::Union{Nothing,AllocationBudget},
+    n::Integer,
+    what::AbstractString,
+)
+    budget === nothing || _charge!(budget, AC._materializedbitvectorbytes(n), what)
+    return nothing
+end
+
+@inline function _chargeobject!(
+    budget::Union{Nothing,AllocationBudget},
+    payload::Integer,
+    what::AbstractString,
+)
+    budget === nothing || _charge!(budget, AC._materializedobjectbytes(payload), what)
+    return nothing
+end
+
+@inline function _dictslotbytes(::Type{K}, ::Type{V}) where {K,V}
+    return AC.checked_add(
+        Int64(Base.elsize(Vector{K})),
+        AC.checked_add(Int64(Base.elsize(Vector{V})), Int64(16)),
+    )
+end
+
+const _MIN_EMPTY_DICT_SLOTS = Int64(16)
+
+"Reserve the supported-version minimum backing store for one empty dictionary."
+function _chargeemptydict!(
+    budget::Union{Nothing,AllocationBudget},
+    ::Type{K},
+    ::Type{V},
+    what::AbstractString,
+) where {K,V}
+    budget === nothing && return nothing
+    payload = AC.checked_mul(_MIN_EMPTY_DICT_SLOTS, _dictslotbytes(K, V))
+    # Julia 1.10 eagerly allocates minimum Dict backing arrays. Later Julia
+    # versions defer more of this work. Reserve the larger supported layout so
+    # cache construction has one stable reader-budget contract on every host.
+    _charge!(budget, AC.checked_add(Int64(512), payload), what)
+    return nothing
+end
+
+function _chargedict!(
+    budget::Union{Nothing,AllocationBudget},
+    ::Type{K},
+    ::Type{V},
+    n::Integer,
+    what::AbstractString,
+) where {K,V}
+    budget === nothing && return nothing
+    n >= 0 || throw(ArgumentError("negative dictionary capacity"))
+    entries = Int64(n)
+    capacity = entries == 0 ? Int64(0) : AC.checked_mul(entries, Int64(2))
+    payload = AC.checked_mul(capacity, _dictslotbytes(K, V))
+    # Dict's requested hash-table capacity and Julia's backing-store capacity
+    # can each round upward. Reserve both layers conservatively.
+    bytes = AC.checked_add(Int64(512), AC.checked_mul(Int64(2), payload))
+    _charge!(budget, bytes, what)
+    return nothing
+end
+
+"Charge amortized growth for one new entry after its container reserve."
+function _chargedictentry!(
+    budget::Union{Nothing,AllocationBudget},
+    ::Type{K},
+    ::Type{V},
+    what::AbstractString,
+) where {K,V}
+    budget === nothing && return nothing
+    # `_chargedict!` reserves two slots per requested entry and two backing
+    # layers. Charge that linear term once per new memo key. ArrowTypes memo
+    # owners reserve the supported-version empty container separately.
+    bytes = AC.checked_mul(Int64(4), _dictslotbytes(K, V))
+    _charge!(budget, bytes, what)
+    return nothing
+end
+
+"Memoize one value after reserving the new dictionary entry's allocation."
+function _memoized!(
+    f::F,
+    cache::AbstractDict{K,V},
+    key,
+    budget::Union{Nothing,AllocationBudget},
+    what::AbstractString,
+) where {F,K,V}
+    haskey(cache, key) && return cache[key]
+    _chargedictentry!(budget, K, V, what)
+    return get!(f, cache, key)
 end
 
 struct FramedMessage
@@ -196,6 +394,8 @@ function _validatelimits(limits::Limits)
         throw(ArgumentError("negative metadata-object limit"))
     limits.max_nesting_depth >= 0 || throw(ArgumentError("negative nesting limit"))
     limits.max_array_length >= 0 || throw(ArgumentError("negative array-length limit"))
+    limits.max_concurrent_reads >= 1 ||
+        throw(ArgumentError("concurrent-read limit must be positive"))
     return nothing
 end
 
@@ -240,11 +440,10 @@ function _framemessages(
         bodyguess = AC.checked_add(metastart, metalen)
         bodyguess <= blob.len ||
             throw(ValidationError("truncated metadata: need $metalen bytes at $pos"))
-        _charge!(budget, metalen, "metadata allocation")
+        _chargevector!(budget, UInt8, metalen, "metadata allocation")
         metabytes = AC.slicebytes(AC.subslice(blob, metastart, metalen))
-        version, header_type, features, reserve =
-            verify_ipc_metadata(metabytes, limits, budget.left)
-        _charge!(budget, reserve, "verified metadata expansion")
+        version, header_type, features, _ =
+            _verify_ipc_metadata_budgeted(metabytes, limits, budget)
         # No generated getter runs before the verifier has bounded the full
         # table/vector/string graph it may visit.
         msg = FB.getrootas(Meta.Message, metabytes, 0)
@@ -784,7 +983,7 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
     payloadlen = wire.len - 8
     payloadlen > 0 || throw(ValidationError("compressed buffer has an empty payload"))
     state = c.state::DecodeState
-    _charge!(state.budget, declared, "decompressed bytes")
+    _chargevector!(state.budget, UInt8, declared, "decompressed bytes")
     committed = false
     try
         # This is the only output allocation. Its size was checked and
@@ -810,7 +1009,7 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
         e isa InterruptException && rethrow()
         throw(ValidationError("buffer decompression failed: $(sprint(showerror, e))"))
     finally
-        committed || (state.budget.left += declared)
+        committed || _refund!(state.budget, declared)
     end
 end
 
@@ -1001,9 +1200,12 @@ mutable struct IPCStream <: AC.RecordBatchSource
     schema::Schema
     corefields::AC.FrozenVector{Field}
     batches::Vector{AC.RecordBatch}
+    region::OwnerRegion                  # one lifetime root for the wire bytes
     nextindex::Int
     @atomic pulling::Bool
     fielddictids::IdDict{Field,Int64}   # adapter-side id table (shared ids preserved)
+    budget::AllocationBudget           # framing, decode, and facade materialization
+    limits::Limits                     # complete policy used when this handle opened
 end
 
 mutable struct PendingRecord
@@ -1221,9 +1423,12 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
             sch,
             AC.FrozenVector{Field}(fields),
             batches,
+            region,
             1,
             false,
             fielddictids,
+            budget,
+            limits,
         )
     finally
         close(state)

@@ -1282,11 +1282,10 @@ function _blockmessage(
     )
     0 <= bodylen <= limits.max_body_bytes ||
         throw(ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"))
-    _charge!(budget, declared, "metadata allocation")
+    _chargevector!(budget, UInt8, declared, "metadata allocation")
     metabytes = AC.slicebytes(AC.subslice(blob, offset + 8, declared))
-    version, header_type, features, reserve =
-        verify_ipc_metadata(metabytes, limits, budget.left)
-    _charge!(budget, reserve, "verified metadata expansion")
+    version, header_type, features, _ =
+        _verify_ipc_metadata_budgeted(metabytes, limits, budget)
     msg = FB.getrootas(Meta.Message, metabytes, 0)
     Int64(msg.bodyLength) == bodylen ||
         throw(ValidationError("footer block body length does not match the message"))
@@ -1336,11 +1335,10 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
     )
     footerstart = region.len - 10 - footerlen
     footerstart >= 8 || throw(ValidationError("footer escapes the file"))
-    _charge!(budget, footerlen, "footer allocation")
+    _chargevector!(budget, UInt8, footerlen, "footer allocation")
     footerbytes = AC.slicebytes(AC.subslice(blob, footerstart, footerlen))
-    version, features, dictblocks, recordblocks, reserve =
-        verify_footer(footerbytes, limits, budget.left)
-    _charge!(budget, reserve, "verified footer expansion")
+    version, features, dictblocks, recordblocks, _ =
+        _verify_footer_budgeted(footerbytes, limits, budget)
     Int64(1) in features &&
         throw(ValidationError("dictionary replacement is forbidden in the IPC file format"))
     nmessages = AC.checked_add(

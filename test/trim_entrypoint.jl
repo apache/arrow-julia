@@ -14,11 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# JuliaC `--trim=safe` workload for ArrowCore (compiled + executed by
-# test/trim_compile_tests.jl, following the trim harness convention
-# from JSON/HTTP/Reseau/StructUtils). Everything reachable from `main` must
-# be free of dynamic dispatch: this file is the executable definition of
-# ArrowCore's trim-safe surface.
+# JuliaC `--trim=safe` workload for ArrowCore and ArrowStrings (compiled and
+# executed by test/trim_compile_tests.jl, following the trim harness convention
+# from JSON/HTTP/Reseau/StructUtils). Everything reachable from `main` must be
+# free of dynamic dispatch: this file is the executable definition of the
+# exercised trim-safe surface.
 
 include(joinpath(@__DIR__, "..", "src", "ArrowCore.jl"))
 using .ArrowCore
@@ -27,6 +27,9 @@ const AC = ArrowCore
 # The C data interface is part of the trim-safe surface: a trimmed binary
 # that moves columns across the C seams is the canonical embedding use.
 include(joinpath(@__DIR__, "..", "src", "cdata.jl"))
+include(joinpath(@__DIR__, "..", "src", "ArrowStrings", "src", "ArrowStrings.jl"))
+using .ArrowStrings
+const AS = ArrowStrings
 
 function checked(cond::Bool, msg::String)::Nothing
     cond || error(msg)
@@ -268,6 +271,37 @@ function exercise_validation_errors()::Nothing
     return nothing
 end
 
+function exercise_arrowstrings()::Nothing
+    inline = UInt8[0x61, 0x62, 0x63, 0x64]
+    viewed = Vector{UInt8}(codeunits("a much longer value"))
+    p1 = AS.inline_payload(inline, 1, 4)
+    p2 = AS.view_payload(viewed, 1, length(viewed), 0, 0)
+    present = StringVector{ArrowString}([p1, p2], Vector{UInt8}[viewed])
+    checked(present[1] == "abcd", "ArrowStrings inline access failed")
+    checked(present[2] == "a much longer value", "ArrowStrings view access failed")
+    checked(isless(present[1], "z"), "ArrowStrings comparison failed")
+    materialized = AS.materialize(present)
+    checked(
+        materialized isa Vector{String} && materialized == ["abcd", "a much longer value"],
+        "ArrowStrings materialize failed",
+    )
+
+    nullable = StringVector{Union{Missing,ArrowString}}(
+        [p1, AS.PAYLOAD_MISSING, p2],
+        Vector{UInt8}[viewed],
+    )
+    checked(nullable[2] === missing, "ArrowStrings missing access failed")
+    nullable_materialized = AS.materialize(nullable)
+    checked(
+        nullable_materialized isa Vector{Union{String,Missing}} && isequal(
+            nullable_materialized,
+            Union{String,Missing}["abcd", missing, "a much longer value"],
+        ),
+        "ArrowStrings nullable materialize failed",
+    )
+    return nothing
+end
+
 function run_trim_workload()::Nothing
     exercise_regions()
     # Plain mkdir/rm rather than `mktempdir() do`: Base's temp-path cleanup
@@ -285,6 +319,7 @@ function run_trim_workload()::Nothing
     exercise_typed_values()
     exercise_validation_errors()
     exercise_cdata()
+    exercise_arrowstrings()
     return nothing
 end
 

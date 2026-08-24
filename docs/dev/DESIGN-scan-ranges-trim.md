@@ -72,10 +72,14 @@ Every facade method consumes its private route markers before returning:
       lower filter literals exactly for storage, or mark public fallback →
       strip public type overrides from the storage plan
 
-    Temporal `In` values lower for Tuple and Array containers. Set members
-    lower only from the field's canonical public type, preserving `isequal`
-    and hashing. Custom membership objects stay intact and force
-    public-domain fallback.
+    Temporal literals lower only when the public conversion preserves the
+    requested operator over the complete physical domain. Date64 and
+    millisecond Timestamp mappings preserve equality but not order;
+    Timestamp-second and Time mappings alias physical values. Duration
+    literals may use the column unit or a coarser fixed unit, never a finer
+    one. `In` applies the equality rule to Tuple and Array; Set additionally
+    requires the canonical public type to preserve `isequal` and hashing.
+    Custom membership objects force public-domain fallback.
 
 Tables.jl does not yet expose execution for an existing `BoundScan`.
 `_executeplan` is the narrow local adapter for public and stream fallback. It
@@ -134,8 +138,9 @@ Properties the composition holds (all implemented in `src/scan.jl`):
   sentinel that can omit later batches.
 - **One scan has one allocation budget.** Standalone lazy `file[i]` calls
   retain their documented per-call budgets. A scan that visits many batches
-  shares one budget and codec state across footer work, metadata, fetched
-  range payloads, decompression, and any full-object public-domain fallback.
+    shares one budget and codec state across footer work, metadata, fetched
+  range payloads, decompression, Core and ArrowTypes materialization, scan
+  slices/joins/overrides, and any full-object public-domain fallback.
 - **Windows saturate.** `offset`/`limit` compose with `min` arithmetic over
   row counts, as the executor does, so `offset + limit` never overflows.
 - **Type overrides run once in the correct value domain.** Direct handle
@@ -208,10 +213,11 @@ sequential — cloud-native access is a file-format feature, stated plainly.
    sparse backing.
 
 Request-count model (what actually matters against cloud latency): `1` tail
-(plus one exact Footer follow-up when the tail is too small)
-+ `⌈candidate metadata spans after coalescing⌉` + `⌈coalesced body ranges⌉`
-— three rounds, each one wall-clock round trip when the source issues a
-round's ranges concurrently.
+(plus one sequential exact Footer follow-up when the tail is too small)
++ `⌈candidate metadata spans after coalescing⌉` + `⌈coalesced body ranges⌉`.
+The common path has three sequential request rounds. A Footer follow-up makes
+four. The source can issue a metadata or body round's planned ranges
+concurrently.
 For a 40-column file reading 3 columns of every batch, this moves roughly
 `3/40` of the body bytes plus metadata. Statistics-pruned batches contribute
 no requested metadata/body range. Coalescing is an explicit over-read policy,
@@ -228,7 +234,8 @@ planner; transports live in extensions:
     readrange(src, offset, len)::Vector{UInt8}  # one exact range, 0-based offset
     concurrentreads(src)::Int                   # default 1
         # Arrow reads a round's planned ranges through readrange with a
-        # worker pool of that size, storing every result by request index —
+        # handle-wide worker pool, capped by Limits.max_concurrent_reads,
+        # storing every result by request index —
         # a source's completion order can never permute payloads, and the
         # reads in flight are bounded whatever the span count.
 
@@ -239,6 +246,9 @@ planner; transports live in extensions:
   scan, with a scan that cannot be pushed down, over a zero-field file, or
   over a stream-format object reads the object whole (one request beyond
   the cached tail), as does `Arrow.Stream(src)`.
+- One `SourceFile` samples `concurrentreads` once and shares one semaphore
+  across its operations. Separate handles are independent; a transport that
+  requires one wider cap enforces it in `readrange`.
 - The abstract type is a dynamic call under `--trim` for a source type the
   trimmed app never mentions; an app that names its concrete source type
   resolves statically. The planner itself is arithmetic over `Int64`s.
@@ -326,9 +336,9 @@ standardized upstream. This convention is deliberately conservative:
 **Trimmability is a standing production gate, not an aspiration.** The
 `--trim=safe` harness (0 errors / 0 warnings / binary exit 0) compiles
 `ArrowCore` plus its value-domain and typed-value workloads and the C-data
-seams. It does **not** yet compile a scan-and-materialize app, so §1–§3 are
-designed for trim but not yet gated by it. The rules in `core-README.md`
-("Trim-compile support") constrain their form:
+seams, plus a representative ArrowStrings workload. It does **not** yet compile
+a scan-and-materialize app, so §1–§3 are designed for trim but not yet gated by
+it. The rules in `core-README.md` ("Trim-compile support") constrain their form:
 
 - `Tables.Scan` is trim-aligned by its own charter (no `Function` fields;
   closed algebra). The evaluator uses the same closed-set `isa` ladder

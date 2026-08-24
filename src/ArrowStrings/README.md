@@ -20,10 +20,26 @@
 # ArrowStrings.jl
 
 An inline-else-view string representation designed for Arrow.jl and compatible
-parsers. It is a separate package, registered from this subdirectory like
-`ArrowTypes.jl`, so producers and consumers can use the representation without
-depending on each other. Until its first release, Arrow.jl resolves it through
-a `[sources]` path entry.
+parsers. It is a separate package, released and registered independently from
+this subdirectory like `ArrowTypes.jl`, so producers and consumers can use the
+representation without depending on each other. Until its first release,
+Arrow.jl resolves it through a `[sources]` path entry.
+
+## Installation
+
+Install a registered release from the Julia REPL:
+
+```julia
+import Pkg
+Pkg.add("ArrowStrings")
+```
+
+Before the first General registration, run this from the repository root:
+
+```julia
+import Pkg
+Pkg.develop(path="src/ArrowStrings")
+```
 
 * `ArrowString <: AbstractString` — a 16-byte string value that **is** an
   Arrow StringView entry: strings of up to 12 bytes are stored inline;
@@ -39,10 +55,11 @@ a `[sources]` path entry.
   allocates nothing; `materialize` copies out to `Vector{String}` (or
   `Vector{Union{String,Missing}}` for the nullable `ELT`).
 
-Everything depends only on Base and is concrete-typed, so it compiles under
-JuliaC `--trim`. Buffers must stay under 2 GiB (Arrow's `Int32` view words).
-Construction validates payload geometry and prefixes. Do not resize or mutate
-the payload vector or any referenced buffer while a column is in use.
+Everything depends only on Base and uses concrete types. CI compiles and runs
+representative construction, access, comparison, and materialization under
+JuliaC `--trim=safe`. Buffers must stay under 2 GiB (Arrow's `Int32` view
+words). Construction validates payload geometry and prefixes. Do not resize or
+mutate the payload vector or any referenced buffer while a column is in use.
 
 ```julia
 using ArrowStrings

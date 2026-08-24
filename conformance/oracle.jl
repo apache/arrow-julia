@@ -28,7 +28,7 @@
 # for every gold family we run:
 #
 #   ours→pyarrow stream   parse the gold JSON into Core, write OUR stream
-#                         bytes; pyarrow reads them, full-validates, and
+#                         bytes; pyarrow reads them, structurally validates,
 #                         rewrites its own stream; OUR reader reads that
 #                         back and the values must equal the gold JSON.
 #                         Proves pyarrow accepts our bytes and we accept
@@ -39,15 +39,32 @@
 #                         nanoarrow's writer (or pyarrow's, on releases
 #                         without one) produces the return stream. Proves
 #                         the nanoarrow reader accepts our bytes.
-#   +lz4 / +zstd          compressed-body variants of generated_primitive,
+#   +lz4 / +zstd          compressed-body variants of primitive,
+#                         nested-dictionary, and binary-view families,
 #                         proving our compressed framing against C++.
+#   +stats                 one primitive file with Arrow.jl statistics schema
+#                         metadata; pyarrow must accept it and preserve values.
 #
 # Comparison is the corpus's own value-level document comparison, so id
 # reassignment, pool unification, and padding differences by the oracle
 # writers are already normalized away.
 # =============================================================================
 
-include(joinpath(@__DIR__, "corpus.jl"))
+using JSON
+import Arrow
+
+if !isdefined(@__MODULE__, :ConformanceSupport)
+    include(joinpath(@__DIR__, "ConformanceSupport.jl"))
+end
+using .ConformanceSupport:
+    ArrowJSON,
+    DEFAULT_CORPUS,
+    Verdict,
+    documentcheck,
+    familyskipreason,
+    filedocument,
+    readjson,
+    streamdocument
 
 # The oracle interpreter: a Python with pyarrow (and nanoarrow) importable.
 # The conformance image sets it; on a host, point it at any such interpreter.
@@ -62,21 +79,15 @@ function _oraclepython()
 end
 
 # The in-container driver. One process over all cases: reads each of our
-# streams/files, validates fully, and writes the return bytes plus a
+# streams/files, structurally validates them, and writes the return bytes plus a
 # results.json of per-case statuses (an oracle refusing our bytes is a
 # finding, not a crash).
 const PYDRIVER = raw"""
 import json, os, sys
 import pyarrow as pa
 import pyarrow.ipc as ipc
-
-NA_ERR = None
-try:
-    import nanoarrow as na
-    import nanoarrow.ipc as naipc
-except Exception as e:  # wheel missing on this arch: report, don't die
-    na = None
-    NA_ERR = f"{type(e).__name__}: {e}"
+import nanoarrow as na
+import nanoarrow.ipc as naipc
 
 def na_stream(path):
     # nanoarrow's IPC entry point moved across releases; probe.
@@ -107,7 +118,7 @@ cases = json.load(open(os.path.join(work, "cases.json")))
 outdir = os.path.join(work, "out")
 os.makedirs(outdir, exist_ok=True)
 results = {"pyarrow": pa.__version__,
-           "nanoarrow": getattr(na, "__version__", None) or NA_ERR,
+           "nanoarrow": na.__version__,
            "cases": {}}
 for case in cases:
     name = case["name"]
@@ -129,23 +140,20 @@ for case in cases:
         r["pyarrow_file"] = "ok"
     except Exception as e:
         r["pyarrow_file"] = classify(e)
-    if na is None:
-        r["nanoarrow_stream"] = "skip: " + NA_ERR
-    else:
-        try:
-            reader = pa.RecordBatchReader.from_stream(na_stream(spath))
-            batches = list(reader)   # nanoarrow reads OUR bytes
-            outpath = os.path.join(outdir, name + ".nanoarrow.stream")
-            try:    # prefer nanoarrow's own writer for the return trip
-                back = pa.RecordBatchReader.from_batches(reader.schema, batches)
-                with naipc.StreamWriter.from_path(outpath) as w:
-                    w.write_stream(na.c_array_stream(back))
-            except Exception:
-                rewrite(batches, reader.schema,
-                        lambda s: ipc.new_stream(outpath, s))
-            r["nanoarrow_stream"] = "ok"
-        except Exception as e:
-            r["nanoarrow_stream"] = classify(e)
+    try:
+        reader = pa.RecordBatchReader.from_stream(na_stream(spath))
+        batches = list(reader)   # nanoarrow reads OUR bytes
+        outpath = os.path.join(outdir, name + ".nanoarrow.stream")
+        try:    # prefer nanoarrow's own writer for the return trip
+            back = pa.RecordBatchReader.from_batches(reader.schema, batches)
+            with naipc.StreamWriter.from_path(outpath) as w:
+                w.write_stream(na.c_array_stream(back))
+        except Exception:
+            rewrite(batches, reader.schema,
+                    lambda s: ipc.new_stream(outpath, s))
+        r["nanoarrow_stream"] = "ok"
+    except Exception as e:
+        r["nanoarrow_stream"] = classify(e)
     results["cases"][name] = r
 json.dump(results, open(os.path.join(work, "results.json"), "w"))
 print(f"driver: {len(cases)} cases")
@@ -157,12 +165,35 @@ struct OracleCase
     goldpath::String
 end
 
+# These families cover primitive buffers, dictionary batches with nested child
+# buffers, and variadic view buffers without multiplying every corpus case.
+const COMPRESSED_ORACLE_FAMILIES =
+    ("generated_primitive", "generated_nested_dictionary", "generated_binary_view")
+const STATISTICS_ORACLE_FAMILY = "generated_primitive"
+const TARGETED_ORACLE_VARIANTS = (
+    (
+        (family, codec) for family in COMPRESSED_ORACLE_FAMILIES for codec in (:lz4, :zstd)
+    )...,
+    (STATISTICS_ORACLE_FAMILY, :stats),
+)
+
+function _requiretargetedoracles(cases)
+    missing = Tuple{String,Symbol}[]
+    for (family, variant) in TARGETED_ORACLE_VARIANTS
+        suffix = "__" * family * "+" * String(variant)
+        any(case -> endswith(case.name, suffix), cases) || push!(missing, (family, variant))
+    end
+    isempty(missing) ||
+        error("pinned corpus did not prepare targeted oracle cases: $missing")
+    return nothing
+end
+
 """
-Write OUR stream + file bytes for every non-skipped gold family (plus
-compressed variants of generated_primitive) into workdir/cases, and the
-case manifest the python driver walks.
+Write OUR stream + file bytes for every non-skipped gold family (plus targeted
+compressed families) into workdir/cases, and the case manifest the python
+driver walks.
 """
-function preparecases(corpus::String, workdir::String)
+function preparecases(corpus::String, workdir::String; require_targeted::Bool=false)
     root = joinpath(corpus, "data", "arrow-ipc-stream", "integration")
     isdir(root) || error("corpus not found at $root (set ARROW_TESTING_DIR)")
     casedir = joinpath(workdir, "cases")
@@ -178,29 +209,41 @@ function preparecases(corpus::String, workdir::String)
             ]),
         )
         for fam in families
-            why = get(SKIP, fam, get(SKIP, v, ""))
+            why = familyskipreason(fam, v)
             isempty(why) || (push!(skips, (v * "/" * fam, why)); continue)
             goldpath = joinpath(dir, fam * ".json.gz")
-            sch, batches, dictids = ArrowJSON.fromjson(_readjson(goldpath))
-            variants = fam == "generated_primitive" ? (:none, :lz4, :zstd) : (:none,)
+            sch, batches, dictids = ArrowJSON.fromjson(readjson(goldpath))
+            variants = fam in COMPRESSED_ORACLE_FAMILIES ? (:none, :lz4, :zstd) : (:none,)
             for compress in variants
                 suffix = compress == :none ? "" : "+" * String(compress)
                 name = v * "__" * fam * suffix
                 write(
                     joinpath(casedir, name * ".stream"),
-                    writestream(sch, batches; compress=compress, dictids=dictids),
+                    Arrow.writestream(sch, batches; compress=compress, dictids=dictids),
                 )
                 write(
                     joinpath(casedir, name * ".arrow"),
-                    writefile(sch, batches; compress=compress, dictids=dictids),
+                    Arrow.writefile(sch, batches; compress=compress, dictids=dictids),
                 )
                 push!(cases, OracleCase(name, v * "/" * fam * suffix, goldpath))
             end
+            if fam == STATISTICS_ORACLE_FAMILY
+                name = v * "__" * fam * "+stats"
+                write(
+                    joinpath(casedir, name * ".stream"),
+                    Arrow.writestream(sch, batches; dictids),
+                )
+                write(joinpath(casedir, name * ".arrow"), Arrow.statsfile(sch, batches))
+                push!(cases, OracleCase(name, v * "/" * fam * "+stats", goldpath))
+            end
         end
     end
+    require_targeted && _requiretargetedoracles(cases)
     open(joinpath(workdir, "cases.json"), "w") do io
         JSON.print(io, [Dict("name" => c.name) for c in cases])
     end
+    isempty(cases) &&
+        error("arrow-testing corpus contains no runnable oracle cases under $root")
     return cases, skips
 end
 
@@ -218,9 +261,9 @@ function runoracles(workdir::String)
 end
 
 const ORACLE_CHECKS = (
-    ("ours→pyarrow stream", "pyarrow_stream", ".pyarrow.stream", _stream_to_json),
-    ("ours→pyarrow file", "pyarrow_file", ".pyarrow.arrow", _file_to_json),
-    ("ours→nanoarrow stream", "nanoarrow_stream", ".nanoarrow.stream", _stream_to_json),
+    ("ours→pyarrow stream", "pyarrow_stream", ".pyarrow.stream", streamdocument),
+    ("ours→pyarrow file", "pyarrow_file", ".pyarrow.arrow", filedocument),
+    ("ours→nanoarrow stream", "nanoarrow_stream", ".nanoarrow.stream", streamdocument),
 )
 
 # The ONLY oracle errors this suite treats as skips: known capability gaps,
@@ -258,10 +301,32 @@ function runoracle(
     corpus::String=DEFAULT_CORPUS;
     workdir::String=get(ENV, "ORACLE_WORKDIR", mktempdir(prefix="arrow-oracle-")),
 )
-    cases, skips = preparecases(corpus, workdir)
+    cases, skips = preparecases(corpus, workdir; require_targeted=true)
     println("oracle: ", length(cases), " cases prepared in ", workdir)
     results = runoracles(workdir)
     return compareresults(cases, skips, results, workdir), results
+end
+
+"Remove exactly Arrow.jl's statistics key from one decoded IPC document."
+function _withoutstatsmetadata(document)
+    stripped = deepcopy(document)
+    schema = get(stripped, "schema", nothing)
+    schema isa AbstractDict || error("statistics oracle document has no schema object")
+    metadata = get(schema, "metadata", nothing)
+    metadata isa AbstractVector ||
+        error("statistics oracle document has no schema metadata")
+    matches = count(
+        entry ->
+            entry isa AbstractDict && get(entry, "key", nothing) == Arrow.STATS_KEY,
+        metadata,
+    )
+    matches == 1 || error("statistics oracle document has $matches statistics keys")
+    kept = [
+        entry for entry in metadata if
+        !(entry isa AbstractDict && get(entry, "key", nothing) == Arrow.STATS_KEY)
+    ]
+    isempty(kept) ? delete!(schema, "metadata") : (schema["metadata"] = kept)
+    return stripped
 end
 
 """
@@ -274,74 +339,45 @@ function compareresults(cases::Vector{OracleCase}, skips, results, workdir::Stri
         push!(verdicts, Verdict(label, "all", :skip, why))
     end
     for case in cases
-        gold = _readjson(case.goldpath)
-        goldmasked = masknulls!(deepcopy(gold), Val(:doc))
+        gold = readjson(case.goldpath)
+        statsinput = if endswith(case.name, "+stats")
+            filedocument(read(joinpath(workdir, "cases", case.name * ".arrow")))
+        end
+        if statsinput !== nothing
+            push!(verdicts, documentcheck(case.label, "ours stats file→gold", gold) do
+                _withoutstatsmetadata(statsinput)
+            end)
+        end
         r = get(results["cases"], case.name, Dict{String,Any}())
         for (check, key, suffix, reader) in ORACLE_CHECKS
             status = get(r, key, "driver produced no result")
             if status != "ok"
-                # "skip: ..." comes only from the driver's import-failure
-                # path (no nanoarrow wheel); feature errors skip only via
-                # the explicit whitelist.
-                kind =
-                    startswith(status, "skip") || _expectedgap(key, case.name, status) ?
-                    :skip : :fail
+                # Capability errors skip only through the explicit whitelist.
+                # A missing required oracle or result is a conformance failure.
+                kind = _expectedgap(key, case.name, status) ? :skip : :fail
                 push!(verdicts, Verdict(case.label, check, kind, status))
                 continue
             end
-            try
-                got = reader(read(joinpath(workdir, "out", case.name * suffix)))
-                diffs = docsequal(masknulls!(deepcopy(got), Val(:doc)), goldmasked)
-                push!(
-                    verdicts,
-                    Verdict(
-                        case.label,
-                        check,
-                        isempty(diffs) ? :pass : :fail,
-                        isempty(diffs) ? "" : first(diffs),
-                    ),
-                )
-            catch e
-                push!(
-                    verdicts,
-                    Verdict(
-                        case.label,
-                        check,
-                        :fail,
-                        sprint(showerror, e)[1:min(end, 200)],
-                    ),
-                )
-            end
+            # The targeted file route adds the statistics key that the gold
+            # JSON does not contain. Compare PyArrow's return against our
+            # exact input document there, proving both values and unknown
+            # schema metadata survive. Its ordinary stream routes still use
+            # the metadata-free gold document.
+            expected =
+                key == "pyarrow_file" && endswith(case.name, "+stats") ? statsinput : gold
+            push!(verdicts, documentcheck(case.label, check, expected) do
+                reader(read(joinpath(workdir, "out", case.name * suffix)))
+            end)
         end
     end
     return verdicts
 end
 
 function oraclereport(verdicts::Vector{Verdict}, results; io=stdout)
-    npass = count(v -> v.status == :pass, verdicts)
-    nfail = count(v -> v.status == :fail, verdicts)
-    nskip = count(v -> v.status == :skip, verdicts)
-    println(
-        io,
-        "oracle round-trips (pyarrow ",
-        get(results, "pyarrow", "?"),
-        ", nanoarrow ",
-        get(results, "nanoarrow", "?"),
-        "): ",
-        npass,
-        " pass, ",
-        nfail,
-        " fail, ",
-        nskip,
-        " skip",
-    )
-    println(io)
-    for v in verdicts
-        v.status == :pass && continue
-        tag = v.status == :fail ? "FAIL" : "skip"
-        println(io, rpad(tag, 5), rpad(v.family, 58), rpad(v.check, 24), v.detail)
-    end
-    return nfail
+    header =
+        "oracle round-trips (pyarrow $(get(results, "pyarrow", "?")), " *
+        "nanoarrow $(get(results, "nanoarrow", "?")))"
+    return ConformanceSupport.report(header, verdicts; io=io)
 end
 
 if abspath(PROGRAM_FILE) == abspath(@__FILE__)

@@ -53,6 +53,18 @@ function _dictbytes(poolfield, pooldata, indices; ordered=false, name="d")
     return Arrow.writestream(schema, [AC.RecordBatch(schema, [data], length(indices))])
 end
 
+function _fixedlistnullbytes(listsize::Int; file::Bool)
+    childtype = AC.NullType()
+    childfield = AC.Field("item", childtype; nullable=true)
+    childdata = AC.ArrayData(childtype, listsize, AC.BufferSlice[]; nullcount=listsize)
+    listtype = AC.FixedSizeListType(listsize)
+    field = AC.Field("x", listtype; nullable=false, children=[childfield])
+    data = AC.ArrayData(listtype, 1, [AC.BufferSlice()]; children=[childdata], nullcount=0)
+    schema = AC.Schema([field])
+    batch = AC.RecordBatch(schema, [data], 1)
+    return file ? Arrow.writefile(schema, [batch]) : Arrow.writestream(schema, [batch])
+end
+
 @testset "facade rewrite correctness regressions" begin
     @testset "duplicate names stay positional" begin
         f1, d1 = AC.fromjulia("x", Int64[1, 2])
@@ -95,8 +107,11 @@ end
     end
 
     @testset "retained dictionaries keep value descriptors and order" begin
-        datefield, datedata =
-            Arrow._writecolumn("date-values", Date[Date(2024, 1, 1), Date(2024, 1, 2)])
+        datefield, dateparts = Arrow._constructcolumn(
+            Symbol("date-values"),
+            AbstractVector[Date[Date(2024, 1, 1), Date(2024, 1, 2)]],
+        )
+        datedata = only(dateparts)
         datebytes = _dictbytes(datefield, datedata, Int8[1, 0])
         dateback = Arrow.readstream(_rewrite(datebytes))
         datetype = dateback.schema.fields[1].type::AC.DictionaryType
@@ -186,7 +201,8 @@ end
     @testset "retained composites rebuild recursively" begin
         Row = NamedTuple{(:x, :y),Tuple{Int64,Union{Missing,String}}}
         pool = Row[(x=1, y=missing), (x=2, y=missing)]
-        structfield, structdata = Arrow._writecolumn("pool", pool)
+        structfield, structparts = Arrow._constructcolumn(:pool, AbstractVector[pool])
+        structdata = only(structparts)
         structbytes = _dictbytes(structfield, structdata, Int8[1, 0])
         structback = Arrow.readstream(_rewrite(structbytes))
         dictionaryfield = structback.schema.fields[1]
@@ -394,6 +410,60 @@ end
             _BytesSource(filebytes);
             scan=Tables.Scan(),
         )
+    end
+
+    @testset "reader budget includes public materialization" begin
+        limit = Int64(1_000_000)
+        limits() = Arrow.Limits(max_total_allocated_bytes=limit)
+        listsize = 200_000
+        streambytes = _fixedlistnullbytes(listsize; file=false)
+        filebytes = _fixedlistnullbytes(listsize; file=true)
+        @test length(streambytes) < 1_000
+        @test length(filebytes) < 1_000
+
+        openstream() = Arrow.readstream(copy(streambytes); limits=limits())
+        openfile() = Arrow.readfile(copy(filebytes); limits=limits())
+
+        @test_throws Arrow.AllocationLimitError Arrow.Table(openstream())
+        @test_throws Arrow.AllocationLimitError Arrow.Table(
+            openstream();
+            scan=Tables.Scan(select=(:x,)),
+        )
+        @test_throws Arrow.AllocationLimitError Arrow.Table(openfile())
+        @test_throws Arrow.AllocationLimitError Arrow.Table(
+            openfile();
+            scan=Tables.Scan(select=(:x,)),
+        )
+        @test_throws Arrow.AllocationLimitError Tables.scan(
+            openfile(),
+            Tables.Scan(select=(:x,)),
+        )
+
+        @test_throws Arrow.AllocationLimitError first(Arrow.Stream(openstream()))
+        @test_throws Arrow.AllocationLimitError first(Arrow.Stream(openfile()))
+
+        ranged = Arrow.SourceFile(
+            _BytesSource(copy(filebytes));
+            limits=limits(),
+            tailbytes=32,
+            coalesce_gap=0,
+        )
+        @test_throws Arrow.AllocationLimitError Arrow.Table(
+            ranged;
+            scan=Tables.Scan(select=(:x,)),
+        )
+
+        largeio = IOBuffer()
+        Arrow.write(largeio, (x=zeros(Int64, 200_000),); file=true)
+        largebytes = take!(largeio)
+        @test length(largebytes) > limit
+        wholesource = Arrow.SourceFile(
+            _BytesSource(largebytes);
+            limits=limits(),
+            tailbytes=32,
+            coalesce_gap=0,
+        )
+        @test_throws Arrow.AllocationLimitError Arrow.Table(wholesource)
     end
 end
 

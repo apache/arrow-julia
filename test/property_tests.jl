@@ -18,82 +18,205 @@
 module PropertyTests
 
 using Arrow
-using Dates
-using Random
-using Tables
 using Test
 
-const SEED = UInt64(0x9f5a_37c2_41de_880b)
-const CASES = 16
-const TEXT =
-    ["", "a", "\0", "alpha", "\u03bb", "\u03b1\u03b2\u2200", "\U0001f9ea", "line\nbreak"]
+include(joinpath(@__DIR__, "support", "SeededFuzz.jl"))
+import .SeededFuzz
 
-_maybe(rng, x) = rand(rng, 1:5) == 1 ? missing : x
-
-function _randomfloat(rng)
-    specials = (0.0, -0.0, Inf, -Inf, NaN)
-    pick = rand(rng, 1:8)
-    return pick <= length(specials) ? specials[pick] : randn(rng)
-end
-
-function _makepart(rng, n)
-    ints = Union{Missing,Int64}[_maybe(rng, rand(rng, Int64)) for _ = 1:n]
-    uints = Union{Missing,UInt64}[_maybe(rng, rand(rng, UInt64)) for _ = 1:n]
-    floats = Union{Missing,Float64}[_maybe(rng, _randomfloat(rng)) for _ = 1:n]
-    bools = Union{Missing,Bool}[_maybe(rng, rand(rng, Bool)) for _ = 1:n]
-    strings = Union{Missing,String}[_maybe(rng, rand(rng, TEXT)) for _ = 1:n]
-    dates = Union{Missing,Date}[
-        _maybe(rng, Date(1970, 1, 1) + Day(rand(rng, -100_000:100_000))) for _ = 1:n
-    ]
-    lists = Vector{Union{Missing,Vector{Union{Missing,Int32}}}}(undef, n)
-    structs =
-        Vector{@NamedTuple{x::Union{Missing,Int16},label::Union{Missing,String}}}(undef, n)
-    dictionary = Union{Missing,String}[_maybe(rng, rand(rng, TEXT)) for _ = 1:n]
-    for i = 1:n
-        lists[i] =
-            rand(rng, 1:5) == 1 ? missing :
-            Union{Missing,Int32}[_maybe(rng, rand(rng, Int32)) for _ = 1:rand(rng, 0:6)]
-        structs[i] = (x=_maybe(rng, rand(rng, Int16)), label=_maybe(rng, rand(rng, TEXT)))
-    end
-    table = (
-        ints=ints,
-        uints=uints,
-        floats=floats,
-        bools=bools,
-        strings=strings,
-        dates=dates,
-        lists=lists,
-        structs=structs,
-        dictionary=Arrow.DictEncode(dictionary),
-    )
-    return table, merge(table, (dictionary=dictionary,))
-end
-
-_expectedstructs(values) = [["x" => x.x, "label" => x.label] for x in values]
-
-function _checktable(actual, expected)
-    @test Tables.columnnames(actual) == collect(keys(expected))
-    @test isequal(collect(actual.ints), expected.ints)
-    @test isequal(collect(actual.uints), expected.uints)
-    @test isequal(collect(actual.floats), expected.floats)
-    @test isequal(collect(actual.bools), expected.bools)
-    @test isequal(collect(actual.strings), expected.strings)
-    @test isequal(collect(actual.dates), expected.dates)
-    @test isequal(collect(actual.lists), expected.lists)
-    @test isequal(collect(actual.structs), _expectedstructs(expected.structs))
-    @test isequal(collect(actual.dictionary), expected.dictionary)
-end
-
-function _concatparts(parts)
-    names = keys(first(parts))
-    return NamedTuple{names}(
-        map(names) do name
-            reduce(vcat, (getproperty(part, name) for part in parts); init=Any[])
-        end,
-    )
-end
+const SEED = SeededFuzz.DEFAULT_SEED
 
 @testset "public IPC properties (seed=$(string(SEED; base=16)))" begin
+    @testset "fuzz failure artifacts are complete and shell-safe" begin
+        @test SeededFuzz._REPLAY_SCRIPT == "sh ./replay.sh /path/to/Arrow.jl"
+        artifact = "reproductions/space and 'quote'\n`literal`.arrowbytes"
+        @test SeededFuzz._shellquote("a b'c\n`d`") == "'a b'\"'\"'c\n`d`'"
+        entry = SeededFuzz.MutationCorpus(:fixture, false, UInt8[])
+        text = SeededFuzz._mutation_repro_text(
+            SEED,
+            UInt64(0x1234),
+            7,
+            entry,
+            :stream_full,
+            "flip[1]=0x01",
+            artifact,
+            "failure details",
+        )
+        for required in (
+            "julia_version=",
+            "source_revision=",
+            "master_seed=",
+            "case_seed=",
+            "index=7",
+            "corpus=fixture",
+            "lane=stream_full",
+            "recipe=flip[1]=0x01",
+            "replay_generated=$(SeededFuzz._REPLAY_SCRIPT)",
+            "replay_bytes=$(SeededFuzz._REPLAY_SCRIPT)",
+            "--mutation-index 7 --skip-layouts",
+            "--mutation-file $(SeededFuzz._shellquote(basename(artifact)))",
+            "failure details",
+        )
+            @test occursin(required, text)
+        end
+        @test !occursin(dirname(artifact), text)
+
+        caseoptions = SeededFuzz.parse_options([
+            "--case-index",
+            "7",
+            "--cases",
+            "99",
+            "--mutations",
+            "99",
+        ])
+        @test caseoptions.case_index == 7
+        @test caseoptions.mutation_index === nothing
+        @test caseoptions.cases == caseoptions.mutations == 0
+        @test !caseoptions.include_layouts
+        @test !caseoptions.verify_determinism
+        @test caseoptions.determinism_every == 0
+
+        mutationoptions =
+            SeededFuzz.parse_options(["--mutation-index=9", "--determinism-every=256"])
+        @test mutationoptions.case_index === nothing
+        @test mutationoptions.mutation_index == 9
+        @test mutationoptions.cases == mutationoptions.mutations == 0
+        @test !mutationoptions.include_layouts
+        @test mutationoptions.verify_determinism
+        @test mutationoptions.determinism_every == 256
+        @test SeededFuzz._shouldverify(1, 41, 256)
+        @test SeededFuzz._shouldverify(41, 41, 256)
+        @test !SeededFuzz._shouldverify(42, 41, 256)
+        @test SeededFuzz._shouldverify(256, 41, 256)
+
+        outcome = SeededFuzz._classify_mutation(UInt8[], :stream_full)
+        @test outcome.category === :validation
+        @test outcome.error isa Arrow.ValidationError
+
+        statsentry = only(
+            entry for entry in SeededFuzz._mutationcorpus() if entry.label === :stats_file
+        )
+        statssnapshot = SeededFuzz._exercise_mutation(statsentry.bytes, :stats_filtered)
+        @test statssnapshot.nrows == 2
+        @test statssnapshot.names == [:id]
+        @test statssnapshot.eltypes == Type[Int64]
+        @test only(statssnapshot.values) == Int64[4, 5]
+        statsfile = Arrow.readfile(copy(statsentry.bytes))
+        recordspans = [(block[1], block[2] + block[3]) for block in statsfile.recordblocks]
+        @test !any(
+            request -> SeededFuzz._rangesintersect(request, recordspans[1]),
+            statssnapshot.requests,
+        )
+        @test any(
+            request -> SeededFuzz._rangesintersect(request, recordspans[2]),
+            statssnapshot.requests,
+        )
+        @test !any(
+            request -> request == (Int64(0), Int64(length(statsentry.bytes))),
+            statssnapshot.requests,
+        )
+        renamed = copy(statsentry.bytes)
+        namestarts = findall(
+            index -> renamed[index] == UInt8('i') && renamed[index + 1] == UInt8('d'),
+            1:(length(renamed) - 1),
+        )
+        @test length(namestarts) == 2
+        for index in namestarts
+            renamed[index] = UInt8('j')
+        end
+        renamedoutcome = SeededFuzz._classify_mutation(renamed, :stats_filtered)
+        @test renamedoutcome.category === :accepted
+        @test first(renamedoutcome.snapshot.names) === :jd
+
+        base = UInt8[0x00, 0x01, 0xff]
+        for seed = UInt64(1):UInt64(256), operation in SeededFuzz._MUTATION_OPERATIONS
+            mutated, _, _ =
+                SeededFuzz._mutatebytes(base, SeededFuzz.StableRNG(seed), operation)
+            @test mutated != base
+        end
+
+        mktempdir() do dir
+            active = joinpath(dir, "active")
+            mkpath(active)
+            project = joinpath(active, "Project.toml")
+            projecttext = "[deps]\n"
+            manifesttext =
+                "julia_version = \"$(VERSION)\"\n" *
+                "manifest_format = \"2.0\"\n" *
+                "project_hash = \"0000000000000000000000000000000000000000\"\n"
+            write(project, projecttext)
+            write(joinpath(active, "Manifest.toml"), manifesttext)
+            artifact = joinpath(dir, "artifact-original")
+            SeededFuzz._snapshot_environment(artifact, project)
+            moved = joinpath(dir, "artifact-renamed")
+            mv(artifact, moved)
+            @test isfile(joinpath(moved, "environment", "Project.toml"))
+            @test isfile(joinpath(moved, "environment", "Manifest.toml"))
+            @test isfile(joinpath(moved, "replay.sh"))
+            replaytext = read(joinpath(moved, "replay.sh"), String)
+            @test occursin("Pkg.instantiate()", replaytext)
+            restore = read(joinpath(moved, "environment", "RESTORE.txt"), String)
+            @test startswith(restore, "environment_restore=")
+            @test !occursin(dir, restore)
+
+            checkout = joinpath(dir, "checkout")
+            mkpath(joinpath(checkout, "test"))
+            write(joinpath(checkout, "Project.toml"), "old project\n")
+            write(joinpath(checkout, "Manifest.toml"), "old manifest\n")
+            write(joinpath(checkout, "test", "fuzz.jl"), "")
+            if !Sys.iswindows()
+                observedproject = joinpath(dir, "observed-project")
+                observedmanifest = joinpath(dir, "observed-manifest")
+                fakejulia = joinpath(dir, "fake-julia")
+                write(
+                    fakejulia,
+                    "#!/bin/sh\ncp \"\$ARROW_REPLAY_CHECKOUT/Project.toml\" " *
+                    "\"\$ARROW_REPLAY_PROJECT\"\n" *
+                    "cp \"\$ARROW_REPLAY_CHECKOUT/Manifest.toml\" " *
+                    "\"\$ARROW_REPLAY_MANIFEST\"\n" *
+                    "for arg in \"\$@\"; do\n" *
+                    "    [ \"\$arg\" = -e ] && exit 0\n" *
+                    "done\n" *
+                    "exit \"\${ARROW_REPLAY_EXIT:-0}\"\n",
+                )
+                chmod(fakejulia, 0o700)
+                replaycommand = Cmd([
+                    "sh",
+                    joinpath(moved, "replay.sh"),
+                    checkout,
+                    "--cases",
+                    "0",
+                    "--mutations",
+                    "0",
+                    "--skip-layouts",
+                ])
+                command = addenv(
+                    replaycommand,
+                    "JULIA" => fakejulia,
+                    "ARROW_REPLAY_CHECKOUT" => checkout,
+                    "ARROW_REPLAY_PROJECT" => observedproject,
+                    "ARROW_REPLAY_MANIFEST" => observedmanifest,
+                )
+                run(command)
+                @test read(observedproject, String) == projecttext
+                @test read(observedmanifest, String) == manifesttext
+                @test read(joinpath(checkout, "Project.toml"), String) == "old project\n"
+                @test read(joinpath(checkout, "Manifest.toml"), String) == "old manifest\n"
+                failed = run(addenv(command, "ARROW_REPLAY_EXIT" => "7"); wait=false)
+                wait(failed)
+                @test failed.exitcode == 7
+                @test read(joinpath(checkout, "Project.toml"), String) == "old project\n"
+                @test read(joinpath(checkout, "Manifest.toml"), String) == "old manifest\n"
+            end
+            SeededFuzz._save_active_repro(moved, :mutation, "active coordinate"; bytes=base)
+            @test read(SeededFuzz._active_repro_path(moved, :mutation, "txt"), String) ==
+                  "active coordinate"
+            @test read(SeededFuzz._active_repro_path(moved, :mutation, "arrowbytes")) ==
+                  base
+            SeededFuzz._clear_active_repro(moved, :mutation)
+            @test sort(readdir(moved)) == ["environment", "replay.sh"]
+        end
+    end
+
     @testset "declared struct child types survive empty and all-missing values" begin
         Row = @NamedTuple{x::Int16, label::Union{Missing,String}}
         for rows in (Row[], Row[(x=1, label=missing), (x=2, label=missing)])
@@ -125,31 +248,48 @@ end
         end
     end
 
-    rng = Xoshiro(SEED)
-    for case = 1:CASES
-        @testset "case $case" begin
-            nparts = rand(rng, 1:4)
-            made = [_makepart(rng, rand(rng, 0:20)) for _ = 1:nparts]
-            inputs = first.(made)
-            expectedparts = last.(made)
-            expected = _concatparts(expectedparts)
-            source = Tables.partitioner(inputs)
-            for file in (false, true), compress in (:none, :lz4, :zstd)
-                @testset "file=$file compress=$compress" begin
-                    io = IOBuffer()
-                    Arrow.write(io, source; file=file, compress=compress)
-                    bytes = take!(io)
-                    _checktable(Arrow.Table(bytes), expected)
-                    if !file
-                        batches = collect(Arrow.Stream(bytes))
-                        @test length(batches) == nparts
-                        for (batch, part) in zip(batches, expectedparts)
-                            _checktable(batch, part)
-                        end
-                    end
-                end
-            end
-        end
+    @testset "one deterministic PR suite" begin
+        summary = SeededFuzz.run_pr_suite(; seed=SEED)
+        differential = summary.differential
+        @test differential.cases == SeededFuzz.PR_CASES
+        @test differential.variants == 6 * SeededFuzz.PR_CASES
+        @test differential.rewrites == 6 * SeededFuzz.PR_CASES
+        @test differential.scanchecks == 54 * SeededFuzz.PR_CASES
+        @test differential.layoutchecks == 49
+        @test Set([
+            :generated_differential,
+            :arrowtypes_extension,
+            :arrowtypes_struct_extension,
+            :map,
+            :map_sorted,
+            :dense_union,
+            :sparse_union,
+            :binary,
+            :large_binary,
+            :utf8_view,
+            :binary_view,
+            :fixed_size_binary,
+            :fixed_size_list,
+            :date_units,
+            :time_units,
+            :timestamp_units,
+            :duration_units,
+            :run_end_encoded,
+            :nullable_struct_parent,
+            :retained_rewrite,
+            :statistics_pruning,
+            :ranged_no_full_fetch,
+        ]) ⊆ differential.coverage
+
+        mutations = summary.mutations
+        @test mutations.mutations == SeededFuzz.PR_MUTATIONS
+        @test sum(values(mutations.counts)) == SeededFuzz.PR_MUTATIONS
+        @test mutations.counts[:validation] + mutations.counts[:allocation_limit] > 0
+        @test length(mutations.routecounts) == 41
+        @test mutations.determinismchecks == SeededFuzz.PR_MUTATIONS
+        @test Set(keys(mutations.operationcounts)) ==
+              Set((:flip, :set, :delete, :insert, :truncate))
+        @test SeededFuzz.case_fingerprint(SEED, 17) == UInt64(0x2253_fcc7_c2ac_cadb)
     end
 end
 

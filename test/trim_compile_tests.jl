@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# JuliaC `--trim=safe` compile gate for ArrowCore, following the harness
+# JuliaC `--trim=safe` compile gate for ArrowCore and ArrowStrings, following the harness
 # convention from JSON/HTTP/Reseau/StructUtils: compile the workload
 # entrypoint, require ZERO verifier errors and ZERO verifier warnings, then
 # run the produced binary and require exit 0.
@@ -93,7 +93,7 @@ function _count_verifier_messages(output::String)::Tuple{Int,Int}
     return errors, warnings
 end
 
-@testset "ArrowCore trim compile" begin
+@testset "ArrowCore and ArrowStrings trim compile" begin
     if !_TRIM_SUPPORTED
         println("[trim] skip: JuliaC --trim requires Julia >= 1.12")
     elseif Sys.iswindows()
@@ -108,7 +108,7 @@ end
                 julia_exe = joinpath(Sys.BINDIR, Base.julia_exename())
                 cmd = `$julia_exe --startup-file=no --history-file=no
                     --project=$trim_project -e $_JULIAC_ENTRYPOINT_EXPR --
-                    --output-exe arrowcore_trim --project=$trim_project
+                    --output-exe arrow_trim --project=$trim_project
                     --experimental --trim=safe $script_path`
                 println("[trim] compile START")
                 exit_code, output, timed_out = _run_with_timeout(
@@ -126,7 +126,7 @@ end
                 @test errors == 0
                 @test warnings == 0
                 @test exit_code == 0
-                binpath = abspath("arrowcore_trim")
+                binpath = abspath("arrow_trim")
                 @test isfile(binpath)
                 run_exit, run_output, run_timed_out = _run_with_timeout(
                     `$binpath`;

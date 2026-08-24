@@ -15,18 +15,28 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[deps]
-Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
-ArrowStrings = "c38d8858-22a2-449e-9eca-ef92ec15f353"
-ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
-DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
-Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
-Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
+using Arrow
+using ArrowTypes
 
-[compat]
-ArrowStrings = "1"
-ArrowTypes = "2"
-DataAPI = "1"
-Documenter = "1.17"
-Tables = "1.1"
-julia = "1.10"
+struct ArrowTypesStorageGuardValue{N}
+    value::Int8
+end
+
+ArrowTypes.ArrowType(::Type{ArrowTypesStorageGuardValue{N}}) where {N} = NTuple{N,Int8}
+ArrowTypes.toarrow(x::ArrowTypesStorageGuardValue{N}) where {N} =
+    ntuple(_ -> x.value, Val(N))
+
+T = ArrowTypesStorageGuardValue{2048}
+input = Union{Missing,T}[missing]
+io = IOBuffer()
+err = try
+    Arrow.write(io, (value=input,); file=false)
+    nothing
+catch e
+    e
+end
+err isa ArgumentError || error("oversized ArrowType result did not fail with ArgumentError")
+message = sprint(showerror, err)
+occursin("concrete Tuple with 2048 fields", message) || error(message)
+occursin("supported limit is 1024", message) || error(message)
+println("oversized ArrowType storage rejected")

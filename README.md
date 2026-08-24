@@ -48,18 +48,18 @@ Pkg.add("Arrow")
 ## Quick start
 
 ```julia
-using Arrow, Tables
+using Arrow
 
 data = (id = [1, 2, 3], name = ["Ada", "Babbage", missing])
 Arrow.write("data.arrow", data)
 
 table = Arrow.Table("data.arrow")
-Tables.columnnames(table) # [:id, :name]
-collect(table.name) == ["Ada", "Babbage", missing] # true
+propertynames(table) # [:id, :name]
+isequal(collect(table.name), ["Ada", "Babbage", missing]) # true
 ```
 
 `Arrow.Table` accepts a path, an `IO`, IPC bytes, or an
-`Arrow.AbstractArrowSource`. `Arrow.Stream` reads one record batch at a time.
+`Arrow.AbstractArrowSource`. `Arrow.Stream` iterates one record batch at a time.
 `Arrow.write` accepts any Tables.jl source.
 
 Arrow 3.0 includes:
@@ -76,7 +76,7 @@ Arrow 3.0 includes:
 Arrow 3.0 is a breaking rewrite. Read the
 [migration guide](docs/src/migration.md) before you update from Arrow 2.x.
 See the [changelog](CHANGELOG.md) for the full release summary. The
-[user manual](https://arrow.apache.org/julia/) and
+[user manual](docs/src/manual.md) and
 [API reference](docs/src/reference.md) describe the supported public API.
 
 ## Development
@@ -98,6 +98,14 @@ The repository also has Apache Arrow gold-corpus checks, PyArrow and
 Nanoarrow IPC oracle checks, and PyArrow C interface checks. Run all of them
 with `julia conformance/run.jl`. Docker and network access for the first image
 build are required.
+
+Run `julia --project=. test/fuzz.jl --cases 16 --mutations 64` for the
+deterministic PR-sized fuzz suite. The scheduled workflow runs the extended
+512-case and 20,000-mutation suite with a new reproducible master seed for each
+scheduled run. It repeats the first full route sweep and every 256th mutation
+to detect unstable outcomes. If the runner records or times out on a case, the
+workflow uploads its replay coordinates, mutated bytes when available, the
+resolved package environment, and a location-independent `replay.sh` wrapper.
 
 The Arrow 3.0 rewrite used Anthropic Claude Code and OpenAI Codex for code
 generation, test generation, and review. Apache Arrow maintainers remain

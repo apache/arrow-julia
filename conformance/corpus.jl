@@ -42,380 +42,74 @@
 # the report reads as coverage, not silence.
 # =============================================================================
 
-using JSON, CodecZlib
-using Arrow
-# The corpus exercises package internals (adapter entry points, Core
-# accessors, metadata types); alias the namespace wholesale, as the test
-# batteries do.
-for n in names(Arrow; all=true)
-    sn = String(n)
-    (startswith(sn, "#") || n in (:eval, :include, :Arrow, :write, :Table, :Stream)) &&
-        continue
-    isdefined(Arrow, n) || continue
-    @eval const $n = Arrow.$n
+import Arrow
+
+if !isdefined(@__MODULE__, :ConformanceSupport)
+    include(joinpath(@__DIR__, "ConformanceSupport.jl"))
 end
-include(joinpath(@__DIR__, "arrowjson.jl"))
-using .ArrowJSON
-
-# The image sets ARROW_TESTING_DIR; every suite defaults its corpus to it.
-const DEFAULT_CORPUS = get(ENV, "ARROW_TESTING_DIR", "")
-
-# Families declared out of scope, with the reason. Everything
-# else must pass or it is a failure.
-const SKIP = Dict{String,String}(
-    "1.0.0-bigendian" => "big-endian streams are not supported (no endianness normalization)",
-    "0.14.1" => "pre-1.0 legacy framing (four-byte prefix) is not accepted by design",
-    "0.17.1" => "V4 experimental compression marker era; superseded by 2.0.0-compression",
-    "generated_decimal256" => "decimal256 (Int256 storage) is not implemented",
-    "generated_extension" => "extension types round-trip as their storage type + metadata; value equality holds but this runner treats the family as informational",
-)
-
-# --- value-level comparison -----------------------------------------------------
-
-_num(x) =
-    x isa AbstractString ? (tryparse(Int128, x) === nothing ? x : parse(Int128, x)) :
-    x isa Integer ? Int128(x) : x
-
-function _eq(a, b, path::String, diffs::Vector{String})
-    if a isa AbstractDict && b isa AbstractDict
-        ka, kb = Set(keys(a)), Set(keys(b))
-        # writers may omit empty/absent optional keys
-        for k in union(ka, kb)
-            va, vb = get(a, k, nothing), get(b, k, nothing)
-            (va === nothing || va == Any[] || va == false) &&
-                (vb === nothing || vb == Any[] || vb == false) &&
-                continue
-            _eq(va, vb, path * "." * String(k), diffs)
-        end
-    elseif a isa AbstractVector && b isa AbstractVector
-        length(a) == length(b) ||
-            (push!(diffs, "$path: length $(length(a)) vs $(length(b))"); return)
-        for (i, (x, y)) in enumerate(zip(a, b))
-            _eq(x, y, path * "[$i]", diffs)
-            length(diffs) > 20 && return
-        end
-    elseif a isa AbstractFloat || b isa AbstractFloat
-        # EXACT equality (± zero unified, NaN equal): a tolerance here would
-        # bless changed values. Sub-double columns are canonicalized to
-        # their physical precision by _normalize! first, which is what makes
-        # exact comparison correct across writers' decimal choices.
-        fa, fb = Float64(_num(a)), Float64(_num(b))
-        (isnan(fa) && isnan(fb)) || fa == fb || push!(diffs, "$path: $a vs $b")
-    elseif a isa Bool || b isa Bool
-        Bool(a) == Bool(b) || push!(diffs, "$path: $a vs $b")
-    else
-        na, nb = _num(a), _num(b)
-        na == nb || push!(diffs, "$path: $(repr(a)) vs $(repr(b))")
-    end
-    return
-end
-
-# The dictionaries section's pool COLUMN name is a placeholder in the JSON
-# format (gold files write "DICT0"; other writers use the field name), and
-# metadata key/value lists are unordered. Normalize both before comparing.
-function _normalize!(doc::AbstractDict)
-    # Dictionary ids and pool sharing are adapter bookkeeping, and the gold
-    # corpus itself is not id-stable across its own representations:
-    # generated_nested_dictionary's JSON shares one pool between two fields
-    # (3 ids) while its gold stream and file carry one pool per field (5 ids).
-    # Canonicalize both documents to one pool entry per dictionary-typed
-    # field position, ids assigned in depth-first schema order.
-    pools = Dict{Int64,Any}(
-        Int64(d["id"]) => d["data"] for d in get(doc, "dictionaries", Any[])
-    )
-    newdicts = Any[]
-    function renumber!(f)
-        f isa AbstractDict || return
-        if get(f, "dictionary", nothing) isa AbstractDict
-            d = f["dictionary"]
-            oldid = Int64(d["id"])
-            newid = length(newdicts)
-            d["id"] = newid
-            push!(
-                newdicts,
-                Dict{String,Any}("id" => newid, "data" => deepcopy(pools[oldid])),
-            )
-        end
-        foreach(renumber!, get(f, "children", Any[]))
-    end
-    foreach(renumber!, get(get(doc, "schema", Dict()), "fields", Any[]))
-    if isempty(newdicts)
-        delete!(doc, "dictionaries")
-    else
-        doc["dictionaries"] = newdicts
-    end
-    for d in get(doc, "dictionaries", Any[])
-        for c in d["data"]["columns"]
-            c["name"] = "DICT"
-        end
-    end
-    # Half/single float values parsed from another writer's shortest-repr
-    # decimals do not lift to the same Float64s ours do; canonicalize every
-    # sub-double column through its physical precision so the comparison can
-    # be EXACT for all floats.
-    canonfloat(precision, v) =
-        !(v isa Real) ? v :
-        precision == "HALF" ? Float64(Float16(Float64(v))) :
-        precision == "SINGLE" ? Float64(Float32(Float64(v))) : Float64(v)
-    function normfloatcols!(f, col)
-        (f isa AbstractDict && col isa AbstractDict) || return
-        # A dictionary field's batch column carries integer INDICES; its
-        # float values live in the dictionaries section, paired below.
-        haskey(f, "dictionary") && return
-        t = get(f, "type", Dict())
-        if get(t, "name", "") == "floatingpoint" && haskey(col, "DATA")
-            p = get(t, "precision", "DOUBLE")
-            col["DATA"] = Any[canonfloat(p, v) for v in col["DATA"]]
-        end
-        for (x, y) in zip(get(f, "children", Any[]), get(col, "children", Any[]))
-            normfloatcols!(x, y)
-        end
-    end
-    fields = get(get(doc, "schema", Dict()), "fields", Any[])
-    for b in get(doc, "batches", Any[])
-        for (f, c) in zip(fields, get(b, "columns", Any[]))
-            normfloatcols!(f, c)
-        end
-    end
-    # Pools pair with dictionary fields in the same depth-first order
-    # `renumber!` rebuilt the dictionaries array in.
-    pools = get(doc, "dictionaries", Any[])
-    poolindex = Ref(0)
-    function normfloatpools!(f)
-        f isa AbstractDict || return
-        if get(f, "dictionary", nothing) isa AbstractDict
-            poolindex[] += 1
-            valuefield = Dict{String,Any}(
-                "type" => get(f, "type", Dict()),
-                "children" => get(f, "children", Any[]),
-            )
-            for pc in pools[poolindex[]]["data"]["columns"]
-                normfloatcols!(valuefield, pc)
-            end
-        end
-        foreach(normfloatpools!, get(f, "children", Any[]))
-    end
-    foreach(normfloatpools!, fields)
-    # Map entries-struct names are NOT round-trip stable in the corpus itself:
-    # generated_map_non_canonical's gold .stream carries `entries` while its
-    # gold .arrow_file and .json carry `some_entries` (the C++ stream writer
-    # canonicalizes). Compare map children structurally, by position.
-    function normmapnames!(fields)
-        for f in fields
-            f isa AbstractDict || continue
-            if get(get(f, "type", Dict()), "name", "") == "map" && haskey(f, "children")
-                for c in f["children"]
-                    c["name"] = "entries"
-                    for (i, kv) in enumerate(get(c, "children", Any[]))
-                        kv["name"] = i == 1 ? "key" : "value"
-                    end
-                end
-            end
-            haskey(f, "children") && normmapnames!(f["children"])
-        end
-    end
-    normmapnames!(get(get(doc, "schema", Dict()), "fields", Any[]))
-    function normmapcols!(cols, fields)
-        for (c, f) in zip(cols, fields)
-            (c isa AbstractDict && f isa AbstractDict) || continue
-            if get(get(f, "type", Dict()), "name", "") == "map" && haskey(c, "children")
-                for cc in c["children"]
-                    cc["name"] = "entries"
-                    for (i, kv) in enumerate(get(cc, "children", Any[]))
-                        kv["name"] = i == 1 ? "key" : "value"
-                    end
-                end
-            end
-            haskey(c, "children") &&
-                haskey(f, "children") &&
-                normmapcols!(c["children"], f["children"])
-        end
-    end
-    fields = get(get(doc, "schema", Dict()), "fields", Any[])
-    for b in get(doc, "batches", Any[])
-        normmapcols!(b["columns"], fields)
-    end
-    function normmeta!(x)
-        if x isa AbstractDict
-            if haskey(x, "metadata") && x["metadata"] isa AbstractVector
-                x["metadata"] =
-                    sort(x["metadata"]; by=kv -> (String(kv["key"]), String(kv["value"])))
-            end
-            foreach(normmeta!, values(x))
-        elseif x isa AbstractVector
-            foreach(normmeta!, x)
-        end
-    end
-    normmeta!(doc)
-    # Decimal bitWidth is optional-with-default (128) in the JSON format; our
-    # renderer always writes it, older gold files omit it.
-    function normdecimal!(x)
-        if x isa AbstractDict
-            if get(x, "name", "") == "decimal" && haskey(x, "precision")
-                get(x, "bitWidth", 128) == 128 && delete!(x, "bitWidth")
-            end
-            foreach(normdecimal!, values(x))
-        elseif x isa AbstractVector
-            foreach(normdecimal!, x)
-        end
-    end
-    normdecimal!(doc)
-    return doc
-end
-
-function docsequal(a, b)
-    diffs = String[]
-    _eq(_normalize!(a), _normalize!(b), "", diffs)
-    return diffs
-end
-
-# Gold JSON carries physical DATA under null slots that our writer does not
-# preserve (we materialize logically). Mask both sides' DATA where VALIDITY
-# is 0 before comparing, recursively — the spec makes those bytes
-# unspecified, so this is the conformance-correct comparison.
-function masknulls!(col::AbstractDict)
-    # Rebuild as Vector{Any}: our rendered docs carry typed vectors that
-    # cannot hold `nothing`, and mutating them in place would also alias
-    # into Core buffers on some paths.
-    if haskey(col, "VALIDITY") && haskey(col, "DATA") && col["DATA"] isa AbstractVector
-        v = col["VALIDITY"]
-        d = col["DATA"]
-        col["DATA"] =
-            Any[(i <= length(v) && v[i] == 0) ? nothing : d[i] for i in eachindex(d)]
-    end
-    if haskey(col, "VALIDITY") && haskey(col, "VIEWS")
-        v = col["VALIDITY"]
-        vs = col["VIEWS"]
-        col["VIEWS"] =
-            Any[(i <= length(v) && v[i] == 0) ? nothing : vs[i] for i in eachindex(vs)]
-    end
-    for c in get(col, "children", Any[])
-        masknulls!(c)
-    end
-    return col
-end
-function masknulls!(doc::AbstractDict, ::Val{:doc})
-    for b in get(doc, "batches", Any[]), c in b["columns"]
-        masknulls!(c)
-    end
-    for d in get(doc, "dictionaries", Any[]), c in d["data"]["columns"]
-        masknulls!(c)
-    end
-    return doc
-end
-
-# --- runner ---------------------------------------------------------------------------
-
-struct Verdict
-    family::String
-    check::String
-    status::Symbol      # :pass, :fail, :skip
-    detail::String
-end
-
-function _readjson(path)
-    bytes = read(path)
-    endswith(path, ".gz") && (bytes = transcode(GzipDecompressor, bytes))
-    return JSON.parse(String(bytes))
-end
-
-function _stream_to_json(bytes::Vector{UInt8})
-    s = readstream(bytes)
-    # Render with the reader's id table so shared and nested pool ids survive
-    # the round-trip instead of being re-assigned one per field.
-    return ArrowJSON.tojson(s.schema, s.batches; dictids=s.fielddictids)
-end
-
-function _file_to_json(bytes::Vector{UInt8})
-    f = readfile(bytes)
-    batches = AC.RecordBatch[f[i] for i = 1:length(f)]
-    return ArrowJSON.tojson(f.schema, batches; dictids=f.fielddictids)
-end
+using .ConformanceSupport:
+    ArrowJSON,
+    DEFAULT_CORPUS,
+    Verdict,
+    documentcheck,
+    familyskipreason,
+    filedocument,
+    goldipcskipreason,
+    readjson,
+    streamdocument
 
 function runfamily(dir::String, family::String, verdicts::Vector{Verdict})
-    for (k, why) in SKIP
-        (k == family || k == basename(dir)) &&
-            (push!(verdicts, Verdict(family, "all", :skip, why)); return)
+    why = familyskipreason(family, basename(dir))
+    if !isempty(why)
+        push!(verdicts, Verdict(family, "all", :skip, why))
+        return
     end
-    jsonpath = joinpath(dir, family * ".json.gz")
-    gold = _readjson(jsonpath)
-    goldmasked = masknulls!(deepcopy(gold), Val(:doc))
+
+    gold = readjson(joinpath(dir, family * ".json.gz"))
+
     # 1. JSON -> Core -> JSON
     check = "json→core→json"
-    try
+    push!(verdicts, documentcheck(family, check, gold) do
         sch, batches, dictids = ArrowJSON.fromjson(gold)
-        back = ArrowJSON.tojson(sch, batches; dictids=dictids)
-        diffs = docsequal(masknulls!(deepcopy(back), Val(:doc)), goldmasked)
-        push!(
-            verdicts,
-            Verdict(
-                family,
-                check,
-                isempty(diffs) ? :pass : :fail,
-                isempty(diffs) ? "" : first(diffs),
-            ),
-        )
-    catch e
-        push!(
-            verdicts,
-            Verdict(family, check, :fail, sprint(showerror, e)[1:min(end, 200)]),
-        )
-    end
+        ArrowJSON.tojson(sch, batches; dictids=dictids)
+    end)
+
     # 2. gold stream -> JSON ; 3. gold file -> JSON
     for (check, path, reader) in (
-        ("gold stream→json", joinpath(dir, family * ".stream"), _stream_to_json),
-        ("gold file→json", joinpath(dir, family * ".arrow_file"), _file_to_json),
+        ("gold stream→json", joinpath(dir, family * ".stream"), streamdocument),
+        ("gold file→json", joinpath(dir, family * ".arrow_file"), filedocument),
     )
-        isfile(path) ||
-            (push!(verdicts, Verdict(family, check, :skip, "no gold file")); continue)
-        try
-            got = reader(read(path))
-            diffs = docsequal(masknulls!(deepcopy(got), Val(:doc)), goldmasked)
-            push!(
-                verdicts,
-                Verdict(
-                    family,
-                    check,
-                    isempty(diffs) ? :pass : :fail,
-                    isempty(diffs) ? "" : first(diffs),
-                ),
-            )
-        catch e
-            push!(
-                verdicts,
-                Verdict(family, check, :fail, sprint(showerror, e)[1:min(end, 200)]),
-            )
+        why = goldipcskipreason(family, basename(dir))
+        if !isempty(why)
+            push!(verdicts, Verdict(family, check, :skip, why))
+            continue
         end
+        if !isfile(path)
+            push!(verdicts, Verdict(family, check, :skip, "no gold file"))
+            continue
+        end
+        push!(verdicts, documentcheck(family, check, gold) do
+            reader(read(path))
+        end)
     end
+
     # 4. JSON -> our IPC (stream + file) -> our reader -> JSON vs gold
     for (check, writer, reader) in (
         (
             "json→our stream→json",
-            (s, b, ids) -> writestream(s, b; dictids=ids),
-            _stream_to_json,
+            (s, b, ids) -> Arrow.writestream(s, b; dictids=ids),
+            streamdocument,
         ),
-        ("json→our file→json", (s, b, ids) -> writefile(s, b; dictids=ids), _file_to_json),
+        (
+            "json→our file→json",
+            (s, b, ids) -> Arrow.writefile(s, b; dictids=ids),
+            filedocument,
+        ),
     )
-        try
+        push!(verdicts, documentcheck(family, check, gold) do
             sch, batches, dictids = ArrowJSON.fromjson(gold)
-            bytes = writer(sch, batches, dictids)
-            got = reader(bytes)
-            diffs = docsequal(masknulls!(deepcopy(got), Val(:doc)), goldmasked)
-            push!(
-                verdicts,
-                Verdict(
-                    family,
-                    check,
-                    isempty(diffs) ? :pass : :fail,
-                    isempty(diffs) ? "" : first(diffs),
-                ),
-            )
-        catch e
-            push!(
-                verdicts,
-                Verdict(family, check, :fail, sprint(showerror, e)[1:min(end, 200)]),
-            )
-        end
+            reader(writer(sch, batches, dictids))
+        end)
     end
     return
 end
@@ -448,22 +142,13 @@ function runcorpus(corpus::String=DEFAULT_CORPUS; versions=nothing)
             end
         end
     end
+    (isempty(verdicts) || all(v -> v.status == :skip, verdicts)) &&
+        error("arrow-testing corpus contains no runnable cases under $root")
     return verdicts
 end
 
-function report(verdicts::Vector{Verdict}; io=stdout)
-    npass = count(v -> v.status == :pass, verdicts)
-    nfail = count(v -> v.status == :fail, verdicts)
-    nskip = count(v -> v.status == :skip, verdicts)
-    println(io, "arrow-testing corpus: $npass pass, $nfail fail, $nskip skip")
-    println(io)
-    for v in verdicts
-        v.status == :pass && continue
-        tag = v.status == :fail ? "FAIL" : "skip"
-        println(io, rpad(tag, 5), rpad(v.family, 58), rpad(v.check, 24), v.detail)
-    end
-    return nfail
-end
+report(verdicts::Vector{Verdict}; io=stdout) =
+    ConformanceSupport.report("arrow-testing corpus", verdicts; io=io)
 
 if abspath(PROGRAM_FILE) == abspath(@__FILE__)
     corpus = isempty(ARGS) ? DEFAULT_CORPUS : ARGS[1]

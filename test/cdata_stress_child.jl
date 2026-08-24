@@ -18,14 +18,9 @@
 # (a fresh process so thread count and lifecycle state start clean).
 module CdataStressChild
 
-using Test
-using Arrow
+include(joinpath(@__DIR__, "support", "CDataStressSupport.jl"))
+import .CDataStressSupport
 
-include("battery_prelude.jl")
-
-include("battery_helpers.jl")
-include("cdata_battery.jl")
-
-_threaded_cdata_stress()
+CDataStressSupport.run()
 
 end # module

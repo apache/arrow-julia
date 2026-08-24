@@ -38,8 +38,9 @@ documents each layer in depth):
   lifecycle accounting.
 - `scan.jl`: `Tables.Scan` pushdown over byte ranges plus footer-carried
   statistics pruning.
-- `table.jl`, `write.jl`: the facade over the adapters, including recursive
-  ArrowTypes.jl lowering and lifting for Julia extension types.
+- `table.jl`, `write.jl`: the read facade and write orchestration.
+- `columnconstruction.jl`: column-wide construction policy, including
+  retained schemas, dictionaries, and recursive ArrowTypes.jl lowering.
 
 The adapter entry points (`readstream`, `writestream`, `readfile`,
 `writefile`, `to_c_data`, `from_c_data`, `export_stream!`, `from_c_stream`)
@@ -99,7 +100,8 @@ include("source.jl")
 include("arrowtypes.jl")
 
 # The public facade. `table.jl` includes the private scan-plan module after
-# its column-conversion seam is defined.
+# its public/storage type seam is defined; `write.jl` includes the private
+# column-construction module after the `DictEncode` marker is defined.
 include("table.jl")
 include("write.jl")
 
@@ -206,6 +208,8 @@ AC.ValidationError
             :ImportedStream,
             :nextbatch!,
             :reap!,
+            :Limits,
+            :AllocationLimitError,
             :ValidationError,
         ),
     )

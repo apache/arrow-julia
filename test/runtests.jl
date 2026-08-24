@@ -34,12 +34,14 @@ include("property_tests.jl")
 # Release-blocking regressions found during the 3.0 rewrite audit.
 include("rewrite_regressions.jl")
 
+# Shared acceptance/conformance support contracts and adapter composition.
+include("conformance_support_tests.jl")
+
 # The CloudStore.jl extension against a local S3-compatible server.
 include("cloudstore_tests.jl")
 
 # The adapter acceptance batteries: assertion-dense scripts over the
-# package's internals, sharing one module that aliases the package
-# namespace wholesale.
+# package's internals, sharing one explicit private support module.
 include("batteries.jl")
 
 # Package hygiene: compat bounds, stale dependencies, ambiguities, exports,

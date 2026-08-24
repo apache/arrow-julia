@@ -182,7 +182,10 @@ function ipc_read_battery()
     # A corrupt LZ4 frame must not erase the native pointer before reader
     # cleanup. CodecLz4's streaming wrapper does erase it on this error, so
     # the adapter owns the raw context and frees it directly.
-    badstate = DecodeState(AllocationBudget(0))
+    # Fund exactly the empty output vector. A zero budget now fails at the
+    # allocation gate before the decoder owns a native context, which would
+    # not exercise the cleanup seam below.
+    badstate = DecodeState(AllocationBudget(AC._materializedvectorbytes(UInt8, Int64(0))))
     badbytes = _compressed_wire(UInt8[0x01, 0x02, 0x03], 0)
     badwire = BufferSlice(heapregion(badbytes), 0, length(badbytes))
     badcursor = DecodeCursor(
@@ -242,13 +245,25 @@ function ipc_read_battery()
         Arrow.write(oneio, large; file=false, compress=:zstd)
         take!(oneio)
     end
-    aggregate_limit = Limits(max_total_allocated_bytes=100_000)
-    @assert length(readstream(onebytes; limits=aggregate_limit).batches) == 1
     twobytes = _fixture2x("large-zeros-zstd-two-partitions") do
         twoio = IOBuffer()
         Arrow.write(twoio, Tables.partitioner([large, large]); file=false, compress=:zstd)
         take!(twoio)
     end
+
+    # Derive the exact boundary from this reader instead of baking in an
+    # allocation threshold that becomes stale when accounting deepens.
+    probe_limit = Int64(1_000_000_000)
+    probe_limits = Limits(max_total_allocated_bytes=probe_limit)
+    onebudget = AllocationBudget(probe_limit)
+    @assert length(Arrow._readstream(onebytes, probe_limits, onebudget).batches) == 1
+    onecharge = probe_limit - _remaining(onebudget)
+    twobudget = AllocationBudget(probe_limit)
+    @assert length(Arrow._readstream(twobytes, probe_limits, twobudget).batches) == 2
+    @assert probe_limit - _remaining(twobudget) > onecharge
+
+    aggregate_limit = Limits(max_total_allocated_bytes=onecharge)
+    @assert length(readstream(onebytes; limits=aggregate_limit).batches) == 1
     @assert _rejects(() -> readstream(twobytes; limits=aggregate_limit))
     println("metadata and decompressed bytes share one reader-wide budget ✓")
 

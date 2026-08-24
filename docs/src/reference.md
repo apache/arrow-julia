@@ -26,6 +26,7 @@
 ```@docs
 Arrow.Table
 Arrow.Stream
+Arrow.Limits
 Arrow.release!(::Arrow.Table)
 ```
 
@@ -78,5 +79,6 @@ Arrow.reap!
 ## Errors
 
 ```@docs
+Arrow.AllocationLimitError
 Arrow.ValidationError
 ```

@@ -14,40 +14,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The acceptance batteries exercise the package's internals wholesale.
-# Rather than maintain a hundred-name import list, this module aliases every
-# binding the package defines.
+# The Test adapter owns only presentation. AcceptanceSupport owns the private
+# package dependencies, fixtures, runner order, and implementation.
 module Batteries
 
 using Test
-using Tables
-using PooledArrays
-import Base64
-using Arrow
-
-include("battery_prelude.jl")
-
-include("battery_helpers.jl")
-include("ipc_read_battery.jl")
-include("ipc_write_battery.jl")
-include("cdata_battery.jl")
-include("scan_battery.jl")
+include(joinpath(@__DIR__, "support", "AcceptanceSupport.jl"))
 
 # The batteries signal failure by throwing; a testset that completes is the
 # pass.
-@testset "IPC read acceptance" begin
-    ipc_read_battery()
-end
-@testset "IPC write acceptance" begin
-    ipc_write_battery()
-end
-@testset "C data acceptance" begin
-    cdata_battery()
-end
-@testset "Scan acceptance" begin
-    _stats_main()
-    filebytes, af, full = _scan_main()
-    _ranged_main(filebytes, af, full)
+const ACCEPTANCE_SUITES = AcceptanceSupport.acceptance_suites()
+@assert map(first, ACCEPTANCE_SUITES) == (
+    "IPC read acceptance",
+    "IPC write acceptance",
+    "C data acceptance",
+    "Scan acceptance",
+)
+for (name, runner) in ACCEPTANCE_SUITES
+    @testset "$name" begin
+        runner()
+    end
 end
 
 end # module Batteries

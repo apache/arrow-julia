@@ -146,14 +146,17 @@ arrowmetadata(::Type{Any}) = EMPTY_STRING
     ArrowTypes.JuliaType(::Val{Symbol(name)}, ::Type{S}, arrowmetadata::String) = T
 
 Interface method to define the custom Julia logical type `T` that a serialized metadata label should be converted to when
-deserializing. When reading arrow data, and a logical type label is encountered for a column, it will call
-`ArrowTypes.JuliaType(Val(Symbol(name)), S, arrowmetadata)` to see if a Julia type has been "registered" for deserialization. The `name`
+deserializing. To resolve a logical type label, a reader calls
+`ArrowTypes.JuliaType(Val(name_symbol), S, arrowmetadata)` with the corresponding existing Julia `Symbol`. The `name`
 used when defining the method *must* correspond to the same `name` when defining `ArrowTypes.arrowname(::Type{T}) = Symbol(name)`.
 The use of `Val(Symbol(...))` is to allow overloading a method on a specific logical type label. The `S` 2nd argument passed to
 `JuliaType` is the native arrow serialized type. This can be useful for parametric Julia types that wish to correctly parameterize
 their custom type based on what was serialized. The 3rd argument `arrowmetadata` is any metadata that was stored when the logical
 type was serialized as the result of calling `ArrowTypes.arrowmetadata(T)`. Note the 2nd and 3rd arguments are optional when
 overloading if unneeded.
+Readers must not intern an unknown, input-controlled name only to probe this interface. Arrow.jl first performs a non-interning
+lookup and calls `JuliaType(Val(...))` only when the corresponding `Symbol` already exists; otherwise it preserves ordinary Arrow
+storage values.
 When defining [`ArrowTypes.arrowname`](@ref) and `ArrowTypes.JuliaType`, you may also want to implement [`ArrowTypes.fromarrow`](@ref)
 in order to customize how a custom type `T` should be constructed from the native arrow data type. See its docs for more details.
 """
@@ -243,6 +246,8 @@ toarrow(x::Symbol) = String(x)
 const SYMBOL = Symbol("JuliaLang.Symbol")
 arrowname(::Type{Symbol}) = SYMBOL
 JuliaType(::Val{SYMBOL}) = Symbol
+# Arrow.jl's IPC reader checks that a Symbol payload is already interned before
+# it calls this compatibility hook. Direct ArrowTypes callers remain trusted.
 _symbol(ptr, len) = ccall(:jl_symbol_n, Ref{Symbol}, (Ptr{UInt8}, Int), ptr, len)
 fromarrow(::Type{Symbol}, ptr::Ptr{UInt8}, len::Int) = _symbol(ptr, len)
 
@@ -349,7 +354,7 @@ struct UnionKind <: ArrowKind end
 
 ArrowKind(::Union) = UnionKind()
 
-"DictEncodedKind store a small pool of unique values in one buffer, with a full-length buffer of integer offsets into the small value pool"
+"`DictEncodedKind` stores a category pool in one buffer and a full-length buffer of integer indices into it. A category pool may contain unused or duplicate physical entries."
 struct DictEncodedKind <: ArrowKind end
 
 """

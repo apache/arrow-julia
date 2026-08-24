@@ -148,7 +148,15 @@ end
         # length would otherwise wrap into the null marker
         @test AS.payloadlength(AS.view_payload(data, 3, Int(typemax(Int32)), 0, 0)) ==
               typemax(Int32)
-        @test_throws ArgumentError AS.view_payload(data, 3, Int(typemax(Int32)) + 1, 0, 0)
+        @static if Sys.WORD_SIZE > 32
+            @test_throws ArgumentError AS.view_payload(
+                data,
+                3,
+                Int(typemax(Int32)) + 1,
+                0,
+                0,
+            )
+        end
         @test_throws ArgumentError AS.view_payload(data, 3, 12, 0, 0)
         @test_throws ArgumentError AS.view_payload(data, 3, -1, 0, 0)
         @test_throws ArgumentError AS.inline_payload(data, 1, 13)

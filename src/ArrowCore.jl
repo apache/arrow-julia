@@ -317,17 +317,21 @@ while the region or any cached validation result remains in use: a shared
 mapping cannot keep a semantic certificate valid when another process
 changes its bytes, and truncation can make an in-range load fault.
 """
-function mmapregion(path::AbstractString)
-    io = open(path, "r")
-    arr = try
-        Mmap.mmap(io, Vector{UInt8})
-    finally
-        # The mapping outlives the descriptor.
-        close(io)
-    end
-    isempty(arr) && throw(ArgumentError("cannot map empty file: $path"))
+function _mmapregion(io::IO, label)
+    arr = Mmap.mmap(io, Vector{UInt8})
+    isempty(arr) && throw(ArgumentError("cannot map empty file: $label"))
     cell = ReleaseCell(@cfunction(_release_mmap, Cvoid, (Ptr{Cvoid},)), _mmaproot(arr))
     return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr); root=arr, cell=cell)
+end
+
+function mmapregion(path::AbstractString)
+    io = open(path, "r")
+    try
+        # The mapping outlives the descriptor.
+        return _mmapregion(io, path)
+    finally
+        close(io)
+    end
 end
 
 # --- BufferSlice ------------------------------------------------------------
@@ -2040,6 +2044,90 @@ function getvalue(f::Field, d::ArrayData, i::Integer)
     return _value_of(d.type, f, d, Int64(i))
 end
 
+# Reader adapters can attach one cumulative allocation budget without making
+# the dependency-free Core know the adapter's budget type. The ordinary
+# methods below remain the trim-safe API. Budgeted overloads only preflight
+# package-owned output containers, then call the same audited extraction.
+function _charge_materialization! end
+function _materialization_remaining end
+function _materialization_limit_exceeded! end
+
+@inline function _materializedvectorbytes(::Type{T}, n::Integer) where {T}
+    n >= 0 || throw(ValidationError("materialized vector length is negative"))
+    payload = checked_mul(Int64(n), Int64(Base.elsize(Vector{T})))
+    # Julia stores one selector byte per element beside an isbits-Union
+    # vector's ordinary payload.
+    Base.isbitsunion(T) && (payload = checked_add(payload, Int64(n)))
+    # Julia 1.11's `Memory` backing store may round a just-over-half-full
+    # allocation to the next size class. The measured worst case approaches
+    # twice the requested payload. Reserve that full capacity plus both the
+    # Vector and Memory headers; using the logical payload alone can let one
+    # package-owned allocation exceed the caller's budget by almost 2x.
+    # Supported Julia runtimes allocate at most one 64-byte object for an
+    # empty Vector after warm-up. Charging the nonempty 128-byte header model
+    # per empty nested value rejects compact Arrow columns by hundreds of
+    # megabytes even though their materialized empty containers are small.
+    payload == 0 && return Int64(64)
+    capacity = checked_mul(Int64(2), payload)
+    return checked_add(Int64(128), capacity)
+end
+
+@inline function _materializedbitvectorbytes(n::Integer)
+    n >= 0 || throw(ValidationError("materialized bit-vector length is negative"))
+    chunks = cld(Int64(n), Int64(64))
+    return checked_add(
+        _materializedvectorbytes(UInt64, chunks),
+        _materializedobjectbytes(sizeof(BitVector)),
+    )
+end
+
+# Conservative Julia heap-object size for a newly boxed inline value: an
+# 8-byte object tag plus the payload, rounded to the 16-byte GC size class.
+@inline function _materializedobjectbytes(payload::Integer)
+    payload >= 0 || throw(ValidationError("materialized object size is negative"))
+    total = checked_add(Int64(payload), Int64(8))
+    return checked_mul(Int64(16), cld(total, Int64(16)))
+end
+
+mutable struct _MaterializationEstimate{B}
+    budget::B
+    bytes::Int64
+    limit::Int64
+end
+
+_MaterializationEstimate(budget) =
+    _MaterializationEstimate(budget, Int64(0), _materialization_remaining(budget))
+
+@inline function _addestimate!(
+    estimate::_MaterializationEstimate,
+    amount::Int64,
+    what::AbstractString,
+)
+    amount >= 0 || throw(ValidationError("materialization estimate is negative"))
+    amount <= estimate.limit - estimate.bytes ||
+        _materialization_limit_exceeded!(estimate.budget, what)
+    estimate.bytes += amount
+    return nothing
+end
+
+@inline _reservevector!(
+    estimate::_MaterializationEstimate,
+    ::Type{T},
+    n::Integer,
+    what::AbstractString,
+) where {T} = _addestimate!(estimate, _materializedvectorbytes(T, n), what)
+
+@inline _reserveobject!(
+    estimate::_MaterializationEstimate,
+    payload::Integer,
+    what::AbstractString,
+) = _addestimate!(estimate, _materializedobjectbytes(payload), what)
+
+@inline function _commitestimate!(estimate::_MaterializationEstimate, what::AbstractString)
+    _charge_materialization!(estimate.budget, estimate.bytes, what)
+    return nothing
+end
+
 _value(::Any, ::Field, ::ArrayData, ::Int64) =
     throw(ArgumentError("unregistered ArrowType"))
 
@@ -2175,6 +2263,34 @@ end
 
 # -- nested -----------------------------------------------------------------
 
+# Dynamic recursion mirrors `_typedchild`: scalar children inline into their
+# parent's loop, while composite children cross one compiled function barrier.
+# Calling public `getvalue` for every scalar child allocates a dispatch box per
+# element; recursively inlining every composite instead breaks trim inference.
+@inline function _dynamicchild(f::Field, d::ArrayData, i::Int64)
+    1 <= i <= d.len || throw(BoundsError(d, i))
+    t = d.type
+    t isa IntType && return _value(t, f, d, i)
+    t isa FloatType && return _value(t, f, d, i)
+    t isa BoolType && return _value(t, f, d, i)
+    t isa Utf8Type && return _value(t, f, d, i)
+    t isa BinaryType && return _value(t, f, d, i)
+    t isa FixedSizeBinaryType && return _value(t, f, d, i)
+    t isa TimestampType && return _value(t, f, d, i)
+    t isa DateType && return _value(t, f, d, i)
+    t isa TimeType && return _value(t, f, d, i)
+    t isa DurationType && return _value(t, f, d, i)
+    t isa DecimalType && return _value(t, f, d, i)
+    t isa IntervalType && return _value(t, f, d, i)
+    t isa ViewType && return _value(t, f, d, i)
+    t isa NullType && return _value(t, f, d, i)
+    return _dynamicchildbox(f, d, i)
+end
+
+function _dynamicchildbox(f::Field, d::ArrayData, i::Int64)
+    return _value_of(d.type, f, d, i)
+end
+
 function _value(t::ListType, f::Field, d::ArrayData, i::Int64)
     isvalid_at(d, i) || return missing
     lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth == 8)
@@ -2184,7 +2300,7 @@ function _value(t::ListType, f::Field, d::ArrayData, i::Int64)
     # containers are the facade's job.
     out = Vector{Any}(undef, Int(hi - lo))
     for k = 1:Int(hi - lo)
-        out[k] = getvalue(cf, child, checked_add(lo, Int64(k)))
+        out[k] = _dynamicchild(cf, child, checked_add(lo, Int64(k)))
     end
     return out
 end
@@ -2195,7 +2311,7 @@ function _value(t::FixedSizeListType, f::Field, d::ArrayData, i::Int64)
     base = checked_mul(_slotindex0(d, i), Int64(t.listsize))
     out = Vector{Any}(undef, t.listsize)
     for j = 1:t.listsize
-        out[j] = getvalue(cf, child, checked_add(base, Int64(j)))
+        out[j] = _dynamicchild(cf, child, checked_add(base, Int64(j)))
     end
     return out
 end
@@ -2214,7 +2330,7 @@ function _value(::StructType, f::Field, d::ArrayData, i::Int64)
     for j = 1:n
         out[j] = Pair{String,Any}(
             f.children[j].name,
-            getvalue(f.children[j], d.children[j], childindex),
+            _dynamicchild(f.children[j], d.children[j], childindex),
         )
     end
     return out
@@ -2230,7 +2346,10 @@ function _value(t::MapType, f::Field, d::ArrayData, i::Int64)
     out = Vector{Pair{Any,Any}}(undef, Int(hi - lo))
     for k = 1:Int(hi - lo)
         entryindex = checked_add(entries.offset, checked_add(lo, Int64(k)))
-        out[k] = Pair{Any,Any}(getvalue(kf, kd, entryindex), getvalue(vf, vd, entryindex))
+        out[k] = Pair{Any,Any}(
+            _dynamicchild(kf, kd, entryindex),
+            _dynamicchild(vf, vd, entryindex),
+        )
     end
     return out
 end
@@ -2242,9 +2361,9 @@ function _value(t::UnionType, f::Field, d::ArrayData, i::Int64)
     child, cf = d.children[pos], f.children[pos]
     if t.mode == DenseMode
         off = loadat(rolebuffer(d, ELEMENT_OFFSETS), Int32, _slotbyteoff(d, i, 4))
-        return getvalue(cf, child, checked_add(Int64(off), Int64(1)))
+        return _dynamicchild(cf, child, checked_add(Int64(off), Int64(1)))
     else
-        return getvalue(cf, child, checked_add(d.offset, i))
+        return _dynamicchild(cf, child, checked_add(d.offset, i))
     end
 end
 
@@ -2255,7 +2374,7 @@ function _value(t::DictionaryType, f::Field, d::ArrayData, i::Int64)
     dict = d.dictionary
     dict === nothing &&
         throw(ValidationError("dictionary-encoded array without a dictionary"))
-    return getvalue(dictvaluefield(f, t), dict, checked_add(Int64(idx), Int64(1)))
+    return _dynamicchild(dictvaluefield(f, t), dict, checked_add(Int64(idx), Int64(1)))
 end
 
 function _value(t::ViewType, f::Field, d::ArrayData, i::Int64)
@@ -2286,13 +2405,410 @@ function _value(t::ListViewType, f::Field, d::ArrayData, i::Int64)
     child, cf = d.children[1], f.children[1]
     out = Vector{Any}(undef, Int(sz))
     for k = 1:Int(sz)
-        out[k] = getvalue(cf, child, checked_add(off, Int64(k)))
+        out[k] = _dynamicchild(cf, child, checked_add(off, Int64(k)))
     end
     return out
 end
 
 _value(::RunEndEncodedType, f::Field, d::ArrayData, i::Int64) =
-    getvalue(f.children[2], d.children[2], _ree_runindex(d, i))
+    _dynamicchild(f.children[2], d.children[2], _ree_runindex(d, i))
+
+# Preflight the containers allocated by one dynamic Core value. This walk uses
+# only validated offsets and scalar buffer loads. In particular, a hostile
+# FixedSizeList width is charged before the child loop starts.
+function _prechargevalue!(
+    ::Type{T},
+    t::Union{IntType,FloatType},
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    isvalid_at(d, i) || return nothing
+    T === Any && _reserveobject!(estimate, primwidth(t), "boxed numeric value")
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type{T},
+    ::Union{TimestampType,DurationType},
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    isvalid_at(d, i) || return nothing
+    T === Any && _reserveobject!(estimate, 8, "boxed temporal value")
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type{T},
+    t::DateType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    isvalid_at(d, i) || return nothing
+    T === Any && _reserveobject!(estimate, t.unit == DAY ? 4 : 8, "boxed date value")
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type{T},
+    t::TimeType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    isvalid_at(d, i) || return nothing
+    T === Any && _reserveobject!(estimate, t.bits == 32 ? 4 : 8, "boxed time value")
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type{T},
+    t::IntervalType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    isvalid_at(d, i) || return nothing
+    payload = t.unit == YEAR_MONTH ? 4 : t.unit == DAY_TIME ? 8 : 16
+    T === Any && _reserveobject!(estimate, payload, "boxed interval value")
+    return nothing
+end
+
+_prechargevalue!(
+    ::Type,
+    ::Union{BoolType,NullType},
+    ::Field,
+    ::ArrayData,
+    ::Int64,
+    estimate,
+) = nothing
+
+function _prechargevalue!(
+    ::Type{T},
+    t::DecimalType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    isvalid_at(d, i) || return nothing
+    if t.bits > 64
+        _reservevector!(estimate, UInt8, primwidth(t), "decimal value")
+    elseif T === Any
+        _reserveobject!(estimate, primwidth(t), "boxed decimal value")
+    end
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type,
+    t::FixedSizeBinaryType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+)
+    isvalid_at(d, i) || return nothing
+    _reservevector!(estimate, UInt8, t.nbytes, "fixed-size binary value")
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type,
+    t::Union{Utf8Type,BinaryType},
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+)
+    isvalid_at(d, i) || return nothing
+    lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth == 8)
+    # `_value` returns Base's singleton empty String without allocating. Keep
+    # that exact fast path out of the per-value reserve. Empty Binary values
+    # still allocate a fresh UInt8 vector and remain charged below.
+    t isa Utf8Type && hi == lo && return nothing
+    _reservevector!(estimate, UInt8, hi - lo, "binary value")
+    return nothing
+end
+
+function _prechargevalue!(::Type, t::ViewType, f::Field, d::ArrayData, i::Int64, estimate)
+    isvalid_at(d, i) || return nothing
+    len = loadat(rolebuffer(d, VIEWS), Int32, _viewbase(d, i))
+    len >= 0 || throw(ValidationError("negative view length $len"))
+    _reservevector!(estimate, UInt8, len, "view value")
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type{T},
+    t::ListType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    isvalid_at(d, i) || return nothing
+    lo, hi = _offsets_at(d, i, layoutspec(t).offsetwidth == 8)
+    _prechargelist!(T, f, d, lo, hi - lo, estimate)
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type{T},
+    t::ListViewType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    isvalid_at(d, i) || return nothing
+    off, n = _listview_range(t, d, i)
+    (off >= 0 && n >= 0) ||
+        throw(ValidationError("list-view offset and size must be non-negative"))
+    _prechargelist!(T, f, d, off, n, estimate)
+    return nothing
+end
+
+function _prechargelist!(
+    ::Type{T},
+    f::Field,
+    d::ArrayData,
+    off::Int64,
+    n::Int64,
+    estimate,
+) where {T}
+    child, cf = d.children[1], f.children[1]
+    if T === Any
+        _reservevector!(estimate, Any, n, "list value")
+        for k = 1:Int(n)
+            _prechargechild!(Any, cf, child, checked_add(off, Int64(k)), estimate)
+        end
+    else
+        CE = eltype(Base.nonmissingtype(T))
+        _reservevector!(estimate, CE, n, "typed list value")
+        for k = 1:Int(n)
+            _prechargechild!(CE, cf, child, checked_add(off, Int64(k)), estimate)
+        end
+    end
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type{T},
+    t::FixedSizeListType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    isvalid_at(d, i) || return nothing
+    child, cf = d.children[1], f.children[1]
+    base = checked_mul(_slotindex0(d, i), Int64(t.listsize))
+    if T === Any
+        CE = Any
+        _reservevector!(estimate, CE, t.listsize, "fixed-size list value")
+    else
+        CE = eltype(Base.nonmissingtype(T))
+        _reservevector!(estimate, CE, t.listsize, "typed fixed-size list value")
+    end
+    for k = 1:t.listsize
+        _prechargechild!(CE, cf, child, checked_add(base, Int64(k)), estimate)
+    end
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type{T},
+    ::StructType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    isvalid_at(d, i) || return nothing
+    E = T === Any ? Any : Base.nonmissingtype(T)
+    childindex = checked_add(d.offset, i)
+    if E === Any || E === Vector{Pair{String,Any}}
+        _reservevector!(estimate, Pair{String,Any}, length(f.children), "struct value")
+        for k in eachindex(f.children)
+            _prechargechild!(Any, f.children[k], d.children[k], childindex, estimate)
+        end
+        return nothing
+    end
+    E <: NamedTuple || return nothing
+    Base.allocatedinline(T) ||
+        _reserveobject!(estimate, sizeof(E), "boxed typed struct value")
+    _prechargetypedstruct!(E, f, d, childindex, estimate)
+    return nothing
+end
+
+@generated function _prechargetypedstruct!(
+    ::Type{E},
+    f::Field,
+    d::ArrayData,
+    childindex::Int64,
+    estimate,
+) where {E<:NamedTuple}
+    calls = Expr[
+        :(_prechargechild!(
+            $(fieldtype(E, j)),
+            f.children[$j],
+            d.children[$j],
+            childindex,
+            estimate,
+        )) for j = 1:fieldcount(E)
+    ]
+    return quote
+        $(calls...)
+        return nothing
+    end
+end
+
+function _prechargevalue!(::Type, t::MapType, f::Field, d::ArrayData, i::Int64, estimate)
+    isvalid_at(d, i) || return nothing
+    lo, hi = _offsets_at(d, i, false)
+    _reservevector!(estimate, Pair{Any,Any}, hi - lo, "map value")
+    entries, ef = d.children[1], f.children[1]
+    for k = 1:Int(hi - lo)
+        entryindex = checked_add(entries.offset, checked_add(lo, Int64(k)))
+        for j = 1:2
+            _prechargechild!(Any, ef.children[j], entries.children[j], entryindex, estimate)
+        end
+    end
+    return nothing
+end
+
+function _prechargevalue!(::Type, t::UnionType, f::Field, d::ArrayData, i::Int64, estimate)
+    cf, child, childindex = _union_child(f, d, i)
+    _prechargechild!(Any, cf, child, childindex, estimate)
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type{T},
+    t::DictionaryType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    isvalid_at(d, i) || return nothing
+    w = primwidth(t.indextype)
+    index = _load_int(rolebuffer(d, DATA), t.indextype, _slotbyteoff(d, i, w))
+    dictionary = d.dictionary
+    dictionary === nothing &&
+        throw(ValidationError("dictionary-encoded array without a dictionary"))
+    _prechargechild!(
+        T,
+        dictvaluefield(f, t),
+        dictionary,
+        checked_add(Int64(index), Int64(1)),
+        estimate,
+    )
+    return nothing
+end
+
+function _prechargevalue!(
+    ::Type{T},
+    ::RunEndEncodedType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    _prechargechild!(T, f.children[2], d.children[2], _ree_runindex(d, i), estimate)
+    return nothing
+end
+
+_prechargevalue!(::Type, ::ArrowType, ::Field, ::ArrayData, ::Int64, estimate) = nothing
+
+# Like the value path, preflight keeps leaves inline and gives recursive
+# composites one concrete compiled edge. The walk itself must not create an
+# uncharged dispatch allocation for every child it inspects.
+@inline function _prechargechild!(
+    ::Type{T},
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    1 <= i <= d.len || throw(BoundsError(d, i))
+    t = d.type
+    t isa IntType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa FloatType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa BoolType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa Utf8Type && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa BinaryType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa FixedSizeBinaryType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa TimestampType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa DateType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa TimeType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa DurationType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa DecimalType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa IntervalType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa ViewType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa NullType && return _prechargevalue!(T, t, f, d, i, estimate)
+    return _prechargechildbox!(T, f, d, i, estimate)
+end
+
+function _prechargechildbox!(
+    ::Type{T},
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    return _prechargevalue_of!(T, d.type, f, d, i, estimate)
+end
+
+@inline function _prechargevalue_of!(
+    ::Type{T},
+    t::ArrowType,
+    f::Field,
+    d::ArrayData,
+    i::Int64,
+    estimate,
+) where {T}
+    t isa IntType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa FloatType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa Utf8Type && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa BoolType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa ListType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa StructType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa DictionaryType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa TimestampType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa DateType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa TimeType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa DurationType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa BinaryType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa FixedSizeBinaryType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa FixedSizeListType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa MapType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa UnionType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa DecimalType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa IntervalType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa NullType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa ViewType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa ListViewType && return _prechargevalue!(T, t, f, d, i, estimate)
+    t isa RunEndEncodedType && return _prechargevalue!(T, t, f, d, i, estimate)
+    return _prechargevalue!(T, t, f, d, i, estimate)
+end
+
+function getvalue(f::Field, d::ArrayData, i::Integer, budget)
+    1 <= i <= d.len || throw(BoundsError(d, i))
+    estimate = _MaterializationEstimate(budget)
+    _prechargevalue_of!(Any, d.type, f, d, Int64(i), estimate)
+    _commitestimate!(estimate, "materialized value")
+    return _value_of(d.type, f, d, Int64(i))
+end
 
 """
     materialize(field, data) -> Vector
@@ -2303,6 +2819,16 @@ descriptor type it receives, so the loop body compiles per LAYOUT (a small
 closed set), never per schema.
 """
 materialize(f::Field, d::ArrayData) = _materialize_of(d.type, f, d)
+
+function materialize(f::Field, d::ArrayData, budget)
+    estimate = _MaterializationEstimate(budget)
+    _reservevector!(estimate, Any, d.len, "materialized column")
+    for i = 1:d.len
+        _prechargevalue_of!(Any, d.type, f, d, Int64(i), estimate)
+    end
+    _commitestimate!(estimate, "materialized column")
+    return materialize(f, d)
+end
 
 # The same closed-set ladder as `layoutspec_of`, for element access and the
 # materialize function barrier: generic entry devirtualizes here; per-layout
@@ -2419,6 +2945,29 @@ rules), through one typed loop per layout.
 function materialize(::Type{T}, f::Field, d::ArrayData) where {T}
     T === Any && return materialize(f, d)
     _checkclaim(T, f, d)
+    return _typedmaterialize_of(T, d.type, f, d)::Vector{T}
+end
+
+function materialize(::Type{T}, f::Field, d::ArrayData, budget) where {T}
+    T === Any && return materialize(f, d, budget)
+    _checkclaim(T, f, d)
+    estimate = _MaterializationEstimate(budget)
+    _reservevector!(estimate, T, d.len, "typed materialized column")
+    for i = 1:d.len
+        _prechargevalue_of!(T, d.type, f, d, Int64(i), estimate)
+    end
+    # Nullable fixed-width bulk extraction first builds Vector{E}, then its
+    # public Vector{Union{Missing,E}}. Account for that private scratch copy.
+    E = Base.nonmissingtype(T)
+    if Missing <: T &&
+       isbitstype(E) &&
+       d.type isa
+       Union{IntType,FloatType,TimestampType,DateType,TimeType,DurationType,DecimalType} &&
+       E === juliatype(d.type) &&
+       primwidth(d.type) == Int64(sizeof(E))
+        _reservevector!(estimate, E, d.len, "typed materialization scratch")
+    end
+    _commitestimate!(estimate, "typed materialized column")
     return _typedmaterialize_of(T, d.type, f, d)::Vector{T}
 end
 
@@ -2886,16 +3435,57 @@ end
 # loop. These are "zero-copy wrap + bitmap build" fast paths; the
 # append-oriented builder layer is the facade's.
 
+@inline function _setbitmapbit!(bytes::Vector{UInt8}, i::Int)
+    bytes[1 + ((i - 1) >> 3)] |= UInt8(1) << ((i - 1) & 7)
+    return nothing
+end
+
 function _bitmapbuffer(present::AbstractVector{Bool})
     any(!, present) || return BufferSlice()   # no nulls -> canonical empty
     bytes = zeros(UInt8, expected_validity_bytes(Int64(length(present))))
     for (i, p) in enumerate(present)
-        p && (bytes[1 + ((i - 1) >> 3)] |= UInt8(1) << ((i - 1) & 7))
+        p && _setbitmapbit!(bytes, i)
     end
     return BufferSlice(heapregion(bytes), 0, length(bytes))
 end
 
 _databuffer(v::Vector{T}) where {T} = BufferSlice(heapregion(v), 0, sizeof(v))
+
+"Build Boolean data and validity buffers directly in Arrow's bit-packed form."
+function _build_bool(name, v::Vector{T}; nullable::Bool) where {T<:Union{Missing,Bool}}
+    bytes = zeros(UInt8, expected_validity_bytes(Int64(length(v))))
+    nc = 0
+    for (i, x) in enumerate(v)
+        if x === missing
+            nc += 1
+        elseif x
+            _setbitmapbit!(bytes, i)
+        end
+    end
+
+    validity = if nc == 0
+        BufferSlice()
+    else
+        validbytes = zeros(UInt8, length(bytes))
+        for (i, x) in enumerate(v)
+            x === missing || _setbitmapbit!(validbytes, i)
+        end
+        _databuffer(validbytes)
+    end
+    t = BoolType()
+    return Field(name, t; nullable=nullable),
+    ArrayData(t, length(v), [validity, _databuffer(bytes)]; nullcount=nc)
+end
+
+"Build non-null Boolean data through a caller-supplied direct bit fill."
+function _build_bool(name, len::Int, fillbits!::F; nullable::Bool) where {F}
+    len >= 0 || throw(ArgumentError("Boolean array length is negative"))
+    bytes = zeros(UInt8, expected_validity_bytes(Int64(len)))
+    fillbits!(bytes)
+    t = BoolType()
+    return Field(name, t; nullable=nullable),
+    ArrayData(t, len, [BufferSlice(), _databuffer(bytes)]; nullcount=0)
+end
 
 arrowtype_for(::Type{Bool}) = BoolType()
 arrowtype_for(::Type{T}) where {T<:Signed} = IntType(8 * sizeof(T), true)
@@ -2926,13 +3516,7 @@ function fromjulia(name, v::Vector{T}) where {T}
         return Field(name, t; nullable=false),
         ArrayData(t, length(v), [BufferSlice(), _databuffer(v)]; nullcount=0)
     elseif T == Bool
-        # Bit-packed through the nullable builder; the DECLARED nullability
-        # is the input's (a plain Vector{Bool} is a non-nullable column).
-        return _build_nullable_primitive(
-            name,
-            convert(Vector{Union{Bool,Missing}}, v);
-            nullable=false,
-        )
+        return _build_bool(name, v; nullable=false)
     elseif T == String
         return _build_strings(name, v)
     elseif T <: Union{
@@ -2967,20 +3551,12 @@ function _build_nullable_primitive(name, v::Vector{T}; nullable::Bool=true) wher
         return Field(name, t; nullable=true),
         ArrayData(t, length(v), BufferSlice[]; nullcount=length(v))
     end
+    S === Bool && return _build_bool(name, v; nullable=nullable)
     t = arrowtype_for(S)
     present = [x !== missing for x in v]
     validity = _bitmapbuffer(present)
-    if S == Bool
-        bytes = zeros(UInt8, expected_validity_bytes(Int64(length(v))))
-        for (i, x) in enumerate(v)
-            (x === missing || !x) && continue
-            bytes[1 + ((i - 1) >> 3)] |= UInt8(1) << ((i - 1) & 7)
-        end
-        data = BufferSlice(heapregion(bytes), 0, length(bytes))
-    else
-        vals = S[x === missing ? zero(S) : S(x) for x in v]
-        data = _databuffer(vals)
-    end
+    vals = S[x === missing ? zero(S) : S(x) for x in v]
+    data = _databuffer(vals)
     nc = count(!, present)
     # Nullability is the DECLARED element type's, not the observed count's:
     # a Union{Missing,T} column with no missing values is still nullable.

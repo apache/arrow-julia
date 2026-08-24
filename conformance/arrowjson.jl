@@ -254,7 +254,32 @@ end
 _decimalint(s, bits) =
     bits == 32 ? Int32(parse(Int128, s)) :
     bits == 64 ? Int64(parse(Int128, s)) :
-    bits == 128 ? parse(Int128, s) : error("decimal256 values are not implemented")
+    bits == 128 ? parse(Int128, s) : error("unsupported decimal width $bits")
+
+function _decimal256bytes(s::AbstractString)
+    value = parse(BigInt, s)
+    half = BigInt(1) << 255
+    -half <= value < half ||
+        throw(ArgumentError("decimal256 value is outside the signed 256-bit range: $s"))
+    unsigned = value < 0 ? value + (BigInt(1) << 256) : value
+    bytes = Vector{UInt8}(undef, 32)
+    for i = 1:32
+        bytes[i] = UInt8(unsigned & 0xff)
+        unsigned >>= 8
+    end
+    return bytes
+end
+
+function _decimal256value(bytes::AbstractVector{UInt8})
+    length(bytes) == 32 ||
+        throw(ArgumentError("a decimal256 value must contain exactly 32 bytes"))
+    value = BigInt(0)
+    for byte in Iterators.reverse(bytes)
+        value = (value << 8) | byte
+    end
+    (bytes[end] & 0x80) == 0 || (value -= BigInt(1) << 256)
+    return value
+end
 
 """
 Build one Core `ArrayData` from a JSON column. `f` supplies the layout;
@@ -299,8 +324,17 @@ function fromjsoncolumn(
             Float64[Float64(x) for x in data]
         return ArrayData(t, n, [validity, AC._databuffer(vals)]; nullcount=nulls)
     elseif t isa DecimalType
-        vals = [_decimalint(String(x), t.bits) for x in data]
-        raw = t.bits == 32 ? Int32.(vals) : t.bits == 64 ? Int64.(vals) : Int128.(vals)
+        raw = if t.bits == 256
+            bytes = UInt8[]
+            sizehint!(bytes, 32 * length(data))
+            for value in data
+                append!(bytes, _decimal256bytes(String(value)))
+            end
+            bytes
+        else
+            vals = [_decimalint(String(x), t.bits) for x in data]
+            t.bits == 32 ? Int32.(vals) : t.bits == 64 ? Int64.(vals) : Int128.(vals)
+        end
         return ArrayData(t, n, [validity, AC._databuffer(raw)]; nullcount=nulls)
     elseif t isa DateType
         vals =
@@ -481,10 +515,19 @@ function tojsoncolumn(f::Field, d::ArrayData)
             t.bits == 16 ? Float64.(_rawvals(d, Float16)) :
             t.bits == 32 ? _rawvals(d, Float32) : _rawvals(d, Float64)
     elseif t isa DecimalType
-        vals =
+        vals = if t.bits == 256
+            buffer = AC.rolebuffer(d, AC.DATA)
+            [
+                _decimal256value(
+                    AC.slicebytes(
+                        AC.subslice(buffer, AC._slotbyteoff(d, Int64(i), 32), 32),
+                    ),
+                ) for i = 1:n
+            ]
+        else
             t.bits == 32 ? _rawvals(d, Int32) :
-            t.bits == 64 ? _rawvals(d, Int64) :
-            t.bits == 128 ? _rawvals(d, Int128) : error("decimal256 is not implemented")
+            t.bits == 64 ? _rawvals(d, Int64) : _rawvals(d, Int128)
+        end
         col["DATA"] = string.(vals)
     elseif t isa DateType
         col["DATA"] = t.unit == AC.DAY ? _rawvals(d, Int32) : string.(_rawvals(d, Int64))
@@ -630,6 +673,14 @@ them; the returned `dictids` maps each dictionary-typed Field to its JSON id
 for writers that must preserve ids.
 """
 function fromjson(doc::AbstractDict)
+    sch, batches, dictids, _ = _fromjson(doc)
+    return sch, batches, dictids
+end
+
+# Internal form used by the value comparator. The dictionary arrays are part
+# of the logical document even when no batch index currently references every
+# pool value, so the comparator must retain them separately from the batches.
+function _fromjson(doc::AbstractDict)
     dictids = IdDict{Field,Int64}()
     fields = Field[fromjsonfield(f, dictids) for f in doc["schema"]["fields"]]
     sch = Schema(
@@ -674,7 +725,7 @@ function fromjson(doc::AbstractDict)
         ]
         push!(batches, AC.RecordBatch(sch, cols, Int(b["count"])))
     end
-    return sch, batches, dictids
+    return sch, batches, dictids, dicts
 end
 
 """

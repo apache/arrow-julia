@@ -40,7 +40,7 @@ Pkg.add(url="https://github.com/JuliaData/Tables.jl",
 ```
 
 ```julia
-using Arrow, Tables, DataAPI
+using Arrow, Tables
 
 Arrow.write("data.arrow", (a = [1, 2, 3], b = ["x", "y", missing]))
 tbl = Arrow.Table("data.arrow")
@@ -101,7 +101,9 @@ rm("data.arrow")
 
 `release!` is idempotent. Because a `Table`'s columns are copies, a released
 `Table` remains fully usable; a released [`Arrow.Stream`](@ref) refuses
-further iteration cleanly.
+further iteration cleanly. Every yielded `Table` shares the source lifetime:
+releasing a batch closes its parent `Stream`, while the batch's materialized
+columns remain usable.
 
 ### `Arrow.Stream`
 
@@ -125,7 +127,18 @@ pass a path to a file-format source) avoids holding the whole source —
 batches are decoded from the mapping one at a time, so a consumer's loop
 over such a `Stream` holds one batch of columns at a time (plus the file's
 dictionaries), and that is the way to process a file larger than RAM. A
-**stream-format** source is read to the end and every batch is decoded when
+`Stream` security budget (the `max_total_allocated_bytes` field of
+[`Arrow.Limits`](@ref)) stays cumulative across every batch it yields, even
+after the consumer drops that batch. Raise the limit explicitly for a trusted
+large file whose total decoded allocation exceeds the default; the same
+`limits` keyword applies to [`Arrow.Table`](@ref):
+
+```julia
+trusted_limits = Arrow.Limits(max_total_allocated_bytes = 2 * 1024^3)
+stream = Arrow.Stream("big.arrow"; limits = trusted_limits)
+```
+
+A **stream-format** source is read to the end and every batch is decoded when
 the `Stream` is constructed. A file-format `IO` or byte-vector input is
 also read to the end (the whole source is held in memory), but its record
 batches are still decoded lazily, one per iteration. `Arrow.write`
@@ -136,13 +149,29 @@ materializes every partition before writing (see
 
 Schema-level and per-column key/value metadata carried in the IPC schema is
 readable through the [DataAPI.jl](https://github.com/JuliaData/DataAPI.jl)
-metadata interface:
+metadata interface. Code that imports DataAPI must add it as a direct
+dependency:
 
 ```julia
-DataAPI.metadatakeys(tbl)
-DataAPI.metadata(tbl, "key")
-DataAPI.colmetadatakeys(tbl, :a)
-DataAPI.colmetadata(tbl, :a, "key")
+import Pkg
+Pkg.add("DataAPI")
+```
+
+```@example metadata_api
+using Arrow, DataAPI
+
+io = IOBuffer()
+Arrow.write(io, (a = [1, 2],);
+    metadata = ["source" => "docs"],
+    colmetadata = Dict(:a => ["unit" => "count"]))
+metadata_table = Arrow.Table(take!(io))
+
+(
+    schema_keys = collect(DataAPI.metadatakeys(metadata_table)),
+    source = DataAPI.metadata(metadata_table, "source"),
+    column_keys = collect(DataAPI.colmetadatakeys(metadata_table, :a)),
+    unit = DataAPI.colmetadata(metadata_table, :a, "unit"),
+)
 ```
 
 Arrow IPC permits duplicate field names. Use integer column positions for
@@ -229,9 +258,10 @@ tbl = Arrow.Table("orders.arrow"; scan = scan)
 
 * `select`: a reference or tuple of select items (`ref`, `ref => name`,
   `ref => Type`, `ref => Type => name`; refs are `Symbol`, `String`, `Int`,
-  `Regex`, `Tables.Not`, `Tables.All`). Only the selected columns (and the
-  columns the filter references) are decoded; everything else is skipped
-  without being sliced, decompressed, or validated.
+  `Regex`, `Tables.Not`, `Tables.All`). Only the selected columns and the
+  columns the filter references are decoded. For every decoded batch, complete
+  node and buffer metadata is validated first. Other columns' body buffers are
+  not sliced, decompressed, content-validated, or materialized.
 * `filter`: an expression over `Tables.col` — comparisons against literals
   (`>`, `>=`, `<`, `<=`, `colcmp`), `colin`, `isnull`, string
   predicates, combined with `&`, `|`, `!`. A row is kept iff the predicate
@@ -239,17 +269,22 @@ tbl = Arrow.Table("orders.arrow"; scan = scan)
 * `limit`/`offset`: applied to qualifying rows.
 
 On the file format, batches whose footer statistics prove no row can match
-the filter are never fetched or decoded; the filter is evaluated batch by
-batch and `limit`/`offset` compose exactly over the qualifying rows, so
-without a filter whole batches outside the window are never decoded, and
-with one decoding stops as soon as the window is full. On the stream format
+receive no dedicated metadata or body request and are not decoded; the filter
+is evaluated batch by batch and `limit`/`offset` compose exactly over the
+qualifying rows. Without a filter, whole batches outside the window are never
+decoded, and with one decoding stops as soon as the window is full. On the stream format
 the scan is applied after decode with identical results. A scan whose filter
-literal has no exact storage representation (a cross-domain or out-of-range
-value) falls back to reading the whole source and evaluating over the
-converted public values. Temporal membership lowers for Tuple and Array
-values. Set members lower only when they already have the column's canonical
+has no semantics-preserving storage representation falls back to
+reading the whole source and evaluating over converted public values. This
+includes an inexact literal and a temporal conversion that aliases values or
+wraps ordering. Date64 and millisecond Timestamp equality can lower, but their
+ordered comparisons stay public; Timestamp-second and Time predicates also
+stay public. Duration lowering accepts a literal in the column unit or a
+coarser fixed unit, but a finer unit stays public because Julia can overflow
+while promoting stored values. Temporal Tuple and Array membership follows
+the same equality rules. Set members must also have the column's canonical
 public type, which preserves `isequal` and hashing. A custom membership object
-falls back because Arrow cannot transform it without changing its `in`
+stays public because Arrow cannot transform it without changing its `in`
 semantics. An empty projection (`select = ()`) stays on the ranged path. It
 preserves the selected row count without fetching output column bodies.
 
@@ -274,11 +309,16 @@ over HTTP, or from a local file it prefers not to map whole — needs only
 the ranges its scan touches. [`Arrow.AbstractArrowSource`](@ref) is that
 contract: a byte-addressable object of known length, read through
 [`Arrow.sourcelength`](@ref) and [`Arrow.readrange`](@ref). Given one,
-`Arrow.Table` with a scan fetches the footer from one tail read, keeps only
-the batches the footer's statistics and the scan's window allow, fetches
-those batches' metadata, and then fetches exactly the buffers of the
-selected (and filter-referenced) columns, coalesced into a few range reads:
-three rounds of requests, however many columns and batches the file holds.
+`Arrow.Table` with a scan first fetches and caches a tail window. That window
+normally contains the complete Footer. If it does not, one exact cached
+follow-up fetch retrieves the Footer. The reader then keeps only the batches
+that the Footer's statistics and the scan's window allow, fetches those
+batches' metadata, and requests ranges that cover the selected and
+filter-referenced buffers. The common path has three sequential request rounds:
+tail/Footer, metadata, and body. An oversized Footer adds a fourth round. Each
+metadata or body round can contain multiple coalesced requests, which a
+concurrent source can issue in parallel. Tail reads and coalescing may
+physically over-read unrequested bytes.
 
 With [CloudStore.jl](https://github.com/JuliaServices/CloudStore.jl)
 loaded, a `CloudStore.Object` (S3 or Azure Blob Storage) is such a source
@@ -303,9 +343,12 @@ Arrow.readrange(s::HTTPSource, offset, len) = fetchbytes(s.url, offset, len)  # 
 tbl = Arrow.Table(HTTPSource(url, objectsize); scan = Scan(select = (:id,)))
 ```
 
-Overriding [`Arrow.concurrentreads`](@ref) lets Arrow issue a round's
-planned ranges concurrently through `readrange` (up to that many at a
-time, results placed by request); the default reads them one at a time.
+Overriding [`Arrow.concurrentreads`](@ref) lets Arrow issue planned ranges
+concurrently through `readrange`. One reader samples that value once, clamps
+it by the `max_concurrent_reads` field of [`Arrow.Limits`](@ref), and shares
+the cap across all operations on that read. Separate reads are
+independent; enforce a transport-wide cap inside `readrange` when required.
+Results are placed by request, and the default reads one at a time.
 Without a scan the whole object is read, as is a stream-format object (no
 footer) and a scan that cannot be pushed down. Arrow.jl has no HTTP or
 cloud dependency of its own.
@@ -342,8 +385,8 @@ IPC compression.
 ### Dictionary encoding
 
 Wrap a column in [`Arrow.DictEncode`](@ref) to write it dictionary-encoded
-(a pool of unique values plus integer indices), which is what a
-categorical or low-cardinality string column wants:
+(a category pool plus integer indices), which is what a categorical or
+low-cardinality string column wants:
 
 ```julia
 Arrow.write("out.arrow", (region = Arrow.DictEncode(regions), sales = sales))
@@ -351,7 +394,10 @@ Arrow.write("out.arrow", (region = Arrow.DictEncode(regions), sales = sales))
 
 Reading a dictionary-encoded column resolves the indices: the column comes
 back as its value type. When a `Table` read from Arrow is written again,
-its dictionary encoding is preserved.
+its dictionary encoding is preserved. Fresh `DictEncode` output coalesces
+categories by exact Arrow storage identity. A retained rewrite preserves the
+source pool prefix, including unused or duplicate physical categories, because
+pool order and index meaning are part of the encoded data.
 
 ### Type mapping when writing
 
@@ -372,7 +418,22 @@ can appear at any nesting depth — is:
 The dense Union mapping applies to freshly supplied Julia data. Each member
 uses the same recursive core or ArrowTypes.jl mapping that it would use at
 that nesting depth. A `Missing` member is represented by a Null child. A
-Union may have at most 128 declared members.
+Union may have at most 32 declared members.
+
+An abstract or `Any` element type does not declare those member types. When
+Arrow.jl must infer writer or storage types from runtime values, it accepts at
+most 8 distinct types across the complete column and all of its partitions.
+This rule includes abstract ArrowTypes.jl storage, dictionary pools, and
+retained registered ArrowTypes.jl columns. Use an explicit declared `Union`
+when a column intentionally has more types. This separate limit bounds
+schema-planning and compiler work for runtime-generated parametric types; it
+does not reduce the 32-member declared Union limit.
+
+If an abstract declaration has no `ArrowType` mapping or extension identity of
+its own, Arrow uses its observed concrete subtypes as writer evidence. This
+keeps a concrete subtype's extension metadata. Multiple observed subtypes form
+an explicit Union under the same 8-type inference limit. An empty abstract
+column still needs declared schema evidence because it has no runtime subtype.
 
 At the *top level* of a column the facade adds:
 
@@ -383,34 +444,62 @@ At the *top level* of a column the facade adds:
 | `Dates.DateTime` | Timestamp (millisecond) |
 | `Dates.Time` | Time64 (nanosecond) |
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
-| `NamedTuple` whose fields are core columns | Struct (no top-level nulls — wrap fields as nullable children instead) |
+| `NamedTuple` whose fields are core columns | Struct; `Union{Missing, T}` adds parent validity while child nullability stays declared |
 | `Arrow.DictEncode` over a writable column | Dictionary of the recursive mapping of its values |
 | `ArrowStrings.StringVector` | Utf8View, **zero-copy** — the column's memory is the Arrow array (see below) |
 
-These native facade conversions do not recurse: a `Vector{Date}` inside a
-list, a `Date` or `SubString` field of a `NamedTuple`, or `DictEncode` over
-dates are refused with an `ArgumentError` naming the element type. The
-ArrowTypes.jl mappings described below do recurse. A column with element type
-`Any` is narrowed once (recovering list columns of a common element type) and
-refused if it cannot be narrowed to a writable type.
+These native facade conversions do not recurse through list or struct shapes:
+a `Vector{Date}` inside a list, or a `Date` or `SubString` field of a
+`NamedTuple`, is refused with an `ArgumentError` naming the element type. A
+top-level `DictEncode` pool uses the same native column mapping as an ordinary
+top-level column. The ArrowTypes.jl mappings described below do recurse. A
+column with element type `Any` is narrowed once (recovering list columns of a
+common element type) and refused if it cannot be narrowed to a writable type.
 When the source is an `Arrow.Table` or `Arrow.Stream`, the writer retains the
 compatible Arrow descriptor tree. Temporal units, byte and list widths,
 Struct, Map, Run-End Encoding, nullability, field metadata, schema metadata,
 and top-level dictionary index types and category order survive a read/write
 round trip. Buffer sharing, overlapping ListView ranges, and exact run
 segmentation are rebuilt into a canonical form without changing logical
-values.
+values. A retained Map that declares sorted keys is rewritten only when each
+row remains sorted.
 
 A fresh Julia column with a heterogeneous declared `Union` element type is
 synthesized as a canonical dense Arrow Union. This is distinct from rewriting
-a retained Union. Once an Arrow Union is materialized, its original child type
-IDs and offsets are no longer present in the Julia values. Writing that
-retained Union from an `Arrow.Table` fails with a clear `ArgumentError` instead
-of inventing new routing under the old schema. A nested dictionary has the
-same fail-closed rule because its pool is not retained. Top-level dictionaries,
-including dictionaries of composite values, are retained on a full read. A
-scan result may not carry the hidden source pool; an ordered dictionary then
-fails instead of inventing category order.
+a retained Union. Once an unregistered Arrow Union is materialized, its
+original child type IDs and offsets are no longer present in the Julia values.
+Writing that retained Union from an `Arrow.Table` fails with a clear
+`ArgumentError` instead of inventing new routing under the old schema.
+
+A registered ArrowTypes.jl target is different. Its public-domain values keep
+writer-side type evidence. When that type lowers to Union storage, Arrow.jl can
+route each value back through the retained children and preserve external child
+order, labels, type IDs, dense or sparse mode, nullability, and metadata. Sparse
+children use canonical hidden placeholder values outside their active rows.
+This also works when `JuliaType` returns an abstract read target and concrete
+writer subtypes provide the storage mapping. A concrete subtype may omit an
+extension identity or use the retained parent's identity. A different explicit
+extension name or metadata is rejected instead of being silently relabeled. An
+outer missing value uses a separate unmarked Null child.
+If the logical storage Union already contains `Missing`, adding an outer missing
+state is rejected because Arrow cannot distinguish the two states.
+
+Registered values can also rebuild compatible retained storage descriptors.
+This includes binary and binary-view widths, fixed-size binary, list and
+fixed-size-list layouts, date and duration units, wide decimals, and interval
+layouts. The retained descriptor remains authoritative. Byte widths, list
+sizes, temporal exactness, child fields, and interval storage shapes are
+checked before output is written. Concrete declared element types provide the
+same schema evidence for empty and typed all-missing columns, so those columns
+cannot bypass retained-schema checks.
+
+A nested dictionary has the same fail-closed rule as an unregistered Union
+because its pool is not retained. Top-level dictionaries, including
+dictionaries of composite values, are retained on a full read. A scan result
+may not carry the hidden source pool; an ordered dictionary then fails instead
+of inventing category order. A nullable `Dictionary<Null>` with an unknown
+extension also fails closed: after materialization, `missing` cannot say whether
+the source row was a valid index into the Null pool or a null dictionary index.
 
 ### Custom and extension types
 
@@ -424,7 +513,8 @@ Define `ArrowType` and `toarrow` to lower a custom value to a supported storage
 type. Define an extension name and the read hooks when the logical type must
 round-trip:
 
-```julia
+```@example arrowtypes_account_id
+using Arrow
 import ArrowTypes
 
 struct AccountID
@@ -442,7 +532,9 @@ ArrowTypes.fromarrow(::Type{AccountID}, value::Int64) = AccountID(value)
 io = IOBuffer()
 Arrow.write(io, (id = AccountID.(1:3),); file = false)
 table = Arrow.Table(take!(io))
-getfield.(table.id, :value) == [1, 2, 3] # true
+values = getfield.(table.id, :value)
+@assert values == [1, 2, 3]
+values
 ```
 
 Arrow applies `ArrowType` and `toarrow` recursively to top-level values and to
@@ -459,6 +551,46 @@ Use the lowering interface to select a different stable storage
 representation. An `ArrowKind` override alone does not select an arbitrary
 Arrow 3.0 physical layout.
 
+Arrow does not intern an unknown on-wire extension name merely to probe
+`JuliaType(Val(...))`. It dispatches only when that name is already a Julia
+`Symbol`. Unsupported-name warnings are deduplicated by the complete extension
+label. Each table materialization emits at most one warning for each of 16
+distinct labels, then one suppression notice for further distinct labels. A
+warning shows at most 128 UTF-8 bytes of its label. The built-in
+`JuliaLang.Symbol` mapping also lifts only a payload that is already interned. A
+novel payload produces `ValidationError` instead of adding permanent
+process-global symbol state.
+
+Recursive custom storage schemas and recursive value containers are rejected
+with `ArgumentError`. Custom mappings may nest to 64 levels. Deeper mappings
+are rejected before the writer can recurse without a bound.
+
+Arrow also bounds exact Julia type construction for composite descriptors.
+It passes the exact `NTuple{N,T}` storage type to `JuliaType` when `N` is at
+most 1024. For a larger fixed-size-list descriptor, it passes the compact
+`Tuple{Vararg{T}}` family instead. Generic registrations still resolve. A
+registration that requires the exact oversized arity remains unknown, so Arrow
+returns ordinary storage values. An extension-labelled Struct receives its
+exact `NamedTuple` storage signature through 1024 children only when its child
+names are unique, contain no embedded NUL, already exist as Julia `Symbol`s,
+are at most 4096 UTF-8 bytes each, and use at most 64 KiB in total. Otherwise
+the labelled Struct remains an unknown extension and reads as ordered `Pair`
+storage. One bounded compatibility exception preserves ArrowTypes.jl Tuple
+storage: when the complete child-name sequence is exactly `"1"`, `"2"`, …,
+`string(N)` for `N ≤ 1024`, Arrow may intern only that fixed finite set of
+positional names. The exception does not apply to an unknown extension label or
+to arbitrary or partly positional Struct names.
+If writer-side `ArrowType` resolution returns a concrete tuple with more than
+1024 fields, the writer rejects that storage type before specializing on it.
+This also applies to ArrowTypes.jl's default mapping for a tuple value. Custom
+trait code still runs as ordinary trusted Julia code; Arrow cannot recover if
+the hook crashes while it constructs its return value.
+
+Retained composite rows hidden by a nullable ancestor are constructed from the
+retained Field and the required logical length. Arrow does not manufacture a
+Julia object for every hidden child slot. This keeps Null-only fixed-size-list
+and inactive sparse-Union storage bounded by the bytes the output requires.
+
 ### ArrowStrings columns
 
 [ArrowStrings.jl](https://github.com/apache/arrow-julia/tree/main/src/ArrowStrings)
@@ -473,15 +605,34 @@ materializing a `String`.
 
 ## Validation
 
-Every batch is validated before it is exposed by a read or emitted by a
-write: buffer arity and byte lengths against the schema (structural), and
-offset monotonicity, dictionary index domains, union type ids and the other
+Every batch decoded by a read, and every batch emitted by a write, is validated:
+buffer arity and byte lengths against the schema (structural), and offset
+monotonicity, dictionary index domains, union type ids, and the other
 data-intrinsic invariants (semantic). Metadata is verified by a generated
-FlatBuffers shape verifier before any of it is used, and resource limits
-(metadata size, body size, allocation budget, nesting depth) are enforced
-before any metadata-directed allocation, so a corrupt or hostile file
-produces a clean `ValidationError` rather than a crash or an unbounded
-allocation.
+FlatBuffers shape verifier before any of it is used. Resource limits (metadata
+size, body size, allocation budget, nesting depth) are enforced before any
+metadata-directed or package-controlled read-facade allocation. The one
+cumulative budget covers byte-range fetch and assembly, IPC decode, Core and
+ArrowTypes containers, scan slices and joins, and final table columns. Custom
+user hook allocations remain the hook author's responsibility. Vector
+reserves include a conservative backing-store capacity, not only the logical
+element payload, because supported Julia versions can round that capacity to
+the next allocation class.
+
+Core schema field and child names remain `String` values and are not interned.
+The Tables.jl facade is the explicit `Symbol` boundary because Tables column
+names are Symbols. Before it interns any novel top-level field name, Arrow
+preflights the complete schema: each name is at most 4096 UTF-8 bytes, one table
+materialization may add at most 65,536 novel names, and their combined UTF-8
+size is at most 1 MiB. A schema outside those limits produces
+`ValidationError` without partially interning its novel names.
+
+A ranged scan validates the Footer's complete Block index up front and the
+complete node and buffer metadata for every statistics-surviving record before
+it requests body ranges. It does not request or decode statistics-pruned record
+metadata or skipped body content. Corrupt or hostile input that reaches these
+validation stages produces a clean `ValidationError` rather than a crash or an
+unbounded allocation.
 
 Content-policy checks that the reference implementation treats as
 advisory — UTF-8 well-formedness of string bytes, the `nullable=false`
@@ -543,10 +694,11 @@ type descriptors are runtime values, layout dispatch goes through closed
 import/export, and the typed accessors `Arrow.ArrowCore.materialize(::Type{T},
 field, data)`) are statically resolvable. The repository's
 `test/trim_compile_tests.jl` gate holds that at zero verifier errors and
-warnings. Arrow.jl itself supports Julia 1.10 and later; JuliaC's `--trim`
-needs Julia 1.12, so the gate runs only there. The dynamic facade
-conveniences (property access on `Arrow.Table`, `NamedTuple` rows) are not
-part of that guarantee.
+warnings. The same gate exercises ArrowStrings construction, inline and view
+access, missing values, comparison, and materialization. Arrow.jl itself
+supports Julia 1.10 and later; JuliaC's `--trim` needs Julia 1.12, so the gate
+runs only there. The dynamic facade conveniences (property access on
+`Arrow.Table`, `NamedTuple` rows) are not part of that guarantee.
 
 ## Updating from Arrow.jl 2.x
 

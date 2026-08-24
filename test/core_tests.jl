@@ -31,6 +31,8 @@ using Arrow
 using Arrow.ArrowCore
 const AC = ArrowCore
 
+@noinline _build_bool_probe(v) = AC.fromjulia("b", v)
+
 struct ManagedLoad
     value::Any
 end
@@ -1913,11 +1915,30 @@ end
         @test getvalue(Union{Missing,String}, fs, ds, 1) == "a"
         fb, db = fromjulia("b", [true, false])
         @test materialize(Bool, fb, db) == [true, false]
-        # A plain Vector{Bool} is a NON-nullable column (bit-packed through
-        # the nullable builder, but the declaration is the input's).
+        # A plain Vector{Bool} is packed directly and remains non-nullable.
         @test !fb.nullable
         @test nullcount(db) == 0
         @test fromjulia("bm", [true, missing])[1].nullable
+
+        packedlen = 1_000_000
+        packedbytes = cld(packedlen, 8)
+        plainbools = Bool[isodd(i) for i = 1:packedlen]
+        nullablebools =
+            Union{Missing,Bool}[i == packedlen ? missing : isodd(i) for i = 1:packedlen]
+        _build_bool_probe(plainbools)
+        _build_bool_probe(nullablebools)
+        GC.gc()
+        plainallocation = @allocated _build_bool_probe(plainbools)
+        GC.gc()
+        nullableallocation = @allocated _build_bool_probe(nullablebools)
+        @test plainallocation <= packedbytes + 256 * 1024
+        @test nullableallocation <= 2 * packedbytes + 256 * 1024
+        _, plainbooldata = _build_bool_probe(plainbools)
+        _, nullablebooldata = _build_bool_probe(nullablebools)
+        @test plainbooldata.buffers[1].len == 0
+        @test plainbooldata.buffers[2].len == packedbytes
+        @test nullablebooldata.buffers[1].len == packedbytes
+        @test nullablebooldata.buffers[2].len == packedbytes
         # lists recurse the claim
         fl, dl = fromjulia("l", [Int64[1, 2], Int64[]])
         @test getvalue(Vector{Int64}, fl, dl, 1) == [1, 2]
@@ -2063,6 +2084,161 @@ end
         # so this suite's own inference cannot mask a regression).
         @test success(
             `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $(joinpath(@__DIR__, "typed_alloc_child.jl"))`,
+        )
+    end
+
+    @testset "exact materialization budgets" begin
+        vectorbytes(T, n) = AC._materializedvectorbytes(T, n)
+        objectbytes(n) = AC._materializedobjectbytes(n)
+
+        # Julia 1.11+ can round a 4097-element Memory backing store to 8192
+        # elements. The common reserve must cover the real warm allocation,
+        # not only the logical payload.
+        @noinline vectorprobe() = Vector{Int64}(undef, 4097)
+        vectorprobe()
+        @test vectorbytes(Int64, 4097) >= @allocated vectorprobe()
+        @noinline emptyvectorprobe() = UInt8[]
+        emptyvectorprobe()
+        @test vectorbytes(UInt8, 0) == 64
+        @test vectorbytes(UInt8, 0) >= @allocated emptyvectorprobe()
+
+        function exactbudget(read, needed)
+            short = Arrow.AllocationBudget(needed - 1)
+            before = Arrow._remaining(short)
+            @test_throws Arrow.AllocationLimitError read(short)
+            @test Arrow._remaining(short) == before
+            exact = Arrow.AllocationBudget(needed)
+            value = read(exact)
+            @test Arrow._remaining(exact) == 0
+            return value
+        end
+
+        f, d = fromjulia("x", Int64[1, 2, 3, 4])
+        dynamicneed = vectorbytes(Any, d.len) + d.len * objectbytes(sizeof(Int64))
+        @test exactbudget(b -> materialize(f, d, b), dynamicneed) == Any[1, 2, 3, 4]
+        typedneed = vectorbytes(Int64, d.len)
+        @test exactbudget(b -> materialize(Int64, f, d, b), typedneed) == Int64[1, 2, 3, 4]
+
+        emptyutf8field, emptyutf8data = fromjulia("s", String["", "", ""])
+        emptyutf8need = vectorbytes(Any, emptyutf8data.len)
+        @test exactbudget(
+            b -> materialize(emptyutf8field, emptyutf8data, b),
+            emptyutf8need,
+        ) == Any["", "", ""]
+
+        emptybinarytype = BinaryType(false)
+        emptybinaryfield = Field("b", emptybinarytype; nullable=false)
+        emptybinarydata = AC.ArrayData(
+            emptybinarytype,
+            3,
+            [BufferSlice(), AC._databuffer(Int32[0, 0, 0, 0]), AC._databuffer(UInt8[])];
+            nullcount=0,
+        )
+        emptybinaryneed = vectorbytes(Any, 3) + 3 * vectorbytes(UInt8, 0)
+        @test exactbudget(
+            b -> materialize(emptybinaryfield, emptybinarydata, b),
+            emptybinaryneed,
+        ) == Any[UInt8[], UInt8[], UInt8[]]
+
+        emptylistfield, emptylistdata =
+            fromjulia("list", Vector{Int64}[Int64[], Int64[], Int64[]])
+        emptylistneed = vectorbytes(Any, 3) + 3 * vectorbytes(Any, 0)
+        @test exactbudget(
+            b -> materialize(emptylistfield, emptylistdata, b),
+            emptylistneed,
+        ) == Any[Any[], Any[], Any[]]
+
+        emptykeyfield, emptykeydata = fromjulia("key", String[])
+        emptyvaluefield, emptyvaluedata = fromjulia("value", Int64[])
+        emptyentriesfield = Field(
+            "entries",
+            StructType();
+            nullable=false,
+            children=[emptykeyfield, emptyvaluefield],
+        )
+        emptyentriesdata = AC.ArrayData(
+            StructType(),
+            0,
+            [BufferSlice()];
+            children=[emptykeydata, emptyvaluedata],
+            nullcount=0,
+        )
+        emptymaptype = MapType(false)
+        emptymapfield =
+            Field("map", emptymaptype; nullable=false, children=[emptyentriesfield])
+        emptymapdata = AC.ArrayData(
+            emptymaptype,
+            3,
+            [BufferSlice(), AC._databuffer(Int32[0, 0, 0, 0])];
+            children=[emptyentriesdata],
+            nullcount=0,
+        )
+        emptymapneed = vectorbytes(Any, 3) + 3 * vectorbytes(Pair{Any,Any}, 0)
+        @test exactbudget(b -> materialize(emptymapfield, emptymapdata, b), emptymapneed) ==
+              Any[Pair{Any,Any}[], Pair{Any,Any}[], Pair{Any,Any}[]]
+
+        nf, nd = fromjulia("nullable", Union{Missing,Int64}[1, missing, 3, missing])
+        nullabledynamic = vectorbytes(Any, nd.len) + 2 * objectbytes(sizeof(Int64))
+        @test isequal(
+            exactbudget(b -> materialize(nf, nd, b), nullabledynamic),
+            Any[1, missing, 3, missing],
+        )
+        NT = Union{Missing,Int64}
+        nullabletyped = vectorbytes(NT, nd.len) + vectorbytes(Int64, nd.len)
+        @test isequal(
+            exactbudget(b -> materialize(NT, nf, nd, b), nullabletyped),
+            NT[1, missing, 3, missing],
+        )
+
+        intervaltype = IntervalType(AC.MONTH_DAY_NANO)
+        intervals = [
+            (months=Int32(1), days=Int32(2), nanos=Int64(3)),
+            (months=Int32(4), days=Int32(5), nanos=Int64(6)),
+        ]
+        intervalfield = Field("i", intervaltype; nullable=false)
+        intervaldata = AC.ArrayData(
+            intervaltype,
+            length(intervals),
+            [BufferSlice(), AC._databuffer(intervals)],
+        )
+        intervalneed =
+            vectorbytes(Any, length(intervals)) + length(intervals) * objectbytes(16)
+        @test exactbudget(b -> materialize(intervalfield, intervaldata, b), intervalneed) ==
+              intervals
+
+        listsize = 100_000
+        childfield, childdata = fromjulia("item", Bool[isodd(i) for i = 1:listsize])
+        fixedtype = FixedSizeListType(listsize)
+        fixedfield = Field("values", fixedtype; nullable=false, children=[childfield])
+        fixeddata = AC.ArrayData(fixedtype, 1, [BufferSlice()]; children=[childdata])
+        fixedneed = vectorbytes(Any, 1) + vectorbytes(Any, listsize)
+        fixed = exactbudget(b -> materialize(fixedfield, fixeddata, b), fixedneed)
+        @test length(only(fixed)) == listsize
+        @test only(fixed)[1:4] == Any[true, false, true, false]
+
+        # A hostile width must exhaust the budget before the preflight can
+        # touch a deliberately short child.
+        huge = FixedSizeListType(1_000_000_000)
+        hugefield = Field(
+            "huge",
+            huge;
+            nullable=false,
+            children=[Field("item", NullType(); nullable=true)],
+        )
+        hugedata = AC.ArrayData(
+            huge,
+            1,
+            [BufferSlice()];
+            children=[AC.ArrayData(NullType(), 0, BufferSlice[]; nullcount=0)],
+        )
+        hugebudget = Arrow.AllocationBudget(1_000_000)
+        @test_throws Arrow.AllocationLimitError materialize(hugefield, hugedata, hugebudget)
+        @test Arrow._remaining(hugebudget) == 1_000_000
+    end
+
+    @testset "compact empty containers fit the default budget" begin
+        @test success(
+            `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $(joinpath(@__DIR__, "empty_container_budget_child.jl"))`,
         )
     end
 

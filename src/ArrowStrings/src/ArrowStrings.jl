@@ -40,8 +40,9 @@ That is byte for byte the Arrow StringView layout (12-byte inline, 4-byte
 prefix, int32 buffer index + int32 offset). Arrow's Int32 words are why a
 buffer must stay under 2 GiB. Byte access, comparison, hashing, and iteration
 never allocate; `String(s)` copies out; `materialize(v)` copies a whole
-column out to `Vector{String}`. Everything here depends only on Base and is
-concrete-typed throughout, so it compiles under JuliaC `--trim`.
+column out to `Vector{String}`. Everything here depends only on Base and uses
+concrete types throughout. CI compiles and runs representative construction,
+access, comparison, and materialization under JuliaC `--trim=safe`.
 
 Lifetime: an `ArrowString` view pins its buffer (`data`), and a
 `StringVector` pins all of its buffers, exactly like any zero-copy
@@ -91,22 +92,17 @@ const PAYLOAD_MISSING = ArrowStringPayload(UInt64(0xffffffff), zero(UInt64))
 const INLINE_MAX = 12
 const EMPTY_BYTES = UInt8[]
 
+"Return the content byte length; a negative result marks a missing value."
 @inline payloadlength(p::ArrowStringPayload) = reinterpret(Int32, p.a % UInt32)
+"Return the zero-based referenced-buffer index of a view payload."
 @inline payloadbufidx(p::ArrowStringPayload) = reinterpret(Int32, p.b % UInt32)
+"Return the zero-based byte offset of a view payload within its buffer."
 @inline payloadoffset(p::ArrowStringPayload) = reinterpret(Int32, (p.b >> 32) % UInt32)
+"Return the one-based byte position of a view payload within its buffer."
 @inline payloadpos(p::ArrowStringPayload) = Int(payloadoffset(p)) + 1
 @inline _viewword(bufidx::Integer, offset0::Integer) =
     UInt64(bufidx % UInt32) | (UInt64(offset0 % UInt32) << 32)
 
-"""
-    inline_payload(src::AbstractVector{UInt8}, pos::Int, len::Int) -> ArrowStringPayload
-
-The payload of the `len` (≤ 12) bytes of `src` starting at 1-based `pos`,
-stored inline. Two overlapping little-endian loads gather up to 12 content
-bytes branch-free; the byte-loop fallback only runs within 11 bytes of the
-buffer's end. The requested byte range is checked before either path reads it.
-`src` must use one-based indexing.
-"""
 @inline function _checkrange(src::AbstractVector, pos::Int, len::Int, label::String)
     Base.require_one_based_indexing(src)
     n = length(src)
@@ -127,6 +123,15 @@ end
     return ArrowStringPayload(a, b)
 end
 
+"""
+    inline_payload(src::AbstractVector{UInt8}, pos::Int, len::Int) -> ArrowStringPayload
+
+The payload of the `len` (≤ 12) bytes of `src` starting at 1-based `pos`,
+stored inline. Two overlapping little-endian loads gather up to 12 content
+bytes branch-free; the byte-loop fallback only runs within 11 bytes of the
+buffer's end. The requested byte range is checked before either path reads it.
+`src` must use one-based indexing.
+"""
 @inline function inline_payload(src::AbstractVector{UInt8}, pos::Int, len::Int)
     0 <= len <= INLINE_MAX ||
         throw(ArgumentError("inline_payload: length $len is not in 0:$INLINE_MAX"))

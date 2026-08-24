@@ -28,10 +28,12 @@ data and C stream interfaces for in-process exchange with other
 implementations, recursive ArrowTypes.jl mappings for custom values, and
 Tables.jl integration throughout.
 
-```julia
+```@example quick_start
 using Arrow
-Arrow.write("data.arrow", (a = [1, 2, 3], b = ["x", "y", missing]))
-tbl = Arrow.Table("data.arrow")
+path = joinpath(mktempdir(), "data.arrow")
+Arrow.write(path, (a = [1, 2, 3], b = ["x", "y", missing]))
+tbl = Arrow.Table(path)
+collect(tbl.b)
 ```
 
 ```@contents

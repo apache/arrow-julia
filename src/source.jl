@@ -41,9 +41,12 @@ and may override
 
     Arrow.concurrentreads(src)::Int                   # default 1
 
-to let Arrow issue the planned ranges of one round through `readrange`
-concurrently, at most that many at a time (Arrow places each result by its
-request, so completion order never matters). Every returned vector must have
+to let Arrow issue planned ranges through `readrange` concurrently. One
+`SourceFile` samples that preference once, clamps it by
+`Limits.max_concurrent_reads`, and uses one semaphore across every operation
+on that handle (Arrow places each result by its request, so completion order
+never matters). Separate `SourceFile` handles are independent; a transport
+that needs one process-wide cap must enforce it inside `readrange`. Every returned vector must have
 exactly the requested length; Arrow validates lengths and offsets and
 refuses violations with a `ValidationError`, but the source is trusted to
 return the bytes that live at the requested range — Arrow cannot
@@ -85,9 +88,10 @@ function readrange end
     Arrow.concurrentreads(src::AbstractArrowSource) -> Int
 
 How many [`Arrow.readrange`](@ref) calls Arrow may have in flight at once
-when it fetches the planned ranges of one round. The default, `1`, reads
-them one at a time; a transport whose requests are independent (HTTP range
-GETs) returns a bound suited to it. Arrow runs a worker pool of that size
-and stores every result by request index.
+through one `SourceFile` handle. The default, `1`, reads them one at a time;
+a transport whose requests are independent (HTTP range GETs) returns a bound
+suited to it. The handle samples the value once, clamps it by
+`Limits.max_concurrent_reads`, and stores every result by request index.
+Separate handles are independent.
 """
 concurrentreads(::AbstractArrowSource) = 1

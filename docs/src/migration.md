@@ -157,6 +157,21 @@ writable at that nesting depth. Fresh heterogeneous Unions use the canonical
 dense Arrow Union layout. See [Type mapping when writing](@ref) for the
 complete table.
 
+A top-level `NamedTuple` column may use `Union{Missing, T}`. Arrow writes the
+outer missing state in the Struct validity bitmap and keeps each child's
+declared nullability unchanged.
+
+Declared Unions may contain up to 32 members. Runtime writer or storage
+inference is limited to 8 distinct types across all partitions. This includes
+abstract ArrowTypes.jl storage, abstract or `Any` dictionary values, and
+abstract retained ArrowTypes.jl targets. Declare the intended Union when a
+column needs more runtime types.
+
+A fresh unresolved abstract declaration keeps concrete subtype writer evidence
+across all partitions. A concrete subtype's extension metadata is not discarded.
+Heterogeneous subtype evidence uses an explicit Union and the same 8-type
+inference limit.
+
 A plain concrete struct whose fields are supported can use ArrowTypes.jl's
 default `StructKind` mapping. Without extension hooks, it reads back as
 ordinary Struct storage rather than the original Julia type. To select a
@@ -177,15 +192,54 @@ instead of being silently written under the old schema.
 
 A fresh Julia column with a heterogeneous declared `Union` element type is
 synthesized as a canonical dense Arrow Union. Materialization of an existing
-Arrow Union discards its child type IDs and offsets. A retained Union therefore
-still fails clearly when rewritten from an `Arrow.Table`; the writer does not
-invent new routing under the retained schema. A retained nested Dictionary
-also fails because its pool is lost. Top-level dictionaries of scalar or
-composite values are supported after a full read. A scan result can lack the
-hidden source pool, so an ordered dictionary from such a result also fails
-clearly. Exact buffer sharing, overlapping ListView ranges, and Run-End
+unregistered Arrow Union discards its child type IDs and offsets. Such a
+retained Union still fails clearly when rewritten from an `Arrow.Table`; the
+writer does not invent new routing under the retained schema. A registered
+ArrowTypes.jl logical type whose storage is a Union retains enough writer-side
+type evidence to reconstruct the original child routing, including dense or
+sparse mode and type IDs. Sparse children use canonical hidden placeholder
+values outside their active rows. When `JuliaType` returns an abstract target,
+a concrete writer subtype may omit an extension identity or use the retained
+parent's identity. A different explicit identity is rejected instead of being
+silently relabeled. A retained nested Dictionary also fails because its pool is
+lost. Top-level dictionaries of scalar or composite values are supported after
+a full read. A scan result can lack the hidden source pool, so an ordered
+dictionary from such a result also fails clearly. A nullable `Dictionary<Null>`
+with an unknown extension fails
+closed because materialization cannot retain valid-index versus null-index
+provenance. Exact buffer sharing, overlapping ListView ranges, and Run-End
 Encoding segmentation are not retained; the writer emits a canonical layout
-with the same logical values and schema type.
+with the same public-domain values and schema type.
+
+Registered public-domain values can rebuild compatible retained binary, list,
+date-like, duration, wide-decimal, and interval descriptors. The retained
+descriptor controls widths, sizes, units, and child fields. Values that do not
+meet those exact constraints fail with `ArgumentError`. A retained Map with
+`keysSorted=true` also rejects a replacement row whose keys are not sorted.
+
+The removed `maxdepth` keyword is not replaced by an unbounded writer.
+Recursive ArrowTypes.jl storage schemas and recursive value containers throw
+`ArgumentError`, as does custom mapping nesting beyond the fixed depth of 64.
+To keep composite descriptors from allocating in proportion to untrusted
+schema width, `JuliaType` receives exact `NTuple{N,T}` fixed-list storage when
+`N` is at most 1024 and the compact `Tuple{Vararg{T}}` family above that limit.
+Exact-arity registrations above the limit remain unregistered. Extension
+Structs receive an exact `NamedTuple` storage signature through 1024 children
+only when child names are unique, contain no embedded NUL, already exist as
+Julia `Symbol`s, are at most 4096 UTF-8 bytes each, and use at most 64 KiB in
+total. Otherwise the labelled Struct remains unknown and reads as ordered
+`Pair` storage. To preserve ArrowTypes.jl Tuple storage, one bounded exception
+may intern positional child names only when the complete sequence is exactly
+`"1"`, `"2"`, …, `string(N)` for `N ≤ 1024`. Unknown extension labels return
+before this check. Arbitrary or partly positional Struct names are not interned.
+Any writer-side `ArrowType` result that is a concrete tuple above the same limit
+is rejected before writer specialization. This includes ArrowTypes.jl's default
+mapping for a tuple value. A custom hook itself remains trusted Julia code and
+must return normally for Arrow to validate its result.
+
+Retained null-parent child slots now use direct length-based construction.
+Null-only fixed-size lists and inactive sparse-Union children no longer expand
+into one Julia placeholder per hidden element.
 
 ## Names and imports
 
@@ -202,7 +256,22 @@ Arrow.write("copy.arrow", table)
 defining mappings. `Arrow.ArrowTypes` remains available as a qualified
 compatibility binding.
 
-`Arrow.getmetadata` was removed. Arrow 3.0 uses DataAPI.jl metadata methods:
+Core schema names now stay as `String` values. `Arrow.Table` converts only
+top-level Tables.jl column names to `Symbol`, after it preflights the complete
+schema against a 4096-byte per-name limit, a 65,536-novel-name limit, and a
+1-MiB novel-name byte budget. Unknown ArrowTypes extension labels are checked
+without interning them. The built-in `JuliaLang.Symbol` extension rejects a
+novel IPC payload with `ValidationError` instead of interning input-controlled
+process-global state. This is an intentional behavior change: an input that a
+prior Arrow.jl release read by interning its payload can now fail.
+
+`Arrow.getmetadata` was removed. Arrow 3.0 uses DataAPI.jl metadata methods.
+Add DataAPI.jl as a direct dependency of code that imports it:
+
+```julia
+import Pkg
+Pkg.add("DataAPI")
+```
 
 ```julia
 using Arrow, DataAPI
