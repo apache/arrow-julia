@@ -58,9 +58,8 @@ writer, validation, scan, and C interface engines.
   `Arrow.Table`, `Arrow.Stream`, `Arrow.write`, and `Arrow.DictEncode` through
   the `Arrow` namespace. Only `release!` is exported.
 - Big-endian IPC and delta-dictionary messages are rejected.
-- Arrow 3.0 requires ArrowTypes.jl 2.x, a Tables.jl release that provides
-  `Tables.Scan`, and the ArrowStrings.jl 1.0 release. The final Tables.jl lower
-  compat bound will be set after that Tables.jl release is registered.
+- Arrow 3.0 requires ArrowTypes.jl 2.x, Tables.jl 1.14 (the first release
+  with `Tables.Scan`), and the ArrowStrings.jl 1.0 release.
 
 ### Added
 

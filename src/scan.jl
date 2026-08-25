@@ -839,7 +839,6 @@ end
 
 function _resolverselectionwork!(scan::Tables.Scan, names, budget)
     select = scan.select
-    select === nothing && return Int64(length(names))
     isempty(select) && return Int64(0)
     if first(select).ref isa Tables.Not
         _chargedict!(budget, Int, Nothing, length(names), "scan resolver exclusion index")

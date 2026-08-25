@@ -81,16 +81,14 @@ See the [changelog](CHANGELOG.md) for the full release summary. The
 
 ## Development
 
-In a checkout of this branch, prepare the local subpackages and the temporary
-Tables.jl dependency, then run the tests:
+In a checkout of this branch, prepare the local subpackages, then run the
+tests:
 
 ```julia
 import Pkg
 Pkg.activate(".")
 Pkg.develop(path="src/ArrowStrings")
 Pkg.develop(path="src/ArrowTypes")
-Pkg.add(url="https://github.com/JuliaData/Tables.jl",
-        rev="64268c6a316e380cc3da26965f440a5433ebc1f7")
 Pkg.test()
 ```
 

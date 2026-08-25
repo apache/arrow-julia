@@ -30,14 +30,7 @@ is a pure Julia implementation of that
 reads and writes the IPC stream and file formats, exchanges in-memory data
 with other implementations through the C data and C stream interfaces, and
 presents everything to Julia through the [Tables.jl](https://tables.juliadata.org)
-interface. Until `Tables.Scan` ships in a Tables.jl release, Arrow.jl 3.0
-needs the pinned Tables.jl development revision:
-
-```julia
-import Pkg
-Pkg.add(url="https://github.com/JuliaData/Tables.jl",
-        rev="64268c6a316e380cc3da26965f440a5433ebc1f7")
-```
+interface (Tables.jl 1.14 or later, for `Tables.Scan`).
 
 ```julia
 using Arrow, Tables

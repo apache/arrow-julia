@@ -23,7 +23,6 @@
 #   * A Python with pyarrow and nanoarrow — the oracles. PythonCall binds to
 #     it (JULIA_PYTHONCALL_EXE; the CondaPkg backend is disabled).
 #   * The apache/arrow-testing gold corpus.
-#   * The reviewed Tables.jl scan commit (until Tables.Scan is released).
 #   * A warm Julia depot with the registered dependencies, in a named volume
 #     at run time so precompilation caches survive between runs.
 #
@@ -43,7 +42,6 @@ ARG PIP_VERSION=26.2.1
 ARG PYARROW_VERSION=25.0.1
 ARG NANOARROW_VERSION=0.9.0
 ARG ARROW_TESTING_REV=9ff285c88565f0f6abc855918c6a342e70e4909c
-ARG TABLES_REV=64268c6a316e380cc3da26965f440a5433ebc1f7
 
 # python3-dev brings the shared libpython that PythonCall embeds; Debian's
 # interpreter binary is statically linked and does not ship it otherwise.
@@ -60,11 +58,7 @@ RUN python3 -m venv /opt/pyarrow \
 RUN git init /opt/arrow-testing \
  && git -C /opt/arrow-testing remote add origin https://github.com/apache/arrow-testing.git \
  && git -C /opt/arrow-testing fetch --depth 1 origin "${ARROW_TESTING_REV}" \
- && git -C /opt/arrow-testing checkout --detach FETCH_HEAD \
- && git init /opt/Tables \
- && git -C /opt/Tables remote add origin https://github.com/JuliaData/Tables.jl.git \
- && git -C /opt/Tables fetch --depth 1 origin "${TABLES_REV}" \
- && git -C /opt/Tables checkout --detach FETCH_HEAD
+ && git -C /opt/arrow-testing checkout --detach FETCH_HEAD
 
 ENV ARROW_TESTING_DIR=/opt/arrow-testing \
     ARROW_ORACLE_PYTHON=/opt/pyarrow/bin/python \
@@ -88,12 +82,13 @@ RUN julia -e 'using Pkg; Pkg.activate("/opt/warm"); \
              PackageSpec(name="TranscodingStreams", version="0.11.3"), \
              PackageSpec(name="JSON", version="1.7.1"), \
              PackageSpec(name="CodecZlib", version="0.7.9"), \
+             PackageSpec(name="Tables", version="1.14.0"), \
              PackageSpec(name="PythonCall", version="0.9.35")]); \
-    Pkg.develop(path="/opt/Tables"); Pkg.precompile()'
+    Pkg.precompile()'
 
 # The suite environment is created from the mounted repository's
-# conformance/Project.toml by conformance/run.jl (developing /work and
-# /opt/Tables into it), so a Manifest never lives in the repository checkout.
+# conformance/Project.toml by conformance/run.jl (developing /work into it),
+# so a Manifest never lives in the repository checkout.
 RUN mkdir -p /opt/env /work
 WORKDIR /work
 # The driver keeps its container alive the same way.

@@ -30,9 +30,9 @@ features changed.
 ## Requirements
 
 Arrow 3.0 requires Julia 1.10 or later and ArrowTypes.jl 2.x. It also requires
-the first Tables.jl release that provides `Tables.Scan` and ArrowStrings.jl
-1.0. The development branch uses temporary source overrides until those
-releases are registered.
+Tables.jl 1.14 (the first release that provides `Tables.Scan`) and
+ArrowStrings.jl 1.0. The development branch uses source overrides for the
+in-repository subpackages until their releases are registered.
 
 ## Materialized columns
 

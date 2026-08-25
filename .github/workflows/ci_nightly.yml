@@ -113,7 +113,6 @@ jobs:
         run: |
           using Pkg;
           Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowTypes"), PackageSpec(path="src/ArrowStrings")])
-          Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="64268c6a316e380cc3da26965f440a5433ebc1f7"))
       - name: Run monorepo tests
         continue-on-error: false
         run: >

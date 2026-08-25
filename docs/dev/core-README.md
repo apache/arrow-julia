@@ -58,7 +58,7 @@ On Julia 1.10, prepare a fresh checkout once before you run the commands below.
 Julia 1.10 does not read the repository's `[sources]` entries.
 
 ```bash
-julia --project=. -e 'using Pkg; Pkg.develop([PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")]); Pkg.add(PackageSpec(url="https://github.com/JuliaData/Tables.jl", rev="64268c6a316e380cc3da26965f440a5433ebc1f7"))'
+julia --project=. -e 'using Pkg; Pkg.develop([PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")])'
 ```
 
 ```bash

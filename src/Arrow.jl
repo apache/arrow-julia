@@ -69,8 +69,7 @@ const TS = TranscodingStreams
 
 isdefined(Tables, :Scan) || error(
     "Arrow 3.0's scan support needs Tables.jl's `Tables.Scan` " *
-    "interface; upgrade Tables.jl or use the pinned development revision " *
-    "from Arrow.jl's Project.toml",
+    "interface; upgrade Tables.jl to 1.14 or later",
 )
 
 include(joinpath("FlatBuffers", "FlatBuffers.jl"))
