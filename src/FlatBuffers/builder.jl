@@ -16,7 +16,8 @@
 
 """
 Scalar
-A Union of the Julia types `T <: Number` that are allowed in FlatBuffers schema
+The Julia scalar types allowed in a FlatBuffers schema: the fixed-width
+integers and floats, `Bool`, and `Enum`.
 """
 const Scalar =
     Union{Bool,Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64,Float32,Float64,Enum}
@@ -64,9 +65,8 @@ Base.write(b::Builder, o, x::Float64) = write(b, o, reinterpret(UInt64, x))
 Base.write(b::Builder, o, x::Enum) = write(b, o, basetype(x)(x))
 
 """
-`finishedbytes` returns a pointer to the written data in the byte buffer.
-Panics if the builder is not in a finished state (which is caused by calling
-`finish!()`).
+`finishedbytes` returns a view of the written data in the byte buffer. It
+throws unless `finish!` has put the builder in a finished state.
 """
 function finishedbytes(b::Builder)
     assertfinished(b)
@@ -83,7 +83,7 @@ function startobject!(b::Builder, numfields)
 end
 
 """
-WriteVtable serializes the vtable for the current object, if applicable.
+`writevtable!` serializes the vtable for the current object, if applicable.
 
 Before writing out the vtable, this checks pre-existing vtables for equality
 to this one. If an equal vtable is found, point the object to the existing
@@ -118,10 +118,7 @@ function writevtable!(b::Builder)
     end
 
     # Search backwards through existing vtables, because similar vtables
-    # are likely to have been recently appended. See
-    # BenchmarkVtableDeduplication for a case in which this heuristic
-    # saves about 30% of the time used in writing objects with duplicate
-    # tables.
+    # are likely to have been recently appended.
     for i = length(b.vtables):-1:1
         # Find the other vtable, which is associated with `i`:
         vt2Offset = b.vtables[i]
@@ -190,7 +187,7 @@ function writevtable!(b::Builder)
 end
 
 """
-`endobject` writes data necessary to finish object construction.
+`endobject!` writes data necessary to finish object construction.
 """
 function endobject!(b::Builder)
     assertnested(b)
@@ -255,7 +252,7 @@ function prependoffsetslot!(b::Builder, o::Int, x::T, d) where {T}
 end
 
 """
-`startvector` initializes bookkeeping for writing a new vector.
+`startvector!` initializes bookkeeping for writing a new vector.
 
 A vector has the following format:
 <UOffsetT: number of elements in this vector>
@@ -270,7 +267,7 @@ function startvector!(b::Builder, elemSize, numElems, alignment)
 end
 
 """
-`endvector` writes data necessary to finish vector construction.
+`endvector!` writes data necessary to finish vector construction.
 """
 function endvector!(b::Builder, vectorNumElems)
     assertnested(b)

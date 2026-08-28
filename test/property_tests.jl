@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# Seeded end-to-end properties over the public IPC read/write paths, driven
+# by the SeededFuzz generators; included from runtests.jl.
+
 module PropertyTests
 
 using Arrow

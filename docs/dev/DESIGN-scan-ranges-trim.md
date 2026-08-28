@@ -347,7 +347,7 @@ it. The rules in `core-README.md` ("Trim-compile support") constrain their form:
 - The range planner is arithmetic over `Int64`s; a trimmed app that names
   its concrete `AbstractArrowSource` type resolves the source calls
   statically. No dynamic registry on the hot path.
-- **Two-tier public API (mirroring the CSV rewrite)**: the runtime-tagged
+- **Two-tier public API**: the runtime-tagged
   core is inherently trim-safe — descriptors are values, accessors use
   literal load widths, struct scalars are `Vector{Pair{String,Any}}`. So:
   - **Tier 1 (trim target)**: the value-domain entry points —
@@ -356,8 +356,7 @@ it. The rules in `core-README.md` ("Trim-compile support") constrain their form:
     path. A harness compiling a scan-and-materialize app at 0/0/exit-0,
     kept permanently in CI, is what would make the scan half guaranteed.
   - **Tier 2 (dynamic, ergonomic)**: the typed facade (`Arrow.Table`
-    property access, NamedTuple rows) — explicitly NOT trim-guaranteed,
-    the same split the CSV rewrite made.
+    property access, NamedTuple rows) — explicitly NOT trim-guaranteed.
   - **The known-schema bridge**: `Scan`'s `ref => Type` overrides ARE the
     known-schema declaration. In a trimmed app, a scan with concrete type
     pins can drive the typed-column path whose element types are statically

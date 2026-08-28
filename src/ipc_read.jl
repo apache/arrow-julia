@@ -15,7 +15,8 @@
 # limitations under the License.
 
 # =============================================================================
-# The IPC reader: stream and file formats as a thin peer over ArrowCore.
+# The IPC STREAM reader as a thin peer over ArrowCore. The file-format
+# reader (readfile/ArrowFile) shares these primitives from ipc_write.jl.
 #
 #   * Framing: checked spans, the generated FlatBuffers verifier before any
 #     generated getter runs, and explicit resource limits (`Limits` +
@@ -40,24 +41,26 @@
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# Stage-1 framing: resource limits before metadata-directed decode allocation
+# Framing stage: resource limits before metadata-directed decode allocation
 # ---------------------------------------------------------------------------
 
 """
     Arrow.Limits(; keyword arguments...)
 
-Resource limits for an Arrow IPC reader. The reader checks metadata, message
-bodies, individual buffers, message and metadata-object counts, nesting depth,
-array lengths, cumulative package-controlled allocation, and concurrent range
-reads before the corresponding work can exceed these bounds.
+Resource limits for an Arrow IPC reader. Each bound is checked before the
+work it governs can exceed it.
 
-The defaults are 16 MiB of metadata per message, 2 GiB per body and buffer,
-256 MiB of cumulative allocation, 1,000,000 messages and metadata objects,
-nesting depth 64, array length 1,000,000,000, and 64 concurrent range reads.
-The corresponding keyword names are `max_metadata_bytes`, `max_body_bytes`,
-`max_buffer_bytes`, `max_total_allocated_bytes`, `max_messages`,
-`max_metadata_objects`, `max_nesting_depth`, `max_array_length`, and
-`max_concurrent_reads`.
+| keyword                     | default       | bounds                         |
+|:----------------------------|:--------------|:-------------------------------|
+| `max_metadata_bytes`        | 16 MiB        | metadata per message           |
+| `max_body_bytes`            | 2 GiB         | one message body               |
+| `max_buffer_bytes`          | 2 GiB         | one buffer                     |
+| `max_total_allocated_bytes` | 256 MiB       | cumulative allocation per read |
+| `max_messages`              | 1,000,000     | messages per stream or file    |
+| `max_metadata_objects`      | 1,000,000     | flatbuffer objects per message |
+| `max_nesting_depth`         | 64            | schema and metadata nesting    |
+| `max_array_length`          | 1,000,000,000 | array length                   |
+| `max_concurrent_reads`      | 64            | concurrent range reads         |
 
 Pass a `Limits` value as the `limits` keyword to [`Arrow.Table`](@ref) or
 [`Arrow.Stream`](@ref).
@@ -283,6 +286,9 @@ struct FramedMessage
     features::Vector{Int64}  # populated on schema messages
 end
 
+# The encapsulated-message marker that precedes every metadata length. This
+# reader requires it even on V4 metadata, so streams written before the
+# marker existed are refused.
 const CONTINUATION = 0xFFFFFFFF
 const EXPERIMENTAL_COMPRESSION_KEY = "ARROW:experimental_compression"
 
@@ -291,14 +297,14 @@ const EXPERIMENTAL_COMPRESSION_KEY = "ARROW:experimental_compression"
 # ---------------------------------------------------------------------------
 
 # The shape verifier is GENERATED from the vendored format/*.fbs by
-# tools/fbsgen.jl (src/metadata/Verifier.jl): table/vtable geometry,
-# scalar widths and alignment, enum domains, string bounds/NUL/UTF-8, vector
-# bounds, complete union dispatch, and the nesting/object/reserve accounting
-# all derive from the schema, so binding drift cannot reach them. The
-# wrappers below own only what the schema cannot express: which metadata
-# versions and message kinds this adapter accepts, and the features/version
-# coupling. Fixture helpers reuse the runtime's traversal primitives to
-# LOCATE bytes they corrupt, so those names are aliased here.
+# tools/fbsgen.jl (src/metadata/Verifier.jl). Table geometry, scalar widths,
+# enum domains, string and vector bounds, union dispatch, and the
+# nesting/object/reserve budgets all derive from the schema, so binding drift
+# cannot reach them. The wrappers below own only what the schema cannot
+# express: the accepted metadata versions and message kinds, and the
+# features/version coupling.
+# The aliases below exist for test fixtures, which reuse the runtime's
+# traversal primitives to LOCATE the bytes they corrupt. No src file uses them.
 const _VTable = Meta.VTable
 const _vtable = Meta._vtable
 const _vfield = Meta._vfield
@@ -345,11 +351,11 @@ function verify_ipc_metadata(
     reserve_limit::Int64=limits.max_total_allocated_bytes,
 )
     ctx = _verifyctx(limits, reserve_limit)
-    # STAGED root verification: the inline stage proves the table shell and
-    # every non-reference field (the version among them), the adapter gates
-    # the version, and only then does the reference stage walk the header
-    # graph — an unsupported version rejects in constant time instead of
-    # after a full attacker-directed traversal.
+    # STAGED root verification. The inline stage proves the table shell and
+    # every non-reference field, including the version. The adapter then
+    # gates the version, so an unsupported one rejects in constant time. Only
+    # after that does the reference stage walk the attacker-directed header
+    # graph.
     t = _verified(() -> Meta.verifyrootstart_Message(bytes, ctx))
     msg = FB.getrootas(Meta.Message, bytes, 0)
     version = Int16(Int64(msg.version))
@@ -374,7 +380,9 @@ Walk the IPC stream framing (continuation marker, metadata length, metadata
 flatbuffer, body), checking every declared length against the limits and the
 region's real extent before metadata-directed decode allocation. A truncated
 prefix, metadata block, or body throws. EOF exactly after a complete message
-is the intentional missing-EOS boundary case and is accepted.
+is the intentional missing-EOS boundary case and is accepted. The framing's
+metadata length covers the padded metadata only; a Footer Block's
+metaDataLength instead covers prefix + metadata.
 """
 framemessages(region::OwnerRegion, limits::Limits=Limits()) = _framemessages(
     region,
@@ -421,7 +429,12 @@ function _framemessages(
         cont = AC.loadat(blob, UInt32, pos)
         cont == CONTINUATION ||
             throw(ValidationError("missing continuation marker at byte $pos"))
+        # The stream framing's metadata length covers the padded metadata
+        # only. A Footer Block.metaDataLength instead covers prefix +
+        # metadata (see block!).
         metalen = Int64(AC.loadat(blob, Int32, AC.checked_add(pos, Int64(4))))
+        # Continuation marker + zero length is the end-of-stream marker.
+        # Nothing may follow it.
         if metalen == 0
             AC.checked_add(pos, Int64(8)) == blob.len ||
                 throw(ValidationError("trailing bytes after IPC end-of-stream"))
@@ -553,6 +566,8 @@ function _coremetatype(mt, children::Vector{Field})::ArrowType
     mode = mt.mode == Meta.UnionMode.Dense ? AC.DenseMode : AC.SparseMode
     ids = mt.typeIds
     nchildren = length(children)
+    # Type ids are Int8 in [0, 127] (checked below), so 128 distinct children
+    # is the ceiling.
     nchildren <= 128 || throw(ValidationError("a union cannot have more than 128 children"))
     if ids === nothing
         return UnionType(mode, Int8[Int8(i) for i = 0:(nchildren - 1)])
@@ -911,12 +926,11 @@ function takenode!(c::DecodeCursor)
 end
 
 """
-Consume one buffer-table entry's METADATA: bounds, alignment, limits, and
-the non-overlap/monotone invariants — everything checkable without touching
-a single body byte. `takebuffer!` adds the body subslice (+ decompression);
-`skipbuffer!` stops here, which lets scan pushdown avoid decoding a column or
-planning its body range. Ranged tail reads and coalescing may still over-read
-those bytes.
+Consume one buffer-table entry's METADATA: bounds, alignment, limits, and the
+non-overlap/monotone invariants — every check that needs no body byte.
+`takebuffer!` continues into the body subslice and decompression;
+`skipbuffer!` stops here, so scan pushdown can skip a column's decode and its
+body range. Ranged tail reads and coalescing may still over-read those bytes.
 """
 function _buffermeta!(c::DecodeCursor)
     c.bufidx <= length(c.buffers) ||
@@ -962,12 +976,12 @@ function takebuffer!(c::DecodeCursor)
 end
 
 """
-Decode one compressed buffer per the spec: an Int64 uncompressed-length
-prefix, then the compressed payload; a prefix of -1 means the payload is
-stored uncompressed. Every declared size is bounded BEFORE allocation (this
-prefix is attacker-controlled), the decompressed size must match the
-declaration exactly, and each decompressed buffer becomes its own exact-sized owned
-region — the wire mapping is never the backing store of decompressed data.
+Decode one compressed buffer: an Int64 uncompressed-length prefix, then the
+payload. A prefix of -1 means the payload is stored raw and stays a view of
+the wire mapping. Every declared size is bounded before allocation (the
+prefix is attacker-controlled) and the decompressed size must match the
+declaration exactly. A positively compressed buffer becomes its own
+exact-sized owned region.
 """
 function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
     wire.len >= 8 || throw(
@@ -1086,11 +1100,10 @@ function decodefield(
         end
     end
     for (role, buffer) in zip(spec.buffers, buffers)
-        # A zero-length array may omit its offsets buffer entirely — Core
-        # accepts that canonical empty form, and nanoarrow and C++ write it
-        # (the oracle suite caught us refusing nanoarrow's bytes). A PARTIAL
-        # offsets buffer — nonempty but short of one slot — is still
-        # malformed framing.
+        # A zero-length array may omit its offsets buffer entirely; Core
+        # accepts that canonical empty form, and nanoarrow and C++ write it.
+        # A PARTIAL offsets buffer — nonempty but short of one slot — is
+        # still malformed framing.
         if role == AC.OFFSETS && node.length == 0 && 0 < buffer.len < spec.offsetwidth
             throw(ValidationError("IPC offsets buffer is shorter than one offset slot"))
         end
@@ -1171,6 +1184,11 @@ function decoderecord(
     return AC.RecordBatch(sch, cols, rblen, validated_dictionaries)
 end
 
+"""
+Arrow 0.17 V4 streams signaled buffer compression on the Message, before
+RecordBatch.compression existed. Reject that legacy marker before treating
+its length-prefixed compressed buffers as raw data.
+"""
 function rejectexperimentalcompression(
     msg::Meta.Message,
     version::Int16,
@@ -1240,6 +1258,7 @@ end
 """
 Map a batch's declared BodyCompression to a codec id, enforcing the spec
 subset this adapter supports: BUFFER-method LZ4_FRAME or ZSTD.
+BodyCompression is V5-only; a V4 batch that declares it is refused.
 """
 function _batchcodec(compression, version::Int16)::Int8
     compression === nothing && return CODEC_NONE
@@ -1271,7 +1290,7 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
     region = heapregion(bytes)
     msgs = _framemessages(region, limits, Base.ENDIAN_BOM, budget)
     isempty(msgs) && throw(ValidationError("empty IPC stream"))
-    first(msgs).header_type == 1 ||
+    first(msgs).header_type == 1 || # Schema
         throw(ValidationError("first IPC message must be a schema"))
     msgs[1].msg.header isa Meta.Schema ||
         throw(ValidationError("first IPC message must be a schema"))
@@ -1308,9 +1327,7 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
         for fm in msgs[2:end]
             fm.version == schemaversion ||
                 throw(ValidationError("IPC metadata version changes within the stream"))
-            # Arrow 0.17 V4 streams signaled buffer compression on the Message,
-            # before RecordBatch.compression existed. Reject that legacy marker
-            # before treating its length-prefixed compressed buffers as raw data.
+            # Legacy V4 compression marker: see rejectexperimentalcompression.
             rejectexperimentalcompression(fm)
             header = fm.msg.header
             if header isa Meta.DictionaryBatch
@@ -1329,14 +1346,13 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
                     )
                 end
                 # A dictionary batch's payload is a one-column record batch of
-                # the VALUE type; decode it with the same generic decoder. The
-                # value field is the metadata field minus its dictionary tag.
-                # Dictionary value schemas are built once from the Core schema.
-                # Reusing them avoids repeated metadata-string/container
-                # allocation on dictionary replacement messages. Pool
-                # nullability is independent from the encoded index field.
+                # the VALUE type, so the generic decoder handles it. Pool
+                # nullability is independent of the encoded index field.
                 haskey(dictvaluefields, header.id) ||
                     throw(ValidationError("dictionary batch has unknown id $(header.id)"))
+                # Value fields were built once from the Core schema; reusing
+                # them avoids repeated metadata-string/container allocation on
+                # dictionary replacement messages.
                 vf = dictvaluefields[header.id]
                 rblen = something(rb.length, Int64(0))
                 0 <= rblen <= limits.max_array_length ||

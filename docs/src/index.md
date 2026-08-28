@@ -33,7 +33,7 @@ using Arrow
 path = joinpath(mktempdir(), "data.arrow")
 Arrow.write(path, (a = [1, 2, 3], b = ["x", "y", missing]))
 tbl = Arrow.Table(path)
-collect(tbl.b)
+tbl.b
 ```
 
 ```@contents

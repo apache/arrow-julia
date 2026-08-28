@@ -14,6 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Stress the concurrent validation caches and the shared allocation budget.
+# Run as a child process with `-t 4` (core_tests.jl launches it with
+# `--threads=4`); it requires Threads.nthreads() >= 4.
+
 using Test
 
 using Arrow

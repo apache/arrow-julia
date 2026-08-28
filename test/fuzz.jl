@@ -14,6 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Standalone seeded fuzz driver over the public IPC read paths: run
+# `julia --project=. test/fuzz.jl --help` for the lanes and replay options.
+
 include(joinpath(@__DIR__, "support", "SeededFuzz.jl"))
 import .SeededFuzz
 

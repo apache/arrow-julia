@@ -929,6 +929,15 @@ const HEADER = """
 
 """
 
+# The verifier banner extends HEADER with the shape of the emitted functions.
+const VERIFIER_HEADER = """
+# Four functions per table: verifyinline_T proves the table shell and every
+# non-reference field; verifyrefs_T walks the reference graph; verify_T does
+# both; verifyrootstart_T/verifyrootrest_T split the root so a caller can gate
+# the metadata version between the two stages.
+
+"""
+
 function generate(fbsdir::AbstractString, outdir::AbstractString)
     mkpath(outdir)
     names = ("Schema", "File", "Message")
@@ -944,6 +953,7 @@ function generate(fbsdir::AbstractString, outdir::AbstractString)
     end
     vio = IOBuffer()
     print(vio, replace(HEADER, "{name}" => "{Schema,File,Message}"))
+    print(vio, VERIFIER_HEADER)
     emitverifier(vio, alldecls)
     write(joinpath(outdir, "Verifier.jl"), take!(vio))
     println("generated Verifier.jl")

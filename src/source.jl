@@ -26,11 +26,11 @@
 A byte-addressable object of known length — an object in cloud storage, an
 HTTP resource, an in-memory buffer — that [`Arrow.Table`](@ref) reads with
 exact byte-range requests instead of downloading whole. With a
-`Tables.Scan`, the file-format footer is fetched from the tail, the record
-batches are pruned by the footer's statistics and (without a filter) the
-scan's window, and only the surviving batches' buffers of the selected (and
-filter-referenced) columns are requested, coalesced into a few range reads
-made in one round; a filtered limit stops decoding, not fetching.
+`Tables.Scan`, Arrow reads the file-format footer from the tail. It prunes
+batches by the footer's statistics and — without a filter — by the scan's
+window. It then requests only the surviving batches' buffers for the
+selected and filter-referenced columns, coalesced into a few ranges issued
+in one round. A filtered limit stops decoding, not fetching.
 
 An implementation defines two methods:
 
@@ -42,15 +42,16 @@ and may override
     Arrow.concurrentreads(src)::Int                   # default 1
 
 to let Arrow issue planned ranges through `readrange` concurrently. One
-`SourceFile` samples that preference once, clamps it by
+read handle samples that preference once, clamps it by
 `Limits.max_concurrent_reads`, and uses one semaphore across every operation
 on that handle (Arrow places each result by its request, so completion order
-never matters). Separate `SourceFile` handles are independent; a transport
-that needs one process-wide cap must enforce it inside `readrange`. Every returned vector must have
-exactly the requested length; Arrow validates lengths and offsets and
-refuses violations with a `ValidationError`, but the source is trusted to
-return the bytes that live at the requested range — Arrow cannot
-authenticate them.
+never matters). Separate read handles are independent; a transport that
+needs one process-wide cap must enforce it inside `readrange`.
+
+Every returned vector must have exactly the requested length. Arrow
+validates lengths and offsets and refuses violations with a
+`ValidationError`. Arrow cannot authenticate the bytes themselves: the
+source is trusted to return what lives at the requested range.
 
 ```julia
 struct BytesSource <: Arrow.AbstractArrowSource

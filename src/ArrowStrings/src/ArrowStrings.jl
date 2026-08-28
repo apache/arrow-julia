@@ -19,10 +19,10 @@
     ArrowStrings
 
 An inline-else-view string representation for Arrow.jl and compatible parsers:
-`ArrowString`, a 16-byte string value that IS an Arrow StringView entry, and
-`StringVector`, a column of them over a set of byte buffers that IS an
-Arrow Utf8View array's memory. A column parsed into this representation can be
-written as an Arrow column without repacking its payloads or data buffers.
+`ArrowString`, a string value whose 16-byte payload IS an Arrow StringView
+entry, and `StringVector`, a column of them over a set of byte buffers that IS
+an Arrow Utf8View array's memory. A column parsed into this representation can
+be written as an Arrow column without repacking its payloads or data buffers.
 
 Every string is one 16-byte payload (`ArrowStringPayload`, two `UInt64`
 words `a` and `b`, packed by explicit shifts so the layout is
@@ -31,7 +31,8 @@ endianness-independent):
     a  bits 0..31   content length as Int32 (-1 marks a missing value)
        bits 32..63  content bytes 1..4 — the full bytes when the string is
                     inline (length ≤ 12), the 4-byte PREFIX when it is a view
-                    (prefixes make equality's fast path branch-free)
+                    (one word compare — length + prefix — rejects most
+                    unequal views)
     b  length ≤ 12  content bytes 5..12, zero-padded
        length > 12  bits 0..31 an Int32 BUFFER INDEX and bits 32..63 an Int32
                     0-based byte OFFSET of the content within that buffer
@@ -41,8 +42,7 @@ prefix, int32 buffer index + int32 offset). Arrow's Int32 words are why a
 buffer must stay under 2 GiB. Byte access, comparison, hashing, and iteration
 never allocate; `String(s)` copies out; `materialize(v)` copies a whole
 column out to `Vector{String}`. Everything here depends only on Base and uses
-concrete types throughout. CI compiles and runs representative construction,
-access, comparison, and materialization under JuliaC `--trim=safe`.
+concrete types throughout.
 
 Lifetime: an `ArrowString` view pins its buffer (`data`), and a
 `StringVector` pins all of its buffers, exactly like any zero-copy
@@ -52,8 +52,8 @@ module ArrowStrings
 
 export ArrowString, StringVector, ArrowStringPayload
 
-# Keep builders and payload accessors namespaced. Julia 1.11 tooling can still
-# distinguish this supported surface from the package's private fast paths.
+# Mark the supported non-exported surface with public. It goes through
+# Core.eval because Julia < 1.11 cannot parse the public keyword at all.
 @static if VERSION >= v"1.11"
     Core.eval(
         @__MODULE__,
@@ -106,6 +106,7 @@ const EMPTY_BYTES = UInt8[]
 @inline function _checkrange(src::AbstractVector, pos::Int, len::Int, label::String)
     Base.require_one_based_indexing(src)
     n = length(src)
+    # pos == n+1 is legal for len == 0: an empty string at the end of a buffer.
     (1 <= pos <= n + 1 && len <= n - pos + 1) ||
         throw(BoundsError("$label: range starts at $pos with length $len in $n bytes"))
     return nothing
@@ -127,9 +128,7 @@ end
     inline_payload(src::AbstractVector{UInt8}, pos::Int, len::Int) -> ArrowStringPayload
 
 The payload of the `len` (≤ 12) bytes of `src` starting at 1-based `pos`,
-stored inline. Two overlapping little-endian loads gather up to 12 content
-bytes branch-free; the byte-loop fallback only runs within 11 bytes of the
-buffer's end. The requested byte range is checked before either path reads it.
+stored inline. The requested byte range is checked before it is read.
 `src` must use one-based indexing.
 """
 @inline function inline_payload(src::AbstractVector{UInt8}, pos::Int, len::Int)
@@ -139,6 +138,9 @@ buffer's end. The requested byte range is checked before either path reads it.
     return _inline_payload_loop(src, pos, len)
 end
 
+# Two overlapping little-endian loads gather up to 12 content bytes
+# branch-free; the byte-loop fallback only runs within 11 bytes of the
+# buffer's end.
 @inline function inline_payload(src::Vector{UInt8}, pos::Int, len::Int)
     0 <= len <= INLINE_MAX ||
         throw(ArgumentError("inline_payload: length $len is not in 0:$INLINE_MAX"))
@@ -202,6 +204,8 @@ concatenating buffers (a chunk's buffer appended to a column's) needs.
 @inline function rebase_payload(p::ArrowStringPayload, base::Integer)
     payloadlength(p) > INLINE_MAX ||
         throw(ArgumentError("rebase_payload requires an out-of-line view payload"))
+    # base may not fit Int and the sum may overflow; both are user-visible
+    # errors, not exceptions to propagate.
     shift = try
         Int(base)
     catch
@@ -224,6 +228,11 @@ end
 @inline _inlinebyte(p::ArrowStringPayload, i::Int) =
     i <= 4 ? (p.a >> (32 + 8 * (i - 1))) % UInt8 : (p.b >> (8 * (i - 5))) % UInt8
 
+"""
+Check one payload against its data buffer: missing marker exactness, inline
+zero padding, view range, and prefix agreement. `missingok=true` accepts only
+the exact `PAYLOAD_MISSING` sentinel.
+"""
 function _validate_payload(
     p::ArrowStringPayload,
     data::Vector{UInt8};
@@ -267,7 +276,8 @@ A string value: its 16-byte payload plus the byte vector a view's content
 lives in (a shared empty vector for inline values). Byte access, direct
 comparisons, hashing, and iteration do not allocate; they use the inline
 bytes or the retained buffer. Hashing and ordering agree with `String`.
-`String(s)` copies out.
+`String(s)` copies out. The two-argument constructor validates the payload
+and throws `ArgumentError`; `Val(:unchecked)` is the internal bypass.
 """
 struct ArrowString <: AbstractString
     p::ArrowStringPayload
@@ -398,13 +408,11 @@ Base.:(==)(y::Union{String,SubString{String}}, x::ArrowString) = x == y
 function Base.cmp(x::ArrowString, y::ArrowString)
     nx, ny = ncodeunits(x), ncodeunits(y)
     if (nx <= INLINE_MAX) & (ny <= INLINE_MAX)
-        # Register compare in memcmp order: payload words are zero-padded past
-        # each length, so the first differing big-endian word decides by the
-        # first differing byte; words all equal means the shared prefix
-        # matches and any longer side is all-NUL past the shorter — exactly
-        # memcmp(min bytes) then the length tiebreak. The non-short-circuit
-        # `&` (one branch) and falling into the unified tail below measures
-        # strictly faster than a dedicated view×view branch.
+        # Inline×inline compares in registers. Payload words are zero-padded
+        # past each length, so the first differing big-endian word decides on
+        # its first differing byte; all-equal words mean the shorter string is
+        # a prefix of the longer. That is memcmp(min bytes) plus the length
+        # tiebreak. `&` (not `&&`) keeps this to one branch.
         w1x, w2x = _payload_words(x)
         w1y, w2y = _payload_words(y)
         a, b = bswap(w1x), bswap(w1y)
@@ -548,6 +556,8 @@ struct StringVector{ELT} <: AbstractVector{ELT}
         missingok = Missing <: ELT
         for p in payloads
             len = payloadlength(p)
+            # Inline and missing payloads reference no buffer; pass the
+            # shared empty vector so only the padding/marker checks run.
             if len < 0
                 _validate_payload(p, EMPTY_BYTES; missingok=missingok)
             elseif len <= INLINE_MAX

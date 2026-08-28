@@ -33,11 +33,11 @@
 #     Callback traversal uses producer-owned canonical child/dictionary
 #     topology, not the caller-visible counts and pointer tables. It still
 #     reads each canonical descendant's public release field so conforming
-#     moves are honored. A reaper pass (`reap!`) scans for aggregates whose
-#     last outstanding node was released, frees mallocs, and drops the
-#     registry root — dropping the root is what lets the source columns (and,
-#     through their OwnerRegion roots, the actual buffer memory) become
-#     collectable again. Callback contract: releases for one tree are
+#     moves are honored. A reaper pass (`reap!`) finds aggregates whose last
+#     outstanding node was released, frees their mallocs, and drops the
+#     registry root. Dropping that root is what lets the source columns —
+#     and, through their `OwnerRegion` roots, the buffer memory itself —
+#     become collectable again. Callback contract: releases for one tree are
 #     serialized and run only on Julia-attached threads.
 #
 #   * Import: the moved ArrowArray becomes ONE ForeignOwner shared by every
@@ -439,6 +439,9 @@ end
 
 function _release_array_children!(topology)
     children, dictionary = topology
+    # Read the child's release pointer under the registry lock, then call it
+    # unlocked: a moved child's callback belongs to the consumer and must not
+    # run while we hold the lock.
     for child in children
         release = lock(REGISTRY_LOCK) do
             unsafe_load(child).release
@@ -468,6 +471,9 @@ end
 
 function _release_schema_children!(topology)
     children, dictionary = topology
+    # Read the child's release pointer under the registry lock, then call it
+    # unlocked: a moved child's callback belongs to the consumer and must not
+    # run while we hold the lock.
     for child in children
         release = lock(REGISTRY_LOCK) do
             unsafe_load(child).release
@@ -946,10 +952,11 @@ function _release_owner_action(p::Ptr{Cvoid})::Cvoid
 end
 
 """
-One owner for one MOVED ArrowArray tree. All BufferSlices from the whole
-tree (children, dictionary) use regions whose `root` is this object, so the
-tree stays alive while any slice does, and the C release callback runs
-exactly once — from `release!` or the GC finalizer, whichever comes first.
+One owner for one MOVED ArrowArray tree. All `BufferSlice`s from the whole
+tree — children and dictionary — use regions whose `root` is this object.
+The tree therefore outlives every slice, and the C release callback runs
+exactly once, from `release!` or from the GC finalizer, whichever comes
+first.
 
 The malloc'd copy of the moved struct mirrors the C Data convention for its
 own state: its release field is NULL (inert) until the move commits, and the
@@ -959,9 +966,8 @@ copy and never calls the producer — the source, whose release field is still
 set, remains the owner.
 """
 mutable struct ForeignOwner
-    const arrayblock::Ptr{CArrowArray} # malloc'd copy of the moved struct: a
-    # stable native address for the
-    # producer's release callback
+    # malloc'd copy: a stable native address for the producer's release callback
+    const arrayblock::Ptr{CArrowArray}
     const producer_release::Ptr{Cvoid} # the moved struct's real callback
     @atomic released::Bool             # one swap picks the single releaser
     # ONE revocation cell for every OwnerRegion built over this import: the
@@ -974,6 +980,10 @@ mutable struct ForeignOwner
         block = Libc.malloc(sizeof(CArrowArray))
         block == C_NULL && throw(OutOfMemoryError())
         p = Ptr{CArrowArray}(block)
+        # The cell must exist before the owner does, so its action receives a
+        # `Ref{Any}` slot that is filled in after `new`. `ReleaseCell.arg`
+        # roots the slot, the slot roots the owner, and
+        # `_release_owner_action` recovers the owner from that pointer.
         slot = Ref{Any}(nothing)
         cell = AC.ReleaseCell(@cfunction(_release_owner_action, Cvoid, (Ptr{Cvoid},)), slot)
         o = try
@@ -1030,17 +1040,16 @@ end
 """
     release!(owner::ForeignOwner)
 
-Deterministically release an imported C-data tree: every `OwnerRegion`
-built over the import is revoked through the shared cell (later access is
-an `InvalidStateException`), then the producer's release callback (if
-armed) runs on the malloc'd struct copy, the copy's release field is
-checked to have been nulled (the C Data conformance rule), and the copy is
-freed. Exactly-once: a single atomic swap picks the one releaser between
-explicit calls and the GC finalizer; later calls return immediately. The
-entry point for imports whose arrays are empty and carry no region at all
-(`ArrayData.owner` is then the only handle on the lifetime). A conformance
-failure throws; from the finalizer path Julia reports it as a finalizer
-error.
+Deterministically release an imported C-data tree, in this order: revoke
+every `OwnerRegion` built over the import through the shared cell (later
+access throws `InvalidStateException`); run the producer's release callback
+(if armed) on the malloc'd struct copy; check that the producer nulled the
+copy's release field, as C Data requires; free the copy. Exactly once — one
+atomic swap picks the single releaser between an explicit call and the GC
+finalizer, and later calls return immediately. This is also the only
+lifetime handle for an empty import that carries no region at all;
+`ArrayData.owner` then holds it. A conformance failure throws, and reports
+as a finalizer error on the finalizer path.
 """
 function release!(o::ForeignOwner)
     return release!(o.cell)
@@ -1258,9 +1267,14 @@ function _validate_schema_flags(sch::CArrowSchema, fmt::AbstractString)
     return nothing
 end
 
-"Parse a C metadata blob: the count and lengths are producer-declared
-(the same trust as every other C Data pointer), but negative values
-refuse — they would wrap the walk."
+"""
+Parse a C metadata blob. The pair count and the key/value lengths are
+producer-declared, the same trust as every other C Data pointer, but a
+negative length is rejected: it would wrap the walk. Metadata bytes are
+taken by declared length and are not UTF-8-checked here: every import runs
+`validate_semantic`, whose structural stage checks them before a `Field`
+escapes, and the stream path re-checks per batch in `_validate_stream_field`.
+"""
 function _import_cmetadata(p::Ptr{UInt8})
     p == C_NULL && return nothing
     n = unsafe_load(Ptr{Int32}(p))
@@ -1443,6 +1457,8 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
     end
     children = ArrayData[]
     for i = 1:arr.n_children
+        # Preflight already rejects children on a dictionary node, so this
+        # branch is unreachable; it keeps the expression total for inference.
         cf = t isa DictionaryType ? error("dictionary carries no children") : f.children[i]
         push!(children, _import_array(cf, childat(arr, i), owner))
     end
@@ -1787,6 +1803,9 @@ function _export_stream!(
             NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
         end
         havekey = true
+        # A stream reuses the node control-block layout, but only the key at
+        # offset 8 is ever read; the state byte at offset 0 exists so the two
+        # block kinds stay interchangeable.
         unsafe_store!(Ptr{UInt8}(control), 0x00)
         unsafe_store!(Ptr{Int64}(control + 8), key)
         lock(REGISTRY_LOCK) do
@@ -1898,7 +1917,9 @@ Consumer side of a moved ArrowArrayStream: `schema(s)` is fixed at import,
 stream), and `release!(s)` ends the producer's stream exactly once. Each
 pulled batch owns its own ForeignOwner and outlives the stream if the caller
 keeps it. Producer-reported failures surface as `ValidationError`s carrying
-the producer's `get_last_error` text.
+the producer's `get_last_error` text. One stream call at a time: an
+overlapping `nextbatch!`/`release!` throws `ConcurrencyViolationError`
+rather than entering the producer's callbacks concurrently.
 """
 mutable struct ImportedStream <: AC.RecordBatchSource
     const owner::StreamOwner

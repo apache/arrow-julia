@@ -27,21 +27,24 @@ Arrow.jl resolves it through a `[sources]` path entry.
 
 ## Installation
 
-Install a registered release from the Julia REPL:
-
-```julia
-import Pkg
-Pkg.add("ArrowStrings")
-```
-
-Before the first General registration, run this from the repository root:
+ArrowStrings is not yet registered in General. Until then, run this from the
+repository root:
 
 ```julia
 import Pkg
 Pkg.develop(path="src/ArrowStrings")
 ```
 
-* `ArrowString <: AbstractString` — a 16-byte string value that **is** an
+After registration, install a released version from the Julia REPL:
+
+```julia
+import Pkg
+Pkg.add("ArrowStrings")
+```
+
+## API
+
+* `ArrowString <: AbstractString` — a string value whose 16-byte payload **is** an
   Arrow StringView entry: strings of up to 12 bytes are stored inline;
   longer strings are a 4-byte prefix plus `(Int32 buffer index, Int32
   offset)` into a byte buffer. Byte access, `==`, `cmp`/`isless`, `hash`,

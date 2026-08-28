@@ -18,8 +18,8 @@
 # ArrowTypes is a facade concern. ArrowCore stays dependency- and
 # conversion-free; this layer interprets the standard extension metadata on
 # materialized values and supplies the shared metadata helpers used by the
-# writer. Unregistered extension types remain ordinary Arrow storage values,
-# as the format requires readers to permit.
+# writer. An unregistered extension type stays an ordinary Arrow storage
+# value; the format requires readers to accept that.
 
 const _EXTENSION_NAME_KEY = "ARROW:extension:name"
 const _EXTENSION_METADATA_KEY = "ARROW:extension:metadata"
@@ -30,6 +30,8 @@ const _MAX_ARROWTYPE_STRUCT_NAME_BYTES = 64 * 1024
 const _MAX_EXTENSION_WARNING_BYTES = 128
 const _MAX_EXTENSION_WARNINGS = 16
 
+# Look a Symbol up without creating one: interning an input-controlled name
+# would permanently allocate process-global state.
 function _existingjlsymbol(name::AbstractString)
     occursin('\0', name) && return nothing
     ncodeunits(name) <= _MAX_ARROWTYPE_SCHEMA_NAME_BYTES || return nothing
@@ -227,8 +229,8 @@ function _warnunsupportedextension(ctx, name::String, f::AC.Field)
     ctx.warnings += 1
     displayname = _extensionwarningname(name, ctx.budget)
     descriptor = AC.descriptorname(f.type)
-    # Reserve the bounded message created by this adapter. The logging
-    # framework's own records and rendering remain host-owned diagnostics.
+    # Charge only the message this adapter builds. The logging framework's
+    # own records and rendering are outside this budget.
     _chargeobject!(
         ctx.budget,
         AC.checked_add(
@@ -804,6 +806,9 @@ function _arrowtypeslogicalnullable(f::AC.Field, target, storage=nothing)
     if f.type isa AC.UnionType
         storage === nothing && (storage = ArrowTypes.ArrowType(target))
     end
+    # A nullable logical column adds exactly one Null child around the
+    # target's storage Union, so one extra field child means "outer nullable";
+    # equal counts mean not nullable, and anything else is a mismatch.
     if storage isa Union
         fieldbranches = length(f.children)
         storagebranches = length(Base.uniontypes(storage))
@@ -890,6 +895,8 @@ end
 
 function _typedvalues(::Type{Any}, values, budget=nothing)
     _chargevector!(budget, Any, length(values), "ArrowTypes public column")
+    # map(identity, …) keeps the input's own narrowed eltype for an Any
+    # target instead of widening every column to Vector{Any}.
     return map(identity, values)
 end
 function _typedvalues(::Type{T}, values, budget=nothing) where {T}
@@ -904,6 +911,8 @@ function _arrowtypesscalar(t::AC.ArrowType, x)
                Dates.DateTime(Dates.UTM(Int64(x) + Dates.UNIXEPOCH))
     end
     if t isa AC.TimestampType
+        # DateTime cannot hold micro/nanosecond precision, so those units
+        # stay raw Int64 rather than lose information.
         t.unit == AC.SECOND &&
             return Dates.DateTime(Dates.UTM(Int64(x) * 1000 + Dates.UNIXEPOCH))
         t.unit == AC.MILLISECOND &&
@@ -1001,7 +1010,7 @@ function _arrowtypesnestedeltype(
     return _arrowtypespubliceltype(ctx, f)
 end
 
-"Convert children, preserving 3.0's unmarked row containers unless requested."
+"Convert children, preserving the reader's unmarked row containers unless requested."
 function _arrowtypesstoragevalue(
     ctx::_ArrowTypesContext,
     f::AC.Field,
@@ -1151,10 +1160,9 @@ function _arrowtypesstoragevalue(
         end
         return x
     end
-    # Native facade conversion is intentionally top-level. Only a marked
-    # parent's ArrowTypes storage shape requests native scalar values here.
-    # An unmarked composite must keep unrelated temporal children in the raw
-    # storage domain even when a marked sibling causes this recursive path.
+    # Only a marked parent's ArrowTypes storage shape asks for native scalars
+    # here. An unmarked composite keeps its temporal children in the raw
+    # storage domain, even when a marked sibling triggered this recursion.
     return extension_shape ? _arrowtypesscalar(t, x) : x
 end
 
@@ -1264,7 +1272,7 @@ function _arrowtypescolumn(
         any(x -> x isa _ArrowTypesRoutedNull || x isa _ArrowTypesRoutedUnion, col)
     if target === nothing && has_label && !has_registered_child && !has_routed_value
         # No hook or routed provenance is available to consume. Preserve the
-        # ordinary 3.0 storage column without building and discarding a per-row
+        # ordinary storage column without building and discarding a per-row
         # ArrowTypes workspace.
         return _publiccolumn(f, _postconvert(f.type, col, ctx.budget), ctx.budget)
     end
@@ -1280,7 +1288,7 @@ function _arrowtypescolumn(
         T = _withmissingtype(target, nullable)
         return _typedvalues(T, values, ctx.budget)
     end
-    # An unknown top-level extension remains the ordinary 3.0 storage column.
+    # An unknown top-level extension remains the ordinary storage column.
     # Recursive registered children have already been lifted in `values`.
     if has_label && !has_registered_child
         # An unknown Dictionary<Null> extension still took the private route to

@@ -15,9 +15,9 @@
 # limitations under the License.
 
 # Isolate the high-row-count acceptance gate so every case releases its heap
-# before the parent suite continues. These compact wire columns used to hit
-# the default 256 MiB allocation limit solely because each empty value was
-# charged as a nonempty Vector.
+# before the parent suite continues.
+# At 2,000,000 rows, charging each empty value as a nonempty Vector would
+# exceed the default 256 MiB budget. Empty values must be charged as empty.
 
 using Arrow
 

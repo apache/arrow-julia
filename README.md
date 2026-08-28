@@ -31,10 +31,10 @@ reads.
 
 > [!IMPORTANT]
 > This is the Arrow.jl 3.0 development branch. Arrow 3.0 is not registered
-> yet. It requires a Tables.jl release that contains `Tables.Scan` and the
-> first registered ArrowStrings.jl release. Until then, a checkout must use
-> the local `src/ArrowStrings` and `src/ArrowTypes` packages and the pinned
-> Tables.jl development commit shown below.
+> yet, and it requires the first registered ArrowStrings.jl release. A
+> checkout uses the in-repository `src/ArrowStrings` and `src/ArrowTypes`
+> packages: Julia 1.11+ resolves them through `[sources]`; on Julia 1.10 run
+> the `Pkg.develop` commands below.
 
 ## Installation
 
