@@ -30,6 +30,11 @@ _fieldmetadata(f::AC.Field) =
 "One native (Field, ArrayData) column from a Julia vector, facade conversions included."
 function _constructnativepart(name::String, v::AbstractVector; context=nothing)
     T = Base.nonmissingtype(eltype(v))
+    # With TimeZones loaded, a fresh ZonedDateTime column writes as a
+    # timezone-declared millisecond timestamp (ext/ArrowTimeZonesExt.jl)
+    # instead of reflecting the zone's whole transition table as a struct.
+    zoned = _zonednativepart(name, v, T)
+    zoned === nothing || return zoned
     if eltype(v) === Missing
         t = AC.NullType()
         return AC.Field(name, t; nullable=true),
@@ -151,9 +156,9 @@ function _constructpart(
         if runtimeparts !== nothing
             narrowed = only(runtimeparts)
             # Julia can canonicalize a Union of concrete Tuple runtime types
-            # back to the original abstract Tuple declaration. This is the
-            # complete runtime-evidence pass, even when its element type does
-            # not change. Do not recursively plan the same declaration.
+            # back to the original abstract declaration, so eltype may be
+            # unchanged. One narrowing pass is enough; recursing on the same
+            # declaration would loop.
             eltype(narrowed) === eltype(v) ||
                 return _constructpart(name, narrowed; context, narrowabstract=false)
         end
@@ -219,6 +224,8 @@ function _narrowlists(v::AbstractVector)
     # ArrowTypes value walk runs. Reject cycles and excessive nesting first,
     # without resolving any user traits.
     _preflightwritercontainers(v)
+    # map(identity, …) re-infers a narrowed element type from the values:
+    # inner maps narrow each row, the outer map narrows the column.
     w = map(x -> x isa AbstractVector ? map(identity, x) : x, v)
     w = map(identity, w)
     NT = Base.nonmissingtype(eltype(w))
@@ -240,7 +247,9 @@ end
 
 # An ArrowStrings column IS Utf8View memory: its payload vector is the views
 # buffer and its byte buffers are the variadic data buffers — no copy, no
-# String materialization; the declared nullability is the column's eltype's.
+# String materialization. Nullability comes from the column's eltype.
+# Both keywords are accepted for dispatch uniformity; a StringVector is
+# already Arrow memory, so no context or narrowing applies.
 function _constructpart(
     name::String,
     v::ArrowStrings.StringVector;
@@ -263,8 +272,9 @@ _missings_to(::Type{S}, v) where {S} =
 "Construct temporal ArrayData from nullable Int64 storage values."
 function _temporaldata(t::AC.ArrowType, storage::AbstractVector)
     _, d0 = AC.fromjulia("storage", storage)
-    # Date32 is the only facade temporal descriptor with 32-bit storage.
-    # All other facade temporal layouts retain the inferred Int64 buffer.
+    # Narrow to Int32 for any 32-bit temporal descriptor (Date32 fresh,
+    # Time32 retained); every other temporal layout keeps the inferred Int64
+    # buffer.
     buffers = d0.buffers
     if AC.primwidth(t) == 4
         narrow = Vector{Int32}(undef, length(storage))
@@ -355,7 +365,20 @@ _arrowtypesnativetype(T) =
         Dates.DateTime,
         Dates.Time,
         Dates.Period,
-    }
+    } || _zonedwritertype(T)
+
+# The TimeZones extension's write hooks. With the extension absent both
+# answer "not mine", so every column keeps this file's ordinary routes.
+function _zonedwritertype(T)
+    ext = Base.get_extension(@__MODULE__, :ArrowTimeZonesExt)
+    return ext !== nothing && ext.iszonedtype(T)
+end
+
+function _zonednativepart(name::String, v::AbstractVector, T)
+    ext = Base.get_extension(@__MODULE__, :ArrowTimeZonesExt)
+    ext === nothing && return nothing
+    return ext.zonednativepart(name, v, T)
+end
 
 function _arrowtypesneedstype(T, arrowtype, hasarrowname, depth::Int=0)
     depth < _MAX_WRITER_SCHEMA_DEPTH || throw(
@@ -395,8 +418,9 @@ function _arrowtypesneedstype(T, arrowtype, hasarrowname, depth::Int=0)
         return _arrowtypesneedstype(eltype(T), arrowtype, hasarrowname, depth + 1)
     end
     _arrowtypesnativetype(T) && return false
-    # Restore ArrowTypes' plain-struct writer without routing native facade
-    # values such as Dates through ArrowTypes' default StructKind.
+    # Plain concrete structs are written by field reflection; native facade
+    # values such as Dates must not be routed through ArrowTypes' default
+    # StructKind.
     return isconcretetype(T) && !isprimitivetype(T)
 end
 
@@ -481,9 +505,9 @@ function _writerroute(routes::_WriterTypeRoutes, runtime::Type)
     return route
 end
 
-_writerpromoteunion(T, S) = begin
+function _writerpromoteunion(T, S)
     promoted = promote_type(T, S)
-    _arrowtypesconcreteorunion(promoted) ? promoted : Union{T,S}
+    return _arrowtypesconcreteorunion(promoted) ? promoted : Union{T,S}
 end
 
 const _WRITER_CONVERSION_ERRORS = Union{MethodError,InexactError,OverflowError,TypeError}
@@ -558,27 +582,42 @@ function _writerconvertedcolumn(
     return out
 end
 
+# Function barrier for the known-storage lowering loop: the storage type is
+# computed at runtime, so specializing on it here keeps the per-element
+# toarrow/convert path monomorphic instead of boxing every lowered value.
+function _writerloweredcolumn(
+    ::Type{T},
+    v::AbstractVector,
+    context,
+    writertype::Type,
+    name::String,
+) where {T}
+    out = Vector{T}(undef, length(v))
+    for (i, value) in enumerate(v)
+        lowered = _writertoarrow(context, value, writertype, name)
+        out[i] = _writerconvertlowered(T, lowered, context, writertype, name)
+    end
+    return out
+end
+
 function _arrowtypesmappedcolumn(name::String, v::AbstractVector, declared, context)
     S = eltype(v)
     logical = Base.nonmissingtype(S)
     storage = Missing <: S ? Union{Missing,declared} : declared
+    # Buffer builders index from 1; a non-one-based vector must go through
+    # the copy path.
     S === storage && _arrowtypesconcreteorunion(S) && firstindex(v) == 1 && return v
 
-    # An empty logical column has no runtime evidence. Preserve a recursively
-    # materializable declared storage shape. Unsized Tuple and other
-    # inference-only declarations retain ArrowTypes' legacy Null fallback.
+    # An empty logical column has no runtime evidence. A recursively
+    # materializable declared storage shape is still authoritative; unsized
+    # Tuple and other inference-only declarations fall back to Arrow Null, as
+    # ArrowTypes.ToArrow does.
     isempty(v) &&
-        return _arrowtypesstorageisspecified(context, declared) ? Vector{storage}() :
-               Missing[]
+        return _arrowtypesstorageisspecified(context, declared) ? storage[] : Missing[]
 
     if _arrowtypesconcreteorunion(storage) ||
        _arrowtypesstorageisspecified(context, declared)
-        out = Vector{storage}(undef, length(v))
-        for (i, value) in enumerate(v)
-            lowered = _writertoarrow(context, value, logical, name)
-            out[i] = _writerconvertlowered(storage, lowered, context, logical, name)
-        end
-        return out
+        return _writerloweredcolumn(storage, v, context, logical, name)
     end
 
     lowered = Any[]
@@ -599,9 +638,10 @@ function _arrowtypesmappedcolumn(name::String, v::AbstractVector, declared, cont
         push!(observed, runtime)
     end
     if isempty(observed)
-        # Preserve ArrowTypes.ToArrow's all-missing/default fallback for a
-        # concrete logical declaration. Abstract inference-only storage has no
-        # shape evidence, so its only honest schema is the legacy Null field.
+        # A concrete logical declaration keeps ArrowTypes.ToArrow's
+        # all-missing fallback type. Abstract inference-only storage has no
+        # shape evidence, so the column is written as Arrow Null (what
+        # ToArrow returns: Missing[]).
         fallbacktype =
             _arrowtypesconcreteorunion(S) ? eltype(ArrowTypes.ToArrow(v)) : Missing
         return _writerconvertedcolumn(fallbacktype, lowered, context, logical, name)
@@ -699,6 +739,9 @@ function _constructarrowtypespart_impl(
             context,
         )
     end
+    # A logical type stored as Arrow Null is not nullable unless the column
+    # itself admits missing; otherwise the label's own values would read back
+    # as missing.
     nullable = f.type isa AC.NullType && !(Missing <: eltype(v)) ? false : f.nullable
     return _arrowtypeslogicalfield(context, f, logical; nullable=nullable), d
 end
@@ -743,7 +786,7 @@ function _arrowtypesstoragecolumn(
     )
 end
 
-"Construct a fresh dense Arrow Union from one concrete Julia Union element type."
+# Arrow Union child limit; shares the ArrowTypes storage-Union limit.
 const _MAX_WRITER_UNION_BRANCHES = _MAX_ARROWTYPE_UNION_BRANCHES
 const _MAX_INFERRED_WRITER_TYPES = 8
 
@@ -779,6 +822,7 @@ function _writeruniontype(types)
     return uniontype
 end
 
+"Construct a fresh dense Arrow Union from one concrete Julia Union element type."
 function _arrowtypesunioncolumn(
     name::String,
     v::AbstractVector;
@@ -787,7 +831,7 @@ function _arrowtypesunioncolumn(
 )
     variants = _checkedwritervariants("Arrow Union column $name", eltype(v))
 
-    childvalues = Any[Vector{T}() for T in variants]
+    childvalues = Any[T[] for T in variants]
     typeids = Vector{Int8}(undef, length(v))
     offsets = Vector{Int32}(undef, length(v))
     for (i, x) in enumerate(v)
@@ -869,7 +913,7 @@ function _arrowtypeslistcolumn(
         ArgumentError("ArrowTypes ListKind column $name must lower to AbstractVector rows"),
     )
     E = eltype(S)
-    flat = Vector{E}()
+    flat = E[]
     present = Bool[x !== missing for x in v]
     offsets = Vector{Int32}(undef, length(v) + 1)
     offsets[1] = 0
@@ -905,7 +949,10 @@ const _RETAINED_HIDDEN = _RetainedHidden()
 
 abstract type _MaskedChildValues{T} <: AbstractVector{T} end
 
-"Lazy physical child slots for fixed-size-list rows hidden by parent validity."
+"""
+Lazy view of a fixed-size-list column's child slots; slots under a missing or
+hidden row read as _RETAINED_HIDDEN.
+"""
 struct _MaskedFixedListValues{V<:AbstractVector} <: _MaskedChildValues{Any}
     rows::V
     width::Int
@@ -1167,10 +1214,11 @@ function _writercandidatefield!(
             end
             field, _ = _arrowtypesstoragecolumn(
                 "",
-                Vector{storage}();
+                storage[];
                 extension_shape=nestedshape,
                 context,
             )
+            # Null-storage nullability rule: see _constructarrowtypespart_impl.
             nullable = field.type isa AC.NullType && T !== Missing ? false : field.nullable
             return _arrowtypeslogicalfield(context, field, T; nullable)
         end
@@ -1192,6 +1240,11 @@ _placeholderadd(a::Int, b::Int) = a > typemax(Int) - b ? typemax(Int) : a + b
 _placeholdermul(a::Int, b::Int) =
     a == 0 || b == 0 ? 0 : a > typemax(Int) ÷ b ? typemax(Int) : a * b
 
+# Two keywords control hidden-slot synthesis, and every function below shares
+# them: `forcevalid` means an ancestor requires a NON-NULL value in this slot
+# (a dense Union child, an REE value run); `inactive` means the whole subtree
+# is unreachable, so validity is free and nothing must be synthesized valid.
+# Hence needvalid = !inactive && (forcevalid || !f.nullable).
 function _writercansynthesize(f::AC.Field; forcevalid::Bool=false, inactive::Bool=false)
     needvalid = !inactive && (forcevalid || !f.nullable)
     t = f.type
@@ -1701,7 +1754,7 @@ function _registeredwriterroutes(
     return routes
 end
 
-"Resolve one registered logical Field before any physical retained fallback."
+"Append `T` once, under `limit`, or throw naming `owner` and `kind`."
 function _writerpushtype!(
     types::Vector{Type},
     seen::Base.IdSet{Type},
@@ -1768,7 +1821,10 @@ function _writerregisterstorageinference!(context::_WriterContext, name::String,
     )
 end
 
-"Narrow one unresolved abstract declaration from whole-column runtime evidence."
+"""
+Narrow one unresolved abstract declaration from whole-column runtime evidence.
+Returns nothing when the declaration cannot be narrowed from runtime evidence.
+"""
 function _narrowabstractwriterparts(name::String, parts, context::_WriterContext)
     logical = nothing
     for part in parts
@@ -1865,6 +1921,10 @@ function _inferredstoragedeclaration(parts, context::_WriterContext; target=noth
     return logical => declared
 end
 
+"""
+One whole-column storage plan for an ArrowTypes mapping with abstract storage,
+or nothing when no plan applies.
+"""
 function _inferredstorageplan(
     name::String,
     parts,
@@ -1947,6 +2007,7 @@ function _constructinferredfreshpart(
 )
     ownshape = _writerextensionshape(context, plan.logical, plan.declared)
     field, data = _arrowtypesstoragecolumn(name, values; extension_shape=ownshape, context)
+    # Null-storage nullability rule: see _constructarrowtypespart_impl.
     nullable = field.type isa AC.NullType && !plan.nullable ? false : field.nullable
     return _arrowtypeslogicalfield(context, field, plan.logical; nullable), data
 end
@@ -2107,6 +2168,7 @@ end
 _registeredwriterplan(context::_WriterContext, f::AC.Field, values::AbstractVector) =
     _registeredwritercolumnplan(context, f, (values,))
 
+"A storage-domain placeholder value tree for one hidden slot under a retained Field."
 function _writerhiddenstorage(f::AC.Field; forcevalid::Bool=false, inactive::Bool=false)
     t = f.type
     if t isa AC.UnionType
@@ -2130,6 +2192,16 @@ function _writerhiddenstorage(f::AC.Field; forcevalid::Bool=false, inactive::Boo
     elseif t isa AC.RunEndEncodedType
         needvalid = !inactive && (forcevalid || !f.nullable)
         return _writerhiddenstorage(f.children[2]; forcevalid=needvalid, inactive)
+    elseif t isa AC.DictionaryType
+        # A dictionary index must point at something even in an inactive
+        # subtree, so a non-nullable dictionary always needs one pool entry
+        # (`_constructhiddenpart`'s dictionary branch shares this rule). In
+        # the value domain that entry is the VALUE field's placeholder, and
+        # it must be non-missing: value-level construction reads a missing
+        # value back as a null INDEX, which a needvalid slot cannot have.
+        needvalid = (!inactive && forcevalid) || !f.nullable
+        needvalid || return missing
+        return _writerhiddenstorage(AC.dictvaluefield(f, t); forcevalid=true)
     end
     return _retainedplaceholder(f; forcevalid=(!inactive && forcevalid))
 end
@@ -2156,6 +2228,9 @@ function _writerhiddenunionchild(
     return candidates[position]
 end
 
+# A Null-only child has exactly one logical value, so hidden and missing rows
+# only contribute child LENGTH. Visible rows are still validated for exact
+# width; no placeholder objects are allocated.
 function _writercompactfixednull(f::AC.Field)
     f.type isa AC.FixedSizeListType || return false
     length(f.children) == 1 || return false
@@ -2301,6 +2376,10 @@ function _constructhiddenpart(
         return _retainedfield(f), AC.ArrayData(t, n, AC.BufferSlice[]; nullcount=n)
     elseif t isa AC.DictionaryType
         valuefield = AC.dictvaluefield(f, t)
+        # Unlike the shared needvalid rule, `inactive` cannot waive validity
+        # here: a non-nullable dictionary's indices are all valid, so they
+        # must point at something — one pool entry — even in an inactive
+        # subtree.
         needvalid = (!inactive && forcevalid) || !f.nullable
         poollength = n == 0 || !needvalid ? 0 : 1
         rebuiltvaluefield, dictionary =
@@ -2579,9 +2658,7 @@ function _constructcompactfixednull(f::AC.Field, values, context::_WriterContext
         present[i] = value.value !== missing
         _writerpushstorage!(visible, value.value, f, value.writertype, context)
     end
-    # Validate every visible row and its exact width. The result is discarded:
-    # a Null-only child has one possible logical value, so length-only data is
-    # the same storage without allocating placeholders for inactive rows.
+    # Visible rows are validated then discarded; see _writercompactfixednull.
     isempty(visible) || _constructwriterstorage(f, visible, context)
     return _constructfixednullpart(f, present, context)
 end
@@ -2890,10 +2967,13 @@ _writerhasdeferred(value::Pair) =
 _writerhasdeferred(values::AbstractVector) = any(_writerhasdeferred, values)
 _writerhasdeferred(value) = false
 
-"Lower writer values under one Field, including slots hidden by a null parent."
+"""
+Empty storage vector typed for one Field's physical values (Any for Unions or
+unknown types).
+"""
 function _writerstoragevector(f::AC.Field)
     T = _declaredeltype(f, false)
-    return f.type isa AC.UnionType || T === Any ? Any[] : Vector{T}()
+    return f.type isa AC.UnionType || T === Any ? Any[] : T[]
 end
 
 function _writerpushstorage!(
@@ -3132,6 +3212,9 @@ function _constructmaskedwriterleaf(
     routes,
     context::_WriterContext,
 )
+    # The masked-leaf fast path writes one physical child. A nonzero route
+    # means the value belongs under a Union child, which this path cannot
+    # express.
     (routes === nothing || all(iszero, Base.values(routes))) || return nothing
     projection = _RegisteredMaskedLeafProjection(f, writetype, routes, context)
     masked = _constructmaskedleaf(f, values, projection)
@@ -3254,8 +3337,7 @@ function _arrowtypesfixedlistcolumn(
             )
     end
     masked = if any(!, present)
-        emptychildfield, _ =
-            _arrowtypeschildcolumn("item", Vector{E}(); extension_shape, context)
+        emptychildfield, _ = _arrowtypeschildcolumn("item", E[]; extension_shape, context)
         t = AC.FixedSizeListType(N)
         emptyfield = AC.Field(
             name,
@@ -3264,12 +3346,11 @@ function _arrowtypesfixedlistcolumn(
             children=AC.Field[emptychildfield],
         )
         if _writercompactfixednull(emptyfield)
-            # Only visible rows need logical validation. Missing parents add
-            # physical Null child length, not N Julia placeholder values.
+            # Only visible rows need validation; see _writercompactfixednull.
             if _writerplainfixednullshape(emptyfield)
                 return _constructplainfixednullpart(emptyfield, v, context)
             else
-                visible = Vector{E}()
+                visible = E[]
                 nvisible = count(identity, present)
                 sizehint!(visible, Base.checked_mul(nvisible, N))
                 for row in v
@@ -3286,7 +3367,7 @@ function _arrowtypesfixedlistcolumn(
         nothing
     end
     if masked === nothing
-        flat = Vector{E}()
+        flat = E[]
         sizehint!(flat, Base.checked_mul(length(v), N))
         for row in v
             append!(flat, row)
@@ -3330,18 +3411,13 @@ function _arrowtypesstructcolumn(
     for j = 1:nchildren
         FT = fieldtype(S, j)
         childname = string(names[j])
-        # A null parent does not make its children nullable in the Arrow
-        # schema. Child slots under a null parent are masked by the parent's
-        # validity bitmap. Build every hidden slot from the resolved child
-        # Field in the storage domain. This avoids both logical default
-        # constructors and duplicated variable payloads.
+        # A null parent does not make its children nullable; the parent's
+        # validity bitmap masks their slots. Build hidden slots from the
+        # resolved child Field in the storage domain — no logical default
+        # constructors, no duplicated variable payloads.
         cf, cd = if hasnull
-            emptychildfield, _ = _arrowtypeschildcolumn(
-                childname,
-                Vector{FT}();
-                extension_shape,
-                context,
-            )
+            emptychildfield, _ =
+                _arrowtypeschildcolumn(childname, FT[]; extension_shape, context)
             values = _freshstructchildvalues(Any, v, j)
             _constructwriterchild(emptychildfield, FT, values; context)
         else
@@ -3375,8 +3451,8 @@ function _arrowtypesmapcolumn(
     )
     K = keytype(S)
     V = valtype(S)
-    keys = Vector{K}()
-    values = Vector{V}()
+    keys = K[]
+    values = V[]
     present = Bool[x !== missing for x in v]
     offsets = Vector{Int32}(undef, length(v) + 1)
     offsets[1] = 0
@@ -3441,7 +3517,7 @@ function _registereddictionaryfield(context::_WriterContext, f::AC.Field)
     return valuefield, target
 end
 
-"Exact recursive identity for an inferred fresh value Field."
+"Recursive Field equality: name, type, nullability, ordered metadata, and children."
 function _fieldcontractequal(a::AC.Field, b::AC.Field)
     a.name == b.name || return false
     AC.typeequal(a.type, b.type) || return false
@@ -3454,7 +3530,10 @@ function _fieldcontractequal(a::AC.Field, b::AC.Field)
     return true
 end
 
-"Construct a new dictionary column through the same recursive value adapter."
+"""
+Assemble a fresh Int32-indexed dictionary Field and its first batch from
+already-built pool data.
+"""
 function _newdictfromdata(
     name::String,
     valuefield::AC.Field,
@@ -3471,21 +3550,6 @@ function _newdictfromdata(
         children=collect(AC.Field, valuefield.children),
     )
     return field, _dictbatch(field, indices, valuedata)
-end
-
-function _constructnewdict(
-    name::String,
-    pool::Vector,
-    indices::Vector;
-    nullable::Bool=any(ismissing, indices),
-    valuefield::Union{Nothing,AC.Field}=nothing,
-    writetype::Union{Nothing,Type}=nothing,
-    routes::Union{Nothing,_WriterTypeRoutes}=nothing,
-    context::_WriterContext=_WriterContext(),
-)
-    builtfield, valuedata =
-        _constructnewdictpooldata(name, pool; valuefield, writetype, routes, context)
-    return _newdictfromdata(name, builtfield, valuedata, indices; nullable)
 end
 
 "Construct a fresh dictionary's candidate categories before index encoding."
@@ -3509,8 +3573,9 @@ function _constructnewdictpooldata(
                 "ArrowTypes metadata identical across the column",
             ),
         )
-        # Evidence is the schema authority. The writer adapter supplied
-        # matching fresh ArrayData; this is not retained reconstruction.
+        # The inferred value Field stays the schema; the writer adapter only
+        # supplied matching fresh ArrayData, so this is not retained
+        # reconstruction.
         builtfield = valuefield
     end
     return builtfield, valuedata
@@ -3967,9 +4032,7 @@ function _retainedlist(f::AC.Field, v::AbstractVector, context::_WriterContext)
         all(row -> row === missing || row === _RETAINED_HIDDEN, v) &&
         return _constructhiddenpart(f, length(v), context)
     if t isa AC.FixedSizeListType && _writercompactfixednull(f)
-        # Validate the visible rows once, but represent every missing or
-        # ancestor-hidden row through the final child length. This avoids N
-        # heap objects per hidden parent while preserving exact row widths.
+        # Hidden rows cost child length only; see _writercompactfixednull.
         plain = _writerplainfixednullshape(f)
         plain && return _constructplainfixednullpart(f, v, context)
         visible = Any[]
@@ -4338,6 +4401,9 @@ function _constructwriterunion(f::AC.Field, v::AbstractVector, context::_WriterC
     t.mode == AC.SparseMode && foreach(values -> sizehint!(values, length(v)), childvalues)
     typeids = Vector{Int8}(undef, length(v))
     offsets = t.mode == AC.DenseMode ? Vector{Int32}(undef, length(v)) : nothing
+    # Sparse Union: every active child needs a value in every slot. nothing
+    # marks children with no rows at all; _RETAINED_HIDDEN marks compacted
+    # Null-only children, whose hidden rows cost length only.
     hidden = if active === nothing || isempty(v)
         nothing
     else
@@ -4614,11 +4680,11 @@ function _constructretainedpart(
     context::_WriterContext,
 )
     _checkretainedidentity(f, t, v)
-    # Non-temporal: build naturally, then impose the retained descriptor —
-    # types must agree and nullability comes from the RETAINED field (values
-    # holding missing under a non-nullable field are a replacement error).
-    # List fields impose RECURSIVELY: retained identity includes the child
-    # fields (names, nullability, metadata) and each level's list width.
+    # Build the column naturally, then impose the retained descriptor: types
+    # must match and nullability comes from the retained field. Missing values
+    # under a non-nullable field mean the column was replaced. For lists this
+    # applies recursively — child names, nullability, metadata, and each
+    # level's width are part of retained identity.
     fn, dn = _constructpart(f.name, v; context)
     AC.typeequal(fn.type, t) || throw(
         ArgumentError(
@@ -4676,7 +4742,7 @@ end
 # Encoding identity belongs to the lowered Arrow storage domain. These
 # wrappers provide structural hashing and equality without calling a logical
 # value's overloadable `hash`, `isequal`, `==`, or `isless` methods. Dictionary
-# compaction and run-end compaction share this rule.
+# pool dedup, dictionary compaction, and run-end compaction share this rule.
 struct _WriterStorageKey{T}
     value::T
 end
@@ -4735,6 +4801,8 @@ function _writerstorageequal(left, right, depth::Int=0)
         return true
     end
     if left isa AbstractFloat || right isa AbstractFloat
+        # Compare floats by bits: pool compaction must keep 0.0 and -0.0
+        # distinct and must treat identical NaN payloads as one category.
         typeof(left) === typeof(right) || return false
         left isa Float16 && return reinterpret(UInt16, left) === reinterpret(UInt16, right)
         left isa Float32 && return reinterpret(UInt32, left) === reinterpret(UInt32, right)
@@ -4750,6 +4818,9 @@ function _writerstorageequal(left, right, depth::Int=0)
         return typeof(left) === typeof(right) && left === right
     end
     typeof(left) === typeof(right) || return false
+    # Mutable values have no structural identity we may trust; compare by
+    # reference and hash by objectid, so equal-but-distinct mutables stay
+    # separate categories.
     Base.ismutabletype(typeof(left)) && return left === right
     fieldcount(typeof(left)) == fieldcount(typeof(right)) || return false
     for i = 1:fieldcount(typeof(left))
@@ -4805,6 +4876,7 @@ function _writerstoragehash(value, seed::UInt, depth::Int=0)
         return h
     end
     if value isa AbstractFloat
+        # Hash floats by bits, matching _writerstorageequal.
         h = hash(typeof(value), hash(UInt8(0x09), seed))
         bits =
             value isa Float16 ? reinterpret(UInt16, value) :
@@ -4815,6 +4887,7 @@ function _writerstoragehash(value, seed::UInt, depth::Int=0)
         return hash(value, hash(typeof(value), hash(UInt8(0x0a), seed)))
     end
     h = hash(typeof(value), hash(UInt8(0x0b), seed))
+    # Mutables hash by objectid, matching _writerstorageequal's `===` rule.
     Base.ismutabletype(typeof(value)) && return hash(objectid(value), h)
     for i = 1:fieldcount(typeof(value))
         h = _writerstoragehash(getfield(value, i), h, depth + 1)
@@ -4845,18 +4918,29 @@ function _dictionarypool(vals, retainedpool; writetype=nothing)
                 "cannot infer a dictionary value type from empty or all-missing columns",
             ),
         )
-        pool = Vector{T}()
+        pool = T[]
     else
         pool = collect(retainedpool)
     end
-    seen = IdDict{Any,Nothing}()
+    # Dedup with the non-overloadable structural key `_compactdictionarypool`
+    # also uses: logical values may overload `hash`/`isequal`, so only the
+    # `_WriterStorageKey` relation (bit-pattern floats, `===`/objectid for
+    # mutables) may pre-merge categories. Exact value-based dedup of the
+    # LOWERED categories still happens in `_compactdictionarypool`, in the
+    # storage domain; this pass only keeps the candidate pool at
+    # O(distinct-under-that-policy) instead of O(rows).
+    seen = Dict{_WriterStorageKey,Nothing}()
     for x in pool
-        x === missing || haskey(seen, x) || (seen[x] = nothing)
+        x === missing && continue
+        key = _WriterStorageKey(x)
+        haskey(seen, key) || (seen[key] = nothing)
     end
     for v in vals, x in v
-        if x !== missing && !haskey(seen, x)
+        x === missing && continue
+        key = _WriterStorageKey(x)
+        if !haskey(seen, key)
             push!(pool, x)
-            seen[x] = nothing
+            seen[key] = nothing
         end
     end
     return pool
@@ -4969,7 +5053,7 @@ function _dictionaryevidence(
     end
     # Field evidence is type-derived. Constructing row data here would lower
     # every repeated category once for each row before the unique pool exists.
-    field, _ = _constructpart(name, Vector{declared}(); context)
+    field, _ = _constructpart(name, declared[]; context)
     routes = if declared isa Union
         _directunionroutes(declared)
     else
@@ -5045,17 +5129,21 @@ end
 
 "First pool position for each non-null value; duplicate categories stay intact."
 function _dictionarylookup(pool)
-    lookup = IdDict{Any,Int64}()
+    # Same `_WriterStorageKey` policy as `_dictionarypool`: no user-overloadable
+    # `hash`/`isequal` participates in encoding identity.
+    lookup = Dict{_WriterStorageKey,Int64}()
     for (i, x) in enumerate(pool)
-        x === missing || haskey(lookup, x) || (lookup[x] = Int64(i - 1))
+        x === missing && continue
+        key = _WriterStorageKey(x)
+        haskey(lookup, key) || (lookup[key] = Int64(i - 1))
     end
     return lookup
 end
 
 function _dictionaryindices(v, lookup, missingindex=nothing)
     return Union{Missing,Int64}[
-        x === missing ? (missingindex === nothing ? missing : missingindex) : lookup[x] for
-        x in v
+        x === missing ? (missingindex === nothing ? missing : missingindex) :
+        lookup[_WriterStorageKey(x)] for x in v
     ]
 end
 
@@ -5192,20 +5280,6 @@ function _retaineddictfromdata(
     return field, _dictbatch(field, firstidx, valuedata)
 end
 
-function _retaineddict(
-    rf::AC.Field,
-    pool::Vector,
-    firstidx::Vector,
-    name::String;
-    valuefield::Union{Nothing,AC.Field}=nothing,
-    context::_WriterContext=_WriterContext(),
-)
-    t = rf.type::AC.DictionaryType
-    constructionfield = valuefield === nothing ? AC.dictvaluefield(rf, t) : valuefield
-    vf, vd = _constructpart(constructionfield, pool; context)
-    return _retaineddictfromdata(rf, vf, vd, length(pool), firstidx, name)
-end
-
 _withfieldmetadata(f::AC.Field, ::Nothing) = f
 function _withfieldmetadata(f::AC.Field, metadata::Vector{Pair{String,String}})
     # Explicit application metadata augments retained/extension metadata.
@@ -5229,6 +5303,10 @@ This is the sole column-policy seam used by the write facade. It owns fresh
 inference, retained reconstruction, ArrowTypes lowering, dictionary pooling,
 partition agreement, and field metadata. The returned data vector is in the
 same order as `parts`.
+
+`retained` is the Field a rewrite must reproduce; `poolhints` carries one
+retained dictionary-pool snapshot (or nothing) per partition, enforced below;
+`metadata` is explicit application metadata merged onto the final Field.
 """
 function _constructcolumn(
     name::Symbol,
@@ -5276,8 +5354,8 @@ function _constructcolumn(
                 )
             # Table materialization already lifts retained pool snapshots
             # through the dictionary value Field. They stay in the same
-            # logical domain as row values until `_retaineddict` lowers the
-            # merged pool exactly once.
+            # logical domain as row values until the merged pool is lowered
+            # exactly once through `_constructpart` on that value Field below.
         end
 
         inferreddeclaration = if retained === nothing

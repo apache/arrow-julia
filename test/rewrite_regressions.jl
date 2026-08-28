@@ -14,6 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Regressions in read-then-rewrite fidelity: bytes read through Arrow.Table
+# and re-emitted with Arrow.write must preserve names, descriptors, dictionary
+# order, metadata order, and null typing. Plus reader-budget accounting.
+
 module RewriteRegressions
 
 using Test
@@ -464,6 +468,90 @@ end
             coalesce_gap=0,
         )
         @test_throws Arrow.AllocationLimitError Arrow.Table(wholesource)
+    end
+
+    @testset "DictEncode pools dedup structurally before construction" begin
+        # Identity-only dedup used to build an O(rows) candidate pool for
+        # identity-distinct (mutable) categories such as Vector{Int} rows.
+        rows = [isodd(i) ? [1, 2] : [3, 4] for i = 1:50_000]
+        pool = Arrow._dictionarypool(AbstractVector[rows], nothing)
+        @test length(pool) == 2
+        @test pool == [[1, 2], [3, 4]]
+
+        io = IOBuffer()
+        Arrow.write(io, (v=Arrow.DictEncode(rows),); file=false)
+        bytes = take!(io)
+        back = Arrow.readstream(bytes)
+        @test back.schema.fields[1].type isa AC.DictionaryType
+        @test length(back.batches[1].columns[1].dictionary::AC.ArrayData) == 2
+        @test isequal(Arrow.Table(bytes).v, rows)
+
+        # The `_WriterStorageKey` policy is preserved exactly: floats compare
+        # by bits (0.0 and -0.0 stay distinct, one NaN payload is one
+        # category) and mutable structs compare by reference.
+        floatpool =
+            Arrow._dictionarypool(AbstractVector[Float64[0.0, -0.0, NaN, NaN]], nothing)
+        @test length(floatpool) == 3
+        a = Ref(1)
+        b = Ref(1)
+        refpool = Arrow._dictionarypool(AbstractVector[[a, b, a]], nothing)
+        @test length(refpool) == 2
+    end
+
+    @testset "hidden dictionary slots synthesize through the value field" begin
+        valuefield, _ = AC.fromjulia("d", ["x"])
+        dicttype = AC.DictionaryType(AC.IntType(32, true), valuefield.type, false)
+        nullabledict = AC.Field("d", dicttype; nullable=true)
+        nonnullabledict = AC.Field("d", dicttype; nullable=false)
+        @test Arrow._writercansynthesize(nonnullabledict; inactive=true)
+        # A nullable dictionary in an inactive subtree may null its index.
+        @test Arrow._writerhiddenstorage(nullabledict; inactive=true) === missing
+        # A non-nullable dictionary's index stays valid even in an inactive
+        # subtree, so the placeholder is the VALUE field's placeholder; this
+        # used to throw "cannot synthesize hidden child data for retained
+        # DictionaryType field", contradicting _writercansynthesize.
+        @test Arrow._writerhiddenstorage(nonnullabledict; inactive=true) == ""
+        @test Arrow._writerhiddenstorage(nullabledict; forcevalid=true) == ""
+
+        intvaluefield, _ = AC.fromjulia("d", Int64[1])
+        intdicttype = AC.DictionaryType(AC.IntType(32, true), intvaluefield.type, false)
+        intdict = AC.Field("d", intdicttype; nullable=false)
+        @test Arrow._writerhiddenstorage(intdict; inactive=true) === Int64(0)
+    end
+
+    # Arrow 2.x's FlatBuffers builder deduplicates vtables comparing slot
+    # offsets only, so a DictionaryEncoding table can reuse a KeyValue vtable
+    # whose declared object length understates the id field's extent. The
+    # verifier must bound inline fields by the buffer (as the reference
+    # implementation does), not by the reused vtable's object length, or
+    # every 2.x file with a dict-encoded, metadata-carrying field is refused.
+    # Fixtures written by registered Arrow 2.8.1 (+ CategoricalArrays 1.1.1
+    # for the categorical pair).
+    @testset "2.x vtable dedup: dict-encoded fields with metadata read" begin
+        fixture(name) = read(joinpath(@__DIR__, "fixtures2x", name * ".arrowbytes"))
+
+        t = Arrow.Table(fixture("dict-ext-metadata"))
+        @test t.a == [1, 2, 1]
+        @test "ARROW:extension:name" in collect(DataAPI.colmetadatakeys(t, :a))
+
+        t = Arrow.Table(fixture("colmeta-plain"))
+        @test t.a == [1, 2]
+        @test DataAPI.colmetadata(t, :a, "k") == "v"
+
+        # The CategoricalArrays extension labels are unregistered here, so the
+        # reader warns and falls back to the dictionary's storage values.
+        t =
+            @test_logs (:warn, r"unsupported ARROW:extension:name") match_mode = :any Arrow.Table(
+                fixture("categorical-column"),
+            )
+        @test t.x == ["a", "b", "a", "c"]
+
+        t =
+            @test_logs (:warn, r"unsupported ARROW:extension:name") match_mode = :any Arrow.Table(
+                fixture("categorical-missing"),
+            )
+        @test isequal(t.y, ["a", missing, "b"])
+        @test eltype(t.y) == Union{Missing,String}
     end
 end
 

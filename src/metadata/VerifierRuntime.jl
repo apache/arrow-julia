@@ -61,6 +61,9 @@ VerifyContext() = VerifyContext(typemax(Int64), typemax(Base.Int), typemax(Int64
 # directed by verified metadata. String payload bytes are charged on every
 # logical getter occurrence. Message bodies remain zero-copy and have their
 # own body/buffer byte limits at the adapter.
+# Deliberate over-estimates of the Julia object a getter may later
+# materialize per table, per vector, per vector element, and per string. They
+# only need to be upper bounds; a tighter figure would buy nothing.
 const METADATA_OBJECT_RESERVE = Int64(2048)
 const METADATA_VECTOR_BASE_RESERVE = Int64(256)
 const METADATA_VECTOR_ELEMENT_RESERVE = Int64(1024)
@@ -155,6 +158,10 @@ function _vtable(bytes::Vector{UInt8}, pos::Int64)
     return VTable(bytes, pos, vpos, vlen, olen)
 end
 
+# vtable layout: [vlen][olen][slot offset]*. Slot i's entry is at vpos+4+2i;
+# an entry past vlen, or a zero entry, means the field is absent and the
+# getter returns its default. A field offset below 4 would overlap the
+# table's own soffset back-pointer.
 function _vfield(t::VTable, slot::Base.Int, width::Base.Int=1; required::Base.Bool=false)
     ep = t.vpos + 4 + 2slot
     if ep + 2 > t.vpos + t.vlen
@@ -166,7 +173,13 @@ function _vfield(t::VTable, slot::Base.Int, width::Base.Int=1; required::Base.Bo
         required && _vfail("required table slot $slot is absent")
         return nothing
     end
-    off >= 4 && off + width <= t.olen || _vfail("table slot $slot exceeds object")
+    # Do not bound inline fields by the vtable's declared object length:
+    # builders in the Go lineage (including Arrow.jl 2.x) deduplicate vtables
+    # comparing slot offsets only, so a reused vtable can understate olen for
+    # a wider field (e.g. a DictionaryEncoding id sharing a two-ref KeyValue
+    # vtable). The reference verifier bounds inline fields by the buffer,
+    # which the _vrange below enforces.
+    off >= 4 || _vfail("table slot $slot overlaps the table header")
     p = t.pos + off
     _vrange(t.bytes, p, Int64(width), "table slot $slot")
     width > 1 && p % min(width, 8) != 0 && _vfail("table slot $slot is misaligned")

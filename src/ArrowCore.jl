@@ -256,6 +256,9 @@ struct OwnerRegion
             lastaddr <= UInt128(typemax(UInt)) ||
                 throw(ArgumentError("region extent wraps the native address space"))
         end
+        # OR-ing in 64 caps the detected alignment at 64 bytes without a
+        # branch; a NULL (necessarily empty) region reports the cap, since
+        # nothing loads from it.
         align = ptr == C_NULL ? 64 : (1 << trailing_zeros(UInt(ptr) | UInt(64)))
         return new(ptr, n, align, root, cell)
     end
@@ -305,6 +308,15 @@ else
     end
 end
 
+# Map from a caller-owned open `io` (the caller closes it; the mapping
+# outlives the descriptor); `label` names the mapping in errors.
+function _mmapregion(io::IO, label)
+    arr = Mmap.mmap(io, Vector{UInt8})
+    isempty(arr) && throw(ArgumentError("cannot map empty file: $label"))
+    cell = ReleaseCell(@cfunction(_release_mmap, Cvoid, (Ptr{Cvoid},)), _mmaproot(arr))
+    return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr); root=arr, cell=cell)
+end
+
 """
     mmapregion(path) -> OwnerRegion
 
@@ -317,13 +329,6 @@ while the region or any cached validation result remains in use: a shared
 mapping cannot keep a semantic certificate valid when another process
 changes its bytes, and truncation can make an in-range load fault.
 """
-function _mmapregion(io::IO, label)
-    arr = Mmap.mmap(io, Vector{UInt8})
-    isempty(arr) && throw(ArgumentError("cannot map empty file: $label"))
-    cell = ReleaseCell(@cfunction(_release_mmap, Cvoid, (Ptr{Cvoid},)), _mmaproot(arr))
-    return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr); root=arr, cell=cell)
-end
-
 function mmapregion(path::AbstractString)
     io = open(path, "r")
     try
@@ -729,9 +734,9 @@ layoutspec(t::UnionType) =
 layoutspec(t::DictionaryType) =
     LayoutSpec(VALIDITY_DATA, 0, 0, primwidth(t.indextype), false)
 layoutspec(::ViewType) = LayoutSpec(VALIDITY_VIEWS, 0, 0, 16, true)
-layoutspec(t::ListViewType) =
 # ListView has one offset and one size per parent slot. These are not
 # the length+1 monotone range offsets used by List/Utf8/Binary.
+layoutspec(t::ListViewType) =
     LayoutSpec(VALIDITY_ELEMENT_OFFSETS_SIZES, 1, t.large ? 8 : 4, 0, false)
 # REE: no top-level validity; run_ends and values are CHILDREN, not buffers.
 layoutspec(::RunEndEncodedType) = LayoutSpec(NO_BUFFERS, 2, 0, 0, false)
@@ -929,7 +934,23 @@ end
 
 function expected_validity_bytes(len::Int64)
     len >= 0 || throw(ArgumentError("negative bitmap length"))
-    return checked_add(len, Int64(7)) >> 3
+    # `len + 7` can overflow a hostile logical extent; the requirement is
+    # then unsatisfiable, which is a validation failure, not a raw
+    # `OverflowError`.
+    len <= typemax(Int64) - 7 ||
+        throw(ValidationError("required bitmap bytes overflow Int64 for $len slots"))
+    return (len + 7) >> 3
+end
+
+# Structural requirements multiply untrusted logical extents. When the
+# product overflows Int64 no real buffer or child can satisfy it, so it
+# surfaces as the same ValidationError an undersized one gets, not as a
+# raw `OverflowError`. Both operands are non-negative at every call site.
+@inline function _required_extent(count::Int64, width::Int64, what::AbstractString)
+    count == 0 ||
+        width <= div(typemax(Int64), count) ||
+        throw(ValidationError("required $what overflows Int64 ($count × $width)"))
+    return count * width
 end
 
 # Runtime descriptor equality must compare values, not only Julia types.
@@ -1175,7 +1196,13 @@ function _validate_structural(
             "$(descriptorname(d.type)): expected $(spec.variadic ? "at least " : "")$nfixed buffers, got $(length(d.buffers))",
         ),
     )
-    total::Int64 = checked_add(d.len, d.offset)
+    # `len` and `offset` are individually non-negative (constructor
+    # invariant), but hostile metadata can still declare a sum past Int64 —
+    # surface that as ValidationError, not a raw OverflowError.
+    d.len <= typemax(Int64) - d.offset || throw(
+        ValidationError("array length $(d.len) plus offset $(d.offset) overflows Int64"),
+    )
+    total::Int64 = d.len + d.offset
     declared_nulls = @atomic :monotonic d.nullcount
     for (i, role) in enumerate(spec.buffers)
         b = d.buffers[i]
@@ -1193,7 +1220,7 @@ function _validate_structural(
             )
         elseif role == DATA
             if spec.fixedwidth > 0
-                need = checked_mul(total, Int64(spec.fixedwidth))
+                need = _required_extent(total, Int64(spec.fixedwidth), "data buffer bytes")
                 b.len >= need ||
                     throw(ValidationError("data buffer too small: $(b.len) < $need bytes"))
             elseif spec.fixedwidth == -1   # bit-packed (Bool)
@@ -1207,21 +1234,29 @@ function _validate_structural(
             # buffer. A sliced empty array (`offset > 0`) still needs the
             # physical prefix that its offset addresses.
             isempty_buffer(b) && d.len == 0 && d.offset == 0 && continue
-            need = checked_mul(checked_add(total, Int64(1)), Int64(spec.offsetwidth))
+            # `total + 1` offset slots: the +1 itself can overflow a hostile
+            # extent.
+            total < typemax(Int64) ||
+                throw(ValidationError("required offsets buffer bytes overflow Int64"))
+            need = _required_extent(
+                total + Int64(1),
+                Int64(spec.offsetwidth),
+                "offsets buffer bytes",
+            )
             b.len >= need ||
                 throw(ValidationError("offsets buffer too small: $(b.len) < $need bytes"))
         elseif role == ELEMENT_OFFSETS
-            need = checked_mul(total, Int64(spec.offsetwidth))
+            need = _required_extent(total, Int64(spec.offsetwidth), "element-offsets bytes")
             b.len >= need || throw(
                 ValidationError("element-offsets buffer too small: $(b.len) < $need bytes"),
             )
         elseif role == SIZES
-            need = checked_mul(total, Int64(spec.offsetwidth))
+            need = _required_extent(total, Int64(spec.offsetwidth), "sizes buffer bytes")
             b.len >= need || throw(ValidationError("sizes buffer too small"))
         elseif role == TYPE_IDS
             b.len >= total || throw(ValidationError("type_ids buffer too small"))
         elseif role == VIEWS
-            need = checked_mul(total, Int64(16))
+            need = _required_extent(total, Int64(16), "views buffer bytes")
             b.len >= need || throw(ValidationError("views buffer too small"))
         end
     end
@@ -1256,7 +1291,7 @@ function _validate_structural(
     end
     fslt = d.type
     if fslt isa FixedSizeListType
-        need = checked_mul(total, Int64(fslt.listsize))
+        need = _required_extent(total, Int64(fslt.listsize), "fixed-size-list child length")
         length(d.children[1]) >= need || throw(
             ValidationError(
                 "fixed-size-list child too short: $(length(d.children[1])) < $need",
@@ -1332,9 +1367,9 @@ end
 # Field's single declared child; dictionary values reuse the field with the
 # value type.
 childfields(f::Field) = f.children
-dictvaluefield(f::Field, t::DictionaryType) =
 # Dictionary values have their own nullability. The index field's
 # nullable flag describes only the indices and cannot constrain the pool.
+dictvaluefield(f::Field, t::DictionaryType) =
     Field(f.name, t.valuetype; nullable=true, children=f.children)
 
 const MILLISECONDS_PER_DAY = Int64(86_400_000)
@@ -1537,7 +1572,8 @@ function _validate_semantic_intrinsic(
         end
         if t isa UnionType
             ids = rolebuffer(d, TYPE_IDS)
-            lastoffset = fill(Int64(-1), length(d.children))
+            # Dense-mode-only bookkeeping; sparse unions never read it.
+            lastoffset = t.mode == DenseMode ? fill(Int64(-1), length(d.children)) : Int64[]
             for i = 1:d.len
                 tid = loadat(ids, Int8, _slotindex0(d, Int64(i)))
                 pos = findfirst(==(tid), t.typeids)
@@ -1575,10 +1611,15 @@ function _validate_semantic_intrinsic(
                 ),
             )
         elseif declared_nulls < 0
+            # Promote the unknown sentinel to the counted value: later
+            # structural checks on this same array then enforce the
+            # absent-bitmap rule against a known count instead of skipping it.
             @atomic :monotonic d.nullcount = actual_nulls
         end
         @atomic :monotonic d.semachecked = true
     end
+    # The cache flag is per-node, so recurse even when this node is cached:
+    # each child short-circuits on its own flag.
     for (cf, cd) in zip(childfields(f), d.children)
         _validate_semantic_intrinsic(cf, cd, validated_dictionaries)
     end
@@ -1615,8 +1656,9 @@ Semantic checks for Utf8View/BinaryView: non-null long entries must point
 inside their indicated variadic buffer, and the inline prefix MUST be a copy
 of the referenced data's first four bytes (the spec's comparison-fast-path
 contract). Null entries' bytes are unrestricted by the spec, so only valid
-slots are checked; canonical zero-padding of short entries' unused inline
-bytes remains a `validate_full`-tier concern alongside canonical bitmaps.
+slots are checked. Canonical zero-padding of short entries' unused inline
+bytes is a writer recommendation no validation tier enforces:
+`validate_full`'s canonical-form checks cover bit-packed buffers only.
 """
 function _validate_view_values(t::ViewType, d::ArrayData)
     views = rolebuffer(d, VIEWS)
@@ -1630,8 +1672,10 @@ function _validate_view_values(t::ViewType, d::ArrayData)
         off = Int64(loadat(views, Int32, checked_add(base, Int64(12))))
         data = _viewdatabuffer(d, bufidx)
         off >= 0 || throw(ValidationError("negative view offset $off"))
-        checked_add(off, Int64(len)) <= data.len ||
-            throw(ValidationError("view range [$off, $len) escapes data buffer $bufidx"))
+        # Both operands are 32-bit loads, so the sum cannot overflow Int64.
+        checked_add(off, Int64(len)) <= data.len || throw(
+            ValidationError("view range [$off, $(off + len)) escapes data buffer $bufidx"),
+        )
         for k = 0:3
             loadat(views, UInt8, checked_add(base, Int64(4 + k))) ==
             loadat(data, UInt8, checked_add(off, Int64(k))) ||
@@ -1667,8 +1711,15 @@ function _validate_listview_values(t::ListViewType, d::ArrayData)
         off, sz = _listview_range(t, d, Int64(i))
         (off >= 0 && sz >= 0) ||
             throw(ValidationError("list-view offset and size must be non-negative"))
-        checked_add(off, sz) <= childlen || throw(
-            ValidationError("list-view range [$off, $sz) escapes child length $childlen"),
+        # Subtraction form: `off + sz` on two hostile 64-bit loads can
+        # overflow Int64 (which must read as invalid data, not a raw
+        # `OverflowError`); the message widens to Int128 so the true
+        # endpoint prints either way.
+        (off <= childlen && sz <= childlen - off) || throw(
+            ValidationError(
+                "list-view range [$off, $(Int128(off) + Int128(sz))) escapes " *
+                "child length $childlen",
+            ),
         )
     end
     return nothing
@@ -1734,17 +1785,8 @@ function _logical_null_at(f::Field, d::ArrayData, i::Int64)
         return _logical_null_at(f.children[2], d.children[2], run)
     end
     if t isa UnionType
-        tid = loadat(rolebuffer(d, TYPE_IDS), Int8, _slotindex0(d, i))
-        pos = findfirst(==(tid), t.typeids)
-        pos === nothing &&
-            throw(ValidationError("union type id $tid not in declared domain"))
-        childi = if t.mode == DenseMode
-            off = loadat(rolebuffer(d, ELEMENT_OFFSETS), Int32, _slotbyteoff(d, i, 4))
-            checked_add(Int64(off), Int64(1))
-        else
-            checked_add(d.offset, i)
-        end
-        return _logical_null_at(f.children[pos], d.children[pos], childi)
+        cf, cd, childi = _union_child(f, d, i)
+        return _logical_null_at(cf, cd, childi)
     end
     spec = layoutspec_of(t)
     return !isempty(spec.buffers) && spec.buffers[1] == VALIDITY && !isvalid_at(d, i)
@@ -1930,8 +1972,8 @@ function _validate_canonical_bits(d::ArrayData)
         role == VALIDITY || (role == DATA && d.type isa BoolType) || continue
         b = d.buffers[idx]
         nbytes = Int64(cld(d.len, 8))
-        b.len >= nbytes || continue     # absent/short bitmaps are the
-        # structural tier's concern
+        # Absent or short bitmaps are the structural tier's concern.
+        b.len >= nbytes || continue
         tail = d.len % 8
         if tail != 0
             mask = UInt8(0xff) << tail
@@ -2022,7 +2064,16 @@ juliatype(::MapType) = Vector{Pair{Any,Any}}
         t.bits == 16 && return Int64(loadat(b, Int16, byteoff))
         return Int64(loadat(b, Int8, byteoff))
     else
-        t.bits == 64 && return Int64(loadat(b, UInt64, byteoff))
+        if t.bits == 64
+            u = loadat(b, UInt64, byteoff)
+            # Explicit range check: a stored UInt64 above typemax(Int64) is
+            # out of domain for every Int64-typed consumer (dictionary
+            # lengths and run ends are Int64), and a bare `Int64(u)` would
+            # leak an `InexactError` through the validation tier.
+            u <= UInt64(typemax(Int64)) ||
+                throw(ValidationError("unsigned 64-bit value $u exceeds the Int64 range"))
+            return Int64(u)
+        end
         t.bits == 32 && return Int64(loadat(b, UInt32, byteoff))
         t.bits == 16 && return Int64(loadat(b, UInt16, byteoff))
         return Int64(loadat(b, UInt8, byteoff))
@@ -2058,16 +2109,16 @@ function _materialization_limit_exceeded! end
     # Julia stores one selector byte per element beside an isbits-Union
     # vector's ordinary payload.
     Base.isbitsunion(T) && (payload = checked_add(payload, Int64(n)))
-    # Julia 1.11's `Memory` backing store may round a just-over-half-full
-    # allocation to the next size class. The measured worst case approaches
-    # twice the requested payload. Reserve that full capacity plus both the
-    # Vector and Memory headers; using the logical payload alone can let one
-    # package-owned allocation exceed the caller's budget by almost 2x.
     # Supported Julia runtimes allocate at most one 64-byte object for an
     # empty Vector after warm-up. Charging the nonempty 128-byte header model
     # per empty nested value rejects compact Arrow columns by hundreds of
     # megabytes even though their materialized empty containers are small.
     payload == 0 && return Int64(64)
+    # Julia 1.11's `Memory` backing store may round a just-over-half-full
+    # allocation to the next size class. The measured worst case approaches
+    # twice the requested payload. Reserve that full capacity plus both the
+    # Vector and Memory headers; using the logical payload alone can let one
+    # package-owned allocation exceed the caller's budget by almost 2x.
     capacity = checked_mul(Int64(2), payload)
     return checked_add(Int64(128), capacity)
 end
@@ -2814,9 +2865,8 @@ end
     materialize(field, data) -> Vector
 
 Bulk conversion to native Julia values: resolve the layout ONCE, then run
-a specialized loop behind a function barrier. `_materialize_loop` is generic over the concrete
-descriptor type it receives, so the loop body compiles per LAYOUT (a small
-closed set), never per schema.
+a specialized loop behind a function barrier — the loop body compiles per
+LAYOUT (a small closed set), never per schema.
 """
 materialize(f::Field, d::ArrayData) = _materialize_of(d.type, f, d)
 
@@ -2906,13 +2956,13 @@ end
 # struct/map): the read produces exactly that type or refuses with a clear
 # error. `Any` is the dynamic path unchanged.
 #
-# Recursion architecture, stated loudly: it mirrors the dynamic path
-# exactly. Recursive edges route through `_typedchild` — a COMPILED
-# function whose argument types are all concrete (like public `getvalue`
-# on the dynamic side) — so the cycle's one non-inlined call is fully
-# resolvable; the `@inline` ladder and leaf methods flatten into it. An
-# `@inline` ladder call carrying an abstract descriptor as the recursive
-# edge is unresolvable under trim (no standalone specialization exists).
+# Recursion architecture: it mirrors the dynamic path exactly. Recursive
+# edges route through `_typedchild` — a COMPILED function whose argument
+# types are all concrete (like public `getvalue` on the dynamic side) — so
+# the cycle's one non-inlined call is fully resolvable; the `@inline`
+# ladder and leaf methods flatten into it. An `@inline` ladder call
+# carrying an abstract descriptor as the recursive edge is unresolvable
+# under trim (no standalone specialization exists).
 # ---------------------------------------------------------------------------
 
 """
@@ -3112,19 +3162,17 @@ end
     throw(ArgumentError("unregistered ArrowType"))
 end
 
-# Typed recursion enters children HERE: the same logical-bounds guard the
-# dynamic path gets from public `getvalue` — unvalidated geometry must not
-# read hidden backing values past a child's logical length. COMPILED with
-# all-concrete argument types: this is the cycle's resolvable edge.
-# The recursion edge, split for two masters. SCALAR leafs inline into
-# the parent's loop (SROA removes the buffer-slice temporaries — a
-# compiled boundary costs ~64 bytes per child read); COMPOSITE children
-# route to `_typedchildbox`, a dedicated compiled shell with all-concrete
-# argument types — the resolvable edge trim requires. The generic ladder
-# reliably flattens into a dedicated shell but NOT into arbitrary hoisted
-# contexts, so the shell is the only place that calls it. The ::T asserts
-# pin inference to the claim even where the same-claim wrapper cycle
-# (Dictionary/REE) would widen to Any in a fresh process.
+# The typed recursion edge, split for two masters. The logical-bounds guard
+# matches what the dynamic path gets from public `getvalue`: unvalidated
+# geometry must not read backing values past a child's logical length.
+# SCALAR leaves inline into the parent's loop so the buffer-slice
+# temporaries stay stack-allocated (a compiled boundary per child read
+# would allocate); COMPOSITE children route to `_typedchildbox`, a compiled
+# shell whose argument types are all concrete — the resolvable edge trim
+# requires. The generic ladder flattens reliably into a dedicated shell but
+# not into arbitrary hoisted contexts, so the shell is the only caller. The
+# `::T` asserts pin inference to the claim where the same-claim wrapper
+# cycle (Dictionary/REE) would widen to Any.
 @inline function _typedchild(::Type{T}, f::Field, d::ArrayData, i::Int64) where {T}
     1 <= i <= d.len || throw(BoundsError(d, i))
     t = d.type
@@ -3409,6 +3457,8 @@ function _bulkmaterialize(
     # a caller-supplied null-count cache is only certified after semantic
     # validation, and this path explicitly serves unvalidated data.
     v = validitybuffer(d)
+    # When the claim admits no Missing, E === T, so `vals` already has the
+    # public element type and needs no copy.
     if !(Missing <: T)
         if !isempty_buffer(v)
             for i = 1:n
@@ -3572,6 +3622,8 @@ function _build_strings(name, v::Vector)
     nbytes = 0
     for (i, x) in enumerate(v)
         nbytes += x === missing ? 0 : ncodeunits(x)
+        nbytes <= typemax(Int32) ||
+            throw(ArgumentError("column $name exceeds the Int32 offset range"))
         offsets[i + 1] = Int32(nbytes)
     end
     bytes = Vector{UInt8}(undef, nbytes)
@@ -3600,11 +3652,13 @@ function _build_list(name, v::Vector)
     total = 0
     for (i, x) in enumerate(v)
         total += x === missing ? 0 : length(x)
+        total <= typemax(Int32) ||
+            throw(ArgumentError("column $name exceeds the Int32 offset range"))
         offsets[i + 1] = Int32(total)
     end
     nonmissing = [x for x in v if x !== missing]
     childtype = eltype(Base.nonmissingtype(eltype(v)))
-    flat = isempty(nonmissing) ? Vector{childtype}() : reduce(vcat, nonmissing)
+    flat = isempty(nonmissing) ? childtype[] : reduce(vcat, nonmissing)
     cf, cd = fromjulia("item", collect(flat))
     nc = count(!, present)
     t = ListType(false)
@@ -3671,11 +3725,13 @@ representation ArrowStrings' `ArrowString` columns use:
 
 `payloads` becomes the views buffer and `buffers` the variadic data buffers,
 in order, without copying (the two-buffer form is `[buf, extra]`; a buffer
-may be empty, and an all-inline column may have none at all). The only work is the validity bitmap: a slot whose length is
-negative is null; the spec leaves a null slot's entry bytes unspecified, and
-neither this reader's nor the reference implementation's validation reads
-them. Long-entry geometry (offsets inside their buffer, prefixes matching
-the data) is checked where every builder's is — by
+may be empty, and an all-inline column may have none at all).
+
+The only work is the validity bitmap: a slot whose length is negative is
+null; the spec leaves a null slot's entry bytes unspecified, and neither
+this reader's nor the reference implementation's validation reads them.
+Long-entry geometry (offsets inside their buffer, prefixes matching the
+data) is checked where every builder's is — by
 `validate_semantic`/`validate_full` — not here. The scoped-borrow rule of
 every zero-copy wrap applies to every vector passed in.
 """
@@ -3695,8 +3751,6 @@ function fromviewentries(
 ) where {P}
     isbitstype(P) && sizeof(P) == 16 ||
         throw(ArgumentError("view-entry payloads must be a 16-byte isbits type"))
-    # `buffers` may be empty: an all-inline column has zero variadic data
-    # buffers, which the format allows.
     # The entry words are values assembled by shifts; Arrow's byte layout is
     # what those values spell out on a little-endian host, and Core reads
     # view entries host-natively.
