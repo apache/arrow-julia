@@ -320,7 +320,11 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
     return node.length
 end
 
-"Validate every metadata-only invariant for the subtrees whose bodies are planned."
+"""
+Validate every metadata-only invariant for the subtrees whose bodies are
+planned, and return the number of nonempty masked-in buffers — exactly the
+body ranges the caller will plan.
+"""
 function _validatebodyplan(
     header::Meta.RecordBatch,
     fields,
@@ -610,8 +614,7 @@ function _storagevalue(f::AC.Field, v, op)
     # semantics. A logical type may, for example, compare by an equivalence
     # class while storing one concrete identifier. Evaluate every registered
     # extension filter, including one nested below an unmarked container, over
-    # the restored public values unless a future interface provides an
-    # explicit comparison-preserving trait.
+    # the restored public values.
     return false, v
 end
 
@@ -816,7 +819,10 @@ function _resolverregexwork!(names, budget)
     return nothing
 end
 
-"Count one selection reference while reserving Tables.resolve's temporary work."
+"""
+How many columns one selection reference matches, charging the scratch work
+`Tables.resolve` will repeat for it.
+"""
 function _resolverrefcount(ref, names, budget)
     if ref isa Regex
         _resolverregexwork!(names, budget)
@@ -973,7 +979,7 @@ function Tables.schema(t::_ScanColumns)
     types = Type[eltype(c) for c in getfield(t, :columns)]
     # Preserve the compact typed schema for ordinary narrow results. Wide
     # schemas stay in values so compiler work cannot scale with input names.
-    return Tables.Schema(names, types; stored=length(names) > 256)
+    return Tables.Schema(names, types; stored=length(names) > _MAX_TYPED_SCHEMA_FIELDS)
 end
 Base.propertynames(t::_ScanColumns) = getfield(t, :names)
 Base.getproperty(t::_ScanColumns, name::Symbol) = Tables.getcolumn(t, name)
@@ -988,14 +994,10 @@ function _ScanColumns(columns::NamedTuple, nrows::Int)
 end
 
 # Join the pieces of one decoded output column under its declared storage
-# claim when that claim closes, else as `Vector{Any}`. A facade scan can put
-# private ArrowTypes routing values in those pieces; they remain inside the
-# facade scan operation and are lifted before it returns. Building the empty
-# result from the same rule keeps conforming columns stable when a scan keeps
-# no rows. Nulls under a non-nullable declaration are advisory at the reader
-# tier. An unread violating batch does not widen a selected result: preserving
-# the skip boundary takes priority over propagating invalid type evidence.
-
+# claim when that claim closes, else as `Vector{Any}`. A facade scan may put
+# private ArrowTypes routing values in those pieces; they never leave the
+# facade scan operation. The empty result follows the same rule, so a scan
+# that keeps no rows still reports the schema a nonempty one would.
 function _joinscanparts(f::Field, parts::Vector, budget=nothing)
     if isempty(parts)
         # Match `_storagebatchcolumn`: a zero-row result must not change its
@@ -1111,15 +1113,14 @@ function _batchwindow(
 end
 
 """
-The exact consumer of a bound scan, one decoded batch at a time: the filter
-is evaluated over the batch's decoded columns by the generic evaluator
-(`Tables.filtermask` — the same three-valued semantics the executor has),
-`offset`/`limit` are composed over qualifying rows with saturating
-arithmetic (the executor's rule) and stop the scan the moment the window is
-full, and only the selected columns' surviving rows are kept, in selection
-order under their output names. Without a filter the caller's metadata
-window (`_batchwindow`) already names the rows, so a batch outside it is
-never decoded.
+The exact consumer of a bound scan, one decoded batch at a time. It
+evaluates the filter over each batch's decoded columns through
+`Tables.filtermask` (the executor's own three-valued semantics), composes
+`offset`/`limit` over the qualifying rows with saturating arithmetic, and
+stops the scan as soon as the window is full. It keeps only the selected
+columns' surviving rows, in selection order, under their output names.
+Without a filter, `_batchwindow` has already named the rows, so a batch
+outside the window never decodes.
 """
 mutable struct _ScanSink{M}
     const names::Vector{Symbol}
@@ -1206,10 +1207,8 @@ function _sinkopen(sink::_ScanSink)
     return sink.remaining_take != 0
 end
 
-# The rows of one batch the scan keeps: the caller's metadata window when
-# there is no filter, else the qualifying rows after this batch's share of
-# the offset/limit. A filter that references no decoded column is
-# row-invariant and evaluates once.
+# Slice the kept rows without allocating: indexing a range yields a range,
+# and a `findall` result is viewed in place.
 _rowwindow(rows::AbstractRange, first::Int, last::Int) = rows[first:last]
 _rowwindow(rows::AbstractVector, first::Int, last::Int) = view(rows, first:last)
 
@@ -1245,6 +1244,10 @@ function _chargefilterscratch!(budget, filter, nrows::Integer)
     return nothing
 end
 
+# The rows of one batch the scan keeps: the caller's metadata window when
+# there is no filter, else this batch's qualifying rows after its share of
+# `offset`/`limit`. A filter that references no decoded column is
+# row-invariant, so one evaluation covers the batch.
 function _sinkrows(sink::_ScanSink, decoded, rblen::Int64, skip::Int64, take::Int64)
     if sink.bound.filter === nothing
         take >= 0 || return 1:Int(rblen)
@@ -1318,6 +1321,9 @@ function _sinkresult(sink::_ScanSink)
     outcols = (
         begin
             parts = sink.parts[k]
+            # Every column may still hold the shared empty sentinel here;
+            # that only happens when no batch was consumed, so every count
+            # is 0 and this resize cannot disturb a sibling.
             resize!(parts, sink.partcounts[k])
             col = _joinscanparts(sink.fields[c.index], parts, sink.budget)
             c.type === nothing ? col : _applyoverride(c.type, col, sink.budget)
@@ -1388,6 +1394,8 @@ function _runboundscan(
                 end
             end
         end
+        # A filtered scan with `limit == 0` is closed before the first batch
+        # (`_sinkopen`), so it reserves no part slots at all.
         partcapacity =
             b.filter !== nothing && b.limit == 0 ? 0 :
             count(entry -> keep[first(entry)], window)
@@ -1418,23 +1426,25 @@ _applyscan(
 # ===========================================================================
 
 """
-    SourceFile(src::AbstractArrowSource; limits, tailbytes=65536, coalesce_gap=262144)
+    SourceFile(src::AbstractArrowSource;
+               limits=Limits(), tailbytes=65536, coalesce_gap=262144)
 
 The scan-driven, fetch-minimal file handle over a byte-range source:
 `Tables.scan(sf, scan)` (and `Arrow.Table(src; scan=…)`, which builds one)
 runs the fetch protocol. The footer normally comes from one cached tail read;
-one exact cached follow-up is used when it escapes that window. Batch windowing
-uses block metadata. Dictionary bodies are requested only for decode-set ids,
-and per-buffer body ranges cover exactly the decode set before coalescing under
-`coalesce_gap`. The source's length is read once, at construction.
+one exact cached follow-up is used when it escapes that window. `tailbytes`
+below 32 is raised to 32. Batch windowing uses block metadata. Dictionary
+bodies are requested only for decode-set ids, and per-buffer body ranges
+cover exactly the decode set before coalescing under `coalesce_gap`. The
+source's length is read once, at construction.
 
-Trust note, stated loudly: the ranged reader treats the FOOTER as the sole
-schema authority — it does not fetch the leading magic, parse and
-cross-check the leading schema message, or inspect the optional EOS marker.
-The tail and coalesced requests may physically over-read unrequested bytes.
-The full Footer Block index and global features/message limit are checked
-up front. Per-record limits stay lazy; every surviving candidate's
-metadata-only plan is validated before any planned body range is requested.
+Trust note: the ranged reader treats the FOOTER as the sole schema
+authority — it does not fetch the leading magic, parse and cross-check the
+leading schema message, or inspect the optional EOS marker. The tail and
+coalesced requests may physically over-read unrequested bytes. The full
+Footer Block index and global features/message limit are checked up front.
+Per-record limits stay lazy; every surviving candidate's metadata-only plan
+is validated before any planned body range is requested.
 `limits.max_concurrent_reads` caps the source preference. One semaphore is
 shared by every operation on this handle.
 """
@@ -1618,7 +1628,11 @@ function _coalesce(ranges::Vector{NTuple{2,Int64}}, gap::Int64, budget=nothing)
     return sorted
 end
 
-"Fetched file-coordinate spans with their bytes, resolvable by containment."
+"""
+Fetched file-coordinate spans with their bytes, resolvable by containment.
+`starts` is ascending and the spans are disjoint (`_coalesce` guarantees
+both), which is what lets `_spanslice` resolve a range by binary search.
+"""
 struct FetchedSpans
     starts::Vector{Int64}
     lens::Vector{Int64}
@@ -1661,11 +1675,11 @@ function _fetchspans(
     return FetchedSpans(Int64[s[1] for s in spans], Int64[s[2] for s in spans], slices)
 end
 
-# Read one round's spans through the source, each length-checked, every
-# result stored by its request index: serially, or through a worker pool of
-# the handle's validated/capped worker count pulling requests off one counter — so a
-# source's completion order can never permute payloads, and the number of
-# reads in flight is bounded whatever the span count.
+# Read one round's spans, each length-checked, into `results[i]` by request
+# index. Small rounds read serially. Larger rounds use `sf.concurrency`
+# workers that pull indexes off one atomic counter. Storing by request index
+# means a source's completion order cannot permute payloads, and the worker
+# count bounds the reads in flight whatever the span count.
 function _readspans(sf::SourceFile, spans::Vector{NTuple{2,Int64}}, budget=nothing)
     n = length(spans)
     _chargevector!(budget, Vector{UInt8}, n, "range-fetch results")
@@ -1951,6 +1965,9 @@ function _runboundscan(
         # keeps the column path's trust boundary: the block index validates
         # first, every touched block passes the full frame checks, and every
         # fetch charges the one cumulative budget.
+        # 8 is the padded leading magic (`ARROW1` plus two bytes). The ranged
+        # reader never fetches those bytes, so a conforming file's first
+        # message starting at 8 is an assumption, not a check.
         _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
         # A zero-field schema declares no dictionary ids, so every indexed
         # dictionary block is orphaned — the same rejection the id-membership
@@ -1980,6 +1997,9 @@ function _runboundscan(
 
     # Footer Blocks remain mutually exclusive and bounded without parsing the
     # leading schema or optional EOS bytes. A tail request may over-read them.
+    # 8 is the padded leading magic (`ARROW1` plus two bytes). The ranged
+    # reader never fetches those bytes, so a conforming file's first message
+    # starting at 8 is an assumption, not a check.
     _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
 
     # Statistics pruning happens FIRST: the stats live in the
@@ -2064,6 +2084,10 @@ function _runboundscan(
         [blockmeta[length(dictblocks) + p][1].header::Meta.RecordBatch for p = 1:nsurv]
     _chargevector!(budget, Vector{Int64}, nsurv, "record variadic-count cache")
     recordvariadics = Vector{Vector{Int64}}(undef, nsurv)
+    # `rowcounts` and `window` are indexed by position in `recidxs`, not by
+    # record-block index. They coincide only because statistics pruning needs
+    # a filter and windowing needs none, so a windowed scan has pruned
+    # nothing.
     _chargevector!(budget, Int64, nsurv, "scan batch row counts")
     rowcounts = Vector{Int64}(undef, nsurv)
     for (p, h) in enumerate(headers)
@@ -2079,6 +2103,8 @@ function _runboundscan(
             _chargevector!(budget, Tuple{Int,Int64,Int64}, nsurv, "scan batch window")
             Tuple{Int,Int64,Int64}[(p, Int64(0), Int64(-1)) for p = 1:nsurv]
         end
+    # A filtered scan with `limit == 0` is closed before the first batch
+    # (`_sinkopen`), so it reserves no part slots at all.
     _reservesinkparts!(sink, b.filter !== nothing && b.limit == 0 ? 0 : length(window))
 
     # Decode-set dictionaries: whole bodies, coalesced; everything else is
@@ -2120,6 +2146,9 @@ function _runboundscan(
             push!(wanted_dict, i)
         end
     end
+    # `_validatebodyplan`'s return value is the exact number of nonempty
+    # ranges the loop below will plan; the assertion after it re-checks that
+    # the two passes agree.
     bodycount = Int64(count(i -> dictblocks[i][3] > 0, wanted_dict))
     for (p, _, _) in window
         _, v = blockmeta[length(dictblocks) + p]
@@ -2270,16 +2299,18 @@ end
 _applyscan(sf::SourceFile, plan::_BoundScanPlan, ft, budget::AllocationBudget) =
     _runboundscan(sf, plan.bound, plan.names, ft, budget, _storagebatchcolumn)
 
-"Compile one direct handle request in the storage domain."
+"""
+Compile one direct-handle request against the file schema; the handle
+consumes it in the storage domain.
+"""
 function _compilehandlescan(scan::Tables.Scan, fields, budget=nothing)
     return _compileboundscan(scan, fields, budget)
 end
 
-# Tables.jl currently exposes binding (`resolve`), predicate evaluation, and
-# allocation, but no executor for an existing BoundScan. Keep this small local
-# executor instead of reconstructing a Scan and resolving it a second time.
-# The differential battery pins it to Tables.scan until the prerequisite API
-# provides a bound-plan execution seam.
+# Tables.jl exposes binding (`resolve`), predicate evaluation, and
+# allocation, but no executor for an existing `BoundScan`. Keep this small
+# local executor instead of reconstructing a Scan and resolving it a second
+# time.
 "Execute an already-compiled scan over a materialized Tables.jl source."
 function _executeplan(table, b::Tables.BoundScan, budget=nothing)
     cols = Tables.columns(table)
@@ -2360,7 +2391,7 @@ The OUTPUT schema of a scan: bound source fields under their output names.
 `precols` supplies each output's pre-override (facade-narrowed) column, so
 override keep/drop follows the SAME actual-subtype decision the conversion
 made: a no-op override keeps its retained field; a real conversion drops it
-(a later rewrite re-infers the column).
+(writing the result back to Arrow then re-infers the column).
 """
 function _boundschema(schema, sourcefields, b::Tables.BoundScan, precols, budget=nothing)
     schema === nothing && return nothing
@@ -2528,24 +2559,61 @@ function _applyoverride(::Type{T}, col, budget=nothing) where {T}
     out = Tables.allocatecolumn(E, length(col))
     @inbounds for i in eachindex(col)
         x = col[i]
-        out[i] = ismissing(x) ? missing : convert(T, x)
+        out[i] = ismissing(x) ? missing : _overridevalue(T, x)
     end
     return out
+end
+
+# One scan-override value. `convert` is the contract, but the composite row
+# containers the facade materializes (struct rows as `Vector{Pair}`, list
+# rows as `Vector`) have no `convert` methods to user types, so fully typed
+# named-tuple and vector targets rebuild recursively — `:c => @NamedTuple{…}`
+# in a select is the supported way to read a struct column as typed rows.
+# Struct fields match by position and the names must agree.
+function _overridevalue(::Type{T}, x) where {T}
+    x isa T && return x
+    if T isa DataType && T <: NamedTuple && x isa AbstractVector{<:Pair}
+        names = fieldnames(T)
+        length(x) == length(names) || throw(
+            ArgumentError(
+                "cannot convert a $(length(x))-field struct row to $(T) " *
+                "with $(length(names)) fields",
+            ),
+        )
+        vals = ntuple(length(names)) do i
+            k, v = x[i]
+            Symbol(k) === names[i] || throw(
+                ArgumentError(
+                    "struct row field $(repr(String(k))) does not match " *
+                    "$(T) field $(repr(names[i])) at position $(i)",
+                ),
+            )
+            F = fieldtype(T, i)
+            v === missing ? missing : _overridevalue(Base.nonmissingtype(F), v)
+        end
+        return T(vals)
+    end
+    if T <: AbstractVector && x isa AbstractVector
+        E = eltype(T)
+        N = Base.nonmissingtype(E)
+        return convert(T, E[v === missing ? missing : _overridevalue(N, v) for v in x])
+    end
+    return convert(T, x)
 end
 
 """
     Tables.scan(f::ArrowFile, scan)
     Tables.scan(sf::SourceFile, scan)
 
-Scan an Arrow file handle: `_applyscan` decodes only the selected and
-filter-referenced columns of the batches the footer statistics and the
-window admit, evaluates the filter per batch, composes `offset`/`limit`
-exactly (stopping as soon as the window is full), and builds the selected
-columns under their output names. The request is compiled once against the
-file schema; the scan plan then owns type overrides too. File and ranged
-`Arrow.Table(source; scan=…)` use the same kernel through the closed
-`_applyfacadescan` operation. Stream facade scans execute post-decode. Every
-facade path converts private ArrowTypes routes before it returns.
+Scan an Arrow file handle. `_applyscan` decodes only the selected and
+filter-referenced columns, and only in the batches the footer statistics
+and the window admit. It evaluates the filter per batch, composes
+`offset`/`limit` exactly, and stops as soon as the window is full. The
+request is compiled once against the file schema, and the plan owns the
+type overrides. File and ranged `Arrow.Table(source; scan=…)` use the same
+kernel through the closed `_applyfacadescan` operation. Stream facade scans
+execute post-decode. Every facade path converts private ArrowTypes routes
+before it returns.
 """
 function Tables.scan(f::ArrowFile, scan::Tables.Scan)
     budget = AllocationBudget(f.limits.max_total_allocated_bytes)
@@ -2634,7 +2702,9 @@ end
 Fold one column's statistics: (null count, min, max) with `nothing` bounds
 for empty, all-null, or unsupported-type columns. Values normalize into the
 union's members: Int64 for integral scalars (dates, times, timestamps, and
-durations are integral in the value domain), Float64, String, Bool.
+durations are integral in the value domain), Float64, String, Bool. A
+column containing any NaN reports no bounds at all, so no predicate can
+prune on it.
 """
 function _statfold(f::Field, d::ArrayData)
     t = f.type
@@ -2677,6 +2747,9 @@ function _statfold(f::Field, d::ArrayData)
         # the one uniform null signal across every layout.
         v = AC.getvalue(f, d, i)
         ismissing(v) && continue
+        # Defensive: only interval descriptors yield a `NamedTuple`, and
+        # `supported` already excludes them. A composite value has no usable
+        # order, so drop the bounds rather than compare it.
         v isa NamedTuple && return nc, nothing, nothing
         if v isa AbstractFloat && isnan(v)
             hasnan = true
@@ -2971,6 +3044,9 @@ function _readstats(
                         maxvalue = value
                     end
                 end
+                # A null `column` reference marks the batch-level entry (the
+                # row count), the same convention the writer emits at
+                # `_statsbatch`.
                 if colref === missing
                     rc = rowcount
                     if rc !== missing
@@ -3088,6 +3164,10 @@ function _statscontext(filter, names, budget)
     return _StatsContext(nameindex, prefixes)
 end
 
+# The polarity is deliberate and one-sided: `_statcmp` treats anything but
+# an exact `false` as 'may pass', and `_stateq` treats anything but an exact
+# `true` as 'not provably equal'. Both directions fail toward fetching the
+# batch.
 function _statcmp(f, a, b)
     return try
         f(a, b) === false ? false : true

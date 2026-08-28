@@ -41,11 +41,6 @@ documents each layer in depth):
 - `table.jl`, `write.jl`: the read facade and write orchestration.
 - `columnconstruction.jl`: column-wide construction policy, including
   retained schemas, dictionaries, and recursive ArrowTypes.jl lowering.
-
-The adapter entry points (`readstream`, `writestream`, `readfile`,
-`writefile`, `to_c_data`, `from_c_data`, `export_stream!`, `from_c_stream`)
-are exercised directly by the test batteries, the arrow-testing conformance
-corpus, and the pyarrow/nanoarrow oracle suites under `conformance/`.
 """
 module Arrow
 
@@ -184,6 +179,10 @@ AC.ValidationError
             :Table,
             :Stream,
             :write,
+            :Writer,
+            :append,
+            :tobuffer,
+            :getmetadata,
             :DictEncode,
             :AbstractArrowSource,
             :sourcelength,
@@ -215,5 +214,12 @@ AC.ValidationError
 end
 
 export release!
+# The one name Arrow 2.x exported. Packages that define custom-type mappings
+# reach the interface as `Arrow.ArrowTypes` or through `using Arrow`.
+export ArrowTypes
+
+# Precompile the common write/read/scan shapes last, once every layer above
+# is defined.
+include("precompile.jl")
 
 end # module Arrow

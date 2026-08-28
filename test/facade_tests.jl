@@ -949,6 +949,46 @@ end
         @test eltype(t3.x) == Int64 && isempty(t3.x)
     end
 
+    @testset "typed schemas keep rowtable working; wide schemas stay stored" begin
+        # At or below _MAX_TYPED_SCHEMA_FIELDS the schema is typed, so
+        # NamedTuple materializers accept it.
+        io = IOBuffer()
+        Arrow.write(
+            io,
+            (a=Int64[1, 2, 3], b=Union{Missing,String}["x", missing, "z"]);
+            file=false,
+        )
+        t = Arrow.Table(take!(io))
+        sch = Tables.schema(t)
+        @test !(sch isa Tables.Schema{nothing,nothing})
+        @test sch.names == (:a, :b)
+        @test sch.types == (Int64, Union{Missing,String})
+        rows = Tables.rowtable(t)
+        @test rows isa Vector{NamedTuple{(:a, :b),Tuple{Int64,Union{Missing,String}}}}
+        @test [r.a for r in rows] == [1, 2, 3]
+        @test isequal([r.b for r in rows], ["x", missing, "z"])
+        # Above the threshold the schema keeps names and types in values so
+        # compiler work cannot scale with input names; Tables.jl then refuses
+        # NamedTuple rows, pinned here deliberately.
+        ncols = Arrow._MAX_TYPED_SCHEMA_FIELDS + 1
+        wide = NamedTuple(Symbol("w", i) => Int64[i] for i = 1:ncols)
+        wio = IOBuffer()
+        Arrow.write(wio, wide; file=false)
+        tw = Arrow.Table(take!(wio))
+        wsch = Tables.schema(tw)
+        @test wsch isa Tables.Schema{nothing,nothing}
+        @test length(wsch.names) == ncols
+        @test wsch.types == fill(Int64, ncols)
+        @test_throws ArgumentError Tables.rowtable(tw)
+        widerr = try
+            Tables.rowtable(tw)
+            nothing
+        catch exception
+            exception
+        end
+        @test occursin("input table too wide", sprint(showerror, widerr))
+    end
+
     @testset "temporal scans agree across formats and renames" begin
         data = (
             x=Int64[1, 2, 3],

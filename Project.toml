@@ -29,6 +29,7 @@ DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 EnumX = "4e289a0a-7415-4d19-859d-a7e5c4648b56"
 Mmap = "a63ad114-7e13-5084-954f-fe012c677804"
+PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 
@@ -41,9 +42,11 @@ ArrowTypes = {path = "src/ArrowTypes"}
 
 [weakdeps]
 CloudStore = "3365d9ee-d53b-4a56-812d-5344d5b716d7"
+TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
 [extensions]
 ArrowCloudStoreExt = "CloudStore"
+ArrowTimeZonesExt = "TimeZones"
 
 [compat]
 ArrowStrings = "1"
@@ -56,6 +59,8 @@ Dates = "1.10"
 CodecZstd = "0.8"
 EnumX = "1"
 Mmap = "1.10"
+PrecompileTools = "1"
 Tables = "1.14"
+TimeZones = "1"
 TranscodingStreams = "0.9.12, 0.10, 0.11"
 julia = "1.10"

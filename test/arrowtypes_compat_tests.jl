@@ -15,6 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# ArrowTypes logical-type lowering, extension metadata, and lifting through
+# the public read/write facade; included from runtests.jl.
+
 using ArrowTypes
 using DataAPI
 using Dates
@@ -1564,7 +1567,9 @@ end
 
 @testset "module boundary" begin
     @test Arrow.ArrowTypes === ArrowTypes
-    @test !Base.isexported(Arrow, :ArrowTypes)
+    # The one Arrow 2.x export kept for compatibility: `using Arrow` provides
+    # the bare `ArrowTypes` binding.
+    @test Base.isexported(Arrow, :ArrowTypes)
 end
 
 @testset "automatic scalar and struct mappings" begin

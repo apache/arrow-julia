@@ -35,6 +35,15 @@ const UNIQUE_SUFFIX = string(getpid(), "_", time_ns())
 
 freshname(prefix::AbstractString) = string(prefix, "_", UNIQUE_SUFFIX)
 
+# Compiling an exception handler lazily interns Julia IR symbols (:phic and
+# friends), and "phic" is a four-letter lowercase name this guard generates.
+# Intern them NOW, so the generated-name scans below measure what Arrow
+# interns — not what the compiler happened to compile first.
+try
+    error("intern the exception-handler IR symbols")
+catch
+end
+
 function isinterned(name::String)
     occursin('\0', name) && error("the Symbol guard only accepts NUL-free names")
     pointer = GC.@preserve name begin
@@ -135,9 +144,26 @@ extensionmetadata(name::AbstractString) = Pair{String,String}[
     # Four ASCII letters provide enough distinct four-byte names to reach the
     # count gate while staying below the independent 1 MiB byte budget. Skip
     # the small set that Julia or a loaded dependency already interned.
+    #
+    # Generated names race the JIT: compiling code at runtime interns the
+    # symbols of the freshly lowered methods (IR heads like :phic, Base local
+    # names like :imid), and any of them can collide with a four-letter name.
+    # Warm every code path this check uses FIRST, then filter immediately
+    # before the guarded call, so the assertions measure what Arrow interns
+    # rather than what the compiler compiled in between.
+    internedof(names) = String[n for n in names if isinterned(n)]
+    guarderr(fields) =
+        try
+            Arrow._fieldnamesymbols(fields)
+            nothing
+        catch exception
+            exception
+        end
+    warmfield = AC.Field(freshname("warm_count_gate"), AC.NullType(); nullable=true)
+    guarderr(AC.Field[warmfield])
     countnames = String[]
     candidate = 0
-    while length(countnames) <= Arrow._MAX_TABLES_NEW_FIELD_NAMES
+    while length(countnames) <= Arrow._MAX_TABLES_NEW_FIELD_NAMES + 64
         value = candidate
         bytes = Vector{UInt8}(undef, 4)
         for index = 1:4
@@ -148,18 +174,18 @@ extensionmetadata(name::AbstractString) = Pair{String,String}[
         isinterned(name) || push!(countnames, name)
         candidate += 1
     end
-    @test all(!isinterned, countnames)
+    internedof(countnames)
     countfields =
         AC.Field[AC.Field(name, AC.NullType(); nullable=true) for name in countnames]
-    counterr = try
-        Arrow._fieldnamesymbols(countfields)
-        nothing
-    catch exception
-        exception
-    end
+    filter!(f -> !isinterned(f.name), countfields)
+    @test length(countfields) > Arrow._MAX_TABLES_NEW_FIELD_NAMES
+    resize!(countfields, Arrow._MAX_TABLES_NEW_FIELD_NAMES + 1)
+    countnames = String[f.name for f in countfields]
+    counterr = guarderr(countfields)
+    stillnovel = internedof(countnames)
+    @test isempty(stillnovel)
     @test counterr isa Arrow.ValidationError
     @test occursin("novel-name limit", sprint(showerror, counterr))
-    @test all(!isinterned, countnames)
 
     bytenames = String[]
     for index =

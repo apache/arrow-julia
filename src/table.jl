@@ -27,7 +27,7 @@
 # =============================================================================
 
 """
-    Arrow.Table(source; scan=nothing, mmap=true, limits=Arrow.Limits()) -> Table
+    Arrow.Table(source; scan=nothing, mmap=true, limits) -> Table
 
 Read Arrow IPC data as Tables.jl columns. `source` is a file path, an `IO`,
 raw bytes (`Vector{UInt8}`), or an [`Arrow.AbstractArrowSource`](@ref) — a
@@ -44,27 +44,29 @@ re-verify it under different limits.
 
 `scan` is a `Tables.Scan` pushdown request: only the selected and
 filter-referenced columns are decoded, footer statistics prune batches no
-row of which can match the filter, the filter is evaluated batch by batch,
-and `limit`/`offset` are composed exactly over the qualifying rows —
-without a filter whole batches outside the window are never decoded, with
-one decoding stops as soon as the window is full. Over an
-`AbstractArrowSource` the footer normally comes from one cached tail read; one
-exact cached follow-up is used when it escapes that window. Statistics prune
-batches before record metadata is requested. Surviving metadata is fetched and
+row of which can match the filter, and the filter is evaluated batch by
+batch. `limit`/`offset` compose exactly over the qualifying rows. Without a
+filter, whole batches outside the window are never decoded. With a filter,
+decoding stops as soon as the window fills. Over an `AbstractArrowSource`
+the footer normally comes from one cached tail read; one exact cached
+follow-up is used when it escapes that window. Statistics prune batches
+before record metadata is requested. Surviving metadata is fetched and
 validated before selected buffer ranges are requested in the next round. A
-filtered limit then stops decoding, not fetching. On the stream format the scan
-is applied after decode.
+filtered limit then stops decoding, not fetching. On the stream format the
+scan is applied after decode.
 
-One exception: a filter that has no semantics-preserving storage-domain form
-falls back to reading the whole source and evaluating over public values. This
-includes inexact literals, temporal conversions that alias values or wrap
-ordering, unsafe Duration unit promotion, and custom membership objects. Tuple
-and Array membership lower only for equality-preserving conversions; Set
-members must also have the column's canonical public type. Empty projections use range
-planning and preserve their row count without fetching output column bodies.
-An `AbstractArrowSource` is also read whole without a scan, for a zero-field
-file, and for a stream-format object; plan remote filters in each column's
-public value domain.
+Some filters have no semantics-preserving storage-domain form: inexact
+literals, temporal conversions that alias values or wrap ordering, unsafe
+Duration unit promotion, and custom membership objects. Tuple and Array
+membership lower only for equality-preserving conversions; Set members must
+also have the column's canonical public type. Such filters fall back to
+reading the whole source and evaluating over public values.
+
+Independent of the filter, some sources are read whole: an
+`AbstractArrowSource` without a scan, a zero-field file, and any
+stream-format source. Empty projections use range planning and preserve
+their row count without fetching output column bodies. When a filter must
+prune remote fetches, write it in each column's public value domain.
 
 Columns are materialized (plain `Vector`s): the returned table does not
 borrow the source bytes, and [`Arrow.release!`](@ref) may be called at any
@@ -85,8 +87,9 @@ struct Table <: Tables.AbstractColumns
     retainedpools::Vector{Any}
 end
 
-# Preserve the pre-3.0-development six-argument construction shape used by
-# downstream tests and code that replaces a materialized column deliberately.
+# Construct a Table with deliberately replaced materialized columns (the
+# facade tests exercise refusal paths this way). The passed lookup is
+# ignored and rebuilt from `names`, and no dictionary pools are retained.
 Table(names, columns, lookup, schema, regions, nrows) = Table(
     names,
     columns,
@@ -102,6 +105,9 @@ function _namelookup(names, budget=nothing)
     lookup = Dict{Symbol,Int}()
     sizehint!(lookup, length(names))
     for (i, nm) in enumerate(names)
+        # Sentinel 0 marks a name that appears more than once; `_columnindex`
+        # turns it into an "ambiguous, use positional access" error. An
+        # absent key (-1 there) means no such column.
         lookup[nm] = haskey(lookup, nm) ? 0 : i
     end
     return lookup
@@ -190,11 +196,21 @@ Tables.columns(t::Table) = t
 Tables.columnnames(t::Table) = getfield(t, :names)
 Tables.getcolumn(t::Table, i::Int) = getfield(t, :columns)[i]
 Tables.getcolumn(t::Table, nm::Symbol) = getfield(t, :columns)[_columnindex(t, nm)]
-Tables.schema(t::Table) = Tables.Schema(
-    getfield(t, :names),
-    Type[eltype(c) for c in getfield(t, :columns)];
-    stored=true,
-)
+# Column count at or below which `Tables.schema` returns the fully typed
+# `Tables.Schema{names, types}`. Typed schemas let materializers that refuse
+# stored schemas (`Tables.rowtable`, `Tables.columntable`) work as usual and
+# comfortably cover Tables.jl's own 100-column specialization threshold.
+# Above it the names and types stay in `Vector` fields (`stored=true`) so
+# compiler work cannot scale with untrusted input names; Tables.jl then
+# refuses `NamedTuple` materialization with its "input table too wide" error,
+# which is the intended behavior for very wide tables.
+const _MAX_TYPED_SCHEMA_FIELDS = 256
+
+function Tables.schema(t::Table)
+    names = getfield(t, :names)
+    types = Type[eltype(c) for c in getfield(t, :columns)]
+    return Tables.Schema(names, types; stored=length(names) > _MAX_TYPED_SCHEMA_FIELDS)
+end
 Base.propertynames(t::Table) = getfield(t, :names)
 Base.getproperty(t::Table, nm::Symbol) = Tables.getcolumn(t, nm)
 Tables.rowcount(t::Table) = getfield(t, :nrows)
@@ -281,6 +297,34 @@ function DataAPI.colmetadata(
 end
 
 """
+    Arrow.getmetadata(t::Arrow.Table)
+
+Compatibility form of the Arrow 2.x metadata accessor: the table-level
+key-value metadata as a `Dict{String,String}`, or `nothing` when the table
+has none. New code should prefer the DataAPI.jl interface
+(`DataAPI.metadata`, `DataAPI.metadatakeys`), which `Arrow.Table` supports.
+
+Arrow 2.x also accepted a column; Arrow 3.0 columns are plain Julia vectors
+and carry no metadata, so use
+`DataAPI.colmetadata(table, column, key)`/`DataAPI.colmetadatakeys(table)`
+for per-column metadata instead.
+"""
+function getmetadata(t::Table)
+    sch = getfield(t, :schema)
+    (sch === nothing || sch.metadata === nothing || isempty(sch.metadata)) && return nothing
+    return Dict{String,String}(String(first(kv)) => String(last(kv)) for kv in sch.metadata)
+end
+function getmetadata(::AbstractVector)
+    throw(
+        ArgumentError(
+            "Arrow 3.0 columns are plain Julia vectors and carry no " *
+            "per-column metadata; use DataAPI.colmetadata(table, column, key) " *
+            "or DataAPI.colmetadatakeys(table) instead",
+        ),
+    )
+end
+
+"""
     Arrow.release!(t::Union{Table,Stream})
 
 Deterministically release the source regions behind a read (a memory map
@@ -302,13 +346,9 @@ const _EPOCH_DAYS = Dates.value(Dates.Date(1970, 1, 1))
 const _LoweredTemporal = Union{Int32,Int64}
 const _MILLIS_PER_DAY = Int128(86_400_000)
 
-"""
-Lower one public-domain scalar to a descriptor's storage domain exactly.
-
-The Boolean result is false when conversion would change facade comparison
-semantics. Scan planning then evaluates in the public domain; retained column
-construction reports incompatible replacement data.
-"""
+# Map a temporal descriptor to the compile-time token the lowering loops
+# dispatch on; fourteen values total (2 date + 4 timestamp + 4 time +
+# 4 duration).
 _facadetoken(t::AC.DateType) =
     t.unit == AC.DAY ? Val((:date, AC.DAY)) : Val((:date, AC.MILLISECOND_DATE))
 _facadetoken(t::AC.TimestampType) =
@@ -390,7 +430,16 @@ end
 @inline function _timestampstorage(unit, value)::Union{Nothing,Int64}
     if unit == AC.SECOND || unit == AC.MILLISECOND
         millis = _epochmillis(value)
-        millis === nothing && return nothing
+        if millis === nothing
+            # With TimeZones loaded, tz-declared columns read as
+            # ZonedDateTime, so retained rewrites and filter literals must
+            # lower those values exactly. The extension lowers only its own
+            # type and never throws; everything else stays `nothing`.
+            ext = Base.get_extension(@__MODULE__, :ArrowTimeZonesExt)
+            ext === nothing && return nothing
+            z = ext.zonedstorage(unit, value)
+            return z === nothing ? nothing : z::Int64
+        end
         unit == AC.MILLISECOND && return millis
         q, r = divrem(millis, Int64(1_000))
         return iszero(r) ? q : nothing
@@ -443,9 +492,9 @@ end
 """
 Lower a built-in temporal value without exceptions or request-defined code.
 
-`token` has only fourteen descriptor/unit values. A result is exact. `nothing`
-selects the public-domain path or, for one scalar, the guarded custom-conversion
-path below.
+`K` is one of the fourteen `_facadetoken` descriptor/unit values. A result is
+exact. `nothing` selects the public-domain path or, for one scalar, the
+guarded custom-conversion path below.
 """
 @inline function _exactfacadevalue(::Val{K}, value)::Union{Nothing,Int32,Int64} where {K}
     kind, unit = K
@@ -515,6 +564,13 @@ function _facadescalarvalue(t::AC.DurationType, value)::Union{Nothing,Int64}
     return _customdurationvalue(t, value)
 end
 
+"""
+Lower one public-domain scalar to a descriptor's storage domain exactly.
+
+The Boolean result is false when conversion would change facade comparison
+semantics. Scan planning then evaluates in the public domain; retained column
+construction reports incompatible replacement data.
+"""
 function _facadeliteral(t::AC.ArrowType, value)
     result = _facadescalarvalue(t, value)
     return result === nothing ? (false, value) : (true, result)
@@ -544,6 +600,20 @@ function _mapcol(::Type{T}, f::F, col, budget=nothing) where {T,F}
     return out
 end
 
+# The ArrowTimeZonesExt extension (loaded when TimeZones.jl is) restores
+# Arrow 2.x reads for second/millisecond timestamps that declare a timezone:
+# they materialize as `ZonedDateTime` instead of a naive UTC `DateTime`.
+# `nothing` (extension absent, no timezone, or a finer unit) keeps this
+# file's naive behavior; the extension itself returns `nothing` when it
+# cannot parse the declared zone, so the eltype decision and the column
+# conversion below always agree. Finer units keep raw Int64 storage either
+# way: neither DateTime nor ZonedDateTime can hold them exactly.
+function _zonedext(t::AC.TimestampType)
+    t.timezone === nothing && return nothing
+    (t.unit == AC.SECOND || t.unit == AC.MILLISECOND) || return nothing
+    return Base.get_extension(@__MODULE__, :ArrowTimeZonesExt)
+end
+
 _postconvert(::AC.ArrowType, col, budget=nothing) = col
 _postconvert(t::AC.DateType, col, budget=nothing) =
     t.unit == AC.DAY ?
@@ -555,6 +625,11 @@ _postconvert(t::AC.DateType, col, budget=nothing) =
         budget,
     )
 function _postconvert(t::AC.TimestampType, col, budget=nothing)
+    ext = _zonedext(t)
+    if ext !== nothing
+        zoned = ext.zonedcolumn(t, col, budget)
+        zoned === nothing || return zoned
+    end
     # DateTime is millisecond-precision. Finer units stay as their raw
     # storage integers rather than silently truncating.
     t.unit == AC.SECOND && return _mapcol(
@@ -599,6 +674,11 @@ _postconvert(t::AC.DictionaryType, col, budget=nothing) =
 function _facadebasetype(t::AC.ArrowType)
     t isa AC.DateType && return t.unit == AC.DAY ? Dates.Date : Dates.DateTime
     if t isa AC.TimestampType
+        ext = _zonedext(t)
+        if ext !== nothing
+            Z = ext.zonedtype(t.timezone)
+            Z === nothing || return Z
+        end
         return t.unit == AC.SECOND || t.unit == AC.MILLISECOND ? Dates.DateTime : Int64
     end
     t isa AC.TimeType && return Dates.Time
@@ -1061,8 +1141,7 @@ function _tablefrom(src, plan::_ScanPlan, regions, fields, budget)
     )
     plan.storage !== nothing && return _applyfacadescan(src, plan, budget)
     # A scan with an unrepresentable storage-domain literal evaluates its
-    # public-domain plan over the fully converted table —
-    # correctness first; these are rare shapes.
+    # public-domain plan over the fully converted table.
     return _publicscan(
         _materialize_table(src, regions, budget),
         _tableschema(src),
@@ -1214,20 +1293,21 @@ end
 # the descriptor's declared facade type. Composites materialize rows as
 # vectors (their eltype accident is `Any[]` when no rows exist), so the
 # declared domain — not the accident — must drive subsumption, keeping the
-# empty decision identical to the nonempty one.
-# Field-aware cases: run-end encoding is transparent at the value layer
-# (rows ARE the values child's rows, no REE-level validity); dictionary
-# rows are pool VALUES whose composite children live on the value FIELD
-# (Dictionary<REE<...>>); union rows take the WINNING child's type. The
-# declared domain must equal the ACTUAL pre-override container type:
-# `_postconvert` dispatches on the ROOT descriptor only, so temporal
-# leaves under a transparent wrapper stay RAW storage integers (the
-# `converted` flag tracks that), and a multi-child union declares what a
-# valid MIXED population materializes as — Julia's pairwise
-# `promote_typejoin`, exactly the widening `map(identity)` performs — not
-# the mathematical union of child domains. Missing in the declared type
-# never changes keep/drop (the rule tests `D <: Union{T,Missing}`), so
-# nullability wraps are cosmetic.
+# empty decision identical to the nonempty one. Field-aware rules:
+#   * The declared domain must equal the ACTUAL pre-override container type.
+#     `_postconvert` dispatches on the ROOT descriptor only, so temporal
+#     leaves under a transparent wrapper stay RAW storage integers (the
+#     `converted` flag tracks that).
+#   * Run-end encoding is transparent at the value layer: rows ARE the
+#     values child's rows, with no REE-level validity.
+#   * Dictionary rows are pool VALUES, and their composite children live on
+#     the value FIELD (Dictionary<REE<...>>).
+#   * A multi-child union declares what a valid MIXED population
+#     materializes as: Julia's pairwise `promote_typejoin`, exactly the
+#     widening `map(identity)` performs — not the mathematical union of the
+#     child domains.
+# Missing in the declared type never changes keep/drop (the rule tests
+# `D <: Union{T,Missing}`), so nullability wraps are cosmetic.
 function _declaredeltype(f::AC.Field, converted::Bool=true)
     t = f.type
     if t isa AC.RunEndEncodedType && length(f.children) == 2
@@ -1288,7 +1368,7 @@ _declaredbasetype(t::AC.ArrowType) =
 # --- Stream ------------------------------------------------------------------
 
 """
-    Arrow.Stream(source; mmap=true, limits=Arrow.Limits())
+    Arrow.Stream(source; mmap=true, limits)
 
 Iterate an IPC source (a file path, an `IO`, a `Vector{UInt8}`, or an
 [`Arrow.AbstractArrowSource`](@ref), which is read whole) one record batch
@@ -1336,6 +1416,9 @@ function Stream(source; mmap::Bool=true, limits::Limits=_defaultreaderlimits(sou
     # The stream and every yielded partition share one lifetime authority.
     # Releasing either closes the same source region and makes later
     # iteration fail consistently for borrowed and decompressed columns.
+    # `_sourceregions` returns exactly one region for both source kinds, so
+    # `only` cannot throw; a second region would need to share this cell,
+    # not add one — the Stream has a single close authority.
     return Stream(
         src,
         regions,
