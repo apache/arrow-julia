@@ -414,4 +414,85 @@ end
         rebased = AS.rebase_payload(payloads[2], length(b0))
         @test String(ArrowString(rebased, combined)) == "second-buffer-value"
     end
+
+    @testset "StringVector: trusted constructor" begin
+        data = Vector{UInt8}(codeunits("hello, a value that is longer than twelve bytes"))
+        payloads = ArrowStringPayload[
+            AS.inline_payload(data, 1, 5),
+            AS.view_payload(data, 8, length(data) - 7, 0, 7),
+        ]
+        checked = StringVector{ArrowString}(payloads, Vector{UInt8}[data])
+        trusted = StringVector{ArrowString}(payloads, Vector{UInt8}[data], Val(:trusted))
+        @test collect(String, trusted) == collect(String, checked)
+        # the element-type gate still applies
+        @test_throws ArgumentError StringVector{Int}(
+            ArrowStringPayload[],
+            Vector{UInt8}[],
+            Val(:trusted),
+        )
+        # a payload the checked constructor rejects is accepted untouched: the
+        # caller vouches instead (nonzero inline padding is safe to observe,
+        # so it is the probe)
+        short = AS.inline_payload(data, 1, 5)
+        badpadding = ArrowStringPayload(short.a, short.b | (UInt64(1) << 8))
+        @test_throws ArgumentError StringVector{ArrowString}(
+            [badpadding],
+            Vector{UInt8}[data],
+        )
+        tv = StringVector{ArrowString}([badpadding], Vector{UInt8}[data], Val(:trusted))
+        @test tv isa StringVector{ArrowString} && length(tv) == 1
+        mp = [AS.PAYLOAD_MISSING]
+        mv = StringVector{Union{Missing,ArrowString}}(mp, Vector{UInt8}[], Val(:trusted))
+        @test mv[1] === missing
+    end
+
+    @testset "ArrowBytes and BytesVector" begin
+        vals = Vector{UInt8}[rand(UInt8, n) for n in (0, 3, 12, 13, 40)]
+        data = vcat(vals...)
+        offs = cumsum([0; map(length, vals)])
+        payloads = ArrowStringPayload[]
+        for (i, v) in enumerate(vals)
+            n = length(v)
+            if n <= AS.INLINE_MAX
+                push!(payloads, AS.inline_payload(data, offs[i] + 1, n))
+            else
+                push!(payloads, AS.view_payload(data, offs[i] + 1, n, 0, offs[i]))
+            end
+        end
+        col = BytesVector{ArrowBytes}(payloads, Vector{UInt8}[data])
+        @test col isa BytesVector{ArrowBytes} && length(col) == length(vals)
+        @test all(col[i] == vals[i] for i in eachindex(vals))
+        @test all(isequal(col[i], vals[i]) for i in eachindex(vals))
+        # hash agrees with Vector{UInt8} (generic AbstractArray hashing), so
+        # ArrowBytes work as Dict keys next to byte vectors
+        @test all(hash(col[i]) == hash(vals[i]) for i in eachindex(vals))
+        @test Vector{UInt8}(col[2]) == vals[2] && Vector{UInt8}(col[5]) == vals[5]
+        @test col[5][7] == vals[5][7] && col[2][1] == vals[2][1]
+        @test cmp(col[2], col[2]) == 0 && cmp(collect(col[2]), vals[2]) == 0
+        m = AS.materialize(col)
+        @test m isa Vector{Vector{UInt8}} && m == vals
+        # equality: one-word length+prefix reject, then memcmp on the tail
+        long1 = Vector{UInt8}([collect(0x01:0x10); 0xaa])
+        long2 = Vector{UInt8}([collect(0x01:0x10); 0xbb])
+        ab1 = ArrowBytes(AS.view_payload(long1, 1, 17, 0, 0), long1)
+        ab2 = ArrowBytes(AS.view_payload(long2, 1, 17, 0, 0), long2)
+        @test ab1 != ab2
+        @test ab1 == ArrowBytes(AS.view_payload(long1, 1, 17, 0, 0), long1)
+
+        # missing markers, materialize, and the trusted constructor
+        mp = ArrowStringPayload[payloads[4], AS.PAYLOAD_MISSING]
+        mcol = BytesVector{Union{Missing,ArrowBytes}}(mp, Vector{UInt8}[data])
+        @test mcol[1] == vals[4] && mcol[2] === missing
+        @test isequal(AS.materialize(mcol), [vals[4], missing])
+        @test AS.materialize(mcol) isa Vector{Union{Vector{UInt8},Missing}}
+        tcol = BytesVector{Union{Missing,ArrowBytes}}(mp, Vector{UInt8}[data], Val(:trusted))
+        @test tcol[2] === missing && tcol[1] == vals[4]
+        # checked constructors reject bad geometry exactly like the string side
+        @test_throws ArgumentError BytesVector{ArrowBytes}(
+            [AS.view_payload(data, 1, 20, 0, 100)],
+            Vector{UInt8}[data],
+        )
+        @test_throws ArgumentError BytesVector{Int}(ArrowStringPayload[], Vector{UInt8}[])
+        @test_throws ArgumentError ArrowBytes(AS.view_payload(data, 1, 20, 0, 100), data)
+    end
 end

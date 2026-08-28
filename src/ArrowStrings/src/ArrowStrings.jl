@@ -44,13 +44,17 @@ never allocate; `String(s)` copies out; `materialize(v)` copies a whole
 column out to `Vector{String}`. Everything here depends only on Base and uses
 concrete types throughout.
 
+The same payload is Arrow's BinaryView entry, so the package also carries the
+bytes counterparts: `ArrowBytes`, an opaque binary value over one payload, and
+`BytesVector`, a column of them that IS a BinaryView array's memory.
+
 Lifetime: an `ArrowString` view pins its buffer (`data`), and a
 `StringVector` pins all of its buffers, exactly like any zero-copy
 string view; a consumer that must outlive the source materializes.
 """
 module ArrowStrings
 
-export ArrowString, StringVector, ArrowStringPayload
+export ArrowString, StringVector, ArrowStringPayload, ArrowBytes, BytesVector
 
 # Mark the supported non-exported surface with public. It goes through
 # Core.eval because Julia < 1.11 cannot parse the public keyword at all.
@@ -521,9 +525,39 @@ function Base.write(io::IO, s::ArrowString)
 end
 Base.print(io::IO, s::ArrowString) = (write(io, s); nothing)
 
+# Validate one column's payloads against its buffers — the shared body of the
+# StringVector and BytesVector checked constructors.
+function _validate_column(
+    payloads::Vector{ArrowStringPayload},
+    buffers::Vector{Vector{UInt8}},
+    missingok::Bool,
+    what::String,
+)
+    for p in payloads
+        len = payloadlength(p)
+        # Inline and missing payloads reference no buffer; pass the
+        # shared empty vector so only the padding/marker checks run.
+        if len < 0
+            _validate_payload(p, EMPTY_BYTES; missingok=missingok)
+        elseif len <= INLINE_MAX
+            _validate_payload(p, EMPTY_BYTES)
+        else
+            bufidx = Int(payloadbufidx(p))
+            0 <= bufidx < length(buffers) || throw(
+                ArgumentError(
+                    "$what view buffer index $bufidx is outside 0:$(length(buffers) - 1)",
+                ),
+            )
+            _validate_payload(p, buffers[bufidx + 1])
+        end
+    end
+    return nothing
+end
+
 """
     StringVector{ELT}(payloads, buffers::Vector{Vector{UInt8}})
     StringVector{ELT}(payloads, buf::Vector{UInt8}, extra::Vector{UInt8})
+    StringVector{ELT}(payloads, buffers, Val(:trusted))
 
 A string column: one payload per element and the byte buffers that view
 payloads point into (`buffers[bufidx + 1]` for an entry's buffer index).
@@ -535,6 +569,14 @@ Construction validates every payload, including missing markers, inline
 padding, buffer indices, byte ranges, and long-string prefixes. This makes
 later zero-copy access safe. Do not resize or mutate the payload vector or any
 buffer while the column is in use.
+
+The `Val(:trusted)` constructor skips that validation. It is for builders
+that produced every payload themselves from bounds they already checked — a
+parser whose offsets were validated as they were read, for example — where
+re-validating each entry would double the column's construction cost. The
+caller vouches for every invariant the checked constructors enforce; a payload
+that violates them makes later access read out of bounds. Payloads that come
+from anywhere else go through a checked constructor.
 
 This is an Arrow Utf8View array's memory: `payloads` is its views buffer and
 `buffers` its variadic data buffers, so Arrow.jl can write the column without
@@ -548,33 +590,25 @@ struct StringVector{ELT} <: AbstractVector{ELT}
         payloads::Vector{ArrowStringPayload},
         buffers::Vector{Vector{UInt8}},
     ) where {ELT}
-        (ELT === ArrowString || ELT === Union{Missing,ArrowString}) || throw(
-            ArgumentError(
-                "StringVector element type must be ArrowString or Union{Missing,ArrowString}",
-            ),
-        )
-        missingok = Missing <: ELT
-        for p in payloads
-            len = payloadlength(p)
-            # Inline and missing payloads reference no buffer; pass the
-            # shared empty vector so only the padding/marker checks run.
-            if len < 0
-                _validate_payload(p, EMPTY_BYTES; missingok=missingok)
-            elseif len <= INLINE_MAX
-                _validate_payload(p, EMPTY_BYTES)
-            else
-                bufidx = Int(payloadbufidx(p))
-                0 <= bufidx < length(buffers) || throw(
-                    ArgumentError(
-                        "ArrowString view buffer index $bufidx is outside 0:$(length(buffers) - 1)",
-                    ),
-                )
-                _validate_payload(p, buffers[bufidx + 1])
-            end
-        end
+        _check_string_elt(ELT)
+        _validate_column(payloads, buffers, Missing <: ELT, "ArrowString")
+        return new{ELT}(payloads, buffers)
+    end
+    function StringVector{ELT}(
+        payloads::Vector{ArrowStringPayload},
+        buffers::Vector{Vector{UInt8}},
+        ::Val{:trusted},
+    ) where {ELT}
+        _check_string_elt(ELT)
         return new{ELT}(payloads, buffers)
     end
 end
+_check_string_elt(ELT) =
+    (ELT === ArrowString || ELT === Union{Missing,ArrowString}) || throw(
+        ArgumentError(
+            "StringVector element type must be ArrowString or Union{Missing,ArrowString}",
+        ),
+    )
 function StringVector{ELT}(
     payloads::Vector{ArrowStringPayload},
     buf::Vector{UInt8},
@@ -636,6 +670,179 @@ function materialize(v::StringVector{ELT}) where {ELT}
                     out[i] = unsafe_string(pointer(src, payloadpos(p)), len)
                 end
             end
+        end
+    end
+    return out
+end
+
+# ---- bytes columns: the same payload machinery for opaque binary values ----
+
+"""
+    ArrowBytes <: AbstractVector{UInt8}
+
+A binary value: its 16-byte payload plus the byte vector a view's content
+lives in — the bytes counterpart of [`ArrowString`](@ref). The payload layout
+is Arrow's BinaryView entry, which is byte for byte the StringView layout, so
+[`ArrowStringPayload`](@ref) serves both. Byte access, comparison, and hashing
+do not allocate; hashing and equality agree with `Vector{UInt8}` through the
+generic `AbstractArray` definitions. `Vector{UInt8}(b)` copies out. The
+two-argument constructor validates the payload and throws `ArgumentError`;
+`Val(:unchecked)` is the internal bypass.
+"""
+struct ArrowBytes <: AbstractVector{UInt8}
+    p::ArrowStringPayload
+    data::Vector{UInt8}    # dereferenced only when the payload is a view
+    function ArrowBytes(p::ArrowStringPayload, data::Vector{UInt8})
+        _validate_payload(p, data)
+        return new(p, data)
+    end
+    ArrowBytes(p::ArrowStringPayload, data::Vector{UInt8}, ::Val{:unchecked}) =
+        new(p, data)
+end
+
+@inline _unchecked_arrowbytes(p::ArrowStringPayload, data::Vector{UInt8}) =
+    ArrowBytes(p, data, Val(:unchecked))
+
+Base.size(b::ArrowBytes) = (Int(payloadlength(b.p)),)
+Base.IndexStyle(::Type{ArrowBytes}) = IndexLinear()
+Base.@propagate_inbounds function Base.getindex(b::ArrowBytes, i::Int)
+    @boundscheck checkbounds(b, i)
+    len = payloadlength(b.p)
+    len <= INLINE_MAX && return _inlinebyte(b.p, i)
+    return @inbounds b.data[payloadpos(b.p) + i - 1]
+end
+
+# One word compares length + first four bytes; equal inline payloads then
+# compare in registers, equal-prefix views memcmp their retained buffers.
+function Base.:(==)(x::ArrowBytes, y::ArrowBytes)
+    x.p.a == y.p.a || return false
+    n = payloadlength(x.p)
+    n <= INLINE_MAX && return x.p.b == y.p.b
+    GC.@preserve x y begin
+        return ccall(
+            :memcmp,
+            Cint,
+            (Ptr{UInt8}, Ptr{UInt8}, Csize_t),
+            pointer(x.data, payloadpos(x.p)),
+            pointer(y.data, payloadpos(y.p)),
+            n,
+        ) == 0
+    end
+end
+
+function Base.Vector{UInt8}(b::ArrowBytes)
+    n = Int(payloadlength(b.p))
+    out = Vector{UInt8}(undef, n)
+    if n > INLINE_MAX
+        GC.@preserve b out begin
+            unsafe_copyto!(pointer(out), pointer(b.data, payloadpos(b.p)), n)
+        end
+    else
+        @inbounds for i = 1:n
+            out[i] = _inlinebyte(b.p, i)
+        end
+    end
+    return out
+end
+Base.convert(::Type{Vector{UInt8}}, b::ArrowBytes) = Vector{UInt8}(b)
+
+"""
+    BytesVector{ELT}(payloads, buffers::Vector{Vector{UInt8}})
+    BytesVector{ELT}(payloads, buffers, Val(:trusted))
+
+A binary column: one payload per element and the byte buffers that view
+payloads point into — the bytes counterpart of [`StringVector`](@ref), and an
+Arrow BinaryView array's memory. `ELT` is `ArrowBytes` or
+`Union{Missing, ArrowBytes}`. `getindex` returns an `ArrowBytes` (or
+`missing`) with NO allocation; `materialize` copies out to
+`Vector{Vector{UInt8}}`.
+
+Construction validates every payload exactly as [`StringVector`](@ref) does,
+and the `Val(:trusted)` constructor skips that validation under the same
+contract. Do not resize or mutate the payload vector or any buffer while the
+column is in use.
+"""
+struct BytesVector{ELT} <: AbstractVector{ELT}
+    payloads::Vector{ArrowStringPayload}
+    buffers::Vector{Vector{UInt8}}
+    function BytesVector{ELT}(
+        payloads::Vector{ArrowStringPayload},
+        buffers::Vector{Vector{UInt8}},
+    ) where {ELT}
+        _check_bytes_elt(ELT)
+        _validate_column(payloads, buffers, Missing <: ELT, "ArrowBytes")
+        return new{ELT}(payloads, buffers)
+    end
+    function BytesVector{ELT}(
+        payloads::Vector{ArrowStringPayload},
+        buffers::Vector{Vector{UInt8}},
+        ::Val{:trusted},
+    ) where {ELT}
+        _check_bytes_elt(ELT)
+        return new{ELT}(payloads, buffers)
+    end
+end
+_check_bytes_elt(ELT) =
+    (ELT === ArrowBytes || ELT === Union{Missing,ArrowBytes}) || throw(
+        ArgumentError(
+            "BytesVector element type must be ArrowBytes or Union{Missing,ArrowBytes}",
+        ),
+    )
+
+Base.size(v::BytesVector) = size(v.payloads)
+Base.@propagate_inbounds @inline function Base.getindex(
+    v::BytesVector{ELT},
+    i::Int,
+) where {ELT}
+    @boundscheck checkbounds(v.payloads, i)
+    @inbounds p = v.payloads[i]
+    len = payloadlength(p)
+    len < 0 && return missing
+    len <= INLINE_MAX && return _unchecked_arrowbytes(p, EMPTY_BYTES)
+    return _unchecked_arrowbytes(p, v.buffers[payloadbufidx(p) + 1])
+end
+# All-present columns skip the missing branch entirely — the concrete return
+# type is what lets access compile down to zero allocations.
+Base.@propagate_inbounds @inline function Base.getindex(
+    v::BytesVector{ArrowBytes},
+    i::Int,
+)
+    @boundscheck checkbounds(v.payloads, i)
+    @inbounds p = v.payloads[i]
+    len = payloadlength(p)
+    len <= INLINE_MAX && return _unchecked_arrowbytes(p, EMPTY_BYTES)
+    return _unchecked_arrowbytes(p, v.buffers[payloadbufidx(p) + 1])
+end
+
+"""
+    materialize(v::BytesVector) -> Vector{Vector{UInt8}} or Vector{Union{Vector{UInt8},Missing}}
+
+Copy every element out to a plain `Vector{UInt8}`, detaching the result from
+the column's buffers.
+"""
+function materialize(v::BytesVector{ELT}) where {ELT}
+    out = Vector{ELT === ArrowBytes ? Vector{UInt8} : Union{Vector{UInt8},Missing}}(
+        undef,
+        length(v),
+    )
+    @inbounds for i in eachindex(v.payloads)
+        p = v.payloads[i]
+        len = payloadlength(p)
+        if len < 0
+            out[i] = missing
+        else
+            b = Vector{UInt8}(undef, len)
+            if len <= INLINE_MAX
+                for j = 1:len
+                    b[j] = _inlinebyte(p, j)
+                end
+            else
+                src = v.buffers[payloadbufidx(p) + 1]
+                GC.@preserve src b begin
+                    unsafe_copyto!(pointer(b), pointer(src, payloadpos(p)), len)
+                end
+            end
+            out[i] = b
         end
     end
     return out
