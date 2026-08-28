@@ -84,9 +84,10 @@ writer, validation, scan, and C interface engines.
 - An incremental writer: `Arrow.Writer(sink; file=true)` publishes each
   written table's batches immediately, holding only the current table in
   memory, for both IPC formats. `Arrow.append(sink, table)` extends an
-  existing IPC stream in place. Streams whose schema has dictionary fields
-  now always declare the DictionaryReplacement feature, so 3.0-written
-  streams stay appendable.
+  existing IPC stream in place. `Arrow.Writer(sink; dictreplacement=true)`
+  declares the DictionaryReplacement feature up front so a stream's pools
+  can be replaced by later writes or appends; declared features are demands
+  on readers, so nothing is declared speculatively.
 - The IPC reader accepts vtables that understate a wider field's extent,
   as the reference implementation does. Arrow 2.x's FlatBuffers builder
   produced them for every dictionary-encoded field carrying metadata, so

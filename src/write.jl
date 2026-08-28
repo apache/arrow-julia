@@ -92,8 +92,8 @@ function tobuffer(tbl; kwargs...)
 end
 
 """
-    Arrow.Writer(sink; file=true, compress=nothing,
-                 metadata=nothing, colmetadata=nothing)
+    Arrow.Writer(sink; file=true, compress=nothing, metadata=nothing,
+                 colmetadata=nothing, dictreplacement=false)
     Arrow.Writer(f::Function, sink; kwargs...)
 
 An incremental IPC writer: batches publish to `sink` as they are written,
@@ -117,12 +117,15 @@ admits `Missing`, and later missing values under a non-nullable field are
 refused. To pin a schema explicitly, write a zero-row table with fully
 typed columns first.
 
-Dictionary-encoded columns: the stream format (`file=false`) re-emits a
-changed pool as a replacement dictionary batch. The file format carries
-one dictionary batch per id, so every later table must produce the first
+Dictionary-encoded columns: every later table may reuse the first
 table's exact pool (the same categories in the same first-appearance
-order); a changed pool is refused — use the stream format for changing
-pools.
+order). A CHANGED pool needs replacement dictionary batches, which the
+schema message must declare up front: pass `dictreplacement=true`
+(stream format only) to declare it. The declaration is a demand on
+readers — strict ones such as nanoarrow refuse any stream declaring a
+feature they do not support — so it is opt-in, and without it a changed
+pool is refused. The file format carries one dictionary batch per id and
+never replaces.
 
 `close` finalizes what has been published — the sink is a valid IPC
 output containing every batch written so far — and is idempotent. A
@@ -138,6 +141,7 @@ mutable struct Writer
     const compress::Symbol
     const metadata::Any
     const colmetadata::Any
+    const dictreplacement::Bool
     st::Union{Nothing,IPCWriteState}
     names::Vector{Symbol}
     schema::Union{Nothing,AC.Schema}
@@ -151,11 +155,21 @@ function _writer(
     compress::Union{Nothing,Symbol}=nothing,
     metadata=nothing,
     colmetadata=nothing,
+    dictreplacement::Bool=false,
 )
     codec = compress === nothing ? :none : compress
     if !haskey(CODEC_NAMES, codec)
         ownio && close(io)
         throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
+    end
+    if dictreplacement && file
+        ownio && close(io)
+        throw(
+            ArgumentError(
+                "dictreplacement is a stream-format feature; the IPC file " *
+                "format carries one dictionary batch per id",
+            ),
+        )
     end
     return Writer(
         io,
@@ -164,6 +178,7 @@ function _writer(
         codec,
         metadata,
         colmetadata,
+        dictreplacement,
         nothing,
         Symbol[],
         nothing,
@@ -219,7 +234,13 @@ function write(w::Writer, tbl)
                 collect(Pair{String,String}, retained.metadata)
             )
         sch = AC.Schema(fields; metadata=schmeta)
-        st = beginwrite!(w.io, sch; file=w.file, compress=w.compress)
+        st = beginwrite!(
+            w.io,
+            sch;
+            file=w.file,
+            compress=w.compress,
+            dictreplacement=w.dictreplacement,
+        )
         w.st = st
         w.schema = sch
         w.names = names
@@ -274,10 +295,10 @@ by a new end-of-stream marker.
 A dictionary-encoded column whose pool matches the stream's current pool
 reuses it; a changed pool is emitted as a replacement dictionary batch
 when the stream's schema message declared the DictionaryReplacement
-feature (streams this package writes declare it whenever the schema has a
-dictionary field), and refused otherwise. The file format does not
-support appending: rewrite the file, or produce it incrementally with
-[`Arrow.Writer`](@ref).
+feature (produce such a stream with
+`Arrow.Writer(sink; file=false, dictreplacement=true)`), and refused
+otherwise. The file format does not support appending: rewrite the file,
+or produce it incrementally with [`Arrow.Writer`](@ref).
 """
 function append(path::AbstractString, tbl; kwargs...)
     bytes = Base.read(path)

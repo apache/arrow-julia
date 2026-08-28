@@ -749,12 +749,22 @@ mutable struct IPCWriteState
     finished::Bool
 end
 
-# Batch sequences are unknown up front, so declare what MAY occur: any
-# dictionary field may later replace its pool (stream format only — the file
-# format forbids replacement), and a codec means compressed bodies.
-function _incrementalfeatures(ids::IdDict{Field,Int64}, codec::Int8, file::Bool)
+# Batch sequences are unknown up front. A declared feature is a demand on
+# readers (nanoarrow refuses any stream declaring one it does not support),
+# so nothing is declared speculatively: pool replacement needs the caller's
+# explicit opt-in, and a codec declares compressed bodies because every
+# batch this state writes will use it.
+function _incrementalfeatures(
+    ids::IdDict{Field,Int64},
+    codec::Int8,
+    file::Bool,
+    dictreplacement::Bool,
+)
     features = Int64[]
-    !file && !isempty(ids) && push!(features, FEATURE_DICTIONARY_REPLACEMENT)
+    dictreplacement &&
+        !file &&
+        !isempty(ids) &&
+        push!(features, FEATURE_DICTIONARY_REPLACEMENT)
     codec == CODEC_NONE || push!(features, FEATURE_COMPRESSED_BODY)
     return features
 end
@@ -772,6 +782,7 @@ function beginwrite!(
     compress::Symbol=:none,
     dictids::IdDict{Field,Int64}=IdDict{Field,Int64}(),
     features::Union{Nothing,Vector{Int64}}=nothing,
+    dictreplacement::Bool=false,
 )
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
@@ -781,7 +792,9 @@ function beginwrite!(
     ids = assigndictids(sch.fields, dictids)
     fielddictids = IdDict{Field,Int64}(ids)
     validatedictionaryids(sch.fields, fielddictids)
-    feats = features === nothing ? _incrementalfeatures(ids, codec, file) : features
+    feats =
+        features === nothing ? _incrementalfeatures(ids, codec, file, dictreplacement) :
+        features
     st = IPCWriteState(
         io,
         file,
@@ -1008,18 +1021,26 @@ function writestream(
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
         throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
+    codec = CODEC_NAMES[compress]
     _checkbatches(sch, batches)
     _validatewriterschema(sch)
     # `beginwrite!` recomputes the same ids from `dictids` (assignment is
     # deterministic); this pass exists so the whole batch sequence is
-    # validated before any bytes exist. Features use the incremental
-    # default: a stream with dictionary fields declares DictionaryReplacement
-    # whether or not these batches replace, so the output stays appendable.
+    # validated — and its EXACT features computed — before any bytes exist.
+    # A declared feature is a demand on readers, so an eager stream declares
+    # only what these batches actually use.
     ids = assigndictids(sch.fields, dictids)
     validatedictionaryids(sch.fields, IdDict{Field,Int64}(ids))
     _validatewriterbatches(sch, batches, ids)
     io = IOBuffer()
-    st = beginwrite!(io, sch; file=false, compress=compress, dictids=dictids)
+    st = beginwrite!(
+        io,
+        sch;
+        file=false,
+        compress=compress,
+        dictids=dictids,
+        features=_streamfeatures(sch, batches, ids, codec),
+    )
     try
         for batch in batches
             writebatch!(st, batch; validate=false)

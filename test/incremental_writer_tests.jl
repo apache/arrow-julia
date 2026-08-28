@@ -113,13 +113,29 @@ const AC = Arrow.ArrowCore
     end
 
     @testset "stream format replaces dictionary pools across writes" begin
+        # Replacement must be opted into: the declaration is a demand on
+        # readers, so the default writer refuses a changed pool instead.
         io = IOBuffer()
         w = Arrow.Writer(io; file=false)
+        Arrow.write(w, (; d=Arrow.DictEncode(["a", "b", "a"])))
+        err = @test_throws Arrow.ValidationError Arrow.write(
+            w,
+            (; d=Arrow.DictEncode(["c", "c", "b"])),
+        )
+        @test occursin("DictionaryReplacement", err.value.msg)
+        Arrow.write(w, (; d=Arrow.DictEncode(["a", "b", "b"])))   # same pool reuses
+        close(w)
+        @test Arrow.Table(take!(io)).d == ["a", "b", "a", "a", "b", "b"]
+
+        io = IOBuffer()
+        w = Arrow.Writer(io; file=false, dictreplacement=true)
         Arrow.write(w, (; d=Arrow.DictEncode(["a", "b", "a"])))
         Arrow.write(w, (; d=Arrow.DictEncode(["c", "c", "b"])))
         close(w)
         t = Arrow.Table(take!(io))
         @test t.d == ["a", "b", "a", "c", "c", "b"]
+        # The file format has no replacement to declare.
+        @test_throws ArgumentError Arrow.Writer(IOBuffer(); dictreplacement=true)
     end
 
     @testset "file format reuses an identical pool and refuses a change" begin
@@ -181,14 +197,27 @@ const AC = Arrow.ArrowCore
     end
 
     @testset "append with dictionary columns" begin
+        # An eager-written stream declares no replacement: a content-equal
+        # pool appends by reuse, and a changed pool is refused.
         path = joinpath(mktempdir(), "d.arrow")
         Arrow.write(path, (; d=Arrow.DictEncode(["a", "b", "a"])); file=false)
-        # A pool the stream already emitted is reused; a new pool becomes a
-        # replacement dictionary batch (3.0 streams with dictionary fields
-        # declare the DictionaryReplacement feature).
-        Arrow.append(path, (; d=Arrow.DictEncode(["b", "a"])))
-        Arrow.append(path, (; d=Arrow.DictEncode(["z", "z", "q"])))
-        @test Arrow.Table(path).d == ["a", "b", "a", "b", "a", "z", "z", "q"]
+        Arrow.append(path, (; d=Arrow.DictEncode(["a", "b", "b"])))
+        @test Arrow.Table(path).d == ["a", "b", "a", "a", "b", "b"]
+        err = @test_throws Arrow.ValidationError Arrow.append(
+            path,
+            (; d=Arrow.DictEncode(["z", "z", "q"])),
+        )
+        @test occursin("DictionaryReplacement", err.value.msg)
+
+        # A Writer stream that opted into replacement accepts replacing
+        # appends.
+        rpath = joinpath(mktempdir(), "r.arrow")
+        Arrow.Writer(rpath; file=false, dictreplacement=true) do w
+            Arrow.write(w, (; d=Arrow.DictEncode(["a", "b", "a"])))
+        end
+        Arrow.append(rpath, (; d=Arrow.DictEncode(["b", "a"])))
+        Arrow.append(rpath, (; d=Arrow.DictEncode(["z", "z", "q"])))
+        @test Arrow.Table(rpath).d == ["a", "b", "a", "b", "a", "z", "z", "q"]
     end
 
     @testset "append refusals" begin
@@ -232,8 +261,13 @@ const AC = Arrow.ArrowCore
         err = @test_throws Arrow.ValidationError Arrow.append(path, tail)
         @test occursin("DictionaryReplacement", err.value.msg)
         @test read(path) == fixture
-        # The migration recipe: one 3.0 rewrite makes the stream appendable.
-        Arrow.write(path, Arrow.Table(read(path)); file=false)
+        # The migration recipe: rewrite once through a replacement-declaring
+        # writer (retention preserves the 2.x pool, null slot included, so
+        # appends with fresh pools need replacement).
+        migrated = Arrow.Table(read(path))
+        Arrow.Writer(path; file=false, dictreplacement=true) do w
+            Arrow.write(w, migrated)
+        end
         Arrow.append(path, tail)
         t = Arrow.Table(path)
         # The 2.x fixture holds the five-row table twice (two partitions).

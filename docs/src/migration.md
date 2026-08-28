@@ -126,7 +126,7 @@ not provide these Arrow 2.x features:
 | Arrow 2.x feature | Arrow 3.0 action |
 |---|---|
 | `Arrow.Writer` | Still works, reimplemented: an incremental writer for both formats. The FIRST table written fixes the schema; later tables must conform (no cross-table inference). See [`Arrow.Writer`](@ref). |
-| `Arrow.append` | Still works for the IPC STREAM format, reimplemented. The file format refuses: produce it incrementally with `Arrow.Writer` or rewrite it. A 2.x stream whose dictionary pools carry null slots needs one 3.0 rewrite before it accepts appends. |
+| `Arrow.append` | Still works for the IPC STREAM format, reimplemented. The file format refuses: produce it incrementally with `Arrow.Writer` or rewrite it. A 2.x stream whose dictionary pools carry null slots needs one rewrite through `Arrow.Writer(path; file=false, dictreplacement=true)` before it accepts pool-changing appends. |
 | `table \|> Arrow.write(sink)` | Still works: the curried form is kept. |
 | `Arrow.tobuffer(table)` | Still works, and still emits the IPC stream format. |
 | `ntasks` | Accepted and ignored with a one-time warning. Encoding is not task-parallel in 3.0, including in `Arrow.Writer`. |
