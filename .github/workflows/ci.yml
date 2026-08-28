@@ -75,19 +75,12 @@ jobs:
                           -e 's/"$//g')
           VERIFY_DEFAULT=0 dev/release/verify_rc.sh ${version} 100
   test:
-    name: ${{ matrix.pkg.name }} - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
+    name: Arrow.jl - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        pkg:
-          - name: Arrow.jl
-            dir: '.'
-          - name: ArrowTypes.jl
-            dir: './src/ArrowTypes'
-          - name: ArrowStrings.jl
-            dir: './src/ArrowStrings'
         version:
           - 'min'
           - '1.11'
@@ -99,20 +92,12 @@ jobs:
         nthreads:
           - 1
           - 2
-        exclude:
-          # ArrowTypes supports Julia 1.0, but Julia 1.0 has no Apple Silicon
-          # macOS binary. Keep its minimum-version coverage on Ubuntu.
-          - pkg:
-              name: ArrowTypes.jl
-              dir: './src/ArrowTypes'
-            version: 'min'
-            os: macos-latest
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
-          project: ${{ matrix.pkg.dir }}
+          project: '.'
       - uses: actions/cache@v6
         env:
           cache-name: cache-artifacts
@@ -126,28 +111,59 @@ jobs:
       # Before the build: ArrowStrings is unregistered and ArrowTypes 2.4 is in
       # this monorepo; Julia 1.10's Pkg does not read the `[sources]` entries
       # that point at them, so the resolve would fail without this step.
-      - name: Dev local subpackages for Arrow.jl tests
-        if: matrix.pkg.name == 'Arrow.jl'
+      - name: Dev local subpackages
         shell: julia --project=. {0}
         run: |
           using Pkg
           Pkg.develop([PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")])
       - uses: julia-actions/julia-buildpkg@v1.6
-        with:
-          project: ${{ matrix.pkg.dir }}
       - uses: julia-actions/julia-runtest@v1
         env:
           JULIA_NUM_THREADS: ${{ matrix.nthreads }}
-        with:
-          project: ${{ matrix.pkg.dir }}
-      - name: Process Arrow.jl coverage
-        if: matrix.pkg.name == 'Arrow.jl'
-        uses: julia-actions/julia-processcoverage@v1
+      - uses: julia-actions/julia-processcoverage@v1
         with:
           directories: src,ext
-      - name: Process subpackage coverage
-        if: matrix.pkg.name != 'Arrow.jl'
-        uses: julia-actions/julia-processcoverage@v1
+      - uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+  # The subpackages' own suites: one job each, on the package's minimum
+  # supported Julia. The full Arrow.jl matrix above exercises both packages'
+  # code on every version, OS, and thread count.
+  test-subpackages:
+    name: ${{ matrix.pkg.name }} - Julia min - ${{ github.event_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg:
+          - name: ArrowTypes.jl
+            dir: './src/ArrowTypes'
+          - name: ArrowStrings.jl
+            dir: './src/ArrowStrings'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: 'min'
+          project: ${{ matrix.pkg.dir }}
+      - uses: actions/cache@v6
+        env:
+          cache-name: cache-artifacts
+        with:
+          path: ~/.julia/artifacts
+          key: ${{ runner.os }}-test-${{ env.cache-name }}-${{ hashFiles('**/Project.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-test-${{ env.cache-name }}-
+            ${{ runner.os }}-test-
+            ${{ runner.os }}-
+      - uses: julia-actions/julia-buildpkg@v1.6
+        with:
+          project: ${{ matrix.pkg.dir }}
+      - uses: julia-actions/julia-runtest@v1
+        with:
+          project: ${{ matrix.pkg.dir }}
+      - uses: julia-actions/julia-processcoverage@v1
         with:
           directories: ${{ matrix.pkg.dir }}/src
       - uses: codecov/codecov-action@v7
