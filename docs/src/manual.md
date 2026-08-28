@@ -115,11 +115,10 @@ partition-aware sinks see the source's batch structure —
 `Arrow.write(sink, Arrow.Stream(...))` writes one record batch per input
 batch.
 
-Memory: only the memory-mapped **file-format** path (the default when you
-pass a path to a file-format source) avoids holding the whole source —
-batches are decoded from the mapping one at a time, so a consumer's loop
-over such a `Stream` holds one batch of columns at a time (plus the file's
-dictionaries), and that is the way to process a file larger than RAM. A
+Memory: only the memory-mapped **file-format** path avoids holding the whole
+source. Batches decode from the map one at a time, so a loop over such a
+`Stream` holds one batch of columns plus the file's dictionaries. That is the
+way to process a file larger than RAM. A
 `Stream` security budget (the `max_total_allocated_bytes` field of
 [`Arrow.Limits`](@ref)) stays cumulative across every batch it yields, even
 after the consumer drops that batch. Raise the limit explicitly for a trusted
@@ -194,7 +193,7 @@ maps to `Union{Missing, T}`.
 | Binary, LargeBinary, BinaryView, FixedSizeBinary | `Vector{UInt8}` |
 | Date32 | `Dates.Date` |
 | Date64 | `Dates.DateTime` |
-| Timestamp (second, millisecond) | `Dates.DateTime` |
+| Timestamp (second, millisecond) | `Dates.DateTime` (UTC instant; a declared timezone stays in the retained schema — loading TimeZones.jl reads these as `ZonedDateTime` instead) |
 | Timestamp (microsecond, nanosecond) | `Int64` (raw storage — `DateTime` cannot represent it) |
 | Time32/Time64 | `Dates.Time` |
 | Duration | `Dates.Second`/`Millisecond`/`Microsecond`/`Nanosecond` by unit |
@@ -266,20 +265,25 @@ receive no dedicated metadata or body request and are not decoded; the filter
 is evaluated batch by batch and `limit`/`offset` compose exactly over the
 qualifying rows. Without a filter, whole batches outside the window are never
 decoded, and with one decoding stops as soon as the window is full. On the stream format
-the scan is applied after decode with identical results. A scan whose filter
-has no semantics-preserving storage representation falls back to
-reading the whole source and evaluating over converted public values. This
-includes an inexact literal and a temporal conversion that aliases values or
-wraps ordering. Date64 and millisecond Timestamp equality can lower, but their
-ordered comparisons stay public; Timestamp-second and Time predicates also
-stay public. Duration lowering accepts a literal in the column unit or a
-coarser fixed unit, but a finer unit stays public because Julia can overflow
-while promoting stored values. Temporal Tuple and Array membership follows
-the same equality rules. Set members must also have the column's canonical
-public type, which preserves `isequal` and hashing. A custom membership object
-stays public because Arrow cannot transform it without changing its `in`
-semantics. An empty projection (`select = ()`) stays on the ranged path. It
-preserves the selected row count without fetching output column bodies.
+the scan is applied after decode with identical results.
+
+A scan whose filter has no semantics-preserving storage representation falls
+back to reading the whole source and evaluating over converted public values.
+This includes an inexact literal and a temporal conversion that aliases values
+or wraps ordering. The detailed rules:
+
+* Temporal lowering: Date64 and millisecond Timestamp equality can lower, but
+  their ordered comparisons stay public; Timestamp-second and Time predicates
+  also stay public. Duration lowering accepts a literal in the column unit or
+  a coarser fixed unit, but a finer unit stays public because Julia can
+  overflow while promoting stored values.
+* Set membership: temporal Tuple and Array membership follows the same
+  equality rules. Set members must also have the column's canonical public
+  type, which preserves `isequal` and hashing. A custom membership object
+  stays public because Arrow cannot transform it without changing its `in`
+  semantics.
+* Empty projection: `select = ()` stays on the ranged path. It preserves the
+  selected row count without fetching output column bodies.
 
 Filters over a field that contains a registered ArrowTypes.jl extension value
 at any depth are evaluated over the restored public values. The ArrowTypes

@@ -28,12 +28,17 @@ Arrow.Table
 Arrow.Stream
 Arrow.Limits
 Arrow.release!(::Arrow.Table)
+Arrow.getmetadata
 ```
 
 ## Write
 
 ```@docs
 Arrow.write
+Arrow.Writer
+Arrow.write(::Arrow.Writer, ::Any)
+Arrow.append
+Arrow.tobuffer
 Arrow.DictEncode
 ```
 

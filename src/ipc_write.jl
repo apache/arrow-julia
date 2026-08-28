@@ -188,6 +188,9 @@ function metatype!(b::FB.Builder, t::ArrowType)
         )
         return Meta.Interval, Meta.intervalEnd(b)
     elseif t isa UnionType
+        # The builder writes last-first, so every vector is prepended in
+        # reverse. A zero UOffsetT means "absent": the slot is left out and
+        # the getter returns the schema default.
         Meta.unionStartTypeIdsVector(b, length(t.typeids))
         foreach(x -> FB.prepend!(b, Int32(x)), Iterators.reverse(t.typeids))
         idvec = FB.endvector!(b, length(t.typeids))
@@ -560,9 +563,10 @@ bookkeeping; Core fields never carry them).
 function assigndictids(fields, given::IdDict{Field,Int64}=IdDict{Field,Int64}())
     # `given` lets a caller preserve ids from a source (a reader's table): two
     # fields sharing one id then share one dictionary batch, exactly as the
-    # source did (4.0.0-shareddict). Fresh ids fill the lowest unoccupied
-    # values so they never collide with given ones — including given ids at
-    # the top of the signed-long domain, where `max + 1` would wrap.
+    # source did (the arrow-testing 4.0.0-shareddict integration case). Fresh
+    # ids fill the lowest unoccupied values so they never collide with given
+    # ones — including given ids at the top of the signed-long domain, where
+    # `max + 1` would wrap.
     ids = IdDict{Field,Int64}(given)
     seen = IdDict{Field,Nothing}()
     used = Set{Int64}(values(ids))
@@ -644,36 +648,49 @@ function _validatewriterschema(sch::Schema)
     return nothing
 end
 
-function _validatewriterbatches(sch::Schema, batches, ids::IdDict{Field,Int64})
-    validated = AC._ValidatedDictionaries()
-    for batch in batches
-        # A shared immutable pool must satisfy every value-field contract
-        # through which the schema refers to it. Identity caching is safe only
-        # after those field-specific checks have run.
-        current = Dict{Int64,ArrayData}()
-        for (f, pool) in dictionarypools(sch.fields, batch.columns)
-            # One id names ONE pool within a record batch: every dictionary
-            # message precedes the record message on the wire, so an
-            # intra-batch pool change is not temporal replacement — it would
-            # silently retarget the earlier field to the later pool.
-            id = ids[f]
-            haskey(current, id) &&
-                current[id] !== pool &&
-                throw(
-                    ValidationError(
-                        "dictionary id $id carries two different pools in one record batch",
-                    ),
-                )
-            current[id] = pool
-            validate_semantic(AC.dictvaluefield(f, f.type::DictionaryType), pool)
-            validated[pool] = nothing
-        end
-        for (f, col) in zip(sch.fields, batch.columns)
-            AC._validate_semantic(f, col, validated)
-        end
+function _validatewriterbatch!(
+    validated::AC._ValidatedDictionaries,
+    sch::Schema,
+    batch::AC.RecordBatch,
+    ids::IdDict{Field,Int64},
+)
+    # A shared immutable pool must satisfy every value-field contract
+    # through which the schema refers to it. Identity caching is safe only
+    # after those field-specific checks have run.
+    current = Dict{Int64,ArrayData}()
+    for (f, pool) in dictionarypools(sch.fields, batch.columns)
+        # One id names ONE pool within a record batch: every dictionary
+        # message precedes the record message on the wire, so an
+        # intra-batch pool change is not temporal replacement — it would
+        # silently retarget the earlier field to the later pool.
+        id = ids[f]
+        haskey(current, id) &&
+            current[id] !== pool &&
+            throw(
+                ValidationError(
+                    "dictionary id $id carries two different pools in one record batch",
+                ),
+            )
+        current[id] = pool
+        validate_semantic(AC.dictvaluefield(f, f.type::DictionaryType), pool)
+        validated[pool] = nothing
+    end
+    for (f, col) in zip(sch.fields, batch.columns)
+        AC._validate_semantic(f, col, validated)
     end
     return nothing
 end
+
+function _validatewriterbatches(sch::Schema, batches, ids::IdDict{Field,Int64})
+    validated = AC._ValidatedDictionaries()
+    for batch in batches
+        _validatewriterbatch!(validated, sch, batch, ids)
+    end
+    return nothing
+end
+
+const FEATURE_DICTIONARY_REPLACEMENT = Int64(1)
+const FEATURE_COMPRESSED_BODY = Int64(2)
 
 """
 Which features must the schema declare for these batches? Replacement is
@@ -692,19 +709,295 @@ function _streamfeatures(sch::Schema, batches, ids::IdDict{Field,Int64}, codec::
             current[id] = pool
         end
     end
-    replacement && push!(features, Int64(1))   # Feature.DICTIONARY_REPLACEMENT
-    isempty(batches) || codec == CODEC_NONE || push!(features, Int64(2))  # Feature.COMPRESSED_BODY
+    replacement && push!(features, FEATURE_DICTIONARY_REPLACEMENT)
+    isempty(batches) || codec == CODEC_NONE || push!(features, FEATURE_COMPRESSED_BODY)
     return features
 end
 
+# ---------------------------------------------------------------------------
+# Incremental writer core: begin/writebatch/finish over one IO
+# ---------------------------------------------------------------------------
+
 """
-    writestream(sch, batches; compress=:none) -> Vector{UInt8}
+One in-progress IPC output. `beginwrite!` emits the schema message (and the
+file-format preamble), `writebatch!` validates and publishes one record batch
+(with any dictionary messages it needs), and `finishwrite!` emits the
+end-of-stream marker (and the file-format Footer). Batch bytes are staged in
+full and published to `io` once, so a validation or encoding failure never
+publishes a partial message — but the SINK gains bytes batch by batch, and an
+abandoned state leaves a torn stream or an unfooted file.
+
+The eager `writestream`/`writefile` drive this same state over an in-memory
+sink, validating every batch up front (`validate=false` per batch) and
+passing the features their whole batch sequence implies, so their output is
+byte-identical to the pre-incremental writers.
+"""
+mutable struct IPCWriteState
+    const io::IO
+    const file::Bool
+    const schema::Schema
+    const fielddictids::IdDict{Field,Int64}
+    const ids::IdDict{Field,Int64}
+    const features::Vector{Int64}
+    const codec::Int8
+    const state::Union{Nothing,EncodeState}
+    const validated::AC._ValidatedDictionaries
+    const current::Dict{Int64,ArrayData}  # last pool per id, for replacement
+    const dictblocks::Vector{NTuple{3,Int64}}    # file format Footer Blocks
+    const recordblocks::Vector{NTuple{3,Int64}}
+    written::Int64                       # bytes published to `io`
+    finished::Bool
+end
+
+# Batch sequences are unknown up front, so declare what MAY occur: any
+# dictionary field may later replace its pool (stream format only — the file
+# format forbids replacement), and a codec means compressed bodies.
+function _incrementalfeatures(ids::IdDict{Field,Int64}, codec::Int8, file::Bool)
+    features = Int64[]
+    !file && !isempty(ids) && push!(features, FEATURE_DICTIONARY_REPLACEMENT)
+    codec == CODEC_NONE || push!(features, FEATURE_COMPRESSED_BODY)
+    return features
+end
+
+function _publish!(st::IPCWriteState, out::Vector{UInt8})
+    Base.write(st.io, out)
+    st.written += length(out)
+    return nothing
+end
+
+function beginwrite!(
+    io::IO,
+    sch::Schema;
+    file::Bool,
+    compress::Symbol=:none,
+    dictids::IdDict{Field,Int64}=IdDict{Field,Int64}(),
+    features::Union{Nothing,Vector{Int64}}=nothing,
+)
+    _requirelittleendian()
+    haskey(CODEC_NAMES, compress) ||
+        throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
+    codec = CODEC_NAMES[compress]
+    _validatewriterschema(sch)
+    ids = assigndictids(sch.fields, dictids)
+    fielddictids = IdDict{Field,Int64}(ids)
+    validatedictionaryids(sch.fields, fielddictids)
+    feats = features === nothing ? _incrementalfeatures(ids, codec, file) : features
+    st = IPCWriteState(
+        io,
+        file,
+        sch,
+        fielddictids,
+        ids,
+        feats,
+        codec,
+        codec == CODEC_NONE ? nothing : EncodeState(),
+        AC._ValidatedDictionaries(),
+        Dict{Int64,ArrayData}(),
+        NTuple{3,Int64}[],
+        NTuple{3,Int64}[],
+        Int64(0),
+        false,
+    )
+    out = UInt8[]
+    if file
+        append!(out, FILE_MAGIC)
+        append!(out, zeros(UInt8, 2))    # pad to 8 before the first message
+    end
+    _schemamessage!(out, sch, fielddictids, feats)
+    _publish!(st, out)
+    return st
+end
+
+# Record one file-format Block around `emit!`: the Block offset is global
+# (bytes already published plus this staging buffer's position), and
+# metaDataLength spans prefix + metadata (up to the body start).
+function _fileblock!(emit!::F, st::IPCWriteState, out::Vector{UInt8}, blocks) where {F}
+    start = Int64(length(out))
+    emit!()
+    total = Int64(length(out)) - start
+    metalen = Int64(8) + Int64(reinterpret(UInt32, out[(start + 5):(start + 8)])[1])
+    push!(blocks, (st.written + start, metalen, total - metalen))
+    return nothing
+end
+
+"Order-sensitive pool content equality, in each pool's public value domain."
+function _poolsequal(vf::Field, a::ArrayData, b::ArrayData)
+    a.len == b.len || return false
+    return isequal(AC.materialize(vf, a), AC.materialize(vf, b))
+end
+
+function writebatch!(st::IPCWriteState, batch::AC.RecordBatch; validate::Bool=true)
+    st.finished && throw(ArgumentError("this IPC writer is already finished"))
+    if validate
+        _checkbatches(st.schema, (batch,))
+        _validatewriterbatch!(st.validated, st.schema, batch, st.ids)
+    end
+    out = UInt8[]
+    for (f, pool) in dictionarypools(st.schema.fields, batch.columns)
+        id = st.ids[f]
+        old = get(st.current, id, nothing)
+        old === pool && continue
+        if old !== nothing
+            vf = AC.dictvaluefield(f, f.type::DictionaryType)
+            if st.file
+                # The file format carries one dictionary batch per id. A new
+                # pool object with identical content references the emitted
+                # batch; anything else is replacement, which files cannot say.
+                _poolsequal(vf, old, pool) || throw(
+                    ValidationError(
+                        "the IPC file format carries one dictionary batch per " *
+                        "id; dictionary id $id changed pools across batches — " *
+                        "use the stream format for replacement",
+                    ),
+                )
+                st.current[id] = pool
+                continue
+            end
+            if !(FEATURE_DICTIONARY_REPLACEMENT in st.features)
+                # Emitting a replacement the schema message did not declare
+                # would publish a stream this package's own reader refuses.
+                _poolsequal(vf, old, pool) || throw(
+                    ValidationError(
+                        "dictionary id $id changed pools, but the stream's " *
+                        "schema message does not declare the " *
+                        "DictionaryReplacement feature",
+                    ),
+                )
+                st.current[id] = pool
+                continue
+            end
+        end
+        vf = AC.dictvaluefield(f, f.type::DictionaryType)
+        if st.file
+            _fileblock!(st, out, st.dictblocks) do
+                _dictionarymessage!(out, id, vf, pool, st.codec, st.state)
+            end
+        else
+            _dictionarymessage!(out, id, vf, pool, st.codec, st.state)
+        end
+        st.current[id] = pool
+    end
+    if st.file
+        _fileblock!(st, out, st.recordblocks) do
+            _recordmessage!(out, batch, st.schema.fields, st.codec, st.state)
+        end
+    else
+        _recordmessage!(out, batch, st.schema.fields, st.codec, st.state)
+    end
+    _publish!(st, out)
+    return nothing
+end
+
+# The file-format trailer: Footer flatbuffer (schema again, then the two
+# Block struct-vectors), the Int32 footer length, and the trailing magic.
+function _filefooter!(
+    out::Vector{UInt8},
+    sch::Schema,
+    fielddictids::IdDict{Field,Int64},
+    features::Vector{Int64},
+    dictblocks::Vector{NTuple{3,Int64}},
+    recordblocks::Vector{NTuple{3,Int64}},
+)
+    b = FB.Builder(1024)
+    schoff = _metaschema!(b, sch, fielddictids, features)
+    Meta.footerStartDictionariesVector(b, length(dictblocks))
+    for (off, metalen, bodylen) in Iterators.reverse(dictblocks)
+        Meta.createBlock(b, off, Int32(metalen), bodylen)
+    end
+    dictvec = FB.endvector!(b, length(dictblocks))
+    Meta.footerStartRecordBatchesVector(b, length(recordblocks))
+    for (off, metalen, bodylen) in Iterators.reverse(recordblocks)
+        Meta.createBlock(b, off, Int32(metalen), bodylen)
+    end
+    recordvec = FB.endvector!(b, length(recordblocks))
+    Meta.footerStart(b)
+    Meta.footerAddVersion(b, Meta.MetadataVersion.V5)
+    Meta.footerAddSchema(b, schoff)
+    Meta.footerAddDictionaries(b, dictvec)
+    Meta.footerAddRecordBatches(b, recordvec)
+    FB.finish!(b, Meta.footerEnd(b))
+    footer = collect(FB.finishedbytes(b))
+    append!(out, footer)
+    append!(out, reinterpret(UInt8, Int32[Int32(length(footer))]))
+    append!(out, FILE_MAGIC)
+    return nothing
+end
+
+function finishwrite!(st::IPCWriteState)
+    st.finished && return nothing
+    out = UInt8[]
+    append!(out, reinterpret(UInt8, UInt32[CONTINUATION, UInt32(0)]))
+    st.file && _filefooter!(
+        out,
+        st.schema,
+        st.fielddictids,
+        st.features,
+        st.dictblocks,
+        st.recordblocks,
+    )
+    _publish!(st, out)
+    st.finished = true
+    st.state === nothing || close(st.state)
+    return nothing
+end
+
+"Release the codec state without emitting anything; for error cleanup."
+function abortwrite!(st::IPCWriteState)
+    st.finished && return nothing
+    st.finished = true
+    st.state === nothing || close(st.state)
+    return nothing
+end
+
+"""
+Resume a STREAM whose schema message is already on the wire: a state that
+emits no preamble. `features` must be the features that schema message
+declared, and `current` the last pool each dictionary id has emitted —
+`writebatch!` then skips content-identical pools and gates replacement on
+the declared features exactly as it does mid-stream.
+"""
+function resumestream!(
+    io::IO,
+    sch::Schema,
+    dictids::IdDict{Field,Int64},
+    features::Vector{Int64};
+    compress::Symbol=:none,
+    current::Dict{Int64,ArrayData}=Dict{Int64,ArrayData}(),
+)
+    _requirelittleendian()
+    haskey(CODEC_NAMES, compress) ||
+        throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
+    codec = CODEC_NAMES[compress]
+    ids = assigndictids(sch.fields, dictids)
+    return IPCWriteState(
+        io,
+        false,
+        sch,
+        IdDict{Field,Int64}(ids),
+        ids,
+        features,
+        codec,
+        codec == CODEC_NONE ? nothing : EncodeState(),
+        AC._ValidatedDictionaries(),
+        current,
+        NTuple{3,Int64}[],
+        NTuple{3,Int64}[],
+        Int64(0),
+        false,
+    )
+end
+
+"""
+    writestream(sch, batches; compress=:none, dictids=IdDict{Field,Int64}()) -> Vector{UInt8}
+    writestream(stream::IPCStream; compress=:none) -> Vector{UInt8}
 
 Encode a complete IPC stream: schema message, dictionary batches emitted
 before the first record batch that references them (and again on
 pool-identity change), record batches, end-of-stream marker. Every column is
 semantically validated before any of its bytes are emitted — the writer
-refuses to publish data Core would refuse to read.
+refuses to publish data Core would refuse to read. `dictids` preserves ids
+from a source table (the `IPCStream` form passes the reader's), so fields
+sharing one id keep sharing one dictionary batch, exactly as the source did.
 """
 function writestream(
     sch::Schema,
@@ -715,36 +1008,27 @@ function writestream(
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
         throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
-    codec = CODEC_NAMES[compress]
     _checkbatches(sch, batches)
     _validatewriterschema(sch)
+    # `beginwrite!` recomputes the same ids from `dictids` (assignment is
+    # deterministic); this pass exists so the whole batch sequence is
+    # validated before any bytes exist. Features use the incremental
+    # default: a stream with dictionary fields declares DictionaryReplacement
+    # whether or not these batches replace, so the output stays appendable.
     ids = assigndictids(sch.fields, dictids)
-    fielddictids = IdDict{Field,Int64}(ids)
-    # Caller-supplied shared ids must name compatible value schemas with one
-    # nested id topology — the same contract the reader enforces on a wire
-    # schema — before any bytes are emitted under them.
-    validatedictionaryids(sch.fields, fielddictids)
+    validatedictionaryids(sch.fields, IdDict{Field,Int64}(ids))
     _validatewriterbatches(sch, batches, ids)
-    out = UInt8[]
-    state = codec == CODEC_NONE ? nothing : EncodeState()
+    io = IOBuffer()
+    st = beginwrite!(io, sch; file=false, compress=compress, dictids=dictids)
     try
-        _schemamessage!(out, sch, fielddictids, _streamfeatures(sch, batches, ids, codec))
-        current = Dict{Int64,ArrayData}()
         for batch in batches
-            for (f, pool) in dictionarypools(sch.fields, batch.columns)
-                id = ids[f]
-                get(current, id, nothing) === pool && continue
-                vf = AC.dictvaluefield(f, f.type::DictionaryType)
-                _dictionarymessage!(out, id, vf, pool, codec, state)
-                current[id] = pool
-            end
-            _recordmessage!(out, batch, sch.fields, codec, state)
+            writebatch!(st, batch; validate=false)
         end
-        append!(out, reinterpret(UInt8, UInt32[CONTINUATION, UInt32(0)]))
-        return out
+        finishwrite!(st)
     finally
-        state === nothing || close(state)
+        abortwrite!(st)
     end
+    return take!(io)
 end
 
 writestream(s::IPCStream; compress::Symbol=:none) =
@@ -757,7 +1041,8 @@ writestream(s::IPCStream; compress::Symbol=:none) =
 const FILE_MAGIC = b"ARROW1"
 
 """
-    writefile(sch, batches; compress=:none) -> Vector{UInt8}
+    writefile(sch, batches; compress=:none, dictids=IdDict{Field,Int64}()) -> Vector{UInt8}
+    writefile(stream::IPCStream; compress=:none) -> Vector{UInt8}
 
 The file variant: leading magic, the same stream messages, an end-of-stream
 marker, then the Footer with its dictionary and record-batch Block indexes,
@@ -765,6 +1050,9 @@ the Int32 footer length, and the trailing magic. Footer bookkeeping is
 isolated here; message writing is the stream code above. The file format
 carries exactly one dictionary batch per id, so batches whose pools change
 identity are a clean refusal (the stream format handles replacement).
+`dictids` preserves ids from a source table (the `IPCStream` form passes the
+reader's), so fields sharing one id keep sharing one dictionary batch,
+exactly as the source did.
 """
 function writefile(
     sch::Schema,
@@ -779,81 +1067,37 @@ function writefile(
     _checkbatches(sch, batches)
     _validatewriterschema(sch)
     ids = assigndictids(sch.fields, dictids)
+    # CODEC_NONE so this refusal sees only DICTIONARY_REPLACEMENT.
+    # COMPRESSED_BODY is legal in a file and is declared through the features
+    # below.
     isempty(_streamfeatures(sch, batches, ids, CODEC_NONE)) || throw(
         ValidationError(
             "the IPC file format carries one dictionary batch per id; " *
-            "changing pools require the stream format",
+            "a dictionary with changing pools requires the stream format",
         ),
     )
-    fielddictids = IdDict{Field,Int64}(ids)
     # Same shared-id contract as the stream writer: compatible value schemas,
     # one nested id topology, one pool per id within each batch.
-    validatedictionaryids(sch.fields, fielddictids)
+    validatedictionaryids(sch.fields, IdDict{Field,Int64}(ids))
     _validatewriterbatches(sch, batches, ids)
-    filefeatures = _streamfeatures(sch, batches, ids, codec)
-    out = UInt8[]
-    append!(out, FILE_MAGIC)
-    append!(out, zeros(UInt8, 2))            # pad to 8 before the first message
-    state = codec == CODEC_NONE ? nothing : EncodeState()
-    dictblocks = NTuple{3,Int64}[]           # (offset, metalen, bodylen)
-    recordblocks = NTuple{3,Int64}[]
+    io = IOBuffer()
+    st = beginwrite!(
+        io,
+        sch;
+        file=true,
+        compress=compress,
+        dictids=dictids,
+        features=_streamfeatures(sch, batches, ids, codec),
+    )
     try
-        _schemamessage!(out, sch, fielddictids, filefeatures)
-        emitted = Set{Int64}()
-        function block!(blocks, emit!)
-            offset = Int64(length(out))
-            emit!()
-            # metaDataLength spans prefix + metadata (up to the body start).
-            total = Int64(length(out)) - offset
-            metalen =
-                Int64(8) + Int64(reinterpret(UInt32, out[(offset + 5):(offset + 8)])[1])
-            push!(blocks, (offset, metalen, total - metalen))
-            return nothing
-        end
         for batch in batches
-            for (f, pool) in dictionarypools(sch.fields, batch.columns)
-                id = ids[f]
-                id in emitted && continue
-                push!(emitted, id)
-                vf = AC.dictvaluefield(f, f.type::DictionaryType)
-                block!(
-                    dictblocks,
-                    () -> _dictionarymessage!(out, id, vf, pool, codec, state),
-                )
-            end
-            block!(
-                recordblocks,
-                () -> _recordmessage!(out, batch, sch.fields, codec, state),
-            )
+            writebatch!(st, batch; validate=false)
         end
-        append!(out, reinterpret(UInt8, UInt32[CONTINUATION, UInt32(0)]))
-        # Footer: schema again, then the two Block struct-vectors.
-        b = FB.Builder(1024)
-        schoff = _metaschema!(b, sch, fielddictids, filefeatures)
-        Meta.footerStartDictionariesVector(b, length(dictblocks))
-        for (off, metalen, bodylen) in Iterators.reverse(dictblocks)
-            Meta.createBlock(b, off, Int32(metalen), bodylen)
-        end
-        dictvec = FB.endvector!(b, length(dictblocks))
-        Meta.footerStartRecordBatchesVector(b, length(recordblocks))
-        for (off, metalen, bodylen) in Iterators.reverse(recordblocks)
-            Meta.createBlock(b, off, Int32(metalen), bodylen)
-        end
-        recordvec = FB.endvector!(b, length(recordblocks))
-        Meta.footerStart(b)
-        Meta.footerAddVersion(b, Meta.MetadataVersion.V5)
-        Meta.footerAddSchema(b, schoff)
-        Meta.footerAddDictionaries(b, dictvec)
-        Meta.footerAddRecordBatches(b, recordvec)
-        FB.finish!(b, Meta.footerEnd(b))
-        footer = collect(FB.finishedbytes(b))
-        append!(out, footer)
-        append!(out, reinterpret(UInt8, Int32[Int32(length(footer))]))
-        append!(out, FILE_MAGIC)
-        return out
+        finishwrite!(st)
     finally
-        state === nothing || close(state)
+        abortwrite!(st)
     end
+    return take!(io)
 end
 
 writefile(s::IPCStream; compress::Symbol=:none) =
@@ -974,7 +1218,7 @@ function _fileschema(
         throw(ValidationError("file schema metadata is not 8-byte aligned"))
     metalen = AC.checked_add(Int64(8), declared)
     fm = _blockmessage(region, (Int64(8), metalen, Int64(0)), footerstart, limits, budget)
-    fm.header_type == UInt8(1) && fm.msg.header isa Meta.Schema ||
+    fm.header_type == UInt8(1) && fm.msg.header isa Meta.Schema || # Schema
         throw(ValidationError("file data section does not start with a schema"))
     return fm, AC.checked_add(Int64(8), metalen)
 end
@@ -982,14 +1226,13 @@ end
 """
     ArrowFile
 
-The footer's record-batch index as a random-access handle:
-`length(file)` batches, `file[i]` decodes batch `i` on
-demand — nothing is decoded at open beyond the schema and the dictionary
-batches every record shares. Each `getindex` decodes fresh from the mapped
-bytes with its own allocation budget and codec contexts; the handle itself
-is immutable after open, so concurrent `getindex` calls are safe by
-construction. The region root (heap vector or Mmap array) is the only
-lifetime anchor, exactly as in Core.
+The footer's record-batch index as a random-access handle: `length(file)`
+batches, `file[i]` decodes batch `i` on demand. Open decodes only the schema
+and the dictionary batches every record shares. Each `getindex` decodes from
+the mapped bytes with its own allocation budget and codec contexts, and the
+handle is read-only after open, so concurrent `getindex` calls are safe. The
+region root (heap vector or Mmap array) is the only lifetime anchor, as in
+Core.
 """
 struct ArrowFile
     region::OwnerRegion
@@ -1013,6 +1256,8 @@ return its `(offset, frameend)` span.
 """
 function _blockextent(block::NTuple{3,Int64}, dataend::Int64)
     offset, metalen, bodylen = block
+    # 16 is the smallest legal prefix + metadata: an 8-byte prefix plus at
+    # least one 8-byte-aligned metadata block.
     (offset >= 0 && metalen >= 16 && bodylen >= 0) ||
         throw(ValidationError("footer block has invalid extents"))
     offset % 8 == 0 || throw(ValidationError("footer block is not 8-byte aligned"))
@@ -1160,10 +1405,10 @@ function _blockvector(t::_BlockTable, slot::Int, elemsize::Int, what::AbstractSt
 end
 
 """
-Read the fixed Message/RecordBatch envelope and wire-buffer structs needed to
-bind one Footer Block to its on-wire frame. The complete metadata graph remains
-lazily verified by `_blockmessage`; this zero-allocation preflight prevents
-optional-EOS classification from trusting forged Footer extents first.
+Read the fixed Message/RecordBatch envelope and wire-buffer structs that bind
+one Footer Block to its on-wire frame. `_blockmessage` still verifies the
+full metadata graph lazily. This preflight runs first so that EOS
+classification never trusts a forged Footer extent.
 """
 function _blockmessagebatch(metadata::BufferSlice)
     root = Int64(_blockload(metadata, UInt32, Int64(0), "message root"))
@@ -1319,6 +1564,8 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
     _requirelittleendian()
     _validatelimits(limits)
     blob = BufferSlice(region, 0, region.len)
+    # leading magic + pad (8), smallest footer flatbuffer (8), footer length
+    # (4), trailing magic (6).
     minlen = Int64(8 + 8 + 4 + 6)
     region.len >= minlen || throw(ValidationError("file is too short to be an IPC file"))
     for (i, byte) in enumerate(FILE_MAGIC)
@@ -1327,6 +1574,8 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
         AC.loadat(blob, UInt8, region.len - 6 + (i - 1)) == byte ||
             throw(ValidationError("missing trailing ARROW1 magic"))
     end
+    # The trailer is <footer><Int32 footer length><ARROW1>, so the length
+    # word sits 10 bytes from the end.
     footerlen = Int64(AC.loadat(blob, Int32, region.len - 10))
     0 < footerlen <= limits.max_metadata_bytes || throw(
         ValidationError(

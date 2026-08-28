@@ -29,10 +29,8 @@ features changed.
 
 ## Requirements
 
-Arrow 3.0 requires Julia 1.10 or later and ArrowTypes.jl 2.x. It also requires
-Tables.jl 1.14 (the first release that provides `Tables.Scan`) and
-ArrowStrings.jl 1.0. The development branch uses source overrides for the
-in-repository subpackages until their releases are registered.
+Arrow 3.0 requires Julia 1.10 or later, ArrowTypes.jl 2.x, Tables.jl 1.14
+(the first release that provides `Tables.Scan`), and ArrowStrings.jl 1.0.
 
 ## Materialized columns
 
@@ -54,6 +52,46 @@ Concrete Arrow 2.x array types such as `Arrow.Primitive`, `Arrow.List`, and
 Use `Tables.getcolumn(table, name_or_index)` in place of Arrow 2.x table
 indexing.
 
+Decimal read types changed. Arrow 2.x read decimal columns as `Arrow.Decimal`
+values that wrap a BitIntegers.jl `Int128` or `Int256` unscaled integer. Arrow
+3.0 reads Decimal32 and Decimal64 as unscaled `Int32` and `Int64` values, and
+Decimal128 and Decimal256 as raw native-endian byte vectors. See
+[Type mapping when reading](@ref) for the complete table.
+
+Struct row types changed. Arrow 2.x read a plain (non-extension) Struct
+column as `NamedTuple` rows. Arrow 3.0 reads it as `Vector{Pair{String,Any}}`
+rows, because Arrow field names are not always valid or unique `Symbol`s. Ask
+for typed rows with a `Tables.Scan` select type override; it applies
+recursively, so a list-of-struct column takes a `Vector{...}` target:
+
+```julia
+NT = @NamedTuple{a::Float64, b::String}
+table = Arrow.Table("data.arrow"; scan=Tables.Scan(select=(:x, :c => NT)))
+eltype(table.c) == NT # true
+```
+
+Code that must read struct columns under both Arrow 2.x and 3.0 can branch on
+what it received instead of on the package version:
+
+```julia
+rows = table.c isa AbstractVector{<:NamedTuple} ? table.c :
+       [r === missing ? missing : NT(Tuple(last(kv) for kv in r)) for r in table.c]
+```
+
+Timezone-aware timestamps changed. Arrow 2.x depended on TimeZones.jl and
+read a timestamp column with a declared timezone as `ZonedDateTime` values.
+Arrow 3.0 does not depend on TimeZones.jl: by default such a column reads as
+naive UTC `DateTime` values (the stored instants), and the declared zone is
+kept in the retained schema for rewrite. Loading TimeZones.jl activates
+Arrow's extension and restores the `ZonedDateTime` behavior for second- and
+millisecond-unit columns, on both sides: those columns read as
+`ZonedDateTime`, and a fresh `ZonedDateTime` column writes as a
+timezone-declared millisecond timestamp. One written column carries one
+zone; convert mixed-zone values with `astimezone` first. Micro- and
+nanosecond timestamps read as raw `Int64` storage either way; neither
+`DateTime` nor `ZonedDateTime` can hold them exactly, and Arrow 3.0 never
+truncates silently (Arrow 2.x truncated with a warning).
+
 The old positional byte-window arguments and multi-input constructors were
 removed. Pass one complete path, `IO`, byte vector, or byte-range source to
 `Arrow.Table` or `Arrow.Stream`. Slice an in-memory byte vector before the call
@@ -73,6 +111,12 @@ rm("data.arrow")
 sum(table.id)
 ```
 
+## Removed input support
+
+Arrow 2.x read delta dictionary batches. Arrow 3.0 rejects delta dictionary
+batches and big-endian IPC input, so a file that Arrow 2.x accepted can now
+fail with a validation error.
+
 ## Writing
 
 `Arrow.write` is eager. It materializes and validates all input partitions,
@@ -81,13 +125,12 @@ not provide these Arrow 2.x features:
 
 | Arrow 2.x feature | Arrow 3.0 action |
 |---|---|
-| `Arrow.Writer` | Collect the source as Tables.jl partitions and call `Arrow.write`. |
-| `Arrow.append` | Rewrite the complete file. There is no append-to-file path. |
-| `table |> Arrow.write(sink)` | Call `Arrow.write(sink, table)`. The curried write form was removed. |
-| `Arrow.tobuffer(table)` | Write to an `IOBuffer`, then call `take!`. See below. |
-| `ntasks` | Remove the keyword. Encoding is not task-parallel in 3.0. |
+| `Arrow.Writer` | Still works, reimplemented: an incremental writer for both formats. The FIRST table written fixes the schema; later tables must conform (no cross-table inference). See [`Arrow.Writer`](@ref). |
+| `Arrow.append` | Still works for the IPC STREAM format, reimplemented. The file format refuses: produce it incrementally with `Arrow.Writer` or rewrite it. A 2.x stream whose dictionary pools carry null slots needs one 3.0 rewrite before it accepts appends. |
+| `table \|> Arrow.write(sink)` | Still works: the curried form is kept. |
+| `Arrow.tobuffer(table)` | Still works, and still emits the IPC stream format. |
+| `ntasks` | Accepted and ignored with a one-time warning. Encoding is not task-parallel in 3.0, including in `Arrow.Writer`. |
 | `Arrow.ToArrow` | Import `ArrowTypes.ToArrow` directly when an explicit lazy conversion view is needed. Normal writes apply the mapping automatically. |
-| `Arrow.ArrowTypes` or an exported `ArrowTypes` name | Use `import ArrowTypes` for new code. The qualified `Arrow.ArrowTypes` binding remains for compatibility, but it is not exported. |
 
 The output default for an `IO` changed. Arrow 2.x wrote the stream format to
 an `IO` by default. Arrow 3.0 uses `file=true` for both paths and `IO` sinks.
@@ -99,15 +142,16 @@ Arrow.write(io, table; file=false)
 stream_bytes = take!(io)
 ```
 
-That pattern replaces `Arrow.tobuffer(table)`. Use `file=true` when you need
-an IPC file with footer-based random access.
+`Arrow.tobuffer(table)` produces exactly those bytes, seeked to the start.
+Use `file=true` when you need an IPC file with footer-based random access.
 
 Arrow 3.0 keeps `file`, `compress`, `metadata`, and `colmetadata`. Compression
 is selected with `:lz4` or `:zstd`; passing an initialized compressor object
 is no longer supported. The Arrow 2.x `alignment`, `dictencode`,
 `dictencodenested`, `denseunions`, `largelists`, `maxdepth`, and `ntasks`
-writer keywords were removed. Wrap only the columns that need dictionary
-encoding in [`Arrow.DictEncode`](@ref).
+writer keywords no longer have any effect: `Arrow.write` accepts them with a
+one-time warning each and ignores them. Wrap only the columns that need
+dictionary encoding in [`Arrow.DictEncode`](@ref).
 
 Arrow 3.0 again consumes the ArrowTypes.jl mapping interface. Package authors
 should depend on and import ArrowTypes.jl directly. Define `ArrowType` and
@@ -252,9 +296,9 @@ table = Arrow.Table("data.arrow")
 Arrow.write("copy.arrow", table)
 ```
 
-`ArrowTypes` is no longer exported. Import ArrowTypes.jl directly when
-defining mappings. `Arrow.ArrowTypes` remains available as a qualified
-compatibility binding.
+`ArrowTypes` stays exported, so `using Arrow` keeps the bare `ArrowTypes`
+binding working. Packages that define mappings should still depend on and
+import ArrowTypes.jl directly rather than reach it through Arrow.
 
 Core schema names now stay as `String` values. `Arrow.Table` converts only
 top-level Tables.jl column names to `Symbol`, after it preflights the complete
@@ -265,8 +309,12 @@ novel IPC payload with `ValidationError` instead of interning input-controlled
 process-global state. This is an intentional behavior change: an input that a
 prior Arrow.jl release read by interning its payload can now fail.
 
-`Arrow.getmetadata` was removed. Arrow 3.0 uses DataAPI.jl metadata methods.
-Add DataAPI.jl as a direct dependency of code that imports it:
+Arrow 3.0 uses DataAPI.jl metadata methods. `Arrow.getmetadata(table)`
+remains as a compatibility method over them, returning the table's key-value
+metadata as a `Dict{String,String}` or `nothing`. The Arrow 2.x per-column
+form `getmetadata(column)` is gone — columns are plain vectors — so use
+`DataAPI.colmetadata` instead. Add DataAPI.jl as a direct dependency of code
+that imports it:
 
 ```julia
 import Pkg

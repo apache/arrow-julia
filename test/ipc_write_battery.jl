@@ -69,10 +69,12 @@ function ipc_write_battery()
     println("writer -> reader stream round-trip ✓")
 
     # The dictionary batch is emitted once: the second batch reuses the same
-    # pool snapshot, so no replacement message and no feature declaration.
+    # pool snapshot, so no replacement message. The schema message still
+    # declares DictionaryReplacement — every stream with a dictionary field
+    # does, so the output stays appendable (Arrow.append may replace later).
     kinds = [f.kind for f in _frameinfo(bytes)]
     @assert count(==(UInt8(2)), kinds) == 1
-    @assert isempty(framemessages(heapregion(copy(bytes)))[1].features)
+    @assert framemessages(heapregion(copy(bytes)))[1].features == Int64[1]
     println("unchanged pools write one dictionary batch (replacement-on-change) ✓")
 
     # Compressed round-trips, both codecs, both directions.
@@ -120,11 +122,13 @@ function ipc_write_battery()
     schemaonly = writestream(emptysch, AC.RecordBatch[])
     schemaonlystream = readstream(schemaonly)
     @assert isempty(schemaonlystream.batches)
-    @assert isempty(
-        framemessages(
-            heapregion(copy(writestream(emptysch, AC.RecordBatch[]; compress=:zstd))),
-        )[1].features,
-    )
+    # A codec declares CompressedBody even with zero batches: the stream
+    # writer commits to features before it knows what batches will follow
+    # (the incremental writer never knows), and a capability declaration
+    # over an empty stream is harmless.
+    @assert framemessages(
+        heapregion(copy(writestream(emptysch, AC.RecordBatch[]; compress=:zstd))),
+    )[1].features == Int64[2]
     zerorow = readstream(writestream(readstream(_fixture2x("int64-empty") do
         z = IOBuffer()
         Arrow.write(z, (x=Int64[],); file=false)

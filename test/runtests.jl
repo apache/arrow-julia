@@ -17,7 +17,6 @@
 using Test
 using Aqua
 using Arrow
-using Pkg
 
 # Core unit tests (ArrowCore in isolation).
 include("core_tests.jl")
@@ -31,8 +30,16 @@ include("arrowtypes_compat_tests.jl")
 # Seeded end-to-end properties over public IPC paths.
 include("property_tests.jl")
 
-# Release-blocking regressions found during the 3.0 rewrite audit.
+# Read-then-rewrite fidelity through the facade, plus reader-budget accounting.
 include("rewrite_regressions.jl")
+
+# The Arrow 2.x compatibility surface (getmetadata, tobuffer, curried write,
+# removed-keyword warnings, typed scan overrides) and the ArrowTimeZonesExt
+# child suite.
+include("compat_tests.jl")
+
+# The incremental writer (Arrow.Writer) and stream append (Arrow.append).
+include("incremental_writer_tests.jl")
 
 # Shared acceptance/conformance support contracts and adapter composition.
 include("conformance_support_tests.jl")
@@ -46,9 +53,4 @@ include("batteries.jl")
 
 # Package hygiene: compat bounds, stale dependencies, ambiguities, exports,
 # and unbound type parameters.
-const ROOT_PROJECT = Pkg.TOML.parsefile(joinpath(pkgdir(Arrow), "Project.toml"))
-const HAS_TABLES_SOURCE_OVERRIDE =
-    haskey(get(ROOT_PROJECT, "sources", Dict{String,Any}()), "Tables")
-# TODO: Removing the temporary Tables source override after Tables.Scan is
-# released automatically re-enables this check on Julia 1.10.
-Aqua.test_all(Arrow; persistent_tasks=(!(VERSION < v"1.11" && HAS_TABLES_SOURCE_OVERRIDE)))
+Aqua.test_all(Arrow)

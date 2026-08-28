@@ -36,27 +36,32 @@ writer, validation, scan, and C interface engines.
   removed.
 - Positional byte-window arguments and the multi-input `Table` and `Stream`
   constructors were removed. Each read accepts one complete source.
-- `Arrow.Writer`, `Arrow.append`, and incremental or append-to-file writes were
-  removed. `Arrow.write` is an eager, whole-buffer writer.
+- `Arrow.write` is an eager, whole-buffer writer. `Arrow.Writer` (incremental
+  writes, both formats) and `Arrow.append` (IPC streams) are reimplemented on
+  the 3.0 core with one semantic change: the first table written fixes the
+  schema, and later tables must conform — no inference crosses tables.
 - Writing to an `IO` now emits the IPC file format by default. Pass
-  `file=false` for the stream format.
-- The curried `Arrow.write(sink)` form and `Arrow.tobuffer` were removed.
-- The `ntasks` multithreaded encoding option was removed.
+  `file=false` for the stream format. `Arrow.tobuffer` still emits the stream
+  format, matching its 2.x bytes.
 - The `alignment`, `dictencode`, `dictencodenested`, `denseunions`,
-  `largelists`, and `maxdepth` writer keywords were removed.
+  `largelists`, `maxdepth`, and `ntasks` writer keywords no longer have any
+  effect. `Arrow.write` accepts them with a one-time warning each and ignores
+  them; wrap columns in `Arrow.DictEncode` to dictionary-encode.
 - The `compress` keyword accepts `nothing`, `:lz4`, or `:zstd`; initialized
   compressor objects are no longer accepted.
 - The `Arrow.ToArrow` compatibility binding was removed. Import
   `ArrowTypes.ToArrow` directly when an explicit lazy conversion view is
   needed. Normal writes apply `ArrowTypes.ArrowType` and `ArrowTypes.toarrow`
   automatically.
-- `ArrowTypes` is no longer exported. Import ArrowTypes.jl directly when
-  defining a custom mapping. `Arrow.ArrowTypes` remains available as a
-  qualified compatibility binding.
-- `Arrow.getmetadata` was replaced by the DataAPI.jl metadata interface.
+- The DataAPI.jl metadata interface replaces the Arrow 2.x metadata
+  accessors. `Arrow.getmetadata(table)` remains as a compatibility method
+  over it; the per-column `getmetadata(column)` form is gone because columns
+  are plain vectors — use `DataAPI.colmetadata` instead.
 - The package now has a narrow export surface. Use names such as
   `Arrow.Table`, `Arrow.Stream`, `Arrow.write`, and `Arrow.DictEncode` through
-  the `Arrow` namespace. Only `release!` is exported.
+  the `Arrow` namespace. Only `release!` and `ArrowTypes` are exported.
+  Packages that define custom mappings should still depend on and import
+  ArrowTypes.jl directly.
 - Big-endian IPC and delta-dictionary messages are rejected.
 - Arrow 3.0 requires ArrowTypes.jl 2.x, Tables.jl 1.14 (the first release
   with `Tables.Scan`), and the ArrowStrings.jl 1.0 release.
@@ -64,6 +69,29 @@ writer, validation, scan, and C interface engines.
 ### Added
 
 - `Tables.Scan` projection, filter, limit, and offset pushdown.
+- Typed `Tables.Scan` select overrides for composite rows: a
+  `:column => NamedTuple{...}` select item reads a Struct column as typed
+  rows (recursively, including `Vector{...}` targets for list columns).
+- A TimeZones.jl extension. When TimeZones.jl is loaded, second- and
+  millisecond-unit timestamps that declare a timezone read as
+  `ZonedDateTime` (the Arrow 2.x behavior) and round-trip through rewrite,
+  and a fresh single-zone `ZonedDateTime` column writes as a
+  timezone-declared millisecond timestamp; without the extension those
+  columns read as naive UTC `DateTime` values.
+- The Arrow 2.x compatibility surface: exported `ArrowTypes`,
+  `Arrow.getmetadata(table)`, `Arrow.tobuffer`, and the curried
+  `table |> Arrow.write(sink)` form.
+- An incremental writer: `Arrow.Writer(sink; file=true)` publishes each
+  written table's batches immediately, holding only the current table in
+  memory, for both IPC formats. `Arrow.append(sink, table)` extends an
+  existing IPC stream in place. Streams whose schema has dictionary fields
+  now always declare the DictionaryReplacement feature, so 3.0-written
+  streams stay appendable.
+- The IPC reader accepts vtables that understate a wider field's extent,
+  as the reference implementation does. Arrow 2.x's FlatBuffers builder
+  produced them for every dictionary-encoded field carrying metadata, so
+  Arrow 3.0 now reads every such 2.x file (including all CategoricalArrays
+  columns) that earlier 3.0 development builds refused.
 - `Arrow.AbstractArrowSource` for sparse byte-range reads.
 - A CloudStore.jl extension for remote object reads.
 - Footer statistics that can prune record batches before their data is read.
@@ -134,17 +162,18 @@ writer, validation, scan, and C interface engines.
 - ArrowTypes logical resolution uses exact fixed-size-list tuple signatures
   through arity 1024 and a compact tuple-family signature above that limit,
   preventing fixed-size-list sizes from causing proportional type allocation.
-  Extension Struct signatures are exact through 1024 children only when child
+- Extension Struct signatures are exact through 1024 children only when child
   names are unique, contain no embedded NUL, already exist as Julia `Symbol`s,
   and pass the 4096-byte per-name and 64-KiB total limits. Otherwise labelled
-  Structs remain unknown extensions and return ordered `Pair` storage. One
-  bounded ArrowTypes.jl Tuple compatibility exception may intern only a
+  Structs remain unknown extensions and return ordered `Pair` storage.
+- One bounded ArrowTypes.jl Tuple compatibility exception may intern only a
   complete canonical positional sequence `"1"`, `"2"`, …, `string(N)` through
   `N = 1024`. Unknown extension labels return before that check; arbitrary or
   partly positional Struct names are not interned.
-  Any writer-side `ArrowType` result that is a concrete tuple above that limit
-  is rejected before the writer specializes on the oversized storage shape.
-  This includes ArrowTypes.jl's default mapping for a tuple value.
+- Any writer-side `ArrowType` result that is a concrete tuple with more than
+  1024 fields is rejected before the writer specializes on the oversized
+  storage shape. This includes ArrowTypes.jl's default mapping for a tuple
+  value.
 - Core keeps schema names as strings. The Tables.jl facade preflights per-name,
   novel-name-count, and novel-name-byte limits before it interns top-level
   column names. Unknown ArrowTypes extension labels do not create Julia
@@ -162,3 +191,6 @@ writer, validation, scan, and C interface engines.
   at any depth evaluate over the public materialized values. The mapping
   interface does not require storage lowering to preserve Julia comparison
   semantics.
+- Removed the JSON3/StructTypes-based arrow-JSON test integration and the
+  associated support claims. Arrow 2.x used those packages only in tests; no
+  public API existed.
