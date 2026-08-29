@@ -38,5 +38,6 @@ Arrow.jl 2.x and 3.x consume this stable 2.x interface. Arrow.jl 3.x applies
 `ArrowType` and `toarrow` recursively for custom values; defining `ArrowKind`
 alone does not select an arbitrary Arrow.jl 3.x physical layout. Packages that
 own custom types should depend on and import ArrowTypes.jl directly. Arrow.jl
-keeps `Arrow.ArrowTypes` as a qualified compatibility binding, but does not
-export it. See the docstrings of the functions above for the contract.
+keeps `ArrowTypes` exported as a compatibility exception, and
+`Arrow.ArrowTypes` remains available as the qualified binding. See the
+docstrings of the functions above for the contract.

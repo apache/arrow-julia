@@ -1135,14 +1135,15 @@ function _writerstoragetype!(context::_WriterContext, T::Type)
     return _arrowtypesstoragetype!(context.arrowtypes, T)
 end
 
-_writerneedstype!(context::_WriterContext, T::Type) = get!(context.needs, T) do
-    _arrowtypesneedstype(
-        T,
-        nested -> _writerstoragetype!(context, nested),
-        nested -> _writerextension!(context, nested) !== nothing,
-        0,
-    )
-end
+_writerneedstype!(context::_WriterContext, T::Type) =
+    get!(context.needs, T) do
+        _arrowtypesneedstype(
+            T,
+            nested -> _writerstoragetype!(context, nested),
+            nested -> _writerextension!(context, nested) !== nothing,
+            0,
+        )
+    end
 
 function _writerkind!(context::_WriterContext, T::Type)
     Base.@nospecialize T
@@ -1533,7 +1534,7 @@ function _writerunionstoragechildcandidate(
 
     # An inferred dictionary can preserve the abstract logical label on each
     # observed subtype branch. Those repeated labels describe the parent
-    # logical value, not distinct physical branches. Remove only labels that
+    # public-domain value, not distinct physical branches. Remove only labels that
     # equal the parent label before matching the parent's storage Union.
     parentextension = _arrowtypesextension(f)
     parentextension === nothing && return nothing
@@ -2228,7 +2229,7 @@ function _writerhiddenunionchild(
     return candidates[position]
 end
 
-# A Null-only child has exactly one logical value, so hidden and missing rows
+# A Null-only child has exactly one public-domain value, so hidden and missing rows
 # only contribute child LENGTH. Visible rows are still validated for exact
 # width; no placeholder objects are allocated.
 function _writercompactfixednull(f::AC.Field)
@@ -2253,7 +2254,7 @@ function _checkplainfixednullvalue(f::AC.Field, value)
     if f.type isa AC.NullType
         value === missing || throw(
             ArgumentError(
-                "retained Null field $(f.name) received a non-null logical value",
+                "retained Null field $(f.name) received a non-null public-domain value",
             ),
         )
         # NullType is null by definition. Its Field.nullable flag is advisory
@@ -3508,7 +3509,7 @@ function _arrowtypesmapcolumn(
     return field, data
 end
 
-"Registered logical value Field and Julia target for a retained dictionary."
+"Registered public-domain value Field and Julia target for a retained dictionary."
 function _registereddictionaryfield(context::_WriterContext, f::AC.Field)
     t = f.type::AC.DictionaryType
     _, target, _ = _arrowtypestarget(context.arrowtypes, f)
@@ -4923,7 +4924,7 @@ function _dictionarypool(vals, retainedpool; writetype=nothing)
         pool = collect(retainedpool)
     end
     # Dedup with the non-overloadable structural key `_compactdictionarypool`
-    # also uses: logical values may overload `hash`/`isequal`, so only the
+    # also uses: public-domain values may overload `hash`/`isequal`, so only the
     # `_WriterStorageKey` relation (bit-pattern floats, `===`/objectid for
     # mutables) may pre-merge categories. Exact value-based dedup of the
     # LOWERED categories still happens in `_compactdictionarypool`, in the
@@ -5354,7 +5355,7 @@ function _constructcolumn(
                 )
             # Table materialization already lifts retained pool snapshots
             # through the dictionary value Field. They stay in the same
-            # logical domain as row values until the merged pool is lowered
+            # public domain as row values until the merged pool is lowered
             # exactly once through `_constructpart` on that value Field below.
         end
 

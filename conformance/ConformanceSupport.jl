@@ -59,8 +59,8 @@ goldipcskipreason(family::AbstractString, context::AbstractString="") =
 # Compared values normally need no physical identity: dictionary ids, pool
 # unification, and integer JSON spellings are representation choices. A Union's
 # selected type id is different. It chooses one declared child and remains part
-# of the logical value even when two children materialize as equal Julia values.
-struct _LogicalUnion
+# of the public-domain value even when two children materialize as equal Julia values.
+struct _PublicUnion
     typeid::Int8
     value::Any
 end
@@ -718,8 +718,8 @@ function _validatedocument!(document, path::String, diffs::Vector{String})
 end
 
 function _eq(a, b, path::String, diffs::Vector{String}; strict::Bool=false)
-    if a isa _LogicalUnion || b isa _LogicalUnion
-        if !(a isa _LogicalUnion && b isa _LogicalUnion)
+    if a isa _PublicUnion || b isa _PublicUnion
+        if !(a isa _PublicUnion && b isa _PublicUnion)
             push!(diffs, "$path: Union value vs non-Union value")
         elseif a.typeid != b.typeid
             push!(diffs, "$path: Union type id $(a.typeid) vs $(b.typeid)")
@@ -857,13 +857,13 @@ function _normalize!(doc::AbstractDict)
     return doc
 end
 
-_logicalvalue(::Missing) = nothing
-_logicalvalue(value::Pair) = Any[_logicalvalue(first(value)), _logicalvalue(last(value))]
-_logicalvalue(value::NamedTuple) =
-    Any[Any[String(name), _logicalvalue(item)] for (name, item) in pairs(value)]
-_logicalvalue(value::Tuple) = Any[_logicalvalue(item) for item in value]
-_logicalvalue(value::AbstractVector) = Any[_logicalvalue(item) for item in value]
-_logicalvalue(value) = value
+_publicvalue(::Missing) = nothing
+_publicvalue(value::Pair) = Any[_publicvalue(first(value)), _publicvalue(last(value))]
+_publicvalue(value::NamedTuple) =
+    Any[Any[String(name), _publicvalue(item)] for (name, item) in pairs(value)]
+_publicvalue(value::Tuple) = Any[_publicvalue(item) for item in value]
+_publicvalue(value::AbstractVector) = Any[_publicvalue(item) for item in value]
+_publicvalue(value) = value
 
 _typecontainsunion(::AC.ArrowType) = false
 _typecontainsunion(::AC.UnionType) = true
@@ -876,7 +876,7 @@ _fieldcontainsunion(field) =
 # Arrow type id. Walk only fields that contain a Union, preserving that id at
 # every depth while applying the same logical masking rules as Core: storage
 # below a null parent does not participate in the value.
-function _logicalvalueat(field, data, index::Int64)
+function _publicvalueat(field, data, index::Int64)
     1 <= index <= data.len || throw(BoundsError(data, index))
     type = data.type
 
@@ -884,10 +884,10 @@ function _logicalvalueat(field, data, index::Int64)
         typeid =
             AC.loadat(AC.rolebuffer(data, AC.TYPE_IDS), Int8, AC._slotindex0(data, index))
         childfield, childdata, childindex = AC._union_child(field, data, index)
-        return _LogicalUnion(typeid, _logicalvalueat(childfield, childdata, childindex))
+        return _PublicUnion(typeid, _publicvalueat(childfield, childdata, childindex))
     elseif type isa AC.RunEndEncodedType
         run = AC._ree_runindex(data, index)
-        return _logicalvalueat(field.children[2], data.children[2], run)
+        return _publicvalueat(field.children[2], data.children[2], run)
     elseif type isa AC.NullType
         return nothing
     end
@@ -905,7 +905,7 @@ function _logicalvalueat(field, data, index::Int64)
         dictionary === nothing &&
             throw(AC.ValidationError("dictionary-encoded array without a dictionary"))
         valuefield = AC.dictvaluefield(field, type)
-        return _logicalvalueat(
+        return _publicvalueat(
             valuefield,
             dictionary,
             AC.checked_add(Int64(dictionaryindex), Int64(1)),
@@ -916,25 +916,23 @@ function _logicalvalueat(field, data, index::Int64)
         values = Vector{Any}(undef, Int(high - low))
         for item = 1:length(values)
             values[item] =
-                _logicalvalueat(childfield, childdata, AC.checked_add(low, Int64(item)))
+                _publicvalueat(childfield, childdata, AC.checked_add(low, Int64(item)))
         end
         return values
     elseif type isa AC.FixedSizeListType
         childfield, childdata = field.children[1], data.children[1]
         base = AC.checked_mul(AC._slotindex0(data, index), Int64(type.listsize))
         values = Vector{Any}(undef, type.listsize)
-        for item = 1:type.listsize
+        for item = 1:(type.listsize)
             values[item] =
-                _logicalvalueat(childfield, childdata, AC.checked_add(base, Int64(item)))
+                _publicvalueat(childfield, childdata, AC.checked_add(base, Int64(item)))
         end
         return values
     elseif type isa AC.StructType
         childindex = AC.checked_add(data.offset, index)
         return Any[
-            Any[
-                String(childfield.name),
-                _logicalvalueat(childfield, childdata, childindex),
-            ] for (childfield, childdata) in zip(field.children, data.children)
+            Any[String(childfield.name), _publicvalueat(childfield, childdata, childindex)]
+            for (childfield, childdata) in zip(field.children, data.children)
         ]
     elseif type isa AC.MapType
         low, high = AC._offsets_at(data, index, false)
@@ -946,8 +944,8 @@ function _logicalvalueat(field, data, index::Int64)
             entryindex =
                 AC.checked_add(entriesdata.offset, AC.checked_add(low, Int64(item)))
             values[item] = Any[
-                _logicalvalueat(keyfield, keydata, entryindex),
-                _logicalvalueat(valuefield, valuedata, entryindex),
+                _publicvalueat(keyfield, keydata, entryindex),
+                _publicvalueat(valuefield, valuedata, entryindex),
             ]
         end
         return values
@@ -957,19 +955,19 @@ function _logicalvalueat(field, data, index::Int64)
         values = Vector{Any}(undef, Int(size))
         for item = 1:length(values)
             values[item] =
-                _logicalvalueat(childfield, childdata, AC.checked_add(offset, Int64(item)))
+                _publicvalueat(childfield, childdata, AC.checked_add(offset, Int64(item)))
         end
         return values
     end
 
-    return _logicalvalue(AC.getvalue(field, data, index))
+    return _publicvalue(AC.getvalue(field, data, index))
 end
 
 function _logicalcolumn(field, data; name=field.name)
     values = if _fieldcontainsunion(field)
-        Any[_logicalvalueat(field, data, Int64(index)) for index = 1:data.len]
+        Any[_publicvalueat(field, data, Int64(index)) for index = 1:(data.len)]
     else
-        Any[_logicalvalue(value) for value in AC.materialize(field, data)]
+        Any[_publicvalue(value) for value in AC.materialize(field, data)]
     end
     return Dict{String,Any}(
         "name" => String(name),
@@ -1041,9 +1039,9 @@ end
 
 function _logicalwindow(field, data, offset::Int, rows::Int)
     if _fieldcontainsunion(field)
-        return Any[_logicalvalueat(field, data, Int64(offset + index)) for index = 1:rows]
+        return Any[_publicvalueat(field, data, Int64(offset + index)) for index = 1:rows]
     end
-    return Any[_logicalvalue(AC.getvalue(field, data, offset + index)) for index = 1:rows]
+    return Any[_publicvalue(AC.getvalue(field, data, offset + index)) for index = 1:rows]
 end
 
 """

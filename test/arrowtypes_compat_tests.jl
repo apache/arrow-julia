@@ -5801,7 +5801,7 @@ end
     end
 end
 
-@testset "partitioned DictEncode enforces logical value agreement" begin
+@testset "partitioned DictEncode enforces public-domain value agreement" begin
     Point = ArrowTypesTestPoint{:dictionary}
     expected = Point[Point(Int32(1), Int32(2)), Point(Int32(3), Int32(4))]
     abstractfirst = Tables.partitioner((
@@ -6119,7 +6119,7 @@ end
         @test any(
             kv ->
                 first(kv) == "ARROW:extension:name" &&
-                last(kv) == String(ARROWTYPES_TEST_ID_NAME),
+                    last(kv) == String(ARROWTYPES_TEST_ID_NAME),
             rewrittenreefield.children[2].metadata,
         )
     end
@@ -6550,7 +6550,7 @@ end
 end
 
 @testset "wide extension Struct signatures are bounded" begin
-    widefield = function (n; marked::Bool=true)
+    widefield = function (n; marked::Bool = true)
         children = ARROWTYPES_TEST_AC.Field[
             ARROWTYPES_TEST_AC.Field(
                 "child_$i",
@@ -7205,7 +7205,7 @@ end
             @test any(
                 kv ->
                     first(kv) == "ARROW:extension:name" &&
-                    last(kv) == String(ARROWTYPES_TEST_ID_NAME),
+                        last(kv) == String(ARROWTYPES_TEST_ID_NAME),
                 fields[1].metadata,
             )
         end

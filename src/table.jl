@@ -1241,7 +1241,7 @@ function _retaineddictpool(f::AC.Field, batches, i::Int, arrowtypes::_ArrowTypes
     ]
     # Replacement pools can add categories, but the first pool's order and
     # duplicate entries remain authoritative. Encoding identity never calls a
-    # logical value's public equality or hashing methods.
+    # public-domain value's equality or hashing methods.
     return _mergecategorypools(
         pools;
         widen=vf.type isa AC.UnionType,

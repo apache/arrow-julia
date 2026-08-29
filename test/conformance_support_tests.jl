@@ -783,7 +783,7 @@ end
     @test isempty(CS.documentdiffs(no_metadata, empty_metadata))
     @test isempty(CS.documentdiffs(no_metadata, null_metadata))
 
-    @testset "nested nulls compare by logical value" begin
+    @testset "nested nulls compare by public-domain value" begin
         inttype = Dict{String,Any}("name" => "int", "bitWidth" => 32, "isSigned" => true)
 
         structfield = _field(
@@ -1114,7 +1114,7 @@ end
         rejectdifferentroute(dictionaryfield, expecteddictionary, actualdictionary)
 
         # Physical child slots below a null parent remain unspecified. A route
-        # tag must therefore follow the same masking rule as its logical value.
+        # tag must therefore follow the same masking rule as its public-domain value.
         hiddenvalidity = AC._databuffer(UInt8[0x00])
         hiddenexpected = AC.ArrayData(
             structtype,

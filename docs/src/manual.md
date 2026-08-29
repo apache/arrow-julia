@@ -372,12 +372,35 @@ so `Arrow.write(sink, Arrow.Stream(path))` and
 writer is eager and whole-buffer: every partition is materialized, encoded
 and validated in memory, then the complete IPC bytes are written to the
 sink once — it holds the whole table, so it is not a bounded-memory path
-for sources larger than RAM (there is no incremental writer in 3.0).
+for sources larger than RAM. Use [`Arrow.Writer`](@ref) when tables must be
+published incrementally.
 
 `compress` applies per-buffer LZ4 frame or Zstandard compression as
 defined by the IPC specification (buffers that do not shrink are stored
 raw). Compressed files are readable by every implementation that supports
 IPC compression.
+
+### Incremental writing and stream append
+
+[`Arrow.Writer`](@ref) publishes each table's batches before the next table
+is supplied, so it holds only the current table in memory:
+
+```julia
+Arrow.Writer("out.arrow") do writer
+    for table in tables
+        Arrow.write(writer, table)
+    end
+end
+```
+
+The first table fixes the schema. Later tables must have the same columns in
+the same order and compatible types. Closing the writer finishes the output;
+an abandoned writer can leave a torn stream or a file without its footer.
+
+[`Arrow.append`](@ref) extends an existing IPC stream in place. It refuses the
+IPC file format, whose footer must be written when the file is closed. Changed
+dictionary pools require a stream created with
+`Arrow.Writer(...; file=false, dictreplacement=true)`.
 
 ### Dictionary encoding
 
@@ -503,8 +526,8 @@ the source row was a valid index into the Null pool or a null dictionary index.
 Arrow 3.0 applies [ArrowTypes.jl](https://github.com/apache/arrow-julia/tree/main/src/ArrowTypes)
 mappings automatically. Import ArrowTypes.jl directly and declare it as a
 dependency of the package that owns the custom type. `Arrow.ArrowTypes`
-remains available as a qualified compatibility binding, but `ArrowTypes` is
-not exported from Arrow.jl.
+remains available as a qualified compatibility binding, and `ArrowTypes`
+stays exported as an Arrow 2.x compatibility exception.
 
 Define `ArrowType` and `toarrow` to lower a custom value to a supported storage
 type. Define an extension name and the read hooks when the logical type must

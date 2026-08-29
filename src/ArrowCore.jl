@@ -918,7 +918,7 @@ function _count_nulls(d::ArrayData)
     v = d.buffers[1]
     isempty_buffer(v) && return Int64(0)
     n = Int64(0)
-    for i = 1:d.len
+    for i = 1:(d.len)
         n += !getbit(v, _slotindex0(d, Int64(i)))
     end
     return n
@@ -1386,7 +1386,7 @@ const MILLISECONDS_PER_DAY = Int64(86_400_000)
 function _validate_advisory_values(t::DateType, d::ArrayData)
     t.unit == MILLISECOND_DATE || return nothing
     data = rolebuffer(d, DATA)
-    for i = 1:d.len
+    for i = 1:(d.len)
         isvalid_at(d, i) || continue
         value = loadat(data, Int64, _slotbyteoff(d, Int64(i), 8))
         value % MILLISECONDS_PER_DAY == 0 ||
@@ -1441,7 +1441,7 @@ function _decimal_fits_precision(t::DecimalType, data::BufferSlice, byteoff::Int
     end
 
     L1, L2, L3, L4 = UInt64(1), UInt64(0), UInt64(0), UInt64(0)
-    for _ = 1:t.precision
+    for _ = 1:(t.precision)
         p1 = UInt128(L1) * 10
         p2 = UInt128(L2) * 10 + (p1 >> 64)
         p3 = UInt128(L3) * 10 + (p2 >> 64)
@@ -1463,7 +1463,7 @@ end
 function _validate_advisory_values(t::DecimalType, d::ArrayData)
     data = rolebuffer(d, DATA)
     width = Int64(primwidth(t))
-    for i = 1:d.len
+    for i = 1:(d.len)
         isvalid_at(d, i) || continue
         byteoff = _slotbyteoff(d, Int64(i), width)
         _decimal_fits_precision(t, data, byteoff) || throw(
@@ -1483,7 +1483,7 @@ function _validate_advisory_values(t::TimeType, d::ArrayData)
         t.unit == MILLISECOND ? MILLISECONDS_PER_DAY :
         t.unit == MICROSECOND ? Int64(86_400_000_000) : Int64(86_400_000_000_000)
     data = rolebuffer(d, DATA)
-    for i = 1:d.len
+    for i = 1:(d.len)
         isvalid_at(d, i) || continue
         value = if t.bits == 32
             Int64(loadat(data, Int32, _slotbyteoff(d, Int64(i), Int64(4))))
@@ -1546,7 +1546,7 @@ function _validate_semantic_intrinsic(
                 end
                 prev = _load_offset(offs, wide, d.offset)
                 prev >= 0 || throw(ValidationError("negative first offset"))
-                for i = 1:d.len
+                for i = 1:(d.len)
                     cur = _load_offset(offs, wide, checked_add(d.offset, Int64(i)))
                     cur >= prev || throw(
                         ValidationError("offsets not monotonically non-decreasing at $i"),
@@ -1562,7 +1562,7 @@ function _validate_semantic_intrinsic(
             dictlen = length(d.dictionary)
             data = rolebuffer(d, DATA)
             w = primwidth(t.indextype)
-            for i = 1:d.len
+            for i = 1:(d.len)
                 isvalid_at(d, i) || continue
                 idx = _load_int(data, t.indextype, _slotbyteoff(d, Int64(i), w))
                 0 <= idx < dictlen || throw(
@@ -1574,7 +1574,7 @@ function _validate_semantic_intrinsic(
             ids = rolebuffer(d, TYPE_IDS)
             # Dense-mode-only bookkeeping; sparse unions never read it.
             lastoffset = t.mode == DenseMode ? fill(Int64(-1), length(d.children)) : Int64[]
-            for i = 1:d.len
+            for i = 1:(d.len)
                 tid = loadat(ids, Int8, _slotindex0(d, Int64(i)))
                 pos = findfirst(==(tid), t.typeids)
                 pos === nothing &&
@@ -1662,7 +1662,7 @@ bytes is a writer recommendation no validation tier enforces:
 """
 function _validate_view_values(t::ViewType, d::ArrayData)
     views = rolebuffer(d, VIEWS)
-    for i = 1:d.len
+    for i = 1:(d.len)
         isvalid_at(d, i) || continue
         base = _viewbase(d, Int64(i))
         len = loadat(views, Int32, base)
@@ -1707,7 +1707,7 @@ are legal — that is the layout's point.
 """
 function _validate_listview_values(t::ListViewType, d::ArrayData)
     childlen = Int64(length(d.children[1]))
-    for i = 1:d.len
+    for i = 1:(d.len)
         off, sz = _listview_range(t, d, Int64(i))
         (off >= 0 && sz >= 0) ||
             throw(ValidationError("list-view offset and size must be non-negative"))
@@ -1746,7 +1746,7 @@ function _validate_ree_values(d::ArrayData)
     rti = runs.type::IntType
     w = primwidth(rti)
     prev = Int64(0)
-    for i = 1:runs.len
+    for i = 1:(runs.len)
         re = _load_int(data, rti, _slotbyteoff(runs, Int64(i), w))
         re > prev ||
             throw(ValidationError("run ends must be positive and strictly ascending"))
@@ -1819,7 +1819,7 @@ function _validate_field_contract_at(f::Field, d::ArrayData, i::Int64)
         # A union has no parent validity bitmap. Its selected child supplies
         # both the value and any logical null, so validate that child even
         # when the union Field itself permits nulls. Unselected child slots
-        # are not part of this logical value and must remain ignored.
+        # are not part of this selected union value and must remain ignored.
         cf, cd, childi = _union_child(f, d, i)
         _validate_field_contract_at(cf, cd, childi)
         return nothing
@@ -1860,7 +1860,7 @@ function _validate_field_contract_at(f::Field, d::ArrayData, i::Int64)
     elseif t isa FixedSizeListType
         base = checked_mul(_slotindex0(d, i), Int64(t.listsize))
         cf, cd = f.children[1], d.children[1]
-        for j = 1:t.listsize
+        for j = 1:(t.listsize)
             _validate_field_contract_at(cf, cd, checked_add(base, Int64(j)))
         end
     elseif t isa Union{ListType,MapType}
@@ -1923,7 +1923,7 @@ function _validate_field_contracts(
 end
 
 function _validate_nullability(f::Field, d::ArrayData)
-    for i = 1:d.len
+    for i = 1:(d.len)
         _validate_field_contract_at(f, d, Int64(i))
     end
     # Dictionary pools are independent arrays: their nested Field contracts
@@ -1954,7 +1954,7 @@ function validate_full(f::Field, d::ArrayData)
     validate_semantic(f, d)
     # The nullability walk enters ONCE at the root: it routes through
     # unions/REE and applies parent-null masking itself, so recursing it per
-    # child would flag masked slots that are not part of any logical value.
+    # child would flag masked slots that are not part of any public-domain value.
     _validate_nullability(f, d)
     _validate_full_content(f, d)
     return d
@@ -2009,7 +2009,7 @@ function _validate_full_content(f::Field, d::ArrayData)
     _validate_advisory_values_of(d)
     _validate_canonical_bits(d)
     if d.type isa Utf8Type || (d.type isa ViewType && d.type.utf8)
-        for i = 1:d.len
+        for i = 1:(d.len)
             isvalid_at(d, i) || continue
             s = getvalue(f, d, i)::String
             # A malformed byte sequence iterates as invalid Chars; checking
@@ -2361,7 +2361,7 @@ function _value(t::FixedSizeListType, f::Field, d::ArrayData, i::Int64)
     child, cf = d.children[1], f.children[1]
     base = checked_mul(_slotindex0(d, i), Int64(t.listsize))
     out = Vector{Any}(undef, t.listsize)
-    for j = 1:t.listsize
+    for j = 1:(t.listsize)
         out[j] = _dynamicchild(cf, child, checked_add(base, Int64(j)))
     end
     return out
@@ -2670,7 +2670,7 @@ function _prechargevalue!(
         CE = eltype(Base.nonmissingtype(T))
         _reservevector!(estimate, CE, t.listsize, "typed fixed-size list value")
     end
-    for k = 1:t.listsize
+    for k = 1:(t.listsize)
         _prechargechild!(CE, cf, child, checked_add(base, Int64(k)), estimate)
     end
     return nothing
@@ -2873,7 +2873,7 @@ materialize(f::Field, d::ArrayData) = _materialize_of(d.type, f, d)
 function materialize(f::Field, d::ArrayData, budget)
     estimate = _MaterializationEstimate(budget)
     _reservevector!(estimate, Any, d.len, "materialized column")
-    for i = 1:d.len
+    for i = 1:(d.len)
         _prechargevalue_of!(Any, d.type, f, d, Int64(i), estimate)
     end
     _commitestimate!(estimate, "materialized column")
@@ -2937,7 +2937,7 @@ end
 
 function _materialize_loop(t::T, f::Field, d::ArrayData) where {T<:ArrowType}
     out = Vector{Any}(undef, d.len)
-    for i = 1:d.len
+    for i = 1:(d.len)
         out[i] = _value(t, f, d, Int64(i))
     end
     # Vector{Any} by design: result-element typing is the caller's claim
@@ -3003,7 +3003,7 @@ function materialize(::Type{T}, f::Field, d::ArrayData, budget) where {T}
     _checkclaim(T, f, d)
     estimate = _MaterializationEstimate(budget)
     _reservevector!(estimate, T, d.len, "typed materialized column")
-    for i = 1:d.len
+    for i = 1:(d.len)
         _prechargevalue_of!(T, d.type, f, d, Int64(i), estimate)
     end
     # Nullable fixed-width bulk extraction first builds Vector{E}, then its
@@ -3314,7 +3314,7 @@ function _typedvalue(
     base = checked_mul(_slotindex0(d, i), Int64(t.listsize))
     CE = eltype(E)
     out = Vector{CE}(undef, t.listsize)
-    for j = 1:t.listsize
+    for j = 1:(t.listsize)
         out[j] = _typedchild(CE, cf, child, checked_add(base, Int64(j)))
     end
     return out
@@ -3412,7 +3412,7 @@ function _typedmaterialize_loop(
     bulk = _bulkmaterialize(T, t, f, d)
     bulk === nothing || return bulk::Vector{T}
     out = Vector{T}(undef, d.len)
-    for i = 1:d.len
+    for i = 1:(d.len)
         out[i] = _typedvalue(T, t, f, d, Int64(i))
     end
     return out

@@ -65,6 +65,7 @@ isequal(collect(table.name), ["Ada", "Babbage", missing]) # true
 Arrow 3.0 includes:
 
 - IPC file and stream reads and writes.
+- Incremental file and stream writing, plus IPC stream append.
 - LZ4 frame and Zstandard buffer compression.
 - Dictionary encoding.
 - `Tables.Scan` projection, filter, limit, and offset pushdown.
