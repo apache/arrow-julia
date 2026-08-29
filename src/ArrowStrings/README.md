@@ -57,12 +57,25 @@ Pkg.add("ArrowStrings")
   `ELT` is `ArrowString` or `Union{Missing, ArrowString}`; `getindex`
   allocates nothing; `materialize` copies out to `Vector{String}` (or
   `Vector{Union{String,Missing}}` for the nullable `ELT`).
+* `ArrowBytes <: AbstractVector{UInt8}` and `BytesVector{ELT}` — the bytes
+  counterparts, over the same 16-byte payload: Arrow's BinaryView entry is
+  byte for byte the StringView layout, so one payload type serves both.
+  `ArrowBytes` gives allocation-free byte access with `==` and `hash`
+  agreeing with `Vector{UInt8}` (they work as `Dict` keys next to byte
+  vectors); `Vector{UInt8}(b)` copies one value out, and
+  `materialize(::BytesVector)` copies a column out to
+  `Vector{Vector{UInt8}}`. `ELT` is `ArrowBytes` or
+  `Union{Missing, ArrowBytes}`.
 
 Everything depends only on Base and uses concrete types. CI compiles and runs
 representative construction, access, comparison, and materialization under
 JuliaC `--trim=safe`. Buffers must stay under 2 GiB (Arrow's `Int32` view
-words). Construction validates payload geometry and prefixes. Do not resize or
-mutate the payload vector or any referenced buffer while a column is in use.
+words). Construction validates payload geometry and prefixes; a builder that
+produced every payload itself from bounds it already checked — a parser whose
+offsets were validated on read — can pass `Val(:trusted)` as a trailing
+constructor argument to skip that re-validation, vouching for the invariants
+itself. Do not resize or mutate the payload vector or any referenced buffer
+while a column is in use.
 
 ```julia
 using ArrowStrings
