@@ -696,8 +696,7 @@ struct ArrowBytes <: AbstractVector{UInt8}
         _validate_payload(p, data)
         return new(p, data)
     end
-    ArrowBytes(p::ArrowStringPayload, data::Vector{UInt8}, ::Val{:unchecked}) =
-        new(p, data)
+    ArrowBytes(p::ArrowStringPayload, data::Vector{UInt8}, ::Val{:unchecked}) = new(p, data)
 end
 
 @inline _unchecked_arrowbytes(p::ArrowStringPayload, data::Vector{UInt8}) =
@@ -803,10 +802,7 @@ Base.@propagate_inbounds @inline function Base.getindex(
 end
 # All-present columns skip the missing branch entirely — the concrete return
 # type is what lets access compile down to zero allocations.
-Base.@propagate_inbounds @inline function Base.getindex(
-    v::BytesVector{ArrowBytes},
-    i::Int,
-)
+Base.@propagate_inbounds @inline function Base.getindex(v::BytesVector{ArrowBytes}, i::Int)
     @boundscheck checkbounds(v.payloads, i)
     @inbounds p = v.payloads[i]
     len = payloadlength(p)

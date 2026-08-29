@@ -485,7 +485,8 @@ end
         @test mcol[1] == vals[4] && mcol[2] === missing
         @test isequal(AS.materialize(mcol), [vals[4], missing])
         @test AS.materialize(mcol) isa Vector{Union{Vector{UInt8},Missing}}
-        tcol = BytesVector{Union{Missing,ArrowBytes}}(mp, Vector{UInt8}[data], Val(:trusted))
+        tcol =
+            BytesVector{Union{Missing,ArrowBytes}}(mp, Vector{UInt8}[data], Val(:trusted))
         @test tcol[2] === missing && tcol[1] == vals[4]
         # checked constructors reject bad geometry exactly like the string side
         @test_throws ArgumentError BytesVector{ArrowBytes}(
