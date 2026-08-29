@@ -61,7 +61,9 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          RELEASE_DEFAULT=0 dev/release/release_rc.sh 100
+          RELEASE_DEFAULT=0 dev/release/release_rc.sh 100 > release-rc-output.txt
+          cat release-rc-output.txt
+          grep -F "The vote will be open for at least 72 hours." release-rc-output.txt
       - uses: actions/cache@v6
         with:
           path: ~/.julia/artifacts

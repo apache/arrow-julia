@@ -45,6 +45,12 @@ $ dev/release/release_rc.sh 1
 
 The argument of `release_rc.sh` is the RC number. If RC1 has a problem, we'll increment the RC number such as RC2, RC3 and so on.
 
+Keep the vote open for at least 72 hours. A release requires at least three
+binding `+1` votes from PMC members and more binding positive votes than
+binding negative votes. See the [ASF voting
+rules](https://www.apache.org/foundation/voting.html) and the [Arrow release
+guide](https://arrow.apache.org/docs/dev/developers/release.html).
+
 Requirements to run `release_rc.sh`:
 
   * You must be an Apache Arrow committer or PMC member
@@ -102,6 +108,16 @@ If ArrowTypes is also registered, we also need to post a comment on the commit w
 ```markdown
 @JuliaRegistrator register subdir=src/ArrowTypes
 ```
+
+To register or release ArrowStrings, post the following comment on the commit
+that contains its version in `src/ArrowStrings/Project.toml`:
+
+```markdown
+@JuliaRegistrator register subdir=src/ArrowStrings
+```
+
+ArrowStrings must be registered and released before an Arrow.jl release that
+depends on it can be registered.
 
 ### Verify
 
