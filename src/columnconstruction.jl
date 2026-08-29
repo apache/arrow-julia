@@ -1135,15 +1135,14 @@ function _writerstoragetype!(context::_WriterContext, T::Type)
     return _arrowtypesstoragetype!(context.arrowtypes, T)
 end
 
-_writerneedstype!(context::_WriterContext, T::Type) =
-    get!(context.needs, T) do
-        _arrowtypesneedstype(
-            T,
-            nested -> _writerstoragetype!(context, nested),
-            nested -> _writerextension!(context, nested) !== nothing,
-            0,
-        )
-    end
+_writerneedstype!(context::_WriterContext, T::Type) = get!(context.needs, T) do
+    _arrowtypesneedstype(
+        T,
+        nested -> _writerstoragetype!(context, nested),
+        nested -> _writerextension!(context, nested) !== nothing,
+        0,
+    )
+end
 
 function _writerkind!(context::_WriterContext, T::Type)
     Base.@nospecialize T
