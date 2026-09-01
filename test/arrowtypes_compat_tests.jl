@@ -21,6 +21,7 @@
 using ArrowTypes
 using DataAPI
 using Dates
+import Decimals
 using Tables
 using UUIDs
 
@@ -858,6 +859,27 @@ ArrowTypes.JuliaType(::Val{ARROWTYPES_TEST_BYTES_ALIAS_NAME}, S, metadata) =
     ArrowTypesTestBytesAlias
 ArrowTypes.fromarrow(::Type{ArrowTypesTestBytesAlias}, x::AbstractVector{UInt8}) =
     ArrowTypesTestBytesAlias(collect(UInt8, x))
+
+# A decimal column's ArrowTypes storage is `Decimals.Decimal{P,S,T}`, exactly
+# as a date column's is `Dates.Date` — so an extension over one is parametric
+# on the storage it labels, the way each Arrow decimal width has its own.
+struct ArrowTypesTestDecimalAlias{D}
+    value::D
+end
+Base.:(==)(a::ArrowTypesTestDecimalAlias, b::ArrowTypesTestDecimalAlias) =
+    a.value == b.value
+Base.isequal(a::ArrowTypesTestDecimalAlias, b::ArrowTypesTestDecimalAlias) =
+    isequal(a.value, b.value)
+
+const ARROWTYPES_TEST_DECIMAL_ALIAS_NAME = Symbol("JuliaLang.ArrowTests.DecimalAlias")
+ArrowTypes.ArrowType(::Type{ArrowTypesTestDecimalAlias{D}}) where {D} = D
+ArrowTypes.toarrow(x::ArrowTypesTestDecimalAlias) = x.value
+ArrowTypes.arrowname(::Type{<:ArrowTypesTestDecimalAlias}) =
+    ARROWTYPES_TEST_DECIMAL_ALIAS_NAME
+ArrowTypes.JuliaType(::Val{ARROWTYPES_TEST_DECIMAL_ALIAS_NAME}, S, metadata) =
+    ArrowTypesTestDecimalAlias{S}
+ArrowTypes.fromarrow(::Type{ArrowTypesTestDecimalAlias{D}}, x::D) where {D} =
+    ArrowTypesTestDecimalAlias{D}(x)
 
 struct ArrowTypesTestIntListAlias
     value::Vector{Int32}
@@ -3846,38 +3868,44 @@ end
 end
 
 @testset "retained wide Decimal storage aliases" begin
-    for (bits, width) in ((128, 16), (256, 32))
+    for (bits, precision, storage) in ((128, 30, Int128), (256, 60, Decimals.Int256))
         @testset "Decimal$bits" begin
-            t = ARROWTYPES_TEST_AC.DecimalType(bits == 128 ? 30 : 60, 4, bits)
+            t = ARROWTYPES_TEST_AC.DecimalType(precision, 4, bits)
             field = ARROWTYPES_TEST_AC.Field(
                 "value",
                 t;
                 nullable=false,
                 metadata=arrowtypes_test_extension_metadata(
-                    ARROWTYPES_TEST_BYTES_ALIAS_NAME,
+                    ARROWTYPES_TEST_DECIMAL_ALIAS_NAME,
                 ),
             )
-            values = [UInt8.(1:width), reverse(UInt8.(1:width))]
+            D = Decimals.Decimal{precision,4,storage}
+            coefficients = storage[storage(1234), storage(-5678)]
             data = ARROWTYPES_TEST_AC.ArrayData(
                 t,
                 2,
                 [
                     ARROWTYPES_TEST_AC.BufferSlice(),
-                    ARROWTYPES_TEST_AC._databuffer(vcat(values...)),
+                    ARROWTYPES_TEST_AC._databuffer(coefficients),
                 ];
                 nullcount=0,
             )
-            expected = ArrowTypesTestBytesAlias.(values)
+            expected = ArrowTypesTestDecimalAlias{D}[
+                ArrowTypesTestDecimalAlias{D}(reinterpret(D, c)) for c in coefficients
+            ]
             arrowtypes_test_retained_rewrites(field, data, expected)
-            wrong = ArrowTypesTestBytesAlias[
-                ArrowTypesTestBytesAlias(zeros(UInt8, width - 1)),
-                ArrowTypesTestBytesAlias(zeros(UInt8, width - 1)),
+            # A replacement in the wrong decimal storage is refused before any
+            # value is written.
+            W = Decimals.Decimal{9,4,Int32}
+            wrong = ArrowTypesTestDecimalAlias{W}[
+                ArrowTypesTestDecimalAlias{W}(reinterpret(W, Int32(1))),
+                ArrowTypesTestDecimalAlias{W}(reinterpret(W, Int32(2))),
             ]
             arrowtypes_test_retained_replacement_error(
                 field,
                 data,
                 wrong,
-                "expected $width",
+                "retained ArrowTypes target",
             )
         end
     end

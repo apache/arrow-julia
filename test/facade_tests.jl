@@ -2317,4 +2317,231 @@ end
     end
 end
 
+# The four Arrow decimal widths and the storage integer each maps to.
+# `Decimal{P,S,T}`'s per-storage digit capacities ARE Arrow's per-width
+# precision ceilings, so the correspondence is exact in both directions.
+const DECIMAL_WIDTHS =
+    ((32, 9, Int32), (64, 18, Int64), (128, 38, Int128), (256, 76, Decimals.Int256))
+
+# One decimal column's Core buffers, written directly so the READ side is
+# exercised against a descriptor no Julia column produced.
+function decimalstream(t::Arrow.AC.DecimalType, coefficients, present=nothing)
+    AC = Arrow.AC
+    n = length(coefficients)
+    validity = present === nothing ? AC.BufferSlice() : AC._bitmapbuffer(present)
+    nullcount = present === nothing ? 0 : count(!, present)
+    d = AC.ArrayData(t, n, [validity, AC._databuffer(coefficients)]; nullcount=nullcount)
+    f = AC.Field("dec", t; nullable=present !== nothing, metadata=["unit" => "usd"])
+    sch = AC.Schema([f])
+    return Arrow.writestream(sch, [AC.RecordBatch(sch, Arrow.AC.ArrayData[d], n)])
+end
+
+@testset "Arrow decimals map to Decimals.Decimal" begin
+    @testset "every width reads as its value type" begin
+        for (bits, prec, T) in DECIMAL_WIDTHS
+            D = Decimals.Decimal{prec,2,T}
+            coefficients = T[T(123), T(-456), T(0)]
+            table = Arrow.Table(
+                decimalstream(Arrow.AC.DecimalType(prec, 2, bits), coefficients),
+            )
+            @test eltype(table.dec) === D
+            @test table.dec == D[reinterpret(D, c) for c in coefficients]
+            # The coefficient is the Arrow slot verbatim, sign included.
+            @test Decimals.unscaled.(table.dec) == coefficients
+            @test Decimals.scale(eltype(table.dec)) == 2
+            @test precision(first(table.dec)) == prec
+            @test DataAPI.colmetadata(table, :dec, "unit") == "usd"
+        end
+    end
+
+    @testset "nulls come from the validity bitmap" begin
+        for (bits, prec, T) in DECIMAL_WIDTHS
+            D = Decimals.Decimal{prec,3,T}
+            t = Arrow.AC.DecimalType(prec, 3, bits)
+            bytes = decimalstream(t, T[T(7), T(0), T(-9)], Bool[true, false, true])
+            column = Arrow.Table(bytes).dec
+            @test eltype(column) === Union{Missing,D}
+            @test isequal(
+                column,
+                Union{Missing,D}[reinterpret(D, T(7)), missing, reinterpret(D, T(-9))],
+            )
+        end
+    end
+
+    @testset "columns round-trip through write" begin
+        for (bits, prec, T) in DECIMAL_WIDTHS, scale in (0, 2, prec)
+            D = Decimals.Decimal{prec,scale,T}
+            values = D[typemin(D), reinterpret(D, T(-1)), zero(D), typemax(D)]
+            nullable = Union{Missing,D}[values[1], missing, values[4], missing]
+            for file in (false, true)
+                io = IOBuffer()
+                Arrow.write(io, (plain=values, holes=nullable); file=file)
+                table = Arrow.Table(take!(io))
+                @test eltype(table.plain) === D
+                @test table.plain == values
+                @test eltype(table.holes) === Union{Missing,D}
+                @test isequal(table.holes, nullable)
+                schema = getfield(table, :schema)
+                # Precision, scale, and the bit width all survive the trip.
+                @test schema.fields[1].type == Arrow.AC.DecimalType(prec, scale, bits)
+                @test !schema.fields[1].nullable
+                @test schema.fields[2].nullable
+            end
+        end
+    end
+
+    @testset "the bit width follows the storage integer, unwidened" begin
+        # Decimal32/64 are format 1.5 additions: a Decimal32 column writes as
+        # a 32-bit decimal rather than inflating to the older 128-bit form.
+        for (bits, _, T) in DECIMAL_WIDTHS
+            D = Decimals.Decimal{5,2,T}
+            io = IOBuffer()
+            Arrow.write(io, (x=D[parse(D, "1.23")],); file=false)
+            table = Arrow.Table(take!(io))
+            @test getfield(table, :schema).fields[1].type ==
+                  Arrow.AC.DecimalType(5, 2, bits)
+            @test eltype(table.x) === D
+        end
+    end
+
+    @testset "a non-nullable column is written zero-copy" begin
+        D = Decimals.Decimal{38,2,Int128}
+        column = D[reinterpret(D, Int128(i)) for i = 1:8]
+        _, parts = Arrow._constructcolumn(:d, AbstractVector[column])
+        values = only(parts).buffers[2]
+        # The column vector itself is the buffer's owner: no copy at all.
+        @test values.region.root === column
+    end
+
+    @testset "reads take Core's bulk copy at every width" begin
+        for (bits, prec, T) in DECIMAL_WIDTHS
+            D = Decimals.Decimal{prec,0,T}
+            t = Arrow.AC.DecimalType(prec, 0, bits)
+            f = Arrow.AC.Field("dec", t; nullable=false)
+            n = 512
+            d = Arrow.AC.ArrayData(
+                t,
+                n,
+                [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(T[T(i) for i = 1:n])];
+                nullcount=0,
+            )
+            Arrow.AC.materialize(D, f, d)
+            # One allocation of exactly the payload (plus vector overhead):
+            # the element loop would allocate per value at 128/256 bits.
+            @test (@allocated Arrow.AC.materialize(D, f, d)) < 3 * n * sizeof(T)
+        end
+    end
+
+    @testset "dictionary-encoded decimals keep distinct categories" begin
+        # The writer's pool identity walks storage fields; a decimal's whole
+        # value lives in one wide primitive with no fields of its own.
+        for (bits, prec, T) in DECIMAL_WIDTHS
+            D = Decimals.Decimal{prec,1,T}
+            values = D[reinterpret(D, T(15)), reinterpret(D, T(15)), reinterpret(D, T(25))]
+            io = IOBuffer()
+            Arrow.write(io, (x=Arrow.DictEncode(values),); file=false)
+            table = Arrow.Table(take!(io))
+            @test table.x == values
+            @test getfield(table, :schema).fields[1].type isa Arrow.AC.DictionaryType
+        end
+    end
+
+    @testset "read-then-rewrite preserves the descriptor" begin
+        for (bits, prec, T) in DECIMAL_WIDTHS
+            t = Arrow.AC.DecimalType(prec, 2, bits)
+            bytes = decimalstream(t, T[T(11), T(0), T(-22)], Bool[true, false, true])
+            source = Arrow.Table(bytes)
+            io = IOBuffer()
+            Arrow.write(io, source; file=false)
+            rewritten = Arrow.Table(take!(io))
+            @test getfield(rewritten, :schema).fields[1].type == t
+            @test isequal(rewritten.dec, source.dec)
+            @test DataAPI.colmetadata(rewritten, :dec, "unit") == "usd"
+        end
+    end
+
+    @testset "a nested decimal keeps Core's raw coefficient domain" begin
+        # `_postconvert` converts the ROOT descriptor only, so a decimal under
+        # a List stays raw exactly as a nested Date stays an Int32 — and a
+        # retained rewrite must accept that domain back.
+        AC = Arrow.AC
+        t = AC.DecimalType(38, 2, 128)
+        child = AC.ArrayData(
+            t,
+            3,
+            [AC.BufferSlice(), AC._databuffer(Int128[123, 456, 789])];
+            nullcount=0,
+        )
+        listtype = AC.ListType(false)
+        data = AC.ArrayData(
+            listtype,
+            2,
+            [AC.BufferSlice(), AC._databuffer(Int32[0, 2, 3])];
+            children=[child],
+            nullcount=0,
+        )
+        field = AC.Field(
+            "l",
+            listtype;
+            nullable=false,
+            children=[AC.Field("item", t; nullable=false)],
+        )
+        schema = AC.Schema([field])
+        bytes = Arrow.writestream(schema, [AC.RecordBatch(schema, AC.ArrayData[data], 2)])
+        source = Arrow.Table(bytes)
+        @test source.l[1][1] == reinterpret(UInt8, Int128[123])
+        io = IOBuffer()
+        Arrow.write(io, source; file=false)
+        rewritten = Arrow.Table(take!(io))
+        @test getfield(rewritten, :schema).fields[1].children[1].type == t
+        @test isequal(rewritten.l, source.l)
+    end
+
+    @testset "a scale Decimal{P,S} cannot name stays raw" begin
+        # Arrow's scale is a signed Int32 and other producers do use it
+        # outside 0:precision; such a column must still READ.
+        for (t, want) in (
+            (Arrow.AC.DecimalType(9, -2, 32), Int32),
+            (Arrow.AC.DecimalType(18, 20, 64), Int64),
+            (Arrow.AC.DecimalType(38, 40, 128), Vector{UInt8}),
+        )
+            T = t.bits == 32 ? Int32 : t.bits == 64 ? Int64 : Int128
+            table = Arrow.Table(decimalstream(t, T[T(5), T(6)]))
+            @test eltype(table.dec) === want
+            io = IOBuffer()
+            Arrow.write(io, table; file=false)
+            @test getfield(Arrow.Table(take!(io)), :schema).fields[1].type == t
+        end
+    end
+
+    @testset "DecimalValue is refused with a fix" begin
+        io = IOBuffer()
+        err = try
+            Arrow.write(io, (x=[Decimals.DecimalValue(123, 2)],); file=false)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        message = sprint(showerror, err)
+        @test occursin("scale travels with each value", message)
+        @test occursin("rescale", message)
+    end
+
+    @testset "Core refuses a decimal claim of the wrong width" begin
+        AC = Arrow.AC
+        t = AC.DecimalType(38, 2, 128)
+        f = AC.Field("dec", t; nullable=false)
+        d = AC.ArrayData(t, 1, [AC.BufferSlice(), AC._databuffer(Int128[7])]; nullcount=0)
+        # Right width, wrong precision/scale: still the caller's claim.
+        @test AC.materialize(Decimals.Decimal{38,2,Int128}, f, d)[1] ==
+              reinterpret(Decimals.Decimal{38,2,Int128}, Int128(7))
+        # An eight-byte claim over a sixteen-byte slot must refuse.
+        @test_throws ArgumentError AC.materialize(Decimals.Decimal{18,2,Int64}, f, d)
+        @test_throws ArgumentError AC.materialize(Int64, f, d)
+        # Core's own byte domain stays claimable.
+        @test AC.materialize(Vector{UInt8}, f, d)[1] == reinterpret(UInt8, Int128[7])
+    end
+end
+
 end # module FacadeTests
