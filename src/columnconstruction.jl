@@ -79,6 +79,17 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
             AC.DurationType(unit),
             x -> Int64(Dates.value(x)),
         )
+    elseif T <: Decimals.Decimal
+        return _constructdecimalpart(name, v, T)
+    elseif T <: Decimals.DecimalValue
+        throw(
+            ArgumentError(
+                "column $name holds DecimalValue values, whose scale travels " *
+                "with each value; an Arrow decimal column declares ONE scale " *
+                "in its schema. Convert the column to a fixed scale first, " *
+                "e.g. `Decimals.rescale.(Decimal{P,S}, $name)`",
+            ),
+        )
     elseif T <: NamedTuple
         any(ismissing, v) && throw(
             ArgumentError(
@@ -306,6 +317,49 @@ function _constructtemporalpart(
     return AC.Field(name, t; nullable=eltype(v) >: Missing), _temporaldata(t, storage)
 end
 
+"""
+Construct one fresh Arrow decimal part from a `Decimals.Decimal{P,S,T}`
+column. Unlike the temporal path there is nothing to convert: the Julia
+coefficient IS the Arrow slot, so `P` and `S` become the descriptor's
+precision and scale, `T`'s width becomes its bitWidth (32/64/128/256), and a
+non-nullable column wraps its own memory zero-copy exactly as `Vector{Int64}`
+does. Only a nullable column copies, to zero the null slots and build the
+validity bitmap.
+
+The bit width is `T`'s and is not widened: format 1.5 defines decimal32 and
+decimal64, and silently inflating a column to 128 bits would cost twice the
+bytes and lose the writer's declared storage on the round trip.
+"""
+function _constructdecimalpart(
+    name::String,
+    v::AbstractVector,
+    ::Type{D},
+) where {P,S,T,D<:Decimals.Decimal{P,S,T}}
+    t = AC.DecimalType(P, S, 8 * sizeof(T))
+    if !(eltype(v) >: Missing)
+        values = _plainvector(v)
+        return AC.Field(name, t; nullable=false),
+        AC.ArrayData(
+            t,
+            length(values),
+            [AC.BufferSlice(), AC._databuffer(values)];
+            nullcount=0,
+        )
+    end
+    present = Bool[x !== missing for x in v]
+    values = Vector{D}(undef, length(v))
+    for (i, x) in enumerate(v)
+        values[i] = x === missing ? zero(D) : x
+    end
+    return AC.Field(name, t; nullable=true),
+    AC.ArrayData(
+        t,
+        length(v),
+        [AC._bitmapbuffer(present), AC._databuffer(values)];
+        nullcount=count(!, present),
+    )
+end
+
 # ArrowTypes write adapter. ArrowCore intentionally stays conversion-free;
 # this layer lowers logical Julia values before it asks Core to build buffers.
 
@@ -365,6 +419,7 @@ _arrowtypesnativetype(T) =
         Dates.DateTime,
         Dates.Time,
         Dates.Period,
+        Decimals.AbstractDecimal,
     } || _zonedwritertype(T)
 
 # The TimeZones extension's write hooks. With the extension absent both
@@ -3794,14 +3849,20 @@ function _retainedfixedbytes(f::AC.Field, v::AbstractVector)
     return _retainedfield(f), d
 end
 
-# Rebuild a retained decimal column. The materialized public domain is
-# `_decimalbasetype(t)`: `Decimal{P,S,T}` for every descriptor Decimals can
-# name (its coefficient IS the Arrow slot, so the values vector needs no
-# per-element conversion), and Core's raw coefficient domain for the rest.
-function _retaineddecimal(f::AC.Field, v::AbstractVector)
+# Rebuild a retained decimal column from one of its two materialized
+# domains. A TOP-LEVEL column holds `_decimalbasetype(t)` — `Decimal{P,S,T}`,
+# whose coefficient IS the Arrow slot, so the values vector needs no
+# per-element conversion. A NESTED one came off Core's dynamic path and holds
+# raw coefficients (`AC.juliatype`), exactly as a nested temporal holds
+# storage integers.
+_retaineddecimal(f::AC.Field, v::AbstractVector) =
+    _retaineddecimal(f, v, _decimalbasetype(f.type::AC.DecimalType))
+_retaineddecimalraw(f::AC.Field, v::AbstractVector) =
+    _retaineddecimal(f, v, AC.juliatype(f.type::AC.DecimalType))
+
+function _retaineddecimal(f::AC.Field, v::AbstractVector, ::Type{D}) where {D}
     t = f.type::AC.DecimalType
     present = _retainedvalidity(f, v)
-    D = _decimalbasetype(t)
     databuf =
         D === Vector{UInt8} ? AC._databuffer(_retaineddecimalbytes(t, f, v)) :
         AC._databuffer(_retaineddecimalvalues(D, f, v))
@@ -3833,9 +3894,8 @@ function _retaineddecimalbytes(t::AC.DecimalType, f::AC.Field, v::AbstractVector
     values = zeros(UInt8, Base.checked_mul(length(v), width))
     for (i, x) in enumerate(v)
         x === missing && continue
-        x isa AbstractVector{UInt8} || throw(
-            ArgumentError("column $(f.name) must contain byte-vector decimal values"),
-        )
+        x isa AbstractVector{UInt8} ||
+            throw(ArgumentError("column $(f.name) must contain byte-vector decimal values"))
         length(x) == width || throw(
             ArgumentError(
                 "column $(f.name) decimal value $i has $(length(x)) bytes; " *
@@ -3883,8 +3943,25 @@ function _retainedinterval(f::AC.Field, v::AbstractVector)
     return _retainedfield(f), d
 end
 
+"""
+The element domain a NESTED retained value actually holds.
+
+It is the storage domain with one exception: Core's DYNAMIC path — which
+materializes every composite's children — has no decimal value type, so a
+decimal leaf under a List/Struct/Map holds raw coefficients while a
+top-level decimal column holds `Decimal{P,S,T}` from the typed path. That
+mirrors a nested temporal, which stays a storage integer while a top-level
+one becomes a `Dates` value.
+"""
+function _dynamicnestedeltype(f::AC.Field)
+    t = f.type
+    t isa AC.DecimalType || return _declaredeltype(f, false)
+    D = AC.juliatype(t)
+    return f.nullable ? Union{Missing,D} : D
+end
+
 function _retainedtypedvalues(f::AC.Field, values; converted::Bool)
-    T = _declaredeltype(f, converted)
+    T = converted ? _declaredeltype(f, true) : _dynamicnestedeltype(f)
     T === Any && return Any[x for x in values]
     out = Vector{T}(undef, length(values))
     for (i, x) in enumerate(values)
@@ -4009,6 +4086,15 @@ function _retainedchildcolumn(f::AC.Field, values, context::_WriterContext)
             # Preserve hidden state until recursive construction reaches a leaf.
             return _constructpart(f, values; context)
         end
+        if f.type isa AC.DecimalType
+            # Nested decimals are raw coefficients (`_dynamicnestedeltype`) —
+            # the domain `_writerhiddenstorage` also supplies — while the
+            # masked-leaf and writer-storage routes below both expect the
+            # public one. Rebuild from the raw domain directly.
+            placeholder = _writerhiddenstorage(f; inactive=true)
+            raw = Any[x === _RETAINED_HIDDEN ? placeholder : x for x in values]
+            return _retaineddecimalraw(f, raw)
+        end
         masked = _constructmaskedleaf(f, values, _NativeMaskedLeafProjection(f, context))
         masked === nothing || return masked
         hidden = _writerhiddenstorage(f; inactive=true)
@@ -4029,6 +4115,7 @@ function _retainedchildcolumn(f::AC.Field, values, context::_WriterContext)
         storage = Union{Missing,Int64}[x === missing ? missing : Int64(x) for x in v]
         return _rebuildtemporal(f, storage)
     end
+    t isa AC.DecimalType && return _retaineddecimalraw(f, v)
     return _constructpart(f, v; context)
 end
 
@@ -4831,6 +4918,10 @@ function _writerstorageequal(left, right, depth::Int=0)
     # reference and hash by objectid, so equal-but-distinct mutables stay
     # separate categories.
     Base.ismutabletype(typeof(left)) && return left === right
+    # A primitive type has NO fields, so the field walk below would call any
+    # two of its values equal. `Int128` and the 256-bit decimal coefficient
+    # reach here (as does any `Enum`); `===` is their bit comparison.
+    isprimitivetype(typeof(left)) && return left === right
     fieldcount(typeof(left)) == fieldcount(typeof(right)) || return false
     for i = 1:fieldcount(typeof(left))
         _writerstorageequal(getfield(left, i), getfield(right, i), depth + 1) ||
@@ -4898,6 +4989,10 @@ function _writerstoragehash(value, seed::UInt, depth::Int=0)
     h = hash(typeof(value), hash(UInt8(0x0b), seed))
     # Mutables hash by objectid, matching _writerstorageequal's `===` rule.
     Base.ismutabletype(typeof(value)) && return hash(objectid(value), h)
+    # Fieldless primitives take the same rule: `objectid` hashes an
+    # immutable's CONTENTS, so it agrees with the `===` comparison above and
+    # a field walk (which would hash every such value alike) is skipped.
+    isprimitivetype(typeof(value)) && return hash(objectid(value), h)
     for i = 1:fieldcount(typeof(value))
         h = _writerstoragehash(getfield(value, i), h, depth + 1)
     end
