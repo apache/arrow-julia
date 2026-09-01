@@ -63,11 +63,23 @@ writer, validation, scan, and C interface engines.
   Packages that define custom mappings should still depend on and import
   ArrowTypes.jl directly.
 - Big-endian IPC and delta-dictionary messages are rejected.
+- Decimal columns read and write as Decimals.jl `Decimal{precision,scale,T}`
+  instead of the `Arrow.Decimal` type Arrow 2.x defined itself. The 2.x type
+  is gone, and Arrow 2.x could only write 128- and 256-bit decimals.
 - Arrow 3.0 requires ArrowTypes.jl 2.x, Tables.jl 1.14 (the first release
-  with `Tables.Scan`), and the ArrowStrings.jl 1.0 release.
+  with `Tables.Scan`), the ArrowStrings.jl 1.0 release, and Decimals.jl 1.x.
 
 ### Added
 
+- Full decimal support over Decimals.jl. All four Arrow widths
+  (decimal32/64/128/256, the 32- and 64-bit ones being format 1.5 additions)
+  read as `Decimal{precision,scale,T}` and write back at the bit width `T`
+  names. The Julia coefficient is byte-identical to an Arrow decimal slot, so
+  reads take one bulk copy and a non-nullable write is zero-copy — no
+  per-element conversion in either direction. A `DecimalValue` column, whose
+  scale travels with each value, is refused with an `ArgumentError` naming
+  `rescale`; so is a decimal descriptor whose scale falls outside
+  `0:precision`, which reads in Arrow's raw coefficient domain instead.
 - `Tables.Scan` projection, filter, limit, and offset pushdown.
 - Typed `Tables.Scan` select overrides for composite rows: a
   `:column => NamedTuple{...}` select item reads a Struct column as typed

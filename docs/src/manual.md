@@ -197,8 +197,7 @@ maps to `Union{Missing, T}`.
 | Timestamp (microsecond, nanosecond) | `Int64` (raw storage — `DateTime` cannot represent it) |
 | Time32/Time64 | `Dates.Time` |
 | Duration | `Dates.Second`/`Millisecond`/`Microsecond`/`Nanosecond` by unit |
-| Decimal32/64 | `Int32`/`Int64` (unscaled integer storage) |
-| Decimal128/256 | `Vector{UInt8}` (raw native-endian storage) |
+| Decimal32/64/128/256 | `Decimals.Decimal{precision,scale,T}` with `T` the width's `Int32`/`Int64`/`Int128`/`Int256` (a descriptor whose scale falls outside `0:precision`, which `Decimal{P,S}` cannot name, keeps the raw storage: `Int32`/`Int64`, or `Vector{UInt8}` at 128/256 bits) |
 | Interval | `Int32` (year-month) or a `NamedTuple` (day-time, month-day-nano) |
 | Dictionary-encoded scalar | the mapping of the *value* type (indices are resolved) |
 
@@ -441,13 +440,19 @@ At the *top level* of a column the facade adds:
 | `Dates.DateTime` | Timestamp (millisecond) |
 | `Dates.Time` | Time64 (nanosecond) |
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
+| `Decimals.Decimal{P,S,T}` | Decimal of precision `P`, scale `S`, and the bit width of `T` (32/64/128/256), **zero-copy** when the column declares no `Missing` |
 | `NamedTuple` whose fields are core columns | Struct; `Union{Missing, T}` adds parent validity while child nullability stays declared |
 | `Arrow.DictEncode` over a writable column | Dictionary of the recursive mapping of its values |
 | `ArrowStrings.StringVector` | Utf8View, **zero-copy** — the column's memory is the Arrow array (see below) |
 
 These native facade conversions do not recurse through list or struct shapes:
-a `Vector{Date}` inside a list, or a `Date` or `SubString` field of a
-`NamedTuple`, is refused with an `ArgumentError` naming the element type. A
+a `Vector{Date}` or `Vector{Decimal{P,S,T}}` inside a list, or a `Date` or
+`SubString` field of a `NamedTuple`, is refused with an `ArgumentError` naming
+the element type. Reading a foreign file whose decimals are nested that way
+still works — those values arrive in Arrow's raw coefficient domain, as nested
+dates arrive as storage integers — and rewriting one preserves its descriptor.
+`Decimals.DecimalValue` carries a scale per value, which an Arrow decimal
+schema cannot express; `rescale` such a column to a fixed `Decimal{P,S}` first. A
 top-level `DictEncode` pool uses the same native column mapping as an ordinary
 top-level column. The ArrowTypes.jl mappings described below do recurse. A
 column with element type `Any` is narrowed once (recovering list columns of a

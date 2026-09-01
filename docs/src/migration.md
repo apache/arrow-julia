@@ -53,10 +53,18 @@ Use `Tables.getcolumn(table, name_or_index)` in place of Arrow 2.x table
 indexing.
 
 Decimal read types changed. Arrow 2.x read decimal columns as `Arrow.Decimal`
-values that wrap a BitIntegers.jl `Int128` or `Int256` unscaled integer. Arrow
-3.0 reads Decimal32 and Decimal64 as unscaled `Int32` and `Int64` values, and
-Decimal128 and Decimal256 as raw native-endian byte vectors. See
-[Type mapping when reading](@ref) for the complete table.
+values — a type Arrow.jl defined itself — that wrap an `Int128` or `Int256`
+unscaled integer, and could only write those two widths. Arrow 3.0 reads and
+writes all four widths as
+[Decimals.jl](https://github.com/JuliaData/Decimals.jl)'s
+`Decimal{precision,scale,T}`, a full-featured decimal number type rather than
+a storage wrapper. Its coefficient is byte-identical to an Arrow decimal slot,
+so columns cross in both directions with no per-element conversion. Writing a
+`Decimal{P,S,T}` column produces the bit width `T` names — Decimal32 and
+Decimal64 are format 1.5 additions, so a reader older than that needs the
+column widened to 128 bits first. A `DecimalValue`, whose scale travels with
+each value, cannot be written: `rescale` it to a fixed `Decimal{P,S}` first.
+See [Type mapping when reading](@ref) for the complete table.
 
 Struct row types changed. Arrow 2.x read a plain (non-extension) Struct
 column as `NamedTuple` rows. Arrow 3.0 reads it as `Vector{Pair{String,Any}}`
