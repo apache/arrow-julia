@@ -3794,41 +3794,17 @@ function _retainedfixedbytes(f::AC.Field, v::AbstractVector)
     return _retainedfield(f), d
 end
 
+# Rebuild a retained decimal column. The materialized public domain is
+# `_decimalbasetype(t)`: `Decimal{P,S,T}` for every descriptor Decimals can
+# name (its coefficient IS the Arrow slot, so the values vector needs no
+# per-element conversion), and Core's raw coefficient domain for the rest.
 function _retaineddecimal(f::AC.Field, v::AbstractVector)
     t = f.type::AC.DecimalType
     present = _retainedvalidity(f, v)
-    if t.bits == 32 || t.bits == 64
-        T = t.bits == 32 ? Int32 : Int64
-        values = Vector{T}(undef, length(v))
-        for (i, x) in enumerate(v)
-            x === missing ||
-                x isa T ||
-                throw(
-                    ArgumentError(
-                        "column $(f.name) must contain $T decimal storage values",
-                    ),
-                )
-            values[i] = x === missing ? zero(T) : x
-        end
-        databuf = AC._databuffer(values)
-    else
-        width = AC.primwidth(t)
-        values = zeros(UInt8, Base.checked_mul(length(v), width))
-        for (i, x) in enumerate(v)
-            x === missing && continue
-            x isa AbstractVector{UInt8} || throw(
-                ArgumentError("column $(f.name) must contain byte-vector decimal values"),
-            )
-            length(x) == width || throw(
-                ArgumentError(
-                    "column $(f.name) decimal value $i has $(length(x)) bytes; " *
-                    "expected $width",
-                ),
-            )
-            copyto!(values, (i - 1) * width + 1, x, 1, width)
-        end
-        databuf = AC._databuffer(values)
-    end
+    D = _decimalbasetype(t)
+    databuf =
+        D === Vector{UInt8} ? AC._databuffer(_retaineddecimalbytes(t, f, v)) :
+        AC._databuffer(_retaineddecimalvalues(D, f, v))
     d = AC.ArrayData(
         t,
         length(v),
@@ -3836,6 +3812,39 @@ function _retaineddecimal(f::AC.Field, v::AbstractVector)
         nullcount=count(!, present),
     )
     return _retainedfield(f), d
+end
+
+function _retaineddecimalvalues(::Type{D}, f::AC.Field, v::AbstractVector) where {D}
+    values = Vector{D}(undef, length(v))
+    for (i, x) in enumerate(v)
+        if x === missing
+            values[i] = zero(D)
+        elseif x isa D
+            values[i] = x
+        else
+            throw(ArgumentError("column $(f.name) must contain $D decimal values"))
+        end
+    end
+    return values
+end
+
+function _retaineddecimalbytes(t::AC.DecimalType, f::AC.Field, v::AbstractVector)
+    width = AC.primwidth(t)
+    values = zeros(UInt8, Base.checked_mul(length(v), width))
+    for (i, x) in enumerate(v)
+        x === missing && continue
+        x isa AbstractVector{UInt8} || throw(
+            ArgumentError("column $(f.name) must contain byte-vector decimal values"),
+        )
+        length(x) == width || throw(
+            ArgumentError(
+                "column $(f.name) decimal value $i has $(length(x)) bytes; " *
+                "expected $width",
+            ),
+        )
+        copyto!(values, (i - 1) * width + 1, x, 1, width)
+    end
+    return values
 end
 
 function _retainedinterval(f::AC.Field, v::AbstractVector)

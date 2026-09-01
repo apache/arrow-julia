@@ -185,9 +185,7 @@ function _arrowtypesprimitivebasetype(f::AC.Field)
                t.unit == AC.MILLISECOND ? Dates.Millisecond :
                t.unit == AC.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
     end
-    if t isa AC.DecimalType
-        return t.bits == 32 ? Int32 : t.bits == 64 ? Int64 : Vector{UInt8}
-    end
+    t isa AC.DecimalType && return _decimalbasetype(t)
     if t isa AC.IntervalType
         return t.unit == AC.YEAR_MONTH ? Int32 :
                t.unit == AC.DAY_TIME ? NamedTuple{(:days, :millis),Tuple{Int32,Int32}} :

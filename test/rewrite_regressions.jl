@@ -24,6 +24,7 @@ using Test
 using Dates
 using Tables
 import DataAPI
+import Decimals
 using Arrow
 using ArrowStrings
 
@@ -199,7 +200,9 @@ end
         )
         decimalback = Arrow.readstream(_rewrite(decimalbytes))
         @test decimalback.schema.fields[1].type == decimaltype
-        @test Arrow.Table(_rewrite(decimalbytes)).dec == Int64[123, 456]
+        D = Decimals.Decimal{10,2,Int64}
+        @test Arrow.Table(_rewrite(decimalbytes)).dec ==
+              D[reinterpret(D, 123), reinterpret(D, 456)]
     end
 
     @testset "retained composites rebuild recursively" begin

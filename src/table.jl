@@ -668,10 +668,39 @@ end
 _postconvert(t::AC.DictionaryType, col, budget=nothing) =
     _postconvert(t.valuetype, col, budget)
 
+# The storage integer and maximum precision behind each Arrow decimal width.
+# `Decimals.Decimal`'s own per-storage digit capacities are exactly Arrow's
+# per-width precision ceilings, so the widths correspond one for one.
+_decimalstorage(bits::Int) =
+    bits == 32 ? Int32 : bits == 64 ? Int64 : bits == 128 ? Int128 : Decimals.Int256
+_decimalcapacity(bits::Int) = bits == 32 ? 9 : bits == 64 ? 18 : bits == 128 ? 38 : 76
+
+"""
+The public element type of one Arrow decimal column.
+
+`Decimal{P,S,T}` holds a two's-complement native-endian coefficient of
+exactly `T`'s width — byte for byte an Arrow decimal slot — so the column
+materializes through Core's bulk copy with no per-element conversion, and
+`_postconvert` passes decimals through untouched.
+
+`Decimal{P,S}` requires `0 <= S <= P`, but Arrow's `scale` is a signed Int32
+that other producers do use outside that range. Such a column keeps Core's
+raw coefficient domain rather than failing the read: a reader must not choke
+on a descriptor it merely cannot type.
+"""
+function _decimalbasetype(t::AC.DecimalType)
+    raw = t.bits == 32 ? Int32 : t.bits == 64 ? Int64 : Vector{UInt8}
+    t.bits in (32, 64, 128, 256) || return raw
+    1 <= t.precision <= _decimalcapacity(t.bits) || return raw
+    0 <= t.scale <= t.precision || return raw
+    return Decimals.Decimal{t.precision,t.scale,_decimalstorage(t.bits)}
+end
+
 # The public element type of the SCALAR layouts the facade converts (Dates)
 # or passes through; `_declaredbasetype` completes it for every layout and
 # `_declaredeltype` is the Field-aware rule the facade materializes with.
 function _facadebasetype(t::AC.ArrowType)
+    t isa AC.DecimalType && return _decimalbasetype(t)
     t isa AC.DateType && return t.unit == AC.DAY ? Dates.Date : Dates.DateTime
     if t isa AC.TimestampType
         ext = _zonedext(t)
@@ -1357,7 +1386,6 @@ _declaredbasetype(t::AC.ArrowType) =
     t isa AC.StructType ? Vector{Pair{String,Any}} :
     t isa AC.MapType ? Vector{Pair{Any,Any}} :
     t isa AC.NullType ? Missing :
-    t isa AC.DecimalType ? (t.bits == 32 ? Int32 : t.bits == 64 ? Int64 : Vector{UInt8}) :
     t isa AC.IntervalType ?
     (
         t.unit == AC.YEAR_MONTH ? Int32 :

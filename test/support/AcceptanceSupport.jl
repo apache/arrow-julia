@@ -18,6 +18,7 @@
 module AcceptanceSupport
 
 import Arrow
+import Decimals
 using PooledArrays
 using Tables
 import Base64

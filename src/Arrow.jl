@@ -50,6 +50,7 @@ import DataAPI
 import ArrowStrings
 import ArrowTypes
 import Dates
+import Decimals
 import Mmap
 import CodecLz4
 import CodecZstd

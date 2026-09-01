@@ -24,6 +24,7 @@ using Test
 using Tables
 using Dates
 import DataAPI
+import Decimals
 using Arrow
 using ArrowStrings
 
@@ -1835,8 +1836,13 @@ end
         # Core _value methods are the authority), including Field-aware
         # compositions; empty and nonempty columns decide keep/drop alike.
         @test Arrow._declaredbasetype(Arrow.AC.ListViewType(false)) === Vector{Any}
-        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(10, 2, 32)) === Int32
-        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(38, 2, 128)) === Vector{UInt8}
+        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(9, 2, 32)) ===
+              Decimals.Decimal32{2}
+        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(38, 2, 128)) ===
+              Decimals.Decimal128{2}
+        # A scale Decimal{P,S} cannot name keeps Core's raw coefficient domain.
+        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(10, -2, 32)) === Int32
+        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(38, 40, 128)) === Vector{UInt8}
         @test Arrow._declaredbasetype(Arrow.AC.IntervalType(Arrow.AC.YEAR_MONTH)) === Int32
         @test Arrow._declaredbasetype(Arrow.AC.IntervalType(Arrow.AC.DAY_TIME)) ===
               NamedTuple{(:days, :millis),Tuple{Int32,Int32}}
@@ -1950,8 +1956,9 @@ end
             )
             @test isempty(getfield(tuo, :schema).fields)
         end
-        # End-to-end: Decimal64 rows are raw Int64 — an => Integer override
-        # keeps the retained field for empty and nonempty columns alike.
+        # End-to-end: Decimal64 rows are `Decimal{P,S,Int64} <: Real` — a
+        # => Real override keeps the retained field for empty and nonempty
+        # columns alike.
         for (n, vals) in ((2, Int64[1234, 5678]), (0, Int64[]))
             dd = Arrow.AC.ArrayData(
                 Arrow.AC.DecimalType(10, 2, 64),
@@ -1969,7 +1976,7 @@ end
                 dsch,
                 [Arrow.AC.RecordBatch(dsch, Arrow.AC.ArrayData[dd], n)],
             )
-            td = Arrow.Table(db; scan=Tables.Scan(select=(:dec => Integer,)))
+            td = Arrow.Table(db; scan=Tables.Scan(select=(:dec => Real,)))
             dsch2 = getfield(td, :schema)
             @test length(dsch2.fields) == 1
             @test dsch2.fields[1].type isa Arrow.AC.DecimalType
@@ -2182,7 +2189,7 @@ end
                     [AC.BufferSlice(), AC._databuffer(Int128[])];
                     nullcount=0,
                 ),
-                Vector{UInt8},
+                Decimals.Decimal{10,2,Int128},
             ),
             (
                 "d64",
@@ -2193,7 +2200,7 @@ end
                     [AC.BufferSlice(), AC._databuffer(Int64[])];
                     nullcount=0,
                 ),
-                Int64,
+                Decimals.Decimal{10,2,Int64},
             ),
             (
                 "iym",
