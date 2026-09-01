@@ -180,9 +180,14 @@ conversion; `Missing <: T` admits nulls; `Any` is the dynamic path),
 composites recurse (List → `Vector{E}`, Struct → `Vector{Pair}` or a
 NamedTuple with name checks, Dictionary → pool values, run-end encoding
 transparent), unions refuse every static claim, and claims are checked
-against the descriptor before any element is read. Closed fixed-width
-claims over Int/Float/temporal/Decimal32/64 columns use one bounds-checked
-bulk byte copy plus a bitmap null punch.
+against the descriptor before any element is read. Decimal is the sole
+widened leaf: Core has no decimal VALUE type (`juliatype` names the 32/64-bit
+coefficient and raw bytes for 128/256), so a caller that owns one may claim
+ANY isbits type of exactly the layout width and Core copies the
+two's-complement native-endian coefficient verbatim — that is how the facade
+reads every width as `Decimals.Decimal{P,S,T}`. Closed fixed-width claims
+over Int/Float/temporal columns and over decimals of all four widths use one
+bounds-checked bulk byte copy plus a bitmap null punch.
 
 `validate_full` adds UTF-8 well-formedness for Utf8 and Utf8View, the
 advisory nullability contract, Date64 day divisibility, time-of-day range,

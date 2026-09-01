@@ -2048,6 +2048,17 @@ juliatype(::BinaryType) = Vector{UInt8}
 juliatype(t::FixedSizeBinaryType) = Vector{UInt8}
 juliatype(t::ViewType) = t.utf8 ? String : Vector{UInt8}
 juliatype(t::DecimalType) = t.bits == 32 ? Int32 : t.bits == 64 ? Int64 : Vector{UInt8}
+
+# Decimal is the one layout Core has no VALUE type for: the coefficient is
+# `primwidth(t)` two's-complement native-endian bytes, and `juliatype` can
+# only name the 32/64-bit ones (Base has no 128/256-bit decimal, hence the
+# byte-vector domain above). So the typed claim widens here alone: a caller
+# that DOES own a decimal value type — the facade's `Decimals.Decimal{P,S,T}`
+# — may claim any isbits type of exactly the layout width, and Core copies
+# the coefficient bytes verbatim. Every other layout keeps exact-match-only.
+_decimalclaim(::Type{E}, t::DecimalType) where {E} =
+    isbitstype(E) && primwidth(t) == Int64(sizeof(E))
+
 juliatype(t::IntervalType) =
     t.unit == YEAR_MONTH ? Int32 :
     t.unit == DAY_TIME ? NamedTuple{(:days, :millis),Tuple{Int32,Int32}} :
@@ -2552,7 +2563,11 @@ function _prechargevalue!(
 ) where {T}
     isvalid_at(d, i) || return nothing
     if t.bits > 64
-        _reservevector!(estimate, UInt8, primwidth(t), "decimal value")
+        # An isbits decimal claim stores the coefficient inline in the
+        # result vector, already charged as a whole; only the byte-vector
+        # domain allocates per element.
+        _decimalclaim(Base.nonmissingtype(T), t) ||
+            _reservevector!(estimate, UInt8, primwidth(t), "decimal value")
     elseif T === Any
         _reserveobject!(estimate, primwidth(t), "boxed decimal value")
     end
@@ -3009,12 +3024,7 @@ function materialize(::Type{T}, f::Field, d::ArrayData, budget) where {T}
     # Nullable fixed-width bulk extraction first builds Vector{E}, then its
     # public Vector{Union{Missing,E}}. Account for that private scratch copy.
     E = Base.nonmissingtype(T)
-    if Missing <: T &&
-       isbitstype(E) &&
-       d.type isa
-       Union{IntType,FloatType,TimestampType,DateType,TimeType,DurationType,DecimalType} &&
-       E === juliatype(d.type) &&
-       primwidth(d.type) == Int64(sizeof(E))
+    if Missing <: T && _bulkeligible(E, d.type)
         _reservevector!(estimate, E, d.len, "typed materialization scratch")
     end
     _commitestimate!(estimate, "typed materialized column")
@@ -3112,6 +3122,13 @@ function _checkclaim(::Type{T}, f::Field, d::ArrayData)::Nothing where {T}
         return nothing
     end
     E = Base.nonmissingtype(T)
+    if t isa DecimalType
+        # The one widened leaf: see `_decimalclaim`. The byte-vector domain
+        # `juliatype` reports stays claimable for 128/256.
+        (E === juliatype(t) || _decimalclaim(E, t)) ||
+            _typedrefuse(E, _layoutname(t), f)
+        return nothing
+    end
     E === _juliatype_of(t) || _typedrefuse(E, _layoutname(t), f)
     return nothing
 end
@@ -3252,7 +3269,6 @@ function _typedvalue(
         TimeType,
         DurationType,
         ViewType,
-        DecimalType,
         IntervalType,
         MapType,
     },
@@ -3270,6 +3286,16 @@ function _typedvalue(
         primwidth(t) != Int64(sizeof(E)) &&
         _typedrefuse(E, _layoutname(t), f)
     return _value(t, f, d, i)::E
+end
+
+# Decimal's own leaf: `juliatype`'s domain, or any isbits type of exactly the
+# layout width (`_decimalclaim`), whose bytes ARE the coefficient.
+function _typedvalue(::Type{T}, t::DecimalType, f::Field, d::ArrayData, i::Int64) where {T}
+    isvalid_at(d, i) || return _typedmissing(T, f)
+    E = Base.nonmissingtype(T)
+    E === juliatype(t) && return _value(t, f, d, i)::E
+    _decimalclaim(E, t) || _typedrefuse(E, _layoutname(t), f)
+    return loadat(rolebuffer(d, DATA), E, _slotbyteoff(d, i, primwidth(t)))::E
 end
 
 function _typedvalue(
@@ -3428,6 +3454,20 @@ end
 
 _bulkmaterialize(::Type{T}, ::ArrowType, ::Field, ::ArrayData) where {T} = nothing
 
+# Does the element claim `E` take the bulk byte copy over layout `t`? The
+# claim's byte size must equal the DESCRIPTOR's layout width: an invalid
+# 24-bit descriptor falls through juliatype's fallback to a 64-bit Julia
+# type, and copying at the claim's width would misread — such descriptors
+# take the element loop (and validation refuses them). Decimal admits any
+# isbits claim of that width (`_decimalclaim`); every other layout demands
+# its exact `juliatype`.
+_bulkeligible(::Type{E}, t::ArrowType) where {E} =
+    t isa
+    Union{IntType,FloatType,TimestampType,DateType,TimeType,DurationType,DecimalType} &&
+    isbitstype(E) &&
+    (E === juliatype(t) || t isa DecimalType) &&
+    primwidth(t) == Int64(sizeof(E))
+
 function _bulkmaterialize(
     ::Type{T},
     t::Union{IntType,FloatType,TimestampType,DateType,TimeType,DurationType,DecimalType},
@@ -3435,14 +3475,8 @@ function _bulkmaterialize(
     d::ArrayData,
 ) where {T}
     E = Base.nonmissingtype(T)
-    isbitstype(E) || return nothing
-    E === juliatype(t) || return nothing
+    _bulkeligible(E, t) || return nothing
     w = Int64(sizeof(E))
-    # The claim's byte size must equal the DESCRIPTOR's layout width: an
-    # invalid 24-bit descriptor falls through juliatype's fallback to a
-    # 64-bit Julia type, and copying at the claim's width would misread —
-    # such descriptors take the element loop (and validation refuses them).
-    primwidth(t) == w || return nothing
     n = d.len
     # The typed path serves unvalidated data too: subslice re-checks the
     # extraction window against the buffer's declared bounds.
