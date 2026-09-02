@@ -2396,7 +2396,7 @@ end
         for (bits, _, T) in DECIMAL_WIDTHS
             D = Decimals.Decimal{5,2,T}
             io = IOBuffer()
-            Arrow.write(io, (x=D[parse(D, "1.23")],); file=false)
+            Arrow.write(io, (x=D[D("1.23")],); file=false)
             table = Arrow.Table(take!(io))
             @test getfield(table, :schema).fields[1].type ==
                   Arrow.AC.DecimalType(5, 2, bits)
