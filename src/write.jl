@@ -106,6 +106,8 @@ in memory. `sink` is a file path (the writer opens and owns the handle) or
 an `IO` (borrowed; `close` finishes the IPC output but leaves the `IO`
 open). The function form runs `f(writer)` and always closes the writer.
 Metadata follows the inheritance rules of [`Arrow.write`](@ref).
+Constructor option checks run before opening a file path. If both `f` and
+`close` fail, the function form preserves the error from `f`.
 
     w = Arrow.Writer(path)
     for tbl in tables
@@ -134,6 +136,7 @@ never replaces.
 
 `close` finalizes what has been published — the sink is a valid IPC
 output containing every batch written so far — and is idempotent. A
+finalization failure still releases the owned sink. A
 writer abandoned without `close` leaves a torn stream or an unfooted
 file; closing a writer that never received a table just closes the sink
 without producing valid IPC. One task owns a writer: overlapping calls
@@ -154,8 +157,7 @@ mutable struct Writer
 end
 
 function _writer(
-    io::IO,
-    ownio::Bool;
+    sink::Union{AbstractString,IO};
     file::Bool=true,
     compress::Union{Nothing,Symbol}=nothing,
     metadata=nothing,
@@ -164,11 +166,9 @@ function _writer(
 )
     codec = compress === nothing ? :none : compress
     if !haskey(CODEC_NAMES, codec)
-        ownio && close(io)
         throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
     end
     if dictreplacement && file
-        ownio && close(io)
         throw(
             ArgumentError(
                 "dictreplacement is a stream-format feature; the IPC file " *
@@ -176,31 +176,52 @@ function _writer(
             ),
         )
     end
-    return Writer(
-        io,
-        ownio,
-        file,
-        codec,
-        metadata,
-        colmetadata,
-        dictreplacement,
-        nothing,
-        Symbol[],
-        nothing,
-        false,
-    )
+    # Open only after keyword dispatch and option checks: opening with "w"
+    # truncates an existing destination.
+    ownio = sink isa AbstractString
+    io = ownio ? open(sink, "w") : sink
+    try
+        return Writer(
+            io,
+            ownio,
+            file,
+            codec,
+            metadata,
+            colmetadata,
+            dictreplacement,
+            nothing,
+            Symbol[],
+            nothing,
+            false,
+        )
+    catch
+        if ownio
+            try
+                close(io)
+            catch
+                # Preserve the construction error if sink cleanup also fails.
+            end
+        end
+        rethrow()
+    end
 end
 
-Writer(io::IO; kwargs...) = _writer(io, false; kwargs...)
-Writer(path::AbstractString; kwargs...) = _writer(open(path, "w"), true; kwargs...)
+Writer(sink::Union{AbstractString,IO}; kwargs...) = _writer(sink; kwargs...)
 
 function Writer(f::Function, sink::Union{AbstractString,IO}; kwargs...)
     w = Writer(sink; kwargs...)
-    try
-        return f(w)
-    finally
-        close(w)
+    result = try
+        f(w)
+    catch
+        try
+            close(w)
+        catch
+            # Preserve the body error if finalization or sink cleanup fails.
+        end
+        rethrow()
     end
+    close(w)
+    return result
 end
 
 # The Arrow 2.x opening idiom: `open(Arrow.Writer, sink)` constructs the
@@ -271,12 +292,24 @@ function Base.close(w::Writer)
     (@atomic w.closed) && return nothing
     @atomic w.closed = true
     st = w.st
-    if st !== nothing
-        try
-            finishwrite!(st)
-        finally
-            abortwrite!(st)
+    try
+        st === nothing || finishwrite!(st)
+    catch
+        if st !== nothing
+            try
+                abortwrite!(st)
+            catch
+                # Preserve the finalization error if codec cleanup also fails.
+            end
         end
+        if w.ownio
+            try
+                close(w.io)
+            catch
+                # Preserve the finalization error if sink cleanup also fails.
+            end
+        end
+        rethrow()
     end
     w.ownio ? close(w.io) : flush(w.io)
     return nothing
