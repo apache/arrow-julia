@@ -295,8 +295,12 @@ Batch pruning uses per-batch statistics (row count, null count, min, max
 per column) carried in the file's footer schema metadata under the key
 `JuliaArrow:batch_statistics.v1`, in the value layout of the Arrow
 project's statistics schema — other readers see ordinary metadata.
-[`Arrow.write`](@ref) does not embed them; files that carry them prune,
-files that do not are simply scanned batch by batch.
+[`Arrow.write`](@ref) does not compute them; files that carry them prune,
+files that do not are simply scanned batch by batch. `Arrow.write` and
+[`Arrow.Writer`](@ref) drop automatically inherited batch statistics when
+rewriting an `Arrow.Table` or `Arrow.Stream`. The source statistics may no
+longer describe the output values, column order, or batch boundaries.
+An explicit `metadata` override is used as supplied, including any statistics.
 
 ### Reading remote and partial files
 
@@ -479,7 +483,8 @@ When the source is an `Arrow.Table` or `Arrow.Stream`, the writer retains the
 compatible Arrow descriptor tree. Temporal units, byte and list widths,
 Struct, Map, Run-End Encoding, nullability, field metadata, schema metadata,
 and top-level dictionary index types and category order survive a read/write
-round trip. Buffer sharing, overlapping ListView ranges, and exact run
+round trip. Automatically inherited batch statistics are dropped as described
+above. Buffer sharing, overlapping ListView ranges, and exact run
 segmentation are rebuilt into a canonical form without changing logical
 values. A retained Map that declares sorted keys is rewritten only when each
 row remains sorted.

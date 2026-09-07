@@ -49,6 +49,10 @@ Write any Tables.jl source as Arrow IPC. `sink` is a file path or an `IO`.
 one record batch. `compress` is `nothing`, `:lz4`, or `:zstd`.
 `metadata`/`colmetadata` attach schema- and per-column key-value pairs
 (a `Dict`, or pairs; `colmetadata` maps column name `Symbol`s to them).
+Schema metadata is inherited from an `Arrow.Table` or `Arrow.Stream` when
+`metadata` is `nothing`. Inherited batch statistics are dropped because the
+values, columns, or batch boundaries may have changed. Explicit `metadata`
+is used as supplied.
 
 Returns `sink`: the path for the path method, the `io` for the `IO` method.
 The one-argument form curries for pipelines: `table |> Arrow.write(sink)`.
@@ -101,6 +105,7 @@ so producing tables one at a time never holds more than the current table
 in memory. `sink` is a file path (the writer opens and owns the handle) or
 an `IO` (borrowed; `close` finishes the IPC output but leaves the `IO`
 open). The function form runs `f(writer)` and always closes the writer.
+Metadata follows the inheritance rules of [`Arrow.write`](@ref).
 
     w = Arrow.Writer(path)
     for tbl in tables
@@ -227,12 +232,7 @@ function write(w::Writer, tbl)
             _retainedfieldfn(retained, names),
             w.colmetadata,
         )
-        schmeta =
-            w.metadata !== nothing ? _metapairs(w.metadata) :
-            (
-                retained === nothing || retained.metadata === nothing ? nothing :
-                collect(Pair{String,String}, retained.metadata)
-            )
+        schmeta = _writermetadata(w.metadata, retained)
         sch = AC.Schema(fields; metadata=schmeta)
         st = beginwrite!(
             w.io,
@@ -375,6 +375,15 @@ _retainedschema(t::Table) = getfield(t, :schema)
 _retainedschema(s::Stream) = _tableschema(getfield(s, :src))
 _retainedschema(::Any) = nothing
 
+function _writermetadata(metadata, retained)
+    metadata !== nothing && return _metapairs(metadata)
+    (retained === nothing || retained.metadata === nothing) && return nothing
+    # Statistics describe the source's values, field indexes, and batch
+    # boundaries. Retaining its descriptors does not preserve that identity.
+    # Keep user metadata in order, including duplicate keys.
+    return Pair{String,String}[kv for kv in retained.metadata if first(kv) != STATS_KEY]
+end
+
 "Dictionary pools retained by one facade partition, in column order."
 _partitiondictpools(t::Table) = getfield(t, :retainedpools)
 _partitiondictpools(::Any) = nothing
@@ -424,12 +433,7 @@ function _writebytes(
         _retainedfieldfn(retained, names),
         colmetadata,
     )
-    schmeta =
-        metadata !== nothing ? _metapairs(metadata) :
-        (
-            retained === nothing || retained.metadata === nothing ? nothing :
-            collect(Pair{String,String}, retained.metadata)
-        )
+    schmeta = _writermetadata(metadata, retained)
     sch = AC.Schema(fields; metadata=schmeta)
     batches = _tablebatches(sch, coldata, rowcounts)
     codec = compress === nothing ? :none : compress

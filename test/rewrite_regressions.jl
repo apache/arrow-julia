@@ -400,6 +400,110 @@ end
         @test count(kv -> first(kv) == Arrow.STATS_KEY, statsschema.metadata) == 1
     end
 
+    @testset "rewrites discard inherited batch statistics" begin
+        xfield, xdata = AC.fromjulia("x", Union{Missing,Int64}[1, 2])
+        yfield, ydata = AC.fromjulia("y", Int64[100, 200])
+        colmetadata = ["unit" => "first", "unit" => "second"]
+        xfield = AC.Field("x", xfield.type; nullable=true, metadata=colmetadata)
+        metadata = ["source" => "first", "note" => "middle", "source" => "second"]
+        schema = AC.Schema([xfield, yfield]; metadata=metadata)
+        batches = [AC.RecordBatch(schema, [xdata, ydata], 2)]
+        statsschema = Arrow.withstatistics(schema, batches)
+        statspair = last(statsschema.metadata)
+        # Remove every copy of the derived key, without deduplicating or
+        # reordering the surrounding user metadata.
+        statsschema = AC.Schema(
+            [xfield, yfield];
+            metadata=[metadata[1], statspair, metadata[2], statspair, metadata[3]],
+        )
+        bytes = Arrow.writefile(statsschema, batches)
+        _, xdata2 = AC.fromjulia("x", Union{Missing,Int64}[100, 200])
+        _, ydata2 = AC.fromjulia("y", Int64[300, 400])
+        groupedbytes = Arrow.statsfile(
+            schema,
+            [only(batches), AC.RecordBatch(schema, [xdata2, ydata2], 2)],
+        )
+
+        for incremental in (false, true), file in (false, true)
+            rewrite = function (table; metadata=nothing)
+                io = IOBuffer()
+                if incremental
+                    Arrow.Writer(io; file=file, metadata=metadata) do writer
+                        Arrow.write(writer, table)
+                    end
+                else
+                    Arrow.write(io, table; file=file, metadata=metadata)
+                end
+                return take!(io)
+            end
+
+            table = Arrow.Table(bytes)
+            table.x[1] = 100
+            table.x[2] = missing
+            rewritten = rewrite(table)
+            result = Arrow.Table(rewritten)
+            @test isequal(result.x, [100, missing])
+            @test collect(getfield(result, :schema).metadata) == metadata
+            @test collect(getfield(result, :schema).fields[1].metadata) == colmetadata
+            for source in (rewritten, _BytesSource(rewritten))
+                filtered = Arrow.Table(source; scan=Tables.Scan(filter=Tables.col(:x) > 50))
+                @test filtered.x == [100]
+                nulls = Arrow.Table(
+                    source;
+                    scan=Tables.Scan(filter=Tables.isnull(Tables.col(:x))),
+                )
+                @test isequal(nulls.x, [missing])
+            end
+            # Reading or rewriting a table must not change its source metadata.
+            @test collect(getfield(table, :schema).metadata) ==
+                  collect(statsschema.metadata)
+
+            # Projection changes the flattened field indexes used by statistics.
+            projected = Arrow.Table(bytes; scan=Tables.Scan(select=(:y => :picked,)))
+            selected = rewrite(projected)
+            @test Arrow.Table(
+                selected;
+                scan=Tables.Scan(filter=Tables.col(:picked) > 50),
+            ).picked == [100, 200]
+
+            # Stream inputs also inherit a source schema, even without mutation.
+            streamed = Arrow.Table(rewrite(Arrow.Stream(bytes)))
+            @test streamed.x == [1, 2]
+            @test collect(getfield(streamed, :schema).metadata) == metadata
+
+            # Change [1, 2] / [100, 200] into one batch for the eager writer,
+            # or [1, 2, 100] / [200] for the incremental writer. Retaining two
+            # statistics records in the latter case would wrongly prune 100.
+            io = IOBuffer()
+            if incremental
+                Arrow.Writer(io; file=file) do writer
+                    for scan in (Tables.Scan(limit=3), Tables.Scan(offset=3))
+                        Arrow.write(writer, Arrow.Table(groupedbytes; scan=scan))
+                    end
+                end
+            else
+                Arrow.write(io, Arrow.Table(groupedbytes); file=file)
+            end
+            regrouped = take!(io)
+            @test Arrow.Table(regrouped).x == [1, 2, 100, 200]
+            @test length(Arrow.Stream(regrouped)) == (incremental ? 2 : 1)
+            for source in (regrouped, _BytesSource(regrouped))
+                @test Arrow.Table(source; scan=Tables.Scan(filter=Tables.col(:x) > 50)).x ==
+                      [100, 200]
+            end
+
+            # An explicit metadata override is caller-owned and keeps its
+            # existing semantics, including duplicate keys and order.
+            override = ["source" => "override", "source" => "last"]
+            explicit = Arrow.Table(rewrite(table; metadata=override))
+            @test collect(getfield(explicit, :schema).metadata) == override
+            explicitstats =
+                Arrow.Table(rewrite(Arrow.Table(bytes); metadata=statsschema.metadata))
+            @test collect(getfield(explicitstats, :schema).metadata) ==
+                  collect(statsschema.metadata)
+        end
+    end
+
     @testset "NUL field names stay Core-only and fail cleanly at the facade" begin
         field, data = AC.fromjulia("a\0b", Int64[1])
         schema = AC.Schema([field])
