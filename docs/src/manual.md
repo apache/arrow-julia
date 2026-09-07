@@ -470,7 +470,7 @@ At the *top level* of a column the facade adds:
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
 | `NamedTuple` whose fields are core columns | Struct; `Union{Missing, T}` adds parent validity while child nullability stays declared |
 | `Arrow.DictEncode` over a writable column | Dictionary of the recursive mapping of its values |
-| `ArrowStrings.StringVector` | Utf8View, **zero-copy** — the column's memory is the Arrow array (see below) |
+| `ArrowStrings.StringVector` | Utf8View, borrowed in memory and compacted for IPC output (see below) |
 
 These native facade conversions do not recurse through list or struct shapes:
 a `Vector{Date}` inside a list, or a `Date` or `SubString` field of a
@@ -624,9 +624,17 @@ and inactive sparse-Union storage bounded by the bytes the output requires.
 (inline up to 12 bytes, otherwise a prefix plus buffer index and offset),
 and `StringVector`, a column of them over a set of byte buffers —
 which *is* an Arrow Utf8View array's memory. A parser or other producer can
-build this representation directly. `Arrow.write` then wraps its payload
-vector and buffers as the Arrow column without repacking them or
-materializing a `String`.
+build this representation directly. The writer wraps its payload vector and
+buffers as an in-memory Arrow column without materializing a `String`.
+
+When writing IPC, Arrow compacts Utf8View and BinaryView arrays. Only byte
+ranges referenced by valid long entries are copied to the output buffers.
+Unused backing buffers and gaps are omitted. Null entries and unused inline
+bytes are zeroed. Repeated and overlapping ranges within a backing buffer
+continue to share output bytes. Source payloads and buffers are not changed.
+The same rule applies to view arrays inside nested columns and dictionary
+pools. Dictionary values, order, and indices are retained, including pool
+values that no row uses. Compaction does not remove those dictionary values.
 
 ## Validation
 

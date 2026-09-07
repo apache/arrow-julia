@@ -30,6 +30,9 @@ include("arrowtypes_compat_tests.jl")
 # Seeded end-to-end properties over public IPC paths.
 include("property_tests.jl")
 
+# Persist only referenced content from shared Utf8View/BinaryView buffers.
+include("ipc_view_output_tests.jl")
+
 # Read-then-rewrite fidelity through the facade, plus reader-budget accounting.
 include("rewrite_regressions.jl")
 

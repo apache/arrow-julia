@@ -400,15 +400,98 @@ function encodebuffer!(c::EncodeCursor, bytes::Vector{UInt8})
     return nothing
 end
 
+"Encode view entries and the union of their referenced byte ranges."
+function _encodeviewbuffers!(c::EncodeCursor, d::ArrayData)
+    # In-memory views may borrow a whole parser input or a larger column.
+    # IPC must not persist those unrelated bytes, null entries, or padding.
+    views = AC.rolebuffer(d, AC.VIEWS)
+    entries = zeros(UInt8, AC.checked_mul(d.len, Int64(16)))
+    payloads = reinterpret(UInt128, entries)
+    words = reinterpret(Int32, entries)
+    validity = AC.nullcount(d) == 0 ? UInt8[] : zeros(UInt8, cld(d.len, 8))
+    refs = Int64[] # rows with non-inline values
+    for i = 1:d.len
+        AC.isvalid_at(d, i) || continue
+        isempty(validity) || (validity[(i - 1) ÷ 8 + 1] |= UInt8(1) << ((i - 1) % 8))
+        base = 16 * (i - 1)
+        len = AC.loadat(views, Int32, base)
+        payload = AC.loadat(views, UInt128, base)
+        # The writer requires little-endian storage. Mask inline padding;
+        # long entries keep their source coordinates until remapped below.
+        payloads[i] =
+            len <= AC.VIEW_INLINE_MAX ? payload & (typemax(UInt128) >> (8 * (12 - len))) :
+            payload
+        if len > AC.VIEW_INLINE_MAX
+            push!(refs, i)
+        end
+    end
+    # Sort by source position so duplicate and overlapping views share the
+    # same output bytes. Already ordered producer columns need no sort.
+    sourcepos(i) = (words[4 * i - 1], words[4 * i])
+    issorted(refs; by=sourcepos) || sort!(refs; by=sourcepos)
+    buffers = Vector{UInt8}[]
+    firstref = 1
+    while firstref <= length(refs)
+        bufidx = words[4 * refs[firstref] - 1]
+        lastref = firstref
+        extent = Int64(0)
+        nbytes = Int64(0)
+        while lastref <= length(refs) && words[4 * refs[lastref] - 1] == bufidx
+            row = refs[lastref]
+            off, len = words[4 * row], words[4 * row - 3]
+            stop = Int64(off) + len
+            nbytes += max(0, stop - max(Int64(off), extent))
+            extent = max(extent, stop)
+            lastref += 1
+        end
+        # One compact buffer per referenced source buffer keeps rewritten
+        # offsets <= their original Int32 offsets, including large buffers.
+        packed = Vector{UInt8}(undef, nbytes)
+        source = AC._viewdatabuffer(d, bufidx)
+        outputidx = Int32(length(buffers))
+        pos = Int64(0)
+        extent = Int64(0)
+        GC.@preserve source packed begin
+            for j = firstref:(lastref - 1)
+                row = refs[j]
+                off, len = words[4 * row], words[4 * row - 3]
+                words[4 * row - 1] = outputidx
+                words[4 * row] = Int32(pos - max(0, extent - off))
+                stop = Int64(off) + len
+                start = max(Int64(off), extent)
+                count = max(0, stop - start)
+                if count > 0
+                    unsafe_copyto!(
+                        pointer(packed, pos + 1),
+                        AC.sliceptr(source) + start,
+                        count,
+                    )
+                    pos += count
+                end
+                extent = max(extent, stop)
+            end
+        end
+        push!(buffers, packed)
+        firstref = lastref
+    end
+    encodebuffer!(c, validity)
+    encodebuffer!(c, entries)
+    push!(c.variadics, Int64(length(buffers)))
+    for bytes in buffers
+        encodebuffer!(c, bytes)
+    end
+    return nothing
+end
+
 """
     encodefield!(cursor, f, d)
 
 The write half of the registry walk — the exact mirror of `decodefield`:
 one node, then the layout's buffers in registry order, then children in
 declared order. Dictionary-encoded fields emit their INDEX buffers here;
-their pool travels in a dictionary batch. Buffer content is emitted from the
-`ArrayData` slices verbatim: the encoder adds no per-layout interpretation,
-so read and write cannot skew.
+their pool travels in a dictionary batch. View layouts compact referenced
+content at this persistence boundary; other layouts emit their `ArrayData`
+slices verbatim, apart from the empty terminal offset below.
 """
 function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
     t = f.type
@@ -427,6 +510,10 @@ function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
     else
         length(d.buffers) == length(spec.buffers) ||
             throw(ValidationError("column buffer count does not match its layout"))
+    end
+    if t isa AC.ViewType
+        _encodeviewbuffers!(c, d)
+        return nothing
     end
     for (role, b) in zip(spec.buffers, d.buffers)
         if role == AC.OFFSETS && d.len == 0 && b.len == 0

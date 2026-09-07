@@ -769,12 +769,13 @@ function ipc_write_battery()
     end
     println("views, list-views, and nested REE round-trip on both formats (plain + zstd) ✓")
 
-    # Wire shape: variadic counts follow field preorder (2 buffers for the
-    # top-level view, then 0 for the inline view below nested REE); the type
-    # tags are the 1.3/1.4 ids.
+    # Wire shape: variadic counts follow field preorder (1 buffer for the
+    # top-level view: the second input buffer is referenced only by a null;
+    # then 0 for the inline view below nested REE). The type tags are the
+    # 1.3/1.4 ids.
     exframes = framemessages(heapregion(copy(writestream(exsch, [exbatch]))))
     exrb = exframes[2].msg.header::Meta.RecordBatch
-    @assert variadiccounts(exrb) == Int64[2, 0]
+    @assert variadiccounts(exrb) == Int64[1, 0]
     exmeta = exframes[1].msg.header::Meta.Schema
     @assert [typeof(f.type) for f in exmeta.fields] == [
         Meta.Utf8View,
@@ -811,7 +812,7 @@ function ipc_write_battery()
     # Corrupt variadic counts fail closed: overstated (consumes into the
     # tail column's buffers → skew caught) and understated (leftover buffers).
     exraw = writestream(exsch, [exbatch])
-    for lie in (Int64(3), Int64(1))
+    for lie in (Int64(2), Int64(0))
         lied = copy(exraw)
         _mutatemessage!(lied, 2) do meta, msg
             rb = _headertable(meta, msg)
