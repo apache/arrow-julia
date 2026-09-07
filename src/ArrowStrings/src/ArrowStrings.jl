@@ -579,9 +579,11 @@ that violates them makes later access read out of bounds. Payloads that come
 from anywhere else go through a checked constructor.
 
 This is an Arrow Utf8View array's memory: `payloads` is its views buffer and
-`buffers` its variadic data buffers, so Arrow.jl can write the column without
-repacking either one. The two-buffer constructor is the CSV shape: buffer 0
-the input, buffer 1 the column's `extra` buffer of unescaped values.
+`buffers` its variadic data buffers, so Arrow.jl can adapt the column in memory
+without repacking either one. IPC output compacts referenced content rather
+than copying the complete backing buffers. The two-buffer constructor is the
+CSV shape: buffer 0 the input, buffer 1 the column's `extra` buffer of unescaped
+values.
 """
 struct StringVector{ELT} <: AbstractVector{ELT}
     payloads::Vector{ArrowStringPayload}

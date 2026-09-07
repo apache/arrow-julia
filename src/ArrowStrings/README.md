@@ -52,8 +52,9 @@ Pkg.add("ArrowStrings")
   out.
 * `StringVector{ELT}` — a column of them: a payload vector plus the
   byte buffers the views point into. That is an Arrow Utf8View array's
-  memory (views buffer + variadic data buffers), so Arrow.jl can write the
-  column without repacking its payloads or data buffers.
+  memory (views buffer + variadic data buffers), so Arrow.jl can adapt the
+  column in memory without repacking its payloads or data buffers. IPC
+  output compacts referenced content from those buffers.
   `ELT` is `ArrowString` or `Union{Missing, ArrowString}`; `getindex`
   allocates nothing; `materialize` copies out to `Vector{String}` (or
   `Vector{Union{String,Missing}}` for the nullable `ELT`).
