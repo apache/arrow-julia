@@ -56,6 +56,8 @@ function _cdata_release_array(ptr::Ptr{Arrow.ArrowArray})
 end
 
 using Dates
+using Libdl
+using Random
 
 const _CDATA_RELEASE_SCHEMA =
     @cfunction(_cdata_release_schema, Cvoid, (Ptr{Arrow.ArrowSchema},))
@@ -249,6 +251,10 @@ function _set_schema!(
     return f
 end
 
+function _replace_schema!(f::CDataFixture; kwargs...)
+    return _set_schema!(f; kwargs...)
+end
+
 function _set_array!(
     f::CDataFixture;
     length=f.array[].length,
@@ -275,6 +281,10 @@ function _set_array!(
         private_data,
     )
     return f
+end
+
+function _replace_array!(f::CDataFixture; len=f.array[].length, kwargs...)
+    return _set_array!(f; length=len, kwargs...)
 end
 
 @testset "Arrow C Data Interface import" begin
@@ -1280,6 +1290,214 @@ end
         end
         bad(child)
     end
+
+    @testset "deterministic malformed import fuzz" begin
+        iters = something(tryparse(Int, get(ENV, "ARROW_CDATA_FUZZ_ITERS", "64")), 64)
+        iters = clamp(iters, 0, 10_000)
+        rng = Random.MersenneTwister(0x0cda7a)
+        for _ = 1:iters
+            f = _primitive_fixture("i", Int32[10, 20, 30])
+            case = rand(rng, 1:11)
+            if case == 1
+                _replace_array!(f; len=Int64(-1))
+            elseif case == 2
+                _replace_array!(f; offset=Int64(-1))
+            elseif case == 3
+                _replace_array!(f; null_count=Int64(4))
+            elseif case == 4
+                _replace_array!(f; n_buffers=Int64(1))
+            elseif case == 5
+                _replace_array!(f; buffers=Ptr{Ptr{Cvoid}}(C_NULL))
+            elseif case == 6
+                _replace_schema!(f; format=Cstring(C_NULL))
+            elseif case == 7
+                _replace_schema!(f; release=Ptr{Cvoid}(C_NULL))
+            elseif case == 8
+                _replace_array!(f; release=Ptr{Cvoid}(C_NULL))
+            elseif case == 9
+                fmt = Vector{UInt8}("+l\0")
+                push!(f.roots, fmt)
+                _replace_schema!(f; format=Cstring(pointer(fmt)))
+            elseif case == 10
+                offsets = Int32[0, 2, 1, 3]
+                bytes = UInt8[0x01, 0x02, 0x03]
+                buffers = Ptr{Cvoid}[
+                    C_NULL,
+                    Ptr{Cvoid}(pointer(offsets)),
+                    Ptr{Cvoid}(pointer(bytes)),
+                ]
+                push!(f.roots, offsets)
+                push!(f.roots, bytes)
+                push!(f.roots, buffers)
+                fmt = Vector{UInt8}("z\0")
+                push!(f.roots, fmt)
+                _replace_schema!(f; format=Cstring(pointer(fmt)))
+                _replace_array!(
+                    f;
+                    buffers=Ptr{Ptr{Cvoid}}(pointer(buffers)),
+                    n_buffers=Int64(3),
+                )
+            else
+                fmt = Vector{UInt8}("w:$(Arrow._CDATA_MAX_FIXED_SIZE + rand(rng, 1:8))\0")
+                push!(f.roots, fmt)
+                _replace_schema!(f; format=Cstring(pointer(fmt)))
+            end
+            @test_throws ArgumentError Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        end
+    end
+
+    @testset "malformed nested inputs" begin
+        child = _primitive_fixture("i", Int32[1, 2, 3])
+        _replace_schema!(child; release=Ptr{Cvoid}(C_NULL))
+        offsets = Int32[0, 1]
+        f = _cdata_fixture(
+            "+l",
+            1,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets))];
+            children=[child],
+        )
+        push!(f.roots, offsets)
+        @test_throws ArgumentError Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+
+        child = _primitive_fixture("i", Int32[1])
+        root = _cdata_fixture("+s", 2, Ptr{Cvoid}[C_NULL]; children=[child])
+        @test_throws ArgumentError Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
+
+        child = _primitive_fixture("i", Int32[])
+        f = _cdata_fixture(
+            "+w:2",
+            1,
+            Ptr{Cvoid}[C_NULL];
+            offset=Int64(typemax(Int)),
+            children=[child],
+        )
+        @test_throws ArgumentError Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+    end
+
+    @testset "C producer smoke" begin
+        cc = Sys.which("cc")
+        if cc === nothing || Sys.iswindows()
+            @test_skip "C producer smoke requires a C compiler"
+        else
+            c_src = """
+            #include <stdint.h>
+            struct ArrowSchema {
+              const char* format;
+              const char* name;
+              const char* metadata;
+              int64_t flags;
+              int64_t n_children;
+              struct ArrowSchema** children;
+              struct ArrowSchema* dictionary;
+              void (*release)(struct ArrowSchema*);
+              void* private_data;
+            };
+            struct ArrowArray {
+              int64_t length;
+              int64_t null_count;
+              int64_t offset;
+              int64_t n_buffers;
+              int64_t n_children;
+              const void** buffers;
+              struct ArrowArray** children;
+              struct ArrowArray* dictionary;
+              void (*release)(struct ArrowArray*);
+              void* private_data;
+            };
+            static const char format[] = "i";
+            static const uint8_t validity[] = {0x05};
+            static const int32_t data[] = {10, 20, 30};
+            static const void* buffers[] = {validity, data};
+            static void release_schema(struct ArrowSchema* schema) {
+              schema->release = 0;
+            }
+            static void release_array(struct ArrowArray* array) {
+              array->release = 0;
+            }
+            int make_nullable_int32(struct ArrowSchema* schema, struct ArrowArray* array) {
+              if (!schema || !array) return -1;
+              schema->format = format;
+              schema->name = "";
+              schema->metadata = 0;
+              schema->flags = 2;
+              schema->n_children = 0;
+              schema->children = 0;
+              schema->dictionary = 0;
+              schema->release = release_schema;
+              schema->private_data = 0;
+              array->length = 3;
+              array->null_count = 1;
+              array->offset = 0;
+              array->n_buffers = 2;
+              array->n_children = 0;
+              array->buffers = buffers;
+              array->children = 0;
+              array->dictionary = 0;
+              array->release = release_array;
+              array->private_data = 0;
+              return 0;
+            }
+            """
+            mktempdir() do dir
+                src = joinpath(dir, "producer.c")
+                lib = joinpath(dir, "producer.$(Libdl.dlext)")
+                write(src, c_src)
+                if Sys.isapple()
+                    run(`$cc -dynamiclib -o $lib $src`)
+                else
+                    run(`$cc -shared -fPIC -o $lib $src`)
+                end
+                handle = Libdl.dlopen(lib)
+                try
+                    make = Libdl.dlsym(handle, :make_nullable_int32)
+                    schema = Ref(
+                        Arrow.ArrowSchema(
+                            Cstring(C_NULL),
+                            Cstring(C_NULL),
+                            Cstring(C_NULL),
+                            0,
+                            0,
+                            Ptr{Ptr{Arrow.ArrowSchema}}(C_NULL),
+                            Ptr{Arrow.ArrowSchema}(C_NULL),
+                            Ptr{Cvoid}(C_NULL),
+                            Ptr{Cvoid}(C_NULL),
+                        ),
+                    )
+                    array = Ref(
+                        Arrow.ArrowArray(
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            Ptr{Ptr{Cvoid}}(C_NULL),
+                            Ptr{Ptr{Arrow.ArrowArray}}(C_NULL),
+                            Ptr{Arrow.ArrowArray}(C_NULL),
+                            Ptr{Cvoid}(C_NULL),
+                            Ptr{Cvoid}(C_NULL),
+                        ),
+                    )
+                    @test ccall(
+                        make,
+                        Cint,
+                        (Ptr{Arrow.ArrowSchema}, Ptr{Arrow.ArrowArray}),
+                        Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, schema),
+                        Base.unsafe_convert(Ptr{Arrow.ArrowArray}, array),
+                    ) == 0
+                    x = Arrow.from_c_data(
+                        Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, schema),
+                        Base.unsafe_convert(Ptr{Arrow.ArrowArray}, array),
+                    )
+                    @test isequal(collect(x), Union{Int32,Missing}[10, missing, 30])
+                    Arrow.release_c_data(x)
+                    @test schema[].release == C_NULL
+                    @test array[].release == C_NULL
+                finally
+                    Libdl.dlclose(handle)
+                end
+            end
+        end
+    end
 end
 
 _schema_ref_ptr(ref::Ref{Arrow.ArrowSchema}) =
@@ -1752,5 +1970,96 @@ end
 
         @test length(Arrow._CDATA_EXPORT_SCHEMA_OWNERS) == schema_count
         @test length(Arrow._CDATA_EXPORT_ARRAY_OWNERS) == array_count
+    end
+
+    @testset "malformed nested export layouts" begin
+        schema_count = length(Arrow._CDATA_EXPORT_SCHEMA_OWNERS)
+        array_count = length(Arrow._CDATA_EXPORT_ARRAY_OWNERS)
+
+        child = Arrow.toarrowvector(Int32[1])
+        bad_struct =
+            Arrow.Struct{NamedTuple{(:a,),Tuple{Int32}},Tuple{typeof(child)},(:a,)}(
+                Arrow.ValidityBitmap(UInt8[], 1, 0, 0),
+                (child,),
+                2,
+                nothing,
+            )
+        @test_throws ArgumentError Arrow.to_c_data(bad_struct)
+
+        fixed_child = Arrow.toarrowvector(Int32[1, 2, 3, 4, 5])
+        bad_fixed = Arrow.FixedSizeList{NTuple{3,Int32},typeof(fixed_child)}(
+            UInt8[],
+            Arrow.ValidityBitmap(UInt8[], 1, 0, 0),
+            fixed_child,
+            2,
+            nothing,
+        )
+        @test_throws ArgumentError Arrow.to_c_data(bad_fixed)
+
+        list_child = Arrow.toarrowvector(Int32[1])
+        bad_list = Arrow.List{Vector{Int32},Int32,typeof(list_child)}(
+            UInt8[],
+            Arrow.ValidityBitmap(UInt8[], 1, 0, 0),
+            Arrow.Offsets(UInt8[], Int32[0, 2]),
+            list_child,
+            1,
+            nothing,
+        )
+        @test_throws ArgumentError Arrow.to_c_data(bad_list)
+
+        @test length(Arrow._CDATA_EXPORT_SCHEMA_OWNERS) == schema_count
+        @test length(Arrow._CDATA_EXPORT_ARRAY_OWNERS) == array_count
+    end
+
+    @testset "repeated GC stress" begin
+        for i = 1:24
+            tbl = (
+                id=Int32[i, i + 1, i + 2],
+                label=["a$(i)", "b$(i)", "c$(i)"],
+                flags=Union{Bool,Missing}[true, missing, isodd(i)],
+            )
+            schema, array = Arrow.to_c_data(tbl)
+            imported = _import_exported(schema, array)
+            GC.gc(true)
+            GC.gc(true)
+            @test collect(imported.id) == tbl.id
+            @test collect(imported.label) == tbl.label
+            @test isequal(collect(imported.flags), tbl.flags)
+            Arrow.release_c_data(imported)
+            @test schema[].release == C_NULL
+            @test array[].release == C_NULL
+        end
+    end
+
+    @testset "optional PyArrow C Data smoke" begin
+        python = Sys.which("python3")
+        if python === nothing
+            @test_skip "python3 not available"
+        else
+            script = """
+            try:
+                import pyarrow as pa
+            except Exception:
+                print("skip: pyarrow unavailable")
+                raise SystemExit(0)
+            arr = pa.array([1, None, 3], type=pa.int32())
+            if not hasattr(arr, "__arrow_c_array__"):
+                print("skip: pyarrow C array export unavailable")
+                raise SystemExit(0)
+            if not hasattr(pa.Array, "_import_from_c_capsule"):
+                print("skip: pyarrow C capsule import unavailable")
+                raise SystemExit(0)
+            capsules = arr.__arrow_c_array__()
+            out = pa.Array._import_from_c_capsule(*capsules)
+            assert out.to_pylist() == [1, None, 3]
+            print("ok")
+            """
+            out = readchomp(`$python -c $script`)
+            if startswith(out, "skip:")
+                @test_skip out
+            else
+                @test out == "ok"
+            end
+        end
     end
 end
