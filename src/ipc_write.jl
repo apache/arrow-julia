@@ -405,26 +405,47 @@ function _encodeviewbuffers!(c::EncodeCursor, d::ArrayData)
     # In-memory views may borrow a whole parser input or a larger column.
     # IPC must not persist those unrelated bytes, null entries, or padding.
     views = AC.rolebuffer(d, AC.VIEWS)
+    inputvalidity = AC.validitybuffer(d)
     entries = zeros(UInt8, AC.checked_mul(d.len, Int64(16)))
     payloads = reinterpret(UInt128, entries)
     words = reinterpret(Int32, entries)
     validity = AC.nullcount(d) == 0 ? UInt8[] : zeros(UInt8, cld(d.len, 8))
-    refs = Int64[] # rows with non-inline values
+    # Prove that valid long entries cover a prefix of every source buffer.
+    # Such columns need neither row sorting nor per-entry data copies.
+    coverage = zeros(Int64, length(d.buffers) - 2)
+    compact = true
     for i = 1:d.len
-        AC.isvalid_at(d, i) || continue
+        (AC.isempty_buffer(inputvalidity) || AC.getbit(inputvalidity, i - 1)) || continue
         isempty(validity) || (validity[(i - 1) ÷ 8 + 1] |= UInt8(1) << ((i - 1) % 8))
         base = 16 * (i - 1)
-        len = AC.loadat(views, Int32, base)
         payload = AC.loadat(views, UInt128, base)
+        len = reinterpret(Int32, payload % UInt32)
         # The writer requires little-endian storage. Mask inline padding;
         # long entries keep their source coordinates until remapped below.
         payloads[i] =
             len <= AC.VIEW_INLINE_MAX ? payload & (typemax(UInt128) >> (8 * (12 - len))) :
             payload
-        if len > AC.VIEW_INLINE_MAX
-            push!(refs, i)
+        if compact && len > AC.VIEW_INLINE_MAX
+            bufidx, off = words[4 * i - 1], words[4 * i]
+            extent = coverage[bufidx + 1]
+            if off > extent
+                compact = false
+            else
+                coverage[bufidx + 1] = max(extent, Int64(off) + len)
+            end
         end
     end
+    if compact && all(>(0), coverage)
+        encodebuffer!(c, validity)
+        encodebuffer!(c, entries)
+        push!(c.variadics, Int64(length(coverage)))
+        for (i, extent) in enumerate(coverage)
+            # Only the proven prefix is copied; trailing bytes are unused.
+            encodebuffer!(c, AC.slicebytes(AC.subslice(d.buffers[i + 2], 0, extent)))
+        end
+        return nothing
+    end
+    refs = Int64[i for i = 1:d.len if words[4 * i - 3] > AC.VIEW_INLINE_MAX]
     # Sort by source position so duplicate and overlapping views share the
     # same output bytes. Already ordered producer columns need no sort.
     sourcepos(i) = (words[4 * i - 1], words[4 * i])
