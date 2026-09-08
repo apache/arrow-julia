@@ -56,12 +56,19 @@ const ARROW_FLAG_DICTIONARY_ORDERED = Int64(1)
 const ARROW_FLAG_NULLABLE = Int64(2)
 const ARROW_FLAG_MAP_KEYS_SORTED = Int64(4)
 
+const _CDATA_MAX_CHILDREN = 10_000
+const _CDATA_MAX_DEPTH = 128
+const _CDATA_MAX_NODES = 100_000
 # An importer policy, not a limit imposed by the C Data Interface spec.
 # Includes the terminating NUL, so at most 4095 format bytes are accepted.
 # Current primitive formats need one byte; leave room for parameterized
 # formats in the follow-up importer. This bounds scanning/allocation but
 # cannot establish whether a foreign pointer references readable memory.
 const _CDATA_MAX_FORMAT_BYTES = 4096
+const _CDATA_MAX_NAME_BYTES = 1 << 16
+const _CDATA_MAX_METADATA_PAIRS = 4096
+const _CDATA_MAX_METADATA_BYTES = 1 << 20
+const _CDATA_MAX_METADATA_FIELD_BYTES = 1 << 20
 
 abstract type CDataFormat end
 
@@ -69,6 +76,7 @@ struct CDataNullFormat <: CDataFormat end
 struct CDataPrimitiveFormat <: CDataFormat
     storage::Type
 end
+struct CDataStructFormat <: CDataFormat end
 
 abstract type CDataVector{T} <: ArrowVector{T} end
 
@@ -105,19 +113,52 @@ end
 struct CDataNull{T} <: CDataVector{T}
     owner::CDataOwner
     len::Int
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
 end
 
 struct CDataPrimitive{T,S,A<:AbstractVector{S}} <: CDataVector{T}
     owner::CDataOwner
     validity::CDataValidity
     data::A
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
+end
+
+struct CDataStruct{T,S,names} <: CDataVector{T}
+    owner::CDataOwner
+    validity::CDataValidity
+    data::S
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
+end
+
+struct CDataSlice{T,V<:AbstractVector{T}} <: CDataVector{T}
+    parent::V
+    first::Int
+    len::Int
+end
+
+struct CDataMasked{T,V<:CDataVector} <: CDataVector{T}
+    parent::V
+    parent_validity::CDataValidity
+end
+
+struct CDataTable <: Tables.AbstractColumns
+    names::Vector{Symbol}
+    types::Vector{Type}
+    columns::Vector{AbstractVector}
+    lookup::Dict{Symbol,AbstractVector}
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
+    owner::CDataOwner
+    rowcount::Int
 end
 
 struct CDataNode
     schema::ArrowSchema
     array::ArrowArray
     format::CDataFormat
+    name::Union{Nothing,String}
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
     buffers::Vector{Ptr{Cvoid}}
+    children::Vector{CDataNode}
     len::Int
     offset::Int
     null_count::Int
@@ -127,8 +168,27 @@ Base.IndexStyle(::Type{<:CDataVector}) = Base.IndexLinear()
 
 Base.size(x::CDataNull) = (x.len,)
 Base.size(x::CDataPrimitive) = size(x.data)
+Base.size(x::CDataStruct) = (x.validity.len,)
+Base.size(x::CDataSlice) = (x.len,)
+Base.size(x::CDataMasked) = size(x.parent)
+Base.length(t::CDataTable) = length(getfield(t, :columns))
 
 _owner(x::CDataVector) = getfield(x, :owner)
+_owner(x::CDataSlice) = _owner(x.parent)
+_owner(x::CDataMasked) = _owner(x.parent)
+
+function _check_live(owner::CDataOwner)
+    lock(owner.lock)
+    try
+        owner.released && throw(ArgumentError("Arrow C Data object has been released"))
+        return
+    finally
+        unlock(owner.lock)
+    end
+end
+
+_check_live(x::CDataVector) = _check_live(_owner(x))
+_check_live(t::CDataTable) = _check_live(getfield(t, :owner))
 
 function _with_live(f::F, owner::CDataOwner) where {F}
     lock(owner.lock)
@@ -141,10 +201,17 @@ function _with_live(f::F, owner::CDataOwner) where {F}
 end
 
 _with_live(f::F, x::CDataVector) where {F} = _with_live(f, _owner(x))
+_with_live(f::F, t::CDataTable) where {F} = _with_live(f, getfield(t, :owner))
 
 validitybitmap(x::CDataNull) = nothing
 nullcount(x::CDataNull) = x.len
 nullcount(x::CDataVector) = validitybitmap(x).null_count
+nullcount(x::CDataSlice) = count(i -> ismissing(x[i]), eachindex(x))
+nullcount(x::CDataMasked) = count(i -> ismissing(x[i]), eachindex(x))
+getmetadata(x::CDataSlice) = getmetadata(x.parent)
+getmetadata(x::CDataMasked) = getmetadata(x.parent)
+getmetadata(t::CDataTable) = getfield(t, :metadata)
+validitybitmap(::CDataMasked) = nothing
 
 @inline function _valid_bit(bytes::Vector{UInt8}, bitoffset::Int, i::Integer)
     pos = bitoffset + Int(i) - 1
@@ -199,6 +266,36 @@ end
             return missing
         end
         return @inbounds ArrowTypes.fromarrow(T, x.data[i])
+    end
+end
+
+@propagate_inbounds function Base.getindex(
+    x::CDataStruct{T,S,names},
+    i::Integer,
+) where {T,S,names}
+    return _with_live(x) do
+        @boundscheck checkbounds(x, i)
+        !_valid(x.validity, i) && return missing
+        NT = Base.nonmissingtype(T)
+        vals = ntuple(j -> @inbounds(x.data[j][i]), fieldcount(S))
+        return NT(vals)
+    end
+end
+
+@propagate_inbounds function Base.getindex(x::CDataSlice, i::Integer)
+    return _with_live(x) do
+        @boundscheck checkbounds(x, i)
+        return @inbounds x.parent[x.first + Int(i) - 1]
+    end
+end
+
+@propagate_inbounds function Base.getindex(x::CDataMasked, i::Integer)
+    return _with_live(x) do
+        @boundscheck checkbounds(x, i)
+        if !_valid(x.parent_validity, i)
+            return missing
+        end
+        return @inbounds x.parent[i]
     end
 end
 
@@ -265,6 +362,82 @@ end
 
 function Serialization.serialize(s::Serialization.AbstractSerializer, x::CDataVector)
     return Serialization.serialize(s, copy(x))
+end
+
+function Serialization.serialize(s::Serialization.AbstractSerializer, t::CDataTable)
+    return Serialization.serialize(s, copy(t))
+end
+
+function Base.copy(t::CDataTable)
+    return _with_live(t) do
+        names = getfield(t, :names)
+        columns = getfield(t, :columns)
+        return NamedTuple{Tuple(names)}(Tuple(copy(col) for col in columns))
+    end
+end
+
+Tables.istable(::Type{CDataTable}) = true
+Tables.columnaccess(::Type{CDataTable}) = true
+Tables.columns(t::CDataTable) = t
+Tables.columnnames(t::CDataTable) = getfield(t, :names)
+Tables.schema(t::CDataTable) = Tables.Schema(getfield(t, :names), getfield(t, :types))
+Tables.getcolumn(t::CDataTable, i::Int) = (_check_live(t); getfield(t, :columns)[i])
+Tables.getcolumn(t::CDataTable, nm::Symbol) = (_check_live(t); getfield(t, :lookup)[nm])
+Tables.rowcount(t::CDataTable) = getfield(t, :rowcount)
+
+Base.getindex(t::CDataTable, i::Int) = Tables.getcolumn(t, i)
+Base.getindex(t::CDataTable, nm::Symbol) = Tables.getcolumn(t, nm)
+function Base.getproperty(t::CDataTable, nm::Symbol)
+    lookup = getfield(t, :lookup)
+    haskey(lookup, nm) && return Tables.getcolumn(t, nm)
+    return getfield(t, nm)
+end
+Base.propertynames(t::CDataTable, private::Bool=false) =
+    private ? fieldnames(typeof(t)) : Tuple(getfield(t, :names))
+
+DataAPI.metadatasupport(::Type{CDataTable}) = (read=true, write=false)
+DataAPI.colmetadatasupport(::Type{CDataTable}) = (read=true, write=false)
+
+function _dataapi_metadata(meta, key::AbstractString, style::Bool)
+    val = meta[key]
+    return style ? (val, :default) : val
+end
+
+function _dataapi_metadata(meta, key::AbstractString, default, style::Bool)
+    if meta !== nothing && haskey(meta, key)
+        val = meta[key]
+        return style ? (val, :default) : val
+    end
+    return style ? (default, :default) : default
+end
+
+DataAPI.metadata(t::CDataTable, key::AbstractString; style::Bool=false) =
+    _dataapi_metadata(getmetadata(t), key, style)
+DataAPI.metadata(t::CDataTable, key::AbstractString, default; style::Bool=false) =
+    _dataapi_metadata(getmetadata(t), key, default, style)
+
+function DataAPI.metadatakeys(t::CDataTable)
+    meta = getmetadata(t)
+    meta === nothing && return ()
+    return keys(meta)
+end
+
+DataAPI.colmetadata(t::CDataTable, col, key::AbstractString; style::Bool=false) =
+    _dataapi_metadata(getmetadata(t[col]), key, style)
+DataAPI.colmetadata(t::CDataTable, col, key::AbstractString, default; style::Bool=false) =
+    _dataapi_metadata(getmetadata(t[col]), key, default, style)
+
+function DataAPI.colmetadatakeys(t::CDataTable, col)
+    meta = getmetadata(t[col])
+    meta === nothing && return ()
+    return keys(meta)
+end
+
+function DataAPI.colmetadatakeys(t::CDataTable)
+    return (
+        col => DataAPI.colmetadatakeys(t, col) for
+        col in Tables.columnnames(t) if getmetadata(t[col]) !== nothing
+    )
 end
 
 # ArrowSchema/ArrowArray are immutable Julia snapshots of mutable C storage.
@@ -364,10 +537,11 @@ end
 """
     Arrow.release_c_data(x)
 
-Release C Data resources owned by an imported array. The call is idempotent.
-Reads through imported arrays throw after release.
+Release C Data resources owned by an imported array or table. The call is
+idempotent. Reads through imported arrays throw after release.
 """
 release_c_data(x::CDataVector) = release_c_data(_owner(x))
+release_c_data(t::CDataTable) = release_c_data(getfield(t, :owner))
 
 function _to_int(x::Int64, name)
     x > typemax(Int) && throw(ArgumentError("$name exceeds the Julia Int range"))
@@ -402,14 +576,17 @@ function _parse_c_data_format(format::AbstractString)
     format == "e" && return CDataPrimitiveFormat(Float16)
     format == "f" && return CDataPrimitiveFormat(Float32)
     format == "g" && return CDataPrimitiveFormat(Float64)
+    format == "+s" && return CDataStructFormat()
     throw(ArgumentError("unsupported Arrow C Data format string: $format"))
 end
 
 _expected_buffers(::CDataNullFormat) = 0
 _expected_buffers(::CDataPrimitiveFormat) = 2
+_expected_buffers(::CDataStructFormat) = 1
 
 _expected_children(::CDataNullFormat) = 0
 _expected_children(::CDataPrimitiveFormat) = 0
+_expected_children(::CDataStructFormat) = nothing
 
 function _nullable(schema::ArrowSchema, null_count::Int)
     return (schema.flags & ARROW_FLAG_NULLABLE) != 0 || null_count != 0
@@ -418,6 +595,12 @@ end
 function _julia_type(storage::Type, nullable::Bool, convert::Bool)
     T = convert ? finaljuliatype(storage) : storage
     return nullable ? Union{T,Missing} : T
+end
+
+function _load_name(ptr::Cstring)
+    ptr == C_NULL && return nothing
+    name = _unsafe_string_bounded(ptr, _CDATA_MAX_NAME_BYTES, "ArrowSchema.name")
+    return isempty(name) ? nothing : name
 end
 
 function _unsafe_string_bounded(ptr::Cstring, maxbytes::Int, name)
@@ -432,6 +615,64 @@ function _unsafe_string_bounded(ptr::Cstring, maxbytes::Int, name)
     throw(
         ArgumentError("$name has no NUL terminator within the $maxbytes byte import limit"),
     )
+end
+
+function _metadata_dict(pairs)
+    isempty(pairs) && return Base.ImmutableDict{String,String}()
+    return toidict(pairs)
+end
+
+@inline function _unsafe_load_int32(p::Ptr{UInt8})
+    b1 = UInt32(unsafe_load(p, 1))
+    b2 = UInt32(unsafe_load(p, 2))
+    b3 = UInt32(unsafe_load(p, 3))
+    b4 = UInt32(unsafe_load(p, 4))
+    u =
+        ENDIAN_BOM == 0x04030201 ? b1 | (b2 << 8) | (b3 << 16) | (b4 << 24) :
+        ENDIAN_BOM == 0x01020304 ? (b1 << 24) | (b2 << 16) | (b3 << 8) | b4 :
+        error("unsupported host byte order")
+    return reinterpret(Int32, u)
+end
+
+function _parse_c_metadata(ptr::Cstring)
+    ptr == C_NULL && return nothing
+    # Per the Arrow C Data Interface spec, metadata is length encoded and not null terminated.
+    p = Ptr{UInt8}(ptr)
+    count = Int(_unsafe_load_int32(p))
+    count < 0 && throw(ArgumentError("Arrow C Data metadata pair count is negative"))
+    count > _CDATA_MAX_METADATA_PAIRS &&
+        throw(ArgumentError("Arrow C Data metadata pair count exceeds the limit"))
+    pos = 4
+    total = 4
+    pairs = Pair{String,String}[]
+    for _ = 1:count
+        key_len = Int(_unsafe_load_int32(p + pos))
+        pos += 4
+        total += 4
+        key_len < 0 && throw(ArgumentError("Arrow C Data metadata key length is negative"))
+        key_len > _CDATA_MAX_METADATA_FIELD_BYTES &&
+            throw(ArgumentError("Arrow C Data metadata key length exceeds the limit"))
+        total = _checked_add(total, key_len, "metadata byte count")
+        total > _CDATA_MAX_METADATA_BYTES &&
+            throw(ArgumentError("Arrow C Data metadata byte count exceeds the limit"))
+        key = unsafe_string(p + pos, key_len)
+        pos += key_len
+
+        value_len = Int(_unsafe_load_int32(p + pos))
+        pos += 4
+        total += 4
+        value_len < 0 &&
+            throw(ArgumentError("Arrow C Data metadata value length is negative"))
+        value_len > _CDATA_MAX_METADATA_FIELD_BYTES &&
+            throw(ArgumentError("Arrow C Data metadata value length exceeds the limit"))
+        total = _checked_add(total, value_len, "metadata byte count")
+        total > _CDATA_MAX_METADATA_BYTES &&
+            throw(ArgumentError("Arrow C Data metadata byte count exceeds the limit"))
+        value = unsafe_string(p + pos, value_len)
+        pos += value_len
+        push!(pairs, key => value)
+    end
+    return _metadata_dict(pairs)
 end
 
 function _load_buffers(array::ArrowArray, expected::Int)
@@ -450,6 +691,23 @@ function _load_buffers(array::ArrowArray, expected::Int)
         push!(buffers, unsafe_load(array.buffers, i))
     end
     return buffers
+end
+
+function _load_child_ptrs(schema::ArrowSchema, array::ArrowArray, count::Int)
+    count == 0 && return Ptr{ArrowSchema}[], Ptr{ArrowArray}[]
+    schema.children == C_NULL && throw(ArgumentError("ArrowSchema.children is NULL"))
+    array.children == C_NULL && throw(ArgumentError("ArrowArray.children is NULL"))
+    schema_children = Ptr{ArrowSchema}[]
+    array_children = Ptr{ArrowArray}[]
+    for i = 1:count
+        schema_child = unsafe_load(schema.children, i)
+        array_child = unsafe_load(array.children, i)
+        schema_child == C_NULL && throw(ArgumentError("ArrowSchema child pointer is NULL"))
+        array_child == C_NULL && throw(ArgumentError("ArrowArray child pointer is NULL"))
+        push!(schema_children, schema_child)
+        push!(array_children, array_child)
+    end
+    return schema_children, array_children
 end
 
 function _validate_flags(schema::ArrowSchema, format::CDataFormat)
@@ -479,7 +737,11 @@ function _validate_common(schema::ArrowSchema, array::ArrowArray, top_level::Boo
     _checked_add(offset, len, "ArrowArray offset plus length")
     _checked_nonnegative(array.n_buffers, "ArrowArray.n_buffers")
     n_children = _checked_nonnegative(array.n_children, "ArrowArray.n_children")
+    n_children > _CDATA_MAX_CHILDREN &&
+        throw(ArgumentError("ArrowArray.n_children exceeds the import limit"))
     schema_n_children = _checked_nonnegative(schema.n_children, "ArrowSchema.n_children")
+    schema_n_children > _CDATA_MAX_CHILDREN &&
+        throw(ArgumentError("ArrowSchema.n_children exceeds the import limit"))
     schema_n_children == n_children ||
         throw(
             ArgumentError(
@@ -506,7 +768,15 @@ function _validate_node(
     schema_ptr::Ptr{ArrowSchema},
     array_ptr::Ptr{ArrowArray};
     top_level::Bool=false,
+    depth::Int=1,
+    budget::Base.RefValue{Int}=Ref(_CDATA_MAX_NODES),
 )
+    depth > _CDATA_MAX_DEPTH &&
+        throw(ArgumentError("Arrow C Data nesting exceeds the import limit"))
+    # A total node budget bounds validation of aliased or cyclic child
+    # pointers, which the depth and child count limits alone do not.
+    (budget[] -= 1) < 0 &&
+        throw(ArgumentError("Arrow C Data node count exceeds the import limit"))
     schema_ptr == C_NULL && throw(ArgumentError("ArrowSchema pointer is NULL"))
     array_ptr == C_NULL && throw(ArgumentError("ArrowArray pointer is NULL"))
     schema = unsafe_load(schema_ptr)
@@ -520,10 +790,37 @@ function _validate_node(
         ),
     )
     _validate_flags(schema, format)
-    n_children == _expected_children(format) ||
+    expected_children = _expected_children(format)
+    if expected_children !== nothing && n_children != expected_children
         throw(ArgumentError("Arrow C Data child count does not match the format"))
+    end
     buffers = _load_buffers(array, _expected_buffers(format))
-    node = CDataNode(schema, array, format, buffers, len, offset, null_count)
+    schema_child_ptrs, array_child_ptrs = _load_child_ptrs(schema, array, n_children)
+    children = CDataNode[]
+    for i in eachindex(schema_child_ptrs)
+        push!(
+            children,
+            _validate_node(
+                schema_child_ptrs[i],
+                array_child_ptrs[i];
+                top_level=false,
+                depth=depth + 1,
+                budget=budget,
+            ),
+        )
+    end
+    node = CDataNode(
+        schema,
+        array,
+        format,
+        _load_name(schema.name),
+        _parse_c_metadata(schema.metadata),
+        buffers,
+        children,
+        len,
+        offset,
+        null_count,
+    )
     _validate_layout(node)
     return node
 end
@@ -559,6 +856,14 @@ function _validate_data_layout(format::CDataPrimitiveFormat, node::CDataNode, to
     nbytes = _checked_mul(total, sizeof(format.storage), "primitive data byte count")
     if nbytes > 0
         node.buffers[2] == C_NULL && throw(ArgumentError("primitive data buffer is NULL"))
+    end
+    return
+end
+
+function _validate_data_layout(::CDataStructFormat, node::CDataNode, total::Int)
+    # Per the Arrow C Data Interface spec, struct children must cover length + offset.
+    for child in node.children
+        child.len >= total || throw(ArgumentError("struct child is too short"))
     end
     return
 end
@@ -607,7 +912,7 @@ function _import_node(node::CDataNode, owner::CDataOwner, convert::Bool)
 end
 
 function _import_node(::CDataNullFormat, node::CDataNode, owner::CDataOwner, convert::Bool)
-    return CDataNull{Missing}(owner, node.len)
+    return CDataNull{Missing}(owner, node.len, node.metadata)
 end
 
 function _import_node(
@@ -620,7 +925,76 @@ function _import_node(
     nullable = _nullable(node.schema, validity.null_count)
     T = _julia_type(format.storage, nullable, convert)
     data = _wrap_data(node.buffers[2], format.storage, node.offset, node.len)
-    return CDataPrimitive{T,format.storage,typeof(data)}(owner, validity, data)
+    return CDataPrimitive{T,format.storage,typeof(data)}(
+        owner,
+        validity,
+        data,
+        node.metadata,
+    )
+end
+
+function _struct_name(node::CDataNode, i::Int)
+    return Symbol(node.name === nothing ? "f$(i)" : node.name)
+end
+
+function _struct_columns(node::CDataNode, owner::CDataOwner, convert::Bool)
+    columns = AbstractVector[]
+    names = Symbol[]
+    for (i, child_node) in enumerate(node.children)
+        child = _import_node(child_node, owner, convert)
+        push!(columns, _slice_for_table(child, node.offset, node.len))
+        push!(names, _struct_name(child_node, i))
+    end
+    # NamedTuple construction and column lookup cannot represent duplicates.
+    allunique(names) ||
+        throw(ArgumentError("duplicate struct field names are not supported"))
+    return Tuple(names), Tuple(columns)
+end
+
+function _struct_type(schema::ArrowSchema, validity::CDataValidity, data, names)
+    NT = NamedTuple{names,Tuple{(eltype(x) for x in data)...}}
+    return _nullable(schema, validity.null_count) ? Union{NT,Missing} : NT
+end
+
+function _import_node(
+    ::CDataStructFormat,
+    node::CDataNode,
+    owner::CDataOwner,
+    convert::Bool,
+)
+    validity = _make_validity(node)
+    names, data = _struct_columns(node, owner, convert)
+    T = _struct_type(node.schema, validity, data, names)
+    return CDataStruct{T,typeof(data),names}(owner, validity, data, node.metadata)
+end
+
+function _slice_for_table(child::CDataVector, offset::Int, len::Int)
+    if offset == 0 && length(child) == len
+        return child
+    else
+        first = offset + 1
+        return CDataSlice{eltype(child),typeof(child)}(child, first, len)
+    end
+end
+
+function _mask_for_struct(child::CDataVector, parent_validity::CDataValidity)
+    if parent_validity.null_count == 0
+        return child
+    else
+        # Per the Arrow struct validity spec, parent and child validity are independent.
+        T = Union{eltype(child),Missing}
+        return CDataMasked{T,typeof(child)}(child, parent_validity)
+    end
+end
+
+function _table_from_struct(node::CDataNode, owner::CDataOwner, convert::Bool)
+    parent_validity = _make_validity(node)
+    names_tuple, data = _struct_columns(node, owner, convert)
+    names = collect(names_tuple)
+    columns = AbstractVector[_mask_for_struct(col, parent_validity) for col in data]
+    types = Type[eltype(col) for col in columns]
+    lookup = Dict{Symbol,AbstractVector}(names[i] => columns[i] for i in eachindex(names))
+    return CDataTable(names, types, columns, lookup, node.metadata, owner, node.len)
 end
 
 """
@@ -663,8 +1037,10 @@ arrow-rs `from_raw`. Element access is liveness checked, but direct field
 introspection of an imported array (for example `Base.dump`) bypasses that
 check and must not be used after release.
 
-This first importer supports null and primitive arrays. Support for further
-data types is added by follow up changes.
+A top level struct array is returned as a Tables.jl column table. Unlike the
+Arrow C++ record batch importer, a nonzero offset or struct level nulls are
+accepted: the offset is applied to the columns and rows behind a struct null
+read as missing in every column.
 """
 function from_c_data(
     schema_ptr::Ptr{ArrowSchema},
@@ -680,7 +1056,11 @@ function from_c_data(
             Base.unsafe_convert(Ptr{ArrowArray}, owner.array);
             top_level=true,
         )
-        return _import_node(node, owner, convert)
+        if node.format isa CDataStructFormat
+            return _table_from_struct(node, owner, convert)
+        else
+            return _import_node(node, owner, convert)
+        end
     catch
         try
             release_c_data(owner)

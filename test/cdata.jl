@@ -91,15 +91,44 @@ function _cstring_root(s::Union{Nothing,String}, roots)
     return Cstring(pointer(bytes))
 end
 
+function _metadata_root(meta::Union{Nothing,AbstractDict}, roots)
+    meta === nothing && return Cstring(C_NULL)
+    io = IOBuffer()
+    write(io, Int32(length(meta)))
+    for (k, v) in meta
+        kb = codeunits(String(k))
+        vb = codeunits(String(v))
+        write(io, Int32(length(kb)))
+        write(io, kb)
+        write(io, Int32(length(vb)))
+        write(io, vb)
+    end
+    bytes = take!(io)
+    push!(roots, bytes)
+    return Cstring(pointer(bytes))
+end
+
 function _cdata_fixture(
     fmt::String,
     len::Integer,
     buffers::Vector{Ptr{Cvoid}};
+    name=nothing,
+    metadata=nothing,
     flags::Int64=0,
     null_count::Int64=0,
     offset::Int64=0,
+    children::Vector{CDataFixture}=CDataFixture[],
 )
     roots = Any[]
+    append!(roots, children)
+    schema_ptrs =
+        [Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, child.schema) for child in children]
+    array_ptrs =
+        [Base.unsafe_convert(Ptr{Arrow.ArrowArray}, child.array) for child in children]
+    if !isempty(children)
+        push!(roots, schema_ptrs)
+        push!(roots, array_ptrs)
+    end
     buffer_ptrs = copy(buffers)
     if !isempty(buffer_ptrs)
         push!(roots, buffer_ptrs)
@@ -107,11 +136,12 @@ function _cdata_fixture(
     schema = Ref(
         Arrow.ArrowSchema(
             _cstring_root(fmt, roots),
-            Cstring(C_NULL),
-            Cstring(C_NULL),
+            _cstring_root(name, roots),
+            _metadata_root(metadata, roots),
             flags,
-            Int64(0),
-            Ptr{Ptr{Arrow.ArrowSchema}}(C_NULL),
+            Int64(length(children)),
+            isempty(children) ? Ptr{Ptr{Arrow.ArrowSchema}}(C_NULL) :
+            Ptr{Ptr{Arrow.ArrowSchema}}(pointer(schema_ptrs)),
             Ptr{Arrow.ArrowSchema}(C_NULL),
             _CDATA_RELEASE_SCHEMA,
             Ptr{Cvoid}(C_NULL),
@@ -123,10 +153,11 @@ function _cdata_fixture(
             null_count,
             offset,
             Int64(length(buffer_ptrs)),
-            Int64(0),
+            Int64(length(children)),
             isempty(buffer_ptrs) ? Ptr{Ptr{Cvoid}}(C_NULL) :
             Ptr{Ptr{Cvoid}}(pointer(buffer_ptrs)),
-            Ptr{Ptr{Arrow.ArrowArray}}(C_NULL),
+            isempty(children) ? Ptr{Ptr{Arrow.ArrowArray}}(C_NULL) :
+            Ptr{Ptr{Arrow.ArrowArray}}(pointer(array_ptrs)),
             Ptr{Arrow.ArrowArray}(C_NULL),
             _CDATA_RELEASE_ARRAY,
             Ptr{Cvoid}(C_NULL),
@@ -147,6 +178,8 @@ function _primitive_fixture(
     flags::Int64=0,
     offset::Int64=0,
     len::Int=length(data) - Int(offset),
+    name=nothing,
+    metadata=nothing,
 ) where {T}
     roots = Any[data]
     buffers = Ptr{Cvoid}[
@@ -154,8 +187,16 @@ function _primitive_fixture(
         isempty(data) ? Ptr{Cvoid}(C_NULL) : Ptr{Cvoid}(pointer(data)),
     ]
     validity !== nothing && push!(roots, validity)
-    fixture =
-        _cdata_fixture(fmt, len, buffers; flags=flags, null_count=null_count, offset=offset)
+    fixture = _cdata_fixture(
+        fmt,
+        len,
+        buffers;
+        name=name,
+        metadata=metadata,
+        flags=flags,
+        null_count=null_count,
+        offset=offset,
+    )
     append!(fixture.roots, roots)
     return fixture
 end
@@ -307,6 +348,198 @@ end
         @test validity.null_count == 0
     end
 
+    @testset "struct root table with names and metadata" begin
+        xchild =
+            _primitive_fixture("i", Int32[1, 2, 3]; name="x", metadata=Dict("unit" => "id"))
+        ychild = _primitive_fixture("g", Float64[1.5, 2.5, 3.5]; name="y")
+        root = _cdata_fixture(
+            "+s",
+            3,
+            Ptr{Cvoid}[C_NULL];
+            children=[xchild, ychild],
+            metadata=Dict("source" => "cdata"),
+        )
+        tbl = Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
+        @test Tables.columnnames(tbl) == [:x, :y]
+        @test Tables.schema(tbl).types == (Int32, Float64)
+        @test length(tbl) == 2
+        @test Tables.rowcount(tbl) == 3
+        @test Tables.istable(typeof(tbl))
+        @test Tables.columnaccess(typeof(tbl))
+        @test Tables.columns(tbl) === tbl
+        @test propertynames(tbl) == (:x, :y)
+        @test :rowcount in propertynames(tbl, true)
+        @test tbl.rowcount == 3
+        @test collect(Tables.getcolumn(tbl, :x)) == Int32[1, 2, 3]
+        @test collect(Tables.getcolumn(tbl, 1)) == Int32[1, 2, 3]
+        @test collect(tbl[1]) == Int32[1, 2, 3]
+        @test collect(tbl.y) == [1.5, 2.5, 3.5]
+        @test copy(tbl) == (x=Int32[1, 2, 3], y=[1.5, 2.5, 3.5])
+        @test DataAPI.metadatasupport(typeof(tbl)) == (read=true, write=false)
+        @test DataAPI.colmetadatasupport(typeof(tbl)) == (read=true, write=false)
+        @test Dict(Arrow.getmetadata(tbl)) == Dict("source" => "cdata")
+        @test DataAPI.metadata(tbl) == Dict("source" => "cdata")
+        @test DataAPI.metadata(tbl, "source") == "cdata"
+        @test DataAPI.metadata(tbl, "source", "fallback"; style=true) == ("cdata", :default)
+        @test DataAPI.metadata(tbl, "missing", "fallback") == "fallback"
+        @test Set(DataAPI.metadatakeys(tbl)) == Set(["source"])
+        @test DataAPI.colmetadata(tbl, :x, "unit") == "id"
+        @test DataAPI.colmetadata(tbl, :x, "unit", "fallback"; style=true) ==
+              ("id", :default)
+        @test DataAPI.colmetadata(tbl, :x, "missing", "fallback") == "fallback"
+        @test Set(DataAPI.colmetadatakeys(tbl, :x)) == Set(["unit"])
+        colkeys = collect(DataAPI.colmetadatakeys(tbl))
+        @test length(colkeys) == 1
+        @test first(colkeys[1]) == :x
+        @test Set(last(colkeys[1])) == Set(["unit"])
+        @test DataAPI.colmetadata(tbl) == Dict(:x => Dict("unit" => "id"))
+
+        col = Tables.getcolumn(tbl, :x)
+        GC.gc(true)
+        @test collect(col) == Int32[1, 2, 3]
+        # deepcopy detaches the table and its columns from the producer.
+        @test deepcopy(tbl).x == Int32[1, 2, 3]
+    end
+
+    @testset "nested struct columns" begin
+        child_validity = UInt8[0b00011101]
+        xchild = _primitive_fixture(
+            "i",
+            Int32[10, 20, 30, 40, 50];
+            validity=child_validity,
+            null_count=Int64(1),
+            flags=Arrow.ARROW_FLAG_NULLABLE,
+            name="x",
+        )
+        struct_validity = UInt8[0b00011011]
+        nested = _cdata_fixture(
+            "+s",
+            5,
+            Ptr{Cvoid}[Ptr{Cvoid}(pointer(struct_validity))];
+            name="point",
+            children=[xchild],
+            metadata=Dict("shape" => "point"),
+            null_count=Int64(1),
+            flags=Arrow.ARROW_FLAG_NULLABLE,
+        )
+        push!(nested.roots, struct_validity)
+        T = NamedTuple{(:x,),Tuple{Union{Int32,Missing}}}
+
+        parent_validity = UInt8[0b00001111]
+        root = _cdata_fixture(
+            "+s",
+            5,
+            Ptr{Cvoid}[Ptr{Cvoid}(pointer(parent_validity))];
+            children=[nested],
+            null_count=Int64(1),
+            flags=Arrow.ARROW_FLAG_NULLABLE,
+        )
+        push!(root.roots, parent_validity)
+        tbl = Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
+        col = Tables.getcolumn(tbl, :point)
+        @test eltype(col) == Union{T,Missing}
+        @test Arrow.nullcount(col) == 2
+        @test Dict(Arrow.getmetadata(col)) == Dict("shape" => "point")
+        @test isequal(
+            collect(col),
+            Union{T,Missing}[(x=10,), (x=missing,), missing, (x=40,), missing],
+        )
+
+        root =
+            _cdata_fixture("+s", 3, Ptr{Cvoid}[C_NULL]; offset=Int64(1), children=[nested])
+        tbl = Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
+        col = Tables.getcolumn(tbl, :point)
+        @test Tables.schema(tbl).types == (Union{T,Missing},)
+        @test isequal(collect(col), Union{T,Missing}[(x=missing,), missing, (x=40,)])
+
+        collected = collect(col)
+        copied = copy(col)
+        detached = deepcopy(col)
+        Arrow.release_c_data(col)
+        @test root.array[].release == C_NULL
+        @test root.schema[].release == C_NULL
+        @test nested.array[].release != C_NULL
+        @test nested.schema[].release != C_NULL
+        @test_throws ArgumentError col[1]
+        @test isequal(collected, Union{T,Missing}[(x=missing,), missing, (x=40,)])
+        @test isequal(copied, Union{T,Missing}[(x=missing,), missing, (x=40,)])
+        # The deepcopied column is detached and outlives the release.
+        @test isequal(collect(detached), collected)
+    end
+
+    @testset "struct table offsets and owner roots" begin
+        child = _primitive_fixture("i", Int32[10, 20, 30]; name="x")
+        root =
+            _cdata_fixture("+s", 2, Ptr{Cvoid}[C_NULL]; offset=Int64(1), children=[child])
+        tbl = Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
+        @test collect(Tables.getcolumn(tbl, :x)) == Int32[20, 30]
+
+        col = let
+            child2 = _primitive_fixture("i", Int32[10, 20, 30]; name="x")
+            root2 = _cdata_fixture(
+                "+s",
+                2,
+                Ptr{Cvoid}[C_NULL];
+                offset=Int64(1),
+                children=[child2],
+            )
+            tbl2 = Arrow.from_c_data(_schema_ptr(root2), _array_ptr(root2))
+            Tables.getcolumn(tbl2, :x)
+        end
+        GC.gc(true)
+        GC.gc(true)
+        @test collect(col) == Int32[20, 30]
+        Arrow.release_c_data(col)
+
+        child = _primitive_fixture("i", Int32[10, 20, 30]; offset=Int64(1), len=2, name="x")
+        root =
+            _cdata_fixture("+s", 2, Ptr{Cvoid}[C_NULL]; offset=Int64(1), children=[child])
+        @test_throws ArgumentError Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
+    end
+
+    @testset "struct parent validity masks children" begin
+        child_validity = UInt8[0b00001011]
+        parent_validity = UInt8[0b00001101]
+        child = _primitive_fixture(
+            "i",
+            Int32[1, 2, 3, 4];
+            validity=child_validity,
+            null_count=Int64(1),
+            flags=Arrow.ARROW_FLAG_NULLABLE,
+            name="x",
+        )
+        root = _cdata_fixture(
+            "+s",
+            4,
+            Ptr{Cvoid}[Ptr{Cvoid}(pointer(parent_validity))];
+            children=[child],
+            null_count=Int64(1),
+            flags=Arrow.ARROW_FLAG_NULLABLE,
+        )
+        push!(root.roots, parent_validity)
+        tbl = Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
+        col = Tables.getcolumn(tbl, :x)
+        @test Tables.schema(tbl).types == (Union{Int32,Missing},)
+        @test Arrow.nullcount(col) == 2
+        @test isequal(collect(col), Union{Int32,Missing}[1, missing, missing, 4])
+        @test isequal(copy(tbl), (x=Union{Int32,Missing}[1, missing, missing, 4],))
+
+        parent_validity = UInt8[0b00000010]
+        child = _primitive_fixture("i", Int32[10, 20, 30]; name="x")
+        root = _cdata_fixture(
+            "+s",
+            2,
+            Ptr{Cvoid}[Ptr{Cvoid}(pointer(parent_validity))];
+            offset=Int64(1),
+            children=[child],
+            null_count=Int64(1),
+            flags=Arrow.ARROW_FLAG_NULLABLE,
+        )
+        push!(root.roots, parent_validity)
+        tbl = Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
+        @test isequal(collect(Tables.getcolumn(tbl, :x)), Union{Int32,Missing}[20, missing])
+    end
+
     @testset "release behavior" begin
         f = _primitive_fixture("i", Int32[1, 2, 3])
         x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
@@ -401,6 +634,18 @@ end
             Ptr{Arrow.ArrowSchema}(C_NULL),
             Ptr{Arrow.ArrowArray}(C_NULL),
         )
+    end
+
+    @testset "table release behavior" begin
+        child = _primitive_fixture("i", Int32[1, 2, 3]; name="x")
+        root = _cdata_fixture("+s", 3, Ptr{Cvoid}[C_NULL]; children=[child])
+        tbl = Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
+        col = Tables.getcolumn(tbl, :x)
+        @test col[1] == 1
+        Arrow.release_c_data(tbl)
+        @test_nowarn Arrow.release_c_data(tbl)
+        @test_throws ArgumentError Tables.getcolumn(tbl, :x)
+        @test_throws ArgumentError col[1]
     end
 
     @testset "copy and collect own the result" begin
@@ -545,7 +790,44 @@ end
         # offset * sizeof(T) data bytes, like arrow-rs and nanoarrow.
         bad(_cdata_fixture("i", 0, Ptr{Cvoid}[C_NULL, C_NULL]; offset=Int64(1)))
 
-        # A primitive format must reject children.
+        for words in (Int32[1, -1], Int32[1, 0, -1])
+            bytes = reinterpret(UInt8, words)
+            f = _primitive_fixture("i", Int32[1])
+            _set_schema!(f; metadata=Cstring(pointer(bytes)))
+            append!(f.roots, Any[words, bytes])
+            bad(f)
+        end
+
+        function bad_child(schema_ptr, array_ptr, child)
+            schema_children = Ptr{Arrow.ArrowSchema}[schema_ptr]
+            array_children = Ptr{Arrow.ArrowArray}[array_ptr]
+            root = _cdata_fixture("+s", 1, Ptr{Cvoid}[C_NULL])
+            _set_schema!(
+                root;
+                n_children=1,
+                children=Ptr{Ptr{Arrow.ArrowSchema}}(pointer(schema_children)),
+            )
+            _set_array!(
+                root;
+                n_children=1,
+                children=Ptr{Ptr{Arrow.ArrowArray}}(pointer(array_children)),
+            )
+            append!(root.roots, Any[child, schema_children, array_children])
+            bad(root)
+        end
+
+        child = _primitive_fixture("i", Int32[1])
+        bad_child(Ptr{Arrow.ArrowSchema}(C_NULL), _array_ptr(child), child)
+        bad_child(_schema_ptr(child), Ptr{Arrow.ArrowArray}(C_NULL), child)
+
+        child = _primitive_fixture("i", Int32[1])
+        _set_schema!(child; release=C_NULL)
+        bad_child(_schema_ptr(child), _array_ptr(child), child)
+
+        child = _primitive_fixture("i", Int32[1])
+        _set_array!(child; release=C_NULL)
+        bad_child(_schema_ptr(child), _array_ptr(child), child)
+
         child = _primitive_fixture("i", Int32[1])
         f = _primitive_fixture("i", Int32[1])
         schema_children = Ptr{Arrow.ArrowSchema}[_schema_ptr(child)]
@@ -562,6 +844,20 @@ end
         )
         append!(f.roots, Any[child, schema_children, array_children])
         bad(f)
+
+        # Duplicate struct field names cannot build a table or NamedTuple rows.
+        a = _primitive_fixture("i", Int32[1]; name="dup")
+        b = _primitive_fixture("i", Int32[1]; name="dup")
+        bad(_cdata_fixture("+s", 1, Ptr{Cvoid}[C_NULL]; children=[a, b]))
+
+        # Aliased child pointers cannot make validation explode combinatorially.
+        c = _cdata_fixture("+s", 1, Ptr{Cvoid}[C_NULL])
+        selfs = Ptr{Arrow.ArrowSchema}[_schema_ptr(c), _schema_ptr(c)]
+        selfa = Ptr{Arrow.ArrowArray}[_array_ptr(c), _array_ptr(c)]
+        _set_schema!(c; n_children=2, children=Ptr{Ptr{Arrow.ArrowSchema}}(pointer(selfs)))
+        _set_array!(c; n_children=2, children=Ptr{Ptr{Arrow.ArrowArray}}(pointer(selfa)))
+        append!(c.roots, Any[selfs, selfa])
+        bad(_cdata_fixture("+s", 1, Ptr{Cvoid}[C_NULL]; children=[c]))
 
         f = _primitive_fixture("i", Int32[1])
         dict_schema = Ref(f.schema[])
@@ -588,5 +884,11 @@ end
         _set_schema!(f; format=Cstring(pointer(fmt)))
         push!(f.roots, fmt)
         bad(f)
+
+        child = _primitive_fixture("i", Int32[])
+        for _ = 1:Arrow._CDATA_MAX_DEPTH
+            child = _cdata_fixture("+s", 0, Ptr{Cvoid}[C_NULL]; children=[child])
+        end
+        bad(child)
     end
 end
