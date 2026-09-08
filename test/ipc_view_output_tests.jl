@@ -42,6 +42,24 @@ function fixture()
     return StringVector{Union{Missing,ArrowString}}(payloads, buffers)
 end
 
+function packedfixture()
+    first, second = "first selected long string", "second selected long string"
+    raw = collect(codeunits(first * second * UNUSED))
+    p = ArrowStrings.view_payload(raw, 1, ncodeunits(first), 0, 0)
+    q = ArrowStrings.view_payload(
+        raw,
+        ncodeunits(first) + 1,
+        ncodeunits(second),
+        0,
+        ncodeunits(first),
+    )
+    inline = ArrowStrings.inline_payload(codeunits("ok"), 1, 2)
+    return StringVector{Union{Missing,ArrowString}}(
+        [p, q, p, ArrowStrings.PAYLOAD_MISSING, inline],
+        [raw],
+    )
+end
+
 function checkoutput(bytes, expected, ndata; file, compress)
     @test isequal(Arrow.Table(bytes).s, expected)
     decoded = file ? Arrow.readfile(bytes) : Arrow.readstream(bytes)
@@ -204,6 +222,131 @@ end
             # Boolean indexing is independent of the encoder's sorted-range
             # union and offset-remapping algorithm.
             @test [AC.slicebytes(b) for b in d.buffers[3:end]] == [buffers[i][used[i]] for i = 1:3 if any(used[i])]
+        end
+    end
+
+    @testset "covered prefixes and gaps preserve the byte boundary" begin
+        # Include interleaved buffers, contained/extended overlaps, a late
+        # gap, a gap filled by a later row, and a wholly unused buffer.
+        cases = [
+            [(0, 0, 20), (1, 0, 18), (0, 8, 24), (1, 10, 22), (0, 0, 13), (0, 32, 32)],
+            [(0, 0, 20), (1, 0, 18), (0, 32, 32)],
+            [(0, 0, 20), (1, 0, 18), (0, 32, 32), (0, 20, 20)],
+            [(1, 0, 18), (1, 10, 22)],
+        ]
+        for ranges in cases, utf8 in (true, false)
+            buffers = [
+                vcat(repeat(collect(codeunits("abcdefgh")), 8), codeunits(UNUSED)),
+                vcat(repeat(collect(codeunits("ijklmnop")), 8), codeunits(UNUSED)),
+            ]
+            utf8 || (buffers[1][1] = 0xff)
+            used = [falses(length(b)) for b in buffers]
+            payloads = ArrowStringPayload[]
+            expected = Any[]
+            for (bufidx, off, len) in ranges
+                raw = buffers[bufidx + 1]
+                push!(payloads, ArrowStrings.view_payload(raw, off + 1, len, bufidx, off))
+                used[bufidx + 1][(off + 1):(off + len)] .= true
+                value = raw[(off + 1):(off + len)]
+                push!(expected, utf8 ? String(value) : value)
+            end
+            # A null entry contains a valid-looking reference to unused
+            # bytes. It must neither extend coverage nor survive as bytes.
+            push!(
+                payloads,
+                ArrowStrings.view_payload(buffers[1], 65, ncodeunits(UNUSED), 0, 64),
+            )
+            push!(expected, missing)
+            push!(payloads, ArrowStrings.inline_payload(codeunits("ok"), 1, 2))
+            push!(expected, utf8 ? "ok" : collect(codeunits("ok")))
+            n = length(payloads)
+            entries = collect(reinterpret(UInt8, payloads))
+            entries[(16 * (n - 1) + 7):(16 * n)] .= 0x5a
+            append!(entries, codeunits("TRAILING_UNUSED_ENTRIES"))
+            # Exercise an unaligned entry buffer and a nonzero slice base
+            # for data. BufferSlice bounds, not owner allocation size, apply.
+            borrowed = vcat(UInt8[0xaa], entries)
+            data = [
+                AC.subslice(AC._databuffer(vcat(UInt8[0xaa], b)), 1, length(b)) for
+                b in buffers
+            ]
+            validity = fill(0xff, cld(n, 8) + 1)
+            validity[(n - 2) ÷ 8 + 1] &= ~(UInt8(1) << ((n - 2) % 8))
+            t = AC.ViewType(utf8)
+            f = AC.Field("s", t; nullable=true)
+            d = AC.ArrayData(
+                t,
+                n,
+                [
+                    AC._databuffer(validity),
+                    AC.subslice(AC._databuffer(borrowed), 1, length(entries)),
+                    data...,
+                ];
+                nullcount=1,
+            )
+            sch = AC.Schema([f])
+            batch = AC.RecordBatch(sch, [d])
+            original = [AC.slicebytes(b) for b in d.buffers]
+            for file in (true, false), compress in (:none, :lz4, :zstd)
+                bytes =
+                    file ? Arrow.writefile(sch, [batch]; compress=compress) :
+                    Arrow.writestream(sch, [batch]; compress=compress)
+                decoded = file ? Arrow.readfile(bytes) : Arrow.readstream(bytes)
+                out = (file ? decoded[1] : decoded.batches[1]).columns[1]
+                @test AC.validate_full(f, out) === out
+                @test isequal(Arrow.Table(bytes).s, expected)
+                @test [AC.slicebytes(b) for b in out.buffers[3:end]] == [buffers[i][used[i]] for i = 1:2 if any(used[i])]
+                outentries = AC.slicebytes(out.buffers[2])
+                @test length(outentries) == 16 * n
+                @test all(iszero, outentries[(16 * (n - 2) + 1):(16 * (n - 1))])
+                @test all(iszero, outentries[(16 * (n - 1) + 7):(16 * n)])
+                @test all(
+                    b -> findfirst(codeunits(UNUSED), AC.slicebytes(b)) === nothing,
+                    out.buffers,
+                )
+                @test isequal([AC.isvalid_at(out, i) for i = 1:n], [i != n - 1 for i = 1:n])
+            end
+            @test [AC.slicebytes(b) for b in d.buffers] == original
+        end
+    end
+
+    @testset "covered dictionary pools retain unreferenced values" begin
+        col = packedfixture()
+        f, parts = Arrow._constructcolumn(:s, AbstractVector[col])
+        pool = only(parts)
+        t = AC.DictionaryType(AC.IntType(8, true), f.type, true)
+        df = AC.Field("s", t; nullable=false)
+        indices = Int8[0, 0, 4]
+        d = AC.ArrayData(
+            t,
+            3,
+            [AC.BufferSlice(), AC._databuffer(indices)];
+            dictionary=pool,
+            nullcount=0,
+        )
+        sch = AC.Schema([df])
+        expectedpool = [
+            "first selected long string",
+            "second selected long string",
+            "first selected long string",
+            missing,
+            "ok",
+        ]
+        for file in (true, false), compress in (:none, :lz4, :zstd)
+            bytes =
+                file ? Arrow.writefile(sch, [AC.RecordBatch(sch, [d])]; compress=compress) :
+                Arrow.writestream(sch, [AC.RecordBatch(sch, [d])]; compress=compress)
+            decoded = file ? Arrow.readfile(bytes) : Arrow.readstream(bytes)
+            out = (file ? decoded[1] : decoded.batches[1]).columns[1]
+            @test Arrow.Table(bytes).s ==
+                  ["first selected long string", "first selected long string", "ok"]
+            @test decoded.schema.fields[1].type == t
+            @test AC.slicebytes(out.buffers[2]) == reinterpret(UInt8, indices)
+            @test out.dictionary.len == 5
+            @test isequal(AC.materialize(f, out.dictionary), expectedpool)
+            @test length(out.dictionary.buffers) == 3
+            @test AC.slicebytes(out.dictionary.buffers[3]) ==
+                  codeunits(expectedpool[1] * expectedpool[2])
         end
     end
 
