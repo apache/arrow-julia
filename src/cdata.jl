@@ -69,12 +69,24 @@ const _CDATA_MAX_NAME_BYTES = 1 << 16
 const _CDATA_MAX_METADATA_PAIRS = 4096
 const _CDATA_MAX_METADATA_BYTES = 1 << 20
 const _CDATA_MAX_METADATA_FIELD_BYTES = 1 << 20
+const _CDATA_MAX_FIXED_SIZE = 4096
 
 abstract type CDataFormat end
 
 struct CDataNullFormat <: CDataFormat end
+struct CDataBoolFormat <: CDataFormat end
 struct CDataPrimitiveFormat <: CDataFormat
     storage::Type
+end
+struct CDataBinaryFormat{O} <: CDataFormat
+    juliatype::Type
+end
+struct CDataFixedSizeBinaryFormat <: CDataFormat
+    bytewidth::Int
+end
+struct CDataListFormat{O} <: CDataFormat end
+struct CDataFixedSizeListFormat <: CDataFormat
+    listsize::Int
 end
 struct CDataStructFormat <: CDataFormat end
 
@@ -123,10 +135,58 @@ struct CDataPrimitive{T,S,A<:AbstractVector{S}} <: CDataVector{T}
     metadata::Union{Nothing,Base.ImmutableDict{String,String}}
 end
 
-struct CDataStruct{T,S,names} <: CDataVector{T}
+struct CDataBool{T} <: CDataVector{T}
+    owner::CDataOwner
+    validity::CDataValidity
+    data::Vector{UInt8}
+    bitoffset::Int
+    len::Int
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
+end
+
+struct CDataBinary{T,O,A<:AbstractVector{O}} <: CDataVector{T}
+    owner::CDataOwner
+    validity::CDataValidity
+    offsets::A
+    data::Vector{UInt8}
+    len::Int
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
+end
+
+struct CDataFixedSizeBinary{T} <: CDataVector{T}
+    owner::CDataOwner
+    validity::CDataValidity
+    data::Vector{UInt8}
+    bytewidth::Int
+    len::Int
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
+end
+
+struct CDataList{T,O,A<:AbstractVector{O},C<:AbstractVector} <: CDataVector{T}
+    owner::CDataOwner
+    validity::CDataValidity
+    offsets::A
+    data::C
+    len::Int
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
+end
+
+struct CDataFixedSizeList{T,C<:AbstractVector} <: CDataVector{T}
+    owner::CDataOwner
+    validity::CDataValidity
+    data::C
+    listsize::Int
+    offset::Int
+    len::Int
+    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
+end
+
+struct CDataStruct{T,S,fnames} <: CDataVector{T}
     owner::CDataOwner
     validity::CDataValidity
     data::S
+    offset::Int
+    len::Int
     metadata::Union{Nothing,Base.ImmutableDict{String,String}}
 end
 
@@ -168,7 +228,12 @@ Base.IndexStyle(::Type{<:CDataVector}) = Base.IndexLinear()
 
 Base.size(x::CDataNull) = (x.len,)
 Base.size(x::CDataPrimitive) = size(x.data)
-Base.size(x::CDataStruct) = (x.validity.len,)
+Base.size(x::CDataBool) = (x.len,)
+Base.size(x::CDataBinary) = (x.len,)
+Base.size(x::CDataFixedSizeBinary) = (x.len,)
+Base.size(x::CDataList) = (x.len,)
+Base.size(x::CDataFixedSizeList) = (x.len,)
+Base.size(x::CDataStruct) = (x.len,)
 Base.size(x::CDataSlice) = (x.len,)
 Base.size(x::CDataMasked) = size(x.parent)
 Base.length(t::CDataTable) = length(getfield(t, :columns))
@@ -269,16 +334,91 @@ end
     end
 end
 
-@propagate_inbounds function Base.getindex(
-    x::CDataStruct{T,S,names},
-    i::Integer,
-) where {T,S,names}
+@propagate_inbounds function Base.getindex(x::CDataBool{T}, i::Integer) where {T}
     return _with_live(x) do
         @boundscheck checkbounds(x, i)
-        !_valid(x.validity, i) && return missing
+        if !_valid(x.validity, i)
+            return missing
+        end
+        pos = x.bitoffset + Int(i) - 1
+        byte = @inbounds x.data[(pos >>> 3) + 1]
+        return ArrowTypes.fromarrow(T, getbit(byte, (pos & 0x07) + 1))
+    end
+end
+
+@propagate_inbounds function Base.getindex(x::CDataBinary{T}, i::Integer) where {T}
+    return _with_live(x) do
+        @boundscheck checkbounds(x, i)
+        if !_valid(x.validity, i)
+            return missing
+        end
+        lo = Int(@inbounds x.offsets[i]) + 1
+        hi = Int(@inbounds x.offsets[i + 1])
+        n = hi - lo + 1
+        if n == 0
+            return ArrowTypes.fromarrow(T, "")
+        end
+        data = x.data
+        owner = _owner(x)
+        GC.@preserve x data owner begin
+            return ArrowTypes.fromarrow(T, pointer(data, lo), n)
+        end
+    end
+end
+
+@propagate_inbounds function Base.getindex(x::CDataFixedSizeBinary{T}, i::Integer) where {T}
+    return _with_live(x) do
+        @boundscheck checkbounds(x, i)
+        if !_valid(x.validity, i)
+            return missing
+        end
+        offset = (Int(i) - 1) * x.bytewidth
+        tup = ntuple(j -> @inbounds(x.data[offset + j]), x.bytewidth)
+        return ArrowTypes.fromarrow(T, tup)
+    end
+end
+
+@propagate_inbounds function Base.getindex(x::CDataList{T}, i::Integer) where {T}
+    return _with_live(x) do
+        @boundscheck checkbounds(x, i)
+        if !_valid(x.validity, i)
+            return missing
+        end
+        lo = Int(@inbounds x.offsets[i]) + 1
+        hi = Int(@inbounds x.offsets[i + 1])
+        return ArrowTypes.fromarrow(T, @view x.data[lo:hi])
+    end
+end
+
+@propagate_inbounds function Base.getindex(x::CDataFixedSizeList{T}, i::Integer) where {T}
+    return _with_live(x) do
+        @boundscheck checkbounds(x, i)
+        if !_valid(x.validity, i)
+            return missing
+        end
+        offset = (x.offset + Int(i) - 1) * x.listsize
+        tup = ntuple(j -> @inbounds(x.data[offset + j]), x.listsize)
+        return ArrowTypes.fromarrow(T, tup)
+    end
+end
+
+@propagate_inbounds function Base.getindex(
+    x::CDataStruct{T,S,fnames},
+    i::Integer,
+) where {T,S,fnames}
+    return _with_live(x) do
+        @boundscheck checkbounds(x, i)
+        if !_valid(x.validity, i)
+            return missing
+        end
+        j = x.offset + Int(i)
+        vals = ntuple(k -> @inbounds(x.data[k][j]), fieldcount(S))
         NT = Base.nonmissingtype(T)
-        vals = ntuple(j -> @inbounds(x.data[j][i]), fieldcount(S))
-        return NT(vals)
+        if isnamedtuple(NT) || istuple(NT)
+            return ArrowTypes.fromarrow(T, NT(vals))
+        else
+            return ArrowTypes.fromarrow(T, _fromarrowstruct(NT, Val{fnames}(), vals...))
+        end
     end
 end
 
@@ -565,6 +705,7 @@ end
 
 function _parse_c_data_format(format::AbstractString)
     format == "n" && return CDataNullFormat()
+    format == "b" && return CDataBoolFormat()
     format == "c" && return CDataPrimitiveFormat(Int8)
     format == "C" && return CDataPrimitiveFormat(UInt8)
     format == "s" && return CDataPrimitiveFormat(Int16)
@@ -576,16 +717,112 @@ function _parse_c_data_format(format::AbstractString)
     format == "e" && return CDataPrimitiveFormat(Float16)
     format == "f" && return CDataPrimitiveFormat(Float32)
     format == "g" && return CDataPrimitiveFormat(Float64)
+    format == "z" && return CDataBinaryFormat{Int32}(Base.CodeUnits)
+    format == "Z" && return CDataBinaryFormat{Int64}(Base.CodeUnits)
+    format == "u" && return CDataBinaryFormat{Int32}(String)
+    format == "U" && return CDataBinaryFormat{Int64}(String)
+    format == "+l" && return CDataListFormat{Int32}()
+    format == "+L" && return CDataListFormat{Int64}()
     format == "+s" && return CDataStructFormat()
+    format == "tdD" && return CDataPrimitiveFormat(Date{Meta.DateUnit.DAY,Int32})
+    format == "tdm" && return CDataPrimitiveFormat(Date{Meta.DateUnit.MILLISECOND,Int64})
+    format == "tts" && return CDataPrimitiveFormat(Time{Meta.TimeUnit.SECOND,Int32})
+    format == "ttm" && return CDataPrimitiveFormat(Time{Meta.TimeUnit.MILLISECOND,Int32})
+    format == "ttu" && return CDataPrimitiveFormat(Time{Meta.TimeUnit.MICROSECOND,Int64})
+    format == "ttn" && return CDataPrimitiveFormat(Time{Meta.TimeUnit.NANOSECOND,Int64})
+    format == "tDs" && return CDataPrimitiveFormat(Duration{Meta.TimeUnit.SECOND})
+    format == "tDm" && return CDataPrimitiveFormat(Duration{Meta.TimeUnit.MILLISECOND})
+    format == "tDu" && return CDataPrimitiveFormat(Duration{Meta.TimeUnit.MICROSECOND})
+    format == "tDn" && return CDataPrimitiveFormat(Duration{Meta.TimeUnit.NANOSECOND})
+    format == "tiM" &&
+        return CDataPrimitiveFormat(Interval{Meta.IntervalUnit.YEAR_MONTH,Int32})
+    format == "tiD" &&
+        return CDataPrimitiveFormat(Interval{Meta.IntervalUnit.DAY_TIME,Int64})
+    if startswith(format, "ts")
+        return CDataPrimitiveFormat(_parse_timestamp_format(format))
+    elseif startswith(format, "d:")
+        return CDataPrimitiveFormat(_parse_decimal_format(format))
+    elseif startswith(format, "w:")
+        return CDataFixedSizeBinaryFormat(
+            _parse_positive_int(format[3:end], format, _CDATA_MAX_FIXED_SIZE),
+        )
+    elseif startswith(format, "+w:")
+        return CDataFixedSizeListFormat(
+            _parse_positive_int(format[4:end], format, _CDATA_MAX_FIXED_SIZE),
+        )
+    end
     throw(ArgumentError("unsupported Arrow C Data format string: $format"))
 end
 
+function _parse_positive_int(s, format, max_value::Int=typemax(Int))
+    n = try
+        parse(Int, s)
+    catch
+        throw(ArgumentError("invalid Arrow C Data format string: $format"))
+    end
+    n <= 0 && throw(ArgumentError("invalid Arrow C Data format string: $format"))
+    n > max_value &&
+        throw(ArgumentError("Arrow C Data format size exceeds the import limit: $format"))
+    return n
+end
+
+function _parse_timestamp_format(format)
+    length(format) >= 4 ||
+        throw(ArgumentError("invalid Arrow C Data format string: $format"))
+    format[4] == ':' || throw(ArgumentError("invalid Arrow C Data format string: $format"))
+    unit = format[3]
+    U =
+        unit == 's' ? Meta.TimeUnit.SECOND :
+        unit == 'm' ? Meta.TimeUnit.MILLISECOND :
+        unit == 'u' ? Meta.TimeUnit.MICROSECOND :
+        unit == 'n' ? Meta.TimeUnit.NANOSECOND :
+        throw(ArgumentError("invalid Arrow C Data timestamp unit: $format"))
+    tz = length(format) == 4 ? nothing : Symbol(format[5:end])
+    return Timestamp{U,tz}
+end
+
+function _parse_decimal_format(format)
+    parts = split(format[3:end], ',')
+    2 <= length(parts) <= 3 ||
+        throw(ArgumentError("invalid Arrow C Data decimal format: $format"))
+    precision = _parse_int_field(parts[1], "decimal precision", format)
+    scale = _parse_int_field(parts[2], "decimal scale", format)
+    bitwidth =
+        length(parts) == 3 ? _parse_int_field(parts[3], "decimal bit width", format) : 128
+    precision > 0 || throw(ArgumentError("decimal precision must be positive"))
+    if bitwidth == 128
+        return Decimal{precision,scale,Int128}
+    elseif bitwidth == 256
+        return Decimal{precision,scale,Int256}
+    else
+        throw(ArgumentError("unsupported decimal bit width: $bitwidth"))
+    end
+end
+
+function _parse_int_field(s, field, format)
+    try
+        return parse(Int, s)
+    catch
+        throw(ArgumentError("invalid Arrow C Data $field: $format"))
+    end
+end
+
 _expected_buffers(::CDataNullFormat) = 0
+_expected_buffers(::CDataBoolFormat) = 2
 _expected_buffers(::CDataPrimitiveFormat) = 2
+_expected_buffers(::CDataBinaryFormat) = 3
+_expected_buffers(::CDataFixedSizeBinaryFormat) = 2
+_expected_buffers(::CDataListFormat) = 2
+_expected_buffers(::CDataFixedSizeListFormat) = 1
 _expected_buffers(::CDataStructFormat) = 1
 
 _expected_children(::CDataNullFormat) = 0
+_expected_children(::CDataBoolFormat) = 0
 _expected_children(::CDataPrimitiveFormat) = 0
+_expected_children(::CDataBinaryFormat) = 0
+_expected_children(::CDataFixedSizeBinaryFormat) = 0
+_expected_children(::CDataListFormat) = 1
+_expected_children(::CDataFixedSizeListFormat) = 1
 _expected_children(::CDataStructFormat) = nothing
 
 function _nullable(schema::ArrowSchema, null_count::Int)
@@ -844,12 +1081,20 @@ function _validate_layout(node::CDataNode)
     return
 end
 
+function _aligned(ptr::Ptr{Cvoid}, ::Type{T}) where {T}
+    return UInt(ptr) % Base.datatype_alignment(T) == 0
+end
+
 function _validate_data_layout(::CDataNullFormat, node::CDataNode, total::Int)
     return
 end
 
-function _aligned(ptr::Ptr{Cvoid}, ::Type{T}) where {T}
-    return UInt(ptr) % Base.datatype_alignment(T) == 0
+function _validate_data_layout(::CDataBoolFormat, node::CDataNode, total::Int)
+    nbytes = cld(total, 8)
+    nbytes > 0 &&
+        node.buffers[2] == C_NULL &&
+        throw(ArgumentError("boolean data buffer is NULL"))
+    return
 end
 
 function _validate_data_layout(format::CDataPrimitiveFormat, node::CDataNode, total::Int)
@@ -860,12 +1105,142 @@ function _validate_data_layout(format::CDataPrimitiveFormat, node::CDataNode, to
     return
 end
 
+function _validate_data_layout(
+    format::CDataFixedSizeBinaryFormat,
+    node::CDataNode,
+    total::Int,
+)
+    nbytes = _checked_mul(total, format.bytewidth, "fixed size binary byte count")
+    nbytes > 0 &&
+        node.buffers[2] == C_NULL &&
+        throw(ArgumentError("fixed size binary data buffer is NULL"))
+    return
+end
+
+function _validate_data_layout(
+    format::CDataBinaryFormat{O},
+    node::CDataNode,
+    total::Int,
+) where {O}
+    node.buffers[2] == C_NULL && throw(ArgumentError("offset buffer is NULL"))
+    first, last = _validate_offsets(Ptr{O}(node.buffers[2]), node.offset, node.len)
+    last < first && throw(ArgumentError("offsets are not monotonic"))
+    last > first && node.buffers[3] == C_NULL && throw(ArgumentError("data buffer is NULL"))
+    format.juliatype === String && _validate_utf8_offsets(
+        Ptr{O}(node.buffers[2]),
+        node.offset,
+        node.len,
+        node.buffers[3],
+        first,
+        last,
+    )
+    return
+end
+
+function _validate_data_layout(
+    format::CDataListFormat{O},
+    node::CDataNode,
+    total::Int,
+) where {O}
+    node.buffers[2] == C_NULL && throw(ArgumentError("offset buffer is NULL"))
+    first, last = _validate_offsets(Ptr{O}(node.buffers[2]), node.offset, node.len)
+    last < first && throw(ArgumentError("offsets are not monotonic"))
+    child = node.children[1]
+    last <= child.len || throw(ArgumentError("list offset exceeds child length"))
+    return
+end
+
+function _validate_data_layout(
+    format::CDataFixedSizeListFormat,
+    node::CDataNode,
+    total::Int,
+)
+    required = _checked_mul(total, format.listsize, "fixed size list child length")
+    node.children[1].len >= required ||
+        throw(ArgumentError("fixed size list child is too short"))
+    return
+end
+
 function _validate_data_layout(::CDataStructFormat, node::CDataNode, total::Int)
     # Per the Arrow C Data Interface spec, struct children must cover length + offset.
     for child in node.children
         child.len >= total || throw(ArgumentError("struct child is too short"))
     end
     return
+end
+
+function _validate_offsets(ptr::Ptr{O}, offset::Int, len::Int) where {O}
+    last_index = _checked_add(_checked_add(offset, len, "offset index"), 1, "offset index")
+    _checked_mul(last_index, sizeof(O), "offset buffer byte count")
+    _checked_mul(offset, sizeof(O), "offset buffer byte offset")
+    first = _offset_to_int(_unsafe_load_offset(ptr, offset + 1), "offset")
+    prev = first
+    for i = (offset + 2):last_index
+        cur = _offset_to_int(_unsafe_load_offset(ptr, i), "offset")
+        cur < prev && throw(ArgumentError("offsets are not monotonic"))
+        prev = cur
+    end
+    return first, prev
+end
+
+@inline function _unsafe_load_int64(p::Ptr{UInt8})
+    b1 = UInt64(unsafe_load(p, 1))
+    b2 = UInt64(unsafe_load(p, 2))
+    b3 = UInt64(unsafe_load(p, 3))
+    b4 = UInt64(unsafe_load(p, 4))
+    b5 = UInt64(unsafe_load(p, 5))
+    b6 = UInt64(unsafe_load(p, 6))
+    b7 = UInt64(unsafe_load(p, 7))
+    b8 = UInt64(unsafe_load(p, 8))
+    u =
+        ENDIAN_BOM == 0x04030201 ?
+        b1 | (b2 << 8) | (b3 << 16) | (b4 << 24) | (b5 << 32) | (b6 << 40) | (b7 << 48) |
+        (b8 << 56) :
+        ENDIAN_BOM == 0x01020304 ?
+        (b1 << 56) | (b2 << 48) | (b3 << 40) | (b4 << 32) | (b5 << 24) | (b6 << 16) |
+        (b7 << 8) | b8 : error("unsupported host byte order")
+    return reinterpret(Int64, u)
+end
+
+@inline function _unsafe_load_offset(ptr::Ptr{Int32}, i::Int)
+    return _unsafe_load_int32(
+        Ptr{UInt8}(ptr) + _checked_mul(i - 1, sizeof(Int32), "offset byte index"),
+    )
+end
+
+@inline function _unsafe_load_offset(ptr::Ptr{Int64}, i::Int)
+    return _unsafe_load_int64(
+        Ptr{UInt8}(ptr) + _checked_mul(i - 1, sizeof(Int64), "offset byte index"),
+    )
+end
+
+function _validate_utf8_offsets(
+    ptr::Ptr{O},
+    offset::Int,
+    len::Int,
+    data_ptr::Ptr{Cvoid},
+    first::Int,
+    last::Int,
+) where {O}
+    last == first && return
+    bytes = unsafe_wrap(Array, Ptr{UInt8}(data_ptr), last; own=false)
+    prev = _offset_to_int(_unsafe_load_offset(ptr, offset + 1), "offset")
+    for i = (offset + 2):(offset + len + 1)
+        cur = _offset_to_int(_unsafe_load_offset(ptr, i), "offset")
+        if cur > prev
+            if !isvalid(String, @view bytes[(prev + 1):cur])
+                throw(ArgumentError("UTF-8 data is invalid"))
+            end
+        end
+        prev = cur
+    end
+    return
+end
+
+function _offset_to_int(x, name)
+    x < 0 && throw(ArgumentError("$name is negative"))
+    x > typemax(Int) && throw(ArgumentError("$name exceeds the Julia Int range"))
+    return Int(x)
 end
 
 function _make_validity(node::CDataNode)
@@ -905,6 +1280,10 @@ function _wrap_data(ptr::Ptr{Cvoid}, ::Type{T}, offset::Int, len::Int) where {T}
     !_aligned(ptr, T) && return _copy_aligned_data(ptr, T, offset, len)
     p = Ptr{T}(ptr) + _checked_mul(offset, sizeof(T), "data buffer byte offset")
     return unsafe_wrap(Array, p, len; own=false)
+end
+
+function _wrap_offsets(ptr::Ptr{Cvoid}, ::Type{T}, offset::Int, len::Int) where {T}
+    return _wrap_data(ptr, T, offset, len)
 end
 
 function _import_node(node::CDataNode, owner::CDataOwner, convert::Bool)
@@ -951,9 +1330,113 @@ function _struct_columns(node::CDataNode, owner::CDataOwner, convert::Bool)
     return Tuple(names), Tuple(columns)
 end
 
-function _struct_type(schema::ArrowSchema, validity::CDataValidity, data, names)
-    NT = NamedTuple{names,Tuple{(eltype(x) for x in data)...}}
-    return _nullable(schema, validity.null_count) ? Union{NT,Missing} : NT
+function _import_node(::CDataBoolFormat, node::CDataNode, owner::CDataOwner, convert::Bool)
+    validity = _make_validity(node)
+    nullable = _nullable(node.schema, validity.null_count)
+    T = nullable ? Union{Bool,Missing} : Bool
+    nbytes = cld(_checked_add(node.offset, node.len, "boolean bitmap length"), 8)
+    data =
+        nbytes == 0 ? UInt8[] :
+        unsafe_wrap(Array, Ptr{UInt8}(node.buffers[2]), nbytes; own=false)
+    return CDataBool{T}(owner, validity, data, node.offset, node.len, node.metadata)
+end
+
+function _import_node(
+    format::CDataBinaryFormat{O},
+    node::CDataNode,
+    owner::CDataOwner,
+    convert::Bool,
+) where {O}
+    validity = _make_validity(node)
+    nullable = _nullable(node.schema, validity.null_count)
+    T = nullable ? Union{format.juliatype,Missing} : format.juliatype
+    offsets = _wrap_offsets(node.buffers[2], O, node.offset, node.len + 1)
+    data_len = offsets[end] == offsets[1] ? 0 : Int(offsets[end])
+    data =
+        data_len == 0 ? UInt8[] :
+        unsafe_wrap(Array, Ptr{UInt8}(node.buffers[3]), data_len; own=false)
+    return CDataBinary{T,O,typeof(offsets)}(
+        owner,
+        validity,
+        offsets,
+        data,
+        node.len,
+        node.metadata,
+    )
+end
+
+function _import_node(
+    format::CDataFixedSizeBinaryFormat,
+    node::CDataNode,
+    owner::CDataOwner,
+    convert::Bool,
+)
+    validity = _make_validity(node)
+    nullable = _nullable(node.schema, validity.null_count)
+    storage = NTuple{format.bytewidth,UInt8}
+    T = nullable ? Union{storage,Missing} : storage
+    nbytes = _checked_mul(node.len, format.bytewidth, "fixed size binary byte count")
+    data =
+        nbytes == 0 ? UInt8[] :
+        unsafe_wrap(
+            Array,
+            Ptr{UInt8}(node.buffers[2]) +
+            _checked_mul(node.offset, format.bytewidth, "fixed size binary byte offset"),
+            nbytes;
+            own=false,
+        )
+    return CDataFixedSizeBinary{T}(
+        owner,
+        validity,
+        data,
+        format.bytewidth,
+        node.len,
+        node.metadata,
+    )
+end
+
+function _import_node(
+    format::CDataListFormat{O},
+    node::CDataNode,
+    owner::CDataOwner,
+    convert::Bool,
+) where {O}
+    validity = _make_validity(node)
+    child = _import_node(node.children[1], owner, convert)
+    nullable = _nullable(node.schema, validity.null_count)
+    storage = Vector{eltype(child)}
+    T = nullable ? Union{storage,Missing} : storage
+    offsets = _wrap_offsets(node.buffers[2], O, node.offset, node.len + 1)
+    return CDataList{T,O,typeof(offsets),typeof(child)}(
+        owner,
+        validity,
+        offsets,
+        child,
+        node.len,
+        node.metadata,
+    )
+end
+
+function _import_node(
+    format::CDataFixedSizeListFormat,
+    node::CDataNode,
+    owner::CDataOwner,
+    convert::Bool,
+)
+    validity = _make_validity(node)
+    child = _import_node(node.children[1], owner, convert)
+    nullable = _nullable(node.schema, validity.null_count)
+    storage = NTuple{format.listsize,eltype(child)}
+    T = nullable ? Union{storage,Missing} : storage
+    return CDataFixedSizeList{T,typeof(child)}(
+        owner,
+        validity,
+        child,
+        format.listsize,
+        node.offset,
+        node.len,
+        node.metadata,
+    )
 end
 
 function _import_node(
@@ -963,9 +1446,23 @@ function _import_node(
     convert::Bool,
 )
     validity = _make_validity(node)
-    names, data = _struct_columns(node, owner, convert)
-    T = _struct_type(node.schema, validity, data, names)
-    return CDataStruct{T,typeof(data),names}(owner, validity, data, node.metadata)
+    children = Tuple(_import_node(child, owner, convert) for child in node.children)
+    names = Tuple(
+        Symbol(child.name === nothing ? "f$(i)" : child.name) for
+        (i, child) in enumerate(node.children)
+    )
+    types = Tuple(eltype(child) for child in children)
+    storage = NamedTuple{names,Tuple{types...}}
+    nullable = _nullable(node.schema, validity.null_count)
+    T = nullable ? Union{storage,Missing} : storage
+    return CDataStruct{T,typeof(children),names}(
+        owner,
+        validity,
+        children,
+        node.offset,
+        node.len,
+        node.metadata,
+    )
 end
 
 function _slice_for_table(child::CDataVector, offset::Int, len::Int)

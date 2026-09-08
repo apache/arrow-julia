@@ -55,6 +55,8 @@ function _cdata_release_array(ptr::Ptr{Arrow.ArrowArray})
     return
 end
 
+using Dates
+
 const _CDATA_RELEASE_SCHEMA =
     @cfunction(_cdata_release_schema, Cvoid, (Ptr{Arrow.ArrowSchema},))
 const _CDATA_RELEASE_ARRAY =
@@ -348,10 +350,243 @@ end
         @test validity.null_count == 0
     end
 
+    @testset "bool bit offsets" begin
+        data = UInt8[0b10110110]
+        validity = UInt8[0xff]
+        f = _cdata_fixture(
+            "b",
+            5,
+            Ptr{Cvoid}[Ptr{Cvoid}(pointer(validity)), Ptr{Cvoid}(pointer(data))];
+            offset=Int64(3),
+        )
+        append!(f.roots, Any[data, validity])
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test collect(x) == [false, true, true, false, true]
+
+        validity = UInt8[0b00001101]
+        f = _cdata_fixture(
+            "b",
+            4,
+            Ptr{Cvoid}[Ptr{Cvoid}(pointer(validity)), Ptr{Cvoid}(pointer(data))];
+            flags=Arrow.ARROW_FLAG_NULLABLE,
+            null_count=Int64(-1),
+        )
+        append!(f.roots, Any[data, validity])
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test Arrow.nullcount(x) == 1
+        @test isequal(collect(x), Union{Bool,Missing}[false, missing, true, false])
+    end
+
+    @testset "string and binary arrays" begin
+        offsets = Int32[0, 3, 3, 6]
+        bytes = Vector{UInt8}(codeunits("abcdef"))
+        f = _cdata_fixture(
+            "u",
+            3,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets)), Ptr{Cvoid}(pointer(bytes))],
+        )
+        append!(f.roots, Any[offsets, bytes])
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test collect(x) == ["abc", "", "def"]
+        offsets[2] = 2
+        @test collect(x) == ["ab", "c", "def"]
+
+        offset_values = Int32[0, 1, 3]
+        offset_nbytes = length(offset_values) * sizeof(Int32)
+        offset_bytes = Vector{UInt8}(undef, offset_nbytes + 1)
+        unsafe_copyto!(
+            pointer(offset_bytes, 2),
+            Ptr{UInt8}(pointer(offset_values)),
+            offset_nbytes,
+        )
+        bytes = Vector{UInt8}(codeunits("abc"))
+        f = _cdata_fixture(
+            "u",
+            2,
+            Ptr{Cvoid}[
+                C_NULL,
+                Ptr{Cvoid}(pointer(offset_bytes, 2)),
+                Ptr{Cvoid}(pointer(bytes)),
+            ],
+        )
+        append!(f.roots, Any[offset_bytes, bytes])
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        fill!(offset_bytes, 0x00)
+        @test collect(x) == ["a", "bc"]
+
+        offsets64 = Int64[0, 2, 5]
+        bytes2 = Vector{UInt8}(codeunits("hello"))
+        f = _cdata_fixture(
+            "U",
+            2,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets64)), Ptr{Cvoid}(pointer(bytes2))],
+        )
+        append!(f.roots, Any[offsets64, bytes2])
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test collect(x) == ["he", "llo"]
+
+        bad_utf8 = UInt8[0xff]
+        offsets = Int32[0, 1]
+        f = _cdata_fixture(
+            "u",
+            1,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets)), Ptr{Cvoid}(pointer(bad_utf8))],
+        )
+        append!(f.roots, Any[offsets, bad_utf8])
+        @test_throws ArgumentError Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+
+        offsets = Int32[0, 2, 3]
+        bytes = UInt8[0x01, 0x02, 0xff]
+        f = _cdata_fixture(
+            "z",
+            2,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets)), Ptr{Cvoid}(pointer(bytes))],
+        )
+        append!(f.roots, Any[offsets, bytes])
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test collect(x) == [b"\x01\x02", b"\xff"]
+
+        offsets64 = Int64[0, 1, 3]
+        f = _cdata_fixture(
+            "Z",
+            2,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets64)), Ptr{Cvoid}(pointer(bytes))],
+        )
+        append!(f.roots, Any[offsets64, bytes])
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test collect(x) == [b"\x01", b"\x02\xff"]
+
+        offsets = Int32[123]
+        f = _cdata_fixture("u", 0, Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets)), C_NULL])
+        push!(f.roots, offsets)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test collect(x) == String[]
+
+        offsets = Int32[123, 123, 123]
+        f = _cdata_fixture("u", 2, Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets)), C_NULL])
+        push!(f.roots, offsets)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test collect(x) == ["", ""]
+
+        offsets = Int32[0, 1, 2, 3]
+        bytes = Vector{UInt8}(codeunits("abc"))
+        validity = UInt8[0b00000101]
+        f = _cdata_fixture(
+            "u",
+            3,
+            Ptr{Cvoid}[
+                Ptr{Cvoid}(pointer(validity)),
+                Ptr{Cvoid}(pointer(offsets)),
+                Ptr{Cvoid}(pointer(bytes)),
+            ];
+            flags=Arrow.ARROW_FLAG_NULLABLE,
+            null_count=Int64(-1),
+        )
+        append!(f.roots, Any[offsets, bytes, validity])
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        y = copy(x)
+        Arrow.release_c_data(x)
+        @test isequal(y, Union{String,Missing}["a", missing, "c"])
+        @test_throws ArgumentError x[1]
+    end
+
+    @testset "fixed size binary" begin
+        data = UInt8[0x01, 0x02, 0x03, 0x04, 0x05, 0x06]
+        f = _cdata_fixture("w:3", 2, Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(data))])
+        push!(f.roots, data)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test collect(x) == [(0x01, 0x02, 0x03), (0x04, 0x05, 0x06)]
+    end
+
+    @testset "list of primitives" begin
+        child = _primitive_fixture("i", Int32[1, 2, 3, 4, 5])
+        offsets = Int32[0, 2, 5]
+        f = _cdata_fixture(
+            "+l",
+            2,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets))];
+            children=[child],
+        )
+        push!(f.roots, offsets)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test collect(x) == [Int32[1, 2], Int32[3, 4, 5]]
+
+        child = _primitive_fixture("i", Int32[10, 20, 30, 40, 50, 60])
+        offsets = Int64[0, 1, 3, 6]
+        f = _cdata_fixture(
+            "+L",
+            2,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets))];
+            offset=Int64(1),
+            children=[child],
+        )
+        push!(f.roots, offsets)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test collect(x) == [Int32[20, 30], Int32[40, 50, 60]]
+
+        child = _primitive_fixture("i", Int32[10, 20, 30])
+        offset_values = Int64[0, 1, 3]
+        offset_nbytes = length(offset_values) * sizeof(Int64)
+        offset_bytes = Vector{UInt8}(undef, offset_nbytes + 1)
+        unsafe_copyto!(
+            pointer(offset_bytes, 2),
+            Ptr{UInt8}(pointer(offset_values)),
+            offset_nbytes,
+        )
+        f = _cdata_fixture(
+            "+L",
+            2,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offset_bytes, 2))];
+            children=[child],
+        )
+        push!(f.roots, offset_bytes)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        fill!(offset_bytes, 0x00)
+        @test collect(x) == [Int32[10], Int32[20, 30]]
+
+        child = _primitive_fixture("i", Int32[1, 2, 3, 4, 5])
+        offsets = Int32[0, 2, 2, 5]
+        validity = UInt8[0b00000101]
+        f = _cdata_fixture(
+            "+l",
+            3,
+            Ptr{Cvoid}[Ptr{Cvoid}(pointer(validity)), Ptr{Cvoid}(pointer(offsets))];
+            flags=Arrow.ARROW_FLAG_NULLABLE,
+            null_count=Int64(-1),
+            children=[child],
+        )
+        append!(f.roots, Any[offsets, validity])
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        @test isequal(
+            collect(x),
+            Union{Vector{Int32},Missing}[Int32[1, 2], missing, Int32[3, 4, 5]],
+        )
+    end
+
+    @testset "fixed size list" begin
+        child = _primitive_fixture("f", Float32[1, 2, 3, 4, 5, 6])
+        f = _cdata_fixture("+w:3", 2, Ptr{Cvoid}[C_NULL]; children=[child])
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f); convert=false)
+        @test collect(x) == [(1.0f0, 2.0f0, 3.0f0), (4.0f0, 5.0f0, 6.0f0)]
+
+        child = _primitive_fixture("i", Int32[1, 2, 3, 4, 5, 6, 7, 8, 9])
+        f = _cdata_fixture("+w:3", 2, Ptr{Cvoid}[C_NULL]; offset=Int64(1), children=[child])
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f); convert=false)
+        @test collect(x) == [(Int32(4), Int32(5), Int32(6)), (Int32(7), Int32(8), Int32(9))]
+    end
+
     @testset "struct root table with names and metadata" begin
         xchild =
             _primitive_fixture("i", Int32[1, 2, 3]; name="x", metadata=Dict("unit" => "id"))
-        ychild = _primitive_fixture("g", Float64[1.5, 2.5, 3.5]; name="y")
+        yoffsets = Int32[0, 1, 2, 3]
+        ybytes = Vector{UInt8}(codeunits("abc"))
+        ychild = _cdata_fixture(
+            "u",
+            3,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(yoffsets)), Ptr{Cvoid}(pointer(ybytes))];
+            name="y",
+        )
+        append!(ychild.roots, Any[yoffsets, ybytes])
         root = _cdata_fixture(
             "+s",
             3,
@@ -361,7 +596,7 @@ end
         )
         tbl = Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
         @test Tables.columnnames(tbl) == [:x, :y]
-        @test Tables.schema(tbl).types == (Int32, Float64)
+        @test Tables.schema(tbl).types == (Int32, String)
         @test length(tbl) == 2
         @test Tables.rowcount(tbl) == 3
         @test Tables.istable(typeof(tbl))
@@ -373,8 +608,8 @@ end
         @test collect(Tables.getcolumn(tbl, :x)) == Int32[1, 2, 3]
         @test collect(Tables.getcolumn(tbl, 1)) == Int32[1, 2, 3]
         @test collect(tbl[1]) == Int32[1, 2, 3]
-        @test collect(tbl.y) == [1.5, 2.5, 3.5]
-        @test copy(tbl) == (x=Int32[1, 2, 3], y=[1.5, 2.5, 3.5])
+        @test collect(tbl.y) == ["a", "b", "c"]
+        @test copy(tbl) == (x=Int32[1, 2, 3], y=["a", "b", "c"])
         @test DataAPI.metadatasupport(typeof(tbl)) == (read=true, write=false)
         @test DataAPI.colmetadatasupport(typeof(tbl)) == (read=true, write=false)
         @test Dict(Arrow.getmetadata(tbl)) == Dict("source" => "cdata")
@@ -393,6 +628,27 @@ end
         @test first(colkeys[1]) == :x
         @test Set(last(colkeys[1])) == Set(["unit"])
         @test DataAPI.colmetadata(tbl) == Dict(:x => Dict("unit" => "id"))
+
+        a = _primitive_fixture("i", Int32[1, 2, 3]; name="a")
+        b = _primitive_fixture("i", Int32[4, 5, 6]; name="b")
+        pair = _cdata_fixture("+s", 3, Ptr{Cvoid}[C_NULL]; name="pair", children=[a, b])
+        root = _cdata_fixture("+s", 3, Ptr{Cvoid}[C_NULL]; children=[pair])
+        pair_tbl = Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
+        @test collect(pair_tbl.pair) == [(a=1, b=4), (a=2, b=5), (a=3, b=6)]
+
+        shortmeta_child =
+            _primitive_fixture("i", Int32[1]; name="x", metadata=Dict("k" => "v"))
+        shortmeta_root = _cdata_fixture(
+            "+s",
+            1,
+            Ptr{Cvoid}[C_NULL];
+            children=[shortmeta_child],
+            metadata=Dict("x" => "yz"),
+        )
+        shortmeta_tbl =
+            Arrow.from_c_data(_schema_ptr(shortmeta_root), _array_ptr(shortmeta_root))
+        @test DataAPI.metadata(shortmeta_tbl, "x") == "yz"
+        @test DataAPI.colmetadata(shortmeta_tbl, :x, "k") == "v"
 
         col = Tables.getcolumn(tbl, :x)
         GC.gc(true)
@@ -538,6 +794,47 @@ end
         push!(root.roots, parent_validity)
         tbl = Arrow.from_c_data(_schema_ptr(root), _array_ptr(root))
         @test isequal(collect(Tables.getcolumn(tbl, :x)), Union{Int32,Missing}[20, missing])
+    end
+
+    @testset "temporal and decimal formats" begin
+        dates = Arrow.DATE[Arrow.DATE(1), Arrow.DATE(2)]
+        f = _primitive_fixture("tdD", dates)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f); convert=false)
+        @test collect(x) == dates
+        f = _primitive_fixture("tdD", dates)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f); convert=true)
+        @test collect(x) == convert.(Dates.Date, dates)
+
+        D = Arrow.Decimal{10,2,Int128}
+        decimals = D[D(123), D(-45)]
+        f = _primitive_fixture("d:10,2", decimals)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f); convert=false)
+        @test collect(x) == decimals
+
+        timestamps = Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,nothing}[
+            Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,nothing}(0),
+            Arrow.Timestamp{Arrow.Meta.TimeUnit.MILLISECOND,nothing}(1),
+        ]
+        f = _primitive_fixture("tsm:", timestamps)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f); convert=true)
+        @test collect(x) ==
+              Dates.DateTime[Dates.DateTime(1970), Dates.DateTime(1970, 1, 1, 0, 0, 0, 1)]
+
+        durations = Arrow.Duration{Arrow.Meta.TimeUnit.SECOND}[
+            Arrow.Duration{Arrow.Meta.TimeUnit.SECOND}(1),
+            Arrow.Duration{Arrow.Meta.TimeUnit.SECOND}(2),
+        ]
+        f = _primitive_fixture("tDs", durations)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f); convert=true)
+        @test collect(x) == Dates.Second[Dates.Second(1), Dates.Second(2)]
+
+        intervals = Arrow.Interval{Arrow.Meta.IntervalUnit.YEAR_MONTH,Int32}[
+            Arrow.Interval{Arrow.Meta.IntervalUnit.YEAR_MONTH}(12),
+            Arrow.Interval{Arrow.Meta.IntervalUnit.YEAR_MONTH}(18),
+        ]
+        f = _primitive_fixture("tiM", intervals)
+        x = Arrow.from_c_data(_schema_ptr(f), _array_ptr(f); convert=false)
+        @test collect(x) == intervals
     end
 
     @testset "release behavior" begin
@@ -782,6 +1079,73 @@ end
             bad(f)
         end
 
+        child = _primitive_fixture("i", Int32[1])
+        f = _cdata_fixture("+l", 1, Ptr{Cvoid}[C_NULL, C_NULL]; children=[child])
+        bad(f)
+
+        child = _primitive_fixture("i", Int32[1, 2])
+        offsets = Int32[0, 3]
+        f = _cdata_fixture(
+            "+l",
+            1,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets))];
+            children=[child],
+        )
+        push!(f.roots, offsets)
+        bad(f)
+
+        child = _primitive_fixture("i", Int32[1, 2, 3, 4, 5])
+        f = _cdata_fixture("+w:3", 2, Ptr{Cvoid}[C_NULL]; children=[child])
+        bad(f)
+
+        offsets = Int32[0, 3, 2]
+        bytes = UInt8[1, 2, 3]
+        f = _cdata_fixture(
+            "z",
+            2,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets)), Ptr{Cvoid}(pointer(bytes))],
+        )
+        append!(f.roots, Any[offsets, bytes])
+        bad(f)
+
+        offsets = Int32[0, -1]
+        bytes = UInt8[]
+        f = _cdata_fixture(
+            "z",
+            1,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets)), Ptr{Cvoid}(C_NULL)],
+        )
+        append!(f.roots, Any[offsets, bytes])
+        bad(f)
+
+        offsets = Int32[0, 1]
+        bytes = UInt8[0x01]
+        f = _cdata_fixture(
+            "u",
+            1,
+            Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets)), Ptr{Cvoid}(pointer(bytes))];
+            flags=Arrow.ARROW_FLAG_NULLABLE,
+            null_count=Int64(-1),
+        )
+        append!(f.roots, Any[offsets, bytes])
+        bad(f)
+
+        badmeta = reinterpret(UInt8, Int32[1, -1])
+        f = _primitive_fixture("i", Int32[1])
+        f.schema[] = Arrow.ArrowSchema(
+            f.schema[].format,
+            f.schema[].name,
+            Cstring(pointer(badmeta)),
+            f.schema[].flags,
+            f.schema[].n_children,
+            f.schema[].children,
+            f.schema[].dictionary,
+            f.schema[].release,
+            f.schema[].private_data,
+        )
+        push!(f.roots, badmeta)
+        bad(f)
+
         for flags in (Arrow.ARROW_FLAG_DICTIONARY_ORDERED, Arrow.ARROW_FLAG_MAP_KEYS_SORTED)
             bad_primitive(f -> _set_schema!(f; flags=flags))
         end
@@ -885,9 +1249,34 @@ end
         push!(f.roots, fmt)
         bad(f)
 
+        for fmt in ("tsq:", "d:x,2", "d:10,2,64", "w:0", "+w:x")
+            f = _cdata_fixture(fmt, 0, Ptr{Cvoid}[C_NULL, C_NULL])
+            @test_throws ArgumentError Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+        end
+
+        f = _cdata_fixture(
+            "w:$(Arrow._CDATA_MAX_FIXED_SIZE + 1)",
+            0,
+            Ptr{Cvoid}[C_NULL, C_NULL],
+        )
+        @test_throws ArgumentError Arrow.from_c_data(_schema_ptr(f), _array_ptr(f))
+
         child = _primitive_fixture("i", Int32[])
         for _ = 1:Arrow._CDATA_MAX_DEPTH
             child = _cdata_fixture("+s", 0, Ptr{Cvoid}[C_NULL]; children=[child])
+        end
+        bad(child)
+
+        child = _primitive_fixture("i", Int32[])
+        for _ = 1:Arrow._CDATA_MAX_DEPTH
+            offsets = Int32[0]
+            child = _cdata_fixture(
+                "+l",
+                0,
+                Ptr{Cvoid}[C_NULL, Ptr{Cvoid}(pointer(offsets))];
+                children=[child],
+            )
+            push!(child.roots, offsets)
         end
         bad(child)
     end
