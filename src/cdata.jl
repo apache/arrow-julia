@@ -1571,3 +1571,639 @@ end
 
 from_c_data(schema_ptr::Ptr{Cvoid}, array_ptr::Ptr{Cvoid}; kw...) =
     from_c_data(Ptr{ArrowSchema}(schema_ptr), Ptr{ArrowArray}(array_ptr); kw...)
+
+mutable struct CDataExportSchemaOwner
+    refs::Vector{Ref{ArrowSchema}}
+    roots::Vector{Any}
+end
+
+mutable struct CDataExportArrayOwner
+    refs::Vector{Ref{ArrowArray}}
+    roots::Vector{Any}
+end
+
+const _CDATA_EXPORT_LOCK = ReentrantLock()
+const _CDATA_EXPORT_NEXT_TOKEN = Ref{UInt}(0)
+const _CDATA_EXPORT_SCHEMA_OWNERS = Dict{UInt,CDataExportSchemaOwner}()
+const _CDATA_EXPORT_ARRAY_OWNERS = Dict{UInt,CDataExportArrayOwner}()
+
+function _next_c_data_export_token()
+    lock(_CDATA_EXPORT_LOCK)
+    try
+        token = _CDATA_EXPORT_NEXT_TOKEN[] + UInt(1)
+        token == 0 && throw(ArgumentError("Arrow C Data export token overflowed"))
+        _CDATA_EXPORT_NEXT_TOKEN[] = token
+        return token
+    finally
+        unlock(_CDATA_EXPORT_LOCK)
+    end
+end
+
+function _release_exported_schema(ptr::Ptr{ArrowSchema})
+    ptr == C_NULL && return
+    schema = unsafe_load(ptr)
+    schema.release == C_NULL && return
+    for i = 1:schema.n_children
+        child = unsafe_load(schema.children, i)
+        if child != C_NULL
+            child_schema = unsafe_load(child)
+            if child_schema.release != C_NULL
+                ccall(child_schema.release, Cvoid, (Ptr{ArrowSchema},), child)
+            end
+        end
+    end
+    if schema.dictionary != C_NULL
+        dictionary = unsafe_load(schema.dictionary)
+        if dictionary.release != C_NULL
+            ccall(dictionary.release, Cvoid, (Ptr{ArrowSchema},), schema.dictionary)
+        end
+    end
+    token = UInt(schema.private_data)
+    owner = lock(_CDATA_EXPORT_LOCK) do
+        pop!(_CDATA_EXPORT_SCHEMA_OWNERS, token, nothing)
+    end
+    if owner === nothing
+        _clear_schema_release!(ptr)
+        return
+    end
+    _clear_schema_release!(ptr)
+    for ref in owner.refs
+        _clear_schema_release!(Base.unsafe_convert(Ptr{ArrowSchema}, ref))
+    end
+    empty!(owner.roots)
+    empty!(owner.refs)
+    return
+end
+
+function _release_exported_array(ptr::Ptr{ArrowArray})
+    ptr == C_NULL && return
+    array = unsafe_load(ptr)
+    array.release == C_NULL && return
+    for i = 1:array.n_children
+        child = unsafe_load(array.children, i)
+        if child != C_NULL
+            child_array = unsafe_load(child)
+            if child_array.release != C_NULL
+                ccall(child_array.release, Cvoid, (Ptr{ArrowArray},), child)
+            end
+        end
+    end
+    if array.dictionary != C_NULL
+        dictionary = unsafe_load(array.dictionary)
+        if dictionary.release != C_NULL
+            ccall(dictionary.release, Cvoid, (Ptr{ArrowArray},), array.dictionary)
+        end
+    end
+    token = UInt(array.private_data)
+    owner = lock(_CDATA_EXPORT_LOCK) do
+        pop!(_CDATA_EXPORT_ARRAY_OWNERS, token, nothing)
+    end
+    if owner === nothing
+        _clear_array_release!(ptr)
+        return
+    end
+    _clear_array_release!(ptr)
+    for ref in owner.refs
+        _clear_array_release!(Base.unsafe_convert(Ptr{ArrowArray}, ref))
+    end
+    empty!(owner.roots)
+    empty!(owner.refs)
+    return
+end
+
+global _CDATA_EXPORT_SCHEMA_RELEASE::Ptr{Cvoid} = C_NULL
+global _CDATA_EXPORT_ARRAY_RELEASE::Ptr{Cvoid} = C_NULL
+
+function _init_c_data_export_callbacks!()
+    global _CDATA_EXPORT_SCHEMA_RELEASE =
+        @cfunction(_release_exported_schema, Cvoid, (Ptr{ArrowSchema},))
+    global _CDATA_EXPORT_ARRAY_RELEASE =
+        @cfunction(_release_exported_array, Cvoid, (Ptr{ArrowArray},))
+    return
+end
+
+function _checked_int64(x::Integer, name)
+    x < 0 && throw(ArgumentError("$name must be nonnegative"))
+    x > typemax(Int64) && throw(ArgumentError("$name exceeds the Int64 range"))
+    return Int64(x)
+end
+
+function _primitive_c_data_format(::Type{T}) where {T}
+    T === Missing && return "n"
+    T === Bool && return "b"
+    T === Int8 && return "c"
+    T === UInt8 && return "C"
+    T === Int16 && return "s"
+    T === UInt16 && return "S"
+    T === Int32 && return "i"
+    T === UInt32 && return "I"
+    T === Int64 && return "l"
+    T === UInt64 && return "L"
+    T === Float16 && return "e"
+    T === Float32 && return "f"
+    T === Float64 && return "g"
+    T === Date{Meta.DateUnit.DAY,Int32} && return "tdD"
+    T === Date{Meta.DateUnit.MILLISECOND,Int64} && return "tdm"
+    T === Time{Meta.TimeUnit.SECOND,Int32} && return "tts"
+    T === Time{Meta.TimeUnit.MILLISECOND,Int32} && return "ttm"
+    T === Time{Meta.TimeUnit.MICROSECOND,Int64} && return "ttu"
+    T === Time{Meta.TimeUnit.NANOSECOND,Int64} && return "ttn"
+    T === Duration{Meta.TimeUnit.SECOND} && return "tDs"
+    T === Duration{Meta.TimeUnit.MILLISECOND} && return "tDm"
+    T === Duration{Meta.TimeUnit.MICROSECOND} && return "tDu"
+    T === Duration{Meta.TimeUnit.NANOSECOND} && return "tDn"
+    T === Interval{Meta.IntervalUnit.YEAR_MONTH,Int32} && return "tiM"
+    T === Interval{Meta.IntervalUnit.DAY_TIME,Int64} && return "tiD"
+    if T <: Timestamp
+        U = T.parameters[1]
+        TZ = T.parameters[2]
+        unit =
+            U === Meta.TimeUnit.SECOND ? "s" :
+            U === Meta.TimeUnit.MILLISECOND ? "m" :
+            U === Meta.TimeUnit.MICROSECOND ? "u" :
+            U === Meta.TimeUnit.NANOSECOND ? "n" :
+            throw(ArgumentError("unsupported Arrow timestamp unit for C Data export"))
+        tz = TZ === nothing ? "" : String(TZ)
+        return "ts$(unit):$(tz)"
+    elseif T <: Decimal
+        P = T.parameters[1]
+        S = T.parameters[2]
+        I = T.parameters[3]
+        I === Int128 && return "d:$(P),$(S),128"
+        I === Int256 && return "d:$(P),$(S),256"
+    end
+    throw(ArgumentError("unsupported Arrow C Data export type: $T"))
+end
+
+_c_data_format(::NullVector) = "n"
+_c_data_format(::BoolVector) = "b"
+_c_data_format(v::Primitive) = _primitive_c_data_format(Base.nonmissingtype(eltype(v)))
+
+function _c_data_format(v::List{T,Int32}) where {T}
+    S = Base.nonmissingtype(T)
+    liststringtype(v) && return S <: AbstractString ? "u" : "z"
+    return "+l"
+end
+
+function _c_data_format(v::List{T,Int64}) where {T}
+    S = Base.nonmissingtype(T)
+    liststringtype(v) && return S <: AbstractString ? "U" : "Z"
+    return "+L"
+end
+
+function _fixed_size_width(v::FixedSizeList{T}) where {T}
+    S = Base.nonmissingtype(T)
+    K = ArrowTypes.ArrowKind(ArrowTypes.ArrowType(S))
+    return ArrowTypes.getsize(K)
+end
+
+_is_fixed_size_binary(v::FixedSizeList) = eltype(v.data) === UInt8
+
+function _c_data_format(v::FixedSizeList)
+    n = _fixed_size_width(v)
+    return _is_fixed_size_binary(v) ? "w:$(n)" : "+w:$(n)"
+end
+
+_c_data_format(::Struct) = "+s"
+
+function _c_data_format(v::ArrowVector)
+    throw(ArgumentError("unsupported Arrow C Data export array type: $(typeof(v))"))
+end
+
+_c_data_children(::ArrowVector) = ()
+_c_data_children(v::List) = liststringtype(v) ? () : (v.data,)
+_c_data_children(v::FixedSizeList) = _is_fixed_size_binary(v) ? () : (v.data,)
+_c_data_children(v::Struct) = v.data
+
+_c_data_child_name(::ArrowVector, i::Integer) = ""
+function _c_data_child_name(v::Struct, i::Integer)
+    names = fieldnames(Base.nonmissingtype(eltype(v)))
+    return i <= length(names) ? String(names[i]) : "f$(i)"
+end
+
+function _assert_c_data_export_supported(v::ArrowVector)
+    if v isa Compressed
+        throw(
+            ArgumentError(
+                "compressed Arrow arrays cannot be exported through the C Data Interface",
+            ),
+        )
+    elseif v isa DictEncoded
+        throw(ArgumentError("dictionary encoded Arrow C Data export is not supported"))
+    elseif v isa Map
+        throw(ArgumentError("map Arrow C Data export is not supported"))
+    elseif v isa Union{DenseUnion,SparseUnion}
+        throw(ArgumentError("union Arrow C Data export is not supported"))
+    end
+    _c_data_format(v)
+    for child in _c_data_children(v)
+        _assert_c_data_export_supported(child)
+    end
+    return
+end
+
+function _metadata_to_c_data(meta)
+    meta === nothing && return UInt8[]
+    isempty(meta) && return UInt8[]
+    length(meta) > _CDATA_MAX_METADATA_PAIRS &&
+        throw(ArgumentError("Arrow C Data metadata has too many pairs"))
+    total = 4
+    io = IOBuffer()
+    Base.write(io, Int32(length(meta)))
+    for (k, v) in meta
+        key = codeunits(String(k))
+        val = codeunits(String(v))
+        length(key) > _CDATA_MAX_METADATA_FIELD_BYTES &&
+            throw(ArgumentError("Arrow C Data metadata key is too large"))
+        total = _checked_add(total, 4, "metadata byte count")
+        total = _checked_add(total, length(key), "metadata byte count")
+        total > _CDATA_MAX_METADATA_BYTES &&
+            throw(ArgumentError("Arrow C Data metadata byte count exceeds the limit"))
+        length(val) > _CDATA_MAX_METADATA_FIELD_BYTES &&
+            throw(ArgumentError("Arrow C Data metadata value is too large"))
+        total = _checked_add(total, 4, "metadata byte count")
+        total = _checked_add(total, length(val), "metadata byte count")
+        total > _CDATA_MAX_METADATA_BYTES &&
+            throw(ArgumentError("Arrow C Data metadata byte count exceeds the limit"))
+        Base.write(io, Int32(length(key)))
+        Base.write(io, key)
+        Base.write(io, Int32(length(val)))
+        Base.write(io, val)
+    end
+    return take!(io)
+end
+
+function _export_cstring(s::AbstractString, roots::Vector{Any})
+    bytes = Vector{UInt8}(s * "\0")
+    push!(roots, bytes)
+    return GC.@preserve bytes begin
+        Cstring(pointer(bytes))
+    end
+end
+
+function _export_metadata(meta, roots::Vector{Any})
+    bytes = _metadata_to_c_data(meta)
+    isempty(bytes) && return Cstring(C_NULL)
+    push!(roots, bytes)
+    return GC.@preserve bytes begin
+        Cstring(pointer(bytes))
+    end
+end
+
+function _schema_flags(v::ArrowVector)
+    flags = Int64(0)
+    if eltype(v) >: Missing || v isa NullVector
+        flags |= ARROW_FLAG_NULLABLE
+    end
+    return flags
+end
+
+function _make_c_data_child_schemas!(v::ArrowVector, owner::CDataExportSchemaOwner)
+    children = _c_data_children(v)
+    isempty(children) && return Int64(0), Ptr{Ptr{ArrowSchema}}(C_NULL)
+    ptrs = Ptr{ArrowSchema}[]
+    try
+        for (i, child) in enumerate(children)
+            ref = _make_c_data_schema(child, _c_data_child_name(v, i))
+            push!(ptrs, Base.unsafe_convert(Ptr{ArrowSchema}, ref))
+        end
+    catch
+        # Release children built before the failure so their owners do not leak.
+        foreach(_release_exported_schema, ptrs)
+        rethrow()
+    end
+    push!(owner.roots, ptrs)
+    return GC.@preserve ptrs begin
+        Int64(length(ptrs)), Ptr{Ptr{ArrowSchema}}(pointer(ptrs))
+    end
+end
+
+function _fill_c_data_schema!(
+    ref::Ref{ArrowSchema},
+    v::ArrowVector,
+    name::AbstractString,
+    token::UInt,
+    owner::CDataExportSchemaOwner,
+)
+    push!(owner.refs, ref)
+    format = _export_cstring(_c_data_format(v), owner.roots)
+    field_name = _export_cstring(String(name), owner.roots)
+    metadata = _export_metadata(getmetadata(v), owner.roots)
+    n_children, children = _make_c_data_child_schemas!(v, owner)
+    ref[] = ArrowSchema(
+        format,
+        field_name,
+        metadata,
+        _schema_flags(v),
+        n_children,
+        children,
+        Ptr{ArrowSchema}(C_NULL),
+        _CDATA_EXPORT_SCHEMA_RELEASE,
+        Ptr{Cvoid}(token),
+    )
+    return ref
+end
+
+function _make_c_data_schema(v::ArrowVector, name::AbstractString)
+    token = _next_c_data_export_token()
+    owner = CDataExportSchemaOwner(Ref{ArrowSchema}[], Any[])
+    ref = Ref{ArrowSchema}()
+    _fill_c_data_schema!(ref, v, name, token, owner)
+    _store_c_data_schema_owner!(token, owner)
+    return ref
+end
+
+function _store_c_data_schema_owner!(token::UInt, owner::CDataExportSchemaOwner)
+    lock(_CDATA_EXPORT_LOCK)
+    try
+        _CDATA_EXPORT_SCHEMA_OWNERS[token] = owner
+        return
+    finally
+        unlock(_CDATA_EXPORT_LOCK)
+    end
+end
+
+function _validity_ptr(v::ArrowVector, roots::Vector{Any})
+    validity = validitybitmap(v)
+    validity.nc == 0 && return Ptr{Cvoid}(C_NULL)
+    validity.nc > 0 || throw(ArgumentError("validity null count is invalid"))
+    len = length(v)
+    validity.nc <= len || throw(ArgumentError("validity null count exceeds array length"))
+    validity.ℓ >= len || throw(ArgumentError("validity bitmap length is too short"))
+    isempty(validity.bytes) && throw(ArgumentError("validity bitmap is empty"))
+    nbytes = cld(len, 8)
+    nbytes > 0 || throw(ArgumentError("validity bitmap is empty"))
+    bytes = validity.bytes
+    _check_export_range(validity.pos, nbytes, length(bytes), "validity bitmap")
+    push!(roots, bytes)
+    return GC.@preserve bytes begin
+        Ptr{Cvoid}(pointer(bytes, validity.pos))
+    end
+end
+
+_validity_ptr(::NullVector, roots::Vector{Any}) = Ptr{Cvoid}(C_NULL)
+
+function _materialized_vector(x, ::Type{T}) where {T}
+    x isa Vector{T} && return x
+    return collect(T, x)
+end
+
+function _optional_data_ptr(x::AbstractVector, roots::Vector{Any})
+    isempty(x) && return Ptr{Cvoid}(C_NULL)
+    push!(roots, x)
+    return GC.@preserve x begin
+        Ptr{Cvoid}(pointer(x))
+    end
+end
+
+function _required_data_ptr(x::AbstractVector, roots::Vector{Any}, name)
+    isempty(x) && throw(ArgumentError("$name is empty"))
+    push!(roots, x)
+    return GC.@preserve x begin
+        Ptr{Cvoid}(pointer(x))
+    end
+end
+
+function _buffer_array_ptr(buffers::Vector{Ptr{Cvoid}}, roots::Vector{Any})
+    isempty(buffers) && return Int64(0), Ptr{Ptr{Cvoid}}(C_NULL)
+    push!(roots, buffers)
+    return GC.@preserve buffers begin
+        Int64(length(buffers)), Ptr{Ptr{Cvoid}}(pointer(buffers))
+    end
+end
+
+function _check_export_range(pos::Int, n::Int, len::Int, name)
+    pos > 0 || throw(ArgumentError("$name position is invalid"))
+    n >= 0 || throw(ArgumentError("$name length is invalid"))
+    pos <= len || throw(ArgumentError("$name is too short"))
+    n <= len - pos + 1 || throw(ArgumentError("$name is too short"))
+    return
+end
+
+function _validate_offsets_for_export(offsets::AbstractVector, len::Int, name)
+    len >= 0 || throw(ArgumentError("$name length is invalid"))
+    count = _checked_add(len, 1, "$name offset count")
+    length(offsets) >= count ||
+        throw(ArgumentError("$name must contain length + 1 offsets"))
+    prev = offsets[1]
+    prev < 0 && throw(ArgumentError("$name contains a negative offset"))
+    prev > typemax(Int) && throw(ArgumentError("$name offset exceeds the Julia Int range"))
+    for i = 2:count
+        cur = offsets[i]
+        cur < 0 && throw(ArgumentError("$name contains a negative offset"))
+        cur > typemax(Int) &&
+            throw(ArgumentError("$name offset exceeds the Julia Int range"))
+        cur < prev && throw(ArgumentError("$name is not monotonic"))
+        prev = cur
+    end
+    return Int(prev)
+end
+
+function _primitive_buffers(v::Primitive, roots::Vector{Any})
+    T = Base.nonmissingtype(eltype(v))
+    data = _materialized_vector(v.data, T)
+    length(data) >= length(v) || throw(ArgumentError("primitive data buffer is too short"))
+    buffers = Ptr{Cvoid}[_validity_ptr(v, roots), _optional_data_ptr(data, roots)]
+    return _buffer_array_ptr(buffers, roots)
+end
+
+function _bool_buffers(v::BoolVector, roots::Vector{Any})
+    data_bytes = cld(length(v), 8)
+    if data_bytes > 0
+        _check_export_range(v.pos, data_bytes, length(v.arrow), "boolean data buffer")
+    end
+    data_ptr = if data_bytes == 0
+        Ptr{Cvoid}(C_NULL)
+    else
+        bytes = v.arrow
+        push!(roots, bytes)
+        GC.@preserve bytes begin
+            Ptr{Cvoid}(pointer(bytes, v.pos))
+        end
+    end
+    buffers = Ptr{Cvoid}[_validity_ptr(v, roots), data_ptr]
+    return _buffer_array_ptr(buffers, roots)
+end
+
+function _list_buffers(v::List{T,O}, roots::Vector{Any}) where {T,O}
+    offsets = _materialized_vector(v.offsets.offsets, O)
+    last = _validate_offsets_for_export(offsets, length(v), "list offset buffer")
+    offset_ptr = _required_data_ptr(offsets, roots, "list offset buffer")
+    if liststringtype(v)
+        data = _materialized_vector(v.data, UInt8)
+        last <= length(data) ||
+            throw(ArgumentError("list offset exceeds data buffer length"))
+        buffers =
+            Ptr{Cvoid}[_validity_ptr(v, roots), offset_ptr, _optional_data_ptr(data, roots)]
+    else
+        child = v.data
+        last <= length(child) ||
+            throw(ArgumentError("list offset exceeds child array length"))
+        buffers = Ptr{Cvoid}[_validity_ptr(v, roots), offset_ptr]
+    end
+    return _buffer_array_ptr(buffers, roots)
+end
+
+function _fixed_size_list_buffers(v::FixedSizeList, roots::Vector{Any})
+    if _is_fixed_size_binary(v)
+        n = _fixed_size_width(v)
+        nbytes = _checked_mul(length(v), n, "fixed size binary byte count")
+        data = _materialized_vector(v.data, UInt8)
+        length(data) >= nbytes ||
+            throw(ArgumentError("fixed size binary data buffer is too short"))
+        buffers = Ptr{Cvoid}[_validity_ptr(v, roots), _optional_data_ptr(data, roots)]
+    else
+        child_len =
+            _checked_mul(length(v), _fixed_size_width(v), "fixed size list child length")
+        length(v.data) >= child_len ||
+            throw(ArgumentError("fixed size list child array is too short"))
+        buffers = Ptr{Cvoid}[_validity_ptr(v, roots)]
+    end
+    return _buffer_array_ptr(buffers, roots)
+end
+
+function _struct_buffers(v::Struct, roots::Vector{Any})
+    for child in v.data
+        length(child) >= length(v) ||
+            throw(ArgumentError("struct child array is too short"))
+    end
+    return _buffer_array_ptr(Ptr{Cvoid}[_validity_ptr(v, roots)], roots)
+end
+
+_c_data_buffers(v::NullVector, roots::Vector{Any}) = Int64(0), Ptr{Ptr{Cvoid}}(C_NULL)
+_c_data_buffers(v::Primitive, roots::Vector{Any}) = _primitive_buffers(v, roots)
+_c_data_buffers(v::BoolVector, roots::Vector{Any}) = _bool_buffers(v, roots)
+_c_data_buffers(v::List, roots::Vector{Any}) = _list_buffers(v, roots)
+_c_data_buffers(v::FixedSizeList, roots::Vector{Any}) = _fixed_size_list_buffers(v, roots)
+_c_data_buffers(v::Struct, roots::Vector{Any}) = _struct_buffers(v, roots)
+
+function _make_c_data_child_arrays!(v::ArrowVector, owner::CDataExportArrayOwner)
+    children = _c_data_children(v)
+    isempty(children) && return Int64(0), Ptr{Ptr{ArrowArray}}(C_NULL)
+    ptrs = Ptr{ArrowArray}[]
+    try
+        for child in children
+            ref = _make_c_data_array(child)
+            push!(ptrs, Base.unsafe_convert(Ptr{ArrowArray}, ref))
+        end
+    catch
+        # Release children built before the failure so their owners do not leak.
+        foreach(_release_exported_array, ptrs)
+        rethrow()
+    end
+    push!(owner.roots, ptrs)
+    return GC.@preserve ptrs begin
+        Int64(length(ptrs)), Ptr{Ptr{ArrowArray}}(pointer(ptrs))
+    end
+end
+
+function _c_data_null_count(v::ArrowVector)
+    nc = nullcount(v)
+    nc <= length(v) || throw(ArgumentError("ArrowArray.null_count exceeds length"))
+    return _checked_int64(nc, "ArrowArray.null_count")
+end
+_c_data_null_count(v::NullVector) = _checked_int64(length(v), "ArrowArray.null_count")
+
+function _fill_c_data_array!(
+    ref::Ref{ArrowArray},
+    v::ArrowVector,
+    token::UInt,
+    owner::CDataExportArrayOwner,
+)
+    push!(owner.refs, ref)
+    n_buffers, buffers = _c_data_buffers(v, owner.roots)
+    n_children, children = _make_c_data_child_arrays!(v, owner)
+    ref[] = ArrowArray(
+        _checked_int64(length(v), "ArrowArray.length"),
+        _c_data_null_count(v),
+        Int64(0),
+        n_buffers,
+        n_children,
+        buffers,
+        children,
+        Ptr{ArrowArray}(C_NULL),
+        _CDATA_EXPORT_ARRAY_RELEASE,
+        Ptr{Cvoid}(token),
+    )
+    return ref
+end
+
+function _make_c_data_array(v::ArrowVector)
+    token = _next_c_data_export_token()
+    owner = CDataExportArrayOwner(Ref{ArrowArray}[], Any[v])
+    ref = Ref{ArrowArray}()
+    _fill_c_data_array!(ref, v, token, owner)
+    _store_c_data_array_owner!(token, owner)
+    return ref
+end
+
+function _store_c_data_array_owner!(token::UInt, owner::CDataExportArrayOwner)
+    lock(_CDATA_EXPORT_LOCK)
+    try
+        _CDATA_EXPORT_ARRAY_OWNERS[token] = owner
+        return
+    finally
+        unlock(_CDATA_EXPORT_LOCK)
+    end
+end
+
+function _to_c_data_refs(col::ArrowVector, name::AbstractString)
+    _assert_c_data_export_supported(col)
+    schema_ref = _make_c_data_schema(col, name)
+    try
+        return schema_ref, _make_c_data_array(col)
+    catch
+        _release_exported_schema(Base.unsafe_convert(Ptr{ArrowSchema}, schema_ref))
+        rethrow()
+    end
+end
+
+"""
+    Arrow.to_c_data(col::ArrowVector; name="") -> (Ref{ArrowSchema}, Ref{ArrowArray})
+
+Export an Arrow array through the Arrow C Data Interface. The returned schema
+and array have independent release callbacks; releasing the schema does not
+release array buffers.
+"""
+to_c_data(col::ArrowVector; name::AbstractString="") = _to_c_data_refs(col, name)
+
+function _table_to_c_data_struct(tbl, names)
+    cols = Tables.columns(tbl)
+    name_strings = String.(collect(names))
+    arrow_tbl = toarrowtable(
+        cols,
+        Dict{Int64,Any}(),
+        false,
+        nothing,
+        true,
+        false,
+        false,
+        DEFAULT_MAX_DEPTH,
+        getmetadata(tbl),
+        nothing,
+    )
+    length(name_strings) == length(arrow_tbl.cols) ||
+        throw(ArgumentError("names length must match the number of table columns"))
+    syms = Tuple(Symbol.(name_strings))
+    data = Tuple(arrow_tbl.cols)
+    types = Tuple(eltype(col) for col in data)
+    T = NamedTuple{syms,Tuple{types...}}
+    validity = ValidityBitmap(UInt8[], 1, Tables.rowcount(arrow_tbl), 0)
+    return Struct{T,typeof(data),syms}(
+        validity,
+        data,
+        Tables.rowcount(arrow_tbl),
+        arrow_tbl.metadata,
+    )
+end
+
+"""
+    Arrow.to_c_data(tbl; names=String.(Tables.columnnames(tbl)))
+        -> (Ref{ArrowSchema}, Ref{ArrowArray})
+
+Export a Tables.jl column table as a root C Data struct array.
+"""
+function to_c_data(tbl; names=String.(Tables.columnnames(Tables.columns(tbl))))
+    root = _table_to_c_data_struct(tbl, names)
+    return _to_c_data_refs(root, "")
+end

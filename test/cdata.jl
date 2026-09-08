@@ -1281,3 +1281,476 @@ end
         bad(child)
     end
 end
+
+_schema_ref_ptr(ref::Ref{Arrow.ArrowSchema}) =
+    Base.unsafe_convert(Ptr{Arrow.ArrowSchema}, ref)
+_array_ref_ptr(ref::Ref{Arrow.ArrowArray}) = Base.unsafe_convert(Ptr{Arrow.ArrowArray}, ref)
+
+function _release_exported_schema!(ref::Ref{Arrow.ArrowSchema})
+    ptr = _schema_ref_ptr(ref)
+    release = unsafe_load(ptr).release
+    release == C_NULL && return
+    ccall(release, Cvoid, (Ptr{Arrow.ArrowSchema},), ptr)
+    return
+end
+
+function _release_exported_array!(ref::Ref{Arrow.ArrowArray})
+    ptr = _array_ref_ptr(ref)
+    release = unsafe_load(ptr).release
+    release == C_NULL && return
+    ccall(release, Cvoid, (Ptr{Arrow.ArrowArray},), ptr)
+    return
+end
+
+function _mark_exported_schema_released!(ptr::Ptr{Arrow.ArrowSchema})
+    schema = unsafe_load(ptr)
+    unsafe_store!(
+        ptr,
+        Arrow.ArrowSchema(
+            schema.format,
+            schema.name,
+            schema.metadata,
+            schema.flags,
+            schema.n_children,
+            schema.children,
+            schema.dictionary,
+            C_NULL,
+            schema.private_data,
+        ),
+    )
+    return
+end
+
+function _mark_exported_array_released!(ptr::Ptr{Arrow.ArrowArray})
+    array = unsafe_load(ptr)
+    unsafe_store!(
+        ptr,
+        Arrow.ArrowArray(
+            array.length,
+            array.null_count,
+            array.offset,
+            array.n_buffers,
+            array.n_children,
+            array.buffers,
+            array.children,
+            array.dictionary,
+            C_NULL,
+            array.private_data,
+        ),
+    )
+    return
+end
+
+function _import_exported(schema_ref, array_ref; convert=true)
+    return Arrow.from_c_data(
+        _schema_ref_ptr(schema_ref),
+        _array_ref_ptr(array_ref);
+        convert=convert,
+    )
+end
+
+function _exported_buffers(array_ref)
+    array = array_ref[]
+    array.n_buffers == 0 && return Ptr{Cvoid}[]
+    return collect(unsafe_wrap(Array, array.buffers, Int(array.n_buffers); own=false))
+end
+
+function _exported_children(array_ref)
+    array = array_ref[]
+    array.n_children == 0 && return Ptr{Arrow.ArrowArray}[]
+    return collect(unsafe_wrap(Array, array.children, Int(array.n_children); own=false))
+end
+
+function _exported_child_schemas(schema_ref)
+    schema = schema_ref[]
+    schema.n_children == 0 && return Ptr{Arrow.ArrowSchema}[]
+    return collect(unsafe_wrap(Array, schema.children, Int(schema.n_children); own=false))
+end
+
+function _exported_vector(::Type{T}, ptr::Ptr{Cvoid}, n::Integer) where {T}
+    n == 0 && return T[]
+    return unsafe_wrap(Array, Ptr{T}(ptr), Int(n); own=false)
+end
+
+function _exported_bits(ptr::Ptr{Cvoid}, len::Integer)
+    len == 0 && return Bool[]
+    bytes = _exported_vector(UInt8, ptr, cld(Int(len), 8))
+    return [
+        Arrow.getbit(bytes[((i - 1) >>> 3) + 1], ((i - 1) & 0x07) + 1) for i = 1:Int(len)
+    ]
+end
+
+@testset "Arrow C Data Interface export" begin
+    @testset "primitive arrays" begin
+        col = Arrow.toarrowvector(Int32[1, 2, 3])
+        schema, array = Arrow.to_c_data(col; name="ints")
+        @test unsafe_string(schema[].format) == "i"
+        @test unsafe_string(schema[].name) == "ints"
+        @test array[].n_buffers == 2
+        @test schema[].private_data != C_NULL
+        @test array[].private_data != C_NULL
+        imported = _import_exported(schema, array)
+        @test collect(imported) == Int32[1, 2, 3]
+        Arrow.release_c_data(imported)
+        @test schema[].release == C_NULL
+        @test array[].release == C_NULL
+    end
+
+    @testset "boolean arrays" begin
+        col = Arrow.toarrowvector(Union{Bool,Missing}[true, missing, false, true])
+        schema, array = Arrow.to_c_data(col)
+        @test unsafe_string(schema[].format) == "b"
+        @test array[].n_buffers == 2
+        @test array[].null_count == 1
+        buffers = _exported_buffers(array)
+        @test _exported_bits(buffers[1], array[].length) == [true, false, true, true]
+        values = _exported_bits(buffers[2], array[].length)
+        @test values[[1, 3, 4]] == [true, false, true]
+        _release_exported_array!(array)
+        _release_exported_schema!(schema)
+    end
+
+    @testset "string and binary arrays" begin
+        strings = Union{String,Missing}["ab", "", missing, "cd"]
+        schema, array = Arrow.to_c_data(Arrow.toarrowvector(strings))
+        @test unsafe_string(schema[].format) == "u"
+        @test array[].n_buffers == 3
+        @test array[].null_count == 1
+        buffers = _exported_buffers(array)
+        @test _exported_bits(buffers[1], array[].length) == [true, true, false, true]
+        offsets = _exported_vector(Int32, buffers[2], array[].length + 1)
+        @test collect(offsets) == Int32[0, 2, 2, 2, 4]
+        data = _exported_vector(UInt8, buffers[3], offsets[end])
+        @test String(copy(data)) == "abcd"
+        _release_exported_array!(array)
+        _release_exported_schema!(schema)
+
+        bytes = [b"ab", b"", b"cd"]
+        schema, array = Arrow.to_c_data(Arrow.toarrowvector(bytes))
+        @test unsafe_string(schema[].format) == "z"
+        @test array[].n_buffers == 3
+        buffers = _exported_buffers(array)
+        offsets = _exported_vector(Int32, buffers[2], array[].length + 1)
+        @test collect(offsets) == Int32[0, 2, 2, 4]
+        data = _exported_vector(UInt8, buffers[3], offsets[end])
+        @test collect(data) == UInt8[0x61, 0x62, 0x63, 0x64]
+        _release_exported_array!(array)
+        _release_exported_schema!(schema)
+    end
+
+    @testset "nested arrays" begin
+        lists = [Int32[1, 2], Int32[], Int32[3]]
+        schema, array = Arrow.to_c_data(Arrow.toarrowvector(lists))
+        @test unsafe_string(schema[].format) == "+l"
+        @test schema[].n_children == 1
+        @test array[].n_children == 1
+        child_schema = unsafe_load(_exported_child_schemas(schema)[1])
+        @test unsafe_string(child_schema.format) == "i"
+        buffers = _exported_buffers(array)
+        offsets = _exported_vector(Int32, buffers[2], array[].length + 1)
+        @test collect(offsets) == Int32[0, 2, 2, 3]
+        child_array = unsafe_load(_exported_children(array)[1])
+        @test child_array.length == 3
+        child_buffers = collect(
+            unsafe_wrap(Array, child_array.buffers, Int(child_array.n_buffers); own=false),
+        )
+        child_data = _exported_vector(Int32, child_buffers[2], child_array.length)
+        @test collect(child_data) == Int32[1, 2, 3]
+        _release_exported_array!(array)
+        _release_exported_schema!(schema)
+
+        fixed = [(0x01, 0x02), (0x03, 0x04)]
+        schema, array = Arrow.to_c_data(Arrow.toarrowvector(fixed))
+        @test unsafe_string(schema[].format) == "w:2"
+        buffers = _exported_buffers(array)
+        data = _exported_vector(UInt8, buffers[2], 4)
+        @test collect(data) == UInt8[0x01, 0x02, 0x03, 0x04]
+        _release_exported_array!(array)
+        _release_exported_schema!(schema)
+
+        structs = [(a=Int32(1), b=1.5), (a=Int32(2), b=2.5)]
+        schema, array = Arrow.to_c_data(Arrow.toarrowvector(structs))
+        @test unsafe_string(schema[].format) == "+s"
+        imported = _import_exported(schema, array)
+        @test Tables.columnnames(imported) == [:a, :b]
+        @test collect(imported.a) == Int32[1, 2]
+        @test collect(imported.b) == [1.5, 2.5]
+        Arrow.release_c_data(imported)
+    end
+
+    @testset "table names and metadata" begin
+        tbl = (col1=Int32[1, 2], col2=Float64[1.5, 2.5])
+        meta = Dict("source" => "export")
+        colmeta = Dict("unit" => "id")
+        arrow_tbl = Arrow.Table(
+            Arrow.tobuffer(tbl; metadata=meta, colmetadata=Dict(:col1 => colmeta)),
+        )
+        schema, array = Arrow.to_c_data(arrow_tbl; names=["left", "right"])
+        imported = _import_exported(schema, array)
+        @test Tables.columnnames(imported) == [:left, :right]
+        @test collect(imported.left) == Int32[1, 2]
+        @test collect(imported.right) == [1.5, 2.5]
+        @test DataAPI.metadata(imported, "source") == "export"
+        @test DataAPI.colmetadata(imported, :left, "unit") == "id"
+        Arrow.release_c_data(imported)
+    end
+
+    @testset "null and empty arrays" begin
+        nulls = Arrow.toarrowvector([missing, missing])
+        schema, array = Arrow.to_c_data(nulls)
+        @test unsafe_string(schema[].format) == "n"
+        @test array[].n_buffers == 0
+        imported = _import_exported(schema, array)
+        @test isequal(collect(imported), [missing, missing])
+        Arrow.release_c_data(imported)
+
+        empty = Arrow.toarrowvector(Int32[])
+        schema, array = Arrow.to_c_data(empty)
+        @test array[].length == 0
+        @test array[].n_buffers == 2
+        imported = _import_exported(schema, array)
+        @test collect(imported) == Int32[]
+        Arrow.release_c_data(imported)
+    end
+
+    @testset "release ordering and GC roots" begin
+        schema, array = Arrow.to_c_data(Arrow.toarrowvector(Int32[1, 2, 3]))
+        schema_token = UInt(schema[].private_data)
+        array_token = UInt(array[].private_data)
+        imported = _import_exported(schema, array)
+        # The import moves the exported base structures into the importer.
+        @test schema[].release == C_NULL
+        @test array[].release == C_NULL
+        @test haskey(Arrow._CDATA_EXPORT_SCHEMA_OWNERS, schema_token)
+        @test haskey(Arrow._CDATA_EXPORT_ARRAY_OWNERS, array_token)
+        scratch = [Vector{UInt8}(undef, 4096) for _ = 1:128]
+        @test sum(length, scratch) > 0
+        GC.gc(true)
+        @test collect(imported) == Int32[1, 2, 3]
+        Arrow.release_c_data(imported)
+        @test !haskey(Arrow._CDATA_EXPORT_SCHEMA_OWNERS, schema_token)
+        @test !haskey(Arrow._CDATA_EXPORT_ARRAY_OWNERS, array_token)
+
+        nested = Arrow.toarrowvector([(a=Int32(4), b="x"), (a=Int32(5), b="y")])
+        schema, array = Arrow.to_c_data(nested)
+        array_release = array[].release
+        schema_release = schema[].release
+        schema_token = UInt(schema[].private_data)
+        ccall(array_release, Cvoid, (Ptr{Arrow.ArrowArray},), _array_ref_ptr(array))
+        @test array[].release == C_NULL
+        @test schema[].release == schema_release
+        @test haskey(Arrow._CDATA_EXPORT_SCHEMA_OWNERS, schema_token)
+        scratch = [Vector{UInt8}(undef, 4096) for _ = 1:128]
+        @test sum(length, scratch) > 0
+        GC.gc(true)
+        @test unsafe_string(schema[].format) == "+s"
+        first_child = unsafe_load(schema[].children, 1)
+        second_child = unsafe_load(schema[].children, 2)
+        @test unsafe_string(unsafe_load(first_child).name) == "a"
+        @test unsafe_string(unsafe_load(first_child).format) == "i"
+        @test unsafe_string(unsafe_load(second_child).name) == "b"
+        @test unsafe_string(unsafe_load(second_child).format) == "u"
+        ccall(schema_release, Cvoid, (Ptr{Arrow.ArrowSchema},), _schema_ref_ptr(schema))
+        @test schema[].release == C_NULL
+        ccall(array_release, Cvoid, (Ptr{Arrow.ArrowArray},), _array_ref_ptr(array))
+        ccall(schema_release, Cvoid, (Ptr{Arrow.ArrowSchema},), _schema_ref_ptr(schema))
+        @test array[].release == C_NULL
+        @test schema[].release == C_NULL
+
+        schema, array = Arrow.to_c_data(Arrow.toarrowvector(Int32[9, 10]))
+        schema_copy = Ref(
+            Arrow.ArrowSchema(
+                schema[].format,
+                schema[].name,
+                schema[].metadata,
+                schema[].flags,
+                schema[].n_children,
+                schema[].children,
+                schema[].dictionary,
+                schema[].release,
+                schema[].private_data,
+            ),
+        )
+        array_copy = Ref(
+            Arrow.ArrowArray(
+                array[].length,
+                array[].null_count,
+                array[].offset,
+                array[].n_buffers,
+                array[].n_children,
+                array[].buffers,
+                array[].children,
+                array[].dictionary,
+                array[].release,
+                array[].private_data,
+            ),
+        )
+        ccall(
+            array_copy[].release,
+            Cvoid,
+            (Ptr{Arrow.ArrowArray},),
+            _array_ref_ptr(array_copy),
+        )
+        @test array_copy[].release == C_NULL
+        @test array[].release == C_NULL
+        ccall(
+            schema_copy[].release,
+            Cvoid,
+            (Ptr{Arrow.ArrowSchema},),
+            _schema_ref_ptr(schema_copy),
+        )
+        @test schema_copy[].release == C_NULL
+        @test schema[].release == C_NULL
+
+        schema, array = let
+            col = Arrow.toarrowvector(Int32[6, 7, 8])
+            Arrow.to_c_data(col)
+        end
+        GC.gc(true)
+        GC.gc(true)
+        imported = _import_exported(schema, array)
+        @test collect(imported) == Int32[6, 7, 8]
+        Arrow.release_c_data(imported)
+
+        schema, array = Arrow.to_c_data(
+            Arrow.toarrowvector([(a=Int32(1), b=Int32(2)), (a=Int32(3), b=Int32(4))]),
+        )
+        child_schema_ptr = _exported_child_schemas(schema)[1]
+        child_array_ptr = _exported_children(array)[1]
+        child_schema_copy = Ref(unsafe_load(child_schema_ptr))
+        child_array_copy = Ref(unsafe_load(child_array_ptr))
+        _mark_exported_schema_released!(child_schema_ptr)
+        _mark_exported_array_released!(child_array_ptr)
+        _release_exported_schema!(schema)
+        _release_exported_array!(array)
+        @test schema[].release == C_NULL
+        @test array[].release == C_NULL
+        @test child_schema_copy[].release != C_NULL
+        @test child_array_copy[].release != C_NULL
+        scratch = [Vector{UInt8}(undef, 4096) for _ = 1:128]
+        @test sum(length, scratch) > 0
+        GC.gc(true)
+        @test unsafe_string(child_schema_copy[].name) == "a"
+        @test unsafe_string(child_schema_copy[].format) == "i"
+        child_buffers = collect(
+            unsafe_wrap(
+                Array,
+                child_array_copy[].buffers,
+                Int(child_array_copy[].n_buffers);
+                own=false,
+            ),
+        )
+        child_data = _exported_vector(Int32, child_buffers[2], child_array_copy[].length)
+        @test collect(child_data) == Int32[1, 3]
+        ccall(
+            child_array_copy[].release,
+            Cvoid,
+            (Ptr{Arrow.ArrowArray},),
+            _array_ref_ptr(child_array_copy),
+        )
+        ccall(
+            child_schema_copy[].release,
+            Cvoid,
+            (Ptr{Arrow.ArrowSchema},),
+            _schema_ref_ptr(child_schema_copy),
+        )
+        @test child_array_copy[].release == C_NULL
+        @test child_schema_copy[].release == C_NULL
+    end
+
+    @testset "unsupported arrays" begin
+        schema_count = length(Arrow._CDATA_EXPORT_SCHEMA_OWNERS)
+        array_count = length(Arrow._CDATA_EXPORT_ARRAY_OWNERS)
+        map_col = Arrow.toarrowvector([Dict(Int32(1) => Float32(2))])
+        @test_throws ArgumentError Arrow.to_c_data(map_col)
+        @test length(Arrow._CDATA_EXPORT_SCHEMA_OWNERS) == schema_count
+        @test length(Arrow._CDATA_EXPORT_ARRAY_OWNERS) == array_count
+
+        dict_col = Arrow.toarrowvector(Arrow.DictEncode(["a", "b"]))
+        @test dict_col isa Arrow.DictEncoded
+        @test_throws ArgumentError Arrow.to_c_data(dict_col)
+        @test length(Arrow._CDATA_EXPORT_SCHEMA_OWNERS) == schema_count
+        @test length(Arrow._CDATA_EXPORT_ARRAY_OWNERS) == array_count
+    end
+
+    @testset "malformed export layouts" begin
+        schema_count = length(Arrow._CDATA_EXPORT_SCHEMA_OWNERS)
+        array_count = length(Arrow._CDATA_EXPORT_ARRAY_OWNERS)
+
+        short_validity = Arrow.ValidityBitmap(UInt8[0xff], 1, 1, 1)
+        bad_validity = Arrow.Primitive{Union{Missing,Int32},Vector{Int32}}(
+            UInt8[],
+            short_validity,
+            Int32[1, 2, 3, 4, 5, 6, 7, 8, 9],
+            9,
+            nothing,
+        )
+        @test_throws ArgumentError Arrow.to_c_data(bad_validity)
+
+        bad_null_count = Arrow.Primitive{Union{Missing,Int32},Vector{Int32}}(
+            UInt8[],
+            Arrow.ValidityBitmap(UInt8[0x00], 1, 1, 2),
+            Int32[1],
+            1,
+            nothing,
+        )
+        @test_throws ArgumentError Arrow.to_c_data(bad_null_count)
+
+        wrapped_validity = Arrow.Primitive{Union{Missing,Int32},Vector{Int32}}(
+            UInt8[],
+            Arrow.ValidityBitmap(UInt8[0xff], typemax(Int), typemax(Int), 1),
+            Int32[1, 2, 3, 4, 5, 6, 7, 8, 9],
+            9,
+            nothing,
+        )
+        @test_throws ArgumentError Arrow.to_c_data(wrapped_validity)
+
+        bad_bool = Arrow.BoolVector{Bool}(
+            UInt8[0xff],
+            typemax(Int),
+            Arrow.ValidityBitmap(UInt8[], 1, 0, 0),
+            9,
+            nothing,
+        )
+        @test_throws ArgumentError Arrow.to_c_data(bad_bool)
+
+        child = Arrow.toarrowvector(Int32[])
+        bad_offsets = Arrow.List{Vector{Int32},Int32,typeof(child)}(
+            UInt8[],
+            Arrow.ValidityBitmap(UInt8[], 1, 0, 0),
+            Arrow.Offsets(UInt8[], Int32[0]),
+            child,
+            typemax(Int),
+            nothing,
+        )
+        @test_throws ArgumentError Arrow.to_c_data(bad_offsets)
+
+        # A failure on a later child must release the children already built.
+        good_child = Arrow.Primitive{Int32,Vector{Int32}}(
+            UInt8[],
+            Arrow.ValidityBitmap(UInt8[], 1, 3, 0),
+            Int32[1, 2, 3],
+            3,
+            nothing,
+        )
+        bad_child = Arrow.Primitive{Union{Missing,Int32},Vector{Int32}}(
+            UInt8[],
+            Arrow.ValidityBitmap(UInt8[0xff], 1, 1, 1),
+            Int32[1, 2, 3],
+            3,
+            nothing,
+        )
+        T = NamedTuple{(:a, :b),Tuple{Int32,Union{Missing,Int32}}}
+        data = (good_child, bad_child)
+        bad_struct = Arrow.Struct{T,typeof(data),(:a, :b)}(
+            Arrow.ValidityBitmap(UInt8[], 1, 3, 0),
+            data,
+            3,
+            nothing,
+        )
+        @test_throws ArgumentError Arrow.to_c_data(bad_struct)
+
+        @test length(Arrow._CDATA_EXPORT_SCHEMA_OWNERS) == schema_count
+        @test length(Arrow._CDATA_EXPORT_ARRAY_OWNERS) == array_count
+    end
+end
