@@ -40,6 +40,7 @@ include(joinpath(@__DIR__, "testappend.jl"))
 include(joinpath(@__DIR__, "integrationtest.jl"))
 include(joinpath(@__DIR__, "dates.jl"))
 include(joinpath(@__DIR__, "cdata.jl"))
+include(joinpath(@__DIR__, "cdata_review.jl"))
 
 struct CustomStruct
     x::Int

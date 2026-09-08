@@ -42,8 +42,11 @@ end
 const _CDATA_PTR_SIZE = sizeof(Ptr{Cvoid})
 @assert isbitstype(ArrowSchema)
 @assert isbitstype(ArrowArray)
-# On 32 bit ABIs with 8 byte Int64 alignment the C structs contain padding, so
-# the packed size formulas hold only where pointer and Int64 sizes agree.
+# These sizes describe the host C ABI, not a serialized representation.
+# On 64 bit ABIs ArrowSchema/ArrowArray occupy 72/80 bytes. On 32 bit ABIs
+# pointer width and Int64 alignment affect padding (e.g. 44/60 bytes with
+# 4 byte alignment, 48/64 with 8 byte alignment). The tests compare every
+# field offset, alignment, and size with a C compiler on the host platform.
 @static if Sys.WORD_SIZE == 64
     @assert sizeof(ArrowSchema) == 7 * _CDATA_PTR_SIZE + 2 * sizeof(Int64)
     @assert sizeof(ArrowArray) == 5 * _CDATA_PTR_SIZE + 5 * sizeof(Int64)
@@ -53,6 +56,11 @@ const ARROW_FLAG_DICTIONARY_ORDERED = Int64(1)
 const ARROW_FLAG_NULLABLE = Int64(2)
 const ARROW_FLAG_MAP_KEYS_SORTED = Int64(4)
 
+# An importer policy, not a limit imposed by the C Data Interface spec.
+# Includes the terminating NUL, so at most 4095 format bytes are accepted.
+# Current primitive formats need one byte; leave room for parameterized
+# formats in the follow-up importer. This bounds scanning/allocation but
+# cannot establish whether a foreign pointer references readable memory.
 const _CDATA_MAX_FORMAT_BYTES = 4096
 
 abstract type CDataFormat end
@@ -149,6 +157,9 @@ end
     return _valid_bit(v.bytes, v.bitoffset, i)
 end
 
+# IPC's ValidityBitmap receives an already known null count and starts at a
+# byte boundary. C Data permits null_count == -1 and slices starting at any
+# bit, so count only the logical slice, excluding prefix and trailing bits.
 function _count_nulls(bytes::Vector{UInt8}, bitoffset::Int, len::Int)
     len == 0 && return 0
     firstbit = bitoffset
@@ -170,6 +181,10 @@ function _count_nulls(bytes::Vector{UInt8}, bitoffset::Int, len::Int)
     return len - set
 end
 
+# Imported arrays implement AbstractVector through these accessors. Keeping
+# the owner locked across validity/data reads prevents release_c_data from
+# freeing a buffer during a read; ordinary indexing and iteration use this
+# path even though the backing data is an unsafe_wrap(...; own=false) view.
 @propagate_inbounds function Base.getindex(x::CDataNull, i::Integer)
     return _with_live(x) do
         @boundscheck checkbounds(x, i)
@@ -199,6 +214,10 @@ end
 
 Base.copy(x::CDataVector) = collect(x)
 
+# This is Julia's optional deepcopy operation on an already imported array.
+# Import itself only moves the C headers. Generic recursive deepcopy would
+# copy raw callback pointers and the release owner, creating a second owner
+# for the producer's resources. Instead, copy buffers into Julia storage.
 # Recursive field traversal must not read foreign buffers directly: deepcopy
 # rebuilds the same wrapper type around Julia owned buffer copies detached
 # from the producer, serialize writes a plain Julia array, and both go
@@ -248,6 +267,10 @@ function Serialization.serialize(s::Serialization.AbstractSerializer, x::CDataVe
     return Serialization.serialize(s, copy(x))
 end
 
+# ArrowSchema/ArrowArray are immutable Julia snapshots of mutable C storage.
+# Write a replacement snapshot through the pointer to change its release
+# field. A fieldoffset-based pointer store could also update only that field;
+# whole-value stores keep the layout handling in Julia's struct definition.
 function _clear_schema_release!(ptr::Ptr{ArrowSchema})
     ptr == C_NULL && return
     schema = unsafe_load(ptr)
@@ -319,9 +342,13 @@ function release_c_data(owner::CDataOwner)
 end
 
 function _finalize_c_data(owner::CDataOwner)
-    # A finalizer must not block on a contended lock, so retry the finalizer
-    # instead of waiting. The reentrant acquisition inside release_c_data is
-    # uncontended once trylock succeeds.
+    # finalizer(f, owner) registers a future callback; finalize(owner) runs
+    # registered callbacks immediately. Re-registering here defers cleanup
+    # until a later finalization attempt and keeps the owner reachable for
+    # that callback. This follows Julia's "Safe use of Finalizers" guidance:
+    # https://docs.julialang.org/en/v1/manual/multi-threading/#Safe-use-of-Finalizers
+    # Avoid waiting on a contended lock. The reentrant acquisition inside
+    # release_c_data is uncontended once trylock succeeds.
     if trylock(owner.lock)
         try
             release_c_data(owner)
@@ -402,13 +429,19 @@ function _unsafe_string_bounded(ptr::Cstring, maxbytes::Int, name)
         byte == 0x00 && return String(bytes)
         push!(bytes, byte)
     end
-    throw(ArgumentError("$name exceeds the import limit"))
+    throw(
+        ArgumentError("$name has no NUL terminator within the $maxbytes byte import limit"),
+    )
 end
 
 function _load_buffers(array::ArrowArray, expected::Int)
     n_buffers = _checked_nonnegative(array.n_buffers, "ArrowArray.n_buffers")
     n_buffers == expected ||
-        throw(ArgumentError("ArrowArray.n_buffers does not match the format"))
+        throw(
+            ArgumentError(
+                "ArrowArray.n_buffers is $n_buffers; expected $expected for the format",
+            ),
+        )
     if expected > 0 && array.buffers == C_NULL
         throw(ArgumentError("ArrowArray.buffers is NULL"))
     end
@@ -446,15 +479,23 @@ function _validate_common(schema::ArrowSchema, array::ArrowArray, top_level::Boo
     _checked_add(offset, len, "ArrowArray offset plus length")
     _checked_nonnegative(array.n_buffers, "ArrowArray.n_buffers")
     n_children = _checked_nonnegative(array.n_children, "ArrowArray.n_children")
-    schema_children = _checked_nonnegative(schema.n_children, "ArrowSchema.n_children")
-    schema_children == n_children ||
-        throw(ArgumentError("ArrowSchema and ArrowArray child counts differ"))
+    schema_n_children = _checked_nonnegative(schema.n_children, "ArrowSchema.n_children")
+    schema_n_children == n_children ||
+        throw(
+            ArgumentError(
+                "ArrowArray.n_children is $n_children; expected $schema_n_children from ArrowSchema.n_children",
+            ),
+        )
     null_count = array.null_count
     if !(null_count == -1 || 0 <= null_count <= len)
         throw(ArgumentError("ArrowArray.null_count is out of range"))
     end
     if (schema.dictionary == C_NULL) != (array.dictionary == C_NULL)
-        throw(ArgumentError("ArrowSchema and ArrowArray dictionary pointers differ"))
+        throw(
+            ArgumentError(
+                "ArrowSchema.dictionary and ArrowArray.dictionary must both be NULL or both be non-NULL",
+            ),
+        )
     end
     schema.dictionary == C_NULL ||
         throw(ArgumentError("dictionary encoded Arrow C Data import is not supported"))
@@ -592,6 +633,10 @@ Aligned imported buffers are viewed without copying and are released by
 into aligned Julia storage before typed access. Use `copy` or `collect` on
 imported arrays to make Julia owned arrays.
 
+The returned array supports indexing and iteration while its shared owner is
+live. `deepcopy` also copies its buffers into Julia storage without retaining
+producer callbacks; this is separate from the move performed during import.
+
 The importer moves the base `ArrowSchema` and `ArrowArray` structures into
 Julia owned storage and marks the passed structures released
 (`release = C_NULL`) without calling their release callbacks, following the
@@ -606,6 +651,10 @@ does not inspect allocator metadata for foreign pointers. A declared
 arrow-rs, an unknown null count (-1) requires a validity bitmap and is resolved
 from it like nanoarrow, and reserved flag bits are ignored for forward
 compatibility.
+
+Format strings must have a NUL terminator within 4096 bytes (at most 4095
+content bytes). This is an implementation limit, not a format specification
+limit. Callers must provide valid, readable pointers for all declared data.
 
 The element type includes `Missing` when the schema declares the field nullable
 or the imported array contains nulls. The move is not atomic: importing the
