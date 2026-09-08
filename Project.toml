@@ -20,7 +20,9 @@ authors = ["quinnj <quinn.jacobd@gmail.com>"]
 version = "3.0.0-DEV"
 
 [deps]
-ArrowStrings = "c38d8858-22a2-449e-9eca-ef92ec15f353"
+DataDecimals = "3e2245cb-6932-498d-a7cf-39d39de8bde3"
+Durations = "41ac09f5-0a95-4810-aa18-c88bf48ee130"
+DataStrings = "48204bd6-5611-42ea-b167-fc1d713f9be2"
 ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 CodecLz4 = "5ba52731-8f18-5e0d-9241-30f10d1ec561"
@@ -33,11 +35,8 @@ PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 
-# ArrowStrings and ArrowTypes live in this repository and are released and
-# registered independently; the source entries resolve their subdirectories.
-# Pkg reads `[sources]` from Julia 1.11; on 1.10 the CI workflow devs both explicitly.
+# ArrowTypes is developed in this repository. DataStrings resolves from General.
 [sources]
-ArrowStrings = {path = "src/ArrowStrings"}
 ArrowTypes = {path = "src/ArrowTypes"}
 
 [weakdeps]
@@ -49,7 +48,9 @@ ArrowCloudStoreExt = "CloudStore"
 ArrowTimeZonesExt = "TimeZones"
 
 [compat]
-ArrowStrings = "1"
+DataDecimals = "1"
+Durations = "1"
+DataStrings = "1"
 ArrowTypes = "2"
 Base64 = "1.10"
 CloudStore = "1.6"

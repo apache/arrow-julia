@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# JuliaC `--trim=safe` workload for ArrowCore and ArrowStrings (compiled and
+# JuliaC `--trim=safe` workload for ArrowCore and DataStrings (compiled and
 # executed by test/trim_compile_tests.jl, following the trim harness convention
 # from JSON/HTTP/Reseau/StructUtils). Everything reachable from `main` must be
 # free of dynamic dispatch: this file is the executable definition of the
@@ -27,9 +27,9 @@ const AC = ArrowCore
 # The C data interface is part of the trim-safe surface: a trimmed binary
 # that moves columns across the C seams is the canonical embedding use.
 include(joinpath(@__DIR__, "..", "src", "cdata.jl"))
-include(joinpath(@__DIR__, "..", "src", "ArrowStrings", "src", "ArrowStrings.jl"))
-using .ArrowStrings
-const AS = ArrowStrings
+using DataStrings
+using DataStrings: StringVector, StringPayload, BytesVector, DataBytes
+const AS = DataStrings
 
 function checked(cond::Bool, msg::String)::Nothing
     cond || error(msg)
@@ -276,28 +276,28 @@ function exercise_arrowstrings()::Nothing
     viewed = Vector{UInt8}(codeunits("a much longer value"))
     p1 = AS.inline_payload(inline, 1, 4)
     p2 = AS.view_payload(viewed, 1, length(viewed), 0, 0)
-    present = StringVector{ArrowString}([p1, p2], Vector{UInt8}[viewed])
-    checked(present[1] == "abcd", "ArrowStrings inline access failed")
-    checked(present[2] == "a much longer value", "ArrowStrings view access failed")
-    checked(isless(present[1], "z"), "ArrowStrings comparison failed")
+    present = StringVector{DataString}([p1, p2], Vector{UInt8}[viewed])
+    checked(present[1] == "abcd", "DataStrings inline access failed")
+    checked(present[2] == "a much longer value", "DataStrings view access failed")
+    checked(isless(present[1], "z"), "DataStrings comparison failed")
     materialized = AS.materialize(present)
     checked(
         materialized isa Vector{String} && materialized == ["abcd", "a much longer value"],
-        "ArrowStrings materialize failed",
+        "DataStrings materialize failed",
     )
 
-    nullable = StringVector{Union{Missing,ArrowString}}(
+    nullable = StringVector{Union{Missing,DataString}}(
         [p1, AS.PAYLOAD_MISSING, p2],
         Vector{UInt8}[viewed],
     )
-    checked(nullable[2] === missing, "ArrowStrings missing access failed")
+    checked(nullable[2] === missing, "DataStrings missing access failed")
     nullable_materialized = AS.materialize(nullable)
     checked(
         nullable_materialized isa Vector{Union{String,Missing}} && isequal(
             nullable_materialized,
             Union{String,Missing}["abcd", missing, "a much longer value"],
         ),
-        "ArrowStrings nullable materialize failed",
+        "DataStrings nullable materialize failed",
     )
     return nothing
 end

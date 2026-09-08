@@ -109,15 +109,7 @@ If ArrowTypes is also registered, we also need to post a comment on the commit w
 @JuliaRegistrator register subdir=src/ArrowTypes
 ```
 
-To register or release ArrowStrings, post the following comment on the commit
-that contains its version in `src/ArrowStrings/Project.toml`:
-
-```markdown
-@JuliaRegistrator register subdir=src/ArrowStrings
-```
-
-ArrowStrings must be registered and released before an Arrow.jl release that
-depends on it can be registered.
+DataStrings is registered separately in [JuliaData/DataStrings.jl](https://github.com/JuliaData/DataStrings.jl).
 
 ### Verify
 

@@ -33,8 +33,6 @@ jobs:
             dir: '.'
           - name: ArrowTypes.jl
             dir: './src/ArrowTypes'
-          - name: ArrowStrings.jl
-            dir: './src/ArrowStrings'
         version:
           - 'nightly'
         os:
@@ -112,7 +110,7 @@ jobs:
         shell: julia --project=monorepo {0}
         run: |
           using Pkg;
-          Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowTypes"), PackageSpec(path="src/ArrowStrings")])
+          Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowTypes")])
       - name: Run monorepo tests
         continue-on-error: false
         run: >

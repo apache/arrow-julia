@@ -17,7 +17,8 @@
 module SeededFuzz
 
 using Arrow
-using ArrowStrings
+using DataStrings
+using DataStrings: StringVector, StringPayload, BytesVector, DataBytes
 using ArrowTypes
 using Dates
 using Tables
@@ -676,13 +677,13 @@ function _logical_layout_case()
     raw = collect(codeunits("tiny-a-view-value-longer-than-twelve-bytes"))
     longstart = findfirst(==(UInt8('a')), raw)
     longlength = length(raw) - longstart + 1
-    payloads = ArrowStrings.ArrowStringPayload[
-        ArrowStrings.inline_payload(raw, 1, 4),
-        ArrowStrings.view_payload(raw, longstart, longlength, 0, longstart - 1),
-        ArrowStrings.PAYLOAD_MISSING,
-        ArrowStrings.inline_payload(raw, 1, 0),
+    payloads = DataStrings.StringPayload[
+        DataStrings.inline_payload(raw, 1, 4),
+        DataStrings.view_payload(raw, longstart, longlength, 0, longstart - 1),
+        DataStrings.PAYLOAD_MISSING,
+        DataStrings.inline_payload(raw, 1, 0),
     ]
-    views = ArrowStrings.StringVector{Union{Missing,ArrowStrings.ArrowString}}(
+    views = DataStrings.StringVector{Union{Missing,DataStrings.DataString}}(
         payloads,
         Vector{UInt8}[raw],
     )
@@ -829,10 +830,10 @@ function _physical_layout_case()
     )
 
     longbinary = collect(UInt8, 0x10:0x20)
-    binarypayloads = ArrowStrings.ArrowStringPayload[
-        ArrowStrings.inline_payload(UInt8[0x01, 0x02], 1, 2),
-        ArrowStrings.view_payload(longbinary, 1, length(longbinary), 0, 0),
-        ArrowStrings.PAYLOAD_MISSING,
+    binarypayloads = DataStrings.StringPayload[
+        DataStrings.inline_payload(UInt8[0x01, 0x02], 1, 2),
+        DataStrings.view_payload(longbinary, 1, length(longbinary), 0, 0),
+        DataStrings.PAYLOAD_MISSING,
     ]
     binaryviewtype = AC.ViewType(false)
     push!(fields, AC.Field("binary_view", binaryviewtype; nullable=true))
@@ -1755,7 +1756,7 @@ function _source_revision()
 end
 
 function _environmenttext()
-    packages = (Arrow, ArrowStrings, ArrowTypes, Tables)
+    packages = (Arrow, DataStrings, ArrowTypes, Tables)
     lines = String["julia_version=$(VERSION)", "source_revision=$(_source_revision())"]
     for package in packages
         push!(lines, "$(nameof(package))_version=$(Base.pkgversion(package))")

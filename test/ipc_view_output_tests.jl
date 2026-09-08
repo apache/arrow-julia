@@ -19,7 +19,8 @@ module IPCViewOutputTests
 using Test
 using Random
 using Arrow
-using ArrowStrings
+using DataStrings
+using DataStrings: StringVector, StringPayload, BytesVector, DataBytes
 
 const AC = Arrow.AC
 const UNUSED = "UNUSED_SYNTHETIC_BUFFER_TEXT"
@@ -28,34 +29,34 @@ const LONG = "selected long string \0 with λ"
 function fixture()
     raw = Vector{UInt8}(codeunits(UNUSED * LONG * UNUSED))
     extra = Vector{UInt8}(codeunits(UNUSED * "another selected string" * UNUSED))
-    p = ArrowStrings.view_payload(
+    p = DataStrings.view_payload(
         raw,
         ncodeunits(UNUSED) + 1,
         ncodeunits(LONG),
         0,
         ncodeunits(UNUSED),
     )
-    q = ArrowStrings.view_payload(extra, ncodeunits(UNUSED) + 1, 23, 2, ncodeunits(UNUSED))
-    inline = ArrowStrings.inline_payload(codeunits("λ\0ok"), 1, 5)
-    payloads = [p, ArrowStrings.PAYLOAD_MISSING, inline, q, p]
+    q = DataStrings.view_payload(extra, ncodeunits(UNUSED) + 1, 23, 2, ncodeunits(UNUSED))
+    inline = DataStrings.inline_payload(codeunits("λ\0ok"), 1, 5)
+    payloads = [p, DataStrings.PAYLOAD_MISSING, inline, q, p]
     buffers = [raw, Vector{UInt8}(codeunits(UNUSED)), extra]
-    return StringVector{Union{Missing,ArrowString}}(payloads, buffers)
+    return StringVector{Union{Missing,DataString}}(payloads, buffers)
 end
 
 function packedfixture()
     first, second = "first selected long string", "second selected long string"
     raw = collect(codeunits(first * second * UNUSED))
-    p = ArrowStrings.view_payload(raw, 1, ncodeunits(first), 0, 0)
-    q = ArrowStrings.view_payload(
+    p = DataStrings.view_payload(raw, 1, ncodeunits(first), 0, 0)
+    q = DataStrings.view_payload(
         raw,
         ncodeunits(first) + 1,
         ncodeunits(second),
         0,
         ncodeunits(first),
     )
-    inline = ArrowStrings.inline_payload(codeunits("ok"), 1, 2)
-    return StringVector{Union{Missing,ArrowString}}(
-        [p, q, p, ArrowStrings.PAYLOAD_MISSING, inline],
+    inline = DataStrings.inline_payload(codeunits("ok"), 1, 2)
+    return StringVector{Union{Missing,DataString}}(
+        [p, q, p, DataStrings.PAYLOAD_MISSING, inline],
         [raw],
     )
 end
@@ -81,11 +82,11 @@ end
         beforepayloads, beforebuffers = copy(col.payloads), deepcopy(col.buffers)
         for file in (true, false), compress in (nothing, :lz4, :zstd)
             for selection in ([1, 2, 3, 4, 5], [4, 2, 1], [3], [2], Int[])
-                selected = StringVector{Union{Missing,ArrowString}}(
+                selected = StringVector{Union{Missing,DataString}}(
                     col.payloads[selection],
                     col.buffers,
                 )
-                expected = ArrowStrings.materialize(selected)
+                expected = DataStrings.materialize(selected)
                 ndata =
                     (1 in selection || 5 in selection ? ncodeunits(LONG) : 0) +
                     (4 in selection ? 23 : 0)
@@ -107,7 +108,7 @@ end
             io = IOBuffer()
             Arrow.write(io, (s=selected,); file=false)
             bytes = take!(io)
-            @test isequal(Arrow.Table(bytes).s, ArrowStrings.materialize(col)[3:5])
+            @test isequal(Arrow.Table(bytes).s, DataStrings.materialize(col)[3:5])
             @test findfirst(codeunits(UNUSED), bytes) === nothing
         end
     end
@@ -116,10 +117,10 @@ end
         raw = Vector{UInt8}(codeunits(UNUSED * "abcdefghijklmnopqrstuvwxyz" * UNUSED))
         off = ncodeunits(UNUSED)
         payloads = [
-            ArrowStrings.view_payload(raw, off + i + 1, n, 0, off + i) for
+            DataStrings.view_payload(raw, off + i + 1, n, 0, off + i) for
             (i, n) in [(8, 18), (0, 20), (4, 13), (0, 20)]
         ]
-        col = StringVector{ArrowString}(payloads, [raw])
+        col = StringVector{DataString}(payloads, [raw])
         io = IOBuffer()
         Arrow.write(io, (s=col,); file=false)
         d = checkoutput(
@@ -189,7 +190,7 @@ end
         for trial = 1:30
             buffers = [rand(rng, UInt8('a'):UInt8('z'), 256) for _ = 1:3]
             used = [falses(length(b)) for b in buffers]
-            payloads = ArrowStringPayload[]
+            payloads = StringPayload[]
             expected = Union{Missing,String}[]
             for _ = 1:50
                 if rand(rng, Bool)
@@ -198,7 +199,7 @@ end
                     len = rand(rng, 13:56)
                     push!(
                         payloads,
-                        ArrowStrings.view_payload(
+                        DataStrings.view_payload(
                             buffers[bufidx],
                             off + 1,
                             len,
@@ -209,11 +210,11 @@ end
                     used[bufidx][(off + 1):(off + len)] .= true
                     push!(expected, String(buffers[bufidx][(off + 1):(off + len)]))
                 else
-                    push!(payloads, ArrowStrings.PAYLOAD_MISSING)
+                    push!(payloads, DataStrings.PAYLOAD_MISSING)
                     push!(expected, missing)
                 end
             end
-            col = StringVector{Union{Missing,ArrowString}}(payloads, buffers)
+            col = StringVector{Union{Missing,DataString}}(payloads, buffers)
             io = IOBuffer()
             Arrow.write(io, (s=col,); file=false)
             bytes = take!(io)
@@ -241,11 +242,11 @@ end
             ]
             utf8 || (buffers[1][1] = 0xff)
             used = [falses(length(b)) for b in buffers]
-            payloads = ArrowStringPayload[]
+            payloads = StringPayload[]
             expected = Any[]
             for (bufidx, off, len) in ranges
                 raw = buffers[bufidx + 1]
-                push!(payloads, ArrowStrings.view_payload(raw, off + 1, len, bufidx, off))
+                push!(payloads, DataStrings.view_payload(raw, off + 1, len, bufidx, off))
                 used[bufidx + 1][(off + 1):(off + len)] .= true
                 value = raw[(off + 1):(off + len)]
                 push!(expected, utf8 ? String(value) : value)
@@ -254,10 +255,10 @@ end
             # bytes. It must neither extend coverage nor survive as bytes.
             push!(
                 payloads,
-                ArrowStrings.view_payload(buffers[1], 65, ncodeunits(UNUSED), 0, 64),
+                DataStrings.view_payload(buffers[1], 65, ncodeunits(UNUSED), 0, 64),
             )
             push!(expected, missing)
-            push!(payloads, ArrowStrings.inline_payload(codeunits("ok"), 1, 2))
+            push!(payloads, DataStrings.inline_payload(codeunits("ok"), 1, 2))
             push!(expected, utf8 ? "ok" : collect(codeunits("ok")))
             n = length(payloads)
             entries = collect(reinterpret(UInt8, payloads))
@@ -378,7 +379,7 @@ end
             @test out.dictionary.len == pool.len
             @test sum(b.len for b in out.dictionary.buffers[3:end]; init=0) ==
                   ncodeunits(LONG) + 23
-            @test isequal(AC.materialize(f, out.dictionary), ArrowStrings.materialize(col))
+            @test isequal(AC.materialize(f, out.dictionary), DataStrings.materialize(col))
         end
     end
 end

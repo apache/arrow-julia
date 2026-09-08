@@ -15,6 +15,8 @@
 # limitations under the License.
 
 [deps]
+DataDecimals = "3e2245cb-6932-498d-a7cf-39d39de8bde3"
+Durations = "41ac09f5-0a95-4810-aa18-c88bf48ee130"
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
@@ -23,7 +25,7 @@ CloudStore = "3365d9ee-d53b-4a56-812d-5344d5b716d7"
 CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
 DataAPI = "9a962f9c-6df0-11e9-0e5d-c546b8b5ee8a"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
-ArrowStrings = "c38d8858-22a2-449e-9eca-ef92ec15f353"
+DataStrings = "48204bd6-5611-42ea-b167-fc1d713f9be2"
 Pkg = "44cfe95a-1eb2-52ea-b672-e2afdf69b78f"
 PooledArrays = "2dfb63ee-cc39-5dd5-95bd-886bf059d720"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
@@ -35,6 +37,9 @@ TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 
 [compat]
+DataDecimals = "1"
+DataStrings = "1"
+Durations = "1"
 Aqua = "0.8"
 ArrowTypes = "2.4"
 TimeZones = "1"

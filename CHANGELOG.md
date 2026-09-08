@@ -64,7 +64,9 @@ writer, validation, scan, and C interface engines.
   ArrowTypes.jl directly.
 - Big-endian IPC and delta-dictionary messages are rejected.
 - Arrow 3.0 requires ArrowTypes.jl 2.x, Tables.jl 1.14 (the first release
-  with `Tables.Scan`), and the ArrowStrings.jl 1.0 release.
+  with `Tables.Scan`), DataStrings.jl 1.0, DataDecimals.jl 1.0, and Durations.jl 1.0.
+- Supported top-level decimals and calendar intervals use shared DataDecimals
+  and Durations values. Negative-scale decimals retain raw coefficients.
 
 ### Added
 
@@ -97,7 +99,7 @@ writer, validation, scan, and C interface engines.
 - A CloudStore.jl extension for remote object reads.
 - Footer statistics that can prune record batches before their data is read.
 - Arrow C data and C stream import and export.
-- Arrow StringView and BinaryView support. ArrowStrings.jl provides a reusable
+- Arrow StringView and BinaryView support. DataStrings.jl provides a reusable
   zero-copy StringView representation for Arrow.jl and compatible producers.
 - Fresh Julia columns with a heterogeneous declared `Union` element type are
   synthesized as canonical dense Arrow Union arrays. Each child uses the

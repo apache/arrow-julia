@@ -336,7 +336,7 @@ standardized upstream. This convention is deliberately conservative:
 **Trimmability is a standing production gate, not an aspiration.** The
 `--trim=safe` harness (0 errors / 0 warnings / binary exit 0) compiles
 `ArrowCore` plus its value-domain and typed-value workloads and the C-data
-seams, plus a representative ArrowStrings workload. It does **not** yet compile
+seams, plus a representative DataStrings workload. It does **not** yet compile
 a scan-and-materialize app, so §1–§3 are designed for trim but not yet gated by
 it. The rules in `core-README.md` ("Trim-compile support") constrain their form:
 

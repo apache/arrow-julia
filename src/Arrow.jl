@@ -47,7 +47,7 @@ module Arrow
 using Tables
 import Base64
 import DataAPI
-import ArrowStrings
+import DataStrings, DataDecimals, Durations
 import ArrowTypes
 import Dates
 import Mmap
@@ -98,6 +98,7 @@ include("arrowtypes.jl")
 # column-construction module after the `DictEncode` marker is defined.
 include("table.jl")
 include("write.jl")
+include("sharedvalues.jl")
 
 @doc """
     Arrow.Field

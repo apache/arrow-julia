@@ -25,7 +25,8 @@ using Dates
 using Tables
 import DataAPI
 using Arrow
-using ArrowStrings
+using DataStrings
+using DataStrings: StringVector, StringPayload, BytesVector, DataBytes
 
 const AC = Arrow.ArrowCore
 
@@ -153,11 +154,11 @@ end
 
     @testset "retained byte and scalar layouts rebuild exactly" begin
         raw = Vector{UInt8}(codeunits("short-thirteen-byte"))
-        payloads = ArrowStringPayload[
-            ArrowStrings.inline_payload(raw, 1, 5),
-            ArrowStrings.view_payload(raw, 7, 13, 0, 6),
+        payloads = StringPayload[
+            DataStrings.inline_payload(raw, 1, 5),
+            DataStrings.view_payload(raw, 7, 13, 0, 6),
         ]
-        strings = StringVector{ArrowString}(payloads, [raw])
+        strings = StringVector{DataString}(payloads, [raw])
         io = IOBuffer()
         Arrow.write(io, (s=strings,); file=false)
         viewbytes = take!(io)
@@ -199,7 +200,8 @@ end
         )
         decimalback = Arrow.readstream(_rewrite(decimalbytes))
         @test decimalback.schema.fields[1].type == decimaltype
-        @test Arrow.Table(_rewrite(decimalbytes)).dec == Int64[123, 456]
+        @test Arrow.Table(_rewrite(decimalbytes)).dec ==
+              Arrow.DataDecimals.Decimal{10,2,Int64}.(["1.23", "4.56"])
     end
 
     @testset "retained composites rebuild recursively" begin

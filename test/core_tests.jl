@@ -928,8 +928,8 @@ end
             @test getvalue(llvf, llvd, 1) == [2, 3]
         end
 
-        @testset "fromviewentries: ArrowString payloads → Utf8View, zero-copy" begin
-            # A local encoder of the ArrowStrings payload (Core cannot depend on
+        @testset "fromviewentries: DataString payloads → Utf8View, zero-copy" begin
+            # A local encoder of the DataStrings payload (Core cannot depend on
             # the package), which IS an Arrow view entry: length | first 4 bytes,
             # then bytes 5..12 (≤12) or (Int32 buffer index, Int32 0-based
             # offset). Any 16-byte isbits type is accepted.

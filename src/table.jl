@@ -1357,13 +1357,9 @@ _declaredbasetype(t::AC.ArrowType) =
     t isa AC.StructType ? Vector{Pair{String,Any}} :
     t isa AC.MapType ? Vector{Pair{Any,Any}} :
     t isa AC.NullType ? Missing :
-    t isa AC.DecimalType ? (t.bits == 32 ? Int32 : t.bits == 64 ? Int64 : Vector{UInt8}) :
-    t isa AC.IntervalType ?
-    (
-        t.unit == AC.YEAR_MONTH ? Int32 :
-        t.unit == AC.DAY_TIME ? NamedTuple{(:days, :millis),Tuple{Int32,Int32}} :
-        NamedTuple{(:months, :days, :nanos),Tuple{Int32,Int32,Int64}}
-    ) : t isa AC.DictionaryType ? _declaredbasetype(t.valuetype) : _facadebasetype(t)
+    t isa AC.DecimalType ? (_shareddecimal(t) ? _decimalhost(t) : _rawdeclaredbasetype(t)) :
+    t isa AC.IntervalType ? Durations.Duration :
+    t isa AC.DictionaryType ? _declaredbasetype(t.valuetype) : _facadebasetype(t)
 
 # --- Stream ------------------------------------------------------------------
 

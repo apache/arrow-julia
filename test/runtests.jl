@@ -23,6 +23,7 @@ include("core_tests.jl")
 
 # The public facade (Arrow.Table / Arrow.Stream / Arrow.write).
 include("facade_tests.jl")
+include("sharedvalues.jl")
 
 # ArrowTypes logical-type lowering, extension metadata, and lifting.
 include("arrowtypes_compat_tests.jl")

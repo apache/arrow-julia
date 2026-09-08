@@ -110,14 +110,12 @@ jobs:
             ${{ runner.os }}-test-${{ env.cache-name }}-
             ${{ runner.os }}-test-
             ${{ runner.os }}-
-      # Before the build: ArrowStrings is unregistered and ArrowTypes 2.4 is in
-      # this monorepo; Julia 1.10's Pkg does not read the `[sources]` entries
-      # that point at them, so the resolve would fail without this step.
+      # Julia 1.10 needs the local ArrowTypes source developed explicitly.
       - name: Dev local subpackages
         shell: julia --project=. {0}
         run: |
           using Pkg
-          Pkg.develop([PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")])
+          Pkg.develop([PackageSpec(path="src/ArrowTypes")])
       - uses: julia-actions/julia-buildpkg@v1.6
       - uses: julia-actions/julia-runtest@v1
         env:
@@ -141,8 +139,6 @@ jobs:
         pkg:
           - name: ArrowTypes.jl
             dir: './src/ArrowTypes'
-          - name: ArrowStrings.jl
-            dir: './src/ArrowStrings'
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
@@ -204,7 +200,7 @@ jobs:
         shell: julia --project=monorepo {0}
         run: |
           using Pkg;
-          Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowTypes"), PackageSpec(path="src/ArrowStrings")])
+          Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowTypes")])
       - name: Run monorepo tests
         continue-on-error: false
         run: >
@@ -228,7 +224,6 @@ jobs:
         shell: julia --project=. {0}
         run: |
           using Pkg
-          Pkg.develop(PackageSpec(path="src/ArrowStrings"))
           Pkg.add(PackageSpec(name="ArrowTypes", version=v"2.0.0"))
           Pkg.pin(PackageSpec(name="ArrowTypes"))
       - name: Test custom-type file and stream round trips
@@ -245,8 +240,6 @@ jobs:
             dir: '.'
           - name: ArrowTypes.jl
             dir: './src/ArrowTypes'
-          - name: ArrowStrings.jl
-            dir: './src/ArrowStrings'
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
@@ -263,7 +256,7 @@ jobs:
         shell: julia --project=. {0}
         run: |
           using Pkg
-          Pkg.develop([PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")])
+          Pkg.develop([PackageSpec(path="src/ArrowTypes")])
       - uses: julia-actions/julia-buildpkg@v1.6
         with:
           project: ${{ matrix.pkg.dir }}
@@ -273,7 +266,7 @@ jobs:
         with:
           project: ${{ matrix.pkg.dir }}
   trim:
-    name: ArrowCore and ArrowStrings JuliaC trim-safe compile
+    name: ArrowCore and DataStrings JuliaC trim-safe compile
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -286,7 +279,7 @@ jobs:
           path: ~/.julia/artifacts
           key: trim-${{ runner.os }}-${{ hashFiles('test/trim/Project.toml') }}
           restore-keys: trim-${{ runner.os }}-
-      - name: Compile and run the trim-safe ArrowCore and ArrowStrings workload
+      - name: Compile and run the trim-safe ArrowCore and DataStrings workload
         run: julia --startup-file=no --history-file=no test/trim_compile_tests.jl
   docs:
     name: Documentation
@@ -301,7 +294,7 @@ jobs:
         shell: julia --project=docs {0}
         run: |
           using Pkg
-          Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")])
+          Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowTypes")])
       - uses: julia-actions/julia-buildpkg@v1.7.0
       - uses: julia-actions/julia-docdeploy@v1.3.1
         env:

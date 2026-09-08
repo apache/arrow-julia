@@ -30,7 +30,13 @@ features changed.
 ## Requirements
 
 Arrow 3.0 requires Julia 1.10 or later, ArrowTypes.jl 2.x, Tables.jl 1.14
-(the first release that provides `Tables.Scan`), and ArrowStrings.jl 1.0.
+(the first release that provides `Tables.Scan`), DataStrings.jl 1.0,
+DataDecimals.jl 1.0, and Durations.jl 1.0.
+
+Supported top-level decimal columns use `DataDecimals.Decimal{P,S,T}`.
+Negative-scale decimals retain raw coefficients. Calendar interval columns use
+`Durations.Duration`; elapsed Arrow Duration columns keep their Dates period types.
+Read-then-write retains the original decimal and interval wire descriptors.
 
 ## Materialized columns
 

@@ -567,13 +567,16 @@ end
 # pass-through: an unlowered literal comparing "equal" to raw storage would
 # change predicate semantics.
 _nativefacadeconversion(t::AC.ArrowType) =
-    _istemporalconv(t) || (t isa AC.DictionaryType && _nativefacadeconversion(t.valuetype))
+    _istemporalconv(t) ||
+    t isa Union{AC.DecimalType,AC.IntervalType} ||
+    (t isa AC.DictionaryType && _nativefacadeconversion(t.valuetype))
 _nativefacadeconversion(f::AC.Field) =
     _nativefacadeconversion(f.type) || any(_nativefacadeconversion, f.children)
 
 _equalityoperator(op) = op == Tables.OP_EQ || op == Tables.OP_NE
 
 _scancomparisonpreserving(::AC.ArrowType, op) = true
+_scancomparisonpreserving(::Union{AC.DecimalType,AC.IntervalType}, op) = false
 _scancomparisonpreserving(t::AC.DictionaryType, op) =
     _scancomparisonpreserving(t.valuetype, op)
 _scancomparisonpreserving(t::AC.DateType, op) = t.unit == AC.DAY || _equalityoperator(op)

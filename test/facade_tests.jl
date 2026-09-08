@@ -25,7 +25,9 @@ using Tables
 using Dates
 import DataAPI
 using Arrow
-using ArrowStrings
+using DataStrings
+import DataDecimals, Durations
+using DataStrings: StringVector, StringPayload, BytesVector, DataBytes
 
 struct _InterruptingInteger <: Integer end
 struct _OutOfMemoryInteger <: Integer end
@@ -1835,11 +1837,14 @@ end
         # Core _value methods are the authority), including Field-aware
         # compositions; empty and nonempty columns decide keep/drop alike.
         @test Arrow._declaredbasetype(Arrow.AC.ListViewType(false)) === Vector{Any}
-        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(10, 2, 32)) === Int32
-        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(38, 2, 128)) === Vector{UInt8}
-        @test Arrow._declaredbasetype(Arrow.AC.IntervalType(Arrow.AC.YEAR_MONTH)) === Int32
+        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(9, 2, 32)) ===
+              DataDecimals.Decimal32{2}
+        @test Arrow._declaredbasetype(Arrow.AC.DecimalType(38, 2, 128)) ===
+              DataDecimals.Decimal128{2}
+        @test Arrow._declaredbasetype(Arrow.AC.IntervalType(Arrow.AC.YEAR_MONTH)) ===
+              Durations.Duration
         @test Arrow._declaredbasetype(Arrow.AC.IntervalType(Arrow.AC.DAY_TIME)) ===
-              NamedTuple{(:days, :millis),Tuple{Int32,Int32}}
+              Durations.Duration
         dleaf = Arrow.AC.Field("v", Arrow.AC.BinaryType(false); nullable=true)
         druns = Arrow.AC.Field("run_ends", Arrow.AC.IntType(32, true); nullable=false)
         dref = Arrow.AC.Field(
@@ -1950,7 +1955,7 @@ end
             )
             @test isempty(getfield(tuo, :schema).fields)
         end
-        # End-to-end: Decimal64 rows are raw Int64 — an => Integer override
+        # End-to-end: Decimal64 rows are shared decimals — an => Real override
         # keeps the retained field for empty and nonempty columns alike.
         for (n, vals) in ((2, Int64[1234, 5678]), (0, Int64[]))
             dd = Arrow.AC.ArrayData(
@@ -1969,7 +1974,7 @@ end
                 dsch,
                 [Arrow.AC.RecordBatch(dsch, Arrow.AC.ArrayData[dd], n)],
             )
-            td = Arrow.Table(db; scan=Tables.Scan(select=(:dec => Integer,)))
+            td = Arrow.Table(db; scan=Tables.Scan(select=(:dec => Real,)))
             dsch2 = getfield(td, :schema)
             @test length(dsch2.fields) == 1
             @test dsch2.fields[1].type isa Arrow.AC.DecimalType
@@ -2182,7 +2187,7 @@ end
                     [AC.BufferSlice(), AC._databuffer(Int128[])];
                     nullcount=0,
                 ),
-                Vector{UInt8},
+                DataDecimals.Decimal{10,2,Int128},
             ),
             (
                 "d64",
@@ -2193,7 +2198,7 @@ end
                     [AC.BufferSlice(), AC._databuffer(Int64[])];
                     nullcount=0,
                 ),
-                Int64,
+                DataDecimals.Decimal{10,2,Int64},
             ),
             (
                 "iym",
@@ -2204,7 +2209,7 @@ end
                     [AC.BufferSlice(), AC._databuffer(Int32[])];
                     nullcount=0,
                 ),
-                Int32,
+                Durations.Duration,
             ),
             (
                 "imdn",
@@ -2215,7 +2220,7 @@ end
                     [AC.BufferSlice(), AC._databuffer(UInt8[])];
                     nullcount=0,
                 ),
-                NamedTuple{(:months, :days, :nanos),Tuple{Int32,Int32,Int64}},
+                Durations.Duration,
             ),
         ]
         for (name, t, mk, want) in cases
@@ -2251,7 +2256,7 @@ end
         ) === Vector{Any}
     end
 
-    @testset "ArrowStrings columns write as Utf8View, zero-copy" begin
+    @testset "DataStrings columns write as Utf8View, zero-copy" begin
         # A StringVector's memory IS a Utf8View array: payloads are the
         # views buffer, its byte buffers the variadic data buffers. Build one
         # the way the CSV kernel does (inline ≤12, else a view into buffer 0
@@ -2262,13 +2267,13 @@ end
         extra = Vector{UInt8}(codeunits("she said \"hi\" and left"))
         long1 = first(findfirst(codeunits("thirteen-byte"), buf))
         abcd = first(findfirst(codeunits("abcd"), buf))
-        payloads = ArrowStringPayload[
-            ArrowStrings.inline_payload(buf, abcd, 4),
-            ArrowStrings.view_payload(buf, long1, 13, 0, long1 - 1),
-            ArrowStrings.PAYLOAD_MISSING,
-            ArrowStrings.view_payload(extra, 1, length(extra), 1, 0),
+        payloads = StringPayload[
+            DataStrings.inline_payload(buf, abcd, 4),
+            DataStrings.view_payload(buf, long1, 13, 0, long1 - 1),
+            DataStrings.PAYLOAD_MISSING,
+            DataStrings.view_payload(extra, 1, length(extra), 1, 0),
         ]
-        col = StringVector{Union{Missing,ArrowString}}(payloads, buf, extra)
+        col = StringVector{Union{Missing,DataString}}(payloads, buf, extra)
         f, columnparts = Arrow._constructcolumn(:s, AbstractVector[col])
         d = only(columnparts)
         @test f.type == Arrow.AC.ViewType(true) && f.nullable
@@ -2283,7 +2288,7 @@ end
         @test eltype(t.s) === Union{Missing,String}
         @test isequal(t.s, ["abcd", "thirteen-byte", missing, "she said \"hi\" and left"])
         # a non-nullable column declares non-nullable
-        col0 = StringVector{ArrowString}(payloads[[1, 2]], buf, extra)
+        col0 = StringVector{DataString}(payloads[[1, 2]], buf, extra)
         f0, _ = Arrow._constructcolumn(:s, AbstractVector[col0])
         @test !f0.nullable
         Arrow.write(io, (s=col0,))
@@ -2291,10 +2296,10 @@ end
         # an all-inline column may have ZERO data buffers — the format allows
         # a Utf8View with no variadic buffers, and the wire carries exactly
         # the fixed validity + views pair
-        inl = StringVector{ArrowString}(
+        inl = StringVector{DataString}(
             [
-                ArrowStrings.inline_payload(buf, abcd, 4),
-                ArrowStrings.inline_payload(buf, abcd, 2),
+                DataStrings.inline_payload(buf, abcd, 4),
+                DataStrings.inline_payload(buf, abcd, 2),
             ],
             Vector{Vector{UInt8}}(),
         )

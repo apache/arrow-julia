@@ -3715,7 +3715,7 @@ end
 
 Wrap a vector of Arrow view entries as a Utf8View column, ZERO-COPY. `P` is
 any 16-byte isbits type whose values are Arrow StringView entries — the
-representation ArrowStrings' `ArrowString` columns use:
+representation DataStrings' `DataString` columns use:
 
     bytes 0..3    Int32 content length (negative marks a null slot)
     bytes 4..15   the content, zero-padded            (length ≤ 12)

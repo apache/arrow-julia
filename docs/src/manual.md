@@ -470,7 +470,7 @@ At the *top level* of a column the facade adds:
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
 | `NamedTuple` whose fields are core columns | Struct; `Union{Missing, T}` adds parent validity while child nullability stays declared |
 | `Arrow.DictEncode` over a writable column | Dictionary of the recursive mapping of its values |
-| `ArrowStrings.StringVector` | Utf8View, borrowed in memory and compacted for IPC output (see below) |
+| `DataStrings.StringVector` | Utf8View, borrowed in memory and compacted for IPC output (see below) |
 
 These native facade conversions do not recurse through list or struct shapes:
 a `Vector{Date}` inside a list, or a `Date` or `SubString` field of a
@@ -616,11 +616,11 @@ retained Field and the required logical length. Arrow does not manufacture a
 Julia object for every hidden child slot. This keeps Null-only fixed-size-list
 and inactive sparse-Union storage bounded by the bytes the output requires.
 
-### ArrowStrings columns
+### DataStrings columns
 
-[ArrowStrings.jl](https://github.com/apache/arrow-julia/tree/main/src/ArrowStrings)
-(a separate package that lives in this repository) defines
-`ArrowString`, a 16-byte string value that *is* an Arrow StringView entry
+[DataStrings.jl](https://github.com/JuliaData/DataStrings.jl)
+(registered in General) defines
+`DataString`, a 16-byte string value that *is* an Arrow StringView entry
 (inline up to 12 bytes, otherwise a prefix plus buffer index and offset),
 and `StringVector`, a column of them over a set of byte buffers —
 which *is* an Arrow Utf8View array's memory. A parser or other producer can
@@ -727,7 +727,7 @@ type descriptors are runtime values, layout dispatch goes through closed
 import/export, and the typed accessors `Arrow.ArrowCore.materialize(::Type{T},
 field, data)`) are statically resolvable. The repository's
 `test/trim_compile_tests.jl` gate holds that at zero verifier errors and
-warnings. The same gate exercises ArrowStrings construction, inline and view
+warnings. The same gate exercises DataStrings construction, inline and view
 access, missing values, comparison, and materialization. Arrow.jl itself
 supports Julia 1.10 and later; JuliaC's `--trim` needs Julia 1.12, so the gate
 runs only there. The dynamic facade conveniences (property access on
@@ -737,3 +737,16 @@ runs only there. The dynamic facade conveniences (property access on
 
 Arrow.jl 3.0 changes the storage model and removes some advanced Arrow 2.x
 write features. Read [Migrating from Arrow.jl 2.x](@ref) before you update.
+
+### Shared decimal and interval values
+
+Arrow uses DataDecimals 1 and Durations 1 from General. Top-level decimal columns
+with nonnegative scale decode to `DataDecimals.Decimal{P,S,T}`. The integer width
+matches the Arrow descriptor. Negative-scale decimals keep the raw representation.
+Calendar interval columns decode to `Durations.Duration`; elapsed-time duration
+columns still use `Dates.Second`, `Dates.Millisecond`, `Dates.Microsecond`, or
+`Dates.Nanosecond`.
+
+The writer accepts fixed-scale DataDecimals columns and Durations columns.
+It writes Durations as MONTH_DAY_NANO intervals. Rewriting a retained year-month
+or day-time interval checks that the value fits that original representation.

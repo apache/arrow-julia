@@ -65,7 +65,7 @@ jobs:
         shell: julia --project=. {0}
         run: |
           using Pkg
-          Pkg.develop([PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")])
+          Pkg.develop([PackageSpec(path="src/ArrowTypes")])
       - name: Report replay coordinates
         run: |
           echo "event=$GITHUB_EVENT_NAME"

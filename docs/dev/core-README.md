@@ -42,7 +42,7 @@ scope of every layer.
 | `src/columnconstruction.jl` | The deep column-construction module: fresh inference, retained-schema reconstruction, recursive ArrowTypes lowering, shared dictionary pools, partition agreement, and field metadata behind `_constructcolumn` |
 | `src/write.jl` | The write facade: partition binding, retained-field alignment, schema and batch assembly, compression selection, and IPC emission |
 | `ext/ArrowCloudStoreExt.jl` | CloudStore.jl objects as sources: HTTP `Range` reads, concurrent per planned range |
-| `src/ArrowStrings/` | ArrowStrings.jl — the shared inline-else-view string representation (`ArrowString`, `StringVector` = Utf8View memory); a separate package, registered on its own like ArrowTypes, that Arrow depends on through a `[sources]` path entry until its first release |
+| DataStrings.jl | Registered shared string scalars and columns |
 | `src/ArrowTypes/` | ArrowTypes.jl — the separate custom-type interface package; the facade applies its lowering and extension hooks recursively |
 | `test/support/AcceptanceSupport.jl` | One explicit private dependency seam for the four stable adapter acceptance suites; the C Data stress child uses its own narrow support module |
 | `test/support/SeededFuzz.jl` | Version-stable differential, layout-family, ranged-read, statistics-pruning, and bounded mutation fuzzing with exact replay artifacts |
@@ -58,7 +58,7 @@ On Julia 1.10, prepare a fresh checkout once before you run the commands below.
 Julia 1.10 does not read the repository's `[sources]` entries.
 
 ```bash
-julia --project=. -e 'using Pkg; Pkg.develop([PackageSpec(path="src/ArrowStrings"), PackageSpec(path="src/ArrowTypes")])'
+julia --project=. -e 'using Pkg; Pkg.develop([PackageSpec(path="src/ArrowTypes")])'
 ```
 
 ```bash
@@ -199,14 +199,14 @@ adapter normalizes). Julia vectors wrapped zero-copy by the builders or `heapreg
 scoped borrows: they must not be resized or mutated while their `ArrayData`
 or cached validation results are in use.
 
-`fromviewentries` wraps a vector of Arrow view entries (ArrowStrings'
-`ArrowStringPayload`, or any 16-byte isbits type with that layout) and
+`fromviewentries` wraps a vector of Arrow view entries (DataStrings'
+`StringPayload`, or any 16-byte isbits type with that layout) and
 its data buffers as a Utf8View column, zero-copy — the payload vector IS the
 views buffer and every data buffer is retained by identity; only the
 validity bitmap is built, and long-entry geometry (offsets inside their
 buffer, prefixes matching the data) is checked by semantic/full validation,
 not at construction. The facade's `Arrow.write` routes
-`ArrowStrings.StringVector` columns through it.
+`DataStrings.StringVector` columns through it.
 
 ### IPC
 
@@ -457,7 +457,7 @@ JuliaC's `--trim=safe` and requires **zero verifier errors, zero verifier
 warnings, and a produced binary that runs to exit 0**. The workload covers
 regions, mmap, C-data export/import/release, dynamic values, typed values
 (a `from_c_data` → `materialize(Int64, …)` scenario among them), and
-validation errors. It also covers ArrowStrings construction, inline and view
+validation errors. It also covers DataStrings construction, inline and view
 access, missing values, comparison, and materialization. The rules that keep a
 runtime-tagged core there:
 
