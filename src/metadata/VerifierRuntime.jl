@@ -210,7 +210,13 @@ function _venum(t::VTable, slot::Base.Int, width::Base.Int, valid)
     return nothing
 end
 
-function _vstring(t::VTable, slot::Base.Int, ctx::VerifyContext; required::Base.Bool=false)
+function _vstring(
+    t::VTable,
+    slot::Base.Int,
+    ctx::VerifyContext;
+    required::Base.Bool=false,
+    utf8::Base.Bool=true,
+)
     p = _vref(t, slot; required=required)
     p === nothing && return nothing
     p % 4 == 0 || _vfail("string length is misaligned")
@@ -220,8 +226,10 @@ function _vstring(t::VTable, slot::Base.Int, ctx::VerifyContext; required::Base.
     _vrange(t.bytes, start, checked_add(n, Int64(1)), "string")
     t.bytes[start + n + 1] == 0 || _vfail("string has no NUL terminator")
     _vcharge!(ctx, checked_add(METADATA_STRING_BASE_RESERVE, n), "string")
-    payload = @view t.bytes[(start + 1):(start + n)]
-    isvalid(String, payload) || _vfail("string is not valid UTF-8")
+    if utf8
+        payload = @view t.bytes[(start + 1):(start + n)]
+        isvalid(String, payload) || _vfail("string is not valid UTF-8")
+    end
     return nothing
 end
 

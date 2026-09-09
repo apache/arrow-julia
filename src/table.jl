@@ -87,6 +87,24 @@ struct Table <: Tables.AbstractColumns
     retainedpools::Vector{Any}
 end
 
+"""
+    copy(table::Arrow.Table) -> Arrow.Table
+
+Copy each materialized column and retain the schema and dictionary category
+order. The new table holds no source mappings. As with `copy` on Julia
+vectors, nested mutable values can still be shared.
+"""
+function Base.copy(t::Table)
+    return _table(
+        copy(getfield(t, :names)),
+        AbstractVector[copy(c) for c in getfield(t, :columns)],
+        getfield(t, :schema),
+        AC.OwnerRegion[],
+        getfield(t, :nrows),
+        Any[p === nothing ? nothing : copy(p) for p in getfield(t, :retainedpools)],
+    )
+end
+
 # Construct a Table with deliberately replaced materialized columns (the
 # facade tests exercise refusal paths this way). The passed lookup is
 # ignored and rebuilt from `names`, and no dictionary pools are retained.

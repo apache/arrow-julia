@@ -857,6 +857,33 @@ end
 
 Base.length(d::ArrayData) = d.len
 
+"""
+    copy(data::ArrayData) -> ArrayData
+
+Detach all buffer slices, children, and dictionary values into Julia-owned
+byte arrays. Preserve the layout and element offset. The result has no
+foreign owner or release callback and remains usable after the source is
+released. Keep its `Field` to materialize named values with `materialize`.
+
+The source must remain valid and unchanged during the copy. This copies
+whole declared buffer slices, which can include values outside a logical
+array slice. Semantic validation is not inherited.
+
+Do not use `deepcopy` to detach Arrow storage: it copies raw pointer and
+release bookkeeping fields without rebuilding their ownership.
+"""
+function Base.copy(d::ArrayData)
+    return ArrayData(
+        d.type,
+        d.len,
+        [_databuffer(slicebytes(b)) for b in d.buffers];
+        offset=d.offset,
+        children=map(copy, d.children),
+        dictionary=d.dictionary === nothing ? nothing : copy(d.dictionary),
+        nullcount=@atomic(:monotonic, d.nullcount),
+    )
+end
+
 # Adapter-private certificate set. An entry means that one immutable
 # dictionary pool snapshot already passed structural, intrinsic semantic, and
 # Field-contract validation under the adapter's canonical value Field.
@@ -1137,15 +1164,6 @@ function _validate_descriptor(t::DictionaryType)
     return nothing
 end
 
-function _validate_metadata(metadata, what::AbstractString)
-    metadata === nothing && return nothing
-    for (key, value) in metadata
-        isvalid(key) || throw(ValidationError("$what metadata key is not valid UTF-8"))
-        isvalid(value) || throw(ValidationError("$what metadata value is not valid UTF-8"))
-    end
-    return nothing
-end
-
 function _validate_schema(s::Schema)
     s.endianness in (LittleEndian, BigEndian) ||
         throw(ValidationError("invalid Arrow schema endianness $(repr(s.endianness))"))
@@ -1154,7 +1172,6 @@ function _validate_schema(s::Schema)
             "non-native Arrow schema endianness must be normalized before Core access",
         ),
     )
-    _validate_metadata(s.metadata, "schema")
     return s
 end
 
@@ -1181,7 +1198,6 @@ function _validate_structural(
     validated_dictionaries::Union{Nothing,_ValidatedDictionaries},
 )
     isvalid(f.name) || throw(ValidationError("field name is not valid UTF-8"))
-    _validate_metadata(f.metadata, "field")
     typeequal(f.type, d.type) || throw(
         ValidationError(
             "field/type mismatch: $(descriptorname(f.type)) vs $(descriptorname(d.type))",
@@ -3809,6 +3825,9 @@ struct RecordBatch
         return new(schema, cols, n)
     end
 end
+"Copy a record batch with detached column buffers and the same immutable schema."
+Base.copy(b::RecordBatch) = RecordBatch(b.schema, map(copy, b.columns), b.nrows)
+
 RecordBatch(schema::Schema, columns) =
     RecordBatch(schema, columns, isempty(columns) ? 0 : length(first(columns)))
 

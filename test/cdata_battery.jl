@@ -1780,53 +1780,27 @@ function cdata_battery()
         release!(plains)
     end
     reap!()
-    # A stream schema travels without any batch, so Core's structural schema
-    # invariants (UTF-8 names and metadata) are checked on the schema ITSELF
-    # in both directions — a zero-batch stream must not export or import a
-    # schema Core would refuse. Export refuses before publishing (no
-    # registry root); import refuses after the schema move and releases the
-    # moved stream exactly once.
-    badkey = String([0xff])
-    for badsch in (
-        Schema(Field[smf]; metadata=[badkey => "v"]),
-        Schema(Field[smf]; metadata=["k" => badkey]),
-        Schema(Field[Field("x", IntType(64, true); metadata=["k" => badkey])]),
+    # Metadata is opaque binary data, including schema-only streams.
+    binary = String([0xff, 0x00, 0x80])
+    for binsch in (
+        Schema(Field[smf]; metadata=[binary => "v"]),
+        Schema(Field[smf]; metadata=["k" => binary]),
+        Schema(Field[Field("x", IntType(64, true); metadata=["k" => binary])]),
     )
-        badref = Ref{CArrowArrayStream}()
-        GC.@preserve badref begin
-            badp = Base.unsafe_convert(Ptr{CArrowArrayStream}, badref)
-            @assert try
-                export_stream!(badp, badsch, AC.RecordBatch[])
-                false
-            catch e
-                e isa ValidationError && occursin("UTF-8", e.msg)
-            end
+        binref = Ref{CArrowArrayStream}()
+        GC.@preserve binref begin
+            binp = Base.unsafe_convert(Ptr{CArrowArrayStream}, binref)
+            export_stream!(binp, binsch, AC.RecordBatch[])
+            bins = from_c_stream(binp)
+            @assert isequal(bins.schema.metadata, binsch.metadata)
+            @assert isequal(bins.schema.fields[1].metadata, binsch.fields[1].metadata)
+            @assert nextbatch!(bins) === nothing
+            release!(bins)
+            @assert binref[].release == C_NULL
         end
+        reap!()
     end
     @assert _stream_registry_count() == stbefore
-    # Import side: a foreign producer whose zero-batch stream carries invalid
-    # UTF-8 schema metadata. The exported stream materializes its schema
-    # blob at each get_schema call from the Field's metadata strings, so
-    # corrupting those bytes AFTER a valid export is exactly that producer.
-    # The importer must refuse at the schema and release the moved stream
-    # exactly once — no batch is ever pulled.
-    corruptkey = String(copy(codeunits("kk")))     # a fresh, un-interned string
-    corruptsch = Schema(Field[smf]; metadata=[corruptkey => "vv"])
-    corruptref = Ref{CArrowArrayStream}()
-    GC.@preserve corruptref corruptkey begin
-        corruptp = Base.unsafe_convert(Ptr{CArrowArrayStream}, corruptref)
-        export_stream!(corruptp, corruptsch, AC.RecordBatch[])
-        unsafe_store!(pointer(corruptkey), 0xff, 1)
-        @assert try
-            from_c_stream(corruptp)
-            false
-        catch e
-            e isa ValidationError && occursin("UTF-8", e.msg)
-        end
-        @assert corruptref[].release == C_NULL     # moved, then released once
-    end
-    @assert _stream_registry_count() == stbefore
-    reap!()
     println("schema metadata crosses the C stream boundary ✓")
 
     childscript = joinpath(@__DIR__, "cdata_stress_child.jl")

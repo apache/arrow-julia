@@ -1271,9 +1271,8 @@ end
 Parse a C metadata blob. The pair count and the key/value lengths are
 producer-declared, the same trust as every other C Data pointer, but a
 negative length is rejected: it would wrap the walk. Metadata bytes are
-taken by declared length and are not UTF-8-checked here: every import runs
-`validate_semantic`, whose structural stage checks them before a `Field`
-escapes, and the stream path re-checks per batch in `_validate_stream_field`.
+opaque binary key/value data, copied by declared length without UTF-8
+validation. Embedded NUL bytes are preserved.
 """
 function _import_cmetadata(p::Ptr{UInt8})
     p == C_NULL && return nothing
@@ -1719,7 +1718,7 @@ function _stream_release(sp::Ptr{CArrowArrayStream})::Cvoid
     return nothing
 end
 
-# Core's structural schema invariants (endianness, UTF-8 names and metadata,
+# Core's structural schema invariants (endianness, UTF-8 names,
 # valid descriptors) for the whole schema TREE. Stream schemas travel
 # separately from any batch, so both stream directions apply this walk to the
 # schema itself — a zero-batch stream never reaches batch validation.
@@ -1733,7 +1732,6 @@ end
 
 function _validate_stream_field(f::Field)
     isvalid(f.name) || throw(ValidationError("field name is not valid UTF-8"))
-    AC._validate_metadata(f.metadata, "field")
     AC._validate_descriptor_of(f.type)
     for c in f.children
         _validate_stream_field(c)

@@ -15,6 +15,7 @@
 # limitations under the License.
 
 [deps]
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 DataDecimals = "3e2245cb-6932-498d-a7cf-39d39de8bde3"
 Durations = "41ac09f5-0a95-4810-aa18-c88bf48ee130"
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"

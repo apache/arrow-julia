@@ -201,7 +201,7 @@ function ipc_write_battery()
     # Schema-only output still validates the full Schema/Field envelope.
     invalidname = String(UInt8[0xff])
     badnameschema = Schema(Field[Field(invalidname, IntType(64, true))])
-    badmetaschema = Schema(emptysch.fields; metadata=[invalidname => "value"])
+    binaryschema = Schema(emptysch.fields; metadata=[invalidname => "value"])
     bigschema = Schema(emptysch.fields; endianness=AC.BigEndian)
     badreeschema = Schema(
         Field[Field(
@@ -215,11 +215,14 @@ function ipc_write_battery()
     )
     @assert _rejects(() -> writestream(badnameschema, AC.RecordBatch[]))
     @assert _rejects(() -> writefile(badnameschema, AC.RecordBatch[]))
-    @assert _rejects(() -> writefile(badmetaschema, AC.RecordBatch[]))
+    binaryfile = readfile(writefile(binaryschema, AC.RecordBatch[]))
+    @assert collect(binaryfile.schema.metadata) == [invalidname => "value"]
     @assert _rejects(() -> writestream(bigschema, AC.RecordBatch[]))
     @assert _rejects(() -> writestream(badreeschema, AC.RecordBatch[]))
     @assert _rejects(() -> writefile(badreeschema, AC.RecordBatch[]))
-    println("schema-only writers validate names, metadata, endianness, and REE children ✓")
+    println(
+        "schema-only writers preserve binary metadata and validate names, endianness, and REE children ✓",
+    )
 
     # A Field object is one writer-side dictionary-id key. Reusing that exact
     # object at two positions must not collapse two distinct pools onto one id.

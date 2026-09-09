@@ -28,6 +28,7 @@ Arrow.Table
 Arrow.Stream
 Arrow.Limits
 Arrow.release!(::Arrow.Table)
+Base.copy(::Arrow.Table)
 Arrow.getmetadata
 ```
 

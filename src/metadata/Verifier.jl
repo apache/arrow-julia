@@ -1100,8 +1100,8 @@ end
 
 function verifyrefs_KeyValue(t::VTable, ctx::VerifyContext, depth::Base.Int)
     bytes = t.bytes
-    _vstring(t, 0, ctx; required=true)
-    _vstring(t, 1, ctx; required=true)
+    _vstring(t, 0, ctx; required=true, utf8=false)
+    _vstring(t, 1, ctx; required=true, utf8=false)
     return nothing
 end
 

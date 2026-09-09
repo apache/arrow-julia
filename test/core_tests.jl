@@ -1089,14 +1089,14 @@ end
 
             badutf8 = String(UInt8[0xff])
             for metadata in (Dict(badutf8 => "v"), Dict("k" => badutf8))
-                badfield = Field("metadata", IntType(8, true); metadata=metadata)
-                baddata = AC.ArrayData(
-                    badfield.type,
+                binaryfield = Field("metadata", IntType(8, true); metadata=metadata)
+                binarydata = AC.ArrayData(
+                    binaryfield.type,
                     0,
                     [BufferSlice(), BufferSlice()];
                     nullcount=0,
                 )
-                @test_throws ValidationError validate_structural(badfield, baddata)
+                @test validate_structural(binaryfield, binarydata) === binarydata
             end
             badtimezone = TimestampType(AC.SECOND, badutf8)
             @test_throws ValidationError validate_structural(
@@ -1845,16 +1845,10 @@ end
         empty_schema = Schema(Field[])
         @test RecordBatch(empty_schema, ArrayData[], 7).nrows == 7
         badutf8 = String(UInt8[0xff])
-        @test_throws ValidationError RecordBatch(
-            Schema(Field[]; metadata=Dict(badutf8 => "v")),
-            ArrayData[],
-            0,
-        )
-        @test_throws ValidationError RecordBatch(
-            Schema(Field[]; metadata=Dict("k" => badutf8)),
-            ArrayData[],
-            0,
-        )
+        for metadata in (Dict(badutf8 => "v"), Dict("k" => badutf8))
+            binaryschema = Schema(Field[]; metadata=metadata)
+            @test RecordBatch(binaryschema, ArrayData[], 0).schema === binaryschema
+        end
         badendian = reinterpret(AC.Endianness, UInt8(0xff))
         @test_throws ValidationError RecordBatch(
             Schema(Field[]; endianness=badendian),

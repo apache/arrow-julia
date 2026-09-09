@@ -98,6 +98,11 @@ further iteration cleanly. Every yielded `Table` shares the source lifetime:
 releasing a batch closes its parent `Stream`, while the batch's materialized
 columns remain usable.
 
+`copy(table)` copies the materialized columns and keeps no source mappings.
+Nested mutable values follow Julia's usual shallow `copy` rules.
+`Serialization.serialize` saves the table's Julia values, schema, and retained
+dictionary pools. Deserialization returns a table with no source mappings.
+
 ### `Arrow.Stream`
 
 [`Arrow.Stream`](@ref) iterates a source one record batch at a time; each
@@ -701,6 +706,31 @@ converts imported column data back to a Julia vector.
 * `Arrow.export_stream!(streamptr, schema, batches)` fills a caller-owned
   `ArrowArrayStream`; `Arrow.from_c_stream(streamptr)` imports one and
   yields record batches through `Arrow.nextbatch!`.
+
+`copy(data::Arrow.ArrayData)` copies all declared buffer slices, children,
+and dictionary values into Julia-owned byte arrays. It preserves the physical
+layout and element offset. The result has no foreign owner or release callback.
+Keep the associated `Field` to get named values with
+`Arrow.materialize(field, copied)`. `copy(batch::Arrow.RecordBatch)` detaches
+all its columns and preserves its immutable schema and row count.
+
+`Serialization.serialize` uses the same ownership boundary. It saves buffer
+bytes and reconstructs fresh owners on deserialization. It does not save raw
+addresses, foreign callbacks, or cached semantic validation. This works for
+`ArrayData` and record batches, including nested and dictionary arrays. Load
+`Serialization` to enable this support. The source must remain valid and
+unchanged until copying or serialization finishes.
+
+!!! warning "Do not use deepcopy to detach Arrow storage"
+    `deepcopy` is not specialized for these objects. It copies raw pointer
+    fields and release bookkeeping without rebuilding ownership. The copy
+    can still point to the source storage after that storage is released.
+    Access or release through the copy can then use freed memory. Use `copy`
+    or `Serialization.serialize` for a detached value instead.
+
+Custom metadata keys and values are opaque byte strings. Import and export
+preserve invalid UTF-8 and embedded NUL bytes in metadata. C format strings
+and field names still follow the C Data interface's UTF-8 requirements.
 
 For example, handing a column to PyArrow in-process through PythonCall:
 

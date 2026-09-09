@@ -40,14 +40,17 @@ TranscodingStreams = "3bb67fe8-82b1-5028-8e26-92a6c54297fa"
 ArrowTypes = {path = "src/ArrowTypes"}
 
 [weakdeps]
+Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 CloudStore = "3365d9ee-d53b-4a56-812d-5344d5b716d7"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
 [extensions]
+ArrowSerializationExt = "Serialization"
 ArrowCloudStoreExt = "CloudStore"
 ArrowTimeZonesExt = "TimeZones"
 
 [compat]
+Serialization = "1.10"
 DataDecimals = "1"
 Durations = "1"
 DataStrings = "1"

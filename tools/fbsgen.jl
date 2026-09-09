@@ -743,7 +743,12 @@ function emitverifier(io::IO, alldecls)
             elseif haskey(SCALARS, t)
                 println(inline, "    _vfield(t, ", slot, ", ", SCALARS[t][2], reqkw, ")")
             elseif t == "string"
-                println(refs, "    _vstring(t, ", slot, ", ctx", reqkw, ")")
+                # Arrow custom metadata is opaque binary data despite its
+                # FlatBuffers string representation. Keep framing checks.
+                strkw =
+                    d.name == "KeyValue" ?
+                    (req ? "; required=true, utf8=false" : "; utf8=false") : reqkw
+                println(refs, "    _vstring(t, ", slot, ", ctx", strkw, ")")
             elseif isvector(t)
                 et = elemtype(t)
                 if haskey(enums, et) && !enums[et].isunion

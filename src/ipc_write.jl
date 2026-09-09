@@ -747,7 +747,6 @@ function _validatewriterschema(sch::Schema)
     AC._validate_schema(sch)
     function walk(f::Field)
         isvalid(f.name) || throw(ValidationError("field name is not valid UTF-8"))
-        AC._validate_metadata(f.metadata, "field")
         foreach(walk, f.children)
         return nothing
     end

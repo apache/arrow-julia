@@ -36,6 +36,7 @@ include("ipc_view_output_tests.jl")
 
 # Read-then-rewrite fidelity through the facade, plus reader-budget accounting.
 include("rewrite_regressions.jl")
+include("detached_values_tests.jl")
 
 # The Arrow 2.x compatibility surface (getmetadata, tobuffer, curried write,
 # removed-keyword warnings, typed scan overrides) and the ArrowTimeZonesExt
