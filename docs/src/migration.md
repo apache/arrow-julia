@@ -119,9 +119,11 @@ sum(table.id)
 
 ## Removed input support
 
-Arrow 2.x read delta dictionary batches. Arrow 3.0 rejects delta dictionary
-batches and big-endian IPC input, so a file that Arrow 2.x accepted can now
-fail with a validation error.
+Arrow 3.0 rejects big-endian IPC input. Dictionary deltas remain supported
+in streams and files. Stream replacements are accepted even when the schema
+omits `DICTIONARY_REPLACEMENT`; earlier record batches keep their original
+dictionaries. A delta requires an existing base dictionary. IPC files permit
+one base per dictionary id followed by deltas, but not replacements.
 
 ## Writing
 

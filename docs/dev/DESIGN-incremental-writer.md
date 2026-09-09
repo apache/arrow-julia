@@ -171,7 +171,7 @@ place and v1 should not normalize that risk. Revisit on demand.)
 - No `ntasks`-style pipelining: `writebatch!` is serial. The 2.x
   concurrency was a large share of its bug surface; add measured
   parallelism later if benchmarks demand it.
-- No delta dictionaries (the 3.0 reader rejects them by design) and no
+- No delta emission (the reader accepts deltas from other producers) and no
   file-format pool growth.
 - No append-to-file-format in v1.
 

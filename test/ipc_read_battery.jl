@@ -491,8 +491,8 @@ function ipc_read_battery()
     end
     @assert _rejects(() -> readstream(wrongdict))
 
-    # A repeated full dictionary is replacement. It is legal only when the
-    # schema declares DICTIONARY_REPLACEMENT in its features vector.
+    # A repeated full dictionary is replacement, even without a schema
+    # feature declaration (as emitted by PyArrow).
     dictidx === nothing && error("acceptance stream has no dictionary batch")
     spans = _frameinfo(bytes)
     duplicate = vcat(
@@ -500,7 +500,7 @@ function ipc_read_battery()
         bytes[spans[dictidx].frame],
         bytes[(last(spans[dictidx].frame) + 1):end],
     )
-    @assert _rejects(() -> readstream(duplicate))
+    @assert length(readstream(duplicate).batches) == length(stream.batches)
 
     replaced = readstream(_dictionary_replacement_stream())
     @assert length(replaced.batches) == 2
@@ -509,7 +509,9 @@ function ipc_read_battery()
     @assert materialize(df, replaced.batches[2].columns[1]) == ["xx", "yy", "xx"]
     @assert replaced.batches[1].columns[1].dictionary !==
             replaced.batches[2].columns[1].dictionary
-    println("dictionary replacement is feature-gated and snapshots stay immutable ✓")
+    println(
+        "dictionary replacement accepts absent feature flags and snapshots stay immutable ✓",
+    )
 
     nestedvals = [[Int64(1), 2], [3]]
     sharedbytes = _fixture2x("shared-nested-dict") do

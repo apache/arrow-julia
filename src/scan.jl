@@ -1347,6 +1347,7 @@ function _runboundscan(
         # empty NamedTuple cannot carry a row count. Header reads share one
         # cumulative allocation budget, like the column path.
         keep = _zerofieldpredicate(b.filter)
+        messageversion = Ref(Int16(0))
         n = _zerofieldwindow(
             (_batchrows(f, i, budget) for i = 1:length(f)),
             keep,
@@ -1924,6 +1925,7 @@ function _zerofieldblockcount(
     version::Int16,
     fields::Vector{Field},
     budget::AllocationBudget,
+    messageversion::Base.RefValue{Int16},
 )
     _, metalen, bodylen = block
     declared = metalen - 8
@@ -1940,7 +1942,8 @@ function _zerofieldblockcount(
     msg, v, header_type = _parseblockmeta(payload, block, sf.limits, budget)
     header_type == UInt8(3) ||
         throw(ValidationError("footer record block is not a record batch"))
-    v == version || throw(ValidationError("IPC metadata version changes within the file"))
+    expected = messageversion[] == 0 ? v : messageversion[]
+    messageversion[] = _filemetadataversion(version, v, expected)
     rejectexperimentalcompression(msg, v, header_type)
     return _recordbatchmeta(msg.header::Meta.RecordBatch, fields, sf.limits, bodylen)
 end
@@ -1981,10 +1984,10 @@ function _runboundscan(
             ),
         )
         keep = _zerofieldpredicate(b.filter)
+        messageversion = Ref(Int16(0))
         n = _zerofieldwindow(
             (
-                _zerofieldblockcount(sf, block, version, fields, budget) for
-                block in recordblocks
+                _zerofieldblockcount(sf, block, version, fields, budget, messageversion) for block in recordblocks
             ),
             keep,
             b.limit,
@@ -2073,11 +2076,12 @@ function _runboundscan(
                 "footer record block is not a record batch",
             ),
         )
-        v == version ||
-            throw(ValidationError("IPC metadata version changes within the file"))
+        _filemetadataversion(version, v, i == 1 ? v : blockmeta[1][2])
         rejectexperimentalcompression(msg, v, header_type)
         blockmeta[i] = (msg, v)
     end
+
+    isempty(blockmeta) || (version = blockmeta[1][2])
 
     # RecordBatch lengths live in block metadata, not the Footer. The metadata
     # pass above is required before limit/offset can choose body ranges.
@@ -2132,11 +2136,9 @@ function _runboundscan(
         header = msg.header
         header isa Meta.DictionaryBatch ||
             throw(ValidationError("footer dictionary block is not a dictionary batch"))
-        header.isDelta && throw(ValidationError("delta dictionaries are not supported"))
         haskey(dictids, header.id) ||
             throw(ValidationError("dictionary batch has unknown id $(header.id)"))
-        header.id in seenids &&
-            throw(ValidationError("the file format carries one dictionary batch per id"))
+        _dictionarytransition(header.id, header.isDelta, header.id in seenids; file=true)
         push!(seenids, header.id)
         rb = header.data
         vf = dictvaluefields[header.id]
@@ -2264,9 +2266,17 @@ function _runboundscan(
                         "dictionary RecordBatch length does not match its field node",
                     ),
                 )
-                validate_semantic(vf, decoded)
-                validated[decoded] = nothing
-                dicts[header.id] = decoded
+                _updatedictionary!(
+                    dicts,
+                    validated,
+                    header.id,
+                    header.isDelta,
+                    vf,
+                    decoded,
+                    limits,
+                    budget;
+                    file=true,
+                )
             end
         end
 

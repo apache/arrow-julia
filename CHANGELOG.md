@@ -62,7 +62,10 @@ writer, validation, scan, and C interface engines.
   the `Arrow` namespace. Only `release!` and `ArrowTypes` are exported.
   Packages that define custom mappings should still depend on and import
   ArrowTypes.jl directly.
-- Big-endian IPC and delta-dictionary messages are rejected.
+- Stream dictionary replacements are accepted with or without a schema feature
+  declaration. Dictionary deltas are read in streams and files, including scans;
+  each stream record batch retains its dictionary snapshot.
+- Big-endian IPC is rejected.
 - Arrow 3.0 requires ArrowTypes.jl 2.x, Tables.jl 1.14 (the first release
   with `Tables.Scan`), DataStrings.jl 1.0, DataDecimals.jl 1.0, and Durations.jl 1.0.
 - Supported top-level decimals and calendar intervals use shared DataDecimals

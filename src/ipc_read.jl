@@ -1321,7 +1321,6 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
     validated_dictionaries = AC._ValidatedDictionaries()
     batchslots = Union{Nothing,AC.RecordBatch}[]
     pending = PendingRecord[]
-    features = Set(msgs[1].features)
     schemaversion = msgs[1].version
     try
         for fm in msgs[2:end]
@@ -1331,20 +1330,12 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
             rejectexperimentalcompression(fm)
             header = fm.msg.header
             if header isa Meta.DictionaryBatch
-                header.isDelta &&
-                    throw(ValidationError("delta dictionaries are not supported"))
                 rb = header.data
                 codec = _batchcodec(rb.compression, fm.version)
                 haskey(dictids, header.id) ||
                     throw(ValidationError("dictionary batch has unknown id $(header.id)"))
                 replacement = haskey(dicts, header.id)
-                if replacement && !(1 in features)
-                    throw(
-                        ValidationError(
-                            "dictionary replacement used without required schema feature",
-                        ),
-                    )
-                end
+                _dictionarytransition(header.id, header.isDelta, replacement)
                 # A dictionary batch's payload is a one-column record batch of
                 # the VALUE type, so the generic decoder handles it. Pool
                 # nullability is independent of the encoded index field.
@@ -1373,13 +1364,16 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
                         "dictionary RecordBatch length does not match its field node",
                     ),
                 )
-                # Certify the entire immutable pool snapshot before publication.
-                # Later record validation may then skip every recursive stage for
-                # this exact identity. Replacements decode to a new identity and
-                # must earn their own certificate here.
-                validate_semantic(vf, decoded)
-                validated_dictionaries[decoded] = nothing
-                dicts[header.id] = decoded
+                decoded = _updatedictionary!(
+                    dicts,
+                    validated_dictionaries,
+                    header.id,
+                    header.isDelta,
+                    vf,
+                    decoded,
+                    limits,
+                    budget,
+                )
 
                 # The IPC spec permits an all-null dictionary column before its
                 # first DictionaryBatch. Resolve only the missing dictionary;

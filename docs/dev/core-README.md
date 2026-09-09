@@ -212,8 +212,9 @@ not at construction. The facade's `Arrow.write` routes
 
 The reader maps every layout above, including nested dictionary encoding
 (read and written in dependency order). It accepts V4 and V5 metadata on
-little-endian hosts, supports feature-gated full dictionary replacement,
-preserves old dictionary snapshots, and rejects delta dictionaries. It
+little-endian hosts, accepts full dictionary replacement in streams with or
+without the schema feature flag, and supports dictionary deltas in streams and
+files. Updates publish new immutable pools and preserve old stream snapshots. It
 requires the eight-byte continuation-marker framing (the pre-0.15 four-byte
 prefix is not accepted). Compression uses the V5 `BodyCompression` field
 for LZ4_FRAME and ZSTD; it accepts the `COMPRESSED_BODY` schema feature and

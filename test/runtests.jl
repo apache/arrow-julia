@@ -33,6 +33,7 @@ include("property_tests.jl")
 
 # Persist only referenced content from shared Utf8View/BinaryView buffers.
 include("ipc_view_output_tests.jl")
+include("ipc_dictionary_tests.jl")
 
 # Read-then-rewrite fidelity through the facade, plus reader-budget accounting.
 include("rewrite_regressions.jl")

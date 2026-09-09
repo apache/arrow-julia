@@ -1678,15 +1678,25 @@ end
 Open an IPC-format file: verify both magics, the footer length, the footer
 flatbuffer, and the schema; eagerly decode the dictionary blocks (shared by
 every record batch); expose record batches lazily through the Block index.
-Pass `mmapregion(path)` to read a file through Core's mmap path. Duplicate
-dictionary ids and delta dictionaries are format errors here — the file
-format carries exactly one dictionary batch per id.
+Pass `mmapregion(path)` to read a file through Core's mmap path. The file
+format permits one base dictionary per id, followed by deltas.
+Full dictionary replacement remains a format error.
 """
 readfile(bytes::Vector{UInt8}; limits::Limits=Limits()) =
     _readfile(heapregion(bytes), limits, AllocationBudget(limits.max_total_allocated_bytes))
 
 readfile(region::OwnerRegion; limits::Limits=Limits()) =
     _readfile(region, limits, AllocationBudget(limits.max_total_allocated_bytes))
+
+# C++ WriteFileFooter uses its current metadata version even when the
+# writer emits V4 messages. The footer must not select the message layout.
+function _filemetadataversion(footer::Int16, message::Int16, expected::Int16=message)
+    message == expected ||
+        throw(ValidationError("IPC metadata version changes within the file"))
+    (footer == message || (footer == Int16(4) && message == Int16(3))) ||
+        throw(ValidationError("file schema and footer metadata versions differ"))
+    return message
+end
 
 function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget)
     _requirelittleendian()
@@ -1740,8 +1750,7 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
     # optional EOS marker: a no-EOS file may end its last data buffer with the
     # same byte pattern.
     schemafm, schemaend = _fileschema(region, footerstart, limits, budget)
-    schemafm.version == version ||
-        throw(ValidationError("file schema and footer metadata versions differ"))
+    version = _filemetadataversion(version, schemafm.version)
     schemafm.features == features ||
         throw(ValidationError("file schema and footer features differ"))
     _schemaequal(schemafm.msg.header::Meta.Schema, metaschema) ||
@@ -1781,11 +1790,13 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
             header = fm.msg.header
             header isa Meta.DictionaryBatch ||
                 throw(ValidationError("footer dictionary block is not a dictionary batch"))
-            header.isDelta && throw(ValidationError("delta dictionaries are not supported"))
             haskey(dictids, header.id) ||
                 throw(ValidationError("dictionary batch has unknown id $(header.id)"))
-            haskey(dicts, header.id) && throw(
-                ValidationError("the file format carries one dictionary batch per id"),
+            _dictionarytransition(
+                header.id,
+                header.isDelta,
+                haskey(dicts, header.id);
+                file=true,
             )
             rb = header.data
             codec = _batchcodec(rb.compression, fm.version)
@@ -1809,9 +1820,17 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
                     "dictionary RecordBatch length does not match its field node",
                 ),
             )
-            validate_semantic(vf, decoded)
-            validated[decoded] = nothing
-            dicts[header.id] = decoded
+            _updatedictionary!(
+                dicts,
+                validated,
+                header.id,
+                header.isDelta,
+                vf,
+                decoded,
+                limits,
+                budget;
+                file=true,
+            )
         end
         # Every id a record batch may reference must be resolvable now unless
         # that batch proves all-null use — checked per batch at decode.
