@@ -20,7 +20,13 @@ using Test, Arrow, Tables
 const AC = Arrow.AC
 const Meta = Arrow.Meta
 const FB = Arrow.FB
-include("support/SeededFuzz.jl")
+# Reuse the property suite's module in the full run: loading it twice
+# overwrites its global ArrowTypes extension registrations.
+const Fuzz = if isdefined(parentmodule(@__MODULE__), :PropertyTests)
+    getfield(getfield(parentmodule(@__MODULE__), :PropertyTests), :SeededFuzz)
+else
+    include("support/SeededFuzz.jl")
+end
 
 # The normal suite consumes independently produced PyArrow 25.0.1 bytes.
 # Regenerate with: python test/support/generate_dictionary_fixtures.py
@@ -255,9 +261,9 @@ end
 
 @testset "Physical dictionary delta layouts" begin
     for case in (
-        SeededFuzz._logical_layout_case(),
-        SeededFuzz._physical_layout_case(),
-        SeededFuzz._union_layout_case(),
+        Fuzz._logical_layout_case(),
+        Fuzz._physical_layout_case(),
+        Fuzz._union_layout_case(),
     )
         for (vf, pool) in zip(case.schema.fields, case.batches[1].columns)
             vf.type isa AC.DictionaryType && continue
