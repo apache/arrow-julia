@@ -136,7 +136,7 @@ The source release rc${rc} is hosted at [2].
 Please download, verify checksums and signatures, run the unit tests,
 and vote on the release. See [3] for how to validate a release candidate.
 
-The vote will be open for at least 24 hours.
+The vote will be open for at least 72 hours.
 
 [ ] +1 Release this as Apache Arrow Julia ${version}
 [ ] +0

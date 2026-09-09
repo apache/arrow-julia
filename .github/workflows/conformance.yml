@@ -1,0 +1,54 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Conformance
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 1 * * 1'
+  pull_request:
+    paths:
+      - 'Project.toml'
+      - 'conformance/**'
+      - 'src/**'
+      - 'test/**'
+      - '.github/workflows/conformance.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conformance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conformance:
+    name: Arrow corpus and external oracles
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12.6'
+      - uses: actions/cache@v6
+        with:
+          path: ~/.julia/artifacts
+          key: conformance-${{ runner.os }}-${{ hashFiles('conformance/host/Project.toml') }}
+          restore-keys: conformance-${{ runner.os }}-
+      - name: Run the Arrow corpus and PyArrow/Nanoarrow oracles
+        run: julia --startup-file=no --history-file=no conformance/run.jl --rebuild
