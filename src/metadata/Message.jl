@@ -101,7 +101,7 @@ function Base.getproperty(x::RecordBatch, field::Symbol)
     elseif field === :variadicBufferCounts
         o = FlatBuffers.offset(x, 12)
         if o != 0
-            return FlatBuffers.Array{Int32}(x, o)
+            return FlatBuffers.Array{Int64}(x, o)
         end
     end
     return nothing
