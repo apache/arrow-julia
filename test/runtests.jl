@@ -1084,6 +1084,75 @@ end
             )
             @test t.reject_reason[end] == "POST_ONLY"
         end
+
+        @testset "#590: variadic buffer counts use 64-bit entries" begin
+            # PyArrow 25.0.1 fixture: text, binary, inline, nested text, then integers.
+            file = joinpath(@__DIR__, "variadic-buffer-counts.arrow")
+            batches = Arrow.BatchIterator(Arrow.ArrowBlob(read(file), 1, nothing))
+            rb = only(
+                b.msg.header for b in batches if b.msg.header isa Arrow.Meta.RecordBatch
+            )
+            @test eltype(rb.variadicBufferCounts) === Int64
+            @test collect(rb.variadicBufferCounts) == [1, 2, 0, 1]
+            offset = Arrow.FlatBuffers.vector(rb, Arrow.FlatBuffers.offset(rb, 12))
+            @test pointer(rb.variadicBufferCounts.data) ==
+                  pointer(Arrow.FlatBuffers.bytes(rb), offset + 1)
+            for t in (Arrow.Table(file), only(Arrow.Stream(file)))
+                @test isequal(t.text, ["नमस्ते", "long enough text", missing, ""])
+                @test isequal(
+                    t.binary,
+                    [
+                        codeunits("first binary value"),
+                        codeunits("second binary value"),
+                        missing,
+                        codeunits("x"),
+                    ],
+                )
+                @test isequal(t.inline, ["a", "b", missing, ""])
+                @test isequal(
+                    t.nested,
+                    [
+                        (value="nested long value",),
+                        (value=missing,),
+                        (value="x",),
+                        (value="another long value",),
+                    ],
+                )
+                @test t.numbers == Int32[1, 2, 3, 4]
+            end
+
+            # Polars 1.21.0 stores these Int64 counts at a four-byte-aligned address.
+            file = joinpath(@__DIR__, "polars-variadic-buffer-counts.arrow")
+            bytes = read(file)
+            batches = Arrow.BatchIterator(Arrow.ArrowBlob(bytes, 1, nothing))
+            rb = only(
+                b.msg.header for b in batches if b.msg.header isa Arrow.Meta.RecordBatch
+            )
+            counts = rb.variadicBufferCounts
+            offset = Arrow.FlatBuffers.vector(rb, Arrow.FlatBuffers.offset(rb, 12))
+            @test counts == [1, 1]
+            @test UInt(pointer(bytes, offset + 1)) % 8 == 4
+            if Base.datatype_alignment(Int64) > 4
+                @test pointer(counts.data) != pointer(bytes, offset + 1)
+                truncated = Arrow.Meta.RecordBatch(
+                    bytes[1:(offset + 15)],
+                    Arrow.FlatBuffers.pos(rb),
+                )
+                @test_throws BoundsError truncated.variadicBufferCounts
+                oversized = copy(bytes)
+                fill!(@view(oversized[(offset - 3):offset]), 0xff)
+                @test_throws BoundsError Arrow.Meta.RecordBatch(
+                    oversized,
+                    Arrow.FlatBuffers.pos(rb),
+                ).variadicBufferCounts
+            else
+                @test pointer(counts.data) == pointer(bytes, offset + 1)
+            end
+            for t in (Arrow.Table(file), only(Arrow.Stream(file)))
+                @test t.more == ["नमस्ते"^2, "नमस्ते"^20]
+                @test t.text == ["k"^2, "k"^20]
+            end
+        end
     end # @testset "misc"
 
     @testset "DataAPI.metadata" begin
