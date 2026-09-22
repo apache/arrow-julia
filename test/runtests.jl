@@ -149,6 +149,30 @@ end
             @test isequal(collect(str)[2].col1, [missing, 11])
         end
 
+        @testset "# 610: dictionary replacement between record batches" begin
+            for compress in (nothing, :lz4, :zstd)
+                first = (a=Arrow.DictEncode(["alpha", "beta"]),)
+                second = (a=Arrow.DictEncode(["gamma", "delta"]),)
+                third = (a=Arrow.DictEncode(["gamma", "epsilon"]),)
+                b1 = take!(Arrow.tobuffer(Tables.partitioner((first, first)); compress))
+                b2 = take!(Arrow.tobuffer(Tables.partitioner((second, third)); compress))
+
+                # Replace the first stream's EOS with the second stream after its schema.
+                _, (pos, _) = iterate(Arrow.BatchIterator(Arrow.ArrowBlob(b2, 1, nothing)))
+                bytes = vcat(b1[1:(end - 8)], b2[pos:end])
+                batches = Arrow.BatchIterator(Arrow.ArrowBlob(bytes, 1, nothing))
+                @test count(batches) do batch
+                    header = batch.msg.header
+                    header isa Arrow.Meta.DictionaryBatch && header.isDelta
+                end == 1
+
+                expected = [first.a.data, first.a.data, second.a.data, third.a.data]
+                @test Arrow.Table(bytes).a == vcat(expected...)
+                @test Arrow.Table([b1, b2]).a == vcat(expected...)
+                @test [collect(batch.a) for batch in Arrow.Stream(bytes)] == expected
+            end
+        end
+
         @testset "# dictionary batch isDelta" begin
             t = (
                 col1=Int64[1, 2, 3, 4],
