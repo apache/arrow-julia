@@ -443,7 +443,7 @@ At the *top level* of a column the facade adds:
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
 | `NamedTuple` whose fields are core columns | Struct; `Union{Missing, T}` adds parent validity while child nullability stays declared |
 | `Arrow.DictEncode` over a writable column | Dictionary of the recursive mapping of its values |
-| `ArrowStrings.StringVector` | Utf8View, **zero-copy** — the column's memory is the Arrow array (see below) |
+| `DataStrings.StringVector` | Utf8View, **zero-copy** — the column's memory is the Arrow array (see below) |
 
 These native facade conversions do not recurse through list or struct shapes:
 a `Vector{Date}` inside a list, or a `Date` or `SubString` field of a
@@ -588,11 +588,11 @@ retained Field and the required logical length. Arrow does not manufacture a
 Julia object for every hidden child slot. This keeps Null-only fixed-size-list
 and inactive sparse-Union storage bounded by the bytes the output requires.
 
-### ArrowStrings columns
+### DataStrings columns
 
-[ArrowStrings.jl](https://github.com/apache/arrow-julia/tree/main/src/ArrowStrings)
-(a separate package that lives in this repository) defines
-`ArrowString`, a 16-byte string value that *is* an Arrow StringView entry
+[DataStrings.jl](https://github.com/JuliaData/DataStrings.jl)
+(a separate registered package) defines
+`DataString`, a 16-byte string value that *is* an Arrow StringView entry
 (inline up to 12 bytes, otherwise a prefix plus buffer index and offset),
 and `StringVector`, a column of them over a set of byte buffers —
 which *is* an Arrow Utf8View array's memory. A parser or other producer can
@@ -691,7 +691,7 @@ type descriptors are runtime values, layout dispatch goes through closed
 import/export, and the typed accessors `Arrow.ArrowCore.materialize(::Type{T},
 field, data)`) are statically resolvable. The repository's
 `test/trim_compile_tests.jl` gate holds that at zero verifier errors and
-warnings. The same gate exercises ArrowStrings construction, inline and view
+warnings. The same gate exercises DataStrings construction, inline and view
 access, missing values, comparison, and materialization. Arrow.jl itself
 supports Julia 1.10 and later; JuliaC's `--trim` needs Julia 1.12, so the gate
 runs only there. The dynamic facade conveniences (property access on

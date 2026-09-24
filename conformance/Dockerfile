@@ -83,6 +83,7 @@ RUN julia -e 'using Pkg; Pkg.activate("/opt/warm"); \
              PackageSpec(name="JSON", version="1.7.1"), \
              PackageSpec(name="CodecZlib", version="0.7.9"), \
              PackageSpec(name="Tables", version="1.14.0"), \
+             PackageSpec(name="DataStrings", version="1.1.0"), \
              PackageSpec(name="PythonCall", version="0.9.35")]); \
     Pkg.precompile()'
 

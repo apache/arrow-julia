@@ -99,7 +99,6 @@ function main(args)
                 """using Pkg
                    cp("/work/conformance/Project.toml", "/opt/env/Project.toml"; force=true)
                    Pkg.develop([
-                       PackageSpec(path="/work/src/ArrowStrings"),
                        PackageSpec(path="/work/src/ArrowTypes"),
                        PackageSpec(path="/work"),
                    ])
