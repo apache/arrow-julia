@@ -47,7 +47,7 @@ module Arrow
 using Tables
 import Base64
 import DataAPI
-import ArrowStrings
+import DataStrings
 import ArrowTypes
 import Dates
 import Mmap

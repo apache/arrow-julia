@@ -30,7 +30,7 @@ features changed.
 ## Requirements
 
 Arrow 3.0 requires Julia 1.10 or later, ArrowTypes.jl 2.x, Tables.jl 1.14
-(the first release that provides `Tables.Scan`), and ArrowStrings.jl 1.0.
+(the first release that provides `Tables.Scan`), and DataStrings.jl 1.1.
 
 ## Materialized columns
 

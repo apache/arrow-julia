@@ -25,7 +25,7 @@ using Tables
 using Dates
 import DataAPI
 using Arrow
-using ArrowStrings
+using DataStrings: DataString, StringVector, StringPayload
 
 struct _InterruptingInteger <: Integer end
 struct _OutOfMemoryInteger <: Integer end
@@ -2251,7 +2251,7 @@ end
         ) === Vector{Any}
     end
 
-    @testset "ArrowStrings columns write as Utf8View, zero-copy" begin
+    @testset "DataStrings columns write as Utf8View, zero-copy" begin
         # A StringVector's memory IS a Utf8View array: payloads are the
         # views buffer, its byte buffers the variadic data buffers. Build one
         # the way the CSV kernel does (inline ≤12, else a view into buffer 0
@@ -2262,13 +2262,13 @@ end
         extra = Vector{UInt8}(codeunits("she said \"hi\" and left"))
         long1 = first(findfirst(codeunits("thirteen-byte"), buf))
         abcd = first(findfirst(codeunits("abcd"), buf))
-        payloads = ArrowStringPayload[
-            ArrowStrings.inline_payload(buf, abcd, 4),
-            ArrowStrings.view_payload(buf, long1, 13, 0, long1 - 1),
-            ArrowStrings.PAYLOAD_MISSING,
-            ArrowStrings.view_payload(extra, 1, length(extra), 1, 0),
+        payloads = StringPayload[
+            DataStrings.inline_payload(buf, abcd, 4),
+            DataStrings.view_payload(buf, long1, 13, 0, long1 - 1),
+            DataStrings.PAYLOAD_MISSING,
+            DataStrings.view_payload(extra, 1, length(extra), 1, 0),
         ]
-        col = StringVector{Union{Missing,ArrowString}}(payloads, buf, extra)
+        col = StringVector{Union{Missing,DataString}}(payloads, buf, extra)
         f, columnparts = Arrow._constructcolumn(:s, AbstractVector[col])
         d = only(columnparts)
         @test f.type == Arrow.AC.ViewType(true) && f.nullable
@@ -2283,7 +2283,7 @@ end
         @test eltype(t.s) === Union{Missing,String}
         @test isequal(t.s, ["abcd", "thirteen-byte", missing, "she said \"hi\" and left"])
         # a non-nullable column declares non-nullable
-        col0 = StringVector{ArrowString}(payloads[[1, 2]], buf, extra)
+        col0 = StringVector{DataString}(payloads[[1, 2]], buf, extra)
         f0, _ = Arrow._constructcolumn(:s, AbstractVector[col0])
         @test !f0.nullable
         Arrow.write(io, (s=col0,))
@@ -2291,10 +2291,10 @@ end
         # an all-inline column may have ZERO data buffers — the format allows
         # a Utf8View with no variadic buffers, and the wire carries exactly
         # the fixed validity + views pair
-        inl = StringVector{ArrowString}(
+        inl = StringVector{DataString}(
             [
-                ArrowStrings.inline_payload(buf, abcd, 4),
-                ArrowStrings.inline_payload(buf, abcd, 2),
+                DataStrings.inline_payload(buf, abcd, 4),
+                DataStrings.inline_payload(buf, abcd, 2),
             ],
             Vector{Vector{UInt8}}(),
         )

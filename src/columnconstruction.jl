@@ -245,14 +245,14 @@ function _narrowlists(v::AbstractVector)
     return S[x === missing ? missing : convert(Vector{E}, x) for x in w]
 end
 
-# An ArrowStrings column IS Utf8View memory: its payload vector is the views
+# An DataStrings column IS Utf8View memory: its payload vector is the views
 # buffer and its byte buffers are the variadic data buffers — no copy, no
 # String materialization. Nullability comes from the column's eltype.
 # Both keywords are accepted for dispatch uniformity; a StringVector is
 # already Arrow memory, so no context or narrowing applies.
 function _constructpart(
     name::String,
-    v::ArrowStrings.StringVector;
+    v::DataStrings.StringVector;
     context=nothing,
     narrowabstract::Bool=true,
 )
@@ -3735,11 +3735,11 @@ end
 function _retainedview(f::AC.Field, v::AbstractVector)
     t = f.type::AC.ViewType
     present = _retainedvalidity(f, v)
-    payloads = Vector{ArrowStrings.ArrowStringPayload}(undef, length(v))
+    payloads = Vector{DataStrings.StringPayload}(undef, length(v))
     data = UInt8[]
     for (i, x) in enumerate(v)
         if x === missing
-            payloads[i] = ArrowStrings.PAYLOAD_MISSING
+            payloads[i] = DataStrings.PAYLOAD_MISSING
             continue
         end
         bytes = if t.utf8
@@ -3752,15 +3752,15 @@ function _retainedview(f::AC.Field, v::AbstractVector)
             x
         end
         n = length(bytes)
-        if n <= ArrowStrings.INLINE_MAX
-            payloads[i] = ArrowStrings.inline_payload(bytes, 1, n)
+        if n <= DataStrings.INLINE_MAX
+            payloads[i] = DataStrings.inline_payload(bytes, 1, n)
         else
             length(data) <= typemax(Int32) - n || throw(
                 ArgumentError("column $(f.name) view data exceeds the Int32 offset range"),
             )
             off = length(data)
             append!(data, bytes)
-            payloads[i] = ArrowStrings.view_payload(data, off + 1, n, 0, off)
+            payloads[i] = DataStrings.view_payload(data, off + 1, n, 0, off)
         end
     end
     buffers = AC.BufferSlice[AC._bitmapbuffer(present), AC._databuffer(payloads)]

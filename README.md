@@ -31,10 +31,9 @@ reads.
 
 > [!IMPORTANT]
 > This is the Arrow.jl 3.0 development branch. Arrow 3.0 is not registered
-> yet, and it requires the first registered ArrowStrings.jl release. A
-> checkout uses the in-repository `src/ArrowStrings` and `src/ArrowTypes`
-> packages: Julia 1.11+ resolves them through `[sources]`; on Julia 1.10 run
-> the `Pkg.develop` commands below.
+> yet. A checkout uses the in-repository `src/ArrowTypes` package: Julia
+> 1.11+ resolves it through `[sources]`; on Julia 1.10 run the `Pkg.develop`
+> command below.
 
 ## Installation
 
@@ -81,13 +80,12 @@ See the [changelog](CHANGELOG.md) for the full release summary. The
 
 ## Development
 
-In a checkout of this branch, prepare the local subpackages, then run the
+In a checkout of this branch, prepare the local subpackage, then run the
 tests:
 
 ```julia
 import Pkg
 Pkg.activate(".")
-Pkg.develop(path="src/ArrowStrings")
 Pkg.develop(path="src/ArrowTypes")
 Pkg.test()
 ```
