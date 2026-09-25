@@ -365,15 +365,24 @@ const _LoweredTemporal = Union{Int32,Int64}
 const _MILLIS_PER_DAY = Int128(86_400_000)
 
 # Map a temporal descriptor to the compile-time token the lowering loops
-# dispatch on; fourteen values total (2 date + 4 timestamp + 4 time +
-# 4 duration).
+# dispatch on; eighteen values total (2 date + 4 timestamp + 4 zoned
+# timestamp + 4 time + 4 duration). Zone-declared timestamps carry their own
+# kind: their literal domain (`ZonedTimestamp`/`ZonedDateTime`) is disjoint
+# from the zone-naive one.
 _facadetoken(t::AC.DateType) =
     t.unit == AC.DAY ? Val((:date, AC.DAY)) : Val((:date, AC.MILLISECOND_DATE))
 _facadetoken(t::AC.TimestampType) =
-    t.unit == AC.SECOND ? Val((:timestamp, AC.SECOND)) :
-    t.unit == AC.MILLISECOND ? Val((:timestamp, AC.MILLISECOND)) :
-    t.unit == AC.MICROSECOND ? Val((:timestamp, AC.MICROSECOND)) :
-    Val((:timestamp, AC.NANOSECOND))
+    if _timestampzone(t) === nothing
+        t.unit == AC.SECOND ? Val((:timestamp, AC.SECOND)) :
+        t.unit == AC.MILLISECOND ? Val((:timestamp, AC.MILLISECOND)) :
+        t.unit == AC.MICROSECOND ? Val((:timestamp, AC.MICROSECOND)) :
+        Val((:timestamp, AC.NANOSECOND))
+    else
+        t.unit == AC.SECOND ? Val((:zonedtimestamp, AC.SECOND)) :
+        t.unit == AC.MILLISECOND ? Val((:zonedtimestamp, AC.MILLISECOND)) :
+        t.unit == AC.MICROSECOND ? Val((:zonedtimestamp, AC.MICROSECOND)) :
+        Val((:zonedtimestamp, AC.NANOSECOND))
+    end
 _facadetoken(t::AC.TimeType) =
     t.unit == AC.SECOND ? Val((:time, AC.SECOND)) :
     t.unit == AC.MILLISECOND ? Val((:time, AC.MILLISECOND)) :
@@ -445,24 +454,67 @@ end
     return iszero(r) ? q : nothing
 end
 
+# The Arrow spec treats an absent and an empty timezone string the same way:
+# the column is zone-naive. One helper keeps every facade rule on that page.
+@inline _timestampzone(t::AC.TimestampType) =
+    t.timezone === nothing || isempty(t.timezone) ? nothing : t.timezone
+
+@inline _unitticks(unit)::Int64 =
+    unit == AC.SECOND ? Int64(1) :
+    unit == AC.MILLISECOND ? Int64(1_000) :
+    unit == AC.MICROSECOND ? Int64(1_000_000) : Int64(1_000_000_000)
+
+# Ticks per second of a Timestamp/ZonedTimestamp period. Package-defined
+# periods return `nothing`: their conversion is request-defined code, so
+# their literals stay in the public domain.
+@inline _periodticks(::Type{Dates.Second})::Union{Nothing,Int64} = Int64(1)
+@inline _periodticks(::Type{Dates.Millisecond})::Union{Nothing,Int64} = Int64(1_000)
+@inline _periodticks(::Type{Dates.Microsecond})::Union{Nothing,Int64} = Int64(1_000_000)
+@inline _periodticks(::Type{Dates.Nanosecond})::Union{Nothing,Int64} = Int64(1_000_000_000)
+@inline _periodticks(::Type)::Union{Nothing,Int64} = nothing
+
+_instantperiod(::Durations.Timestamp{P}) where {P} = P
+_instantperiod(::Durations.ZonedTimestamp{P}) where {P} = P
+
+"Exactly rescale an instant count between tick rates, or `nothing`."
+@inline function _rescalecount(count::Int64, from::Int64, to::Int64)::Union{Nothing,Int64}
+    from == to && return count
+    to > from && return _boundedint64(Int128(count) * Int128(to ÷ from))
+    q, r = divrem(count, from ÷ to)
+    return iszero(r) ? q : nothing
+end
+
+# Zone-NAIVE timestamp columns: `Durations.Timestamp`, `DateTime`, and `Date`
+# literals lower by instant. Zoned values never lower here — the public
+# domain defines them as unequal to every zone-naive value.
 @inline function _timestampstorage(unit, value)::Union{Nothing,Int64}
-    if unit == AC.SECOND || unit == AC.MILLISECOND
-        millis = _epochmillis(value)
-        if millis === nothing
-            # With TimeZones loaded, tz-declared columns read as
-            # ZonedDateTime, so retained rewrites and filter literals must
-            # lower those values exactly. The extension lowers only its own
-            # type and never throws; everything else stays `nothing`.
-            ext = Base.get_extension(@__MODULE__, :ArrowTimeZonesExt)
-            ext === nothing && return nothing
-            z = ext.zonedstorage(unit, value)
-            return z === nothing ? nothing : z::Int64
-        end
-        unit == AC.MILLISECOND && return millis
-        q, r = divrem(millis, Int64(1_000))
-        return iszero(r) ? q : nothing
+    if value isa Durations.Timestamp
+        from = _periodticks(_instantperiod(value))
+        from === nothing && return nothing
+        return _rescalecount(Int64(Dates.value(value)), from, _unitticks(unit))
     end
-    return _closedint64(value)
+    value isa Durations.ZonedTimestamp && return nothing
+    millis = _epochmillis(value)
+    millis === nothing && return nothing
+    return _rescalecount(millis, Int64(1_000), _unitticks(unit))
+end
+
+# Zone-DECLARED timestamp columns: a `ZonedTimestamp` literal in ANY zone
+# lowers to its UTC instant — public `==`/`isless` between zoned values
+# compare only the UTC time, so the zone label plays no role. With TimeZones
+# loaded, `ZonedDateTime` literals lower the same way through the extension
+# (it lowers only its own type and never throws). Zone-naive literals stay
+# public: the domain defines them as unequal to every zoned value.
+@inline function _zonedtimestampstorage(unit, value)::Union{Nothing,Int64}
+    if value isa Durations.ZonedTimestamp
+        from = _periodticks(_instantperiod(value))
+        from === nothing && return nothing
+        return _rescalecount(Int64(Dates.value(value)), from, _unitticks(unit))
+    end
+    ext = Base.get_extension(@__MODULE__, :ArrowTimeZonesExt)
+    ext === nothing && return nothing
+    z = ext.zonedstorage(unit, value)
+    return z === nothing ? nothing : z::Int64
 end
 
 @inline function _periodscale(value)::Union{Nothing,Int128}
@@ -510,9 +562,9 @@ end
 """
 Lower a built-in temporal value without exceptions or request-defined code.
 
-`K` is one of the fourteen `_facadetoken` descriptor/unit values. A result is
-exact. `nothing` selects the public-domain path or, for one scalar, the
-guarded custom-conversion path below.
+`K` is one of the eighteen `_facadetoken` descriptor/unit values. A result is
+exact. `nothing` selects the public-domain path or, for a Duration scalar,
+the guarded custom-conversion path below.
 """
 @inline function _exactfacadevalue(::Val{K}, value)::Union{Nothing,Int32,Int64} where {K}
     kind, unit = K
@@ -520,6 +572,8 @@ guarded custom-conversion path below.
         return unit == AC.DAY ? _datestorage(value) : _epochmillis(value)
     elseif kind === :timestamp
         return _timestampstorage(unit, value)
+    elseif kind === :zonedtimestamp
+        return _zonedtimestampstorage(unit, value)
     elseif kind === :time
         return _timestorage(unit, value)
     elseif kind === :duration
@@ -538,27 +592,15 @@ end
 
 @inline _exactfacadescalar(t::AC.DateType, value) =
     t.unit == AC.DAY ? _datestorage(value) : _epochmillis(value)
-@inline _exactfacadescalar(t::AC.TimestampType, value) = _timestampstorage(t.unit, value)
+@inline _exactfacadescalar(t::AC.TimestampType, value) =
+    _timestampzone(t) === nothing ? _timestampstorage(t.unit, value) :
+    _zonedtimestampstorage(t.unit, value)
 @inline _exactfacadescalar(t::AC.TimeType, value) = _timestorage(t.unit, value)
 @inline _exactfacadescalar(t::AC.DurationType, value) = _durationstorage(t.unit, value)
 
 _facadescalarvalue(t::Union{AC.DateType,AC.TimeType}, value) = _exactfacadescalar(t, value)
 
-@noinline function _customint64(value)::Union{Nothing,Int64}
-    try
-        return Int64(value)
-    catch err
-        return _facadeconversionfailure(err)
-    end
-end
-
-function _facadescalarvalue(t::AC.TimestampType, value)::Union{Nothing,Int64}
-    result = _exactfacadescalar(t, value)
-    result === nothing || return result
-    # Sub-millisecond timestamps remain raw integers in the public facade.
-    value isa Integer && t.unit in (AC.MICROSECOND, AC.NANOSECOND) || return nothing
-    return _customint64(value)
-end
+_facadescalarvalue(t::AC.TimestampType, value) = _exactfacadescalar(t, value)
 
 @noinline function _customdurationvalue(
     t::AC.DurationType,
@@ -600,8 +642,12 @@ function _facadetostorage(t::AC.ArrowType, v)
         return _facadeliteral(t, v)
     end
     # Non-temporal fields compare in their storage (and public) domain, but
-    # temporal public literals are incompatible with them.
-    if v isa Dates.Date || v isa Dates.DateTime || v isa Dates.Time || v isa Dates.Period
+    # temporal public literals — including Timestamp and ZonedTimestamp,
+    # which are AbstractDateTime — are incompatible with them.
+    if v isa Dates.Date ||
+       v isa Dates.AbstractDateTime ||
+       v isa Dates.Time ||
+       v isa Dates.Period
         return false, v
     end
     return true, v
@@ -618,19 +664,23 @@ function _mapcol(::Type{T}, f::F, col, budget=nothing) where {T,F}
     return out
 end
 
-# The ArrowTimeZonesExt extension (loaded when TimeZones.jl is) restores
-# Arrow 2.x reads for second/millisecond timestamps that declare a timezone:
-# they materialize as `ZonedDateTime` instead of a naive UTC `DateTime`.
-# `nothing` (extension absent, no timezone, or a finer unit) keeps this
-# file's naive behavior; the extension itself returns `nothing` when it
-# cannot parse the declared zone, so the eltype decision and the column
-# conversion below always agree. Finer units keep raw Int64 storage either
-# way: neither DateTime nor ZonedDateTime can hold them exactly.
-function _zonedext(t::AC.TimestampType)
-    t.timezone === nothing && return nothing
-    (t.unit == AC.SECOND || t.unit == AC.MILLISECOND) || return nothing
-    return Base.get_extension(@__MODULE__, :ArrowTimeZonesExt)
-end
+@inline _timestampperiod(unit) =
+    unit == AC.SECOND ? Dates.Second :
+    unit == AC.MILLISECOND ? Dates.Millisecond :
+    unit == AC.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
+
+# The `ZonedTimestamp{P,Z}` (and `Timestamp{P}`) element type of a
+# zone-declared (naive micro/nanosecond) timestamp column. Both types have
+# the 8-byte layout of the Arrow column itself — every Int64 is a valid
+# value — so conversion is a per-element reinterpret.
+_zonedtimestamptype(unit, zone::String) =
+    Durations.ZonedTimestamp{_timestampperiod(unit),Symbol(zone)}
+
+# Function barrier: `T` arrives as a runtime type (the zone name is a type
+# parameter), one dynamic call per column, and the element loop compiles
+# type-stable per `T`.
+_instantcolumn(::Type{T}, col, budget) where {T} =
+    _mapcol(T, x -> reinterpret(T, Int64(x)), col, budget)
 
 _postconvert(::AC.ArrowType, col, budget=nothing) = col
 _postconvert(t::AC.DateType, col, budget=nothing) =
@@ -643,13 +693,14 @@ _postconvert(t::AC.DateType, col, budget=nothing) =
         budget,
     )
 function _postconvert(t::AC.TimestampType, col, budget=nothing)
-    ext = _zonedext(t)
-    if ext !== nothing
-        zoned = ext.zonedcolumn(t, col, budget)
-        zoned === nothing || return zoned
-    end
-    # DateTime is millisecond-precision. Finer units stay as their raw
-    # storage integers rather than silently truncating.
+    zone = _timestampzone(t)
+    # A zone-declared column materializes as `ZonedTimestamp` at every unit:
+    # the stored value IS the UTC instant, so no zone rules are consulted.
+    zone === nothing ||
+        return _instantcolumn(_zonedtimestamptype(t.unit, zone), col, budget)
+    # Zone-naive second/millisecond columns keep the Arrow 2.x `DateTime`
+    # read; DateTime is millisecond-precision, so finer units materialize as
+    # `Durations.Timestamp` rather than silently truncating.
     t.unit == AC.SECOND && return _mapcol(
         Dates.DateTime,
         x -> Dates.DateTime(Dates.UTM(Int64(x) * 1000 + Dates.UNIXEPOCH)),
@@ -662,7 +713,7 @@ function _postconvert(t::AC.TimestampType, col, budget=nothing)
         col,
         budget,
     )
-    return col
+    return _instantcolumn(Durations.Timestamp{_timestampperiod(t.unit)}, col, budget)
 end
 function _postconvert(t::AC.TimeType, col, budget=nothing)
     scale =
@@ -692,12 +743,10 @@ _postconvert(t::AC.DictionaryType, col, budget=nothing) =
 function _facadebasetype(t::AC.ArrowType)
     t isa AC.DateType && return t.unit == AC.DAY ? Dates.Date : Dates.DateTime
     if t isa AC.TimestampType
-        ext = _zonedext(t)
-        if ext !== nothing
-            Z = ext.zonedtype(t.timezone)
-            Z === nothing || return Z
-        end
-        return t.unit == AC.SECOND || t.unit == AC.MILLISECOND ? Dates.DateTime : Int64
+        zone = _timestampzone(t)
+        zone === nothing || return _zonedtimestamptype(t.unit, zone)
+        (t.unit == AC.SECOND || t.unit == AC.MILLISECOND) && return Dates.DateTime
+        return Durations.Timestamp{_timestampperiod(t.unit)}
     end
     t isa AC.TimeType && return Dates.Time
     if t isa AC.DurationType
@@ -1358,7 +1407,7 @@ _istemporalconv(t::AC.ArrowType) =
     t isa AC.DateType ||
     t isa AC.TimeType ||
     t isa AC.DurationType ||
-    (t isa AC.TimestampType && (t.unit == AC.SECOND || t.unit == AC.MILLISECOND))
+    t isa AC.TimestampType
 _rawdeclaredbasetype(t::AC.ArrowType) =
     _istemporalconv(t) ? (AC.primwidth(t) == 4 ? Int32 : Int64) : _declaredbasetype(t)
 # One entry per Core layout whose _value materializes a CLOSED row type

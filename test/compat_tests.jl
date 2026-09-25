@@ -19,6 +19,7 @@ using Dates
 using Tables
 using Arrow
 using ArrowTypes
+import Durations
 
 const AC = Arrow.ArrowCore
 
@@ -131,15 +132,24 @@ end
 end
 
 @testset "timezone-aware timestamps without TimeZones" begin
-    # This process must not have loaded TimeZones: the naive read is the
-    # default the extension replaces.
+    # This process must not have loaded TimeZones: zoned reads are native
+    # ZonedTimestamp values and need no extension.
     @test Base.get_extension(Arrow, :ArrowTimeZonesExt) === nothing
     t = AC.TimestampType(AC.MILLISECOND, "America/Denver")
     d = AC.ArrayData(t, 1, [AC.BufferSlice(), AC._databuffer(Int64[0])]; nullcount=0)
     sch = AC.Schema([AC.Field("ts", t; nullable=false)])
     tbl = Arrow.Table(Arrow.writefile(sch, [AC.RecordBatch(sch, [d])]))
-    @test eltype(tbl.ts) == Dates.DateTime
-    @test tbl.ts[1] == Dates.DateTime(1970, 1, 1)
+    Z = Durations.ZonedTimestamp{Dates.Millisecond,Symbol("America/Denver")}
+    @test eltype(tbl.ts) == Z
+    @test tbl.ts[1] == Z(Durations.Timestamp{Dates.Millisecond}(1970), Dates.UTC)
+    # instant operations need no zone rules; local-time ones name TimeZones
+    @test tbl.ts[1] < tbl.ts[1] + Dates.Second(1)
+    err = try
+        Dates.hour(tbl.ts[1])
+    catch e
+        e
+    end
+    @test err isa ArgumentError && occursin("TimeZones.jl", err.msg)
 end
 
 @testset "ArrowTimeZonesExt child" begin

@@ -52,7 +52,7 @@ ArrowTimeZonesExt = "TimeZones"
 [compat]
 Serialization = "1.10"
 DataDecimals = "1"
-Durations = "1"
+Durations = "1.4"
 DataStrings = "1"
 ArrowTypes = "2"
 Base64 = "1.10"

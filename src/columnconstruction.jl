@@ -27,6 +27,25 @@
 _fieldmetadata(f::AC.Field) =
     f.metadata === nothing ? nothing : collect(Pair{String,String}, f.metadata)
 
+# The Arrow unit of a Timestamp/ZonedTimestamp element type. Only the four
+# built-in resolutions have an Arrow timestamp unit; Durations 1.3+ permits
+# package-defined periods, which have no Arrow representation.
+function _instantunit(T::Type)
+    P = _instantelementperiod(T)
+    P === Dates.Second && return AC.SECOND
+    P === Dates.Millisecond && return AC.MILLISECOND
+    P === Dates.Microsecond && return AC.MICROSECOND
+    P === Dates.Nanosecond && return AC.NANOSECOND
+    throw(
+        ArgumentError(
+            "timestamp period $P has no Arrow timestamp unit; use Second, " *
+            "Millisecond, Microsecond, or Nanosecond resolution",
+        ),
+    )
+end
+_instantelementperiod(::Type{Durations.Timestamp{P}}) where {P} = P
+_instantelementperiod(::Type{<:Durations.ZonedTimestamp{P}}) where {P} = P
+
 "One native (Field, ArrayData) column from a Julia vector, facade conversions included."
 function _constructnativepart(name::String, v::AbstractVector; context=nothing)
     T = Base.nonmissingtype(eltype(v))
@@ -48,6 +67,33 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
         )
     elseif T <: Union{DataDecimals.Decimal,Durations.Duration}
         return _constructsharedpart(name, v, T)
+    elseif T <: Durations.Timestamp
+        isconcretetype(T) || throw(
+            ArgumentError(
+                "column $name has abstract Timestamp element type $T; give the " *
+                "column one concrete resolution",
+            ),
+        )
+        return _constructtemporalpart(
+            name,
+            v,
+            AC.TimestampType(_instantunit(T), nothing),
+            x -> Int64(Dates.value(x)),
+        )
+    elseif T <: Durations.ZonedTimestamp
+        isconcretetype(T) || throw(
+            ArgumentError(
+                "column $name has abstract ZonedTimestamp element type $T; an " *
+                "Arrow column declares one time zone and one resolution — " *
+                "convert the values with Durations.astimezone first",
+            ),
+        )
+        return _constructtemporalpart(
+            name,
+            v,
+            AC.TimestampType(_instantunit(T), Durations.zonename(T)),
+            x -> Int64(Dates.value(x)),
+        )
     elseif T <: Dates.Date
         return _constructtemporalpart(
             name,
@@ -372,6 +418,8 @@ _arrowtypesnativetype(T) =
         Dates.Period,
         DataDecimals.Decimal,
         Durations.Duration,
+        Durations.Timestamp,
+        Durations.ZonedTimestamp,
     } || _zonedwritertype(T)
 
 # The TimeZones extension's write hooks. With the extension absent both

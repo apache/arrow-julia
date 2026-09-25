@@ -31,7 +31,7 @@ features changed.
 
 Arrow 3.0 requires Julia 1.10 or later, ArrowTypes.jl 2.x, Tables.jl 1.14
 (the first release that provides `Tables.Scan`), DataStrings.jl 1.0,
-DataDecimals.jl 1.0, and Durations.jl 1.0.
+DataDecimals.jl 1.0, and Durations.jl 1.4.
 
 Supported top-level decimal columns use `DataDecimals.Decimal{P,S,T}`.
 Negative-scale decimals retain raw coefficients. Calendar interval columns use
@@ -86,17 +86,19 @@ rows = table.c isa AbstractVector{<:NamedTuple} ? table.c :
 
 Timezone-aware timestamps changed. Arrow 2.x depended on TimeZones.jl and
 read a timestamp column with a declared timezone as `ZonedDateTime` values.
-Arrow 3.0 does not depend on TimeZones.jl: by default such a column reads as
-naive UTC `DateTime` values (the stored instants), and the declared zone is
-kept in the retained schema for rewrite. Loading TimeZones.jl activates
-Arrow's extension and restores the `ZonedDateTime` behavior for second- and
-millisecond-unit columns, on both sides: those columns read as
-`ZonedDateTime`, and a fresh `ZonedDateTime` column writes as a
-timezone-declared millisecond timestamp. One written column carries one
-zone; convert mixed-zone values with `astimezone` first. Micro- and
-nanosecond timestamps read as raw `Int64` storage either way; neither
-`DateTime` nor `ZonedDateTime` can hold them exactly, and Arrow 3.0 never
-truncates silently (Arrow 2.x truncated with a warning).
+Arrow 3.0 does not depend on TimeZones.jl: such a column reads as
+`Durations.ZonedTimestamp{P,Z}` values at every unit — 8-byte values holding
+the stored UTC instant, with the declared zone in the type. Instant
+comparisons, hashing, and arithmetic need no zone rules; local-time
+operations know `"UTC"` and fixed offsets, and loading TimeZones.jl teaches
+them named zones and converts to and from `ZonedDateTime`
+(`ZonedDateTime(zt)` / `ZonedTimestamp(zdt)`). A fresh `ZonedTimestamp`
+column writes back zero-conversion, and — with TimeZones.jl loaded — a fresh
+single-zone `ZonedDateTime` column still writes as a timezone-declared
+millisecond timestamp. One written column carries one zone; convert
+mixed-zone values with `astimezone` first. Zone-naive micro- and nanosecond
+timestamps read as `Durations.Timestamp{P}` (Arrow 2.x truncated to
+`DateTime` with a warning; Arrow 3.0 is exact and never truncates).
 
 The old positional byte-window arguments and multi-input constructors were
 removed. Pass one complete path, `IO`, byte vector, or byte-range source to

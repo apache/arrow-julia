@@ -20,6 +20,7 @@ using Arrow
 using DataStrings
 using DataStrings: StringVector, StringPayload, BytesVector, DataBytes
 using ArrowTypes
+import Durations
 using Dates
 using Tables
 
@@ -1044,8 +1045,18 @@ function _physical_layout_case()
             epoch,
             epoch + Millisecond(1_000_001),
         ],
-        timestamp_us=Int64[-1, 0, 1_000_001],
-        timestamp_ns=Int64[-1, 0, 1_000_001],
+        timestamp_us=collect(
+            reinterpret(
+                Durations.ZonedTimestamp{Microsecond,:UTC},
+                Int64[-1, 0, 1_000_001],
+            ),
+        ),
+        timestamp_ns=collect(
+            reinterpret(
+                Durations.ZonedTimestamp{Nanosecond,Symbol("+00:00")},
+                Int64[-1, 0, 1_000_001],
+            ),
+        ),
         duration_s=Second[Second(-1), Second(0), Second(1_000_001)],
         duration_ms=Millisecond[Millisecond(-1), Millisecond(0), Millisecond(1_000_001)],
         duration_us=Microsecond[Microsecond(-1), Microsecond(0), Microsecond(1_000_001)],

@@ -74,8 +74,13 @@ Every facade method consumes its private route markers before returning:
 
     Temporal literals lower only when the public conversion preserves the
     requested operator over the complete physical domain. Date64 and
-    millisecond Timestamp mappings preserve equality but not order;
-    Timestamp-second and Time mappings alias physical values. Duration
+    zone-naive millisecond Timestamp mappings preserve equality but not
+    order; zone-naive Timestamp-second and Time mappings alias physical
+    values. Micro/nanosecond and zone-declared timestamps read as
+    `Durations.Timestamp`/`ZonedTimestamp` — total order-preserving
+    bijections with storage — so exact literals lower for every operator,
+    and cross-domain literals (zone-naive against zone-declared or the
+    reverse) never lower. Duration
     literals may use the column unit or a coarser fixed unit, never a finer
     one. `In` applies the equality rule to Tuple and Array; Set additionally
     requires the canonical public type to preserve `isequal` and hashing.

@@ -29,12 +29,14 @@ using DataStrings
 import DataDecimals, Durations
 using DataStrings: StringVector, StringPayload, BytesVector, DataBytes
 
+struct _InterruptingPeriod <: Dates.Period end
+struct _OutOfMemoryPeriod <: Dates.Period end
 struct _InterruptingInteger <: Integer end
-struct _OutOfMemoryInteger <: Integer end
 struct _ScanHookInteger <: Integer end
-const _SCAN_HOOK_CALLS = Ref(0)
 Base.Int64(::_InterruptingInteger) = throw(InterruptException())
-Base.Int64(::_OutOfMemoryInteger) = throw(OutOfMemoryError())
+const _SCAN_HOOK_CALLS = Ref(0)
+Base.convert(::Type{Second}, ::_InterruptingPeriod) = throw(InterruptException())
+Base.convert(::Type{Second}, ::_OutOfMemoryPeriod) = throw(OutOfMemoryError())
 Base.Int64(::_ScanHookInteger) = (_SCAN_HOOK_CALLS[] += 1; Int64(7))
 Base.:(==)(::Int64, ::_ScanHookInteger) = false
 Base.:(==)(::_ScanHookInteger, ::Int64) = false
@@ -654,9 +656,9 @@ end
             )
         end
 
-        # Calendar periods cannot enter the membership kernel. Raw sub-ms
-        # timestamps already share their public and storage domain, so their
-        # membership path does not inspect or rebuild the caller's container.
+        # Calendar periods cannot enter the membership kernel, and an integer
+        # has no timestamp public representation: neither lowers, and the
+        # membership path never inspects or rebuilds the caller's container.
         timestampfield = Arrow.AC.Field(
             "timestamp",
             Arrow.AC.TimestampType(Arrow.AC.MICROSECOND, nothing);
@@ -1055,7 +1057,9 @@ end
         sch = Arrow.AC.Schema([f_us]; metadata=["k" => "v"])
         bytes = Arrow.writestream(sch, [Arrow.AC.RecordBatch(sch, [d_us], 2)])
         t = Arrow.Table(bytes)
-        @test t.us == [1, 1001]          # sub-ms stays raw, exact
+        # sub-ms is exact: the counts read back as Timestamp{Microsecond}
+        us = Durations.Timestamp{Dates.Microsecond}
+        @test isequal(t.us, reinterpret(us, Int64[1, 1001]))
         io = IOBuffer()
         Arrow.write(io, t; file=false)
         rt = Arrow.Table(take!(io))
@@ -1063,7 +1067,7 @@ end
         @test rsch.fields[1].type isa Arrow.AC.TimestampType
         @test rsch.fields[1].type.unit == Arrow.AC.MICROSECOND
         @test DataAPI.metadata(rt, "k") == "v"   # schema metadata carried
-        @test rt.us == [1, 1001]
+        @test isequal(rt.us, reinterpret(us, Int64[1, 1001]))
         # dictionary columns round-trip as dictionaries, multi-partition,
         # file format (one shared pool, no replacement refusal)
         io2 = IOBuffer()
@@ -1235,13 +1239,15 @@ end
         @test_throws InexactError Tables.scan(Arrow.Table(copy(bytes)), overflow)
         @test_throws InexactError Arrow.Table(copy(bytes); scan=overflow)
 
-        # Scan planning must never execute a permissive writer conversion hook.
+        # Scan planning must never execute a permissive conversion hook. An
+        # integer literal has no timestamp public representation, so the plan
+        # stays public and the hook is never consulted on either plan.
         field, bytes =
             rawtemporal(Arrow.AC.TimestampType(Arrow.AC.MICROSECOND, nothing), Int64[7])
         literal = _ScanHookInteger()
         hookscan = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), literal))
         _SCAN_HOOK_CALLS[] = 0
-        @test Arrow._ScanPlan(hookscan, [field]).storage !== nothing
+        @test Arrow._ScanPlan(hookscan, [field]).storage === nothing
         @test _SCAN_HOOK_CALLS[] == 0
         @test isempty(Arrow.Table(copy(bytes); scan=hookscan).v)
         @test _SCAN_HOOK_CALLS[] == 0
@@ -1355,8 +1361,8 @@ end
     end
 
     @testset "lowering honors the facade comparison domain" begin
-        # Sub-ms timestamps materialize as raw Int64: a DateTime literal is
-        # never equal in public, and integers compare directly.
+        # Sub-ms timestamps materialize as Timestamp{Microsecond}: a DateTime
+        # literal compares by instant, and raw integers are never equal.
         us = Union{Missing,Int64}[1_000_000, 2_000_000]
         f, d = Arrow.AC.fromjulia("us", us)
         t_us = Arrow.AC.TimestampType(Arrow.AC.MICROSECOND, nothing)
@@ -1372,16 +1378,29 @@ end
         )
         sch = Arrow.AC.Schema([Arrow.AC.Field("us", t_us; nullable=true)])
         bytes = Arrow.writestream(sch, [Arrow.AC.RecordBatch(sch, [d_us], 2)])
-        data = (us=us,)
-        for scan in (
-            Tables.Scan(
-                filter=Tables.colcmp(==, Tables.col(:us), DateTime(1970, 1, 1, 0, 0, 1)),
+        data = (
+            us=Union{Missing,Durations.Timestamp{Microsecond}}[
+                reinterpret(Durations.Timestamp{Microsecond}, x) for
+                x in Int64[1_000_000, 2_000_000]
+            ],
+        )
+        for (scan, matched) in (
+            (
+                Tables.Scan(
+                    filter=Tables.colcmp(
+                        ==,
+                        Tables.col(:us),
+                        DateTime(1970, 1, 1, 0, 0, 1),
+                    ),
+                ),
+                1,
             ),
-            Tables.Scan(filter=Tables.colcmp(==, Tables.col(:us), 2_000_000)),
+            (Tables.Scan(filter=Tables.colcmp(==, Tables.col(:us), 2_000_000)), 0),
         )
             want = Tables.scan(data, scan)
             got = Arrow.Table(bytes; scan=scan)
             @test isequal(got.us, want.us)
+            @test length(got.us) == matched
         end
         # Out-of-range and cross-Period literals fall back, matching the
         # authority instead of throwing.
@@ -1414,8 +1433,105 @@ end
             @test !ok
             @test original === extreme
         end
-        @test_throws InterruptException Arrow._facadetostorage(t_us, _InterruptingInteger())
-        @test_throws OutOfMemoryError Arrow._facadetostorage(t_us, _OutOfMemoryInteger())
+        dur_s = Arrow.AC.DurationType(Arrow.AC.SECOND)
+        @test_throws InterruptException Arrow._facadetostorage(dur_s, _InterruptingPeriod())
+        @test_throws OutOfMemoryError Arrow._facadetostorage(dur_s, _OutOfMemoryPeriod())
+    end
+
+    @testset "native Timestamp and ZonedTimestamp columns" begin
+        Ts = Durations.Timestamp
+        Zts = Durations.ZonedTimestamp
+        Denver = Zts{Microsecond,Symbol("America/Denver")}
+
+        # Fresh writes round-trip zero-conversion at each resolution, with
+        # and without missing; the descriptor carries the unit and zone.
+        ncol = [Ts{Nanosecond}(2026, 1, 1), Ts{Nanosecond}(2026, 1, 2)]
+        zcol = [Denver(Ts{Microsecond}(2026, 1, i), Dates.UTC) for i = 1:4]
+        bytes = take!(Arrow.tobuffer((n=ncol, z=zcol[1:2], mz=[zcol[3], missing])))
+        t = Arrow.Table(copy(bytes))
+        sch = getfield(t, :schema)
+        @test sch.fields[1].type == Arrow.AC.TimestampType(Arrow.AC.NANOSECOND, nothing)
+        @test sch.fields[2].type ==
+              Arrow.AC.TimestampType(Arrow.AC.MICROSECOND, "America/Denver")
+        @test eltype(t.n) == Ts{Nanosecond} && t.n == ncol
+        @test eltype(t.z) == Denver && t.z == zcol[1:2]
+        @test eltype(t.mz) == Union{Missing,Denver}
+        @test isequal(collect(t.mz), [zcol[3], missing])
+        # retained rewrite keeps unit, zone, and values
+        rt = Arrow.Table(take!(Arrow.tobuffer(Arrow.Table(copy(bytes)))))
+        @test eltype(rt.z) == Denver && rt.z == zcol[1:2] && rt.n == ncol
+
+        # One column, one zone and one resolution: abstract eltypes refuse.
+        mixed = [zcol[1], Durations.astimezone(zcol[2], :UTC)]
+        @test_throws ArgumentError Arrow.tobuffer((m=mixed,))
+        # mixed naive resolutions PROMOTE to the finer unit and write cleanly
+        units = [Ts{Nanosecond}(2026, 1, 1), Ts{Microsecond}(2026, 1, 2)]
+        @test eltype(units) == Ts{Nanosecond}
+        tu = Arrow.Table(take!(Arrow.tobuffer((u=units,))))
+        @test eltype(tu.u) == Ts{Nanosecond} && tu.u == units
+        # a declared-abstract column and a non-Arrow resolution both refuse
+        @test_throws ArgumentError Arrow.tobuffer((u=Ts[Ts{Nanosecond}(2026)],))
+        @test_throws ArgumentError Arrow._instantunit(Ts{Dates.Minute})
+
+        # Zoned scans push down every operator; literals convert exactly
+        # across zones and units, and cross-domain literals match nothing.
+        zbytes = take!(Arrow.tobuffer((z=zcol,)))
+        zfield = getfield(Arrow.Table(copy(zbytes)), :schema).fields[1]
+        for (filter, want) in (
+            (Tables.colcmp(>, Tables.col(:z), zcol[2]), zcol[3:4]),
+            (
+                Tables.colcmp(==, Tables.col(:z), Durations.astimezone(zcol[2], :UTC)),
+                zcol[2:2],
+            ),
+            (
+                Tables.colcmp(
+                    <=,
+                    Tables.col(:z),
+                    Zts{Nanosecond,:UTC}(Ts{Nanosecond}(zcol[2].utc), Dates.UTC),
+                ),
+                zcol[1:2],
+            ),
+        )
+            scan = Tables.Scan(; filter)
+            @test Arrow._ScanPlan(scan, [zfield]).storage !== nothing
+            @test collect(Arrow.Table(copy(zbytes); scan).z) == want
+        end
+        for naive in
+            (DateTime(2026, 1, 2), Ts{Microsecond}(2026, 1, 2), Dates.value(zcol[2]))
+            scan = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:z), naive))
+            @test Arrow._ScanPlan(scan, [zfield]).storage === nothing
+            @test isempty(Arrow.Table(copy(zbytes); scan).z)
+        end
+        # a zoned literal against a zone-naive column matches nothing
+        nbytes = take!(Arrow.tobuffer((n=ncol,)))
+        nscan = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:n), zcol[1]))
+        @test isempty(Arrow.Table(copy(nbytes); scan=nscan).n)
+        # a nanosecond zoned literal that truncates on a microsecond column
+        # has no exact storage form; public evaluation still answers exactly
+        sub = Zts{Nanosecond,:UTC}(Ts{Nanosecond}(zcol[2].utc) + Nanosecond(1), Dates.UTC)
+        subscan = Tables.Scan(filter=Tables.colcmp(<, Tables.col(:z), sub))
+        @test Arrow._ScanPlan(subscan, [zfield]).storage === nothing
+        @test collect(Arrow.Table(copy(zbytes); scan=subscan).z) == zcol[1:2]
+
+        # The Arrow spec reads an EMPTY timezone string as zone-naive.
+        et = Arrow.AC.TimestampType(Arrow.AC.NANOSECOND, "")
+        ed = Arrow.AC.ArrayData(
+            et,
+            1,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int64[7])];
+            nullcount=0,
+        )
+        esch = Arrow.AC.Schema([Arrow.AC.Field("e", et; nullable=false)])
+        etbl = Arrow.Table(Arrow.writefile(esch, [Arrow.AC.RecordBatch(esch, [ed])]))
+        @test eltype(etbl.e) == Ts{Nanosecond}
+        @test Dates.value(etbl.e[1]) == 7
+
+        # Instant values under a union wrapper stay raw integer storage, and
+        # empty columns declare the same eltype as populated ones.
+        ebytes = take!(Arrow.tobuffer((n=Ts{Nanosecond}[], z=Denver[])))
+        et2 = Arrow.Table(ebytes)
+        @test eltype(et2.n) == Ts{Nanosecond} && isempty(et2.n)
+        @test eltype(et2.z) == Denver && isempty(et2.z)
     end
 
     @testset "overrides preserve missing and re-infer on rewrite" begin

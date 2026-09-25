@@ -16,15 +16,18 @@
 
 # ArrowTimeZonesExt coverage. Loading TimeZones.jl activates the extension
 # for the whole process, so compat_tests.jl re-execs this file as a child:
-# the parent process stays extension-free and keeps testing the naive reads.
+# the parent process stays extension-free and keeps testing the
+# TimeZones-free reads.
 module TimeZonesExtChild
 
 using Test, Dates, Tables, TimeZones
 import Arrow
+import Durations
+using Durations: ZonedTimestamp
 const AC = Arrow.ArrowCore
 
 # One single-column file-format buffer with a timestamp descriptor built
-# directly, since the facade writer has no fresh ZonedDateTime route yet.
+# directly, exercising the read side independently of the fresh writer.
 function tzfile(unit, tz, values::Vector{Int64}; validity=nothing)
     t = AC.TimestampType(unit, tz)
     bufs =
@@ -38,62 +41,27 @@ end
 
 @testset "ArrowTimeZonesExt" begin
     @test Base.get_extension(Arrow, :ArrowTimeZonesExt) !== nothing
+    @test Base.get_extension(Durations, :DurationsTimeZonesExt) !== nothing
     denver = tz"America/Denver"
+    Dnv = ZonedTimestamp{Millisecond,Symbol("America/Denver")}
 
-    @testset "millisecond reads as ZonedDateTime" begin
+    @testset "zoned reads are ZonedTimestamp; ZonedDateTime compares" begin
         t = Arrow.Table(tzfile(AC.MILLISECOND, "America/Denver", Int64[0, 1_000]))
-        @test eltype(t.ts) == ZonedDateTime
+        @test eltype(t.ts) == Dnv
         @test t.ts[1] == ZonedDateTime(DateTime(1970, 1, 1), denver; from_utc=true)
         @test t.ts[2] == ZonedDateTime(DateTime(1970, 1, 1, 0, 0, 1), denver; from_utc=true)
+        @test ZonedDateTime(t.ts[1]) ==
+              ZonedDateTime(DateTime(1970, 1, 1), denver; from_utc=true)
+        # named-zone local-time operations work with TimeZones loaded
+        @test hour(t.ts[1]) == 17  # 1970-01-01T00:00 UTC is 17:00 MST the day before
+        @test Date(t.ts[1]) == Date(1969, 12, 31)
     end
 
     @testset "second unit scales" begin
         t = Arrow.Table(tzfile(AC.SECOND, "UTC", Int64[42]))
-        @test eltype(t.ts) == ZonedDateTime
+        @test eltype(t.ts) == ZonedTimestamp{Second,:UTC}
         @test t.ts[1] ==
               ZonedDateTime(DateTime(1970, 1, 1, 0, 0, 42), tz"UTC"; from_utc=true)
-    end
-
-    @testset "fixed-offset zone" begin
-        t = Arrow.Table(tzfile(AC.MILLISECOND, "+07:00", Int64[0]))
-        @test eltype(t.ts) == ZonedDateTime
-        @test DateTime(t.ts[1], TimeZones.UTC) == DateTime(1970, 1, 1)
-    end
-
-    @testset "unparseable zone warns and reads naive" begin
-        bytes = tzfile(AC.MILLISECOND, "Bogus/Nowhere", Int64[0])
-        t = @test_logs (:warn, r"cannot parse") match_mode = :any Arrow.Table(bytes)
-        @test eltype(t.ts) == DateTime
-        @test t.ts[1] == DateTime(1970, 1, 1)
-    end
-
-    @testset "finer units keep raw storage" begin
-        t = Arrow.Table(tzfile(AC.MICROSECOND, "America/Denver", Int64[7]))
-        @test eltype(t.ts) == Int64
-        @test t.ts[1] == 7
-    end
-
-    @testset "nulls widen with Missing" begin
-        t = Arrow.Table(tzfile(AC.MILLISECOND, "UTC", Int64[0, 0]; validity=UInt8[0x01]))
-        @test eltype(t.ts) == Union{Missing,ZonedDateTime}
-        @test t.ts[2] === missing
-    end
-
-    @testset "retained rewrite round-trips" begin
-        t = Arrow.Table(tzfile(AC.MILLISECOND, "America/Denver", Int64[0, 1_000]))
-        io = IOBuffer()
-        Arrow.write(io, t)
-        t2 = Arrow.Table(take!(io))
-        @test eltype(t2.ts) == ZonedDateTime
-        @test t2.ts == t.ts
-    end
-
-    @testset "second-unit rewrite stays exact" begin
-        t = Arrow.Table(tzfile(AC.SECOND, "UTC", Int64[42]))
-        io = IOBuffer()
-        Arrow.write(io, t)
-        t2 = Arrow.Table(take!(io))
-        @test t2.ts == t.ts
     end
 
     @testset "fresh ZonedDateTime columns write as timestamps" begin
@@ -104,15 +72,16 @@ end
         io = IOBuffer()
         Arrow.write(io, (; ts=zs))
         t = Arrow.Table(take!(io))
-        @test eltype(t.ts) == ZonedDateTime
+        @test eltype(t.ts) == Dnv
         @test t.ts == zs
+        @test ZonedDateTime.(t.ts) == zs
         mixed =
             [ZonedDateTime(DateTime(2020), denver), ZonedDateTime(DateTime(2020), tz"UTC")]
         @test_throws ArgumentError Arrow.write(IOBuffer(), (; ts=mixed))
         io = IOBuffer()
         Arrow.write(io, (; ts=[zs[1], missing]))
         t2 = Arrow.Table(take!(io))
-        @test eltype(t2.ts) == Union{Missing,ZonedDateTime}
+        @test eltype(t2.ts) == Union{Missing,Dnv}
         @test t2.ts[1] == zs[1]
         @test t2.ts[2] === missing
     end
@@ -120,12 +89,23 @@ end
     @testset "scan filter lowers a ZonedDateTime literal" begin
         bytes = tzfile(AC.MILLISECOND, "America/Denver", Int64[0, 1_000, 2_000])
         want = ZonedDateTime(DateTime(1970, 1, 1, 0, 0, 1), denver; from_utc=true)
+        for op in (==, <)  # zoned columns push down ordered comparisons too
+            t = Arrow.Table(
+                bytes;
+                scan=Tables.Scan(filter=Tables.colcmp(op, Tables.col(:ts), want)),
+            )
+            @test length(t.ts) == 1
+            @test only(t.ts) == (op === (==) ? want : want - Second(1))
+        end
+        # a sub-unit ZonedDateTime literal cannot lower to a SECOND column
+        # exactly; the filter still evaluates correctly in the public domain
+        sbytes = tzfile(AC.SECOND, "America/Denver", Int64[0, 1, 2])
+        subsec = ZonedDateTime(DateTime(1970, 1, 1, 0, 0, 1, 500), denver; from_utc=true)
         t = Arrow.Table(
-            bytes;
-            scan=Tables.Scan(filter=Tables.colcmp(==, Tables.col(:ts), want)),
+            sbytes;
+            scan=Tables.Scan(filter=Tables.colcmp(<, Tables.col(:ts), subsec)),
         )
-        @test length(t.ts) == 1
-        @test t.ts[1] == want
+        @test length(t.ts) == 2
     end
 end
 

@@ -67,7 +67,8 @@ writer, validation, scan, and C interface engines.
   each stream record batch retains its dictionary snapshot.
 - Big-endian IPC is rejected.
 - Arrow 3.0 requires ArrowTypes.jl 2.x, Tables.jl 1.14 (the first release
-  with `Tables.Scan`), DataStrings.jl 1.0, DataDecimals.jl 1.0, and Durations.jl 1.0.
+  with `Tables.Scan`), DataStrings.jl 1.0, DataDecimals.jl 1.0, and
+  Durations.jl 1.4 (`Timestamp` and `ZonedTimestamp`).
 - Supported top-level decimals and calendar intervals use shared DataDecimals
   and Durations values. Negative-scale decimals retain raw coefficients.
 
@@ -77,12 +78,19 @@ writer, validation, scan, and C interface engines.
 - Typed `Tables.Scan` select overrides for composite rows: a
   `:column => NamedTuple{...}` select item reads a Struct column as typed
   rows (recursively, including `Vector{...}` targets for list columns).
-- A TimeZones.jl extension. When TimeZones.jl is loaded, second- and
-  millisecond-unit timestamps that declare a timezone read as
-  `ZonedDateTime` (the Arrow 2.x behavior) and round-trip through rewrite,
-  and a fresh single-zone `ZonedDateTime` column writes as a
-  timezone-declared millisecond timestamp; without the extension those
-  columns read as naive UTC `DateTime` values.
+- Native `Durations.Timestamp` and `Durations.ZonedTimestamp` columns.
+  Zone-naive micro- and nanosecond timestamps read as
+  `Durations.Timestamp{P}` (exact; Arrow 2.x truncated to `DateTime` with a
+  warning), and every timezone-declared timestamp reads as
+  `Durations.ZonedTimestamp{P,Z}` holding the stored UTC instant — with no
+  TimeZones.jl requirement. Both write back zero-conversion, and their scan
+  filters push down for every comparison operator.
+- A TimeZones.jl extension. When TimeZones.jl is loaded, a fresh
+  single-zone `ZonedDateTime` column writes as a timezone-declared
+  millisecond timestamp, and `ZonedDateTime` filter literals lower to
+  zone-declared columns' storage. (Durations' own TimeZones extension
+  converts the `ZonedTimestamp` values a zoned column reads as to and from
+  `ZonedDateTime`.)
 - The Arrow 2.x compatibility surface: exported `ArrowTypes`,
   `Arrow.getmetadata(table)`, `Arrow.tobuffer`, and the curried
   `table |> Arrow.write(sink)` form.

@@ -580,7 +580,14 @@ _scancomparisonpreserving(::Union{AC.DecimalType,AC.IntervalType}, op) = false
 _scancomparisonpreserving(t::AC.DictionaryType, op) =
     _scancomparisonpreserving(t.valuetype, op)
 _scancomparisonpreserving(t::AC.DateType, op) = t.unit == AC.DAY || _equalityoperator(op)
+# `ZonedTimestamp` and `Timestamp` order by their Int64 count — a total
+# bijection with storage — so every operator survives lowering. Zone-naive
+# second/millisecond columns read as `DateTime`, whose epoch shift (and
+# second-unit scale) wraps at the Int64 edges: equality survives the
+# millisecond shift (a bijection), order does not, and the non-injective
+# second-unit scale preserves neither.
 _scancomparisonpreserving(t::AC.TimestampType, op) =
+    _timestampzone(t) !== nothing ||
     t.unit in (AC.MICROSECOND, AC.NANOSECOND) ||
     (t.unit == AC.MILLISECOND && _equalityoperator(op))
 _scancomparisonpreserving(::AC.TimeType, op) = false

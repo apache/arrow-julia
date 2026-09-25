@@ -198,8 +198,9 @@ maps to `Union{Missing, T}`.
 | Binary, LargeBinary, BinaryView, FixedSizeBinary | `Vector{UInt8}` |
 | Date32 | `Dates.Date` |
 | Date64 | `Dates.DateTime` |
-| Timestamp (second, millisecond) | `Dates.DateTime` (UTC instant; a declared timezone stays in the retained schema — loading TimeZones.jl reads these as `ZonedDateTime` instead) |
-| Timestamp (microsecond, nanosecond) | `Int64` (raw storage — `DateTime` cannot represent it) |
+| Timestamp (second, millisecond; no timezone) | `Dates.DateTime` (UTC instant) |
+| Timestamp (microsecond, nanosecond; no timezone) | `Durations.Timestamp{Microsecond}`/`{Nanosecond}` (exact — `DateTime` cannot represent these units) |
+| Timestamp with a declared timezone | `Durations.ZonedTimestamp{P,Z}` at every unit (the stored UTC instant; `Z` is the declared zone — see below) |
 | Time32/Time64 | `Dates.Time` |
 | Duration | `Dates.Second`/`Millisecond`/`Microsecond`/`Nanosecond` by unit |
 | Decimal32/64 | `Int32`/`Int64` (unscaled integer storage) |
@@ -235,8 +236,10 @@ or union wrapper stays in its raw integer storage. And field nullability is
 corpus accept a null under a `nullable=false` field), so a column that
 holds a null its field did not declare reads as `Union{Missing, T}` rather
 than failing; a conforming column keeps its declared, `Missing`-free type.
-Sub-millisecond timestamps stay as raw integers everywhere rather than
-silently truncating into `DateTime`; the same rule applies when writing.
+Sub-millisecond and timezone-declared timestamps never truncate into
+`DateTime`: at the top level they materialize as `Durations.Timestamp` and
+`Durations.ZonedTimestamp`, and under a run-end-encoded or union wrapper
+they stay raw integer storage like every nested temporal.
 
 ### Scan pushdown
 
@@ -277,9 +280,18 @@ back to reading the whole source and evaluating over converted public values.
 This includes an inexact literal and a temporal conversion that aliases values
 or wraps ordering. The detailed rules:
 
-* Temporal lowering: Date64 and millisecond Timestamp equality can lower, but
-  their ordered comparisons stay public; Timestamp-second and Time predicates
-  also stay public. Duration lowering accepts a literal in the column unit or
+* Temporal lowering: Date64 and zone-naive millisecond Timestamp equality
+  can lower, but their ordered comparisons stay public; zone-naive
+  Timestamp-second and Time predicates also stay public. Micro/nanosecond
+  and timezone-declared timestamp columns read as `Durations.Timestamp` and
+  `ZonedTimestamp` — total bijections with their storage — so every
+  operator lowers when the literal converts exactly (`Timestamp`,
+  `DateTime`, and `Date` literals on zone-naive columns; `ZonedTimestamp`
+  in any zone, and `ZonedDateTime` with TimeZones.jl loaded, on
+  zone-declared columns). A zone-naive literal never lowers against a
+  zone-declared column, or vice versa: the public domain defines those
+  comparisons as unequal (`==` is `false`; ordered comparisons error).
+  Duration lowering accepts a literal in the column unit or
   a coarser fixed unit, but a finer unit stays public because Julia can
   overflow while promoting stored values.
 * Set membership: temporal Tuple and Array membership follows the same
@@ -473,6 +485,8 @@ At the *top level* of a column the facade adds:
 | `Dates.DateTime` | Timestamp (millisecond) |
 | `Dates.Time` | Time64 (nanosecond) |
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
+| `Durations.Timestamp{P}` | Timestamp of that unit, no timezone |
+| `Durations.ZonedTimestamp{P,Z}` | Timestamp of that unit with timezone `String(Z)` (one zone per column; `Durations.astimezone` normalizes) |
 | `NamedTuple` whose fields are core columns | Struct; `Union{Missing, T}` adds parent validity while child nullability stays declared |
 | `Arrow.DictEncode` over a writable column | Dictionary of the recursive mapping of its values |
 | `DataStrings.StringVector` | Utf8View, borrowed in memory and compacted for IPC output (see below) |
@@ -768,15 +782,27 @@ runs only there. The dynamic facade conveniences (property access on
 Arrow.jl 3.0 changes the storage model and removes some advanced Arrow 2.x
 write features. Read [Migrating from Arrow.jl 2.x](@ref) before you update.
 
-### Shared decimal and interval values
+### Shared decimal, interval, and timestamp values
 
-Arrow uses DataDecimals 1 and Durations 1 from General. Top-level decimal columns
+Arrow uses DataDecimals 1 and Durations 1.4 from General. Top-level decimal columns
 with nonnegative scale decode to `DataDecimals.Decimal{P,S,T}`. The integer width
 matches the Arrow descriptor. Negative-scale decimals keep the raw representation.
 Calendar interval columns decode to `Durations.Duration`; elapsed-time duration
 columns still use `Dates.Second`, `Dates.Millisecond`, `Dates.Microsecond`, or
 `Dates.Nanosecond`.
 
-The writer accepts fixed-scale DataDecimals columns and Durations columns.
-It writes Durations as MONTH_DAY_NANO intervals. Rewriting a retained year-month
+Micro- and nanosecond zone-naive timestamp columns decode to
+`Durations.Timestamp{Microsecond}`/`{Nanosecond}`, and every
+timezone-declared timestamp column decodes to
+`Durations.ZonedTimestamp{P,Z}` with the declared zone in `Z` — both are
+8-byte values whose bits are exactly the column storage, holding the UTC
+instant. No zone rules are consulted to read or write them; local-time
+operations on a `ZonedTimestamp` know `"UTC"` and fixed offsets, and loading
+TimeZones.jl teaches them named zones (and conversion to and from
+`ZonedDateTime`).
+
+The writer accepts fixed-scale DataDecimals columns, Durations columns, and
+`Timestamp`/`ZonedTimestamp` columns (one zone and one resolution per
+column; `Durations.astimezone` normalizes a mixed column). It writes
+Durations as MONTH_DAY_NANO intervals. Rewriting a retained year-month
 or day-time interval checks that the value fits that original representation.

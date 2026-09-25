@@ -40,7 +40,7 @@ UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 [compat]
 DataDecimals = "1"
 DataStrings = "1"
-Durations = "1"
+Durations = "1.4"
 Aqua = "0.8"
 ArrowTypes = "2.4"
 TimeZones = "1"

@@ -16,18 +16,18 @@
 # under the License.
 
 """
-Loading TimeZones.jl restores Arrow 2.x reads for timezone-aware timestamps:
-a second- or millisecond-unit timestamp column that declares a timezone
-materializes as `TimeZones.ZonedDateTime` (the stored value is the UTC
-instant; the declared zone is the display zone) instead of a naive UTC
-`Dates.DateTime`.
+TimeZones.jl conveniences for timezone-aware timestamp columns. Reading
+never needs this extension: a zone-declared timestamp column materializes as
+`Durations.ZonedTimestamp` at every unit (Durations' own TimeZones extension
+adds named-zone rules and `ZonedDateTime` conversions to those values).
+Loading TimeZones.jl adds two things here:
 
-Micro- and nanosecond timestamps keep their raw `Int64` storage values with
-or without this extension: neither `DateTime` nor `ZonedDateTime` can hold
-them exactly, and Arrow 3.0 never truncates silently. A declared zone that
-TimeZones.jl cannot parse falls back to the naive read with a one-time
-warning. Scan filters that compare `ZonedDateTime` literals evaluate in the
-public value domain (no storage-domain pushdown).
+  * Writing: a fresh `TimeZones.ZonedDateTime` column writes as a
+    timezone-declared millisecond timestamp, matching Arrow 2.x, instead of
+    falling through to reflected-struct lowering.
+  * Scan and retained-write literals: a `ZonedDateTime` lowers exactly to a
+    zone-declared column's storage domain (the UTC instant in the column
+    unit), so filters comparing `ZonedDateTime` values push down.
 """
 module ArrowTimeZonesExt
 
@@ -37,56 +37,19 @@ import TimeZones
 
 const AC = Arrow.ArrowCore
 
-# Parse an Arrow timezone string: an IANA name ("America/Denver", legacy
-# aliases included) or a fixed offset ("+07:00"). `nothing` means the zone is
-# unusable and the caller keeps the naive read.
-function _timezone(tz::AbstractString)
-    try
-        return TimeZones.TimeZone(tz, TimeZones.Class(:ALL))
-    catch
-    end
-    try
-        return TimeZones.FixedTimeZone(tz)
-    catch
-    end
-    @warn "Arrow timestamp declares timezone $(repr(String(tz))) that " *
-          "TimeZones.jl cannot parse; reading the column as naive UTC values" _id =
-        Symbol(:arrow_bad_timezone_, tz) maxlog = 1
-    return nothing
-end
-
-# The two hooks `Arrow._zonedext` routes to. Both return `nothing` for an
-# unusable zone so the eltype decision and the conversion agree.
-zonedtype(tz::AbstractString) =
-    _timezone(tz) === nothing ? nothing : TimeZones.ZonedDateTime
-
-# Lower one ZonedDateTime to a timestamp's storage domain exactly: the UTC
-# instant in the descriptor's unit, or `nothing` when the value is not a
-# ZonedDateTime or would not round-trip (a second-unit column cannot hold a
-# sub-second instant). The declared zone deliberately plays no role: storage
-# is the UTC instant, so comparison semantics survive lowering.
+# Lower one ZonedDateTime to a zone-declared timestamp's storage domain
+# exactly: the UTC instant in the descriptor's unit, or `nothing` when the
+# value is not a ZonedDateTime or the unit cannot hold the instant exactly.
+# The declared zone deliberately plays no role: storage is the UTC instant
+# and zoned comparisons use only it, so semantics survive lowering.
 function zonedstorage(unit::AC.TimeUnit, value)
     value isa TimeZones.ZonedDateTime || return nothing
     ms = Dates.value(Dates.DateTime(value, TimeZones.UTC)) - Dates.UNIXEPOCH
     unit == AC.MILLISECOND && return ms
-    (unit == AC.SECOND && ms % 1000 == 0) && return ms ÷ 1000
-    return nothing
-end
-
-function zonedcolumn(t::AC.TimestampType, col, budget)
-    zone = _timezone(t.timezone)
-    zone === nothing && return nothing
-    scale = t.unit == AC.SECOND ? Int64(1000) : Int64(1)
-    return Arrow._mapcol(
-        TimeZones.ZonedDateTime,
-        x -> TimeZones.ZonedDateTime(
-            Dates.DateTime(Dates.UTM(Int64(x) * scale + Dates.UNIXEPOCH)),
-            zone;
-            from_utc=true,
-        ),
-        col,
-        budget,
-    )
+    unit == AC.SECOND && return ms % 1000 == 0 ? ms ÷ 1000 : nothing
+    scale = unit == AC.MICROSECOND ? Int64(1_000) : Int64(1_000_000)
+    wide = Int128(ms) * Int128(scale)
+    return Int128(typemin(Int64)) <= wide <= Int128(typemax(Int64)) ? Int64(wide) : nothing
 end
 
 # The fresh-write hooks `Arrow._zonedwritertype`/`Arrow._zonednativepart`
