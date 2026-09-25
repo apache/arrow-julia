@@ -746,7 +746,8 @@ function _logical_layout_case()
             "",
         ],
         dates=table.dates,
-        datetimes=table.datetimes,
+        # a written DateTime column reads back as Timestamp{Millisecond}
+        datetimes=Durations.Timestamp{Millisecond}.(table.datetimes),
         times=table.times,
         durations=table.durations,
     )
@@ -1039,12 +1040,12 @@ function _physical_layout_case()
             Time(Nanosecond(43_200_000_000_000)),
             Time(Nanosecond(86_399_999_999_999)),
         ],
-        timestamp_s=DateTime[epoch - Second(1), epoch, epoch + Second(1_000_001)],
-        timestamp_ms=DateTime[
-            epoch - Millisecond(1),
-            epoch,
-            epoch + Millisecond(1_000_001),
-        ],
+        timestamp_s=collect(
+            reinterpret(Durations.Timestamp{Second}, Int64[-1, 0, 1_000_001]),
+        ),
+        timestamp_ms=collect(
+            reinterpret(Durations.Timestamp{Millisecond}, Int64[-1, 0, 1_000_001]),
+        ),
         timestamp_us=collect(
             reinterpret(
                 Durations.ZonedTimestamp{Microsecond,:UTC},

@@ -884,8 +884,8 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     println("temporal membership preserves container semantics and safe range plans ✓")
 
     # Dictionary wrappers recurse into their temporal value descriptor during
-    # planning. Exact Date membership lowers. Aliasing Timestamp(seconds) and
-    # fine-unit Duration membership stay in the public domain.
+    # planning. Exact Date and Timestamp membership lowers; fine-unit
+    # Duration membership stays in the public domain.
     function temporaldictionary(t, pool, indices)
         pooldata = Arrow.AC.ArrayData(
             t,
@@ -916,14 +916,18 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
             Arrow.Dates.Date[Arrow.Dates.Date(1970, 1, 2), Arrow.Dates.Date(1970, 1, 2)],
         ),
         (
+            # Timestamp{Second} is a bijection with its counts: the extreme
+            # pool entry no longer wrap-aliases the epoch, so the membership
+            # lowers and matches exactly the epoch-valued row.
             Arrow.AC.TimestampType(Arrow.AC.SECOND, nothing),
             Int64[0, Int64(1) << 61],
             Int32[0, 1],
             (Arrow.Dates.DateTime(1970, 1, 1),),
-            false,
-            Arrow.Dates.DateTime[
-                Arrow.Dates.DateTime(1970, 1, 1),
-                Arrow.Dates.DateTime(1970, 1, 1),
+            true,
+            [
+                Arrow.Durations.Timestamp{Arrow.Dates.Second}(
+                    Arrow.Dates.UTInstant(Arrow.Dates.Second(0)),
+                ),
             ],
         ),
         (

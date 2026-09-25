@@ -23,6 +23,7 @@ using DataAPI
 using Dates
 using Tables
 using UUIDs
+import Durations
 
 struct ArrowTypesTestBytesSource <: Arrow.AbstractArrowSource
     data::Vector{UInt8}
@@ -5493,11 +5494,16 @@ end
     rows = [(id=Int32(1), label="one"), (id=Int32(2), label="two")]
     maps = [Dict("one" => Int32(1)), Dict("two" => Int32(2))]
     tuples = [(Int16(1), Int16(2)), (Int16(3), Int16(4))]
+    # each temporal input with the eltype its column reads back as (a
+    # written DateTime column reads back as Timestamp{Millisecond})
     temporals = (
-        Date[Date(2024, 1, 1), Date(2024, 2, 29)],
-        DateTime[DateTime(2024, 1, 1, 1, 2, 3), DateTime(2024, 2, 29, 4, 5, 6)],
-        Time[Time(1, 2, 3), Time(4, 5, 6)],
-        Millisecond[Millisecond(7), Millisecond(11)],
+        (Date[Date(2024, 1, 1), Date(2024, 2, 29)], Date),
+        (
+            DateTime[DateTime(2024, 1, 1, 1, 2, 3), DateTime(2024, 2, 29, 4, 5, 6)],
+            Durations.Timestamp{Millisecond},
+        ),
+        (Time[Time(1, 2, 3), Time(4, 5, 6)], Time),
+        (Millisecond[Millisecond(7), Millisecond(11)], Millisecond),
     )
     ids = ArrowTypesTestID.(Int64[1, 2])
     writeonly = ArrowTypesTestWriteOnly.(Int32[3, 4])
@@ -5522,12 +5528,12 @@ end
         @test collect.(tupletable.value) == collect.(tuples)
         @test all(row -> all(x -> x isa Int16, row), tupletable.value)
 
-        for temporal in temporals
+        for (temporal, readeltype) in temporals
             temporaltable = Arrow.Table(
                 arrowtypes_test_bytes((value=Arrow.DictEncode(temporal),); file=file),
             )
             @test temporaltable.value == temporal
-            @test eltype(temporaltable.value) === eltype(temporal)
+            @test eltype(temporaltable.value) === readeltype
         end
 
         idtable =

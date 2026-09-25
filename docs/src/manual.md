@@ -198,8 +198,7 @@ maps to `Union{Missing, T}`.
 | Binary, LargeBinary, BinaryView, FixedSizeBinary | `Vector{UInt8}` |
 | Date32 | `Dates.Date` |
 | Date64 | `Dates.DateTime` |
-| Timestamp (second, millisecond; no timezone) | `Dates.DateTime` (UTC instant) |
-| Timestamp (microsecond, nanosecond; no timezone) | `Durations.Timestamp{Microsecond}`/`{Nanosecond}` (exact — `DateTime` cannot represent these units) |
+| Timestamp (no timezone) | `Durations.Timestamp{P}` at the column unit (the stored UTC instant, exact at every unit) |
 | Timestamp with a declared timezone | `Durations.ZonedTimestamp{P,Z}` at every unit (the stored UTC instant; `Z` is the declared zone — see below) |
 | Time32/Time64 | `Dates.Time` |
 | Duration | `Dates.Second`/`Millisecond`/`Microsecond`/`Nanosecond` by unit |
@@ -236,10 +235,11 @@ or union wrapper stays in its raw integer storage. And field nullability is
 corpus accept a null under a `nullable=false` field), so a column that
 holds a null its field did not declare reads as `Union{Missing, T}` rather
 than failing; a conforming column keeps its declared, `Missing`-free type.
-Sub-millisecond and timezone-declared timestamps never truncate into
-`DateTime`: at the top level they materialize as `Durations.Timestamp` and
-`Durations.ZonedTimestamp`, and under a run-end-encoded or union wrapper
-they stay raw integer storage like every nested temporal.
+Timestamps never truncate or wrap into `DateTime`: at the top level they
+materialize as `Durations.Timestamp` and `Durations.ZonedTimestamp` (both
+compare equal to `DateTime` values at the same instant), and under a
+run-end-encoded or union wrapper they stay raw integer storage like every
+nested temporal.
 
 ### Scan pushdown
 
@@ -280,20 +280,18 @@ back to reading the whole source and evaluating over converted public values.
 This includes an inexact literal and a temporal conversion that aliases values
 or wraps ordering. The detailed rules:
 
-* Temporal lowering: Date64 and zone-naive millisecond Timestamp equality
-  can lower, but their ordered comparisons stay public; zone-naive
-  Timestamp-second and Time predicates also stay public. Micro/nanosecond
-  and timezone-declared timestamp columns read as `Durations.Timestamp` and
-  `ZonedTimestamp` — total bijections with their storage — so every
-  operator lowers when the literal converts exactly (`Timestamp`,
-  `DateTime`, and `Date` literals on zone-naive columns; `ZonedTimestamp`
-  in any zone, and `ZonedDateTime` with TimeZones.jl loaded, on
-  zone-declared columns). A zone-naive literal never lowers against a
-  zone-declared column, or vice versa: the public domain defines those
-  comparisons as unequal (`==` is `false`; ordered comparisons error).
-  Duration lowering accepts a literal in the column unit or
-  a coarser fixed unit, but a finer unit stays public because Julia can
-  overflow while promoting stored values.
+* Temporal lowering: Date64 equality can lower, but its ordered
+  comparisons stay public, and Time predicates stay public. Timestamp
+  columns read as `Durations.Timestamp` and `ZonedTimestamp` — total
+  bijections with their storage — so every operator lowers when the
+  literal converts exactly (`Timestamp`, `DateTime`, and `Date` literals
+  on zone-naive columns; `ZonedTimestamp` in any zone, and `ZonedDateTime`
+  with TimeZones.jl loaded, on zone-declared columns). A zone-naive
+  literal never lowers against a zone-declared column, or vice versa: the
+  public domain defines those comparisons as unequal (`==` is `false`;
+  ordered comparisons error). Duration lowering accepts a literal in the
+  column unit or a coarser fixed unit, but a finer unit stays public
+  because Julia can overflow while promoting stored values.
 * Set membership: temporal Tuple and Array membership follows the same
   equality rules. Set members must also have the column's canonical public
   type, which preserves `isequal` and hashing. A custom membership object
@@ -791,9 +789,8 @@ Calendar interval columns decode to `Durations.Duration`; elapsed-time duration
 columns still use `Dates.Second`, `Dates.Millisecond`, `Dates.Microsecond`, or
 `Dates.Nanosecond`.
 
-Micro- and nanosecond zone-naive timestamp columns decode to
-`Durations.Timestamp{Microsecond}`/`{Nanosecond}`, and every
-timezone-declared timestamp column decodes to
+Zone-naive timestamp columns decode to `Durations.Timestamp{P}` at the
+column unit, and every timezone-declared timestamp column decodes to
 `Durations.ZonedTimestamp{P,Z}` with the declared zone in `Z` — both are
 8-byte values whose bits are exactly the column storage, holding the UTC
 instant. No zone rules are consulted to read or write them; local-time

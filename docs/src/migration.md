@@ -96,9 +96,11 @@ them named zones and converts to and from `ZonedDateTime`
 column writes back zero-conversion, and — with TimeZones.jl loaded — a fresh
 single-zone `ZonedDateTime` column still writes as a timezone-declared
 millisecond timestamp. One written column carries one zone; convert
-mixed-zone values with `astimezone` first. Zone-naive micro- and nanosecond
-timestamps read as `Durations.Timestamp{P}` (Arrow 2.x truncated to
-`DateTime` with a warning; Arrow 3.0 is exact and never truncates).
+mixed-zone values with `astimezone` first. Zone-naive timestamps read as
+`Durations.Timestamp{P}` at every unit — a written `DateTime` column reads
+back as `Timestamp{Millisecond}`, which compares equal to the `DateTime`
+values it stores (Arrow 2.x truncated sub-millisecond units to `DateTime`
+with a warning; Arrow 3.0 is exact and never truncates).
 
 The old positional byte-window arguments and multi-input constructors were
 removed. Pass one complete path, `IO`, byte vector, or byte-range source to

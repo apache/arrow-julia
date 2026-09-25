@@ -73,11 +73,9 @@ Every facade method consumes its private route markers before returning:
       strip public type overrides from the storage plan
 
     Temporal literals lower only when the public conversion preserves the
-    requested operator over the complete physical domain. Date64 and
-    zone-naive millisecond Timestamp mappings preserve equality but not
-    order; zone-naive Timestamp-second and Time mappings alias physical
-    values. Micro/nanosecond and zone-declared timestamps read as
-    `Durations.Timestamp`/`ZonedTimestamp` — total order-preserving
+    requested operator over the complete physical domain. Date64 preserves
+    equality but not order; Time mappings alias physical values. Timestamps
+    read as `Durations.Timestamp`/`ZonedTimestamp` — total order-preserving
     bijections with storage — so exact literals lower for every operator,
     and cross-domain literals (zone-naive against zone-declared or the
     reverse) never lower. Duration

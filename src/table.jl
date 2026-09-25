@@ -694,25 +694,12 @@ _postconvert(t::AC.DateType, col, budget=nothing) =
     )
 function _postconvert(t::AC.TimestampType, col, budget=nothing)
     zone = _timestampzone(t)
-    # A zone-declared column materializes as `ZonedTimestamp` at every unit:
-    # the stored value IS the UTC instant, so no zone rules are consulted.
+    # A zone-declared column materializes as `ZonedTimestamp` and a
+    # zone-naive one as `Timestamp`, both at every unit: the stored value IS
+    # the instant count, so conversion is a per-element reinterpret and no
+    # value can wrap or truncate.
     zone === nothing ||
         return _instantcolumn(_zonedtimestamptype(t.unit, zone), col, budget)
-    # Zone-naive second/millisecond columns keep the Arrow 2.x `DateTime`
-    # read; DateTime is millisecond-precision, so finer units materialize as
-    # `Durations.Timestamp` rather than silently truncating.
-    t.unit == AC.SECOND && return _mapcol(
-        Dates.DateTime,
-        x -> Dates.DateTime(Dates.UTM(Int64(x) * 1000 + Dates.UNIXEPOCH)),
-        col,
-        budget,
-    )
-    t.unit == AC.MILLISECOND && return _mapcol(
-        Dates.DateTime,
-        x -> Dates.DateTime(Dates.UTM(Int64(x) + Dates.UNIXEPOCH)),
-        col,
-        budget,
-    )
     return _instantcolumn(Durations.Timestamp{_timestampperiod(t.unit)}, col, budget)
 end
 function _postconvert(t::AC.TimeType, col, budget=nothing)
@@ -745,7 +732,6 @@ function _facadebasetype(t::AC.ArrowType)
     if t isa AC.TimestampType
         zone = _timestampzone(t)
         zone === nothing || return _zonedtimestamptype(t.unit, zone)
-        (t.unit == AC.SECOND || t.unit == AC.MILLISECOND) && return Dates.DateTime
         return Durations.Timestamp{_timestampperiod(t.unit)}
     end
     t isa AC.TimeType && return Dates.Time

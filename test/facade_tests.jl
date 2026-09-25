@@ -1033,7 +1033,8 @@ end
         src = _BytesSource(fb)
         t = Arrow.Table(src)
         @test t.stamp == [DateTime(2020, 5, 5)]
-        @test eltype(t.stamp) == Union{Missing,DateTime} || eltype(t.stamp) == DateTime
+        Tms = Durations.Timestamp{Millisecond}
+        @test eltype(t.stamp) == Union{Missing,Tms} || eltype(t.stamp) == Tms
         @test DataAPI.metadata(t, "origin") == "ranged"
     end
 
@@ -1176,16 +1177,10 @@ end
             @test Tables.rowcount(got) == Tables.rowcount(Tables.columns(want))
         end
 
-        # These public conversions alias distinct physical values. Equality
+        # This public conversion aliases distinct physical values. Equality
         # and membership must use the public plan, not drop one matching row.
-        for (type, values, literal) in (
-            (
-                Arrow.AC.TimestampType(Arrow.AC.SECOND, nothing),
-                Int64[0, Int64(1) << 61],
-                DateTime(1970, 1, 1),
-            ),
-            (Arrow.AC.TimeType(Arrow.AC.SECOND, 32), Int32[0, 86_400], Time(0)),
-        )
+        let (type, values, literal) =
+                (Arrow.AC.TimeType(Arrow.AC.SECOND, 32), Int32[0, 86_400], Time(0))
             field, bytes = rawtemporal(type, values)
             for scan in (
                 Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), literal)),
@@ -1197,13 +1192,33 @@ end
             end
         end
 
-        # Millisecond epoch addition is one-to-one but wraps Int64 ordering.
-        # Equality may lower; ordered comparisons must stay public.
-        for type in (
-            Arrow.AC.DateType(Arrow.AC.MILLISECOND_DATE),
-            Arrow.AC.TimestampType(Arrow.AC.MILLISECOND, nothing),
-        )
-            field, bytes = rawtemporal(type, Int64[typemax(Int64), 0])
+        # Second-unit timestamps used to wrap-alias extreme counts into one
+        # DateTime; as Timestamp{Second} every count is a distinct public
+        # value, so equality lowers and matches exactly one row.
+        let field_bytes = rawtemporal(
+                Arrow.AC.TimestampType(Arrow.AC.SECOND, nothing),
+                Int64[0, Int64(1) << 61],
+            )
+            field, bytes = field_bytes
+            for scan in (
+                Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), DateTime(1970, 1, 1))),
+                Tables.Scan(filter=Tables.colin(Tables.col(:v), (DateTime(1970, 1, 1),))),
+            )
+                @test Arrow._ScanPlan(scan, [field]).storage !== nothing
+                assertmatches(bytes, scan)
+                @test Tables.rowcount(Arrow.Table(copy(bytes); scan=scan)) == 1
+            end
+        end
+
+        # Date64's millisecond epoch addition is one-to-one but wraps Int64
+        # ordering: equality may lower; ordered comparisons stay public. A
+        # millisecond TIMESTAMP reads as Timestamp{Millisecond} — a total
+        # bijection — so both of its comparisons lower.
+        let field_bytes = rawtemporal(
+                Arrow.AC.DateType(Arrow.AC.MILLISECOND_DATE),
+                Int64[typemax(Int64), 0],
+            )
+            field, bytes = field_bytes
             eqscan =
                 Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), DateTime(1970, 1, 1)))
             @test Arrow._ScanPlan(eqscan, [field]).storage !== nothing
@@ -1212,6 +1227,19 @@ end
                 Tables.Scan(filter=Tables.colcmp(<, Tables.col(:v), DateTime(1970, 1, 1)))
             @test Arrow._ScanPlan(ordered, [field]).storage === nothing
             assertmatches(bytes, ordered)
+        end
+        let field_bytes = rawtemporal(
+                Arrow.AC.TimestampType(Arrow.AC.MILLISECOND, nothing),
+                Int64[typemax(Int64), 0],
+            )
+            field, bytes = field_bytes
+            for op in (==, <)
+                scan = Tables.Scan(
+                    filter=Tables.colcmp(op, Tables.col(:v), DateTime(1970, 1, 1)),
+                )
+                @test Arrow._ScanPlan(scan, [field]).storage !== nothing
+                assertmatches(bytes, scan)
+            end
         end
 
         # A coarser Duration literal converts into the column's unit without
@@ -1442,6 +1470,25 @@ end
         Ts = Durations.Timestamp
         Zts = Durations.ZonedTimestamp
         Denver = Zts{Microsecond,Symbol("America/Denver")}
+
+        # Every zone-naive unit reads as Timestamp{P}; a written DateTime
+        # column reads back as Timestamp{Millisecond} with equal instants.
+        for (P, unit) in (
+            (Second, Arrow.AC.SECOND),
+            (Millisecond, Arrow.AC.MILLISECOND),
+            (Microsecond, Arrow.AC.MICROSECOND),
+            (Nanosecond, Arrow.AC.NANOSECOND),
+        )
+            col = [Ts{P}(2026, 1, 1), Ts{P}(2026, 1, 2)]
+            tp = Arrow.Table(take!(Arrow.tobuffer((c=col,))))
+            @test getfield(tp, :schema).fields[1].type ==
+                  Arrow.AC.TimestampType(unit, nothing)
+            @test eltype(tp.c) == Ts{P} && tp.c == col
+        end
+        dts = [DateTime(2026, 1, 1), DateTime(2026, 1, 2)]
+        tdt = Arrow.Table(take!(Arrow.tobuffer((c=dts,))))
+        @test eltype(tdt.c) == Ts{Millisecond}
+        @test tdt.c == dts && tdt.c == Ts{Millisecond}.(dts)
 
         # Fresh writes round-trip zero-conversion at each resolution, with
         # and without missing; the descriptor carries the unit and zone.

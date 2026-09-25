@@ -79,12 +79,14 @@ writer, validation, scan, and C interface engines.
   `:column => NamedTuple{...}` select item reads a Struct column as typed
   rows (recursively, including `Vector{...}` targets for list columns).
 - Native `Durations.Timestamp` and `Durations.ZonedTimestamp` columns.
-  Zone-naive micro- and nanosecond timestamps read as
-  `Durations.Timestamp{P}` (exact; Arrow 2.x truncated to `DateTime` with a
-  warning), and every timezone-declared timestamp reads as
-  `Durations.ZonedTimestamp{P,Z}` holding the stored UTC instant — with no
-  TimeZones.jl requirement. Both write back zero-conversion, and their scan
-  filters push down for every comparison operator.
+  Every zone-naive timestamp reads as `Durations.Timestamp{P}` at the
+  column unit (exact at every unit; Arrow 2.x truncated sub-millisecond
+  units to `DateTime` with a warning), and every timezone-declared
+  timestamp reads as `Durations.ZonedTimestamp{P,Z}` holding the stored
+  UTC instant — with no TimeZones.jl requirement. Both compare equal to
+  `DateTime` at the same instant, write back zero-conversion, and their
+  scan filters push down for every comparison operator. A written
+  `DateTime` column reads back as `Timestamp{Millisecond}`.
 - A TimeZones.jl extension. When TimeZones.jl is loaded, a fresh
   single-zone `ZonedDateTime` column writes as a timezone-declared
   millisecond timestamp, and `ZonedDateTime` filter literals lower to
