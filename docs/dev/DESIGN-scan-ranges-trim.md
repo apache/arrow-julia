@@ -78,7 +78,10 @@ Every facade method consumes its private route markers before returning:
     read as `Durations.Timestamp`/`ZonedTimestamp` — total order-preserving
     bijections with storage — so exact literals lower for every operator,
     and cross-domain literals (zone-naive against zone-declared or the
-    reverse) never lower. Duration
+    reverse) never lower. Run-end-encoded and dictionary wrappers are
+    transparent to lowering; a convertible leaf inside a COMPOSITE container
+    keeps its filters in the public domain, where rows now hold the same
+    public values. Duration
     literals may use the column unit or a coarser fixed unit, never a finer
     one. `In` applies the equality rule to Tuple and Array; Set additionally
     requires the canonical public type to preserve `isequal` and hashing.

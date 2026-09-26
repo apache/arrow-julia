@@ -599,6 +599,20 @@ end
 _scandescriptor(t::AC.DictionaryType) = _scandescriptor(t.valuetype)
 _scandescriptor(t::AC.ArrowType) = t
 
+# The FIELD whose descriptor governs a lowered literal: run-end encoding and
+# dictionary encoding are transparent wrappers whose flat expansion is the
+# leaf's storage, so literals lower against the leaf exactly as the public
+# values compare. (Dictionary children live on the type; run-end children on
+# the Field — this walk sees both.)
+function _lowerleaffield(f::AC.Field)
+    t = f.type
+    if t isa AC.RunEndEncodedType && length(f.children) == 2
+        return _lowerleaffield(f.children[2])
+    end
+    t isa AC.DictionaryType && return _lowerleaffield(AC.dictvaluefield(f, t))
+    return f
+end
+
 function _scanfacadetostorage(t::AC.ArrowType, v)
     result = _exactfacadescalar(_scandescriptor(t), v)
     return result === nothing ? (false, v) : (true, result)
@@ -606,14 +620,16 @@ end
 
 function _storagevalue(f::AC.Field, v, op)
     if !_hasarrowtypesextension(f)
-        # A root temporal descriptor can lower a scalar literal. A temporal
-        # conversion nested inside a container cannot: it would require a
-        # semantics-aware recursive rewrite of the caller's composite value.
-        _nativefacadeconversion(f) || return true, v
-        _nativefacadeconversion(f.type) || return false, v
-        _scancomparisonpreserving(f.type, op) || return false, v
-        _scanliteralcompatible(f.type, v) || return false, v
-        return _scanfacadetostorage(f.type, v)
+        # A temporal descriptor at the root — or behind transparent run-end
+        # or dictionary wrappers — can lower a scalar literal. A temporal
+        # conversion nested inside a COMPOSITE container cannot: its values
+        # sit inside public rows, so the whole filter evaluates publicly.
+        lf = _lowerleaffield(f)
+        _nativefacadeconversion(lf) || return true, v
+        _nativefacadeconversion(lf.type) || return false, v
+        _scancomparisonpreserving(lf.type, op) || return false, v
+        _scanliteralcompatible(lf.type, v) || return false, v
+        return _scanfacadetostorage(lf.type, v)
     end
     # ArrowTypes does not require `toarrow` to preserve Julia comparison
     # semantics. A logical type may, for example, compare by an equivalence
@@ -654,12 +670,13 @@ _loweringdescriptor(t::AC.ArrowType) = t
 end
 
 function _lowermembership(f::AC.Field, values::Union{Tuple,Array}, budget)
-    # A temporal conversion nested inside a public container is not a scalar
-    # membership conversion. Match `_storagevalue` and decline it before any
-    # output is allocated.
-    _nativefacadeconversion(f.type) || return false, values
-    _scancomparisonpreserving(f.type, Tables.OP_EQ) || return false, values
-    descriptor = _loweringdescriptor(f.type)
+    # A temporal conversion nested inside a COMPOSITE container is not a
+    # scalar membership conversion. Match `_storagevalue` and decline it
+    # before any output is allocated; transparent wrappers lower.
+    lf = _lowerleaffield(f)
+    _nativefacadeconversion(lf.type) || return false, values
+    _scancomparisonpreserving(lf.type, Tables.OP_EQ) || return false, values
+    descriptor = _loweringdescriptor(lf.type)
     return _lowersequence(_facadetoken(descriptor), descriptor, values, budget)
 end
 
@@ -687,9 +704,10 @@ end
 end
 
 function _lowermembership(f::AC.Field, values::Set, budget)
-    _nativefacadeconversion(f.type) || return false, values
-    _scancomparisonpreserving(f.type, Tables.OP_EQ) || return false, values
-    descriptor = _loweringdescriptor(f.type)
+    lf = _lowerleaffield(f)
+    _nativefacadeconversion(lf.type) || return false, values
+    _scancomparisonpreserving(lf.type, Tables.OP_EQ) || return false, values
+    descriptor = _loweringdescriptor(lf.type)
     return _lowerset(_facadetoken(descriptor), _facadebasetype(descriptor), values, budget)
 end
 

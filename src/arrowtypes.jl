@@ -296,6 +296,10 @@ function _ArrowTypesRoutePlan(
 end
 
 function _hasarrowtypesextension(f::AC.Field, plan::_ArrowTypesRoutePlan)
+    # The routed walker asks per value: a cache hit must not construct the
+    # memoization thunk, or one heap closure rides beside every row.
+    cached = get(plan.extensions, f, nothing)
+    cached === nothing || return cached
     return _memoized!(
         plan.extensions,
         f,
@@ -312,6 +316,9 @@ function _routedictionaryfield!(
     f::AC.Field,
     t::AC.DictionaryType,
 )
+    # Per dictionary value in the routed walker: hits must not allocate.
+    cached = get(plan.dictionaryfields, f, nothing)
+    cached === nothing || return cached
     return _memoized!(
         plan.dictionaryfields,
         f,
@@ -345,9 +352,18 @@ function _arrowtypesroutedvalue(
     plan::_ArrowTypesRoutePlan,
     routeallunions::Bool=false,
     budget::Union{Nothing,AllocationBudget}=nothing,
+    underlabel::Bool=false,
 )
-    (routeallunions || _needsarrowtypesroute(f, plan)) ||
-        return budget === nothing ? AC.getvalue(f, d, i) : AC.getvalue(f, d, i, budget)
+    # A label-free subtree that is NOT below any label lands in PUBLIC rows,
+    # so build it with the facade's public row builder. Everything at or
+    # below a label — registered or not — stays in the ArrowTypes STORAGE
+    # domain and keeps walking, so leaves reach the raw tail and unions
+    # carry routed markers; restoration then either feeds a registered
+    # target's fromarrow or converts the raw values itself when the label
+    # resolves to no target.
+    (routeallunions || underlabel || _hasarrowtypesextension(f, plan)) ||
+        return _publicvalue(f, d, i, budget, true)
+    under = underlabel || _arrowtypesextension(f) !== nothing
     t = f.type
     if t isa AC.DictionaryType
         AC.isvalid_at(d, i) || return missing
@@ -363,6 +379,7 @@ function _arrowtypesroutedvalue(
             plan,
             routeallunions,
             budget,
+            under,
         )
         # A NullType pool's physical value is always `missing`. The valid index
         # above makes it a logical extension value; an invalid outer index has
@@ -379,6 +396,7 @@ function _arrowtypesroutedvalue(
             plan,
             routeallunions,
             budget,
+            under,
         )
     elseif t isa AC.UnionType
         childfield, childdata, childindex = AC._union_child(f, d, i)
@@ -391,6 +409,7 @@ function _arrowtypesroutedvalue(
             plan,
             routeallunions,
             budget,
+            under,
         )
         routed = _ArrowTypesRoutedUnion(child, value)
         _chargeobject!(budget, sizeof(typeof(routed)), "ArrowTypes routed union value")
@@ -409,6 +428,7 @@ function _arrowtypesroutedvalue(
                 plan,
                 routeallunions,
                 budget,
+                under,
             )
         end
         return out
@@ -426,6 +446,7 @@ function _arrowtypesroutedvalue(
                 plan,
                 routeallunions,
                 budget,
+                under,
             )
         end
         return out
@@ -443,6 +464,7 @@ function _arrowtypesroutedvalue(
                 plan,
                 routeallunions,
                 budget,
+                under,
             )
         end
         return out
@@ -465,6 +487,7 @@ function _arrowtypesroutedvalue(
                     plan,
                     routeallunions,
                     budget,
+                    under,
                 )
         end
         return out
@@ -486,6 +509,7 @@ function _arrowtypesroutedvalue(
                     plan,
                     routeallunions,
                     budget,
+                    under,
                 ),
                 _arrowtypesroutedvalue(
                     valuefield,
@@ -494,17 +518,37 @@ function _arrowtypesroutedvalue(
                     plan,
                     routeallunions,
                     budget,
+                    under,
                 ),
             )
         end
         return out
     end
-    return budget === nothing ? AC.getvalue(f, d, i) : AC.getvalue(f, d, i, budget)
+    # A null slot must not run the budgeted extraction: its transient
+    # charging machinery would allocate per missing value with nothing to
+    # reserve it against. The Null layout has no validity buffer (asking
+    # for it throws) and every slot is missing.
+    t isa AC.NullType && return missing
+    AC.isvalid_at(d, i) || return missing
+    budget === nothing && return AC.getvalue(f, d, i)
+    # Core's budgeted getvalue reserves the materialized value but its own
+    # transient estimate object rides beside every leaf; flat wrapper
+    # columns have no container reserve to absorb it, so charge it here.
+    _chargeobject!(budget, 24, "ArrowTypes routed leaf estimate")
+    return AC.getvalue(f, d, i, budget)
 end
 
 "Materialize only when facade lifting needs storage provenance from the layout."
-function _arrowtypesroutedcolumn(f::AC.Field, d::AC.ArrayData, plan::_ArrowTypesRoutePlan)
-    _needsarrowtypesroute(f, plan) || return nothing
+function _arrowtypesroutedcolumn(
+    f::AC.Field,
+    d::AC.ArrayData,
+    plan::_ArrowTypesRoutePlan;
+    force::Bool=false,
+)
+    # Consult the route cache even when forced: the plan memoizes and
+    # budget-charges one route entry per schema Field either way.
+    needed = _needsarrowtypesroute(f, plan)
+    (force || needed) || return nothing
     budget = plan.budget
     _chargevector!(budget, Any, d.len, "ArrowTypes routed column")
     return Any[
@@ -529,6 +573,7 @@ mutable struct _ArrowTypesContext
     dictionaryfields::Dict{AC.Field,AC.Field}
     metadata_dictionaryfields::Dict{AC.Field,AC.Field}
     public_dictionaryfields::Dict{AC.Field,AC.Field}
+    boxedchildren::Dict{AC.Field,Vector{Any}}
     routeplan::Union{Nothing,_ArrowTypesRoutePlan}
     warn::Bool
     warned::Set{String}
@@ -570,6 +615,12 @@ function _ArrowTypesContext(;
         AC.Field,
         "ArrowTypes public dictionary-field cache container",
     )
+    _chargeemptydict!(
+        budget,
+        AC.Field,
+        Vector{Any},
+        "ArrowTypes boxed-children cache container",
+    )
     _chargeemptydict!(budget, String, Nothing, "ArrowTypes warning cache container")
     _chargeobject!(budget, sizeof(Set{String}), "ArrowTypes warning-set owner")
     return _ArrowTypesContext(
@@ -582,6 +633,7 @@ function _ArrowTypesContext(;
         Dict{AC.Field,AC.Field}(),
         Dict{AC.Field,AC.Field}(),
         Dict{AC.Field,AC.Field}(),
+        Dict{AC.Field,Vector{Any}}(),
         nothing,
         warn,
         Set{String}(),
@@ -681,6 +733,10 @@ end
 
 Base.@noinline function _arrowtypesstoragetype!(ctx::_ArrowTypesContext, T::Type)
     Base.@nospecialize T
+    # Row lifting asks per union value: a cache hit must not construct the
+    # memoization thunk.
+    cached = get(ctx.storage, T, nothing)
+    cached === nothing || return cached
     return _memoized!(ctx.storage, T, ctx.budget, "ArrowTypes storage-type cache") do
         _validatedarrowtypesstoragetype(T, _arrowtypesrawstoragetype(T))
     end
@@ -764,6 +820,10 @@ function _preflightarrowtypesstructnames(ctx::_ArrowTypesContext, f::AC.Field)
 end
 
 function _arrowtypestarget(ctx::_ArrowTypesContext, f::AC.Field)
+    # Row lifting asks per value: a cache hit must not construct the
+    # memoization thunk.
+    cached = get(ctx.targets, f, nothing)
+    cached === nothing || return cached
     return _memoized!(ctx.targets, f, ctx.budget, "ArrowTypes target cache") do
         ext = _arrowtypesextension(f)
         # Most Fields have no extension label. Do not synthesize their full
@@ -841,6 +901,10 @@ _arrowtypeslogicalnullable(ctx::_ArrowTypesContext, f::AC.Field, target) =
     )
 
 function _arrowtypeslogicaleltype(ctx::_ArrowTypesContext, f::AC.Field)
+    # Row restoration asks per value: a cache hit must not construct the
+    # memoization thunk.
+    cached = get(ctx.logicaltypes, f, nothing)
+    cached === nothing || return cached
     return _memoized!(ctx.logicaltypes, f, ctx.budget, "ArrowTypes logical-type cache") do
         _, target, storage = _arrowtypestarget(ctx, f)
         storage === nothing && (storage = _arrowtypesstoragebasetype(ctx, f))
@@ -851,6 +915,10 @@ function _arrowtypeslogicaleltype(ctx::_ArrowTypesContext, f::AC.Field)
 end
 
 function _arrowtypespubliceltype(ctx::_ArrowTypesContext, f::AC.Field)
+    # Row restoration asks per value: a cache hit must not construct the
+    # memoization thunk.
+    cached = get(ctx.publictypes, f, nothing)
+    cached === nothing || return cached
     return _memoized!(ctx.publictypes, f, ctx.budget, "ArrowTypes public-type cache") do
         _, target, storage = _arrowtypestarget(ctx, f)
         if target !== nothing
@@ -888,8 +956,12 @@ function _arrowtypespubliceltype(ctx::_ArrowTypesContext, f::AC.Field)
             end
             return T
         end
-        storage === nothing && (storage = _arrowtypesstoragebasetype(ctx, f))
-        return _withmissingtype(storage, f.nullable)
+        # An unmarked or unknown-label leaf materializes in the native
+        # public domain regardless of any storage fallback the label lookup
+        # produced: no registered mapping consumes these values. The native
+        # declared rule already carries nullability, and a Null leaf keeps
+        # its intrinsic Missing domain.
+        return _declaredeltype(f, true)
     end
 end
 
@@ -957,6 +1029,9 @@ function _arrowtypesdictvaluefield(
     retainmetadata::Bool=false,
 )
     cache = retainmetadata ? ctx.metadata_dictionaryfields : ctx.dictionaryfields
+    # Per dictionary value during row lifting: hits must not allocate.
+    cached = get(cache, f, nothing)
+    cached === nothing || return cached
     what =
         retainmetadata ? "ArrowTypes metadata dictionary-field cache" :
         "ArrowTypes dictionary-field cache"
@@ -986,8 +1061,11 @@ function _arrowtypesnestedvalue(
     f::AC.Field,
     x;
     extension_shape::Bool,
+    rawdomain::Bool=false,
 )
-    _, target, _ = _arrowtypestarget(ctx, f)
+    # Indexing instead of destructuring: per-value callers must not box
+    # iteration-state tuples beside every row.
+    target = _arrowtypestarget(ctx, f)[2]
     # Dictionary<Null> needs a private marker to distinguish a valid index
     # into its null pool from a null dictionary index. Consume that marker at
     # every recursive Field seam, including when the extension label is not
@@ -995,7 +1073,16 @@ function _arrowtypesnestedvalue(
     # row container.
     (target !== nothing || x isa _ArrowTypesRoutedNull) &&
         return _arrowtypesvalue(ctx, f, x)
-    return _arrowtypesstoragevalue(ctx, f, x; extension_shape=extension_shape)
+    # A label with no target left its whole subtree in the raw storage
+    # domain (see the routed walker); its values convert here on the way
+    # into public rows.
+    return _arrowtypesstoragevalue(
+        ctx,
+        f,
+        x;
+        extension_shape=extension_shape,
+        rawdomain=rawdomain || _arrowtypesextension(f) !== nothing,
+    )
 end
 
 function _arrowtypesnestedeltype(
@@ -1003,11 +1090,50 @@ function _arrowtypesnestedeltype(
     f::AC.Field;
     extension_shape::Bool,
 )
-    _, target, _ = _arrowtypestarget(ctx, f)
+    target = _arrowtypestarget(ctx, f)[2]
     if target !== nothing || extension_shape
         return _arrowtypeslogicaleltype(ctx, f)
     end
     return _arrowtypespubliceltype(ctx, f)
+end
+
+"""
+Reserve the dynamic per-element restoration overhead for `n` nested calls:
+each one is a dynamic keyword invocation that leaves a small argument tuple
+and scalar boxes behind (32 bytes covers the measured worst case).
+"""
+function _chargerestoredelements!(
+    budget::Union{Nothing,AllocationBudget},
+    n::Integer,
+    what::AbstractString,
+)
+    budget === nothing && return nothing
+    _charge!(budget, AC.checked_mul(Int64(n), Int64(32)), what)
+    return nothing
+end
+
+"""
+One heap-boxed reference per child Field. `Field` is an inline immutable, so
+handing `f.children[i]` to a dynamic per-row call re-boxes it beside every
+value; restoration loops index this cached vector instead.
+"""
+function _arrowtypesboxedchildren(ctx::_ArrowTypesContext, f::AC.Field)
+    cached = get(ctx.boxedchildren, f, nothing)
+    cached === nothing || return cached
+    return _memoized!(
+        ctx.boxedchildren,
+        f,
+        ctx.budget,
+        "ArrowTypes boxed-children cache",
+    ) do
+        _chargevector!(
+            ctx.budget,
+            AC.Field,
+            length(f.children),
+            "ArrowTypes boxed children",
+        )
+        Any[child for child in f.children]
+    end
 end
 
 "Convert children, preserving the reader's unmarked row containers unless requested."
@@ -1016,6 +1142,7 @@ function _arrowtypesstoragevalue(
     f::AC.Field,
     x;
     extension_shape::Bool,
+    rawdomain::Bool=false,
 )
     t = f.type
     x === missing && return missing
@@ -1024,27 +1151,45 @@ function _arrowtypesstoragevalue(
         _arrowtypesdictvaluefield(ctx, f, t),
         x;
         extension_shape=extension_shape,
+        rawdomain=rawdomain,
     )
     if t isa AC.RunEndEncodedType
         length(f.children) == 2 || return x
         return _arrowtypesnestedvalue(
             ctx,
-            f.children[2],
+            _arrowtypesboxedchildren(ctx, f)[2],
             x;
             extension_shape=extension_shape,
+            rawdomain=rawdomain,
         )
     end
     if t isa Union{AC.ListType,AC.ListViewType,AC.FixedSizeListType}
         length(f.children) == 1 || return x
         child = f.children[1]
+        childbox = _arrowtypesboxedchildren(ctx, f)[1]
         _chargevector!(ctx.budget, Any, length(x), "ArrowTypes converted list value")
+        _chargerestoredelements!(ctx.budget, length(x), "ArrowTypes restored list elements")
         vals = Any[
-            _arrowtypesnestedvalue(ctx, child, y; extension_shape=extension_shape) for
-            y in x
+            _arrowtypesnestedvalue(
+                ctx,
+                childbox,
+                y;
+                extension_shape=extension_shape,
+                rawdomain=rawdomain,
+            ) for y in x
         ]
         if t isa AC.FixedSizeListType && extension_shape
             _chargevector!(ctx.budget, Any, length(vals), "ArrowTypes tuple storage")
-            return Tuple(vals)
+            out = Tuple(vals)
+            # The tuple construction and the dynamic hook call each copy
+            # inline (isbits) child payloads wholesale; heap children
+            # contribute pointer slots only, which sizeof reflects.
+            _chargeobject!(
+                ctx.budget,
+                AC.checked_mul(Int64(2), Int64(sizeof(typeof(out)))),
+                "ArrowTypes tuple payload",
+            )
+            return out
         end
         return _typedvalues(
             _arrowtypesnestedeltype(ctx, child; extension_shape=extension_shape),
@@ -1057,6 +1202,12 @@ function _arrowtypesstoragevalue(
             AC.ValidationError("extension struct value width does not match its Field"),
         )
         _chargevector!(ctx.budget, Any, length(f.children), "ArrowTypes struct workspace")
+        _chargerestoredelements!(
+            ctx.budget,
+            length(f.children),
+            "ArrowTypes restored struct children",
+        )
+        boxedchildren = _arrowtypesboxedchildren(ctx, f)
         vals = Vector{Any}(undef, length(f.children))
         for (i, child) in enumerate(f.children)
             kv = x[i]
@@ -1067,13 +1218,24 @@ function _arrowtypesstoragevalue(
             )
             vals[i] = _arrowtypesnestedvalue(
                 ctx,
-                child,
+                boxedchildren[i],
                 last(kv);
                 extension_shape=extension_shape,
+                rawdomain=rawdomain,
             )
         end
         if extension_shape
-            NT = _arrowtypesstoragebasetype(ctx, f)
+            # Rebuilding the storage base type per row walks every child and
+            # re-applies the NamedTuple constructor. A registered Field's
+            # target cache carries the exact type; an unlabeled Field reads
+            # it through the logical-eltype memo. An unknown label keeps the
+            # direct computation: its cached slot holds the bounded fallback
+            # shape, not the exact one.
+            tgt = _arrowtypestarget(ctx, f)
+            NT =
+                tgt[2] !== nothing ? tgt[3] :
+                tgt[1] === false ? Base.nonmissingtype(_arrowtypeslogicaleltype(ctx, f)) :
+                _arrowtypesstoragebasetype(ctx, f)
             if NT <: NamedTuple
                 _chargevector!(
                     ctx.budget,
@@ -1081,6 +1243,16 @@ function _arrowtypesstoragevalue(
                     length(vals),
                     "ArrowTypes NamedTuple storage",
                 )
+                # The transient tuple and the constructed row each copy the
+                # row's inline (isbits) payload; heap-backed children only
+                # contribute pointer slots, which sizeof reflects.
+                NT isa DataType &&
+                    isconcretetype(NT) &&
+                    _chargeobject!(
+                        ctx.budget,
+                        AC.checked_mul(Int64(2), Int64(sizeof(NT))),
+                        "ArrowTypes NamedTuple payload",
+                    )
                 return NT(Tuple(vals))
             end
             _chargevector!(
@@ -1097,29 +1269,57 @@ function _arrowtypesstoragevalue(
             length(vals),
             "ArrowTypes converted struct value",
         )
+        # The raw-domain path (a label with no resolvable target) rebuilds
+        # every child pair with freshly boxed scalars; reserve that beside
+        # the pair vector.
+        _chargerestoredelements!(
+            ctx.budget,
+            AC.checked_mul(Int64(3), Int64(length(vals))),
+            "ArrowTypes raw struct rows",
+        )
         return Pair{String,Any}[f.children[i].name => vals[i] for i in eachindex(vals)]
     end
     if t isa AC.MapType
         length(f.children) == 1 || return x
         entries = f.children[1]
         length(entries.children) == 2 || return x
-        kf, vf = entries.children
+        entryboxes = _arrowtypesboxedchildren(ctx, entries)
+        kfbox, vfbox = entryboxes[1], entryboxes[2]
         _chargevector!(
             ctx.budget,
             Pair{Any,Any},
             length(x),
             "ArrowTypes converted map value",
         )
+        _chargerestoredelements!(
+            ctx.budget,
+            AC.checked_mul(Int64(2), Int64(length(x))),
+            "ArrowTypes restored map entries",
+        )
         vals = Pair{Any,Any}[
-            _arrowtypesnestedvalue(ctx, kf, first(kv); extension_shape=extension_shape) => _arrowtypesnestedvalue(
+            _arrowtypesnestedvalue(
                 ctx,
-                vf,
+                kfbox,
+                first(kv);
+                extension_shape=extension_shape,
+                rawdomain=rawdomain,
+            ) => _arrowtypesnestedvalue(
+                ctx,
+                vfbox,
                 last(kv);
                 extension_shape=extension_shape,
+                rawdomain=rawdomain,
             ) for kv in x
         ]
         if extension_shape
-            D = _arrowtypesstoragebasetype(ctx, f)
+            # Same caching rule as the struct branch: registered Fields use
+            # the exact cached storage type, unlabeled Fields the memoized
+            # logical eltype, unknown labels the direct computation.
+            tgt = _arrowtypestarget(ctx, f)
+            D =
+                tgt[2] !== nothing ? tgt[3] :
+                tgt[1] === false ? Base.nonmissingtype(_arrowtypeslogicaleltype(ctx, f)) :
+                _arrowtypesstoragebasetype(ctx, f)
             if D <: Dict
                 _chargedict!(
                     ctx.budget,
@@ -1144,26 +1344,38 @@ function _arrowtypesstoragevalue(
                 throw(AC.ValidationError("routed union child is outside its Field"))
             return _arrowtypesnestedvalue(
                 ctx,
-                f.children[x.child],
+                _arrowtypesboxedchildren(ctx, f)[x.child],
                 x.value;
                 extension_shape=extension_shape,
+                rawdomain=rawdomain,
             )
         end
-        for child in f.children
+        boxedchildren = _arrowtypesboxedchildren(ctx, f)
+        for (k, child) in enumerate(f.children)
             T = _arrowtypesnestedeltype(ctx, child; extension_shape=extension_shape)
             x isa T && return _arrowtypesnestedvalue(
                 ctx,
-                child,
+                boxedchildren[k],
                 x;
                 extension_shape=extension_shape,
+                rawdomain=rawdomain,
             )
         end
         return x
     end
-    # Only a marked parent's ArrowTypes storage shape asks for native scalars
-    # here. An unmarked composite keeps its temporal children in the raw
-    # storage domain, even when a marked sibling triggered this recursion.
-    return extension_shape ? _arrowtypesscalar(t, x) : x
+    # Only a marked parent's ArrowTypes storage shape asks for ArrowTypes
+    # scalars here — that domain is the registered mappings' contract. A
+    # leaf outside any label already arrived public from the routed walker;
+    # a leaf inside a label-without-target subtree arrived as raw storage
+    # and converts here, landing in public rows like every unmarked value.
+    extension_shape && return _arrowtypesscalar(t, x)
+    if rawdomain && _isconvertibleleaf(t)
+        # Same reserve as the facade's converted leaf: the public box plus
+        # its transient conversion temporaries.
+        _chargeobject!(ctx.budget, 96, "ArrowTypes converted leaf")
+        return _publicleafscalar(t, x)
+    end
+    return x
 end
 
 function _arrowtypesutf8storage(ctx::_ArrowTypesContext, f::AC.Field)
@@ -1215,10 +1427,33 @@ function _arrowtypesfromarrow(ctx::_ArrowTypesContext, T, f::AC.Field, storage)
     elseif t isa AC.RunEndEncodedType
         return ArrowTypes.fromarrow(T, storage)
     elseif t isa AC.StructType
+        # Reconstruction copies the row's inline (isbits) payload at each
+        # seam — the transient tuple, the splatted arguments, and an isbits
+        # target's returned box; heap-backed children contribute pointer
+        # slots only, which sizeof reflects.
+        storage isa Union{NamedTuple,Tuple} && _chargeobject!(
+            ctx.budget,
+            AC.checked_mul(Int64(3), Int64(sizeof(typeof(storage)))),
+            "ArrowTypes struct hook payload",
+        )
         if T <: NamedTuple || T <: Tuple
+            # The transient tuple and constructed row beside the payload.
+            _chargerestoredelements!(
+                ctx.budget,
+                AC.checked_mul(Int64(2), Int64(length(storage))),
+                "ArrowTypes struct hook tuple",
+            )
             return T(Tuple(storage))
         end
         names = _arrowtypesstructnames(ctx, f)
+        # The `applicable` probe and the variadic hook call each re-splat
+        # every child value, re-boxing scalars whose types Julia does not
+        # cache; charge that width-dependent dispatch work per child.
+        ctx.budget === nothing || _charge!(
+            ctx.budget,
+            AC.checked_mul(Int64(length(storage)), Int64(160)),
+            "ArrowTypes struct hook dispatch",
+        )
         values = Tuple(storage)
         if isdefined(ArrowTypes, :fromarrowstruct)
             fromstruct = getfield(ArrowTypes, :fromarrowstruct)
@@ -1233,9 +1468,15 @@ end
 function _arrowtypesvalue(ctx::_ArrowTypesContext, f::AC.Field, x)
     routednull = x isa _ArrowTypesRoutedNull
     routednull && (x = missing)
-    has_label, target, _ = _arrowtypestarget(ctx, f)
+    target = _arrowtypestarget(ctx, f)[2]
     if target === nothing
-        return _arrowtypesstoragevalue(ctx, f, x; extension_shape=false)
+        return _arrowtypesstoragevalue(
+            ctx,
+            f,
+            x;
+            extension_shape=false,
+            rawdomain=_arrowtypesextension(f) !== nothing,
+        )
     end
     if f.type isa AC.UnionType && x isa _ArrowTypesRoutedUnion
         child = f.children[x.child]
@@ -1252,8 +1493,35 @@ function _arrowtypesvalue(ctx::_ArrowTypesContext, f::AC.Field, x)
     # physical storage of public-domain values such as `nothing` and must lift.
     x === missing && !routednull && !(f.type isa AC.NullType) && return missing
     storage = _arrowtypesstoragevalue(ctx, f, x; extension_shape=true)
+    # Reserve the lifted value plus the dynamic-dispatch temporaries around
+    # the fromarrow hook. Childless (flat scalar) storage leaves about 140
+    # bytes of boxes per lifted value; container storage's per-element
+    # restoration and hook-dispatch reserves already carry its width, so
+    # only a small fixed remainder rides per row; union storage and the
+    # transparent wrappers (run-end, dictionary) lift one scalar with no
+    # per-element reserve and keep the larger fixed one.
+    _chargeobject!(
+        ctx.budget,
+        isempty(f.children) ? 152 :
+        f.type isa
+        Union{AC.StructType,AC.ListType,AC.ListViewType,AC.FixedSizeListType,AC.MapType} ?
+        96 : 216,
+        "ArrowTypes lifted value",
+    )
+    # The default ArrowTypes pointer adapter copies a string's bytes again
+    # (`unsafe_string`) before the hook sees them: that copy grows with the
+    # value, so reserve it by length (plus the copy's measured header and
+    # size-class slop) beside the fixed overhead.
+    storage isa AbstractString && _chargeobject!(
+        ctx.budget,
+        AC.checked_add(Int64(ncodeunits(storage)), Int64(256)),
+        "ArrowTypes lifted string copy",
+    )
     return _arrowtypesfromarrow(ctx, target, f, storage)
 end
+
+"Heap-box an inline immutable once; @noinline keeps the box from folding away."
+@noinline _boxonce(@nospecialize(x)) = x
 
 "Interpret extension labels recursively over an already materialized column."
 function _arrowtypescolumn(
@@ -1270,14 +1538,25 @@ function _arrowtypescolumn(
     )
     has_routed_value =
         any(x -> x isa _ArrowTypesRoutedNull || x isa _ArrowTypesRoutedUnion, col)
-    if target === nothing && has_label && !has_registered_child && !has_routed_value
-        # No hook or routed provenance is available to consume. Preserve the
-        # ordinary storage column without building and discarding a per-row
-        # ArrowTypes workspace.
-        return _publiccolumn(f, _postconvert(f.type, col, ctx.budget), ctx.budget)
+    if target === nothing &&
+       has_label &&
+       !has_registered_child &&
+       !has_routed_value &&
+       isempty(f.children)
+        # No hook or routed provenance is available to consume, and the
+        # column is flat (its raw values sit under one leaf descriptor, via
+        # transparent wrappers at most): convert the whole column at once
+        # without building a per-row ArrowTypes workspace. A composite
+        # column with an unconsumed label falls through to the per-row
+        # lifting below, which converts its raw-domain leaves in place.
+        return _publiccolumn(f, _postconvertfield(f, col, ctx.budget), ctx.budget)
     end
     _chargevector!(ctx.budget, Any, length(col), "ArrowTypes lifting workspace")
-    values = Any[_arrowtypesvalue(ctx, f, x) for x in col]
+    # `f` is an immutable struct held inline in this frame: box it once,
+    # behind a call boundary the optimizer cannot fold away, so the dynamic
+    # per-row call does not re-box it beside every value.
+    fbox = _boxonce(f)
+    values = Any[_arrowtypesvalue(ctx, fbox, x) for x in col]
     if target !== nothing
         # NullType uses the physical null slots as its storage values. A
         # registered logical type such as `Nothing` lifts those slots to real
@@ -1291,11 +1570,10 @@ function _arrowtypescolumn(
     # An unknown top-level extension remains the ordinary storage column.
     # Recursive registered children have already been lifted in `values`.
     if has_label && !has_registered_child
-        # An unknown Dictionary<Null> extension still took the private route to
-        # retain index validity. Use the consumed values so its marker cannot
-        # escape; other unknown extensions keep their original storage column.
-        storage = has_routed_value ? values : col
-        return _publiccolumn(f, _postconvert(f.type, storage, ctx.budget), ctx.budget)
+        # The lifted rows: routed markers consumed, and raw-domain leaves
+        # under the unconsumed label already converted to their public
+        # values — no whole-column conversion may run again.
+        return _publiccolumn(f, values, ctx.budget)
     end
     T = _arrowtypespubliceltype(ctx, f)
     any(ismissing, values) && !(Missing <: T) && (T = Union{Missing,T})

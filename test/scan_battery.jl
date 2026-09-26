@@ -965,7 +965,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
                     bigio,
                     Tables.partitioner([
                         (a=collect(Int64, 1:n), b=[fat(i) for i = 1:n]),
-                        (a=collect(Int64, (n + 1):2n), b=[fat(i) for i = (n + 1):2n]),
+                        (a=collect(Int64, (n + 1):(2n)), b=[fat(i) for i = (n + 1):(2n)]),
                     ]);
                     file=false,
                 )

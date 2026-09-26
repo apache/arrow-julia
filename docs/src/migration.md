@@ -60,9 +60,10 @@ indexing.
 
 Decimal read types changed. Arrow 2.x read decimal columns as `Arrow.Decimal`
 values that wrap a BitIntegers.jl `Int128` or `Int256` unscaled integer. Arrow
-3.0 reads Decimal32 and Decimal64 as unscaled `Int32` and `Int64` values, and
-Decimal128 and Decimal256 as raw native-endian byte vectors. See
-[Type mapping when reading](@ref) for the complete table.
+3.0 reads decimals with nonnegative scale as `DataDecimals.Decimal{P,S,T}`
+values whose integer width matches the descriptor; negative-scale decimals
+keep raw storage (`Int32`/`Int64`, or native-endian byte vectors at 128/256
+bits). See [Type mapping when reading](@ref) for the complete table.
 
 Struct row types changed. Arrow 2.x read a plain (non-extension) Struct
 column as `NamedTuple` rows. Arrow 3.0 reads it as `Vector{Pair{String,Any}}`
@@ -207,7 +208,7 @@ mapping. A fully read top-level dictionary also retains its pool for rewrite.
 ## Supported write types
 
 The writer accepts fixed-width integers and floats, `Bool`, strings, supported
-`Dates` values, lists of supported core values, top-level `NamedTuple` struct
+`Dates` values, lists of supported core values, `NamedTuple` struct
 columns, and fresh heterogeneous Julia Union columns whose members are
 writable at that nesting depth. Fresh heterogeneous Unions use the canonical
 dense Arrow Union layout. See [Type mapping when writing](@ref) for the

@@ -129,6 +129,48 @@ end
         Bad = NamedTuple{(:a, :wrong),Tuple{Float64,String}}
         @test_throws ArgumentError Arrow.Table(bytes; scan=Tables.Scan(select=(:c => Bad,)))
     end
+
+    @testset "public temporal leaves in typed rows" begin
+        # Rows hold public values at every depth, so a claim naming the
+        # public leaf types is an identity check per leaf.
+        ns = AC.TimestampType(AC.NANOSECOND, nothing)
+        day = AC.DateType(AC.DAY)
+        tsf = AC.Field("when", ns; nullable=false)
+        dayf = AC.Field("day", day; nullable=false)
+        stf = AC.Field("c", AC.StructType(); nullable=false, children=[tsf, dayf])
+        tsd = AC.ArrayData(
+            ns,
+            2,
+            [AC.BufferSlice(), AC._databuffer(Int64[10, 20])];
+            nullcount=0,
+        )
+        dayd = AC.ArrayData(
+            day,
+            2,
+            [AC.BufferSlice(), AC._databuffer(Int32[0, 1])];
+            nullcount=0,
+        )
+        std = AC.ArrayData(
+            AC.StructType(),
+            2,
+            [AC.BufferSlice()];
+            children=[tsd, dayd],
+            nullcount=0,
+        )
+        sch = AC.Schema([stf])
+        tsbytes = Arrow.writefile(sch, [AC.RecordBatch(sch, [std])])
+        Ts = Durations.Timestamp{Dates.Nanosecond}
+        TNT = NamedTuple{(:when, :day),Tuple{Ts,Dates.Date}}
+        t = Arrow.Table(tsbytes; scan=Tables.Scan(select=(:c => TNT,)))
+        @test eltype(t.c) == TNT
+        @test t.c == [
+            (when=reinterpret(Ts, Int64(10)), day=Dates.Date(1970, 1, 1)),
+            (when=reinterpret(Ts, Int64(20)), day=Dates.Date(1970, 1, 2)),
+        ]
+        # a claim naming raw storage integers no longer matches public rows
+        RawNT = NamedTuple{(:when, :day),Tuple{Int64,Int32}}
+        @test_throws Exception Arrow.Table(tsbytes; scan=Tables.Scan(select=(:c => RawNT,)))
+    end
 end
 
 @testset "timezone-aware timestamps without TimeZones" begin

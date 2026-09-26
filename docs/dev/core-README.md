@@ -369,10 +369,11 @@ is exercised (on the available hosts), the 32-bit branch is inspected.
 ### Facade
 
 `Arrow.Table` materializes columns into plain Julia vectors (closed
-fixed-width claims through Core's bulk typed path, everything else through
-the dynamic accessors, then facade conversions: Dates types in both
-directions, with sub-millisecond timestamps staying raw integers rather than
-silently truncating). `Arrow.Stream` iterates record batches as one Table
+fixed-width claims through Core's bulk typed path plus one whole-column
+conversion; composite and wrapper rows through the facade's own dynamic row
+builder, which converts temporal, decimal, and interval leaves to their
+public values at every depth — timestamps as `Durations.Timestamp` and
+`ZonedTimestamp`, never truncating). `Arrow.Stream` iterates record batches as one Table
 each. `Arrow.write` accepts any Tables.jl source (partitions become record
 batches), `DictEncode` marks a column for pooling, retained-schema rewrites
 of a `Table`/`Stream` recursively preserve every descriptor that materialized

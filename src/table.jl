@@ -683,6 +683,210 @@ _instantcolumn(::Type{T}, col, budget) where {T} =
     _mapcol(T, x -> reinterpret(T, Int64(x)), col, budget)
 
 _postconvert(::AC.ArrowType, col, budget=nothing) = col
+
+# The convertible-leaf authority, per SCALAR: the same conversions the
+# `_postconvert` column methods apply, for one value at a time. The dynamic
+# row builder below uses it where a leaf lands inside an `Any`-shaped row.
+# A differential test pins scalar/column agreement for every leaf kind.
+_isconvertibleleaf(t::AC.ArrowType) =
+    t isa AC.DateType ||
+    t isa AC.TimeType ||
+    t isa AC.TimestampType ||
+    t isa AC.DurationType ||
+    t isa AC.IntervalType ||
+    (t isa AC.DecimalType && _shareddecimal(t))
+
+function _publicleafscalar(t::AC.ArrowType, x)
+    if t isa AC.DateType
+        return t.unit == AC.DAY ? Dates.Date(Dates.UTD(Int64(x) + _EPOCH_DAYS)) :
+               Dates.DateTime(Dates.UTM(Int64(x) + Dates.UNIXEPOCH))
+    elseif t isa AC.TimestampType
+        zone = _timestampzone(t)
+        T =
+            zone === nothing ? Durations.Timestamp{_timestampperiod(t.unit)} :
+            _zonedtimestamptype(t.unit, zone)
+        return reinterpret(T, Int64(x))
+    elseif t isa AC.TimeType
+        scale =
+            t.unit == AC.SECOND ? Int64(1_000_000_000) :
+            t.unit == AC.MILLISECOND ? Int64(1_000_000) :
+            t.unit == AC.MICROSECOND ? Int64(1_000) : Int64(1)
+        return Dates.Time(Dates.Nanosecond(Int64(x) * scale))
+    elseif t isa AC.DurationType
+        P =
+            t.unit == AC.SECOND ? Dates.Second :
+            t.unit == AC.MILLISECOND ? Dates.Millisecond :
+            t.unit == AC.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
+        return P(Int64(x))
+    elseif t isa AC.IntervalType
+        return t.unit == AC.YEAR_MONTH ? Durations.Duration(x, 0, 0) :
+               t.unit == AC.DAY_TIME ?
+               Durations.Duration(0, x.days, Int64(x.millis) * 1_000_000) :
+               Durations.Duration(x.months, x.days, x.nanos)
+    elseif t isa AC.DecimalType && _shareddecimal(t)
+        return _shareddecimalscalar(
+            _decimalhost(t),
+            _decimalstorage(t),
+            Int(t.precision),
+            x,
+        )
+    end
+    return x
+end
+
+# Whole-column conversion, FIELD-aware: transparent wrappers (run-end
+# encoding via the values child field, dictionary via the value field) walk
+# to the leaf whose descriptor governs every element of the flat column the
+# typed path produced. Composite roots fall to the no-op: their rows were
+# already built in the public domain by `_publicvalue`.
+function _postconvertfield(f::AC.Field, col, budget=nothing)
+    t = f.type
+    if t isa AC.RunEndEncodedType && length(f.children) == 2
+        return _postconvertfield(f.children[2], col, budget)
+    end
+    t isa AC.DictionaryType &&
+        return _postconvertfield(AC.dictvaluefield(f, t), col, budget)
+    return _postconvert(t, col, budget)
+end
+
+# The facade's dynamic row builder: Core's `_value` shapes — struct rows as
+# `Vector{Pair{String,Any}}`, list rows as `Vector{Any}`, map rows as
+# `Vector{Pair{Any,Any}}` — with facade-converted leaves. `convertleaf` is
+# false at a column root: a root scalar (or a transparent-wrapper chain to
+# one) stays in storage for the one-pass whole-column conversion above and
+# for storage-domain scan predicates. It turns true when the walk enters a
+# composite container, where each leaf value lands inside an `Any`-shaped
+# row and must convert AS it is read — a built union row cannot recover its
+# branch afterward, so leaf conversion cannot run as a post-pass.
+function _publicvalue(f::AC.Field, d::AC.ArrayData, i::Int64, budget, convertleaf::Bool)
+    t = f.type
+    if t isa AC.DictionaryType
+        AC.isvalid_at(d, i) || return missing
+        w = AC.primwidth(t.indextype)
+        index =
+            AC._load_int(AC.rolebuffer(d, AC.DATA), t.indextype, AC._slotbyteoff(d, i, w))
+        pool = d.dictionary
+        pool === nothing && throw(AC.ValidationError("dictionary array has no value pool"))
+        return _publicvalue(
+            AC.dictvaluefield(f, t),
+            pool,
+            AC.checked_add(Int64(index), Int64(1)),
+            budget,
+            convertleaf,
+        )
+    elseif t isa AC.RunEndEncodedType && length(f.children) == 2
+        return _publicvalue(
+            f.children[2],
+            d.children[2],
+            AC._ree_runindex(d, i),
+            budget,
+            convertleaf,
+        )
+    elseif t isa AC.UnionType
+        childfield, childdata, childindex = AC._union_child(f, d, i)
+        return _publicvalue(childfield, childdata, childindex, budget, true)
+    elseif t isa AC.ListType
+        AC.isvalid_at(d, i) || return missing
+        lo, hi = AC._offsets_at(d, i, AC.layoutspec(t).offsetwidth == 8)
+        childfield, childdata = f.children[1], d.children[1]
+        _chargevector!(budget, Any, hi - lo, "facade public list row")
+        out = Vector{Any}(undef, Int(hi - lo))
+        for k = 1:length(out)
+            out[k] = _publicvalue(
+                childfield,
+                childdata,
+                AC.checked_add(lo, Int64(k)),
+                budget,
+                true,
+            )
+        end
+        return out
+    elseif t isa AC.ListViewType
+        AC.isvalid_at(d, i) || return missing
+        off, size = AC._listview_range(t, d, i)
+        childfield, childdata = f.children[1], d.children[1]
+        _chargevector!(budget, Any, size, "facade public list-view row")
+        out = Vector{Any}(undef, Int(size))
+        for k = 1:length(out)
+            out[k] = _publicvalue(
+                childfield,
+                childdata,
+                AC.checked_add(off, Int64(k)),
+                budget,
+                true,
+            )
+        end
+        return out
+    elseif t isa AC.FixedSizeListType
+        AC.isvalid_at(d, i) || return missing
+        childfield, childdata = f.children[1], d.children[1]
+        base = AC.checked_mul(AC._slotindex0(d, i), Int64(t.listsize))
+        _chargevector!(budget, Any, t.listsize, "facade public fixed-list row")
+        out = Vector{Any}(undef, t.listsize)
+        for k = 1:(t.listsize)
+            out[k] = _publicvalue(
+                childfield,
+                childdata,
+                AC.checked_add(base, Int64(k)),
+                budget,
+                true,
+            )
+        end
+        return out
+    elseif t isa AC.StructType
+        AC.isvalid_at(d, i) || return missing
+        childindex = AC.checked_add(d.offset, i)
+        _chargevector!(
+            budget,
+            Pair{String,Any},
+            length(f.children),
+            "facade public struct row",
+        )
+        out = Vector{Pair{String,Any}}(undef, length(f.children))
+        for k in eachindex(f.children)
+            out[k] =
+                f.children[k].name =>
+                    _publicvalue(f.children[k], d.children[k], childindex, budget, true)
+        end
+        return out
+    elseif t isa AC.MapType
+        AC.isvalid_at(d, i) || return missing
+        lo, hi = AC._offsets_at(d, i, false)
+        entriesfield, entriesdata = f.children[1], d.children[1]
+        keyfield, valuefield = entriesfield.children
+        keydata, valuedata = entriesdata.children
+        _chargevector!(budget, Pair{Any,Any}, hi - lo, "facade public map row")
+        out = Vector{Pair{Any,Any}}(undef, Int(hi - lo))
+        for k = 1:length(out)
+            entryindex = AC.checked_add(entriesdata.offset, AC.checked_add(lo, Int64(k)))
+            out[k] = Pair{Any,Any}(
+                _publicvalue(keyfield, keydata, entryindex, budget, true),
+                _publicvalue(valuefield, valuedata, entryindex, budget, true),
+            )
+        end
+        return out
+    end
+    # A null slot must not run the budgeted extraction: its transient
+    # charging machinery would allocate per missing value with nothing to
+    # reserve it against. The Null layout has no validity buffer (asking
+    # for it throws) and every slot is missing.
+    t isa AC.NullType && return missing
+    AC.isvalid_at(d, i) || return missing
+    x = budget === nothing ? AC.getvalue(f, d, i) : AC.getvalue(f, d, i, budget)
+    (convertleaf && x !== missing && _isconvertibleleaf(t)) || return x
+    # The converted value is one more boxed object beside the storage value
+    # the budgeted getvalue charged, plus transient conversion temporaries;
+    # the measured worst case (shared Decimal inside a union row) leaves
+    # about 96 bytes of boxes and charging machinery per converted leaf.
+    _chargeobject!(budget, 96, "facade converted leaf")
+    return _publicleafscalar(t, x)
+end
+
+"One dynamic-path column: public rows, storage roots (see `_publicvalue`)."
+function _publicdynamiccolumn(f::AC.Field, d::AC.ArrayData, budget=nothing)
+    _chargevector!(budget, Any, d.len, "facade dynamic column")
+    return Any[_publicvalue(f, d, Int64(i), budget, false) for i = 1:(d.len)]
+end
 _postconvert(t::AC.DateType, col, budget=nothing) =
     t.unit == AC.DAY ?
     _mapcol(Dates.Date, x -> Dates.Date(Dates.UTD(Int64(x) + _EPOCH_DAYS)), col, budget) :
@@ -721,8 +925,6 @@ function _postconvert(t::AC.DurationType, col, budget=nothing)
         t.unit == AC.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
     return _mapcol(P, x -> P(Int64(x)), col, budget)
 end
-_postconvert(t::AC.DictionaryType, col, budget=nothing) =
-    _postconvert(t.valuetype, col, budget)
 
 # The public element type of the SCALAR layouts the facade converts (Dates)
 # or passes through; `_declaredbasetype` completes it for every layout and
@@ -842,25 +1044,48 @@ function _storagebatchcolumn(f::AC.Field, d::AC.ArrayData, budget=nothing)
     return budget === nothing ? AC.materialize(T, f, d) : AC.materialize(T, f, d, budget)
 end
 
+# The public-domain sibling of `_storagebatchcolumn`: identical typed path
+# (the flat storage column converts once, whole-column, in `_facadefromraw`),
+# but the dynamic path builds PUBLIC rows — composite leaf conversion cannot
+# run as a post-pass (see `_publicvalue`).
+function _publicbatchcolumn(f::AC.Field, d::AC.ArrayData, budget=nothing)
+    T = _storageelementclaim(f)
+    T === Any && return _publicdynamiccolumn(f, d, budget)
+    (Missing <: T || !_hasnulls(f, d)) || (T = Union{Missing,T})
+    return budget === nothing ? AC.materialize(T, f, d) : AC.materialize(T, f, d, budget)
+end
+
 "Materialize for the facade, retaining an ArrowTypes Union route when needed."
 function _batchcolumn(f::AC.Field, d::AC.ArrayData, plan::_ArrowTypesRoutePlan)
     if _hasarrowtypesextension(f, plan)
-        routed = _arrowtypesroutedcolumn(f, d, plan)
+        # Ext-bearing columns WITH structure walk the routed builder: it
+        # keeps union branch provenance and splits labeled (raw, for
+        # restoration) from label-free (public) subtrees. A flat labeled
+        # leaf column stays on the typed storage path; restoration converts
+        # the whole column at once.
+        routed = _arrowtypesroutedcolumn(f, d, plan; force=(!isempty(f.children)))
         routed === nothing || return routed
+        return _storagebatchcolumn(f, d, plan.budget)
     end
-    return _storagebatchcolumn(f, d, plan.budget)
+    return _publicbatchcolumn(f, d, plan.budget)
 end
 
 function _batchcolumn(f::AC.Field, d::AC.ArrayData, arrowtypes::_ArrowTypesContext)
     if _hasarrowtypesextension(f, arrowtypes)
-        routed = _arrowtypesroutedcolumn(f, d, _arrowtypesrouteplan!(arrowtypes))
+        routed = _arrowtypesroutedcolumn(
+            f,
+            d,
+            _arrowtypesrouteplan!(arrowtypes);
+            force=(!isempty(f.children)),
+        )
         routed === nothing || return routed
+        return _storagebatchcolumn(f, d, arrowtypes.budget)
     end
-    return _storagebatchcolumn(f, d, arrowtypes.budget)
+    return _publicbatchcolumn(f, d, arrowtypes.budget)
 end
 
 function _batchcolumn(f::AC.Field, d::AC.ArrayData, budget=nothing)
-    _hasarrowtypesextension(f) || return _storagebatchcolumn(f, d, budget)
+    _hasarrowtypesextension(f) || return _publicbatchcolumn(f, d, budget)
     return _batchcolumn(f, d, _ArrowTypesRoutePlan(budget))
 end
 
@@ -928,7 +1153,7 @@ _facadefromraw(
     arrowtypes::_ArrowTypesContext=_ArrowTypesContext(),
 ) =
     _hasarrowtypesextension(f, arrowtypes) ? _arrowtypescolumn(f, col, arrowtypes) :
-    _publiccolumn(f, _postconvert(f.type, col, arrowtypes.budget), arrowtypes.budget)
+    _publiccolumn(f, _postconvertfield(f, col, arrowtypes.budget), arrowtypes.budget)
 
 "Wire owner regions that a facade result retains for source lifetime control."
 function _sourceregions(s::IPCStream, budget=nothing)
@@ -1348,9 +1573,11 @@ end
 # declared domain — not the accident — must drive subsumption, keeping the
 # empty decision identical to the nonempty one. Field-aware rules:
 #   * The declared domain must equal the ACTUAL pre-override container type.
-#     `_postconvert` dispatches on the ROOT descriptor only, so temporal
-#     leaves under a transparent wrapper stay RAW storage integers (the
-#     `converted` flag tracks that).
+#     With `converted=true` every convertible leaf declares its PUBLIC type
+#     at every depth — wrappers and union children propagate the flag — and
+#     the dynamic row builder (`_publicvalue`) delivers exactly that.
+#     `converted=false` is the STORAGE-claim domain the typed Core path
+#     materializes before the whole-column conversion.
 #   * Run-end encoding is transparent at the value layer: rows ARE the
 #     values child's rows, with no REE-level validity.
 #   * Dictionary rows are pool VALUES, and their composite children live on
@@ -1364,7 +1591,7 @@ end
 function _declaredeltype(f::AC.Field, converted::Bool=true)
     t = f.type
     if t isa AC.RunEndEncodedType && length(f.children) == 2
-        return _declaredeltype(f.children[2], false)
+        return _declaredeltype(f.children[2], converted)
     end
     if t isa AC.DictionaryType
         # The schema carries ONE nullability flag for a dictionary column;
@@ -1377,9 +1604,9 @@ function _declaredeltype(f::AC.Field, converted::Bool=true)
         return f.nullable ? Union{Missing,D0} : D0
     end
     if t isa AC.UnionType && !isempty(f.children)
-        D = _declaredeltype(f.children[1], false)
+        D = _declaredeltype(f.children[1], converted)
         for k = 2:length(f.children)
-            D = Base.promote_typejoin(D, _declaredeltype(f.children[k], false))
+            D = Base.promote_typejoin(D, _declaredeltype(f.children[k], converted))
         end
         return D
     end

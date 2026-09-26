@@ -1573,12 +1573,44 @@ end
         @test eltype(etbl.e) == Ts{Nanosecond}
         @test Dates.value(etbl.e[1]) == 7
 
-        # Instant values under a union wrapper stay raw integer storage, and
-        # empty columns declare the same eltype as populated ones.
+        # Empty columns declare the same eltype as populated ones.
         ebytes = take!(Arrow.tobuffer((n=Ts{Nanosecond}[], z=Denver[])))
         et2 = Arrow.Table(ebytes)
         @test eltype(et2.n) == Ts{Nanosecond} && isempty(et2.n)
         @test eltype(et2.z) == Denver && isempty(et2.z)
+    end
+
+    @testset "leaf conversion authorities agree" begin
+        # `_publicleafscalar` (dynamic rows) and `_postconvert` (whole
+        # columns) must convert identically for every convertible leaf.
+        AC2 = Arrow.AC
+        cases = Any[
+            (AC2.DateType(AC2.DAY), Int32[0, 19000]),
+            (AC2.DateType(AC2.MILLISECOND_DATE), Int64[0, 86_400_000]),
+            (AC2.TimeType(AC2.SECOND, 32), Int32[0, 86_399]),
+            (AC2.TimeType(AC2.NANOSECOND, 64), Int64[0, 1]),
+            (AC2.DurationType(AC2.MICROSECOND), Int64[-5, 7]),
+            (AC2.IntervalType(AC2.YEAR_MONTH), Int32[3, -2]),
+            (
+                AC2.IntervalType(AC2.MONTH_DAY_NANO),
+                [(months=Int32(1), days=Int32(2), nanos=Int64(3))],
+            ),
+            (AC2.DecimalType(10, 2, 64), Int64[12345, -7]),
+            (AC2.TimestampType(AC2.SECOND, nothing), Int64[0, 42]),
+            (AC2.TimestampType(AC2.NANOSECOND, nothing), Int64[typemin(Int64), 9]),
+            (AC2.TimestampType(AC2.MICROSECOND, "America/Denver"), Int64[0, -1]),
+            (AC2.TimestampType(AC2.MILLISECOND, "+07:00"), Int64[5]),
+        ]
+        for (t, xs) in cases
+            converted = Arrow._postconvert(t, collect(xs))
+            for (x, c) in zip(xs, converted)
+                s = Arrow._publicleafscalar(t, x)
+                @test s === c || isequal(s, c) && typeof(s) === typeof(c)
+            end
+            @test Arrow._isconvertibleleaf(t)
+        end
+        @test !Arrow._isconvertibleleaf(Arrow.AC.IntType(64, true))
+        @test !Arrow._isconvertibleleaf(Arrow.AC.Utf8Type(false))
     end
 
     @testset "overrides preserve missing and re-infer on rewrite" begin
@@ -2028,8 +2060,8 @@ end
             children=[Arrow.AC.Field("a", Arrow.AC.IntType(64, true); nullable=false)],
         )
         @test Arrow._declaredeltype(u1) === Int64
-        # The declared domain equals the ACTUAL container type: temporal
-        # leaves under a transparent wrapper stay raw storage, and a
+        # The declared domain equals the ACTUAL container type: convertible
+        # leaves declare their PUBLIC type at every depth, and a
         # multi-child union declares the mixed-population join.
         dtf = Arrow.AC.Field("values", Arrow.AC.DateType(Arrow.AC.DAY); nullable=true)
         rnf = Arrow.AC.Field("run_ends", Arrow.AC.IntType(32, true); nullable=false)
@@ -2039,7 +2071,8 @@ end
             nullable=false,
             children=[rnf, dtf],
         )
-        @test Arrow._declaredeltype(reef0) === Union{Missing,Int32}
+        @test Arrow._declaredeltype(reef0) === Union{Missing,Date}
+        @test Arrow._declaredeltype(reef0, false) === Union{Missing,Int32}
         huf = Arrow.AC.Field(
             "u",
             Arrow.AC.UnionType(Arrow.AC.SparseMode, Int8[0, 1]);
@@ -2050,8 +2083,9 @@ end
             ],
         )
         @test Arrow._declaredeltype(huf) === Any
-        # REE<Date32> end-to-end: raw Int32 rows, => Integer keeps the
-        # retained field for empty and nonempty columns alike.
+        # REE<Date32> end-to-end: public Date rows; a `=> Date` override is
+        # a subsuming no-op that keeps the retained field for empty and
+        # nonempty columns alike.
         for (n, runs, vals) in
             ((3, Int32[2, 3], Int32[19000, 19001]), (0, Int32[], Int32[]))
             vd = Arrow.AC.ArrayData(
@@ -2076,8 +2110,14 @@ end
                 rsch0,
                 [Arrow.AC.RecordBatch(rsch0, Arrow.AC.ArrayData[reed], n)],
             )
-            n > 0 && @test Arrow.Table(rb).r == Int32[19000, 19000, 19001]
-            tre = Arrow.Table(rb; scan=Tables.Scan(select=(:r => Integer,)))
+            if n > 0
+                got = Arrow.Table(rb).r
+                @test eltype(got) == Union{Missing,Date}
+                @test got == Date.(
+                    Dates.UTD.(Int64[19000, 19000, 19001] .+ Dates.value(Date(1970, 1, 1))),
+                )
+            end
+            tre = Arrow.Table(rb; scan=Tables.Scan(select=(:r => Date,)))
             rsch2 = getfield(tre, :schema)
             @test length(rsch2.fields) == 1
             @test rsch2.fields[1].type isa Arrow.AC.RunEndEncodedType
@@ -2229,10 +2269,13 @@ end
     @testset "errors are clean" begin
         @test_throws ArgumentError Arrow.write(IOBuffer(), Tables.partitioner(NamedTuple[]))
 
+        # Nested facade conversions recurse: SubString and Date fields of a
+        # NamedTuple write the same descriptors they write at the top level.
         TextRow = @NamedTuple{text::SubString{String}}
         text = SubString("nested", 1, 4)
         for values in (TextRow[(text=text,)], Union{Missing,TextRow}[(text=text,), missing])
-            @test_throws ArgumentError Arrow.write(IOBuffer(), (st=values,))
+            t = Arrow.Table(take!(Arrow.tobuffer((st=values,))))
+            @test only(skipmissing(t.st))[1].second == "nest"
         end
 
         DateRow = @NamedTuple{day::Date}
@@ -2240,7 +2283,8 @@ end
             DateRow[(day=Date(2024, 1, 1),)],
             Union{Missing,DateRow}[(day=Date(2024, 1, 1),), missing],
         )
-            @test_throws ArgumentError Arrow.write(IOBuffer(), (st=values,))
+            t = Arrow.Table(take!(Arrow.tobuffer((st=values,))))
+            @test only(skipmissing(t.st))[1].second == Date(2024, 1, 1)
         end
     end
 

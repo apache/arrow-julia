@@ -5249,15 +5249,22 @@ end
         table = Arrow.Table(bytes)
         plainrows = arrowtypes_test_rowdict.(table.plain)
         @test getindex.(plainrows, "id") == ArrowTypesTestID.(Int64[1, 2])
-        @test getindex.(plainrows, "day") == Int32[0, 1]
-        @test all(x -> x isa Int32, getindex.(plainrows, "day"))
+        # the unmarked temporal sibling converts to the public domain; the
+        # marked struct keeps the ArrowTypes contract for its fromarrow hook
+        @test getindex.(plainrows, "day") == [Date(1970, 1, 1), Date(1970, 1, 2)]
+        @test all(x -> x isa Date, getindex.(plainrows, "day"))
         @test table.marked == markedvalues
         @test eltype(table.marked) === ArrowTypesTestStampedID
     end
 
     rows = [(id=ArrowTypesTestID(1), day=Date(1970, 1, 1))]
     for file in (false, true)
-        @test_throws ArgumentError arrowtypes_test_bytes((row=rows,); file=file)
+        # a fresh NamedTuple with a registered child and a Date child writes
+        # and round-trips in the public domain
+        freshtable = Arrow.Table(arrowtypes_test_bytes((row=rows,); file=file))
+        freshrows = arrowtypes_test_rowdict.(freshtable.row)
+        @test getindex.(freshrows, "id") == [ArrowTypesTestID(1)]
+        @test getindex.(freshrows, "day") == [Date(1970, 1, 1)]
     end
 end
 

@@ -140,27 +140,33 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
                 "concrete NamedTuple type with declared field names and types",
             ),
         )
-        if fieldcount(T) == 0
-            t = AC.StructType()
-            return AC.Field(name, t; nullable=false, children=AC.Field[]),
-            AC.ArrayData(
-                t,
-                length(v),
-                [AC.BufferSlice()];
-                children=AC.ArrayData[],
-                nullcount=0,
-            )
-        end
-        # Preserve the declared child types. A value-narrowing comprehension
-        # turns an empty child into `Any[]` and an all-missing nullable child
-        # into `Missing[]`, so neither can recover its Arrow descriptor.
-        cols = NamedTuple{fieldnames(T)}(
-            ntuple(
-                i -> collect(fieldtype(T, i), (getfield(x, i) for x in v)),
-                fieldcount(T),
-            ),
+        # Children build like top-level columns, so public leaf values lower
+        # through the facade. Preserve the declared child types: a
+        # value-narrowing comprehension turns an empty child into `Any[]` and
+        # an all-missing nullable child into `Missing[]`, so neither can
+        # recover its Arrow descriptor.
+        context === nothing && (context = _WriterContext())
+        children = [
+            _constructpart(
+                String(fieldname(T, i)),
+                collect(fieldtype(T, i), (getfield(x, i) for x in v));
+                context,
+            ) for i = 1:fieldcount(T)
+        ]
+        t = AC.StructType()
+        return AC.Field(
+            name,
+            t;
+            nullable=false,
+            children=AC.Field[first(c) for c in children],
+        ),
+        AC.ArrayData(
+            t,
+            length(v),
+            [AC.BufferSlice()];
+            children=AC.ArrayData[last(c) for c in children],
+            nullcount=0,
         )
-        return AC.fromjulia_struct(name, cols)
     elseif T <: AbstractString && T != String
         return AC.fromjulia(name, _missings_to(String, v))
     elseif T === Any || (T <: AbstractVector && eltype(T) === Any)
@@ -176,6 +182,11 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
             ),
         )
         return _constructpart(name, w; context)
+    elseif T <: AbstractVector
+        # The facade list builder builds the child like a column, so public
+        # leaf values lower at every depth.
+        context === nothing && (context = _WriterContext())
+        return _arrowtypeslistcolumn(name, v, T; extension_shape=false, context)
     else
         return AC.fromjulia(name, _plainvector(v))
     end
@@ -931,7 +942,7 @@ function _arrowtypesunioncolumn(
     return field, data
 end
 
-"Construct one child while keeping unmarked nested facade conversions disabled."
+"Construct one child; a leaf builds like a column, so public leaf values lower."
 function _arrowtypeschildcolumn(
     name::String,
     v::AbstractVector;
@@ -953,8 +964,7 @@ function _arrowtypeschildcolumn(
     )
         return _constructarrowtypespart(name, v; extension_shape, context)
     end
-    return extension_shape ? _constructnativepart(name, v; context) :
-           AC.fromjulia(name, _plainvector(v))
+    return _constructnativepart(name, v; context)
 end
 
 function _arrowtypeslistcolumn(
@@ -1119,6 +1129,9 @@ mutable struct _WriterContext
     values::Base.IdSet{Any}
     collecting::Bool
     deferred::Bool
+    # True while values being rebuilt are already in the storage domain (see
+    # `_constructwriterstorage`); false for facade-materialized public rows.
+    lowered::Bool
     column::String
 end
 
@@ -1139,6 +1152,7 @@ function _WriterContext(column::AbstractString="")
         IdDict{AC.Field,Any}(),
         Type[],
         Base.IdSet{Any}(),
+        false,
         false,
         false,
         String(column),
@@ -2812,12 +2826,9 @@ function _arrowtypeswriterstoragevalue(
             storagewritetype,
         )
     end
-    if t isa AC.DateType ||
-       t isa AC.TimestampType ||
-       t isa AC.TimeType ||
-       t isa AC.DurationType
-        ok, storage = _facadetostorage(t, value)
-        ok && return storage
+    if _istemporalconv(t)
+        storage = _arrowtypestemporalstorage(t, value)
+        storage === nothing || return storage
         throw(
             ArgumentError(
                 "registered writer value $(repr(value)) for field $(f.name) cannot " *
@@ -2825,6 +2836,12 @@ function _arrowtypeswriterstoragevalue(
             ),
         )
     end
+    t isa AC.DecimalType &&
+        value isa DataDecimals.AbstractDecimal &&
+        return _shareddecimalraw(t, value)
+    t isa AC.IntervalType &&
+        value isa Durations.Duration &&
+        return _sharedintervalraw(t, value)
     if t isa Union{AC.ListType,AC.ListViewType,AC.FixedSizeListType}
         child = only(f.children)
         childtype = eltype(storagewritetype)
@@ -2884,6 +2901,18 @@ function _arrowtypeswriterstoragevalue(
         ]
     end
     return value
+end
+
+# Registered mappings exchange ArrowTypes-domain temporals (`_arrowtypesscalar`):
+# micro/nanosecond timestamps as raw Int64 and second/millisecond timestamps as
+# zone-free DateTime. Unmarked fresh composites bring public values to the same
+# seam, so both domains lower here; anything else has no exact storage.
+function _arrowtypestemporalstorage(t::AC.ArrowType, value)
+    ok, storage = _facadetostorage(t, value)
+    ok && return storage
+    t isa AC.TimestampType || return nothing
+    t.unit in (AC.MICROSECOND, AC.NANOSECOND) && value isa Int64 && return value
+    return value isa Dates.DateTime ? _timestampstorage(t.unit, value) : nothing
 end
 
 function _registeredvalueplan!(context::_WriterContext, f::AC.Field, value, writetype::Type)
@@ -3063,7 +3092,8 @@ function _maskedleafvalue(
     value,
 ) where {S}
     value === missing && return missing
-    return _writerconvertlowered(S, value, projection.context, S, projection.field.name)
+    stored = _retainedleafstorage(projection.field, value, projection.context)
+    return _writerconvertlowered(S, stored, projection.context, S, projection.field.name)
 end
 
 function _maskedleafvalue(
@@ -3355,8 +3385,14 @@ function _constructwriterstorage(
         return _rebuildtemporal(f, values)
     end
     storagefield = _writerstoragefield(f)
-    _, data = _constructpart(storagefield, storage; context)
-    return f, data
+    lowered = context.lowered
+    context.lowered = true
+    try
+        _, data = _constructpart(storagefield, storage; context)
+        return f, data
+    finally
+        context.lowered = lowered
+    end
 end
 
 "Remove logical labels while rebuilding values already in physical storage."
@@ -3947,6 +3983,32 @@ function _retainedtypedvalues(f::AC.Field, values; converted::Bool)
     return out
 end
 
+"""
+One visible leaf value in its retained Field's storage domain. Public values
+lower through the facade authority, or the column refuses as replaced data.
+Hidden-slot placeholders are storage values and never pass through here.
+"""
+function _retainedleafstorage(f::AC.Field, value, context::_WriterContext)
+    (context.lowered || value === missing) && return value
+    t = f.type
+    t isa AC.DecimalType &&
+        value isa DataDecimals.AbstractDecimal &&
+        return _shareddecimalraw(t, value)
+    t isa AC.IntervalType &&
+        value isa Durations.Duration &&
+        return _sharedintervalraw(t, value)
+    _istemporalconv(t) || return value
+    stored = _exactfacadescalar(t, value)
+    stored === nothing && throw(
+        ArgumentError(
+            "column $(f.name) holds $(typeof(value)) values that do not match " *
+            "its retained Arrow type $(repr(t)); the column was replaced with " *
+            "incompatible data",
+        ),
+    )
+    return stored
+end
+
 "A physical child value hidden by a null composite parent."
 function _retainedplaceholder(f::AC.Field; forcevalid::Bool=false)
     f.nullable && !forcevalid && return missing
@@ -4017,7 +4079,10 @@ _retainedcontainer(t::AC.ArrowType) =
         AC.RunEndEncodedType,
     }
 
-"Write values materialized inside a composite, where temporal values stay raw."
+"""
+Write values materialized inside a composite. Facade rows carry public leaf
+values; under `context.lowered` the values are already storage.
+"""
 function _retainedchildcolumn(f::AC.Field, values, context::_WriterContext)
     f.type isa AC.DictionaryType && throw(
         ArgumentError(
@@ -4063,20 +4128,17 @@ function _retainedchildcolumn(f::AC.Field, values, context::_WriterContext)
         storage = _writerstoragevector(f)
         sizehint!(storage, length(values))
         for value in values
-            push!(storage, value === _RETAINED_HIDDEN ? hidden : value)
+            push!(
+                storage,
+                value === _RETAINED_HIDDEN ? hidden :
+                _retainedleafstorage(f, value, context),
+            )
         end
         return _constructwriterstorage(f, storage, context)
     end
     _retainedcontainer(f.type) && return _constructpart(f, values; context)
-    v = _retainedtypedvalues(f, values; converted=false)
-    t = f.type
-    if t isa AC.DateType ||
-       t isa AC.TimestampType ||
-       t isa AC.TimeType ||
-       t isa AC.DurationType
-        storage = Union{Missing,Int64}[x === missing ? missing : Int64(x) for x in v]
-        return _rebuildtemporal(f, storage)
-    end
+    v = _retainedtypedvalues(f, values; converted=(!context.lowered))
+    context.lowered && return _constructwriterstorage(f, v, context)
     return _constructpart(f, v; context)
 end
 
@@ -4617,11 +4679,8 @@ function _constructretainedpart(
     v::AbstractVector,
     ::_WriterContext,
 )
-    Fp = _checkretainedidentity(f, t, v)
-    storage =
-        Fp === Int64 ? Union{Missing,Int64}[x === missing ? missing : Int64(x) for x in v] :
-        _retainedstorage(t, v, f.name)
-    return _rebuildtemporal(f, storage)
+    _checkretainedidentity(f, t, v)
+    return _rebuildtemporal(f, _retainedstorage(t, v, f.name))
 end
 
 function _constructretainedpart(

@@ -28,9 +28,7 @@ _rawdeclaredbasetype(t::AC.IntervalType) =
     t.unit == AC.DAY_TIME ? NamedTuple{(:days, :millis),Tuple{Int32,Int32}} :
     NamedTuple{(:months, :days, :nanos),Tuple{Int32,Int32,Int64}}
 
-function _decimalcoefficient(t::AC.DecimalType, x)
-    x isa Integer && return _decimalstorage(t)(x)
-    T = _decimalstorage(t)
+function _bytescoefficient(::Type{T}, x::AbstractVector{UInt8}) where {T}
     U = unsigned(T)
     u = zero(U)
     for b in Iterators.reverse(x)
@@ -39,21 +37,36 @@ function _decimalcoefficient(t::AC.DecimalType, x)
     return reinterpret(T, u)
 end
 
+"""
+One shared-decimal scalar conversion, specialized on the host and storage
+types: the coefficient loop, the bound power, and the range check must all
+run unboxed, or a wide (128/256-bit) coefficient boxes on every operation.
+"""
+function _shareddecimalscalar(::Type{D}, ::Type{T}, precision::Int, x)::D where {D,T}
+    u =
+        x isa Integer ? T(x) :
+        x isa AbstractVector{UInt8} ? _bytescoefficient(T, x) :
+        throw(ArgumentError("unsupported decimal storage value"))
+    bound = T(10)^precision
+    -bound < u < bound ||
+        throw(ArgumentError("decimal coefficient exceeds declared precision"))
+    return reinterpret(D, u)
+end
+
 function _postconvert(t::AC.DecimalType, col, budget=nothing)
     _shareddecimal(t) || return col
     D = _decimalhost(t)
-    return _mapcol(
-        D,
-        x -> begin
-            u = _decimalcoefficient(t, x)
-            bound = _decimalstorage(t)(10)^t.precision
-            -bound < u < bound ||
-                throw(ArgumentError("decimal coefficient exceeds declared precision"))
-            reinterpret(D, u)
-        end,
-        col,
+    T = _decimalstorage(t)
+    precision = Int(t.precision)
+    # The per-element call into the specialized converter is dynamic, so
+    # each element leaves a few transient boxes behind even over a
+    # concretely typed storage column.
+    budget === nothing || _charge!(
         budget,
+        AC.checked_mul(Int64(length(col)), Int64(64)),
+        "facade decimal conversion temporaries",
     )
+    return _mapcol(D, x -> _shareddecimalscalar(D, T, precision, x), col, budget)
 end
 
 function _postconvert(t::AC.IntervalType, col, budget=nothing)
@@ -78,7 +91,7 @@ function _shareddecimalraw(t::AC.DecimalType, x::DataDecimals.AbstractDecimal)
         throw(ArgumentError("decimal coefficient exceeds declared precision"))
     t.bits == 32 && return Int32(u)
     t.bits == 64 && return Int64(u)
-    return UInt8[(u >> (8*i)) & 0xff for i = 0:(t.bits ÷ 8 - 1)]
+    return UInt8[(u >> (8 * i)) & 0xff for i = 0:(t.bits ÷ 8 - 1)]
 end
 
 function _sharedintervalraw(t::AC.IntervalType, x::Durations.Duration)

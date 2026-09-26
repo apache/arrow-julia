@@ -202,9 +202,9 @@ maps to `Union{Missing, T}`.
 | Timestamp with a declared timezone | `Durations.ZonedTimestamp{P,Z}` at every unit (the stored UTC instant; `Z` is the declared zone — see below) |
 | Time32/Time64 | `Dates.Time` |
 | Duration | `Dates.Second`/`Millisecond`/`Microsecond`/`Nanosecond` by unit |
-| Decimal32/64 | `Int32`/`Int64` (unscaled integer storage) |
-| Decimal128/256 | `Vector{UInt8}` (raw native-endian storage) |
-| Interval | `Int32` (year-month) or a `NamedTuple` (day-time, month-day-nano) |
+| Decimal (nonnegative scale) | `DataDecimals.Decimal{P,S,T}` with `T` matching the descriptor width |
+| Decimal (negative scale) | raw storage: `Int32`/`Int64` (32/64-bit) or `Vector{UInt8}` (128/256-bit) |
+| Interval | `Durations.Duration` (month/day/nanosecond components) |
 | Dictionary-encoded scalar | the mapping of the *value* type (indices are resolved) |
 
 Composite layouts (list, struct, map, union) are read on the dynamic path
@@ -228,18 +228,18 @@ path):
 
 Three refinements. A list-family field with a registered ArrowTypes.jl child
 uses a row vector with that restored child element type; this is the same for
-a zero-row and a populated column. The `Dates` conversions above apply at the top level and
-through dictionary encoding; a temporal type nested under a run-end-encoded
-or union wrapper stays in its raw integer storage. And field nullability is
+a zero-row and a populated column. The public value domain is uniform at
+every depth: the temporal, decimal, and interval conversions above apply to
+a leaf whether it is a top-level column, a dictionary pool, a run-end-encoded
+values child, a union branch, or a field inside a struct, list, or map row.
+And field nullability is
 *advisory* in Arrow (the reference implementation and the conformance
 corpus accept a null under a `nullable=false` field), so a column that
 holds a null its field did not declare reads as `Union{Missing, T}` rather
 than failing; a conforming column keeps its declared, `Missing`-free type.
-Timestamps never truncate or wrap into `DateTime`: at the top level they
-materialize as `Durations.Timestamp` and `Durations.ZonedTimestamp` (both
-compare equal to `DateTime` values at the same instant), and under a
-run-end-encoded or union wrapper they stay raw integer storage like every
-nested temporal.
+Timestamps never truncate or wrap into `DateTime`: they materialize as
+`Durations.Timestamp` and `Durations.ZonedTimestamp` (both compare equal to
+`DateTime` values at the same instant) at every depth.
 
 ### Scan pushdown
 
@@ -474,7 +474,7 @@ keeps a concrete subtype's extension metadata. Multiple observed subtypes form
 an explicit Union under the same 8-type inference limit. An empty abstract
 column still needs declared schema evidence because it has no runtime subtype.
 
-At the *top level* of a column the facade adds:
+At every depth of a column the facade adds:
 
 | Julia element type | Arrow type |
 |---|---|
@@ -489,9 +489,11 @@ At the *top level* of a column the facade adds:
 | `Arrow.DictEncode` over a writable column | Dictionary of the recursive mapping of its values |
 | `DataStrings.StringVector` | Utf8View, borrowed in memory and compacted for IPC output (see below) |
 
-These native facade conversions do not recurse through list or struct shapes:
-a `Vector{Date}` inside a list, or a `Date` or `SubString` field of a
-`NamedTuple`, is refused with an `ArgumentError` naming the element type. A
+These native facade conversions recurse through list and struct shapes: a
+`Vector{Date}` inside a list, or a `SubString` or `Timestamp{Nanosecond}`
+field of a `NamedTuple`, writes the same descriptor it writes at the top
+level; an element type with no writable mapping is refused with an
+`ArgumentError` naming it. A
 top-level `DictEncode` pool uses the same native column mapping as an ordinary
 top-level column. The ArrowTypes.jl mappings described below do recurse. A
 column with element type `Any` is narrowed once (recovering list columns of a
@@ -782,8 +784,8 @@ write features. Read [Migrating from Arrow.jl 2.x](@ref) before you update.
 
 ### Shared decimal, interval, and timestamp values
 
-Arrow uses DataDecimals 1 and Durations 1.4 from General. Top-level decimal columns
-with nonnegative scale decode to `DataDecimals.Decimal{P,S,T}`. The integer width
+Arrow uses DataDecimals 1 and Durations 1.4 from General. Decimal columns
+with nonnegative scale decode to `DataDecimals.Decimal{P,S,T}` at every depth. The integer width
 matches the Arrow descriptor. Negative-scale decimals keep the raw representation.
 Calendar interval columns decode to `Durations.Duration`; elapsed-time duration
 columns still use `Dates.Second`, `Dates.Millisecond`, `Dates.Microsecond`, or

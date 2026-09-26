@@ -69,8 +69,16 @@ writer, validation, scan, and C interface engines.
 - Arrow 3.0 requires ArrowTypes.jl 2.x, Tables.jl 1.14 (the first release
   with `Tables.Scan`), DataStrings.jl 1.0, DataDecimals.jl 1.0, and
   Durations.jl 1.4 (`Timestamp` and `ZonedTimestamp`).
-- Supported top-level decimals and calendar intervals use shared DataDecimals
-  and Durations values. Negative-scale decimals retain raw coefficients.
+- Supported decimals and calendar intervals use shared DataDecimals and
+  Durations values at every depth. Negative-scale decimals retain raw
+  coefficients.
+- The public value domain is uniform at every depth: temporal, decimal, and
+  interval leaves materialize as the same public values inside struct, list,
+  map, and union rows and under run-end-encoded wrappers as they do at the
+  top level; the writer accepts those public values back at every depth,
+  fresh and retained. The reader allocation budget covers the dynamic
+  conversion work, so `Limits.max_total_allocated_bytes` bounds these reads
+  like every other.
 
 ### Added
 

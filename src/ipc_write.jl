@@ -414,7 +414,7 @@ function _encodeviewbuffers!(c::EncodeCursor, d::ArrayData)
     # Such columns need neither row sorting nor per-entry data copies.
     coverage = zeros(Int64, length(d.buffers) - 2)
     compact = true
-    for i = 1:d.len
+    for i = 1:(d.len)
         (AC.isempty_buffer(inputvalidity) || AC.getbit(inputvalidity, i - 1)) || continue
         isempty(validity) || (validity[(i - 1) ÷ 8 + 1] |= UInt8(1) << ((i - 1) % 8))
         base = 16 * (i - 1)
@@ -445,7 +445,7 @@ function _encodeviewbuffers!(c::EncodeCursor, d::ArrayData)
         end
         return nothing
     end
-    refs = Int64[i for i = 1:d.len if words[4 * i - 3] > AC.VIEW_INLINE_MAX]
+    refs = Int64[i for i = 1:(d.len) if words[4 * i - 3] > AC.VIEW_INLINE_MAX]
     # Sort by source position so duplicate and overlapping views share the
     # same output bytes. Already ordered producer columns need no sort.
     sourcepos(i) = (words[4 * i - 1], words[4 * i])
@@ -940,7 +940,7 @@ function _fileblock!(emit!::F, st::IPCWriteState, out::Vector{UInt8}, blocks) wh
     return nothing
 end
 
-"Order-sensitive pool content equality, in each pool's public value domain."
+"Order-sensitive pool content equality, in each pool's STORAGE value domain."
 function _poolsequal(vf::Field, a::ArrayData, b::ArrayData)
     a.len == b.len || return false
     return isequal(AC.materialize(vf, a), AC.materialize(vf, b))
