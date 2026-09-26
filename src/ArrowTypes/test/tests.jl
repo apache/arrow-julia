@@ -22,6 +22,21 @@ struct Person
     name::String
 end
 
+# Keep these fixtures at top level. Julia 1.0 does not permit type definitions
+# inside the local scope introduced by `@testset`.
+struct DateTimeTZ
+    instant::Int64
+    tz::String
+end
+
+struct Timestamp{TZ}
+    x::Int64
+end
+
+ArrowTypes.ArrowType(::Type{DateTimeTZ}) = Timestamp
+ArrowTypes.toarrow(x::DateTimeTZ) = Timestamp{Symbol(x.tz)}(x.instant)
+ArrowTypes.default(::Type{DateTimeTZ}) = DateTimeTZ(0, "UTC")
+
 @testset "ArrowTypes" begin
     @test ArrowTypes.ArrowKind(MyInt) == ArrowTypes.PrimitiveKind()
     @test ArrowTypes.ArrowKind(Person) == ArrowTypes.StructKind()
@@ -203,19 +218,6 @@ end
         @test x == [1, 3.14]
 
         @testset "respect non-missing concrete type" begin
-            struct DateTimeTZ
-                instant::Int64
-                tz::String
-            end
-
-            struct Timestamp{TZ}
-                x::Int64
-            end
-
-            ArrowTypes.ArrowType(::Type{DateTimeTZ}) = Timestamp
-            ArrowTypes.toarrow(x::DateTimeTZ) = Timestamp{Symbol(x.tz)}(x.instant)
-            ArrowTypes.default(::Type{DateTimeTZ}) = DateTimeTZ(0, "UTC")
-
             T = Union{DateTimeTZ,Missing}
             @test !ArrowTypes.concrete_or_concreteunion(ArrowTypes.ArrowType(T))
             @test eltype(ArrowTypes.ToArrow(T[missing])) == Union{Timestamp{:UTC},Missing}

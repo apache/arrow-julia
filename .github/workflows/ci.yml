@@ -61,7 +61,9 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          RELEASE_DEFAULT=0 dev/release/release_rc.sh 100
+          RELEASE_DEFAULT=0 dev/release/release_rc.sh 100 > release-rc-output.txt
+          cat release-rc-output.txt
+          grep -F "The vote will be open for at least 72 hours." release-rc-output.txt
       - uses: actions/cache@v6
         with:
           path: ~/.julia/artifacts
@@ -75,20 +77,15 @@ jobs:
                           -e 's/"$//g')
           VERIFY_DEFAULT=0 dev/release/verify_rc.sh ${version} 100
   test:
-    name: ${{ matrix.pkg.name }} - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
+    name: Arrow.jl - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        pkg:
-          - name: Arrow.jl
-            dir: '.'
-          - name: ArrowTypes.jl
-            dir: './src/ArrowTypes'
         version:
           - 'min'
-          - 'lts'
+          - '1.11'
           - '1' # automatically expands to the latest stable 1.x release of Julia
           - 'pre' # expands to latest alpha, beta or RC, if available, otherwise same as `1`
         os:
@@ -102,6 +99,52 @@ jobs:
       - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.version }}
+          project: '.'
+      - uses: actions/cache@v6
+        env:
+          cache-name: cache-artifacts
+        with:
+          path: ~/.julia/artifacts
+          key: ${{ runner.os }}-test-${{ env.cache-name }}-${{ hashFiles('**/Project.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-test-${{ env.cache-name }}-
+            ${{ runner.os }}-test-
+            ${{ runner.os }}-
+      # Julia 1.10 needs the local ArrowTypes source developed explicitly.
+      - name: Dev local subpackages
+        shell: julia --project=. {0}
+        run: |
+          using Pkg
+          Pkg.develop([PackageSpec(path="src/ArrowTypes")])
+      - uses: julia-actions/julia-buildpkg@v1.6
+      - uses: julia-actions/julia-runtest@v1
+        env:
+          JULIA_NUM_THREADS: ${{ matrix.nthreads }}
+      - uses: julia-actions/julia-processcoverage@v1
+        with:
+          directories: src,ext
+      - uses: codecov/codecov-action@v7
+        with:
+          files: lcov.info
+  # The subpackages' own suites: one job each, on the package's minimum
+  # supported Julia. The full Arrow.jl matrix above exercises both packages'
+  # code on every version, OS, and thread count.
+  test-subpackages:
+    name: ${{ matrix.pkg.name }} - Julia min - ${{ github.event_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg:
+          - name: ArrowTypes.jl
+            dir: './src/ArrowTypes'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: 'min'
+          project: ${{ matrix.pkg.dir }}
       - uses: actions/cache@v6
         env:
           cache-name: cache-artifacts
@@ -115,18 +158,12 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1.6
         with:
           project: ${{ matrix.pkg.dir }}
-      - name: Dev local ArrowTypes for Arrow.jl tests
-        if: matrix.pkg.name == 'Arrow.jl'
-        shell: julia --project=. {0}
-        run: |
-          using Pkg
-          Pkg.develop(PackageSpec(path="src/ArrowTypes"))
       - uses: julia-actions/julia-runtest@v1
-        env:
-          JULIA_NUM_THREADS: ${{ matrix.nthreads }}
         with:
           project: ${{ matrix.pkg.dir }}
       - uses: julia-actions/julia-processcoverage@v1
+        with:
+          directories: ${{ matrix.pkg.dir }}/src
       - uses: codecov/codecov-action@v7
         with:
           files: lcov.info
@@ -168,14 +205,98 @@ jobs:
         continue-on-error: false
         run: >
           julia --color=yes --project=monorepo -e 'using Pkg; Pkg.test("Arrow")'
+  test_min_arrowtypes:
+    name: Arrow.jl - ArrowTypes 2.0 compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.10'
+          project: '.'
+      - uses: actions/cache@v6
+        with:
+          path: ~/.julia/artifacts
+          key: min-arrowtypes-${{ runner.os }}-${{ hashFiles('Project.toml') }}
+          restore-keys: min-arrowtypes-${{ runner.os }}-
+      - name: Resolve the minimum supported ArrowTypes version
+        shell: julia --project=. {0}
+        run: |
+          using Pkg
+          Pkg.add(PackageSpec(name="ArrowTypes", version=v"2.0.0"))
+          Pkg.pin(PackageSpec(name="ArrowTypes"))
+      - name: Test custom-type file and stream round trips
+        run: julia --startup-file=no --history-file=no --project=. test/min_arrowtypes_compat.jl
+  test_windows:
+    name: ${{ matrix.pkg.name }} - Julia latest - Windows - 2 threads
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg:
+          - name: Arrow.jl
+            dir: '.'
+          - name: ArrowTypes.jl
+            dir: './src/ArrowTypes'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+          project: ${{ matrix.pkg.dir }}
+      - uses: actions/cache@v6
+        with:
+          path: ~/.julia/artifacts
+          key: windows-test-${{ hashFiles('**/Project.toml') }}
+          restore-keys: windows-test-
+      - name: Prepare Arrow.jl development dependencies
+        if: matrix.pkg.name == 'Arrow.jl'
+        shell: julia --project=. {0}
+        run: |
+          using Pkg
+          Pkg.develop([PackageSpec(path="src/ArrowTypes")])
+      - uses: julia-actions/julia-buildpkg@v1.6
+        with:
+          project: ${{ matrix.pkg.dir }}
+      - uses: julia-actions/julia-runtest@v1
+        env:
+          JULIA_NUM_THREADS: 2
+        with:
+          project: ${{ matrix.pkg.dir }}
+  trim:
+    name: ArrowCore and DataStrings JuliaC trim-safe compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12.6'
+      - uses: actions/cache@v6
+        with:
+          path: ~/.julia/artifacts
+          key: trim-${{ runner.os }}-${{ hashFiles('test/trim/Project.toml') }}
+          restore-keys: trim-${{ runner.os }}-
+      - name: Compile and run the trim-safe ArrowCore and DataStrings workload
+        run: julia --startup-file=no --history-file=no test/trim_compile_tests.jl
   docs:
     name: Documentation
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - uses: julia-actions/julia-buildpkg@latest
-      - uses: julia-actions/julia-docdeploy@latest
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+      - name: Prepare Arrow.jl development dependencies for the docs
+        shell: julia --project=docs {0}
+        run: |
+          using Pkg
+          Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowTypes")])
+      - uses: julia-actions/julia-buildpkg@v1.7.0
+      - uses: julia-actions/julia-docdeploy@v1.3.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
@@ -186,11 +307,9 @@ jobs:
       - uses: julia-actions/setup-julia@v3
       - uses: actions/checkout@v7
       - name: Install JuliaFormatter and format
-        # This will use the latest version by default but you can set the version like so:
-        # julia  -e 'using Pkg; Pkg.add(PackageSpec(name="JuliaFormatter", version="0.13.0"))'
         run: |
-          julia  -e 'using Pkg; Pkg.add(PackageSpec(name="JuliaFormatter"))'
-          julia  -e 'using JuliaFormatter; format(".", verbose=true)'
+          julia -e 'using Pkg; Pkg.add(PackageSpec(name="JuliaFormatter", version="2.12.4"))'
+          julia -e 'using JuliaFormatter; format(".", verbose=true)'
       - name: Format check
         run: |
           julia -e '

@@ -14,799 +14,581 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-const DEFAULT_MAX_DEPTH = 6
+# =============================================================================
+# The write facade: Tables.jl source -> Arrow IPC bytes.
+#
+# This file owns partition binding, retained-field alignment, schema and batch
+# assembly, compression selection, and IPC emission. Column construction is a
+# deep module behind `_constructcolumn`.
+# =============================================================================
 
 """
-    Arrow.write(io::IO, tbl)
-    Arrow.write(file::String, tbl)
-    tbl |> Arrow.write(io_or_file)
+    Arrow.DictEncode(v)
 
-Write any [Tables.jl](https://github.com/JuliaData/Tables.jl)-compatible `tbl` out as arrow formatted data.
-Providing an `io::IO` argument will cause the data to be written to it
-in the ["streaming" format](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format), unless `file=true` keyword argument is passed.
-Providing a `file::String` argument will result in the ["file" format](https://arrow.apache.org/docs/format/Columnar.html#ipc-file-format) being written.
-
-Multiple record batches will be written based on the number of
-`Tables.partitions(tbl)` that are provided; by default, this is just
-one for a given table, but some table sources support automatic
-partitioning. Note you can turn multiple table objects into partitions
-by doing `Tables.partitioner([tbl1, tbl2, ...])`, but note that
-each table must have the exact same `Tables.Schema`.
-
-By default, `Arrow.write` will use multiple threads to write multiple
-record batches simultaneously (e.g. if julia is started with `julia -t 8` or the `JULIA_NUM_THREADS` environment variable is set).
-
-Supported keyword arguments to `Arrow.write` include:
-  * `colmetadata=nothing`: the metadata that should be written as the table's columns' `custom_metadata` fields; must either be `nothing` or an `AbstractDict` of `column_name::Symbol => column_metadata` where `column_metadata` is an iterable of `<:AbstractString` pairs.
-  * `compress`: possible values include `:lz4`, `:zstd`, or your own initialized `LZ4FrameCompressor` or `ZstdCompressor` objects; will cause all buffers in each record batch to use the respective compression encoding
-  * `alignment::Int=8`: specify the number of bytes to align buffers to when written in messages; strongly recommended to only use alignment values of 8 or 64 for modern memory cache line optimization
-  * `dictencode::Bool=false`: whether all columns should use dictionary encoding when being written; to dict encode specific columns, wrap the column/array in `Arrow.DictEncode(col)`
-  * `dictencodenested::Bool=false`: whether nested data type columns should also dict encode nested arrays/buffers; other language implementations [may not support this](https://arrow.apache.org/docs/status.html)
-  * `denseunions::Bool=true`: whether Julia `Vector{<:Union}` arrays should be written using the dense union layout; passing `false` will result in the sparse union layout
-  * `largelists::Bool=false`: causes list column types to be written with Int64 offset arrays; mainly for testing purposes; by default, Int64 offsets will be used only if needed
-  * `maxdepth::Int=$DEFAULT_MAX_DEPTH`: deepest allowed nested serialization level; this is provided by default to prevent accidental infinite recursion with mutually recursive data structures
-  * `metadata=Arrow.getmetadata(tbl)`: the metadata that should be written as the table's schema's `custom_metadata` field; must either be `nothing` or an iterable of `<:AbstractString` pairs.
-  * `ntasks::Int`: number of buffered threaded tasks to allow while writing input partitions out as arrow record batches; default is no limit; for unbuffered writing, pass `ntasks=0`
-  * `file::Bool=false`: if a an `io` argument is being written to, passing `file=true` will cause the arrow file format to be written instead of just IPC streaming
+Mark a column for dictionary encoding: the writer builds a category pool and
+encodes slots as integer indices into it. Fresh pools coalesce exact Arrow
+storage values. A retained rewrite may preserve unused or duplicate physical
+categories because pool order and index meaning are part of the encoded data.
 """
-function write end
-
-write(io_or_file; kw...) = x -> write(io_or_file, x; kw...)
-
-function write(file_path, tbl; kwargs...)
-    open(Writer, file_path; file=true, kwargs...) do writer
-        write(writer, tbl)
-    end
-    file_path
+struct DictEncode{T,V<:AbstractVector{T}} <: AbstractVector{T}
+    data::V
 end
+Base.size(d::DictEncode) = size(d.data)
+Base.getindex(d::DictEncode, i::Int) = d.data[i]
 
-struct Message
-    msgflatbuf::Any
-    columns::Any
-    bodylen::Any
-    isrecordbatch::Bool
-    blockmsg::Bool
-    headerType::Any
-end
-
-struct Block
-    offset::Int64
-    metaDataLength::Int32
-    bodyLength::Int64
-end
+include("columnconstruction.jl")
 
 """
-    Arrow.Writer{T<:IO}
+    Arrow.write(sink, table; file=true, compress=nothing,
+                metadata=nothing, colmetadata=nothing)
+    Arrow.write(sink; kwargs...)
 
-An object that can be used to incrementally write Arrow partitions
+Write any Tables.jl source as Arrow IPC. `sink` is a file path or an `IO`.
+`file=true` emits the random-access file format (`ARROW1` magic + footer);
+`file=false` the stream format. Each `Tables.partitions` partition becomes
+one record batch. `compress` is `nothing`, `:lz4`, or `:zstd`.
+`metadata`/`colmetadata` attach schema- and per-column key-value pairs
+(a `Dict`, or pairs; `colmetadata` maps column name `Symbol`s to them).
+Schema metadata is inherited from an `Arrow.Table` or `Arrow.Stream` when
+`metadata` is `nothing`. Inherited batch statistics are dropped because the
+values, columns, or batch boundaries may have changed. Explicit `metadata`
+is used as supplied.
 
-# Examples
-```julia
-julia> writer = open(Arrow.Writer, tempname())
+Returns `sink`: the path for the path method, the `io` for the `IO` method.
+The one-argument form curries for pipelines: `table |> Arrow.write(sink)`.
 
-julia> partition1 = (col1 = [1, 2], col2 = ["A", "B"])
-(col1 = [1, 2], col2 = ["A", "B"])
+The writer is eager and whole-buffer: batches are encoded and validated in
+memory, then written to the sink once.
 
-julia> Arrow.write(writer, partition1)
-
-julia> partition2 = (col1 = [3, 4], col2 = ["C", "D"])
-(col1 = [3, 4], col2 = ["C", "D"])
-
-julia> Arrow.write(writer, partition2)
-
-julia> close(writer)
-```
-
-It's also possible to automatically close the Writer using a do-block:
-
-```julia
-julia> open(Arrow.Writer, tempname()) do writer
-           partition1 = (col1 = [1, 2], col2 = ["A", "B"])
-           Arrow.write(writer, partition1)
-           partition2 = (col1 = [3, 4], col2 = ["C", "D"])
-           Arrow.write(writer, partition2)
-       end
-```
+Keywords the Arrow 2.x incremental writer accepted (`alignment`,
+`dictencode`, `dictencodenested`, `denseunions`, `largelists`, `maxdepth`,
+`ntasks`) are accepted with a one-time warning and ignored; wrap columns in
+[`Arrow.DictEncode`](@ref) to dictionary-encode. See `docs/src/migration.md`.
 """
-mutable struct Writer{T<:IO}
-    io::T
-    closeio::Bool
-    compress::Union{Nothing,Symbol,LZ4FrameCompressor,ZstdCompressor}
-    writetofile::Bool
-    largelists::Bool
-    denseunions::Bool
-    dictencode::Bool
-    dictencodenested::Bool
-    threaded::Bool
-    alignment::Int32
-    maxdepth::Int64
-    meta::Union{Nothing,Base.ImmutableDict{String,String}}
-    colmeta::Union{Nothing,Base.ImmutableDict{Symbol,Base.ImmutableDict{String,String}}}
-    sync::OrderedSynchronizer
-    msgs::Channel{Message}
-    schema::Ref{Tables.Schema}
-    firstcols::Ref{Any}
-    dictencodings::Dict{Int64,Any}
-    blocks::NTuple{2,Vector{Block}}
-    task::Task
-    anyerror::Threads.Atomic{Bool}
-    errorref::Ref{Any}
-    partition_count::Int32
-    isclosed::Bool
-end
-
-function Base.open(
-    ::Type{Writer},
-    io::T,
-    compress::Union{Nothing,Symbol,LZ4FrameCompressor,ZstdCompressor},
-    writetofile::Bool,
-    largelists::Bool,
-    denseunions::Bool,
-    dictencode::Bool,
-    dictencodenested::Bool,
-    alignment::Integer,
-    maxdepth::Integer,
-    ntasks::Integer,
-    meta::Union{Nothing,Any},
-    colmeta::Union{Nothing,Any},
-    closeio::Bool,
-) where {T<:IO}
-    if compress isa Symbol && compress !== :lz4 && compress !== :zstd
-        throw(
-            ArgumentError(
-                "unsupported compress keyword argument value: $compress. Valid values include `:lz4` or `:zstd`",
-            ),
-        )
+function write(path::AbstractString, tbl; kwargs...)
+    bytes = _writebytes(tbl; kwargs...)
+    open(path, "w") do io
+        Base.write(io, bytes)
     end
-    sync = OrderedSynchronizer(2)
-    msgs = Channel{Message}(ntasks)
-    schema = Ref{Tables.Schema}()
-    firstcols = Ref{Any}()
-    dictencodings = Dict{Int64,Any}() # Lockable{DictEncoding}
-    blocks = (Block[], Block[])
-    # start message writing from channel
-    threaded = Threads.nthreads() > 1
-    task =
-        threaded ? (@wkspawn for msg in msgs
-            Base.write(io, msg, blocks, schema, alignment)
-        end) : (@async for msg in msgs
-            Base.write(io, msg, blocks, schema, alignment)
-        end)
-    anyerror = Threads.Atomic{Bool}(false)
-    errorref = Ref{Any}()
-    meta = _normalizemeta(meta)
-    colmeta = _normalizecolmeta(colmeta)
-    return Writer{T}(
-        io,
-        closeio,
-        compress,
-        writetofile,
-        largelists,
-        denseunions,
-        dictencode,
-        dictencodenested,
-        threaded,
-        alignment,
-        maxdepth,
-        meta,
-        colmeta,
-        sync,
-        msgs,
-        schema,
-        firstcols,
-        dictencodings,
-        blocks,
-        task,
-        anyerror,
-        errorref,
-        1,
-        false,
-    )
-end
-
-function Base.open(
-    ::Type{Writer},
-    io::IO;
-    compress::Union{Nothing,Symbol,LZ4FrameCompressor,ZstdCompressor}=nothing,
-    file::Bool=true,
-    largelists::Bool=false,
-    denseunions::Bool=true,
-    dictencode::Bool=false,
-    dictencodenested::Bool=false,
-    alignment::Integer=8,
-    maxdepth::Integer=DEFAULT_MAX_DEPTH,
-    ntasks::Integer=typemax(Int32),
-    metadata::Union{Nothing,Any}=nothing,
-    colmetadata::Union{Nothing,Any}=nothing,
-    closeio::Bool=false,
-)
-    open(
-        Writer,
-        io,
-        compress,
-        file,
-        largelists,
-        denseunions,
-        dictencode,
-        dictencodenested,
-        alignment,
-        maxdepth,
-        ntasks,
-        metadata,
-        colmetadata,
-        closeio,
-    )
-end
-
-Base.open(::Type{Writer}, file_path; kwargs...) =
-    open(Writer, open(file_path, "w"); kwargs..., closeio=true)
-
-function check_errors(writer::Writer)
-    if writer.anyerror[]
-        errorref = writer.errorref[]
-        @error "error writing arrow data on partition = $(errorref[3])" exception =
-            (errorref[1], errorref[2])
-        error("fatal error writing arrow data")
-    end
-end
-
-function write(writer::Writer, source)
-    @sync for tbl in Tables.partitions(source)
-        check_errors(writer)
-        @debug "processing table partition $(writer.partition_count)"
-        tblcols = Tables.columns(tbl)
-        if !isassigned(writer.firstcols)
-            if writer.writetofile
-                @debug "starting write of arrow formatted file"
-                Base.write(writer.io, FILE_FORMAT_MAGIC_BYTES, b"\0\0")
-            end
-            meta = isnothing(writer.meta) ? getmetadata(source) : writer.meta
-            cols = toarrowtable(
-                tblcols,
-                writer.dictencodings,
-                writer.largelists,
-                writer.compress,
-                writer.denseunions,
-                writer.dictencode,
-                writer.dictencodenested,
-                writer.maxdepth,
-                meta,
-                writer.colmeta,
-            )
-            writer.schema[] = Tables.schema(cols)
-            writer.firstcols[] = cols
-            put!(writer.msgs, makeschemamsg(writer.schema[], cols))
-            if !isempty(writer.dictencodings)
-                des = sort!(collect(writer.dictencodings); by=x -> x.first, rev=true)
-                for (id, delock) in des
-                    # assign dict encoding ids
-                    de = delock.value
-                    dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                    dictbatchmsg = makedictionarybatchmsg(
-                        dictsch,
-                        (col=de.data,),
-                        id,
-                        false,
-                        writer.alignment,
-                    )
-                    put!(writer.msgs, dictbatchmsg)
-                end
-            end
-            recbatchmsg = makerecordbatchmsg(writer.schema[], cols, writer.alignment)
-            put!(writer.msgs, recbatchmsg)
-        else
-            # XXX There is a race condition in the processing of dict encodings
-            # so we disable multithreaded writing until that can be addressed. See #582
-            # if writer.threaded
-            #     @wkspawn process_partition(
-            #         tblcols,
-            #         writer.dictencodings,
-            #         writer.largelists,
-            #         writer.compress,
-            #         writer.denseunions,
-            #         writer.dictencode,
-            #         writer.dictencodenested,
-            #         writer.maxdepth,
-            #         writer.sync,
-            #         writer.msgs,
-            #         writer.alignment,
-            #         $(writer.partition_count),
-            #         writer.schema,
-            #         writer.errorref,
-            #         writer.anyerror,
-            #         writer.meta,
-            #         writer.colmeta,
-            #     )
-            # else
-            @async process_partition(
-                tblcols,
-                writer.dictencodings,
-                writer.largelists,
-                writer.compress,
-                writer.denseunions,
-                writer.dictencode,
-                writer.dictencodenested,
-                writer.maxdepth,
-                writer.sync,
-                writer.msgs,
-                writer.alignment,
-                $(writer.partition_count),
-                writer.schema,
-                writer.errorref,
-                writer.anyerror,
-                writer.meta,
-                writer.colmeta,
-            )
-            # end
-        end
-        writer.partition_count += 1
-    end
-    check_errors(writer)
-    return
-end
-
-function Base.close(writer::Writer)
-    writer.isclosed && return
-    # close our message-writing channel, no further put!-ing is allowed
-    close(writer.msgs)
-    # now wait for our message-writing task to finish writing
-    !istaskfailed(writer.task) && wait(writer.task)
-    if (!isassigned(writer.schema) || !isassigned(writer.firstcols))
-        writer.closeio && close(writer.io)
-        writer.isclosed = true
-        return
-    end
-    # write empty message
-    if !writer.writetofile
-        msg = Message(UInt8[], nothing, 0, true, false, Meta.Schema)
-        Base.write(writer.io, msg, writer.blocks, writer.schema, writer.alignment)
-        writer.closeio && close(writer.io)
-        writer.isclosed = true
-        return
-    end
-    b = FlatBuffers.Builder(1024)
-    schfoot = makeschema(b, writer.schema[], writer.firstcols[])
-    recordbatches = if !isempty(writer.blocks[1])
-        N = length(writer.blocks[1])
-        Meta.footerStartRecordBatchesVector(b, N)
-        for blk in Iterators.reverse(writer.blocks[1])
-            Meta.createBlock(b, blk.offset, blk.metaDataLength, blk.bodyLength)
-        end
-        FlatBuffers.endvector!(b, N)
-    else
-        FlatBuffers.UOffsetT(0)
-    end
-    dicts = if !isempty(writer.blocks[2])
-        N = length(writer.blocks[2])
-        Meta.footerStartDictionariesVector(b, N)
-        for blk in Iterators.reverse(writer.blocks[2])
-            Meta.createBlock(b, blk.offset, blk.metaDataLength, blk.bodyLength)
-        end
-        FlatBuffers.endvector!(b, N)
-    else
-        FlatBuffers.UOffsetT(0)
-    end
-    Meta.footerStart(b)
-    Meta.footerAddVersion(b, Meta.MetadataVersion.V5)
-    Meta.footerAddSchema(b, schfoot)
-    Meta.footerAddDictionaries(b, dicts)
-    Meta.footerAddRecordBatches(b, recordbatches)
-    foot = Meta.footerEnd(b)
-    FlatBuffers.finish!(b, foot)
-    footer = FlatBuffers.finishedbytes(b)
-    Base.write(writer.io, footer)
-    Base.write(writer.io, Int32(length(footer)))
-    Base.write(writer.io, "ARROW1")
-    writer.closeio && close(writer.io)
-    writer.isclosed = true
-    nothing
+    return path
 end
 
 function write(io::IO, tbl; kwargs...)
-    open(Writer, io; file=false, kwargs...) do writer
-        write(writer, tbl)
-    end
-    io
+    bytes = _writebytes(tbl; kwargs...)
+    Base.write(io, bytes)
+    return io
 end
 
-function write(
-    io,
-    source,
-    writetofile,
-    largelists,
-    compress,
-    denseunions,
-    dictencode,
-    dictencodenested,
-    alignment,
-    maxdepth,
-    ntasks,
-    meta,
-    colmeta,
-)
-    open(
-        Writer,
-        io,
-        compress,
-        writetofile,
-        largelists,
-        denseunions,
-        dictencode,
-        dictencodenested,
-        alignment,
-        maxdepth,
-        ntasks,
-        meta,
-        colmeta,
-    ) do writer
-        write(writer, source)
-    end
-    io
+write(sink::Union{AbstractString,IO}; kwargs...) = tbl -> write(sink, tbl; kwargs...)
+
+"""
+    Arrow.tobuffer(table; kwargs...)
+
+Write `table` to a fresh `IOBuffer`, seeked to the start, in the IPC STREAM
+format — the same bytes Arrow 2.x's `tobuffer` produced. Keyword arguments
+are those of [`Arrow.write`](@ref) except `file`, which is `false` here.
+"""
+function tobuffer(tbl; kwargs...)
+    io = IOBuffer()
+    write(io, tbl; file=false, kwargs...)
+    seekstart(io)
+    return io
 end
 
-function process_partition(
-    cols,
-    dictencodings,
-    largelists,
-    compress,
-    denseunions,
-    dictencode,
-    dictencodenested,
-    maxdepth,
-    sync,
-    msgs,
-    alignment,
-    i,
-    sch,
-    errorref,
-    anyerror,
-    meta,
-    colmeta,
+"""
+    Arrow.Writer(sink; file=true, compress=nothing, metadata=nothing,
+                 colmetadata=nothing, dictreplacement=false)
+    Arrow.Writer(f::Function, sink; kwargs...)
+
+An incremental IPC writer: batches publish to `sink` as they are written,
+so producing tables one at a time never holds more than the current table
+in memory. `sink` is a file path (the writer opens and owns the handle) or
+an `IO` (borrowed; `close` finishes the IPC output but leaves the `IO`
+open). The function form runs `f(writer)` and always closes the writer.
+Metadata follows the inheritance rules of [`Arrow.write`](@ref).
+Constructor option checks run before opening a file path. If both `f` and
+`close` fail, the function form preserves the error from `f`.
+
+    w = Arrow.Writer(path)
+    for tbl in tables
+        Arrow.write(w, tbl)
+    end
+    close(w)
+
+The FIRST table written fixes the schema, with the same inference one
+eager `Arrow.write` of that table would use; every later table must
+conform to it (same column names and order, compatible types) or the
+write is refused with the mismatch. Unlike the eager writer, no inference
+crosses tables: a field is nullable iff the first table's column eltype
+admits `Missing`, and later missing values under a non-nullable field are
+refused. To pin a schema explicitly, write a zero-row table with fully
+typed columns first.
+
+Dictionary-encoded columns: every later table may reuse the first
+table's exact pool (the same categories in the same first-appearance
+order). A CHANGED pool needs replacement dictionary batches, which the
+schema message must declare up front: pass `dictreplacement=true`
+(stream format only) to declare it. The declaration is a demand on
+readers — strict ones such as nanoarrow refuse any stream declaring a
+feature they do not support — so it is opt-in, and without it a changed
+pool is refused. The file format carries one dictionary batch per id and
+never replaces.
+
+`close` finalizes what has been published — the sink is a valid IPC
+output containing every batch written so far — and is idempotent. A
+finalization failure still releases the owned sink. A
+writer abandoned without `close` leaves a torn stream or an unfooted
+file; closing a writer that never received a table just closes the sink
+without producing valid IPC. One task owns a writer: overlapping calls
+are not synchronized.
+"""
+mutable struct Writer
+    const io::IO
+    const ownio::Bool
+    const file::Bool
+    const compress::Symbol
+    const metadata::Any
+    const colmetadata::Any
+    const dictreplacement::Bool
+    st::Union{Nothing,IPCWriteState}
+    names::Vector{Symbol}
+    schema::Union{Nothing,AC.Schema}
+    @atomic closed::Bool
+end
+
+function _writer(
+    sink::Union{AbstractString,IO};
+    file::Bool=true,
+    compress::Union{Nothing,Symbol}=nothing,
+    metadata=nothing,
+    colmetadata=nothing,
+    dictreplacement::Bool=false,
 )
+    codec = compress === nothing ? :none : compress
+    if !haskey(CODEC_NAMES, codec)
+        throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
+    end
+    if dictreplacement && file
+        throw(
+            ArgumentError(
+                "dictreplacement is a stream-format feature; the IPC file " *
+                "format carries one dictionary batch per id",
+            ),
+        )
+    end
+    # Open only after keyword dispatch and option checks: opening with "w"
+    # truncates an existing destination.
+    ownio = sink isa AbstractString
+    io = ownio ? open(sink, "w") : sink
     try
-        cols = toarrowtable(
-            cols,
-            dictencodings,
-            largelists,
-            compress,
-            denseunions,
-            dictencode,
-            dictencodenested,
-            maxdepth,
-            meta,
-            colmeta,
+        return Writer(
+            io,
+            ownio,
+            file,
+            codec,
+            metadata,
+            colmetadata,
+            dictreplacement,
+            nothing,
+            Symbol[],
+            nothing,
+            false,
         )
-        dictmsgs = nothing
-        if !isempty(cols.dictencodingdeltas)
-            dictmsgs = []
-            for de in cols.dictencodingdeltas
-                dictsch = Tables.Schema((:col,), (eltype(de.data),))
-                push!(
-                    dictmsgs,
-                    makedictionarybatchmsg(dictsch, (col=de.data,), de.id, true, alignment),
-                )
+    catch
+        if ownio
+            try
+                close(io)
+            catch
+                # Preserve the construction error if sink cleanup also fails.
             end
         end
-        put!(sync, i) do
-            if !isnothing(dictmsgs)
-                foreach(msg -> put!(msgs, msg), dictmsgs)
-            end
-            put!(msgs, makerecordbatchmsg(sch[], cols, alignment))
-        end
-    catch e
-        errorref[] = (e, catch_backtrace(), i)
-        anyerror[] = true
+        rethrow()
     end
-    return
 end
 
-struct ToArrowTable
-    sch::Tables.Schema
-    cols::Vector{Any}
-    metadata::Union{Nothing,Base.ImmutableDict{String,String}}
-    dictencodingdeltas::Vector{DictEncoding}
+Writer(sink::Union{AbstractString,IO}; kwargs...) = _writer(sink; kwargs...)
+
+function Writer(f::Function, sink::Union{AbstractString,IO}; kwargs...)
+    w = Writer(sink; kwargs...)
+    result = try
+        f(w)
+    catch
+        try
+            close(w)
+        catch
+            # Preserve the body error if finalization or sink cleanup fails.
+        end
+        rethrow()
+    end
+    close(w)
+    return result
 end
 
-function toarrowtable(
-    cols,
-    dictencodings,
-    largelists,
-    compress,
-    denseunions,
-    dictencode,
-    dictencodenested,
-    maxdepth,
-    meta,
-    colmeta,
+# The Arrow 2.x opening idiom: `open(Arrow.Writer, sink)` constructs the
+# writer (the caller closes it), and the function form closes it after `f`.
+Base.open(::Type{Writer}, sink::Union{AbstractString,IO}; kwargs...) =
+    Writer(sink; kwargs...)
+Base.open(f::Function, ::Type{Writer}, sink::Union{AbstractString,IO}; kwargs...) =
+    Writer(f, sink; kwargs...)
+
+Base.isopen(w::Writer) = !(@atomic w.closed)
+
+"""
+    Arrow.write(writer::Arrow.Writer, table)
+
+Write one Tables.jl source through an incremental [`Arrow.Writer`](@ref):
+each `Tables.partitions` partition becomes one record batch, published to
+the sink before the call returns. Returns `writer`. See [`Arrow.Writer`](@ref)
+for the schema rules.
+"""
+function write(w::Writer, tbl)
+    (@atomic w.closed) && throw(ArgumentError("this Arrow.Writer is closed"))
+    names, partcols, partpools, rowcounts = _collectparts(tbl)
+    if w.st === nothing
+        retained = _retainedschema(tbl)
+        fields, coldata = _constructcolumns(
+            names,
+            partcols,
+            partpools,
+            _retainedfieldfn(retained, names),
+            w.colmetadata,
+        )
+        schmeta = _writermetadata(w.metadata, retained)
+        sch = AC.Schema(fields; metadata=schmeta)
+        st = beginwrite!(
+            w.io,
+            sch;
+            file=w.file,
+            compress=w.compress,
+            dictreplacement=w.dictreplacement,
+        )
+        w.st = st
+        w.schema = sch
+        w.names = names
+        for batch in _tablebatches(sch, coldata, rowcounts)
+            writebatch!(st, batch)
+        end
+    else
+        names == w.names || throw(
+            ArgumentError(
+                "table column names $(names) do not match this writer's " *
+                "schema columns $(w.names) (same names, same order)",
+            ),
+        )
+        sch = w.schema::AC.Schema
+        fields, coldata =
+            _constructcolumns(names, partcols, partpools, j -> sch.fields[j], nothing)
+        # A fresh Schema over the BUILT fields, so `writebatch!` re-checks
+        # them against the writer's schema instead of trusting construction.
+        batchsch = AC.Schema(fields; metadata=sch.metadata)
+        for batch in _tablebatches(batchsch, coldata, rowcounts)
+            writebatch!(w.st, batch)
+        end
+    end
+    return w
+end
+
+function Base.close(w::Writer)
+    (@atomic w.closed) && return nothing
+    @atomic w.closed = true
+    st = w.st
+    try
+        st === nothing || finishwrite!(st)
+    catch
+        if st !== nothing
+            try
+                abortwrite!(st)
+            catch
+                # Preserve the finalization error if codec cleanup also fails.
+            end
+        end
+        if w.ownio
+            try
+                close(w.io)
+            catch
+                # Preserve the finalization error if sink cleanup also fails.
+            end
+        end
+        rethrow()
+    end
+    w.ownio ? close(w.io) : flush(w.io)
+    return nothing
+end
+
+"""
+    Arrow.append(sink, table; compress=nothing)
+
+Add `table`'s record batches to an existing IPC STREAM (`sink` is a file
+path or a seekable read/write `IO`). The existing stream is validated in
+full first, the new columns are constructed against its schema (same
+names, order, and compatible types, or the append is refused), and the
+new batches are published where the end-of-stream marker stood, followed
+by a new end-of-stream marker.
+
+A dictionary-encoded column whose pool matches the stream's current pool
+reuses it; a changed pool is emitted as a replacement dictionary batch
+when the stream's schema message declared the DictionaryReplacement
+feature (produce such a stream with
+`Arrow.Writer(sink; file=false, dictreplacement=true)`), and refused
+otherwise. The file format does not support appending: rewrite the file,
+or produce it incrementally with [`Arrow.Writer`](@ref).
+"""
+function append(path::AbstractString, tbl; kwargs...)
+    bytes = Base.read(path)
+    tail = _appendbytes(bytes, tbl; kwargs...)
+    open(path, "r+") do io
+        seek(io, length(bytes) - 8)   # overwrite the end-of-stream marker
+        Base.write(io, tail)
+    end
+    return path
+end
+
+function append(io::IO, tbl; kwargs...)
+    seekstart(io)
+    bytes = Base.read(io)
+    tail = _appendbytes(bytes, tbl; kwargs...)
+    seek(io, length(bytes) - 8)       # overwrite the end-of-stream marker
+    Base.write(io, tail)
+    return io
+end
+
+function _appendbytes(bytes::Vector{UInt8}, tbl; compress::Union{Nothing,Symbol}=nothing)
+    length(bytes) >= 6 &&
+        view(bytes, 1:6) == FILE_MAGIC &&
+        throw(
+            ArgumentError(
+                "Arrow.append supports the IPC stream format; this sink holds " *
+                "the file format (ARROW1) — produce it incrementally with " *
+                "Arrow.Writer, or rewrite it with Arrow.write",
+            ),
+        )
+    codec = compress === nothing ? :none : compress
+    # Validate the whole existing stream before extending it; a corrupt
+    # prefix must refuse, not gain valid-looking bytes. `readstream` also
+    # guarantees the trailing 8 bytes are the end-of-stream marker.
+    s = readstream(bytes)
+    sch = s.schema
+    # The declared features gate replacement exactly as they do on read.
+    msgs = framemessages(AC.heapregion(bytes), s.limits)
+    features = Int64[Int64(x) for x in msgs[1].features]
+    names, partcols, partpools, rowcounts = _collectparts(tbl)
+    length(names) == length(sch.fields) &&
+    all(j -> String(names[j]) == sch.fields[j].name, eachindex(names)) || throw(
+        ArgumentError(
+            "table column names $(names) do not match the existing stream's " *
+            "schema fields $([f.name for f in sch.fields]) (same names, same order)",
+        ),
+    )
+    fields, coldata =
+        _constructcolumns(names, partcols, partpools, j -> sch.fields[j], nothing)
+    batchsch = AC.Schema(fields; metadata=sch.metadata)
+    # Prime the resumed state with the stream's last pool per id, so a
+    # content-identical appended pool reuses the emitted dictionary batch.
+    current = Dict{Int64,AC.ArrayData}()
+    for batch in s.batches
+        for (f, pool) in dictionarypools(sch.fields, batch.columns)
+            current[s.fielddictids[f]] = pool
+        end
+    end
+    io = IOBuffer()
+    st = resumestream!(io, sch, s.fielddictids, features; compress=codec, current=current)
+    try
+        for batch in _tablebatches(batchsch, coldata, rowcounts)
+            writebatch!(st, batch)
+        end
+        finishwrite!(st)
+    finally
+        abortwrite!(st)
+    end
+    return take!(io)
+end
+
+"Retained Arrow schema when the source is a facade read, else nothing."
+_retainedschema(t::Table) = getfield(t, :schema)
+_retainedschema(s::Stream) = _tableschema(getfield(s, :src))
+_retainedschema(::Any) = nothing
+
+function _writermetadata(metadata, retained)
+    metadata !== nothing && return _metapairs(metadata)
+    (retained === nothing || retained.metadata === nothing) && return nothing
+    # Statistics describe the source's values, field indexes, and batch
+    # boundaries. Retaining its descriptors does not preserve that identity.
+    # Keep user metadata in order, including duplicate keys.
+    return Pair{String,String}[kv for kv in retained.metadata if first(kv) != STATS_KEY]
+end
+
+"Dictionary pools retained by one facade partition, in column order."
+_partitiondictpools(t::Table) = getfield(t, :retainedpools)
+_partitiondictpools(::Any) = nothing
+
+# One warning per removed-keyword name for the whole session, so a write
+# loop does not flood the log.
+function _warnremovedkwarg(name::Symbol)
+    @warn "Arrow.write keyword `$(name)` was removed in Arrow 3.0 and is " *
+          "ignored; see docs/src/migration.md" _id = Symbol(:arrow_removed_kwarg_, name) maxlog =
+        1
+    return nothing
+end
+
+function _writebytes(
+    tbl;
+    file::Bool=true,
+    compress::Union{Nothing,Symbol}=nothing,
+    metadata=nothing,
+    colmetadata=nothing,
+    # Arrow 2.x writer keywords: accepted and ignored (with a one-time
+    # warning each) so 2.x call sites keep working during migration.
+    alignment=nothing,
+    dictencode=nothing,
+    dictencodenested=nothing,
+    denseunions=nothing,
+    largelists=nothing,
+    maxdepth=nothing,
+    ntasks=nothing,
 )
-    @debug "converting input table to arrow formatted columns"
-    sch = Tables.schema(cols)
-    types = collect(sch.types)
-    N = length(types)
-    newcols = Vector{Any}(undef, N)
-    newtypes = Vector{Type}(undef, N)
-    dictencodingdeltas = DictEncoding[]
-    Tables.eachcolumn(sch, cols) do col, i, nm
-        oldcolmeta = getmetadata(col)
-        newcolmeta = isnothing(colmeta) ? oldcolmeta : get(colmeta, nm, oldcolmeta)
-        newcol = toarrowvector(
-            col,
-            i,
-            dictencodings,
-            dictencodingdeltas,
-            newcolmeta;
-            compression=compress,
-            largelists=largelists,
-            denseunions=denseunions,
-            dictencode=dictencode,
-            dictencodenested=dictencodenested,
-            maxdepth=maxdepth,
-        )
-        newtypes[i] = eltype(newcol)
-        newcols[i] = newcol
-    end
-    minlen, maxlen = isempty(newcols) ? (0, 0) : extrema(length, newcols)
-    minlen == maxlen ||
-        throw(ArgumentError("columns with unequal lengths detected: $minlen < $maxlen"))
-    meta = _normalizemeta(meta)
-    return ToArrowTable(
-        Tables.Schema(sch.names, newtypes),
-        newcols,
-        meta,
-        dictencodingdeltas,
+    for (name, value) in (
+        (:alignment, alignment),
+        (:dictencode, dictencode),
+        (:dictencodenested, dictencodenested),
+        (:denseunions, denseunions),
+        (:largelists, largelists),
+        (:maxdepth, maxdepth),
+        (:ntasks, ntasks),
     )
+        value === nothing || _warnremovedkwarg(name)
+    end
+    retained = _retainedschema(tbl)
+    names, partcols, partpools, rowcounts = _collectparts(tbl)
+    fields, coldata = _constructcolumns(
+        names,
+        partcols,
+        partpools,
+        _retainedfieldfn(retained, names),
+        colmetadata,
+    )
+    schmeta = _writermetadata(metadata, retained)
+    sch = AC.Schema(fields; metadata=schmeta)
+    batches = _tablebatches(sch, coldata, rowcounts)
+    codec = compress === nothing ? :none : compress
+    return file ? writefile(sch, batches; compress=codec) :
+           writestream(sch, batches; compress=codec)
 end
 
-Tables.columns(x::ToArrowTable) = x
-Tables.rowcount(x::ToArrowTable) = length(x.cols) == 0 ? 0 : length(x.cols[1])
-Tables.schema(x::ToArrowTable) = x.sch
-Tables.columnnames(x::ToArrowTable) = x.sch.names
-Tables.getcolumn(x::ToArrowTable, i::Int) = x.cols[i]
-
-function Base.write(io::IO, msg::Message, blocks, sch, alignment)
-    metalen = padding(length(msg.msgflatbuf), alignment)
-    @debug "writing message: metalen = $metalen, bodylen = $(msg.bodylen), isrecordbatch = $(msg.isrecordbatch), headerType = $(msg.headerType)"
-    if msg.blockmsg
+# Phase 1 of a write: materialize every partition's columns, validating
+# name/order agreement — a drift here would silently bind data to the wrong
+# fields.
+function _collectparts(tbl)
+    names = Symbol[]
+    partcols = Vector{AbstractVector}[]
+    partpools = Any[]
+    rowcounts = Int[]
+    for part in Tables.partitions(tbl)
+        cols = Tables.columns(part)
+        pnames = collect(Symbol, Tables.columnnames(cols))
+        if isempty(partcols)
+            names = pnames
+        else
+            pnames == names || throw(
+                ArgumentError(
+                    "partition $(length(partcols) + 1) column names $(pnames) " *
+                    "do not match the first partition's $(names) (same names, " *
+                    "same order); reorder or rename the partition's columns",
+                ),
+            )
+        end
+        # Arrow permits duplicate field names. Tables.getcolumn(cols, name)
+        # cannot distinguish them, so bind every partition by position.
         push!(
-            blocks[msg.isrecordbatch ? 1 : 2],
-            Block(position(io), metalen + 8, msg.bodylen),
+            partcols,
+            AbstractVector[Tables.getcolumn(cols, j) for j in eachindex(pnames)],
+        )
+        pools = _partitiondictpools(part)
+        pools !== nothing &&
+            length(pools) != length(pnames) &&
+            throw(
+                ArgumentError(
+                    "retained dictionary pool count does not match partition width",
+                ),
+            )
+        push!(partpools, pools)
+        n = Int(Tables.rowcount(cols))
+        # A zero-column partition has no column to count rows from, so ask
+        # the partition itself: Arrow legally allows zero fields with a
+        # positive row count (the reader carries that count on the Table).
+        if n == 0 && isempty(pnames)
+            n = Int(Tables.rowcount(part))
+        end
+        push!(rowcounts, n)
+    end
+    isempty(partcols) &&
+        throw(ArgumentError("table has no partitions; cannot infer a schema"))
+    return names, partcols, partpools, rowcounts
+end
+
+# Position is the only unambiguous identity for a retained field, because
+# Arrow permits duplicate names. Fall back to a name match only when the
+# name is unique on both sides; otherwise treat the column as un-retained.
+function _retainedfieldfn(retained, names)
+    ncols = length(names)
+    retainedaligned =
+        retained !== nothing &&
+        length(retained.fields) == ncols &&
+        all(j -> retained.fields[j].name == String(names[j]), 1:ncols)
+    function retainedfield(j)
+        retained === nothing && return nothing
+        retainedaligned && return retained.fields[j]
+        count(==(names[j]), names) == 1 || return nothing
+        matches = findall(f -> f.name == String(names[j]), collect(retained.fields))
+        return length(matches) == 1 ? retained.fields[only(matches)] : nothing
+    end
+    return retainedfield
+end
+
+# Phase 2: construct each complete logical column across the collected
+# partitions. The column module owns inference, retained reconstruction,
+# ArrowTypes, dictionary pooling, partition agreement, and field metadata.
+function _constructcolumns(
+    names,
+    partcols,
+    partpools,
+    retainedfield::F,
+    colmetadata,
+) where {F}
+    nparts = length(partcols)
+    ncols = length(names)
+    fields = Vector{AC.Field}(undef, ncols)
+    coldata = Vector{Vector{AC.ArrayData}}(undef, ncols)
+    colmetamap = colmetadata === nothing ? nothing : Dict(colmetadata)
+    for j = 1:ncols
+        parts = AbstractVector[partcols[k][j] for k = 1:nparts]
+        poolhints = Any[pools === nothing ? nothing : pools[j] for pools in partpools]
+        columnmeta = colmetamap === nothing ? nothing : get(colmetamap, names[j], nothing)
+        fields[j], coldata[j] = _constructcolumn(
+            names[j],
+            parts;
+            retained=retainedfield(j),
+            poolhints=poolhints,
+            metadata=_metapairs(columnmeta),
         )
     end
-    # now write the final message spec out
-    # continuation byte
-    n = Base.write(io, CONTINUATION_INDICATOR_BYTES)
-    # metadata length
-    n += Base.write(io, Int32(metalen))
-    # message flatbuffer
-    n += Base.write(io, msg.msgflatbuf)
-    n += writezeros(io, paddinglength(length(msg.msgflatbuf), alignment))
-    # message body
-    if msg.columns !== nothing
-        # write out buffers
-        for col in Tables.Columns(msg.columns)
-            writebuffer(io, col, alignment)
-        end
-    end
-    return n
+    return fields, coldata
 end
 
-function makemessage(b, headerType, header, columns=nothing, bodylen=0)
-    # write the message flatbuffer object
-    Meta.messageStart(b)
-    Meta.messageAddVersion(b, Meta.MetadataVersion.V5)
-    Meta.messageAddHeaderType(b, headerType)
-    Meta.messageAddHeader(b, header)
-    Meta.messageAddBodyLength(b, Int64(bodylen))
-    # Meta.messageAddCustomMetadata(b, meta)
-    # Meta.messageStartCustomMetadataVector(b, num_meta_elems)
-    msg = Meta.messageEnd(b)
-    FlatBuffers.finish!(b, msg)
-    return Message(
-        FlatBuffers.finishedbytes(b),
-        columns,
-        bodylen,
-        headerType == Meta.RecordBatch,
-        headerType == Meta.RecordBatch || headerType == Meta.DictionaryBatch,
-        headerType,
-    )
+function _tablebatches(sch::AC.Schema, coldata, rowcounts)
+    ncols = length(sch.fields)
+    return AC.RecordBatch[
+        AC.RecordBatch(sch, AC.ArrayData[coldata[j][k] for j = 1:ncols], rowcounts[k]) for
+        k in eachindex(rowcounts)
+    ]
 end
 
-function makeschema(b, sch::Tables.Schema, columns)
-    # build Field objects
-    names = sch.names
-    N = length(names)
-    fieldoffsets = [fieldoffset(b, names[i], columns.cols[i]) for i = 1:N]
-    Meta.schemaStartFieldsVector(b, N)
-    for off in Iterators.reverse(fieldoffsets)
-        FlatBuffers.prependoffset!(b, off)
+_metapairs(::Nothing) = nothing
+function _metapairs(m)
+    entries = m isa AbstractDict || m isa NamedTuple ? Base.pairs(m) : m
+    out = Pair{String,String}[]
+    for kv in entries
+        kv isa Pair || throw(ArgumentError("metadata sequences must contain Pair values"))
+        push!(out, String(first(kv)) => String(last(kv)))
     end
-    fields = FlatBuffers.endvector!(b, N)
-    if columns.metadata !== nothing
-        kvs = columns.metadata
-        kvoffs = Vector{FlatBuffers.UOffsetT}(undef, length(kvs))
-        for (i, (k, v)) in enumerate(kvs)
-            koff = FlatBuffers.createstring!(b, String(k))
-            voff = FlatBuffers.createstring!(b, String(v))
-            Meta.keyValueStart(b)
-            Meta.keyValueAddKey(b, koff)
-            Meta.keyValueAddValue(b, voff)
-            kvoffs[i] = Meta.keyValueEnd(b)
-        end
-        Meta.schemaStartCustomMetadataVector(b, length(kvs))
-        for off in Iterators.reverse(kvoffs)
-            FlatBuffers.prependoffset!(b, off)
-        end
-        meta = FlatBuffers.endvector!(b, length(kvs))
-    else
-        meta = FlatBuffers.UOffsetT(0)
-    end
-    # write schema object
-    Meta.schemaStart(b)
-    Meta.schemaAddEndianness(b, Meta.Endianness.Little)
-    Meta.schemaAddFields(b, fields)
-    Meta.schemaAddCustomMetadata(b, meta)
-    return Meta.schemaEnd(b)
-end
-
-function makeschemamsg(sch::Tables.Schema, columns)
-    @debug "building schema message: sch = $sch"
-    b = FlatBuffers.Builder(1024)
-    schema = makeschema(b, sch, columns)
-    return makemessage(b, Meta.Schema, schema)
-end
-
-function fieldoffset(b, name, col)
-    nameoff = FlatBuffers.createstring!(b, string(name))
-    T = eltype(col)
-    nullable = T >: Missing
-    # check for custom metadata
-    if getmetadata(col) !== nothing
-        kvs = getmetadata(col)
-        kvoffs = Vector{FlatBuffers.UOffsetT}(undef, length(kvs))
-        for (i, (k, v)) in enumerate(kvs)
-            koff = FlatBuffers.createstring!(b, String(k))
-            voff = FlatBuffers.createstring!(b, String(v))
-            Meta.keyValueStart(b)
-            Meta.keyValueAddKey(b, koff)
-            Meta.keyValueAddValue(b, voff)
-            kvoffs[i] = Meta.keyValueEnd(b)
-        end
-        Meta.fieldStartCustomMetadataVector(b, length(kvs))
-        for off in Iterators.reverse(kvoffs)
-            FlatBuffers.prependoffset!(b, off)
-        end
-        meta = FlatBuffers.endvector!(b, length(kvs))
-    else
-        meta = FlatBuffers.UOffsetT(0)
-    end
-    # build dictionary
-    if isdictencoded(col)
-        encodingtype = indtype(col)
-        IT, inttype, _ = arrowtype(b, encodingtype)
-        Meta.dictionaryEncodingStart(b)
-        Meta.dictionaryEncodingAddId(b, Int64(getid(col)))
-        Meta.dictionaryEncodingAddIndexType(b, inttype)
-        # TODO: support isOrdered?
-        Meta.dictionaryEncodingAddIsOrdered(b, false)
-        dict = Meta.dictionaryEncodingEnd(b)
-    else
-        dict = FlatBuffers.UOffsetT(0)
-    end
-    type, typeoff, children = arrowtype(b, col)
-    if children !== nothing
-        Meta.fieldStartChildrenVector(b, length(children))
-        for off in Iterators.reverse(children)
-            FlatBuffers.prependoffset!(b, off)
-        end
-        children = FlatBuffers.endvector!(b, length(children))
-    else
-        Meta.fieldStartChildrenVector(b, 0)
-        children = FlatBuffers.endvector!(b, 0)
-    end
-    # build field object
-    if isdictencoded(col)
-        @debug "building field: name = $name, nullable = $nullable, T = $T, type = $type, inttype = $IT, dictionary id = $(getid(col))"
-    else
-        @debug "building field: name = $name, nullable = $nullable, T = $T, type = $type"
-    end
-    Meta.fieldStart(b)
-    Meta.fieldAddName(b, nameoff)
-    Meta.fieldAddNullable(b, nullable)
-    Meta.fieldAddTypeType(b, type)
-    Meta.fieldAddType(b, typeoff)
-    Meta.fieldAddDictionary(b, dict)
-    Meta.fieldAddChildren(b, children)
-    Meta.fieldAddCustomMetadata(b, meta)
-    return Meta.fieldEnd(b)
-end
-
-struct FieldNode
-    length::Int64
-    null_count::Int64
-end
-
-struct Buffer
-    offset::Int64
-    length::Int64
-end
-
-function makerecordbatchmsg(
-    sch::Tables.Schema{names,types},
-    columns,
-    alignment,
-) where {names,types}
-    b = FlatBuffers.Builder(1024)
-    recordbatch, bodylen = makerecordbatch(b, sch, columns, alignment)
-    return makemessage(b, Meta.RecordBatch, recordbatch, columns, bodylen)
-end
-
-function makerecordbatch(
-    b,
-    sch::Tables.Schema{names,types},
-    columns,
-    alignment,
-) where {names,types}
-    nrows = Tables.rowcount(columns)
-
-    compress = nothing
-    fieldnodes = FieldNode[]
-    fieldbuffers = Buffer[]
-    bufferoffset = 0
-    for col in Tables.Columns(columns)
-        if col isa Compressed
-            compress = compressiontype(col)
-        end
-        bufferoffset =
-            makenodesbuffers!(col, fieldnodes, fieldbuffers, bufferoffset, alignment)
-    end
-    @debug "building record batch message: nrows = $nrows, sch = $sch, compress = $compress"
-
-    # write field nodes objects
-    FN = length(fieldnodes)
-    Meta.recordBatchStartNodesVector(b, FN)
-    for fn in Iterators.reverse(fieldnodes)
-        Meta.createFieldNode(b, fn.length, fn.null_count)
-    end
-    nodes = FlatBuffers.endvector!(b, FN)
-
-    # write buffer objects
-    bodylen = 0
-    BN = length(fieldbuffers)
-    Meta.recordBatchStartBuffersVector(b, BN)
-    for buf in Iterators.reverse(fieldbuffers)
-        Meta.createBuffer(b, buf.offset, buf.length)
-        bodylen += padding(buf.length, alignment)
-    end
-    buffers = FlatBuffers.endvector!(b, BN)
-
-    # compression
-    if compress !== nothing
-        Meta.bodyCompressionStart(b)
-        Meta.bodyCompressionAddCodec(b, compress)
-        Meta.bodyCompressionAddMethod(b, Meta.BodyCompressionMethod.BUFFER)
-        compression = Meta.bodyCompressionEnd(b)
-    else
-        compression = FlatBuffers.UOffsetT(0)
-    end
-
-    # write record batch object
-    @debug "built record batch message: nrows = $nrows, nodes = $fieldnodes, buffers = $fieldbuffers, compress = $compress, bodylen = $bodylen"
-    Meta.recordBatchStart(b)
-    Meta.recordBatchAddLength(b, Int64(nrows))
-    Meta.recordBatchAddNodes(b, nodes)
-    Meta.recordBatchAddBuffers(b, buffers)
-    Meta.recordBatchAddCompression(b, compression)
-    return Meta.recordBatchEnd(b), bodylen
-end
-
-function makedictionarybatchmsg(sch, columns, id, isdelta, alignment)
-    @debug "building dictionary message: id = $id, sch = $sch, isdelta = $isdelta"
-    b = FlatBuffers.Builder(1024)
-    recordbatch, bodylen = makerecordbatch(b, sch, columns, alignment)
-    Meta.dictionaryBatchStart(b)
-    Meta.dictionaryBatchAddId(b, Int64(id))
-    Meta.dictionaryBatchAddData(b, recordbatch)
-    Meta.dictionaryBatchAddIsDelta(b, isdelta)
-    dictionarybatch = Meta.dictionaryBatchEnd(b)
-    return makemessage(b, Meta.DictionaryBatch, dictionarybatch, columns, bodylen)
+    return out
 end

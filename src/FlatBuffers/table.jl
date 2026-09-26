@@ -21,8 +21,10 @@ The object containing the flatbuffer and positional information specific to the 
 The `vtable` containing the offsets for specific members precedes `pos`.
 The actual values in the table follow `pos` offset and size of the vtable.
 
+Concrete subtypes declare:
+
 - `bytes::Vector{UInt8}`: the flatbuffer itself
-- `pos::Integer`:  the base position in `bytes` of the table
+- `pos::Base.Int`: the base position in `bytes` of the table
 """
 abstract type Table end
 abstract type Struct end
@@ -34,9 +36,6 @@ pos(x::TableOrStruct) = getfield(x, :pos)
 
 ==(a::T, b::T) where {T<:TableOrStruct} =
     all(getproperty(a, p) == getproperty(b, p) for p in propertynames(a))
-
-(::Type{T})(b::Builder) where {T<:TableOrStruct} =
-    T(b.bytes[(b.head + 1):end], get(b, b.head, Int32))
 
 getrootas(::Type{T}, bytes::Vector{UInt8}, offset) where {T<:Table} =
     init(T, bytes, offset + readbuffer(bytes, offset, UOffsetT))
@@ -61,22 +60,11 @@ end
 "`indirect` retrieves the relative offset stored at `offset`."
 indirect(t::Table, off) = off + get(t, off, UOffsetT)
 
-getvalue(t, o, ::Type{Nothing}) = nothing
-getvalue(t, o, ::Type{T}) where {T<:Scalar} = get(t, pos(t) + o, T)
-getvalue(t, o, ::Type{T}) where {T<:Enum} = T(get(t, pos(t) + o, enumtype(T)))
-
 function Base.String(t::Table, off)
     off += get(t, off, UOffsetT)
     start = off + sizeof(UOffsetT)
     len = get(t, off, UOffsetT)
     return unsafe_string(pointer(bytes(t), start + 1), len)
-end
-
-function bytevector(t::Table, off)
-    off += get(t, off, UOffsetT)
-    start = off + sizeof(UOffsetT)
-    len = get(t, off, UOffsetT)
-    return view(bytes(t), (start + 1):(start + len + 1))
 end
 
 """
@@ -128,49 +116,7 @@ Base.@propagate_inbounds function Base.getindex(A::Array{T,S}, i::Integer) where
     end
 end
 
-Base.@propagate_inbounds function Base.setindex!(A::Array{T,S}, v, i::Integer) where {T,S}
-    if T === S
-        return setindex!(A.data, v, i)
-    else
-        error("setindex! not supported for reference/table types")
-    end
-end
-
 function union(t::Table, off)
     off += pos(t)
     return off + get(t, off, UOffsetT)
-end
-
-function union!(t::Table, t2::Table, off)
-    off += pos(t)
-    t2.pos = off + get(t, off, UOffsetT)
-    t2.bytes = bytes(t)
-    return
-end
-
-"""
-GetVOffsetTSlot retrieves the VOffsetT that the given vtable location
-points to. If the vtable value is zero, the default value `d`
-will be returned.
-"""
-function getoffsetslot(t::Table, slot, d)
-    off = offset(t, slot)
-    if off == 0
-        return d
-    end
-    return off
-end
-
-"""
-`getslot` retrieves the `T` that the given vtable location
-points to. If the vtable value is zero, the default value `d`
-will be returned.
-"""
-function getslot(t::Table, slot, d::T) where {T}
-    off = offset(t, slot)
-    if off == 0
-        return d
-    end
-
-    return get(t, pos(t) + off, T)
 end

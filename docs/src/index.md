@@ -21,8 +21,23 @@
 
 # Arrow.jl
 
+A pure Julia implementation of the [Apache Arrow](https://arrow.apache.org)
+columnar format: the IPC stream and file formats (read and write, with
+memory-mapped and byte-range reads, scan pushdown, and compression), the C
+data and C stream interfaces for in-process exchange with other
+implementations, recursive ArrowTypes.jl mappings for custom values, and
+Tables.jl integration throughout.
+
+```@example quick_start
+using Arrow
+path = joinpath(mktempdir(), "data.arrow")
+Arrow.write(path, (a = [1, 2, 3], b = ["x", "y", missing]))
+tbl = Arrow.Table(path)
+tbl.b
+```
+
 ```@contents
-Pages = ["manual.md", "reference.md"]
+Pages = ["manual.md", "migration.md", "reference.md"]
 Depth = 3
 ```
 
