@@ -52,7 +52,7 @@ include("writer_sink_tests.jl")
 # Shared acceptance/conformance support contracts and adapter composition.
 include("conformance_support_tests.jl")
 
-# The CloudStore.jl extension against a local S3-compatible server.
+# The CloudStore.jl extension against local S3 and Azure emulators.
 include("cloudstore_tests.jl")
 
 # The adapter acceptance batteries: assertion-dense scripts over the
