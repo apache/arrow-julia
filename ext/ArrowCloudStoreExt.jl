@@ -27,13 +27,29 @@ using CloudStore: CloudStore, Object
 
 A `CloudStore.Object` as an [`Arrow.AbstractArrowSource`](@ref): the length
 is the object's known size, one range is one HTTP `Range` GET pinned to the
-object's ETag with `If-Match` (an overwritten key fails the read instead of
+object's strong ETag with `If-Match` (an overwritten key fails the read instead of
 mixing versions across requests), and Arrow issues up to
 `CONCURRENT_RANGE_READS` of a round's ranges at once. `Arrow.Table(obj; …)`
 and `Arrow.Stream(obj; …)` construct one implicitly.
+
+If the ETag is missing, construction refreshes metadata once. A changed size or
+missing, weak, or malformed ETag throws before any ranges are read.
 """
 struct CloudObjectSource{O<:Object} <: Arrow.AbstractArrowSource
     obj::O
+
+    function CloudObjectSource(obj::Object)
+        obj.size >= 0 || throw(ArgumentError("object size must be nonnegative"))
+        snapshot =
+            isempty(obj.eTag) ? Object(obj.store, obj.key; credentials=obj.credentials) :
+            obj
+        snapshot.size == obj.size ||
+            throw(ArgumentError("object size changed before reading"))
+        tag = _ifmatch(snapshot.eTag)
+        tag !== nothing && occursin(r"^\"[^\x00-\x20\"\x7f]*\"\z", tag) ||
+            throw(ArgumentError("cloud source requires a strong ETag"))
+        return new{typeof(snapshot)}(snapshot)
+    end
 end
 
 # Independent HTTP range GETs are latency-bound, so a round's requests are
