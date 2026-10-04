@@ -325,8 +325,9 @@ names, order, and compatible types, or the append is refused), and the
 new batches are published where the end-of-stream marker stood, followed
 by a new end-of-stream marker.
 
-A dictionary-encoded column whose pool matches the stream's current pool
-reuses it; a changed pool is emitted as a replacement dictionary batch
+A dictionary-encoded column whose pool matches the stream's latest dictionary
+update reuses it, including updates after the last record batch; a changed
+pool is emitted as a replacement dictionary batch
 when the stream's schema message declared the DictionaryReplacement
 feature (produce such a stream with
 `Arrow.Writer(sink; file=false, dictreplacement=true)`), and refused
@@ -368,7 +369,7 @@ function _appendbytes(bytes::Vector{UInt8}, tbl; compress::Union{Nothing,Symbol}
     # guarantees the trailing 8 bytes are the end-of-stream marker.
     s = readstream(bytes)
     sch = s.schema
-    # The declared features gate replacement exactly as they do on read.
+    # Retain the schema's declared features when resuming the writer.
     msgs = framemessages(AC.heapregion(bytes), s.limits)
     features = Int64[Int64(x) for x in msgs[1].features]
     names, partcols, partpools, rowcounts = _collectparts(tbl)
@@ -382,16 +383,15 @@ function _appendbytes(bytes::Vector{UInt8}, tbl; compress::Union{Nothing,Symbol}
     fields, coldata =
         _constructcolumns(names, partcols, partpools, j -> sch.fields[j], nothing)
     batchsch = AC.Schema(fields; metadata=sch.metadata)
-    # Prime the resumed state with the stream's last pool per id, so a
-    # content-identical appended pool reuses the emitted dictionary batch.
-    current = Dict{Int64,AC.ArrayData}()
-    for batch in s.batches
-        for (f, pool) in dictionarypools(sch.fields, batch.columns)
-            current[s.fielddictids[f]] = pool
-        end
-    end
     io = IOBuffer()
-    st = resumestream!(io, sch, s.fielddictids, features; compress=codec, current=current)
+    st = resumestream!(
+        io,
+        sch,
+        s.fielddictids,
+        features;
+        compress=codec,
+        current=s.dictionaries,
+    )
     try
         for batch in _tablebatches(batchsch, coldata, rowcounts)
             writebatch!(st, batch)

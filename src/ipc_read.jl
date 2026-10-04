@@ -1222,6 +1222,7 @@ mutable struct IPCStream <: AC.RecordBatchSource
     nextindex::Int
     @atomic pulling::Bool
     fielddictids::IdDict{Field,Int64}   # adapter-side id table (shared ids preserved)
+    dictionaries::Dict{Int64,ArrayData} # final pools, including updates after the last record
     budget::AllocationBudget           # framing, decode, and facade materialization
     limits::Limits                     # complete policy used when this handle opened
 end
@@ -1437,6 +1438,7 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
             1,
             false,
             fielddictids,
+            dicts,
             budget,
             limits,
         )

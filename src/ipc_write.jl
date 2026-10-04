@@ -974,8 +974,8 @@ function writebatch!(st::IPCWriteState, batch::AC.RecordBatch; validate::Bool=tr
                 continue
             end
             if !(FEATURE_DICTIONARY_REPLACEMENT in st.features)
-                # Emitting a replacement the schema message did not declare
-                # would publish a stream this package's own reader refuses.
+                # Require an explicit replacement declaration on output;
+                # the reader also accepts undeclared replacements from peers.
                 _poolsequal(vf, old, pool) || throw(
                     ValidationError(
                         "dictionary id $id changed pools, but the stream's " *

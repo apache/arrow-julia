@@ -438,4 +438,36 @@ end
     @test dicts[0] === strings
 end
 
+@testset "Append after trailing dictionary updates" begin
+    vf, base = AC.fromjulia("pool", ["alpha", "beta"])
+    for delta in (false, true), compress in (:none, :lz4, :zstd)
+        poolvalues = delta ? ["gamma"] : ["gamma", "delta"]
+        _, update = AC.fromjulia("pool", poolvalues)
+        finalvalues = delta ? vcat(["alpha", "beta"], poolvalues) : poolvalues
+        bytes = fixture(vf, [(false, base, [0, 1]), (delta, update, nothing)]; compress)
+        @test Arrow.Table(bytes).a == ["alpha", "beta"]
+        mktempdir() do dir
+            for path in (false, true)
+                sink = path ? joinpath(dir, "trailing.arrows") : IOBuffer()
+                write(sink, bytes)
+                @test Arrow.append(sink, (; a=Arrow.DictEncode(finalvalues))) == sink
+                appended = path ? read(sink) : take!(sink)
+                @test Arrow.Table(appended).a == vcat(["alpha", "beta"], finalvalues)
+                parts = collect(Arrow.Stream(appended))
+                @test parts[1].a == ["alpha", "beta"]
+                @test parts[2].a == finalvalues
+
+                sink = path ? joinpath(dir, "refused.arrows") : IOBuffer()
+                write(sink, bytes)
+                err = @test_throws Arrow.ValidationError Arrow.append(
+                    sink,
+                    (; a=Arrow.DictEncode(["alpha", "beta"])),
+                )
+                @test occursin("DictionaryReplacement", err.value.msg)
+                @test (path ? read(sink) : take!(sink)) == bytes
+            end
+        end
+    end
+end
+
 end
