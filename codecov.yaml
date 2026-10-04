@@ -18,5 +18,5 @@
 ---
 codecov:
   notify:
-    # 48 base matrix jobs minus the two ArrowTypes/min/macOS thread variants.
-    after_n_builds: 46
+    # One CI run uploads 16 Arrow reports and one ArrowTypes report.
+    after_n_builds: 17
