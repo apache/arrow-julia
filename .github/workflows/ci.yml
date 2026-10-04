@@ -80,6 +80,9 @@ jobs:
     name: Arrow.jl - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -126,6 +129,8 @@ jobs:
       - uses: codecov/codecov-action@v7
         with:
           files: lcov.info
+          fail_ci_if_error: true
+          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
   # The subpackages' own suites: one job each, on the package's minimum
   # supported Julia. The full Arrow.jl matrix above exercises both packages'
   # code on every version, OS, and thread count.
@@ -133,6 +138,9 @@ jobs:
     name: ${{ matrix.pkg.name }} - Julia min - ${{ github.event_name }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -167,6 +175,8 @@ jobs:
       - uses: codecov/codecov-action@v7
         with:
           files: lcov.info
+          fail_ci_if_error: true
+          use_oidc: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
   test_monorepo:
     name: Monorepo dev - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
