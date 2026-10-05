@@ -346,6 +346,14 @@ obj = CloudStore.Object(bucket, "events/2024-05.arrow"; credentials)
 tbl = Arrow.Table(obj; scan = Scan(select = (:id,), filter = col(:day) > 20))
 ```
 
+Cloud reads pin a strong ETag before fetching bytes. If the object's ETag is
+missing, Arrow refreshes its metadata once and requires the size to agree.
+Each nonempty request, including a whole-object range, must return HTTP 206
+with the requested byte range, total object size, ETag, and byte count.
+Overwritten objects and inconsistent responses fail the read. HTTP content
+encodings such as gzip are rejected to preserve byte offsets; Arrow's IPC
+compression is still supported. Empty reads send no request.
+
 Any other transport is two methods away:
 
 ```julia
