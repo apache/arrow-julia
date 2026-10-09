@@ -79,15 +79,15 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
             AC.DurationType(unit),
             x -> Int64(Dates.value(x)),
         )
-    elseif T <: Decimals.Decimal
+    elseif T <: DataDecimals.Decimal
         return _constructdecimalpart(name, v, T)
-    elseif T <: Decimals.DecimalValue
+    elseif T <: DataDecimals.DecimalValue
         throw(
             ArgumentError(
                 "column $name holds DecimalValue values, whose scale travels " *
                 "with each value; an Arrow decimal column declares ONE scale " *
                 "in its schema. Convert the column to a fixed scale first, " *
-                "e.g. `Decimals.rescale.(Decimal{P,S}, $name)`",
+                "e.g. `DataDecimals.rescale.(Decimal{P,S}, $name)`",
             ),
         )
     elseif T <: NamedTuple
@@ -256,14 +256,14 @@ function _narrowlists(v::AbstractVector)
     return S[x === missing ? missing : convert(Vector{E}, x) for x in w]
 end
 
-# An ArrowStrings column IS Utf8View memory: its payload vector is the views
+# An DataStrings column IS Utf8View memory: its payload vector is the views
 # buffer and its byte buffers are the variadic data buffers — no copy, no
 # String materialization. Nullability comes from the column's eltype.
 # Both keywords are accepted for dispatch uniformity; a StringVector is
 # already Arrow memory, so no context or narrowing applies.
 function _constructpart(
     name::String,
-    v::ArrowStrings.StringVector;
+    v::DataStrings.StringVector;
     context=nothing,
     narrowabstract::Bool=true,
 )
@@ -318,7 +318,7 @@ function _constructtemporalpart(
 end
 
 """
-Construct one fresh Arrow decimal part from a `Decimals.Decimal{P,S,T}`
+Construct one fresh Arrow decimal part from a `DataDecimals.Decimal{P,S,T}`
 column. Unlike the temporal path there is nothing to convert: the Julia
 coefficient IS the Arrow slot, so `P` and `S` become the descriptor's
 precision and scale, `T`'s width becomes its bitWidth (32/64/128/256), and a
@@ -334,7 +334,7 @@ function _constructdecimalpart(
     name::String,
     v::AbstractVector,
     ::Type{D},
-) where {P,S,T,D<:Decimals.Decimal{P,S,T}}
+) where {P,S,T,D<:DataDecimals.Decimal{P,S,T}}
     t = AC.DecimalType(P, S, 8 * sizeof(T))
     if !(eltype(v) >: Missing)
         values = _plainvector(v)
@@ -419,7 +419,7 @@ _arrowtypesnativetype(T) =
         Dates.DateTime,
         Dates.Time,
         Dates.Period,
-        Decimals.AbstractDecimal,
+        DataDecimals.AbstractDecimal,
     } || _zonedwritertype(T)
 
 # The TimeZones extension's write hooks. With the extension absent both
@@ -3790,11 +3790,11 @@ end
 function _retainedview(f::AC.Field, v::AbstractVector)
     t = f.type::AC.ViewType
     present = _retainedvalidity(f, v)
-    payloads = Vector{ArrowStrings.ArrowStringPayload}(undef, length(v))
+    payloads = Vector{DataStrings.StringPayload}(undef, length(v))
     data = UInt8[]
     for (i, x) in enumerate(v)
         if x === missing
-            payloads[i] = ArrowStrings.PAYLOAD_MISSING
+            payloads[i] = DataStrings.PAYLOAD_MISSING
             continue
         end
         bytes = if t.utf8
@@ -3807,15 +3807,15 @@ function _retainedview(f::AC.Field, v::AbstractVector)
             x
         end
         n = length(bytes)
-        if n <= ArrowStrings.INLINE_MAX
-            payloads[i] = ArrowStrings.inline_payload(bytes, 1, n)
+        if n <= DataStrings.INLINE_MAX
+            payloads[i] = DataStrings.inline_payload(bytes, 1, n)
         else
             length(data) <= typemax(Int32) - n || throw(
                 ArgumentError("column $(f.name) view data exceeds the Int32 offset range"),
             )
             off = length(data)
             append!(data, bytes)
-            payloads[i] = ArrowStrings.view_payload(data, off + 1, n, 0, off)
+            payloads[i] = DataStrings.view_payload(data, off + 1, n, 0, off)
         end
     end
     buffers = AC.BufferSlice[AC._bitmapbuffer(present), AC._databuffer(payloads)]

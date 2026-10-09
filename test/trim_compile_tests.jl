@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# JuliaC `--trim=safe` compile gate for ArrowCore and ArrowStrings, following the harness
+# JuliaC `--trim=safe` compile gate for ArrowCore and DataStrings, following the harness
 # convention from JSON/HTTP/Reseau/StructUtils: compile the workload
 # entrypoint, require ZERO verifier errors and ZERO verifier warnings, then
 # run the produced binary and require exit 0.
@@ -93,7 +93,7 @@ function _count_verifier_messages(output::String)::Tuple{Int,Int}
     return errors, warnings
 end
 
-@testset "ArrowCore and ArrowStrings trim compile" begin
+@testset "ArrowCore and DataStrings trim compile" begin
     if !_TRIM_SUPPORTED
         println("[trim] skip: JuliaC --trim requires Julia >= 1.12")
     elseif Sys.iswindows()

@@ -417,7 +417,7 @@ function _scan_main()
     routeclaims = (
         Field("binary", BinaryType(false); nullable=false) => Vector{UInt8},
         Field("decimal", DecimalType(10, 2, 128); nullable=false) =>
-            Decimals.Decimal{10,2,Int128},
+            DataDecimals.Decimal{10,2,Int128},
         # A scale `Decimal{P,S}` cannot name keeps the raw byte domain.
         Field("decimal_wide_scale", DecimalType(10, 40, 128); nullable=false) =>
             Vector{UInt8},

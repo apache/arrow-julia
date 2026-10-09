@@ -24,9 +24,9 @@ using Test
 using Dates
 using Tables
 import DataAPI
-import Decimals
+import DataDecimals
 using Arrow
-using ArrowStrings
+using DataStrings
 
 const AC = Arrow.ArrowCore
 
@@ -154,11 +154,11 @@ end
 
     @testset "retained byte and scalar layouts rebuild exactly" begin
         raw = Vector{UInt8}(codeunits("short-thirteen-byte"))
-        payloads = ArrowStringPayload[
-            ArrowStrings.inline_payload(raw, 1, 5),
-            ArrowStrings.view_payload(raw, 7, 13, 0, 6),
+        payloads = StringPayload[
+            DataStrings.inline_payload(raw, 1, 5),
+            DataStrings.view_payload(raw, 7, 13, 0, 6),
         ]
-        strings = StringVector{ArrowString}(payloads, [raw])
+        strings = StringVector{DataString}(payloads, [raw])
         io = IOBuffer()
         Arrow.write(io, (s=strings,); file=false)
         viewbytes = take!(io)
@@ -200,7 +200,7 @@ end
         )
         decimalback = Arrow.readstream(_rewrite(decimalbytes))
         @test decimalback.schema.fields[1].type == decimaltype
-        D = Decimals.Decimal{10,2,Int64}
+        D = DataDecimals.Decimal{10,2,Int64}
         @test Arrow.Table(_rewrite(decimalbytes)).dec ==
               D[reinterpret(D, 123), reinterpret(D, 456)]
     end

@@ -24,9 +24,9 @@ using Test
 using Tables
 using Dates
 import DataAPI
-import Decimals
+import DataDecimals
 using Arrow
-using ArrowStrings
+using DataStrings
 
 struct _InterruptingInteger <: Integer end
 struct _OutOfMemoryInteger <: Integer end
@@ -1837,9 +1837,9 @@ end
         # compositions; empty and nonempty columns decide keep/drop alike.
         @test Arrow._declaredbasetype(Arrow.AC.ListViewType(false)) === Vector{Any}
         @test Arrow._declaredbasetype(Arrow.AC.DecimalType(9, 2, 32)) ===
-              Decimals.Decimal32{2}
+              DataDecimals.Decimal32{2}
         @test Arrow._declaredbasetype(Arrow.AC.DecimalType(38, 2, 128)) ===
-              Decimals.Decimal128{2}
+              DataDecimals.Decimal128{2}
         # A scale Decimal{P,S} cannot name keeps Core's raw coefficient domain.
         @test Arrow._declaredbasetype(Arrow.AC.DecimalType(10, -2, 32)) === Int32
         @test Arrow._declaredbasetype(Arrow.AC.DecimalType(38, 40, 128)) === Vector{UInt8}
@@ -2189,7 +2189,7 @@ end
                     [AC.BufferSlice(), AC._databuffer(Int128[])];
                     nullcount=0,
                 ),
-                Decimals.Decimal{10,2,Int128},
+                DataDecimals.Decimal{10,2,Int128},
             ),
             (
                 "d64",
@@ -2200,7 +2200,7 @@ end
                     [AC.BufferSlice(), AC._databuffer(Int64[])];
                     nullcount=0,
                 ),
-                Decimals.Decimal{10,2,Int64},
+                DataDecimals.Decimal{10,2,Int64},
             ),
             (
                 "iym",
@@ -2258,7 +2258,7 @@ end
         ) === Vector{Any}
     end
 
-    @testset "ArrowStrings columns write as Utf8View, zero-copy" begin
+    @testset "DataStrings columns write as Utf8View, zero-copy" begin
         # A StringVector's memory IS a Utf8View array: payloads are the
         # views buffer, its byte buffers the variadic data buffers. Build one
         # the way the CSV kernel does (inline ≤12, else a view into buffer 0
@@ -2269,13 +2269,13 @@ end
         extra = Vector{UInt8}(codeunits("she said \"hi\" and left"))
         long1 = first(findfirst(codeunits("thirteen-byte"), buf))
         abcd = first(findfirst(codeunits("abcd"), buf))
-        payloads = ArrowStringPayload[
-            ArrowStrings.inline_payload(buf, abcd, 4),
-            ArrowStrings.view_payload(buf, long1, 13, 0, long1 - 1),
-            ArrowStrings.PAYLOAD_MISSING,
-            ArrowStrings.view_payload(extra, 1, length(extra), 1, 0),
+        payloads = StringPayload[
+            DataStrings.inline_payload(buf, abcd, 4),
+            DataStrings.view_payload(buf, long1, 13, 0, long1 - 1),
+            DataStrings.PAYLOAD_MISSING,
+            DataStrings.view_payload(extra, 1, length(extra), 1, 0),
         ]
-        col = StringVector{Union{Missing,ArrowString}}(payloads, buf, extra)
+        col = StringVector{Union{Missing,DataString}}(payloads, buf, extra)
         f, columnparts = Arrow._constructcolumn(:s, AbstractVector[col])
         d = only(columnparts)
         @test f.type == Arrow.AC.ViewType(true) && f.nullable
@@ -2290,7 +2290,7 @@ end
         @test eltype(t.s) === Union{Missing,String}
         @test isequal(t.s, ["abcd", "thirteen-byte", missing, "she said \"hi\" and left"])
         # a non-nullable column declares non-nullable
-        col0 = StringVector{ArrowString}(payloads[[1, 2]], buf, extra)
+        col0 = StringVector{DataString}(payloads[[1, 2]], buf, extra)
         f0, _ = Arrow._constructcolumn(:s, AbstractVector[col0])
         @test !f0.nullable
         Arrow.write(io, (s=col0,))
@@ -2298,10 +2298,10 @@ end
         # an all-inline column may have ZERO data buffers — the format allows
         # a Utf8View with no variadic buffers, and the wire carries exactly
         # the fixed validity + views pair
-        inl = StringVector{ArrowString}(
+        inl = StringVector{DataString}(
             [
-                ArrowStrings.inline_payload(buf, abcd, 4),
-                ArrowStrings.inline_payload(buf, abcd, 2),
+                DataStrings.inline_payload(buf, abcd, 4),
+                DataStrings.inline_payload(buf, abcd, 2),
             ],
             Vector{Vector{UInt8}}(),
         )
@@ -2321,7 +2321,7 @@ end
 # `Decimal{P,S,T}`'s per-storage digit capacities ARE Arrow's per-width
 # precision ceilings, so the correspondence is exact in both directions.
 const DECIMAL_WIDTHS =
-    ((32, 9, Int32), (64, 18, Int64), (128, 38, Int128), (256, 76, Decimals.Int256))
+    ((32, 9, Int32), (64, 18, Int64), (128, 38, Int128), (256, 76, DataDecimals.Int256))
 
 # One decimal column's Core buffers, written directly so the READ side is
 # exercised against a descriptor no Julia column produced.
@@ -2336,10 +2336,10 @@ function decimalstream(t::Arrow.AC.DecimalType, coefficients, present=nothing)
     return Arrow.writestream(sch, [AC.RecordBatch(sch, Arrow.AC.ArrayData[d], n)])
 end
 
-@testset "Arrow decimals map to Decimals.Decimal" begin
+@testset "Arrow decimals map to DataDecimals.Decimal" begin
     @testset "every width reads as its value type" begin
         for (bits, prec, T) in DECIMAL_WIDTHS
-            D = Decimals.Decimal{prec,2,T}
+            D = DataDecimals.Decimal{prec,2,T}
             coefficients = T[T(123), T(-456), T(0)]
             table = Arrow.Table(
                 decimalstream(Arrow.AC.DecimalType(prec, 2, bits), coefficients),
@@ -2347,8 +2347,8 @@ end
             @test eltype(table.dec) === D
             @test table.dec == D[reinterpret(D, c) for c in coefficients]
             # The coefficient is the Arrow slot verbatim, sign included.
-            @test Decimals.unscaled.(table.dec) == coefficients
-            @test Decimals.scale(eltype(table.dec)) == 2
+            @test DataDecimals.unscaled.(table.dec) == coefficients
+            @test DataDecimals.scale(eltype(table.dec)) == 2
             @test precision(first(table.dec)) == prec
             @test DataAPI.colmetadata(table, :dec, "unit") == "usd"
         end
@@ -2356,7 +2356,7 @@ end
 
     @testset "nulls come from the validity bitmap" begin
         for (bits, prec, T) in DECIMAL_WIDTHS
-            D = Decimals.Decimal{prec,3,T}
+            D = DataDecimals.Decimal{prec,3,T}
             t = Arrow.AC.DecimalType(prec, 3, bits)
             bytes = decimalstream(t, T[T(7), T(0), T(-9)], Bool[true, false, true])
             column = Arrow.Table(bytes).dec
@@ -2370,7 +2370,7 @@ end
 
     @testset "columns round-trip through write" begin
         for (bits, prec, T) in DECIMAL_WIDTHS, scale in (0, 2, prec)
-            D = Decimals.Decimal{prec,scale,T}
+            D = DataDecimals.Decimal{prec,scale,T}
             values = D[typemin(D), reinterpret(D, T(-1)), zero(D), typemax(D)]
             nullable = Union{Missing,D}[values[1], missing, values[4], missing]
             for file in (false, true)
@@ -2394,7 +2394,7 @@ end
         # Decimal32/64 are format 1.5 additions: a Decimal32 column writes as
         # a 32-bit decimal rather than inflating to the older 128-bit form.
         for (bits, _, T) in DECIMAL_WIDTHS
-            D = Decimals.Decimal{5,2,T}
+            D = DataDecimals.Decimal{5,2,T}
             io = IOBuffer()
             Arrow.write(io, (x=D[D("1.23")],); file=false)
             table = Arrow.Table(take!(io))
@@ -2405,7 +2405,7 @@ end
     end
 
     @testset "a non-nullable column is written zero-copy" begin
-        D = Decimals.Decimal{38,2,Int128}
+        D = DataDecimals.Decimal{38,2,Int128}
         column = D[reinterpret(D, Int128(i)) for i = 1:8]
         _, parts = Arrow._constructcolumn(:d, AbstractVector[column])
         values = only(parts).buffers[2]
@@ -2415,7 +2415,7 @@ end
 
     @testset "reads take Core's bulk copy at every width" begin
         for (bits, prec, T) in DECIMAL_WIDTHS
-            D = Decimals.Decimal{prec,0,T}
+            D = DataDecimals.Decimal{prec,0,T}
             t = Arrow.AC.DecimalType(prec, 0, bits)
             f = Arrow.AC.Field("dec", t; nullable=false)
             n = 512
@@ -2436,7 +2436,7 @@ end
         # The writer's pool identity walks storage fields; a decimal's whole
         # value lives in one wide primitive with no fields of its own.
         for (bits, prec, T) in DECIMAL_WIDTHS
-            D = Decimals.Decimal{prec,1,T}
+            D = DataDecimals.Decimal{prec,1,T}
             values = D[reinterpret(D, T(15)), reinterpret(D, T(15)), reinterpret(D, T(25))]
             io = IOBuffer()
             Arrow.write(io, (x=Arrow.DictEncode(values),); file=false)
@@ -2517,7 +2517,7 @@ end
     @testset "DecimalValue is refused with a fix" begin
         io = IOBuffer()
         err = try
-            Arrow.write(io, (x=[Decimals.DecimalValue(123, 2)],); file=false)
+            Arrow.write(io, (x=[DataDecimals.DecimalValue(123, 2)],); file=false)
             nothing
         catch e
             e
@@ -2534,10 +2534,10 @@ end
         f = AC.Field("dec", t; nullable=false)
         d = AC.ArrayData(t, 1, [AC.BufferSlice(), AC._databuffer(Int128[7])]; nullcount=0)
         # Right width, wrong precision/scale: still the caller's claim.
-        @test AC.materialize(Decimals.Decimal{38,2,Int128}, f, d)[1] ==
-              reinterpret(Decimals.Decimal{38,2,Int128}, Int128(7))
+        @test AC.materialize(DataDecimals.Decimal{38,2,Int128}, f, d)[1] ==
+              reinterpret(DataDecimals.Decimal{38,2,Int128}, Int128(7))
         # An eight-byte claim over a sixteen-byte slot must refuse.
-        @test_throws ArgumentError AC.materialize(Decimals.Decimal{18,2,Int64}, f, d)
+        @test_throws ArgumentError AC.materialize(DataDecimals.Decimal{18,2,Int64}, f, d)
         @test_throws ArgumentError AC.materialize(Int64, f, d)
         # Core's own byte domain stays claimable.
         @test AC.materialize(Vector{UInt8}, f, d)[1] == reinterpret(UInt8, Int128[7])

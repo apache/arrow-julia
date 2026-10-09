@@ -669,10 +669,10 @@ _postconvert(t::AC.DictionaryType, col, budget=nothing) =
     _postconvert(t.valuetype, col, budget)
 
 # The storage integer and maximum precision behind each Arrow decimal width.
-# `Decimals.Decimal`'s own per-storage digit capacities are exactly Arrow's
+# `DataDecimals.Decimal`'s own per-storage digit capacities are exactly Arrow's
 # per-width precision ceilings, so the widths correspond one for one.
 _decimalstorage(bits::Int) =
-    bits == 32 ? Int32 : bits == 64 ? Int64 : bits == 128 ? Int128 : Decimals.Int256
+    bits == 32 ? Int32 : bits == 64 ? Int64 : bits == 128 ? Int128 : DataDecimals.Int256
 _decimalcapacity(bits::Int) = bits == 32 ? 9 : bits == 64 ? 18 : bits == 128 ? 38 : 76
 
 """
@@ -693,7 +693,7 @@ function _decimalbasetype(t::AC.DecimalType)
     t.bits in (32, 64, 128, 256) || return raw
     1 <= t.precision <= _decimalcapacity(t.bits) || return raw
     0 <= t.scale <= t.precision || return raw
-    return Decimals.Decimal{t.precision,t.scale,_decimalstorage(t.bits)}
+    return DataDecimals.Decimal{t.precision,t.scale,_decimalstorage(t.bits)}
 end
 
 # The public element type of the SCALAR layouts the facade converts (Dates)

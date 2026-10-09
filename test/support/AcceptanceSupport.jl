@@ -18,7 +18,7 @@
 module AcceptanceSupport
 
 import Arrow
-import Decimals
+import DataDecimals
 using PooledArrays
 using Tables
 import Base64

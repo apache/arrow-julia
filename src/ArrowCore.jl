@@ -2053,7 +2053,7 @@ juliatype(t::DecimalType) = t.bits == 32 ? Int32 : t.bits == 64 ? Int64 : Vector
 # `primwidth(t)` two's-complement native-endian bytes, and `juliatype` can
 # only name the 32/64-bit ones (Base has no 128/256-bit decimal, hence the
 # byte-vector domain above). So the typed claim widens here alone: a caller
-# that DOES own a decimal value type — the facade's `Decimals.Decimal{P,S,T}`
+# that DOES own a decimal value type — the facade's `DataDecimals.Decimal{P,S,T}`
 # — may claim any isbits type of exactly the layout width, and Core copies
 # the coefficient bytes verbatim. Every other layout keeps exact-match-only.
 _decimalclaim(::Type{E}, t::DecimalType) where {E} =
@@ -3749,7 +3749,7 @@ end
 
 Wrap a vector of Arrow view entries as a Utf8View column, ZERO-COPY. `P` is
 any 16-byte isbits type whose values are Arrow StringView entries — the
-representation ArrowStrings' `ArrowString` columns use:
+representation DataStrings' `DataString` columns use:
 
     bytes 0..3    Int32 content length (negative marks a null slot)
     bytes 4..15   the content, zero-padded            (length ≤ 12)
