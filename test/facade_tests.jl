@@ -152,6 +152,14 @@ function assert_mixed(t)
     @test isequal(t.pooled, ["lo", "hi", "lo", missing])
 end
 
+# Allocation of one warmed facade read; a top-level function so the probe
+# measures the read, not testset closure boxing.
+function _tableallocs(bytes)
+    Arrow.Table(bytes)
+    Arrow.Table(bytes)
+    return @allocated Arrow.Table(bytes)
+end
+
 @testset "Arrow facade" begin
     @testset "file round-trip with metadata" begin
         path = tempname()
@@ -1123,6 +1131,17 @@ end
         @test Tables.rowcount(t2) == 3
         @test length(t2) == 0
         @test isempty(collect(t2))
+    end
+
+    @testset "a single-batch primitive column is materialized once" begin
+        # One 8 MB output vector, not a second public copy of it.
+        bytes = Arrow.tobuffer((a=collect(Int64, 1:1_000_000),)) |> take!
+        @test _tableallocs(bytes) < 12_000_000
+        nb =
+            Arrow.tobuffer((
+                a=Union{Missing,Float64}[isodd(i) ? missing : 1.0 for i = 1:1_000_000],
+            )) |> take!
+        @test _tableallocs(nb) < 14_000_000
     end
 
     @testset "Table iterates its columns like other Tables.AbstractColumns" begin

@@ -990,9 +990,16 @@ function _narrowcopy(values, budget, what::AbstractString)
     return out
 end
 
-function _publiccolumn(f::AC.Field, converted, budget=nothing)
+"""
+The public column for `converted`, a column already in the public domain.
+`owned=true` means no other object references `converted` (the facade just
+materialized or joined it), so a vector that already has the public element
+type is returned as is instead of copied.
+"""
+function _publiccolumn(f::AC.Field, converted, budget=nothing; owned::Bool=false)
     T = _publictype(f, converted)
     T === Any && return _narrowcopy(converted, budget, "facade public column")
+    owned && converted isa Vector{T} && return converted
     _chargevector!(budget, T, length(converted), "facade public column")
     return collect(T, converted)
 end
@@ -1136,7 +1143,8 @@ function _facadecolumn(
             offset += length(part)
         end
     end
-    return _facadefromraw(f, col, arrowtypes)
+    # `col` is a fresh batch materialization or the join just built.
+    return _facadefromraw(f, col, arrowtypes; owned=true)
 end
 
 function _facadesinglecolumn(f::AC.Field, d::AC.ArrayData, arrowtypes::_ArrowTypesContext)
@@ -1154,10 +1162,16 @@ end
 _facadefromraw(
     f::AC.Field,
     col::AbstractVector,
-    arrowtypes::_ArrowTypesContext=_ArrowTypesContext(),
+    arrowtypes::_ArrowTypesContext=_ArrowTypesContext();
+    owned::Bool=false,
 ) =
     _hasarrowtypesextension(f, arrowtypes) ? _arrowtypescolumn(f, col, arrowtypes) :
-    _publiccolumn(f, _postconvertfield(f, col, arrowtypes.budget), arrowtypes.budget)
+    _publiccolumn(
+        f,
+        _postconvertfield(f, col, arrowtypes.budget),
+        arrowtypes.budget;
+        owned=owned,
+    )
 
 "Wire owner regions that a facade result retains for source lifetime control."
 function _sourceregions(s::IPCStream, budget=nothing)

@@ -3463,19 +3463,19 @@ function _bulkmaterialize(
     # The typed path serves unvalidated data too: subslice re-checks the
     # extraction window against the buffer's declared bounds.
     src = subslice(rolebuffer(d, DATA), checked_mul(d.offset, w), checked_mul(n, w))
-    vals = Vector{E}(undef, n)
-    if n > 0
-        GC.@preserve vals d begin
-            unsafe_copyto!(Ptr{UInt8}(pointer(vals)), sliceptr(src), Int(src.len))
-        end
-    end
     # The BITMAP is the validity authority, exactly as per-element access:
     # a caller-supplied null-count cache is only certified after semantic
     # validation, and this path explicitly serves unvalidated data.
     v = validitybuffer(d)
-    # When the claim admits no Missing, E === T, so `vals` already has the
-    # public element type and needs no copy.
+    # When the claim admits no Missing, E === T: one byte copy builds the
+    # public vector.
     if !(Missing <: T)
+        vals = Vector{E}(undef, n)
+        if n > 0
+            GC.@preserve vals d begin
+                unsafe_copyto!(Ptr{UInt8}(pointer(vals)), sliceptr(src), Int(src.len))
+            end
+        end
         if !isempty_buffer(v)
             for i = 1:n
                 isvalid_at(d, Int64(i)) || _typednullrefuse(f)
@@ -3483,8 +3483,18 @@ function _bulkmaterialize(
         end
         return vals
     end
+    # A Missing-admitting vector has no contiguous byte view to copy into, so
+    # load each value straight from the buffer (unsafe_load is unaligned-safe)
+    # instead of staging a Vector{E} copy first.
     out = Vector{T}(undef, n)
-    copyto!(out, vals)
+    if n > 0
+        GC.@preserve d begin
+            p = Ptr{E}(sliceptr(src))
+            @inbounds for i = 1:n
+                out[i] = unsafe_load(p, i)
+            end
+        end
+    end
     isempty_buffer(v) && return out
     for i = 1:n
         isvalid_at(d, Int64(i)) || (out[i] = missing)
