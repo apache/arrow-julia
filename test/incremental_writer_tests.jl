@@ -24,6 +24,7 @@ using Test
 using Dates
 using Tables
 using Arrow
+import DataAPI
 
 const AC = Arrow.ArrowCore
 
@@ -74,6 +75,48 @@ const AC = Arrow.ArrowCore
         parts = collect(Arrow.Stream(take!(io)))
         @test length(parts) == 2
         @test parts[2].a == [3, 4]
+    end
+
+    @testset "a zero-batch Stream keeps its schema when rewritten" begin
+        io = IOBuffer()
+        Arrow.Writer(io; file=false) do w
+            Arrow.write(w, (; a=Int64[], b=Union{Missing,String}[]))
+        end
+        bytes = take!(io)
+        # Drop the one empty record batch: schema message, then end-of-stream.
+        msgs = Arrow.framemessages(Arrow.ArrowCore.heapregion(bytes))
+        schemaend = msgs[1].body.offset + msgs[1].body.len
+        nobatches = vcat(bytes[1:schemaend], bytes[(end - 7):end])
+        @test isempty(collect(Arrow.Stream(nobatches)))
+
+        for file in (true, false)
+            out = IOBuffer()
+            Arrow.write(
+                out,
+                Arrow.Stream(nobatches);
+                file=file,
+                colmetadata=Dict(:a => ["k" => "v"]),
+            )
+            t = Arrow.Table(take!(out))
+            @test Tables.columnnames(t) == [:a, :b]
+            @test eltype(t.b) == Union{Missing,String}
+            @test DataAPI.colmetadata(t, :a, "k") == "v"
+        end
+
+        out = IOBuffer()
+        Arrow.Writer(out; file=false) do w
+            Arrow.write(w, Arrow.Stream(nobatches))
+            Arrow.write(w, t1)
+            Arrow.write(w, Arrow.Stream(nobatches))
+        end
+        @test Arrow.Table(take!(out)).a == [1, 2]
+
+        path = joinpath(mktempdir(), "s.arrow")
+        Arrow.write(path, t1; file=false)
+        Arrow.append(path, Arrow.Stream(nobatches))
+        @test Arrow.Table(path).a == [1, 2]
+
+        @test_throws ArgumentError Arrow.write(IOBuffer(), Tables.partitioner(NamedTuple[]))
     end
 
     @testset "writer metadata and colmetadata" begin

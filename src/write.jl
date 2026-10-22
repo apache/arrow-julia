@@ -246,13 +246,18 @@ function write(w::Writer, tbl)
     names, partcols, partpools, rowcounts = _collectparts(tbl)
     if w.st === nothing
         retained = _retainedschema(tbl)
-        fields, coldata = _constructcolumns(
-            names,
-            partcols,
-            partpools,
-            _retainedfieldfn(retained, names),
-            w.colmetadata,
-        )
+        fields, coldata = if isempty(partcols)
+            _schemaonly(retained, w.colmetadata)
+        else
+            _constructcolumns(
+                names,
+                partcols,
+                partpools,
+                _retainedfieldfn(retained, names),
+                w.colmetadata,
+            )
+        end
+        isempty(partcols) && (names = Symbol[Symbol(f.name) for f in fields])
         schmeta = _writermetadata(w.metadata, retained)
         sch = AC.Schema(fields; metadata=schmeta)
         st = beginwrite!(
@@ -269,6 +274,7 @@ function write(w::Writer, tbl)
             writebatch!(st, batch)
         end
     else
+        isempty(partcols) && return w
         names == w.names || throw(
             ArgumentError(
                 "table column names $(names) do not match this writer's " *
@@ -375,13 +381,18 @@ function _appendbytes(bytes::Vector{UInt8}, tbl; compress::Union{Nothing,Symbol}
     # end-of-stream marker when the stream has one, else at the end.
     keep = last(msgs).body.offset + last(msgs).body.len
     names, partcols, partpools, rowcounts = _collectparts(tbl)
-    length(names) == length(sch.fields) &&
-    all(j -> String(names[j]) == sch.fields[j].name, eachindex(names)) || throw(
-        ArgumentError(
-            "table column names $(names) do not match the existing stream's " *
-            "schema fields $([f.name for f in sch.fields]) (same names, same order)",
-        ),
-    )
+    namesmatch =
+        length(names) == length(sch.fields) &&
+        all(j -> String(names[j]) == sch.fields[j].name, eachindex(names))
+    # A partition-free source (a zero-batch Arrow.Stream) appends nothing.
+    isempty(partcols) ||
+        namesmatch ||
+        throw(
+            ArgumentError(
+                "table column names $(names) do not match the existing stream's " *
+                "schema fields $([f.name for f in sch.fields]) (same names, same order)",
+            ),
+        )
     fields, coldata =
         _constructcolumns(names, partcols, partpools, j -> sch.fields[j], nothing)
     batchsch = AC.Schema(fields; metadata=sch.metadata)
@@ -461,13 +472,17 @@ function _writebytes(
     end
     retained = _retainedschema(tbl)
     names, partcols, partpools, rowcounts = _collectparts(tbl)
-    fields, coldata = _constructcolumns(
-        names,
-        partcols,
-        partpools,
-        _retainedfieldfn(retained, names),
-        colmetadata,
-    )
+    fields, coldata = if isempty(partcols)
+        _schemaonly(retained, colmetadata)
+    else
+        _constructcolumns(
+            names,
+            partcols,
+            partpools,
+            _retainedfieldfn(retained, names),
+            colmetadata,
+        )
+    end
     schmeta = _writermetadata(metadata, retained)
     sch = AC.Schema(fields; metadata=schmeta)
     batches = _tablebatches(sch, coldata, rowcounts)
@@ -522,9 +537,26 @@ function _collectparts(tbl)
         end
         push!(rowcounts, n)
     end
-    isempty(partcols) &&
-        throw(ArgumentError("table has no partitions; cannot infer a schema"))
     return names, partcols, partpools, rowcounts
+end
+
+"""
+Fields for a source with no partitions. A zero-batch `Arrow.Stream` still
+carries its retained schema, so the output keeps that schema and has no
+record batches; any other partition-free source has no schema to write.
+"""
+function _schemaonly(retained, colmetadata)
+    retained === nothing &&
+        throw(ArgumentError("table has no partitions; cannot infer a schema"))
+    colmetamap = colmetadata === nothing ? nothing : Dict(colmetadata)
+    fields = AC.Field[]
+    for f in retained.fields
+        meta =
+            colmetamap === nothing ? nothing :
+            _metapairs(get(colmetamap, Symbol(f.name), nothing))
+        push!(fields, meta === nothing ? f : _withfieldmetadata(f, meta))
+    end
+    return fields, Vector{AC.ArrayData}[AC.ArrayData[] for _ in fields]
 end
 
 # Position is the only unambiguous identity for a retained field, because
