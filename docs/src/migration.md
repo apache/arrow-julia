@@ -193,6 +193,10 @@ one-time warning each and ignores them. As in Arrow 2.x, a column with a
 dictionary-encoded with its pool order and unused pool entries; values that
 need it, such as `CategoricalValue`s, unwrap through `DataAPI.unwrap`. Wrap
 any other column that needs dictionary encoding in [`Arrow.DictEncode`](@ref).
+[`Arrow.Writer`](@ref) writes ref-pool columns as their values, because every
+later table must reuse the first table's exact dictionary pool; wrap a column
+in `Arrow.DictEncode` to encode it there. `Arrow.append` to a stream column
+that is dictionary-encoded has the same exact-pool rule.
 
 Arrow 3.0 again consumes the ArrowTypes.jl mapping interface. Package authors
 should depend on and import ArrowTypes.jl directly. Define `ArrowType` and

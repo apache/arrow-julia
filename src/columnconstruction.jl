@@ -5440,7 +5440,8 @@ end
 
 # A column with a DataAPI ref pool (a PooledArray or CategoricalArray, say) is
 # written dictionary-encoded, as Arrow 2.x did: its pool, in pool order and
-# with unused entries, starts the Arrow dictionary.
+# with unused entries, starts the Arrow dictionary. `refpools=false` (the
+# incremental writer) writes such a column as its values instead.
 _hasrefpool(x::AbstractVector) =
     DataAPI.refpool(x) !== nothing &&
     DataAPI.refarray(x) !== x &&
@@ -5515,6 +5516,7 @@ function _constructcolumnparts(
     retained::Union{Nothing,AC.Field}=nothing,
     poolhints::Vector{Any}=Any[nothing for _ in parts],
     metadata::Union{Nothing,Vector{Pair{String,String}}}=nothing,
+    refpools::Bool=true,
 )
     isempty(parts) && throw(ArgumentError("column $name has no partitions"))
     length(poolhints) == length(parts) || throw(
@@ -5530,7 +5532,11 @@ function _constructcolumnparts(
     dictintent =
         (retained !== nothing && retained.type isa AC.DictionaryType) ||
         any(part isa DictEncode for part in parts) ||
-        (retained === nothing && any(_hasrefpool, parts))
+        (refpools && retained === nothing && any(_hasrefpool, parts))
+    # A ref-pool column written as its values still unwraps them.
+    if !dictintent && any(_hasrefpool, parts)
+        parts = AbstractVector[_hasrefpool(p) ? first(_refpoolvalues(p)) : p for p in parts]
+    end
 
     local field::AC.Field
     if dictintent

@@ -124,9 +124,10 @@ admits `Missing`, and later missing values under a non-nullable field are
 refused. To pin a schema explicitly, write a zero-row table with fully
 typed columns first.
 
-Dictionary-encoded columns: every later table may reuse the first
-table's exact pool (the same categories in the same first-appearance
-order). A CHANGED pool needs replacement dictionary batches, which the
+Dictionary-encoded columns: only `Arrow.DictEncode` columns are encoded
+here (a `PooledArray` or `CategoricalArray` column is written as its
+values), and every later table may reuse the first table's exact pool (the
+same categories in the same first-appearance order). A CHANGED pool needs replacement dictionary batches, which the
 schema message must declare up front: pass `dictreplacement=true`
 (stream format only) to declare it. The declaration is a demand on
 readers — strict ones such as nanoarrow refuse any stream declaring a
@@ -246,6 +247,8 @@ function write(w::Writer, tbl)
     names, partcols, partpools, rowcounts = _collectparts(tbl)
     if w.st === nothing
         retained = _retainedschema(tbl)
+        # Later tables must reuse the first table's exact dictionary pool,
+        # so only explicit DictEncode columns are encoded here.
         fields, coldata = if isempty(partcols)
             _schemaonly(retained, w.colmetadata)
         else
@@ -254,7 +257,8 @@ function write(w::Writer, tbl)
                 partcols,
                 partpools,
                 _retainedfieldfn(retained, names),
-                w.colmetadata,
+                w.colmetadata;
+                refpools=false,
             )
         end
         # The bounded facade interning rule, as when the source was read.
@@ -587,7 +591,8 @@ function _constructcolumns(
     partcols,
     partpools,
     retainedfield::F,
-    colmetadata,
+    colmetadata;
+    refpools::Bool=true,
 ) where {F}
     nparts = length(partcols)
     ncols = length(names)
@@ -604,6 +609,7 @@ function _constructcolumns(
             retained=retainedfield(j),
             poolhints=poolhints,
             metadata=_metapairs(columnmeta),
+            refpools=refpools,
         )
     end
     return fields, coldata
@@ -657,7 +663,7 @@ end
 
 function _freshcolumn(name::Symbol, parts)
     try
-        return _constructcolumn(name, parts)
+        return _constructcolumn(name, parts; refpools=false)
     catch err
         # The retained construction reports why this column cannot be written.
         err isa ArgumentError || rethrow()

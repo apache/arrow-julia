@@ -239,6 +239,17 @@ end
     t = Arrow.Table(Arrow.tobuffer((; w)))
     @test eltype(t.w) == String
     @test t.w == ["b", "a", "b"]
+    # Arrow.Writer encodes only DictEncode columns: independently pooled
+    # tables rarely share the exact pool that every later table must reuse.
+    io = IOBuffer()
+    Arrow.Writer(io) do writer
+        Arrow.write(writer, (; p=PooledArray(["a", "b", "a"]), w))
+        return Arrow.write(writer, (; p=PooledArray(["c", "c", "d"]), w))
+    end
+    t = Arrow.Table(take!(io))
+    @test !any(f -> f.type isa AC.DictionaryType, getfield(t, :schema).fields)
+    @test t.p == ["a", "b", "a", "c", "c", "d"]
+    @test t.w == ["b", "a", "b", "b", "a", "b"]
     # A struct whose fields cannot be written names the column and type.
     err = @test_throws ArgumentError Arrow.tobuffer((; x=[CompatHasPtr(C_NULL)]))
     @test occursin("column x holds", err.value.msg)

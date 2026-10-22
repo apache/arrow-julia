@@ -439,7 +439,9 @@ A column with a `DataAPI.refpool`, such as a `PooledArray` or a
 `CategoricalArray`, is written dictionary-encoded without the wrapper. Its
 pool, in pool order and including unused entries, starts the Arrow dictionary.
 Pool values that are wrappers without an ArrowTypes.jl mapping, such as
-`CategoricalValue`, are written through `DataAPI.unwrap`.
+`CategoricalValue`, are written through `DataAPI.unwrap`. [`Arrow.Writer`](@ref)
+writes ref-pool columns as their values and encodes only `Arrow.DictEncode`
+columns, since every later table must reuse the first table's exact pool.
 
 Reading a dictionary-encoded column resolves the indices: the column comes
 back as its value type. When a `Table` read from Arrow is written again,
