@@ -66,6 +66,10 @@ writer, validation, scan, and C interface engines.
   declaration. Dictionary deltas are read in streams and files, including scans;
   each stream record batch retains its dictionary snapshot.
 - Big-endian IPC is rejected.
+- Reading a stored time of day outside the format's [0, 24 h) range, or a
+  decimal coefficient outside its field's declared precision, throws
+  `Arrow.ValidationError`. Arrow 2.x wrapped such times modulo 24 hours and
+  read such decimals unchecked.
 - Arrow 3.0 requires ArrowTypes.jl 2.x, Tables.jl 1.14 (the first release
   with `Tables.Scan`), DataStrings.jl 1.0, DataDecimals.jl 1.0, and
   Durations.jl 1.4 (`Timestamp` and `ZonedTimestamp`).
