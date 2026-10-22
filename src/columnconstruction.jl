@@ -4645,6 +4645,14 @@ function _constructretainedpart(
     return AC.Field(f.name, t; nullable=f.nullable, metadata=_fieldmetadata(f)), d
 end
 
+# Writer-side element types that a retained descriptor's per-value lowering
+# converts exactly, beyond its public type: a written `DateTime` (or another
+# date-time) column under a timestamp, any `AbstractString` under a string.
+_retainedwritertype(::AC.TimestampType, ::Type{T}) where {T} = T <: Dates.AbstractDateTime
+_retainedwritertype(::AC.Utf8Type, ::Type{T}) where {T} = T <: AbstractString
+_retainedwritertype(t::AC.ViewType, ::Type{T}) where {T} = t.utf8 && T <: AbstractString
+_retainedwritertype(::AC.ArrowType, ::Type) = false
+
 function _checkretainedidentity(f::AC.Field, t::AC.ArrowType, v::AbstractVector)
     # Identity FIRST, for every retained field with a known facade type:
     # a replaced column is rejected on its declared element type before any
@@ -4654,6 +4662,7 @@ function _checkretainedidentity(f::AC.Field, t::AC.ArrowType, v::AbstractVector)
         NT = Base.nonmissingtype(eltype(v))
         NT <: Fp ||
             NT === Union{} ||
+            _retainedwritertype(t, NT) ||
             throw(
                 ArgumentError(
                     "column $(f.name) holds $(NT) values, but its retained Arrow " *

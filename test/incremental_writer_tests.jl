@@ -164,6 +164,57 @@ const AC = Arrow.ArrowCore
         @test isequal(t.a, [missing, 2])
     end
 
+    @testset "later tables take the first table's Julia value types" begin
+        # Later tables are built like later partitions of one eager write, so
+        # writer values the retained public domain does not use still conform.
+        cols = (;
+            dt=[DateTime(2026), DateTime(2027)],
+            s=[SubString("ab", 1, 1), SubString("ab", 2, 2)],
+            nt=[(a=1, b="x"), (a=2, b="y")],
+            tup=[(1, 2), (3, 4)],
+            d=[Dict("k" => 1), Dict("k" => 2)],
+        )
+        for file in (true, false)
+            io = IOBuffer()
+            Arrow.Writer(io; file=file) do w
+                Arrow.write(w, cols)
+                return Arrow.write(w, cols)
+            end
+            @test take!(io) ==
+                  Arrow._writebytes(Tables.partitioner([cols, cols]); file=file)
+        end
+        path = joinpath(mktempdir(), "values.arrow")
+        Arrow.write(path, cols; file=false)
+        Arrow.append(path, cols)
+        t = Arrow.Table(path)
+        @test t.dt == repeat(cols.dt, 2)
+        @test t.s == ["a", "b", "a", "b"]
+        # A non-conforming later table names the difference.
+        io = IOBuffer()
+        w = Arrow.Writer(io)
+        Arrow.write(w, (; nt=[(a=1, b="x")]))
+        err = @test_throws ArgumentError Arrow.write(w, (; nt=[(b="x", a=1)]))
+        @test occursin("does not conform", err.value.msg)
+        close(w)
+    end
+
+    @testset "append DateTime values to an Arrow 2.x labelled timestamp" begin
+        # Arrow 2.x labelled every DateTime column JuliaLang.DateTime; fresh
+        # DateTime values lower exactly into the retained descriptor.
+        ms = AC.TimestampType(AC.MILLISECOND, nothing)
+        meta = [
+            "ARROW:extension:name" => "JuliaLang.DateTime",
+            "ARROW:extension:metadata" => "",
+        ]
+        f = AC.Field("dt", ms; nullable=true, metadata=meta)
+        d = AC.ArrayData(ms, 1, [AC.BufferSlice(), AC._databuffer(Int64[0])]; nullcount=0)
+        sch = AC.Schema([f])
+        path = joinpath(mktempdir(), "dt.arrow")
+        write(path, Arrow.writestream(sch, [AC.RecordBatch(sch, [d])]))
+        Arrow.append(path, (; dt=[DateTime(2026, 1, 2, 3)]))
+        @test Arrow.Table(path).dt == [DateTime(1970), DateTime(2026, 1, 2, 3)]
+    end
+
     @testset "stream format replaces dictionary pools across writes" begin
         # Replacement must be opted into: the declaration is a demand on
         # readers, so the default writer refuses a changed pool instead.

@@ -283,8 +283,7 @@ function write(w::Writer, tbl)
             ),
         )
         sch = w.schema::AC.Schema
-        fields, coldata =
-            _constructcolumns(names, partcols, partpools, j -> sch.fields[j], nothing)
+        fields, coldata = _constructconforming(names, partcols, partpools, sch, tbl)
         # A fresh Schema over the BUILT fields, so `writebatch!` re-checks
         # them against the writer's schema instead of trusting construction.
         batchsch = AC.Schema(fields; metadata=sch.metadata)
@@ -394,8 +393,7 @@ function _appendbytes(bytes::Vector{UInt8}, tbl; compress::Union{Nothing,Symbol}
                 "schema fields $([f.name for f in sch.fields]) (same names, same order)",
             ),
         )
-    fields, coldata =
-        _constructcolumns(names, partcols, partpools, j -> sch.fields[j], nothing)
+    fields, coldata = _constructconforming(names, partcols, partpools, sch, tbl)
     batchsch = AC.Schema(fields; metadata=sch.metadata)
     io = IOBuffer()
     st = resumestream!(
@@ -609,6 +607,103 @@ function _constructcolumns(
         )
     end
     return fields, coldata
+end
+
+# Construct the columns of a table that must conform to an existing schema:
+# a later `Arrow.Writer` table or an `Arrow.append` table. A facade source
+# (`Arrow.Table`, `Arrow.Stream`) holds public values, which the retained
+# construction lowers. Any other source holds writer values (`DateTime`,
+# `NamedTuple` rows, tuples, `Dict`s, any `AbstractString`): build each such
+# column the way an eager write builds a later partition and use it when it
+# conforms to the schema field. Dictionary columns keep the retained
+# construction, which continues the existing pool, and so does a column whose
+# own mapping differs from the field, such as an all-missing column.
+function _constructconforming(names, partcols, partpools, sch::AC.Schema, tbl)
+    retainedfield = j -> sch.fields[j]
+    _retainedschema(tbl) === nothing ||
+        return _constructcolumns(names, partcols, partpools, retainedfield, nothing)
+    nparts = length(partcols)
+    fields = Vector{AC.Field}(undef, length(names))
+    coldata = Vector{Vector{AC.ArrayData}}(undef, length(names))
+    for j in eachindex(names)
+        expected = sch.fields[j]
+        parts = AbstractVector[partcols[k][j] for k = 1:nparts]
+        fresh =
+            expected.type isa AC.DictionaryType ? nothing : _freshcolumn(names[j], parts)
+        mismatch =
+            fresh === nothing ? nothing : _conformancemismatch(expected, first(fresh))
+        if fresh !== nothing && mismatch === nothing
+            fields[j], coldata[j] = expected, last(fresh)
+            continue
+        end
+        poolhints = Any[pools === nothing ? nothing : pools[j] for pools in partpools]
+        try
+            fields[j], coldata[j] =
+                _constructcolumn(names[j], parts; retained=expected, poolhints=poolhints)
+        catch err
+            # Report the schema difference of a column the writer mapping could
+            # build instead of the retained construction's value-domain error.
+            (err isa ArgumentError && mismatch !== nothing) || rethrow()
+            throw(
+                ArgumentError(
+                    "column $(names[j]) does not conform to the existing schema: " *
+                    mismatch,
+                ),
+            )
+        end
+    end
+    return fields, coldata
+end
+
+function _freshcolumn(name::Symbol, parts)
+    try
+        return _constructcolumn(name, parts)
+    catch err
+        # The retained construction reports why this column cannot be written.
+        err isa ArgumentError || rethrow()
+        return nothing
+    end
+end
+
+"""
+Why data built for `actual` is not valid under `expected`, or `nothing`. Valid
+data has equal descriptors, child names, and extension types at every level,
+with nullability only widened. Nested metadata must match; the top-level user
+metadata is `expected`'s.
+"""
+function _conformancemismatch(
+    expected::AC.Field,
+    actual::AC.Field;
+    path::String=expected.name,
+    top::Bool=true,
+)
+    expected.name == actual.name || return "$path is named $(repr(actual.name))"
+    AC.typeequal(expected.type, actual.type) ||
+        return "$path maps to $(repr(actual.type)) where the schema has " *
+               repr(expected.type)
+    actual.nullable &&
+        !expected.nullable &&
+        return "$path admits missing values but the schema field is non-nullable"
+    _arrowtypesextension(expected) == _arrowtypesextension(actual) ||
+        return "$path has a different extension type than the schema field"
+    top ||
+        something(_fieldmetadata(expected), Pair{String,String}[]) ==
+        something(_fieldmetadata(actual), Pair{String,String}[]) ||
+        return "$path has different field metadata than the schema"
+    length(expected.children) == length(actual.children) ||
+        return "$path has $(length(actual.children)) children where the schema has " *
+               "$(length(expected.children))"
+    for i in eachindex(expected.children)
+        child = expected.children[i]
+        mismatch = _conformancemismatch(
+            child,
+            actual.children[i];
+            path="$path.$(child.name)",
+            top=false,
+        )
+        mismatch === nothing || return mismatch
+    end
+    return nothing
 end
 
 function _tablebatches(sch::AC.Schema, coldata, rowcounts)
