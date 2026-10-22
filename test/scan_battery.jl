@@ -1829,6 +1829,30 @@ end
     @assert _statfold(nf, nd) == (2, "p", "p")
     println("nested REE/view statistics fold logical nulls and String bounds ✓")
 
+    # A union has no validity bitmap: its nulls live in the selected child. A
+    # physical null count of 0 would let `isnull` prune the batch holding them.
+    uio = IOBuffer()
+    Arrow.write(
+        uio,
+        Tables.partitioner([
+            (u=Union{Missing,Int64,String}[1, missing, "a"], k=[1, 2, 3]),
+            (u=Union{Missing,Int64,String}[2, "b"], k=[4, 5]),
+        ]);
+        file=false,
+    )
+    usource = readstream(take!(uio))
+    @assert _statfold(usource.schema.fields[1], usource.batches[1].columns[1]) ==
+            (1, nothing, nothing)
+    ubytes = statsfile(usource.schema, usource.batches)
+    unull = Tables.Scan(select=(:k,), filter=Tables.isnull(Tables.col(:u)))
+    for got in (
+        Arrow.Table(copy(ubytes); scan=unull),
+        Arrow.Table(BytesSource(copy(ubytes)); scan=unull),
+    )
+        @assert got.k == [2]
+    end
+    println("union statistics count child nulls logically ✓")
+
     # Request-plan proof: x > 7 prunes batch 1, so its block metadata and body
     # add no dedicated ranges. This fixture's request log also excludes its
     # indexed bytes.

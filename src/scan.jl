@@ -2742,9 +2742,10 @@ prune on it.
 function _statfold(f::Field, d::ArrayData)
     t = f.type
     # Statistics describe storage-domain values: dictionary columns fold through
-    # their pools, and REE columns fold through their values child — the REE
-    # parent's physical null count is always 0 (spec), so its logical null
-    # count must be derived or `isnull` pruning would drop real nulls.
+    # their pools, and REE columns fold through their values child. REE and
+    # union parents have no validity bitmap (their physical null count is
+    # always 0, per spec), so their logical null count must be derived or
+    # `isnull` pruning would drop real nulls.
     statfield = f
     stat = t
     while stat isa DictionaryType || stat isa RunEndEncodedType
@@ -2756,7 +2757,7 @@ function _statfold(f::Field, d::ArrayData)
             stat = statfield.type
         end
     end
-    nc = if t isa DictionaryType || t isa RunEndEncodedType
+    nc = if t isa Union{DictionaryType,RunEndEncodedType,UnionType}
         count(i -> ismissing(AC.getvalue(f, d, i)), 1:(d.len))
     else
         AC.nullcount(d)
