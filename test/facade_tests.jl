@@ -1115,6 +1115,26 @@ end
         Arrow.write(io, t; file=false)
         t2 = Arrow.Table(take!(io))
         @test Tables.rowcount(t2) == 3
+        @test length(t2) == 0
+        @test isempty(collect(t2))
+    end
+
+    @testset "Table iterates its columns like other Tables.AbstractColumns" begin
+        # length counts columns, so iteration, values, and end indexing see
+        # every column exactly once whatever the row count.
+        t = Arrow.Table(Arrow.tobuffer((a=Int64[1, 2, 3, 4], b=["w", "x", "y", "z"])))
+        @test length(t) == 2
+        @test Tables.rowcount(t) == 4
+        @test collect(t) == [[1, 2, 3, 4], ["w", "x", "y", "z"]]
+        @test values(t) == collect(t)
+        @test t[end] == ["w", "x", "y", "z"]
+        wide = Arrow.Table(Arrow.tobuffer((a=Int64[1], b=["x"], c=[1.5])))
+        @test length(collect(wide)) == 3
+        @test [c[1] for c in wide] == Any[1, "x", 1.5]
+        empty = Arrow.Table(Arrow.tobuffer((a=Int64[],)))
+        @test length(empty) == 1
+        @test !isempty(empty)
+        @test Tables.rowcount(empty) == 0
     end
 
     @testset "DataAPI defaults and selectors" begin

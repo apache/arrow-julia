@@ -232,7 +232,6 @@ end
 Base.propertynames(t::Table) = getfield(t, :names)
 Base.getproperty(t::Table, nm::Symbol) = Tables.getcolumn(t, nm)
 Tables.rowcount(t::Table) = getfield(t, :nrows)
-Base.length(t::Table) = getfield(t, :nrows)
 
 DataAPI.metadatasupport(::Type{Table}) = (read=true, write=false)
 DataAPI.colmetadatasupport(::Type{Table}) = (read=true, write=false)

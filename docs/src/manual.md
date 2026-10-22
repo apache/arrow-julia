@@ -65,7 +65,7 @@ Tables.columnnames(tbl)                    # [:a, :b]
 Tables.schema(tbl)
 tbl.a                                      # property access = a column
 Tables.getcolumn(tbl, :b)
-length(tbl)                                # number of rows
+Tables.rowcount(tbl)                       # number of rows
 ```
 
 Pass `tbl` directly to any Tables.jl-compatible sink.
