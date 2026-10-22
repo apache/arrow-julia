@@ -257,7 +257,8 @@ function write(w::Writer, tbl)
                 w.colmetadata,
             )
         end
-        isempty(partcols) && (names = Symbol[Symbol(f.name) for f in fields])
+        # The bounded facade interning rule, as when the source was read.
+        isempty(partcols) && (names = _fieldnamesymbols(fields))
         schmeta = _writermetadata(w.metadata, retained)
         sch = AC.Schema(fields; metadata=schmeta)
         st = beginwrite!(
@@ -548,12 +549,14 @@ record batches; any other partition-free source has no schema to write.
 function _schemaonly(retained, colmetadata)
     retained === nothing &&
         throw(ArgumentError("table has no partitions; cannot infer a schema"))
-    colmetamap = colmetadata === nothing ? nothing : Dict(colmetadata)
+    # Match colmetadata by name without interning the source's field names.
+    colmetamap =
+        colmetadata === nothing ? nothing :
+        Dict(String(k) => v for (k, v) in Dict(colmetadata))
     fields = AC.Field[]
     for f in retained.fields
         meta =
-            colmetamap === nothing ? nothing :
-            _metapairs(get(colmetamap, Symbol(f.name), nothing))
+            colmetamap === nothing ? nothing : _metapairs(get(colmetamap, f.name, nothing))
         push!(fields, meta === nothing ? f : _withfieldmetadata(f, meta))
     end
     return fields, Vector{AC.ArrayData}[AC.ArrayData[] for _ in fields]

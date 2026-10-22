@@ -117,6 +117,15 @@ const AC = Arrow.ArrowCore
         @test Arrow.Table(path).a == [1, 2]
 
         @test_throws ArgumentError Arrow.write(IOBuffer(), Tables.partitioner(NamedTuple[]))
+
+        # The Writer interns the schema's names under the facade's bounds.
+        longsch = Arrow.ArrowCore.Schema([
+            Arrow.ArrowCore.Field("x"^5000, Arrow.ArrowCore.IntType(64, true)),
+        ])
+        longbytes = Arrow.writestream(longsch, Arrow.ArrowCore.RecordBatch[])
+        @test_throws Arrow.ValidationError Arrow.Writer(IOBuffer(); file=false) do w
+            Arrow.write(w, Arrow.Stream(longbytes))
+        end
     end
 
     @testset "writer metadata and colmetadata" begin
