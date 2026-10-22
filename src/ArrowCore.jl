@@ -3664,11 +3664,23 @@ function _build_nullable_primitive(name, v::Vector{T}; nullable::Bool=true) wher
     end
     S === Bool && return _build_bool(name, v; nullable=nullable)
     t = arrowtype_for(S)
-    present = [x !== missing for x in v]
-    validity = _bitmapbuffer(present)
-    vals = S[x === missing ? zero(S) : S(x) for x in v]
+    # One pass fills the values and the validity bitmap.
+    n = length(v)
+    vals = Vector{S}(undef, n)
+    bits = zeros(UInt8, expected_validity_bytes(Int64(n)))
+    nc = 0
+    for i = 1:n
+        x = v[i]
+        if x === missing
+            nc += 1
+            vals[i] = zero(S)
+        else
+            vals[i] = S(x)
+            _setbitmapbit!(bits, i)
+        end
+    end
+    validity = nc == 0 ? BufferSlice() : BufferSlice(heapregion(bits), 0, length(bits))
     data = _databuffer(vals)
-    nc = count(!, present)
     # Nullability is the DECLARED element type's, not the observed count's:
     # a Union{Missing,T} column with no missing values is still nullable.
     return Field(name, t; nullable=nullable),
