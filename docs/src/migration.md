@@ -324,8 +324,9 @@ prior Arrow.jl release read by interning its payload can now fail.
 
 Arrow 3.0 uses DataAPI.jl metadata methods. `Arrow.getmetadata(table)`
 remains as a compatibility method over them, returning the table's key-value
-metadata as a `Dict{String,String}` or `nothing`. The Arrow 2.x per-column
-form `getmetadata(column)` is gone — columns are plain vectors — so use
+metadata as a `Dict{String,String}` or `nothing`. As in Arrow 2.x, every
+other object returns `nothing`. Columns are plain vectors, so the Arrow 2.x
+per-column form `getmetadata(column)` also returns `nothing`; use
 `DataAPI.colmetadata` instead. Add DataAPI.jl as a direct dependency of code
 that imports it:
 

@@ -55,8 +55,8 @@ writer, validation, scan, and C interface engines.
   automatically.
 - The DataAPI.jl metadata interface replaces the Arrow 2.x metadata
   accessors. `Arrow.getmetadata(table)` remains as a compatibility method
-  over it; the per-column `getmetadata(column)` form is gone because columns
-  are plain vectors — use `DataAPI.colmetadata` instead.
+  over it. Columns are plain vectors, so `getmetadata(column)` returns
+  `nothing` — use `DataAPI.colmetadata` instead.
 - The package now has a narrow export surface. Use names such as
   `Arrow.Table`, `Arrow.Stream`, `Arrow.write`, and `Arrow.DictEncode` through
   the `Arrow` namespace. Only `release!` and `ArrowTypes` are exported.

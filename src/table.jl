@@ -314,32 +314,27 @@ function DataAPI.colmetadata(
 end
 
 """
-    Arrow.getmetadata(t::Arrow.Table)
+    Arrow.getmetadata(x)
 
-Compatibility form of the Arrow 2.x metadata accessor: the table-level
-key-value metadata as a `Dict{String,String}`, or `nothing` when the table
-has none. New code should prefer the DataAPI.jl interface
+Compatibility form of the Arrow 2.x metadata accessor. For an `Arrow.Table`,
+returns the table-level key-value metadata as a `Dict{String,String}`, or
+`nothing` when the table has none. Every other object returns `nothing`,
+including other Tables.jl tables, so `metadata=Arrow.getmetadata(table)` works
+for any `Arrow.write` input. New code should prefer the DataAPI.jl interface
 (`DataAPI.metadata`, `DataAPI.metadatakeys`), which `Arrow.Table` supports.
 
-Arrow 2.x also accepted a column; Arrow 3.0 columns are plain Julia vectors
-and carry no metadata, so use
-`DataAPI.colmetadata(table, column, key)`/`DataAPI.colmetadatakeys(table)`
-for per-column metadata instead.
+Arrow 3.0 columns are plain Julia vectors, so a column also returns `nothing`;
+use `DataAPI.colmetadata(table, column, key)`/`DataAPI.colmetadatakeys(table)`
+for per-column metadata.
 """
 function getmetadata(t::Table)
     sch = getfield(t, :schema)
     (sch === nothing || sch.metadata === nothing || isempty(sch.metadata)) && return nothing
     return Dict{String,String}(String(first(kv)) => String(last(kv)) for kv in sch.metadata)
 end
-function getmetadata(::AbstractVector)
-    throw(
-        ArgumentError(
-            "Arrow 3.0 columns are plain Julia vectors and carry no " *
-            "per-column metadata; use DataAPI.colmetadata(table, column, key) " *
-            "or DataAPI.colmetadatakeys(table) instead",
-        ),
-    )
-end
+# Arrow 2.x returned `nothing` for every non-Arrow object; a row table such as
+# a `Vector` of records is indistinguishable from a column here.
+getmetadata(::Any) = nothing
 
 """
     Arrow.release!(t::Union{Table,Stream})

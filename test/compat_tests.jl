@@ -45,7 +45,11 @@ const AC = Arrow.ArrowCore
         Arrow.write(io, tbl)
         bare = Arrow.Table(take!(io))
         @test Arrow.getmetadata(bare) === nothing
-        @test_throws ArgumentError Arrow.getmetadata(bare.a)
+        # Arrow 2.x returned `nothing` for any other object; callers pass
+        # `metadata=Arrow.getmetadata(table)` for arbitrary write inputs.
+        @test Arrow.getmetadata(bare.a) === nothing
+        @test Arrow.getmetadata([(a=1,), (a=2,)]) === nothing
+        @test Arrow.getmetadata(tbl) === nothing
     end
 
     @testset "tobuffer emits the stream format" begin
