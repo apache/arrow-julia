@@ -1937,7 +1937,15 @@ function _narrowabstractwriterparts(name::String, parts, context::_WriterContext
         end
     end
     isempty(observed) && return nothing
-    needsruntime || return nothing
+    if !needsruntime
+        # Rows of an abstract NamedTuple column (some fields missing in some
+        # rows, say) share one concrete row type once widened field by field.
+        logical <: NamedTuple || return nothing
+        rowtype = _widenednamedtuple(observed)
+        rowtype === nothing && return nothing
+        nullable && (rowtype = Union{Missing,rowtype})
+        return AbstractVector[collect(rowtype, part) for part in parts]
+    end
     for runtime in observed
         _writerregisterinferredtype!(
             context,
@@ -1949,6 +1957,14 @@ function _narrowabstractwriterparts(name::String, parts, context::_WriterContext
     storagetype = _writeruniontype(observed)
     nullable && (storagetype = Union{Missing,storagetype})
     return AbstractVector[collect(storagetype, part) for part in parts]
+end
+
+"The field-wise Union of same-named NamedTuple row types, or nothing."
+function _widenednamedtuple(observed)
+    names = fieldnames(first(observed))
+    all(T -> T <: NamedTuple && fieldnames(T) === names, observed) || return nothing
+    types = ntuple(i -> Union{(fieldtype(T, i) for T in observed)...}, length(names))
+    return NamedTuple{names,Tuple{types...}}
 end
 
 "One whole-column plan for an ArrowTypes mapping whose storage needs values."

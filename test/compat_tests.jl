@@ -130,6 +130,17 @@ end
         @test t.c == [[(a=1.0, b="x")], [(a=2.0, b="y"), (a=3.0, b="z")]]
     end
 
+    @testset "abstract NamedTuple columns widen field by field" begin
+        # Rows whose fields are missing in some rows have different concrete
+        # types; Arrow 2.x wrote them as one Struct, and so does 3.0.
+        v = [(a=isodd(i) ? missing : i, b=isodd(i) ? "x$i" : missing) for i = 1:4]
+        @test !isconcretetype(eltype(v))
+        W = @NamedTuple{a::Union{Missing,Int64}, b::Union{Missing,String}}
+        t = Arrow.Table(Arrow.tobuffer((; v)); scan=Tables.Scan(select=(:v => W,)))
+        @test eltype(t.v) == W
+        @test isequal(t.v, v)
+    end
+
     @testset "field-name mismatch errors" begin
         Bad = NamedTuple{(:a, :wrong),Tuple{Float64,String}}
         @test_throws ArgumentError Arrow.Table(bytes; scan=Tables.Scan(select=(:c => Bad,)))
