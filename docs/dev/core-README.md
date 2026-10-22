@@ -360,7 +360,10 @@ ordinary export root, producer-side failures surface through
 until replaced or released), and the stream's own root drops at its release
 callback. `from_c_stream` moves a producer's stream, reads the schema once,
 pulls batches whose trees each own one `ForeignOwner`, and surfaces
-producer errors as exceptions carrying the producer's message. Stream
+producer errors as exceptions carrying the producer's message. Each batch
+column is its struct child's visible window (struct offsets and longer
+children are honored); a batch with null struct rows is refused, since a
+record batch has no row validity. Stream
 callbacks call into Julia, so they are legal only from Julia-attached
 threads and calls on one stream must not overlap (the C stream spec itself
 declares the structure not thread-safe).

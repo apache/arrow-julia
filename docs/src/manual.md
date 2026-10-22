@@ -726,7 +726,9 @@ converts imported column data back to a Julia vector.
   them and `Arrow.reap!()` reclaims the export.
 * `Arrow.export_stream!(streamptr, schema, batches)` fills a caller-owned
   `ArrowArrayStream`; `Arrow.from_c_stream(streamptr)` imports one and
-  yields record batches through `Arrow.nextbatch!`.
+  yields record batches through `Arrow.nextbatch!`. A producer batch whose
+  struct array has null rows is refused with `Arrow.ValidationError`: a
+  record batch has no row validity.
 
 `copy(data::Arrow.ArrayData)` copies all declared buffer slices, children,
 and dictionary values into Julia-owned byte arrays. It preserves the physical
