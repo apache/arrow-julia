@@ -782,6 +782,33 @@ function cdata_battery()
     @assert reap!() == 2
     println("moved (released) source cannot be imported twice ✓")
 
+    # Re-exporting an import lends the producer's memory to a new consumer.
+    # `release!` on the import revokes Julia access at once but must not free
+    # that memory under the consumer: the producer release waits for the
+    # re-export to be released and reaped.
+    lbefore = _registry_count()
+    lf, ld = fromjulia("lent", Int64[1, 2, 3])
+    lsp, lap = to_c_data(lf, ld)
+    lf2, ld2 = from_c_data(lsp, lap)
+    lent = ld2.owner::ForeignOwner
+    rsp, rap = to_c_data(lf2, ld2)
+    release!(lent)
+    @assert try
+        materialize(lf2, ld2)
+        false
+    catch e
+        e isa InvalidStateException
+    end
+    reap!()
+    @assert !(@atomic lent.released)
+    _call_release(rsp)
+    _call_release(rap)
+    reap!()
+    @assert (@atomic lent.released)
+    reap!()
+    @assert _registry_count() == lbefore
+    println("released imports stay valid while a re-export lends them out ✓")
+
     # Schema cleanup is installed before owner construction. If construction
     # fails, the array remains with its source while the schema is released.
     cf, cd = fromjulia("owner-construction", Int64[1])

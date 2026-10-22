@@ -721,6 +721,9 @@ converts imported column data back to a Julia vector.
   reachable; `Arrow.release!` on the import's `ForeignOwner` (or on the
   owner region behind any imported buffer, `buffer.region`) revokes every
   imported buffer and runs the producer's release callback exactly once.
+  If `Arrow.to_c_data` or `Arrow.export_stream!` lent those buffers to
+  another consumer, the producer release waits until that consumer releases
+  them and `Arrow.reap!()` reclaims the export.
 * `Arrow.export_stream!(streamptr, schema, batches)` fills a caller-owned
   `ArrowArrayStream`; `Arrow.from_c_stream(streamptr)` imports one and
   yields record batches through `Arrow.nextbatch!`.

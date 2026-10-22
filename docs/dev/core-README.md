@@ -151,7 +151,9 @@ Exactly-once release lives in the adapters' owners: the C-data
 `ForeignOwner` and C-stream `StreamOwner` carry one `@atomic` flag each, a
 finalizer, and an explicit `release!`; their revocation cells route through
 the same flag. The export registries root exported columns and streams until
-the consumer releases them and cleanup drops the root.
+the consumer releases them and cleanup drops the root. An export of imported
+data pins its `ForeignOwner`: `release!` still revokes Julia access at once,
+but the producer release waits until the last pinning export is reaped.
 
 ## Scope and limits, layer by layer
 

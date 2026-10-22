@@ -342,6 +342,7 @@ mutable struct ExportedRoot
     remaining::Int64           # exported C nodes whose callback has not run
     schema_topology::Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}
     array_topology::Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}
+    pinned::Vector{Any}         # ForeignOwners whose memory this export lends out
 end
 
 const EXPORT_REGISTRY = Dict{Int64,ExportedRoot}()
@@ -727,6 +728,9 @@ function _export_array!(
         _malloc!(root, AC.checked_mul(Int64(max(nbuf, 1)), Int64(sizeof(Ptr)))),
     )
     for (i, b) in enumerate(d.buffers)
+        # Pin before `sliceptr` checks revocation: a racing `release!` then
+        # either revokes first (the export fails) or defers to this export.
+        _pin_foreign!(root, b)
         role = i <= length(spec.buffers) ? spec.buffers[i] : AC.DATA
         bufferp =
             if role == AC.OFFSETS && d.len == 0 && d.offset == 0 && AC.isempty_buffer(b)
@@ -842,14 +846,45 @@ function to_c_data(f::Field, d::ArrayData)
 end
 
 function _free_export!(root::ExportedRoot)
-    # After a root is claimed, cleanup only drops Julia references and frees
-    # tracked mallocs. There is no fallible ownership transition to retry.
+    # After a root is claimed, cleanup drops Julia references, frees tracked
+    # mallocs, and returns its pins, which can run a deferred producer
+    # release. Nothing here is retried.
     empty!(root.schema_topology)
     empty!(root.array_topology)
     while !isempty(root.mallocs)
         Libc.free(pop!(root.mallocs))
     end
     empty!(root.roots)
+    _unpin_foreign!(root)
+    return nothing
+end
+
+# An exported buffer of a C Data import lends the producer's memory: pin its
+# owner so `release!` defers the producer release until this export is reaped.
+function _pin_foreign!(root::ExportedRoot, b::BufferSlice)
+    region = b.region
+    region === nothing && return nothing
+    o = region.root
+    (o isa ForeignOwner && !any(x -> x === o, root.pinned)) || return nothing
+    _lend!(o, 2)
+    push!(root.pinned, o)
+    return nothing
+end
+
+# Return this export's pins; the last one runs a producer release that
+# `release!` deferred while the memory was lent out.
+function _unpin_foreign!(root::ExportedRoot)
+    err = nothing
+    while !isempty(root.pinned)
+        o = pop!(root.pinned)::ForeignOwner
+        _lend!(o, -2) == 1 || continue
+        try
+            _release_foreign_owner!(o, Libc.free)
+        catch e
+            err === nothing && (err = e)
+        end
+    end
+    err === nothing || throw(err)
     return nothing
 end
 
@@ -933,6 +968,7 @@ function _newroot(build, roots::Vector{Any}; result_slot=nothing, key_slot=nothi
         0,
         Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}(),
         Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}(),
+        Any[],
     )::ExportedRoot
     try
         # The pointer cannot escape before `build` returns. Keep the root
@@ -964,7 +1000,17 @@ end
 function _release_owner_action(p::Ptr{Cvoid})::Cvoid
     slot = unsafe_pointer_to_objref(p)::Base.RefValue{Any}
     x = slot[]
-    x === nothing || _release_foreign_owner!(x::ForeignOwner, Libc.free)
+    x === nothing && return nothing
+    o = x::ForeignOwner
+    # While C Data exports lend this memory out, mark the release deferred:
+    # the export whose reap returns the last pin runs it.
+    while true
+        lent = @atomic o.lent
+        lent < 2 && break
+        _, ok = @atomicreplace o.lent lent => (lent | 1)
+        ok && return nothing
+    end
+    _release_foreign_owner!(o, Libc.free)
     return nothing
 end
 
@@ -973,7 +1019,9 @@ One owner for one MOVED ArrowArray tree. All `BufferSlice`s from the whole
 tree — children and dictionary — use regions whose `root` is this object.
 The tree therefore outlives every slice, and the C release callback runs
 exactly once, from `release!` or from the GC finalizer, whichever comes
-first.
+first. While a `to_c_data` or `export_stream!` export lends this tree's
+memory to a consumer, `release!` still revokes Julia access at once, and the
+reap of the last such export runs the producer release.
 
 The malloc'd copy of the moved struct mirrors the C Data convention for its
 own state: its release field is NULL (inert) until the move commits, and the
@@ -993,6 +1041,9 @@ mutable struct ForeignOwner
     # lifetime). `release!` revokes through the cell, whose action runs the
     # producer release — exactly-once against the GC-finalizer path.
     const cell::AC.ReleaseCell
+    # Twice the number of live C Data exports lending this memory out, plus
+    # one once `release!` has deferred the producer release to them.
+    @atomic lent::Int
     function ForeignOwner(arr::CArrowArray, registerfinalizer)
         block = Libc.malloc(sizeof(CArrowArray))
         block == C_NULL && throw(OutOfMemoryError())
@@ -1006,7 +1057,7 @@ mutable struct ForeignOwner
         o = try
             unsafe_store!(p, arr)
             _store_field!(p, Val(:release), Ptr{Cvoid}(C_NULL))  # inert until armed
-            new(p, arr.release, false, cell)
+            new(p, arr.release, false, cell, 0)
         catch
             # The native copy exists before the Julia owner does. If copy
             # initialization or owner allocation fails, no finalizer can
@@ -1029,6 +1080,15 @@ mutable struct ForeignOwner
     end
 end
 ForeignOwner(arr::CArrowArray) = ForeignOwner(arr, finalizer)
+
+# One compare-and-swap update of an owner's lend state; returns the new state.
+function _lend!(o::ForeignOwner, delta::Int)
+    while true
+        old = @atomic o.lent
+        _, ok = @atomicreplace o.lent old => old + delta
+        ok && return old + delta
+    end
+end
 
 # The move commit: the source ArrowArray's release has been nulled, so this
 # copy is now the sole owner of the producer's resources. Storing the real
@@ -1061,12 +1121,15 @@ Deterministically release an imported C-data tree, in this order: revoke
 every `OwnerRegion` built over the import through the shared cell (later
 access throws `InvalidStateException`); run the producer's release callback
 (if armed) on the malloc'd struct copy; check that the producer nulled the
-copy's release field, as C Data requires; free the copy. Exactly once — one
+copy's release field, as C Data requires; free the copy. If a C Data export
+still lends this memory out, the steps after revocation wait until the
+consumer has released that export and `reap!` reclaims it. Exactly once — one
 atomic swap picks the single releaser between an explicit call and the GC
 finalizer, and later calls return immediately. This is also the only
 lifetime handle for an empty import that carries no region at all;
-`ArrayData.owner` then holds it. A conformance failure throws, and reports
-as a finalizer error on the finalizer path.
+`ArrayData.owner` then holds it. A conformance failure throws (from `reap!`
+for a deferred release), and reports as a finalizer error on the finalizer
+path.
 """
 function release!(o::ForeignOwner)
     return release!(o.cell)
