@@ -85,6 +85,16 @@ rows = table.c isa AbstractVector{<:NamedTuple} ? table.c :
        [r === missing ? missing : NT(Tuple(last(kv) for kv in r)) for r in table.c]
 ```
 
+List, map, and fixed-size-list row types changed too. Arrow 2.x read list
+rows as views with the child's element type (an `Int64` list read back as
+`SubArray{Int64}` rows), map rows as `Dict{K,V}`, and fixed-size-list rows as
+`NTuple{N,T}`. Arrow 3.0 reads them as `Vector{Any}`, `Vector{Pair{Any,Any}}`,
+and `Vector{Any}` rows. A `Tables.Scan` select type
+override such as `:xs => Vector{Int64}` reads typed list rows. Convert map
+and fixed-size-list rows after the read, for example with `Dict(row)` or
+`NTuple{2,Int64}(row)`. Code that checks a column's element type, such as a
+Legolas.jl schema with a `Vector{String}` field, sees the new row types.
+
 Timezone-aware timestamps changed. Arrow 2.x depended on TimeZones.jl and
 read a timestamp column with a declared timezone as `ZonedDateTime` values.
 Arrow 3.0 does not depend on TimeZones.jl: such a column reads as
@@ -101,7 +111,9 @@ mixed-zone values with `astimezone` first. Zone-naive timestamps read as
 `Durations.Timestamp{P}` at every unit — a written `DateTime` column reads
 back as `Timestamp{Millisecond}`, which compares equal to the `DateTime`
 values it stores (Arrow 2.x truncated sub-millisecond units to `DateTime`
-with a warning; Arrow 3.0 is exact and never truncates).
+with a warning; Arrow 3.0 is exact and never truncates). Code that needs
+`DateTime` values converts with `DateTime.(table.ts)` or reads with a
+`Tables.Scan` select type override such as `:ts => DateTime`.
 
 Arrow 2.x labelled its temporal columns with extension names such as
 `JuliaLang.DateTime` and `JuliaLang.ZonedDateTime-UTC`. Arrow 3.0 reads those
@@ -115,7 +127,12 @@ The old positional byte-window arguments and multi-input constructors were
 removed. Pass one complete path, `IO`, byte vector, or byte-range source to
 `Arrow.Table` or `Arrow.Stream`. Slice an in-memory byte vector before the call
 when needed. Read independent IPC sources separately and combine their tables
-with a Tables.jl-aware consumer.
+with a Tables.jl-aware consumer. Bytes after a stream's end-of-stream marker,
+such as a second stream written to the same `IO`, are rejected with
+`ValidationError`; Arrow 2.x read only the first stream.
+
+The internal Arrow 2.x accessors are gone: use `Tables.columnnames(table)` for
+`Arrow.names(table)` and `Arrow.getmetadata(table)` for `Arrow.metadata(table)[]`.
 
 The source can still be memory-mapped while it is read. The returned columns
 do not borrow the map. Call [`Arrow.release!`](@ref) when you need to release a
