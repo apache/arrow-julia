@@ -1158,7 +1158,11 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
     arr.release != C_NULL || throw(ValidationError("released C array node"))
     arr.length >= 0 || throw(ValidationError("negative C array length"))
     arr.offset >= 0 || throw(ValidationError("negative C array offset"))
-    AC.checked_add(arr.offset, arr.length)
+    arr.length <= typemax(Int64) - arr.offset || throw(
+        ValidationError(
+            "C array length $(arr.length) plus offset $(arr.offset) overflows Int64",
+        ),
+    )
     -1 <= arr.null_count <= arr.length ||
         throw(ValidationError("invalid C array null count $(arr.null_count)"))
     arr.n_buffers >= 0 || throw(ValidationError("negative C array buffer count"))
@@ -1385,10 +1389,18 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
                 throw(ValidationError("NULL validity buffer requires null_count == 0"))
             p == C_NULL ? Int64(0) : AC.expected_validity_bytes(total)
         elseif role == AC.OFFSETS
-            AC.checked_mul(AC.checked_add(total, Int64(1)), Int64(spec.offsetwidth))
+            # Hostile extents overflow as ValidationErrors, as in Core's own
+            # structural checks.
+            total < typemax(Int64) ||
+                throw(ValidationError("required offsets buffer bytes overflow Int64"))
+            AC._required_extent(
+                total + Int64(1),
+                Int64(spec.offsetwidth),
+                "offsets buffer bytes",
+            )
         elseif role == AC.DATA
             if spec.fixedwidth > 0
-                AC.checked_mul(total, Int64(spec.fixedwidth))
+                AC._required_extent(total, Int64(spec.fixedwidth), "data buffer bytes")
             elseif spec.fixedwidth == -1
                 AC.expected_validity_bytes(total)
             else
@@ -1413,9 +1425,9 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
         elseif role == AC.ELEMENT_OFFSETS || role == AC.SIZES
             # Per-slot values (dense-union offsets; list-view offsets and
             # sizes), not monotone ranges: exactly `total` entries, no +1.
-            AC.checked_mul(total, Int64(spec.offsetwidth))
+            AC._required_extent(total, Int64(spec.offsetwidth), "per-slot buffer bytes")
         elseif role == AC.VIEWS
-            AC.checked_mul(total, Int64(16))
+            AC._required_extent(total, Int64(16), "views buffer bytes")
         else
             throw(ValidationError("unsupported buffer role $role in C data import"))
         end

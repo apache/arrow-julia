@@ -749,6 +749,24 @@ function cdata_battery()
     @assert reap!() == 2
     println("negative C Data final offsets fail cleanly ✓")
 
+    # Lengths and offsets whose required extents overflow Int64 are malformed
+    # declarations: ValidationError, never a raw OverflowError.
+    for (f, d) in (fromjulia("wide", Int64[1]), fromjulia("text", ["x"]))
+        for (len, off) in ((typemax(Int64), 0), (2, typemax(Int64)), (Int64(2)^61, 0))
+            sp, ap = to_c_data(f, d)
+            _store_field!(ap, :length, len)
+            _store_field!(ap, :offset, off)
+            @assert try
+                from_c_data(sp, ap)
+                false
+            catch e
+                e isa ValidationError
+            end
+            @assert reap!() == 2
+        end
+    end
+    println("overflowing C Data extents fail as ValidationErrors ✓")
+
     # Import of an already-released structure is refused.
     f, col = b.schema.fields[1], b.columns[1]
     sp, ap = to_c_data(f, col)
