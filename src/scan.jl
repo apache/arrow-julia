@@ -1441,7 +1441,7 @@ end
 _applyscan(
     f::ArrowFile,
     plan::_BoundScanPlan,
-    budget::AllocationBudget=AllocationBudget(f.limits.max_total_allocated_bytes),
+    budget::AllocationBudget=_readbudget(f.limits, f.region.len),
 ) = _runboundscan(f, plan.bound, plan.names, budget, _storagebatchcolumn)
 
 # ===========================================================================
@@ -2563,8 +2563,7 @@ function _applyfacadescan(
     budget::Union{Nothing,AllocationBudget}=nothing,
 )
     b = _facadestorage(plan)
-    actual =
-        budget === nothing ? AllocationBudget(f.limits.max_total_allocated_bytes) : budget
+    actual = budget === nothing ? _readbudget(f.limits, f.region.len) : budget
     routes = _ArrowTypesRoutePlan(actual)
     snapshots = _dictsnapshots(f.fields, b, actual)
     materialize =
@@ -2704,12 +2703,12 @@ execute post-decode. Every facade path converts private ArrowTypes routes
 before it returns.
 """
 function Tables.scan(f::ArrowFile, scan::Tables.Scan)
-    budget = AllocationBudget(f.limits.max_total_allocated_bytes)
+    budget = _readbudget(f.limits, f.region.len)
     return _applyscan(f, _compilehandlescan(scan, f.fields, budget), budget)
 end
 
 function Tables.scan(sf::SourceFile, scan::Tables.Scan)
-    budget = AllocationBudget(sf.limits.max_total_allocated_bytes)
+    budget = _readbudget(sf.limits, sf.len)
     ft = _rangedfooter(sf, budget)
     return _applyscan(sf, _compilehandlescan(scan, ft.fields, budget), ft, budget)
 end
@@ -3080,7 +3079,8 @@ function _readstats(
     end
     blob === nothing && return nothing
     localbudget =
-        budget === nothing ? AllocationBudget(limits.max_total_allocated_bytes) : budget
+        budget === nothing ? _readbudget(limits, blob isa String ? sizeof(blob) : 0) :
+        budget
     try
         blob isa String || return nothing
         decoded = _decodebase64budgeted(blob, localbudget)

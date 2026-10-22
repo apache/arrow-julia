@@ -136,7 +136,10 @@ writer, validation, scan, and C interface engines.
   structs, maps, dictionary-encoded values, and freshly synthesized
   heterogeneous Unions.
 - Structural, semantic, and optional full-content validation tiers.
-- Resource limits for untrusted IPC metadata and buffers.
+- Resource limits for untrusted IPC metadata and buffers. A read's allocation
+  budget scales with its input (`Limits.max_allocation_ratio`, 64 bytes per
+  input byte, at least 256 MiB and at most `max_total_allocated_bytes`, 16 GiB),
+  so ordinary files of any size read with the default limits.
 - Apache Arrow gold-corpus tests, external IPC oracle tests, C interface oracle
   tests, deterministic differential and bounded mutation fuzzing, and a JuliaC
   `--trim=safe` compile gate.

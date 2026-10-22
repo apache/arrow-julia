@@ -124,14 +124,14 @@ Memory: only the memory-mapped **file-format** path avoids holding the whole
 source. Batches decode from the map one at a time, so a loop over such a
 `Stream` holds one batch of columns plus the file's dictionaries. That is the
 way to process a file larger than RAM. A
-`Stream` security budget (the `max_total_allocated_bytes` field of
-[`Arrow.Limits`](@ref)) stays cumulative across every batch it yields, even
+`Stream` security budget ([`Arrow.Limits`](@ref): 64 bytes per input byte, at
+most 16 GiB by default) stays cumulative across every batch it yields, even
 after the consumer drops that batch. Raise the limit explicitly for a trusted
-large file whose total decoded allocation exceeds the default; the same
-`limits` keyword applies to [`Arrow.Table`](@ref):
+large file whose total decoded allocation exceeds it; the same `limits`
+keyword applies to [`Arrow.Table`](@ref):
 
 ```julia
-trusted_limits = Arrow.Limits(max_total_allocated_bytes = 2 * 1024^3)
+trusted_limits = Arrow.Limits(max_total_allocated_bytes = 64 * 1024^3)
 stream = Arrow.Stream("big.arrow"; limits = trusted_limits)
 ```
 
@@ -677,7 +677,11 @@ FlatBuffers shape verifier before any of it is used. Resource limits (metadata
 size, body size, allocation budget, nesting depth) are enforced before any
 metadata-directed or package-controlled read-facade allocation. The one
 cumulative budget covers byte-range fetch and assembly, IPC decode, Core and
-ArrowTypes containers, scan slices and joins, and final table columns. Custom
+ArrowTypes containers, scan slices and joins, and final table columns. It
+scales with the input (`max_allocation_ratio` bytes per input byte, at least
+256 MiB, at most `max_total_allocated_bytes`), so ordinary files read with the
+default limits while lengths a small file declares without backing bytes fail
+before allocation. Custom
 user hook allocations remain the hook author's responsibility. Vector
 reserves include a conservative backing-store capacity, not only the logical
 element payload, because supported Julia versions can round that capacity to

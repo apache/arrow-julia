@@ -55,12 +55,22 @@ work it governs can exceed it.
 | `max_metadata_bytes`        | 16 MiB        | metadata per message           |
 | `max_body_bytes`            | 2 GiB         | one message body               |
 | `max_buffer_bytes`          | 2 GiB         | one buffer                     |
-| `max_total_allocated_bytes` | 256 MiB       | cumulative allocation per read |
+| `max_total_allocated_bytes` | 16 GiB        | cumulative allocation per read |
+| `max_allocation_ratio`      | 64            | allocation per input byte      |
 | `max_messages`              | 1,000,000     | messages per stream or file    |
 | `max_metadata_objects`      | 1,000,000     | flatbuffer objects per message |
 | `max_nesting_depth`         | 64            | schema and metadata nesting    |
 | `max_array_length`          | 1,000,000,000 | array length                   |
 | `max_concurrent_reads`      | 64            | concurrent range reads         |
+
+One read may allocate `max_allocation_ratio` bytes per byte of its input (the
+file, buffer, IO, or object), at least 256 MiB, and at most
+`max_total_allocated_bytes`. Ordinary columns cost a small multiple of their
+stored bytes, so files of any size read with the defaults; lengths a small
+malformed file declares without the bytes to back them (run-end encoded,
+view, null-child, or decompressed lengths) fail before they are allocated.
+Raise `max_allocation_ratio` for trusted data that expands further, such as
+long runs or heavily repeated dictionary values.
 
 Pass a `Limits` value as the `limits` keyword to [`Arrow.Table`](@ref) or
 [`Arrow.Stream`](@ref).
@@ -69,7 +79,8 @@ Base.@kwdef struct Limits
     max_metadata_bytes::Int64 = 16 * 1024 * 1024
     max_body_bytes::Int64 = Int64(2) * 1024 * 1024 * 1024
     max_buffer_bytes::Int64 = Int64(2) * 1024 * 1024 * 1024
-    max_total_allocated_bytes::Int64 = 256 * 1024 * 1024
+    max_total_allocated_bytes::Int64 = Int64(16) * 1024 * 1024 * 1024
+    max_allocation_ratio::Int64 = 64
     max_messages::Int = 1_000_000
     max_metadata_objects::Int = 1_000_000
     max_nesting_depth::Int = 64
@@ -89,6 +100,35 @@ function AllocationBudget(limit::Integer)
     return AllocationBudget(value, value, ReentrantLock())
 end
 
+# Below this, a read's budget does not shrink with its input: small files keep
+# the allowance every input had before the budget scaled with input size.
+const _MIN_INPUT_BUDGET = Int64(256) * 1024 * 1024
+
+"The allocation budget for one read of `nbytes` input bytes (see [`Limits`](@ref))."
+function _readlimit(limits::Limits, nbytes::Integer)
+    scaled, overflow =
+        Base.Checked.mul_with_overflow(limits.max_allocation_ratio, Int64(nbytes))
+    perinput = overflow ? typemax(Int64) : scaled
+    return min(limits.max_total_allocated_bytes, max(_MIN_INPUT_BUDGET, perinput))
+end
+
+_readbudget(limits::Limits, nbytes::Integer) = AllocationBudget(_readlimit(limits, nbytes))
+
+"Lower an open read's budget to its input's allowance once the input size is known."
+function _boundbudget!(budget::AllocationBudget, limits::Limits, nbytes::Integer)
+    limit = _readlimit(limits, nbytes)
+    lock(budget.lock)
+    try
+        if limit < budget.limit
+            budget.left = max(Int64(0), budget.left - (budget.limit - limit))
+            budget.limit = limit
+        end
+    finally
+        unlock(budget.lock)
+    end
+    return budget
+end
+
 """
     Arrow.AllocationLimitError
 
@@ -104,8 +144,9 @@ function Base.showerror(io::IO, e::AllocationLimitError)
     print(
         io,
         e.msg,
-        " (Limits.max_total_allocated_bytes; to read trusted input that needs ",
-        "more, pass `limits=Arrow.Limits(max_total_allocated_bytes=...)`)",
+        " (Limits.max_allocation_ratio bytes per input byte, at most ",
+        "Limits.max_total_allocated_bytes; to read trusted input that needs more, pass ",
+        "`limits=Arrow.Limits(max_allocation_ratio=..., max_total_allocated_bytes=...)`)",
     )
     return nothing
 end
@@ -393,12 +434,8 @@ is the intentional missing-EOS boundary case and is accepted. The framing's
 metadata length covers the padded metadata only; a Footer Block's
 metaDataLength instead covers prefix + metadata.
 """
-framemessages(region::OwnerRegion, limits::Limits=Limits()) = _framemessages(
-    region,
-    limits,
-    Base.ENDIAN_BOM,
-    AllocationBudget(limits.max_total_allocated_bytes),
-)
+framemessages(region::OwnerRegion, limits::Limits=Limits()) =
+    _framemessages(region, limits, Base.ENDIAN_BOM, _readbudget(limits, region.len))
 
 function _validatelimits(limits::Limits)
     limits.max_metadata_bytes >= 0 || throw(ArgumentError("negative metadata limit"))
@@ -406,6 +443,7 @@ function _validatelimits(limits::Limits)
     limits.max_buffer_bytes >= 0 || throw(ArgumentError("negative buffer limit"))
     limits.max_total_allocated_bytes >= 0 ||
         throw(ArgumentError("negative allocation limit"))
+    limits.max_allocation_ratio >= 0 || throw(ArgumentError("negative allocation ratio"))
     limits.max_messages >= 0 || throw(ArgumentError("negative message limit"))
     limits.max_metadata_objects >= 0 ||
         throw(ArgumentError("negative metadata-object limit"))
@@ -420,7 +458,7 @@ function _framemessages(
     region::OwnerRegion,
     limits::Limits,
     host_endian_bom::UInt32,
-    budget::AllocationBudget=AllocationBudget(limits.max_total_allocated_bytes),
+    budget::AllocationBudget=_readbudget(limits, region.len),
 )
     # The generated FlatBuffers bindings use native-endian scalar
     # loads. Reject an unsupported host before any generated getter sees the
@@ -1294,7 +1332,7 @@ and `Arrow.Stream` own their backing storage and do not expose this borrow).
 `ConcurrencyViolationError`.
 """
 readstream(bytes::Vector{UInt8}; limits::Limits=Limits()) =
-    _readstream(bytes, limits, AllocationBudget(limits.max_total_allocated_bytes))
+    _readstream(bytes, limits, _readbudget(limits, length(bytes)))
 
 function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBudget)
     region = heapregion(bytes)

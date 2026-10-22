@@ -369,6 +369,53 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test !Base.isexported(Arrow, :AllocationLimitError)
     end
 
+    @testset "default limits scale with the input" begin
+        # Ordinary files read with the default limits whatever their size.
+        path = tempname()
+        try
+            Arrow.write(path, (a=collect(Int64, 1:20_000_000),))
+            t = Arrow.Table(path)
+            @test length(t.a) == 20_000_000 && t.a[end] == 20_000_000
+            Arrow.release!(t)
+            # An explicit ceiling still applies.
+            @test_throws Arrow.AllocationLimitError Arrow.Table(
+                path;
+                limits=Arrow.Limits(max_total_allocated_bytes=256 * 1024^2),
+            )
+            strings = [lpad(string(i), 64, 'x') for i = 1:1_000_000]
+            Arrow.write(path, (s=strings,))
+            t = Arrow.Table(path)
+            @test t.s == strings
+            Arrow.release!(t)
+        finally
+            rm(path; force=true)
+        end
+        # A 464-byte file whose run-end encoded column claims ~1e9 rows has no
+        # bytes behind that length: it fails before allocating the column.
+        rf, rd = Arrow.AC.fromjulia("run_ends", Int32[999_999_999])
+        vf, vd = Arrow.AC.fromjulia("values", Int64[7])
+        ree = Arrow.AC.RunEndEncodedType()
+        f = Arrow.AC.Field("r", ree; nullable=false, children=[rf, vf])
+        d = Arrow.AC.ArrayData(
+            ree,
+            999_999_999,
+            Arrow.AC.BufferSlice[];
+            children=[rd, vd],
+            nullcount=0,
+        )
+        sch = Arrow.AC.Schema([f])
+        bytes = Arrow.writestream(sch, [Arrow.AC.RecordBatch(sch, [d])])
+        @test length(bytes) < 1024
+        @test_throws Arrow.AllocationLimitError Arrow.Table(bytes)
+        stats = @timed try
+            Arrow.Table(bytes)
+        catch err
+            err
+        end
+        @test stats.value isa Arrow.AllocationLimitError
+        @test stats.bytes < 64_000_000
+    end
+
     @testset "scan pushdown through Arrow.Table" begin
         io = IOBuffer()
         Arrow.write(io, (x=collect(Int64, 1:100), y=string.(1:100)))
@@ -843,7 +890,8 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         secondbatch, _ = iterate(stream, state)
         @test firstbatch.x == [1, 2]
         @test secondbatch.x == [3, 4]
-        needed = probe_limit - Arrow._remaining(probe)
+        # The read's budget is the input's allowance, below the configured cap.
+        needed = probe.limit - Arrow._remaining(probe)
 
         exactstream, exact = openstream(needed)
         firstexact, state = iterate(exactstream)
@@ -866,7 +914,8 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test err isa Arrow.AllocationLimitError
         shown = sprint(showerror, err)
         @test occursin(err.msg, shown)
-        @test occursin("limits=Arrow.Limits(max_total_allocated_bytes=", shown)
+        @test occursin("limits=Arrow.Limits(max_allocation_ratio=", shown)
+        @test occursin("max_total_allocated_bytes=", shown)
     end
 
     @testset "mmap path and release!" begin

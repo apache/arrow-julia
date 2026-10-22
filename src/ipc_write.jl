@@ -1735,10 +1735,10 @@ format permits one base dictionary per id, followed by deltas.
 Full dictionary replacement remains a format error.
 """
 readfile(bytes::Vector{UInt8}; limits::Limits=Limits()) =
-    _readfile(heapregion(bytes), limits, AllocationBudget(limits.max_total_allocated_bytes))
+    _readfile(heapregion(bytes), limits, _readbudget(limits, length(bytes)))
 
 readfile(region::OwnerRegion; limits::Limits=Limits()) =
-    _readfile(region, limits, AllocationBudget(limits.max_total_allocated_bytes))
+    _readfile(region, limits, _readbudget(limits, region.len))
 
 # C++ WriteFileFooter uses its current metadata version even when the
 # writer emits V4 messages, and Arrow.jl before 2.6 wrote a V4 footer over V5
@@ -1935,7 +1935,7 @@ function _filebatch(f::ArrowFile, i::Integer, state::DecodeState)
 end
 
 function Base.getindex(f::ArrowFile, i::Integer)
-    budget = AllocationBudget(f.limits.max_total_allocated_bytes)
+    budget = _readbudget(f.limits, f.region.len)
     state = DecodeState(budget)
     try
         return _filebatch(f, i, state)

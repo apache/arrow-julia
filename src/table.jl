@@ -1272,8 +1272,8 @@ function _readmappedfile(
     budget::Union{Nothing,AllocationBudget},
 )
     try
-        return budget === nothing ? readfile(region; limits=limits) :
-               _readfile(region, limits, budget)
+        budget === nothing && return readfile(region; limits=limits)
+        return _readfile(region, limits, _boundbudget!(budget, limits, region.len))
     catch
         AC.release!(region)
         rethrow()
@@ -1289,6 +1289,8 @@ function _openbytes(
         return _isfilebytes(bytes) ? readfile(bytes; limits=limits) :
                readstream(bytes; limits=limits)
     end
+    # The read's allowance scales with the input it turned out to have.
+    _boundbudget!(budget, limits, length(bytes))
     return _isfilebytes(bytes) ? _readfile(heapregion(bytes), limits, budget) :
            _readstream(bytes, limits, budget)
 end
@@ -1412,7 +1414,7 @@ function Table(
     if source isa AbstractArrowSource || source isa SourceFile
         sf = source isa SourceFile ? source : SourceFile(source; limits=readlimits)
         _requirelittleendian()
-        budget = AllocationBudget(readlimits.max_total_allocated_bytes)
+        budget = _readbudget(readlimits, sf.len)
         if scan === nothing
             opened = _openbytes(_wholeobject(sf, budget); limits=readlimits, budget=budget)
             return _tablefrom(opened, nothing, budget)
@@ -1635,7 +1637,7 @@ function _materialize_table(src::IPCStream, regions, budget=nothing)
 end
 
 function _materialize_table(src::ArrowFile, regions, budget=nothing)
-    budget === nothing && (budget = AllocationBudget(src.limits.max_total_allocated_bytes))
+    budget === nothing && (budget = _readbudget(src.limits, src.region.len))
     names = _fieldnamesymbols(src.schema.fields, budget)
     arrowtypes = _ArrowTypesContext(budget=budget)
     nb = length(src)

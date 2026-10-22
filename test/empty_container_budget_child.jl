@@ -17,7 +17,7 @@
 # Isolate the high-row-count acceptance gate so every case releases its heap
 # before the parent suite continues.
 # At 2,000,000 rows, charging each empty value as a nonempty Vector would
-# exceed the default 256 MiB budget. Empty values must be charged as empty.
+# exceed a 256 MiB budget. Empty values must be charged as empty.
 
 using Arrow
 
@@ -27,7 +27,7 @@ const N = 2_000_000
 function roundtripempty(field, data)
     schema = AC.Schema([field])
     bytes = Arrow.writestream(schema, [AC.RecordBatch(schema, [data], N)])
-    table = Arrow.Table(bytes)
+    table = Arrow.Table(bytes; limits=Arrow.Limits(max_total_allocated_bytes=256 * 1024^2))
     column = table.x
     @assert length(column) == N
     @assert isempty(first(column))
