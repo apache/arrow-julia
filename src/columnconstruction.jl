@@ -499,12 +499,23 @@ _arrowtypesneedsvalue(x, context, depth::Int=0) =
     ) === true
 
 function _arrowtypes_needs(v::AbstractVector, context)
-    _writerneedstype!(context, eltype(v)) && return true
+    T = eltype(v)
+    _writerneedstype!(context, T) && return true
     # Abstract/Any containers do not expose nested logical types. Inspect only
-    # until the first ArrowTypes value is found; concrete columns take no scan.
-    return (eltype(v) === Any || !isconcretetype(eltype(v))) &&
+    # until the first ArrowTypes value is found; concrete columns, and Unions
+    # of leaf types such as Union{Missing,Int64}, take no scan: the check
+    # above already decided every value they can hold.
+    return !isconcretetype(T) &&
+           !_writerleafunion(T) &&
            any(value -> _arrowtypesneedsvalue(value, context), v)
 end
+
+# A Union of concrete types the value walk does not descend into.
+_writerleafunion(T) =
+    T isa Union && all(Base.uniontypes(T)) do S
+        isconcretetype(S) &&
+        !(S <: Union{Tuple,NamedTuple,Pair,AbstractVector,AbstractDict})
+    end
 
 _arrowtypesconcreteorunion(T) =
     isconcretetype(T) ||
