@@ -21,15 +21,70 @@
 
 # API Reference
 
-```@autodocs
-Modules = [Arrow]
-Order   = [:type, :function]
+## Read
+
+```@docs
+Arrow.Table
+Arrow.Stream
+Arrow.Limits
+Arrow.release!(::Arrow.Table)
+Base.copy(::Arrow.Table)
+Arrow.getmetadata
 ```
 
-## Internals: `Arrow.FlatBuffers`
+## Write
 
-The `FlatBuffers` module is not part of Arrow.jl's public API, and these functions may change without notice.
+```@docs
+Arrow.write
+Arrow.Writer
+Arrow.write(::Arrow.Writer, ::Any)
+Arrow.append
+Arrow.tobuffer
+Arrow.DictEncode
+```
 
-```@autodocs
-Modules = [Arrow.FlatBuffers]
+## Byte-range reads
+
+```@docs
+Arrow.AbstractArrowSource
+Arrow.sourcelength
+Arrow.readrange
+Arrow.concurrentreads
+```
+
+## The C data and C stream interfaces
+
+The low-level value and ABI types are public but not exported.
+
+```@docs
+Arrow.Field
+Arrow.Schema
+Arrow.ArrayData
+Arrow.RecordBatch
+Arrow.fromjulia
+Arrow.batch
+Arrow.materialize
+Arrow.CArrowSchema
+Arrow.CArrowArray
+Arrow.CArrowArrayStream
+```
+
+```@docs
+Arrow.to_c_data
+Arrow.from_c_data
+Arrow.export_stream!
+Arrow.from_c_stream
+Arrow.ForeignOwner
+Arrow.ImportedStream
+Arrow.nextbatch!
+Arrow.release!(::Arrow.ForeignOwner)
+Arrow.release!(::Arrow.ImportedStream)
+Arrow.reap!
+```
+
+## Errors
+
+```@docs
+Arrow.AllocationLimitError
+Arrow.ValidationError
 ```
