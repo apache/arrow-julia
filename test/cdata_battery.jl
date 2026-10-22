@@ -1774,9 +1774,10 @@ function cdata_battery()
     @assert getvalue(df2, dd2, 2) == "hi"
     release!(dd2.buffers[2].region::OwnerRegion)
     reap!()
-    # Extension pairs name the dictionary's VALUE type: they ride the value
-    # node (on the wrapper they would declare dictionary storage, which
-    # PyArrow refuses), and import rejoins them after the wrapper's pairs.
+    # Canonical (`arrow.`) extension pairs name the dictionary's VALUE type:
+    # they ride the value node (on the wrapper they would declare dictionary
+    # storage, which PyArrow refuses), and import rejoins them after the
+    # wrapper's pairs.
     extmeta = [
         "dk" => "dv",
         "ARROW:extension:name" => "arrow.json",
@@ -1796,6 +1797,25 @@ function cdata_battery()
     xf2, xd2 = from_c_data(xsp, xap)
     @assert collect(xf2.metadata) == extmeta
     release!(xd2.buffers[2].region::OwnerRegion)
+    reap!()
+    # Other extension names stay on the wrapper as field metadata, where a
+    # consumer that does not know them keeps them.
+    appmeta =
+        ["ARROW:extension:name" => "dict-extension", "ARROW:extension:metadata" => "m"]
+    af = Field(
+        "d",
+        dvf.type;
+        nullable=dvf.nullable,
+        metadata=appmeta,
+        children=collect(Field, dvf.children),
+    )
+    asp, aap = to_c_data(af, dvd)
+    asch = unsafe_load(asp)
+    @assert Arrow._import_cmetadata(asch.metadata) == appmeta
+    @assert unsafe_load(asch.dictionary).metadata == C_NULL
+    af2, ad2 = from_c_data(asp, aap)
+    @assert collect(af2.metadata) == appmeta
+    release!(ad2.buffers[2].region::OwnerRegion)
     reap!()
     # A foreign producer annotating the DEPENDENT node too (extension-type
     # metadata is legal there) loses no pair on import: wrapper pairs

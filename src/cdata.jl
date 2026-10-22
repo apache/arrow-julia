@@ -644,16 +644,23 @@ function _newcontrol!(root::ExportedRoot)
     return control
 end
 
-# A dictionary Field's extension pairs name its VALUE type, as in IPC. Like the
-# C++ bridge, export them on the dependent value node and the remaining field
-# metadata on the wrapper: an extension on the wrapper would declare dictionary
-# storage, which PyArrow refuses for its canonical extension types.
+# A dictionary Field's extension pairs name its VALUE type, as in IPC. For a
+# canonical extension (the format reserves the `arrow.` prefix for them), export
+# them on the dependent value node, as the C++ bridge does for an extension type
+# it knows: on the wrapper they would declare dictionary storage, which PyArrow
+# refuses. Other extension names stay on the wrapper with the field's metadata,
+# where a consumer that does not know them keeps them as field metadata (PyArrow
+# drops unknown extension pairs on a dependent node).
 # (Literal keys: the trim gate includes this file without arrowtypes.jl.)
 _isextensionpair(kv) =
     first(kv) == "ARROW:extension:name" || first(kv) == "ARROW:extension:metadata"
 
+_iscanonicalextension(kv) =
+    first(kv) == "ARROW:extension:name" && startswith(last(kv), "arrow.")
+
 function _splitdictmetadata(metadata::Union{Nothing,AC.FrozenVector{Pair{String,String}}})
-    (metadata === nothing || !any(_isextensionpair, metadata)) && return metadata, nothing
+    (metadata === nothing || !any(_iscanonicalextension, metadata)) &&
+        return metadata, nothing
     wrapper = Pair{String,String}[kv for kv in metadata if !_isextensionpair(kv)]
     values = Pair{String,String}[kv for kv in metadata if _isextensionpair(kv)]
     return (isempty(wrapper) ? nothing : AC.FrozenVector{Pair{String,String}}(wrapper)),
