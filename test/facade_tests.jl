@@ -1116,6 +1116,18 @@ end
         @test t3.d == ["a", "b", "b", "c"]
     end
 
+    @testset "aliased extension columns rewrite" begin
+        # Selecting one column twice shares its retained child fields; the
+        # rewrite still needs one Field object per schema position.
+        io = IOBuffer()
+        Arrow.write(io, (u=[Base.UUID(UInt128(i)) for i = 1:3],))
+        t = Arrow.Table(take!(io); scan=Tables.Scan(select=(:u, :u => :v)))
+        out = IOBuffer()
+        Arrow.write(out, t)
+        back = Arrow.Table(take!(out))
+        @test back.u == back.v == t.u
+    end
+
     @testset "zero-column row counts survive" begin
         # A zero-column three-row batch built at the core level: the facade
         # read must preserve the count, and a facade round-trip must carry

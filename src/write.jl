@@ -575,13 +575,25 @@ function _retainedfieldfn(retained, names)
         all(j -> retained.fields[j].name == String(names[j]), 1:ncols)
     function retainedfield(j)
         retained === nothing && return nothing
-        retainedaligned && return retained.fields[j]
+        retainedaligned && return _unsharedfield(retained.fields[j])
         count(==(names[j]), names) == 1 || return nothing
         matches = findall(f -> f.name == String(names[j]), collect(retained.fields))
-        return length(matches) == 1 ? retained.fields[only(matches)] : nothing
+        return length(matches) == 1 ? _unsharedfield(retained.fields[only(matches)]) :
+               nothing
     end
     return retainedfield
 end
+
+# The written schema needs one Field object per position (dictionary ids key
+# on Field identity), but a retained schema can share child subtrees between
+# positions, as a scan that selects one column twice does.
+_unsharedfield(f::AC.Field) = AC.Field(
+    f.name,
+    f.type;
+    nullable=f.nullable,
+    metadata=f.metadata,
+    children=AC.Field[_unsharedfield(c) for c in f.children],
+)
 
 # Phase 2: construct each complete logical column across the collected
 # partitions. The column module owns inference, retained reconstruction,
