@@ -222,6 +222,12 @@ writable at that nesting depth. Fresh heterogeneous Unions use the canonical
 dense Arrow Union layout. See [Type mapping when writing](@ref) for the
 complete table.
 
+A `VersionNumber` column is written as strings labelled
+`JuliaLang.VersionNumber`. Arrow 3.0 reads it back as `VersionNumber` values;
+Arrow 2.x expects that label on a Struct and throws a `MethodError` when it
+indexes such a column. Write `string.(versions)` for files that Arrow 2.x
+readers must consume.
+
 A top-level `NamedTuple` column may use `Union{Missing, T}`. Arrow writes the
 outer missing state in the Struct validity bitmap and keeps each child's
 declared nullability unchanged.

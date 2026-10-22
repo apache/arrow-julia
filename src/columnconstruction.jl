@@ -743,9 +743,10 @@ function _constructarrowtypespart_impl(
     context,
 )
     # VersionNumber's legacy reflected representation contains variable-length
-    # tuples. String is an equivalent extension storage form: ArrowTypes'
-    # one-argument JuliaType registration and default VersionNumber(String)
-    # constructor read it in both Arrow 2.x and 3.x.
+    # tuples, so Arrow 3.0 writes String extension storage instead. ArrowTypes'
+    # one-argument JuliaType registration and the VersionNumber(String)
+    # constructor read it back. Arrow 2.x readers cannot: they index the
+    # column with the Struct layout ArrowTypes declares for VersionNumber.
     if logical === VersionNumber
         mapped =
             eltype(v) >: Missing ?
