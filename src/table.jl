@@ -363,6 +363,23 @@ end
 const _EPOCH_DAYS = Dates.value(Dates.Date(1970, 1, 1))
 const _LoweredTemporal = Union{Int32,Int64}
 const _MILLIS_PER_DAY = Int128(86_400_000)
+const _NANOS_PER_DAY = Int64(86_400_000_000_000)
+
+"""
+The public `Dates.Time` for one stored time-of-day value. `Dates.Time` wraps
+modulo 24 hours, so a value outside the format's [0, 24h) range has no
+exact public value and is refused instead of aliasing another time.
+"""
+function _publictime(unit, x)
+    perday =
+        unit == AC.SECOND ? Int64(86_400) :
+        unit == AC.MILLISECOND ? Int64(86_400_000) :
+        unit == AC.MICROSECOND ? Int64(86_400_000_000) : _NANOS_PER_DAY
+    v = Int64(x)
+    0 <= v < perday ||
+        throw(ValidationError("time-of-day value $v is outside [0, $perday) in its unit"))
+    return Dates.Time(Dates.Nanosecond(v * (_NANOS_PER_DAY ÷ perday)))
+end
 
 # Map a temporal descriptor to the compile-time token the lowering loops
 # dispatch on; eighteen values total (2 date + 4 timestamp + 4 zoned
@@ -707,11 +724,7 @@ function _publicleafscalar(t::AC.ArrowType, x)
             _zonedtimestamptype(t.unit, zone)
         return reinterpret(T, Int64(x))
     elseif t isa AC.TimeType
-        scale =
-            t.unit == AC.SECOND ? Int64(1_000_000_000) :
-            t.unit == AC.MILLISECOND ? Int64(1_000_000) :
-            t.unit == AC.MICROSECOND ? Int64(1_000) : Int64(1)
-        return Dates.Time(Dates.Nanosecond(Int64(x) * scale))
+        return _publictime(t.unit, x)
     elseif t isa AC.DurationType
         P =
             t.unit == AC.SECOND ? Dates.Second :
@@ -907,16 +920,8 @@ function _postconvert(t::AC.TimestampType, col, budget=nothing)
     return _instantcolumn(Durations.Timestamp{_timestampperiod(t.unit)}, col, budget)
 end
 function _postconvert(t::AC.TimeType, col, budget=nothing)
-    scale =
-        t.unit == AC.SECOND ? Int64(1_000_000_000) :
-        t.unit == AC.MILLISECOND ? Int64(1_000_000) :
-        t.unit == AC.MICROSECOND ? Int64(1_000) : Int64(1)
-    return _mapcol(
-        Dates.Time,
-        x -> Dates.Time(Dates.Nanosecond(Int64(x) * scale)),
-        col,
-        budget,
-    )
+    unit = t.unit
+    return _mapcol(Dates.Time, x -> _publictime(unit, x), col, budget)
 end
 function _postconvert(t::AC.DurationType, col, budget=nothing)
     P =

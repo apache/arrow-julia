@@ -1188,10 +1188,11 @@ end
             @test Tables.rowcount(got) == Tables.rowcount(Tables.columns(want))
         end
 
-        # This public conversion aliases distinct physical values. Equality
-        # and membership must use the public plan, not drop one matching row.
+        # Time predicates stay public. A stored time of day outside [0, 24h)
+        # has no exact Dates.Time (which wraps modulo 24 hours), so reads
+        # refuse it instead of aliasing it onto another time.
         let (type, values, literal) =
-                (Arrow.AC.TimeType(Arrow.AC.SECOND, 32), Int32[0, 86_400], Time(0))
+                (Arrow.AC.TimeType(Arrow.AC.SECOND, 32), Int32[0, 86_399], Time(0))
             field, bytes = rawtemporal(type, values)
             for scan in (
                 Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), literal)),
@@ -1199,8 +1200,19 @@ end
             )
                 @test Arrow._ScanPlan(scan, [field]).storage === nothing
                 assertmatches(bytes, scan)
-                @test Tables.rowcount(Arrow.Table(copy(bytes); scan=scan)) == 2
+                @test Tables.rowcount(Arrow.Table(copy(bytes); scan=scan)) == 1
             end
+        end
+        for (type, values) in (
+            (Arrow.AC.TimeType(Arrow.AC.SECOND, 32), Int32[0, 86_400]),
+            (Arrow.AC.TimeType(Arrow.AC.MILLISECOND, 32), Int32[-1, 0]),
+            (Arrow.AC.TimeType(Arrow.AC.MICROSECOND, 64), Int64[0, typemax(Int64)]),
+            (Arrow.AC.TimeType(Arrow.AC.NANOSECOND, 64), Int64[86_400 * 10 ^ 9, 0]),
+        )
+            field, bytes = rawtemporal(type, values)
+            @test_throws Arrow.ValidationError Arrow.Table(copy(bytes))
+            scan = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), Time(0)))
+            @test_throws Arrow.ValidationError Arrow.Table(copy(bytes); scan=scan)
         end
 
         # Second-unit timestamps used to wrap-alias extreme counts into one

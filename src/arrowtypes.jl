@@ -991,13 +991,7 @@ function _arrowtypesscalar(t::AC.ArrowType, x)
             return Dates.DateTime(Dates.UTM(Int64(x) + Dates.UNIXEPOCH))
         return x
     end
-    if t isa AC.TimeType
-        scale =
-            t.unit == AC.SECOND ? Int64(1_000_000_000) :
-            t.unit == AC.MILLISECOND ? Int64(1_000_000) :
-            t.unit == AC.MICROSECOND ? Int64(1_000) : Int64(1)
-        return Dates.Time(Dates.Nanosecond(Int64(x) * scale))
-    end
+    t isa AC.TimeType && return _publictime(t.unit, x)
     if t isa AC.DurationType
         P =
             t.unit == AC.SECOND ? Dates.Second :

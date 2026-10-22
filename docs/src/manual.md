@@ -239,7 +239,11 @@ holds a null its field did not declare reads as `Union{Missing, T}` rather
 than failing; a conforming column keeps its declared, `Missing`-free type.
 Timestamps never truncate or wrap into `DateTime`: they materialize as
 `Durations.Timestamp` and `Durations.ZonedTimestamp` (both compare equal to
-`DateTime` values at the same instant) at every depth.
+`DateTime` values at the same instant) at every depth. Two kinds of invalid
+stored value have no exact public value: a time of day outside the format's
+[0, 24 h) range (`Dates.Time` wraps modulo 24 hours) and a decimal
+coefficient outside the field's declared precision. Reading one throws
+`Arrow.ValidationError`.
 
 ### Scan pushdown
 
