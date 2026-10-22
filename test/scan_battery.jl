@@ -818,9 +818,12 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     @assert sum(last, datelog.ranges) < length(datebytes) ÷ 2
 
     # Tuple membership uses `==`, while Set uses `isequal` plus hashing.
-    # Date and midnight DateTime compare equal but are distinct Set keys.
+    # Date and midnight DateTime compare equal; whether they are the same Set
+    # key depends on Julia's Dates hashing (distinct before Julia 1.14), so
+    # the expectation follows Julia's own `in`.
     datetime = Arrow.Dates.DateTime(2024, 3, 1)
-    for (values, expectedrows) in ((Set([datetime]), 0), ((datetime,), 1))
+    for values in (Set([datetime]), (datetime,))
+        expectedrows = targetdate in values ? 1 : 0
         scan = Tables.Scan(select=(:d,), filter=Tables.colin(Tables.col(:d), values))
         plan = Arrow._ScanPlan(scan, [datefield])
         @assert (plan.storage !== nothing) == (values isa Tuple)
