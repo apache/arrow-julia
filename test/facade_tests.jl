@@ -1892,6 +1892,8 @@ end
             sch,
             [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 1_000_000)],
         )
+        # Warm first: compiling the scan is not part of the per-row cost.
+        Arrow.Table(big; scan=Tables.Scan(filter=Tables.AlwaysTrue(), limit=1))
         stats =
             @timed Arrow.Table(big; scan=Tables.Scan(filter=Tables.AlwaysTrue(), limit=1))
         @test Tables.rowcount(stats.value) == 1
