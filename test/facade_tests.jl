@@ -2420,6 +2420,20 @@ end
             @test only(skipmissing(t.st))[1].second == Date(2024, 1, 1)
         end
 
+        # A declared timezone becomes a Symbol type parameter; one that no
+        # Symbol can hold, or past the per-name bound, is invalid input.
+        for zone in ("UT\0C", "Z"^5000)
+            zt = Arrow.AC.TimestampType(Arrow.AC.MILLISECOND, zone)
+            zd = Arrow.AC.ArrayData(
+                zt,
+                1,
+                [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int64[0])],
+            )
+            zs = Arrow.AC.Schema([Arrow.AC.Field("t", zt; nullable=false)])
+            zb = Arrow.writestream(zs, [Arrow.AC.RecordBatch(zs, [zd], 1)])
+            @test_throws Arrow.ValidationError Arrow.Table(zb)
+        end
+
         # Footer Block extents near typemax(Int64) are invalid input, not an
         # arithmetic overflow, on every read path.
         io = IOBuffer()

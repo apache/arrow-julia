@@ -715,7 +715,21 @@ end
 # the 8-byte layout of the Arrow column itself — every Int64 is a valid
 # value — so conversion is a per-element reinterpret.
 _zonedtimestamptype(unit, zone::String) =
-    Durations.ZonedTimestamp{_timestampperiod(unit),Symbol(zone)}
+    Durations.ZonedTimestamp{_timestampperiod(unit),_zonesymbol(zone)}
+
+# The declared zone becomes a type parameter. A Symbol cannot hold an
+# embedded NUL, and the facade's per-name bound keeps input-controlled zone
+# names from interning arbitrarily large process-global state.
+function _zonesymbol(zone::String)
+    occursin('\0', zone) &&
+        throw(AC.ValidationError("timestamp timezone contains an embedded NUL"))
+    ncodeunits(zone) <= _MAX_ARROWTYPE_SCHEMA_NAME_BYTES || throw(
+        AC.ValidationError(
+            "timestamp timezone exceeds $_MAX_ARROWTYPE_SCHEMA_NAME_BYTES UTF-8 bytes",
+        ),
+    )
+    return Symbol(zone)
+end
 
 # Function barrier: `T` arrives as a runtime type (the zone name is a type
 # parameter), one dynamic call per column, and the element loop compiles

@@ -689,7 +689,10 @@ names are Symbols. Before it interns any novel top-level field name, Arrow
 preflights the complete schema: each name is at most 4096 UTF-8 bytes, one table
 materialization may add at most 65,536 novel names, and their combined UTF-8
 size is at most 1 MiB. A schema outside those limits produces
-`ValidationError` without partially interning its novel names.
+`ValidationError` without partially interning its novel names. A declared
+timestamp timezone becomes the `Z` parameter of `ZonedTimestamp{P,Z}`; one
+longer than 4096 UTF-8 bytes or containing a NUL byte produces
+`ValidationError`.
 
 A ranged scan validates the Footer's complete Block index up front and the
 complete node and buffer metadata for every statistics-surviving record before
