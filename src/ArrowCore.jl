@@ -3037,19 +3037,24 @@ function materialize(::Type{T}, f::Field, d::ArrayData, budget) where {T}
     _checkclaim(T, f, d)
     estimate = _MaterializationEstimate(budget)
     _reservevector!(estimate, T, d.len, "typed materialized column")
-    for i = 1:(d.len)
-        _prechargevalue_of!(T, d.type, f, d, Int64(i), estimate)
-    end
-    # Nullable fixed-width bulk extraction first builds Vector{E}, then its
-    # public Vector{Union{Missing,E}}. Account for that private scratch copy.
-    E = Base.nonmissingtype(T)
-    if Missing <: T &&
-       isbitstype(E) &&
-       d.type isa
-       Union{IntType,FloatType,TimestampType,DateType,TimeType,DurationType,DecimalType} &&
-       E === juliatype(d.type) &&
-       primwidth(d.type) == Int64(sizeof(E))
-        _reservevector!(estimate, E, d.len, "typed materialization scratch")
+    # Fixed-width values charge nothing beyond the column under a typed
+    # claim (only `Any` boxes them), so they skip the per-value walk.
+    fixedwidth =
+        d.type isa Union{
+            IntType,
+            FloatType,
+            TimestampType,
+            DurationType,
+            DateType,
+            TimeType,
+            IntervalType,
+            BoolType,
+            NullType,
+        }
+    if !fixedwidth
+        for i = 1:(d.len)
+            _prechargevalue_of!(T, d.type, f, d, Int64(i), estimate)
+        end
     end
     _commitestimate!(estimate, "typed materialized column")
     return _typedmaterialize_of(T, d.type, f, d)::Vector{T}

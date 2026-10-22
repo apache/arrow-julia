@@ -2203,7 +2203,8 @@ end
             Any[1, missing, 3, missing],
         )
         NT = Union{Missing,Int64}
-        nullabletyped = vectorbytes(NT, nd.len) + vectorbytes(Int64, nd.len)
+        # The nullable bulk path loads values straight into its result.
+        nullabletyped = vectorbytes(NT, nd.len)
         @test isequal(
             exactbudget(b -> materialize(NT, nf, nd, b), nullabletyped),
             NT[1, missing, 3, missing],
