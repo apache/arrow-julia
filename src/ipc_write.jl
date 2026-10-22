@@ -299,6 +299,7 @@ function _finishmessage!(out::Vector{UInt8}, b::FB.Builder, msg, body::Vector{UI
     meta = collect(FB.finishedbytes(b))
     _pad8!(meta)
     length(body) % 8 == 0 || throw(ArgumentError("message body must be padded"))
+    sizehint!(out, length(out) + 8 + length(meta) + length(body))
     append!(out, reinterpret(UInt8, UInt32[CONTINUATION, UInt32(length(meta))]))
     append!(out, meta)
     append!(out, body)
@@ -400,6 +401,26 @@ function encodebuffer!(c::EncodeCursor, bytes::Vector{UInt8})
     return nothing
 end
 
+# An uncompressed buffer is copied straight from its slice into the body;
+# compression needs the slice as a vector first.
+function encodebuffer!(c::EncodeCursor, b::AC.BufferSlice)
+    c.codec == CODEC_NONE || return encodebuffer!(c, AC.slicebytes(b))
+    offset = Int64(length(c.body))
+    offset % 8 == 0 || throw(ArgumentError("encoder lost body alignment"))
+    n = Int64(b.len)
+    if n > 0
+        b.region === nothing && throw(ArgumentError("empty buffer has no data"))
+        resize!(c.body, offset + n)
+        # Preserve both owners across the raw copy.
+        GC.@preserve b c begin
+            unsafe_copyto!(pointer(c.body, offset + 1), AC.sliceptr(b), n)
+        end
+    end
+    push!(c.buffers, (offset, n))
+    n > 0 && _pad8!(c.body)
+    return nothing
+end
+
 "Encode view entries and the union of their referenced byte ranges."
 function _encodeviewbuffers!(c::EncodeCursor, d::ArrayData)
     # In-memory views may borrow a whole parser input or a larger column.
@@ -441,7 +462,7 @@ function _encodeviewbuffers!(c::EncodeCursor, d::ArrayData)
         push!(c.variadics, Int64(length(coverage)))
         for (i, extent) in enumerate(coverage)
             # Only the proven prefix is copied; trailing bytes are unused.
-            encodebuffer!(c, AC.slicebytes(AC.subslice(d.buffers[i + 2], 0, extent)))
+            encodebuffer!(c, AC.subslice(d.buffers[i + 2], 0, extent))
         end
         return nothing
     end
@@ -543,7 +564,7 @@ function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
             # terminal zero offset (length + 1 entries).
             encodebuffer!(c, zeros(UInt8, spec.offsetwidth))
         else
-            encodebuffer!(c, AC.slicebytes(b))
+            encodebuffer!(c, b)
         end
     end
     if spec.variadic
@@ -552,7 +573,7 @@ function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
         # variadicBufferCounts vector, depth-first (format 1.4).
         push!(c.variadics, Int64(length(d.buffers) - length(spec.buffers)))
         for b in Iterators.drop(d.buffers, length(spec.buffers))
-            encodebuffer!(c, AC.slicebytes(b))
+            encodebuffer!(c, b)
         end
     end
     t isa DictionaryType && return nothing
@@ -605,6 +626,31 @@ function _batchheader!(b::FB.Builder, c::EncodeCursor, nrows::Int64)
     return Meta.recordBatchEnd(b)
 end
 
+# Padded byte size of a column's buffers, children included and dictionary
+# pools excluded (they travel in their own messages): the uncompressed body
+# size, used to size the body once instead of growing it per buffer.
+function _bodybytes(d::ArrayData)
+    n = Int64(0)
+    for b in d.buffers
+        n = AC.checked_add(n, (Int64(b.len) + 7) & ~Int64(7))
+    end
+    for child in d.children
+        n = AC.checked_add(n, _bodybytes(child))
+    end
+    return n
+end
+
+# Capacity for an eager writer's output: the uncompressed record bodies plus
+# slack for metadata and dictionaries, so the staging buffer rarely regrows.
+function _outputhint(batches, codec::Int8)
+    codec == CODEC_NONE || return 0
+    n = Int64(4096)
+    for batch in batches
+        n = AC.checked_add(n, sum(_bodybytes, batch.columns; init=Int64(1024)))
+    end
+    return Int(n)
+end
+
 function _recordmessage!(
     out::Vector{UInt8},
     batch::AC.RecordBatch,
@@ -613,6 +659,7 @@ function _recordmessage!(
     state::Union{Nothing,EncodeState},
 )
     c = EncodeCursor(codec, state)
+    codec == CODEC_NONE && sizehint!(c.body, sum(_bodybytes, batch.columns; init=Int64(0)))
     for (f, col) in zip(fields, batch.columns)
         encodefield!(c, f, col)
     end
@@ -1139,7 +1186,7 @@ function writestream(
     ids = assigndictids(sch.fields, dictids)
     validatedictionaryids(sch.fields, IdDict{Field,Int64}(ids))
     _validatewriterbatches(sch, batches, ids)
-    io = IOBuffer()
+    io = IOBuffer(; sizehint=_outputhint(batches, codec))
     st = beginwrite!(
         io,
         sch;
@@ -1208,7 +1255,7 @@ function writefile(
     # one nested id topology, one pool per id within each batch.
     validatedictionaryids(sch.fields, IdDict{Field,Int64}(ids))
     _validatewriterbatches(sch, batches, ids)
-    io = IOBuffer()
+    io = IOBuffer(; sizehint=_outputhint(batches, codec))
     st = beginwrite!(
         io,
         sch;

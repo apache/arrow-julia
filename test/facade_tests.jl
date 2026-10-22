@@ -160,6 +160,12 @@ function _tableallocs(bytes)
     return @allocated Arrow.Table(bytes)
 end
 
+function _writeallocs(path, tbl)
+    Arrow.write(path, tbl)
+    Arrow.write(path, tbl)
+    return @allocated Arrow.write(path, tbl)
+end
+
 @testset "Arrow facade" begin
     @testset "file round-trip with metadata" begin
         path = tempname()
@@ -1155,6 +1161,14 @@ end
             )) |> take!
         # Julia 1.10 boxes in the per-element null punch, a separate cost.
         VERSION >= v"1.12" && @test _tableallocs(nb) < 14_000_000
+        # An uncompressed write stages the 8 MB column in the message body,
+        # the batch message, and the output buffer, and no more often.
+        path = tempname()
+        try
+            @test _writeallocs(path, (a=collect(Int64, 1:1_000_000),)) < 30_000_000
+        finally
+            rm(path; force=true)
+        end
     end
 
     @testset "Table iterates its columns like other Tables.AbstractColumns" begin
