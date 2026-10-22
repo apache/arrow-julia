@@ -551,6 +551,83 @@ end
 test_nonconforming_release() =
     @cfunction(_test_nonconforming_release, Cvoid, (Ptr{CArrowArray},))
 
+# A one-batch C stream producer over a hand-built struct column, for batch
+# shapes `export_stream!` never emits (null struct rows, struct offsets).
+# `private_data` stays non-NULL until the batch has been sent.
+const ONE_BATCH_STREAM = Ref{Any}(nothing)
+
+function _one_batch_move!(out::Ptr{T}, src::Ptr{T}) where {T}
+    unsafe_store!(out, unsafe_load(src))
+    _store_field!(src, :release, Ptr{Cvoid}(C_NULL))
+    return nothing
+end
+
+function _one_batch_get_schema(::Ptr{CArrowArrayStream}, out::Ptr{CArrowSchema})::Cint
+    f, d = ONE_BATCH_STREAM[]::Tuple{Field,ArrayData}
+    sp, ap = to_c_data(f, d)
+    _one_batch_move!(out, sp)
+    ccall(unsafe_load(ap).release, Cvoid, (Ptr{CArrowArray},), ap)
+    return Cint(0)
+end
+
+function _one_batch_get_next(stream::Ptr{CArrowArrayStream}, out::Ptr{CArrowArray})::Cint
+    if unsafe_load(stream).private_data == C_NULL
+        unsafe_store!(
+            out,
+            CArrowArray(
+                0,
+                0,
+                0,
+                0,
+                0,
+                Ptr{Ptr{Cvoid}}(C_NULL),
+                Ptr{Ptr{CArrowArray}}(C_NULL),
+                Ptr{CArrowArray}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+                Ptr{Cvoid}(C_NULL),
+            ),
+        )
+        return Cint(0)
+    end
+    f, d = ONE_BATCH_STREAM[]::Tuple{Field,ArrayData}
+    sp, ap = to_c_data(f, d)
+    _one_batch_move!(out, ap)
+    ccall(unsafe_load(sp).release, Cvoid, (Ptr{CArrowSchema},), sp)
+    _store_field!(stream, :private_data, Ptr{Cvoid}(C_NULL))
+    return Cint(0)
+end
+
+_one_batch_last_error(::Ptr{CArrowArrayStream})::Ptr{UInt8} = Ptr{UInt8}(C_NULL)
+
+function _one_batch_release(stream::Ptr{CArrowArrayStream})::Cvoid
+    _store_field!(stream, :release, Ptr{Cvoid}(C_NULL))
+    return nothing
+end
+
+"Fill `sp` with a C stream whose single batch is the struct column `(f, d)`."
+function one_batch_stream!(sp::Ptr{CArrowArrayStream}, f::Field, d::ArrayData)
+    ONE_BATCH_STREAM[] = (f, d)
+    unsafe_store!(
+        sp,
+        CArrowArrayStream(
+            @cfunction(
+                _one_batch_get_schema,
+                Cint,
+                (Ptr{CArrowArrayStream}, Ptr{CArrowSchema})
+            ),
+            @cfunction(
+                _one_batch_get_next,
+                Cint,
+                (Ptr{CArrowArrayStream}, Ptr{CArrowArray})
+            ),
+            @cfunction(_one_batch_last_error, Ptr{UInt8}, (Ptr{CArrowArrayStream},)),
+            @cfunction(_one_batch_release, Cvoid, (Ptr{CArrowArrayStream},)),
+            Ptr{Cvoid}(1),
+        ),
+    )
+    return sp
+end
+
 # ---------------------------------------------------------------------------
 # C Data battery support: nonconforming release probe and topology mutators
 # ---------------------------------------------------------------------------

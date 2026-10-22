@@ -1646,6 +1646,49 @@ function cdata_battery()
     @assert _registry_count() == sbefore
     println("zero-batch streams, double import, and release edges hold ✓")
 
+    # A C stream batch is a struct array. Null struct rows have no record-batch
+    # form and must be refused, not dropped; a struct offset and children that
+    # run past the struct select the visible child window.
+    rowf, rowd = fromjulia("x", Int64[10, 20, 30, 40, 50])
+    rowsf = Field("", StructType(); nullable=false, children=[rowf])
+    rowsref = Ref{CArrowArrayStream}()
+    GC.@preserve rowsref begin
+        rowsp = Base.unsafe_convert(Ptr{CArrowArrayStream}, rowsref)
+        nullrows = ArrayData(
+            StructType(),
+            5,
+            [AC._bitmapbuffer(Bool[1, 0, 1, 1, 1])];
+            children=[rowd],
+            nullcount=1,
+        )
+        rows = from_c_stream(one_batch_stream!(rowsp, rowsf, nullrows))
+        @assert try
+            nextbatch!(rows)
+            false
+        catch e
+            e isa ValidationError && occursin("null struct rows", e.msg)
+        end
+        release!(rows)
+        window = ArrayData(
+            StructType(),
+            2,
+            [BufferSlice()];
+            offset=2,
+            children=[rowd],
+            nullcount=0,
+        )
+        rows = from_c_stream(one_batch_stream!(rowsp, rowsf, window))
+        got = nextbatch!(rows)
+        @assert got.nrows == 2
+        @assert materialize(got.schema.fields[1], got.columns[1]) == Any[30, 40]
+        @assert nextbatch!(rows) === nothing
+        release!(rows)
+        release!(got.columns[1].owner::ForeignOwner)
+    end
+    @assert reap!() == 8                            # two roots per to_c_data call
+    @assert _registry_count() == sbefore
+    println("C stream struct batches refuse null rows and use their child window ✓")
+
     # Field metadata crosses the C boundary (the C data interface blob:
     # int32 pair count, length-prefixed keys and values), recursively
     # through children and dictionary value fields; absent metadata stays

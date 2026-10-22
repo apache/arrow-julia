@@ -2083,7 +2083,7 @@ function _nextbatch!(s::ImportedStream, ownerfactory)
             rethrow()
         end
         moved = false
-        d = try
+        return try
             GC.@preserve out _store_field!(
                 Base.unsafe_convert(Ptr{CArrowArray}, out),
                 :release,
@@ -2092,15 +2092,40 @@ function _nextbatch!(s::ImportedStream, ownerfactory)
             moved = true
             _arm_foreign_owner!(batchowner)
             _preflight_array(s.batchfield, arr)
-            d0 = _import_array(s.batchfield, arr, batchowner)
-            validate_semantic(s.batchfield, d0)
-            d0
+            d = _import_array(s.batchfield, arr, batchowner)
+            validate_semantic(s.batchfield, d)
+            _structbatch(s.schema, d)
         catch
             moved ? _release_moved_owner!(batchowner) : release!(batchowner)
             rethrow()
         end
-        return AC.RecordBatch(s.schema, collect(ArrayData, d.children), d.len)
     finally
         _finishstreamcall!(s)
     end
+end
+
+# A record batch has no row validity, so null struct rows are refused rather
+# than exposing the child values under them (Arrow C++ refuses them too).
+# Row i of a struct array is child row `offset + i`, and children may run past
+# `offset + length`; each column is that visible child window.
+function _structbatch(sch::Schema, d::ArrayData)
+    AC.nullcount(d) == 0 || throw(
+        ValidationError(
+            "C stream batch has null struct rows; a record batch cannot represent them",
+        ),
+    )
+    columns = ArrayData[
+        d.offset == 0 && c.len == d.len ? c :
+        AC._arraydata(
+            c.type,
+            d.len,
+            c.buffers,
+            c.offset + d.offset,
+            c.children,
+            c.dictionary,
+            c.owner,
+            -1,
+        ) for c in d.children
+    ]
+    return AC.RecordBatch(sch, columns, d.len)
 end
