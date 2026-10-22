@@ -1826,6 +1826,31 @@ end
         @test (@atomic d2.nullcount) == 2
     end
 
+    @testset "bitmap scans honor slice offsets and lengths" begin
+        # Null counts and nullable bulk reads walk the validity bitmap a byte
+        # at a time; every start bit and length must agree with per-element
+        # validity, and a bitmap too short for the slice must refuse.
+        vals = [i % 3 == 0 ? missing : Int64(i) for i = 1:40]
+        f, d = fromjulia("x", vals)
+        for off = 0:9, len = 0:(40 - off)
+            s = AC.ArrayData(d.type, len, d.buffers; offset=off)
+            want = vals[(off + 1):(off + len)]
+            @test nullcount(s) == count(ismissing, want)
+            @test isequal(materialize(Union{Missing,Int64}, f, s), want)
+        end
+        short = AC.ArrayData(d.type, 40, [AC.subslice(d.buffers[1], 0, 4), d.buffers[2]])
+        @test_throws BoundsError nullcount(short)
+        @test_throws BoundsError materialize(Union{Missing,Int64}, f, short)
+        # A claim without Missing refuses a slice holding a null (slot 2)
+        # and accepts one whose bits are all set.
+        @test_throws ArgumentError materialize(
+            Int64,
+            f,
+            AC.ArrayData(d.type, 2, d.buffers; offset=1),
+        )
+        @test materialize(Int64, f, AC.ArrayData(d.type, 2, d.buffers; offset=3)) == [4, 5]
+    end
+
     @testset "RecordBatch" begin
         b = batch((a=Int64[1, 2, 3], b=["x", "y", "z"]))
         @test b.nrows == 3

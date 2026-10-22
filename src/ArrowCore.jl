@@ -944,9 +944,27 @@ function _count_nulls(d::ArrayData)
     spec.buffers[1] == VALIDITY || return Int64(0)   # unions: no top-level nulls
     v = d.buffers[1]
     isempty_buffer(v) && return Int64(0)
+    return d.len - _countsetbits(v, d.offset, d.len)
+end
+
+"Set bits among the `len` bitmap bits that start at 0-based bit `start`."
+function _countsetbits(v::BufferSlice, start::Int64, len::Int64)
+    len > 0 || return Int64(0)
+    start >= 0 || throw(BoundsError(v, start))
+    stop = checked_add(start, len)           # exclusive
+    firstbyte, lastbyte = start >> 3, (stop - 1) >> 3
+    nbytes = lastbyte - firstbyte + 1
+    # One bounds check covers every byte the bits touch, as getbit's would.
+    (nbytes <= v.len && firstbyte <= v.len - nbytes) || throw(BoundsError(v, lastbyte))
     n = Int64(0)
-    for i = 1:(d.len)
-        n += !getbit(v, _slotindex0(d, Int64(i)))
+    GC.@preserve v begin
+        p = sliceptr(v) + firstbyte
+        for k = 0:(nbytes - 1)
+            byte = unsafe_load(p + k)
+            k == 0 && (byte &= 0xff << (start & 7))
+            k == nbytes - 1 && (byte &= 0xff >> (7 - ((stop - 1) & 7)))
+            n += count_ones(byte)
+        end
     end
     return n
 end
@@ -3476,11 +3494,7 @@ function _bulkmaterialize(
                 unsafe_copyto!(Ptr{UInt8}(pointer(vals)), sliceptr(src), Int(src.len))
             end
         end
-        if !isempty_buffer(v)
-            for i = 1:n
-                isvalid_at(d, Int64(i)) || _typednullrefuse(f)
-            end
-        end
+        isempty_buffer(v) || _countsetbits(v, d.offset, n) == n || _typednullrefuse(f)
         return vals
     end
     # A Missing-admitting vector has no contiguous byte view to copy into, so
@@ -3495,9 +3509,25 @@ function _bulkmaterialize(
             end
         end
     end
-    isempty_buffer(v) && return out
-    for i = 1:n
-        isvalid_at(d, Int64(i)) || (out[i] = missing)
+    isempty_buffer(v) || _punchnulls!(out, v, d.offset, n)
+    return out
+end
+
+# Set out[i] = missing for each cleared bit among the `n` validity bits that
+# start at 0-based bit `start`, under one bounds check for the bitmap bytes.
+function _punchnulls!(out::Vector, v::BufferSlice, start::Int64, n::Int64)
+    n > 0 || return out
+    start >= 0 || throw(BoundsError(v, start))
+    stop = checked_add(start, n)
+    firstbyte, lastbyte = start >> 3, (stop - 1) >> 3
+    nbytes = lastbyte - firstbyte + 1
+    (nbytes <= v.len && firstbyte <= v.len - nbytes) || throw(BoundsError(v, lastbyte))
+    GC.@preserve v begin
+        p = sliceptr(v)
+        for i = 1:n
+            bit = start + (i - 1)
+            (unsafe_load(p + (bit >> 3)) >> (bit & 7)) & 0x01 == 0x00 && (out[i] = missing)
+        end
     end
     return out
 end
