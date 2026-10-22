@@ -1440,8 +1440,13 @@ function _blockextent(block::NTuple{3,Int64}, dataend::Int64)
         throw(ValidationError("footer block metadata length is not 8-byte aligned"))
     bodylen % 8 == 0 ||
         throw(ValidationError("footer block body length is not 8-byte aligned"))
-    frameend = AC.checked_add(AC.checked_add(offset, metalen), bodylen)
-    frameend <= dataend || throw(ValidationError("footer block escapes the data section"))
+    # Every extent is nonnegative, so these comparisons cannot overflow.
+    (
+        offset <= dataend &&
+        metalen <= dataend - offset &&
+        bodylen <= dataend - offset - metalen
+    ) || throw(ValidationError("footer block escapes the data section"))
+    frameend = offset + metalen + bodylen
     return offset, frameend
 end
 

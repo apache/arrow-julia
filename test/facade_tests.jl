@@ -2419,6 +2419,25 @@ end
             t = Arrow.Table(take!(Arrow.tobuffer((st=values,))))
             @test only(skipmissing(t.st))[1].second == Date(2024, 1, 1)
         end
+
+        # Footer Block extents near typemax(Int64) are invalid input, not an
+        # arithmetic overflow, on every read path.
+        io = IOBuffer()
+        Arrow.write(io, (x=Int64[1, 2],); file=true)
+        good = take!(io)
+        (offset, metalen, bodylen) = Arrow.readfile(copy(good)).recordblocks[1]
+        block = reinterpret(UInt8, [offset, Int64(metalen), bodylen])
+        at = findlast(block, good)
+        @test at !== nothing
+        for (slot, forged) in ((0, typemax(Int64) - 7), (16, typemax(Int64) - 7))
+            bad = copy(good)
+            bad[first(at) .+ (slot:(slot + 7))] .= reinterpret(UInt8, [forged])
+            @test_throws Arrow.ValidationError Arrow.Table(bad)
+            @test_throws Arrow.ValidationError Arrow.Table(
+                _BytesSource(bad);
+                scan=Tables.Scan(select=(:x,)),
+            )
+        end
     end
 
     @testset "advisory nullability: nulls under a non-nullable field read" begin
