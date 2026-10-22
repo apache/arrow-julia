@@ -39,6 +39,12 @@ function _existingjlsymbol(name::AbstractString)
     return pointer == C_NULL ? nothing : Symbol(name)
 end
 
+# ArrowTypes.jl hooks take FixedSizeBinary storage as `NTuple{N,UInt8}` (for
+# example `fromarrow(::Type{UUID}, ::NTuple{16,UInt8})`). Wider descriptors keep
+# their bytes as a vector so an untrusted width cannot force a huge tuple type.
+_arrowtypesfixedbinarytype(t::AC.FixedSizeBinaryType) =
+    t.nbytes <= _MAX_ARROWTYPE_EXACT_ARITY ? NTuple{t.nbytes,UInt8} : Vector{UInt8}
+
 function _boundedfixedliststoragetype(listsize::Int, element)
     # Julia materializes an NTuple type's parameter list in O(N) space. Keep
     # the exact storage signature for ordinary fixed lists, but use the compact
@@ -792,6 +798,7 @@ function _arrowtypesstoragebasetype(ctx::_ArrowTypesContext, f::AC.Field)
         end
         return T
     end
+    t isa AC.FixedSizeBinaryType && return _arrowtypesfixedbinarytype(t)
     return _arrowtypesprimitivebasetype(f)
 end
 
@@ -810,6 +817,7 @@ function _arrowtypesfallbackstoragebasetype(ctx::_ArrowTypesContext, f::AC.Field
     t isa AC.StructType && return Vector{Pair{String,Any}}
     t isa AC.MapType && return Dict{Any,Any}
     t isa AC.UnionType && return Any
+    t isa AC.FixedSizeBinaryType && return _arrowtypesfixedbinarytype(t)
     return _arrowtypesprimitivebasetype(f)
 end
 
@@ -1362,7 +1370,14 @@ function _arrowtypesstoragevalue(
     # leaf outside any label already arrived public from the routed walker;
     # a leaf inside a label-without-target subtree arrived as raw storage
     # and converts here, landing in public rows like every unmarked value.
-    extension_shape && return _arrowtypesscalar(t, x)
+    if extension_shape
+        if t isa AC.FixedSizeBinaryType && _arrowtypesfixedbinarytype(t) !== Vector{UInt8}
+            # The tuple is built here and copied again into the dynamic hook call.
+            _chargeobject!(ctx.budget, 2 * t.nbytes, "ArrowTypes fixed-size binary tuple")
+            return NTuple{t.nbytes,UInt8}(x)
+        end
+        return _arrowtypesscalar(t, x)
+    end
     if rawdomain && _isconvertibleleaf(t)
         # Same reserve as the facade's converted leaf: the public box plus
         # its transient conversion temporaries.

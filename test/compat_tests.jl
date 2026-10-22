@@ -20,6 +20,7 @@ using Tables
 using Arrow
 using ArrowTypes
 import Durations
+import UUIDs
 
 const AC = Arrow.ArrowCore
 
@@ -175,6 +176,20 @@ end
         RawNT = NamedTuple{(:when, :day),Tuple{Int64,Int32}}
         @test_throws Exception Arrow.Table(tsbytes; scan=Tables.Scan(select=(:c => RawNT,)))
     end
+end
+
+@testset "Arrow 2.x FixedSizeBinary extension columns" begin
+    # Arrow 2.x wrote every NTuple{N,UInt8} storage type, including UUID, as
+    # FixedSizeBinary(N); ArrowTypes.jl restores UUID from NTuple{16,UInt8}.
+    u = [UUIDs.UUID(1), UUIDs.UUID(typemax(UInt128) - 1)]
+    t = AC.FixedSizeBinaryType(16)
+    meta = ["ARROW:extension:name" => "JuliaLang.UUID", "ARROW:extension:metadata" => ""]
+    bytes = collect(reinterpret(UInt8, [x.value for x in u]))
+    d = AC.ArrayData(t, 2, [AC.BufferSlice(), AC._databuffer(bytes)]; nullcount=0)
+    sch = AC.Schema([AC.Field("u", t; nullable=false, metadata=meta)])
+    tbl = Arrow.Table(Arrow.writefile(sch, [AC.RecordBatch(sch, [d])]))
+    @test eltype(tbl.u) == UUIDs.UUID
+    @test tbl.u == u
 end
 
 @testset "timezone-aware timestamps without TimeZones" begin

@@ -859,6 +859,9 @@ ArrowTypes.JuliaType(::Val{ARROWTYPES_TEST_BYTES_ALIAS_NAME}, S, metadata) =
     ArrowTypesTestBytesAlias
 ArrowTypes.fromarrow(::Type{ArrowTypesTestBytesAlias}, x::AbstractVector{UInt8}) =
     ArrowTypesTestBytesAlias(collect(UInt8, x))
+# FixedSizeBinary storage reaches ArrowTypes hooks as NTuple{N,UInt8}.
+ArrowTypes.fromarrow(::Type{ArrowTypesTestBytesAlias}, x::NTuple{N,UInt8}) where {N} =
+    ArrowTypesTestBytesAlias(collect(UInt8, x))
 
 struct ArrowTypesTestIntListAlias
     value::Vector{Int32}
