@@ -320,9 +320,9 @@ Utf8View and BinaryView (`vu`/`vz`, with the C-Data-only trailing int64
 buffer of variadic data-buffer lengths), ListView/LargeListView
 (`+vl`/`+vL`), and run-end encoding (`+r`). Field metadata and schema-level
 metadata cross both directions (schema metadata rides the stream's
-struct-typed schema node; dictionary field metadata rides the wrapper node,
-matching the C++ bridge, and import concatenates wrapper and dependent
-pairs losslessly).
+struct-typed schema node; dictionary field metadata rides the wrapper node
+and a dictionary's extension pairs ride its value node, matching the C++
+bridge, and import concatenates wrapper and dependent pairs losslessly).
 
 Foreign allocation extents cannot be verified by the ABI and are trusted
 declarations; the producer must keep declared storage alive and unchanged

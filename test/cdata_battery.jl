@@ -1747,6 +1747,29 @@ function cdata_battery()
     @assert getvalue(df2, dd2, 2) == "hi"
     release!(dd2.buffers[2].region::OwnerRegion)
     reap!()
+    # Extension pairs name the dictionary's VALUE type: they ride the value
+    # node (on the wrapper they would declare dictionary storage, which
+    # PyArrow refuses), and import rejoins them after the wrapper's pairs.
+    extmeta = [
+        "dk" => "dv",
+        "ARROW:extension:name" => "arrow.json",
+        "ARROW:extension:metadata" => "",
+    ]
+    xf = Field(
+        "d",
+        dvf.type;
+        nullable=dvf.nullable,
+        metadata=extmeta,
+        children=collect(Field, dvf.children),
+    )
+    xsp, xap = to_c_data(xf, dvd)
+    xsch = unsafe_load(xsp)
+    @assert Arrow._import_cmetadata(xsch.metadata) == extmeta[1:1]
+    @assert Arrow._import_cmetadata(unsafe_load(xsch.dictionary).metadata) == extmeta[2:3]
+    xf2, xd2 = from_c_data(xsp, xap)
+    @assert collect(xf2.metadata) == extmeta
+    release!(xd2.buffers[2].region::OwnerRegion)
+    reap!()
     # A foreign producer annotating the DEPENDENT node too (extension-type
     # metadata is legal there) loses no pair on import: wrapper pairs
     # first, then the dependent node's.

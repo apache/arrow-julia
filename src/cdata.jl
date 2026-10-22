@@ -643,10 +643,27 @@ function _newcontrol!(root::ExportedRoot)
     return control
 end
 
+# A dictionary Field's extension pairs name its VALUE type, as in IPC. Like the
+# C++ bridge, export them on the dependent value node and the remaining field
+# metadata on the wrapper: an extension on the wrapper would declare dictionary
+# storage, which PyArrow refuses for its canonical extension types.
+# (Literal keys: the trim gate includes this file without arrowtypes.jl.)
+_isextensionpair(kv) =
+    first(kv) == "ARROW:extension:name" || first(kv) == "ARROW:extension:metadata"
+
+function _splitdictmetadata(metadata::Union{Nothing,AC.FrozenVector{Pair{String,String}}})
+    (metadata === nothing || !any(_isextensionpair, metadata)) && return metadata, nothing
+    wrapper = Pair{String,String}[kv for kv in metadata if !_isextensionpair(kv)]
+    values = Pair{String,String}[kv for kv in metadata if _isextensionpair(kv)]
+    return (isempty(wrapper) ? nothing : AC.FrozenVector{Pair{String,String}}(wrapper)),
+    AC.FrozenVector{Pair{String,String}}(values)
+end
+
 function _export_schema!(
     root::ExportedRoot,
     f::Field,
     release::Ptr{Cvoid},
+    metadata::Union{Nothing,AC.FrozenVector{Pair{String,String}}}=f.metadata,
 )::Ptr{CArrowSchema}
     p = Ptr{CArrowSchema}(_malloc!(root, sizeof(CArrowSchema)))
     childfields = f.type isa DictionaryType ? Field[] : f.children
@@ -664,8 +681,10 @@ function _export_schema!(
         end
     end
     dict = Ptr{CArrowSchema}(C_NULL)
+    wrappermetadata = metadata
     if f.type isa DictionaryType
-        dict = _export_schema!(root, AC.dictvaluefield(f, f.type), release)
+        wrappermetadata, valuemetadata = _splitdictmetadata(metadata)
+        dict = _export_schema!(root, AC.dictvaluefield(f, f.type), release, valuemetadata)
     end
     flags = f.nullable ? ARROW_FLAG_NULLABLE : Int64(0)
     f.type isa DictionaryType && f.type.ordered && (flags |= ARROW_FLAG_DICTIONARY_ORDERED)
@@ -677,10 +696,8 @@ function _export_schema!(
             _cstring!(root, formatstring_of(f.type)),
             _cstring!(root, f.name),
             # Field metadata rides the OUTER node for every field, dictionary
-            # wrappers included — the C++ bridge exports field.metadata() on
-            # the wrapper and only TYPE metadata (extensions) on the dependent
-            # value node, and PyArrow imports only the wrapper's pairs.
-            _cmetadata!(root, f.metadata),
+            # wrappers included; PyArrow imports only the wrapper's pairs.
+            _cmetadata!(root, wrappermetadata),
             flags,
             nchildren,
             childptrs,
