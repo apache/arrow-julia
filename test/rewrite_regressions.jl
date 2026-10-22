@@ -152,6 +152,53 @@ end
         )
     end
 
+    @testset "scan results retain dictionary pools" begin
+        # An ordered dictionary rewrites only with its category pool. A scan
+        # keeps the pool, unused categories included, as a full read does.
+        poolfield, pooldata = AC.fromjulia("ordered-values", ["a", "b", "unused"])
+        t = AC.DictionaryType(AC.IntType(8, true), poolfield.type, true)
+        ddata = AC.ArrayData(
+            t,
+            2,
+            [AC.BufferSlice(), AC._databuffer(Int8[1, 0])];
+            dictionary=pooldata,
+            nullcount=0,
+        )
+        dfield =
+            AC.Field("d", t; nullable=false, children=collect(AC.Field, poolfield.children))
+        # A Decimal predicate has no storage-domain form: the public fallback.
+        Dec = Arrow.DataDecimals.Decimal64{2}
+        xio = IOBuffer()
+        Arrow.write(xio, (x=[Dec("1.00"), Dec("2.00")],); file=false)
+        xs = Arrow.readstream(take!(xio))
+        schema = AC.Schema([dfield, xs.schema.fields[1]])
+        batch = AC.RecordBatch(schema, [ddata, xs.batches[1].columns[1]], 2)
+        streambytes = Arrow.writestream(schema, [batch])
+        filebytes = Arrow.writefile(schema, [batch])
+        scans = (
+            Tables.Scan(
+                select=(:d => :e,),
+                filter=Tables.colcmp(==, Tables.col(:d), "a"),
+            ) => ["a"],
+            Tables.Scan(select=(:d => :e,), filter=Tables.col(:x) < Dec("2.00")) =>
+                ["b"],
+        )
+        for (scan, want) in scans,
+            source in (streambytes, filebytes, _BytesSource(filebytes))
+
+            got = Arrow.Table(source isa Vector{UInt8} ? copy(source) : source; scan=scan)
+            @test got.e == want
+            io = IOBuffer()
+            Arrow.write(io, got)
+            back = Arrow.readfile(take!(io))
+            field = back.schema.fields[1]
+            @test (field.type::AC.DictionaryType).ordered
+            pool = back[1].columns[1].dictionary
+            @test AC.materialize(AC.dictvaluefield(field, field.type), pool) ==
+                  ["a", "b", "unused"]
+        end
+    end
+
     @testset "retained byte and scalar layouts rebuild exactly" begin
         raw = Vector{UInt8}(codeunits("short-thirteen-byte"))
         payloads = StringPayload[

@@ -1527,19 +1527,38 @@ function _mergecategorypools(pools; widen::Bool=false, budget=nothing)
     return out
 end
 
+"""
+The retained pool of a top-level dictionary column whose batches all share
+`dictionary`; `nothing` (no batch) retains an empty pool.
+"""
+function _retainedsnapshotpool(
+    f::AC.Field,
+    dictionary::Union{Nothing,AC.ArrayData},
+    arrowtypes::_ArrowTypesContext,
+)
+    # DictionaryType stores the value descriptor on the index Field. Reapply
+    # that Field's extension metadata while materializing pool snapshots so a
+    # registered dictionary value and its nested children lift exactly once.
+    vf = _arrowtypesdictvaluefield(
+        arrowtypes,
+        f,
+        f.type::AC.DictionaryType;
+        retainmetadata=true,
+    )
+    dictionary === nothing && return _facadecolumn(vf, Any[], arrowtypes)
+    return _facadesinglecolumn(vf, dictionary, arrowtypes)
+end
+
 "Retain one top-level dictionary's category order across pool snapshots."
 function _retaineddictpool(f::AC.Field, batches, i::Int, arrowtypes::_ArrowTypesContext)
     t = f.type
     t isa AC.DictionaryType || return nothing
-    # DictionaryType stores the value descriptor on the index Field. Reapply
-    # that Field's extension metadata while materializing pool snapshots so a
-    # registered dictionary value and its nested children lift exactly once.
-    vf = _arrowtypesdictvaluefield(arrowtypes, f, t; retainmetadata=true)
-    isempty(batches) && return _facadecolumn(vf, Any[], arrowtypes)
+    isempty(batches) && return _retainedsnapshotpool(f, nothing, arrowtypes)
     firstdictionary = batches[1].columns[i].dictionary::AC.ArrayData
     if all(batch -> batch.columns[i].dictionary === firstdictionary, batches)
-        return _facadesinglecolumn(vf, firstdictionary, arrowtypes)
+        return _retainedsnapshotpool(f, firstdictionary, arrowtypes)
     end
+    vf = _arrowtypesdictvaluefield(arrowtypes, f, t; retainmetadata=true)
     _chargevector!(
         arrowtypes.budget,
         AC.ArrayData,

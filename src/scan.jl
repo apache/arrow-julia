@@ -2415,9 +2415,19 @@ function _publicscan(
     precols = AbstractVector[Tables.getcolumn(full, bc.index) for bc in b.columns]
     n = Int(Tables.rowcount(cols))
     bound = _boundschema(schema, sourcefields, b, precols, budget)
+    fullpools = getfield(full, :retainedpools)
+    _chargevector!(budget, Any, length(b.columns), "scan retained dictionary pools")
+    pools = Any[
+        _keepsfield(bc, precols[i]) ? fullpools[bc.index] : nothing for
+        (i, bc) in enumerate(b.columns)
+    ]
     _chargevector!(budget, AC.OwnerRegion, length(regions), "scan owner regions")
-    return _table(names, columns, bound, AC.OwnerRegion[regions...], n, nothing, budget)
+    return _table(names, columns, bound, AC.OwnerRegion[regions...], n, pools, budget)
 end
+
+"Whether an output keeps its source field: no override, or a no-op one."
+_keepsfield(bc::Tables.BoundColumn, precol) =
+    bc.type === nothing || eltype(precol) <: Union{bc.type,Missing}
 
 """
 The OUTPUT schema of a scan: bound source fields under their output names.
@@ -2433,10 +2443,7 @@ function _boundschema(schema, sourcefields, b::Tables.BoundScan, precols, budget
     sizehint!(outfields, length(b.columns))
     for (i, bc) in enumerate(b.columns)
         f = sourcefields[bc.index]
-        if bc.type !== nothing && i <= length(precols)
-            D = eltype(precols[i])
-            D <: Union{bc.type,Missing} || continue
-        end
+        i <= length(precols) && !_keepsfield(bc, precols[i]) && continue
         # Metadata and children are immutable Core values. Share them instead
         # of copying the same schema subtrees once per aliased selection.
         _chargeobject!(budget, sizeof(bc.name), "scan field name")
@@ -2460,6 +2467,7 @@ function _finishfacadescan(
     plan::_ScanPlan;
     regions=AC.OwnerRegion[],
     budget=nothing,
+    poolof=nothing,
 )
     cols = Tables.columns(got)
     ncols = length(Tables.columnnames(cols))
@@ -2471,6 +2479,7 @@ function _finishfacadescan(
     precols = AbstractVector[]
     sizehint!(precols, length(columns))
     b = plan.public
+    pools = nothing
     if !isempty(sourcefields)
         arrowtypes = _ArrowTypesContext(budget=budget)
         length(b.columns) == length(columns) || throw(
@@ -2488,11 +2497,41 @@ function _finishfacadescan(
             push!(precols, base)
             columns[i] = bc.type === nothing ? base : _applyoverride(bc.type, base, budget)
         end
+        # Dictionary columns keep their source category pool, as a full read
+        # does, so a rewrite preserves category order (required when ordered).
+        if poolof !== nothing
+            _chargevector!(budget, Any, length(b.columns), "scan retained dictionary pools")
+            pools = Any[
+                sourcefields[bc.index].type isa DictionaryType &&
+                _keepsfield(bc, precols[i]) ?
+                poolof(bc, sourcefields[bc.index], arrowtypes) : nothing for
+                (i, bc) in enumerate(b.columns)
+            ]
+        end
     end
     nrows = isempty(columns) ? _scanrowcount(got) : length(columns[1])
     bound = _boundschema(schema, sourcefields, b, precols, budget)
     _chargevector!(budget, AC.OwnerRegion, length(regions), "scan owner regions")
-    return _table(names, columns, bound, AC.OwnerRegion[regions...], nrows, nothing, budget)
+    return _table(names, columns, bound, AC.OwnerRegion[regions...], nrows, pools, budget)
+end
+
+# File record batches all reference each dictionary's final pool, so the first
+# decoded snapshot of a selected dictionary column is the pool a full read
+# retains. Slots start `nothing`; the facade materializer fills them.
+function _dictsnapshots(fields, b::Tables.BoundScan, budget)
+    n = count(bc -> fields[bc.index].type isa DictionaryType, b.columns)
+    _chargedict!(budget, Field, Union{Nothing,ArrayData}, n, "scan dictionary snapshots")
+    snapshots = IdDict{Field,Union{Nothing,ArrayData}}()
+    for bc in b.columns
+        f = fields[bc.index]
+        f.type isa DictionaryType && (snapshots[f] = nothing)
+    end
+    return snapshots
+end
+
+function _snapshotdict!(snapshots, field::Field, data::ArrayData)
+    get(snapshots, field, missing) === nothing && (snapshots[field] = data.dictionary)
+    return nothing
 end
 
 # The facade executor only accepts the override-free storage half of a plan.
@@ -2527,7 +2566,10 @@ function _applyfacadescan(
     actual =
         budget === nothing ? AllocationBudget(f.limits.max_total_allocated_bytes) : budget
     routes = _ArrowTypesRoutePlan(actual)
-    materialize = (field, data, _) -> _batchcolumn(field, data, routes)
+    snapshots = _dictsnapshots(f.fields, b, actual)
+    materialize =
+        (field, data, _) ->
+            (_snapshotdict!(snapshots, field, data); _batchcolumn(field, data, routes))
     got = _runboundscan(f, b, plan.names, actual, materialize)
     return _finishfacadescan(
         got,
@@ -2536,14 +2578,26 @@ function _applyfacadescan(
         plan;
         regions=AC.OwnerRegion[f.region],
         budget=actual,
+        poolof=(_, field, ctx) -> _retainedsnapshotpool(field, snapshots[field], ctx),
     )
 end
 
 function _applyfacadescan(sf::SourceFile, plan::_ScanPlan, ft, budget::AllocationBudget)
     routes = _ArrowTypesRoutePlan(budget)
-    materialize = (field, data, _) -> _batchcolumn(field, data, routes)
-    got = _runboundscan(sf, _facadestorage(plan), plan.names, ft, budget, materialize)
-    return _finishfacadescan(got, ft.sch, ft.fields, plan; budget=budget)
+    b = _facadestorage(plan)
+    snapshots = _dictsnapshots(ft.fields, b, budget)
+    materialize =
+        (field, data, _) ->
+            (_snapshotdict!(snapshots, field, data); _batchcolumn(field, data, routes))
+    got = _runboundscan(sf, b, plan.names, ft, budget, materialize)
+    return _finishfacadescan(
+        got,
+        ft.sch,
+        ft.fields,
+        plan;
+        budget=budget,
+        poolof=(_, field, ctx) -> _retainedsnapshotpool(field, snapshots[field], ctx),
+    )
 end
 
 function _facadescanrawcolumn(s::IPCStream, i::Int, budget, routes::_ArrowTypesRoutePlan)
@@ -2578,6 +2632,7 @@ function _applyfacadescan(
         plan;
         regions=_sourceregions(s, budget),
         budget=budget,
+        poolof=(bc, field, ctx) -> _retaineddictpool(field, s.batches, bc.index, ctx),
     )
 end
 
