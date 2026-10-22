@@ -831,6 +831,17 @@ end
         firstshort, state = iterate(shortstream)
         @test firstshort.x == [1, 2]
         @test_throws Arrow.AllocationLimitError iterate(shortstream, state)
+
+        # The displayed error names the limit and how to raise it.
+        err = try
+            Arrow.Table(bytes; limits=Arrow.Limits(max_total_allocated_bytes=64))
+        catch e
+            e
+        end
+        @test err isa Arrow.AllocationLimitError
+        shown = sprint(showerror, err)
+        @test occursin(err.msg, shown)
+        @test occursin("limits=Arrow.Limits(max_total_allocated_bytes=", shown)
     end
 
     @testset "mmap path and release!" begin

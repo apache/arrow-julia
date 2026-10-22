@@ -99,7 +99,16 @@ materialization allocations for one read.
 struct AllocationLimitError <: Exception
     msg::String
 end
-Base.showerror(io::IO, e::AllocationLimitError) = print(io, e.msg)
+
+function Base.showerror(io::IO, e::AllocationLimitError)
+    print(
+        io,
+        e.msg,
+        " (Limits.max_total_allocated_bytes; to read trusted input that needs ",
+        "more, pass `limits=Arrow.Limits(max_total_allocated_bytes=...)`)",
+    )
+    return nothing
+end
 
 function _charge_unlocked!(budget::AllocationBudget, amount::Int64, what::AbstractString)
     amount >= 0 || throw(ArgumentError("negative allocation charge"))
