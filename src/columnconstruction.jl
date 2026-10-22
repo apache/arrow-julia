@@ -5077,7 +5077,15 @@ function _dictionarypool(vals, retainedpool; writetype=nothing)
         key = _WriterStorageKey(x)
         haskey(seen, key) || (seen[key] = nothing)
     end
-    for v in vals, x in v
+    for v in vals
+        _addcategories!(pool, seen, v)
+    end
+    return pool
+end
+
+# Function barrier: `pool` and each part of `vals` are only known at run time.
+function _addcategories!(pool, seen, v)
+    for x in v
         x === missing && continue
         key = _WriterStorageKey(x)
         if !haskey(seen, key)
@@ -5085,7 +5093,7 @@ function _dictionarypool(vals, retainedpool; writetype=nothing)
             seen[key] = nothing
         end
     end
-    return pool
+    return nothing
 end
 
 struct _DictionaryEvidence
@@ -5375,9 +5383,8 @@ end
 "One shared-pool dictionary batch: identical pool OBJECT across batches."
 function _dictbatch(fld::AC.Field, indices::Vector, pool_d::AC.ArrayData)
     t = fld.type::AC.DictionaryType
-    IT = AC.juliatype(t.indextype)
     present = [x !== missing for x in indices]
-    inds = IT[x === missing ? zero(IT) : IT(x) for x in indices]
+    inds = _dictindexvalues(AC.juliatype(t.indextype), indices)
     nc = count(!, present)
     d = AC.ArrayData(
         t,
@@ -5388,6 +5395,10 @@ function _dictbatch(fld::AC.Field, indices::Vector, pool_d::AC.ArrayData)
     )
     return d
 end
+
+# Function barrier: the index type is a run-time property of the field.
+_dictindexvalues(::Type{IT}, indices) where {IT} =
+    IT[x === missing ? zero(IT) : IT(x) for x in indices]
 
 "Field + first-batch data for a dictionary column under a RETAINED type."
 function _retaineddictfromdata(

@@ -256,6 +256,14 @@ end
     @test occursin("CompatHasPtr", err.value.msg)
 end
 
+@testset "dictionary writes do not allocate per row" begin
+    # Ref-pool and DictEncode columns share one encoder; 200,000 cells here.
+    vals = [string("c", i % 50) for i = 1:100_000]
+    tbl = (d=Arrow.DictEncode(vals), p=PooledArray(vals))
+    Arrow.tobuffer(tbl)
+    @test (@allocations Arrow.tobuffer(tbl)) < 100_000
+end
+
 @testset "Arrow 2.x FixedSizeBinary extension columns" begin
     # Arrow 2.x wrote every NTuple{N,UInt8} storage type, including UUID, as
     # FixedSizeBinary(N); ArrowTypes.jl restores UUID from NTuple{16,UInt8}.
