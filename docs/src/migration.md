@@ -103,6 +103,14 @@ back as `Timestamp{Millisecond}`, which compares equal to the `DateTime`
 values it stores (Arrow 2.x truncated sub-millisecond units to `DateTime`
 with a warning; Arrow 3.0 is exact and never truncates).
 
+Arrow 2.x labelled its temporal columns with extension names such as
+`JuliaLang.DateTime` and `JuliaLang.ZonedDateTime-UTC`. Arrow 3.0 reads those
+columns with the native mappings above. Arrow.jl releases before 2.4.2 wrote
+`ZonedDateTime` columns under the name `JuliaLang.ZonedDateTime` with local
+wall-clock time as the stored value. Arrow 3.0 reads that storage as a UTC
+instant and warns about the name; read such a file with Arrow 2.x and rewrite
+it.
+
 The old positional byte-window arguments and multi-input constructors were
 removed. Pass one complete path, `IO`, byte vector, or byte-range source to
 `Arrow.Table` or `Arrow.Stream`. Slice an in-memory byte vector before the call

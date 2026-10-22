@@ -192,6 +192,41 @@ end
     @test tbl.u == u
 end
 
+@testset "Arrow 2.x temporal extension labels" begin
+    # Arrow 2.x labelled its temporal columns; Arrow 3.0 reads the storage
+    # natively and does not warn about these labels.
+    label(name) = ["ARROW:extension:name" => name, "ARROW:extension:metadata" => ""]
+    ms = AC.TimestampType(AC.MILLISECOND, nothing)
+    zms = AC.TimestampType(AC.MILLISECOND, "UTC")
+    cols = [
+        ("d", AC.DateType(AC.DAY), "JuliaLang.Date", Int32[1]),
+        ("dt", ms, "JuliaLang.DateTime", Int64[1]),
+        ("t", AC.TimeType(AC.NANOSECOND, 64), "JuliaLang.Time", Int64[1]),
+        ("p", AC.DurationType(AC.SECOND), "JuliaLang.Dates.Period", Int64[1]),
+        ("z", zms, "JuliaLang.ZonedDateTime-UTC", Int64[1]),
+        ("ts", ms, "JuliaLang.Durations.Timestamp", Int64[1]),
+    ]
+    fields = [AC.Field(n, t; nullable=false, metadata=label(l)) for (n, t, l, _) in cols]
+    data = [
+        AC.ArrayData(t, 1, [AC.BufferSlice(), AC._databuffer(v)]; nullcount=0) for
+        (_, t, _, v) in cols
+    ]
+    sch = AC.Schema(fields)
+    bytes = Arrow.writestream(sch, [AC.RecordBatch(sch, data)])
+    tbl = @test_logs min_level = Base.CoreLogging.Warn Arrow.Table(bytes)
+    @test tbl.d == [Date(1970, 1, 2)]
+    @test tbl.dt == [DateTime(1970, 1, 1, 0, 0, 0, 1)]
+    @test tbl.t == [Time(0, 0, 0, 0, 0, 1)]
+    @test tbl.p == [Second(1)]
+    @test tbl.ts == tbl.dt
+    # Before Arrow 2.4.2 the zoned label stored local wall time, which a UTC
+    # instant read does not reproduce, so it still warns.
+    old = AC.Field("z", zms; nullable=false, metadata=label("JuliaLang.ZonedDateTime"))
+    osch = AC.Schema([old])
+    obytes = Arrow.writestream(osch, [AC.RecordBatch(osch, [data[5]])])
+    @test_logs (:warn, r"JuliaLang.ZonedDateTime") Arrow.Table(obytes)
+end
+
 @testset "timezone-aware timestamps without TimeZones" begin
     # This process must not have loaded TimeZones: zoned reads are native
     # ZonedTimestamp values and need no extension.

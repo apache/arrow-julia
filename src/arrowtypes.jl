@@ -220,8 +220,29 @@ function _extensionwarningname(
     return string(SubString(name, firstindex(name), lastindex), '…')
 end
 
+# Labels that Arrow.jl 2.x (and Durations.jl's Arrow 2.x extension) wrote on
+# temporal columns whose storage Arrow 3.0 reads natively into the same
+# instants and values. They are expected in 2.x files, so they do not warn.
+# The pre-2.4.2 `JuliaLang.ZonedDateTime` label is not one of them: that
+# storage holds local wall time, not a UTC instant.
+function _arrow2temporallabel(name::String, t::AC.ArrowType)
+    t isa AC.DictionaryType && (t = t.valuetype)
+    naive = t isa AC.TimestampType && _timestampzone(t) === nothing
+    zoned = t isa AC.TimestampType && _timestampzone(t) !== nothing
+    name == "JuliaLang.Date" && return t isa AC.DateType
+    name == "JuliaLang.DateTime" &&
+        return naive || (t isa AC.DateType && t.unit == AC.MILLISECOND)
+    name == "JuliaLang.Time" && return t isa AC.TimeType
+    name == "JuliaLang.Dates.Period" && return t isa AC.DurationType
+    name == "JuliaLang.ZonedDateTime-UTC" && return zoned
+    name == "JuliaLang.Durations.Timestamp" && return naive
+    name == "JuliaLang.Durations.ZonedTimestamp" && return zoned
+    return false
+end
+
 function _warnunsupportedextension(ctx, name::String, f::AC.Field)
     ctx.warn || return nothing
+    _arrow2temporallabel(name, f.type) && return nothing
     name in ctx.warned && return nothing
     if ctx.warnings >= _MAX_EXTENSION_WARNINGS
         if !ctx.warningsuppressed
