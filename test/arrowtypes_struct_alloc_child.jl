@@ -128,13 +128,24 @@ function constructretained(field, rows)
     return nothing
 end
 
+# Least of three warm readings, each after a full collection. `@allocated`
+# counts each big block's usable size, which an allocator that hands back a
+# larger cached block (macOS malloc does) inflates by up to the request; a
+# real extra allocation shows in every reading.
+function leastallocated(f)
+    least = typemax(Int)
+    for _ = 1:3
+        GC.gc()
+        least = min(least, @allocated f())
+    end
+    return least
+end
+
 function allocationdelta(f, small, large, physicaldelta::Int)
     f(small)
     f(large)
-    GC.gc()
-    smallallocation = @allocated f(small)
-    GC.gc()
-    largeallocation = @allocated f(large)
+    smallallocation = leastallocated(() -> f(small))
+    largeallocation = leastallocated(() -> f(large))
     @test largeallocation <= smallallocation + (7 * physicaldelta) ÷ 4 + 1_000_000
 end
 

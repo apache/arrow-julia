@@ -169,6 +169,19 @@ function maskedleafallocation(
     return nothing
 end
 
+# Least of three warm readings, each after a full collection. `@allocated`
+# counts each big block's usable size, which an allocator that hands back a
+# larger cached block (macOS malloc does) inflates by up to the request; a
+# real extra allocation shows in every reading.
+function leastallocated(f)
+    least = typemax(Int)
+    for _ = 1:3
+        GC.gc()
+        least = min(least, @allocated f())
+    end
+    return least
+end
+
 function allocationguard(
     ::Type{S};
     nullable::Bool,
@@ -178,10 +191,8 @@ function allocationguard(
     maskedleafallocation(S, 2, 1; nullable, registered)
     maskedleafallocation(S, listsize, 1; nullable, registered)
     maskedleafallocation(S, listsize, 49; nullable, registered)
-    GC.gc()
-    few = @allocated maskedleafallocation(S, listsize, 1; nullable, registered)
-    GC.gc()
-    many = @allocated maskedleafallocation(S, listsize, 49; nullable, registered)
+    few = leastallocated(() -> maskedleafallocation(S, listsize, 1; nullable, registered))
+    many = leastallocated(() -> maskedleafallocation(S, listsize, 49; nullable, registered))
     slots = 48 * listsize
     physicaldelta = if S === Bool
         (nullable ? 2 : 1) * cld(slots, 8)
@@ -197,10 +208,8 @@ function allocationdelta(f, small::Int, large::Int, allowance::Int)
     f(2)
     f(small)
     f(large)
-    GC.gc()
-    smallallocation = @allocated f(small)
-    GC.gc()
-    largeallocation = @allocated f(large)
+    smallallocation = leastallocated(() -> f(small))
+    largeallocation = leastallocated(() -> f(large))
     @test largeallocation <= smallallocation + allowance
     return nothing
 end
@@ -373,10 +382,8 @@ end
     registeredhidden(listsize, 1)
     registeredhidden(listsize, 49)
 
-    GC.gc()
-    few = @allocated registeredhidden(listsize, 1)
-    GC.gc()
-    many = @allocated registeredhidden(listsize, 49)
+    few = leastallocated(() -> registeredhidden(listsize, 1))
+    many = leastallocated(() -> registeredhidden(listsize, 49))
     physicaldelta = 48 * sizeof(Int32) * listsize
     @test many <= few + (7 * physicaldelta) ÷ 4 + 1_000_000
 
