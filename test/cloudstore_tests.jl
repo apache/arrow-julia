@@ -15,7 +15,7 @@
 # limitations under the License.
 
 # The CloudStore.jl extension end to end against a local S3-compatible
-# server (CloudBase's Minio harness): a `CloudStore.Object` is an
+# server (CloudBaseTest's Minio harness): a `CloudStore.Object` is an
 # `Arrow.AbstractArrowSource`, so `Arrow.Table(obj; scan=…)` reads through
 # HTTP Range requests, and the whole-object paths agree with in-memory reads.
 
@@ -25,7 +25,7 @@ using Test
 using Tables
 using Arrow
 using CloudStore
-using CloudBase.CloudTest: Minio
+using CloudBaseTest: Minio
 
 @testset "CloudStore extension" begin
     ext = Base.get_extension(Arrow, :ArrowCloudStoreExt)
