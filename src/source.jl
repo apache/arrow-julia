@@ -50,8 +50,11 @@ needs one process-wide cap must enforce it inside `readrange`.
 
 Every returned vector must have exactly the requested length. Arrow
 validates lengths and offsets and refuses violations with a
-`ValidationError`. Arrow cannot authenticate the bytes themselves: the
-source is trusted to return what lives at the requested range.
+`ValidationError`. Arrow keeps each returned vector without copying it and
+reads it again after later requests, so `readrange` must return a new
+vector every time and never reuse, resize, or mutate one it returned.
+Arrow cannot authenticate the bytes themselves: the source is trusted to
+return what lives at the requested range.
 
 ```julia
 struct BytesSource <: Arrow.AbstractArrowSource
@@ -81,7 +84,8 @@ function sourcelength end
     Arrow.readrange(src::AbstractArrowSource, offset, len) -> Vector{UInt8}
 
 `len` bytes starting at 0-based `offset`; the result must have exactly `len`
-elements. Required of every implementation.
+elements and be a new vector that the source never touches again (Arrow
+keeps it without copying). Required of every implementation.
 """
 function readrange end
 
