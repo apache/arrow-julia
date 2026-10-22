@@ -405,8 +405,18 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         )
         sch = Arrow.AC.Schema([f])
         bytes = Arrow.writestream(sch, [Arrow.AC.RecordBatch(sch, [d])])
+        fbytes = Arrow.writefile(sch, [Arrow.AC.RecordBatch(sch, [d])])
         @test length(bytes) < 1024
-        @test_throws Arrow.AllocationLimitError Arrow.Table(bytes)
+        # Every source kind, including handles opened beforehand.
+        for source in (
+            bytes,
+            fbytes,
+            IOBuffer(bytes),
+            Arrow.readstream(copy(bytes)),
+            Arrow.readfile(copy(fbytes)),
+        )
+            @test_throws Arrow.AllocationLimitError Arrow.Table(source)
+        end
         stats = @timed try
             Arrow.Table(bytes)
         catch err

@@ -1404,6 +1404,13 @@ end
 
 # --- Table construction ------------------------------------------------------
 
+# A fresh read budget. An opened file handle's input is its region; other
+# sources are bounded by their input once it is read (`_openbytes`,
+# `_readmappedfile`).
+_sourcebudget(source, limits::Limits) =
+    source isa ArrowFile ? _readbudget(limits, source.region.len) :
+    AllocationBudget(limits.max_total_allocated_bytes)
+
 function Table(
     source;
     scan::Union{Nothing,Tables.Scan}=nothing,
@@ -1442,9 +1449,7 @@ function Table(
         opened = _openbytes(_wholeobject(sf, budget); limits=readlimits, budget=budget)
         return _tablefrom(opened, scan, budget)
     end
-    budget =
-        source isa IPCStream ? source.budget :
-        AllocationBudget(readlimits.max_total_allocated_bytes)
+    budget = source isa IPCStream ? source.budget : _sourcebudget(source, readlimits)
     opened = _opensource(source; mmap=mmap, limits=readlimits, budget=budget)
     scan === nothing && return _tablefrom(opened, nothing, budget)
     return _tablefrom(opened, scan, budget)
@@ -1774,9 +1779,7 @@ end
 
 function Stream(source; mmap::Bool=true, limits::Limits=_defaultreaderlimits(source))
     readlimits = _readerlimits(source, limits)
-    budget =
-        source isa IPCStream ? source.budget :
-        AllocationBudget(readlimits.max_total_allocated_bytes)
+    budget = source isa IPCStream ? source.budget : _sourcebudget(source, readlimits)
     src = _opensource(source; mmap=mmap, limits=readlimits, budget=budget)
     regions = _sourceregions(src, budget)
     # The stream and every yielded partition share one lifetime authority.
