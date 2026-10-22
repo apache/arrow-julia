@@ -258,24 +258,50 @@ function DataAPI.metadata(
     default === _NO_DEFAULT && throw(KeyError(key))
     return style ? (default, :default) : default
 end
-function _schemafield(t::Table, col::Int)
+# `sym` names `s`, compared without interning `s` (Symbols hold no NUL).
+function _symbolis(sym::Symbol, s::String)
+    p = Base.unsafe_convert(Ptr{UInt8}, sym)
+    n = ncodeunits(s)
+    ccall(:strlen, Csize_t, (Ptr{UInt8},), p) == n || return false
+    return GC.@preserve s ccall(
+        :memcmp,
+        Cint,
+        (Ptr{UInt8}, Ptr{UInt8}, Csize_t),
+        p,
+        pointer(s),
+        n,
+    ) == 0
+end
+
+# An ordinary facade read retains one field per output column in the same
+# order and under the same name.
+function _schemaaligned(t::Table)
+    names = getfield(t, :names)
+    sch = getfield(t, :schema)
+    sch === nothing && return false
+    fields = sch.fields
+    length(fields) == length(names) || return false
+    for i in eachindex(names)
+        _symbolis(names[i], fields[i].name) || return false
+    end
+    return true
+end
+
+function _schemafield(t::Table, col::Int, aligned::Bool=_schemaaligned(t))
     names = getfield(t, :names)
     checkbounds(names, col)
     sch = getfield(t, :schema)
     sch === nothing && return nothing
     fields = sch.fields
-    # An ordinary facade read retains one field per output column in the same
-    # order. Position is the only unambiguous identity when Arrow legally
-    # carries duplicate field names.
-    if length(fields) == length(names) &&
-       all(i -> Symbol(fields[i].name) == names[i], eachindex(names))
-        return fields[col]
-    end
+    # Position is the only unambiguous identity when Arrow legally carries
+    # duplicate field names.
+    aligned && return fields[col]
     # A real Tables.Scan type conversion drops that column's retained field,
     # so its schema can be an ordered subset. Name lookup remains safe only
     # when the output name itself is unique.
     nm = names[col]
-    count(==(nm), names) == 1 || return nothing
+    # The lookup holds 0 for a name that appears more than once.
+    getfield(t, :lookup)[nm] == 0 && return nothing
     text = String(nm)
     i = findfirst(f -> f.name == text, fields)
     return i === nothing ? nothing : sch.fields[i]
@@ -285,16 +311,20 @@ function _schemafield(t::Table, col::Symbol)
 end
 function DataAPI.colmetadatakeys(t::Table, col::Union{Symbol,Int})
     c = col isa Symbol ? _columnindex(t, col) : col
-    f = _schemafield(t, c)
-    (f === nothing || f.metadata === nothing) && return ()
-    return (String(first(kv)) for kv in f.metadata)
+    return _colmetadatakeys(_schemafield(t, c))
 end
 function DataAPI.colmetadatakeys(t::Table)
+    # One alignment check for the whole listing keeps it linear in the
+    # column count.
+    aligned = _schemaaligned(t)
     return (
         nm => keys for (i, nm) in enumerate(getfield(t, :names)) for
-        keys in (DataAPI.colmetadatakeys(t, i),) if !isempty(keys)
+        keys in (_colmetadatakeys(_schemafield(t, i, aligned)),) if !isempty(keys)
     )
 end
+_colmetadatakeys(f) =
+    (f === nothing || f.metadata === nothing) ? () :
+    (String(first(kv)) for kv in f.metadata)
 function DataAPI.colmetadata(
     t::Table,
     col::Union{Symbol,Int},

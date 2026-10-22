@@ -1170,6 +1170,19 @@ end
         @test DataAPI.colmetadata(t, 1, "u") == "1"
         @test DataAPI.colmetadata(t, :x, "nope", :d) == :d
         @test collect(first.(DataAPI.colmetadatakeys(t))) == [:x]
+
+        # Listing every column's metadata (what DataFrame(table) does) is
+        # linear in the column count, not quadratic.
+        n = 3000
+        wide = NamedTuple(Symbol("w", i) => Int64[i] for i = 1:n)
+        meta = Dict(Symbol("w", i) => ["k" => string(i)] for i = 1:10:n)
+        wio = IOBuffer()
+        Arrow.write(wio, wide; file=false, colmetadata=meta)
+        tw = Arrow.Table(take!(wio))
+        listed = collect(DataAPI.colmetadatakeys(tw))
+        @test length(listed) == length(meta)
+        @test DataAPI.colmetadata(tw, :w2991, "k") == "2991"
+        @test minimum(@elapsed(collect(DataAPI.colmetadatakeys(tw))) for _ = 1:3) < 0.2
     end
 
     @testset "temporal scans preserve cross-type predicate semantics" begin
