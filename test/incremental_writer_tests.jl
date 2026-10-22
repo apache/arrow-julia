@@ -196,6 +196,26 @@ const AC = Arrow.ArrowCore
         @test Arrow.Table(take!(io)).a == [1, 2, 3, 4]
     end
 
+    @testset "append to a stream without an end-of-stream marker" begin
+        # The reader accepts a stream that ends right after its last message;
+        # appending must keep that message intact.
+        io = IOBuffer()
+        Arrow.write(io, t1; file=false)
+        noeos = take!(io)[1:(end - 8)]
+        @test Arrow.Table(noeos).a == [1, 2]
+        path = joinpath(mktempdir(), "noeos.arrow")
+        write(path, noeos)
+        Arrow.append(path, t2)
+        @test Arrow.Table(path).a == [1, 2, 3, 4]
+        Arrow.append(path, t2)
+        @test Arrow.Table(path).b == ["x", "y", "z", "w", "z", "w"]
+
+        io = IOBuffer()
+        write(io, noeos)
+        Arrow.append(io, t2)
+        @test Arrow.Table(take!(io)).b == ["x", "y", "z", "w"]
+    end
+
     @testset "append with dictionary columns" begin
         # An eager-written stream declares no replacement: a content-equal
         # pool appends by reuse, and a changed pool is refused.

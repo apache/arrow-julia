@@ -322,8 +322,8 @@ Add `table`'s record batches to an existing IPC STREAM (`sink` is a file
 path or a seekable read/write `IO`). The existing stream is validated in
 full first, the new columns are constructed against its schema (same
 names, order, and compatible types, or the append is refused), and the
-new batches are published where the end-of-stream marker stood, followed
-by a new end-of-stream marker.
+new batches are published after the last existing message (over its
+end-of-stream marker, if it has one), followed by a new end-of-stream marker.
 
 A dictionary-encoded column whose pool matches the stream's latest dictionary
 update reuses it, including updates after the last record batch; a changed
@@ -336,9 +336,9 @@ or produce it incrementally with [`Arrow.Writer`](@ref).
 """
 function append(path::AbstractString, tbl; kwargs...)
     bytes = Base.read(path)
-    tail = _appendbytes(bytes, tbl; kwargs...)
+    keep, tail = _appendbytes(bytes, tbl; kwargs...)
     open(path, "r+") do io
-        seek(io, length(bytes) - 8)   # overwrite the end-of-stream marker
+        seek(io, keep)
         Base.write(io, tail)
     end
     return path
@@ -347,8 +347,8 @@ end
 function append(io::IO, tbl; kwargs...)
     seekstart(io)
     bytes = Base.read(io)
-    tail = _appendbytes(bytes, tbl; kwargs...)
-    seek(io, length(bytes) - 8)       # overwrite the end-of-stream marker
+    keep, tail = _appendbytes(bytes, tbl; kwargs...)
+    seek(io, keep)
     Base.write(io, tail)
     return io
 end
@@ -365,13 +365,15 @@ function _appendbytes(bytes::Vector{UInt8}, tbl; compress::Union{Nothing,Symbol}
         )
     codec = compress === nothing ? :none : compress
     # Validate the whole existing stream before extending it; a corrupt
-    # prefix must refuse, not gain valid-looking bytes. `readstream` also
-    # guarantees the trailing 8 bytes are the end-of-stream marker.
+    # prefix must refuse, not gain valid-looking bytes.
     s = readstream(bytes)
     sch = s.schema
     # Retain the schema's declared features when resuming the writer.
     msgs = framemessages(AC.heapregion(bytes), s.limits)
     features = Int64[Int64(x) for x in msgs[1].features]
+    # New messages start where the last framed message ends: over the
+    # end-of-stream marker when the stream has one, else at the end.
+    keep = last(msgs).body.offset + last(msgs).body.len
     names, partcols, partpools, rowcounts = _collectparts(tbl)
     length(names) == length(sch.fields) &&
     all(j -> String(names[j]) == sch.fields[j].name, eachindex(names)) || throw(
@@ -400,7 +402,7 @@ function _appendbytes(bytes::Vector{UInt8}, tbl; compress::Union{Nothing,Symbol}
     finally
         abortwrite!(st)
     end
-    return take!(io)
+    return keep, take!(io)
 end
 
 "Retained Arrow schema when the source is a facade read, else nothing."
