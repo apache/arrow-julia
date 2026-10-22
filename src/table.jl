@@ -1344,6 +1344,18 @@ function _opensource(
     return _openbytes(_wholeobject(sf, budget); limits=limits, budget=budget)
 end
 
+# Arrow 2.x also accepted a vector of sources and positional byte windows;
+# name the supported source kinds instead of failing with a MethodError.
+function _opensource(source; kwargs...)
+    throw(
+        ArgumentError(
+            "Arrow reads one IPC source: a file path, an IO, a Vector{UInt8}, or " *
+            "an Arrow.AbstractArrowSource, not $(typeof(source)); read several " *
+            "sources separately and combine their tables",
+        ),
+    )
+end
+
 # --- Table construction ------------------------------------------------------
 
 function Table(

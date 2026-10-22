@@ -53,6 +53,13 @@ const AC = Arrow.ArrowCore
         @test Arrow.getmetadata(tbl) === nothing
     end
 
+    @testset "unsupported sources name the supported kinds" begin
+        bytes = take!(Arrow.tobuffer((; a=[1])))
+        err = @test_throws ArgumentError Arrow.Table([bytes, bytes])
+        @test occursin("one IPC source", err.value.msg)
+        @test_throws ArgumentError Arrow.Stream(view(bytes, 1:length(bytes)))
+    end
+
     @testset "tobuffer emits the stream format" begin
         buf = Arrow.tobuffer((; a=[1, 2, 3]))
         @test position(buf) == 0
