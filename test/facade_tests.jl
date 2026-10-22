@@ -24,6 +24,7 @@ using Test
 using Tables
 using Dates
 import DataAPI
+import Profile
 using Arrow
 using DataStrings
 import DataDecimals, Durations
@@ -152,19 +153,23 @@ function assert_mixed(t)
     @test isequal(t.pooled, ["lo", "hi", "lo", missing])
 end
 
-# Allocation of one warmed facade read; a top-level function so the probe
-# measures the read, not testset closure boxing.
-function _tableallocs(bytes)
-    Arrow.Table(bytes)
-    Arrow.Table(bytes)
-    return @allocated Arrow.Table(bytes)
+# Bytes one warmed call of `f` requests from the allocator. `@allocated`
+# counts the usable size of each big block instead, and an allocator that
+# hands back a larger cached block (macOS malloc does) can nearly double
+# that. Top-level functions, so the probe measures `f`, not testset closure
+# boxing.
+function _requestedbytes(f)
+    f()
+    f()
+    Profile.Allocs.clear()
+    Profile.Allocs.@profile sample_rate = 1 f()
+    bytes = sum(a.size for a in Profile.Allocs.fetch().allocs; init=0)
+    Profile.Allocs.clear()
+    return bytes
 end
 
-function _writeallocs(path, tbl)
-    Arrow.write(path, tbl)
-    Arrow.write(path, tbl)
-    return @allocated Arrow.write(path, tbl)
-end
+_tableallocs(bytes) = _requestedbytes(() -> Arrow.Table(bytes))
+_writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
 
 @testset "Arrow facade" begin
     @testset "file round-trip with metadata" begin
