@@ -5438,6 +5438,35 @@ function _withfieldmetadata(f::AC.Field, metadata::Vector{Pair{String,String}})
     )
 end
 
+# A column with a DataAPI ref pool (a PooledArray or CategoricalArray, say) is
+# written dictionary-encoded, as Arrow 2.x did: its pool, in pool order and
+# with unused entries, starts the Arrow dictionary.
+_hasrefpool(x::AbstractVector) =
+    DataAPI.refpool(x) !== nothing &&
+    DataAPI.refarray(x) !== x &&
+    Base.nonmissingtype(eltype(x)) !== Union{}
+_hasrefpool(::Any) = false
+
+"""
+The values and category pool of a ref-pool column. Pool values that are
+wrappers without an ArrowTypes.jl mapping (CategoricalArrays' values) unwrap
+through `DataAPI.unwrap`; a mapped element type keeps its values so its
+ArrowTypes.jl lowering applies.
+"""
+function _refpoolvalues(x::AbstractVector)
+    T = Base.nonmissingtype(eltype(x))
+    mapped = ArrowTypes.ArrowType(T) !== T || ArrowTypes.arrowname(T) !== Symbol()
+    pool = DataAPI.refpool(x)
+    unwrap = !mapped && any(v -> v !== missing && DataAPI.unwrap(v) !== v, pool)
+    values = unwrap ? [DataAPI.unwrap(v) for v in x] : x
+    hint = Base.nonmissingtype(eltype(values))[]
+    # Iterate: CategoricalArrays' ref pool is indexed from zero.
+    for v in pool
+        v === missing || push!(hint, unwrap ? DataAPI.unwrap(v) : v)
+    end
+    return values, hint
+end
+
 """
 Construct one logical column across all table partitions.
 
@@ -5450,7 +5479,37 @@ same order as `parts`.
 retained dictionary-pool snapshot (or nothing) per partition, enforced below;
 `metadata` is explicit application metadata merged onto the final Field.
 """
-function _constructcolumn(
+function _constructcolumn(name::Symbol, parts::Vector{AbstractVector}; kwargs...)
+    try
+        return _constructcolumnparts(name, parts; kwargs...)
+    catch err
+        err isa ArgumentError || rethrow()
+        T = _reflectedstructtype(parts)
+        (T === nothing || !startswith(err.msg, "fromjulia: unsupported element type")) &&
+            rethrow()
+        throw(
+            ArgumentError(
+                "column $name holds $T values, which have no ArrowTypes.jl mapping, so " *
+                "Arrow writes their fields as a Struct; a field failed with " *
+                "\"$(err.msg)\". Define ArrowTypes.ArrowType and ArrowTypes.toarrow " *
+                "for $T, or convert the column first (DataAPI.unwrap.(column) for " *
+                "wrapped values such as CategoricalValue)",
+            ),
+        )
+    end
+end
+
+# The element type of a column written by reflecting a plain struct's fields
+# (ArrowTypes.jl's default StructKind mapping), or nothing.
+function _reflectedstructtype(parts)
+    T = Base.nonmissingtype(eltype(first(parts)))
+    isconcretetype(T) && isstructtype(T) && !(T <: Union{NamedTuple,Tuple}) ||
+        return nothing
+    ArrowTypes.ArrowType(T) === T && ArrowTypes.arrowname(T) === Symbol() || return nothing
+    return ArrowTypes.ArrowKind(T) isa ArrowTypes.StructKind ? T : nothing
+end
+
+function _constructcolumnparts(
     name::Symbol,
     parts::Vector{AbstractVector};
     retained::Union{Nothing,AC.Field}=nothing,
@@ -5470,13 +5529,22 @@ function _constructcolumn(
     context = _WriterContext(fieldname)
     dictintent =
         (retained !== nothing && retained.type isa AC.DictionaryType) ||
-        any(part isa DictEncode for part in parts)
+        any(part isa DictEncode for part in parts) ||
+        (retained === nothing && any(_hasrefpool, parts))
 
     local field::AC.Field
     if dictintent
         values = AbstractVector[
             part isa DictEncode ? (part::DictEncode).data : part for part in parts
         ]
+        if any(_hasrefpool, values)
+            poolhints = copy(poolhints)
+            for k in eachindex(values)
+                _hasrefpool(values[k]) || continue
+                values[k], hint = _refpoolvalues(values[k])
+                poolhints[k] === nothing && (poolhints[k] = hint)
+            end
+        end
         retainedvaluefield = nothing
         retainedtarget = nothing
         if retained !== nothing

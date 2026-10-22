@@ -171,8 +171,11 @@ is selected with `:lz4` or `:zstd`; passing an initialized compressor object
 is no longer supported. The Arrow 2.x `alignment`, `dictencode`,
 `dictencodenested`, `denseunions`, `largelists`, `maxdepth`, and `ntasks`
 writer keywords no longer have any effect: `Arrow.write` accepts them with a
-one-time warning each and ignores them. Wrap only the columns that need
-dictionary encoding in [`Arrow.DictEncode`](@ref).
+one-time warning each and ignores them. As in Arrow 2.x, a column with a
+`DataAPI.refpool`, such as a `PooledArray` or `CategoricalArray`, is written
+dictionary-encoded with its pool order and unused pool entries; values that
+need it, such as `CategoricalValue`s, unwrap through `DataAPI.unwrap`. Wrap
+any other column that needs dictionary encoding in [`Arrow.DictEncode`](@ref).
 
 Arrow 3.0 again consumes the ArrowTypes.jl mapping interface. Package authors
 should depend on and import ArrowTypes.jl directly. Define `ArrowType` and
@@ -210,8 +213,9 @@ Defining `ArrowKind` alone is not a supported way to select an Arrow 3.0
 physical layout. Use the `ArrowType` and `toarrow` lowering interface.
 
 [`Arrow.DictEncode`](@ref) remains the opt-in wrapper for a newly written
-dictionary-encoded column. Its pool values use the same recursive ArrowTypes.jl
-mapping. A fully read top-level dictionary also retains its pool for rewrite.
+dictionary-encoded column; a `DataAPI.refpool` column needs no wrapper. Pool
+values use the same recursive ArrowTypes.jl mapping. A fully read top-level
+dictionary also retains its pool for rewrite.
 
 ## Supported write types
 

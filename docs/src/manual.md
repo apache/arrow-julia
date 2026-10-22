@@ -435,6 +435,12 @@ low-cardinality string column wants:
 Arrow.write("out.arrow", (region = Arrow.DictEncode(regions), sales = sales))
 ```
 
+A column with a `DataAPI.refpool`, such as a `PooledArray` or a
+`CategoricalArray`, is written dictionary-encoded without the wrapper. Its
+pool, in pool order and including unused entries, starts the Arrow dictionary.
+Pool values that are wrappers without an ArrowTypes.jl mapping, such as
+`CategoricalValue`, are written through `DataAPI.unwrap`.
+
 Reading a dictionary-encoded column resolves the indices: the column comes
 back as its value type. When a `Table` read from Arrow is written again,
 its dictionary encoding is preserved. Fresh `DictEncode` output coalesces

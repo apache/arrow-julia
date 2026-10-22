@@ -19,8 +19,10 @@ using Dates
 using Tables
 using Arrow
 using ArrowTypes
+import DataAPI
 import Durations
 import UUIDs
+using PooledArrays: PooledArray
 
 const AC = Arrow.ArrowCore
 
@@ -194,6 +196,53 @@ end
         RawNT = NamedTuple{(:when, :day),Tuple{Int64,Int32}}
         @test_throws Exception Arrow.Table(tsbytes; scan=Tables.Scan(select=(:c => RawNT,)))
     end
+end
+
+# A value wrapper with a DataAPI ref pool, shaped like CategoricalArrays'
+# CategoricalValue/CategoricalArray, which has no ArrowTypes.jl mapping.
+struct CompatWrapped
+    x::String
+end
+DataAPI.unwrap(w::CompatWrapped) = w.x
+struct CompatWrappedVector <: AbstractVector{CompatWrapped}
+    refs::Vector{UInt32}
+    levels::Vector{String}
+end
+Base.size(v::CompatWrappedVector) = size(v.refs)
+Base.getindex(v::CompatWrappedVector, i::Int) = CompatWrapped(v.levels[v.refs[i]])
+DataAPI.refarray(v::CompatWrappedVector) = v.refs
+DataAPI.refpool(v::CompatWrappedVector) = CompatWrapped.(v.levels)
+
+struct CompatHasPtr
+    p::Ptr{Nothing}
+end
+
+@testset "DataAPI ref-pool columns write dictionary-encoded" begin
+    # Arrow 2.x dictionary-encoded PooledArray and CategoricalArray columns;
+    # the pool order and unused entries carry over.
+    function pool(col)
+        s = Arrow.readstream(take!(Arrow.tobuffer((; col))))
+        f = only(s.schema.fields)
+        @test f.type isa AC.DictionaryType
+        d = only(s.batches).columns[1]
+        return Arrow.materialize(AC.dictvaluefield(f, f.type), d.dictionary)
+    end
+    p = PooledArray(["b", "a", "b"])
+    p[1] = "z"
+    @test pool(p) == ["b", "a", "z"]
+    @test Arrow.Table(Arrow.tobuffer((; p))).p == ["z", "a", "b"]
+    m = PooledArray(["a", missing, "a"])
+    @test isequal(Arrow.Table(Arrow.tobuffer((; m))).m, ["a", missing, "a"])
+    # Wrapped values without an ArrowTypes.jl mapping unwrap through DataAPI.
+    w = CompatWrappedVector(UInt32[2, 3, 2], ["c", "b", "a"])
+    @test pool(w) == ["c", "b", "a"]
+    t = Arrow.Table(Arrow.tobuffer((; w)))
+    @test eltype(t.w) == String
+    @test t.w == ["b", "a", "b"]
+    # A struct whose fields cannot be written names the column and type.
+    err = @test_throws ArgumentError Arrow.tobuffer((; x=[CompatHasPtr(C_NULL)]))
+    @test occursin("column x holds", err.value.msg)
+    @test occursin("CompatHasPtr", err.value.msg)
 end
 
 @testset "Arrow 2.x FixedSizeBinary extension columns" begin

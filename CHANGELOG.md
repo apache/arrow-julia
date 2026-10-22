@@ -46,7 +46,9 @@ writer, validation, scan, and C interface engines.
 - The `alignment`, `dictencode`, `dictencodenested`, `denseunions`,
   `largelists`, `maxdepth`, and `ntasks` writer keywords no longer have any
   effect. `Arrow.write` accepts them with a one-time warning each and ignores
-  them; wrap columns in `Arrow.DictEncode` to dictionary-encode.
+  them; wrap columns in `Arrow.DictEncode` to dictionary-encode. Columns with
+  a `DataAPI.refpool` (`PooledArray`, `CategoricalArray`) are still written
+  dictionary-encoded automatically.
 - The `compress` keyword accepts `nothing`, `:lz4`, or `:zstd`; initialized
   compressor objects are no longer accepted.
 - The `Arrow.ToArrow` compatibility binding was removed. Import
