@@ -1689,12 +1689,15 @@ readfile(region::OwnerRegion; limits::Limits=Limits()) =
     _readfile(region, limits, AllocationBudget(limits.max_total_allocated_bytes))
 
 # C++ WriteFileFooter uses its current metadata version even when the
-# writer emits V4 messages. The footer must not select the message layout.
+# writer emits V4 messages, and Arrow.jl before 2.6 wrote a V4 footer over V5
+# messages. The footer must not select the message layout.
 function _filemetadataversion(footer::Int16, message::Int16, expected::Int16=message)
     message == expected ||
         throw(ValidationError("IPC metadata version changes within the file"))
-    (footer == message || (footer == Int16(4) && message == Int16(3))) ||
-        throw(ValidationError("file schema and footer metadata versions differ"))
+    (
+        footer == message ||
+        (footer in (Int16(3), Int16(4)) && message in (Int16(3), Int16(4)))
+    ) || throw(ValidationError("file schema and footer metadata versions differ"))
     return message
 end
 

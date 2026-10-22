@@ -249,7 +249,9 @@ end
         end
     end
     @test Arrow._filemetadataversion(Int16(4), Int16(3)) == 3
-    @test_throws AC.ValidationError Arrow._filemetadataversion(Int16(3), Int16(4))
+    # Arrow.jl before 2.6 wrote a V4 footer over V5 messages.
+    @test Arrow._filemetadataversion(Int16(3), Int16(4)) == 4
+    @test_throws AC.ValidationError Arrow._filemetadataversion(Int16(2), Int16(4))
     @test_throws AC.ValidationError Arrow._filemetadataversion(Int16(4), Int16(4), Int16(3))
     # Deltas queued before a record batch still append in wire order.
     bytes = fixture(

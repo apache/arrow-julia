@@ -259,6 +259,24 @@ end
     @test tbl.u == u
 end
 
+@testset "files from Arrow.jl before 2.6" begin
+    # Those releases wrote V5 messages under a V4 file footer, which the
+    # reference implementation reads.
+    bytes = take!(Arrow.write(IOBuffer(), (; a=[1, 2]); file=true))
+    footerlen = Int(only(reinterpret(Int32, bytes[(end - 9):(end - 6)])))
+    footerstart = length(bytes) - 10 - footerlen
+    footer = Arrow.FB.getrootas(
+        Arrow.Meta.Footer,
+        bytes[(footerstart + 1):(footerstart + footerlen)],
+        0,
+    )
+    @test footer.version == Arrow.Meta.MetadataVersion.V5
+    at = footerstart + Arrow.FB.offset(footer, 4) + Arrow.FB.pos(footer)
+    bytes[(at + 1):(at + 2)] = reinterpret(UInt8, [Int16(Arrow.Meta.MetadataVersion.V4)])
+    @test Arrow.Table(bytes).a == [1, 2]
+    @test [b.a for b in Arrow.Stream(bytes)] == [[1, 2]]
+end
+
 @testset "Arrow 2.x temporal extension labels" begin
     # Arrow 2.x labelled its temporal columns; Arrow 3.0 reads the storage
     # natively and does not warn about these labels.
