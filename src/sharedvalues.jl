@@ -48,8 +48,11 @@ function _shareddecimalscalar(::Type{D}, ::Type{T}, precision::Int, x)::D where 
         x isa AbstractVector{UInt8} ? _bytescoefficient(T, x) :
         throw(ArgumentError("unsupported decimal storage value"))
     bound = T(10)^precision
-    -bound < u < bound ||
-        throw(ArgumentError("decimal coefficient exceeds declared precision"))
+    # Stored input that breaks the format's precision rule, which
+    # DataDecimals requires of every value.
+    -bound < u < bound || throw(
+        ValidationError("decimal coefficient $u exceeds the declared precision $precision"),
+    )
     return reinterpret(D, u)
 end
 

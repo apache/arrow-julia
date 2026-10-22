@@ -2194,6 +2194,31 @@ end
             @test dsch2.fields[1].type isa Arrow.AC.DecimalType
             @test DataAPI.colmetadata(td, :dec, "dk") == "dv"
         end
+        # A coefficient outside the declared precision is invalid input that
+        # DataDecimals cannot hold: the read fails with ValidationError at the
+        # top level and inside a list.
+        let t = Arrow.AC.DecimalType(3, 2, 64)
+            dd = Arrow.AC.ArrayData(
+                t,
+                2,
+                [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int64[100, 1000])],
+            )
+            dsch = Arrow.AC.Schema([Arrow.AC.Field("dec", t; nullable=false)])
+            db = Arrow.writestream(dsch, [Arrow.AC.RecordBatch(dsch, [dd], 2)])
+            @test_throws Arrow.ValidationError Arrow.Table(db)
+            item = Arrow.AC.Field("item", t; nullable=false)
+            lt = Arrow.AC.ListType(false)
+            ld = Arrow.AC.ArrayData(
+                lt,
+                1,
+                [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int32[0, 2])];
+                children=[dd],
+            )
+            lsch =
+                Arrow.AC.Schema([Arrow.AC.Field("l", lt; nullable=false, children=[item])])
+            lb = Arrow.writestream(lsch, [Arrow.AC.RecordBatch(lsch, [ld], 1)])
+            @test_throws Arrow.ValidationError Arrow.Table(lb)
+        end
         # Identity-strict at every depth: a replaced list column refuses,
         # never coerces (convert would turn true into Int64(1)).
         io6 = IOBuffer()
