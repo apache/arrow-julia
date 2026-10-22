@@ -250,6 +250,12 @@ end
         end
         # Whole-table read concatenates.
         @test Arrow.Table(bytes).x == [1, 2, 3, 4]
+        # A Stream is a sequence of tables, not one: whole-table Tables.jl
+        # access refuses instead of reading each batch as one row of vectors.
+        @test_throws ArgumentError Tables.columns(Arrow.Stream(bytes))
+        @test_throws ArgumentError Tables.rows(Arrow.Stream(bytes))
+        @test_throws ArgumentError Tables.columntable(Arrow.Stream(bytes))
+        @test_throws ArgumentError Tables.rowtable(Arrow.Stream(bytes))
     end
 
     @testset "facade reader limits" begin

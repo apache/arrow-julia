@@ -1765,3 +1765,18 @@ function Base.iterate(s::Stream, i::Int=1)
 end
 
 Tables.partitions(s::Stream) = s
+
+# A Stream is a sequence of record-batch tables, not one table. Without these
+# methods Tables.jl's iterator fallback reads each batch as one row whose
+# values are whole columns (so `DataFrame(stream)` would hold vectors).
+function _streamisnotatable()
+    throw(
+        ArgumentError(
+            "Arrow.Stream iterates record batches; read the whole table with " *
+            "Arrow.Table(source), or iterate the Stream (or Tables.partitions) " *
+            "for one batch at a time",
+        ),
+    )
+end
+Tables.columns(::Stream) = _streamisnotatable()
+Tables.rows(::Stream) = _streamisnotatable()
