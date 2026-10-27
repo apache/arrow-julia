@@ -42,14 +42,67 @@ PrecompileTools.@setup_workload begin
         ],
         pooled=DictEncode(["lo", "hi", "lo"]),
     )
+    # pyarrow and Polars declare every field nullable: each flat width both
+    # ways, and the common temporal types (timestamps naive and in UTC,
+    # durations, dates, times), so a first read of their files finds its
+    # column views compiled.
+    widths = (
+        Int8,
+        Int16,
+        Int32,
+        Int64,
+        UInt8,
+        UInt16,
+        UInt32,
+        UInt64,
+        Float16,
+        Float32,
+        Float64,
+        Bool,
+    )
+    units = (Dates.Second, Dates.Millisecond, Dates.Microsecond, Dates.Nanosecond)
+    flat = (;
+        (Symbol(:n, nameof(T)) => Union{Missing,T}[one(T), missing] for T in widths)...,
+        (Symbol(:p, nameof(T)) => T[one(T), zero(T)] for T in widths)...,
+        nstring=Union{Missing,String}["a", missing],
+        ndate=Union{Missing,Dates.Date}[Dates.Date(2020, 1, 1), missing],
+        ndatetime=Union{Missing,Dates.DateTime}[Dates.DateTime(2020, 1, 1), missing],
+        ntime=Union{Missing,Dates.Time}[Dates.Time(12), missing],
+        (
+            Symbol(:n, nameof(P)) => Union{Missing,Durations.Timestamp{P}}[
+                Durations.Timestamp{P}(2020, 1, 1),
+                missing,
+            ] for P in units
+        )...,
+        (
+            Symbol(:u, nameof(P)) => Union{Missing,Durations.ZonedTimestamp{P,:UTC}}[
+                Durations.ZonedTimestamp{P,:UTC}(2020, 1, 1),
+                missing,
+            ] for P in units
+        )...,
+        (Symbol(:d, nameof(P)) => Union{Missing,P}[P(1), missing] for P in units)...,
+    )
     PrecompileTools.@compile_workload begin
+        # The flat table goes out as two record batches, so its columns chain.
+        for table in (columns, Tables.partitioner((flat, flat)))
+            io = IOBuffer()
+            write(io, table)
+            flatbytes = take!(seekstart(io))
+            tbl = Table(flatbytes)
+            for name in Tables.columnnames(tbl)
+                col = Tables.getcolumn(tbl, name)
+                foreach(identity, col)
+                copy(col)
+            end
+            table === columns && continue
+            # A timestamp filter runs on stored integers.
+            stamp = Tables.colcmp(>=, Tables.col(:nMicrosecond), Dates.DateTime(2020))
+            Table(flatbytes; scan=Tables.Scan(filter=stamp))
+        end
         io = IOBuffer()
         write(io, columns)
         bytes = take!(seekstart(io))
         tbl = Table(bytes)
-        for name in Tables.columnnames(tbl)
-            foreach(identity, Tables.getcolumn(tbl, name))
-        end
         Tables.columntable(tbl)
         Table(
             bytes;
