@@ -137,12 +137,18 @@ function ipc_read_battery()
             @assert pos >= 0 "no nonempty compressed buffer found"
             pos
         end
-        # (a) a hostile declared length is rejected BEFORE any allocation
+        # (a) a hostile declared length allocates only what the column reads:
+        # decoding stops at the column's bytes, which are the original values
         lying = copy(cbytes)
         lying[(prefixpos + 1):(prefixpos + 8)] .= reinterpret(UInt8, [Int64(2)^61])
-        @assert _rejects(() -> readstream(lying))
+        lyingstream = readstream(lying)
+        for (i, f) in enumerate(lyingstream.schema.fields)
+            got = materialize(f, lyingstream.batches[1].columns[i])
+            @assert isequal(collect(Any, got), wanted[Symbol(f.name)])
+        end
+        @assert (@allocated readstream(lying)) < 1 << 24
         println(
-            "$(codecname): hostile decompressed-length prefix rejected before allocation ✓",
+            "$(codecname): hostile decompressed-length prefix decodes only the column's bytes ✓",
         )
         # (b) a prefix that understates the payload is a mismatch error, not
         # silent truncation

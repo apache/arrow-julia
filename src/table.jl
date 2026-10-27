@@ -1448,9 +1448,15 @@ end
 # A fresh read budget. An opened file handle's input is its region; other
 # sources are bounded by their input once it is read (`_openbytes`,
 # `_readmappedfile`).
+# A source whose size is not known yet starts at the cap; opening it bounds
+# the budget to the input's allowance (`_boundbudget!`).
 _sourcebudget(source, limits::Limits) =
     source isa ArrowFile ? _readbudget(limits, source.region.len) :
-    AllocationBudget(limits.max_total_allocated_bytes)
+    AllocationBudget(
+        limits.max_total_allocated_bytes;
+        ratio=limits.max_allocation_ratio,
+        cap=limits.max_total_allocated_bytes,
+    )
 
 function Table(
     source;
@@ -1879,9 +1885,9 @@ Memory: over a memory-mapped FILE-format path (the default for a path) the
 batches are decoded lazily from the mapping, one per iteration, so a
 consumer that processes and drops batches holds one batch of columns at a
 time (plus the file's dictionaries) — the path for a file larger than RAM.
-The `Limits.max_total_allocated_bytes` security budget is cumulative across
-one `Stream` iterator, even after a batch is dropped; raise it explicitly for
-a trusted large file whose total decoded allocation exceeds the default.
+Each batch of a file-format source decodes under its own allocation allowance
+(see [`Arrow.Limits`](@ref)), sized from that batch's bytes, so a file of any
+length streams with the defaults.
 Every yielded `Table` shares the source lifetime: releasing a batch releases its
 parent `Stream` (see [`Arrow.release!`](@ref)).
 A STREAM-format source is read to the end and every batch is decoded when
@@ -1957,15 +1963,21 @@ function Base.iterate(s::Stream, i::Int=1)
     (@atomic :acquire closed.closed) &&
         throw(InvalidStateException("the stream was released", :closed))
     i > _nbatches(s.src) && return nothing
-    b = _batch(s.src, i, s.budget)
+    budget = _batchbudget(s.src, i)
+    b = _batch(s.src, i, budget)
     fields = _batchfields(s.src)
-    names = _fieldnamesymbols(fields, s.budget)
+    names = _fieldnamesymbols(fields, budget)
     arrowtypes = getfield(s, :arrowtypes)
-    views = getfield(s, :views)
+    shared = getfield(s, :views)
     arrowtypeslock = getfield(s, :arrowtypeslock)
     lock(arrowtypeslock)
     try
-        _chargevector!(s.budget, AbstractVector, length(fields), "table columns")
+        # The caches outlive the batch; its allocations charge its own budget.
+        arrowtypes.budget = budget
+        plan = arrowtypes.routeplan
+        plan === nothing || (plan.budget = budget)
+        views = _ViewContext(shared.stringtype, budget, shared.pools)
+        _chargevector!(budget, AbstractVector, length(fields), "table columns")
         cols = AbstractVector[
             _viewable(f) ? _viewcolumn(f, AC.ArrayData[b.columns[j]], views) :
             _facadesinglecolumn(f, b.columns[j], arrowtypes) for
@@ -1979,13 +1991,26 @@ function Base.iterate(s::Stream, i::Int=1)
             s.regions,
             Int(b.nrows),
             pools,
-            s.budget,
+            budget,
         ),
         i + 1
     finally
         unlock(arrowtypeslock)
     end
 end
+
+# A batch's allowance comes from its own bytes: the message for a file, the
+# decoded buffers for a stream already read whole.
+function _batchbudget(f::ArrowFile, i::Int)
+    _, metalen, bodylen = f.recordblocks[i]
+    return _readbudget(f.limits, metalen + bodylen)
+end
+_batchbudget(s::IPCStream, i::Int) = _readbudget(s.limits, _databytes(s.batches[i]))
+
+_databytes(b::AC.RecordBatch) = sum(_databytes, b.columns; init=Int64(0))
+_databytes(d::AC.ArrayData) =
+    sum(x -> Int64(x.len), d.buffers; init=Int64(0)) +
+    sum(_databytes, d.children; init=Int64(0))
 
 Tables.partitions(s::Stream) = s
 

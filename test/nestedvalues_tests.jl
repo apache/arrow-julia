@@ -471,8 +471,24 @@ end
                 copy(bytes);
                 limits=Arrow.Limits(max_total_allocated_bytes=cap),
             )
-            table = only(collect(stream))
-            return table, stream.budget.limit - Arrow._remaining(stream.budget)
+            return only(collect(stream))
+        end
+        # The smallest cap that reads the stream: its batch's charge, which
+        # outweighs opening the stream here.
+        function charge(bytes)
+            lo, hi = 0, 1 << 32
+            while lo < hi
+                mid = (lo + hi) >>> 1
+                fits = try
+                    streamread(bytes, mid)
+                    true
+                catch e
+                    e isa Arrow.AllocationLimitError || rethrow()
+                    false
+                end
+                fits ? (hi = mid) : (lo = mid + 1)
+            end
+            return lo
         end
         function corebytes(field, data)
             schema = AC.Schema([field])
@@ -577,12 +593,13 @@ end
                 ("registered fromarrow union", liftedbytes, 224n, lifted[1]),
                 ("nested fixed-size-list identity", fslbytes, fslfloor, fslexpected),
             )
-                table, charged = streamread(bytes, typemax(Int64))
+                table = streamread(bytes, typemax(Int64))
                 @test isequal(first(table.x), first_expected)
+                charged = charge(bytes)
                 @test charged > floor
                 # The charge is the security bound: a cap below it refuses,
                 # and the exact charge admits the read.
-                @test_throws Arrow.AllocationLimitError streamread(bytes, charged ÷ 2)
+                @test_throws Arrow.AllocationLimitError streamread(bytes, charged - 1)
                 streamread(bytes, charged)
                 @static if VERSION >= v"1.12"
                     # Warmed, the read's true allocation stays within its

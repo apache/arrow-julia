@@ -68,7 +68,7 @@ function _wrapbuffer(
     src = AC.subslice(b, AC.checked_mul(offset, w), AC.checked_mul(n, w))
     p = AC.sliceptr(src)
     if UInt(p) % Base.datatype_alignment(S) != 0
-        _chargevector!(budget, S, n, "aligned buffer copy")
+        _chargeexact!(budget, S, n, "aligned buffer copy")
         out = Vector{S}(undef, Int(n))
         GC.@preserve out src begin
             unsafe_copyto!(Ptr{UInt8}(pointer(out)), p, Int(src.len))
@@ -510,7 +510,7 @@ function _offsetpayloads!(
                 ),
             )
             hi = Int64(offsets[j])
-            _chargevector!(budget, UInt8, hi - lo, "string column data")
+            _chargeexact!(budget, UInt8, hi - lo, "string column data")
             buf = Vector{UInt8}(undef, Int(hi - lo))
             if hi > lo
                 src = AC.subslice(data, lo, hi - lo)
@@ -608,7 +608,7 @@ function _viewpayloads!(
     n = Int(d.len)
     base = length(buffers)
     for k = 3:length(d.buffers)
-        _chargevector!(budget, UInt8, d.buffers[k].len, "string column data")
+        _chargeexact!(budget, UInt8, d.buffers[k].len, "string column data")
         push!(buffers, AC.slicebytes(d.buffers[k]))
     end
     n == 0 && return payloads
@@ -639,7 +639,7 @@ end
 "One `StringVector`/`BytesVector` over every batch of a string or binary column."
 function _payloadcolumn(::Type{V}, datas, budget=nothing) where {V}
     n = sum(d -> Int(d.len), datas; init=0)
-    _chargevector!(budget, _StringPayload, n, "string column payloads")
+    _chargeexact!(budget, _StringPayload, n, "string column payloads")
     payloads = Vector{_StringPayload}(undef, n)
     buffers = Vector{UInt8}[]
     at = 0
@@ -656,7 +656,7 @@ end
 "One `Vector{String}` (with `missing` where null) over every batch of a string column."
 function _stringvector(::Type{T}, datas, budget=nothing) where {T}
     n = sum(d -> Int(d.len), datas; init=0)
-    _chargevector!(budget, T, n, "string column")
+    _chargeexact!(budget, T, n, "string column")
     out = Vector{T}(undef, n)
     at = 0
     for d in datas
@@ -848,7 +848,7 @@ function _batchview(::Type{T}, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext) 
     if t isa AC.RunEndEncodedType
         runs, values = d.children[1], d.children[2]
         R = AC.juliatype(runs.type::AC.IntType)
-        _chargevector!(budget, Int64, runs.len, "run ends")
+        _chargeexact!(budget, Int64, runs.len, "run ends")
         runends = Int64.(_primitive(R, R, Nothing, runs, budget))
         vcol = _viewcolumn(f.children[2], [values], ctx, T)
         return RunEndEncoded{T,typeof(vcol)}(runends, vcol, Int(d.offset), Int(d.len))

@@ -138,17 +138,9 @@ batch.
 Memory: only the memory-mapped **file-format** path avoids holding the whole
 source. Batches decode from the map one at a time, so a loop over such a
 `Stream` holds one batch of columns plus the file's dictionaries. That is the
-way to process a file larger than RAM. A
-`Stream` security budget ([`Arrow.Limits`](@ref): 64 bytes per input byte, at
-most 16 GiB by default) stays cumulative across every batch it yields, even
-after the consumer drops that batch. Raise the limit explicitly for a trusted
-large file whose total decoded allocation exceeds it; the same `limits`
-keyword applies to [`Arrow.Table`](@ref):
-
-```julia
-trusted_limits = Arrow.Limits(max_total_allocated_bytes = 64 * 1024^3)
-stream = Arrow.Stream("big.arrow"; limits = trusted_limits)
-```
+way to process a file larger than RAM. Each of those batches decodes under its
+own allocation allowance ([`Arrow.Limits`](@ref)), sized from its own bytes,
+so a file of any length streams with the default limits.
 
 A **stream-format** source is read to the end and every batch is decoded when
 the `Stream` is constructed. A file-format `IO` or byte-vector input is
@@ -728,17 +720,20 @@ monotonicity, dictionary index domains, union type ids, and the other
 data-intrinsic invariants (semantic). Metadata is verified by a generated
 FlatBuffers shape verifier before any of it is used. Resource limits (metadata
 size, body size, allocation budget, nesting depth) are enforced before any
-metadata-directed or package-controlled read-facade allocation. The one
-cumulative budget covers byte-range fetch and assembly, IPC decode, Core and
-ArrowTypes containers, scan slices and joins, and final table columns. It
-scales with the input (`max_allocation_ratio` bytes per input byte, at least
-256 MiB, at most `max_total_allocated_bytes`), so ordinary files read with the
-default limits while lengths a small file declares without backing bytes fail
-before allocation. Custom
-user hook allocations remain the hook author's responsibility. Vector
-reserves include a conservative backing-store capacity, not only the logical
-element payload, because supported Julia versions can round that capacity to
-the next allocation class.
+metadata-directed or package-controlled read-facade allocation. A read's
+budget (one per `Arrow.Table`, one per batch of a file-format `Arrow.Stream`)
+covers byte-range fetch and assembly, IPC decode, Core and ArrowTypes
+containers, scan slices and joins, and final table columns. It scales with the
+input (`max_allocation_ratio` bytes per input byte, at least 256 MiB, at most
+`max_total_allocated_bytes`, the machine's physical memory by default). A
+compressed buffer counts at its decompressed size, as far as its column reads
+it, so highly compressible files read with the default limits. Lengths a small
+file declares without backing bytes fail before allocation, and a compressed
+buffer that claims more than its column reads decodes only the column's bytes.
+Custom user hook allocations remain the hook author's responsibility. Small
+vector reserves include a conservative backing-store capacity, not only the
+logical element payload, because supported Julia versions can round that
+capacity to the next allocation class.
 
 Core schema field and child names remain `String` values and are not interned.
 The Tables.jl facade is the explicit `Symbol` boundary because Tables column

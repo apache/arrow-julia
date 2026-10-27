@@ -50,36 +50,40 @@
 Resource limits for an Arrow IPC reader. Each bound is checked before the
 work it governs can exceed it.
 
-| keyword                     | default       | bounds                         |
-|:----------------------------|:--------------|:-------------------------------|
-| `max_metadata_bytes`        | 16 MiB        | metadata per message           |
-| `max_body_bytes`            | 2 GiB         | one message body               |
-| `max_buffer_bytes`          | 2 GiB         | one buffer                     |
-| `max_total_allocated_bytes` | 16 GiB        | cumulative allocation per read |
-| `max_allocation_ratio`      | 64            | allocation per input byte      |
-| `max_messages`              | 1,000,000     | messages per stream or file    |
-| `max_metadata_objects`      | 1,000,000     | flatbuffer objects per message |
-| `max_nesting_depth`         | 64            | schema and metadata nesting    |
-| `max_array_length`          | 1,000,000,000 | array length                   |
-| `max_concurrent_reads`      | 64            | concurrent range reads         |
+| keyword                     | default         | bounds                              |
+|:----------------------------|:----------------|:------------------------------------|
+| `max_metadata_bytes`        | 16 MiB          | metadata per message                |
+| `max_body_bytes`            | none            | one message body                    |
+| `max_buffer_bytes`          | none            | one buffer, compressed or not       |
+| `max_total_allocated_bytes` | physical memory | allocation per read or stream batch |
+| `max_allocation_ratio`      | 64              | allocation per input byte           |
+| `max_messages`              | 1,000,000       | messages per stream or file         |
+| `max_metadata_objects`      | 1,000,000       | flatbuffer objects per message      |
+| `max_nesting_depth`         | 64              | schema and metadata nesting         |
+| `max_array_length`          | 1,000,000,000   | array length                        |
+| `max_concurrent_reads`      | 64              | concurrent range reads              |
 
-One read may allocate `max_allocation_ratio` bytes per byte of its input (the
+A read may allocate `max_allocation_ratio` bytes per byte of its input (the
 file, buffer, IO, or object), at least 256 MiB, and at most
-`max_total_allocated_bytes`. Ordinary columns cost a small multiple of their
-stored bytes, so files of any size read with the defaults; lengths a small
-malformed file declares without the bytes to back them (run-end encoded,
-view, null-child, or decompressed lengths) fail before they are allocated.
-Raise `max_allocation_ratio` for trusted data that expands further, such as
-long runs or heavily repeated dictionary values.
+`max_total_allocated_bytes`. A compressed buffer counts at its decompressed
+size, up to the size its column needs, so a compressed file reads with the
+allowance it would have uncompressed. Each batch an [`Arrow.Stream`](@ref)
+yields gets its own allowance from its own bytes. Ordinary columns cost a
+small multiple of their stored bytes, so files of any size and compression
+ratio read with the defaults; lengths a small malformed file declares without
+the bytes to back them (run-end encoded, view, null-child, or decompressed
+lengths beyond what the columns need) fail before they are allocated. Raise
+`max_allocation_ratio` for trusted data that expands further, such as long runs
+or heavily repeated dictionary values.
 
 Pass a `Limits` value as the `limits` keyword to [`Arrow.Table`](@ref) or
 [`Arrow.Stream`](@ref).
 """
 Base.@kwdef struct Limits
     max_metadata_bytes::Int64 = 16 * 1024 * 1024
-    max_body_bytes::Int64 = Int64(2) * 1024 * 1024 * 1024
-    max_buffer_bytes::Int64 = Int64(2) * 1024 * 1024 * 1024
-    max_total_allocated_bytes::Int64 = Int64(16) * 1024 * 1024 * 1024
+    max_body_bytes::Int64 = typemax(Int64)
+    max_buffer_bytes::Int64 = typemax(Int64)
+    max_total_allocated_bytes::Int64 = _physicalmemory()
     max_allocation_ratio::Int64 = 64
     max_messages::Int = 1_000_000
     max_metadata_objects::Int = 1_000_000
@@ -88,45 +92,72 @@ Base.@kwdef struct Limits
     max_concurrent_reads::Int = 64
 end
 
+_physicalmemory() = Int64(min(Sys.total_memory(), UInt64(typemax(Int64))))
+
+# `left` is charged and refunded with compare-and-swap, so decoding tasks
+# share a budget without a lock. `limit` grows as decompressed input arrives
+# (`ratio` bytes per byte, never past `cap`).
 mutable struct AllocationBudget
-    left::Int64
-    limit::Int64
-    lock::ReentrantLock
+    @atomic left::Int64
+    @atomic limit::Int64
+    const ratio::Int64
+    const cap::Int64
 end
 
-function AllocationBudget(limit::Integer)
+function AllocationBudget(limit::Integer; ratio::Integer=0, cap::Integer=limit)
     value = Int64(limit)
     value >= 0 || throw(ArgumentError("allocation budget must be nonnegative"))
-    return AllocationBudget(value, value, ReentrantLock())
+    return AllocationBudget(value, value, Int64(ratio), max(value, Int64(cap)))
 end
 
 # Below this, a read's budget does not shrink with its input: small files keep
 # the allowance every input had before the budget scaled with input size.
 const _MIN_INPUT_BUDGET = Int64(256) * 1024 * 1024
 
+_saturatingmul(a::Int64, b::Int64) =
+    (p=Base.Checked.mul_with_overflow(a, b); p[2] ? typemax(Int64) : p[1])
+
 "The allocation budget for one read of `nbytes` input bytes (see [`Limits`](@ref))."
 function _readlimit(limits::Limits, nbytes::Integer)
-    scaled, overflow =
-        Base.Checked.mul_with_overflow(limits.max_allocation_ratio, Int64(nbytes))
-    perinput = overflow ? typemax(Int64) : scaled
+    perinput = _saturatingmul(limits.max_allocation_ratio, Int64(nbytes))
     return min(limits.max_total_allocated_bytes, max(_MIN_INPUT_BUDGET, perinput))
 end
 
-_readbudget(limits::Limits, nbytes::Integer) = AllocationBudget(_readlimit(limits, nbytes))
+_readbudget(limits::Limits, nbytes::Integer) = AllocationBudget(
+    _readlimit(limits, nbytes);
+    ratio=limits.max_allocation_ratio,
+    cap=limits.max_total_allocated_bytes,
+)
+
+# Move `limit` to `new` and shift `left` by the same amount (not below 0).
+function _setlimit!(budget::AllocationBudget, old::Int64, new::Int64)
+    _, ok = @atomicreplace budget.limit old => new
+    ok || return false
+    left = @atomic budget.left
+    while true
+        left, done = @atomicreplace budget.left left => max(Int64(0), left + (new - old))
+        done && return true
+    end
+end
 
 "Lower an open read's budget to its input's allowance once the input size is known."
 function _boundbudget!(budget::AllocationBudget, limits::Limits, nbytes::Integer)
     limit = _readlimit(limits, nbytes)
-    lock(budget.lock)
-    try
-        if limit < budget.limit
-            budget.left = max(Int64(0), budget.left - (budget.limit - limit))
-            budget.limit = limit
-        end
-    finally
-        unlock(budget.lock)
+    while true
+        old = @atomic budget.limit
+        (limit >= old || _setlimit!(budget, old, limit)) && return budget
     end
-    return budget
+end
+
+"Raise the allowance as if `extra` more input bytes had been read, up to the cap."
+function _grow!(budget::AllocationBudget, extra::Int64)
+    (budget.ratio > 0 && extra > 0) || return nothing
+    add = _saturatingmul(budget.ratio, extra)
+    while true
+        old = @atomic budget.limit
+        new = min(budget.cap, old > typemax(Int64) - add ? typemax(Int64) : old + add)
+        (new <= old || _setlimit!(budget, old, new)) && return nothing
+    end
 end
 
 """
@@ -151,45 +182,30 @@ function Base.showerror(io::IO, e::AllocationLimitError)
     return nothing
 end
 
-function _charge_unlocked!(budget::AllocationBudget, amount::Int64, what::AbstractString)
-    amount >= 0 || throw(ArgumentError("negative allocation charge"))
-    amount <= budget.left ||
-        throw(AllocationLimitError("$what exceeds the reader allocation budget"))
-    budget.left -= amount
-    return nothing
-end
-
 function _charge!(budget::AllocationBudget, amount::Int64, what::AbstractString)
-    lock(budget.lock)
-    try
-        return _charge_unlocked!(budget, amount, what)
-    finally
-        unlock(budget.lock)
+    amount >= 0 || throw(ArgumentError("negative allocation charge"))
+    left = @atomic budget.left
+    while true
+        amount <= left ||
+            throw(AllocationLimitError("$what exceeds the reader allocation budget"))
+        left, ok = @atomicreplace budget.left left => left - amount
+        ok && return nothing
     end
 end
 
 function _refund!(budget::AllocationBudget, amount::Int64)
     amount >= 0 || throw(ArgumentError("negative allocation refund"))
-    lock(budget.lock)
-    try
-        refunded = Base.Checked.checked_add(budget.left, amount)
-        refunded <= budget.limit ||
+    left = @atomic budget.left
+    while true
+        refunded = Base.Checked.checked_add(left, amount)
+        refunded <= (@atomic budget.limit) ||
             throw(ArgumentError("allocation refund exceeds the charged total"))
-        budget.left = refunded
-        return nothing
-    finally
-        unlock(budget.lock)
+        left, ok = @atomicreplace budget.left left => refunded
+        ok && return nothing
     end
 end
 
-function _remaining(budget::AllocationBudget)
-    lock(budget.lock)
-    try
-        return budget.left
-    finally
-        unlock(budget.lock)
-    end
-end
+_remaining(budget::AllocationBudget) = @atomic budget.left
 
 AC._charge_materialization!(budget::AllocationBudget, amount::Int64, what::AbstractString) =
     _charge!(budget, amount, what)
@@ -202,14 +218,9 @@ function _verify_ipc_metadata_budgeted(
     limits::Limits,
     budget::AllocationBudget,
 )
-    lock(budget.lock)
-    try
-        result = verify_ipc_metadata(metabytes, limits, budget.left)
-        _charge_unlocked!(budget, result[4], "verified metadata expansion")
-        return result
-    finally
-        unlock(budget.lock)
-    end
+    result = verify_ipc_metadata(metabytes, limits, _remaining(budget))
+    _charge!(budget, result[4], "verified metadata expansion")
+    return result
 end
 
 function _verify_footer_budgeted(
@@ -217,14 +228,9 @@ function _verify_footer_budgeted(
     limits::Limits,
     budget::AllocationBudget,
 )
-    lock(budget.lock)
-    try
-        result = verify_footer(footerbytes, limits, budget.left)
-        _charge_unlocked!(budget, result[5], "verified footer expansion")
-        return result
-    finally
-        unlock(budget.lock)
-    end
+    result = verify_footer(footerbytes, limits, _remaining(budget))
+    _charge!(budget, result[5], "verified footer expansion")
+    return result
 end
 
 @inline function _chargevector!(
@@ -234,6 +240,26 @@ end
     what::AbstractString,
 ) where {T}
     budget === nothing || _charge!(budget, AC._materializedvectorbytes(T, n), what)
+    return nothing
+end
+
+# A vector allocated once at its final length (`Vector{T}(undef, n)`).
+# Beyond Julia's small-object size classes its storage is the payload plus
+# a header, so large columns are charged what they cost.
+@inline function _exactbytes(::Type{T}, n::Integer) where {T}
+    payload = AC.checked_mul(Int64(n), Int64(Base.elsize(Vector{T})))
+    Base.isbitsunion(T) && (payload = AC.checked_add(payload, Int64(n)))
+    return payload <= 4096 ? AC._materializedvectorbytes(T, n) :
+           AC.checked_add(payload, Int64(128))
+end
+
+@inline function _chargeexact!(
+    budget::Union{Nothing,AllocationBudget},
+    ::Type{T},
+    n::Integer,
+    what::AbstractString,
+) where {T}
+    budget === nothing || _charge!(budget, _exactbytes(T, n), what)
     return nothing
 end
 
@@ -822,12 +848,16 @@ function Base.close(state::DecodeState)
     return nothing
 end
 
+# Decode into `out[1:declared]` and return the bytes produced. With
+# `exact=false` the frame may hold more (decoding stops once `out` is full)
+# or less; the caller checks the count.
 function _decode_lz4!(
     state::DecodeState,
     src::Ptr{UInt8},
     srclen::Int64,
     out::Vector{UInt8},
     declared::Int64,
+    exact::Bool=true,
 )
     ctx = _lz4ctx!(state)
     CLZ4.LZ4F_resetDecompressionContext(ctx)
@@ -843,7 +873,9 @@ function _decode_lz4!(
         hint = CLZ4.LZ4F_decompress(ctx, dst, outsize, src + inpos, insize, C_NULL)
         inpos += Int64(insize[])
         outpos += Int64(outsize[])
+        exact || outpos < declared || return outpos
         if hint == 0
+            exact || return outpos
             inpos == srclen || throw(
                 ValidationError("LZ4 buffer contains trailing bytes or multiple frames"),
             )
@@ -852,9 +884,10 @@ function _decode_lz4!(
                     "LZ4 output length $outpos does not match declared $declared",
                 ),
             )
-            return nothing
+            return outpos
         end
-        inpos < srclen || throw(ValidationError("truncated LZ4 frame"))
+        inpos < srclen ||
+            (exact ? throw(ValidationError("truncated LZ4 frame")) : return outpos)
         (insize[] != 0 || outsize[] != 0) ||
             throw(ValidationError("LZ4 output exceeds declared length $declared"))
     end
@@ -884,7 +917,32 @@ function _decode_zstd!(
             "ZSTD output length $(Int64(got)) does not match declared $declared",
         ),
     )
-    return nothing
+    return Int64(got)
+end
+
+# Decode at most `length(out)` bytes of a zstd buffer and return how many
+# were produced; the rest of the input is not read.
+function _decode_zstd_prefix!(
+    state::DecodeState,
+    src::Ptr{UInt8},
+    srclen::Int64,
+    out::Vector{UInt8},
+)
+    dctx = _zstdctx!(state)
+    ZSTD.ZSTD_DCtx_reset(dctx, ZSTD.ZSTD_reset_session_only)
+    input = ZSTD.ZSTD_inBuffer(Ptr{Cvoid}(src), Csize_t(srclen), Csize_t(0))
+    output = ZSTD.ZSTD_outBuffer(Ptr{Cvoid}(pointer(out)), Csize_t(length(out)), Csize_t(0))
+    while output.pos < length(out)
+        before = (input.pos, output.pos)
+        r = ZSTD.ZSTD_decompressStream(dctx, output, input)
+        ZSTD.ZSTD_isError(r) == 0 || throw(
+            ValidationError(
+                "ZSTD decompression failed: $(unsafe_string(ZSTD.ZSTD_getErrorName(r)))",
+            ),
+        )
+        (r == 0 || (input.pos, output.pos) == before) && break
+    end
+    return Int64(output.pos)
 end
 
 # `B` is the body representation: a contiguous `BufferSlice` for in-memory
@@ -1012,7 +1070,9 @@ end
 
 skipbuffer!(c::DecodeCursor) = (_buffermeta!(c); nothing)
 
-function takebuffer!(c::DecodeCursor)
+# `needed` is the byte count the buffer's column reads (-1 when unknown); it
+# bounds how far decompressed bytes extend the read's allowance.
+function takebuffer!(c::DecodeCursor, needed::Int64=Int64(-1))
     offset, len = _buffermeta!(c)
     # THE checked-subslice step: a buffer is only ever a window into this
     # message's body span (or, for a sparse body, into a fetched span that
@@ -1025,18 +1085,25 @@ function takebuffer!(c::DecodeCursor)
         throw(ValidationError("batch buffer [$offset, $len] escapes its message body"))
     end
     (c.codec == CODEC_NONE || len == 0) && return wire
-    return _decompressbuffer!(c, wire)
+    return _decompressbuffer!(c, wire, needed)
 end
 
 """
 Decode one compressed buffer: an Int64 uncompressed-length prefix, then the
 payload. A prefix of -1 means the payload is stored raw and stays a view of
-the wire mapping. Every declared size is bounded before allocation (the
-prefix is attacker-controlled) and the decompressed size must match the
-declaration exactly. A positively compressed buffer becomes its own
+the wire mapping. The declared size is attacker-controlled: it must agree with
+the size the frame headers record, if any, and is charged to the read's budget
+before allocation. A buffer that declares more than its column reads
+(`needed`, from the field node; a writer may store a sliced column's whole
+buffer) decodes only the column's bytes; otherwise the decompressed size must
+match the declaration exactly. A positively compressed buffer becomes its own
 exact-sized owned region.
+
+Decompressed bytes count as input to the budget as far as the column reads
+them, so a highly compressible buffer is funded while a claim beyond what the
+column reads is not.
 """
-function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
+function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice, needed::Int64=Int64(-1))
     wire.len >= 8 || throw(
         ValidationError("compressed buffer of $(wire.len) bytes lacks its length prefix"),
     )
@@ -1045,29 +1112,55 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
     0 <= declared <= c.max_buffer_bytes || throw(
         ValidationError("declared decompressed length $declared exceeds the buffer limit"),
     )
-    declared <= typemax(Int) ||
+    declared <= typemax(Int) >> 1 ||
         throw(ValidationError("declared decompressed buffer is not addressable"))
     payloadlen = wire.len - 8
     payloadlen > 0 || throw(ValidationError("compressed buffer has an empty payload"))
     state = c.state::DecodeState
-    _chargevector!(state.budget, UInt8, declared, "decompressed bytes")
+    wireregion = wire.region::OwnerRegion
+    recorded = GC.@preserve wireregion _framecontentsize(
+        c.codec,
+        AC.sliceptr(wire) + 8,
+        payloadlen,
+    )
+    (recorded < 0 || recorded == declared) || throw(
+        ValidationError(
+            "declared decompressed length $declared does not match the $recorded bytes " *
+            "its frame records",
+        ),
+    )
+    # A buffer longer than its column reads (a writer may store a sliced
+    # column's whole buffer) decodes only the column's bytes.
+    exact = needed < 0 || declared <= _padded64(needed)
+    outlen = exact ? declared : _padded64(needed)
+    needed >= 0 && _grow!(state.budget, outlen - payloadlen)
+    charged = _exactbytes(UInt8, outlen)
+    _charge!(state.budget, charged, "decompressed bytes")
     committed = false
     try
         # This is the only output allocation. Its size was checked and
         # charged before either native decoder sees the input frame.
-        out = Vector{UInt8}(undef, Int(declared))
+        out = Vector{UInt8}(undef, Int(outlen))
         # The native decoders read through a raw pointer, so the wire
         # region's root must stay reachable for the whole call (Core rule 2).
-        wireregion = wire.region::OwnerRegion
-        GC.@preserve out wireregion begin
+        got = GC.@preserve out wireregion begin
             src = AC.sliceptr(wire) + 8
             if c.codec == CODEC_LZ4_FRAME
-                _decode_lz4!(state, src, payloadlen, out, declared)
+                _decode_lz4!(state, src, payloadlen, out, outlen, exact)
+            elseif exact
+                _decode_zstd!(state, src, payloadlen, out, outlen)
             else
-                _decode_zstd!(state, src, payloadlen, out, declared)
+                _decode_zstd_prefix!(state, src, payloadlen, out)
             end
         end
-        result = BufferSlice(heapregion(out), 0, declared)
+        exact ||
+            got >= needed ||
+            throw(
+                ValidationError(
+                    "compressed buffer holds $got bytes; its column needs $needed",
+                ),
+            )
+        result = BufferSlice(heapregion(out), 0, got)
         committed = true
         return result
     catch e
@@ -1076,8 +1169,44 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice)
         e isa InterruptException && rethrow()
         throw(ValidationError("buffer decompression failed: $(sprint(showerror, e))"))
     finally
-        committed || _refund!(state.budget, declared)
+        committed || _refund!(state.budget, charged)
     end
+end
+
+_padded64(n::Int64) = n > typemax(Int64) - 63 ? typemax(Int64) : (n + 63) & ~Int64(63)
+
+# The decompressed size the frame headers record: zstd frames usually do (a
+# buffer may hold several), LZ4 frames optionally. -1 when a header does not
+# say; a malformed header is left for the decoder to reject.
+function _framecontentsize(codec::Int8, src::Ptr{UInt8}, len::Int64)::Int64
+    if codec == CODEC_ZSTD
+        total = Int64(0)
+        pos = Int64(0)
+        while pos < len
+            n = ZSTD.ZSTD_getFrameContentSize(src + pos, Csize_t(len - pos))
+            n >= ZSTD.ZSTD_CONTENTSIZE_ERROR && return Int64(-1)
+            n > typemax(Int64) - total && return Int64(-1)
+            total += Int64(n)
+            framelen = ZSTD.ZSTD_findFrameCompressedSize(src + pos, Csize_t(len - pos))
+            (ZSTD.ZSTD_isError(framelen) == 0 && framelen > 0) || return Int64(-1)
+            pos += Int64(framelen)
+        end
+        return total
+    end
+    # LZ4 frame: magic, FLG (bit 3: content size present), BD, then the size.
+    (
+        len >= 14 &&
+        unsafe_load(src, 1) == 0x04 &&
+        unsafe_load(src, 2) == 0x22 &&
+        unsafe_load(src, 3) == 0x4d &&
+        unsafe_load(src, 4) == 0x18
+    ) || return Int64(-1)
+    unsafe_load(src, 5) & 0x08 == 0 && return Int64(-1)
+    n = UInt64(0)
+    for k = 14:-1:7
+        n = (n << 8) | unsafe_load(src, k)
+    end
+    return n > typemax(Int64) ? Int64(-1) : Int64(n)
 end
 
 function finishcursor!(c::DecodeCursor)
@@ -1135,6 +1264,51 @@ included.
 Dictionary-encoded columns consume the INDEX layout's buffers (validity +
 indices) and resolve their values through the adapter's dictionary table.
 """
+# The bytes a column of `n` slots reads from a buffer in `role`, from its
+# field node alone (-1 when that needs bytes not decoded yet). Variable-width
+# data ends at the last offset, which precedes it in `previous`.
+function _neededbytes(role::AC.BufferRole, spec::AC.LayoutSpec, n::Int64, previous)
+    role == AC.VALIDITY && return cld(n, 8)
+    role == AC.TYPE_IDS && return n
+    role == AC.VIEWS && return _saturatingmul(n, Int64(16))
+    role == AC.OFFSETS &&
+        return n == 0 ? Int64(0) : _saturatingmul(n + 1, Int64(spec.offsetwidth))
+    (role == AC.ELEMENT_OFFSETS || role == AC.SIZES) &&
+        return _saturatingmul(n, Int64(spec.offsetwidth))
+    role == AC.DATA || return Int64(-1)
+    spec.fixedwidth > 0 && return _saturatingmul(n, Int64(spec.fixedwidth))
+    spec.fixedwidth == -1 && return cld(n, 8)
+    # Byte-addressed data follows its offsets (validity, offsets, data).
+    (spec.offsetwidth > 0 && length(previous) == 2) || return Int64(-1)
+    n == 0 && return Int64(0)
+    offsets = previous[2]
+    w = spec.offsetwidth
+    offsets.len >= (n + 1) * w || return Int64(-1)
+    last =
+        w == 8 ? AC.loadat(offsets, Int64, n * 8) : Int64(AC.loadat(offsets, Int32, n * 4))
+    return last >= 0 ? last : Int64(-1)
+end
+
+# The end of the last value each variadic data buffer of a view column holds,
+# from its views: what a compressed data buffer's column reads. `nothing` for
+# an uncompressed batch, whose buffers are not decompressed.
+function _variadicends(c::DecodeCursor, views::BufferSlice, n::Int64, nvariadic::Int)
+    c.codec == CODEC_NONE && return nothing
+    _chargevector!((c.state::DecodeState).budget, Int64, nvariadic, "variadic buffer ends")
+    ends = fill(Int64(-1), nvariadic)
+    (nvariadic == 0 || views.len < 16n) && return ends
+    fill!(ends, 0)
+    for i = 0:(n - 1)
+        len = AC.loadat(views, Int32, 16i)
+        len > 12 || continue
+        k = AC.loadat(views, Int32, 16i + 8)
+        off = AC.loadat(views, Int32, 16i + 12)
+        (0 <= k < nvariadic && off >= 0) || continue
+        ends[k + 1] = max(ends[k + 1], Int64(off) + len)
+    end
+    return ends
+end
+
 function decodefield(
     f::Field,
     c::DecodeCursor,
@@ -1144,12 +1318,18 @@ function decodefield(
     t = f.type
     node = takenode!(c)
     spec = AC.layoutspec_of(t)
-    buffers = BufferSlice[takebuffer!(c) for _ in spec.buffers]
+    n = Int64(node.length)
+    buffers = BufferSlice[]
+    for role in spec.buffers
+        push!(buffers, takebuffer!(c, _neededbytes(role, spec, n, buffers)))
+    end
     if spec.variadic
         # View layouts append their declared count of variadic data buffers
         # after the fixed validity/views pair (format 1.4).
-        for _ = 1:takevariadic!(c)
-            push!(buffers, takebuffer!(c))
+        nvariadic = takevariadic!(c)
+        ends = _variadicends(c, buffers[end], n, nvariadic)
+        for k = 1:nvariadic
+            push!(buffers, takebuffer!(c, ends === nothing ? Int64(-1) : ends[k]))
         end
     end
     for (role, buffer) in zip(spec.buffers, buffers)

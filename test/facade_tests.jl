@@ -887,7 +887,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test_throws Arrow.AllocationLimitError ranged(needed - 1)
     end
 
-    @testset "stream batches share one exact budget" begin
+    @testset "the allocation limit error" begin
         io = IOBuffer()
         Arrow.write(
             io,
@@ -895,35 +895,6 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             file=false,
         )
         bytes = take!(io)
-        function openstream(cap)
-            src = Arrow.readstream(
-                copy(bytes);
-                limits=Arrow.Limits(max_total_allocated_bytes=cap),
-            )
-            return Arrow.Stream(src), src.budget
-        end
-
-        probe_limit = Int64(1_000_000_000)
-        stream, probe = openstream(probe_limit)
-        firstbatch, state = iterate(stream)
-        secondbatch, _ = iterate(stream, state)
-        @test firstbatch.x == [1, 2]
-        @test secondbatch.x == [3, 4]
-        # The read's budget is the input's allowance, below the configured cap.
-        needed = probe.limit - Arrow._remaining(probe)
-
-        exactstream, exact = openstream(needed)
-        firstexact, state = iterate(exactstream)
-        secondexact, _ = iterate(exactstream, state)
-        @test firstexact.x == [1, 2]
-        @test secondexact.x == [3, 4]
-        @test Arrow._remaining(exact) == 0
-
-        shortstream, _ = openstream(needed - 1)
-        firstshort, state = iterate(shortstream)
-        @test firstshort.x == [1, 2]
-        @test_throws Arrow.AllocationLimitError iterate(shortstream, state)
-
         # The displayed error names the limit and how to raise it.
         err = try
             Arrow.Table(bytes; limits=Arrow.Limits(max_total_allocated_bytes=64))

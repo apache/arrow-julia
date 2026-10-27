@@ -1571,8 +1571,8 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         select=(),
         filter=Tables.colcmp(==, Tables.col(:d), Arrow.Dates.Month(1)),
     )
-    # The opened read needs 338,688 bytes and the remote path 379,628 here.
-    publiclimits = Limits(max_total_allocated_bytes=360_000)
+    # The opened read needs 217,760 bytes and the remote path 258,700 here.
+    publiclimits = Limits(max_total_allocated_bytes=238_000)
     opened = readfile(copy(publicbytes); limits=publiclimits)
     @assert Tables.rowcount(Arrow.Table(opened; scan=publicscan)) == 0
     publicerror = try
