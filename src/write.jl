@@ -450,8 +450,21 @@ function _writepartition!(w::Writer, @nospecialize(part), retained, several::Boo
     hints =
         w.st === nothing || retained !== nothing ? _partitionhints(w, columns, own) :
         Any[nothing for _ in columns]
+    # The partition is captured as `Any`, so `_eachbatch` compiles once, not
+    # once per table type.
+    anypart = Ref{Any}(part)
     _eachbatch(columns, n, w.batchsize) do batchcols, nrows
-        _writebatch!(w, part, names, batchcols, nrows, hints, retained, encoded, several)
+        _writebatch!(
+            w,
+            anypart[],
+            names,
+            batchcols,
+            nrows,
+            hints,
+            retained,
+            encoded,
+            several,
+        )
     end
     return nothing
 end

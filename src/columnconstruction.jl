@@ -47,7 +47,14 @@ _instantelementperiod(::Type{Durations.Timestamp{P}}) where {P} = P
 _instantelementperiod(::Type{<:Durations.ZonedTimestamp{P}}) where {P} = P
 
 "One native (Field, ArrayData) column from a Julia vector, facade conversions included."
-function _constructnativepart(name::String, v::AbstractVector; context=nothing)
+# The column-level dispatchers (`_constructnativepart`, `_constructpart`) do
+# not specialize on the vector type: the builders they call do, so each new
+# column type compiles its builder and not the whole dispatch.
+function _constructnativepart(
+    name::String,
+    @nospecialize(v::AbstractVector);
+    context=nothing,
+)
     T = Base.nonmissingtype(eltype(v))
     # With TimeZones loaded, a fresh ZonedDateTime column writes as a
     # timezone-declared millisecond timestamp (ext/ArrowTimeZonesExt.jl)
@@ -274,7 +281,7 @@ end
 "One (Field, ArrayData) column, including the ArrowTypes compatibility adapter."
 function _constructpart(
     name::String,
-    v::AbstractVector;
+    @nospecialize(v::AbstractVector);
     context=nothing,
     narrowabstract::Bool=true,
 )
@@ -5671,7 +5678,7 @@ end
 "Construct one part under a retained Field: descriptor, nullability, metadata."
 function _constructpart(
     f::AC.Field,
-    v::AbstractVector;
+    @nospecialize(v::AbstractVector);
     context::_WriterContext=_WriterContext(),
 )
     # Typed nested rows of the field's layout (an Arrow.Table's, say) build as
@@ -6929,7 +6936,7 @@ end
 "One partition of a non-dictionary column, by the plan `_constructcolumnparts` chose."
 function _constructcolumnpart(
     fieldname::String,
-    part::AbstractVector,
+    @nospecialize(part::AbstractVector),
     partition::Int;
     retained,
     inferredplan,
