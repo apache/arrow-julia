@@ -501,7 +501,7 @@ struct NullType <: ArrowType end
 struct BoolType <: ArrowType end
 "Integer of `bits` width, `signed` or not."
 struct IntType <: ArrowType
-    bits::Int      # 8/16/32/64 — the spec's Int; wider is NOT valid
+    bits::Int      # 8/16/32/64 per the spec; 128 is Polars' Int128/UInt128 extension
     signed::Bool
 end
 "IEEE floating point of `bits` width (16/32/64)."
@@ -1118,8 +1118,8 @@ _validate_descriptor(::Any) = throw(ArgumentError("unregistered ArrowType"))
     throw(ArgumentError("unregistered ArrowType"))
 end
 _validate_descriptor(t::IntType) =
-    t.bits in (8, 16, 32, 64) ||
-    throw(ValidationError("integer bit width must be 8, 16, 32, or 64"))
+    t.bits in (8, 16, 32, 64, 128) ||
+    throw(ValidationError("integer bit width must be 8, 16, 32, 64, or 128"))
 _validate_descriptor(t::FloatType) =
     t.bits in (16, 32, 64) ||
     throw(ValidationError("floating-point bit width must be 16, 32, or 64"))
@@ -1174,6 +1174,8 @@ _validate_descriptor(t::UnionType) =
     throw(ValidationError("invalid Arrow union mode $(repr(t.mode))"))
 function _validate_descriptor(t::DictionaryType)
     _validate_descriptor(t.indextype)
+    t.indextype.bits <= 64 ||
+        throw(ValidationError("dictionary index bit width must be 8, 16, 32, or 64"))
     # The spec forbids dictionary-encoded dictionary values; enforcing it
     # here is also what keeps descriptor equality non-recursive (typeequal).
     t.valuetype isa DictionaryType &&
@@ -2070,8 +2072,15 @@ end
 # what lets the C-data and IPC adapters share it unchanged.
 juliatype(::BoolType) = Bool
 juliatype(t::IntType) =
-    t.signed ? (t.bits == 8 ? Int8 : t.bits == 16 ? Int16 : t.bits == 32 ? Int32 : Int64) :
-    (t.bits == 8 ? UInt8 : t.bits == 16 ? UInt16 : t.bits == 32 ? UInt32 : UInt64)
+    t.signed ?
+    (
+        t.bits == 8 ? Int8 :
+        t.bits == 16 ? Int16 : t.bits == 32 ? Int32 : t.bits == 128 ? Int128 : Int64
+    ) :
+    (
+        t.bits == 8 ? UInt8 :
+        t.bits == 16 ? UInt16 : t.bits == 32 ? UInt32 : t.bits == 128 ? UInt128 : UInt64
+    )
 juliatype(t::FloatType) = t.bits == 16 ? Float16 : t.bits == 32 ? Float32 : Float64
 juliatype(::TimestampType) = Int64
 juliatype(::DurationType) = Int64
@@ -2228,11 +2237,13 @@ function _value(t::IntType, f::Field, d::ArrayData, i::Int64)
         t.bits == 64 && return loadat(b, Int64, _slotbyteoff(d, i, 8))
         t.bits == 32 && return loadat(b, Int32, _slotbyteoff(d, i, 4))
         t.bits == 16 && return loadat(b, Int16, _slotbyteoff(d, i, 2))
+        t.bits == 128 && return loadat(b, Int128, _slotbyteoff(d, i, 16))
         return loadat(b, Int8, _slotbyteoff(d, i, 1))
     else
         t.bits == 64 && return loadat(b, UInt64, _slotbyteoff(d, i, 8))
         t.bits == 32 && return loadat(b, UInt32, _slotbyteoff(d, i, 4))
         t.bits == 16 && return loadat(b, UInt16, _slotbyteoff(d, i, 2))
+        t.bits == 128 && return loadat(b, UInt128, _slotbyteoff(d, i, 16))
         return loadat(b, UInt8, _slotbyteoff(d, i, 1))
     end
 end

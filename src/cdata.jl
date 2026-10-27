@@ -114,10 +114,18 @@ const ARROW_FLAG_ALL_SUPPORTED =
 _tuchar(u) =
     u == AC.SECOND ? "s" : u == AC.MILLISECOND ? "m" : u == AC.MICROSECOND ? "u" : "n"
 
-formatstring(t::IntType) = (
-    t.signed ? Dict(8 => "c", 16 => "s", 32 => "i", 64 => "l") :
-    Dict(8 => "C", 16 => "S", 32 => "I", 64 => "L")
-)[t.bits]
+function formatstring(t::IntType)
+    t.bits == 128 && throw(
+        ArgumentError(
+            "the C data interface has no 128-bit integer format; " *
+            "convert the column to a decimal or fixed-size binary first",
+        ),
+    )
+    return (
+        t.signed ? Dict(8 => "c", 16 => "s", 32 => "i", 64 => "l") :
+        Dict(8 => "C", 16 => "S", 32 => "I", 64 => "L")
+    )[t.bits]
+end
 formatstring(t::FloatType) = Dict(16 => "e", 32 => "f", 64 => "g")[t.bits]
 formatstring(::BoolType) = "b"
 formatstring(::NullType) = "n"

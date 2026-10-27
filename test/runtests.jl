@@ -36,6 +36,9 @@ include("property_tests.jl")
 include("ipc_view_output_tests.jl")
 include("ipc_dictionary_tests.jl")
 
+# Files written by Polars (footer-authoritative file reads, 128-bit ints).
+include("polars_tests.jl")
+
 # Read-then-rewrite fidelity through the facade, plus reader-budget accounting.
 include("rewrite_regressions.jl")
 include("detached_values_tests.jl")

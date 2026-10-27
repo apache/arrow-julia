@@ -2817,7 +2817,7 @@ function _statfold(f::Field, d::ArrayData)
         AC.nullcount(d)
     end
     supported =
-        stat isa IntType ? (stat.signed || stat.bits < 64) :
+        stat isa IntType ? (stat.bits <= 64 && (stat.signed || stat.bits < 64)) :
         stat isa FloatType ||
         stat isa BoolType ||
         stat isa Utf8Type ||

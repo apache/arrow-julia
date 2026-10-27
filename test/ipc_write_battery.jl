@@ -497,8 +497,8 @@ function ipc_write_battery()
     lyinglen[lenpos:(lenpos + 3)] .= reinterpret(UInt8, Int32[Int32(2^30)])
     @assert _rejects(() -> readfile(lyinglen))
 
-    # The leading Schema message is part of the file contract, not dead
-    # padding. It must agree semantically with Footer.schema.
+    # The Footer is authoritative, as in Arrow C++: a leading Schema message
+    # that disagrees with Footer.schema is never read.
     differentschema = copy(filebytes)
     embeddedlen = Int64(reinterpret(Int32, differentschema[13:16])[1])
     embedded = copy(differentschema[17:(16 + embeddedlen)])
@@ -510,7 +510,8 @@ function ipc_write_battery()
         _vtable(embedded, AC.checked_add(fieldvec, Int64(_vu32(embedded, fieldvec))))
     namepos = _vref(embeddedfield, 0; required=true)
     differentschema[16 + namepos + 4 + 1] = UInt8('z')
-    @assert _rejects(() -> readfile(differentschema))
+    @assert readfile(differentschema).schema.fields[1].name ==
+            readfile(filebytes).schema.fields[1].name
 
     # Files cannot opt into stream dictionary replacement, even when their
     # block index happens to contain no duplicate dictionary id.

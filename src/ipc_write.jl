@@ -1325,89 +1325,6 @@ function verify_footer(
     ctx.reserved
 end
 
-function _metadataequal(a, b)
-    av = something(a, Meta.KeyValue[])
-    bv = something(b, Meta.KeyValue[])
-    length(av) == length(bv) || return false
-    for (x, y) in zip(av, bv)
-        x.key == y.key || return false
-        something(x.value, "") == something(y.value, "") || return false
-    end
-    return true
-end
-
-function _fieldequal(a::Field, b::Field)
-    a.name == b.name &&
-    a.nullable == b.nullable &&
-    AC.typeequal(a.type, b.type) &&
-    a.metadata == b.metadata &&
-    length(a.children) == length(b.children) || return false
-    return all(_fieldequal(x, y) for (x, y) in zip(a.children, b.children))
-end
-
-function _schemaside(metaschema::Meta.Schema)
-    dictids = Dict{Int64,Meta.Field}()
-    fielddictids = IdDict{Field,Int64}()
-    fields = Field[
-        corefield(f, dictids, fielddictids) for
-        f in something(metaschema.fields, Meta.Field[])
-    ]
-    foreach(validateschemafield, fields)
-    valueschemas = validatedictionaryids(fields, fielddictids)
-    length(valueschemas) == length(dictids) ||
-        throw(ValidationError("duplicate dictionary id in file schema"))
-    return fields
-end
-
-function _fieldwireequal(a::Meta.Field, b::Meta.Field)
-    _metadataequal(a.custom_metadata, b.custom_metadata) || return false
-    adict, bdict = a.dictionary, b.dictionary
-    (adict === nothing) == (bdict === nothing) || return false
-    if adict !== nothing
-        adict.id == bdict.id || return false
-    end
-    achildren = something(a.children, Meta.Field[])
-    bchildren = something(b.children, Meta.Field[])
-    length(achildren) == length(bchildren) || return false
-    return all(_fieldwireequal(x, y) for (x, y) in zip(achildren, bchildren))
-end
-
-function _schemaequal(a::Meta.Schema, b::Meta.Schema)
-    something(a.endianness, Meta.Endianness.Little) ==
-    something(b.endianness, Meta.Endianness.Little) || return false
-    ametafields = something(a.fields, Meta.Field[])
-    bmetafields = something(b.fields, Meta.Field[])
-    length(ametafields) == length(bmetafields) || return false
-    all(_fieldwireequal(x, y) for (x, y) in zip(ametafields, bmetafields)) || return false
-    afields = _schemaside(a)
-    bfields = _schemaside(b)
-    length(afields) == length(bfields) || return false
-    _metadataequal(a.custom_metadata, b.custom_metadata) || return false
-    all(_fieldequal(x, y) for (x, y) in zip(afields, bfields)) || return false
-    return true
-end
-
-function _fileschema(
-    region::OwnerRegion,
-    footerstart::Int64,
-    limits::Limits,
-    budget::AllocationBudget,
-)
-    blob = BufferSlice(region, 0, region.len)
-    AC.loadat(blob, UInt32, Int64(8)) == CONTINUATION ||
-        throw(ValidationError("file data section does not start with an IPC message"))
-    declared = Int64(AC.loadat(blob, Int32, Int64(12)))
-    0 < declared <= limits.max_metadata_bytes ||
-        throw(ValidationError("file schema metadata length is outside the limit"))
-    declared % 8 == 0 ||
-        throw(ValidationError("file schema metadata is not 8-byte aligned"))
-    metalen = AC.checked_add(Int64(8), declared)
-    fm = _blockmessage(region, (Int64(8), metalen, Int64(0)), footerstart, limits, budget)
-    fm.header_type == UInt8(1) && fm.msg.header isa Meta.Schema || # Schema
-        throw(ValidationError("file data section does not start with a schema"))
-    return fm, AC.checked_add(Int64(8), metalen)
-end
-
 """
     ArrowFile
 
@@ -1604,6 +1521,11 @@ function _blockmessagebatch(metadata::BufferSlice)
     root = Int64(_blockload(metadata, UInt32, Int64(0), "message root"))
     root >= 4 || throw(ValidationError("invalid block message root offset"))
     msg = _blocktable(metadata, root, "block message table")
+    # An absent version slot is the schema default, V1 (0).
+    versionpos = _blockfield(msg, 0, 2, "message version slot")
+    version =
+        versionpos === nothing ? Int16(0) :
+        _blockload(metadata, Int16, versionpos, "message version slot")
     bodypos = _blockfield(msg, 3, 8, "message body-length slot")
     bodylen =
         bodypos === nothing ? Int64(0) :
@@ -1620,7 +1542,7 @@ function _blockmessagebatch(metadata::BufferSlice)
     else
         throw(ValidationError("footer block has unsupported message header type $headertype"))
     end
-    return bodylen, headertype, batch
+    return bodylen, headertype, batch, version
 end
 
 function _verifyblockbuffers(batch::_BlockTable, bodylen::Int64)
@@ -1669,26 +1591,37 @@ function _verifyblockframe(
     declared == metalen - 8 ||
         throw(ValidationError("footer block metadata length does not match the message"))
     metadata = AC.subslice(blob, offset + 8, declared)
-    messagebodylen, headertype, batch = _blockmessagebatch(metadata)
+    messagebodylen, headertype, batch, version = _blockmessagebatch(metadata)
     messagebodylen == bodylen ||
         throw(ValidationError("footer block body length does not match the message"))
     headertype == expectedheadertype ||
         throw(ValidationError("footer block has the wrong message header type"))
     _verifyblockbuffers(batch, bodylen)
-    return nothing
+    return version
 end
 
+"""
+Preflight every Footer Block's frame. Returns the end of the indexed data and
+the metadata version the indexed messages share (`footerversion` when the
+file indexes no message).
+"""
 function _verifyblockframes(
     blob::BufferSlice,
     dictblocks,
     recordblocks,
-    dataend::Int64;
+    dataend::Int64,
+    footerversion::Int16;
     datastart::Int64=0,
 )
     indexedend = _validateblockindex(dictblocks, recordblocks, dataend; datastart=datastart)
-    foreach(block -> _verifyblockframe(blob, block, UInt8(2)), dictblocks)
-    foreach(block -> _verifyblockframe(blob, block, UInt8(3)), recordblocks)
-    return indexedend
+    version = Int16(0)
+    for (blocks, headertype) in ((dictblocks, UInt8(2)), (recordblocks, UInt8(3)))
+        for block in blocks
+            v = _verifyblockframe(blob, block, headertype)
+            version = _filemetadataversion(footerversion, v, version == 0 ? v : version)
+        end
+    end
+    return indexedend, version == 0 ? footerversion : version
 end
 
 """
@@ -1738,8 +1671,10 @@ end
     readfile(region::OwnerRegion; limits=Limits()) -> ArrowFile
 
 Open an IPC-format file: verify both magics, the footer length, the footer
-flatbuffer, and the schema; eagerly decode the dictionary blocks (shared by
-every record batch); expose record batches lazily through the Block index.
+flatbuffer and its schema, and the frame of every message the footer
+indexes; eagerly decode the dictionary blocks (shared by every record batch);
+expose record batches lazily through the Block index. The schema comes from
+the footer; the leading Schema message is not read.
 Pass `mmapregion(path)` to read a file through Core's mmap path. The file
 format permits one base dictionary per id, followed by deltas.
 Full dictionary replacement remains a format error.
@@ -1759,7 +1694,7 @@ function _filemetadataversion(footer::Int16, message::Int16, expected::Int16=mes
     (
         footer == message ||
         (footer in (Int16(3), Int16(4)) && message in (Int16(3), Int16(4)))
-    ) || throw(ValidationError("file schema and footer metadata versions differ"))
+    ) || throw(ValidationError("IPC message and footer metadata versions differ"))
     return message
 end
 
@@ -1810,26 +1745,28 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
         )
     )
     metaschema === nothing && throw(ValidationError("file footer carries no schema"))
-    # Validate the leading schema and indexed messages against the Footer
-    # boundary first. Only then can the final eight bytes be classified as an
-    # optional EOS marker: a no-EOS file may end its last data buffer with the
-    # same byte pattern.
-    schemafm, schemaend = _fileschema(region, footerstart, limits, budget)
-    version = _filemetadataversion(version, schemafm.version)
-    schemafm.features == features ||
-        throw(ValidationError("file schema and footer features differ"))
-    _schemaequal(schemafm.msg.header::Meta.Schema, metaschema) ||
-        throw(ValidationError("file schema and footer schema differ"))
-    _metadataequal(schemafm.msg.custom_metadata, footer.custom_metadata) ||
-        throw(ValidationError("file schema and footer custom metadata differ"))
-    indexedend =
-        _verifyblockframes(blob, dictblocks, recordblocks, footerstart; datastart=schemaend)
+    # The Footer is authoritative, as in Arrow C++: the schema comes from it
+    # and every message is reached through its Blocks, so the leading Schema
+    # message is never read. (Polars writes that message without its stream
+    # framing.) Data starts after the padded magic (`ARROW1` plus two bytes).
+    # Validate the indexed messages against the Footer boundary first. Only
+    # then can the final eight bytes be classified as an optional EOS marker:
+    # a no-EOS file may end its last data buffer with the same byte pattern.
+    datastart = Int64(8)
+    indexedend, version = _verifyblockframes(
+        blob,
+        dictblocks,
+        recordblocks,
+        footerstart,
+        version;
+        datastart=datastart,
+    )
     haseos =
         footerstart - indexedend >= 8 &&
         AC.loadat(blob, UInt32, footerstart - 8) == CONTINUATION &&
         AC.loadat(blob, UInt32, footerstart - 4) == UInt32(0)
     dataend = haseos ? footerstart - 8 : footerstart
-    _validateblockindex(dictblocks, recordblocks, dataend; datastart=schemaend)
+    _validateblockindex(dictblocks, recordblocks, dataend; datastart=datastart)
     dictids = Dict{Int64,Meta.Field}()
     fielddictids = IdDict{Field,Int64}()
     fields = Field[
