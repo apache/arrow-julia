@@ -164,35 +164,37 @@ function _primitive(
     return Primitive{T,S,C}(data, validity, bitoffset, d)
 end
 
-# One bulk copy where the layouts match and no slot is null.
+# One pass over the buffer, and its validity bitmap where some slot is null:
+# the stored values are the values.
 function Base.copyto!(
     dest::Vector{T},
     doffs::Integer,
-    src::Primitive{T,T,Nothing},
+    src::Primitive{T,S,Nothing},
     soffs::Integer,
     n::Integer,
-) where {T}
+) where {T,S}
     n == 0 && return dest
     (
         n > 0 &&
         checkbounds(Bool, dest, doffs:(doffs + n - 1)) &&
         checkbounds(Bool, src, soffs:(soffs + n - 1))
     ) || throw(BoundsError(dest, doffs:(doffs + n - 1)))
-    isempty(src.validity) || return invoke(
-        copyto!,
-        Tuple{AbstractArray,Integer,AbstractArray,Integer,Integer},
-        dest,
-        doffs,
-        src,
-        soffs,
-        n,
-    )
-    GC.@preserve src copyto!(dest, doffs, src.data, soffs, n)
+    GC.@preserve src begin
+        data, bits, off = src.data, src.validity, src.bitoffset
+        if isempty(bits)
+            copyto!(dest, doffs, data, soffs, n)
+        else
+            # Validity is present only when some slot is null, so `T` has `Missing`.
+            @inbounds for i = 0:(n - 1)
+                dest[doffs + i] = _bitset(bits, off, soffs + i) ? data[soffs + i] : missing
+            end
+        end
+    end
     return dest
 end
 
-Base.copy(v::Primitive{T,T,Nothing}) where {T} =
-    isempty(v.validity) ? GC.@preserve(v, copy(v.data)) : collect(T, v)
+Base.copy(v::Primitive{T,S,Nothing}) where {T,S} =
+    copyto!(Vector{T}(undef, length(v)), 1, v, 1, length(v))
 
 # Base's generic `map`, `filter`, and `collect` do not vectorize through the
 # per-access preserve. A view whose values are its stored layout (no nulls
@@ -420,29 +422,43 @@ DataAPI.refarray(x::ChainedVector{T,<:DictEncoded}) where {T} =
 DataAPI.refpool(x::ChainedVector{T,<:DictEncoded}) where {T} =
     isempty(x.arrays) || !_sharedpool(x) ? nothing : DataAPI.refpool(x.arrays[1])
 
-function Base.copy(v::DictEncoded{T}) where {T}
+Base.copy(v::DictEncoded{T}) where {T} = _pooledcopy(T, (v,))
+# The batches of a column copy into one `PooledArray`, whether they share a
+# pool, extend it (delta dictionaries), or replace it.
+Base.copy(c::ChainedVector{T,<:DictEncoded}) where {T} = _pooledcopy(T, c.arrays)
+
+function _pooledcopy(::Type{T}, chunks) where {T}
     # Distinct values in first-pool-position order; duplicates and null
     # pool entries remap so the PooledArray's invariants hold.
     invpool = Dict{T,UInt32}()
     pool = T[]
-    remap = Vector{UInt32}(undef, length(v.pool))
-    for (k, x) in enumerate(v.pool)
-        remap[k] = get!(invpool, x) do
-            push!(pool, x)
-            UInt32(length(pool))
-        end
-    end
-    refs = Vector{UInt32}(undef, length(v))
-    for i in eachindex(refs)
-        code = @inbounds v.indices[i]
-        refs[i] = if code === missing
-            get!(invpool, missing) do
-                push!(pool, missing)
-                UInt32(length(pool))
+    refs = Vector{UInt32}(undef, sum(length, chunks; init=0))
+    remap = UInt32[]
+    lastpool = nothing
+    at = 0
+    for v in chunks
+        if v.pool !== lastpool
+            remap = Vector{UInt32}(undef, length(v.pool))
+            for (k, x) in enumerate(v.pool)
+                remap[k] = get!(invpool, x) do
+                    push!(pool, x)
+                    UInt32(length(pool))
+                end
             end
-        else
-            @inbounds remap[Int(code) + 1]
+            lastpool = v.pool
         end
+        for i in eachindex(v.indices)
+            code = @inbounds v.indices[i]
+            refs[at + i] = if code === missing
+                get!(invpool, missing) do
+                    push!(pool, missing)
+                    UInt32(length(pool))
+                end
+            else
+                @inbounds remap[Int(code) + 1]
+            end
+        end
+        at += length(v)
     end
     return PooledArrays.PooledArray(PooledArrays.RefArray(refs), invpool, pool)
 end
@@ -846,6 +862,110 @@ function _viewstrings!(out, d::AC.ArrayData, c::_StringChunk)
     end
     return nothing
 end
+
+# --- multi-batch columns -----------------------------------------------------------
+
+# Broadcasting over a column of several batches runs batch by batch, each
+# over its own view (as fast as over a `Vector`), instead of locating the
+# batch of every element.
+struct _ChainedStyle <: Broadcast.AbstractArrayStyle{1} end
+_ChainedStyle(::Val{1}) = _ChainedStyle()
+_ChainedStyle(::Val{N}) where {N} = Broadcast.DefaultArrayStyle{N}()
+Base.BroadcastStyle(::Type{<:ChainedVector{<:Any,<:ArrowVector}}) = _ChainedStyle()
+Base.similar(::Broadcast.Broadcasted{_ChainedStyle}, ::Type{T}, dims) where {T} =
+    similar(Array{T}, dims)
+Base.similar(::Broadcast.Broadcasted{_ChainedStyle}, ::Type{Bool}, dims) =
+    similar(BitArray, dims)
+
+function Base.copyto!(dest::AbstractVector, bc::Broadcast.Broadcasted{_ChainedStyle})
+    axes(dest) == axes(bc) || Broadcast.throwdm(axes(dest), axes(bc))
+    c = _drivingchain(bc)
+    c === nothing && return copyto!(dest, convert(Broadcast.Broadcasted{Nothing}, bc))
+    for r in _batchranges(c)
+        part = Broadcast.instantiate(_batchargs(bc, r))
+        if dest isa BitVector
+            # Bits pack fastest into a BitVector of their own.
+            bits = copyto!(BitVector(undef, length(r)), part)
+            copyto!(dest, first(r), bits, 1, length(r))
+        else
+            copyto!(view(dest, r), part)
+        end
+    end
+    return dest
+end
+
+# Without a concrete element type, Base narrows the result to the values it
+# computes (`x .+ 1` over a nullable column with no nulls gives a
+# `Vector{Int}`): each batch narrows on its own, and the batches join under
+# the same widening (`promote_typejoin`).
+function Base.copy(bc::Broadcast.Broadcasted{_ChainedStyle})
+    c = _drivingchain(bc)
+    c === nothing && return copy(_elementwise(bc))
+    E = Broadcast.combine_eltypes(bc.f, bc.args)
+    isconcretetype(E) && return copyto!(similar(bc, E), bc)
+    ranges = _batchranges(c)
+    parts = [copy(Broadcast.instantiate(_batchargs(bc, r))) for r in ranges]
+    isempty(parts) && return copy(_elementwise(bc))
+    T = mapreduce(eltype, Base.promote_typejoin, parts)
+    dest = similar(bc, T)
+    for (r, part) in zip(ranges, parts)
+        copyto!(dest, first(r), part, 1, length(part))
+    end
+    return dest
+end
+
+_elementwise(bc::Broadcast.Broadcasted) =
+    Broadcast.Broadcasted{Broadcast.DefaultArrayStyle{1}}(bc.f, bc.args, bc.axes)
+
+# The column the broadcast is cut by (its first multi-batch view argument), or
+# `nothing` when some argument cannot be cut into rows (a tuple, an array of
+# other dimensions).
+_drivingchain(bc::Broadcast.Broadcasted) =
+    all(_cuttable, bc.args) ? _firstchain(bc) : nothing
+
+# The row ranges of `c`'s batches, empty batches left out.
+function _batchranges(c::ChainedVector)
+    ranges = UnitRange{Int}[]
+    lo = 1
+    for a in c.arrays
+        n = length(a)
+        n > 0 && push!(ranges, lo:(lo + n - 1))
+        lo += n
+    end
+    return ranges
+end
+
+# Arguments a broadcast can be cut into rows by: vectors, scalars, and
+# broadcasts of them (not tuples or other arrays).
+_cuttable(a::Broadcast.Broadcasted) = all(_cuttable, a.args)
+_cuttable(a::AbstractVector) = axes(a, 1) isa Base.OneTo
+_cuttable(a) = axes(a) == ()
+
+_firstchain(a::ChainedVector{<:Any,<:ArrowVector}) = a
+function _firstchain(a::Broadcast.Broadcasted)
+    for x in a.args
+        c = _firstchain(x)
+        c === nothing || return c
+    end
+    return nothing
+end
+_firstchain(a) = nothing
+
+# `bc` restricted to rows `r`: a column whose batch is exactly `r` gives that
+# batch, other vectors a view, and scalars and length-1 vectors stay whole.
+_batchargs(bc::Broadcast.Broadcasted, r) =
+    Broadcast.Broadcasted(bc.f, map(a -> _batcharg(a, r), bc.args))
+_batcharg(a::Broadcast.Broadcasted, r) = _batchargs(a, r)
+function _batcharg(a::ChainedVector{<:Any,<:ArrowVector}, r)
+    k = searchsortedfirst(a.inds, last(r))
+    k <= length(a.inds) &&
+        a.inds[k] == last(r) &&
+        (k == 1 ? 0 : a.inds[k - 1]) == first(r) - 1 &&
+        return a.arrays[k]
+    return view(a, r)
+end
+_batcharg(a::AbstractVector, r) = length(a) == 1 ? a : view(a, r)
+_batcharg(a, r) = a
 
 # --- column assembly --------------------------------------------------------------
 

@@ -1604,9 +1604,9 @@ function read(source; kwargs...)
     )
 end
 
-# Views copy into owned memory; columns this read materialized are already
-# owned by nobody else.
-_ownedcolumn(c::Union{ArrowVector,ChainedVector{<:Any,<:ArrowVector}}) = copy(c)
+# Views copy into owned memory, a column of several batches into one vector;
+# columns this read materialized are already owned by nobody else.
+_ownedcolumn(c::Union{ArrowVector,ChainedVector}) = copy(c)
 _ownedcolumn(c) = c
 
 # A Table from an opened IPC source: the whole thing, or a scan pushed

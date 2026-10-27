@@ -509,6 +509,49 @@ end
         @test_throws ArgumentError Arrow.Stream(arrowbytes(part(1:3)); ntasks=-1)
     end
 
+    @testset "columns of several batches copy and broadcast by batch" begin
+        part(r) = (
+            x=collect(Int64, r),
+            n=[iseven(i) ? missing : i for i in r],
+            c=PooledArray([string("k", i % 3) for i in r]),
+            s=[string(i) for i in r],
+        )
+        parts = Tables.partitioner([part(1:5), part(6:6), part(7:12)])
+        for file in (true, false)
+            t = Arrow.Table(arrowbytes(parts; file=file))
+            @test t.x isa Arrow.ChainedVector
+            owned = copy(t)
+            @test owned.x isa Vector{Union{Missing,Int64}} && owned.x == 1:12
+            @test owned.n isa Vector{Union{Missing,Int64}} && isequal(owned.n, t.n)
+            # Dictionary batches (shared, delta, or replaced pools) give one PooledArray.
+            @test owned.c isa PooledArray && owned.c == [string("k", i % 3) for i = 1:12]
+            @test owned.s == string.(1:12)
+            nt = Arrow.read(arrowbytes(parts; file=file), Tables.columntable)
+            @test nt.x isa Vector && nt.c isa PooledArray && !(nt.s isa Arrow.ChainedVector)
+            # Broadcasts give what they give over a Vector of the same values.
+            v = collect(t.x)
+            n = collect(t.n)
+            for (got, want) in (
+                (t.x .+ 1, v .+ 1),
+                (t.x .> 6, v .> 6),
+                (t.n .* 2, n .* 2),
+                (coalesce.(t.n, 0), coalesce.(n, 0)),
+                (Float64.(t.x), Float64.(v)),
+            )
+                @test typeof(got) == typeof(want) && isequal(got, want)
+            end
+            @test t.x .+ t.x .* collect(1:12) == v .+ v .* (1:12)
+            @test isequal(t.x .+ t.n, v .+ collect(t.n))
+            @test t.x .+ [10] == v .+ 10 && t.x .+ Ref(1) == v .+ 1
+            @test string.(t.s, "!") == string.(1:12, "!")
+            dest = zeros(Int, 12)
+            dest .= t.x .* 2
+            @test dest == 2 .* (1:12)
+            @test t.x .+ Tuple(1:12) == 2 .* (1:12)
+            @test (t.x .+ (1:12)') == v .+ (1:12)'
+        end
+    end
+
     @testset "parallel work reports the first failing item" begin
         for ntasks in (1, 3, 8)
             ran = zeros(Int, 20)
