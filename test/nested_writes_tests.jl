@@ -220,4 +220,58 @@ end
     @test collect(back.l) == [[1, 2], [3]]
 end
 
+@testset "a retained rewrite routes typed union rows to their children" begin
+    # A dense union, as a fresh write makes one.
+    t = roundtrip((u=Union{Int64,String}[1, "two", 3],))
+    back = roundtrip(t)
+    @test Arrow._fieldcontractequal(field(back), field(t))
+    @test collect(back.u) == [1, "two", 3]
+    # A sparse union with a null, built as pyarrow would.
+    int = AC.ArrayData(
+        AC.IntType(64, true),
+        3,
+        [AC._bitmapbuffer([true, true, false]), AC._databuffer([1, 0, 0])];
+        nullcount=1,
+    )
+    str = last(AC.fromjulia("s", ["", "two", ""]))
+    ut = AC.UnionType(AC.SparseMode, Int8[0, 1])
+    d = AC.ArrayData(ut, 3, [AC._databuffer(Int8[0, 1, 0])]; children=[int, str])
+    children = [
+        AC.Field("i", AC.IntType(64, true)),
+        AC.Field("s", AC.Utf8Type(false); nullable=false),
+    ]
+    f = AC.Field("u", ut; nullable=false, children)
+    sch = AC.Schema([f])
+    sparse = Arrow.Table(Arrow.writestream(sch, [AC.RecordBatch(sch, [d], 3)]))
+    @test isequal(collect(sparse.u), [1, "two", missing])
+    back = roundtrip(sparse)
+    @test field(back).type.mode == AC.SparseMode
+    @test isequal(collect(back.u), [1, "two", missing])
+    # Two children of one type cannot be told apart by value.
+    twin = AC.ArrayData(
+        ut,
+        2,
+        [AC._databuffer(Int8[0, 1])];
+        children=[
+            last(AC.fromjulia("a", Int32[1, 2])),
+            last(AC.fromjulia("b", Int32[3, 4])),
+        ],
+    )
+    tf = AC.Field(
+        "u",
+        ut;
+        nullable=false,
+        children=[AC.Field("a", AC.IntType(32, true)), AC.Field("b", AC.IntType(32, true))],
+    )
+    tsch = AC.Schema([tf])
+    twins = Arrow.Table(Arrow.writestream(tsch, [AC.RecordBatch(tsch, [twin], 2)]))
+    err = try
+        roundtrip(twins)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError && occursin("fit none or several", err.msg)
+end
+
 end # module NestedWritesTests

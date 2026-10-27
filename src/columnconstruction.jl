@@ -663,6 +663,41 @@ function _mappart(name::String, v::AbstractVector, context)
     return AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[ef]), d
 end
 
+"""
+The values of a retained Union column routed to its children, or nothing
+when some value fits no child or several. A value goes to the one child whose
+layout a column of its type would write as; a missing value to the first Null
+child, else the first nullable one. Typed Union rows (as `Arrow.Table` reads
+them) route; children of one layout cannot be told apart and do not.
+"""
+function _routeunion(f::AC.Field, v::AbstractVector, context)
+    any(x -> x isa _WriterRoutedUnion || x === _RETAINED_HIDDEN, v) && return nothing
+    children = f.children
+    routes = IdDict{Type,Int}()
+    routed = Vector{_WriterRoutedUnion}(undef, length(v))
+    for (i, x) in enumerate(v)
+        if x === missing
+            k = something(
+                findfirst(c -> c.type isa AC.NullType, children),
+                findfirst(c -> c.nullable, children),
+                Some(nothing),
+            )
+            k === nothing && return nothing
+        else
+            T = typeof(x)
+            k = get(routes, T, 0)
+            if k == 0
+                probe = first(_constructpart("probe", T[x]; context))
+                matches = findall(c -> _asretained(c, probe) !== nothing, children)
+                length(matches) == 1 || return nothing
+                k = routes[T] = only(matches)
+            end
+        end
+        routed[i] = _WriterRoutedUnion(k, x)
+    end
+    return routed
+end
+
 # Rows with `Any` element or field types (the retained builders' own
 # intermediate rows among them) rebuild under the retained field.
 _untypedrow(R::Type) =
@@ -5712,6 +5747,10 @@ function _constructpart(
         t isa AC.ListType ? :list :
         t isa AC.FixedSizeListType ? :fixedlist :
         t isa AC.StructType ? :struct : t isa AC.MapType ? :map : nothing
+    if t isa AC.UnionType && !context.lowered
+        routed = _routeunion(f, v, context)
+        routed === nothing || return _constructwriterunion(f, routed, context)
+    end
     R = Base.nonmissingtype(eltype(v))
     if kind !== nothing &&
        !context.lowered &&
@@ -5911,8 +5950,11 @@ function _constructretainedpart(
     all(x -> x isa _WriterRoutedUnion, v) && return _constructwriterunion(f, v, context)
     throw(
         ArgumentError(
-            "column $(f.name) has a retained UnionType whose child type ids " *
-            "cannot be recovered from materialized facade values",
+            "column $(f.name) is an Arrow union, and some of its values fit none or " *
+            "several of the union's children (two children of one type, say), so " *
+            "which child each value belongs to is unknown; write the values as a " *
+            "fresh column instead (Arrow.write(path, DataFrame(table)) infers the " *
+            "column's type from them) or drop the column",
         ),
     )
 end
