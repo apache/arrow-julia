@@ -2809,6 +2809,95 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test_logs min_level = Logging.Warn onecolumn(f, ds)
     end
 
+    @testset "write knobs: batchsize, compresslevel, dictencode, largelists" begin
+        AC = Arrow.AC
+        nbatches(bytes) = length(Arrow.readfile(bytes).recordblocks)
+        types(bytes) = [f.type for f in Arrow.readfile(bytes).schema.fields]
+        t = (; a=collect(1:10), s=[isodd(i) ? "x$i" : missing for i = 1:10])
+        for (batchsize, n) in ((1, 10), (3, 4), (10, 1), (11, 1))
+            bytes = take!(Arrow.write(IOBuffer(), t; batchsize))
+            @test nbatches(bytes) == n
+            back = Arrow.Table(bytes)
+            @test back.a == t.a && isequal(collect(back.s), t.s)
+        end
+        @test nbatches(take!(Arrow.write(IOBuffer(), (; a=zeros(Int8, (1 << 20) + 1))))) ==
+              2
+        parts = Tables.partitioner([(; a=collect(1:5)), (; a=Int[]), (; a=[6, 7])])
+        bytes = take!(Arrow.write(IOBuffer(), parts; batchsize=2))
+        f = Arrow.readfile(bytes)
+        @test [f[i].nrows for i = 1:length(f)] == [2, 2, 1, 0, 2]
+        @test Arrow.Table(bytes).a == 1:7
+        @test_throws ArgumentError Arrow.write(IOBuffer(), t; batchsize=0)
+        io = IOBuffer()
+        Arrow.Writer(io; batchsize=4) do w
+            Arrow.write(w, t)
+            Arrow.write(w, t)
+        end
+        @test nbatches(take!(io)) == 6
+        # compression levels change the bytes, not the values
+        big = (; a=repeat(collect(1:1000), 50))
+        for compress in (:lz4, :zstd)
+            sizes = map((1, 9)) do compresslevel
+                bytes = take!(Arrow.write(IOBuffer(), big; compress, compresslevel))
+                @test Arrow.Table(bytes).a == big.a
+                length(bytes)
+            end
+            @test sizes[1] != sizes[2]
+        end
+        @test_throws ArgumentError Arrow.write(IOBuffer(), t; compresslevel=3)
+        # dictencode: every column, or the named ones
+        dt = (; a=[1, 2, 1], s=["x", "y", "x"])
+        isdict(bytes) = [ty isa AC.DictionaryType for ty in types(bytes)]
+        @test isdict(take!(Arrow.write(IOBuffer(), dt; dictencode=true))) == [true, true]
+        @test isdict(take!(Arrow.write(IOBuffer(), dt; dictencode=[:s]))) == [false, true]
+        @test isdict(take!(Arrow.write(IOBuffer(), dt; dictencode=["a"]))) == [true, false]
+        @test_throws ArgumentError Arrow.write(IOBuffer(), dt; dictencode=[:nope])
+        plain = Arrow.Table(take!(Arrow.write(IOBuffer(), dt)))
+        bytes = take!(Arrow.write(IOBuffer(), plain; dictencode=[:s]))
+        @test isdict(bytes) == [false, true] && Arrow.Table(bytes).s == dt.s
+        # 64-bit offsets only on request
+        lt = (; s=["a", "bb"], b=[UInt8[1], UInt8[]], l=[[1, 2], [3]])
+        @test types(take!(Arrow.write(IOBuffer(), lt))) ==
+              [AC.Utf8Type(false), AC.BinaryType(false), AC.ListType(false)]
+        bytes = take!(Arrow.write(IOBuffer(), lt; largelists=true))
+        @test types(bytes) == [AC.Utf8Type(true), AC.BinaryType(true), AC.ListType(true)]
+        back = Arrow.Table(bytes)
+        @test back.s == lt.s && back.b == lt.b && back.l == lt.l
+    end
+
+    @testset "batches whose offsets would pass Int32 are cut smaller" begin
+        # A builder reports the batch and row where 32-bit offsets overflow;
+        # the writer cuts every batch at least that long and rebuilds.
+        calls = Ref(0)
+        parts = [AbstractVector[collect(1:10)]]
+        fields, data, rows =
+            Arrow._constructbatches(parts, Any[nothing], [10], 4) do cols, _
+                calls[] += 1
+                calls[] == 1 && throw(Arrow._OffsetOverflow("s", 2, 3))
+                return [AC.Field("a", AC.IntType(64, true); nullable=false)],
+                [[last(AC.fromjulia("a", collect(c[1]))) for c in cols]]
+            end
+        @test calls[] == 2
+        @test rows == [2, 2, 2, 2, 2]
+        # the cut applies from each partition's start, leaving no slivers
+        sizes = [4]
+        Arrow._shrinkbatches!(
+            sizes,
+            Arrow._batchplan([10], sizes),
+            Arrow._OffsetOverflow("s", 1, 4),
+        )
+        @test Arrow._batchplan([10], sizes) == [(1, 1:3), (1, 4:6), (1, 7:9), (1, 10:10)]
+        # a single value too large for 32-bit offsets says how to write it
+        err = try
+            Arrow._constructbatches(parts, Any[nothing], [10], 4) do cols, _
+                throw(Arrow._OffsetOverflow("s", 1, 1))
+            end
+        catch e
+            e
+        end
+        @test err isa ArgumentError && occursin("largelists=true", err.msg)
+    end
+
     @testset "DataStrings columns write as utf8, or as Utf8View zero-copy" begin
         # A StringVector's memory IS a Utf8View array: payloads are the
         # views buffer, its byte buffers the variadic data buffers. Build one

@@ -84,10 +84,10 @@ const AC = Arrow.ArrowCore
 
     @testset "removed write keywords warn and are ignored" begin
         io = IOBuffer()
-        @test_logs (:warn, r"`dictencode` was removed") match_mode = :any Arrow.write(
+        @test_logs (:warn, r"`alignment` was removed") match_mode = :any Arrow.write(
             io,
             (; a=[1]);
-            dictencode=true,
+            alignment=64,
         )
         @test Arrow.Table(take!(io)).a == [1]
         # Ignored keywords still produce a working write.

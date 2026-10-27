@@ -384,15 +384,21 @@ an `IO`:
 Arrow.write("out.arrow", tbl)              # file format (ARROW1 + footer)
 Arrow.write(io, tbl; file = false)          # stream format
 Arrow.write("out.arrow", tbl; compress = :zstd)     # or :lz4
+Arrow.write("out.arrow", tbl; compress = :zstd, compresslevel = 9)
+Arrow.write("out.arrow", tbl; batchsize = 100_000, dictencode = [:city])
 Arrow.write("out.arrow", tbl;
     metadata = ["source" => "sensor-7"],
     colmetadata = Dict(:temp => ["unit" => "C"]))
 ```
 
-Each `Tables.partitions` partition of the source becomes one record batch,
-so `Arrow.write(sink, Arrow.Stream(path))` and
-`Arrow.write(sink, Tables.partitioner(...))` preserve batch structure. The
-writer is eager and whole-buffer: every partition is materialized, encoded
+Each `Tables.partitions` partition of the source becomes one or more record
+batches of at most `batchsize` rows (default 1,048,576), so
+`Arrow.write(sink, Arrow.Stream(path))` and
+`Arrow.write(sink, Tables.partitioner(...))` preserve batch boundaries. A batch
+whose strings, bytes, or lists would pass the 2 GiB that 32-bit offsets address
+is cut smaller; `largelists = true` declares 64-bit offsets (LargeUtf8,
+LargeBinary, LargeList) instead. `dictencode` dictionary-encodes every column
+(`true`) or the named ones. The writer is eager and whole-buffer: every partition is materialized, encoded
 and validated in memory, then the complete IPC bytes are written to the
 sink once — it holds the whole table, so it is not a bounded-memory path
 for sources larger than RAM. Use [`Arrow.Writer`](@ref) when tables must be

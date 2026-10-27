@@ -39,24 +39,37 @@ Base.getindex(d::DictEncode, i::Int) = d.data[i]
 include("columnconstruction.jl")
 
 """
-    Arrow.write(sink, table; file=true, compress=nothing,
-                metadata=nothing, colmetadata=nothing, stringview=false)
+    Arrow.write(sink, table; file=true, compress=nothing, compresslevel=nothing,
+                batchsize=1_048_576, dictencode=false, largelists=false,
+                stringview=false, metadata=nothing, colmetadata=nothing)
     Arrow.write(sink; kwargs...)
 
-Write any Tables.jl source as Arrow IPC. `sink` is a file path or an `IO`.
-`file=true` emits the random-access file format (`ARROW1` magic + footer);
-`file=false` the stream format. Each `Tables.partitions` partition becomes
-one record batch. `compress` is `nothing`, `:lz4`, or `:zstd`.
-`metadata`/`colmetadata` attach schema- and per-column key-value pairs
-(a `Dict`, or pairs; `colmetadata` maps column name `Symbol`s to them).
-Schema metadata is inherited from an `Arrow.Table` or `Arrow.Stream` when
-`metadata` is `nothing`. Inherited batch statistics are dropped because the
-values, columns, or batch boundaries may have changed. Explicit `metadata`
-is used as supplied. Strings and bytes write as Utf8 and Binary;
-`stringview=true` writes them as Utf8View and BinaryView.
+Write any Tables.jl source as Arrow IPC to `sink`, a file path or an `IO`, and
+return `sink`. The one-argument form curries: `table |> Arrow.write(sink)`.
 
-Returns `sink`: the path for the path method, the `io` for the `IO` method.
-The one-argument form curries for pipelines: `table |> Arrow.write(sink)`.
+Keywords:
+- `file`: the random-access file format (`ARROW1` magic and footer), or with
+  `file=false` the stream format.
+- `compress`: `nothing`, `:lz4`, or `:zstd`; `compresslevel` sets the codec's
+  level (LZ4 up to 12, Zstandard up to 22; `nothing` keeps the codec's
+  default, 0 for LZ4 and 3 for Zstandard).
+- `batchsize`: rows per record batch. Each `Tables.partitions` partition
+  becomes one or more batches of at most `batchsize` rows. A batch whose
+  strings, bytes, or lists would pass the 2 GiB that 32-bit offsets address
+  is cut smaller, so the declared types never change.
+- `dictencode`: dictionary-encode every column (`true`) or the named ones (a
+  collection of `Symbol`s or strings). Columns with a `DataAPI.refpool`
+  (`PooledArray`, `CategoricalArray`) and [`Arrow.DictEncode`](@ref) columns
+  are always dictionary-encoded.
+- `largelists`: declare 64-bit offsets (LargeUtf8, LargeBinary, LargeList).
+- `stringview`: write strings and bytes as Utf8View/BinaryView instead of
+  Utf8/Binary.
+- `metadata`, `colmetadata`: schema and per-column key-value pairs (a `Dict`
+  or pairs; `colmetadata` maps column name `Symbol`s to them). Schema metadata
+  is inherited from an `Arrow.Table` or `Arrow.Stream` when `metadata` is
+  `nothing`, without inherited batch statistics, since values, columns, or
+  batch boundaries may have changed.
+- `ntasks` is accepted; encoding runs on one task.
 
 Writing to an existing file writes a temporary file in the same directory
 and renames it over the old one when the output is complete, so a failed
@@ -67,10 +80,9 @@ refuses the rename, `write` throws a `Base.IOError` and the old file is kept.
 The writer is eager and whole-buffer: batches are encoded and validated in
 memory, then written to the sink once.
 
-Keywords the Arrow 2.x incremental writer accepted (`alignment`,
-`dictencode`, `dictencodenested`, `denseunions`, `largelists`, `maxdepth`,
-`ntasks`) are accepted with a one-time warning and ignored; wrap columns in
-[`Arrow.DictEncode`](@ref) to dictionary-encode. See `docs/src/migration.md`.
+The Arrow 2.x keywords `alignment`, `dictencodenested`, `denseunions`, and
+`maxdepth` are accepted with a one-time warning and ignored. See
+`docs/src/migration.md`.
 """
 function write(path::AbstractString, tbl; kwargs...)
     bytes = _writebytes(tbl; kwargs...)
@@ -166,8 +178,9 @@ function tobuffer(tbl; kwargs...)
 end
 
 """
-    Arrow.Writer(sink; file=true, compress=nothing, metadata=nothing,
-                 colmetadata=nothing, dictreplacement=false, stringview=false)
+    Arrow.Writer(sink; file=true, compress=nothing, compresslevel=nothing,
+                 batchsize=1_048_576, largelists=false, stringview=false,
+                 metadata=nothing, colmetadata=nothing, dictreplacement=false)
     Arrow.Writer(f::Function, sink; kwargs...)
 
 An incremental IPC writer: batches publish to `sink` as they are written,
@@ -175,7 +188,8 @@ so producing tables one at a time never holds more than the current table
 in memory. `sink` is a file path (the writer opens and owns the handle) or
 an `IO` (borrowed; `close` finishes the IPC output but leaves the `IO`
 open). The function form runs `f(writer)` and always closes the writer.
-Metadata follows the inheritance rules of [`Arrow.write`](@ref).
+The keywords mean what they mean for [`Arrow.write`](@ref), whose metadata
+inheritance rules apply too.
 Constructor option checks run before opening a file path. If both `f` and
 `close` fail, the function form preserves the error from `f`. An existing
 file path is replaced as by [`Arrow.write`](@ref): the output goes to a
@@ -224,6 +238,9 @@ mutable struct Writer
     const metadata::Any
     const colmetadata::Any
     const dictreplacement::Bool
+    const compresslevel::Union{Nothing,Int}
+    const batchsize::Int
+    const largelists::Bool
     const stringview::Bool
     st::Union{Nothing,IPCWriteState}
     names::Vector{Symbol}
@@ -238,12 +255,14 @@ function _writer(
     metadata=nothing,
     colmetadata=nothing,
     dictreplacement::Bool=false,
+    compresslevel::Union{Nothing,Integer}=nothing,
+    batchsize::Integer=DEFAULT_BATCHSIZE,
+    largelists::Bool=false,
     stringview::Bool=false,
+    ntasks::Union{Nothing,Integer}=nothing,
 )
-    codec = compress === nothing ? :none : compress
-    if !haskey(CODEC_NAMES, codec)
-        throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
-    end
+    codec = _codec(compress, compresslevel)
+    batchsize = _checkbatchsize(batchsize)
     if dictreplacement && file
         throw(
             ArgumentError(
@@ -266,6 +285,9 @@ function _writer(
             metadata,
             colmetadata,
             dictreplacement,
+            compresslevel === nothing ? nothing : Int(compresslevel),
+            batchsize,
+            largelists,
             stringview,
             nothing,
             Symbol[],
@@ -309,8 +331,9 @@ Base.isopen(w::Writer) = !(@atomic w.closed)
     Arrow.write(writer::Arrow.Writer, table)
 
 Write one Tables.jl source through an incremental [`Arrow.Writer`](@ref):
-each `Tables.partitions` partition becomes one record batch, published to
-the sink before the call returns. Returns `writer`. See [`Arrow.Writer`](@ref)
+each `Tables.partitions` partition becomes one or more record batches of at
+most the writer's `batchsize` rows, published to the sink before the call
+returns. Returns `writer`. See [`Arrow.Writer`](@ref)
 for the schema rules.
 """
 function write(w::Writer, tbl)
@@ -320,18 +343,22 @@ function write(w::Writer, tbl)
         retained = _retainedschema(tbl)
         # Later tables must reuse the first table's exact dictionary pool,
         # so only explicit DictEncode columns are encoded here.
-        fields, coldata = if isempty(partcols)
-            _schemaonly(retained, w.colmetadata)
+        fields, coldata, batchrows = if isempty(partcols)
+            (_schemaonly(retained, w.colmetadata)..., Int[])
         else
-            _constructcolumns(
-                names,
-                partcols,
-                partpools,
-                _retainedfieldfn(retained, names),
-                w.colmetadata;
-                refpools=false,
-                stringview=w.stringview,
-            )
+            retainedfield = _retainedfieldfn(retained, names)
+            _constructbatches(partcols, partpools, rowcounts, w.batchsize) do cols, pools
+                _constructcolumns(
+                    names,
+                    cols,
+                    pools,
+                    retainedfield,
+                    w.colmetadata;
+                    refpools=false,
+                    stringview=w.stringview,
+                    largelists=w.largelists,
+                )
+            end
         end
         # The bounded facade interning rule, as when the source was read.
         isempty(partcols) && (names = _fieldnamesymbols(fields))
@@ -342,12 +369,13 @@ function write(w::Writer, tbl)
             sch;
             file=w.file,
             compress=w.compress,
+            compresslevel=w.compresslevel,
             dictreplacement=w.dictreplacement,
         )
         w.st = st
         w.schema = sch
         w.names = names
-        for batch in _tablebatches(sch, coldata, rowcounts)
+        for batch in _tablebatches(sch, coldata, batchrows)
             writebatch!(st, batch)
         end
     else
@@ -359,12 +387,14 @@ function write(w::Writer, tbl)
             ),
         )
         sch = w.schema::AC.Schema
-        fields, coldata =
-            _constructconforming(names, partcols, partpools, sch, tbl; w.stringview)
+        fields, coldata, batchrows =
+            _constructbatches(partcols, partpools, rowcounts, w.batchsize) do cols, pools
+                _constructconforming(names, cols, pools, sch, tbl; w.stringview)
+            end
         # A fresh Schema over the BUILT fields, so `writebatch!` re-checks
         # them against the writer's schema instead of trusting construction.
         batchsch = AC.Schema(fields; metadata=sch.metadata)
-        for batch in _tablebatches(batchsch, coldata, rowcounts)
+        for batch in _tablebatches(batchsch, coldata, batchrows)
             writebatch!(w.st, batch)
         end
     end
@@ -393,7 +423,7 @@ function Base.close(w::Writer)
 end
 
 """
-    Arrow.append(sink, table; compress=nothing)
+    Arrow.append(sink, table; compress=nothing, compresslevel=nothing, batchsize=1_048_576)
 
 Add `table`'s record batches to an existing IPC STREAM (`sink` is a file
 path or a seekable read/write `IO`). The existing stream is validated in
@@ -430,7 +460,13 @@ function append(io::IO, tbl; kwargs...)
     return io
 end
 
-function _appendbytes(bytes::Vector{UInt8}, tbl; compress::Union{Nothing,Symbol}=nothing)
+function _appendbytes(
+    bytes::Vector{UInt8},
+    tbl;
+    compress::Union{Nothing,Symbol}=nothing,
+    compresslevel::Union{Nothing,Integer}=nothing,
+    batchsize::Integer=DEFAULT_BATCHSIZE,
+)
     length(bytes) >= 6 &&
         view(bytes, 1:6) == FILE_MAGIC &&
         throw(
@@ -440,7 +476,8 @@ function _appendbytes(bytes::Vector{UInt8}, tbl; compress::Union{Nothing,Symbol}
                 "Arrow.Writer, or rewrite it with Arrow.write",
             ),
         )
-    codec = compress === nothing ? :none : compress
+    codec = _codec(compress, compresslevel)
+    batchsize = _checkbatchsize(batchsize)
     # Validate the whole existing stream before extending it; a corrupt
     # prefix must refuse, not gain valid-looking bytes.
     s = readstream(bytes)
@@ -464,7 +501,10 @@ function _appendbytes(bytes::Vector{UInt8}, tbl; compress::Union{Nothing,Symbol}
                 "schema fields $([f.name for f in sch.fields]) (same names, same order)",
             ),
         )
-    fields, coldata = _constructconforming(names, partcols, partpools, sch, tbl)
+    fields, coldata, batchrows =
+        _constructbatches(partcols, partpools, rowcounts, batchsize) do cols, pools
+            _constructconforming(names, cols, pools, sch, tbl)
+        end
     batchsch = AC.Schema(fields; metadata=sch.metadata)
     io = IOBuffer()
     st = resumestream!(
@@ -473,10 +513,11 @@ function _appendbytes(bytes::Vector{UInt8}, tbl; compress::Union{Nothing,Symbol}
         s.fielddictids,
         features;
         compress=codec,
+        compresslevel,
         current=s.dictionaries,
     )
     try
-        for batch in _tablebatches(batchsch, coldata, rowcounts)
+        for batch in _tablebatches(batchsch, coldata, batchrows)
             writebatch!(st, batch)
         end
         finishwrite!(st)
@@ -517,51 +558,173 @@ function _writebytes(
     tbl;
     file::Bool=true,
     compress::Union{Nothing,Symbol}=nothing,
+    compresslevel::Union{Nothing,Integer}=nothing,
     metadata=nothing,
     colmetadata=nothing,
+    batchsize::Integer=DEFAULT_BATCHSIZE,
+    dictencode=false,
+    largelists::Bool=false,
     stringview::Bool=false,
+    # Accepted for the API's shared concurrency keyword; writes run on one task.
+    ntasks::Union{Nothing,Integer}=nothing,
     # Arrow 2.x writer keywords: accepted and ignored (with a one-time
     # warning each) so 2.x call sites keep working during migration.
     alignment=nothing,
-    dictencode=nothing,
     dictencodenested=nothing,
     denseunions=nothing,
-    largelists=nothing,
     maxdepth=nothing,
-    ntasks=nothing,
 )
     for (name, value) in (
         (:alignment, alignment),
-        (:dictencode, dictencode),
         (:dictencodenested, dictencodenested),
         (:denseunions, denseunions),
-        (:largelists, largelists),
         (:maxdepth, maxdepth),
-        (:ntasks, ntasks),
     )
         value === nothing || _warnremovedkwarg(name)
     end
+    codec = _codec(compress, compresslevel)
+    batchsize = _checkbatchsize(batchsize)
     retained = _retainedschema(tbl)
     names, partcols, partpools, rowcounts = _collectparts(tbl)
-    fields, coldata = if isempty(partcols)
-        _schemaonly(retained, colmetadata)
+    encoded = _dictencodeflags(names, dictencode)
+    _applydictencode!(partcols, encoded)
+    fields, coldata, batchrows = if isempty(partcols)
+        (_schemaonly(retained, colmetadata)..., Int[])
     else
-        _constructcolumns(
-            names,
-            partcols,
-            partpools,
-            _retainedfieldfn(retained, names),
-            colmetadata;
-            stringview,
-        )
+        retainedfield = _retainedfieldfn(retained, names, encoded)
+        _constructbatches(partcols, partpools, rowcounts, batchsize) do cols, pools
+            _constructcolumns(
+                names,
+                cols,
+                pools,
+                retainedfield,
+                colmetadata;
+                stringview,
+                largelists,
+            )
+        end
     end
     schmeta = _writermetadata(metadata, retained)
     sch = AC.Schema(fields; metadata=schmeta)
-    batches = _tablebatches(sch, coldata, rowcounts)
-    codec = compress === nothing ? :none : compress
-    return file ? writefile(sch, batches; compress=codec) :
-           writestream(sch, batches; compress=codec)
+    batches = _tablebatches(sch, coldata, batchrows)
+    return file ? writefile(sch, batches; compress=codec, compresslevel) :
+           writestream(sch, batches; compress=codec, compresslevel)
 end
+
+"Rows per record batch when `batchsize` is not given: 1,048,576 (as pyarrow's chunks)."
+const DEFAULT_BATCHSIZE = 1 << 20
+
+function _checkbatchsize(batchsize::Integer)
+    batchsize >= 1 || throw(ArgumentError("batchsize must be at least 1, got $batchsize"))
+    return Int(batchsize)
+end
+
+function _codec(compress, compresslevel)
+    codec = compress === nothing ? :none : compress
+    haskey(CODEC_NAMES, codec) || throw(
+        ArgumentError("compress must be nothing, :lz4, or :zstd, got $(repr(compress))"),
+    )
+    compresslevel === nothing ||
+        codec !== :none ||
+        throw(ArgumentError("compresslevel needs compress=:lz4 or compress=:zstd"))
+    return codec
+end
+
+# Which top-level columns `dictencode` asks to dictionary-encode: all of them
+# (`true`), none (`false`), or those named (Symbols or Strings).
+function _dictencodeflags(names::Vector{Symbol}, dictencode)
+    dictencode isa Bool && return fill(dictencode, length(names))
+    wanted = Set{Symbol}(Symbol(n) for n in dictencode)
+    for n in wanted
+        n in names || throw(
+            ArgumentError("dictencode names column $n, which the table does not have"),
+        )
+    end
+    return Bool[n in wanted for n in names]
+end
+
+function _applydictencode!(partcols, encoded::Vector{Bool})
+    for cols in partcols, j in eachindex(cols)
+        encoded[j] || continue
+        col = cols[j]
+        col isa DictEncode || _hasrefpool(col) || (cols[j] = DictEncode(col))
+    end
+    return partcols
+end
+
+"""
+Construct columns over record batches of at most `batchsize` rows: each
+partition is cut into consecutive row ranges, and `construct(cols, pools)`
+builds every column across those batches. A builder with 32-bit offsets
+whose data would pass the Int32 range throws `_OffsetOverflow`; the batches
+are then cut smaller and construction restarts, so the declared types never
+change. Returns the fields, the column data, and the row count per batch.
+"""
+function _constructbatches(
+    construct::F,
+    partcols,
+    partpools,
+    rowcounts,
+    batchsize::Int,
+) where {F}
+    sizes = fill(batchsize, length(rowcounts))
+    while true
+        plan = _batchplan(rowcounts, sizes)
+        cols = Vector{AbstractVector}[
+            AbstractVector[_rowslice(col, r) for col in partcols[p]] for (p, r) in plan
+        ]
+        pools = Any[partpools[p] for (p, _) in plan]
+        try
+            fields, coldata = construct(cols, pools)
+            return fields, coldata, Int[length(r) for (_, r) in plan]
+        catch err
+            err isa _OffsetOverflow || rethrow()
+            _shrinkbatches!(sizes, plan, err)
+        end
+    end
+end
+
+"(partition, rows) of each record batch: consecutive ranges of `sizes[p]` rows."
+function _batchplan(rowcounts, sizes)
+    plan = Tuple{Int,UnitRange{Int}}[]
+    for (p, n) in enumerate(rowcounts)
+        n == 0 && push!(plan, (p, 1:0))
+        for start = 1:sizes[p]:n
+            push!(plan, (p, start:min(start + sizes[p] - 1, n)))
+        end
+    end
+    return plan
+end
+
+# Every partition's batches shrink to the rows that fit before the overflow
+# (half the batch when the row is unknown, as in nested data).
+function _shrinkbatches!(sizes, plan, err::_OffsetOverflow)
+    hint = "write it with largelists=true, which declares 64-bit offsets"
+    err.part > 0 || throw(
+        ArgumentError(
+            "column $(err.column) holds more than 2 GiB of data that cannot be split " *
+            "across record batches (a dictionary pool, say); $hint",
+        ),
+    )
+    _, r = plan[err.part]
+    (length(r) <= 1 || err.row == 1) &&
+        throw(ArgumentError("column $(err.column) has a value of more than 2 GiB; $hint"))
+    chunk = err.row > 1 ? err.row - 1 : cld(length(r), 2)
+    sizes .= min.(sizes, chunk)
+    return sizes
+end
+
+# Rows `r` (1-based positions) of a column, without copying when it can.
+function _rowslice(col::AbstractVector, r::UnitRange{Int})
+    length(r) == length(col) && return col
+    return _rowview(col, (firstindex(col) - 1) .+ r)
+end
+_rowview(col::AbstractVector, r) = view(col, r)
+_rowview(col::DictEncode, r) = DictEncode(_rowslice(col.data, r .- (firstindex(col) - 1)))
+_rowview(col::DataStrings.StringVector{T}, r) where {T} =
+    DataStrings.StringVector{T}(col.payloads[r], col.buffers, Val(:trusted))
+_rowview(col::DataStrings.BytesVector{T}, r) where {T} =
+    DataStrings.BytesVector{T}(col.payloads[r], col.buffers, Val(:trusted))
 
 # Phase 1 of a write: materialize every partition's columns, validating
 # name/order agreement — a drift here would silently bind data to the wrong
@@ -636,7 +799,7 @@ end
 # Position is the only unambiguous identity for a retained field, because
 # Arrow permits duplicate names. Fall back to a name match only when the
 # name is unique on both sides; otherwise treat the column as un-retained.
-function _retainedfieldfn(retained, names)
+function _retainedfieldfn(retained, names, encoded=nothing)
     ncols = length(names)
     retainedaligned =
         retained !== nothing &&
@@ -644,13 +807,23 @@ function _retainedfieldfn(retained, names)
         all(j -> retained.fields[j].name == String(names[j]), 1:ncols)
     function retainedfield(j)
         retained === nothing && return nothing
-        retainedaligned && return _unsharedfield(retained.fields[j])
-        count(==(names[j]), names) == 1 || return nothing
-        matches = findall(f -> f.name == String(names[j]), collect(retained.fields))
-        return length(matches) == 1 ? _unsharedfield(retained.fields[only(matches)]) :
-               nothing
+        f = _retainedfieldat(retained, names, retainedaligned, j)
+        # A column `dictencode` encodes gets a fresh dictionary field.
+        f === nothing ||
+            encoded === nothing ||
+            !encoded[j] ||
+            f.type isa AC.DictionaryType ||
+            return nothing
+        return f
     end
     return retainedfield
+end
+
+function _retainedfieldat(retained, names, retainedaligned::Bool, j::Int)
+    retainedaligned && return _unsharedfield(retained.fields[j])
+    count(==(names[j]), names) == 1 || return nothing
+    matches = findall(f -> f.name == String(names[j]), collect(retained.fields))
+    return length(matches) == 1 ? _unsharedfield(retained.fields[only(matches)]) : nothing
 end
 
 # The written schema needs one Field object per position (dictionary ids key
@@ -675,6 +848,7 @@ function _constructcolumns(
     colmetadata;
     refpools::Bool=true,
     stringview::Bool=false,
+    largelists::Bool=false,
 ) where {F}
     nparts = length(partcols)
     ncols = length(names)
@@ -693,6 +867,7 @@ function _constructcolumns(
             metadata=_metapairs(columnmeta),
             refpools=refpools,
             stringview=stringview,
+            largelists=largelists,
         )
     end
     return fields, coldata

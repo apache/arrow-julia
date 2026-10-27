@@ -181,13 +181,13 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
             AC.Field(name, AC.ViewType(true); nullable=Missing <: eltype(v)),
             v,
         )
-        return _varbytespart(name, v, AC.Utf8Type(false))
+        return _varbytespart(name, v, AC.Utf8Type(_largelists(context)))
     elseif T <: AbstractVector{UInt8}
         _stringview(context) && return _retainedview(
             AC.Field(name, AC.ViewType(false); nullable=Missing <: eltype(v)),
             v,
         )
-        return _varbytespart(name, v, AC.BinaryType(false))
+        return _varbytespart(name, v, AC.BinaryType(_largelists(context)))
     elseif T === Any || (T <: AbstractVector && eltype(T) === Any)
         # Materialized facade columns are Any-eltype for composite layouts;
         # one narrowing pass recovers list columns (inner vectors narrow
@@ -206,9 +206,36 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
         # leaf values lower at every depth.
         context === nothing && (context = _WriterContext())
         return _arrowtypeslistcolumn(name, v, T; extension_shape=false, context)
+    elseif T <: _FixedPrimitive
+        t = AC.arrowtype_for(T)
+        if eltype(v) === T
+            data = _fixedbuffer(v)
+            data === nothing && return AC.fromjulia(name, _plainvector(v))
+            return AC.Field(name, t; nullable=false),
+            AC.ArrayData(t, length(v), [AC.BufferSlice(), data]; nullcount=0)
+        end
+        vals, validity, nc = _nullablevalues(T, v, zero(T))
+        return AC.Field(name, t; nullable=true),
+        AC.ArrayData(t, length(v), [validity, AC._databuffer(vals)]; nullcount=nc)
     else
         return AC.fromjulia(name, _plainvector(v))
     end
+end
+
+const _FixedPrimitive =
+    Union{Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64,Float16,Float32,Float64}
+
+"""
+The values of a non-null fixed-width column as one buffer: a `Vector`, or a
+contiguous view of one (a record batch's rows), is borrowed without a copy;
+nothing for any other vector or a nullable element type.
+"""
+function _fixedbuffer(v::AbstractVector{T}) where {T}
+    isbitstype(T) || return nothing
+    v isa Vector{T} && return AC._databuffer(v)
+    v isa SubArray{T,1,Vector{T},<:Tuple{AbstractUnitRange{Int}},true} || return nothing
+    offset = (first(parentindices(v)[1]) - 1) * sizeof(T)
+    return AC.BufferSlice(AC.heapregion(parent(v)), offset, length(v) * sizeof(T))
 end
 
 "One (Field, ArrayData) column, including the ArrowTypes compatibility adapter."
@@ -388,11 +415,14 @@ function _constructpart(
         return AC.Field(name, t; nullable),
         AC.ArrayData(t, d.len, d.buffers; nullcount=AC.nullcount(d))
     end
+    large = _largelists(context)
+    t = utf8 ? AC.Utf8Type(large) : AC.BinaryType(large)
     return _packedpayloadpart(
         name,
         v.payloads,
         v.buffers,
-        utf8 ? AC.Utf8Type(false) : AC.BinaryType(false),
+        t,
+        large ? Int64 : Int32,
         nullable,
     )
 end
@@ -403,10 +433,11 @@ function _packedpayloadpart(
     payloads,
     buffers,
     t::AC.ArrowType,
+    ::Type{Offset},
     nullable::Bool,
-)
+) where {Offset}
     n = length(payloads)
-    offsets = Vector{Int32}(undef, n + 1)
+    offsets = Vector{Offset}(undef, n + 1)
     offsets[1] = 0
     bits = zeros(UInt8, cld(n, 8))
     pos = 0
@@ -416,8 +447,7 @@ function _packedpayloadpart(
         if len < 0
             nc += 1
         else
-            pos <= typemax(Int32) - len ||
-                throw(ArgumentError("column $name exceeds the Int32 offset range"))
+            pos <= typemax(Offset) - len || throw(_OffsetOverflow(name, 0, i))
             pos += len
             @inbounds bits[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7)
         end
@@ -449,6 +479,20 @@ function _packedpayloadpart(
 end
 
 _stringview(context) = context !== nothing && context.stringview
+_largelists(context) = context !== nothing && context.largelists
+
+"""
+A 32-bit-offset column's data passes the Int32 range at `row` (0 when the row
+is not known, as in nested data) of partition `part` (0 until the partition
+loop records it). The writer cuts its record batches smaller and retries.
+"""
+struct _OffsetOverflow <: Exception
+    column::String
+    part::Int
+    row::Int
+end
+Base.showerror(io::IO, e::_OffsetOverflow) =
+    print(io, "column $(e.column) exceeds the Int32 offset range of one record batch")
 
 # Duration seconds and year-month interval months of the larger Dates periods.
 _periodseconds(x::Dates.Week) = Base.checked_mul(Dates.value(x), Int64(604_800))
@@ -501,8 +545,12 @@ end
 
 "A utf8 or binary column (`t`), built in one pass over the values."
 function _varbytespart(name::String, v::AbstractVector, t::AC.ArrowType)
+    Offset = t.large ? Int64 : Int32
+    return _varbytespart(name, v, t, Offset)
+end
+function _varbytespart(name::String, v::AbstractVector, t, ::Type{Offset}) where {Offset}
     n = length(v)
-    offsets = Vector{Int32}(undef, n + 1)
+    offsets = Vector{Offset}(undef, n + 1)
     offsets[1] = 0
     bits = zeros(UInt8, cld(n, 8))
     data = UInt8[]
@@ -513,8 +561,7 @@ function _varbytespart(name::String, v::AbstractVector, t::AC.ArrowType)
             nc += 1
         else
             m = _nbytes(x)
-            pos <= typemax(Int32) - m ||
-                throw(ArgumentError("column $name exceeds the Int32 offset range"))
+            pos <= typemax(Offset) - m || throw(_OffsetOverflow(name, 0, i))
             pos + m > length(data) && resize!(data, max(2 * length(data), pos + m, 64))
             _copybytes!(data, pos, x, m)
             pos += m
@@ -1202,24 +1249,23 @@ function _arrowtypeslistcolumn(
     E = eltype(S)
     flat = E[]
     present = Bool[x !== missing for x in v]
-    offsets = Vector{Int32}(undef, length(v) + 1)
+    large = _largelists(context)
+    Offset = large ? Int64 : Int32
+    offsets = Vector{Offset}(undef, length(v) + 1)
     offsets[1] = 0
     for (i, row) in enumerate(v)
         if row !== missing
             row isa AbstractVector || throw(
                 ArgumentError("ArrowTypes ListKind column $name contains a non-vector row"),
             )
-            length(flat) <= typemax(Int32) - length(row) || throw(
-                ArgumentError(
-                    "ArrowTypes ListKind column $name exceeds the Int32 offset range",
-                ),
-            )
+            length(flat) <= typemax(Offset) - length(row) ||
+                throw(_OffsetOverflow(name, 0, i))
             append!(flat, row)
         end
-        offsets[i + 1] = Int32(length(flat))
+        offsets[i + 1] = Offset(length(flat))
     end
     childfield, childdata = _arrowtypeschildcolumn("item", flat; extension_shape, context)
-    t = AC.ListType(false)
+    t = AC.ListType(large)
     field = AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[childfield])
     data = AC.ArrayData(
         t,
@@ -1357,9 +1403,15 @@ mutable struct _WriterContext
     column::String
     # Fresh strings and bytes write as utf8/binary views instead of offsets.
     stringview::Bool
+    # Fresh strings, bytes, and lists declare 64-bit offsets.
+    largelists::Bool
 end
 
-function _WriterContext(column::AbstractString=""; stringview::Bool=false)
+function _WriterContext(
+    column::AbstractString="";
+    stringview::Bool=false,
+    largelists::Bool=false,
+)
     arrowtypes = _ArrowTypesContext(; warn=false)
     return _WriterContext(
         _WriterUnionPlanCache(),
@@ -1381,6 +1433,7 @@ function _WriterContext(column::AbstractString=""; stringview::Bool=false)
         false,
         String(column),
         stringview,
+        largelists,
     )
 end
 
@@ -3758,9 +3811,8 @@ function _fixedbinarypart(name::String, v::AbstractVector, N::Int)
     t = AC.FixedSizeBinaryType(N)
     field = AC.Field(name, t; nullable=Missing <: eltype(v))
     if eltype(v) === T
-        rows = v isa Vector{T} ? v : collect(T, v)
-        return field,
-        AC.ArrayData(t, length(v), [AC.BufferSlice(), AC._databuffer(rows)]; nullcount=0)
+        data = something(_fixedbuffer(v), AC._databuffer(collect(T, v)))
+        return field, AC.ArrayData(t, length(v), [AC.BufferSlice(), data]; nullcount=0)
     end
     rows, validity, nc = _nullablevalues(T, v, ntuple(_ -> 0x00, N))
     return field, AC.ArrayData(t, length(v), [validity, AC._databuffer(rows)]; nullcount=nc)
@@ -4092,9 +4144,8 @@ function _retainedvarbytes(f::AC.Field, v::AbstractVector)
                 )
                 x
             end
-            length(data) <= typemax(Offset) - length(bytes) || throw(
-                ArgumentError("column $(f.name) data exceeds its retained offset width"),
-            )
+            length(data) <= typemax(Offset) - length(bytes) ||
+                throw(_OffsetOverflow(f.name, 0, i))
             append!(data, bytes)
         end
         offsets[i + 1] = Offset(length(data))
@@ -4210,13 +4261,8 @@ end
 function _decimaldata(f::AC.Field, v::AbstractVector, ::Type{D}) where {D}
     t = f.type
     if eltype(v) === D
-        vals = v isa Vector{D} ? v : collect(D, v)
-        return AC.ArrayData(
-            t,
-            length(v),
-            [AC.BufferSlice(), AC._databuffer(vals)];
-            nullcount=0,
-        )
+        data = something(_fixedbuffer(v), AC._databuffer(collect(D, v)))
+        return AC.ArrayData(t, length(v), [AC.BufferSlice(), data]; nullcount=0)
     end
     vals, validity, nc = _nullablevalues(D, v, zero(D))
     nc > 0 &&
@@ -5860,6 +5906,7 @@ function _constructcolumnparts(
     metadata::Union{Nothing,Vector{Pair{String,String}}}=nothing,
     refpools::Bool=true,
     stringview::Bool=false,
+    largelists::Bool=false,
 )
     isempty(parts) && throw(ArgumentError("column $name has no partitions"))
     length(poolhints) == length(parts) || throw(
@@ -5871,7 +5918,7 @@ function _constructcolumnparts(
     fieldname = String(name)
     nparts = length(parts)
     data = Vector{AC.ArrayData}(undef, nparts)
-    context = _WriterContext(fieldname; stringview)
+    context = _WriterContext(fieldname; stringview, largelists)
     dictintent =
         (retained !== nothing && retained.type isa AC.DictionaryType) ||
         any(part isa DictEncode for part in parts) ||
@@ -6102,43 +6149,22 @@ function _constructcolumnparts(
             retained === nothing || inferredplan !== nothing ? nothing :
             _registeredwritercolumnplan(context, retained, constructionparts)
         for partition = 1:nparts
-            partitionfield, data[partition] = if inferredplan !== nothing
-                if retained === nothing
-                    _constructinferredfreshpart(
-                        fieldname,
-                        inferredplan,
-                        inferredplan.parts[partition],
-                        context,
-                    )
-                else
-                    _constructinferredretainedpart(
-                        retained,
-                        inferredplan,
-                        inferredplan.parts[partition],
-                        context,
-                    )
-                end
-            elseif retained === nothing
-                # A successful column-scoped narrowing pass already saw every
-                # partition. Replanning each partition from its local values
-                # can split one declared nullable Tuple child into incompatible
-                # Int and Null Fields.
-                _constructpart(
+            partitionfield, data[partition] = try
+                _constructcolumnpart(
                     fieldname,
-                    constructionparts[partition];
-                    context,
-                    narrowabstract=narrowedparts === nothing,
-                )
-            elseif registeredwriter === nothing
-                _constructpart(retained, constructionparts[partition]; context)
-            else
-                _constructwriterchild(
+                    constructionparts[partition],
+                    partition;
                     retained,
-                    registeredwriter.input,
-                    constructionparts[partition];
-                    routes=registeredwriter.routes,
+                    inferredplan,
+                    registeredwriter,
+                    narrowabstract=narrowedparts === nothing,
                     context,
                 )
+            catch err
+                (err isa _OffsetOverflow && err.part == 0) || rethrow()
+                # The overflow row is a row of this column only at its top level.
+                row = err.column == fieldname ? err.row : 0
+                throw(_OffsetOverflow(err.column, partition, row))
             end
             if partition == 1
                 field = partitionfield
@@ -6148,4 +6174,50 @@ function _constructcolumnparts(
         end
     end
     return _withfieldmetadata(field, metadata), data
+end
+
+"One partition of a non-dictionary column, by the plan `_constructcolumnparts` chose."
+function _constructcolumnpart(
+    fieldname::String,
+    part::AbstractVector,
+    partition::Int;
+    retained,
+    inferredplan,
+    registeredwriter,
+    narrowabstract::Bool,
+    context::_WriterContext,
+)
+    return if inferredplan !== nothing
+        if retained === nothing
+            _constructinferredfreshpart(
+                fieldname,
+                inferredplan,
+                inferredplan.parts[partition],
+                context,
+            )
+        else
+            _constructinferredretainedpart(
+                retained,
+                inferredplan,
+                inferredplan.parts[partition],
+                context,
+            )
+        end
+    elseif retained === nothing
+        # A successful column-scoped narrowing pass already saw every
+        # partition. Replanning each partition from its local values
+        # can split one declared nullable Tuple child into incompatible
+        # Int and Null Fields.
+        _constructpart(fieldname, part; context, narrowabstract)
+    elseif registeredwriter === nothing
+        _constructpart(retained, part; context)
+    else
+        _constructwriterchild(
+            retained,
+            registeredwriter.input,
+            part;
+            routes=registeredwriter.routes,
+            context,
+        )
+    end
 end

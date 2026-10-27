@@ -48,12 +48,16 @@
 mutable struct EncodeState
     lz4::Union{Nothing,LZ4FrameCompressor}
     zstd::Union{Nothing,ZstdCompressor}
+    const level::Union{Nothing,Int}   # codec compression level; nothing = codec default
 end
-EncodeState() = EncodeState(nothing, nothing)
+EncodeState(level::Union{Nothing,Integer}=nothing) =
+    EncodeState(nothing, nothing, level === nothing ? nothing : Int(level))
 
 function _lz4c!(s::EncodeState)
     if s.lz4 === nothing
-        c = LZ4FrameCompressor()
+        c =
+            s.level === nothing ? LZ4FrameCompressor() :
+            LZ4FrameCompressor(; compressionlevel=s.level)
         TS.initialize(c)
         s.lz4 = c
     end
@@ -62,7 +66,7 @@ end
 
 function _zstdc!(s::EncodeState)
     if s.zstd === nothing
-        c = ZstdCompressor()
+        c = s.level === nothing ? ZstdCompressor() : ZstdCompressor(; level=s.level)
         TS.initialize(c)
         s.zstd = c
     end
@@ -937,6 +941,7 @@ function beginwrite!(
     dictids::IdDict{Field,Int64}=IdDict{Field,Int64}(),
     features::Union{Nothing,Vector{Int64}}=nothing,
     dictreplacement::Bool=false,
+    compresslevel::Union{Nothing,Integer}=nothing,
 )
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
@@ -957,7 +962,7 @@ function beginwrite!(
         ids,
         feats,
         codec,
-        codec == CODEC_NONE ? nothing : EncodeState(),
+        codec == CODEC_NONE ? nothing : EncodeState(compresslevel),
         AC._ValidatedDictionaries(),
         Dict{Int64,ArrayData}(),
         NTuple{3,Int64}[],
@@ -1129,6 +1134,7 @@ function resumestream!(
     dictids::IdDict{Field,Int64},
     features::Vector{Int64};
     compress::Symbol=:none,
+    compresslevel::Union{Nothing,Integer}=nothing,
     current::Dict{Int64,ArrayData}=Dict{Int64,ArrayData}(),
 )
     _requirelittleendian()
@@ -1144,7 +1150,7 @@ function resumestream!(
         ids,
         features,
         codec,
-        codec == CODEC_NONE ? nothing : EncodeState(),
+        codec == CODEC_NONE ? nothing : EncodeState(compresslevel),
         AC._ValidatedDictionaries(),
         current,
         NTuple{3,Int64}[],
@@ -1155,7 +1161,7 @@ function resumestream!(
 end
 
 """
-    writestream(sch, batches; compress=:none, dictids=IdDict{Field,Int64}()) -> Vector{UInt8}
+    writestream(sch, batches; compress=:none, compresslevel=nothing, dictids=IdDict{Field,Int64}()) -> Vector{UInt8}
     writestream(stream::IPCStream; compress=:none) -> Vector{UInt8}
 
 Encode a complete IPC stream: schema message, dictionary batches emitted
@@ -1170,6 +1176,7 @@ function writestream(
     sch::Schema,
     batches::AbstractVector{AC.RecordBatch};
     compress::Symbol=:none,
+    compresslevel::Union{Nothing,Integer}=nothing,
     dictids::IdDict{Field,Int64}=IdDict{Field,Int64}(),
 )
     _requirelittleendian()
@@ -1192,6 +1199,7 @@ function writestream(
         sch;
         file=false,
         compress=compress,
+        compresslevel=compresslevel,
         dictids=dictids,
         features=_streamfeatures(sch, batches, ids, codec),
     )
@@ -1216,7 +1224,7 @@ writestream(s::IPCStream; compress::Symbol=:none) =
 const FILE_MAGIC = b"ARROW1"
 
 """
-    writefile(sch, batches; compress=:none, dictids=IdDict{Field,Int64}()) -> Vector{UInt8}
+    writefile(sch, batches; compress=:none, compresslevel=nothing, dictids=IdDict{Field,Int64}()) -> Vector{UInt8}
     writefile(stream::IPCStream; compress=:none) -> Vector{UInt8}
 
 The file variant: leading magic, the same stream messages, an end-of-stream
@@ -1233,6 +1241,7 @@ function writefile(
     sch::Schema,
     batches::AbstractVector{AC.RecordBatch};
     compress::Symbol=:none,
+    compresslevel::Union{Nothing,Integer}=nothing,
     dictids::IdDict{Field,Int64}=IdDict{Field,Int64}(),
 )
     _requirelittleendian()
@@ -1261,6 +1270,7 @@ function writefile(
         sch;
         file=true,
         compress=compress,
+        compresslevel=compresslevel,
         dictids=dictids,
         features=_streamfeatures(sch, batches, ids, codec),
     )

@@ -167,7 +167,8 @@ not provide these Arrow 2.x features:
 | `Arrow.append` | Still works for the IPC STREAM format, reimplemented. The file format refuses: produce it incrementally with `Arrow.Writer` or rewrite it. A 2.x stream whose dictionary pools carry null slots needs one rewrite through `Arrow.Writer(path; file=false, dictreplacement=true)` before it accepts pool-changing appends. |
 | `table \|> Arrow.write(sink)` | Still works: the curried form is kept. |
 | `Arrow.tobuffer(table)` | Still works, and still emits the IPC stream format. |
-| `ntasks` | Accepted and ignored with a one-time warning. Encoding is not task-parallel in 3.0, including in `Arrow.Writer`. |
+| `ntasks` | Accepted; encoding runs on one task, including in `Arrow.Writer`. |
+| `dictencode`, `largelists` | Kept: `dictencode` (Bool or column names) dictionary-encodes columns, `largelists=true` declares 64-bit offsets. |
 | `Arrow.ToArrow` | Import `ArrowTypes.ToArrow` directly when an explicit lazy conversion view is needed. Normal writes apply the mapping automatically. |
 
 The output default for an `IO` changed. Arrow 2.x wrote the stream format to
@@ -183,12 +184,13 @@ stream_bytes = take!(io)
 `Arrow.tobuffer(table)` produces exactly those bytes, seeked to the start.
 Use `file=true` when you need an IPC file with footer-based random access.
 
-Arrow 3.0 keeps `file`, `compress`, `metadata`, and `colmetadata`. Compression
-is selected with `:lz4` or `:zstd`; passing an initialized compressor object
-is no longer supported. The Arrow 2.x `alignment`, `dictencode`,
-`dictencodenested`, `denseunions`, `largelists`, `maxdepth`, and `ntasks`
-writer keywords no longer have any effect: `Arrow.write` accepts them with a
-one-time warning each and ignores them. As in Arrow 2.x, a column with a
+Arrow 3.0 keeps `file`, `compress`, `dictencode`, `largelists`, `metadata`,
+and `colmetadata`, and adds `compresslevel`, `batchsize`, and `stringview`.
+Compression is selected with `:lz4` or `:zstd`; passing an initialized
+compressor object is no longer supported. The Arrow 2.x `alignment`,
+`dictencodenested`, `denseunions`, and `maxdepth` writer keywords no longer
+have any effect: `Arrow.write` accepts them with a one-time warning each and
+ignores them. As in Arrow 2.x, a column with a
 `DataAPI.refpool`, such as a `PooledArray` or `CategoricalArray`, is written
 dictionary-encoded with its pool order and unused pool entries; values that
 need it, such as `CategoricalValue`s, unwrap through `DataAPI.unwrap`. Wrap
