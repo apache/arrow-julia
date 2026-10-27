@@ -455,9 +455,13 @@ end
             @test err isa ArgumentError
             @test occursin("astimezone", sprint(showerror, err))
         end
-        err = refusal(() -> Arrow.tobuffer((c=[Ts[Ts{Nanosecond}(2026, 1, 1)]],)))
+        mixed = Ts[Ts{Nanosecond}(2026, 1, 1), Ts{Millisecond}(2026, 1, 1)]
+        err = refusal(() -> Arrow.tobuffer((c=[mixed],)))
         @test err isa ArgumentError
         @test occursin("abstract Timestamp", sprint(showerror, err))
+        # One resolution narrows, as at the top level.
+        one = Arrow.Table(take!(Arrow.tobuffer((c=[Ts[Ts{Nanosecond}(2026, 1, 1)]],))))
+        @test eltype(only(one.c)) === Ts{Nanosecond}
     end
 
     @testset "nested conversion consumes the reader allocation budget" begin

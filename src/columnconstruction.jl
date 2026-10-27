@@ -61,8 +61,9 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
     elseif T === Union{}
         throw(
             ArgumentError(
-                "column $name has bottom element type Union{} and cannot infer " *
-                "an Arrow type; give the empty column a declared element type",
+                "column $(_errname(context, name)) has bottom element type Union{} " *
+                "and cannot infer an Arrow type; give the empty column a declared " *
+                "element type",
             ),
         )
     elseif T <: Union{DataDecimals.Decimal,Durations.Duration}
@@ -70,8 +71,8 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
     elseif T <: Durations.Timestamp
         isconcretetype(T) || throw(
             ArgumentError(
-                "column $name has abstract Timestamp element type $T; give the " *
-                "column one concrete resolution",
+                "column $(_errname(context, name)) has abstract Timestamp element " *
+                "type $T; give the column one concrete resolution",
             ),
         )
         return _constructtemporalpart(
@@ -83,8 +84,9 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
     elseif T <: Durations.ZonedTimestamp
         isconcretetype(T) || throw(
             ArgumentError(
-                "column $name has abstract ZonedTimestamp element type $T; an " *
-                "Arrow column declares one time zone and one resolution — " *
+                "column $(_errname(context, name)) has abstract ZonedTimestamp " *
+                "element type $T; an Arrow column declares one time zone and one " *
+                "resolution — " *
                 "convert the values with Durations.astimezone first",
             ),
         )
@@ -145,8 +147,9 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
         )
         isconcretetype(T) || throw(
             ArgumentError(
-                "column $name has abstract NamedTuple element type; give it a " *
-                "concrete NamedTuple type with declared field names and types",
+                "column $(_errname(context, name)) has abstract NamedTuple element " *
+                "type; give it a concrete NamedTuple type with declared field names " *
+                "and types",
             ),
         )
         # Children build like top-level columns, so public leaf values lower
@@ -196,8 +199,8 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
         NW = Base.nonmissingtype(eltype(w))
         (NW === Any || (NW <: AbstractVector && eltype(NW) === Any)) && throw(
             ArgumentError(
-                "column $name has element type Any and cannot be narrowed to " *
-                "a writable Arrow column; give it a concrete element type",
+                "column $(_errname(context, name)) has element type Any and cannot " *
+                "be narrowed to a writable Arrow column; give it a concrete element type",
             ),
         )
         return _constructpart(name, w; context)
@@ -280,12 +283,14 @@ function _constructpart(
         narrowed = _narrowlists(v)
         eltype(narrowed) === Any && throw(
             ArgumentError(
-                "column $name has element type Any and cannot be narrowed to a " *
-                "writable Arrow column; give it a concrete element type",
+                "column $(_errname(context, name)) has element type Any and cannot " *
+                "be narrowed to a writable Arrow column; give it a concrete element type",
             ),
         )
         return _constructpart(name, narrowed; context)
     end
+    nested = _nestedpart(name, v, context)
+    nested === nothing || return nested
     if narrowabstract
         runtimeparts = _narrowabstractwriterparts(name, AbstractVector[v], context)
         if runtimeparts !== nothing
@@ -300,6 +305,373 @@ function _constructpart(
     end
     return _arrowtypes_needs(v, context) ? _constructarrowtypespart(name, v; context) :
            _constructnativepart(name, v; context)
+end
+
+# --- plain nested columns -------------------------------------------------------
+#
+# Lists (rows are AbstractVectors), fixed-size lists (NTuples of one element
+# type), structs (NamedTuples), and maps (AbstractDicts or AbstractVectors of
+# Pairs) build here in a few typed passes, at any depth and with missing at
+# any level. Their children build as columns do, so leaves keep every
+# mapping. A container with an ArrowTypes.jl mapping or label of its own takes
+# the general route.
+
+# How an error names a column: a nested child also names its top-level column.
+_errname(context, name) =
+    context === nothing || isempty(context.column) || context.column == name ? name :
+    "$(context.column) (child $name)"
+
+"The layout `T` writes as (`:list`, `:fixedlist`, `:struct`, `:map`), or nothing."
+function _nestedkind(context, T::Type)
+    Base.@nospecialize T
+    T isa DataType && T <: Union{AbstractVector,AbstractDict,Tuple,NamedTuple} ||
+        return nothing
+    T <: AbstractVector{UInt8} && return nothing
+    _writerstoragetype!(context, T) === T && _writerextension!(context, T) === nothing ||
+        return nothing
+    if T <: NamedTuple
+        return fieldcount(T) > 0 ? :struct : nothing
+    elseif T <: Tuple
+        # NTuple{N,UInt8} is fixed_size_binary; tuples of mixed types are structs.
+        Base.isvatuple(T) && return nothing
+        types = fieldtypes(T)
+        (isempty(types) || !allequal(types) || types[1] === UInt8) && return nothing
+        return :fixedlist
+    end
+    T <: AbstractDict && return :map
+    E = eltype(T)
+    return E !== Union{} && E <: Pair ? :map : :list
+end
+
+"""
+`v` as a plain nested column, or nothing when it is not one. Nothing too for
+a struct or fixed-size list with missing rows whose non-nullable children
+cannot hide placeholder slots (see `_hidevalidity`).
+"""
+function _nestedpart(name::String, v::AbstractVector, context)
+    kind = _nestedkind(context, Base.nonmissingtype(eltype(v)))
+    kind === nothing && return nothing
+    # Dispatching on the kind compiles only the matching builder for `v`'s type.
+    return _nestedbuild(Val(kind), name, v, context)
+end
+_nestedbuild(::Val{:list}, name, v, context) = _listpart(name, v, context)
+_nestedbuild(::Val{:map}, name, v, context) = _mappart(name, v, context)
+_nestedbuild(::Val{:struct}, name, v, context) = _structpart(name, v, context)
+_nestedbuild(::Val{:fixedlist}, name, v, context) = _fixedlistpart(name, v, context)
+
+"""
+List offsets (row `i` holds values `offsets[i]+1:offsets[i+1]` of the
+child), validity, and null count of `v`'s rows, in one pass.
+"""
+function _listoffsets(name::String, v::AbstractVector, ::Type{O}) where {O}
+    n = length(v)
+    i0 = firstindex(v) - 1
+    offsets = Vector{O}(undef, n + 1)
+    offsets[1] = 0
+    bits = Vector{UInt8}(undef, cld(n, 8))
+    pos = 0
+    valid = 0
+    @inbounds for b in eachindex(bits)
+        base = (b - 1) << 3
+        byte = 0x00
+        for j = 0:(min(8, n - base) - 1)
+            i = base + j + 1
+            x = v[i0 + i]
+            present = x !== missing
+            pos += present ? length(x) : 0
+            pos <= typemax(O) || throw(_OffsetOverflow(name, 0, i))
+            offsets[i + 1] = pos
+            byte |= UInt8(present) << (j % UInt)
+        end
+        bits[b] = byte
+        valid += count_ones(byte)
+    end
+    nc = n - valid
+    validity =
+        nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
+    return offsets, validity, nc
+end
+
+# A list column read from Arrow keeps its offsets, rebased to start at zero:
+# a null row may span child values, which stay in the child.
+function _listoffsets(name::String, v::ListVector, ::Type{O}) where {O}
+    n = length(v)
+    raw = v.offsets
+    lo = Int64(raw[1])
+    offsets = Vector{O}(undef, n + 1)
+    @inbounds for i = 1:(n + 1)
+        x = Int64(raw[i]) - lo
+        x <= typemax(O) || throw(_OffsetOverflow(name, 0, i - 1))
+        offsets[i] = x
+    end
+    isempty(v.validity) && return offsets, AC.BufferSlice(), 0
+    bits = Vector{UInt8}(undef, cld(n, 8))
+    valid = 0
+    @inbounds for b in eachindex(bits)
+        byte = 0x00
+        for j = 0:(min(8, n - ((b - 1) << 3)) - 1)
+            byte |= UInt8(_bitset(v.validity, v.bitoffset, ((b - 1) << 3) + j + 1)) << j
+        end
+        bits[b] = byte
+        valid += count_ones(byte)
+    end
+    nc = n - valid
+    validity =
+        nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
+    return offsets, validity, nc
+end
+
+# A row whose length differs from the first pass's would write past its slots.
+_changedrows(name) = ArgumentError("column $name changed while it was being written")
+
+"The values of `v`'s rows back to back, as `_listoffsets` counted them."
+function _listvalues(name::String, ::Type{E}, v::AbstractVector, offsets) where {E}
+    # A list column read from Arrow already holds its rows' values in order.
+    if v isa ListVector && eltype(v.values) === E
+        lo, hi = Int(v.offsets[1]), Int(v.offsets[end])
+        hi - lo == offsets[end] || throw(_changedrows(name))
+        return view(v.values, (lo + 1):hi)
+    end
+    flat = Vector{E}(undef, Int(offsets[end]))
+    i0 = firstindex(v) - 1
+    @inbounds for i = 1:(length(offsets) - 1)
+        x = v[i0 + i]
+        x === missing && continue
+        lo = Int(offsets[i])
+        m = Int(offsets[i + 1]) - lo
+        length(x) == m || throw(_changedrows(name))
+        copyto!(flat, lo + 1, x, firstindex(x), m)
+    end
+    return flat
+end
+
+function _listpart(name::String, v::AbstractVector, context)
+    large = _largelists(context)
+    offsets, validity, nc = _listoffsets(name, v, large ? Int64 : Int32)
+    E = eltype(Base.nonmissingtype(eltype(v)))
+    values = _listvalues(_errname(context, name), E, v, offsets)
+    cf, cd = _constructpart("item", values; context)
+    t = AC.ListType(large)
+    d = AC.ArrayData(
+        t,
+        length(v),
+        [validity, AC._databuffer(offsets)];
+        children=AC.ArrayData[cd],
+        nullcount=nc,
+    )
+    return AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[cf]), d
+end
+
+"""
+Child `K` of each row of `rows` (a struct field, a map entry's key or value)
+as a lazy vector of `T`; a missing row reads as missing.
+"""
+struct _ChildValues{T,K,V<:AbstractVector} <: AbstractVector{T}
+    rows::V
+end
+_ChildValues{T,K}(rows::V) where {T,K,V} = _ChildValues{T,K,V}(rows)
+Base.size(c::_ChildValues) = (length(c.rows),)
+Base.@propagate_inbounds function Base.getindex(c::_ChildValues{T,K}, i::Int) where {T,K}
+    x = c.rows[firstindex(c.rows) + i - 1]
+    return (x === missing ? missing : getfield(x, K))::T
+end
+
+# Element `j` of a fixed-size list column's child: value `(j-1) % N + 1` of
+# row `(j-1) ÷ N + 1`.
+struct _TupleValues{T,N,V<:AbstractVector} <: AbstractVector{T}
+    rows::V
+end
+_TupleValues{T,N}(rows::V) where {T,N,V} = _TupleValues{T,N,V}(rows)
+Base.size(c::_TupleValues{T,N}) where {T,N} = (N * length(c.rows),)
+Base.@propagate_inbounds function Base.getindex(c::_TupleValues{T,N}, j::Int) where {T,N}
+    r, k = divrem(j - 1, N)
+    x = c.rows[firstindex(c.rows) + r]
+    return (x === missing ? missing : x[k + 1])::T
+end
+
+"""
+Whether a non-nullable child of type `T` can sit under missing parent rows:
+it is built nullable, with missing in those slots, and `_hidevalidity` then
+drops its validity, so the slots hold placeholders (zeros, empty strings,
+empty lists). That needs a layout with a validity buffer that a nullable
+build of `T` keeps: leaves without an ArrowTypes.jl mapping and the plain
+nested kinds.
+"""
+_hideable(context, T::Type) =
+    T !== Missing &&
+    T !== Union{} &&
+    !(T isa Union) &&
+    (_nestedkind(context, T) !== nothing || !_writerneedstype!(context, T))
+
+"A nullable child built for hidden slots, declared non-nullable."
+function _hidevalidity(f::AC.Field, d::AC.ArrayData)
+    AC.layoutspec_of(d.type).buffers[1] == AC.VALIDITY ||
+        throw(ArgumentError("internal error: column $(f.name) has no validity to hide"))
+    buffers = collect(AC.BufferSlice, d.buffers)
+    buffers[1] = AC.BufferSlice()
+    field = AC.Field(
+        f.name,
+        f.type;
+        nullable=false,
+        metadata=_fieldmetadata(f),
+        children=collect(AC.Field, f.children),
+    )
+    data = AC.ArrayData(
+        d.type,
+        d.len,
+        buffers;
+        offset=d.offset,
+        children=collect(AC.ArrayData, d.children),
+        dictionary=d.dictionary,
+        owner=d.owner,
+        nullcount=0,
+    )
+    return field, data
+end
+
+"""
+One child column of rows that may be missing: `V{T}` (or `V{Union{Missing,T}}`)
+over `v` gives its values. A child that cannot be null is built nullable over
+the missing rows and its validity hidden.
+"""
+function _rowchild(V::Type, v, name::String, T::Type, hidden::Bool, context)
+    hidden && !(Missing <: T) || return _constructpart(name, V{T}(v); context)
+    return _hidevalidity(_constructpart(name, V{Union{Missing,T}}(v); context)...)
+end
+
+function _structpart(name::String, v::AbstractVector, context)
+    NT = Base.nonmissingtype(eltype(v))
+    present = Bool[x !== missing for x in v]
+    nc = count(!, present)
+    hidden = nc > 0
+    hidden &&
+        !all(T -> Missing <: T || _hideable(context, T), fieldtypes(NT)) &&
+        return nothing
+    fields = AC.Field[]
+    children = AC.ArrayData[]
+    for k = 1:fieldcount(NT)
+        V = _ChildValues{C,k} where {C}
+        f, d = _rowchild(V, v, String(fieldname(NT, k)), fieldtype(NT, k), hidden, context)
+        push!(fields, f)
+        push!(children, d)
+    end
+    t = AC.StructType()
+    d = AC.ArrayData(
+        t,
+        length(v),
+        [nc == 0 ? AC.BufferSlice() : AC._bitmapbuffer(present)];
+        children,
+        nullcount=nc,
+    )
+    return AC.Field(name, t; nullable=Missing <: eltype(v), children=fields), d
+end
+
+function _fixedlistpart(name::String, v::AbstractVector, context)
+    NT = Base.nonmissingtype(eltype(v))
+    N = fieldcount(NT)
+    E = fieldtype(NT, 1)
+    present = Bool[x !== missing for x in v]
+    nc = count(!, present)
+    hidden = nc > 0
+    hidden && !(Missing <: E || _hideable(context, E)) && return nothing
+    cf, cd = _rowchild(_TupleValues{C,N} where {C}, v, "item", E, hidden, context)
+    t = AC.FixedSizeListType(N)
+    d = AC.ArrayData(
+        t,
+        length(v),
+        [nc == 0 ? AC.BufferSlice() : AC._bitmapbuffer(present)];
+        children=AC.ArrayData[cd],
+        nullcount=nc,
+    )
+    return AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[cf]), d
+end
+
+_maptypes(::Type{T}) where {T<:AbstractDict} = (keytype(T), valtype(T))
+_maptypes(::Type{T}) where {T<:AbstractVector} =
+    eltype(T) isa DataType ? fieldtypes(eltype(T)) : (Any, Any)
+
+"The entries of `v`'s map rows back to back, as `_listoffsets` counted them."
+function _mapentries(name::String, ::Type{P}, v::AbstractVector, offsets) where {P}
+    R = Base.nonmissingtype(eltype(v))
+    R <: AbstractVector && eltype(R) === P && return _listvalues(name, P, v, offsets)
+    entries = Vector{P}(undef, Int(offsets[end]))
+    i0 = firstindex(v) - 1
+    @inbounds for i = 1:(length(offsets) - 1)
+        x = v[i0 + i]
+        x === missing && continue
+        pos = Int(offsets[i])
+        length(x) == Int(offsets[i + 1]) - pos || throw(_changedrows(name))
+        # A dictionary iterates its entries as key => value pairs too.
+        for p in x
+            entries[pos += 1] = P(first(p), last(p))
+        end
+    end
+    return entries
+end
+
+function _mappart(name::String, v::AbstractVector, context)
+    K, V = _maptypes(Base.nonmissingtype(eltype(v)))
+    offsets, validity, nc = _listoffsets(name, v, Int32)
+    entries = _mapentries(_errname(context, name), Pair{K,V}, v, offsets)
+    KK = Base.nonmissingtype(K)
+    KK === K ||
+        all(p -> first(p) !== missing, entries) ||
+        throw(
+            ArgumentError(
+                "column $(_errname(context, name)) has a missing map key; Arrow map " *
+                "keys cannot be null, so drop those entries or replace the key",
+            ),
+        )
+    kf, kd = _constructpart("key", _ChildValues{KK,1}(entries); context)
+    vf, vd = _constructpart("value", _ChildValues{V,2}(entries); context)
+    kf.nullable && throw(
+        ArgumentError(
+            "column $(_errname(context, name)) has map keys of type $KK, which " *
+            "write as a nullable Arrow type; Arrow map keys cannot be null",
+        ),
+    )
+    entriestype = AC.StructType()
+    ef = AC.Field("entries", entriestype; nullable=false, children=AC.Field[kf, vf])
+    ed = AC.ArrayData(
+        entriestype,
+        length(entries),
+        [AC.BufferSlice()];
+        children=AC.ArrayData[kd, vd],
+        nullcount=0,
+    )
+    t = AC.MapType(false)
+    d = AC.ArrayData(
+        t,
+        length(v),
+        [validity, AC._databuffer(offsets)];
+        children=AC.ArrayData[ed],
+        nullcount=nc,
+    )
+    return AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[ef]), d
+end
+
+"""
+A freshly built field as the retained field `f` declares it, or nothing when
+their layouts differ. Names, nullability, and metadata come from `f`; a fresh
+field may be non-nullable where `f` is nullable.
+"""
+function _asretained(f::AC.Field, built::AC.Field)
+    AC.typeequal(f.type, built.type) &&
+    (f.nullable || !built.nullable) &&
+    length(f.children) == length(built.children) || return nothing
+    children = AC.Field[]
+    for (fc, bc) in zip(f.children, built.children)
+        c = _asretained(fc, bc)
+        c === nothing && return nothing
+        push!(children, c)
+    end
+    return AC.Field(
+        f.name,
+        f.type;
+        nullable=f.nullable,
+        metadata=_fieldmetadata(f),
+        children,
+    )
 end
 
 "Walk a bounded writer value graph, with optional short-circuit inspection."
@@ -403,19 +775,27 @@ function _narrowlists(v::AbstractVector)
     w = map(identity, w)
     NT = Base.nonmissingtype(eltype(w))
     _abstractnonnative(NT) && return collect(_observedtype(w), w)
-    NT <: AbstractVector || return w
+    NT !== Union{} && NT <: AbstractVector || return w
     # Join the inner element types (empties narrow to Union{} and would
-    # otherwise poison the join), then retype every inner vector.
+    # otherwise poison the join), then retype every inner vector. With only
+    # empty rows, their declared element types are all there is.
     E = Union{}
     for x in w
         x === missing && continue
         isempty(x) && continue
         E = typejoin(E, eltype(x))
     end
+    if E === Union{}
+        for x in w
+            x === missing || (E = typejoin(E, eltype(x)))
+        end
+    end
     E === Union{} && (E = Any)
     # Rows of different element types: the elements' runtime types.
-    _abstractnonnative(E) &&
-        (E = _observedtype(collect(Iterators.flatten(x for x in w if x !== missing))))
+    if _abstractnonnative(E)
+        values = collect(Iterators.flatten(x for x in w if x !== missing))
+        isempty(values) || (E = _observedtype(values))
+    end
     E === Any && return w
     hasm = eltype(w) >: Missing
     S = hasm ? Union{Missing,Vector{E}} : Vector{E}
@@ -2419,6 +2799,9 @@ function _narrowabstractwriterparts(name::String, parts, context::_WriterContext
     logical === nothing && return nothing
     _writerstoragetype!(context, logical) === logical || return nothing
     _writerextension!(context, logical) === nothing || return nothing
+    # Abstract row types of a plain nested layout (NTuples of nullable values,
+    # `AbstractVector{Int}`) write as that layout without runtime narrowing.
+    _nestedkind(context, logical) === nothing || return nothing
 
     observed = Type[]
     seen = Base.IdSet{Type}()
@@ -5291,6 +5674,20 @@ function _constructpart(
     v::AbstractVector;
     context::_WriterContext=_WriterContext(),
 )
+    # Typed nested rows of the field's layout (an Arrow.Table's, say) build as
+    # a fresh column and keep the field when the layouts agree.
+    t = f.type
+    kind =
+        t isa AC.ListType ? :list :
+        t isa AC.FixedSizeListType ? :fixedlist :
+        t isa AC.StructType ? :struct : t isa AC.MapType ? :map : nothing
+    if kind !== nothing && _nestedkind(context, Base.nonmissingtype(eltype(v))) === kind
+        built = _nestedpart(f.name, v, context)
+        if built !== nothing
+            field = _asretained(f, first(built))
+            field === nothing || return field, last(built)
+        end
+    end
     _, target, _ = _arrowtypestarget(context.arrowtypes, f)
     inferredplan =
         target === nothing ? nothing :
