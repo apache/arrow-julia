@@ -81,6 +81,14 @@ PrecompileTools.@setup_workload begin
             ] for P in units
         )...,
         (Symbol(:d, nameof(P)) => Union{Missing,P}[P(1), missing] for P in units)...,
+        # Nested columns: their per-batch builders compile once for every row
+        # type, so these also leave a first nested read only its row loops.
+        nlist=Union{Missing,Vector{Int64}}[[1], missing],
+        nfloats=Union{Missing,Vector{Float64}}[[1.0], missing],
+        nstrings=Union{Missing,Vector{String}}[["a"], missing],
+        nmap=Union{Missing,Dict{String,Int64}}[Dict("a" => 1), missing],
+        nstruct=Union{Missing,@NamedTuple{a::Int64,b::String}}[(a=1, b="x"), missing],
+        nunion=Union{Int64,String}[1, "a"],
     )
     PrecompileTools.@compile_workload begin
         # The flat table goes out as two record batches, so its columns chain.
