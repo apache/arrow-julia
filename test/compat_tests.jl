@@ -113,10 +113,13 @@ end
     @testset "missing rows stay missing" begin
         io = IOBuffer()
         Arrow.write(io, (; c=[(a=1.0, b="x"), missing]))
-        t = Arrow.Table(take!(io); scan=Tables.Scan(select=(:c => NT,)))
-        @test eltype(t.c) == Union{Missing,NT}
-        @test t.c[1] == (a=1.0, b="x")
-        @test t.c[2] === missing
+        bytes = take!(io)
+        for T in (NT, Union{Missing,NT})
+            t = Arrow.Table(bytes; scan=Tables.Scan(select=(:c => T,)))
+            @test eltype(t.c) == Union{Missing,NT}
+            @test t.c[1] == (a=1.0, b="x")
+            @test t.c[2] === missing
+        end
     end
 
     @testset "nested vectors of structs" begin

@@ -2797,9 +2797,10 @@ function _applyoverride(::Type{T}, col, budget=nothing) where {T}
     E = anymissing ? Union{T,Missing} : T
     _chargevector!(budget, E, length(col), "scan type override")
     out = Tables.allocatecolumn(E, length(col))
+    V = Base.nonmissingtype(T)
     @inbounds for i in eachindex(col)
         x = col[i]
-        out[i] = ismissing(x) ? missing : _overridevalue(T, x)
+        out[i] = ismissing(x) ? missing : _overridevalue(V, x)
     end
     return out
 end
