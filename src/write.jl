@@ -951,10 +951,18 @@ function _rowslice(col::AbstractVector, r::UnitRange{Int})
 end
 _rowview(col::AbstractVector, r) = view(col, r)
 _rowview(col::DictEncode, r) = DictEncode(_rowslice(col.data, r .- (firstindex(col) - 1)))
-_rowview(col::DataStrings.StringVector{T}, r) where {T} =
-    DataStrings.StringVector{T}(col.payloads[r], col.buffers, Val(:trusted))
-_rowview(col::DataStrings.BytesVector{T}, r) where {T} =
-    DataStrings.BytesVector{T}(col.payloads[r], col.buffers, Val(:trusted))
+# A record batch that is exactly one of a chained column's arrays (one batch it
+# was read from, say) is that array.
+function _rowview(col::ChainedVector, r)
+    start = 1
+    for a in col.arrays
+        start > first(r) && break
+        stop = start + length(a) - 1
+        start == first(r) && stop == last(r) && eltype(a) === eltype(col) && return a
+        start = stop + 1
+    end
+    return view(col, r)
+end
 
 # Phase 1 of a write: materialize every partition's columns, validating
 # name/order agreement — a drift here would silently bind data to the wrong

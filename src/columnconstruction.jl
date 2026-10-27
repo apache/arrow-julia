@@ -422,24 +422,71 @@ function _narrowlists(v::AbstractVector)
     return S[x === missing ? missing : convert(Vector{E}, x) for x in w]
 end
 
-# A DataStrings column IS Utf8View (BinaryView) memory: its payload vector is
-# the views buffer and its byte buffers are the variadic data buffers. With
-# `stringview=true` it is written as is, without a copy; otherwise its bytes
-# are packed into utf8 (binary) offsets and data in one pass over the
-# payloads. Nullability comes from the column's eltype. Both keywords are
-# accepted for dispatch uniformity; no narrowing applies.
+# A column read as a view over decoded Arrow buffers (one record batch's
+# `ArrayData`) writes those buffers as they are when the writer would declare
+# the same type for the column's element type: no value is converted.
 function _constructpart(
     name::String,
-    v::Union{DataStrings.StringVector,DataStrings.BytesVector};
+    v::Union{Primitive,BoolVector};
     context=nothing,
     narrowabstract::Bool=true,
 )
-    utf8 = v isa DataStrings.StringVector
+    d = v.owner
+    if d isa AC.ArrayData && d.offset == 0 && d.len == length(v)
+        f, _ = _constructnativepart(name, eltype(v)[]; context)
+        AC.typeequal(f.type, d.type) && return f, _viewbuffers(d)
+    end
+    return invoke(
+        _constructpart,
+        Tuple{String,AbstractVector},
+        name,
+        v;
+        context,
+        narrowabstract,
+    )
+end
+
+# A fixed-width or Bool batch's buffers cut to its length, so no byte past the
+# last value (padding of the source) is written.
+function _viewbuffers(d::AC.ArrayData)
+    n = d.len
+    databytes = d.type isa AC.BoolType ? cld(n, 8) : n * AC.primwidth(d.type)
+    data = AC.subslice(AC.rolebuffer(d, AC.DATA), 0, databytes)
+    nc = AC.nullcount(d)
+    validity = nc == 0 ? AC.BufferSlice() : AC.subslice(AC.validitybuffer(d), 0, cld(n, 8))
+    return AC.ArrayData(d.type, n, [validity, data]; nullcount=nc)
+end
+
+const _PayloadColumn = Union{DataStrings.StringVector,DataStrings.BytesVector}
+# A record batch's rows of a DataStrings column.
+const _PayloadRows = SubArray{<:Any,1,<:_PayloadColumn,<:Tuple{UnitRange{Int}}}
+_payloadparent(v::_PayloadColumn) = v
+_payloadparent(v::_PayloadRows) = parent(v)
+_payloadentries(v::_PayloadColumn) = v.payloads
+_payloadentries(v::_PayloadRows) = view(parent(v).payloads, only(parentindices(v)))
+
+# A DataStrings column IS Utf8View (BinaryView) memory: its payload vector is
+# the views buffer and its byte buffers are the variadic data buffers. With
+# `stringview=true` it is written as is, without a copy (a row range copies
+# its view entries); otherwise its bytes are packed into utf8 (binary)
+# offsets and data in one pass over the payloads. Nullability comes from the
+# column's eltype. Both keywords are accepted for dispatch uniformity; no
+# narrowing applies.
+function _constructpart(
+    name::String,
+    v::Union{_PayloadColumn,_PayloadRows};
+    context=nothing,
+    narrowabstract::Bool=true,
+)
+    p = _payloadparent(v)
+    utf8 = p isa DataStrings.StringVector
     nullable = Missing <: eltype(v)
     if _stringview(context)
+        # View entries are the payloads themselves, so a row range copies them.
+        payloads = v isa _PayloadRows ? collect(_payloadentries(v)) : p.payloads
         # DataStrings keeps a private append arena, which may be empty.
-        lastbuffer = something(findlast(!isempty, v.buffers), 0)
-        f, d = AC.fromviewentries(name, v.payloads, v.buffers[1:lastbuffer]; nullable)
+        lastbuffer = something(findlast(!isempty, p.buffers), 0)
+        f, d = AC.fromviewentries(name, payloads, p.buffers[1:lastbuffer]; nullable)
         utf8 && return f, d
         t = AC.ViewType(false)
         return AC.Field(name, t; nullable),
@@ -449,15 +496,20 @@ function _constructpart(
     t = utf8 ? AC.Utf8Type(large) : AC.BinaryType(large)
     return _packedpayloadpart(
         name,
-        v.payloads,
-        v.buffers,
+        _payloadentries(v),
+        p.buffers,
         t,
         large ? Int64 : Int32,
         nullable,
     )
 end
 
-"utf8/binary offsets and data from DataStrings payloads: one length pass, one copy."
+"""
+utf8/binary offsets and data from DataStrings payloads: one length pass, one
+copy. Values of at most 32 bytes are copied as whole words (an inline payload
+from its entry, a longer value when its buffer has 32 bytes from its start),
+so the data buffer keeps 32 bytes of slack while it is filled.
+"""
 function _packedpayloadpart(
     name::String,
     payloads,
@@ -469,38 +521,56 @@ function _packedpayloadpart(
     n = length(payloads)
     offsets = Vector{Offset}(undef, n + 1)
     offsets[1] = 0
-    bits = zeros(UInt8, cld(n, 8))
+    bits = Vector{UInt8}(undef, cld(n, 8))
     pos = 0
-    nc = 0
-    for i = 1:n
-        len = Int(DataStrings.payloadlength(@inbounds payloads[i]))
-        if len < 0
-            nc += 1
-        else
-            pos <= typemax(Offset) - len || throw(_OffsetOverflow(name, 0, i))
-            pos += len
-            @inbounds bits[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7)
+    valid = 0
+    @inbounds for b in eachindex(bits)
+        base = (b - 1) << 3
+        byte = 0x00
+        for j = 0:(min(8, n - base) - 1)
+            i = base + j + 1
+            len = Int(DataStrings.payloadlength(payloads[i]))
+            present = len >= 0
+            pos += ifelse(present, len, 0)
+            pos <= typemax(Offset) || throw(_OffsetOverflow(name, 0, i))
+            byte |= UInt8(present) << (j % UInt)
+            offsets[i + 1] = pos
         end
-        @inbounds offsets[i + 1] = pos
+        bits[b] = byte
+        valid += count_ones(byte)
     end
-    data = Vector{UInt8}(undef, pos)
+    nc = n - valid
+    data = Vector{UInt8}(undef, pos + 32)
     GC.@preserve payloads buffers data begin
         out = pointer(data)
         entries = Ptr{UInt8}(pointer(payloads))
-        for i = 1:n
-            p = @inbounds payloads[i]
+        @inbounds for i = 1:n
+            p = payloads[i]
             len = Int(DataStrings.payloadlength(p))
             len <= 0 && continue
-            src = if len <= DataStrings.INLINE_MAX
-                entries + 16 * (i - 1) + 4
+            if len <= DataStrings.INLINE_MAX
+                src = entries + 16 * (i - 1) + 4
+                unsafe_store!(Ptr{UInt64}(out), unsafe_load(Ptr{UInt64}(src)))
+                unsafe_store!(Ptr{UInt32}(out + 8), unsafe_load(Ptr{UInt32}(src + 8)))
             else
-                buf = @inbounds buffers[DataStrings.payloadbufidx(p) + 1]
-                pointer(buf) + DataStrings.payloadoffset(p)
+                buf = buffers[DataStrings.payloadbufidx(p) + 1]
+                off = Int(DataStrings.payloadoffset(p))
+                src = pointer(buf) + off
+                if len <= 32 && off + 32 <= length(buf)
+                    for k = 0:8:24
+                        unsafe_store!(
+                            Ptr{UInt64}(out + k),
+                            unsafe_load(Ptr{UInt64}(src + k)),
+                        )
+                    end
+                else
+                    unsafe_copyto!(out, src, len)
+                end
             end
-            unsafe_copyto!(out, src, len)
             out += len
         end
     end
+    resize!(data, pos)
     validity =
         nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
     databuf = pos == 0 ? AC.BufferSlice() : AC._databuffer(data)
@@ -4224,21 +4294,30 @@ function _retainedvarbytes(f::AC.Field, v::AbstractVector)
     t = f.type::Union{AC.Utf8Type,AC.BinaryType}
     utf8 = t isa AC.Utf8Type
     Offset = t.large ? Int64 : Int32
-    _, d = if v isa (utf8 ? DataStrings.StringVector : DataStrings.BytesVector)
-        _packedpayloadpart(f.name, v.payloads, v.buffers, t, Offset, Missing <: eltype(v))
-    else
-        V = utf8 ? AbstractString : AbstractVector{UInt8}
-        Base.nonmissingtype(eltype(v)) <: V ||
-            all(x -> x === missing || x isa V, v) ||
-            throw(
-                ArgumentError(
-                    "column $(f.name) must contain " *
-                    (utf8 ? "string" : "byte-vector") *
-                    " values",
-                ),
+    _, d =
+        if v isa Union{_PayloadColumn,_PayloadRows} &&
+           _payloadparent(v) isa (utf8 ? DataStrings.StringVector : DataStrings.BytesVector)
+            _packedpayloadpart(
+                f.name,
+                _payloadentries(v),
+                _payloadparent(v).buffers,
+                t,
+                Offset,
+                Missing <: eltype(v),
             )
-        _varbytespart(f.name, v, t, Offset)
-    end
+        else
+            V = utf8 ? AbstractString : AbstractVector{UInt8}
+            Base.nonmissingtype(eltype(v)) <: V ||
+                all(x -> x === missing || x isa V, v) ||
+                throw(
+                    ArgumentError(
+                        "column $(f.name) must contain " *
+                        (utf8 ? "string" : "byte-vector") *
+                        " values",
+                    ),
+                )
+            _varbytespart(f.name, v, t, Offset)
+        end
     AC.nullcount(d) == 0 ||
         f.nullable ||
         throw(

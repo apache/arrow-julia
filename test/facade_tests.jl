@@ -2831,6 +2831,30 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test_logs min_level = Logging.Warn onecolumn(f, ds)
     end
 
+    @testset "read views write back from their own buffers" begin
+        AC = Arrow.AC
+        n = 3000
+        src = (;
+            i=[isodd(k) ? missing : k for k = 1:n],
+            d=[k % 5 == 0 ? missing : Dates.Date(2020) + Dates.Day(k) for k = 1:n],
+            b=[k % 7 == 0 ? missing : iseven(k) for k = 1:n],
+            s=[k % 3 == 0 ? missing : repeat("s", k % 40) for k = 1:n],
+        )
+        t = Arrow.Table(take!(Arrow.write(IOBuffer(), src; batchsize=1000)))
+        cols = (; i=t.i, d=t.d, b=t.b, s=t.s)
+        # A batch that is one read batch reuses its buffers.
+        chunk = first(t.i.arrays)
+        _, d = Arrow._constructpart("i", chunk)
+        @test AC.sliceptr(d.buffers[2]) == AC.sliceptr(AC.rolebuffer(chunk.owner, AC.DATA))
+        for batchsize in (1000, 777, 5000)
+            back = Arrow.Table(take!(Arrow.write(IOBuffer(), cols; batchsize)))
+            @test all(
+                c -> isequal(collect(getproperty(back, c)), getproperty(src, c)),
+                keys(src),
+            )
+        end
+    end
+
     @testset "write knobs: batchsize, compresslevel, dictencode, largelists" begin
         AC = Arrow.AC
         nbatches(bytes) = length(Arrow.readfile(bytes).recordblocks)
