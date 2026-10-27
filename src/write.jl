@@ -101,7 +101,7 @@ end
 
 # One table through a one-shot writer: an error abandons the output (a path
 # destination keeps its old bytes or stays absent).
-function _writeall!(w, tbl)
+function _writeall!(w, @nospecialize(tbl))
     try
         _writeparts!(w, tbl)
     catch
@@ -386,7 +386,9 @@ end
 # Write `tbl` partition by partition: each partition is read, encoded, and
 # published before the next one is requested, so memory holds one partition
 # (and one record batch of encoded output) at a time.
-function _writeparts!(w::Writer, tbl)
+# The table and partition types are not specialized on: columns dispatch on
+# their own types, so a new table type compiles no new writer code.
+function _writeparts!(w::Writer, @nospecialize(tbl))
     retained = _retainedschema(tbl)
     parts = Tables.partitions(tbl)
     next = iterate(parts)
@@ -409,7 +411,7 @@ function _writeparts!(w::Writer, tbl)
     end
 end
 
-function _writepartition!(w::Writer, part, retained, several::Bool)
+function _writepartition!(w::Writer, @nospecialize(part), retained, several::Bool)
     cols = Tables.columns(part)
     names = collect(Symbol, Tables.columnnames(cols))
     w.st === nothing ||
@@ -457,7 +459,7 @@ end
 "One record batch: the first fixes the schema; later ones must conform to it."
 function _writebatch!(
     w::Writer,
-    part,
+    @nospecialize(part),
     names,
     cols,
     nrows,
@@ -1129,7 +1131,7 @@ function _constructconforming(
     partcols,
     partpools,
     sch::AC.Schema,
-    tbl;
+    @nospecialize(tbl);
     stringview::Bool=false,
     written=nothing,
 )

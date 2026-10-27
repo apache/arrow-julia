@@ -28,6 +28,11 @@ PrecompileTools.@setup_workload begin
         strings=["a", "bb", "ccc"],
         bools=[true, false, true],
         maybe=Union{Missing,Int64}[1, missing, 3],
+        maybefloats=Union{Missing,Float64}[1.5, missing, 3.5],
+        maybestrings=Union{Missing,String}["a", missing, "ccc"],
+        maybesmall=Union{Missing,Int32}[1, missing, 3],
+        maybebools=Union{Missing,Bool}[true, missing, false],
+        maybedates=[Dates.Date(2020, 1, 1), missing, Dates.Date(2020, 1, 3)],
         lists=[Int64[1, 2], Int64[], Int64[3]],
         dates=[Dates.Date(2020, 1, 1), Dates.Date(2020, 1, 2), Dates.Date(2020, 1, 3)],
         stamps=[
@@ -54,5 +59,12 @@ PrecompileTools.@setup_workload begin
                 limit=2,
             ),
         )
+        # Writing what was read: a rewrite, and the read columns as a table,
+        # also when each column is read from several batches.
+        write(IOBuffer(), tbl)
+        write(IOBuffer(), Tables.columntable(tbl))
+        io = IOBuffer()
+        write(io, columns; batchsize=2)
+        write(IOBuffer(), Tables.columntable(Table(take!(seekstart(io)))); batchsize=2)
     end
 end
