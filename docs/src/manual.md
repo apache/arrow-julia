@@ -426,8 +426,8 @@ next one is requested, so `Arrow.write("big.arrow", CSV.Chunks("big.csv"))`
 holds about one partition at a time. A source with several partitions takes its
 schema from the first partition, with every field nullable; later partitions
 must conform to it (numbers widen losslessly, missing values fill nullable
-fields) and dictionary columns grow with delta batches (pyarrow reads them;
-Polars 1.43 does not), as for [`Arrow.Writer`](@ref). Use `Arrow.Writer` when
+fields) and dictionary columns gain categories as for [`Arrow.Writer`](@ref).
+Use `Arrow.Writer` when
 tables arrive one at a time. Columns read by Arrow.jl write back cheaply: a
 fixed-width or Bool column writes the buffers it was read from.
 
@@ -454,8 +454,11 @@ The first table fixes the schema, with every field declared nullable (pass
 the same columns in the same order and types that fit: numbers widen losslessly
 (`Int32` into `Int64`), an all-missing column writes nulls, and anything else is
 refused with an error naming the column. Dictionary-encoded columns keep one
-dictionary across tables; new categories are appended as delta dictionary
-batches, which pyarrow reads and Polars 1.43 does not. Closing the writer
+dictionary across tables, and later tables' new categories extend it. A file
+writes each dictionary once, complete, when the writer closes; a stream writes
+a dictionary again, whole, when it gains categories. pyarrow and Polars read
+both. `dictdeltas = true` writes delta dictionary batches instead (only the new
+categories), which pyarrow reads and Polars 1.43 refuses. Closing the writer
 finishes the output; an abandoned writer can leave a torn stream or a file
 without its footer.
 

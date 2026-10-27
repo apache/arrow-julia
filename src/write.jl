@@ -193,7 +193,7 @@ end
     Arrow.Writer(sink; file=true, compress=nothing, compresslevel=nothing,
                  batchsize=1_048_576, largelists=false, stringview=false,
                  nullable=true, metadata=nothing, colmetadata=nothing,
-                 dictreplacement=false)
+                 dictdeltas=false, dictreplacement=false, ntasks=Threads.nthreads())
     Arrow.Writer(f::Function, sink; kwargs...)
 
 An incremental IPC writer: batches publish to `sink` as they are written,
@@ -229,11 +229,16 @@ stays open.
 
 Dictionary-encoded columns (`Arrow.DictEncode`, `PooledArray`,
 `CategoricalArray`) keep one dictionary across tables: a later table's new
-categories are appended with a delta dictionary batch (in both formats), and
-its indices refer to the combined categories. Such dictionaries use `Int32`
-indices. pyarrow reads delta dictionaries; Polars 1.43 does not. With
-`dictreplacement=true` (stream format only), each table instead replaces the
-dictionary with its own categories; the schema then declares the
+categories are added after the earlier ones, and its indices refer to the
+combined categories. Such dictionaries use `Int32` indices. In the file
+format each dictionary is written once, complete, when the writer closes
+(after the record batches; the format allows a dictionary anywhere before
+the footer). In the stream format a dictionary that gained categories is
+written again whole before the batch that needs it. pyarrow and Polars read
+both. `dictdeltas=true` writes only the new categories, as delta dictionary
+batches (in both formats): smaller, read by pyarrow, refused by Polars 1.43.
+With `dictreplacement=true` (stream format only), each table instead replaces
+the dictionary with its own categories; the schema then declares the
 DictionaryReplacement feature, which strict readers such as nanoarrow refuse.
 
 `close` finalizes what has been published — the sink is a valid IPC
@@ -253,6 +258,7 @@ mutable struct Writer
     const metadata::Any
     const colmetadata::Any
     const dictreplacement::Bool
+    const dictdeltas::Bool
     const compresslevel::Union{Nothing,Int}
     const batchsize::Int
     const largelists::Bool
@@ -276,6 +282,7 @@ function _writer(
     metadata=nothing,
     colmetadata=nothing,
     dictreplacement::Bool=false,
+    dictdeltas::Bool=false,
     compresslevel::Union{Nothing,Integer}=nothing,
     batchsize::Integer=DEFAULT_BATCHSIZE,
     largelists::Bool=false,
@@ -327,6 +334,7 @@ function _writer(
             metadata,
             colmetadata,
             dictreplacement,
+            dictdeltas,
             compresslevel === nothing ? nothing : Int(compresslevel),
             batchsize,
             largelists,
@@ -502,7 +510,7 @@ function _writebatch!(
         # several input partitions); a retained schema keeps its own.
         nullable = (w.oneshot ? several : w.nullable) && retained === nothing
         nullable && (fields = AC.Field[_nullablefield(f) for f in fields])
-        _beginwrite!(w, fields, retained, names)
+        _beginwrite!(w, fields, retained, names; several)
         writebatch!(w.st::IPCWriteState, only(_tablebatches(w.schema, coldata, [nrows])))
         return nothing
     end
@@ -531,7 +539,7 @@ function _writebatch!(
 end
 
 "Fix the schema and publish its message (and the file preamble)."
-function _beginwrite!(w::Writer, fields, retained, names=nothing)
+function _beginwrite!(w::Writer, fields, retained, names=nothing; several::Bool=false)
     # The bounded facade interning rule, as when the source was read.
     names === nothing && (names = _fieldnamesymbols(fields))
     sch = AC.Schema(fields; metadata=_writermetadata(w.metadata, retained))
@@ -543,10 +551,24 @@ function _beginwrite!(w::Writer, fields, retained, names=nothing)
         compresslevel=w.compresslevel,
         dictreplacement=w.dictreplacement,
         ntasks=w.ntasks,
+        growth=_dictgrowth(w, several),
     )
     w.schema = sch
     w.names = names
     return nothing
+end
+
+"""
+How a dictionary that gains categories is written (see `IPCWriteState`).
+Defaults every reader accepts: files write each final dictionary once, at
+the end; streams write a grown dictionary again whole. One table with one
+partition has all its categories from the start, so it keeps its
+dictionaries before the record batches.
+"""
+function _dictgrowth(w::Writer, several::Bool)
+    w.dictdeltas && return :delta
+    w.file || return :replace
+    return w.oneshot && !several ? :delta : :defer
 end
 
 """
@@ -650,7 +672,8 @@ function Base.close(w::Writer)
 end
 
 """
-    Arrow.append(sink, table; compress=nothing, compresslevel=nothing, batchsize=1_048_576)
+    Arrow.append(sink, table; compress=nothing, compresslevel=nothing,
+                 batchsize=1_048_576, dictdeltas=false)
 
 Add `table`'s record batches to an existing IPC STREAM (`sink` is a file
 path or a seekable read/write `IO`). The existing stream is validated in
@@ -660,9 +683,10 @@ or the append is refused), and the new batches are published after the last
 existing message (over its end-of-stream marker, if it has one), followed by a
 new end-of-stream marker.
 
-A dictionary-encoded column continues the stream's latest dictionary: new
-categories are appended with a delta dictionary batch, within the range of the
-dictionary's index type. A stream whose schema declares DictionaryReplacement
+A dictionary-encoded column continues the stream's latest dictionary, within
+the range of its index type: a dictionary that gains categories is written
+again whole (`dictdeltas=true` writes only the new categories, as a delta
+dictionary batch). A stream whose schema declares DictionaryReplacement
 (`Arrow.Writer(sink; file=false, dictreplacement=true)`) gets a replacement
 dictionary instead. The file format does not support appending: rewrite the
 file, or produce it incrementally with [`Arrow.Writer`](@ref).
@@ -692,6 +716,7 @@ function _appendbytes(
     compress::Union{Nothing,Symbol}=nothing,
     compresslevel::Union{Nothing,Integer}=nothing,
     batchsize::Integer=DEFAULT_BATCHSIZE,
+    dictdeltas::Bool=false,
 )
     length(bytes) >= 6 &&
         view(bytes, 1:6) == FILE_MAGIC &&
@@ -748,6 +773,7 @@ function _appendbytes(
         compress=codec,
         compresslevel,
         current=s.dictionaries,
+        growth=dictdeltas ? :delta : :replace,
     )
     try
         for batch in _tablebatches(batchsch, coldata, batchrows)

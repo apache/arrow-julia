@@ -996,12 +996,32 @@ mutable struct IPCWriteState
     # One codec context per compression task (none when uncompressed).
     const states::Vector{EncodeState}
     const ntasks::Int
+    # How a pool that extends the one written before is written: `:delta`
+    # (a delta dictionary batch), `:replace` (stream: the whole pool again),
+    # or `:defer` (file: each id's final pool, once, by `finishwrite!`).
+    const growth::Symbol
+    # `:defer`: the dictionary fields to write at the end, in the order
+    # nested pools need (inner before outer), each id once.
+    const deferred::Vector{Tuple{Field,Int64}}
     const validated::AC._ValidatedDictionaries
     const current::Dict{Int64,ArrayData}  # last pool per id, for replacement
     const dictblocks::Vector{NTuple{3,Int64}}    # file format Footer Blocks
     const recordblocks::Vector{NTuple{3,Int64}}
     written::Int64                       # bytes published to `io`
     finished::Bool
+end
+
+function _checkgrowth(growth::Symbol, file::Bool)
+    growth in (:delta, :replace, :defer) ||
+        throw(ArgumentError("dictionary growth must be :delta, :replace, or :defer"))
+    growth === (file ? :replace : :defer) && throw(
+        ArgumentError(
+            "dictionary growth $(repr(growth)) needs the " *
+            (file ? "stream" : "file") *
+            " format",
+        ),
+    )
+    return growth
 end
 
 # Batch sequences are unknown up front. A declared feature is a demand on
@@ -1044,11 +1064,13 @@ function beginwrite!(
     dictreplacement::Bool=false,
     compresslevel::Union{Nothing,Integer}=nothing,
     ntasks::Integer=1,
+    growth::Symbol=:delta,
 )
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
         throw(ArgumentError("compress must be :none, :lz4, or :zstd"))
     codec = CODEC_NAMES[compress]
+    _checkgrowth(growth, file)
     _validatewriterschema(sch)
     ids = assigndictids(sch.fields, dictids)
     fielddictids = IdDict{Field,Int64}(ids)
@@ -1066,6 +1088,8 @@ function beginwrite!(
         codec,
         _encodestates(codec, compresslevel, ntasks),
         Int(ntasks),
+        growth,
+        Tuple{Field,Int64}[],
         AC._ValidatedDictionaries(),
         Dict{Int64,ArrayData}(),
         NTuple{3,Int64}[],
@@ -1108,8 +1132,10 @@ end
 
 Publish one record batch, preceded by any dictionary batches it needs. A pool
 whose id has `deltas[id]` extends the pool written before by those values:
-that is emitted as a delta dictionary batch (both formats). Any other changed
-pool is a replacement (stream format, declared) or refused.
+it is written as `st.growth` says (a delta dictionary batch, the whole pool
+again in a stream, or nothing until `finishwrite!` writes each file
+dictionary once). Any other changed pool is a replacement (stream format,
+declared) or refused.
 """
 function writebatch!(
     st::IPCWriteState,
@@ -1128,6 +1154,7 @@ function writebatch!(
     # with one pool: its first occurrence stages the pool, the rest see it.
     messages = Tuple{Vector{UInt8},EncodeCursor,Any}[]
     staged = Dict{Int64,ArrayData}()
+    deferred = Tuple{Field,Int64}[]
     dictblocks = st.file ? st.dictblocks : nothing
     for (f, pool) in dictionarypools(st.schema.fields, batch.columns)
         id = st.ids[f]
@@ -1135,6 +1162,31 @@ function writebatch!(
         old === pool && continue
         vf = AC.dictvaluefield(f, f.type::DictionaryType)
         delta = deltas === nothing || old === nothing ? nothing : get(deltas, id, nothing)
+        if st.growth === :defer
+            # Batches index into the pool as far as it has grown; the final
+            # pool covers them all.
+            old === nothing ||
+                delta !== nothing ||
+                _poolsequal(vf, old, pool) ||
+                throw(
+                    ValidationError(
+                        "column $(f.name) changed its existing dictionary " *
+                        "categories; the IPC file format carries one dictionary " *
+                        "per column, which can only gain categories — use the " *
+                        "stream format for replacement",
+                    ),
+                )
+            old === nothing && push!(deferred, (f, id))
+            staged[id] = pool
+            continue
+        end
+        if delta !== nothing && st.growth === :replace
+            # A stream re-sends a grown pool whole, which every reader accepts.
+            header, body = _dictionarymessage(id, vf, pool, st.codec, st.states, st.ntasks)
+            push!(messages, (header, body, dictblocks))
+            staged[id] = pool
+            continue
+        end
         if delta !== nothing
             old.len + delta.len == pool.len || throw(
                 ArgumentError("delta dictionary does not complete the pool for id $id"),
@@ -1193,6 +1245,7 @@ function writebatch!(
     push!(messages, (header, body, st.file ? st.recordblocks : nothing))
     _publishmessages!(st, messages)
     merge!(st.current, staged)
+    append!(st.deferred, deferred)
     return nothing
 end
 
@@ -1233,6 +1286,18 @@ end
 
 function finishwrite!(st::IPCWriteState)
     st.finished && return nothing
+    if st.growth === :defer && !isempty(st.current)
+        # Each id's final pool once, after the record batches that use it (the
+        # file format allows a dictionary anywhere before the footer).
+        messages = Tuple{Vector{UInt8},EncodeCursor,Any}[]
+        for (f, id) in st.deferred
+            vf = AC.dictvaluefield(f, f.type::DictionaryType)
+            header, body =
+                _dictionarymessage(id, vf, st.current[id], st.codec, st.states, st.ntasks)
+            push!(messages, (header, body, st.dictblocks))
+        end
+        _publishmessages!(st, messages)
+    end
     out = UInt8[]
     append!(out, reinterpret(UInt8, UInt32[CONTINUATION, UInt32(0)]))
     st.file && _filefooter!(
@@ -1273,6 +1338,7 @@ function resumestream!(
     compresslevel::Union{Nothing,Integer}=nothing,
     current::Dict{Int64,ArrayData}=Dict{Int64,ArrayData}(),
     ntasks::Integer=1,
+    growth::Symbol=:delta,
 )
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
@@ -1289,6 +1355,8 @@ function resumestream!(
         codec,
         _encodestates(codec, compresslevel, ntasks),
         Int(ntasks),
+        _checkgrowth(growth, false),
+        Tuple{Field,Int64}[],
         AC._ValidatedDictionaries(),
         current,
         NTuple{3,Int64}[],

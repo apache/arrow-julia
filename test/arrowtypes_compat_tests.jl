@@ -4209,7 +4209,7 @@ end
             table = Arrow.Table(bytes)
             @test getproperty.(table.value, :value) == getproperty.(parityvalues, :value)
             field, batches = arrowtypes_test_core_parts(bytes)
-            # Split partitions extend the first partition's pool by a delta.
+            # Split partitions extend the first partition's pool.
             dictionary = last(batches).columns[1].dictionary
             @test length(dictionary) == 4
             valuefield = ARROWTYPES_TEST_AC.dictvaluefield(field, field.type)

@@ -242,7 +242,7 @@ end
     t = Arrow.Table(Arrow.tobuffer((; w)))
     @test eltype(t.w) == Arrow.DataStrings.DataString
     @test t.w == ["b", "a", "b"]
-    # Arrow.Writer encodes them too; later tables' new categories are deltas.
+    # Arrow.Writer encodes them too; later tables' new categories extend them.
     io = IOBuffer()
     Arrow.Writer(io) do writer
         Arrow.write(writer, (; p=PooledArray(["a", "b", "a"]), w))

@@ -30,18 +30,26 @@ import DataAPI
 
 const AC = Arrow.ArrowCore
 
-# (id, isDelta, length) of each dictionary batch, in order.
-function dictbatches(bytes)
+# The IPC messages of a stream, or of a file's message section.
+function framedmessages(bytes)
     if bytes[1:6] == b"ARROW1"
         footerlen = only(reinterpret(Int32, bytes[(end - 9):(end - 6)]))
         bytes = bytes[9:(end - 10 - footerlen)]
     end
-    msgs = Arrow.framemessages(AC.heapregion(bytes))
-    return [
-        (m.msg.header.id, m.msg.header.isDelta, m.msg.header.data.length) for
-        m in msgs if m.msg.header isa Arrow.Meta.DictionaryBatch
-    ]
+    return Arrow.framemessages(AC.heapregion(bytes))
 end
+
+# (id, isDelta, length) of each dictionary batch, in order.
+dictbatches(bytes) = [
+    (m.msg.header.id, m.msg.header.isDelta, m.msg.header.data.length) for
+    m in framedmessages(bytes) if m.msg.header isa Arrow.Meta.DictionaryBatch
+]
+
+# :dictionary or :record for each batch message, in order.
+batchkinds(bytes) = [
+    m.msg.header isa Arrow.Meta.DictionaryBatch ? :dictionary : :record for
+    m in framedmessages(bytes) if !(m.msg.header isa Arrow.Meta.Schema)
+]
 
 @testset "incremental writer and append" begin
     t1 = (; a=Int64[1, 2], b=["x", "y"])
@@ -271,18 +279,31 @@ end
         @test Arrow.Table(path).dt == [DateTime(1970), DateTime(2026, 1, 2, 3)]
     end
 
-    @testset "dictionaries grow with delta batches in both formats" begin
-        for file in (true, false), mk in (Arrow.DictEncode, PooledArray)
+    @testset "dictionaries grow across tables in both formats" begin
+        for file in (true, false),
+            dictdeltas in (false, true),
+            mk in (Arrow.DictEncode, PooledArray)
+
             io = IOBuffer()
-            Arrow.Writer(io; file) do w
+            Arrow.Writer(io; file, dictdeltas) do w
                 Arrow.write(w, (; d=mk(["a", "b", "a"])))
                 Arrow.write(w, (; d=mk(["c", "c", "b"])))   # adds "c"
                 Arrow.write(w, (; d=mk(["b", "a"])))        # nothing new
             end
             bytes = take!(io)
             @test Arrow.Table(bytes).d == ["a", "b", "a", "c", "c", "b", "b", "a"]
-            # One base dictionary, then one delta holding only the new category.
-            @test [(isdelta, n) for (_, isdelta, n) in dictbatches(bytes)] == [(false, 2), (true, 1)]
+            batches = [(isdelta, n) for (_, isdelta, n) in dictbatches(bytes)]
+            if dictdeltas
+                # A base dictionary, then a delta holding only the new category.
+                @test batches == [(false, 2), (true, 1)]
+            elseif file
+                # One complete dictionary, after the record batches using it.
+                @test batches == [(false, 3)]
+                @test batchkinds(bytes) == [:record, :record, :record, :dictionary]
+            else
+                # A stream writes the grown dictionary again, whole.
+                @test batches == [(false, 2), (false, 3)]
+            end
             # A growing pool is indexed with Int32, as pyarrow writes.
             f = only(
                 Arrow.readfile(take!(Arrow.write(IOBuffer(), Arrow.Table(bytes)))).schema.fields,
@@ -389,15 +410,17 @@ end
     end
 
     @testset "append with dictionary columns" begin
-        # New categories append as a delta dictionary batch; existing ones
-        # reuse the stream's dictionary.
-        path = joinpath(mktempdir(), "d.arrow")
-        Arrow.write(path, (; d=Arrow.DictEncode(["a", "b", "a"])); file=false)
-        Arrow.append(path, (; d=Arrow.DictEncode(["a", "b", "b"])))
-        @test Arrow.Table(path).d == ["a", "b", "a", "a", "b", "b"]
-        Arrow.append(path, (; d=Arrow.DictEncode(["z", "z", "q"])))
-        @test Arrow.Table(path).d == ["a", "b", "a", "a", "b", "b", "z", "z", "q"]
-        @test [(isdelta, n) for (_, isdelta, n) in dictbatches(read(path))] == [(false, 2), (true, 2)]
+        # New categories extend the stream's dictionary, written again whole
+        # (or as a delta batch with dictdeltas=true); existing ones reuse it.
+        for dictdeltas in (false, true)
+            path = joinpath(mktempdir(), "d.arrow")
+            Arrow.write(path, (; d=Arrow.DictEncode(["a", "b", "a"])); file=false)
+            Arrow.append(path, (; d=Arrow.DictEncode(["a", "b", "b"])); dictdeltas)
+            @test Arrow.Table(path).d == ["a", "b", "a", "a", "b", "b"]
+            Arrow.append(path, (; d=Arrow.DictEncode(["z", "z", "q"])); dictdeltas)
+            @test Arrow.Table(path).d == ["a", "b", "a", "a", "b", "b", "z", "z", "q"]
+            @test [(isdelta, n) for (_, isdelta, n) in dictbatches(read(path))] == (dictdeltas ? [(false, 2), (true, 2)] : [(false, 2), (false, 4)])
+        end
 
         # A Writer stream that opted into replacement replaces on append.
         rpath = joinpath(mktempdir(), "r.arrow")

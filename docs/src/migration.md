@@ -163,8 +163,8 @@ keeps or changes these Arrow 2.x features:
 
 | Arrow 2.x feature | Arrow 3.0 action |
 |---|---|
-| `Arrow.Writer` | Still works, reimplemented: an incremental writer for both formats. The first table written fixes the schema, with every field nullable; later tables must conform, with lossless widening. Dictionaries grow with delta batches. See [`Arrow.Writer`](@ref). |
-| `Arrow.append` | Still works for the IPC STREAM format, reimplemented. The file format refuses: produce it incrementally with `Arrow.Writer` or rewrite it. New dictionary categories are appended as delta batches. |
+| `Arrow.Writer` | Still works, reimplemented: an incremental writer for both formats. The first table written fixes the schema, with every field nullable; later tables must conform, with lossless widening. Dictionaries gain later tables' categories (written once at the end of a file, again whole in a stream; `dictdeltas=true` for delta batches). See [`Arrow.Writer`](@ref). |
+| `Arrow.append` | Still works for the IPC STREAM format, reimplemented. The file format refuses: produce it incrementally with `Arrow.Writer` or rewrite it. A dictionary that gains categories is written again whole (`dictdeltas=true` for a delta batch). |
 | `table \|> Arrow.write(sink)` | Still works: the curried form is kept. |
 | `Arrow.tobuffer(table)` | Still works, and still emits the IPC stream format. |
 | `ntasks` | Accepted; encoding runs on one task, including in `Arrow.Writer`. |
