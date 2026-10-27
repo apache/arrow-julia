@@ -2898,6 +2898,16 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             back = Arrow.Table(take!(Arrow.write(IOBuffer(), (; s=appended); batchsize)))
             @test isequal(collect(back.s), src.s)
         end
+        # An edited value never writes the read buffer's stale bytes: a short
+        # value lives in its payload (the buffer keeps the old bytes), a long
+        # one moves to an edit buffer.
+        rows = view(t.s, 1:1000)
+        for (row, value) in ((2, "sx"), (5, "a value longer than twelve bytes"))
+            t.s[row] = value
+            back = Arrow.Table(take!(Arrow.write(IOBuffer(), (; s=rows))))
+            @test back.s[row] == value
+            @test isequal(collect(back.s), collect(rows))
+        end
     end
 
     @testset "write knobs: batchsize, compresslevel, dictencode, largelists" begin
