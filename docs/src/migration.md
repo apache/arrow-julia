@@ -60,10 +60,11 @@ indexing.
 
 Decimal read types changed. Arrow 2.x read decimal columns as `Arrow.Decimal`
 values that wrap a BitIntegers.jl `Int128` or `Int256` unscaled integer. Arrow
-3.0 reads decimals with nonnegative scale as `DataDecimals.Decimal{P,S,T}`
-values whose integer width matches the descriptor; negative-scale decimals
-keep raw storage (`Int32`/`Int64`, or native-endian byte vectors at 128/256
-bits). See [Type mapping when reading](@ref) for the complete table.
+3.0 reads decimals whose scale is between 0 and the precision as
+`DataDecimals.Decimal{P,S,T}` values whose integer width matches the
+descriptor; other decimals (a negative scale, or a scale above the
+precision) keep raw storage (`Int32`/`Int64`, or native-endian byte vectors
+at 128/256 bits). See [Type mapping when reading](@ref) for the complete table.
 
 Struct rows are `NamedTuple`s, as in Arrow 2.x, for a struct of at most 64
 fields with distinct names; a wider struct, or one with duplicate names,

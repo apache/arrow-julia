@@ -209,8 +209,8 @@ maps to `Union{Missing, T}`.
 | Timestamp with a declared timezone | `Durations.ZonedTimestamp{P,Z}` at every unit (the stored UTC instant; `Z` is the declared zone — see below) |
 | Time32/Time64 | `Dates.Time` |
 | Duration | `Dates.Second`/`Millisecond`/`Microsecond`/`Nanosecond` by unit |
-| Decimal (nonnegative scale) | `DataDecimals.Decimal{P,S,T}` with `T` matching the descriptor width |
-| Decimal (negative scale) | raw storage: `Int32`/`Int64` (32/64-bit) or `Vector{UInt8}` (128/256-bit) |
+| Decimal (scale from 0 to the precision) | `DataDecimals.Decimal{P,S,T}` with `T` matching the descriptor width |
+| Decimal (negative scale, or scale above the precision) | raw storage: `Int32`/`Int64` (32/64-bit) or `Vector{UInt8}` (128/256-bit) |
 | Interval | `Durations.Duration` (month/day/nanosecond components) |
 | Dictionary-encoded scalar | the mapping of the *value* type, in an `Arrow.DictEncoded` column whose codes `DataAPI.refarray`, `refpool`, and `levels` expose |
 | Run-end encoded scalar | the mapping of the *values* type, in an `Arrow.RunEndEncoded` column (runs are not expanded) |
@@ -865,8 +865,10 @@ write features. Read [Migrating from Arrow.jl 2.x](@ref) before you update.
 ### Shared decimal, interval, and timestamp values
 
 Arrow uses DataDecimals 1 and Durations 1.4 from General. Decimal columns
-with nonnegative scale decode to `DataDecimals.Decimal{P,S,T}` at every depth. The integer width
-matches the Arrow descriptor. Negative-scale decimals keep the raw representation.
+whose scale is between 0 and the precision decode to `DataDecimals.Decimal{P,S,T}`
+at every depth. The integer width matches the Arrow descriptor. Other
+decimals (a negative scale, or a scale above the precision) keep the raw
+representation.
 Calendar interval columns decode to `Durations.Duration`; elapsed-time duration
 columns still use `Dates.Second`, `Dates.Millisecond`, `Dates.Microsecond`, or
 `Dates.Nanosecond`.
