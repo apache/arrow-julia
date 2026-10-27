@@ -617,7 +617,8 @@ function _mapentries(name::String, ::Type{P}, v::AbstractVector, offsets) where 
 end
 
 function _mappart(name::String, v::AbstractVector, context)
-    K, V = _maptypes(Base.nonmissingtype(eltype(v)))
+    R = Base.nonmissingtype(eltype(v))
+    K, V = _maptypes(R)
     offsets, validity, nc = _listoffsets(name, v, Int32)
     entries = _mapentries(_errname(context, name), Pair{K,V}, v, offsets)
     KK = Base.nonmissingtype(K)
@@ -637,6 +638,11 @@ function _mappart(name::String, v::AbstractVector, context)
             "write as a nullable Arrow type; Arrow map keys cannot be null",
         ),
     )
+    # Distinct Dict keys that an ArrowTypes mapping stores alike would read
+    # back as repeated keys of one row.
+    R <: AbstractDict &&
+        _writerneedstype!(context, KK) &&
+        _validatemapphysicalkeys(_errname(context, name), kf, kd, offsets)
     entriestype = AC.StructType()
     ef = AC.Field("entries", entriestype; nullable=false, children=AC.Field[kf, vf])
     ed = AC.ArrayData(
@@ -657,6 +663,14 @@ function _mappart(name::String, v::AbstractVector, context)
     return AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[ef]), d
 end
 
+# Rows with `Any` element or field types (the retained builders' own
+# intermediate rows among them) rebuild under the retained field.
+_untypedrow(R::Type) =
+    R <: Union{NamedTuple,Tuple} ? any(T -> T === Any, fieldtypes(R)) :
+    R <: AbstractDict ? (keytype(R) === Any || valtype(R) === Any) :
+    eltype(R) === Any ||
+    (eltype(R) <: Pair && eltype(R) isa DataType && Any in fieldtypes(eltype(R)))
+
 """
 A freshly built field as the retained field `f` declares it, or nothing when
 their layouts differ. Names, nullability, and metadata come from `f`; a fresh
@@ -665,6 +679,7 @@ field may be non-nullable where `f` is nullable.
 function _asretained(f::AC.Field, built::AC.Field)
     AC.typeequal(f.type, built.type) &&
     (f.nullable || !built.nullable) &&
+    _extensionpairs(f) == _extensionpairs(built) &&
     length(f.children) == length(built.children) || return nothing
     children = AC.Field[]
     for (fc, bc) in zip(f.children, built.children)
@@ -680,6 +695,14 @@ function _asretained(f::AC.Field, built::AC.Field)
         children,
     )
 end
+
+# A field's extension name and metadata: its logical type.
+_extensionpairs(f::AC.Field) =
+    f.metadata === nothing ? Pair{String,String}[] :
+    Pair{String,String}[
+        kv for kv in f.metadata if
+        first(kv) == _EXTENSION_NAME_KEY || first(kv) == _EXTENSION_METADATA_KEY
+    ]
 
 "Walk a bounded writer value graph, with optional short-circuit inspection."
 function _walkwritercontainer!(visit, x, active::Base.IdSet{Any}, depth::Int)
@@ -5682,13 +5705,18 @@ function _constructpart(
     context::_WriterContext=_WriterContext(),
 )
     # Typed nested rows of the field's layout (an Arrow.Table's, say) build as
-    # a fresh column and keep the field when the layouts agree.
+    # a fresh column and keep the field when the layouts agree. Values already
+    # lowered to storage (`context.lowered`) rebuild under the field instead.
     t = f.type
     kind =
         t isa AC.ListType ? :list :
         t isa AC.FixedSizeListType ? :fixedlist :
         t isa AC.StructType ? :struct : t isa AC.MapType ? :map : nothing
-    if kind !== nothing && _nestedkind(context, Base.nonmissingtype(eltype(v))) === kind
+    R = Base.nonmissingtype(eltype(v))
+    if kind !== nothing &&
+       !context.lowered &&
+       _nestedkind(context, R) === kind &&
+       !_untypedrow(R)
         built = _nestedpart(f.name, v, context)
         if built !== nothing
             field = _asretained(f, first(built))
