@@ -74,12 +74,18 @@ extensionmetadata(name::AbstractString) = Pair{String,String}[
         metadata=extensionmetadata(unknown),
     )
     for file in (false, true)
+        empty!(Arrow._WARNED_EXTENSIONS)
         table = @test_logs (:warn, r"unsupported ARROW:extension:name") Arrow.Table(
             ipcone(unknownfield, unknowndata; file),
         )
         @test table.value == Int64[7]
         @test !isinterned(unknown)
     end
+    # The warning is once per process for each extension name.
+    table = @test_logs min_level = Logging.Warn Arrow.Table(
+        ipcone(unknownfield, unknowndata; file=true),
+    )
+    @test table.value == Int64[7]
 
     childname = freshname("untrusted_struct_child")
     @test !isinterned(childname)
@@ -95,6 +101,7 @@ extensionmetadata(name::AbstractString) = Pair{String,String}[
     structdata =
         AC.ArrayData(structtype, 1, [AC.BufferSlice()]; children=[childdata], nullcount=0)
     for file in (false, true)
+        empty!(Arrow._WARNED_EXTENSIONS)
         table = @test_logs (:warn, r"unsupported ARROW:extension:name") Arrow.Table(
             ipcone(structfield, structdata; file),
         )
@@ -111,17 +118,31 @@ extensionmetadata(name::AbstractString) = Pair{String,String}[
         nullable=false,
         metadata=extensionmetadata("JuliaLang.Symbol"),
     )
-    for file in (false, true)
-        err = try
-            Arrow.Table(ipcone(symbolfield, payloaddata; file))
-            nothing
-        catch exception
-            exception
-        end
-        @test err isa Arrow.ValidationError
-        @test occursin("is not already interned", sprint(showerror, err))
-        @test !isinterned(payload)
+    # A read interns new Symbol values, up to a per-read count and byte limit.
+    @test Arrow.Table(ipcone(symbolfield, payloaddata; file=false)).value ==
+          [Symbol(payload)]
+    @test isinterned(payload)
+    novel = [
+        freshname("untrusted_symbol_payload_$i") for
+        i = 1:(Arrow._MAX_TABLES_NEW_FIELD_NAMES + 1)
+    ]
+    @test !any(isinterned, novel)
+    manyfield, manydata = AC.fromjulia("value", novel)
+    manyfield = AC.Field(
+        manyfield.name,
+        manyfield.type;
+        nullable=false,
+        metadata=extensionmetadata("JuliaLang.Symbol"),
+    )
+    err = try
+        Arrow.Table(ipcone(manyfield, manydata; file=true))
+        nothing
+    catch exception
+        exception
     end
+    @test err isa Arrow.ValidationError
+    @test occursin("interns at most", sprint(showerror, err))
+    @test !isinterned(last(novel))
 
     streamname = freshname("untrusted_stream_field")
     @test !isinterned(streamname)
@@ -232,6 +253,7 @@ extensionmetadata(name::AbstractString) = Pair{String,String}[
     warningbytes = Arrow.writestream(warningschema, [warningbatch])
     warningio = IOBuffer()
     logger = SimpleLogger(warningio, Logging.Warn)
+    empty!(Arrow._WARNED_EXTENSIONS)
     with_logger(logger) do
         Arrow.Table(warningbytes)
     end

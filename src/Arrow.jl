@@ -51,6 +51,7 @@ import DataStrings, DataDecimals, Durations
 import ArrowTypes
 import Dates
 import Mmap
+import UUIDs
 import CodecLz4
 import CodecZstd
 import TranscodingStreams

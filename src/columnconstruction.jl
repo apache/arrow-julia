@@ -127,6 +127,15 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
             AC.DurationType(unit),
             x -> Int64(Dates.value(x)),
         )
+    elseif T <: Union{Dates.Week,Dates.Day,Dates.Hour,Dates.Minute}
+        return _constructtemporalpart(name, v, AC.DurationType(AC.SECOND), _periodseconds)
+    elseif T <: Union{Dates.Month,Dates.Year}
+        return _constructtemporalpart(
+            name,
+            v,
+            AC.IntervalType(AC.YEAR_MONTH),
+            _periodmonths,
+        )
     elseif T <: NamedTuple
         any(ismissing, v) && throw(
             ArgumentError(
@@ -167,8 +176,18 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
             children=AC.ArrayData[last(c) for c in children],
             nullcount=0,
         )
-    elseif T <: AbstractString && T != String
-        return AC.fromjulia(name, _missings_to(String, v))
+    elseif T <: AbstractString
+        _stringview(context) && return _retainedview(
+            AC.Field(name, AC.ViewType(true); nullable=Missing <: eltype(v)),
+            v,
+        )
+        return _varbytespart(name, v, AC.Utf8Type(false))
+    elseif T <: AbstractVector{UInt8}
+        _stringview(context) && return _retainedview(
+            AC.Field(name, AC.ViewType(false); nullable=Missing <: eltype(v)),
+            v,
+        )
+        return _varbytespart(name, v, AC.BinaryType(false))
     elseif T === Any || (T <: AbstractVector && eltype(T) === Any)
         # Materialized facade columns are Any-eltype for composite layouts;
         # one narrowing pass recovers list columns (inner vectors narrow
@@ -277,6 +296,44 @@ function _preflightwritercontainers(v::AbstractVector)
     return nothing
 end
 
+# An abstract element type no native builder writes as one column (`Real`,
+# `Any`): such values are written as a dense Union of their runtime types.
+_abstractnonnative(T) =
+    T !== Union{} &&
+    !isconcretetype(T) &&
+    !(T isa Union) &&
+    !(T <: Union{AbstractString,AbstractVector,NamedTuple}) &&
+    !_singletypefamily(T)
+
+# Families one Arrow column holds at a single concrete type (one resolution,
+# zone, or precision): their abstract columns narrow only when every value
+# has the same type, and refuse otherwise.
+_singletypefamily(T) =
+    T <: Union{Durations.Timestamp,Durations.ZonedTimestamp,DataDecimals.Decimal}
+
+"The Union of the runtime types of a column's values, `Missing` included."
+function _observedtype(v::AbstractVector)
+    types = Type[]
+    hasmissing = false
+    for x in v
+        if x === missing
+            hasmissing = true
+            continue
+        end
+        T = typeof(x)
+        any(S -> S === T, types) && continue
+        length(types) < _MAX_INFERRED_WRITER_TYPES || throw(
+            ArgumentError(
+                "a column holds values of more than $_MAX_INFERRED_WRITER_TYPES " *
+                "types ($(join(types, ", ")), $T, ...); give it a concrete element type",
+            ),
+        )
+        push!(types, T)
+    end
+    U = _writeruniontype(types)
+    return hasmissing ? Union{Missing,U} : U
+end
+
 "Narrow an Any-eltype column, recovering list-of-T structure when present."
 function _narrowlists(v::AbstractVector)
     # Narrowing can turn an Any column into a concrete list type before the
@@ -288,6 +345,7 @@ function _narrowlists(v::AbstractVector)
     w = map(x -> x isa AbstractVector ? map(identity, x) : x, v)
     w = map(identity, w)
     NT = Base.nonmissingtype(eltype(w))
+    _abstractnonnative(NT) && return collect(_observedtype(w), w)
     NT <: AbstractVector || return w
     # Join the inner element types (empties narrow to Union{} and would
     # otherwise poison the join), then retype every inner vector.
@@ -298,27 +356,178 @@ function _narrowlists(v::AbstractVector)
         E = typejoin(E, eltype(x))
     end
     E === Union{} && (E = Any)
+    # Rows of different element types: the elements' runtime types.
+    _abstractnonnative(E) &&
+        (E = _observedtype(collect(Iterators.flatten(x for x in w if x !== missing))))
     E === Any && return w
     hasm = eltype(w) >: Missing
     S = hasm ? Union{Missing,Vector{E}} : Vector{E}
     return S[x === missing ? missing : convert(Vector{E}, x) for x in w]
 end
 
-# A DataStrings column IS Utf8View memory: its payload vector is the views
-# buffer and its byte buffers are the variadic data buffers — no copy, no
-# String materialization. Nullability comes from the column's eltype.
-# Both keywords are accepted for dispatch uniformity; a StringVector is
-# already Arrow memory, so no context or narrowing applies.
+# A DataStrings column IS Utf8View (BinaryView) memory: its payload vector is
+# the views buffer and its byte buffers are the variadic data buffers. With
+# `stringview=true` it is written as is, without a copy; otherwise its bytes
+# are packed into utf8 (binary) offsets and data in one pass over the
+# payloads. Nullability comes from the column's eltype. Both keywords are
+# accepted for dispatch uniformity; no narrowing applies.
 function _constructpart(
     name::String,
-    v::DataStrings.StringVector;
+    v::Union{DataStrings.StringVector,DataStrings.BytesVector};
     context=nothing,
     narrowabstract::Bool=true,
 )
-    # DataStrings keeps a private append arena, which may be empty.
-    lastbuffer = something(findlast(!isempty, v.buffers), 0)
-    buffers = v.buffers[1:lastbuffer]
-    return AC.fromviewentries(name, v.payloads, buffers; nullable=eltype(v) >: Missing)
+    utf8 = v isa DataStrings.StringVector
+    nullable = Missing <: eltype(v)
+    if _stringview(context)
+        # DataStrings keeps a private append arena, which may be empty.
+        lastbuffer = something(findlast(!isempty, v.buffers), 0)
+        f, d = AC.fromviewentries(name, v.payloads, v.buffers[1:lastbuffer]; nullable)
+        utf8 && return f, d
+        t = AC.ViewType(false)
+        return AC.Field(name, t; nullable),
+        AC.ArrayData(t, d.len, d.buffers; nullcount=AC.nullcount(d))
+    end
+    return _packedpayloadpart(
+        name,
+        v.payloads,
+        v.buffers,
+        utf8 ? AC.Utf8Type(false) : AC.BinaryType(false),
+        nullable,
+    )
+end
+
+"utf8/binary offsets and data from DataStrings payloads: one length pass, one copy."
+function _packedpayloadpart(
+    name::String,
+    payloads,
+    buffers,
+    t::AC.ArrowType,
+    nullable::Bool,
+)
+    n = length(payloads)
+    offsets = Vector{Int32}(undef, n + 1)
+    offsets[1] = 0
+    bits = zeros(UInt8, cld(n, 8))
+    pos = 0
+    nc = 0
+    for i = 1:n
+        len = Int(DataStrings.payloadlength(@inbounds payloads[i]))
+        if len < 0
+            nc += 1
+        else
+            pos <= typemax(Int32) - len ||
+                throw(ArgumentError("column $name exceeds the Int32 offset range"))
+            pos += len
+            @inbounds bits[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7)
+        end
+        @inbounds offsets[i + 1] = pos
+    end
+    data = Vector{UInt8}(undef, pos)
+    GC.@preserve payloads buffers data begin
+        out = pointer(data)
+        entries = Ptr{UInt8}(pointer(payloads))
+        for i = 1:n
+            p = @inbounds payloads[i]
+            len = Int(DataStrings.payloadlength(p))
+            len <= 0 && continue
+            src = if len <= DataStrings.INLINE_MAX
+                entries + 16 * (i - 1) + 4
+            else
+                buf = @inbounds buffers[DataStrings.payloadbufidx(p) + 1]
+                pointer(buf) + DataStrings.payloadoffset(p)
+            end
+            unsafe_copyto!(out, src, len)
+            out += len
+        end
+    end
+    validity =
+        nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
+    databuf = pos == 0 ? AC.BufferSlice() : AC._databuffer(data)
+    return AC.Field(name, t; nullable),
+    AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
+end
+
+_stringview(context) = context !== nothing && context.stringview
+
+# Duration seconds and year-month interval months of the larger Dates periods.
+_periodseconds(x::Dates.Week) = Base.checked_mul(Dates.value(x), Int64(604_800))
+_periodseconds(x::Dates.Day) = Base.checked_mul(Dates.value(x), Int64(86_400))
+_periodseconds(x::Dates.Hour) = Base.checked_mul(Dates.value(x), Int64(3_600))
+_periodseconds(x::Dates.Minute) = Base.checked_mul(Dates.value(x), Int64(60))
+_periodmonths(x::Dates.Month) = Dates.value(x)
+_periodmonths(x::Dates.Year) = Base.checked_mul(Dates.value(x), Int64(12))
+
+_nbytes(x::AbstractString) = ncodeunits(x)
+_nbytes(x::AbstractVector{UInt8}) = length(x)
+function _copybytes!(
+    data::Vector{UInt8},
+    pos::Int,
+    x::Union{String,SubString{String}},
+    n::Int,
+)
+    GC.@preserve data x unsafe_copyto!(pointer(data, pos + 1), pointer(x), n)
+    return nothing
+end
+# A DataStrings value's bytes are inline in its 16-byte payload (after the
+# 4-byte length) or at `payloadpos` in its buffer.
+_copybytes!(data::Vector{UInt8}, pos::Int, x::DataStrings.DataString, n::Int) =
+    _copypayloadbytes!(data, pos, x, n)
+_copybytes!(data::Vector{UInt8}, pos::Int, x::DataStrings.DataBytes, n::Int) =
+    _copypayloadbytes!(data, pos, x, n)
+function _copypayloadbytes!(data::Vector{UInt8}, pos::Int, x, n::Int)
+    if n <= DataStrings.INLINE_MAX
+        r = Ref(x.p)
+        GC.@preserve r data begin
+            src = Ptr{UInt8}(Base.unsafe_convert(Ptr{DataStrings.StringPayload}, r)) + 4
+            unsafe_copyto!(pointer(data, pos + 1), src, n)
+        end
+    else
+        GC.@preserve x data begin
+            src = pointer(x.data, DataStrings.payloadpos(x.p))
+            unsafe_copyto!(pointer(data, pos + 1), src, n)
+        end
+    end
+    return nothing
+end
+_copybytes!(data::Vector{UInt8}, pos::Int, x::AbstractVector{UInt8}, n::Int) =
+    (copyto!(data, pos + 1, x, firstindex(x), n); nothing)
+function _copybytes!(data::Vector{UInt8}, pos::Int, x::AbstractString, n::Int)
+    for (j, b) in enumerate(codeunits(x))
+        @inbounds data[pos + j] = b
+    end
+    return nothing
+end
+
+"A utf8 or binary column (`t`), built in one pass over the values."
+function _varbytespart(name::String, v::AbstractVector, t::AC.ArrowType)
+    n = length(v)
+    offsets = Vector{Int32}(undef, n + 1)
+    offsets[1] = 0
+    bits = zeros(UInt8, cld(n, 8))
+    data = UInt8[]
+    pos = 0
+    nc = 0
+    for (i, x) in enumerate(v)
+        if x === missing
+            nc += 1
+        else
+            m = _nbytes(x)
+            pos <= typemax(Int32) - m ||
+                throw(ArgumentError("column $name exceeds the Int32 offset range"))
+            pos + m > length(data) && resize!(data, max(2 * length(data), pos + m, 64))
+            _copybytes!(data, pos, x, m)
+            pos += m
+            @inbounds bits[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7)
+        end
+        @inbounds offsets[i + 1] = pos
+    end
+    resize!(data, pos)
+    validity =
+        nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
+    databuf = pos == 0 ? AC.BufferSlice() : AC._databuffer(data)
+    return AC.Field(name, t; nullable=Missing <: eltype(v)),
+    AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
 end
 
 "Concrete Vector with an exact Union{Missing,T} or T eltype for fromjulia."
@@ -606,7 +815,8 @@ end
 _writercolumnname(context, fallback::String) =
     isempty(context.column) ? fallback : context.column
 
-function _writertoarrow(context, value, writertype::Type, fallback::String)
+function _writertoarrow(context, value, writertype::Type, fallback::String, field=nothing)
+    value isa Union{UUIDs.UUID,Int128,UInt128} && return _facadetoarrow(value, field)
     try
         return ArrowTypes.toarrow(value)
     catch err
@@ -1145,9 +1355,11 @@ mutable struct _WriterContext
     # `_constructwriterstorage`); false for facade-materialized public rows.
     lowered::Bool
     column::String
+    # Fresh strings and bytes write as utf8/binary views instead of offsets.
+    stringview::Bool
 end
 
-function _WriterContext(column::AbstractString="")
+function _WriterContext(column::AbstractString=""; stringview::Bool=false)
     arrowtypes = _ArrowTypesContext(; warn=false)
     return _WriterContext(
         _WriterUnionPlanCache(),
@@ -1168,6 +1380,7 @@ function _WriterContext(column::AbstractString="")
         false,
         false,
         String(column),
+        stringview,
     )
 end
 
@@ -1233,6 +1446,11 @@ end
 function _writerextension!(context::_WriterContext, T::Type)
     Base.@nospecialize T
     return get!(context.extensions, T) do
+        name = _facadearrowname(T)
+        name === nothing || return Pair{String,String}[
+            _EXTENSION_NAME_KEY => name,
+            _EXTENSION_METADATA_KEY => "",
+        ]
         ArrowTypes.hasarrowname(T) || return nothing
         Pair{String,String}[
             _EXTENSION_NAME_KEY => String(ArrowTypes.arrowname(T)),
@@ -1462,15 +1680,18 @@ _writerplainstorageshape(f::AC.Field) =
     all(_writerplainstorageshape, f.children)
 
 function _writeropaquestoragealias(retained::AC.Field, candidate::AC.Field)
-    isempty(retained.children) && !isempty(candidate.children) || return false
+    isempty(retained.children) || return false
     t = retained.type
-    supported =
+    bytes =
         t isa AC.BinaryType ||
         t isa AC.FixedSizeBinaryType ||
         (t isa AC.ViewType && !t.utf8) ||
-        (t isa AC.DecimalType && t.bits > 64) ||
-        (t isa AC.IntervalType && t.unit != AC.YEAR_MONTH)
-    supported || return false
+        (t isa AC.DecimalType && t.bits > 64)
+    # Byte-vector storage (Binary) fills any retained byte layout.
+    c = candidate.type
+    isempty(candidate.children) &&
+        return bytes && (c isa AC.BinaryType || (c isa AC.ViewType && !c.utf8))
+    (bytes || (t isa AC.IntervalType && t.unit != AC.YEAR_MONTH)) || return false
     return all(_writerplainstorageshape, candidate.children)
 end
 
@@ -1948,6 +2169,24 @@ function _narrowabstractwriterparts(name::String, parts, context::_WriterContext
         end
     end
     isempty(observed) && return nothing
+    if !needsruntime && _singletypefamily(logical)
+        length(observed) == 1 || return nothing
+        storagetype = nullable ? Union{Missing,only(observed)} : only(observed)
+        return AbstractVector[collect(storagetype, part) for part in parts]
+    end
+    if !needsruntime && _abstractnonnative(logical)
+        # `Real[1, 2.5]`: one runtime type writes as that type, several as a
+        # dense Union of them.
+        length(observed) <= _MAX_INFERRED_WRITER_TYPES || throw(
+            ArgumentError(
+                "column $name holds values of more than $_MAX_INFERRED_WRITER_TYPES " *
+                "types; give it a concrete element type",
+            ),
+        )
+        storagetype = _writeruniontype(observed)
+        nullable && (storagetype = Union{Missing,storagetype})
+        return AbstractVector[collect(storagetype, part) for part in parts]
+    end
     if !needsruntime
         # Rows of an abstract NamedTuple column (some fields missing in some
         # rows, say) share one concrete row type once widened field by field.
@@ -2049,7 +2288,7 @@ function _inferredstorageplan(
                 sawmissing = true
                 continue
             end
-            mapped = _writertoarrow(context, value, logical, name)
+            mapped = _writertoarrow(context, value, logical, name, retained)
             mapped = _writerconvertlowered(declared, mapped, context, logical, name)
             push!(values, mapped)
             if retained !== nothing && !isconcretetype(logical)
@@ -2831,7 +3070,7 @@ function _arrowtypeswriterstoragevalue(
     value = if T === VersionNumber
         string(value)
     elseif _writerneedstype!(context, T)
-        _writertoarrow(context, value, T, f.name)
+        _writertoarrow(context, value, T, f.name, f)
     else
         value
     end
@@ -2867,9 +3106,7 @@ function _arrowtypeswriterstoragevalue(
     t isa AC.DecimalType &&
         value isa DataDecimals.AbstractDecimal &&
         return _shareddecimalraw(t, value)
-    t isa AC.IntervalType &&
-        value isa Durations.Duration &&
-        return _sharedintervalraw(t, value)
+    t isa AC.IntervalType && value isa _IntervalValue && return _sharedintervalraw(t, value)
     if t isa Union{AC.ListType,AC.ListViewType,AC.FixedSizeListType}
         child = only(f.children)
         childtype = eltype(storagewritetype)
@@ -3084,6 +3321,12 @@ Empty storage vector typed for one Field's physical values (Any for Unions or
 unknown types).
 """
 function _writerstoragevector(f::AC.Field)
+    # ArrowTypes.jl hooks see FixedSizeBinary storage as NTuple{N,UInt8}.
+    t = f.type
+    t isa AC.FixedSizeBinaryType && return _withmissingtype(
+        Union{_arrowtypesfixedbinarytype(t),Vector{UInt8}},
+        f.nullable,
+    )[]
     T = _declaredeltype(f, false)
     return f.type isa AC.UnionType || T === Any ? Any[] : T[]
 end
@@ -3445,6 +3688,7 @@ function _arrowtypesfixedlistcolumn(
 )
     N = ArrowTypes.getsize(kind)
     E = ArrowTypes.gettype(kind)
+    E === UInt8 && return _fixedbinarypart(name, v, N)
     present = Bool[x !== missing for x in v]
     for row in v
         row === missing ||
@@ -3506,6 +3750,20 @@ function _arrowtypesfixedlistcolumn(
         nullcount=count(!, present),
     )
     return field, data
+end
+
+"A fixed_size_binary(N) column from `NTuple{N,UInt8}` rows."
+function _fixedbinarypart(name::String, v::AbstractVector, N::Int)
+    T = NTuple{N,UInt8}
+    t = AC.FixedSizeBinaryType(N)
+    field = AC.Field(name, t; nullable=Missing <: eltype(v))
+    if eltype(v) === T
+        rows = v isa Vector{T} ? v : collect(T, v)
+        return field,
+        AC.ArrayData(t, length(v), [AC.BufferSlice(), AC._databuffer(rows)]; nullcount=0)
+    end
+    rows, validity, nc = _nullablevalues(T, v, ntuple(_ -> 0x00, N))
+    return field, AC.ArrayData(t, length(v), [validity, AC._databuffer(rows)]; nullcount=nc)
 end
 
 function _arrowtypesstructcolumn(
@@ -3890,10 +4148,22 @@ end
 
 function _retainedfixedbytes(f::AC.Field, v::AbstractVector)
     t = f.type::AC.FixedSizeBinaryType
+    if Base.nonmissingtype(eltype(v)) === NTuple{t.nbytes,UInt8}
+        _, d = _fixedbinarypart(f.name, v, t.nbytes)
+        AC.nullcount(d) > 0 &&
+            !f.nullable &&
+            throw(
+                ArgumentError(
+                    "column $(f.name) holds missing values but its retained field is non-nullable",
+                ),
+            )
+        return _retainedfield(f), d
+    end
     present = _retainedvalidity(f, v)
     data = zeros(UInt8, Base.checked_mul(length(v), t.nbytes))
     for (i, x) in enumerate(v)
         x === missing && continue
+        x isa NTuple{t.nbytes,UInt8} && (x = reinterpret(UInt8, [x]))
         x isa AbstractVector{UInt8} ||
             throw(ArgumentError("column $(f.name) must contain byte-vector values"))
         length(x) == t.nbytes || throw(
@@ -4010,7 +4280,7 @@ end
 
 function _retainedinterval(f::AC.Field, v::AbstractVector)
     t = f.type::AC.IntervalType
-    v = [x isa Durations.Duration ? _sharedintervalraw(t, x) : x for x in v]
+    v = [x isa _IntervalValue ? _sharedintervalraw(t, x) : x for x in v]
     present = _retainedvalidity(f, v)
     if t.unit == AC.YEAR_MONTH
         values = Int32[
@@ -4072,9 +4342,7 @@ function _retainedleafstorage(f::AC.Field, value, context::_WriterContext)
     t isa AC.DecimalType &&
         value isa DataDecimals.AbstractDecimal &&
         return _shareddecimalraw(t, value)
-    t isa AC.IntervalType &&
-        value isa Durations.Duration &&
-        return _sharedintervalraw(t, value)
+    t isa AC.IntervalType && value isa _IntervalValue && return _sharedintervalraw(t, value)
     _istemporalconv(t) || return value
     stored = _exactfacadescalar(t, value)
     stored === nothing && throw(
@@ -4110,7 +4378,9 @@ function _retainedplaceholder(f::AC.Field; forcevalid::Bool=false)
     t isa AC.BoolType && return false
     t isa AC.Utf8Type && return ""
     t isa AC.BinaryType && return UInt8[]
-    t isa AC.FixedSizeBinaryType && return zeros(UInt8, t.nbytes)
+    t isa AC.FixedSizeBinaryType &&
+        return t.nbytes <= _MAX_ARROWTYPE_EXACT_ARITY ? ntuple(_ -> 0x00, t.nbytes) :
+               zeros(UInt8, t.nbytes)
     t isa AC.ViewType && return t.utf8 ? "" : UInt8[]
     if t isa AC.DecimalType
         return t.bits == 32 ? Int32(0) :
@@ -5589,6 +5859,7 @@ function _constructcolumnparts(
     poolhints::Vector{Any}=Any[nothing for _ in parts],
     metadata::Union{Nothing,Vector{Pair{String,String}}}=nothing,
     refpools::Bool=true,
+    stringview::Bool=false,
 )
     isempty(parts) && throw(ArgumentError("column $name has no partitions"))
     length(poolhints) == length(parts) || throw(
@@ -5600,7 +5871,7 @@ function _constructcolumnparts(
     fieldname = String(name)
     nparts = length(parts)
     data = Vector{AC.ArrayData}(undef, nparts)
-    context = _WriterContext(fieldname)
+    context = _WriterContext(fieldname; stringview)
     dictintent =
         (retained !== nothing && retained.type isa AC.DictionaryType) ||
         any(part isa DictEncode for part in parts) ||

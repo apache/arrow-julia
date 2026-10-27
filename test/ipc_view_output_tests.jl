@@ -91,10 +91,16 @@ end
                     (1 in selection || 5 in selection ? ncodeunits(LONG) : 0) +
                     (4 in selection ? 23 : 0)
                 io = IOBuffer()
-                Arrow.write(io, (s=selected,); file=file, compress=compress)
+                Arrow.write(
+                    io,
+                    (s=selected,);
+                    file=file,
+                    compress=compress,
+                    stringview=true,
+                )
                 eager = take!(io)
                 checkoutput(eager, expected, ndata; file=file, compress=compress)
-                w = Arrow.Writer(io; file=file, compress=compress)
+                w = Arrow.Writer(io; file=file, compress=compress, stringview=true)
                 Arrow.write(w, (s=selected,))
                 close(w)
                 @test take!(io) == eager
@@ -106,7 +112,7 @@ end
         # strings. They must obey the same content boundary.
         for selected in (view(col, 3:5), col[[false, false, true, true, true]])
             io = IOBuffer()
-            Arrow.write(io, (s=selected,); file=false)
+            Arrow.write(io, (s=selected,); file=false, stringview=true)
             bytes = take!(io)
             @test isequal(Arrow.Table(bytes).s, DataStrings.materialize(col)[3:5])
             @test findfirst(codeunits(UNUSED), bytes) === nothing
@@ -122,7 +128,7 @@ end
         ]
         col = StringVector{DataString}(payloads, [raw])
         io = IOBuffer()
-        Arrow.write(io, (s=col,); file=false)
+        Arrow.write(io, (s=col,); file=false, stringview=true)
         d = checkoutput(
             take!(io),
             [
@@ -216,7 +222,7 @@ end
             end
             col = StringVector{Union{Missing,DataString}}(payloads, buffers)
             io = IOBuffer()
-            Arrow.write(io, (s=col,); file=false)
+            Arrow.write(io, (s=col,); file=false, stringview=true)
             bytes = take!(io)
             @test isequal(Arrow.Table(bytes).s, expected)
             d = Arrow.readstream(bytes).batches[1].columns[1]
@@ -313,7 +319,7 @@ end
 
     @testset "covered dictionary pools retain unreferenced values" begin
         col = packedfixture()
-        f, parts = Arrow._constructcolumn(:s, AbstractVector[col])
+        f, parts = Arrow._constructcolumn(:s, AbstractVector[col]; stringview=true)
         pool = only(parts)
         t = AC.DictionaryType(AC.IntType(8, true), f.type, true)
         df = AC.Field("s", t; nullable=false)
@@ -353,7 +359,7 @@ end
 
     @testset "dictionary pools preserve values and indices" begin
         col = fixture()
-        f, parts = Arrow._constructcolumn(:s, AbstractVector[col])
+        f, parts = Arrow._constructcolumn(:s, AbstractVector[col]; stringview=true)
         pool = only(parts)
         t = AC.DictionaryType(AC.IntType(8, true), f.type, true)
         df = AC.Field("s", t; nullable=false)

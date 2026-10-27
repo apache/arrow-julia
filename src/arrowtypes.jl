@@ -69,6 +69,76 @@ function _arrowtypesextension(f::AC.Field)
     return String(name), String(metadata)
 end
 
+# ---------------------------------------------------------------------------
+# Mappings the facade owns, consulted before ArrowTypes.jl's hooks: canonical
+# Arrow extension types, and Julia types ArrowTypes.jl gives no Arrow
+# storage. `UUID` writes canonical `arrow.uuid` (big-endian bytes); the
+# little-endian `JuliaLang.UUID` layout older writers used still reads and
+# rewrites through ArrowTypes.jl's own UUID hooks.
+# ---------------------------------------------------------------------------
+
+const _UUID_EXTENSION = "arrow.uuid"
+const _FACADE_PERIOD_NAMES = (
+    (Dates.Week, "JuliaLang.Dates.Week"),
+    (Dates.Day, "JuliaLang.Dates.Day"),
+    (Dates.Hour, "JuliaLang.Dates.Hour"),
+    (Dates.Minute, "JuliaLang.Dates.Minute"),
+    (Dates.Month, "JuliaLang.Dates.Month"),
+    (Dates.Year, "JuliaLang.Dates.Year"),
+)
+# Canonical extensions whose storage is already their public value.
+_quietextension(name::String) = name == "arrow.json" || name == "arrow.opaque"
+
+function _facadearrowname(T::Type)
+    T === UUIDs.UUID && return _UUID_EXTENSION
+    T === Int128 && return "JuliaLang.Int128"
+    T === UInt128 && return "JuliaLang.UInt128"
+    for (P, name) in _FACADE_PERIOD_NAMES
+        T === P && return name
+    end
+    return nothing
+end
+
+_facadestoragetype(T::Type) = T === Int128 || T === UInt128 ? NTuple{16,UInt8} : nothing
+
+# The Julia type a facade-owned label reads as, given its ArrowTypes storage
+# type, or nothing.
+function _facadejuliatype(name::String, storage)
+    bytes16 = storage === NTuple{16,UInt8}
+    name == _UUID_EXTENSION && return bytes16 ? UUIDs.UUID : nothing
+    name == "JuliaLang.Int128" && return bytes16 ? Int128 : nothing
+    name == "JuliaLang.UInt128" && return bytes16 ? UInt128 : nothing
+    name == "arrow.bool8" && return storage === Int8 ? Bool : nothing
+    for (P, label) in _FACADE_PERIOD_NAMES
+        name == label || continue
+        P <: Union{Dates.Month,Dates.Year} && return storage === Int32 ? P : nothing
+        return storage isa Type && storage <: Dates.FixedPeriod ? P : nothing
+    end
+    return nothing
+end
+
+# Storage for a facade-owned value. `field` is the Field being rewritten, if
+# any: a retained `JuliaLang.UUID` field keeps its little-endian layout.
+function _facadetoarrow(x::UUIDs.UUID, field)
+    legacy =
+        field !== nothing && _fieldmetavalue(field, _EXTENSION_NAME_KEY) == "JuliaLang.UUID"
+    legacy && return ArrowTypes.toarrow(x)
+    return ArrowTypes._cast(NTuple{16,UInt8}, hton(x.value))
+end
+_facadetoarrow(x::Union{Int128,UInt128}, field) = ArrowTypes._cast(NTuple{16,UInt8}, x)
+
+# The public value of facade-owned storage under `f`'s label, or nothing when
+# the label is not one the facade owns (ArrowTypes.jl's hooks then apply).
+function _facadefromarrow(T::Type, f::AC.Field, storage)
+    name = _fieldmetavalue(f, _EXTENSION_NAME_KEY)
+    (name === nothing || _facadejuliatype(name, typeof(storage)) !== T) && return nothing
+    T === UUIDs.UUID && return UUIDs.UUID(ntoh(ArrowTypes._cast(UInt128, storage)))
+    T === Bool && return storage != 0
+    T <: Union{Int128,UInt128} && return ArrowTypes._cast(T, storage)
+    T <: Union{Dates.Month,Dates.Year} && return convert(T, Dates.Month(storage))
+    return convert(T, storage)
+end
+
 function _withoutownextension(f::AC.Field, t::AC.ArrowType=f.type; nullable=f.nullable)
     metadata =
         f.metadata === nothing ? nothing :
@@ -177,7 +247,7 @@ function _arrowtypesprimitivebasetype(f::AC.Field)
     t isa AC.BoolType && return Bool
     t isa AC.Utf8Type && return String
     t isa AC.BinaryType && return Vector{UInt8}
-    t isa AC.FixedSizeBinaryType && return Vector{UInt8}
+    t isa AC.FixedSizeBinaryType && return _arrowtypesfixedbinarytype(t)
     t isa AC.ViewType && return t.utf8 ? String : Vector{UInt8}
     if t isa AC.DateType
         return t.unit == AC.DAY ? Dates.Date : Dates.DateTime
@@ -240,21 +310,26 @@ function _arrow2temporallabel(name::String, t::AC.ArrowType)
     return false
 end
 
+# Unsupported extension names already reported, process-wide, so reading
+# many files that carry the same label warns once.
+const _WARNED_EXTENSIONS = Set{String}()
+const _WARNED_EXTENSIONS_LOCK = ReentrantLock()
+
 function _warnunsupportedextension(ctx, name::String, f::AC.Field)
     ctx.warn || return nothing
     _arrow2temporallabel(name, f.type) && return nothing
-    name in ctx.warned && return nothing
-    if ctx.warnings >= _MAX_EXTENSION_WARNINGS
-        if !ctx.warningsuppressed
-            ctx.warningsuppressed = true
-            @warn "additional unsupported Arrow extension warnings were suppressed"
-        end
+    displayname = _extensionwarningname(name, ctx.budget)
+    report = lock(_WARNED_EXTENSIONS_LOCK) do
+        displayname in _WARNED_EXTENSIONS && return :seen
+        length(_WARNED_EXTENSIONS) > _MAX_EXTENSION_WARNINGS && return :seen
+        push!(_WARNED_EXTENSIONS, displayname)
+        return length(_WARNED_EXTENSIONS) > _MAX_EXTENSION_WARNINGS ? :suppress : :warn
+    end
+    report === :seen && return nothing
+    if report === :suppress
+        @warn "additional unsupported Arrow extension warnings were suppressed"
         return nothing
     end
-    _chargedictentry!(ctx.budget, String, Nothing, "ArrowTypes warning cache")
-    push!(ctx.warned, name)
-    ctx.warnings += 1
-    displayname = _extensionwarningname(name, ctx.budget)
     descriptor = AC.descriptorname(f.type)
     # Charge only the message this adapter builds. The logging framework's
     # own records and rendering are outside this budget.
@@ -603,9 +678,8 @@ mutable struct _ArrowTypesContext
     boxedchildren::Dict{AC.Field,Vector{Any}}
     routeplan::Union{Nothing,_ArrowTypesRoutePlan}
     warn::Bool
-    warned::Set{String}
-    warnings::Int
-    warningsuppressed::Bool
+    newsymbols::Int
+    newsymbolbytes::Int
     budget::Union{Nothing,AllocationBudget}
 end
 function _ArrowTypesContext(;
@@ -648,8 +722,6 @@ function _ArrowTypesContext(;
         Vector{Any},
         "ArrowTypes boxed-children cache container",
     )
-    _chargeemptydict!(budget, String, Nothing, "ArrowTypes warning cache container")
-    _chargeobject!(budget, sizeof(Set{String}), "ArrowTypes warning-set owner")
     return _ArrowTypesContext(
         Dict{AC.Field,Any}(),
         Dict{AC.Field,Any}(),
@@ -663,9 +735,8 @@ function _ArrowTypesContext(;
         Dict{AC.Field,Vector{Any}}(),
         nothing,
         warn,
-        Set{String}(),
         0,
-        false,
+        0,
         budget,
     )
 end
@@ -698,6 +769,8 @@ end
 
 Base.@noinline function _arrowtypesrawstoragetype(T::Type)
     Base.@nospecialize T
+    storage = _facadestoragetype(T)
+    storage === nothing || return storage
     return Base.inferencebarrier(ArrowTypes.ArrowType(Base.inferencebarrier(T)))
 end
 
@@ -819,7 +892,6 @@ function _arrowtypesstoragebasetype(ctx::_ArrowTypesContext, f::AC.Field)
         end
         return T
     end
-    t isa AC.FixedSizeBinaryType && return _arrowtypesfixedbinarytype(t)
     return _arrowtypesprimitivebasetype(f)
 end
 
@@ -838,7 +910,6 @@ function _arrowtypesfallbackstoragebasetype(ctx::_ArrowTypesContext, f::AC.Field
     t isa AC.StructType && return Vector{Pair{String,Any}}
     t isa AC.MapType && return Dict{Any,Any}
     t isa AC.UnionType && return Any
-    t isa AC.FixedSizeBinaryType && return _arrowtypesfixedbinarytype(t)
     return _arrowtypesprimitivebasetype(f)
 end
 
@@ -861,6 +932,12 @@ function _arrowtypestarget(ctx::_ArrowTypesContext, f::AC.Field)
         # FixedSizeList must not allocate in proportion to an untrusted N.
         ext === nothing && return (false, nothing, nothing)
         name, metadata = ext
+        if isempty(f.children)
+            storage = _arrowtypesstoragebasetype(ctx, f)
+            facade = _facadejuliatype(name, storage)
+            facade === nothing || return (true, facade, storage)
+            _quietextension(name) && return (true, nothing, storage)
+        end
         sym = _existingjlsymbol(name)
         if sym === nothing
             storage = _arrowtypesfallbackstoragebasetype(ctx, f)
@@ -1419,30 +1496,11 @@ function _arrowtypesutf8storage(ctx::_ArrowTypesContext, f::AC.Field)
 end
 
 function _arrowtypesfromarrow(ctx::_ArrowTypesContext, T, f::AC.Field, storage)
+    value = _facadefromarrow(T, f, storage)
+    value === nothing || return value
     t = f.type
     if _arrowtypesutf8storage(ctx, f) && storage isa AbstractString
-        if T === Symbol
-            symbol = _existingjlsymbol(storage)
-            if symbol === nothing
-                displayname = _extensionwarningname(storage, ctx.budget)
-                _chargeobject!(
-                    ctx.budget,
-                    AC.checked_add(
-                        Int64(160),
-                        AC.checked_mul(Int64(4), Int64(ncodeunits(displayname))),
-                    ),
-                    "ArrowTypes Symbol validation message",
-                )
-                throw(
-                    AC.ValidationError(
-                        "JuliaLang.Symbol payload $(repr(displayname)) is not already " *
-                        "interned; automatic lifting would permanently allocate " *
-                        "process-global state",
-                    ),
-                )
-            end
-            return symbol
-        end
+        T === Symbol && return _liftsymbol!(ctx, storage)
         bytes = codeunits(storage)
         GC.@preserve storage bytes begin
             return ArrowTypes.fromarrow(T, pointer(bytes), length(bytes))
@@ -1548,6 +1606,40 @@ function _arrowtypesvalue(ctx::_ArrowTypesContext, f::AC.Field, x)
         "ArrowTypes lifted string copy",
     )
     return _arrowtypesfromarrow(ctx, target, f, storage)
+end
+
+# Interning a Symbol permanently allocates process-global state, so one read
+# may intern at most as many new Symbol values (and bytes) as it may intern
+# new column names; values already interned cost nothing.
+function _liftsymbol!(ctx::_ArrowTypesContext, s::AbstractString)
+    symbol = _existingjlsymbol(s)
+    symbol === nothing || return symbol
+    n = ncodeunits(s)
+    if occursin('\0', s) ||
+       ctx.newsymbols >= _MAX_TABLES_NEW_FIELD_NAMES ||
+       ctx.newsymbolbytes > _MAX_TABLES_NEW_FIELD_NAME_BYTES - n
+        displayname = _extensionwarningname(s, ctx.budget)
+        _chargeobject!(
+            ctx.budget,
+            AC.checked_add(
+                Int64(160),
+                AC.checked_mul(Int64(4), Int64(ncodeunits(displayname))),
+            ),
+            "ArrowTypes Symbol validation message",
+        )
+        throw(
+            AC.ValidationError(
+                "JuliaLang.Symbol payload $(repr(displayname)) cannot be interned: " *
+                "Symbol values may not contain NUL, and one read interns at most " *
+                "$_MAX_TABLES_NEW_FIELD_NAMES new values totalling " *
+                "$_MAX_TABLES_NEW_FIELD_NAME_BYTES bytes",
+            ),
+        )
+    end
+    ctx.budget === nothing || _charge!(ctx.budget, Int64(n), "interned Symbol values")
+    ctx.newsymbols += 1
+    ctx.newsymbolbytes += n
+    return Symbol(s)
 end
 
 "Heap-box an inline immutable once; @noinline keeps the box from folding away."

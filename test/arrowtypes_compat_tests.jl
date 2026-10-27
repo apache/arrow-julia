@@ -5562,6 +5562,7 @@ end
         field, _ = arrowtypes_test_core_parts(namedbytes)
         @test arrowtypes_test_extension_name(field) ==
               String(ARROWTYPES_TEST_NAMED_WRITE_ONLY)
+        empty!(Arrow._WARNED_EXTENSIONS)  # warnings are once per process
         namedtable =
             @test_logs (:warn, r"unsupported .*extension.*NamedWriteOnly") Arrow.Table(
                 namedbytes,
@@ -6548,6 +6549,7 @@ end
         bytes =
             file ? Arrow.writefile(schema, ARROWTYPES_TEST_AC.RecordBatch[]) :
             Arrow.writestream(schema, ARROWTYPES_TEST_AC.RecordBatch[])
+        empty!(Arrow._WARNED_EXTENSIONS)  # warnings are once per process
         table =
             @test_logs (:warn, r"unsupported .*extension.*UnknownStruct") Arrow.Table(bytes)
         @test Tuple(
@@ -6630,6 +6632,7 @@ end
 
     schema = ARROWTYPES_TEST_AC.Schema([bounded])
     bytes = Arrow.writestream(schema, ARROWTYPES_TEST_AC.RecordBatch[])
+    empty!(Arrow._WARNED_EXTENSIONS)  # warnings are once per process
     table = @test_logs (:warn, r"unsupported .*UnknownWideStruct") Arrow.Table(bytes)
     @test isempty(table.wide)
     @test eltype(table.wide) === Vector{Pair{String,Any}}
@@ -6965,6 +6968,7 @@ end
         ),
     )
     bytes = arrowtypes_test_bytes((x=Int64[7, 8],); file=false, colmetadata=metadata)
+    empty!(Arrow._WARNED_EXTENSIONS)  # warnings are once per process
     table = @test_logs (:warn, r"unsupported .*extension.*Unknown") Arrow.Table(bytes)
     @test table.x == Int64[7, 8]
     @test eltype(table.x) === Int64
@@ -6990,6 +6994,7 @@ end
     nullschema = ARROWTYPES_TEST_AC.Schema([nullfield])
     nullbatch = ARROWTYPES_TEST_AC.RecordBatch(nullschema, [nulldata], 2)
     nullbytes = Arrow.writestream(nullschema, [nullbatch])
+    empty!(Arrow._WARNED_EXTENSIONS)  # warnings are once per process
     nulltable =
         @test_logs (:warn, r"unsupported .*extension.*UnknownNull") Arrow.Table(nullbytes)
     @test isequal(nulltable.x, Missing[missing, missing])
@@ -7188,6 +7193,7 @@ end
 
     for file in (false, true)
         bytes = file ? Arrow.writefile(schema, [batch]) : Arrow.writestream(schema, [batch])
+        empty!(Arrow._WARNED_EXTENSIONS)  # warnings are once per process
         table =
             @test_logs (:warn, r"unsupported .*extension.*UnknownDuplicateStruct") Arrow.Table(
                 bytes,

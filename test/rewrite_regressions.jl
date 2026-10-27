@@ -207,7 +207,7 @@ end
         ]
         strings = StringVector{DataString}(payloads, [raw])
         io = IOBuffer()
-        Arrow.write(io, (s=strings,); file=false)
+        Arrow.write(io, (s=strings,); file=false, stringview=true)
         viewbytes = take!(io)
         viewback = Arrow.readstream(_rewrite(viewbytes))
         @test viewback.schema.fields[1].type == AC.ViewType(true)
@@ -692,13 +692,16 @@ end
         @test DataAPI.colmetadata(t, :a, "k") == "v"
 
         # The CategoricalArrays extension labels are unregistered here, so the
-        # reader warns and falls back to the dictionary's storage values.
+        # reader warns (once per process) and falls back to the dictionary's
+        # storage values.
+        empty!(Arrow._WARNED_EXTENSIONS)
         t =
             @test_logs (:warn, r"unsupported ARROW:extension:name") match_mode = :any Arrow.Table(
                 fixture("categorical-column"),
             )
         @test t.x == ["a", "b", "a", "c"]
 
+        empty!(Arrow._WARNED_EXTENSIONS)
         t =
             @test_logs (:warn, r"unsupported ARROW:extension:name") match_mode = :any Arrow.Table(
                 fixture("categorical-missing"),

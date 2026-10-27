@@ -27,6 +27,8 @@ import DataAPI
 import Profile
 using Arrow
 using DataStrings
+using Logging
+using UUIDs
 import DataDecimals, Durations
 using DataStrings: StringVector, StringPayload, BytesVector, DataBytes
 
@@ -1688,8 +1690,10 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test eltype(units) == Ts{Nanosecond}
         tu = Arrow.Table(take!(Arrow.tobuffer((u=units,))))
         @test eltype(tu.u) == Ts{Nanosecond} && tu.u == units
-        # a declared-abstract column and a non-Arrow resolution both refuse
-        @test_throws ArgumentError Arrow.tobuffer((u=Ts[Ts{Nanosecond}(2026)],))
+        # a declared-abstract column writes as its values' one resolution; a
+        # non-Arrow resolution refuses
+        ta = Arrow.Table(take!(Arrow.tobuffer((u=Ts[Ts{Nanosecond}(2026)],))))
+        @test eltype(ta.u) == Ts{Nanosecond}
         @test_throws ArgumentError Arrow._instantunit(Ts{Dates.Minute})
 
         # Zoned scans push down every operator; literals convert exactly
@@ -2695,7 +2699,117 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         ) === Vector{Any}
     end
 
-    @testset "DataStrings columns write as Utf8View, zero-copy" begin
+    @testset "type mappings: bytes, 128-bit ints, UUIDs, periods, abstract columns" begin
+        rt(t; kw...) = Arrow.Table(take!(Arrow.write(IOBuffer(), t; kw...)))
+        fieldof(t) = getfield(t, :schema).fields[1]
+        label(f) = Arrow._fieldmetavalue(f, "ARROW:extension:name")
+        # Byte vectors are Binary; byte tuples FixedSizeBinary.
+        for col in ([UInt8[1, 2], UInt8[]], [codeunits("ab"), codeunits("")])
+            t = rt((; x=col))
+            @test fieldof(t).type == Arrow.AC.BinaryType(false)
+            @test t.x == collect.(col)
+        end
+        long = collect(0x01:0x20)
+        bv = DataStrings.BytesVector{DataBytes}(
+            [
+                DataStrings.inline_payload(UInt8[1, 2], 1, 2),
+                DataStrings.inline_payload(UInt8[], 1, 0),
+                DataStrings.view_payload(long, 1, 32, 0, 0),
+            ],
+            [long],
+        )
+        for (sv, type) in
+            ((false, Arrow.AC.BinaryType(false)), (true, Arrow.AC.ViewType(false)))
+            t = rt((; x=bv); stringview=sv)
+            @test fieldof(t).type == type
+            @test t.x == [UInt8[1, 2], UInt8[], collect(0x01:0x20)]
+        end
+        t = rt((; x=[(0x01, 0x02, 0x03), (0x04, 0x05, 0x06)]))
+        @test fieldof(t).type == Arrow.AC.FixedSizeBinaryType(3)
+        @test t.x == [[1, 2, 3], [4, 5, 6]]
+        # UUID: canonical arrow.uuid, big-endian bytes; fresh and retained.
+        u = Union{Missing,UUID}[UUID("00112233-4455-6677-8899-aabbccddeeff"), missing]
+        t = rt((; x=u))
+        f = fieldof(t)
+        @test f.type == Arrow.AC.FixedSizeBinaryType(16) && label(f) == "arrow.uuid"
+        bytes = Arrow.readfile(take!(Arrow.write(IOBuffer(), (; x=u))))[1].columns[1]
+        @test Arrow.AC.loadat(Arrow.AC.rolebuffer(bytes, Arrow.AC.DATA), UInt8, 0) == 0x00
+        @test Arrow.AC.loadat(Arrow.AC.rolebuffer(bytes, Arrow.AC.DATA), UInt8, 15) == 0xff
+        @test isequal(collect(t.x), u) && isequal(collect(rt(t).x), u)
+        # 128-bit integers: FixedSizeBinary(16) with a Julia label.
+        for (T, name) in ((Int128, "JuliaLang.Int128"), (UInt128, "JuliaLang.UInt128"))
+            col = T[typemin(T), one(T), typemax(T)]
+            t = rt((; x=col))
+            @test label(fieldof(t)) == name
+            @test eltype(t.x) == T && t.x == col && rt(t).x == col
+        end
+        # Larger periods: exact durations and year-month intervals that read back
+        # as the same period type.
+        for (col, type) in (
+            ([Day(2), Day(-1)], Arrow.AC.DurationType(Arrow.AC.SECOND)),
+            ([Week(1)], Arrow.AC.DurationType(Arrow.AC.SECOND)),
+            ([Hour(3)], Arrow.AC.DurationType(Arrow.AC.SECOND)),
+            ([Minute(-5)], Arrow.AC.DurationType(Arrow.AC.SECOND)),
+            ([Month(14)], Arrow.AC.IntervalType(Arrow.AC.YEAR_MONTH)),
+            ([Year(-2)], Arrow.AC.IntervalType(Arrow.AC.YEAR_MONTH)),
+        )
+            t = rt((; x=col))
+            @test fieldof(t).type == type
+            @test eltype(t.x) == eltype(col) && t.x == col && rt(t).x == col
+        end
+        @test_throws OverflowError Arrow.tobuffer((; x=[Week(typemax(Int64))]))
+        # Abstract columns narrow to their values' types.
+        t = rt((; x=Real[1, 2]))
+        @test eltype(t.x) == Int64 && t.x == [1, 2]
+        for col in (Any[1, "a", 2.5, missing], Real[1, 2.5])
+            t = rt((; x=col))
+            @test fieldof(t).type isa Arrow.AC.UnionType
+            @test isequal(collect(t.x), col)
+        end
+        t = rt((; x=Any[[1], ["a", "b"]]))
+        @test isequal(collect(t.x), [[1], ["a", "b"]])
+        @test_throws ArgumentError Arrow.tobuffer((;
+            x=Any[
+                Int8(1),
+                Int16(2),
+                Int32(3),
+                Int64(4),
+                UInt8(5),
+                UInt16(6),
+                UInt32(7),
+                UInt64(8),
+                9.0,
+            ]
+        ))
+    end
+
+    @testset "canonical extension reads" begin
+        AC = Arrow.AC
+        ext(name) = ["ARROW:extension:name" => name, "ARROW:extension:metadata" => ""]
+        function onecolumn(f, d)
+            sch = AC.Schema([f])
+            return Arrow.Table(Arrow.writefile(sch, [AC.RecordBatch(sch, [d])]))
+        end
+        _, d8 = AC.fromjulia("x", Int8[0, 1, 7])
+        t = onecolumn(
+            AC.Field("x", AC.IntType(8, true); nullable=false, metadata=ext("arrow.bool8")),
+            d8,
+        )
+        @test eltype(t.x) == Bool && t.x == [false, true, true]
+        _, ds = AC.fromjulia("x", ["{\"a\": 1}", "[]"])
+        for name in ("arrow.json", "arrow.opaque")
+            f = AC.Field("x", AC.Utf8Type(false); nullable=false, metadata=ext(name))
+            t = @test_logs min_level = Logging.Warn onecolumn(f, ds)
+            @test t.x == ["{\"a\": 1}", "[]"]
+        end
+        # An unknown extension warns once per process.
+        name = "example.unknown.$(time_ns())"
+        f = AC.Field("x", AC.Utf8Type(false); nullable=false, metadata=ext(name))
+        @test_logs (:warn, r"unsupported ARROW:extension:name") onecolumn(f, ds)
+        @test_logs min_level = Logging.Warn onecolumn(f, ds)
+    end
+
+    @testset "DataStrings columns write as utf8, or as Utf8View zero-copy" begin
         # A StringVector's memory IS a Utf8View array: payloads are the
         # views buffer, its byte buffers the variadic data buffers. Build one
         # the way the CSV kernel does (inline ≤12, else a view into buffer 0
@@ -2713,19 +2827,28 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             DataStrings.view_payload(extra, 1, length(extra), 1, 0),
         ]
         col = StringVector{Union{Missing,DataString}}(payloads, buf, extra)
+        expected = ["abcd", "thirteen-byte", missing, "she said \"hi\" and left"]
+        # By default the bytes are packed into one utf8 column.
         f, columnparts = Arrow._constructcolumn(:s, AbstractVector[col])
+        @test f.type == Arrow.AC.Utf8Type(false) && f.nullable
+        io = IOBuffer()
+        Arrow.write(io, (id=[1, 2, 3, 4], s=col))
+        bytes = take!(io)
+        @test Arrow.readfile(bytes).schema.fields[2].type == Arrow.AC.Utf8Type(false)
+        @test isequal(Arrow.Table(bytes).s, expected)
+        # stringview=true writes the column's own memory as Utf8View.
+        f, columnparts = Arrow._constructcolumn(:s, AbstractVector[col]; stringview=true)
         d = only(columnparts)
         @test f.type == Arrow.AC.ViewType(true) && f.nullable
         @test d.buffers[2].region.root === payloads       # views: the payload vector itself
         @test d.buffers[3].region.root === buf
         @test d.buffers[4].region.root === extra
-        io = IOBuffer()
-        Arrow.write(io, (id=[1, 2, 3, 4], s=col))
+        Arrow.write(io, (id=[1, 2, 3, 4], s=col); stringview=true)
         bytes = take!(io)
         @test Arrow.readfile(bytes).schema.fields[2].type == Arrow.AC.ViewType(true)
         t = Arrow.Table(bytes)
         @test eltype(t.s) === Union{Missing,String}
-        @test isequal(t.s, ["abcd", "thirteen-byte", missing, "she said \"hi\" and left"])
+        @test isequal(t.s, expected)
         # a non-nullable column declares non-nullable
         col0 = StringVector{DataString}(payloads[[1, 2]], buf, extra)
         f0, _ = Arrow._constructcolumn(:s, AbstractVector[col0])
@@ -2742,10 +2865,10 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             ],
             Vector{Vector{UInt8}}(),
         )
-        fi, inlineparts = Arrow._constructcolumn(:s, AbstractVector[inl])
+        fi, inlineparts = Arrow._constructcolumn(:s, AbstractVector[inl]; stringview=true)
         di = only(inlineparts)
         @test length(di.buffers) == 2
-        Arrow.write(io, (s=inl,))
+        Arrow.write(io, (s=inl,); stringview=true)
         bytes0 = take!(io)
         @test Arrow.Table(bytes0).s == ["abcd", "ab"]
         af = Arrow.readfile(bytes0)

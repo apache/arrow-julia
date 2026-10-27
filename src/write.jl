@@ -40,7 +40,7 @@ include("columnconstruction.jl")
 
 """
     Arrow.write(sink, table; file=true, compress=nothing,
-                metadata=nothing, colmetadata=nothing)
+                metadata=nothing, colmetadata=nothing, stringview=false)
     Arrow.write(sink; kwargs...)
 
 Write any Tables.jl source as Arrow IPC. `sink` is a file path or an `IO`.
@@ -52,7 +52,8 @@ one record batch. `compress` is `nothing`, `:lz4`, or `:zstd`.
 Schema metadata is inherited from an `Arrow.Table` or `Arrow.Stream` when
 `metadata` is `nothing`. Inherited batch statistics are dropped because the
 values, columns, or batch boundaries may have changed. Explicit `metadata`
-is used as supplied.
+is used as supplied. Strings and bytes write as Utf8 and Binary;
+`stringview=true` writes them as Utf8View and BinaryView.
 
 Returns `sink`: the path for the path method, the `io` for the `IO` method.
 The one-argument form curries for pipelines: `table |> Arrow.write(sink)`.
@@ -166,7 +167,7 @@ end
 
 """
     Arrow.Writer(sink; file=true, compress=nothing, metadata=nothing,
-                 colmetadata=nothing, dictreplacement=false)
+                 colmetadata=nothing, dictreplacement=false, stringview=false)
     Arrow.Writer(f::Function, sink; kwargs...)
 
 An incremental IPC writer: batches publish to `sink` as they are written,
@@ -223,6 +224,7 @@ mutable struct Writer
     const metadata::Any
     const colmetadata::Any
     const dictreplacement::Bool
+    const stringview::Bool
     st::Union{Nothing,IPCWriteState}
     names::Vector{Symbol}
     schema::Union{Nothing,AC.Schema}
@@ -236,6 +238,7 @@ function _writer(
     metadata=nothing,
     colmetadata=nothing,
     dictreplacement::Bool=false,
+    stringview::Bool=false,
 )
     codec = compress === nothing ? :none : compress
     if !haskey(CODEC_NAMES, codec)
@@ -263,6 +266,7 @@ function _writer(
             metadata,
             colmetadata,
             dictreplacement,
+            stringview,
             nothing,
             Symbol[],
             nothing,
@@ -326,6 +330,7 @@ function write(w::Writer, tbl)
                 _retainedfieldfn(retained, names),
                 w.colmetadata;
                 refpools=false,
+                stringview=w.stringview,
             )
         end
         # The bounded facade interning rule, as when the source was read.
@@ -354,7 +359,8 @@ function write(w::Writer, tbl)
             ),
         )
         sch = w.schema::AC.Schema
-        fields, coldata = _constructconforming(names, partcols, partpools, sch, tbl)
+        fields, coldata =
+            _constructconforming(names, partcols, partpools, sch, tbl; w.stringview)
         # A fresh Schema over the BUILT fields, so `writebatch!` re-checks
         # them against the writer's schema instead of trusting construction.
         batchsch = AC.Schema(fields; metadata=sch.metadata)
@@ -513,6 +519,7 @@ function _writebytes(
     compress::Union{Nothing,Symbol}=nothing,
     metadata=nothing,
     colmetadata=nothing,
+    stringview::Bool=false,
     # Arrow 2.x writer keywords: accepted and ignored (with a one-time
     # warning each) so 2.x call sites keep working during migration.
     alignment=nothing,
@@ -544,7 +551,8 @@ function _writebytes(
             partcols,
             partpools,
             _retainedfieldfn(retained, names),
-            colmetadata,
+            colmetadata;
+            stringview,
         )
     end
     schmeta = _writermetadata(metadata, retained)
@@ -666,6 +674,7 @@ function _constructcolumns(
     retainedfield::F,
     colmetadata;
     refpools::Bool=true,
+    stringview::Bool=false,
 ) where {F}
     nparts = length(partcols)
     ncols = length(names)
@@ -683,6 +692,7 @@ function _constructcolumns(
             poolhints=poolhints,
             metadata=_metapairs(columnmeta),
             refpools=refpools,
+            stringview=stringview,
         )
     end
     return fields, coldata
@@ -697,7 +707,14 @@ end
 # conforms to the schema field. Dictionary columns keep the retained
 # construction, which continues the existing pool, and so does a column whose
 # own mapping differs from the field, such as an all-missing column.
-function _constructconforming(names, partcols, partpools, sch::AC.Schema, tbl)
+function _constructconforming(
+    names,
+    partcols,
+    partpools,
+    sch::AC.Schema,
+    tbl;
+    stringview::Bool=false,
+)
     retainedfield = j -> sch.fields[j]
     _retainedschema(tbl) === nothing ||
         return _constructcolumns(names, partcols, partpools, retainedfield, nothing)
@@ -708,7 +725,8 @@ function _constructconforming(names, partcols, partpools, sch::AC.Schema, tbl)
         expected = sch.fields[j]
         parts = AbstractVector[partcols[k][j] for k = 1:nparts]
         fresh =
-            expected.type isa AC.DictionaryType ? nothing : _freshcolumn(names[j], parts)
+            expected.type isa AC.DictionaryType ? nothing :
+            _freshcolumn(names[j], parts; stringview)
         mismatch =
             fresh === nothing ? nothing : _conformancemismatch(expected, first(fresh))
         if fresh !== nothing && mismatch === nothing
@@ -734,9 +752,9 @@ function _constructconforming(names, partcols, partpools, sch::AC.Schema, tbl)
     return fields, coldata
 end
 
-function _freshcolumn(name::Symbol, parts)
+function _freshcolumn(name::Symbol, parts; stringview::Bool=false)
     try
-        return _constructcolumn(name, parts; refpools=false)
+        return _constructcolumn(name, parts; refpools=false, stringview)
     catch err
         # The retained construction reports why this column cannot be written.
         err isa ArgumentError || rethrow()

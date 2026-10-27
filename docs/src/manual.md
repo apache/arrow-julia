@@ -461,7 +461,8 @@ can appear at any nesting depth — is:
 | `Float16/32/64` | the same-width float |
 | `Bool` | Bool |
 | `String` | Utf8 |
-| `Vector{T}` for core `T` (including `Vector{UInt8}`) | List of the mapping of `T` |
+| `Vector{UInt8}` and any other `AbstractVector{UInt8}` (`DataBytes`, `CodeUnits`) | Binary |
+| `Vector{T}` for any other core `T` | List of the mapping of `T` |
 | `Union{Missing, T}` for core `T` | the mapping of `T`, nullable |
 | `Union{T1, T2, ...}` with two or more non-`Missing` writable member types | canonical dense Union with one child per declared member type |
 | `Missing` | Null |
@@ -491,15 +492,20 @@ At every depth of a column the facade adds:
 | Julia element type | Arrow type |
 |---|---|
 | any other `AbstractString` (e.g. `SubString`) | Utf8 |
+| `NTuple{N,UInt8}` | FixedSizeBinary(N) |
+| `UUIDs.UUID` | canonical `arrow.uuid` extension (FixedSizeBinary(16), big-endian bytes) |
+| `Int128`, `UInt128` | FixedSizeBinary(16), little-endian, labelled `JuliaLang.Int128`/`JuliaLang.UInt128` |
 | `Dates.Date` | Date32 |
 | `Dates.DateTime` | Timestamp (millisecond) |
 | `Dates.Time` | Time64 (nanosecond) |
 | `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
+| `Dates.Week/Day/Hour/Minute` | Duration (second), labelled `JuliaLang.Dates.Week` etc. so it reads back as the same type |
+| `Dates.Month/Year` | Interval (year-month), labelled `JuliaLang.Dates.Month`/`Year` |
 | `Durations.Timestamp{P}` | Timestamp of that unit, no timezone |
 | `Durations.ZonedTimestamp{P,Z}` | Timestamp of that unit with timezone `String(Z)` (one zone per column; `Durations.astimezone` normalizes) |
 | `NamedTuple` whose fields are core columns | Struct; `Union{Missing, T}` adds parent validity while child nullability stays declared |
 | `Arrow.DictEncode` over a writable column | Dictionary of the recursive mapping of its values |
-| `DataStrings.StringVector` | Utf8View, borrowed in memory and compacted for IPC output (see below) |
+| `DataStrings.StringVector`, `DataStrings.BytesVector` | Utf8, Binary (Utf8View, BinaryView with `stringview=true`; see below) |
 
 These native facade conversions recurse through list and struct shapes: a
 `Vector{Date}` inside a list, or a `SubString` or `Timestamp{Nanosecond}`
@@ -508,8 +514,15 @@ level; an element type with no writable mapping is refused with an
 `ArgumentError` naming it. A
 top-level `DictEncode` pool uses the same native column mapping as an ordinary
 top-level column. The ArrowTypes.jl mappings described below do recurse. A
-column with element type `Any` is narrowed once (recovering list columns of a
-common element type) and refused if it cannot be narrowed to a writable type.
+column with element type `Any`, or another abstract type no single Arrow type
+holds (`Real`, say), is narrowed from its values: one runtime type writes as
+that type, several (at most 8) as a dense Union of them. An abstract
+`Timestamp`, `ZonedTimestamp`, or `Decimal` column narrows only when every value
+has the same type, since one Arrow column has one unit, zone, or precision.
+
+Strings write as Utf8 and bytes as Binary by default, the types every reader
+supports. `stringview=true` (on `Arrow.write` and `Arrow.Writer`) writes them as
+Utf8View/BinaryView instead.
 When the source is an `Arrow.Table` or `Arrow.Stream`, the writer retains the
 compatible Arrow descriptor tree. Temporal units, byte and list widths,
 Struct, Map, Run-End Encoding, nullability, field metadata, schema metadata,
@@ -607,15 +620,20 @@ Use the lowering interface to select a different stable storage
 representation. An `ArrowKind` override alone does not select an arbitrary
 Arrow 3.0 physical layout.
 
+Arrow reads the canonical extension types `arrow.uuid` as `UUIDs.UUID` and
+`arrow.bool8` as `Bool` (any nonzero byte is `true`), and `arrow.json` and
+`arrow.opaque` as their storage values (`String`, bytes) without a warning. The
+`JuliaLang.UUID` label older Arrow.jl versions wrote (little-endian bytes) still
+reads as `UUID`, and rewriting such a column keeps that layout.
+
 Arrow does not intern an unknown on-wire extension name merely to probe
 `JuliaType(Val(...))`. It dispatches only when that name is already a Julia
-`Symbol`. Unsupported-name warnings are deduplicated by the complete extension
-label. Each table materialization emits at most one warning for each of 16
-distinct labels, then one suppression notice for further distinct labels. A
-warning shows at most 128 UTF-8 bytes of its label. The built-in
-`JuliaLang.Symbol` mapping also lifts only a payload that is already interned. A
-novel payload produces `ValidationError` instead of adding permanent
-process-global symbol state.
+`Symbol`. An unsupported extension name warns once per process; after 16
+distinct names, one notice says further warnings are suppressed. A warning
+shows at most 128 UTF-8 bytes of its label. The built-in `JuliaLang.Symbol`
+mapping interns new `Symbol` values, at most 65,536 of them (1 MiB in total) per
+read; a column beyond that, or a payload containing NUL, produces
+`ValidationError`.
 
 Recursive custom storage schemas and recursive value containers are rejected
 with `ArgumentError`. Custom mappings may nest to 64 levels. Deeper mappings
@@ -655,8 +673,10 @@ and inactive sparse-Union storage bounded by the bytes the output requires.
 (inline up to 12 bytes, otherwise a prefix plus buffer index and offset),
 and `StringVector`, a column of them over a set of byte buffers —
 which *is* an Arrow Utf8View array's memory. A parser or other producer can
-build this representation directly. The writer wraps its payload vector and
-buffers as an in-memory Arrow column without materializing a `String`.
+build this representation directly. By default the writer packs its bytes
+into a Utf8 column in one pass over the payloads; with `stringview=true` it
+wraps the payload vector and buffers as an in-memory Utf8View column without a
+copy.
 
 When writing IPC, Arrow compacts Utf8View and BinaryView arrays. Only byte
 ranges referenced by valid long entries are copied to the output buffers.

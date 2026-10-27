@@ -85,16 +85,23 @@ function _postconvert(t::AC.IntervalType, col, budget=nothing)
     )
 end
 
+# Coefficients write as stored, as Arrow C++ writes them; precision is the
+# `validate_full` tier's check.
 function _shareddecimalraw(t::AC.DecimalType, x::DataDecimals.AbstractDecimal)
     DataDecimals.scale(x) == t.scale ||
         throw(ArgumentError("decimal scale does not match the Arrow schema"))
     u = _decimalstorage(t)(DataDecimals.unscaled(x))
-    bound = _decimalstorage(t)(10)^t.precision
-    -bound < u < bound ||
-        throw(ArgumentError("decimal coefficient exceeds declared precision"))
     t.bits == 32 && return Int32(u)
     t.bits == 64 && return Int64(u)
     return UInt8[(u >> (8 * i)) & 0xff for i = 0:(t.bits ÷ 8 - 1)]
+end
+
+# Public values the writer lowers into interval storage.
+const _IntervalValue = Union{Durations.Duration,Dates.Month,Dates.Year}
+
+function _sharedintervalraw(t::AC.IntervalType, x::Union{Dates.Month,Dates.Year})
+    t.unit == AC.YEAR_MONTH && return Int32(_periodmonths(x))
+    return _sharedintervalraw(t, Durations.Duration(Int32(_periodmonths(x)), 0, 0))
 end
 
 function _sharedintervalraw(t::AC.IntervalType, x::Durations.Duration)

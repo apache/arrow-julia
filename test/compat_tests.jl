@@ -276,6 +276,10 @@ end
     tbl = Arrow.Table(Arrow.writefile(sch, [AC.RecordBatch(sch, [d])]))
     @test eltype(tbl.u) == UUIDs.UUID
     @test tbl.u == u
+    # A rewrite keeps the 2.x label and byte order.
+    re = Arrow.readfile(take!(Arrow.write(IOBuffer(), tbl)))
+    @test Arrow._fieldmetadata(only(re.schema.fields)) == meta
+    @test AC.slicebytes(AC.rolebuffer(re[1].columns[1], AC.DATA)) == bytes
 end
 
 @testset "files from Arrow.jl before 2.6" begin
