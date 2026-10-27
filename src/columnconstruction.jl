@@ -5623,6 +5623,16 @@ Base.isequal(left::_WriterStorageKey, right::_WriterStorageKey) =
     _writerstorageequal(left.value, right.value)
 Base.hash(key::_WriterStorageKey, seed::UInt) = _writerstoragehash(key.value, seed)
 
+"""
+An element type that holds both `T` and `S` values: `T` when it already
+does, else their common supertype, with `missing` if either has it.
+"""
+function _widenedtype(T::Type, S::Type)
+    S <: T && return T
+    W = typejoin(Base.nonmissingtype(T), Base.nonmissingtype(S))
+    return Missing <: T || Missing <: S ? Union{Missing,W} : W
+end
+
 "Declared common value type for a newly inferred dictionary pool."
 function _dictvaluetype(vals)
     T = Union{}
@@ -5645,10 +5655,10 @@ function _dictionarypool(vals, retainedpool; writetype=nothing)
         pool = T[]
     else
         # New categories may be other types than the retained ones (writer
-        # values after a public pool read back): widen instead of converting.
-        T = eltype(retainedpool)
-        V = _dictvaluetype(vals)
-        pool = collect(V <: T ? T : typejoin(T, V), retainedpool)
+        # values after a public pool read back, DataStrings after Strings):
+        # widen the value type instead of converting.
+        pool =
+            collect(_widenedtype(eltype(retainedpool), _dictvaluetype(vals)), retainedpool)
     end
     # Dedup with the non-overloadable structural key `_compactdictionarypool`
     # also uses: public-domain values may overload `hash`/`isequal`, so only the

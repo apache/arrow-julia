@@ -761,13 +761,14 @@ function _extendpools(pools::Vector{Any}, partpools)
         ] for own in partpools
     ]
 end
-_extendpool(written, own) =
-    written === nothing ? own :
-    own === nothing ? written :
-    _mergecategorypools(
-        AbstractVector[written, own];
-        widen=(!(eltype(own) <: eltype(written))),
+function _extendpool(written, own)
+    written === nothing && return own
+    own === nothing && return written
+    T = _widenedtype(eltype(written), eltype(own))
+    return _mergecategorypools(
+        AbstractVector[T === eltype(written) ? written : collect(T, written), own],
     )
+end
 
 """
 Delta dictionaries for a batch whose pools extend, value by value, the pools
