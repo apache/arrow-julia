@@ -950,9 +950,10 @@ function _constructpart(
 end
 
 """
-utf8/binary offsets and data from DataStrings payloads: one length pass, then
-the data is a slice of the payloads' buffer when every value's bytes sit
-there in row order (as a read of utf8 data stores them), or one copy.
+utf8/binary offsets and data from DataStrings payloads. One pass measures the
+values and copies them while every value so far is inline; a batch with an
+out-of-line value is a slice of that value's buffer when every value's bytes
+sit there in row order (as a read of utf8 data stores them), else one copy.
 """
 function _packedpayloadpart(
     name::String,
@@ -966,6 +967,11 @@ function _packedpayloadpart(
     offsets = Vector{Offset}(undef, n + 1)
     offsets[1] = 0
     bits = Vector{UInt8}(undef, cld(n, 8))
+    # Inline values are at most 12 bytes, so this holds every value until the
+    # first out-of-line one; a batch that starts out of line goes without.
+    firstlong =
+        n > 0 && DataStrings.payloadlength(@inbounds payloads[1]) > DataStrings.INLINE_MAX
+    inline = Vector{UInt8}(undef, firstlong ? 16 : 12n + 16)
     # The out-of-line values must sit back to back in row order in the buffer
     # of the first one (`runbuf`), from `runstart`, for the data to be a slice.
     runbuf = 0
@@ -973,8 +979,9 @@ function _packedpayloadpart(
     runok = true
     pos = 0
     valid = 0
-    GC.@preserve payloads begin
+    GC.@preserve payloads inline begin
         words = Ptr{UInt64}(pointer(payloads))
+        out = pointer(inline)
         @inbounds for b in eachindex(bits)
             base = (b - 1) << 3
             byte = 0x00
@@ -992,6 +999,11 @@ function _packedpayloadpart(
                 end
                 # Without branches: the values are a random mix of kinds.
                 runok &= !long | ((k == runbuf) & (at == runstart))
+                if runbuf == 0
+                    # The payload's last 12 bytes, stored as whole words.
+                    unsafe_store!(Ptr{UInt64}(out + pos), (a >> 32) | (w << 32))
+                    unsafe_store!(Ptr{UInt32}(out + pos + 8), (w >> 32) % UInt32)
+                end
                 pos += ifelse(present, len, 0)
                 pos <= typemax(Offset) || throw(_OffsetOverflow(name, 0, i))
                 offsets[i + 1] = pos % Offset
@@ -1004,7 +1016,13 @@ function _packedpayloadpart(
     nc = n - valid
     validity =
         nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
-    if runok && runbuf != 0 && _inlineinrun(payloads, offsets, buffers, runbuf, runstart)
+    if runbuf == 0
+        resize!(inline, pos)
+        databuf = pos == 0 ? AC.BufferSlice() : AC._databuffer(inline)
+        d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
+        return AC.Field(name, t; nullable), _constructedvalid(d)
+    end
+    if runok && _inlineinrun(payloads, offsets, buffers, runbuf, runstart)
         databuf = AC.BufferSlice(AC.heapregion(buffers[runbuf]), runstart, pos)
         d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
         return AC.Field(name, t; nullable), _constructedvalid(d)
