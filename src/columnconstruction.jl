@@ -4626,19 +4626,21 @@ end
 function _retainedtypedvalues(f::AC.Field, values; converted::Bool)
     T = _declaredeltype(f, converted)
     T === Any && return Any[x for x in values]
-    out = Vector{T}(undef, length(values))
-    for (i, x) in enumerate(values)
-        x isa T ||
-            _retainedwritertype(f.type, typeof(x)) ||
-            throw(
-                ArgumentError(
-                    "column $(f.name) holds $(typeof(x)) values that do not match " *
-                    "its retained Arrow type $(repr(f.type))",
-                ),
-            )
-        out[i] = x
+    # A value of another accepted writer type (the `NTuple` bytes of a typed
+    # struct row's fixed-size binary field) widens the vector instead of
+    # being converted to the declared type.
+    S = T
+    for x in values
+        x isa T && continue
+        _retainedwritertype(f.type, typeof(x)) || throw(
+            ArgumentError(
+                "column $(f.name) holds $(typeof(x)) values that do not match " *
+                "its retained Arrow type $(repr(f.type))",
+            ),
+        )
+        S = Base.promote_typejoin(S, typeof(x))
     end
-    return out
+    return S[x for x in values]
 end
 
 """

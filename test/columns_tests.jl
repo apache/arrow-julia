@@ -365,6 +365,11 @@ end
         two = Arrow.Table(arrowbytes(Tables.partitioner([tbl, tbl]); file=true))
         @test isequal(collect(two.l), [tbl.l; tbl.l]) && two.st == [tbl.st; tbl.st]
         @test copy(two.l) isa Vector && all(r -> r === missing || r isa Vector, copy(two.l))
+        # A struct row's fixed-size binary field is an `NTuple`, and the
+        # struct rewrites from it.
+        ids = Arrow.Table(arrowbytes((s=[(id=ntuple(UInt8, 16), n=1), missing],)))
+        @test eltype(ids.s) == Union{Missing,@NamedTuple{id::NTuple{16,UInt8},n::Int64}}
+        @test isequal(Arrow.Table(arrowbytes(ids)).s, ids.s)
         # Scans give the full read's rows.
         st = Arrow.Table(arrowbytes(tbl); scan=Tables.Scan(select=(:st, :l)))
         @test typeof(st.st) == typeof(t.st) && typeof(st.l) == typeof(t.l)
