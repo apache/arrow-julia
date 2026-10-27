@@ -502,6 +502,9 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                     )
                 end
             elseif header isa Meta.DictionaryBatch
+                # Earlier record batches must capture their dictionaries before an update.
+                _waitall(tasks)
+                empty!(tasks)
                 id = header.id
                 recordbatch = header.data
                 @debug "parsing dictionary batch message: id = $id, compression = $(recordbatch.compression)"
@@ -522,20 +525,7 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                             convert,
                         )
                         dictencoding = dictencodings[id]
-                        if typeof(dictencoding.data) <: ChainedVector
-                            append!(dictencoding.data, values)
-                        else
-                            A = ChainedVector([dictencoding.data, values])
-                            S =
-                                field.dictionary.indexType === nothing ? Int32 :
-                                juliaeltype(field, field.dictionary.indexType, false)
-                            dictencodings[id] = DictEncoding{eltype(A),S,typeof(A)}(
-                                id,
-                                A,
-                                field.dictionary.isOrdered,
-                                values.metadata,
-                            )
-                        end
+                        append!(dictencoding.data, values)
                         continue
                     end
                     # new dictencoding or replace
@@ -551,7 +541,8 @@ function Table(blobs::Vector{ArrowBlob}; convert::Bool=true)
                         Int64(1),
                         convert,
                     )
-                    A = values
+                    # Keep the dictionary storage type stable when later deltas arrive.
+                    A = ChainedVector([values])
                     S =
                         field.dictionary.indexType === nothing ? Int32 :
                         juliaeltype(field, field.dictionary.indexType, false)
