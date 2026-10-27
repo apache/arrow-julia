@@ -1735,7 +1735,8 @@ end
     end
 end
 
-@testset "fresh partition traits are column-scoped" begin
+@testset "fresh partition traits are planned once per partition" begin
+    # Partitions stream: each is planned as it arrives, not once per value.
     parts = Tables.partitioner(
         Tuple(
             (value=ArrowTypesTestPlanCounted[ArrowTypesTestPlanCounted(Int32(i))],) for
@@ -1746,8 +1747,8 @@ end
     ARROWTYPES_TEST_PLAN_COUNTED_NAME_CALLS[] = 0
     ARROWTYPES_TEST_PLAN_COUNTED_LOWER_CALLS[] = 0
     bytes = arrowtypes_test_bytes(parts; file=false)
-    @test ARROWTYPES_TEST_PLAN_COUNTED_KIND_CALLS[] == 1
-    @test ARROWTYPES_TEST_PLAN_COUNTED_NAME_CALLS[] == 1
+    @test ARROWTYPES_TEST_PLAN_COUNTED_KIND_CALLS[] == 16
+    @test ARROWTYPES_TEST_PLAN_COUNTED_NAME_CALLS[] == 16
     @test ARROWTYPES_TEST_PLAN_COUNTED_LOWER_CALLS[] == 16
     @test Arrow.Table(bytes).value == ArrowTypesTestPlanCounted.(Int32.(1:16))
 end
@@ -2760,34 +2761,33 @@ end
         sprint(showerror, err),
     )
 
-    split8 = Tables.partitioner((
-        (value=Arrow.DictEncode(values128[1:4]),),
-        (value=Arrow.DictEncode(values128[5:8]),),
-    ))
-    @test Arrow.Table(arrowtypes_test_bytes(split8; file=false)).value == Int16.(1:8)
-
-    split9 = Tables.partitioner((
-        (value=Arrow.DictEncode(values128[1:4]),),
-        (value=Arrow.DictEncode(values128[5:9]),),
-    ))
-    spliterror = function ()
+    nineerror = function ()
         try
-            arrowtypes_test_bytes(split9; file=false)
+            arrowtypes_test_bytes((value=Arrow.DictEncode(values128[1:9]),); file=false)
             return nothing
         catch e
             return e
         end
     end
     ARROWTYPES_TEST_MANY_DICT_TYPE_CALLS[] = 0
-    err = spliterror()
+    err = nineerror()
     @test err isa ArgumentError
     @test ARROWTYPES_TEST_MANY_DICT_TYPE_CALLS[] == 0
-    @test occursin(
-        "dictionary column value has more than 8 inferred runtime value types",
-        sprint(showerror, err),
-    )
     GC.gc()
-    @test (@allocated spliterror()) < 5_000_000
+    @test (@allocated nineerror()) < 5_000_000
+
+    # Partitions stream: each plans its own values, and later categories
+    # (other runtime types that lower the same way) extend the pool.
+    split8 = Tables.partitioner((
+        (value=Arrow.DictEncode(values128[1:4]),),
+        (value=Arrow.DictEncode(values128[5:8]),),
+    ))
+    @test Arrow.Table(arrowtypes_test_bytes(split8; file=false)).value == Int16.(1:8)
+    split9 = Tables.partitioner((
+        (value=Arrow.DictEncode(values128[1:4]),),
+        (value=Arrow.DictEncode(values128[5:9]),),
+    ))
+    @test Arrow.Table(arrowtypes_test_bytes(split9; file=false)).value == Int16.(1:9)
 
     seedbytes = arrowtypes_test_bytes(
         (
@@ -2837,23 +2837,27 @@ end
         row in Arrow.Table(nestedbytes).value
     ] == Int16.(1:8)
 
-    for parts in (
-        ((value=torows(registered9),),),
+    source = ArrowTypesTestRetainedPartitions(nestedschema, ((value=torows(registered9),),))
+    err = try
+        arrowtypes_test_bytes(source; file=false)
+        nothing
+    catch e
+        e
+    end
+    @test err isa ArgumentError
+    @test occursin(
+        "column child has more than 8 inferred registered writer runtime types",
+        sprint(showerror, err),
+    )
+    # Each streamed partition is planned on its own, within the cap.
+    split = ArrowTypesTestRetainedPartitions(
+        nestedschema,
         ((value=torows(registered9[1:4]),), (value=torows(registered9[5:9]),)),
     )
-        source = ArrowTypesTestRetainedPartitions(nestedschema, parts)
-        err = try
-            arrowtypes_test_bytes(source; file=false)
-            nothing
-        catch e
-            e
-        end
-        @test err isa ArgumentError
-        @test occursin(
-            "column child has more than 8 inferred registered writer runtime types",
-            sprint(showerror, err),
-        )
-    end
+    @test [
+        arrowtypes_test_rowdict(row)["child"].value for
+        row in Arrow.Table(arrowtypes_test_bytes(split; file=false)).value
+    ] == Int16.(1:9)
 
     @testset "retained registered inference is column-wide across children" begin
         WideSeedRow = @NamedTuple{
@@ -2907,44 +2911,33 @@ end
         )
     end
 
-    @testset "fresh abstract storage is column-scoped across partitions" begin
+    @testset "fresh abstract storage across partitions follows the first" begin
         first4 = arrowtypes_test_same_field_values(1:4)
-        second4 = arrowtypes_test_same_field_values(5:8)
-        parts8 = Tables.partitioner(((value=first4,), (value=second4,)))
+        again4 = arrowtypes_test_same_field_values(1:4)
         ARROWTYPES_TEST_SAME_FIELD_LOWER_CALLS[] = 0
-        accepted8 = try
-            arrowtypes_test_bytes(parts8; file=false)
-        catch e
-            e
-        end
-        @test accepted8 isa Vector{UInt8}
-        if accepted8 isa Vector{UInt8}
-            @test ARROWTYPES_TEST_SAME_FIELD_LOWER_CALLS[] == 8
-            field8, batches8 = arrowtypes_test_core_parts(accepted8)
-            @test field8.type isa ARROWTYPES_TEST_AC.UnionType
-            @test length(field8.children) == 4
-            @test all(
-                batch -> ARROWTYPES_TEST_AC.typeequal(batch.columns[1].type, field8.type),
-                batches8,
-            )
-            @test map(x -> x.value, Arrow.Table(accepted8).value) == Int16.(1:8)
-        end
-
-        fifthroughnine = arrowtypes_test_same_field_values(5:9)
-        parts9 = Tables.partitioner(((value=first4,), (value=fifthroughnine,)))
-        ARROWTYPES_TEST_SAME_FIELD_LOWER_CALLS[] = 0
-        err = try
-            arrowtypes_test_bytes(parts9; file=false)
-            nothing
-        catch e
-            e
-        end
-        @test err isa ArgumentError
-        @test occursin(
-            "column value has more than 8 inferred ArrowTypes storage types",
-            sprint(showerror, err),
+        bytes = arrowtypes_test_bytes(
+            Tables.partitioner(((value=first4,), (value=again4,)));
+            file=false,
         )
-        @test ARROWTYPES_TEST_SAME_FIELD_LOWER_CALLS[] == 9
+        @test ARROWTYPES_TEST_SAME_FIELD_LOWER_CALLS[] == 8
+        field, batches = arrowtypes_test_core_parts(bytes)
+        @test field.type isa ARROWTYPES_TEST_AC.UnionType
+        @test all(
+            batch -> ARROWTYPES_TEST_AC.typeequal(batch.columns[1].type, field.type),
+            batches,
+        )
+        @test map(x -> x.value, Arrow.Table(bytes).value) == Int16[1:4; 1:4]
+
+        # Other runtime types with the same storage and label plan the same
+        # union, so they conform too.
+        second4 = arrowtypes_test_same_field_values(5:8)
+        bytes8 = arrowtypes_test_bytes(
+            Tables.partitioner(((value=first4,), (value=second4,)));
+            file=false,
+        )
+        field8, _ = arrowtypes_test_core_parts(bytes8)
+        @test ARROWTYPES_TEST_AC.typeequal(field8.type, field.type)
+        @test map(x -> x.value, Arrow.Table(bytes8).value) == Int16.(1:8)
     end
 
     @testset "declared registered Union bypasses the inference cap" begin
@@ -3025,7 +3018,11 @@ end
             bytes = arrowtypes_test_bytes(layout; file)
             table = Arrow.Table(bytes)
             @test isequal(table.value, structvalues)
-            @test eltype(table.value) === StructT
+            # Several partitions declare every field nullable.
+            @test eltype(table.value) === (
+                label == "split partitions" ?
+                Union{Missing,Tuple{Union{Missing,Int64},Union{Missing,String}}} : StructT
+            )
             field, batches = arrowtypes_test_core_parts(bytes)
             @test field.type isa ARROWTYPES_TEST_AC.StructType
             @test occursin("Tuple", something(arrowtypes_test_extension_name(field), ""))
@@ -3040,22 +3037,32 @@ end
 @testset "inference-only tuple storage is planned once per complete column" begin
     Flex = ArrowTypesTestFlexTuple
     values = Flex[Flex(Int16[1]), Flex(Int16[2, 3])]
-    layouts = (
-        ("one partition", (value=values,)),
-        ("empty first", Tables.partitioner(((value=Flex[],), (value=values,)))),
-        ("split shapes", Tables.partitioner(((value=values[1:1],), (value=values[2:2],)))),
-    )
-    for (label, layout) in layouts, file in (false, true)
-        @testset "$label ($(file ? "file" : "stream"))" begin
-            ARROWTYPES_TEST_FLEX_TUPLE_CALLS[] = 0
-            bytes = arrowtypes_test_bytes(layout; file)
-            @test ARROWTYPES_TEST_FLEX_TUPLE_CALLS[] == length(values)
-            @test Arrow.Table(bytes).value == values
-            field, _ = arrowtypes_test_core_parts(bytes)
-            @test field.type isa ARROWTYPES_TEST_AC.UnionType
-            @test sort([child.type.listsize for child in field.children]) == [1, 2]
-            @test arrowtypes_test_extension_name(field) ==
-                  String(ARROWTYPES_TEST_FLEX_TUPLE_NAME)
+    for file in (false, true)
+        ARROWTYPES_TEST_FLEX_TUPLE_CALLS[] = 0
+        bytes = arrowtypes_test_bytes((value=values,); file)
+        @test ARROWTYPES_TEST_FLEX_TUPLE_CALLS[] == length(values)
+        @test Arrow.Table(bytes).value == values
+        field, _ = arrowtypes_test_core_parts(bytes)
+        @test field.type isa ARROWTYPES_TEST_AC.UnionType
+        @test sort([child.type.listsize for child in field.children]) == [1, 2]
+        @test arrowtypes_test_extension_name(field) ==
+              String(ARROWTYPES_TEST_FLEX_TUPLE_NAME)
+
+        # Streamed partitions take the schema from the first: an empty one
+        # plans null and one shape plans one fixed-size list, so later rows
+        # that need another type are refused, naming the difference.
+        for (parts, message) in (
+            ((value=Flex[],), (value=values,)) => "declared it null",
+            ((value=values[1:1],), (value=values[2:2],)) => "writes as fixed_size_list[2]",
+        )
+            err = try
+                arrowtypes_test_bytes(Tables.partitioner(parts); file)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ArgumentError
+            @test occursin(message, sprint(showerror, err))
         end
     end
 
@@ -4212,7 +4219,8 @@ end
             table = Arrow.Table(bytes)
             @test getproperty.(table.value, :value) == getproperty.(parityvalues, :value)
             field, batches = arrowtypes_test_core_parts(bytes)
-            dictionary = first(batches).columns[1].dictionary
+            # Split partitions extend the first partition's pool by a delta.
+            dictionary = last(batches).columns[1].dictionary
             @test length(dictionary) == 4
             valuefield = ARROWTYPES_TEST_AC.dictvaluefield(field, field.type)
             @test ARROWTYPES_TEST_AC.materialize(valuefield, dictionary) ==
@@ -5415,24 +5423,19 @@ end
         @test (field.type::ARROWTYPES_TEST_AC.DictionaryType).valuetype isa
               ARROWTYPES_TEST_AC.UnionType
         @test length(batches) == 2
-        @test batches[1].columns[1].dictionary === batches[2].columns[1].dictionary
+        # The second partition's categories extend the first's pool (a file
+        # reader applies every dictionary batch before the record batches).
+        @test length(batches[1].columns[1].dictionary) == (file ? 4 : 2)
+        @test length(batches[2].columns[1].dictionary) == 4
     end
 
+    # The schema comes from the first partition, which has no value to type.
     later = Tables.partitioner((
         (value=Arrow.DictEncode(Missing[missing]),),
         (value=Arrow.DictEncode(N[1, "two", missing]),),
     ))
-    laterexpected = N[missing, 1, "two", missing]
     for file in (false, true)
-        bytes = arrowtypes_test_bytes(later; file=file)
-        table = Arrow.Table(bytes)
-        @test isequal(table.value, laterexpected)
-        @test typeof.(table.value) == typeof.(laterexpected)
-        field, batches = arrowtypes_test_core_parts(bytes)
-        @test field.nullable
-        @test (field.type::ARROWTYPES_TEST_AC.DictionaryType).valuetype isa
-              ARROWTYPES_TEST_AC.UnionType
-        @test batches[1].columns[1].dictionary === batches[2].columns[1].dictionary
+        @test_throws ArgumentError arrowtypes_test_bytes(later; file=file)
     end
 end
 
@@ -5496,7 +5499,9 @@ end
         field, batches = arrowtypes_test_core_parts(bytes)
         @test (field.type::ARROWTYPES_TEST_AC.DictionaryType).valuetype isa
               ARROWTYPES_TEST_AC.UnionType
-        @test batches[1].columns[1].dictionary === batches[2].columns[1].dictionary
+        # The second partition's category extends the first's pool.
+        @test length(batches[1].columns[1].dictionary) == (file ? 2 : 1)
+        @test length(batches[2].columns[1].dictionary) == 2
     end
 end
 
@@ -5639,12 +5644,14 @@ end
         bytes = arrowtypes_test_bytes(mixedparts; file=file)
         table = Arrow.Table(bytes)
         @test table.value == Int32[1, 2, 3, 4]
-        @test eltype(table.value) === Int32
+        # Several partitions declare every field nullable.
+        @test eltype(table.value) === Union{Missing,Int32}
         field, batches = arrowtypes_test_core_parts(bytes)
         @test field.type isa ARROWTYPES_TEST_AC.DictionaryType
         @test field.type.valuetype isa ARROWTYPES_TEST_AC.IntType
         @test length(batches) == 2
-        @test batches[1].columns[1].dictionary === batches[2].columns[1].dictionary
+        @test length.(getproperty.(first.(getproperty.(batches, :columns)), :dictionary)) ==
+              (file ? [4, 4] : [2, 4])
     end
 
     abstractparts = Tables.partitioner((
@@ -5666,12 +5673,13 @@ end
         bytes = arrowtypes_test_bytes(abstractparts; file=file)
         table = Arrow.Table(bytes)
         @test table.value == Int32[5, 6, 7]
-        @test eltype(table.value) === Int32
+        @test eltype(table.value) === Union{Missing,Int32}
         field, batches = arrowtypes_test_core_parts(bytes)
         @test field.type isa ARROWTYPES_TEST_AC.DictionaryType
         @test field.type.valuetype isa ARROWTYPES_TEST_AC.IntType
         @test length(batches) == 2
-        @test batches[1].columns[1].dictionary === batches[2].columns[1].dictionary
+        @test length.(getproperty.(first.(getproperty.(batches, :columns)), :dictionary)) ==
+              (file ? [3, 3] : [2, 3])
     end
 
     Mixed = ArrowTypesTestAbstractMixedWrite
@@ -5723,17 +5731,24 @@ end
             ARROWTYPES_TEST_AC.dictvaluefield(controlfield, controlfield.type)
         for (label, layout, expected) in layouts
             @testset "$label ($(file ? "file" : "stream"))" begin
-                bytes = arrowtypes_test_bytes(layout; file)
-                table = Arrow.Table(bytes)
-                @test isequal(table.value, expected)
-                field, batches = arrowtypes_test_core_parts(bytes)
-                valuefield = ARROWTYPES_TEST_AC.dictvaluefield(field, field.type)
-                @test arrowtypes_test_field_contract_equal(controlvaluefield, valuefield)
-                @test all(
-                    batch ->
-                        batch.columns[1].dictionary === batches[1].columns[1].dictionary,
-                    batches,
-                )
+                if label != "one partition"
+                    # Streamed partitions take the value type from the first;
+                    # a later partition must plan the same one (here the
+                    # union of both branches), which these do not.
+                    @test_throws ArgumentError arrowtypes_test_bytes(layout; file)
+                else
+                    bytes = arrowtypes_test_bytes(layout; file)
+                    table = Arrow.Table(bytes)
+                    @test isequal(table.value, expected)
+                    field, batches = arrowtypes_test_core_parts(bytes)
+                    valuefield = ARROWTYPES_TEST_AC.dictvaluefield(field, field.type)
+                    @test arrowtypes_test_field_contract_equal(
+                        controlvaluefield,
+                        valuefield,
+                    )
+                    @test length(last(batches).columns[1].dictionary) ==
+                          length(unique(expected))
+                end
             end
         end
     end
@@ -5782,11 +5797,12 @@ end
     end
 end
 
-@testset "partitioned DictEncode uses later type evidence" begin
+@testset "partitioned DictEncode takes its value type from the first partition" begin
     expected = Union{Missing,Int64}[missing, missing, 3, 4]
     for file in (false, true)
+        # An all-missing first partition types the pool from its element type.
         parts = Tables.partitioner((
-            (value=Arrow.DictEncode(Missing[missing, missing]),),
+            (value=Arrow.DictEncode(Union{Missing,Int64}[missing, missing]),),
             (value=Arrow.DictEncode(Int64[3, 4]),),
         ))
         bytes = arrowtypes_test_bytes(parts; file=file)
@@ -5803,33 +5819,51 @@ end
         @test isequal(batches[1].value, Union{Missing,Int64}[missing, missing])
         @test batches[2].value == Int64[3, 4]
 
-        allnull = Tables.partitioner((
-            (value=Arrow.DictEncode(Missing[missing]),),
-            (value=Arrow.DictEncode(Missing[]),),
-        ))
-        err = try
-            arrowtypes_test_bytes(allnull; file=file)
-            nothing
-        catch e
-            e
+        # Without an element type, later partitions cannot supply it.
+        for first in (Missing[missing, missing], Missing[missing])
+            untyped = Tables.partitioner((
+                (value=Arrow.DictEncode(first),),
+                (value=Arrow.DictEncode(Int64[3, 4]),),
+            ))
+            err = try
+                arrowtypes_test_bytes(untyped; file=file)
+                nothing
+            catch e
+                e
+            end
+            @test err isa ArgumentError
+            @test occursin("cannot infer a dictionary value type", sprint(showerror, err))
         end
-        @test err isa ArgumentError
-        @test occursin("cannot infer a dictionary value type", sprint(showerror, err))
     end
 end
 
 @testset "partitioned DictEncode enforces public-domain value agreement" begin
     Point = ArrowTypesTestPoint{:dictionary}
     expected = Point[Point(Int32(1), Int32(2)), Point(Int32(3), Int32(4))]
+    concretefirst = Tables.partitioner((
+        (point=Arrow.DictEncode(Point[]),),
+        (point=Arrow.DictEncode(expected),),
+    ))
     abstractfirst = Tables.partitioner((
         (point=Arrow.DictEncode(ArrowTypesTestPoint[]),),
         (point=Arrow.DictEncode(expected),),
     ))
     for file in (false, true)
-        table = Arrow.Table(arrowtypes_test_bytes(abstractfirst; file=file))
+        table = Arrow.Table(arrowtypes_test_bytes(concretefirst; file=file))
         @test table.point == expected
-        @test eltype(table.point) === Point
+        # Several partitions declare every field nullable.
+        @test eltype(table.point) === Union{Missing,Point}
         @test DataAPI.colmetadata(table, :point, "ARROW:extension:metadata") == "dictionary"
+        # An empty first partition of the abstract type declares the label
+        # without metadata, which the later Point{:dictionary} values lack.
+        err = try
+            arrowtypes_test_bytes(abstractfirst; file=file)
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError
+        @test occursin("different extension type", sprint(showerror, err))
     end
 
     Left = ArrowTypesTestPoint{:left}
@@ -5846,7 +5880,7 @@ end
             e
         end
         @test err isa ArgumentError
-        @test occursin("different ordered metadata", sprint(showerror, err))
+        @test occursin("does not conform", sprint(showerror, err))
     end
 end
 
@@ -5887,11 +5921,13 @@ end
         source = getfield(stream, :src)
         budget = getfield(stream, :budget)
         batches = [Arrow._batch(source, i, budget) for i = 1:2]
-        @test batches[1].columns[1].dictionary === batches[2].columns[1].dictionary
+        # The all-missing first partition writes an empty pool; the second's
+        # categories extend it.
+        @test length(batches[1].columns[1].dictionary) == (file ? 2 : 0)
         valuefield = ARROWTYPES_TEST_AC.dictvaluefield(field, field.type)
         @test ARROWTYPES_TEST_AC.materialize(
             valuefield,
-            batches[1].columns[1].dictionary,
+            batches[2].columns[1].dictionary,
         ) == Any[
             Pair{String,Any}["y" => Int32(2), "x" => Int32(1)],
             Pair{String,Any}["y" => Int32(4), "x" => Int32(3)],
@@ -5913,8 +5949,7 @@ end
         rewritten_budget = getfield(rewritten_stream, :budget)
         rewritten_batches =
             [Arrow._batch(rewritten_source, i, rewritten_budget) for i = 1:2]
-        @test rewritten_batches[1].columns[1].dictionary ===
-              rewritten_batches[2].columns[1].dictionary
+        @test length(rewritten_batches[2].columns[1].dictionary) == 2
     end
 end
 

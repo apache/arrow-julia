@@ -101,7 +101,8 @@ const SEED = SeededFuzz.DEFAULT_SEED
         statssnapshot = SeededFuzz._exercise_mutation(statsentry.bytes, :stats_filtered)
         @test statssnapshot.nrows == 2
         @test statssnapshot.names == [:id]
-        @test statssnapshot.eltypes == Type[Int64]
+        # The corpus table has two partitions, so every field is nullable.
+        @test statssnapshot.eltypes == Type[Union{Missing,Int64}]
         @test only(statssnapshot.values) == Int64[4, 5]
         statsfile = Arrow.readfile(copy(statsentry.bytes))
         recordspans = [(block[1], block[2] + block[3]) for block in statsfile.recordblocks]

@@ -38,7 +38,7 @@ Arrow.readrange(s::BytesSource, off, len) = s.data[(off + 1):(off + len)]
 
 const FIXTURES = joinpath(@__DIR__, "fixtures-dictionaries")
 
-function dictmessage!(out, id, vf, pool, delta, codec, state)
+function dictmessage(id, vf, pool, delta, codec, state)
     cursor = Arrow.EncodeCursor(codec, state)
     Arrow.encodefield!(cursor, vf, pool)
     builder = FB.Builder(1024)
@@ -52,8 +52,8 @@ function dictmessage!(out, id, vf, pool, delta, codec, state)
     Meta.messageAddVersion(builder, Meta.MetadataVersion.V5)
     Meta.messageAddHeaderType(builder, Meta.DictionaryBatch)
     Meta.messageAddHeader(builder, header)
-    Meta.messageAddBodyLength(builder, Int64(length(cursor.body)))
-    Arrow._finishmessage!(out, builder, Meta.messageEnd(builder), cursor.body)
+    Meta.messageAddBodyLength(builder, cursor.bodylen)
+    return Arrow._messageheader(builder, Meta.messageEnd(builder), cursor.bodylen), cursor
 end
 
 # Test-only producer can deliberately emit malformed state transitions. It
@@ -66,15 +66,8 @@ function fixture(vf, events; file=false, features=Int64[], compress=:none)
     state = Arrow.beginwrite!(io, schema; file, features, compress)
     nested = IdDict{AC.Field,AC.ArrayData}()
     function emit!(callback, blocks)
-        out = UInt8[]
-        if file
-            Arrow._fileblock!(state, out, blocks) do
-                callback(out)
-            end
-        else
-            callback(out)
-        end
-        Arrow._publish!(state, out)
+        header, body = callback()
+        Arrow._publishmessages!(state, [(header, body, file ? blocks : nothing)])
     end
     try
         for (delta, pool, indices) in events
@@ -82,9 +75,8 @@ function fixture(vf, events; file=false, features=Int64[], compress=:none)
             # snapshot is a full replacement under the same nested id.
             for (nf, np) in Arrow.dictionarypools((vf,), (pool,))
                 get(nested, nf, nothing) === np && continue
-                emit!(state.dictblocks) do out
-                    dictmessage!(
-                        out,
+                emit!(state.dictblocks) do
+                    dictmessage(
                         state.ids[nf],
                         AC.dictvaluefield(nf, nf.type),
                         np,
@@ -95,16 +87,8 @@ function fixture(vf, events; file=false, features=Int64[], compress=:none)
                 end
                 nested[nf] = np
             end
-            emit!(state.dictblocks) do out
-                dictmessage!(
-                    out,
-                    state.ids[field],
-                    vf,
-                    pool,
-                    delta,
-                    state.codec,
-                    state.state,
-                )
+            emit!(state.dictblocks) do
+                dictmessage(state.ids[field], vf, pool, delta, state.codec, state.state)
             end
             indices === nothing && continue
             column = AC.ArrayData(
@@ -115,8 +99,8 @@ function fixture(vf, events; file=false, features=Int64[], compress=:none)
                 nullcount=0,
             )
             batch = AC.RecordBatch(schema, [column], length(indices))
-            emit!(state.recordblocks) do out
-                Arrow._recordmessage!(out, batch, schema.fields, state.codec, state.state)
+            emit!(state.recordblocks) do
+                Arrow._recordmessage(batch, schema.fields, state.codec, state.state)
             end
         end
         Arrow.finishwrite!(state)

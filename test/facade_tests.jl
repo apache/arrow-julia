@@ -1024,11 +1024,22 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             Tables.partitioner([(x=Int64[1],), (y=Int64[2],)]);
             file=false,
         )
+        # The schema comes from the first partition: a later Int32 column
+        # widens into its int64 field; a Float64 column cannot.
         @test_throws ArgumentError Arrow.write(
             io,
-            Tables.partitioner([(x=Int64[1],), (x=Int32[2],)]);
+            Tables.partitioner([(x=Int64[1],), (x=Float64[2.5],)]);
             file=false,
         )
+        bytes = take!(
+            Arrow.write(
+                IOBuffer(),
+                Tables.partitioner([(x=Int64[1],), (x=Int32[2],)]);
+                file=false,
+            ),
+        )
+        @test isequal(Arrow.Table(bytes).x, [1, 2])
+        @test eltype(Arrow.Table(bytes).x) === Union{Missing,Int64}
     end
 
     @testset "schema is the authority for facade eltypes" begin

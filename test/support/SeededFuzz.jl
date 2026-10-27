@@ -1258,9 +1258,10 @@ function _run_statistics_pruning()
     stream = Arrow.readstream(streambytes)
     bytes = Arrow.statsfile(stream.schema, stream.batches)
     scan = Tables.Scan(select=(:x,), filter=Tables.col(:x) > 7)
+    # Several partitions write every field nullable.
     reference = Tables.scan(
         (
-            x=reduce(vcat, getproperty.(parts, :x)),
+            x=Vector{Union{Missing,Int64}}(reduce(vcat, getproperty.(parts, :x))),
             payload=reduce(vcat, getproperty.(parts, :payload)),
         ),
         scan,

@@ -153,9 +153,7 @@ stream = Arrow.Stream("big.arrow"; limits = trusted_limits)
 A **stream-format** source is read to the end and every batch is decoded when
 the `Stream` is constructed. A file-format `IO` or byte-vector input is
 also read to the end (the whole source is held in memory), but its record
-batches are still decoded lazily, one per iteration. `Arrow.write`
-materializes every partition before writing (see
-[Writing](@ref "manual-writing")), so it does not bound memory either.
+batches are still decoded lazily, one per iteration.
 
 ### Metadata
 
@@ -415,11 +413,15 @@ batches of at most `batchsize` rows (default 1,048,576), so
 whose strings, bytes, or lists would pass the 2 GiB that 32-bit offsets address
 is cut smaller; `largelists = true` declares 64-bit offsets (LargeUtf8,
 LargeBinary, LargeList) instead. `dictencode` dictionary-encodes every column
-(`true`) or the named ones. The writer is eager and whole-buffer: every partition is materialized, encoded
-and validated in memory, then the complete IPC bytes are written to the
-sink once — it holds the whole table, so it is not a bounded-memory path
-for sources larger than RAM. Use [`Arrow.Writer`](@ref) when tables must be
-published incrementally.
+(`true`) or the named ones.
+
+The writer streams: each partition is read, encoded, and published before the
+next one is requested, so `Arrow.write("big.arrow", CSV.Chunks("big.csv"))`
+holds about one partition at a time. A source with several partitions takes its
+schema from the first partition, with every field nullable; later partitions
+must conform to it (numbers widen losslessly) and dictionary columns grow with
+delta batches, as for [`Arrow.Writer`](@ref). Use `Arrow.Writer` when tables
+arrive one at a time.
 
 `compress` applies per-buffer LZ4 frame or Zstandard compression as
 defined by the IPC specification (buffers that do not shrink are stored
@@ -503,7 +505,7 @@ Union may have at most 32 declared members.
 
 An abstract or `Any` element type does not declare those member types. When
 Arrow.jl must infer writer or storage types from runtime values, it accepts at
-most 8 distinct types across the complete column and all of its partitions.
+most 8 distinct types in a column (in each partition of a source with several).
 This rule includes abstract ArrowTypes.jl storage, dictionary pools, and
 retained registered ArrowTypes.jl columns. Use an explicit declared `Union`
 when a column intentionally has more types. This separate limit bounds

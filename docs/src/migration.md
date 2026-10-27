@@ -156,9 +156,8 @@ one base per dictionary id followed by deltas, but not replacements.
 
 ## Writing
 
-`Arrow.write` is eager. It materializes and validates all input partitions,
-builds the complete IPC output, and then writes it to the sink. Arrow 3.0 does
-not provide these Arrow 2.x features:
+`Arrow.write` streams partition by partition, as Arrow 2.x did. Arrow 3.0
+keeps or changes these Arrow 2.x features:
 
 | Arrow 2.x feature | Arrow 3.0 action |
 |---|---|

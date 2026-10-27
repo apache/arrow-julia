@@ -295,19 +295,19 @@ end
 _pad8!(bytes::Vector{UInt8}) = append!(bytes, zeros(UInt8, mod(-length(bytes), 8)))
 
 """
-Finish the current builder content as one framed message: continuation
-marker, padded metadata length, metadata, then the (already padded) body.
+The framing prefix of a message: continuation marker, padded metadata length,
+then the padded metadata. Its body (`bodylen` bytes, already padded) follows.
 """
-function _finishmessage!(out::Vector{UInt8}, b::FB.Builder, msg, body::Vector{UInt8})
+function _messageheader(b::FB.Builder, msg, bodylen::Int64)
     FB.finish!(b, msg)
     meta = collect(FB.finishedbytes(b))
     _pad8!(meta)
-    length(body) % 8 == 0 || throw(ArgumentError("message body must be padded"))
-    sizehint!(out, length(out) + 8 + length(meta) + length(body))
-    append!(out, reinterpret(UInt8, UInt32[CONTINUATION, UInt32(length(meta))]))
-    append!(out, meta)
-    append!(out, body)
-    return out
+    bodylen % 8 == 0 || throw(ArgumentError("message body must be padded"))
+    header = UInt8[]
+    sizehint!(header, 8 + length(meta))
+    append!(header, reinterpret(UInt8, UInt32[CONTINUATION, UInt32(length(meta))]))
+    append!(header, meta)
+    return header
 end
 
 function _metaschema!(
@@ -347,27 +347,44 @@ function _schemamessage!(
     Meta.messageAddVersion(b, Meta.MetadataVersion.V5)
     Meta.messageAddHeaderType(b, Meta.Schema)
     Meta.messageAddHeader(b, schoff)
-    return _finishmessage!(out, b, Meta.messageEnd(b), UInt8[])
+    return append!(out, _messageheader(b, Meta.messageEnd(b), Int64(0)))
 end
 
 # ---------------------------------------------------------------------------
 # THE generic encoder: registry-driven node/buffer emission
 # ---------------------------------------------------------------------------
 
+# A message body is the list of its pieces, each followed by zero padding to
+# a multiple of 8 bytes. Uncompressed pieces are the column buffers
+# themselves, so `_writebody` streams them to the sink without a body copy.
 mutable struct EncodeCursor
     nodes::Vector{NTuple{2,Int64}}       # (length, null_count), forward order
     buffers::Vector{NTuple{2,Int64}}     # (offset, length), forward order
-    body::Vector{UInt8}
+    body::Vector{AC.BufferSlice}         # body pieces, in order
+    bodylen::Int64                       # padded body length
     codec::Int8
     state::Union{Nothing,EncodeState}
     variadics::Vector{Int64}             # per view field, depth-first order
 end
-EncodeCursor(codec::Int8, state::Union{Nothing,EncodeState}) =
-    EncodeCursor(NTuple{2,Int64}[], NTuple{2,Int64}[], UInt8[], codec, state, Int64[])
+EncodeCursor(codec::Int8, state::Union{Nothing,EncodeState}) = EncodeCursor(
+    NTuple{2,Int64}[],
+    NTuple{2,Int64}[],
+    AC.BufferSlice[],
+    Int64(0),
+    codec,
+    state,
+    Int64[],
+)
 
 function _compressbytes(state::EncodeState, codec::Int8, raw::Vector{UInt8})
     codec == CODEC_LZ4_FRAME && return transcode(_lz4c!(state), raw)
     return transcode(_zstdc!(state), raw)
+end
+
+function _addpiece!(c::EncodeCursor, b::AC.BufferSlice)
+    push!(c.body, b)
+    c.bodylen = AC.checked_add(c.bodylen, (b.len + 7) & ~Int64(7))
+    return nothing
 end
 
 """
@@ -378,50 +395,43 @@ payload. Zero-length buffers write no body bytes in either mode. The recorded
 Buffer length is the wire length; 8-byte alignment padding sits between
 buffers and belongs to neither.
 """
-function encodebuffer!(c::EncodeCursor, bytes::Vector{UInt8})
-    offset = Int64(length(c.body))
-    offset % 8 == 0 || throw(ArgumentError("encoder lost body alignment"))
-    if isempty(bytes)
+encodebuffer!(c::EncodeCursor, bytes::Vector{UInt8}) =
+    encodebuffer!(c, AC.BufferSlice(AC.heapregion(bytes), 0, length(bytes)))
+
+function encodebuffer!(c::EncodeCursor, b::AC.BufferSlice)
+    offset = c.bodylen
+    if b.len == 0
         push!(c.buffers, (offset, Int64(0)))
         return nothing
     end
+    b.region === nothing && throw(ArgumentError("empty buffer has no data"))
     if c.codec == CODEC_NONE
-        append!(c.body, bytes)
-        push!(c.buffers, (offset, Int64(length(bytes))))
-        _pad8!(c.body)
+        push!(c.buffers, (offset, b.len))
+        _addpiece!(c, b)
         return nothing
     end
-    compressed = _compressbytes(c.state::EncodeState, c.codec, bytes)
-    if length(compressed) < length(bytes)
-        append!(c.body, reinterpret(UInt8, Int64[Int64(length(bytes))]))
-        append!(c.body, compressed)
-        push!(c.buffers, (offset, Int64(8 + length(compressed))))
-    else
-        append!(c.body, reinterpret(UInt8, Int64[Int64(-1)]))
-        append!(c.body, bytes)
-        push!(c.buffers, (offset, Int64(8 + length(bytes))))
-    end
-    _pad8!(c.body)
+    raw = AC.slicebytes(b)
+    compressed = _compressbytes(c.state::EncodeState, c.codec, raw)
+    shrinks = length(compressed) < length(raw)
+    payload = shrinks ? compressed : raw
+    prefix = Int64[shrinks ? length(raw) : -1]
+    _addpiece!(c, AC.BufferSlice(AC.heapregion(prefix), 0, 8))
+    _addpiece!(c, AC.BufferSlice(AC.heapregion(payload), 0, length(payload)))
+    push!(c.buffers, (offset, Int64(8 + length(payload))))
     return nothing
 end
 
-# An uncompressed buffer is copied straight from its slice into the body;
-# compression needs the slice as a vector first.
-function encodebuffer!(c::EncodeCursor, b::AC.BufferSlice)
-    c.codec == CODEC_NONE || return encodebuffer!(c, AC.slicebytes(b))
-    offset = Int64(length(c.body))
-    offset % 8 == 0 || throw(ArgumentError("encoder lost body alignment"))
-    n = Int64(b.len)
-    if n > 0
-        b.region === nothing && throw(ArgumentError("empty buffer has no data"))
-        resize!(c.body, offset + n)
-        # Preserve both owners across the raw copy.
-        GC.@preserve b c begin
-            unsafe_copyto!(pointer(c.body, offset + 1), AC.sliceptr(b), n)
-        end
+const _PADDING = ntuple(k -> zeros(UInt8, k), 7)
+
+"Write a message body: each piece, then its zero padding to 8 bytes."
+function _writebody(io::IO, c::EncodeCursor)
+    for b in c.body
+        # An uncopied array over the piece; preserving the piece keeps its
+        # owner alive across the write.
+        GC.@preserve b Base.write(io, unsafe_wrap(Array, AC.sliceptr(b), Int(b.len)))
+        pad = Int((-b.len) & 7)
+        pad > 0 && Base.write(io, _PADDING[pad])
     end
-    push!(c.buffers, (offset, n))
-    n > 0 && _pad8!(c.body)
     return nothing
 end
 
@@ -632,7 +642,7 @@ end
 
 # Padded byte size of a column's buffers, children included and dictionary
 # pools excluded (they travel in their own messages): the uncompressed body
-# size, used to size the body once instead of growing it per buffer.
+# size.
 function _bodybytes(d::ArrayData)
     n = Int64(0)
     for b in d.buffers
@@ -655,15 +665,14 @@ function _outputhint(batches, codec::Int8)
     return Int(n)
 end
 
-function _recordmessage!(
-    out::Vector{UInt8},
+"A record batch message as its header and its body's `EncodeCursor`."
+function _recordmessage(
     batch::AC.RecordBatch,
     fields,
     codec::Int8,
     state::Union{Nothing,EncodeState},
 )
     c = EncodeCursor(codec, state)
-    codec == CODEC_NONE && sizehint!(c.body, sum(_bodybytes, batch.columns; init=Int64(0)))
     for (f, col) in zip(fields, batch.columns)
         encodefield!(c, f, col)
     end
@@ -673,12 +682,12 @@ function _recordmessage!(
     Meta.messageAddVersion(b, Meta.MetadataVersion.V5)
     Meta.messageAddHeaderType(b, Meta.RecordBatch)
     Meta.messageAddHeader(b, rb)
-    Meta.messageAddBodyLength(b, Int64(length(c.body)))
-    return _finishmessage!(out, b, Meta.messageEnd(b), c.body)
+    Meta.messageAddBodyLength(b, c.bodylen)
+    return _messageheader(b, Meta.messageEnd(b), c.bodylen), c
 end
 
-function _dictionarymessage!(
-    out::Vector{UInt8},
+"A dictionary batch message as its header and its body's `EncodeCursor`."
+function _dictionarymessage(
     id::Int64,
     vf::Field,
     pool::ArrayData,
@@ -699,8 +708,8 @@ function _dictionarymessage!(
     Meta.messageAddVersion(b, Meta.MetadataVersion.V5)
     Meta.messageAddHeaderType(b, Meta.DictionaryBatch)
     Meta.messageAddHeader(b, dictbatch)
-    Meta.messageAddBodyLength(b, Int64(length(c.body)))
-    return _finishmessage!(out, b, Meta.messageEnd(b), c.body)
+    Meta.messageAddBodyLength(b, c.bodylen)
+    return _messageheader(b, Meta.messageEnd(b), c.bodylen), c
 end
 
 # ---------------------------------------------------------------------------
@@ -857,15 +866,24 @@ Which features must the schema declare for these batches? Replacement is
 detected by pool-identity change per id across the batch sequence
 (replacement-on-change); compression declares COMPRESSED_BODY.
 """
-function _streamfeatures(sch::Schema, batches, ids::IdDict{Field,Int64}, codec::Int8)
+function _streamfeatures(
+    sch::Schema,
+    batches,
+    ids::IdDict{Field,Int64},
+    codec::Int8,
+    deltas=nothing,
+)
     features = Int64[]
     current = Dict{Int64,ArrayData}()
     replacement = false
-    for batch in batches
+    for (k, batch) in enumerate(batches)
         for (f, pool) in dictionarypools(sch.fields, batch.columns)
             id = ids[f]
             old = get(current, id, nothing)
-            old === pool || old === nothing || (replacement = true)
+            old === pool ||
+                old === nothing ||
+                (deltas !== nothing && haskey(deltas[k], id)) ||
+                (replacement = true)
             current[id] = pool
         end
     end
@@ -882,15 +900,16 @@ end
 One in-progress IPC output. `beginwrite!` emits the schema message (and the
 file-format preamble), `writebatch!` validates and publishes one record batch
 (with any dictionary messages it needs), and `finishwrite!` emits the
-end-of-stream marker (and the file-format Footer). Batch bytes are staged in
-full and published to `io` once, so a validation or encoding failure never
-publishes a partial message — but the SINK gains bytes batch by batch, and an
-abandoned state leaves a torn stream or an unfooted file.
+end-of-stream marker (and the file-format Footer). A batch's messages are
+encoded before any of them is published, so a validation or encoding failure
+publishes nothing; each message is then written as its header followed by its
+body, uncompressed buffers straight from the columns. The SINK gains bytes
+batch by batch, and an abandoned state leaves a torn stream or an unfooted
+file.
 
 The eager `writestream`/`writefile` drive this same state over an in-memory
 sink, validating every batch up front (`validate=false` per batch) and
-passing the features their whole batch sequence implies, so their output is
-byte-identical to the pre-incremental writers.
+declaring only the features their whole batch sequence uses.
 """
 mutable struct IPCWriteState
     const io::IO
@@ -982,15 +1001,17 @@ function beginwrite!(
     return st
 end
 
-# Record one file-format Block around `emit!`: the Block offset is global
-# (bytes already published plus this staging buffer's position), and
-# metaDataLength spans prefix + metadata (up to the body start).
-function _fileblock!(emit!::F, st::IPCWriteState, out::Vector{UInt8}, blocks) where {F}
-    start = Int64(length(out))
-    emit!()
-    total = Int64(length(out)) - start
-    metalen = Int64(8) + Int64(reinterpret(UInt32, out[(start + 5):(start + 8)])[1])
-    push!(blocks, (st.written + start, metalen, total - metalen))
+# Publish staged messages in order: each header, then its body straight
+# from the column buffers. A file-format Block records the global offset,
+# the header length (prefix + metadata), and the body length.
+function _publishmessages!(st::IPCWriteState, messages)
+    for (header, body, blocks) in messages
+        blocks === nothing ||
+            push!(blocks, (st.written, Int64(length(header)), body.bodylen))
+        Base.write(st.io, header)
+        _writebody(st.io, body)
+        st.written += length(header) + body.bodylen
+    end
     return nothing
 end
 
@@ -1019,42 +1040,34 @@ function writebatch!(
         _checkbatches(st.schema, (batch,))
         _validatewriterbatch!(st.validated, st.schema, batch, st.ids)
     end
-    out = UInt8[]
+    # Stage every message (dictionaries first, then the record batch) and the
+    # pool updates, so a failure publishes nothing and changes no state.
+    messages = Tuple{Vector{UInt8},EncodeCursor,Any}[]
+    updates = Pair{Int64,ArrayData}[]
+    dictblocks = st.file ? st.dictblocks : nothing
     for (f, pool) in dictionarypools(st.schema.fields, batch.columns)
         id = st.ids[f]
         old = get(st.current, id, nothing)
         old === pool && continue
+        vf = AC.dictvaluefield(f, f.type::DictionaryType)
         delta = deltas === nothing || old === nothing ? nothing : get(deltas, id, nothing)
         if delta !== nothing
-            vf = AC.dictvaluefield(f, f.type::DictionaryType)
             old.len + delta.len == pool.len || throw(
                 ArgumentError("delta dictionary does not complete the pool for id $id"),
             )
             validate_semantic(vf, delta)
-            if st.file
-                _fileblock!(st, out, st.dictblocks) do
-                    _dictionarymessage!(
-                        out,
-                        id,
-                        vf,
-                        delta,
-                        st.codec,
-                        st.state;
-                        isdelta=true,
-                    )
-                end
-            else
-                _dictionarymessage!(out, id, vf, delta, st.codec, st.state; isdelta=true)
-            end
-            st.current[id] = pool
+            header, body =
+                _dictionarymessage(id, vf, delta, st.codec, st.state; isdelta=true)
+            push!(messages, (header, body, dictblocks))
+            push!(updates, id => pool)
             continue
         end
         if old !== nothing
-            vf = AC.dictvaluefield(f, f.type::DictionaryType)
             if st.file
-                # The file format carries one dictionary batch per id. A new
-                # pool object with identical content references the emitted
-                # batch; anything else is replacement, which files cannot say.
+                # The file format carries one dictionary per id, extended
+                # only by deltas. A new pool object with identical content
+                # references the emitted batches; anything else is
+                # replacement, which files cannot say.
                 _poolsequal(vf, old, pool) || throw(
                     ValidationError(
                         "column $(f.name) changed its existing dictionary " *
@@ -1063,7 +1076,7 @@ function writebatch!(
                         "the stream format for replacement",
                     ),
                 )
-                st.current[id] = pool
+                push!(updates, id => pool)
                 continue
             end
             if !(FEATURE_DICTIONARY_REPLACEMENT in st.features)
@@ -1077,28 +1090,20 @@ function writebatch!(
                         "stream with Arrow.Writer(...; dictreplacement=true))",
                     ),
                 )
-                st.current[id] = pool
+                push!(updates, id => pool)
                 continue
             end
         end
-        vf = AC.dictvaluefield(f, f.type::DictionaryType)
-        if st.file
-            _fileblock!(st, out, st.dictblocks) do
-                _dictionarymessage!(out, id, vf, pool, st.codec, st.state)
-            end
-        else
-            _dictionarymessage!(out, id, vf, pool, st.codec, st.state)
-        end
+        header, body = _dictionarymessage(id, vf, pool, st.codec, st.state)
+        push!(messages, (header, body, dictblocks))
+        push!(updates, id => pool)
+    end
+    header, body = _recordmessage(batch, st.schema.fields, st.codec, st.state)
+    push!(messages, (header, body, st.file ? st.recordblocks : nothing))
+    _publishmessages!(st, messages)
+    for (id, pool) in updates
         st.current[id] = pool
     end
-    if st.file
-        _fileblock!(st, out, st.recordblocks) do
-            _recordmessage!(out, batch, st.schema.fields, st.codec, st.state)
-        end
-    else
-        _recordmessage!(out, batch, st.schema.fields, st.codec, st.state)
-    end
-    _publish!(st, out)
     return nothing
 end
 
@@ -1273,8 +1278,9 @@ The file variant: leading magic, the same stream messages, an end-of-stream
 marker, then the Footer with its dictionary and record-batch Block indexes,
 the Int32 footer length, and the trailing magic. Footer bookkeeping is
 isolated here; message writing is the stream code above. The file format
-carries exactly one dictionary batch per id, so batches whose pools change
-identity are a clean refusal (the stream format handles replacement).
+carries one dictionary per id: a later pool that extends the previous one
+value by value is written as a delta dictionary batch, and any other pool
+change is a clean refusal (the stream format handles replacement).
 `dictids` preserves ids from a source table (the `IPCStream` form passes the
 reader's), so fields sharing one id keep sharing one dictionary batch,
 exactly as the source did.
@@ -1293,19 +1299,21 @@ function writefile(
     _checkbatches(sch, batches)
     _validatewriterschema(sch)
     ids = assigndictids(sch.fields, dictids)
-    # CODEC_NONE so this refusal sees only DICTIONARY_REPLACEMENT.
-    # COMPRESSED_BODY is legal in a file and is declared through the features
-    # below.
-    isempty(_streamfeatures(sch, batches, ids, CODEC_NONE)) || throw(
-        ValidationError(
-            "the IPC file format carries one dictionary batch per id; " *
-            "a dictionary with changing pools requires the stream format",
-        ),
-    )
     # Same shared-id contract as the stream writer: compatible value schemas,
     # one nested id topology, one pool per id within each batch.
     validatedictionaryids(sch.fields, IdDict{Field,Int64}(ids))
     _validatewriterbatches(sch, batches, ids)
+    deltas = _batchdeltas(sch, batches, ids)
+    # CODEC_NONE so this refusal sees only DICTIONARY_REPLACEMENT.
+    # COMPRESSED_BODY is legal in a file and is declared through the features
+    # below.
+    isempty(_streamfeatures(sch, batches, ids, CODEC_NONE, deltas)) || throw(
+        ValidationError(
+            "the IPC file format carries one dictionary per id, extended only " *
+            "by delta batches; a dictionary whose existing categories change " *
+            "requires the stream format",
+        ),
+    )
     io = IOBuffer(; sizehint=_outputhint(batches, codec))
     st = beginwrite!(
         io,
@@ -1314,11 +1322,11 @@ function writefile(
         compress=compress,
         compresslevel=compresslevel,
         dictids=dictids,
-        features=_streamfeatures(sch, batches, ids, codec),
+        features=_streamfeatures(sch, batches, ids, codec, deltas),
     )
     try
-        for batch in batches
-            writebatch!(st, batch; validate=false)
+        for (batch, delta) in zip(batches, deltas)
+            writebatch!(st, batch; validate=false, deltas=delta)
         end
         finishwrite!(st)
     finally
@@ -1329,6 +1337,18 @@ end
 
 writefile(s::IPCStream; compress::Symbol=:none) =
     writefile(s.schema, s.batches; compress=compress, dictids=s.fielddictids)
+
+# Each batch's delta dictionaries against the pools the batches before it use.
+function _batchdeltas(sch::Schema, batches, ids)
+    current = Dict{Int64,ArrayData}()
+    return map(batches) do batch
+        deltas = _dictionarydeltas(current, sch.fields, ids, batch)
+        for (f, pool) in dictionarypools(sch.fields, batch.columns)
+            current[ids[f]] = pool
+        end
+        deltas
+    end
+end
 
 # ---------------------------------------------------------------------------
 # File reader: footer verification + lazy random-access batch handle

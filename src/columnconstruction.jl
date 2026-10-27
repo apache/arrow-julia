@@ -543,7 +543,11 @@ function _copybytes!(data::Vector{UInt8}, pos::Int, x::AbstractString, n::Int)
     return nothing
 end
 
-"A utf8 or binary column (`t`), built in one pass over the values."
+"""
+A utf8 or binary column (`t`). One pass measures the values (offsets,
+validity, and the offset-range check), a second copies their bytes into a
+data buffer of the exact size.
+"""
 function _varbytespart(name::String, v::AbstractVector, t::AC.ArrowType)
     Offset = t.large ? Int64 : Int32
     return _varbytespart(name, v, t, Offset)
@@ -553,7 +557,6 @@ function _varbytespart(name::String, v::AbstractVector, t, ::Type{Offset}) where
     offsets = Vector{Offset}(undef, n + 1)
     offsets[1] = 0
     bits = zeros(UInt8, cld(n, 8))
-    data = UInt8[]
     pos = 0
     nc = 0
     for (i, x) in enumerate(v)
@@ -562,14 +565,21 @@ function _varbytespart(name::String, v::AbstractVector, t, ::Type{Offset}) where
         else
             m = _nbytes(x)
             pos <= typemax(Offset) - m || throw(_OffsetOverflow(name, 0, i))
-            pos + m > length(data) && resize!(data, max(2 * length(data), pos + m, 64))
-            _copybytes!(data, pos, x, m)
             pos += m
             @inbounds bits[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7)
         end
         @inbounds offsets[i + 1] = pos
     end
-    resize!(data, pos)
+    data = Vector{UInt8}(undef, pos)
+    for (i, x) in enumerate(v)
+        start = Int(@inbounds offsets[i])
+        m = Int(@inbounds offsets[i + 1]) - start
+        # Every data byte is written exactly once, even if a lazy column
+        # yields different values on the second pass.
+        (x === missing ? m == 0 : _nbytes(x) == m) ||
+            throw(ArgumentError("column $name changed while it was being written"))
+        x === missing || _copybytes!(data, start, x, m)
+    end
     validity =
         nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
     databuf = pos == 0 ? AC.BufferSlice() : AC._databuffer(data)
@@ -844,6 +854,10 @@ function _writerpromoteunion(T, S)
 end
 
 const _WRITER_CONVERSION_ERRORS = Union{MethodError,InexactError,OverflowError,TypeError}
+
+# Base's `convert(Missing, x)` raises a plain error; report a conversion error.
+_writerconvert(::Type{Missing}, value) =
+    value === missing ? missing : throw(MethodError(convert, (Missing, value)))
 
 function _writerconvert(::Type{T}, value) where {T}
     value isa T && return value
@@ -4142,38 +4156,34 @@ function _retainedvalidity(f::AC.Field, v::AbstractVector)
     return present
 end
 
+# The writer's utf8/binary builders, after checking the values against the
+# retained field: strings for utf8, byte vectors for binary.
 function _retainedvarbytes(f::AC.Field, v::AbstractVector)
     t = f.type::Union{AC.Utf8Type,AC.BinaryType}
-    present = _retainedvalidity(f, v)
+    utf8 = t isa AC.Utf8Type
     Offset = t.large ? Int64 : Int32
-    offsets = Vector{Offset}(undef, length(v) + 1)
-    offsets[1] = zero(Offset)
-    data = UInt8[]
-    for (i, x) in enumerate(v)
-        if x !== missing
-            bytes = if t isa AC.Utf8Type
-                x isa AbstractString ||
-                    throw(ArgumentError("column $(f.name) must contain string values"))
-                codeunits(x)
-            else
-                x isa AbstractVector{UInt8} || throw(
-                    ArgumentError("column $(f.name) must contain byte-vector values"),
-                )
-                x
-            end
-            length(data) <= typemax(Offset) - length(bytes) ||
-                throw(_OffsetOverflow(f.name, 0, i))
-            append!(data, bytes)
-        end
-        offsets[i + 1] = Offset(length(data))
+    _, d = if v isa (utf8 ? DataStrings.StringVector : DataStrings.BytesVector)
+        _packedpayloadpart(f.name, v.payloads, v.buffers, t, Offset, Missing <: eltype(v))
+    else
+        V = utf8 ? AbstractString : AbstractVector{UInt8}
+        Base.nonmissingtype(eltype(v)) <: V ||
+            all(x -> x === missing || x isa V, v) ||
+            throw(
+                ArgumentError(
+                    "column $(f.name) must contain " *
+                    (utf8 ? "string" : "byte-vector") *
+                    " values",
+                ),
+            )
+        _varbytespart(f.name, v, t, Offset)
     end
-    databuf = isempty(data) ? AC.BufferSlice() : AC._databuffer(data)
-    d = AC.ArrayData(
-        t,
-        length(v),
-        [AC._bitmapbuffer(present), AC._databuffer(offsets), databuf];
-        nullcount=count(!, present),
-    )
+    AC.nullcount(d) == 0 ||
+        f.nullable ||
+        throw(
+            ArgumentError(
+                "column $(f.name) holds missing values but its retained field is non-nullable",
+            ),
+        )
     return _retainedfield(f), d
 end
 
@@ -5275,11 +5285,25 @@ struct _MergedDictionaryPool{V<:AbstractVector}
     retainedprefix::Int
 end
 
+"""
+A dictionary pool hint whose first `prefix` categories are kept exactly (a
+pool already written or retained from an Arrow source); the categories after
+them are candidates, deduplicated by storage value like a column's own.
+"""
+struct _PoolHint{V<:AbstractVector}
+    values::V
+    prefix::Int
+end
+_hintvalues(hint::_PoolHint) = hint.values
+_hintvalues(hint::AbstractVector) = hint
+_hintprefix(hint::_PoolHint) = hint.prefix
+_hintprefix(hint::AbstractVector) = length(hint)
+
 function _mergeddictpool(poolhints; widen::Bool=false)
     hints = Any[pool for pool in poolhints if pool !== nothing]
     isempty(hints) && return nothing
-    values = _mergecategorypools(hints; widen)
-    return _MergedDictionaryPool(values, length(first(hints)))
+    values = _mergecategorypools(Any[_hintvalues(h) for h in hints]; widen)
+    return _MergedDictionaryPool(values, _hintprefix(first(hints)))
 end
 
 # Encoding identity belongs to the lowered Arrow storage domain. These
@@ -5463,7 +5487,11 @@ function _dictionarypool(vals, retainedpool; writetype=nothing)
         )
         pool = T[]
     else
-        pool = collect(retainedpool)
+        # New categories may be other types than the retained ones (writer
+        # values after a public pool read back): widen instead of converting.
+        T = eltype(retainedpool)
+        V = _dictvaluetype(vals)
+        pool = collect(V <: T ? T : typejoin(T, V), retainedpool)
     end
     # Dedup with the non-overloadable structural key `_compactdictionarypool`
     # also uses: public-domain values may overload `hash`/`isequal`, so only the
@@ -5748,6 +5776,20 @@ function _compactdictionarypool(
     0 <= retainedprefix <= d.len ||
         throw(ArgumentError("retained dictionary prefix is outside the candidate pool"))
     physical = _writerstoredcolumn(f, d)
+    selected, remap = _compactstorage(physical, retainedprefix)
+    length(selected) == length(physical) && return f, d, remap
+
+    compactfield, compactdata =
+        _rebuildwriterstorageselection(f, physical, selected, context)
+    return compactfield, compactdata, remap
+end
+
+"""
+The first occurrence of each distinct stored value (`selected`, positions in
+`physical`) and every position's 0-based index among them (`remap`). The
+first `retainedprefix` positions are all kept, in order.
+"""
+function _compactstorage(physical::Vector{Any}, retainedprefix::Int)
     remap = Vector{Int64}(undef, length(physical))
     selected = Int[]
     seen = Dict{_WriterStorageKey,Int64}()
@@ -5768,11 +5810,7 @@ function _compactdictionarypool(
         end
         remap[i] = index
     end
-    length(selected) == length(physical) && return f, d, remap
-
-    compactfield, compactdata =
-        _rebuildwriterstorageselection(f, physical, selected, context)
-    return compactfield, compactdata, remap
+    return selected, remap
 end
 
 function _remapdictionaryindices(indices, remap::Vector{Int64})
