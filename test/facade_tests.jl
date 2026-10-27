@@ -2812,6 +2812,12 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             d8,
         )
         @test eltype(t.x) == Bool && t.x == [false, true, true]
+        # A rewrite keeps the label and stores the values as 0 and 1.
+        bytes = take!(Arrow.write(IOBuffer(), t))
+        f = only(Arrow.readfile(bytes).schema.fields)
+        @test f.type == AC.IntType(8, true)
+        @test Dict(f.metadata)["ARROW:extension:name"] == "arrow.bool8"
+        @test Arrow.Table(bytes).x == [false, true, true]
         _, ds = AC.fromjulia("x", ["{\"a\": 1}", "[]"])
         for name in ("arrow.json", "arrow.opaque")
             f = AC.Field("x", AC.Utf8Type(false); nullable=false, metadata=ext(name))

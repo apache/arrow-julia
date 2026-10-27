@@ -4188,6 +4188,14 @@ function _checkpartitionfield(
     return nothing
 end
 
+_isbool8(f::AC.Field) =
+    f.type isa AC.IntType &&
+    f.type.bits == 8 &&
+    _fieldmetavalue(f, _EXTENSION_NAME_KEY) == "arrow.bool8"
+_bool8storage(v::AbstractVector) =
+    Missing <: eltype(v) ? Union{Missing,Int8}[x isa Bool ? Int8(x) : x for x in v] :
+    Int8[x isa Bool ? Int8(x) : x for x in v]
+
 function _retainedfield(f::AC.Field; children=collect(AC.Field, f.children))
     return AC.Field(
         f.name,
@@ -6049,6 +6057,17 @@ function _constructcolumnparts(
             "$(length(parts)) partitions",
         ),
     )
+    if retained !== nothing && _isbool8(retained)
+        # arrow.bool8 reads as Bool; its storage is Int8 0 or 1.
+        int8parts = AbstractVector[_bool8storage(p) for p in parts]
+        _, int8data = _constructcolumnparts(
+            name,
+            int8parts;
+            retained=_withoutownextension(retained),
+            metadata,
+        )
+        return _withfieldmetadata(_retainedfield(retained), metadata), int8data
+    end
     fieldname = String(name)
     nparts = length(parts)
     data = Vector{AC.ArrayData}(undef, nparts)
