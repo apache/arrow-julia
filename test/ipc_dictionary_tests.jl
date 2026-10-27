@@ -38,9 +38,10 @@ Arrow.readrange(s::BytesSource, off, len) = s.data[(off + 1):(off + len)]
 
 const FIXTURES = joinpath(@__DIR__, "fixtures-dictionaries")
 
-function dictmessage(id, vf, pool, delta, codec, state)
-    cursor = Arrow.EncodeCursor(codec, state)
+function dictmessage(id, vf, pool, delta, codec, states)
+    cursor = Arrow.EncodeCursor(codec)
     Arrow.encodefield!(cursor, vf, pool)
+    Arrow._compressbody!(cursor, states, 1)
     builder = FB.Builder(1024)
     rb = Arrow._batchheader!(builder, cursor, pool.len)
     Meta.dictionaryBatchStart(builder)
@@ -82,13 +83,13 @@ function fixture(vf, events; file=false, features=Int64[], compress=:none)
                         np,
                         false,
                         state.codec,
-                        state.state,
+                        state.states,
                     )
                 end
                 nested[nf] = np
             end
             emit!(state.dictblocks) do
-                dictmessage(state.ids[field], vf, pool, delta, state.codec, state.state)
+                dictmessage(state.ids[field], vf, pool, delta, state.codec, state.states)
             end
             indices === nothing && continue
             column = AC.ArrayData(
@@ -100,7 +101,7 @@ function fixture(vf, events; file=false, features=Int64[], compress=:none)
             )
             batch = AC.RecordBatch(schema, [column], length(indices))
             emit!(state.recordblocks) do
-                Arrow._recordmessage(batch, schema.fields, state.codec, state.state)
+                Arrow._recordmessage(batch, schema.fields, state.codec, state.states)
             end
         end
         Arrow.finishwrite!(state)

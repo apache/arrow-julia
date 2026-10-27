@@ -2910,6 +2910,41 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         end
     end
 
+    @testset "ntasks: the same bytes on any number of tasks" begin
+        n = 40_000
+        src = (;
+            i=collect(1:n),
+            s=[isodd(k) ? "short$k" : "a longer string value $k" for k = 1:n],
+            l=[collect(1:(k % 4)) for k = 1:n],
+            r=[(a=k, b=string(k)) for k = 1:n],
+            d=Arrow.DictEncode([string(k % 7) for k = 1:n]),
+        )
+        for compress in (nothing, :lz4, :zstd), file in (true, false)
+            one = take!(
+                Arrow.write(IOBuffer(), src; compress, file, ntasks=1, batchsize=9000),
+            )
+            many = take!(
+                Arrow.write(IOBuffer(), src; compress, file, ntasks=4, batchsize=9000),
+            )
+            @test one == many
+        end
+        @test_throws ArgumentError Arrow.write(IOBuffer(), src; ntasks=0)
+        # With several failing columns, the error is the first column's.
+        for ntasks in (1, 4)
+            err = try
+                Arrow.write(
+                    IOBuffer(),
+                    (; a=fill(Any[], 100_000), c=fill(Any[], 100_000));
+                    ntasks,
+                )
+                nothing
+            catch e
+                e
+            end
+            @test err isa ArgumentError && startswith(err.msg, "column a (child item)")
+        end
+    end
+
     @testset "write knobs: batchsize, compresslevel, dictencode, largelists" begin
         AC = Arrow.AC
         nbatches(bytes) = length(Arrow.readfile(bytes).recordblocks)

@@ -41,7 +41,8 @@ include("columnconstruction.jl")
 """
     Arrow.write(sink, table; file=true, compress=nothing, compresslevel=nothing,
                 batchsize=1_048_576, dictencode=false, largelists=false,
-                stringview=false, metadata=nothing, colmetadata=nothing)
+                stringview=false, metadata=nothing, colmetadata=nothing,
+                ntasks=Threads.nthreads())
     Arrow.write(sink; kwargs...)
 
 Write any Tables.jl source as Arrow IPC to `sink`, a file path or an `IO`, and
@@ -69,7 +70,9 @@ Keywords:
   is inherited from an `Arrow.Table` or `Arrow.Stream` when `metadata` is
   `nothing`, without inherited batch statistics, since values, columns, or
   batch boundaries may have changed.
-- `ntasks` is accepted; encoding runs on one task.
+- `ntasks`: how many tasks build a batch's columns and compress its buffers
+  (default `Threads.nthreads()`; `ntasks=1` runs on the calling task). The
+  output bytes are the same for any `ntasks`.
 
 Writing to an existing file writes a temporary file in the same directory
 and renames it over the old one when the output is complete, so a failed
@@ -256,6 +259,7 @@ mutable struct Writer
     const stringview::Bool
     const nullable::Bool
     const dictencode::Any
+    const ntasks::Int
     # Arrow.write's writer: nullability and dictionary index types come from
     # the input (one partition or several) instead of the Writer rules.
     const oneshot::Bool
@@ -279,8 +283,7 @@ function _writer(
     nullable::Bool=true,
     dictencode=false,
     oneshot::Bool=false,
-    # Accepted for the API's shared concurrency keyword; writes run on one task.
-    ntasks::Union{Nothing,Integer}=nothing,
+    ntasks::Integer=Threads.nthreads(),
     # Arrow 2.x writer keywords: accepted and ignored (with a one-time
     # warning each) so 2.x call sites keep working during migration.
     alignment=nothing,
@@ -298,6 +301,7 @@ function _writer(
     end
     codec = _codec(compress, compresslevel)
     batchsize = _checkbatchsize(batchsize)
+    ntasks >= 1 || throw(ArgumentError("ntasks must be at least 1, got $ntasks"))
     dictencode isa Bool ||
         all(n -> n isa Union{Symbol,AbstractString}, dictencode) ||
         throw(ArgumentError("dictencode must be true, false, or column names"))
@@ -329,6 +333,7 @@ function _writer(
             stringview,
             nullable,
             dictencode,
+            Int(ntasks),
             oneshot,
             nothing,
             Symbol[],
@@ -491,6 +496,7 @@ function _writebatch!(
             stringview=w.stringview,
             largelists=w.largelists,
             growable=(!w.oneshot || several),
+            ntasks=_batchtasks(w, nrows, length(names)),
         )
         # Fields are nullable so later missing values conform (a Writer, or
         # several input partitions); a retained schema keeps its own.
@@ -506,8 +512,17 @@ function _writebatch!(
         f.type isa AC.DictionaryType && !w.dictreplacement ?
         get(st.current, st.ids[f], nothing) : nothing for f in sch.fields
     ]
-    fields, coldata =
-        _constructconforming(names, [cols], Any[hints], sch, part; w.stringview, written)
+    fields, coldata = _constructconforming(
+        names,
+        [cols],
+        Any[hints],
+        sch,
+        part;
+        w.stringview,
+        w.largelists,
+        written,
+        ntasks=_batchtasks(w, nrows, length(names)),
+    )
     # A fresh Schema over the BUILT fields, so `writebatch!` re-checks them
     # against the writer's schema instead of trusting construction.
     batch = only(_tablebatches(AC.Schema(fields; metadata=sch.metadata), coldata, [nrows]))
@@ -527,6 +542,7 @@ function _beginwrite!(w::Writer, fields, retained, names=nothing)
         compress=w.compress,
         compresslevel=w.compresslevel,
         dictreplacement=w.dictreplacement,
+        ntasks=w.ntasks,
     )
     w.schema = sch
     w.names = names
@@ -1105,17 +1121,16 @@ function _constructcolumns(
     stringview::Bool=false,
     largelists::Bool=false,
     growable::Bool=false,
+    ntasks::Int=1,
 ) where {F}
     nparts = length(partcols)
-    ncols = length(names)
-    fields = Vector{AC.Field}(undef, ncols)
-    coldata = Vector{Vector{AC.ArrayData}}(undef, ncols)
     colmetamap = colmetadata === nothing ? nothing : Dict(colmetadata)
-    for j = 1:ncols
+    built = _tasksmap(length(names), ntasks) do j, _
         parts = AbstractVector[partcols[k][j] for k = 1:nparts]
         poolhints = Any[pools === nothing ? nothing : pools[j] for pools in partpools]
-        columnmeta = colmetamap === nothing ? nothing : get(colmetamap, names[j], nothing)
-        fields[j], coldata[j] = _constructcolumn(
+        columnmeta =
+            colmetamap === nothing ? nothing : get(colmetamap, names[j], nothing)
+        return _constructcolumn(
             names[j],
             parts;
             retained=retainedfield(j),
@@ -1127,8 +1142,14 @@ function _constructcolumns(
             growable=growable,
         )
     end
-    return fields, coldata
+    return AC.Field[first(b) for b in built], Vector{AC.ArrayData}[last(b) for b in built]
 end
+
+# Columns build in parallel when a batch holds enough values for the tasks to
+# pay for themselves (writing many small tables stays on one task).
+const _PARALLEL_CELLS = 1 << 16
+_batchtasks(w::Writer, nrows::Int, ncols::Int) =
+    nrows * ncols >= _PARALLEL_CELLS ? w.ntasks : 1
 
 # Construct the columns of a table that must conform to an existing schema:
 # a later `Arrow.Writer` table or an `Arrow.append` table. A facade source
@@ -1147,78 +1168,89 @@ function _constructconforming(
     sch::AC.Schema,
     @nospecialize(tbl);
     stringview::Bool=false,
+    largelists::Bool=false,
     written=nothing,
+    ntasks::Int=1,
 )
     retainedfield = j -> sch.fields[j]
     _retainedschema(tbl) === nothing ||
-        return _constructcolumns(names, partcols, partpools, retainedfield, nothing)
-    nparts = length(partcols)
-    fields = Vector{AC.Field}(undef, length(names))
-    coldata = Vector{Vector{AC.ArrayData}}(undef, length(names))
-    for j in eachindex(names)
-        expected = sch.fields[j]
-        parts = AbstractVector[partcols[k][j] for k = 1:nparts]
-        dictmismatch = nothing
-        if expected.type isa AC.DictionaryType && written !== nothing
-            conformed, dictmismatch =
-                _conformdictionary(names[j], parts, expected, written[j]; stringview)
-            if conformed !== nothing
-                fields[j], coldata[j] = conformed
-                continue
-            end
-        end
-        if expected.nullable &&
-           !(expected.type isa AC.DictionaryType) &&
-           all(p -> eltype(p) === Missing, parts)
-            # An all-missing column is all nulls of the field's type.
-            context = _WriterContext(String(names[j]))
-            fields[j] = expected
-            coldata[j] = AC.ArrayData[
-                last(_constructhiddenpart(expected, length(p), context)) for p in parts
-            ]
-            continue
-        end
-        fresh =
-            expected.type isa AC.DictionaryType ? nothing :
-            _freshcolumn(names[j], parts; stringview)
-        mismatch =
-            fresh === nothing ? dictmismatch : _conformancemismatch(expected, first(fresh))
-        if fresh !== nothing && mismatch !== nothing
-            # Missing values conform wherever the field is nullable, nested too.
-            fresh = _fillnulls(expected, fresh, _WriterContext(String(names[j])))
-            mismatch = _conformancemismatch(expected, first(fresh))
-        end
-        if fresh !== nothing && mismatch !== nothing
-            # Numbers widen losslessly into the field's type (Int32 into Int64).
-            widened = _widenparts(expected, parts)
-            if widened !== nothing
-                fresh = _freshcolumn(names[j], widened; stringview)
-                fresh === nothing ||
-                    _conformancemismatch(expected, first(fresh)) !== nothing ||
-                    (mismatch = nothing)
-            end
-        end
-        if fresh !== nothing && mismatch === nothing
-            fields[j], coldata[j] = expected, last(fresh)
-            continue
-        end
-        poolhints = Any[pools === nothing ? nothing : pools[j] for pools in partpools]
-        try
-            fields[j], coldata[j] =
-                _constructcolumn(names[j], parts; retained=expected, poolhints=poolhints)
-        catch err
-            # Report the schema difference of a column the writer mapping could
-            # build instead of the retained construction's value-domain error.
-            (err isa ArgumentError && mismatch !== nothing) || rethrow()
-            throw(
-                ArgumentError(
-                    "column $(names[j]) does not conform to the existing schema: " *
-                    mismatch,
-                ),
-            )
+        return _constructcolumns(names, partcols, partpools, retainedfield, nothing; ntasks)
+    built = _tasksmap(length(names), ntasks) do j, _
+        parts = AbstractVector[p[j] for p in partcols]
+        hints = Any[pools === nothing ? nothing : pools[j] for pools in partpools]
+        w = written === nothing ? nothing : written[j]
+        return _conformcolumn(
+            names[j],
+            parts,
+            hints,
+            sch.fields[j],
+            w;
+            stringview,
+            largelists,
+        )
+    end
+    return AC.Field[first(b) for b in built], Vector{AC.ArrayData}[last(b) for b in built]
+end
+
+"One column of `_constructconforming`: its field and its data per partition."
+function _conformcolumn(
+    name::Symbol,
+    parts,
+    poolhints,
+    expected::AC.Field,
+    written;
+    stringview::Bool,
+    largelists::Bool,
+)
+    dictmismatch = nothing
+    if expected.type isa AC.DictionaryType && written !== nothing
+        conformed, dictmismatch =
+            _conformdictionary(name, parts, expected, written; stringview)
+        conformed === nothing || return conformed
+    end
+    if expected.nullable &&
+       !(expected.type isa AC.DictionaryType) &&
+       all(p -> eltype(p) === Missing, parts)
+        # An all-missing column is all nulls of the field's type.
+        context = _WriterContext(String(name))
+        return expected,
+        AC.ArrayData[
+            last(_constructhiddenpart(expected, length(p), context)) for p in parts
+        ]
+    end
+    fresh =
+        expected.type isa AC.DictionaryType ? nothing :
+        _freshcolumn(name, parts; stringview, largelists)
+    mismatch =
+        fresh === nothing ? dictmismatch : _conformancemismatch(expected, first(fresh))
+    if fresh !== nothing && mismatch !== nothing
+        # Missing values conform wherever the field is nullable, nested too.
+        fresh = _fillnulls(expected, fresh, _WriterContext(String(name)))
+        mismatch = _conformancemismatch(expected, first(fresh))
+    end
+    if fresh !== nothing && mismatch !== nothing
+        # Numbers widen losslessly into the field's type (Int32 into Int64).
+        widened = _widenparts(expected, parts)
+        if widened !== nothing
+            fresh = _freshcolumn(name, widened; stringview, largelists)
+            fresh === nothing ||
+                _conformancemismatch(expected, first(fresh)) !== nothing ||
+                (mismatch = nothing)
         end
     end
-    return fields, coldata
+    fresh !== nothing && mismatch === nothing && return expected, last(fresh)
+    try
+        return _constructcolumn(name, parts; retained=expected, poolhints)
+    catch err
+        # Report the schema difference of a column the writer mapping could
+        # build instead of the retained construction's value-domain error.
+        (err isa ArgumentError && mismatch !== nothing) || rethrow()
+        throw(
+            ArgumentError(
+                "column $name does not conform to the existing schema: " * mismatch,
+            ),
+        )
+    end
 end
 
 """
@@ -1405,9 +1437,9 @@ _widens(::Type{S}, ::Type{T}) where {S<:Integer,T<:AbstractFloat} =
     S !== Bool && 8 * sizeof(S) < precision(T)
 _widens(::Type, ::Type) = false
 
-function _freshcolumn(name::Symbol, parts; stringview::Bool=false)
+function _freshcolumn(name::Symbol, parts; stringview::Bool=false, largelists::Bool=false)
     try
-        return _constructcolumn(name, parts; refpools=false, stringview)
+        return _constructcolumn(name, parts; refpools=false, stringview, largelists)
     catch err
         # The retained construction reports why this column cannot be written.
         err isa ArgumentError || rethrow()

@@ -169,7 +169,7 @@ end
             @test w.st.finished
             @test io.closes == Int(ownio)
             @test isopen(io) == !ownio
-            @test w.st.state === nothing || w.st.state.zstd === nothing
+            @test all(s -> s.zstd === nothing, w.st.states)
             @test close(w) === nothing
             @test io.closes == Int(ownio)
             io.closeerror = nothing

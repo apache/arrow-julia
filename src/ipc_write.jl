@@ -363,20 +363,24 @@ mutable struct EncodeCursor
     body::Vector{AC.BufferSlice}         # body pieces, in order
     bodylen::Int64                       # padded body length
     codec::Int8
-    state::Union{Nothing,EncodeState}
+    # A compressed body's buffers in order, compressed together by
+    # `_compressbody!` once the walk is done.
+    raw::Vector{AC.BufferSlice}
     variadics::Vector{Int64}             # per view field, depth-first order
 end
-EncodeCursor(codec::Int8, state::Union{Nothing,EncodeState}) = EncodeCursor(
+EncodeCursor(codec::Int8) = EncodeCursor(
     NTuple{2,Int64}[],
     NTuple{2,Int64}[],
     AC.BufferSlice[],
     Int64(0),
     codec,
-    state,
+    AC.BufferSlice[],
     Int64[],
 )
 
-function _compressbytes(state::EncodeState, codec::Int8, raw::Vector{UInt8})
+# One frame of the `len` bytes at `ptr`, compressed with `state`'s codec context.
+function _compressbytes(state::EncodeState, codec::Int8, ptr::Ptr{UInt8}, len::Int)
+    raw = unsafe_wrap(Array, ptr, len)
     codec == CODEC_LZ4_FRAME && return transcode(_lz4c!(state), raw)
     return transcode(_zstdc!(state), raw)
 end
@@ -391,41 +395,100 @@ end
 Append one buffer to the message body: raw bytes for uncompressed batches;
 for compressed batches, the spec's Int64 uncompressed-length prefix plus the
 frame, falling back to `-1` + raw whenever compression does not shrink the
-payload. Zero-length buffers write no body bytes in either mode. The recorded
-Buffer length is the wire length; 8-byte alignment padding sits between
-buffers and belongs to neither.
+payload (see `_compressbody!`). Zero-length buffers write no body bytes in
+either mode. The recorded Buffer length is the wire length; 8-byte alignment
+padding sits between buffers and belongs to neither.
 """
-function encodebuffer!(c::EncodeCursor, bytes::Vector{UInt8})
-    c.codec == CODEC_NONE || isempty(bytes) || return _encodecompressed!(c, bytes)
-    return encodebuffer!(c, AC.BufferSlice(AC.heapregion(bytes), 0, length(bytes)))
-end
+encodebuffer!(c::EncodeCursor, bytes::Vector{UInt8}) =
+    encodebuffer!(c, AC.BufferSlice(AC.heapregion(bytes), 0, length(bytes)))
 
 function encodebuffer!(c::EncodeCursor, b::AC.BufferSlice)
+    b.len == 0 || b.region !== nothing || throw(ArgumentError("empty buffer has no data"))
+    c.codec == CODEC_NONE || (push!(c.raw, b); return nothing)
     offset = c.bodylen
-    if b.len == 0
-        push!(c.buffers, (offset, Int64(0)))
-        return nothing
-    end
-    b.region === nothing && throw(ArgumentError("empty buffer has no data"))
-    if c.codec == CODEC_NONE
-        push!(c.buffers, (offset, b.len))
-        _addpiece!(c, b)
-        return nothing
-    end
-    # Compression reads the slice as a vector.
-    return _encodecompressed!(c, AC.slicebytes(b))
+    push!(c.buffers, (offset, Int64(b.len)))
+    b.len == 0 || _addpiece!(c, b)
+    return nothing
 end
 
-function _encodecompressed!(c::EncodeCursor, raw::Vector{UInt8})
-    offset = c.bodylen
-    compressed = _compressbytes(c.state::EncodeState, c.codec, raw)
-    shrinks = length(compressed) < length(raw)
-    payload = shrinks ? compressed : raw
-    prefix = Int64[shrinks ? length(raw) : -1]
-    _addpiece!(c, AC.BufferSlice(AC.heapregion(prefix), 0, 8))
-    _addpiece!(c, AC.BufferSlice(AC.heapregion(payload), 0, length(payload)))
-    push!(c.buffers, (offset, Int64(8 + length(payload))))
+# Bodies under this many raw bytes compress on one task.
+const _PARALLEL_BODY_BYTES = 1 << 20
+
+"""
+Compress a compressed message's buffers (`c.raw`), on up to `ntasks` tasks
+with one codec context each, and lay out the body in buffer order. Each
+buffer is its own frame, so the bytes do not depend on the task count.
+"""
+function _compressbody!(c::EncodeCursor, states::Vector{EncodeState}, ntasks::Int)
+    c.codec == CODEC_NONE && return nothing
+    raw = c.raw
+    total = sum(b -> Int64(b.len), raw; init=Int64(0))
+    k = total < _PARALLEL_BODY_BYTES ? 1 : ntasks
+    frames = _tasksmap(length(raw), k) do j, w
+        b = raw[j]
+        b.len == 0 && return nothing
+        frame = GC.@preserve b _compressbytes(
+            states[w],
+            c.codec,
+            AC.sliceptr(b),
+            Int(b.len),
+        )
+        return length(frame) < b.len ? frame : nothing
+    end
+    for (j, b) in enumerate(raw)
+        offset = c.bodylen
+        if b.len == 0
+            push!(c.buffers, (offset, Int64(0)))
+            continue
+        end
+        frame = frames[j]
+        prefix = Int64[frame === nothing ? -1 : b.len]
+        payload =
+            frame === nothing ? b : AC.BufferSlice(AC.heapregion(frame), 0, length(frame))
+        _addpiece!(c, AC.BufferSlice(AC.heapregion(prefix), 0, 8))
+        _addpiece!(c, payload)
+        push!(c.buffers, (offset, Int64(8 + payload.len)))
+    end
+    empty!(raw)
     return nothing
+end
+
+# The shared index counter of one parallel map.
+mutable struct _TaskQueue
+    @atomic next::Int
+end
+
+"""
+`f(j, w)` for `j` in `1:n` on up to `ntasks` tasks, results in index order;
+`w` numbers the task (1 to `ntasks`), for per-task state. A failure is
+rethrown after every index ran, the lowest index's first, so the error does
+not depend on scheduling.
+"""
+function _tasksmap(f::F, n::Int, ntasks::Int) where {F}
+    k = min(n, ntasks)
+    k <= 1 && return Any[f(j, 1) for j = 1:n]
+    results = Vector{Any}(undef, n)
+    failures = Vector{Any}(nothing, n)
+    queue = _TaskQueue(0)
+    @sync for w = 1:k
+        errormonitor(Threads.@spawn _taskworker!(f, results, failures, queue, w))
+    end
+    for err in failures
+        err === nothing || throw(err)
+    end
+    return results
+end
+
+function _taskworker!(f::F, results, failures, queue::_TaskQueue, w::Int) where {F}
+    while true
+        j = @atomic queue.next += 1
+        j > length(results) && return nothing
+        try
+            results[j] = f(j, w)
+        catch err
+            failures[j] = err
+        end
+    end
 end
 
 const _PADDING = ntuple(k -> zeros(UInt8, k), 7)
@@ -677,12 +740,14 @@ function _recordmessage(
     batch::AC.RecordBatch,
     fields,
     codec::Int8,
-    state::Union{Nothing,EncodeState},
+    states::Vector{EncodeState},
+    ntasks::Int=1,
 )
-    c = EncodeCursor(codec, state)
+    c = EncodeCursor(codec)
     for (f, col) in zip(fields, batch.columns)
         encodefield!(c, f, col)
     end
+    _compressbody!(c, states, ntasks)
     b = FB.Builder(1024)
     rb = _batchheader!(b, c, batch.nrows)
     Meta.messageStart(b)
@@ -699,11 +764,13 @@ function _dictionarymessage(
     vf::Field,
     pool::ArrayData,
     codec::Int8,
-    state::Union{Nothing,EncodeState};
+    states::Vector{EncodeState},
+    ntasks::Int=1;
     isdelta::Bool=false,
 )
-    c = EncodeCursor(codec, state)
+    c = EncodeCursor(codec)
     encodefield!(c, vf, pool)
+    _compressbody!(c, states, ntasks)
     b = FB.Builder(1024)
     rb = _batchheader!(b, c, pool.len)
     Meta.dictionaryBatchStart(b)
@@ -926,7 +993,9 @@ mutable struct IPCWriteState
     const ids::IdDict{Field,Int64}
     const features::Vector{Int64}
     const codec::Int8
-    const state::Union{Nothing,EncodeState}
+    # One codec context per compression task (none when uncompressed).
+    const states::Vector{EncodeState}
+    const ntasks::Int
     const validated::AC._ValidatedDictionaries
     const current::Dict{Int64,ArrayData}  # last pool per id, for replacement
     const dictblocks::Vector{NTuple{3,Int64}}    # file format Footer Blocks
@@ -955,6 +1024,10 @@ function _incrementalfeatures(
     return features
 end
 
+# Codec contexts are created on first use, so unused ones cost nothing.
+_encodestates(codec::Int8, level, ntasks::Integer) =
+    codec == CODEC_NONE ? EncodeState[] : EncodeState[EncodeState(level) for _ = 1:ntasks]
+
 function _publish!(st::IPCWriteState, out::Vector{UInt8})
     Base.write(st.io, out)
     st.written += length(out)
@@ -970,6 +1043,7 @@ function beginwrite!(
     features::Union{Nothing,Vector{Int64}}=nothing,
     dictreplacement::Bool=false,
     compresslevel::Union{Nothing,Integer}=nothing,
+    ntasks::Integer=1,
 )
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
@@ -990,7 +1064,8 @@ function beginwrite!(
         ids,
         feats,
         codec,
-        codec == CODEC_NONE ? nothing : EncodeState(compresslevel),
+        _encodestates(codec, compresslevel, ntasks),
+        Int(ntasks),
         AC._ValidatedDictionaries(),
         Dict{Int64,ArrayData}(),
         NTuple{3,Int64}[],
@@ -1065,8 +1140,15 @@ function writebatch!(
                 ArgumentError("delta dictionary does not complete the pool for id $id"),
             )
             validate_semantic(vf, delta)
-            header, body =
-                _dictionarymessage(id, vf, delta, st.codec, st.state; isdelta=true)
+            header, body = _dictionarymessage(
+                id,
+                vf,
+                delta,
+                st.codec,
+                st.states,
+                st.ntasks;
+                isdelta=true,
+            )
             push!(messages, (header, body, dictblocks))
             staged[id] = pool
             continue
@@ -1103,11 +1185,11 @@ function writebatch!(
                 continue
             end
         end
-        header, body = _dictionarymessage(id, vf, pool, st.codec, st.state)
+        header, body = _dictionarymessage(id, vf, pool, st.codec, st.states, st.ntasks)
         push!(messages, (header, body, dictblocks))
         staged[id] = pool
     end
-    header, body = _recordmessage(batch, st.schema.fields, st.codec, st.state)
+    header, body = _recordmessage(batch, st.schema.fields, st.codec, st.states, st.ntasks)
     push!(messages, (header, body, st.file ? st.recordblocks : nothing))
     _publishmessages!(st, messages)
     merge!(st.current, staged)
@@ -1163,7 +1245,7 @@ function finishwrite!(st::IPCWriteState)
     )
     _publish!(st, out)
     st.finished = true
-    st.state === nothing || close(st.state)
+    foreach(close, st.states)
     return nothing
 end
 
@@ -1171,7 +1253,7 @@ end
 function abortwrite!(st::IPCWriteState)
     st.finished && return nothing
     st.finished = true
-    st.state === nothing || close(st.state)
+    foreach(close, st.states)
     return nothing
 end
 
@@ -1190,6 +1272,7 @@ function resumestream!(
     compress::Symbol=:none,
     compresslevel::Union{Nothing,Integer}=nothing,
     current::Dict{Int64,ArrayData}=Dict{Int64,ArrayData}(),
+    ntasks::Integer=1,
 )
     _requirelittleendian()
     haskey(CODEC_NAMES, compress) ||
@@ -1204,7 +1287,8 @@ function resumestream!(
         ids,
         features,
         codec,
-        codec == CODEC_NONE ? nothing : EncodeState(compresslevel),
+        _encodestates(codec, compresslevel, ntasks),
+        Int(ntasks),
         AC._ValidatedDictionaries(),
         current,
         NTuple{3,Int64}[],
