@@ -271,7 +271,10 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             @test_throws InvalidStateException mappedpartition.x
             @test x == [1]
             @test_throws InvalidStateException iterate(mappedstream, state)
+            # Windows deletes the file only once nothing maps it.
+            mappedstream = mappedregion = mappedpartition = x = nothing
         finally
+            GC.gc(true)
             ispath(path) && rm(path)
         end
         # Whole-table read concatenates.
