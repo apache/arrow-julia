@@ -99,7 +99,7 @@ const AC = Arrow.ArrowCore
             )
             t = Arrow.Table(take!(out))
             @test Tables.columnnames(t) == [:a, :b]
-            @test eltype(t.b) == Union{Missing,String}
+            @test eltype(t.b) == Union{Missing,Arrow.DataStrings.DataString}
             @test DataAPI.colmetadata(t, :a, "k") == "v"
         end
 

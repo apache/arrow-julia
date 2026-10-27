@@ -567,11 +567,11 @@ end
         # (`_publicvalue`'s converted leaf and the ArrowTypes raw-domain and
         # fromarrow tails), and composite restorations reserve the row's
         # inline payload besides. The floors below fail if a reserve is
-        # dropped. A flat decimal column reads in bulk with no per-value
-        # conversion, so its floor is the column's own storage.
+        # dropped. A flat decimal column reads as a view over its buffer,
+        # with no per-value charge.
         with_logger(NullLogger()) do
             for (name, bytes, floor, first_expected) in (
-                ("flat decimal", decbytes, 8n, reinterpret(Dec64, Int64(70000))),
+                ("flat decimal", decbytes, 0, reinterpret(Dec64, Int64(70000))),
                 ("union timestamp", unionbytes, 112n, ns(1)),
                 ("unknown-label run-end timestamp", reebytes, 160n, ns(1)),
                 ("registered fromarrow union", liftedbytes, 224n, lifted[1]),

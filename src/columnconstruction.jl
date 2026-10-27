@@ -4217,8 +4217,7 @@ function _retainedfixedbytes(f::AC.Field, v::AbstractVector)
     data = zeros(UInt8, Base.checked_mul(length(v), t.nbytes))
     for (i, x) in enumerate(v)
         x === missing && continue
-        x isa NTuple{t.nbytes,UInt8} && (x = reinterpret(UInt8, [x]))
-        x isa AbstractVector{UInt8} ||
+        x isa Union{AbstractVector{UInt8},NTuple{<:Any,UInt8}} ||
             throw(ArgumentError("column $(f.name) must contain byte-vector values"))
         length(x) == t.nbytes || throw(
             ArgumentError(
@@ -4226,7 +4225,9 @@ function _retainedfixedbytes(f::AC.Field, v::AbstractVector)
                 "expected $(t.nbytes)",
             ),
         )
-        copyto!(data, (i - 1) * t.nbytes + 1, x, 1, t.nbytes)
+        for k = 1:(t.nbytes)
+            data[(i - 1) * t.nbytes + k] = x[k]
+        end
     end
     d = AC.ArrayData(
         t,
@@ -4369,12 +4370,14 @@ function _retainedtypedvalues(f::AC.Field, values; converted::Bool)
     T === Any && return Any[x for x in values]
     out = Vector{T}(undef, length(values))
     for (i, x) in enumerate(values)
-        x isa T || throw(
-            ArgumentError(
-                "column $(f.name) holds $(typeof(x)) values that do not match " *
-                "its retained Arrow type $(repr(f.type))",
-            ),
-        )
+        x isa T ||
+            _retainedwritertype(f.type, typeof(x)) ||
+            throw(
+                ArgumentError(
+                    "column $(f.name) holds $(typeof(x)) values that do not match " *
+                    "its retained Arrow type $(repr(f.type))",
+                ),
+            )
         out[i] = x
     end
     return out
@@ -5047,7 +5050,11 @@ end
 # date-time) column under a timestamp, any `AbstractString` under a string.
 _retainedwritertype(::AC.TimestampType, ::Type{T}) where {T} = T <: Dates.AbstractDateTime
 _retainedwritertype(::AC.Utf8Type, ::Type{T}) where {T} = T <: AbstractString
-_retainedwritertype(t::AC.ViewType, ::Type{T}) where {T} = t.utf8 && T <: AbstractString
+_retainedwritertype(t::AC.ViewType, ::Type{T}) where {T} =
+    t.utf8 ? T <: AbstractString : T <: AbstractVector{UInt8}
+_retainedwritertype(::AC.BinaryType, ::Type{T}) where {T} = T <: AbstractVector{UInt8}
+_retainedwritertype(t::AC.FixedSizeBinaryType, ::Type{T}) where {T} =
+    T <: NTuple{t.nbytes,UInt8} || T <: AbstractVector{UInt8}
 _retainedwritertype(::AC.ArrowType, ::Type) = false
 
 function _checkretainedidentity(f::AC.Field, t::AC.ArrowType, v::AbstractVector)
@@ -6004,6 +6011,10 @@ function _constructcolumnparts(
                     publictype = _facadebasetype(retained.type)
                     publictype !== Any &&
                         !(T <: publictype) &&
+                        !_retainedwritertype(
+                            (retained.type::AC.DictionaryType).valuetype,
+                            T,
+                        ) &&
                         T !== Union{} &&
                         throw(
                             ArgumentError(

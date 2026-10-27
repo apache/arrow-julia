@@ -237,7 +237,7 @@ end
     w = CompatWrappedVector(UInt32[2, 3, 2], ["c", "b", "a"])
     @test pool(w) == ["c", "b", "a"]
     t = Arrow.Table(Arrow.tobuffer((; w)))
-    @test eltype(t.w) == String
+    @test eltype(t.w) == Arrow.DataStrings.DataString
     @test t.w == ["b", "a", "b"]
     # Arrow.Writer encodes only DictEncode columns: independently pooled
     # tables rarely share the exact pool that every later table must reuse.

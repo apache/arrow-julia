@@ -134,18 +134,17 @@ such as a second stream written to the same `IO`, are rejected with
 The internal Arrow 2.x accessors are gone: use `Tables.columnnames(table)` for
 `Arrow.names(table)` and `Arrow.getmetadata(table)` for `Arrow.metadata(table)[]`.
 
-The source can still be memory-mapped while it is read. The returned columns
-do not borrow the map. Call [`Arrow.release!`](@ref) when you need to release a
-mapped file at a known time:
-
-```julia
-table = Arrow.Table("data.arrow")
-Arrow.release!(table)
-rm("data.arrow")
-
-# The materialized columns are still valid.
-sum(table.id)
-```
+Flat columns are read-only views of the source, as in 2.x, but each column now
+keeps the memory it reads alive, so it stays valid after its table is gone and
+writing to it is an error. `copy(column)`, `copy(table)`, `DataFrame(table)`, and
+`Arrow.read(source, DataFrame)` give mutable copies. String columns are
+`DataStrings.StringVector`s (`stringtype=String` gives `Vector{String}`), binary
+columns `BytesVector`s, and fixed-size binary values `NTuple{N,UInt8}`.
+[`Arrow.release!`](@ref) ends a read without unmapping: the table refuses
+further column access, and a mapped file is unmapped once the table and its
+columns are garbage collected. Windows reads paths into memory unless
+`mmap=true` is passed, so a file read there can be replaced or deleted right
+away.
 
 ## Removed input support
 

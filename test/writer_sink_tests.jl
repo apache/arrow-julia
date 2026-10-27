@@ -232,7 +232,7 @@ end
                 p -> Arrow.write(p, (; a=Int64[1])),
                 p -> Arrow.Writer(w -> Arrow.write(w, (; a=Int64[1])), p),
             )
-                s = Arrow.Stream(path)  # maps the file; batches decode lazily
+                s = Arrow.Stream(path; mmap=true)  # maps the file; batches decode lazily
                 overwrite(path)
                 @test [sum(b.a) for b in s] == sums
                 @test Arrow.Table(path).a == [1]

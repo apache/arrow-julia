@@ -141,14 +141,15 @@ end
         Arrow.write(io, (x=Int32[1, 2], y=["a long materialized string", "two"]))
         close(io)
         t = Arrow.Table(path)
+        want = Tables.columntable(t)
         tc, ts = copy(t), roundtrip(t)
         Arrow.release!(t)
         for result in (tc, ts)
             @test isempty(getfield(result, :regions))
-            @test Tables.columntable(result) == Tables.columntable(t)
+            @test Tables.columntable(result) == want
         end
         tc.x[1] = 99
-        @test t.x[1] == ts.x[1] == 1
+        @test want.x[1] == ts.x[1] == 1
     end
 end
 

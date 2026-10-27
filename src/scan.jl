@@ -2468,6 +2468,7 @@ function _finishfacadescan(
     regions=AC.OwnerRegion[],
     budget=nothing,
     poolof=nothing,
+    views::_ViewContext=_ViewContext(DataStrings.DataString, budget),
 )
     cols = Tables.columns(got)
     ncols = length(Tables.columnnames(cols))
@@ -2493,7 +2494,9 @@ function _finishfacadescan(
             # Public type overrides run HERE, after facade conversion —
             # they are public-domain requests, never storage casts, and
             # they preserve missing exactly as Tables.scan does.
-            base = _facadefromraw(f, columns[i], arrowtypes)
+            base =
+                _scanview(f) ? _scanviewoutput(f, columns[i], views) :
+                _facadefromraw(f, columns[i], arrowtypes)
             push!(precols, base)
             columns[i] = bc.type === nothing ? base : _applyoverride(bc.type, base, budget)
         end
@@ -2560,15 +2563,19 @@ end
 function _applyfacadescan(
     f::ArrowFile,
     plan::_ScanPlan,
-    budget::Union{Nothing,AllocationBudget}=nothing,
+    budget::Union{Nothing,AllocationBudget}=nothing;
+    stringtype::Type=DataStrings.DataString,
 )
     b = _facadestorage(plan)
     actual = budget === nothing ? _readbudget(f.limits, f.region.len) : budget
     routes = _ArrowTypesRoutePlan(actual)
+    views = _ViewContext(stringtype, actual)
     snapshots = _dictsnapshots(f.fields, b, actual)
     materialize =
-        (field, data, _) ->
-            (_snapshotdict!(snapshots, field, data); _batchcolumn(field, data, routes))
+        (field, data, _) -> (
+            _snapshotdict!(snapshots, field, data);
+            _scanbatchcolumn(field, data, routes, views)
+        )
     got = _runboundscan(f, b, plan.names, actual, materialize)
     return _finishfacadescan(
         got,
@@ -2578,16 +2585,26 @@ function _applyfacadescan(
         regions=AC.OwnerRegion[f.region],
         budget=actual,
         poolof=(_, field, ctx) -> _retainedsnapshotpool(field, snapshots[field], ctx),
+        views=views,
     )
 end
 
-function _applyfacadescan(sf::SourceFile, plan::_ScanPlan, ft, budget::AllocationBudget)
+function _applyfacadescan(
+    sf::SourceFile,
+    plan::_ScanPlan,
+    ft,
+    budget::AllocationBudget;
+    stringtype::Type=DataStrings.DataString,
+)
     routes = _ArrowTypesRoutePlan(budget)
+    views = _ViewContext(stringtype, budget)
     b = _facadestorage(plan)
     snapshots = _dictsnapshots(ft.fields, b, budget)
     materialize =
-        (field, data, _) ->
-            (_snapshotdict!(snapshots, field, data); _batchcolumn(field, data, routes))
+        (field, data, _) -> (
+            _snapshotdict!(snapshots, field, data);
+            _scanbatchcolumn(field, data, routes, views)
+        )
     got = _runboundscan(sf, b, plan.names, ft, budget, materialize)
     return _finishfacadescan(
         got,
@@ -2596,20 +2613,49 @@ function _applyfacadescan(sf::SourceFile, plan::_ScanPlan, ft, budget::Allocatio
         plan;
         budget=budget,
         poolof=(_, field, ctx) -> _retainedsnapshotpool(field, snapshots[field], ctx),
+        views=views,
     )
 end
 
-function _facadescanrawcolumn(s::IPCStream, i::Int, budget, routes::_ArrowTypesRoutePlan)
+function _facadescanrawcolumn(
+    s::IPCStream,
+    i::Int,
+    budget,
+    routes::_ArrowTypesRoutePlan,
+    views::_ViewContext,
+)
     f = s.corefields[i]
+    _scanview(f) &&
+        return _viewcolumn(f, AC.ArrayData[b.columns[i] for b in s.batches], views)
     _chargevector!(budget, AbstractVector, length(s.batches), "stream scan column parts")
     parts = [_batchcolumn(f, b.columns[i], routes) for b in s.batches]
     return _joinscanparts(f, parts, budget)
 end
 
+# Facade scans read a flat column as the view a full read gives whenever its
+# storage and public values agree. Dates, times, timestamps, and durations
+# stay in storage until the filter has run: their literals lower to storage.
+_scanview(f::AC.Field) = _viewable(f) && !_storageconverted(f)
+function _storageconverted(f::AC.Field)
+    t = f.type
+    t isa AC.DictionaryType && return _storageconverted(AC.dictvaluefield(f, t))
+    t isa AC.RunEndEncodedType && return _storageconverted(f.children[2])
+    return _istemporalconv(t)
+end
+
+_scanbatchcolumn(f::AC.Field, d::AC.ArrayData, routes, views::_ViewContext) =
+    _scanview(f) ? _viewcolumn(f, AC.ArrayData[d], views) : _batchcolumn(f, d, routes)
+
+# A selected view column's scan output: its gathered rows, or, when no row
+# survived, an empty vector of the element type a full read gives.
+_scanviewoutput(f::AC.Field, col, views::_ViewContext) =
+    isempty(col) ? _vieweltype(f, AC.ArrayData[], views)[] : col
+
 function _applyfacadescan(
     s::IPCStream,
     plan::_ScanPlan,
-    supplied::Union{Nothing,AllocationBudget}=nothing,
+    supplied::Union{Nothing,AllocationBudget}=nothing;
+    stringtype::Type=DataStrings.DataString,
 )
     budget = supplied === nothing ? s.budget : supplied
     b = _facadestorage(plan)
@@ -2617,8 +2663,10 @@ function _applyfacadescan(
     fields = collect(Field, s.corefields)
     _chargevector!(budget, AbstractVector, length(fields), "stream scan columns")
     routes = _ArrowTypesRoutePlan(budget)
-    rawcolumns =
-        AbstractVector[_facadescanrawcolumn(s, i, budget, routes) for i = 1:length(fields)]
+    views = _ViewContext(stringtype, budget)
+    rawcolumns = AbstractVector[
+        _facadescanrawcolumn(s, i, budget, routes, views) for i = 1:length(fields)
+    ]
     nrows =
         isempty(rawcolumns) ? sum(Int(b.nrows) for b in s.batches; init=0) :
         length(first(rawcolumns))
@@ -2632,6 +2680,7 @@ function _applyfacadescan(
         regions=_sourceregions(s, budget),
         budget=budget,
         poolof=(bc, field, ctx) -> _retaineddictpool(field, s.batches, bc.index, ctx),
+        views=views,
     )
 end
 

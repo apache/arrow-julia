@@ -25,11 +25,22 @@
 
 ```@docs
 Arrow.Table
+Arrow.read
 Arrow.Stream
 Arrow.Limits
 Arrow.release!(::Arrow.Table)
 Base.copy(::Arrow.Table)
 Arrow.getmetadata
+```
+
+## Columns
+
+```@docs
+Arrow.ArrowVector
+Arrow.Primitive
+Arrow.BoolVector
+Arrow.DictEncoded
+Arrow.RunEndEncoded
 ```
 
 ## Write

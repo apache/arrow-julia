@@ -427,11 +427,11 @@ const _GENERATED_PUBLIC_ELTYPES = (
     uints=Union{Missing,UInt64},
     floats=Union{Missing,Float64},
     bools=Union{Missing,Bool},
-    strings=Union{Missing,String},
+    strings=Union{Missing,DataString},
     dates=Union{Missing,Date},
     lists=Union{Missing,Vector{Any}},
     structs=Union{Missing,Vector{Pair{String,Any}}},
-    dictionary=Union{Missing,String},
+    dictionary=Union{Missing,DataString},
 )
 
 _fail(message) = throw(ErrorException(message))
@@ -739,11 +739,11 @@ function _logical_layout_case()
             return Pair{Any,Any}[key => item for (key, item) in pairs(value)]
         end,
         fixed=Vector{Any}[Any[1, 2], Any[3, 4], Any[5, 6], Any[7, 8]],
-        views=Union{Missing,String}[
-            "tiny",
-            String(copy(@view raw[longstart:end])),
+        views=Union{Missing,DataStrings.DataString}[
+            DataStrings.DataString("tiny"),
+            DataStrings.DataString(String(copy(@view raw[longstart:end]))),
             missing,
-            "",
+            DataStrings.DataString(""),
         ],
         dates=table.dates,
         # a written DateTime column reads back as Timestamp{Millisecond}
@@ -1017,10 +1017,14 @@ function _physical_layout_case()
     batch = AC.RecordBatch(schema, columns, 3)
     epoch = DateTime(1970, 1, 1)
     expected = (
-        binary=Vector{UInt8}[UInt8[0x00, 0xff], UInt8[], UInt8[0x01, 0x02, 0x03]],
-        large_binary=Vector{UInt8}[UInt8[0x10, 0x11], UInt8[], UInt8[0x12, 0x13, 0x14]],
-        fixed_binary=Vector{UInt8}[UInt8[1, 2, 3], UInt8[4, 5, 6], UInt8[7, 8, 9]],
-        binary_view=Union{Missing,Vector{UInt8}}[UInt8[0x01, 0x02], longbinary, missing],
+        binary=DataBytes.([UInt8[0x00, 0xff], UInt8[], UInt8[0x01, 0x02, 0x03]]),
+        large_binary=DataBytes.([UInt8[0x10, 0x11], UInt8[], UInt8[0x12, 0x13, 0x14]]),
+        fixed_binary=NTuple{3,UInt8}[(1, 2, 3), (4, 5, 6), (7, 8, 9)],
+        binary_view=Union{Missing,DataBytes}[
+            DataBytes(UInt8[0x01, 0x02]),
+            DataBytes(longbinary),
+            missing,
+        ],
         sorted_map=Vector{Pair{Any,Any}}[
             Pair{Any,Any}["a" => Int32(1), "b" => missing],
             Pair{Any,Any}[],
@@ -1063,7 +1067,7 @@ function _physical_layout_case()
         duration_us=Microsecond[Microsecond(-1), Microsecond(0), Microsecond(1_000_001)],
         duration_ns=Nanosecond[Nanosecond(-1), Nanosecond(0), Nanosecond(1_000_001)],
         fixed_list=Vector{Any}[Any[1, 2], Any[3, 4], Any[5, 6]],
-        ree=Union{Missing,String}["run", "run", missing],
+        ree=Union{Missing,DataString}[DataString("run"), DataString("run"), missing],
         nullable_struct=Union{Missing,Vector{Pair{String,Any}}}[
             Pair{String,Any}["x" => Int32(1), "y" => "a"],
             missing,

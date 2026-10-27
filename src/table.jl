@@ -17,9 +17,9 @@
 # =============================================================================
 # The read facade: Arrow IPC -> Tables.jl columns.
 #
-# `Arrow.Table` materializes the selected columns into plain Julia vectors
-# (closed element-type claims through Core's bulk typed path, everything else
-# through the dynamic accessors); there is no lazy typed-view layer.
+# `Arrow.Table` reads flat columns as zero-copy views (`columns.jl`) and
+# materializes nested and union columns (closed element-type claims through
+# Core's typed path, everything else through the dynamic accessors).
 # `Arrow.Stream` iterates record batches as one Table each. Scan pushdown
 # routes through the ranged-scan adapter: on the file format, column
 # pruning, statistics-based batch pruning, and window consumption all happen
@@ -27,15 +27,32 @@
 # =============================================================================
 
 """
-    Arrow.Table(source; scan=nothing, mmap=true, limits) -> Table
+    Arrow.Table(source; scan=nothing, mmap, stringtype=DataString, limits) -> Table
 
 Read Arrow IPC data as Tables.jl columns. `source` is a file path, an `IO`,
 raw bytes (`Vector{UInt8}`), or an [`Arrow.AbstractArrowSource`](@ref) — a
 byte-range-addressable object, such as one in cloud storage, read with
 exact range requests. Both IPC formats are accepted: the file format
 (`ARROW1` magic, random access, footer statistics) and the stream format.
-`mmap=true` memory-maps a file-format path instead of reading it into
-memory; it has no effect on the other source kinds.
+
+Flat columns read their Arrow buffers in place: numbers, booleans, temporal
+values, decimals, and dictionary-encoded values are read-only
+[`Arrow.ArrowVector`](@ref) views, so building a table costs time
+proportional to its columns and record batches, not its bytes. A column
+with several record batches is a `ChainedVector` of per-batch views. String
+and binary columns are `DataStrings.StringVector`/`BytesVector`, built with
+one copy of their bytes; `stringtype=String` reads strings as
+`Vector{String}`. Nested and union columns are materialized vectors. A
+column keeps the memory it reads alive while it is reachable, independent of
+its table. `copy(table)`, `DataFrame(table)`, and [`Arrow.read`](@ref) return
+owned, mutable columns.
+
+`mmap=true` memory-maps a file-format path; a mapping is unmapped once the
+table and all of its columns are garbage collected. It is the default except
+on Windows, which cannot replace or delete a mapped file: there a path is
+read into memory unless `mmap=true` is passed. `mmap` has no effect on the
+other source kinds. A byte vector is read in place: do not modify or resize
+it while the table's columns are in use.
 
 `limits` sets the [`Arrow.Limits`](@ref) policy for a raw source. Omit it to
 use `Arrow.Limits()`. An internal reader handle that was opened under a
@@ -67,11 +84,6 @@ Independent of the filter, some sources are read whole: an
 stream-format source. Empty projections use range planning and preserve
 their row count without fetching output column bodies. When a filter must
 prune remote fetches, write it in each column's public value domain.
-
-Columns are materialized (plain `Vector`s): the returned table does not
-borrow the source bytes, and [`Arrow.release!`](@ref) may be called at any
-time afterward to release a memory-mapped file deterministically — do this
-on Windows before deleting a mapped file.
 """
 struct Table <: Tables.AbstractColumns
     names::Vector{Symbol}
@@ -90,11 +102,13 @@ end
 """
     copy(table::Arrow.Table) -> Arrow.Table
 
-Copy each materialized column and retain the schema and dictionary category
-order. The new table holds no source mappings. As with `copy` on Julia
-vectors, nested mutable values can still be shared.
+Copy every column into owned, mutable memory (`copy` of each column) and
+retain the schema and dictionary category order. The new table reads nothing
+from the source. As with `copy` on Julia vectors, nested mutable values can
+still be shared.
 """
 function Base.copy(t::Table)
+    _checkopen(t)
     return _table(
         copy(getfield(t, :names)),
         AbstractVector[copy(c) for c in getfield(t, :columns)],
@@ -212,8 +226,18 @@ Tables.istable(::Type{Table}) = true
 Tables.columnaccess(::Type{Table}) = true
 Tables.columns(t::Table) = t
 Tables.columnnames(t::Table) = getfield(t, :names)
-Tables.getcolumn(t::Table, i::Int) = getfield(t, :columns)[i]
-Tables.getcolumn(t::Table, nm::Symbol) = getfield(t, :columns)[_columnindex(t, nm)]
+Tables.getcolumn(t::Table, i::Int) = (_checkopen(t); getfield(t, :columns)[i])
+Tables.getcolumn(t::Table, nm::Symbol) =
+    (_checkopen(t); getfield(t, :columns)[_columnindex(t, nm)])
+
+# A released table refuses column access; columns taken before stay valid.
+function _checkopen(t::Table)
+    for r in getfield(t, :regions)
+        (@atomic :acquire r.cell.closed) &&
+            throw(InvalidStateException("the table was released", :closed))
+    end
+    return nothing
+end
 # Column count at or below which `Tables.schema` returns the fully typed
 # `Tables.Schema{names, types}`. Typed schemas let materializers that refuse
 # stored schemas (`Tables.rowtable`, `Tables.columntable`) work as usual and
@@ -353,9 +377,9 @@ including other Tables.jl tables, so `metadata=Arrow.getmetadata(table)` works
 for any `Arrow.write` input. New code should prefer the DataAPI.jl interface
 (`DataAPI.metadata`, `DataAPI.metadatakeys`), which `Arrow.Table` supports.
 
-Arrow 3.0 columns are plain Julia vectors, so a column also returns `nothing`;
-use `DataAPI.colmetadata(table, column, key)`/`DataAPI.colmetadatakeys(table)`
-for per-column metadata.
+A column also returns `nothing`; use
+`DataAPI.colmetadata(table, column, key)`/`DataAPI.colmetadatakeys(table)` for
+per-column metadata.
 """
 function getmetadata(t::Table)
     sch = getfield(t, :schema)
@@ -369,12 +393,11 @@ getmetadata(::Any) = nothing
 """
     Arrow.release!(t::Union{Table,Stream})
 
-Deterministically release the source regions behind a read (a memory map
-unmaps NOW; imported foreign buffers run their release callbacks). `Table`
-columns are materialized copies, so a closed `Table` remains fully usable;
-a closed `Stream` refuses further iteration cleanly. Every yielded `Table`
-shares its parent `Stream` source lifetime, so releasing either one closes the
-stream while already materialized columns remain usable. Idempotent.
+End a read: the table refuses further column access, and a stream refuses
+further iteration. Every `Table` a `Stream` yields shares its source, so
+releasing either one releases both. Columns taken before the release remain
+usable and keep the memory they read: a memory-mapped file is unmapped once
+the table and all of its columns are garbage collected. Idempotent.
 """
 function AC.release!(t::Table)
     foreach(AC.release!, getfield(t, :regions))
@@ -1195,6 +1218,11 @@ function _facadesinglecolumn(f::AC.Field, d::AC.ArrayData, arrowtypes::_ArrowTyp
     return _facadecolumn(f, AbstractVector[_batchcolumn(f, d, arrowtypes)], arrowtypes)
 end
 
+# One table column: a view column for flat layouts, else a materialized one.
+_tablecolumn(f::AC.Field, batches, i::Int, arrowtypes, views::_ViewContext) =
+    _viewable(f) ? _viewcolumn(f, AC.ArrayData[b.columns[i] for b in batches], views) :
+    _facadebatchcolumn(f, batches, i, arrowtypes)
+
 function _facadebatchcolumn(f::AC.Field, batches, i::Int, arrowtypes::_ArrowTypesContext)
     _chargevector!(arrowtypes.budget, AbstractVector, length(batches), "batch column parts")
     parts =
@@ -1267,7 +1295,7 @@ end
 _isfilebytes(bytes::Vector{UInt8}) = length(bytes) >= 6 && view(bytes, 1:6) == _FILE_MAGIC
 
 # A successful ArrowFile adopts the mapped region. Before that handoff, this
-# layer owns the region and must release it if validation or parsing fails.
+# layer owns the region and must unmap it if validation or parsing fails.
 # This is observable on Windows, where an unreleased mapping prevents the
 # source file from being deleted.
 function _readmappedfile(
@@ -1279,7 +1307,9 @@ function _readmappedfile(
         budget === nothing && return readfile(region; limits=limits)
         return _readfile(region, limits, _boundbudget!(budget, limits, region.len))
     catch
+        # No column exists yet, so the mapping can go now.
         AC.release!(region)
+        AC._unmap!(region)
         rethrow()
     end
 end
@@ -1301,7 +1331,7 @@ end
 
 function _opensource(
     path::AbstractString;
-    mmap::Bool=true,
+    mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=Limits(),
     budget::Union{Nothing,AllocationBudget}=nothing,
 )
@@ -1311,7 +1341,9 @@ function _opensource(
         if magic == _FILE_MAGIC && mmap
             # Probe and map the same open file. A replacement of `path`
             # between those steps cannot redirect the read to another inode.
-            region = AC._mmapregion(io, path)
+            # Columns read the mapping in place, so `release!` must not unmap
+            # it: the mapping lives until nothing reaches it.
+            region = AC._mmapregion(io, path; eager=false)
             return _readmappedfile(region, limits, budget)
         end
         reported = stat(io).size
@@ -1328,7 +1360,12 @@ function _opensource(
         return _openbytes(bytes; limits=limits, budget=budget)
     end
 end
-function _opensource(io::IO; mmap::Bool=true, limits::Limits=Limits(), budget=nothing)
+function _opensource(
+    io::IO;
+    mmap::Bool=_MMAP_DEFAULT,
+    limits::Limits=Limits(),
+    budget=nothing,
+)
     if budget === nothing
         return _openbytes(Base.read(io); limits=limits)
     end
@@ -1360,13 +1397,13 @@ function _opensource(io::IO; mmap::Bool=true, limits::Limits=Limits(), budget=no
 end
 _opensource(
     bytes::Vector{UInt8};
-    mmap::Bool=true,
+    mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=Limits(),
     budget=nothing,
 ) = _openbytes(bytes; limits=limits, budget=budget)
 _opensource(
     src::Union{IPCStream,ArrowFile};
-    mmap::Bool=true,
+    mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=_configuredlimits(src),
     budget=nothing,
 ) = src
@@ -1374,7 +1411,7 @@ _opensource(
 # batch, so there is nothing for range planning to skip.
 function _opensource(
     src::AbstractArrowSource;
-    mmap::Bool=true,
+    mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=Limits(),
     budget=nothing,
 )
@@ -1387,7 +1424,7 @@ function _opensource(
 end
 function _opensource(
     sf::SourceFile;
-    mmap::Bool=true,
+    mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=sf.limits,
     budget=nothing,
 )
@@ -1418,17 +1455,19 @@ _sourcebudget(source, limits::Limits) =
 function Table(
     source;
     scan::Union{Nothing,Tables.Scan}=nothing,
-    mmap::Bool=true,
+    mmap::Bool=_MMAP_DEFAULT,
+    stringtype::Type=DataStrings.DataString,
     limits::Limits=_defaultreaderlimits(source),
 )
     readlimits = _readerlimits(source, limits)
+    _checkstringtype(stringtype)
     if source isa AbstractArrowSource || source isa SourceFile
         sf = source isa SourceFile ? source : SourceFile(source; limits=readlimits)
         _requirelittleendian()
         budget = _readbudget(readlimits, sf.len)
         if scan === nothing
             opened = _openbytes(_wholeobject(sf, budget); limits=readlimits, budget=budget)
-            return _tablefrom(opened, nothing, budget)
+            return _tablefrom(opened, nothing, budget; stringtype=stringtype)
         end
         # Range planning pays off only for a pushable scan over a file-format
         # object with columns. With a scan the schema comes up front from
@@ -1438,70 +1477,124 @@ function Table(
             ft = _rangedfooter(sf, budget)
             plan = _ScanPlan(scan, ft.fields, budget)
             if !isempty(ft.fields) && plan.storage !== nothing
-                return _applyfacadescan(sf, plan, ft, budget)
+                return _applyfacadescan(sf, plan, ft, budget; stringtype=stringtype)
             end
             # A public-domain fallback still reuses the scan plan compiled
             # from the Footer schema after the object is read in full. Keep
             # the same budget through whole-object assembly, parsing, and
             # lazy batch materialization.
             opened = _openbytes(_wholeobject(sf, budget); limits=readlimits, budget=budget)
-            return _tablefrom(opened, plan, budget)
+            return _tablefrom(opened, plan, budget; stringtype=stringtype)
         end
         # A stream-format object has no Footer to plan from. Read it whole,
         # without resetting the budget used by the format probe, then execute
         # the scan over its decoded columns.
         opened = _openbytes(_wholeobject(sf, budget); limits=readlimits, budget=budget)
-        return _tablefrom(opened, scan, budget)
+        return _tablefrom(opened, scan, budget; stringtype=stringtype)
     end
     budget = source isa IPCStream ? source.budget : _sourcebudget(source, readlimits)
     opened = _opensource(source; mmap=mmap, limits=readlimits, budget=budget)
-    scan === nothing && return _tablefrom(opened, nothing, budget)
-    return _tablefrom(opened, scan, budget)
+    return _tablefrom(opened, scan, budget; stringtype=stringtype)
 end
+
+# Windows cannot delete or replace a file while it is mapped, and the
+# facade unmaps only when the table and its columns are garbage collected,
+# so paths there read into memory unless `mmap=true` is requested.
+const _MMAP_DEFAULT = !Sys.iswindows()
+
+"""
+    Arrow.read(source, sink; kwargs...)
+
+Read `source` as [`Arrow.Table`](@ref) does, with the same keywords, and pass
+the result to `sink` with owned, mutable columns, copied exactly once:
+`Arrow.read(path, DataFrame)` returns a `DataFrame` whose columns are
+`Vector`s (`PooledArray`s for dictionary-encoded columns).
+"""
+function read(source, sink; kwargs...)
+    t = Table(source; kwargs...)
+    cols = AbstractVector[_ownedcolumn(c) for c in getfield(t, :columns)]
+    owned = Table(
+        getfield(t, :names),
+        cols,
+        getfield(t, :lookup),
+        getfield(t, :schema),
+        getfield(t, :regions),
+        getfield(t, :nrows),
+        getfield(t, :retainedpools),
+    )
+    return sink(Tables.CopiedColumns(owned))
+end
+
+function read(source; kwargs...)
+    throw(
+        ArgumentError(
+            "Arrow.read needs a sink, as in Arrow.read(source, DataFrame); " *
+            "Arrow.Table(source) reads without copying",
+        ),
+    )
+end
+
+# Views copy into owned memory; columns this read materialized are already
+# owned by nobody else.
+_ownedcolumn(c::Union{ArrowVector,ChainedVector{<:Any,<:ArrowVector}}) = copy(c)
+_ownedcolumn(c) = c
 
 # A Table from an opened IPC source: the whole thing, or a scan pushed
 # where the format can prove it and evaluated over the rest.
 function _tablefrom(
     src::Union{IPCStream,ArrowFile},
     scan::Union{Nothing,Tables.Scan},
-    budget::Union{Nothing,AllocationBudget}=nothing,
+    budget::Union{Nothing,AllocationBudget}=nothing;
+    stringtype::Type=DataStrings.DataString,
 )
     regions = _sourceregions(src, budget)
     fields = _corefields(src, budget)
-    scan === nothing && return _materialize_table(src, regions, budget)
-    return _tablefrom(src, _ScanPlan(scan, fields, budget), regions, fields, budget)
+    scan === nothing &&
+        return _materialize_table(src, regions, budget; stringtype=stringtype)
+    plan = _ScanPlan(scan, fields, budget)
+    return _tablefrom(src, plan, regions, fields, budget; stringtype=stringtype)
 end
 
 function _tablefrom(
     src::Union{IPCStream,ArrowFile},
     plan::_ScanPlan,
-    budget::Union{Nothing,AllocationBudget}=nothing,
+    budget::Union{Nothing,AllocationBudget}=nothing;
+    stringtype::Type=DataStrings.DataString,
 )
     return _tablefrom(
         src,
         plan,
         _sourceregions(src, budget),
         _corefields(src, budget),
-        budget,
+        budget;
+        stringtype=stringtype,
     )
 end
 
-function _tablefrom(src, plan::_ScanPlan, regions, fields, budget)
+function _tablefrom(
+    src,
+    plan::_ScanPlan,
+    regions,
+    fields,
+    budget;
+    stringtype::Type=DataStrings.DataString,
+)
     # Zero-field sources carry their row count on the Table itself; the raw
     # scan path would lose it inside an empty NamedTuple.
     isempty(fields) && return _publicscan(
-        _materialize_table(src, regions, budget),
+        _materialize_table(src, regions, budget; stringtype=stringtype),
         _tableschema(src),
         fields,
         plan,
         regions,
         budget,
     )
-    plan.storage !== nothing && return _applyfacadescan(src, plan, budget)
+    plan.storage !== nothing &&
+        return _applyfacadescan(src, plan, budget; stringtype=stringtype)
     # A scan with an unrepresentable storage-domain literal evaluates its
     # public-domain plan over the fully converted table.
     return _publicscan(
-        _materialize_table(src, regions, budget),
+        _materialize_table(src, regions, budget; stringtype=stringtype),
         _tableschema(src),
         fields,
         plan,
@@ -1631,13 +1724,19 @@ function _retaineddictpools(fields, batches, arrowtypes::_ArrowTypesContext)
     return Any[_retaineddictpool(f, batches, i, arrowtypes) for (i, f) in enumerate(fields)]
 end
 
-function _materialize_table(src::IPCStream, regions, budget=nothing)
+function _materialize_table(
+    src::IPCStream,
+    regions,
+    budget=nothing;
+    stringtype::Type=DataStrings.DataString,
+)
     budget === nothing && (budget = src.budget)
     names = _fieldnamesymbols(src.schema.fields, budget)
     arrowtypes = _ArrowTypesContext(budget=budget)
+    views = _ViewContext(stringtype, budget)
     _chargevector!(budget, AbstractVector, length(src.corefields), "table columns")
     cols = AbstractVector[
-        _facadebatchcolumn(f, src.batches, i, arrowtypes) for
+        _tablecolumn(f, src.batches, i, arrowtypes, views) for
         (i, f) in enumerate(src.corefields)
     ]
     nrows = sum(Int(b.nrows) for b in src.batches; init=0)
@@ -1645,10 +1744,16 @@ function _materialize_table(src::IPCStream, regions, budget=nothing)
     return _table(names, cols, src.schema, regions, nrows, pools, budget)
 end
 
-function _materialize_table(src::ArrowFile, regions, budget=nothing)
+function _materialize_table(
+    src::ArrowFile,
+    regions,
+    budget=nothing;
+    stringtype::Type=DataStrings.DataString,
+)
     budget === nothing && (budget = _readbudget(src.limits, src.region.len))
     names = _fieldnamesymbols(src.schema.fields, budget)
     arrowtypes = _ArrowTypesContext(budget=budget)
+    views = _ViewContext(stringtype, budget)
     nb = length(src)
     _chargevector!(budget, AC.RecordBatch, nb, "decoded batch list")
     state = DecodeState(budget)
@@ -1659,7 +1764,7 @@ function _materialize_table(src::ArrowFile, regions, budget=nothing)
     end
     _chargevector!(budget, AbstractVector, length(src.fields), "table columns")
     cols = AbstractVector[
-        _facadebatchcolumn(f, batches, i, arrowtypes) for (i, f) in enumerate(src.fields)
+        _tablecolumn(f, batches, i, arrowtypes, views) for (i, f) in enumerate(src.fields)
     ]
     nrows = sum(Int(b.nrows) for b in batches; init=0)
     pools = _retaineddictpools(src.fields, batches, arrowtypes)
@@ -1743,13 +1848,13 @@ _declaredbasetype(t::AC.ArrowType) =
 # --- Stream ------------------------------------------------------------------
 
 """
-    Arrow.Stream(source; mmap=true, limits)
+    Arrow.Stream(source; mmap, stringtype=DataString, limits)
 
 Iterate an IPC source (a file path, an `IO`, a `Vector{UInt8}`, or an
 [`Arrow.AbstractArrowSource`](@ref), which is read whole) one record batch
-at a time; each iteration yields an [`Arrow.Table`](@ref) for that batch.
-`mmap=true` memory-maps a file-format path instead of reading it into
-memory; it has no effect on the other source kinds. Satisfies `Tables.partitions` (each
+at a time; each iteration yields an [`Arrow.Table`](@ref) for that batch,
+with columns as in `Arrow.Table`. `mmap` and `stringtype` have the same
+meaning and defaults as for [`Arrow.Table`](@ref). Satisfies `Tables.partitions` (each
 batch is one partition), so partition-aware sinks — including `Arrow.write`,
 which writes one record batch per partition — see the source batch structure.
 
@@ -1763,8 +1868,8 @@ time (plus the file's dictionaries) — the path for a file larger than RAM.
 The `Limits.max_total_allocated_bytes` security budget is cumulative across
 one `Stream` iterator, even after a batch is dropped; raise it explicitly for
 a trusted large file whose total decoded allocation exceeds the default.
-Every yielded `Table` shares the source lifetime: releasing a batch closes its
-parent `Stream`, while the batch's materialized columns remain usable.
+Every yielded `Table` shares the source lifetime: releasing a batch releases its
+parent `Stream` (see [`Arrow.release!`](@ref)).
 A STREAM-format source is read to the end and every batch is decoded when
 the `Stream` is constructed. A file-format `IO` or byte-vector input is read
 to the end too (the whole source stays in memory) but its record batches
@@ -1778,11 +1883,18 @@ struct Stream
     budget::AllocationBudget
     closed::AC.ReleaseCell
     arrowtypes::_ArrowTypesContext
+    views::_ViewContext
     arrowtypeslock::ReentrantLock
 end
 
-function Stream(source; mmap::Bool=true, limits::Limits=_defaultreaderlimits(source))
+function Stream(
+    source;
+    mmap::Bool=_MMAP_DEFAULT,
+    stringtype::Type=DataStrings.DataString,
+    limits::Limits=_defaultreaderlimits(source),
+)
     readlimits = _readerlimits(source, limits)
+    _checkstringtype(stringtype)
     budget = source isa IPCStream ? source.budget : _sourcebudget(source, readlimits)
     src = _opensource(source; mmap=mmap, limits=readlimits, budget=budget)
     regions = _sourceregions(src, budget)
@@ -1798,6 +1910,7 @@ function Stream(source; mmap::Bool=true, limits::Limits=_defaultreaderlimits(sou
         budget,
         only(regions).cell,
         _ArrowTypesContext(budget=budget),
+        _ViewContext(stringtype, budget),
         ReentrantLock(),
     )
 end
@@ -1834,12 +1947,15 @@ function Base.iterate(s::Stream, i::Int=1)
     fields = _batchfields(s.src)
     names = _fieldnamesymbols(fields, s.budget)
     arrowtypes = getfield(s, :arrowtypes)
+    views = getfield(s, :views)
     arrowtypeslock = getfield(s, :arrowtypeslock)
     lock(arrowtypeslock)
     try
         _chargevector!(s.budget, AbstractVector, length(fields), "table columns")
         cols = AbstractVector[
-            _facadesinglecolumn(f, b.columns[j], arrowtypes) for (j, f) in enumerate(fields)
+            _viewable(f) ? _viewcolumn(f, AC.ArrayData[b.columns[j]], views) :
+            _facadesinglecolumn(f, b.columns[j], arrowtypes) for
+            (j, f) in enumerate(fields)
         ]
         pools = _retaineddictpools(fields, (b,), arrowtypes)
         return _table(

@@ -309,13 +309,22 @@ else
 end
 
 # Map from a caller-owned open `io` (the caller closes it; the mapping
-# outlives the descriptor); `label` names the mapping in errors.
-function _mmapregion(io::IO, label)
+# outlives the descriptor); `label` names the mapping in errors. With
+# `eager=false`, `release!` only revokes the region and the mapping is unmapped
+# when its root is garbage collected: the form for memory that unowned views
+# still read after a release.
+function _mmapregion(io::IO, label; eager::Bool=true)
     arr = Mmap.mmap(io, Vector{UInt8})
     isempty(arr) && throw(ArgumentError("cannot map empty file: $label"))
-    cell = ReleaseCell(@cfunction(_release_mmap, Cvoid, (Ptr{Cvoid},)), _mmaproot(arr))
+    cell =
+        eager ?
+        ReleaseCell(@cfunction(_release_mmap, Cvoid, (Ptr{Cvoid},)), _mmaproot(arr)) :
+        ReleaseCell()
     return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr); root=arr, cell=cell)
 end
+
+"Unmap a mapped region's memory now. Nothing may read the region afterward."
+_unmap!(r::OwnerRegion) = finalize(_mmaproot(r.root::Vector{UInt8}))
 
 """
     mmapregion(path) -> OwnerRegion

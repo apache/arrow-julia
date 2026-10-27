@@ -486,7 +486,8 @@ end
                 return take!(io)
             end
 
-            table = Arrow.Table(bytes)
+            # Read columns are read-only views; edit an owned copy.
+            table = copy(Arrow.Table(bytes))
             table.x[1] = 100
             table.x[2] = missing
             rewritten = rewrite(table)

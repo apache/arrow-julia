@@ -33,12 +33,13 @@ presents everything to Julia through the [Tables.jl](https://tables.juliadata.or
 interface (Tables.jl 1.14 or later, for `Tables.Scan`).
 
 ```julia
-using Arrow, Tables
+using Arrow, Tables, DataFrames
 
 Arrow.write("data.arrow", (a = [1, 2, 3], b = ["x", "y", missing]))
 tbl = Arrow.Table("data.arrow")
-tbl.a            # Vector{Int64}
-tbl.b            # Vector{Union{Missing, String}}
+tbl.a            # a read-only view of the file's Int64 values
+tbl.b            # a DataStrings.StringVector of Union{Missing, DataString}
+df = Arrow.read("data.arrow", DataFrame)    # owned, mutable columns
 ```
 
 ## Reading
@@ -70,38 +71,52 @@ Tables.rowcount(tbl)                       # number of rows
 
 Pass `tbl` directly to any Tables.jl-compatible sink.
 
-Columns are **materialized**: each column is a plain Julia `Vector` with a
-concrete element type determined by the Arrow schema (see [Type
-mapping when reading](@ref)). A `Table` therefore does not borrow the source bytes after
-it is constructed, and its columns behave like any other Julia vectors.
+Column element types follow the Arrow schema (see [Type mapping when
+reading](@ref)). Flat columns read the Arrow buffers in place: numbers,
+booleans, temporal values, decimals, and dictionary-encoded values are
+read-only [`Arrow.ArrowVector`](@ref) views, so building a table costs time
+proportional to its columns and record batches, not its size. A column read
+from several record batches is a `ChainedVector` of per-batch views. String
+and binary columns are `DataStrings.StringVector` and `BytesVector`, built
+with one copy of their bytes; pass `stringtype=String` for `Vector{String}`
+columns. Nested and union columns are materialized vectors.
+
+Views are read-only. `copy(column)` returns an owned `Vector` (a
+`PooledArray` for a dictionary-encoded column), `copy(table)` copies every
+column, and `DataFrame(table)` copies once by default. [`Arrow.read`](@ref)
+hands a sink owned columns with exactly one copy:
+
+```julia
+df = Arrow.read("data.arrow", DataFrame)
+```
+
+A column keeps the memory it reads alive while it is reachable, even after
+its table is gone. Reductions such as `sum`, `count`, and `sum(skipmissing(col))`
+run directly on the buffers.
 
 ### Memory mapping and `release!`
 
 A path to a file-format source is memory-mapped by default (`mmap=true`), so
-reading a large file does not copy it into RAM up front; pass `mmap=false`
-to read it into memory instead (a stream-format path is always read into
-memory). A memory map is released when the last reference to it
-is garbage collected. To release it deterministically — required on Windows
-before a still-mapped file can be deleted, and useful anywhere for prompt
-resource release — call [`Arrow.release!`](@ref):
+opening a large file does not copy it into RAM; pass `mmap=false` to read it
+into memory instead (a stream-format path is always read into memory). A
+mapping is unmapped once the table and all of its columns are garbage
+collected. Windows cannot replace or delete a mapped file, so there the
+default is `mmap=false`. A byte vector is read in place: do not modify or
+resize it while the table's columns are in use.
+
+[`Arrow.release!`](@ref) ends a read: the table refuses further column
+access, and a released [`Arrow.Stream`](@ref) refuses further iteration
+(every yielded `Table` shares its parent's source, so releasing either one
+releases both). Columns taken before the release stay usable:
 
 ```julia
 tbl = Arrow.Table("data.arrow")
-# ... use tbl ...
-Arrow.release!(tbl)                          # unmaps NOW; tbl's columns remain usable
-rm("data.arrow")
+ids = tbl.id
+Arrow.release!(tbl)          # tbl.id now throws; `ids` still reads the file
 ```
 
-`release!` is idempotent. Because a `Table`'s columns are copies, a released
-`Table` remains fully usable; a released [`Arrow.Stream`](@ref) refuses
-further iteration cleanly. Every yielded `Table` shares the source lifetime:
-releasing a batch closes its parent `Stream`, while the batch's materialized
-columns remain usable.
-
-`copy(table)` copies the materialized columns and keeps no source mappings.
-Nested mutable values follow Julia's usual shallow `copy` rules.
 `Serialization.serialize` saves the table's Julia values, schema, and retained
-dictionary pools. Deserialization returns a table with no source mappings.
+dictionary pools. Deserialization returns a table with owned columns.
 
 ### `Arrow.Stream`
 
@@ -194,8 +209,9 @@ maps to `Union{Missing, T}`.
 | Int8…Int64, UInt8…UInt64 | the same-width `Integer` |
 | Float16/32/64 | `Float16`/`Float32`/`Float64` |
 | Bool | `Bool` |
-| Utf8, LargeUtf8, Utf8View | `String` |
-| Binary, LargeBinary, BinaryView, FixedSizeBinary | `Vector{UInt8}` |
+| Utf8, LargeUtf8, Utf8View | `DataStrings.DataString` (`String` with `stringtype=String`) |
+| Binary, LargeBinary, BinaryView | `DataStrings.DataBytes` |
+| FixedSizeBinary(N) | `NTuple{N,UInt8}` |
 | Date32 | `Dates.Date` |
 | Date64 | `Dates.DateTime` |
 | Timestamp (no timezone) | `Durations.Timestamp{P}` at the column unit (the stored UTC instant, exact at every unit) |
@@ -205,7 +221,8 @@ maps to `Union{Missing, T}`.
 | Decimal (nonnegative scale) | `DataDecimals.Decimal{P,S,T}` with `T` matching the descriptor width |
 | Decimal (negative scale) | raw storage: `Int32`/`Int64` (32/64-bit) or `Vector{UInt8}` (128/256-bit) |
 | Interval | `Durations.Duration` (month/day/nanosecond components) |
-| Dictionary-encoded scalar | the mapping of the *value* type (indices are resolved) |
+| Dictionary-encoded scalar | the mapping of the *value* type, in an `Arrow.DictEncoded` column whose codes `DataAPI.refarray`, `refpool`, and `levels` expose |
+| Run-end encoded scalar | the mapping of the *values* type, in an `Arrow.RunEndEncoded` column (runs are not expanded) |
 
 Composite layouts (list, struct, map, union) are read on the dynamic path
 (each row is built as a Julia value), and their column element type is
@@ -223,7 +240,7 @@ path):
 | Struct | `Vector{Pair{String,Any}}` (rows are ordered name => value pairs) |
 | Map | `Vector{Pair{Any,Any}}` |
 | Union | the join of the children's element types when it is concrete (a homogeneous union reads as that type); otherwise `Any`, narrowed from the rows |
-| Run-end encoded | the *values* child's element type (runs are expanded) |
+| Run-end encoded (composite values) | the *values* child's element type (runs are expanded) |
 | Null | `Missing` |
 
 Three refinements. A list-family field with a registered ArrowTypes.jl child
@@ -237,13 +254,13 @@ And field nullability is
 corpus accept a null under a `nullable=false` field), so a column that
 holds a null its field did not declare reads as `Union{Missing, T}` rather
 than failing; a conforming column keeps its declared, `Missing`-free type.
-Timestamps never truncate or wrap into `DateTime`: they materialize as
+Timestamps never truncate or wrap into `DateTime`: they read as
 `Durations.Timestamp` and `Durations.ZonedTimestamp` (both compare equal to
-`DateTime` values at the same instant) at every depth. Two kinds of invalid
-stored value have no exact public value: a time of day outside the format's
-[0, 24 h) range (`Dates.Time` wraps modulo 24 hours) and a decimal
-coefficient outside the field's declared precision. Reading one throws
-`Arrow.ValidationError`.
+`DateTime` values at the same instant) at every depth. A decimal coefficient
+outside the field's declared precision reads as stored, as in Arrow C++. A
+time of day outside the format's [0, 24 h) range has no `Dates.Time` value
+(it would wrap modulo 24 hours), so reading one throws
+`Arrow.ValidationError` naming the column.
 
 ### Scan pushdown
 

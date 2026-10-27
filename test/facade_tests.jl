@@ -190,10 +190,12 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test collect(DataAPI.metadatakeys(t)) == ["who"]
         @test DataAPI.colmetadata(t, :ints, "unit") == "count"
         @test_throws KeyError DataAPI.metadata(t, "absent")
-        # Materialized columns survive deterministic release; the mapping
-        # is gone, so the file is deletable everywhere (the Windows case).
+        # A released table refuses column access; a column taken before the
+        # release keeps the mapping alive and stays readable.
+        ints = t.ints
         Arrow.release!(t)
-        @test t.ints == MIXED.ints
+        @test_throws InvalidStateException t.ints
+        @test ints == MIXED.ints
         rm(path)
     end
 
@@ -247,24 +249,27 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             )
             partitionstream = Arrow.Stream(take!(partitionio))
             partition, state = iterate(partitionstream)
-            @test partition.x == [1]
+            x = partition.x
+            @test x == [1]
             Arrow.release!(partition)
-            @test partition.x == [1]
+            @test_throws InvalidStateException partition.x
+            @test x == [1]
             @test_throws InvalidStateException iterate(partitionstream, state)
         end
-        # A path-backed file uses the mmap owner. Releasing one yielded batch
-        # must close that owner before Windows permits deletion.
+        # A path-backed file's mapping is never unmapped eagerly (columns may
+        # still read it): releasing a yielded batch closes the stream, and
+        # garbage collection unmaps once nothing reaches the mapping.
         path = tempname()
         try
             Arrow.write(path, Tables.partitioner([(x=Int64[1],), (x=Int64[2],)]); file=true)
-            mappedstream = Arrow.Stream(path)
+            mappedstream = Arrow.Stream(path; mmap=true)
             mappedregion = only(getfield(mappedstream, :regions))
-            @test getfield(getfield(mappedregion, :cell), :action) != C_NULL
+            @test getfield(getfield(mappedregion, :cell), :action) == C_NULL
             mappedpartition, state = iterate(mappedstream)
+            x = mappedpartition.x
             Arrow.release!(mappedpartition)
-            rm(path)
-            @test !ispath(path)
-            @test mappedpartition.x == [1]
+            @test_throws InvalidStateException mappedpartition.x
+            @test x == [1]
             @test_throws InvalidStateException iterate(mappedstream, state)
         finally
             ispath(path) && rm(path)
@@ -379,21 +384,23 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             t = Arrow.Table(path)
             @test length(t.a) == 20_000_000 && t.a[end] == 20_000_000
             Arrow.release!(t)
-            # An explicit ceiling still applies.
-            @test_throws Arrow.AllocationLimitError Arrow.Table(
-                path;
-                limits=Arrow.Limits(max_total_allocated_bytes=256 * 1024^2),
-            )
             strings = [lpad(string(i), 64, 'x') for i = 1:1_000_000]
             Arrow.write(path, (s=strings,))
             t = Arrow.Table(path)
             @test t.s == strings
             Arrow.release!(t)
+            # An explicit ceiling still applies (string columns copy their
+            # bytes: about 80 MB here).
+            @test_throws Arrow.AllocationLimitError Arrow.Table(
+                path;
+                limits=Arrow.Limits(max_total_allocated_bytes=16 * 1024^2),
+            )
         finally
             rm(path; force=true)
         end
-        # A 464-byte file whose run-end encoded column claims ~1e9 rows has no
-        # bytes behind that length: it fails before allocating the column.
+        # A 464-byte file whose run-end encoded column claims ~1e9 rows reads
+        # as a run-end view: nothing proportional to the claimed length is
+        # allocated.
         rf, rd = Arrow.AC.fromjulia("run_ends", Int32[999_999_999])
         vf, vd = Arrow.AC.fromjulia("values", Int64[7])
         ree = Arrow.AC.RunEndEncodedType()
@@ -417,14 +424,11 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             Arrow.readstream(copy(bytes)),
             Arrow.readfile(copy(fbytes)),
         )
-            @test_throws Arrow.AllocationLimitError Arrow.Table(source)
+            r = Arrow.Table(source).r
+            @test length(r) == 999_999_999 && r[1] == 7 && r[end] == 7
         end
-        stats = @timed try
-            Arrow.Table(bytes)
-        catch err
-            err
-        end
-        @test stats.value isa Arrow.AllocationLimitError
+        stats = @timed Arrow.Table(bytes)
+        @test stats.value isa Arrow.Table
         @test stats.bytes < 64_000_000
     end
 
@@ -947,11 +951,12 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
                 Arrow.AC.BufferSlice(region, 0, 1),
             )
 
-            t = Arrow.Table(path)   # mmap by default for ARROW1 files
-            @test t.x == 1:10
+            t = Arrow.Table(path)   # mmap by default for ARROW1 files (not on Windows)
+            x = t.x
+            @test x == 1:10
             Arrow.release!(t)
-            rm(path)                # deletable post-close on every platform
-            @test t.x == 1:10
+            @test_throws InvalidStateException t.x
+            @test x == 1:10
         finally
             ispath(path) && rm(path)
         end
@@ -1034,13 +1039,13 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             file=false,
         )
         t = Arrow.Table(take!(io))
-        @test eltype(t.s) == Union{Missing,String}
-        @test eltype(t.m) == Union{Missing,String}
+        @test eltype(t.s) == Union{Missing,DataString}
+        @test eltype(t.m) == Union{Missing,DataString}
         # all-missing columns round-trip as their DECLARED type
         io2 = IOBuffer()
         Arrow.write(io2, t; file=false)
         t2 = Arrow.Table(take!(io2))
-        @test eltype(t2.m) == Union{Missing,String}
+        @test eltype(t2.m) == Union{Missing,DataString}
         @test isequal(t2.m, [missing, missing])
         # zero-row typed columns, including via a scan with no matches
         io3 = IOBuffer()
@@ -1063,9 +1068,9 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         sch = Tables.schema(t)
         @test !(sch isa Tables.Schema{nothing,nothing})
         @test sch.names == (:a, :b)
-        @test sch.types == (Int64, Union{Missing,String})
+        @test sch.types == (Int64, Union{Missing,DataString})
         rows = Tables.rowtable(t)
-        @test rows isa Vector{NamedTuple{(:a, :b),Tuple{Int64,Union{Missing,String}}}}
+        @test rows isa Vector{NamedTuple{(:a, :b),Tuple{Int64,Union{Missing,DataString}}}}
         @test [r.a for r in rows] == [1, 2, 3]
         @test isequal([r.b for r in rows], ["x", missing, "z"])
         # Above the threshold the schema keeps names and types in values so
@@ -1822,7 +1827,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         # keep the DECLARED element type, exactly like Tables.scan.
         t = Arrow.Table(fb; scan=Tables.Scan(select=(:x => Int64, :s => AbstractString)))
         @test eltype(t.x) == Union{Missing,Int64}
-        @test eltype(t.s) == Union{Missing,String}
+        @test eltype(t.s) == Union{Missing,DataString}
         io2 = IOBuffer()
         Arrow.write(io2, t; file=false)   # rewrites cleanly, metadata intact
         @test isequal(Arrow.Table(take!(io2)).x, [1, 2])
@@ -2200,7 +2205,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
                 bsch,
                 [Arrow.AC.RecordBatch(bsch, Arrow.AC.ArrayData[bd], n)],
             )
-            tb = Arrow.Table(bb; scan=Tables.Scan(select=(:b => Vector,)))
+            tb = Arrow.Table(bb; scan=Tables.Scan(select=(:b => AbstractVector,)))
             bsch2 = getfield(tb, :schema)
             @test length(bsch2.fields) == 1
             @test bsch2.fields[1].type isa Arrow.AC.BinaryType
@@ -2574,7 +2579,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         schd = AC.Schema([df])
         bytesd = Arrow.writefile(schd, AC.RecordBatch[AC.RecordBatch(schd, [dd], 3)])
         @test Arrow.Table(bytesd).d == ["lo", "hi", "lo"]
-        @test eltype(Arrow.Table(bytesd).d) === String
+        @test eltype(Arrow.Table(bytesd).d) === DataString
         pf0, pd = AC.fromjulia_dict("d", Union{Missing,String}["lo", missing], [0, 1, 0])
         pf = AC.Field(
             "d",
@@ -2585,7 +2590,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         schp = AC.Schema([pf])
         bytesp = Arrow.writefile(schp, AC.RecordBatch[AC.RecordBatch(schp, [pd], 3)])
         @test isequal(Arrow.Table(bytesp).d, ["lo", missing, "lo"])
-        @test eltype(Arrow.Table(bytesp).d) === Union{Missing,String}
+        @test eltype(Arrow.Table(bytesp).d) === Union{Missing,DataString}
         # a conforming batch keeps the declared, Missing-free type
         cf, cd = AC.fromjulia("c", Int64[1, 2])
         schc = AC.Schema([cf])
@@ -2608,7 +2613,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
                     [AC.BufferSlice(), AC._databuffer(Int32[0]), AC._databuffer(UInt8[])];
                     nullcount=0,
                 ),
-                Vector{UInt8},
+                DataStrings.DataBytes,
             ),
             (
                 "fsb",
@@ -2619,7 +2624,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
                     [AC.BufferSlice(), AC._databuffer(UInt8[])];
                     nullcount=0,
                 ),
-                Vector{UInt8},
+                NTuple{2,UInt8},
             ),
             (
                 "d128",
@@ -2726,7 +2731,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         end
         t = rt((; x=[(0x01, 0x02, 0x03), (0x04, 0x05, 0x06)]))
         @test fieldof(t).type == Arrow.AC.FixedSizeBinaryType(3)
-        @test t.x == [[1, 2, 3], [4, 5, 6]]
+        @test t.x == [(0x01, 0x02, 0x03), (0x04, 0x05, 0x06)]
         # UUID: canonical arrow.uuid, big-endian bytes; fresh and retained.
         u = Union{Missing,UUID}[UUID("00112233-4455-6677-8899-aabbccddeeff"), missing]
         t = rt((; x=u))
@@ -2905,7 +2910,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         # the way the CSV kernel does (inline ≤12, else a view into buffer 0
         # or the `extra` buffer 1) and check the writer wraps rather than
         # materializes, the file carries Utf8View, and the facade reads it
-        # back as ordinary Strings.
+        # back as a StringVector.
         buf = Vector{UInt8}(codeunits("id,s\n1,abcd\n2,thirteen-byte\n3,\n"))
         extra = Vector{UInt8}(codeunits("she said \"hi\" and left"))
         long1 = first(findfirst(codeunits("thirteen-byte"), buf))
@@ -2937,7 +2942,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         bytes = take!(io)
         @test Arrow.readfile(bytes).schema.fields[2].type == Arrow.AC.ViewType(true)
         t = Arrow.Table(bytes)
-        @test eltype(t.s) === Union{Missing,String}
+        @test eltype(t.s) === Union{Missing,DataString}
         @test isequal(t.s, expected)
         # a non-nullable column declares non-nullable
         col0 = StringVector{DataString}(payloads[[1, 2]], buf, extra)

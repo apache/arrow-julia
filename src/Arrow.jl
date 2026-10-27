@@ -48,6 +48,8 @@ using Tables
 import Base64
 import DataAPI
 import DataStrings, DataDecimals, Durations
+import PooledArrays
+using SentinelArrays: ChainedVector
 import ArrowTypes
 import Dates
 import Mmap
@@ -182,6 +184,8 @@ AC.ValidationError
             :public,
             :Table,
             :Stream,
+            :read,
+            :ArrowVector,
             :write,
             :Writer,
             :append,
