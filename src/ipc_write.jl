@@ -395,8 +395,10 @@ payload. Zero-length buffers write no body bytes in either mode. The recorded
 Buffer length is the wire length; 8-byte alignment padding sits between
 buffers and belongs to neither.
 """
-encodebuffer!(c::EncodeCursor, bytes::Vector{UInt8}) =
-    encodebuffer!(c, AC.BufferSlice(AC.heapregion(bytes), 0, length(bytes)))
+function encodebuffer!(c::EncodeCursor, bytes::Vector{UInt8})
+    c.codec == CODEC_NONE || isempty(bytes) || return _encodecompressed!(c, bytes)
+    return encodebuffer!(c, AC.BufferSlice(AC.heapregion(bytes), 0, length(bytes)))
+end
 
 function encodebuffer!(c::EncodeCursor, b::AC.BufferSlice)
     offset = c.bodylen
@@ -410,7 +412,12 @@ function encodebuffer!(c::EncodeCursor, b::AC.BufferSlice)
         _addpiece!(c, b)
         return nothing
     end
-    raw = AC.slicebytes(b)
+    # Compression reads the slice as a vector.
+    return _encodecompressed!(c, AC.slicebytes(b))
+end
+
+function _encodecompressed!(c::EncodeCursor, raw::Vector{UInt8})
+    offset = c.bodylen
     compressed = _compressbytes(c.state::EncodeState, c.codec, raw)
     shrinks = length(compressed) < length(raw)
     payload = shrinks ? compressed : raw
