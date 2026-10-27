@@ -19,9 +19,14 @@
 
 # Design: the Arrow 3.x incremental writer
 
-Status: PROPOSAL (not yet reviewed). Motivating issues: #237, #244, #247,
-#413 (write memory), #485/#501 (Writer/append removal fallout), Pioneer.jl
-and SpineOpt.jl migration blockers.
+Status: implemented, and the implementation differs from this proposal:
+`Arrow.write` also streams (one partition in memory at a time), the Writer
+declares every field nullable by default and widens later tables losslessly,
+and dictionaries grow by delta batches in both formats. The manual
+(`docs/src/manual.md`) and the docstrings describe the current behavior.
+Motivating issues: #237, #244, #247, #413 (write memory), #485/#501
+(Writer/append removal fallout), Pioneer.jl and SpineOpt.jl migration
+blockers.
 
 ## Problem
 
