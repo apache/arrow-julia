@@ -533,28 +533,34 @@ function _packedpayloadpart(
     runstart = 0
     runok = true
     longbytes = 0
-    @inbounds for b in eachindex(bits)
-        base = (b - 1) << 3
-        byte = 0x00
-        for j = 0:(min(8, n - base) - 1)
-            i = base + j + 1
-            p = payloads[i]
-            len = Int(DataStrings.payloadlength(p))
-            if len > DataStrings.INLINE_MAX
-                k = Int(DataStrings.payloadbufidx(p)) + 1
-                at = Int(DataStrings.payloadoffset(p)) - pos
-                runbuf == 0 && (runbuf=k; runstart=at)
-                runok &= k == runbuf && at == runstart
-                longbytes += len
+    GC.@preserve payloads begin
+        entries = Ptr{DataStrings.StringPayload}(pointer(payloads))
+        @inbounds for b in eachindex(bits)
+            base = (b - 1) << 3
+            byte = 0x00
+            for j = 0:(min(8, n - base) - 1)
+                i = base + j + 1
+                p = unsafe_load(entries, i)
+                len = Int(DataStrings.payloadlength(p))
+                if len > DataStrings.INLINE_MAX
+                    k = Int(DataStrings.payloadbufidx(p)) + 1
+                    at = Int(DataStrings.payloadoffset(p)) - pos
+                    if runbuf == 0
+                        runbuf = k
+                        runstart = at
+                    end
+                    runok &= k == runbuf && at == runstart
+                    longbytes += len
+                end
+                present = len >= 0
+                pos += ifelse(present, len, 0)
+                pos <= typemax(Offset) || throw(_OffsetOverflow(name, 0, i))
+                byte |= UInt8(present) << (j % UInt)
+                offsets[i + 1] = pos
             end
-            present = len >= 0
-            pos += ifelse(present, len, 0)
-            pos <= typemax(Offset) || throw(_OffsetOverflow(name, 0, i))
-            byte |= UInt8(present) << (j % UInt)
-            offsets[i + 1] = pos
+            bits[b] = byte
+            valid += count_ones(byte)
         end
-        bits[b] = byte
-        valid += count_ones(byte)
     end
     nc = n - valid
     validity =
@@ -573,8 +579,9 @@ function _packedpayloadpart(
     GC.@preserve payloads buffers data begin
         out = pointer(data)
         entries = Ptr{UInt8}(pointer(payloads))
+        payloadptr = Ptr{DataStrings.StringPayload}(entries)
         @inbounds for i = 1:n
-            p = payloads[i]
+            p = unsafe_load(payloadptr, i)
             len = Int(DataStrings.payloadlength(p))
             len <= 0 && continue
             if len <= DataStrings.INLINE_MAX
@@ -618,8 +625,9 @@ function _inlineinrun(payloads, offsets, buffers, k::Int, start::Int)
     GC.@preserve payloads buf begin
         base = pointer(buf) + start
         entries = Ptr{UInt8}(pointer(payloads))
-        @inbounds for i in eachindex(payloads)
-            len = Int(DataStrings.payloadlength(payloads[i]))
+        payloadptr = Ptr{DataStrings.StringPayload}(entries)
+        @inbounds for i = 1:length(payloads)
+            len = Int(DataStrings.payloadlength(unsafe_load(payloadptr, i)))
             0 < len <= DataStrings.INLINE_MAX || continue
             at = Int(offsets[i])
             inline = entries + 16 * (i - 1) + 4
