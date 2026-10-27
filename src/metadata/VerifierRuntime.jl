@@ -114,10 +114,12 @@ function _vcount!(ctx::VerifyContext, n::Int64, what::AbstractString)
 end
 
 function _vrange(bytes::Vector{UInt8}, pos::Int64, len::Int64, what::AbstractString)
-    (pos >= 0 && len >= 0 && len <= length(bytes) && pos <= length(bytes) - len) ||
-        _vfail("$what is outside metadata")
+    _vinrange(bytes, pos, len) || _vfail("$what is outside metadata")
     return pos
 end
+
+@inline _vinrange(bytes::Vector{UInt8}, pos::Int64, len::Int64) =
+    pos >= 0 && len >= 0 && len <= length(bytes) && pos <= length(bytes) - len
 
 function _vu(bytes, pos::Int64, width::Base.Int)
     _vrange(bytes, pos, Int64(width), "scalar")
@@ -178,10 +180,11 @@ function _vfield(t::VTable, slot::Base.Int, width::Base.Int=1; required::Base.Bo
     # comparing slot offsets only, so a reused vtable can understate olen for
     # a wider field (e.g. a DictionaryEncoding id sharing a two-ref KeyValue
     # vtable). The reference verifier bounds inline fields by the buffer,
-    # which the _vrange below enforces.
+    # which the range check below enforces.
     off >= 4 || _vfail("table slot $slot overlaps the table header")
     p = t.pos + off
-    _vrange(t.bytes, p, Int64(width), "table slot $slot")
+    # Build the message only on failure: this runs for every verified slot.
+    _vinrange(t.bytes, p, Int64(width)) || _vfail("table slot $slot is outside metadata")
     width > 1 && p % min(width, 8) != 0 && _vfail("table slot $slot is misaligned")
     return p
 end
@@ -192,7 +195,8 @@ function _vref(t::VTable, slot::Base.Int; required::Base.Bool=false)
     rel = Int64(_vu32(t.bytes, p))
     rel > 0 || _vfail("reference slot $slot has a null/backward offset")
     target = checked_add(p, rel)
-    _vrange(t.bytes, target, Int64(1), "reference slot $slot target")
+    _vinrange(t.bytes, target, Int64(1)) ||
+        _vfail("reference slot $slot target is outside metadata")
     return target
 end
 

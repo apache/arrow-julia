@@ -891,9 +891,15 @@ end
 # and mmapped messages, or a sparse body (scan.jl) whose fetched
 # spans stand in for the contiguous message body. `_bodyslice` is the one
 # seam between them; the parameter keeps the cursor concrete per use.
-mutable struct DecodeCursor{B}
-    nodes::AbstractVector{Meta.FieldNode}
-    buffers::AbstractVector{Meta.Buffer}
+# Concretely typed vectors: node and buffer reads run once per field per batch.
+mutable struct DecodeCursor{
+    B,
+    N<:AbstractVector{Meta.FieldNode},
+    U<:AbstractVector{Meta.Buffer},
+    V<:AbstractVector{<:Integer},
+}
+    nodes::N
+    buffers::U
     body::B
     max_buffer_bytes::Int64
     max_array_length::Int64
@@ -905,7 +911,7 @@ mutable struct DecodeCursor{B}
     # One entry per view-typed field in depth-first schema order: how many
     # variadic data buffers that field consumes (format 1.4). Non-view
     # batches carry an empty vector; a leftover entry is a skew error.
-    variadics::AbstractVector{<:Integer}
+    variadics::V
     varidx::Int
 end
 
@@ -1137,7 +1143,7 @@ function decodefield(
 )
     t = f.type
     node = takenode!(c)
-    spec = layoutspec(t)
+    spec = AC.layoutspec_of(t)
     buffers = BufferSlice[takebuffer!(c) for _ in spec.buffers]
     if spec.variadic
         # View layouts append their declared count of variadic data buffers

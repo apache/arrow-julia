@@ -1580,17 +1580,11 @@ function _validate_semantic_intrinsic(
                 else
                     isempty(d.children) ? Int64(0) : Int64(length(d.children[1]))
                 end
-                prev = _load_offset(offs, wide, d.offset)
-                prev >= 0 || throw(ValidationError("negative first offset"))
-                for i = 1:(d.len)
-                    cur = _load_offset(offs, wide, checked_add(d.offset, Int64(i)))
-                    cur >= prev || throw(
-                        ValidationError("offsets not monotonically non-decreasing at $i"),
-                    )
-                    prev = cur
-                end
-                prev <= databytes || throw(
-                    ValidationError("final offset $prev exceeds data extent $databytes"),
+                _load_offset(offs, wide, d.offset) >= 0 ||
+                    throw(ValidationError("negative first offset"))
+                last = _monotonicoffsets(offs, wide, d.offset, d.len)
+                last <= databytes || throw(
+                    ValidationError("final offset $last exceeds data extent $databytes"),
                 )
             end
         end
@@ -1598,12 +1592,16 @@ function _validate_semantic_intrinsic(
             dictlen = length(d.dictionary)
             data = rolebuffer(d, DATA)
             w = primwidth(t.indextype)
-            for i = 1:(d.len)
-                isvalid_at(d, i) || continue
-                idx = _load_int(data, t.indextype, _slotbyteoff(d, Int64(i), w))
-                0 <= idx < dictlen || throw(
-                    ValidationError("dictionary index $idx out of bounds [0, $dictlen)"),
-                )
+            if !_dictindicesinrange(d, t.indextype, dictlen)
+                for i = 1:(d.len)
+                    isvalid_at(d, i) || continue
+                    idx = _load_int(data, t.indextype, _slotbyteoff(d, Int64(i), w))
+                    0 <= idx < dictlen || throw(
+                        ValidationError(
+                            "dictionary index $idx out of bounds [0, $dictlen)",
+                        ),
+                    )
+                end
             end
         end
         if t isa UnionType
@@ -1688,6 +1686,59 @@ function _viewdatabuffer(d::ArrayData, bufidx::Int32)
 end
 
 """
+Whether every valid slot's dictionary index lies in `[0, dictlen)`: one
+bounds check for the index window, then a branch-free pass. `false` sends
+the caller to the per-slot loop that names the offending index.
+"""
+function _dictindicesinrange(d::ArrayData, it::IntType, dictlen::Int64)
+    d.len == 0 && return true
+    w = Int64(primwidth(it))
+    src = subslice(rolebuffer(d, DATA), checked_mul(d.offset, w), checked_mul(d.len, w))
+    validity = validitybuffer(d)
+    ok = GC.@preserve d begin
+        p = sliceptr(src)
+        if it.signed
+            w == 1 ? _indicesinrange(Ptr{Int8}(p), d, validity, dictlen) :
+            w == 2 ? _indicesinrange(Ptr{Int16}(p), d, validity, dictlen) :
+            w == 4 ? _indicesinrange(Ptr{Int32}(p), d, validity, dictlen) :
+            _indicesinrange(Ptr{Int64}(p), d, validity, dictlen)
+        else
+            w == 1 ? _indicesinrange(Ptr{UInt8}(p), d, validity, dictlen) :
+            w == 2 ? _indicesinrange(Ptr{UInt16}(p), d, validity, dictlen) :
+            w == 4 ? _indicesinrange(Ptr{UInt32}(p), d, validity, dictlen) :
+            _indicesinrange(Ptr{UInt64}(p), d, validity, dictlen)
+        end
+    end
+    return ok
+end
+
+function _indicesinrange(
+    p::Ptr{T},
+    d::ArrayData,
+    validity::BufferSlice,
+    dictlen::Int64,
+) where {T}
+    ok = true
+    if isempty_buffer(validity)
+        for i = 1:(d.len)
+            # A UInt64 above typemax(Int64) reinterprets negative and fails.
+            x =
+                T === UInt64 ? reinterpret(Int64, unsafe_load(p, i)) :
+                Int64(unsafe_load(p, i))
+            ok &= (0 <= x) & (x < dictlen)
+        end
+    else
+        for i = 1:(d.len)
+            x =
+                T === UInt64 ? reinterpret(Int64, unsafe_load(p, i)) :
+                Int64(unsafe_load(p, i))
+            ok &= !getbit(validity, _slotindex0(d, Int64(i))) | ((0 <= x) & (x < dictlen))
+        end
+    end
+    return ok
+end
+
+"""
 Semantic checks for Utf8View/BinaryView: non-null long entries must point
 inside their indicated variadic buffer, and the inline prefix MUST be a copy
 of the referenced data's first four bytes (the spec's comparison-fast-path
@@ -1697,24 +1748,32 @@ bytes is a writer recommendation no validation tier enforces:
 `validate_full`'s canonical-form checks cover bit-packed buffers only.
 """
 function _validate_view_values(t::ViewType, d::ArrayData)
+    d.len == 0 && return nothing
     views = rolebuffer(d, VIEWS)
-    for i = 1:(d.len)
-        isvalid_at(d, i) || continue
-        base = _viewbase(d, Int64(i))
-        len = loadat(views, Int32, base)
-        len >= 0 || throw(ValidationError("negative view length $len"))
-        len <= VIEW_INLINE_MAX && continue
-        bufidx = loadat(views, Int32, checked_add(base, Int64(8)))
-        off = Int64(loadat(views, Int32, checked_add(base, Int64(12))))
-        data = _viewdatabuffer(d, bufidx)
-        off >= 0 || throw(ValidationError("negative view offset $off"))
-        # Both operands are 32-bit loads, so the sum cannot overflow Int64.
-        checked_add(off, Int64(len)) <= data.len || throw(
-            ValidationError("view range [$off, $(off + len)) escapes data buffer $bufidx"),
-        )
-        for k = 0:3
-            loadat(views, UInt8, checked_add(base, Int64(4 + k))) ==
-            loadat(data, UInt8, checked_add(off, Int64(k))) ||
+    # One bounds check for every entry, then raw loads per row.
+    entries = subslice(views, _viewbase(d, Int64(1)), checked_mul(d.len, Int64(16)))
+    validity = validitybuffer(d)
+    GC.@preserve d begin
+        p = sliceptr(entries)
+        for i = 1:(d.len)
+            (isempty_buffer(validity) || getbit(validity, _slotindex0(d, Int64(i)))) ||
+                continue
+            e = p + 16 * (i - 1)
+            len = unsafe_load(Ptr{Int32}(e))
+            len >= 0 || throw(ValidationError("negative view length $len"))
+            len <= VIEW_INLINE_MAX && continue
+            bufidx = unsafe_load(Ptr{Int32}(e + 8))
+            off = Int64(unsafe_load(Ptr{Int32}(e + 12)))
+            data = _viewdatabuffer(d, bufidx)
+            off >= 0 || throw(ValidationError("negative view offset $off"))
+            # Both operands are 32-bit loads, so the sum cannot overflow Int64.
+            off + Int64(len) <= data.len || throw(
+                ValidationError(
+                    "view range [$off, $(off + len)) escapes data buffer $bufidx",
+                ),
+            )
+            unsafe_load(Ptr{UInt32}(e + 4)) ==
+            unsafe_load(Ptr{UInt32}(sliceptr(data) + off)) ||
                 throw(ValidationError("view prefix does not match referenced data"))
         end
     end
@@ -2335,6 +2394,38 @@ end
 @inline function _load_offset(offs::BufferSlice, wide::Bool, idx0::Int64)::Int64
     return wide ? loadat(offs, Int64, checked_mul(idx0, Int64(8))) :
            Int64(loadat(offs, Int32, checked_mul(idx0, Int64(4))))
+end
+
+"""
+The last of the `n + 1` offsets that start at 0-based entry `start0` of
+`offs`, after checking that they never decrease. One bounds check covers the
+window, and the check runs branch-free so it vectorizes.
+"""
+function _monotonicoffsets(offs::BufferSlice, wide::Bool, start0::Int64, n::Int64)::Int64
+    w = wide ? Int64(8) : Int64(4)
+    first = checked_mul(start0, w)
+    span = checked_mul(checked_add(n, Int64(1)), w)
+    (first >= 0 && span <= offs.len && first <= offs.len - span) ||
+        throw(BoundsError(offs, checked_add(start0, n)))
+    last = GC.@preserve offs begin
+        p = sliceptr(offs) + first
+        wide ? _monotonic(Ptr{Int64}(p), n) : _monotonic(Ptr{Int32}(p), n)
+    end
+    return last
+end
+
+function _monotonic(p::Ptr{T}, n::Int64)::Int64 where {T}
+    ok = true
+    for i = 1:n
+        ok &= unsafe_load(p, i) <= unsafe_load(p, i + 1)
+    end
+    if !ok
+        for i = 1:n
+            unsafe_load(p, i) <= unsafe_load(p, i + 1) ||
+                throw(ValidationError("offsets not monotonically non-decreasing at $i"))
+        end
+    end
+    return Int64(unsafe_load(p, n + 1))
 end
 
 @inline function _offsets_at(d::ArrayData, i::Int64, wide::Bool)
