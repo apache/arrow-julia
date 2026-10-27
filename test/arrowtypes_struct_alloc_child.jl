@@ -129,9 +129,10 @@ function constructretained(field, rows)
 end
 
 # Least of three warm readings, each after a full collection. `@allocated`
-# counts each big block's usable size, which an allocator that hands back a
-# larger cached block (macOS malloc does) inflates by up to the request; a
-# real extra allocation shows in every reading.
+# counts each big block's usable size; the parent test runs this file with
+# MallocLargeCache=0 so macOS malloc does not hand a request a larger cached
+# region (counted as up to twice the request). A real extra allocation shows
+# in every reading.
 function leastallocated(f)
     least = typemax(Int)
     for _ = 1:3

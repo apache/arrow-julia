@@ -3372,18 +3372,17 @@ end
     end
     registeredhidden(2)
     registeredhidden(1_000)
-    fixedlistallocchild = joinpath(@__DIR__, "arrowtypes_fixedlist_alloc_child.jl")
-    fixedlistallocoutput = read(
-        `$(Base.julia_cmd()) --startup-file=no --history-file=no --project=$(Base.active_project()) $fixedlistallocchild`,
-        String,
+    # `@allocated` counts a big block's usable size, and macOS malloc can hand
+    # a request a cached region of up to twice its size; the allocation
+    # children run with that cache off so their readings track the requests.
+    allocchild(file) = addenv(
+        `$(Base.julia_cmd()) --startup-file=no --history-file=no --project=$(Base.active_project()) $(joinpath(@__DIR__, file))`,
+        "MallocLargeCache" => "0",
     )
+    fixedlistallocoutput = read(allocchild("arrowtypes_fixedlist_alloc_child.jl"), String)
     @test occursin("ArrowTypes fixed-list allocation guard passed", fixedlistallocoutput)
 
-    structallocchild = joinpath(@__DIR__, "arrowtypes_struct_alloc_child.jl")
-    structallocoutput = read(
-        `$(Base.julia_cmd()) --startup-file=no --history-file=no --project=$(Base.active_project()) $structallocchild`,
-        String,
-    )
+    structallocoutput = read(allocchild("arrowtypes_struct_alloc_child.jl"), String)
     @test occursin("ArrowTypes Struct allocation guard passed", structallocoutput)
 
     countedchild = ARROWTYPES_TEST_AC.Field(
