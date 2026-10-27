@@ -1560,13 +1560,19 @@ function arrowtypes_test_retained_replacement_error(field, data, replacement, me
     return nothing
 end
 
+# The Core fields and decoded record batches of IPC bytes of either format.
+function arrowtypes_test_batches(bytes)
+    if view(bytes, 1:6) == b"ARROW1"
+        file = Arrow.readfile(bytes)
+        return file.fields, [file[i] for i = 1:length(file)]
+    end
+    stream = Arrow.readstream(bytes)
+    return stream.corefields, stream.batches
+end
+
 function arrowtypes_test_core_parts(bytes)
-    stream = Arrow.Stream(bytes)
-    source = getfield(stream, :src)
-    budget = getfield(stream, :budget)
-    field = Arrow._batchfields(source)[1]
-    batches = [Arrow._batch(source, i, budget) for i = 1:Arrow._nbatches(source)]
-    return field, batches
+    fields, batches = arrowtypes_test_batches(bytes)
+    return fields[1], batches
 end
 
 @testset "module boundary" begin
@@ -5904,10 +5910,8 @@ end
         @test DataAPI.colmetadata(table, :point, "ARROW:extension:metadata") == "dictionary"
         @test DataAPI.colmetadata(table, :point, "application:key") == "kept"
 
-        stream = Arrow.Stream(bytes)
-        source = getfield(stream, :src)
-        budget = getfield(stream, :budget)
-        batches = [Arrow._batch(source, i, budget) for i = 1:2]
+        _, batches = arrowtypes_test_batches(bytes)
+        @test length(batches) == 2
         # The all-missing first partition writes an empty pool; the second's
         # categories extend it.
         @test length(batches[1].columns[1].dictionary) == (file ? 2 : 0)
@@ -5931,25 +5935,19 @@ end
         @test DataAPI.colmetadata(rewritten_table, :point, "ARROW:extension:metadata") ==
               "dictionary"
         @test DataAPI.colmetadata(rewritten_table, :point, "application:key") == "kept"
-        rewritten_stream = Arrow.Stream(rewritten)
-        rewritten_source = getfield(rewritten_stream, :src)
-        rewritten_budget = getfield(rewritten_stream, :budget)
-        rewritten_batches =
-            [Arrow._batch(rewritten_source, i, rewritten_budget) for i = 1:2]
+        _, rewritten_batches = arrowtypes_test_batches(rewritten)
+        @test length(rewritten_batches) == 2
         @test length(rewritten_batches[2].columns[1].dictionary) == 2
     end
 end
 
 @testset "DictEncode NullType keeps valid values distinct from outer nulls" begin
     function checknullencoding(bytes, expectedvalid; nullable::Bool)
-        stream = Arrow.Stream(bytes)
-        source = getfield(stream, :src)
-        budget = getfield(stream, :budget)
-        field = Arrow._batchfields(source)[1]
+        fields, batches = arrowtypes_test_batches(bytes)
+        field = fields[1]
         @test field.type isa ARROWTYPES_TEST_AC.DictionaryType
         @test field.type.valuetype isa ARROWTYPES_TEST_AC.NullType
         @test field.nullable == nullable
-        batches = [Arrow._batch(source, i, budget) for i = 1:Arrow._nbatches(source)]
         @test length(batches) == length(expectedvalid)
         for (batch, valid) in zip(batches, expectedvalid)
             data = batch.columns[1]

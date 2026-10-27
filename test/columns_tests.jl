@@ -459,4 +459,75 @@ end
         @test nt.l == [[1], [2, 3], Int[]]
         @test_throws ArgumentError Arrow.read(bytes)
     end
+
+    @testset "reads give the same columns for any ntasks" begin
+        n = 150_000   # string columns span several chunks of rows
+        word(i) = i % 7 == 0 ? "" : repeat(string(i, base=36), 1 + i % 5)
+        part(r) = (
+            x=collect(Int64, r),
+            f=[isodd(i) ? missing : i / 2 for i in r],
+            s=[i % 11 == 0 ? missing : word(i) for i in r],
+            v=[word(i) for i in r],
+            b=[Vector{UInt8}(word(i)) for i in r],
+            c=PooledArray([isodd(i) ? "odd" : "even" for i in r]),
+            d=[reinterpret(Decimal{20,2,Int128}, Int128(i)) for i in r],
+            t=[Date(2000) + Day(i % 1000) for i in r],
+            q=[isodd(i) for i in r],
+        )
+        parts = Tables.partitioner([part(1:n), part((n + 1):(2n)), part(1:0)])
+        same(a, b) = typeof(a) == typeof(b) && isequal(collect(a), collect(b))
+        for (file, compress) in
+            ((true, nothing), (true, :zstd), (true, :lz4), (false, :zstd))
+            bytes = arrowbytes(parts; file=file, compress=compress, stringview=false)
+            views = arrowbytes(parts; file=file, compress=compress, stringview=true)
+            for src in (bytes, views), stringtype in (DataString, String)
+                one = Arrow.Table(src; ntasks=1, stringtype=stringtype)
+                for ntasks in (2, 5)
+                    t = Arrow.Table(src; ntasks=ntasks, stringtype=stringtype)
+                    @test all(
+                        same(Tables.getcolumn(t, nm), Tables.getcolumn(one, nm)) for
+                        nm in Tables.columnnames(one)
+                    )
+                end
+                for (b1, b5) in
+                    zip(Arrow.Stream(src; ntasks=1), Arrow.Stream(src; ntasks=5))
+                    @test all(
+                        same(Tables.getcolumn(b5, nm), Tables.getcolumn(b1, nm)) for
+                        nm in Tables.columnnames(b1)
+                    )
+                end
+                scan = Tables.Scan(select=(:s, :x, :c))
+                @test all(
+                    same(
+                        Tables.getcolumn(Arrow.Table(src; scan=scan, ntasks=5), nm),
+                        Tables.getcolumn(Arrow.Table(src; scan=scan, ntasks=1), nm),
+                    ) for nm in (:s, :x, :c)
+                )
+            end
+        end
+        @test_throws ArgumentError Arrow.Table(arrowbytes(part(1:3)); ntasks=0)
+        @test_throws ArgumentError Arrow.Stream(arrowbytes(part(1:3)); ntasks=-1)
+    end
+
+    @testset "parallel work reports the first failing item" begin
+        for ntasks in (1, 3, 8)
+            ran = zeros(Int, 20)
+            err = try
+                Arrow._foreach(20, ntasks) do i, w
+                    @test 1 <= w <= min(20, ntasks)
+                    ran[i] += 1
+                    i in (6, 9, 14) && error("item $i")
+                end
+                nothing
+            catch e
+                e
+            end
+            @test err isa ErrorException && err.msg == "item 6"
+            # Every item before the first failure ran exactly once.
+            @test all(==(1), ran[1:6]) && all(<=(1), ran)
+            ran .= 0
+            Arrow._foreach((i, w) -> (ran[i] += 1), 20, ntasks)
+            @test all(==(1), ran)
+        end
+    end
 end

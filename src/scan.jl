@@ -1061,21 +1061,10 @@ function _addscanrows(total::Int, rows::Int64)
     return total + Int(rows)
 end
 
-function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool}, state::DecodeState)
-    fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, state.budget)
-    return _maskedrecord(
-        fm.msg,
-        fm.version,
-        fm.body,
-        f.fields,
-        f.dictionaries,
-        f.fielddictids,
-        f.validated,
-        f.limits,
-        f.schemaversion,
-        mask,
-        state,
-    )
+# The fields `mask` selects of batch `i`, decoded on at most `ntasks` tasks.
+function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool}, budget, ntasks::Int)
+    plans, cols = _filebatches(f, (i,), budget, ntasks, mask)
+    return only(plans).rblen, only(cols)
 end
 
 # ---------------------------------------------------------------------------
@@ -1379,6 +1368,7 @@ function _runboundscan(
     names::Vector{Symbol},
     budget::AllocationBudget,
     materializecolumn,
+    ntasks::Int=1,
 )
     if isempty(names)
         # Zero-field sources consume their filter and window here because an
@@ -1398,84 +1388,78 @@ function _runboundscan(
     _chargebitvector!(budget, length(names), "scan decode mask")
     mask = falses(length(names))
     mask[sink.decodeidx] .= true
-    state = DecodeState(budget)
-    try
-        # Without a filter the window is metadata arithmetic: batches outside
-        # it are never decoded. With one, the sink composes it over
-        # qualifying rows as batches decode.
-        windowed = b.filter === nothing && (b.limit !== nothing || b.offset > 0)
-        window = if windowed
-            _chargevector!(budget, Int64, length(f), "scan batch row counts")
-            _batchwindow(
-                Int64[_batchrows(f, i, budget) for i = 1:length(f)],
-                b.offset,
-                b.limit,
-                budget,
-            )
-        else
-            _chargevector!(budget, Tuple{Int,Int64,Int64}, length(f), "scan batch window")
-            Tuple{Int,Int64,Int64}[(i, Int64(0), Int64(-1)) for i = 1:length(f)]
-        end
-        # Statistics pruning: one-sided — a pruned batch is provably empty
-        # under the filter; the rows of the rest are decided by the sink.
-        _chargebitvector!(budget, length(f), "scan statistics decisions")
-        keep = trues(length(f))
-        if b.filter !== nothing
-            stats = _readstats(
-                f.schema.metadata,
-                length(f),
-                f.fields;
-                limits=f.limits,
-                budget=budget,
-            )
-            if stats !== nothing
-                context = _statscontext(b.filter, names, budget)
-                for i in eachindex(keep)
-                    keep[i] =
-                        _maypass(b.filter, stats[i].cols, names, stats[i].rows, context)
-                end
-            end
-        end
-        # A filtered scan with `limit == 0` is closed before the first batch
-        # (`_sinkopen`), so it reserves no part slots at all.
-        partcapacity =
-            b.filter !== nothing && b.limit == 0 ? 0 :
-            count(entry -> keep[first(entry)], window)
-        _reservesinkparts!(sink, partcapacity)
-        # Late materialization: a filtered batch decodes its filter columns
-        # first and the other selected columns only if some row qualifies.
-        _chargevector!(budget, Int, length(sink.decodeidx), "scan late-column index")
-        restidx = setdiff(sink.decodeidx, sink.filteridx)
-        late = b.filter !== nothing && !isempty(sink.filteridx) && !isempty(restidx)
-        if late
-            _chargebitvector!(budget, length(names), "scan filter decode mask")
-            _chargebitvector!(budget, length(names), "scan late decode mask")
-            filtermask = falses(length(names))
-            filtermask[sink.filteridx] .= true
-            restmask = falses(length(names))
-            restmask[restidx] .= true
-        end
-        for (i, skip, take) in window
-            _sinkopen(sink) || break
-            keep[i] || continue
-            if late
-                rblen, cols = _scanbatch(f, i, filtermask, state)
-                decoded =
-                    _materializecolumns!(_decodedcolumns(sink), sink, cols, sink.filteridx)
-                rows = _sinkrows(sink, decoded, rblen, skip, take)
-                isempty(rows) && continue
-                _, rest = _scanbatch(f, i, restmask, state)
-                _materializecolumns!(decoded, sink, rest, restidx)
-                _keeprows!(sink, decoded, rows, rblen)
-            else
-                rblen, cols = _scanbatch(f, i, mask, state)
-                _consumebatch!(sink, cols, rblen, skip, take)
-            end
-        end
-        return _sinkresult(sink)
-    finally
-        close(state)
+    # Without a filter the window is metadata arithmetic: batches outside
+    # it are never decoded. With one, the sink composes it over
+    # qualifying rows as batches decode.
+    windowed = b.filter === nothing && (b.limit !== nothing || b.offset > 0)
+    window = if windowed
+        _chargevector!(budget, Int64, length(f), "scan batch row counts")
+        _batchwindow(
+            Int64[_batchrows(f, i, budget) for i = 1:length(f)],
+            b.offset,
+            b.limit,
+            budget,
+        )
+    else
+        _chargevector!(budget, Tuple{Int,Int64,Int64}, length(f), "scan batch window")
+        Tuple{Int,Int64,Int64}[(i, Int64(0), Int64(-1)) for i = 1:length(f)]
     end
+    # Statistics pruning: one-sided — a pruned batch is provably empty
+    # under the filter; the rows of the rest are decided by the sink.
+    _chargebitvector!(budget, length(f), "scan statistics decisions")
+    keep = trues(length(f))
+    if b.filter !== nothing
+        stats = _readstats(
+            f.schema.metadata,
+            length(f),
+            f.fields;
+            limits=f.limits,
+            budget=budget,
+        )
+        if stats !== nothing
+            context = _statscontext(b.filter, names, budget)
+            for i in eachindex(keep)
+                keep[i] = _maypass(b.filter, stats[i].cols, names, stats[i].rows, context)
+            end
+        end
+    end
+    # A filtered scan with `limit == 0` is closed before the first batch
+    # (`_sinkopen`), so it reserves no part slots at all.
+    partcapacity =
+        b.filter !== nothing && b.limit == 0 ? 0 :
+        count(entry -> keep[first(entry)], window)
+    _reservesinkparts!(sink, partcapacity)
+    # Late materialization: a filtered batch decodes its filter columns
+    # first and the other selected columns only if some row qualifies.
+    _chargevector!(budget, Int, length(sink.decodeidx), "scan late-column index")
+    restidx = setdiff(sink.decodeidx, sink.filteridx)
+    late = b.filter !== nothing && !isempty(sink.filteridx) && !isempty(restidx)
+    if late
+        _chargebitvector!(budget, length(names), "scan filter decode mask")
+        _chargebitvector!(budget, length(names), "scan late decode mask")
+        filtermask = falses(length(names))
+        filtermask[sink.filteridx] .= true
+        restmask = falses(length(names))
+        restmask[restidx] .= true
+    end
+    for (i, skip, take) in window
+        _sinkopen(sink) || break
+        keep[i] || continue
+        if late
+            rblen, cols = _scanbatch(f, i, filtermask, budget, ntasks)
+            decoded =
+                _materializecolumns!(_decodedcolumns(sink), sink, cols, sink.filteridx)
+            rows = _sinkrows(sink, decoded, rblen, skip, take)
+            isempty(rows) && continue
+            _, rest = _scanbatch(f, i, restmask, budget, ntasks)
+            _materializecolumns!(decoded, sink, rest, restidx)
+            _keeprows!(sink, decoded, rows, rblen)
+        else
+            rblen, cols = _scanbatch(f, i, mask, budget, ntasks)
+            _consumebatch!(sink, cols, rblen, skip, take)
+        end
+    end
+    return _sinkresult(sink)
 end
 
 # Direct-handle scans are storage-domain operations. Their interface cannot
@@ -2610,6 +2594,7 @@ function _applyfacadescan(
     plan::_ScanPlan,
     budget::Union{Nothing,AllocationBudget}=nothing;
     stringtype::Type=DataStrings.DataString,
+    ntasks::Int=1,
 )
     b = _facadestorage(plan)
     actual = budget === nothing ? _readbudget(f.limits, f.region.len) : budget
@@ -2626,8 +2611,8 @@ function _applyfacadescan(
     # slices or joins.
     selectonly = _selectsonly(b) && !isempty(plan.names)
     got =
-        selectonly ? _selectscan(f, b, actual, snapshots, views) :
-        _runboundscan(f, b, plan.names, actual, materialize)
+        selectonly ? _selectscan(f, b, actual, snapshots, views, ntasks) :
+        _runboundscan(f, b, plan.names, actual, materialize, ntasks)
     return _finishfacadescan(
         got,
         f.schema,
@@ -2645,37 +2630,34 @@ _selectsonly(b::Tables.BoundScan) =
     b.filter === nothing && b.limit === nothing && b.offset == 0
 
 # Decode the selected columns of every batch and build each as a full read
-# does, in the public domain.
-function _selectscan(f::ArrowFile, b::Tables.BoundScan, budget, snapshots, views)
+# does, in the public domain, on at most `ntasks` tasks.
+function _selectscan(
+    f::ArrowFile,
+    b::Tables.BoundScan,
+    budget,
+    snapshots,
+    views,
+    ntasks::Int,
+)
     _chargebitvector!(budget, length(f.fields), "scan decode mask")
     mask = falses(length(f.fields))
     for c in b.columns
         mask[c.index] = true
     end
+    plans, cols = _filebatches(f, 1:length(f), budget, ntasks, mask)
     _chargevector!(budget, NamedTuple, length(f), "scan batches")
-    batches = Vector{NamedTuple{(:columns,),Tuple{Vector{Union{Nothing,ArrayData}}}}}(
-        undef,
-        length(f),
-    )
+    batches = [(columns=c,) for c in cols]
     nrows = 0
-    state = DecodeState(budget)
-    try
-        for i = 1:length(f)
-            rblen, cols = _scanbatch(f, i, mask, state)
-            batches[i] = (columns=cols,)
-            nrows = _addscanrows(nrows, rblen)
-        end
-    finally
-        close(state)
+    for p in plans
+        nrows = _addscanrows(nrows, p.rblen)
     end
-    arrowtypes = _ArrowTypesContext(budget=budget)
-    _chargevector!(budget, AbstractVector, length(b.columns), "scan columns")
-    columns = AbstractVector[]
     for c in b.columns
         field = f.fields[c.index]
         foreach(batch -> _snapshotdict!(snapshots, field, batch.columns[c.index]), batches)
-        push!(columns, _tablecolumn(field, batches, c.index, arrowtypes, views))
     end
+    arrowtypes = _ArrowTypesContext(budget=budget)
+    idxs = Int[c.index for c in b.columns]
+    columns = _buildcolumns(f.fields, batches, idxs, arrowtypes, views, ntasks)
     return _scantable(Symbol[c.name for c in b.columns], columns, nrows, budget)
 end
 
@@ -2760,6 +2742,7 @@ function _applyfacadescan(
     plan::_ScanPlan,
     supplied::Union{Nothing,AllocationBudget}=nothing;
     stringtype::Type=DataStrings.DataString,
+    ntasks::Int=1,
 )
     budget = supplied === nothing ? s.budget : supplied
     b = _facadestorage(plan)

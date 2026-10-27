@@ -848,6 +848,64 @@ function Base.close(state::DecodeState)
     return nothing
 end
 
+# --- task parallelism -------------------------------------------------------
+
+function _checkntasks(ntasks)
+    (ntasks isa Integer && ntasks >= 1) ||
+        throw(ArgumentError("ntasks must be a positive integer, got $(repr(ntasks))"))
+    return Int(ntasks)
+end
+
+# The next item `_foreach` hands out and the smallest item that failed.
+mutable struct _Claims
+    @atomic next::Int
+    @atomic failed::Int
+end
+
+"""
+Call `f(i, w)` for each `i` in `1:n` on at most `ntasks` tasks, the caller
+being one of them; `w` in `1:min(n, ntasks)` names the task, so `f` can use
+per-task scratch state. Items are claimed in increasing order. When items
+throw, items after the smallest failing one are skipped and its exception is
+rethrown once every task has stopped, so errors do not depend on `ntasks`.
+"""
+function _foreach(f, n::Int, ntasks::Int)
+    nt = min(n, ntasks)
+    if nt <= 1
+        for i = 1:n
+            f(i, 1)
+        end
+        return nothing
+    end
+    claims = _Claims(0, typemax(Int))
+    errors = Vector{Any}(nothing, n)
+    function work(w)
+        while true
+            i = @atomic claims.next += 1
+            (i > n || i > @atomic(claims.failed)) && return nothing
+            try
+                f(i, w)
+            catch e
+                errors[i] = e
+                old = @atomic claims.failed
+                while i < old
+                    old, ok = @atomicreplace claims.failed old => i
+                    ok && break
+                end
+            end
+        end
+    end
+    tasks = [errormonitor(Threads.@spawn work(w)) for w = 2:nt]
+    try
+        work(1)
+    finally
+        foreach(wait, tasks)
+    end
+    failed = @atomic claims.failed
+    failed == typemax(Int) || throw(errors[failed])
+    return nothing
+end
+
 # Decode into `out[1:declared]` and return the bytes produced. With
 # `exact=false` the frame may hold more (decoding stops once `out` is full)
 # or less; the caller checks the count.
@@ -1385,6 +1443,76 @@ function validaterecordcolumns(
     return validated_dictionaries
 end
 
+"""
+The sequential half of decoding a record batch: its codec, its length, and
+where each top-level field's nodes and buffers start. A metadata-only walk
+(`skipfield!`) checks the whole node and buffer table first; the fields then
+decode independently (`_decodeplanned`), in any order or concurrently.
+"""
+struct _RecordPlan{B}
+    header::Meta.RecordBatch
+    body::B
+    codec::Int8
+    variadics::Vector{Int64}
+    rblen::Int64
+    # Cursor (node, buffer, variadic count, last buffer end) at each field.
+    starts::Vector{NTuple{4,Int64}}
+end
+
+function _recordplan(header::Meta.RecordBatch, body, version::Int16, fields, limits::Limits)
+    codec = _batchcodec(header.compression, version)
+    rblen = something(header.length, Int64(0))
+    0 <= rblen <= limits.max_array_length ||
+        throw(ValidationError("record batch length $rblen exceeds limit"))
+    variadics = variadiccounts(header)
+    c = DecodeCursor(
+        header.nodes,
+        header.buffers,
+        body,
+        limits;
+        codec=codec,
+        variadics=variadics,
+    )
+    starts = Vector{NTuple{4,Int64}}(undef, length(fields))
+    for (j, f) in enumerate(fields)
+        starts[j] = (c.nodeidx, c.bufidx, c.varidx, c.last_nonempty_end)
+        skipfield!(f, c)
+    end
+    finishcursor!(c)
+    return _RecordPlan(header, body, codec, variadics, rblen, starts)
+end
+
+"Decode and validate field `j` of a planned record batch."
+function _decodeplanned(
+    p::_RecordPlan,
+    j::Int,
+    f::Field,
+    dicts::Dict{Int64,ArrayData},
+    fielddictids::IdDict{Field,Int64},
+    limits::Limits,
+    validated_dictionaries,
+    state::DecodeState,
+)
+    c = DecodeCursor(
+        p.header.nodes,
+        p.header.buffers,
+        p.body,
+        limits;
+        codec=p.codec,
+        state=state,
+        variadics=p.variadics,
+    )
+    c.nodeidx, c.bufidx, c.varidx, c.last_nonempty_end = p.starts[j]
+    col = decodefield(f, c, dicts, fielddictids)
+    # One IPC dictionary id can back many fields. Each immutable pool
+    # snapshot was certified at its DictionaryBatch, so semantic validation
+    # skips that pool tree; index contracts still run for every field.
+    AC._validate_semantic(f, col, validated_dictionaries)
+    col.len == p.rblen ||
+        throw(ValidationError("RecordBatch length does not match top-level field nodes"))
+    return col
+end
+
 function decoderecord(
     fm::FramedMessage,
     fields,
@@ -1395,26 +1523,11 @@ function decoderecord(
     validated_dictionaries,
     state::DecodeState,
 )
-    header = fm.msg.header::Meta.RecordBatch
-    codec = _batchcodec(header.compression, fm.version)
-    rblen = something(header.length, Int64(0))
-    0 <= rblen <= limits.max_array_length ||
-        throw(ValidationError("record batch length $rblen exceeds limit"))
-    cursor = DecodeCursor(
-        header.nodes,
-        header.buffers,
-        fm.body,
-        limits;
-        codec=codec,
-        state=state,
-        variadics=variadiccounts(header),
-    )
-    cols = ArrayData[decodefield(f, cursor, dicts, fielddictids) for f in fields]
-    finishcursor!(cursor)
-    validaterecordcolumns(fields, cols, validated_dictionaries)
-    all(col -> col.len == rblen, cols) ||
-        throw(ValidationError("RecordBatch length does not match top-level field nodes"))
-    return AC.RecordBatch(sch, cols, rblen, validated_dictionaries)
+    p = _recordplan(fm.msg.header::Meta.RecordBatch, fm.body, fm.version, fields, limits)
+    cols = ArrayData[
+        _decodeplanned(p, j, f, dicts, fielddictids, limits, validated_dictionaries, state) for (j, f) in enumerate(fields)
+    ]
+    return AC.RecordBatch(sch, cols, p.rblen, validated_dictionaries)
 end
 
 """

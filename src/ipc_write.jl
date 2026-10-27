@@ -1922,32 +1922,105 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
     end
 end
 
-function _filebatch(f::ArrowFile, i::Integer, state::DecodeState)
+# Frame and check record batch `i` of `f` and plan its decode. With `mask`,
+# only the fields it selects need their dictionaries (a scan).
+function _fileplan(f::ArrowFile, i::Integer, budget::AllocationBudget, mask=nothing)
     1 <= i <= length(f.recordblocks) || throw(BoundsError(f, i))
-    fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, state.budget)
+    fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
     fm.version == f.schemaversion ||
         throw(ValidationError("IPC metadata version changes within the file"))
     rejectexperimentalcompression(fm)
-    fm.msg.header isa Meta.RecordBatch ||
+    header = fm.msg.header
+    header isa Meta.RecordBatch ||
         throw(ValidationError("footer record block is not a record batch"))
-    for id in missingdicts(f.fields, fm.msg.header.nodes, f.dictionaries, f.fielddictids)
-        throw(
-            ValidationError(
-                "record batch references dictionary id $id " *
-                "with no dictionary batch in the file",
-            ),
-        )
+    if mask === nothing
+        for id in missingdicts(f.fields, header.nodes, f.dictionaries, f.fielddictids)
+            throw(
+                ValidationError(
+                    "record batch references dictionary id $id " *
+                    "with no dictionary batch in the file",
+                ),
+            )
+        end
+    else
+        _recordbatchmeta(header, f.fields, f.limits, fm.body.len)
+        _scanmissingdicts(f.fields, header.nodes, f.dictionaries, f.fielddictids, mask)
     end
-    return decoderecord(
-        fm,
-        f.fields,
-        f.schema,
-        f.dictionaries,
-        f.fielddictids,
-        f.limits,
-        f.validated,
-        state,
+    return _recordplan(header, fm.body, fm.version, f.fields, f.limits)
+end
+
+_decodefilefield(f::ArrowFile, p::_RecordPlan, j::Int, state::DecodeState) = _decodeplanned(
+    p,
+    j,
+    f.fields[j],
+    f.dictionaries,
+    f.fielddictids,
+    f.limits,
+    f.validated,
+    state,
+)
+
+function _filebatch(f::ArrowFile, i::Integer, state::DecodeState)
+    p = _fileplan(f, i, state.budget)
+    cols = ArrayData[_decodefilefield(f, p, j, state) for j = 1:length(f.fields)]
+    return AC.RecordBatch(f.schema, cols, p.rblen, f.validated)
+end
+
+"""
+Decode record batches `idxs` of `f` on at most `ntasks` tasks: every batch's
+framing and plan first, then each (batch, field) pair on its own, so one
+large batch spreads over the tasks too. With `mask`, only the fields it
+selects decode; the others stay `nothing`. Returns the plans and, per batch,
+its columns.
+"""
+function _filebatches(
+    f::ArrowFile,
+    idxs,
+    budget::AllocationBudget,
+    ntasks::Int,
+    mask=nothing,
+)
+    nb = length(idxs)
+    nf = length(f.fields)
+    _chargevector!(budget, _RecordPlan{BufferSlice}, nb, "batch decode plans")
+    plans = Vector{_RecordPlan{BufferSlice}}(undef, nb)
+    _foreach(nb, ntasks) do k, _
+        plans[k] = _fileplan(f, idxs[k], budget, mask)
+        return nothing
+    end
+    _chargevector!(
+        budget,
+        Union{Nothing,ArrayData},
+        AC.checked_mul(nb, nf),
+        "batch columns",
     )
+    cols = [Vector{Union{Nothing,ArrayData}}(nothing, nf) for _ = 1:nb]
+    states = [DecodeState(budget) for _ = 1:min(ntasks, nb * nf)]
+    try
+        _foreach(nb * nf, ntasks) do item, w
+            k, j = divrem(item - 1, nf) .+ (1, 1)
+            (mask === nothing || mask[j]) || return nothing
+            cols[k][j] = _decodefilefield(f, plans[k], j, states[w])
+            return nothing
+        end
+    finally
+        foreach(close, states)
+    end
+    return plans, cols
+end
+
+# Record batches `idxs` of `f`, decoded on at most `ntasks` tasks.
+function _filerecordbatches(f::ArrowFile, idxs, budget::AllocationBudget, ntasks::Int)
+    plans, cols = _filebatches(f, idxs, budget, ntasks)
+    _chargevector!(budget, AC.RecordBatch, length(idxs), "decoded batch list")
+    return AC.RecordBatch[
+        AC.RecordBatch(
+            f.schema,
+            ArrayData[c::ArrayData for c in cols[k]],
+            p.rblen,
+            f.validated,
+        ) for (k, p) in enumerate(plans)
+    ]
 end
 
 function Base.getindex(f::ArrowFile, i::Integer)

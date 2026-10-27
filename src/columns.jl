@@ -857,14 +857,28 @@ _decimalcolumn(f::AC.Field, d::AC.ArrayData, budget=nothing) =
     _viewcolumn(f, AC.ArrayData[d], _ViewContext(DataStrings.DataString, budget))
 
 # One read's view settings, its allocation budget, and its cache of
-# dictionary pools (built once per pool snapshot).
+# dictionary pools (built once per pool snapshot; columns building on several
+# tasks share it under the lock).
 struct _ViewContext
     stringtype::Type
     budget::Union{Nothing,AllocationBudget}
     pools::IdDict{AC.ArrayData,AbstractVector}
+    poolslock::ReentrantLock
 end
 _ViewContext(stringtype::Type=DataStrings.DataString, budget=nothing) =
-    _ViewContext(stringtype, budget, IdDict{AC.ArrayData,AbstractVector}())
+    _ViewContext(stringtype, budget, IdDict{AC.ArrayData,AbstractVector}(), ReentrantLock())
+# The same settings and pool cache under another allowance (`Arrow.Stream` batches).
+_ViewContext(ctx::_ViewContext, budget) =
+    _ViewContext(ctx.stringtype, budget, ctx.pools, ctx.poolslock)
+
+# The view column of a dictionary's values, built once per pool snapshot. The
+# build runs outside the lock; a concurrent duplicate is dropped.
+function _dictpool(ctx::_ViewContext, vf::AC.Field, dict::AC.ArrayData)
+    pool = @lock ctx.poolslock get(ctx.pools, dict, nothing)
+    pool === nothing || return pool
+    built = _viewcolumn(vf, AC.ArrayData[dict], ctx)
+    return @lock ctx.poolslock get!(ctx.pools, dict, built)
+end
 
 # A view object's own size (struct, wrapped vector headers), charged per batch.
 const _VIEW_OBJECT_BYTES = Int64(256)
@@ -1039,9 +1053,7 @@ function _batchview(::Type{T}, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext) 
     if t isa AC.DictionaryType
         vf = AC.dictvaluefield(f, t)
         dict = d.dictionary::AC.ArrayData
-        pool = get!(ctx.pools, dict) do
-            _viewcolumn(vf, [dict], ctx)
-        end
+        pool = _dictpool(ctx, vf, dict)
         R = AC.juliatype(t.indextype)
         indices = _primitive(Missing <: T ? Union{Missing,R} : R, R, Nothing, d, budget)
         return DictEncoded{T,R,typeof(pool),typeof(indices)}(indices, pool, t.ordered)

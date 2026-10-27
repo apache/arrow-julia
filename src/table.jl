@@ -27,7 +27,7 @@
 # =============================================================================
 
 """
-    Arrow.Table(source; scan=nothing, mmap, stringtype=DataString, limits) -> Table
+    Arrow.Table(source; scan=nothing, mmap, stringtype=DataString, limits, ntasks) -> Table
 
 Read Arrow IPC data as Tables.jl columns. `source` is a file path, an `IO`,
 raw bytes (`Vector{UInt8}`), or an [`Arrow.AbstractArrowSource`](@ref) — a
@@ -54,6 +54,11 @@ on Windows, which cannot replace or delete a mapped file: there a path is
 read into memory unless `mmap=true` is passed. `mmap` has no effect on the
 other source kinds. A byte vector is read in place: do not modify or resize
 it while the table's columns are in use.
+
+`ntasks` (default `Threads.nthreads()`) is the number of tasks a read uses:
+record batches decode and decompress field by field in parallel, and columns
+build in parallel, string columns in chunks of rows. `ntasks=1` reads on the
+calling task. The result does not depend on `ntasks`.
 
 `limits` sets the [`Arrow.Limits`](@ref) policy for a raw source. Omit it to
 use `Arrow.Limits()`. An internal reader handle that was opened under a
@@ -1219,10 +1224,52 @@ function _facadesinglecolumn(f::AC.Field, d::AC.ArrayData, arrowtypes::_ArrowTyp
     return _facadecolumn(f, AbstractVector[_batchcolumn(f, d, arrowtypes)], arrowtypes)
 end
 
-# One table column: a view column for flat layouts, else a materialized one.
-_tablecolumn(f::AC.Field, batches, i::Int, arrowtypes, views::_ViewContext) =
-    _viewable(f) ? _viewcolumn(f, AC.ArrayData[b.columns[i] for b in batches], views) :
-    _facadebatchcolumn(f, batches, i, arrowtypes)
+_columndatas(batches, i::Int) = AC.ArrayData[b.columns[i] for b in batches]
+
+"""
+Table columns `idxs` of `fields` over decoded `batches`, built on at most
+`ntasks` tasks: a view column is one piece of work, a string or binary
+column is cut into chunks of rows, and the materialized (nested, union,
+extension) columns build on the calling task afterwards.
+"""
+function _buildcolumns(fields, batches, idxs, arrowtypes, views::_ViewContext, ntasks::Int)
+    m = length(idxs)
+    _chargevector!(views.budget, AbstractVector, m, "table columns")
+    cols = Vector{AbstractVector}(undef, m)
+    builds = Vector{Any}(nothing, m)
+    jobs = Tuple{Int,Int}[]   # (output column, string chunk or 0 for the whole column)
+    rows = ntasks > 1 ? _STRING_CHUNK_ROWS : typemax(Int)
+    for (p, i) in enumerate(idxs)
+        f = fields[i]
+        _viewable(f) || continue
+        if _isstringlayout(f.type)
+            datas = _columndatas(batches, i)
+            b = _stringbuild(_vieweltype(f, datas, views), datas, views.budget, rows)
+            builds[p] = b
+            append!(jobs, (p, k) for k in eachindex(b.chunks))
+        else
+            push!(jobs, (p, 0))
+        end
+    end
+    _foreach(length(jobs), ntasks) do q, _
+        p, k = jobs[q]
+        if k == 0
+            cols[p] = _viewcolumn(fields[idxs[p]], _columndatas(batches, idxs[p]), views)
+        else
+            _buildchunk!(builds[p], k)
+        end
+        return nothing
+    end
+    for (p, i) in enumerate(idxs)
+        b = builds[p]
+        if b !== nothing
+            cols[p] = _finishbuild(b)
+        elseif !isassigned(cols, p)
+            cols[p] = _facadebatchcolumn(fields[i], batches, i, arrowtypes)
+        end
+    end
+    return cols
+end
 
 function _facadebatchcolumn(f::AC.Field, batches, i::Int, arrowtypes::_ArrowTypesContext)
     _chargevector!(arrowtypes.budget, AbstractVector, length(batches), "batch column parts")
@@ -1465,16 +1512,18 @@ function Table(
     mmap::Bool=_MMAP_DEFAULT,
     stringtype::Type=DataStrings.DataString,
     limits::Limits=_defaultreaderlimits(source),
+    ntasks::Integer=Threads.nthreads(),
 )
     readlimits = _readerlimits(source, limits)
     _checkstringtype(stringtype)
+    ntasks = _checkntasks(ntasks)
     if source isa AbstractArrowSource || source isa SourceFile
         sf = source isa SourceFile ? source : SourceFile(source; limits=readlimits)
         _requirelittleendian()
         budget = _readbudget(readlimits, sf.len)
         if scan === nothing
             opened = _openbytes(_wholeobject(sf, budget); limits=readlimits, budget=budget)
-            return _tablefrom(opened, nothing, budget; stringtype=stringtype)
+            return _tablefrom(opened, nothing, budget; stringtype=stringtype, ntasks=ntasks)
         end
         # Range planning pays off only for a pushable scan over a file-format
         # object with columns. With a scan the schema comes up front from
@@ -1491,13 +1540,13 @@ function Table(
             # the same budget through whole-object assembly, parsing, and
             # lazy batch materialization.
             opened = _openbytes(_wholeobject(sf, budget); limits=readlimits, budget=budget)
-            return _tablefrom(opened, plan, budget; stringtype=stringtype)
+            return _tablefrom(opened, plan, budget; stringtype=stringtype, ntasks=ntasks)
         end
         # A stream-format object has no Footer to plan from. Read it whole,
         # without resetting the budget used by the format probe, then execute
         # the scan over its decoded columns.
         opened = _openbytes(_wholeobject(sf, budget); limits=readlimits, budget=budget)
-        return _tablefrom(opened, scan, budget; stringtype=stringtype)
+        return _tablefrom(opened, scan, budget; stringtype=stringtype, ntasks=ntasks)
     end
     budget = source isa IPCStream ? source.budget : _sourcebudget(source, readlimits)
     opened = _opensource(source; mmap=mmap, limits=readlimits, budget=budget)
@@ -1515,7 +1564,7 @@ function Table(
             e isa SystemError || rethrow()
         end
     end
-    return _tablefrom(opened, scan, budget; stringtype=stringtype)
+    return _tablefrom(opened, scan, budget; stringtype=stringtype, ntasks=ntasks)
 end
 
 # Windows cannot delete or replace a file while it is mapped, and the
@@ -1567,13 +1616,27 @@ function _tablefrom(
     scan::Union{Nothing,Tables.Scan},
     budget::Union{Nothing,AllocationBudget}=nothing;
     stringtype::Type=DataStrings.DataString,
+    ntasks::Int=1,
 )
     regions = _sourceregions(src, budget)
     fields = _corefields(src, budget)
-    scan === nothing &&
-        return _materialize_table(src, regions, budget; stringtype=stringtype)
+    scan === nothing && return _materialize_table(
+        src,
+        regions,
+        budget;
+        stringtype=stringtype,
+        ntasks=ntasks,
+    )
     plan = _ScanPlan(scan, fields, budget)
-    return _tablefrom(src, plan, regions, fields, budget; stringtype=stringtype)
+    return _tablefrom(
+        src,
+        plan,
+        regions,
+        fields,
+        budget;
+        stringtype=stringtype,
+        ntasks=ntasks,
+    )
 end
 
 function _tablefrom(
@@ -1581,6 +1644,7 @@ function _tablefrom(
     plan::_ScanPlan,
     budget::Union{Nothing,AllocationBudget}=nothing;
     stringtype::Type=DataStrings.DataString,
+    ntasks::Int=1,
 )
     return _tablefrom(
         src,
@@ -1589,6 +1653,7 @@ function _tablefrom(
         _corefields(src, budget),
         budget;
         stringtype=stringtype,
+        ntasks=ntasks,
     )
 end
 
@@ -1599,11 +1664,12 @@ function _tablefrom(
     fields,
     budget;
     stringtype::Type=DataStrings.DataString,
+    ntasks::Int=1,
 )
     # Zero-field sources carry their row count on the Table itself; the raw
     # scan path would lose it inside an empty NamedTuple.
     isempty(fields) && return _publicscan(
-        _materialize_table(src, regions, budget; stringtype=stringtype),
+        _materialize_table(src, regions, budget; stringtype=stringtype, ntasks=ntasks),
         _tableschema(src),
         fields,
         plan,
@@ -1611,11 +1677,11 @@ function _tablefrom(
         budget,
     )
     plan.storage !== nothing &&
-        return _applyfacadescan(src, plan, budget; stringtype=stringtype)
+        return _applyfacadescan(src, plan, budget; stringtype=stringtype, ntasks=ntasks)
     # A scan with an unrepresentable storage-domain literal evaluates its
     # public-domain plan over the fully converted table.
     return _publicscan(
-        _materialize_table(src, regions, budget; stringtype=stringtype),
+        _materialize_table(src, regions, budget; stringtype=stringtype, ntasks=ntasks),
         _tableschema(src),
         fields,
         plan,
@@ -1750,16 +1816,14 @@ function _materialize_table(
     regions,
     budget=nothing;
     stringtype::Type=DataStrings.DataString,
+    ntasks::Int=1,
 )
     budget === nothing && (budget = src.budget)
     names = _fieldnamesymbols(src.schema.fields, budget)
     arrowtypes = _ArrowTypesContext(budget=budget)
     views = _ViewContext(stringtype, budget)
-    _chargevector!(budget, AbstractVector, length(src.corefields), "table columns")
-    cols = AbstractVector[
-        _tablecolumn(f, src.batches, i, arrowtypes, views) for
-        (i, f) in enumerate(src.corefields)
-    ]
+    fields = src.corefields
+    cols = _buildcolumns(fields, src.batches, 1:length(fields), arrowtypes, views, ntasks)
     nrows = sum(Int(b.nrows) for b in src.batches; init=0)
     pools = _retaineddictpools(src.corefields, src.batches, arrowtypes)
     return _table(names, cols, src.schema, regions, nrows, pools, budget)
@@ -1770,23 +1834,15 @@ function _materialize_table(
     regions,
     budget=nothing;
     stringtype::Type=DataStrings.DataString,
+    ntasks::Int=1,
 )
     budget === nothing && (budget = _readbudget(src.limits, src.region.len))
     names = _fieldnamesymbols(src.schema.fields, budget)
     arrowtypes = _ArrowTypesContext(budget=budget)
     views = _ViewContext(stringtype, budget)
-    nb = length(src)
-    _chargevector!(budget, AC.RecordBatch, nb, "decoded batch list")
-    state = DecodeState(budget)
-    batches = try
-        [_filebatch(src, i, state) for i = 1:nb]
-    finally
-        close(state)
-    end
-    _chargevector!(budget, AbstractVector, length(src.fields), "table columns")
-    cols = AbstractVector[
-        _tablecolumn(f, batches, i, arrowtypes, views) for (i, f) in enumerate(src.fields)
-    ]
+    batches = _filerecordbatches(src, 1:length(src), budget, ntasks)
+    cols =
+        _buildcolumns(src.fields, batches, 1:length(src.fields), arrowtypes, views, ntasks)
     nrows = sum(Int(b.nrows) for b in batches; init=0)
     pools = _retaineddictpools(src.fields, batches, arrowtypes)
     return _table(names, cols, src.schema, regions, nrows, pools, budget)
@@ -1869,13 +1925,14 @@ _declaredbasetype(t::AC.ArrowType) =
 # --- Stream ------------------------------------------------------------------
 
 """
-    Arrow.Stream(source; mmap, stringtype=DataString, limits)
+    Arrow.Stream(source; mmap, stringtype=DataString, limits, ntasks)
 
 Iterate an IPC source (a file path, an `IO`, a `Vector{UInt8}`, or an
 [`Arrow.AbstractArrowSource`](@ref), which is read whole) one record batch
 at a time; each iteration yields an [`Arrow.Table`](@ref) for that batch,
-with columns as in `Arrow.Table`. `mmap` and `stringtype` have the same
-meaning and defaults as for [`Arrow.Table`](@ref). Satisfies `Tables.partitions` (each
+with columns as in `Arrow.Table`. `mmap`, `stringtype`, and `ntasks` have the
+same meaning and defaults as for [`Arrow.Table`](@ref); each batch decodes and
+builds its columns on at most `ntasks` tasks. Satisfies `Tables.partitions` (each
 batch is one partition), so partition-aware sinks — including `Arrow.write`,
 which writes one record batch per partition — see the source batch structure.
 
@@ -1906,6 +1963,7 @@ struct Stream
     arrowtypes::_ArrowTypesContext
     views::_ViewContext
     arrowtypeslock::ReentrantLock
+    ntasks::Int
 end
 
 function Stream(
@@ -1913,9 +1971,11 @@ function Stream(
     mmap::Bool=_MMAP_DEFAULT,
     stringtype::Type=DataStrings.DataString,
     limits::Limits=_defaultreaderlimits(source),
+    ntasks::Integer=Threads.nthreads(),
 )
     readlimits = _readerlimits(source, limits)
     _checkstringtype(stringtype)
+    ntasks = _checkntasks(ntasks)
     budget = source isa IPCStream ? source.budget : _sourcebudget(source, readlimits)
     src = _opensource(source; mmap=mmap, limits=readlimits, budget=budget)
     regions = _sourceregions(src, budget)
@@ -1933,6 +1993,7 @@ function Stream(
         _ArrowTypesContext(budget=budget),
         _ViewContext(stringtype, budget),
         ReentrantLock(),
+        ntasks,
     )
 end
 
@@ -1944,15 +2005,8 @@ end
 
 _nbatches(s::IPCStream) = length(s.batches)
 _nbatches(f::ArrowFile) = length(f)
-_batch(s::IPCStream, i, budget) = s.batches[i]
-function _batch(f::ArrowFile, i, budget)
-    state = DecodeState(budget)
-    try
-        return _filebatch(f, i, state)
-    finally
-        close(state)
-    end
-end
+_batch(s::IPCStream, i, budget, ntasks) = s.batches[i]
+_batch(f::ArrowFile, i, budget, ntasks) = only(_filerecordbatches(f, (i,), budget, ntasks))
 _batchfields(s::IPCStream) = s.corefields
 _batchfields(f::ArrowFile) = f.fields
 
@@ -1965,7 +2019,8 @@ function Base.iterate(s::Stream, i::Int=1)
         throw(InvalidStateException("the stream was released", :closed))
     i > _nbatches(s.src) && return nothing
     budget = _batchbudget(s.src, i)
-    b = _batch(s.src, i, budget)
+    ntasks = getfield(s, :ntasks)
+    b = _batch(s.src, i, budget, ntasks)
     fields = _batchfields(s.src)
     names = _fieldnamesymbols(fields, budget)
     arrowtypes = getfield(s, :arrowtypes)
@@ -1977,13 +2032,8 @@ function Base.iterate(s::Stream, i::Int=1)
         arrowtypes.budget = budget
         plan = arrowtypes.routeplan
         plan === nothing || (plan.budget = budget)
-        views = _ViewContext(shared.stringtype, budget, shared.pools)
-        _chargevector!(budget, AbstractVector, length(fields), "table columns")
-        cols = AbstractVector[
-            _viewable(f) ? _viewcolumn(f, AC.ArrayData[b.columns[j]], views) :
-            _facadesinglecolumn(f, b.columns[j], arrowtypes) for
-            (j, f) in enumerate(fields)
-        ]
+        views = _ViewContext(shared, budget)
+        cols = _buildcolumns(fields, (b,), 1:length(fields), arrowtypes, views, ntasks)
         pools = _retaineddictpools(fields, (b,), arrowtypes)
         return _table(
             names,

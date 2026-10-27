@@ -22,6 +22,7 @@ using Test
 
 using Arrow
 using Arrow.ArrowCore
+using Tables
 const AC = ArrowCore
 
 @testset "ArrowCore threaded caches" begin
@@ -61,5 +62,31 @@ const AC = ArrowCore
         end
         @test successes[] == limit
         @test Arrow._remaining(budget) == 0
+    end
+
+    @testset "parallel reads from concurrent tasks" begin
+        n = 100_000
+        parts = Tables.partitioner([
+            (x=collect(1:n), s=[i % 9 == 0 ? missing : string(i, base=7) for i = 1:n]),
+            (x=collect(1:n), s=[repeat("long value ", i % 4) for i = 1:n]),
+        ])
+        io = IOBuffer()
+        Arrow.write(io, parts; compress=:zstd)
+        bytes = take!(io)
+        expected = Arrow.Table(bytes; ntasks=1)
+        failures = AC.ReleaseCounter()
+        tasks = map(1:4) do _
+            errormonitor(
+                Threads.@spawn begin
+                    for _ = 1:5
+                        t = Arrow.Table(bytes; ntasks=4)
+                        isequal(t.x, expected.x) && isequal(t.s, expected.s) ||
+                            AC.increment!(failures)
+                    end
+                end
+            )
+        end
+        foreach(wait, tasks)
+        @test failures[] == 0
     end
 end
