@@ -258,10 +258,9 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         end
         # A path-backed file's mapping is never unmapped eagerly (columns may
         # still read it): releasing a yielded batch closes the stream, and
-        # garbage collection unmaps once nothing reaches the mapping.
-        path = tempname()
-        try
-            Arrow.write(path, Tables.partitioner([(x=Int64[1],), (x=Int64[2],)]); file=true)
+        # garbage collection unmaps once nothing reaches the mapping. The
+        # checks run in their own frame, so no temporary outlives them.
+        function releasemapped(path)
             mappedstream = Arrow.Stream(path; mmap=true)
             mappedregion = only(getfield(mappedstream, :regions))
             @test getfield(getfield(mappedregion, :cell), :action) == C_NULL
@@ -271,10 +270,14 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             @test_throws InvalidStateException mappedpartition.x
             @test x == [1]
             @test_throws InvalidStateException iterate(mappedstream, state)
-            # Windows deletes the file only once nothing maps it.
-            mappedstream = mappedregion = mappedpartition = x = nothing
+            return nothing
+        end
+        path = tempname()
+        try
+            Arrow.write(path, Tables.partitioner([(x=Int64[1],), (x=Int64[2],)]); file=true)
+            releasemapped(path)
         finally
-            GC.gc(true)
+            GC.gc(true)  # Windows deletes the file only once nothing maps it.
             ispath(path) && rm(path)
         end
         # Whole-table read concatenates.

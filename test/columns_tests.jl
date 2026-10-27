@@ -31,6 +31,50 @@ function arrowbytes(table; kw...)
     return take!(io)
 end
 
+# Reads of a mapped file run in their own frame, so no temporary outlives
+# them and garbage collection can unmap the file before it is deleted.
+function mappedviews(path, n)
+    # Columns outlive their table: drop it and collect garbage.
+    x = Arrow.Table(path; mmap=true).x
+    s = Arrow.Table(path; mmap=true).s
+    for _ = 1:3
+        GC.gc(true)
+    end
+    @test sum(x) == n * (n + 1) ÷ 2 && s[n] == string(n)
+    # Release ends the table, not its taken columns.
+    t = Arrow.Table(path; mmap=true)
+    y = t.x
+    Arrow.release!(t)
+    @test_throws InvalidStateException t.x
+    @test_throws InvalidStateException copy(t)
+    GC.gc(true)
+    @test y[end] == n
+    # Replacing a file that live columns map keeps the old contents.
+    if !Sys.iswindows()
+        Arrow.write(path, Arrow.Table(path; mmap=true))
+        Arrow.write(path, (x=collect((-n):-1),); file=true)
+        GC.gc(true)
+        @test x[1] == 1 && y[1] == 1 && Arrow.Table(path).x[1] == -n
+    end
+    return nothing
+end
+
+function mappedentrypoints(tbl, bytes, path)
+    for t in (
+        Arrow.Table(bytes),
+        Arrow.Table(IOBuffer(bytes)),
+        Arrow.Table(path; mmap=true),
+        Arrow.Table(path; mmap=false),
+        only(collect(Arrow.Stream(bytes))),
+        only(collect(Arrow.Stream(path; mmap=true))),
+    )
+        @test t.x isa Arrow.Primitive && isequal(collect(t.x), tbl.x)
+        @test t.s isa StringVector && t.s == tbl.s
+        @test t.d isa Arrow.Primitive && t.d == tbl.d
+    end
+    return nothing
+end
+
 @testset "column reads" begin
     @testset "decimals read in bulk, as stored" begin
         n = 100_000
@@ -196,32 +240,9 @@ end
         path = tempname()
         try
             Arrow.write(path, (x=collect(1:n), s=string.(1:n)); file=true)
-            # Columns outlive their table: drop it and collect garbage.
-            x = Arrow.Table(path; mmap=true).x
-            s = Arrow.Table(path; mmap=true).s
-            for _ = 1:3
-                GC.gc(true)
-            end
-            @test sum(x) == n * (n + 1) ÷ 2 && s[n] == string(n)
-            # Release ends the table, not its taken columns.
-            t = Arrow.Table(path; mmap=true)
-            y = t.x
-            Arrow.release!(t)
-            @test_throws InvalidStateException t.x
-            @test_throws InvalidStateException copy(t)
-            GC.gc(true)
-            @test y[end] == n
-            # Replacing a file that live columns map keeps the old contents.
-            if !Sys.iswindows()
-                Arrow.write(path, Arrow.Table(path; mmap=true))
-                Arrow.write(path, (x=collect((-n):-1),); file=true)
-                GC.gc(true)
-                @test x[1] == 1 && y[1] == 1 && Arrow.Table(path).x[1] == -n
-            end
-            # Windows deletes the file only once nothing maps it.
-            x = s = t = y = nothing
+            mappedviews(path, n)
         finally
-            GC.gc(true)
+            GC.gc(true)  # Windows deletes the file only once nothing maps it.
             rm(path; force=true)
         end
         @test Arrow._MMAP_DEFAULT == !Sys.iswindows()
@@ -254,18 +275,7 @@ end
             path = tempname()
             write(path, bytes)
             try
-                for t in (
-                    Arrow.Table(bytes),
-                    Arrow.Table(IOBuffer(bytes)),
-                    Arrow.Table(path; mmap=true),
-                    Arrow.Table(path; mmap=false),
-                    only(collect(Arrow.Stream(bytes))),
-                    only(collect(Arrow.Stream(path; mmap=true))),
-                )
-                    @test t.x isa Arrow.Primitive && isequal(collect(t.x), tbl.x)
-                    @test t.s isa StringVector && t.s == tbl.s
-                    @test t.d isa Arrow.Primitive && t.d == tbl.d
-                end
+                mappedentrypoints(tbl, bytes, path)
                 # Scans give the element types of a full read.
                 full = Arrow.Table(bytes)
                 for source in (bytes, ColumnsBytesSource(bytes))
