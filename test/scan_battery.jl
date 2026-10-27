@@ -1924,12 +1924,19 @@ end
     scanx = Tables.Scan(select=(:s,), filter=Tables.col(:x) > 7)
     got = Tables.scan(readfile(copy(scorrupt)), scanx)
     @assert isequal(collect(Any, got.s), Any["hazel", "iris", "jam"])
+    # Without statistics every batch decodes its filter column; the other
+    # selected columns decode only in batches with qualifying rows (late
+    # materialization), so `s` corruption in a batch the filter rejects stays
+    # invisible, and a filter that keeps rows of that batch catches it.
     plainbytes = writefile(source.schema, source.batches)
     pcorrupt = copy(plainbytes)
     poff, _ = _bufferposition(plainbytes, 1, 4)
     pcorrupt[(poff + 5):(poff + 8)] .= reinterpret(UInt8, Int32[Int32(2) ^ 30])
-    @assert _rejects(() -> Tables.scan(readfile(copy(pcorrupt)), scanx))
-    println("pruning skips decode; without statistics the same scan must decode ✓")
+    got = Tables.scan(readfile(copy(pcorrupt)), scanx)
+    @assert isequal(collect(Any, got.s), Any["hazel", "iris", "jam"])
+    scanall = Tables.Scan(select=(:s,), filter=Tables.col(:x) > 0)
+    @assert _rejects(() -> Tables.scan(readfile(copy(pcorrupt)), scanall))
+    println("pruning skips decode; without statistics rejected batches skip late columns ✓")
     return nothing
 end
 

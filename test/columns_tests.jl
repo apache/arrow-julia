@@ -298,6 +298,26 @@ end
         end
     end
 
+    @testset "a scan that only selects reads as a full read does" begin
+        part = (x=collect(1:3), s=["a", "b", "c"], d=Date.(2020:2022))
+        bytes = arrowbytes(Tables.partitioner([part, part]); file=true)
+        full = Arrow.Table(bytes)
+        st = Arrow.Table(bytes; scan=Tables.Scan(select=(:d, :s, :x)))
+        for nm in (:x, :s, :d)
+            @test typeof(Tables.getcolumn(st, nm)) == typeof(Tables.getcolumn(full, nm))
+            @test Tables.getcolumn(st, nm) == Tables.getcolumn(full, nm)
+        end
+        # A temporal filter runs on the stored integers and returns dates.
+        filter = Tables.colcmp(>=, Tables.col(:d), Date(2021))
+        ft = Arrow.Table(bytes; scan=Tables.Scan(filter=filter))
+        @test ft.d == Date.([2021, 2022, 2021, 2022]) && ft.x == [2, 3, 2, 3]
+        # Selecting views allocates independently of the file's size.
+        large = arrowbytes((a=collect(1:2_000_000), b=rand(2_000_000)); file=true)
+        sel = Tables.Scan(select=(:a,))
+        Arrow.Table(large; scan=sel)
+        @test (@allocated Arrow.Table(large; scan=sel)) < 200_000
+    end
+
     @testset "an uncompressed open allocates independently of its size" begin
         small = arrowbytes((a=collect(1:1_000), b=rand(1_000)))
         large = arrowbytes((a=collect(1:2_000_000), b=rand(2_000_000)))

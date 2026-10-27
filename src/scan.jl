@@ -1307,6 +1307,14 @@ end
 # decode-set column materializes once through the operation's closed policy,
 # the kept rows are chosen, and every output column keeps its slice of them.
 function _consumebatch!(sink::_ScanSink, cols, rblen::Int64, skip::Int64, take::Int64)
+    decoded = _decodedcolumns(sink)
+    _materializecolumns!(decoded, sink, cols, sink.decodeidx)
+    rows = _sinkrows(sink, decoded, rblen, skip, take)
+    _keeprows!(sink, decoded, rows, rblen)
+    return nothing
+end
+
+function _decodedcolumns(sink::_ScanSink)
     _chargedict!(
         sink.budget,
         Int,
@@ -1316,20 +1324,30 @@ function _consumebatch!(sink::_ScanSink, cols, rblen::Int64, skip::Int64, take::
     )
     decoded = Dict{Int,AbstractVector}()
     sizehint!(decoded, length(sink.decodeidx))
-    for idx in sink.decodeidx
-        f = sink.fields[idx]
-        d = cols[idx]::ArrayData
-        decoded[idx] = sink.materializecolumn(f, d, sink.budget)
+    return decoded
+end
+
+function _materializecolumns!(decoded, sink::_ScanSink, cols, idxs)
+    for idx in idxs
+        decoded[idx] =
+            sink.materializecolumn(sink.fields[idx], cols[idx]::ArrayData, sink.budget)
     end
-    rows = _sinkrows(sink, decoded, rblen, skip, take)
+    return decoded
+end
+
+# Every output column keeps its slice of the kept rows: the column itself
+# when the rows are all of it.
+function _keeprows!(sink::_ScanSink, decoded, rows, rblen::Int64)
     sink.outrows = _addscanrows(sink.outrows, Int64(length(rows)))
+    whole = length(rows) == rblen
     for (k, c) in enumerate(sink.columns)
         source = decoded[c.index]
-        _chargevector!(sink.budget, eltype(source), length(rows), "scan column slice")
+        whole ||
+            _chargevector!(sink.budget, eltype(source), length(rows), "scan column slice")
         partidx = sink.partcounts[k] + 1
         partidx <= length(sink.parts[k]) ||
             throw(AssertionError("scan consumed more batches than its planned capacity"))
-        sink.parts[k][partidx] = source[rows]
+        sink.parts[k][partidx] = whole ? source : source[rows]
         sink.partcounts[k] = partidx
     end
     return nothing
@@ -1424,11 +1442,35 @@ function _runboundscan(
             b.filter !== nothing && b.limit == 0 ? 0 :
             count(entry -> keep[first(entry)], window)
         _reservesinkparts!(sink, partcapacity)
+        # Late materialization: a filtered batch decodes its filter columns
+        # first and the other selected columns only if some row qualifies.
+        _chargevector!(budget, Int, length(sink.decodeidx), "scan late-column index")
+        restidx = setdiff(sink.decodeidx, sink.filteridx)
+        late = b.filter !== nothing && !isempty(sink.filteridx) && !isempty(restidx)
+        if late
+            _chargebitvector!(budget, length(names), "scan filter decode mask")
+            _chargebitvector!(budget, length(names), "scan late decode mask")
+            filtermask = falses(length(names))
+            filtermask[sink.filteridx] .= true
+            restmask = falses(length(names))
+            restmask[restidx] .= true
+        end
         for (i, skip, take) in window
             _sinkopen(sink) || break
             keep[i] || continue
-            rblen, cols = _scanbatch(f, i, mask, state)
-            _consumebatch!(sink, cols, rblen, skip, take)
+            if late
+                rblen, cols = _scanbatch(f, i, filtermask, state)
+                decoded =
+                    _materializecolumns!(_decodedcolumns(sink), sink, cols, sink.filteridx)
+                rows = _sinkrows(sink, decoded, rblen, skip, take)
+                isempty(rows) && continue
+                _, rest = _scanbatch(f, i, restmask, state)
+                _materializecolumns!(decoded, sink, rest, restidx)
+                _keeprows!(sink, decoded, rows, rblen)
+            else
+                rblen, cols = _scanbatch(f, i, mask, state)
+                _consumebatch!(sink, cols, rblen, skip, take)
+            end
         end
         return _sinkresult(sink)
     finally
@@ -2469,6 +2511,7 @@ function _finishfacadescan(
     budget=nothing,
     poolof=nothing,
     views::_ViewContext=_ViewContext(DataStrings.DataString, budget),
+    public::Bool=false,
 )
     cols = Tables.columns(got)
     ncols = length(Tables.columnnames(cols))
@@ -2494,7 +2537,9 @@ function _finishfacadescan(
             # Public type overrides run HERE, after facade conversion —
             # they are public-domain requests, never storage casts, and
             # they preserve missing exactly as Tables.scan does.
+            # `public` columns are already the full read's (a select-only scan).
             base =
+                public ? columns[i] :
                 _scanview(f) ? _scanviewoutput(f, columns[i], views) :
                 _facadefromraw(f, columns[i], arrowtypes)
             push!(precols, base)
@@ -2576,7 +2621,13 @@ function _applyfacadescan(
             _snapshotdict!(snapshots, field, data);
             _scanbatchcolumn(field, data, routes, views)
         )
-    got = _runboundscan(f, b, plan.names, actual, materialize)
+    # A scan that only selects keeps every row: its columns are the full
+    # read's columns (views chain, strings are one column), with no per-batch
+    # slices or joins.
+    selectonly = _selectsonly(b) && !isempty(plan.names)
+    got =
+        selectonly ? _selectscan(f, b, actual, snapshots, views) :
+        _runboundscan(f, b, plan.names, actual, materialize)
     return _finishfacadescan(
         got,
         f.schema,
@@ -2586,7 +2637,46 @@ function _applyfacadescan(
         budget=actual,
         poolof=(_, field, ctx) -> _retainedsnapshotpool(field, snapshots[field], ctx),
         views=views,
+        public=selectonly,
     )
+end
+
+_selectsonly(b::Tables.BoundScan) =
+    b.filter === nothing && b.limit === nothing && b.offset == 0
+
+# Decode the selected columns of every batch and build each as a full read
+# does, in the public domain.
+function _selectscan(f::ArrowFile, b::Tables.BoundScan, budget, snapshots, views)
+    _chargebitvector!(budget, length(f.fields), "scan decode mask")
+    mask = falses(length(f.fields))
+    for c in b.columns
+        mask[c.index] = true
+    end
+    _chargevector!(budget, NamedTuple, length(f), "scan batches")
+    batches = Vector{NamedTuple{(:columns,),Tuple{Vector{Union{Nothing,ArrayData}}}}}(
+        undef,
+        length(f),
+    )
+    nrows = 0
+    state = DecodeState(budget)
+    try
+        for i = 1:length(f)
+            rblen, cols = _scanbatch(f, i, mask, state)
+            batches[i] = (columns=cols,)
+            nrows = _addscanrows(nrows, rblen)
+        end
+    finally
+        close(state)
+    end
+    arrowtypes = _ArrowTypesContext(budget=budget)
+    _chargevector!(budget, AbstractVector, length(b.columns), "scan columns")
+    columns = AbstractVector[]
+    for c in b.columns
+        field = f.fields[c.index]
+        foreach(batch -> _snapshotdict!(snapshots, field, batch.columns[c.index]), batches)
+        push!(columns, _tablecolumn(field, batches, c.index, arrowtypes, views))
+    end
+    return _scantable(Symbol[c.name for c in b.columns], columns, nrows, budget)
 end
 
 function _applyfacadescan(
@@ -2628,7 +2718,8 @@ function _facadescanrawcolumn(
     _scanview(f) &&
         return _viewcolumn(f, AC.ArrayData[b.columns[i] for b in s.batches], views)
     _chargevector!(budget, AbstractVector, length(s.batches), "stream scan column parts")
-    parts = [_batchcolumn(f, b.columns[i], routes) for b in s.batches]
+    parts =
+        AbstractVector[_scanbatchcolumn(f, b.columns[i], routes, views) for b in s.batches]
     return _joinscanparts(f, parts, budget)
 end
 
@@ -2644,7 +2735,20 @@ function _storageconverted(f::AC.Field)
 end
 
 _scanbatchcolumn(f::AC.Field, d::AC.ArrayData, routes, views::_ViewContext) =
-    _scanview(f) ? _viewcolumn(f, AC.ArrayData[d], views) : _batchcolumn(f, d, routes)
+    _scanview(f) ? _viewcolumn(f, AC.ArrayData[d], views) :
+    _viewable(f) && _istemporalconv(f.type) ? _storageview(f, d, views) :
+    _batchcolumn(f, d, routes)
+
+# A temporal column stays in storage until the filter has run: a view of its
+# stored integers, the claim `_storagebatchcolumn` would materialize.
+function _storageview(f::AC.Field, d::AC.ArrayData, ctx::_ViewContext)
+    t = f.type
+    t isa AC.TimeType && _checktimes(f, t, d, ctx.budget)
+    S = _rawdeclaredbasetype(t)
+    _chargeobject!(ctx.budget, _VIEW_OBJECT_BYTES, "column view")
+    nullable = Missing <: _declaredeltype(f, false) || _viewnulls(f, d)
+    return _primitive(nullable ? Union{Missing,S} : S, S, Nothing, d, ctx.budget)
+end
 
 # A selected view column's scan output: its gathered rows, or, when no row
 # survived, an empty vector of the element type a full read gives.
