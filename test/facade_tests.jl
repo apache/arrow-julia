@@ -99,6 +99,22 @@ function Arrow.readrange(s::_ConcurrentSource, off, len)
     return s.data[(off + 1):(off + len)]
 end
 # Sources that violate the contract in each way the reader must refuse.
+# A table with DataAPI metadata, as a DataFrame carries it.
+struct _MetaTable
+    columns::NamedTuple
+    metadata::Dict{String,String}
+    colmetadata::Dict{Symbol,Dict{String,String}}
+end
+Tables.istable(::Type{_MetaTable}) = true
+Tables.columnaccess(::Type{_MetaTable}) = true
+Tables.columns(t::_MetaTable) = t.columns
+DataAPI.metadatasupport(::Type{_MetaTable}) = (read=true, write=false)
+DataAPI.metadatakeys(t::_MetaTable) = keys(t.metadata)
+DataAPI.metadata(t::_MetaTable, k::AbstractString) = t.metadata[k]
+DataAPI.colmetadatasupport(::Type{_MetaTable}) = (read=true, write=false)
+DataAPI.colmetadatakeys(t::_MetaTable, c::Symbol) = keys(get(t.colmetadata, c, Dict()))
+DataAPI.colmetadata(t::_MetaTable, c::Symbol, k::AbstractString) = t.colmetadata[c][k]
+
 struct _ShortSource <: Arrow.AbstractArrowSource
     data::Vector{UInt8}
 end
@@ -2943,6 +2959,39 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             end
             @test err isa ArgumentError && startswith(err.msg, "column a (child item)")
         end
+    end
+
+    @testset "metadata defaults to the table's DataAPI metadata" begin
+        t = _MetaTable(
+            (; a=[1, 2], u=[UUIDs.UUID(1), UUIDs.UUID(2)]),
+            Dict("source" => "test", "ARROW:schema" => "dropped"),
+            Dict(:a => Dict("unit" => "m"), :u => Dict("ARROW:extension:name" => "x.y")),
+        )
+        back = Arrow.Table(take!(Arrow.write(IOBuffer(), t)))
+        @test DataAPI.metadata(back) == Dict("source" => "test")
+        @test DataAPI.colmetadata(back, :a, "unit") == "m"
+        # The reserved ARROW: keys stay the writer's: u keeps its arrow.uuid label.
+        @test DataAPI.colmetadata(back, :u, "ARROW:extension:name") == "arrow.uuid"
+        @test back.u == t.columns.u
+        # Keywords win over the table's metadata.
+        kw = Arrow.Table(take!(Arrow.write(IOBuffer(), t; metadata=["k" => "v"])))
+        @test DataAPI.metadata(kw) == Dict("k" => "v")
+    end
+
+    @testset "errors name the column and say what to do" begin
+        msg(t) =
+            try
+                Arrow.write(IOBuffer(), t)
+                ""
+            catch e
+                sprint(showerror, e)
+            end
+        @test startswith(
+            msg((; mixed=Any[1, 1.0, "x", 'c', :s, 0x01, Int16(2), Int32(3), true])),
+            "ArgumentError: column mixed holds values of more than 8 types",
+        )
+        @test occursin("column m holds Matrix{Int64} values", msg((; m=[[1 2; 3 4]])))
+        @test occursin("column a has no values to infer an Arrow type", msg((; a=Any[])))
     end
 
     @testset "write knobs: batchsize, compresslevel, dictencode, largelists" begin

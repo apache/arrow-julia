@@ -387,6 +387,17 @@ batchkinds(bytes) = [
         Arrow.write(io, t1; file=false)
         Arrow.append(io, t2)
         @test Arrow.Table(take!(io)).a == [1, 2, 3, 4]
+
+        # Appending to nothing starts a stream; the one-argument form curries.
+        fresh = joinpath(mktempdir(), "new.arrows")
+        @test (t1 |> Arrow.append(fresh)) == fresh
+        @test Arrow.append(fresh, t2) == fresh
+        @test Arrow.Table(fresh).a == [1, 2, 3, 4]
+        @test read(fresh, 6) != b"ARROW1"
+        io = IOBuffer()
+        Arrow.append(io, t1)
+        Arrow.append(io, t2)
+        @test Arrow.Table(take!(io)).b == ["x", "y", "z", "w"]
     end
 
     @testset "append to a stream without an end-of-stream marker" begin

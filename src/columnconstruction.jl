@@ -68,9 +68,9 @@ function _constructnativepart(
     elseif T === Union{}
         throw(
             ArgumentError(
-                "column $(_errname(context, name)) has bottom element type Union{} " *
-                "and cannot infer an Arrow type; give the empty column a declared " *
-                "element type",
+                "column $(_errname(context, name)) has no values to infer an Arrow " *
+                "type from; give the empty column a concrete element type " *
+                "(Int64[] or String[], say)",
             ),
         )
     elseif T <: Union{DataDecimals.Decimal,Durations.Duration}
@@ -202,7 +202,7 @@ function _constructnativepart(
         # Materialized facade columns are Any-eltype for composite layouts;
         # one narrowing pass recovers list columns (inner vectors narrow
         # element-wise, empties adopt the joined element type).
-        w = _narrowlists(v)
+        w = _narrowlists(v, _errname(context, name))
         NW = Base.nonmissingtype(eltype(w))
         (NW === Any || (NW <: AbstractVector && eltype(NW) === Any)) && throw(
             ArgumentError(
@@ -287,7 +287,7 @@ function _constructpart(
 )
     context === nothing && (context = _WriterContext())
     if eltype(v) === Any
-        narrowed = _narrowlists(v)
+        narrowed = _narrowlists(v, _errname(context, name))
         eltype(narrowed) === Any && throw(
             ArgumentError(
                 "column $(_errname(context, name)) has element type Any and cannot " *
@@ -805,8 +805,8 @@ _abstractnonnative(T) =
 _singletypefamily(T) =
     T <: Union{Durations.Timestamp,Durations.ZonedTimestamp,DataDecimals.Decimal}
 
-"The Union of the runtime types of a column's values, `Missing` included."
-function _observedtype(v::AbstractVector)
+"The Union of the runtime types of column `name`'s values, `Missing` included."
+function _observedtype(v::AbstractVector, name="")
     types = Type[]
     hasmissing = false
     for x in v
@@ -818,8 +818,10 @@ function _observedtype(v::AbstractVector)
         any(S -> S === T, types) && continue
         length(types) < _MAX_INFERRED_WRITER_TYPES || throw(
             ArgumentError(
-                "a column holds values of more than $_MAX_INFERRED_WRITER_TYPES " *
-                "types ($(join(types, ", ")), $T, ...); give it a concrete element type",
+                (isempty(name) ? "a column" : "column $name") *
+                " holds values of " *
+                "more than $_MAX_INFERRED_WRITER_TYPES types ($(join(types, ", ")), " *
+                "$T, ...); give it a concrete element type",
             ),
         )
         push!(types, T)
@@ -829,7 +831,7 @@ function _observedtype(v::AbstractVector)
 end
 
 "Narrow an Any-eltype column, recovering list-of-T structure when present."
-function _narrowlists(v::AbstractVector)
+function _narrowlists(v::AbstractVector, name="")
     # Narrowing can turn an Any column into a concrete list type before the
     # ArrowTypes value walk runs. Reject cycles and excessive nesting first,
     # without resolving any user traits.
@@ -839,7 +841,7 @@ function _narrowlists(v::AbstractVector)
     w = map(x -> x isa AbstractVector ? map(identity, x) : x, v)
     w = map(identity, w)
     NT = Base.nonmissingtype(eltype(w))
-    _abstractnonnative(NT) && return collect(_observedtype(w), w)
+    _abstractnonnative(NT) && return collect(_observedtype(w, name), w)
     NT !== Union{} && NT <: AbstractVector || return w
     # Join the inner element types (empties narrow to Union{} and would
     # otherwise poison the join), then retype every inner vector. With only
@@ -859,7 +861,7 @@ function _narrowlists(v::AbstractVector)
     # Rows of different element types: the elements' runtime types.
     if _abstractnonnative(E)
         values = collect(Iterators.flatten(x for x in w if x !== missing))
-        isempty(values) || (E = _observedtype(values))
+        isempty(values) || (E = _observedtype(values, name))
     end
     E === Any && return w
     hasm = eltype(w) >: Missing
@@ -1903,7 +1905,10 @@ function _arrowtypeslistcolumn(
     context,
 )
     S <: AbstractVector || throw(
-        ArgumentError("ArrowTypes ListKind column $name must lower to AbstractVector rows"),
+        ArgumentError(
+            "column $(_errname(context, name)) holds $S values, which are not " *
+            "vectors; an Arrow list holds a vector per row (vec(x) flattens an array)",
+        ),
     )
     E = eltype(S)
     flat = E[]

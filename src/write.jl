@@ -40,9 +40,9 @@ include("columnconstruction.jl")
 
 """
     Arrow.write(sink, table; file=true, compress=nothing, compresslevel=nothing,
-                batchsize=1_048_576, dictencode=false, largelists=false,
-                stringview=false, metadata=nothing, colmetadata=nothing,
-                ntasks=Threads.nthreads())
+                batchsize=1_048_576, dictencode=false, dictdeltas=false,
+                largelists=false, stringview=false, metadata=nothing,
+                colmetadata=nothing, ntasks=Threads.nthreads())
     Arrow.write(sink; kwargs...)
 
 Write any Tables.jl source as Arrow IPC to `sink`, a file path or an `IO`, and
@@ -62,14 +62,17 @@ Keywords:
   collection of `Symbol`s or strings). Columns with a `DataAPI.refpool`
   (`PooledArray`, `CategoricalArray`) and [`Arrow.DictEncode`](@ref) columns
   are always dictionary-encoded.
+- `dictdeltas`: write the categories a dictionary gains in later partitions
+  as delta dictionary batches (see [`Arrow.Writer`](@ref)).
 - `largelists`: declare 64-bit offsets (LargeUtf8, LargeBinary, LargeList).
 - `stringview`: write strings and bytes as Utf8View/BinaryView instead of
   Utf8/Binary.
 - `metadata`, `colmetadata`: schema and per-column key-value pairs (a `Dict`
-  or pairs; `colmetadata` maps column name `Symbol`s to them). Schema metadata
-  is inherited from an `Arrow.Table` or `Arrow.Stream` when `metadata` is
-  `nothing`, without inherited batch statistics, since values, columns, or
-  batch boundaries may have changed.
+  or pairs; `colmetadata` maps column name `Symbol`s to them). They default to
+  the table's DataAPI metadata (a `DataFrame`'s `metadata` and `colmetadata`,
+  say), without keys under the reserved `ARROW:` prefix. An `Arrow.Table` or
+  `Arrow.Stream` keeps its own schema and field metadata, without its batch
+  statistics, since values, columns, or batch boundaries may have changed.
 - `ntasks`: how many tasks build a batch's columns and compress its buffers
   (default `Threads.nthreads()`; `ntasks=1` runs on the calling task). The
   output bytes are the same for any `ntasks`.
@@ -85,8 +88,10 @@ source such as `CSV.Chunks` writes in about one partition's memory. One
 partition declares each field's nullability from its element type; several
 partitions take their schema from the first, with every field nullable, and
 later partitions conform to it as later tables of an [`Arrow.Writer`](@ref)
-do. If writing fails, a path destination is left as it was; an `IO` sink may
-hold a partial output.
+do. So a several-partition source of non-missing values reads back with
+`Union{Missing,T}` element types, as pyarrow and Polars write it. If writing
+fails, a path destination is left as it was; an `IO` sink may hold a partial
+output.
 
 The Arrow 2.x keywords `alignment`, `dictencodenested`, `denseunions`, and
 `maxdepth` are accepted with a one-time warning and ignored. See
@@ -495,12 +500,16 @@ function _writebatch!(
     several,
 )
     if w.st === nothing
+        colmetadata = w.colmetadata
+        colmetadata === nothing &&
+            retained === nothing &&
+            (colmetadata = _inputcolmetadata(part, names))
         fields, coldata = _constructcolumns(
             names,
             [cols],
             Any[hints],
             _retainedfieldfn(retained, names, encoded),
-            w.colmetadata;
+            colmetadata;
             stringview=w.stringview,
             largelists=w.largelists,
             growable=(!w.oneshot || several),
@@ -510,7 +519,7 @@ function _writebatch!(
         # several input partitions); a retained schema keeps its own.
         nullable = (w.oneshot ? several : w.nullable) && retained === nothing
         nullable && (fields = AC.Field[_nullablefield(f) for f in fields])
-        _beginwrite!(w, fields, retained, names; several)
+        _beginwrite!(w, fields, retained, names; several, input=part)
         writebatch!(w.st::IPCWriteState, only(_tablebatches(w.schema, coldata, [nrows])))
         return nothing
     end
@@ -539,10 +548,17 @@ function _writebatch!(
 end
 
 "Fix the schema and publish its message (and the file preamble)."
-function _beginwrite!(w::Writer, fields, retained, names=nothing; several::Bool=false)
+function _beginwrite!(
+    w::Writer,
+    fields,
+    retained,
+    names=nothing;
+    several::Bool=false,
+    input=nothing,
+)
     # The bounded facade interning rule, as when the source was read.
     names === nothing && (names = _fieldnamesymbols(fields))
-    sch = AC.Schema(fields; metadata=_writermetadata(w.metadata, retained))
+    sch = AC.Schema(fields; metadata=_writermetadata(w.metadata, retained, input))
     w.st = beginwrite!(
         w.io,
         sch;
@@ -611,7 +627,7 @@ end
 # from all its values, so every batch writes the same type.
 function _narrowcolumn(name::String, col::AbstractVector)
     col isa DictEncode && return col
-    eltype(col) === Any && (col = _narrowlists(col))
+    eltype(col) === Any && (col = _narrowlists(col, name))
     narrowed = _narrowabstractwriterparts(name, AbstractVector[col], _WriterContext(name))
     return narrowed === nothing ? col : only(narrowed)
 end
@@ -674,6 +690,7 @@ end
 """
     Arrow.append(sink, table; compress=nothing, compresslevel=nothing,
                  batchsize=1_048_576, dictdeltas=false)
+    Arrow.append(sink; kwargs...)
 
 Add `table`'s record batches to an existing IPC STREAM (`sink` is a file
 path or a seekable read/write `IO`). The existing stream is validated in
@@ -689,9 +706,13 @@ again whole (`dictdeltas=true` writes only the new categories, as a delta
 dictionary batch). A stream whose schema declares DictionaryReplacement
 (`Arrow.Writer(sink; file=false, dictreplacement=true)`) gets a replacement
 dictionary instead. The file format does not support appending: rewrite the
-file, or produce it incrementally with [`Arrow.Writer`](@ref).
+file, or produce it incrementally with [`Arrow.Writer`](@ref). A missing or
+empty `sink` starts a new stream, as `Arrow.write(sink, table; file=false)`
+does. The one-argument form curries: `table |> Arrow.append(path)`.
 """
 function append(path::AbstractString, tbl; kwargs...)
+    # Appending to nothing starts a stream.
+    isfile(path) && filesize(path) > 0 || return write(path, tbl; file=false, kwargs...)
     bytes = Base.read(path)
     keep, tail = _appendbytes(bytes, tbl; kwargs...)
     open(path, "r+") do io
@@ -704,11 +725,14 @@ end
 function append(io::IO, tbl; kwargs...)
     seekstart(io)
     bytes = Base.read(io)
+    isempty(bytes) && return write(io, tbl; file=false, kwargs...)
     keep, tail = _appendbytes(bytes, tbl; kwargs...)
     seek(io, keep)
     Base.write(io, tail)
     return io
 end
+
+append(sink::Union{AbstractString,IO}; kwargs...) = tbl -> append(sink, tbl; kwargs...)
 
 function _appendbytes(
     bytes::Vector{UInt8},
@@ -884,13 +908,39 @@ _retainedschema(t::Table) = getfield(t, :schema)
 _retainedschema(s::Stream) = _tableschema(getfield(s, :src))
 _retainedschema(::Any) = nothing
 
-function _writermetadata(metadata, retained)
+function _writermetadata(metadata, retained, input=nothing)
     metadata !== nothing && return _metapairs(metadata)
-    (retained === nothing || retained.metadata === nothing) && return nothing
+    retained === nothing && return _inputmetadata(input)
+    retained.metadata === nothing && return nothing
     # Statistics describe the source's values, field indexes, and batch
     # boundaries. Retaining its descriptors does not preserve that identity.
     # Keep user metadata in order, including duplicate keys.
     return Pair{String,String}[kv for kv in retained.metadata if first(kv) != STATS_KEY]
+end
+
+# A table's DataAPI metadata, as the schema's key-value pairs. Keys under the
+# reserved `ARROW:` prefix (an extension label a column was read with, say)
+# describe the source's encoding, not the table, and are left out.
+function _inputmetadata(@nospecialize(tbl))
+    (tbl === nothing || !DataAPI.metadatasupport(typeof(tbl)).read) && return nothing
+    out = Pair{String,String}[
+        String(string(k)) => string(DataAPI.metadata(tbl, k)) for
+        k in DataAPI.metadatakeys(tbl) if !startswith(string(k), "ARROW:")
+    ]
+    return isempty(out) ? nothing : out
+end
+
+function _inputcolmetadata(@nospecialize(tbl), names)
+    DataAPI.colmetadatasupport(typeof(tbl)).read || return nothing
+    out = Dict{Symbol,Vector{Pair{String,String}}}()
+    for name in names
+        pairs = Pair{String,String}[
+            String(string(k)) => string(DataAPI.colmetadata(tbl, name, k)) for
+            k in DataAPI.colmetadatakeys(tbl, name) if !startswith(string(k), "ARROW:")
+        ]
+        isempty(pairs) || (out[name] = pairs)
+    end
+    return isempty(out) ? nothing : out
 end
 
 "Dictionary pools retained by one facade partition, in column order."
