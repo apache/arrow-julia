@@ -1083,6 +1083,9 @@ path when its raw domain is closed, else through Core's dynamic path. This
 never emits the private ArrowTypes Union routing markers.
 """
 function _storagebatchcolumn(f::AC.Field, d::AC.ArrayData, budget=nothing)
+    # A registered extension over a decimal restores from raw coefficients.
+    (_isbulkdecimal(f) && !_hasarrowtypesextension(f)) &&
+        return _decimalcolumn(f, d, budget)
     T = _storageelementclaim(f)
     T === Any &&
         return budget === nothing ? AC.materialize(f, d) : AC.materialize(f, d, budget)
@@ -1099,6 +1102,7 @@ end
 # but the dynamic path builds PUBLIC rows — composite leaf conversion cannot
 # run as a post-pass (see `_publicvalue`).
 function _publicbatchcolumn(f::AC.Field, d::AC.ArrayData, budget=nothing)
+    _isbulkdecimal(f) && return _decimalcolumn(f, d, budget)
     T = _storageelementclaim(f)
     T === Any && return _publicdynamiccolumn(f, d, budget)
     (Missing <: T || !_hasnulls(f, d)) || (T = Union{Missing,T})

@@ -36,6 +36,9 @@ include("property_tests.jl")
 include("ipc_view_output_tests.jl")
 include("ipc_dictionary_tests.jl")
 
+# Read-side column construction for flat layouts.
+include("columns_tests.jl")
+
 # Files written by Polars (footer-authoritative file reads, 128-bit ints).
 include("polars_tests.jl")
 

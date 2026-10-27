@@ -94,6 +94,7 @@ include("ipc_write.jl")
 include("cdata.jl")
 include("source.jl")
 include("arrowtypes.jl")
+include("columns.jl")
 
 # The public facade. `table.jl` includes the private scan-plan module after
 # its public/storage type seam is defined; `write.jl` includes the private

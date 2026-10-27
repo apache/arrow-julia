@@ -42,23 +42,22 @@ One shared-decimal scalar conversion, specialized on the host and storage
 types: the coefficient loop, the bound power, and the range check must all
 run unboxed, or a wide (128/256-bit) coefficient boxes on every operation.
 """
+# A coefficient outside the declared precision reads as stored, as in Arrow
+# C++ (`DataDecimals` leaves that invariant to the producer).
 function _shareddecimalscalar(::Type{D}, ::Type{T}, precision::Int, x)::D where {D,T}
+    x isa D && return x
     u =
         x isa Integer ? T(x) :
         x isa AbstractVector{UInt8} ? _bytescoefficient(T, x) :
         throw(ArgumentError("unsupported decimal storage value"))
-    bound = T(10)^precision
-    # Stored input that breaks the format's precision rule, which
-    # DataDecimals requires of every value.
-    -bound < u < bound || throw(
-        ValidationError("decimal coefficient $u exceeds the declared precision $precision"),
-    )
     return reinterpret(D, u)
 end
 
 function _postconvert(t::AC.DecimalType, col, budget=nothing)
     _shareddecimal(t) || return col
     D = _decimalhost(t)
+    # Top-level columns already read as `D` (`_decimalcolumn`).
+    eltype(col) <: Union{Missing,D} && return col
     T = _decimalstorage(t)
     precision = Int(t.precision)
     # The per-element call into the specialized converter is dynamic, so
