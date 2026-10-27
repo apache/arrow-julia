@@ -233,17 +233,10 @@ end
                 p -> Arrow.Writer(w -> Arrow.write(w, (; a=Int64[1])), p),
             )
                 s = Arrow.Stream(path)  # maps the file; batches decode lazily
-                if Sys.iswindows()
-                    err = caught(() -> overwrite(path))
-                    @test err isa Base.IOError
-                    @test occursin("memory-mapped", sprint(showerror, err))
-                    @test [sum(b.a) for b in s] == sums
-                else
-                    overwrite(path)
-                    @test [sum(b.a) for b in s] == sums
-                    @test Arrow.Table(path).a == [1]
-                    Arrow.write(path, Tables.partitioner(parts))
-                end
+                overwrite(path)
+                @test [sum(b.a) for b in s] == sums
+                @test Arrow.Table(path).a == [1]
+                Arrow.write(path, Tables.partitioner(parts))
                 @test readdir(dir) == ["mapped.arrow"]
             end
         end

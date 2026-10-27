@@ -60,9 +60,8 @@ The one-argument form curries for pipelines: `table |> Arrow.write(sink)`.
 Writing to an existing file writes a temporary file in the same directory
 and renames it over the old one when the output is complete, so a failed
 write leaves the old file unchanged, and an `Arrow.Table` or `Arrow.Stream`
-that memory-maps the old file keeps reading it. Windows cannot replace a
-file that is memory-mapped: `release!` the table first (or read it with
-`mmap=false`), or write to another path.
+that memory-maps the old file keeps reading it. If the operating system
+refuses the rename, `write` throws a `Base.IOError` and the old file is kept.
 
 The writer is eager and whole-buffer: batches are encoded and validated in
 memory, then written to the sink once.
@@ -125,12 +124,7 @@ function _commitpath(sink::_PathSink)
     err = ccall(:jl_fs_rename, Int32, (Cstring, Cstring), sink.tmp, sink.path)
     err < 0 || return nothing
     rm(sink.tmp; force=true)
-    hint =
-        Sys.iswindows() ?
-        "; Windows cannot replace a file that is open or memory-mapped, for " *
-        "example by a live Arrow.Table or Arrow.Stream: call Arrow.release! on it " *
-        "(or read with mmap=false) before overwriting, or write to another path" : ""
-    throw(Base.IOError("Arrow could not replace $(repr(sink.path))$hint", err))
+    throw(Base.IOError("Arrow could not replace $(repr(sink.path)); it is unchanged", err))
 end
 
 # Error cleanup: the destination keeps its old bytes (or stays absent).
