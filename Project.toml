@@ -44,11 +44,13 @@ ArrowTypes = {path = "src/ArrowTypes"}
 
 [weakdeps]
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
+CategoricalArrays = "324d7699-5711-5eae-9e2f-1d82baa6b597"
 CloudStore = "3365d9ee-d53b-4a56-812d-5344d5b716d7"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
 [extensions]
 ArrowSerializationExt = "Serialization"
+ArrowCategoricalArraysExt = "CategoricalArrays"
 ArrowCloudStoreExt = "CloudStore"
 ArrowTimeZonesExt = "TimeZones"
 
@@ -59,6 +61,7 @@ Durations = "1.4"
 DataStrings = "1"
 ArrowTypes = "2"
 Base64 = "1.10"
+CategoricalArrays = "0.10, 1"
 CloudStore = "1.6"
 CodecLz4 = "0.4"
 DataAPI = "1.12"

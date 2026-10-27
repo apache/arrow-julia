@@ -108,17 +108,19 @@ end
             for file in (true, false), compress in (nothing, :none, :lz4, :zstd)
                 expected = Arrow._writebytes(table; file=file, compress=compress)
                 write(path, "replace this longer existing destination"^100)
-                w = Arrow.Writer(path; file=file, compress=compress)
+                # nullable=false declares what one eager write declares.
+                w = Arrow.Writer(path; file=file, compress=compress, nullable=false)
                 @test Arrow.write(w, table) === w
                 @test close(w) === nothing
                 @test !isopen(w.io)
                 @test read(path) == expected
 
                 io = IOBuffer()
-                result = Arrow.Writer(io; file=file, compress=compress) do writer
-                    Arrow.write(writer, table)
-                    :done
-                end
+                result =
+                    Arrow.Writer(io; file=file, compress=compress, nullable=false) do writer
+                        Arrow.write(writer, table)
+                        :done
+                    end
                 @test result === :done
                 @test isopen(io)
                 @test take!(io) == expected
@@ -206,7 +208,7 @@ end
                 failure = ErrorException("body failed after publishing a batch")
                 writer = Ref{Arrow.Writer}()
                 err = caught() do
-                    Arrow.Writer(ownio ? path : io; file=file) do w
+                    Arrow.Writer(ownio ? path : io; file=file, nullable=false) do w
                         writer[] = w
                         Arrow.write(w, table)
                         throw(failure)

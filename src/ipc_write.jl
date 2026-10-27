@@ -683,7 +683,8 @@ function _dictionarymessage!(
     vf::Field,
     pool::ArrayData,
     codec::Int8,
-    state::Union{Nothing,EncodeState},
+    state::Union{Nothing,EncodeState};
+    isdelta::Bool=false,
 )
     c = EncodeCursor(codec, state)
     encodefield!(c, vf, pool)
@@ -692,6 +693,7 @@ function _dictionarymessage!(
     Meta.dictionaryBatchStart(b)
     Meta.dictionaryBatchAddId(b, id)
     Meta.dictionaryBatchAddData(b, rb)
+    isdelta && Meta.dictionaryBatchAddIsDelta(b, true)
     dictbatch = Meta.dictionaryBatchEnd(b)
     Meta.messageStart(b)
     Meta.messageAddVersion(b, Meta.MetadataVersion.V5)
@@ -998,7 +1000,20 @@ function _poolsequal(vf::Field, a::ArrayData, b::ArrayData)
     return isequal(AC.materialize(vf, a), AC.materialize(vf, b))
 end
 
-function writebatch!(st::IPCWriteState, batch::AC.RecordBatch; validate::Bool=true)
+"""
+    writebatch!(st, batch; validate=true, deltas=nothing)
+
+Publish one record batch, preceded by any dictionary batches it needs. A pool
+whose id has `deltas[id]` extends the pool written before by those values:
+that is emitted as a delta dictionary batch (both formats). Any other changed
+pool is a replacement (stream format, declared) or refused.
+"""
+function writebatch!(
+    st::IPCWriteState,
+    batch::AC.RecordBatch;
+    validate::Bool=true,
+    deltas::Union{Nothing,Dict{Int64,ArrayData}}=nothing,
+)
     st.finished && throw(ArgumentError("this IPC writer is already finished"))
     if validate
         _checkbatches(st.schema, (batch,))
@@ -1009,6 +1024,31 @@ function writebatch!(st::IPCWriteState, batch::AC.RecordBatch; validate::Bool=tr
         id = st.ids[f]
         old = get(st.current, id, nothing)
         old === pool && continue
+        delta = deltas === nothing || old === nothing ? nothing : get(deltas, id, nothing)
+        if delta !== nothing
+            vf = AC.dictvaluefield(f, f.type::DictionaryType)
+            old.len + delta.len == pool.len || throw(
+                ArgumentError("delta dictionary does not complete the pool for id $id"),
+            )
+            validate_semantic(vf, delta)
+            if st.file
+                _fileblock!(st, out, st.dictblocks) do
+                    _dictionarymessage!(
+                        out,
+                        id,
+                        vf,
+                        delta,
+                        st.codec,
+                        st.state;
+                        isdelta=true,
+                    )
+                end
+            else
+                _dictionarymessage!(out, id, vf, delta, st.codec, st.state; isdelta=true)
+            end
+            st.current[id] = pool
+            continue
+        end
         if old !== nothing
             vf = AC.dictvaluefield(f, f.type::DictionaryType)
             if st.file
@@ -1017,9 +1057,10 @@ function writebatch!(st::IPCWriteState, batch::AC.RecordBatch; validate::Bool=tr
                 # batch; anything else is replacement, which files cannot say.
                 _poolsequal(vf, old, pool) || throw(
                     ValidationError(
-                        "the IPC file format carries one dictionary batch per " *
-                        "id; dictionary id $id changed pools across batches — " *
-                        "use the stream format for replacement",
+                        "column $(f.name) changed its existing dictionary " *
+                        "categories; the IPC file format carries one dictionary " *
+                        "per column (new categories are appended as deltas) — use " *
+                        "the stream format for replacement",
                     ),
                 )
                 st.current[id] = pool
@@ -1030,9 +1071,10 @@ function writebatch!(st::IPCWriteState, batch::AC.RecordBatch; validate::Bool=tr
                 # the reader also accepts undeclared replacements from peers.
                 _poolsequal(vf, old, pool) || throw(
                     ValidationError(
-                        "dictionary id $id changed pools, but the stream's " *
-                        "schema message does not declare the " *
-                        "DictionaryReplacement feature",
+                        "column $(f.name) changed its existing dictionary " *
+                        "categories, but the stream's schema message does not " *
+                        "declare the DictionaryReplacement feature (create the " *
+                        "stream with Arrow.Writer(...; dictreplacement=true))",
                     ),
                 )
                 st.current[id] = pool

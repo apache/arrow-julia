@@ -3966,14 +3966,28 @@ end
 Assemble a fresh Int32-indexed dictionary Field and its first batch from
 already-built pool data.
 """
+# The narrowest signed index type for `n` categories (indices 0 to n - 1).
+_dictindextype(n::Integer) =
+    n <= 128 ? AC.IntType(8, true) :
+    n <= 32_768 ? AC.IntType(16, true) :
+    n - 1 <= typemax(Int32) ? AC.IntType(32, true) : AC.IntType(64, true)
+
+# Whether a column's categories are ordered: a CategoricalArray's flag (the
+# CategoricalArrays extension), else false.
+_isordered(::AbstractVector) = false
+_isordered(x::SubArray) = _isordered(parent(x))
+_isordered(x::DictEncode) = _isordered(x.data)
+
 function _newdictfromdata(
     name::String,
     valuefield::AC.Field,
     valuedata::AC.ArrayData,
     indices::Vector;
     nullable::Bool,
+    indextype::AC.IntType=AC.IntType(32, true),
+    ordered::Bool=false,
 )
-    t = AC.DictionaryType(AC.IntType(32, true), valuefield.type, false)
+    t = AC.DictionaryType(indextype, valuefield.type, ordered)
     field = AC.Field(
         name,
         t;
@@ -5838,8 +5852,9 @@ end
 
 # A column with a DataAPI ref pool (a PooledArray or CategoricalArray, say) is
 # written dictionary-encoded, as Arrow 2.x did: its pool, in pool order and
-# with unused entries, starts the Arrow dictionary. `refpools=false` (the
-# incremental writer) writes such a column as its values instead.
+# with unused entries, starts the Arrow dictionary. `refpools=false` writes
+# such a column as its values instead (a later table's column whose schema
+# field is not a dictionary).
 _hasrefpool(x::AbstractVector) =
     DataAPI.refpool(x) !== nothing &&
     DataAPI.refarray(x) !== x &&
@@ -5917,6 +5932,7 @@ function _constructcolumnparts(
     refpools::Bool=true,
     stringview::Bool=false,
     largelists::Bool=false,
+    growable::Bool=false,
 )
     isempty(parts) && throw(ArgumentError("column $name has no partitions"))
     length(poolhints) == length(parts) || throw(
@@ -6009,6 +6025,8 @@ function _constructcolumnparts(
                 T = Base.nonmissingtype(eltype(valuespart))
                 if retainedvaluefield === nothing
                     publictype = _facadebasetype(retained.type)
+                    # Any string writes to a utf8 pool.
+                    publictype === String && (publictype = AbstractString)
                     publictype !== Any &&
                         !(T <: publictype) &&
                         !_retainedwritertype(
@@ -6123,15 +6141,18 @@ function _constructcolumnparts(
             _remapdictionaryindices(part, remap) for part in candidateindices
         ]
         if retained === nothing
-            valuedata.len - 1 <= typemax(Int32) || throw(
-                ArgumentError("column $name dictionary exceeds the Int32 index range"),
-            )
+            # The narrowest index type the categories need; a pool that later
+            # tables may extend takes at least Int32, as pyarrow writes.
+            indextype =
+                _dictindextype(growable ? max(valuedata.len, 1 << 16) : valuedata.len)
             field, data[1] = _newdictfromdata(
                 fieldname,
                 valuefield,
                 valuedata,
                 indices[1];
                 nullable=any(v -> Missing <: eltype(v), values),
+                indextype,
+                ordered=all(_isordered, parts),
             )
         else
             field, data[1] = _retaineddictfromdata(

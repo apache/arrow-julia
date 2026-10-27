@@ -162,8 +162,8 @@ not provide these Arrow 2.x features:
 
 | Arrow 2.x feature | Arrow 3.0 action |
 |---|---|
-| `Arrow.Writer` | Still works, reimplemented: an incremental writer for both formats. The FIRST table written fixes the schema; later tables must conform (no cross-table inference). See [`Arrow.Writer`](@ref). |
-| `Arrow.append` | Still works for the IPC STREAM format, reimplemented. The file format refuses: produce it incrementally with `Arrow.Writer` or rewrite it. A 2.x stream whose dictionary pools carry null slots needs one rewrite through `Arrow.Writer(path; file=false, dictreplacement=true)` before it accepts pool-changing appends. |
+| `Arrow.Writer` | Still works, reimplemented: an incremental writer for both formats. The first table written fixes the schema, with every field nullable; later tables must conform, with lossless widening. Dictionaries grow with delta batches. See [`Arrow.Writer`](@ref). |
+| `Arrow.append` | Still works for the IPC STREAM format, reimplemented. The file format refuses: produce it incrementally with `Arrow.Writer` or rewrite it. New dictionary categories are appended as delta batches. |
 | `table \|> Arrow.write(sink)` | Still works: the curried form is kept. |
 | `Arrow.tobuffer(table)` | Still works, and still emits the IPC stream format. |
 | `ntasks` | Accepted; encoding runs on one task, including in `Arrow.Writer`. |
@@ -193,11 +193,8 @@ ignores them. As in Arrow 2.x, a column with a
 `DataAPI.refpool`, such as a `PooledArray` or `CategoricalArray`, is written
 dictionary-encoded with its pool order and unused pool entries; values that
 need it, such as `CategoricalValue`s, unwrap through `DataAPI.unwrap`. Wrap
-any other column that needs dictionary encoding in [`Arrow.DictEncode`](@ref).
-[`Arrow.Writer`](@ref) writes ref-pool columns as their values, because every
-later table must reuse the first table's exact dictionary pool; wrap a column
-in `Arrow.DictEncode` to encode it there. `Arrow.append` to a stream column
-that is dictionary-encoded has the same exact-pool rule.
+any other column that needs dictionary encoding in [`Arrow.DictEncode`](@ref),
+or name it in `dictencode`.
 
 Arrow 3.0 again consumes the ArrowTypes.jl mapping interface. Package authors
 should depend on and import ArrowTypes.jl directly. Define `ArrowType` and

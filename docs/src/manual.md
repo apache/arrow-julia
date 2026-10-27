@@ -439,14 +439,19 @@ Arrow.Writer("out.arrow") do writer
 end
 ```
 
-The first table fixes the schema. Later tables must have the same columns in
-the same order and compatible types. Closing the writer finishes the output;
-an abandoned writer can leave a torn stream or a file without its footer.
+The first table fixes the schema, with every field declared nullable (pass
+`nullable=false` to keep the first table's nullability). Later tables must have
+the same columns in the same order and types that fit: numbers widen losslessly
+(`Int32` into `Int64`), an all-missing column writes nulls, and anything else is
+refused with an error naming the column. Dictionary-encoded columns keep one
+dictionary across tables; new categories are appended as delta dictionary
+batches, which pyarrow reads and Polars 1.43 does not. Closing the writer
+finishes the output; an abandoned writer can leave a torn stream or a file
+without its footer.
 
-[`Arrow.append`](@ref) extends an existing IPC stream in place. It refuses the
-IPC file format, whose footer must be written when the file is closed. Changed
-dictionary pools require a stream created with
-`Arrow.Writer(...; file=false, dictreplacement=true)`.
+[`Arrow.append`](@ref) extends an existing IPC stream in place, with the same
+rules for later tables. It refuses the IPC file format, whose footer must be
+written when the file is closed.
 
 ### Dictionary encoding
 
@@ -462,9 +467,10 @@ A column with a `DataAPI.refpool`, such as a `PooledArray` or a
 `CategoricalArray`, is written dictionary-encoded without the wrapper. Its
 pool, in pool order and including unused entries, starts the Arrow dictionary.
 Pool values that are wrappers without an ArrowTypes.jl mapping, such as
-`CategoricalValue`, are written through `DataAPI.unwrap`. [`Arrow.Writer`](@ref)
-writes ref-pool columns as their values and encodes only `Arrow.DictEncode`
-columns, since every later table must reuse the first table's exact pool.
+`CategoricalValue`, are written through `DataAPI.unwrap`. An ordered
+`CategoricalArray` writes an ordered dictionary. `Arrow.write` uses the
+narrowest index type that holds the categories (`Int8` up to 128); an
+[`Arrow.Writer`](@ref), whose dictionaries grow across tables, uses `Int32`.
 
 Reading a dictionary-encoded column resolves the indices: the column comes
 back as its value type. When a `Table` read from Arrow is written again,

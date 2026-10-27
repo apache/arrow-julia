@@ -24,9 +24,24 @@ using Test
 using Dates
 using Tables
 using Arrow
+using PooledArrays
+import CategoricalArrays
 import DataAPI
 
 const AC = Arrow.ArrowCore
+
+# (id, isDelta, length) of each dictionary batch, in order.
+function dictbatches(bytes)
+    if bytes[1:6] == b"ARROW1"
+        footerlen = only(reinterpret(Int32, bytes[(end - 9):(end - 6)]))
+        bytes = bytes[9:(end - 10 - footerlen)]
+    end
+    msgs = Arrow.framemessages(AC.heapregion(bytes))
+    return [
+        (m.msg.header.id, m.msg.header.isDelta, m.msg.header.data.length) for
+        m in msgs if m.msg.header isa Arrow.Meta.DictionaryBatch
+    ]
+end
 
 @testset "incremental writer and append" begin
     t1 = (; a=Int64[1, 2], b=["x", "y"])
@@ -144,13 +159,54 @@ const AC = Arrow.ArrowCore
         Arrow.write(w, t1)
         err = @test_throws ArgumentError Arrow.write(w, (; a=[1], c=["q"]))
         @test occursin("do not match", err.value.msg)
-        # Type drift and missing under a non-nullable field are refused.
-        @test_throws Exception Arrow.write(w, (; a=[1.5], b=["q"]))
-        @test_throws Exception Arrow.write(w, (; a=[missing, 1], b=["q", "r"]))
-        # The writer stays usable after a refused write.
+        # Lossy type drift is refused, naming the column and both types.
+        err = @test_throws ArgumentError Arrow.write(w, (; a=[1.5], b=["q"]))
+        @test occursin("column a", err.value.msg)
+        @test occursin("double", err.value.msg) && occursin("int64", err.value.msg)
+        # Every field is nullable, so later missing values conform; the
+        # writer stays usable after a refused write.
+        Arrow.write(w, (; a=[missing, 1], b=["q", missing]))
         Arrow.write(w, t2)
         close(w)
-        @test Arrow.Table(take!(io)).a == [1, 2, 3, 4]
+        t = Arrow.Table(take!(io))
+        @test isequal(t.a, [1, 2, missing, 1, 3, 4])
+        @test isequal(t.b, ["x", "y", "q", missing, "z", "w"])
+        # nullable=false declares the first table's nullability instead.
+        w = Arrow.Writer(IOBuffer(); nullable=false)
+        Arrow.write(w, t1)
+        err = @test_throws ArgumentError Arrow.write(w, (; a=[missing, 1], b=["q", "r"]))
+        @test occursin("not nullable", err.value.msg)
+        close(w)
+    end
+
+    @testset "later tables widen losslessly" begin
+        for file in (true, false)
+            io = IOBuffer()
+            Arrow.Writer(io; file) do w
+                Arrow.write(w, (; i=Int64[1], f=[1.5], g=[0.5], s=["a"], u=[true]))
+                Arrow.write(
+                    w,
+                    (; i=Int32[2], f=Float32[2.5], g=Int16[3], s=[missing], u=[false]),
+                )
+                Arrow.write(
+                    w,
+                    (; i=[missing], f=[missing], g=[missing], s=[missing], u=[missing]),
+                )
+            end
+            t = Arrow.Table(take!(io))
+            @test isequal(collect(t.i), [1, 2, missing])
+            @test isequal(collect(t.f), [1.5, 2.5, missing])
+            @test isequal(collect(t.g), [0.5, 3.0, missing])
+            @test isequal(collect(t.s), ["a", missing, missing])
+            @test isequal(collect(t.u), [true, false, missing])
+            @test eltype(t.i) == Union{Missing,Int64}
+        end
+        # Narrowing (Int64 into Int32) is refused.
+        w = Arrow.Writer(IOBuffer())
+        Arrow.write(w, (; i=Int32[1]))
+        err = @test_throws ArgumentError Arrow.write(w, (; i=Int64[2]))
+        @test occursin("column i", err.value.msg)
+        close(w)
     end
 
     @testset "a zero-row typed first write pins the schema" begin
@@ -215,45 +271,58 @@ const AC = Arrow.ArrowCore
         @test Arrow.Table(path).dt == [DateTime(1970), DateTime(2026, 1, 2, 3)]
     end
 
-    @testset "stream format replaces dictionary pools across writes" begin
-        # Replacement must be opted into: the declaration is a demand on
-        # readers, so the default writer refuses a changed pool instead.
-        io = IOBuffer()
-        w = Arrow.Writer(io; file=false)
-        Arrow.write(w, (; d=Arrow.DictEncode(["a", "b", "a"])))
-        err = @test_throws Arrow.ValidationError Arrow.write(
-            w,
-            (; d=Arrow.DictEncode(["c", "c", "b"])),
-        )
-        @test occursin("DictionaryReplacement", err.value.msg)
-        Arrow.write(w, (; d=Arrow.DictEncode(["a", "b", "b"])))   # same pool reuses
-        close(w)
-        @test Arrow.Table(take!(io)).d == ["a", "b", "a", "a", "b", "b"]
-
+    @testset "dictionaries grow with delta batches in both formats" begin
+        for file in (true, false), mk in (Arrow.DictEncode, PooledArray)
+            io = IOBuffer()
+            Arrow.Writer(io; file) do w
+                Arrow.write(w, (; d=mk(["a", "b", "a"])))
+                Arrow.write(w, (; d=mk(["c", "c", "b"])))   # adds "c"
+                Arrow.write(w, (; d=mk(["b", "a"])))        # nothing new
+            end
+            bytes = take!(io)
+            @test Arrow.Table(bytes).d == ["a", "b", "a", "c", "c", "b", "b", "a"]
+            # One base dictionary, then one delta holding only the new category.
+            @test [(isdelta, n) for (_, isdelta, n) in dictbatches(bytes)] == [(false, 2), (true, 1)]
+            # A growing pool is indexed with Int32, as pyarrow writes.
+            f = only(
+                Arrow.readfile(take!(Arrow.write(IOBuffer(), Arrow.Table(bytes)))).schema.fields,
+            )
+            @test (f.type::AC.DictionaryType).indextype == AC.IntType(32, true)
+        end
+        # dictreplacement=true replaces each table's pool instead (stream only).
         io = IOBuffer()
         w = Arrow.Writer(io; file=false, dictreplacement=true)
         Arrow.write(w, (; d=Arrow.DictEncode(["a", "b", "a"])))
         Arrow.write(w, (; d=Arrow.DictEncode(["c", "c", "b"])))
         close(w)
-        t = Arrow.Table(take!(io))
-        @test t.d == ["a", "b", "a", "c", "c", "b"]
+        bytes = take!(io)
+        @test Arrow.Table(bytes).d == ["a", "b", "a", "c", "c", "b"]
+        @test [(isdelta, n) for (_, isdelta, n) in dictbatches(bytes)] == [(false, 2), (false, 2)]
         # The file format has no replacement to declare.
         @test_throws ArgumentError Arrow.Writer(IOBuffer(); dictreplacement=true)
     end
 
-    @testset "file format reuses an identical pool and refuses a change" begin
-        io = IOBuffer()
-        w = Arrow.Writer(io; file=true)
-        Arrow.write(w, (; d=Arrow.DictEncode(["a", "b", "a"])))
-        Arrow.write(w, (; d=Arrow.DictEncode(["a", "b", "b"])))
-        err = @test_throws Arrow.ValidationError Arrow.write(
-            w,
-            (; d=Arrow.DictEncode(["b", "a"])),
-        )
-        @test occursin("one dictionary batch per", err.value.msg)
-        close(w)
-        t = Arrow.Table(take!(io))
-        @test t.d == ["a", "b", "a", "a", "b", "b"]
+    @testset "one-shot dictionaries use the narrowest index type" begin
+        indextype(t) = (
+            only(
+                Arrow.readfile(take!(Arrow.write(IOBuffer(), t))).schema.fields,
+            ).type::AC.DictionaryType
+        ).indextype
+        @test indextype((; d=Arrow.DictEncode(["a", "b"]))) == AC.IntType(8, true)
+        @test indextype((; d=PooledArray(string.(1:200)))) == AC.IntType(16, true)
+        @test indextype((; d=PooledArray(string.(1:40_000)))) == AC.IntType(32, true)
+        # An ordered CategoricalArray writes an ordered dictionary.
+        for ordered in (true, false)
+            c = CategoricalArrays.categorical(
+                ["lo", "hi", "lo"];
+                ordered,
+                levels=["lo", "hi"],
+            )
+            bytes = take!(Arrow.write(IOBuffer(), (; c=c)))
+            t = only(Arrow.readfile(bytes).schema.fields).type::AC.DictionaryType
+            @test t.ordered == ordered
+            @test Arrow.Table(bytes).c == ["lo", "hi", "lo"]
+        end
     end
 
     @testset "close is idempotent; a closed writer refuses writes" begin
@@ -320,20 +389,17 @@ const AC = Arrow.ArrowCore
     end
 
     @testset "append with dictionary columns" begin
-        # An eager-written stream declares no replacement: a content-equal
-        # pool appends by reuse, and a changed pool is refused.
+        # New categories append as a delta dictionary batch; existing ones
+        # reuse the stream's dictionary.
         path = joinpath(mktempdir(), "d.arrow")
         Arrow.write(path, (; d=Arrow.DictEncode(["a", "b", "a"])); file=false)
         Arrow.append(path, (; d=Arrow.DictEncode(["a", "b", "b"])))
         @test Arrow.Table(path).d == ["a", "b", "a", "a", "b", "b"]
-        err = @test_throws Arrow.ValidationError Arrow.append(
-            path,
-            (; d=Arrow.DictEncode(["z", "z", "q"])),
-        )
-        @test occursin("DictionaryReplacement", err.value.msg)
+        Arrow.append(path, (; d=Arrow.DictEncode(["z", "z", "q"])))
+        @test Arrow.Table(path).d == ["a", "b", "a", "a", "b", "b", "z", "z", "q"]
+        @test [(isdelta, n) for (_, isdelta, n) in dictbatches(read(path))] == [(false, 2), (true, 2)]
 
-        # A Writer stream that opted into replacement accepts replacing
-        # appends.
+        # A Writer stream that opted into replacement replaces on append.
         rpath = joinpath(mktempdir(), "r.arrow")
         Arrow.Writer(rpath; file=false, dictreplacement=true) do w
             Arrow.write(w, (; d=Arrow.DictEncode(["a", "b", "a"])))
@@ -375,28 +441,16 @@ const AC = Arrow.ArrowCore
                 Pair{String,Any}["a" => 6, "b" => "u"],
                 Pair{String,Any}["a" => 7, "b" => "t"],
             ],
-            dict=Arrow.DictEncode(["lo", "hi"]),
+            dict=Arrow.DictEncode(["lo", "mid"]),
         )
         # The 2.x pool carries a null slot (2.x encoded missing as a pool
-        # entry), which a 3.0 pool never reproduces — so the append needs
-        # replacement, which the 2.x schema message does not declare. The
-        # refusal must leave the file untouched.
-        err = @test_throws Arrow.ValidationError Arrow.append(path, tail)
-        @test occursin("DictionaryReplacement", err.value.msg)
-        @test read(path) == fixture
-        # The migration recipe: rewrite once through a replacement-declaring
-        # writer (retention preserves the 2.x pool, null slot included, so
-        # appends with fresh pools need replacement).
-        migrated = Arrow.Table(read(path))
-        Arrow.Writer(path; file=false, dictreplacement=true) do w
-            Arrow.write(w, migrated)
-        end
+        # entry); the new category extends it with a delta dictionary batch.
         Arrow.append(path, tail)
         t = Arrow.Table(path)
         # The 2.x fixture holds the five-row table twice (two partitions).
         @test t.ints == [1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 6, 7]
         @test t.strs[11] == "tail"
-        @test isequal(t.dict, [before.dict..., "lo", "hi"])
+        @test isequal(t.dict, [before.dict..., "lo", "mid"])
         @test t.structs[end] == [Pair{String,Any}("a", 7), Pair{String,Any}("b", "t")]
     end
 end

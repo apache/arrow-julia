@@ -180,7 +180,8 @@ end
 """
     Arrow.Writer(sink; file=true, compress=nothing, compresslevel=nothing,
                  batchsize=1_048_576, largelists=false, stringview=false,
-                 metadata=nothing, colmetadata=nothing, dictreplacement=false)
+                 nullable=true, metadata=nothing, colmetadata=nothing,
+                 dictreplacement=false)
     Arrow.Writer(f::Function, sink; kwargs...)
 
 An incremental IPC writer: batches publish to `sink` as they are written,
@@ -201,25 +202,24 @@ temporary file that `close` renames over the old file.
     end
     close(w)
 
-The FIRST table written fixes the schema, with the same inference one
-eager `Arrow.write` of that table would use; every later table must
-conform to it (same column names and order, compatible types) or the
-write is refused with the mismatch. Unlike the eager writer, no inference
-crosses tables: a field is nullable iff the first table's column eltype
-admits `Missing`, and later missing values under a non-nullable field are
-refused. To pin a schema explicitly, write a zero-row table with fully
-typed columns first.
+The first table written fixes the schema, with the inference one
+`Arrow.write` of that table would use, except that every field is declared
+nullable (as pyarrow and Polars do), so later missing values conform;
+`nullable=false` keeps the first table's nullability instead. A table from
+`Arrow.Table` or `Arrow.Stream` keeps its own schema. Every later table must
+have the same column names in the same order and types that fit the schema:
+numbers widen losslessly (`Int32` into an `Int64` column, `Float32` into
+`Float64`), an all-missing column writes nulls, and anything else is refused
+with an error naming the column and both types.
 
-Dictionary-encoded columns: only `Arrow.DictEncode` columns are encoded
-here (a `PooledArray` or `CategoricalArray` column is written as its
-values), and every later table may reuse the first table's exact pool (the
-same categories in the same first-appearance order). A CHANGED pool needs replacement dictionary batches, which the
-schema message must declare up front: pass `dictreplacement=true`
-(stream format only) to declare it. The declaration is a demand on
-readers — strict ones such as nanoarrow refuse any stream declaring a
-feature they do not support — so it is opt-in, and without it a changed
-pool is refused. The file format carries one dictionary batch per id and
-never replaces.
+Dictionary-encoded columns (`Arrow.DictEncode`, `PooledArray`,
+`CategoricalArray`) keep one dictionary across tables: a later table's new
+categories are appended with a delta dictionary batch (in both formats), and
+its indices refer to the combined categories. Such dictionaries use `Int32`
+indices. pyarrow reads delta dictionaries; Polars 1.43 does not. With
+`dictreplacement=true` (stream format only), each table instead replaces the
+dictionary with its own categories; the schema then declares the
+DictionaryReplacement feature, which strict readers such as nanoarrow refuse.
 
 `close` finalizes what has been published — the sink is a valid IPC
 output containing every batch written so far — and is idempotent. A
@@ -242,9 +242,13 @@ mutable struct Writer
     const batchsize::Int
     const largelists::Bool
     const stringview::Bool
+    const nullable::Bool
     st::Union{Nothing,IPCWriteState}
     names::Vector{Symbol}
     schema::Union{Nothing,AC.Schema}
+    # Each top-level dictionary column's categories so far (public values),
+    # which later tables extend; nothing for other columns.
+    pools::Vector{Any}
     @atomic closed::Bool
 end
 
@@ -259,6 +263,7 @@ function _writer(
     batchsize::Integer=DEFAULT_BATCHSIZE,
     largelists::Bool=false,
     stringview::Bool=false,
+    nullable::Bool=true,
     ntasks::Union{Nothing,Integer}=nothing,
 )
     codec = _codec(compress, compresslevel)
@@ -289,9 +294,11 @@ function _writer(
             batchsize,
             largelists,
             stringview,
+            nullable,
             nothing,
             Symbol[],
             nothing,
+            Any[],
             false,
         )
     catch
@@ -341,8 +348,6 @@ function write(w::Writer, tbl)
     names, partcols, partpools, rowcounts = _collectparts(tbl)
     if w.st === nothing
         retained = _retainedschema(tbl)
-        # Later tables must reuse the first table's exact dictionary pool,
-        # so only explicit DictEncode columns are encoded here.
         fields, coldata, batchrows = if isempty(partcols)
             (_schemaonly(retained, w.colmetadata)..., Int[])
         else
@@ -354,14 +359,19 @@ function write(w::Writer, tbl)
                     pools,
                     retainedfield,
                     w.colmetadata;
-                    refpools=false,
                     stringview=w.stringview,
                     largelists=w.largelists,
+                    growable=true,
                 )
             end
         end
         # The bounded facade interning rule, as when the source was read.
         isempty(partcols) && (names = _fieldnamesymbols(fields))
+        # Every field nullable, so a later table's missing values conform; a
+        # retained schema keeps its own declarations.
+        w.nullable &&
+            retained === nothing &&
+            (fields = AC.Field[_nullablefield(f) for f in fields])
         schmeta = _writermetadata(w.metadata, retained)
         sch = AC.Schema(fields; metadata=schmeta)
         st = beginwrite!(
@@ -375,6 +385,7 @@ function write(w::Writer, tbl)
         w.st = st
         w.schema = sch
         w.names = names
+        w.pools = _writtenpools(sch, coldata)
         for batch in _tablebatches(sch, coldata, batchrows)
             writebatch!(st, batch)
         end
@@ -387,16 +398,22 @@ function write(w::Writer, tbl)
             ),
         )
         sch = w.schema::AC.Schema
+        # Dictionary columns extend the categories written so far (a delta
+        # dictionary batch carries the new ones), unless each table replaces
+        # its pool.
+        hints = w.dictreplacement ? partpools : _extendpools(w.pools, partpools)
         fields, coldata, batchrows =
-            _constructbatches(partcols, partpools, rowcounts, w.batchsize) do cols, pools
+            _constructbatches(partcols, hints, rowcounts, w.batchsize) do cols, pools
                 _constructconforming(names, cols, pools, sch, tbl; w.stringview)
             end
         # A fresh Schema over the BUILT fields, so `writebatch!` re-checks
         # them against the writer's schema instead of trusting construction.
         batchsch = AC.Schema(fields; metadata=sch.metadata)
+        st = w.st::IPCWriteState
         for batch in _tablebatches(batchsch, coldata, batchrows)
-            writebatch!(w.st, batch)
+            writebatch!(st, batch; deltas=_dictionarydeltas(st, batch))
         end
+        w.pools = _writtenpools(sch, coldata)
     end
     return w
 end
@@ -428,18 +445,17 @@ end
 Add `table`'s record batches to an existing IPC STREAM (`sink` is a file
 path or a seekable read/write `IO`). The existing stream is validated in
 full first, the new columns are constructed against its schema (same
-names, order, and compatible types, or the append is refused), and the
-new batches are published after the last existing message (over its
-end-of-stream marker, if it has one), followed by a new end-of-stream marker.
+names and order; types fit as for a later table of [`Arrow.Writer`](@ref),
+or the append is refused), and the new batches are published after the last
+existing message (over its end-of-stream marker, if it has one), followed by a
+new end-of-stream marker.
 
-A dictionary-encoded column whose pool matches the stream's latest dictionary
-update reuses it, including updates after the last record batch; a changed
-pool is emitted as a replacement dictionary batch
-when the stream's schema message declared the DictionaryReplacement
-feature (produce such a stream with
-`Arrow.Writer(sink; file=false, dictreplacement=true)`), and refused
-otherwise. The file format does not support appending: rewrite the file,
-or produce it incrementally with [`Arrow.Writer`](@ref).
+A dictionary-encoded column continues the stream's latest dictionary: new
+categories are appended with a delta dictionary batch, within the range of the
+dictionary's index type. A stream whose schema declares DictionaryReplacement
+(`Arrow.Writer(sink; file=false, dictreplacement=true)`) gets a replacement
+dictionary instead. The file format does not support appending: rewrite the
+file, or produce it incrementally with [`Arrow.Writer`](@ref).
 """
 function append(path::AbstractString, tbl; kwargs...)
     bytes = Base.read(path)
@@ -501,8 +517,11 @@ function _appendbytes(
                 "schema fields $([f.name for f in sch.fields]) (same names, same order)",
             ),
         )
+    # Dictionary columns extend the stream's latest categories; a delta
+    # dictionary batch carries the new ones.
+    hints = _extendpools(_streampools(s), partpools)
     fields, coldata, batchrows =
-        _constructbatches(partcols, partpools, rowcounts, batchsize) do cols, pools
+        _constructbatches(partcols, hints, rowcounts, batchsize) do cols, pools
             _constructconforming(names, cols, pools, sch, tbl)
         end
     batchsch = AC.Schema(fields; metadata=sch.metadata)
@@ -518,13 +537,97 @@ function _appendbytes(
     )
     try
         for batch in _tablebatches(batchsch, coldata, batchrows)
-            writebatch!(st, batch)
+            writebatch!(st, batch; deltas=_dictionarydeltas(st, batch))
         end
         finishwrite!(st)
     finally
         abortwrite!(st)
     end
     return keep, take!(io)
+end
+
+# --- dictionaries that grow across tables -----------------------------------
+
+"Each top-level dictionary column's written categories (public values), else nothing."
+function _writtenpools(sch::AC.Schema, coldata)
+    ctx = _ArrowTypesContext(; warn=false)
+    return Any[
+        (f.type isa AC.DictionaryType && !isempty(coldata[j])) ?
+        _retainedsnapshotpool(f, coldata[j][1].dictionary, ctx) : nothing for
+        (j, f) in enumerate(sch.fields)
+    ]
+end
+
+"The latest categories of each top-level dictionary column of a stream."
+function _streampools(s::IPCStream)
+    ctx = _ArrowTypesContext(; warn=false)
+    return Any[
+        f.type isa AC.DictionaryType ?
+        _retainedsnapshotpool(f, get(s.dictionaries, s.fielddictids[f], nothing), ctx) :
+        nothing for f in s.schema.fields
+    ]
+end
+
+# Pool hints for each partition: the categories written so far, followed by
+# any categories the partition retains from its own source.
+function _extendpools(pools::Vector{Any}, partpools)
+    return Any[
+        Any[
+            _extendpool(pools[j], own === nothing ? nothing : own[j]) for
+            j in eachindex(pools)
+        ] for own in partpools
+    ]
+end
+_extendpool(written, own) =
+    written === nothing ? own :
+    own === nothing ? written : _mergecategorypools(AbstractVector[written, own])
+
+"""
+Delta dictionaries for a batch whose pools extend, value by value, the pools
+already written under their ids: the new categories as storage, by id.
+"""
+function _dictionarydeltas(st::IPCWriteState, batch::AC.RecordBatch)
+    deltas = Dict{Int64,AC.ArrayData}()
+    for (f, pool) in dictionarypools(st.schema.fields, batch.columns)
+        id = st.ids[f]
+        old = get(st.current, id, nothing)
+        (old === nothing || old === pool || pool.len <= old.len) && continue
+        vf = AC.dictvaluefield(f, f.type::AC.DictionaryType)
+        stored = _writerstoredcolumn(vf, pool)
+        isequal(_writerstoredcolumn(vf, old), stored[1:(old.len)]) || continue
+        _, delta = _rebuildwriterstorageselection(
+            vf,
+            stored,
+            collect((old.len + 1):(pool.len)),
+            _WriterContext(f.name),
+        )
+        deltas[id] = delta
+    end
+    return deltas
+end
+
+"""
+A schema field declared nullable, with its descendants, except the children
+the format requires to be non-null (map entries and keys, run ends).
+"""
+function _nullablefield(f::AC.Field)
+    t = f.type
+    children = if t isa AC.MapType && length(f.children) == 1
+        entries = only(f.children)
+        kv = entries.children
+        AC.Field[AC.Field(
+            entries.name,
+            entries.type;
+            nullable=false,
+            metadata=entries.metadata,
+            children=AC.Field[kv[1], (_nullablefield(c) for c in kv[2:end])...],
+        )]
+    elseif t isa AC.RunEndEncodedType && length(f.children) == 2
+        AC.Field[f.children[1], _nullablefield(f.children[2])]
+    else
+        AC.Field[_nullablefield(c) for c in f.children]
+    end
+    return AC.Field(f.name, t; nullable=true, metadata=f.metadata, children=children)
 end
 
 "Retained Arrow schema when the source is a facade read, else nothing."
@@ -604,6 +707,11 @@ function _writebytes(
             )
         end
     end
+    # Several input partitions declare every field nullable, as an
+    # Arrow.Writer does; one partition keeps its element types' nullability.
+    retained === nothing &&
+        length(partcols) > 1 &&
+        (fields = AC.Field[_nullablefield(f) for f in fields])
     schmeta = _writermetadata(metadata, retained)
     sch = AC.Schema(fields; metadata=schmeta)
     batches = _tablebatches(sch, coldata, batchrows)
@@ -849,6 +957,7 @@ function _constructcolumns(
     refpools::Bool=true,
     stringview::Bool=false,
     largelists::Bool=false,
+    growable::Bool=false,
 ) where {F}
     nparts = length(partcols)
     ncols = length(names)
@@ -868,6 +977,7 @@ function _constructcolumns(
             refpools=refpools,
             stringview=stringview,
             largelists=largelists,
+            growable=growable,
         )
     end
     return fields, coldata
@@ -899,11 +1009,32 @@ function _constructconforming(
     for j in eachindex(names)
         expected = sch.fields[j]
         parts = AbstractVector[partcols[k][j] for k = 1:nparts]
+        if expected.nullable &&
+           !(expected.type isa AC.DictionaryType) &&
+           all(p -> eltype(p) === Missing, parts)
+            # An all-missing column is all nulls of the field's type.
+            context = _WriterContext(String(names[j]))
+            fields[j] = expected
+            coldata[j] = AC.ArrayData[
+                last(_constructhiddenpart(expected, length(p), context)) for p in parts
+            ]
+            continue
+        end
         fresh =
             expected.type isa AC.DictionaryType ? nothing :
             _freshcolumn(names[j], parts; stringview)
         mismatch =
             fresh === nothing ? nothing : _conformancemismatch(expected, first(fresh))
+        if mismatch !== nothing
+            # Numbers widen losslessly into the field's type (Int32 into Int64).
+            widened = _widenparts(expected, parts)
+            if widened !== nothing
+                fresh = _freshcolumn(names[j], widened; stringview)
+                fresh === nothing ||
+                    _conformancemismatch(expected, first(fresh)) !== nothing ||
+                    (mismatch = nothing)
+            end
+        end
         if fresh !== nothing && mismatch === nothing
             fields[j], coldata[j] = expected, last(fresh)
             continue
@@ -927,6 +1058,40 @@ function _constructconforming(
     return fields, coldata
 end
 
+"""
+A later table's number columns converted to a schema field's wider number
+type, when every value converts exactly (`Int32` into `Int64`, `Float32` into
+`Float64`, `Int32` into `Float64`); nothing otherwise.
+"""
+function _widenparts(expected::AC.Field, parts)
+    t = expected.type
+    t isa Union{AC.IntType,AC.FloatType} || return nothing
+    T = AC.juliatype(t)
+    widened = AbstractVector[]
+    for p in parts
+        S = Base.nonmissingtype(eltype(p))
+        if S === T
+            push!(widened, p)
+        elseif S === Union{} || _widens(S, T)
+            push!(
+                widened,
+                Missing <: eltype(p) ? convert(Vector{Union{Missing,T}}, p) :
+                convert(Vector{T}, p),
+            )
+        else
+            return nothing
+        end
+    end
+    return widened
+end
+_widens(::Type{S}, ::Type{T}) where {S<:Integer,T<:Integer} =
+    S !== Bool && typemin(T) <= typemin(S) && typemax(S) <= typemax(T)
+_widens(::Type{S}, ::Type{T}) where {S<:AbstractFloat,T<:AbstractFloat} =
+    sizeof(S) <= sizeof(T)
+_widens(::Type{S}, ::Type{T}) where {S<:Integer,T<:AbstractFloat} =
+    S !== Bool && 8 * sizeof(S) < precision(T)
+_widens(::Type, ::Type) = false
+
 function _freshcolumn(name::Symbol, parts; stringview::Bool=false)
     try
         return _constructcolumn(name, parts; refpools=false, stringview)
@@ -935,6 +1100,38 @@ function _freshcolumn(name::Symbol, parts; stringview::Bool=false)
         err isa ArgumentError || rethrow()
         return nothing
     end
+end
+
+"An Arrow type's name for messages, as pyarrow spells it."
+function _typename(t::AC.ArrowType)
+    unit(u) =
+        u == AC.SECOND ? "s" :
+        u == AC.MILLISECOND ? "ms" : u == AC.MICROSECOND ? "us" : "ns"
+    t isa AC.IntType && return (t.signed ? "int" : "uint") * string(t.bits)
+    t isa AC.FloatType &&
+        return t.bits == 16 ? "halffloat" : t.bits == 32 ? "float" : "double"
+    t isa AC.BoolType && return "bool"
+    t isa AC.Utf8Type && return t.large ? "large_string" : "string"
+    t isa AC.BinaryType && return t.large ? "large_binary" : "binary"
+    t isa AC.ViewType && return t.utf8 ? "string_view" : "binary_view"
+    t isa AC.FixedSizeBinaryType && return "fixed_size_binary[$(t.nbytes)]"
+    t isa AC.DateType && return t.unit == AC.DAY ? "date32" : "date64"
+    t isa AC.TimeType && return "time$(t.bits)[$(unit(t.unit))]"
+    t isa AC.TimestampType &&
+        return "timestamp[$(unit(t.unit))$(t.timezone === nothing ? "" : ", tz=$(t.timezone)")]"
+    t isa AC.DurationType && return "duration[$(unit(t.unit))]"
+    t isa AC.DecimalType && return "decimal$(t.bits)($(t.precision), $(t.scale))"
+    t isa AC.IntervalType && return "interval"
+    t isa AC.ListType && return t.large ? "large_list" : "list"
+    t isa AC.ListViewType && return t.large ? "large_list_view" : "list_view"
+    t isa AC.FixedSizeListType && return "fixed_size_list[$(t.listsize)]"
+    t isa AC.StructType && return "struct"
+    t isa AC.MapType && return "map"
+    t isa AC.UnionType && return "union"
+    t isa AC.DictionaryType && return "dictionary<$(_typename(t.valuetype))>"
+    t isa AC.RunEndEncodedType && return "run_end_encoded"
+    t isa AC.NullType && return "null (all missing)"
+    return String(AC.descriptorname(t))
 end
 
 """
@@ -951,11 +1148,13 @@ function _conformancemismatch(
 )
     expected.name == actual.name || return "$path is named $(repr(actual.name))"
     AC.typeequal(expected.type, actual.type) ||
-        return "$path maps to $(repr(actual.type)) where the schema has " *
-               repr(expected.type)
+        return "$path writes as $(_typename(actual.type)), but the schema has " *
+               _typename(expected.type)
     actual.nullable &&
         !expected.nullable &&
-        return "$path admits missing values but the schema field is non-nullable"
+        return "$path holds missing values, but the schema field is not nullable " *
+               "(an Arrow.Writer declares every field nullable unless created " *
+               "with nullable=false)"
     _arrowtypesextension(expected) == _arrowtypesextension(actual) ||
         return "$path has a different extension type than the schema field"
     top ||

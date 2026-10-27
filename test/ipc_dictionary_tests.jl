@@ -459,14 +459,12 @@ end
                 @test parts[1].a == ["alpha", "beta"]
                 @test parts[2].a == finalvalues
 
-                sink = path ? joinpath(dir, "refused.arrows") : IOBuffer()
+                # Categories missing from the latest pool extend it (a delta).
+                sink = path ? joinpath(dir, "extended.arrows") : IOBuffer()
                 write(sink, bytes)
-                err = @test_throws Arrow.ValidationError Arrow.append(
-                    sink,
-                    (; a=Arrow.DictEncode(["alpha", "beta"])),
-                )
-                @test occursin("DictionaryReplacement", err.value.msg)
-                @test (path ? read(sink) : take!(sink)) == bytes
+                Arrow.append(sink, (; a=Arrow.DictEncode(["alpha", "beta"])))
+                appended = path ? read(sink) : take!(sink)
+                @test Arrow.Table(appended).a == ["alpha", "beta", "alpha", "beta"]
             end
         end
     end
