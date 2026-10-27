@@ -202,7 +202,7 @@ maps to `Union{Missing, T}`.
 | Bool | `Bool` |
 | Utf8, LargeUtf8, Utf8View | `DataStrings.DataString` (`String` with `stringtype=String`) |
 | Binary, LargeBinary, BinaryView | `DataStrings.DataBytes` |
-| FixedSizeBinary(N) | `NTuple{N,UInt8}` |
+| FixedSizeBinary(N) | `NTuple{N,UInt8}` for `N ≤ 256`; `DataStrings.DataBytes` for wider values |
 | Date32 | `Dates.Date` |
 | Date64 | `Dates.DateTime` |
 | Timestamp (no timezone) | `Durations.Timestamp{P}` at the column unit (the stored UTC instant, exact at every unit) |

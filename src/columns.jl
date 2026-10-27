@@ -653,11 +653,22 @@ function _payloadcolumn(::Type{V}, datas, budget=nothing) where {V}
     for d in datas
         t = d.type
         t isa AC.ViewType ? _viewpayloads!(payloads, buffers, at, d, budget) :
+        t isa AC.FixedSizeBinaryType ? _fixedpayloads!(payloads, buffers, at, d, budget) :
         _offsetpayloads!(payloads, buffers, at, d, t.large, budget)
         at += Int(d.len)
     end
     # Every payload was built here from validated geometry.
     return V(payloads, buffers, Val(:trusted))
+end
+
+# A fixed-size binary batch: value `i` starts `(offset + i - 1) * width`
+# bytes into the data buffer.
+function _fixedpayloads!(payloads, buffers, at::Int, d::AC.ArrayData, budget)
+    n = Int64(d.len)
+    w = Int64((d.type::AC.FixedSizeBinaryType).nbytes)
+    _chargeexact!(budget, Int64, n + 1, "fixed-size binary offsets")
+    offsets = Int64[(Int64(d.offset) + i) * w for i = 0:n]
+    return _offsetpayloads!(payloads, buffers, at, d, offsets, budget)
 end
 
 "One `Vector{String}` (with `missing` where null) over every batch of a string column."
@@ -770,6 +781,12 @@ function _viewablelayout(f::AC.Field, depth::Int=0)
     return false
 end
 
+# Fixed-size binary values wider than this read as `DataBytes`: code over
+# an `NTuple{N,UInt8}` compiles in time that grows faster than `N` (minutes
+# at 16 KiB), and a hostile schema can declare any width.
+const _MAX_TUPLE_BYTES = 256
+_widebinary(t::AC.ArrowType) = t isa AC.FixedSizeBinaryType && t.nbytes > _MAX_TUPLE_BYTES
+
 # The stored element type and storage conversion of a fixed-width layout.
 function _fixedstorage(t::AC.ArrowType)
     t isa AC.IntType && return AC.juliatype(t), Nothing
@@ -809,7 +826,8 @@ function _viewbasetype(f::AC.Field, ctx::_ViewContext, datas=AC.ArrayData[])
     t isa Union{AC.Utf8Type,AC.ViewType} &&
         (!(t isa AC.ViewType) || t.utf8) &&
         return ctx.stringtype === String ? String : DataStrings.DataString
-    t isa Union{AC.BinaryType,AC.ViewType} && return DataStrings.DataBytes
+    (t isa Union{AC.BinaryType,AC.ViewType} || _widebinary(t)) &&
+        return DataStrings.DataBytes
     t isa AC.DictionaryType && return _viewbasetype(AC.dictvaluefield(f, t), ctx)
     t isa AC.RunEndEncodedType && return _viewbasetype(f.children[2], ctx)
     t isa _NestedLayout && return _rowtype(f, ctx, datas)
@@ -910,7 +928,7 @@ function _viewcolumn(
     t = f.type
     t isa AC.NullType && return fill(missing, sum(d -> Int(d.len), datas; init=0))
     B = Base.nonmissingtype(T)
-    if t isa Union{AC.Utf8Type,AC.BinaryType,AC.ViewType}
+    if t isa Union{AC.Utf8Type,AC.BinaryType,AC.ViewType} || _widebinary(t)
         B === String && return _stringvector(T, datas, ctx.budget)
         V =
             B === DataStrings.DataString ? DataStrings.StringVector :

@@ -318,6 +318,24 @@ end
         @test (@allocated Arrow.Table(large; scan=sel)) < 200_000
     end
 
+    @testset "fixed-size binary wider than 256 bytes reads as DataBytes" begin
+        AC = Arrow.AC
+        for (w, T) in ((256, NTuple{256,UInt8}), (300, Arrow.DataStrings.DataBytes))
+            data = UInt8[i % 251 for i = 1:(3w)]
+            t = AC.FixedSizeBinaryType(w)
+            f = AC.Field("b", t; nullable=true)
+            valid = AC._bitmapbuffer(Bool[true, false, true])
+            d = AC.ArrayData(t, 3, [valid, AC._databuffer(data)]; nullcount=1)
+            s = AC.Schema([f])
+            tbl = Arrow.Table(Arrow.writestream(s, [AC.RecordBatch(s, [d], 3)]))
+            @test eltype(tbl.b) == Union{Missing,T}
+            @test tbl.b[2] === missing && collect(tbl.b[3]) == data[(2w + 1):(3w)]
+            # A rewrite keeps the fixed-size layout.
+            again = Arrow.Table(arrowbytes(tbl))
+            @test isequal(again.b, tbl.b) && getfield(again, :schema).fields[1].type == t
+        end
+    end
+
     @testset "nested columns read as typed rows" begin
         Row = Arrow.ListRow
         tbl = (
