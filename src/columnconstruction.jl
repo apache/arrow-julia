@@ -206,6 +206,8 @@ function _constructnativepart(name::String, v::AbstractVector; context=nothing)
         # leaf values lower at every depth.
         context === nothing && (context = _WriterContext())
         return _arrowtypeslistcolumn(name, v, T; extension_shape=false, context)
+    elseif T === Bool
+        return _boolpart(name, v)
     elseif T <: _FixedPrimitive
         t = AC.arrowtype_for(T)
         if eltype(v) === T
@@ -224,6 +226,34 @@ end
 
 const _FixedPrimitive =
     Union{Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64,Float16,Float32,Float64}
+
+"A Bool column: values and validity bit-packed in one pass."
+function _boolpart(name::String, v::AbstractVector)
+    n = length(v)
+    i0 = firstindex(v) - 1
+    values = Vector{UInt8}(undef, cld(n, 8))
+    bits = Vector{UInt8}(undef, cld(n, 8))
+    valid = 0
+    @inbounds for b in eachindex(bits)
+        base = (b - 1) << 3
+        byte = 0x00
+        valuebyte = 0x00
+        for j = 0:(min(8, n - base) - 1)
+            x = v[i0 + base + j + 1]
+            present = x !== missing
+            byte |= UInt8(present) << (j % UInt)
+            valuebyte |= UInt8(present && x::Bool) << (j % UInt)
+        end
+        bits[b] = byte
+        values[b] = valuebyte
+        valid += count_ones(byte)
+    end
+    nc = n - valid
+    t = AC.BoolType()
+    validity = nc == 0 ? AC.BufferSlice() : AC._databuffer(bits)
+    return AC.Field(name, t; nullable=Missing <: eltype(v)),
+    AC.ArrayData(t, n, [validity, AC._databuffer(values)]; nullcount=nc)
+end
 
 """
 The values of a non-null fixed-width column as one buffer: a `Vector`, or a
@@ -474,8 +504,8 @@ function _packedpayloadpart(
     validity =
         nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
     databuf = pos == 0 ? AC.BufferSlice() : AC._databuffer(data)
-    return AC.Field(name, t; nullable),
-    AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
+    d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
+    return AC.Field(name, t; nullable), _constructedvalid(d)
 end
 
 _stringview(context) = context !== nothing && context.stringview
@@ -554,26 +584,29 @@ function _varbytespart(name::String, v::AbstractVector, t::AC.ArrowType)
 end
 function _varbytespart(name::String, v::AbstractVector, t, ::Type{Offset}) where {Offset}
     n = length(v)
+    i0 = firstindex(v) - 1
     offsets = Vector{Offset}(undef, n + 1)
     offsets[1] = 0
     bits = zeros(UInt8, cld(n, 8))
     pos = 0
     nc = 0
-    for (i, x) in enumerate(v)
+    @inbounds for i = 1:n
+        x = v[i0 + i]
         if x === missing
             nc += 1
         else
             m = _nbytes(x)
             pos <= typemax(Offset) - m || throw(_OffsetOverflow(name, 0, i))
             pos += m
-            @inbounds bits[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7)
+            bits[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7)
         end
-        @inbounds offsets[i + 1] = pos
+        offsets[i + 1] = pos
     end
     data = Vector{UInt8}(undef, pos)
-    for (i, x) in enumerate(v)
-        start = Int(@inbounds offsets[i])
-        m = Int(@inbounds offsets[i + 1]) - start
+    @inbounds for i = 1:n
+        x = v[i0 + i]
+        start = Int(offsets[i])
+        m = Int(offsets[i + 1]) - start
         # Every data byte is written exactly once, even if a lazy column
         # yields different values on the second pass.
         (x === missing ? m == 0 : _nbytes(x) == m) ||
@@ -583,8 +616,15 @@ function _varbytespart(name::String, v::AbstractVector, t, ::Type{Offset}) where
     validity =
         nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
     databuf = pos == 0 ? AC.BufferSlice() : AC._databuffer(data)
-    return AC.Field(name, t; nullable=Missing <: eltype(v)),
-    AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
+    d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
+    return AC.Field(name, t; nullable=Missing <: eltype(v)), _constructedvalid(d)
+end
+
+# Offsets built here never decrease and end at the data length, and the null
+# count is exact: the data passes Core's semantic checks by construction.
+function _constructedvalid(d::AC.ArrayData)
+    @atomic :monotonic d.semachecked = true
+    return d
 end
 
 "Concrete Vector with an exact Union{Missing,T} or T eltype for fromjulia."
@@ -630,8 +670,10 @@ function _constructtemporalpart(
     t::AC.ArrowType,
     tostorage::F,
 ) where {F}
-    storage = Union{Missing,Int64}[x === missing ? missing : Int64(tostorage(x)) for x in v]
-    return AC.Field(name, t; nullable=eltype(v) >: Missing), _temporaldata(t, storage)
+    S = AC.primwidth(t) == 4 ? Int32 : Int64
+    vals, validity, nc = _nullablevalues(S, v, zero(S), x -> S(tostorage(x)))
+    d = AC.ArrayData(t, length(v), [validity, AC._databuffer(vals)]; nullcount=nc)
+    return AC.Field(name, t; nullable=eltype(v) >: Missing), d
 end
 
 # ArrowTypes write adapter. ArrowCore intentionally stays conversion-free;
@@ -1451,8 +1493,13 @@ function _WriterContext(
     )
 end
 
-_writerunionvariants!(context::_WriterContext, T::Type) =
-    get!(() -> _checkedwritervariants("writer type $T", T), context.unionvariants, T)
+# The type caches below look up before computing: a closure that captures a
+# `Type` is instantiated for that type, which costs microseconds per call.
+function _writerunionvariants!(context::_WriterContext, T::Type)
+    Base.@nospecialize T
+    haskey(context.unionvariants, T) && return context.unionvariants[T]
+    return context.unionvariants[T] = _checkedwritervariants("writer type $T", T)
+end
 
 function _writerunionbranch!(
     context::_WriterContext,
@@ -1496,8 +1543,10 @@ function _writerstoragetype!(context::_WriterContext, T::Type)
     return _arrowtypesstoragetype!(context.arrowtypes, T)
 end
 
-_writerneedstype!(context::_WriterContext, T::Type) = get!(context.needs, T) do
-    _arrowtypesneedstype(
+function _writerneedstype!(context::_WriterContext, T::Type)
+    Base.@nospecialize T
+    haskey(context.needs, T) && return context.needs[T]
+    return context.needs[T] = _arrowtypesneedstype(
         T,
         nested -> _writerstoragetype!(context, nested),
         nested -> _writerextension!(context, nested) !== nothing,
@@ -1507,33 +1556,38 @@ end
 
 function _writerkind!(context::_WriterContext, T::Type)
     Base.@nospecialize T
-    return get!(() -> ArrowTypes.ArrowKind(T), context.kinds, T)
+    haskey(context.kinds, T) && return context.kinds[T]
+    return context.kinds[T] = ArrowTypes.ArrowKind(T)
 end
 
 function _writerextension!(context::_WriterContext, T::Type)
     Base.@nospecialize T
-    return get!(context.extensions, T) do
-        name = _facadearrowname(T)
-        name === nothing || return Pair{String,String}[
-            _EXTENSION_NAME_KEY => name,
-            _EXTENSION_METADATA_KEY => "",
-        ]
-        ArrowTypes.hasarrowname(T) || return nothing
-        Pair{String,String}[
-            _EXTENSION_NAME_KEY => String(ArrowTypes.arrowname(T)),
-            _EXTENSION_METADATA_KEY => String(ArrowTypes.arrowmetadata(T)),
-        ]
-    end
+    haskey(context.extensions, T) && return context.extensions[T]
+    return context.extensions[T] = _writerextensionlabel(T)
+end
+
+function _writerextensionlabel(T::Type)
+    Base.@nospecialize T
+    name = _facadearrowname(T)
+    name === nothing || return Pair{String,String}[
+        _EXTENSION_NAME_KEY => name,
+        _EXTENSION_METADATA_KEY => "",
+    ]
+    ArrowTypes.hasarrowname(T) || return nothing
+    return Pair{String,String}[
+        _EXTENSION_NAME_KEY => String(ArrowTypes.arrowname(T)),
+        _EXTENSION_METADATA_KEY => String(ArrowTypes.arrowmetadata(T)),
+    ]
 end
 
 function _writerextensionshape(context::_WriterContext, T::Type, storage)
     Base.@nospecialize T
-    return get!(context.extensionshapes, T) do
-        kind = _writerkind!(context, T)
+    haskey(context.extensionshapes, T) && return context.extensionshapes[T]
+    kind = _writerkind!(context, T)
+    return context.extensionshapes[T] =
         storage !== T ||
-            _writerextension!(context, T) !== nothing ||
-            (kind isa ArrowTypes.StructKind && !(T <: Union{NamedTuple,Tuple}))
-    end
+        _writerextension!(context, T) !== nothing ||
+        (kind isa ArrowTypes.StructKind && !(T <: Union{NamedTuple,Tuple}))
 end
 
 function _writercandidatefield!(
@@ -4263,20 +4317,36 @@ function _retainedfixedbytes(f::AC.Field, v::AbstractVector)
 end
 
 "Values (`fill` at missing slots), validity buffer, and null count of a column."
-function _nullablevalues(::Type{S}, v::AbstractVector, fill::S) where {S}
+function _nullablevalues(::Type{S}, v::AbstractVector, fill::S, f::F=identity) where {S,F}
     n = length(v)
+    i0 = firstindex(v) - 1
     vals = Vector{S}(undef, n)
-    bits = zeros(UInt8, cld(n, 8))
-    nc = 0
-    for (i, x) in enumerate(v)
-        if x === missing
-            nc += 1
-            @inbounds vals[i] = fill
+    bits = Vector{UInt8}(undef, cld(n, 8))
+    valid = 0
+    # Each validity byte is built in a register from 8 values, branch-free;
+    # whole bytes take a fixed 8-step loop the compiler unrolls.
+    @inbounds for b in eachindex(bits)
+        base = (b - 1) << 3
+        byte = 0x00
+        if base + 8 <= n
+            for j = 0:7
+                x = v[i0 + base + j + 1]
+                present = x !== missing
+                vals[base + j + 1] = present ? f(x) : fill
+                byte |= UInt8(present) << (j % UInt)
+            end
         else
-            @inbounds vals[i] = x
-            @inbounds bits[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7)
+            for j = 0:(n - base - 1)
+                x = v[i0 + base + j + 1]
+                present = x !== missing
+                vals[base + j + 1] = present ? f(x) : fill
+                byte |= UInt8(present) << (j % UInt)
+            end
         end
+        bits[b] = byte
+        valid += count_ones(byte)
     end
+    nc = n - valid
     validity =
         nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
     return vals, validity, nc
