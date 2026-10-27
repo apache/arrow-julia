@@ -194,6 +194,13 @@ end
 Base.copy(v::Primitive{T,T,Nothing}) where {T} =
     isempty(v.validity) ? GC.@preserve(v, copy(v.data)) : collect(T, v)
 
+# Base's generic `map`, `filter`, and `collect` do not vectorize through the
+# per-access preserve. A view whose values are its stored layout (no nulls
+# can occur in a non-`Missing` element type) runs them on its buffer.
+Base.map(f, v::Primitive{T,T,Nothing}) where {T} = GC.@preserve v map(f, v.data)
+Base.filter(f, v::Primitive{T,T,Nothing}) where {T} = GC.@preserve v filter(f, v.data)
+Base.collect(v::Primitive{T,T,Nothing}) where {T} = GC.@preserve v copy(v.data)
+
 # Reductions over a view with no nulls run on its buffer, so they vectorize
 # as they do over a `Vector`.
 const _BufferPrimitive = Primitive{T,S,Nothing} where {T,S}
