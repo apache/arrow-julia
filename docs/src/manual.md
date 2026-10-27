@@ -419,9 +419,11 @@ The writer streams: each partition is read, encoded, and published before the
 next one is requested, so `Arrow.write("big.arrow", CSV.Chunks("big.csv"))`
 holds about one partition at a time. A source with several partitions takes its
 schema from the first partition, with every field nullable; later partitions
-must conform to it (numbers widen losslessly) and dictionary columns grow with
-delta batches, as for [`Arrow.Writer`](@ref). Use `Arrow.Writer` when tables
-arrive one at a time.
+must conform to it (numbers widen losslessly, missing values fill nullable
+fields) and dictionary columns grow with delta batches (pyarrow reads them;
+Polars 1.43 does not), as for [`Arrow.Writer`](@ref). Use `Arrow.Writer` when
+tables arrive one at a time. Columns read by Arrow.jl write back cheaply: a
+fixed-width or Bool column writes the buffers it was read from.
 
 `compress` applies per-buffer LZ4 frame or Zstandard compression as
 defined by the IPC specification (buffers that do not shrink are stored
@@ -431,7 +433,7 @@ IPC compression.
 ### Incremental writing and stream append
 
 [`Arrow.Writer`](@ref) publishes each table's batches before the next table
-is supplied, so it holds only the current table in memory:
+is supplied, so it holds at most one partition of the current table in memory:
 
 ```julia
 Arrow.Writer("out.arrow") do writer
