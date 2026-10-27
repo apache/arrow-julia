@@ -582,33 +582,29 @@ end
         openstream() = Arrow.readstream(copy(streambytes); limits=limits())
         openfile() = Arrow.readfile(copy(filebytes); limits=limits())
 
-        @test_throws Arrow.AllocationLimitError Arrow.Table(openstream())
-        @test_throws Arrow.AllocationLimitError Arrow.Table(
-            openstream();
-            scan=Tables.Scan(select=(:x,)),
-        )
-        @test_throws Arrow.AllocationLimitError Arrow.Table(openfile())
-        @test_throws Arrow.AllocationLimitError Arrow.Table(
-            openfile();
-            scan=Tables.Scan(select=(:x,)),
-        )
-        @test_throws Arrow.AllocationLimitError Tables.scan(
-            openfile(),
-            Tables.Scan(select=(:x,)),
-        )
-
-        @test_throws Arrow.AllocationLimitError first(Arrow.Stream(openstream()))
-        @test_throws Arrow.AllocationLimitError first(Arrow.Stream(openfile()))
-
-        ranged = Arrow.SourceFile(
+        # The facade reads the row as a view of one owned `Vector{Missing}`,
+        # which stores no elements, so it fits the budget at every entry point.
+        ranged() = Arrow.SourceFile(
             _BytesSource(copy(filebytes));
             limits=limits(),
             tailbytes=32,
             coalesce_gap=0,
         )
-        @test_throws Arrow.AllocationLimitError Arrow.Table(
-            ranged;
-            scan=Tables.Scan(select=(:x,)),
+        for t in (
+            Arrow.Table(openstream()),
+            Arrow.Table(openstream(); scan=Tables.Scan(select=(:x,))),
+            Arrow.Table(openfile()),
+            Arrow.Table(openfile(); scan=Tables.Scan(select=(:x,))),
+            first(Arrow.Stream(openstream())),
+            first(Arrow.Stream(openfile())),
+            Arrow.Table(ranged(); scan=Tables.Scan(select=(:x,))),
+        )
+            @test length(t.x) == 1 && length(t.x[1]) == listsize && all(ismissing, t.x[1])
+        end
+        # A direct-handle scan materializes storage rows, which the budget refuses.
+        @test_throws Arrow.AllocationLimitError Tables.scan(
+            openfile(),
+            Tables.Scan(select=(:x,)),
         )
 
         largeio = IOBuffer()

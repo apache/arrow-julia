@@ -318,6 +318,104 @@ end
         @test (@allocated Arrow.Table(large; scan=sel)) < 200_000
     end
 
+    @testset "nested columns read as typed rows" begin
+        Row = Arrow.ListRow
+        tbl = (
+            l=Union{Missing,Vector{Int64}}[[1, 2], missing, Int64[]],
+            ls=[["a"], String[], ["b", "c"]],
+            st=[(a=1, b="x"), (a=2, b="y"), (a=3, b="z")],
+            m=[Dict("k" => 1), Dict{String,Int64}(), Dict("p" => 2)],
+            t=[(Int16(1), Int16(2)), (Int16(3), Int16(4)), (Int16(5), Int16(6))],
+            ll=[[[1], [2, 3]], Vector{Int64}[], [Int64[]]],
+        )
+        t = Arrow.Table(arrowbytes(tbl))
+        @test eltype(t.l) == Union{Missing,Row{Int64}}
+        @test isequal(collect(t.l), tbl.l)
+        @test eltype(t.ls) == Row{DataString} && t.ls == tbl.ls
+        @test eltype(t.st) == @NamedTuple{a::Int64, b::DataString} && t.st == tbl.st
+        @test eltype(t.m) == Row{Pair{DataString,Int64}}
+        @test t.m == [["k" => 1], Pair{String,Int64}[], ["p" => 2]]
+        @test eltype(t.t) == NTuple{2,Int16} && t.t == tbl.t
+        @test eltype(t.ll) == Row{Row{Int64}} && t.ll == tbl.ll
+        # Rows outlive their table; copies hold rows as their own vectors.
+        row = Arrow.Table(arrowbytes(tbl)).l[1]
+        GC.gc(true)
+        @test row == [1, 2]
+        @test copy(t.l) isa Vector{Union{Missing,Vector{Int64}}} &&
+              isequal(copy(t.l), tbl.l)
+        # Several batches chain, and copy the same way.
+        two = Arrow.Table(arrowbytes(Tables.partitioner([tbl, tbl]); file=true))
+        @test isequal(collect(two.l), [tbl.l; tbl.l]) && two.st == [tbl.st; tbl.st]
+        @test copy(two.l) isa Vector && all(r -> r === missing || r isa Vector, copy(two.l))
+        # Scans give the full read's rows.
+        st = Arrow.Table(arrowbytes(tbl); scan=Tables.Scan(select=(:st, :l)))
+        @test typeof(st.st) == typeof(t.st) && typeof(st.l) == typeof(t.l)
+        # Unions are a small Union of their children's types.
+        U = Union{Int64,String}
+        u = Arrow.Table(arrowbytes((u=U[1, "two"],))).u
+        @test eltype(u) == Union{Int64,DataString} && u == [1, "two"]
+        # A map's entries start at the entries struct's own offset.
+        AC = Arrow.AC
+        kf, kd = AC.fromjulia("key", ["a", "b", "c"])
+        vf, vd = AC.fromjulia("value", Int64[1, 2, 3])
+        ef = AC.Field("entries", AC.StructType(); nullable=false, children=[kf, vf])
+        ed = AC.ArrayData(
+            AC.StructType(),
+            2,
+            [AC.BufferSlice()];
+            offset=1,
+            children=[kd, vd],
+        )
+        mf = AC.Field("m", AC.MapType(false); nullable=false, children=[ef])
+        md = AC.ArrayData(
+            AC.MapType(false),
+            1,
+            [AC.BufferSlice(), AC._databuffer(Int32[0, 2])];
+            children=[ed],
+        )
+        ctx = Arrow._ViewContext(DataString, nothing)
+        @test Arrow._viewcolumn(mf, AC.ArrayData[md], ctx) == [["b" => 2, "c" => 3]]
+        # Long fixed-size lists read as views; wide or duplicate-named
+        # structs keep `Pair` rows.
+        long = Arrow.Table(arrowbytes((x=[ntuple(Int64, 65)],))).x
+        @test eltype(long) == Row{Int64} && long[1] == 1:65
+        wide = NamedTuple{Tuple(Symbol(:f, k) for k = 1:65)}(Tuple(1:65))
+        @test Arrow.Table(arrowbytes((w=[wide],))).w[1] isa AbstractVector{<:Pair}
+        # Rows of 32 or more fields build without boxing each value.
+        nt = NamedTuple{Tuple(Symbol(:f, k) for k = 1:40)}(Tuple(1:40))
+        bytes = arrowbytes((s=fill(nt, 10_000),))
+        @test Arrow.Table(bytes).s[end] === nt
+        @test (@allocated Arrow.Table(bytes)) < 2 * 10_000 * sizeof(nt)
+        # Fixed-size lists of nullable values read as `ListRow`s: a tuple type
+        # with `Missing` in it is abstract, so its rows would be boxed and a
+        # rewrite would see up to 2^N runtime types.
+        vals = Union{Missing,Int16}[
+            (r >> k) & 1 == 1 ? missing : Int16(4r + k) for r = 0:15 for k = 0:3
+        ]
+        cf, cd = AC.fromjulia("item", vals)
+        ff = AC.Field("f", AC.FixedSizeListType(4); nullable=false, children=[cf])
+        fd = AC.ArrayData(AC.FixedSizeListType(4), 16, [AC.BufferSlice()]; children=[cd])
+        fs = AC.Schema([ff])
+        f4 = Arrow.Table(Arrow.writestream(fs, [AC.RecordBatch(fs, [fd], 16)]))
+        @test eltype(f4.f) == Row{Union{Missing,Int16}}
+        @test isequal(reduce(vcat, f4.f), vals)
+        @test isequal(Arrow.Table(arrowbytes(f4)).f, f4.f)
+        # Fixed-size lists of no values read as empty tuples.
+        cf, cd = AC.fromjulia("item", Int64[])
+        zf = AC.Field("z", AC.FixedSizeListType(0); nullable=false, children=[cf])
+        zd = AC.ArrayData(AC.FixedSizeListType(0), 2, [AC.BufferSlice()]; children=[cd])
+        zs = AC.Schema([zf])
+        z = Arrow.Table(Arrow.writestream(zs, [AC.RecordBatch(zs, [zd], 2)])).z
+        @test eltype(z) == Tuple{} && z == [(), ()]
+        # Nesting deeper than 8 levels keeps the materializing path: a row
+        # type grows with every level, and so does its compile time.
+        nest(x, k) = k == 0 ? x : nest([x], k - 1)
+        deep8 = Arrow.Table(arrowbytes((x=[nest([1], 7)],))).x
+        deep9 = Arrow.Table(arrowbytes((x=[nest([1], 8)],))).x
+        @test eltype(deep8) <: Row && deep8 == [nest([1], 7)]
+        @test !(eltype(deep9) <: Row) && deep9 == [nest([1], 8)]
+    end
+
     @testset "an uncompressed open allocates independently of its size" begin
         small = arrowbytes((a=collect(1:1_000), b=rand(1_000)))
         large = arrowbytes((a=collect(1:2_000_000), b=rand(2_000_000)))

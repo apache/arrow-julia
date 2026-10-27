@@ -952,15 +952,12 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         io = IOBuffer()
         Arrow.write(io, (st=[(a=1, b="x"), (a=2, b="y")],); file=false)
         t = Arrow.Table(take!(io))
-        @test t.st == [["a" => 1, "b" => "x"], ["a" => 2, "b" => "y"]]
+        @test t.st == [(a=1, b="x"), (a=2, b="y")]
+        @test eltype(t.st) == @NamedTuple{a::Int64, b::Arrow.DataStrings.DataString}
 
         Row = @NamedTuple{a::Int64, b::Union{Missing,String}}
         nullable = Union{Missing,Row}[(a=1, b="x"), missing, (a=3, b=missing)]
-        expected = Any[
-            Pair{String,Any}["a" => 1, "b" => "x"],
-            missing,
-            Pair{String,Any}["a" => 3, "b" => missing],
-        ]
+        expected = Any[(a=1, b="x"), missing, (a=3, b=missing)]
         for file in (false, true)
             io = IOBuffer()
             Arrow.write(io, (st=nullable,); file)
@@ -980,10 +977,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         ))
         io = IOBuffer()
         Arrow.write(io, parts; file=false)
-        @test isequal(
-            Arrow.Table(take!(io)).st,
-            Any[missing, Pair{String,Any}["a" => 2, "b" => "visible"]],
-        )
+        @test isequal(Arrow.Table(take!(io)).st, Any[missing, (a=2, b="visible")])
     end
 
     @testset "partition drift is refused, not misbound" begin
@@ -1914,8 +1908,8 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             ),
         )
         @test Tables.rowcount(t3) == 1
-        # List => Vector is a no-op: values, retained field, and metadata
-        # all survive.
+        # List => AbstractVector is a no-op: values, retained field, and
+        # metadata all survive. List => Vector copies each row view.
         io4 = IOBuffer()
         Arrow.write(
             io4,
@@ -1924,12 +1918,14 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             colmetadata=Dict(:l => Dict("k" => "v")),
         )
         lb = take!(io4)
-        t4 = Arrow.Table(lb; scan=Tables.Scan(select=(:l => Vector,)))
-        @test isequal(t4.l, [Any[1, 2], Any[3]])
+        t4 = Arrow.Table(lb; scan=Tables.Scan(select=(:l => AbstractVector,)))
+        @test isequal(t4.l, [[1, 2], [3]])
         rsch = getfield(t4, :schema)
         @test length(rsch.fields) == 1
         @test rsch.fields[1].type isa Arrow.AC.ListType
         @test DataAPI.colmetadata(t4, :l, "k") == "v"
+        t5 = Arrow.Table(lb; scan=Tables.Scan(select=(:l => Vector,)))
+        @test t5.l == [[1, 2], [3]] && eltype(t5.l) <: Vector
     end
 
     @testset "zero-field scans hold at the Tables.scan layer too" begin
@@ -2045,7 +2041,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             colmetadata=Dict(:l => Dict("k" => "v")),
         )
         lb = take!(io3)
-        t3 = Arrow.Table(lb; scan=Tables.Scan(select=(:l => Vector,)))
+        t3 = Arrow.Table(lb; scan=Tables.Scan(select=(:l => AbstractVector,)))
         rsch = getfield(t3, :schema)
         @test length(rsch.fields) == 1
         @test rsch.fields[1].type isa Arrow.AC.ListType
@@ -2293,8 +2289,8 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             @test length(rsch2.fields) == 1
             @test rsch2.fields[1].type isa Arrow.AC.RunEndEncodedType
         end
-        # Mixed heterogeneous union: a valid mixed population widens to Any,
-        # so empty and nonempty drop the field alike under a union target.
+        # Mixed heterogeneous union: rows are a small Union of the children's
+        # types, so a union target covering them keeps the field, empty or not.
         for n in (2, 0)
             tid = Arrow.AC._databuffer(Int8[0, 1][1:n])
             uad = Arrow.AC.ArrayData(
@@ -2327,7 +2323,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
                 ub0;
                 scan=Tables.Scan(select=(:u => Union{Integer,AbstractString},)),
             )
-            @test isempty(getfield(tuo, :schema).fields)
+            @test length(getfield(tuo, :schema).fields) == 1
         end
         # End-to-end: Decimal64 rows are shared decimals — an => Real override
         # keeps the retained field for empty and nonempty columns alike.
@@ -2471,7 +2467,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         text = SubString("nested", 1, 4)
         for values in (TextRow[(text=text,)], Union{Missing,TextRow}[(text=text,), missing])
             t = Arrow.Table(take!(Arrow.tobuffer((st=values,))))
-            @test only(skipmissing(t.st))[1].second == "nest"
+            @test only(skipmissing(t.st)).text == "nest"
         end
 
         DateRow = @NamedTuple{day::Date}
@@ -2480,7 +2476,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             Union{Missing,DateRow}[(day=Date(2024, 1, 1),), missing],
         )
             t = Arrow.Table(take!(Arrow.tobuffer((st=values,))))
-            @test only(skipmissing(t.st))[1].second == Date(2024, 1, 1)
+            @test only(skipmissing(t.st)).day == Date(2024, 1, 1)
         end
 
         # A declared timezone becomes a Symbol type parameter; one that no
@@ -2681,15 +2677,16 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         zr =
             Arrow.Table(Arrow.writefile(sch, AC.RecordBatch[AC.RecordBatch(sch, [red], 0)]))
         @test eltype(so.r) === Int64 === eltype(zr.r)
-        # composites: the declared row container, both ways
+        # composites: the typed row, both ways
         lf, ld = AC.fromjulia("l", Vector{Int64}[])
         schl = AC.Schema([lf])
-        @test eltype(Arrow.Table(Arrow.writefile(schl, AC.RecordBatch[])).l) === Vector{Any}
+        Row = Arrow.ListRow{Int64}
+        @test eltype(Arrow.Table(Arrow.writefile(schl, AC.RecordBatch[])).l) === Row
         @test eltype(
             Arrow.Table(
                 Arrow.writefile(schl, AC.RecordBatch[AC.RecordBatch(schl, [ld], 0)]),
             ).l,
-        ) === Vector{Any}
+        ) === Row
     end
 
     @testset "type mappings: bytes, 128-bit ints, UUIDs, periods, abstract columns" begin

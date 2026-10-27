@@ -451,7 +451,7 @@ end
         @test t.ints == [1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 6, 7]
         @test t.strs[11] == "tail"
         @test isequal(t.dict, [before.dict..., "lo", "mid"])
-        @test t.structs[end] == [Pair{String,Any}("a", 7), Pair{String,Any}("b", "t")]
+        @test t.structs[end] == (a=7, b="t")
     end
 end
 

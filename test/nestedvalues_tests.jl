@@ -101,8 +101,8 @@ function refusal(f)
 end
 
 ns(x) = reinterpret(Ts{Nanosecond}, Int64(x))
-row(pairs...) = Pair{String,Any}[pairs...]
-const StructRows = Union{Missing,Vector{Pair{String,Any}}}
+row(pairs...) = (; (Symbol(first(p)) => last(p) for p in pairs)...)
+const StructRows = Union{Missing,NamedTuple}
 
 const NS = AC.TimestampType(AC.NANOSECOND, nothing)
 const ST = AC.StructType()
@@ -150,7 +150,7 @@ end
             row("at" => reinterpret(Denver, Int64(30))),
         ]
         table = checkrewrite(field, data, expected)
-        @test last(only(table.z[1])) isa Denver
+        @test table.z[1].at isa Denver
     end
 
     @testset "retained list{date32} with null rows and null items" begin
@@ -224,11 +224,7 @@ end
             nullcount=1,
         )
         dec(x) = reinterpret(Dec64, Int64(x))
-        expected = Union{Missing,Vector{Any}}[
-            Any[dec(125), dec(-5)],
-            missing,
-            Any[dec(999), dec(1)],
-        ]
+        expected = Union{Missing,Tuple}[(dec(125), dec(-5)), missing, (dec(999), dec(1))]
         checkrewrite(field, data, expected)
     end
 
@@ -394,9 +390,9 @@ end
             AC.TimestampType(AC.NANOSECOND, nothing),
             AC.DateType(AC.DAY),
         ]
-        @test [first.(r) for r in table.s] == [["dt", "n", "d"], ["dt", "n", "d"]]
-        @test [last.(r) for r in table.s] == [collect(Any, r) for r in rows]
-        @test last(table.s[1][1]) isa Ts{Millisecond}
+        @test all(keys(r) == (:dt, :n, :d) for r in table.s)
+        @test [collect(Any, values(r)) for r in table.s] == [collect(Any, r) for r in rows]
+        @test table.s[1].dt isa Ts{Millisecond}
         back = Arrow.Table(take!(Arrow.tobuffer(table)))
         @test isequal(collect(back.s), collect(table.s))
         @test samefields(getfield(back, :schema).fields, [field])
@@ -416,7 +412,7 @@ end
             AC.IntervalType(AC.MONTH_DAY_NANO),
         ]
         @test ismissing(table.s[2])
-        @test last.(table.s[1]) == collect(Any, rows[1])
+        @test collect(Any, values(table.s[1])) == collect(Any, rows[1])
         back = Arrow.Table(take!(Arrow.tobuffer(table)))
         @test isequal(collect(back.s), collect(table.s))
     end
@@ -584,11 +580,12 @@ end
         # fromarrow tails), and composite restorations reserve the row's
         # inline payload besides. The floors below fail if a reserve is
         # dropped. A flat decimal column reads as a view over its buffer,
-        # with no per-value charge.
+        # with no per-value charge, and an unlabeled union as one typed row
+        # vector (8 bytes per row).
         with_logger(NullLogger()) do
             for (name, bytes, floor, first_expected) in (
                 ("flat decimal", decbytes, 0, reinterpret(Dec64, Int64(70000))),
-                ("union timestamp", unionbytes, 112n, ns(1)),
+                ("union timestamp", unionbytes, 8n, ns(1)),
                 ("unknown-label run-end timestamp", reebytes, 160n, ns(1)),
                 ("registered fromarrow union", liftedbytes, 224n, lifted[1]),
                 ("nested fixed-size-list identity", fslbytes, fslfloor, fslexpected),
@@ -604,11 +601,12 @@ end
                 @static if VERSION >= v"1.12"
                     # Warmed, the read's true allocation stays within its
                     # charge (boxing differs on older runtimes, so the
-                    # allocation pin runs on the tested-current one).
+                    # allocation pin runs on the tested-current one). The
+                    # input copy `streamread` makes is not the reader's.
                     streamread(bytes, charged)
                     GC.gc()
                     allocated = @allocated streamread(bytes, charged)
-                    @test allocated <= charged + 200_000
+                    @test allocated <= charged + sizeof(bytes) + 200_000
                 end
             end
         end

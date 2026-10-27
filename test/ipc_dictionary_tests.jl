@@ -135,6 +135,10 @@ end
         "list" => Any[[1, 2], Int[], [3], missing, [4, 5]],
         "struct" => Any[["x" => 1], ["x" => 2], ["x" => 3], missing, ["x" => 4]],
     )
+    # Table reads give struct rows as named tuples; handle scans keep the
+    # materialized `Pair` rows.
+    publicrow(x) =
+        x isa AbstractVector{<:Pair} ? (; (Symbol(k) => v for (k, v) in x)...) : x
     for (name, pool) in pools, file in (false, true), codec in ("None", "lz4", "zstd")
         kind = file ? "file" : "stream"
         path = joinpath(FIXTURES, "$name-$kind-$codec.arrowbytes")
@@ -150,8 +154,9 @@ end
             pool[5],
             pool[2],
         ]
+        public = map(publicrow, expected)
         for source in (bytes, path, IOBuffer(bytes))
-            @test isequal(collect(Arrow.Table(source).a), expected)
+            @test isequal(collect(Arrow.Table(source).a), public)
         end
         if file
             for handle in
@@ -173,12 +178,12 @@ end
             end
         else
             parts = collect(Arrow.Stream(bytes))
-            @test isequal(vcat([collect(b.a) for b in parts]...), expected)
+            @test isequal(vcat([collect(b.a) for b in parts]...), public)
             core = Arrow.readstream(bytes)
             snapshots = [b.columns[1].dictionary for b in core.batches]
             @test length.(snapshots) == [2, 3, 5]
             @test snapshots[1] !== snapshots[2] !== snapshots[3]
-            @test isequal(parts[1].a, expected[1:3])
+            @test isequal(parts[1].a, public[1:3])
         end
     end
 end

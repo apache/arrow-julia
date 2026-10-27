@@ -1901,9 +1901,7 @@ end
         Union{Missing,Row}[missing, missing],
     )
     for values in cases, file in (false, true)
-        expected = Any[
-            row === missing ? missing : Pair{String,Any}["u" => row.u] for row in values
-        ]
+        expected = Any[row === missing ? missing : (u=row.u,) for row in values]
         bytes = arrowtypes_test_bytes((value=values,); file=file)
         table = Arrow.Table(bytes)
         @test isequal(table.value, expected)
@@ -1925,11 +1923,8 @@ end
         Union{Missing,Outer}[missing, missing],
     )
     for values in nestedcases, file in (false, true)
-        expected = Any[
-            row === missing ? missing :
-            Pair{String,Any}["inner" => Pair{String,Any}["u" => row.inner.u],] for
-            row in values
-        ]
+        expected =
+            Any[row === missing ? missing : (inner=(u=row.inner.u,),) for row in values]
         bytes = arrowtypes_test_bytes((value=values,); file=file)
         @test isequal(Arrow.Table(bytes).value, expected)
         field, _ = arrowtypes_test_core_parts(bytes)
@@ -1946,12 +1941,7 @@ end
         (child=(u="text",),),
         (child=(u=Int64(7),),),
     ]
-    expectednullablechildren = Any[
-        missing,
-        Pair{String,Any}["child" => missing],
-        Pair{String,Any}["child" => Pair{String,Any}["u" => "text"],],
-        Pair{String,Any}["child" => Pair{String,Any}["u" => Int64(7)],],
-    ]
+    expectednullablechildren = nullablechildren
     for file in (false, true)
         bytes = arrowtypes_test_bytes((value=nullablechildren,); file=file)
         @test isequal(Arrow.Table(bytes).value, expectednullablechildren)
@@ -1963,10 +1953,7 @@ end
     allmissingchildren = Union{Missing,NullableOuter}[(child=missing,), (child=missing,)]
     for file in (false, true)
         table = arrowtypes_test_table((value=allmissingchildren,); file=file)
-        @test isequal(
-            table.value,
-            Any[Pair{String,Any}["child" => missing], Pair{String,Any}["child" => missing]],
-        )
+        @test isequal(table.value, allmissingchildren)
         field = getfield(table, :schema).fields[1]
         @test only(only(field.children).children).type isa ARROWTYPES_TEST_AC.UnionType
     end
@@ -1978,10 +1965,8 @@ end
         Union{Missing,FixedOuter}[missing, missing],
     )
     for values in fixedcases, file in (false, true)
-        expected = Any[
-            row === missing ? missing : Pair{String,Any}["inner" => Any[row.inner...],]
-            for row in values
-        ]
+        # Fixed-size lists of union values read as `ListRow`s.
+        expected = Any[v === missing ? missing : (inner=collect(v.inner),) for v in values]
         bytes = arrowtypes_test_bytes((value=values,); file=file)
         @test isequal(Arrow.Table(bytes).value, expected)
         field, _ = arrowtypes_test_core_parts(bytes)
@@ -2000,10 +1985,7 @@ end
         visiblebytes = arrowtypes_test_bytes((value=visible,); file=file)
         hiddenbytes = arrowtypes_test_bytes((value=hidden,); file=file)
         @test length(hiddenbytes) - length(visiblebytes) < 2 * 1024
-        @test isequal(
-            Arrow.Table(hiddenbytes).value,
-            Any[Pair{String,Any}["u" => "x"], fill(missing, 32)...],
-        )
+        @test isequal(Arrow.Table(hiddenbytes).value, hidden)
     end
 end
 
@@ -2151,6 +2133,7 @@ end
     )
     for values in structcases, inputfile in (false, true)
         bytes = arrowtypes_test_bytes((value=values,); file=inputfile)
+        # A struct with an ArrowTypes-labelled child keeps `Pair` rows.
         expected = Any[
             row === missing ? missing : Pair{String,Any}["u" => row.u] for row in values
         ]
@@ -2324,7 +2307,8 @@ end
             Any[Int32(1), Float64(2.5)],
         ),
         (Declared[], Any[]),
-        (Textual[Int64(3), "four"], Any[Int64(3), "four"]),
+        # Union rows read strings as the default string type.
+        (Textual[Int64(3), "four"], Any[Int64(3), Arrow.DataStrings.DataString("four")]),
         (Textual[], Any[]),
     )
     for (values, expected) in cases, encoded in (false, true), file in (false, true)
@@ -3624,8 +3608,10 @@ end
             children=[innerdata],
             nullcount=0,
         )
-        expectedrow =
-            Any[innervalid[i] ? fill(missing, 2) : missing for i in eachindex(innervalid)]
+        # The outer list's values are nullable, so its rows are `ListRow`s.
+        expectedrow = Any[
+            innervalid[i] ? (missing, missing) : missing for i in eachindex(innervalid)
+        ]
         expected = Any[expectedrow]
         schema = ARROWTYPES_TEST_AC.Schema([outerfield])
         batch = ARROWTYPES_TEST_AC.RecordBatch(schema, [outerdata], 1)
@@ -5379,7 +5365,9 @@ end
             bytes = arrowtypes_test_bytes((value=Arrow.DictEncode(values),); file=file)
             table = Arrow.Table(bytes)
             @test isequal(table.value, values)
-            @test typeof.(table.value) == typeof.(values)
+            # Union rows read strings as the default string type.
+            readtype(x) = x isa String ? Arrow.DataStrings.DataString : typeof(x)
+            @test typeof.(table.value) == readtype.(values)
 
             field, batches = arrowtypes_test_core_parts(bytes)
             @test field.type isa ARROWTYPES_TEST_AC.DictionaryType
@@ -5417,7 +5405,8 @@ end
         bytes = arrowtypes_test_bytes(parts; file=file)
         table = Arrow.Table(bytes)
         @test table.value == expected
-        @test typeof.(table.value) == typeof.(expected)
+        @test typeof.(table.value) ==
+              [x isa String ? Arrow.DataStrings.DataString : typeof(x) for x in expected]
         field, batches = arrowtypes_test_core_parts(bytes)
         @test (field.type::ARROWTYPES_TEST_AC.DictionaryType).valuetype isa
               ARROWTYPES_TEST_AC.UnionType
@@ -6269,10 +6258,16 @@ end
             if !present[i]
                 push!(expected, missing)
             elseif parentkind === :struct
-                push!(expected, Pair{String,Any}[childname => logical(physical[i])])
+                # Labelled children keep `Pair` rows; native ones read as NamedTuples.
+                push!(
+                    expected,
+                    marked ? Pair{String,Any}[childname => logical(physical[i])] :
+                    NamedTuple{(Symbol(childname),)}((physical[i],)),
+                )
             else
                 lo = 2 * (i - 1) + 1
-                push!(expected, [logical(physical[j]) for j = lo:(lo + 1)])
+                values = [logical(physical[j]) for j = lo:(lo + 1)]
+                push!(expected, marked ? values : Tuple(values))
             end
         end
 
@@ -6485,9 +6480,9 @@ end
         schema = ARROWTYPES_TEST_AC.Schema([parentfield])
         batch = ARROWTYPES_TEST_AC.RecordBatch(schema, [parentdata], length(present))
         expected = if parentkind === :struct
-            Any[Pair{String,Any}["text" => payload], fill(missing, 16)...]
+            Any[(text=payload,), fill(missing, 16)...]
         else
-            Any[String[payload, "tail"], fill(missing, 16)...]
+            Any[(payload, "tail"), fill(missing, 16)...]
         end
 
         for file in (false, true)

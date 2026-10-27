@@ -79,7 +79,8 @@ proportional to its columns and record batches, not its size. A column read
 from several record batches is a `ChainedVector` of per-batch views. String
 and binary columns are `DataStrings.StringVector` and `BytesVector`, built
 with one copy of their bytes; pass `stringtype=String` for `Vector{String}`
-columns. Nested and union columns are materialized vectors.
+columns. List, map, struct, and union columns read as typed rows (see
+[Type mapping when reading](@ref)).
 
 Views are read-only. `copy(column)` returns an owned `Vector` (a
 `PooledArray` for a dictionary-encoded column), `copy(table)` copies every
@@ -214,24 +215,31 @@ maps to `Union{Missing, T}`.
 | Dictionary-encoded scalar | the mapping of the *value* type, in an `Arrow.DictEncoded` column whose codes `DataAPI.refarray`, `refpool`, and `levels` expose |
 | Run-end encoded scalar | the mapping of the *values* type, in an `Arrow.RunEndEncoded` column (runs are not expanded) |
 
-Composite layouts (list, struct, map, union) are read on the dynamic path
-(each row is built as a Julia value), and their column element type is
-derived from the schema — the declared row container — so it too is the
-same for a zero-row, an all-`missing`, and a populated column, with two
-exceptions: the heterogeneous-union case in the Union row, and nulls the
-field did not declare (below). The two wrapper layouts are transparent:
-a dictionary-encoded or run-end-encoded column takes the route and the
-element type of its value child (a closed scalar child keeps the typed
-path):
+Composite layouts read as typed rows built from their children's element
+types, so a composite column's element type is also the same for a zero-row,
+an all-`missing`, and a populated column (except for nulls the field did not
+declare, below). The two wrapper layouts are transparent: a
+dictionary-encoded or run-end-encoded column takes the element type of its
+value child:
 
 | Arrow type | Element type |
 |---|---|
-| List, LargeList, FixedSizeList, ListView, LargeListView | `Vector{Any}` (rows are vectors of the child's values) |
-| Struct | `Vector{Pair{String,Any}}` (rows are ordered name => value pairs) |
-| Map | `Vector{Pair{Any,Any}}` |
-| Union | the join of the children's element types when it is concrete (a homogeneous union reads as that type); otherwise `Any`, narrowed from the rows |
+| List, LargeList | [`Arrow.ListRow{T}`](@ref Arrow.ListRow): a read-only view of the row's values |
+| FixedSizeList(N) | `NTuple{N,T}` for `N ≤ 64` and non-null values; otherwise `Arrow.ListRow{T}` (a tuple with `Missing` in its element type is abstract, so every row would be boxed) |
+| Struct | a `NamedTuple` of the children's names and element types |
+| Map | `Arrow.ListRow{Pair{K,V}}`: the row's entries in stored order, duplicate keys kept (`Dict(row)` builds a dictionary) |
+| Union | the `Union` of the children's element types |
 | Run-end encoded (composite values) | the *values* child's element type (runs are expanded) |
 | Null | `Missing` |
+
+List and map rows view a vector their column owns, so a row stays valid
+after its table is gone; `copy(column)` gives `Vector{T}` rows. Three kinds
+of field keep the dynamic path, which builds each row as a Julia value (list
+rows as `Vector{Any}`, struct rows as `Vector{Pair{String,Any}}` ordered
+name => value pairs): a struct with more than 64 fields or duplicate field
+names, a ListView or LargeListView, and a composite nested more than 8
+levels deep (each level adds to the row type, and Julia's compile time grows
+with it).
 
 Three refinements. A list-family field with a registered ArrowTypes.jl child
 uses a row vector with that restored child element type; this is the same for

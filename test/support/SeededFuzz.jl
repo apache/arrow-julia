@@ -419,8 +419,7 @@ function ipcbytes(table; file::Bool, compress::Symbol)
     return take!(io)
 end
 
-_expectedstructs(values) =
-    [x === missing ? missing : ["x" => x.x, "label" => x.label] for x in values]
+_expectedstructs(values) = values
 
 const _GENERATED_PUBLIC_ELTYPES = (
     ints=Union{Missing,Int64},
@@ -429,8 +428,11 @@ const _GENERATED_PUBLIC_ELTYPES = (
     bools=Union{Missing,Bool},
     strings=Union{Missing,DataString},
     dates=Union{Missing,Date},
-    lists=Union{Missing,Vector{Any}},
-    structs=Union{Missing,Vector{Pair{String,Any}}},
+    lists=Union{Missing,Arrow.ListRow{Union{Missing,Int32}}},
+    structs=Union{
+        Missing,
+        @NamedTuple{x::Union{Missing,Int16},label::Union{Missing,DataString}},
+    },
     dictionary=Union{Missing,DataString},
 )
 
@@ -484,6 +486,24 @@ function _check_same_table(actual, expected; label::AbstractString)
 end
 
 "Check a layout against values constructed without the Arrow writer or reader."
+# List or map rows as a typed read gives them: views of one vector of
+# `E` values, `missing` for a null row.
+function _rowviews(::Type{E}, rows; nullable::Bool=false) where {E}
+    values = E[]
+    spans = UnitRange{Int}[]
+    for row in rows
+        start = length(values) + 1
+        row === missing || append!(values, row)
+        push!(spans, start:length(values))
+    end
+    V = Arrow.ListRow{E}
+    T = nullable ? Union{Missing,V} : V
+    return T[
+        row === missing ? missing : V(values, first(span) - 1, length(span)) for
+        (row, span) in zip(rows, spans)
+    ]
+end
+
 function _check_expected_layout(actual, expected; label::AbstractString)
     actualnames = collect(Tables.columnnames(actual))
     expectednames = collect(keys(expected))
@@ -734,11 +754,12 @@ function _logical_layout_case()
     expected = (
         extension=table.extension,
         extension_struct=table.extension_struct,
-        maps=map(table.maps) do value
-            ismissing(value) && return missing
-            return Pair{Any,Any}[key => item for (key, item) in pairs(value)]
-        end,
-        fixed=Vector{Any}[Any[1, 2], Any[3, 4], Any[5, 6], Any[7, 8]],
+        maps=_rowviews(
+            Pair{DataStrings.DataString,Union{Missing,Int32}},
+            [ismissing(value) ? missing : collect(pairs(value)) for value in table.maps];
+            nullable=true,
+        ),
+        fixed=table.fixed,
         views=Union{Missing,DataStrings.DataString}[
             DataStrings.DataString("tiny"),
             DataStrings.DataString(String(copy(@view raw[longstart:end]))),
@@ -1025,11 +1046,10 @@ function _physical_layout_case()
             DataBytes(longbinary),
             missing,
         ],
-        sorted_map=Vector{Pair{Any,Any}}[
-            Pair{Any,Any}["a" => Int32(1), "b" => missing],
-            Pair{Any,Any}[],
-            Pair{Any,Any}["c" => Int32(3)],
-        ],
+        sorted_map=_rowviews(
+            Pair{DataString,Union{Missing,Int32}},
+            [["a" => Int32(1), "b" => missing], Pair[], ["c" => Int32(3)]],
+        ),
         date32=Date[Date(1969, 12, 31), Date(1970, 1, 1), Date(1970, 1, 2)],
         date64=DateTime[epoch - Day(1), epoch, epoch + Day(1)],
         time_s=Time[Time(0), Time(12), Time(23, 59, 59)],
@@ -1066,12 +1086,12 @@ function _physical_layout_case()
         duration_ms=Millisecond[Millisecond(-1), Millisecond(0), Millisecond(1_000_001)],
         duration_us=Microsecond[Microsecond(-1), Microsecond(0), Microsecond(1_000_001)],
         duration_ns=Nanosecond[Nanosecond(-1), Nanosecond(0), Nanosecond(1_000_001)],
-        fixed_list=Vector{Any}[Any[1, 2], Any[3, 4], Any[5, 6]],
+        fixed_list=NTuple{2,Int16}[(1, 2), (3, 4), (5, 6)],
         ree=Union{Missing,DataString}[DataString("run"), DataString("run"), missing],
-        nullable_struct=Union{Missing,Vector{Pair{String,Any}}}[
-            Pair{String,Any}["x" => Int32(1), "y" => "a"],
+        nullable_struct=Union{Missing,@NamedTuple{x::Int32,y::Union{Missing,DataString}}}[
+            (x=Int32(1), y="a"),
             missing,
-            Pair{String,Any}["x" => Int32(3), "y" => "c"],
+            (x=Int32(3), y="c"),
         ],
     )
     return LayoutCase(
@@ -1141,8 +1161,18 @@ function _union_layout_case()
         schema,
         [AC.RecordBatch(schema, [densedata, sparsedata], 4)],
         (
-            dense=Any[Int64(1), "two", missing, Int64(3)],
-            sparse=Any[Int64(1), "two", Int64(3), "four"],
+            dense=Union{Missing,Int64,DataString}[
+                Int64(1),
+                DataString("two"),
+                missing,
+                Int64(3),
+            ],
+            sparse=Union{Int64,DataString}[
+                Int64(1),
+                DataString("two"),
+                Int64(3),
+                DataString("four"),
+            ],
         ),
         false,
         Set([:dense_union, :sparse_union]),

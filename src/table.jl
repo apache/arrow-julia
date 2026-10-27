@@ -42,7 +42,8 @@ proportional to its columns and record batches, not its bytes. A column
 with several record batches is a `ChainedVector` of per-batch views. String
 and binary columns are `DataStrings.StringVector`/`BytesVector`, built with
 one copy of their bytes; `stringtype=String` reads strings as
-`Vector{String}`. Nested and union columns are materialized vectors. A
+`Vector{String}`. List, map, struct, and union columns read as typed rows:
+[`Arrow.ListRow`](@ref) views, `NTuple`s, `NamedTuple`s, and `Union`s. A
 column keeps the memory it reads alive while it is reachable, independent of
 its table. `copy(table)`, `DataFrame(table)`, and [`Arrow.read`](@ref) return
 owned, mutable columns.

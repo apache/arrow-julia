@@ -1557,6 +1557,7 @@ function Base.getindex(
     row = values.rows[firstindex(values.rows) + index - 1]
     row === missing && return _RETAINED_HIDDEN
     row === _RETAINED_HIDDEN && return _RETAINED_HIDDEN
+    row isa NamedTuple && return row[values.child]
     return last(row[firstindex(row) + values.child - 1])
 end
 
@@ -4815,7 +4816,7 @@ function _retainedlist(f::AC.Field, v::AbstractVector, context::_WriterContext)
         for row in v
             row === missing && continue
             row === _RETAINED_HIDDEN && continue
-            row isa AbstractVector || throw(
+            row isa Union{AbstractVector,Tuple} || throw(
                 ArgumentError(
                     "column $(f.name) retained fixed-size list rows must be vectors",
                 ),
@@ -4883,7 +4884,7 @@ function _retainedlist(f::AC.Field, v::AbstractVector, context::_WriterContext)
             if row === missing || row === _RETAINED_HIDDEN
                 continue
             end
-            row isa AbstractVector || throw(
+            row isa Union{AbstractVector,Tuple} || throw(
                 ArgumentError(
                     "column $(f.name) retained fixed-size list rows must be vectors",
                 ),
@@ -4917,6 +4918,19 @@ function _validateretainedstructrows(f::AC.Field, rows::AbstractVector)
     for row in rows
         row === missing && continue
         row === _RETAINED_HIDDEN && continue
+        if row isa NamedTuple
+            # A typed read's row: the field names must be the children's.
+            (
+                length(row) == nchildren &&
+                all(j -> String(keys(row)[j]) == f.children[j].name, 1:nchildren)
+            ) || throw(
+                ArgumentError(
+                    "column $(f.name) retained struct row has fields $(keys(row)); " *
+                    "expected $(Tuple(c.name for c in f.children))",
+                ),
+            )
+            continue
+        end
         row isa AbstractVector || throw(
             ArgumentError(
                 "column $(f.name) retained struct rows must be ordered Pair vectors",

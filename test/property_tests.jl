@@ -234,10 +234,7 @@ const SEED = SeededFuzz.DEFAULT_SEED
             @test children[2].type == Arrow.AC.Utf8Type(false)
             @test children[2].nullable
             table = Arrow.Table(bytes)
-            @test isequal(
-                collect(table.structs),
-                [["x" => row.x, "label" => row.label] for row in rows],
-            )
+            @test isequal(collect(table.structs), rows)
         end
 
         EmptyRow = NamedTuple{(),Tuple{}}
@@ -248,7 +245,7 @@ const SEED = SeededFuzz.DEFAULT_SEED
             field = Arrow.readstream(bytes).schema.fields[1]
             @test field.type isa Arrow.AC.StructType
             @test isempty(field.children)
-            @test Arrow.Table(bytes).structs == [Pair{String,Any}[] for _ in rows]
+            @test Arrow.Table(bytes).structs == rows
         end
     end
 

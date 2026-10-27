@@ -39,6 +39,8 @@ Arrow.getmetadata
 Arrow.ArrowVector
 Arrow.Primitive
 Arrow.BoolVector
+Arrow.ListVector
+Arrow.ListRow
 Arrow.DictEncoded
 Arrow.RunEndEncoded
 ```

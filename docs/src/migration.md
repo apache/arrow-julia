@@ -65,11 +65,12 @@ values whose integer width matches the descriptor; negative-scale decimals
 keep raw storage (`Int32`/`Int64`, or native-endian byte vectors at 128/256
 bits). See [Type mapping when reading](@ref) for the complete table.
 
-Struct row types changed. Arrow 2.x read a plain (non-extension) Struct
-column as `NamedTuple` rows. Arrow 3.0 reads it as `Vector{Pair{String,Any}}`
-rows, because Arrow field names are not always valid or unique `Symbol`s. Ask
-for typed rows with a `Tables.Scan` select type override; it applies
-recursively, so a list-of-struct column takes a `Vector{...}` target:
+Struct rows are `NamedTuple`s, as in Arrow 2.x, for a struct of at most 64
+fields with distinct names; a wider struct, or one with duplicate names,
+reads `Vector{Pair{String,Any}}` rows (ordered name => value pairs). String
+fields read as `DataString`s; a `Tables.Scan` select type override names
+exact Julia types, and it applies recursively, so a list-of-struct column
+takes a `Vector{...}` target:
 
 ```julia
 NT = @NamedTuple{a::Float64, b::String}
@@ -77,23 +78,23 @@ table = Arrow.Table("data.arrow"; scan=Tables.Scan(select=(:x, :c => NT)))
 eltype(table.c) == NT # true
 ```
 
-Code that must read struct columns under both Arrow 2.x and 3.0 can branch on
-what it received instead of on the package version:
+Code that must handle both row shapes can branch on what it received:
 
 ```julia
 rows = table.c isa AbstractVector{<:NamedTuple} ? table.c :
        [r === missing ? missing : NT(Tuple(last(kv) for kv in r)) for r in table.c]
 ```
 
-List, map, and fixed-size-list row types changed too. Arrow 2.x read list
-rows as views with the child's element type (an `Int64` list read back as
-`SubArray{Int64}` rows), map rows as `Dict{K,V}`, and fixed-size-list rows as
-`NTuple{N,T}`. Arrow 3.0 reads them as `Vector{Any}`, `Vector{Pair{Any,Any}}`,
-and `Vector{Any}` rows. A `Tables.Scan` select type
-override such as `:xs => Vector{Int64}` reads typed list rows. Convert map
-and fixed-size-list rows after the read, for example with `Dict(row)` or
-`NTuple{2,Int64}(row)`. Code that checks a column's element type, such as a
-Legolas.jl schema with a `Vector{String}` field, sees the new row types.
+List and map row types changed. Arrow 2.x read list rows as `SubArray`
+views with the child's element type and map rows as `Dict{K,V}`. Arrow 3.0
+reads list rows as `Arrow.ListRow{T}` views and map rows as
+`Arrow.ListRow{Pair{K,V}}` views (entries in stored order; `Dict(row)` gives
+the 2.x value). Fixed-size-list rows are `NTuple{N,T}` as before when the list
+has at most 64 values and its values are not nullable; otherwise they are
+`Arrow.ListRow{T}`. `copy(column)` gives `Vector{T}` rows.
+Code that checks a column's element type, such as a Legolas.jl schema with a
+`Vector{String}` field, sees the new row types; a `Tables.Scan` select type
+override such as `:xs => Vector{String}` reads `Vector` rows.
 
 Timezone-aware timestamps changed. Arrow 2.x depended on TimeZones.jl and
 read a timestamp column with a declared timezone as `ZonedDateTime` values.

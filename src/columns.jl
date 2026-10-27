@@ -30,10 +30,10 @@
     Arrow.ArrowVector{T} <: AbstractVector{T}
 
 Supertype of the read-only columns `Arrow.Table` and `Arrow.Stream` return
-for flat Arrow layouts. A column reads its Arrow buffers in place (a
-memory-mapped file, the input bytes, or a decompressed buffer) and keeps that
-memory alive while the column is reachable, independent of its table.
-`copy(column)` returns an owned, mutable vector: a `Vector`, or a
+for flat, list, and map layouts. A flat column reads its Arrow buffers in
+place (a memory-mapped file, the input bytes, or a decompressed buffer) and
+keeps that memory alive while the column is reachable, independent of its
+table. `copy(column)` returns an owned, mutable vector: a `Vector`, or a
 `PooledArray` for a dictionary-encoded column.
 """
 abstract type ArrowVector{T} <: AbstractVector{T} end
@@ -720,15 +720,17 @@ function _checkstringtype(stringtype)
 end
 
 """
-Whether `f` reads through a view column: a flat layout with no ArrowTypes
-extension label. Nested, union, and extension columns keep the materializing
-path.
+Whether `f` reads through this file's columns: a flat layout (as a view) or
+a list, fixed-size list, map, struct, or union of such layouts (as typed
+rows), with no ArrowTypes extension label anywhere in it. List views,
+structs with duplicate or more than 64 field names, layouts nested more
+than 8 deep, and extension columns keep the materializing path.
 """
 function _viewable(f::AC.Field)
     _hasarrowtypesextension(f) && return false
     return _viewablelayout(f)
 end
-function _viewablelayout(f::AC.Field)
+function _viewablelayout(f::AC.Field, depth::Int=0)
     t = f.type
     t isa Union{
         AC.IntType,
@@ -746,9 +748,25 @@ function _viewablelayout(f::AC.Field)
         AC.NullType,
     } && return true
     t isa AC.DecimalType && return _shareddecimal(t)
-    t isa AC.DictionaryType && return _viewablelayout(AC.dictvaluefield(f, t))
+    t isa AC.DictionaryType && return _viewablelayout(AC.dictvaluefield(f, t), depth)
     t isa AC.RunEndEncodedType &&
-        return length(f.children) == 2 && _viewablelayout(f.children[2])
+        return length(f.children) == 2 && _viewablelayout(f.children[2], depth)
+    # Row types nest one type per level, and Julia compiles deep ones slowly.
+    t isa _NestedLayout && depth == _MAX_ROW_DEPTH && return false
+    viewable(c) = _viewablelayout(c, depth + 1)
+    t isa Union{AC.ListType,AC.FixedSizeListType} &&
+        return length(f.children) == 1 && viewable(f.children[1])
+    if t isa AC.MapType
+        length(f.children) == 1 || return false
+        entries = f.children[1]
+        return entries.type isa AC.StructType &&
+               length(entries.children) == 2 &&
+               all(viewable, entries.children)
+    end
+    t isa AC.StructType && return length(f.children) <= _MAX_ROW_FIELDS &&
+           allunique(c.name for c in f.children) &&
+           all(viewable, f.children)
+    t isa AC.UnionType && return !isempty(f.children) && all(viewable, f.children)
     return false
 end
 
@@ -779,8 +797,12 @@ _timeticksperday(unit) =
     unit == AC.MILLISECOND ? Int64(86_400_000) :
     unit == AC.MICROSECOND ? Int64(86_400_000_000) : _NANOS_PER_DAY
 
-"The public element type of a view column, before nullability."
-function _viewbasetype(f::AC.Field, ctx::_ViewContext)
+"""
+The public element type of a column, before nullability. Nested rows take
+their children's element types over `datas`, the batches being read, so a
+child whose data holds undeclared nulls widens the row type of every batch.
+"""
+function _viewbasetype(f::AC.Field, ctx::_ViewContext, datas=AC.ArrayData[])
     t = f.type
     t isa AC.NullType && return Missing
     t isa AC.BoolType && return Bool
@@ -790,6 +812,7 @@ function _viewbasetype(f::AC.Field, ctx::_ViewContext)
     t isa Union{AC.BinaryType,AC.ViewType} && return DataStrings.DataBytes
     t isa AC.DictionaryType && return _viewbasetype(AC.dictvaluefield(f, t), ctx)
     t isa AC.RunEndEncodedType && return _viewbasetype(f.children[2], ctx)
+    t isa _NestedLayout && return _rowtype(f, ctx, datas)
     S, C = _fixedstorage(t)
     return C === Nothing ? S : _storagetarget(C)
 end
@@ -814,8 +837,10 @@ end
 # data that holds nulls a non-nullable declaration did not admit widens the
 # column, as on every other read path.
 function _vieweltype(f::AC.Field, datas, ctx::_ViewContext)
-    B = _viewbasetype(f, ctx)
+    B = _viewbasetype(f, ctx, datas)
     B === Missing && return Missing
+    # A union has no validity of its own: its children's types carry nulls.
+    f.type isa AC.UnionType && return B
     nullable = Missing <: _declaredeltype(f, true) || any(d -> _viewnulls(f, d), datas)
     return nullable ? Union{Missing,B} : B
 end
@@ -835,6 +860,11 @@ function _checktimes(f::AC.Field, t::AC.TimeType, d::AC.ArrayData, budget)
     end
     return nothing
 end
+
+# One batch of a view column. Nested layouts skip `_batchview`, whose body
+# for every flat layout would otherwise compile once per row type.
+_viewbatch(T::Type, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext) =
+    f.type isa _NestedLayout ? _nestedbatch(T, f, d, ctx) : _batchview(T, f, d, ctx)
 
 "One batch of a fixed-width, boolean, dictionary, or run-end view column."
 function _batchview(::Type{T}, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext) where {T}
@@ -889,7 +919,7 @@ function _viewcolumn(
         return _payloadcolumn(V{ELT}, datas, ctx.budget)
     end
     isempty(datas) && return T[]
-    first = _batchview(T, f, datas[1], ctx)
+    first = _viewbatch(T, f, datas[1], ctx)
     length(datas) == 1 && return first
     return _chainviews(first, f, datas, ctx, T)
 end
@@ -903,13 +933,309 @@ function _chainviews(first::V, f::AC.Field, datas, ctx::_ViewContext, T::Type) w
     cols = Vector{V}(undef, length(datas))
     cols[1] = first
     for k = 2:length(datas)
-        col = _batchview(T, f, datas[k], ctx)
+        col = _viewbatch(T, f, datas[k], ctx)
         col isa V || return ChainedVector(
             AbstractVector{T}[
-                k == 1 ? first : _batchview(T, f, d, ctx) for (k, d) in enumerate(datas)
+                k == 1 ? first : _viewbatch(T, f, d, ctx) for (k, d) in enumerate(datas)
             ],
         )
         cols[k] = col
     end
     return ChainedVector(cols)
+end
+
+# --- nested rows ----------------------------------------------------------------
+#
+# Lists read as `ListRow` views of one owned vector of their child values,
+# so a row can outlive its table; fixed-size lists of up to 64 non-null
+# values as `NTuple`s; structs as `NamedTuple`s; maps as `ListRow`s of
+# `Pair`s; unions as a `Union` of their children's element types. A row type depends only
+# on its children's element types, and names each of them once, so its size
+# grows linearly with the nesting depth.
+
+const _NestedLayout =
+    Union{AC.ListType,AC.FixedSizeListType,AC.MapType,AC.StructType,AC.UnionType}
+const _MAX_ROW_FIELDS = 64
+const _MAX_ROW_DEPTH = 8
+const _MAX_TUPLE_ROW = 64
+
+"""
+    Arrow.ListRow{T} <: AbstractVector{T}
+
+A row of a list or map column, or of a fixed-size list column longer than
+64 values or with nullable values: a read-only view of consecutive values
+in its column's owned vector of child values (`Pair`s for a map), so the
+row stays valid after its table is gone. `copy(row)` gives a `Vector{T}`.
+"""
+struct ListRow{T} <: AbstractVector{T}
+    values::Vector{T}
+    offset::Int
+    len::Int
+end
+
+Base.size(r::ListRow) = (r.len,)
+Base.IndexStyle(::Type{<:ListRow}) = IndexLinear()
+Base.@propagate_inbounds function Base.getindex(r::ListRow, i::Int)
+    @boundscheck checkbounds(r, i)
+    return @inbounds r.values[r.offset + i]
+end
+
+_childdatas(datas, k::Int) = AC.ArrayData[d.children[k] for d in datas]
+
+function _rowtype(f::AC.Field, ctx::_ViewContext, datas)
+    t = f.type
+    if t isa AC.StructType
+        names = Tuple(Symbol(c.name) for c in f.children)
+        types =
+            (_vieweltype(c, _childdatas(datas, k), ctx) for (k, c) in enumerate(f.children))
+        return NamedTuple{names,Tuple{types...}}
+    end
+    t isa AC.UnionType && return Union{
+        (_vieweltype(c, _childdatas(datas, k), ctx) for (k, c) in enumerate(f.children))...,
+    }
+    if t isa AC.MapType
+        entries = f.children[1]
+        entrydatas = _childdatas(datas, 1)
+        K = _vieweltype(entries.children[1], _childdatas(entrydatas, 1), ctx)
+        V = _vieweltype(entries.children[2], _childdatas(entrydatas, 2), ctx)
+        return ListRow{Pair{K,V}}
+    end
+    E = _vieweltype(f.children[1], _childdatas(datas, 1), ctx)
+    # A tuple of a non-concrete `E` (nullable values) is an abstract type:
+    # every row would be boxed, with up to 2^N runtime types.
+    t isa AC.FixedSizeListType &&
+        t.listsize <= _MAX_TUPLE_ROW &&
+        isconcretetype(E) &&
+        return NTuple{t.listsize,E}
+    return ListRow{E}
+end
+
+"""
+    Arrow.ListVector{T} <: ArrowVector{T}
+
+A list or map column: row `i` is an [`Arrow.ListRow`](@ref) of the
+column's owned vector of child values (`Pair`s for a map).
+"""
+struct ListVector{T,O,E} <: ArrowVector{T}
+    offsets::Vector{O}
+    values::Vector{E}
+    validity::Vector{UInt8}
+    bitoffset::Int
+    owner::Any
+end
+
+Base.size(v::ListVector) = (length(v.offsets) - 1,)
+Base.@propagate_inbounds function Base.getindex(v::ListVector{T}, i::Int) where {T}
+    @boundscheck checkbounds(v, i)
+    if Missing <: T
+        null = GC.@preserve v _isnullslot(v.validity, v.bitoffset, i)
+        null && return missing
+    end
+    lo, hi = GC.@preserve v (@inbounds(v.offsets[i]), @inbounds(v.offsets[i + 1]))
+    return ListRow(v.values, Int(lo), Int(hi - lo))
+end
+
+# An owned copy holds each row as its own `Vector`, over every batch.
+function Base.copy(v::ListVector{T,O,E}) where {T,O,E}
+    R = Missing <: T ? Union{Missing,Vector{E}} : Vector{E}
+    return R[x === missing ? missing : collect(x) for x in v]
+end
+function Base.copy(c::ChainedVector{T,ListVector{T,O,E}}) where {T,O,E}
+    R = Missing <: T ? Union{Missing,Vector{E}} : Vector{E}
+    return R[x === missing ? missing : collect(x) for x in c]
+end
+
+# The child's values in an owned vector: rows view it, so it must not be a
+# view of the source's memory.
+function _ownedvalues(::Type{E}, col, budget) where {E}
+    col isa Vector{E} && return col
+    _chargeexact!(budget, E, length(col), "nested child values")
+    out = Vector{E}(undef, length(col))
+    @inbounds for i in eachindex(out, col)
+        out[i] = col[i]
+    end
+    return out
+end
+
+# Not specialized on the row or value type, like `_nestedbatch`.
+function _listvector(
+    @nospecialize(T::Type),
+    d::AC.ArrayData,
+    @nospecialize(values::Vector),
+    budget,
+)
+    E = eltype(values)
+    n = Int64(d.len)
+    offs = AC.rolebuffer(d, AC.OFFSETS)
+    validity, bitoffset = _validitybits(d)
+    wide = AC.layoutspec_of(d.type).offsetwidth == 8
+    if n == 0
+        return ListVector{T,wide ? Int64 : Int32,E}(
+            wide ? Int64[0] : Int32[0],
+            values,
+            validity,
+            bitoffset,
+            d,
+        )
+    end
+    offsets =
+        wide ? _wrapbuffer(Int64, offs, d.offset, n + 1, budget) :
+        _wrapbuffer(Int32, offs, d.offset, n + 1, budget)
+    return ListVector{T,eltype(offsets),E}(offsets, values, validity, bitoffset, d)
+end
+
+# Not specialized on the row type, so it compiles once for every nested
+# column; the per-row loops it calls are function barriers specialized on
+# the row and column types.
+function _nestedbatch(
+    @nospecialize(T::Type),
+    f::AC.Field,
+    d::AC.ArrayData,
+    ctx::_ViewContext,
+)
+    t = f.type
+    R = Base.nonmissingtype(T)
+    budget = ctx.budget
+    _chargeobject!(budget, _VIEW_OBJECT_BYTES, "column view")
+    t isa AC.UnionType && return _unionrows(T, f, d, ctx)
+    if t isa AC.StructType
+        # A loop, not a generator: a closure over `R` would be a new type,
+        # compiled again, for every row type.
+        cols = Vector{Any}(undef, length(f.children))
+        for (k, c) in enumerate(f.children)
+            cols[k] = _viewcolumn(c, AC.ArrayData[d.children[k]], ctx, fieldtype(R, k))
+        end
+        return _structrows(T, Tuple(cols), d, budget)
+    end
+    if t isa AC.MapType
+        entries, ed = f.children[1], d.children[1]
+        K, V = fieldtypes(eltype(R))
+        keys = _viewcolumn(entries.children[1], AC.ArrayData[ed.children[1]], ctx, K)
+        vals = _viewcolumn(entries.children[2], AC.ArrayData[ed.children[2]], ctx, V)
+        n = Int(ed.len)
+        _chargeexact!(budget, Pair{K,V}, n, "map entries")
+        return _listvector(
+            T,
+            d,
+            _mapentries(Pair{K,V}, keys, vals, Int(ed.offset), n),
+            budget,
+        )
+    end
+    E = eltype(R)
+    if t isa AC.FixedSizeListType && R <: Tuple
+        # `NTuple{0,E}` is `Tuple{}`, whose rows read no child values.
+        N = fieldcount(R)
+        N == 0 && return _tuplerows(T, Val(0), nothing, d, budget)
+        child = _viewcolumn(f.children[1], AC.ArrayData[d.children[1]], ctx, E)
+        return _tuplerows(T, Val(N), child, d, budget)
+    end
+    child = _viewcolumn(f.children[1], AC.ArrayData[d.children[1]], ctx, E)
+    if t isa AC.FixedSizeListType
+        values = _ownedvalues(E, child, budget)
+        w = t.listsize
+        _chargeexact!(budget, Int64, d.len + 1, "fixed-size list offsets")
+        validity, bitoffset = _validitybits(d)
+        base = Int64(d.offset) * w
+        offsets = Int64[base + Int64(i) * w for i = 0:(d.len)]
+        return ListVector{T,Int64,E}(offsets, values, validity, bitoffset, d)
+    end
+    return _listvector(T, d, _ownedvalues(E, child, budget), budget)
+end
+
+# Entry `j` pairs the key and value at `base + j`, the entries struct's own
+# offset. Specialized on the key and value column types (a function barrier).
+function _mapentries(::Type{P}, keys, vals, base::Int, n::Int) where {P}
+    pairs = Vector{P}(undef, n)
+    for j = 1:n
+        pairs[j] = keys[base + j] => vals[base + j]
+    end
+    return pairs
+end
+
+# Row `j` of a struct's child columns. Generated because `map` builds a
+# tuple of 32 or more values through a `Vector{Any}`; left to the inliner,
+# since inlining a wide row into the read loop multiplies its compile time.
+@generated _structrow(cols::Tuple, j::Int) =
+    Expr(:tuple, (:(cols[$k][j]) for k = 1:fieldcount(cols))...)
+
+function _structrows(::Type{T}, cols::Tuple, d::AC.ArrayData, budget) where {T}
+    NT = Base.nonmissingtype(T)
+    n = Int(d.len)
+    _chargeexact!(budget, T, n, "struct rows")
+    out = Vector{T}(undef, n)
+    validity, bitoffset = _validitybits(d)
+    base = Int(d.offset)
+    GC.@preserve validity cols for i = 1:n
+        if Missing <: T && _isnullslot(validity, bitoffset, i)
+            out[i] = missing
+        else
+            out[i] = NT(_structrow(cols, base + i))
+        end
+    end
+    return out
+end
+
+function _tuplerows(::Type{T}, ::Val{N}, child, d::AC.ArrayData, budget) where {T,N}
+    n = Int(d.len)
+    _chargeexact!(budget, T, n, "fixed-size list rows")
+    out = Vector{T}(undef, n)
+    validity, bitoffset = _validitybits(d)
+    GC.@preserve validity child for i = 1:n
+        if Missing <: T && _isnullslot(validity, bitoffset, i)
+            out[i] = missing
+        else
+            base = (Int(d.offset) + i - 1) * N
+            out[i] = ntuple(j -> child[base + j], Val(N))
+        end
+    end
+    return out
+end
+
+# The value at child index `j` of the `k`th column, unrolled over the tuple.
+_pickchild(cols::Tuple, k::Int, j::Int) =
+    k == 1 ? first(cols)[j] : _pickchild(Base.tail(cols), k - 1, j)
+_pickchild(::Tuple{}, ::Int, ::Int) = throw(ValidationError("union child out of range"))
+
+function _unionrows(@nospecialize(T::Type), f::AC.Field, d::AC.ArrayData, ctx::_ViewContext)
+    t = f.type::AC.UnionType
+    budget = ctx.budget
+    cols = Tuple(
+        _viewcolumn(
+            c,
+            AC.ArrayData[d.children[k]],
+            ctx,
+            _vieweltype(c, AC.ArrayData[d.children[k]], ctx),
+        ) for (k, c) in enumerate(f.children)
+    )
+    n = Int(d.len)
+    _chargeexact!(budget, T, n, "union rows")
+    out = Vector{T}(undef, n)
+    ids = _wrapbuffer(Int8, AC.rolebuffer(d, AC.TYPE_IDS), d.offset, n, budget)
+    dense = t.mode == AC.DenseMode
+    offsets =
+        dense ?
+        _wrapbuffer(Int32, AC.rolebuffer(d, AC.ELEMENT_OFFSETS), d.offset, n, budget) :
+        Int32[]
+    GC.@preserve ids offsets d _fillunion!(
+        out,
+        cols,
+        ids,
+        offsets,
+        t.typeids,
+        dense,
+        Int(d.offset),
+    )
+    return out
+end
+
+# Specialized on the children's column types (a function barrier).
+function _fillunion!(out, cols::Tuple, ids, offsets, typeids, dense::Bool, base::Int)
+    for i in eachindex(out)
+        k = findfirst(==(ids[i]), typeids)
+        k === nothing &&
+            throw(ValidationError("union type id $(ids[i]) not in declared domain"))
+        j = dense ? Int(offsets[i]) + 1 : base + i
+        out[i] = _pickchild(cols, k, j)
+    end
+    return out
 end

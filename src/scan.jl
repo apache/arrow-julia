@@ -2805,14 +2805,26 @@ function _applyoverride(::Type{T}, col, budget=nothing) where {T}
     return out
 end
 
-# One scan-override value. `convert` is the contract, but the composite row
-# containers the facade materializes (struct rows as `Vector{Pair}`, list
-# rows as `Vector`) have no `convert` methods to user types, so fully typed
-# named-tuple and vector targets rebuild recursively — `:c => @NamedTuple{…}`
-# in a select is the supported way to read a struct column as typed rows.
-# Struct fields match by position and the names must agree.
+# One scan-override value. `convert` is the contract, but the composite rows
+# the facade reads (struct rows as `NamedTuple`s or, for wide or duplicate
+# names, `Vector{Pair}`s; list rows as views) have no `convert` methods to
+# user types, so fully typed named-tuple and vector targets rebuild
+# recursively. Struct fields match by position and the names must agree.
 function _overridevalue(::Type{T}, x) where {T}
     x isa T && return x
+    if T isa DataType && T <: NamedTuple && x isa NamedTuple
+        names = fieldnames(T)
+        keys(x) == names || throw(
+            ArgumentError("struct row fields $(keys(x)) do not match $(T) fields $(names)"),
+        )
+        return T(
+            ntuple(length(names)) do i
+                v = x[i]
+                v === missing ? missing :
+                _overridevalue(Base.nonmissingtype(fieldtype(T, i)), v)
+            end,
+        )
+    end
     if T isa DataType && T <: NamedTuple && x isa AbstractVector{<:Pair}
         names = fieldnames(T)
         length(x) == length(names) || throw(
