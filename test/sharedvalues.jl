@@ -57,7 +57,27 @@ using Test, Arrow, DataDecimals, Durations, DataStrings, Tables
     @test isequal(Arrow.Table(take!(io)).x, values)
 end
 
-@test_throws ArgumentError Arrow.write(
-    IOBuffer(),
-    (; x=[reinterpret(DataDecimals.Decimal32{2}, Int32(1_000_000_000))]),
-)
+@testset "decimal columns write their storage directly" begin
+    AC = Arrow.ArrowCore
+    D = DataDecimals.Decimal128{2}
+    n = 100_000
+    plain = [reinterpret(D, Int128(i)) for i = 1:n]
+    nullable = Union{Missing,D}[isodd(i) ? plain[i] : missing for i = 1:n]
+    for x in (plain, nullable, view(plain, 2:n), Tables.partitioner([plain, plain]))
+        tbl = x isa AbstractVector ? (; x=x) : Tables.partitioner([(; x=p) for p in x.x])
+        io = IOBuffer()
+        Arrow.write(io, tbl)
+        expected = x isa AbstractVector ? x : vcat(plain, plain)
+        @test isequal(Arrow.Table(take!(io)).x, expected)
+    end
+    # One allocation per row before: a coefficient byte vector per value.
+    Arrow.write(IOBuffer(), (; x=nullable))
+    @test @allocations(Arrow.write(IOBuffer(), (; x=nullable))) < 1_000
+    @test @allocations(Arrow.write(IOBuffer(), (; x=plain))) < 1_000
+    # Precision is advisory, as in Arrow C++: an out-of-precision coefficient
+    # (only reachable through `reinterpret`) writes as stored.
+    io = IOBuffer()
+    Arrow.write(io, (; x=[reinterpret(DataDecimals.Decimal32{2}, Int32(1_000_000_000))]))
+    data = AC.rolebuffer(Arrow.readfile(take!(io))[1].columns[1], AC.DATA)
+    @test AC.loadat(data, Int32, 0) == 1_000_000_000
+end

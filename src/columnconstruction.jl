@@ -3913,8 +3913,58 @@ function _retainedfixedbytes(f::AC.Field, v::AbstractVector)
     return _retainedfield(f), d
 end
 
+"Values (`fill` at missing slots), validity buffer, and null count of a column."
+function _nullablevalues(::Type{S}, v::AbstractVector, fill::S) where {S}
+    n = length(v)
+    vals = Vector{S}(undef, n)
+    bits = zeros(UInt8, cld(n, 8))
+    nc = 0
+    for (i, x) in enumerate(v)
+        if x === missing
+            nc += 1
+            @inbounds vals[i] = fill
+        else
+            @inbounds vals[i] = x
+            @inbounds bits[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7)
+        end
+    end
+    validity =
+        nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
+    return vals, validity, nc
+end
+
+# A `Decimal{P,S,T}` is its storage integer, so a column of them already is
+# the Arrow coefficient buffer: a `Vector` is wrapped without copying and any
+# other vector is collected once. Values write as stored, as Arrow C++ does;
+# the precision check is `validate_full`'s.
+function _decimaldata(f::AC.Field, v::AbstractVector, ::Type{D}) where {D}
+    t = f.type
+    if eltype(v) === D
+        vals = v isa Vector{D} ? v : collect(D, v)
+        return AC.ArrayData(
+            t,
+            length(v),
+            [AC.BufferSlice(), AC._databuffer(vals)];
+            nullcount=0,
+        )
+    end
+    vals, validity, nc = _nullablevalues(D, v, zero(D))
+    nc > 0 &&
+        !f.nullable &&
+        throw(
+            ArgumentError(
+                "column $(f.name) holds missing values but its retained field is non-nullable",
+            ),
+        )
+    return AC.ArrayData(t, length(v), [validity, AC._databuffer(vals)]; nullcount=nc)
+end
+
 function _retaineddecimal(f::AC.Field, v::AbstractVector)
     t = f.type::AC.DecimalType
+    D = Base.nonmissingtype(eltype(v))
+    _shareddecimal(t) &&
+        D === _decimalhost(t) &&
+        return _retainedfield(f), _decimaldata(f, v, D)
     v = [x isa DataDecimals.AbstractDecimal ? _shareddecimalraw(t, x) : x for x in v]
     present = _retainedvalidity(f, v)
     if t.bits == 32 || t.bits == 64
