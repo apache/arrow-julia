@@ -57,6 +57,13 @@ is used as supplied.
 Returns `sink`: the path for the path method, the `io` for the `IO` method.
 The one-argument form curries for pipelines: `table |> Arrow.write(sink)`.
 
+Writing to an existing file writes a temporary file in the same directory
+and renames it over the old one when the output is complete, so a failed
+write leaves the old file unchanged, and an `Arrow.Table` or `Arrow.Stream`
+that memory-maps the old file keeps reading it. Windows cannot replace a
+file that is memory-mapped: `release!` the table first (or read it with
+`mmap=false`), or write to another path.
+
 The writer is eager and whole-buffer: batches are encoded and validated in
 memory, then written to the sink once.
 
@@ -67,10 +74,78 @@ Keywords the Arrow 2.x incremental writer accepted (`alignment`,
 """
 function write(path::AbstractString, tbl; kwargs...)
     bytes = _writebytes(tbl; kwargs...)
-    open(path, "w") do io
-        Base.write(io, bytes)
+    sink = _openpath(path)
+    try
+        Base.write(sink.io, bytes)
+    catch
+        _abortpath(sink)
+        rethrow()
     end
+    _commitpath(sink)
     return path
+end
+
+# An existing regular file is replaced by writing a temporary file in the
+# same directory and renaming it over the destination once the output is
+# complete. A live Arrow.Table or Arrow.Stream that memory-maps the old file
+# keeps reading the old inode, and a failed write leaves the old file as it
+# was. New paths and non-regular files (FIFOs, devices) are written in place.
+struct _PathSink
+    io::IO
+    path::String                # the destination, symlinks resolved
+    tmp::Union{Nothing,String}  # renamed over `path` on commit
+    created::Bool               # `path` did not exist before this write
+end
+
+function _openpath(path::AbstractString)
+    if !isfile(path)
+        created = !ispath(path) && !islink(path)
+        return _PathSink(open(path, "w"), String(path), nothing, created)
+    end
+    dest = realpath(path)
+    tmp, io = mktemp(dirname(dest); cleanup=false)
+    try
+        chmod(tmp, filemode(dest) & 0o7777)
+    catch
+        close(io)
+        rm(tmp; force=true)
+        rethrow()
+    end
+    return _PathSink(io, dest, tmp, false)
+end
+
+function _commitpath(sink::_PathSink)
+    try
+        close(sink.io)
+    catch
+        sink.tmp === nothing || rm(sink.tmp; force=true)
+        rethrow()
+    end
+    sink.tmp === nothing && return nothing
+    err = ccall(:jl_fs_rename, Int32, (Cstring, Cstring), sink.tmp, sink.path)
+    err < 0 || return nothing
+    rm(sink.tmp; force=true)
+    hint =
+        Sys.iswindows() ?
+        "; Windows cannot replace a file that is open or memory-mapped, for " *
+        "example by a live Arrow.Table or Arrow.Stream: call Arrow.release! on it " *
+        "(or read with mmap=false) before overwriting, or write to another path" : ""
+    throw(Base.IOError("Arrow could not replace $(repr(sink.path))$hint", err))
+end
+
+# Error cleanup: the destination keeps its old bytes (or stays absent).
+function _abortpath(sink::_PathSink)
+    try
+        close(sink.io)
+    catch
+        # Preserve the write error if closing also fails.
+    end
+    if sink.tmp !== nothing
+        rm(sink.tmp; force=true)
+    elseif sink.created
+        rm(sink.path; force=true)
+    end
+    return nothing
 end
 
 function write(io::IO, tbl; kwargs...)
@@ -107,7 +182,9 @@ an `IO` (borrowed; `close` finishes the IPC output but leaves the `IO`
 open). The function form runs `f(writer)` and always closes the writer.
 Metadata follows the inheritance rules of [`Arrow.write`](@ref).
 Constructor option checks run before opening a file path. If both `f` and
-`close` fail, the function form preserves the error from `f`.
+`close` fail, the function form preserves the error from `f`. An existing
+file path is replaced as by [`Arrow.write`](@ref): the output goes to a
+temporary file that `close` renames over the old file.
 
     w = Arrow.Writer(path)
     for tbl in tables
@@ -146,6 +223,7 @@ are not synchronized.
 mutable struct Writer
     const io::IO
     const ownio::Bool
+    const path::Union{Nothing,_PathSink}
     const file::Bool
     const compress::Symbol
     const metadata::Any
@@ -177,14 +255,15 @@ function _writer(
             ),
         )
     end
-    # Open only after keyword dispatch and option checks: opening with "w"
-    # truncates an existing destination.
+    # Open only after keyword dispatch and option checks.
     ownio = sink isa AbstractString
-    io = ownio ? open(sink, "w") : sink
+    path = ownio ? _openpath(sink) : nothing
+    io = ownio ? path.io : sink
     try
         return Writer(
             io,
             ownio,
+            path,
             file,
             codec,
             metadata,
@@ -196,13 +275,7 @@ function _writer(
             false,
         )
     catch
-        if ownio
-            try
-                close(io)
-            catch
-                # Preserve the construction error if sink cleanup also fails.
-            end
-        end
+        ownio && _abortpath(path)
         rethrow()
     end
 end
@@ -312,16 +385,10 @@ function Base.close(w::Writer)
                 # Preserve the finalization error if codec cleanup also fails.
             end
         end
-        if w.ownio
-            try
-                close(w.io)
-            catch
-                # Preserve the finalization error if sink cleanup also fails.
-            end
-        end
+        w.ownio && _abortpath(w.path)
         rethrow()
     end
-    w.ownio ? close(w.io) : flush(w.io)
+    w.ownio ? _commitpath(w.path) : flush(w.io)
     return nothing
 end
 

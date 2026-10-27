@@ -18,6 +18,7 @@ module WriterSinkTests
 
 using Test
 using Arrow
+using Tables
 
 # Inject sink failures at the public path/IO boundary. The path wrapper lets
 # the writer own a controlled IO without depending on OS-specific failures.
@@ -33,7 +34,7 @@ FailingSink() = FailingSink(IOBuffer(), nothing, nothing, nothing, 0)
 struct SinkPath <: AbstractString
     io::FailingSink
 end
-Base.open(path::SinkPath, ::String) = path.io
+Arrow._openpath(path::SinkPath) = Arrow._PathSink(path.io, "", nothing, false)
 Base.isopen(io::FailingSink) = isopen(io.data)
 function Base.write(io::FailingSink, bytes::Vector{UInt8})
     io.writeerror === nothing || throw(io.writeerror)
@@ -218,6 +219,58 @@ end
                 @test bytes == Arrow._writebytes(table; file=file)
                 close(io)
             end
+        end
+    end
+
+    @testset "overwriting a memory-mapped file keeps the live handle valid" begin
+        mktempdir() do dir
+            path = joinpath(dir, "mapped.arrow")
+            parts = [(; a=collect(Int64, (1:100_000) .+ 100_000k)) for k = 0:3]
+            Arrow.write(path, Tables.partitioner(parts))
+            sums = [sum(p.a) for p in parts]
+            for overwrite in (
+                p -> Arrow.write(p, (; a=Int64[1])),
+                p -> Arrow.Writer(w -> Arrow.write(w, (; a=Int64[1])), p),
+            )
+                s = Arrow.Stream(path)  # maps the file; batches decode lazily
+                if Sys.iswindows()
+                    err = caught(() -> overwrite(path))
+                    @test err isa Base.IOError
+                    @test occursin("memory-mapped", sprint(showerror, err))
+                    @test [sum(b.a) for b in s] == sums
+                else
+                    overwrite(path)
+                    @test [sum(b.a) for b in s] == sums
+                    @test Arrow.Table(path).a == [1]
+                    Arrow.write(path, Tables.partitioner(parts))
+                end
+                @test readdir(dir) == ["mapped.arrow"]
+            end
+        end
+    end
+
+    @testset "replacing a file keeps its mode and symlinks; failures keep it" begin
+        mktempdir() do dir
+            target = joinpath(dir, "target.arrow")
+            link = joinpath(dir, "link.arrow")
+            Arrow.write(target, table)
+            original = read(target)
+            Sys.iswindows() || chmod(target, 0o640)
+            symlink(target, link)
+            Arrow.write(link, (; b=["x"]))
+            @test islink(link)
+            @test Arrow.Table(target).b == ["x"]
+            Sys.iswindows() || @test filemode(target) & 0o777 == 0o640
+            Arrow.write(target, table)
+            @test read(target) == original
+            # The second partition's columns do not match the first's.
+            unwritable = Tables.partitioner([(; a=Int64[1]), (; b=Int64[2])])
+            @test caught(() -> Arrow.write(target, unwritable)) isa Exception
+            @test read(target) == original
+            fresh = joinpath(dir, "fresh.arrow")
+            @test caught(() -> Arrow.write(fresh, unwritable)) isa Exception
+            @test !ispath(fresh)
+            @test sort(readdir(dir)) == ["link.arrow", "target.arrow"]
         end
     end
 
