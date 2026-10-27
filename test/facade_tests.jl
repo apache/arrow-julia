@@ -2866,6 +2866,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
     end
 
     @testset "batches whose offsets would pass Int32 are cut smaller" begin
+        AC = Arrow.AC
         # A builder reports the batch and row where 32-bit offsets overflow;
         # the writer cuts every batch at least that long and rebuilds.
         calls = Ref(0)

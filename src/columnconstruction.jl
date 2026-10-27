@@ -1105,7 +1105,7 @@ function _arrowtypesstoragecolumn(
     elseif kind isa ArrowTypes.MapKind
         return _arrowtypesmapcolumn(name, v, S; extension_shape, context)
     elseif kind isa ArrowTypes.ListKind
-        if S <: AbstractString
+        if S <: Union{AbstractString,AbstractVector{UInt8}}
             return _constructnativepart(name, v; context)
         end
         return _arrowtypeslistcolumn(name, v, S; extension_shape, context)
@@ -1776,13 +1776,16 @@ function _writerdescriptordistance(
         end
         return typeof(retained.type) === typeof(candidate.type) ? 1 : 3
     end
-    retainedstorage = _writerphysicalbasetype(context, retained)
-    candidatestorage = _writerphysicalbasetype(context, candidate)
+    retainedstorage = _bytevectordomain(_writerphysicalbasetype(context, retained))
+    candidatestorage = _bytevectordomain(_writerphysicalbasetype(context, candidate))
     retainedstorage === Any && return nothing
     candidatestorage === Any && return nothing
     retainedstorage === candidatestorage || return nothing
     return typeof(retained.type) === typeof(candidate.type) ? 1 : 4
 end
+
+# FixedSizeBinary storage (`NTuple{N,UInt8}`) and byte vectors are one domain.
+_bytevectordomain(T) = T isa DataType && T <: NTuple{<:Any,UInt8} ? Vector{UInt8} : T
 
 "Physical writer identity distance for a retained logical branch."
 function _writerfielddistance(
