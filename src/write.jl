@@ -783,6 +783,7 @@ function _dictionarydeltas(current, fields, ids, batch::AC.RecordBatch)
         id = ids[f]
         old = get(current, id, nothing)
         (old === nothing || old === pool || pool.len <= old.len) && continue
+        haskey(deltas, id) && continue
         vf = AC.dictvaluefield(f, f.type::AC.DictionaryType)
         stored = _writerstoredcolumn(vf, pool)
         isequal(_writerstoredcolumn(vf, old), stored[1:(old.len)]) || continue

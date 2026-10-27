@@ -1048,13 +1048,15 @@ function writebatch!(
         _validatewriterbatch!(st.validated, st.schema, batch, st.ids)
     end
     # Stage every message (dictionaries first, then the record batch) and the
-    # pool updates, so a failure publishes nothing and changes no state.
+    # pool updates, so a failure publishes nothing and changes no state. A
+    # shared or nested dictionary id occurs more than once in a batch, always
+    # with one pool: its first occurrence stages the pool, the rest see it.
     messages = Tuple{Vector{UInt8},EncodeCursor,Any}[]
-    updates = Pair{Int64,ArrayData}[]
+    staged = Dict{Int64,ArrayData}()
     dictblocks = st.file ? st.dictblocks : nothing
     for (f, pool) in dictionarypools(st.schema.fields, batch.columns)
         id = st.ids[f]
-        old = get(st.current, id, nothing)
+        old = haskey(staged, id) ? staged[id] : get(st.current, id, nothing)
         old === pool && continue
         vf = AC.dictvaluefield(f, f.type::DictionaryType)
         delta = deltas === nothing || old === nothing ? nothing : get(deltas, id, nothing)
@@ -1066,7 +1068,7 @@ function writebatch!(
             header, body =
                 _dictionarymessage(id, vf, delta, st.codec, st.state; isdelta=true)
             push!(messages, (header, body, dictblocks))
-            push!(updates, id => pool)
+            staged[id] = pool
             continue
         end
         if old !== nothing
@@ -1083,7 +1085,7 @@ function writebatch!(
                         "the stream format for replacement",
                     ),
                 )
-                push!(updates, id => pool)
+                staged[id] = pool
                 continue
             end
             if !(FEATURE_DICTIONARY_REPLACEMENT in st.features)
@@ -1097,20 +1099,18 @@ function writebatch!(
                         "stream with Arrow.Writer(...; dictreplacement=true))",
                     ),
                 )
-                push!(updates, id => pool)
+                staged[id] = pool
                 continue
             end
         end
         header, body = _dictionarymessage(id, vf, pool, st.codec, st.state)
         push!(messages, (header, body, dictblocks))
-        push!(updates, id => pool)
+        staged[id] = pool
     end
     header, body = _recordmessage(batch, st.schema.fields, st.codec, st.state)
     push!(messages, (header, body, st.file ? st.recordblocks : nothing))
     _publishmessages!(st, messages)
-    for (id, pool) in updates
-        st.current[id] = pool
-    end
+    merge!(st.current, staged)
     return nothing
 end
 

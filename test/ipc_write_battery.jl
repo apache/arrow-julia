@@ -275,9 +275,14 @@ function ipc_write_battery()
     okd2 =
         ArrayData(skewf2.type, 1, skewd2.buffers; dictionary=skewd1.dictionary, nullcount=0)
     okbatch = AC.RecordBatch(skewsch, ArrayData[skewd1, okd2], 1)
-    okstream = readstream(writestream(skewsch, [okbatch]; dictids=skewids))
+    okbytes = writestream(skewsch, [okbatch]; dictids=skewids)
+    okstream = readstream(okbytes)
     @assert okstream.fielddictids[okstream.schema.fields[1]] ==
             okstream.fielddictids[okstream.schema.fields[2]]
+    # The shared pool is one dictionary message, so the file format, which
+    # forbids replacement, carries a shared id too.
+    @assert count(f -> f.kind == UInt8(2), _frameinfo(okbytes)) == 1
+    @assert length(readfile(writefile(skewsch, [okbatch]; dictids=skewids))) == 1
     # ... and a repeated id must carry ONE nested dictionary-id topology, or
     # the second field would decode through pools its schema never declared.
     innerty = DictionaryType(IntType(32, true), Utf8Type(false), false)
