@@ -2853,6 +2853,15 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
                 keys(src),
             )
         end
+        # A string batch read in order is a slice of the read buffer; strings
+        # appended one by one (short ones only inline) are copied.
+        _, sd = Arrow._constructpart("s", view(t.s, 1:1000))
+        @test any(b -> b === AC.rolebuffer(sd, AC.DATA).region.root, t.s.buffers)
+        appended = DataStrings.StringVector(src.s)
+        for batchsize in (3, 1000)
+            back = Arrow.Table(take!(Arrow.write(IOBuffer(), (; s=appended); batchsize)))
+            @test isequal(collect(back.s), src.s)
+        end
     end
 
     @testset "write knobs: batchsize, compresslevel, dictencode, largelists" begin

@@ -505,10 +505,12 @@ function _constructpart(
 end
 
 """
-utf8/binary offsets and data from DataStrings payloads: one length pass, one
-copy. Values of at most 32 bytes are copied as whole words (an inline payload
-from its entry, a longer value when its buffer has 32 bytes from its start),
-so the data buffer keeps 32 bytes of slack while it is filled.
+utf8/binary offsets and data from DataStrings payloads: one length pass, then
+the data is a slice of the payloads' buffer when the rows are stored there in
+order and mostly out of line, or one copy. Copied values of at most 32 bytes
+move as whole words (an inline payload from its entry, a longer value when its
+buffer has 32 bytes from its start), so the copy keeps 32 bytes of slack while
+it is filled.
 """
 function _packedpayloadpart(
     name::String,
@@ -524,12 +526,27 @@ function _packedpayloadpart(
     bits = Vector{UInt8}(undef, cld(n, 8))
     pos = 0
     valid = 0
+    # Whether the values stored out of line sit back to back in row order in
+    # one buffer (`runbuf`, from `runstart`), as a read of utf8 data stores
+    # them, and how many bytes they hold.
+    runbuf = 0
+    runstart = 0
+    runok = true
+    longbytes = 0
     @inbounds for b in eachindex(bits)
         base = (b - 1) << 3
         byte = 0x00
         for j = 0:(min(8, n - base) - 1)
             i = base + j + 1
-            len = Int(DataStrings.payloadlength(payloads[i]))
+            p = payloads[i]
+            len = Int(DataStrings.payloadlength(p))
+            if len > DataStrings.INLINE_MAX
+                k = Int(DataStrings.payloadbufidx(p)) + 1
+                at = Int(DataStrings.payloadoffset(p)) - pos
+                runbuf == 0 && (runbuf=k; runstart=at)
+                runok &= k == runbuf && at == runstart
+                longbytes += len
+            end
             present = len >= 0
             pos += ifelse(present, len, 0)
             pos <= typemax(Offset) || throw(_OffsetOverflow(name, 0, i))
@@ -540,6 +557,18 @@ function _packedpayloadpart(
         valid += count_ones(byte)
     end
     nc = n - valid
+    validity =
+        nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
+    # Slicing pays when the out-of-line values hold most of the bytes: the
+    # inline values are then checked against the buffer instead of copied.
+    if runok &&
+       runbuf != 0 &&
+       2 * longbytes >= pos &&
+       _inlineinrun(payloads, offsets, buffers, runbuf, runstart)
+        databuf = AC.BufferSlice(AC.heapregion(buffers[runbuf]), runstart, pos)
+        d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
+        return AC.Field(name, t; nullable), _constructedvalid(d)
+    end
     data = Vector{UInt8}(undef, pos + 32)
     GC.@preserve payloads buffers data begin
         out = pointer(data)
@@ -571,11 +600,50 @@ function _packedpayloadpart(
         end
     end
     resize!(data, pos)
-    validity =
-        nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
     databuf = pos == 0 ? AC.BufferSlice() : AC._databuffer(data)
     d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
     return AC.Field(name, t; nullable), _constructedvalid(d)
+end
+
+"""
+Whether every inline value (at most 12 bytes) also sits at its row's position
+in `buffers[k]` from `start`, so the buffer holds all the rows' bytes in order.
+`offsets` are the rows' utf8 offsets.
+"""
+function _inlineinrun(payloads, offsets, buffers, k::Int, start::Int)
+    1 <= k <= length(buffers) || return false
+    buf = buffers[k]
+    total = Int(@inbounds offsets[length(payloads) + 1])
+    start >= 0 && start + total <= length(buf) || return false
+    GC.@preserve payloads buf begin
+        base = pointer(buf) + start
+        entries = Ptr{UInt8}(pointer(payloads))
+        @inbounds for i in eachindex(payloads)
+            len = Int(DataStrings.payloadlength(payloads[i]))
+            0 < len <= DataStrings.INLINE_MAX || continue
+            at = Int(offsets[i])
+            inline = entries + 16 * (i - 1) + 4
+            _sameinline(base + at, inline, len, start + at + 12 <= length(buf)) ||
+                return false
+        end
+    end
+    return true
+end
+
+# Whether `len` (at most 12) bytes at `a` equal those at `b`; `wide` says 12
+# bytes are readable at `a`, so whole words are compared.
+@inline function _sameinline(a::Ptr{UInt8}, b::Ptr{UInt8}, len::Int, wide::Bool)
+    if !wide
+        for j = 0:(len - 1)
+            unsafe_load(a + j) == unsafe_load(b + j) || return false
+        end
+        return true
+    end
+    low = len >= 8 ? typemax(UInt64) : (UInt64(1) << (8 * len)) - 1
+    (unsafe_load(Ptr{UInt64}(a)) ⊻ unsafe_load(Ptr{UInt64}(b))) & low == 0 || return false
+    len <= 8 && return true
+    high = (UInt32(1) << ((8 * (len - 8)) % UInt)) - UInt32(1)
+    return (unsafe_load(Ptr{UInt32}(a + 8)) ⊻ unsafe_load(Ptr{UInt32}(b + 8))) & high == 0
 end
 
 _stringview(context) = context !== nothing && context.stringview
