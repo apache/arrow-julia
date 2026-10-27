@@ -1494,6 +1494,20 @@ function Table(
     end
     budget = source isa IPCStream ? source.budget : _sourcebudget(source, readlimits)
     opened = _opensource(source; mmap=mmap, limits=readlimits, budget=budget)
+    if Sys.isunix() &&
+       mmap &&
+       scan === nothing &&
+       source isa AbstractString &&
+       opened isa ArrowFile
+        # A whole-table read touches every page of the mapping. One
+        # madvise maps them all at once (as Arrow C++ does for mapped
+        # reads), several times cheaper on macOS than a fault per page.
+        try
+            Mmap.madvise!(opened.region.root::Vector{UInt8}, Mmap.MADV_WILLNEED)
+        catch e
+            e isa SystemError || rethrow()
+        end
+    end
     return _tablefrom(opened, scan, budget; stringtype=stringtype)
 end
 
