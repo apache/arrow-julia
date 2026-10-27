@@ -75,8 +75,8 @@ jobs:
                           -e 's/"$//g')
           VERIFY_DEFAULT=0 dev/release/verify_rc.sh ${version} 100
   test:
-    name: ${{ matrix.pkg.name }} - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
-    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.pkg.name }} - Julia ${{ matrix.version }} - ${{ matrix.runner || matrix.os }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
+    runs-on: ${{ matrix.runner || matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -97,6 +97,11 @@ jobs:
         nthreads:
           - 1
           - 2
+        include:
+          # Julia 1.9's libopenlibm requires executable-stack support rejected by newer glibc.
+          - version: 'min'
+            os: ubuntu-latest
+            runner: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
@@ -174,6 +179,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
       - uses: julia-actions/julia-buildpkg@latest
       - uses: julia-actions/julia-docdeploy@latest
         env:
