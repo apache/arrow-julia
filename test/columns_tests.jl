@@ -116,8 +116,11 @@ end
         ])
         for file in (true, false)
             t = Arrow.Table(arrowbytes(parts; file=file))
-            @test t.x isa Arrow.ChainedVector{Int64,<:Arrow.Primitive}
-            @test t.x == [1, 2, 3] && sum(t.x) == 6 && copy(t.x) isa Vector{Int64}
+            # Several partitions declare every field nullable.
+            @test t.x isa Arrow.ChainedVector{Union{Missing,Int64},<:Arrow.Primitive}
+            @test t.x == [1, 2, 3] &&
+                  sum(t.x) == 6 &&
+                  copy(t.x) isa Vector{Union{Missing,Int64}}
             # One StringVector spans every batch.
             @test t.s isa StringVector && t.s == ["a", "bb", "a fairly long string value"]
             @test collect(t.c) == ["u", "v", "v"]
@@ -130,10 +133,10 @@ end
         @test length(collect(Arrow.Stream(empty))) == 2
         for source in (empty, ColumnsBytesSource(empty))
             s = Arrow.Table(source; scan=Tables.Scan())
-            @test isempty(s.x) && eltype(s.x) == Int8 && isempty(s.b)
+            @test isempty(s.x) && eltype(s.x) == Union{Missing,Int8} && isempty(s.b)
         end
         t = Arrow.Table(empty)
-        @test t.x[Int[]] == Int8[] && similar(t.x, 2) isa Vector{Int8}
+        @test t.x[Int[]] == Int8[] && similar(t.x, 2) isa Vector{Union{Missing,Int8}}
     end
 
     @testset "dictionary columns expose their encoding" begin
