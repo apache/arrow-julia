@@ -122,13 +122,15 @@ end
 
 """
 `f(args...; kwargs...)` without inferring the call (it dispatches at run
-time). The write path calls each column's construction, and code that other
-packages extend (a table's DataAPI metadata methods), this way: methods
-loaded later (DataFrames and its dependencies add some that Base's generic
-code dispatches to) then invalidate at most that code, instead of making the
-whole write path compile again.
+time, through `invokelatest`). Wherever a column's type is known only at run
+time, the reader and the writer call the typed work this way, as they do
+code that other packages extend (a table's DataAPI metadata methods): `f`
+then compiles for the concrete types alone, and methods loaded later
+(DataFrames and its dependencies add some that Base's generic code
+dispatches to) invalidate at most that code, instead of making the whole
+read or write path compile again.
 """
-_uninferred(f, args...; kwargs...) = Base.inferencebarrier(f)(args...; kwargs...)
+_uninferred(f, args...; kwargs...) = Base.invokelatest(f, args...; kwargs...)
 
 # One table through a one-shot writer: an error abandons the output (a path
 # destination keeps its old bytes or stays absent).
@@ -440,7 +442,7 @@ end
 # The table and partition types are not specialized on: columns dispatch on
 # their own types, so a new table type compiles no new writer code.
 Base.@nospecializeinfer function _writeparts!(w::Writer, @nospecialize(tbl))
-    retained = _retainedschema(tbl)::Union{Nothing,AC.Schema}
+    retained = _uninferred(_retainedschema, tbl)::Union{Nothing,AC.Schema}
     w.dictencode === false &&
         retained !== nothing &&
         (retained = _plainschema(retained, Tables.schema(tbl)))
@@ -498,8 +500,9 @@ Base.@nospecializeinfer function _writepartition!(
         names == w.names ||
         throw(
             ArgumentError(
-                "table column names $(names) do not match the schema columns " *
-                "$(w.names) (same names, same order)",
+                "table column names $(_uninferred(string, names)::String) do not match " *
+                "the schema columns $(_uninferred(string, w.names)::String) (same names, " *
+                "same order)",
             ),
         )
     # Arrow permits duplicate field names. Tables.getcolumn(cols, name)
@@ -706,7 +709,7 @@ function _partitionhints(w::Writer, columns, own)
             retainedown !== nothing ? length(retainedown) : 0
         col = columns[j]
         if col isa DictEncode
-            T = Base.nonmissingtype(eltype(col.data))
+            T = Base.nonmissingtype(_eltypeof(col.data))
             writetype = isconcretetype(T) ? T : nothing
             all(ismissing, col.data) ||
                 (hint = _dictionarypool(AbstractVector[col.data], hint; writetype))
@@ -1019,10 +1022,9 @@ function _nullablefield(f::AC.Field)
 end
 
 # The retained Arrow schema when the source is a facade read, else nothing.
-# Callers pass tables of any type, and inference considers no method for an
-# unknown one, so the writer's compiled code does not depend on the Stream
-# scan code (methods other packages add there would make it recompile).
-Base.Experimental.@max_methods 1 function _retainedschema end
+# Called through `_uninferred` with tables of any type, so the writer's
+# compiled code does not depend on the Stream scan code (methods other
+# packages add there would make it recompile).
 _retainedschema(t::Table) = getfield(t, :schema)
 _retainedschema(s::Stream) =
     getfield(s, :scan) === nothing ? _tableschema(getfield(s, :src)) :
@@ -1305,7 +1307,7 @@ function _schemaonly(retained, colmetadata)
     # Match colmetadata by name without interning the source's field names.
     colmetamap =
         colmetadata === nothing ? nothing :
-        Dict(String(k) => v for (k, v) in Dict(colmetadata))
+        _uninferred(Dict, (String(k)::String => v for (k, v) in Dict(colmetadata)))
     fields = AC.Field[]
     for f in retained.fields
         meta =
@@ -1425,7 +1427,7 @@ Base.@nospecializeinfer function _constructconforming(
     pool=nothing,
 )
     retainedfield = j -> sch.fields[j]
-    _retainedschema(tbl) === nothing || return _constructcolumns(
+    _uninferred(_retainedschema, tbl) === nothing || return _constructcolumns(
         names,
         partcols,
         partpools,
@@ -1534,7 +1536,7 @@ function _conformdictionary(
     et = expected.type::AC.DictionaryType
     vf = AC.dictvaluefield(expected, et)
     written === nothing && (written = last(_constructhiddenpart(vf, 0, context)))
-    if all(p -> eltype(p) === Missing, parts)
+    if all(p -> _eltypeof(p) === Missing, parts)
         expected.nullable || return nothing, nothing
         return (
             expected,
@@ -1582,7 +1584,10 @@ function _conformdictionary(
         ),
     )
     reindexed =
-        AC.ArrayData[_reindexdictionary(d, et, IT, remap, offset, pool) for d in data]
+    # `IT` is known at run time; see `_uninferred`.
+        AC.ArrayData[
+            _uninferred(_reindexdictionary, d, et, IT, remap, offset, pool) for d in data
+        ]
     return (expected, reindexed), nothing
 end
 
@@ -1593,7 +1598,8 @@ function _nulldictionary(t::AC.DictionaryType, n::Int, pool::AC.ArrayData)
     return AC.ArrayData(
         t,
         n,
-        [validity, AC._databuffer(zeros(IT, n))];
+        # `IT` is known at run time; see `_uninferred`.
+        [validity, _uninferred(AC._databuffer, zeros(IT, n))::AC.BufferSlice];
         dictionary=pool,
         nullcount=n,
     )
@@ -1816,7 +1822,7 @@ function _metapairs(m)
         kv isa Pair || throw(ArgumentError("metadata sequences must contain Pair values"))
         # Keys and values that are not strings are written as they print, as
         # DataAPI metadata is.
-        push!(out, _metastring(first(kv)) => _metastring(last(kv)))
+        push!(out, _metastring(first(kv))::String => _metastring(last(kv))::String)
     end
     return out
 end

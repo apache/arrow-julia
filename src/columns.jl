@@ -125,7 +125,8 @@ function _wrapbuffer(
         _chargeexact!(budget, S, n, "aligned buffer copy")
         out = Vector{S}(undef, Int(n))
         GC.@preserve out src begin
-            unsafe_copyto!(Ptr{UInt8}(pointer(out)), p, Int(src.len))
+            # `S` is known at run time; see `_uninferred`.
+            unsafe_copyto!(Ptr{UInt8}(_uninferred(pointer, out)::Ptr), p, Int(src.len))
         end
         return out
     end
@@ -785,10 +786,9 @@ function _forcestrings(p::_PendingStrings)
         c = @atomic :acquire p.column
         if c === nothing
             b = _allocate!(p.build)
-            _foreach(length(b.chunks), p.ntasks) do k, _
-                _buildchunk!(b, k)
-                return nothing
-            end
+            # `b`'s type is known at run time; see `_uninferred`.
+            build! = (k, _) -> (_buildchunk!(b, k); nothing)
+            _uninferred(_foreach, build!, length(b.chunks), p.ntasks)
             c = _finishbuild(b)
             @atomic :release p.column = c
         end
@@ -1248,7 +1248,7 @@ function _viewablelayout(f::AC.Field, depth::Int=0)
                all(viewable, entries.children)
     end
     t isa AC.StructType && return length(f.children) <= _MAX_ROW_FIELDS &&
-           allunique(c.name for c in f.children) &&
+           allunique(String[c.name for c in f.children]) &&
            all(viewable, f.children)
     t isa AC.UnionType && return !isempty(f.children) && all(viewable, f.children)
     return false
@@ -1354,7 +1354,8 @@ function _checktimes(f::AC.Field, t::AC.TimeType, d::AC.ArrayData, budget)
             ValidationError(
                 "column $(repr(f.name)): time-of-day value $x is outside [0, $perday) " *
                 "in its unit; read the column as durations since midnight with " *
-                "`scan=Tables.Scan(select=($(repr(Symbol(f.name))) => Dates.$P,))`",
+                "`scan=Tables.Scan(select=($(_uninferred(repr, Symbol(f.name))::String) " *
+                "=> Dates.$P,))`",
             ),
         )
     end
@@ -1418,7 +1419,7 @@ function _runendview(::Type{T}, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext)
     runs, values = d.children[1], d.children[2]
     R = AC.juliatype(runs.type::AC.IntType)
     _chargeexact!(ctx.budget, Int64, runs.len, "run ends")
-    runends = Int64.(_primitive(R, R, Nothing, runs, ctx.budget))
+    runends = _collectas(Int64, _primitive(R, R, Nothing, runs, ctx.budget))
     vcol = _viewcolumn(f.children[2], [values], ctx, T)
     return RunEndEncoded{T,typeof(vcol)}(runends, vcol, Int(d.offset), Int(d.len))
 end
@@ -1447,7 +1448,8 @@ function _viewcolumn(
     isempty(datas) && return T[]
     first = _viewbatch(T, f, datas[1], ctx)
     length(datas) == 1 && return first
-    return _chainviews(first, f, datas, ctx, T)
+    # `first`'s type is known at run time; see `_uninferred`.
+    return _uninferred(_chainviews, first, f, datas, ctx, T)
 end
 
 # A concretely typed chunk vector (a comprehension over `_batchview` would
@@ -1460,15 +1462,18 @@ function _chainviews(first::V, f::AC.Field, datas, ctx::_ViewContext, T::Type) w
     cols[1] = first
     for k = 2:length(datas)
         col = _viewbatch(T, f, datas[k], ctx)
-        col isa V || return ChainedVector(
-            AbstractVector{T}[
-                k == 1 ? first : _viewbatch(T, f, d, ctx) for (k, d) in enumerate(datas)
-            ],
-        )
+        # The abstract chain compiles apart (see `_uninferred`).
+        col isa V || return _uninferred(_mixedchainviews, first, f, datas, ctx, T)
         cols[k] = col
     end
     return ChainedVector(cols)
 end
+
+_mixedchainviews(first, f::AC.Field, datas, ctx::_ViewContext, T::Type) = ChainedVector(
+    AbstractVector{T}[
+        k == 1 ? first : _viewbatch(T, f, d, ctx) for (k, d) in enumerate(datas)
+    ],
+)
 
 # --- nested rows ----------------------------------------------------------------
 #
@@ -2063,12 +2068,14 @@ function _unionrows(@nospecialize(T::Type), f::AC.Field, d::AC.ArrayData, ctx::_
     t = f.type::AC.UnionType
     budget = ctx.budget
     cols = Tuple(
-        _viewcolumn(
-            c,
-            AC.ArrayData[d.children[k]],
-            ctx,
-            _vieweltype(c, AC.ArrayData[d.children[k]], ctx),
-        ) for (k, c) in enumerate(f.children)
+        Any[
+            _viewcolumn(
+                c,
+                AC.ArrayData[d.children[k]],
+                ctx,
+                _vieweltype(c, AC.ArrayData[d.children[k]], ctx),
+            ) for (k, c) in enumerate(f.children)
+        ],
     )
     n = Int(d.len)
     _chargeexact!(budget, T, n, "union rows")
@@ -2178,7 +2185,7 @@ function _tensorrows(@nospecialize(T::Type), f::AC.Field, d::AC.ArrayData, ctx, 
     shape, perm = shapeperm
     R = Base.nonmissingtype(T)
     child = _viewcolumn(f.children[1], AC.ArrayData[d.children[1]], ctx, eltype(R))
-    return _tensorrows(T, R, child, d, ctx.budget, shape, perm)
+    return _uninferred(_tensorrows, T, R, child, d, ctx.budget, shape, perm)
 end
 
 function _tensorrows(

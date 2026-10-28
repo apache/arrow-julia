@@ -755,7 +755,8 @@ function _lowerexpr(e, fields, names, ok::Base.RefValue{Bool}, budget=nothing)
             return e
         end
         _nativefacadeconversion(f) || return e
-        good, values = _lowermembership(f, e.values, budget)
+        # `e.values`' type is known at run time; see `_uninferred`.
+        good, values = _uninferred(_lowermembership, f, e.values, budget)::Tuple{Bool,Any}
         if !good
             ok[] = false
             return e
@@ -813,7 +814,7 @@ function _zonedliteral(f::AC.Field, x)
     zone === nothing && return x
     P = _timestampperiod(t.unit)
     if zone == "UTC"
-        z = _utcinstant(x)
+        z = _uninferred(_utcinstant, x)
         # In the column's unit when exact, so `Set` membership hashes alike.
         try
             return Durations.ZonedTimestamp{P,:UTC}(z)
@@ -825,7 +826,8 @@ function _zonedliteral(f::AC.Field, x)
     unit = nameof(P)
     throw(
         ArgumentError(
-            "column $(f.name) holds ZonedTimestamp{$unit, $(repr(Symbol(zone)))} values, " *
+            "column $(f.name) holds ZonedTimestamp{$unit, " *
+            "$(_uninferred(repr, Symbol(zone))::String)} values, " *
             "which do not compare with a $(nameof(typeof(x))); compare with an instant " *
             "such as `Durations.ZonedTimestamp{Dates.$unit,:UTC}(2020, 1, 1)`",
         ),
@@ -843,12 +845,8 @@ function _zonedliterals(e, fields, names)
         values = e.values
         # Only Base containers whose membership semantics survive a rebuild.
         (f === nothing || !(values isa Union{Tuple,Array,Set})) && return e
-        any(x -> x isa _ZonelessTime, values) || return e
-        lit(x) = _zonedliteral(f, x)
-        rebuilt =
-            values isa Tuple ? map(lit, values) :
-            values isa Set ? Set(lit(x) for x in values) : map(lit, values)
-        return Tables.In(e.lhs, rebuilt)
+        # `values`' type is known at run time; see `_uninferred`.
+        return _uninferred(_zonedin, e, f, values)::Tables.In
     elseif e isa Tables.AndExpr
         return Tables.AndExpr(
             Tables.ScanExpr[_zonedliterals(a, fields, names) for a in e.args],
@@ -861,6 +859,16 @@ function _zonedliterals(e, fields, names)
         return Tables.NotExpr(_zonedliterals(e.arg, fields, names))
     end
     return e
+end
+
+# `e` with its zone-free time values given `f`'s zone.
+function _zonedin(e::Tables.In, f, values)
+    any(x -> x isa _ZonelessTime, values) || return e
+    lit(x) = _zonedliteral(f, x)
+    rebuilt =
+        values isa Tuple ? map(lit, values) :
+        values isa Set ? Set(lit(x) for x in values) : map(lit, values)
+    return Tables.In(e.lhs, rebuilt)
 end
 
 function _zonedbound(b::Tables.BoundScan, fields, names)
@@ -1099,7 +1107,8 @@ function _resolvescan(scan::Tables.Scan, names, budget=nothing)
     _chargevector!(budget, Int, refcapacity, "scan resolver filter references")
     _resolverfilterwork!(scan.filter, names, budget)
     _chargeobject!(budget, 64, "resolved scan")
-    return Tables.resolve(scan, names)
+    # Not inferred: Tables resolves untyped selections (see `_uninferred`).
+    return _uninferred(Tables.resolve, scan, names)::Tables.BoundScan
 end
 
 function _compileboundscan(scan::Tables.Scan, fields, budget=nothing)
@@ -1148,7 +1157,9 @@ Tables.columnnames(t::_ScanColumns) = getfield(t, :names)
 Tables.getcolumn(t::_ScanColumns, i::Int) = getfield(t, :columns)[i]
 function Tables.getcolumn(t::_ScanColumns, name::Symbol)
     i = findfirst(==(name), getfield(t, :names))
-    i === nothing && throw(ArgumentError("no column $(repr(name)) in this scan result"))
+    i === nothing && throw(
+        ArgumentError("no column $(_uninferred(repr, name)::String) in this scan result"),
+    )
     return getfield(t, :columns)[i]
 end
 Tables.rowcount(t::_ScanColumns) = getfield(t, :nrows)
@@ -1188,9 +1199,9 @@ function _joinscanparts(f::Field, parts::Vector, budget=nothing)
     end
     length(parts) == 1 && return parts[1]
     total = sum(length, parts; init=0)
-    T = eltype(first(parts))
+    T = _eltypeof(first(parts))
     for part in Iterators.drop(parts, 1)
-        T = Base.promote_typejoin(T, eltype(part))
+        T = Base.promote_typejoin(T, _eltypeof(part))
     end
     _chargevector!(budget, T, total, "joined scan column")
     out = Vector{T}(undef, total)
@@ -1434,7 +1445,8 @@ function _sinkrows(sink::_ScanSink, decoded, rblen::Int64, skip::Int64, take::In
         )
         filtercolumns = AbstractVector[decoded[idx] for idx in sink.filteridx]
         raw = _ScanColumns(sink.filternames, filtercolumns, Int(rblen))
-        filtermask = Tables.filtermask(sink.bound, raw)
+        # Not inferred: Tables evaluates the filter on columns of any type.
+        filtermask = _uninferred(Tables.filtermask, sink.bound, raw)::AbstractVector{Bool}
         matches = count(identity, filtermask)
         _chargevector!(sink.budget, Int, matches, "scan matching rows")
         qualifying = findall(filtermask)
@@ -1486,8 +1498,12 @@ function _keeprows!(sink::_ScanSink, decoded, rows, rblen::Int64)
     whole = length(rows) == rblen
     for (k, c) in enumerate(sink.columns)
         source = decoded[c.index]
-        whole ||
-            _chargevector!(sink.budget, eltype(source), length(rows), "scan column slice")
+        whole || _chargevector!(
+            sink.budget,
+            _eltypeof(source),
+            length(rows),
+            "scan column slice",
+        )
         partidx = sink.partcounts[k] + 1
         partidx <= length(sink.parts[k]) ||
             throw(AssertionError("scan consumed more batches than its planned capacity"))
@@ -1511,7 +1527,8 @@ function _sinkresult(sink::_ScanSink)
             # is 0 and this resize cannot disturb a sibling.
             resize!(parts, sink.partcounts[k])
             col = _joinscanparts(sink.fields[c.index], parts, sink.budget)
-            c.type === nothing ? col : _applyoverride(c.type, col, sink.budget)
+            c.type === nothing ? col :
+            _uninferred(_applyoverride, c.type, col, sink.budget)
         end for (k, c) in enumerate(sink.columns)
     )
     return _scantable(outnames, outcols, sink.outrows, sink.budget)
@@ -2866,7 +2883,7 @@ function _executeplan(table, b::Tables.BoundScan, names::Vector{Symbol}, budget=
     else
         _chargefilterscratch!(budget, b.filter, nrows)
         _chargevector!(budget, Bool, nrows, "scan filter mask")
-        filtermask = Tables.filtermask(b, cols)
+        filtermask = _uninferred(Tables.filtermask, b, cols)::AbstractVector{Bool}
         matches = count(identity, filtermask)
         _chargevector!(budget, Int, matches, "scan matching rows")
         findall(filtermask)
@@ -2880,9 +2897,9 @@ function _executeplan(table, b::Tables.BoundScan, names::Vector{Symbol}, budget=
     outcols = (
         begin
             source = Tables.getcolumn(cols, c.index)
-            _chargevector!(budget, eltype(source), length(rows), "scan column slice")
+            _chargevector!(budget, _eltypeof(source), length(rows), "scan column slice")
             col = source[rows]
-            c.type === nothing ? col : _applyoverride(c.type, col, budget)
+            c.type === nothing ? col : _uninferred(_applyoverride, c.type, col, budget)
         end for c in b.columns
     )
     return _scantable(outnames, outcols, taken, budget)
@@ -2921,7 +2938,7 @@ end
 
 "Whether an output keeps its source field: no override, or a no-op one."
 _keepsfield(bc::Tables.BoundColumn, precol) =
-    bc.type === nothing || eltype(precol) <: Union{bc.type,Missing}
+    bc.type === nothing || _eltypeof(precol) <: Union{bc.type,Missing}
 
 """
 The OUTPUT schema of a scan: bound source fields under their output names.
@@ -2987,7 +3004,12 @@ function _finishfacadescan(
         for (i, bc) in enumerate(b.columns)
             f = sourcefields[bc.index]
             if !public && _periodoverride(bc, f)
-                columns[i] = _timeperiods(f.type, columns[i], Base.nonmissingtype(bc.type))
+                columns[i] = _uninferred(
+                    _timeperiods,
+                    f.type,
+                    columns[i],
+                    Base.nonmissingtype(bc.type),
+                )
                 # A real conversion: the output does not keep the time field.
                 push!(precols, Dates.Time[])
                 continue
@@ -3004,9 +3026,11 @@ function _finishfacadescan(
             base =
                 public ? columns[i] :
                 _scanview(f) ? _scanviewoutput(f, columns[i], views) :
-                _facadefromraw(f, columns[i], arrowtypes)
+                _uninferred(_facadefromraw, f, columns[i], arrowtypes)
             push!(precols, base)
-            columns[i] = bc.type === nothing ? base : _applyoverride(bc.type, base, budget)
+            columns[i] =
+                bc.type === nothing ? base :
+                _uninferred(_applyoverride, bc.type, base, budget)
         end
         # Dictionary columns keep their source category pool, as a full read
         # does, so a rewrite preserves category order (required when ordered).
@@ -3974,7 +3998,8 @@ end
 # batch.
 function _statcmp(f, a, b)
     return try
-        f(a, b) === false ? false : true
+        # Not inferred: statistics and literals are of any type.
+        _uninferred(f, a, b) === false ? false : true
     catch e
         e isa InterruptException && rethrow()
         e isa OutOfMemoryError && rethrow()
@@ -4025,6 +4050,11 @@ _trustedstatliteral(v, s) =
 # other object disables pruning and goes to the exact row filter untouched.
 _statsmembers(values::Union{Tuple,Array,BitArray,Set,BitSet}) = values
 _statsmembers(values) = nothing
+
+# Whether a batch with statistics `s` may hold one of `members`.
+_maycontainany(members, s) =
+    !all(v -> _trustedstatliteral(v, s), members) ||
+    any(_statcmp(>=, v, s.min) && _statcmp(>=, s.max, v) for v in members)
 
 """
 One-sided may-contain evaluation of a scan predicate against one batch's
@@ -4084,8 +4114,8 @@ function _maypass(
         unknownbounds(s) && return true
         members = _statsmembers(e.values)
         members === nothing && return true
-        all(v -> _trustedstatliteral(v, s), members) || return true
-        return any(_statcmp(>=, v, s.min) && _statcmp(>=, s.max, v) for v in members)
+        # `members`' type is known at run time; see `_uninferred`.
+        return _uninferred(_maycontainany, members, s)::Bool
     elseif e isa Tables.IsNull
         s = lookup(e.lhs)
         s === nothing && return true

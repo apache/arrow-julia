@@ -33,6 +33,9 @@ const _MAX_EXTENSION_WARNINGS = 16
 # Look a Symbol up without creating one: interning an input-controlled name
 # would permanently allocate process-global state.
 function _existingjlsymbol(name::AbstractString)
+    # Checked as a `String`: other packages add methods to the iteration of
+    # other string types.
+    name isa String || return _existingjlsymbol(String(name)::String)
     occursin('\0', name) && return nothing
     ncodeunits(name) <= _MAX_ARROWTYPE_SCHEMA_NAME_BYTES || return nothing
     pointer = ccall(:jl_symbol_lookup, Ptr{Cvoid}, (Cstring,), name)
@@ -132,9 +135,11 @@ _facadetoarrow(x::Union{Int128,UInt128}, field) = ArrowTypes._cast(NTuple{16,UIn
 function _facadefromarrow(T::Type, f::AC.Field, storage)
     name = _fieldmetavalue(f, _EXTENSION_NAME_KEY)
     (name === nothing || _facadejuliatype(name, typeof(storage)) !== T) && return nothing
-    T === UUIDs.UUID && return UUIDs.UUID(ntoh(ArrowTypes._cast(UInt128, storage)))
+    # `storage`'s type is known at run time; see `_uninferred`.
+    T === UUIDs.UUID &&
+        return UUIDs.UUID(ntoh(_uninferred(ArrowTypes._cast, UInt128, storage)::UInt128))
     T === Bool && return storage != 0
-    T <: Union{Int128,UInt128} && return ArrowTypes._cast(T, storage)
+    T <: Union{Int128,UInt128} && return _uninferred(ArrowTypes._cast, T, storage)
     T <: Union{Dates.Month,Dates.Year} && return convert(T, Dates.Month(storage))
     return convert(T, storage)
 end
@@ -276,6 +281,9 @@ function _extensionwarningname(
     name::AbstractString,
     budget::Union{Nothing,AllocationBudget}=nothing,
 )
+    # Measured as a `String`: other packages add methods to the iteration of
+    # other string types.
+    name isa String || return _extensionwarningname(String(name)::String, budget)
     ncodeunits(name) <= _MAX_EXTENSION_WARNING_BYTES && return name
     bytes = 0
     lastindex = 0
@@ -409,7 +417,11 @@ function _hasarrowtypesextension(f::AC.Field, plan::_ArrowTypesRoutePlan)
         "ArrowTypes extension-presence cache",
     ) do
         _arrowtypesextension(f) === nothing || return true
-        return any(child -> _hasarrowtypesextension(child, plan), f.children)
+        return _uninferred(
+            any,
+            child -> _hasarrowtypesextension(child, plan),
+            f.children,
+        )::Bool
     end
 end
 
@@ -443,7 +455,11 @@ function _needsarrowtypesroute(f::AC.Field, plan::_ArrowTypesRoutePlan)
         elseif t isa AC.UnionType && _hasarrowtypesextension(f, plan)
             return true
         end
-        return any(child -> _needsarrowtypesroute(child, plan), f.children)
+        return _uninferred(
+            any,
+            child -> _needsarrowtypesroute(child, plan),
+            f.children,
+        )::Bool
     end
 end
 
@@ -747,7 +763,11 @@ function _hasarrowtypesextension(f::AC.Field, ctx::_ArrowTypesContext)
         "ArrowTypes extension-presence cache",
     ) do
         _arrowtypesextension(f) === nothing || return true
-        return any(child -> _hasarrowtypesextension(child, ctx), f.children)
+        return _uninferred(
+            any,
+            child -> _hasarrowtypesextension(child, ctx),
+            f.children,
+        )::Bool
     end
 end
 
@@ -769,7 +789,7 @@ Base.@noinline function _arrowtypesrawstoragetype(T::Type)
     Base.@nospecialize T
     storage = _facadestoragetype(T)
     storage === nothing || return storage
-    return Base.inferencebarrier(ArrowTypes.ArrowType(Base.inferencebarrier(T)))
+    return _uninferred(ArrowTypes.ArrowType, T)
 end
 
 function _checkarrowtypesstorageshape!(
@@ -1073,11 +1093,11 @@ function _typedvalues(::Type{Any}, values, budget=nothing)
     _chargevector!(budget, Any, length(values), "ArrowTypes public column")
     # map(identity, …) keeps the input's own narrowed eltype for an Any
     # target instead of widening every column to Vector{Any}.
-    return map(identity, values)
+    return _uninferred(map, identity, values)
 end
 function _typedvalues(::Type{T}, values, budget=nothing) where {T}
     _chargevector!(budget, T, length(values), "ArrowTypes typed column")
-    return T[x for x in values]
+    return _collectas(T, values)
 end
 
 function _arrowtypesscalar(t::AC.ArrowType, x)
@@ -1499,9 +1519,9 @@ function _arrowtypesfromarrow(ctx::_ArrowTypesContext, T, f::AC.Field, storage)
     t = f.type
     if _arrowtypesutf8storage(ctx, f) && storage isa AbstractString
         T === Symbol && return _liftsymbol!(ctx, storage, f.name)
-        bytes = codeunits(storage)
+        bytes = _utf8units(storage)
         GC.@preserve storage bytes begin
-            return ArrowTypes.fromarrow(T, pointer(bytes), length(bytes))
+            return _uninferred(ArrowTypes.fromarrow, T, pointer(bytes), length(bytes))
         end
     elseif t isa AC.DictionaryType
         # The extension label lives on the dictionary field, but the shape
@@ -1613,6 +1633,8 @@ _maxnewsymbols(ctx::_ArrowTypesContext) =
     ctx.budget === nothing ? _DEFAULT_MAX_NEW_SYMBOLS : ctx.budget.maxnewsymbols
 
 function _liftsymbol!(ctx::_ArrowTypesContext, s::AbstractString, name::AbstractString)
+    # As a `String`: see `_existingjlsymbol`.
+    s isa String || return _liftsymbol!(ctx, String(s)::String, name)
     symbol = _existingjlsymbol(s)
     symbol === nothing || return symbol
     occursin('\0', s) && _symbolnulerror(ctx, s, name)

@@ -875,12 +875,12 @@ function validateschemafield(f::Field)
         ),
     )
     if f.type isa UnionType
-        length(f.type.typeids) == length(f.children) ||
+        typeids = (f.type::UnionType).typeids
+        length(typeids) == length(f.children) ||
             throw(ValidationError("union type-id count must equal child count"))
-        length(unique(f.type.typeids)) == length(f.type.typeids) ||
+        length(unique(typeids)) == length(typeids) ||
             throw(ValidationError("union type ids must be unique"))
-        all(>=(0), f.type.typeids) ||
-            throw(ValidationError("union type ids must be in [0, 127]"))
+        all(>=(0), typeids) || throw(ValidationError("union type ids must be in [0, 127]"))
     elseif f.type isa MapType
         entries = f.children[1]
         entries.type isa StructType &&
@@ -1010,7 +1010,7 @@ function _foreach(f::F, n::Int, ntasks::Int) where {F}
             end
         end
     end
-    tasks = [errormonitor(Threads.@spawn work(w)) for w = 2:nt]
+    tasks = Task[errormonitor(Threads.@spawn work(w)) for w = 2:nt]
     try
         work(1)
     finally

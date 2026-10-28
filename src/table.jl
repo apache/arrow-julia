@@ -132,9 +132,13 @@ end
 
 function _columnindex(t::Table, nm::Symbol)
     i = get(getfield(t, :lookup), nm, -1)
-    i == -1 && throw(ArgumentError("no column $(repr(nm)) in this table"))
+    i == -1 &&
+        throw(ArgumentError("no column $(_uninferred(repr, nm)::String) in this table"))
     i == 0 && throw(
-        ArgumentError("column name $(repr(nm)) is ambiguous; use positional column access"),
+        ArgumentError(
+            "column name $(_uninferred(repr, nm)::String) is ambiguous; use positional " *
+            "column access",
+        ),
     )
     return i
 end
@@ -313,7 +317,7 @@ const _MAX_TYPED_SCHEMA_FIELDS = 256
 
 function Tables.schema(t::Table)
     names = getfield(t, :names)
-    types = Type[eltype(c) for c in getfield(t, :columns)]
+    types = Type[_eltypeof(c) for c in getfield(t, :columns)]
     return Tables.Schema(names, types; stored=length(names) > _MAX_TYPED_SCHEMA_FIELDS)
 end
 Base.propertynames(t::Table) = getfield(t, :names)
@@ -1128,7 +1132,7 @@ function _publiccolumn(f::AC.Field, converted, budget=nothing; owned::Bool=false
     T === Any && return _narrowcopy(converted, budget, "facade public column")
     owned && converted isa Vector{T} && return converted
     _chargevector!(budget, T, length(converted), "facade public column")
-    return collect(T, converted)
+    return _collectas(T, converted)
 end
 
 # A claim the typed path resolves without boxing: concrete scalars,
@@ -1182,7 +1186,9 @@ function _storagebatchcolumn(f::AC.Field, d::AC.ArrayData, budget=nothing)
     # reference implementation does). Admit them in the claim rather than
     # refuse the read; conforming batches keep the Missing-free fast path.
     (Missing <: T || !_hasnulls(f, d)) || (T = Union{Missing,T})
-    return budget === nothing ? AC.materialize(T, f, d) : AC.materialize(T, f, d, budget)
+    # `T` is known at run time; see `_uninferred`.
+    return budget === nothing ? _uninferred(AC.materialize, T, f, d) :
+           _uninferred(AC.materialize, T, f, d, budget)
 end
 
 # The public-domain sibling of `_storagebatchcolumn`: identical typed path
@@ -1194,7 +1200,8 @@ function _publicbatchcolumn(f::AC.Field, d::AC.ArrayData, budget=nothing)
     T = _storageelementclaim(f)
     T === Any && return _publicdynamiccolumn(f, d, budget)
     (Missing <: T || !_hasnulls(f, d)) || (T = Union{Missing,T})
-    return budget === nothing ? AC.materialize(T, f, d) : AC.materialize(T, f, d, budget)
+    return budget === nothing ? _uninferred(AC.materialize, T, f, d) :
+           _uninferred(AC.materialize, T, f, d, budget)
 end
 
 "Materialize for the facade, retaining an ArrowTypes Union route when needed."
@@ -1262,9 +1269,9 @@ function _facadecolumn(
         col = parts[1]
     else
         total = sum(length, parts; init=0)
-        T = eltype(first(parts))
+        T = _eltypeof(first(parts))
         for part in Iterators.drop(parts, 1)
-            T = Base.promote_typejoin(T, eltype(part))
+            T = Base.promote_typejoin(T, _eltypeof(part))
         end
         _chargevector!(budget, T, total, "joined facade column")
         col = Vector{T}(undef, total)
@@ -1274,8 +1281,9 @@ function _facadecolumn(
             offset += length(part)
         end
     end
-    # `col` is a fresh batch materialization or the join just built.
-    return _facadefromraw(f, col, arrowtypes; owned=true)
+    # `col` is a fresh batch materialization or the join just built; its type
+    # is known at run time (see `_uninferred`).
+    return _uninferred(_facadefromraw, f, col, arrowtypes; owned=true)
 end
 
 function _facadesinglecolumn(f::AC.Field, d::AC.ArrayData, arrowtypes::_ArrowTypesContext)
@@ -1988,7 +1996,7 @@ function _mergecategorypools(pools; widen::Bool=false, budget=nothing)
     end
     capacity <= typemax(Int) ||
         throw(AC.ValidationError("merged category pool is not addressable"))
-    T = widen ? Any : eltype(first(pools))
+    T = widen ? Any : _eltypeof(first(pools))
     _chargevector!(budget, T, capacity, "merged category pool")
     _chargedict!(budget, Any, Nothing, capacity, "category identity index")
     out = Vector{T}()

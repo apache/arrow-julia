@@ -129,9 +129,13 @@ function _constructsharedpart(name, v, ::Type{D}) where {D<:DataDecimals.Decimal
     )
     P, S, _ = D.parameters
     t = AC.DecimalType(P, S, P <= 38 ? 128 : 256)
-    return _retaineddecimal(AC.Field(name, t; nullable=Missing <: eltype(v)), v)
+    f = AC.Field(name, t; nullable=Missing <: _eltypeof(v))
+    # `v`'s type is known at run time; see `_uninferred`.
+    return _uninferred(_retaineddecimal, f, v)::Tuple{AC.Field,AC.ArrayData}
 end
 function _constructsharedpart(name, v, ::Type{Durations.Duration})
     t = AC.IntervalType(AC.MONTH_DAY_NANO)
-    return _retainedinterval(AC.Field(name, t; nullable=Missing <: eltype(v)), v)
+    f = AC.Field(name, t; nullable=Missing <: _eltypeof(v))
+    # `v`'s type is known at run time; see `_uninferred`.
+    return _uninferred(_retainedinterval, f, v)::Tuple{AC.Field,AC.ArrayData}
 end

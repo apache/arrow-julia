@@ -1110,7 +1110,7 @@ function _checkgrowth(growth::Symbol, file::Bool)
         throw(ArgumentError("dictionary growth must be :delta, :replace, or :defer"))
     growth === (file ? :replace : :defer) && throw(
         ArgumentError(
-            "dictionary growth $(repr(growth)) needs the " *
+            "dictionary growth :$growth needs the " *
             (file ? "stream" : "file") *
             " format",
         ),

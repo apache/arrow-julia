@@ -64,13 +64,13 @@ Base.@nospecializeinfer function _nativepart(
     @nospecialize(v::AbstractVector),
     context,
 )
-    T = Base.nonmissingtype(eltype(v))
+    T = Base.nonmissingtype(_eltypeof(v))
     # With TimeZones loaded, a fresh ZonedDateTime column writes as a
     # timezone-declared millisecond timestamp (ext/ArrowTimeZonesExt.jl)
     # instead of reflecting the zone's whole transition table as a struct.
-    zoned = _zonednativepart(name, v, T)
+    zoned = _uninferred(_zonednativepart, name, v, T)
     zoned === nothing || return zoned
-    if eltype(v) === Missing
+    if _eltypeof(v) === Missing
         t = AC.NullType()
         return AC.Field(name, t; nullable=true),
         AC.ArrayData(t, length(v), AC.BufferSlice[]; nullcount=length(v))
@@ -83,7 +83,7 @@ Base.@nospecializeinfer function _nativepart(
             ),
         )
     elseif T <: Union{DataDecimals.Decimal,Durations.Duration}
-        return _constructsharedpart(name, v, T)
+        return _uninferred(_constructsharedpart, name, v, T)
     elseif T <: Durations.Timestamp
         isconcretetype(T) || throw(
             ArgumentError(
@@ -91,7 +91,8 @@ Base.@nospecializeinfer function _nativepart(
                 "type $T; give the column one concrete resolution",
             ),
         )
-        return _constructtemporalpart(
+        return _uninferred(
+            _constructtemporalpart,
             name,
             v,
             AC.TimestampType(_instantunit(T), nothing),
@@ -106,28 +107,32 @@ Base.@nospecializeinfer function _nativepart(
                 "convert the values with Durations.astimezone first",
             ),
         )
-        return _constructtemporalpart(
+        return _uninferred(
+            _constructtemporalpart,
             name,
             v,
-            AC.TimestampType(_instantunit(T), Durations.zonename(T)),
+            AC.TimestampType(_instantunit(T), Durations.zonename(T)::String),
             x -> Int64(Dates.value(x)),
         )
     elseif T <: Dates.Date
-        return _constructtemporalpart(
+        return _uninferred(
+            _constructtemporalpart,
             name,
             v,
             AC.DateType(AC.DAY),
             x -> Int32(Dates.value(x) - _EPOCH_DAYS),
         )
     elseif T <: Dates.DateTime
-        return _constructtemporalpart(
+        return _uninferred(
+            _constructtemporalpart,
             name,
             v,
             AC.TimestampType(AC.MILLISECOND, nothing),
             x -> Int64(Dates.value(x) - Dates.UNIXEPOCH),
         )
     elseif T <: Dates.Time
-        return _constructtemporalpart(
+        return _uninferred(
+            _constructtemporalpart,
             name,
             v,
             AC.TimeType(AC.NANOSECOND, 64),
@@ -139,23 +144,31 @@ Base.@nospecializeinfer function _nativepart(
             T <: Dates.Second ? AC.SECOND :
             T <: Dates.Millisecond ? AC.MILLISECOND :
             T <: Dates.Microsecond ? AC.MICROSECOND : AC.NANOSECOND
-        return _constructtemporalpart(
+        return _uninferred(
+            _constructtemporalpart,
             name,
             v,
             AC.DurationType(unit),
             x -> Int64(Dates.value(x)),
         )
     elseif T <: Union{Dates.Week,Dates.Day,Dates.Hour,Dates.Minute}
-        return _constructtemporalpart(name, v, AC.DurationType(AC.SECOND), _periodseconds)
+        return _uninferred(
+            _constructtemporalpart,
+            name,
+            v,
+            AC.DurationType(AC.SECOND),
+            _periodseconds,
+        )
     elseif T <: Union{Dates.Month,Dates.Year}
-        return _constructtemporalpart(
+        return _uninferred(
+            _constructtemporalpart,
             name,
             v,
             AC.IntervalType(AC.YEAR_MONTH),
             _periodmonths,
         )
     elseif T <: NamedTuple
-        any(ismissing, v) && throw(
+        _uninferred(any, ismissing, v)::Bool && throw(
             ArgumentError(
                 "column $name has nullable NamedTuple rows that require the " *
                 "recursive column adapter",
@@ -174,10 +187,10 @@ Base.@nospecializeinfer function _nativepart(
         # an all-missing nullable child into `Missing[]`, so neither can
         # recover its Arrow descriptor.
         context === nothing && (context = _WriterContext())
-        children = [
+        children = Any[
             _constructpart(
                 String(fieldname(T, i)),
-                collect(fieldtype(T, i), (getfield(x, i) for x in v));
+                _uninferred(collect, fieldtype(T, i), (getfield(x, i) for x in v));
                 context,
             ) for i = 1:fieldcount(T)
         ]
@@ -196,23 +209,25 @@ Base.@nospecializeinfer function _nativepart(
             nullcount=0,
         )
     elseif T <: AbstractString
-        _stringview(context) && return _retainedview(
-            AC.Field(name, AC.ViewType(true); nullable=Missing <: eltype(v)),
+        _stringview(context) && return _uninferred(
+            _retainedview,
+            AC.Field(name, AC.ViewType(true); nullable=Missing <: _eltypeof(v)),
             v,
         )
-        return _varbytespart(name, v, AC.Utf8Type(_largelists(context)))
+        return _uninferred(_varbytespart, name, v, AC.Utf8Type(_largelists(context)))
     elseif T <: AbstractVector{UInt8}
-        _stringview(context) && return _retainedview(
-            AC.Field(name, AC.ViewType(false); nullable=Missing <: eltype(v)),
+        _stringview(context) && return _uninferred(
+            _retainedview,
+            AC.Field(name, AC.ViewType(false); nullable=Missing <: _eltypeof(v)),
             v,
         )
-        return _varbytespart(name, v, AC.BinaryType(_largelists(context)))
+        return _uninferred(_varbytespart, name, v, AC.BinaryType(_largelists(context)))
     elseif T === Any || (T <: AbstractVector && eltype(T) === Any)
         # Materialized facade columns are Any-eltype for composite layouts;
         # one narrowing pass recovers list columns (inner vectors narrow
         # element-wise, empties adopt the joined element type).
-        w = _narrowlists(v, _errname(context, name))
-        NW = Base.nonmissingtype(eltype(w))
+        w = _uninferred(_narrowlists, v, _errname(context, name))
+        NW = Base.nonmissingtype(_eltypeof(w))
         (NW === Any || (NW <: AbstractVector && eltype(NW) === Any)) && throw(
             ArgumentError(
                 "column $(_errname(context, name)) has element type Any and cannot " *
@@ -224,22 +239,30 @@ Base.@nospecializeinfer function _nativepart(
         # The facade list builder builds the child like a column, so public
         # leaf values lower at every depth.
         context === nothing && (context = _WriterContext())
-        return _arrowtypeslistcolumn(name, v, T; extension_shape=false, context)
+        return _uninferred(
+            _arrowtypeslistcolumn,
+            name,
+            v,
+            T;
+            extension_shape=false,
+            context,
+        )
     elseif T === Bool
-        return _boolpart(name, v)
+        return _uninferred(_boolpart, name, v)
     elseif T <: _FixedPrimitive
         t = AC.arrowtype_for(T)
-        if eltype(v) === T
-            data = _fixedbuffer(v)
-            data === nothing && return AC.fromjulia(name, _plainvector(v))
+        if _eltypeof(v) === T
+            data = _uninferred(_fixedbuffer, v)
+            data === nothing && return _uninferred(AC.fromjulia, name, _plainvector(v))
             return AC.Field(name, t; nullable=false),
             AC.ArrayData(t, length(v), [AC.BufferSlice(), data]; nullcount=0)
         end
-        vals, validity, nc = _nullablevalues(T, v, zero(T))
+        vals, validity, nc = _uninferred(_nullablevalues, T, v, zero(T))::Tuple
         return AC.Field(name, t; nullable=true),
         AC.ArrayData(t, length(v), [validity, AC._databuffer(vals)]; nullcount=nc)
     else
-        return AC.fromjulia(name, _plainvector(v))
+        # The vector's type is known at run time; see `_uninferred`.
+        return _uninferred(AC.fromjulia, name, _plainvector(v))
     end
 end
 
@@ -270,7 +293,7 @@ function _boolpart(name::String, v::AbstractVector)
     nc = n - valid
     t = AC.BoolType()
     validity = nc == 0 ? AC.BufferSlice() : AC._databuffer(bits)
-    return AC.Field(name, t; nullable=Missing <: eltype(v)),
+    return AC.Field(name, t; nullable=Missing <: _eltypeof(v)),
     AC.ArrayData(t, n, [validity, AC._databuffer(values)]; nullcount=nc)
 end
 
@@ -302,9 +325,9 @@ Base.@nospecializeinfer function _partof(
     narrowabstract::Bool,
 )
     context === nothing && (context = _WriterContext())
-    if eltype(v) === Any
-        narrowed = _narrowlists(v, _errname(context, name))
-        eltype(narrowed) === Any && throw(
+    if _eltypeof(v) === Any
+        narrowed = _uninferred(_narrowlists, v, _errname(context, name))
+        _eltypeof(narrowed) === Any && throw(
             ArgumentError(
                 "column $(_errname(context, name)) has element type Any and cannot " *
                 "be narrowed to a writable Arrow column; give it a concrete element type",
@@ -312,21 +335,24 @@ Base.@nospecializeinfer function _partof(
         )
         return _constructpart(name, narrowed; context)
     end
-    nested = _nestedpart(name, v, context)
+    nested = _uninferred(_nestedpart, name, v, context)
     nested === nothing || return nested
     if narrowabstract
-        runtimeparts = _narrowabstractwriterparts(name, AbstractVector[v], context)
+        runtimeparts =
+            _uninferred(_narrowabstractwriterparts, name, AbstractVector[v], context)
         if runtimeparts !== nothing
             narrowed = only(runtimeparts)
             # Julia can canonicalize a Union of concrete Tuple runtime types
             # back to the original abstract declaration, so eltype may be
             # unchanged. One narrowing pass is enough; recursing on the same
             # declaration would loop.
-            eltype(narrowed) === eltype(v) ||
+            _eltypeof(narrowed) === _eltypeof(v) ||
                 return _constructpart(name, narrowed; context, narrowabstract=false)
         end
     end
-    return _arrowtypes_needs(v, context) ? _constructarrowtypespart(name, v; context) :
+    # The builders compile for the column's own type (see `_uninferred`).
+    return _uninferred(_arrowtypes_needs, v, context)::Bool ?
+           _uninferred(_constructarrowtypespart, name, v; context) :
            _constructnativepart(name, v; context)
 end
 
@@ -372,7 +398,7 @@ a struct or fixed-size list with missing rows whose non-nullable children
 cannot hide placeholder slots (see `_hidevalidity`).
 """
 function _nestedpart(name::String, @nospecialize(v::AbstractVector), context)
-    kind = _nestedkind(context, Base.nonmissingtype(eltype(v)))
+    kind = _nestedkind(context, Base.nonmissingtype(_eltypeof(v)))
     kind === nothing && return nothing
     # Dispatching on the kind compiles only the matching builder for `v`'s type.
     return _nestedbuild(Val(kind), name, v, context)
@@ -503,7 +529,7 @@ _changedrows(name) = ArgumentError("column $name changed while it was being writ
 
 # A list column read from Arrow already holds its rows' values in order, as a
 # child of element type `E`; its values are that child, sliced.
-_storedlist(@nospecialize(v), E) = v isa ListVector && eltype(v.values) === E
+_storedlist(@nospecialize(v), E) = v isa ListVector && _eltypeof(v.values) === E
 function _storedlistvalues(name::String, @nospecialize(v::ListVector), offsets)
     lo, hi = GC.@preserve v Int(v.offsets[1]), Int(v.offsets[end])
     hi - lo == offsets[end] || throw(_changedrows(name))
@@ -529,7 +555,7 @@ end
 function _listpart(name::String, @nospecialize(v::AbstractVector), context)
     large = _largelists(context)
     offsets, validity, nc = _listoffsets(name, v, large ? Int64 : Int32, _pool(context))
-    E = eltype(Base.nonmissingtype(eltype(v)))
+    E = eltype(Base.nonmissingtype(_eltypeof(v)))
     errname = _errname(context, name)
     values =
         _storedlist(v, E) ? _storedlistvalues(errname, v, offsets) :
@@ -543,7 +569,7 @@ function _listpart(name::String, @nospecialize(v::AbstractVector), context)
         children=AC.ArrayData[cd],
         nullcount=nc,
     )
-    return AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[cf]), d
+    return AC.Field(name, t; nullable=Missing <: _eltypeof(v), children=AC.Field[cf]), d
 end
 
 """
@@ -624,7 +650,7 @@ function _rowchild(V::Type, v, name::String, T::Type, hidden::Bool, context)
 end
 
 function _structpart(name::String, v::AbstractVector, context)
-    NT = Base.nonmissingtype(eltype(v))
+    NT = Base.nonmissingtype(_eltypeof(v))
     present = Bool[x !== missing for x in v]
     nc = count(!, present)
     hidden = nc > 0
@@ -647,13 +673,13 @@ function _structpart(name::String, v::AbstractVector, context)
         children,
         nullcount=nc,
     )
-    return AC.Field(name, t; nullable=Missing <: eltype(v), children=fields), d
+    return AC.Field(name, t; nullable=Missing <: _eltypeof(v), children=fields), d
 end
 
 # A struct column read from Arrow writes its children as stored, slots under
 # null rows included, so no child needs hiding.
 function _structpart(name::String, @nospecialize(v::StructVector), context)
-    NT = Base.nonmissingtype(eltype(v))
+    NT = Base.nonmissingtype(_eltypeof(v))
     n = length(v)
     validity, nc = _storedvalidity(v.validity, v.bitoffset, n, _pool(context))
     fields = AC.Field[]
@@ -666,11 +692,11 @@ function _structpart(name::String, @nospecialize(v::StructVector), context)
     end
     t = AC.StructType()
     d = AC.ArrayData(t, n, [validity]; children, nullcount=nc)
-    return AC.Field(name, t; nullable=Missing <: eltype(v), children=fields), d
+    return AC.Field(name, t; nullable=Missing <: _eltypeof(v), children=fields), d
 end
 
 function _fixedlistpart(name::String, v::AbstractVector, context)
-    NT = Base.nonmissingtype(eltype(v))
+    NT = Base.nonmissingtype(_eltypeof(v))
     N = fieldcount(NT)
     E = fieldtype(NT, 1)
     present = Bool[x !== missing for x in v]
@@ -686,7 +712,7 @@ function _fixedlistpart(name::String, v::AbstractVector, context)
         children=AC.ArrayData[cd],
         nullcount=nc,
     )
-    return AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[cf]), d
+    return AC.Field(name, t; nullable=Missing <: _eltypeof(v), children=AC.Field[cf]), d
 end
 
 _maptypes(::Type{T}) where {T<:AbstractDict} = (keytype(T), valtype(T))
@@ -695,7 +721,7 @@ _maptypes(::Type{T}) where {T<:AbstractVector} =
 
 "The entries of `v`'s map rows back to back, as `_listoffsets` counted them."
 function _mapentries(name::String, ::Type{P}, v::AbstractVector, offsets) where {P}
-    R = Base.nonmissingtype(eltype(v))
+    R = Base.nonmissingtype(_eltypeof(v))
     R <: AbstractVector && eltype(R) === P && return _listvalues(name, P, v, offsets)
     entries = Vector{P}(undef, Int(offsets[end]))
     i0 = firstindex(v) - 1
@@ -713,7 +739,7 @@ function _mapentries(name::String, ::Type{P}, v::AbstractVector, offsets) where 
 end
 
 function _mappart(name::String, v::AbstractVector, context)
-    R = Base.nonmissingtype(eltype(v))
+    R = Base.nonmissingtype(_eltypeof(v))
     K, V = _maptypes(R)
     offsets, validity, nc = _listoffsets(name, v, Int32, _pool(context))
     entries = _mapentries(_errname(context, name), Pair{K,V}, v, offsets)
@@ -776,7 +802,7 @@ function _mapcolumn(name, @nospecialize(v), offsets, validity, nc, nentries, kf,
         children=AC.ArrayData[ed],
         nullcount=nc,
     )
-    return AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[ef]), d
+    return AC.Field(name, t; nullable=Missing <: _eltypeof(v), children=AC.Field[ef]), d
 end
 
 """
@@ -988,7 +1014,8 @@ function _observedtype(v::AbstractVector, name="")
             ArgumentError(
                 (isempty(name) ? "a column" : "column $name") *
                 " holds values of " *
-                "more than $_MAX_INFERRED_WRITER_TYPES types ($(join(types, ", ")), " *
+                "more than $_MAX_INFERRED_WRITER_TYPES types " *
+                "($(_uninferred(join, types, ", ")::String), " *
                 "$T, ...); give it a concrete element type",
             ),
         )
@@ -1008,7 +1035,7 @@ function _narrowlists(v::AbstractVector, name="")
     # inner maps narrow each row, the outer map narrows the column.
     w = map(x -> x isa AbstractVector ? map(identity, x) : x, v)
     w = map(identity, w)
-    NT = Base.nonmissingtype(eltype(w))
+    NT = Base.nonmissingtype(_eltypeof(w))
     _abstractnonnative(NT) && return _collectas(_observedtype(w, name), w)
     NT !== Union{} && NT <: AbstractVector || return w
     # Join the inner element types (empties narrow to Union{} and would
@@ -1032,7 +1059,7 @@ function _narrowlists(v::AbstractVector, name="")
         isempty(values) || (E = _observedtype(values, name))
     end
     E === Any && return w
-    hasm = eltype(w) >: Missing
+    hasm = _eltypeof(w) >: Missing
     S = hasm ? Union{Missing,Vector{E}} : Vector{E}
     return S[x === missing ? missing : convert(Vector{E}, x) for x in w]
 end
@@ -1053,8 +1080,8 @@ function _constructpart(
     if d isa AC.ArrayData &&
        d.offset == 0 &&
        d.len == length(v) &&
-       !(Base.nonmissingtype(eltype(v)) <: Union{Tuple,Int128,UInt128})
-        f, _ = _constructnativepart(name, eltype(v)[]; context)
+       !(Base.nonmissingtype(_eltypeof(v)) <: Union{Tuple,Int128,UInt128})
+        f, _ = _constructnativepart(name, _eltypeof(v)[]; context)
         AC.typeequal(f.type, d.type) && return f, _viewbuffers(d)
     end
     return invoke(
@@ -1101,7 +1128,7 @@ function _constructpart(
 )
     p = _payloadparent(v)
     utf8 = p isa DataStrings.StringVector
-    nullable = Missing <: eltype(v)
+    nullable = Missing <: _eltypeof(v)
     if _stringview(context)
         # View entries are the payloads themselves, so a row range copies them.
         payloads = v isa _PayloadRows ? collect(_payloadentries(v)) : p.payloads
@@ -1569,7 +1596,7 @@ function _varbytespart(name::String, v::AbstractVector, t, ::Type{Offset}) where
         if x === missing
             nc += 1
         else
-            m = _nbytes(x)
+            m = _nbytes(x)::Int
             pos <= typemax(Offset) - m || throw(_OffsetOverflow(name, 0, i))
             pos += m
             bits[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7)
@@ -1591,7 +1618,7 @@ function _varbytespart(name::String, v::AbstractVector, t, ::Type{Offset}) where
         nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
     databuf = pos == 0 ? AC.BufferSlice() : AC._databuffer(data)
     d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
-    return AC.Field(name, t; nullable=Missing <: eltype(v)), _constructedvalid(d)
+    return AC.Field(name, t; nullable=Missing <: _eltypeof(v)), _constructedvalid(d)
 end
 
 # Offsets built here never decrease and end at the data length, and the null
@@ -1603,7 +1630,7 @@ end
 
 "Concrete Vector with an exact Union{Missing,T} or T eltype for fromjulia."
 function _plainvector(v::AbstractVector)
-    T = eltype(v)
+    T = _eltypeof(v)
     return v isa Vector{T} ? v : _collectas(T, v)
 end
 
@@ -1621,18 +1648,18 @@ _utf8units(x::AbstractString) = codeunits((x isa String ? x : String(x))::String
 _collectas(::Type{T}, v::AbstractVector) where {T} = copyto!(Vector{T}(undef, length(v)), v)
 
 _missings_to(::Type{S}, v) where {S} =
-    eltype(v) >: Missing ? Union{Missing,S}[x === missing ? missing : S(x) for x in v] :
+    _eltypeof(v) >: Missing ? Union{Missing,S}[x === missing ? missing : S(x) for x in v] :
     S[S(x) for x in v]
 
 "Construct temporal ArrayData from nullable Int64 storage values."
 function _temporaldata(t::AC.ArrowType, storage::AbstractVector)
-    _, d0 = AC.fromjulia("storage", storage)
+    _, d0 = _uninferred(AC.fromjulia, "storage", storage)::Tuple{AC.Field,AC.ArrayData}
     # Narrow to Int32 for any 32-bit temporal descriptor (Date32 fresh,
     # Time32 retained); every other temporal layout keeps the inferred Int64
     # buffer.
     buffers = d0.buffers
     if AC.primwidth(t) == 4
-        narrow = Vector{Int32}(undef, length(storage))
+        narrow = Vector{Int32}(undef, length(storage)::Int)
         for (i, x) in enumerate(storage)
             narrow[i] = x === missing ? Int32(0) : Int32(x)
         end
@@ -1660,7 +1687,7 @@ function _constructtemporalpart(
     S = AC.primwidth(t) == 4 ? Int32 : Int64
     vals, validity, nc = _nullablevalues(S, v, zero(S), x -> S(tostorage(x)))
     d = AC.ArrayData(t, length(v), [validity, AC._databuffer(vals)]; nullcount=nc)
-    return AC.Field(name, t; nullable=eltype(v) >: Missing), d
+    return AC.Field(name, t; nullable=_eltypeof(v) >: Missing), d
 end
 
 # ArrowTypes write adapter. ArrowCore intentionally stays conversion-free;
@@ -1669,11 +1696,12 @@ end
 "Stable metadata merge; `extra` wins except for protected extension labels."
 function _mergemetapairs(base, extra; protectextension::Bool=false)
     out = Pair{String,String}[]
-    base === nothing || append!(out, String(first(kv)) => String(last(kv)) for kv in base)
+    base === nothing ||
+        append!(out, String(first(kv))::String => String(last(kv))::String for kv in base)
     extra === nothing && return isempty(out) ? nothing : out
     for kv in extra
-        key = String(first(kv))
-        value = String(last(kv))
+        key = String(first(kv))::String
+        value = String(last(kv))::String
         i = findfirst(p -> first(p) == key, out)
         if protectextension &&
            (key == _EXTENSION_NAME_KEY || key == _EXTENSION_METADATA_KEY) &&
@@ -1794,7 +1822,7 @@ _arrowtypesneedsvalue(x, context, depth::Int=0) =
     ) === true
 
 function _arrowtypes_needs(v::AbstractVector, context)
-    T = eltype(v)
+    T = _eltypeof(v)
     _writerneedstype!(context, T) && return true
     # Abstract/Any containers do not expose nested logical types. Inspect only
     # until the first ArrowTypes value is found; concrete columns, and Unions
@@ -1831,7 +1859,7 @@ function _arrowtypesstorageisspecified(context, T::Type, path::Vector{Type}=Type
     T in path && throw(
         ArgumentError(
             "recursive ArrowTypes storage schema: " *
-            join((string(S) for S in (path..., T)), " -> "),
+            _uninferred(join, (string(S) for S in (path..., T)), " -> ")::String,
         ),
     )
     push!(path, T)
@@ -1916,7 +1944,7 @@ function _writertoarrow(context, value, writertype::Type, fallback::String, fiel
         throw(
             ArgumentError(
                 "ArrowTypes.toarrow for writer type $writertype failed for " *
-                "column $column: $(sprint(showerror, err))",
+                "column $column: $(_uninferred(sprint, showerror, err)::String)",
             ),
         )
     end
@@ -1978,7 +2006,7 @@ function _writerloweredcolumn(
 end
 
 function _arrowtypesmappedcolumn(name::String, v::AbstractVector, declared, context)
-    S = eltype(v)
+    S = _eltypeof(v)
     logical = Base.nonmissingtype(S)
     storage = Missing <: S ? Union{Missing,declared} : declared
     # Buffer builders index from 1; a non-one-based vector must go through
@@ -2020,7 +2048,8 @@ function _arrowtypesmappedcolumn(name::String, v::AbstractVector, declared, cont
         # shape evidence, so the column is written as Arrow Null (what
         # ToArrow returns: Missing[]).
         fallbacktype =
-            _arrowtypesconcreteorunion(S) ? eltype(ArrowTypes.ToArrow(v)) : Missing
+            _arrowtypesconcreteorunion(S) ?
+            _eltypeof(_uninferred(ArrowTypes.ToArrow, v)::AbstractVector) : Missing
         return _writerconvertedcolumn(fallbacktype, lowered, context, logical, name)
     end
     resulttype = reduce(_writerpromoteunion, observed)
@@ -2034,15 +2063,23 @@ function _constructarrowtypespart(
     extension_shape::Bool=false,
     context=nothing,
 )
-    logical = Base.nonmissingtype(eltype(v))
+    logical = Base.nonmissingtype(_eltypeof(v))
     # `Base.nonmissingtype(Missing) === Union{}`. Handle a pure-null child
     # before trait dispatch: bottom is a subtype of every container type and
     # would otherwise enter an unrelated ArrowKind branch.
-    eltype(v) === Missing && return _constructnativepart(name, v; context)
+    _eltypeof(v) === Missing && return _constructnativepart(name, v; context)
     logical === Union{} && return _constructnativepart(name, v; context)
     context === nothing && (context = _WriterContext())
     return _withwriterschema(context, logical) do
-        _constructarrowtypespart_impl(name, v, logical; extension_shape, context)
+        # `v`'s type is known at run time; see `_uninferred`.
+        _uninferred(
+            _constructarrowtypespart_impl,
+            name,
+            v,
+            logical;
+            extension_shape,
+            context,
+        )
     end
 end
 
@@ -2060,14 +2097,14 @@ function _constructarrowtypespart_impl(
     # column with the Struct layout ArrowTypes declares for VersionNumber.
     if logical === VersionNumber
         mapped =
-            eltype(v) >: Missing ?
+            _eltypeof(v) >: Missing ?
             Union{Missing,String}[x === missing ? missing : string(x) for x in v] :
             String[string(x) for x in v]
         f, d = _constructnativepart(name, mapped; context)
         return _arrowtypeslogicalfield(context, f, logical), d
     end
     declared = _writerstoragetype!(context, logical)
-    if Missing <: eltype(v) &&
+    if Missing <: _eltypeof(v) &&
        !(declared isa Union) &&
        _writerkind!(context, declared) isa ArrowTypes.NullKind
         throw(
@@ -2078,7 +2115,7 @@ function _constructarrowtypespart_impl(
             ),
         )
     end
-    if Missing <: eltype(v) && declared isa Union && Missing <: declared
+    if Missing <: _eltypeof(v) && declared isa Union && Missing <: declared
         throw(
             ArgumentError(
                 "ArrowTypes logical type $logical uses Missing as a storage Union " *
@@ -2120,7 +2157,7 @@ function _constructarrowtypespart_impl(
     # A logical type stored as Arrow Null is not nullable unless the column
     # itself admits missing; otherwise the label's own values would read back
     # as missing.
-    nullable = f.type isa AC.NullType && !(Missing <: eltype(v)) ? false : f.nullable
+    nullable = f.type isa AC.NullType && !(Missing <: _eltypeof(v)) ? false : f.nullable
     return _arrowtypeslogicalfield(context, f, logical; nullable=nullable), d
 end
 
@@ -2130,30 +2167,38 @@ function _arrowtypesstoragecolumn(
     extension_shape::Bool,
     context,
 )
-    eltype(v) === Missing && return _constructnativepart(name, v; context)
-    S = Base.nonmissingtype(eltype(v))
+    _eltypeof(v) === Missing && return _constructnativepart(name, v; context)
+    S = Base.nonmissingtype(_eltypeof(v))
     S === Union{} && return _constructnativepart(name, v; context)
     if S isa Union
-        return _arrowtypesunioncolumn(name, v; extension_shape, context)
+        return _uninferred(_arrowtypesunioncolumn, name, v; extension_shape, context)
     end
     _arrowtypesnativetype(S) && return _constructnativepart(name, v; context)
-    S <: NamedTuple && return _arrowtypesstructcolumn(name, v, S; extension_shape, context)
+    S <: NamedTuple &&
+        return _uninferred(_arrowtypesstructcolumn, name, v, S; extension_shape, context)
     kind = _writerkind!(context, S)
     if kind isa ArrowTypes.NullKind
         nulls = S === Nothing ? fill(missing, length(v)) : v
         return _constructnativepart(name, nulls; context)
     end
     if kind isa ArrowTypes.FixedSizeListKind
-        return _arrowtypesfixedlistcolumn(name, v, kind; extension_shape, context)
+        return _uninferred(
+            _arrowtypesfixedlistcolumn,
+            name,
+            v,
+            kind;
+            extension_shape,
+            context,
+        )
     elseif kind isa ArrowTypes.MapKind
-        return _arrowtypesmapcolumn(name, v, S; extension_shape, context)
+        return _uninferred(_arrowtypesmapcolumn, name, v, S; extension_shape, context)
     elseif kind isa ArrowTypes.ListKind
         if S <: Union{AbstractString,AbstractVector{UInt8}}
             return _constructnativepart(name, v; context)
         end
-        return _arrowtypeslistcolumn(name, v, S; extension_shape, context)
+        return _uninferred(_arrowtypeslistcolumn, name, v, S; extension_shape, context)
     elseif kind isa ArrowTypes.StructKind
-        return _arrowtypesstructcolumn(name, v, S; extension_shape, context)
+        return _uninferred(_arrowtypesstructcolumn, name, v, S; extension_shape, context)
     elseif kind isa Union{ArrowTypes.PrimitiveKind,ArrowTypes.BoolKind}
         return _constructnativepart(name, v; context)
     end
@@ -2207,7 +2252,7 @@ function _arrowtypesunioncolumn(
     extension_shape::Bool,
     context,
 )
-    variants = _checkedwritervariants("Arrow Union column $name", eltype(v))
+    variants = _checkedwritervariants("Arrow Union column $name", _eltypeof(v))
 
     childvalues = Any[T[] for T in variants]
     typeids = Vector{Int8}(undef, length(v))
@@ -2217,7 +2262,7 @@ function _arrowtypesunioncolumn(
         pos === nothing && throw(
             ArgumentError(
                 "Arrow Union column $name contains $(typeof(x)), which is not in " *
-                "its declared element type $(eltype(v))",
+                "its declared element type $(_eltypeof(v))",
             ),
         )
         child = childvalues[pos]
@@ -2262,7 +2307,7 @@ function _arrowtypeschildcolumn(
     union_member::Bool=false,
     context,
 )
-    T = Base.nonmissingtype(eltype(v))
+    T = Base.nonmissingtype(_eltypeof(v))
     union_member &&
         T === AbstractString &&
         return _constructnativepart(name, _missings_to(String, v); context)
@@ -2312,7 +2357,8 @@ function _arrowtypeslistcolumn(
     end
     childfield, childdata = _arrowtypeschildcolumn("item", flat; extension_shape, context)
     t = AC.ListType(large)
-    field = AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[childfield])
+    field =
+        AC.Field(name, t; nullable=Missing <: _eltypeof(v), children=AC.Field[childfield])
     data = AC.ArrayData(
         t,
         length(v),
@@ -2406,11 +2452,10 @@ end
 
 # A typed read's struct row is a `NamedTuple`; a materialized one is an
 # ordered `Pair` vector. These values are declared `Any`, and the field comes
-# back through an inference barrier: inferring its exact type makes Julia
-# 1.10 with code coverage fail in `any`/`all` over the values ("fatal error
-# in type inference (type bound)").
-_retainedchildvalue(row::NamedTuple, child::Int) =
-    Base.inferencebarrier(getfield(row, child))
+# back through `_uninferred`: inferring its exact type makes Julia 1.10 with
+# code coverage fail in `any`/`all` over the values ("fatal error in type
+# inference (type bound)").
+_retainedchildvalue(row::NamedTuple, child::Int) = _uninferred(getfield, row, child)
 _retainedchildvalue(row, child::Int) = last(row[firstindex(row) + child - 1])
 
 "A writer-side Union route retained until dense or sparse child construction."
@@ -2524,7 +2569,8 @@ const _MAX_WRITER_SCHEMA_DEPTH = 64
 function _withwriterschema(f, context::_WriterContext, T::Type)
     Base.@nospecialize T
     if T in context.schema
-        path = join((string(S) for S in (context.schema..., T)), " -> ")
+        path =
+            _uninferred(join, (string(S) for S in (context.schema..., T)), " -> ")::String
         throw(ArgumentError("recursive ArrowTypes storage schema: $path"))
     end
     length(context.schema) < _MAX_WRITER_SCHEMA_DEPTH || throw(
@@ -2585,9 +2631,11 @@ function _writerextensionlabel(T::Type)
         _EXTENSION_METADATA_KEY => "",
     ]
     ArrowTypes.hasarrowname(T) || return nothing
+    # Asserted: the label methods are inferred for any `T`, and a `String` of an
+    # unknown value would convert through methods other packages add.
     return Pair{String,String}[
-        _EXTENSION_NAME_KEY => String(ArrowTypes.arrowname(T)),
-        _EXTENSION_METADATA_KEY => String(ArrowTypes.arrowmetadata(T)),
+        _EXTENSION_NAME_KEY => String(ArrowTypes.arrowname(T))::String,
+        _EXTENSION_METADATA_KEY => String(ArrowTypes.arrowmetadata(T))::String,
     ]
 end
 
@@ -2643,12 +2691,14 @@ function _writercandidatefield!(
                 field = AC.Field("", uniontype; nullable=Missing in variants, children)
                 return _arrowtypeslogicalfield(context, field, T; nullable=field.nullable)
             end
-            field, _ = _arrowtypesstoragecolumn(
+            # `storage` is known at run time; see `_uninferred`.
+            field, _ = _uninferred(
+                _arrowtypesstoragecolumn,
                 "",
                 storage[];
                 extension_shape=nestedshape,
                 context,
-            )
+            )::Tuple{AC.Field,Any}
             # Null-storage nullability rule: see _constructarrowtypespart_impl.
             nullable = field.type isa AC.NullType && T !== Missing ? false : field.nullable
             return _arrowtypeslogicalfield(context, field, T; nullable)
@@ -3265,7 +3315,7 @@ Returns nothing when the declaration cannot be narrowed from runtime evidence.
 function _narrowabstractwriterparts(name::String, parts, context::_WriterContext)
     logical = nothing
     for part in parts
-        declared = Base.nonmissingtype(eltype(part))
+        declared = Base.nonmissingtype(_eltypeof(part))
         declared in (Union{}, Any) && continue
         if !isconcretetype(declared) && !(declared isa Union)
             logical === nothing ? (logical = declared) :
@@ -3284,8 +3334,8 @@ function _narrowabstractwriterparts(name::String, parts, context::_WriterContext
     needsruntime = false
     nullable = false
     for part in parts
-        declared = Base.nonmissingtype(eltype(part))
-        nullable |= Missing <: eltype(part)
+        declared = Base.nonmissingtype(_eltypeof(part))
+        nullable |= Missing <: _eltypeof(part)
         declared in (Union{}, logical) ||
             (isconcretetype(declared) && declared <: logical) ||
             return nothing
@@ -3351,7 +3401,11 @@ end
 function _widenednamedtuple(observed)
     names = fieldnames(first(observed))
     all(T -> T <: NamedTuple && fieldnames(T) === names, observed) || return nothing
-    types = ntuple(i -> Union{(fieldtype(T, i) for T in observed)...}, length(names))
+    types = _uninferred(
+        ntuple,
+        i -> Union{(fieldtype(T, i) for T in observed)...},
+        length(names),
+    )::Tuple
     return NamedTuple{names,Tuple{types...}}
 end
 
@@ -3368,7 +3422,7 @@ function _inferredstoragelogical(parts, target)
     target === nothing || return target
     logical = nothing
     for part in parts
-        T = Base.nonmissingtype(eltype(part))
+        T = Base.nonmissingtype(_eltypeof(part))
         T === Union{} && continue
         isconcretetype(T) || return nothing
         logical === nothing ? (logical = T) : logical === T || return nothing
@@ -3381,11 +3435,11 @@ function _inferredstoragedeclaration(parts, context::_WriterContext; target=noth
     logical === nothing && return nothing
     logical === VersionNumber && return nothing
     for part in parts
-        T = Base.nonmissingtype(eltype(part))
+        T = Base.nonmissingtype(_eltypeof(part))
         T in (Union{}, logical) && continue
         target !== nothing &&
             T === Any &&
-            all(value -> value === missing || value isa logical, part) &&
+            _uninferred(all, value -> value === missing || value isa logical, part)::Bool &&
             continue
         return nothing
     end
@@ -3417,7 +3471,7 @@ function _inferredstorageplan(
     nullable = false
     logicalseen = Base.IdSet{Type}()
     for (partition, part) in enumerate(parts)
-        nullable |= Missing <: eltype(part)
+        nullable |= Missing <: _eltypeof(part)
         values = Any[]
         sizehint!(values, length(part))
         for value in part
@@ -3543,7 +3597,7 @@ function _registeredwritercolumnplan(context::_WriterContext, f::AC.Field, value
     schemaseen = Base.IdSet{Type}()
     sawmissing = false
     for values in valueparts
-        declared = Base.nonmissingtype(eltype(values))
+        declared = Base.nonmissingtype(_eltypeof(values))
         declared in (Union{}, Any) ||
             declared <: target ||
             throw(
@@ -4476,7 +4530,7 @@ function _writerpushstorage!(
     writertype::Type,
     context::_WriterContext,
 )
-    stored = _writerconvertlowered(eltype(storage), value, context, writertype, f.name)
+    stored = _writerconvertlowered(_eltypeof(storage), value, context, writertype, f.name)
     push!(storage, stored)
     return nothing
 end
@@ -4601,7 +4655,7 @@ function _constructmaskedfixedleaf(
     n = length(values)
     placeholder = _writerhiddenstorage(f; forcevalid=true)
     storedplaceholder = _writerconvertlowered(S, placeholder, projection.context, S, f.name)
-    data = fill(storedplaceholder, n)
+    data = _uninferred(fill, storedplaceholder, n)::Vector
     validity, nullcount = _maskedleafvalidity(f, n)
     for index in eachindex(values)
         raw = values[index]
@@ -4614,7 +4668,9 @@ function _constructmaskedfixedleaf(
         data[index] = stored
         nullcount = _maskedleafpresent!(validity, index, nullcount)
     end
-    return _maskedleafarray(f, n, validity, AC._databuffer(data), nullcount)
+    # `data`'s element type is known at run time; see `_uninferred`.
+    buffer = _uninferred(AC._databuffer, data)::AC.BufferSlice
+    return _maskedleafarray(f, n, validity, buffer, nullcount)
 end
 
 function _constructmaskedvarbytesleaf(
@@ -4635,7 +4691,7 @@ function _constructmaskedvarbytesleaf(
     ::Type{Offset},
 ) where {S,Offset<:Union{Int32,Int64},V<:_MaskedChildValues}
     t = f.type::Union{AC.Utf8Type,AC.BinaryType}
-    n = length(values)
+    n = length(values)::Int
     offsets = Vector{Offset}(undef, n + 1)
     offsets[1] = zero(Offset)
     data = UInt8[]
@@ -4683,7 +4739,11 @@ function _constructmaskedleaf(f::AC.Field, values, projection::_MaskedLeafProjec
     values isa _MaskedChildValues || return nothing
     isempty(f.children) || return nothing
     f.type isa AC.DictionaryType && return nothing
-    any(row -> row === missing || row === _RETAINED_HIDDEN, values.rows) || return nothing
+    _uninferred(
+        any,
+        row -> row === missing || row === _RETAINED_HIDDEN,
+        values.rows,
+    )::Bool || return nothing
     T = _declaredeltype(f, false)
     T === Any && return nothing
     S = Base.nonmissingtype(T)
@@ -4716,13 +4776,17 @@ function _constructmaskedwriterleaf(
     values isa _MaskedChildValues || return nothing
     isempty(f.children) || return nothing
     f.type isa AC.DictionaryType && return nothing
-    any(row -> row === missing || row === _RETAINED_HIDDEN, values.rows) || return nothing
+    _uninferred(
+        any,
+        row -> row === missing || row === _RETAINED_HIDDEN,
+        values.rows,
+    )::Bool || return nothing
     storage = _writerstoragevector(f)
-    eltype(storage) === Any && return nothing
+    _eltypeof(storage) === Any && return nothing
 
     hidden = _writerhiddenvalue(f, writetype)
     storedhidden =
-        _writerconvertlowered(eltype(storage), hidden, context, writetype, f.name)
+        _writerconvertlowered(_eltypeof(storage), hidden, context, writetype, f.name)
     resize!(storage, length(values))
     fill!(storage, storedhidden)
     for index in eachindex(values)
@@ -4730,7 +4794,7 @@ function _constructmaskedwriterleaf(
         value === _RETAINED_HIDDEN && continue
         lowered = _writerconvertedvalue(context, f, value, writetype, routes)
         storage[index] =
-            _writerconvertlowered(eltype(storage), lowered, context, writetype, f.name)
+            _writerconvertlowered(_eltypeof(storage), lowered, context, writetype, f.name)
     end
     return _constructwriterstorage(f, storage, context)
 end
@@ -4744,7 +4808,7 @@ function _constructwriterchild(
 )
     masked = _constructmaskedwriterleaf(f, writetype, values, routes, context)
     masked === nothing || return masked
-    hashidden = any(value -> value === _RETAINED_HIDDEN, values)
+    hashidden = _uninferred(any, value -> value === _RETAINED_HIDDEN, values)::Bool
     hidden = hashidden ? _writerhiddenvalue(f, writetype) : nothing
     prepared, deferred = _withwritercollection(context) do
         out = Any[]
@@ -4843,7 +4907,7 @@ function _arrowtypesfixedlistcolumn(
         emptyfield = AC.Field(
             name,
             t;
-            nullable=Missing <: eltype(v),
+            nullable=Missing <: _eltypeof(v),
             children=AC.Field[emptychildfield],
         )
         if _writercompactfixednull(emptyfield)
@@ -4879,7 +4943,8 @@ function _arrowtypesfixedlistcolumn(
         childfield, childdata = masked
     end
     t = AC.FixedSizeListType(N)
-    field = AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[childfield])
+    field =
+        AC.Field(name, t; nullable=Missing <: _eltypeof(v), children=AC.Field[childfield])
     data = AC.ArrayData(
         t,
         length(v),
@@ -4894,8 +4959,8 @@ end
 function _fixedbinarypart(name::String, v::AbstractVector, N::Int)
     T = NTuple{N,UInt8}
     t = AC.FixedSizeBinaryType(N)
-    field = AC.Field(name, t; nullable=Missing <: eltype(v))
-    if eltype(v) === T
+    field = AC.Field(name, t; nullable=Missing <: _eltypeof(v))
+    if _eltypeof(v) === T
         data = something(_fixedbuffer(v), AC._databuffer(collect(T, v)))
         return field, AC.ArrayData(t, length(v), [AC.BufferSlice(), data]; nullcount=0)
     end
@@ -4942,7 +5007,7 @@ function _arrowtypesstructcolumn(
         push!(childdata, cd)
     end
     t = AC.StructType()
-    field = AC.Field(name, t; nullable=Missing <: eltype(v), children=childfields)
+    field = AC.Field(name, t; nullable=Missing <: _eltypeof(v), children=childfields)
     data = AC.ArrayData(
         t,
         length(v),
@@ -5011,7 +5076,7 @@ function _arrowtypesmapcolumn(
     )
     t = AC.MapType(false)
     field =
-        AC.Field(name, t; nullable=Missing <: eltype(v), children=AC.Field[entriesfield])
+        AC.Field(name, t; nullable=Missing <: _eltypeof(v), children=AC.Field[entriesfield])
     data = AC.ArrayData(
         t,
         length(v),
@@ -5211,7 +5276,7 @@ _isbool8(f::AC.Field) =
     f.type == AC.IntType(8, true) &&
     _fieldmetavalue(f, _EXTENSION_NAME_KEY) == "arrow.bool8"
 _bool8storage(v::AbstractVector) =
-    Missing <: eltype(v) ? Union{Missing,Int8}[x isa Bool ? Int8(x) : x for x in v] :
+    Missing <: _eltypeof(v) ? Union{Missing,Int8}[x isa Bool ? Int8(x) : x for x in v] :
     Int8[x isa Bool ? Int8(x) : x for x in v]
 
 function _retainedfield(f::AC.Field; children=collect(AC.Field, f.children))
@@ -5251,12 +5316,12 @@ function _retainedvarbytes(f::AC.Field, v::AbstractVector, pool=nothing)
                 _payloadparent(v).buffers,
                 t,
                 Offset,
-                Missing <: eltype(v),
+                Missing <: _eltypeof(v),
                 pool,
             )
         else
             V = utf8 ? AbstractString : AbstractVector{UInt8}
-            Base.nonmissingtype(eltype(v)) <: V ||
+            Base.nonmissingtype(_eltypeof(v)) <: V ||
                 all(x -> x === missing || x isa V, v) ||
                 throw(
                     ArgumentError(
@@ -5316,7 +5381,7 @@ end
 
 function _retainedfixedbytes(f::AC.Field, v::AbstractVector)
     t = f.type::AC.FixedSizeBinaryType
-    if Base.nonmissingtype(eltype(v)) === NTuple{t.nbytes,UInt8}
+    if Base.nonmissingtype(_eltypeof(v)) === NTuple{t.nbytes,UInt8}
         _, d = _fixedbinarypart(f.name, v, t.nbytes)
         AC.nullcount(d) > 0 &&
             !f.nullable &&
@@ -5394,7 +5459,7 @@ end
 # the precision check is `validate_full`'s.
 function _decimaldata(f::AC.Field, v::AbstractVector, ::Type{D}) where {D}
     t = f.type
-    if eltype(v) === D
+    if _eltypeof(v) === D
         data = something(_fixedbuffer(v), AC._databuffer(collect(D, v)))
         return AC.ArrayData(t, length(v), [AC.BufferSlice(), data]; nullcount=0)
     end
@@ -5415,7 +5480,7 @@ _widendecimals(::Type{H}, ::Type{T}, v) where {H,T} =
 
 function _retaineddecimal(f::AC.Field, v::AbstractVector)
     t = f.type::AC.DecimalType
-    D = Base.nonmissingtype(eltype(v))
+    D = Base.nonmissingtype(_eltypeof(v))
     if _shareddecimal(t)
         H = _decimalhost(t)
         D === H && return _retainedfield(f), _decimaldata(f, v, D)
@@ -6223,7 +6288,7 @@ function _constructretainedpart(
     v::AbstractVector,
     ::_WriterContext,
 )
-    eltype(v) === Missing || throw(
+    _eltypeof(v) === Missing || throw(
         ArgumentError(
             "column $(f.name) no longer matches its retained Arrow NullType; " *
             "give it a Missing element type",
@@ -6251,7 +6316,7 @@ function _checkretainedidentity(f::AC.Field, t::AC.ArrowType, v::AbstractVector)
     # value is read.
     Fp = _facadebasetype(t)
     if Fp !== Any
-        NT = Base.nonmissingtype(eltype(v))
+        NT = Base.nonmissingtype(_eltypeof(v))
         NT <: Fp ||
             NT === Union{} ||
             _retainedwritertype(t, NT) ||
@@ -6262,7 +6327,7 @@ function _checkretainedidentity(f::AC.Field, t::AC.ArrowType, v::AbstractVector)
                     "replaced with incompatible data",
                 ),
             )
-        eltype(v) >: Missing &&
+        _eltypeof(v) >: Missing &&
             !f.nullable &&
             throw(
                 ArgumentError(
@@ -6321,7 +6386,7 @@ function _constructretainedpart(
     ::_WriterContext,
 )
     _checkretainedidentity(f, t, v)
-    return _retaineddecimal(f, v)
+    return _uninferred(_retaineddecimal, f, v)::Tuple{AC.Field,AC.ArrayData}
 end
 
 function _constructretainedpart(
@@ -6331,7 +6396,7 @@ function _constructretainedpart(
     ::_WriterContext,
 )
     _checkretainedidentity(f, t, v)
-    return _retainedinterval(f, v)
+    return _uninferred(_retainedinterval, f, v)::Tuple{AC.Field,AC.ArrayData}
 end
 
 function _constructretainedpart(
@@ -6663,7 +6728,7 @@ end
 function _dictvaluetype(vals)
     T = Union{}
     for v in vals
-        V = Base.nonmissingtype(eltype(v))
+        V = Base.nonmissingtype(_eltypeof(v))
         V === Union{} || (T = typejoin(T, V))
     end
     return T
@@ -6684,7 +6749,7 @@ function _dictionarypool(vals, retainedpool; writetype=nothing)
         # values after a public pool read back, DataStrings after Strings):
         # widen the value type instead of converting.
         pool = _collectas(
-            _widenedtype(eltype(retainedpool), _dictvaluetype(vals)),
+            _widenedtype(_eltypeof(retainedpool), _dictvaluetype(vals)),
             retainedpool,
         )
     end
@@ -6814,7 +6879,7 @@ function _dictionaryevidence(
     context::_WriterContext,
     observed::Union{Nothing,Vector{Type}}=nothing,
 )
-    declared = Base.nonmissingtype(eltype(values))
+    declared = Base.nonmissingtype(_eltypeof(values))
     if !isconcretetype(declared) && !(declared isa Union)
         # Empty/all-missing abstract vectors cannot identify ArrowTypes metadata
         # (for example, a parametric logical tag). Let a later concrete partition
@@ -6848,7 +6913,7 @@ function _dictionaryvaluefield(
     allobserved = Type[]
     observations = Vector{Union{Nothing,Vector{Type}}}(undef, length(values))
     for (partition, part) in enumerate(values)
-        declared = Base.nonmissingtype(eltype(part))
+        declared = Base.nonmissingtype(_eltypeof(part))
         if !isconcretetype(declared) && !(declared isa Union)
             observations[partition] = _observeddictionarytypes(name, part)
             allobserved = _mergewritertypes(
@@ -7091,7 +7156,7 @@ end
 _hasrefpool(x::AbstractVector) =
     DataAPI.refpool(x) !== nothing &&
     DataAPI.refarray(x) !== x &&
-    Base.nonmissingtype(eltype(x)) !== Union{}
+    Base.nonmissingtype(_eltypeof(x)) !== Union{}
 _hasrefpool(::Any) = false
 
 """
@@ -7101,12 +7166,14 @@ through `DataAPI.unwrap`; a mapped element type keeps its values so its
 ArrowTypes.jl lowering applies.
 """
 function _refpoolvalues(x::AbstractVector)
-    T = Base.nonmissingtype(eltype(x))
+    T = Base.nonmissingtype(_eltypeof(x))
     mapped = ArrowTypes.ArrowType(T) !== T || ArrowTypes.arrowname(T) !== Symbol()
     pool = DataAPI.refpool(x)
-    unwrap = !mapped && any(v -> v !== missing && DataAPI.unwrap(v) !== v, pool)
+    unwrap =
+        !mapped &&
+        _uninferred(any, v -> v !== missing && DataAPI.unwrap(v) !== v, pool)::Bool
     values = unwrap ? [DataAPI.unwrap(v) for v in x] : x
-    hint = Base.nonmissingtype(eltype(values))[]
+    hint = Base.nonmissingtype(_eltypeof(values))[]
     # Iterate: CategoricalArrays' ref pool is indexed from zero.
     for v in pool
         v === missing || push!(hint, unwrap ? DataAPI.unwrap(v) : v)
@@ -7186,7 +7253,7 @@ function _constructcolumnparts(
     )
     if retained !== nothing && _isbool8(retained)
         # arrow.bool8 reads as Bool; its storage is Int8 0 or 1.
-        int8parts = AbstractVector[_bool8storage(p) for p in parts]
+        int8parts = AbstractVector[_uninferred(_bool8storage, p) for p in parts]
         _, int8data = _constructcolumnparts(
             name,
             int8parts;
@@ -7205,7 +7272,9 @@ function _constructcolumnparts(
         _WriterContext(fieldname; stringview, largelists, pool=dictintent ? nothing : pool)
     # A ref-pool column written as its values still unwraps them.
     if !dictintent && any(_hasrefpool, parts)
-        parts = AbstractVector[_hasrefpool(p) ? first(_refpoolvalues(p)) : p for p in parts]
+        parts = AbstractVector[
+            _hasrefpool(p) ? first(_uninferred(_refpoolvalues, p)::Tuple) : p for p in parts
+        ]
     end
     # Built by calls this function does not infer (see `_uninferred`).
     field, data =
@@ -7243,7 +7312,7 @@ function _dictcolumnparts(name, fieldname, parts, poolhints, retained, growable,
         poolhints = copy(poolhints)
         for k in eachindex(values)
             _hasrefpool(values[k]) || continue
-            values[k], hint = _refpoolvalues(values[k])
+            values[k], hint = _uninferred(_refpoolvalues, values[k])::Tuple
             poolhints[k] === nothing && (poolhints[k] = hint)
         end
     end
@@ -7301,7 +7370,7 @@ function _dictcolumnparts(name, fieldname, parts, poolhints, retained, growable,
                 ),
             )
         for valuespart in values
-            T = Base.nonmissingtype(eltype(valuespart))
+            T = Base.nonmissingtype(_eltypeof(valuespart))
             if retainedvaluefield === nothing
                 publictype = _facadebasetype(retained.type)
                 # Any string writes to a utf8 pool.
@@ -7424,9 +7493,10 @@ function _dictcolumnparts(name, fieldname, parts, poolhints, retained, growable,
             valuefield,
             valuedata,
             indices[1];
-            nullable=any(v -> Missing <: eltype(v), values),
+            nullable=any(v -> Missing <: _eltypeof(v), values),
             indextype,
-            ordered=all(_isordered, parts),
+            # ArrowCategoricalArraysExt adds an `_isordered` method.
+            ordered=_uninferred(all, _isordered, parts)::Bool,
         )
     else
         field, data[1] = _retaineddictfromdata(
