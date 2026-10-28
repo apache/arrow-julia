@@ -187,9 +187,9 @@ end
 """
     Arrow.AllocationLimitError
 
-Thrown when a reader exhausts `Limits.max_total_allocated_bytes`. This budget
-covers package-controlled fetch, decode, scan, ArrowTypes, and facade
-materialization allocations for one read.
+Thrown when a read needs more memory than its allocation budget: `max_allocation_ratio`
+bytes per byte of input, at least 256 MiB and at most `max_total_allocated_bytes`
+([`Arrow.Limits`](@ref)). The message names the fields to raise for trusted input.
 """
 struct AllocationLimitError <: Exception
     msg::String

@@ -414,12 +414,12 @@ end
 # --- dictionary encoding ----------------------------------------------------------
 
 """
-    Arrow.DictEncoded{T,R,P,I} <: Arrow.ArrowVector{T}
+    Arrow.DictEncoded{T} <: Arrow.ArrowVector{T}
 
-A dictionary-encoded column: zero-based codes of type `R` (the index vector
-`I`, `missing` where null) into the value pool `P`. `DataAPI.refarray`, `DataAPI.refpool`, and
-`DataAPI.levels` expose the encoding without decoding it, and `copy`
-returns a `PooledArray`.
+A dictionary-encoded column: each row is an index into a pool of values.
+`DataAPI.refarray`, `DataAPI.refpool`, and `DataAPI.levels` (in dictionary order)
+expose the encoding without decoding it, and `copy` returns a `PooledArray`. With
+CategoricalArrays loaded, `isordered` tells whether the dictionary is ordered.
 """
 struct DictEncoded{T,R,P<:AbstractVector,I<:AbstractVector} <: ArrowVector{T}
     indices::I

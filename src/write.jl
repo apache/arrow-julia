@@ -25,10 +25,9 @@
 """
     Arrow.DictEncode(v)
 
-Mark a column for dictionary encoding: the writer builds a category pool and
-encodes slots as integer indices into it. Fresh pools coalesce exact Arrow
-storage values. A retained rewrite may preserve unused or duplicate physical
-categories because pool order and index meaning are part of the encoded data.
+Wrap a column to write it dictionary encoded: each distinct value is stored once, in the
+dictionary, and each row as an index into it. A wrapped column stays encoded with
+`dictencode=false`.
 """
 struct DictEncode{T,V<:AbstractVector{T}} <: AbstractVector{T}
     data::V
@@ -51,9 +50,9 @@ return `sink`. The one-argument form curries: `table |> Arrow.write(sink)`.
 Keywords:
 - `file`: `true` writes the random-access file format (`ARROW1` magic and
   footer), `false` the stream format. A path gets the file format and an `IO`
-  the stream format by default, as in Arrow 2.x: a reader at the other end of
-  a pipe or socket (`Arrow.Stream`, pyarrow's `ipc.open_stream`) gets each
-  record batch as it is written.
+  the stream format by default, so a reader at the other end of a pipe or
+  socket (`Arrow.Stream`, pyarrow's `ipc.open_stream`) gets each record batch
+  as it is written.
 - `compress`: `nothing`, `:lz4`, or `:zstd`; `compresslevel` sets the codec's
   level (LZ4 up to 12, Zstandard up to 22; `nothing` keeps the codec's
   default, 0 for LZ4 and 3 for Zstandard).
@@ -81,8 +80,8 @@ Keywords:
   `Arrow.Stream` keeps its own schema and field metadata, without its batch
   statistics, since values, columns, or batch boundaries may have changed.
 - `ntasks`: how many tasks build a batch's columns and compress its buffers
-  (default `Threads.nthreads()`; `ntasks=1` runs on the calling task, as does
-  Arrow 2.x's `ntasks=0`). The output bytes are the same for any `ntasks`.
+  (default `Threads.nthreads()`; `ntasks=1`, or `0`, runs on the calling
+  task). The output bytes are the same for any `ntasks`.
 
 Strings, at any depth, must be valid UTF-8, as the format requires: a string
 that is not throws an `ArgumentError` naming the column and row. Write bytes
@@ -108,9 +107,8 @@ do. So a several-partition source of non-missing values reads back with
 fails, a path destination is left as it was; an `IO` sink may hold a partial
 output.
 
-The Arrow 2.x keywords `alignment`, `dictencodenested`, `denseunions`, and
-`maxdepth` are accepted with a one-time warning and ignored. See
-`docs/src/migration.md`.
+The keywords `alignment`, `dictencodenested`, `denseunions`, and `maxdepth`,
+which Arrow 2.x took, are accepted with a one-time warning and ignored.
 """
 function write(path::AbstractString, tbl; kwargs...)
     _writeall!(_writer(path; oneshot=true, kwargs...), tbl)
@@ -217,9 +215,8 @@ write(sink::Union{AbstractString,IO}; kwargs...) = tbl -> write(sink, tbl; kwarg
 """
     Arrow.tobuffer(table; kwargs...)
 
-Write `table` to a fresh `IOBuffer`, seeked to the start, in the IPC STREAM
-format — the same bytes Arrow 2.x's `tobuffer` produced. Keyword arguments
-are those of [`Arrow.write`](@ref) except `file`, which is `false` here.
+Write `table` in the IPC stream format to a new `IOBuffer`, positioned at its
+start. The keywords are those of [`Arrow.write`](@ref), except `file`.
 """
 function tobuffer(tbl; kwargs...)
     io = IOBuffer()
@@ -241,11 +238,8 @@ the current table in memory. `sink` is a file path (the writer opens and owns th
 an `IO` (borrowed; `close` finishes the IPC output but leaves the `IO`
 open). The function form runs `f(writer)` and always closes the writer.
 The keywords mean what they mean for [`Arrow.write`](@ref), whose metadata
-inheritance rules apply too.
-Constructor option checks run before opening a file path. If both `f` and
-`close` fail, the function form preserves the error from `f`. An existing
-file path is replaced as by [`Arrow.write`](@ref): the output goes to a
-temporary file that `close` renames over the old file.
+rules apply too. An existing file path is replaced as by [`Arrow.write`](@ref):
+the output goes to a temporary file that `close` renames over the old file.
 
     w = Arrow.Writer(path)
     for tbl in tables
@@ -280,13 +274,12 @@ With `dictreplacement=true` (stream format only), each table instead replaces
 the dictionary with its own categories; the schema then declares the
 DictionaryReplacement feature, which strict readers such as nanoarrow refuse.
 
-`close` finalizes what has been published — the sink is a valid IPC
-output containing every batch written so far — and is idempotent. A
-finalization failure still releases the owned sink. A
-writer abandoned without `close` leaves a torn stream or an unfooted
-file; closing a writer that never received a table writes an output with
-no columns. A table (or partition) with no rows adds no record batch. One
-task owns a writer: overlapping calls are not synchronized.
+`close` finishes the output, which then holds every batch written so far;
+closing again does nothing. A writer closed before it receives a table writes
+an output with no columns; one abandoned without `close` leaves a stream
+without its end marker or a file without its footer. A table, or partition,
+with no rows adds no record batch. One task owns a writer: overlapping calls
+are not synchronized.
 """
 mutable struct Writer
     const io::IO

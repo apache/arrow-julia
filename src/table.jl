@@ -28,88 +28,47 @@
 
 """
     Arrow.Table(source; select=nothing, drop=nothing, filter=nothing, limit=nothing,
-                scan=nothing, mmap, stringtype=DataString, limits, ntasks) -> Table
+                scan=nothing, mmap, stringtype=DataString, ntasks=Threads.nthreads(),
+                limits=Arrow.Limits()) -> Arrow.Table
 
-Read Arrow IPC data as Tables.jl columns. `source` is a file path, an `IO`,
-raw bytes (`Vector{UInt8}`), or an [`Arrow.AbstractArrowSource`](@ref) — a
-byte-range-addressable object, such as one in cloud storage, read with
-exact range requests. Both IPC formats are accepted: the file format
-(`ARROW1` magic, random access, footer statistics) and the stream format.
+Read Arrow IPC data, in the file or the stream format, as Tables.jl columns. `source` is
+a path, an `IO` (read to its end), a byte vector (read in place: do not modify it while
+the columns are in use), or an [`Arrow.AbstractArrowSource`](@ref).
 
-- `select` keeps the given columns, in that order (names, indices, a regex,
-  or a vector of them, or a function `(i, name) -> Bool` as in CSV.jl); `drop`
-  keeps all but the given columns. Repeated column names in a file read as
-  `a`, `a_1`, as CSV.jl names them.
-- `filter` keeps the rows where a predicate built from [`Arrow.col`](@ref)
-  is `true`, for example `filter=Arrow.col(:fare) > 10`.
-- `limit` keeps at most that many (filtered) rows.
-- `scan` takes a full `Tables.Scan` (renames, type overrides, `offset`,
-  `validate`) instead of the keywords above.
+- `select` keeps the given columns, in that order: names, indices, a regex, a vector of
+  them, or a function `(i, name) -> Bool`; `name => newname` renames a column and
+  `name => Type` reads it as `Type`. `drop` keeps the others.
+- `filter` keeps the rows where a predicate built from [`Arrow.col`](@ref) is `true`,
+  such as `filter=Arrow.col(:fare) > 10`.
+- `limit` keeps at most that many rows.
+- `scan` takes a `Tables.Scan` instead of those four, for an offset.
+- `mmap` memory-maps a path. It is the default except on Windows, which cannot delete a
+  mapped file.
+- `stringtype=String` reads strings as `String`s instead of `DataStrings.DataString`s.
+- `ntasks` tasks decode record batches and build columns; `ntasks=1` reads on the
+  calling task. The result does not depend on `ntasks`.
+- `limits` sets the [`Arrow.Limits`](@ref).
 
-Flat columns read their Arrow buffers in place: numbers, booleans, temporal
-values, decimals, and dictionary-encoded values are read-only
-[`Arrow.ArrowVector`](@ref) views, so building a table costs time
-proportional to its columns and record batches, not its bytes. A column
-with several record batches is a `ChainedVector` of per-batch views. String
-and binary columns are `DataStrings.StringVector`/`BytesVector`, built with
-one copy of their bytes the first time the table hands them out (the read's
-allocation allowance is charged when it opens); `stringtype=String` reads
-strings as `Vector{String}`. List, map, struct, and union columns read as typed rows:
-[`Arrow.ListValue`](@ref) and [`Arrow.MapValue`](@ref) views, `NTuple`s,
-`NamedTuple`s, and `Union`s. A
-column keeps the memory it reads alive while it is reachable, independent of
-its table. `copy(table)`, `DataFrame(table)`, and [`Arrow.read`](@ref) return
-owned, mutable columns.
+Only the selected and filter columns are read, and a `limit` stops reading once it has
+its rows; from an `AbstractArrowSource`, only their bytes are fetched.
 
-`mmap=true` memory-maps a path; a mapping is unmapped once the table and all
-of its columns are garbage collected. It is the default except
-on Windows, which cannot delete a file while it is mapped: there a path is
-read into memory unless `mmap=true` is passed. `mmap` has no effect on the
-other source kinds. A byte vector is read in place: do not modify or resize
-it while the table's columns are in use.
+Numbers, booleans, temporal values, decimals, and dictionary indices read as read-only
+[`Arrow.ArrowVector`](@ref) views of the source; a column of several record batches is a
+`ChainedVector` of them. Strings and binary values are `DataStrings.StringVector` and
+`BytesVector` columns, built with one copy of their bytes the first time the table hands
+them out. Lists, maps, and structs read as typed rows. A column keeps the memory it reads
+alive while it is reachable, even after its table is gone; a mapped file is unmapped
+once the table and its columns are garbage collected. `copy(table)`, `DataFrame(table)`,
+and [`Arrow.read`](@ref) give owned, mutable columns. Columns that share a name read as
+`a`, `a_1`, `a_2`, and so on.
 
 !!! warning
-    If another program rewrites a memory-mapped file in place (truncating it,
-    as `open(path, "w")`, `CSV.write`, pyarrow, and shell redirection do) while
-    any column read from it is in use, the next access to that column kills the
-    Julia process with a bus error (SIGBUS). Read files that other programs
-    rewrite with `mmap=false`. `Arrow.write` replaces a file safely: it writes a
-    new file and renames it over the old one.
-
-`ntasks` (default `Threads.nthreads()`) is the number of tasks a read uses:
-record batches decode and decompress field by field in parallel, columns
-build in parallel, and a string column builds in chunks of rows. `ntasks=1`
-reads on the calling task. The result does not depend on `ntasks`.
-
-`limits` sets the [`Arrow.Limits`](@ref) policy for a raw source. Omit it to
-use `Arrow.Limits()`. An internal reader handle that was opened under a
-specific policy keeps that policy; a facade call cannot retroactively
-re-verify it under different limits.
-
-A read with these keywords decodes only the selected and filter-referenced
-columns, footer statistics prune batches no row of which can match the
-filter, and the filter is evaluated batch by batch. `limit`/`offset` compose exactly over the qualifying rows. Without a
-filter, whole batches outside the window are never decoded. With a filter,
-decoding stops as soon as the window fills. Over an `AbstractArrowSource`
-the footer normally comes from one cached tail read; one exact cached
-follow-up is used when it escapes that window. Statistics prune batches
-before record metadata is requested. Surviving metadata is fetched and
-validated before selected buffer ranges are requested in the next round. A
-filtered limit then stops decoding, not fetching. On the stream format the
-scan is applied after decode.
-
-Some filters have no semantics-preserving storage-domain form: inexact
-literals, temporal conversions that alias values or wrap ordering, unsafe
-Duration unit promotion, and custom membership objects. Tuple and Array
-membership lower only for equality-preserving conversions; Set members must
-also have the column's canonical public type. Such filters fall back to
-reading the whole source and evaluating over public values.
-
-Independent of the filter, some sources are read whole: an
-`AbstractArrowSource` without a scan, a zero-field file, and any
-stream-format source. Empty projections use range planning and preserve
-their row count without fetching output column bodies. When a filter must
-prune remote fetches, write it in each column's public value domain.
+    If another program rewrites a memory-mapped file in place (truncating it, as
+    `open(path, "w")`, `CSV.write`, pyarrow, and shell redirection do) while any column
+    read from it is in use, the next access to that column kills the Julia process with
+    a bus error (SIGBUS). Read files that other programs rewrite with `mmap=false`.
+    `Arrow.write` replaces a file safely: it writes a new file and renames it over the
+    old one.
 """
 struct Table <: Tables.AbstractColumns
     names::Vector{Symbol}
@@ -1835,12 +1794,11 @@ const _MMAP_DEFAULT = !Sys.iswindows()
 """
     Arrow.read(source, sink; kwargs...)
 
-Read `source` as [`Arrow.Table`](@ref) does, with the same keywords, and pass
-the result to `sink` with owned, mutable columns, copied exactly once:
-`Arrow.read(path, DataFrame)` returns a `DataFrame` whose columns are
-`Vector`s (`PooledArray`s for dictionary-encoded columns). A sink that takes
-DataAPI metadata, such as a `DataFrame`, gets the file and column metadata, as
-`DataFrame(Arrow.Table(path))` does.
+Read `source` as [`Arrow.Table`](@ref) does, with the same keywords, and pass the
+result to `sink` with owned, mutable columns, copied once: `Arrow.read(path, DataFrame)`
+returns a `DataFrame` whose columns are `Vector`s (`PooledArray`s for dictionary columns,
+`StringVector`s for strings). A sink that takes DataAPI metadata, such as a `DataFrame`,
+gets the file and column metadata, as `DataFrame(Arrow.Table(path))` does.
 """
 function read(source, sink; kwargs...)
     t = Table(source; kwargs...)
@@ -1898,8 +1856,9 @@ const col = Tables.col
 """
     Arrow.colcmp(op, column, value)
 
-A filter comparison for values the operator forms of [`Arrow.col`](@ref) do
-not cover (dates, timestamps), the same as `Tables.colcmp`:
+A filter comparison, the same as `Tables.colcmp`: `Arrow.colcmp(==, Arrow.col(:zone),
+"A")` for equality, and comparisons with values the operator forms of
+[`Arrow.col`](@ref) do not take, such as dates and timestamps:
 `Arrow.colcmp(>=, Arrow.col(:day), Date(2025, 1, 1))`.
 """
 const colcmp = Tables.colcmp
@@ -2257,49 +2216,29 @@ _declaredbasetype(t::AC.ArrowType) =
 
 """
     Arrow.Stream(source; select=nothing, drop=nothing, filter=nothing, limit=nothing,
-                 scan=nothing, mmap, stringtype=DataString, limits, ntasks)
+                 scan=nothing, mmap, stringtype=DataString, ntasks=Threads.nthreads(),
+                 limits=Arrow.Limits())
 
-Iterate an IPC source (a file path, an `IO`, a `Vector{UInt8}`, or an
-[`Arrow.AbstractArrowSource`](@ref)) one record batch at a time; each iteration yields an [`Arrow.Table`](@ref) for that batch,
-with columns as in `Arrow.Table`. `mmap`, `stringtype`, and `ntasks` have the
-same meaning and defaults as for [`Arrow.Table`](@ref); each batch decodes and
-builds its columns on at most `ntasks` tasks. `select`, `drop`, `filter`, and
-`scan` apply to every batch; `limit` and a scan's `offset` count rows across
-the batches, and the iteration ends once `limit` rows have been yielded (such a
-Stream can be iterated but not indexed). Satisfies `Tables.partitions` (each
-batch is one partition), so partition-aware sinks — including `Arrow.write`,
-which writes one record batch per partition — see the source batch structure.
+Read `source` one record batch at a time: each iteration gives an [`Arrow.Table`](@ref)
+of one batch. The keywords are those of `Arrow.Table`; `select`, `drop`, and `filter`
+apply to each batch, and `limit` (and a scan's `offset`) counts rows across batches. A
+stream is its own `Tables.partitions`, so `Arrow.write(sink, stream)` writes a record
+batch for each batch read.
 
-`limits` has the same policy as [`Arrow.Table`](@ref). It configures a raw
-source. An internal reader handle keeps the policy that verified it.
+Batches are read as the iteration reaches them: from a stream-format `IO`, such as a
+pipe or a socket, as they arrive; from a mapped path, in place; and from an
+[`Arrow.AbstractArrowSource`](@ref), by range. A file-format `IO` is read to its end
+first. A loop that drops each batch holds one batch at a time, plus the dictionaries,
+and each batch is read under its own allocation allowance ([`Arrow.Limits`](@ref)).
 
-Batches decode as they are iterated. A stream-format source is read one
-message at a time: from an `IO` (a file, a pipe, a socket) each batch's bytes
-are read when the iteration reaches them, and over a byte vector or a
-memory-mapped path the batches are framed in place. A file-format source
-decodes each batch from the file (memory-mapped for a path; an `IO` is read
-to its end first, since the format keeps its index at the end). A consumer
-that processes and drops batches holds one batch of columns at a time, plus
-the dictionaries, so a source larger than memory streams with the defaults;
-each batch decodes under its own allocation allowance (see
-[`Arrow.Limits`](@ref)), sized from its own bytes.
+`Tables.schema(stream)`, `Tables.columnnames(stream)`, `DataAPI.metadata(stream)`, and
+`DataAPI.colmetadata(stream, col)` read no data. A file-format source also has
+`length(stream)`, `stream[i]`, and `DataAPI.nrow(stream)`, counted from the batches'
+metadata. A stream-format source is read in order, and one over an `IO` can be iterated
+once.
 
-An `AbstractArrowSource` is fetched as it is iterated: a file-format object
-reads its footer and dictionaries, then each record batch's bytes; a
-stream-format object reads one message at a time.
-
-A file-format source has `length` and `stream[i]`. A stream-format source
-iterates in order; one over an `IO` can be iterated once (the bytes are
-consumed), and its `length` is unknown until it has been read, as for a
-stream-format `AbstractArrowSource`.
-
-`Tables.schema(stream)` and `Tables.columnnames(stream)` give the columns of
-each batch, `DataAPI.metadata` and `DataAPI.colmetadata` the schema's
-key-value metadata, and `DataAPI.nrow(stream)` the row count of a
-file-format source (from batch metadata alone), all without reading data.
-
-Every yielded `Table` shares the source lifetime: releasing a batch releases its
-parent `Stream` (see [`Arrow.release!`](@ref)).
+The tables a stream yields share its source: [`Arrow.release!`](@ref) of the stream or
+of any of them releases all of them.
 """
 struct Stream
     src::Union{IPCStream,ArrowFile,_RangedFile,_StreamReader}
