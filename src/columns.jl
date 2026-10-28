@@ -1039,7 +1039,7 @@ structs with duplicate or more than 64 field names, layouts nested more
 than 8 deep, and extension columns keep the materializing path.
 """
 function _viewable(f::AC.Field)
-    _hasarrowtypesextension(f) && return false
+    _hasarrowtypesextension(f) && return _tensorshape(f) !== nothing
     return _viewablelayout(f)
 end
 function _viewablelayout(f::AC.Field, depth::Int=0)
@@ -1135,6 +1135,8 @@ function _viewbasetype(f::AC.Field, ctx::_ViewContext, datas=AC.ArrayData[])
         return DataStrings.DataBytes
     t isa AC.DictionaryType && return _viewbasetype(AC.dictvaluefield(f, t), ctx)
     t isa AC.RunEndEncodedType && return _viewbasetype(f.children[2], ctx)
+    shape = _tensorshape(f)
+    shape === nothing || return _tensortype(f, ctx, datas, shape)
     t isa _NestedLayout && return _rowtype(f, ctx, datas)
     S, C = _fixedstorage(t)
     return C === Nothing ? S : _storagetarget(C)
@@ -1597,6 +1599,7 @@ function _nestedbatch(
         offsets = _listoffsets(d, Int(ed.offset), budget)
         return MapVector{T}(offsets, keys, vals, validity, bitoffset, d)
     end
+    R <: Array && return _tensorrows(T, f, d, ctx, _tensorshape(f)::Tuple)
     E = eltype(R)
     if t isa AC.FixedSizeListType && R <: Tuple
         # `NTuple{0,E}` is `Tuple{}`, whose rows read no child values.
@@ -1729,4 +1732,123 @@ function _fillunion!(out, cols::Tuple, ids, offsets, typeids, dense::Bool, base:
         out[i] = _pickchild(cols, k, j)
     end
     return out
+end
+
+# --- fixed-shape tensors ----------------------------------------------------------
+#
+# The canonical `arrow.fixed_shape_tensor` extension stores each tensor as a
+# fixed-size list of its elements in row-major order over its physical
+# `shape`; `permutation` says which physical dimension each logical one is.
+# Rows read as `Array{T,N}`s of the logical shape.
+
+const _TENSOR_EXTENSION = "arrow.fixed_shape_tensor"
+
+# `(shape, permutation)` of a tensor field (1-based permutation), or nothing
+# when `f` is not one this reader can read: a fixed-size list of a flat,
+# unlabelled child with a well-formed `shape`.
+function _tensorshape(f::AC.Field)
+    f.type isa AC.FixedSizeListType || return nothing
+    ext = _arrowtypesextension(f)
+    (ext === nothing || ext[1] != _TENSOR_EXTENSION) && return nothing
+    (length(f.children) == 1 && !_hasarrowtypesextension(f.children[1])) || return nothing
+    child = f.children[1]
+    (_viewablelayout(child) && !_nestedvalue(child)) || return nothing
+    shape = _jsonints(ext[2], "shape")
+    shape === nothing && return nothing
+    perm = _jsonints(ext[2], "permutation")
+    perm = perm === nothing ? collect(1:length(shape)) : perm .+ 1
+    (
+        all(>=(0), shape) &&
+        length(perm) == length(shape) &&
+        isperm(perm) &&
+        prod(shape; init=1) == f.type.listsize
+    ) || return nothing
+    return (Tuple(shape), Tuple(perm))
+end
+
+# The integers of JSON array `key` in `json`, or nothing.
+function _jsonints(json::AbstractString, key::String)
+    m = match(Regex("\"" * key * "\"\\s*:\\s*\\[([^\\]]*)\\]"), json)
+    m === nothing && return nothing
+    values = Int[]
+    for part in split(m[1], ','; keepempty=false)
+        x = tryparse(Int, strip(part))
+        x === nothing && return nothing
+        push!(values, x)
+    end
+    return values
+end
+
+# Tensor rows are `Array{E,N}`: `E` is the element type, without `Missing`
+# unless an element of a non-null tensor is null.
+function _tensortype(f::AC.Field, ctx::_ViewContext, datas, shape)
+    child = f.children[1]
+    B = _viewbasetype(child, ctx, _childdatas(datas, 1))
+    w = (f.type::AC.FixedSizeListType).listsize
+    nulls = any(d -> _tensornulls(child, d, w), datas)
+    return Array{nulls ? Union{Missing,B} : B,length(first(shape))}
+end
+
+# Whether a non-null row of tensor batch `d` holds a null element.
+function _tensornulls(child::AC.Field, d::AC.ArrayData, w::Int)
+    c = d.children[1]
+    _viewnulls(child, c) || return false
+    # Null elements under a null tensor are never read.
+    rows, rowoff = _validitybits(d)
+    elems, elemoff = _validitybits(c)
+    isempty(elems) && return true  # dictionary or run-end values with nulls
+    GC.@preserve d for i = 1:Int(d.len)
+        _isnullslot(rows, rowoff, i) && continue
+        base = (Int(d.offset) + i - 1) * w
+        any(j -> _isnullslot(elems, elemoff, base + j), 1:w) && return true
+    end
+    return false
+end
+
+function _tensorrows(@nospecialize(T::Type), f::AC.Field, d::AC.ArrayData, ctx, shapeperm)
+    shape, perm = shapeperm
+    R = Base.nonmissingtype(T)
+    child = _viewcolumn(f.children[1], AC.ArrayData[d.children[1]], ctx, eltype(R))
+    return _tensorrows(T, R, child, d, ctx.budget, shape, perm)
+end
+
+function _tensorrows(
+    ::Type{T},
+    ::Type{R},
+    child,
+    d::AC.ArrayData,
+    budget,
+    shape,
+    perm,
+) where {T,R}
+    n = Int(d.len)
+    w = prod(shape; init=1)
+    N = length(shape)
+    _chargeexact!(budget, T, n, "tensor rows")
+    _chargeexact!(budget, eltype(R), n * w, "tensor values")
+    out = Vector{T}(undef, n)
+    validity, bitoffset = _validitybits(d)
+    for i = 1:n
+        if Missing <: T && _isnullslot(validity, bitoffset, i)
+            out[i] = missing
+            continue
+        end
+        base = (Int(d.offset) + i - 1) * w
+        flat = eltype(R)[child[base + j] for j = 1:w]
+        # Row-major storage: reverse the dimensions to reshape, then back.
+        physical = permutedims(reshape(flat, reverse(shape)), N:-1:1)
+        out[i] = perm == Tuple(1:N) ? physical : permutedims(physical, perm)
+    end
+    return out
+end
+
+# Tensor rows back to their row-major storage values, for a rewrite.
+function _tensorstorage(v::AbstractVector, (shape, perm))
+    N = length(shape)
+    return [
+        row isa AbstractArray && ndims(row) == N ?
+        vec(
+            permutedims(perm == Tuple(1:N) ? row : permutedims(row, invperm(perm)), N:-1:1),
+        ) : row for row in v
+    ]
 end

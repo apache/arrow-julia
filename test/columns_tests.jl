@@ -268,6 +268,44 @@ end
         end
     end
 
+    @testset "fixed-shape tensors read as arrays" begin
+        AC = Arrow.AC
+        meta(json) = [
+            "ARROW:extension:name" => "arrow.fixed_shape_tensor",
+            "ARROW:extension:metadata" => json,
+        ]
+        cf, cd = AC.fromjulia("item", Int32.(0:11))
+        cf2, cd2 = AC.fromjulia("item", Int32.(0:11))
+        tf = AC.Field(
+            "t",
+            AC.FixedSizeListType(6);
+            nullable=true,
+            metadata=meta("{\"shape\":[2,3]}"),
+            children=[cf],
+        )
+        pf = AC.Field(
+            "p",
+            AC.FixedSizeListType(6);
+            nullable=true,
+            metadata=meta("{\"shape\":[2,3],\"permutation\":[1,0]}"),
+            children=[cf2],
+        )
+        td = AC.ArrayData(AC.FixedSizeListType(6), 2, [AC.BufferSlice()]; children=[cd])
+        pd = AC.ArrayData(AC.FixedSizeListType(6), 2, [AC.BufferSlice()]; children=[cd2])
+        sch = AC.Schema([tf, pf])
+        bytes = Arrow.writestream(sch, [AC.RecordBatch(sch, [td, pd], 2)])
+        t = Arrow.Table(bytes)
+        # Row-major storage over the physical shape [2, 3].
+        @test eltype(t.t) == Union{Missing,Matrix{Int32}}
+        @test t.t[2] == Int32[6 7 8; 9 10 11]
+        # Logical dimension 1 is physical dimension 2.
+        @test t.p[1] == Int32[0 3; 1 4; 2 5]
+        # A rewrite stores the rows back in row-major order.
+        again = Arrow.Table(arrowbytes(t))
+        @test isequal(collect(again.t), collect(t.t)) &&
+              isequal(collect(again.p), collect(t.p))
+    end
+
     @testset "views keep their memory alive" begin
         n = 1_000_000
         path = tempname()

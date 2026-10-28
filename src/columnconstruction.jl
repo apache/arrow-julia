@@ -4814,6 +4814,8 @@ function _retainedlist(f::AC.Field, v::AbstractVector, context::_WriterContext)
     t = f.type::Union{AC.ListType,AC.ListViewType,AC.FixedSizeListType}
     length(f.children) == 1 ||
         throw(ArgumentError("column $(f.name) retained list descriptor needs one child"))
+    shape = _tensorshape(f)
+    shape === nothing || (v = _tensorstorage(v, shape))
     present = _retainedvalidity(f, v)
     t isa AC.FixedSizeListType &&
         all(row -> row === missing || row === _RETAINED_HIDDEN, v) &&
