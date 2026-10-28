@@ -2060,17 +2060,23 @@ function _StreamReader(messages, limits::Limits)
     )
 end
 
-# Start over from the first batch (a region stream only).
+# Start over from the first batch (a byte region or a byte-range source).
 function _restart!(r::_StreamReader)
     # A reader that has not read past its schema is at the start already.
     r.messages.pos == r.start && isempty(r.queue) && !r.done && !r.failed && return r
-    r.messages isa _RegionMessages || throw(
-        ArgumentError(
-            "an Arrow.Stream over an IO reads its batches once; " *
-            "read the IO into a byte vector to iterate it again",
-        ),
-    )
-    r.messages.pos = r.start
+    m = r.messages
+    if m isa _IOMessages{_SourceIO}
+        empty!(m.head)
+        m.io.pos = r.start
+    elseif !(m isa _RegionMessages)
+        throw(
+            ArgumentError(
+                "an Arrow.Stream over an IO reads its batches once; " *
+                "read the IO into a byte vector to iterate it again",
+            ),
+        )
+    end
+    m.pos = r.start
     st = r.st
     r.st = _StreamState(
         st.schema,

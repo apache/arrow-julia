@@ -1594,14 +1594,179 @@ function _isfilesource(sf::SourceFile, budget::Union{Nothing,AllocationBudget}=n
     return length(tail) >= 6 && tail[(end - 5):end] == Vector{UInt8}(FILE_MAGIC)
 end
 
-# The whole object as bytes, reusing the cached tail for its final window.
+# A long read (a whole object, a record batch, a stream message) fetches in
+# ranges of this size, `sf.concurrency` at a time, so a source with concurrent
+# reads downloads in parallel and holds at most that many ranges besides the
+# result.
+const _READ_RANGE = Int64(8 * 1024 * 1024)
+
+# Bytes `[off, off + len)` of the source into `out` from index `at`: in
+# `_READ_RANGE` ranges at once, or as one range from a source that reads one
+# at a time.
+function _fetchinto!(out::Vector{UInt8}, at::Int, sf::SourceFile, off::Int64, len::Int64)
+    step = sf.concurrency == 1 ? max(len, Int64(1)) : _READ_RANGE
+    _foreach(Int(cld(len, step)), sf.concurrency) do i, _
+        o = (i - 1) * step
+        n = min(step, len - o)
+        copyto!(out, at + o, _fetchexact(sf, off + o, n), 1, n)
+        return nothing
+    end
+    return out
+end
+
+# The whole object as one buffer, reusing the cached tail for its final window.
 function _wholeobject(sf::SourceFile, budget::Union{Nothing,AllocationBudget}=nothing)
     tail, tailstart = _fetchtail(sf, budget)
     tailstart == 0 && return tail
-    _chargevector!(budget, UInt8, tailstart, "whole-object prefix fetch")
-    prefix = _fetchexact(sf, Int64(0), tailstart)
-    _chargevector!(budget, UInt8, sf.len, "whole-object assembly")
-    return vcat(prefix, tail)
+    _chargevector!(budget, UInt8, sf.len, "whole-object buffer")
+    _chargevector!(
+        budget,
+        UInt8,
+        min(sf.concurrency * _READ_RANGE, tailstart),
+        "range fetches",
+    )
+    out = Vector{UInt8}(undef, sf.len)
+    copyto!(out, tailstart + 1, tail, 1, length(tail))
+    return _fetchinto!(out, 1, sf, Int64(0), tailstart)
+end
+
+"""
+A file-format source read one record batch at a time (`Arrow.Stream` over an
+`AbstractArrowSource`): the footer and every dictionary batch when opened,
+then each record batch's bytes when the batch is read.
+"""
+mutable struct _RangedFile
+    const sf::SourceFile
+    const schema::Schema
+    const fields::AC.FrozenVector{Field}
+    const fielddictids::IdDict{Field,Int64}
+    const dictionaries::Dict{Int64,ArrayData}
+    const validated::AC._ValidatedDictionaries
+    const recordblocks::Vector{NTuple{3,Int64}}
+    const dataend::Int64
+    const limits::Limits
+    const footerversion::Int16
+    # The message metadata version every block must share (0 until one is read).
+    @atomic version::Int16
+    # The stream's lifetime authority; each batch's bytes are their own region.
+    const region::OwnerRegion
+end
+
+function _RangedFile(sf::SourceFile, budget::AllocationBudget)
+    ft = _rangedfooter(sf, budget)
+    version = Ref(Int16(0))
+    framed(block) =
+        let fm = first(_blockframe(sf, block, ft.footerstart, budget))
+            version[] = _filemetadataversion(
+                ft.version,
+                fm.version,
+                version[] == 0 ? fm.version : version[],
+            )
+            fm
+        end
+    dicts, validated = _filedictionaries(
+        framed,
+        ft.dictblocks,
+        ft.dictids,
+        ft.dictvaluefields,
+        ft.fielddictids,
+        sf.limits,
+        budget,
+    )
+    return _RangedFile(
+        sf,
+        ft.sch,
+        AC.FrozenVector{Field}(ft.fields),
+        ft.fielddictids,
+        dicts,
+        validated,
+        ft.recordblocks,
+        ft.footerstart,
+        sf.limits,
+        ft.version,
+        version[],
+        heapregion(UInt8[]),
+    )
+end
+
+# A footer block fetched and framed as a message of its own: the message and
+# the region holding the block's bytes.
+function _blockframe(sf::SourceFile, block::NTuple{3,Int64}, dataend::Int64, budget)
+    offset, frameend = _blockextent(block, dataend)
+    len = frameend - offset
+    region = heapregion(_fetchinto!(Vector{UInt8}(undef, len), 1, sf, offset, len))
+    _, metalen, bodylen = block
+    fm = _blockmessage(region, (Int64(0), metalen, bodylen), region.len, sf.limits, budget)
+    return fm, region
+end
+
+Base.length(r::_RangedFile) = length(r.recordblocks)
+
+# Record batch `i`, decoded through a one-block `ArrowFile` over its bytes.
+function _rangedbatch(r::_RangedFile, i::Int, budget::AllocationBudget, ntasks::Int)
+    1 <= i <= length(r.recordblocks) || throw(BoundsError(r, i))
+    fm, region = _blockframe(r.sf, r.recordblocks[i], r.dataend, budget)
+    known = @atomic r.version
+    if known == 0
+        known, _ = @atomicreplace r.version Int16(0) => fm.version
+        known == 0 && (known = fm.version)
+    end
+    version = _filemetadataversion(r.footerversion, fm.version, known)
+    _, metalen, bodylen = r.recordblocks[i]
+    f = ArrowFile(
+        region,
+        r.schema,
+        r.fields,
+        r.fielddictids,
+        r.dictionaries,
+        r.validated,
+        [(Int64(0), metalen, bodylen)],
+        region.len,
+        r.limits,
+        version,
+    )
+    return only(_filerecordbatches(f, (1,), budget, ntasks))
+end
+
+"""
+A forward `IO` over a `SourceFile`, for reading a stream-format object one
+message at a time: each fetch covers the bytes asked for plus a readahead
+window that serves the next short reads.
+"""
+mutable struct _SourceIO <: IO
+    const sf::SourceFile
+    pos::Int64
+    window::Vector{UInt8}
+    windowstart::Int64
+end
+_SourceIO(sf::SourceFile) = _SourceIO(sf, Int64(0), UInt8[], Int64(0))
+
+const _SOURCE_READAHEAD = Int64(64 * 1024)
+
+Base.eof(io::_SourceIO) = io.pos >= io.sf.len
+function Base.unsafe_read(io::_SourceIO, p::Ptr{UInt8}, n::UInt)
+    want = Int64(n)
+    want <= io.sf.len - io.pos || throw(EOFError())
+    windowend = io.windowstart + length(io.window)
+    buffered =
+        io.windowstart <= io.pos < windowend ? min(windowend - io.pos, want) : Int64(0)
+    if buffered > 0
+        from = Int(io.pos - io.windowstart) + 1
+        GC.@preserve io unsafe_copyto!(p, pointer(io.window, from), buffered)
+        io.pos += buffered
+    end
+    rest = want - buffered
+    rest == 0 && return nothing
+    # One fetch covers the rest and the next window (a body and the next
+    # message's prefix and metadata, for a stream).
+    len = min(rest + _SOURCE_READAHEAD, io.sf.len - io.pos)
+    fetched = _fetchinto!(Vector{UInt8}(undef, len), 1, io.sf, io.pos, len)
+    GC.@preserve fetched unsafe_copyto!(p + buffered, pointer(fetched), rest)
+    io.pos += rest
+    # Keep only the readahead, not a copy of the bytes just delivered.
+    io.window = fetched[(rest + 1):end]
+    io.windowstart = io.pos
+    return nothing
 end
 
 # One exact range through the source, bounds-checked against the length

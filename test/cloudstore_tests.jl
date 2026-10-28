@@ -27,6 +27,19 @@ using Arrow
 using CloudStore
 using CloudBaseTest: Minio
 
+# Counts the requests a source receives.
+struct CountedSource{S} <: Arrow.AbstractArrowSource
+    inner::S
+    requests::Threads.Atomic{Int}
+end
+CountedSource(inner) = CountedSource(inner, Threads.Atomic{Int}(0))
+Arrow.sourcelength(s::CountedSource) = Arrow.sourcelength(s.inner)
+Arrow.concurrentreads(s::CountedSource) = Arrow.concurrentreads(s.inner)
+function Arrow.readrange(s::CountedSource, off, len)
+    Threads.atomic_add!(s.requests, 1)
+    return Arrow.readrange(s.inner, off, len)
+end
+
 @testset "CloudStore extension" begin
     ext = Base.get_extension(Arrow, :ArrowCloudStoreExt)
     @test ext !== nothing
@@ -67,6 +80,18 @@ using CloudBaseTest: Minio
         @test st.a == mem.a && st.b == mem.b
         @test [length(batch.a) for batch in Arrow.Stream(sobj)] == [1000, 1000]
         @test [length(batch.a) for batch in Arrow.Stream(obj)] == [1000, 1000]
+        # Over a 9.6 MB file: a whole read is the tail plus two 8 MiB-bound
+        # ranges; a Stream is the tail plus one range per batch.
+        big = Tables.partitioner([(n=collect(Int64, 1:600_000),) for _ = 1:2])
+        bigbytes = take!(Arrow.write(IOBuffer(), big; file=true))
+        CloudStore.put(bucket, "big.arrow", bigbytes; credentials=credentials)
+        bigobj = CloudStore.Object(bucket, "big.arrow"; credentials=credentials)
+        counted = CountedSource(ext.CloudObjectSource(bigobj))
+        @test length(Arrow.Table(counted).n) == 1_200_000
+        @test counted.requests[] == 3
+        counted = CountedSource(ext.CloudObjectSource(bigobj))
+        @test [b.n[end] for b in Arrow.Stream(counted)] == [600_000, 600_000]
+        @test counted.requests[] == 3
         # A handle is pinned to the object version it was made from: after the
         # key is overwritten, its next range read fails (If-Match) rather than
         # mixing bytes of two versions across request rounds.

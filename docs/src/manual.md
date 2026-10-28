@@ -410,8 +410,13 @@ the cap across all operations on that read. Separate reads are
 independent; enforce a transport-wide cap inside `readrange` when required.
 Results are placed by request, and the default reads one at a time.
 Without a scan the whole object is read, as is a stream-format object (no
-footer) and a scan that cannot be pushed down. Arrow.jl has no HTTP or
-cloud dependency of its own.
+footer) and a scan that cannot be pushed down: Arrow fetches it in 8 MiB
+ranges, as many at once as `concurrentreads` allows, into one buffer.
+[`Arrow.Stream`](@ref) over a source fetches as it iterates instead, the
+same way: a file-format object reads its footer and dictionaries, then each
+record batch's bytes as the iteration reaches it (so `stream[i]` fetches
+only batch `i`), and a stream-format object reads one message at a time. Arrow.jl has no HTTP or cloud dependency
+of its own.
 
 ## Writing
 

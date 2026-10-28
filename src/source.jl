@@ -66,10 +66,15 @@ Arrow.readrange(s::BytesSource, offset, len) = s.data[(offset + 1):(offset + len
 tbl = Arrow.Table(BytesSource(bytes); scan=Tables.Scan(select=(:a, :b)))
 ```
 
+Without a scan, `Arrow.Table` reads the whole object in 8 MiB ranges,
+`concurrentreads` of them at a time, into one buffer. [`Arrow.Stream`](@ref)
+fetches as it iterates: a file-format object each record batch's bytes
+after its footer and dictionaries, a stream-format object one message at a
+time.
+
 The `CloudStore.jl` extension makes a `CloudStore.Object` a source, so
 `Arrow.Table(CloudStore.Object(bucket, key); scan=…)` reads just the needed
-column bytes from S3 or Azure Blob Storage. Stream-format objects have
-no footer and are read whole.
+column bytes from S3 or Azure Blob Storage.
 """
 abstract type AbstractArrowSource end
 
@@ -93,9 +98,10 @@ function readrange end
     Arrow.concurrentreads(src::AbstractArrowSource) -> Int
 
 How many [`Arrow.readrange`](@ref) calls Arrow may have in flight at once
-through one `SourceFile` handle. The default, `1`, reads them one at a time;
-a transport whose requests are independent (HTTP range GETs) returns a bound
-suited to it. The handle samples the value once, clamps it by
+through one `SourceFile` handle: a scan's planned ranges, or the ranges of a
+whole-object read. The default, `1`, reads them one at a time (a whole object
+in one range); a transport whose requests are independent (HTTP range GETs)
+returns a bound suited to it. The handle samples the value once, clamps it by
 `Limits.max_concurrent_reads`, and stores every result by request index.
 Separate handles are independent.
 """

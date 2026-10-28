@@ -2075,14 +2075,56 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
         metadata=coremetadata(metaschema.custom_metadata),
         endianness=AC.LittleEndian,
     )
+    framed(block) =
+        let fm = _blockmessage(region, block, dataend, limits, budget)
+            fm.version == version ||
+                throw(ValidationError("IPC metadata version changes within the file"))
+            fm
+        end
+    dicts, validated = _filedictionaries(
+        framed,
+        dictblocks,
+        dictids,
+        dictvaluefields,
+        fielddictids,
+        limits,
+        budget,
+    )
+    # Every id a record batch may reference must be resolvable now unless
+    # that batch proves all-null use — checked per batch at decode.
+    return ArrowFile(
+        region,
+        sch,
+        AC.FrozenVector{Field}(fields),
+        fielddictids,
+        dicts,
+        validated,
+        recordblocks,
+        dataend,
+        limits,
+        version,
+    )
+end
+
+"""
+Decode a file's dictionary batches in footer order; `framed(block)` returns
+each block's framed message with its metadata version checked.
+"""
+function _filedictionaries(
+    framed,
+    dictblocks,
+    dictids,
+    dictvaluefields,
+    fielddictids,
+    limits::Limits,
+    budget::AllocationBudget,
+)
     dicts = Dict{Int64,ArrayData}()
     validated = AC._ValidatedDictionaries()
     state = DecodeState(budget)
     try
         for block in dictblocks
-            fm = _blockmessage(region, block, dataend, limits, budget)
-            fm.version == version ||
-                throw(ValidationError("IPC metadata version changes within the file"))
+            fm = framed(block)
             rejectexperimentalcompression(fm)
             header = fm.msg.header
             header isa Meta.DictionaryBatch ||
@@ -2129,20 +2171,7 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
                 file=true,
             )
         end
-        # Every id a record batch may reference must be resolvable now unless
-        # that batch proves all-null use — checked per batch at decode.
-        return ArrowFile(
-            region,
-            sch,
-            AC.FrozenVector{Field}(fields),
-            fielddictids,
-            dicts,
-            validated,
-            recordblocks,
-            dataend,
-            limits,
-            version,
-        )
+        return dicts, validated
     finally
         close(state)
     end

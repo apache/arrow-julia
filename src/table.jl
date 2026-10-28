@@ -1342,7 +1342,7 @@ const _FILE_MAGIC = b"ARROW1"
 const _OpenedReader = Union{SourceFile,ArrowFile,IPCStream}
 
 _configuredlimits(source::SourceFile) = source.limits
-_configuredlimits(source::ArrowFile) = source.limits
+_configuredlimits(source::Union{ArrowFile,_RangedFile}) = source.limits
 _configuredlimits(source::IPCStream) = source.limits
 _configuredlimits(source::_StreamReader) = source.limits
 _defaultreaderlimits(source) =
@@ -1826,7 +1826,7 @@ function _corefields(source::Union{IPCStream,ArrowFile}, budget=nothing)
 end
 
 _tableschema(s::IPCStream) = s.schema
-_tableschema(f::ArrowFile) = f.schema
+_tableschema(f::Union{ArrowFile,_RangedFile}) = f.schema
 _tableschema(r::_StreamReader) = r.st.schema
 
 "Merge category snapshots while preserving every entry in the first snapshot."
@@ -2074,8 +2074,7 @@ _declaredbasetype(t::AC.ArrowType) =
                  scan=nothing, mmap, stringtype=DataString, limits, ntasks)
 
 Iterate an IPC source (a file path, an `IO`, a `Vector{UInt8}`, or an
-[`Arrow.AbstractArrowSource`](@ref), which is read whole) one record batch
-at a time; each iteration yields an [`Arrow.Table`](@ref) for that batch,
+[`Arrow.AbstractArrowSource`](@ref)) one record batch at a time; each iteration yields an [`Arrow.Table`](@ref) for that batch,
 with columns as in `Arrow.Table`. `mmap`, `stringtype`, and `ntasks` have the
 same meaning and defaults as for [`Arrow.Table`](@ref); each batch decodes and
 builds its columns on at most `ntasks` tasks. `select`, `drop`, `filter`, and
@@ -2099,9 +2098,14 @@ the dictionaries, so a source larger than memory streams with the defaults;
 each batch decodes under its own allocation allowance (see
 [`Arrow.Limits`](@ref)), sized from its own bytes.
 
+An `AbstractArrowSource` is fetched as it is iterated: a file-format object
+reads its footer and dictionaries, then each record batch's bytes; a
+stream-format object reads one message at a time.
+
 A file-format source has `length` and `stream[i]`. A stream-format source
 iterates in order; one over an `IO` can be iterated once (the bytes are
-consumed), and its `length` is unknown until it has been read.
+consumed), and its `length` is unknown until it has been read, as for a
+stream-format `AbstractArrowSource`.
 
 `Tables.schema(stream)` and `Tables.columnnames(stream)` give the columns of
 each batch, `DataAPI.metadata` and `DataAPI.colmetadata` the schema's
@@ -2112,7 +2116,7 @@ Every yielded `Table` shares the source lifetime: releasing a batch releases its
 parent `Stream` (see [`Arrow.release!`](@ref)).
 """
 struct Stream
-    src::Union{IPCStream,ArrowFile,_StreamReader}
+    src::Union{IPCStream,ArrowFile,_RangedFile,_StreamReader}
     regions::Vector{AC.OwnerRegion}
     budget::AllocationBudget
     closed::AC.ReleaseCell
@@ -2210,16 +2214,24 @@ function _openstream(
     end
     return _StreamReader(_IOMessages(io, head, Int64(0)), limits)
 end
-_openstream(
+# A byte-range source is fetched as it is iterated: a file-format object one
+# record batch at a time (its footer and dictionaries first), a
+# stream-format object one message at a time.
+function _openstream(
     src::Union{AbstractArrowSource,SourceFile};
     limits::Limits=Limits(),
     budget=nothing,
     kwargs...,
-) = _openstream(
-    _wholeobject(src isa SourceFile ? src : SourceFile(src; limits=limits), budget);
-    limits=limits,
-    budget=budget,
 )
+    sf = src isa SourceFile ? src : SourceFile(src; limits=limits)
+    _isfilesource(sf, budget) && return _RangedFile(sf, budget)
+    return _StreamReader(_IOMessages(_SourceIO(sf), UInt8[], Int64(0)), sf.limits)
+end
+
+function _sourceregions(r::_RangedFile, budget=nothing)
+    _chargevector!(budget, AC.OwnerRegion, 1, "source owner regions")
+    return AC.OwnerRegion[r.region]
+end
 
 function _sourceregions(r::_StreamReader, budget=nothing)
     _chargevector!(budget, AC.OwnerRegion, 1, "source owner regions")
@@ -2227,7 +2239,7 @@ function _sourceregions(r::_StreamReader, budget=nothing)
 end
 
 _nbatches(s::IPCStream) = length(s.batches)
-_nbatches(f::ArrowFile) = length(f)
+_nbatches(f::Union{ArrowFile,_RangedFile}) = length(f)
 _nbatches(r::_StreamReader{_RegionMessages}) = _countrecords(r)
 _nbatches(::_StreamReader) = throw(
     ArgumentError(
@@ -2237,8 +2249,9 @@ _nbatches(::_StreamReader) = throw(
 )
 _batch(s::IPCStream, i, budget, ntasks) = s.batches[i]
 _batch(f::ArrowFile, i, budget, ntasks) = only(_filerecordbatches(f, (i,), budget, ntasks))
+_batch(r::_RangedFile, i, budget, ntasks) = _rangedbatch(r, i, budget, ntasks)
 _batchfields(s::IPCStream) = s.corefields
-_batchfields(f::ArrowFile) = f.fields
+_batchfields(f::Union{ArrowFile,_RangedFile}) = f.fields
 _batchfields(r::_StreamReader) = r.st.fields
 
 Base.length(s::Stream) = _nbatches(s.src)
@@ -2385,9 +2398,9 @@ end
 
 # A batch's allowance comes from its own bytes: the message for a file, the
 # decoded buffers for a stream already read whole.
-function _batchbudget(f::ArrowFile, i::Int)
+function _batchbudget(f::Union{ArrowFile,_RangedFile}, i::Int)
     _, metalen, bodylen = f.recordblocks[i]
-    return _readbudget(f.limits, metalen + bodylen)
+    return _readbudget(_configuredlimits(f), metalen + bodylen)
 end
 _batchbudget(s::IPCStream, i::Int) = _readbudget(s.limits, _databytes(s.batches[i]))
 
