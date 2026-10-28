@@ -65,10 +65,9 @@
 # ---------------------------------------------------------------------------
 
 """
-    CArrowSchema
+    Arrow.CArrowSchema
 
-The field-exact Julia representation of the Arrow C data interface's
-`ArrowSchema` ABI struct.
+The C data interface's `ArrowSchema` struct, field for field.
 """
 struct CArrowSchema
     format::Ptr{UInt8}
@@ -83,10 +82,9 @@ struct CArrowSchema
 end
 
 """
-    CArrowArray
+    Arrow.CArrowArray
 
-The field-exact Julia representation of the Arrow C data interface's
-`ArrowArray` ABI struct.
+The C data interface's `ArrowArray` struct, field for field.
 """
 struct CArrowArray
     length::Int64
@@ -821,20 +819,19 @@ function _build_c_data!(sp, skey, ap, akey, f::Field, d::ArrayData, arel, srel)
     return nothing
 end
 
+# The schema and the array have separate per-node control blocks and Julia-side
+# roots, since their C lifetimes are independent: releasing either marks only
+# that tree released, and moved descendants defer the aggregate cleanup. The
+# array root keeps the source ArrayData reachable until it is reaped, which is
+# what keeps the exported buffer pointers valid.
 """
-    to_c_data(field, data) -> (Ptr{CArrowSchema}, Ptr{CArrowArray})
+    Arrow.to_c_data(field, data) -> (Ptr{CArrowSchema}, Ptr{CArrowArray})
 
-Export one column. The schema and array have separate sets of per-node
-control blocks and separate Julia-side roots, as required by their
-independent C Data lifetimes. Releasing either root recursively marks only
-that structure tree released. Moved descendants defer aggregate cleanup.
-The array root keeps the source ArrayData reachable until it is reaped;
-that reachability is what keeps the exported buffer pointers valid.
-
-The column is validated through the semantic tier before publication —
-the same tier the IPC writer applies. Content policy (`validate_full`:
-UTF-8 well-formedness, the advisory nullability contract, canonical bits)
-is the caller's opt-in, exactly as for IPC.
+Export one column through the C data interface: an `ArrowSchema` and an `ArrowArray`
+that Arrow.jl allocates, pointing at `data`'s buffers without copying them. A consumer
+imports the two structs and calls their `release` callbacks when it is done; `data` stays
+reachable until then, and [`Arrow.reap!`](@ref) frees the structs afterwards. The column
+is validated before it is exported.
 """
 function to_c_data(f::Field, d::ArrayData)
     # Reject mismatched schema/data and malformed buffers before publishing
@@ -923,11 +920,11 @@ function _cleanup_registered_root!(key::Int64; require_released=true)
 end
 
 """
-    reap!() -> Int
+    Arrow.reap!() -> Int
 
-Find fully released exports: free every malloc they own and drop their
-registry roots. Cleanup is this explicit scan — there is no background
-reaper task; call it after consumers have released their structures.
+Free what Arrow.jl keeps for each export whose consumer has released it, and return how
+many exports were freed. Nothing does this in the background: call it after consumers
+release what [`Arrow.to_c_data`](@ref) and [`Arrow.export_stream!`](@ref) exported.
 """
 function reap!()
     keys = lock(REGISTRY_LOCK) do
@@ -1029,21 +1026,27 @@ function _release_owner_action(p::Ptr{Cvoid})::Cvoid
     return nothing
 end
 
+# One owner for one MOVED ArrowArray tree. All `BufferSlice`s from the whole
+# tree (children and dictionary) use regions whose `root` is this object, so
+# the tree outlives every slice, and the C release callback runs exactly once,
+# from `release!` or from the GC finalizer, whichever comes first. While a
+# `to_c_data` or `export_stream!` export lends this tree's memory to a
+# consumer, `release!` still revokes Julia access at once, and the reap of the
+# last such export runs the producer release.
+#
+# The malloc'd copy of the moved struct mirrors the C Data convention for its
+# own state: its release field is NULL (inert) until the move commits, and the
+# producer's real callback is stored only then (`_arm_foreign_owner!`). A
+# failure between construction and the move commit therefore frees just our
+# copy and never calls the producer: the source, whose release field is still
+# set, remains the owner.
 """
-One owner for one MOVED ArrowArray tree. All `BufferSlice`s from the whole
-tree — children and dictionary — use regions whose `root` is this object.
-The tree therefore outlives every slice, and the C release callback runs
-exactly once, from `release!` or from the GC finalizer, whichever comes
-first. While a `to_c_data` or `export_stream!` export lends this tree's
-memory to a consumer, `release!` still revokes Julia access at once, and the
-reap of the last such export runs the producer release.
+    Arrow.ForeignOwner
 
-The malloc'd copy of the moved struct mirrors the C Data convention for its
-own state: its release field is NULL (inert) until the move commits, and the
-producer's real callback is stored only then (`_arm_foreign_owner!`). A
-failure between construction and the move commit therefore frees just our
-copy and never calls the producer — the source, whose release field is still
-set, remains the owner.
+Owns the memory of one column imported with [`Arrow.from_c_data`](@ref); the imported
+data's `owner` field holds it. The producer's `release` callback runs once: at
+[`Arrow.release!(owner)`](@ref Arrow.release!(::Arrow.ForeignOwner)), or when the garbage
+collector finds the memory unused.
 """
 mutable struct ForeignOwner
     # malloc'd copy: a stable native address for the producer's release callback
@@ -1129,22 +1132,22 @@ function _release_moved_owner!(o::ForeignOwner)
     return nothing
 end
 
+# Order: revoke every OwnerRegion built over the import through the shared
+# cell; run the producer's release callback (if armed) on the malloc'd struct
+# copy; check that the producer nulled the copy's release field; free the
+# copy. One atomic swap picks the single releaser between an explicit call and
+# the GC finalizer. This is also the only lifetime handle for an empty import
+# that carries no region; `ArrayData.owner` then holds it. A deferred
+# release's conformance failure throws from `reap!`, and a finalizer's is
+# reported as a finalizer error.
 """
-    release!(owner::ForeignOwner)
+    Arrow.release!(owner::Arrow.ForeignOwner)
 
-Deterministically release an imported C-data tree, in this order: revoke
-every `OwnerRegion` built over the import through the shared cell (later
-access throws `InvalidStateException`); run the producer's release callback
-(if armed) on the malloc'd struct copy; check that the producer nulled the
-copy's release field, as C Data requires; free the copy. If a C Data export
-still lends this memory out, the steps after revocation wait until the
-consumer has released that export and `reap!` reclaims it. Exactly once — one
-atomic swap picks the single releaser between an explicit call and the GC
-finalizer, and later calls return immediately. This is also the only
-lifetime handle for an empty import that carries no region at all;
-`ArrayData.owner` then holds it. A conformance failure throws (from `reap!`
-for a deferred release), and reports as a finalizer error on the finalizer
-path.
+Release an imported column now: later access to its buffers throws an
+`InvalidStateException`, and the producer's `release` callback runs. If the column was
+exported again and that consumer still holds it, the callback runs once the consumer
+releases it and [`Arrow.reap!`](@ref) runs. Later calls do nothing. A producer whose
+callback does not mark the struct released, as the interface requires, makes this throw.
 """
 function release!(o::ForeignOwner)
     return release!(o.cell)
@@ -1172,17 +1175,16 @@ childat(a::CArrowArray, i::Int) = unsafe_load(unsafe_load(a.children, i))
 bufferptr(a::CArrowArray, i::Int) = unsafe_load(a.buffers, i)
 
 """
-    from_c_data(schemaptr, arrayptr) -> (Field, ArrayData)
+    Arrow.from_c_data(schemaptr, arrayptr) -> (Arrow.Field, Arrow.ArrayData)
 
-Import a C-data column. The ArrowArray is moved: it is copied by value and its
-source release is nulled so the producer side cannot double-free. The
-ArrowSchema is parsed and then released in place. Buffer extents are computed
-from length/offset/layout — DECLARED extents: the ABI cannot prove the
-allocation sizes, so this is the trusted-in-process boundary, and validation
-runs on the declared geometry. The imported column passes the semantic tier
-(the same default as the IPC reader); `validate_full` on the returned pair is
-the caller's opt-in for content policy. A failed import releases the moved
-tree exactly once.
+Import one column through the C data interface. The array is moved, as the interface
+requires: Arrow.jl takes over its `release` callback and marks the struct at `arrayptr`
+released. The schema is read and then released. The imported buffers stay valid while
+the returned data is reachable; `Arrow.release!(data.owner)` releases them at once.
+
+Buffer sizes follow from the declared lengths and offsets, which the producer is
+trusted to get right, as the interface cannot check them; the column is then validated
+as an IPC read is. A failed import releases the array.
 """
 from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}) = _from_c_data(sp, ap)
 
@@ -1597,10 +1599,9 @@ end
 # marshaling to a Julia-owned worker for foreign-thread callers.
 
 """
-    CArrowArrayStream
+    Arrow.CArrowArrayStream
 
-The field-exact Julia representation of the Arrow C stream interface's
-`ArrowArrayStream` ABI struct.
+The C stream interface's `ArrowArrayStream` struct, field for field.
 """
 struct CArrowArrayStream
     get_schema::Ptr{Cvoid}     # int (*)(ArrowArrayStream*, ArrowSchema* out)
@@ -1847,14 +1848,13 @@ function _validate_stream_field(f::Field)
 end
 
 """
-    export_stream!(sp::Ptr{CArrowArrayStream}, sch::Schema, batches)
+    Arrow.export_stream!(streamptr::Ptr{CArrowArrayStream}, schema::Arrow.Schema, batches)
 
-Fill a CALLER-owned ArrowArrayStream struct (the C stream convention: the
-producer fills, the consumer owns the struct storage) streaming `batches` as
-struct-typed arrays whose children are the schema's columns. The stream's
-registry root keeps schema fields and batches reachable until `release`;
-every `get_schema`/`get_next` result is its own export root with the same
-lifecycle as `to_c_data` output.
+Fill the `ArrowArrayStream` the caller allocated at `streamptr` with a stream that yields
+`batches`, a vector of [`Arrow.RecordBatch`](@ref) values with `schema`. Each batch the
+consumer pulls is a struct array of the batch's columns, exported as
+[`Arrow.to_c_data`](@ref) exports a column. The batches stay reachable until the consumer
+releases the stream.
 """
 export_stream!(
     sp::Ptr{CArrowArrayStream},
@@ -2015,16 +2015,13 @@ function release!(o::StreamOwner)
 end
 
 """
-    ImportedStream
+    Arrow.ImportedStream
 
-Consumer side of a moved ArrowArrayStream: `schema(s)` is fixed at import,
-`nextbatch!(s)` pulls one struct-typed batch (returning `nothing` at end of
-stream), and `release!(s)` ends the producer's stream exactly once. Each
-pulled batch owns its own ForeignOwner and outlives the stream if the caller
-keeps it. Producer-reported failures surface as `ValidationError`s carrying
-the producer's `get_last_error` text. One stream call at a time: an
-overlapping `nextbatch!`/`release!` throws `ConcurrencyViolationError`
-rather than entering the producer's callbacks concurrently.
+A stream imported with [`Arrow.from_c_stream`](@ref). `Arrow.nextbatch!(stream)` returns
+its next [`Arrow.RecordBatch`](@ref), or `nothing` at the end, and `Arrow.release!(stream)`
+releases the producer's stream; batches already read stay valid. An error the producer
+reports is a `ValidationError` with the producer's message. Use a stream from one task at
+a time: overlapping calls throw a `ConcurrencyViolationError`.
 """
 mutable struct ImportedStream <: AC.RecordBatchSource
     const owner::StreamOwner
@@ -2052,11 +2049,10 @@ end
 _finishstreamcall!(s::ImportedStream) = (@atomic :release s.pulling = false)
 
 """
-    release!(s::ImportedStream)
+    Arrow.release!(stream::Arrow.ImportedStream)
 
-Run the producer's stream release callback exactly once (later calls and the
-GC finalizer are no-ops); batches already pulled keep their own owners and
-stay valid.
+Release an imported stream now: the producer's `release` callback runs, and later calls
+do nothing. Batches already read stay valid.
 """
 function release!(s::ImportedStream)
     _claimstreamcall!(s)
@@ -2080,11 +2076,11 @@ function _stream_call_failed(o::StreamOwner, what::AbstractString)
 end
 
 """
-    from_c_stream(sp::Ptr{CArrowArrayStream}) -> ImportedStream
+    Arrow.from_c_stream(streamptr::Ptr{CArrowArrayStream}) -> Arrow.ImportedStream
 
-Move a producer's stream (copy the struct, null the source release) and read
-its schema. The schema must be a struct-typed batch schema, per the C stream
-convention; its fields become the imported `Schema`.
+Import a C stream: Arrow.jl takes over the stream, marking the struct at `streamptr`
+released, and reads its schema, whose fields are the batches' columns. Read batches with
+[`Arrow.nextbatch!`](@ref) and release the stream with `Arrow.release!`.
 """
 function from_c_stream(sp::Ptr{CArrowArrayStream})
     sp == C_NULL && throw(ArgumentError("ArrowArrayStream pointer is NULL"))

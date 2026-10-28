@@ -23,38 +23,23 @@
 """
     Arrow.AbstractArrowSource
 
-A byte-addressable object of known length — an object in cloud storage, an
-HTTP resource, an in-memory buffer — that [`Arrow.Table`](@ref) reads with
-exact byte-range requests instead of downloading whole. With a
-`Tables.Scan`, Arrow reads the file-format footer from the tail. It prunes
-batches by the footer's statistics and — without a filter — by the scan's
-window. It then requests only the surviving batches' buffers for the
-selected and filter-referenced columns, coalesced into a few ranges issued
-in one round. A filtered limit stops decoding, not fetching.
-
-An implementation defines two methods:
+Supertype of sources that supply bytes by range, such as objects in cloud storage, for
+[`Arrow.Table`](@ref) and [`Arrow.Stream`](@ref). An implementation defines
 
     Arrow.sourcelength(src)::Integer                  # total length in bytes
     Arrow.readrange(src, offset, len)::Vector{UInt8}  # `len` bytes from 0-based `offset`
 
-and may override
+and may define [`Arrow.concurrentreads`](@ref) to let several ranges be read at once.
 
-    Arrow.concurrentreads(src)::Int                   # default 1
+`Arrow.Table` with `select`, `drop`, `filter`, `limit`, or `scan` reads the file-format
+footer from the end of the source, then fetches only the record batches and columns it
+needs, coalesced into a few ranges; without them, it fetches the whole source in 8 MiB
+ranges. `Arrow.Stream` fetches record batches as the iteration reaches them, small ones
+several to a request. A stream-format source has no footer and is read in order.
 
-to let Arrow issue planned ranges through `readrange` concurrently. One
-read handle samples that preference once, clamps it by
-`Limits.max_concurrent_reads`, and uses one semaphore across every operation
-on that handle (Arrow places each result by its request, so completion order
-never matters). Separate read handles are independent; a transport that
-needs one process-wide cap must enforce it inside `readrange`.
-
-Every returned vector must have exactly the requested length. Arrow
-validates lengths and offsets and refuses violations with a
-`ValidationError`. Arrow keeps each returned vector without copying it and
-reads it again after later requests, so `readrange` must return a new
-vector every time and never reuse, resize, or mutate one it returned.
-Arrow cannot authenticate the bytes themselves: the source is trusted to
-return what lives at the requested range.
+`readrange` must return a new vector of exactly `len` bytes each time, and never reuse or
+change it: Arrow keeps it without copying. Arrow validates what it reads, but the source
+is trusted to return the bytes stored at the range.
 
 ```julia
 struct BytesSource <: Arrow.AbstractArrowSource
@@ -63,46 +48,36 @@ end
 Arrow.sourcelength(s::BytesSource) = length(s.data)
 Arrow.readrange(s::BytesSource, offset, len) = s.data[(offset + 1):(offset + len)]
 
-tbl = Arrow.Table(BytesSource(bytes); scan=Tables.Scan(select=(:a, :b)))
+table = Arrow.Table(BytesSource(bytes); select=[:a, :b])
 ```
 
-Without a scan, `Arrow.Table` reads the whole object in 8 MiB ranges,
-`concurrentreads` of them at a time, into one buffer. [`Arrow.Stream`](@ref)
-fetches as it iterates: a file-format object each record batch's bytes
-after its footer and dictionaries, a stream-format object one message at a
-time.
-
-The `CloudStore.jl` extension makes a `CloudStore.Object` a source, so
-`Arrow.Table(CloudStore.Object(bucket, key); scan=…)` reads just the needed
-column bytes from S3 or Azure Blob Storage.
+With CloudStore.jl loaded, a `CloudStore.Object` (S3 or Azure Blob Storage) is a source.
 """
 abstract type AbstractArrowSource end
 
 """
-    Arrow.sourcelength(src::AbstractArrowSource) -> Integer
+    Arrow.sourcelength(src::Arrow.AbstractArrowSource) -> Integer
 
-The source's total length in bytes. Required of every implementation.
+The source's length in bytes. Every source defines it.
 """
 function sourcelength end
 
 """
-    Arrow.readrange(src::AbstractArrowSource, offset, len) -> Vector{UInt8}
+    Arrow.readrange(src::Arrow.AbstractArrowSource, offset, len) -> Vector{UInt8}
 
-`len` bytes starting at 0-based `offset`; the result must have exactly `len`
-elements and be a new vector that the source never touches again (Arrow
-keeps it without copying). Required of every implementation.
+The `len` bytes starting at 0-based `offset`, as a new vector of exactly `len` elements
+that the source does not touch again: Arrow keeps it without copying. Every source
+defines it.
 """
 function readrange end
 
 """
-    Arrow.concurrentreads(src::AbstractArrowSource) -> Int
+    Arrow.concurrentreads(src::Arrow.AbstractArrowSource) -> Int
 
-How many [`Arrow.readrange`](@ref) calls Arrow may have in flight at once
-through one `SourceFile` handle: a scan's planned ranges, or the ranges of a
-whole-object read. The default, `1`, reads them one at a time (a whole object
-in one range); a transport whose requests are independent (HTTP range GETs)
-returns a bound suited to it. The handle samples the value once, clamps it by
-`Limits.max_concurrent_reads`, and stores every result by request index.
-Separate handles are independent.
+How many [`Arrow.readrange`](@ref) calls one read may have in flight at once, up to
+`Limits.max_concurrent_reads`. The default, 1, reads ranges one at a time; a source whose
+requests are independent, such as HTTP range requests, returns a larger number. The
+limit applies to each read separately: a source that needs one cap for the whole
+process enforces it in `readrange`.
 """
 concurrentreads(::AbstractArrowSource) = 1

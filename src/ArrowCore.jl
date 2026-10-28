@@ -195,15 +195,12 @@ end
 ReleaseCell(action::Ptr{Cvoid}, arg) = ReleaseCell(false, action, arg)
 ReleaseCell() = ReleaseCell(false, Ptr{Cvoid}(C_NULL), nothing)
 
-"""
-    release!(cell::ReleaseCell)
-
-Revoke every region sharing the cell — later raw access throws
-`InvalidStateException` — and run the cell's release action exactly once.
-Idempotent. Not a data-race shield for accesses concurrent WITH the release;
-quiescing readers first is the caller's contract, as with `Base.close` on
-a shared IO.
-"""
+# Revoke every region sharing the cell (later raw access throws
+# `InvalidStateException`) and run the cell's release action exactly once.
+# Idempotent. Not a data-race shield for accesses concurrent with the release:
+# quiescing readers first is the caller's contract, as with `Base.close` on a
+# shared IO. (Comments, not docstrings: `?Arrow.release!` lists only the
+# public methods.)
 function release!(cell::ReleaseCell)
     (@atomicswap :acquire_release cell.closed = true) && return nothing
     if cell.action != C_NULL
@@ -264,18 +261,12 @@ struct OwnerRegion
     end
 end
 
-"""
-    release!(r::OwnerRegion)
-
-Deterministically release the region's backing storage through its
-`ReleaseCell`: every region sharing the cell is revoked (later raw
-access throws `InvalidStateException`) and the cell's release action runs
-exactly once — an mmap region unmaps NOW (the eager path exists for hosts
-where a GC-timed unmap is not enough, deleting a still-mapped file on
-Windows being the canonical case); an imported C-data tree runs the
-producer's release callback; a borrowed heap region is revoked with no
-eager action. Idempotent.
-"""
+# Release the region's backing storage through its `ReleaseCell`: every region
+# sharing the cell is revoked (later raw access throws `InvalidStateException`)
+# and the cell's release action runs exactly once. An mmap region unmaps now
+# (for hosts where a GC-timed unmap is not enough, such as deleting a mapped
+# file on Windows); an imported C-data tree runs the producer's release
+# callback; a borrowed heap region is revoked with no eager action. Idempotent.
 function release!(r::OwnerRegion)
     return release!(r.cell)
 end

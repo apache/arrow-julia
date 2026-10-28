@@ -14,33 +14,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Layering (docs/dev/core-README.md documents each layer in depth):
+#
+# - `ArrowCore` (private): ownership regions, layout registry, `ArrayData`,
+#   staged validation, accessors; the trim-friendly, dependency-free core.
+# - `Meta`: FlatBuffers metadata bindings and the shape verifier, both
+#   generated from the vendored spec schemas (`src/metadata/fbs/`, generator
+#   `tools/fbsgen.jl`) over the vendored `FlatBuffers` runtime.
+# - IPC adapters (`ipc_read.jl`, `ipc_write.jl`): stream and file formats,
+#   framing, resource limits, compression, dictionary lifecycles.
+# - `cdata.jl`: the C data and C stream interfaces, import and export, with
+#   lifecycle accounting.
+# - `scan.jl`: `Tables.Scan` pushdown over byte ranges plus footer-carried
+#   statistics pruning.
+# - `table.jl`, `write.jl`: the read facade and write orchestration.
+# - `columnconstruction.jl`: column-wide construction policy, including
+#   retained schemas, dictionaries, and recursive ArrowTypes.jl lowering.
 """
-    Arrow.jl — a pure Julia implementation of the Apache Arrow columnar format.
+    Arrow
 
-Public surface: `Arrow.Table` reads the IPC stream and file formats (paths,
-`IO`, byte vectors, or an `AbstractArrowSource` — a byte-range-addressable
-object such as one in cloud storage) as Tables.jl tables, with `Tables.Scan`
-pushdown; `Arrow.Stream` iterates a source one record batch at a time;
-`Arrow.write` writes any Tables.jl source; `Arrow.release!` releases mapped or
-foreign storage deterministically.
-
-Layering ([docs/dev/core-README.md](https://github.com/apache/arrow-julia/blob/main/docs/dev/core-README.md)
-documents each layer in depth):
-
-- `ArrowCore` (private): ownership regions, layout registry, `ArrayData`,
-  staged validation, accessors — the trim-friendly, dependency-free core.
-- `Meta`: FlatBuffers metadata bindings AND the shape verifier, both
-  GENERATED from the vendored spec schemas (`src/metadata/fbs/`, generator
-  `tools/fbsgen.jl`) over the vendored `FlatBuffers` runtime.
-- IPC adapters (`ipc_read.jl`, `ipc_write.jl`): stream and file formats,
-  framing, resource limits, compression, dictionary lifecycles.
-- `cdata.jl`: the C data and C stream interfaces, import and export, with
-  lifecycle accounting.
-- `scan.jl`: `Tables.Scan` pushdown over byte ranges plus footer-carried
-  statistics pruning.
-- `table.jl`, `write.jl`: the read facade and write orchestration.
-- `columnconstruction.jl`: column-wide construction policy, including
-  retained schemas, dictionaries, and recursive ArrowTypes.jl lowering.
+Read and write the Apache Arrow IPC file and stream formats. [`Arrow.Table`](@ref) reads
+a path, an `IO`, a byte vector, or an [`Arrow.AbstractArrowSource`](@ref) as Tables.jl
+columns; [`Arrow.Stream`](@ref) reads one record batch at a time; [`Arrow.write`](@ref)
+and [`Arrow.Writer`](@ref) write any Tables.jl table. The names are public but not
+exported, apart from `ArrowTypes`: call them as `Arrow.Table` and so on.
 """
 module Arrow
 
@@ -108,69 +105,71 @@ include("sharedvalues.jl")
 @doc """
     Arrow.Field
 
-A low-level Arrow column descriptor used by the C data interface. Obtain a
-field with [`Arrow.fromjulia`](@ref) or [`Arrow.from_c_data`](@ref).
+A column's name, Arrow type, nullability, children, and metadata, as the C data
+interface uses it. [`Arrow.fromjulia`](@ref) and [`Arrow.from_c_data`](@ref) return one.
 """ Field
 
 @doc """
     Arrow.Schema
 
-A low-level ordered collection of [`Arrow.Field`](@ref) values plus optional
-schema metadata. The C stream interface uses it to describe each batch.
+The [`Arrow.Field`](@ref)s of a record batch, in order, with optional key-value
+metadata. The C stream interface describes its batches with one.
 """ Schema
 
 @doc """
     Arrow.ArrayData
 
-A low-level Arrow array: buffers, children, an optional dictionary, and a
-logical length. Obtain it with [`Arrow.fromjulia`](@ref) or
-[`Arrow.from_c_data`](@ref), and convert it with [`Arrow.materialize`](@ref).
+The values of one column in Arrow's memory layout: its buffers, children, optional
+dictionary, and length. [`Arrow.fromjulia`](@ref) and [`Arrow.from_c_data`](@ref) return
+one; [`Arrow.materialize`](@ref) converts it to a Julia vector, and `copy` copies it into
+Julia-owned memory.
 """ ArrayData
 
 @doc """
     Arrow.RecordBatch
 
-A low-level [`Arrow.Schema`](@ref) and an equal-length `Arrow.ArrayData`
-column for each field. [`Arrow.batch`](@ref) builds one from Julia vectors.
+A record batch: a [`Arrow.Schema`](@ref) (`batch.schema`), one
+[`Arrow.ArrayData`](@ref) per field (`batch.columns`), and the row count
+(`batch.nrows`). [`Arrow.batch`](@ref) builds one from Julia vectors.
 """ RecordBatch
 
 @doc """
     Arrow.fromjulia(name, values) -> (Arrow.Field, Arrow.ArrayData)
 
-Build the low-level C-interchange representation of one supported Julia
-vector. Do not resize or mutate zero-copy input buffers while the result is in
-use.
+The field and data of a column named `name` holding `values`, for the C data
+interface. The data may share `values`' memory: do not modify or resize `values` while
+the result is in use.
 """ fromjulia
 
 @doc """
     Arrow.batch(columns::NamedTuple) -> Arrow.RecordBatch
 
-Build a low-level record batch from a named tuple of supported Julia vectors.
+A record batch of the named vectors in `columns`, as [`Arrow.fromjulia`](@ref) builds
+each one.
 """ batch
 
 @doc """
     Arrow.materialize(field, data) -> Vector
     Arrow.materialize(T, field, data) -> Vector{T}
 
-Convert low-level `Arrow.ArrayData` to native Julia values. The typed form
-checks that `T` agrees with the Arrow descriptor before conversion.
+The values of `data`, a column described by `field`, as a new Julia vector. The typed
+form returns a `Vector{T}` and first checks that `T` fits the field's Arrow type.
 """ materialize
 
 """
-    Arrow.nextbatch!(source) -> Union{Nothing, RecordBatch}
+    Arrow.nextbatch!(stream::Arrow.ImportedStream) -> Union{Arrow.RecordBatch,Nothing}
 
-Pull the next record batch from a record-batch source — an IPC stream
-(`readstream`), an imported C stream (`from_c_stream`) — or `nothing` at end
-of stream. Sources are single-owner cursors: overlapping calls on one source
-are an error.
+The next record batch of a stream imported with [`Arrow.from_c_stream`](@ref), or
+`nothing` at its end. Overlapping calls on one stream are an error.
 """
 AC.nextbatch!
 
 """
     Arrow.ValidationError
 
-Thrown by every validation tier — structural, semantic, and the opt-in
-`validate_full` — when a descriptor or array violates the Arrow format.
+Thrown when input is not valid Arrow data, or uses something this package does not
+read: corrupt, truncated, or inconsistent metadata or buffers, bytes that are not Arrow
+at all, or big-endian data. The message names the problem.
 """
 AC.ValidationError
 
