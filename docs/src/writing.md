@@ -97,15 +97,18 @@ gives smaller files; LZ4 is faster to write and read.
 ## Threads and memory
 
 `ntasks` tasks build the columns of a record batch and compress its buffers
-in parallel; batches are written in order, one at a time. A batch with fewer
-than 65,536 values (rows times columns) builds on one task, and a body of
-less than 1 MiB compresses on one task, since smaller work does not pay for
-the tasks. The output is the same bytes for every `ntasks`. Start Julia with
-threads (`julia -t 8`) for the tasks to run at once.
+in parallel, largest buffers first. With compression, a batch compresses while
+the next one builds, and batches are written in order; every batch of a table
+is written before `Arrow.write` returns. A batch with fewer than 65,536 values
+(rows times columns) builds on one task, and a body of less than 1 MiB
+compresses on one task, since smaller work does not pay for the tasks. The
+output is the same bytes for every `ntasks`. Start Julia with threads
+(`julia -t 8`) for the tasks to run at once.
 
-The writer holds the partition being written, the record batch being built,
-and that batch's encoded buffers, and in the file format each dictionary that
-grows until it is written at the end. Columns that are already Arrow layouts
+The writer holds the partition being written, the record batch being built
+(with compression on several tasks, also the batch before it) and its encoded
+buffers, and in the file format each dictionary that grows until it is
+written at the end. Columns that are already Arrow layouts
 (fixed-width values and validity from an `Arrow.Table`, say) are written from
 their own memory, without a copy.
 

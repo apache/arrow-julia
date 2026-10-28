@@ -431,18 +431,32 @@ function _writeparts!(w::Writer, @nospecialize(tbl))
     # nullable, and dictionaries may grow, as for an Arrow.Writer.
     several = next !== nothing
     k = 1
-    while true
-        try
-            _writepartition!(w, part, retained, several)
-        catch err
-            err isa _InvalidUTF8 || rethrow()
-            throw(ArgumentError(_invalidutf8message(err.column, err.row, several ? k : 0)))
+    try
+        while true
+            try
+                _writepartition!(w, part, retained, several)
+            catch err
+                err isa _InvalidUTF8 || rethrow()
+                msg = _invalidutf8message(err.column, err.row, several ? k : 0)
+                throw(ArgumentError(msg))
+            end
+            next === nothing && break
+            part, state = next
+            next = iterate(parts, state)
+            k += 1
         end
-        next === nothing && return nothing
-        part, state = next
-        next = iterate(parts, state)
-        k += 1
+    catch
+        # The batches written before the failure still publish; the failure
+        # is the error to report.
+        try
+            w.st === nothing || drainwrite!(w.st)
+        catch
+        end
+        rethrow()
     end
+    # A table's batches are published before its write returns.
+    w.st === nothing || drainwrite!(w.st)
+    return nothing
 end
 
 function _writepartition!(w::Writer, @nospecialize(part), retained, several::Bool)

@@ -373,6 +373,28 @@ batchkinds(bytes) = [
         @test t.a == [1, 2]
     end
 
+    @testset "compressed batches on several tasks publish before each write returns" begin
+        big = (; a=collect(1:50_000), b=[string(k) for k = 1:50_000])
+        # The second partition is refused; the first's batch still publishes.
+        bad = Tables.partitioner([(; a=[1, 2], b=["p", "q"]), (; a=[1.5], b=["x"])])
+        for compress in (:lz4, :zstd), file in (true, false)
+            sizes = map((1, 4)) do ntasks
+                io = IOBuffer()
+                w = Arrow.Writer(io; file, compress, ntasks, batchsize=7000)
+                Arrow.write(w, big)
+                afterbig = io.size
+                @test_throws ArgumentError Arrow.write(w, bad)
+                afterbad = io.size
+                close(w)
+                bytes = take!(io)
+                t = Arrow.Table(bytes)
+                @test t.a == [big.a; 1; 2] && t.b == [big.b; "p"; "q"]
+                (afterbig, afterbad, bytes)
+            end
+            @test sizes[1] == sizes[2]
+        end
+    end
+
     @testset "append to a stream path and io" begin
         path = joinpath(mktempdir(), "s.arrow")
         Arrow.write(path, t1; file=false)

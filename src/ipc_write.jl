@@ -1018,7 +1018,16 @@ mutable struct IPCWriteState
     const recordblocks::Vector{NTuple{3,Int64}}
     written::Int64                       # bytes published to `io`
     finished::Bool
+    # A compressed batch encodes on its own task while the next one builds;
+    # batches publish in order. Each pending entry is the encoding task and
+    # the codec states it uses; `statesets` holds idle sets for reuse.
+    const pending::Vector{Tuple{Task,Vector{EncodeState}}}
+    const statesets::Vector{Vector{EncodeState}}
 end
+
+# Compressed batches encoding at once: two keep the tasks busy while one
+# batch waits for its largest buffer, and two sets of frames are reused.
+const _INFLIGHT = 2
 
 function _checkgrowth(growth::Symbol, file::Bool)
     growth in (:delta, :replace, :defer) ||
@@ -1105,6 +1114,8 @@ function beginwrite!(
         NTuple{3,Int64}[],
         Int64(0),
         false,
+        Tuple{Task,Vector{EncodeState}}[],
+        Vector{EncodeState}[],
     )
     out = UInt8[]
     if file
@@ -1119,7 +1130,7 @@ end
 # Publish staged messages in order: each header, then its body straight
 # from the column buffers. A file-format Block records the global offset,
 # the header length (prefix + metadata), and the body length.
-function _publishmessages!(st::IPCWriteState, messages)
+function _publishmessages!(st::IPCWriteState, messages, states=st.states)
     for (header, body, blocks) in messages
         blocks === nothing ||
             push!(blocks, (st.written, Int64(length(header)), body.bodylen))
@@ -1128,7 +1139,36 @@ function _publishmessages!(st::IPCWriteState, messages)
         st.written += length(header) + body.bodylen
     end
     # The sink holds the bytes now, so the frames can hold the next ones.
-    _recycleframes!(st.states)
+    _recycleframes!(states)
+    return nothing
+end
+
+# Encode staged messages: each builder makes one (header, body) with `states`.
+_buildmessages(builders, states, ntasks) = Tuple{Vector{UInt8},EncodeCursor,Any}[
+    (build(states, ntasks)..., blocks) for (build, blocks) in builders
+]
+
+"Publish the oldest pending batch, after its encoding task finishes."
+function _publishnext!(st::IPCWriteState)
+    task, states = popfirst!(st.pending)
+    messages = try
+        fetch(task)
+    catch err
+        _recycleframes!(states)
+        push!(st.statesets, states)
+        err isa TaskFailedException && throw(err.task.exception)
+        rethrow()
+    end
+    _publishmessages!(st, messages, states)
+    push!(st.statesets, states)
+    return nothing
+end
+
+"Publish every pending batch, in order."
+function drainwrite!(st::IPCWriteState)
+    while !isempty(st.pending)
+        _publishnext!(st)
+    end
     return nothing
 end
 
@@ -1163,7 +1203,7 @@ function writebatch!(
     # pool updates, so a failure publishes nothing and changes no state. A
     # shared or nested dictionary id occurs more than once in a batch, always
     # with one pool: its first occurrence stages the pool, the rest see it.
-    messages = Tuple{Vector{UInt8},EncodeCursor,Any}[]
+    builders = Tuple{Any,Any}[]
     staged = Dict{Int64,ArrayData}()
     deferred = Tuple{Field,Int64}[]
     dictblocks = st.file ? st.dictblocks : nothing
@@ -1193,8 +1233,7 @@ function writebatch!(
         end
         if delta !== nothing && st.growth === :replace
             # A stream re-sends a grown pool whole, which every reader accepts.
-            header, body = _dictionarymessage(id, vf, pool, st.codec, st.states, st.ntasks)
-            push!(messages, (header, body, dictblocks))
+            push!(builders, (_dictbuilder(st, id, vf, pool, false), dictblocks))
             staged[id] = pool
             continue
         end
@@ -1203,16 +1242,7 @@ function writebatch!(
                 ArgumentError("delta dictionary does not complete the pool for id $id"),
             )
             validate_semantic(vf, delta)
-            header, body = _dictionarymessage(
-                id,
-                vf,
-                delta,
-                st.codec,
-                st.states,
-                st.ntasks;
-                isdelta=true,
-            )
-            push!(messages, (header, body, dictblocks))
+            push!(builders, (_dictbuilder(st, id, vf, delta, true), dictblocks))
             staged[id] = pool
             continue
         end
@@ -1248,17 +1278,31 @@ function writebatch!(
                 continue
             end
         end
-        header, body = _dictionarymessage(id, vf, pool, st.codec, st.states, st.ntasks)
-        push!(messages, (header, body, dictblocks))
+        push!(builders, (_dictbuilder(st, id, vf, pool, false), dictblocks))
         staged[id] = pool
     end
-    header, body = _recordmessage(batch, st.schema.fields, st.codec, st.states, st.ntasks)
-    push!(messages, (header, body, st.file ? st.recordblocks : nothing))
-    _publishmessages!(st, messages)
+    fields, codec = st.schema.fields, st.codec
+    record = (states, k) -> _recordmessage(batch, fields, codec, states, k)
+    push!(builders, (record, st.file ? st.recordblocks : nothing))
+    if st.ntasks > 1 && codec != CODEC_NONE
+        states =
+            isempty(st.statesets) ? _encodestates(codec, st.states[1].level, st.ntasks) :
+            pop!(st.statesets)
+        push!(
+            st.pending,
+            (Threads.@spawn(_buildmessages(builders, states, st.ntasks)), states),
+        )
+        length(st.pending) > _INFLIGHT - 1 && _publishnext!(st)
+    else
+        _publishmessages!(st, _buildmessages(builders, st.states, st.ntasks))
+    end
     merge!(st.current, staged)
     append!(st.deferred, deferred)
     return nothing
 end
+
+_dictbuilder(st::IPCWriteState, id, vf, pool, isdelta::Bool) =
+    (states, k) -> _dictionarymessage(id, vf, pool, st.codec, states, k; isdelta)
 
 # The file-format trailer: Footer flatbuffer (schema again, then the two
 # Block struct-vectors), the Int32 footer length, and the trailing magic.
@@ -1297,6 +1341,7 @@ end
 
 function finishwrite!(st::IPCWriteState)
     st.finished && return nothing
+    drainwrite!(st)
     if st.growth === :defer && !isempty(st.current)
         # Each id's final pool once, after the record batches that use it (the
         # file format allows a dictionary anywhere before the footer).
@@ -1321,7 +1366,7 @@ function finishwrite!(st::IPCWriteState)
     )
     _publish!(st, out)
     st.finished = true
-    foreach(close, st.states)
+    _closestates!(st)
     return nothing
 end
 
@@ -1329,7 +1374,23 @@ end
 function abortwrite!(st::IPCWriteState)
     st.finished && return nothing
     st.finished = true
+    for (task, states) in st.pending
+        # A failure here follows from the caller's error.
+        try
+            wait(task)
+        catch
+        end
+        push!(st.statesets, states)
+    end
+    empty!(st.pending)
+    _closestates!(st)
+    return nothing
+end
+
+function _closestates!(st::IPCWriteState)
     foreach(close, st.states)
+    foreach(states -> foreach(close, states), st.statesets)
+    empty!(st.statesets)
     return nothing
 end
 
@@ -1374,6 +1435,8 @@ function resumestream!(
         NTuple{3,Int64}[],
         Int64(0),
         false,
+        Tuple{Task,Vector{EncodeState}}[],
+        Vector{EncodeState}[],
     )
 end
 
