@@ -51,10 +51,60 @@ Base.similar(::Type{<:ArrowVector{T}}, dims::Dims) where {T} = Array{T}(undef, d
 
 # --- buffer wrapping ------------------------------------------------------------
 
+"""
+A read-only vector of `S` values in memory that need not be aligned for `S`,
+read with unaligned loads. Arrow IPC buffers are aligned to 8 bytes (pyarrow
+writes no more), so 16- and 32-byte values (`Int128`, 128- and 256-bit
+decimals) start at a 16-byte boundary only half of the time. `owner` keeps
+the memory alive.
+"""
+struct _UnalignedVector{S} <: AbstractVector{S}
+    ptr::Ptr{S}
+    len::Int
+    owner::Any
+end
+Base.size(v::_UnalignedVector) = (v.len,)
+Base.IndexStyle(::Type{<:_UnalignedVector}) = IndexLinear()
+Base.@propagate_inbounds function Base.getindex(v::_UnalignedVector, i::Int)
+    @boundscheck checkbounds(v, i)
+    owner = v.owner
+    # `unsafe_load` loads with alignment 1.
+    return GC.@preserve owner unsafe_load(v.ptr, i)
+end
+function Base.copyto!(
+    dest::Vector{S},
+    doffs::Integer,
+    src::_UnalignedVector{S},
+    soffs::Integer,
+    n::Integer,
+) where {S}
+    n == 0 && return dest
+    (
+        n > 0 &&
+        checkbounds(Bool, dest, doffs:(doffs + n - 1)) &&
+        checkbounds(Bool, src, soffs:(soffs + n - 1))
+    ) || throw(BoundsError(dest, doffs:(doffs + n - 1)))
+    owner = src.owner
+    GC.@preserve dest owner unsafe_copyto!(
+        Ptr{UInt8}(pointer(dest, doffs)),
+        Ptr{UInt8}(src.ptr + (soffs - 1) * sizeof(S)),
+        n * sizeof(S),
+    )
+    return dest
+end
+
+Base.copy(v::_UnalignedVector{S}) where {S} =
+    copyto!(Vector{S}(undef, v.len), 1, v, 1, v.len)
+
+# How a column stores its `S` values: in place with unaligned loads when `S`
+# needs more than the 8-byte alignment Arrow buffers have, else a `Vector`.
+_buffertype(::Type{S}) where {S} =
+    Base.datatype_alignment(S) > 8 ? _UnalignedVector{S} : Vector{S}
+
 # An unowned vector over `n` elements of `S` starting `offset` elements into
-# `b`. Callers keep `b`'s region reachable for as long as the vector is used.
-# A misaligned start (possible only for foreign or hand-built buffers) gets
-# an owned, aligned copy instead.
+# `b` (a `_buffertype(S)`). Callers keep `b`'s region reachable for as long
+# as the vector is used. A start misaligned for `S` (possible only for
+# foreign or hand-built buffers) gets an owned, aligned `Vector` copy.
 function _wrapbuffer(
     ::Type{S},
     b::AC.BufferSlice,
@@ -63,10 +113,12 @@ function _wrapbuffer(
     budget=nothing,
 ) where {S}
     isbitstype(S) || throw(ArgumentError("a wrapped buffer needs an isbits element type"))
-    n == 0 && return S[]
+    unaligned = _buffertype(S) === _UnalignedVector{S}
+    n == 0 && return unaligned ? _UnalignedVector{S}(Ptr{S}(C_NULL), 0, nothing) : S[]
     w = Int64(sizeof(S))
     src = AC.subslice(b, AC.checked_mul(offset, w), AC.checked_mul(n, w))
     p = AC.sliceptr(src)
+    unaligned && return _UnalignedVector{S}(Ptr{S}(p), Int(n), src)
     if UInt(p) % Base.datatype_alignment(S) != 0
         _chargeexact!(budget, S, n, "aligned buffer copy")
         out = Vector{S}(undef, Int(n))
@@ -131,18 +183,21 @@ _storagetarget(::Type{_StoredBytes}) = Vector{UInt8}
 # --- fixed width ------------------------------------------------------------------
 
 """
-    Arrow.Primitive{T,S,C} <: Arrow.ArrowVector{T}
+    Arrow.Primitive{T,S,C,D} <: Arrow.ArrowVector{T}
 
 A fixed-width column: element `i` is the `i`th stored `S` value converted to
 `T` (the same bits when the layouts match), or `missing` where the validity
-bitmap marks a null.
+bitmap marks a null. `D` is how the `S` values are held: a `Vector{S}`, or
+for 16- and 32-byte values, a view of their buffer read with unaligned loads.
 """
-struct Primitive{T,S,C} <: ArrowVector{T}
-    data::Vector{S}
+struct Primitive{T,S,C,D<:AbstractVector{S}} <: ArrowVector{T}
+    data::D
     validity::Vector{UInt8}
     bitoffset::Int
     owner::Any
 end
+Primitive{T,S,C}(data::D, validity, bitoffset, owner) where {T,S,C,D<:AbstractVector{S}} =
+    Primitive{T,S,C,D}(data, validity, bitoffset, owner)
 
 Base.size(v::Primitive) = size(v.data)
 
@@ -250,7 +305,7 @@ function _maskedsum(A::Primitive{T,S}) where {T,S}
     return _maskedsum(A.data, A.validity, A.bitoffset, 1, length(A.data), neutral)
 end
 function _maskedsum(
-    data::Vector,
+    data::AbstractVector,
     bits::Vector{UInt8},
     off::Int,
     lo::Int,
@@ -1517,7 +1572,7 @@ end
 _columntype(::Type{T}) where {T} = _columntype(T, Base.nonmissingtype(T))
 _columntype(::Type{Missing}) = Vector{Missing}
 _columntype(::Type{T}, ::Type{S}) where {T,S} =
-    isbitstype(S) && S !== Bool ? Primitive{T,S,Nothing} : Vector{T}
+    isbitstype(S) && S !== Bool ? Primitive{T,S,Nothing,_buffertype(S)} : Vector{T}
 _columntype(::Type{T}, ::Type{DataStrings.DataString}) where {T} =
     DataStrings.StringVector{T}
 _columntype(::Type{T}, ::Type{DataStrings.DataBytes}) where {T} = DataStrings.BytesVector{T}
@@ -1666,7 +1721,7 @@ end
 # Converted values (dates, dictionary or run-end encoded values, ...) stored
 # as `S`s, with a validity bitmap when some slot is null; null slots hold zero
 # bytes.
-function _storeas(::Type{Primitive{T,S,Nothing}}, col, budget) where {T,S}
+function _storeas(::Type{Primitive{T,S,Nothing,D}}, col, budget) where {T,S,D}
     n = length(col)
     _chargeexact!(budget, S, n, "nested child values")
     data = Vector{S}(undef, n)
@@ -1679,7 +1734,8 @@ function _storeas(::Type{Primitive{T,S,Nothing}}, col, budget) where {T,S}
             @inbounds data[i] = x
         end
     end
-    return Primitive{T,S,Nothing}(data, validity, 0, nothing)
+    values = D === Vector{S} ? data : _UnalignedVector{S}(pointer(data), n, data)
+    return Primitive{T,S,Nothing,D}(values, validity, 0, nothing)
 end
 
 # A validity bitmap for `n` slots with slot `i` null; an empty `validity` (no
@@ -1901,7 +1957,7 @@ end
 
 _gathered(values::Vector, take) = values[take]
 _gathered(v::Primitive{T,S,Nothing}, take) where {T,S} =
-    _storeas(Primitive{T,S,Nothing}, view(v, take), nothing)
+    _storeas(typeof(v), view(v, take), nothing)
 _gathered(v::DataStrings.StringVector{E}, take) where {E} =
     DataStrings.StringVector{E}(v.payloads[take], v.buffers, Val(:trusted))
 _gathered(v::DataStrings.BytesVector{E}, take) where {E} =

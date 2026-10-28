@@ -136,6 +136,39 @@ end
         end
     end
 
+    @testset "16-byte values read in place at any 8-byte alignment" begin
+        # pyarrow aligns buffers to 8 bytes only: read each file from a
+        # 16-byte boundary and from 8 bytes past one, so that one of the two
+        # places its 16-byte values off their natural alignment. 128-bit
+        # decimals and Polars' 128-bit integers are views either way.
+        n = 10_000
+        vals = [reinterpret(Decimal{15,2,Int128}, Int128(i) * 7) for i = 1:n]
+        ints = Int128.(1:n) .* typemax(Int64)
+        AC = Arrow.AC
+        f = AC.Field("i", AC.IntType(128, true); nullable=false)
+        d = AC.ArrayData(f.type, n, [AC.BufferSlice(), AC._databuffer(ints)]; nullcount=0)
+        sch = AC.Schema([f])
+        for (bytes, col, want) in (
+            (arrowbytes((d=vals,)), :d, vals),
+            (Arrow.writefile(sch, [AC.RecordBatch(sch, [d])]), :i, ints),
+        )
+            holder = Vector{UInt8}(undef, length(bytes) + 8)
+            for shift in (0, 8)
+                GC.@preserve holder begin
+                    shifted = unsafe_wrap(Array, pointer(holder) + shift, length(bytes))
+                    copyto!(shifted, bytes)
+                    @test UInt(pointer(shifted)) % 16 == shift
+                    t = Arrow.Table(shifted)
+                    c = Tables.getcolumn(t, col)
+                    @test c isa Arrow.Primitive && c == want
+                    @test fewestbytes(() -> Arrow.Table(shifted)) < 100_000
+                    @test copy(c) == want && sum(c) == sum(want)
+                    @test c .+ c == want .+ want
+                end
+            end
+        end
+    end
+
     @testset "flat columns are read-only views" begin
         cols = (
             i=Int32[1, -2, 3],
