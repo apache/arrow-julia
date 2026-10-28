@@ -1594,6 +1594,7 @@ _sourcebudget(source, limits::Limits) =
         limits.max_total_allocated_bytes;
         ratio=limits.max_allocation_ratio,
         cap=limits.max_total_allocated_bytes,
+        maxnewsymbols=limits.max_new_symbols,
     )
 
 # The scan the read keywords ask for, or `nothing` for a whole read.
@@ -2409,8 +2410,10 @@ function _batchtable(s::Stream, b::AC.RecordBatch, budget::AllocationBudget)
     arrowtypeslock = getfield(s, :arrowtypeslock)
     lock(arrowtypeslock)
     try
-        # The caches outlive the batch; its allocations charge its own budget.
+        # The caches outlive the batch; its allocations charge its own budget,
+        # and its new Symbols count against its own limit.
         arrowtypes.budget = budget
+        arrowtypes.newsymbols = 0
         plan = arrowtypes.routeplan
         plan === nothing || (plan.budget = budget)
         views = _ViewContext(shared, budget)

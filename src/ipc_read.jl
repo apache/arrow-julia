@@ -44,6 +44,8 @@
 # Framing stage: resource limits before metadata-directed decode allocation
 # ---------------------------------------------------------------------------
 
+const _DEFAULT_MAX_NEW_SYMBOLS = 1_000_000
+
 """
     Arrow.Limits(; keyword arguments...)
 
@@ -62,6 +64,7 @@ work it governs can exceed it.
 | `max_nesting_depth`         | 64              | schema and metadata nesting         |
 | `max_array_length`          | 1,000,000,000   | array length                        |
 | `max_concurrent_reads`      | 64              | concurrent range reads              |
+| `max_new_symbols`           | 1,000,000       | new `Symbol` values per read        |
 
 A read may allocate `max_allocation_ratio` bytes per byte of its input (the
 file, buffer, IO, or object), at least 256 MiB, and at most
@@ -75,6 +78,12 @@ the bytes to back them (run-end encoded, view, null-child, or decompressed
 lengths beyond what the columns need) fail before they are allocated. Raise
 `max_allocation_ratio` for trusted data that expands further, such as long runs
 or heavily repeated dictionary values.
+
+A `Symbol` column (Julia's `JuliaLang.Symbol` extension) creates the `Symbol`s
+this process has not seen yet, and Julia never frees them, so a read (or one
+stream batch) creates at most `max_new_symbols`; a column needing more is
+refused before any of its values is converted. `select=[:col => String]` reads
+such a column as strings instead.
 
 Pass a `Limits` value as the `limits` keyword to [`Arrow.Table`](@ref) or
 [`Arrow.Stream`](@ref).
@@ -90,6 +99,7 @@ Base.@kwdef struct Limits
     max_nesting_depth::Int = 64
     max_array_length::Int64 = 1_000_000_000
     max_concurrent_reads::Int = 64
+    max_new_symbols::Int = _DEFAULT_MAX_NEW_SYMBOLS
 end
 
 _physicalmemory() = Int64(min(Sys.total_memory(), UInt64(typemax(Int64))))
@@ -97,17 +107,30 @@ _physicalmemory() = Int64(min(Sys.total_memory(), UInt64(typemax(Int64))))
 # `left` is charged and refunded with compare-and-swap, so decoding tasks
 # share a budget without a lock. `limit` grows as decompressed input arrives
 # (`ratio` bytes per byte, never past `cap`).
+# A read's budget also carries its `Limits.max_new_symbols`.
 mutable struct AllocationBudget
     @atomic left::Int64
     @atomic limit::Int64
     const ratio::Int64
     const cap::Int64
+    const maxnewsymbols::Int
 end
 
-function AllocationBudget(limit::Integer; ratio::Integer=0, cap::Integer=limit)
+function AllocationBudget(
+    limit::Integer;
+    ratio::Integer=0,
+    cap::Integer=limit,
+    maxnewsymbols::Integer=_DEFAULT_MAX_NEW_SYMBOLS,
+)
     value = Int64(limit)
     value >= 0 || throw(ArgumentError("allocation budget must be nonnegative"))
-    return AllocationBudget(value, value, Int64(ratio), max(value, Int64(cap)))
+    return AllocationBudget(
+        value,
+        value,
+        Int64(ratio),
+        max(value, Int64(cap)),
+        maxnewsymbols,
+    )
 end
 
 # Below this, a read's budget does not shrink with its input: small files keep
@@ -127,6 +150,7 @@ _readbudget(limits::Limits, nbytes::Integer) = AllocationBudget(
     _readlimit(limits, nbytes);
     ratio=limits.max_allocation_ratio,
     cap=limits.max_total_allocated_bytes,
+    maxnewsymbols=limits.max_new_symbols,
 )
 
 # Move `limit` to `new` and shift `left` by the same amount (not below 0).
@@ -477,6 +501,7 @@ function _validatelimits(limits::Limits)
     limits.max_array_length >= 0 || throw(ArgumentError("negative array-length limit"))
     limits.max_concurrent_reads >= 1 ||
         throw(ArgumentError("concurrent-read limit must be positive"))
+    limits.max_new_symbols >= 0 || throw(ArgumentError("negative new-Symbol limit"))
     return nothing
 end
 

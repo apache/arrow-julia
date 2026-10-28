@@ -678,8 +678,7 @@ mutable struct _ArrowTypesContext
     boxedchildren::Dict{AC.Field,Vector{Any}}
     routeplan::Union{Nothing,_ArrowTypesRoutePlan}
     warn::Bool
-    newsymbols::Int
-    newsymbolbytes::Int
+    newsymbols::Int   # Symbols this read created (see `_liftsymbol!`)
     budget::Union{Nothing,AllocationBudget}
 end
 function _ArrowTypesContext(;
@@ -735,7 +734,6 @@ function _ArrowTypesContext(;
         Dict{AC.Field,Vector{Any}}(),
         nothing,
         warn,
-        0,
         0,
         budget,
     )
@@ -1500,7 +1498,7 @@ function _arrowtypesfromarrow(ctx::_ArrowTypesContext, T, f::AC.Field, storage)
     value === nothing || return value
     t = f.type
     if _arrowtypesutf8storage(ctx, f) && storage isa AbstractString
-        T === Symbol && return _liftsymbol!(ctx, storage)
+        T === Symbol && return _liftsymbol!(ctx, storage, f.name)
         bytes = codeunits(storage)
         GC.@preserve storage bytes begin
             return ArrowTypes.fromarrow(T, pointer(bytes), length(bytes))
@@ -1609,37 +1607,69 @@ function _arrowtypesvalue(ctx::_ArrowTypesContext, f::AC.Field, x)
 end
 
 # Interning a Symbol permanently allocates process-global state, so one read
-# may intern at most as many new Symbol values (and bytes) as it may intern
-# new column names; values already interned cost nothing.
-function _liftsymbol!(ctx::_ArrowTypesContext, s::AbstractString)
+# (one stream batch) creates at most `Limits.max_new_symbols` of them, and
+# charges their bytes to its allocation budget; existing Symbols cost nothing.
+_maxnewsymbols(ctx::_ArrowTypesContext) =
+    ctx.budget === nothing ? _DEFAULT_MAX_NEW_SYMBOLS : ctx.budget.maxnewsymbols
+
+function _liftsymbol!(ctx::_ArrowTypesContext, s::AbstractString, name::AbstractString)
     symbol = _existingjlsymbol(s)
     symbol === nothing || return symbol
-    n = ncodeunits(s)
-    if occursin('\0', s) ||
-       ctx.newsymbols >= _MAX_TABLES_NEW_FIELD_NAMES ||
-       ctx.newsymbolbytes > _MAX_TABLES_NEW_FIELD_NAME_BYTES - n
-        displayname = _extensionwarningname(s, ctx.budget)
-        _chargeobject!(
-            ctx.budget,
-            AC.checked_add(
-                Int64(160),
-                AC.checked_mul(Int64(4), Int64(ncodeunits(displayname))),
-            ),
-            "ArrowTypes Symbol validation message",
-        )
-        throw(
-            AC.ValidationError(
-                "JuliaLang.Symbol payload $(repr(displayname)) cannot be interned: " *
-                "Symbol values may not contain NUL, and one read interns at most " *
-                "$_MAX_TABLES_NEW_FIELD_NAMES new values totalling " *
-                "$_MAX_TABLES_NEW_FIELD_NAME_BYTES bytes",
-            ),
-        )
-    end
-    ctx.budget === nothing || _charge!(ctx.budget, Int64(n), "interned Symbol values")
+    occursin('\0', s) && _symbolnulerror(ctx, s, name)
+    # Top-level columns were counted before conversion (`_checknewsymbols`).
+    ctx.newsymbols < _maxnewsymbols(ctx) || _symbollimiterror(ctx, name, false)
+    ctx.budget === nothing ||
+        _charge!(ctx.budget, Int64(ncodeunits(s)), "interned Symbol values")
     ctx.newsymbols += 1
-    ctx.newsymbolbytes += n
     return Symbol(s)
+end
+
+@noinline function _symbolnulerror(ctx::_ArrowTypesContext, s, name)
+    displayname = _extensionwarningname(s, ctx.budget)
+    throw(
+        AC.ValidationError(
+            "field $name holds the JuliaLang.Symbol value $(repr(displayname)), " *
+            "which contains a NUL byte and cannot be a Symbol",
+        ),
+    )
+end
+
+# `column`: `name` is a top-level column, which `select` can read as strings.
+@noinline function _symbollimiterror(ctx::_ArrowTypesContext, name, column::Bool)
+    limit = _maxnewsymbols(ctx)
+    hint =
+        column ?
+        ", or read the column as strings with select=[$(repr(Symbol(name))) => String]" : ""
+    throw(
+        AC.ValidationError(
+            "$(column ? "column" : "field") $name holds more than $limit Symbol values " *
+            "this process has not created yet, the most one read may create (Julia " *
+            "never frees a Symbol). Raise the limit with " *
+            "limits=Arrow.Limits(max_new_symbols=...)$hint",
+        ),
+    )
+end
+
+# A JuliaLang.Symbol column's new names, counted (deduplicated) before any
+# is created, so a refused read leaves no Symbols behind.
+function _checknewsymbols(ctx::_ArrowTypesContext, f::AC.Field, col::AbstractVector)
+    limit = _maxnewsymbols(ctx) - ctx.newsymbols
+    new = Set{String}()
+    charged = Int64(0)
+    for x in col
+        x isa AbstractString || continue
+        _existingjlsymbol(x) === nothing || continue
+        occursin('\0', x) && _symbolnulerror(ctx, x, f.name)
+        x in new && continue
+        length(new) < limit || _symbollimiterror(ctx, f.name, true)
+        # The set's entry and its copy of the name, returned below.
+        bytes = Int64(ncodeunits(x) + 64)
+        ctx.budget === nothing || _charge!(ctx.budget, bytes, "new Symbol name count")
+        charged += bytes
+        push!(new, String(x))
+    end
+    ctx.budget === nothing || _refund!(ctx.budget, charged)
+    return nothing
 end
 
 "Heap-box an inline immutable once; @noinline keeps the box from folding away."
@@ -1673,6 +1703,7 @@ function _arrowtypescolumn(
         # lifting below, which converts its raw-domain leaves in place.
         return _publiccolumn(f, _postconvertfield(f, col, ctx.budget), ctx.budget)
     end
+    target === Symbol && _checknewsymbols(ctx, f, col)
     _chargevector!(ctx.budget, Any, length(col), "ArrowTypes lifting workspace")
     # `f` is an immutable struct held inline in this frame: box it once,
     # behind a call boundary the optimizer cannot fold away, so the dynamic

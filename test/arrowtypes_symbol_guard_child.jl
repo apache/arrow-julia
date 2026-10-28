@@ -22,6 +22,7 @@
 using Arrow
 using ArrowTypes
 using Logging
+using Tables
 using Test
 
 const AC = Arrow.ArrowCore
@@ -118,31 +119,74 @@ extensionmetadata(name::AbstractString) = Pair{String,String}[
         nullable=false,
         metadata=extensionmetadata("JuliaLang.Symbol"),
     )
-    # A read interns new Symbol values, up to a per-read count and byte limit.
+    # A read creates new Symbol values, up to `Limits.max_new_symbols`.
     @test Arrow.Table(ipcone(symbolfield, payloaddata; file=false)).value ==
           [Symbol(payload)]
     @test isinterned(payload)
-    novel = [
-        freshname("untrusted_symbol_payload_$i") for
-        i = 1:(Arrow._MAX_TABLES_NEW_FIELD_NAMES + 1)
-    ]
-    @test !any(isinterned, novel)
-    manyfield, manydata = AC.fromjulia("value", novel)
-    manyfield = AC.Field(
-        manyfield.name,
-        manyfield.type;
-        nullable=false,
-        metadata=extensionmetadata("JuliaLang.Symbol"),
-    )
-    err = try
-        Arrow.Table(ipcone(manyfield, manydata; file=true))
-        nothing
-    catch exception
-        exception
+    symbolcolumn(name, values) = begin
+        f, d = AC.fromjulia(name, values)
+        f = AC.Field(
+            f.name,
+            f.type;
+            nullable=false,
+            metadata=extensionmetadata("JuliaLang.Symbol"),
+        )
+        return f, d
     end
-    @test err isa Arrow.ValidationError
-    @test occursin("interns at most", sprint(showerror, err))
-    @test !isinterned(last(novel))
+    novel = [freshname("untrusted_symbol_payload_$i") for i = 1:5]
+    @test !any(isinterned, novel)
+    # Repeated values count once.
+    manyfield, manydata = symbolcolumn("value", vcat(novel, novel))
+    manybytes = ipcone(manyfield, manydata; file=true)
+    # A column needing more is refused before any of its values becomes a
+    # Symbol, so the same read is refused every time.
+    for _ = 1:2
+        err = try
+            Arrow.Table(manybytes; limits=Arrow.Limits(max_new_symbols=4))
+            nothing
+        catch exception
+            exception
+        end
+        @test err isa Arrow.ValidationError
+        msg = sprint(showerror, err)
+        @test occursin("column value holds more than 4 Symbol values", msg)
+        @test occursin("limits=Arrow.Limits(max_new_symbols=...)", msg)
+        @test occursin("select=[:value => String]", msg)
+        @test !any(isinterned, novel)
+    end
+    # `=> String` reads the stored strings without creating Symbols.
+    for kw in
+        ((; select=[:value => String]), (; scan=Tables.Scan(select=[:value => String])))
+        strings = Arrow.Table(manybytes; kw..., limits=Arrow.Limits(max_new_symbols=0))
+        @test strings.value == vcat(novel, novel)
+        @test eltype(strings.value) == String
+        for b in Arrow.Stream(manybytes; kw...)
+            @test b.value == vcat(novel, novel)
+        end
+    end
+    @test !any(isinterned, novel)
+    # An Arrow.Stream counts each record batch on its own.
+    streamnames = [freshname("untrusted_stream_symbol_$i") for i = 1:6]
+    halves = (streamnames[1:3], streamnames[4:6])
+    schema = AC.Schema([first(symbolcolumn("value", halves[1]))])
+    batches = [AC.RecordBatch(schema, [last(symbolcolumn("value", h))], 3) for h in halves]
+    for streambytes in
+        (Arrow.writestream(schema, batches), Arrow.writefile(schema, batches))
+        @test_throws Arrow.ValidationError Arrow.Table(
+            streambytes;
+            limits=Arrow.Limits(max_new_symbols=4),
+        )
+        @test !any(isinterned, streamnames)
+    end
+    got = [
+        b.value for b in Arrow.Stream(
+            Arrow.writestream(schema, batches);
+            limits=Arrow.Limits(max_new_symbols=4),
+        )
+    ]
+    @test got == [Symbol.(h) for h in halves]
+    @test Arrow.Table(manybytes; limits=Arrow.Limits(max_new_symbols=5)).value ==
+          Symbol.(vcat(novel, novel))
 
     streamname = freshname("untrusted_stream_field")
     @test !isinterned(streamname)

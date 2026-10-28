@@ -2937,6 +2937,11 @@ function _finishfacadescan(
                 # A real conversion: the output does not keep the time field.
                 push!(precols, Dates.Time[])
                 continue
+            elseif !public && _symboloverride(bc, f)
+                # The stored strings, without creating a Symbol per value.
+                columns[i] = _applyoverride(bc.type, columns[i], budget)
+                push!(precols, Symbol[])
+                continue
             end
             # Public type overrides run HERE, after facade conversion —
             # they are public-domain requests, never storage casts, and
@@ -3021,16 +3026,16 @@ function _applyfacadescan(
     routes = _ArrowTypesRoutePlan(actual)
     views = _ViewContext(stringtype, actual)
     snapshots = _dictsnapshots(f.fields, b, actual)
-    rawtimes = _rawtimes(plan.public, f.fields)
+    rawoverrides = _rawoverrides(plan.public, f.fields)
     materialize =
         (field, data, _) -> (
             _snapshotdict!(snapshots, field, data);
-            _scanbatchcolumn(field, data, routes, views, _checkstimes(rawtimes, field))
+            _scanbatchcolumn(field, data, routes, views, _checkstimes(rawoverrides, field))
         )
     # A scan that only selects keeps every row: its columns are the full
     # read's columns (views chain, strings are one column), with no per-batch
     # slices or joins.
-    selectonly = _selectsonly(b) && !isempty(plan.names) && isempty(rawtimes)
+    selectonly = _selectsonly(b) && !isempty(plan.names) && isempty(rawoverrides)
     got =
         selectonly ? _selectscan(f, b, actual, snapshots, views, ntasks) :
         _runboundscan(f, b, plan.names, actual, materialize, ntasks)
@@ -3094,11 +3099,11 @@ function _applyfacadescan(
     views = _ViewContext(stringtype, budget)
     b = _facadestorage(plan)
     snapshots = _dictsnapshots(ft.fields, b, budget)
-    rawtimes = _rawtimes(plan.public, ft.fields)
+    rawoverrides = _rawoverrides(plan.public, ft.fields)
     materialize =
         (field, data, _) -> (
             _snapshotdict!(snapshots, field, data);
-            _scanbatchcolumn(field, data, routes, views, _checkstimes(rawtimes, field))
+            _scanbatchcolumn(field, data, routes, views, _checkstimes(rawoverrides, field))
         )
     got = _runboundscan(sf, b, plan.names, ft, budget, materialize)
     return _finishfacadescan(
@@ -3160,9 +3165,21 @@ _periodoverride(bc::Tables.BoundColumn, f::AC.Field) =
     bc.type !== nothing &&
     Base.nonmissingtype(bc.type) <: Dates.Period &&
     f.type isa AC.TimeType
-_rawtimes(b::Tables.BoundScan, fields) =
-    AC.Field[fields[bc.index] for bc in b.columns if _periodoverride(bc, fields[bc.index])]
-_checkstimes(rawtimes, f::AC.Field) = !any(x -> x === f, rawtimes)
+# A select override of a `JuliaLang.Symbol` column with a string type reads its
+# stored strings, so the read creates no Symbol (`Limits.max_new_symbols`).
+function _symboloverride(bc::Tables.BoundColumn, f::AC.Field)
+    bc.type === nothing && return false
+    Base.nonmissingtype(bc.type) <: AbstractString || return false
+    ext = _arrowtypesextension(f)
+    return ext !== nothing && first(ext) == "JuliaLang.Symbol"
+end
+# The fields whose overrides read their stored values (see above); a scan
+# with any reads them from storage, not through the whole-read columns.
+_rawoverrides(b::Tables.BoundScan, fields) = AC.Field[
+    fields[bc.index] for bc in b.columns if
+    _periodoverride(bc, fields[bc.index]) || _symboloverride(bc, fields[bc.index])
+]
+_checkstimes(rawoverrides, f::AC.Field) = !any(x -> x === f, rawoverrides)
 
 # A temporal column stays in storage until the filter has run: a view of its
 # stored integers, the claim `_storagebatchcolumn` would materialize.
@@ -3212,8 +3229,8 @@ function _scanbatches(
     routes = _ArrowTypesRoutePlan(budget)
     nrows = sum(b -> Int(b.nrows), batches; init=0)
     poolof = (bc, field, ctx) -> _retaineddictpool(field, batches, bc.index, ctx)
-    rawtimes = _rawtimes(plan.public, fields)
-    if _selectsonly(b) && !isempty(plan.names) && isempty(rawtimes)
+    rawoverrides = _rawoverrides(plan.public, fields)
+    if _selectsonly(b) && !isempty(plan.names) && isempty(rawoverrides)
         # Every row is kept: the selected columns are the full read's.
         arrowtypes = _ArrowTypesContext(budget=budget)
         idxs = Int[c.index for c in b.columns]
@@ -3248,7 +3265,7 @@ function _scanbatches(
             budget,
             routes,
             views,
-            _checkstimes(rawtimes, fields[i]),
+            _checkstimes(rawoverrides, fields[i]),
         ) : Missing[] for i = 1:length(fields)
     ]
     raw = _ScanColumns(plan.names, rawcolumns, nrows)
