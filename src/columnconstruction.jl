@@ -49,11 +49,20 @@ _instantelementperiod(::Type{<:Durations.ZonedTimestamp{P}}) where {P} = P
 "One native (Field, ArrayData) column from a Julia vector, facade conversions included."
 # The column-level dispatchers (`_constructnativepart`, `_constructpart`) do
 # not specialize on the vector type: the builders they call do, so each new
-# column type compiles its builder and not the whole dispatch.
-Base.@nospecializeinfer function _constructnativepart(
+# column type compiles its builder and not the whole dispatch. Each keyword
+# method calls its body through `_uninferred`, so a method another package adds
+# under a body makes only that body compile again, not every column type's
+# keyword method.
+Base.@nospecializeinfer _constructnativepart(
     name::String,
     @nospecialize(v::AbstractVector);
     context=nothing,
+) = _uninferred(_nativepart, name, v, context)::Tuple{AC.Field,AC.ArrayData}
+
+Base.@nospecializeinfer function _nativepart(
+    name::String,
+    @nospecialize(v::AbstractVector),
+    context,
 )
     T = Base.nonmissingtype(eltype(v))
     # With TimeZones loaded, a fresh ZonedDateTime column writes as a
@@ -279,11 +288,18 @@ function _fixedbuffer(v::AbstractVector{T}) where {T}
 end
 
 "One (Field, ArrayData) column, including the ArrowTypes compatibility adapter."
-Base.@nospecializeinfer function _constructpart(
+Base.@nospecializeinfer _constructpart(
     name::String,
     @nospecialize(v::AbstractVector);
     context=nothing,
     narrowabstract::Bool=true,
+) = _uninferred(_partof, name, v, context, narrowabstract)::Tuple{AC.Field,AC.ArrayData}
+
+Base.@nospecializeinfer function _partof(
+    name::String,
+    @nospecialize(v::AbstractVector),
+    context,
+    narrowabstract::Bool,
 )
     context === nothing && (context = _WriterContext())
     if eltype(v) === Any
@@ -6123,10 +6139,16 @@ function _constructwriterunion(f::AC.Field, v::AbstractVector, context::_WriterC
 end
 
 "Construct one part under a retained Field: descriptor, nullability, metadata."
-Base.@nospecializeinfer function _constructpart(
+Base.@nospecializeinfer _constructpart(
     f::AC.Field,
     @nospecialize(v::AbstractVector);
     context::_WriterContext=_WriterContext(),
+) = _uninferred(_retainedpartof, f, v, context)::Tuple{AC.Field,AC.ArrayData}
+
+Base.@nospecializeinfer function _retainedpartof(
+    f::AC.Field,
+    @nospecialize(v::AbstractVector),
+    context::_WriterContext,
 )
     # Typed nested rows of the field's layout (an Arrow.Table's, say) build as
     # a fresh column and keep the field when the layouts agree. Values already
@@ -7400,7 +7422,7 @@ function _plaincolumnparts(name, fieldname, parts, retained, context)
                 _constructcolumnpart,
                 fieldname,
                 constructionparts[partition],
-                partition;
+                partition,
                 retained,
                 inferredplan,
                 registeredwriter,
@@ -7449,7 +7471,7 @@ end
 Base.@nospecializeinfer function _constructcolumnpart(
     fieldname::String,
     @nospecialize(part::AbstractVector),
-    partition::Int;
+    partition::Int,
     retained,
     inferredplan,
     registeredwriter,

@@ -691,7 +691,12 @@ end
 function _narrowcolumn(name::String, col::AbstractVector)
     col isa DictEncode && return col
     eltype(col) === Any && (col = _narrowlists(col, name))
-    narrowed = _narrowabstractwriterparts(name, AbstractVector[col], _WriterContext(name))
+    narrowed = _uninferred(
+        _narrowabstractwriterparts,
+        name,
+        AbstractVector[col],
+        _WriterContext(name),
+    )::Union{Nothing,Vector{AbstractVector}}
     return narrowed === nothing ? col : only(narrowed)
 end
 
