@@ -688,7 +688,7 @@ end
 
 # A column whose element type no Arrow type holds (`Any`, `Real`) narrowed
 # from all its values, so every batch writes the same type.
-function _narrowcolumn(name::String, col::AbstractVector)
+function _narrowcolumn(name::String, @nospecialize(col::AbstractVector))
     col isa DictEncode && return col
     eltype(col) === Any && (col = _narrowlists(col, name))
     narrowed = _uninferred(
@@ -1141,15 +1141,15 @@ function _shrinkbatches!(sizes, plan, err::_OffsetOverflow)
 end
 
 # Rows `r` (1-based positions) of a column, without copying when it can.
-function _rowslice(col::AbstractVector, r::UnitRange{Int})
+function _rowslice(@nospecialize(col::AbstractVector), r::UnitRange{Int})
     length(r) == length(col) && return col
     return _rowview(col, (firstindex(col) - 1) .+ r)
 end
-_rowview(col::AbstractVector, r) = view(col, r)
+_rowview(@nospecialize(col::AbstractVector), r) = view(col, r)
 _rowview(col::DictEncode, r) = DictEncode(_rowslice(col.data, r .- (firstindex(col) - 1)))
 # A record batch that is exactly one of a chained column's arrays (one batch it
 # was read from, say) is that array.
-function _rowview(col::ChainedVector, r)
+function _rowview(@nospecialize(col::ChainedVector), r)
     start = 1
     for a in col.arrays
         start > first(r) && break

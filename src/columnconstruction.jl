@@ -371,16 +371,18 @@ end
 a struct or fixed-size list with missing rows whose non-nullable children
 cannot hide placeholder slots (see `_hidevalidity`).
 """
-function _nestedpart(name::String, v::AbstractVector, context)
+function _nestedpart(name::String, @nospecialize(v::AbstractVector), context)
     kind = _nestedkind(context, Base.nonmissingtype(eltype(v)))
     kind === nothing && return nothing
     # Dispatching on the kind compiles only the matching builder for `v`'s type.
     return _nestedbuild(Val(kind), name, v, context)
 end
-_nestedbuild(::Val{:list}, name, v, context) = _listpart(name, v, context)
-_nestedbuild(::Val{:map}, name, v, context) = _mappart(name, v, context)
-_nestedbuild(::Val{:struct}, name, v, context) = _structpart(name, v, context)
-_nestedbuild(::Val{:fixedlist}, name, v, context) = _fixedlistpart(name, v, context)
+_nestedbuild(::Val{:list}, name, @nospecialize(v), context) = _listpart(name, v, context)
+_nestedbuild(::Val{:map}, name, @nospecialize(v), context) = _mappart(name, v, context)
+_nestedbuild(::Val{:struct}, name, @nospecialize(v), context) =
+    _structpart(name, v, context)
+_nestedbuild(::Val{:fixedlist}, name, @nospecialize(v), context) =
+    _fixedlistpart(name, v, context)
 
 """
 List offsets (row `i` holds values `offsets[i]+1:offsets[i+1]` of the
@@ -419,7 +421,7 @@ end
 # zero: a null row may span child values, which stay in the child.
 function _listoffsets(
     name::String,
-    v::Union{ListVector,MapVector},
+    @nospecialize(v::Union{ListVector,MapVector}),
     ::Type{O},
     pool=nothing,
 ) where {O}
@@ -469,9 +471,9 @@ view, or for a nested child the same storage over those rows.
 """
 _childslice(v::AbstractVector, lo::Int, hi::Int) =
     lo == 0 && hi == length(v) ? v : view(v, (lo + 1):hi)
-function _childslice(v::StructVector{T}, lo::Int, hi::Int) where {T}
+function _childslice(@nospecialize(v::StructVector), lo::Int, hi::Int)
     lo == 0 && hi == length(v) && return v
-    return StructVector{T}(
+    return typeof(v)(
         v.children,
         v.offset + lo,
         hi - lo,
@@ -480,9 +482,9 @@ function _childslice(v::StructVector{T}, lo::Int, hi::Int) where {T}
         v.owner,
     )
 end
-function _childslice(v::ListVector{T}, lo::Int, hi::Int) where {T}
+function _childslice(@nospecialize(v::ListVector), lo::Int, hi::Int)
     lo == 0 && hi == length(v) && return v
-    return ListVector{T}(
+    return typeof(v)(
         GC.@preserve(v, v.offsets[(lo + 1):(hi + 1)]),
         v.values,
         v.validity,
@@ -490,23 +492,27 @@ function _childslice(v::ListVector{T}, lo::Int, hi::Int) where {T}
         v.owner,
     )
 end
-function _childslice(v::MapVector{T}, lo::Int, hi::Int) where {T}
+function _childslice(@nospecialize(v::MapVector), lo::Int, hi::Int)
     lo == 0 && hi == length(v) && return v
     offsets = GC.@preserve v v.offsets[(lo + 1):(hi + 1)]
-    return MapVector{T}(offsets, v.keys, v.values, v.validity, v.bitoffset + lo, v.owner)
+    return typeof(v)(offsets, v.keys, v.values, v.validity, v.bitoffset + lo, v.owner)
 end
 
 # A row whose length differs from the first pass's would write past its slots.
 _changedrows(name) = ArgumentError("column $name changed while it was being written")
 
+# A list column read from Arrow already holds its rows' values in order, as a
+# child of element type `E`; its values are that child, sliced.
+_storedlist(@nospecialize(v), E) = v isa ListVector && eltype(v.values) === E
+function _storedlistvalues(name::String, @nospecialize(v::ListVector), offsets)
+    lo, hi = GC.@preserve v Int(v.offsets[1]), Int(v.offsets[end])
+    hi - lo == offsets[end] || throw(_changedrows(name))
+    return _childslice(v.values, lo, hi)
+end
+
 "The values of `v`'s rows back to back, as `_listoffsets` counted them."
 function _listvalues(name::String, ::Type{E}, v::AbstractVector, offsets) where {E}
-    # A list column read from Arrow already holds its rows' values in order.
-    if v isa ListVector && eltype(v.values) === E
-        lo, hi = GC.@preserve v Int(v.offsets[1]), Int(v.offsets[end])
-        hi - lo == offsets[end] || throw(_changedrows(name))
-        return _childslice(v.values, lo, hi)
-    end
+    _storedlist(v, E) && return _storedlistvalues(name, v, offsets)
     flat = Vector{E}(undef, Int(offsets[end]))
     i0 = firstindex(v) - 1
     @inbounds for i = 1:(length(offsets) - 1)
@@ -520,11 +526,14 @@ function _listvalues(name::String, ::Type{E}, v::AbstractVector, offsets) where 
     return flat
 end
 
-function _listpart(name::String, v::AbstractVector, context)
+function _listpart(name::String, @nospecialize(v::AbstractVector), context)
     large = _largelists(context)
     offsets, validity, nc = _listoffsets(name, v, large ? Int64 : Int32, _pool(context))
     E = eltype(Base.nonmissingtype(eltype(v)))
-    values = _listvalues(_errname(context, name), E, v, offsets)
+    errname = _errname(context, name)
+    values =
+        _storedlist(v, E) ? _storedlistvalues(errname, v, offsets) :
+        _listvalues(errname, E, v, offsets)
     cf, cd = _constructpart("item", values; context)
     t = AC.ListType(large)
     d = AC.ArrayData(
@@ -643,7 +652,7 @@ end
 
 # A struct column read from Arrow writes its children as stored, slots under
 # null rows included, so no child needs hiding.
-function _structpart(name::String, v::StructVector, context)
+function _structpart(name::String, @nospecialize(v::StructVector), context)
     NT = Base.nonmissingtype(eltype(v))
     n = length(v)
     validity, nc = _storedvalidity(v.validity, v.bitoffset, n, _pool(context))
@@ -734,7 +743,7 @@ function _mappart(name::String, v::AbstractVector, context)
 end
 
 # A map column read from Arrow writes its offsets, keys, and values as stored.
-function _mappart(name::String, v::MapVector, context)
+function _mappart(name::String, @nospecialize(v::MapVector), context)
     offsets, validity, nc = _listoffsets(name, v, Int32, _pool(context))
     lo, hi = GC.@preserve v Int(v.offsets[1]), Int(v.offsets[end])
     kf, kd = _constructpart("key", _childslice(v.keys, lo, hi); context)
@@ -749,7 +758,7 @@ function _mappart(name::String, v::MapVector, context)
     return _mapcolumn(name, v, offsets, validity, nc, hi - lo, kf, kd, vf, vd)
 end
 
-function _mapcolumn(name, v, offsets, validity, nc, nentries, kf, kd, vf, vd)
+function _mapcolumn(name, @nospecialize(v), offsets, validity, nc, nentries, kf, kd, vf, vd)
     entriestype = AC.StructType()
     ef = AC.Field("entries", entriestype; nullable=false, children=AC.Field[kf, vf])
     ed = AC.ArrayData(
