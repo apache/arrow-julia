@@ -68,8 +68,10 @@ struct _LoggingSource <: Arrow.AbstractArrowSource
     requests::Vector{NTuple{2,Int64}}
 end
 Arrow.sourcelength(s::_LoggingSource) = length(s.data)
+# A Stream reads ahead on another task: log and inspect under one lock.
+const _LOG_LOCK = ReentrantLock()
 function Arrow.readrange(s::_LoggingSource, off, len)
-    push!(s.requests, (Int64(off), Int64(len)))
+    @lock _LOG_LOCK push!(s.requests, (Int64(off), Int64(len)))
     return s.data[(off + 1):(off + len)]
 end
 mutable struct _ConcurrentSource <: Arrow.AbstractArrowSource
@@ -680,14 +682,19 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             kept = Arrow.Stream(log; filter=Arrow.col(:a) > 70_000, select=[:a])
             @test sum(b -> length(b.a), kept) == 10_000
         end
-        # Batches larger than a window are fetched one at a time, when asked
-        # for.
+        # Batches larger than a window are fetched one at a time, and at most
+        # one ahead of the batch in use: the third is not fetched while the
+        # first is in use.
         large = [(a=collect(Int64, ((k - 1) * 1_200_000 + 1):(k * 1_200_000)),) for k = 1:3]
         bytes = take!(Arrow.write(IOBuffer(), Tables.partitioner(large)))
+        third = Arrow.readfile(bytes).recordblocks[3][1]
         log = _LoggingSource(bytes, NTuple{2,Int64}[])
-        b1, _ = iterate(Arrow.Stream(log))
+        st = Arrow.Stream(log)
+        b1, _ = iterate(st)
         @test b1.a[1] == 1
-        @test sum(last, log.requests) < length(bytes) ÷ 2
+        tailstart = length(bytes) - 65536
+        @test @lock _LOG_LOCK all(r -> sum(r) <= third || r[1] >= tailstart, log.requests)
+        @test sum(b -> length(b.a), st) == 3_600_000
         # With concurrent reads, a whole-object read fetches the bytes before
         # the tail in 8 MiB ranges at once, into one buffer.
         big = take!(Arrow.write(IOBuffer(), (a=collect(Int64, 1:2_200_000),)))

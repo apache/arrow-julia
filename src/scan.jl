@@ -1717,10 +1717,11 @@ end
 """
 Reads footer blocks for a pass in file order: a block read right after the
 one before it comes with the blocks that follow it, up to `_READ_RANGE`
-bytes in all, and those are then served from that window. A pass over small
-blocks makes one request per window instead of one per block; a block read
-out of order is fetched alone. The window is at most `_READ_RANGE` bytes,
-held until the next fetch.
+bytes in all, and those are then served from that window. While a window
+(or a block larger than one) is in use, the next window is already being
+fetched. A pass over small blocks makes one request per window instead of
+one per block; a block read out of order is fetched alone. At most one
+window is held and one more is in flight.
 """
 mutable struct _BlockReader
     const sf::SourceFile
@@ -1729,9 +1730,12 @@ mutable struct _BlockReader
     next::Int64
     start::Int64
     window::Vector{UInt8}
+    # The window being fetched ahead: its start and end offsets, the index of
+    # its last block, and the task fetching it.
+    pending::Union{Nothing,Tuple{Int64,Int64,Int,Task}}
 end
 _BlockReader(sf::SourceFile) =
-    _BlockReader(sf, ReentrantLock(), Int64(-1), Int64(0), UInt8[])
+    _BlockReader(sf, ReentrantLock(), Int64(-1), Int64(0), UInt8[], nothing)
 
 """
 A file-format source read one record batch at a time (`Arrow.Stream` over an
@@ -1795,33 +1799,74 @@ function _RangedFile(sf::SourceFile, budget::AllocationBudget)
     )
 end
 
-# The bytes of `blocks[i]`, from the window or fetched.
+# The bytes of `blocks[i]`, from the window, the window fetched ahead, or
+# fetched now.
 function _readblock(br::_BlockReader, blocks, i::Int, dataend::Int64)
     offset, frameend = _blockextent(blocks[i], dataend)
-    stop = frameend
+    ahead = nothing
+    sequential = false
     @lock br.lock begin
         if br.start <= offset && frameend <= br.start + length(br.window)
             br.next = frameend
             return br.window[(offset - br.start + 1):(frameend - br.start)]
         end
-        if i == 1 || 0 <= offset - br.next <= br.sf.coalesce_gap
-            j = i
-            while j < length(blocks)
-                o, e = _blockextent(blocks[j + 1], dataend)
-                (o >= stop && e - offset <= _READ_RANGE) || break
-                stop = e
-                j += 1
-            end
+        sequential = i == 1 || 0 <= offset - br.next <= br.sf.coalesce_gap
+        p = br.pending
+        if p !== nothing && p[1] == offset
+            ahead = p
+            br.pending = nothing
         end
     end
-    bytes =
-        _fetchinto!(Vector{UInt8}(undef, stop - offset), 1, br.sf, offset, stop - offset)
+    if ahead === nothing
+        stop, last = sequential ? _windowfrom(blocks, i, dataend) : (frameend, i)
+        bytes = _fetchinto!(
+            Vector{UInt8}(undef, stop - offset),
+            1,
+            br.sf,
+            offset,
+            stop - offset,
+        )
+    else
+        _, stop, last, task = ahead
+        bytes = try
+            fetch(task)::Vector{UInt8}
+        catch e
+            rethrow(_firstcause(e))
+        end
+    end
     @lock br.lock begin
         br.next = frameend
+        if sequential && last < length(blocks) && br.pending === nothing
+            nstart, _ = _blockextent(blocks[last + 1], dataend)
+            nstop, nlast = _windowfrom(blocks, last + 1, dataend)
+            sf = br.sf
+            task = Threads.@spawn _fetchinto!(
+                Vector{UInt8}(undef, nstop - nstart),
+                1,
+                sf,
+                nstart,
+                nstop - nstart,
+            )
+            br.pending = (nstart, nstop, nlast, task)
+        end
         stop == frameend && return bytes
         br.start, br.window = offset, bytes
     end
     return bytes[1:(frameend - offset)]
+end
+
+# The end offset and last block index of the window that starts at block
+# `i`: the blocks after it while all of them fit in `_READ_RANGE` bytes.
+function _windowfrom(blocks, i::Int, dataend::Int64)
+    offset, stop = _blockextent(blocks[i], dataend)
+    j = i
+    while j < length(blocks)
+        o, e = _blockextent(blocks[j + 1], dataend)
+        (o >= stop && e - offset <= _READ_RANGE) || break
+        stop = e
+        j += 1
+    end
+    return stop, j
 end
 
 # A footer block fetched and framed as a message of its own: the message and
