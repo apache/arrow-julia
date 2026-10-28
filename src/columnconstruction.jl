@@ -1118,14 +1118,22 @@ function _packedpayloadpart(
     firstlong =
         n > 0 && DataStrings.payloadlength(@inbounds payloads[1]) > DataStrings.INLINE_MAX
     inline = _takevector(pool, UInt8, firstlong ? 16 : 12n + 16)
-    # The out-of-line values must sit back to back in row order in the buffer
-    # of the first one (`runbuf`), from `runstart`, for the data to be a slice.
+    # From the first out-of-line value on, the bytes are a slice of its buffer
+    # (`runbuf`, from `runstart`) when every out-of-line value sits there at
+    # its row's position and every inline value matches the bytes there, as in
+    # a column read from Arrow. This pass checks the values after the first
+    # out-of-line one; the ones copied to `inline` before it are compared once
+    # after.
     runbuf = 0
     runstart = 0
     runok = true
+    prefix = 0
+    run = Ptr{UInt8}(0)
+    room = 0
+    mismatch = UInt64(0)
     pos = 0
     valid = 0
-    GC.@preserve payloads inline begin
+    GC.@preserve payloads inline buffers begin
         words = Ptr{UInt64}(pointer(payloads))
         out = pointer(inline)
         @inbounds for b in eachindex(bits)
@@ -1138,17 +1146,42 @@ function _packedpayloadpart(
                 len = Int(reinterpret(Int32, a % UInt32))
                 present = len >= 0
                 long = len > DataStrings.INLINE_MAX
-                k = Int(reinterpret(Int32, w % UInt32)) + 1
-                at = Int(reinterpret(Int32, (w >> 32) % UInt32)) - pos
-                if long & (runbuf == 0)
-                    runbuf, runstart = k, at
-                end
-                # Without branches: the values are a random mix of kinds.
-                runok &= !long | ((k == runbuf) & (at == runstart))
+                # The payload's last 12 bytes, an inline value's bytes, as words.
+                lo = (a >> 32) | (w << 32)
+                hi = (w >> 32) % UInt32
                 if runbuf == 0
-                    # The payload's last 12 bytes, stored as whole words.
-                    unsafe_store!(Ptr{UInt64}(out + pos), (a >> 32) | (w << 32))
-                    unsafe_store!(Ptr{UInt32}(out + pos + 8), (w >> 32) % UInt32)
+                    if long
+                        runbuf = Int(reinterpret(Int32, w % UInt32)) + 1
+                        runstart = Int(reinterpret(Int32, (w >> 32) % UInt32)) - pos
+                        prefix = pos
+                        if 1 <= runbuf <= length(buffers) && runstart >= 0
+                            run = pointer(buffers[runbuf]) + runstart
+                            room = length(buffers[runbuf]) - runstart
+                        else
+                            runok = false
+                        end
+                    else
+                        unsafe_store!(Ptr{UInt64}(out + pos), lo)
+                        unsafe_store!(Ptr{UInt32}(out + pos + 8), hi)
+                    end
+                else
+                    k = Int(reinterpret(Int32, w % UInt32)) + 1
+                    at = Int(reinterpret(Int32, (w >> 32) % UInt32)) - pos
+                    # Without branches: the values are a random mix of kinds.
+                    runok &= !long | ((k == runbuf) & (at == runstart))
+                    if pos + 12 <= room
+                        m = max(len, 0)
+                        lomask = (UInt64(1) << (8 * min(m, 8))) - UInt64(1)
+                        himask = (UInt32(1) << (8 * clamp(m - 8, 0, 4))) - UInt32(1)
+                        diff =
+                            ((unsafe_load(Ptr{UInt64}(run + pos)) ⊻ lo) & lomask) |
+                            ((unsafe_load(Ptr{UInt32}(run + pos + 8)) ⊻ hi) & himask)
+                        mismatch |= ifelse(long, UInt64(0), diff)
+                    elseif !long & (len > 0)
+                        # Within 12 bytes of the buffer's end: byte by byte.
+                        entry = Ptr{UInt8}(words) + 16 * (i - 1) + 4
+                        runok &= pos + len <= room && _memequal(run + pos, entry, len)
+                    end
                 end
                 pos += ifelse(present, len, 0)
                 pos <= typemax(Offset) || throw(_OffsetOverflow(name, 0, i))
@@ -1158,6 +1191,8 @@ function _packedpayloadpart(
             bits[b] = byte
             valid += count_ones(byte)
         end
+        runok &= (runbuf != 0) & (mismatch == 0) & (pos <= room)
+        runok && (runok = _memequal(pointer(inline), run, prefix))
     end
     nc = n - valid
     validity =
@@ -1165,11 +1200,12 @@ function _packedpayloadpart(
     if runbuf == 0
         # The bytes are a slice: the vector keeps its length, which a reused
         # vector's pool reads as its capacity.
-        databuf = pos == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(inline), 0, pos)
+        databuf =
+            pos == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(inline), 0, pos)
         d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
         return AC.Field(name, t; nullable), _constructedvalid(d)
     end
-    if runok && _inlineinrun(payloads, offsets, buffers, runbuf, runstart)
+    if runok
         databuf = AC.BufferSlice(AC.heapregion(buffers[runbuf]), runstart, pos)
         d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
         return AC.Field(name, t; nullable), _constructedvalid(d)
@@ -1211,51 +1247,8 @@ function _packedpayloadpart(
     return AC.Field(name, t; nullable), _constructedvalid(d)
 end
 
-"""
-Whether every inline value (at most 12 bytes) also sits at its row's position
-in `buffers[k]` from `start`, so the buffer holds all the rows' bytes in order.
-`offsets` are the rows' utf8 offsets. Rows whose 12 bytes from their position
-stay in the buffer compare whole words without branches; the rest byte by byte.
-"""
-function _inlineinrun(payloads, offsets, buffers, k::Int, start::Int)
-    1 <= k <= length(buffers) || return false
-    buf = buffers[k]
-    n = length(payloads)
-    total = Int(@inbounds offsets[n + 1])
-    start >= 0 && start + total <= length(buf) || return false
-    # Rows 1:wide start at least 12 bytes before the buffer's end.
-    wide = searchsortedlast(view(offsets, 1:n), length(buf) - start - 12)
-    mismatch = UInt64(0)
-    GC.@preserve payloads buf begin
-        base = pointer(buf) + start
-        words = Ptr{UInt64}(pointer(payloads))
-        @inbounds for i = 1:wide
-            a = unsafe_load(words, 2i - 1)
-            w = unsafe_load(words, 2i)
-            len = Int(reinterpret(Int32, a % UInt32))
-            at = base + Int(offsets[i])
-            lo =
-                (unsafe_load(Ptr{UInt64}(at)) ⊻ ((a >> 32) | (w << 32))) &
-                ((UInt64(1) << (8 * min(max(len, 0), 8))) - UInt64(1))
-            hi =
-                (unsafe_load(Ptr{UInt32}(at + 8)) ⊻ ((w >> 32) % UInt32)) &
-                ((UInt32(1) << (8 * clamp(len - 8, 0, 4))) - UInt32(1))
-            mismatch |= ifelse(0 < len <= DataStrings.INLINE_MAX, lo | hi, UInt64(0))
-        end
-        mismatch == 0 || return false
-        entries = Ptr{UInt8}(words)
-        @inbounds for i = (wide + 1):n
-            len = Int(DataStrings.payloadlength(payloads[i]))
-            0 < len <= DataStrings.INLINE_MAX || continue
-            at = base + Int(offsets[i])
-            inline = entries + 16 * (i - 1) + 4
-            for j = 0:(len - 1)
-                unsafe_load(at + j) == unsafe_load(inline + j) || return false
-            end
-        end
-    end
-    return true
-end
+_memequal(p::Ptr{UInt8}, q::Ptr{UInt8}, n::Int) =
+    ccall(:memcmp, Cint, (Ptr{UInt8}, Ptr{UInt8}, Csize_t), p, q, n) == 0
 
 _stringview(context) = context !== nothing && context.stringview
 _pool(context) = context === nothing ? nothing : context.pool
