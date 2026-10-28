@@ -158,9 +158,11 @@ end
         Arrow.write(w, table)
         reader = @async first(Arrow.Stream(pipe)).a
         @test timedwait(() -> istaskdone(reader), 60) === :ok
-        @test fetch(reader) == table.a
+        # Closing first ends a reader that is still waiting, so a regression
+        # fails here instead of hanging the suite.
         close(w)
         close(pipe)
+        @test fetch(reader) == table.a
     end
 
     @testset "eager write and append reject options before changing bytes" begin
