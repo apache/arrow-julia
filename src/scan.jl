@@ -2751,12 +2751,19 @@ function _applyfacadescan(
     _chargevector!(budget, AbstractVector, length(fields), "stream scan columns")
     routes = _ArrowTypesRoutePlan(budget)
     views = _ViewContext(stringtype, budget)
+    # Only the selected and filter-referenced columns are built; the executor
+    # reads no other column (an empty placeholder would fail loudly if it did).
+    needed = falses(length(fields))
+    for c in b.columns
+        needed[c.index] = true
+    end
+    needed[b.filtercols] .= true
+    b.validate && fill!(needed, true)
     rawcolumns = AbstractVector[
-        _facadescanrawcolumn(s, i, budget, routes, views) for i = 1:length(fields)
+        needed[i] ? _facadescanrawcolumn(s, i, budget, routes, views) : Missing[] for
+        i = 1:length(fields)
     ]
-    nrows =
-        isempty(rawcolumns) ? sum(Int(b.nrows) for b in s.batches; init=0) :
-        length(first(rawcolumns))
+    nrows = sum(Int(b.nrows) for b in s.batches; init=0)
     raw = _ScanColumns(plan.names, rawcolumns, nrows)
     got = _executeplan(raw, b, plan.names, budget)
     return _finishfacadescan(

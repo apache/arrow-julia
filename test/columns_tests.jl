@@ -509,6 +509,15 @@ end
         @test_throws ArgumentError Arrow.Stream(arrowbytes(part(1:3)); ntasks=-1)
     end
 
+    @testset "a stream-format scan builds only the columns it needs" begin
+        tbl = (x=collect(1:6), s=["a", "b", "c", "d", "e", "f"], y=collect(6:-1:1))
+        bytes = arrowbytes(tbl; file=false)
+        t = Arrow.Table(bytes; scan=Tables.Scan(select=(:s,), filter=Tables.col(:y) > 3))
+        @test Tables.columnnames(t) == [:s] && t.s == ["a", "b", "c"]
+        t = Arrow.Table(bytes; scan=Tables.Scan(select=(:y, :s), limit=2))
+        @test t.y == [6, 5] && t.s == ["a", "b"]
+    end
+
     @testset "columns of several batches copy and broadcast by batch" begin
         part(r) = (
             x=collect(Int64, r),
