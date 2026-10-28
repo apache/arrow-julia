@@ -14,12 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# An ordered CategoricalArray writes an ordered Arrow dictionary.
+# An ordered CategoricalArray writes an ordered Arrow dictionary, and
+# `isordered` reads a dictionary column's flag.
 module ArrowCategoricalArraysExt
 
 import Arrow
 import CategoricalArrays
 
 Arrow._isordered(x::CategoricalArrays.CategoricalArray) = CategoricalArrays.isordered(x)
+CategoricalArrays.isordered(x::Arrow.DictEncoded) = Arrow._isordered(x)
+CategoricalArrays.isordered(x::Arrow.ChainedVector{T,<:Arrow.DictEncoded}) where {T} =
+    Arrow._isordered(x)
 
 end

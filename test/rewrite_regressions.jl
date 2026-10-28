@@ -24,6 +24,7 @@ using Test
 using Dates
 using Tables
 import DataAPI
+import CategoricalArrays
 using Arrow
 using DataStrings
 using DataStrings: StringVector, StringPayload, BytesVector, DataBytes
@@ -150,6 +151,37 @@ end
             AC.materialize(nullback.schema.fields[1], nullback.batches[1].columns[1]),
             [missing, "a"],
         )
+    end
+
+    @testset "ordered dictionaries keep their order and flag through rewrites" begin
+        sizes = CategoricalArrays.categorical(
+            ["small", "large", "medium", "small"];
+            ordered=true,
+            levels=["small", "medium", "large"],
+        )
+        order = ["small", "medium", "large"]
+        isordereddict(t) = (getfield(t, :schema).fields[1].type::AC.DictionaryType).ordered
+        one = Arrow.Table(Arrow.tobuffer((; sizes)))
+        two = Arrow.Table(
+            Arrow.tobuffer(Tables.partitioner([(; sizes=sizes[1:2]), (; sizes)])),
+        )
+        @test two.sizes isa Arrow.ChainedVector
+        for t in (one, two)
+            @test isordereddict(t)
+            @test DataAPI.levels(t.sizes) == order
+            @test CategoricalArrays.isordered(t.sizes)
+            # The table, a bare column (as DataFrame(t; copycols=false) holds
+            # it), and a copy of the table all write an ordered dictionary.
+            for src in (t, (; sizes=t.sizes), copy(t))
+                back = Arrow.Table(Arrow.tobuffer(src))
+                @test isordereddict(back)
+                @test DataAPI.levels(back.sizes) == order
+            end
+        end
+        plain =
+            Arrow.Table(Arrow.tobuffer((; sizes=CategoricalArrays.categorical(["b", "a"]))))
+        @test !CategoricalArrays.isordered(plain.sizes)
+        @test !isordereddict(Arrow.Table(Arrow.tobuffer((; sizes=plain.sizes))))
     end
 
     @testset "scan results retain dictionary pools" begin

@@ -475,6 +475,13 @@ DataAPI.levels(v::DictEncoded) = unique(skipmissing(v.pool))
 # Chunks that share one pool keep a column-wide encoding.
 _sharedpool(x::ChainedVector{T,<:DictEncoded}) where {T} =
     all(c -> c.pool === x.arrays[1].pool, x.arrays)
+# Categories in dictionary order, as one batch's are: those of later batches'
+# dictionaries (deltas, replacements) follow the first's.
+function DataAPI.levels(x::ChainedVector{T,<:DictEncoded}) where {T}
+    isempty(x.arrays) && return Base.nonmissingtype(T)[]
+    _sharedpool(x) && return DataAPI.levels(x.arrays[1])
+    return unique!(reduce(vcat, [DataAPI.levels(c) for c in x.arrays]))
+end
 DataAPI.refarray(x::ChainedVector{T,<:DictEncoded}) where {T} =
     isempty(x.arrays) || !_sharedpool(x) ? x :
     ChainedVector([DataAPI.refarray(c) for c in x.arrays])

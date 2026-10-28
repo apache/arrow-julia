@@ -5054,11 +5054,14 @@ _dictindextype(n::Integer) =
     n <= 32_768 ? AC.IntType(16, true) :
     n - 1 <= typemax(Int32) ? AC.IntType(32, true) : AC.IntType(64, true)
 
-# Whether a column's categories are ordered: a CategoricalArray's flag (the
-# CategoricalArrays extension), else false.
+# Whether a column's categories are ordered: a read dictionary column's flag,
+# a CategoricalArray's (the CategoricalArrays extension), else false.
 _isordered(::AbstractVector) = false
 _isordered(x::SubArray) = _isordered(parent(x))
 _isordered(x::DictEncode) = _isordered(x.data)
+_isordered(x::DictEncoded) = x.ordered
+_isordered(x::ChainedVector{T,<:DictEncoded}) where {T} =
+    !isempty(x.arrays) && all(_isordered, x.arrays)
 
 function _newdictfromdata(
     name::String,
