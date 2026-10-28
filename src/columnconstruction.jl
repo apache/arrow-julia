@@ -399,33 +399,74 @@ function _listoffsets(name::String, v::AbstractVector, ::Type{O}) where {O}
     return offsets, validity, nc
 end
 
-# A list column read from Arrow keeps its offsets, rebased to start at zero:
-# a null row may span child values, which stay in the child.
-function _listoffsets(name::String, v::ListVector, ::Type{O}) where {O}
+# A list or map column read from Arrow keeps its offsets, rebased to start at
+# zero: a null row may span child values, which stay in the child.
+function _listoffsets(name::String, v::Union{ListVector,MapVector}, ::Type{O}) where {O}
     n = length(v)
     raw = v.offsets
-    lo = Int64(raw[1])
+    lo = raw[1]
     offsets = Vector{O}(undef, n + 1)
     @inbounds for i = 1:(n + 1)
-        x = Int64(raw[i]) - lo
+        x = raw[i] - lo
         x <= typemax(O) || throw(_OffsetOverflow(name, 0, i - 1))
         offsets[i] = x
     end
-    isempty(v.validity) && return offsets, AC.BufferSlice(), 0
-    bits = Vector{UInt8}(undef, cld(n, 8))
+    validity, nc = _storedvalidity(v.validity, v.bitoffset, n)
+    return offsets, validity, nc
+end
+
+"""
+The validity of `n` rows a read column stores as `bits` from `bitoffset` (no
+bits: no nulls), as a write buffer, and the null count.
+"""
+function _storedvalidity(bits::Vector{UInt8}, bitoffset::Int, n::Int)
+    isempty(bits) && return AC.BufferSlice(), 0
+    out = Vector{UInt8}(undef, cld(n, 8))
     valid = 0
-    @inbounds for b in eachindex(bits)
+    @inbounds for b in eachindex(out)
         byte = 0x00
         for j = 0:(min(8, n - ((b - 1) << 3)) - 1)
-            byte |= UInt8(_bitset(v.validity, v.bitoffset, ((b - 1) << 3) + j + 1)) << j
+            byte |= UInt8(_bitset(bits, bitoffset, ((b - 1) << 3) + j + 1)) << j
         end
-        bits[b] = byte
+        out[b] = byte
         valid += count_ones(byte)
     end
     nc = n - valid
-    validity =
-        nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
-    return offsets, validity, nc
+    return nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(out), 0, length(out)),
+    nc
+end
+
+"""
+Elements `lo+1:hi` of a read column's child values without copying them: a
+view, or for a nested child the same storage over those rows.
+"""
+_childslice(v::AbstractVector, lo::Int, hi::Int) =
+    lo == 0 && hi == length(v) ? v : view(v, (lo + 1):hi)
+function _childslice(v::StructVector{T}, lo::Int, hi::Int) where {T}
+    lo == 0 && hi == length(v) && return v
+    return StructVector{T}(
+        v.children,
+        v.offset + lo,
+        hi - lo,
+        v.validity,
+        v.bitoffset + lo,
+        v.owner,
+    )
+end
+function _childslice(v::ListVector{T}, lo::Int, hi::Int) where {T}
+    lo == 0 && hi == length(v) && return v
+    return ListVector{T}(
+        v.offsets[(lo + 1):(hi + 1)],
+        v.values,
+        v.validity,
+        v.bitoffset + lo,
+        v.owner,
+    )
+end
+function _childslice(v::MapVector{T}, lo::Int, hi::Int) where {T}
+    lo == 0 && hi == length(v) && return v
+    offsets = v.offsets[(lo + 1):(hi + 1)]
+    return MapVector{T}(offsets, v.keys, v.values, v.validity, v.bitoffset + lo, v.owner)
 end
 
 # A row whose length differs from the first pass's would write past its slots.
@@ -435,9 +476,9 @@ _changedrows(name) = ArgumentError("column $name changed while it was being writ
 function _listvalues(name::String, ::Type{E}, v::AbstractVector, offsets) where {E}
     # A list column read from Arrow already holds its rows' values in order.
     if v isa ListVector && eltype(v.values) === E
-        lo, hi = Int(v.offsets[1]), Int(v.offsets[end])
+        lo, hi = v.offsets[1], v.offsets[end]
         hi - lo == offsets[end] || throw(_changedrows(name))
-        return view(v.values, (lo + 1):hi)
+        return _childslice(v.values, lo, hi)
     end
     flat = Vector{E}(undef, Int(offsets[end]))
     i0 = firstindex(v) - 1
@@ -573,6 +614,25 @@ function _structpart(name::String, v::AbstractVector, context)
     return AC.Field(name, t; nullable=Missing <: eltype(v), children=fields), d
 end
 
+# A struct column read from Arrow writes its children as stored, slots under
+# null rows included, so no child needs hiding.
+function _structpart(name::String, v::StructVector, context)
+    NT = Base.nonmissingtype(eltype(v))
+    n = length(v)
+    validity, nc = _storedvalidity(v.validity, v.bitoffset, n)
+    fields = AC.Field[]
+    children = AC.ArrayData[]
+    for k = 1:fieldcount(NT)
+        child = _childslice(v.children[k], v.offset, v.offset + n)
+        f, d = _constructpart(String(fieldname(NT, k)), child; context)
+        push!(fields, f)
+        push!(children, d)
+    end
+    t = AC.StructType()
+    d = AC.ArrayData(t, n, [validity]; children, nullcount=nc)
+    return AC.Field(name, t; nullable=Missing <: eltype(v), children=fields), d
+end
+
 function _fixedlistpart(name::String, v::AbstractVector, context)
     NT = Base.nonmissingtype(eltype(v))
     N = fieldcount(NT)
@@ -643,11 +703,31 @@ function _mappart(name::String, v::AbstractVector, context)
     R <: AbstractDict &&
         _writerneedstype!(context, KK) &&
         _validatemapphysicalkeys(_errname(context, name), kf, kd, offsets)
+    return _mapcolumn(name, v, offsets, validity, nc, length(entries), kf, kd, vf, vd)
+end
+
+# A map column read from Arrow writes its offsets, keys, and values as stored.
+function _mappart(name::String, v::MapVector, context)
+    offsets, validity, nc = _listoffsets(name, v, Int32)
+    lo, hi = v.offsets[1], v.offsets[end]
+    kf, kd = _constructpart("key", _childslice(v.keys, lo, hi); context)
+    vf, vd = _constructpart("value", _childslice(v.values, lo, hi); context)
+    kf.nullable && throw(
+        ArgumentError(
+            "column $(_errname(context, name)) has map keys of type " *
+            "$(eltype(v.keys)), which write as a nullable Arrow type; Arrow map " *
+            "keys cannot be null",
+        ),
+    )
+    return _mapcolumn(name, v, offsets, validity, nc, hi - lo, kf, kd, vf, vd)
+end
+
+function _mapcolumn(name, v, offsets, validity, nc, nentries, kf, kd, vf, vd)
     entriestype = AC.StructType()
     ef = AC.Field("entries", entriestype; nullable=false, children=AC.Field[kf, vf])
     ed = AC.ArrayData(
         entriestype,
-        length(entries),
+        nentries,
         [AC.BufferSlice()];
         children=AC.ArrayData[kd, vd],
         nullcount=0,
