@@ -50,8 +50,9 @@ values, decimals, and dictionary-encoded values are read-only
 proportional to its columns and record batches, not its bytes. A column
 with several record batches is a `ChainedVector` of per-batch views. String
 and binary columns are `DataStrings.StringVector`/`BytesVector`, built with
-one copy of their bytes; `stringtype=String` reads strings as
-`Vector{String}`. List, map, struct, and union columns read as typed rows:
+one copy of their bytes the first time the table hands them out (the read's
+allocation allowance is charged when it opens); `stringtype=String` reads
+strings as `Vector{String}`. List, map, struct, and union columns read as typed rows:
 [`Arrow.ListValue`](@ref) and [`Arrow.MapValue`](@ref) views, `NTuple`s,
 `NamedTuple`s, and `Union`s. A
 column keeps the memory it reads alive while it is reachable, independent of
@@ -66,9 +67,9 @@ other source kinds. A byte vector is read in place: do not modify or resize
 it while the table's columns are in use.
 
 `ntasks` (default `Threads.nthreads()`) is the number of tasks a read uses:
-record batches decode and decompress field by field in parallel, and columns
-build in parallel, string columns in chunks of rows. `ntasks=1` reads on the
-calling task. The result does not depend on `ntasks`.
+record batches decode and decompress field by field in parallel, columns
+build in parallel, and a string column builds in chunks of rows. `ntasks=1`
+reads on the calling task. The result does not depend on `ntasks`.
 
 `limits` sets the [`Arrow.Limits`](@ref) policy for a raw source. Omit it to
 use `Arrow.Limits()`. An internal reader handle that was opened under a
@@ -126,7 +127,7 @@ function Base.copy(t::Table)
     _checkopen(t)
     return _table(
         copy(getfield(t, :names)),
-        AbstractVector[copy(c) for c in getfield(t, :columns)],
+        AbstractVector[copy(_force(c)) for c in getfield(t, :columns)],
         getfield(t, :schema),
         AC.OwnerRegion[],
         getfield(t, :nrows),
@@ -241,9 +242,9 @@ Tables.istable(::Type{Table}) = true
 Tables.columnaccess(::Type{Table}) = true
 Tables.columns(t::Table) = t
 Tables.columnnames(t::Table) = getfield(t, :names)
-Tables.getcolumn(t::Table, i::Int) = (_checkopen(t); getfield(t, :columns)[i])
+Tables.getcolumn(t::Table, i::Int) = (_checkopen(t); _force(getfield(t, :columns)[i]))
 Tables.getcolumn(t::Table, nm::Symbol) =
-    (_checkopen(t); getfield(t, :columns)[_columnindex(t, nm)])
+    (_checkopen(t); _force(getfield(t, :columns)[_columnindex(t, nm)]))
 
 # A released table refuses column access; columns taken before stay valid.
 function _checkopen(t::Table)
@@ -1241,7 +1242,17 @@ Table columns `idxs` of `fields` over decoded `batches`, built on at most
 column is cut into chunks of rows, and the materialized (nested, union,
 extension) columns build on the calling task afterwards.
 """
-function _buildcolumns(fields, batches, idxs, arrowtypes, views::_ViewContext, ntasks::Int)
+# With `lazy`, string and binary columns are `_PendingStrings` that build when a
+# table first hands them out.
+function _buildcolumns(
+    fields,
+    batches,
+    idxs,
+    arrowtypes,
+    views::_ViewContext,
+    ntasks::Int;
+    lazy::Bool=false,
+)
     m = length(idxs)
     _chargevector!(views.budget, AbstractVector, m, "table columns")
     cols = Vector{AbstractVector}(undef, m)
@@ -1253,8 +1264,13 @@ function _buildcolumns(fields, batches, idxs, arrowtypes, views::_ViewContext, n
         _viewable(f) || continue
         if _isstringlayout(f.type)
             datas = _columndatas(batches, i)
-            b = _stringbuild(_vieweltype(f, datas, views), datas, views.budget, rows)
-            builds[p] = b
+            T = _vieweltype(f, datas, views)
+            b = _stringbuild(T, datas, views.budget, rows)
+            if lazy
+                cols[p] = _PendingStrings{T}(b, ntasks)
+                continue
+            end
+            builds[p] = _allocate!(b)
             append!(jobs, (p, k) for k in eachindex(b.chunks))
         else
             push!(jobs, (p, 0))
@@ -1661,7 +1677,7 @@ the result to `sink` with owned, mutable columns, copied exactly once:
 """
 function read(source, sink; kwargs...)
     t = Table(source; kwargs...)
-    cols = AbstractVector[_ownedcolumn(c) for c in getfield(t, :columns)]
+    cols = AbstractVector[_ownedcolumn(_force(c)) for c in getfield(t, :columns)]
     owned = Table(
         getfield(t, :names),
         cols,
@@ -1936,7 +1952,15 @@ function _materialize_table(
     arrowtypes = _ArrowTypesContext(budget=budget)
     views = _ViewContext(stringtype, budget)
     fields = src.corefields
-    cols = _buildcolumns(fields, src.batches, 1:length(fields), arrowtypes, views, ntasks)
+    cols = _buildcolumns(
+        fields,
+        src.batches,
+        1:length(fields),
+        arrowtypes,
+        views,
+        ntasks;
+        lazy=true,
+    )
     nrows = sum(Int(b.nrows) for b in src.batches; init=0)
     pools = _retaineddictpools(src.corefields, src.batches, arrowtypes)
     return _table(names, cols, src.schema, regions, nrows, pools, budget)
@@ -1954,8 +1978,15 @@ function _materialize_table(
     arrowtypes = _ArrowTypesContext(budget=budget)
     views = _ViewContext(stringtype, budget)
     batches = _filerecordbatches(src, 1:length(src), budget, ntasks)
-    cols =
-        _buildcolumns(src.fields, batches, 1:length(src.fields), arrowtypes, views, ntasks)
+    cols = _buildcolumns(
+        src.fields,
+        batches,
+        1:length(src.fields),
+        arrowtypes,
+        views,
+        ntasks;
+        lazy=true,
+    )
     nrows = sum(Int(b.nrows) for b in batches; init=0)
     pools = _retaineddictpools(src.fields, batches, arrowtypes)
     return _table(names, cols, src.schema, regions, nrows, pools, budget)
@@ -2272,7 +2303,7 @@ end
 
 # Rows `r` of table `t`.
 function _tablerows(t::Table, r::UnitRange{Int})
-    cols = AbstractVector[c[r] for c in getfield(t, :columns)]
+    cols = AbstractVector[_force(c)[r] for c in getfield(t, :columns)]
     return Table(
         getfield(t, :names),
         cols,

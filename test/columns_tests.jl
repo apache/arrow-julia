@@ -713,6 +713,33 @@ end
         @test t.s == tbl.s && t.x == tbl.x
     end
 
+    @testset "string columns build when first taken" begin
+        n = 100_000
+        strs = [string("value number ", i) for i = 1:n]
+        bytes = arrowbytes((s=strs, x=collect(1:n)))
+        Arrow.Table(bytes)
+        # Opening the table builds no string column (its payloads are 16n bytes).
+        @test (@allocated Arrow.Table(bytes)) < 16n ÷ 4
+        t = Arrow.Table(bytes)
+        @test Tables.schema(t).types == (DataString, Int64)
+        # Tasks that ask at once get the one built column.
+        cols = fetch.([Threads.@spawn(t.s) for _ = 1:8])
+        @test all(c -> c === cols[1], cols) && cols[1] isa StringVector
+        @test cols[1] == strs && t.s === cols[1] && t[1] === cols[1]
+        @test copy(Arrow.Table(bytes)).s == strs
+        @test Arrow.read(bytes, Tables.columntable).s == strs
+        @test Arrow.Table(bytes; stringtype=String).s == strs
+        # The read's allowance is charged when the table opens.
+        @test_throws Arrow.AllocationLimitError Arrow.Table(
+            bytes;
+            limits=Arrow.Limits(max_total_allocated_bytes=16n ÷ 2),
+        )
+        # A released table builds nothing more.
+        released = Arrow.Table(bytes)
+        Arrow.release!(released)
+        @test_throws InvalidStateException released.s
+    end
+
     @testset "string columns keep decompressed data without a copy" begin
         strs = [string(repeat("x", 100), i) for i = 1:100_000]
         data = sum(ncodeunits, strs)

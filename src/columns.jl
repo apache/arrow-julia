@@ -497,13 +497,24 @@ end
 """
 A string or binary column under construction: the payloads and data buffers
 of a `StringVector`/`BytesVector` of type `V`, or the values of a
-`Vector{String}` (`V === String`). Its chunks are independent, so several
-tasks can fill them (`_buildchunk!`); `_finishbuild` returns the column.
+`Vector{String}` (`V === String`). `_stringbuild` plans and charges it,
+`_allocate!` allocates it; its chunks are independent, so several tasks can
+fill them (`_buildchunk!`); `_finishbuild` returns the column.
 """
-struct _StringBuild{V,O}
-    out::O
-    buffers::Vector{Vector{UInt8}}
+mutable struct _StringBuild{V,O}
+    n::Int                           # values
+    out::O                           # payloads or values, `n` long once allocated
+    buffers::Vector{Vector{UInt8}}   # data buffers: kept bytes, or copies once allocated
+    sizes::Vector{Int64}             # the bytes `_allocate!` gives buffer k (-1: kept)
     chunks::Vector{_StringChunk}
+end
+
+function _allocate!(b::_StringBuild{V,O}) where {V,O}
+    b.out = O(undef, b.n)
+    for (k, len) in enumerate(b.sizes)
+        len >= 0 && (b.buffers[k] = Vector{UInt8}(undef, Int(len)))
+    end
+    return b
 end
 
 # Call `f` with the `n + 1` offsets of offsets-layout batch `d`. A fixed-size
@@ -555,6 +566,7 @@ end
 function _offsetruns!(
     chunks,
     buffers,
+    sizes,
     d,
     offsets::AbstractVector{O},
     at::Int,
@@ -566,6 +578,7 @@ function _offsetruns!(
     own = _adoptbytes(AC.rolebuffer(d, AC.DATA))
     if own !== nothing && Int64(offsets[n + 1]) <= _MAX_VIEW_BUFFER
         push!(buffers, own)
+        push!(sizes, -1)
         return _rowchunks!(chunks, d, at, 1, n, length(buffers) - 1, Int64(0), rows, false)
     end
     i = 1
@@ -587,7 +600,8 @@ function _offsetruns!(
         )
         hi = Int64(offsets[j])
         _chargeexact!(budget, UInt8, hi - lo, "string column data")
-        push!(buffers, Vector{UInt8}(undef, Int(hi - lo)))
+        push!(buffers, UInt8[])
+        push!(sizes, hi - lo)
         _rowchunks!(chunks, d, at, i, j - 1, length(buffers) - 1, lo, rows)
         i = j
     end
@@ -603,15 +617,17 @@ _stringbytes(d::AC.ArrayData) =
 
 """
 Plan the column of string or binary batches `datas` with element type `T`:
-allocate and charge its output and data buffers, and cut its rows into chunks
-of at most `rows`. Each data buffer is one copy of a run of the referenced
-bytes; a run stays under 2 GiB so view offsets fit DataStrings' Int32 words.
+charge its output and data buffers (`_allocate!` allocates them), and cut its
+rows into chunks of at most `rows`. Each data buffer is one copy of a run of
+the referenced bytes; a run stays under 2 GiB so view offsets fit
+DataStrings' Int32 words.
 """
 function _stringbuild(::Type{T}, datas, budget, rows::Int=typemax(Int)) where {T}
     B = Base.nonmissingtype(T)
     n = sum(d -> Int(d.len), datas; init=0)
     chunks = _StringChunk[]
     buffers = Vector{UInt8}[]
+    sizes = Int64[]
     at = 0
     if B === String
         _chargeexact!(budget, T, n, "string column")
@@ -627,13 +643,12 @@ function _stringbuild(::Type{T}, datas, budget, rows::Int=typemax(Int)) where {T
             AC.checked_add(AC.checked_mul(Int64(n), Int64(32)), bytes),
             "string values",
         )
-        return _StringBuild{String,Vector{T}}(Vector{T}(undef, n), buffers, chunks)
+        return _StringBuild{String,Vector{T}}(n, T[], buffers, sizes, chunks)
     end
     V =
         B === DataStrings.DataString ? DataStrings.StringVector{T} :
         DataStrings.BytesVector{T}
     _chargeexact!(budget, _StringPayload, n, "string column payloads")
-    payloads = Vector{_StringPayload}(undef, n)
     for d in datas
         m = Int(d.len)
         if d.type isa AC.ViewType
@@ -642,28 +657,76 @@ function _stringbuild(::Type{T}, datas, budget, rows::Int=typemax(Int)) where {T
                 own = _adoptbytes(d.buffers[k])
                 if own !== nothing
                     push!(buffers, own)
+                    push!(sizes, -1)
                     continue
                 end
                 len = d.buffers[k].len
                 _chargeexact!(budget, UInt8, len, "string column data")
-                push!(buffers, Vector{UInt8}(undef, Int(len)))
+                push!(buffers, UInt8[])
+                push!(sizes, len)
                 push!(chunks, _StringChunk(d, at, 1, 0, base, Int64(0), k, true))
             end
             _rowchunks!(chunks, d, at, 1, m, base, Int64(0), rows)
         elseif m > 0
             _withoffsets(
-                o -> _offsetruns!(chunks, buffers, d, o, at, budget, rows),
+                o -> _offsetruns!(chunks, buffers, sizes, d, o, at, budget, rows),
                 d,
                 budget,
             )
         end
         at += m
     end
-    return _StringBuild{V,Vector{_StringPayload}}(payloads, buffers, chunks)
+    return _StringBuild{V,Vector{_StringPayload}}(
+        n,
+        _StringPayload[],
+        buffers,
+        sizes,
+        chunks,
+    )
 end
 
 _finishbuild(b::_StringBuild{String}) = b.out
 _finishbuild(b::_StringBuild{V}) where {V} = V(b.out, b.buffers, Val(:trusted))
+
+"""
+A string or binary column of a whole-table read that builds when it is first
+taken from its table (`_force`): the read charges its allowance up front, and
+the payloads are built and the bytes copied on first access, on up to
+`ntasks` tasks. One task builds; tasks that ask meanwhile wait for it. The
+table hands out only the built column, so loops run over a `StringVector`
+(`BytesVector`, `Vector{String}`) as for an eager read.
+"""
+mutable struct _PendingStrings{T} <: AbstractVector{T}
+    const build::_StringBuild
+    const ntasks::Int
+    const lock::ReentrantLock
+    @atomic column::Union{Nothing,AbstractVector}
+end
+_PendingStrings{T}(b::_StringBuild, ntasks::Int) where {T} =
+    _PendingStrings{T}(b, ntasks, ReentrantLock(), nothing)
+
+Base.size(p::_PendingStrings) = (p.build.n,)
+Base.getindex(p::_PendingStrings, i::Int) = _force(p)[i]
+
+# A table column as it is handed out: a pending string column, built.
+_force(c::AbstractVector) = c isa _PendingStrings ? _forcestrings(c) : c
+function _forcestrings(p::_PendingStrings)
+    c = @atomic :acquire p.column
+    c === nothing || return c
+    return @lock p.lock begin
+        c = @atomic :acquire p.column
+        if c === nothing
+            b = _allocate!(p.build)
+            _foreach(length(b.chunks), p.ntasks) do k, _
+                _buildchunk!(b, k)
+                return nothing
+            end
+            c = _finishbuild(b)
+            @atomic :release p.column = c
+        end
+        c
+    end
+end
 
 "Fill chunk `k` of a string column under construction."
 function _buildchunk!(
@@ -1253,7 +1316,7 @@ function _viewcolumn(
     t = f.type
     t isa AC.NullType && return fill(missing, sum(d -> Int(d.len), datas; init=0))
     if _isstringlayout(t)
-        b = _stringbuild(T, datas, ctx.budget)
+        b = _allocate!(_stringbuild(T, datas, ctx.budget))
         for k in eachindex(b.chunks)
             _buildchunk!(b, k)
         end

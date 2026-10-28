@@ -78,8 +78,9 @@ read-only [`Arrow.ArrowVector`](@ref) views, so building a table costs time
 proportional to its columns and record batches, not its size. A column read
 from several record batches is a `ChainedVector` of per-batch views. String
 and binary columns are `DataStrings.StringVector` and `BytesVector`, built
-with one copy of their bytes; pass `stringtype=String` for `Vector{String}`
-columns. List, map, struct, and union columns read as typed rows (see
+with one copy of their bytes the first time the table hands them out (`tbl.s`,
+`Tables.getcolumn`, or a sink such as `DataFrame`); pass `stringtype=String`
+for `Vector{String}` columns. List, map, struct, and union columns read as typed rows (see
 [Type mapping when reading](@ref)).
 
 Views are read-only. `copy(column)` returns an owned `Vector` (a

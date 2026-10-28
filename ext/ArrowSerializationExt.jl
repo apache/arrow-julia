@@ -63,7 +63,10 @@ function S.serialize(s::S.AbstractSerializer, t::Arrow.Table)
     S.serialize_type(s, Arrow.Table)
     S.serialize(s, getfield(t, :names))
     # Views serialize as the owned vectors they copy to, not as their buffers.
-    S.serialize(s, AbstractVector[Arrow._ownedcolumn(c) for c in getfield(t, :columns)])
+    S.serialize(
+        s,
+        AbstractVector[Arrow._ownedcolumn(Arrow._force(c)) for c in getfield(t, :columns)],
+    )
     for name in (:schema, :nrows, :retainedpools)
         S.serialize(s, getfield(t, name))
     end
