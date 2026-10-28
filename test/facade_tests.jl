@@ -3047,6 +3047,11 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             back = Arrow.readfile(take!(Arrow.write(IOBuffer(), t)))
             @test Dict(only(back.schema.fields).metadata)["ARROW:extension:name"] == label
         end
+        # So does a name some code already made a Symbol, when no
+        # ArrowTypes.jl `JuliaType` method takes it.
+        Symbol(name)
+        f = AC.Field("x", AC.Utf8Type(false); nullable=false, metadata=ext(name))
+        @test onecolumn(f, ds).x isa StringVector
         _, d32 = AC.fromjulia("x", Int32[1, 2, 3])
         f = AC.Field("x", AC.IntType(32, true); nullable=false, metadata=ext(name))
         t = onecolumn(f, d32)

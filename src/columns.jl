@@ -1112,10 +1112,9 @@ end
 
 # Whether `f` carries an extension label that reads as its storage: a quiet
 # canonical label (`arrow.json`, `arrow.opaque`), or a label the facade does
-# not own and no ArrowTypes.jl registration can name (its name is not yet a
-# Julia `Symbol`), which warns once per process. Other labels, and labels
-# below the top level, keep the materializing path, which resolves
-# ArrowTypes.jl hooks once per field.
+# not own and no ArrowTypes.jl `JuliaType` method names, which warns once
+# per process. Other labels, and labels below the top level, keep the
+# materializing path, which resolves ArrowTypes.jl hooks once per field.
 function _storagelabel(f::AC.Field)
     ext = _arrowtypesextension(f)
     ext === nothing && return false
@@ -1123,9 +1122,21 @@ function _storagelabel(f::AC.Field)
     name = first(ext)
     _quietextension(name) && return true
     _facadelabel(name) && return false
-    _existingjlsymbol(name) === nothing || return false
+    # A name that is not a Symbol yet cannot be registered; looking it up
+    # does not intern it.
+    sym = _existingjlsymbol(name)
+    sym === nothing || !_juliatypenames(sym) || return false
     _warnunsupportedextension((warn=true, budget=nothing), name, f)
     return true
+end
+
+# Whether an `ArrowTypes.JuliaType` method other than its catch-all
+# fallbacks can take `Val(sym)` as its first argument.
+_juliatypenames(sym::Symbol) = any(methods(ArrowTypes.JuliaType)) do m
+    sig = Base.unwrap_unionall(m.sig)
+    length(sig.parameters) >= 2 || return false
+    arg = Base.rewrap_unionall(sig.parameters[2], m.sig)
+    return arg !== Any && Val{sym} <: arg
 end
 
 _facadelabel(name::String) =

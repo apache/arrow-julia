@@ -685,8 +685,8 @@ end
         @test DataAPI.colmetadata(t, :a, "k") == "v"
 
         # The CategoricalArrays extension labels are unregistered here, so the
-        # reader warns (once per process) and falls back to the dictionary's
-        # storage values.
+        # reader warns (once per process) and reads the dictionary-encoded
+        # strings the label is stored as.
         empty!(Arrow._WARNED_EXTENSIONS)
         t =
             @test_logs (:warn, r"unsupported ARROW:extension:name") match_mode = :any Arrow.Table(
@@ -700,7 +700,7 @@ end
                 fixture("categorical-missing"),
             )
         @test isequal(t.y, ["a", missing, "b"])
-        @test eltype(t.y) == Union{Missing,String}
+        @test eltype(t.y) == Union{Missing,DataString}
     end
 end
 
