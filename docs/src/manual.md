@@ -483,7 +483,9 @@ Arrow 3.0 physical layout.
 
 Arrow reads the canonical extension types `arrow.uuid` as `UUIDs.UUID` and
 `arrow.bool8` as `Bool` (any nonzero byte is `true`), and `arrow.json` and
-`arrow.opaque` as their storage values (`String`, bytes) without a warning. The
+`arrow.opaque` as their storage columns (a `StringVector` of `DataString`, or
+`String` with `stringtype=String`; bytes as `DataBytes`) without a warning. A
+column with an unsupported extension label reads its storage the same way. The
 `JuliaLang.UUID` label older Arrow.jl versions wrote (little-endian bytes) still
 reads as `UUID`, and rewriting such a column keeps that layout.
 

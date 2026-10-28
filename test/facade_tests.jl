@@ -2998,9 +2998,9 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
     @testset "canonical extension reads" begin
         AC = Arrow.AC
         ext(name) = ["ARROW:extension:name" => name, "ARROW:extension:metadata" => ""]
-        function onecolumn(f, d)
+        function onecolumn(f, d; kw...)
             sch = AC.Schema([f])
-            return Arrow.Table(Arrow.writefile(sch, [AC.RecordBatch(sch, [d])]))
+            return Arrow.Table(Arrow.writefile(sch, [AC.RecordBatch(sch, [d])]); kw...)
         end
         _, d8 = AC.fromjulia("x", Int8[0, 1, 7])
         t = onecolumn(
@@ -3025,6 +3025,21 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         f = AC.Field("x", AC.Utf8Type(false); nullable=false, metadata=ext(name))
         @test_logs (:warn, r"unsupported ARROW:extension:name") onecolumn(f, ds)
         @test_logs min_level = Logging.Warn onecolumn(f, ds)
+        # Labels that read as their storage read as its columns: strings as
+        # a StringVector (or `stringtype`), integers as a view; a rewrite
+        # keeps the label.
+        for label in ("arrow.json", "arrow.opaque", name)
+            f = AC.Field("x", AC.Utf8Type(false); nullable=false, metadata=ext(label))
+            t = onecolumn(f, ds)
+            @test t.x isa StringVector && eltype(t.x) == DataStrings.DataString
+            @test eltype(onecolumn(f, ds; stringtype=String).x) == String
+            back = Arrow.readfile(take!(Arrow.write(IOBuffer(), t)))
+            @test Dict(only(back.schema.fields).metadata)["ARROW:extension:name"] == label
+        end
+        _, d32 = AC.fromjulia("x", Int32[1, 2, 3])
+        f = AC.Field("x", AC.IntType(32, true); nullable=false, metadata=ext(name))
+        t = onecolumn(f, d32)
+        @test t.x isa Arrow.Primitive && t.x == [1, 2, 3]
     end
 
     @testset "read views write back from their own buffers" begin

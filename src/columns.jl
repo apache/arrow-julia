@@ -1097,14 +1097,40 @@ end
 """
 Whether `f` reads through this file's columns: a flat layout (as a view) or
 a list, fixed-size list, map, struct, or union of such layouts (as typed
-rows), with no ArrowTypes extension label anywhere in it. List views,
-structs with duplicate or more than 64 field names, layouts nested more
-than 8 deep, and extension columns keep the materializing path.
+rows). An ArrowTypes extension label keeps the materializing path unless it
+maps to no Julia type (see `_storagelabel`) or is a fixed-shape tensor. List
+views, structs with duplicate or more than 64 field names, and layouts
+nested more than 8 deep also keep the materializing path.
 """
 function _viewable(f::AC.Field)
-    _hasarrowtypesextension(f) && return _tensorshape(f) !== nothing
+    if _hasarrowtypesextension(f)
+        _tensorshape(f) === nothing || return true
+        _storagelabel(f) || return false
+    end
     return _viewablelayout(f)
 end
+
+# Whether `f` carries an extension label that reads as its storage: a quiet
+# canonical label (`arrow.json`, `arrow.opaque`), or a label the facade does
+# not own and no ArrowTypes.jl registration can name (its name is not yet a
+# Julia `Symbol`), which warns once per process. Other labels, and labels
+# below the top level, keep the materializing path, which resolves
+# ArrowTypes.jl hooks once per field.
+function _storagelabel(f::AC.Field)
+    ext = _arrowtypesextension(f)
+    ext === nothing && return false
+    any(_hasarrowtypesextension, f.children) && return false
+    name = first(ext)
+    _quietextension(name) && return true
+    _facadelabel(name) && return false
+    _existingjlsymbol(name) === nothing || return false
+    _warnunsupportedextension((warn=true, budget=nothing), name, f)
+    return true
+end
+
+_facadelabel(name::String) =
+    name in (_UUID_EXTENSION, "JuliaLang.Int128", "JuliaLang.UInt128", "arrow.bool8") ||
+    any(p -> last(p) == name, _FACADE_PERIOD_NAMES)
 function _viewablelayout(f::AC.Field, depth::Int=0)
     t = f.type
     t isa Union{

@@ -6549,11 +6549,13 @@ end
         ],
     )
     schema = ARROWTYPES_TEST_AC.Schema([structfield, mapfield, fixedfield, unknownfield])
+    # An unknown label reads its storage, here a struct of unlabelled fields
+    # (typed rows, as the same struct without a label).
     expected = (
         Vector{Pair{String,Any}},
         Vector{Pair{Any,Any}},
         Vector{ArrowTypesTestID},
-        Vector{Pair{String,Any}},
+        @NamedTuple{plain::Int64},
     )
 
     _, fixedchilddata = ARROWTYPES_TEST_AC.fromjulia("item", Int64[1, 2, 3, 4])

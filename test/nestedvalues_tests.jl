@@ -584,13 +584,15 @@ end
         # fromarrow tails), and composite restorations reserve the row's
         # inline payload besides. The floors below fail if a reserve is
         # dropped. A flat decimal column reads as a view over its buffer,
-        # with no per-value charge, and an unlabeled union as one typed row
-        # vector (8 bytes per row).
+        # with no per-value charge; an unlabeled union as one typed row
+        # vector (8 bytes per row); and a run-end column whose unknown label
+        # reads as storage as a run-end view (its run ends copied, 8 bytes
+        # per run).
         with_logger(NullLogger()) do
             for (name, bytes, floor, first_expected) in (
                 ("flat decimal", decbytes, 0, reinterpret(Dec64, Int64(70000))),
                 ("union timestamp", unionbytes, 8n, ns(1)),
-                ("unknown-label run-end timestamp", reebytes, 160n, ns(1)),
+                ("unknown-label run-end timestamp", reebytes, 8n, ns(1)),
                 ("registered fromarrow union", liftedbytes, 224n, lifted[1]),
                 ("nested fixed-size-list identity", fslbytes, fslfloor, fslexpected),
             )
