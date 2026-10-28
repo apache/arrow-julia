@@ -57,6 +57,12 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y -V subversion
+      # Without an installed Julia, verify_rc.sh asks api.github.com for the
+      # latest release without a token, which a rate-limited runner refuses.
+      - uses: julia-actions/setup-julia@v3
+        if: matrix.os == 'ubuntu-latest'
+        with:
+          version: '1'
       - name: Create
         run: |
           git config user.name "github-actions[bot]"
