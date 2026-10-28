@@ -72,33 +72,38 @@ function _fixedlistnullbytes(listsize::Int; file::Bool)
 end
 
 @testset "facade rewrite correctness regressions" begin
-    @testset "duplicate names stay positional" begin
+    @testset "repeated names read as x, x_1, as CSV.jl names them" begin
         f1, d1 = AC.fromjulia("x", Int64[1, 2])
         f2, d2 = AC.fromjulia("x", Int64[10, 20])
+        f3, d3 = AC.fromjulia("x_1", Int64[5, 6])
         f1 = AC.Field("x", f1.type; nullable=false, metadata=["slot" => "first"])
         f2 = AC.Field("x", f2.type; nullable=false, metadata=["slot" => "second"])
-        schema = AC.Schema([f1, f2])
-        bytes = Arrow.writestream(schema, [AC.RecordBatch(schema, [d1, d2], 2)])
-        table = Arrow.Table(bytes)
-        @test Tables.columnnames(table) == [:x, :x]
-        @test Tables.getcolumn(table, 1) == [1, 2]
-        @test Tables.getcolumn(table, 2) == [10, 20]
-        @test DataAPI.colmetadata(table, 1, "slot") == "first"
-        @test DataAPI.colmetadata(table, 2, "slot") == "second"
-        @test_throws ArgumentError table.x
-        @test_throws ArgumentError Tables.getcolumn(table, :x)
-        @test_throws ArgumentError DataAPI.colmetadatakeys(table, :x)
-        @test_throws ArgumentError DataAPI.colmetadata(table, :x, "slot")
-        allkeys = collect(DataAPI.colmetadatakeys(table))
-        @test first.(allkeys) == [:x, :x]
-        @test [collect(last(kv)) for kv in allkeys] == [["slot"], ["slot"]]
-
-        rewritten = Arrow.readstream(_rewrite(bytes))
-        batch = rewritten.batches[1]
-        @test AC.materialize(rewritten.schema.fields[1], batch.columns[1]) == [1, 2]
-        @test AC.materialize(rewritten.schema.fields[2], batch.columns[2]) == [10, 20]
-        @test collect(rewritten.schema.fields[1].metadata) == ["slot" => "first"]
-        @test collect(rewritten.schema.fields[2].metadata) == ["slot" => "second"]
+        schema = AC.Schema([f1, f2, f3])
+        batch = AC.RecordBatch(schema, [d1, d2, d3], 2)
+        for bytes in (Arrow.writestream(schema, [batch]), Arrow.writefile(schema, [batch]))
+            table = Arrow.Table(bytes)
+            # A suffix never takes a name the file already has.
+            @test Tables.columnnames(table) == [:x, :x_2, :x_1]
+            @test table.x == [1, 2]
+            @test table.x_2 == [10, 20]
+            @test table.x_1 == [5, 6]
+            @test DataAPI.colmetadata(table, :x, "slot") == "first"
+            @test DataAPI.colmetadata(table, :x_2, "slot") == "second"
+            # Selections, filters, and streams see the same names.
+            sel = Arrow.Table(bytes; select=[:x_2], filter=Arrow.col(:x) > 1)
+            @test Tables.columnnames(sel) == [:x_2] && sel.x_2 == [20]
+            for b in Arrow.Stream(bytes)
+                @test Tables.columnnames(b) == [:x, :x_2, :x_1]
+            end
+            @test Tables.columnnames(Arrow.Stream(bytes)) == [:x, :x_2, :x_1]
+            # A rewrite writes the unique names, each column's metadata kept.
+            rewritten = Arrow.readstream(_rewrite(bytes))
+            @test [f.name for f in rewritten.schema.fields] == ["x", "x_2", "x_1"]
+            back = rewritten.batches[1]
+            @test AC.materialize(rewritten.schema.fields[2], back.columns[2]) == [10, 20]
+            @test collect(rewritten.schema.fields[1].metadata) == ["slot" => "first"]
+            @test collect(rewritten.schema.fields[2].metadata) == ["slot" => "second"]
+        end
     end
 
     @testset "NullType is inferred and retained" begin

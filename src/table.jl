@@ -231,15 +231,59 @@ function _newzones!(seen::Set{String}, f::AC.Field)
     return seen
 end
 
+# `names` with each repeated name made unique as CSV.jl does (`a`, `a_1`, `a_2`,
+# never taking a name already present); `names` itself when all are unique.
+function _uniquenames(names::AbstractVector{String})
+    allunique(names) && return names
+    taken = Set{String}(names)
+    next = Dict{String,Int}()
+    unique = String[]
+    for name in names
+        if haskey(next, name)
+            k = next[name]
+            while "$(name)_$k" in taken
+                k += 1
+            end
+            next[name] = k + 1
+            renamed = "$(name)_$k"
+            push!(taken, renamed)
+            push!(unique, renamed)
+        else
+            next[name] = 1
+            push!(unique, name)
+        end
+    end
+    return unique
+end
+
+# `schema` with its top-level fields renamed as `_fieldnamesymbols` names them.
+function _uniqueschema(schema::AC.Schema)
+    names = String[f.name for f in schema.fields]
+    unique = _uniquenames(names)
+    unique === names && return schema
+    fields = AC.Field[
+        AC.Field(n, f.type, f.nullable, f.metadata, f.children) for
+        (n, f) in zip(unique, schema.fields)
+    ]
+    return AC.Schema(
+        AC.FrozenVector{AC.Field}(fields, nothing),
+        schema.metadata,
+        schema.endianness,
+    )
+end
+
+# Column names of `fields`, unique (`_uniquenames`) and interned within the
+# per-read novel-name limits.
 function _fieldnamesymbols(fields, budget=nothing)
     # Before any name is interned, so names cannot pre-intern zones.
     _checknewzones(fields)
+    _chargevector!(budget, String, length(fields), "field names")
+    names = _uniquenames(String[field.name for field in fields])
     _chargedict!(budget, String, Nothing, length(fields), "novel field-name set")
     novel = Set{String}()
     sizehint!(novel, length(fields))
     novelbytes = 0
-    for field in fields
-        name = field.name
+    for name in names
         _validatefieldsymbolname(name)
         _existingjlsymbol(name) === nothing || continue
         name in novel && continue
@@ -259,7 +303,7 @@ function _fieldnamesymbols(fields, budget=nothing)
     end
     budget === nothing || _charge!(budget, Int64(novelbytes), "novel field-name bytes")
     _chargevector!(budget, Symbol, length(fields), "table field names")
-    return Symbol[_fieldsymbol(field.name) for field in fields]
+    return Symbol[_fieldsymbol(name) for name in names]
 end
 
 function _table(
@@ -1889,9 +1933,10 @@ function _corefields(source::Union{IPCStream,ArrowFile}, budget=nothing)
     return collect(AC.Field, fields)
 end
 
-_tableschema(s::IPCStream) = s.schema
-_tableschema(f::Union{ArrowFile,_RangedFile}) = f.schema
-_tableschema(r::_StreamReader) = r.st.schema
+# A source's schema as its tables carry it: repeated column names made unique.
+_tableschema(s::IPCStream) = _uniqueschema(s.schema)
+_tableschema(f::Union{ArrowFile,_RangedFile}) = _uniqueschema(f.schema)
+_tableschema(r::_StreamReader) = _uniqueschema(r.st.schema)
 
 "Merge category snapshots while preserving every entry in the first snapshot."
 function _mergecategorypools(pools; widen::Bool=false, budget=nothing)
@@ -2028,7 +2073,7 @@ function _materialize_table(
     )
     nrows = sum(Int(b.nrows) for b in src.batches; init=0)
     pools = _retaineddictpools(src.corefields, src.batches, arrowtypes)
-    return _table(names, cols, src.schema, regions, nrows, pools, budget)
+    return _table(names, cols, _tableschema(src), regions, nrows, pools, budget)
 end
 
 function _materialize_table(
@@ -2054,7 +2099,7 @@ function _materialize_table(
     )
     nrows = sum(Int(b.nrows) for b in batches; init=0)
     pools = _retaineddictpools(src.fields, batches, arrowtypes)
-    return _table(names, cols, src.schema, regions, nrows, pools, budget)
+    return _table(names, cols, _tableschema(src), regions, nrows, pools, budget)
 end
 
 # The eltype the keep/drop decision uses for an EMPTY pre-override column:

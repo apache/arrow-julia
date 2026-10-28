@@ -876,11 +876,6 @@ struct _BoundScanPlan
     bound::Tables.BoundScan
 end
 
-function _alluniquenames(names, budget=nothing)
-    _chargedict!(budget, Symbol, Nothing, length(names), "scan name-uniqueness index")
-    return allunique(names)
-end
-
 function _deduplicatesorted!(values::Vector)
     isempty(values) && return values
     # Stability is irrelevant here. QuickSort avoids the input-sized scratch
@@ -1027,12 +1022,8 @@ function _resolvescan(scan::Tables.Scan, names, budget=nothing)
 end
 
 function _compileboundscan(scan::Tables.Scan, fields, budget=nothing)
+    # Unique names (`_fieldnamesymbols`), so every column has one reference.
     names = _fieldnamesymbols(fields, budget)
-    _alluniquenames(names, budget) || throw(
-        AC.ValidationError(
-            "scan pushdown over duplicate column names is not supported; read the file without a scan",
-        ),
-    )
     return _BoundScanPlan(names, _resolvescan(scan, names, budget))
 end
 

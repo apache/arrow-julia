@@ -573,7 +573,7 @@ function _scan_main()
     @assert _rejects(() -> readfile(copy(overlap)))
     println("buffer-table invariants hold before any skip can run ✓")
 
-    # Duplicate source names are a declared facade boundary.
+    # Duplicate source names.
     dupfields = Field[
         Field("x", IntType(64, true), true, nothing, Field[]),
         Field("x", IntType(64, true), true, nothing, Field[]),
@@ -587,8 +587,10 @@ function _scan_main()
     )
     dupbytes = writefile(dupsch, [AC.RecordBatch(dupsch, ArrayData[dupcol(), dupcol()], 1)])
     dupaf = readfile(dupbytes)
-    @assert _rejects(() -> Tables.scan(dupaf, Tables.Scan(select=(1,))))
-    println("duplicate-name scans refuse cleanly (facade boundary) ✓")
+    # They read as x, x_1, as CSV.jl names them, scans included.
+    dupscan = Tables.scan(dupaf, Tables.Scan(select=(2,)))
+    @assert collect(Tables.columnnames(Tables.columns(dupscan))) == [:x_1]
+    println("duplicate source names scan as x, x_1 ✓")
 
     # Window row counts are metadata, but they are not trusted until the
     # RecordBatch length agrees with every top-level FieldNode. Otherwise a
