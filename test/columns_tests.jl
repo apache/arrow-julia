@@ -156,7 +156,7 @@ end
             tbl = Arrow.Table(Arrow.writefile(sch, [AC.RecordBatch(sch, [dd, ld])]))
             @test tbl.d isa Arrow.Primitive && tbl.d == want
             @test tbl.l[1] isa Arrow.ListValue && tbl.l[1] == want && isempty(tbl.l[2])
-            back = Arrow.readfile(take!(Arrow.write(IOBuffer(), tbl)))
+            back = Arrow.readfile(take!(Arrow.write(IOBuffer(), tbl; file=true)))
             @test [f.type for f in back.schema.fields] == [t, lt]
             @test only(back.schema.fields[2].children).type == t
             @test Arrow.Table(back).d == want

@@ -699,7 +699,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         # one ahead of the batch in use: the third is not fetched while the
         # first is in use.
         large = [(a=collect(Int64, ((k - 1) * 1_200_000 + 1):(k * 1_200_000)),) for k = 1:3]
-        bytes = take!(Arrow.write(IOBuffer(), Tables.partitioner(large)))
+        bytes = take!(Arrow.write(IOBuffer(), Tables.partitioner(large); file=true))
         third = Arrow.readfile(bytes).recordblocks[3][1]
         log = _LoggingSource(bytes, NTuple{2,Int64}[])
         st = Arrow.Stream(log)
@@ -710,7 +710,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test sum(b -> length(b.a), st) == 3_600_000
         # With concurrent reads, a whole-object read fetches the bytes before
         # the tail in 8 MiB ranges at once, into one buffer.
-        big = take!(Arrow.write(IOBuffer(), (a=collect(Int64, 1:2_200_000),)))
+        big = take!(Arrow.write(IOBuffer(), (a=collect(Int64, 1:2_200_000),); file=true))
         cs = _ConcurrentSource(big, 4)
         @test Arrow.Table(cs).a == 1:2_200_000
         @test (@atomic cs.issued) == 1 + cld(length(big) - 65536, 8 * 1024 * 1024)
