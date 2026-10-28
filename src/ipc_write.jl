@@ -63,6 +63,84 @@ EncodeState(level::Union{Nothing,Integer}=nothing) = EncodeState(
     Vector{UInt8}[],
 )
 
+"""
+Vectors the writer's columns rebuild for each record batch (string offsets and
+bytes, validity bitmaps), taken here while the batch builds and returned once
+it is published, so a write holds about one batch of them instead of every
+batch until the GC runs; reused memory also skips the page faults that fresh
+memory takes, which several threads cannot take at once.
+"""
+struct _BufferPool
+    lock::ReentrantLock
+    bytes::Vector{Vector{UInt8}}
+    i32::Vector{Vector{Int32}}
+    i64::Vector{Vector{Int64}}
+    # Handed out since the last `_handoff!`: the batch being built.
+    taken::Vector{Any}
+end
+_BufferPool() =
+    _BufferPool(ReentrantLock(), Vector{UInt8}[], Vector{Int32}[], Vector{Int64}[], Any[])
+
+_freelist(p::_BufferPool, ::Type{UInt8}) = p.bytes
+_freelist(p::_BufferPool, ::Type{Int32}) = p.i32
+_freelist(p::_BufferPool, ::Type{Int64}) = p.i64
+
+"""
+A `Vector{T}` of length `n`, from `pool` (or new without one): the shortest
+free vector at least that long, else the longest one, grown.
+"""
+function _takevector(pool, ::Type{T}, n::Int) where {T}
+    pool === nothing && return Vector{T}(undef, n)
+    p = pool::_BufferPool
+    @lock p.lock begin
+        free = _freelist(p, T)
+        k = 0
+        for (i, v) in enumerate(free)
+            m, best = length(v), k == 0 ? 0 : length(free[k])
+            if k == 0 || (m >= n ? (best < n || m < best) : (best < n && m > best))
+                k = i
+            end
+        end
+        v = k == 0 ? Vector{T}(undef, n) : resize!(popat!(free, k), n)
+        push!(p.taken, v)
+        v
+    end
+end
+
+"The vectors taken for the batch just built, to return once it is published."
+function _handoff!(pool)
+    pool === nothing && return nothing
+    p = pool::_BufferPool
+    @lock p.lock begin
+        out = copy(p.taken)
+        empty!(p.taken)
+        (p, out)
+    end
+end
+
+"Return a published batch's vectors, except those a kept dictionary still uses."
+function _recycle!(st, recycle)
+    recycle === nothing && return nothing
+    p, vectors = recycle
+    kept = Base.IdSet{Any}()
+    for d in values(st.current)
+        _bufferroots!(kept, d)
+    end
+    @lock p.lock for v in vectors
+        v in kept || push!(_freelist(p, eltype(v)), v)
+    end
+    return nothing
+end
+
+function _bufferroots!(roots, d::ArrayData)
+    for b in d.buffers
+        b.region === nothing || push!(roots, b.region.root)
+    end
+    foreach(c -> _bufferroots!(roots, c), d.children)
+    d.dictionary === nothing || _bufferroots!(roots, d.dictionary)
+    return roots
+end
+
 "Return the frames of published messages to their states for reuse."
 function _recycleframes!(states::Vector{EncodeState})
     for s in states
@@ -1021,7 +1099,7 @@ mutable struct IPCWriteState
     # A compressed batch encodes on its own task while the next one builds;
     # batches publish in order. Each pending entry is the encoding task and
     # the codec states it uses; `statesets` holds idle sets for reuse.
-    const pending::Vector{Tuple{Task,Vector{EncodeState}}}
+    const pending::Vector{Tuple{Task,Vector{EncodeState},Any}}
     const statesets::Vector{Vector{EncodeState}}
 end
 
@@ -1114,7 +1192,7 @@ function beginwrite!(
         NTuple{3,Int64}[],
         Int64(0),
         false,
-        Tuple{Task,Vector{EncodeState}}[],
+        Tuple{Task,Vector{EncodeState},Any}[],
         Vector{EncodeState}[],
     )
     out = UInt8[]
@@ -1150,7 +1228,7 @@ _buildmessages(builders, states, ntasks) = Tuple{Vector{UInt8},EncodeCursor,Any}
 
 "Publish the oldest pending batch, after its encoding task finishes."
 function _publishnext!(st::IPCWriteState)
-    task, states = popfirst!(st.pending)
+    task, states, recycle = popfirst!(st.pending)
     messages = try
         fetch(task)
     catch err
@@ -1161,6 +1239,7 @@ function _publishnext!(st::IPCWriteState)
     end
     _publishmessages!(st, messages, states)
     push!(st.statesets, states)
+    _recycle!(st, recycle)
     return nothing
 end
 
@@ -1193,6 +1272,7 @@ function writebatch!(
     batch::AC.RecordBatch;
     validate::Bool=true,
     deltas::Union{Nothing,Dict{Int64,ArrayData}}=nothing,
+    recycle=nothing,
 )
     st.finished && throw(ArgumentError("this IPC writer is already finished"))
     if validate
@@ -1288,15 +1368,15 @@ function writebatch!(
         states =
             isempty(st.statesets) ? _encodestates(codec, st.states[1].level, st.ntasks) :
             pop!(st.statesets)
-        push!(
-            st.pending,
-            (Threads.@spawn(_buildmessages(builders, states, st.ntasks)), states),
-        )
+        task = Threads.@spawn _buildmessages(builders, states, st.ntasks)
+        push!(st.pending, (task, states, recycle))
+        merge!(st.current, staged)
         length(st.pending) > _INFLIGHT - 1 && _publishnext!(st)
     else
         _publishmessages!(st, _buildmessages(builders, st.states, st.ntasks))
+        merge!(st.current, staged)
+        _recycle!(st, recycle)
     end
-    merge!(st.current, staged)
     append!(st.deferred, deferred)
     return nothing
 end
@@ -1374,7 +1454,7 @@ end
 function abortwrite!(st::IPCWriteState)
     st.finished && return nothing
     st.finished = true
-    for (task, states) in st.pending
+    for (task, states, _) in st.pending
         # A failure here follows from the caller's error.
         try
             wait(task)
@@ -1435,7 +1515,7 @@ function resumestream!(
         NTuple{3,Int64}[],
         Int64(0),
         false,
-        Tuple{Task,Vector{EncodeState}}[],
+        Tuple{Task,Vector{EncodeState},Any}[],
         Vector{EncodeState}[],
     )
 end

@@ -370,12 +370,12 @@ _nestedbuild(::Val{:fixedlist}, name, v, context) = _fixedlistpart(name, v, cont
 List offsets (row `i` holds values `offsets[i]+1:offsets[i+1]` of the
 child), validity, and null count of `v`'s rows, in one pass.
 """
-function _listoffsets(name::String, v::AbstractVector, ::Type{O}) where {O}
+function _listoffsets(name::String, v::AbstractVector, ::Type{O}, pool=nothing) where {O}
     n = length(v)
     i0 = firstindex(v) - 1
-    offsets = Vector{O}(undef, n + 1)
+    offsets = _takevector(pool, O, n + 1)
     offsets[1] = 0
-    bits = Vector{UInt8}(undef, cld(n, 8))
+    bits = _takevector(pool, UInt8, cld(n, 8))
     pos = 0
     valid = 0
     @inbounds for b in eachindex(bits)
@@ -401,17 +401,22 @@ end
 
 # A list or map column read from Arrow keeps its offsets, rebased to start at
 # zero: a null row may span child values, which stay in the child.
-function _listoffsets(name::String, v::Union{ListVector,MapVector}, ::Type{O}) where {O}
+function _listoffsets(
+    name::String,
+    v::Union{ListVector,MapVector},
+    ::Type{O},
+    pool=nothing,
+) where {O}
     n = length(v)
     raw = v.offsets
     lo = raw[1]
-    offsets = Vector{O}(undef, n + 1)
+    offsets = _takevector(pool, O, n + 1)
     @inbounds for i = 1:(n + 1)
         x = raw[i] - lo
         x <= typemax(O) || throw(_OffsetOverflow(name, 0, i - 1))
         offsets[i] = x
     end
-    validity, nc = _storedvalidity(v.validity, v.bitoffset, n)
+    validity, nc = _storedvalidity(v.validity, v.bitoffset, n, pool)
     return offsets, validity, nc
 end
 
@@ -419,9 +424,9 @@ end
 The validity of `n` rows a read column stores as `bits` from `bitoffset` (no
 bits: no nulls), as a write buffer, and the null count.
 """
-function _storedvalidity(bits::Vector{UInt8}, bitoffset::Int, n::Int)
+function _storedvalidity(bits::Vector{UInt8}, bitoffset::Int, n::Int, pool=nothing)
     isempty(bits) && return AC.BufferSlice(), 0
-    out = Vector{UInt8}(undef, cld(n, 8))
+    out = _takevector(pool, UInt8, cld(n, 8))
     valid = 0
     @inbounds for b in eachindex(out)
         byte = 0x00
@@ -495,7 +500,7 @@ end
 
 function _listpart(name::String, v::AbstractVector, context)
     large = _largelists(context)
-    offsets, validity, nc = _listoffsets(name, v, large ? Int64 : Int32)
+    offsets, validity, nc = _listoffsets(name, v, large ? Int64 : Int32, _pool(context))
     E = eltype(Base.nonmissingtype(eltype(v)))
     values = _listvalues(_errname(context, name), E, v, offsets)
     cf, cd = _constructpart("item", values; context)
@@ -619,7 +624,7 @@ end
 function _structpart(name::String, v::StructVector, context)
     NT = Base.nonmissingtype(eltype(v))
     n = length(v)
-    validity, nc = _storedvalidity(v.validity, v.bitoffset, n)
+    validity, nc = _storedvalidity(v.validity, v.bitoffset, n, _pool(context))
     fields = AC.Field[]
     children = AC.ArrayData[]
     for k = 1:fieldcount(NT)
@@ -679,7 +684,7 @@ end
 function _mappart(name::String, v::AbstractVector, context)
     R = Base.nonmissingtype(eltype(v))
     K, V = _maptypes(R)
-    offsets, validity, nc = _listoffsets(name, v, Int32)
+    offsets, validity, nc = _listoffsets(name, v, Int32, _pool(context))
     entries = _mapentries(_errname(context, name), Pair{K,V}, v, offsets)
     KK = Base.nonmissingtype(K)
     KK === K ||
@@ -708,7 +713,7 @@ end
 
 # A map column read from Arrow writes its offsets, keys, and values as stored.
 function _mappart(name::String, v::MapVector, context)
-    offsets, validity, nc = _listoffsets(name, v, Int32)
+    offsets, validity, nc = _listoffsets(name, v, Int32, _pool(context))
     lo, hi = v.offsets[1], v.offsets[end]
     kf, kd = _constructpart("key", _childslice(v.keys, lo, hi); context)
     vf, vd = _constructpart("value", _childslice(v.values, lo, hi); context)
@@ -1085,6 +1090,7 @@ function _constructpart(
         t,
         large ? Int64 : Int32,
         nullable,
+        _pool(context),
     )
 end
 
@@ -1101,16 +1107,17 @@ function _packedpayloadpart(
     t::AC.ArrowType,
     ::Type{Offset},
     nullable::Bool,
+    pool=nothing,
 ) where {Offset}
     n = length(payloads)
-    offsets = Vector{Offset}(undef, n + 1)
+    offsets = _takevector(pool, Offset, n + 1)
     offsets[1] = 0
-    bits = Vector{UInt8}(undef, cld(n, 8))
+    bits = _takevector(pool, UInt8, cld(n, 8))
     # Inline values are at most 12 bytes, so this holds every value until the
     # first out-of-line one; a batch that starts out of line goes without.
     firstlong =
         n > 0 && DataStrings.payloadlength(@inbounds payloads[1]) > DataStrings.INLINE_MAX
-    inline = Vector{UInt8}(undef, firstlong ? 16 : 12n + 16)
+    inline = _takevector(pool, UInt8, firstlong ? 16 : 12n + 16)
     # The out-of-line values must sit back to back in row order in the buffer
     # of the first one (`runbuf`), from `runstart`, for the data to be a slice.
     runbuf = 0
@@ -1156,8 +1163,9 @@ function _packedpayloadpart(
     validity =
         nc == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(bits), 0, length(bits))
     if runbuf == 0
-        resize!(inline, pos)
-        databuf = pos == 0 ? AC.BufferSlice() : AC._databuffer(inline)
+        # The bytes are a slice: the vector keeps its length, which a reused
+        # vector's pool reads as its capacity.
+        databuf = pos == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(inline), 0, pos)
         d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
         return AC.Field(name, t; nullable), _constructedvalid(d)
     end
@@ -1166,7 +1174,7 @@ function _packedpayloadpart(
         d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
         return AC.Field(name, t; nullable), _constructedvalid(d)
     end
-    data = Vector{UInt8}(undef, pos + 32)
+    data = _takevector(pool, UInt8, pos + 32)
     GC.@preserve payloads buffers data begin
         out = pointer(data)
         words = Ptr{UInt64}(pointer(payloads))
@@ -1198,8 +1206,7 @@ function _packedpayloadpart(
             out += len
         end
     end
-    resize!(data, pos)
-    databuf = pos == 0 ? AC.BufferSlice() : AC._databuffer(data)
+    databuf = pos == 0 ? AC.BufferSlice() : AC.BufferSlice(AC.heapregion(data), 0, pos)
     d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
     return AC.Field(name, t; nullable), _constructedvalid(d)
 end
@@ -1251,6 +1258,7 @@ function _inlineinrun(payloads, offsets, buffers, k::Int, start::Int)
 end
 
 _stringview(context) = context !== nothing && context.stringview
+_pool(context) = context === nothing ? nothing : context.pool
 _largelists(context) = context !== nothing && context.largelists
 
 """
@@ -2409,12 +2417,15 @@ mutable struct _WriterContext
     stringview::Bool
     # Fresh strings, bytes, and lists declare 64-bit offsets.
     largelists::Bool
+    # Where a writer's rebuilt buffers come from (`_BufferPool`), or nothing.
+    pool::Any
 end
 
 function _WriterContext(
     column::AbstractString="";
     stringview::Bool=false,
     largelists::Bool=false,
+    pool=nothing,
 )
     arrowtypes = _ArrowTypesContext(; warn=false)
     return _WriterContext(
@@ -2438,6 +2449,7 @@ function _WriterContext(
         String(column),
         stringview,
         largelists,
+        pool,
     )
 end
 
@@ -5180,7 +5192,7 @@ end
 
 # The writer's utf8/binary builders, after checking the values against the
 # retained field: strings for utf8, byte vectors for binary.
-function _retainedvarbytes(f::AC.Field, v::AbstractVector)
+function _retainedvarbytes(f::AC.Field, v::AbstractVector, pool=nothing)
     t = f.type::Union{AC.Utf8Type,AC.BinaryType}
     utf8 = t isa AC.Utf8Type
     Offset = t.large ? Int64 : Int32
@@ -5194,6 +5206,7 @@ function _retainedvarbytes(f::AC.Field, v::AbstractVector)
                 t,
                 Offset,
                 Missing <: eltype(v),
+                pool,
             )
         else
             V = utf8 ? AbstractString : AbstractVector{UInt8}
@@ -6209,10 +6222,10 @@ function _constructretainedpart(
     f::AC.Field,
     t::Union{AC.Utf8Type,AC.BinaryType},
     v::AbstractVector,
-    ::_WriterContext,
+    context::_WriterContext,
 )
     _checkretainedidentity(f, t, v)
-    return _retainedvarbytes(f, v)
+    return _retainedvarbytes(f, v, context.pool)
 end
 
 function _constructretainedpart(
@@ -6590,8 +6603,10 @@ function _dictionarypool(vals, retainedpool; writetype=nothing)
         # New categories may be other types than the retained ones (writer
         # values after a public pool read back, DataStrings after Strings):
         # widen the value type instead of converting.
-        pool =
-            collect(_widenedtype(eltype(retainedpool), _dictvaluetype(vals)), retainedpool)
+        pool = collect(
+            _widenedtype(eltype(retainedpool), _dictvaluetype(vals)),
+            retainedpool,
+        )
     end
     # Dedup with the non-overloadable structural key `_compactdictionarypool`
     # also uses: public-domain values may overload `hash`/`isequal`, so only the
@@ -7079,6 +7094,7 @@ function _constructcolumnparts(
     stringview::Bool=false,
     largelists::Bool=false,
     growable::Bool=false,
+    pool=nothing,
 )
     isempty(parts) && throw(ArgumentError("column $name has no partitions"))
     length(poolhints) == length(parts) || throw(
@@ -7101,11 +7117,13 @@ function _constructcolumnparts(
     fieldname = String(name)
     nparts = length(parts)
     data = Vector{AC.ArrayData}(undef, nparts)
-    context = _WriterContext(fieldname; stringview, largelists)
     dictintent =
         (retained !== nothing && retained.type isa AC.DictionaryType) ||
         any(part isa DictEncode for part in parts) ||
         (refpools && retained === nothing && any(_hasrefpool, parts))
+    # A dictionary's pool outlives its batch, so it never takes reused buffers.
+    context =
+        _WriterContext(fieldname; stringview, largelists, pool=dictintent ? nothing : pool)
     # A ref-pool column written as its values still unwraps them.
     if !dictintent && any(_hasrefpool, parts)
         parts = AbstractVector[_hasrefpool(p) ? first(_refpoolvalues(p)) : p for p in parts]

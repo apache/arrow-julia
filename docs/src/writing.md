@@ -108,9 +108,11 @@ output is the same bytes for every `ntasks`. Start Julia with threads
 The writer holds the partition being written, the record batch being built
 (with compression on several tasks, also the batch before it) and its encoded
 buffers, and in the file format each dictionary that grows until it is
-written at the end. Columns that are already Arrow layouts
-(fixed-width values and validity from an `Arrow.Table`, say) are written from
-their own memory, without a copy.
+written at the end. The buffers a batch's columns rebuild (string offsets and
+bytes, list offsets, validity bitmaps) are reused by the next batch once it is
+written, so a write holds about one batch of them. Columns that are already
+Arrow layouts (fixed-width values and validity from an `Arrow.Table`, say) are
+written from their own memory, without a copy.
 
 ## Strings and bytes
 
