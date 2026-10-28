@@ -31,6 +31,7 @@ using Logging
 using UUIDs
 import DataDecimals, Durations
 using DataStrings: StringVector, StringPayload, BytesVector, DataBytes
+include(joinpath(@__DIR__, "support", "mapped.jl"))
 
 struct _InterruptingPeriod <: Dates.Period end
 struct _OutOfMemoryPeriod <: Dates.Period end
@@ -293,8 +294,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             Arrow.write(path, Tables.partitioner([(x=Int64[1],), (x=Int64[2],)]); file=true)
             releasemapped(path)
         finally
-            GC.gc(true)  # Windows deletes the file only once nothing maps it.
-            ispath(path) && rm(path)
+            rmmapped(path)
         end
         # Whole-table read concatenates.
         @test Arrow.Table(bytes).x == [1, 2, 3, 4]

@@ -60,7 +60,7 @@ owned, mutable columns.
 
 `mmap=true` memory-maps a file-format path; a mapping is unmapped once the
 table and all of its columns are garbage collected. It is the default except
-on Windows, which cannot replace or delete a mapped file: there a path is
+on Windows, which cannot delete a file while it is mapped: there a path is
 read into memory unless `mmap=true` is passed. `mmap` has no effect on the
 other source kinds. A byte vector is read in place: do not modify or resize
 it while the table's columns are in use.
@@ -1624,9 +1624,9 @@ function Table(
     return _tablefrom(opened, scan, budget; stringtype=stringtype, ntasks=ntasks)
 end
 
-# Windows cannot delete or replace a file while it is mapped, and the
-# facade unmaps only when the table and its columns are garbage collected,
-# so paths there read into memory unless `mmap=true` is requested.
+# Windows cannot delete a file while it is mapped, and the facade unmaps
+# only when the table and its columns are garbage collected, so paths there
+# read into memory unless `mmap=true` is requested.
 const _MMAP_DEFAULT = !Sys.iswindows()
 
 """

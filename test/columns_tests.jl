@@ -18,6 +18,7 @@
 
 using Test, Arrow, Tables, DataAPI, Dates, DataDecimals, Durations, PooledArrays
 using DataStrings: DataString, DataBytes, StringVector, BytesVector
+isdefined(Main, :rmmapped) || include(joinpath(@__DIR__, "support", "mapped.jl"))
 
 struct ColumnsBytesSource <: Arrow.AbstractArrowSource
     data::Vector{UInt8}
@@ -53,13 +54,12 @@ function mappedviews(path, n)
     @test_throws InvalidStateException copy(t)
     GC.gc(true)
     @test y[end] == n
-    # Replacing a file that live columns map keeps the old contents.
-    if !Sys.iswindows()
-        Arrow.write(path, Arrow.Table(path; mmap=true))
-        Arrow.write(path, (x=collect((-n):-1),); file=true)
-        GC.gc(true)
-        @test x[1] == 1 && y[1] == 1 && Arrow.Table(path).x[1] == -n
-    end
+    # Replacing a file that live columns map keeps the old contents (Windows
+    # too: the writer renames a new file over the mapped one).
+    Arrow.write(path, Arrow.Table(path; mmap=true))
+    Arrow.write(path, (x=collect((-n):-1),); file=true)
+    GC.gc(true)
+    @test x[1] == 1 && y[1] == 1 && Arrow.Table(path).x[1] == -n
     return nothing
 end
 
@@ -313,8 +313,7 @@ end
             Arrow.write(path, (x=collect(1:n), s=string.(1:n)); file=true)
             mappedviews(path, n)
         finally
-            GC.gc(true)  # Windows deletes the file only once nothing maps it.
-            rm(path; force=true)
+            rmmapped(path)
         end
         @test Arrow._MMAP_DEFAULT == !Sys.iswindows()
         # Tasks read columns whose table is gone while collections run.
@@ -363,8 +362,7 @@ end
                     end
                 end
             finally
-                GC.gc(true)
-                rm(path; force=true)
+                rmmapped(path)
             end
         end
     end
@@ -624,8 +622,8 @@ end
         GC.gc(true)
         GC.gc(true)
         @test row == [7, 8, 9, 10] && st[n] == tbl.st[n] && entry == [9 => 9.0]
-        # Windows cannot delete a file while it is mapped.
-        Sys.iswindows() || rm(path)
+        row = st = entry = nothing
+        rmmapped(path)
     end
 
     @testset "an uncompressed open allocates independently of its size" begin

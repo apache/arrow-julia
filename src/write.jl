@@ -169,7 +169,13 @@ function _commitpath(sink::_PathSink)
     err = ccall(:jl_fs_rename, Int32, (Cstring, Cstring), sink.tmp, sink.path)
     err < 0 || return nothing
     rm(sink.tmp; force=true)
-    throw(Base.IOError("Arrow could not replace $(repr(sink.path)); it is unchanged", err))
+    hint = Sys.iswindows() ? " (close programs that hold it open, then retry)" : ""
+    throw(
+        Base.IOError(
+            "Arrow could not replace $(repr(sink.path)); it is unchanged$hint",
+            err,
+        ),
+    )
 end
 
 # Error cleanup: the destination keeps its old bytes (or stays absent).

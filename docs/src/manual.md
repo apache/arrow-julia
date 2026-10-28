@@ -99,9 +99,11 @@ run directly on the buffers.
 
 A path to a file-format source is memory-mapped by default (`mmap=true`), so
 opening a large file does not copy it into RAM; pass `mmap=false` to read it
-into memory instead (a stream-format path is always read into memory). A
-mapping is unmapped once the table and all of its columns are garbage
-collected. Windows cannot replace or delete a mapped file, so there the
+into memory instead (`Arrow.Table` reads a stream-format path into memory;
+`Arrow.Stream` maps it). A mapping is unmapped once the table and all of its
+columns are garbage collected. [`Arrow.write`](@ref) to a mapped path writes a
+new file and renames it over the old one, so live columns keep reading the old
+contents. Windows cannot delete a file while it is mapped, so there the
 default is `mmap=false`. A byte vector is read in place: do not modify or
 resize it while the table's columns are in use.
 
