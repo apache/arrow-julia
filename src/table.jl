@@ -357,6 +357,8 @@ function Tables.schema(t::Table)
 end
 Base.propertynames(t::Table) = getfield(t, :names)
 Base.getproperty(t::Table, nm::Symbol) = Tables.getcolumn(t, nm)
+Base.getindex(t::Table, name::AbstractString) = Tables.getcolumn(t, Symbol(name))
+Base.names(t::Table) = String[String(name) for name in getfield(t, :names)]
 Tables.rowcount(t::Table) = getfield(t, :nrows)
 
 DataAPI.metadatasupport(::Type{Table}) = (read=true, write=false)
@@ -1624,11 +1626,15 @@ end
 # Arrow 2.x also accepted a vector of sources and positional byte windows;
 # name the supported source kinds instead of failing with a MethodError.
 function _opensource(source; kwargs...)
+    hint =
+        Tables.istable(source) ?
+        "; to read a table in memory as an Arrow.Table, write it first, as " *
+        "Arrow.Table(Arrow.tobuffer(table))" :
+        "; read several sources separately and combine their tables"
     throw(
         ArgumentError(
             "Arrow reads one IPC source: a file path, an IO, a Vector{UInt8}, or " *
-            "an Arrow.AbstractArrowSource, not $(typeof(source)); read several " *
-            "sources separately and combine their tables",
+            "an Arrow.AbstractArrowSource, not $(typeof(source))$hint",
         ),
     )
 end
@@ -1649,7 +1655,17 @@ _sourcebudget(source, limits::Limits) =
         maxnewsymbols=limits.max_new_symbols,
     )
 
-# The scan the read keywords ask for, or `nothing` for a whole read.
+# The select/drop/filter/limit keywords: a `Tables.Scan` once the column
+# names are known (`_requestedscan`).
+struct _ScanRequest
+    select::Any
+    drop::Any
+    filter::Any
+    limit::Any
+end
+
+# The scan the read keywords ask for: `nothing` for a whole read, the `scan`,
+# or a `_ScanRequest`.
 function _scanrequest(select, drop, filter, limit, scan)
     sugar =
         select !== nothing || drop !== nothing || filter !== nothing || limit !== nothing
@@ -1665,8 +1681,53 @@ function _scanrequest(select, drop, filter, limit, scan)
     sugar || return nothing
     (select === nothing || drop === nothing) ||
         throw(ArgumentError("pass `select` or `drop`, not both"))
-    columns = drop === nothing ? something(select, Tables.All()) : Tables.Not(drop)
-    return Tables.Scan(; select=columns, filter=filter, limit=limit)
+    # The filter and limit are checked now, before the source is read.
+    Tables.Scan(; filter=filter, limit=limit)
+    return _ScanRequest(select, drop, filter, limit)
+end
+
+_requestedscan(scan::Tables.Scan, names) = scan
+function _requestedscan(r::_ScanRequest, names)
+    columns =
+        r.drop === nothing ? _selection(:select, something(r.select, Tables.All()), names) :
+        Tables.Not(_selection(:drop, r.drop, names))
+    return Tables.Scan(; select=columns, filter=r.filter, limit=r.limit)
+end
+_ScanPlan(r::_ScanRequest, fields, budget=nothing) =
+    _ScanPlan(_requestedscan(r, _fieldnamesymbols(fields, budget)), fields, budget)
+
+# The columns `select` or `drop` (`keyword`) names among `names`: a function
+# `(i, name) -> Bool` picks them by index and name, as in CSV.jl; names,
+# indices, and patterns must each match a column.
+function _selection(keyword::Symbol, selection, names)
+    selection isa Function &&
+        return Int[i for (i, name) in enumerate(names) if selection(i, name)]
+    items =
+        selection isa Union{AbstractVector,Tuple} ? selection :
+        selection isa Union{Tables.All,Tables.Not} ? () : (selection,)
+    for item in items
+        ref = item isa Pair ? first(item) : item
+        found =
+            ref isa Union{Symbol,AbstractString} ? Symbol(ref) in names :
+            ref isa Integer ? 1 <= ref <= length(names) :
+            ref isa Regex ? any(name -> occursin(ref, String(name)), names) :
+            ref isa Union{Tables.All,Tables.Not} ? true :
+            throw(
+                ArgumentError(
+                    "$keyword takes column names, indices, a Regex, a function " *
+                    "(i, name) -> Bool, or a vector of them, not $(repr(ref))" *
+                    (keyword === :select ? "; drop gives the columns to leave out" : ""),
+                ),
+            )
+        found || throw(
+            ArgumentError(
+                "$keyword names no column $(repr(ref)); the columns are " *
+                join(first(names, 20), ", ") *
+                (length(names) > 20 ? ", … ($(length(names)) in all)" : ""),
+            ),
+        )
+    end
+    return selection
 end
 
 function Table(
@@ -1864,7 +1925,7 @@ _ownedcolumn(c) = c
 # where the format can prove it and evaluated over the rest.
 function _tablefrom(
     src::Union{IPCStream,ArrowFile},
-    scan::Union{Nothing,Tables.Scan},
+    scan::Union{Nothing,Tables.Scan,_ScanRequest},
     budget::Union{Nothing,AllocationBudget}=nothing;
     stringtype::Type=DataStrings.DataString,
     ntasks::Int=1,
@@ -2278,6 +2339,7 @@ function Stream(
     # `only` cannot throw; a second region would need to share this cell,
     # not add one — the Stream has a single close authority.
     # A scan that does not fit the schema fails here, not at the first batch.
+    scan === nothing || (scan = _requestedscan(scan, _fieldnamesymbols(_batchfields(src))))
     scan === nothing || _ScanPlan(scan, _batchfields(src), _readbudget(readlimits, 0))
     return Stream(
         src,

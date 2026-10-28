@@ -146,6 +146,38 @@ end
     @test Arrow.Table(bytes; filter=startswith(Arrow.col(:s), "y")).s == ["y"]
 end
 
+@testset "select and drop by function; errors in their terms; table names" begin
+    bytes = take!(Arrow.tobuffer((a=[1, 2], b=["x", "y"], c=[1.5, 2.5])))
+    names(t) = collect(Tables.columnnames(t))
+    # A function (i, name) -> Bool picks columns, as in CSV.jl.
+    @test names(Arrow.Table(bytes; select=(i, name) -> i > 1)) == [:b, :c]
+    @test names(Arrow.Table(bytes; drop=(i, name) -> name === :b)) == [:a, :c]
+    @test names(first(Arrow.Stream(bytes; select=(i, name) -> name !== :a))) == [:b, :c]
+    msg(f) =
+        try
+            f()
+            ""
+        catch e
+            e isa ArgumentError ? e.msg : "not an ArgumentError: $(typeof(e))"
+        end
+    @test msg(() -> Arrow.Table(bytes; select=[:nope])) ==
+          "select names no column :nope; the columns are a, b, c"
+    @test msg(() -> Arrow.Table(bytes; drop=:nope)) ==
+          "drop names no column :nope; the columns are a, b, c"
+    @test msg(() -> Arrow.Stream(bytes; select=[4])) ==
+          "select names no column 4; the columns are a, b, c"
+    # An unsupported selector (a Set, or DataFrames' Not) points at drop.
+    m = msg(() -> Arrow.Table(bytes; select=Set([:a])))
+    @test occursin("select takes column names, indices, a Regex, a function", m)
+    @test occursin("drop gives the columns to leave out", m)
+    # Container conveniences.
+    t = Arrow.Table(bytes)
+    @test Base.names(t) == ["a", "b", "c"]
+    @test t["b"] == ["x", "y"]
+    # A table in memory is not a source; the error says how to get one.
+    @test occursin("Arrow.Table(Arrow.tobuffer(table))", msg(() -> Arrow.Table((a=[1],))))
+end
+
 @testset "typed scan overrides for composite rows" begin
     NT = NamedTuple{(:a, :b),Tuple{Float64,String}}
     tbl = (; x=[1, 2], c=[(a=1.0, b="x"), (a=2.0, b="y")])
