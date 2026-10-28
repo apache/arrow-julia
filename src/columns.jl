@@ -1174,14 +1174,34 @@ function _checktimes(f::AC.Field, t::AC.TimeType, d::AC.ArrayData, budget)
     col = _primitive(Union{Missing,S}, S, Nothing, d, budget)
     for x in col
         (x === missing || 0 <= x < perday) && continue
+        P = nameof(_unitperiod(t.unit))
         throw(
             ValidationError(
                 "column $(repr(f.name)): time-of-day value $x is outside [0, $perday) " *
-                "in its unit",
+                "in its unit; read the column as durations since midnight with " *
+                "`scan=Tables.Scan(select=($(repr(Symbol(f.name))) => Dates.$P,))`",
             ),
         )
     end
     return nothing
+end
+
+# The period of one tick of a time-of-day unit.
+_unitperiod(unit) =
+    unit == AC.SECOND ? Dates.Second :
+    unit == AC.MILLISECOND ? Dates.Millisecond :
+    unit == AC.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
+
+# Time-of-day storage `raw` read as `P` periods since midnight: the scan
+# override that reads times a `Dates.Time` cannot hold.
+function _timeperiods(t::AC.TimeType, raw, ::Type{P}) where {P}
+    unit = _unitperiod(t.unit)
+    out = Vector{Missing<:eltype(raw) ? Union{Missing,P} : P}(undef, length(raw))
+    for i in eachindex(out, raw)
+        x = raw[i]
+        out[i] = x === missing ? missing : convert(P, unit(x))
+    end
+    return out
 end
 
 # One batch of a view column. Nested layouts skip `_batchview`, whose body

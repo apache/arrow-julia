@@ -2518,6 +2518,12 @@ function _finishfacadescan(
         )
         for (i, bc) in enumerate(b.columns)
             f = sourcefields[bc.index]
+            if !public && _periodoverride(bc, f)
+                columns[i] = _timeperiods(f.type, columns[i], Base.nonmissingtype(bc.type))
+                # A real conversion: the output does not keep the time field.
+                push!(precols, Dates.Time[])
+                continue
+            end
             # Public type overrides run HERE, after facade conversion —
             # they are public-domain requests, never storage casts, and
             # they preserve missing exactly as Tables.scan does.
@@ -2601,15 +2607,16 @@ function _applyfacadescan(
     routes = _ArrowTypesRoutePlan(actual)
     views = _ViewContext(stringtype, actual)
     snapshots = _dictsnapshots(f.fields, b, actual)
+    rawtimes = _rawtimes(plan.public, f.fields)
     materialize =
         (field, data, _) -> (
             _snapshotdict!(snapshots, field, data);
-            _scanbatchcolumn(field, data, routes, views)
+            _scanbatchcolumn(field, data, routes, views, _checkstimes(rawtimes, field))
         )
     # A scan that only selects keeps every row: its columns are the full
     # read's columns (views chain, strings are one column), with no per-batch
     # slices or joins.
-    selectonly = _selectsonly(b) && !isempty(plan.names)
+    selectonly = _selectsonly(b) && !isempty(plan.names) && isempty(rawtimes)
     got =
         selectonly ? _selectscan(f, b, actual, snapshots, views, ntasks) :
         _runboundscan(f, b, plan.names, actual, materialize, ntasks)
@@ -2672,10 +2679,11 @@ function _applyfacadescan(
     views = _ViewContext(stringtype, budget)
     b = _facadestorage(plan)
     snapshots = _dictsnapshots(ft.fields, b, budget)
+    rawtimes = _rawtimes(plan.public, ft.fields)
     materialize =
         (field, data, _) -> (
             _snapshotdict!(snapshots, field, data);
-            _scanbatchcolumn(field, data, routes, views)
+            _scanbatchcolumn(field, data, routes, views, _checkstimes(rawtimes, field))
         )
     got = _runboundscan(sf, b, plan.names, ft, budget, materialize)
     return _finishfacadescan(
@@ -2695,13 +2703,15 @@ function _facadescanrawcolumn(
     budget,
     routes::_ArrowTypesRoutePlan,
     views::_ViewContext,
+    checktimes=true,
 )
     f = s.corefields[i]
     _scanview(f) &&
         return _viewcolumn(f, AC.ArrayData[b.columns[i] for b in s.batches], views)
     _chargevector!(budget, AbstractVector, length(s.batches), "stream scan column parts")
-    parts =
-        AbstractVector[_scanbatchcolumn(f, b.columns[i], routes, views) for b in s.batches]
+    parts = AbstractVector[
+        _scanbatchcolumn(f, b.columns[i], routes, views, checktimes) for b in s.batches
+    ]
     return _joinscanparts(f, parts, budget)
 end
 
@@ -2716,16 +2726,33 @@ function _storageconverted(f::AC.Field)
     return _istemporalconv(t)
 end
 
-_scanbatchcolumn(f::AC.Field, d::AC.ArrayData, routes, views::_ViewContext) =
+_scanbatchcolumn(
+    f::AC.Field,
+    d::AC.ArrayData,
+    routes,
+    views::_ViewContext,
+    checktimes=true,
+) =
     _scanview(f) ? _viewcolumn(f, AC.ArrayData[d], views) :
-    _viewable(f) && _istemporalconv(f.type) ? _storageview(f, d, views) :
+    _viewable(f) && _istemporalconv(f.type) ? _storageview(f, d, views, checktimes) :
     _batchcolumn(f, d, routes)
+
+# A select override of a time-of-day column with a `Dates.Period` type reads
+# its stored ticks as periods (`_timeperiods`), so its values are not checked
+# against a day's length.
+_periodoverride(bc::Tables.BoundColumn, f::AC.Field) =
+    bc.type !== nothing &&
+    Base.nonmissingtype(bc.type) <: Dates.Period &&
+    f.type isa AC.TimeType
+_rawtimes(b::Tables.BoundScan, fields) =
+    AC.Field[fields[bc.index] for bc in b.columns if _periodoverride(bc, fields[bc.index])]
+_checkstimes(rawtimes, f::AC.Field) = !any(x -> x === f, rawtimes)
 
 # A temporal column stays in storage until the filter has run: a view of its
 # stored integers, the claim `_storagebatchcolumn` would materialize.
-function _storageview(f::AC.Field, d::AC.ArrayData, ctx::_ViewContext)
+function _storageview(f::AC.Field, d::AC.ArrayData, ctx::_ViewContext, checktimes=true)
     t = f.type
-    t isa AC.TimeType && _checktimes(f, t, d, ctx.budget)
+    checktimes && t isa AC.TimeType && _checktimes(f, t, d, ctx.budget)
     S = _rawdeclaredbasetype(t)
     _chargeobject!(ctx.budget, _VIEW_OBJECT_BYTES, "column view")
     nullable = Missing <: _declaredeltype(f, false) || _viewnulls(f, d)
@@ -2753,7 +2780,8 @@ function _applyfacadescan(
     views = _ViewContext(stringtype, budget)
     nrows = sum(Int(b.nrows) for b in s.batches; init=0)
     poolof = (bc, field, ctx) -> _retaineddictpool(field, s.batches, bc.index, ctx)
-    if _selectsonly(b) && !isempty(plan.names)
+    rawtimes = _rawtimes(plan.public, fields)
+    if _selectsonly(b) && !isempty(plan.names) && isempty(rawtimes)
         # Every row is kept: the selected columns are the full read's.
         arrowtypes = _ArrowTypesContext(budget=budget)
         idxs = Int[c.index for c in b.columns]
@@ -2780,8 +2808,15 @@ function _applyfacadescan(
     needed[b.filtercols] .= true
     b.validate && fill!(needed, true)
     rawcolumns = AbstractVector[
-        needed[i] ? _facadescanrawcolumn(s, i, budget, routes, views) : Missing[] for
-        i = 1:length(fields)
+        needed[i] ?
+        _facadescanrawcolumn(
+            s,
+            i,
+            budget,
+            routes,
+            views,
+            _checkstimes(rawtimes, fields[i]),
+        ) : Missing[] for i = 1:length(fields)
     ]
     raw = _ScanColumns(plan.names, rawcolumns, nrows)
     got = _executeplan(raw, b, plan.names, budget)

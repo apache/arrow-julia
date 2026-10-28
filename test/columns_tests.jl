@@ -237,6 +237,35 @@ end
             e
         end
         @test err isa Arrow.ValidationError && occursin("\"late\"", err.msg)
+        # The error names a scan that reads the stored values as periods.
+        @test occursin("Tables.Scan(select=(:late => Dates.Second,))", err.msg)
+        ids = Arrow.AC.Field("id", Arrow.AC.IntType(64, true); nullable=false)
+        idd = Arrow.AC.ArrayData(
+            ids.type,
+            2,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int64[1, 2])];
+            nullcount=0,
+        )
+        d2 = Arrow.AC.ArrayData(
+            f.type,
+            2,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int32[86_400, 5])];
+            nullcount=0,
+        )
+        sch2 = Arrow.AC.Schema([f, ids])
+        stream = Arrow.writestream(sch2, [Arrow.AC.RecordBatch(sch2, [d2, idd])])
+        file = Arrow.writefile(sch2, [Arrow.AC.RecordBatch(sch2, [d2, idd])])
+        for src in (stream, file, ColumnsBytesSource(file))
+            t = Arrow.Table(src; scan=Tables.Scan(select=(:late => Second,)))
+            @test t.late == [Second(86_400), Second(5)]
+            t = Arrow.Table(src; scan=Tables.Scan(select=(:late => Millisecond, :id)))
+            @test t.late == [Millisecond(86_400_000), Millisecond(5000)] && t.id == [1, 2]
+            t = Arrow.Table(
+                src;
+                scan=Tables.Scan(select=(:late => Second,), filter=Tables.col(:id) > 1),
+            )
+            @test t.late == [Second(5)]
+        end
     end
 
     @testset "views keep their memory alive" begin
