@@ -606,7 +606,7 @@ end
         @test t.st[end] == tbl.st[end] && t.ls[2] == ["2", "x"] && t.m[3] == ["3" => 3]
     end
 
-    @testset "fixed-width nested children view the data read" begin
+    @testset "fixed-width nested children and list offsets view the data read" begin
         n = 200_000
         tbl = (
             l=[[i, i + 1, i + 2, i + 3] for i = 1:n],
@@ -616,11 +616,14 @@ end
         path = tempname()
         Arrow.write(path, tbl)
         Arrow.Table(path; mmap=true)
-        # Copies of the 4n list values, the struct fields, or the map entries
-        # would allocate 8 bytes or more each; list offsets cost 8 bytes a row.
-        @test fewestbytes(() -> Arrow.Table(path; mmap=true)) < 2 * 8n + 1_000_000
+        # Copies of the 4n list values, the struct fields, the map entries, or
+        # the list and map offsets would allocate 4 bytes or more each.
+        @test fewestbytes(() -> Arrow.Table(path; mmap=true)) < 2n
         t = Arrow.Table(path; mmap=true)
+        @test t.l.offsets isa Vector{Int32} && t.m.offsets isa Vector{Int32}
         @test t.l == tbl.l && t.st == tbl.st && t.m[5] == [5 => 5.0]
+        # A rewrite reads the stored offsets.
+        @test Arrow.Table(arrowbytes(t)).l == tbl.l
         # Rows keep the mapping they view alive.
         row, st, entry = t.l[7], t.st, t.m[9]
         Arrow.release!(t)

@@ -408,16 +408,22 @@ function _listoffsets(
     pool=nothing,
 ) where {O}
     n = length(v)
-    raw = v.offsets
-    lo = raw[1]
     offsets = _takevector(pool, O, n + 1)
-    @inbounds for i = 1:(n + 1)
+    # A read column's offsets may view its batch (Int32 or Int64): kept alive
+    # through `v`.
+    GC.@preserve v _rebaseoffsets!(offsets, v.offsets, name)
+    validity, nc = _storedvalidity(v.validity, v.bitoffset, n, pool)
+    return offsets, validity, nc
+end
+
+function _rebaseoffsets!(offsets::AbstractVector{O}, raw, name::String) where {O}
+    lo = raw[1]
+    @inbounds for i in eachindex(offsets)
         x = raw[i] - lo
         x <= typemax(O) || throw(_OffsetOverflow(name, 0, i - 1))
         offsets[i] = x
     end
-    validity, nc = _storedvalidity(v.validity, v.bitoffset, n, pool)
-    return offsets, validity, nc
+    return offsets
 end
 
 """
@@ -461,7 +467,7 @@ end
 function _childslice(v::ListVector{T}, lo::Int, hi::Int) where {T}
     lo == 0 && hi == length(v) && return v
     return ListVector{T}(
-        v.offsets[(lo + 1):(hi + 1)],
+        GC.@preserve(v, v.offsets[(lo + 1):(hi + 1)]),
         v.values,
         v.validity,
         v.bitoffset + lo,
@@ -470,7 +476,7 @@ function _childslice(v::ListVector{T}, lo::Int, hi::Int) where {T}
 end
 function _childslice(v::MapVector{T}, lo::Int, hi::Int) where {T}
     lo == 0 && hi == length(v) && return v
-    offsets = v.offsets[(lo + 1):(hi + 1)]
+    offsets = GC.@preserve v v.offsets[(lo + 1):(hi + 1)]
     return MapVector{T}(offsets, v.keys, v.values, v.validity, v.bitoffset + lo, v.owner)
 end
 
@@ -481,7 +487,7 @@ _changedrows(name) = ArgumentError("column $name changed while it was being writ
 function _listvalues(name::String, ::Type{E}, v::AbstractVector, offsets) where {E}
     # A list column read from Arrow already holds its rows' values in order.
     if v isa ListVector && eltype(v.values) === E
-        lo, hi = v.offsets[1], v.offsets[end]
+        lo, hi = GC.@preserve v Int(v.offsets[1]), Int(v.offsets[end])
         hi - lo == offsets[end] || throw(_changedrows(name))
         return _childslice(v.values, lo, hi)
     end
@@ -714,7 +720,7 @@ end
 # A map column read from Arrow writes its offsets, keys, and values as stored.
 function _mappart(name::String, v::MapVector, context)
     offsets, validity, nc = _listoffsets(name, v, Int32, _pool(context))
-    lo, hi = v.offsets[1], v.offsets[end]
+    lo, hi = GC.@preserve v Int(v.offsets[1]), Int(v.offsets[end])
     kf, kd = _constructpart("key", _childslice(v.keys, lo, hi); context)
     vf, vd = _constructpart("value", _childslice(v.values, lo, hi); context)
     kf.nullable && throw(

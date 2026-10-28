@@ -1455,6 +1455,10 @@ struct MapValue{K,V} <: AbstractVector{Pair{K,V}}
     len::Int
 end
 
+# List and map offsets: the batch's `Int32` (`Int64` for the large layouts)
+# offsets, or ones the read computed.
+const _Offsets = Union{Vector{Int32},Vector{Int64}}
+
 """
     Arrow.ListVector{T} <: Arrow.ArrowVector{T}
 
@@ -1463,7 +1467,7 @@ A list column: row `i` is the [`Arrow.ListValue`](@ref) of child values
 null.
 """
 struct ListVector{T} <: ArrowVector{T}
-    offsets::Vector{Int}
+    offsets::_Offsets   # the batch's own offsets where it can (see `_listoffsets`)
     values::Any   # child values, a `_columntype(eltype(row))`
     validity::Vector{UInt8}
     bitoffset::Int
@@ -1478,7 +1482,7 @@ A map column: row `i` is the [`Arrow.MapValue`](@ref) of entries
 null.
 """
 struct MapVector{T} <: ArrowVector{T}
-    offsets::Vector{Int}
+    offsets::_Offsets
     keys::Any
     values::Any
     validity::Vector{UInt8}
@@ -1580,7 +1584,7 @@ Base.@propagate_inbounds function Base.getindex(v::ListVector{T}, i::Int) where 
         null = GC.@preserve v _isnullslot(v.validity, v.bitoffset, i)
         null && return missing
     end
-    lo, hi = @inbounds v.offsets[i], v.offsets[i + 1]
+    lo, hi = GC.@preserve v @inbounds Int(v.offsets[i]), Int(v.offsets[i + 1])
     return Base.nonmissingtype(T)(v.values, lo, hi - lo)
 end
 
@@ -1590,7 +1594,7 @@ Base.@propagate_inbounds function Base.getindex(v::MapVector{T}, i::Int) where {
         null = GC.@preserve v _isnullslot(v.validity, v.bitoffset, i)
         null && return missing
     end
-    lo, hi = @inbounds v.offsets[i], v.offsets[i + 1]
+    lo, hi = GC.@preserve v @inbounds Int(v.offsets[i]), Int(v.offsets[i + 1])
     return Base.nonmissingtype(T)(v.keys, v.values, lo, hi - lo)
 end
 
@@ -1775,22 +1779,22 @@ function _storeas(::Type{DataStrings.BytesVector{E}}, col, budget) where {E}
     return DataStrings.BytesVector{E}(payloads, buffers, Val(:trusted))
 end
 
-# The `n + 1` offsets of list or map batch `d` as owned `Int`s, plus `base`
-# (a map's entries struct offset).
+# The `n + 1` offsets of list or map batch `d`, plus `base` (a map's entries
+# struct offset): a view of the batch's buffer when `base` is 0 (copied only if
+# misaligned), else shifted copies.
 function _listoffsets(d::AC.ArrayData, base::Int, budget)
     n = Int64(d.len)
-    _chargeexact!(budget, Int, n + 1, "list offsets")
     n == 0 && return Int[base]
     buf = AC.rolebuffer(d, AC.OFFSETS)
-    out = Vector{Int}(undef, n + 1)
-    GC.@preserve d begin
+    raw =
         AC.layoutspec_of(d.type).offsetwidth == 8 ?
-        _addbase!(out, _wrapbuffer(Int64, buf, d.offset, n + 1, budget), base) :
-        _addbase!(out, _wrapbuffer(Int32, buf, d.offset, n + 1, budget), base)
-    end
-    return out
+        _wrapbuffer(Int64, buf, d.offset, n + 1, budget) :
+        _wrapbuffer(Int32, buf, d.offset, n + 1, budget)
+    # The view stays valid while the column (whose owner is `d`) is reachable.
+    base == 0 && return raw
+    _chargeexact!(budget, Int, n + 1, "list offsets")
+    return GC.@preserve d raw .+ base
 end
-_addbase!(out, offsets, base::Int) = (out.=offsets .+ base; out)
 
 # Not specialized on the row type, so it compiles once for every nested
 # column; the per-row loops it calls are function barriers specialized on
