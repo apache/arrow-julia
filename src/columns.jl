@@ -116,6 +116,9 @@ struct _YearMonth end
 struct _DayTime end
 @inline _fromstorage(::Type{_DayTime}, x::NTuple{2,Int32}) =
     Durations.Duration(0, x[1], Int64(x[2]) * 1_000_000)
+"Stored bytes as a byte vector (the raw read of a decimal no `Decimal` type holds)."
+struct _StoredBytes end
+@inline _fromstorage(::Type{_StoredBytes}, x::NTuple{N,UInt8}) where {N} = collect(x)
 
 # The element type each conversion produces.
 _storagetarget(::Type{_DaysToDate}) = Dates.Date
@@ -123,6 +126,7 @@ _storagetarget(::Type{_MillisToDateTime}) = Dates.DateTime
 _storagetarget(::Type{<:_TimeOfDay}) = Dates.Time
 _storagetarget(::Type{_YearMonth}) = Durations.Duration
 _storagetarget(::Type{_DayTime}) = Durations.Duration
+_storagetarget(::Type{_StoredBytes}) = Vector{UInt8}
 
 # --- fixed width ------------------------------------------------------------------
 
@@ -1159,7 +1163,7 @@ function _viewablelayout(f::AC.Field, depth::Int=0)
         AC.ViewType,
         AC.NullType,
     } && return true
-    t isa AC.DecimalType && return _shareddecimal(t)
+    t isa AC.DecimalType && return true
     t isa AC.DictionaryType && return _viewablelayout(AC.dictvaluefield(f, t), depth)
     t isa AC.RunEndEncodedType &&
         return length(f.children) == 2 && _viewablelayout(f.children[2], depth)
@@ -1196,7 +1200,12 @@ _widebinary(t::AC.ArrowType) = t isa AC.FixedSizeBinaryType && t.nbytes > _MAX_T
 function _fixedstorage(t::AC.ArrowType)
     t isa AC.IntType && return AC.juliatype(t), Nothing
     t isa AC.FloatType && return AC.juliatype(t), Nothing
-    t isa AC.DecimalType && return _decimalhost(t), Nothing
+    if t isa AC.DecimalType
+        _shareddecimal(t) && return _decimalhost(t), Nothing
+        # Other decimals read as stored: integers, or bytes at 128 and 256 bits.
+        t.bits <= 64 && return (t.bits == 32 ? Int32 : Int64), Nothing
+        return NTuple{t.bits ÷ 8,UInt8}, _StoredBytes
+    end
     t isa AC.TimestampType && return _facadebasetype(t), Nothing
     t isa AC.DurationType && return _facadebasetype(t), Nothing
     t isa AC.FixedSizeBinaryType && return NTuple{t.nbytes,UInt8}, Nothing

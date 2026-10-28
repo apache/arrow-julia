@@ -101,6 +101,39 @@ end
                 @test (@allocations Arrow.Table(bytes)) < 10_000
             end
         end
+        # A decimal no `Decimal` type holds (a negative scale, or a scale above
+        # the precision) is a view of its storage: integers, or the stored bytes
+        # at 128 and 256 bits. Nested in a list, it reads as typed rows.
+        AC = Arrow.AC
+        bytesof(x) = collect(reinterpret(UInt8, [x]))
+        lt = AC.ListType(false)
+        for (t, raw) in (
+            (AC.DecimalType(5, -1, 32), Int32[99_999, -7]),
+            (AC.DecimalType(12, -3, 64), Int64[-999_999_999_999, 0]),
+            (AC.DecimalType(10, -2, 128), Int128[123, -5]),
+            (AC.DecimalType(2, 4, 256), DataDecimals.Int256[1, -1]),
+        )
+            want = eltype(raw) <: Union{Int32,Int64} ? raw : bytesof.(raw)
+            df = AC.Field("d", t; nullable=false)
+            dd = AC.ArrayData(t, 2, [AC.BufferSlice(), AC._databuffer(raw)]; nullcount=0)
+            lf = AC.Field(
+                "l",
+                lt;
+                nullable=false,
+                children=[AC.Field("item", t; nullable=false)],
+            )
+            offsets = AC._databuffer(Int32[0, 2, 2])
+            ld =
+                AC.ArrayData(lt, 2, [AC.BufferSlice(), offsets]; children=[dd], nullcount=0)
+            sch = AC.Schema([df, lf])
+            tbl = Arrow.Table(Arrow.writefile(sch, [AC.RecordBatch(sch, [dd, ld])]))
+            @test tbl.d isa Arrow.Primitive && tbl.d == want
+            @test tbl.l[1] isa Arrow.ListValue && tbl.l[1] == want && isempty(tbl.l[2])
+            back = Arrow.readfile(take!(Arrow.write(IOBuffer(), tbl)))
+            @test [f.type for f in back.schema.fields] == [t, lt]
+            @test only(back.schema.fields[2].children).type == t
+            @test Arrow.Table(back).d == want
+        end
     end
 
     @testset "flat columns are read-only views" begin
