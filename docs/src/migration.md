@@ -1,6 +1,4 @@
-```@meta
-CurrentModule = Arrow
-```
+```@raw html
 <!---
   Licensed to the Apache Software Foundation (ASF) under one
   or more contributor license agreements.  See the NOTICE file
@@ -19,384 +17,144 @@ CurrentModule = Arrow
   specific language governing permissions and limitations
   under the License.
 -->
+```
 
 # Migrating from Arrow.jl 2.x
 
-Arrow.jl 3.0 is a breaking rewrite. The common names remain the same:
-[`Arrow.Table`](@ref), [`Arrow.Stream`](@ref), [`Arrow.write`](@ref), and
-[`Arrow.DictEncode`](@ref). The storage model and some advanced write
-features changed.
+Arrow.jl 3.0 is a new implementation with the same main names: `Arrow.Table`,
+`Arrow.Stream`, `Arrow.write`, `Arrow.Writer`, `Arrow.append`, `Arrow.tobuffer`,
+`Arrow.DictEncode`, and `Arrow.getmetadata`. It reads every file Arrow 2.x writes, with
+the same values. Code that reads a table into a `DataFrame` and writes it back usually
+runs unchanged. What changes is the Julia type of some values, a few removed arguments,
+and, for teams that run both versions, a few column types that Arrow 2.x cannot read.
 
-## Requirements
+## Before you upgrade
 
-Arrow 3.0 requires Julia 1.10 or later, ArrowTypes.jl 2.x, Tables.jl 1.14
-(the first release that provides `Tables.Scan`), DataStrings.jl 1.0,
-DataDecimals.jl 1.0, and Durations.jl 1.4.
+Arrow 3.0 needs Julia 1.10 or later and uses ArrowTypes.jl 2, Tables.jl 1.14,
+DataStrings.jl, DataDecimals.jl, and Durations.jl. It no longer depends on TimeZones.jl
+or BitIntegers.jl.
 
-Supported top-level decimal columns use `DataDecimals.Decimal{P,S,T}`.
-Negative-scale decimals retain raw coefficients. Calendar interval columns use
-`Durations.Duration`; elapsed Arrow Duration columns keep their Dates period types.
-Read-then-write retains the original decimal and interval wire descriptors.
+Some registered packages still declare compatibility with Arrow 2 only, so adding Arrow 3
+can make the package manager hold them, or downgrade them, to older versions; until its
+next release this includes CategoricalArrays, through its Arrow extension. After
+upgrading, check `Pkg.status()` for packages that went backwards.
 
-## Materialized columns
+## Calls
 
-Arrow 2.x returned lazy `ArrowVector` objects that viewed the source buffers.
-Arrow 3.0 returns plain Julia vectors:
+| Arrow 2.x | Arrow 3.0 |
+|:--|:--|
+| `Arrow.Table(path; convert=false)` | removed: values always convert to Julia types ([Values](@ref)) |
+| `Arrow.Table(bytes, pos, len)` | `Arrow.Table(bytes[pos:(pos + len - 1)])` |
+| `Arrow.Table(path)` with a path object, such as a FilePathsBase.jl or AWSS3.jl `S3Path` | `Arrow.Table(string(path))` for a local path, or `Arrow.Table(read(path))`; to write, `write(path, take!(Arrow.write(IOBuffer(), table; file=true)))` |
+| `Arrow.Table([path1, path2])`, `Arrow.Stream([...])` | read each source: `reduce(vcat, DataFrame.(Arrow.Table.(paths)))`, or `for path in paths, batch in Arrow.Stream(path)` |
+| `table.col[i] = x` | columns are read-only: `df = DataFrame(table); df.col[i] = x` |
+| `table.col isa Arrow.List` (or `Map`, `Struct`, `DenseUnion`, ...) | the column types are now `Arrow.ListVector`, `MapVector`, `StructVector`, and plain `Vector`s for unions; better, test the element type |
+| `Arrow.getmetadata(table)` | unchanged; `DataAPI.metadata(table)` also works |
+| `Arrow.getmetadata(table.col)` | `DataAPI.colmetadata(table, :col)` |
+| `Arrow.write(...; compress=LZ4FrameCompressor())` | `compress=:lz4` (or `:zstd`), with `compresslevel` |
+| `Arrow.write(...; alignment, dictencodenested, denseunions, maxdepth)` | accepted with a warning and ignored |
+| `Arrow.write(...; ntasks=0)` | `ntasks=1` |
+| `Arrow.ToTimestamp(x)` | removed: write `Durations.ZonedTimestamp` values, or `ZonedDateTime`s with TimeZones loaded |
+| `open(Arrow.Writer, path) do writer ... end` | unchanged, or `Arrow.Writer(path) do writer ... end` |
 
-```julia
-table = Arrow.Table("data.arrow")
-table.id isa Vector
+A keyword Arrow 3.0 does not know is an `ArgumentError` that lists the valid ones and
+suggests the name to use for pyarrow's, Polars', and Arrow 2.x's names. `release!` is new
+and public, and like every name but `ArrowTypes` it is called with the `Arrow.` prefix.
+
+## Values
+
+Columns are still views of the file, and most element types are the same as in 2.x.
+These changed:
+
+| Arrow type | Arrow 2.x | Arrow 3.0 | To get the 2.x value |
+|:--|:--|:--|:--|
+| Utf8 | `String` | `DataStrings.DataString` | `String(x)`; or read with `stringtype=String` |
+| Binary | `Base.CodeUnits` | `DataStrings.DataBytes` | `Vector{UInt8}(x)` |
+| Timestamp | `DateTime`, truncated to milliseconds | `Durations.Timestamp{unit}`, exact | `DateTime(x)`; or select the column as `:col => DateTime` |
+| Timestamp with a zone | `TimeZones.ZonedDateTime` | `Durations.ZonedTimestamp{unit,zone}` | `ZonedDateTime(x)`, with TimeZones loaded |
+| Decimal | `Arrow.Decimal{P,S,Int128}` | `DataDecimals.Decimal{P,S,T}` | |
+| Interval | `Arrow.Interval` | `Durations.Duration` | |
+| List | a `SubArray` view | `Arrow.ListValue{T}` view | `copy(x)` |
+| FixedSizeList with nullable values | a `Tuple` | `Arrow.ListValue{T}` | `Tuple(x)` |
+| Map | `Dict{K,V}` | `Arrow.MapValue{K,V}`, an `AbstractDict` in stored order | `Dict(x)`; `Dict{String,V}(x)` for `String` keys |
+| Struct | `NamedTuple` | `NamedTuple`, with `DataString` fields for strings | |
+
+A `DataString` compares and hashes equal to the `String` with the same characters, and a
+`Timestamp` to the `DateTime` at the same time, so lookups, joins, and comparisons
+against `String` and `DateTime` values keep working. Code that dispatches on, or asserts,
+`String`, `DateTime`, or `Dict` element types needs the conversions above:
+
+```@example migration
+using Arrow, Dates
+
+path = joinpath(mktempdir(), "values.arrow")
+Arrow.write(path, (name=["Ada"], at=[DateTime(2025, 1, 1, 12)], attrs=[Dict("k" => 1)]))
+table = Arrow.Table(path)
+(table.name[1] == "Ada", String(table.name[1]), DateTime(table.at[1]),
+    Dict{String,Int}(table.attrs[1]))
 ```
 
-There is no `convert=false` mode. Code that checks for an `ArrowVector` type
-must use the Tables.jl interface or the column's normal `AbstractVector`
-interface instead.
+[Type mapping](@ref) lists every type.
 
-Concrete Arrow 2.x array types such as `Arrow.Primitive`, `Arrow.List`, and
-`Arrow.DictEncoded` are no longer part of the read result. Use
-`Tables.schema(table)`, `eltype(column)`, and the standard array interface.
-Use `Tables.getcolumn(table, name_or_index)` in place of Arrow 2.x table
-indexing.
+Ordered dictionary columns keep their order in `DataAPI.levels`, and with
+CategoricalArrays loaded `isordered(column)` reports it; see [Dictionary
+columns](@ref) for rebuilding an ordered `CategoricalArray`.
 
-Decimal read types changed. Arrow 2.x read decimal columns as `Arrow.Decimal`
-values that wrap a BitIntegers.jl `Int128` or `Int256` unscaled integer. Arrow
-3.0 reads decimals whose scale is between 0 and the precision as
-`DataDecimals.Decimal{P,S,T}` values whose integer width matches the
-descriptor; other decimals (a negative scale, or a scale above the
-precision) keep raw storage (`Int32`/`Int64`, or native-endian byte vectors
-at 128/256 bits). See [Type mapping when reading](@ref) for the complete table.
+`Symbol` columns intern at most `Arrow.Limits().max_new_symbols` new symbols per read
+([Resource limits](@ref)).
 
-Struct rows are `NamedTuple`s, as in Arrow 2.x, for a struct of at most 64
-fields with distinct names; a wider struct, or one with duplicate names,
-reads `Vector{Pair{String,Any}}` rows (ordered name => value pairs). String
-fields read as `DataString`s; a `Tables.Scan` select type override names
-exact Julia types, and it applies recursively, so a list-of-struct column
-takes a `Vector{...}` target:
+## Writing changes
 
-```julia
-NT = @NamedTuple{a::Float64, b::String}
-table = Arrow.Table("data.arrow"; scan=Tables.Scan(select=(:x, :c => NT)))
-eltype(table.c) == NT # true
-```
+- A path still gets the file format and an `IO` the stream format; `file=` overrides.
+- `Arrow.Writer` takes its schema from the first table, with every column nullable
+  unless `nullable=false`. Later tables, and tables given to `Arrow.append`, must have
+  the same columns with values that convert exactly (an `Int32` column fits an `Int64`
+  one), or the write is an error naming the column. Arrow 2.x did not check them.
+- `dictencode=false` writes `PooledArray` and `CategoricalArray` columns as plain values;
+  2.x dictionary-encoded them regardless. `dictencode` also takes column names.
+- Strings must be valid UTF-8; write other bytes as `Vector{UInt8}`.
+- `UUID` columns write as the canonical `arrow.uuid` extension, which pyarrow and Polars
+  read as UUIDs. Files from 2.x, which used a `JuliaLang.UUID` label, still read as
+  `UUID`.
+- `Int128` and `UInt128` write as 16-byte fixed-size binary labelled `JuliaLang.Int128`
+  and `JuliaLang.UInt128`.
+- A vector of `Pair`s writes as an Arrow map, where 2.x wrote a list of structs.
+- `metadata` and `colmetadata` default to the table's DataAPI metadata, so a
+  `DataFrame`'s metadata is written.
+- New keywords: `compresslevel`, `batchsize`, `dictdeltas`, `stringview`, and, for
+  `Arrow.Writer`, `nullable` and `dictreplacement` ([Writing](@ref)).
 
-Code that must handle both row shapes can branch on what it received:
+## Packages that define mappings
 
-```julia
-rows = table.c isa AbstractVector{<:NamedTuple} ? table.c :
-       [r === missing ? missing : NT(Tuple(last(kv) for kv in r)) for r in table.c]
-```
+ArrowTypes.jl 2 keeps the 2.x interface. Define `ArrowTypes.ArrowType` and
+`ArrowTypes.toarrow` to write a type as a supported one, and `ArrowTypes.arrowname`,
+`ArrowTypes.JuliaType`, and `ArrowTypes.fromarrow` to read it back ([Custom
+types](@ref)). Files written with 2.x mappings read back through the same definitions.
+Overriding `ArrowTypes.ArrowKind` alone no longer chooses how a type is stored. A
+package that defines mappings should depend on ArrowTypes.jl directly rather than reach
+it through Arrow.
 
-List and map row types changed. Arrow 2.x read list rows as `SubArray`
-views with the child's element type and map rows as `Dict{K,V}`. Arrow 3.0
-reads list rows as `Arrow.ListValue{T}` views and map rows as
-`Arrow.MapValue{K,V}` views of `Pair{K,V}` entries (in stored order; `Dict(row)`
-gives the 2.x value). Fixed-size-list rows are `NTuple{N,T}` as before when the list
-has at most 64 values and its values are not nullable; otherwise they are
-`Arrow.ListValue{T}`. `copy(column)` gives `Vector{T}` rows.
-Code that checks a column's element type, such as a Legolas.jl schema with a
-`Vector{String}` field, sees the new row types; a `Tables.Scan` select type
-override such as `:xs => Vector{String}` reads `Vector` rows.
+## Reading and writing alongside Arrow.jl 2.x
 
-Timezone-aware timestamps changed. Arrow 2.x depended on TimeZones.jl and
-read a timestamp column with a declared timezone as `ZonedDateTime` values.
-Arrow 3.0 does not depend on TimeZones.jl: such a column reads as
-`Durations.ZonedTimestamp{P,Z}` values at every unit — 8-byte values holding
-the stored UTC instant, with the declared zone in the type. Instant
-comparisons, hashing, and arithmetic need no zone rules; local-time
-operations know `"UTC"` and fixed offsets, and loading TimeZones.jl teaches
-them named zones and converts to and from `ZonedDateTime`
-(`ZonedDateTime(zt)` / `ZonedTimestamp(zdt)`). A fresh `ZonedTimestamp`
-column writes back zero-conversion, and — with TimeZones.jl loaded — a fresh
-single-zone `ZonedDateTime` column still writes as a timezone-declared
-millisecond timestamp. One written column carries one zone; convert
-mixed-zone values with `astimezone` first. Zone-naive timestamps read as
-`Durations.Timestamp{P}` at every unit — a written `DateTime` column reads
-back as `Timestamp{Millisecond}`, which compares equal to the `DateTime`
-values it stores (Arrow 2.x truncated sub-millisecond units to `DateTime`
-with a warning; Arrow 3.0 is exact and never truncates). Code that needs
-`DateTime` values converts with `DateTime.(table.ts)` or reads with a
-`Tables.Scan` select type override such as `:ts => DateTime`.
+Arrow 3.0 reads every file Arrow 2.x writes, with the values 2.x reads, as the types
+listed under [Values](@ref). The other direction has gaps: Arrow 2.x reads most files
+Arrow 3.0 writes, but not all. While some readers still run Arrow 2.x, avoid these
+columns or write them in the form the last column suggests:
 
-Arrow 2.x labelled its temporal columns with extension names such as
-`JuliaLang.DateTime` and `JuliaLang.ZonedDateTime-UTC`. Arrow 3.0 reads those
-columns with the native mappings above. Arrow.jl releases before 2.4.2 wrote
-`ZonedDateTime` columns under the name `JuliaLang.ZonedDateTime` with local
-wall-clock time as the stored value. Arrow 3.0 reads that storage as a UTC
-instant and warns about the name; read such a file with Arrow 2.x and rewrite
-it.
+| Written by Arrow 3.0 | Arrow 2.x reads | For 2.x readers, write |
+|:--|:--|:--|
+| `UUID` | `NTuple{16,UInt8}`, with a warning | `string.(uuids)` |
+| `Int128`, `UInt128` | `NTuple{16,UInt8}`, with a warning | `string.(x)` |
+| `Minute`, `Hour`, `Day`, `Week` | an `Arrow.Duration` of seconds, with a warning | `Dates.Second.(x)` |
+| `Month`, `Year` | an `Arrow.Interval` of months, with a warning | `Dates.value.(x)` |
+| `VersionNumber` | fails when the column is read | `string.(versions)` |
+| `Durations.Duration` | cannot open the file | separate columns, or `string.(x)` |
+| A dictionary column that gained values across partitions or `Arrow.Writer` tables, in the file format | with several threads, can fail with a `KeyError` | `dictdeltas=true`, or the stream format |
+| Decimal32 or Decimal64, kept from a file another tool wrote | wrong values, without an error | `DataFrame(table)` first, which writes Decimal128 |
 
-The old positional byte-window arguments and multi-input constructors were
-removed. Pass one complete path, `IO`, byte vector, or byte-range source to
-`Arrow.Table` or `Arrow.Stream`. Slice an in-memory byte vector before the call
-when needed. Read independent IPC sources separately and combine their tables
-with a Tables.jl-aware consumer. Bytes after a stream's end-of-stream marker,
-such as a second stream written to the same `IO`, are rejected with
-`ValidationError`; Arrow 2.x read only the first stream.
+Arrow 2.x reads the other columns as its own types, as listed under [Values](@ref):
+timestamps as `DateTime`, strings as `String`, maps as `Dict`s.
 
-The internal Arrow 2.x accessors are gone: use `Tables.columnnames(table)` for
-`Arrow.names(table)` and `Arrow.getmetadata(table)` for `Arrow.metadata(table)[]`.
-
-Flat columns are read-only views of the source, as in 2.x, but each column now
-keeps the memory it reads alive, so it stays valid after its table is gone and
-writing to it is an error. `copy(column)`, `copy(table)`, `DataFrame(table)`, and
-`Arrow.read(source, DataFrame)` give mutable copies. String columns are
-`DataStrings.StringVector`s (`stringtype=String` gives `Vector{String}`), binary
-columns `BytesVector`s, and fixed-size binary values `NTuple{N,UInt8}`.
-[`Arrow.release!`](@ref) ends a read without unmapping: the table refuses
-further column access, and a mapped file is unmapped once the table and its
-columns are garbage collected. Windows reads paths into memory unless
-`mmap=true` is passed, so a file read there can be replaced or deleted right
-away.
-
-## Removed input support
-
-Arrow 3.0 rejects big-endian IPC input. Dictionary deltas remain supported
-in streams and files. Stream replacements are accepted even when the schema
-omits `DICTIONARY_REPLACEMENT`; earlier record batches keep their original
-dictionaries. A delta requires an existing base dictionary. IPC files permit
-one base per dictionary id followed by deltas, but not replacements.
-
-## Writing
-
-`Arrow.write` streams partition by partition, as Arrow 2.x did. Arrow 3.0
-keeps or changes these Arrow 2.x features:
-
-| Arrow 2.x feature | Arrow 3.0 action |
-|---|---|
-| `Arrow.Writer` | Still works, reimplemented: an incremental writer for both formats. The first table written fixes the schema, with every field nullable; later tables must conform, with lossless widening. Dictionaries gain later tables' categories (written once at the end of a file, again whole in a stream; `dictdeltas=true` for delta batches). See [`Arrow.Writer`](@ref). |
-| `Arrow.append` | Still works for the IPC stream format, as in 2.x, reimplemented; a missing or empty sink starts a stream. The file format refuses: produce it incrementally with `Arrow.Writer` or rewrite it. A dictionary that gains categories is written again whole (`dictdeltas=true` for a delta batch). |
-| `table \|> Arrow.write(sink)` | Still works: the curried form is kept. |
-| `Arrow.tobuffer(table)` | Still works, and still emits the IPC stream format. |
-| `ntasks` | Kept: that many tasks build each batch's columns and compress its buffers (default `Threads.nthreads()`), in `Arrow.Writer` too. The output bytes are the same for any `ntasks`. |
-| `dictencode`, `largelists` | Kept: `dictencode` (Bool or column names) dictionary-encodes columns, `largelists=true` declares 64-bit offsets. |
-| `Arrow.ToArrow` | Import `ArrowTypes.ToArrow` directly when an explicit lazy conversion view is needed. Normal writes apply the mapping automatically. |
-
-The output default for an `IO` changed. Arrow 2.x wrote the stream format to
-an `IO` by default. Arrow 3.0 uses `file=true` for both paths and `IO` sinks.
-Pass `file=false` when you need the IPC stream format:
-
-```julia
-io = IOBuffer()
-Arrow.write(io, table; file=false)
-stream_bytes = take!(io)
-```
-
-`Arrow.tobuffer(table)` produces exactly those bytes, seeked to the start.
-Use `file=true` when you need an IPC file with footer-based random access.
-
-Arrow 3.0 keeps `file`, `compress`, `dictencode`, `largelists`, `metadata`,
-`colmetadata`, and `ntasks`, and adds `compresslevel`, `batchsize`,
-`stringview`, and `dictdeltas`. `metadata` and `colmetadata` default to the
-table's DataAPI metadata. Strings must be valid UTF-8 (Arrow 2.x wrote any
-bytes); write other bytes as `Vector{UInt8}`.
-Compression is selected with `:lz4` or `:zstd`; passing an initialized
-compressor object is no longer supported. The Arrow 2.x `alignment`,
-`dictencodenested`, `denseunions`, and `maxdepth` writer keywords no longer
-have any effect: `Arrow.write` accepts them with a one-time warning each and
-ignores them. As in Arrow 2.x, a column with a
-`DataAPI.refpool`, such as a `PooledArray` or `CategoricalArray`, is written
-dictionary-encoded with its pool order and unused pool entries; values that
-need it, such as `CategoricalValue`s, unwrap through `DataAPI.unwrap`. Wrap
-any other column that needs dictionary encoding in [`Arrow.DictEncode`](@ref),
-or name it in `dictencode`.
-
-Arrow 3.0 again consumes the ArrowTypes.jl mapping interface. Package authors
-should depend on and import ArrowTypes.jl directly. Define `ArrowType` and
-`toarrow` to lower a custom value to supported storage. Add an extension name
-and the read hooks when the logical type must round-trip:
-
-```julia
-import ArrowTypes
-
-struct AccountID
-    value::Int64
-end
-
-const ACCOUNT_ID = Symbol("JuliaLang.Example.AccountID")
-
-ArrowTypes.ArrowType(::Type{AccountID}) = Int64
-ArrowTypes.toarrow(id::AccountID) = id.value
-ArrowTypes.arrowname(::Type{AccountID}) = ACCOUNT_ID
-ArrowTypes.JuliaType(::Val{ACCOUNT_ID}, ::Type{Int64}, metadata) = AccountID
-ArrowTypes.fromarrow(::Type{AccountID}, value::Int64) = AccountID(value)
-
-Arrow.write("accounts.arrow", (id = AccountID.(1:3),))
-table = Arrow.Table("accounts.arrow")
-getfield.(table.id, :value) == [1, 2, 3] # true
-```
-
-The lowering and restoration apply recursively to top-level values and values
-nested in lists, tuples and fixed-size lists, structs, maps,
-dictionary-encoded values, and freshly synthesized heterogeneous Unions.
-Arrow writes `arrowname` and `arrowmetadata` as standard extension metadata.
-On read, it uses `JuliaType` and then `fromarrow` or `fromarrowstruct`. If the
-current process has no mapping for an extension name, Arrow warns and returns
-the ordinary storage values instead.
-Defining `ArrowKind` alone is not a supported way to select an Arrow 3.0
-physical layout. Use the `ArrowType` and `toarrow` lowering interface.
-
-[`Arrow.DictEncode`](@ref) remains the opt-in wrapper for a newly written
-dictionary-encoded column; a `DataAPI.refpool` column needs no wrapper. Pool
-values use the same recursive ArrowTypes.jl mapping. A fully read top-level
-dictionary also retains its pool for rewrite.
-
-## Supported write types
-
-The writer accepts fixed-width integers and floats, `Bool`, strings, bytes,
-supported `Dates`, Durations, and DataDecimals values, and, nested to any
-depth, vectors (lists), `NTuple`s (fixed-size lists), `NamedTuple`s (structs),
-`Dict`s and `Pair` vectors (maps), and heterogeneous `Union`s (dense unions).
-See [Type mapping when writing](@ref) for the complete table.
-
-A `VersionNumber` column is written as strings labelled
-`JuliaLang.VersionNumber`. Arrow 3.0 reads it back as `VersionNumber` values;
-Arrow 2.x expects that label on a Struct and throws a `MethodError` when it
-indexes such a column. Write `string.(versions)` for files that Arrow 2.x
-readers must consume.
-
-A top-level `NamedTuple` column may use `Union{Missing, T}`. Arrow writes the
-outer missing state in the Struct validity bitmap and keeps each child's
-declared nullability unchanged.
-
-Declared Unions may contain up to 32 members. Runtime writer or storage
-inference is limited to 8 distinct types across all partitions. This includes
-abstract ArrowTypes.jl storage, abstract or `Any` dictionary values, and
-abstract retained ArrowTypes.jl targets. Declare the intended Union when a
-column needs more runtime types.
-
-A fresh unresolved abstract declaration keeps concrete subtype writer evidence
-across all partitions. A concrete subtype's extension metadata is not discarded.
-Heterogeneous subtype evidence uses an explicit Union and the same 8-type
-inference limit.
-
-A plain concrete struct whose fields are supported can use ArrowTypes.jl's
-default `StructKind` mapping. Without extension hooks, it reads back as
-ordinary Struct storage rather than the original Julia type. To select a
-different stable representation, map the struct to a supported storage type
-with `ArrowTypes.ArrowType` and `ArrowTypes.toarrow`, or convert it to a
-`NamedTuple` or separate columns. An `ArrowKind` override alone does not select
-an arbitrary Arrow 3.0 physical layout. `Arrow.ToTimestamp` was removed; define
-an ArrowTypes.jl lowering or convert zoned values before writing.
-
-## Schema retention
-
-When the source is an `Arrow.Table` or `Arrow.Stream`, the writer keeps
-compatible details from the source schema. These details include temporal
-units, byte and list widths, composite descriptors, nullability, field
-metadata, schema metadata, and top-level dictionary index types and category
-order. A column that was replaced with an incompatible Julia type is rejected
-instead of being silently written under the old schema.
-
-A fresh Julia column with a heterogeneous declared `Union` element type is
-synthesized as a canonical dense Arrow Union. Rewriting an Arrow Union read by
-`Arrow.Table` keeps its mode, type ids, and children: each value goes back to
-the one child whose type it has. A Union with two children of one type cannot
-be rewritten that way, since the values do not say which child each came from,
-and is refused. A registered ArrowTypes.jl logical type whose storage is a Union retains enough writer-side
-type evidence to reconstruct the original child routing, including dense or
-sparse mode and type IDs. Sparse children use canonical hidden placeholder
-values outside their active rows. When `JuliaType` returns an abstract target,
-a concrete writer subtype may omit an extension identity or use the retained
-parent's identity. A different explicit identity is rejected instead of being
-silently relabeled. A retained nested Dictionary also fails because its pool is
-lost. Top-level dictionaries of scalar or composite values are supported after
-a full read. A scan result can lack the hidden source pool, so an ordered
-dictionary from such a result also fails clearly. A nullable `Dictionary<Null>`
-with an unknown extension fails
-closed because materialization cannot retain valid-index versus null-index
-provenance. Exact buffer sharing, overlapping ListView ranges, and Run-End
-Encoding segmentation are not retained; the writer emits a canonical layout
-with the same public-domain values and schema type.
-
-Registered public-domain values can rebuild compatible retained binary, list,
-date-like, duration, wide-decimal, and interval descriptors. The retained
-descriptor controls widths, sizes, units, and child fields. Values that do not
-meet those exact constraints fail with `ArgumentError`. A retained Map with
-`keysSorted=true` also rejects a replacement row whose keys are not sorted.
-
-The removed `maxdepth` keyword is not replaced by an unbounded writer.
-Recursive ArrowTypes.jl storage schemas and recursive value containers throw
-`ArgumentError`, as does custom mapping nesting beyond the fixed depth of 64.
-To keep composite descriptors from allocating in proportion to untrusted
-schema width, `JuliaType` receives exact `NTuple{N,T}` fixed-list storage when
-`N` is at most 1024 and the compact `Tuple{Vararg{T}}` family above that limit.
-Exact-arity registrations above the limit remain unregistered. Extension
-Structs receive an exact `NamedTuple` storage signature through 1024 children
-only when child names are unique, contain no embedded NUL, already exist as
-Julia `Symbol`s, are at most 4096 UTF-8 bytes each, and use at most 64 KiB in
-total. Otherwise the labelled Struct remains unknown and reads as ordered
-`Pair` storage. To preserve ArrowTypes.jl Tuple storage, one bounded exception
-may intern positional child names only when the complete sequence is exactly
-`"1"`, `"2"`, …, `string(N)` for `N ≤ 1024`. Unknown extension labels return
-before this check. Arbitrary or partly positional Struct names are not interned.
-Any writer-side `ArrowType` result that is a concrete tuple above the same limit
-is rejected before writer specialization. This includes ArrowTypes.jl's default
-mapping for a tuple value. A custom hook itself remains trusted Julia code and
-must return normally for Arrow to validate its result.
-
-Retained null-parent child slots now use direct length-based construction.
-Null-only fixed-size lists and inactive sparse-Union children no longer expand
-into one Julia placeholder per hidden element.
-
-## Names and imports
-
-Arrow 3.0 uses a small export surface. Qualify package functions:
-
-```julia
-using Arrow
-
-table = Arrow.Table("data.arrow")
-Arrow.write("copy.arrow", table)
-```
-
-`ArrowTypes` stays exported, so `using Arrow` keeps the bare `ArrowTypes`
-binding working. Packages that define mappings should still depend on and
-import ArrowTypes.jl directly rather than reach it through Arrow.
-
-Core schema names now stay as `String` values. `Arrow.Table` converts only
-top-level Tables.jl column names to `Symbol`, after it preflights the complete
-schema against a 4096-byte per-name limit, a 65,536-novel-name limit, and a
-1-MiB novel-name byte budget. Unknown ArrowTypes extension labels are checked
-without interning them. The built-in `JuliaLang.Symbol` extension rejects a
-novel IPC payload with `ValidationError` instead of interning input-controlled
-process-global state. This is an intentional behavior change: an input that a
-prior Arrow.jl release read by interning its payload can now fail.
-
-Arrow 3.0 uses DataAPI.jl metadata methods. `Arrow.getmetadata(table)`
-remains as a compatibility method over them, returning the table's key-value
-metadata as a `Dict{String,String}` or `nothing`. As in Arrow 2.x, every
-other object returns `nothing`. Columns are plain vectors, so the Arrow 2.x
-per-column form `getmetadata(column)` also returns `nothing`; use
-`DataAPI.colmetadata` instead. Add DataAPI.jl as a direct dependency of code
-that imports it:
-
-```julia
-import Pkg
-Pkg.add("DataAPI")
-```
-
-```julia
-using Arrow, DataAPI
-
-collect(DataAPI.metadatakeys(table))
-DataAPI.metadata(table, "key")
-DataAPI.colmetadata(table, :column, "key")
-```
-
-## New features
-
-Arrow 3.0 adds:
-
-- `Tables.Scan` pushdown for projection, filters, limits, and offsets.
-- Recursive ArrowTypes.jl custom and extension-type mappings. Filters over a
-  field that contains a registered logical type at any depth evaluate over the
-  public materialized values because the interface does not require its
-  storage lowering to preserve Julia comparison semantics.
-- Sparse byte-range reads through [`Arrow.AbstractArrowSource`](@ref).
-- A CloudStore.jl extension for object storage.
-- Arrow C data and C stream import and export.
-- Arrow StringView and BinaryView support.
-- Stronger validation and resource limits for untrusted IPC input.
-
-See the [User Manual](@ref) for examples and the [API Reference](@ref) for the
-supported entry points.
+Arrow.jl releases before 2.4.2 stored `ZonedDateTime` columns as local times, labelled
+`JuliaLang.ZonedDateTime`. Arrow 3.0 warns about that label and reads the stored values
+as UTC instants, so rewrite such files with Arrow 2.x before reading them with 3.0.

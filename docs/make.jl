@@ -33,10 +33,14 @@ makedocs(;
     ),
     pages=[
         "Home" => "index.md",
-        "User Manual" => "manual.md",
+        "Reading" => "reading.md",
         "Writing" => "writing.md",
-        "Migrating from 2.x" => "migration.md",
-        "API Reference" => "reference.md",
+        "Streams and IPC" => "streams.md",
+        "Type mapping" => "types.md",
+        "Limits and errors" => "limits.md",
+        "C data interface" => "cdata.md",
+        "Migrating from Arrow.jl 2.x" => "migration.md",
+        "API reference" => "reference.md",
     ],
     pagesonly=true,
 )

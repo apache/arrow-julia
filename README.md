@@ -23,22 +23,17 @@
 [![CI](https://github.com/apache/arrow-julia/actions/workflows/ci.yml/badge.svg)](https://github.com/apache/arrow-julia/actions/workflows/ci.yml)
 [![Codecov](https://codecov.io/gh/apache/arrow-julia/branch/main/graph/badge.svg)](https://codecov.io/gh/apache/arrow-julia)
 
-Arrow.jl is a pure Julia implementation of the
-[Apache Arrow](https://arrow.apache.org) columnar data standard. It reads and
-writes Arrow IPC files and streams. It also supports the Arrow C data and C
-stream interfaces, Tables.jl, compressed buffers, and selective byte-range
-reads.
+Arrow.jl reads and writes the [Apache Arrow](https://arrow.apache.org) IPC file and
+stream formats in pure Julia. A file reads as Tables.jl columns that view its memory, and
+any Tables.jl table writes. It also implements the Arrow C data and C stream interfaces.
 
 > [!IMPORTANT]
-> This is the Arrow.jl 3.0 development branch. Arrow 3.0 is not registered
-> yet. It uses registered DataStrings, DataDecimals, and Durations releases. A
-> checkout uses the registered DataStrings and in-repository `src/ArrowTypes`
-> packages: Julia 1.11+ resolves them through `[sources]`; on Julia 1.10 run
-> the `Pkg.develop` commands below.
+> This is the Arrow.jl 3.0 development branch; 3.0 is not registered yet. Arrow 3.0 is a
+> breaking release: read the [migration guide](docs/src/migration.md) before you upgrade
+> from 2.x. A checkout uses the in-repository `src/ArrowTypes` package: Julia 1.11+
+> resolves it through `[sources]`; on Julia 1.10 run the `Pkg.develop` commands below.
 
 ## Installation
-
-Install the latest registered release from the Julia REPL:
 
 ```julia
 import Pkg
@@ -48,37 +43,24 @@ Pkg.add("Arrow")
 ## Quick start
 
 ```julia
-using Arrow
+using Arrow, DataFrames
 
-data = (id = [1, 2, 3], name = ["Ada", "Babbage", missing])
-Arrow.write("data.arrow", data)
+Arrow.write("data.arrow", (id=[1, 2, 3], name=["Ada", "Ben", missing]))
 
-table = Arrow.Table("data.arrow")
-propertynames(table) # [:id, :name]
-isequal(collect(table.name), ["Ada", "Babbage", missing]) # true
+table = Arrow.Table("data.arrow")        # columns view the file
+table.name                               # ["Ada", "Ben", missing]
+df = Arrow.read("data.arrow", DataFrame) # a DataFrame with its own columns
+
+subset = Arrow.Table("data.arrow"; select=[:id], filter=Arrow.col(:id) > 1)
+
+for batch in Arrow.Stream("data.arrow")  # one record batch at a time
+    # ...
+end
 ```
 
-`Arrow.Table` accepts a path, an `IO`, IPC bytes, or an
-`Arrow.AbstractArrowSource`. `Arrow.Stream` iterates one record batch at a time.
-`Arrow.write` accepts any Tables.jl source.
-
-Arrow 3.0 includes:
-
-- IPC file and stream reads and writes.
-- Incremental file and stream writing, plus IPC stream append.
-- LZ4 frame and Zstandard buffer compression.
-- Dictionary encoding.
-- `Tables.Scan` projection, filter, limit, and offset pushdown.
-- Sparse byte-range reads, including a CloudStore.jl extension.
-- Arrow C data and C stream import and export.
-- Recursive ArrowTypes.jl mappings for custom and extension types.
-- Structural, semantic, and optional full-content validation.
-
-Arrow 3.0 is a breaking rewrite. Read the
-[migration guide](docs/src/migration.md) before you update from Arrow 2.x.
-See the [changelog](CHANGELOG.md) for the full release summary. The
-[user manual](docs/src/manual.md) and
-[API reference](docs/src/reference.md) describe the supported public API.
+The [documentation](https://arrow.apache.org/julia/) covers reading, writing, streams,
+the type mapping, limits and errors, the C data interface, and migrating from 2.x. The
+[changelog](CHANGELOG.md) summarizes what changed in 3.0.
 
 ## Development
 

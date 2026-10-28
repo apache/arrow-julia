@@ -300,7 +300,7 @@ jobs:
   docs:
     name: Documentation
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3

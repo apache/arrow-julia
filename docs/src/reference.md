@@ -19,7 +19,11 @@
 -->
 ```
 
-# API Reference
+# API reference
+
+```@docs
+Arrow
+```
 
 ## Read
 
@@ -27,43 +31,48 @@
 Arrow.Table
 Arrow.read
 Arrow.Stream
+Arrow.release!(::Arrow.Table)
+Base.copy(::Arrow.Table)
+Arrow.getmetadata
+Arrow.Limits
+```
+
+## Filter
+
+```@docs
 Arrow.col
 Arrow.colcmp
 Arrow.colin
 Arrow.isnull
-Arrow.Limits
-Arrow.release!(::Arrow.Table)
-Base.copy(::Arrow.Table)
-Arrow.getmetadata
-```
-
-## Columns
-
-```@docs
-Arrow.ArrowVector
-Arrow.Primitive
-Arrow.BoolVector
-Arrow.ListVector
-Arrow.ListValue
-Arrow.MapVector
-Arrow.MapValue
-Arrow.StructVector
-Arrow.DictEncoded
-Arrow.RunEndEncoded
 ```
 
 ## Write
 
 ```@docs
 Arrow.write
-Arrow.Writer
 Arrow.write(::Arrow.Writer, ::Any)
+Arrow.Writer
 Arrow.append
 Arrow.tobuffer
 Arrow.DictEncode
 ```
 
-## Byte-range reads
+## Column and value types
+
+```@docs
+Arrow.ArrowVector
+Arrow.Primitive
+Arrow.BoolVector
+Arrow.DictEncoded
+Arrow.RunEndEncoded
+Arrow.ListVector
+Arrow.ListValue
+Arrow.MapVector
+Arrow.MapValue
+Arrow.StructVector
+```
+
+## Byte-range sources
 
 ```@docs
 Arrow.AbstractArrowSource
@@ -72,9 +81,14 @@ Arrow.readrange
 Arrow.concurrentreads
 ```
 
-## The C data and C stream interfaces
+## Error types
 
-The low-level value and ABI types are public but not exported.
+```@docs
+Arrow.ValidationError
+Arrow.AllocationLimitError
+```
+
+## C data and C stream interfaces
 
 ```@docs
 Arrow.Field
@@ -84,27 +98,17 @@ Arrow.RecordBatch
 Arrow.fromjulia
 Arrow.batch
 Arrow.materialize
-Arrow.CArrowSchema
-Arrow.CArrowArray
-Arrow.CArrowArrayStream
-```
-
-```@docs
 Arrow.to_c_data
 Arrow.from_c_data
 Arrow.export_stream!
 Arrow.from_c_stream
-Arrow.ForeignOwner
-Arrow.ImportedStream
 Arrow.nextbatch!
+Arrow.ImportedStream
+Arrow.ForeignOwner
 Arrow.release!(::Arrow.ForeignOwner)
 Arrow.release!(::Arrow.ImportedStream)
 Arrow.reap!
-```
-
-## Errors
-
-```@docs
-Arrow.AllocationLimitError
-Arrow.ValidationError
+Arrow.CArrowSchema
+Arrow.CArrowArray
+Arrow.CArrowArrayStream
 ```
