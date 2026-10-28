@@ -1372,7 +1372,7 @@ slot (a dictionary value no row uses, say).
 function _badutf8(f::AC.Field, d::AC.ArrayData)
     t = d.type
     if t isa AC.Utf8Type
-        i = _badutf8offsets(d, t.large)
+        i = _badutf8offsets(d, t.large ? Int64 : Int32)
         return i == 0 ? nothing : (i, "")
     elseif t isa AC.ViewType
         t.utf8 || return nothing
@@ -1411,13 +1411,12 @@ end
 
 # A utf8 column's first non-null row that is not UTF-8, or 0. ASCII data, or
 # data valid as a whole whose rows all start on a character, is valid; only
-# other data is checked row by row.
-function _badutf8offsets(d::AC.ArrayData, large::Bool)
+# other data is checked row by row. `T` is the offset type.
+function _badutf8offsets(d::AC.ArrayData, ::Type{T}) where {T}
     n = Int(d.len)
     n == 0 && return 0
     offs = AC.rolebuffer(d, AC.OFFSETS)
     data = AC.rolebuffer(d, AC.DATA)
-    T = large ? Int64 : Int32
     (d.offset + n + 1) * sizeof(T) <= offs.len || return 0
     GC.@preserve offs data begin
         op = Ptr{T}(AC.sliceptr(offs)) + d.offset * sizeof(T)
