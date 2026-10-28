@@ -653,35 +653,41 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         end
     end
 
-    @testset "a source streams per batch and downloads whole in concurrent ranges" begin
-        # Four batches of 160 KB, each larger than the 64 KiB tail window.
+    @testset "a source streams batches in windows and downloads whole in concurrent ranges" begin
+        # Four batches of 160 KB: a file pass reads them in one window after
+        # the tail, and serves a second pass and random access from it.
         parts = [(a=collect(Int64, ((k - 1) * 20_000 + 1):(k * 20_000)),) for k = 1:4]
         for file in (true, false)
             bytes = take!(Arrow.write(IOBuffer(), Tables.partitioner(parts); file=file))
             log = _LoggingSource(bytes, NTuple{2,Int64}[])
             st = Arrow.Stream(log)
             @test [b.a[1] for b in st] == [1, 20_001, 40_001, 60_001]
-            # The tail, then one range per batch: no request reads more than
-            # one batch and a 64 KiB window.
-            @test length(log.requests) <= 2 + length(parts)
-            @test maximum(last, log.requests) < 160_000 + 70_000
-            # A second pass starts over and fetches the batches again.
+            # A stream object reads forward, its readahead doubling.
+            @test length(log.requests) <= (file ? 2 : 2 + length(parts))
             n = length(log.requests)
             @test [b.a[end] for b in st] == [20_000, 40_000, 60_000, 80_000]
-            @test length(log.requests) - n == length(parts) + !file
             if file
-                # Random access fetches only the batch asked for.
-                n = length(log.requests)
-                @test st[3].a[1] == 40_001 && length(log.requests) == n + 1
+                @test length(log.requests) == n
+                @test st[3].a[1] == 40_001 && length(log.requests) == n
                 # The row count reads each batch's metadata, not its body.
-                n = length(log.requests)
                 @test DataAPI.nrow(st) == 80_000
                 @test length(log.requests) == n + length(parts)
                 @test maximum(last, log.requests[(n + 1):end]) < 1_000
+            else
+                # A second pass starts over.
+                @test length(log.requests) > n
             end
             kept = Arrow.Stream(log; filter=Arrow.col(:a) > 70_000, select=[:a])
             @test sum(b -> length(b.a), kept) == 10_000
         end
+        # Batches larger than a window are fetched one at a time, when asked
+        # for.
+        large = [(a=collect(Int64, ((k - 1) * 1_200_000 + 1):(k * 1_200_000)),) for k = 1:3]
+        bytes = take!(Arrow.write(IOBuffer(), Tables.partitioner(large)))
+        log = _LoggingSource(bytes, NTuple{2,Int64}[])
+        b1, _ = iterate(Arrow.Stream(log))
+        @test b1.a[1] == 1
+        @test sum(last, log.requests) < length(bytes) ÷ 2
         # With concurrent reads, a whole-object read fetches the bytes before
         # the tail in 8 MiB ranges at once, into one buffer.
         big = take!(Arrow.write(IOBuffer(), (a=collect(Int64, 1:2_200_000),)))

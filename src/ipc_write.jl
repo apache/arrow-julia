@@ -2155,7 +2155,7 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
         metadata=coremetadata(metaschema.custom_metadata),
         endianness=AC.LittleEndian,
     )
-    framed(block) =
+    framed(_, block) =
         let fm = _blockmessage(region, block, dataend, limits, budget)
             fm.version == version ||
                 throw(ValidationError("IPC metadata version changes within the file"))
@@ -2187,8 +2187,8 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
 end
 
 """
-Decode a file's dictionary batches in footer order; `framed(block)` returns
-each block's framed message with its metadata version checked.
+Decode a file's dictionary batches in footer order; `framed(i, block)` returns
+block `i`'s framed message with its metadata version checked.
 """
 function _filedictionaries(
     framed,
@@ -2203,8 +2203,8 @@ function _filedictionaries(
     validated = AC._ValidatedDictionaries()
     state = DecodeState(budget)
     try
-        for block in dictblocks
-            fm = framed(block)
+        for (i, block) in enumerate(dictblocks)
+            fm = framed(i, block)
             rejectexperimentalcompression(fm)
             header = fm.msg.header
             header isa Meta.DictionaryBatch ||

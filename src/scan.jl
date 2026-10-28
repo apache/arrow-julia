@@ -1715,6 +1715,25 @@ function _wholeobject(sf::SourceFile, budget::Union{Nothing,AllocationBudget}=no
 end
 
 """
+Reads footer blocks for a pass in file order: a block read right after the
+one before it comes with the blocks that follow it, up to `_READ_RANGE`
+bytes in all, and those are then served from that window. A pass over small
+blocks makes one request per window instead of one per block; a block read
+out of order is fetched alone. The window is at most `_READ_RANGE` bytes,
+held until the next fetch.
+"""
+mutable struct _BlockReader
+    const sf::SourceFile
+    const lock::ReentrantLock
+    # Where the last block served ended, and the window's start and bytes.
+    next::Int64
+    start::Int64
+    window::Vector{UInt8}
+end
+_BlockReader(sf::SourceFile) =
+    _BlockReader(sf, ReentrantLock(), Int64(-1), Int64(0), UInt8[])
+
+"""
 A file-format source read one record batch at a time (`Arrow.Stream` over an
 `AbstractArrowSource`): the footer and every dictionary batch when opened,
 then each record batch's bytes when the batch is read.
@@ -1734,13 +1753,15 @@ mutable struct _RangedFile
     @atomic version::Int16
     # The stream's lifetime authority; each batch's bytes are their own region.
     const region::OwnerRegion
+    const blocks::_BlockReader
 end
 
 function _RangedFile(sf::SourceFile, budget::AllocationBudget)
     ft = _rangedfooter(sf, budget)
     version = Ref(Int16(0))
-    framed(block) =
-        let fm = first(_blockframe(sf, block, ft.footerstart, budget))
+    dictreader = _BlockReader(sf)
+    framed(i, block) =
+        let fm = first(_blockframe(dictreader, ft.dictblocks, i, ft.footerstart, budget))
             version[] = _filemetadataversion(
                 ft.version,
                 fm.version,
@@ -1770,17 +1791,51 @@ function _RangedFile(sf::SourceFile, budget::AllocationBudget)
         ft.version,
         version[],
         heapregion(UInt8[]),
+        _BlockReader(sf),
     )
+end
+
+# The bytes of `blocks[i]`, from the window or fetched.
+function _readblock(br::_BlockReader, blocks, i::Int, dataend::Int64)
+    offset, frameend = _blockextent(blocks[i], dataend)
+    stop = frameend
+    @lock br.lock begin
+        if br.start <= offset && frameend <= br.start + length(br.window)
+            br.next = frameend
+            return br.window[(offset - br.start + 1):(frameend - br.start)]
+        end
+        if i == 1 || 0 <= offset - br.next <= br.sf.coalesce_gap
+            j = i
+            while j < length(blocks)
+                o, e = _blockextent(blocks[j + 1], dataend)
+                (o >= stop && e - offset <= _READ_RANGE) || break
+                stop = e
+                j += 1
+            end
+        end
+    end
+    bytes =
+        _fetchinto!(Vector{UInt8}(undef, stop - offset), 1, br.sf, offset, stop - offset)
+    @lock br.lock begin
+        br.next = frameend
+        stop == frameend && return bytes
+        br.start, br.window = offset, bytes
+    end
+    return bytes[1:(frameend - offset)]
 end
 
 # A footer block fetched and framed as a message of its own: the message and
 # the region holding the block's bytes.
-function _blockframe(sf::SourceFile, block::NTuple{3,Int64}, dataend::Int64, budget)
-    offset, frameend = _blockextent(block, dataend)
-    len = frameend - offset
-    region = heapregion(_fetchinto!(Vector{UInt8}(undef, len), 1, sf, offset, len))
-    _, metalen, bodylen = block
-    fm = _blockmessage(region, (Int64(0), metalen, bodylen), region.len, sf.limits, budget)
+function _blockframe(br::_BlockReader, blocks, i::Int, dataend::Int64, budget)
+    region = heapregion(_readblock(br, blocks, i, dataend))
+    _, metalen, bodylen = blocks[i]
+    fm = _blockmessage(
+        region,
+        (Int64(0), metalen, bodylen),
+        region.len,
+        br.sf.limits,
+        budget,
+    )
     return fm, region
 end
 
@@ -1804,7 +1859,7 @@ end
 # Record batch `i`, decoded through a one-block `ArrowFile` over its bytes.
 function _rangedbatch(r::_RangedFile, i::Int, budget::AllocationBudget, ntasks::Int)
     1 <= i <= length(r.recordblocks) || throw(BoundsError(r, i))
-    fm, region = _blockframe(r.sf, r.recordblocks[i], r.dataend, budget)
+    fm, region = _blockframe(r.blocks, r.recordblocks, i, r.dataend, budget)
     known = @atomic r.version
     if known == 0
         known, _ = @atomicreplace r.version Int16(0) => fm.version
@@ -1837,8 +1892,12 @@ mutable struct _SourceIO <: IO
     pos::Int64
     window::Vector{UInt8}
     windowstart::Int64
+    # The readahead of the next short read: it doubles from
+    # `_SOURCE_READAHEAD` to `_READ_RANGE`, so a long pass over small messages
+    # makes few requests and a short one over-reads little.
+    ahead::Int64
 end
-_SourceIO(sf::SourceFile) = _SourceIO(sf, Int64(0), UInt8[], Int64(0))
+_SourceIO(sf::SourceFile) = _SourceIO(sf, Int64(0), UInt8[], Int64(0), _SOURCE_READAHEAD)
 
 const _SOURCE_READAHEAD = Int64(64 * 1024)
 
@@ -1858,7 +1917,11 @@ function Base.unsafe_read(io::_SourceIO, p::Ptr{UInt8}, n::UInt)
     rest == 0 && return nothing
     # One fetch covers the rest and the next window (a body and the next
     # message's prefix and metadata, for a stream).
-    len = min(rest + _SOURCE_READAHEAD, io.sf.len - io.pos)
+    # A read shorter than one `_READ_RANGE` brings the readahead and doubles
+    # it; a longer one (a large message) brings only the base readahead.
+    short = rest < _READ_RANGE
+    len = min(rest + (short ? io.ahead : _SOURCE_READAHEAD), io.sf.len - io.pos)
+    short && (io.ahead = min(2 * io.ahead, _READ_RANGE))
     fetched = _fetchinto!(Vector{UInt8}(undef, len), 1, io.sf, io.pos, len)
     GC.@preserve fetched unsafe_copyto!(p + buffered, pointer(fetched), rest)
     io.pos += rest
