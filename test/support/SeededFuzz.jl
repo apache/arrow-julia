@@ -519,8 +519,10 @@ function _maprowviews(::Type{K}, ::Type{V}, rows; nullable::Bool=false) where {K
         push!(spans, start:length(keys))
     end
     # Rows read their keys and values back as the reader stores them.
-    store(::Type{E}, xs) where {E} =
-        (C = Arrow._columntype(E); xs isa C ? xs : Arrow._storeas(C, xs, nothing))
+    function store(::Type{E}, xs) where {E}
+        C = Arrow._columntype(E)
+        return xs isa C ? xs : Arrow._storeas(C, xs, nothing)
+    end
     kcol, vcol = store(K, keys), store(V, values)
     M = Arrow.MapValue{K,V}
     T = nullable ? Union{Missing,M} : M
