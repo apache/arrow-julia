@@ -944,7 +944,9 @@ end
 
 "Retained Arrow schema when the source is a facade read, else nothing."
 _retainedschema(t::Table) = getfield(t, :schema)
-_retainedschema(s::Stream) = _tableschema(getfield(s, :src))
+_retainedschema(s::Stream) =
+    getfield(s, :scan) === nothing ? _tableschema(getfield(s, :src)) :
+    getfield(_schematable(s), :schema)
 _retainedschema(::Any) = nothing
 
 function _writermetadata(metadata, retained, input=nothing)

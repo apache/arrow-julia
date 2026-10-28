@@ -2698,19 +2698,20 @@ function _applyfacadescan(
 end
 
 function _facadescanrawcolumn(
-    s::IPCStream,
+    fields,
+    batches,
     i::Int,
     budget,
     routes::_ArrowTypesRoutePlan,
     views::_ViewContext,
     checktimes=true,
 )
-    f = s.corefields[i]
+    f = fields[i]
     _scanview(f) &&
-        return _viewcolumn(f, AC.ArrayData[b.columns[i] for b in s.batches], views)
-    _chargevector!(budget, AbstractVector, length(s.batches), "stream scan column parts")
+        return _viewcolumn(f, AC.ArrayData[b.columns[i] for b in batches], views)
+    _chargevector!(budget, AbstractVector, length(batches), "stream scan column parts")
     parts = AbstractVector[
-        _scanbatchcolumn(f, b.columns[i], routes, views, checktimes) for b in s.batches
+        _scanbatchcolumn(f, b.columns[i], routes, views, checktimes) for b in batches
     ]
     return _joinscanparts(f, parts, budget)
 end
@@ -2772,27 +2773,43 @@ function _applyfacadescan(
     ntasks::Int=1,
 )
     budget = supplied === nothing ? s.budget : supplied
-    b = _facadestorage(plan)
     _chargevector!(budget, Field, length(s.corefields), "stream scan source fields")
     fields = collect(Field, s.corefields)
+    regions = _sourceregions(s, budget)
+    views = _ViewContext(stringtype, budget)
+    return _scanbatches(s.schema, fields, s.batches, regions, plan, budget, views, ntasks)
+end
+
+# A scan over decoded record batches: every batch of a stream-format read, or
+# one batch of an `Arrow.Stream`. The result keeps `regions`.
+function _scanbatches(
+    schema,
+    fields::Vector{Field},
+    batches,
+    regions,
+    plan::_ScanPlan,
+    budget,
+    views::_ViewContext,
+    ntasks::Int,
+)
+    b = _facadestorage(plan)
     _chargevector!(budget, AbstractVector, length(fields), "stream scan columns")
     routes = _ArrowTypesRoutePlan(budget)
-    views = _ViewContext(stringtype, budget)
-    nrows = sum(Int(b.nrows) for b in s.batches; init=0)
-    poolof = (bc, field, ctx) -> _retaineddictpool(field, s.batches, bc.index, ctx)
+    nrows = sum(b -> Int(b.nrows), batches; init=0)
+    poolof = (bc, field, ctx) -> _retaineddictpool(field, batches, bc.index, ctx)
     rawtimes = _rawtimes(plan.public, fields)
     if _selectsonly(b) && !isempty(plan.names) && isempty(rawtimes)
         # Every row is kept: the selected columns are the full read's.
         arrowtypes = _ArrowTypesContext(budget=budget)
         idxs = Int[c.index for c in b.columns]
-        columns = _buildcolumns(fields, s.batches, idxs, arrowtypes, views, ntasks)
+        columns = _buildcolumns(fields, batches, idxs, arrowtypes, views, ntasks)
         got = _scantable(Symbol[c.name for c in b.columns], columns, nrows, budget)
         return _finishfacadescan(
             got,
-            s.schema,
+            schema,
             fields,
             plan;
-            regions=_sourceregions(s, budget),
+            regions=regions,
             budget=budget,
             poolof=poolof,
             views=views,
@@ -2810,7 +2827,8 @@ function _applyfacadescan(
     rawcolumns = AbstractVector[
         needed[i] ?
         _facadescanrawcolumn(
-            s,
+            fields,
+            batches,
             i,
             budget,
             routes,
@@ -2822,10 +2840,10 @@ function _applyfacadescan(
     got = _executeplan(raw, b, plan.names, budget)
     return _finishfacadescan(
         got,
-        s.schema,
+        schema,
         fields,
         plan;
-        regions=_sourceregions(s, budget),
+        regions=regions,
         budget=budget,
         poolof=poolof,
         views=views,

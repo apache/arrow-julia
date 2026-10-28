@@ -605,6 +605,38 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test first(s).b == tbl.b
     end
 
+    @testset "Stream batches take the read keywords" begin
+        parts = [(x=collect(1:4) .+ 4k, s=string.(collect(1:4) .+ 4k)) for k = 0:2]
+        xs(stream) = reduce(vcat, [collect(t.x) for t in stream]; init=Int[])
+        for file in (true, false)
+            io = IOBuffer()
+            Arrow.write(io, Tables.partitioner(parts); file=file)
+            bytes = take!(io)
+            @test [Tables.columnnames(t) for t in Arrow.Stream(bytes; select=[:s])] == fill([:s], 3)
+            @test [Tables.columnnames(t) for t in Arrow.Stream(bytes; drop=[:s])] == fill([:x], 3)
+            @test xs(Arrow.Stream(bytes; filter=Arrow.col(:x) > 5)) == 6:12
+            # A window counts rows across batches and stops the iteration.
+            @test xs(Arrow.Stream(bytes; limit=6)) == 1:6
+            @test length(collect(Arrow.Stream(bytes; limit=6))) == 2
+            @test xs(Arrow.Stream(bytes; scan=Tables.Scan(offset=3, limit=6))) == 4:9
+            scan =
+                Tables.Scan(select=(:x => :y,), filter=Arrow.col(:x) > 1, offset=2, limit=5)
+            @test reduce(vcat, [collect(t.y) for t in Arrow.Stream(bytes; scan=scan)]) ==
+                  Arrow.Table(bytes; scan=scan).y ==
+                  4:8
+            s = Arrow.Stream(bytes; select=[:s], filter=Arrow.col(:x) > 5)
+            @test Tables.columnnames(s) == [:s]
+            @test Tables.schema(s).types == (Union{Missing,DataString},)
+            @test_throws ArgumentError DataAPI.nrow(s)
+            @test_throws ArgumentError Arrow.Stream(bytes; select=[:nope])
+            if file
+                @test s[2].s == ["6", "7", "8"]
+                @test DataAPI.nrow(Arrow.Stream(bytes; select=[:s])) == 12
+                @test_throws ArgumentError Arrow.Stream(bytes; limit=2)[1]
+            end
+        end
+    end
+
     @testset "input that is not Arrow IPC data says so" begin
         for bytes in
             (collect(UInt8, 1:16), UInt8[0x10, 0, 0, 0, 1, 2, 3, 4], UInt8[1, 2, 3])

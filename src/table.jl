@@ -2016,14 +2016,18 @@ _declaredbasetype(t::AC.ArrowType) =
 # --- Stream ------------------------------------------------------------------
 
 """
-    Arrow.Stream(source; mmap, stringtype=DataString, limits, ntasks)
+    Arrow.Stream(source; select=nothing, drop=nothing, filter=nothing, limit=nothing,
+                 scan=nothing, mmap, stringtype=DataString, limits, ntasks)
 
 Iterate an IPC source (a file path, an `IO`, a `Vector{UInt8}`, or an
 [`Arrow.AbstractArrowSource`](@ref), which is read whole) one record batch
 at a time; each iteration yields an [`Arrow.Table`](@ref) for that batch,
 with columns as in `Arrow.Table`. `mmap`, `stringtype`, and `ntasks` have the
 same meaning and defaults as for [`Arrow.Table`](@ref); each batch decodes and
-builds its columns on at most `ntasks` tasks. Satisfies `Tables.partitions` (each
+builds its columns on at most `ntasks` tasks. `select`, `drop`, `filter`, and
+`scan` apply to every batch; `limit` and a scan's `offset` count rows across
+the batches, and the iteration ends once `limit` rows have been yielded (such a
+Stream can be iterated but not indexed). Satisfies `Tables.partitions` (each
 batch is one partition), so partition-aware sinks — including `Arrow.write`,
 which writes one record batch per partition — see the source batch structure.
 
@@ -2062,15 +2066,22 @@ struct Stream
     views::_ViewContext
     arrowtypeslock::ReentrantLock
     ntasks::Int
+    scan::Union{Nothing,Tables.Scan}   # applied to each batch; its window spans them
 end
 
 function Stream(
     source;
+    select=nothing,
+    drop=nothing,
+    filter=nothing,
+    limit=nothing,
+    scan::Union{Nothing,Tables.Scan}=nothing,
     mmap::Bool=_MMAP_DEFAULT,
     stringtype::Type=DataStrings.DataString,
     limits::Limits=_defaultreaderlimits(source),
     ntasks::Integer=Threads.nthreads(),
 )
+    scan = _scanrequest(select, drop, filter, limit, scan)
     readlimits = _readerlimits(source, limits)
     _checkstringtype(stringtype)
     ntasks = _checkntasks(ntasks)
@@ -2083,6 +2094,8 @@ function Stream(
     # `_sourceregions` returns exactly one region for both source kinds, so
     # `only` cannot throw; a second region would need to share this cell,
     # not add one — the Stream has a single close authority.
+    # A scan that does not fit the schema fails here, not at the first batch.
+    scan === nothing || _ScanPlan(scan, _batchfields(src), _readbudget(readlimits, 0))
     return Stream(
         src,
         regions,
@@ -2092,6 +2105,7 @@ function Stream(
         _ViewContext(stringtype, budget),
         ReentrantLock(),
         ntasks,
+        scan,
     )
 end
 
@@ -2193,12 +2207,59 @@ function _streambatch(s::Stream, i::Int, ntasks::Int)
     return _batch(src, i, budget, ntasks), budget
 end
 
-function Base.iterate(s::Stream, i::Int=1)
+# The state is the next batch and, for a scan's window, the qualifying rows
+# skipped and yielded so far.
+function Base.iterate(s::Stream, state::NTuple{3,Int}=(1, 0, 0))
     _checkstream(s)
+    i, skipped, yielded = state
+    scan = getfield(s, :scan)
+    scan === nothing || scan.limit === nothing || yielded < scan.limit || return nothing
     got = _streambatch(s, i, getfield(s, :ntasks))
     got === nothing && return nothing
     b, budget = got
-    return _batchtable(s, b, budget), i + 1
+    scan === nothing && return _batchtable(s, b, budget), (i + 1, 0, 0)
+    t, skipped, yielded = _scannedbatch(s, b, budget, scan, skipped, yielded)
+    return t, (i + 1, skipped, yielded)
+end
+
+# Batch `b` under the stream's scan, after `skipped` qualifying rows of its
+# offset and `yielded` rows of its limit: the batch's share of the window.
+function _scannedbatch(s::Stream, b, budget, scan::Tables.Scan, skipped::Int, yielded::Int)
+    src = s.src
+    offset = scan.offset - skipped
+    limit = scan.limit === nothing ? nothing : offset + scan.limit - yielded
+    fields = collect(AC.Field, _batchfields(src))
+    plan = _ScanPlan(Tables.Scan(scan; offset=0, limit=limit), fields, budget)
+    views = _ViewContext(getfield(s, :views), budget)
+    t = _scanbatches(
+        _tableschema(src),
+        fields,
+        AC.RecordBatch[b],
+        s.regions,
+        plan,
+        budget,
+        views,
+        getfield(s, :ntasks),
+    )
+    n = getfield(t, :nrows)
+    skip = min(offset, n)
+    take = scan.limit === nothing ? n - skip : min(scan.limit - yielded, n - skip)
+    take == n || (t = _tablerows(t, (skip + 1):(skip + take)))
+    return t, skipped + skip, yielded + take
+end
+
+# Rows `r` of table `t`.
+function _tablerows(t::Table, r::UnitRange{Int})
+    cols = AbstractVector[c[r] for c in getfield(t, :columns)]
+    return Table(
+        getfield(t, :names),
+        cols,
+        getfield(t, :lookup),
+        getfield(t, :schema),
+        getfield(t, :regions),
+        length(r),
+        getfield(t, :retainedpools),
+    )
 end
 
 """
@@ -2214,9 +2275,20 @@ function Base.getindex(s::Stream, i::Integer)
             "a stream-format source has no random access to its batches; iterate it",
         ),
     )
+    scan = getfield(s, :scan)
+    scan === nothing ||
+        (scan.limit === nothing && scan.offset == 0) ||
+        throw(
+            ArgumentError(
+                "which batches hold a Stream's limited or offset rows is known only " *
+                "while iterating; iterate the Stream",
+            ),
+        )
     1 <= i <= _nbatches(src) || throw(BoundsError(s, i))
     budget = _batchbudget(src, Int(i))
-    return _batchtable(s, _batch(src, Int(i), budget, getfield(s, :ntasks)), budget)
+    b = _batch(src, Int(i), budget, getfield(s, :ntasks))
+    scan === nothing && return _batchtable(s, b, budget)
+    return first(_scannedbatch(s, b, budget, scan, 0, 0))
 end
 
 function _checkstream(s::Stream)
@@ -2301,6 +2373,21 @@ function _schematable(s::Stream)
         plan = arrowtypes.routeplan
         plan === nothing || (plan.budget = budget)
         views = _ViewContext(getfield(s, :views), budget)
+        scan = getfield(s, :scan)
+        if scan !== nothing
+            fieldvec = collect(AC.Field, fields)
+            plan = _ScanPlan(Tables.Scan(scan; offset=0, limit=nothing), fieldvec, budget)
+            return _scanbatches(
+                _tableschema(src),
+                fieldvec,
+                AC.RecordBatch[],
+                AC.OwnerRegion[],
+                plan,
+                budget,
+                views,
+                1,
+            )
+        end
         cols = _buildcolumns(fields, (), 1:length(fields), arrowtypes, views, 1)
         names = _fieldnamesymbols(fields, budget)
         return _table(names, cols, _tableschema(src), AC.OwnerRegion[], 0, nothing, budget)
@@ -2310,11 +2397,22 @@ function _schematable(s::Stream)
 end
 
 Tables.schema(s::Stream) = Tables.schema(_schematable(s))
-Tables.columnnames(s::Stream) = _fieldnamesymbols(_batchfields(s.src))
+Tables.columnnames(s::Stream) =
+    getfield(s, :scan) === nothing ? _fieldnamesymbols(_batchfields(s.src)) :
+    Tables.columnnames(_schematable(s))
 
-DataAPI.ncol(s::Stream) = length(_batchfields(s.src))
+DataAPI.ncol(s::Stream) = length(Tables.columnnames(s))
 function DataAPI.nrow(s::Stream)
     src = s.src
+    scan = getfield(s, :scan)
+    scan === nothing ||
+        (scan.filter === nothing && scan.limit === nothing && scan.offset == 0) ||
+        throw(
+            ArgumentError(
+                "the row count of a Stream with a filter, limit, or offset is " *
+                "known once it is read; iterate it and add up its batches' rows",
+            ),
+        )
     src isa _StreamReader && throw(
         ArgumentError(
             "the row count of a stream-format source is known once it is read; " *
@@ -2344,13 +2442,14 @@ DataAPI.colmetadata(
 
 function Base.show(io::IO, s::Stream)
     src = s.src
-    m = length(_batchfields(src))
+    m = DataAPI.ncol(s)
+    cols = m == 1 ? "1 column" : "$m columns"
     if src isa _StreamReader
-        print(io, "Arrow.Stream with ", m, " columns and schema:\n")
+        print(io, "Arrow.Stream with ", cols, " and schema:\n")
     else
         n = _nbatches(src)
         print(io, "Arrow.Stream with ", n, n == 1 ? " record batch, " : " record batches, ")
-        print(io, m, " columns, and schema:\n")
+        print(io, cols, ", and schema:\n")
     end
     show(IOContext(io, :print_schema_header => false), Tables.schema(s))
 end
