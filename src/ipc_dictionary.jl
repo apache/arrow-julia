@@ -26,8 +26,11 @@ end
 
 function _dictionaryvector(::Type{T}, n::Integer, limits::Limits, budget) where {T}
     bytes = AC.checked_mul(Int64(n), Int64(sizeof(T)))
-    bytes <= limits.max_buffer_bytes ||
-        throw(ValidationError("combined dictionary buffer exceeds max_buffer_bytes"))
+    bytes <= limits.max_buffer_bytes || _limiterror(
+        "combined dictionary buffer of $bytes bytes",
+        "max_buffer_bytes",
+        limits.max_buffer_bytes,
+    )
     _chargevector!(budget, T, n, "dictionary concatenation")
     return zeros(T, n)
 end
@@ -79,8 +82,11 @@ function _dictionarylength(ranges, limits)
     for r in ranges
         n = AC.checked_add(n, r.len)
     end
-    n <= limits.max_array_length ||
-        throw(ValidationError("combined dictionary length exceeds max_array_length"))
+    n <= limits.max_array_length || _limiterror(
+        "combined dictionary length $n",
+        "max_array_length",
+        limits.max_array_length,
+    )
     return n
 end
 
@@ -140,10 +146,10 @@ function _dictionaryconcat(f::Field, ranges, limits::Limits, budget)
                 isview && _dictionaryput!(sizes, k * width, len, width)
                 total = AC.checked_add(total, len)
                 if !isbinary
-                    total <= limits.max_array_length || throw(
-                        ValidationError(
-                            "combined dictionary child exceeds max_array_length",
-                        ),
+                    total <= limits.max_array_length || _limiterror(
+                        "combined dictionary child length $total",
+                        "max_array_length",
+                        limits.max_array_length,
                     )
                     _dictionaryrange!(childranges, r.data.children[1], lo, len, budget)
                 end

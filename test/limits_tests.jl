@@ -52,11 +52,46 @@ smallbudget() = Arrow.AllocationBudget(64 * 1024; ratio=64, cap=1 << 30)
             ),
             (Arrow.Limits(max_buffer_bytes=8), "limits=Arrow.Limits(max_buffer_bytes=...)"),
             (Arrow.Limits(max_body_bytes=8), "limits=Arrow.Limits(max_body_bytes=...)"),
+            (
+                Arrow.Limits(max_nesting_depth=1),
+                "metadata nesting exceeds Arrow.Limits max_nesting_depth (1); " *
+                "raise it with limits=Arrow.Limits(max_nesting_depth=...)",
+            ),
+            (
+                Arrow.Limits(max_metadata_objects=2),
+                "metadata object count exceeds Arrow.Limits max_metadata_objects (2)",
+            ),
         )
             for source in (bytes, IOBuffer(bytes))
                 err = @test_throws Arrow.ValidationError Arrow.Table(source; limits)
                 @test occursin(text, err.value.msg)
             end
+        end
+        # The low-level file reader, and dictionaries combined across batches.
+        dict =
+            take!(Arrow.write(IOBuffer(), (d=Arrow.DictEncode(string.(1:10)),); file=true))
+        io = IOBuffer()
+        Arrow.Writer(io; dictdeltas=true) do w
+            Arrow.write(w, (d=Arrow.DictEncode(["a", "b", "c", "d"]),))
+            Arrow.write(w, (d=Arrow.DictEncode(["e", "f", "g", "h"]),))
+        end
+        deltas = take!(io)
+        for (read, text) in (
+            (
+                () -> Arrow.readfile(bytes; limits=Arrow.Limits(max_messages=1)),
+                "message count 2 exceeds Arrow.Limits max_messages (1)",
+            ),
+            (
+                () -> Arrow.readfile(dict; limits=Arrow.Limits(max_array_length=5)),
+                "dictionary batch length 10 exceeds Arrow.Limits max_array_length (5)",
+            ),
+            (
+                () -> Arrow.Table(deltas; limits=Arrow.Limits(max_array_length=5)),
+                "combined dictionary length 8 exceeds Arrow.Limits max_array_length (5)",
+            ),
+        )
+            err = @test_throws Arrow.ValidationError read()
+            @test occursin(text, err.value.msg)
         end
     end
 

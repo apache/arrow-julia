@@ -2101,7 +2101,7 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
         AC.checked_add(Int64(length(dictblocks)), Int64(length(recordblocks))),
     )
     nmessages <= limits.max_messages ||
-        throw(ValidationError("message count exceeds limit"))
+        _limiterror("message count $nmessages", "max_messages", limits.max_messages)
     footer = FB.getrootas(Meta.Footer, footerbytes, 0)
     metaschema = footer.schema
     metaschema === nothing || (
@@ -2214,8 +2214,13 @@ function _filedictionaries(
             codec = _batchcodec(rb.compression, fm.version)
             vf = dictvaluefields[header.id]
             rblen = something(rb.length, Int64(0))
-            0 <= rblen <= limits.max_array_length ||
-                throw(ValidationError("dictionary batch length $rblen exceeds limit"))
+            rblen >= 0 ||
+                throw(ValidationError("dictionary batch length $rblen is negative"))
+            rblen <= limits.max_array_length || _limiterror(
+                "dictionary batch length $rblen",
+                "max_array_length",
+                limits.max_array_length,
+            )
             cursor = DecodeCursor(
                 rb.nodes,
                 rb.buffers,

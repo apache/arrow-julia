@@ -431,6 +431,11 @@ function _verified(f::F) where {F}
         return f()
     catch e
         e isa Meta.VerifyError && _vfail(e.msg)
+        e isa Meta.VerifyLimitError && (
+            e.ceiling === :depth ?
+            _limiterror("metadata nesting", "max_nesting_depth", e.limit) :
+            _limiterror("metadata object count", "max_metadata_objects", e.limit)
+        )
         e isa Meta.VerifyBudgetError && throw(AllocationLimitError(e.msg))
         rethrow()
     end

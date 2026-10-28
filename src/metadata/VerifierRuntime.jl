@@ -42,7 +42,15 @@ struct VerifyBudgetError <: Exception
     msg::String
 end
 
+# Verification passed the context's `max_objects` ceiling (`ceiling === :objects`)
+# or its `maxdepth` ceiling (`:depth`), whose value is `limit`.
+struct VerifyLimitError <: Exception
+    ceiling::Symbol
+    limit::Int64
+end
+
 _vfail(msg) = throw(VerifyError(msg))
+@noinline _vlimit(ceiling::Symbol, limit::Integer) = throw(VerifyLimitError(ceiling, limit))
 
 mutable struct VerifyContext
     objects::Int64
@@ -96,7 +104,7 @@ function _vvisit!(ctx::VerifyContext, what::AbstractString)
         e isa OverflowError || rethrow()
         _vfail("metadata object count overflow")
     end
-    ctx.objects <= ctx.max_objects || _vfail("metadata object count exceeds limit")
+    ctx.objects <= ctx.max_objects || _vlimit(:objects, ctx.max_objects)
     _vcharge!(ctx, METADATA_OBJECT_RESERVE, what)
     return nothing
 end
@@ -109,7 +117,7 @@ function _vcount!(ctx::VerifyContext, n::Int64, what::AbstractString)
         e isa OverflowError || rethrow()
         _vfail("metadata object count overflow")
     end
-    ctx.objects <= ctx.max_objects || _vfail("metadata object count exceeds limit")
+    ctx.objects <= ctx.max_objects || _vlimit(:objects, ctx.max_objects)
     return nothing
 end
 

@@ -835,10 +835,7 @@ function emitverifier(io::IO, alldecls)
         )
         println(io, "    t = _vtable(bytes, pos)")
         println(io, "    _vvisit!(ctx, \"", name, "\")")
-        println(
-            io,
-            "    depth <= ctx.maxdepth || _vfail(\"metadata nesting exceeds limit\")",
-        )
+        println(io, "    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)")
         print(io, String(take!(inline)))
         println(io, "    return t")
         println(io, "end")

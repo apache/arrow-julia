@@ -30,7 +30,7 @@ function verifyinline_Null(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Null")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -66,7 +66,7 @@ function verifyinline_Struct(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Struct")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -107,7 +107,7 @@ function verifyinline_List(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "List")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -143,7 +143,7 @@ function verifyinline_LargeList(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "LargeList")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -184,7 +184,7 @@ function verifyinline_ListView(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "ListView")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -225,7 +225,7 @@ function verifyinline_LargeListView(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "LargeListView")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -267,7 +267,7 @@ function verifyinline_FixedSizeList(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "FixedSizeList")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vfield(t, 0, 4)
     return t
 end
@@ -310,7 +310,7 @@ function verifyinline_Map(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Map")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vbool(t, 0)
     return t
 end
@@ -347,7 +347,7 @@ function verifyinline_Union(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Union")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001))
     return t
 end
@@ -385,7 +385,7 @@ function verifyinline_Int(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Int")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vfield(t, 0, 4)
     _vbool(t, 1)
     return t
@@ -423,7 +423,7 @@ function verifyinline_FloatingPoint(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "FloatingPoint")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001, 0x0000000000000002))
     return t
 end
@@ -466,7 +466,7 @@ function verifyinline_Utf8(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Utf8")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -502,7 +502,7 @@ function verifyinline_Binary(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Binary")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -543,7 +543,7 @@ function verifyinline_LargeUtf8(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "LargeUtf8")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -584,7 +584,7 @@ function verifyinline_LargeBinary(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "LargeBinary")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -626,7 +626,7 @@ function verifyinline_Utf8View(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Utf8View")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -667,7 +667,7 @@ function verifyinline_BinaryView(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "BinaryView")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -708,7 +708,7 @@ function verifyinline_FixedSizeBinary(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "FixedSizeBinary")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vfield(t, 0, 4)
     return t
 end
@@ -755,7 +755,7 @@ function verifyinline_Bool(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Bool")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -791,7 +791,7 @@ function verifyinline_RunEndEncoded(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "RunEndEncoded")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -833,7 +833,7 @@ function verifyinline_Decimal(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Decimal")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vfield(t, 0, 4)
     _vfield(t, 1, 4)
     _vfield(t, 2, 4)
@@ -877,7 +877,7 @@ function verifyinline_Date(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Date")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001))
     return t
 end
@@ -914,7 +914,7 @@ function verifyinline_Time(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Time")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(
         t,
         0,
@@ -957,7 +957,7 @@ function verifyinline_Timestamp(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Timestamp")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(
         t,
         0,
@@ -1005,7 +1005,7 @@ function verifyinline_Interval(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Interval")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001, 0x0000000000000002))
     return t
 end
@@ -1047,7 +1047,7 @@ function verifyinline_Duration(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Duration")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(
         t,
         0,
@@ -1094,7 +1094,7 @@ function verifyinline_KeyValue(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "KeyValue")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return t
 end
 
@@ -1137,7 +1137,7 @@ function verifyinline_DictionaryEncoding(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "DictionaryEncoding")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vfield(t, 0, 8)
     _vbool(t, 2)
     _venum(t, 3, 2, (0x0000000000000000,))
@@ -1188,7 +1188,7 @@ function verifyinline_Field(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Field")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vbool(t, 1)
     return t
 end
@@ -1317,7 +1317,7 @@ function verifyinline_Schema(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Schema")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001))
     return t
 end
@@ -1369,7 +1369,7 @@ function verifyinline_Footer(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Footer")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(
         t,
         0,
@@ -1427,7 +1427,7 @@ function verifyinline_BodyCompression(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "BodyCompression")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(t, 0, 1, (0x0000000000000000, 0x0000000000000001))
     _venum(t, 1, 1, (0x0000000000000000,))
     return t
@@ -1475,7 +1475,7 @@ function verifyinline_RecordBatch(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "RecordBatch")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vfield(t, 0, 8)
     return t
 end
@@ -1523,7 +1523,7 @@ function verifyinline_DictionaryBatch(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "DictionaryBatch")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vfield(t, 0, 8)
     _vbool(t, 2)
     return t
@@ -1573,7 +1573,7 @@ function verifyinline_Message(
 )
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Message")
-    depth <= ctx.maxdepth || _vfail("metadata nesting exceeds limit")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(
         t,
         0,
