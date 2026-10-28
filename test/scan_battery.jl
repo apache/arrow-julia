@@ -1559,7 +1559,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     publicbytes = take!(publicio)
     publicscan = Tables.Scan(
         select=(),
-        filter=Tables.colcmp(==, Tables.col(:d), Arrow.Dates.Month(1)),
+        filter=Tables.colcmp(==, Tables.col(:d), Arrow.Dates.Date(6_000_000, 1, 1)),
     )
     # The opened read needs 217,760 bytes and the remote path 258,700 here.
     publiclimits = Limits(max_total_allocated_bytes=238_000)

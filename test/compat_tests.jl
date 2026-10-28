@@ -97,6 +97,55 @@ const AC = Arrow.ArrowCore
     end
 end
 
+@testset "unknown keywords and mismatched filter literals are ArgumentErrors" begin
+    bytes = take!(Arrow.tobuffer((a=[1, 2], s=["x", "y"])))
+    msg(f) =
+        try
+            f()
+            ""
+        catch e
+            e isa ArgumentError ? e.msg : "not an ArgumentError: $(typeof(e))"
+        end
+    m = msg(() -> Arrow.write(IOBuffer(), (a=[1],); compression=:zstd))
+    @test occursin("unknown write keyword `compression` (use `compress`).", m)
+    @test occursin("The keywords are file, compress, compresslevel, batchsize", m)
+    m = msg(() -> Arrow.Writer(IOBuffer(); compression_level=3, nope=1))
+    @test occursin("keywords `compression_level` (use `compresslevel`), `nope`", m)
+    m = msg(() -> Arrow.append(Arrow.tobuffer((a=[1],)), (a=[2],); compression=:lz4))
+    @test occursin("unknown append keyword `compression` (use `compress`)", m)
+    m = msg(() -> Arrow.Table(bytes; columns=[:a]))
+    @test occursin("unknown read keyword `columns` (use `select`).", m)
+    @test occursin("The keywords are select, drop, filter, limit, scan", m)
+    @test occursin(
+        "`convert` (removed in Arrow 3.0",
+        msg(() -> Arrow.Table(bytes; convert=false)),
+    )
+    @test occursin(
+        "`use_threads` (use `ntasks`)",
+        msg(() -> Arrow.Stream(bytes; use_threads=true)),
+    )
+    @test occursin(
+        "`memory_map` (use `mmap`)",
+        msg(() -> Arrow.read(bytes, identity; memory_map=true)),
+    )
+    # Arrow 2.x's byte windows.
+    @test occursin(
+        "Arrow.Table(bytes[pos:pos+len-1])",
+        msg(() -> Arrow.Table(bytes, 1, 10)),
+    )
+    @test occursin("Arrow.Stream(bytes[pos:pos+len-1])", msg(() -> Arrow.Stream(bytes, 1)))
+    # A literal of another kind than its column, when the read binds the filter.
+    m = msg(() -> Arrow.Table(bytes; filter=Arrow.col(:s) > 1))
+    @test m == "the filter compares column s, which holds strings, with 1::Int64"
+    m = msg(() -> Arrow.Table(bytes; filter=Arrow.colin(Arrow.col(:a), ["1"])))
+    @test m == "the filter compares column a, which holds Int64 values, with \"1\"::String"
+    m = msg(() -> Arrow.Stream(bytes; filter=startswith(Arrow.col(:a), "1")))
+    @test m == "the filter matches text in column a, which holds Int64 values"
+    # Literals of the column's kind still read.
+    @test Arrow.Table(bytes; filter=Arrow.col(:a) > 1.5).a == [2]
+    @test Arrow.Table(bytes; filter=startswith(Arrow.col(:s), "y")).s == ["y"]
+end
+
 @testset "typed scan overrides for composite rows" begin
     NT = NamedTuple{(:a, :b),Tuple{Float64,String}}
     tbl = (; x=[1, 2], c=[(a=1.0, b="x"), (a=2.0, b="y")])

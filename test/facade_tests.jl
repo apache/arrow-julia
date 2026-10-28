@@ -1527,8 +1527,6 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
                 select=(:x,),
                 filter=Tables.colcmp(==, Tables.col(:ts), Date(2020, 1, 2)),
             ),
-            # raw integer vs a temporal column: never equal in public domain
-            Tables.Scan(select=(:x,), filter=Tables.colcmp(==, Tables.col(:d32), 1)),
             # non-midnight DateTime vs Date32: no exact representation
             Tables.Scan(
                 select=(:x,),
@@ -1541,6 +1539,12 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
                 got = Arrow.Table(bytes; scan=scan)
                 @test isequal(got.x, want.x)
             end
+        end
+        # A raw integer for a temporal column is refused when the scan binds,
+        # as any literal of another kind than its column is.
+        rawint = Tables.Scan(select=(:x,), filter=Tables.colcmp(==, Tables.col(:d32), 1))
+        for bytes in (fb, sb)
+            @test_throws ArgumentError Arrow.Table(bytes; scan=rawint)
         end
     end
 
@@ -1668,16 +1672,15 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test_throws InexactError Arrow.Table(copy(bytes); scan=overflow)
 
         # Scan planning must never execute a permissive conversion hook. An
-        # integer literal has no timestamp public representation, so the plan
-        # stays public and the hook is never consulted on either plan.
+        # integer literal has no timestamp public representation: binding
+        # refuses it without consulting the hook.
         field, bytes =
             rawtemporal(Arrow.AC.TimestampType(Arrow.AC.MICROSECOND, nothing), Int64[7])
         literal = _ScanHookInteger()
         hookscan = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), literal))
         _SCAN_HOOK_CALLS[] = 0
-        @test Arrow._ScanPlan(hookscan, [field]).storage === nothing
-        @test _SCAN_HOOK_CALLS[] == 0
-        @test isempty(Arrow.Table(copy(bytes); scan=hookscan).v)
+        @test_throws ArgumentError Arrow._ScanPlan(hookscan, [field])
+        @test_throws ArgumentError Arrow.Table(copy(bytes); scan=hookscan)
         @test _SCAN_HOOK_CALLS[] == 0
     end
 
@@ -1790,7 +1793,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
 
     @testset "lowering honors the facade comparison domain" begin
         # Sub-ms timestamps materialize as Timestamp{Microsecond}: a DateTime
-        # literal compares by instant, and raw integers are never equal.
+        # literal compares by instant, and a raw integer is refused.
         us = Union{Missing,Int64}[1_000_000, 2_000_000]
         f, d = Arrow.AC.fromjulia("us", us)
         t_us = Arrow.AC.TimestampType(Arrow.AC.MICROSECOND, nothing)
@@ -1812,24 +1815,16 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
                 x in Int64[1_000_000, 2_000_000]
             ],
         )
-        for (scan, matched) in (
-            (
-                Tables.Scan(
-                    filter=Tables.colcmp(
-                        ==,
-                        Tables.col(:us),
-                        DateTime(1970, 1, 1, 0, 0, 1),
-                    ),
-                ),
-                1,
-            ),
-            (Tables.Scan(filter=Tables.colcmp(==, Tables.col(:us), 2_000_000)), 0),
+        scan = Tables.Scan(
+            filter=Tables.colcmp(==, Tables.col(:us), DateTime(1970, 1, 1, 0, 0, 1)),
         )
-            want = Tables.scan(data, scan)
-            got = Arrow.Table(bytes; scan=scan)
-            @test isequal(got.us, want.us)
-            @test length(got.us) == matched
-        end
+        got = Arrow.Table(bytes; scan=scan)
+        @test isequal(got.us, Tables.scan(data, scan).us)
+        @test length(got.us) == 1
+        @test_throws ArgumentError Arrow.Table(
+            bytes;
+            scan=Tables.Scan(filter=Tables.colcmp(==, Tables.col(:us), 2_000_000)),
+        )
         # Out-of-range and cross-Period literals fall back, matching the
         # authority instead of throwing.
         pdata = (d=[Date(2024, 1, 1)], s=[Second(30)])
@@ -1950,14 +1945,15 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             scan = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:z), naive))
             @test_throws ArgumentError Arrow.Table(copy(zbytes); scan)
         end
+        # A raw integer, or a zoned literal against a zone-naive column, is
+        # refused when the scan binds.
         rawscan =
             Tables.Scan(filter=Tables.colcmp(==, Tables.col(:z), Dates.value(zcol[2])))
-        @test Arrow._ScanPlan(rawscan, [zfield]).storage === nothing
-        @test isempty(Arrow.Table(copy(zbytes); scan=rawscan).z)
-        # a zoned literal against a zone-naive column matches nothing
+        @test_throws ArgumentError Arrow._ScanPlan(rawscan, [zfield])
+        @test_throws ArgumentError Arrow.Table(copy(zbytes); scan=rawscan)
         nbytes = take!(Arrow.tobuffer((n=ncol,)))
         nscan = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:n), zcol[1]))
-        @test isempty(Arrow.Table(copy(nbytes); scan=nscan).n)
+        @test_throws ArgumentError Arrow.Table(copy(nbytes); scan=nscan)
         # a nanosecond zoned literal that truncates on a microsecond column
         # has no exact storage form; public evaluation still answers exactly
         sub = Zts{Nanosecond,:UTC}(Ts{Nanosecond}(zcol[2].utc) + Nanosecond(1), Dates.UTC)

@@ -332,7 +332,9 @@ function _writer(
     dictencodenested=nothing,
     denseunions=nothing,
     maxdepth=nothing,
+    unknown...,
 )
+    isempty(unknown) || _unknownkeywords("write", keys(unknown))
     for (name, value) in (
         (:alignment, alignment),
         (:dictencodenested, dictencodenested),
@@ -815,7 +817,9 @@ function _appendbytes(
     compresslevel::Union{Nothing,Integer}=nothing,
     batchsize::Integer=DEFAULT_BATCHSIZE,
     dictdeltas::Bool=false,
+    unknown...,
 )
+    isempty(unknown) || _unknownkeywords("append", keys(unknown))
     length(bytes) >= 6 &&
         view(bytes, 1:6) == FILE_MAGIC &&
         throw(
@@ -1038,6 +1042,46 @@ function _warnremovedkwarg(name::Symbol)
           "ignored; see docs/src/migration.md" _id = Symbol(:arrow_removed_kwarg_, name) maxlog =
         1
     return nothing
+end
+
+# Other tools' names for keywords (pyarrow, Polars) and Arrow 2.x's, for
+# the unknown-keyword error.
+const _KEYWORD_HINTS = Dict(
+    :compression => "use `compress`",
+    :compression_level => "use `compresslevel`",
+    :compressionlevel => "use `compresslevel`",
+    :max_chunksize => "use `batchsize`",
+    :chunksize => "use `batchsize`",
+    :columns => "use `select`",
+    :filters => "use `filter`",
+    :n_rows => "use `limit`",
+    :memory_map => "use `mmap`",
+    :use_threads => "use `ntasks`",
+    :convert => "removed in Arrow 3.0, which reads Julia values; see the migration guide",
+)
+
+const _KEYWORDS = Dict(
+    "write" =>
+        "file, compress, compresslevel, batchsize, dictencode, dictdeltas, " *
+        "largelists, stringview, metadata, colmetadata, and ntasks, plus nullable " *
+        "and dictreplacement for Arrow.Writer",
+    "append" => "compress, compresslevel, batchsize, and dictdeltas",
+    "read" => "select, drop, filter, limit, scan, mmap, stringtype, limits, and ntasks",
+)
+
+@noinline function _unknownkeywords(what::String, names)
+    listed = join(
+        (
+            haskey(_KEYWORD_HINTS, name) ? "`$name` ($(_KEYWORD_HINTS[name]))" : "`$name`" for name in names
+        ),
+        ", ",
+    )
+    throw(
+        ArgumentError(
+            "unknown $what keyword$(length(names) == 1 ? "" : "s") $listed. " *
+            "The keywords are $(_KEYWORDS[what])",
+        ),
+    )
 end
 
 "The bytes `Arrow.write` writes for `tbl`."

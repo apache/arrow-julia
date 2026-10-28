@@ -857,6 +857,74 @@ function _zonedbound(b::Tables.BoundScan, fields, names)
     return Tables.BoundScan(b.columns, filter, b.filtercols, b.limit, b.offset, b.validate)
 end
 
+# --- filter literal kinds --------------------------------------------------------
+# A literal of another kind than its column's values (a number for a string
+# column, say) is an ArgumentError naming the column when the scan binds, not a
+# MethodError once values are compared. Kinds: numbers, strings, characters,
+# local and zoned instants, times of day, periods; other values, and columns
+# with an extension label, are not checked.
+
+function _filterkind(f::AC.Field)
+    _hasarrowtypesextension(f) && return nothing
+    t = _lowerleaffield(f).type
+    t isa Union{AC.IntType,AC.FloatType,AC.BoolType,AC.DecimalType} && return :number
+    (t isa AC.Utf8Type || (t isa AC.ViewType && t.utf8)) && return :string
+    t isa AC.DateType && return :local
+    t isa AC.TimestampType && return _timestampzone(t) === nothing ? :local : :zoned
+    t isa AC.TimeType && return :time
+    t isa AC.DurationType && return :period
+    return nothing
+end
+
+_filterkind(::Type{T}) where {T} =
+    T <: Real ? :number :
+    T <: AbstractString ? :string :
+    T <: AbstractChar ? :char :
+    T <: Durations.ZonedTimestamp ? :zoned :
+    T <: _ZonelessTime ? :local :
+    T <: Dates.Time ? :time : T <: Dates.Period ? :period : nothing
+
+function _checkliterals(e, fields, names)
+    if e isa Union{Tables.Cmp,Tables.In,Tables.StrPred}
+        f = _fieldfor(fields, e.lhs.ref, names)
+        f === nothing && return nothing
+        kind = _filterkind(f)
+        kind === nothing && return nothing
+        ref = e.lhs.ref isa Integer ? names[e.lhs.ref] : e.lhs.ref
+        if e isa Tables.StrPred
+            kind === :string || throw(
+                ArgumentError(
+                    "the filter matches text in column $ref, which holds " *
+                    "$(_kindvalues(f, kind))",
+                ),
+            )
+        elseif e isa Tables.Cmp
+            _checkliteral(f, ref, kind, e.rhs)
+        elseif e.values isa Union{Tuple,AbstractArray,AbstractSet}
+            foreach(v -> _checkliteral(f, ref, kind, v), e.values)
+        end
+    elseif e isa Union{Tables.AndExpr,Tables.OrExpr}
+        foreach(a -> _checkliterals(a, fields, names), e.args)
+    elseif e isa Tables.NotExpr
+        _checkliterals(e.arg, fields, names)
+    end
+    return nothing
+end
+
+function _checkliteral(f::AC.Field, ref, kind::Symbol, value)
+    literal = _filterkind(typeof(value))
+    (literal === nothing || literal === kind) && return nothing
+    throw(
+        ArgumentError(
+            "the filter compares column $ref, which holds $(_kindvalues(f, kind)), " *
+            "with $(repr(value))::$(typeof(value))",
+        ),
+    )
+end
+
+_kindvalues(f::AC.Field, kind::Symbol) =
+    kind === :string ? "strings" : "$(Base.nonmissingtype(_declaredeltype(f))) values"
+
 """
 One scan plan resolved against one Arrow schema. `names` is the owned source
 schema identity used by every executor. `public` is the request in the public
@@ -1031,6 +1099,7 @@ function _ScanPlan(scan::Tables.Scan, fields, budget=nothing)
     compiled = _compileboundscan(scan, fields, budget)
     names = compiled.names
     b = _zonedbound(compiled.bound, fields, names)
+    _checkliterals(b.filter, fields, names)
     # The facade keeps zero-field sources on its metadata-count path. Avoid
     # compiling a storage form that no adapter will consume.
     isempty(fields) && return _ScanPlan(names, b, nothing)

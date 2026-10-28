@@ -77,7 +77,7 @@ end
             ((; file=:invalid), TypeError),
             ((; compress=1), TypeError),
             ((; dictreplacement=:invalid), TypeError),
-            ((; unknown=true), MethodError),
+            ((; unknown=true), ArgumentError),
         )
         mktempdir() do dir
             path = joinpath(dir, "existing.arrow")
@@ -169,7 +169,7 @@ end
                 for (options, error) in (
                     ((; compress=:invalid), ArgumentError),
                     ((; compress=1), TypeError),
-                    ((; unknown=true), MethodError),
+                    ((; unknown=true), ArgumentError),
                 )
                     write(path, original)
                     @test_throws error operation(path, table; options...)

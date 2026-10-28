@@ -1680,7 +1680,9 @@ function Table(
     stringtype::Type=DataStrings.DataString,
     limits::Limits=_defaultreaderlimits(source),
     ntasks::Integer=Threads.nthreads(),
+    unknown...,
 )
+    isempty(unknown) || _unknownkeywords("read", keys(unknown))
     scan = _scanrequest(select, drop, filter, limit, scan)
     readlimits = _readerlimits(source, limits)
     _checkstringtype(stringtype)
@@ -1749,6 +1751,18 @@ function Table(
     end
     return _tablefrom(opened, scan, budget; stringtype=stringtype, ntasks=ntasks)
 end
+
+# Arrow 2.x read a window of a byte vector as `Arrow.Table(bytes, pos, len)`.
+function _bytewindowerror(name)
+    throw(
+        ArgumentError(
+            "Arrow.$name(bytes, pos, len) was removed in Arrow 3.0; pass the bytes " *
+            "themselves, as Arrow.$name(bytes[pos:pos+len-1])",
+        ),
+    )
+end
+Table(::AbstractVector{UInt8}, ::Integer, ::Any=nothing; kwargs...) =
+    _bytewindowerror(:Table)
 
 # Windows cannot delete a file while it is mapped, and the facade unmaps
 # only when the table and its columns are garbage collected, so paths there
@@ -2247,7 +2261,9 @@ function Stream(
     stringtype::Type=DataStrings.DataString,
     limits::Limits=_defaultreaderlimits(source),
     ntasks::Integer=Threads.nthreads(),
+    unknown...,
 )
+    isempty(unknown) || _unknownkeywords("read", keys(unknown))
     scan = _scanrequest(select, drop, filter, limit, scan)
     readlimits = _readerlimits(source, limits)
     _checkstringtype(stringtype)
@@ -2275,6 +2291,9 @@ function Stream(
         scan,
     )
 end
+
+Stream(::AbstractVector{UInt8}, ::Integer, ::Any=nothing; kwargs...) =
+    _bytewindowerror(:Stream)
 
 function AC.release!(s::Stream)
     AC.release!(getfield(s, :closed))
