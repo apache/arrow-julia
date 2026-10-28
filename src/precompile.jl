@@ -16,7 +16,8 @@
 
 # Precompile workload: run the common write/read/scan shapes once during
 # package precompilation so first use does not pay their compilation cost.
-# Everything here is in-memory and deterministic — no files, no network.
+# Everything here is deterministic and in memory, except one temporary file
+# that is read by path; no network.
 # This file belongs to the top-level Arrow package only; the JuliaC trim gate
 # includes src/ArrowCore.jl standalone and must not see PrecompileTools.
 import PrecompileTools
@@ -81,6 +82,7 @@ PrecompileTools.@setup_workload begin
             ] for P in units
         )...,
         (Symbol(:d, nameof(P)) => Union{Missing,P}[P(1), missing] for P in units)...,
+        nduration=Union{Missing,Durations.Duration}[Durations.Duration(1, 2, 3), missing],
         # Nested columns: their per-batch builders compile once for every row
         # type, so these also leave a first nested read only its row loops.
         nlist=Union{Missing,Vector{Int64}}[[1], missing],
@@ -90,6 +92,39 @@ PrecompileTools.@setup_workload begin
         nstruct=Union{Missing,@NamedTuple{a::Int64,b::String}}[(a=1, b="x"), missing],
         nunion=Union{Int64,String}[1, "a"],
     )
+    # Units pyarrow writes and this writer does not (it writes dates in days and
+    # times in nanoseconds): date64, time32 in s and ms, and time64 in us,
+    # nullable, in two batches.
+    rawtypes = (
+        AC.DateType(AC.MILLISECOND_DATE),
+        AC.TimeType(AC.SECOND, 32),
+        AC.TimeType(AC.MILLISECOND, 32),
+        AC.TimeType(AC.MICROSECOND, 64),
+    )
+    rawschema = AC.Schema(
+        AC.Field[AC.Field("t$i", t; nullable=true) for (i, t) in enumerate(rawtypes)],
+    )
+    rawdata(t) = AC.ArrayData(
+        t,
+        2,
+        [
+            AC._bitmapbuffer([true, false]),
+            AC._databuffer(t isa AC.TimeType && t.bits == 32 ? Int32[1, 0] : Int64[1, 0]),
+        ];
+        nullcount=1,
+    )
+    rawbatch = AC.RecordBatch(rawschema, AC.ArrayData[rawdata(t) for t in rawtypes])
+    rawbytes = writefile(rawschema, [rawbatch, rawbatch])
+    # Reading a column: iterating, indexing, and copying it.
+    function readall(tbl)
+        for name in Tables.columnnames(tbl)
+            column = Tables.getcolumn(tbl, name)
+            foreach(identity, column)
+            isempty(column) || (column[begin]; column[end])
+            copy(column)
+        end
+        return nothing
+    end
     PrecompileTools.@compile_workload begin
         # The flat table goes out as two record batches, so its columns chain.
         # Reads of the file format, what `Arrow.Table(path)` reads.
@@ -98,11 +133,7 @@ PrecompileTools.@setup_workload begin
             write(io, table; file=true)
             flatbytes = take!(seekstart(io))
             tbl = Table(flatbytes)
-            for name in Tables.columnnames(tbl)
-                column = Tables.getcolumn(tbl, name)
-                foreach(identity, column)
-                copy(column)
-            end
+            readall(tbl)
             table === columns && continue
             # Writing what was read, column by column (a DataFrame of a read
             # table hands the writer these columns).
@@ -110,6 +141,12 @@ PrecompileTools.@setup_workload begin
             # A timestamp filter runs on stored integers.
             stamp = Tables.colcmp(>=, Tables.col(:nMicrosecond), Dates.DateTime(2020))
             Table(flatbytes; scan=Tables.Scan(filter=stamp))
+        end
+        readall(Table(rawbytes))
+        mktempdir() do dir
+            path = joinpath(dir, "flat.arrow")
+            write(path, Tables.partitioner((flat, flat)))
+            readall(Table(path))
         end
         io = IOBuffer()
         write(io, columns; file=true)
