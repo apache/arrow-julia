@@ -46,6 +46,11 @@ allocationsof(f, x) = (f(x); @allocated f(x))
 # The fewest bytes `f()` allocates over three calls: a collection that runs
 # finalizers or other tasks during one measurement adds to that one only.
 fewestbytes(f) = minimum(_ -> (@allocated f()), 1:3)
+# Bytes, and allocations, of one call. `@allocated` or `@allocations` written in
+# the testset below would make Julia compile the whole testset as one function
+# before running it, which takes minutes; it measures through these instead.
+callbytes(f, args...; kwargs...) = @allocated f(args...; kwargs...)
+callallocations(f, args...) = @allocations f(args...)
 
 function arrowbytes(table; kw...)
     io = IOBuffer()
@@ -125,7 +130,7 @@ end
                 @test eltype(t.d) == eltype(col)
                 @test isequal(collect(t.d), col)
                 # One bulk copy per column: no allocation per value.
-                @test (@allocations Arrow.Table(bytes)) < 10_000
+                @test callallocations(Arrow.Table, bytes) < 10_000
             end
         end
         # A decimal no `Decimal` type holds (a negative scale, or a scale above
@@ -491,7 +496,7 @@ end
         large = arrowbytes((a=collect(1:2_000_000), b=rand(2_000_000)); file=true)
         sel = Tables.Scan(select=(:a,))
         Arrow.Table(large; scan=sel)
-        @test (@allocated Arrow.Table(large; scan=sel)) < 200_000
+        @test callbytes(Arrow.Table, large; scan=sel) < 200_000
     end
 
     @testset "fixed-size binary wider than 256 bytes reads as DataBytes" begin
@@ -602,7 +607,7 @@ end
         nt = NamedTuple{Tuple(Symbol(:f, k) for k = 1:40)}(Tuple(1:40))
         bytes = arrowbytes((s=fill(nt, 10_000),))
         @test Arrow.Table(bytes).s[end] === nt
-        @test (@allocated Arrow.Table(bytes)) < 2 * 10_000 * sizeof(nt)
+        @test callbytes(Arrow.Table, bytes) < 2 * 10_000 * sizeof(nt)
         # Fixed-size lists of nullable values read as `ListValue`s: a tuple type
         # with `Missing` in it is abstract, so its rows would be boxed and a
         # rewrite would see up to 2^N runtime types.
@@ -755,7 +760,7 @@ end
         bytes = arrowbytes(tbl)
         Arrow.Table(bytes)
         # A boxed child value or row would cost an allocation each.
-        @test (@allocations Arrow.Table(bytes)) < 5_000
+        @test callallocations(Arrow.Table, bytes) < 5_000
         t = Arrow.Table(bytes)
         bsum(st) = sum(r -> ncodeunits(r.b), st)
         lsum(ls) = sum(r -> sum(ncodeunits, r), ls)
@@ -803,7 +808,7 @@ end
         large = arrowbytes((a=collect(1:2_000_000), b=rand(2_000_000)))
         Arrow.Table(small)
         Arrow.Table(large)
-        @test (@allocated Arrow.Table(large)) < (@allocated Arrow.Table(small)) + 100_000
+        @test callbytes(Arrow.Table, large) < callbytes(Arrow.Table, small) + 100_000
     end
 
     @testset "Arrow.read copies once into owned columns" begin

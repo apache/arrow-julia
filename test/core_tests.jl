@@ -26,6 +26,11 @@ function _cell_bump(p::Ptr{Cvoid})::Cvoid
     (unsafe_pointer_to_objref(p)::Base.RefValue{Int})[] += 1
     return nothing
 end
+# Its C pointer. A `@cfunction`, `@allocated`, or `@timed` written in a top-level
+# testset makes Julia compile that whole testset as one function before running
+# it, which takes minutes for "ArrowCore"; the testset calls these instead.
+_cell_bump_ptr() = @cfunction(_cell_bump, Cvoid, (Ptr{Cvoid},))
+_allocated(f, args...) = @allocated f(args...)
 
 using Arrow
 using Arrow.ArrowCore
@@ -315,7 +320,7 @@ end
             # Regions sharing one ReleaseCell are revoked together and the
             # release action runs exactly once.
             released = Ref(0)
-            cell = ReleaseCell(@cfunction(_cell_bump, Cvoid, (Ptr{Cvoid},)), released)
+            cell = ReleaseCell(_cell_bump_ptr(), released)
             v1, v2 = UInt8[1, 2], UInt8[3, 4]
             ra = GC.@preserve v1 OwnerRegion(pointer(v1), 2; root=v1, cell=cell)
             rb = GC.@preserve v2 OwnerRegion(pointer(v2), 2; root=v2, cell=cell)
@@ -1947,9 +1952,9 @@ end
         _build_bool_probe(plainbools)
         _build_bool_probe(nullablebools)
         GC.gc()
-        plainallocation = @allocated _build_bool_probe(plainbools)
+        plainallocation = _allocated(_build_bool_probe, plainbools)
         GC.gc()
-        nullableallocation = @allocated _build_bool_probe(nullablebools)
+        nullableallocation = _allocated(_build_bool_probe, nullablebools)
         @test plainallocation <= packedbytes + 256 * 1024
         @test nullableallocation <= 2 * packedbytes + 256 * 1024
         _, plainbooldata = _build_bool_probe(plainbools)
@@ -2115,11 +2120,11 @@ end
         # not only the logical payload.
         @noinline vectorprobe() = Vector{Int64}(undef, 4097)
         vectorprobe()
-        @test vectorbytes(Int64, 4097) >= @allocated vectorprobe()
+        @test vectorbytes(Int64, 4097) >= _allocated(vectorprobe)
         @noinline emptyvectorprobe() = UInt8[]
         emptyvectorprobe()
         @test vectorbytes(UInt8, 0) == 64
-        @test vectorbytes(UInt8, 0) >= @allocated emptyvectorprobe()
+        @test vectorbytes(UInt8, 0) >= _allocated(emptyvectorprobe)
 
         function exactbudget(read, needed)
             short = Arrow.AllocationBudget(needed - 1)

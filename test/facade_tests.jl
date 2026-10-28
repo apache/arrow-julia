@@ -192,6 +192,12 @@ end
 _tableallocs(bytes) = _requestedbytes(() -> Arrow.Table(bytes))
 _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
 
+# `@allocated` or `@timed` written in the testset below would make Julia compile
+# the whole testset as one function before running it, which takes minutes; it
+# measures through these instead.
+_allocated(f, args...) = @allocated f(args...)
+_timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
+
 @testset "Arrow facade" begin
     @testset "file round-trip with metadata" begin
         path = tempname()
@@ -515,7 +521,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             r = Arrow.Table(source).r
             @test length(r) == 999_999_999 && r[1] == 7 && r[end] == 7
         end
-        stats = @timed Arrow.Table(bytes)
+        stats = _timed(Arrow.Table, bytes)
         @test stats.value isa Arrow.Table
         @test stats.bytes < 64_000_000
     end
@@ -974,7 +980,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         needed = Arrow.AC._materializedvectorbytes(Union{Int32,Int64}, nvalues)
         for (field, values, expected) in membership_cases
             Arrow._lowermembership(field, values, nothing) # warm the closed kernel
-            @test (@allocated Arrow._lowermembership(field, values, nothing)) <= needed
+            @test _allocated(Arrow._lowermembership, field, values, nothing) <= needed
             exact = Arrow.AllocationBudget(needed)
             good, lowered = Arrow._lowermembership(field, values, exact)
             @test good && eltype(lowered) == Union{Int32,Int64}
@@ -993,7 +999,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         retainedneeded = Arrow.AC._materializedvectorbytes(Union{Missing,Int64}, nvalues)
         for (field, values, expected) in temporal_cases
             Arrow._retainedstorage(field.type, values, "temporal")
-            @test (@allocated Arrow._retainedstorage(field.type, values, "temporal")) <=
+            @test _allocated(Arrow._retainedstorage, field.type, values, "temporal") <=
                   retainedneeded
             @test all(
                 ==(Int64(expected)),
@@ -1043,11 +1049,12 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             nvalues *
             (Base.elsize(Vector{Union{Int32,Int64}}) + Base.elsize(Vector{Nothing}) + 16)
         Arrow._lowermembership(temporal_cases[1][1], setvalues, nothing)
-        @test (@allocated Arrow._lowermembership(
+        @test _allocated(
+            Arrow._lowermembership,
             temporal_cases[1][1],
             setvalues,
             nothing,
-        )) <= setneeded
+        ) <= setneeded
         exact = Arrow.AllocationBudget(setneeded)
         good, lowered = Arrow._lowermembership(temporal_cases[1][1], setvalues, exact)
         @test good
@@ -2203,7 +2210,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         # Warm first: compiling the scan is not part of the per-row cost.
         Arrow.Table(big; scan=Tables.Scan(filter=Tables.AlwaysTrue(), limit=1))
         stats =
-            @timed Arrow.Table(big; scan=Tables.Scan(filter=Tables.AlwaysTrue(), limit=1))
+            _timed(Arrow.Table, big; scan=Tables.Scan(filter=Tables.AlwaysTrue(), limit=1))
         @test Tables.rowcount(stats.value) == 1
         @test stats.bytes < 1_000_000
         # The metadata-only ranged read keeps the reader trust boundary: a
