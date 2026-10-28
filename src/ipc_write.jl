@@ -46,7 +46,6 @@
 # ---------------------------------------------------------------------------
 
 mutable struct EncodeState
-    lz4::Union{Nothing,LZ4FrameCompressor}
     zstd::Union{Nothing,ZstdCompressor}
     const level::Union{Nothing,Int}   # codec compression level; nothing = codec default
     # Compressed frames this state wrote for messages not yet published, and
@@ -56,7 +55,6 @@ mutable struct EncodeState
     const free::Vector{Vector{UInt8}}
 end
 EncodeState(level::Union{Nothing,Integer}=nothing) = EncodeState(
-    nothing,
     nothing,
     level === nothing ? nothing : Int(level),
     Vector{UInt8}[],
@@ -150,15 +148,20 @@ function _recycleframes!(states::Vector{EncodeState})
     return nothing
 end
 
-function _lz4c!(s::EncodeState)
-    if s.lz4 === nothing
-        c =
-            s.level === nothing ? LZ4FrameCompressor() :
-            LZ4FrameCompressor(; compressionlevel=s.level)
-        TS.initialize(c)
-        s.lz4 = c
+# One LZ4 frame of `raw` from a fresh context (about half a microsecond). A
+# reused context keeps its previous input's hash table (LZ4's fast reset),
+# which changes the output, so which task compressed which buffer would show
+# in the bytes.
+function _lz4frame(s::EncodeState, raw::TS.Buffer, out::Vector{UInt8})
+    c =
+        s.level === nothing ? LZ4FrameCompressor() :
+        LZ4FrameCompressor(; compressionlevel=s.level)
+    TS.initialize(c)
+    try
+        return transcode(c, raw, out)
+    finally
+        TS.finalize(c)
     end
-    return s.lz4::LZ4FrameCompressor
 end
 
 function _zstdc!(s::EncodeState)
@@ -171,15 +174,9 @@ function _zstdc!(s::EncodeState)
 end
 
 function Base.close(s::EncodeState)
-    lz4 = s.lz4
-    s.lz4 = nothing
-    try
-        lz4 === nothing || TS.finalize(lz4)
-    finally
-        zstd = s.zstd
-        s.zstd = nothing
-        zstd === nothing || TS.finalize(zstd)
-    end
+    zstd = s.zstd
+    s.zstd = nothing
+    zstd === nothing || TS.finalize(zstd)
     return nothing
 end
 
@@ -475,7 +472,8 @@ EncodeCursor(codec::Int8) = EncodeCursor(
     Int64[],
 )
 
-# One frame of the `len` bytes at `ptr`, compressed with `state`'s codec context.
+# One frame of the `len` bytes at `ptr`: LZ4 from a fresh context
+# (`_lz4frame`), Zstandard with `state`'s.
 function _compressbytes(state::EncodeState, codec::Int8, ptr::Ptr{UInt8}, len::Int)
     raw = TS.Buffer(unsafe_wrap(Array, ptr, len))
     out = isempty(state.free) ? UInt8[] : pop!(state.free)
@@ -484,7 +482,7 @@ function _compressbytes(state::EncodeState, codec::Int8, ptr::Ptr{UInt8}, len::I
     need = len + (len >> 7) + 1024
     length(out) < need && resize!(out, need)
     frame =
-        codec == CODEC_LZ4_FRAME ? transcode(_lz4c!(state), raw, out) :
+        codec == CODEC_LZ4_FRAME ? _lz4frame(state, raw, out) :
         transcode(_zstdc!(state), raw, out)
     push!(state.inuse, frame)
     return frame

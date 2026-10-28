@@ -3184,6 +3184,16 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             @test one == many
         end
         @test_throws ArgumentError Arrow.write(IOBuffer(), src; ntasks=0)
+        # Each task compresses with its own codec state, and which task gets
+        # which buffer varies; an LZ4 frame must not depend on what its
+        # task's state compressed before.
+        text = Vector{UInt8}(join(["str$(k % 1000)_" * "x"^(k % 13) for k = 1:50_000]))
+        lz4(st, v) = GC.@preserve v copy(
+            Arrow._compressbytes(st, Arrow.CODEC_LZ4_FRAME, pointer(v), length(v)),
+        )
+        fresh, used = Arrow.EncodeState(), Arrow.EncodeState()
+        lz4(used, reverse(text))
+        @test lz4(fresh, text) == lz4(used, text)
         # With several failing columns, the error is the first column's.
         for ntasks in (1, 4)
             err = try
