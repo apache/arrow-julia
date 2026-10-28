@@ -425,11 +425,11 @@ end
         @test eltype(t.m) == Arrow.MapRow{DataString,Int64}
         @test t.m == [["k" => 1], Pair{String,Int64}[], ["p" => 2]]
         # The element type alone fixes how children are stored: strings in a
-        # StringVector, structs lazily in a StructVector, maps as key and
-        # value columns, so no value is boxed.
+        # StringVector, fixed-width values in a Primitive view, structs lazily
+        # in a StructVector, maps as key and value columns, so no value is boxed.
         @test t.ls isa Arrow.ListVector && t.ls.values isa StringVector{DataString}
         @test t.st isa Arrow.StructVector &&
-              t.st.children[1] isa Vector{Int64} &&
+              t.st.children[1] isa Arrow.Primitive{Int64,Int64,Nothing} &&
               t.st.children[2] isa StringVector{DataString}
         @test t.m isa Arrow.MapVector && t.m.keys isa StringVector{DataString}
         @test t.ll.values isa Arrow.ListVector{Row{Int64}}
@@ -560,6 +560,32 @@ end
             @test allocationsof(bsum, t.st) == 0 && allocationsof(lsum, t.ls) == 0
         end
         @test t.st[end] == tbl.st[end] && t.ls[2] == ["2", "x"] && t.m[3] == ["3" => 3]
+    end
+
+    @testset "fixed-width nested children view the data read" begin
+        n = 200_000
+        tbl = (
+            l=[[i, i + 1, i + 2, i + 3] for i = 1:n],
+            st=[(a=Int32(i), c=i / 2) for i = 1:n],
+            m=[Dict(i => float(i)) for i = 1:n],
+        )
+        path = tempname()
+        Arrow.write(path, tbl)
+        Arrow.Table(path; mmap=true)
+        # Copies of the 4n list values, the struct fields, or the map entries
+        # would allocate 8 bytes or more each; list offsets cost 8 bytes a row.
+        @test (@allocated Arrow.Table(path; mmap=true)) < 2 * 8n + 1_000_000
+        t = Arrow.Table(path; mmap=true)
+        @test t.l == tbl.l && t.st == tbl.st && t.m[5] == [5 => 5.0]
+        # Rows keep the mapping they view alive.
+        row, st, entry = t.l[7], t.st, t.m[9]
+        Arrow.release!(t)
+        t = nothing
+        GC.gc(true)
+        GC.gc(true)
+        @test row == [7, 8, 9, 10] && st[n] == tbl.st[n] && entry == [9 => 9.0]
+        # Windows cannot delete a file while it is mapped.
+        Sys.iswindows() || rm(path)
     end
 
     @testset "an uncompressed open allocates independently of its size" begin

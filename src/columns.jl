@@ -1293,10 +1293,12 @@ end
 # element type alone fixes how its child values are stored (`_columntype`):
 # strings in a `StringVector`, binary in a `BytesVector`, lists in a
 # `ListVector`, maps in a `MapVector`, structs in a `StructVector`, other
-# values in a `Vector`. Columns keep their children untyped and read them back
-# through that type, so a column type has only its element type as a
-# parameter, however deep the schema, and access is type-stable. Child values
-# are copied out of the source, so a row stays valid after its table is gone.
+# fixed-width values in a `Primitive{E,S,Nothing}` (`S` the non-missing `E`),
+# other values in a `Vector`. Columns keep their children untyped and read
+# them back through that type, so a column type has only its element type as
+# a parameter, however deep the schema, and access is type-stable. A
+# fixed-width child whose stored layout is its values views the source, as a
+# top-level column does, and keeps it alive; other children are owned copies.
 
 const _NestedLayout = Union{
     AC.ListType,
@@ -1386,7 +1388,8 @@ end
 
 _columntype(::Type{T}) where {T} = _columntype(T, Base.nonmissingtype(T))
 _columntype(::Type{Missing}) = Vector{Missing}
-_columntype(::Type{T}, ::Type) where {T} = Vector{T}
+_columntype(::Type{T}, ::Type{S}) where {T,S} =
+    isbitstype(S) && S !== Bool ? Primitive{T,S,Nothing} : Vector{T}
 _columntype(::Type{T}, ::Type{DataStrings.DataString}) where {T} =
     DataStrings.StringVector{T}
 _columntype(::Type{T}, ::Type{DataStrings.DataBytes}) where {T} = DataStrings.BytesVector{T}
@@ -1530,6 +1533,28 @@ function _storeas(::Type{Vector{E}}, col, budget) where {E}
     _chargeexact!(budget, E, length(col), "nested child values")
     return copyto!(Vector{E}(undef, length(col)), 1, col, 1, length(col))
 end
+# Converted values (dates, dictionary or run-end encoded values, ...) stored
+# as `S`s, with a validity bitmap when some slot is null; null slots hold zero
+# bytes.
+function _storeas(::Type{Primitive{T,S,Nothing}}, col, budget) where {T,S}
+    n = length(col)
+    _chargeexact!(budget, S, n, "nested child values")
+    data = Vector{S}(undef, n)
+    GC.@preserve data Libc.memset(pointer(data), 0, sizeof(data))
+    validity = UInt8[]
+    for (i, x) in enumerate(col)
+        if x === missing
+            if isempty(validity)
+                _chargeexact!(budget, UInt8, cld(n, 8), "nested child validity")
+                validity = fill(0xff, cld(n, 8))
+            end
+            @inbounds validity[((i - 1) >> 3) + 1] &= ~(0x01 << ((i - 1) & 7))
+        else
+            @inbounds data[i] = x
+        end
+    end
+    return Primitive{T,S,Nothing}(data, validity, 0, nothing)
+end
 _storeas(::Type{DataStrings.StringVector{E}}, col, budget) where {E} =
     DataStrings.StringVector{E}(collect(col))
 function _storeas(::Type{DataStrings.BytesVector{E}}, col, budget) where {E}
@@ -1664,6 +1689,8 @@ function _listviewvector(
 end
 
 _gathered(values::Vector, take) = values[take]
+_gathered(v::Primitive{T,S,Nothing}, take) where {T,S} =
+    _storeas(Primitive{T,S,Nothing}, view(v, take), nothing)
 _gathered(v::DataStrings.StringVector{E}, take) where {E} =
     DataStrings.StringVector{E}(v.payloads[take], v.buffers, Val(:trusted))
 _gathered(v::DataStrings.BytesVector{E}, take) where {E} =

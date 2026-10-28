@@ -518,12 +518,14 @@ function _maprowviews(::Type{K}, ::Type{V}, rows; nullable::Bool=false) where {K
         end
         push!(spans, start:length(keys))
     end
-    C = Arrow._columntype(K)
-    kcol = keys isa C ? keys : C(keys)
+    # Rows read their keys and values back as the reader stores them.
+    store(::Type{E}, xs) where {E} =
+        (C = Arrow._columntype(E); xs isa C ? xs : Arrow._storeas(C, xs, nothing))
+    kcol, vcol = store(K, keys), store(V, values)
     M = Arrow.MapRow{K,V}
     T = nullable ? Union{Missing,M} : M
     return T[
-        row === missing ? missing : M(kcol, values, first(span) - 1, length(span)) for
+        row === missing ? missing : M(kcol, vcol, first(span) - 1, length(span)) for
         (row, span) in zip(rows, spans)
     ]
 end

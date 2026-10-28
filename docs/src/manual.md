@@ -235,10 +235,12 @@ value child:
 A composite column stores its children by their element types alone:
 strings in a `DataStrings.StringVector`, binary in a `BytesVector`, lists in an
 [`Arrow.ListVector`](@ref), maps in an [`Arrow.MapVector`](@ref), structs in an
-[`Arrow.StructVector`](@ref), other values in a `Vector`. No child value is
-boxed, and a struct row is built only when it is read. The children are the
-column's own copies, so a row stays valid after its table is gone;
-`copy(column)` gives `Vector{T}` rows (`Vector{Pair{K,V}}` for maps,
+[`Arrow.StructVector`](@ref), other fixed-width values in an
+[`Arrow.Primitive`](@ref), other values in a `Vector`. No child value is
+boxed, and a struct row is built only when it is read. Fixed-width children
+stored as their values view the data read, as a top-level column does; the
+other children are the column's own copies. A row keeps what it views alive,
+so it stays valid after its table is gone; `copy(column)` gives `Vector{T}` rows (`Vector{Pair{K,V}}` for maps,
 `NamedTuple`s for structs). Three kinds of field keep the dynamic path,
 which builds each row as a Julia value (list rows as `Vector{Any}`, struct
 rows as `Vector{Pair{String,Any}}` ordered name => value pairs): a struct
