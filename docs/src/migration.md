@@ -164,10 +164,10 @@ keeps or changes these Arrow 2.x features:
 | Arrow 2.x feature | Arrow 3.0 action |
 |---|---|
 | `Arrow.Writer` | Still works, reimplemented: an incremental writer for both formats. The first table written fixes the schema, with every field nullable; later tables must conform, with lossless widening. Dictionaries gain later tables' categories (written once at the end of a file, again whole in a stream; `dictdeltas=true` for delta batches). See [`Arrow.Writer`](@ref). |
-| `Arrow.append` | Still works for the IPC STREAM format, reimplemented. The file format refuses: produce it incrementally with `Arrow.Writer` or rewrite it. A dictionary that gains categories is written again whole (`dictdeltas=true` for a delta batch). |
+| `Arrow.append` | Still works for the IPC stream format, as in 2.x, reimplemented; a missing or empty sink starts a stream. The file format refuses: produce it incrementally with `Arrow.Writer` or rewrite it. A dictionary that gains categories is written again whole (`dictdeltas=true` for a delta batch). |
 | `table \|> Arrow.write(sink)` | Still works: the curried form is kept. |
 | `Arrow.tobuffer(table)` | Still works, and still emits the IPC stream format. |
-| `ntasks` | Accepted; encoding runs on one task, including in `Arrow.Writer`. |
+| `ntasks` | Kept: that many tasks build each batch's columns and compress its buffers (default `Threads.nthreads()`), in `Arrow.Writer` too. The output bytes are the same for any `ntasks`. |
 | `dictencode`, `largelists` | Kept: `dictencode` (Bool or column names) dictionary-encodes columns, `largelists=true` declares 64-bit offsets. |
 | `Arrow.ToArrow` | Import `ArrowTypes.ToArrow` directly when an explicit lazy conversion view is needed. Normal writes apply the mapping automatically. |
 
@@ -185,7 +185,10 @@ stream_bytes = take!(io)
 Use `file=true` when you need an IPC file with footer-based random access.
 
 Arrow 3.0 keeps `file`, `compress`, `dictencode`, `largelists`, `metadata`,
-and `colmetadata`, and adds `compresslevel`, `batchsize`, and `stringview`.
+`colmetadata`, and `ntasks`, and adds `compresslevel`, `batchsize`,
+`stringview`, and `dictdeltas`. `metadata` and `colmetadata` default to the
+table's DataAPI metadata. Strings must be valid UTF-8 (Arrow 2.x wrote any
+bytes); write other bytes as `Vector{UInt8}`.
 Compression is selected with `:lz4` or `:zstd`; passing an initialized
 compressor object is no longer supported. The Arrow 2.x `alignment`,
 `dictencodenested`, `denseunions`, and `maxdepth` writer keywords no longer
@@ -239,12 +242,11 @@ dictionary also retains its pool for rewrite.
 
 ## Supported write types
 
-The writer accepts fixed-width integers and floats, `Bool`, strings, supported
-`Dates` values, lists of supported core values, `NamedTuple` struct
-columns, and fresh heterogeneous Julia Union columns whose members are
-writable at that nesting depth. Fresh heterogeneous Unions use the canonical
-dense Arrow Union layout. See [Type mapping when writing](@ref) for the
-complete table.
+The writer accepts fixed-width integers and floats, `Bool`, strings, bytes,
+supported `Dates`, Durations, and DataDecimals values, and, nested to any
+depth, vectors (lists), `NTuple`s (fixed-size lists), `NamedTuple`s (structs),
+`Dict`s and `Pair` vectors (maps), and heterogeneous `Union`s (dense unions).
+See [Type mapping when writing](@ref) for the complete table.
 
 A `VersionNumber` column is written as strings labelled
 `JuliaLang.VersionNumber`. Arrow 3.0 reads it back as `VersionNumber` values;
@@ -286,11 +288,11 @@ order. A column that was replaced with an incompatible Julia type is rejected
 instead of being silently written under the old schema.
 
 A fresh Julia column with a heterogeneous declared `Union` element type is
-synthesized as a canonical dense Arrow Union. Materialization of an existing
-unregistered Arrow Union discards its child type IDs and offsets. Such a
-retained Union still fails clearly when rewritten from an `Arrow.Table`; the
-writer does not invent new routing under the retained schema. A registered
-ArrowTypes.jl logical type whose storage is a Union retains enough writer-side
+synthesized as a canonical dense Arrow Union. Rewriting an Arrow Union read by
+`Arrow.Table` keeps its mode, type ids, and children: each value goes back to
+the one child whose type it has. A Union with two children of one type cannot
+be rewritten that way, since the values do not say which child each came from,
+and is refused. A registered ArrowTypes.jl logical type whose storage is a Union retains enough writer-side
 type evidence to reconstruct the original child routing, including dense or
 sparse mode and type IDs. Sparse children use canonical hidden placeholder
 values outside their active rows. When `JuliaType` returns an abstract target,

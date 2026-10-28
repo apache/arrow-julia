@@ -37,7 +37,7 @@ tbl.b
 ```
 
 ```@contents
-Pages = ["manual.md", "migration.md", "reference.md"]
+Pages = ["manual.md", "writing.md", "migration.md", "reference.md"]
 Depth = 3
 ```
 

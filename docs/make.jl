@@ -34,6 +34,7 @@ makedocs(;
     pages=[
         "Home" => "index.md",
         "User Manual" => "manual.md",
+        "Writing" => "writing.md",
         "Migrating from 2.x" => "migration.md",
         "API Reference" => "reference.md",
     ],

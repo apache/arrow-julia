@@ -200,8 +200,8 @@ end
 
 """
     Arrow.Writer(sink; file=true, compress=nothing, compresslevel=nothing,
-                 batchsize=1_048_576, largelists=false, stringview=false,
-                 nullable=true, metadata=nothing, colmetadata=nothing,
+                 batchsize=1_048_576, dictencode=false, largelists=false,
+                 stringview=false, nullable=true, metadata=nothing, colmetadata=nothing,
                  dictdeltas=false, dictreplacement=false, ntasks=Threads.nthreads())
     Arrow.Writer(f::Function, sink; kwargs...)
 

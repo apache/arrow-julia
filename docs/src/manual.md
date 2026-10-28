@@ -394,225 +394,20 @@ Without a scan the whole object is read, as is a stream-format object (no
 footer) and a scan that cannot be pushed down. Arrow.jl has no HTTP or
 cloud dependency of its own.
 
-## [Writing](@id manual-writing)
+## Writing
 
-### `Arrow.write`
-
-[`Arrow.write`](@ref) writes any Tables.jl-compatible source to a path or
-an `IO`:
+[`Arrow.write`](@ref) writes any Tables.jl source to a path or an `IO`, and
+[`Arrow.Writer`](@ref) and [`Arrow.append`](@ref) write tables as they arrive:
 
 ```julia
-Arrow.write("out.arrow", tbl)              # file format (ARROW1 + footer)
-Arrow.write(io, tbl; file = false)          # stream format
-Arrow.write("out.arrow", tbl; compress = :zstd)     # or :lz4
-Arrow.write("out.arrow", tbl; compress = :zstd, compresslevel = 9)
-Arrow.write("out.arrow", tbl; batchsize = 100_000, dictencode = [:city])
-Arrow.write("out.arrow", tbl;
-    metadata = ["source" => "sensor-7"],
-    colmetadata = Dict(:temp => ["unit" => "C"]))
+Arrow.write("out.arrow", df; compress = :zstd)
 ```
 
-Each `Tables.partitions` partition of the source becomes one or more record
-batches of at most `batchsize` rows (default 1,048,576), so
-`Arrow.write(sink, Arrow.Stream(path))` and
-`Arrow.write(sink, Tables.partitioner(...))` preserve batch boundaries. A batch
-whose strings, bytes, or lists would pass the 2 GiB that 32-bit offsets address
-is cut smaller; `largelists = true` declares 64-bit offsets (LargeUtf8,
-LargeBinary, LargeList) instead. `dictencode` dictionary-encodes every column
-(`true`) or the named ones.
+The [Writing](@ref manual-writing) page covers the keywords, batches and
+partitions, nullability, compression, threads, strings, dictionary encoding,
+incremental writing, metadata, and the type each Julia type writes as.
 
-The writer streams: each partition is read, encoded, and published before the
-next one is requested, so `Arrow.write("big.arrow", CSV.Chunks("big.csv"))`
-holds about one partition at a time. A source with several partitions takes its
-schema from the first partition, with every field nullable; later partitions
-must conform to it (numbers widen losslessly, missing values fill nullable
-fields) and dictionary columns gain categories as for [`Arrow.Writer`](@ref).
-Use `Arrow.Writer` when
-tables arrive one at a time. Columns read by Arrow.jl write back cheaply: a
-fixed-width or Bool column writes the buffers it was read from.
-
-`compress` applies per-buffer LZ4 frame or Zstandard compression as
-defined by the IPC specification (buffers that do not shrink are stored
-raw). Compressed files are readable by every implementation that supports
-IPC compression.
-
-### Incremental writing and stream append
-
-[`Arrow.Writer`](@ref) publishes each table's batches before the next table
-is supplied, so it holds at most one partition of the current table in memory:
-
-```julia
-Arrow.Writer("out.arrow") do writer
-    for table in tables
-        Arrow.write(writer, table)
-    end
-end
-```
-
-The first table fixes the schema, with every field declared nullable (pass
-`nullable=false` to keep the first table's nullability). Later tables must have
-the same columns in the same order and types that fit: numbers widen losslessly
-(`Int32` into `Int64`), an all-missing column writes nulls, and anything else is
-refused with an error naming the column. Dictionary-encoded columns keep one
-dictionary across tables, and later tables' new categories extend it. A file
-writes each dictionary once, complete, when the writer closes; a stream writes
-a dictionary again, whole, when it gains categories. pyarrow and Polars read
-both. `dictdeltas = true` writes delta dictionary batches instead (only the new
-categories), which pyarrow reads and Polars 1.43 refuses. Closing the writer
-finishes the output; an abandoned writer can leave a torn stream or a file
-without its footer.
-
-[`Arrow.append`](@ref) extends an existing IPC stream in place, with the same
-rules for later tables. It refuses the IPC file format, whose footer must be
-written when the file is closed.
-
-### Dictionary encoding
-
-Wrap a column in [`Arrow.DictEncode`](@ref) to write it dictionary-encoded
-(a category pool plus integer indices), which is what a categorical or
-low-cardinality string column wants:
-
-```julia
-Arrow.write("out.arrow", (region = Arrow.DictEncode(regions), sales = sales))
-```
-
-A column with a `DataAPI.refpool`, such as a `PooledArray` or a
-`CategoricalArray`, is written dictionary-encoded without the wrapper. Its
-pool, in pool order and including unused entries, starts the Arrow dictionary.
-Pool values that are wrappers without an ArrowTypes.jl mapping, such as
-`CategoricalValue`, are written through `DataAPI.unwrap`. An ordered
-`CategoricalArray` writes an ordered dictionary. `Arrow.write` uses the
-narrowest index type that holds the categories (`Int8` up to 128); an
-[`Arrow.Writer`](@ref), whose dictionaries grow across tables, uses `Int32`.
-
-Reading a dictionary-encoded column resolves the indices: the column comes
-back as its value type. When a `Table` read from Arrow is written again,
-its dictionary encoding is preserved. Fresh `DictEncode` output coalesces
-categories by exact Arrow storage identity. A retained rewrite preserves the
-source pool prefix, including unused or duplicate physical categories, because
-pool order and index meaning are part of the encoded data.
-
-### Type mapping when writing
-
-Writing maps Julia element types to Arrow types. The *core* domain — what
-can appear at any nesting depth — is:
-
-| Julia element type | Arrow type |
-|---|---|
-| `Int8`…`Int64`, `UInt8`…`UInt64` | the same-width integer |
-| `Float16/32/64` | the same-width float |
-| `Bool` | Bool |
-| `String` | Utf8 |
-| `Vector{UInt8}` and any other `AbstractVector{UInt8}` (`DataBytes`, `CodeUnits`) | Binary |
-| `Vector{T}` for any other core `T` | List of the mapping of `T` |
-| `Union{Missing, T}` for core `T` | the mapping of `T`, nullable |
-| `Union{T1, T2, ...}` with two or more non-`Missing` writable member types | canonical dense Union with one child per declared member type |
-| `Missing` | Null |
-
-The dense Union mapping applies to freshly supplied Julia data. Each member
-uses the same recursive core or ArrowTypes.jl mapping that it would use at
-that nesting depth. A `Missing` member is represented by a Null child. A
-Union may have at most 32 declared members.
-
-An abstract or `Any` element type does not declare those member types. When
-Arrow.jl must infer writer or storage types from runtime values, it accepts at
-most 8 distinct types in a column (in each partition of a source with several).
-This rule includes abstract ArrowTypes.jl storage, dictionary pools, and
-retained registered ArrowTypes.jl columns. Use an explicit declared `Union`
-when a column intentionally has more types. This separate limit bounds
-schema-planning and compiler work for runtime-generated parametric types; it
-does not reduce the 32-member declared Union limit.
-
-If an abstract declaration has no `ArrowType` mapping or extension identity of
-its own, Arrow uses its observed concrete subtypes as writer evidence. This
-keeps a concrete subtype's extension metadata. Multiple observed subtypes form
-an explicit Union under the same 8-type inference limit. An empty abstract
-column still needs declared schema evidence because it has no runtime subtype.
-
-At every depth of a column the facade adds:
-
-| Julia element type | Arrow type |
-|---|---|
-| any other `AbstractString` (e.g. `SubString`) | Utf8 |
-| `NTuple{N,UInt8}` | FixedSizeBinary(N) |
-| `UUIDs.UUID` | canonical `arrow.uuid` extension (FixedSizeBinary(16), big-endian bytes) |
-| `Int128`, `UInt128` | FixedSizeBinary(16), little-endian, labelled `JuliaLang.Int128`/`JuliaLang.UInt128` |
-| `Dates.Date` | Date32 |
-| `Dates.DateTime` | Timestamp (millisecond) |
-| `Dates.Time` | Time64 (nanosecond) |
-| `Dates.Second/Millisecond/Microsecond/Nanosecond` | Duration of that unit |
-| `Dates.Week/Day/Hour/Minute` | Duration (second), labelled `JuliaLang.Dates.Week` etc. so it reads back as the same type |
-| `Dates.Month/Year` | Interval (year-month), labelled `JuliaLang.Dates.Month`/`Year` |
-| `Durations.Timestamp{P}` | Timestamp of that unit, no timezone |
-| `Durations.ZonedTimestamp{P,Z}` | Timestamp of that unit with timezone `String(Z)` (one zone per column; `Durations.astimezone` normalizes) |
-| `NamedTuple` whose fields are core columns | Struct; `Union{Missing, T}` adds parent validity while child nullability stays declared |
-| `Arrow.DictEncode` over a writable column | Dictionary of the recursive mapping of its values |
-| `DataStrings.StringVector`, `DataStrings.BytesVector` | Utf8, Binary (Utf8View, BinaryView with `stringview=true`; see below) |
-
-These native facade conversions recurse through list and struct shapes: a
-`Vector{Date}` inside a list, or a `SubString` or `Timestamp{Nanosecond}`
-field of a `NamedTuple`, writes the same descriptor it writes at the top
-level; an element type with no writable mapping is refused with an
-`ArgumentError` naming it. A
-top-level `DictEncode` pool uses the same native column mapping as an ordinary
-top-level column. The ArrowTypes.jl mappings described below do recurse. A
-column with element type `Any`, or another abstract type no single Arrow type
-holds (`Real`, say), is narrowed from its values: one runtime type writes as
-that type, several (at most 8) as a dense Union of them. An abstract
-`Timestamp`, `ZonedTimestamp`, or `Decimal` column narrows only when every value
-has the same type, since one Arrow column has one unit, zone, or precision.
-
-Strings write as Utf8 and bytes as Binary by default, the types every reader
-supports. `stringview=true` (on `Arrow.write` and `Arrow.Writer`) writes them as
-Utf8View/BinaryView instead.
-When the source is an `Arrow.Table` or `Arrow.Stream`, the writer retains the
-compatible Arrow descriptor tree. Temporal units, byte and list widths,
-Struct, Map, Run-End Encoding, nullability, field metadata, schema metadata,
-and top-level dictionary index types and category order survive a read/write
-round trip. Automatically inherited batch statistics are dropped as described
-above. Buffer sharing, overlapping ListView ranges, and exact run
-segmentation are rebuilt into a canonical form without changing logical
-values. A retained Map that declares sorted keys is rewritten only when each
-row remains sorted.
-
-A fresh Julia column with a heterogeneous declared `Union` element type is
-synthesized as a canonical dense Arrow Union. This is distinct from rewriting
-a retained Union. Once an unregistered Arrow Union is materialized, its
-original child type IDs and offsets are no longer present in the Julia values.
-Writing that retained Union from an `Arrow.Table` fails with a clear
-`ArgumentError` instead of inventing new routing under the old schema.
-
-A registered ArrowTypes.jl target is different. Its public-domain values keep
-writer-side type evidence. When that type lowers to Union storage, Arrow.jl can
-route each value back through the retained children and preserve external child
-order, labels, type IDs, dense or sparse mode, nullability, and metadata. Sparse
-children use canonical hidden placeholder values outside their active rows.
-This also works when `JuliaType` returns an abstract read target and concrete
-writer subtypes provide the storage mapping. A concrete subtype may omit an
-extension identity or use the retained parent's identity. A different explicit
-extension name or metadata is rejected instead of being silently relabeled. An
-outer missing value uses a separate unmarked Null child.
-If the logical storage Union already contains `Missing`, adding an outer missing
-state is rejected because Arrow cannot distinguish the two states.
-
-Registered values can also rebuild compatible retained storage descriptors.
-This includes binary and binary-view widths, fixed-size binary, list and
-fixed-size-list layouts, date and duration units, wide decimals, and interval
-layouts. The retained descriptor remains authoritative. Byte widths, list
-sizes, temporal exactness, child fields, and interval storage shapes are
-checked before output is written. Concrete declared element types provide the
-same schema evidence for empty and typed all-missing columns, so those columns
-cannot bypass retained-schema checks.
-
-A nested dictionary has the same fail-closed rule as an unregistered Union
-because its pool is not retained. Top-level dictionaries, including
-dictionaries of composite values, are retained on a full read. A scan result
-may not carry the hidden source pool; an ordered dictionary then fails instead
-of inventing category order. A nullable `Dictionary<Null>` with an unknown
-extension also fails closed: after materialization, `missing` cannot say whether
-the source row was a valid index into the Null pool or a null dictionary index.
-
-### Custom and extension types
+## Custom and extension types
 
 Arrow 3.0 applies [ArrowTypes.jl](https://github.com/apache/arrow-julia/tree/main/src/ArrowTypes)
 mappings automatically. Import ArrowTypes.jl directly and declare it as a
@@ -707,7 +502,7 @@ retained Field and the required logical length. Arrow does not manufacture a
 Julia object for every hidden child slot. This keeps Null-only fixed-size-list
 and inactive sparse-Union storage bounded by the bytes the output requires.
 
-### DataStrings columns
+## DataStrings columns
 
 [DataStrings.jl](https://github.com/JuliaData/DataStrings.jl)
 (registered in General) defines
