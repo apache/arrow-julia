@@ -1309,6 +1309,9 @@ const _NestedLayout = Union{
     AC.UnionType,
 }
 const _MAX_ROW_FIELDS = 64
+# Each level nests a `Union{Missing,...}` in the row type, and the first read's
+# compile time grows steeply with it: on Julia 1.13, lists 10 deep take about
+# 1.5 s, 17 deep about 50 s, and structs 32 deep over 8 minutes.
 const _MAX_ROW_DEPTH = 8
 const _MAX_TUPLE_ROW = 64
 
