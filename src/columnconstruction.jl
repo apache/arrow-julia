@@ -664,39 +664,91 @@ function _mappart(name::String, v::AbstractVector, context)
 end
 
 """
-The values of a retained Union column routed to its children, or nothing
-when some value fits no child or several. A value goes to the one child whose
-layout a column of its type would write as; a missing value to the first Null
-child, else the first nullable one. Typed Union rows (as `Arrow.Table` reads
-them) route; children of one layout cannot be told apart and do not.
+A retained Union column built from public values, or nothing when some value
+fits none of the union's children or several. A value goes to the one child
+whose layout a column of its type would write as (or to a union child that
+takes it); a missing value to the first Null child, else the first nullable
+one. Typed Union rows (as `Arrow.Table` reads them) route; children of one
+layout cannot be told apart and do not. Each child then builds from its values
+as a composite's child does, so values that lower to storage (dates, extension
+types) lower there.
 """
-function _routeunion(f::AC.Field, v::AbstractVector, context)
-    any(x -> x isa _WriterRoutedUnion || x === _RETAINED_HIDDEN, v) && return nothing
+function _constructfacadeunion(f::AC.Field, v::AbstractVector, context)
+    t = f.type::AC.UnionType
     children = f.children
+    n = length(v)
+    length(t.typeids) == length(children) && n <= typemax(Int32) || return nothing
     routes = IdDict{Type,Int}()
-    routed = Vector{_WriterRoutedUnion}(undef, length(v))
+    route = Vector{Int}(undef, n)
     for (i, x) in enumerate(v)
-        if x === missing
-            k = something(
+        if x === _RETAINED_HIDDEN
+            # A slot hidden by a null parent; any child may hold it.
+            route[i] = 0
+            continue
+        end
+        k = if x === missing
+            something(
                 findfirst(c -> c.type isa AC.NullType, children),
                 findfirst(c -> c.nullable, children),
-                Some(nothing),
+                0,
             )
-            k === nothing && return nothing
         else
-            T = typeof(x)
-            k = get(routes, T, 0)
-            if k == 0
-                probe = first(_constructpart("probe", T[x]; context))
-                matches = findall(c -> _asretained(c, probe) !== nothing, children)
-                length(matches) == 1 || return nothing
-                k = routes[T] = only(matches)
+            get!(routes, typeof(x)) do
+                probe = first(_constructpart("probe", typeof(x)[x]; context))
+                matches = findall(c -> _unionfits(c, probe), children)
+                length(matches) == 1 ? only(matches) : 0
             end
         end
-        routed[i] = _WriterRoutedUnion(k, x)
+        k == 0 && return nothing
+        route[i] = k
     end
-    return routed
+    sparse = t.mode == AC.SparseMode
+    hiddenchild =
+        any(iszero, route) ? _writerhiddenunionchild(f; forcevalid=false, inactive=true) : 0
+    typeids = Vector{Int8}(undef, n)
+    offsets = sparse ? nothing : Vector{Int32}(undef, n)
+    childvalues = [Any[] for _ in children]
+    for (i, x) in enumerate(v)
+        k = route[i] == 0 ? hiddenchild : route[i]
+        typeids[i] = t.typeids[k]
+        if sparse
+            for j in eachindex(children)
+                push!(childvalues[j], j == k ? x : _RETAINED_HIDDEN)
+            end
+        else
+            offsets[i] = length(childvalues[k])
+            push!(childvalues[k], x)
+        end
+    end
+    fields = AC.Field[]
+    datas = AC.ArrayData[]
+    for (c, vals) in zip(children, childvalues)
+        # Narrowed values take the typed builders; hidden slots stay boxed.
+        any(x -> x === _RETAINED_HIDDEN, vals) ||
+            isempty(vals) ||
+            (vals = map(identity, vals))
+        cf, cd = _retainedchildcolumn(c, vals, context)
+        push!(fields, cf)
+        push!(datas, cd)
+    end
+    field = AC.Field(
+        f.name,
+        t;
+        nullable=f.nullable,
+        metadata=_fieldmetadata(f),
+        children=fields,
+    )
+    buffers =
+        sparse ? AC.BufferSlice[AC._databuffer(typeids)] :
+        AC.BufferSlice[AC._databuffer(typeids), AC._databuffer(offsets)]
+    return field, AC.ArrayData(t, n, buffers; children=datas, nullcount=0)
 end
+
+# A child takes a value whose fresh field it matches, or, when the child is a
+# union itself, that one of its children takes.
+_unionfits(c::AC.Field, probe::AC.Field) =
+    _asretained(c, probe) !== nothing ||
+    c.type isa AC.UnionType && any(cc -> _unionfits(cc, probe), c.children)
 
 # Rows with `Any` element or field types (the retained builders' own
 # intermediate rows among them) rebuild under the retained field.
@@ -5250,6 +5302,8 @@ function _retainedchildcolumn(f::AC.Field, values, context::_WriterContext)
         prepared = Any[x === _RETAINED_HIDDEN ? hidden : x for x in values]
         return _constructpart(f, prepared; context)
     end
+    # Public union rows route to their children in `_constructretainedpart`.
+    f.type isa AC.UnionType && !context.lowered && return _constructpart(f, values; context)
     if any(x -> x === _RETAINED_HIDDEN, values)
         if _retainedcontainer(f.type)
             # Preserve hidden state until recursive construction reaches a leaf.
@@ -5764,10 +5818,6 @@ function _constructpart(
         t isa AC.ListType ? :list :
         t isa AC.FixedSizeListType ? :fixedlist :
         t isa AC.StructType ? :struct : t isa AC.MapType ? :map : nothing
-    if t isa AC.UnionType && !context.lowered
-        routed = _routeunion(f, v, context)
-        routed === nothing || return _constructwriterunion(f, routed, context)
-    end
     R = Base.nonmissingtype(eltype(v))
     if kind !== nothing &&
        !context.lowered &&
@@ -5965,6 +6015,8 @@ function _constructretainedpart(
 )
     _checkretainedidentity(f, t, v)
     all(x -> x isa _WriterRoutedUnion, v) && return _constructwriterunion(f, v, context)
+    built = context.lowered ? nothing : _constructfacadeunion(f, v, context)
+    built === nothing || return built
     throw(
         ArgumentError(
             "column $(f.name) is an Arrow union, and some of its values fit none or " *

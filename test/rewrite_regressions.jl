@@ -417,14 +417,10 @@ end
         unionschema = AC.Schema([unionfield])
         unionbytes =
             Arrow.writestream(unionschema, [AC.RecordBatch(unionschema, [uniondata], 2)])
-        err = try
-            Arrow.write(IOBuffer(), Arrow.Table(unionbytes); file=false)
-            nothing
-        catch e
-            e
-        end
-        @test err isa ArgumentError
-        @test occursin("cannot be recovered", sprint(showerror, err))
+        # Each value goes back to the child of its type, under the same field.
+        unionback = Arrow.readstream(_rewrite(unionbytes))
+        @test Arrow._fieldcontractequal(unionback.schema.fields[1], unionfield)
+        @test isequal(collect(Arrow.Table(_rewrite(unionbytes)).u), [1, "x"])
     end
 
     @testset "metadata duplicates and order survive" begin

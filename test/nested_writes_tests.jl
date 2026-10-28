@@ -21,6 +21,7 @@ module NestedWritesTests
 
 using Test
 using Arrow
+using Dates
 using Tables
 
 const AC = Arrow.AC
@@ -272,6 +273,49 @@ end
         e
     end
     @test err isa ArgumentError && occursin("fit none or several", err.msg)
+end
+
+@testset "union children lower their values, nested and inside unions" begin
+    ut = AC.UnionType(AC.SparseMode, Int8[0, 1])
+    rewrite(f, d, n) = begin
+        sch = AC.Schema([f])
+        src = Arrow.Table(Arrow.writestream(sch, [AC.RecordBatch(sch, [d], n)]))
+        back = roundtrip(src)
+        @test Arrow._fieldcontractequal(field(back), field(src))
+        @test isequal(collect(Tables.getcolumn(back, 1)), collect(Tables.getcolumn(src, 1)))
+        return back
+    end
+    sparse(children, ids, fields) = (
+        AC.Field("u", ut; children=fields),
+        AC.ArrayData(ut, length(ids), [AC._databuffer(ids)]; children),
+    )
+    # A date child: its values lower to days, not stored as they read.
+    datef, dated = AC.fromjulia("d", Int32[19000, 0, 19002])
+    datef = AC.Field("d", AC.DateType(AC.DAY))
+    dated = AC.ArrayData(AC.DateType(AC.DAY), 3, dated.buffers)
+    strf, strd = AC.fromjulia("s", ["", "two", ""])
+    uf, ud = sparse([dated, strd], Int8[0, 1, 0], [datef, strf])
+    back = rewrite(uf, ud, 3)
+    @test collect(back.u) == [Dates.Date(2022, 1, 8), "two", Dates.Date(2022, 1, 10)]
+    # The same union as a struct field, and as list values.
+    sf = AC.Field("st", AC.StructType(); children=[uf])
+    sd = AC.ArrayData(AC.StructType(), 3, [AC.BufferSlice()]; children=[ud])
+    rewrite(sf, sd, 3)
+    lt = AC.ListType(false)
+    lf = AC.Field("l", lt; children=[uf])
+    ld = AC.ArrayData(
+        lt,
+        2,
+        [AC.BufferSlice(), AC._databuffer(Int32[0, 1, 3])];
+        children=[ud],
+    )
+    rewrite(lf, ld, 2)
+    # A union whose first child is itself a union.
+    intf, intd = AC.fromjulia("i", Int32[7, 8, 9])
+    of, od = sparse([ud, intd], Int8[0, 1, 0], [uf, intf])
+    back = rewrite(of, od, 3)
+    @test collect(Tables.getcolumn(back, 1)) ==
+          [Dates.Date(2022, 1, 8), 8, Dates.Date(2022, 1, 10)]
 end
 
 end # module NestedWritesTests
