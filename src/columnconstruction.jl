@@ -5930,8 +5930,11 @@ function _retainedmap(f::AC.Field, v::AbstractVector, context::_WriterContext)
     values = Any[]
     for (i, row) in enumerate(v)
         if row !== missing && row !== _RETAINED_HIDDEN
-            row isa AbstractVector || throw(
-                ArgumentError("column $(f.name) retained map rows must be Pair vectors"),
+            # Read map rows (`MapValue`) are dictionaries of their entries.
+            row isa Union{AbstractVector,AbstractDict} || throw(
+                ArgumentError(
+                    "column $(f.name) retained map rows must be Pair vectors or dictionaries",
+                ),
             )
             length(keys) <= typemax(Int32) - length(row) || throw(
                 ArgumentError("column $(f.name) map entries exceed the Int32 offset range"),

@@ -99,8 +99,8 @@ asdict(x) = x === missing ? missing : Dict(x)
         pairs = [["k" => 1, "k" => 2, "a" => 3], Pair{String,Int}[]]
         tp = roundtrip((m=pairs,))
         @test field(tp).type isa AC.MapType
-        @test collect(tp.m) == pairs
-        @test eltype(tp.m) <: AbstractVector{<:Pair}
+        @test collect.(tp.m) == pairs
+        @test eltype(tp.m) <: Arrow.MapValue
         # Any vector type of Pairs is a map row (Parquet's MapValue, say).
         own = [PairRow(["a" => 1]), PairRow(["b" => 2, "c" => 3])]
         to = roundtrip((m=own, l=[[own[1]], [own[2], own[1]]]))

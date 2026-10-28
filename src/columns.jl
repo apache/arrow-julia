@@ -1513,13 +1513,17 @@ struct ListValue{T} <: AbstractVector{T}
 end
 
 """
-    Arrow.MapValue{K,V} <: AbstractVector{Pair{K,V}}
+    Arrow.MapValue{K,V} <: AbstractDict{K,V}
 
-A row of a map column: its entries as `key => value` pairs, in stored order
-(duplicate keys are kept; `Dict(row)` keeps the last). It stays valid after
-its table is gone. `copy(row)` gives a `Vector{Pair{K,V}}`.
+A row of a map column: a read-only dictionary that iterates the map's
+`key => value` entries in stored order, duplicate keys included, which `length`
+counts. `row[key]`, `get`, and `haskey` find the last entry with that key, the
+one `Dict(row)` keeps; `keys(row)` and `values(row)` are vectors in stored
+order. Each lookup scans the row, so for many lookups in a large map
+`Dict(row)` is faster. `collect(row)` gives the `Vector{Pair{K,V}}` of entries
+and `copy(row)` a `Dict{K,V}`. It stays valid after its table is gone.
 """
-struct MapValue{K,V} <: AbstractVector{Pair{K,V}}
+struct MapValue{K,V} <: AbstractDict{K,V}
     keys::Any     # the column's keys and values, `_columntype(K)`, `_columntype(V)`
     values::Any
     offset::Int
@@ -1633,8 +1637,8 @@ _nestedvalue(f::AC.Field) =
 Base.@propagate_inbounds _childvalue(::Type{T}, values, j::Int) where {T} =
     (values::_columntype(T))[j]
 
-Base.IndexStyle(::Type{<:Union{ListValue,MapValue}}) = IndexLinear()
-Base.size(r::Union{ListValue,MapValue}) = (r.len,)
+Base.IndexStyle(::Type{<:ListValue}) = IndexLinear()
+Base.size(r::ListValue) = (r.len,)
 Base.size(v::Union{ListVector,MapVector}) = (length(v.offsets) - 1,)
 Base.size(v::StructVector) = (v.len,)
 
@@ -1643,10 +1647,72 @@ Base.@propagate_inbounds function Base.getindex(r::ListValue{T}, i::Int) where {
     return @inbounds _childvalue(T, r.values, r.offset + i)
 end
 
-Base.@propagate_inbounds function Base.getindex(r::MapValue{K,V}, i::Int) where {K,V}
-    @boundscheck checkbounds(r, i)
+# `push!`, `append!`, `merge!`, and the like go through `resize!`,
+# `setindex!`, and `delete!`.
+@noinline _readonlyvalue(x) = throw(
+    ArgumentError(
+        "an Arrow.$(nameof(typeof(x))) is read-only; copy(x) gives a " *
+        "$(x isa MapValue ? "Dict" : "Vector") that can change",
+    ),
+)
+Base.setindex!(x::ListValue, v, ::Int) = _readonlyvalue(x)
+Base.resize!(x::ListValue, ::Integer) = _readonlyvalue(x)
+Base.setindex!(x::MapValue, v, k) = _readonlyvalue(x)
+Base.delete!(x::MapValue, k) = _readonlyvalue(x)
+Base.empty!(x::MapValue) = _readonlyvalue(x)
+
+Base.length(r::MapValue) = r.len
+function Base.iterate(r::MapValue{K,V}, i::Int=1) where {K,V}
+    i > r.len && return nothing
     j = r.offset + i
-    return @inbounds Pair{K,V}(_childvalue(K, r.keys, j), _childvalue(V, r.values, j))
+    return Pair{K,V}(_childvalue(K, r.keys, j), _childvalue(V, r.values, j)), i + 1
+end
+
+# The child position of the last entry whose key is `key`, or `nothing`.
+function _mapentry(r::MapValue{K}, key) where {K}
+    for j = (r.offset + r.len):-1:(r.offset + 1)
+        isequal(_childvalue(K, r.keys, j), key) && return j
+    end
+    return nothing
+end
+Base.haskey(r::MapValue, key) = _mapentry(r, key) !== nothing
+function Base.get(r::MapValue{K,V}, key, default) where {K,V}
+    j = _mapentry(r, key)
+    return j === nothing ? default : _childvalue(V, r.values, j)
+end
+function Base.get(default::Base.Callable, r::MapValue{K,V}, key) where {K,V}
+    j = _mapentry(r, key)
+    return j === nothing ? default() : _childvalue(V, r.values, j)
+end
+function Base.getindex(r::MapValue{K,V}, key) where {K,V}
+    j = _mapentry(r, key)
+    j === nothing && throw(KeyError(key))
+    return _childvalue(V, r.values, j)
+end
+Base.keys(r::MapValue{K}) where {K} = ListValue{K}(r.keys, r.offset, r.len)
+Base.values(r::MapValue{K,V}) where {K,V} = ListValue{V}(r.values, r.offset, r.len)
+
+# Inside a container or under `:compact` (DataFrame cells), list and map values
+# print as the plain Julia values they hold, without element types:
+# `[1, missing]`, `Dict("a" => 1)`.
+_compactshow(io::IO) = get(io, :compact, false) === true || haskey(io, :typeinfo)
+function Base.show(io::IO, r::ListValue)
+    _compactshow(io) || return invoke(show, Tuple{IO,AbstractArray}, io, r)
+    # A `:typeinfo` of the row's own type leaves out the element type.
+    return invoke(show, Tuple{IO,AbstractArray}, IOContext(io, :typeinfo => typeof(r)), r)
+end
+function Base.show(io::IO, r::MapValue)
+    _compactshow(io) || return invoke(show, Tuple{IO,AbstractDict}, io, r)
+    entries = IOContext(io, :typeinfo => eltype(r))
+    limit = get(io, :limit, false)::Bool
+    print(io, "Dict(")
+    for (count, pair) in enumerate(r)
+        count > 1 && print(io, ", ")
+        show(entries, pair)
+        limit && count == 10 < length(r) && (print(io, ", …"); break)
+    end
+    print(io, ')')
+    return nothing
 end
 
 Base.@propagate_inbounds function Base.getindex(v::ListVector{T}, i::Int) where {T}

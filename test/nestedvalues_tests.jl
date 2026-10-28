@@ -63,6 +63,8 @@ function leaf(name, t, storage::Vector; present=nothing)
 end
 
 samefields(a, b) = length(a) == length(b) && all(Arrow._fieldcontractequal.(a, b))
+# A map row's entries, in stored order, for comparing with `Pair` vectors.
+entries(x) = x isa Arrow.MapValue ? collect(x) : x
 
 """
 Core-built file -> Arrow.Table -> Arrow.tobuffer -> Arrow.Table. Checks that
@@ -74,8 +76,8 @@ function checkrewrite(field, data, expected)
     table = Arrow.Table(Arrow.writefile(schema, [AC.RecordBatch(schema, [data])]))
     back = Arrow.Table(take!(Arrow.tobuffer(table)))
     name = Symbol(field.name)
-    @test isequal(collect(getproperty(table, name)), expected)
-    @test isequal(collect(getproperty(back, name)), expected)
+    @test isequal(entries.(collect(getproperty(table, name))), expected)
+    @test isequal(entries.(collect(getproperty(back, name))), expected)
     @test eltype(getproperty(back, name)) == eltype(getproperty(table, name))
     @test samefields(getfield(back, :schema).fields, getfield(table, :schema).fields)
     @test samefields(getfield(back, :schema).fields, [field])
@@ -443,7 +445,7 @@ end
 
         maps = [Dict("a" => Millisecond(5))]
         mtable = Arrow.Table(take!(Arrow.tobuffer((m=maps,))))
-        @test collect(mtable.m) == [Pair{Any,Any}["a" => Millisecond(5)]]
+        @test mtable.m == maps
     end
 
     @testset "fresh nested temporal columns refuse like the top level" begin

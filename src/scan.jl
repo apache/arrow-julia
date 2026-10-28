@@ -3331,7 +3331,8 @@ function _overridevalue(::Type{T}, x) where {T}
         end
         return T(vals)
     end
-    if T <: AbstractVector && x isa AbstractVector
+    # A map row (a `MapValue`) converts entry by entry, as a vector of pairs.
+    if T <: AbstractVector && x isa Union{AbstractVector,MapValue}
         E = eltype(T)
         N = Base.nonmissingtype(E)
         return convert(T, E[v === missing ? missing : _overridevalue(N, v) for v in x])

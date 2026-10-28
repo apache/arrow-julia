@@ -517,7 +517,7 @@ end
         @test eltype(t.ls) == Row{DataString} && t.ls == tbl.ls
         @test eltype(t.st) == @NamedTuple{a::Int64, b::DataString} && t.st == tbl.st
         @test eltype(t.m) == Arrow.MapValue{DataString,Int64}
-        @test t.m == [["k" => 1], Pair{String,Int64}[], ["p" => 2]]
+        @test t.m == tbl.m
         # The element type alone fixes how children are stored: strings in a
         # StringVector, fixed-width values in a Primitive view, structs lazily
         # in a StructVector, maps as key and value columns, so no value is boxed.
@@ -533,6 +533,9 @@ end
         row = Arrow.Table(arrowbytes(tbl)).l[1]
         GC.gc(true)
         @test row == [1, 2]
+        err = @test_throws ArgumentError push!(row, 3)
+        @test err.value.msg ==
+              "an Arrow.ListValue is read-only; copy(x) gives a Vector that can change"
         @test copy(t.l) isa Vector{Union{Missing,Vector{Int64}}} &&
               isequal(copy(t.l), tbl.l)
         @test copy(t.m) isa Vector{Vector{Pair{DataString,Int64}}} &&
@@ -576,7 +579,8 @@ end
             children=[ed],
         )
         ctx = Arrow._ViewContext(DataString, nothing)
-        @test Arrow._viewcolumn(mf, AC.ArrayData[md], ctx) == [["b" => 2, "c" => 3]]
+        @test collect.(Arrow._viewcolumn(mf, AC.ArrayData[md], ctx)) ==
+              [["b" => 2, "c" => 3]]
         # Long fixed-size lists read as views; wide or duplicate-named
         # structs keep `Pair` rows.
         long = Arrow.Table(arrowbytes((x=[ntuple(Int64, 65)],))).x
@@ -635,6 +639,59 @@ end
         deep9 = Arrow.Table(arrowbytes((x=[nest([1], 8)],))).x
         @test eltype(deep8) <: Row && deep8 == [nest([1], 7)]
         @test !(eltype(deep9) <: Row) && deep9 == [nest([1], 8)]
+    end
+
+    @testset "map rows look keys up and keep every entry" begin
+        pairs = [["a" => 1, "b" => 2, "a" => 3], Pair{String,Int64}[]]
+        t = Arrow.Table(arrowbytes((m=pairs, d=[Dict("x" => 1.5), Dict{String,Float64}()])))
+        row = t.m[1]
+        @test row isa AbstractDict{DataString,Int64}
+        # Entries in stored order, duplicate keys kept.
+        @test length(row) == 3 && collect(row) == pairs[1]
+        @test keys(row) == ["a", "b", "a"] && values(row) == [1, 2, 3]
+        @test keys(row) isa Arrow.ListValue{DataString}
+        # Lookups take the last entry with the key, as Dict(row) does.
+        @test row["a"] == 3 && row["b"] == 2
+        @test get(row, "a", 0) == 3 && get(row, "zz", 0) == 0
+        @test haskey(row, "b") && !haskey(row, "zz")
+        @test_throws KeyError row["zz"]
+        @test Dict(row) == Dict("a" => 3, "b" => 2)
+        @test copy(row) == Dict("a" => 3, "b" => 2) && copy(row) isa Dict{DataString,Int64}
+        @test get(() -> 0, row, "zz") == 0
+        err = @test_throws ArgumentError row["z"] = 1
+        @test err.value.msg ==
+              "an Arrow.MapValue is read-only; copy(x) gives a Dict that can change"
+        @test_throws ArgumentError push!(row, "z" => 1)
+        @test_throws ArgumentError empty!(row)
+        @test isempty(t.m[2]) && length(t.m[2]) == 0
+        # Maps compare as dictionaries, as Arrow 2.x's Dict rows did.
+        @test t.d == [Dict("x" => 1.5), Dict{String,Float64}()]
+        @test t.d[1]["x"] == 1.5
+        # They write back as maps, entries in order.
+        back = Arrow.Table(arrowbytes(t))
+        @test collect(back.m[1]) == pairs[1] && back.d == t.d
+    end
+
+    @testset "list and map values print their values in cells" begin
+        t = Arrow.Table(
+            arrowbytes((
+                l=Union{Missing,Vector{Union{Missing,Int64}}}[[1, missing], missing],
+                m=[Dict("a" => 1), Dict("b" => 2)],
+            )),
+        )
+        compact(x) = sprint(show, x; context=:compact => true)
+        @test compact(t.l[1]) == "[1, missing]"
+        @test compact(t.m[1]) == "Dict(\"a\"=>1)"
+        # As elements of a vector, too (a DataFrame cell prints so).
+        @test endswith(sprint(show, [t.l[1]]), "[[1, missing]]")
+        @test occursin("Dict(\"a\" => 1)", sprint(show, MIME"text/plain"(), t.m))
+        # On their own they print as Base prints vectors and dictionaries.
+        @test sprint(show, t.l[1]) == "Union{Missing, Int64}[1, missing]"
+        @test startswith(sprint(show, t.m[1]), "Arrow.MapValue{")
+        # A long map prints its first ten entries under :limit.
+        big = Arrow.Table(arrowbytes((m=[Dict(string(i) => i for i = 1:12)],))).m[1]
+        shown = sprint(show, big; context=(:compact => true, :limit => true))
+        @test endswith(shown, ", …)") && count("=>", shown) == 10
     end
 
     @testset "nested children of union or run-end encoded values" begin
@@ -696,7 +753,9 @@ end
         if VERSION >= v"1.12" && Base.JLOptions().code_coverage == 0
             @test allocationsof(bsum, t.st) == 0 && allocationsof(lsum, t.ls) == 0
         end
-        @test t.st[end] == tbl.st[end] && t.ls[2] == ["2", "x"] && t.m[3] == ["3" => 3]
+        @test t.st[end] == tbl.st[end] &&
+              t.ls[2] == ["2", "x"] &&
+              collect(t.m[3]) == ["3" => 3]
     end
 
     @testset "fixed-width nested children and list offsets view the data read" begin
@@ -714,7 +773,7 @@ end
         @test fewestbytes(() -> Arrow.Table(path; mmap=true)) < 2n
         t = Arrow.Table(path; mmap=true)
         @test t.l.offsets isa Vector{Int32} && t.m.offsets isa Vector{Int32}
-        @test t.l == tbl.l && t.st == tbl.st && t.m[5] == [5 => 5.0]
+        @test t.l == tbl.l && t.st == tbl.st && collect(t.m[5]) == [5 => 5.0]
         # A rewrite reads the stored offsets.
         @test Arrow.Table(arrowbytes(t)).l == tbl.l
         # Rows keep the mapping they view alive.
@@ -723,7 +782,7 @@ end
         t = nothing
         GC.gc(true)
         GC.gc(true)
-        @test row == [7, 8, 9, 10] && st[n] == tbl.st[n] && entry == [9 => 9.0]
+        @test row == [7, 8, 9, 10] && st[n] == tbl.st[n] && collect(entry) == [9 => 9.0]
         row = st = entry = nothing
         rmmapped(path)
     end
