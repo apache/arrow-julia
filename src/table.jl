@@ -191,7 +191,41 @@ _fieldsymbol(name::AbstractString) = (_validatefieldsymbolname(name); Symbol(nam
 const _MAX_TABLES_NEW_FIELD_NAMES = 65_536
 const _MAX_TABLES_NEW_FIELD_NAME_BYTES = 1024 * 1024
 
+# A timestamp's zone becomes a `ZonedTimestamp` type parameter: its name is
+# interned for the life of the process and its columns compile their own
+# methods. One read may bring at most this many zones new to the process.
+const _MAX_NEW_ZONES = 1024
+
+function _checknewzones(fields)
+    seen = Set{String}()
+    for f in fields
+        _newzones!(seen, f)
+    end
+    return nothing
+end
+
+function _newzones!(seen::Set{String}, f::AC.Field)
+    t = f.type
+    if t isa AC.TimestampType
+        zone = _timestampzone(t)
+        if zone !== nothing && !(zone in seen) && _existingjlsymbol(zone) === nothing
+            push!(seen, zone)
+            length(seen) <= _MAX_NEW_ZONES || throw(
+                AC.ValidationError(
+                    "timestamp columns declare more than $_MAX_NEW_ZONES time zones " *
+                    "this Julia process has not seen; each zone is a type parameter",
+                ),
+            )
+        end
+    end
+    t isa AC.DictionaryType && _newzones!(seen, AC.dictvaluefield(f, t))
+    foreach(c -> _newzones!(seen, c), f.children)
+    return seen
+end
+
 function _fieldnamesymbols(fields, budget=nothing)
+    # Before any name is interned, so names cannot pre-intern zones.
+    _checknewzones(fields)
     _chargedict!(budget, String, Nothing, length(fields), "novel field-name set")
     novel = Set{String}()
     sizehint!(novel, length(fields))

@@ -330,10 +330,14 @@ or wraps ordering. The detailed rules:
   bijections with their storage — so every operator lowers when the
   literal converts exactly (`Timestamp`, `DateTime`, and `Date` literals
   on zone-naive columns; `ZonedTimestamp` in any zone, and `ZonedDateTime`
-  with TimeZones.jl loaded, on zone-declared columns). A zone-naive
-  literal never lowers against a zone-declared column, or vice versa: the
-  public domain defines those comparisons as unequal (`==` is `false`;
-  ordered comparisons error). Duration lowering accepts a literal in the
+  with TimeZones.jl loaded, on zone-declared columns). On a UTC column
+  (pandas tz-aware data, DuckDB `TIMESTAMPTZ`) a `DateTime`, `Date`, or
+  `Timestamp` literal is taken as that UTC time, so
+  `colcmp(>=, col(:ts), DateTime(2020))` works. A column in another zone
+  refuses a zone-free literal with an `ArgumentError`; compare it with a
+  zoned instant such as `Durations.ZonedTimestamp{Dates.Microsecond,:UTC}(2020, 1, 1)`.
+  A zoned literal against a zone-naive column matches nothing (`==` is
+  `false`; ordered comparisons error). Duration lowering accepts a literal in the
   column unit or a coarser fixed unit, but a finer unit stays public
   because Julia can overflow while promoting stored values.
 * Set membership: temporal Tuple and Array membership follows the same
@@ -582,7 +586,8 @@ size is at most 1 MiB. A schema outside those limits produces
 `ValidationError` without partially interning its novel names. A declared
 timestamp timezone becomes the `Z` parameter of `ZonedTimestamp{P,Z}`; one
 longer than 4096 UTF-8 bytes or containing a NUL byte produces
-`ValidationError`.
+`ValidationError`, and so does a schema whose timestamps declare more than
+1,024 zones the process has not seen yet.
 
 A ranged scan validates the Footer's complete Block index up front and the
 complete node and buffer metadata for every statistics-surviving record before

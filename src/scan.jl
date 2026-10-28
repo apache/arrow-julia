@@ -775,6 +775,88 @@ function _lowerexpr(e, fields, names, ok::Base.RefValue{Bool}, budget=nothing)
     return e
 end
 
+# --- zoned timestamp literals --------------------------------------------------
+# A UTC timestamp column (pandas tz-aware data, DuckDB TIMESTAMPTZ) reads as
+# `ZonedTimestamp{P,:UTC}`, which does not compare with `DateTime`, `Date`, or
+# `Timestamp`. A filter binding one of those to a UTC column reads it as the
+# same UTC wall time. For a column in another zone a zone-free literal is
+# ambiguous, and the filter fails naming a literal that works.
+
+const _ZonelessTime = Union{Dates.DateTime,Dates.Date,Durations.Timestamp}
+
+_utcinstant(x::Dates.DateTime) = Durations.ZonedTimestamp{Dates.Millisecond,:UTC}(
+    Durations.Timestamp{Dates.Millisecond}(x),
+)
+_utcinstant(x::Dates.Date) = Durations.ZonedTimestamp{Dates.Second,:UTC}(x)
+_utcinstant(x::Durations.Timestamp{P}) where {P} = Durations.ZonedTimestamp{P,:UTC}(x)
+
+# `x` as a literal for field `f`: unchanged unless `f` holds zoned timestamps.
+function _zonedliteral(f::AC.Field, x)
+    x isa _ZonelessTime || return x
+    t = _lowerleaffield(f).type
+    t isa AC.DictionaryType && (t = t.valuetype)
+    t isa AC.TimestampType || return x
+    zone = _timestampzone(t)
+    zone === nothing && return x
+    P = _timestampperiod(t.unit)
+    if zone == "UTC"
+        z = _utcinstant(x)
+        # In the column's unit when exact, so `Set` membership hashes alike.
+        try
+            return Durations.ZonedTimestamp{P,:UTC}(z)
+        catch err
+            err isa Union{InexactError,OverflowError} || rethrow()
+            return z
+        end
+    end
+    unit = nameof(P)
+    throw(
+        ArgumentError(
+            "column $(f.name) holds ZonedTimestamp{$unit, $(repr(Symbol(zone)))} values, " *
+            "which do not compare with a $(nameof(typeof(x))); compare with an instant " *
+            "such as `Durations.ZonedTimestamp{Dates.$unit,:UTC}(2020, 1, 1)`",
+        ),
+    )
+end
+
+function _zonedliterals(e, fields, names)
+    if e isa Tables.Cmp
+        f = _fieldfor(fields, e.lhs.ref, names)
+        f === nothing && return e
+        v = _zonedliteral(f, e.rhs)
+        return v === e.rhs ? e : Tables.Cmp(e.op, e.lhs, v)
+    elseif e isa Tables.In
+        f = _fieldfor(fields, e.lhs.ref, names)
+        values = e.values
+        # Only Base containers whose membership semantics survive a rebuild.
+        (f === nothing || !(values isa Union{Tuple,Array,Set})) && return e
+        any(x -> x isa _ZonelessTime, values) || return e
+        lit(x) = _zonedliteral(f, x)
+        rebuilt =
+            values isa Tuple ? map(lit, values) :
+            values isa Set ? Set(lit(x) for x in values) : map(lit, values)
+        return Tables.In(e.lhs, rebuilt)
+    elseif e isa Tables.AndExpr
+        return Tables.AndExpr(
+            Tables.ScanExpr[_zonedliterals(a, fields, names) for a in e.args],
+        )
+    elseif e isa Tables.OrExpr
+        return Tables.OrExpr(
+            Tables.ScanExpr[_zonedliterals(a, fields, names) for a in e.args],
+        )
+    elseif e isa Tables.NotExpr
+        return Tables.NotExpr(_zonedliterals(e.arg, fields, names))
+    end
+    return e
+end
+
+function _zonedbound(b::Tables.BoundScan, fields, names)
+    b.filter === nothing && return b
+    filter = _zonedliterals(b.filter, fields, names)
+    filter === b.filter && return b
+    return Tables.BoundScan(b.columns, filter, b.filtercols, b.limit, b.offset, b.validate)
+end
+
 """
 One scan plan resolved against one Arrow schema. `names` is the owned source
 schema identity used by every executor. `public` is the request in the public
@@ -957,7 +1039,7 @@ end
 function _ScanPlan(scan::Tables.Scan, fields, budget=nothing)
     compiled = _compileboundscan(scan, fields, budget)
     names = compiled.names
-    b = compiled.bound
+    b = _zonedbound(compiled.bound, fields, names)
     # The facade keeps zero-field sources on its metadata-count path. Avoid
     # compiling a storage form that no adapter will consume.
     isempty(fields) && return _ScanPlan(names, b, nothing)

@@ -1906,7 +1906,8 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test_throws ArgumentError Arrow._instantunit(Ts{Dates.Minute})
 
         # Zoned scans push down every operator; literals convert exactly
-        # across zones and units, and cross-domain literals match nothing.
+        # across zones and units. Zone-free literals refuse on this zone
+        # (only UTC takes them), and a raw count matches nothing.
         zbytes = take!(Arrow.tobuffer((z=zcol,)))
         zfield = getfield(Arrow.Table(copy(zbytes)), :schema).fields[1]
         for (filter, want) in (
@@ -1928,12 +1929,14 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             @test Arrow._ScanPlan(scan, [zfield]).storage !== nothing
             @test collect(Arrow.Table(copy(zbytes); scan).z) == want
         end
-        for naive in
-            (DateTime(2026, 1, 2), Ts{Microsecond}(2026, 1, 2), Dates.value(zcol[2]))
+        for naive in (DateTime(2026, 1, 2), Ts{Microsecond}(2026, 1, 2))
             scan = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:z), naive))
-            @test Arrow._ScanPlan(scan, [zfield]).storage === nothing
-            @test isempty(Arrow.Table(copy(zbytes); scan).z)
+            @test_throws ArgumentError Arrow.Table(copy(zbytes); scan)
         end
+        rawscan =
+            Tables.Scan(filter=Tables.colcmp(==, Tables.col(:z), Dates.value(zcol[2])))
+        @test Arrow._ScanPlan(rawscan, [zfield]).storage === nothing
+        @test isempty(Arrow.Table(copy(zbytes); scan=rawscan).z)
         # a zoned literal against a zone-naive column matches nothing
         nbytes = take!(Arrow.tobuffer((n=ncol,)))
         nscan = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:n), zcol[1]))
@@ -3040,6 +3043,52 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         f = AC.Field("x", AC.IntType(32, true); nullable=false, metadata=ext(name))
         t = onecolumn(f, d32)
         @test t.x isa Arrow.Primitive && t.x == [1, 2, 3]
+    end
+
+    @testset "time zones: filter literals and the per-read cap" begin
+        AC = Arrow.AC
+        utc(x...) = Durations.ZonedTimestamp{Dates.Microsecond,:UTC}(x...)
+        denver = Durations.ZonedTimestamp{Dates.Microsecond,Symbol("America/Denver")}
+        ts = [utc(2019, 12, 31), utc(2020, 1, 1, 12)]
+        bytes = take!(Arrow.write(IOBuffer(), (u=ts, d=denver.(ts), n=[1, 2])))
+        rows(f) = Arrow.Table(bytes; scan=Tables.Scan(filter=f)).n
+        # A zone-free literal on a UTC column is that UTC wall time.
+        for lit in (
+            Dates.DateTime(2020),
+            Dates.Date(2020),
+            Durations.Timestamp{Dates.Millisecond}(2020),
+            utc(2020),
+        )
+            @test rows(Tables.colcmp(>=, Tables.col(:u), lit)) == [2]
+        end
+        @test rows(Tables.colin(Tables.col(:u), [Dates.DateTime(2020, 1, 1, 12)])) == [2]
+        @test rows(Tables.colin(Tables.col(:u), Set([Dates.DateTime(2020, 1, 1, 12)]))) ==
+              [2]
+        # An inexact literal for the column's unit compares exactly.
+        later = Durations.Timestamp{Dates.Nanosecond}(2020, 1, 1, 12) + Dates.Nanosecond(1)
+        @test isempty(rows(Tables.colcmp(>=, Tables.col(:u), later)))
+        # Another zone needs a zoned literal, and the error shows one.
+        err = try
+            rows(Tables.colcmp(>=, Tables.col(:d), Dates.DateTime(2020)))
+        catch e
+            e
+        end
+        @test err isa ArgumentError && occursin(
+            "Durations.ZonedTimestamp{Dates.Microsecond,:UTC}(2020, 1, 1)",
+            err.msg,
+        )
+        @test rows(Tables.colcmp(>=, Tables.col(:d), utc(2020))) == [2]
+        # One read may bring at most 1,024 zones the process has not seen.
+        tag = string(time_ns())
+        zoned(n) = AC.Schema([
+            AC.Field("t$i", AC.TimestampType(AC.SECOND, "Test/$tag-$n-$i"); nullable=true) for i = 1:n
+        ])
+        @test_throws Arrow.ValidationError Arrow.Table(
+            Arrow.writefile(zoned(1025), AC.RecordBatch[]),
+        )
+        @test length(
+            Tables.columnnames(Arrow.Table(Arrow.writefile(zoned(3), AC.RecordBatch[]))),
+        ) == 3
     end
 
     @testset "read views write back from their own buffers" begin
