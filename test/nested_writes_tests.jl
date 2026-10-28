@@ -33,6 +33,13 @@ end
 Base.size(g::Grows) = (g.n += 1,)
 Base.getindex(::Grows, i::Int) = i
 
+# A map row type of its own, as Parquet's MapValue is.
+struct PairRow <: AbstractVector{Pair{String,Int}}
+    pairs::Vector{Pair{String,Int}}
+end
+Base.size(r::PairRow) = size(r.pairs)
+Base.getindex(r::PairRow, i::Int) = r.pairs[i]
+
 roundtrip(cols; kw...) = Arrow.Table(take!(Arrow.tobuffer(cols; kw...)))
 field(t, j=1) = getfield(t, :schema).fields[j]
 # A map row as the Dict it describes, for comparing with Dict inputs.
@@ -94,6 +101,12 @@ asdict(x) = x === missing ? missing : Dict(x)
         @test field(tp).type isa AC.MapType
         @test collect(tp.m) == pairs
         @test eltype(tp.m) <: AbstractVector{<:Pair}
+        # Any vector type of Pairs is a map row (Parquet's MapValue, say).
+        own = [PairRow(["a" => 1]), PairRow(["b" => 2, "c" => 3])]
+        to = roundtrip((m=own, l=[[own[1]], [own[2], own[1]]]))
+        @test field(to, 1).type isa AC.MapType
+        @test only(field(to, 2).children).type isa AC.MapType
+        @test collect.(to.m) == [r.pairs for r in own]
         err = try
             Arrow.tobuffer((m=[Dict{Union{Missing,String},Int}(missing => 1)],))
         catch e
