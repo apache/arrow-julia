@@ -1557,9 +1557,17 @@ function Base.getindex(
     row = values.rows[firstindex(values.rows) + index - 1]
     row === missing && return _RETAINED_HIDDEN
     row === _RETAINED_HIDDEN && return _RETAINED_HIDDEN
-    row isa NamedTuple && return row[values.child]
-    return last(row[firstindex(row) + values.child - 1])
+    return _retainedchildvalue(row, values.child)
 end
+
+# A typed read's struct row is a `NamedTuple`; a materialized one is an
+# ordered `Pair` vector. These values are declared `Any`, and the field comes
+# back through an inference barrier: inferring its exact type makes Julia
+# 1.10 with code coverage fail in `any`/`all` over the values ("fatal error
+# in type inference (type bound)").
+_retainedchildvalue(row::NamedTuple, child::Int) =
+    Base.inferencebarrier(getfield(row, child))
+_retainedchildvalue(row, child::Int) = last(row[firstindex(row) + child - 1])
 
 "A writer-side Union route retained until dense or sparse child construction."
 struct _WriterRoutedUnion{T}
