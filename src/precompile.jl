@@ -103,6 +103,9 @@ PrecompileTools.@setup_workload begin
                 copy(column)
             end
             table === columns && continue
+            # Writing what was read, column by column (a DataFrame of a read
+            # table hands the writer these columns).
+            write(IOBuffer(), Tables.columntable(tbl))
             # A timestamp filter runs on stored integers.
             stamp = Tables.colcmp(>=, Tables.col(:nMicrosecond), Dates.DateTime(2020))
             Table(flatbytes; scan=Tables.Scan(filter=stamp))

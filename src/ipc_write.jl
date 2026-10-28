@@ -542,7 +542,7 @@ function _compressbody!(c::EncodeCursor, states::Vector{EncodeState}, ntasks::In
         )
         return length(frame) < b.len ? frame : nothing
     end
-    frames = Vector{Any}(undef, length(raw))
+    frames = Vector{Union{Nothing,Vector{UInt8}}}(undef, length(raw))
     for (i, j) in enumerate(order)
         frames[j] = done[i]
     end

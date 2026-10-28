@@ -50,7 +50,7 @@ _instantelementperiod(::Type{<:Durations.ZonedTimestamp{P}}) where {P} = P
 # The column-level dispatchers (`_constructnativepart`, `_constructpart`) do
 # not specialize on the vector type: the builders they call do, so each new
 # column type compiles its builder and not the whole dispatch.
-function _constructnativepart(
+Base.@nospecializeinfer function _constructnativepart(
     name::String,
     @nospecialize(v::AbstractVector);
     context=nothing,
@@ -279,7 +279,7 @@ function _fixedbuffer(v::AbstractVector{T}) where {T}
 end
 
 "One (Field, ArrayData) column, including the ArrowTypes compatibility adapter."
-function _constructpart(
+Base.@nospecializeinfer function _constructpart(
     name::String,
     @nospecialize(v::AbstractVector);
     context=nothing,
@@ -899,7 +899,7 @@ function _walkwritercontainer!(visit, x, active::Base.IdSet{Any}, depth::Int)
         push!(active, x)
         try
             if x isa AbstractDict
-                for (key, value) in pairs(x)
+                for (key, value) in x
                     _walkwritercontainer!(visit, key, active, depth + 1) === true &&
                         return true
                     _walkwritercontainer!(visit, value, active, depth + 1) === true &&
@@ -978,7 +978,7 @@ function _narrowlists(v::AbstractVector, name="")
     w = map(x -> x isa AbstractVector ? map(identity, x) : x, v)
     w = map(identity, w)
     NT = Base.nonmissingtype(eltype(w))
-    _abstractnonnative(NT) && return collect(_observedtype(w, name), w)
+    _abstractnonnative(NT) && return _collectas(_observedtype(w, name), w)
     NT !== Union{} && NT <: AbstractVector || return w
     # Join the inner element types (empties narrow to Union{} and would
     # otherwise poison the join), then retype every inner vector. With only
@@ -1567,8 +1567,21 @@ end
 "Concrete Vector with an exact Union{Missing,T} or T eltype for fromjulia."
 function _plainvector(v::AbstractVector)
     T = eltype(v)
-    return v isa Vector{T} ? v : collect(T, v)
+    return v isa Vector{T} ? v : _collectas(T, v)
 end
+
+# `eltype` of a vector the caller does not specialize on: Base's `eltype` of an
+# abstract vector type has methods other packages add to (DataFrames does).
+_eltypeof(::AbstractVector{T}) where {T} = T
+
+# A string's UTF-8 bytes. `codeunits` of an `AbstractString` has methods other
+# packages add to (LaTeXStrings does); the bytes of a `String` do not.
+_utf8units(x::AbstractString) = codeunits((x isa String ? x : String(x))::String)
+
+# `collect(T, v)` for an element type known only at run time. Other packages
+# add `collect(::Type{...}, v)` methods (InlineStrings does), and writer code
+# inferred against Base's one method would recompile once they load.
+_collectas(::Type{T}, v::AbstractVector) where {T} = copyto!(Vector{T}(undef, length(v)), v)
 
 _missings_to(::Type{S}, v) where {S} =
     eltype(v) >: Missing ? Union{Missing,S}[x === missing ? missing : S(x) for x in v] :
@@ -3260,7 +3273,7 @@ function _narrowabstractwriterparts(name::String, parts, context::_WriterContext
     if !needsruntime && _singletypefamily(logical)
         length(observed) == 1 || return nothing
         storagetype = nullable ? Union{Missing,only(observed)} : only(observed)
-        return AbstractVector[collect(storagetype, part) for part in parts]
+        return AbstractVector[_collectas(storagetype, part) for part in parts]
     end
     if !needsruntime && _abstractnonnative(logical)
         # `Real[1, 2.5]`: one runtime type writes as that type, several as a
@@ -3273,7 +3286,7 @@ function _narrowabstractwriterparts(name::String, parts, context::_WriterContext
         )
         storagetype = _writeruniontype(observed)
         nullable && (storagetype = Union{Missing,storagetype})
-        return AbstractVector[collect(storagetype, part) for part in parts]
+        return AbstractVector[_collectas(storagetype, part) for part in parts]
     end
     if !needsruntime
         # Rows of an abstract NamedTuple column (some fields missing in some
@@ -3282,7 +3295,7 @@ function _narrowabstractwriterparts(name::String, parts, context::_WriterContext
         rowtype = _widenednamedtuple(observed)
         rowtype === nothing && return nothing
         nullable && (rowtype = Union{Missing,rowtype})
-        return AbstractVector[collect(rowtype, part) for part in parts]
+        return AbstractVector[_collectas(rowtype, part) for part in parts]
     end
     for runtime in observed
         _writerregisterinferredtype!(
@@ -3294,7 +3307,7 @@ function _narrowabstractwriterparts(name::String, parts, context::_WriterContext
     end
     storagetype = _writeruniontype(observed)
     nullable && (storagetype = Union{Missing,storagetype})
-    return AbstractVector[collect(storagetype, part) for part in parts]
+    return AbstractVector[_collectas(storagetype, part) for part in parts]
 end
 
 "The field-wise Union of same-named NamedTuple row types, or nothing."
@@ -4601,7 +4614,7 @@ function _constructmaskedvarbytesleaf(
                     stored isa AbstractString || throw(
                         ArgumentError("column $(f.name) must contain string values"),
                     )
-                    codeunits(stored)
+                    _utf8units(stored)
                 else
                     stored isa AbstractVector{UInt8} || throw(
                         ArgumentError("column $(f.name) must contain byte-vector values"),
@@ -5237,7 +5250,7 @@ function _retainedview(f::AC.Field, v::AbstractVector)
         bytes = if t.utf8
             x isa AbstractString ||
                 throw(ArgumentError("column $(f.name) must contain string values"))
-            codeunits(x)
+            _utf8units(x)
         else
             x isa AbstractVector{UInt8} ||
                 throw(ArgumentError("column $(f.name) must contain byte-vector values"))
@@ -6099,7 +6112,7 @@ function _constructwriterunion(f::AC.Field, v::AbstractVector, context::_WriterC
 end
 
 "Construct one part under a retained Field: descriptor, nullability, metadata."
-function _constructpart(
+Base.@nospecializeinfer function _constructpart(
     f::AC.Field,
     @nospecialize(v::AbstractVector);
     context::_WriterContext=_WriterContext(),
@@ -6112,7 +6125,7 @@ function _constructpart(
         t isa AC.ListType ? :list :
         t isa AC.FixedSizeListType ? :fixedlist :
         t isa AC.StructType ? :struct : t isa AC.MapType ? :map : nothing
-    R = Base.nonmissingtype(eltype(v))
+    R = Base.nonmissingtype(_eltypeof(v))
     if kind !== nothing &&
        !context.lowered &&
        _nestedkind(context, R) === kind &&
@@ -6458,7 +6471,7 @@ function _writerstorageequal(left, right, depth::Int=0)
     if left isa Tuple || right isa Tuple
         left isa Tuple && right isa Tuple || return false
         length(left) == length(right) || return false
-        for i in eachindex(left, right)
+        for i = 1:length(left)
             _writerstorageequal(left[i], right[i], depth + 1) || return false
         end
         return true
@@ -6507,8 +6520,8 @@ function _writerstoragehash(value, seed::UInt, depth::Int=0)
     if value isa AbstractString
         h = hash(UInt8(0x04), seed)
         h = hash(ncodeunits(value), h)
-        for byte in codeunits(value)
-            h = hash(byte, h)
+        for i = 1:ncodeunits(value)
+            h = hash(codeunit(value, i), h)
         end
         return h
     end
@@ -6596,7 +6609,7 @@ function _dictionarypool(vals, retainedpool; writetype=nothing)
         # New categories may be other types than the retained ones (writer
         # values after a public pool read back, DataStrings after Strings):
         # widen the value type instead of converting.
-        pool = collect(
+        pool = _collectas(
             _widenedtype(eltype(retainedpool), _dictvaluetype(vals)),
             retainedpool,
         )
@@ -6931,21 +6944,21 @@ end
 function _dictbatch(fld::AC.Field, indices::Vector, pool_d::AC.ArrayData)
     t = fld.type::AC.DictionaryType
     present = [x !== missing for x in indices]
-    inds = _dictindexvalues(AC.juliatype(t.indextype), indices)
+    # The index type is a run-time property of the field.
+    inds = _uninferred(_dictindexbuffer, AC.juliatype(t.indextype), indices)::AC.BufferSlice
     nc = count(!, present)
     d = AC.ArrayData(
         t,
         length(indices),
-        [AC._bitmapbuffer(present), AC._databuffer(inds)];
+        [AC._bitmapbuffer(present), inds];
         dictionary=pool_d,
         nullcount=nc,
     )
     return d
 end
 
-# Function barrier: the index type is a run-time property of the field.
-_dictindexvalues(::Type{IT}, indices) where {IT} =
-    IT[x === missing ? zero(IT) : IT(x) for x in indices]
+_dictindexbuffer(::Type{IT}, indices) where {IT} =
+    AC._databuffer(IT[x === missing ? zero(IT) : IT(x) for x in indices])
 
 "Field + first-batch data for a dictionary column under a RETAINED type."
 function _retaineddictfromdata(
@@ -7046,11 +7059,12 @@ function _constructcolumn(name::Symbol, parts::Vector{AbstractVector}; kwargs...
         return field, data
     catch err
         prefix = "fromjulia: unsupported element type "
-        err isa ArgumentError && startswith(err.msg, prefix) || rethrow()
+        msg = err isa ArgumentError ? err.msg : nothing
+        msg isa String && startswith(msg, prefix) || rethrow()
         T = _reflectedstructtype(parts)
         T === nothing && throw(
             ArgumentError(
-                "column $name holds $(chopprefix(err.msg, prefix)) values, which have " *
+                "column $name holds $(chopprefix(msg::String, prefix)) values, which have " *
                 "no Arrow type; convert them first, or define ArrowTypes.ArrowType and " *
                 "ArrowTypes.toarrow for their type",
             ),
@@ -7059,7 +7073,7 @@ function _constructcolumn(name::Symbol, parts::Vector{AbstractVector}; kwargs...
             ArgumentError(
                 "column $name holds $T values, which have no ArrowTypes.jl mapping, so " *
                 "Arrow writes their fields as a Struct; a field failed with " *
-                "\"$(err.msg)\". Define ArrowTypes.ArrowType and ArrowTypes.toarrow " *
+                "\"$msg\". Define ArrowTypes.ArrowType and ArrowTypes.toarrow " *
                 "for $T, or convert the column first (DataAPI.unwrap.(column) for " *
                 "wrapped values such as CategoricalValue)",
             ),
@@ -7070,7 +7084,7 @@ end
 # The element type of a column written by reflecting a plain struct's fields
 # (ArrowTypes.jl's default StructKind mapping), or nothing.
 function _reflectedstructtype(parts)
-    T = Base.nonmissingtype(eltype(first(parts)))
+    T = Base.nonmissingtype(_eltypeof(first(parts)))
     isconcretetype(T) && isstructtype(T) && !(T <: Union{NamedTuple,Tuple}) ||
         return nothing
     ArrowTypes.ArrowType(T) === T && ArrowTypes.arrowname(T) === Symbol() || return nothing
@@ -7108,8 +7122,6 @@ function _constructcolumnparts(
         return _withfieldmetadata(_retainedfield(retained), metadata), int8data
     end
     fieldname = String(name)
-    nparts = length(parts)
-    data = Vector{AC.ArrayData}(undef, nparts)
     dictintent =
         (retained !== nothing && retained.type isa AC.DictionaryType) ||
         any(part isa DictEncode for part in parts) ||
@@ -7121,266 +7133,309 @@ function _constructcolumnparts(
     if !dictintent && any(_hasrefpool, parts)
         parts = AbstractVector[_hasrefpool(p) ? first(_refpoolvalues(p)) : p for p in parts]
     end
-
-    local field::AC.Field
-    if dictintent
-        values = AbstractVector[
-            part isa DictEncode ? (part::DictEncode).data : part for part in parts
-        ]
-        if any(_hasrefpool, values)
-            poolhints = copy(poolhints)
-            for k in eachindex(values)
-                _hasrefpool(values[k]) || continue
-                values[k], hint = _refpoolvalues(values[k])
-                poolhints[k] === nothing && (poolhints[k] = hint)
-            end
-        end
-        retainedvaluefield = nothing
-        retainedtarget = nothing
-        if retained !== nothing
-            retainedvaluefield, retainedtarget =
-                _registereddictionaryfield(context, retained)
-            retainedtype = retained.type::AC.DictionaryType
-            retainedvaluefield === nothing &&
-                retainedtype.valuetype isa AC.NullType &&
-                retained.nullable &&
-                _arrowtypesextension(retained) !== nothing &&
-                throw(
-                    ArgumentError(
-                        "column $name has a nullable retained Dictionary<Null> with " *
-                        "an unregistered extension; materialization cannot " *
-                        "distinguish a valid null-pool index from an outer null index",
-                    ),
-                )
-            # Table materialization already lifts retained pool snapshots
-            # through the dictionary value Field. They stay in the same
-            # public domain as row values until the merged pool is lowered
-            # exactly once through `_constructpart` on that value Field below.
-        end
-
-        inferreddeclaration = if retained === nothing
-            _inferredstoragedeclaration(values, context)
-        elseif retainedtarget === nothing
-            nothing
-        else
-            _inferredstoragedeclaration(values, context; target=retainedtarget)
-        end
-        freshevidence =
-            retained === nothing && inferreddeclaration === nothing ?
-            _dictionaryvaluefield(fieldname, values, name, context) : nothing
-        freshvaluefield = freshevidence === nothing ? nothing : freshevidence.field
-        freshwritetype = freshevidence === nothing ? nothing : freshevidence.writetype
-        freshroutes = freshevidence === nothing ? nothing : freshevidence.routes
-        widenpool = if inferreddeclaration !== nothing
-            true
-        elseif retained === nothing
-            freshvaluefield !== nothing && freshvaluefield.type isa AC.UnionType
-        else
-            (retained.type::AC.DictionaryType).valuetype isa AC.UnionType
-        end
-        mergedpool = _mergeddictpool(poolhints; widen=widenpool)
-        poolhint = mergedpool === nothing ? nothing : mergedpool.values
-        if retained !== nothing
-            (retained.type::AC.DictionaryType).valuetype isa AC.UnionType &&
-                retainedvaluefield === nothing &&
-                throw(
-                    ArgumentError(
-                        "column $name has a retained UnionType whose child type ids " *
-                        "cannot be recovered from materialized facade values",
-                    ),
-                )
-            for valuespart in values
-                T = Base.nonmissingtype(eltype(valuespart))
-                if retainedvaluefield === nothing
-                    publictype = _facadebasetype(retained.type)
-                    # Any string writes to a utf8 pool.
-                    publictype === String && (publictype = AbstractString)
-                    publictype !== Any &&
-                        !(T <: publictype) &&
-                        !_retainedwritertype(
-                            (retained.type::AC.DictionaryType).valuetype,
-                            T,
-                        ) &&
-                        T !== Union{} &&
-                        throw(
-                            ArgumentError(
-                                "column $name holds $T values, but its retained " *
-                                "dictionary materializes as $publictype; the column " *
-                                "was replaced with incompatible data",
-                            ),
-                        )
-                else
-                    islogical =
-                        T <: retainedtarget || (
-                            T === Any &&
-                            all(x -> x === missing || x isa retainedtarget, valuespart)
-                        )
-                    islogical || throw(
-                        ArgumentError(
-                            "column $name holds $T values, but its retained " *
-                            "dictionary materializes as $retainedtarget; the column " *
-                            "was replaced with incompatible data",
-                        ),
-                    )
-                end
-                # A non-nullable dictionary can materialize missing through a
-                # valid index into a null pool entry. The retained pool keeps
-                # that distinct from a missing index.
-                any(ismissing, valuespart) &&
-                    !retained.nullable &&
-                    (poolhint === nothing || !any(ismissing, poolhint)) &&
-                    throw(
-                        ArgumentError(
-                            "column $name may hold missing values but its retained " *
-                            "dictionary field is non-nullable",
-                        ),
-                    )
-            end
-            (retained.type::AC.DictionaryType).ordered &&
-                poolhint === nothing &&
-                throw(
-                    ArgumentError(
-                        "column $name has an ordered retained dictionary, but " *
-                        "its original category pool is unavailable",
-                    ),
-                )
-        end
-
-        poolwritetype =
-            inferreddeclaration === nothing ? freshwritetype : first(inferreddeclaration)
-        pool = _dictionarypool(values, poolhint; writetype=poolwritetype)
-        inferredplan =
-            inferreddeclaration === nothing ? nothing :
-            _inferredstorageplan(
-                fieldname,
-                AbstractVector[pool],
-                context;
-                target=first(inferreddeclaration),
-                retained=retainedvaluefield,
-            )
-        lookup = _dictionarylookup(pool)
-        missingindex =
-            retained !== nothing && !retained.nullable ? findfirst(ismissing, pool) :
-            nothing
-        missingindex === nothing || (missingindex = Int64(missingindex - 1))
-        candidateindices = Vector{Union{Missing,Int64}}[
-            _dictionaryindices(part, lookup, missingindex) for part in values
-        ]
-        candidatevaluefield, candidatevaluedata = if inferredplan !== nothing
-            if retained === nothing
-                _constructinferredfreshpart(
-                    fieldname,
-                    inferredplan,
-                    only(inferredplan.parts),
-                    context,
-                )
-            else
-                _constructinferredretainedpart(
-                    retainedvaluefield,
-                    inferredplan,
-                    only(inferredplan.parts),
-                    context,
-                )
-            end
-        elseif retained === nothing
-            _constructnewdictpooldata(
-                fieldname,
-                pool;
-                valuefield=freshvaluefield,
-                writetype=freshwritetype,
-                routes=freshroutes,
-                context,
-            )
-        else
-            retainedtype = retained.type::AC.DictionaryType
-            constructionfield =
-                retainedvaluefield === nothing ?
-                AC.dictvaluefield(retained, retainedtype) : retainedvaluefield
-            _constructpart(constructionfield, pool; context)
-        end
-        retainedprefix = mergedpool === nothing ? 0 : mergedpool.retainedprefix
-        valuefield, valuedata, remap = _compactdictionarypool(
-            candidatevaluefield,
-            candidatevaluedata,
-            retainedprefix,
+    # Built by calls this function does not infer (see `_uninferred`).
+    field, data =
+        dictintent ?
+        _uninferred(
+            _dictcolumnparts,
+            name,
+            fieldname,
+            parts,
+            poolhints,
+            retained,
+            growable,
             context,
-        )
-        indices = Vector{Union{Missing,Int64}}[
-            _remapdictionaryindices(part, remap) for part in candidateindices
-        ]
-        if retained === nothing
-            # The narrowest index type the categories need; a pool that later
-            # tables may extend takes at least Int32, as pyarrow writes.
-            indextype =
-                _dictindextype(growable ? max(valuedata.len, 1 << 16) : valuedata.len)
-            field, data[1] = _newdictfromdata(
-                fieldname,
-                valuefield,
-                valuedata,
-                indices[1];
-                nullable=any(v -> Missing <: eltype(v), values),
-                indextype,
-                ordered=all(_isordered, parts),
-            )
-        else
-            field, data[1] = _retaineddictfromdata(
-                retained,
-                valuefield,
-                valuedata,
-                Int(valuedata.len),
-                indices[1],
-                fieldname,
-            )
-        end
-        pooldata = data[1].dictionary::AC.ArrayData
-        for partition = 2:nparts
-            data[partition] = _dictbatch(field, indices[partition], pooldata)
-        end
-    else
-        narrowedparts =
-            retained === nothing ? _narrowabstractwriterparts(fieldname, parts, context) :
-            nothing
-        constructionparts = narrowedparts === nothing ? parts : narrowedparts
-        inferredplan = if retained === nothing
-            _inferredstorageplan(fieldname, constructionparts, context)
-        else
-            _, target, _ = _arrowtypestarget(context.arrowtypes, retained)
-            target === nothing ? nothing :
-            _inferredstorageplan(fieldname, constructionparts, context; target, retained)
-        end
-        registeredwriter =
-            retained === nothing || inferredplan !== nothing ? nothing :
-            _registeredwritercolumnplan(context, retained, constructionparts)
-        for partition = 1:nparts
-            partitionfield, data[partition] = try
-                _constructcolumnpart(
-                    fieldname,
-                    constructionparts[partition],
-                    partition;
-                    retained,
-                    inferredplan,
-                    registeredwriter,
-                    narrowabstract=narrowedparts === nothing,
-                    context,
-                )
-            catch err
-                (err isa _OffsetOverflow && err.part == 0) || rethrow()
-                # The overflow row is a row of this column only at its top level.
-                row = err.column == fieldname ? err.row : 0
-                throw(_OffsetOverflow(err.column, partition, row))
-            end
-            if partition == 1
-                field = partitionfield
-            else
-                _checkpartitionfield(field, partitionfield, partition, name)
-            end
-        end
-    end
+        )::Tuple{AC.Field,Vector{AC.ArrayData}} :
+        _uninferred(
+            _plaincolumnparts,
+            name,
+            fieldname,
+            parts,
+            retained,
+            context,
+        )::Tuple{AC.Field,Vector{AC.ArrayData}}
     return _withfieldmetadata(field, metadata), data
 end
 
+"A dictionary column of `_constructcolumnparts`: its field and data per partition."
+function _dictcolumnparts(name, fieldname, parts, poolhints, retained, growable, context)
+    nparts = length(parts)
+    data = Vector{AC.ArrayData}(undef, nparts)
+    local field::AC.Field
+    values = AbstractVector[
+        part isa DictEncode ? (part::DictEncode).data : part for part in parts
+    ]
+    if any(_hasrefpool, values)
+        poolhints = copy(poolhints)
+        for k in eachindex(values)
+            _hasrefpool(values[k]) || continue
+            values[k], hint = _refpoolvalues(values[k])
+            poolhints[k] === nothing && (poolhints[k] = hint)
+        end
+    end
+    retainedvaluefield = nothing
+    retainedtarget = nothing
+    if retained !== nothing
+        retainedvaluefield, retainedtarget = _registereddictionaryfield(context, retained)
+        retainedtype = retained.type::AC.DictionaryType
+        retainedvaluefield === nothing &&
+            retainedtype.valuetype isa AC.NullType &&
+            retained.nullable &&
+            _arrowtypesextension(retained) !== nothing &&
+            throw(
+                ArgumentError(
+                    "column $name has a nullable retained Dictionary<Null> with " *
+                    "an unregistered extension; materialization cannot " *
+                    "distinguish a valid null-pool index from an outer null index",
+                ),
+            )
+        # Table materialization already lifts retained pool snapshots
+        # through the dictionary value Field. They stay in the same
+        # public domain as row values until the merged pool is lowered
+        # exactly once through `_constructpart` on that value Field below.
+    end
+
+    inferreddeclaration = if retained === nothing
+        _inferredstoragedeclaration(values, context)
+    elseif retainedtarget === nothing
+        nothing
+    else
+        _inferredstoragedeclaration(values, context; target=retainedtarget)
+    end
+    freshevidence =
+        retained === nothing && inferreddeclaration === nothing ?
+        _dictionaryvaluefield(fieldname, values, name, context) : nothing
+    freshvaluefield = freshevidence === nothing ? nothing : freshevidence.field
+    freshwritetype = freshevidence === nothing ? nothing : freshevidence.writetype
+    freshroutes = freshevidence === nothing ? nothing : freshevidence.routes
+    widenpool = if inferreddeclaration !== nothing
+        true
+    elseif retained === nothing
+        freshvaluefield !== nothing && freshvaluefield.type isa AC.UnionType
+    else
+        (retained.type::AC.DictionaryType).valuetype isa AC.UnionType
+    end
+    mergedpool = _mergeddictpool(poolhints; widen=widenpool)
+    poolhint = mergedpool === nothing ? nothing : mergedpool.values
+    if retained !== nothing
+        (retained.type::AC.DictionaryType).valuetype isa AC.UnionType &&
+            retainedvaluefield === nothing &&
+            throw(
+                ArgumentError(
+                    "column $name has a retained UnionType whose child type ids " *
+                    "cannot be recovered from materialized facade values",
+                ),
+            )
+        for valuespart in values
+            T = Base.nonmissingtype(eltype(valuespart))
+            if retainedvaluefield === nothing
+                publictype = _facadebasetype(retained.type)
+                # Any string writes to a utf8 pool.
+                publictype === String && (publictype = AbstractString)
+                publictype !== Any &&
+                    !(T <: publictype) &&
+                    !_retainedwritertype((retained.type::AC.DictionaryType).valuetype, T) &&
+                    T !== Union{} &&
+                    throw(
+                        ArgumentError(
+                            "column $name holds $T values, but its retained " *
+                            "dictionary materializes as $publictype; the column " *
+                            "was replaced with incompatible data",
+                        ),
+                    )
+            else
+                islogical =
+                    T <: retainedtarget || (
+                        T === Any &&
+                        all(x -> x === missing || x isa retainedtarget, valuespart)
+                    )
+                islogical || throw(
+                    ArgumentError(
+                        "column $name holds $T values, but its retained " *
+                        "dictionary materializes as $retainedtarget; the column " *
+                        "was replaced with incompatible data",
+                    ),
+                )
+            end
+            # A non-nullable dictionary can materialize missing through a
+            # valid index into a null pool entry. The retained pool keeps
+            # that distinct from a missing index.
+            any(ismissing, valuespart) &&
+                !retained.nullable &&
+                (poolhint === nothing || !any(ismissing, poolhint)) &&
+                throw(
+                    ArgumentError(
+                        "column $name may hold missing values but its retained " *
+                        "dictionary field is non-nullable",
+                    ),
+                )
+        end
+        (retained.type::AC.DictionaryType).ordered &&
+            poolhint === nothing &&
+            throw(
+                ArgumentError(
+                    "column $name has an ordered retained dictionary, but " *
+                    "its original category pool is unavailable",
+                ),
+            )
+    end
+
+    poolwritetype =
+        inferreddeclaration === nothing ? freshwritetype : first(inferreddeclaration)
+    pool = _dictionarypool(values, poolhint; writetype=poolwritetype)
+    inferredplan =
+        inferreddeclaration === nothing ? nothing :
+        _inferredstorageplan(
+            fieldname,
+            AbstractVector[pool],
+            context;
+            target=first(inferreddeclaration),
+            retained=retainedvaluefield,
+        )
+    lookup = _dictionarylookup(pool)
+    missingindex =
+        retained !== nothing && !retained.nullable ? findfirst(ismissing, pool) : nothing
+    missingindex === nothing || (missingindex = Int64(missingindex - 1))
+    candidateindices = Vector{Union{Missing,Int64}}[
+        _dictionaryindices(part, lookup, missingindex) for part in values
+    ]
+    candidatevaluefield, candidatevaluedata = if inferredplan !== nothing
+        if retained === nothing
+            _constructinferredfreshpart(
+                fieldname,
+                inferredplan,
+                only(inferredplan.parts),
+                context,
+            )
+        else
+            _constructinferredretainedpart(
+                retainedvaluefield,
+                inferredplan,
+                only(inferredplan.parts),
+                context,
+            )
+        end
+    elseif retained === nothing
+        _constructnewdictpooldata(
+            fieldname,
+            pool;
+            valuefield=freshvaluefield,
+            writetype=freshwritetype,
+            routes=freshroutes,
+            context,
+        )
+    else
+        retainedtype = retained.type::AC.DictionaryType
+        constructionfield =
+            retainedvaluefield === nothing ? AC.dictvaluefield(retained, retainedtype) :
+            retainedvaluefield
+        _constructpart(constructionfield, pool; context)
+    end
+    retainedprefix = mergedpool === nothing ? 0 : mergedpool.retainedprefix
+    valuefield, valuedata, remap = _compactdictionarypool(
+        candidatevaluefield,
+        candidatevaluedata,
+        retainedprefix,
+        context,
+    )
+    indices = Vector{Union{Missing,Int64}}[
+        _remapdictionaryindices(part, remap) for part in candidateindices
+    ]
+    if retained === nothing
+        # The narrowest index type the categories need; a pool that later
+        # tables may extend takes at least Int32, as pyarrow writes.
+        indextype = _dictindextype(growable ? max(valuedata.len, 1 << 16) : valuedata.len)
+        field, data[1] = _newdictfromdata(
+            fieldname,
+            valuefield,
+            valuedata,
+            indices[1];
+            nullable=any(v -> Missing <: eltype(v), values),
+            indextype,
+            ordered=all(_isordered, parts),
+        )
+    else
+        field, data[1] = _retaineddictfromdata(
+            retained,
+            valuefield,
+            valuedata,
+            Int(valuedata.len),
+            indices[1],
+            fieldname,
+        )
+    end
+    pooldata = data[1].dictionary::AC.ArrayData
+    for partition = 2:nparts
+        data[partition] = _dictbatch(field, indices[partition], pooldata)
+    end
+    return field, data
+end
+
+"A non-dictionary column of `_constructcolumnparts`: its field and data per partition."
+function _plaincolumnparts(name, fieldname, parts, retained, context)
+    nparts = length(parts)
+    data = Vector{AC.ArrayData}(undef, nparts)
+    local field::AC.Field
+    constructionparts, inferredplan, registeredwriter, narrowabstract = _uninferred(
+        _plaincolumnplan,
+        fieldname,
+        parts,
+        retained,
+        context,
+    )::Tuple{Vector{AbstractVector},Any,Any,Bool}
+    for partition = 1:nparts
+        partitionfield, data[partition] = try
+            _uninferred(
+                _constructcolumnpart,
+                fieldname,
+                constructionparts[partition],
+                partition;
+                retained,
+                inferredplan,
+                registeredwriter,
+                narrowabstract,
+                context,
+            )::Tuple{AC.Field,AC.ArrayData}
+        catch err
+            (err isa _OffsetOverflow && err.part == 0) || rethrow()
+            # The overflow row is a row of this column only at its top level.
+            row = err.column == fieldname ? err.row : 0
+            throw(_OffsetOverflow(err.column, partition, row))
+        end
+        if partition == 1
+            field = partitionfield
+        else
+            _checkpartitionfield(field, partitionfield, partition, name)
+        end
+    end
+    return field, data
+end
+
+"""
+How `_plaincolumnparts` builds a column's partitions: the parts to build
+(narrowed from abstract element types), the inferred storage plan, the
+registered ArrowTypes writer plan, and whether the parts were left as given.
+"""
+function _plaincolumnplan(fieldname, parts, retained, context)
+    narrowedparts =
+        retained === nothing ? _narrowabstractwriterparts(fieldname, parts, context) :
+        nothing
+    constructionparts = narrowedparts === nothing ? parts : narrowedparts
+    inferredplan = if retained === nothing
+        _inferredstorageplan(fieldname, constructionparts, context)
+    else
+        _, target, _ = _arrowtypestarget(context.arrowtypes, retained)
+        target === nothing ? nothing :
+        _inferredstorageplan(fieldname, constructionparts, context; target, retained)
+    end
+    registeredwriter =
+        retained === nothing || inferredplan !== nothing ? nothing :
+        _registeredwritercolumnplan(context, retained, constructionparts)
+    return constructionparts, inferredplan, registeredwriter, narrowedparts === nothing
+end
+
 "One partition of a non-dictionary column, by the plan `_constructcolumnparts` chose."
-function _constructcolumnpart(
+Base.@nospecializeinfer function _constructcolumnpart(
     fieldname::String,
     @nospecialize(part::AbstractVector),
     partition::Int;

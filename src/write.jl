@@ -113,9 +113,19 @@ function write(io::IO, tbl; kwargs...)
     return io
 end
 
+"""
+`f(args...; kwargs...)` without inferring the call (it dispatches at run
+time). The write path calls each column's construction, and code that other
+packages extend (a table's DataAPI metadata methods), this way: methods
+loaded later (DataFrames and its dependencies add some that Base's generic
+code dispatches to) then invalidate at most that code, instead of making the
+whole write path compile again.
+"""
+_uninferred(f, args...; kwargs...) = Base.inferencebarrier(f)(args...; kwargs...)
+
 # One table through a one-shot writer: an error abandons the output (a path
 # destination keeps its old bytes or stays absent).
-function _writeall!(w, @nospecialize(tbl))
+Base.@nospecializeinfer function _writeall!(w, @nospecialize(tbl))
     try
         _writeparts!(w, tbl)
     catch
@@ -424,8 +434,8 @@ end
 # (and one record batch of encoded output) at a time.
 # The table and partition types are not specialized on: columns dispatch on
 # their own types, so a new table type compiles no new writer code.
-function _writeparts!(w::Writer, @nospecialize(tbl))
-    retained = _retainedschema(tbl)
+Base.@nospecializeinfer function _writeparts!(w::Writer, @nospecialize(tbl))
+    retained = _retainedschema(tbl)::Union{Nothing,AC.Schema}
     parts = Tables.partitions(tbl)
     next = iterate(parts)
     if next === nothing
@@ -468,7 +478,12 @@ function _writeparts!(w::Writer, @nospecialize(tbl))
     return nothing
 end
 
-function _writepartition!(w::Writer, @nospecialize(part), retained, several::Bool)
+Base.@nospecializeinfer function _writepartition!(
+    w::Writer,
+    @nospecialize(part),
+    retained,
+    several::Bool,
+)
     cols = Tables.columns(part)
     names = collect(Symbol, Tables.columnnames(cols))
     w.st === nothing ||
@@ -496,16 +511,20 @@ function _writepartition!(w::Writer, @nospecialize(part), retained, several::Boo
     encoded = _dictencodeflags(names, w.dictencode)
     for j in eachindex(columns)
         col = columns[j]
-        encoded[j] && !(col isa DictEncode) && !_hasrefpool(col) && (col = DictEncode(col))
+        encoded[j] &&
+            !(col isa DictEncode) &&
+            !_uninferred(_hasrefpool, col)::Bool &&
+            (col = DictEncode(col))
         # Inference from values sees the whole partition, not one batch.
-        columns[j] = _narrowcolumn(String(names[j]), col)
+        columns[j] = _uninferred(_narrowcolumn, String(names[j]), col)
     end
     # The first partition's dictionaries hold all of its categories, so its
     # batches share one pool. A later partition re-indexes its dictionaries into
     # the written pools, except an Arrow source's, whose retained construction
     # continues them from these hints.
     hints =
-        w.st === nothing || retained !== nothing ? _partitionhints(w, columns, own) :
+        w.st === nothing || retained !== nothing ?
+        _uninferred(_partitionhints, w, columns, own)::Vector{Any} :
         Any[nothing for _ in columns]
     # The partition is captured as `Any`, so `_eachbatch` compiles once, not
     # once per table type.
@@ -527,7 +546,7 @@ function _writepartition!(w::Writer, @nospecialize(part), retained, several::Boo
 end
 
 "One record batch: the first fixes the schema; later ones must conform to it."
-function _writebatch!(
+Base.@nospecializeinfer function _writebatch!(
     w::Writer,
     @nospecialize(part),
     names,
@@ -542,7 +561,7 @@ function _writebatch!(
         colmetadata = w.colmetadata
         colmetadata === nothing &&
             retained === nothing &&
-            (colmetadata = _inputcolmetadata(part, names))
+            (colmetadata = _uninferred(_inputcolmetadata, part, names))
         fields, coldata = _constructcolumns(
             names,
             [cols],
@@ -585,7 +604,8 @@ function _writebatch!(
     # A fresh Schema over the BUILT fields, so `writebatch!` re-checks them
     # against the writer's schema instead of trusting construction.
     batch = only(_tablebatches(AC.Schema(fields; metadata=sch.metadata), coldata, [nrows]))
-    writebatch!(st, batch; deltas=_dictionarydeltas(st, batch), recycle=_handoff!(w.pool))
+    deltas = _uninferred(_dictionarydeltas, st, batch)::Dict{Int64,AC.ArrayData}
+    writebatch!(st, batch; deltas, recycle=_handoff!(w.pool))
     return nothing
 end
 
@@ -639,7 +659,8 @@ dictionary.
 function _partitionhints(w::Writer, columns, own)
     hints = Vector{Any}(undef, length(columns))
     written =
-        w.st === nothing || w.dictreplacement ? nothing : _writtenpools(w.st::IPCWriteState)
+        w.st === nothing || w.dictreplacement ? nothing :
+        _uninferred(_writtenpools, w.st::IPCWriteState)::Vector{Any}
     for j in eachindex(columns)
         prior = written === nothing ? nothing : written[j]
         retainedown = own === nothing ? nothing : own[j]
@@ -682,13 +703,13 @@ fit (every later batch of the partition too) and built again, so the declared
 types never change. A zero-row partition is one empty batch.
 """
 function _eachbatch(f::F, cols::Vector{AbstractVector}, n::Int, batchsize::Int) where {F}
-    n == 0 && return f(AbstractVector[_rowslice(c, 1:0) for c in cols], 0)
+    n == 0 && return f(AbstractVector[_uninferred(_rowslice, c, 1:0) for c in cols], 0)
     size = batchsize
     start = 1
     while start <= n
         r = start:min(start + size - 1, n)
         try
-            f(AbstractVector[_rowslice(c, r) for c in cols], length(r))
+            f(AbstractVector[_uninferred(_rowslice, c, r) for c in cols], length(r))
         catch err
             err isa _InvalidUTF8 && throw(
                 _InvalidUTF8(err.column, 0, err.row == 0 ? 0 : first(r) - 1 + err.row),
@@ -846,7 +867,8 @@ function _appendbytes(
     )
     try
         for batch in _tablebatches(batchsch, coldata, batchrows)
-            writebatch!(st, batch; deltas=_dictionarydeltas(st, batch))
+            deltas = _uninferred(_dictionarydeltas, st, batch)::Dict{Int64,AC.ArrayData}
+            writebatch!(st, batch; deltas)
         end
         finishwrite!(st)
     finally
@@ -892,7 +914,7 @@ function _extendpool(written, own)
     own === nothing && return written
     T = _widenedtype(eltype(written), eltype(own))
     return _mergecategorypools(
-        AbstractVector[T === eltype(written) ? written : collect(T, written), own],
+        AbstractVector[T === eltype(written) ? written : _collectas(T, written), own],
     )
 end
 
@@ -948,7 +970,11 @@ function _nullablefield(f::AC.Field)
     return AC.Field(f.name, t; nullable=true, metadata=f.metadata, children=children)
 end
 
-"Retained Arrow schema when the source is a facade read, else nothing."
+# The retained Arrow schema when the source is a facade read, else nothing.
+# Callers pass tables of any type, and inference considers no method for an
+# unknown one, so the writer's compiled code does not depend on the Stream
+# scan code (methods other packages add there would make it recompile).
+Base.Experimental.@max_methods 1 function _retainedschema end
 _retainedschema(t::Table) = getfield(t, :schema)
 _retainedschema(s::Stream) =
     getfield(s, :scan) === nothing ? _tableschema(getfield(s, :src)) :
@@ -957,7 +983,10 @@ _retainedschema(::Any) = nothing
 
 function _writermetadata(metadata, retained, input=nothing)
     metadata !== nothing && return _metapairs(metadata)
-    retained === nothing && return _inputmetadata(input)
+    retained === nothing && return _uninferred(
+        _inputmetadata,
+        input,
+    )::Union{Nothing,Vector{Pair{String,String}}}
     retained.metadata === nothing && return nothing
     # Statistics describe the source's values, field indexes, and batch
     # boundaries. Retaining its descriptors does not preserve that identity.
@@ -968,7 +997,7 @@ end
 # A table's DataAPI metadata, as the schema's key-value pairs. Keys under the
 # reserved `ARROW:` prefix (an extension label a column was read with, say)
 # describe the source's encoding, not the table, and are left out.
-function _inputmetadata(@nospecialize(tbl))
+Base.@nospecializeinfer function _inputmetadata(@nospecialize(tbl))
     (tbl === nothing || !DataAPI.metadatasupport(typeof(tbl)).read) && return nothing
     out = Pair{String,String}[
         String(string(k)) => string(DataAPI.metadata(tbl, k)) for
@@ -977,7 +1006,7 @@ function _inputmetadata(@nospecialize(tbl))
     return isempty(out) ? nothing : out
 end
 
-function _inputcolmetadata(@nospecialize(tbl), names)
+Base.@nospecializeinfer function _inputcolmetadata(@nospecialize(tbl), names)
     DataAPI.colmetadatasupport(typeof(tbl)).read || return nothing
     out = Dict{Symbol,Vector{Pair{String,String}}}()
     for name in names
@@ -1260,7 +1289,8 @@ function _constructcolumns(
         poolhints = Any[pools === nothing ? nothing : pools[j] for pools in partpools]
         columnmeta =
             colmetamap === nothing ? nothing : get(colmetamap, names[j], nothing)
-        return _constructcolumn(
+        return _uninferred(
+            _constructcolumn,
             names[j],
             parts;
             retained=retainedfield(j),
@@ -1271,7 +1301,7 @@ function _constructcolumns(
             largelists=largelists,
             growable=growable,
             pool,
-        )
+        )::Tuple{AC.Field,Vector{AC.ArrayData}}
     end
     return AC.Field[first(b) for b in built], Vector{AC.ArrayData}[last(b) for b in built]
 end
@@ -1292,7 +1322,7 @@ _batchtasks(w::Writer, nrows::Int, ncols::Int) =
 # `written[j]`, the pool its field last wrote (storage; `nothing` starts a
 # replacement pool). Columns that cannot be built that way, such as one
 # whose own mapping differs from the field, take the retained construction.
-function _constructconforming(
+Base.@nospecializeinfer function _constructconforming(
     names,
     partcols,
     partpools,
@@ -1318,7 +1348,8 @@ function _constructconforming(
         parts = AbstractVector[p[j] for p in partcols]
         hints = Any[pools === nothing ? nothing : pools[j] for pools in partpools]
         w = written === nothing ? nothing : written[j]
-        return _conformcolumn(
+        return _uninferred(
+            _conformcolumn,
             names[j],
             parts,
             hints,
@@ -1327,7 +1358,7 @@ function _constructconforming(
             stringview,
             largelists,
             pool,
-        )
+        )::Tuple{AC.Field,Vector{AC.ArrayData}}
     end
     return AC.Field[first(b) for b in built], Vector{AC.ArrayData}[last(b) for b in built]
 end
@@ -1346,12 +1377,12 @@ function _conformcolumn(
     dictmismatch = nothing
     if expected.type isa AC.DictionaryType && written !== nothing
         conformed, dictmismatch =
-            _conformdictionary(name, parts, expected, written; stringview)
+            _uninferred(_conformdictionary, name, parts, expected, written; stringview)
         conformed === nothing || return conformed
     end
     if expected.nullable &&
        !(expected.type isa AC.DictionaryType) &&
-       all(p -> eltype(p) === Missing, parts)
+       all(p -> _eltypeof(p) === Missing, parts)
         # An all-missing column is all nulls of the field's type.
         context = _WriterContext(String(name))
         return expected,
@@ -1371,7 +1402,7 @@ function _conformcolumn(
     end
     if fresh !== nothing && mismatch !== nothing
         # Numbers widen losslessly into the field's type (Int32 into Int64).
-        widened = _widenparts(expected, parts)
+        widened = _uninferred(_widenparts, expected, parts)
         if widened !== nothing
             fresh = _freshcolumn(name, widened; stringview, largelists, pool)
             fresh === nothing ||
@@ -1388,7 +1419,7 @@ function _conformcolumn(
         (err isa ArgumentError && mismatch !== nothing) || rethrow()
         throw(
             ArgumentError(
-                "column $name does not conform to the existing schema: " * mismatch,
+                "column $name does not conform to the existing schema: $mismatch",
             ),
         )
     end
@@ -1687,7 +1718,9 @@ end
 
 _metapairs(::Nothing) = nothing
 function _metapairs(m)
-    entries = m isa AbstractDict || m isa NamedTuple ? Base.pairs(m) : m
+    # A dict iterates as its pairs (`pairs` of one has a single method, which
+    # other packages specialize, so a call here would make this recompile).
+    entries = m isa NamedTuple ? Base.pairs(m) : m
     out = Pair{String,String}[]
     for kv in entries
         kv isa Pair || throw(ArgumentError("metadata sequences must contain Pair values"))
