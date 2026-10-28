@@ -224,22 +224,28 @@ value child:
 
 | Arrow type | Element type |
 |---|---|
-| List, LargeList | [`Arrow.ListRow{T}`](@ref Arrow.ListRow): a read-only view of the row's values |
+| List, LargeList, ListView, LargeListView | [`Arrow.ListRow{T}`](@ref Arrow.ListRow): a read-only view of the row's values |
 | FixedSizeList(N) | `NTuple{N,T}` for `N ≤ 64` and non-null values; otherwise `Arrow.ListRow{T}` (a tuple with `Missing` in its element type is abstract, so every row would be boxed) |
-| Struct | a `NamedTuple` of the children's names and element types |
-| Map | `Arrow.ListRow{Pair{K,V}}`: the row's entries in stored order, duplicate keys kept (`Dict(row)` builds a dictionary) |
+| Struct | a `NamedTuple` of the children's names and element types, built when the row is read |
+| Map | [`Arrow.MapRow{K,V}`](@ref Arrow.MapRow), an `AbstractVector{Pair{K,V}}`: the row's entries in stored order, duplicate keys kept (`Dict(row)` builds a dictionary) |
 | Union | the `Union` of the children's element types |
 | Run-end encoded (composite values) | the *values* child's element type (runs are expanded) |
 | Null | `Missing` |
 
-List and map rows view a vector their column owns, so a row stays valid
-after its table is gone; `copy(column)` gives `Vector{T}` rows. Three kinds
-of field keep the dynamic path, which builds each row as a Julia value (list
-rows as `Vector{Any}`, struct rows as `Vector{Pair{String,Any}}` ordered
-name => value pairs): a struct with more than 64 fields or duplicate field
-names, a ListView or LargeListView, and a composite nested more than 8
-levels deep (each level adds to the row type, and Julia's compile time grows
-with it).
+A composite column stores its children by their element types alone:
+strings in a `DataStrings.StringVector`, binary in a `BytesVector`, lists in an
+[`Arrow.ListVector`](@ref), maps in an [`Arrow.MapVector`](@ref), structs in an
+[`Arrow.StructVector`](@ref), other values in a `Vector`. No child value is
+boxed, and a struct row is built only when it is read. The children are the
+column's own copies, so a row stays valid after its table is gone;
+`copy(column)` gives `Vector{T}` rows (`Vector{Pair{K,V}}` for maps,
+`NamedTuple`s for structs). Three kinds of field keep the dynamic path,
+which builds each row as a Julia value (list rows as `Vector{Any}`, struct
+rows as `Vector{Pair{String,Any}}` ordered name => value pairs): a struct
+with more than 64 fields or duplicate field names, a ListView or
+LargeListView of composite values, and a composite nested more than 8 levels
+deep (each level adds to the row type, and Julia's compile time grows with
+it).
 
 Three refinements. A list-family field with a registered ArrowTypes.jl child
 uses a row vector with that restored child element type; this is the same for

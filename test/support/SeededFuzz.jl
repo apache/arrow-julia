@@ -504,6 +504,30 @@ function _rowviews(::Type{E}, rows; nullable::Bool=false) where {E}
     ]
 end
 
+# `Pair{K,V}` entries as `Arrow.MapRow`s, `missing` for a null row.
+function _maprowviews(::Type{K}, ::Type{V}, rows; nullable::Bool=false) where {K,V}
+    keys, values = K[], V[]
+    spans = UnitRange{Int}[]
+    for row in rows
+        start = length(keys) + 1
+        if row !== missing
+            for (k, v) in row
+                push!(keys, k)
+                push!(values, v)
+            end
+        end
+        push!(spans, start:length(keys))
+    end
+    C = Arrow._columntype(K)
+    kcol = keys isa C ? keys : C(keys)
+    M = Arrow.MapRow{K,V}
+    T = nullable ? Union{Missing,M} : M
+    return T[
+        row === missing ? missing : M(kcol, values, first(span) - 1, length(span)) for
+        (row, span) in zip(rows, spans)
+    ]
+end
+
 function _check_expected_layout(actual, expected; label::AbstractString)
     actualnames = collect(Tables.columnnames(actual))
     expectednames = collect(keys(expected))
@@ -754,8 +778,9 @@ function _logical_layout_case()
     expected = (
         extension=table.extension,
         extension_struct=table.extension_struct,
-        maps=_rowviews(
-            Pair{DataStrings.DataString,Union{Missing,Int32}},
+        maps=_maprowviews(
+            DataStrings.DataString,
+            Union{Missing,Int32},
             [ismissing(value) ? missing : collect(pairs(value)) for value in table.maps];
             nullable=true,
         ),
@@ -1046,8 +1071,9 @@ function _physical_layout_case()
             DataBytes(longbinary),
             missing,
         ],
-        sorted_map=_rowviews(
-            Pair{DataString,Union{Missing,Int32}},
+        sorted_map=_maprowviews(
+            DataString,
+            Union{Missing,Int32},
             [["a" => Int32(1), "b" => missing], Pair[], ["c" => Int32(3)]],
         ),
         date32=Date[Date(1969, 12, 31), Date(1970, 1, 1), Date(1970, 1, 2)],

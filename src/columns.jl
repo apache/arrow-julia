@@ -30,7 +30,7 @@
     Arrow.ArrowVector{T} <: AbstractVector{T}
 
 Supertype of the read-only columns `Arrow.Table` and `Arrow.Stream` return
-for flat, list, and map layouts. A flat column reads its Arrow buffers in
+for flat, list, map, and struct layouts. A flat column reads its Arrow buffers in
 place (a memory-mapped file, the input bytes, or a decompressed buffer) and
 keeps that memory alive while the column is reachable, independent of its
 table. `copy(column)` returns an owned, mutable vector: a `Vector`, or a
@@ -1068,6 +1068,10 @@ function _viewablelayout(f::AC.Field, depth::Int=0)
     viewable(c) = _viewablelayout(c, depth + 1)
     t isa Union{AC.ListType,AC.FixedSizeListType} &&
         return length(f.children) == 1 && viewable(f.children[1])
+    # A list view gathers its rows' values, which it does for flat values.
+    t isa AC.ListViewType && return length(f.children) == 1 &&
+           !_nestedvalue(f.children[1]) &&
+           viewable(f.children[1])
     if t isa AC.MapType
         length(f.children) == 1 || return false
         entries = f.children[1]
@@ -1261,15 +1265,25 @@ end
 
 # --- nested rows ----------------------------------------------------------------
 #
-# Lists read as `ListRow` views of one owned vector of their child values,
-# so a row can outlive its table; fixed-size lists of up to 64 non-null
-# values as `NTuple`s; structs as `NamedTuple`s; maps as `ListRow`s of
-# `Pair`s; unions as a `Union` of their children's element types. A row type depends only
-# on its children's element types, and names each of them once, so its size
-# grows linearly with the nesting depth.
+# Lists read as `ListRow` views, maps as `MapRow` views, fixed-size lists of up
+# to 64 non-null values as `NTuple`s, structs as `NamedTuple`s built on access,
+# and unions as a `Union` of their children's element types. A column's
+# element type alone fixes how its child values are stored (`_columntype`):
+# strings in a `StringVector`, binary in a `BytesVector`, lists in a
+# `ListVector`, maps in a `MapVector`, structs in a `StructVector`, other
+# values in a `Vector`. Columns keep their children untyped and read them back
+# through that type, so a column type has only its element type as a
+# parameter, however deep the schema, and access is type-stable. Child values
+# are copied out of the source, so a row stays valid after its table is gone.
 
-const _NestedLayout =
-    Union{AC.ListType,AC.FixedSizeListType,AC.MapType,AC.StructType,AC.UnionType}
+const _NestedLayout = Union{
+    AC.ListType,
+    AC.ListViewType,
+    AC.FixedSizeListType,
+    AC.MapType,
+    AC.StructType,
+    AC.UnionType,
+}
 const _MAX_ROW_FIELDS = 64
 const _MAX_ROW_DEPTH = 8
 const _MAX_TUPLE_ROW = 64
@@ -1277,26 +1291,91 @@ const _MAX_TUPLE_ROW = 64
 """
     Arrow.ListRow{T} <: AbstractVector{T}
 
-A row of a list or map column, or of a fixed-size list column longer than
-64 values or with nullable values: a read-only view of consecutive values
-in its column's owned vector of child values (`Pair`s for a map), so the
-row stays valid after its table is gone. `copy(row)` gives a `Vector{T}`.
+A row of a list column, or of a fixed-size list column longer than 64 values
+or with nullable values: a read-only view of consecutive child values of its
+column. It stays valid after its table is gone. `copy(row)` gives a
+`Vector{T}`.
 """
 struct ListRow{T} <: AbstractVector{T}
-    values::Vector{T}
+    values::Any   # the column's child values, a `_columntype(T)`
+    offset::Int   # child values before the row's first
+    len::Int
+end
+
+"""
+    Arrow.MapRow{K,V} <: AbstractVector{Pair{K,V}}
+
+A row of a map column: its entries as `key => value` pairs, in stored order
+(duplicate keys are kept; `Dict(row)` keeps the last). It stays valid after
+its table is gone. `copy(row)` gives a `Vector{Pair{K,V}}`.
+"""
+struct MapRow{K,V} <: AbstractVector{Pair{K,V}}
+    keys::Any     # the column's keys and values, `_columntype(K)`, `_columntype(V)`
+    values::Any
     offset::Int
     len::Int
 end
 
-Base.size(r::ListRow) = (r.len,)
-Base.IndexStyle(::Type{<:ListRow}) = IndexLinear()
-Base.@propagate_inbounds function Base.getindex(r::ListRow, i::Int)
-    @boundscheck checkbounds(r, i)
-    return @inbounds r.values[r.offset + i]
+"""
+    Arrow.ListVector{T} <: Arrow.ArrowVector{T}
+
+A list column: row `i` is the [`Arrow.ListRow`](@ref) of child values
+`offsets[i]+1:offsets[i+1]`, or `missing` where the validity bitmap marks a
+null.
+"""
+struct ListVector{T} <: ArrowVector{T}
+    offsets::Vector{Int}
+    values::Any   # child values, a `_columntype(eltype(row))`
+    validity::Vector{UInt8}
+    bitoffset::Int
+    owner::Any
 end
+
+"""
+    Arrow.MapVector{T} <: Arrow.ArrowVector{T}
+
+A map column: row `i` is the [`Arrow.MapRow`](@ref) of entries
+`offsets[i]+1:offsets[i+1]`, or `missing` where the validity bitmap marks a
+null.
+"""
+struct MapVector{T} <: ArrowVector{T}
+    offsets::Vector{Int}
+    keys::Any
+    values::Any
+    validity::Vector{UInt8}
+    bitoffset::Int
+    owner::Any
+end
+
+"""
+    Arrow.StructVector{T} <: Arrow.ArrowVector{T}
+
+A struct column: row `i` is the `NamedTuple` of each field's value `i`,
+built when it is read, or `missing` where the validity bitmap marks a null.
+"""
+struct StructVector{T} <: ArrowVector{T}
+    children::Vector{AbstractVector}   # field `k`'s values, a `_columntype(fieldtype(row, k))`
+    offset::Int                        # child values before row 1
+    len::Int
+    validity::Vector{UInt8}
+    bitoffset::Int
+    owner::Any
+end
+
+_columntype(::Type{T}) where {T} = _columntype(T, Base.nonmissingtype(T))
+_columntype(::Type{Missing}) = Vector{Missing}
+_columntype(::Type{T}, ::Type) where {T} = Vector{T}
+_columntype(::Type{T}, ::Type{DataStrings.DataString}) where {T} =
+    DataStrings.StringVector{T}
+_columntype(::Type{T}, ::Type{DataStrings.DataBytes}) where {T} = DataStrings.BytesVector{T}
+_columntype(::Type{T}, ::Type{<:ListRow}) where {T} = ListVector{T}
+_columntype(::Type{T}, ::Type{<:MapRow}) where {T} = MapVector{T}
+_columntype(::Type{T}, ::Type{<:NamedTuple}) where {T} = StructVector{T}
 
 _childdatas(datas, k::Int) = AC.ArrayData[d.children[k] for d in datas]
 
+# The row type of nested field `f` over batches `datas`: each child's element
+# type, so a child whose data holds undeclared nulls widens every batch's rows.
 function _rowtype(f::AC.Field, ctx::_ViewContext, datas)
     t = f.type
     if t isa AC.StructType
@@ -1313,7 +1392,7 @@ function _rowtype(f::AC.Field, ctx::_ViewContext, datas)
         entrydatas = _childdatas(datas, 1)
         K = _vieweltype(entries.children[1], _childdatas(entrydatas, 1), ctx)
         V = _vieweltype(entries.children[2], _childdatas(entrydatas, 2), ctx)
-        return ListRow{Pair{K,V}}
+        return MapRow{K,V}
     end
     E = _vieweltype(f.children[1], _childdatas(datas, 1), ctx)
     # A tuple of a non-concrete `E` (nullable values) is an abstract type:
@@ -1325,79 +1404,148 @@ function _rowtype(f::AC.Field, ctx::_ViewContext, datas)
     return ListRow{E}
 end
 
-"""
-    Arrow.ListVector{T} <: ArrowVector{T}
+# Whether field `f`'s values are nested rows (through a dictionary's values
+# or run-end encoding too).
+_nestedvalue(f::AC.Field) =
+    f.type isa AC.DictionaryType ? _nestedvalue(AC.dictvaluefield(f, f.type)) :
+    f.type isa AC.RunEndEncodedType ? _nestedvalue(f.children[2]) : f.type isa _NestedLayout
 
-A list or map column: row `i` is an [`Arrow.ListRow`](@ref) of the
-column's owned vector of child values (`Pair`s for a map).
-"""
-struct ListVector{T,O,E} <: ArrowVector{T}
-    offsets::AbstractVector{O}
-    values::Vector{E}
-    validity::Vector{UInt8}
-    bitoffset::Int
-    owner::Any
+# Element `j` of `values`, a column of `T` values stored as its `_columntype`.
+Base.@propagate_inbounds _childvalue(::Type{T}, values, j::Int) where {T} =
+    (values::_columntype(T))[j]
+
+Base.IndexStyle(::Type{<:Union{ListRow,MapRow}}) = IndexLinear()
+Base.size(r::Union{ListRow,MapRow}) = (r.len,)
+Base.size(v::Union{ListVector,MapVector}) = (length(v.offsets) - 1,)
+Base.size(v::StructVector) = (v.len,)
+
+Base.@propagate_inbounds function Base.getindex(r::ListRow{T}, i::Int) where {T}
+    @boundscheck checkbounds(r, i)
+    return @inbounds _childvalue(T, r.values, r.offset + i)
 end
 
-Base.size(v::ListVector) = (length(v.offsets) - 1,)
+Base.@propagate_inbounds function Base.getindex(r::MapRow{K,V}, i::Int) where {K,V}
+    @boundscheck checkbounds(r, i)
+    j = r.offset + i
+    return @inbounds Pair{K,V}(_childvalue(K, r.keys, j), _childvalue(V, r.values, j))
+end
+
 Base.@propagate_inbounds function Base.getindex(v::ListVector{T}, i::Int) where {T}
     @boundscheck checkbounds(v, i)
     if Missing <: T
         null = GC.@preserve v _isnullslot(v.validity, v.bitoffset, i)
         null && return missing
     end
-    lo, hi = GC.@preserve v (@inbounds(v.offsets[i]), @inbounds(v.offsets[i + 1]))
-    return ListRow(v.values, Int(lo), Int(hi - lo))
+    lo, hi = @inbounds v.offsets[i], v.offsets[i + 1]
+    return Base.nonmissingtype(T)(v.values, lo, hi - lo)
 end
 
-# An owned copy holds each row as its own `Vector`, over every batch.
-function Base.copy(v::ListVector{T,O,E}) where {T,O,E}
-    R = Missing <: T ? Union{Missing,Vector{E}} : Vector{E}
-    return R[x === missing ? missing : collect(x) for x in v]
-end
-function Base.copy(c::ChainedVector{T,ListVector{T,O,E}}) where {T,O,E}
-    R = Missing <: T ? Union{Missing,Vector{E}} : Vector{E}
-    return R[x === missing ? missing : collect(x) for x in c]
+Base.@propagate_inbounds function Base.getindex(v::MapVector{T}, i::Int) where {T}
+    @boundscheck checkbounds(v, i)
+    if Missing <: T
+        null = GC.@preserve v _isnullslot(v.validity, v.bitoffset, i)
+        null && return missing
+    end
+    lo, hi = @inbounds v.offsets[i], v.offsets[i + 1]
+    return Base.nonmissingtype(T)(v.keys, v.values, lo, hi - lo)
 end
 
-# The child's values in an owned vector: rows view it, so it must not be a
-# view of the source's memory.
-function _ownedvalues(::Type{E}, col, budget) where {E}
-    col isa Vector{E} && return col
-    _chargeexact!(budget, E, length(col), "nested child values")
-    out = Vector{E}(undef, length(col))
-    @inbounds for i in eachindex(out, col)
-        out[i] = col[i]
+Base.@propagate_inbounds function Base.getindex(v::StructVector{T}, i::Int) where {T}
+    @boundscheck checkbounds(v, i)
+    if Missing <: T
+        null = GC.@preserve v _isnullslot(v.validity, v.bitoffset, i)
+        null && return missing
+    end
+    return _structrow(Base.nonmissingtype(T), v.children, v.offset + i)
+end
+
+# Generated so each field reads through its own child type, without
+# allocating. The generator loops: a comprehension's closure would compile
+# once per row type.
+@generated function _structrow(
+    ::Type{R},
+    children::Vector{AbstractVector},
+    j::Int,
+) where {R<:NamedTuple}
+    fields = Expr[]
+    for k = 1:fieldcount(R)
+        push!(fields, :(@inbounds _childvalue($(fieldtype(R, k)), children[$k], j)))
+    end
+    return :(R(($(fields...),)))
+end
+
+# An owned copy holds each list or map row as its own `Vector`, over every
+# batch, and each struct row as its `NamedTuple`.
+function _copyrows(::Type{T}, v) where {T}
+    R = Vector{eltype(Base.nonmissingtype(T))}
+    out = Vector{Missing<:T ? Union{Missing,R} : R}(undef, length(v))
+    for (i, x) in enumerate(v)
+        out[i] = x === missing ? missing : collect(x)
     end
     return out
 end
+Base.copy(v::Union{ListVector{T},MapVector{T}}) where {T} = _copyrows(T, v)
+Base.copy(c::ChainedVector{T,<:Union{ListVector{T},MapVector{T}}}) where {T} =
+    _copyrows(T, c)
+Base.copy(v::StructVector{T}) where {T} = T[v[i] for i = 1:length(v)]
 
-# Not specialized on the row or value type, like `_nestedbatch`.
-function _listvector(
-    @nospecialize(T::Type),
+# The values of child `d` (field `f`) as their `_columntype(E)`: the column a
+# read builds, copied into owned storage when it is a view of the source
+# (rows view their column's children, and outlive their table).
+function _childcolumn(
+    f::AC.Field,
     d::AC.ArrayData,
-    @nospecialize(values::Vector),
-    budget,
+    ctx::_ViewContext,
+    @nospecialize(E::Type)
 )
-    E = eltype(values)
-    n = Int64(d.len)
-    offs = AC.rolebuffer(d, AC.OFFSETS)
-    validity, bitoffset = _validitybits(d)
-    wide = AC.layoutspec_of(d.type).offsetwidth == 8
-    if n == 0
-        return ListVector{T,wide ? Int64 : Int32,E}(
-            wide ? Int64[0] : Int32[0],
-            values,
-            validity,
-            bitoffset,
-            d,
-        )
-    end
-    offsets =
-        wide ? _wrapbuffer(Int64, offs, d.offset, n + 1, budget) :
-        _wrapbuffer(Int32, offs, d.offset, n + 1, budget)
-    return ListVector{T,eltype(offsets),E}(offsets, values, validity, bitoffset, d)
+    col = _viewcolumn(f, AC.ArrayData[d], ctx, E)
+    C = _columntype(E)
+    col isa C && return col
+    return _storeas(C, col, ctx.budget)
 end
+
+function _storeas(::Type{Vector{E}}, col, budget) where {E}
+    _chargeexact!(budget, E, length(col), "nested child values")
+    return copyto!(Vector{E}(undef, length(col)), 1, col, 1, length(col))
+end
+_storeas(::Type{DataStrings.StringVector{E}}, col, budget) where {E} =
+    DataStrings.StringVector{E}(collect(col))
+function _storeas(::Type{DataStrings.BytesVector{E}}, col, budget) where {E}
+    payloads = Vector{_StringPayload}(undef, length(col))
+    buffers = Vector{UInt8}[]
+    for (i, x) in enumerate(col)
+        if x === missing
+            payloads[i] = DataStrings.PAYLOAD_MISSING
+            continue
+        end
+        bytes = collect(UInt8, x)
+        n = length(bytes)
+        payloads[i] = if n <= DataStrings.INLINE_MAX
+            DataStrings.inline_payload(bytes, 1, n)
+        else
+            push!(buffers, bytes)
+            DataStrings.view_payload(bytes, 1, n, length(buffers) - 1, 0)
+        end
+    end
+    return DataStrings.BytesVector{E}(payloads, buffers, Val(:trusted))
+end
+
+# The `n + 1` offsets of list or map batch `d` as owned `Int`s, plus `base`
+# (a map's entries struct offset).
+function _listoffsets(d::AC.ArrayData, base::Int, budget)
+    n = Int64(d.len)
+    _chargeexact!(budget, Int, n + 1, "list offsets")
+    n == 0 && return Int[base]
+    buf = AC.rolebuffer(d, AC.OFFSETS)
+    out = Vector{Int}(undef, n + 1)
+    GC.@preserve d begin
+        AC.layoutspec_of(d.type).offsetwidth == 8 ?
+        _addbase!(out, _wrapbuffer(Int64, buf, d.offset, n + 1, budget), base) :
+        _addbase!(out, _wrapbuffer(Int32, buf, d.offset, n + 1, budget), base)
+    end
+    return out
+end
+_addbase!(out, offsets, base::Int) = (out.=offsets .+ base; out)
 
 # Not specialized on the row type, so it compiles once for every nested
 # column; the per-row loops it calls are function barriers specialized on
@@ -1413,28 +1561,21 @@ function _nestedbatch(
     budget = ctx.budget
     _chargeobject!(budget, _VIEW_OBJECT_BYTES, "column view")
     t isa AC.UnionType && return _unionrows(T, f, d, ctx)
+    validity, bitoffset = _validitybits(d)
     if t isa AC.StructType
-        # A loop, not a generator: a closure over `R` would be a new type,
-        # compiled again, for every row type.
-        cols = Vector{Any}(undef, length(f.children))
+        children = Vector{AbstractVector}(undef, length(f.children))
         for (k, c) in enumerate(f.children)
-            cols[k] = _viewcolumn(c, AC.ArrayData[d.children[k]], ctx, fieldtype(R, k))
+            children[k] = _childcolumn(c, d.children[k], ctx, fieldtype(R, k))
         end
-        return _structrows(T, Tuple(cols), d, budget)
+        return StructVector{T}(children, Int(d.offset), Int(d.len), validity, bitoffset, d)
     end
     if t isa AC.MapType
         entries, ed = f.children[1], d.children[1]
         K, V = fieldtypes(eltype(R))
-        keys = _viewcolumn(entries.children[1], AC.ArrayData[ed.children[1]], ctx, K)
-        vals = _viewcolumn(entries.children[2], AC.ArrayData[ed.children[2]], ctx, V)
-        n = Int(ed.len)
-        _chargeexact!(budget, Pair{K,V}, n, "map entries")
-        return _listvector(
-            T,
-            d,
-            _mapentries(Pair{K,V}, keys, vals, Int(ed.offset), n),
-            budget,
-        )
+        keys = _childcolumn(entries.children[1], ed.children[1], ctx, K)
+        vals = _childcolumn(entries.children[2], ed.children[2], ctx, V)
+        offsets = _listoffsets(d, Int(ed.offset), budget)
+        return MapVector{T}(offsets, keys, vals, validity, bitoffset, d)
     end
     E = eltype(R)
     if t isa AC.FixedSizeListType && R <: Tuple
@@ -1444,51 +1585,66 @@ function _nestedbatch(
         child = _viewcolumn(f.children[1], AC.ArrayData[d.children[1]], ctx, E)
         return _tuplerows(T, Val(N), child, d, budget)
     end
-    child = _viewcolumn(f.children[1], AC.ArrayData[d.children[1]], ctx, E)
-    if t isa AC.FixedSizeListType
-        values = _ownedvalues(E, child, budget)
+    values = _childcolumn(f.children[1], d.children[1], ctx, E)
+    t isa AC.ListViewType &&
+        return _listviewvector(T, d, values, validity, bitoffset, budget)
+    offsets = if t isa AC.FixedSizeListType
         w = t.listsize
-        _chargeexact!(budget, Int64, d.len + 1, "fixed-size list offsets")
-        validity, bitoffset = _validitybits(d)
-        base = Int64(d.offset) * w
-        offsets = Int64[base + Int64(i) * w for i = 0:(d.len)]
-        return ListVector{T,Int64,E}(offsets, values, validity, bitoffset, d)
+        _chargeexact!(budget, Int, d.len + 1, "fixed-size list offsets")
+        Int[(Int(d.offset) + i) * w for i = 0:(d.len)]
+    else
+        _listoffsets(d, 0, budget)
     end
-    return _listvector(T, d, _ownedvalues(E, child, budget), budget)
+    return ListVector{T}(offsets, values, validity, bitoffset, d)
 end
 
-# Entry `j` pairs the key and value at `base + j`, the entries struct's own
-# offset. Specialized on the key and value column types (a function barrier).
-function _mapentries(::Type{P}, keys, vals, base::Int, n::Int) where {P}
-    pairs = Vector{P}(undef, n)
-    for j = 1:n
-        pairs[j] = keys[base + j] => vals[base + j]
+# A list view batch: rows may overlap or come in any order, so the child
+# values of each row are gathered in row order (their own storage keeps
+# flat values only; see `_viewablelayout`).
+function _listviewvector(
+    @nospecialize(T::Type),
+    d::AC.ArrayData,
+    values,
+    validity,
+    bitoffset,
+    budget,
+)
+    n = Int64(d.len)
+    _chargeexact!(budget, Int, n + 1, "list view offsets")
+    offsets = zeros(Int, n + 1)
+    n == 0 &&
+        return ListVector{T}(offsets, _gathered(values, Int[]), validity, bitoffset, d)
+    wide = AC.layoutspec_of(d.type).offsetwidth == 8
+    starts, sizes = GC.@preserve d (
+        wide ?
+        (
+            Int.(_wrapbuffer(Int64, AC.rolebuffer(d, AC.ELEMENT_OFFSETS), d.offset, n)),
+            Int.(_wrapbuffer(Int64, AC.rolebuffer(d, AC.SIZES), d.offset, n)),
+        ) :
+        (
+            Int.(_wrapbuffer(Int32, AC.rolebuffer(d, AC.ELEMENT_OFFSETS), d.offset, n)),
+            Int.(_wrapbuffer(Int32, AC.rolebuffer(d, AC.SIZES), d.offset, n)),
+        )
+    )
+    for i = 1:n
+        len = _isnullslot(validity, bitoffset, i) ? 0 : sizes[i]
+        offsets[i + 1] = offsets[i] + len
     end
-    return pairs
-end
-
-# Row `j` of a struct's child columns. Generated because `map` builds a
-# tuple of 32 or more values through a `Vector{Any}`; left to the inliner,
-# since inlining a wide row into the read loop multiplies its compile time.
-@generated _structrow(cols::Tuple, j::Int) =
-    Expr(:tuple, (:(cols[$k][j]) for k = 1:fieldcount(cols))...)
-
-function _structrows(::Type{T}, cols::Tuple, d::AC.ArrayData, budget) where {T}
-    NT = Base.nonmissingtype(T)
-    n = Int(d.len)
-    _chargeexact!(budget, T, n, "struct rows")
-    out = Vector{T}(undef, n)
-    validity, bitoffset = _validitybits(d)
-    base = Int(d.offset)
-    GC.@preserve validity cols for i = 1:n
-        if Missing <: T && _isnullslot(validity, bitoffset, i)
-            out[i] = missing
-        else
-            out[i] = NT(_structrow(cols, base + i))
+    _chargeexact!(budget, Int, offsets[end], "list view value index")
+    take = Vector{Int}(undef, offsets[end])
+    for i = 1:n
+        for k = 1:(offsets[i + 1] - offsets[i])
+            take[offsets[i] + k] = starts[i] + k
         end
     end
-    return out
+    return ListVector{T}(offsets, _gathered(values, take), validity, bitoffset, d)
 end
+
+_gathered(values::Vector, take) = values[take]
+_gathered(v::DataStrings.StringVector{E}, take) where {E} =
+    DataStrings.StringVector{E}(v.payloads[take], v.buffers, Val(:trusted))
+_gathered(v::DataStrings.BytesVector{E}, take) where {E} =
+    DataStrings.BytesVector{E}(v.payloads[take], v.buffers, Val(:trusted))
 
 function _tuplerows(::Type{T}, ::Val{N}, child, d::AC.ArrayData, budget) where {T,N}
     n = Int(d.len)

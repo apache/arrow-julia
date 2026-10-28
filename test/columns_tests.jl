@@ -25,6 +25,10 @@ end
 Arrow.sourcelength(s::ColumnsBytesSource) = length(s.data)
 Arrow.readrange(s::ColumnsBytesSource, off, len) = s.data[(off + 1):(off + len)]
 
+# Bytes `f(x)` allocates once compiled, measured inside a function so the
+# call is not a dynamic one.
+allocationsof(f, x) = (f(x); @allocated f(x))
+
 function arrowbytes(table; kw...)
     io = IOBuffer()
     Arrow.write(io, table; kw...)
@@ -351,8 +355,17 @@ end
         @test isequal(collect(t.l), tbl.l)
         @test eltype(t.ls) == Row{DataString} && t.ls == tbl.ls
         @test eltype(t.st) == @NamedTuple{a::Int64, b::DataString} && t.st == tbl.st
-        @test eltype(t.m) == Row{Pair{DataString,Int64}}
+        @test eltype(t.m) == Arrow.MapRow{DataString,Int64}
         @test t.m == [["k" => 1], Pair{String,Int64}[], ["p" => 2]]
+        # The element type alone fixes how children are stored: strings in a
+        # StringVector, structs lazily in a StructVector, maps as key and
+        # value columns, so no value is boxed.
+        @test t.ls isa Arrow.ListVector && t.ls.values isa StringVector{DataString}
+        @test t.st isa Arrow.StructVector &&
+              t.st.children[1] isa Vector{Int64} &&
+              t.st.children[2] isa StringVector{DataString}
+        @test t.m isa Arrow.MapVector && t.m.keys isa StringVector{DataString}
+        @test t.ll.values isa Arrow.ListVector{Row{Int64}}
         @test eltype(t.t) == NTuple{2,Int16} && t.t == tbl.t
         @test eltype(t.ll) == Row{Row{Int64}} && t.ll == tbl.ll
         # Rows outlive their table; copies hold rows as their own vectors.
@@ -361,6 +374,8 @@ end
         @test row == [1, 2]
         @test copy(t.l) isa Vector{Union{Missing,Vector{Int64}}} &&
               isequal(copy(t.l), tbl.l)
+        @test copy(t.m) isa Vector{Vector{Pair{DataString,Int64}}} &&
+              copy(t.st) isa Vector{@NamedTuple{a::Int64,b::DataString}}
         # Several batches chain, and copy the same way.
         two = Arrow.Table(arrowbytes(Tables.partitioner([tbl, tbl]); file=true))
         @test isequal(collect(two.l), [tbl.l; tbl.l]) && two.st == [tbl.st; tbl.st]
@@ -423,6 +438,25 @@ end
         @test eltype(f4.f) == Row{Union{Missing,Int16}}
         @test isequal(reduce(vcat, f4.f), vals)
         @test isequal(Arrow.Table(arrowbytes(f4)).f, f4.f)
+        # List views gather their rows' values, so rows may overlap or come
+        # in any order.
+        cf, cd = AC.fromjulia("item", ["a", "b", "c", "a longer value"])
+        vf = AC.Field("v", AC.ListViewType(false); nullable=true, children=[cf])
+        vd = AC.ArrayData(
+            AC.ListViewType(false),
+            3,
+            [
+                AC._databuffer(UInt8[0b101]),
+                AC._databuffer(Int32[2, 0, 0]),
+                AC._databuffer(Int32[2, 1, 3]),
+            ];
+            children=[cd],
+            nullcount=1,
+        )
+        vs = AC.Schema([vf])
+        lv = Arrow.Table(Arrow.writestream(vs, [AC.RecordBatch(vs, [vd], 3)])).v
+        @test eltype(lv) == Union{Missing,Row{DataString}}
+        @test isequal(collect(lv), [["c", "a longer value"], missing, ["a", "b", "c"]])
         # Fixed-size lists of no values read as empty tuples.
         cf, cd = AC.fromjulia("item", Int64[])
         zf = AC.Field("z", AC.FixedSizeListType(0); nullable=false, children=[cf])
@@ -437,6 +471,28 @@ end
         deep9 = Arrow.Table(arrowbytes((x=[nest([1], 8)],))).x
         @test eltype(deep8) <: Row && deep8 == [nest([1], 7)]
         @test !(eltype(deep9) <: Row) && deep9 == [nest([1], 8)]
+    end
+
+    @testset "nested rows read without boxing their values" begin
+        n = 100_000
+        tbl = (
+            st=[(a=i, b=string("s", i)) for i = 1:n],
+            ls=[[string(i), "x"] for i = 1:n],
+            m=[Dict(string(i) => i) for i = 1:n],
+        )
+        bytes = arrowbytes(tbl)
+        Arrow.Table(bytes)
+        # A boxed child value or row would cost an allocation each.
+        @test (@allocations Arrow.Table(bytes)) < 5_000
+        t = Arrow.Table(bytes)
+        bsum(st) = sum(r -> ncodeunits(r.b), st)
+        lsum(ls) = sum(r -> sum(ncodeunits, r), ls)
+        # Rows build without allocating once compiled (older Julia and coverage
+        # builds do not always inline far enough for that).
+        if VERSION >= v"1.12" && Base.JLOptions().code_coverage == 0
+            @test allocationsof(bsum, t.st) == 0 && allocationsof(lsum, t.ls) == 0
+        end
+        @test t.st[end] == tbl.st[end] && t.ls[2] == ["2", "x"] && t.m[3] == ["3" => 3]
     end
 
     @testset "an uncompressed open allocates independently of its size" begin
