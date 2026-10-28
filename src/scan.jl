@@ -119,8 +119,12 @@ function _recordbatchmeta(
     variadics::AbstractVector{Int64}=variadiccounts(header),
 )
     rblen = something(header.length, Int64(0))
-    0 <= rblen <= limits.max_array_length ||
-        throw(ValidationError("record batch length $rblen exceeds limit"))
+    rblen >= 0 || throw(ValidationError("record batch length $rblen is negative"))
+    rblen <= limits.max_array_length || _limiterror(
+        "record batch length $rblen",
+        "max_array_length",
+        limits.max_array_length,
+    )
 
     nodes = something(header.nodes, Meta.FieldNode[])
     expectednodes = sum(_fieldnodespan(f) for f in fields; init=0)
@@ -135,8 +139,13 @@ function _recordbatchmeta(
         nodeidx += _fieldnodespan(f)
     end
     for node in nodes
-        0 <= node.length <= limits.max_array_length ||
-            throw(ValidationError("field-node length $(node.length) exceeds limit"))
+        node.length >= 0 ||
+            throw(ValidationError("field-node length $(node.length) is negative"))
+        node.length <= limits.max_array_length || _limiterror(
+            "field-node length $(node.length)",
+            "max_array_length",
+            limits.max_array_length,
+        )
         0 <= node.null_count <= node.length ||
             throw(ValidationError("invalid field-node null count $(node.null_count)"))
     end
@@ -162,8 +171,12 @@ function _recordbatchmeta(
         offset >= 0 || throw(ValidationError("negative batch buffer offset $offset"))
         offset % 8 == 0 ||
             throw(ValidationError("batch buffer offset $offset is not 8-byte aligned"))
-        0 <= len <= limits.max_buffer_bytes ||
-            throw(ValidationError("batch buffer length $len exceeds limit"))
+        len >= 0 || throw(ValidationError("batch buffer length $len is negative"))
+        len <= limits.max_buffer_bytes || _limiterror(
+            "batch buffer length $len",
+            "max_buffer_bytes",
+            limits.max_buffer_bytes,
+        )
         bufferend = try
             AC.checked_add(offset, len)
         catch e
@@ -2333,13 +2346,7 @@ function _parseblockmeta(
     declared = Int64(AC.loadat(bytes, Int32, Int64(4)))
     declared == metalen - 8 ||
         throw(ValidationError("footer block metadata length does not match the message"))
-    0 < declared <= limits.max_metadata_bytes || throw(
-        ValidationError(
-            "metadata length $declared outside (0, $(limits.max_metadata_bytes)]",
-        ),
-    )
-    0 <= bodylen <= limits.max_body_bytes ||
-        throw(ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"))
+    _checkblocklengths(declared, bodylen, limits)
     _chargevector!(budget, UInt8, declared, "metadata allocation")
     metabytes = AC.slicebytes(AC.subslice(bytes, 8, declared))
     version, header_type, _, _ = _verify_ipc_metadata_budgeted(metabytes, limits, budget)
@@ -2364,10 +2371,11 @@ function _rangedfooter(sf::SourceFile, budget::AllocationBudget)
     tail[(end - 5):end] == Vector{UInt8}(FILE_MAGIC) ||
         throw(ValidationError("missing trailing ARROW1 magic"))
     footerlen = Int64(reinterpret(Int32, tail[(end - 9):(end - 6)])[1])
-    0 < footerlen <= limits.max_metadata_bytes || throw(
-        ValidationError(
-            "footer length $footerlen outside (0, $(limits.max_metadata_bytes)]",
-        ),
+    footerlen > 0 || throw(ValidationError("footer length $footerlen is not positive"))
+    footerlen <= limits.max_metadata_bytes || _limiterror(
+        "footer length $footerlen",
+        "max_metadata_bytes",
+        limits.max_metadata_bytes,
     )
     footerstart = L - 10 - footerlen
     footerstart >= 8 || throw(ValidationError("footer escapes the file"))
@@ -2387,7 +2395,7 @@ function _rangedfooter(sf::SourceFile, budget::AllocationBudget)
         AC.checked_add(Int64(length(dictblocks)), Int64(length(recordblocks))),
     )
     nmessages <= limits.max_messages ||
-        throw(ValidationError("message count exceeds limit"))
+        _limiterror("message count", "max_messages", limits.max_messages)
     footer = FB.getrootas(Meta.Footer, footerbytes, 0)
     metaschema = footer.schema
     metaschema === nothing && throw(ValidationError("file footer carries no schema"))
@@ -2442,14 +2450,7 @@ function _zerofieldblockcount(
 )
     _, metalen, bodylen = block
     declared = metalen - 8
-    0 < declared <= sf.limits.max_metadata_bytes || throw(
-        ValidationError(
-            "metadata length $declared outside (0, $(sf.limits.max_metadata_bytes)]",
-        ),
-    )
-    0 <= bodylen <= sf.limits.max_body_bytes || throw(
-        ValidationError("body length $bodylen outside [0, $(sf.limits.max_body_bytes)]"),
-    )
+    _checkblocklengths(declared, bodylen, sf.limits)
     _chargevector!(budget, UInt8, metalen, "metadata range fetch")
     payload = _fetchexact(sf, block[1], metalen)
     msg, v, header_type = _parseblockmeta(payload, block, sf.limits, budget)
@@ -2554,14 +2555,7 @@ function _runboundscan(
     for block in metablocks
         _, metalen, bodylen = block
         declared = metalen - 8
-        0 < declared <= limits.max_metadata_bytes || throw(
-            ValidationError(
-                "metadata length $declared outside (0, $(limits.max_metadata_bytes)]",
-            ),
-        )
-        0 <= bodylen <= limits.max_body_bytes || throw(
-            ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"),
-        )
+        _checkblocklengths(declared, bodylen, limits)
     end
     _chargevector!(budget, NTuple{2,Int64}, nmeta, "metadata range plan")
     # Each block's metadata comes with the start of its body, or all of a small

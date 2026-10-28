@@ -42,6 +42,24 @@ end
 smallbudget() = Arrow.AllocationBudget(64 * 1024; ratio=64, cap=1 << 30)
 
 @testset "reader allocation limits" begin
+    @testset "a size past a Limits field names the field to raise" begin
+        bytes = take!(Arrow.write(IOBuffer(), (a=collect(1:10),); file=true))
+        for (limits, text) in (
+            (
+                Arrow.Limits(max_array_length=5),
+                "record batch length 10 exceeds Arrow.Limits max_array_length (5); " *
+                "raise it with limits=Arrow.Limits(max_array_length=...)",
+            ),
+            (Arrow.Limits(max_buffer_bytes=8), "limits=Arrow.Limits(max_buffer_bytes=...)"),
+            (Arrow.Limits(max_body_bytes=8), "limits=Arrow.Limits(max_body_bytes=...)"),
+        )
+            for source in (bytes, IOBuffer(bytes))
+                err = @test_throws Arrow.ValidationError Arrow.Table(source; limits)
+                @test occursin(text, err.value.msg)
+            end
+        end
+    end
+
     @testset "decompressed bytes a column reads fund themselves" begin
         n = 1 << 20
         frame = transcode(ZstdCompressor, zeros(UInt8, n))

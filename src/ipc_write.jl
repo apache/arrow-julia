@@ -2016,13 +2016,7 @@ function _blockmessage(
     declared = Int64(AC.loadat(blob, Int32, offset + 4))
     declared == metalen - 8 ||
         throw(ValidationError("footer block metadata length does not match the message"))
-    0 < declared <= limits.max_metadata_bytes || throw(
-        ValidationError(
-            "metadata length $declared outside (0, $(limits.max_metadata_bytes)]",
-        ),
-    )
-    0 <= bodylen <= limits.max_body_bytes ||
-        throw(ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"))
+    _checkblocklengths(declared, bodylen, limits)
     _chargevector!(budget, UInt8, declared, "metadata allocation")
     metabytes = AC.slicebytes(AC.subslice(blob, offset + 8, declared))
     version, header_type, features, _ =
@@ -2088,10 +2082,11 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
     # The trailer is <footer><Int32 footer length><ARROW1>, so the length
     # word sits 10 bytes from the end.
     footerlen = Int64(AC.loadat(blob, Int32, region.len - 10))
-    0 < footerlen <= limits.max_metadata_bytes || throw(
-        ValidationError(
-            "footer length $footerlen outside (0, $(limits.max_metadata_bytes)]",
-        ),
+    footerlen > 0 || throw(ValidationError("footer length $footerlen is not positive"))
+    footerlen <= limits.max_metadata_bytes || _limiterror(
+        "footer length $footerlen",
+        "max_metadata_bytes",
+        limits.max_metadata_bytes,
     )
     footerstart = region.len - 10 - footerlen
     footerstart >= 8 || throw(ValidationError("footer escapes the file"))

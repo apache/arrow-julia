@@ -605,14 +605,38 @@ function _framemessage(
     return fm, bodyend
 end
 
+# `what` (a declared size) passes `Limits` field `field`, whose value is `limit`.
+@noinline _limiterror(what::AbstractString, field::String, limit) = throw(
+    ValidationError(
+        "$what exceeds Arrow.Limits $field ($limit); raise it with " *
+        "limits=Arrow.Limits($field=...)",
+    ),
+)
+
+# A footer block's declared metadata and body lengths.
+function _checkblocklengths(metalen::Int64, bodylen::Int64, limits::Limits)
+    metalen > 0 || throw(ValidationError("metadata length $metalen is not positive"))
+    metalen <= limits.max_metadata_bytes || _limiterror(
+        "metadata length $metalen",
+        "max_metadata_bytes",
+        limits.max_metadata_bytes,
+    )
+    bodylen >= 0 || throw(ValidationError("body length $bodylen is negative"))
+    bodylen <= limits.max_body_bytes ||
+        _limiterror("body length $bodylen", "max_body_bytes", limits.max_body_bytes)
+    return nothing
+end
+
 _checkmessagecount(nread::Int, limits::Limits) =
-    nread < limits.max_messages || throw(ValidationError("message count exceeds limit"))
+    nread < limits.max_messages ||
+    _limiterror("message count", "max_messages", limits.max_messages)
 
 function _checkmetalen(metalen::Int64, limits::Limits)
-    0 < metalen <= limits.max_metadata_bytes || throw(
-        ValidationError(
-            "metadata length $metalen outside (0, $(limits.max_metadata_bytes)]",
-        ),
+    metalen > 0 || throw(ValidationError("metadata length $metalen is not positive"))
+    metalen <= limits.max_metadata_bytes || _limiterror(
+        "metadata length $metalen",
+        "max_metadata_bytes",
+        limits.max_metadata_bytes,
     )
     metalen % 8 == 0 ||
         throw(ValidationError("metadata length $metalen is not 8-byte aligned"))
@@ -631,8 +655,9 @@ function _verifiedmessage(
     # table/vector/string graph it may visit.
     msg = FB.getrootas(Meta.Message, metabytes, 0)
     bodylen = Int64(msg.bodyLength)
-    0 <= bodylen <= limits.max_body_bytes ||
-        throw(ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"))
+    bodylen >= 0 || throw(ValidationError("body length $bodylen is negative"))
+    bodylen <= limits.max_body_bytes ||
+        _limiterror("body length $bodylen", "max_body_bytes", limits.max_body_bytes)
     bodylen % 8 == 0 || throw(ValidationError("body length $bodylen is not 8-byte aligned"))
     return msg, version, header_type, features, bodylen
 end
@@ -1173,8 +1198,9 @@ function takenode!(c::DecodeCursor)
     )
     n = c.nodes[c.nodeidx]
     c.nodeidx += 1
-    0 <= n.length <= c.max_array_length ||
-        throw(ValidationError("field-node length $(n.length) exceeds limit"))
+    n.length >= 0 || throw(ValidationError("field-node length $(n.length) is negative"))
+    n.length <= c.max_array_length ||
+        _limiterror("field-node length $(n.length)", "max_array_length", c.max_array_length)
     0 <= n.null_count <= n.length ||
         throw(ValidationError("invalid field-node null count $(n.null_count)"))
     return n
@@ -1197,8 +1223,9 @@ function _buffermeta!(c::DecodeCursor)
     offset >= 0 || throw(ValidationError("negative batch buffer offset $offset"))
     offset % 8 == 0 ||
         throw(ValidationError("batch buffer offset $offset is not 8-byte aligned"))
-    0 <= len <= c.max_buffer_bytes ||
-        throw(ValidationError("batch buffer length $len exceeds limit"))
+    len >= 0 || throw(ValidationError("batch buffer length $len is negative"))
+    len <= c.max_buffer_bytes ||
+        _limiterror("batch buffer length $len", "max_buffer_bytes", c.max_buffer_bytes)
     if len > 0
         offset >= c.last_nonempty_end ||
             throw(ValidationError("batch buffers overlap or move backwards"))
@@ -1253,8 +1280,12 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice, needed::Int64=In
     )
     declared = AC.loadat(wire, Int64, Int64(0))
     declared == -1 && return AC.subslice(wire, 8, wire.len - 8)  # stored raw
-    0 <= declared <= c.max_buffer_bytes || throw(
-        ValidationError("declared decompressed length $declared exceeds the buffer limit"),
+    declared >= 0 ||
+        throw(ValidationError("declared decompressed length $declared is negative"))
+    declared <= c.max_buffer_bytes || _limiterror(
+        "declared decompressed length $declared",
+        "max_buffer_bytes",
+        c.max_buffer_bytes,
     )
     declared <= typemax(Int) >> 1 ||
         throw(ValidationError("declared decompressed buffer is not addressable"))
@@ -1566,8 +1597,12 @@ end
 function _recordplan(header::Meta.RecordBatch, body, version::Int16, fields, limits::Limits)
     codec = _batchcodec(header.compression, version)
     rblen = something(header.length, Int64(0))
-    0 <= rblen <= limits.max_array_length ||
-        throw(ValidationError("record batch length $rblen exceeds limit"))
+    rblen >= 0 || throw(ValidationError("record batch length $rblen is negative"))
+    rblen <= limits.max_array_length || _limiterror(
+        "record batch length $rblen",
+        "max_array_length",
+        limits.max_array_length,
+    )
     variadics = variadiccounts(header)
     c = DecodeCursor(
         header.nodes,
@@ -1827,8 +1862,12 @@ function _applydictionary!(
         throw(ValidationError("dictionary batch has unknown id $(header.id)"))
     vf = st.dictvaluefields[header.id]
     rblen = something(rb.length, Int64(0))
-    0 <= rblen <= st.limits.max_array_length ||
-        throw(ValidationError("dictionary batch length $rblen exceeds limit"))
+    rblen >= 0 || throw(ValidationError("dictionary batch length $rblen is negative"))
+    rblen <= st.limits.max_array_length || _limiterror(
+        "dictionary batch length $rblen",
+        "max_array_length",
+        st.limits.max_array_length,
+    )
     cursor = DecodeCursor(
         rb.nodes,
         rb.buffers,
