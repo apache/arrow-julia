@@ -58,8 +58,8 @@ column keeps the memory it reads alive while it is reachable, independent of
 its table. `copy(table)`, `DataFrame(table)`, and [`Arrow.read`](@ref) return
 owned, mutable columns.
 
-`mmap=true` memory-maps a file-format path; a mapping is unmapped once the
-table and all of its columns are garbage collected. It is the default except
+`mmap=true` memory-maps a path; a mapping is unmapped once the table and all
+of its columns are garbage collected. It is the default except
 on Windows, which cannot delete a file while it is mapped: there a path is
 read into memory unless `mmap=true` is passed. `mmap` has no effect on the
 other source kinds. A byte vector is read in place: do not modify or resize
@@ -1371,6 +1371,27 @@ function _readmappedfile(
     end
 end
 
+# A memory-mapped stream-format file decodes in place, like a byte vector.
+function _readmappedstream(
+    region::AC.OwnerRegion,
+    limits::Limits,
+    budget::Union{Nothing,AllocationBudget},
+    ntasks::Int,
+)
+    try
+        return _openbytes(
+            region.root::Vector{UInt8};
+            limits=limits,
+            budget=budget,
+            ntasks=ntasks,
+        )
+    catch
+        # No column exists yet, so the mapping can go now.
+        AC._unmap!(region)
+        rethrow()
+    end
+end
+
 function _openbytes(
     bytes::Vector{UInt8};
     limits::Limits=Limits(),
@@ -1397,18 +1418,19 @@ function _opensource(
     return open(path, "r") do io
         magic = Base.read(io, 6)
         seekstart(io)
-        if magic == _FILE_MAGIC && mmap
+        reported = stat(io).size
+        (reported isa Integer && 0 <= reported <= typemax(Int)) ||
+            throw(AC.ValidationError("source file length is not addressable"))
+        size = Int(reported)
+        if mmap && size > 0
             # Probe and map the same open file. A replacement of `path`
             # between those steps cannot redirect the read to another inode.
             # Columns read the mapping in place, so `release!` must not unmap
             # it: the mapping lives until nothing reaches it.
             region = AC._mmapregion(io, path; eager=false)
-            return _readmappedfile(region, limits, budget)
+            magic == _FILE_MAGIC && return _readmappedfile(region, limits, budget)
+            return _readmappedstream(region, limits, budget, ntasks)
         end
-        reported = stat(io).size
-        (reported isa Integer && 0 <= reported <= typemax(Int)) ||
-            throw(AC.ValidationError("source file length is not addressable"))
-        size = Int(reported)
         _chargevector!(budget, UInt8, size, "source file read")
         bytes = Base.read(io, size)
         length(bytes) == size || throw(

@@ -53,7 +53,7 @@ and detected automatically: the *file* format (`ARROW1` magic, random
 access, optional footer statistics) and the *stream* format.
 
 ```julia
-tbl = Arrow.Table("data.arrow")           # a file-format path: memory-mapped
+tbl = Arrow.Table("data.arrow")           # a path: memory-mapped
 tbl = Arrow.Table(io)                      # an IO: read to the end
 tbl = Arrow.Table(bytes)                   # IPC bytes already in memory
 ```
@@ -97,11 +97,10 @@ run directly on the buffers.
 
 ### Memory mapping and `release!`
 
-A path to a file-format source is memory-mapped by default (`mmap=true`), so
-opening a large file does not copy it into RAM; pass `mmap=false` to read it
-into memory instead (`Arrow.Table` reads a stream-format path into memory;
-`Arrow.Stream` maps it). A mapping is unmapped once the table and all of its
-columns are garbage collected. [`Arrow.write`](@ref) to a mapped path writes a
+A path is memory-mapped by default (`mmap=true`), so opening a large file does
+not copy it into RAM; pass `mmap=false` to read it into memory instead. A
+mapping is unmapped once the table and all of its columns are garbage
+collected. [`Arrow.write`](@ref) to a mapped path writes a
 new file and renames it over the old one, so live columns keep reading the old
 contents. Windows cannot delete a file while it is mapped, so there the
 default is `mmap=false`. A byte vector is read in place: do not modify or
