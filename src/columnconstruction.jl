@@ -1176,9 +1176,9 @@ function _packedpayloadpart(
                     # Without branches: the values are a random mix of kinds.
                     runok &= !long | ((k == runbuf) & (at == runstart))
                     if pos + 12 <= room
-                        m = max(len, 0)
-                        lomask = (UInt64(1) << (8 * min(m, 8))) - UInt64(1)
-                        himask = (UInt32(1) << (8 * clamp(m - 8, 0, 4))) - UInt32(1)
+                        m = clamp(len, 0, DataStrings.INLINE_MAX) + 1
+                        lomask = _INLINELOMASKS[m]
+                        himask = _INLINEHIMASKS[m]
                         diff =
                             ((unsafe_load(Ptr{UInt64}(run + pos)) ⊻ lo) & lomask) |
                             ((unsafe_load(Ptr{UInt32}(run + pos + 8)) ⊻ hi) & himask)
@@ -1252,6 +1252,11 @@ function _packedpayloadpart(
     d = AC.ArrayData(t, n, [validity, AC._databuffer(offsets), databuf]; nullcount=nc)
     return AC.Field(name, t; nullable), _constructedvalid(d)
 end
+
+# The masks of an inline value's first `len` bytes (0 to 12) in the two words
+# `_packedpayloadpart` compares it as, at index `len + 1`.
+const _INLINELOMASKS = ntuple(k -> (UInt64(1) << (8 * min(k - 1, 8))) - UInt64(1), 13)
+const _INLINEHIMASKS = ntuple(k -> (UInt32(1) << (8 * clamp(k - 9, 0, 4))) - UInt32(1), 13)
 
 _memequal(p::Ptr{UInt8}, q::Ptr{UInt8}, n::Int) =
     ccall(:memcmp, Cint, (Ptr{UInt8}, Ptr{UInt8}, Csize_t), p, q, n) == 0
