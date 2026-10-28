@@ -1512,6 +1512,7 @@ function run_differential(;
     seed::UInt64=DEFAULT_SEED,
     cases::Integer=EXTENDED_CASES,
     case_index::Union{Nothing,Integer}=nothing,
+    sample::Tuple{Int,Int}=(0, 1),
     include_layouts::Bool=true,
     reproduction_dir::Union{Nothing,AbstractString}=nothing,
     repro_environment::Union{Nothing,String}=nothing,
@@ -1559,7 +1560,10 @@ function run_differential(;
         end
         _clear_active_repro(reproduction_dir, :layout)
     end
-    indices = case_index === nothing ? (1:Int(cases)) : (Int(case_index):Int(case_index))
+    # `sample = (k, n)` runs the cases whose index is k + 1 modulo n.
+    indices =
+        case_index === nothing ? ((1 + first(sample)):last(sample):Int(cases)) :
+        (Int(case_index):Int(case_index))
     total = length(indices)
     total == 0 || push!(coverage, :generated_differential)
     progress_every = max(1, min(64, total ÷ 8))
@@ -2239,6 +2243,7 @@ function run_suite(;
     cases::Integer=EXTENDED_CASES,
     mutations::Integer=EXTENDED_MUTATIONS,
     case_index::Union{Nothing,Integer}=nothing,
+    sample::Tuple{Int,Int}=(0, 1),
     mutation_index::Union{Nothing,Integer}=nothing,
     include_layouts::Bool=true,
     reproduction_dir::Union{Nothing,AbstractString}=nothing,
@@ -2253,6 +2258,7 @@ function run_suite(;
         seed,
         cases,
         case_index,
+        sample,
         include_layouts,
         reproduction_dir,
         repro_environment,
@@ -2271,9 +2277,10 @@ function run_suite(;
     return FuzzSummary(differential, mutation)
 end
 
-run_pr_suite(; seed::UInt64=DEFAULT_SEED) = run_suite(;
+run_pr_suite(; seed::UInt64=DEFAULT_SEED, sample::Tuple{Int,Int}=(0, 1)) = run_suite(;
     seed,
     cases=PR_CASES,
+    sample,
     mutations=PR_MUTATIONS,
     include_layouts=true,
     verify_determinism=true,

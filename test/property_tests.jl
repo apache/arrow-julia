@@ -27,6 +27,13 @@ include(joinpath(@__DIR__, "support", "SeededFuzz.jl"))
 import .SeededFuzz
 
 const SEED = SeededFuzz.DEFAULT_SEED
+# CI runs every generated case on one job and one case in n on the others:
+# ARROW_PROPERTY_CASES is "k/n" (case indices k + 1 modulo n); unset or "all"
+# runs every case.
+const SAMPLE = let spec = get(ENV, "ARROW_PROPERTY_CASES", "all")
+    k, n = spec == "all" ? (0, 1) : parse.(Int, split(spec, "/"))
+    (mod(k, n), n)
+end
 
 @testset "public IPC properties (seed=$(string(SEED; base=16)))" begin
     @testset "fuzz failure artifacts are complete and shell-safe" begin
@@ -250,12 +257,13 @@ const SEED = SeededFuzz.DEFAULT_SEED
     end
 
     @testset "one deterministic PR suite" begin
-        summary = SeededFuzz.run_pr_suite(; seed=SEED)
+        summary = SeededFuzz.run_pr_suite(; seed=SEED, sample=SAMPLE)
         differential = summary.differential
-        @test differential.cases == SeededFuzz.PR_CASES
-        @test differential.variants == 6 * SeededFuzz.PR_CASES
-        @test differential.rewrites == 6 * SeededFuzz.PR_CASES
-        @test differential.scanchecks == 54 * SeededFuzz.PR_CASES
+        cases = length((1 + first(SAMPLE)):last(SAMPLE):SeededFuzz.PR_CASES)
+        @test differential.cases == cases
+        @test differential.variants == 6 * cases
+        @test differential.rewrites == 6 * cases
+        @test differential.scanchecks == 54 * cases
         @test differential.layoutchecks == 49
         @test Set([
             :generated_differential,

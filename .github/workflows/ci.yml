@@ -76,13 +76,21 @@ jobs:
           key: ${{ runner.os }}-release-${{ hashFiles('**/Project.toml') }}
           restore-keys: |
             ${{ runner.os }}-release-
+      # The release candidate's suite, with one generated property case in four
+      # (the test job runs them all).
       - name: Verify
+        env:
+          ARROW_PROPERTY_CASES: 3/4
         run: |
           version=$(grep -o '^version = ".*"' "Project.toml" | \
                       sed -e 's/^version = "//g' \
                           -e 's/"$//g')
           VERIFY_DEFAULT=0 dev/release/verify_rc.sh ${version} 100
   test:
+    # Coverage makes Julia compile the package, and each child process the tests
+    # start, without its precompiled code, so it runs on one job: ubuntu, Julia 1,
+    # 2 threads. That job also runs every generated property case; the others run
+    # one in four, chosen by their matrix position (ARROW_PROPERTY_CASES).
     name: Arrow.jl - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -127,12 +135,17 @@ jobs:
           Pkg.develop([PackageSpec(path="src/ArrowTypes")])
       - uses: julia-actions/julia-buildpkg@v1.6
       - uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: ${{ matrix.os == 'ubuntu-latest' && matrix.version == '1' && matrix.nthreads == 2 }}
         env:
           JULIA_NUM_THREADS: ${{ matrix.nthreads }}
+          ARROW_PROPERTY_CASES: ${{ (matrix.os == 'ubuntu-latest' && matrix.version == '1' && matrix.nthreads == 2) && 'all' || format('{0}/4', strategy.job-index) }}
       - uses: julia-actions/julia-processcoverage@v1
+        if: matrix.os == 'ubuntu-latest' && matrix.version == '1' && matrix.nthreads == 2
         with:
           directories: src,ext
       - uses: codecov/codecov-action@v7
+        if: matrix.os == 'ubuntu-latest' && matrix.version == '1' && matrix.nthreads == 2
         with:
           files: lcov.info
           fail_ci_if_error: true
@@ -219,6 +232,8 @@ jobs:
           Pkg.develop([PackageSpec(path="."), PackageSpec(path="src/ArrowTypes")])
       - name: Run monorepo tests
         continue-on-error: false
+        env:
+          ARROW_PROPERTY_CASES: 2/4
         run: >
           julia --color=yes --project=monorepo -e 'using Pkg; Pkg.test("Arrow")'
   test_min_arrowtypes:
@@ -276,11 +291,14 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1.6
         with:
           project: ${{ matrix.pkg.dir }}
+      # Nothing uploads this job's coverage, so it runs without it.
       - uses: julia-actions/julia-runtest@v1
         env:
           JULIA_NUM_THREADS: 2
+          ARROW_PROPERTY_CASES: 1/4
         with:
           project: ${{ matrix.pkg.dir }}
+          coverage: false
   trim:
     name: ArrowCore and DataStrings JuliaC trim-safe compile
     runs-on: ubuntu-latest
