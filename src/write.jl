@@ -97,7 +97,9 @@ symlink is written through, and a read-only file is refused with a
 the rename, `write` throws a `Base.IOError` and the old file is kept.
 
 Partitions are read, encoded, and published one at a time, so a partitioned
-source such as `CSV.Chunks` writes in about one partition's memory. One
+source such as `CSV.Chunks` writes in about one partition's memory. A
+partition with no rows adds no record batch, so a table with no rows writes
+its schema alone, as pyarrow writes one. One
 partition declares each field's nullability from its element type; several
 partitions take their schema from the first, with every field nullable, and
 later partitions conform to it as later tables of an [`Arrow.Writer`](@ref)
@@ -282,9 +284,9 @@ DictionaryReplacement feature, which strict readers such as nanoarrow refuse.
 output containing every batch written so far — and is idempotent. A
 finalization failure still releases the owned sink. A
 writer abandoned without `close` leaves a torn stream or an unfooted
-file; closing a writer that never received a table just closes the sink
-without producing valid IPC. One task owns a writer: overlapping calls
-are not synchronized.
+file; closing a writer that never received a table writes an output with
+no columns. A table (or partition) with no rows adds no record batch. One
+task owns a writer: overlapping calls are not synchronized.
 """
 mutable struct Writer
     const io::IO
@@ -521,6 +523,9 @@ Base.@nospecializeinfer function _writepartition!(
     # partition itself: Arrow legally allows zero fields with a positive
     # row count (the reader carries that count on the Table).
     n == 0 && isempty(names) && (n = Int(Tables.rowcount(part)))
+    # A partition with no rows writes no record batch, as pyarrow writes an
+    # empty table; the first one still fixes the schema (`_writebatch!`).
+    n == 0 && w.st !== nothing && return nothing
     encoded = _dictencodeflags(names, w.dictencode)
     for j in eachindex(columns)
         col = columns[j]
@@ -593,6 +598,7 @@ Base.@nospecializeinfer function _writebatch!(
         nullable = (w.oneshot ? several : w.nullable) && retained === nothing
         nullable && (fields = AC.Field[_nullablefield(f) for f in fields])
         _beginwrite!(w, fields, retained, names; several, input=part)
+        nrows == 0 && return nothing
         batch = only(_tablebatches(w.schema, coldata, [nrows]))
         writebatch!(w.st::IPCWriteState, batch; recycle=_handoff!(w.pool))
         return nothing
@@ -775,6 +781,13 @@ end
 function Base.close(w::Writer)
     (@atomic w.closed) && return nothing
     @atomic w.closed = true
+    try
+        # A writer that got no table writes a valid output with no columns.
+        w.st === nothing && _beginwrite!(w, AC.Field[], nothing, Symbol[])
+    catch
+        w.ownio && _abortpath(w.path)
+        rethrow()
+    end
     st = w.st
     try
         st === nothing || finishwrite!(st)

@@ -2964,7 +2964,8 @@ end
         emptybytes = arrowtypes_test_bytes((value=empty,); file=false)
         emptyfield, emptybatches = arrowtypes_test_core_parts(emptybytes)
         @test emptyfield.type isa ARROWTYPES_TEST_AC.NullType
-        @test only(emptybatches).nrows == 0
+        # A table with no rows writes no record batch.
+        @test isempty(emptybatches)
         @test Tables.rowcount(Arrow.Table(emptybytes)) == 0
     end
 end
@@ -3067,7 +3068,7 @@ end
         @test Tables.rowcount(Arrow.Table(emptybytes)) == 0
         emptyfield, emptybatches = arrowtypes_test_core_parts(emptybytes)
         @test arrowtypes_test_field_contract_equal(seedfield, emptyfield)
-        ARROWTYPES_TEST_AC.validate_full(emptyfield, only(emptybatches).columns[1])
+        @test isempty(emptybatches)
     end
 
     Row = @NamedTuple{child::Flex}
@@ -5849,6 +5850,8 @@ end
         @test DataAPI.colmetadata(table, :point, "ARROW:extension:metadata") == "dictionary"
         # An empty first partition of the abstract type declares the label
         # without metadata, which the later Point{:dictionary} values lack.
+        # (It writes no record batch, so no dictionary precedes the later
+        # partition's.)
         err = try
             arrowtypes_test_bytes(abstractfirst; file=file)
             nothing
@@ -5856,7 +5859,11 @@ end
             e
         end
         @test err isa ArgumentError
-        @test occursin("different extension type", sprint(showerror, err))
+        @test occursin(
+            "holds ArrowTypesTestPoint{:dictionary} values, but its retained dictionary " *
+            "materializes as ArrowTypesTestPoint{Symbol(\"\")}",
+            sprint(showerror, err),
+        )
     end
 
     Left = ArrowTypesTestPoint{:left}

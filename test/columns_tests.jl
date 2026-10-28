@@ -272,11 +272,19 @@ end
             @test t.s isa StringVector && t.s == ["a", "bb", "a fairly long string value"]
             @test collect(t.c) == ["u", "v", "v"]
         end
-        # Empty batches chain to a vector with no chunks; scans still slice it.
-        empty = arrowbytes(
-            Tables.partitioner([(x=Int8[], b=Bool[]), (x=Int8[], b=Bool[])]);
-            file=false,
-        )
+        # A partition with no rows adds no record batch.
+        noparts = Tables.partitioner([(x=Int8[], b=Bool[]), (x=Int8[], b=Bool[])])
+        @test isempty(collect(Arrow.Stream(arrowbytes(noparts; file=false))))
+        # Empty batches (other writers write them) chain to a vector with no
+        # chunks; scans still slice it.
+        xf, xd = Arrow.AC.fromjulia("x", Int8[])
+        bf, bd = Arrow.AC.fromjulia("b", Bool[])
+        esch = Arrow.AC.Schema([
+            Arrow.AC.Field("x", xf.type; nullable=true),
+            Arrow.AC.Field("b", bf.type; nullable=true),
+        ])
+        ebatch() = Arrow.AC.RecordBatch(esch, [xd, bd], 0)
+        empty = Arrow.writestream(esch, [ebatch(), ebatch()])
         @test length(collect(Arrow.Stream(empty))) == 2
         for source in (empty, ColumnsBytesSource(empty))
             s = Arrow.Table(source; scan=Tables.Scan())

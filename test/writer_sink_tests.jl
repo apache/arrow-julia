@@ -129,7 +129,9 @@ end
             w = Arrow.Writer(path)
             close(w)
             @test !isopen(w.io)
-            @test isempty(read(path))
+            # A writer that got no table writes a valid output with no columns.
+            none = Arrow.Table(path)
+            @test isempty(Tables.columnnames(none)) && Tables.rowcount(none) == 0
         end
     end
 

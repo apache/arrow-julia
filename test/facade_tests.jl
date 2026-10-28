@@ -3330,12 +3330,14 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             back = Arrow.Table(bytes)
             @test back.a == t.a && isequal(collect(back.s), t.s)
         end
-        @test nbatches(take!(Arrow.write(IOBuffer(), (; a=zeros(Int8, (1 << 20) + 1))))) ==
-              2
+        @test nbatches(
+            take!(Arrow.write(IOBuffer(), (; a=zeros(Int8, (1 << 20) + 1)); file=true)),
+        ) == 2
+        # A partition with no rows adds no record batch.
         parts = Tables.partitioner([(; a=collect(1:5)), (; a=Int[]), (; a=[6, 7])])
         bytes = take!(Arrow.write(IOBuffer(), parts; batchsize=2, file=true))
         f = Arrow.readfile(bytes)
-        @test [f[i].nrows for i = 1:length(f)] == [2, 2, 1, 0, 2]
+        @test [f[i].nrows for i = 1:length(f)] == [2, 2, 1, 2]
         @test Arrow.Table(bytes).a == 1:7
         @test_throws ArgumentError Arrow.write(IOBuffer(), t; batchsize=0)
         io = IOBuffer()

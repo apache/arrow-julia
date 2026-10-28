@@ -65,8 +65,11 @@ function checkoutput(bytes, expected, ndata; file, compress)
     @test isequal(Arrow.Table(bytes).s, expected)
     decoded = file ? Arrow.readfile(bytes) : Arrow.readstream(bytes)
     f = decoded.schema.fields[1]
-    d = (file ? decoded[1] : decoded.batches[1]).columns[1]
     @test f.type == AC.ViewType(true)
+    # A table with no rows writes no record batch.
+    isempty(expected) &&
+        return @test (file ? length(decoded) : length(decoded.batches)) == 0
+    d = (file ? decoded[1] : decoded.batches[1]).columns[1]
     @test AC.validate_full(f, d) === d
     @test sum(b.len for b in d.buffers[3:end]; init=0) == ndata
     @test all(b -> findfirst(codeunits(UNUSED), AC.slicebytes(b)) === nothing, d.buffers)

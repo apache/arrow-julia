@@ -356,11 +356,12 @@ batchkinds(bytes) = [
         close(w)
         err = @test_throws ArgumentError Arrow.write(w, t2)
         @test occursin("closed", err.value.msg)
-        # Closing a writer that never wrote produces no IPC output but does
-        # not throw (finally-friendly).
+        # Closing a writer that never wrote does not throw (finally-friendly)
+        # and writes a valid output with no columns.
         io2 = IOBuffer()
         close(Arrow.Writer(io2))
-        @test isempty(take!(io2))
+        none = Arrow.Table(take!(io2))
+        @test isempty(Tables.columnnames(none)) && Tables.rowcount(none) == 0
     end
 
     @testset "close finalizes what was published" begin

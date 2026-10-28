@@ -1361,7 +1361,9 @@ end
 
 function _run_differential_case(master::UInt64, index::Int)
     case = make_case(master, index)
-    nparts = length(case.inputs)
+    # A partition with no rows writes no record batch.
+    writtenparts = [p for p in case.expectedparts if length(first(p)) > 0]
+    nparts = length(writtenparts)
     variants = 0
     rewrites = 0
     scanchecks = 0
@@ -1372,8 +1374,7 @@ function _run_differential_case(master::UInt64, index::Int)
 
         batches = collect(Arrow.Stream(copy(bytes)))
         _require(length(batches) == nparts, "$label partition count differs")
-        for (partition, (batch, expectedpart)) in
-            enumerate(zip(batches, case.expectedparts))
+        for (partition, (batch, expectedpart)) in enumerate(zip(batches, writtenparts))
             check_expected_table(batch, expectedpart; label="$label partition=$partition")
         end
 
@@ -1390,7 +1391,7 @@ function _run_differential_case(master::UInt64, index::Int)
         rewrittenparts = collect(Arrow.Stream(copy(rewritten)))
         _require(length(rewrittenparts) == nparts, "$label rewrite partition count differs")
         for (partition, (batch, expectedpart)) in
-            enumerate(zip(rewrittenparts, case.expectedparts))
+            enumerate(zip(rewrittenparts, writtenparts))
             check_expected_table(
                 batch,
                 expectedpart;

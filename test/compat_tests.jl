@@ -180,6 +180,18 @@ end
     @test occursin("Arrow.Table(Arrow.tobuffer(table))", msg(() -> Arrow.Table((a=[1],))))
 end
 
+@testset "a filtered Stream writes only the batches with rows" begin
+    parts = Tables.partitioner([(a=[1, 2],), (a=[3, 4],), (a=[5, 6],)])
+    bytes = take!(Arrow.write(IOBuffer(), parts; file=true))
+    out = take!(Arrow.write(IOBuffer(), Arrow.Stream(bytes; filter=Arrow.col(:a) > 4)))
+    @test [Tables.rowcount(b) for b in Arrow.Stream(out)] == [2]
+    @test Arrow.Table(out).a == [5, 6]
+    # No match at all: the schema and no record batch.
+    none = take!(Arrow.write(IOBuffer(), Arrow.Stream(bytes; filter=Arrow.col(:a) > 9)))
+    @test isempty(collect(Arrow.Stream(none)))
+    @test isempty(Arrow.Table(none).a) && eltype(Arrow.Table(none).a) <: Union{Missing,Int}
+end
+
 @testset "typed scan overrides for composite rows" begin
     NT = NamedTuple{(:a, :b),Tuple{Float64,String}}
     tbl = (; x=[1, 2], c=[(a=1.0, b="x"), (a=2.0, b="y")])
