@@ -716,7 +716,7 @@ function _partitionhints(w::Writer, columns, own)
         elseif _hasrefpool(col) && (
             w.st === nothing || (w.schema::AC.Schema).fields[j].type isa AC.DictionaryType
         )
-            hint = _extendpool(hint, last(_refpoolvalues(col)))
+            hint = _extendpool(hint, last(_uninferred(_refpoolvalues, col)))
         end
         hints[j] = hint === nothing ? nothing : _PoolHint(hint, prefix)
     end
@@ -1343,7 +1343,8 @@ end
 function _retainedfieldat(retained, names, retainedaligned::Bool, j::Int)
     retainedaligned && return _unsharedfield(retained.fields[j])
     count(==(names[j]), names) == 1 || return nothing
-    matches = findall(f -> f.name == String(names[j]), collect(retained.fields))
+    name = String(names[j])::String
+    matches = findall(f -> f.name == name, collect(retained.fields))
     return length(matches) == 1 ? _unsharedfield(retained.fields[only(matches)]) : nothing
 end
 

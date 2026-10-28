@@ -7542,9 +7542,10 @@ function _plaincolumnparts(name, fieldname, parts, retained, context)
             )::Tuple{AC.Field,AC.ArrayData}
         catch err
             (err isa _OffsetOverflow && err.part == 0) || rethrow()
+            e = err::_OffsetOverflow
             # The overflow row is a row of this column only at its top level.
-            row = err.column == fieldname ? err.row : 0
-            throw(_OffsetOverflow(err.column, partition, row))
+            row = e.column == fieldname ? e.row : 0
+            throw(_OffsetOverflow(e.column, partition, row))
         end
         if partition == 1
             field = partitionfield

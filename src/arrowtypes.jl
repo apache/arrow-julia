@@ -1659,9 +1659,9 @@ end
 # `column`: `name` is a top-level column, which `select` can read as strings.
 @noinline function _symbollimiterror(ctx::_ArrowTypesContext, name, column::Bool)
     limit = _maxnewsymbols(ctx)
-    hint =
-        column ?
-        ", or read the column as strings with select=[$(repr(Symbol(name))) => String]" : ""
+    # `repr` of a Symbol runs Base code that other packages invalidate.
+    sym = _uninferred(repr, Symbol(name))::String
+    hint = column ? ", or read the column as strings with select=[$sym => String]" : ""
     throw(
         AC.ValidationError(
             "$(column ? "column" : "field") $name holds more than $limit Symbol values " *

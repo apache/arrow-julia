@@ -911,7 +911,8 @@ function _checkliterals(e, fields, names)
         f === nothing && return nothing
         kind = _filterkind(f)
         kind === nothing && return nothing
-        ref = e.lhs.ref isa Integer ? names[e.lhs.ref] : e.lhs.ref
+        r = e.lhs.ref
+        ref = r isa Integer ? names[r] : r
         if e isa Tables.StrPred
             kind === :string || throw(
                 ArgumentError(
@@ -3015,7 +3016,7 @@ function _finishfacadescan(
                 continue
             elseif !public && _symboloverride(bc, f)
                 # The stored strings, without creating a Symbol per value.
-                columns[i] = _applyoverride(bc.type, columns[i], budget)
+                columns[i] = _uninferred(_applyoverride, bc.type, columns[i], budget)
                 push!(precols, Symbol[])
                 continue
             end
