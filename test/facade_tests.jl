@@ -2978,6 +2978,57 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test DataAPI.metadata(kw) == Dict("k" => "v")
     end
 
+    @testset "strings that are not UTF-8 are refused, naming the column and row" begin
+        bad = String(UInt8[0x61, 0xff])
+        msg(t; kw...) =
+            try
+                Arrow.write(IOBuffer(), t; kw...)
+                ""
+            catch e
+                e isa ArgumentError ? e.msg : sprint(showerror, e)
+            end
+        utf8msg(at) = "column $at holds a string that is not valid UTF-8"
+        @test startswith(msg((; s=["ok", bad])), utf8msg("s row 2"))
+        @test occursin("Vector{UInt8}", msg((; s=["ok", bad])))
+        @test startswith(msg((; s=["ok", bad]); stringview=true), utf8msg("s row 2"))
+        @test startswith(msg((; s=[fill("ok", 5); bad]); batchsize=2), utf8msg("s row 6"))
+        parts = Tables.partitioner([(; s=["a"]), (; s=["b", bad])])
+        @test startswith(msg(parts), utf8msg("s row 2 of partition 2"))
+        @test startswith(msg((; s=[["ok"], ["a", bad]])), utf8msg("s (child item) row 2"))
+        @test startswith(
+            msg((; s=[(a=1, b="ok"), (a=2, b=bad)])),
+            utf8msg("s (child b) row 2"),
+        )
+        @test startswith(
+            msg((; s=[Dict("ok" => 1), Dict(bad => 2)])),
+            utf8msg("s (child entries.key) row 2"),
+        )
+        @test startswith(msg((; s=Arrow.DictEncode(["ok", "ok", bad]))), utf8msg("s row 3"))
+        @test startswith(msg((; s=[:ok, Symbol(bad)])), utf8msg("s row 2"))
+        # Rows split inside one character: the bytes are UTF-8 together, not apart.
+        halves = [String(UInt8[0xc3]), String(UInt8[0xa9])]
+        @test startswith(msg((; s=halves)), utf8msg("s row 1"))
+        @test msg((; s=["é", "日本", "a", ""])) == ""
+        io = IOBuffer()
+        @test_throws ArgumentError Arrow.Writer(io) do w
+            Arrow.write(w, (; s=["ok"]))
+            Arrow.write(w, (; s=[bad]))
+        end
+        stream = take!(Arrow.write(IOBuffer(), (; s=["ok"]); file=false))
+        err = try
+            Arrow.append(IOBuffer(stream; read=true, write=true), (; s=["a", bad]))
+            nothing
+        catch e
+            e
+        end
+        @test err isa ArgumentError && startswith(err.msg, utf8msg("s row 2"))
+        # A table read from a file that holds such a string rewrites only as binary.
+        f, d = Arrow.AC.fromjulia("s", ["ok", bad])
+        sch = Arrow.AC.Schema([f])
+        src = Arrow.Table(Arrow.writestream(sch, [Arrow.AC.RecordBatch(sch, [d], 2)]))
+        @test startswith(msg(src), utf8msg("s row 2"))
+    end
+
     @testset "errors name the column and say what to do" begin
         msg(t) =
             try

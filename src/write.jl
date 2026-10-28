@@ -77,6 +77,10 @@ Keywords:
   (default `Threads.nthreads()`; `ntasks=1` runs on the calling task). The
   output bytes are the same for any `ntasks`.
 
+Strings, at any depth, must be valid UTF-8, as the format requires: a string
+that is not throws an `ArgumentError` naming the column and row. Write bytes
+that are not text as `Vector{UInt8}` values, a binary column.
+
 Writing to an existing file writes a temporary file in the same directory
 and renames it over the old one when the output is complete, so a failed
 write leaves the old file unchanged, and an `Arrow.Table` or `Arrow.Stream`
@@ -421,11 +425,18 @@ function _writeparts!(w::Writer, @nospecialize(tbl))
     # Several partitions: their schema comes from the first, every field
     # nullable, and dictionaries may grow, as for an Arrow.Writer.
     several = next !== nothing
+    k = 1
     while true
-        _writepartition!(w, part, retained, several)
+        try
+            _writepartition!(w, part, retained, several)
+        catch err
+            err isa _InvalidUTF8 || rethrow()
+            throw(ArgumentError(_invalidutf8message(err.column, err.row, several ? k : 0)))
+        end
         next === nothing && return nothing
         part, state = next
         next = iterate(parts, state)
+        k += 1
     end
 end
 
@@ -648,6 +659,9 @@ function _eachbatch(f::F, cols::Vector{AbstractVector}, n::Int, batchsize::Int) 
         try
             f(AbstractVector[_rowslice(c, r) for c in cols], length(r))
         catch err
+            err isa _InvalidUTF8 && throw(
+                _InvalidUTF8(err.column, 0, err.row == 0 ? 0 : first(r) - 1 + err.row),
+            )
             err isa _OffsetOverflow || rethrow()
             size = only(_shrinkbatches!([size], [(1, r)], err))
             continue
@@ -1017,6 +1031,12 @@ function _constructbatches(
             fields, coldata = construct(cols, pools)
             return fields, coldata, Int[length(r) for (_, r) in plan]
         catch err
+            if err isa _InvalidUTF8
+                p, r = plan[err.part]
+                row = err.row == 0 ? 0 : first(r) - 1 + err.row
+                partition = length(rowcounts) > 1 ? p : 0
+                throw(ArgumentError(_invalidutf8message(err.column, row, partition)))
+            end
             err isa _OffsetOverflow || rethrow()
             _shrinkbatches!(sizes, plan, err)
         end

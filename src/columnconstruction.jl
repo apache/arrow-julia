@@ -1181,6 +1181,200 @@ end
 Base.showerror(io::IO, e::_OffsetOverflow) =
     print(io, "column $(e.column) exceeds the Int32 offset range of one record batch")
 
+"""
+A string of `column` (a child as "a (child b.c)") is not valid UTF-8, at `row`
+(0 when no row refers to it) of part `part` of the values being built. The
+batch and partition loops report it as an `ArgumentError` naming the row of
+the table being written.
+"""
+struct _InvalidUTF8 <: Exception
+    column::String
+    part::Int
+    row::Int
+end
+Base.showerror(io::IO, e::_InvalidUTF8) = print(io, _invalidutf8message(e.column, e.row, 0))
+
+function _invalidutf8message(column::String, row::Int, partition::Int)
+    at = row == 0 ? "" : partition == 0 ? " row $row" : " row $row of partition $partition"
+    return "column $column$at holds a string that is not valid UTF-8; Arrow strings " *
+           "must be UTF-8 (Polars and DuckDB refuse files with others), so write " *
+           "binary data as a Vector{UInt8} column"
+end
+
+"Throw `_InvalidUTF8` for the first string of a built column that is not UTF-8."
+function _checkutf8(name::Symbol, f::AC.Field, data::Vector{AC.ArrayData})
+    for (p, d) in enumerate(data)
+        bad = _badutf8(f, d)
+        bad === nothing && continue
+        row, path = bad
+        column = isempty(path) ? String(name) : "$name (child $path)"
+        throw(_InvalidUTF8(column, p, row))
+    end
+    return nothing
+end
+
+"""
+The first row of `d` holding a string, at any depth, that is not valid UTF-8,
+and the path of child names to it, or nothing. Every non-null string slot is
+checked, as Arrow's full validation does; row 0 means no row refers to the
+slot (a dictionary value no row uses, say).
+"""
+function _badutf8(f::AC.Field, d::AC.ArrayData)
+    t = d.type
+    if t isa AC.Utf8Type
+        i = _badutf8offsets(d, t.large)
+        return i == 0 ? nothing : (i, "")
+    elseif t isa AC.ViewType
+        t.utf8 || return nothing
+        i = _badutf8views(d)
+        return i == 0 ? nothing : (i, "")
+    elseif t isa AC.DictionaryType
+        pool = d.dictionary
+        pool === nothing && return nothing
+        bad = _badutf8(AC.dictvaluefield(f, t), pool)
+        bad === nothing && return nothing
+        return (bad[1] == 0 ? 0 : _dictrow(d, t, bad[1]), bad[2])
+    end
+    for (j, (cf, cd)) in enumerate(zip(f.children, d.children))
+        bad = _badutf8(cf, cd)
+        bad === nothing && continue
+        path = isempty(bad[2]) ? cf.name : cf.name * "." * bad[2]
+        return (bad[1] == 0 ? 0 : _parentrow(d, j, bad[1]), path)
+    end
+    return nothing
+end
+
+function _isascii(bytes::Vector{UInt8})
+    acc = UInt64(0)
+    words = length(bytes) >> 3
+    GC.@preserve bytes begin
+        p = Ptr{UInt64}(pointer(bytes))
+        for i = 1:words
+            acc |= unsafe_load(p, i)
+        end
+    end
+    for i = (8words + 1):length(bytes)
+        acc |= @inbounds bytes[i]
+    end
+    return iszero(acc & 0x8080808080808080)
+end
+
+# A utf8 column's first non-null row that is not UTF-8, or 0. ASCII data, or
+# data valid as a whole whose rows all start on a character, is valid; only
+# other data is checked row by row.
+function _badutf8offsets(d::AC.ArrayData, large::Bool)
+    n = Int(d.len)
+    n == 0 && return 0
+    offs = AC.rolebuffer(d, AC.OFFSETS)
+    data = AC.rolebuffer(d, AC.DATA)
+    T = large ? Int64 : Int32
+    (d.offset + n + 1) * sizeof(T) <= offs.len || return 0
+    GC.@preserve offs data begin
+        op = Ptr{T}(AC.sliceptr(offs)) + d.offset * sizeof(T)
+        lo = Int(unsafe_load(op, 1))
+        hi = Int(unsafe_load(op, n + 1))
+        0 <= lo < hi <= data.len || return 0
+        bytes = unsafe_wrap(Array, AC.sliceptr(data) + lo, hi - lo)
+        _isascii(bytes) && return 0
+        if isvalid(String, bytes)
+            # A row starts on a character unless its first byte continues one;
+            # a row at the end (empty) starts anywhere.
+            starts = true
+            m = length(bytes)
+            for i = 2:n
+                o = Int(unsafe_load(op, i)) - lo
+                lead = @inbounds bytes[clamp(o + 1, 1, m)]
+                starts &= (o >= m) | (lead & 0xc0 != 0x80)
+            end
+            starts && return 0
+        end
+        for i = 1:n
+            AC.isvalid_at(d, i) || continue
+            a = Int(unsafe_load(op, i)) - lo
+            b = Int(unsafe_load(op, i + 1)) - lo
+            isvalid(String, view(bytes, (a + 1):b)) || return i
+        end
+    end
+    return 0
+end
+
+# A utf8_view column's first non-null row that is not UTF-8, or 0.
+function _badutf8views(d::AC.ArrayData)
+    n = Int(d.len)
+    views = AC.rolebuffer(d, AC.VIEWS)
+    16 * (d.offset + n) <= views.len || return 0
+    GC.@preserve d begin
+        entries = unsafe_wrap(Array, AC.sliceptr(views), views.len)
+        buffers = Vector{UInt8}[
+            unsafe_wrap(Array, AC.sliceptr(b), b.len) for b in @view(d.buffers[3:end])
+        ]
+        longascii = all(_isascii, buffers)
+        for i = 1:n
+            AC.isvalid_at(d, i) || continue
+            base = 16 * (d.offset + i - 1)
+            len = Int(unsafe_load(Ptr{Int32}(pointer(entries, base + 1))))
+            bytes = if len <= AC.VIEW_INLINE_MAX
+                view(entries, (base + 5):(base + 4 + len))
+            else
+                longascii && continue
+                k = Int(unsafe_load(Ptr{Int32}(pointer(entries, base + 9))))
+                at = Int(unsafe_load(Ptr{Int32}(pointer(entries, base + 13))))
+                view(buffers[k + 1], (at + 1):(at + len))
+            end
+            isvalid(String, bytes) || return i
+        end
+    end
+    return 0
+end
+
+# The first row of a dictionary column whose index refers to pool value `k`.
+function _dictrow(d::AC.ArrayData, t::AC.DictionaryType, k::Int)
+    w = AC.primwidth(t.indextype)
+    indices = AC.rolebuffer(d, AC.DATA)
+    for i = 1:Int(d.len)
+        AC.isvalid_at(d, i) || continue
+        AC._load_int(indices, t.indextype, AC._slotbyteoff(d, Int64(i), w)) + 1 == k &&
+            return i
+    end
+    return 0
+end
+
+# The first row of `d` whose values include element `k` of its child `j`.
+function _parentrow(d::AC.ArrayData, j::Int, k::Int)
+    t = d.type
+    for i = 1:Int(d.len)
+        k in _childspan(t, d, j, Int64(i)) && return i
+    end
+    return 0
+end
+
+function _childspan(t::AC.ArrowType, d::AC.ArrayData, j::Int, i::Int64)
+    if t isa Union{AC.ListType,AC.MapType}
+        lo, hi = AC._offsets_at(d, i, t isa AC.ListType && t.large)
+        return (lo + 1):hi
+    elseif t isa AC.ListViewType
+        off, sz = AC._listview_range(t, d, i)
+        return (off + 1):(off + sz)
+    elseif t isa AC.FixedSizeListType
+        base = AC._slotindex0(d, i) * t.listsize
+        return (base + 1):(base + t.listsize)
+    elseif t isa AC.StructType
+        return (d.offset + i):(d.offset + i)
+    elseif t isa AC.UnionType
+        tid = AC.loadat(AC.rolebuffer(d, AC.TYPE_IDS), Int8, AC._slotindex0(d, i))
+        tid == t.typeids[j] || return 1:0
+        t.mode == AC.SparseMode && return (d.offset + i):(d.offset + i)
+        at =
+            AC.loadat(AC.rolebuffer(d, AC.ELEMENT_OFFSETS), Int32, AC._slotbyteoff(d, i, 4))
+        return (at + 1):(at + 1)
+    elseif t isa AC.RunEndEncodedType
+        j == 2 || return 1:0
+        r = AC._ree_runindex(d, i)
+        return r:r
+    end
+    return 1:0
+end
+
 # Duration seconds and year-month interval months of the larger Dates periods.
 _periodseconds(x::Dates.Week) = Base.checked_mul(Dates.value(x), Int64(604_800))
 _periodseconds(x::Dates.Day) = Base.checked_mul(Dates.value(x), Int64(86_400))
@@ -6736,8 +6930,8 @@ Construct one logical column across all table partitions.
 
 This is the sole column-policy seam used by the write facade. It owns fresh
 inference, retained reconstruction, ArrowTypes lowering, dictionary pooling,
-partition agreement, and field metadata. The returned data vector is in the
-same order as `parts`.
+partition agreement, field metadata, and the check that strings are UTF-8
+(`_InvalidUTF8`). The returned data vector is in the same order as `parts`.
 
 `retained` is the Field a rewrite must reproduce; `poolhints` carries one
 retained dictionary-pool snapshot (or nothing) per partition, enforced below;
@@ -6745,7 +6939,9 @@ retained dictionary-pool snapshot (or nothing) per partition, enforced below;
 """
 function _constructcolumn(name::Symbol, parts::Vector{AbstractVector}; kwargs...)
     try
-        return _constructcolumnparts(name, parts; kwargs...)
+        field, data = _constructcolumnparts(name, parts; kwargs...)
+        _checkutf8(name, field, data)
+        return field, data
     catch err
         err isa ArgumentError || rethrow()
         T = _reflectedstructtype(parts)
