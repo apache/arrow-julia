@@ -25,8 +25,10 @@
 
 [`Arrow.write(sink, table)`](@ref Arrow.write) writes any Tables.jl source (a
 `DataFrame`, a `NamedTuple` of vectors, a `CSV.File`, an `Arrow.Table`) to a path or an
-`IO` and returns the sink. `Arrow.write(sink)` returns a function, so a table can be piped
-into it, as in `CSV.File("trips.csv") |> Arrow.write("trips.arrow")`.
+`IO` and returns the sink; any other object that `open(sink, "w")` accepts, such as a
+FilePathsBase.jl path, is written as a path is, in place. `Arrow.write(sink)` returns a
+function, so a table can be piped into it, as in
+`CSV.File("trips.csv") |> Arrow.write("trips.arrow")`.
 
 ```@example writing
 using Arrow, Tables

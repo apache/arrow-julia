@@ -33,7 +33,9 @@
 
 Read Arrow IPC data, in the file or the stream format, as Tables.jl columns. `source` is
 a path, an `IO` (read to its end), a byte vector (read in place: do not modify it while
-the columns are in use), or an [`Arrow.AbstractArrowSource`](@ref).
+the columns are in use), or an [`Arrow.AbstractArrowSource`](@ref). Any other `source`
+that `open(source, "r")` accepts, such as a FilePathsBase.jl path, reads as the file or
+`IO` it opens.
 
 - `select` keeps the given columns, in that order: names, indices, a regex, a vector of
   them, or a function `(i, name) -> Bool`; `name => newname` renames a column and
@@ -1482,38 +1484,41 @@ function _openbytes(
            _readstream(bytes, limits, budget, ntasks)
 end
 
-function _opensource(
-    path::AbstractString;
+_opensource(path::AbstractString; kwargs...) =
+    open(io -> _openfile(io, path; kwargs...), path, "r")
+
+# An open file, read from its start (`label` names it in errors).
+function _openfile(
+    io::IOStream,
+    label;
     mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=Limits(),
     budget::Union{Nothing,AllocationBudget}=nothing,
     ntasks::Int=1,
 )
-    return open(path, "r") do io
-        magic = Base.read(io, 6)
-        seekstart(io)
-        reported = stat(io).size
-        (reported isa Integer && 0 <= reported <= typemax(Int)) ||
-            throw(AC.ValidationError("source file length is not addressable"))
-        size = Int(reported)
-        if mmap && size > 0
-            # Probe and map the same open file. A replacement of `path`
-            # between those steps cannot redirect the read to another inode.
-            # Columns read the mapping in place, so `release!` must not unmap
-            # it: the mapping lives until nothing reaches it.
-            region = AC._mmapregion(io, path; eager=false)
-            magic == _FILE_MAGIC && return _readmappedfile(region, limits, budget)
-            return _readmappedstream(region, limits, budget, ntasks)
-        end
-        _chargevector!(budget, UInt8, size, "source file read")
-        bytes = Base.read(io, size)
-        length(bytes) == size || throw(
-            AC.ValidationError(
-                "source file changed while reading: got $(length(bytes)) of $size bytes",
-            ),
-        )
-        return _openbytes(bytes; limits=limits, budget=budget, ntasks=ntasks)
+    magic = Base.read(io, 6)
+    seekstart(io)
+    reported = stat(io).size
+    (reported isa Integer && 0 <= reported <= typemax(Int)) ||
+        throw(AC.ValidationError("source file length is not addressable"))
+    size = Int(reported)
+    if mmap && size > 0
+        # Probe and map the same open file. A replacement of the path
+        # between those steps cannot redirect the read to another inode.
+        # Columns read the mapping in place, so `release!` must not unmap
+        # it: the mapping lives until nothing reaches it.
+        region = AC._mmapregion(io, label; eager=false)
+        magic == _FILE_MAGIC && return _readmappedfile(region, limits, budget)
+        return _readmappedstream(region, limits, budget, ntasks)
     end
+    _chargevector!(budget, UInt8, size, "source file read")
+    bytes = Base.read(io, size)
+    length(bytes) == size || throw(
+        AC.ValidationError(
+            "source file changed while reading: got $(length(bytes)) of $size bytes",
+        ),
+    )
+    return _openbytes(bytes; limits=limits, budget=budget, ntasks=ntasks)
 end
 function _opensource(
     io::IO;
@@ -1592,9 +1597,21 @@ function _opensource(
     return _openbytes(_wholeobject(sf, budget); limits=limits, budget=budget, ntasks=ntasks)
 end
 
-# Arrow 2.x also accepted a vector of sources and positional byte windows;
-# name the supported source kinds instead of failing with a MethodError.
+# Whether `open(x, mode)` opens `x`, as it does a FilePathsBase path or AWSS3's
+# `S3Path`. Base's `open(f::Function, args...)` would call a function instead,
+# and `open(Arrow.Writer, x)` would make a writer.
+_openable(x, mode) = !(x isa Union{Function,Type}) && applicable(open, x, mode)
+
+# Any other source that `open(source, "r")` accepts reads as Arrow 2.x read
+# it: an `IOStream` as a path is read, any other `IO` whole. Arrow 2.x also
+# accepted a vector of sources and positional byte windows; name the supported
+# source kinds instead of failing with a MethodError.
 function _opensource(source; kwargs...)
+    if _openable(source, "r")
+        return open(source, "r") do io
+            io isa IOStream ? _openfile(io, source; kwargs...) : _opensource(io; kwargs...)
+        end
+    end
     hint =
         Tables.istable(source) ?
         "; to read a table in memory as an Arrow.Table, write it first, as " *
@@ -1602,8 +1619,9 @@ function _opensource(source; kwargs...)
         "; read several sources separately and combine their tables"
     throw(
         ArgumentError(
-            "Arrow reads one IPC source: a file path, an IO, a Vector{UInt8}, or " *
-            "an Arrow.AbstractArrowSource, not $(typeof(source))$hint",
+            "Arrow reads one IPC source: a file path, an IO, a Vector{UInt8}, an " *
+            "Arrow.AbstractArrowSource, or an object that open(x, \"r\") accepts, " *
+            "not $(typeof(source))$hint",
         ),
     )
 end
@@ -2314,8 +2332,16 @@ end
 
 # A stream-format source reads incrementally: bytes and memory-mapped paths
 # frame their messages in place, an `IO` is read one message at a time. A
-# file-format source decodes its batches lazily from the whole file.
-_openstream(source; kwargs...) = _opensource(source; kwargs...)
+# file-format source decodes its batches lazily from the whole file. Another
+# object that `open(source, "r")` accepts streams as a path does when it opens
+# an `IOStream`, and is read whole otherwise, as by `_opensource`.
+function _openstream(source; kwargs...)
+    _openable(source, "r") || return _opensource(source; kwargs...)
+    return open(source, "r") do io
+        io isa IOStream ? _openstreamfile(io, source; kwargs...) :
+        _opensource(io; kwargs...)
+    end
+end
 function _openstream(
     bytes::Vector{UInt8};
     mmap::Bool=_MMAP_DEFAULT,
@@ -2325,20 +2351,24 @@ function _openstream(
     _isfilebytes(bytes) && return _openbytes(bytes; limits=limits, budget=budget)
     return _StreamReader(_RegionMessages(heapregion(bytes)), limits)
 end
-function _openstream(
-    path::AbstractString;
+_openstream(path::AbstractString; kwargs...) =
+    open(io -> _openstreamfile(io, path; kwargs...), path, "r")
+
+# An open file, streamed from its start (`label` names it in errors).
+function _openstreamfile(
+    io::IOStream,
+    label;
     mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=Limits(),
     budget=nothing,
 )
-    magic = open(io -> Base.read(io, 6), path, "r")
+    magic = Base.read(io, 6)
+    seekstart(io)
     magic == _FILE_MAGIC &&
-        return _opensource(path; mmap=mmap, limits=limits, budget=budget)
-    mmap || return _openstream(Base.read(path); limits=limits)
-    return open(path, "r") do io
-        eof(io) && return _openstream(UInt8[]; limits=limits)
-        _StreamReader(_RegionMessages(AC._mmapregion(io, path; eager=false)), limits)
-    end
+        return _openfile(io, label; mmap=mmap, limits=limits, budget=budget)
+    mmap || return _openstream(Base.read(io); limits=limits)
+    eof(io) && return _openstream(UInt8[]; limits=limits)
+    return _StreamReader(_RegionMessages(AC._mmapregion(io, label; eager=false)), limits)
 end
 function _openstream(
     io::IO;

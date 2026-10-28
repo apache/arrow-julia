@@ -23,8 +23,23 @@ import DataAPI
 import Durations
 import UUIDs
 using PooledArrays: PooledArray
+import FilePathsBase
 
 const AC = Arrow.ArrowCore
+
+# Objects that `open` accepts, as FilePathsBase paths and AWSS3's `S3Path` are:
+# one opens a local file (an IOStream), the other hands out an IO it holds.
+struct OpenableFile
+    path::String
+end
+Base.open(f::OpenableFile, mode::AbstractString) = open(f.path, mode)
+struct OpenableIO
+    io::IO
+end
+Base.open(x::OpenableIO, ::AbstractString) = x.io
+
+# Bytes allocated by a second call of `f` (the first compiles it).
+allocatedby(f) = (f(); @allocated f())
 
 # The Arrow 2.x compatibility surface: the exported ArrowTypes binding, the
 # getmetadata accessor, tobuffer, the curried write, the removed-keyword
@@ -60,6 +75,68 @@ const AC = Arrow.ArrowCore
         err = @test_throws ArgumentError Arrow.Table([bytes, bytes])
         @test occursin("one IPC source", err.value.msg)
         @test_throws ArgumentError Arrow.Stream(view(bytes, 1:length(bytes)))
+    end
+
+    @testset "objects that open accepts read and write as paths do" begin
+        dir = mktempdir()
+        tbl = (; a=collect(1:1_000_000))
+        for (k, P) in enumerate((FilePathsBase.Path, OpenableFile))
+            at(name) = P(joinpath(dir, "$k-$name.arrow"))
+            p = at("write")
+            @test Arrow.write(p, tbl) === p
+            @test open(io -> Base.read(io, 6), p, "r") == b"ARROW1"
+            @test Arrow.Table(p).a == tbl.a
+            @test Arrow.Table(p; mmap=false).a == tbl.a
+            @test only(collect(Arrow.Stream(p))).a == tbl.a
+            @test Arrow.read(p, Tables.columntable).a == tbl.a
+            # A stream-format file streams batch by batch, as a path does.
+            p = at("stream")
+            Arrow.write(p, Tables.partitioner(((; a=[1]), (; a=[2]))); file=false)
+            s = Arrow.Stream(p)
+            @test getfield(s, :src) isa Arrow._StreamReader
+            @test [b.a for b in s] == [[1], [2]]
+            p = at("curried")
+            @test ((; a=[1]) |> Arrow.write(p)) === p
+            @test Arrow.Table(p).a == [1]
+            p = at("writer")
+            Arrow.Writer(p) do w
+                Arrow.write(w, (; a=[1]))
+                return Arrow.write(w, (; a=[2]))
+            end
+            @test Arrow.Table(p).a == [1, 2]
+            p = at("open")
+            w = open(Arrow.Writer, p)
+            Arrow.write(w, (; a=[3]))
+            close(w)
+            @test Arrow.Table(p).a == [3]
+        end
+        # An IOStream is mapped, as a path is: the read copies nothing.
+        p = FilePathsBase.Path(joinpath(dir, "mapped.arrow"))
+        Arrow.write(p, tbl)
+        if !Sys.iswindows()
+            @test allocatedby(() -> Arrow.Table(p; mmap=true)) < sizeof(tbl.a) ÷ 8
+            @test allocatedby(() -> Arrow.Table(p; mmap=false)) > sizeof(tbl.a)
+        end
+        # Another IO is read whole, or written in place in the file format.
+        bytes = take!(Arrow.write(IOBuffer(), tbl))
+        @test Arrow.Table(OpenableIO(IOBuffer(bytes))).a == tbl.a
+        sink = Base.BufferStream()
+        Arrow.write(OpenableIO(sink), (; a=[4]))
+        out = Base.read(sink)
+        @test out[1:6] == b"ARROW1"
+        @test Arrow.Table(out).a == [4]
+        # Anything else says what Arrow writes to.
+        for f in (() -> Arrow.write((; a=[1]), (; a=[1])), () -> Arrow.write((; a=[1])))
+            err = @test_throws ArgumentError f()
+            @test occursin("an object that open(x, \"w\") accepts", err.value.msg)
+        end
+        # A function is no path, though `open(f, mode)` calls it: a do-block
+        # Writer without a sink, or a function as a source, opens no file.
+        cd(mktempdir()) do
+            @test_throws ArgumentError Arrow.Writer(w -> Arrow.write(w, (; a=[1])))
+            @test_throws ArgumentError Arrow.Table(identity)
+            @test isempty(readdir())
+        end
     end
 
     @testset "tobuffer emits the stream format" begin

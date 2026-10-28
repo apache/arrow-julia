@@ -45,7 +45,7 @@ upgrading, check `Pkg.status()` for packages that went backwards.
 |:--|:--|
 | `Arrow.Table(path; convert=false)` | removed: values always convert to Julia types ([Values](@ref)) |
 | `Arrow.Table(bytes, pos, len)` | `Arrow.Table(bytes[pos:(pos + len - 1)])` |
-| `Arrow.Table(path)` with a path object, such as a FilePathsBase.jl or AWSS3.jl `S3Path` | `Arrow.Table(string(path))` for a local path, or `Arrow.Table(read(path))`; to write, `write(path, take!(Arrow.write(IOBuffer(), table; file=true)))` |
+| `Arrow.Table(path)`, `Arrow.write(path, table)` with a path object, such as a FilePathsBase.jl path or an AWSS3.jl `S3Path` | unchanged: any object that `open(path, "r")` (to read) or `open(path, "w")` (to write) accepts works |
 | `Arrow.Table([path1, path2])`, `Arrow.Stream([...])` | read each source: `reduce(vcat, DataFrame.(Arrow.Table.(paths)))`, or `for path in paths, batch in Arrow.Stream(path)` |
 | `table.col[i] = x` | columns are read-only: `df = DataFrame(table); df.col[i] = x` |
 | `table.col isa Arrow.List` (or `Map`, `Struct`, `DenseUnion`, ...) | the column types are now `Arrow.ListVector`, `MapVector`, `StructVector`, and plain `Vector`s for unions; better, test the element type |

@@ -38,14 +38,17 @@ Base.getindex(d::DictEncode, i::Int) = d.data[i]
 include("columnconstruction.jl")
 
 """
-    Arrow.write(sink, table; file=sink isa AbstractString, compress=nothing,
+    Arrow.write(sink, table; file=!(sink isa IO), compress=nothing,
                 compresslevel=nothing, batchsize=1_048_576, dictencode=nothing,
                 dictdeltas=false, largelists=false, stringview=false, metadata=nothing,
                 colmetadata=nothing, ntasks=Threads.nthreads())
     Arrow.write(sink; kwargs...)
 
 Write any Tables.jl source as Arrow IPC to `sink`, a file path or an `IO`, and
-return `sink`. The one-argument form curries: `table |> Arrow.write(sink)`.
+return `sink`. Any other `sink` that `open(sink, "w")` accepts, such as a
+FilePathsBase.jl path, gets the file format as a path does, written in place through
+the `IO` that `open` returns. The one-argument form curries:
+`table |> Arrow.write(sink)`.
 
 Keywords:
 - `file`: `true` writes the random-access file format (`ARROW1` magic and
@@ -110,14 +113,9 @@ output.
 The keywords `alignment`, `dictencodenested`, `denseunions`, and `maxdepth`,
 which Arrow 2.x took, are accepted with a one-time warning and ignored.
 """
-function write(path::AbstractString, tbl; kwargs...)
-    _writeall!(_writer(path; oneshot=true, kwargs...), tbl)
-    return path
-end
-
-function write(io::IO, tbl; kwargs...)
-    _writeall!(_writer(io; oneshot=true, kwargs...), tbl)
-    return io
+function write(sink, tbl; kwargs...)
+    _writeall!(_writer(sink; oneshot=true, kwargs...), tbl)
+    return sink
 end
 
 """
@@ -149,13 +147,31 @@ end
 # same directory and renaming it over the destination once the output is
 # complete. A live Arrow.Table or Arrow.Stream that memory-maps the old file
 # keeps reading the old inode, and a failed write leaves the old file as it
-# was. New paths and non-regular files (FIFOs, devices) are written in place.
+# was. New paths and non-regular files (FIFOs, devices) are written in place,
+# as is any other object that `open(x, "w")` accepts (a FilePathsBase path,
+# AWSS3's `S3Path`), as Arrow 2.x wrote them.
 struct _PathSink
     io::IO
     path::String                # the destination, symlinks resolved
     tmp::Union{Nothing,String}  # renamed over `path` on commit
     created::Bool               # `path` did not exist before this write
 end
+
+_opensink(path::AbstractString) = _openpath(path)
+function _opensink(sink)
+    _checksink(sink)
+    return _PathSink(open(sink, "w"), string(sink), nothing, false)
+end
+
+_checksink(sink) =
+    sink isa Union{AbstractString,IO} ||
+    _openable(sink, "w") ||
+    throw(
+        ArgumentError(
+            "Arrow writes to a file path, an IO, or an object that open(x, \"w\") " *
+            "accepts, not $(typeof(sink))",
+        ),
+    )
 
 function _openpath(path::AbstractString)
     if !isfile(path)
@@ -212,7 +228,10 @@ function _abortpath(sink::_PathSink)
     return nothing
 end
 
-write(sink::Union{AbstractString,IO}; kwargs...) = tbl -> write(sink, tbl; kwargs...)
+function write(sink; kwargs...)
+    _checksink(sink)
+    return tbl -> write(sink, tbl; kwargs...)
+end
 
 """
     Arrow.tobuffer(table; kwargs...)
@@ -228,7 +247,7 @@ function tobuffer(tbl; kwargs...)
 end
 
 """
-    Arrow.Writer(sink; file=sink isa AbstractString, compress=nothing, compresslevel=nothing,
+    Arrow.Writer(sink; file=!(sink isa IO), compress=nothing, compresslevel=nothing,
                  batchsize=1_048_576, dictencode=nothing, largelists=false,
                  stringview=false, nullable=true, metadata=nothing, colmetadata=nothing,
                  dictdeltas=false, dictreplacement=false, ntasks=Threads.nthreads())
@@ -236,12 +255,13 @@ end
 
 An incremental IPC writer: batches publish to `sink` as they are written,
 so producing tables one at a time never holds more than one partition of
-the current table in memory. `sink` is a file path (the writer opens and owns the handle) or
-an `IO` (borrowed; `close` finishes the IPC output but leaves the `IO`
-open). The function form runs `f(writer)` and always closes the writer.
-The keywords mean what they mean for [`Arrow.write`](@ref), whose metadata
-rules apply too. An existing file path is replaced as by [`Arrow.write`](@ref):
-the output goes to a temporary file that `close` renames over the old file.
+the current table in memory. `sink` is a file path, or another object that
+`open(sink, "w")` accepts (the writer opens and owns the handle), or an `IO`
+(borrowed; `close` finishes the IPC output but leaves the `IO` open). The function
+form runs `f(writer)` and always closes the writer. The keywords mean what they mean
+for [`Arrow.write`](@ref), whose metadata rules apply too. An existing file path is
+replaced as by [`Arrow.write`](@ref): the output goes to a temporary file that `close`
+renames over the old file.
 
     w = Arrow.Writer(path)
     for tbl in tables
@@ -312,8 +332,8 @@ mutable struct Writer
 end
 
 function _writer(
-    sink::Union{AbstractString,IO};
-    file::Bool=sink isa AbstractString,
+    sink;
+    file::Bool=(!isa(sink, IO)),
     compress::Union{Nothing,Symbol}=nothing,
     metadata=nothing,
     colmetadata=nothing,
@@ -360,8 +380,8 @@ function _writer(
         )
     end
     # Open only after keyword dispatch and option checks.
-    ownio = sink isa AbstractString
-    path = ownio ? _openpath(sink) : nothing
+    ownio = !(sink isa IO)
+    path = ownio ? _opensink(sink) : nothing
     io = ownio ? path.io : sink
     try
         return Writer(
@@ -394,9 +414,9 @@ function _writer(
     end
 end
 
-Writer(sink::Union{AbstractString,IO}; kwargs...) = _writer(sink; kwargs...)
+Writer(sink; kwargs...) = _writer(sink; kwargs...)
 
-function Writer(f::Function, sink::Union{AbstractString,IO}; kwargs...)
+function Writer(f::Function, sink; kwargs...)
     w = Writer(sink; kwargs...)
     result = try
         f(w)
@@ -414,10 +434,8 @@ end
 
 # The Arrow 2.x opening idiom: `open(Arrow.Writer, sink)` constructs the
 # writer (the caller closes it), and the function form closes it after `f`.
-Base.open(::Type{Writer}, sink::Union{AbstractString,IO}; kwargs...) =
-    Writer(sink; kwargs...)
-Base.open(f::Function, ::Type{Writer}, sink::Union{AbstractString,IO}; kwargs...) =
-    Writer(f, sink; kwargs...)
+Base.open(::Type{Writer}, sink; kwargs...) = Writer(sink; kwargs...)
+Base.open(f::Function, ::Type{Writer}, sink; kwargs...) = Writer(f, sink; kwargs...)
 
 Base.isopen(w::Writer) = !(@atomic w.closed)
 
