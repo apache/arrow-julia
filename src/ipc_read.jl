@@ -536,6 +536,8 @@ function _nomarker(pos::Int64, word::UInt32)
     msg =
         "not Arrow IPC data: the input starts with neither the file magic " *
         "ARROW1 nor an IPC stream message"
+    # "PAR1", read as a little-endian word.
+    word == 0x31524150 && return msg * " (it starts with PAR1, as a Parquet file does)"
     0 < (word % Int32) <= 1 << 24 || return msg
     return msg *
            " (a stream written before Arrow 0.15 starts like this; " *
@@ -571,8 +573,13 @@ function _framemessage(
     # Continuation marker + zero length is the end-of-stream marker.
     # Nothing may follow it.
     if metalen == 0
-        AC.checked_add(pos, Int64(8)) == blob.len ||
-            throw(ValidationError("trailing bytes after IPC end-of-stream"))
+        AC.checked_add(pos, Int64(8)) == blob.len || throw(
+            ValidationError(
+                "trailing bytes after IPC end-of-stream; for IPC streams written " *
+                "one after another, an Arrow.Stream of an IO reads one stream and " *
+                "leaves the IO at the next",
+            ),
+        )
         return nothing, blob.len
     end
     _checkmessagecount(nread, limits)

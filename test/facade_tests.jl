@@ -653,6 +653,19 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
                 "Arrow.ValidationError: not Arrow IPC data",
             )
         end
+        parquet = vcat(Vector{UInt8}("PAR1"), zeros(UInt8, 12))
+        err = @test_throws Arrow.ValidationError Arrow.Table(parquet)
+        @test occursin("it starts with PAR1, as a Parquet file does", err.value.msg)
+        # Streams written one after another read through Arrow.Stream.
+        io = IOBuffer()
+        Arrow.write(io, (a=[1],); file=false)
+        Arrow.write(io, (a=[2],); file=false)
+        bytes = take!(io)
+        err = @test_throws Arrow.ValidationError Arrow.Table(bytes)
+        @test occursin("an Arrow.Stream of an IO reads one stream", err.value.msg)
+        io = IOBuffer(bytes)
+        @test [b.a for b in Arrow.Stream(io)] == [[1]]
+        @test [b.a for b in Arrow.Stream(io)] == [[2]]
     end
 
     @testset "a source streams batches in windows and downloads whole in concurrent ranges" begin
