@@ -2926,7 +2926,8 @@ function _selectscan(
     end
     arrowtypes = _ArrowTypesContext(budget=budget)
     idxs = Int[c.index for c in b.columns]
-    columns = _buildcolumns(f.fields, batches, idxs, arrowtypes, views, ntasks)
+    # As in a whole read, string columns build when the table hands them out.
+    columns = _buildcolumns(f.fields, batches, idxs, arrowtypes, views, ntasks; lazy=true)
     return _scantable(Symbol[c.name for c in b.columns], columns, nrows, budget)
 end
 
@@ -3064,7 +3065,7 @@ function _scanbatches(
         # Every row is kept: the selected columns are the full read's.
         arrowtypes = _ArrowTypesContext(budget=budget)
         idxs = Int[c.index for c in b.columns]
-        columns = _buildcolumns(fields, batches, idxs, arrowtypes, views, ntasks)
+        columns = _buildcolumns(fields, batches, idxs, arrowtypes, views, ntasks; lazy=true)
         got = _scantable(Symbol[c.name for c in b.columns], columns, nrows, budget)
         return _finishfacadescan(
             got,

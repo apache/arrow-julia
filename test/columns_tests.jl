@@ -728,6 +728,10 @@ end
         @test cols[1] == strs && t.s === cols[1] && t[1] === cols[1]
         @test copy(Arrow.Table(bytes)).s == strs
         @test Arrow.read(bytes, Tables.columntable).s == strs
+        # A scan that only selects builds them the same way.
+        Arrow.Table(bytes; select=[:x, :s])
+        @test (@allocated Arrow.Table(bytes; select=[:x, :s])) < 16n ÷ 4
+        @test Arrow.Table(bytes; select=[:s]).s == strs
         @test Arrow.Table(bytes; stringtype=String).s == strs
         # The read's allowance is charged when the table opens.
         @test_throws Arrow.AllocationLimitError Arrow.Table(
