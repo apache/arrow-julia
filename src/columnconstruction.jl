@@ -1011,7 +1011,12 @@ function _constructpart(
     narrowabstract::Bool=true,
 )
     d = v.owner
-    if d isa AC.ArrayData && d.offset == 0 && d.len == length(v)
+    # Fixed-size binary rows (`NTuple{N,UInt8}`) have no native construction;
+    # the general path writes them.
+    if d isa AC.ArrayData &&
+       d.offset == 0 &&
+       d.len == length(v) &&
+       !(Base.nonmissingtype(eltype(v)) <: Tuple)
         f, _ = _constructnativepart(name, eltype(v)[]; context)
         AC.typeequal(f.type, d.type) && return f, _viewbuffers(d)
     end
