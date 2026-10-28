@@ -85,4 +85,14 @@ end
     @test isequal(collect(t.i128), [1, -Int128(2)^100, missing])
     @test eltype(t.u128) == Union{Missing,UInt128}
     @test isequal(collect(t.u128), [UInt128(2)^127 + 5, UInt128(0), missing])
+    # They rewrite, from the table or as bare columns, as a fresh Int128 column
+    # writes: fixed-size binary plus the JuliaLang.(U)Int128 label, which
+    # pyarrow reads (it refuses Int bitWidth 128).
+    for src in (t, (; i128=t.i128, u128=t.u128))
+        back = Arrow.Table(Arrow.tobuffer(src))
+        @test isequal(back.i128, t.i128) && isequal(back.u128, t.u128)
+        fields = getfield(back, :schema).fields
+        @test all(f -> f.type == Arrow.ArrowCore.FixedSizeBinaryType(16), fields)
+        @test [Dict(f.metadata)["ARROW:extension:name"] for f in fields] == ["JuliaLang.Int128", "JuliaLang.UInt128"]
+    end
 end

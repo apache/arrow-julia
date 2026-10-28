@@ -1047,12 +1047,13 @@ function _constructpart(
     narrowabstract::Bool=true,
 )
     d = v.owner
-    # Fixed-size binary rows (`NTuple{N,UInt8}`) have no native construction;
-    # the general path writes them.
+    # Fixed-size binary rows (`NTuple{N,UInt8}`) and 128-bit integers (stored
+    # as fixed-size binary) have no native construction; the general path
+    # writes them.
     if d isa AC.ArrayData &&
        d.offset == 0 &&
        d.len == length(v) &&
-       !(Base.nonmissingtype(eltype(v)) <: Tuple)
+       !(Base.nonmissingtype(eltype(v)) <: Union{Tuple,Int128,UInt128})
         f, _ = _constructnativepart(name, eltype(v)[]; context)
         AC.typeequal(f.type, d.type) && return f, _viewbuffers(d)
     end
@@ -6401,12 +6402,18 @@ function _constructretainedpart(
     # applies recursively — child names, nullability, metadata, and each
     # level's width are part of retained identity.
     fn, dn = _constructpart(f.name, v; context)
-    AC.typeequal(fn.type, t) || throw(
-        ArgumentError(
-            "column $(f.name) no longer matches its retained Arrow type " *
-            "$(repr(t)); it now maps to $(repr(fn.type))",
-        ),
-    )
+    # Polars' and Arrow 2.x's 128-bit Int type, which pyarrow cannot read,
+    # rewrites as a fresh Int128 column writes: fixed-size binary plus the
+    # JuliaLang.(U)Int128 label.
+    wide = t isa AC.IntType && t.bits == 128 && fn.type isa AC.FixedSizeBinaryType
+    wide ||
+        AC.typeequal(fn.type, t) ||
+        throw(
+            ArgumentError(
+                "column $(f.name) no longer matches its retained Arrow type " *
+                "$(repr(t)); it now maps to $(repr(fn.type))",
+            ),
+        )
     fn.nullable &&
         !f.nullable &&
         AC.nullcount(dn) > 0 &&
@@ -6416,11 +6423,19 @@ function _constructretainedpart(
                 "non-nullable",
             ),
         )
+    metadata = _fieldmetadata(f)
+    if wide
+        metadata = Pair{String,String}[
+            p for p in something(metadata, Pair{String,String}[]) if
+            !startswith(first(p), "ARROW:extension:")
+        ]
+        append!(metadata, something(_fieldmetadata(fn), Pair{String,String}[]))
+    end
     rebuilt = AC.Field(
         f.name,
         fn.type;
         nullable=f.nullable,
-        metadata=_fieldmetadata(f),
+        metadata=metadata,
         children=collect(AC.Field, fn.children),
     )
     return rebuilt, dn
