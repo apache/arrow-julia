@@ -516,6 +516,11 @@ end
         @test Tables.columnnames(t) == [:s] && t.s == ["a", "b", "c"]
         t = Arrow.Table(bytes; scan=Tables.Scan(select=(:y, :s), limit=2))
         @test t.y == [6, 5] && t.s == ["a", "b"]
+        # A scan that only selects gives the full read's columns.
+        full = Arrow.Table(bytes)
+        t = Arrow.Table(bytes; scan=Tables.Scan(select=(:s, :x)))
+        @test typeof(t.s) == typeof(full.s) && typeof(t.x) == typeof(full.x)
+        @test t.s == tbl.s && t.x == tbl.x
     end
 
     @testset "string columns keep decompressed data without a copy" begin

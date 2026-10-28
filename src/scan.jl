@@ -2751,6 +2751,26 @@ function _applyfacadescan(
     _chargevector!(budget, AbstractVector, length(fields), "stream scan columns")
     routes = _ArrowTypesRoutePlan(budget)
     views = _ViewContext(stringtype, budget)
+    nrows = sum(Int(b.nrows) for b in s.batches; init=0)
+    poolof = (bc, field, ctx) -> _retaineddictpool(field, s.batches, bc.index, ctx)
+    if _selectsonly(b) && !isempty(plan.names)
+        # Every row is kept: the selected columns are the full read's.
+        arrowtypes = _ArrowTypesContext(budget=budget)
+        idxs = Int[c.index for c in b.columns]
+        columns = _buildcolumns(fields, s.batches, idxs, arrowtypes, views, ntasks)
+        got = _scantable(Symbol[c.name for c in b.columns], columns, nrows, budget)
+        return _finishfacadescan(
+            got,
+            s.schema,
+            fields,
+            plan;
+            regions=_sourceregions(s, budget),
+            budget=budget,
+            poolof=poolof,
+            views=views,
+            public=true,
+        )
+    end
     # Only the selected and filter-referenced columns are built; the executor
     # reads no other column (an empty placeholder would fail loudly if it did).
     needed = falses(length(fields))
@@ -2763,7 +2783,6 @@ function _applyfacadescan(
         needed[i] ? _facadescanrawcolumn(s, i, budget, routes, views) : Missing[] for
         i = 1:length(fields)
     ]
-    nrows = sum(Int(b.nrows) for b in s.batches; init=0)
     raw = _ScanColumns(plan.names, rawcolumns, nrows)
     got = _executeplan(raw, b, plan.names, budget)
     return _finishfacadescan(
@@ -2773,7 +2792,7 @@ function _applyfacadescan(
         plan;
         regions=_sourceregions(s, budget),
         budget=budget,
-        poolof=(bc, field, ctx) -> _retaineddictpool(field, s.batches, bc.index, ctx),
+        poolof=poolof,
         views=views,
     )
 end
