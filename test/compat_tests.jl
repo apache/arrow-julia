@@ -94,6 +94,8 @@ const AC = Arrow.ArrowCore
         io = IOBuffer()
         Arrow.write(io, (; a=[1]); ntasks=2, alignment=64, maxdepth=6)
         @test Arrow.Table(take!(io)).a == [1]
+        # Arrow 2.x documented ntasks=0 for unbuffered writing: one task.
+        @test Arrow.Table(take!(Arrow.write(IOBuffer(), (; a=[1]); ntasks=0))).a == [1]
     end
 end
 

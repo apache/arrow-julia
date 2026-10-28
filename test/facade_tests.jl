@@ -3179,7 +3179,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             )
             @test one == many
         end
-        @test_throws ArgumentError Arrow.write(IOBuffer(), src; ntasks=0)
+        @test_throws ArgumentError Arrow.write(IOBuffer(), src; ntasks=-1)
         # Each task compresses with its own codec state, and which task gets
         # which buffer varies; an LZ4 frame must not depend on what its
         # task's state compressed before.

@@ -81,8 +81,8 @@ Keywords:
   `Arrow.Stream` keeps its own schema and field metadata, without its batch
   statistics, since values, columns, or batch boundaries may have changed.
 - `ntasks`: how many tasks build a batch's columns and compress its buffers
-  (default `Threads.nthreads()`; `ntasks=1` runs on the calling task). The
-  output bytes are the same for any `ntasks`.
+  (default `Threads.nthreads()`; `ntasks=1` runs on the calling task, as does
+  Arrow 2.x's `ntasks=0`). The output bytes are the same for any `ntasks`.
 
 Strings, at any depth, must be valid UTF-8, as the format requires: a string
 that is not throws an `ArgumentError` naming the column and row. Write bytes
@@ -349,7 +349,8 @@ function _writer(
     end
     codec = _codec(compress, compresslevel)
     batchsize = _checkbatchsize(batchsize)
-    ntasks >= 1 || throw(ArgumentError("ntasks must be at least 1, got $ntasks"))
+    # Arrow 2.x's `ntasks=0` (unbuffered writing) is one task.
+    ntasks >= 0 || throw(ArgumentError("ntasks must be at least 1, got $ntasks"))
     dictencode isa Union{Nothing,Bool,Symbol,AbstractString} ||
         all(n -> n isa Union{Symbol,AbstractString}, dictencode) ||
         throw(ArgumentError("dictencode must be true, false, or column names"))
@@ -382,7 +383,7 @@ function _writer(
             stringview,
             nullable,
             dictencode,
-            Int(ntasks),
+            max(Int(ntasks), 1),
             oneshot,
             _BufferPool(),
             nothing,
