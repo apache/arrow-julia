@@ -3043,6 +3043,10 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         )
         @test occursin("column m holds Matrix{Int64} values", msg((; m=[[1 2; 3 4]])))
         @test occursin("column a has no values to infer an Arrow type", msg((; a=Any[])))
+        @test occursin(
+            "column b holds BigInt values, which have no Arrow type",
+            msg((; b=[big(1)])),
+        )
     end
 
     @testset "write knobs: batchsize, compresslevel, dictencode, largelists" begin

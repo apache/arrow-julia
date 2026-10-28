@@ -6951,10 +6951,16 @@ function _constructcolumn(name::Symbol, parts::Vector{AbstractVector}; kwargs...
         _checkutf8(name, field, data)
         return field, data
     catch err
-        err isa ArgumentError || rethrow()
+        prefix = "fromjulia: unsupported element type "
+        err isa ArgumentError && startswith(err.msg, prefix) || rethrow()
         T = _reflectedstructtype(parts)
-        (T === nothing || !startswith(err.msg, "fromjulia: unsupported element type")) &&
-            rethrow()
+        T === nothing && throw(
+            ArgumentError(
+                "column $name holds $(chopprefix(err.msg, prefix)) values, which have " *
+                "no Arrow type; convert them first, or define ArrowTypes.ArrowType and " *
+                "ArrowTypes.toarrow for their type",
+            ),
+        )
         throw(
             ArgumentError(
                 "column $name holds $T values, which have no ArrowTypes.jl mapping, so " *
