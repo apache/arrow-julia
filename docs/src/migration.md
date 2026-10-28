@@ -88,11 +88,11 @@ rows = table.c isa AbstractVector{<:NamedTuple} ? table.c :
 
 List and map row types changed. Arrow 2.x read list rows as `SubArray`
 views with the child's element type and map rows as `Dict{K,V}`. Arrow 3.0
-reads list rows as `Arrow.ListRow{T}` views and map rows as
-`Arrow.MapRow{K,V}` views of `Pair{K,V}` entries (in stored order; `Dict(row)`
+reads list rows as `Arrow.ListValue{T}` views and map rows as
+`Arrow.MapValue{K,V}` views of `Pair{K,V}` entries (in stored order; `Dict(row)`
 gives the 2.x value). Fixed-size-list rows are `NTuple{N,T}` as before when the list
 has at most 64 values and its values are not nullable; otherwise they are
-`Arrow.ListRow{T}`. `copy(column)` gives `Vector{T}` rows.
+`Arrow.ListValue{T}`. `copy(column)` gives `Vector{T}` rows.
 Code that checks a column's element type, such as a Legolas.jl schema with a
 `Vector{String}` field, sees the new row types; a `Tables.Scan` select type
 override such as `:xs => Vector{String}` reads `Vector` rows.

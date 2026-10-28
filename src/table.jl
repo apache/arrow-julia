@@ -52,7 +52,7 @@ with several record batches is a `ChainedVector` of per-batch views. String
 and binary columns are `DataStrings.StringVector`/`BytesVector`, built with
 one copy of their bytes; `stringtype=String` reads strings as
 `Vector{String}`. List, map, struct, and union columns read as typed rows:
-[`Arrow.ListRow`](@ref) and [`Arrow.MapRow`](@ref) views, `NTuple`s,
+[`Arrow.ListValue`](@ref) and [`Arrow.MapValue`](@ref) views, `NTuple`s,
 `NamedTuple`s, and `Union`s. A
 column keeps the memory it reads alive while it is reachable, independent of
 its table. `copy(table)`, `DataFrame(table)`, and [`Arrow.read`](@ref) return

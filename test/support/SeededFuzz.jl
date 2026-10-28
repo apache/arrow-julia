@@ -428,7 +428,7 @@ const _GENERATED_PUBLIC_ELTYPES = (
     bools=Union{Missing,Bool},
     strings=Union{Missing,DataString},
     dates=Union{Missing,Date},
-    lists=Union{Missing,Arrow.ListRow{Union{Missing,Int32}}},
+    lists=Union{Missing,Arrow.ListValue{Union{Missing,Int32}}},
     structs=Union{
         Missing,
         @NamedTuple{x::Union{Missing,Int16},label::Union{Missing,DataString}},
@@ -496,7 +496,7 @@ function _rowviews(::Type{E}, rows; nullable::Bool=false) where {E}
         row === missing || append!(values, row)
         push!(spans, start:length(values))
     end
-    V = Arrow.ListRow{E}
+    V = Arrow.ListValue{E}
     T = nullable ? Union{Missing,V} : V
     return T[
         row === missing ? missing : V(values, first(span) - 1, length(span)) for
@@ -504,7 +504,7 @@ function _rowviews(::Type{E}, rows; nullable::Bool=false) where {E}
     ]
 end
 
-# `Pair{K,V}` entries as `Arrow.MapRow`s, `missing` for a null row.
+# `Pair{K,V}` entries as `Arrow.MapValue`s, `missing` for a null row.
 function _maprowviews(::Type{K}, ::Type{V}, rows; nullable::Bool=false) where {K,V}
     keys, values = K[], V[]
     spans = UnitRange{Int}[]
@@ -522,7 +522,7 @@ function _maprowviews(::Type{K}, ::Type{V}, rows; nullable::Bool=false) where {K
     store(::Type{E}, xs) where {E} =
         (C = Arrow._columntype(E); xs isa C ? xs : Arrow._storeas(C, xs, nothing))
     kcol, vcol = store(K, keys), store(V, values)
-    M = Arrow.MapRow{K,V}
+    M = Arrow.MapValue{K,V}
     T = nullable ? Union{Missing,M} : M
     return T[
         row === missing ? missing : M(kcol, vcol, first(span) - 1, length(span)) for

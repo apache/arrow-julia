@@ -1287,7 +1287,7 @@ end
 
 # --- nested rows ----------------------------------------------------------------
 #
-# Lists read as `ListRow` views, maps as `MapRow` views, fixed-size lists of up
+# Lists read as `ListValue` views, maps as `MapValue` views, fixed-size lists of up
 # to 64 non-null values as `NTuple`s, structs as `NamedTuple`s built on access,
 # and unions as a `Union` of their children's element types. A column's
 # element type alone fixes how its child values are stored (`_columntype`):
@@ -1313,27 +1313,27 @@ const _MAX_ROW_DEPTH = 8
 const _MAX_TUPLE_ROW = 64
 
 """
-    Arrow.ListRow{T} <: AbstractVector{T}
+    Arrow.ListValue{T} <: AbstractVector{T}
 
 A row of a list column, or of a fixed-size list column longer than 64 values
 or with nullable values: a read-only view of consecutive child values of its
 column. It stays valid after its table is gone. `copy(row)` gives a
 `Vector{T}`.
 """
-struct ListRow{T} <: AbstractVector{T}
+struct ListValue{T} <: AbstractVector{T}
     values::Any   # the column's child values, a `_columntype(T)`
     offset::Int   # child values before the row's first
     len::Int
 end
 
 """
-    Arrow.MapRow{K,V} <: AbstractVector{Pair{K,V}}
+    Arrow.MapValue{K,V} <: AbstractVector{Pair{K,V}}
 
 A row of a map column: its entries as `key => value` pairs, in stored order
 (duplicate keys are kept; `Dict(row)` keeps the last). It stays valid after
 its table is gone. `copy(row)` gives a `Vector{Pair{K,V}}`.
 """
-struct MapRow{K,V} <: AbstractVector{Pair{K,V}}
+struct MapValue{K,V} <: AbstractVector{Pair{K,V}}
     keys::Any     # the column's keys and values, `_columntype(K)`, `_columntype(V)`
     values::Any
     offset::Int
@@ -1343,7 +1343,7 @@ end
 """
     Arrow.ListVector{T} <: Arrow.ArrowVector{T}
 
-A list column: row `i` is the [`Arrow.ListRow`](@ref) of child values
+A list column: row `i` is the [`Arrow.ListValue`](@ref) of child values
 `offsets[i]+1:offsets[i+1]`, or `missing` where the validity bitmap marks a
 null.
 """
@@ -1358,7 +1358,7 @@ end
 """
     Arrow.MapVector{T} <: Arrow.ArrowVector{T}
 
-A map column: row `i` is the [`Arrow.MapRow`](@ref) of entries
+A map column: row `i` is the [`Arrow.MapValue`](@ref) of entries
 `offsets[i]+1:offsets[i+1]`, or `missing` where the validity bitmap marks a
 null.
 """
@@ -1394,9 +1394,9 @@ _columntype(::Type{T}, ::Type{DataStrings.DataString}) where {T} =
     DataStrings.StringVector{T}
 _columntype(::Type{T}, ::Type{DataStrings.DataBytes}) where {T} = DataStrings.BytesVector{T}
 # A `Union` of row types (a union column's values) is stored as a `Vector`.
-_columntype(::Type{T}, ::Type{R}) where {T,R<:ListRow} =
+_columntype(::Type{T}, ::Type{R}) where {T,R<:ListValue} =
     R isa DataType ? ListVector{T} : Vector{T}
-_columntype(::Type{T}, ::Type{R}) where {T,R<:MapRow} =
+_columntype(::Type{T}, ::Type{R}) where {T,R<:MapValue} =
     R isa DataType ? MapVector{T} : Vector{T}
 _columntype(::Type{T}, ::Type{R}) where {T,R<:NamedTuple} =
     R isa DataType ? StructVector{T} : Vector{T}
@@ -1421,7 +1421,7 @@ function _rowtype(f::AC.Field, ctx::_ViewContext, datas)
         entrydatas = _childdatas(datas, 1)
         K = _vieweltype(entries.children[1], _childdatas(entrydatas, 1), ctx)
         V = _vieweltype(entries.children[2], _childdatas(entrydatas, 2), ctx)
-        return MapRow{K,V}
+        return MapValue{K,V}
     end
     E = _vieweltype(f.children[1], _childdatas(datas, 1), ctx)
     # A tuple of a non-concrete `E` (nullable values) is an abstract type:
@@ -1430,7 +1430,7 @@ function _rowtype(f::AC.Field, ctx::_ViewContext, datas)
         t.listsize <= _MAX_TUPLE_ROW &&
         isconcretetype(E) &&
         return NTuple{t.listsize,E}
-    return ListRow{E}
+    return ListValue{E}
 end
 
 # Whether field `f`'s values are nested rows (through a dictionary's values
@@ -1443,17 +1443,17 @@ _nestedvalue(f::AC.Field) =
 Base.@propagate_inbounds _childvalue(::Type{T}, values, j::Int) where {T} =
     (values::_columntype(T))[j]
 
-Base.IndexStyle(::Type{<:Union{ListRow,MapRow}}) = IndexLinear()
-Base.size(r::Union{ListRow,MapRow}) = (r.len,)
+Base.IndexStyle(::Type{<:Union{ListValue,MapValue}}) = IndexLinear()
+Base.size(r::Union{ListValue,MapValue}) = (r.len,)
 Base.size(v::Union{ListVector,MapVector}) = (length(v.offsets) - 1,)
 Base.size(v::StructVector) = (v.len,)
 
-Base.@propagate_inbounds function Base.getindex(r::ListRow{T}, i::Int) where {T}
+Base.@propagate_inbounds function Base.getindex(r::ListValue{T}, i::Int) where {T}
     @boundscheck checkbounds(r, i)
     return @inbounds _childvalue(T, r.values, r.offset + i)
 end
 
-Base.@propagate_inbounds function Base.getindex(r::MapRow{K,V}, i::Int) where {K,V}
+Base.@propagate_inbounds function Base.getindex(r::MapValue{K,V}, i::Int) where {K,V}
     @boundscheck checkbounds(r, i)
     j = r.offset + i
     return @inbounds Pair{K,V}(_childvalue(K, r.keys, j), _childvalue(V, r.values, j))

@@ -226,10 +226,10 @@ value child:
 
 | Arrow type | Element type |
 |---|---|
-| List, LargeList, ListView, LargeListView | [`Arrow.ListRow{T}`](@ref Arrow.ListRow): a read-only view of the row's values |
-| FixedSizeList(N) | `NTuple{N,T}` for `N ≤ 64` and non-null values; otherwise `Arrow.ListRow{T}` (a tuple with `Missing` in its element type is abstract, so every row would be boxed) |
+| List, LargeList, ListView, LargeListView | [`Arrow.ListValue{T}`](@ref Arrow.ListValue): a read-only view of the row's values |
+| FixedSizeList(N) | `NTuple{N,T}` for `N ≤ 64` and non-null values; otherwise `Arrow.ListValue{T}` (a tuple with `Missing` in its element type is abstract, so every row would be boxed) |
 | Struct | a `NamedTuple` of the children's names and element types, built when the row is read |
-| Map | [`Arrow.MapRow{K,V}`](@ref Arrow.MapRow), an `AbstractVector{Pair{K,V}}`: the row's entries in stored order, duplicate keys kept (`Dict(row)` builds a dictionary) |
+| Map | [`Arrow.MapValue{K,V}`](@ref Arrow.MapValue), an `AbstractVector{Pair{K,V}}`: the row's entries in stored order, duplicate keys kept (`Dict(row)` builds a dictionary) |
 | Union | the `Union` of the children's element types |
 | Run-end encoded (composite values) | the *values* child's element type (runs are expanded) |
 | Null | `Missing` |

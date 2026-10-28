@@ -2839,7 +2839,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         # composites: the typed row, both ways
         lf, ld = AC.fromjulia("l", Vector{Int64}[])
         schl = AC.Schema([lf])
-        Row = Arrow.ListRow{Int64}
+        Row = Arrow.ListValue{Int64}
         @test eltype(Arrow.Table(Arrow.writefile(schl, AC.RecordBatch[])).l) === Row
         @test eltype(
             Arrow.Table(

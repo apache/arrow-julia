@@ -44,9 +44,9 @@ Arrow.ArrowVector
 Arrow.Primitive
 Arrow.BoolVector
 Arrow.ListVector
-Arrow.ListRow
+Arrow.ListValue
 Arrow.MapVector
-Arrow.MapRow
+Arrow.MapValue
 Arrow.StructVector
 Arrow.DictEncoded
 Arrow.RunEndEncoded

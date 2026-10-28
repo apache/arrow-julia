@@ -406,7 +406,7 @@ end
     end
 
     @testset "nested columns read as typed rows" begin
-        Row = Arrow.ListRow
+        Row = Arrow.ListValue
         tbl = (
             l=Union{Missing,Vector{Int64}}[[1, 2], missing, Int64[]],
             ls=[["a"], String[], ["b", "c"]],
@@ -420,7 +420,7 @@ end
         @test isequal(collect(t.l), tbl.l)
         @test eltype(t.ls) == Row{DataString} && t.ls == tbl.ls
         @test eltype(t.st) == @NamedTuple{a::Int64, b::DataString} && t.st == tbl.st
-        @test eltype(t.m) == Arrow.MapRow{DataString,Int64}
+        @test eltype(t.m) == Arrow.MapValue{DataString,Int64}
         @test t.m == [["k" => 1], Pair{String,Int64}[], ["p" => 2]]
         # The element type alone fixes how children are stored: strings in a
         # StringVector, fixed-width values in a Primitive view, structs lazily
@@ -489,7 +489,7 @@ end
         bytes = arrowbytes((s=fill(nt, 10_000),))
         @test Arrow.Table(bytes).s[end] === nt
         @test (@allocated Arrow.Table(bytes)) < 2 * 10_000 * sizeof(nt)
-        # Fixed-size lists of nullable values read as `ListRow`s: a tuple type
+        # Fixed-size lists of nullable values read as `ListValue`s: a tuple type
         # with `Missing` in it is abstract, so its rows would be boxed and a
         # rewrite would see up to 2^N runtime types.
         vals = Union{Missing,Int16}[
@@ -552,7 +552,7 @@ end
         ree = Arrow.AC.RunEndEncodedType()
         lt = Arrow.AC.ListType(false)
         offsets = Arrow.AC._databuffer(Int32[0, 3, 3, 6])
-        same(a, b) = isequal(a isa Arrow.MapRow ? Dict(a) : a, b)
+        same(a, b) = isequal(a isa Arrow.MapValue ? Dict(a) : a, b)
         for values in (
             Union{Missing,Vector{Int64}}[[1, 2], missing, [3]],
             Union{Missing,@NamedTuple{p::Int64,q::String}}[

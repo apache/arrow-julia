@@ -1971,7 +1971,7 @@ end
         Union{Missing,FixedOuter}[missing, missing],
     )
     for values in fixedcases, file in (false, true)
-        # Fixed-size lists of union values read as `ListRow`s.
+        # Fixed-size lists of union values read as `ListValue`s.
         expected = Any[v === missing ? missing : (inner=collect(v.inner),) for v in values]
         bytes = arrowtypes_test_bytes((value=values,); file=file)
         @test isequal(Arrow.Table(bytes).value, expected)
@@ -3614,7 +3614,7 @@ end
             children=[innerdata],
             nullcount=0,
         )
-        # The outer list's values are nullable, so its rows are `ListRow`s.
+        # The outer list's values are nullable, so its rows are `ListValue`s.
         expectedrow =
             Any[innervalid[i] ? (missing, missing) : missing for i in eachindex(innervalid)]
         expected = Any[expectedrow]
