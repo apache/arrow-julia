@@ -66,6 +66,14 @@ read into memory unless `mmap=true` is passed. `mmap` has no effect on the
 other source kinds. A byte vector is read in place: do not modify or resize
 it while the table's columns are in use.
 
+!!! warning
+    If another program rewrites a memory-mapped file in place (truncating it,
+    as `open(path, "w")`, `CSV.write`, pyarrow, and shell redirection do) while
+    any column read from it is in use, the next access to that column kills the
+    Julia process with a bus error (SIGBUS). Read files that other programs
+    rewrite with `mmap=false`. `Arrow.write` replaces a file safely: it writes a
+    new file and renames it over the old one.
+
 `ntasks` (default `Threads.nthreads()`) is the number of tasks a read uses:
 record batches decode and decompress field by field in parallel, columns
 build in parallel, and a string column builds in chunks of rows. `ntasks=1`
