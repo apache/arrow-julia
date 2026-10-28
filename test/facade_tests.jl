@@ -673,7 +673,14 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
                 # Random access fetches only the batch asked for.
                 n = length(log.requests)
                 @test st[3].a[1] == 40_001 && length(log.requests) == n + 1
+                # The row count reads each batch's metadata, not its body.
+                n = length(log.requests)
+                @test DataAPI.nrow(st) == 80_000
+                @test length(log.requests) == n + length(parts)
+                @test maximum(last, log.requests[(n + 1):end]) < 1_000
             end
+            kept = Arrow.Stream(log; filter=Arrow.col(:a) > 70_000, select=[:a])
+            @test sum(b -> length(b.a), kept) == 10_000
         end
         # With concurrent reads, a whole-object read fetches the bytes before
         # the tail in 8 MiB ranges at once, into one buffer.

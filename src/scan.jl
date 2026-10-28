@@ -1784,6 +1784,21 @@ end
 
 Base.length(r::_RangedFile) = length(r.recordblocks)
 
+# Row count of batch `i` from one range request for its metadata.
+function _batchrows(r::_RangedFile, i::Int, budget::AllocationBudget)
+    seen = Ref(@atomic r.version)
+    n = _zerofieldblockcount(
+        r.sf,
+        r.recordblocks[i],
+        r.footerversion,
+        r.fields,
+        budget,
+        seen,
+    )
+    @atomicreplace r.version Int16(0) => seen[]
+    return n
+end
+
 # Record batch `i`, decoded through a one-block `ArrowFile` over its bytes.
 function _rangedbatch(r::_RangedFile, i::Int, budget::AllocationBudget, ntasks::Int)
     1 <= i <= length(r.recordblocks) || throw(BoundsError(r, i))
@@ -2216,7 +2231,7 @@ function _zerofieldblockcount(
     sf::SourceFile,
     block::NTuple{3,Int64},
     version::Int16,
-    fields::Vector{Field},
+    fields::AbstractVector{Field},
     budget::AllocationBudget,
     messageversion::Base.RefValue{Int16},
 )
