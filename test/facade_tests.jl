@@ -3017,6 +3017,14 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test f.type == AC.IntType(8, true)
         @test Dict(f.metadata)["ARROW:extension:name"] == "arrow.bool8"
         @test Arrow.Table(bytes).x == [false, true, true]
+        # On uint8 storage the label is not arrow.bool8's: the column reads,
+        # and rewrites, as its stored bytes.
+        _, du8 = AC.fromjulia("x", UInt8[0, 254])
+        f = AC.Field("x", AC.IntType(8, false); nullable=false, metadata=ext("arrow.bool8"))
+        empty!(Arrow._WARNED_EXTENSIONS)
+        t = @test_logs (:warn, r"unsupported ARROW:extension:name") onecolumn(f, du8)
+        @test t.x == [0x00, 0xfe]
+        @test Arrow.Table(take!(Arrow.write(IOBuffer(), t))).x == [0x00, 0xfe]
         _, ds = AC.fromjulia("x", ["{\"a\": 1}", "[]"])
         for name in ("arrow.json", "arrow.opaque")
             f = AC.Field("x", AC.Utf8Type(false); nullable=false, metadata=ext(name))

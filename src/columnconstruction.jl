@@ -5147,9 +5147,10 @@ function _checkpartitionfield(
     return nothing
 end
 
+# The reader takes arrow.bool8 as Bool only on int8 storage; on other
+# storage the label is kept and the values are written as they read.
 _isbool8(f::AC.Field) =
-    f.type isa AC.IntType &&
-    f.type.bits == 8 &&
+    f.type == AC.IntType(8, true) &&
     _fieldmetavalue(f, _EXTENSION_NAME_KEY) == "arrow.bool8"
 _bool8storage(v::AbstractVector) =
     Missing <: eltype(v) ? Union{Missing,Int8}[x isa Bool ? Int8(x) : x for x in v] :
