@@ -92,9 +92,10 @@ PrecompileTools.@setup_workload begin
     )
     PrecompileTools.@compile_workload begin
         # The flat table goes out as two record batches, so its columns chain.
+        # Reads of the file format, what `Arrow.Table(path)` reads.
         for table in (columns, Tables.partitioner((flat, flat)))
             io = IOBuffer()
-            write(io, table)
+            write(io, table; file=true)
             flatbytes = take!(seekstart(io))
             tbl = Table(flatbytes)
             for name in Tables.columnnames(tbl)
@@ -111,7 +112,7 @@ PrecompileTools.@setup_workload begin
             Table(flatbytes; scan=Tables.Scan(filter=stamp))
         end
         io = IOBuffer()
-        write(io, columns)
+        write(io, columns; file=true)
         bytes = take!(seekstart(io))
         tbl = Table(bytes)
         Tables.columntable(tbl)
@@ -128,7 +129,7 @@ PrecompileTools.@setup_workload begin
         write(IOBuffer(), tbl)
         write(IOBuffer(), Tables.columntable(tbl))
         io = IOBuffer()
-        write(io, columns; batchsize=2)
+        write(io, columns; batchsize=2, file=true)
         write(IOBuffer(), Tables.columntable(Table(take!(seekstart(io)))); batchsize=2)
     end
 end

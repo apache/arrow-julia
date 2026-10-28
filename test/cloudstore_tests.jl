@@ -46,7 +46,7 @@ end
     part1 = (a=collect(Int64, 1:1000), b=["v$i" for i = 1:1000], c=rand(1000))
     part2 = (a=collect(Int64, 1001:2000), b=["v$i" for i = 1001:2000], c=rand(1000))
     fio = IOBuffer()
-    Arrow.write(fio, Tables.partitioner([part1, part2]))
+    Arrow.write(fio, Tables.partitioner([part1, part2]); file=true)
     filebytes = take!(fio)
     sio = IOBuffer()
     Arrow.write(sio, Tables.partitioner([part1, part2]); file=false)

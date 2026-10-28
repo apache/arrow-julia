@@ -73,7 +73,7 @@ end
         )
         invalid = (
             ((; compress=:invalid), ArgumentError),
-            ((; dictreplacement=true), ArgumentError),
+            ((; dictreplacement=true, file=true), ArgumentError),
             ((; file=:invalid), TypeError),
             ((; compress=1), TypeError),
             ((; dictreplacement=:invalid), TypeError),
@@ -131,6 +131,34 @@ end
             @test !isopen(w.io)
             @test isempty(read(path))
         end
+    end
+
+    @testset "an IO gets the stream format and a path the file format" begin
+        stream = Arrow._writebytes(table; file=false)
+        io = IOBuffer()
+        Arrow.write(io, table)
+        @test take!(io) == stream
+        io = IOBuffer()
+        Arrow.Writer(w -> Arrow.write(w, table), io; nullable=false)
+        @test take!(io) == stream
+        io = IOBuffer()
+        Arrow.write(io, table; file=true)
+        @test take!(io) == Arrow._writebytes(table; file=true)
+        mktempdir() do dir
+            path = joinpath(dir, "default.arrow")
+            Arrow.write(path, table)
+            @test read(path) == Arrow._writebytes(table; file=true)
+        end
+        # A reader at the other end of a pipe gets each batch as it is
+        # written, before the writer closes.
+        pipe = Base.BufferStream()
+        w = Arrow.Writer(pipe)
+        Arrow.write(w, table)
+        reader = @async first(Arrow.Stream(pipe)).a
+        @test timedwait(() -> istaskdone(reader), 60) === :ok
+        @test fetch(reader) == table.a
+        close(w)
+        close(pipe)
     end
 
     @testset "eager write and append reject options before changing bytes" begin

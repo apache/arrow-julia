@@ -189,7 +189,7 @@ end
             got = Arrow.Table(source isa Vector{UInt8} ? copy(source) : source; scan=scan)
             @test got.e == want
             io = IOBuffer()
-            Arrow.write(io, got)
+            Arrow.write(io, got; file=true)
             back = Arrow.readfile(take!(io))
             field = back.schema.fields[1]
             @test (field.type::AC.DictionaryType).ordered

@@ -306,7 +306,9 @@ batchkinds(bytes) = [
             end
             # A growing pool is indexed with Int32, as pyarrow writes.
             f = only(
-                Arrow.readfile(take!(Arrow.write(IOBuffer(), Arrow.Table(bytes)))).schema.fields,
+                Arrow.readfile(
+                    take!(Arrow.write(IOBuffer(), Arrow.Table(bytes); file=true)),
+                ).schema.fields,
             )
             @test (f.type::AC.DictionaryType).indextype == AC.IntType(32, true)
         end
@@ -320,13 +322,13 @@ batchkinds(bytes) = [
         @test Arrow.Table(bytes).d == ["a", "b", "a", "c", "c", "b"]
         @test [(isdelta, n) for (_, isdelta, n) in dictbatches(bytes)] == [(false, 2), (false, 2)]
         # The file format has no replacement to declare.
-        @test_throws ArgumentError Arrow.Writer(IOBuffer(); dictreplacement=true)
+        @test_throws ArgumentError Arrow.Writer(IOBuffer(); file=true, dictreplacement=true)
     end
 
     @testset "one-shot dictionaries use the narrowest index type" begin
         indextype(t) = (
             only(
-                Arrow.readfile(take!(Arrow.write(IOBuffer(), t))).schema.fields,
+                Arrow.readfile(take!(Arrow.write(IOBuffer(), t; file=true))).schema.fields,
             ).type::AC.DictionaryType
         ).indextype
         @test indextype((; d=Arrow.DictEncode(["a", "b"]))) == AC.IntType(8, true)
@@ -339,7 +341,7 @@ batchkinds(bytes) = [
                 ordered,
                 levels=["lo", "hi"],
             )
-            bytes = take!(Arrow.write(IOBuffer(), (; c=c)))
+            bytes = take!(Arrow.write(IOBuffer(), (; c=c); file=true))
             t = only(Arrow.readfile(bytes).schema.fields).type::AC.DictionaryType
             @test t.ordered == ordered
             @test Arrow.Table(bytes).c == ["lo", "hi", "lo"]

@@ -299,7 +299,7 @@ function _scan_main()
     # planning. Sets use `isequal`, so they match NaN and distinguish signed
     # zero; rebuilding them as tuples would change both results.
     specialio = IOBuffer()
-    Arrow.write(specialio, (x=[NaN, 0.0, -0.0], id=Int64[1, 2, 3]))
+    Arrow.write(specialio, (x=[NaN, 0.0, -0.0], id=Int64[1, 2, 3]); file=true)
     specialbytes = take!(specialio)
     specialfull = Arrow.Table(copy(specialbytes))
     for (values, expectedids) in ((Set([NaN]), [1]), (Set([0.0]), [2]))
@@ -801,7 +801,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     # `in` semantics, so a remote Date filter stays on the ranged path.
     dateio = IOBuffer()
     dates = Arrow.Dates.Date(2024, 1, 1) .+ Arrow.Dates.Day.(0:9_999)
-    Arrow.write(dateio, (d=dates, fat=fill(repeat("x", 128), length(dates))))
+    Arrow.write(dateio, (d=dates, fat=fill(repeat("x", 128), length(dates))); file=true)
     datebytes = take!(dateio)
     targetdate = Arrow.Dates.Date(2024, 3, 1)
     datescan =
@@ -858,7 +858,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         missing,
         Arrow.Dates.Date(2024, 1, 3),
     ]
-    Arrow.write(nullableio, (id=Int64[1, 2, 3], d=nullable_dates))
+    Arrow.write(nullableio, (id=Int64[1, 2, 3], d=nullable_dates); file=true)
     nullablebytes = take!(nullableio)
     nullablefull = Arrow.Table(copy(nullablebytes))
     nullablefield = getfield(nullablefull, :schema).fields[2]
@@ -1525,7 +1525,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     # outside the cumulative budget, even when an empty projection needs no
     # record body.
     tailio = IOBuffer()
-    Arrow.write(tailio, (x=collect(Int64, 1:5_000),))
+    Arrow.write(tailio, (x=collect(Int64, 1:5_000),); file=true)
     tailfilebytes = take!(tailio)
     taillog, tailsource = countingsource(tailfilebytes)
     tailtight = Limits(max_total_allocated_bytes=32_000)
@@ -1552,6 +1552,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         publicio,
         (d=fill(Arrow.Dates.Date(2024, 1, 1), 10_000), x=zeros(Int64, 10_000));
         compress=:zstd,
+        file=true,
     )
     publicbytes = take!(publicio)
     publicscan = Tables.Scan(

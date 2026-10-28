@@ -39,9 +39,9 @@ Base.getindex(d::DictEncode, i::Int) = d.data[i]
 include("columnconstruction.jl")
 
 """
-    Arrow.write(sink, table; file=true, compress=nothing, compresslevel=nothing,
-                batchsize=1_048_576, dictencode=false, dictdeltas=false,
-                largelists=false, stringview=false, metadata=nothing,
+    Arrow.write(sink, table; file=sink isa AbstractString, compress=nothing,
+                compresslevel=nothing, batchsize=1_048_576, dictencode=false,
+                dictdeltas=false, largelists=false, stringview=false, metadata=nothing,
                 colmetadata=nothing, ntasks=Threads.nthreads())
     Arrow.write(sink; kwargs...)
 
@@ -49,8 +49,11 @@ Write any Tables.jl source as Arrow IPC to `sink`, a file path or an `IO`, and
 return `sink`. The one-argument form curries: `table |> Arrow.write(sink)`.
 
 Keywords:
-- `file`: the random-access file format (`ARROW1` magic and footer), or with
-  `file=false` the stream format.
+- `file`: `true` writes the random-access file format (`ARROW1` magic and
+  footer), `false` the stream format. A path gets the file format and an `IO`
+  the stream format by default, as in Arrow 2.x: a reader at the other end of
+  a pipe or socket (`Arrow.Stream`, pyarrow's `ipc.open_stream`) gets each
+  record batch as it is written.
 - `compress`: `nothing`, `:lz4`, or `:zstd`; `compresslevel` sets the codec's
   level (LZ4 up to 12, Zstandard up to 22; `nothing` keeps the codec's
   default, 0 for LZ4 and 3 for Zstandard).
@@ -220,7 +223,7 @@ function tobuffer(tbl; kwargs...)
 end
 
 """
-    Arrow.Writer(sink; file=true, compress=nothing, compresslevel=nothing,
+    Arrow.Writer(sink; file=sink isa AbstractString, compress=nothing, compresslevel=nothing,
                  batchsize=1_048_576, dictencode=false, largelists=false,
                  stringview=false, nullable=true, metadata=nothing, colmetadata=nothing,
                  dictdeltas=false, dictreplacement=false, ntasks=Threads.nthreads())
@@ -309,7 +312,7 @@ end
 
 function _writer(
     sink::Union{AbstractString,IO};
-    file::Bool=true,
+    file::Bool=sink isa AbstractString,
     compress::Union{Nothing,Symbol}=nothing,
     metadata=nothing,
     colmetadata=nothing,

@@ -372,7 +372,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
 
     @testset "facade reader limits" begin
         fileio = IOBuffer()
-        Arrow.write(fileio, (x=Int64[1, 2],))
+        Arrow.write(fileio, (x=Int64[1, 2],); file=true)
         filebytes = take!(fileio)
         streamio = IOBuffer()
         Arrow.write(streamio, (x=Int64[1, 2],); file=false)
@@ -711,7 +711,8 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             Tables.partitioner([
                 (a=collect(Int64, 1:1000), b=[string("v", i) for i = 1:1000]),
                 (a=collect(Int64, 1001:2000), b=[string("v", i) for i = 1001:2000]),
-            ]),
+            ]);
+            file=true,
         )
         fb = take!(io)
         fetched = Ref(Int64(0))
@@ -734,7 +735,8 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             Tables.partitioner([
                 (a=collect(Int64, 1:1000), b=wide[1:1000]),
                 (a=collect(Int64, 1001:2000), b=wide[1001:2000]),
-            ]),
+            ]);
+            file=true,
         )
         wb = take!(wio)
         @test length(wb) > 65536
@@ -1105,7 +1107,8 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             Tables.partitioner([
                 (x=Int64[1, 2, 3, 4], y=["a", "b", "c", "d"]),
                 (x=Int64[5, 6, 7, 8], y=["e", "f", "g", "h"]),
-            ]),
+            ]);
+            file=true,
         )
         bytes = take!(io)
         scan = Tables.Scan(select=(:x,), filter=Tables.col(:x) > 2, offset=1, limit=2)
@@ -1508,7 +1511,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             ts=[DateTime(2020, 1, 1), DateTime(2020, 1, 2), DateTime(2020, 1, 3)],
         )
         fio = IOBuffer()
-        Arrow.write(fio, data)
+        Arrow.write(fio, data; file=true)
         fb = take!(fio)
         sio = IOBuffer()
         Arrow.write(sio, data; file=false)
@@ -2961,7 +2964,8 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         t = rt((; x=u))
         f = fieldof(t)
         @test f.type == Arrow.AC.FixedSizeBinaryType(16) && label(f) == "arrow.uuid"
-        bytes = Arrow.readfile(take!(Arrow.write(IOBuffer(), (; x=u))))[1].columns[1]
+        bytes =
+            Arrow.readfile(take!(Arrow.write(IOBuffer(), (; x=u); file=true)))[1].columns[1]
         @test Arrow.AC.loadat(Arrow.AC.rolebuffer(bytes, Arrow.AC.DATA), UInt8, 0) == 0x00
         @test Arrow.AC.loadat(Arrow.AC.rolebuffer(bytes, Arrow.AC.DATA), UInt8, 15) == 0xff
         @test isequal(collect(t.x), u) && isequal(collect(rt(t).x), u)
@@ -3026,7 +3030,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         )
         @test eltype(t.x) == Bool && t.x == [false, true, true]
         # A rewrite keeps the label and stores the values as 0 and 1.
-        bytes = take!(Arrow.write(IOBuffer(), t))
+        bytes = take!(Arrow.write(IOBuffer(), t; file=true))
         f = only(Arrow.readfile(bytes).schema.fields)
         @test f.type == AC.IntType(8, true)
         @test Dict(f.metadata)["ARROW:extension:name"] == "arrow.bool8"
@@ -3058,7 +3062,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             t = onecolumn(f, ds)
             @test t.x isa StringVector && eltype(t.x) == DataStrings.DataString
             @test eltype(onecolumn(f, ds; stringtype=String).x) == String
-            back = Arrow.readfile(take!(Arrow.write(IOBuffer(), t)))
+            back = Arrow.readfile(take!(Arrow.write(IOBuffer(), t; file=true)))
             @test Dict(only(back.schema.fields).metadata)["ARROW:extension:name"] == label
         end
         # So does a name some code already made a Symbol, when no
@@ -3286,11 +3290,14 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
 
     @testset "write knobs: batchsize, compresslevel, dictencode, largelists" begin
         AC = Arrow.AC
-        nbatches(bytes) = length(Arrow.readfile(bytes).recordblocks)
-        types(bytes) = [f.type for f in Arrow.readfile(bytes).schema.fields]
+        nbatches(bytes) = length(Arrow.Stream(bytes))
+        function types(bytes)
+            core = view(bytes, 1:6) == b"ARROW1" ? Arrow.readfile : Arrow.readstream
+            return [f.type for f in core(bytes).schema.fields]
+        end
         t = (; a=collect(1:10), s=[isodd(i) ? "x$i" : missing for i = 1:10])
         for (batchsize, n) in ((1, 10), (3, 4), (10, 1), (11, 1))
-            bytes = take!(Arrow.write(IOBuffer(), t; batchsize))
+            bytes = take!(Arrow.write(IOBuffer(), t; batchsize, file=true))
             @test nbatches(bytes) == n
             back = Arrow.Table(bytes)
             @test back.a == t.a && isequal(collect(back.s), t.s)
@@ -3298,7 +3305,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test nbatches(take!(Arrow.write(IOBuffer(), (; a=zeros(Int8, (1 << 20) + 1))))) ==
               2
         parts = Tables.partitioner([(; a=collect(1:5)), (; a=Int[]), (; a=[6, 7])])
-        bytes = take!(Arrow.write(IOBuffer(), parts; batchsize=2))
+        bytes = take!(Arrow.write(IOBuffer(), parts; batchsize=2, file=true))
         f = Arrow.readfile(bytes)
         @test [f[i].nrows for i = 1:length(f)] == [2, 2, 1, 0, 2]
         @test Arrow.Table(bytes).a == 1:7
@@ -3397,7 +3404,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         f, columnparts = Arrow._constructcolumn(:s, AbstractVector[col])
         @test f.type == Arrow.AC.Utf8Type(false) && f.nullable
         io = IOBuffer()
-        Arrow.write(io, (id=[1, 2, 3, 4], s=col))
+        Arrow.write(io, (id=[1, 2, 3, 4], s=col); file=true)
         bytes = take!(io)
         @test Arrow.readfile(bytes).schema.fields[2].type == Arrow.AC.Utf8Type(false)
         @test isequal(Arrow.Table(bytes).s, expected)
@@ -3408,7 +3415,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test d.buffers[2].region.root === payloads       # views: the payload vector itself
         @test d.buffers[3].region.root === buf
         @test d.buffers[4].region.root === extra
-        Arrow.write(io, (id=[1, 2, 3, 4], s=col); stringview=true)
+        Arrow.write(io, (id=[1, 2, 3, 4], s=col); stringview=true, file=true)
         bytes = take!(io)
         @test Arrow.readfile(bytes).schema.fields[2].type == Arrow.AC.ViewType(true)
         t = Arrow.Table(bytes)
@@ -3433,7 +3440,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         fi, inlineparts = Arrow._constructcolumn(:s, AbstractVector[inl]; stringview=true)
         di = only(inlineparts)
         @test length(di.buffers) == 2
-        Arrow.write(io, (s=inl,); stringview=true)
+        Arrow.write(io, (s=inl,); stringview=true, file=true)
         bytes0 = take!(io)
         @test Arrow.Table(bytes0).s == ["abcd", "ab"]
         af = Arrow.readfile(bytes0)
