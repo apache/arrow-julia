@@ -45,6 +45,8 @@ Base.IndexStyle(::Type{<:ArrowVector}) = IndexLinear()
     "copy(column), copy(table), or DataFrame(table) returns a mutable copy",
 )
 Base.setindex!(::ArrowVector, v, ::Int) = _readonlycolumn()
+# `push!` and `append!` resize first.
+Base.resize!(::ArrowVector, ::Integer) = _readonlycolumn()
 # Containers that know only a column's type (a `ChainedVector` whose batches
 # are all empty) allocate through this; a new vector is a mutable `Array`.
 Base.similar(::Type{<:ArrowVector{T}}, dims::Dims) where {T} = Array{T}(undef, dims)

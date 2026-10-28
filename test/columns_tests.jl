@@ -220,6 +220,9 @@ end
             @test col isa Arrow.ArrowVector
             @test isequal(collect(col), collect(want))
             @test_throws ErrorException col[1] = col[2]
+            # push! and append! say so too (they resize first).
+            @test_throws ErrorException push!(col, col[1])
+            @test_throws ErrorException append!(col, col)
             owned = copy(col)
             @test owned isa Vector && isequal(owned, collect(col))
         end
