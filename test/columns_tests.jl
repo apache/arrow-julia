@@ -518,6 +518,17 @@ end
         @test t.y == [6, 5] && t.s == ["a", "b"]
     end
 
+    @testset "string columns keep decompressed data without a copy" begin
+        strs = [string(repeat("x", 100), i) for i = 1:100_000]
+        data = sum(ncodeunits, strs)
+        for compress in (:zstd, :lz4), stringview in (false, true)
+            bytes = arrowbytes((s=strs,); compress=compress, stringview=stringview)
+            @test Arrow.Table(bytes).s == strs
+            # The decompressed data plus 16-byte payloads; a copy adds `data` more.
+            @test (@allocated Arrow.Table(bytes)) < data + 4_000_000
+        end
+    end
+
     @testset "columns of several batches copy and broadcast by batch" begin
         part(r) = (
             x=collect(Int64, r),

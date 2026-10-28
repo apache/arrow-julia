@@ -491,6 +491,7 @@ struct _StringChunk
     buf::Int
     lo::Int64
     variadic::Int
+    copybytes::Bool   # false: buffer `buf` is the batch's own decompressed data
 end
 
 """
@@ -530,14 +531,23 @@ function _rowchunks!(
     buf::Int,
     lo::Int64,
     rows::Int,
+    copybytes::Bool=true,
 )
     a = first
     while a <= last
         b = last - a >= rows ? a + rows - 1 : last
-        push!(chunks, _StringChunk(d, at, a, b, buf, lo, 0))
+        push!(chunks, _StringChunk(d, at, a, b, buf, lo, 0, copybytes))
         a = b + 1
     end
     return chunks
+end
+
+# The decompressed bytes behind slice `b` when this read owns them and `b`
+# starts at their start, so a column can keep them instead of a copy.
+function _adoptbytes(b::AC.BufferSlice)
+    r = b.region
+    (r !== nothing && b.offset == 0 && r.root isa _Decompressed) || return nothing
+    return (r.root::_Decompressed).bytes
 end
 
 # Cut offsets batch `d` into runs of rows whose bytes span at most 2 GiB, one
@@ -552,6 +562,12 @@ function _offsetruns!(
     rows::Int,
 ) where {O}
     n = Int(d.len)
+    # Decompressed data is the read's own: the column keeps it as it is.
+    own = _adoptbytes(AC.rolebuffer(d, AC.DATA))
+    if own !== nothing && Int64(offsets[n + 1]) <= _MAX_VIEW_BUFFER
+        push!(buffers, own)
+        return _rowchunks!(chunks, d, at, 1, n, length(buffers) - 1, Int64(0), rows, false)
+    end
     i = 1
     while i <= n
         lo = Int64(offsets[i])
@@ -623,10 +639,15 @@ function _stringbuild(::Type{T}, datas, budget, rows::Int=typemax(Int)) where {T
         if d.type isa AC.ViewType
             base = length(buffers)
             for k = 3:length(d.buffers)
+                own = _adoptbytes(d.buffers[k])
+                if own !== nothing
+                    push!(buffers, own)
+                    continue
+                end
                 len = d.buffers[k].len
                 _chargeexact!(budget, UInt8, len, "string column data")
                 push!(buffers, Vector{UInt8}(undef, Int(len)))
-                push!(chunks, _StringChunk(d, at, 1, 0, base, Int64(0), k))
+                push!(chunks, _StringChunk(d, at, 1, 0, base, Int64(0), k, true))
             end
             _rowchunks!(chunks, d, at, 1, m, base, Int64(0), rows)
         elseif m > 0
@@ -682,7 +703,7 @@ function _offsetrows!(
 ) where {O}
     a = Int64(offsets[c.first])
     z = Int64(offsets[c.last + 1])
-    if z > a
+    if c.copybytes && z > a
         src = AC.subslice(AC.rolebuffer(d, AC.DATA), a, z - a)
         GC.@preserve buf d unsafe_copyto!(
             pointer(buf, Int(a - c.lo) + 1),

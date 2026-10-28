@@ -1247,7 +1247,8 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice, needed::Int64=In
                     "compressed buffer holds $got bytes; its column needs $needed",
                 ),
             )
-        result = BufferSlice(heapregion(out), 0, got)
+        region = OwnerRegion(Ptr{UInt8}(pointer(out)), sizeof(out); root=_Decompressed(out))
+        result = BufferSlice(region, 0, got)
         committed = true
         return result
     catch e
@@ -1261,6 +1262,13 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice, needed::Int64=In
 end
 
 _padded64(n::Int64) = n > typemax(Int64) - 63 ? typemax(Int64) : (n + 63) & ~Int64(63)
+
+# The root of a decompressed buffer's region: bytes this read allocated and no
+# other buffer shares, so a column may keep them instead of a copy (string
+# data, `_adoptbytes`).
+struct _Decompressed
+    bytes::Vector{UInt8}
+end
 
 # The decompressed size the frame headers record: zstd frames usually do (a
 # buffer may hold several), LZ4 frames optionally. -1 when a header does not
