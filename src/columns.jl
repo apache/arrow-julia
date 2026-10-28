@@ -1393,9 +1393,13 @@ _columntype(::Type{T}, ::Type{S}) where {T,S} =
 _columntype(::Type{T}, ::Type{DataStrings.DataString}) where {T} =
     DataStrings.StringVector{T}
 _columntype(::Type{T}, ::Type{DataStrings.DataBytes}) where {T} = DataStrings.BytesVector{T}
-_columntype(::Type{T}, ::Type{<:ListRow}) where {T} = ListVector{T}
-_columntype(::Type{T}, ::Type{<:MapRow}) where {T} = MapVector{T}
-_columntype(::Type{T}, ::Type{<:NamedTuple}) where {T} = StructVector{T}
+# A `Union` of row types (a union column's values) is stored as a `Vector`.
+_columntype(::Type{T}, ::Type{R}) where {T,R<:ListRow} =
+    R isa DataType ? ListVector{T} : Vector{T}
+_columntype(::Type{T}, ::Type{R}) where {T,R<:MapRow} =
+    R isa DataType ? MapVector{T} : Vector{T}
+_columntype(::Type{T}, ::Type{R}) where {T,R<:NamedTuple} =
+    R isa DataType ? StructVector{T} : Vector{T}
 
 _childdatas(datas, k::Int) = AC.ArrayData[d.children[k] for d in datas]
 
@@ -1523,11 +1527,9 @@ function _childcolumn(
     ctx::_ViewContext,
     @nospecialize(E::Type)
 )
-    col = _viewcolumn(f, AC.ArrayData[d], ctx, E)
-    C = _columntype(E)
-    col isa C && return col
-    return _storeas(C, col, ctx.budget)
+    return _storedas(_columntype(E), _viewcolumn(f, AC.ArrayData[d], ctx, E), ctx.budget)
 end
+_storedas(::Type{C}, col, budget) where {C} = col isa C ? col : _storeas(C, col, budget)
 
 function _storeas(::Type{Vector{E}}, col, budget) where {E}
     _chargeexact!(budget, E, length(col), "nested child values")
@@ -1544,16 +1546,97 @@ function _storeas(::Type{Primitive{T,S,Nothing}}, col, budget) where {T,S}
     validity = UInt8[]
     for (i, x) in enumerate(col)
         if x === missing
-            if isempty(validity)
-                _chargeexact!(budget, UInt8, cld(n, 8), "nested child validity")
-                validity = fill(0xff, cld(n, 8))
-            end
-            @inbounds validity[((i - 1) >> 3) + 1] &= ~(0x01 << ((i - 1) & 7))
+            validity = _setnull(validity, i, n, budget)
         else
             @inbounds data[i] = x
         end
     end
     return Primitive{T,S,Nothing}(data, validity, 0, nothing)
+end
+
+# A validity bitmap for `n` slots with slot `i` null; an empty `validity` (no
+# nulls yet) becomes an all-valid bitmap first.
+function _setnull(validity::Vector{UInt8}, i::Int, n::Int, budget)
+    if isempty(validity)
+        _chargeexact!(budget, UInt8, cld(n, 8), "nested child validity")
+        validity = fill(0xff, cld(n, 8))
+    end
+    @inbounds validity[((i - 1) >> 3) + 1] &= ~(0x01 << ((i - 1) & 7))
+    return validity
+end
+
+# Converted list, map, and struct values (run-end encoded or dictionary
+# children) gather their rows into a column of their own.
+function _storeas(::Type{ListVector{T}}, col, budget) where {T}
+    E = eltype(Base.nonmissingtype(T))
+    n = length(col)
+    _chargeexact!(budget, Int, n + 1, "list offsets")
+    offsets = zeros(Int, n + 1)
+    values, validity = E[], UInt8[]
+    for (i, row) in enumerate(col)
+        if row === missing
+            validity = _setnull(validity, i, n, budget)
+        else
+            append!(values, row)
+        end
+        offsets[i + 1] = length(values)
+    end
+    _chargeexact!(budget, E, length(values), "nested child values")
+    return ListVector{T}(
+        offsets,
+        _storedas(_columntype(E), values, budget),
+        validity,
+        0,
+        nothing,
+    )
+end
+function _storeas(::Type{MapVector{T}}, col, budget) where {T}
+    K, V = fieldtypes(eltype(Base.nonmissingtype(T)))
+    n = length(col)
+    _chargeexact!(budget, Int, n + 1, "map offsets")
+    offsets = zeros(Int, n + 1)
+    keys, values, validity = K[], V[], UInt8[]
+    for (i, row) in enumerate(col)
+        if row === missing
+            validity = _setnull(validity, i, n, budget)
+        else
+            for (k, v) in row
+                push!(keys, k)
+                push!(values, v)
+            end
+        end
+        offsets[i + 1] = length(keys)
+    end
+    _chargeexact!(budget, Pair{K,V}, length(keys), "nested child values")
+    keys = _storedas(_columntype(K), keys, budget)
+    return MapVector{T}(
+        offsets,
+        keys,
+        _storedas(_columntype(V), values, budget),
+        validity,
+        0,
+        nothing,
+    )
+end
+function _storeas(::Type{StructVector{T}}, col, budget) where {T}
+    R = Base.nonmissingtype(T)
+    n = length(col)
+    validity = UInt8[]
+    for (i, row) in enumerate(col)
+        row === missing && (validity = _setnull(validity, i, n, budget))
+    end
+    # A null row's field slots are never read; they repeat a valid row's
+    # values (none when every row is null).
+    k = findfirst(!ismissing, col)
+    rows = k === nothing ? R[] : R[row === missing ? col[k] : row for row in col]
+    _chargevector!(budget, AbstractVector, fieldcount(R), "struct children")
+    children = Vector{AbstractVector}(undef, fieldcount(R))
+    for j = 1:fieldcount(R)
+        F = fieldtype(R, j)
+        _chargeexact!(budget, F, length(rows), "nested child values")
+        children[j] = _storedas(_columntype(F), F[getfield(r, j) for r in rows], budget)
+    end
+    return StructVector{T}(children, 0, n, validity, 0, nothing)
 end
 _storeas(::Type{DataStrings.StringVector{E}}, col, budget) where {E} =
     DataStrings.StringVector{E}(collect(col))

@@ -540,6 +540,46 @@ end
         @test !(eltype(deep9) <: Row) && deep9 == [nest([1], 8)]
     end
 
+    @testset "nested children of union or run-end encoded values" begin
+        # A union of row types is a union column's values: stored as a Vector.
+        U = Union{Vector{Int64},Vector{Bool}}
+        t = Arrow.Table(arrowbytes((c=[U[[1], [true]], U[]],)))
+        @test isequal(t.c, [[[1], [true]], []])
+        NT = Union{@NamedTuple{a::Int64},@NamedTuple{b::String}}
+        t = Arrow.Table(arrowbytes((c=[NT[(a=1,), (b="x",)]],)))
+        @test t.c[1][1] == (a=1,) && t.c[1][2] == (b="x",)
+        t = Arrow.Table(arrowbytes((m=[Dict{String,U}("a" => [1], "b" => [true])],)))
+        @test Dict(t.m[1]) == Dict("a" => [1], "b" => [true])
+        # Run-end encoded list, struct, and map values inside a list.
+        ree = Arrow.AC.RunEndEncodedType()
+        lt = Arrow.AC.ListType(false)
+        offsets = Arrow.AC._databuffer(Int32[0, 3, 3, 6])
+        same(a, b) = isequal(a isa Arrow.MapRow ? Dict(a) : a, b)
+        for values in (
+            Union{Missing,Vector{Int64}}[[1, 2], missing, [3]],
+            Union{Missing,@NamedTuple{p::Int64,q::String}}[
+                (p=1, q="a"),
+                missing,
+                (p=3, q="c"),
+            ],
+            [Dict("k" => 1), Dict{String,Int64}(), Dict("j" => 2)],
+        )
+            rf, rd = Arrow.AC.fromjulia("run_ends", Int32[2, 3, 6])
+            src = Arrow.readstream(arrowbytes((values=values,); file=false))
+            vf, vd =
+                only(Arrow.AC.schema(src).fields), only(Arrow.AC.nextbatch!(src).columns)
+            ef = Arrow.AC.Field("item", ree; nullable=true, children=[rf, vf])
+            ed = Arrow.AC.ArrayData(ree, 6, Arrow.AC.BufferSlice[]; children=[rd, vd])
+            f = Arrow.AC.Field("l", lt; nullable=false, children=[ef])
+            d = Arrow.AC.ArrayData(lt, 3, [Arrow.AC.BufferSlice(), offsets]; children=[ed])
+            sch = Arrow.AC.Schema([f])
+            t = Arrow.Table(Arrow.writestream(sch, [Arrow.AC.RecordBatch(sch, [d])]))
+            runs = values[[1, 1, 2, 3, 3, 3]]
+            @test all(same.(t.l[1], runs[1:3])) && isempty(t.l[2])
+            @test all(same.(t.l[3], runs[4:6]))
+        end
+    end
+
     @testset "nested rows read without boxing their values" begin
         n = 100_000
         tbl = (
