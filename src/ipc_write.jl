@@ -453,42 +453,18 @@ function _compressbody!(c::EncodeCursor, states::Vector{EncodeState}, ntasks::In
     return nothing
 end
 
-# The shared index counter of one parallel map.
-mutable struct _TaskQueue
-    @atomic next::Int
-end
-
 """
-`f(j, w)` for `j` in `1:n` on up to `ntasks` tasks, results in index order;
-`w` numbers the task (1 to `ntasks`), for per-task state. A failure is
-rethrown after every index ran, the lowest index's first, so the error does
-not depend on scheduling.
+`f(j, w)` for `j` in `1:n` on up to `ntasks` tasks (`_foreach`), results in
+index order; `w` numbers the task, for per-task state. A failure rethrows the
+lowest failing index's error, so it does not depend on scheduling.
 """
 function _tasksmap(f::F, n::Int, ntasks::Int) where {F}
-    k = min(n, ntasks)
-    k <= 1 && return Any[f(j, 1) for j = 1:n]
     results = Vector{Any}(undef, n)
-    failures = Vector{Any}(nothing, n)
-    queue = _TaskQueue(0)
-    @sync for w = 1:k
-        errormonitor(Threads.@spawn _taskworker!(f, results, failures, queue, w))
-    end
-    for err in failures
-        err === nothing || throw(err)
+    _foreach(n, ntasks) do j, w
+        results[j] = f(j, w)
+        return nothing
     end
     return results
-end
-
-function _taskworker!(f::F, results, failures, queue::_TaskQueue, w::Int) where {F}
-    while true
-        j = @atomic queue.next += 1
-        j > length(results) && return nothing
-        try
-            results[j] = f(j, w)
-        catch err
-            failures[j] = err
-        end
-    end
 end
 
 const _PADDING = ntuple(k -> zeros(UInt8, k), 7)
