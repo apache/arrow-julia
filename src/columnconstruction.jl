@@ -5405,12 +5405,23 @@ function _decimaldata(f::AC.Field, v::AbstractVector, ::Type{D}) where {D}
     return AC.ArrayData(t, length(v), [validity, AC._databuffer(vals)]; nullcount=nc)
 end
 
+# `v`'s decimals as `H`s, whose storage is `T`.
+_widendecimals(::Type{H}, ::Type{T}, v) where {H,T} =
+    map(x -> x === missing ? missing : reinterpret(H, T(DataDecimals.unscaled(x))), v)
+
 function _retaineddecimal(f::AC.Field, v::AbstractVector)
     t = f.type::AC.DecimalType
     D = Base.nonmissingtype(eltype(v))
-    _shareddecimal(t) &&
-        D === _decimalhost(t) &&
-        return _retainedfield(f), _decimaldata(f, v, D)
+    if _shareddecimal(t)
+        H = _decimalhost(t)
+        D === H && return _retainedfield(f), _decimaldata(f, v, D)
+        # Another storage width at the field's scale (`dec"1.25"` stores an
+        # Int32): widen every coefficient in one pass.
+        if D <: DataDecimals.Decimal && isconcretetype(D) && D.parameters[2] == t.scale
+            w = _widendecimals(H, _decimalstorage(t), v)
+            return _retainedfield(f), _decimaldata(f, w, H)
+        end
+    end
     v = [x isa DataDecimals.AbstractDecimal ? _shareddecimalraw(t, x) : x for x in v]
     present = _retainedvalidity(f, v)
     if t.bits == 32 || t.bits == 64

@@ -408,7 +408,7 @@ end
         field = only(getfield(table, :schema).fields)
         @test [child.type for child in field.children] == [
             AC.TimestampType(AC.MILLISECOND, nothing),
-            AC.DecimalType(10, 2, 64),
+            AC.DecimalType(10, 2, 128),
             AC.IntervalType(AC.MONTH_DAY_NANO),
         ]
         @test ismissing(table.s[2])

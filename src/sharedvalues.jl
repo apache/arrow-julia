@@ -117,14 +117,18 @@ function _sharedintervalraw(t::AC.IntervalType, x::Durations.Duration)
     return (months=x.months, days=x.days, nanos=x.nanoseconds)
 end
 
+# Decimals write as decimal128 (precision <= 38) or decimal256, whatever their
+# storage type, as pyarrow, Polars, and DuckDB write them: Arrow 2.x and
+# readers on Arrow C++ before 18.0 do not read decimal32/64. A rewrite of an
+# Arrow column keeps its retained width.
 function _constructsharedpart(name, v, ::Type{D}) where {D<:DataDecimals.Decimal}
     isconcretetype(D) || throw(
         ArgumentError(
             "an empty decimal column needs a concrete precision, scale, and storage type",
         ),
     )
-    P, S, T = D.parameters
-    t = AC.DecimalType(P, S, 8sizeof(T))
+    P, S, _ = D.parameters
+    t = AC.DecimalType(P, S, P <= 38 ? 128 : 256)
     return _retaineddecimal(AC.Field(name, t; nullable=Missing <: eltype(v)), v)
 end
 function _constructsharedpart(name, v, ::Type{Durations.Duration})

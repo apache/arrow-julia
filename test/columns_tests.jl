@@ -91,9 +91,22 @@ end
             vals = [reinterpret(D, T(i) * T(7) - T(3)) for i = 1:n]
             nullable = Union{Missing,D}[isodd(i) ? vals[i] : missing for i = 1:n]
             for col in (vals, nullable)
-                io = IOBuffer()
-                Arrow.write(io, (d=col,))
-                bytes = take!(io)
+                # A file of each Arrow width (Arrow.write writes decimal128 or
+                # decimal256; other writers write decimal32/64 too).
+                t32 = Arrow.AC.DecimalType(P, S, 8sizeof(T))
+                present = [x !== missing for x in col]
+                data = T[x === missing ? zero(T) : reinterpret(T, x) for x in col]
+                validity =
+                    col === nullable ? Arrow.AC._bitmapbuffer(present) :
+                    Arrow.AC.BufferSlice()
+                d = Arrow.AC.ArrayData(
+                    t32,
+                    n,
+                    [validity, Arrow.AC._databuffer(data)];
+                    nullcount=count(!, present),
+                )
+                sch = Arrow.AC.Schema([Arrow.AC.Field("d", t32; nullable=col === nullable)])
+                bytes = Arrow.writefile(sch, [Arrow.AC.RecordBatch(sch, [d], n)])
                 t = Arrow.Table(bytes)
                 @test eltype(t.d) == eltype(col)
                 @test isequal(collect(t.d), col)
