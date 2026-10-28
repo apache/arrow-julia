@@ -503,6 +503,20 @@ function _framemessages(
     end
 end
 
+# The error for a message prefix without the continuation marker: at the
+# start of the input, the input is not Arrow IPC data (or is a stream from
+# before Arrow 0.15, whose messages start with their metadata length).
+function _nomarker(pos::Int64, word::UInt32)
+    pos == 0 || return "missing continuation marker at byte $pos"
+    msg =
+        "not Arrow IPC data: the input starts with neither the file magic " *
+        "ARROW1 nor an IPC stream message"
+    0 < (word % Int32) <= 1 << 24 || return msg
+    return msg *
+           " (a stream written before Arrow 0.15 starts like this; " *
+           "rewrite it with a newer Arrow writer)"
+end
+
 """
 Frame the message at 0-based `pos` of `blob`, the `nread + 1`th of its stream:
 returns it and the position after it, or `nothing` at the end-of-stream
@@ -516,11 +530,15 @@ function _framemessage(
     nread::Int,
 )
     pos == blob.len && return nothing, pos
-    blob.len - pos >= 8 || throw(ValidationError("truncated IPC prefix at byte $pos"))
+    blob.len - pos >= 8 || throw(
+        ValidationError(
+            pos == 0 ? "not Arrow IPC data: the input is $(blob.len) bytes" :
+            "truncated IPC prefix at byte $pos",
+        ),
+    )
     pos % 8 == 0 || throw(ValidationError("IPC message is not 8-byte aligned"))
     cont = AC.loadat(blob, UInt32, pos)
-    cont == CONTINUATION ||
-        throw(ValidationError("missing continuation marker at byte $pos"))
+    cont == CONTINUATION || throw(ValidationError(_nomarker(pos, cont)))
     # The stream framing's metadata length covers the padded metadata
     # only. A Footer Block.metaDataLength instead covers prefix +
     # metadata (see block!).
@@ -1978,8 +1996,8 @@ function _nextmessage!(m::_IOMessages, limits::Limits, budget::AllocationBudget)
     isempty(m.head) && eof(m.io) && return nothing   # the stream ended between messages
     prefix = _readbytes!(m, Int64(8))
     prefix === nothing && throw(ValidationError("truncated IPC prefix at byte $at"))
-    reinterpret(UInt32, prefix)[1] == CONTINUATION ||
-        throw(ValidationError("missing continuation marker at byte $at"))
+    word = reinterpret(UInt32, prefix)[1]
+    word == CONTINUATION || throw(ValidationError(_nomarker(at, word)))
     metalen = Int64(ltoh(reinterpret(Int32, prefix)[2]))
     metalen == 0 && return nothing   # end-of-stream marker
     _checkmetalen(metalen, limits)

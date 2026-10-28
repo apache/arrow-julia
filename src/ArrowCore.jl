@@ -985,6 +985,7 @@ end
 struct ValidationError <: Exception
     msg::String
 end
+Base.showerror(io::IO, e::ValidationError) = print(io, "Arrow.ValidationError: ", e.msg)
 
 function expected_validity_bytes(len::Int64)
     len >= 0 || throw(ArgumentError("negative bitmap length"))

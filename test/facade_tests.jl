@@ -455,9 +455,11 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @static if VERSION >= v"1.11"
             @test Base.ispublic(Arrow, :Limits)
             @test Base.ispublic(Arrow, :AllocationLimitError)
+            @test Base.ispublic(Arrow, :release!)
         end
         @test !Base.isexported(Arrow, :Limits)
         @test !Base.isexported(Arrow, :AllocationLimitError)
+        @test !Base.isexported(Arrow, :release!)
     end
 
     @testset "default limits scale with the input" begin
@@ -538,6 +540,85 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         t3 = Arrow.Table(fb; scan=Tables.Scan(select=(:x => :renamed,), limit=2))
         @test Tables.columnnames(t3) == [:renamed]
         @test t3.renamed == [1, 2]
+    end
+
+    @testset "read keywords build one scan" begin
+        tbl = (a=collect(1:6), b=["x", "y", "z", "w", "v", "u"], c=collect(6.0:-1:1))
+        for file in (true, false)
+            io = IOBuffer()
+            Arrow.write(io, tbl; file=file)
+            bytes = take!(io)
+            @test Tables.columnnames(Arrow.Table(bytes; select=[:c, :a])) == [:c, :a]
+            @test Tables.columnnames(Arrow.Table(bytes; drop=[:b])) == [:a, :c]
+            @test Arrow.Table(bytes; filter=Arrow.col(:a) > 4).b == ["v", "u"]
+            @test Arrow.Table(
+                bytes;
+                filter=Arrow.colcmp(<=, Arrow.col(:c), 2.0),
+                limit=1,
+            ).a == [5]
+            @test Arrow.Table(bytes; filter=Arrow.colin(Arrow.col(:b), ("y", "w"))).a ==
+                  [2, 4]
+            @test isempty(Arrow.Table(bytes; filter=Arrow.isnull(Arrow.col(:a))).a)
+            @test Arrow.Table(bytes; limit=2).a == [1, 2]
+            @test Arrow.read(bytes, Tables.columntable; select=[:b]).b == tbl.b
+            @test_throws ArgumentError Arrow.Table(bytes; select=[:a], drop=[:b])
+            @test_throws ArgumentError Arrow.Table(
+                bytes;
+                limit=1,
+                scan=Tables.Scan(select=(:a,)),
+            )
+        end
+        @test Arrow.col === Tables.col && Arrow.colcmp === Tables.colcmp
+        @test Arrow.colin === Tables.colin && Arrow.isnull === Tables.isnull
+    end
+
+    @testset "a Stream describes its source without reading a batch" begin
+        tbl = (a=collect(1:3), b=["x", "y", "z"])
+        io = IOBuffer()
+        Arrow.write(
+            io,
+            Tables.partitioner([tbl, tbl]);
+            file=true,
+            metadata=Dict("k" => "v"),
+            colmetadata=Dict(:a => Dict("ck" => "cv")),
+        )
+        s = Arrow.Stream(take!(io))
+        shown = sprint(show, MIME"text/plain"(), s)
+        @test startswith(
+            shown,
+            "Arrow.Stream with 2 record batches, 2 columns, and schema:",
+        )
+        @test occursin(":b", shown) && length(shown) < 300
+        @test Tables.columnnames(s) == [:a, :b]
+        @test Tables.schema(s).types == (Union{Missing,Int64}, Union{Missing,DataString})
+        @test DataAPI.nrow(s) == 6 && DataAPI.ncol(s) == 2
+        @test DataAPI.metadata(s, "k") == "v" && DataAPI.metadata(s) == Dict("k" => "v")
+        @test DataAPI.colmetadata(s, :a, "ck") == "cv"
+        @test DataAPI.colmetadata(s, :a) == Dict("ck" => "cv")
+        io = IOBuffer()
+        Arrow.write(io, tbl; file=false)
+        seekstart(io)
+        s = Arrow.Stream(io)
+        @test startswith(sprint(show, s), "Arrow.Stream with 2 columns and schema:")
+        @test Tables.columnnames(s) == [:a, :b]
+        @test_throws ArgumentError DataAPI.nrow(s)
+        @test first(s).b == tbl.b
+    end
+
+    @testset "input that is not Arrow IPC data says so" begin
+        for bytes in
+            (collect(UInt8, 1:16), UInt8[0x10, 0, 0, 0, 1, 2, 3, 4], UInt8[1, 2, 3])
+            err = try
+                Arrow.Table(bytes)
+            catch e
+                e
+            end
+            @test err isa Arrow.ValidationError
+            @test startswith(
+                sprint(showerror, err),
+                "Arrow.ValidationError: not Arrow IPC data",
+            )
+        end
     end
 
     @testset "ranged source fetches only what the scan needs" begin

@@ -27,13 +27,22 @@
 # =============================================================================
 
 """
-    Arrow.Table(source; scan=nothing, mmap, stringtype=DataString, limits, ntasks) -> Table
+    Arrow.Table(source; select=nothing, drop=nothing, filter=nothing, limit=nothing,
+                scan=nothing, mmap, stringtype=DataString, limits, ntasks) -> Table
 
 Read Arrow IPC data as Tables.jl columns. `source` is a file path, an `IO`,
 raw bytes (`Vector{UInt8}`), or an [`Arrow.AbstractArrowSource`](@ref) — a
 byte-range-addressable object, such as one in cloud storage, read with
 exact range requests. Both IPC formats are accepted: the file format
 (`ARROW1` magic, random access, footer statistics) and the stream format.
+
+- `select` keeps the given columns, in that order (names, indices, a regex,
+  or a vector of them); `drop` keeps all but the given columns.
+- `filter` keeps the rows where a predicate built from [`Arrow.col`](@ref)
+  is `true`, for example `filter=Arrow.col(:fare) > 10`.
+- `limit` keeps at most that many (filtered) rows.
+- `scan` takes a full `Tables.Scan` (renames, type overrides, `offset`,
+  `validate`) instead of the keywords above.
 
 Flat columns read their Arrow buffers in place: numbers, booleans, temporal
 values, decimals, and dictionary-encoded values are read-only
@@ -66,10 +75,9 @@ use `Arrow.Limits()`. An internal reader handle that was opened under a
 specific policy keeps that policy; a facade call cannot retroactively
 re-verify it under different limits.
 
-`scan` is a `Tables.Scan` pushdown request: only the selected and
-filter-referenced columns are decoded, footer statistics prune batches no
-row of which can match the filter, and the filter is evaluated batch by
-batch. `limit`/`offset` compose exactly over the qualifying rows. Without a
+A read with these keywords decodes only the selected and filter-referenced
+columns, footer statistics prune batches no row of which can match the
+filter, and the filter is evaluated batch by batch. `limit`/`offset` compose exactly over the qualifying rows. Without a
 filter, whole batches outside the window are never decoded. With a filter,
 decoding stops as soon as the window fills. Over an `AbstractArrowSource`
 the footer normally comes from one cached tail read; one exact cached
@@ -1515,14 +1523,39 @@ _sourcebudget(source, limits::Limits) =
         cap=limits.max_total_allocated_bytes,
     )
 
+# The scan the read keywords ask for, or `nothing` for a whole read.
+function _scanrequest(select, drop, filter, limit, scan)
+    sugar =
+        select !== nothing || drop !== nothing || filter !== nothing || limit !== nothing
+    if scan !== nothing
+        sugar && throw(
+            ArgumentError(
+                "pass `scan` or the select/drop/filter/limit keywords, not both; " *
+                "a Tables.Scan can express all of them",
+            ),
+        )
+        return scan
+    end
+    sugar || return nothing
+    (select === nothing || drop === nothing) ||
+        throw(ArgumentError("pass `select` or `drop`, not both"))
+    columns = drop === nothing ? something(select, Tables.All()) : Tables.Not(drop)
+    return Tables.Scan(; select=columns, filter=filter, limit=limit)
+end
+
 function Table(
     source;
+    select=nothing,
+    drop=nothing,
+    filter=nothing,
+    limit=nothing,
     scan::Union{Nothing,Tables.Scan}=nothing,
     mmap::Bool=_MMAP_DEFAULT,
     stringtype::Type=DataStrings.DataString,
     limits::Limits=_defaultreaderlimits(source),
     ntasks::Integer=Threads.nthreads(),
 )
+    scan = _scanrequest(select, drop, filter, limit, scan)
     readlimits = _readerlimits(source, limits)
     _checkstringtype(stringtype)
     ntasks = _checkntasks(ntasks)
@@ -1627,6 +1660,39 @@ function read(source; kwargs...)
         ),
     )
 end
+
+"""
+    Arrow.col(name)
+
+A column reference for a read `filter`, the same as `Tables.col`:
+`Arrow.Table(path; filter=Arrow.col(:x) > 3)`. Combine comparisons with `&`,
+`|`, and `!`; see also [`Arrow.colcmp`](@ref), [`Arrow.colin`](@ref), and
+[`Arrow.isnull`](@ref).
+"""
+const col = Tables.col
+
+"""
+    Arrow.colcmp(op, column, value)
+
+A filter comparison for values the operator forms of [`Arrow.col`](@ref) do
+not cover (dates, timestamps), the same as `Tables.colcmp`:
+`Arrow.colcmp(>=, Arrow.col(:day), Date(2025, 1, 1))`.
+"""
+const colcmp = Tables.colcmp
+
+"""
+    Arrow.colin(column, values)
+
+A filter that keeps rows whose value is in `values`, the same as `Tables.colin`.
+"""
+const colin = Tables.colin
+
+"""
+    Arrow.isnull(column)
+
+A filter that keeps rows whose value is missing, the same as `Tables.isnull`.
+"""
+const isnull = Tables.isnull
 
 # Views copy into owned memory, a column of several batches into one vector;
 # columns this read materialized are already owned by nobody else.
@@ -1979,6 +2045,11 @@ A file-format source has `length` and `stream[i]`. A stream-format source
 iterates in order; one over an `IO` can be iterated once (the bytes are
 consumed), and its `length` is unknown until it has been read.
 
+`Tables.schema(stream)` and `Tables.columnnames(stream)` give the columns of
+each batch, `DataAPI.metadata` and `DataAPI.colmetadata` the schema's
+key-value metadata, and `DataAPI.nrow(stream)` the row count of a
+file-format source (from batch metadata alone), all without reading data.
+
 Every yielded `Table` shares the source lifetime: releasing a batch releases its
 parent `Stream` (see [`Arrow.release!`](@ref)).
 """
@@ -2215,3 +2286,71 @@ function _streamisnotatable()
 end
 Tables.columns(::Stream) = _streamisnotatable()
 Tables.rows(::Stream) = _streamisnotatable()
+
+# A zero-row table of the stream's schema: its column names, element types,
+# and metadata, without reading a batch.
+function _schematable(s::Stream)
+    src = s.src
+    fields = _batchfields(src)
+    budget = _readbudget(src.limits, 0)
+    arrowtypes = getfield(s, :arrowtypes)
+    arrowtypeslock = getfield(s, :arrowtypeslock)
+    lock(arrowtypeslock)
+    try
+        arrowtypes.budget = budget
+        plan = arrowtypes.routeplan
+        plan === nothing || (plan.budget = budget)
+        views = _ViewContext(getfield(s, :views), budget)
+        cols = _buildcolumns(fields, (), 1:length(fields), arrowtypes, views, 1)
+        names = _fieldnamesymbols(fields, budget)
+        return _table(names, cols, _tableschema(src), AC.OwnerRegion[], 0, nothing, budget)
+    finally
+        unlock(arrowtypeslock)
+    end
+end
+
+Tables.schema(s::Stream) = Tables.schema(_schematable(s))
+Tables.columnnames(s::Stream) = _fieldnamesymbols(_batchfields(s.src))
+
+DataAPI.ncol(s::Stream) = length(_batchfields(s.src))
+function DataAPI.nrow(s::Stream)
+    src = s.src
+    src isa _StreamReader && throw(
+        ArgumentError(
+            "the row count of a stream-format source is known once it is read; " *
+            "iterate the Arrow.Stream and add up its batches' rows",
+        ),
+    )
+    src isa IPCStream && return sum(b -> Int(b.nrows), src.batches; init=0)
+    budget = _readbudget(src.limits, 0)
+    return sum(i -> Int(_batchrows(src, i, budget)), 1:_nbatches(src); init=0)
+end
+
+DataAPI.metadatasupport(::Type{Stream}) = (read=true, write=false)
+DataAPI.colmetadatasupport(::Type{Stream}) = (read=true, write=false)
+DataAPI.metadatakeys(s::Stream) = DataAPI.metadatakeys(_schematable(s))
+DataAPI.metadata(s::Stream, key::AbstractString, default=_NO_DEFAULT; style::Bool=false) =
+    DataAPI.metadata(_schematable(s), key, default; style=style)
+DataAPI.colmetadatakeys(s::Stream, col::Union{Symbol,Int}) =
+    DataAPI.colmetadatakeys(_schematable(s), col)
+DataAPI.colmetadatakeys(s::Stream) = DataAPI.colmetadatakeys(_schematable(s))
+DataAPI.colmetadata(
+    s::Stream,
+    col::Union{Symbol,Int},
+    key::AbstractString,
+    default=_NO_DEFAULT;
+    style::Bool=false,
+) = DataAPI.colmetadata(_schematable(s), col, key, default; style=style)
+
+function Base.show(io::IO, s::Stream)
+    src = s.src
+    m = length(_batchfields(src))
+    if src isa _StreamReader
+        print(io, "Arrow.Stream with ", m, " columns and schema:\n")
+    else
+        n = _nbatches(src)
+        print(io, "Arrow.Stream with ", n, n == 1 ? " record batch, " : " record batches, ")
+        print(io, m, " columns, and schema:\n")
+    end
+    show(IOContext(io, :print_schema_header => false), Tables.schema(s))
+end

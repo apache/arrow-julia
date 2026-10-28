@@ -268,18 +268,33 @@ time of day outside the format's [0, 24 h) range has no `Dates.Time` value
 (it would wrap modulo 24 hours), so reading one throws
 `Arrow.ValidationError` naming the column.
 
-### Scan pushdown
+### Selecting columns and rows
 
-`Arrow.Table` accepts a `Tables.Scan` — a plain-data description of which
-columns to keep, which rows qualify, and how many — and pushes it down into
-the reader:
+`Arrow.Table` (and [`Arrow.read`](@ref)) read only the columns and rows you
+ask for:
 
 ```julia
-using Tables: Scan, col, colcmp, colin, isnull
+tbl = Arrow.Table("orders.arrow"; select = [:id, :amount],
+                  filter = (Arrow.col(:amount) > 100) & !Arrow.isnull(Arrow.col(:id)),
+                  limit = 1_000)
+tbl = Arrow.Table("orders.arrow"; drop = [:comment])
+```
 
-scan = Scan(select = (:id, :amount),
-            filter = (col(:amount) > 100) & !isnull(col(:id)),
-            limit = 1_000)
+`select` keeps columns in the given order (names, indices, a regex, or a
+vector of them); `drop` keeps all but the given columns; `filter` keeps the
+rows where the predicate is `true`; `limit` keeps at most that many rows.
+[`Arrow.col`](@ref), [`Arrow.colcmp`](@ref), [`Arrow.colin`](@ref), and
+[`Arrow.isnull`](@ref) are the `Tables` functions, so a filter needs no
+other package. The keywords build one `Tables.Scan` — a plain-data
+description of which columns to keep, which rows qualify, and how many —
+which the reader pushes down. Pass a `Tables.Scan` as `scan` for what the
+keywords do not cover (renames, type overrides, `offset`):
+
+```julia
+using Tables: Scan, col
+
+scan = Scan(select = (:id => :order_id, :amount), filter = col(:amount) > 100,
+            offset = 10, limit = 1_000)
 tbl = Arrow.Table("orders.arrow"; scan = scan)
 ```
 

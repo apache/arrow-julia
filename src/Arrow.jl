@@ -21,7 +21,7 @@ Public surface: `Arrow.Table` reads the IPC stream and file formats (paths,
 `IO`, byte vectors, or an `AbstractArrowSource` — a byte-range-addressable
 object such as one in cloud storage) as Tables.jl tables, with `Tables.Scan`
 pushdown; `Arrow.Stream` iterates a source one record batch at a time;
-`Arrow.write` writes any Tables.jl source; `release!` releases mapped or
+`Arrow.write` writes any Tables.jl source; `Arrow.release!` releases mapped or
 foreign storage deterministically.
 
 Layering ([docs/dev/core-README.md](https://github.com/apache/arrow-julia/blob/main/docs/dev/core-README.md)
@@ -185,7 +185,21 @@ AC.ValidationError
             :Table,
             :Stream,
             :read,
+            :release!,
+            :col,
+            :colcmp,
+            :colin,
+            :isnull,
             :ArrowVector,
+            :Primitive,
+            :BoolVector,
+            :ListVector,
+            :ListRow,
+            :MapVector,
+            :MapRow,
+            :StructVector,
+            :DictEncoded,
+            :RunEndEncoded,
             :write,
             :Writer,
             :append,
@@ -221,7 +235,6 @@ AC.ValidationError
     )
 end
 
-export release!
 # The one name Arrow 2.x exported. Packages that define custom-type mappings
 # reach the interface as `Arrow.ArrowTypes` or through `using Arrow`.
 export ArrowTypes

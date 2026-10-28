@@ -27,6 +27,10 @@
 Arrow.Table
 Arrow.read
 Arrow.Stream
+Arrow.col
+Arrow.colcmp
+Arrow.colin
+Arrow.isnull
 Arrow.Limits
 Arrow.release!(::Arrow.Table)
 Base.copy(::Arrow.Table)

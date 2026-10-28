@@ -98,9 +98,9 @@ PrecompileTools.@setup_workload begin
             flatbytes = take!(seekstart(io))
             tbl = Table(flatbytes)
             for name in Tables.columnnames(tbl)
-                col = Tables.getcolumn(tbl, name)
-                foreach(identity, col)
-                copy(col)
+                column = Tables.getcolumn(tbl, name)
+                foreach(identity, column)
+                copy(column)
             end
             table === columns && continue
             # A timestamp filter runs on stored integers.
