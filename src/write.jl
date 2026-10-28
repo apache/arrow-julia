@@ -84,8 +84,10 @@ that are not text as `Vector{UInt8}` values, a binary column.
 Writing to an existing file writes a temporary file in the same directory
 and renames it over the old one when the output is complete, so a failed
 write leaves the old file unchanged, and an `Arrow.Table` or `Arrow.Stream`
-that memory-maps the old file keeps reading it. If the operating system
-refuses the rename, `write` throws a `Base.IOError` and the old file is kept.
+that memory-maps the old file keeps reading it. The file keeps its mode, a
+symlink is written through, and a read-only file is refused with a
+`SystemError`, as opening it for writing is. If the operating system refuses
+the rename, `write` throws a `Base.IOError` and the old file is kept.
 
 Partitions are read, encoded, and published one at a time, so a partitioned
 source such as `CSV.Chunks` writes in about one partition's memory. One
@@ -141,6 +143,9 @@ function _openpath(path::AbstractString)
         created = !ispath(path) && !islink(path)
         return _PathSink(open(path, "w"), String(path), nothing, created)
     end
+    # The replacement below never opens the old file, so check it can be
+    # written, as `open(path, "w")` would: a read-only file refuses.
+    close(open(path, "a"))
     dest = realpath(path)
     tmp, io = mktemp(dirname(dest); cleanup=false)
     try

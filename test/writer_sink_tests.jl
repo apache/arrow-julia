@@ -269,6 +269,25 @@ end
         end
     end
 
+    @testset "a read-only file refuses, as opening it for writing does" begin
+        mktempdir() do dir
+            target = joinpath(dir, "readonly.arrow")
+            Arrow.write(target, table)
+            original = read(target)
+            chmod(target, 0o444)
+            # Privileges that ignore file modes (root) open it for writing anyway.
+            ignored = caught(() -> close(open(target, "a"))) === nothing
+            if !ignored
+                err = caught(() -> Arrow.write(target, (; b=["x"])))
+                @test err isa SystemError && occursin(target, sprint(showerror, err))
+                @test caught(() -> Arrow.Writer(target)) isa SystemError
+                @test read(target) == original
+                @test readdir(dir) == ["readonly.arrow"]
+            end
+            chmod(target, 0o644)
+        end
+    end
+
     @testset "cleanup errors propagate when the body succeeds" begin
         for ownio in (true, false), written in (true, false)
             io = FailingSink()
