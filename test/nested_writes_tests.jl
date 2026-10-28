@@ -221,6 +221,20 @@ end
     @test collect(back.l) == [[1, 2], [3]]
 end
 
+@testset "a Union of tuple types writes unlabelled, as a map value too" begin
+    v = Union{Tuple{Int32,Int32},Tuple{Date,Date,Date}}[
+        (Int32(1), Int32(2)),
+        (Date(2020), Date(2020), Date(2021)),
+    ]
+    for tbl in ((c=v,), (c=[Dict("a" => x) for x in v],))
+        t = roundtrip(tbl)
+        @test field(t).metadata === nothing
+        @test field(t).type isa AC.UnionType || field(t).children[1].type isa AC.StructType
+        back = collect(t.c)
+        tbl.c isa Vector{<:Dict} ? @test(Dict.(back) == tbl.c) : @test(back == v)
+    end
+end
+
 @testset "a retained rewrite routes typed union rows to their children" begin
     # A dense union, as a fresh write makes one.
     t = roundtrip((u=Union{Int64,String}[1, "two", 3],))

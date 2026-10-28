@@ -2431,6 +2431,14 @@ end
 
 function _writerextensionlabel(T::Type)
     Base.@nospecialize T
+    # A Union has the label its members share, if they all have one: a label
+    # that only matches the Union as a whole (tuple types' JuliaLang.Tuple)
+    # belongs to none of the children it writes as.
+    U = Base.nonmissingtype(T)
+    if U isa Union
+        labels = Any[_writerextensionlabel(M) for M in Base.uniontypes(U)]
+        return allequal(labels) ? first(labels) : nothing
+    end
     name = _facadearrowname(T)
     name === nothing || return Pair{String,String}[
         _EXTENSION_NAME_KEY => name,
