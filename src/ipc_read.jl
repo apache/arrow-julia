@@ -57,7 +57,7 @@ work it governs can exceed it.
 | `max_buffer_bytes`          | none            | one buffer, compressed or not       |
 | `max_total_allocated_bytes` | physical memory | allocation per read or stream batch |
 | `max_allocation_ratio`      | 64              | allocation per input byte           |
-| `max_messages`              | 1,000,000       | messages per stream or file         |
+| `max_messages`              | 1,000,000       | messages per file or `Arrow.Table`  |
 | `max_metadata_objects`      | 1,000,000       | flatbuffer objects per message      |
 | `max_nesting_depth`         | 64              | schema and metadata nesting         |
 | `max_array_length`          | 1,000,000,000   | array length                        |
@@ -496,66 +496,95 @@ function _framemessages(
     blob = BufferSlice(region, 0, region.len)
     msgs = FramedMessage[]
     pos = Int64(0)   # 0-based byte position within the blob
-    while pos < blob.len
-        blob.len - pos >= 8 || throw(ValidationError("truncated IPC prefix at byte $pos"))
-        pos % 8 == 0 || throw(ValidationError("IPC message is not 8-byte aligned"))
-        cont = AC.loadat(blob, UInt32, pos)
-        cont == CONTINUATION ||
-            throw(ValidationError("missing continuation marker at byte $pos"))
-        # The stream framing's metadata length covers the padded metadata
-        # only. A Footer Block.metaDataLength instead covers prefix +
-        # metadata (see block!).
-        metalen = Int64(AC.loadat(blob, Int32, AC.checked_add(pos, Int64(4))))
-        # Continuation marker + zero length is the end-of-stream marker.
-        # Nothing may follow it.
-        if metalen == 0
-            AC.checked_add(pos, Int64(8)) == blob.len ||
-                throw(ValidationError("trailing bytes after IPC end-of-stream"))
-            return msgs
-        end
-        length(msgs) < limits.max_messages ||
-            throw(ValidationError("message count exceeds limit"))
-        0 < metalen <= limits.max_metadata_bytes || throw(
-            ValidationError(
-                "metadata length $metalen outside (0, $(limits.max_metadata_bytes)]",
-            ),
-        )
-        metalen % 8 == 0 ||
-            throw(ValidationError("metadata length $metalen is not 8-byte aligned"))
-        metastart = AC.checked_add(pos, Int64(8))
-        bodyguess = AC.checked_add(metastart, metalen)
-        bodyguess <= blob.len ||
-            throw(ValidationError("truncated metadata: need $metalen bytes at $pos"))
-        _chargevector!(budget, UInt8, metalen, "metadata allocation")
-        metabytes = AC.slicebytes(AC.subslice(blob, metastart, metalen))
-        version, header_type, features, _ =
-            _verify_ipc_metadata_budgeted(metabytes, limits, budget)
-        # No generated getter runs before the verifier has bounded the full
-        # table/vector/string graph it may visit.
-        msg = FB.getrootas(Meta.Message, metabytes, 0)
-        bodylen = Int64(msg.bodyLength)
-        0 <= bodylen <= limits.max_body_bytes || throw(
-            ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"),
-        )
-        bodylen % 8 == 0 ||
-            throw(ValidationError("body length $bodylen is not 8-byte aligned"))
-        bodystart = bodyguess
-        bodyend = AC.checked_add(bodystart, bodylen)
-        bodyend <= blob.len ||
-            throw(ValidationError("truncated body: need $bodylen bytes at $bodystart"))
-        push!(
-            msgs,
-            FramedMessage(
-                msg,
-                AC.subslice(blob, bodystart, bodylen),
-                version,
-                header_type,
-                features,
-            ),
-        )
-        pos = bodyend
+    while true
+        fm, pos = _framemessage(blob, pos, limits, budget, length(msgs))
+        fm === nothing && return msgs
+        push!(msgs, fm)
     end
-    return msgs
+end
+
+"""
+Frame the message at 0-based `pos` of `blob`, the `nread + 1`th of its stream:
+returns it and the position after it, or `nothing` at the end-of-stream
+marker or the end of the bytes.
+"""
+function _framemessage(
+    blob::BufferSlice,
+    pos::Int64,
+    limits::Limits,
+    budget::AllocationBudget,
+    nread::Int,
+)
+    pos == blob.len && return nothing, pos
+    blob.len - pos >= 8 || throw(ValidationError("truncated IPC prefix at byte $pos"))
+    pos % 8 == 0 || throw(ValidationError("IPC message is not 8-byte aligned"))
+    cont = AC.loadat(blob, UInt32, pos)
+    cont == CONTINUATION ||
+        throw(ValidationError("missing continuation marker at byte $pos"))
+    # The stream framing's metadata length covers the padded metadata
+    # only. A Footer Block.metaDataLength instead covers prefix +
+    # metadata (see block!).
+    metalen = Int64(AC.loadat(blob, Int32, AC.checked_add(pos, Int64(4))))
+    # Continuation marker + zero length is the end-of-stream marker.
+    # Nothing may follow it.
+    if metalen == 0
+        AC.checked_add(pos, Int64(8)) == blob.len ||
+            throw(ValidationError("trailing bytes after IPC end-of-stream"))
+        return nothing, blob.len
+    end
+    _checkmessagecount(nread, limits)
+    _checkmetalen(metalen, limits)
+    metastart = AC.checked_add(pos, Int64(8))
+    bodystart = AC.checked_add(metastart, metalen)
+    bodystart <= blob.len ||
+        throw(ValidationError("truncated metadata: need $metalen bytes at $pos"))
+    _chargevector!(budget, UInt8, metalen, "metadata allocation")
+    metabytes = AC.slicebytes(AC.subslice(blob, metastart, metalen))
+    msg, version, header_type, features, bodylen =
+        _verifiedmessage(metabytes, limits, budget)
+    bodyend = AC.checked_add(bodystart, bodylen)
+    bodyend <= blob.len ||
+        throw(ValidationError("truncated body: need $bodylen bytes at $bodystart"))
+    fm = FramedMessage(
+        msg,
+        AC.subslice(blob, bodystart, bodylen),
+        version,
+        header_type,
+        features,
+    )
+    return fm, bodyend
+end
+
+_checkmessagecount(nread::Int, limits::Limits) =
+    nread < limits.max_messages || throw(ValidationError("message count exceeds limit"))
+
+function _checkmetalen(metalen::Int64, limits::Limits)
+    0 < metalen <= limits.max_metadata_bytes || throw(
+        ValidationError(
+            "metadata length $metalen outside (0, $(limits.max_metadata_bytes)]",
+        ),
+    )
+    metalen % 8 == 0 ||
+        throw(ValidationError("metadata length $metalen is not 8-byte aligned"))
+    return nothing
+end
+
+# Verify a message's metadata, then read it and its body length.
+function _verifiedmessage(
+    metabytes::Vector{UInt8},
+    limits::Limits,
+    budget::AllocationBudget,
+)
+    version, header_type, features, _ =
+        _verify_ipc_metadata_budgeted(metabytes, limits, budget)
+    # No generated getter runs before the verifier has bounded the full
+    # table/vector/string graph it may visit.
+    msg = FB.getrootas(Meta.Message, metabytes, 0)
+    bodylen = Int64(msg.bodyLength)
+    0 <= bodylen <= limits.max_body_bytes ||
+        throw(ValidationError("body length $bodylen outside [0, $(limits.max_body_bytes)]"))
+    bodylen % 8 == 0 || throw(ValidationError("body length $bodylen is not 8-byte aligned"))
+    return msg, version, header_type, features, bodylen
 end
 
 # ---------------------------------------------------------------------------
@@ -1573,12 +1602,6 @@ mutable struct IPCStream <: AC.RecordBatchSource
     limits::Limits                     # complete policy used when this handle opened
 end
 
-mutable struct PendingRecord
-    fm::FramedMessage
-    dictionaries::Dict{Int64,ArrayData}
-    missing::Set{Int64}
-    slot::Int
-end
 AC.schema(s::IPCStream) = s.schema
 
 function AC.nextbatch!(s::IPCStream)
@@ -1633,17 +1656,17 @@ and `Arrow.Stream` own their backing storage and do not expose this borrow).
 readstream(bytes::Vector{UInt8}; limits::Limits=Limits()) =
     _readstream(bytes, limits, _readbudget(limits, length(bytes)))
 
-function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBudget)
-    region = heapregion(bytes)
-    msgs = _framemessages(region, limits, Base.ENDIAN_BOM, budget)
-    isempty(msgs) && throw(ValidationError("empty IPC stream"))
-    first(msgs).header_type == 1 || # Schema
+"""
+The schema of an IPC stream from its first message: the Core schema and
+fields, the dictionary ids, and each dictionary's value field.
+"""
+function _streamschema(fm::FramedMessage)
+    fm.header_type == 1 || # Schema
         throw(ValidationError("first IPC message must be a schema"))
-    msgs[1].msg.header isa Meta.Schema ||
+    fm.msg.header isa Meta.Schema ||
         throw(ValidationError("first IPC message must be a schema"))
-    metaschema = msgs[1].msg.header
-    msgs[1].body.len == 0 ||
-        throw(ValidationError("schema message must have an empty body"))
+    metaschema = fm.msg.header
+    fm.body.len == 0 || throw(ValidationError("schema message must have an empty body"))
     endian = something(metaschema.endianness, Meta.Endianness.Little)
     endian == Meta.Endianness.Little || throw(
         ValidationError("big-endian IPC is not supported (no endianness normalization)"),
@@ -1661,134 +1684,450 @@ function _readstream(bytes::Vector{UInt8}, limits::Limits, budget::AllocationBud
         metadata=coremetadata(metaschema.custom_metadata),
         endianness=AC.LittleEndian,
     )
-    dicts = Dict{Int64,ArrayData}()
-    # One codec context per reader, shared by every compressed batch in the
-    # stream and explicitly finalized on every exit path.
+    return sch, fields, dictids, fielddictids, dictvaluefields
+end
+
+"""
+The decoding state of an IPC stream after its schema: the dictionaries as of
+the last message applied and the stream's metadata version.
+"""
+struct _StreamState
+    schema::Schema
+    fields::Vector{Field}
+    dictids::Dict{Int64,Meta.Field}
+    fielddictids::IdDict{Field,Int64}
+    dictvaluefields::Dict{Int64,Field}
+    dicts::Dict{Int64,ArrayData}
+    validated::AC._ValidatedDictionaries
+    version::Int16
+    limits::Limits
+end
+
+function _StreamState(fm::FramedMessage, limits::Limits)
+    sch, fields, dictids, fielddictids, dictvaluefields = _streamschema(fm)
+    return _StreamState(
+        sch,
+        fields,
+        dictids,
+        fielddictids,
+        dictvaluefields,
+        Dict{Int64,ArrayData}(),
+        AC._ValidatedDictionaries(),
+        fm.version,
+        limits,
+    )
+end
+
+# A message after the schema: its version, and the legacy V4 compression
+# marker (see rejectexperimentalcompression).
+function _checkstreammessage(st::_StreamState, fm::FramedMessage)
+    fm.version == st.version ||
+        throw(ValidationError("IPC metadata version changes within the stream"))
+    rejectexperimentalcompression(fm)
+    return nothing
+end
+
+"""
+Decode dictionary batch `fm` and apply it to the stream's dictionaries (a
+first pool, a delta, or a replacement). Returns its id, the pool now in
+effect, and whether the id already had one.
+"""
+function _applydictionary!(
+    st::_StreamState,
+    fm::FramedMessage,
+    budget::AllocationBudget,
+    state::DecodeState,
+)
+    header = fm.msg.header::Meta.DictionaryBatch
+    rb = header.data
+    codec = _batchcodec(rb.compression, fm.version)
+    haskey(st.dictids, header.id) ||
+        throw(ValidationError("dictionary batch has unknown id $(header.id)"))
+    replacement = haskey(st.dicts, header.id)
+    _dictionarytransition(header.id, header.isDelta, replacement)
+    # A dictionary batch's payload is a one-column record batch of the VALUE
+    # type, so the generic decoder handles it. Pool nullability is
+    # independent of the encoded index field.
+    haskey(st.dictvaluefields, header.id) ||
+        throw(ValidationError("dictionary batch has unknown id $(header.id)"))
+    vf = st.dictvaluefields[header.id]
+    rblen = something(rb.length, Int64(0))
+    0 <= rblen <= st.limits.max_array_length ||
+        throw(ValidationError("dictionary batch length $rblen exceeds limit"))
+    cursor = DecodeCursor(
+        rb.nodes,
+        rb.buffers,
+        fm.body,
+        st.limits;
+        codec=codec,
+        state=state,
+        variadics=variadiccounts(rb),
+    )
+    decoded = decodefield(vf, cursor, st.dicts, st.fielddictids)
+    finishcursor!(cursor)
+    decoded.len == rblen || throw(
+        ValidationError("dictionary RecordBatch length does not match its field node"),
+    )
+    decoded = _updatedictionary!(
+        st.dicts,
+        st.validated,
+        header.id,
+        header.isDelta,
+        vf,
+        decoded,
+        st.limits,
+        budget,
+    )
+    return header.id, decoded, replacement
+end
+
+"""
+A record batch of a stream, planned against the dictionaries in effect at its
+position. The IPC format lets a batch whose dictionary column is all null
+arrive before that dictionary; such a batch waits (`missing` is not empty)
+until the dictionary arrives, and then decodes with it.
+"""
+mutable struct PendingRecord
+    plan::_RecordPlan{BufferSlice}
+    dictionaries::Dict{Int64,ArrayData}
+    missing::Set{Int64}
+    budget::AllocationBudget
+end
+
+function _pendingrecord(st::_StreamState, fm::FramedMessage, budget::AllocationBudget)
+    header = fm.msg.header::Meta.RecordBatch
+    missing = missingdicts(st.fields, header.nodes, st.dicts, st.fielddictids)
+    plan = _recordplan(header, fm.body, fm.version, st.fields, st.limits)
+    return PendingRecord(plan, copy(st.dicts), missing, budget)
+end
+
+# A dictionary that arrived resolves the records waiting for it.
+function _resolvepending!(queue, id::Int64, pool::ArrayData)
+    for p in queue
+        p isa PendingRecord && id in p.missing || continue
+        p.dictionaries[id] = pool
+        delete!(p.missing, id)
+    end
+    return queue
+end
+
+"""
+Decode the fields of planned records `ps` (every one resolved) on at most
+`ntasks` tasks, one (record, field) pair at a time.
+"""
+function _decoderecords(st::_StreamState, ps::Vector{PendingRecord}, ntasks::Int)
+    isempty(ps) && return AC.RecordBatch[]
+    nf = length(st.fields)
+    cols = [Vector{ArrayData}(undef, nf) for _ in ps]
+    # One codec state per task, charging the budget of the record at hand.
+    states = [DecodeState(first(ps).budget) for _ = 1:min(ntasks, length(ps) * nf)]
+    try
+        _foreach(length(ps) * nf, ntasks) do item, w
+            k, j = divrem(item - 1, nf) .+ (1, 1)
+            p = ps[k]
+            state = states[w]
+            state.budget = p.budget
+            cols[k][j] = _decodeplanned(
+                p.plan,
+                j,
+                st.fields[j],
+                p.dictionaries,
+                st.fielddictids,
+                st.limits,
+                st.validated,
+                state,
+            )
+            return nothing
+        end
+    finally
+        foreach(close, states)
+    end
+    return AC.RecordBatch[
+        AC.RecordBatch(st.schema, cols[k], p.plan.rblen, st.validated) for
+        (k, p) in enumerate(ps)
+    ]
+end
+
+function _readstream(
+    bytes::Vector{UInt8},
+    limits::Limits,
+    budget::AllocationBudget,
+    ntasks::Int=1,
+)
+    region = heapregion(bytes)
+    msgs = _framemessages(region, limits, Base.ENDIAN_BOM, budget)
+    isempty(msgs) && throw(ValidationError("empty IPC stream"))
+    st = _StreamState(msgs[1], limits)
+    # One codec context per reader for the dictionary batches, which apply in
+    # order; record batches are planned in order and decoded together after.
     state = DecodeState(budget)
-    validated_dictionaries = AC._ValidatedDictionaries()
-    batchslots = Union{Nothing,AC.RecordBatch}[]
-    pending = PendingRecord[]
-    schemaversion = msgs[1].version
+    records = PendingRecord[]
     try
         for fm in msgs[2:end]
-            fm.version == schemaversion ||
-                throw(ValidationError("IPC metadata version changes within the stream"))
-            # Legacy V4 compression marker: see rejectexperimentalcompression.
-            rejectexperimentalcompression(fm)
+            _checkstreammessage(st, fm)
             header = fm.msg.header
             if header isa Meta.DictionaryBatch
-                rb = header.data
-                codec = _batchcodec(rb.compression, fm.version)
-                haskey(dictids, header.id) ||
-                    throw(ValidationError("dictionary batch has unknown id $(header.id)"))
-                replacement = haskey(dicts, header.id)
-                _dictionarytransition(header.id, header.isDelta, replacement)
-                # A dictionary batch's payload is a one-column record batch of
-                # the VALUE type, so the generic decoder handles it. Pool
-                # nullability is independent of the encoded index field.
-                haskey(dictvaluefields, header.id) ||
-                    throw(ValidationError("dictionary batch has unknown id $(header.id)"))
-                # Value fields were built once from the Core schema; reusing
-                # them avoids repeated metadata-string/container allocation on
-                # dictionary replacement messages.
-                vf = dictvaluefields[header.id]
-                rblen = something(rb.length, Int64(0))
-                0 <= rblen <= limits.max_array_length ||
-                    throw(ValidationError("dictionary batch length $rblen exceeds limit"))
-                cursor = DecodeCursor(
-                    rb.nodes,
-                    rb.buffers,
-                    fm.body,
-                    limits;
-                    codec=codec,
-                    state=state,
-                    variadics=variadiccounts(rb),
-                )
-                decoded = decodefield(vf, cursor, dicts, fielddictids)
-                finishcursor!(cursor)
-                decoded.len == rblen || throw(
-                    ValidationError(
-                        "dictionary RecordBatch length does not match its field node",
-                    ),
-                )
-                decoded = _updatedictionary!(
-                    dicts,
-                    validated_dictionaries,
-                    header.id,
-                    header.isDelta,
-                    vf,
-                    decoded,
-                    limits,
-                    budget,
-                )
-
-                # The IPC spec permits an all-null dictionary column before its
-                # first DictionaryBatch. Resolve only the missing dictionary;
-                # preserve every dictionary snapshot already visible at the
-                # record's wire position.
-                if !replacement
-                    stillpending = PendingRecord[]
-                    for p in pending
-                        if header.id in p.missing
-                            p.dictionaries[header.id] = decoded
-                            delete!(p.missing, header.id)
-                        end
-                        if isempty(p.missing)
-                            batchslots[p.slot] = decoderecord(
-                                p.fm,
-                                fields,
-                                sch,
-                                p.dictionaries,
-                                fielddictids,
-                                limits,
-                                validated_dictionaries,
-                                state,
-                            )
-                        else
-                            push!(stillpending, p)
-                        end
-                    end
-                    pending = stillpending
-                end
+                id, pool, replaced = _applydictionary!(st, fm, budget, state)
+                # Waiting records take an id's first pool only; a later
+                # replacement is for the records after it.
+                replaced || _resolvepending!(records, id, pool)
             elseif header isa Meta.RecordBatch
-                missing = missingdicts(fields, header.nodes, dicts, fielddictids)
-                push!(batchslots, nothing)
-                slot = length(batchslots)
-                if isempty(missing)
-                    batchslots[slot] = decoderecord(
-                        fm,
-                        fields,
-                        sch,
-                        dicts,
-                        fielddictids,
-                        limits,
-                        validated_dictionaries,
-                        state,
-                    )
-                else
-                    push!(pending, PendingRecord(fm, copy(dicts), missing, slot))
-                end
+                push!(records, _pendingrecord(st, fm, budget))
             else
                 throw(ValidationError("unsupported IPC message header $(typeof(header))"))
             end
         end
-        isempty(pending) || throw(
-            ValidationError("stream ended before required dictionary batches arrived"),
-        )
-        batches = AC.RecordBatch[b::AC.RecordBatch for b in batchslots]
-        return IPCStream(
-            sch,
-            AC.FrozenVector{Field}(fields),
-            batches,
-            region,
-            1,
-            false,
-            fielddictids,
-            dicts,
-            budget,
-            limits,
-        )
     finally
         close(state)
+    end
+    all(p -> isempty(p.missing), records) ||
+        throw(ValidationError("stream ended before required dictionary batches arrived"))
+    return IPCStream(
+        st.schema,
+        AC.FrozenVector{Field}(st.fields),
+        _decoderecords(st, records, ntasks),
+        region,
+        1,
+        false,
+        st.fielddictids,
+        st.dicts,
+        budget,
+        limits,
+    )
+end
+
+# --- incremental streams ----------------------------------------------------
+
+"""
+The messages of an IPC stream, framed one at a time from a byte region (a
+byte vector or a memory map) as the reader reaches them.
+"""
+mutable struct _RegionMessages
+    const blob::BufferSlice
+    pos::Int64
+end
+_RegionMessages(region::OwnerRegion) =
+    _RegionMessages(BufferSlice(region, 0, region.len), 0)
+
+function _nextmessage!(m::_RegionMessages, limits::Limits, budget::AllocationBudget)
+    fm, m.pos = _framemessage(m.blob, m.pos, limits, budget, 0)
+    return fm
+end
+
+"""
+The messages of an IPC stream read from an `IO` one at a time: each message's
+metadata and body are read when the reader reaches them, so a pipe or socket
+streams with one message in memory. `head` holds bytes already read from the
+`IO` (while telling the formats apart).
+"""
+mutable struct _IOMessages{I<:IO}
+    const io::I
+    head::Vector{UInt8}
+    pos::Int64
+end
+
+# Read `n` bytes into `out` from index `at` on; false when the stream ends first.
+function _readinto!(m::_IOMessages, out::Vector{UInt8}, at::Int, n::Int)
+    k = min(length(m.head), n)
+    copyto!(out, at, m.head, 1, k)
+    deleteat!(m.head, 1:k)
+    if k < n
+        try
+            GC.@preserve out unsafe_read(m.io, pointer(out, at + k), UInt(n - k))
+        catch e
+            e isa EOFError || rethrow()
+            return false
+        end
+    end
+    m.pos += n
+    return true
+end
+
+function _readbytes!(m::_IOMessages, n::Int64)
+    out = Vector{UInt8}(undef, Int(n))
+    return _readinto!(m, out, 1, Int(n)) ? out : nothing
+end
+
+# A body is read in pieces of growing size, so a declared length the stream
+# does not back costs only the bytes that arrive. Those bytes are the input
+# itself, so they are not charged to the reader's allowance.
+const _IO_BODY_PIECE = 64 * 1024 * 1024
+
+function _readbody!(m::_IOMessages, bodylen::Int64)
+    body = UInt8[]
+    while length(body) < bodylen
+        have = length(body)
+        n = Int(min(bodylen - have, max(_IO_BODY_PIECE, have)))
+        resize!(body, have + n)
+        _readinto!(m, body, have + 1, n) ||
+            throw(ValidationError("truncated body: need $bodylen bytes at byte $(m.pos)"))
+    end
+    return body
+end
+
+function _nextmessage!(m::_IOMessages, limits::Limits, budget::AllocationBudget)
+    at = m.pos
+    isempty(m.head) && eof(m.io) && return nothing   # the stream ended between messages
+    prefix = _readbytes!(m, Int64(8))
+    prefix === nothing && throw(ValidationError("truncated IPC prefix at byte $at"))
+    reinterpret(UInt32, prefix)[1] == CONTINUATION ||
+        throw(ValidationError("missing continuation marker at byte $at"))
+    metalen = Int64(ltoh(reinterpret(Int32, prefix)[2]))
+    metalen == 0 && return nothing   # end-of-stream marker
+    _checkmetalen(metalen, limits)
+    _chargevector!(budget, UInt8, metalen, "metadata allocation")
+    metabytes = _readbytes!(m, metalen)
+    metabytes === nothing &&
+        throw(ValidationError("truncated metadata: need $metalen bytes at $at"))
+    msg, version, header_type, features, bodylen =
+        _verifiedmessage(metabytes, limits, budget)
+    body = _readbody!(m, bodylen)
+    return FramedMessage(
+        msg,
+        BufferSlice(heapregion(body), 0, length(body)),
+        version,
+        header_type,
+        features,
+    )
+end
+
+# The budget a stream message frames under; its batch then decodes under one
+# sized from the message's own bytes.
+_framebudget(limits::Limits) = _readbudget(limits, 0)
+
+"""
+An IPC stream read incrementally: messages are read and decoded as record
+batches are requested (`_nextrecord!`), each under its own allowance, so a
+stream of any length reads with one batch in memory. A stream over a byte
+region can start over; one over an `IO` reads once.
+"""
+mutable struct _StreamReader{M}
+    const messages::M
+    const start::Int64                 # position after the schema
+    # The lifetime authority of the stream and its batches: the byte region,
+    # or for an `IO` (each body is its own region) an empty one.
+    const region::OwnerRegion
+    st::_StreamState
+    queue::Vector{PendingRecord}       # record batches read and not yet returned
+    done::Bool
+    failed::Bool                       # a read threw; the stream stops there
+    const limits::Limits
+    const lock::ReentrantLock
+end
+
+function _StreamReader(messages, limits::Limits)
+    _validatelimits(limits)
+    fm = _nextmessage!(messages, limits, _framebudget(limits))
+    fm === nothing && throw(ValidationError("empty IPC stream"))
+    st = _StreamState(fm, limits)
+    region = messages isa _RegionMessages ? messages.blob.region : heapregion(UInt8[])
+    return _StreamReader(
+        messages,
+        messages.pos,
+        region,
+        st,
+        PendingRecord[],
+        false,
+        false,
+        limits,
+        ReentrantLock(),
+    )
+end
+
+# Start over from the first batch (a region stream only).
+function _restart!(r::_StreamReader)
+    # A reader that has not read past its schema is at the start already.
+    r.messages.pos == r.start && isempty(r.queue) && !r.done && !r.failed && return r
+    r.messages isa _RegionMessages || throw(
+        ArgumentError(
+            "an Arrow.Stream over an IO reads its batches once; " *
+            "read the IO into a byte vector to iterate it again",
+        ),
+    )
+    r.messages.pos = r.start
+    st = r.st
+    r.st = _StreamState(
+        st.schema,
+        st.fields,
+        st.dictids,
+        st.fielddictids,
+        st.dictvaluefields,
+        Dict{Int64,ArrayData}(),
+        AC._ValidatedDictionaries(),
+        st.version,
+        st.limits,
+    )
+    empty!(r.queue)
+    r.done = false
+    r.failed = false
+    return r
+end
+
+"""
+The next record batch of the stream and the allowance it decoded under, or
+`nothing` at its end. Messages are read until the next batch in stream order
+is decodable; its fields decode on at most `ntasks` tasks.
+"""
+function _nextrecord!(r::_StreamReader, ntasks::Int)
+    r.failed && throw(
+        ArgumentError(
+            "this Arrow.Stream stopped at an error; open a new one to read the source again",
+        ),
+    )
+    try
+        return _readrecord!(r, ntasks)
+    catch
+        r.failed = true
+        rethrow()
+    end
+end
+
+function _readrecord!(r::_StreamReader, ntasks::Int)
+    while true
+        if !isempty(r.queue)
+            p = first(r.queue)
+            if isempty(p.missing)
+                popfirst!(r.queue)
+                return only(_decoderecords(r.st, PendingRecord[p], ntasks)), p.budget
+            end
+        end
+        if r.done
+            isempty(r.queue) && return nothing
+            throw(
+                ValidationError("stream ended before required dictionary batches arrived"),
+            )
+        end
+        fm = _nextmessage!(r.messages, r.limits, _framebudget(r.limits))
+        if fm === nothing
+            r.done = true
+            continue
+        end
+        _checkstreammessage(r.st, fm)
+        budget = _readbudget(r.limits, fm.body.len)
+        header = fm.msg.header
+        if header isa Meta.DictionaryBatch
+            state = DecodeState(budget)
+            try
+                id, pool, replaced = _applydictionary!(r.st, fm, budget, state)
+                replaced || _resolvepending!(r.queue, id, pool)
+            finally
+                close(state)
+            end
+        elseif header isa Meta.RecordBatch
+            push!(r.queue, _pendingrecord(r.st, fm, budget))
+        else
+            throw(ValidationError("unsupported IPC message header $(typeof(header))"))
+        end
+    end
+end
+
+"The number of record batches of a region stream, from its framing alone."
+function _countrecords(r::_StreamReader{_RegionMessages})
+    m = _RegionMessages(r.messages.blob, r.start)
+    n = 0
+    while true
+        fm = _nextmessage!(m, r.limits, _framebudget(r.limits))
+        fm === nothing && return n
+        fm.msg.header isa Meta.RecordBatch && (n += 1)
     end
 end

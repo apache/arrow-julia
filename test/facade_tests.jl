@@ -290,6 +290,68 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test_throws ArgumentError Tables.rowtable(Arrow.Stream(bytes))
     end
 
+    @testset "a stream-format Stream reads one batch at a time" begin
+        tables = [(x=Int64[i, i + 1], s=["a$i", "a much longer value $i"]) for i = 1:3]
+        # Over a pipe, each batch is yielded while the writer still holds
+        # the next one: the writer waits for the reader before writing it.
+        pipe = Base.BufferStream()
+        seen = Channel{Int}(3)
+        writer = errormonitor(Threads.@spawn begin
+            Arrow.Writer(pipe; file=false) do w
+                for (k, tbl) in enumerate(tables)
+                    Arrow.write(w, tbl)
+                    k < length(tables) && take!(seen)
+                end
+            end
+            close(pipe)
+        end)
+        reader = Threads.@spawn begin
+            got = Int64[]
+            for (k, b) in enumerate(Arrow.Stream(pipe))
+                append!(got, b.x)
+                put!(seen, k)
+            end
+            got
+        end
+        done = timedwait(() -> istaskdone(reader), 120) == :ok
+        @test done && fetch(reader) == [1, 2, 2, 3, 3, 4]
+        # A failed or stuck reader must not leave the writer waiting.
+        close(seen)
+        done || close(pipe)
+        @test timedwait(() -> istaskdone(writer), 60) == :ok
+        io = IOBuffer()
+        Arrow.write(io, Tables.partitioner(tables); file=false)
+        bytes = take!(io)
+        # Over bytes the batches are framed in place: a length, and a second
+        # iteration starts over.
+        s = Arrow.Stream(bytes)
+        @test length(s) == 3
+        @test [b.x for b in s] == [b.x for b in s] == [[1, 2], [2, 3], [3, 4]]
+        @test_throws ArgumentError s[1]
+        # An IO is read once, and its batch count is not known up front.
+        once = Arrow.Stream(IOBuffer(bytes))
+        @test_throws ArgumentError length(once)
+        @test [b.s[2] for b in once] == ["a much longer value $i" for i = 1:3]
+        @test_throws ArgumentError iterate(once)
+        # A file-format Stream has random access.
+        fio = IOBuffer()
+        Arrow.write(fio, Tables.partitioner(tables); file=true)
+        f = Arrow.Stream(take!(fio))
+        @test length(f) == 3 && f[2].x == [2, 3] && f[3].s[1] == "a3"
+        @test_throws BoundsError f[4]
+        # A truncated stream yields the batches before the damage, then fails;
+        # the Stream stays stopped at the error.
+        for src in (bytes[1:(end - 24)], IOBuffer(bytes[1:(end - 24)]))
+            cut = Arrow.Stream(src)
+            b, state = iterate(cut)
+            @test b.x == [1, 2]
+            b, state = iterate(cut, state)
+            @test b.x == [2, 3]
+            @test_throws Arrow.ValidationError iterate(cut, state)
+            @test_throws ArgumentError iterate(cut, state)
+        end
+    end
+
     @testset "facade reader limits" begin
         fileio = IOBuffer()
         Arrow.write(fileio, (x=Int64[1, 2],))

@@ -1366,6 +1366,7 @@ function _openbytes(
     bytes::Vector{UInt8};
     limits::Limits=Limits(),
     budget::Union{Nothing,AllocationBudget}=nothing,
+    ntasks::Int=1,
 )
     if budget === nothing
         return _isfilebytes(bytes) ? readfile(bytes; limits=limits) :
@@ -1374,7 +1375,7 @@ function _openbytes(
     # The read's allowance scales with the input it turned out to have.
     _boundbudget!(budget, limits, length(bytes))
     return _isfilebytes(bytes) ? _readfile(heapregion(bytes), limits, budget) :
-           _readstream(bytes, limits, budget)
+           _readstream(bytes, limits, budget, ntasks)
 end
 
 function _opensource(
@@ -1382,6 +1383,7 @@ function _opensource(
     mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=Limits(),
     budget::Union{Nothing,AllocationBudget}=nothing,
+    ntasks::Int=1,
 )
     return open(path, "r") do io
         magic = Base.read(io, 6)
@@ -1405,7 +1407,7 @@ function _opensource(
                 "source file changed while reading: got $(length(bytes)) of $size bytes",
             ),
         )
-        return _openbytes(bytes; limits=limits, budget=budget)
+        return _openbytes(bytes; limits=limits, budget=budget, ntasks=ntasks)
     end
 end
 function _opensource(
@@ -1413,6 +1415,7 @@ function _opensource(
     mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=Limits(),
     budget=nothing,
+    ntasks::Int=1,
 )
     if budget === nothing
         return _openbytes(Base.read(io); limits=limits)
@@ -1441,19 +1444,21 @@ function _opensource(
     end
     _chargevector!(budget, UInt8, total, "source IO assembly")
     bytes = isempty(chunks) ? UInt8[] : reduce(vcat, chunks)
-    return _openbytes(bytes; limits=limits, budget=budget)
+    return _openbytes(bytes; limits=limits, budget=budget, ntasks=ntasks)
 end
 _opensource(
     bytes::Vector{UInt8};
     mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=Limits(),
     budget=nothing,
-) = _openbytes(bytes; limits=limits, budget=budget)
+    ntasks::Int=1,
+) = _openbytes(bytes; limits=limits, budget=budget, ntasks=ntasks)
 _opensource(
     src::Union{IPCStream,ArrowFile};
     mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=_configuredlimits(src),
     budget=nothing,
+    ntasks::Int=1,
 ) = src
 # A byte-range source is read whole: iteration is sequential over every
 # batch, so there is nothing for range planning to skip.
@@ -1462,12 +1467,14 @@ function _opensource(
     mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=Limits(),
     budget=nothing,
+    ntasks::Int=1,
 )
     return _opensource(
         SourceFile(src; limits=limits);
         mmap=mmap,
         limits=limits,
         budget=budget,
+        ntasks=ntasks,
     )
 end
 function _opensource(
@@ -1475,8 +1482,9 @@ function _opensource(
     mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=sf.limits,
     budget=nothing,
+    ntasks::Int=1,
 )
-    return _openbytes(_wholeobject(sf, budget); limits=limits, budget=budget)
+    return _openbytes(_wholeobject(sf, budget); limits=limits, budget=budget, ntasks=ntasks)
 end
 
 # Arrow 2.x also accepted a vector of sources and positional byte windows;
@@ -1522,7 +1530,12 @@ function Table(
         _requirelittleendian()
         budget = _readbudget(readlimits, sf.len)
         if scan === nothing
-            opened = _openbytes(_wholeobject(sf, budget); limits=readlimits, budget=budget)
+            opened = _openbytes(
+                _wholeobject(sf, budget);
+                limits=readlimits,
+                budget=budget,
+                ntasks=ntasks,
+            )
             return _tablefrom(opened, nothing, budget; stringtype=stringtype, ntasks=ntasks)
         end
         # Range planning pays off only for a pushable scan over a file-format
@@ -1539,17 +1552,27 @@ function Table(
             # from the Footer schema after the object is read in full. Keep
             # the same budget through whole-object assembly, parsing, and
             # lazy batch materialization.
-            opened = _openbytes(_wholeobject(sf, budget); limits=readlimits, budget=budget)
+            opened = _openbytes(
+                _wholeobject(sf, budget);
+                limits=readlimits,
+                budget=budget,
+                ntasks=ntasks,
+            )
             return _tablefrom(opened, plan, budget; stringtype=stringtype, ntasks=ntasks)
         end
         # A stream-format object has no Footer to plan from. Read it whole,
         # without resetting the budget used by the format probe, then execute
         # the scan over its decoded columns.
-        opened = _openbytes(_wholeobject(sf, budget); limits=readlimits, budget=budget)
+        opened = _openbytes(
+            _wholeobject(sf, budget);
+            limits=readlimits,
+            budget=budget,
+            ntasks=ntasks,
+        )
         return _tablefrom(opened, scan, budget; stringtype=stringtype, ntasks=ntasks)
     end
     budget = source isa IPCStream ? source.budget : _sourcebudget(source, readlimits)
-    opened = _opensource(source; mmap=mmap, limits=readlimits, budget=budget)
+    opened = _opensource(source; mmap=mmap, limits=readlimits, budget=budget, ntasks=ntasks)
     if Sys.isunix() &&
        mmap &&
        scan === nothing &&
@@ -1698,6 +1721,7 @@ end
 
 _tableschema(s::IPCStream) = s.schema
 _tableschema(f::ArrowFile) = f.schema
+_tableschema(r::_StreamReader) = r.st.schema
 
 "Merge category snapshots while preserving every entry in the first snapshot."
 function _mergecategorypools(pools; widen::Bool=false, budget=nothing)
@@ -1939,24 +1963,26 @@ which writes one record batch per partition — see the source batch structure.
 `limits` has the same policy as [`Arrow.Table`](@ref). It configures a raw
 source. An internal reader handle keeps the policy that verified it.
 
-Memory: over a memory-mapped FILE-format path (the default for a path) the
-batches are decoded lazily from the mapping, one per iteration, so a
-consumer that processes and drops batches holds one batch of columns at a
-time (plus the file's dictionaries) — the path for a file larger than RAM.
-Each batch of a file-format source decodes under its own allocation allowance
-(see [`Arrow.Limits`](@ref)), sized from that batch's bytes, so a file of any
-length streams with the defaults.
+Batches decode as they are iterated. A stream-format source is read one
+message at a time: from an `IO` (a file, a pipe, a socket) each batch's bytes
+are read when the iteration reaches them, and over a byte vector or a
+memory-mapped path the batches are framed in place. A file-format source
+decodes each batch from the file (memory-mapped for a path; an `IO` is read
+to its end first, since the format keeps its index at the end). A consumer
+that processes and drops batches holds one batch of columns at a time, plus
+the dictionaries, so a source larger than memory streams with the defaults;
+each batch decodes under its own allocation allowance (see
+[`Arrow.Limits`](@ref)), sized from its own bytes.
+
+A file-format source has `length` and `stream[i]`. A stream-format source
+iterates in order; one over an `IO` can be iterated once (the bytes are
+consumed), and its `length` is unknown until it has been read.
+
 Every yielded `Table` shares the source lifetime: releasing a batch releases its
 parent `Stream` (see [`Arrow.release!`](@ref)).
-A STREAM-format source is read to the end and every batch is decoded when
-the `Stream` is constructed. A file-format `IO` or byte-vector input is read
-to the end too (the whole source stays in memory) but its record batches
-still decode lazily, one per iteration. `Arrow.write` itself is whole-buffer
-(it materializes every partition before writing), so it does not bound
-memory either.
 """
 struct Stream
-    src::Union{IPCStream,ArrowFile}
+    src::Union{IPCStream,ArrowFile,_StreamReader}
     regions::Vector{AC.OwnerRegion}
     budget::AllocationBudget
     closed::AC.ReleaseCell
@@ -1977,7 +2003,7 @@ function Stream(
     _checkstringtype(stringtype)
     ntasks = _checkntasks(ntasks)
     budget = source isa IPCStream ? source.budget : _sourcebudget(source, readlimits)
-    src = _opensource(source; mmap=mmap, limits=readlimits, budget=budget)
+    src = _openstream(source; mmap=mmap, limits=readlimits, budget=budget)
     regions = _sourceregions(src, budget)
     # The stream and every yielded partition share one lifetime authority.
     # Releasing either closes the same source region and makes later
@@ -2003,28 +2029,138 @@ function AC.release!(s::Stream)
     return nothing
 end
 
+# A stream-format source reads incrementally: bytes and memory-mapped paths
+# frame their messages in place, an `IO` is read one message at a time. A
+# file-format source decodes its batches lazily from the whole file.
+_openstream(source; kwargs...) = _opensource(source; kwargs...)
+function _openstream(
+    bytes::Vector{UInt8};
+    mmap::Bool=_MMAP_DEFAULT,
+    limits::Limits=Limits(),
+    budget=nothing,
+)
+    _isfilebytes(bytes) && return _openbytes(bytes; limits=limits, budget=budget)
+    return _StreamReader(_RegionMessages(heapregion(bytes)), limits)
+end
+function _openstream(
+    path::AbstractString;
+    mmap::Bool=_MMAP_DEFAULT,
+    limits::Limits=Limits(),
+    budget=nothing,
+)
+    magic = open(io -> Base.read(io, 6), path, "r")
+    magic == _FILE_MAGIC &&
+        return _opensource(path; mmap=mmap, limits=limits, budget=budget)
+    mmap || return _openstream(Base.read(path); limits=limits)
+    return open(path, "r") do io
+        eof(io) && return _openstream(UInt8[]; limits=limits)
+        _StreamReader(_RegionMessages(AC._mmapregion(io, path; eager=false)), limits)
+    end
+end
+function _openstream(
+    io::IO;
+    mmap::Bool=_MMAP_DEFAULT,
+    limits::Limits=Limits(),
+    budget=nothing,
+)
+    head = Base.read(io, 8)
+    if length(head) >= 6 && view(head, 1:6) == _FILE_MAGIC
+        # The file format needs its footer: read the rest.
+        return _openbytes(vcat(head, Base.read(io)); limits=limits, budget=budget)
+    end
+    return _StreamReader(_IOMessages(io, head, Int64(0)), limits)
+end
+_openstream(
+    src::Union{AbstractArrowSource,SourceFile};
+    limits::Limits=Limits(),
+    budget=nothing,
+    kwargs...,
+) = _openstream(
+    _wholeobject(src isa SourceFile ? src : SourceFile(src; limits=limits), budget);
+    limits=limits,
+    budget=budget,
+)
+
+function _sourceregions(r::_StreamReader, budget=nothing)
+    _chargevector!(budget, AC.OwnerRegion, 1, "source owner regions")
+    return AC.OwnerRegion[r.region]
+end
+
 _nbatches(s::IPCStream) = length(s.batches)
 _nbatches(f::ArrowFile) = length(f)
+_nbatches(r::_StreamReader{_RegionMessages}) = _countrecords(r)
+_nbatches(::_StreamReader) = throw(
+    ArgumentError(
+        "the number of batches of a stream read from an IO is unknown until it is " *
+        "read; iterate the Arrow.Stream, or collect it first",
+    ),
+)
 _batch(s::IPCStream, i, budget, ntasks) = s.batches[i]
 _batch(f::ArrowFile, i, budget, ntasks) = only(_filerecordbatches(f, (i,), budget, ntasks))
 _batchfields(s::IPCStream) = s.corefields
 _batchfields(f::ArrowFile) = f.fields
+_batchfields(r::_StreamReader) = r.st.fields
 
 Base.length(s::Stream) = _nbatches(s.src)
 Base.eltype(::Type{Stream}) = Table
+Base.IteratorSize(::Type{Stream}) = Base.SizeUnknown()
+
+# Batch `i` of the stream and the allowance it decodes under, or `nothing`
+# past the end. A stream-format source returns its batches in order (`i == 1`
+# starts over).
+function _streambatch(s::Stream, i::Int, ntasks::Int)
+    src = s.src
+    if src isa _StreamReader
+        return @lock src.lock begin
+            i == 1 && _restart!(src)
+            _nextrecord!(src, ntasks)
+        end
+    end
+    i > _nbatches(src) && return nothing
+    budget = _batchbudget(src, i)
+    return _batch(src, i, budget, ntasks), budget
+end
 
 function Base.iterate(s::Stream, i::Int=1)
+    _checkstream(s)
+    got = _streambatch(s, i, getfield(s, :ntasks))
+    got === nothing && return nothing
+    b, budget = got
+    return _batchtable(s, b, budget), i + 1
+end
+
+"""
+    stream[i] -> Arrow.Table
+
+Record batch `i` of a file-format `Arrow.Stream`, decoded on demand.
+"""
+function Base.getindex(s::Stream, i::Integer)
+    _checkstream(s)
+    src = s.src
+    src isa _StreamReader && throw(
+        ArgumentError(
+            "a stream-format source has no random access to its batches; iterate it",
+        ),
+    )
+    1 <= i <= _nbatches(src) || throw(BoundsError(s, i))
+    budget = _batchbudget(src, Int(i))
+    return _batchtable(s, _batch(src, Int(i), budget, getfield(s, :ntasks)), budget)
+end
+
+function _checkstream(s::Stream)
     closed = getfield(s, :closed)
     (@atomic :acquire closed.closed) &&
         throw(InvalidStateException("the stream was released", :closed))
-    i > _nbatches(s.src) && return nothing
-    budget = _batchbudget(s.src, i)
-    ntasks = getfield(s, :ntasks)
-    b = _batch(s.src, i, budget, ntasks)
+    return nothing
+end
+
+# The table of one decoded batch of the stream.
+function _batchtable(s::Stream, b::AC.RecordBatch, budget::AllocationBudget)
     fields = _batchfields(s.src)
     names = _fieldnamesymbols(fields, budget)
     arrowtypes = getfield(s, :arrowtypes)
     shared = getfield(s, :views)
+    ntasks = getfield(s, :ntasks)
     arrowtypeslock = getfield(s, :arrowtypeslock)
     lock(arrowtypeslock)
     try
@@ -2043,8 +2179,7 @@ function Base.iterate(s::Stream, i::Int=1)
             Int(b.nrows),
             pools,
             budget,
-        ),
-        i + 1
+        )
     finally
         unlock(arrowtypeslock)
     end
