@@ -916,7 +916,7 @@ per-task scratch state. Items are claimed in increasing order. When items
 throw, items after the smallest failing one are skipped and its exception is
 rethrown once every task has stopped, so errors do not depend on `ntasks`.
 """
-function _foreach(f, n::Int, ntasks::Int)
+function _foreach(f::F, n::Int, ntasks::Int) where {F}
     nt = min(n, ntasks)
     if nt <= 1
         for i = 1:n
@@ -926,12 +926,18 @@ function _foreach(f, n::Int, ntasks::Int)
     end
     claims = _Claims(0, typemax(Int))
     errors = Vector{Any}(nothing, n)
+    # The tasks reach `f` (and whatever it captures, such as a read's decoded
+    # batches) only through `job`, which is cleared once they are done: a
+    # finished task can stay reachable after this call (an idle thread keeps
+    # the last task it ran), and must not keep that data alive.
+    job = Ref{Union{Nothing,F}}(f)
     function work(w)
+        g = job[]::F
         while true
             i = @atomic claims.next += 1
             (i > n || i > @atomic(claims.failed)) && return nothing
             try
-                f(i, w)
+                g(i, w)
             catch e
                 errors[i] = e
                 old = @atomic claims.failed
@@ -947,6 +953,7 @@ function _foreach(f, n::Int, ntasks::Int)
         work(1)
     finally
         foreach(wait, tasks)
+        job[] = nothing
     end
     failed = @atomic claims.failed
     failed == typemax(Int) || throw(errors[failed])

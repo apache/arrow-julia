@@ -794,6 +794,28 @@ end
         end
     end
 
+    @testset "parallel work keeps nothing alive once it returns" begin
+        # A finished task can stay reachable (a thread keeps the last task it
+        # ran), so the work function, and a read's data it captures, must not
+        # be reachable from it. `run!` must not inline: a caller's stack slot
+        # would keep `data` alive on its own.
+        @noinline function run!(ref)
+            data = zeros(UInt8, 10)
+            ref[] = WeakRef(data)
+            Arrow._foreach((i, _) -> (data[i]=0x01; nothing), 10, 4)
+            return nothing
+        end
+        retained = map(1:10) do _
+            ref = Ref{WeakRef}()
+            run!(ref)
+            for _ = 1:3
+                GC.gc(true)
+            end
+            ref[].value !== nothing
+        end
+        @test !any(retained)
+    end
+
     @testset "parallel work reports the first failing item" begin
         for ntasks in (1, 3, 8)
             ran = zeros(Int, 20)
