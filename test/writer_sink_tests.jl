@@ -279,7 +279,9 @@ end
             ignored = caught(() -> close(open(target, "a"))) === nothing
             if !ignored
                 err = caught(() -> Arrow.write(target, (; b=["x"])))
-                @test err isa SystemError && occursin(target, sprint(showerror, err))
+                # The message names the file (Windows prints the path escaped).
+                @test err isa SystemError &&
+                      occursin("readonly.arrow", sprint(showerror, err))
                 @test caught(() -> Arrow.Writer(target)) isa SystemError
                 @test read(target) == original
                 @test readdir(dir) == ["readonly.arrow"]
