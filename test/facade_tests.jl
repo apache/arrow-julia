@@ -3206,6 +3206,28 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         end
     end
 
+    @testset "colmetadata names columns by Symbol or string" begin
+        write1(tbl; kw...) = Arrow.Table(take!(Arrow.write(IOBuffer(), tbl; kw...)))
+        back = write1(
+            (a=[1], b=[2]);
+            colmetadata=Dict("a" => Dict("unit" => "m")),
+            metadata=Dict("version" => 2),
+        )
+        @test DataAPI.colmetadata(back, :a, "unit") == "m"
+        @test isempty(collect(DataAPI.colmetadatakeys(back, :b)))
+        # Values that are not strings are written as they print, as DataAPI
+        # metadata is.
+        @test DataAPI.metadata(back, "version") == "2"
+        back = write1((a=[1],); colmetadata=Dict(:a => Dict("scale" => 1.5)))
+        @test DataAPI.colmetadata(back, :a, "scale") == "1.5"
+        # A name that is not a column is an error, as in dictencode.
+        err = @test_throws ArgumentError write1(
+            (a=[1],);
+            colmetadata=Dict(:A => Dict("unit" => "m")),
+        )
+        @test occursin("colmetadata names column A", err.value.msg)
+    end
+
     @testset "metadata defaults to the table's DataAPI metadata" begin
         t = _MetaTable(
             (; a=[1, 2], u=[UUIDs.UUID(1), UUIDs.UUID(2)]),

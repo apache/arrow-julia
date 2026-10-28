@@ -74,7 +74,8 @@ Keywords:
 - `stringview`: write strings and bytes as Utf8View/BinaryView instead of
   Utf8/Binary.
 - `metadata`, `colmetadata`: schema and per-column key-value pairs (a `Dict`
-  or pairs; `colmetadata` maps column name `Symbol`s to them). They default to
+  or pairs; `colmetadata` maps column names, `Symbol`s or strings, to them;
+  values that are not strings are written as they print). They default to
   the table's DataAPI metadata (a `DataFrame`'s `metadata` and `colmetadata`,
   say), without keys under the reserved `ARROW:` prefix. An `Arrow.Table` or
   `Arrow.Stream` keeps its own schema and field metadata, without its batch
@@ -1365,7 +1366,7 @@ function _constructcolumns(
     pool=nothing,
 ) where {F}
     nparts = length(partcols)
-    colmetamap = colmetadata === nothing ? nothing : Dict(colmetadata)
+    colmetamap = _colmetadatamap(colmetadata, names)
     built = _tasksmap(length(names), ntasks) do j, _
         parts = AbstractVector[partcols[k][j] for k = 1:nparts]
         poolhints = Any[pools === nothing ? nothing : pools[j] for pools in partpools]
@@ -1806,7 +1807,28 @@ function _metapairs(m)
     out = Pair{String,String}[]
     for kv in entries
         kv isa Pair || throw(ArgumentError("metadata sequences must contain Pair values"))
-        push!(out, String(first(kv)) => String(last(kv)))
+        # Keys and values that are not strings are written as they print, as
+        # DataAPI metadata is.
+        push!(out, _metastring(first(kv)) => _metastring(last(kv)))
+    end
+    return out
+end
+_metastring(x::AbstractString) = String(x)
+_metastring(x) = string(x)
+
+# `colmetadata` keyed by column `Symbol`, given by `Symbol` or string; a name
+# that is not a column is an error, as in `dictencode`.
+function _colmetadatamap(colmetadata, names)
+    colmetadata === nothing && return nothing
+    out = Dict{Symbol,Any}()
+    for kv in (colmetadata isa NamedTuple ? Base.pairs(colmetadata) : colmetadata)
+        kv isa Pair ||
+            throw(ArgumentError("colmetadata must map column names to key-value pairs"))
+        name = Symbol(first(kv))
+        name in names || throw(
+            ArgumentError("colmetadata names column $name, which the table does not have"),
+        )
+        out[name] = last(kv)
     end
     return out
 end
