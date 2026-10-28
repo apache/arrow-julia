@@ -710,10 +710,10 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test fetched[] < length(fb) ÷ 2
 
         # Request rounds through the public path over an object larger than
-        # the tail window: a pushable scan is the tail, the surviving batch's
-        # metadata, then the selected buffers (three rounds; here one request
-        # each with coalescing), the tail read exactly once; ranges inside the
-        # cached tail window are served from it without a request.
+        # the tail window: a pushable scan reads the tail once, then the
+        # surviving batches' metadata with their bodies (small bodies come
+        # whole), so the selected buffers need no third request; ranges
+        # inside the cached tail window are served from it without a request.
         wide = [string("v", i, "-", repeat("x", 60)) for i = 1:2000]
         wio = IOBuffer()
         Arrow.write(
@@ -730,7 +730,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         @test t2.a == collect(1:9)
         tailreq = (Int64(length(wb) - 65536), Int64(65536))
         @test count(==(tailreq), log.requests) == 1
-        @test length(log.requests) == 3
+        @test length(log.requests) == 2
         # An object no larger than the tail window is entirely in hand after
         # the tail read: every planned range is served from it.
         small = _LoggingSource(fb, NTuple{2,Int64}[])

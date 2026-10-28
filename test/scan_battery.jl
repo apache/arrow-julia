@@ -1182,7 +1182,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     zfull = _fulltable(readfile(copy(zbytes)))
     logz, srcz = countingsource(zbytes)
     gotz = Tables.scan(
-        SourceFile(srcz; tailbytes=256, coalesce_gap=64),
+        SourceFile(srcz; tailbytes=256, coalesce_gap=0),
         Tables.Scan(select=(:x,)),
     )
     @assert isequal(collect(Any, gotz.x), collect(Any, zfull.x))

@@ -1565,10 +1565,12 @@ The scan-driven, fetch-minimal file handle over a byte-range source:
 `Tables.scan(sf, scan)` (and `Arrow.Table(src; scan=…)`, which builds one)
 runs the fetch protocol. The footer normally comes from one cached tail read;
 one exact cached follow-up is used when it escapes that window. `tailbytes`
-below 32 is raised to 32. Batch windowing uses block metadata. Dictionary
-bodies are requested only for decode-set ids, and per-buffer body ranges
-cover exactly the decode set before coalescing under `coalesce_gap`. The
-source's length is read once, at construction.
+below 32 is raised to 32. Batch windowing uses block metadata. Each block's
+metadata request also reads its body when the body is at most four
+`coalesce_gap`s, and otherwise the body's first `coalesce_gap` bytes (a scan
+with a `limit` or `offset` reads metadata alone). Body ranges of the decode
+set not read that way are coalesced under `coalesce_gap`, at most 8 MiB per
+request. The source's length is read once, at construction.
 
 Trust note: the ranged reader treats the FOOTER as the sole schema
 authority — it does not fetch the leading magic, parse and cross-check the
@@ -1899,9 +1901,16 @@ end
 
 """
 Merge sorted ranges whose gap is at most `gap`: a small over-read is usually
-cheaper than another request round-trip. Returns file-coordinate spans.
+cheaper than another request round-trip. Ranges that do not overlap are not
+merged past `maxspan` bytes, so a long run of them is fetched in several
+requests at once. Returns file-coordinate spans.
 """
-function _coalesce(ranges::Vector{NTuple{2,Int64}}, gap::Int64, budget=nothing)
+function _coalesce(
+    ranges::Vector{NTuple{2,Int64}},
+    gap::Int64,
+    budget=nothing,
+    maxspan::Int64=typemax(Int64),
+)
     gap >= 0 || throw(ArgumentError("negative coalesce gap"))
     all(r -> r[1] >= 0 && r[2] >= 0, ranges) ||
         throw(ValidationError("negative range offset or length"))
@@ -1929,7 +1938,7 @@ function _coalesce(ranges::Vector{NTuple{2,Int64}}, gap::Int64, budget=nothing)
         loff, llen = sorted[outidx]
         loend = AC.checked_add(loff, llen)
         thisend = AC.checked_add(off, len)
-        if off <= loend || off - loend <= gap
+        if off < loend || (off - loend <= gap && max(loend, thisend) - loff <= maxspan)
             sorted[outidx] = (loff, max(loend, thisend) - loff)
         else
             outidx += 1
@@ -1942,14 +1951,20 @@ end
 
 """
 Fetched file-coordinate spans with their bytes, resolvable by containment.
-`starts` is ascending and the spans are disjoint (`_coalesce` guarantees
-both), which is what lets `_spanslice` resolve a range by binary search.
+`starts` is ascending. The spans of one fetch round are disjoint
+(`_coalesce`); a scan's body round can overlap its metadata round
+(`_unionspans`), so `_spanslice` also checks earlier spans.
 """
 struct FetchedSpans
     starts::Vector{Int64}
     lens::Vector{Int64}
     slices::Vector{BufferSlice}
 end
+
+# How much of a body of `bodylen` bytes a block's metadata request also reads:
+# all of it up to four coalescing gaps, otherwise one gap's worth.
+_speculativebody(bodylen::Int64, gap::Int64) =
+    bodylen <= AC.checked_mul(gap, Int64(4)) ? bodylen : min(bodylen, gap)
 
 function _fetchspans(
     sf::SourceFile,
@@ -1958,7 +1973,7 @@ function _fetchspans(
     budget::Union{Nothing,AllocationBudget}=nothing,
     what::AbstractString="range fetch",
 )
-    spans = _coalesce(ranges, gap, budget)
+    spans = _coalesce(ranges, gap, budget, _READ_RANGE)
     all(s -> s[1] >= 0 && s[2] >= 0 && s[1] <= sf.len - s[2], spans) ||
         throw(ValidationError("planned range escapes the object"))
     budget === nothing || foreach(s -> _chargevector!(budget, UInt8, s[2], what), spans)
@@ -2049,13 +2064,35 @@ end
 
 function _spanslice(fs::FetchedSpans, off::Int64, len::Int64)
     len == 0 && return BufferSlice()
-    i = searchsortedlast(fs.starts, off)
-    (
-        i >= 1 &&
-        off >= fs.starts[i] &&
-        AC.checked_add(off, len) <= AC.checked_add(fs.starts[i], fs.lens[i])
-    ) || throw(ValidationError("required bytes [$off, $len] were not fetched"))
+    i = _spanholding(fs, off, len)
+    i == 0 && throw(ValidationError("required bytes [$off, $len] were not fetched"))
     return AC.subslice(fs.slices[i], off - fs.starts[i], len)
+end
+
+# The index of a span that holds `[off, off + len)`, or 0.
+function _spanholding(fs::FetchedSpans, off::Int64, len::Int64)
+    stop = AC.checked_add(off, len)
+    i = searchsortedlast(fs.starts, off)
+    while i >= 1
+        stop <= AC.checked_add(fs.starts[i], fs.lens[i]) && return i
+        i -= 1
+    end
+    return 0
+end
+
+# Spans of two fetch rounds as one lookup, ordered by start.
+function _unionspans(a::FetchedSpans, b::FetchedSpans, budget)
+    isempty(b.starts) && return a
+    n = length(a.starts) + length(b.starts)
+    _chargevector!(budget, Int64, 2n, "fetched span index")
+    _chargevector!(budget, BufferSlice, n, "fetched span slices")
+    starts = vcat(a.starts, b.starts)
+    order = sortperm(starts)
+    return FetchedSpans(
+        starts[order],
+        vcat(a.lens, b.lens)[order],
+        vcat(a.slices, b.slices)[order],
+    )
 end
 
 """
@@ -2359,7 +2396,16 @@ function _runboundscan(
         )
     end
     _chargevector!(budget, NTuple{2,Int64}, nmeta, "metadata range plan")
-    metaranges = NTuple{2,Int64}[(bl[1], bl[2]) for bl in metablocks]
+    # Each block's metadata comes with the start of its body, or all of a small
+    # body: the selected buffers often lie there, and an over-read of a few
+    # hundred KiB costs less than a second request round. The body round then
+    # fetches only what this one did not. A scan with a row window needs few
+    # of the bodies, so it reads metadata alone.
+    bodygap = b.limit === nothing && b.offset == 0 ? sf.coalesce_gap : Int64(0)
+    metaranges = NTuple{2,Int64}[
+        (bl[1], AC.checked_add(bl[2], _speculativebody(bl[3], bodygap))) for
+        bl in metablocks
+    ]
     metaspans = _fetchspans(
         sf,
         metaranges,
@@ -2541,8 +2587,11 @@ function _runboundscan(
     end
     rangeidx == length(bodyranges) ||
         throw(AssertionError("body range preflight count changed during planning"))
-    bodyspans =
-        _fetchspans(sf, bodyranges, sf.coalesce_gap; budget=budget, what="body range fetch")
+    _chargevector!(budget, NTuple{2,Int64}, length(bodyranges), "unfetched body ranges")
+    unfetched = filter(r -> _spanholding(metaspans, r[1], r[2]) == 0, bodyranges)
+    fetched =
+        _fetchspans(sf, unfetched, sf.coalesce_gap; budget=budget, what="body range fetch")
+    bodyspans = _unionspans(metaspans, fetched, budget)
 
     state = DecodeState(budget)
     try
