@@ -1328,7 +1328,7 @@ function _run_statistics_pruning()
     )
     source = FuzzBytesSource(copy(bytes))
     actual = Arrow.Table(
-        Arrow.SourceFile(source; limits=STRICT_LIMITS, tailbytes=32, coalesce_gap=0);
+        Arrow.SourceFile(source; limits=STRICT_LIMITS, tailbytes=32, gapbytes=0);
         scan,
     )
     _check_same_table(actual, reference; label="statistics-pruned ranged scan")
@@ -1417,7 +1417,7 @@ function _run_differential_case(master::UInt64, index::Int)
                         source;
                         limits=STRICT_LIMITS,
                         tailbytes=32,
-                        coalesce_gap=0,
+                        gapbytes=0,
                     );
                     scan=scan,
                 )
@@ -1762,7 +1762,7 @@ function _exercise_mutation(bytes::Vector{UInt8}, lane::Symbol)
     elseif lane === :file_ranged
         fuzzsource = FuzzBytesSource(copy(bytes))
         source =
-            Arrow.SourceFile(fuzzsource; limits=STRICT_LIMITS, tailbytes=32, coalesce_gap=0)
+            Arrow.SourceFile(fuzzsource; limits=STRICT_LIMITS, tailbytes=32, gapbytes=0)
         try
             table = Arrow.Table(source; scan=Tables.Scan())
         finally
@@ -1785,7 +1785,7 @@ function _exercise_mutation(bytes::Vector{UInt8}, lane::Symbol)
         reference = Tables.scan(Arrow.Table(file), scan)
         fuzzsource = FuzzBytesSource(copy(bytes))
         source =
-            Arrow.SourceFile(fuzzsource; limits=STRICT_LIMITS, tailbytes=32, coalesce_gap=0)
+            Arrow.SourceFile(fuzzsource; limits=STRICT_LIMITS, tailbytes=32, gapbytes=0)
         table = Tables.scan(source, scan)
         _check_same_table(table, reference; label="statistics-filtered mutation")
         if !valuefiltered

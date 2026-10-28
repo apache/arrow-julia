@@ -584,7 +584,7 @@ end
             _BytesSource(copy(filebytes));
             limits=limits(),
             tailbytes=32,
-            coalesce_gap=0,
+            gapbytes=0,
         )
         for t in (
             Arrow.Table(openstream()),
@@ -611,7 +611,7 @@ end
             _BytesSource(largebytes);
             limits=limits(),
             tailbytes=32,
-            coalesce_gap=0,
+            gapbytes=0,
         )
         @test_throws Arrow.AllocationLimitError Arrow.Table(wholesource)
     end

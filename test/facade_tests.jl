@@ -716,7 +716,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         fb = take!(io)
         fetched = Ref(Int64(0))
         src = _MeteredSource(fb, fetched)
-        rf = Arrow.SourceFile(src; tailbytes=1024, coalesce_gap=0)
+        rf = Arrow.SourceFile(src; tailbytes=1024, gapbytes=0)
         t = Arrow.Table(rf; scan=Tables.Scan(select=(:b,), limit=3, offset=1500))
         @test t.b == ["v1501", "v1502", "v1503"]
         # The first batch is skipped entirely and column :a is never fetched.
@@ -761,11 +761,8 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         # row count and transfers much less than the whole object. The scan
         # battery checks the exact no-body request plan.
         emptyfetched = Ref(Int64(0))
-        emptyfile = Arrow.SourceFile(
-            _MeteredSource(wb, emptyfetched);
-            tailbytes=1024,
-            coalesce_gap=0,
-        )
+        emptyfile =
+            Arrow.SourceFile(_MeteredSource(wb, emptyfetched); tailbytes=1024, gapbytes=0)
         tz = Arrow.Table(emptyfile; scan=Tables.Scan(select=()))
         @test isempty(Tables.columnnames(tz))
         @test Tables.rowcount(tz) == 2000
@@ -774,11 +771,8 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         # A filtered empty projection remains range-efficient. The scan
         # battery checks that only the filter buffers are requested.
         filterfetched = Ref(Int64(0))
-        filterfile = Arrow.SourceFile(
-            _MeteredSource(wb, filterfetched);
-            tailbytes=1024,
-            coalesce_gap=0,
-        )
+        filterfile =
+            Arrow.SourceFile(_MeteredSource(wb, filterfetched); tailbytes=1024, gapbytes=0)
         tf =
             Arrow.Table(filterfile; scan=Tables.Scan(select=(), filter=Tables.col(:a) < 10))
         @test isempty(Tables.columnnames(tf))
@@ -788,7 +782,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         # Concurrent reads: bounded by the source's limit, results placed by
         # request even though later requests complete first.
         cs = _ConcurrentSource(fb, 3)
-        cf = Arrow.SourceFile(cs; tailbytes=1024, coalesce_gap=0)
+        cf = Arrow.SourceFile(cs; tailbytes=1024, gapbytes=0)
         tc = Arrow.Table(cf; scan=Tables.Scan(select=(:a, :b)))
         @test tc.a == 1:2000 && tc.b == [string("v", i) for i = 1:2000]
         @test 1 < (@atomic cs.peak) <= 3
@@ -801,7 +795,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             cappedsource;
             limits=Arrow.Limits(max_concurrent_reads=2),
             tailbytes=1024,
-            coalesce_gap=0,
+            gapbytes=0,
         )
         cappedtable = Arrow.Table(capped; scan=Tables.Scan(select=(:a, :b)))
         @test cappedtable.a == 1:2000
@@ -811,7 +805,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         # One SourceFile owns one handle-wide semaphore across overlapping
         # scans, not one semaphore per scan operation.
         serialsource = _ConcurrentSource(fb, 1)
-        serial = Arrow.SourceFile(serialsource; tailbytes=1024, coalesce_gap=0)
+        serial = Arrow.SourceFile(serialsource; tailbytes=1024, gapbytes=0)
         results = Vector{Any}(undef, 2)
         @sync for i = 1:2
             Threads.@spawn results[i] =
@@ -1071,7 +1065,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
             handle = Arrow.SourceFile(
                 source;
                 limits=Arrow.Limits(max_concurrent_reads=2),
-                coalesce_gap=0,
+                gapbytes=0,
             )
             return Arrow._fetchspans(handle, ranges, 0; budget=Arrow.AllocationBudget(cap)),
             source
@@ -1086,7 +1080,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         handle = Arrow.SourceFile(
             source;
             limits=Arrow.Limits(max_concurrent_reads=2),
-            coalesce_gap=0,
+            gapbytes=0,
         )
         err = try
             Arrow._fetchspans(
@@ -1116,7 +1110,7 @@ _writeallocs(path, tbl) = _requestedbytes(() -> Arrow.write(path, tbl))
         bytes = take!(io)
         scan = Tables.Scan(select=(:x,), filter=Tables.col(:x) > 2, offset=1, limit=2)
         function ranged(cap)
-            handle = Arrow.SourceFile(_BytesSource(bytes); tailbytes=64, coalesce_gap=0)
+            handle = Arrow.SourceFile(_BytesSource(bytes); tailbytes=64, gapbytes=0)
             budget = Arrow.AllocationBudget(cap)
             footer = Arrow._rangedfooter(handle, budget)
             bound = Arrow._compilehandlescan(scan, footer.fields, budget)

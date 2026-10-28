@@ -206,7 +206,7 @@ sequential — cloud-native access is a file-format feature, stated plainly.
    window when there is no filter; the bound column set then maps to a buffer
    index set (subtree-
    inclusive; dictionary Blocks for selected dictionary columns) → byte
-   ranges → **coalesce** ranges with gaps below `coalesce_gap` (default
+   ranges → **coalesce** ranges with gaps below `gapbytes` (default
    ~256 KiB — a gap fetch is usually cheaper than a request round-trip;
    both knobs are options, not constants).
 5. **Body fetches** — the selected dictionary bodies and the selected record
@@ -246,7 +246,7 @@ planner; transports live in extensions:
         # reads in flight are bounded whatever the span count.
 
 - The entry point is `Arrow.Table(src; scan=…)`, which builds the internal
-  `SourceFile(src; limits, tailbytes, coalesce_gap)` handle and runs
+  `SourceFile(src; limits, tailbytes, gapbytes)` handle and runs
   `Tables.scan(sf, scan)`; the source's length is read once, at handle
   construction, and the tail once per handle. `Arrow.Table(src)` without a
   scan, with a scan that cannot be pushed down, over a zero-field file, or

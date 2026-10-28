@@ -302,7 +302,7 @@ follow-up when the Footer escapes that window) as its sole schema authority,
 validates the full Block index and the complete metadata plan for every
 statistics-surviving record before
 requesting a body range, and requests per-buffer body ranges for exactly
-the decode set, coalesced under `coalesce_gap`. It does not fetch the
+the decode set, coalesced under `gapbytes`. It does not fetch the
 leading magic, parse or cross-check the leading schema message, or inspect
 the optional EOS marker; tail reads and coalescing may physically
 over-read any unrequested bytes. Embedded batch statistics use the official

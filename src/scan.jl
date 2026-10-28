@@ -1558,36 +1558,36 @@ _applyscan(
 # ===========================================================================
 
 """
-    SourceFile(src::AbstractArrowSource;
-               limits=Limits(), tailbytes=65536, coalesce_gap=262144)
+    SourceFile(src::AbstractArrowSource; limits=Limits(), tailbytes=65536, gapbytes=262144)
 
-The scan-driven, fetch-minimal file handle over a byte-range source:
-`Tables.scan(sf, scan)` (and `Arrow.Table(src; scan=…)`, which builds one)
-runs the fetch protocol. The footer normally comes from one cached tail read;
-one exact cached follow-up is used when it escapes that window. `tailbytes`
-below 32 is raised to 32. Batch windowing uses block metadata. Each block's
-metadata request also reads its body when the body is at most four
-`coalesce_gap`s, and otherwise the body's first `coalesce_gap` bytes (a scan
-with a `limit` or `offset` reads metadata alone). Body ranges of the decode
-set not read that way are coalesced under `coalesce_gap`, at most 8 MiB per
-request. The source's length is read once, at construction.
+A handle that reads an Arrow IPC file from `src` by byte range, so a scan or
+an `Arrow.Stream` fetches only the parts it needs. Internal, not part of the
+public API: pass the source itself to `Arrow.Table` or `Arrow.Stream`.
 
-Trust note: the ranged reader treats the FOOTER as the sole schema
-authority — it does not fetch the leading magic, parse and cross-check the
-leading schema message, or inspect the optional EOS marker. The tail and
-coalesced requests may physically over-read unrequested bytes. The full
-Footer Block index and global features/message limit are checked up front.
-Per-record limits stay lazy; every surviving candidate's metadata-only plan
-is validated before any planned body range is requested.
-`limits.max_concurrent_reads` caps the source preference. One semaphore is
-shared by every operation on this handle.
+- `limits`: the [`Arrow.Limits`](@ref) every read through the handle checks.
+- `tailbytes`: the size of the first read, from the end of the object, which
+  normally holds the footer (at least 32).
+- `gapbytes`: how many unrequested bytes a read may include to save a request.
+  Ranges at most this far apart are read together, and a scan reads a
+  batch's body with its metadata when the body is at most four `gapbytes`
+  (otherwise its first `gapbytes`). `gapbytes=0` reads only the bytes asked
+  for, in more requests.
 """
+# The footer is the only schema authority: a ranged read does not fetch the
+# leading magic, cross-check the leading schema message, or look for the EOS
+# marker, and the tail and coalesced reads may include bytes nobody asked for.
+# The footer's Block index and the global feature and message limits are
+# checked up front; per-record limits stay lazy, and every surviving
+# candidate's metadata plan is validated before any planned body range is
+# requested. Coalesced spans stop at 8 MiB. `limits.max_concurrent_reads`
+# caps the source's preferred concurrency, and one semaphore is shared by
+# every read on the handle. The source's length is read once, at construction.
 struct SourceFile{S<:AbstractArrowSource}
     src::S
     len::Int64
     limits::Limits
     tailbytes::Int64
-    coalesce_gap::Int64
+    gapbytes::Int64
     # The last `tailbytes` of the object, read once and reused by every
     # footer parse and format probe on this handle: `(bytes, tailstart)`.
     tail::Base.RefValue{Union{Nothing,Tuple{Vector{UInt8},Int64}}}
@@ -1602,11 +1602,11 @@ function SourceFile(
     src::AbstractArrowSource;
     limits::Limits=Limits(),
     tailbytes::Integer=65536,
-    coalesce_gap::Integer=262144,
+    gapbytes::Integer=262144,
 )
     _validatelimits(limits)
-    gap = Int64(coalesce_gap)
-    gap >= 0 || throw(ArgumentError("negative coalesce gap"))
+    gap = Int64(gapbytes)
+    gap >= 0 || throw(ArgumentError("gapbytes must not be negative, got $gapbytes"))
     reported = sourcelength(src)
     (reported isa Integer && reported >= 0 && reported <= typemax(Int64)) ||
         throw(ValidationError("source reports an invalid length $(repr(reported))"))
@@ -1810,7 +1810,7 @@ function _readblock(br::_BlockReader, blocks, i::Int, dataend::Int64)
             br.next = frameend
             return br.window[(offset - br.start + 1):(frameend - br.start)]
         end
-        sequential = i == 1 || 0 <= offset - br.next <= br.sf.coalesce_gap
+        sequential = i == 1 || 0 <= offset - br.next <= br.sf.gapbytes
         p = br.pending
         if p !== nothing && p[1] == offset
             ahead = p
@@ -2070,7 +2070,7 @@ struct FetchedSpans
 end
 
 # How much of a body of `bodylen` bytes a block's metadata request also reads:
-# all of it up to four coalescing gaps, otherwise one gap's worth.
+# all of it up to four `gapbytes`, otherwise one `gapbytes`' worth.
 _speculativebody(bodylen::Int64, gap::Int64) =
     bodylen <= AC.checked_mul(gap, Int64(4)) ? bodylen : min(bodylen, gap)
 
@@ -2509,18 +2509,13 @@ function _runboundscan(
     # hundred KiB costs less than a second request round. The body round then
     # fetches only what this one did not. A scan with a row window needs few
     # of the bodies, so it reads metadata alone.
-    bodygap = b.limit === nothing && b.offset == 0 ? sf.coalesce_gap : Int64(0)
+    bodygap = b.limit === nothing && b.offset == 0 ? sf.gapbytes : Int64(0)
     metaranges = NTuple{2,Int64}[
         (bl[1], AC.checked_add(bl[2], _speculativebody(bl[3], bodygap))) for
         bl in metablocks
     ]
-    metaspans = _fetchspans(
-        sf,
-        metaranges,
-        sf.coalesce_gap;
-        budget=budget,
-        what="metadata range fetch",
-    )
+    metaspans =
+        _fetchspans(sf, metaranges, sf.gapbytes; budget=budget, what="metadata range fetch")
     _chargevector!(
         budget,
         Tuple{Meta.Message,Int16},
@@ -2698,7 +2693,7 @@ function _runboundscan(
     _chargevector!(budget, NTuple{2,Int64}, length(bodyranges), "unfetched body ranges")
     unfetched = filter(r -> _spanholding(metaspans, r[1], r[2]) == 0, bodyranges)
     fetched =
-        _fetchspans(sf, unfetched, sf.coalesce_gap; budget=budget, what="body range fetch")
+        _fetchspans(sf, unfetched, sf.gapbytes; budget=budget, what="body range fetch")
     bodyspans = _unionspans(metaspans, fetched, budget)
 
     state = DecodeState(budget)
