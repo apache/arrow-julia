@@ -1344,6 +1344,7 @@ const _OpenedReader = Union{SourceFile,ArrowFile,IPCStream}
 _configuredlimits(source::SourceFile) = source.limits
 _configuredlimits(source::ArrowFile) = source.limits
 _configuredlimits(source::IPCStream) = source.limits
+_configuredlimits(source::_StreamReader) = source.limits
 _defaultreaderlimits(source) =
     source isa _OpenedReader ? _configuredlimits(source) : Limits()
 
@@ -2417,7 +2418,7 @@ Tables.rows(::Stream) = _streamisnotatable()
 function _schematable(s::Stream)
     src = s.src
     fields = _batchfields(src)
-    budget = _readbudget(src.limits, 0)
+    budget = _readbudget(_configuredlimits(src), 0)
     arrowtypes = getfield(s, :arrowtypes)
     arrowtypeslock = getfield(s, :arrowtypeslock)
     lock(arrowtypeslock)
@@ -2473,7 +2474,7 @@ function DataAPI.nrow(s::Stream)
         ),
     )
     src isa IPCStream && return sum(b -> Int(b.nrows), src.batches; init=0)
-    budget = _readbudget(src.limits, 0)
+    budget = _readbudget(_configuredlimits(src), 0)
     return sum(i -> Int(_batchrows(src, i, budget)), 1:_nbatches(src); init=0)
 end
 
