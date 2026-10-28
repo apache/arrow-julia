@@ -37,7 +37,9 @@ exact range requests. Both IPC formats are accepted: the file format
 (`ARROW1` magic, random access, footer statistics) and the stream format.
 
 - `select` keeps the given columns, in that order (names, indices, a regex,
-  or a vector of them); `drop` keeps all but the given columns.
+  or a vector of them, or a function `(i, name) -> Bool` as in CSV.jl); `drop`
+  keeps all but the given columns. Repeated column names in a file read as
+  `a`, `a_1`, as CSV.jl names them.
 - `filter` keeps the rows where a predicate built from [`Arrow.col`](@ref)
   is `true`, for example `filter=Arrow.col(:fare) > 10`.
 - `limit` keeps at most that many (filtered) rows.
