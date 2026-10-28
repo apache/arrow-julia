@@ -1311,31 +1311,43 @@ end
 _viewbatch(T::Type, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext) =
     f.type isa _NestedLayout ? _nestedbatch(T, f, d, ctx) : _batchview(T, f, d, ctx)
 
-"One batch of a fixed-width, boolean, dictionary, or run-end view column."
-function _batchview(::Type{T}, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext) where {T}
+"""
+One batch of a fixed-width, boolean, dictionary, or run-end view column.
+`T` is only passed on, so this body compiles once, not once per element type
+(every time zone and decimal scale is a type of its own).
+"""
+function _batchview(T::Type, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext)
     t = f.type
     budget = ctx.budget
     _chargeobject!(budget, _VIEW_OBJECT_BYTES, "column view")
     t isa AC.BoolType && return _boolvector(T, d)
-    if t isa AC.DictionaryType
-        vf = AC.dictvaluefield(f, t)
-        dict = d.dictionary::AC.ArrayData
-        pool = _dictpool(ctx, vf, dict)
-        R = AC.juliatype(t.indextype)
-        indices = _primitive(Missing <: T ? Union{Missing,R} : R, R, Nothing, d, budget)
-        return DictEncoded{T,R,typeof(pool),typeof(indices)}(indices, pool, t.ordered)
-    end
-    if t isa AC.RunEndEncodedType
-        runs, values = d.children[1], d.children[2]
-        R = AC.juliatype(runs.type::AC.IntType)
-        _chargeexact!(budget, Int64, runs.len, "run ends")
-        runends = Int64.(_primitive(R, R, Nothing, runs, budget))
-        vcol = _viewcolumn(f.children[2], [values], ctx, T)
-        return RunEndEncoded{T,typeof(vcol)}(runends, vcol, Int(d.offset), Int(d.len))
-    end
+    t isa AC.DictionaryType && return _dictview(T, f, t, d, ctx)
+    t isa AC.RunEndEncodedType && return _runendview(T, f, d, ctx)
     t isa AC.TimeType && _checktimes(f, t, d, budget)
     S, C = _fixedstorage(t)
     return _primitive(T, S, C, d, budget)
+end
+
+function _dictview(
+    ::Type{T},
+    f::AC.Field,
+    t::AC.DictionaryType,
+    d::AC.ArrayData,
+    ctx::_ViewContext,
+) where {T}
+    pool = _dictpool(ctx, AC.dictvaluefield(f, t), d.dictionary::AC.ArrayData)
+    R = AC.juliatype(t.indextype)
+    indices = _primitive(Missing <: T ? Union{Missing,R} : R, R, Nothing, d, ctx.budget)
+    return DictEncoded{T,R,typeof(pool),typeof(indices)}(indices, pool, t.ordered)
+end
+
+function _runendview(::Type{T}, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext) where {T}
+    runs, values = d.children[1], d.children[2]
+    R = AC.juliatype(runs.type::AC.IntType)
+    _chargeexact!(ctx.budget, Int64, runs.len, "run ends")
+    runends = Int64.(_primitive(R, R, Nothing, runs, ctx.budget))
+    vcol = _viewcolumn(f.children[2], [values], ctx, T)
+    return RunEndEncoded{T,typeof(vcol)}(runends, vcol, Int(d.offset), Int(d.len))
 end
 
 """
