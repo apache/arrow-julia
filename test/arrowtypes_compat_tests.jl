@@ -3609,9 +3609,8 @@ end
             nullcount=0,
         )
         # The outer list's values are nullable, so its rows are `ListRow`s.
-        expectedrow = Any[
-            innervalid[i] ? (missing, missing) : missing for i in eachindex(innervalid)
-        ]
+        expectedrow =
+            Any[innervalid[i] ? (missing, missing) : missing for i in eachindex(innervalid)]
         expected = Any[expectedrow]
         schema = ARROWTYPES_TEST_AC.Schema([outerfield])
         batch = ARROWTYPES_TEST_AC.RecordBatch(schema, [outerdata], 1)
