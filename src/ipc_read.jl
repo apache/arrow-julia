@@ -1238,6 +1238,16 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice, needed::Int64=In
     # column's whole buffer) decodes only the column's bytes.
     exact = needed < 0 || declared <= _padded64(needed)
     outlen = exact ? declared : _padded64(needed)
+    # No payload decodes to more than its codec's largest expansion: LZ4
+    # turns one byte into at most 255, a 4-byte zstd RLE block into at most
+    # 128 KiB. A larger claim is refused before it is allocated.
+    expansion = c.codec == CODEC_LZ4_FRAME ? Int64(255) : Int64(32768)
+    outlen <= AC.checked_mul(expansion, payloadlen) || throw(
+        ValidationError(
+            "declared decompressed length $outlen exceeds what $payloadlen " *
+            "compressed bytes can hold",
+        ),
+    )
     needed >= 0 && _grow!(state.budget, outlen - payloadlen)
     charged = _exactbytes(UInt8, outlen)
     _charge!(state.budget, charged, "decompressed bytes")

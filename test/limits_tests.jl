@@ -64,6 +64,28 @@ smallbudget() = Arrow.AllocationBudget(64 * 1024; ratio=64, cap=1 << 30)
         )
     end
 
+    @testset "a claim beyond the codec's expansion fails before allocation" begin
+        # 1 GiB cannot come from a few dozen compressed bytes, even when the
+        # column says it reads that much.
+        n = 1 << 30
+        for (codec, frame) in (
+            (
+                Arrow.CODEC_LZ4_FRAME,
+                transcode(Arrow.LZ4FrameCompressor, zeros(UInt8, 1000)),
+            ),
+            (Arrow.CODEC_ZSTD, transcode(ZstdCompressor, zeros(UInt8, 1000))),
+        )
+            budget = Arrow.AllocationBudget(Int64(1) << 40)
+            err = try
+                decodebuffer(frame, n, n; codec=codec, budget=budget)
+            catch e
+                e
+            end
+            @test err isa Arrow.ValidationError && occursin("can hold", err.msg)
+            @test Arrow._remaining(budget) == Int64(1) << 40
+        end
+    end
+
     @testset "the bytes a column reads come from its layout" begin
         AC = Arrow.AC
         slice(bytes) = Arrow.BufferSlice(Arrow.heapregion(bytes), 0, length(bytes))
