@@ -49,9 +49,28 @@ mutable struct EncodeState
     lz4::Union{Nothing,LZ4FrameCompressor}
     zstd::Union{Nothing,ZstdCompressor}
     const level::Union{Nothing,Int}   # codec compression level; nothing = codec default
+    # Compressed frames this state wrote for messages not yet published, and
+    # the published ones' vectors, reused for later frames: fresh memory
+    # faults its pages in, which several threads cannot do at once.
+    const inuse::Vector{Vector{UInt8}}
+    const free::Vector{Vector{UInt8}}
 end
-EncodeState(level::Union{Nothing,Integer}=nothing) =
-    EncodeState(nothing, nothing, level === nothing ? nothing : Int(level))
+EncodeState(level::Union{Nothing,Integer}=nothing) = EncodeState(
+    nothing,
+    nothing,
+    level === nothing ? nothing : Int(level),
+    Vector{UInt8}[],
+    Vector{UInt8}[],
+)
+
+"Return the frames of published messages to their states for reuse."
+function _recycleframes!(states::Vector{EncodeState})
+    for s in states
+        append!(s.free, s.inuse)
+        empty!(s.inuse)
+    end
+    return nothing
+end
 
 function _lz4c!(s::EncodeState)
     if s.lz4 === nothing
@@ -380,9 +399,17 @@ EncodeCursor(codec::Int8) = EncodeCursor(
 
 # One frame of the `len` bytes at `ptr`, compressed with `state`'s codec context.
 function _compressbytes(state::EncodeState, codec::Int8, ptr::Ptr{UInt8}, len::Int)
-    raw = unsafe_wrap(Array, ptr, len)
-    codec == CODEC_LZ4_FRAME && return transcode(_lz4c!(state), raw)
-    return transcode(_zstdc!(state), raw)
+    raw = TS.Buffer(unsafe_wrap(Array, ptr, len))
+    out = isempty(state.free) ? UInt8[] : pop!(state.free)
+    # Room for the codec's worst case (LZ4 and Zstandard frames stay under
+    # this), so a reused vector is never too small for one compression call.
+    need = len + (len >> 7) + 1024
+    length(out) < need && resize!(out, need)
+    frame =
+        codec == CODEC_LZ4_FRAME ? transcode(_lz4c!(state), raw, out) :
+        transcode(_zstdc!(state), raw, out)
+    push!(state.inuse, frame)
+    return frame
 end
 
 function _addpiece!(c::EncodeCursor, b::AC.BufferSlice)
@@ -424,8 +451,10 @@ function _compressbody!(c::EncodeCursor, states::Vector{EncodeState}, ntasks::In
     raw = c.raw
     total = sum(b -> Int64(b.len), raw; init=Int64(0))
     k = total < _PARALLEL_BODY_BYTES ? 1 : ntasks
-    frames = _tasksmap(length(raw), k) do j, w
-        b = raw[j]
+    # Largest buffers first, so the last task to finish has a small one.
+    order = k == 1 ? (1:length(raw)) : sortperm(raw; by=b -> b.len, rev=true)
+    done = _tasksmap(length(raw), k) do i, w
+        b = raw[order[i]]
         b.len == 0 && return nothing
         frame = GC.@preserve b _compressbytes(
             states[w],
@@ -434,6 +463,10 @@ function _compressbody!(c::EncodeCursor, states::Vector{EncodeState}, ntasks::In
             Int(b.len),
         )
         return length(frame) < b.len ? frame : nothing
+    end
+    frames = Vector{Any}(undef, length(raw))
+    for (i, j) in enumerate(order)
+        frames[j] = done[i]
     end
     for (j, b) in enumerate(raw)
         offset = c.bodylen
@@ -1094,6 +1127,8 @@ function _publishmessages!(st::IPCWriteState, messages)
         _writebody(st.io, body)
         st.written += length(header) + body.bodylen
     end
+    # The sink holds the bytes now, so the frames can hold the next ones.
+    _recycleframes!(st.states)
     return nothing
 end
 
