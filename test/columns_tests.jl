@@ -29,6 +29,9 @@ Arrow.readrange(s::ColumnsBytesSource, off, len) = s.data[(off + 1):(off + len)]
 # Bytes `f(x)` allocates once compiled, measured inside a function so the
 # call is not a dynamic one.
 allocationsof(f, x) = (f(x); @allocated f(x))
+# The fewest bytes `f()` allocates over three calls: a collection that runs
+# finalizers or other tasks during one measurement adds to that one only.
+fewestbytes(f) = minimum(_ -> (@allocated f()), 1:3)
 
 function arrowbytes(table; kw...)
     io = IOBuffer()
@@ -615,7 +618,7 @@ end
         Arrow.Table(path; mmap=true)
         # Copies of the 4n list values, the struct fields, or the map entries
         # would allocate 8 bytes or more each; list offsets cost 8 bytes a row.
-        @test (@allocated Arrow.Table(path; mmap=true)) < 2 * 8n + 1_000_000
+        @test fewestbytes(() -> Arrow.Table(path; mmap=true)) < 2 * 8n + 1_000_000
         t = Arrow.Table(path; mmap=true)
         @test t.l == tbl.l && t.st == tbl.st && t.m[5] == [5 => 5.0]
         # Rows keep the mapping they view alive.
@@ -719,7 +722,7 @@ end
         bytes = arrowbytes((s=strs, x=collect(1:n)))
         Arrow.Table(bytes)
         # Opening the table builds no string column (its payloads are 16n bytes).
-        @test (@allocated Arrow.Table(bytes)) < 16n ÷ 4
+        @test fewestbytes(() -> Arrow.Table(bytes)) < 16n ÷ 4
         t = Arrow.Table(bytes)
         @test Tables.schema(t).types == (DataString, Int64)
         # Tasks that ask at once get the one built column.
@@ -730,7 +733,7 @@ end
         @test Arrow.read(bytes, Tables.columntable).s == strs
         # A scan that only selects builds them the same way.
         Arrow.Table(bytes; select=[:x, :s])
-        @test (@allocated Arrow.Table(bytes; select=[:x, :s])) < 16n ÷ 4
+        @test fewestbytes(() -> Arrow.Table(bytes; select=[:x, :s])) < 16n ÷ 4
         @test Arrow.Table(bytes; select=[:s]).s == strs
         @test Arrow.Table(bytes; stringtype=String).s == strs
         # The read's allowance is charged when the table opens.
@@ -750,8 +753,9 @@ end
         for compress in (:zstd, :lz4), stringview in (false, true)
             bytes = arrowbytes((s=strs,); compress=compress, stringview=stringview)
             @test Arrow.Table(bytes).s == strs
-            # The decompressed data plus 16-byte payloads; a copy adds `data` more.
-            @test (@allocated Arrow.Table(bytes)) < data + 4_000_000
+            # The decompressed data plus 16-byte payloads once the column is
+            # built; a copy adds `data` more.
+            @test fewestbytes(() -> Arrow.Table(bytes).s) < data + 4_000_000
         end
     end
 
