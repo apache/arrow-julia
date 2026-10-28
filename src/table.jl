@@ -1717,7 +1717,9 @@ const _MMAP_DEFAULT = !Sys.iswindows()
 Read `source` as [`Arrow.Table`](@ref) does, with the same keywords, and pass
 the result to `sink` with owned, mutable columns, copied exactly once:
 `Arrow.read(path, DataFrame)` returns a `DataFrame` whose columns are
-`Vector`s (`PooledArray`s for dictionary-encoded columns).
+`Vector`s (`PooledArray`s for dictionary-encoded columns). A sink that takes
+DataAPI metadata, such as a `DataFrame`, gets the file and column metadata, as
+`DataFrame(Arrow.Table(path))` does.
 """
 function read(source, sink; kwargs...)
     t = Table(source; kwargs...)
@@ -1731,7 +1733,26 @@ function read(source, sink; kwargs...)
         getfield(t, :nrows),
         getfield(t, :retainedpools),
     )
-    return sink(Tables.CopiedColumns(owned))
+    result = sink(Tables.CopiedColumns(owned))
+    # The CopiedColumns wrapper, which lets the sink keep the columns, hides
+    # the table's metadata from it.
+    if DataAPI.metadatasupport(typeof(result)).write
+        for key in DataAPI.metadatakeys(owned)
+            DataAPI.metadata!(result, key, DataAPI.metadata(owned, key); style=:default)
+        end
+    end
+    if DataAPI.colmetadatasupport(typeof(result)).write
+        for (col, keys) in DataAPI.colmetadatakeys(owned), key in keys
+            DataAPI.colmetadata!(
+                result,
+                col,
+                key,
+                DataAPI.colmetadata(owned, col, key);
+                style=:default,
+            )
+        end
+    end
+    return result
 end
 
 function read(source; kwargs...)

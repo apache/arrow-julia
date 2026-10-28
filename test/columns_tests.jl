@@ -18,6 +18,20 @@
 
 using Test, Arrow, Tables, DataAPI, Dates, DataDecimals, Durations, PooledArrays
 using DataStrings: DataString, DataBytes, StringVector, BytesVector
+
+# A table sink that takes DataAPI metadata, as a DataFrame does.
+struct _MetaSink
+    columns::NamedTuple
+    metadata::Dict{String,Any}
+    colmetadata::Dict{Symbol,Dict{String,Any}}
+end
+_MetaSink(columns) = _MetaSink(columns, Dict{String,Any}(), Dict{Symbol,Dict{String,Any}}())
+DataAPI.metadatasupport(::Type{_MetaSink}) = (read=true, write=true)
+DataAPI.colmetadatasupport(::Type{_MetaSink}) = (read=true, write=true)
+DataAPI.metadata!(s::_MetaSink, key::AbstractString, value; style) =
+    (s.metadata[key]=value; s)
+DataAPI.colmetadata!(s::_MetaSink, col::Symbol, key::AbstractString, value; style) =
+    (get!(Dict{String,Any}, s.colmetadata, col)[key]=value; s)
 isdefined(Main, :rmmapped) || include(joinpath(@__DIR__, "support", "mapped.jl"))
 
 struct ColumnsBytesSource <: Arrow.AbstractArrowSource
@@ -733,6 +747,24 @@ end
         @test nt.c isa PooledArray && nt.c == ["a", "b", "a"]
         @test nt.l == [[1], [2, 3], Int[]]
         @test_throws ArgumentError Arrow.read(bytes)
+    end
+
+    @testset "Arrow.read gives a sink the file and column metadata" begin
+        bytes = take!(
+            Arrow.write(
+                IOBuffer(),
+                (a=[1, 2], b=["x", "y"]);
+                metadata=Dict("owner" => "me"),
+                colmetadata=Dict(:a => Dict("unit" => "m")),
+            ),
+        )
+        # A sink that takes DataAPI metadata, as a DataFrame does.
+        got = Arrow.read(bytes, cols -> _MetaSink(Tables.columntable(cols)))
+        @test got.columns.a == [1, 2]
+        @test got.metadata == Dict("owner" => "me")
+        @test got.colmetadata == Dict(:a => Dict("unit" => "m"))
+        # Other sinks get the columns as before.
+        @test Arrow.read(bytes, Tables.columntable).b == ["x", "y"]
     end
 
     @testset "reads give the same columns for any ntasks" begin
