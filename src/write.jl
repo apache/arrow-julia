@@ -40,7 +40,7 @@ include("columnconstruction.jl")
 
 """
     Arrow.write(sink, table; file=sink isa AbstractString, compress=nothing,
-                compresslevel=nothing, batchsize=1_048_576, dictencode=false,
+                compresslevel=nothing, batchsize=1_048_576, dictencode=nothing,
                 dictdeltas=false, largelists=false, stringview=false, metadata=nothing,
                 colmetadata=nothing, ntasks=Threads.nthreads())
     Arrow.write(sink; kwargs...)
@@ -61,10 +61,13 @@ Keywords:
   becomes one or more batches of at most `batchsize` rows. A batch whose
   strings, bytes, or lists would pass the 2 GiB that 32-bit offsets address
   is cut smaller, so the declared types never change.
-- `dictencode`: dictionary-encode every column (`true`) or the named ones (a
-  collection of `Symbol`s or strings). Columns with a `DataAPI.refpool`
-  (`PooledArray`, `CategoricalArray`) and [`Arrow.DictEncode`](@ref) columns
-  are always dictionary-encoded.
+- `dictencode`: which columns to dictionary-encode. By default, columns with
+  a `DataAPI.refpool` (`PooledArray`, `CategoricalArray`, a dictionary column
+  read from Arrow) and [`Arrow.DictEncode`](@ref) columns. `true` adds every
+  other column, and a column name or a collection of names adds those.
+  `false` writes pooled, categorical, and read dictionary columns as their
+  values (DuckDB's `read_arrow` refuses dictionaries); `Arrow.DictEncode`
+  columns stay encoded.
 - `dictdeltas`: write the categories a dictionary gains in later partitions
   as delta dictionary batches (see [`Arrow.Writer`](@ref)).
 - `largelists`: declare 64-bit offsets (LargeUtf8, LargeBinary, LargeList).
@@ -224,7 +227,7 @@ end
 
 """
     Arrow.Writer(sink; file=sink isa AbstractString, compress=nothing, compresslevel=nothing,
-                 batchsize=1_048_576, dictencode=false, largelists=false,
+                 batchsize=1_048_576, dictencode=nothing, largelists=false,
                  stringview=false, nullable=true, metadata=nothing, colmetadata=nothing,
                  dictdeltas=false, dictreplacement=false, ntasks=Threads.nthreads())
     Arrow.Writer(f::Function, sink; kwargs...)
@@ -323,7 +326,7 @@ function _writer(
     largelists::Bool=false,
     stringview::Bool=false,
     nullable::Bool=true,
-    dictencode=false,
+    dictencode=nothing,
     oneshot::Bool=false,
     ntasks::Integer=Threads.nthreads(),
     # Arrow 2.x writer keywords: accepted and ignored (with a one-time
@@ -346,7 +349,7 @@ function _writer(
     codec = _codec(compress, compresslevel)
     batchsize = _checkbatchsize(batchsize)
     ntasks >= 1 || throw(ArgumentError("ntasks must be at least 1, got $ntasks"))
-    dictencode isa Bool ||
+    dictencode isa Union{Nothing,Bool,Symbol,AbstractString} ||
         all(n -> n isa Union{Symbol,AbstractString}, dictencode) ||
         throw(ArgumentError("dictencode must be true, false, or column names"))
     if dictreplacement && file
@@ -441,6 +444,9 @@ end
 # their own types, so a new table type compiles no new writer code.
 Base.@nospecializeinfer function _writeparts!(w::Writer, @nospecialize(tbl))
     retained = _retainedschema(tbl)::Union{Nothing,AC.Schema}
+    w.dictencode === false &&
+        retained !== nothing &&
+        (retained = _plainschema(retained, Tables.schema(tbl)))
     parts = Tables.partitions(tbl)
     next = iterate(parts)
     if next === nothing
@@ -573,6 +579,7 @@ Base.@nospecializeinfer function _writebatch!(
             Any[hints],
             _retainedfieldfn(retained, names, encoded),
             colmetadata;
+            refpools=w.dictencode !== false,
             stringview=w.stringview,
             largelists=w.largelists,
             growable=(!w.oneshot || several),
@@ -639,6 +646,27 @@ function _beginwrite!(
     w.schema = sch
     w.names = names
     return nothing
+end
+
+# `dictencode=false`: a retained top-level dictionary column writes as its
+# values, nullable when its values can be missing.
+function _plainschema(retained::AC.Schema, sch)
+    any(f -> f.type isa AC.DictionaryType, retained.fields) || return retained
+    types = sch === nothing ? nothing : sch.types
+    fields = AC.Field[
+        f.type isa AC.DictionaryType ?
+        AC.Field(
+            f.name,
+            f.type.valuetype;
+            nullable=f.nullable ||
+                     types === nothing ||
+                     length(types) != length(retained.fields) ||
+                     Missing <: types[j],
+            metadata=f.metadata,
+            children=collect(AC.Field, f.children),
+        ) : f for (j, f) in enumerate(retained.fields)
+    ]
+    return AC.Schema(fields; metadata=retained.metadata)
 end
 
 """
@@ -1106,10 +1134,12 @@ function _codec(compress, compresslevel)
     return codec
 end
 
-# Which top-level columns `dictencode` asks to dictionary-encode: all of them
-# (`true`), none (`false`), or those named (Symbols or Strings).
+# Which top-level columns `dictencode` asks to encode beyond the pooled ones:
+# all (`true`), none (`nothing`, `false`), or those named (Symbols or Strings).
 function _dictencodeflags(names::Vector{Symbol}, dictencode)
+    dictencode === nothing && return fill(false, length(names))
     dictencode isa Bool && return fill(dictencode, length(names))
+    dictencode isa Union{Symbol,AbstractString} && (dictencode = (dictencode,))
     wanted = Set{Symbol}(Symbol(n) for n in dictencode)
     for n in wanted
         n in names || throw(

@@ -307,6 +307,29 @@ end
     @test occursin("CompatHasPtr", err.value.msg)
 end
 
+@testset "dictencode=false writes pooled columns as their values" begin
+    isdict(t, j) = getfield(t, :schema).fields[j].type isa AC.DictionaryType
+    p = PooledArray(["NY", "LA", "NY"])
+    t = Arrow.Table(
+        Arrow.tobuffer((; p, d=Arrow.DictEncode(["a", "b", "a"])); dictencode=false),
+    )
+    @test !isdict(t, 1) && t.p == ["NY", "LA", "NY"]
+    # An Arrow.DictEncode column asks for its dictionary itself.
+    @test isdict(t, 2) && t.d == ["a", "b", "a"]
+    @test isdict(Arrow.Table(Arrow.tobuffer((; p))), 1)
+    # A dictionary column read from Arrow, in its table or on its own.
+    src = Arrow.Table(Arrow.tobuffer((; p=PooledArray(["x", missing, "x"]), n=[1, 2, 3])))
+    @test isdict(src, 1)
+    for x in (src, (; p=src.p))
+        back = Arrow.Table(Arrow.tobuffer(x; dictencode=false))
+        @test !isdict(back, 1) && getfield(back, :schema).fields[1].nullable
+        @test isequal(back.p, ["x", missing, "x"])
+    end
+    # One column name, as well as a collection of them.
+    t = Arrow.Table(Arrow.tobuffer((a=["u", "v"], b=["w", "w"]); dictencode=:a))
+    @test isdict(t, 1) && !isdict(t, 2)
+end
+
 @testset "dictionary writes do not allocate per row" begin
     # Ref-pool and DictEncode columns share one encoder; 200,000 cells here.
     vals = [string("c", i % 50) for i = 1:100_000]
