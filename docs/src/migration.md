@@ -23,10 +23,12 @@
 
 Arrow.jl 3.0 is a new implementation with the same main names: `Arrow.Table`,
 `Arrow.Stream`, `Arrow.write`, `Arrow.Writer`, `Arrow.append`, `Arrow.tobuffer`,
-`Arrow.DictEncode`, and `Arrow.getmetadata`. It reads every file Arrow 2.x writes, with
-the same values. Code that reads a table into a `DataFrame` and writes it back usually
-runs unchanged. What changes is the Julia type of some values, a few removed arguments,
-and, for teams that run both versions, a few column types that Arrow 2.x cannot read.
+`Arrow.DictEncode`, and `Arrow.getmetadata`. It reads Arrow 2.x files using the Julia
+types described below. Code that reads a table into a `DataFrame` and writes it back
+usually runs unchanged. Files containing `ZonedDateTime` written before Arrow 2.4.2
+need rewriting first; see [Reading and writing alongside Arrow.jl 2.x](@ref).
+Other changes include a few removed arguments and, for teams that run both versions,
+column types that Arrow 2.x cannot read correctly.
 
 ## Before you upgrade
 
@@ -136,10 +138,10 @@ it through Arrow.
 
 ## Reading and writing alongside Arrow.jl 2.x
 
-Arrow 3.0 reads every file Arrow 2.x writes, with the values 2.x reads, as the types
-listed under [Values](@ref). The other direction has gaps: Arrow 2.x reads most files
-Arrow 3.0 writes, but not all. While some readers still run Arrow 2.x, avoid these
-columns or write them in the form the last column suggests:
+Arrow 3.0 reads Arrow 2.x files as the types listed under [Values](@ref), with the
+older `ZonedDateTime` exception described below. The other direction has gaps:
+Arrow 2.x reads most files Arrow 3.0 writes, but not all. While some readers still
+run Arrow 2.x, avoid these columns or write them in the form the last column suggests:
 
 | Written by Arrow 3.0 | Arrow 2.x reads | For 2.x readers, write |
 |:--|:--|:--|
