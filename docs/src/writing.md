@@ -25,8 +25,9 @@
 
 [`Arrow.write(sink, table)`](@ref Arrow.write) writes any Tables.jl source (a
 `DataFrame`, a `NamedTuple` of vectors, a `CSV.File`, an `Arrow.Table`) to a path or an
-`IO` and returns the sink; any other object that `open(sink, "w")` accepts, such as a
-FilePathsBase.jl path, is written as a path is, in place. `Arrow.write(sink)` returns a
+`IO` and returns the sink. FilePathsBase.jl local paths (`SystemPath`) work like string
+paths, including atomic replacement and `Arrow.append`. Any other object that
+`open(sink, "w")` accepts is written in place. `Arrow.write(sink)` returns a
 function, so a table can be piped into it, as in
 `CSV.File("trips.csv") |> Arrow.write("trips.arrow")`.
 
@@ -99,9 +100,10 @@ its schema alone. `Arrow.write(path, Arrow.Stream(src))` keeps the source's reco
 batches. Partitions are read, encoded, and written one at a time, so
 `Arrow.write("big.arrow", CSV.Chunks("big.csv"))` holds about one chunk in memory.
 
-The first partition fixes the schema. With several partitions every field is declared
-nullable, since a later partition may hold missing values the first did not (pyarrow and
-Polars write partitioned data the same way), so such a table reads back with
+The first partition fixes the schema. With several partitions, or a source whose
+partition count is unknown, every field is declared nullable, since a later partition
+may hold missing values the first did not (pyarrow and Polars write partitioned data the
+same way), so such a table reads back with
 `Union{Missing,T}` columns. Later partitions must have the same columns in the same
 order, with values that convert exactly (an `Int32` partition fits an `Int64` column);
 anything else is an error naming the column.
@@ -139,8 +141,8 @@ t.region
 ```
 
 The indices are the narrowest signed integers that hold the dictionary (`Int8` up to 128
-values) for a one-partition table, and `Int32` for several partitions and for an
-`Arrow.Writer`, since later tables may add values. Reading gives a
+values) for a known one-partition table, and `Int32` for several or an unknown number of
+partitions and for an `Arrow.Writer`, since later tables may add values. Reading gives a
 [`Arrow.DictEncoded`](@ref) column: `DataAPI.refarray`, `DataAPI.refpool`, and
 `DataAPI.levels` expose the encoding, and `copy` gives a `PooledArray`.
 

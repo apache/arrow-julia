@@ -3398,31 +3398,29 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
     end
 
     @testset "batches whose offsets would pass Int32 are cut smaller" begin
-        AC = Arrow.AC
-        # A builder reports the batch and row where 32-bit offsets overflow;
-        # the writer cuts every batch at least that long and rebuilds.
+        # A later batch overflows after an earlier batch has been published.
+        # Only that batch and the remaining rows need to be cut smaller.
         calls = Ref(0)
-        parts = [AbstractVector[collect(1:10)]]
-        fields, data, rows =
-            Arrow._constructbatches(parts, Any[nothing], [10], 4) do cols, _
-                calls[] += 1
-                calls[] == 1 && throw(Arrow._OffsetOverflow("s", 2, 3))
-                return [AC.Field("a", AC.IntType(64, true); nullable=false)],
-                [[last(AC.fromjulia("a", collect(c[1]))) for c in cols]]
-            end
-        @test calls[] == 2
-        @test rows == [2, 2, 2, 2, 2]
-        # the cut applies from each partition's start, leaving no slivers
-        sizes = [4]
-        Arrow._shrinkbatches!(
-            sizes,
-            Arrow._batchplan([10], sizes),
-            Arrow._OffsetOverflow("s", 1, 4),
-        )
-        @test Arrow._batchplan([10], sizes) == [(1, 1:3), (1, 4:6), (1, 7:9), (1, 10:10)]
+        columns = AbstractVector[collect(1:10)]
+        batches = Vector{Int}[]
+        Arrow._eachbatch(columns, 10, 4) do cols, nrows
+            calls[] += 1
+            calls[] == 2 && throw(Arrow._OffsetOverflow("s", 1, 3))
+            @test length(only(cols)) == nrows
+            push!(batches, collect(only(cols)))
+        end
+        @test calls[] == 5
+        @test batches == [[1, 2, 3, 4], [5, 6], [7, 8], [9, 10]]
+
+        empty!(batches)
+        Arrow._eachbatch(columns, 10, 4) do cols, _
+            length(only(cols)) > 3 && throw(Arrow._OffsetOverflow("s", 1, 4))
+            push!(batches, collect(only(cols)))
+        end
+        @test batches == [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10]]
         # a single value too large for 32-bit offsets says how to write it
         err = try
-            Arrow._constructbatches(parts, Any[nothing], [10], 4) do cols, _
+            Arrow._eachbatch(columns, 10, 4) do cols, _
                 throw(Arrow._OffsetOverflow("s", 1, 1))
             end
         catch e

@@ -597,6 +597,33 @@ function ipc_read_battery()
         materialize(nullstream.schema.fields[1], nullstream.batches[1].columns[1]),
         nullvalues,
     )
+    # A streaming consumer receives an all-null batch before the producer
+    # sends its dictionary, without reading into subsequent batches.
+    repeated = vcat(
+        nullbytes[nullframes[nschema].frame],
+        nullbytes[nullframes[nrecord].frame],
+        nullbytes[nullframes[nrecord].frame],
+        nullbytes[nullframes[ndict].frame],
+        nullbytes[nullframes[neos].frame],
+    )
+    nullio = IOBuffer(repeated)
+    incremental = Arrow.Stream(nullio)
+    part, state = iterate(incremental)
+    @assert isequal(part.d, nullvalues)
+    @assert position(nullio) ==
+            length(nullframes[nschema].frame) + length(nullframes[nrecord].frame)
+    part, state = iterate(incremental, state)
+    @assert isequal(part.d, nullvalues)
+    @assert position(nullio) ==
+            length(nullframes[nschema].frame) + 2 * length(nullframes[nrecord].frame)
+    @assert iterate(incremental, state) === nothing
+    # EOF still checks that every promised dictionary eventually arrived.
+    missingpool = vcat(
+        nullbytes[nullframes[nschema].frame],
+        nullbytes[nullframes[nrecord].frame],
+        nullbytes[nullframes[neos].frame],
+    )
+    @assert _rejects(() -> collect(Arrow.Stream(IOBuffer(missingpool))))
     println("all-null dictionary references may precede their dictionary ✓")
 
     # The 2.x writer omits Map.keysSorted when false. The generated getter

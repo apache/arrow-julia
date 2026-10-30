@@ -43,18 +43,21 @@ UUIDs = "cf7118a7-6976-5b1a-9a39-7adc72f591a4"
 ArrowTypes = {path = "src/ArrowTypes"}
 
 [weakdeps]
+FilePathsBase = "48062228-2e41-5def-b9a4-89aafe57970f"
 Serialization = "9e88b42a-f829-5b0c-bbe9-9e923198166b"
 CategoricalArrays = "324d7699-5711-5eae-9e2f-1d82baa6b597"
 CloudStore = "3365d9ee-d53b-4a56-812d-5344d5b716d7"
 TimeZones = "f269a46b-ccf7-5d73-abea-4c690281aa53"
 
 [extensions]
+ArrowFilePathsBaseExt = "FilePathsBase"
 ArrowSerializationExt = "Serialization"
 ArrowCategoricalArraysExt = "CategoricalArrays"
 ArrowCloudStoreExt = "CloudStore"
 ArrowTimeZonesExt = "TimeZones"
 
 [compat]
+FilePathsBase = "0.9"
 Serialization = "1.10"
 DataDecimals = "1"
 Durations = "1.4"

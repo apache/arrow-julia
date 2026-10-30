@@ -88,6 +88,12 @@ sink)`](@ref Arrow.read) reads and hands the copies to a sink in one step:
 df = Arrow.read(path, DataFrame)
 ```
 
+`copy(table)` and `Arrow.read` also detach nested Arrow views. Lists become vectors,
+maps become vectors of key-value pairs (keeping duplicate keys), and structs and tuples
+keep their shape with owned child values. A copied table therefore keeps no dependency
+on the input's buffers. Nested values that were already ordinary Julia arrays follow
+Julia's usual shallow-copy behavior.
+
 ## Memory mapping and lifetime
 
 A path is memory mapped by default, so opening a file larger than memory is cheap and

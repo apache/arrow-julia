@@ -117,6 +117,25 @@ allocatedby(f) = (f(); @allocated f())
             @test allocatedby(() -> Arrow.Table(p; mmap=true)) < sizeof(tbl.a) ÷ 8
             @test allocatedby(() -> Arrow.Table(p; mmap=false)) > sizeof(tbl.a)
         end
+        # A local path object gets the same atomic replacement as a string:
+        # failed writes preserve the file, and rewriting a mapped source is safe.
+        p = FilePathsBase.Path(joinpath(dir, "atomic.arrow"))
+        Arrow.write(p, (; a=[1, 2, 3]))
+        original = Base.read(string(p))
+        @test_throws ArgumentError Arrow.write(p, (; a=[big(1)]))
+        @test Base.read(string(p)) == original
+        mapped = Arrow.Table(p)
+        @test Arrow.write(p, mapped) === p
+        @test mapped.a == [1, 2, 3]
+        Arrow.Writer(p) do w
+            Arrow.write(w, (; a=[4]))
+        end
+        @test mapped.a == [1, 2, 3]
+        @test Arrow.Table(p).a == [4]
+        p = FilePathsBase.Path(joinpath(dir, "append.arrow"))
+        @test Arrow.append(p, (; a=[1])) === p
+        @test ((; a=[2, 3]) |> Arrow.append(p)) === p
+        @test Arrow.Table(p).a == [1, 2, 3]
         # Another IO is read whole, or written in place in the file format.
         bytes = take!(Arrow.write(IOBuffer(), tbl))
         @test Arrow.Table(OpenableIO(IOBuffer(bytes))).a == tbl.a

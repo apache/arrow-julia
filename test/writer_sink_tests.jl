@@ -209,6 +209,23 @@ end
         end
     end
 
+    @testset "a failed asynchronous batch releases its codecs" begin
+        io = FailingSink()
+        batch = Arrow.AC.batch(table)
+        st = Arrow.beginwrite!(io, batch.schema; file=false, compress=:zstd, ntasks=2)
+        Arrow.writebatch!(st, batch)
+        task, states, _ = only(st.pending)
+        wait(task)
+        @test any(s -> s.zstd !== nothing, states)
+        failure = ErrorException("asynchronous output write failed")
+        io.writeerror = failure
+        @test caught(() -> Arrow.drainwrite!(st)) === failure
+        Arrow.abortwrite!(st)
+        @test all(s -> s.zstd === nothing, states)
+        @test isopen(io)
+        close(io)
+    end
+
     @testset "function forms preserve the body error when close also fails" begin
         for construct in
             (Arrow.Writer, (f, sink; kw...) -> open(f, Arrow.Writer, sink; kw...))

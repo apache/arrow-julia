@@ -2127,7 +2127,7 @@ mutable struct _StreamReader{M}
     # or for an `IO` (each body is its own region) an empty one.
     const region::OwnerRegion
     st::_StreamState
-    queue::Vector{PendingRecord}       # record batches read and not yet returned
+    missing::Set{Int64}                # dictionaries promised by all-null batches
     done::Bool
     failed::Bool                       # a read threw; the stream stops there
     const limits::Limits
@@ -2145,7 +2145,7 @@ function _StreamReader(messages, limits::Limits)
         messages.pos,
         region,
         st,
-        PendingRecord[],
+        Set{Int64}(),
         false,
         false,
         limits,
@@ -2156,7 +2156,7 @@ end
 # Start over from the first batch (a byte region or a byte-range source).
 function _restart!(r::_StreamReader)
     # A reader that has not read past its schema is at the start already.
-    r.messages.pos == r.start && isempty(r.queue) && !r.done && !r.failed && return r
+    r.messages.pos == r.start && isempty(r.missing) && !r.done && !r.failed && return r
     m = r.messages
     if m isa _IOMessages{_SourceIO}
         empty!(m.head)
@@ -2182,7 +2182,7 @@ function _restart!(r::_StreamReader)
         st.version,
         st.limits,
     )
-    empty!(r.queue)
+    empty!(r.missing)
     r.done = false
     r.failed = false
     return r
@@ -2209,15 +2209,8 @@ end
 
 function _readrecord!(r::_StreamReader, ntasks::Int)
     while true
-        if !isempty(r.queue)
-            p = first(r.queue)
-            if isempty(p.missing)
-                popfirst!(r.queue)
-                return only(_decoderecords(r.st, PendingRecord[p], ntasks)), p.budget
-            end
-        end
         if r.done
-            isempty(r.queue) && return nothing
+            isempty(r.missing) && return nothing
             throw(
                 ValidationError("stream ended before required dictionary batches arrived"),
             )
@@ -2233,13 +2226,25 @@ function _readrecord!(r::_StreamReader, ntasks::Int)
         if header isa Meta.DictionaryBatch
             state = DecodeState(budget)
             try
-                id, pool, replaced = _applydictionary!(r.st, fm, budget, state)
-                replaced || _resolvepending!(r.queue, id, pool)
+                id, _, _ = _applydictionary!(r.st, fm, budget, state)
+                delete!(r.missing, id)
             finally
                 close(state)
             end
         elseif header isa Meta.RecordBatch
-            push!(r.queue, _pendingrecord(r.st, fm, budget))
+            p = _pendingrecord(r.st, fm, budget)
+            # An all-null batch needs no pool values. Yield it now, even when
+            # its dictionary has not arrived, without retaining later batches.
+            union!(r.missing, p.missing)
+            for id in p.missing
+                p.dictionaries[id] = _dictionaryconcat(
+                    r.st.dictvaluefields[id],
+                    _DictionaryRange[],
+                    r.limits,
+                    budget,
+                )
+            end
+            return only(_decoderecords(r.st, PendingRecord[p], ntasks)), budget
         else
             throw(ValidationError("unsupported IPC message header $(typeof(header))"))
         end

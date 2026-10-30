@@ -499,8 +499,9 @@ Base.copy(c::ChainedVector{T,<:DictEncoded}) where {T} = _pooledcopy(T, c.arrays
 function _pooledcopy(::Type{T}, chunks) where {T}
     # Distinct values in first-pool-position order; duplicates and null
     # pool entries remap so the PooledArray's invariants hold.
-    invpool = Dict{T,UInt32}()
-    pool = T[]
+    R = _ownedtype(T)
+    invpool = Dict{R,UInt32}()
+    pool = R[]
     refs = Vector{UInt32}(undef, sum(length, chunks; init=0))
     remap = UInt32[]
     lastpool = nothing
@@ -509,8 +510,9 @@ function _pooledcopy(::Type{T}, chunks) where {T}
         if v.pool !== lastpool
             remap = Vector{UInt32}(undef, length(v.pool))
             for (k, x) in enumerate(v.pool)
-                remap[k] = get!(invpool, x) do
-                    push!(pool, x)
+                value = _ownedvalue(x)
+                remap[k] = get!(invpool, value) do
+                    push!(pool, value)
                     UInt32(length(pool))
                 end
             end
@@ -1152,6 +1154,29 @@ function _dictpool(ctx::_ViewContext, vf::AC.Field, dict::AC.ArrayData)
     return @lock ctx.poolslock get!(ctx.pools, dict, built)
 end
 
+function _markpools!(live, data::AC.ArrayData, cached)
+    dict = data.dictionary
+    if dict !== nothing
+        haskey(cached, dict) && (live[dict] = nothing)
+        _markpools!(live, dict, cached)
+    end
+    foreach(child -> _markpools!(live, child, cached), data.children)
+    return nothing
+end
+
+# A stream reuses current pools, but only returned tables may keep old ones alive.
+function _prunepools!(ctx::_ViewContext, columns, budget)
+    lock(ctx.poolslock) do
+        isempty(ctx.pools) && return nothing
+        _chargedict!(budget, AC.ArrayData, Nothing, length(ctx.pools), "live stream pools")
+        live = IdDict{AC.ArrayData,Nothing}()
+        foreach(data -> _markpools!(live, data, ctx.pools), columns)
+        filter!(entry -> haskey(live, first(entry)), ctx.pools)
+        return nothing
+    end
+    return nothing
+end
+
 # A view object's own size (struct, wrapped vector headers), charged per batch.
 const _VIEW_OBJECT_BYTES = Int64(256)
 
@@ -1766,20 +1791,63 @@ end
     return :(R(($(fields...),)))
 end
 
-# An owned copy holds each list or map row as its own `Vector`, over every
-# batch, and each struct row as its `NamedTuple`.
+# Owned column copies replace nested views too: a struct or list can contain
+# another list whose child values still point into the input's buffers.
+_ownedtype(::Type{T}) where {T} =
+    T isa Union ? Union{(_ownedtype(S) for S in Base.uniontypes(T))...} : T
+_ownedtype(::Type{ListValue{T}}) where {T} = Vector{_ownedtype(T)}
+_ownedtype(::Type{MapValue{K,V}}) where {K,V} = Vector{Pair{_ownedtype(K),_ownedtype(V)}}
+_ownedtype(::Type{NamedTuple{N,T}}) where {N,T} = NamedTuple{N,_ownedtype(T)}
+_ownedtype(::Type{Pair{K,V}}) where {K,V} = Pair{_ownedtype(K),_ownedtype(V)}
+_ownedtype(::Type{T}) where {T<:Tuple} =
+    T isa Union ? Union{(_ownedtype(S) for S in Base.uniontypes(T))...} :
+    (T === Union{} || T isa UnionAll || Base.isvatuple(T)) ? T :
+    Tuple{map(_ownedtype, fieldtypes(T))...}
+
+# Unknown element types need a value check; concrete scalar types cannot
+# contain any of the nested views this module creates.
+_mayborrow(::Type{T}) where {T} =
+    T isa Union ? any(_mayborrow, Base.uniontypes(T)) : !isconcretetype(T)
+_mayborrow(::Type{<:ListValue}) = true
+_mayborrow(::Type{<:MapValue}) = true
+_mayborrow(::Type{T}) where {T<:Union{NamedTuple,Tuple,Pair}} =
+    !isconcretetype(T) || any(_mayborrow, fieldtypes(T))
+_mayborrow(::Type{T}) where {T<:AbstractVector} =
+    !isconcretetype(T) || _mayborrow(eltype(T))
+_mayborrow(::Type{T}) where {T<:AbstractDict} =
+    !isconcretetype(T) || _mayborrow(keytype(T)) || _mayborrow(valtype(T))
+
+_hasborrowed(x) = false
+_hasborrowed(::Union{ListValue,MapValue}) = true
+_hasborrowed(x::Union{NamedTuple,Tuple,Pair}) = any(_hasborrowed, x)
+_hasborrowed(x::Union{AbstractVector,AbstractDict}) =
+    _mayborrow(eltype(x)) && any(_hasborrowed, x)
+
+_needsowned(c::AbstractVector{T}) where {T} =
+    _ownedtype(T) !== T || (_mayborrow(T) && any(_hasborrowed, c))
+
+_ownedvalue(x) = x
+_ownedvalue(x::ListValue) = _copyrows(eltype(x), x)
+_ownedvalue(x::MapValue) = _copyrows(eltype(x), x)
+_ownedvalue(x::Union{NamedTuple,Tuple}) = map(_ownedvalue, x)
+_ownedvalue(x::Pair) = _ownedvalue(first(x)) => _ownedvalue(last(x))
+_ownedvalue(x::AbstractVector) = _needsowned(x) ? _copyrows(eltype(x), x) : x
+_ownedvalue(x::AbstractDict) = _hasborrowed(x) ? Dict(_ownedvalue(p) for p in x) : x
+
 function _copyrows(::Type{T}, v) where {T}
-    R = Vector{eltype(Base.nonmissingtype(T))}
-    out = Vector{Missing<:T ? Union{Missing,R} : R}(undef, length(v))
+    R = _ownedtype(T)
+    # An abstract container may change its element type when a hidden view
+    # becomes a vector. Let map infer or widen it from the converted values.
+    R === T && _mayborrow(T) && !isempty(v) && return map(_ownedvalue, v)
+    out = Vector{R}(undef, length(v))
     for (i, x) in enumerate(v)
-        out[i] = x === missing ? missing : collect(x)
+        out[i] = _ownedvalue(x)
     end
     return out
 end
-Base.copy(v::Union{ListVector{T},MapVector{T}}) where {T} = _copyrows(T, v)
-Base.copy(c::ChainedVector{T,<:Union{ListVector{T},MapVector{T}}}) where {T} =
-    _copyrows(T, c)
-Base.copy(v::StructVector{T}) where {T} = T[v[i] for i = 1:length(v)]
+Base.copy(v::ArrowVector{T}) where {T} = _copyrows(T, v)
+Base.copy(c::ChainedVector{T,<:ArrowVector}) where {T} =
+    _ownedtype(T) === T ? invoke(copy, Tuple{ChainedVector}, c) : _copyrows(T, c)
 
 # The values of child `d` (field `f`) as their `_columntype(E)`: the column a
 # read builds, copied into owned storage when it is a view of the source

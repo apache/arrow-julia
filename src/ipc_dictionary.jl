@@ -423,6 +423,7 @@ function _updatedictionary!(
         )
         validate_semantic(vf, decoded)
     end
+    haskey(dicts, id) && delete!(validated, dicts[id])
     validated[decoded] = nothing
     dicts[id] = decoded
     return decoded

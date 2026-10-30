@@ -982,6 +982,7 @@ function _validatewriterbatch!(
     batch::AC.RecordBatch,
     ids::IdDict{Field,Int64},
 )
+    empty!(validated)
     # A shared immutable pool must satisfy every value-field contract
     # through which the schema refers to it. Identity caching is safe only
     # after those field-specific checks have run.
@@ -1227,17 +1228,20 @@ _buildmessages(builders, states, ntasks) = Tuple{Vector{UInt8},EncodeCursor,Any}
 "Publish the oldest pending batch, after its encoding task finishes."
 function _publishnext!(st::IPCWriteState)
     task, states, recycle = popfirst!(st.pending)
-    messages = try
-        fetch(task)
-    catch err
-        _recycleframes!(states)
+    try
+        messages = try
+            fetch(task)
+        catch err
+            _recycleframes!(states)
+            err isa TaskFailedException && throw(err.task.exception)
+            rethrow()
+        end
+        _publishmessages!(st, messages, states)
+        _recycle!(st, recycle)
+    finally
+        # Failed sink writes must leave every codec reachable by abortwrite!.
         push!(st.statesets, states)
-        err isa TaskFailedException && throw(err.task.exception)
-        rethrow()
     end
-    _publishmessages!(st, messages, states)
-    push!(st.statesets, states)
-    _recycle!(st, recycle)
     return nothing
 end
 
@@ -1249,10 +1253,104 @@ function drainwrite!(st::IPCWriteState)
     return nothing
 end
 
-"Order-sensitive pool content equality, in each pool's STORAGE value domain."
+"Order-sensitive pool equality, including Union routes inside nested values."
 function _poolsequal(vf::Field, a::ArrayData, b::ArrayData)
+    a === b && return true
     a.len == b.len || return false
-    return isequal(AC.materialize(vf, a), AC.materialize(vf, b))
+    return _poolrangeequal(vf, a, Int64(0), b, Int64(0), a.len)
+end
+
+_poolrangeequal(f::Field, a::ArrayData, lo::Int64, b::ArrayData, bo::Int64, n::Int64) =
+    _poolrangeequal(f.type, f, a, lo, b, bo, n)
+
+function _poolrangeequal(
+    t::T,
+    f::Field,
+    a::ArrayData,
+    lo::Int64,
+    b::ArrayData,
+    bo::Int64,
+    n::Int64,
+) where {T<:ArrowType}
+    for i = 1:n
+        _poolvalueequal(t, f, a, lo + i, b, bo + i) || return false
+    end
+    return true
+end
+
+_poolvalueequal(f::Field, a::ArrayData, ia::Int64, b::ArrayData, ib::Int64) =
+    _poolvalueequal(f.type, f, a, ia, b, ib)
+
+function _poolvalueequal(
+    t::T,
+    f::Field,
+    a::ArrayData,
+    ia::Int64,
+    b::ArrayData,
+    ib::Int64,
+) where {T<:ArrowType}
+    if t isa NullType
+        return true
+    elseif t isa UnionType
+        atag = AC.loadat(AC.rolebuffer(a, AC.TYPE_IDS), Int8, AC._slotindex0(a, ia))
+        btag = AC.loadat(AC.rolebuffer(b, AC.TYPE_IDS), Int8, AC._slotindex0(b, ib))
+        atag == btag || return false
+        cf, ca, ja = AC._union_child(f, a, ia)
+        _, cb, jb = AC._union_child(f, b, ib)
+        return _poolvalueequal(cf, ca, ja, cb, jb)
+    elseif t isa RunEndEncodedType
+        return _poolvalueequal(
+            f.children[2],
+            a.children[2],
+            AC._ree_runindex(a, ia),
+            b.children[2],
+            AC._ree_runindex(b, ib),
+        )
+    end
+    present = AC.isvalid_at(a, ia)
+    present == AC.isvalid_at(b, ib) || return false
+    present || return true
+    if t isa DictionaryType
+        w = AC.primwidth(t.indextype)
+        ja = AC._load_int(AC.rolebuffer(a, AC.DATA), t.indextype, AC._slotbyteoff(a, ia, w))
+        jb = AC._load_int(AC.rolebuffer(b, AC.DATA), t.indextype, AC._slotbyteoff(b, ib, w))
+        return _poolvalueequal(
+            AC.dictvaluefield(f, t),
+            a.dictionary,
+            Int64(ja) + 1,
+            b.dictionary,
+            Int64(jb) + 1,
+        )
+    elseif t isa StructType
+        for j in eachindex(f.children)
+            _poolvalueequal(
+                f.children[j],
+                a.children[j],
+                a.offset + ia,
+                b.children[j],
+                b.offset + ib,
+            ) || return false
+        end
+        return true
+    elseif t isa Union{ListType,MapType,FixedSizeListType,ListViewType}
+        if t isa FixedSizeListType
+            lo, n = AC._slotindex0(a, ia) * t.listsize, Int64(t.listsize)
+            bo, bn = AC._slotindex0(b, ib) * t.listsize, n
+        elseif t isa ListViewType
+            lo, n = AC._listview_range(t, a, ia)
+            bo, bn = AC._listview_range(t, b, ib)
+        else
+            wide = AC.layoutspec_of(t).offsetwidth == 8
+            lo, hi = AC._offsets_at(a, ia, wide)
+            bo, bh = AC._offsets_at(b, ib, wide)
+            n, bn = hi - lo, bh - bo
+        end
+        n == bn || return false
+        return _poolrangeequal(f.children[1], a.children[1], lo, b.children[1], bo, n)
+    end
+    avalue = AC._value(t, f, a, ia)
+    bvalue = AC._value(t, f, b, ib)
+    return t isa FloatType ? _writerstorageequal(avalue, bvalue) : isequal(avalue, bvalue)
 end
 
 """
@@ -2045,6 +2143,10 @@ the footer; the leading Schema message is not read.
 Pass `mmapregion(path)` to read a file through Core's mmap path. The file
 format permits one base dictionary per id, followed by deltas.
 Full dictionary replacement remains a format error.
+
+`Arrow.Table(handle)` and `Arrow.Stream(handle)` copy a region that can be
+released eagerly, so their columns remain valid after release. Pass the path
+directly to those constructors for memory-mapped views without this copy.
 """
 readfile(bytes::Vector{UInt8}; limits::Limits=Limits()) =
     _readfile(heapregion(bytes), limits, _readbudget(limits, length(bytes)))

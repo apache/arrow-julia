@@ -89,20 +89,20 @@ end
 """
     copy(table::Arrow.Table) -> Arrow.Table
 
-Copy every column into owned, mutable memory (`copy` of each column) and
-retain the schema and dictionary category order. The new table reads nothing
-from the source. As with `copy` on Julia vectors, nested mutable values can
-still be shared.
+Copy every column into owned, mutable memory and retain the schema and dictionary
+category order. Nested Arrow list and map views become vectors too, including within
+structs and tuples, so the new table reads nothing from the source. As with `copy` on
+Julia vectors, nested mutable values that were already materialized can still be shared.
 """
 function Base.copy(t::Table)
     _checkopen(t)
     return _table(
         copy(getfield(t, :names)),
-        AbstractVector[copy(_force(c)) for c in getfield(t, :columns)],
+        AbstractVector[_copycolumn(_force(c)) for c in getfield(t, :columns)],
         getfield(t, :schema),
         AC.OwnerRegion[],
         getfield(t, :nrows),
-        Any[p === nothing ? nothing : copy(p) for p in getfield(t, :retainedpools)],
+        Any[p === nothing ? nothing : _copycolumn(p) for p in getfield(t, :retainedpools)],
     )
 end
 
@@ -1563,13 +1563,21 @@ _opensource(
     budget=nothing,
     ntasks::Int=1,
 ) = _openbytes(bytes; limits=limits, budget=budget, ntasks=ntasks)
-_opensource(
+function _opensource(
     src::Union{IPCStream,ArrowFile};
     mmap::Bool=_MMAP_DEFAULT,
     limits::Limits=_configuredlimits(src),
     budget=nothing,
     ntasks::Int=1,
-) = src
+)
+    src.region.cell.action == C_NULL && return src
+    # Facade columns outlive release!(table). A caller-owned region may free
+    # its memory explicitly, so it cannot back those unguarded views.
+    budget === nothing && (budget = _readbudget(limits, src.region.len))
+    _chargevector!(budget, UInt8, src.region.len, "detached reader source")
+    bytes = AC.slicebytes(AC.BufferSlice(src.region, 0, src.region.len))
+    return _openbytes(bytes; limits, budget, ntasks)
+end
 # A byte-range source is read whole: iteration is sequential over every
 # batch, so there is nothing for range planning to skip.
 function _opensource(
@@ -1905,8 +1913,12 @@ const isnull = Tables.isnull
 
 # Views copy into owned memory, a column of several batches into one vector;
 # columns this read materialized are already owned by nobody else.
-_ownedcolumn(c::Union{ArrowVector,ChainedVector}) = copy(c)
-_ownedcolumn(c) = c
+_ownedcolumn(c::Union{ArrowVector,ChainedVector}) = _copycolumn(c)
+_ownedcolumn(c::AbstractVector{T}) where {T} = _needsowned(c) ? _copyrows(T, c) : c
+
+_copycolumn(c::ArrowVector) = copy(c)
+_copycolumn(c::AbstractVector{T}) where {T} = _needsowned(c) ? _copyrows(T, c) : copy(c)
+_copycolumn(c::ChainedVector{T,<:ArrowVector}) where {T} = copy(c)
 
 # A Table from an opened IPC source: the whole thing, or a scan pushed
 # where the format can prove it and evaluated over the rest.
@@ -2453,6 +2465,7 @@ function Base.iterate(s::Stream, state::NTuple{3,Int}=(1, 0, 0))
     got = _streambatch(s, i, getfield(s, :ntasks))
     got === nothing && return nothing
     b, budget = got
+    _prunepools!(getfield(s, :views), b.columns, budget)
     scan === nothing && return _batchtable(s, b, budget), (i + 1, 0, 0)
     t, skipped, yielded = _scannedbatch(s, b, budget, scan, skipped, yielded)
     return t, (i + 1, skipped, yielded)
@@ -2523,6 +2536,7 @@ function Base.getindex(s::Stream, i::Integer)
     1 <= i <= _nbatches(src) || throw(BoundsError(s, i))
     budget = _batchbudget(src, Int(i))
     b = _batch(src, Int(i), budget, getfield(s, :ntasks))
+    _prunepools!(getfield(s, :views), b.columns, budget)
     scan === nothing && return _batchtable(s, b, budget)
     return first(_scannedbatch(s, b, budget, scan, 0, 0))
 end

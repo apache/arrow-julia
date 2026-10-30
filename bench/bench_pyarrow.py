@@ -15,20 +15,24 @@
 # limitations under the License.
 
 # PyArrow serialize/deserialize timing over the same logical workloads.
-# Reads are pyarrow-idiomatic (memory-mapped read_all): pyarrow defers
-# per-element materialization, so its read numbers measure wrapping, not
-# element conversion — the driver's report states this asymmetry.
-# Usage: run through bench/run.jl, which executes this file with the
-# conformance image's oracle interpreter (/opt/pyarrow/bin/python).
+# Both readers use the Julia-written files. read_all returns Arrow arrays;
+# neither leg times scalar iteration or conversion to Python objects.
+# Usage: bench/run.jl chooses a local Python or the conformance image.
 
-import sys, time, os
+import sys, time, os, math
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
-ROWS_PRIMITIVE = 10_000_000
-ROWS_STRINGS = 2_000_000
-ROWS_LISTS = 1_000_000
-ROWS_DICT = 2_000_000
+SCALE = float(os.environ.get("ARROW_BENCH_SCALE", "1"))
+if not math.isfinite(SCALE) or SCALE <= 0:
+    raise ValueError("ARROW_BENCH_SCALE must be positive and finite")
+ROWS_PRIMITIVE = max(1, round(10_000_000 * SCALE))
+ROWS_STRINGS = max(1, round(2_000_000 * SCALE))
+ROWS_LISTS = max(1, round(1_000_000 * SCALE))
+ROWS_DICT = max(1, round(2_000_000 * SCALE))
+BATCHSIZE = 1_048_576
+THREADS = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+pa.set_cpu_count(THREADS)
 
 
 def wl_primitive():
@@ -63,7 +67,7 @@ def wl_lists():
 
 def wl_dictpool():
     # Plain strings: dictionary_encode runs INSIDE the write timer so all
-    # three legs time pool construction + dictionary write.
+    # both legs time pool construction + dictionary write.
     n = ROWS_DICT
     return pa.table({"d": pa.array("cat-%d" % (i % 32)
                                    for i in range(1, n + 1))})
@@ -78,10 +82,12 @@ WORKLOADS = [
 ]
 
 
-def bench(f, runs=3):
+def bench(f, runs=3, setup=lambda: None):
+    setup()
     f()
     ts = []
     for _ in range(runs):
+        setup()
         t0 = time.perf_counter()
         f()
         ts.append(time.perf_counter() - t0)
@@ -100,19 +106,30 @@ def main(outdir):
                 out = pa.table({"d": tbl["d"].combine_chunks()
                                 .dictionary_encode()})
             with ipc.new_file(path, out.schema) as w:
-                w.write_table(out)
+                w.write_table(out, max_chunksize=BATCHSIZE)
 
-        twrite = bench(write)
+        def fresh():
+            if os.path.exists(path):
+                os.remove(path)
+
+        twrite = bench(write, setup=fresh)
         size = os.path.getsize(path)
+        inputpath = os.path.join(outdir, "rewrite-%s.arrow" % name)
 
         def read():
-            with pa.memory_map(path) as src:
-                ipc.open_file(src).read_all()
+            with pa.memory_map(inputpath) as src:
+                return ipc.open_file(
+                    src, options=ipc.IpcReadOptions(use_threads=THREADS > 1)
+                ).read_all()
 
         tread = bench(read)
+        # Cast dictionary columns back to their plain-string input domain.
+        if not read().cast(tbl.schema).equals(tbl):
+            raise AssertionError("round-trip mismatch in %s" % name)
         for op, secs in (("write", twrite), ("read", tread)):
+            nbytes = size if op == "write" else os.path.getsize(inputpath)
             print('{"impl":"pyarrow","workload":"%s","op":"%s",'
-                  '"seconds":%r,"bytes":%d}' % (name, op, secs, size))
+                  '"seconds":%r,"bytes":%d}' % (name, op, secs, nbytes))
 
 
 main(sys.argv[1])

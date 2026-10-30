@@ -19,15 +19,12 @@
 #
 #   julia --project=. bench/run.jl [workdir]
 #
-# Legs run in their own processes (PyArrow inside the conformance image
-# when docker is available — skipped cleanly otherwise). Results print as
-# a markdown table of seconds and throughput.
+# Legs run in separate processes on the host when PyArrow is installed.
+# The conformance image is a fallback. Results print seconds and throughput.
 #
-# READ SEMANTICS DIFFER BY DESIGN, so read rows are not like-for-like:
-#   rewrite  = full structural+semantic validation + materialized Julia
-#              Vectors (the facade contract)
-#   pyarrow  = memory-mapped wrap only; per-element work is deferred
-# Write rows ARE like-for-like: table in memory -> IPC file on disk.
+# Both readers open the Julia-written files and return native columns.
+# Arrow.jl also validates buffers and builds DataStrings payloads; PyArrow
+# generally wraps buffers. Neither times scalar iteration or mutable copies.
 
 function _runleg(cmd::Cmd, out::String)
     open(out, "w") do io
@@ -45,20 +42,34 @@ function main(workdir::String)
     here = @__DIR__
     repo = dirname(here)
     legs = Tuple{String,String}[]
+    threads = Threads.nthreads()
+    scale = get(ENV, "ARROW_BENCH_SCALE", "1")
+    println("Julia $(VERSION), $threads threads; ARROW_BENCH_SCALE=$scale")
 
     rewriteout = joinpath(workdir, "rewrite.jsonl")
     rewritescript = joinpath(here, "bench_rewrite.jl")
     _runleg(
-        `$(Base.julia_cmd()) --startup-file=no --project=$repo $rewritescript $workdir`,
+        `$(Base.julia_cmd()) --startup-file=no --threads=$threads --project=$repo $rewritescript $workdir`,
         rewriteout,
     )
     push!(legs, ("rewrite", rewriteout))
 
     pyout = joinpath(workdir, "pyarrow.jsonl")
-    # The pyarrow leg runs the conformance image's oracle interpreter
-    # (build it once with `julia conformance/run.jl`).
+    python = get(ENV, "ARROW_BENCH_PYTHON", something(Sys.which("python3"), "python3"))
+    havepython = try
+        success(pipeline(`$python -c "import pyarrow"`; stdout=devnull, stderr=devnull))
+    catch
+        false
+    end
+    !havepython &&
+        haskey(ENV, "ARROW_BENCH_PYTHON") &&
+        error("ARROW_BENCH_PYTHON must name a Python executable with pyarrow installed")
+    # A container is useful for smoke checks, but its IO and CPU scheduling
+    # differ from the host Julia process. Prefer a local Python for timings.
     havedocker =
-        Sys.which("docker") !== nothing && try
+        !havepython &&
+        Sys.which("docker") !== nothing &&
+        try
             success(
                 pipeline(
                     `docker image inspect arrow-julia-conformance:latest`;
@@ -69,16 +80,26 @@ function main(workdir::String)
         catch
             false
         end
-    if havedocker
+    if havepython
+        version = readchomp(`$python -c "import pyarrow; print(pyarrow.__version__)"`)
+        println("PyArrow $version, $threads threads, host Python: $python")
+        _runleg(`$python $(joinpath(here, "bench_pyarrow.py")) $workdir $threads`, pyout)
+        push!(legs, ("pyarrow", pyout))
+    elseif havedocker
         image = "arrow-julia-conformance:latest"
         python = "/opt/pyarrow/bin/python"
+        println(
+            "PyArrow runs in Docker; host/container timing ratios are not directly comparable.",
+        )
         _runleg(
-            `docker run --rm -v $workdir:/bench -v $here:/src $image $python /src/bench_pyarrow.py /bench`,
+            `docker run --rm -e ARROW_BENCH_SCALE=$scale -v $workdir:/bench -v $here:/src $image $python /src/bench_pyarrow.py /bench $threads`,
             pyout,
         )
         push!(legs, ("pyarrow", pyout))
     else
-        println("(pyarrow leg skipped: conformance docker image not available)")
+        println(
+            "(pyarrow leg skipped: neither host PyArrow nor the conformance Docker image is available)",
+        )
     end
 
     # Minimal JSONL field extraction; the emitters write flat one-line
@@ -100,9 +121,13 @@ function main(workdir::String)
     end
 
     println()
-    println("READ ROWS ARE NOT LIKE-FOR-LIKE: rewrite = validate + fully")
-    println("materialized Julia Vectors; pyarrow = memory-mapped wrap only,")
-    println("all per-element work deferred. Write rows are like-for-like.")
+    println("Reads use the same memory-mapped files and request every column.")
+    println(
+        "Arrow.jl validates buffers and builds string payloads; PyArrow generally wraps buffers.",
+    )
+    println(
+        "Neither read times scalar iteration or mutable copies. Writes use fresh destinations.",
+    )
     println()
     println(
         "| workload | op | " *

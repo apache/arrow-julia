@@ -16,6 +16,7 @@
 
 module DetachedValuesTests
 using Test, Arrow, Serialization, Tables
+using DataDecimals: Decimal
 const AC = Arrow.ArrowCore
 
 function roundtrip(x)
@@ -151,6 +152,74 @@ end
         tc.x[1] = 99
         @test want.x[1] == ts.x[1] == 1
     end
+end
+
+@testset "nested public values detach from input buffers" begin
+    D = Decimal{20,2,Int128}
+    a, b = D("1.25"), D("2.50")
+    cases = (
+        [[a, b], D[]],
+        [[[a], [b]], Vector{D}[]],
+        [(amount=a, values=[a, b]), (amount=b, values=D[])],
+        [([a], [b]), (D[], [a])],
+        [["key" => [a], "key" => [b]], ["empty" => D[]]],
+        Union{Missing,Vector{D}}[missing, [a, b]],
+        Union{Int,Vector{D}}[1, [a, b]],
+    )
+    for values in cases, batchsize in (1, 64)
+        bytes = take!(Arrow.tobuffer((; x=values); batchsize))
+        table = Arrow.Table(bytes)
+        copied = copy(table)
+        saved = roundtrip(table)
+        readcopy = Arrow.read(bytes, Tables.columntable)
+        fill!(bytes, 0)
+        for result in (copied, saved, readcopy)
+            @test isequal(result.x, values)
+            rewritten = Arrow.Table(take!(Arrow.tobuffer(result)))
+            @test isequal(copy(rewritten).x, values)
+        end
+    end
+    for batchsize in (1, 64)
+        values = [[a], [b], [a]]
+        bytes = take!(Arrow.tobuffer((; x=Arrow.DictEncode(values)); batchsize))
+        table = Arrow.Table(bytes)
+        copied, saved = copy(table), roundtrip(table)
+        fill!(bytes, 0)
+        @test copied.x == saved.x == values
+        @test copied.x[1] isa Vector{D}
+        @test copy(Arrow.Table(take!(Arrow.tobuffer(copied)))).x == values
+    end
+
+    # Empty nested columns use the same owned element types as nonempty ones.
+    empty = Arrow.Table(take!(Arrow.tobuffer((; x=Vector{Vector{D}}[]))))
+    @test eltype(copy(empty).x) === Vector{Vector{D}}
+    @test eltype(roundtrip(empty).x) === Vector{Vector{D}}
+
+    # Type overrides can box a borrowed row behind Any or an abstract container.
+    boxed = (
+        ([[a, b]], Any),
+        ([[a, b]], AbstractVector),
+        ([[a, b]], AbstractVector{D}),
+        ([(values=[a, b],)], NamedTuple),
+        ([([a], [b])], Tuple),
+    )
+    for (values, target) in boxed
+        bytes = take!(Arrow.tobuffer((; x=values)))
+        select = [:x => target]
+        table = Arrow.Table(bytes; select)
+        copied, saved = copy(table), roundtrip(table)
+        readcopy = Arrow.read(bytes, Tables.columntable; select)
+        fill!(bytes, 0)
+        @test copied.x == saved.x == readcopy.x == values
+    end
+    for target in (Any, Tuple, Tuple{Vararg{Int}}, NamedTuple)
+        bytes = take!(Arrow.tobuffer((; x=NamedTuple{(:a,),Tuple{Int}}[])))
+        table = Arrow.Table(bytes; select=[:x => target])
+        @test isempty(copy(table).x)
+        @test isempty(roundtrip(table).x)
+    end
+    materialized = Arrow.Table(take!(Arrow.tobuffer((; x=[Int128[1, 2]]))))
+    @test copy(materialized).x[1] === materialized.x[1]
 end
 
 @testset "Opaque binary metadata" begin

@@ -30,6 +30,23 @@ import DataAPI
 
 const AC = Arrow.ArrowCore
 
+# A producer may refill its buffers once the consumer asks for another partition.
+struct ReusedPartitions{Known,F}
+    values::Vector{Int}
+    count::Int
+    before_next::F
+end
+Tables.partitions(p::ReusedPartitions) = p
+Base.IteratorSize(::Type{<:ReusedPartitions{true}}) = Base.HasLength()
+Base.IteratorSize(::Type{<:ReusedPartitions{false}}) = Base.SizeUnknown()
+Base.length(p::ReusedPartitions) = p.count
+function Base.iterate(p::ReusedPartitions, i=1)
+    p.before_next(i)
+    i > p.count && return nothing
+    fill!(p.values, i)
+    return (; a=p.values), i + 1
+end
+
 # The IPC messages of a stream, or of a file's message section.
 function framedmessages(bytes)
     if bytes[1:6] == b"ARROW1"
@@ -54,6 +71,47 @@ batchkinds(bytes) = [
 @testset "incremental writer and append" begin
     t1 = (; a=Int64[1, 2], b=["x", "y"])
     t2 = (; a=Int64[3, 4], b=["z", "w"])
+
+    @testset "partitions publish before their buffers are reused" begin
+        for known in (false, true),
+            file in (false, true),
+            compress in (nothing, :lz4, :zstd)
+
+            io = IOBuffer()
+            part = ReusedPartitions{known,typeof(identity)}(zeros(Int, 32_768), 3, identity)
+            Arrow.write(io, part; file, compress, ntasks=4)
+            @test collect(Arrow.Table(take!(io)).a) == repeat(1:3; inner=32_768)
+        end
+
+        # The producer can depend on the previous batch already being available.
+        io = IOBuffer()
+        before_next = function (i)
+            i == 1 && return
+            pos = position(io)
+            seekstart(io)
+            bytes = read(io)
+            seek(io, pos)
+            @test collect(Arrow.Table(bytes).a) == repeat(1:(i - 1); inner=2)
+        end
+        part = ReusedPartitions{false,typeof(before_next)}([0, 0], 3, before_next)
+        Arrow.write(io, part)
+        @test collect(Arrow.Table(take!(io)).a) == [1, 1, 2, 2, 3, 3]
+
+        # Unknown-length inputs declare nullable fields without reading ahead,
+        # even when this particular iteration happens to yield just one table.
+        for known in (false, true)
+            part = ReusedPartitions{known,typeof(identity)}([0, 0], 1, identity)
+            table = Arrow.Table(take!(Arrow.tobuffer(part)))
+            @test eltype(table.a) === (known ? Int : Union{Missing,Int})
+        end
+
+        for compress in (nothing, :lz4, :zstd)
+            io = Arrow.tobuffer((; a=[0, 0]))
+            part = ReusedPartitions{false,typeof(identity)}([0, 0], 3, identity)
+            Arrow.append(io, part; compress)
+            @test collect(Arrow.Table(take!(io)).a) == [0, 0, 1, 1, 2, 2, 3, 3]
+        end
+    end
 
     @testset "multi-write output is byte-identical to the eager writer" begin
         for file in (true, false), compress in (nothing, :zstd)

@@ -6632,6 +6632,8 @@ function _writerstorageequal(left, right, depth::Int=0)
         return typeof(left) === typeof(right) && left === right
     end
     typeof(left) === typeof(right) || return false
+    # Primitive types have no fields; their bits still distinguish values.
+    isprimitivetype(typeof(left)) && return left === right
     # Mutable values have no structural identity we may trust; compare by
     # reference and hash by objectid, so equal-but-distinct mutables stay
     # separate categories.
@@ -6701,6 +6703,7 @@ function _writerstoragehash(value, seed::UInt, depth::Int=0)
         return hash(value, hash(typeof(value), hash(UInt8(0x0a), seed)))
     end
     h = hash(typeof(value), hash(UInt8(0x0b), seed))
+    isprimitivetype(typeof(value)) && return hash(objectid(value), h)
     # Mutables hash by objectid, matching _writerstorageequal's `===` rule.
     Base.ismutabletype(typeof(value)) && return hash(objectid(value), h)
     for i = 1:fieldcount(typeof(value))

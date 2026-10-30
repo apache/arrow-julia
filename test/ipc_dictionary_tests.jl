@@ -16,10 +16,13 @@
 
 module IPCDictionaryTests
 
-using Test, Arrow, Tables
+using Test, Arrow, Tables, DataDecimals, UUIDs
 const AC = Arrow.AC
 const Meta = Arrow.Meta
 const FB = Arrow.FB
+primitive type PrimitiveCode 16 end
+Arrow.ArrowTypes.ArrowType(::Type{PrimitiveCode}) = Int16
+Arrow.ArrowTypes.toarrow(value::PrimitiveCode) = reinterpret(Int16, value)
 # Reuse the property suite's module in the full run: loading it twice
 # overwrites its global ArrowTypes extension registrations.
 const Fuzz = if isdefined(parentmodule(@__MODULE__), :PropertyTests)
@@ -109,6 +112,47 @@ function fixture(vf, events; file=false, features=Int64[], compress=:none)
         Arrow.abortwrite!(state)
     end
     return take!(io)
+end
+
+function firstpool(reader)
+    batch, _ = Arrow._nextrecord!(reader, 1)
+    return WeakRef(batch.columns[1].dictionary)
+end
+
+function discardrecord!(reader)
+    Arrow._nextrecord!(reader, 1)
+    return nothing
+end
+
+function writepool!(state, value)
+    _, column = AC.fromjulia_dict("a", [value], Int32[0])
+    Arrow.writebatch!(state, AC.RecordBatch(state.schema, [column], 1))
+    return WeakRef(column.dictionary)
+end
+
+@testset "stream dictionary history can be collected" begin
+    vf, pool = AC.fromjulia("pool", Int64[1])
+    _, replacement = AC.fromjulia("pool", Int64[2])
+    for delta in (false, true)
+        bytes = fixture(vf, [(false, pool, [0]), (delta, replacement, [delta ? 1 : 0])])
+        reader = Arrow._openstream(IOBuffer(bytes))
+        previous = firstpool(reader)
+        discardrecord!(reader)
+        GC.gc(true)
+        @test previous.value === nothing
+    end
+    field, _ = AC.fromjulia_dict("a", Int64[], Int32[])
+    state =
+        Arrow.beginwrite!(IOBuffer(), AC.Schema([field]); file=false, dictreplacement=true)
+    try
+        previous = writepool!(state, 1)
+        writepool!(state, 2)
+        GC.gc(true)
+        @test previous.value === nothing
+        Arrow.finishwrite!(state)
+    finally
+        Arrow.abortwrite!(state)
+    end
 end
 
 @testset "PyArrow dictionary updates" begin
@@ -375,6 +419,236 @@ end
     core = Arrow.readstream(fixture(f, [(false, pool, [0, 1]), (true, pool, [2, 3])]))
     combined = core.batches[2].columns[1].dictionary
     @test AC.slicebytes(AC.rolebuffer(combined, AC.TYPE_IDS)) == UInt8[7, 3, 7, 3]
+end
+
+@testset "Dictionary pool equality retains nested Union routes" begin
+    leftfield, left = AC.fromjulia("left", Int64[1])
+    rightfield, right = AC.fromjulia("right", Int64[1])
+    uniontype = AC.UnionType(AC.DenseMode, Int8[3, 7])
+    unionfield = AC.Field("values", uniontype; children=[leftfield, rightfield])
+    unionpool(tag) = AC.ArrayData(
+        uniontype,
+        1,
+        [AC._databuffer(Int8[tag]), AC._databuffer(Int32[0])];
+        children=[left, right],
+        nullcount=0,
+    )
+    a, b = unionpool(3), unionpool(7)
+    cases = [(unionfield, a, b)]
+    for type in (
+        AC.StructType(),
+        AC.ListType(false),
+        AC.ListType(true),
+        AC.FixedSizeListType(1),
+        AC.ListViewType(false),
+        AC.ListViewType(true),
+    )
+        field = AC.Field("container", type; children=[unionfield])
+        buffers = if type isa AC.StructType || type isa AC.FixedSizeListType
+            [AC.BufferSlice()]
+        elseif type isa AC.ListViewType
+            Offset = type.large ? Int64 : Int32
+            [AC.BufferSlice(), AC._databuffer(Offset[0]), AC._databuffer(Offset[1])]
+        else
+            Offset = type.large ? Int64 : Int32
+            [AC.BufferSlice(), AC._databuffer(Offset[0, 1])]
+        end
+        wrap(pool) = AC.ArrayData(type, 1, buffers; children=[pool], nullcount=0)
+        push!(cases, (field, wrap(a), wrap(b)))
+    end
+    runfield, runends = AC.fromjulia("run_ends", Int32[2])
+    reetype = AC.RunEndEncodedType()
+    reefield = AC.Field("runs", reetype; children=[runfield, unionfield])
+    ree(pool) =
+        AC.ArrayData(reetype, 2, AC.BufferSlice[]; children=[runends, pool], nullcount=0)
+    push!(cases, (reefield, ree(a), ree(b)))
+    keyfield, keys = AC.fromjulia("key", Int64[1])
+    entriesfield = AC.Field(
+        "entries",
+        AC.StructType();
+        nullable=false,
+        children=[keyfield, unionfield],
+    )
+    mapfield = AC.Field("map", AC.MapType(false); children=[entriesfield])
+    map(pool) = AC.ArrayData(
+        mapfield.type,
+        1,
+        [AC.BufferSlice(), AC._databuffer(Int32[0, 1])];
+        children=[
+            AC.ArrayData(
+                entriesfield.type,
+                1,
+                [AC.BufferSlice()];
+                children=[keys, pool],
+                nullcount=0,
+            ),
+        ],
+        nullcount=0,
+    )
+    push!(cases, (mapfield, map(a), map(b)))
+    dicttype = AC.DictionaryType(AC.IntType(8, true), uniontype, false)
+    dictfield = AC.Field("item", dicttype; children=unionfield.children)
+    listfield = AC.Field("list", AC.ListType(false); children=[dictfield])
+    nested(pool) = AC.ArrayData(
+        listfield.type,
+        1,
+        [AC.BufferSlice(), AC._databuffer(Int32[0, 1])];
+        children=[
+            AC.ArrayData(
+                dicttype,
+                1,
+                [AC.BufferSlice(), AC._databuffer(Int8[0])];
+                dictionary=pool,
+                nullcount=0,
+            ),
+        ],
+        nullcount=0,
+    )
+    push!(cases, (listfield, nested(a), nested(b)))
+    for (vf, first, changed) in cases
+        @test isequal(AC.materialize(vf, first), AC.materialize(vf, changed))
+        @test Arrow._poolsequal(vf, first, copy(first))
+        @test !Arrow._poolsequal(vf, first, changed)
+        type = AC.DictionaryType(AC.IntType(32, true), vf.type, false)
+        field = AC.Field("a", type; children=vf.children)
+        schema = AC.Schema([field])
+        batch(pool) = AC.RecordBatch(
+            schema,
+            [
+                AC.ArrayData(
+                    type,
+                    1,
+                    [AC.BufferSlice(), AC._databuffer(Int32[0])];
+                    dictionary=pool,
+                    nullcount=0,
+                ),
+            ],
+            1,
+        )
+        for file in (false, true)
+            io = IOBuffer()
+            state = Arrow.beginwrite!(io, schema; file)
+            try
+                Arrow.writebatch!(state, batch(first))
+                Arrow.writebatch!(state, batch(copy(first)))
+                before = position(io)
+                @test_throws AC.ValidationError Arrow.writebatch!(state, batch(changed))
+                @test position(io) == before
+                Arrow.finishwrite!(state)
+                @test Tables.rowcount(Arrow.Table(take!(io))) == 2
+            finally
+                Arrow.abortwrite!(state)
+            end
+        end
+    end
+end
+
+@testset "Dictionary categories preserve primitive bits" begin
+    D = Decimal{20,2,Int128}
+    decimals = D[D("1.25"), D("2.50"), D("1.25")]
+    for values in (
+            Int128[1, 2, 1],
+            UInt128[1, 2, 1],
+            UUID.(UInt128[1, 2, 1]),
+            decimals,
+            [[x] for x in decimals],
+        ),
+        file in (false, true),
+        batchsize in (1, 64)
+
+        bytes = take!(Arrow.tobuffer((x=Arrow.DictEncode(values),); file, batchsize))
+        @test Arrow.Table(bytes).x == values
+    end
+    codes = reinterpret(PrimitiveCode, Int16[1, 2, 1])
+    bytes = take!(Arrow.tobuffer((x=Arrow.DictEncode(codes),)))
+    @test Arrow.Table(bytes).x == Int16[1, 2, 1]
+end
+
+@testset "Dictionary pool updates preserve NaN payloads" begin
+    for (F, U, bits) in (
+        (Float16, UInt16, 0x7e01),
+        (Float32, UInt32, 0x7fc00001),
+        (Float64, UInt64, 0x7ff8000000000001),
+    )
+        valuefield, initial = AC.fromjulia("values", F[reinterpret(F, bits)])
+        _, changed = AC.fromjulia("values", F[reinterpret(F, bits + U(1))])
+        type = AC.DictionaryType(AC.IntType(8, true), valuefield.type, false)
+        field = AC.Field("a", type; nullable=false)
+        schema = AC.Schema([field])
+        batch(pool) = AC.RecordBatch(
+            schema,
+            [
+                AC.ArrayData(
+                    type,
+                    1,
+                    [AC.BufferSlice(), AC._databuffer(Int8[0])];
+                    dictionary=pool,
+                    nullcount=0,
+                ),
+            ],
+            1,
+        )
+        @test !Arrow._poolsequal(valuefield, initial, changed)
+        bytes = Arrow.writestream(schema, [batch(initial), batch(changed)])
+        @test reinterpret(U, collect(F, Arrow.Table(bytes).a)) == U[bits, bits + U(1)]
+        for file in (false, true)
+            io = IOBuffer()
+            state = Arrow.beginwrite!(io, schema; file)
+            try
+                Arrow.writebatch!(state, batch(initial))
+                Arrow.writebatch!(state, batch(copy(initial)))
+                before = position(io)
+                @test_throws AC.ValidationError Arrow.writebatch!(state, batch(changed))
+                @test position(io) == before
+                Arrow.finishwrite!(state)
+                @test reinterpret(U, collect(F, Arrow.Table(take!(io)).a)) == U[bits, bits]
+            finally
+                Arrow.abortwrite!(state)
+            end
+        end
+    end
+end
+
+@testset "Null pools and growing Union pools" begin
+    nullfield = AC.Field("null", AC.NullType())
+    nullpool = AC.ArrayData(nullfield.type, 1, AC.BufferSlice[]; nullcount=1)
+    @test Arrow._poolsequal(nullfield, nullpool, copy(nullpool))
+    leftfield, left = AC.fromjulia("left", [[Int64(1)]])
+    rightfield, right = AC.fromjulia("right", [[Int64(1)]])
+    uniontype = AC.UnionType(AC.DenseMode, Int8[3, 7])
+    valuefield = AC.Field("pool", uniontype; children=[leftfield, rightfield])
+    pool(tags) = AC.ArrayData(
+        uniontype,
+        length(tags),
+        [AC._databuffer(tags), AC._databuffer(zeros(Int32, length(tags)))];
+        children=[left, right],
+        nullcount=0,
+    )
+    type = AC.DictionaryType(AC.IntType(32, true), uniontype, false)
+    field = AC.Field("a", type; children=valuefield.children)
+    schema = AC.Schema([field])
+    batch(values) = AC.RecordBatch(
+        schema,
+        [
+            AC.ArrayData(
+                type,
+                1,
+                [AC.BufferSlice(), AC._databuffer(Int32[0])];
+                dictionary=values,
+                nullcount=0,
+            ),
+        ],
+        1,
+    )
+    initial, grown = pool(Int8[3]), pool(Int8[3, 7])
+    bytes = Arrow.writefile(schema, [batch(initial), batch(grown)])
+    result = Arrow.readfile(bytes)[2].columns[1].dictionary
+    @test Arrow._poolsequal(valuefield, grown, result)
+    @test AC.slicebytes(AC.rolebuffer(result, AC.TYPE_IDS)) == UInt8[3, 7]
+    @test_throws AC.ValidationError Arrow.writefile(
+        schema,
+        [batch(initial), batch(pool(Int8[7, 3]))],
+    )
 end
 
 @testset "Dictionary delta limits and malformed payloads" begin

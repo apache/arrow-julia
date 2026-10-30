@@ -16,12 +16,17 @@
 
 # Shared workload definitions for the serialize/deserialize benchmarks.
 # Deterministic arithmetic data — every implementation
-# builds the same logical tables, so file sizes and work agree.
+# builds the same logical tables. The driver reads the Julia-written files
+# in both implementations; writers may choose different physical layouts.
 
-const BENCH_ROWS_PRIMITIVE = 10_000_000
-const BENCH_ROWS_STRINGS = 2_000_000
-const BENCH_ROWS_LISTS = 1_000_000
-const BENCH_ROWS_DICT = 2_000_000
+const BENCH_SCALE = parse(Float64, get(ENV, "ARROW_BENCH_SCALE", "1"))
+isfinite(BENCH_SCALE) && BENCH_SCALE > 0 ||
+    error("ARROW_BENCH_SCALE must be positive and finite")
+const BENCH_ROWS_PRIMITIVE = max(1, round(Int, 10_000_000 * BENCH_SCALE))
+const BENCH_ROWS_STRINGS = max(1, round(Int, 2_000_000 * BENCH_SCALE))
+const BENCH_ROWS_LISTS = max(1, round(Int, 1_000_000 * BENCH_SCALE))
+const BENCH_ROWS_DICT = max(1, round(Int, 2_000_000 * BENCH_SCALE))
+const BENCH_BATCHSIZE = 1_048_576
 
 function workload_primitive()
     n = BENCH_ROWS_PRIMITIVE
@@ -63,10 +68,12 @@ const BENCH_WORKLOADS = (
 )
 
 "Median-of-k timing after one warmup run."
-function bench_time(f::F; runs::Int=3) where {F}
+function bench_time(f::F; runs::Int=3, setup=() -> nothing) where {F}
+    setup()
     f()
     times = Float64[]
     for _ = 1:runs
+        setup()
         t0 = time_ns()
         f()
         push!(times, (time_ns() - t0) / 1e9)

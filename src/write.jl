@@ -45,9 +45,10 @@ include("columnconstruction.jl")
     Arrow.write(sink; kwargs...)
 
 Write any Tables.jl source as Arrow IPC to `sink`, a file path or an `IO`, and
-return `sink`. Any other `sink` that `open(sink, "w")` accepts, such as a
-FilePathsBase.jl path, gets the file format as a path does, written in place through
-the `IO` that `open` returns. The one-argument form curries:
+return `sink`. A FilePathsBase.jl `SystemPath` has the same behavior as a string path,
+including atomic replacement. Any other `sink` that `open(sink, "w")` accepts gets the
+file format, written in place through the `IO` that `open` returns. The one-argument
+form curries:
 `table |> Arrow.write(sink)`.
 
 Keywords:
@@ -103,7 +104,8 @@ source such as `CSV.Chunks` writes in about one partition's memory. A
 partition with no rows adds no record batch, so a table with no rows writes
 its schema alone, as pyarrow writes one. One
 partition declares each field's nullability from its element type; several
-partitions take their schema from the first, with every field nullable, and
+partitions, or an iterator whose length is unknown, take their schema from the first,
+with every field nullable, and
 later partitions conform to it as later tables of an [`Arrow.Writer`](@ref)
 do. So a several-partition source of non-missing values reads back with
 `Union{Missing,T}` element types, as pyarrow and Polars write it. If writing
@@ -148,8 +150,8 @@ end
 # complete. A live Arrow.Table or Arrow.Stream that memory-maps the old file
 # keeps reading the old inode, and a failed write leaves the old file as it
 # was. New paths and non-regular files (FIFOs, devices) are written in place,
-# as is any other object that `open(x, "w")` accepts (a FilePathsBase path,
-# AWSS3's `S3Path`), as Arrow 2.x wrote them.
+# as is any other object that `open(x, "w")` accepts (AWSS3's `S3Path`, for
+# example). The FilePathsBase extension sends local paths through `_openpath`.
 struct _PathSink
     io::IO
     path::String                # the destination, symlinks resolved
@@ -320,8 +322,8 @@ mutable struct Writer
     const nullable::Bool
     const dictencode::Any
     const ntasks::Int
-    # Arrow.write's writer: nullability and dictionary index types come from
-    # the input (one partition or several) instead of the Writer rules.
+    # Arrow.write keeps input nullability and index types for a known
+    # single partition; other sources allow later partitions to extend them.
     const oneshot::Bool
     # The buffers each batch's columns rebuild, reused batch to batch.
     const pool::_BufferPool
@@ -472,24 +474,26 @@ Base.@nospecializeinfer function _writeparts!(w::Writer, @nospecialize(tbl))
             _beginwrite!(w, first(_schemaonly(retained, w.colmetadata)), retained)
         return nothing
     end
-    part, state = next
-    next = iterate(parts, state)
-    # Several partitions: their schema comes from the first, every field
-    # nullable, and dictionaries may grow, as for an Arrow.Writer.
-    several = next !== nothing
+    # An unknown-length source may have later partitions. Do not fetch one
+    # to find out: iterators may reuse their column buffers or wait for the
+    # current batch to reach the consumer before producing another.
+    knownlength = Base.IteratorSize(typeof(parts)) isa Union{Base.HasLength,Base.HasShape}
+    several = !knownlength || length(parts) != 1
     k = 1
     try
         while true
+            part, state = next
             try
                 _writepartition!(w, part, retained, several)
+                # Compression tasks may still read the partition's buffers.
+                w.st === nothing || drainwrite!(w.st)
             catch err
                 err isa _InvalidUTF8 || rethrow()
                 msg = _invalidutf8message(err.column, err.row, several ? k : 0)
                 throw(ArgumentError(msg))
             end
-            next === nothing && break
-            part, state = next
             next = iterate(parts, state)
+            next === nothing && break
             k += 1
         end
     catch
@@ -501,8 +505,6 @@ Base.@nospecializeinfer function _writeparts!(w::Writer, @nospecialize(tbl))
         end
         rethrow()
     end
-    # A table's batches are published before its write returns.
-    w.st === nothing || drainwrite!(w.st)
     return nothing
 end
 
@@ -775,7 +777,7 @@ function _eachbatch(f::F, cols::Vector{AbstractVector}, n::Int, batchsize::Int) 
                 _InvalidUTF8(err.column, 0, err.row == 0 ? 0 : first(r) - 1 + err.row),
             )
             err isa _OffsetOverflow || rethrow()
-            size = only(_shrinkbatches!([size], [(1, r)], err))
+            size = min(size, _smallerbatch(length(r), err))
             continue
         end
         start = last(r) + 1
@@ -898,33 +900,20 @@ function _appendbytes(
     # New messages start where the last framed message ends: over the
     # end-of-stream marker when the stream has one, else at the end.
     keep = last(msgs).body.offset + last(msgs).body.len
-    names, partcols, partpools, rowcounts = _collectparts(tbl)
-    namesmatch =
-        length(names) == length(sch.fields) &&
-        all(j -> String(names[j]) == sch.fields[j].name, eachindex(names))
-    # A partition-free source (a zero-batch Arrow.Stream) appends nothing.
-    isempty(partcols) ||
-        namesmatch ||
-        throw(
-            ArgumentError(
-                "table column names $(names) do not match the existing stream's " *
-                "schema fields $([f.name for f in sch.fields]) (same names, same order)",
-            ),
-        )
-    # Dictionary columns extend the stream's latest categories; a delta
-    # dictionary batch carries the new ones.
-    hints = _extendpools(_streampools(s), partpools)
-    written = Any[
-        f.type isa AC.DictionaryType ? get(s.dictionaries, s.fielddictids[f], nothing) :
-        nothing for f in sch.fields
-    ]
-    fields, coldata, batchrows =
-        _constructbatches(partcols, hints, rowcounts, batchsize) do cols, pools
-            _constructconforming(names, cols, pools, sch, tbl; written)
-        end
-    batchsch = AC.Schema(fields; metadata=sch.metadata)
     io = IOBuffer()
-    st = resumestream!(
+    w = _writer(
+        io;
+        file=false,
+        compress,
+        compresslevel,
+        batchsize,
+        dictdeltas,
+        dictreplacement=FEATURE_DICTIONARY_REPLACEMENT in features,
+        ntasks=1,
+    )
+    w.schema = sch
+    w.names = Symbol[_fieldsymbol(f.name) for f in sch.fields]
+    w.st = resumestream!(
         io,
         sch,
         s.fielddictids,
@@ -934,15 +923,9 @@ function _appendbytes(
         current=s.dictionaries,
         growth=dictdeltas ? :delta : :replace,
     )
-    try
-        for batch in _tablebatches(batchsch, coldata, batchrows)
-            deltas = _uninferred(_dictionarydeltas, st, batch)::Dict{Int64,AC.ArrayData}
-            writebatch!(st, batch; deltas)
-        end
-        finishwrite!(st)
-    finally
-        abortwrite!(st)
-    end
+    # Build the tail before touching the destination, using the same
+    # partition ownership and schema rules as an incremental write.
+    _writeall!(w, tbl)
     return keep, take!(io)
 end
 
@@ -958,26 +941,6 @@ function _writtenpools(st::IPCWriteState)
     ]
 end
 
-"The latest categories of each top-level dictionary column of a stream."
-function _streampools(s::IPCStream)
-    ctx = _ArrowTypesContext(; warn=false)
-    return Any[
-        f.type isa AC.DictionaryType ?
-        _retainedsnapshotpool(f, get(s.dictionaries, s.fielddictids[f], nothing), ctx) :
-        nothing for f in s.schema.fields
-    ]
-end
-
-# Pool hints for each partition: the categories written so far, followed by
-# any categories the partition retains from its own source.
-function _extendpools(pools::Vector{Any}, partpools)
-    return Any[
-        Any[
-            _extendpool(pools[j], own === nothing ? nothing : own[j]) for
-            j in eachindex(pools)
-        ] for own in partpools
-    ]
-end
 function _extendpool(written, own)
     written === nothing && return own
     own === nothing && return written
@@ -1000,8 +963,8 @@ function _dictionarydeltas(current, fields, ids, batch::AC.RecordBatch)
         (old === nothing || old === pool || pool.len <= old.len) && continue
         haskey(deltas, id) && continue
         vf = AC.dictvaluefield(f, f.type::AC.DictionaryType)
+        _poolrangeequal(vf, old, Int64(0), pool, Int64(0), old.len) || continue
         stored = _writerstoredcolumn(vf, pool)
-        isequal(_writerstoredcolumn(vf, old), stored[1:(old.len)]) || continue
         _, delta = _rebuildwriterstorageselection(
             vf,
             stored,
@@ -1177,59 +1140,8 @@ function _dictencodeflags(names::Vector{Symbol}, dictencode)
     return Bool[n in wanted for n in names]
 end
 
-"""
-Construct columns over record batches of at most `batchsize` rows: each
-partition is cut into consecutive row ranges, and `construct(cols, pools)`
-builds every column across those batches. A builder with 32-bit offsets
-whose data would pass the Int32 range throws `_OffsetOverflow`; the batches
-are then cut smaller and construction restarts, so the declared types never
-change. Returns the fields, the column data, and the row count per batch.
-"""
-function _constructbatches(
-    construct::F,
-    partcols,
-    partpools,
-    rowcounts,
-    batchsize::Int,
-) where {F}
-    sizes = fill(batchsize, length(rowcounts))
-    while true
-        plan = _batchplan(rowcounts, sizes)
-        cols = Vector{AbstractVector}[
-            AbstractVector[_rowslice(col, r) for col in partcols[p]] for (p, r) in plan
-        ]
-        pools = Any[partpools[p] for (p, _) in plan]
-        try
-            fields, coldata = construct(cols, pools)
-            return fields, coldata, Int[length(r) for (_, r) in plan]
-        catch err
-            if err isa _InvalidUTF8
-                p, r = plan[err.part]
-                row = err.row == 0 ? 0 : first(r) - 1 + err.row
-                partition = length(rowcounts) > 1 ? p : 0
-                throw(ArgumentError(_invalidutf8message(err.column, row, partition)))
-            end
-            err isa _OffsetOverflow || rethrow()
-            _shrinkbatches!(sizes, plan, err)
-        end
-    end
-end
-
-"(partition, rows) of each record batch: consecutive ranges of `sizes[p]` rows."
-function _batchplan(rowcounts, sizes)
-    plan = Tuple{Int,UnitRange{Int}}[]
-    for (p, n) in enumerate(rowcounts)
-        n == 0 && push!(plan, (p, 1:0))
-        for start = 1:sizes[p]:n
-            push!(plan, (p, start:min(start + sizes[p] - 1, n)))
-        end
-    end
-    return plan
-end
-
-# Every partition's batches shrink to the rows that fit before the overflow
-# (half the batch when the row is unknown, as in nested data).
-function _shrinkbatches!(sizes, plan, err::_OffsetOverflow)
+# Cut a batch before the overflowing row (in half when a nested row is unknown).
+function _smallerbatch(n::Int, err::_OffsetOverflow)
     hint = "write it with largelists=true, which declares 64-bit offsets"
     err.part > 0 || throw(
         ArgumentError(
@@ -1237,12 +1149,9 @@ function _shrinkbatches!(sizes, plan, err::_OffsetOverflow)
             "across record batches (a dictionary pool, say); $hint",
         ),
     )
-    _, r = plan[err.part]
-    (length(r) <= 1 || err.row == 1) &&
+    (n <= 1 || err.row == 1) &&
         throw(ArgumentError("column $(err.column) has a value of more than 2 GiB; $hint"))
-    chunk = err.row > 1 ? err.row - 1 : cld(length(r), 2)
-    sizes .= min.(sizes, chunk)
-    return sizes
+    return err.row > 1 ? err.row - 1 : cld(n, 2)
 end
 
 # Rows `r` (1-based positions) of a column, without copying when it can.
@@ -1263,55 +1172,6 @@ function _rowview(@nospecialize(col::ChainedVector), r)
         start = stop + 1
     end
     return view(col, r)
-end
-
-# Phase 1 of a write: materialize every partition's columns, validating
-# name/order agreement — a drift here would silently bind data to the wrong
-# fields.
-function _collectparts(tbl)
-    names = Symbol[]
-    partcols = Vector{AbstractVector}[]
-    partpools = Any[]
-    rowcounts = Int[]
-    for part in Tables.partitions(tbl)
-        cols = Tables.columns(part)
-        pnames = collect(Symbol, Tables.columnnames(cols))
-        if isempty(partcols)
-            names = pnames
-        else
-            pnames == names || throw(
-                ArgumentError(
-                    "partition $(length(partcols) + 1) column names $(pnames) " *
-                    "do not match the first partition's $(names) (same names, " *
-                    "same order); reorder or rename the partition's columns",
-                ),
-            )
-        end
-        # Arrow permits duplicate field names. Tables.getcolumn(cols, name)
-        # cannot distinguish them, so bind every partition by position.
-        push!(
-            partcols,
-            AbstractVector[Tables.getcolumn(cols, j) for j in eachindex(pnames)],
-        )
-        pools = _partitiondictpools(part)
-        pools !== nothing &&
-            length(pools) != length(pnames) &&
-            throw(
-                ArgumentError(
-                    "retained dictionary pool count does not match partition width",
-                ),
-            )
-        push!(partpools, pools)
-        n = Int(Tables.rowcount(cols))
-        # A zero-column partition has no column to count rows from, so ask
-        # the partition itself: Arrow legally allows zero fields with a
-        # positive row count (the reader carries that count on the Table).
-        if n == 0 && isempty(pnames)
-            n = Int(Tables.rowcount(part))
-        end
-        push!(rowcounts, n)
-    end
-    return names, partcols, partpools, rowcounts
 end
 
 """

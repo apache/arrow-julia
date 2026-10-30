@@ -2294,6 +2294,14 @@ function _unionspans(a::FetchedSpans, b::FetchedSpans, budget)
     )
 end
 
+function _fetchbodyspans(sf::SourceFile, ranges, metadata::FetchedSpans, budget)
+    _chargevector!(budget, NTuple{2,Int64}, length(ranges), "unfetched body ranges")
+    unfetched = filter(r -> _spanholding(metadata, r[1], r[2]) == 0, ranges)
+    fetched =
+        _fetchspans(sf, unfetched, sf.gapbytes; budget=budget, what="body range fetch")
+    return _unionspans(metadata, fetched, budget)
+end
+
 """
     SparseBody
 
@@ -2581,13 +2589,21 @@ function _runboundscan(
     # hundred KiB costs less than a second request round. The body round then
     # fetches only what this one did not. A scan with a row window needs few
     # of the bodies, so it reads metadata alone.
+    limitedfilter = b.filter !== nothing && b.limit !== nothing
     bodygap = b.limit === nothing && b.offset == 0 ? sf.gapbytes : Int64(0)
     metaranges = NTuple{2,Int64}[
         (bl[1], AC.checked_add(bl[2], _speculativebody(bl[3], bodygap))) for
         bl in metablocks
     ]
-    metaspans =
-        _fetchspans(sf, metaranges, sf.gapbytes; budget=budget, what="metadata range fetch")
+    # A filtered limit may end at the first batch. Coalescing across its
+    # successors' bodies would download those rows before the filter runs.
+    metaspans = _fetchspans(
+        sf,
+        metaranges,
+        limitedfilter ? Int64(0) : sf.gapbytes;
+        budget=budget,
+        what="metadata range fetch",
+    )
     _chargevector!(
         budget,
         Tuple{Meta.Message,Int16},
@@ -2637,7 +2653,9 @@ function _runboundscan(
         windowed ? _batchwindow(rowcounts, b.offset, b.limit, budget) :
         begin
             _chargevector!(budget, Tuple{Int,Int64,Int64}, nsurv, "scan batch window")
-            Tuple{Int,Int64,Int64}[(p, Int64(0), Int64(-1)) for p = 1:nsurv]
+            Tuple{Int,Int64,Int64}[
+                (p, Int64(0), Int64(-1)) for p = 1:nsurv if _sinkopen(sink)
+            ]
         end
     # A filtered scan with `limit == 0` is closed before the first batch
     # (`_sinkopen`), so it reserves no part slots at all.
@@ -2711,9 +2729,8 @@ function _runboundscan(
     )
     validated = AC._ValidatedDictionaries()
     sizehint!(validated, length(wanted_dict))
-    # One body round: the selected dictionary bodies and the selected record
-    # buffers are planned together and fetched in a single pass; the
-    # dictionaries decode first from the shared spans.
+    # An unrestricted scan coalesces the selected bodies into one round.
+    # A filtered limit fetches them batch by batch, stopping when it is full.
     bodycount <= typemax(Int) ||
         throw(ValidationError("body range count exceeds the host index range"))
     _chargevector!(budget, NTuple{2,Int64}, bodycount, "body range plan")
@@ -2724,7 +2741,11 @@ function _runboundscan(
         rangeidx += 1
         bodyranges[rangeidx] = (dictblocks[i][1] + dictblocks[i][2], dictblocks[i][3])
     end
-    for (p, _, _) in window
+    dictranges = 1:rangeidx
+    _chargevector!(budget, UnitRange{Int}, length(window), "record body range indexes")
+    recordranges = Vector{UnitRange{Int}}(undef, length(window))
+    for (batchidx, (p, _, _)) in enumerate(window)
+        firstindex = rangeidx + 1
         block = recordblocks[recidxs[p]]
         header = headers[p]
         buffers = something(header.buffers, Meta.Buffer[])
@@ -2759,14 +2780,16 @@ function _runboundscan(
             end
             bufidx += span
         end
+        recordranges[batchidx] = firstindex:rangeidx
     end
     rangeidx == length(bodyranges) ||
         throw(AssertionError("body range preflight count changed during planning"))
-    _chargevector!(budget, NTuple{2,Int64}, length(bodyranges), "unfetched body ranges")
-    unfetched = filter(r -> _spanholding(metaspans, r[1], r[2]) == 0, bodyranges)
-    fetched =
-        _fetchspans(sf, unfetched, sf.gapbytes; budget=budget, what="body range fetch")
-    bodyspans = _unionspans(metaspans, fetched, budget)
+    bodyspans = _fetchbodyspans(
+        sf,
+        limitedfilter ? view(bodyranges, dictranges) : bodyranges,
+        metaspans,
+        budget,
+    )
 
     state = DecodeState(budget)
     try
@@ -2812,8 +2835,16 @@ function _runboundscan(
             end
         end
 
-        for (p, skip, take) in window
+        for (batchidx, (p, skip, take)) in enumerate(window)
             _sinkopen(sink) || break
+            if limitedfilter
+                bodyspans = _fetchbodyspans(
+                    sf,
+                    view(bodyranges, recordranges[batchidx]),
+                    metaspans,
+                    budget,
+                )
+            end
             block = recordblocks[recidxs[p]]
             msg, v = blockmeta[length(dictblocks) + p]
             body = SparseBody(block[3], block[1] + block[2], bodyspans)

@@ -25,10 +25,15 @@ function main(outdir::String)
     for (name, make) in BENCH_WORKLOADS
         tbl = make()
         path = joinpath(outdir, "rewrite-$name.arrow")
-        # write: table -> file bytes on disk
-        twrite = bench_time(() -> Arrow.write(path, tbl))
+        # Fresh destinations keep atomic replacement of existing paths out of
+        # the measurement. Removing the preceding output is untimed.
+        twrite = bench_time(
+            () -> Arrow.write(path, tbl; batchsize=BENCH_BATCHSIZE);
+            setup=() -> rm(path; force=true),
+        )
         sz = filesize(path)
-        # read: file -> fully materialized public columns
+        # Request every column: string payload construction is deferred until
+        # first access. Numeric and nested columns still contain views.
         tread = bench_time() do
             t = Arrow.Table(path)
             for nm in Tables.columnnames(t)
@@ -36,6 +41,13 @@ function main(outdir::String)
             end
             Arrow.release!(t)
         end
+        # Check every value outside the timing, including dictionary decoding.
+        t = Arrow.Table(path)
+        for nm in Tables.columnnames(tbl)
+            isequal(Tables.getcolumn(t, nm), Tables.getcolumn(tbl, nm)) ||
+                error("round-trip mismatch in $name.$nm")
+        end
+        Arrow.release!(t)
         for (op, secs) in (("write", twrite), ("read", tread))
             println(
                 "{\"impl\":\"rewrite\",\"workload\":\"$name\"," *
