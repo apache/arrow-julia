@@ -16,13 +16,45 @@
 
 module IPCDictionaryTests
 
-using Test, Arrow, Tables, DataDecimals, UUIDs
+using Test, Arrow, Tables, DataDecimals, DataStrings, InlineStrings, UUIDs
 const AC = Arrow.AC
 const Meta = Arrow.Meta
 const FB = Arrow.FB
 primitive type PrimitiveCode 16 end
 Arrow.ArrowTypes.ArrowType(::Type{PrimitiveCode}) = Int16
 Arrow.ArrowTypes.toarrow(value::PrimitiveCode) = reinterpret(Int16, value)
+
+struct ByteString <: AbstractString
+    data::String
+end
+Base.ncodeunits(s::ByteString) = ncodeunits(s.data)
+Base.codeunit(::ByteString) = UInt8
+Base.codeunit(s::ByteString, i::Int) = codeunit(s.data, i)
+Base.isvalid(s::ByteString, i::Int) = isvalid(s.data, i)
+Base.firstindex(s::ByteString) = firstindex(s.data)
+Base.lastindex(s::ByteString) = lastindex(s.data)
+Base.getindex(s::ByteString, i::Int) = getindex(s.data, i)
+Base.iterate(s::ByteString) = iterate(s.data)
+Base.iterate(s::ByteString, i::Int) = iterate(s.data, i)
+Base.thisind(s::ByteString, i::Int) = thisind(s.data, i)
+Base.nextind(s::ByteString, i::Int) = nextind(s.data, i)
+Base.prevind(s::ByteString, i::Int) = prevind(s.data, i)
+Base.hash(::ByteString, ::UInt) = error("custom logical hash must not run")
+Base.isequal(::ByteString, ::ByteString) = error("custom logical isequal must not run")
+Base.codeunits(::ByteString) = error("custom codeunits method must not run")
+Arrow.ArrowTypes.ArrowType(::Type{ByteString}) = String
+Arrow.ArrowTypes.toarrow(s::ByteString) = s.data
+Arrow.ArrowTypes.ArrowType(::Type{SubString{ByteString}}) = String
+Arrow.ArrowTypes.toarrow(s::SubString{ByteString}) =
+    String([codeunit(s, i) for i = 1:ncodeunits(s)])
+
+struct WideString <: AbstractString
+    data::Vector{UInt16}
+end
+Base.ncodeunits(s::WideString) = length(s.data)
+Base.codeunit(s::WideString, i::Int) = s.data[i]
+Base.hash(::WideString, ::UInt) = error("custom logical hash must not run")
+
 # Reuse the property suite's module in the full run: loading it twice
 # overwrites its global ArrowTypes extension registrations.
 const Fuzz = if isdefined(parentmodule(@__MODULE__), :PropertyTests)
@@ -540,6 +572,68 @@ end
                 Arrow.abortwrite!(state)
             end
         end
+    end
+end
+
+@testset "String dictionary categories use their physical code units" begin
+    texts = ["", "cat-17", "éø漢", "\0a\0", repeat("long-", 24), repeat("x", 255)]
+    representations = function (text; inline=true)
+        padded = "_" * text * "_"
+        first = 2
+        last = prevind(padded, lastindex(padded))
+        values = (
+            text,
+            SubString(padded, first, last),
+            DataString(text),
+            LazyString(text),
+            ByteString(text),
+            SubString(ByteString(padded), first, last),
+        )
+        return inline ? (values..., InlineStrings.String255(text)) : values
+    end
+    # Encoding identity must agree across representations, even with invalid UTF-8.
+    for text in [texts; String(UInt8[0xff, 0x00, 0x80])]
+        for left in representations(text),
+            right in representations(text),
+            seed in (UInt(0), UInt(15), typemax(UInt))
+
+            @test Arrow._writerstorageequal(left, right)
+            @test Arrow._writerstoragehash(left, seed) ==
+                  Arrow._writerstoragehash(right, seed)
+        end
+    end
+    wide = WideString(UInt16[0x0100, 0x0200, 0x0300])
+    widekeys = Dict(Arrow._WriterStorageKey(wide) => 1)
+    widekeys[Arrow._WriterStorageKey(WideString(copy(wide.data)))] = 2
+    widekeys[Arrow._WriterStorageKey(WideString(UInt16[0x0101, 0x0200, 0x0300]))] = 3
+    @test length(widekeys) == 2
+    @test widekeys[Arrow._WriterStorageKey(wide)] == 2
+    for seed in (UInt(0), UInt(15), typemax(UInt))
+        @test Arrow._writerstorageequal(WideString(UInt16[]), "")
+        @test Arrow._writerstoragehash(WideString(UInt16[]), seed) ==
+              Arrow._writerstoragehash("", seed)
+    end
+
+    mixed = AbstractString[
+        value for text in texts for value in representations(text; inline=false)
+    ]
+    expected = [text for text in texts for _ in representations(text; inline=false)]
+    layouts = (
+        (a=Arrow.DictEncode(mixed),),
+        (a=Arrow.DictEncode(InlineStrings.String255.(expected)),),
+        Tables.partitioner((
+            (a=Arrow.DictEncode(mixed[1:13]),),
+            (a=Arrow.DictEncode(mixed[14:end]),),
+        )),
+    )
+    for layout in layouts, file in (false, true), compress in (:none, :lz4, :zstd)
+        io = IOBuffer()
+        Arrow.write(io, layout; file, compress)
+        bytes = take!(io)
+        @test String.(Arrow.Table(bytes).a) == expected
+        core = file ? Arrow.readfile(bytes) : Arrow.readstream(bytes)
+        batch = file ? core[length(core)] : last(core.batches)
+        @test batch.columns[1].dictionary.len == length(texts)
     end
 end
 

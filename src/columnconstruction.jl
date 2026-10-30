@@ -6554,9 +6554,9 @@ function _mergeddictpool(poolhints; widen::Bool=false)
 end
 
 # Encoding identity belongs to the lowered Arrow storage domain. These
-# wrappers provide structural hashing and equality without calling a logical
-# value's overloadable `hash`, `isequal`, `==`, or `isless` methods. Dictionary
-# pool dedup, dictionary compaction, and run-end compaction share this rule.
+# wrappers compare physical contents and use canonical byte hashing for strings,
+# without calling custom logical `hash`, `isequal`, `==`, or `isless` methods.
+# Dictionary pool dedup, dictionary compaction, and run-end compaction share this rule.
 struct _WriterStorageKey{T}
     value::T
 end
@@ -6659,6 +6659,18 @@ function _writerstoragehash(value, seed::UInt, depth::Int=0)
     value === nothing && return hash(UInt8(0x03), seed)
     if value isa AbstractString
         h = hash(UInt8(0x04), seed)
+        @static if isdefined(Base, :hash_bytes) && isdefined(Base, :HASH_SECRET)
+            value isa Union{String,SubString{String},DataStrings.DataString} &&
+                return hash(value, h)
+            value isa LazyString && return hash(String(value), h)
+            n = ncodeunits(value)
+            n == 0 && return hash("", h)
+            if typeof(codeunit(value, 1)) === UInt8
+                # CodeUnits bypasses custom hash/codeunits methods while matching String's byte hash.
+                return Base.hash_bytes(Base.CodeUnits(value), UInt64(h), Base.HASH_SECRET) %
+                       UInt
+            end
+        end
         h = hash(ncodeunits(value), h)
         for i = 1:ncodeunits(value)
             h = hash(codeunit(value, i), h)
@@ -6970,7 +6982,7 @@ end
 
 "First pool position for each non-null value; duplicate categories stay intact."
 function _dictionarylookup(pool)
-    # Same `_WriterStorageKey` policy as `_dictionarypool`: no user-overloadable
+    # Same `_WriterStorageKey` policy as `_dictionarypool`: no custom logical
     # `hash`/`isequal` participates in encoding identity.
     lookup = Dict{_WriterStorageKey,Int64}()
     for (i, x) in enumerate(pool)
