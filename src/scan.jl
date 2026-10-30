@@ -2838,11 +2838,20 @@ function _runboundscan(
         for (batchidx, (p, skip, take)) in enumerate(window)
             _sinkopen(sink) || break
             if limitedfilter
-                bodyspans = _fetchbodyspans(
-                    sf,
-                    view(bodyranges, recordranges[batchidx]),
-                    metaspans,
+                ranges = recordranges[batchidx]
+                _chargevector!(
                     budget,
+                    NTuple{2,Int64},
+                    length(ranges),
+                    "record body ranges",
+                )
+                # Limited-filter metadata reads contain no speculative body bytes.
+                bodyspans = _fetchspans(
+                    sf,
+                    bodyranges[ranges],
+                    sf.gapbytes;
+                    budget=budget,
+                    what="body range fetch",
                 )
             end
             block = recordblocks[recidxs[p]]

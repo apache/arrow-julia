@@ -38,6 +38,7 @@ include("ipc_view_output_tests.jl")
 include("ipc_dictionary_tests.jl")
 include("stream_lifetime_tests.jl")
 include("ranged_scan_tests.jl")
+include("ranged_scan_budget_tests.jl")
 include("eager_source_tests.jl")
 
 # Read-side column construction for flat layouts.
