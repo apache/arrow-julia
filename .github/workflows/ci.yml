@@ -91,8 +91,8 @@ jobs:
     # start, without its precompiled code, so it runs on one job: ubuntu, Julia 1,
     # 2 threads. That job also runs every generated property case; the others run
     # one in four, chosen by their matrix position (ARROW_PROPERTY_CASES).
-    name: Arrow.jl - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
-    runs-on: ${{ matrix.os }}
+    name: Arrow.jl - Julia ${{ matrix.version }} - ${{ matrix.runner || matrix.os }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
+    runs-on: ${{ matrix.runner || matrix.os }}
     timeout-minutes: 45
     permissions:
       contents: read
@@ -111,6 +111,11 @@ jobs:
         nthreads:
           - 1
           - 2
+        include:
+          # Older Julia binaries need executable-stack support from this runner.
+          - version: 'min'
+            os: ubuntu-latest
+            runner: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3
@@ -155,7 +160,7 @@ jobs:
   # code on every version, OS, and thread count.
   test-subpackages:
     name: ${{ matrix.pkg.name }} - Julia min - ${{ github.event_name }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
       contents: read
