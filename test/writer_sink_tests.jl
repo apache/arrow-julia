@@ -1,0 +1,363 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+module WriterSinkTests
+
+using Test
+using Arrow
+using Tables
+
+# Inject sink failures at the public path/IO boundary. The path wrapper lets
+# the writer own a controlled IO without depending on OS-specific failures.
+mutable struct FailingSink <: IO
+    data::IOBuffer
+    writeerror::Union{Nothing,Exception}
+    closeerror::Union{Nothing,Exception}
+    flusherror::Union{Nothing,Exception}
+    closes::Int
+end
+FailingSink() = FailingSink(IOBuffer(), nothing, nothing, nothing, 0)
+
+struct SinkPath <: AbstractString
+    io::FailingSink
+end
+Arrow._openpath(path::SinkPath) = Arrow._PathSink(path.io, "", nothing, false)
+Base.isopen(io::FailingSink) = isopen(io.data)
+function Base.write(io::FailingSink, bytes::Vector{UInt8})
+    io.writeerror === nothing || throw(io.writeerror)
+    return write(io.data, bytes)
+end
+function Base.close(io::FailingSink)
+    io.closes += 1
+    close(io.data)
+    io.closeerror === nothing || throw(io.closeerror)
+    return nothing
+end
+function Base.flush(io::FailingSink)
+    io.flusherror === nothing || throw(io.flusherror)
+    return flush(io.data)
+end
+
+function caught(f)
+    try
+        f()
+        return nothing
+    catch err
+        return err
+    end
+end
+
+@testset "writer sink validation and cleanup" begin
+    table = (; a=fill(Int64(7), 64))
+
+    @testset "invalid constructor options preserve the sink" begin
+        original = UInt8[0x00, 0xff, 0x41, 0x52, 0x52, 0x4f, 0x57]
+        constructors = (
+            (sink, options) -> Arrow.Writer(sink; options...),
+            (sink, options) -> open(Arrow.Writer, sink; options...),
+            (sink, options) -> Arrow.Writer(_ -> nothing, sink; options...),
+            (sink, options) -> open(_ -> nothing, Arrow.Writer, sink; options...),
+        )
+        invalid = (
+            ((; compress=:invalid), ArgumentError),
+            ((; dictreplacement=true, file=true), ArgumentError),
+            ((; file=:invalid), TypeError),
+            ((; compress=1), TypeError),
+            ((; dictreplacement=:invalid), TypeError),
+            ((; unknown=true), ArgumentError),
+        )
+        mktempdir() do dir
+            path = joinpath(dir, "existing.arrow")
+            missingpath = joinpath(dir, "missing.arrow")
+            for construct in constructors, (options, error) in invalid
+                write(path, original)
+                @test_throws error construct(path, options)
+                @test read(path) == original
+                @test_throws error construct(missingpath, options)
+                @test !ispath(missingpath)
+
+                io = IOBuffer(copy(original); read=true, write=true)
+                seek(io, 3)
+                @test_throws error construct(io, options)
+                @test isopen(io)
+                @test position(io) == 3
+                @test take!(io) == original
+                close(io)
+                # The old constructor creates this file before rejecting.
+                rm(missingpath; force=true)
+            end
+        end
+    end
+
+    @testset "valid constructors retain eager byte parity and ownership" begin
+        mktempdir() do dir
+            path = joinpath(dir, "valid.arrow")
+            for file in (true, false), compress in (nothing, :none, :lz4, :zstd)
+                expected = Arrow._writebytes(table; file=file, compress=compress)
+                write(path, "replace this longer existing destination"^100)
+                # nullable=false declares what one eager write declares.
+                w = Arrow.Writer(path; file=file, compress=compress, nullable=false)
+                @test Arrow.write(w, table) === w
+                @test close(w) === nothing
+                @test !isopen(w.io)
+                @test read(path) == expected
+
+                io = IOBuffer()
+                result =
+                    Arrow.Writer(io; file=file, compress=compress, nullable=false) do writer
+                        Arrow.write(writer, table)
+                        :done
+                    end
+                @test result === :done
+                @test isopen(io)
+                @test take!(io) == expected
+                close(io)
+            end
+            w = Arrow.Writer(path)
+            close(w)
+            @test !isopen(w.io)
+            # A writer that got no table writes a valid output with no columns.
+            none = Arrow.Table(path)
+            @test isempty(Tables.columnnames(none)) && Tables.rowcount(none) == 0
+        end
+    end
+
+    @testset "an IO gets the stream format and a path the file format" begin
+        stream = Arrow._writebytes(table; file=false)
+        io = IOBuffer()
+        Arrow.write(io, table)
+        @test take!(io) == stream
+        io = IOBuffer()
+        Arrow.Writer(w -> Arrow.write(w, table), io; nullable=false)
+        @test take!(io) == stream
+        io = IOBuffer()
+        Arrow.write(io, table; file=true)
+        @test take!(io) == Arrow._writebytes(table; file=true)
+        mktempdir() do dir
+            path = joinpath(dir, "default.arrow")
+            Arrow.write(path, table)
+            @test read(path) == Arrow._writebytes(table; file=true)
+        end
+        # A reader at the other end of a pipe gets each batch as it is
+        # written, before the writer closes.
+        pipe = Base.BufferStream()
+        w = Arrow.Writer(pipe)
+        Arrow.write(w, table)
+        reader = @async first(Arrow.Stream(pipe)).a
+        @test timedwait(() -> istaskdone(reader), 60) === :ok
+        # Closing first ends a reader that is still waiting, so a regression
+        # fails here instead of hanging the suite.
+        close(w)
+        close(pipe)
+        @test fetch(reader) == table.a
+    end
+
+    @testset "eager write and append reject options before changing bytes" begin
+        mktempdir() do dir
+            path = joinpath(dir, "existing.arrow")
+            original = Arrow._writebytes(table; file=false)
+            for operation in (Arrow.write, Arrow.append)
+                for (options, error) in (
+                    ((; compress=:invalid), ArgumentError),
+                    ((; compress=1), TypeError),
+                    ((; unknown=true), ArgumentError),
+                )
+                    write(path, original)
+                    @test_throws error operation(path, table; options...)
+                    @test read(path) == original
+                    io = IOBuffer(copy(original); read=true, write=true)
+                    @test_throws error operation(io, table; options...)
+                    @test isopen(io)
+                    @test take!(io) == original
+                    close(io)
+                end
+            end
+        end
+    end
+
+    @testset "finalization failures still release owned sinks and codecs" begin
+        for ownio in (true, false), file in (true, false), compress in (nothing, :zstd)
+            io = FailingSink()
+            w = Arrow.Writer(ownio ? SinkPath(io) : io; file=file, compress=compress)
+            Arrow.write(w, table)
+            failure = ErrorException("final output write failed")
+            io.writeerror = failure
+            io.closeerror = ErrorException("sink close also failed")
+            @test caught(() -> close(w)) === failure
+            @test !isopen(w)
+            @test w.st.finished
+            @test io.closes == Int(ownio)
+            @test isopen(io) == !ownio
+            @test all(s -> s.zstd === nothing, w.st.states)
+            @test close(w) === nothing
+            @test io.closes == Int(ownio)
+            io.closeerror = nothing
+            ownio || close(io)
+        end
+    end
+
+    @testset "a failed asynchronous batch releases its codecs" begin
+        io = FailingSink()
+        batch = Arrow.AC.batch(table)
+        st = Arrow.beginwrite!(io, batch.schema; file=false, compress=:zstd, ntasks=2)
+        Arrow.writebatch!(st, batch)
+        task, states, _ = only(st.pending)
+        wait(task)
+        @test any(s -> s.zstd !== nothing, states)
+        failure = ErrorException("asynchronous output write failed")
+        io.writeerror = failure
+        @test caught(() -> Arrow.drainwrite!(st)) === failure
+        Arrow.abortwrite!(st)
+        @test all(s -> s.zstd === nothing, states)
+        @test isopen(io)
+        close(io)
+    end
+
+    @testset "function forms preserve the body error when close also fails" begin
+        for construct in
+            (Arrow.Writer, (f, sink; kw...) -> open(f, Arrow.Writer, sink; kw...))
+            for ownio in (true, false), file in (true, false)
+                io = FailingSink()
+                failure = ErrorException("body failed")
+                err = caught() do
+                    construct(ownio ? SinkPath(io) : io; file=file) do w
+                        Arrow.write(w, table)
+                        io.writeerror = ErrorException("final output write also failed")
+                        io.closeerror = ErrorException("sink close also failed")
+                        throw(failure)
+                    end
+                end
+                @test err === failure
+                @test io.closes == Int(ownio)
+                @test isopen(io) == !ownio
+                io.closeerror = nothing
+                ownio || close(io)
+            end
+        end
+    end
+
+    @testset "a body error still finalizes accepted batches" begin
+        mktempdir() do dir
+            path = joinpath(dir, "body-error.arrow")
+            for ownio in (true, false), file in (true, false)
+                io = IOBuffer()
+                failure = ErrorException("body failed after publishing a batch")
+                writer = Ref{Arrow.Writer}()
+                err = caught() do
+                    Arrow.Writer(ownio ? path : io; file=file, nullable=false) do w
+                        writer[] = w
+                        Arrow.write(w, table)
+                        throw(failure)
+                    end
+                end
+                @test err === failure
+                @test !isopen(writer[])
+                @test isopen(writer[].io) == !ownio
+                bytes = ownio ? read(path) : take!(io)
+                @test bytes == Arrow._writebytes(table; file=file)
+                close(io)
+            end
+        end
+    end
+
+    @testset "overwriting a memory-mapped file keeps the live handle valid" begin
+        mktempdir() do dir
+            path = joinpath(dir, "mapped.arrow")
+            parts = [(; a=collect(Int64, (1:100_000) .+ 100_000k)) for k = 0:3]
+            Arrow.write(path, Tables.partitioner(parts))
+            sums = [sum(p.a) for p in parts]
+            for overwrite in (
+                p -> Arrow.write(p, (; a=Int64[1])),
+                p -> Arrow.Writer(w -> Arrow.write(w, (; a=Int64[1])), p),
+            )
+                s = Arrow.Stream(path; mmap=true)  # maps the file; batches decode lazily
+                overwrite(path)
+                @test [sum(b.a) for b in s] == sums
+                @test Arrow.Table(path).a == [1]
+                Arrow.write(path, Tables.partitioner(parts))
+                @test readdir(dir) == ["mapped.arrow"]
+            end
+        end
+    end
+
+    @testset "replacing a file keeps its mode and symlinks; failures keep it" begin
+        mktempdir() do dir
+            target = joinpath(dir, "target.arrow")
+            link = joinpath(dir, "link.arrow")
+            Arrow.write(target, table)
+            original = read(target)
+            Sys.iswindows() || chmod(target, 0o640)
+            symlink(target, link)
+            Arrow.write(link, (; b=["x"]))
+            @test islink(link)
+            @test Arrow.Table(target).b == ["x"]
+            Sys.iswindows() || @test filemode(target) & 0o777 == 0o640
+            Arrow.write(target, table)
+            @test read(target) == original
+            # The second partition's columns do not match the first's.
+            unwritable = Tables.partitioner([(; a=Int64[1]), (; b=Int64[2])])
+            @test caught(() -> Arrow.write(target, unwritable)) isa Exception
+            @test read(target) == original
+            fresh = joinpath(dir, "fresh.arrow")
+            @test caught(() -> Arrow.write(fresh, unwritable)) isa Exception
+            @test !ispath(fresh)
+            @test sort(readdir(dir)) == ["link.arrow", "target.arrow"]
+        end
+    end
+
+    @testset "a read-only file refuses, as opening it for writing does" begin
+        mktempdir() do dir
+            target = joinpath(dir, "readonly.arrow")
+            Arrow.write(target, table)
+            original = read(target)
+            chmod(target, 0o444)
+            # Privileges that ignore file modes (root) open it for writing anyway.
+            ignored = caught(() -> close(open(target, "a"))) === nothing
+            if !ignored
+                err = caught(() -> Arrow.write(target, (; b=["x"])))
+                # The message names the file (Windows prints the path escaped).
+                @test err isa SystemError &&
+                      occursin("readonly.arrow", sprint(showerror, err))
+                @test caught(() -> Arrow.Writer(target)) isa SystemError
+                @test read(target) == original
+                @test readdir(dir) == ["readonly.arrow"]
+            end
+            chmod(target, 0o644)
+        end
+    end
+
+    @testset "cleanup errors propagate when the body succeeds" begin
+        for ownio in (true, false), written in (true, false)
+            io = FailingSink()
+            failure = ErrorException("sink cleanup failed")
+            io.closeerror = ownio ? failure : nothing
+            io.flusherror = ownio ? nothing : failure
+            err = caught() do
+                Arrow.Writer(ownio ? SinkPath(io) : io) do w
+                    written && Arrow.write(w, table)
+                    :done
+                end
+            end
+            @test err === failure
+            @test io.closes == Int(ownio)
+            @test isopen(io) == !ownio
+            io.closeerror = nothing
+            ownio || close(io)
+        end
+    end
+end
+
+end # module WriterSinkTests

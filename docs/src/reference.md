@@ -19,17 +19,96 @@
 -->
 ```
 
-# API Reference
+# API reference
 
-```@autodocs
-Modules = [Arrow]
-Order   = [:type, :function]
+```@docs
+Arrow
 ```
 
-## Internals: `Arrow.FlatBuffers`
+## Read
 
-The `FlatBuffers` module is not part of Arrow.jl's public API, and these functions may change without notice.
+```@docs
+Arrow.Table
+Arrow.read
+Arrow.Stream
+Arrow.release!(::Arrow.Table)
+Base.copy(::Arrow.Table)
+Arrow.getmetadata
+Arrow.Limits
+```
 
-```@autodocs
-Modules = [Arrow.FlatBuffers]
+## Filter
+
+```@docs
+Arrow.col
+Arrow.colcmp
+Arrow.colin
+Arrow.isnull
+```
+
+## Write
+
+```@docs
+Arrow.write
+Arrow.write(::Arrow.Writer, ::Any)
+Arrow.Writer
+Arrow.append
+Arrow.tobuffer
+Arrow.DictEncode
+```
+
+## Column and value types
+
+```@docs
+Arrow.ArrowVector
+Arrow.Primitive
+Arrow.BoolVector
+Arrow.DictEncoded
+Arrow.RunEndEncoded
+Arrow.ListVector
+Arrow.ListValue
+Arrow.MapVector
+Arrow.MapValue
+Arrow.StructVector
+```
+
+## Byte-range sources
+
+```@docs
+Arrow.AbstractArrowSource
+Arrow.sourcelength
+Arrow.readrange
+Arrow.concurrentreads
+```
+
+## Error types
+
+```@docs
+Arrow.ValidationError
+Arrow.AllocationLimitError
+```
+
+## C data and C stream interfaces
+
+```@docs
+Arrow.Field
+Arrow.Schema
+Arrow.ArrayData
+Arrow.RecordBatch
+Arrow.fromjulia
+Arrow.batch
+Arrow.materialize
+Arrow.to_c_data
+Arrow.from_c_data
+Arrow.export_stream!
+Arrow.from_c_stream
+Arrow.nextbatch!
+Arrow.ImportedStream
+Arrow.ForeignOwner
+Arrow.release!(::Arrow.ForeignOwner)
+Arrow.release!(::Arrow.ImportedStream)
+Arrow.reap!
+Arrow.CArrowSchema
+Arrow.CArrowArray
+Arrow.CArrowArrayStream
 ```

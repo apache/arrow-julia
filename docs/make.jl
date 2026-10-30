@@ -22,16 +22,27 @@ makedocs(;
     modules=[Arrow],
     repo=Remotes.GitHub("apache", "arrow-julia"),
     sitename="Arrow.jl",
+    # The reference page documents the public surface explicitly; internal
+    # helpers carry docstrings for maintainers and are not part of the site.
+    checkdocs=:public,
+    checkdocs_ignored_modules=[Arrow.ArrowCore, Arrow.FlatBuffers, Arrow.Meta],
     format=Documenter.HTML(;
-        prettyurls=get(ENV, "CI", "false") == "true",
+        prettyurls=true,
         canonical="https://arrow.apache.org/julia/",
         assets=String[],
     ),
     pages=[
         "Home" => "index.md",
-        "User Manual" => "manual.md",
-        "API Reference" => "reference.md",
+        "Reading" => "reading.md",
+        "Writing" => "writing.md",
+        "Streams and IPC" => "streams.md",
+        "Type mapping" => "types.md",
+        "Limits and errors" => "limits.md",
+        "C data interface" => "cdata.md",
+        "Migrating from Arrow.jl 2.x" => "migration.md",
+        "API reference" => "reference.md",
     ],
+    pagesonly=true,
 )
 
 deploydocs(; repo="github.com/apache/arrow-julia", devbranch="main", branch="asf-site")

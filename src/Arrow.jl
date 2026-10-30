@@ -14,131 +14,232 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Layering (docs/dev/core-README.md documents each layer in depth):
+#
+# - `ArrowCore` (private): ownership regions, layout registry, `ArrayData`,
+#   staged validation, accessors; the trim-friendly, dependency-free core.
+# - `Meta`: FlatBuffers metadata bindings and the shape verifier, both
+#   generated from the vendored spec schemas (`src/metadata/fbs/`, generator
+#   `tools/fbsgen.jl`) over the vendored `FlatBuffers` runtime.
+# - IPC adapters (`ipc_read.jl`, `ipc_write.jl`): stream and file formats,
+#   framing, resource limits, compression, dictionary lifecycles.
+# - `cdata.jl`: the C data and C stream interfaces, import and export, with
+#   lifecycle accounting.
+# - `scan.jl`: `Tables.Scan` pushdown over byte ranges plus footer-carried
+#   statistics pruning.
+# - `table.jl`, `write.jl`: the read facade and write orchestration.
+# - `columnconstruction.jl`: column-wide construction policy, including
+#   retained schemas, dictionaries, and recursive ArrowTypes.jl lowering.
 """
-    Arrow.jl
+    Arrow
 
-A pure Julia implementation of the [apache arrow](https://arrow.apache.org/) memory format specification.
-
-This implementation supports the 1.0 version of the specification, including support for:
-  * All primitive data types
-  * All nested data types
-  * Dictionary encodings, nested dictionary encodings, and messages
-  * Extension types
-  * Streaming, file, record batch, and replacement and isdelta dictionary messages
-  * Buffer compression/decompression via the standard LZ4 frame and Zstd formats
-
-It currently doesn't include support for:
-  * Tensors or sparse tensors
-  * Flight RPC
-  * C data interface
-
-Third-party data formats:
-  * csv and parquet support via the existing [CSV.jl](https://github.com/JuliaData/CSV.jl) and [Parquet.jl](https://github.com/JuliaIO/Parquet.jl) packages
-  * Other [Tables.jl](https://github.com/JuliaData/Tables.jl)-compatible packages automatically supported ([DataFrames.jl](https://github.com/JuliaData/DataFrames.jl), [JSONTables.jl](https://github.com/JuliaData/JSONTables.jl), [JuliaDB.jl](https://github.com/JuliaData/JuliaDB.jl), [SQLite.jl](https://github.com/JuliaDatabases/SQLite.jl), [MySQL.jl](https://github.com/JuliaDatabases/MySQL.jl), [JDBC.jl](https://github.com/JuliaDatabases/JDBC.jl), [ODBC.jl](https://github.com/JuliaDatabases/ODBC.jl), [XLSX.jl](https://github.com/felipenoris/XLSX.jl), etc.)
-  * No current Julia packages support ORC or Avro data formats
-
-See docs for official Arrow.jl API with the [User Manual](@ref) and reference docs for [`Arrow.Table`](@ref), [`Arrow.write`](@ref), and [`Arrow.Stream`](@ref).
+Read and write the Apache Arrow IPC file and stream formats. [`Arrow.Table`](@ref) reads
+a path, an `IO`, a byte vector, or an [`Arrow.AbstractArrowSource`](@ref) as Tables.jl
+columns; [`Arrow.Stream`](@ref) reads one record batch at a time; [`Arrow.write`](@ref)
+and [`Arrow.Writer`](@ref) write any Tables.jl table. The names are public but not
+exported, apart from `ArrowTypes`: call them as `Arrow.Table` and so on.
 """
 module Arrow
 
-using Base.Iterators
-using Mmap
+using Tables
+import Base64
+import DataAPI
+import DataStrings, DataDecimals, Durations
+import PooledArrays
+using SentinelArrays: ChainedVector
+import ArrowTypes
 import Dates
-using DataAPI,
-    Tables,
-    SentinelArrays,
-    PooledArrays,
-    CodecLz4,
-    CodecZstd,
-    TimeZones,
-    BitIntegers,
-    ConcurrentUtilities,
-    StringViews
+import Mmap
+import UUIDs
+import CodecLz4
+import CodecZstd
+import TranscodingStreams
+using CodecLz4: LZ4FrameCompressor
+using CodecZstd: ZstdCompressor
 
-export ArrowTypes
+const CLZ4 = CodecLz4
+const CZSTD = CodecZstd
+const ZSTD = CZSTD.LibZstd
+const TS = TranscodingStreams
 
-using Base: @propagate_inbounds
-import Base: ==
+isdefined(Tables, :Scan) || error(
+    "Arrow 3.0's scan support needs Tables.jl's `Tables.Scan` " *
+    "interface; upgrade Tables.jl to 1.14 or later",
+)
 
-const FILE_FORMAT_MAGIC_BYTES = b"ARROW1"
-const CONTINUATION_INDICATOR_BYTES = 0xffffffff
+include(joinpath("FlatBuffers", "FlatBuffers.jl"))
+const FB = FlatBuffers
 
-# vendored flatbuffers code for now
-include("FlatBuffers/FlatBuffers.jl")
-using .FlatBuffers
+# Generated metadata bindings + shape verifier (regenerate with
+# `julia tools/fbsgen.jl src/metadata/fbs src/metadata`).
+module Meta
+using EnumX
+using ..FlatBuffers
+include(joinpath("metadata", "Schema.jl"))
+include(joinpath("metadata", "File.jl"))
+include(joinpath("metadata", "Message.jl"))
+include(joinpath("metadata", "VerifierRuntime.jl"))
+include(joinpath("metadata", "Verifier.jl"))
+end
 
-include("metadata/Flatbuf.jl")
-using .Flatbuf
-const Meta = Flatbuf
+include("ArrowCore.jl")
+using .ArrowCore
+import .ArrowCore: release!
+const AC = ArrowCore
 
-using ArrowTypes
-include("utils.jl")
-include("arraytypes/arraytypes.jl")
-include("eltypes.jl")
+include("ipc_read.jl")
+include("ipc_dictionary.jl")
+include("ipc_write.jl")
+include("cdata.jl")
+include("source.jl")
+include("arrowtypes.jl")
+include("columns.jl")
+
+# The public facade. `table.jl` includes the private scan-plan module after
+# its public/storage type seam is defined; `write.jl` includes the private
+# column-construction module after the `DictEncode` marker is defined.
 include("table.jl")
 include("write.jl")
-include("append.jl")
-include("show.jl")
+include("sharedvalues.jl")
 
-const ZSTD_COMPRESSOR = Lockable{ZstdCompressor}[]
-const ZSTD_DECOMPRESSOR = Lockable{ZstdDecompressor}[]
-const LZ4_FRAME_COMPRESSOR = Lockable{LZ4FrameCompressor}[]
-const LZ4_FRAME_DECOMPRESSOR = Lockable{LZ4FrameDecompressor}[]
+@doc """
+    Arrow.Field
 
-function init_zstd_compressor()
-    zstd = ZstdCompressor(; level=3)
-    CodecZstd.TranscodingStreams.initialize(zstd)
-    return Lockable(zstd)
+A column's name, Arrow type, nullability, children, and metadata, as the C data
+interface uses it. [`Arrow.fromjulia`](@ref) and [`Arrow.from_c_data`](@ref) return one.
+""" Field
+
+@doc """
+    Arrow.Schema
+
+The [`Arrow.Field`](@ref)s of a record batch, in order, with optional key-value
+metadata. The C stream interface describes its batches with one.
+""" Schema
+
+@doc """
+    Arrow.ArrayData
+
+The values of one column in Arrow's memory layout: its buffers, children, optional
+dictionary, and length. [`Arrow.fromjulia`](@ref) and [`Arrow.from_c_data`](@ref) return
+one; [`Arrow.materialize`](@ref) converts it to a Julia vector, and `copy` copies it into
+Julia-owned memory.
+""" ArrayData
+
+@doc """
+    Arrow.RecordBatch
+
+A record batch: a [`Arrow.Schema`](@ref) (`batch.schema`), one
+[`Arrow.ArrayData`](@ref) per field (`batch.columns`), and the row count
+(`batch.nrows`). [`Arrow.batch`](@ref) builds one from Julia vectors.
+""" RecordBatch
+
+@doc """
+    Arrow.fromjulia(name, values) -> (Arrow.Field, Arrow.ArrayData)
+
+The field and data of a column named `name` holding `values`, for the C data
+interface. The data may share `values`' memory: do not modify or resize `values` while
+the result is in use.
+""" fromjulia
+
+@doc """
+    Arrow.batch(columns::NamedTuple) -> Arrow.RecordBatch
+
+A record batch of the named vectors in `columns`, as [`Arrow.fromjulia`](@ref) builds
+each one.
+""" batch
+
+@doc """
+    Arrow.materialize(field, data) -> Vector
+    Arrow.materialize(T, field, data) -> Vector{T}
+
+The values of `data`, a column described by `field`, as a new Julia vector. The typed
+form returns a `Vector{T}` and first checks that `T` fits the field's Arrow type.
+""" materialize
+
+"""
+    Arrow.nextbatch!(stream::Arrow.ImportedStream) -> Union{Arrow.RecordBatch,Nothing}
+
+The next record batch of a stream imported with [`Arrow.from_c_stream`](@ref), or
+`nothing` at its end. Overlapping calls on one stream are an error.
+"""
+AC.nextbatch!
+
+"""
+    Arrow.ValidationError
+
+Thrown when input is not valid Arrow data, or uses something this package does not
+read: corrupt, truncated, or inconsistent metadata or buffers, bytes that are not Arrow
+at all, or big-endian data. The message names the problem.
+"""
+AC.ValidationError
+
+# Julia 1.11 added `public`. Keep the source parseable on the supported
+# Julia 1.10 floor while giving tooling an exact, non-exporting API boundary
+# on newer Julia versions.
+@static if VERSION >= v"1.11"
+    Core.eval(
+        @__MODULE__,
+        Expr(
+            :public,
+            :Table,
+            :Stream,
+            :read,
+            :release!,
+            :col,
+            :colcmp,
+            :colin,
+            :isnull,
+            :ArrowVector,
+            :Primitive,
+            :BoolVector,
+            :ListVector,
+            :ListValue,
+            :MapVector,
+            :MapValue,
+            :StructVector,
+            :DictEncoded,
+            :RunEndEncoded,
+            :write,
+            :Writer,
+            :append,
+            :tobuffer,
+            :getmetadata,
+            :DictEncode,
+            :AbstractArrowSource,
+            :sourcelength,
+            :readrange,
+            :concurrentreads,
+            :Field,
+            :Schema,
+            :ArrayData,
+            :RecordBatch,
+            :fromjulia,
+            :batch,
+            :materialize,
+            :CArrowSchema,
+            :CArrowArray,
+            :CArrowArrayStream,
+            :to_c_data,
+            :from_c_data,
+            :export_stream!,
+            :from_c_stream,
+            :ForeignOwner,
+            :ImportedStream,
+            :nextbatch!,
+            :reap!,
+            :Limits,
+            :AllocationLimitError,
+            :ValidationError,
+        ),
+    )
 end
 
-function init_zstd_decompressor()
-    zstd = ZstdDecompressor()
-    CodecZstd.TranscodingStreams.initialize(zstd)
-    return Lockable(zstd)
-end
+# The one name Arrow 2.x exported. Packages that define custom-type mappings
+# reach the interface as `Arrow.ArrowTypes` or through `using Arrow`.
+export ArrowTypes
 
-function init_lz4_frame_compressor()
-    lz4 = LZ4FrameCompressor(; compressionlevel=4)
-    CodecLz4.TranscodingStreams.initialize(lz4)
-    return Lockable(lz4)
-end
+# Precompile the common write/read/scan shapes last, once every layer above
+# is defined.
+include("precompile.jl")
 
-function init_lz4_frame_decompressor()
-    lz4 = LZ4FrameDecompressor()
-    CodecLz4.TranscodingStreams.initialize(lz4)
-    return Lockable(lz4)
-end
-
-function access_threaded(f, v::Vector)
-    tid = Threads.threadid()
-    0 < tid <= length(v) || _length_assert()
-    if @inbounds isassigned(v, tid)
-        @inbounds x = v[tid]
-    else
-        x = f()
-        @inbounds v[tid] = x
-    end
-    return x
-end
-@noinline _length_assert() = @assert false "0 < tid <= v"
-
-zstd_compressor() = access_threaded(init_zstd_compressor, ZSTD_COMPRESSOR)
-zstd_decompressor() = access_threaded(init_zstd_decompressor, ZSTD_DECOMPRESSOR)
-lz4_frame_compressor() = access_threaded(init_lz4_frame_compressor, LZ4_FRAME_COMPRESSOR)
-lz4_frame_decompressor() =
-    access_threaded(init_lz4_frame_decompressor, LZ4_FRAME_DECOMPRESSOR)
-
-function __init__()
-    nt = @static if isdefined(Base.Threads, :maxthreadid)
-        Threads.maxthreadid()
-    else
-        Threads.nthreads()
-    end
-    resize!(empty!(LZ4_FRAME_COMPRESSOR), nt)
-    resize!(empty!(ZSTD_COMPRESSOR), nt)
-    resize!(empty!(LZ4_FRAME_DECOMPRESSOR), nt)
-    resize!(empty!(ZSTD_DECOMPRESSOR), nt)
-    return
-end
-
-end  # module Arrow
+end # module Arrow

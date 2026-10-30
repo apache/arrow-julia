@@ -17,55 +17,80 @@
   under the License.
 -->
 
-# Arrow
+# Arrow.jl
 
-[![docs](https://img.shields.io/badge/docs-latest-blue&logo=julia)](https://arrow.apache.org/julia/)
-[![CI](https://github.com/apache/arrow-julia/workflows/CI/badge.svg)](https://github.com/apache/arrow-julia/actions?query=workflow%3ACI)
-[![codecov](https://app.codecov.io/gh/apache/arrow-julia/branch/main/graph/badge.svg)](https://app.codecov.io/gh/apache/arrow-julia)
+[![Documentation](https://img.shields.io/badge/docs-latest-blue?logo=julia)](https://arrow.apache.org/julia/)
+[![CI](https://github.com/apache/arrow-julia/actions/workflows/ci.yml/badge.svg)](https://github.com/apache/arrow-julia/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/apache/arrow-julia/branch/main/graph/badge.svg)](https://codecov.io/gh/apache/arrow-julia)
 
-[![deps](https://juliahub.com/docs/Arrow/deps.svg)](https://juliahub.com/ui/Packages/Arrow/QnF3w?t=2)
-[![version](https://juliahub.com/docs/Arrow/version.svg)](https://juliahub.com/ui/Packages/Arrow/QnF3w)
-[![pkgeval](https://juliahub.com/docs/Arrow/pkgeval.svg)](https://juliahub.com/ui/Packages/Arrow/QnF3w)
+Arrow.jl reads and writes the [Apache Arrow](https://arrow.apache.org) IPC file and
+stream formats in pure Julia. A file reads as Tables.jl columns that view its memory, and
+any Tables.jl table writes. It also implements the Arrow C data and C stream interfaces.
 
-This is a pure Julia implementation of the [Apache Arrow](https://arrow.apache.org) data standard.  This package provides Julia `AbstractVector` objects for
-referencing data that conforms to the Arrow standard.  This allows users to seamlessly interface Arrow formatted data with a great deal of existing Julia code.
-
-Please see this [document](https://arrow.apache.org/docs/format/Columnar.html#physical-memory-layout) for a description of the Arrow memory layout.
+> [!IMPORTANT]
+> This is the Arrow.jl 3.0 development branch; 3.0 is not registered yet. Arrow 3.0 is a
+> breaking release: read the [migration guide](docs/src/migration.md) before you upgrade
+> from 2.x. A checkout uses the in-repository `src/ArrowTypes` package: Julia 1.11+
+> resolves it through `[sources]`; on Julia 1.10 run the `Pkg.develop` commands below.
 
 ## Installation
 
-The package can be installed by typing in the following in a Julia REPL:
+```julia
+import Pkg
+Pkg.add("Arrow")
+```
+
+## Quick start
 
 ```julia
-julia> using Pkg; Pkg.add("Arrow")
+using Arrow, DataFrames
+
+Arrow.write("data.arrow", (id=[1, 2, 3], name=["Ada", "Ben", missing]))
+
+table = Arrow.Table("data.arrow")        # columns view the file
+table.name                               # ["Ada", "Ben", missing]
+df = Arrow.read("data.arrow", DataFrame) # a DataFrame with its own columns
+
+subset = Arrow.Table("data.arrow"; select=[:id], filter=Arrow.col(:id) > 1)
+
+for batch in Arrow.Stream("data.arrow")  # one record batch at a time
+    # ...
+end
 ```
 
-## Local Development
+The [documentation](https://arrow.apache.org/julia/) covers reading, writing, streams,
+the type mapping, limits and errors, the C data interface, and migrating from 2.x. The
+[changelog](CHANGELOG.md) summarizes what changed in 3.0.
 
-When developing on Arrow.jl it is recommended that you run the following to ensure that any
-changes to ArrowTypes.jl are immediately available to Arrow.jl without requiring a release:
+## Development
 
-```sh
-julia --project -e 'using Pkg; Pkg.develop(path="src/ArrowTypes")'
+In a checkout of this branch, prepare the local subpackages, then run the
+tests:
+
+```julia
+import Pkg
+Pkg.activate(".")
+Pkg.develop(path="src/ArrowTypes")
+Pkg.test()
 ```
 
-## Format Support
+The repository also has Apache Arrow gold-corpus checks, PyArrow and
+Nanoarrow IPC oracle checks, and PyArrow C interface checks. Run all of them
+with `julia conformance/run.jl`. Docker and network access for the first image
+build are required.
 
-This implementation supports the 1.0 version of the specification, including support for:
-  * All primitive data types
-  * All nested data types
-  * Dictionary encodings and messages
-  * Extension types
-  * Streaming, file, record batch, and replacement and isdelta dictionary messages
+Run `julia --project=. test/fuzz.jl --cases 16 --mutations 64` for the
+deterministic PR-sized fuzz suite. The scheduled workflow runs the extended
+512-case and 20,000-mutation suite with a new reproducible master seed for each
+scheduled run. It repeats the first full route sweep and every 256th mutation
+to detect unstable outcomes. If the runner records or times out on a case, the
+workflow uploads its replay coordinates, mutated bytes when available, the
+resolved package environment, and a location-independent `replay.sh` wrapper.
 
-It currently doesn't include support for:
-  * Tensors or sparse tensors
-  * Flight RPC
-  * C data interface
+The Arrow 3.0 rewrite used Anthropic Claude Code and OpenAI Codex for code
+generation, test generation, and review. Apache Arrow maintainers remain
+responsible for understanding, reviewing, testing, and approving the code and
+each release.
 
-Third-party data formats:
-  * CSV, parquet and avro support via the existing [CSV.jl](https://github.com/JuliaData/CSV.jl), [Parquet.jl](https://github.com/JuliaIO/Parquet.jl) and [Avro.jl](https://github.com/JuliaData/Avro.jl) packages
-  * Other Tables.jl-compatible packages automatically supported ([DataFrames.jl](https://github.com/JuliaData/DataFrames.jl), [JSONTables.jl](https://github.com/JuliaData/JSONTables.jl), [JuliaDB.jl](https://github.com/JuliaData/JuliaDB.jl), [SQLite.jl](https://github.com/JuliaDatabases/SQLite.jl), [MySQL.jl](https://github.com/JuliaDatabases/MySQL.jl), [JDBC.jl](https://github.com/JuliaDatabases/JDBC.jl), [ODBC.jl](https://github.com/JuliaDatabases/ODBC.jl), [XLSX.jl](https://github.com/felipenoris/XLSX.jl), etc.)
-  * No current Julia packages support ORC
-
-See the [full documentation](https://arrow.apache.org/julia/) for details on reading and writing arrow data.
+See [the engine design](docs/dev/core-README.md) for the source layout and
+internal contracts.

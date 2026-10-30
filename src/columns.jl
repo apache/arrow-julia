@@ -1,0 +1,2298 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# =============================================================================
+# Read-side columns for flat layouts: zero-copy views over decoded Arrow
+# buffers, DataStrings string columns, and dictionary vectors.
+#
+# A view wraps its buffers as unowned Julia vectors (so loops vectorize like
+# `Vector` loops) and holds the decoded `ArrayData`, whose buffer slices keep
+# the backing memory (a memory map, the input bytes, or a decompressed
+# buffer) reachable. Every access preserves the view, so memory a view can
+# read is memory that is alive. Views check no release flag: the facade never
+# unmaps a source eagerly (see `release!(::Table)`).
+# =============================================================================
+
+"""
+    Arrow.ArrowVector{T} <: AbstractVector{T}
+
+Supertype of the read-only columns `Arrow.Table` and `Arrow.Stream` return
+for flat, list, map, and struct layouts. A flat column reads its Arrow buffers in
+place (a memory-mapped file, the input bytes, or a decompressed buffer) and
+keeps that memory alive while the column is reachable, independent of its
+table. `copy(column)` returns an owned, mutable vector: a `Vector`, or a
+`PooledArray` for a dictionary-encoded column.
+"""
+abstract type ArrowVector{T} <: AbstractVector{T} end
+
+Base.IndexStyle(::Type{<:ArrowVector}) = IndexLinear()
+
+@noinline _readonlycolumn() = error(
+    "Arrow columns are read-only views of the data they were read from; " *
+    "copy(column), copy(table), or DataFrame(table) returns a mutable copy",
+)
+Base.setindex!(::ArrowVector, v, ::Int) = _readonlycolumn()
+# `push!` and `append!` resize first.
+Base.resize!(::ArrowVector, ::Integer) = _readonlycolumn()
+# Containers that know only a column's type (a `ChainedVector` whose batches
+# are all empty) allocate through this; a new vector is a mutable `Array`.
+Base.similar(::Type{<:ArrowVector{T}}, dims::Dims) where {T} = Array{T}(undef, dims)
+
+# --- buffer wrapping ------------------------------------------------------------
+
+"""
+A read-only vector of `S` values in memory that need not be aligned for `S`,
+read with unaligned loads. Arrow IPC buffers are aligned to 8 bytes (pyarrow
+writes no more), so 16- and 32-byte values (`Int128`, 128- and 256-bit
+decimals) start at a 16-byte boundary only half of the time. `owner` keeps
+the memory alive.
+"""
+struct _UnalignedVector{S} <: AbstractVector{S}
+    ptr::Ptr{S}
+    len::Int
+    owner::Any
+end
+Base.size(v::_UnalignedVector) = (v.len,)
+Base.IndexStyle(::Type{<:_UnalignedVector}) = IndexLinear()
+Base.@propagate_inbounds function Base.getindex(v::_UnalignedVector, i::Int)
+    @boundscheck checkbounds(v, i)
+    owner = v.owner
+    # `unsafe_load` loads with alignment 1.
+    return GC.@preserve owner unsafe_load(v.ptr, i)
+end
+function Base.copyto!(
+    dest::Vector{S},
+    doffs::Integer,
+    src::_UnalignedVector{S},
+    soffs::Integer,
+    n::Integer,
+) where {S}
+    n == 0 && return dest
+    (
+        n > 0 &&
+        checkbounds(Bool, dest, doffs:(doffs + n - 1)) &&
+        checkbounds(Bool, src, soffs:(soffs + n - 1))
+    ) || throw(BoundsError(dest, doffs:(doffs + n - 1)))
+    owner = src.owner
+    GC.@preserve dest owner unsafe_copyto!(
+        Ptr{UInt8}(pointer(dest, doffs)),
+        Ptr{UInt8}(src.ptr + (soffs - 1) * sizeof(S)),
+        n * sizeof(S),
+    )
+    return dest
+end
+
+Base.copy(v::_UnalignedVector{S}) where {S} =
+    copyto!(Vector{S}(undef, v.len), 1, v, 1, v.len)
+
+# How a column stores its `S` values: in place with unaligned loads when `S`
+# needs more than the 8-byte alignment Arrow buffers have, else a `Vector`.
+_buffertype(::Type{S}) where {S} =
+    Base.datatype_alignment(S) > 8 ? _UnalignedVector{S} : Vector{S}
+
+# An unowned vector over `n` elements of `S` starting `offset` elements into
+# `b` (a `_buffertype(S)`). Callers keep `b`'s region reachable for as long
+# as the vector is used. A start misaligned for `S` (possible only for
+# foreign or hand-built buffers) gets an owned, aligned `Vector` copy.
+function _wrapbuffer(
+    ::Type{S},
+    b::AC.BufferSlice,
+    offset::Int64,
+    n::Int64,
+    budget=nothing,
+) where {S}
+    isbitstype(S) || throw(ArgumentError("a wrapped buffer needs an isbits element type"))
+    unaligned = _buffertype(S) === _UnalignedVector{S}
+    n == 0 && return unaligned ? _UnalignedVector{S}(Ptr{S}(C_NULL), 0, nothing) : S[]
+    w = Int64(sizeof(S))
+    src = AC.subslice(b, AC.checked_mul(offset, w), AC.checked_mul(n, w))
+    p = AC.sliceptr(src)
+    unaligned && return _UnalignedVector{S}(Ptr{S}(p), Int(n), src)
+    if UInt(p) % Base.datatype_alignment(S) != 0
+        _chargeexact!(budget, S, n, "aligned buffer copy")
+        out = Vector{S}(undef, Int(n))
+        GC.@preserve out src begin
+            # `S` is known at run time; see `_uninferred`.
+            unsafe_copyto!(Ptr{UInt8}(_uninferred(pointer, out)::Ptr), p, Int(src.len))
+        end
+        return out
+    end
+    return unsafe_wrap(Array, Ptr{S}(p), Int(n))
+end
+
+# The validity bitmap bytes covering `d`'s slots and the bit position of slot
+# 1 in them; an empty vector when no slot is null.
+function _validitybits(d::AC.ArrayData)
+    v = AC.validitybuffer(d)
+    (AC.isempty_buffer(v) || AC.nullcount(d) == 0 || d.len == 0) && return UInt8[], 0
+    first = d.offset >> 3
+    nbytes = ((d.offset + d.len - 1) >> 3) - first + 1
+    return _wrapbuffer(UInt8, v, first, nbytes), Int(d.offset & 7)
+end
+
+@inline function _bitset(bits::Vector{UInt8}, bitoffset::Int, i::Int)
+    k = bitoffset + i - 1
+    return @inbounds((bits[(k >> 3) + 1] >> (k & 7)) & 0x01) == 0x01
+end
+
+@inline _isnullslot(validity::Vector{UInt8}, bitoffset::Int, i::Int) =
+    !isempty(validity) && !_bitset(validity, bitoffset, i)
+
+# --- storage conversions --------------------------------------------------------
+
+# `C` in `Primitive{T,S,C}` names how one stored `S` becomes a `T`;
+# `Nothing` means the layouts are identical.
+@inline _fromstorage(::Type{Nothing}, x) = x
+struct _DaysToDate end
+@inline _fromstorage(::Type{_DaysToDate}, x::Int32) =
+    Dates.Date(Dates.UTD(Int64(x) + _EPOCH_DAYS))
+struct _MillisToDateTime end
+@inline _fromstorage(::Type{_MillisToDateTime}, x::Int64) =
+    Dates.DateTime(Dates.UTM(x + Dates.UNIXEPOCH))
+"Time of day stored in ticks of `N` nanoseconds (range-checked when built)."
+struct _TimeOfDay{N} end
+@inline _fromstorage(::Type{_TimeOfDay{N}}, x) where {N} =
+    Dates.Time(Dates.Nanosecond(Int64(x) * N))
+struct _YearMonth end
+@inline _fromstorage(::Type{_YearMonth}, x::Int32) = Durations.Duration(x, 0, 0)
+struct _DayTime end
+@inline _fromstorage(::Type{_DayTime}, x::NTuple{2,Int32}) =
+    Durations.Duration(0, x[1], Int64(x[2]) * 1_000_000)
+"Stored bytes as a byte vector (the raw read of a decimal no `Decimal` type holds)."
+struct _StoredBytes end
+@inline _fromstorage(::Type{_StoredBytes}, x::NTuple{N,UInt8}) where {N} = collect(x)
+
+# The element type each conversion produces.
+_storagetarget(::Type{_DaysToDate}) = Dates.Date
+_storagetarget(::Type{_MillisToDateTime}) = Dates.DateTime
+_storagetarget(::Type{<:_TimeOfDay}) = Dates.Time
+_storagetarget(::Type{_YearMonth}) = Durations.Duration
+_storagetarget(::Type{_DayTime}) = Durations.Duration
+_storagetarget(::Type{_StoredBytes}) = Vector{UInt8}
+
+# --- fixed width ------------------------------------------------------------------
+
+"""
+    Arrow.Primitive{T,S,C,D} <: Arrow.ArrowVector{T}
+
+A fixed-width column: element `i` is the `i`th stored `S` value converted to
+`T` (the same bits when the layouts match), or `missing` where the validity
+bitmap marks a null. `D` is how the `S` values are held: a `Vector{S}`, or
+for 16- and 32-byte values, a view of their buffer read with unaligned loads.
+"""
+struct Primitive{T,S,C,D<:AbstractVector{S}} <: ArrowVector{T}
+    data::D
+    validity::Vector{UInt8}
+    bitoffset::Int
+    owner::Any
+end
+Primitive{T,S,C}(data::D, validity, bitoffset, owner) where {T,S,C,D<:AbstractVector{S}} =
+    Primitive{T,S,C,D}(data, validity, bitoffset, owner)
+
+Base.size(v::Primitive) = size(v.data)
+
+Base.@propagate_inbounds function Base.getindex(v::Primitive{T,S,C}, i::Int) where {T,S,C}
+    @boundscheck checkbounds(v, i)
+    x = GC.@preserve v @inbounds(v.data[i])
+    if Missing <: T
+        null = GC.@preserve v _isnullslot(v.validity, v.bitoffset, i)
+        null && return missing
+    end
+    return _fromstorage(C, x)
+end
+
+function _primitive(
+    ::Type{T},
+    ::Type{S},
+    ::Type{C},
+    d::AC.ArrayData,
+    budget=nothing,
+) where {T,S,C}
+    data = _wrapbuffer(S, AC.rolebuffer(d, AC.DATA), d.offset, d.len, budget)
+    validity, bitoffset = _validitybits(d)
+    return Primitive{T,S,C}(data, validity, bitoffset, d)
+end
+
+# One pass over the buffer, and its validity bitmap where some slot is null:
+# the stored values are the values.
+function Base.copyto!(
+    dest::Vector{T},
+    doffs::Integer,
+    src::Primitive{T,S,Nothing},
+    soffs::Integer,
+    n::Integer,
+) where {T,S}
+    n == 0 && return dest
+    (
+        n > 0 &&
+        checkbounds(Bool, dest, doffs:(doffs + n - 1)) &&
+        checkbounds(Bool, src, soffs:(soffs + n - 1))
+    ) || throw(BoundsError(dest, doffs:(doffs + n - 1)))
+    GC.@preserve src begin
+        data, bits, off = src.data, src.validity, src.bitoffset
+        if isempty(bits)
+            copyto!(dest, doffs, data, soffs, n)
+        else
+            # Validity is present only when some slot is null, so `T` has `Missing`.
+            @inbounds for i = 0:(n - 1)
+                dest[doffs + i] = _bitset(bits, off, soffs + i) ? data[soffs + i] : missing
+            end
+        end
+    end
+    return dest
+end
+
+Base.copy(v::Primitive{T,S,Nothing}) where {T,S} =
+    copyto!(Vector{T}(undef, length(v)), 1, v, 1, length(v))
+
+# Base's generic `map`, `filter`, and `collect` do not vectorize through the
+# per-access preserve. A view whose values are its stored layout (no nulls
+# can occur in a non-`Missing` element type) runs them on its buffer.
+Base.map(f, v::Primitive{T,T,Nothing}) where {T} = GC.@preserve v map(f, v.data)
+Base.filter(f, v::Primitive{T,T,Nothing}) where {T} = GC.@preserve v filter(f, v.data)
+Base.collect(v::Primitive{T,T,Nothing}) where {T} = GC.@preserve v copy(v.data)
+
+# Reductions over a view with no nulls run on its buffer, so they vectorize
+# as they do over a `Vector`.
+const _BufferPrimitive = Primitive{T,S,Nothing} where {T,S}
+function Base.mapreduce(f, op, A::_BufferPrimitive; kw...)
+    isempty(A.validity) && return GC.@preserve A mapreduce(f, op, A.data; kw...)
+    return invoke(mapreduce, Tuple{Any,Any,AbstractArray}, f, op, A; kw...)
+end
+function Base.mapreduce(f, op, itr::Base.SkipMissing{<:_BufferPrimitive})
+    A = itr.x
+    isempty(A.validity) && return GC.@preserve A mapreduce(f, op, A.data)
+    _maskablesum(f, op, A) && return GC.@preserve A _maskedsum(A)
+    return invoke(mapreduce, Tuple{Any,Any,Base.SkipMissing{<:AbstractArray}}, f, op, itr)
+end
+function Base.mapreduce(
+    f,
+    op,
+    itr::Base.SkipMissing{<:ChainedVector{T,<:_BufferPrimitive}},
+) where {T}
+    chunks = itr.x.arrays
+    if !isempty(chunks) &&
+       (all(c -> isempty(c.validity), chunks) || all(c -> _maskablesum(f, op, c), chunks))
+        return reduce(op, (mapreduce(f, op, skipmissing(c)) for c in chunks))
+    end
+    return invoke(mapreduce, Tuple{Any,Any,Base.SkipMissing{<:AbstractArray}}, f, op, itr)
+end
+
+# `sum(skipmissing(col))` over numbers with nulls: a branch-free pairwise sum
+# in which null slots add the neutral element (`-0.0` keeps the sign of an
+# all-`-0.0` float sum).
+_maskablesum(f, op, ::Primitive) = false
+_maskablesum(
+    ::typeof(identity),
+    ::Union{typeof(+),typeof(Base.add_sum)},
+    ::Primitive{T,<:Union{Base.BitInteger,Base.IEEEFloat},Nothing},
+) where {T} = true
+
+function _maskedsum(A::Primitive{T,S}) where {T,S}
+    R = typeof(Base.add_sum(zero(S), zero(S)))
+    neutral = S <: AbstractFloat ? -zero(R) : zero(R)
+    isempty(A.data) && return neutral
+    return _maskedsum(A.data, A.validity, A.bitoffset, 1, length(A.data), neutral)
+end
+function _maskedsum(
+    data::AbstractVector,
+    bits::Vector{UInt8},
+    off::Int,
+    lo::Int,
+    hi::Int,
+    neutral::R,
+) where {R}
+    if hi - lo < 1024
+        s = neutral
+        @inbounds @simd for i = lo:hi
+            k = off + i - 1
+            valid = (bits[(k >> 3) + 1] >> (k & 7)) & 0x01 == 0x01
+            s += ifelse(valid, R(data[i]), neutral)
+        end
+        return s
+    end
+    mid = (lo + hi) >>> 1
+    return _maskedsum(data, bits, off, lo, mid, neutral) +
+           _maskedsum(data, bits, off, mid + 1, hi, neutral)
+end
+
+# --- booleans ---------------------------------------------------------------------
+
+"""
+    Arrow.BoolVector{T} <: Arrow.ArrowVector{T}
+
+A boolean column read from its bit-packed values and validity bitmaps.
+"""
+struct BoolVector{T} <: ArrowVector{T}
+    values::Vector{UInt8}
+    valueoffset::Int
+    validity::Vector{UInt8}
+    bitoffset::Int
+    len::Int
+    owner::Any
+end
+
+Base.size(v::BoolVector) = (v.len,)
+
+Base.@propagate_inbounds function Base.getindex(v::BoolVector{T}, i::Int) where {T}
+    @boundscheck checkbounds(v, i)
+    if Missing <: T
+        null = GC.@preserve v _isnullslot(v.validity, v.bitoffset, i)
+        null && return missing
+    end
+    return GC.@preserve v _bitset(v.values, v.valueoffset, i)
+end
+
+function _boolvector(::Type{T}, d::AC.ArrayData) where {T}
+    validity, bitoffset = _validitybits(d)
+    d.len == 0 && return BoolVector{T}(UInt8[], 0, validity, bitoffset, 0, d)
+    first = d.offset >> 3
+    nbytes = ((d.offset + d.len - 1) >> 3) - first + 1
+    values = _wrapbuffer(UInt8, AC.rolebuffer(d, AC.DATA), first, nbytes)
+    return BoolVector{T}(values, Int(d.offset & 7), validity, bitoffset, Int(d.len), d)
+end
+
+# Non-null counts come from the validity bitmap.
+Base.count(
+    ::ComposedFunction{typeof(!),typeof(ismissing)},
+    A::Union{Primitive,BoolVector},
+) = length(A) - _nullslots(A)
+function _nullslots(A::Union{Primitive,BoolVector})
+    n = length(A)
+    (isempty(A.validity) || n == 0) && return 0
+    bits, off = A.validity, A.bitoffset
+    stop = off + n - 1
+    last = stop >> 3 + 1
+    valid = 0
+    GC.@preserve A begin
+        @inbounds @simd for k = 1:last
+            valid += count_ones(bits[k])
+        end
+        # Drop the bits before slot 1 and after slot n.
+        valid -= count_ones(bits[1] & ~(0xff << off))
+        valid -= count_ones(bits[last] & ~(0xff >> (7 - (stop & 7))))
+    end
+    return n - valid
+end
+
+# --- run-end encoding -------------------------------------------------------------
+
+"""
+    Arrow.RunEndEncoded{T,V} <: Arrow.ArrowVector{T}
+
+A run-end encoded column: element `i` is the value of the run that covers
+it, found by binary search over the run ends.
+"""
+struct RunEndEncoded{T,V<:AbstractVector} <: ArrowVector{T}
+    runends::Vector{Int64}
+    values::V
+    offset::Int
+    len::Int
+end
+
+Base.size(v::RunEndEncoded) = (v.len,)
+
+Base.@propagate_inbounds function Base.getindex(v::RunEndEncoded{T}, i::Int) where {T}
+    @boundscheck checkbounds(v, i)
+    # Validation proved the run ends ascending and covering every slot.
+    run = searchsortedfirst(v.runends, v.offset + i)
+    return @inbounds(v.values[run])::T
+end
+
+# --- dictionary encoding ----------------------------------------------------------
+
+"""
+    Arrow.DictEncoded{T} <: Arrow.ArrowVector{T}
+
+A dictionary-encoded column: each row is an index into a pool of values.
+`DataAPI.refarray`, `DataAPI.refpool`, and `DataAPI.levels` (in dictionary order)
+expose the encoding without decoding it, and `copy` returns a `PooledArray`. With
+CategoricalArrays loaded, `isordered` tells whether the dictionary is ordered.
+"""
+struct DictEncoded{T,R,P<:AbstractVector,I<:AbstractVector} <: ArrowVector{T}
+    indices::I
+    pool::P
+    ordered::Bool
+end
+
+Base.size(v::DictEncoded) = size(v.indices)
+
+Base.@propagate_inbounds function Base.getindex(v::DictEncoded{T}, i::Int) where {T}
+    @boundscheck checkbounds(v, i)
+    code = @inbounds v.indices[i]
+    code === missing && return missing
+    # Validation proved every valid index in [0, length(pool)).
+    return @inbounds(v.pool[Int(code) + 1])::T
+end
+
+"""
+The `DataAPI.refarray` of a dictionary column: the one-based pool position
+of each value, with 0 for a null slot.
+"""
+struct DictRefs{R,I<:AbstractVector} <: AbstractVector{R}
+    indices::I
+end
+Base.size(v::DictRefs) = size(v.indices)
+Base.IndexStyle(::Type{<:DictRefs}) = IndexLinear()
+Base.@propagate_inbounds function Base.getindex(v::DictRefs{R}, i::Int) where {R}
+    code = v.indices[i]
+    return code === missing ? zero(R) : R(code) + one(R)
+end
+
+"""
+The `DataAPI.refpool` of a dictionary column whose codes can be null: index
+0 holds `missing`, then the pool values in order.
+"""
+struct DictRefPool{T,P<:AbstractVector} <: AbstractVector{T}
+    pool::P
+end
+Base.size(v::DictRefPool) = (length(v.pool) + 1,)
+Base.axes(v::DictRefPool) = (Base.IdentityUnitRange(0:length(v.pool)),)
+Base.IndexStyle(::Type{<:DictRefPool}) = IndexLinear()
+Base.@propagate_inbounds Base.getindex(v::DictRefPool{T}, i::Int) where {T} =
+    i == 0 ? missing : convert(T, v.pool[i])
+
+# Codes widen by one step so `code + 1` never overflows.
+_reftype(::Type{R}) where {R<:Union{Int8,UInt8,Int16,UInt16}} = Int32
+_reftype(::Type{R}) where {R<:Union{Int32,UInt32,Int64,UInt64}} = Int64
+
+DataAPI.refarray(v::DictEncoded{T,R}) where {T,R} =
+    DictRefs{_reftype(R),typeof(v.indices)}(v.indices)
+DataAPI.refpool(v::DictEncoded{T}) where {T} =
+    Missing <: T ? DictRefPool{T,typeof(v.pool)}(v.pool) : v.pool
+DataAPI.levels(v::DictEncoded) = unique(skipmissing(v.pool))
+
+# Chunks that share one pool keep a column-wide encoding.
+_sharedpool(x::ChainedVector{T,<:DictEncoded}) where {T} =
+    all(c -> c.pool === x.arrays[1].pool, x.arrays)
+# Categories in dictionary order, as one batch's are: those of later batches'
+# dictionaries (deltas, replacements) follow the first's.
+function DataAPI.levels(x::ChainedVector{T,<:DictEncoded}) where {T}
+    isempty(x.arrays) && return Base.nonmissingtype(T)[]
+    _sharedpool(x) && return DataAPI.levels(x.arrays[1])
+    return unique!(reduce(vcat, [DataAPI.levels(c) for c in x.arrays]))
+end
+DataAPI.refarray(x::ChainedVector{T,<:DictEncoded}) where {T} =
+    isempty(x.arrays) || !_sharedpool(x) ? x :
+    ChainedVector([DataAPI.refarray(c) for c in x.arrays])
+DataAPI.refpool(x::ChainedVector{T,<:DictEncoded}) where {T} =
+    isempty(x.arrays) || !_sharedpool(x) ? nothing : DataAPI.refpool(x.arrays[1])
+
+Base.copy(v::DictEncoded{T}) where {T} = _pooledcopy(T, (v,))
+# The batches of a column copy into one `PooledArray`, whether they share a
+# pool, extend it (delta dictionaries), or replace it.
+Base.copy(c::ChainedVector{T,<:DictEncoded}) where {T} = _pooledcopy(T, c.arrays)
+
+function _pooledcopy(::Type{T}, chunks) where {T}
+    # Distinct values in first-pool-position order; duplicates and null
+    # pool entries remap so the PooledArray's invariants hold.
+    R = _ownedtype(T)
+    invpool = Dict{R,UInt32}()
+    pool = R[]
+    refs = Vector{UInt32}(undef, sum(length, chunks; init=0))
+    remap = UInt32[]
+    lastpool = nothing
+    at = 0
+    for v in chunks
+        if v.pool !== lastpool
+            remap = Vector{UInt32}(undef, length(v.pool))
+            for (k, x) in enumerate(v.pool)
+                value = _ownedvalue(x)
+                remap[k] = get!(invpool, value) do
+                    push!(pool, value)
+                    UInt32(length(pool))
+                end
+            end
+            lastpool = v.pool
+        end
+        for i in eachindex(v.indices)
+            code = @inbounds v.indices[i]
+            refs[at + i] = if code === missing
+                get!(invpool, missing) do
+                    push!(pool, missing)
+                    UInt32(length(pool))
+                end
+            else
+                @inbounds remap[Int(code) + 1]
+            end
+        end
+        at += length(v)
+    end
+    return PooledArrays.PooledArray(PooledArrays.RefArray(refs), invpool, pool)
+end
+
+# --- strings and binary -----------------------------------------------------------
+
+const _StringPayload = DataStrings.StringPayload
+
+# Byte runs at most this long fit DataStrings' Int32 view words.
+const _MAX_VIEW_BUFFER = Int64(typemax(Int32))
+
+# Rows per chunk when a string column builds on several tasks.
+const _STRING_CHUNK_ROWS = 1 << 16
+
+_isstringlayout(t::AC.ArrowType) =
+    t isa Union{AC.Utf8Type,AC.BinaryType,AC.ViewType} || _widebinary(t)
+
+"""
+Rows `first:last` of string batch `d`, whose output slots follow index `at`.
+An offsets layout (`utf8`/`binary`, normal or large) copies the rows' bytes
+into data buffer `buf` (0-based), which holds the batch's bytes from offset
+`lo` on. For a view layout `buf` is the batch's first data buffer, and a chunk
+with `variadic > 0` copies that buffer of the batch instead of encoding rows.
+"""
+struct _StringChunk
+    d::AC.ArrayData
+    at::Int
+    first::Int
+    last::Int
+    buf::Int
+    lo::Int64
+    variadic::Int
+    copybytes::Bool   # false: buffer `buf` is the batch's own decompressed data
+end
+
+"""
+A string or binary column under construction: the payloads and data buffers
+of a `StringVector`/`BytesVector` of type `V`, or the values of a
+`Vector{String}` (`V === String`). `_stringbuild` plans and charges it,
+`_allocate!` allocates it; its chunks are independent, so several tasks can
+fill them (`_buildchunk!`); `_finishbuild` returns the column.
+"""
+mutable struct _StringBuild{V,O}
+    n::Int                           # values
+    out::O                           # payloads or values, `n` long once allocated
+    buffers::Vector{Vector{UInt8}}   # data buffers: kept bytes, or copies once allocated
+    sizes::Vector{Int64}             # the bytes `_allocate!` gives buffer k (-1: kept)
+    chunks::Vector{_StringChunk}
+end
+
+function _allocate!(b::_StringBuild{V,O}) where {V,O}
+    b.out = O(undef, b.n)
+    for (k, len) in enumerate(b.sizes)
+        len >= 0 && (b.buffers[k] = Vector{UInt8}(undef, Int(len)))
+    end
+    return b
+end
+
+# Call `f` with the `n + 1` offsets of offsets-layout batch `d`. A fixed-size
+# binary batch's value `i` starts `(offset + i - 1) * width` bytes into its
+# data buffer.
+function _withoffsets(f, d::AC.ArrayData, budget=nothing)
+    t = d.type
+    n = Int64(d.len)
+    if t isa AC.FixedSizeBinaryType
+        w = Int64(t.nbytes)
+        o = Int64(d.offset)
+        return f((o * w):w:((o + n) * w))
+    end
+    offs = AC.rolebuffer(d, AC.OFFSETS)
+    return t.large ? f(_wrapbuffer(Int64, offs, d.offset, n + 1, budget)) :
+           f(_wrapbuffer(Int32, offs, d.offset, n + 1, budget))
+end
+
+function _rowchunks!(
+    chunks,
+    d,
+    at::Int,
+    first::Int,
+    last::Int,
+    buf::Int,
+    lo::Int64,
+    rows::Int,
+    copybytes::Bool=true,
+)
+    a = first
+    while a <= last
+        b = last - a >= rows ? a + rows - 1 : last
+        push!(chunks, _StringChunk(d, at, a, b, buf, lo, 0, copybytes))
+        a = b + 1
+    end
+    return chunks
+end
+
+# The decompressed bytes behind slice `b` when this read owns them and `b`
+# starts at their start, so a column can keep them instead of a copy.
+function _adoptbytes(b::AC.BufferSlice)
+    r = b.region
+    (r !== nothing && b.offset == 0 && r.root isa _Decompressed) || return nothing
+    return (r.root::_Decompressed).bytes
+end
+
+# Cut offsets batch `d` into runs of rows whose bytes span at most 2 GiB, one
+# data buffer each, and the runs into chunks.
+function _offsetruns!(
+    chunks,
+    buffers,
+    sizes,
+    d,
+    offsets::AbstractVector{O},
+    at::Int,
+    budget,
+    rows::Int,
+) where {O}
+    n = Int(d.len)
+    # Decompressed data is the read's own: the column keeps it as it is.
+    own = _adoptbytes(AC.rolebuffer(d, AC.DATA))
+    if own !== nothing && Int64(offsets[n + 1]) <= _MAX_VIEW_BUFFER
+        push!(buffers, own)
+        push!(sizes, -1)
+        return _rowchunks!(chunks, d, at, 1, n, length(buffers) - 1, Int64(0), rows, false)
+    end
+    i = 1
+    while i <= n
+        lo = Int64(offsets[i])
+        j = i
+        if Int64(offsets[n + 1]) - lo <= _MAX_VIEW_BUFFER
+            j = n + 1
+        else
+            while j <= n && Int64(offsets[j + 1]) - lo <= _MAX_VIEW_BUFFER
+                j += 1
+            end
+        end
+        j == i && throw(
+            ArgumentError(
+                "a string longer than 2 GiB does not fit a DataString; " *
+                "read the column with stringtype=String",
+            ),
+        )
+        hi = Int64(offsets[j])
+        _chargeexact!(budget, UInt8, hi - lo, "string column data")
+        push!(buffers, UInt8[])
+        push!(sizes, hi - lo)
+        _rowchunks!(chunks, d, at, i, j - 1, length(buffers) - 1, lo, rows)
+        i = j
+    end
+    return chunks
+end
+
+# The bytes the values of string batch `d` reference: its data span, or its
+# variadic buffers.
+_stringbytes(d::AC.ArrayData) =
+    d.type isa AC.ViewType ?
+    sum(k -> d.buffers[k].len, 3:length(d.buffers); init=Int64(0)) :
+    d.len == 0 ? Int64(0) : _withoffsets(o -> Int64(o[end]) - Int64(o[1]), d)
+
+"""
+Plan the column of string or binary batches `datas` with element type `T`:
+charge its output and data buffers (`_allocate!` allocates them), and cut its
+rows into chunks of at most `rows`. Each data buffer is one copy of a run of
+the referenced bytes; a run stays under 2 GiB so view offsets fit
+DataStrings' Int32 words.
+"""
+function _stringbuild(::Type{T}, datas, budget, rows::Int=typemax(Int)) where {T}
+    B = Base.nonmissingtype(T)
+    n = sum(d -> Int(d.len), datas; init=0)
+    chunks = _StringChunk[]
+    buffers = Vector{UInt8}[]
+    sizes = Int64[]
+    at = 0
+    if B === String
+        _chargeexact!(budget, T, n, "string column")
+        bytes = Int64(0)
+        for d in datas
+            _rowchunks!(chunks, d, at, 1, Int(d.len), 0, Int64(0), rows)
+            bytes = AC.checked_add(bytes, _stringbytes(d))
+            at += Int(d.len)
+        end
+        # One String object per value: its bytes plus a header and rounding.
+        budget === nothing || _charge!(
+            budget,
+            AC.checked_add(AC.checked_mul(Int64(n), Int64(32)), bytes),
+            "string values",
+        )
+        return _StringBuild{String,Vector{T}}(n, T[], buffers, sizes, chunks)
+    end
+    V =
+        B === DataStrings.DataString ? DataStrings.StringVector{T} :
+        DataStrings.BytesVector{T}
+    _chargeexact!(budget, _StringPayload, n, "string column payloads")
+    for d in datas
+        m = Int(d.len)
+        if d.type isa AC.ViewType
+            base = length(buffers)
+            for k = 3:length(d.buffers)
+                own = _adoptbytes(d.buffers[k])
+                if own !== nothing
+                    push!(buffers, own)
+                    push!(sizes, -1)
+                    continue
+                end
+                len = d.buffers[k].len
+                _chargeexact!(budget, UInt8, len, "string column data")
+                push!(buffers, UInt8[])
+                push!(sizes, len)
+                push!(chunks, _StringChunk(d, at, 1, 0, base, Int64(0), k, true))
+            end
+            _rowchunks!(chunks, d, at, 1, m, base, Int64(0), rows)
+        elseif m > 0
+            _withoffsets(
+                o -> _offsetruns!(chunks, buffers, sizes, d, o, at, budget, rows),
+                d,
+                budget,
+            )
+        end
+        at += m
+    end
+    return _StringBuild{V,Vector{_StringPayload}}(
+        n,
+        _StringPayload[],
+        buffers,
+        sizes,
+        chunks,
+    )
+end
+
+_finishbuild(b::_StringBuild{String}) = b.out
+_finishbuild(b::_StringBuild{V}) where {V} = V(b.out, b.buffers, Val(:trusted))
+
+"""
+A string or binary column of a whole-table read that builds when it is first
+taken from its table (`_force`): the read charges its allowance up front, and
+the payloads are built and the bytes copied on first access, on up to
+`ntasks` tasks. One task builds; tasks that ask meanwhile wait for it. The
+table hands out only the built column, so loops run over a `StringVector`
+(`BytesVector`, `Vector{String}`) as for an eager read.
+"""
+mutable struct _PendingStrings{T} <: AbstractVector{T}
+    const build::_StringBuild
+    const ntasks::Int
+    const lock::ReentrantLock
+    @atomic column::Union{Nothing,AbstractVector}
+end
+_PendingStrings{T}(b::_StringBuild, ntasks::Int) where {T} =
+    _PendingStrings{T}(b, ntasks, ReentrantLock(), nothing)
+
+Base.size(p::_PendingStrings) = (p.build.n,)
+Base.getindex(p::_PendingStrings, i::Int) = _force(p)[i]
+
+# A table column as it is handed out: a pending string column, built.
+_force(c::AbstractVector) = c isa _PendingStrings ? _forcestrings(c) : c
+function _forcestrings(p::_PendingStrings)
+    c = @atomic :acquire p.column
+    c === nothing || return c
+    return @lock p.lock begin
+        c = @atomic :acquire p.column
+        if c === nothing
+            b = _allocate!(p.build)
+            # `b`'s type is known at run time; see `_uninferred`.
+            build! = (k, _) -> (_buildchunk!(b, k); nothing)
+            _uninferred(_foreach, build!, length(b.chunks), p.ntasks)
+            c = _finishbuild(b)
+            @atomic :release p.column = c
+        end
+        c
+    end
+end
+
+"Fill chunk `k` of a string column under construction."
+function _buildchunk!(
+    b::_StringBuild{V,Vector{_StringPayload}},
+    k::Int,
+) where {V<:AbstractVector}
+    c = b.chunks[k]
+    d = c.d
+    if d.type isa AC.ViewType
+        c.variadic > 0 &&
+            return _copyvariadic!(b.buffers[c.buf + c.variadic - 2], d, c.variadic)
+        return _viewrows!(b.out, d, c)
+    end
+    buf = b.buffers[c.buf + 1]
+    return _withoffsets(o -> _offsetrows!(b.out, buf, d, o, c), d)
+end
+function _buildchunk!(b::_StringBuild{String}, k::Int)
+    c = b.chunks[k]
+    d = c.d
+    d.type isa AC.ViewType && return _viewstrings!(b.out, d, c)
+    return _withoffsets(o -> _offsetstrings!(b.out, d, o, c), d)
+end
+
+function _copyvariadic!(dst::Vector{UInt8}, d::AC.ArrayData, k::Int)
+    src = d.buffers[k]
+    GC.@preserve dst d unsafe_copyto!(pointer(dst), AC.sliceptr(src), length(dst))
+    return nothing
+end
+
+# Copy a chunk's bytes into its data buffer and encode its payloads.
+function _offsetrows!(
+    payloads,
+    buf::Vector{UInt8},
+    d::AC.ArrayData,
+    offsets::AbstractVector{O},
+    c,
+) where {O}
+    a = Int64(offsets[c.first])
+    z = Int64(offsets[c.last + 1])
+    if c.copybytes && z > a
+        src = AC.subslice(AC.rolebuffer(d, AC.DATA), a, z - a)
+        GC.@preserve buf d unsafe_copyto!(
+            pointer(buf, Int(a - c.lo) + 1),
+            AC.sliceptr(src),
+            Int(z - a),
+        )
+    end
+    validity, bitoffset = _validitybits(d)
+    GC.@preserve d _encodepayloads!(
+        payloads,
+        c.at,
+        buf,
+        offsets,
+        c.lo,
+        c.first,
+        c.last,
+        Int(z - c.lo),
+        validity,
+        bitoffset,
+        c.buf,
+    )
+    return nothing
+end
+
+@inline _load8(p::Ptr{UInt8}, i::Int) = ltoh(unsafe_load(Ptr{UInt64}(p + i)))
+
+# The payload of the `len` bytes at `p + start`, which may read 12 bytes from
+# `start` on: the length and up to four content bytes, then either the next
+# eight content bytes (inline, zero-padded) or the buffer index and offset.
+@inline function _payload(p::Ptr{UInt8}, start::Int, len::UInt64, viewword::UInt64)
+    w0 = _load8(p, start)
+    w1 = _load8(p, start + 4)
+    n4 = min(len, UInt64(4))
+    a = (len % UInt32) | ((w0 & ((UInt64(1) << (8 * n4)) - UInt64(1))) << 32)
+    n8 = min(max(len, UInt64(4)) - UInt64(4), UInt64(8))
+    inline = n8 == 8 ? w1 : w1 & ((UInt64(1) << (8 * n8)) - UInt64(1))
+    view = viewword | (UInt64(start % UInt32) << 32)
+    return _StringPayload(a, len <= DataStrings.INLINE_MAX ? inline : view)
+end
+
+"""
+Encode rows `first:last` of an offsets-based string batch as payloads over
+`buf`, the copy of the batch's bytes from offset `lo` on, reading only its
+first `limit` bytes. Rows whose 12-byte window ends within `limit` encode
+branch-free; the rows after them (inline, since their bytes end by `limit`)
+byte by byte.
+"""
+function _encodepayloads!(
+    payloads::Vector{_StringPayload},
+    at::Int,
+    buf::Vector{UInt8},
+    offsets::AbstractVector{O},
+    lo::Int64,
+    first::Int,
+    last::Int,
+    limit::Int,
+    validity::Vector{UInt8},
+    bitoffset::Int,
+    bufidx::Int=0,
+) where {O}
+    viewword = UInt64(bufidx % UInt32)
+    # Offsets ascend, so the rows with a whole window form a prefix.
+    fast = last
+    while fast >= first && Int64(offsets[fast]) - lo > limit - 12
+        fast -= 1
+    end
+    GC.@preserve buf begin
+        p = pointer(buf)
+        if isempty(validity)
+            @inbounds for k = first:fast
+                o = Int64(offsets[k])
+                payloads[at + k] =
+                    _payload(p, Int(o - lo), (Int64(offsets[k + 1]) - o) % UInt64, viewword)
+            end
+        else
+            @inbounds for k = first:fast
+                o = Int64(offsets[k])
+                x = _payload(p, Int(o - lo), (Int64(offsets[k + 1]) - o) % UInt64, viewword)
+                payloads[at + k] =
+                    _bitset(validity, bitoffset, k) ? x : DataStrings.PAYLOAD_MISSING
+            end
+        end
+        @inbounds for k = (fast + 1):last
+            start = Int(Int64(offsets[k]) - lo)
+            len = Int(Int64(offsets[k + 1]) - Int64(offsets[k]))
+            x = DataStrings.inline_payload(buf, start + 1, len)
+            payloads[at + k] =
+                _isnullslot(validity, bitoffset, k) ? DataStrings.PAYLOAD_MISSING : x
+        end
+    end
+    return payloads
+end
+
+# Zero the bytes after an inline payload's content, as DataStrings requires.
+@inline function _canonicalinline(p::_StringPayload)
+    len = Int(DataStrings.payloadlength(p))
+    len > DataStrings.INLINE_MAX && return p
+    a = len >= 4 ? p.a : p.a & ((UInt64(1) << (32 + 8 * len)) - 1)
+    nb = max(len - 4, 0)
+    b = nb >= 8 ? p.b : p.b & ((UInt64(1) << (8 * nb)) - 1)
+    return _StringPayload(a, b)
+end
+
+# The rows of a `utf8_view`/`binary_view` chunk: the view entries copied as
+# payloads (the layouts are identical), re-pointed at the batch's buffers
+# within the column's list.
+function _viewrows!(payloads::Vector{_StringPayload}, d::AC.ArrayData, c::_StringChunk)
+    views = _wrapbuffer(_StringPayload, AC.rolebuffer(d, AC.VIEWS), d.offset, Int64(d.len))
+    validity, bitoffset = _validitybits(d)
+    base = c.buf
+    GC.@preserve d for k = c.first:c.last
+        if _isnullslot(validity, bitoffset, k)
+            payloads[c.at + k] = DataStrings.PAYLOAD_MISSING
+            continue
+        end
+        p = _canonicalinline(views[k])
+        if base > 0 && DataStrings.payloadlength(p) > DataStrings.INLINE_MAX
+            p = _StringPayload(
+                p.a,
+                UInt64((DataStrings.payloadbufidx(p) + base) % UInt32) |
+                (UInt64(DataStrings.payloadoffset(p) % UInt32) << 32),
+            )
+        end
+        payloads[c.at + k] = p
+    end
+    return nothing
+end
+
+# `String`s of an offsets-based chunk, read from the batch's data.
+function _offsetstrings!(
+    out,
+    d::AC.ArrayData,
+    offsets::AbstractVector{O},
+    c::_StringChunk,
+) where {O}
+    a = Int64(offsets[c.first])
+    z = Int64(offsets[c.last + 1])
+    src = AC.subslice(AC.rolebuffer(d, AC.DATA), a, z - a)
+    validity, bitoffset = _validitybits(d)
+    GC.@preserve d begin
+        p = AC.sliceptr(src) - a
+        for k = c.first:c.last
+            o = Int64(offsets[k])
+            out[c.at + k] =
+                _isnullslot(validity, bitoffset, k) ? missing :
+                unsafe_string(p + o, Int(Int64(offsets[k + 1]) - o))
+        end
+    end
+    return nothing
+end
+
+# `String`s of a view chunk: inline bytes from the payload, others from the
+# batch's variadic buffers.
+function _viewstrings!(out, d::AC.ArrayData, c::_StringChunk)
+    views = _wrapbuffer(_StringPayload, AC.rolebuffer(d, AC.VIEWS), d.offset, Int64(d.len))
+    validity, bitoffset = _validitybits(d)
+    scratch = Vector{UInt8}(undef, 16)
+    GC.@preserve d scratch for k = c.first:c.last
+        if _isnullslot(validity, bitoffset, k)
+            out[c.at + k] = missing
+            continue
+        end
+        p = views[k]
+        len = Int(DataStrings.payloadlength(p))
+        out[c.at + k] = if len <= DataStrings.INLINE_MAX
+            q = pointer(scratch)
+            unsafe_store!(Ptr{UInt64}(q), htol((p.a >> 32) | (p.b << 32)))
+            unsafe_store!(Ptr{UInt64}(q + 8), htol(p.b >> 32))
+            unsafe_string(q, len)
+        else
+            data = d.buffers[DataStrings.payloadbufidx(p) + 3]
+            unsafe_string(
+                AC.sliceptr(AC.subslice(data, DataStrings.payloadoffset(p), len)),
+                len,
+            )
+        end
+    end
+    return nothing
+end
+
+# --- multi-batch columns -----------------------------------------------------------
+
+# Broadcasting over a column of several batches runs batch by batch, each
+# over its own view (as fast as over a `Vector`), instead of locating the
+# batch of every element.
+struct _ChainedStyle <: Broadcast.AbstractArrayStyle{1} end
+_ChainedStyle(::Val{1}) = _ChainedStyle()
+_ChainedStyle(::Val{N}) where {N} = Broadcast.DefaultArrayStyle{N}()
+Base.BroadcastStyle(::Type{<:ChainedVector{<:Any,<:ArrowVector}}) = _ChainedStyle()
+Base.similar(::Broadcast.Broadcasted{_ChainedStyle}, ::Type{T}, dims) where {T} =
+    similar(Array{T}, dims)
+Base.similar(::Broadcast.Broadcasted{_ChainedStyle}, ::Type{Bool}, dims) =
+    similar(BitArray, dims)
+
+function Base.copyto!(dest::AbstractVector, bc::Broadcast.Broadcasted{_ChainedStyle})
+    axes(dest) == axes(bc) || Broadcast.throwdm(axes(dest), axes(bc))
+    c = _drivingchain(bc)
+    c === nothing && return copyto!(dest, convert(Broadcast.Broadcasted{Nothing}, bc))
+    for r in _batchranges(c)
+        part = Broadcast.instantiate(_batchargs(bc, r))
+        if dest isa BitVector
+            # Bits pack fastest into a BitVector of their own.
+            bits = copyto!(BitVector(undef, length(r)), part)
+            copyto!(dest, first(r), bits, 1, length(r))
+        else
+            copyto!(view(dest, r), part)
+        end
+    end
+    return dest
+end
+
+# Without a concrete element type, Base narrows the result to the values it
+# computes (`x .+ 1` over a nullable column with no nulls gives a
+# `Vector{Int}`): each batch narrows on its own, and the batches join under
+# the same widening (`promote_typejoin`).
+function Base.copy(bc::Broadcast.Broadcasted{_ChainedStyle})
+    c = _drivingchain(bc)
+    c === nothing && return copy(_elementwise(bc))
+    E = Broadcast.combine_eltypes(bc.f, bc.args)
+    isconcretetype(E) && return copyto!(similar(bc, E), bc)
+    ranges = _batchranges(c)
+    parts = [copy(Broadcast.instantiate(_batchargs(bc, r))) for r in ranges]
+    isempty(parts) && return copy(_elementwise(bc))
+    T = mapreduce(eltype, Base.promote_typejoin, parts)
+    dest = similar(bc, T)
+    for (r, part) in zip(ranges, parts)
+        copyto!(dest, first(r), part, 1, length(part))
+    end
+    return dest
+end
+
+_elementwise(bc::Broadcast.Broadcasted) =
+    Broadcast.Broadcasted{Broadcast.DefaultArrayStyle{1}}(bc.f, bc.args, bc.axes)
+
+# The column the broadcast is cut by (its first multi-batch view argument), or
+# `nothing` when some argument cannot be cut into rows (a tuple, an array of
+# other dimensions).
+_drivingchain(bc::Broadcast.Broadcasted) =
+    all(_cuttable, bc.args) ? _firstchain(bc) : nothing
+
+# The row ranges of `c`'s batches, empty batches left out.
+function _batchranges(c::ChainedVector)
+    ranges = UnitRange{Int}[]
+    lo = 1
+    for a in c.arrays
+        n = length(a)
+        n > 0 && push!(ranges, lo:(lo + n - 1))
+        lo += n
+    end
+    return ranges
+end
+
+# Arguments a broadcast can be cut into rows by: vectors, scalars, and
+# broadcasts of them (not tuples or other arrays).
+_cuttable(a::Broadcast.Broadcasted) = all(_cuttable, a.args)
+_cuttable(a::AbstractVector) = axes(a, 1) isa Base.OneTo
+_cuttable(a) = axes(a) == ()
+
+_firstchain(a::ChainedVector{<:Any,<:ArrowVector}) = a
+function _firstchain(a::Broadcast.Broadcasted)
+    for x in a.args
+        c = _firstchain(x)
+        c === nothing || return c
+    end
+    return nothing
+end
+_firstchain(a) = nothing
+
+# `bc` restricted to rows `r`: a column whose batch is exactly `r` gives that
+# batch, other vectors a view, and scalars and length-1 vectors stay whole.
+_batchargs(bc::Broadcast.Broadcasted, r) =
+    Broadcast.Broadcasted(bc.f, map(a -> _batcharg(a, r), bc.args))
+_batcharg(a::Broadcast.Broadcasted, r) = _batchargs(a, r)
+function _batcharg(a::ChainedVector{<:Any,<:ArrowVector}, r)
+    k = searchsortedfirst(a.inds, last(r))
+    k <= length(a.inds) &&
+        a.inds[k] == last(r) &&
+        (k == 1 ? 0 : a.inds[k - 1]) == first(r) - 1 &&
+        return a.arrays[k]
+    return view(a, r)
+end
+_batcharg(a::AbstractVector, r) = length(a) == 1 ? a : view(a, r)
+_batcharg(a, r) = a
+
+# --- column assembly --------------------------------------------------------------
+
+# Shared decimals read as `DataDecimals.Decimal{P,S,T}`, which has the storage
+# layout of every Arrow decimal width.
+_isbulkdecimal(f::AC.Field) = f.type isa AC.DecimalType && _shareddecimal(f.type)
+"One batch of a decimal column, read as stored."
+_decimalcolumn(f::AC.Field, d::AC.ArrayData, budget=nothing) =
+    _viewcolumn(f, AC.ArrayData[d], _ViewContext(DataStrings.DataString, budget))
+
+# One read's view settings, its allocation budget, and its cache of
+# dictionary pools (built once per pool snapshot; columns building on several
+# tasks share it under the lock).
+struct _ViewContext
+    stringtype::Type
+    budget::Union{Nothing,AllocationBudget}
+    pools::IdDict{AC.ArrayData,AbstractVector}
+    poolslock::ReentrantLock
+end
+_ViewContext(stringtype::Type=DataStrings.DataString, budget=nothing) =
+    _ViewContext(stringtype, budget, IdDict{AC.ArrayData,AbstractVector}(), ReentrantLock())
+# The same settings and pool cache under another allowance (`Arrow.Stream` batches).
+_ViewContext(ctx::_ViewContext, budget) =
+    _ViewContext(ctx.stringtype, budget, ctx.pools, ctx.poolslock)
+
+# The view column of a dictionary's values, built once per pool snapshot. The
+# build runs outside the lock; a concurrent duplicate is dropped.
+function _dictpool(ctx::_ViewContext, vf::AC.Field, dict::AC.ArrayData)
+    pool = @lock ctx.poolslock get(ctx.pools, dict, nothing)
+    pool === nothing || return pool
+    built = _viewcolumn(vf, AC.ArrayData[dict], ctx)
+    return @lock ctx.poolslock get!(ctx.pools, dict, built)
+end
+
+function _markpools!(live, data::AC.ArrayData, cached)
+    dict = data.dictionary
+    if dict !== nothing
+        haskey(cached, dict) && (live[dict] = nothing)
+        _markpools!(live, dict, cached)
+    end
+    foreach(child -> _markpools!(live, child, cached), data.children)
+    return nothing
+end
+
+# A stream reuses current pools, but only returned tables may keep old ones alive.
+function _prunepools!(ctx::_ViewContext, columns, budget)
+    lock(ctx.poolslock) do
+        isempty(ctx.pools) && return nothing
+        _chargedict!(budget, AC.ArrayData, Nothing, length(ctx.pools), "live stream pools")
+        live = IdDict{AC.ArrayData,Nothing}()
+        foreach(data -> _markpools!(live, data, ctx.pools), columns)
+        filter!(entry -> haskey(live, first(entry)), ctx.pools)
+        return nothing
+    end
+    return nothing
+end
+
+# A view object's own size (struct, wrapped vector headers), charged per batch.
+const _VIEW_OBJECT_BYTES = Int64(256)
+
+function _checkstringtype(stringtype)
+    stringtype === DataStrings.DataString ||
+        stringtype === String ||
+        throw(ArgumentError("stringtype must be DataString or String, got $stringtype"))
+    return stringtype
+end
+
+"""
+Whether `f` reads through this file's columns: a flat layout (as a view) or
+a list, fixed-size list, map, struct, or union of such layouts (as typed
+rows). An ArrowTypes extension label keeps the materializing path unless it
+maps to no Julia type (see `_storagelabel`) or is a fixed-shape tensor. List
+views, structs with duplicate or more than 64 field names, and layouts
+nested more than 8 deep also keep the materializing path.
+"""
+function _viewable(f::AC.Field)
+    if _hasarrowtypesextension(f)
+        _tensorshape(f) === nothing || return true
+        _storagelabel(f) || return false
+    end
+    return _viewablelayout(f)
+end
+
+# Whether `f` carries an extension label that reads as its storage: a quiet
+# canonical label (`arrow.json`, `arrow.opaque`), or a label the facade does
+# not own and no ArrowTypes.jl `JuliaType` method names, which warns once
+# per process. Other labels, and labels below the top level, keep the
+# materializing path, which resolves ArrowTypes.jl hooks once per field.
+function _storagelabel(f::AC.Field)
+    ext = _arrowtypesextension(f)
+    ext === nothing && return false
+    any(_hasarrowtypesextension, f.children) && return false
+    name = first(ext)
+    _quietextension(name) && return true
+    _facadelabel(name) && return false
+    # A name that is not a Symbol yet cannot be registered; looking it up
+    # does not intern it.
+    sym = _existingjlsymbol(name)
+    sym === nothing || !_juliatypenames(sym) || return false
+    _warnunsupportedextension((warn=true, budget=nothing), name, f)
+    return true
+end
+
+# Whether an `ArrowTypes.JuliaType` method other than its catch-all
+# fallbacks can take `Val(sym)` as its first argument.
+_juliatypenames(sym::Symbol) = any(methods(ArrowTypes.JuliaType)) do m
+    sig = Base.unwrap_unionall(m.sig)
+    length(sig.parameters) >= 2 || return false
+    arg = Base.rewrap_unionall(sig.parameters[2], m.sig)
+    return arg !== Any && Val{sym} <: arg
+end
+
+_facadelabel(name::String) =
+    name in (_UUID_EXTENSION, "JuliaLang.Int128", "JuliaLang.UInt128", "arrow.bool8") ||
+    any(p -> last(p) == name, _FACADE_PERIOD_NAMES)
+function _viewablelayout(f::AC.Field, depth::Int=0)
+    t = f.type
+    t isa Union{
+        AC.IntType,
+        AC.FloatType,
+        AC.BoolType,
+        AC.DateType,
+        AC.TimeType,
+        AC.TimestampType,
+        AC.DurationType,
+        AC.IntervalType,
+        AC.FixedSizeBinaryType,
+        AC.Utf8Type,
+        AC.BinaryType,
+        AC.ViewType,
+        AC.NullType,
+    } && return true
+    t isa AC.DecimalType && return true
+    t isa AC.DictionaryType && return _viewablelayout(AC.dictvaluefield(f, t), depth)
+    t isa AC.RunEndEncodedType &&
+        return length(f.children) == 2 && _viewablelayout(f.children[2], depth)
+    # Row types nest one type per level, and Julia compiles deep ones slowly.
+    t isa _NestedLayout && depth == _MAX_ROW_DEPTH && return false
+    viewable(c) = _viewablelayout(c, depth + 1)
+    t isa Union{AC.ListType,AC.FixedSizeListType} &&
+        return length(f.children) == 1 && viewable(f.children[1])
+    # A list view gathers its rows' values, which it does for flat values.
+    t isa AC.ListViewType && return length(f.children) == 1 &&
+           !_nestedvalue(f.children[1]) &&
+           viewable(f.children[1])
+    if t isa AC.MapType
+        length(f.children) == 1 || return false
+        entries = f.children[1]
+        return entries.type isa AC.StructType &&
+               length(entries.children) == 2 &&
+               all(viewable, entries.children)
+    end
+    t isa AC.StructType && return length(f.children) <= _MAX_ROW_FIELDS &&
+           allunique(String[c.name for c in f.children]) &&
+           all(viewable, f.children)
+    t isa AC.UnionType && return !isempty(f.children) && all(viewable, f.children)
+    return false
+end
+
+# Fixed-size binary values wider than this read as `DataBytes`: code over
+# an `NTuple{N,UInt8}` compiles in time that grows faster than `N` (minutes
+# at 16 KiB), and a hostile schema can declare any width.
+const _MAX_TUPLE_BYTES = 256
+_widebinary(t::AC.ArrowType) = t isa AC.FixedSizeBinaryType && t.nbytes > _MAX_TUPLE_BYTES
+
+# The stored element type and storage conversion of a fixed-width layout.
+function _fixedstorage(t::AC.ArrowType)
+    t isa AC.IntType && return AC.juliatype(t), Nothing
+    t isa AC.FloatType && return AC.juliatype(t), Nothing
+    if t isa AC.DecimalType
+        _shareddecimal(t) && return _decimalhost(t), Nothing
+        # Other decimals read as stored: integers, or bytes at 128 and 256 bits.
+        t.bits <= 64 && return (t.bits == 32 ? Int32 : Int64), Nothing
+        return NTuple{t.bits ÷ 8,UInt8}, _StoredBytes
+    end
+    t isa AC.TimestampType && return _facadebasetype(t), Nothing
+    t isa AC.DurationType && return _facadebasetype(t), Nothing
+    t isa AC.FixedSizeBinaryType && return NTuple{t.nbytes,UInt8}, Nothing
+    t isa AC.DateType &&
+        return t.unit == AC.DAY ? (Int32, _DaysToDate) : (Int64, _MillisToDateTime)
+    if t isa AC.TimeType
+        S = t.bits == 32 ? Int32 : Int64
+        return S, _TimeOfDay{_NANOS_PER_DAY ÷ _timeticksperday(t.unit)}
+    end
+    if t isa AC.IntervalType
+        t.unit == AC.YEAR_MONTH && return Int32, _YearMonth
+        t.unit == AC.DAY_TIME && return NTuple{2,Int32}, _DayTime
+        return Durations.Duration, Nothing
+    end
+    throw(ArgumentError("no fixed-width storage for $(AC.descriptorname(t))"))
+end
+
+_timeticksperday(unit) =
+    unit == AC.SECOND ? Int64(86_400) :
+    unit == AC.MILLISECOND ? Int64(86_400_000) :
+    unit == AC.MICROSECOND ? Int64(86_400_000_000) : _NANOS_PER_DAY
+
+"""
+The public element type of a column, before nullability. Nested rows take
+their children's element types over `datas`, the batches being read, so a
+child whose data holds undeclared nulls widens the row type of every batch.
+"""
+function _viewbasetype(f::AC.Field, ctx::_ViewContext, datas=AC.ArrayData[])
+    t = f.type
+    t isa AC.NullType && return Missing
+    t isa AC.BoolType && return Bool
+    t isa Union{AC.Utf8Type,AC.ViewType} &&
+        (!(t isa AC.ViewType) || t.utf8) &&
+        return ctx.stringtype === String ? String : DataStrings.DataString
+    (t isa Union{AC.BinaryType,AC.ViewType} || _widebinary(t)) &&
+        return DataStrings.DataBytes
+    t isa AC.DictionaryType && return _viewbasetype(AC.dictvaluefield(f, t), ctx)
+    t isa AC.RunEndEncodedType && return _viewbasetype(f.children[2], ctx)
+    shape = _tensorshape(f)
+    shape === nothing || return _tensortype(f, ctx, datas, shape)
+    t isa _NestedLayout && return _rowtype(f, ctx, datas)
+    S, C = _fixedstorage(t)
+    return C === Nothing ? S : _storagetarget(C)
+end
+
+# Physical nulls the column's values can hold, through dictionary pools and
+# run-end values.
+function _viewnulls(f::AC.Field, d::AC.ArrayData)
+    t = f.type
+    t isa AC.NullType && return d.len > 0
+    if t isa AC.RunEndEncodedType
+        return _viewnulls(f.children[2], d.children[2])
+    end
+    if t isa AC.DictionaryType
+        AC.nullcount(d) > 0 && return true
+        dict = d.dictionary::AC.ArrayData
+        return _viewnulls(AC.dictvaluefield(f, t), dict)
+    end
+    return AC.nullcount(d) > 0
+end
+
+# The declared type decides `Missing` (`_declaredeltype` is the authority);
+# data that holds nulls a non-nullable declaration did not admit widens the
+# column, as on every other read path.
+function _vieweltype(f::AC.Field, datas, ctx::_ViewContext)
+    B = _viewbasetype(f, ctx, datas)
+    B === Missing && return Missing
+    # A union has no validity of its own: its children's types carry nulls.
+    f.type isa AC.UnionType && return B
+    nullable = Missing <: _declaredeltype(f, true) || any(d -> _viewnulls(f, d), datas)
+    return nullable ? Union{Missing,B} : B
+end
+
+function _checktimes(f::AC.Field, t::AC.TimeType, d::AC.ArrayData, budget)
+    perday = _timeticksperday(t.unit)
+    S = t.bits == 32 ? Int32 : Int64
+    col = _primitive(Union{Missing,S}, S, Nothing, d, budget)
+    for x in col
+        (x === missing || 0 <= x < perday) && continue
+        P = nameof(_unitperiod(t.unit))
+        throw(
+            ValidationError(
+                "column $(repr(f.name)): time-of-day value $x is outside [0, $perday) " *
+                "in its unit; read the column as durations since midnight with " *
+                "`scan=Tables.Scan(select=($(_uninferred(repr, Symbol(f.name))::String) " *
+                "=> Dates.$P,))`",
+            ),
+        )
+    end
+    return nothing
+end
+
+# The period of one tick of a time-of-day unit.
+_unitperiod(unit) =
+    unit == AC.SECOND ? Dates.Second :
+    unit == AC.MILLISECOND ? Dates.Millisecond :
+    unit == AC.MICROSECOND ? Dates.Microsecond : Dates.Nanosecond
+
+# Time-of-day storage `raw` read as `P` periods since midnight: the scan
+# override that reads times a `Dates.Time` cannot hold.
+function _timeperiods(t::AC.TimeType, raw, ::Type{P}) where {P}
+    unit = _unitperiod(t.unit)
+    out = Vector{Missing<:eltype(raw) ? Union{Missing,P} : P}(undef, length(raw))
+    for i in eachindex(out, raw)
+        x = raw[i]
+        out[i] = x === missing ? missing : convert(P, unit(x))
+    end
+    return out
+end
+
+# One batch of a view column. Nested layouts skip `_batchview`, whose body
+# for every flat layout would otherwise compile once per row type.
+_viewbatch(T::Type, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext) =
+    f.type isa _NestedLayout ? _nestedbatch(T, f, d, ctx) : _batchview(T, f, d, ctx)
+
+"""
+One batch of a fixed-width, boolean, dictionary, or run-end view column.
+`T` is only passed on, so this body compiles once, not once per element type
+(every time zone and decimal scale is a type of its own).
+"""
+function _batchview(T::Type, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext)
+    t = f.type
+    budget = ctx.budget
+    _chargeobject!(budget, _VIEW_OBJECT_BYTES, "column view")
+    t isa AC.BoolType && return _boolvector(T, d)
+    t isa AC.DictionaryType && return _dictview(T, f, t, d, ctx)
+    t isa AC.RunEndEncodedType && return _runendview(T, f, d, ctx)
+    t isa AC.TimeType && _checktimes(f, t, d, budget)
+    S, C = _fixedstorage(t)
+    return _primitive(T, S, C, d, budget)
+end
+
+function _dictview(
+    ::Type{T},
+    f::AC.Field,
+    t::AC.DictionaryType,
+    d::AC.ArrayData,
+    ctx::_ViewContext,
+) where {T}
+    pool = _dictpool(ctx, AC.dictvaluefield(f, t), d.dictionary::AC.ArrayData)
+    R = AC.juliatype(t.indextype)
+    indices = _primitive(Missing <: T ? Union{Missing,R} : R, R, Nothing, d, ctx.budget)
+    return DictEncoded{T,R,typeof(pool),typeof(indices)}(indices, pool, t.ordered)
+end
+
+function _runendview(::Type{T}, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext) where {T}
+    runs, values = d.children[1], d.children[2]
+    R = AC.juliatype(runs.type::AC.IntType)
+    _chargeexact!(ctx.budget, Int64, runs.len, "run ends")
+    runends = _collectas(Int64, _primitive(R, R, Nothing, runs, ctx.budget))
+    vcol = _viewcolumn(f.children[2], [values], ctx, T)
+    return RunEndEncoded{T,typeof(vcol)}(runends, vcol, Int(d.offset), Int(d.len))
+end
+
+"""
+The view column of field `f` over its decoded batches `datas`: one view for
+one batch, a `ChainedVector` of per-batch views for several, and one
+`StringVector`/`BytesVector` (or `Vector{String}`) across all batches of a
+string or binary column. `T` overrides the element type (run-end values).
+"""
+function _viewcolumn(
+    f::AC.Field,
+    datas::AbstractVector{AC.ArrayData},
+    ctx::_ViewContext,
+    T::Type=_vieweltype(f, datas, ctx),
+)
+    t = f.type
+    t isa AC.NullType && return fill(missing, sum(d -> Int(d.len), datas; init=0))
+    if _isstringlayout(t)
+        b = _allocate!(_stringbuild(T, datas, ctx.budget))
+        for k in eachindex(b.chunks)
+            _buildchunk!(b, k)
+        end
+        return _finishbuild(b)
+    end
+    isempty(datas) && return T[]
+    first = _viewbatch(T, f, datas[1], ctx)
+    length(datas) == 1 && return first
+    # `first`'s type is known at run time; see `_uninferred`.
+    return _uninferred(_chainviews, first, f, datas, ctx, T)
+end
+
+# A concretely typed chunk vector (a comprehension over `_batchview` would
+# infer its element type at run time, per column). Batches whose views differ
+# in type (dictionary pools that differ in nullability) chain abstractly.
+function _chainviews(first::V, f::AC.Field, datas, ctx::_ViewContext, T::Type) where {V}
+    _chargevector!(ctx.budget, V, length(datas), "column views")
+    _chargevector!(ctx.budget, Int, length(datas), "chunked column index")
+    cols = Vector{V}(undef, length(datas))
+    cols[1] = first
+    for k = 2:length(datas)
+        col = _viewbatch(T, f, datas[k], ctx)
+        # The abstract chain compiles apart (see `_uninferred`).
+        col isa V || return _uninferred(_mixedchainviews, first, f, datas, ctx, T)
+        cols[k] = col
+    end
+    return ChainedVector(cols)
+end
+
+_mixedchainviews(first, f::AC.Field, datas, ctx::_ViewContext, T::Type) = ChainedVector(
+    AbstractVector{T}[
+        k == 1 ? first : _viewbatch(T, f, d, ctx) for (k, d) in enumerate(datas)
+    ],
+)
+
+# --- nested rows ----------------------------------------------------------------
+#
+# Lists read as `ListValue` views, maps as `MapValue` views, fixed-size lists of up
+# to 64 non-null values as `NTuple`s, structs as `NamedTuple`s built on access,
+# and unions as a `Union` of their children's element types. A column's
+# element type alone fixes how its child values are stored (`_columntype`):
+# strings in a `StringVector`, binary in a `BytesVector`, lists in a
+# `ListVector`, maps in a `MapVector`, structs in a `StructVector`, other
+# fixed-width values in a `Primitive{E,S,Nothing}` (`S` the non-missing `E`),
+# other values in a `Vector`. Columns keep their children untyped and read
+# them back through that type, so a column type has only its element type as
+# a parameter, however deep the schema, and access is type-stable. A
+# fixed-width child whose stored layout is its values views the source, as a
+# top-level column does, and keeps it alive; other children are owned copies.
+
+const _NestedLayout = Union{
+    AC.ListType,
+    AC.ListViewType,
+    AC.FixedSizeListType,
+    AC.MapType,
+    AC.StructType,
+    AC.UnionType,
+}
+const _MAX_ROW_FIELDS = 64
+# Each level nests a `Union{Missing,...}` in the row type, and the first read's
+# compile time grows steeply with it: on Julia 1.13, lists 10 deep take about
+# 1.5 s, 17 deep about 50 s, and structs 32 deep over 8 minutes.
+const _MAX_ROW_DEPTH = 8
+const _MAX_TUPLE_ROW = 64
+
+"""
+    Arrow.ListValue{T} <: AbstractVector{T}
+
+A row of a list column, or of a fixed-size list column longer than 64 values
+or with nullable values: a read-only view of consecutive child values of its
+column. It stays valid after its table is gone. `copy(row)` gives a
+`Vector{T}`.
+"""
+struct ListValue{T} <: AbstractVector{T}
+    values::Any   # the column's child values, a `_columntype(T)`
+    offset::Int   # child values before the row's first
+    len::Int
+end
+
+"""
+    Arrow.MapValue{K,V} <: AbstractDict{K,V}
+
+A row of a map column: a read-only dictionary that iterates the map's
+`key => value` entries in stored order, duplicate keys included, which `length`
+counts. `row[key]`, `get`, and `haskey` find the last entry with that key, the
+one `Dict(row)` keeps; `keys(row)` and `values(row)` are vectors in stored
+order. Each lookup scans the row, so for many lookups in a large map
+`Dict(row)` is faster. `collect(row)` gives the `Vector{Pair{K,V}}` of entries
+and `copy(row)` a `Dict{K,V}`. It stays valid after its table is gone.
+"""
+struct MapValue{K,V} <: AbstractDict{K,V}
+    keys::Any     # the column's keys and values, `_columntype(K)`, `_columntype(V)`
+    values::Any
+    offset::Int
+    len::Int
+end
+
+# List and map offsets: the batch's `Int32` (`Int64` for the large layouts)
+# offsets, or ones the read computed.
+const _Offsets = Union{Vector{Int32},Vector{Int64}}
+
+"""
+    Arrow.ListVector{T} <: Arrow.ArrowVector{T}
+
+A list column: row `i` is the [`Arrow.ListValue`](@ref) of child values
+`offsets[i]+1:offsets[i+1]`, or `missing` where the validity bitmap marks a
+null.
+"""
+struct ListVector{T} <: ArrowVector{T}
+    offsets::_Offsets   # the batch's own offsets where it can (see `_listoffsets`)
+    values::Any   # child values, a `_columntype(eltype(row))`
+    validity::Vector{UInt8}
+    bitoffset::Int
+    owner::Any
+end
+
+"""
+    Arrow.MapVector{T} <: Arrow.ArrowVector{T}
+
+A map column: row `i` is the [`Arrow.MapValue`](@ref) of entries
+`offsets[i]+1:offsets[i+1]`, or `missing` where the validity bitmap marks a
+null.
+"""
+struct MapVector{T} <: ArrowVector{T}
+    offsets::_Offsets
+    keys::Any
+    values::Any
+    validity::Vector{UInt8}
+    bitoffset::Int
+    owner::Any
+end
+
+"""
+    Arrow.StructVector{T} <: Arrow.ArrowVector{T}
+
+A struct column: row `i` is the `NamedTuple` of each field's value `i`,
+built when it is read, or `missing` where the validity bitmap marks a null.
+"""
+struct StructVector{T} <: ArrowVector{T}
+    children::Vector{AbstractVector}   # field `k`'s values, a `_columntype(fieldtype(row, k))`
+    offset::Int                        # child values before row 1
+    len::Int
+    validity::Vector{UInt8}
+    bitoffset::Int
+    owner::Any
+end
+
+_columntype(::Type{T}) where {T} = _columntype(T, Base.nonmissingtype(T))
+_columntype(::Type{Missing}) = Vector{Missing}
+_columntype(::Type{T}, ::Type{S}) where {T,S} =
+    isbitstype(S) && S !== Bool ? Primitive{T,S,Nothing,_buffertype(S)} : Vector{T}
+_columntype(::Type{T}, ::Type{DataStrings.DataString}) where {T} =
+    DataStrings.StringVector{T}
+_columntype(::Type{T}, ::Type{DataStrings.DataBytes}) where {T} = DataStrings.BytesVector{T}
+# A `Union` of row types (a union column's values) is stored as a `Vector`.
+_columntype(::Type{T}, ::Type{R}) where {T,R<:ListValue} =
+    R isa DataType ? ListVector{T} : Vector{T}
+_columntype(::Type{T}, ::Type{R}) where {T,R<:MapValue} =
+    R isa DataType ? MapVector{T} : Vector{T}
+_columntype(::Type{T}, ::Type{R}) where {T,R<:NamedTuple} =
+    R isa DataType ? StructVector{T} : Vector{T}
+
+_childdatas(datas, k::Int) = AC.ArrayData[d.children[k] for d in datas]
+
+# The row type of nested field `f` over batches `datas`: each child's element
+# type, so a child whose data holds undeclared nulls widens every batch's rows.
+function _rowtype(f::AC.Field, ctx::_ViewContext, datas)
+    t = f.type
+    if t isa AC.StructType
+        names = Tuple(Symbol(c.name) for c in f.children)
+        types =
+            (_vieweltype(c, _childdatas(datas, k), ctx) for (k, c) in enumerate(f.children))
+        return NamedTuple{names,Tuple{types...}}
+    end
+    t isa AC.UnionType && return Union{
+        (_vieweltype(c, _childdatas(datas, k), ctx) for (k, c) in enumerate(f.children))...,
+    }
+    if t isa AC.MapType
+        entries = f.children[1]
+        entrydatas = _childdatas(datas, 1)
+        K = _vieweltype(entries.children[1], _childdatas(entrydatas, 1), ctx)
+        V = _vieweltype(entries.children[2], _childdatas(entrydatas, 2), ctx)
+        return MapValue{K,V}
+    end
+    E = _vieweltype(f.children[1], _childdatas(datas, 1), ctx)
+    # A tuple of a non-concrete `E` (nullable values) is an abstract type:
+    # every row would be boxed, with up to 2^N runtime types.
+    t isa AC.FixedSizeListType &&
+        t.listsize <= _MAX_TUPLE_ROW &&
+        isconcretetype(E) &&
+        return NTuple{t.listsize,E}
+    return ListValue{E}
+end
+
+# Whether field `f`'s values are nested rows (through a dictionary's values
+# or run-end encoding too).
+_nestedvalue(f::AC.Field) =
+    f.type isa AC.DictionaryType ? _nestedvalue(AC.dictvaluefield(f, f.type)) :
+    f.type isa AC.RunEndEncodedType ? _nestedvalue(f.children[2]) : f.type isa _NestedLayout
+
+# Element `j` of `values`, a column of `T` values stored as its `_columntype`.
+Base.@propagate_inbounds _childvalue(::Type{T}, values, j::Int) where {T} =
+    (values::_columntype(T))[j]
+
+Base.IndexStyle(::Type{<:ListValue}) = IndexLinear()
+Base.size(r::ListValue) = (r.len,)
+Base.size(v::Union{ListVector,MapVector}) = (length(v.offsets) - 1,)
+Base.size(v::StructVector) = (v.len,)
+
+Base.@propagate_inbounds function Base.getindex(r::ListValue{T}, i::Int) where {T}
+    @boundscheck checkbounds(r, i)
+    return @inbounds _childvalue(T, r.values, r.offset + i)
+end
+
+# `push!`, `append!`, `merge!`, and the like go through `resize!`,
+# `setindex!`, and `delete!`.
+@noinline _readonlyvalue(x) = throw(
+    ArgumentError(
+        "an Arrow.$(nameof(typeof(x))) is read-only; copy(x) gives a " *
+        "$(x isa MapValue ? "Dict" : "Vector") that can change",
+    ),
+)
+Base.setindex!(x::ListValue, v, ::Int) = _readonlyvalue(x)
+Base.resize!(x::ListValue, ::Integer) = _readonlyvalue(x)
+Base.setindex!(x::MapValue, v, k) = _readonlyvalue(x)
+Base.delete!(x::MapValue, k) = _readonlyvalue(x)
+Base.empty!(x::MapValue) = _readonlyvalue(x)
+
+Base.length(r::MapValue) = r.len
+function Base.iterate(r::MapValue{K,V}, i::Int=1) where {K,V}
+    i > r.len && return nothing
+    j = r.offset + i
+    return Pair{K,V}(_childvalue(K, r.keys, j), _childvalue(V, r.values, j)), i + 1
+end
+
+# The child position of the last entry whose key is `key`, or `nothing`.
+function _mapentry(r::MapValue{K}, key) where {K}
+    for j = (r.offset + r.len):-1:(r.offset + 1)
+        isequal(_childvalue(K, r.keys, j), key) && return j
+    end
+    return nothing
+end
+Base.haskey(r::MapValue, key) = _mapentry(r, key) !== nothing
+function Base.get(r::MapValue{K,V}, key, default) where {K,V}
+    j = _mapentry(r, key)
+    return j === nothing ? default : _childvalue(V, r.values, j)
+end
+function Base.get(default::Base.Callable, r::MapValue{K,V}, key) where {K,V}
+    j = _mapentry(r, key)
+    return j === nothing ? default() : _childvalue(V, r.values, j)
+end
+function Base.getindex(r::MapValue{K,V}, key) where {K,V}
+    j = _mapentry(r, key)
+    j === nothing && throw(KeyError(key))
+    return _childvalue(V, r.values, j)
+end
+Base.keys(r::MapValue{K}) where {K} = ListValue{K}(r.keys, r.offset, r.len)
+Base.values(r::MapValue{K,V}) where {K,V} = ListValue{V}(r.values, r.offset, r.len)
+
+# Inside a container or under `:compact` (DataFrame cells), list and map values
+# print as the plain Julia values they hold, without element types:
+# `[1, missing]`, `Dict("a" => 1)`.
+_compactshow(io::IO) = get(io, :compact, false) === true || haskey(io, :typeinfo)
+function Base.show(io::IO, r::ListValue)
+    _compactshow(io) || return invoke(show, Tuple{IO,AbstractArray}, io, r)
+    # A `:typeinfo` of the row's own type leaves out the element type.
+    return invoke(show, Tuple{IO,AbstractArray}, IOContext(io, :typeinfo => typeof(r)), r)
+end
+function Base.show(io::IO, r::MapValue)
+    _compactshow(io) || return invoke(show, Tuple{IO,AbstractDict}, io, r)
+    entries = IOContext(io, :typeinfo => eltype(r))
+    limit = get(io, :limit, false)::Bool
+    print(io, "Dict(")
+    for (count, pair) in enumerate(r)
+        count > 1 && print(io, ", ")
+        show(entries, pair)
+        limit && count == 10 < length(r) && (print(io, ", …"); break)
+    end
+    print(io, ')')
+    return nothing
+end
+
+Base.@propagate_inbounds function Base.getindex(v::ListVector{T}, i::Int) where {T}
+    @boundscheck checkbounds(v, i)
+    if Missing <: T
+        null = GC.@preserve v _isnullslot(v.validity, v.bitoffset, i)
+        null && return missing
+    end
+    lo, hi = GC.@preserve v @inbounds Int(v.offsets[i]), Int(v.offsets[i + 1])
+    return Base.nonmissingtype(T)(v.values, lo, hi - lo)
+end
+
+Base.@propagate_inbounds function Base.getindex(v::MapVector{T}, i::Int) where {T}
+    @boundscheck checkbounds(v, i)
+    if Missing <: T
+        null = GC.@preserve v _isnullslot(v.validity, v.bitoffset, i)
+        null && return missing
+    end
+    lo, hi = GC.@preserve v @inbounds Int(v.offsets[i]), Int(v.offsets[i + 1])
+    return Base.nonmissingtype(T)(v.keys, v.values, lo, hi - lo)
+end
+
+Base.@propagate_inbounds function Base.getindex(v::StructVector{T}, i::Int) where {T}
+    @boundscheck checkbounds(v, i)
+    if Missing <: T
+        null = GC.@preserve v _isnullslot(v.validity, v.bitoffset, i)
+        null && return missing
+    end
+    return _structrow(Base.nonmissingtype(T), v.children, v.offset + i)
+end
+
+# Generated so each field reads through its own child type, without
+# allocating. The generator loops: a comprehension's closure would compile
+# once per row type.
+@generated function _structrow(
+    ::Type{R},
+    children::Vector{AbstractVector},
+    j::Int,
+) where {R<:NamedTuple}
+    fields = Expr[]
+    for k = 1:fieldcount(R)
+        push!(fields, :(@inbounds _childvalue($(fieldtype(R, k)), children[$k], j)))
+    end
+    return :(R(($(fields...),)))
+end
+
+# Owned column copies replace nested views too: a struct or list can contain
+# another list whose child values still point into the input's buffers.
+_ownedtype(::Type{T}) where {T} =
+    T isa Union ? Union{(_ownedtype(S) for S in Base.uniontypes(T))...} : T
+_ownedtype(::Type{ListValue{T}}) where {T} = Vector{_ownedtype(T)}
+_ownedtype(::Type{MapValue{K,V}}) where {K,V} = Vector{Pair{_ownedtype(K),_ownedtype(V)}}
+_ownedtype(::Type{NamedTuple{N,T}}) where {N,T} = NamedTuple{N,_ownedtype(T)}
+_ownedtype(::Type{Pair{K,V}}) where {K,V} = Pair{_ownedtype(K),_ownedtype(V)}
+_ownedtype(::Type{T}) where {T<:Tuple} =
+    T isa Union ? Union{(_ownedtype(S) for S in Base.uniontypes(T))...} :
+    (T === Union{} || T isa UnionAll || Base.isvatuple(T)) ? T :
+    Tuple{map(_ownedtype, fieldtypes(T))...}
+
+# Unknown element types need a value check; concrete scalar types cannot
+# contain any of the nested views this module creates.
+_mayborrow(::Type{T}) where {T} =
+    T isa Union ? any(_mayborrow, Base.uniontypes(T)) : !isconcretetype(T)
+_mayborrow(::Type{<:ListValue}) = true
+_mayborrow(::Type{<:MapValue}) = true
+_mayborrow(::Type{T}) where {T<:Union{NamedTuple,Tuple,Pair}} =
+    !isconcretetype(T) || any(_mayborrow, fieldtypes(T))
+_mayborrow(::Type{T}) where {T<:AbstractVector} =
+    !isconcretetype(T) || _mayborrow(eltype(T))
+_mayborrow(::Type{T}) where {T<:AbstractDict} =
+    !isconcretetype(T) || _mayborrow(keytype(T)) || _mayborrow(valtype(T))
+
+_hasborrowed(x) = false
+_hasborrowed(::Union{ListValue,MapValue}) = true
+_hasborrowed(x::Union{NamedTuple,Tuple,Pair}) = any(_hasborrowed, x)
+_hasborrowed(x::Union{AbstractVector,AbstractDict}) =
+    _mayborrow(eltype(x)) && any(_hasborrowed, x)
+
+_needsowned(c::AbstractVector{T}) where {T} =
+    _ownedtype(T) !== T || (_mayborrow(T) && any(_hasborrowed, c))
+
+_ownedvalue(x) = x
+_ownedvalue(x::ListValue) = _copyrows(eltype(x), x)
+_ownedvalue(x::MapValue) = _copyrows(eltype(x), x)
+_ownedvalue(x::Union{NamedTuple,Tuple}) = map(_ownedvalue, x)
+_ownedvalue(x::Pair) = _ownedvalue(first(x)) => _ownedvalue(last(x))
+_ownedvalue(x::AbstractVector) = _needsowned(x) ? _copyrows(eltype(x), x) : x
+_ownedvalue(x::AbstractDict) = _hasborrowed(x) ? Dict(_ownedvalue(p) for p in x) : x
+
+function _copyrows(::Type{T}, v) where {T}
+    R = _ownedtype(T)
+    # An abstract container may change its element type when a hidden view
+    # becomes a vector. Let map infer or widen it from the converted values.
+    R === T && _mayborrow(T) && !isempty(v) && return map(_ownedvalue, v)
+    out = Vector{R}(undef, length(v))
+    for (i, x) in enumerate(v)
+        out[i] = _ownedvalue(x)
+    end
+    return out
+end
+Base.copy(v::ArrowVector{T}) where {T} = _copyrows(T, v)
+Base.copy(c::ChainedVector{T,<:ArrowVector}) where {T} =
+    _ownedtype(T) === T ? invoke(copy, Tuple{ChainedVector}, c) : _copyrows(T, c)
+
+# The values of child `d` (field `f`) as their `_columntype(E)`: the column a
+# read builds, copied into owned storage when it is a view of the source
+# (rows view their column's children, and outlive their table).
+function _childcolumn(
+    f::AC.Field,
+    d::AC.ArrayData,
+    ctx::_ViewContext,
+    @nospecialize(E::Type)
+)
+    return _storedas(_columntype(E), _viewcolumn(f, AC.ArrayData[d], ctx, E), ctx.budget)
+end
+_storedas(::Type{C}, col, budget) where {C} = col isa C ? col : _storeas(C, col, budget)
+
+function _storeas(::Type{Vector{E}}, col, budget) where {E}
+    _chargeexact!(budget, E, length(col), "nested child values")
+    return copyto!(Vector{E}(undef, length(col)), 1, col, 1, length(col))
+end
+# Converted values (dates, dictionary or run-end encoded values, ...) stored
+# as `S`s, with a validity bitmap when some slot is null; null slots hold zero
+# bytes.
+function _storeas(::Type{Primitive{T,S,Nothing,D}}, col, budget) where {T,S,D}
+    n = length(col)
+    _chargeexact!(budget, S, n, "nested child values")
+    data = Vector{S}(undef, n)
+    GC.@preserve data Libc.memset(pointer(data), 0, sizeof(data))
+    validity = UInt8[]
+    for (i, x) in enumerate(col)
+        if x === missing
+            validity = _setnull(validity, i, n, budget)
+        else
+            @inbounds data[i] = x
+        end
+    end
+    values = D === Vector{S} ? data : _UnalignedVector{S}(pointer(data), n, data)
+    return Primitive{T,S,Nothing,D}(values, validity, 0, nothing)
+end
+
+# A validity bitmap for `n` slots with slot `i` null; an empty `validity` (no
+# nulls yet) becomes an all-valid bitmap first.
+function _setnull(validity::Vector{UInt8}, i::Int, n::Int, budget)
+    if isempty(validity)
+        _chargeexact!(budget, UInt8, cld(n, 8), "nested child validity")
+        validity = fill(0xff, cld(n, 8))
+    end
+    @inbounds validity[((i - 1) >> 3) + 1] &= ~(0x01 << ((i - 1) & 7))
+    return validity
+end
+
+# Converted list, map, and struct values (run-end encoded or dictionary
+# children) gather their rows into a column of their own.
+function _storeas(::Type{ListVector{T}}, col, budget) where {T}
+    E = eltype(Base.nonmissingtype(T))
+    n = length(col)
+    _chargeexact!(budget, Int, n + 1, "list offsets")
+    offsets = zeros(Int, n + 1)
+    values, validity = E[], UInt8[]
+    for (i, row) in enumerate(col)
+        if row === missing
+            validity = _setnull(validity, i, n, budget)
+        else
+            append!(values, row)
+        end
+        offsets[i + 1] = length(values)
+    end
+    _chargeexact!(budget, E, length(values), "nested child values")
+    return ListVector{T}(
+        offsets,
+        _storedas(_columntype(E), values, budget),
+        validity,
+        0,
+        nothing,
+    )
+end
+function _storeas(::Type{MapVector{T}}, col, budget) where {T}
+    K, V = fieldtypes(eltype(Base.nonmissingtype(T)))
+    n = length(col)
+    _chargeexact!(budget, Int, n + 1, "map offsets")
+    offsets = zeros(Int, n + 1)
+    keys, values, validity = K[], V[], UInt8[]
+    for (i, row) in enumerate(col)
+        if row === missing
+            validity = _setnull(validity, i, n, budget)
+        else
+            for (k, v) in row
+                push!(keys, k)
+                push!(values, v)
+            end
+        end
+        offsets[i + 1] = length(keys)
+    end
+    _chargeexact!(budget, Pair{K,V}, length(keys), "nested child values")
+    keys = _storedas(_columntype(K), keys, budget)
+    return MapVector{T}(
+        offsets,
+        keys,
+        _storedas(_columntype(V), values, budget),
+        validity,
+        0,
+        nothing,
+    )
+end
+function _storeas(::Type{StructVector{T}}, col, budget) where {T}
+    R = Base.nonmissingtype(T)
+    n = length(col)
+    validity = UInt8[]
+    for (i, row) in enumerate(col)
+        row === missing && (validity = _setnull(validity, i, n, budget))
+    end
+    # A null row's field slots are never read; they repeat a valid row's
+    # values (none when every row is null).
+    k = findfirst(!ismissing, col)
+    rows = k === nothing ? R[] : R[row === missing ? col[k] : row for row in col]
+    _chargevector!(budget, AbstractVector, fieldcount(R), "struct children")
+    children = Vector{AbstractVector}(undef, fieldcount(R))
+    for j = 1:fieldcount(R)
+        F = fieldtype(R, j)
+        _chargeexact!(budget, F, length(rows), "nested child values")
+        children[j] = _storedas(_columntype(F), F[getfield(r, j) for r in rows], budget)
+    end
+    return StructVector{T}(children, 0, n, validity, 0, nothing)
+end
+_storeas(::Type{DataStrings.StringVector{E}}, col, budget) where {E} =
+    DataStrings.StringVector{E}(collect(col))
+function _storeas(::Type{DataStrings.BytesVector{E}}, col, budget) where {E}
+    payloads = Vector{_StringPayload}(undef, length(col))
+    buffers = Vector{UInt8}[]
+    for (i, x) in enumerate(col)
+        if x === missing
+            payloads[i] = DataStrings.PAYLOAD_MISSING
+            continue
+        end
+        bytes = collect(UInt8, x)
+        n = length(bytes)
+        payloads[i] = if n <= DataStrings.INLINE_MAX
+            DataStrings.inline_payload(bytes, 1, n)
+        else
+            push!(buffers, bytes)
+            DataStrings.view_payload(bytes, 1, n, length(buffers) - 1, 0)
+        end
+    end
+    return DataStrings.BytesVector{E}(payloads, buffers, Val(:trusted))
+end
+
+# The `n + 1` offsets of list or map batch `d`, plus `base` (a map's entries
+# struct offset): a view of the batch's buffer when `base` is 0 (copied only if
+# misaligned), else shifted copies.
+function _listoffsets(d::AC.ArrayData, base::Int, budget)
+    n = Int64(d.len)
+    n == 0 && return Int[base]
+    buf = AC.rolebuffer(d, AC.OFFSETS)
+    raw =
+        AC.layoutspec_of(d.type).offsetwidth == 8 ?
+        _wrapbuffer(Int64, buf, d.offset, n + 1, budget) :
+        _wrapbuffer(Int32, buf, d.offset, n + 1, budget)
+    # The view stays valid while the column (whose owner is `d`) is reachable.
+    base == 0 && return raw
+    _chargeexact!(budget, Int, n + 1, "list offsets")
+    return GC.@preserve d raw .+ base
+end
+
+# Not specialized on the row type, so it compiles once for every nested
+# column; the per-row loops it calls are function barriers specialized on
+# the row and column types.
+function _nestedbatch(
+    @nospecialize(T::Type),
+    f::AC.Field,
+    d::AC.ArrayData,
+    ctx::_ViewContext,
+)
+    t = f.type
+    R = Base.nonmissingtype(T)
+    budget = ctx.budget
+    _chargeobject!(budget, _VIEW_OBJECT_BYTES, "column view")
+    t isa AC.UnionType && return _unionrows(T, f, d, ctx)
+    validity, bitoffset = _validitybits(d)
+    if t isa AC.StructType
+        children = Vector{AbstractVector}(undef, length(f.children))
+        for (k, c) in enumerate(f.children)
+            children[k] = _childcolumn(c, d.children[k], ctx, fieldtype(R, k))
+        end
+        return StructVector{T}(children, Int(d.offset), Int(d.len), validity, bitoffset, d)
+    end
+    if t isa AC.MapType
+        entries, ed = f.children[1], d.children[1]
+        K, V = fieldtypes(eltype(R))
+        keys = _childcolumn(entries.children[1], ed.children[1], ctx, K)
+        vals = _childcolumn(entries.children[2], ed.children[2], ctx, V)
+        offsets = _listoffsets(d, Int(ed.offset), budget)
+        return MapVector{T}(offsets, keys, vals, validity, bitoffset, d)
+    end
+    R <: Array && return _tensorrows(T, f, d, ctx, _tensorshape(f)::Tuple)
+    E = eltype(R)
+    if t isa AC.FixedSizeListType && R <: Tuple
+        # `NTuple{0,E}` is `Tuple{}`, whose rows read no child values.
+        N = fieldcount(R)
+        N == 0 && return _tuplerows(T, Val(0), nothing, d, budget)
+        child = _viewcolumn(f.children[1], AC.ArrayData[d.children[1]], ctx, E)
+        return _tuplerows(T, Val(N), child, d, budget)
+    end
+    values = _childcolumn(f.children[1], d.children[1], ctx, E)
+    t isa AC.ListViewType &&
+        return _listviewvector(T, d, values, validity, bitoffset, budget)
+    offsets = if t isa AC.FixedSizeListType
+        w = t.listsize
+        _chargeexact!(budget, Int, d.len + 1, "fixed-size list offsets")
+        Int[(Int(d.offset) + i) * w for i = 0:(d.len)]
+    else
+        _listoffsets(d, 0, budget)
+    end
+    return ListVector{T}(offsets, values, validity, bitoffset, d)
+end
+
+# A list view batch: rows may overlap or come in any order, so the child
+# values of each row are gathered in row order (their own storage keeps
+# flat values only; see `_viewablelayout`).
+function _listviewvector(
+    @nospecialize(T::Type),
+    d::AC.ArrayData,
+    values,
+    validity,
+    bitoffset,
+    budget,
+)
+    n = Int64(d.len)
+    _chargeexact!(budget, Int, n + 1, "list view offsets")
+    offsets = zeros(Int, n + 1)
+    n == 0 &&
+        return ListVector{T}(offsets, _gathered(values, Int[]), validity, bitoffset, d)
+    wide = AC.layoutspec_of(d.type).offsetwidth == 8
+    starts, sizes = GC.@preserve d (
+        wide ?
+        (
+            Int.(_wrapbuffer(Int64, AC.rolebuffer(d, AC.ELEMENT_OFFSETS), d.offset, n)),
+            Int.(_wrapbuffer(Int64, AC.rolebuffer(d, AC.SIZES), d.offset, n)),
+        ) :
+        (
+            Int.(_wrapbuffer(Int32, AC.rolebuffer(d, AC.ELEMENT_OFFSETS), d.offset, n)),
+            Int.(_wrapbuffer(Int32, AC.rolebuffer(d, AC.SIZES), d.offset, n)),
+        )
+    )
+    for i = 1:n
+        len = _isnullslot(validity, bitoffset, i) ? 0 : sizes[i]
+        offsets[i + 1] = offsets[i] + len
+    end
+    _chargeexact!(budget, Int, offsets[end], "list view value index")
+    take = Vector{Int}(undef, offsets[end])
+    for i = 1:n
+        for k = 1:(offsets[i + 1] - offsets[i])
+            take[offsets[i] + k] = starts[i] + k
+        end
+    end
+    return ListVector{T}(offsets, _gathered(values, take), validity, bitoffset, d)
+end
+
+_gathered(values::Vector, take) = values[take]
+_gathered(v::Primitive{T,S,Nothing}, take) where {T,S} =
+    _storeas(typeof(v), view(v, take), nothing)
+_gathered(v::DataStrings.StringVector{E}, take) where {E} =
+    DataStrings.StringVector{E}(v.payloads[take], v.buffers, Val(:trusted))
+_gathered(v::DataStrings.BytesVector{E}, take) where {E} =
+    DataStrings.BytesVector{E}(v.payloads[take], v.buffers, Val(:trusted))
+
+function _tuplerows(::Type{T}, ::Val{N}, child, d::AC.ArrayData, budget) where {T,N}
+    n = Int(d.len)
+    _chargeexact!(budget, T, n, "fixed-size list rows")
+    out = Vector{T}(undef, n)
+    validity, bitoffset = _validitybits(d)
+    GC.@preserve validity child for i = 1:n
+        if Missing <: T && _isnullslot(validity, bitoffset, i)
+            out[i] = missing
+        else
+            base = (Int(d.offset) + i - 1) * N
+            out[i] = ntuple(j -> child[base + j], Val(N))
+        end
+    end
+    return out
+end
+
+# The value at child index `j` of the `k`th column, unrolled over the tuple.
+_pickchild(cols::Tuple, k::Int, j::Int) =
+    k == 1 ? first(cols)[j] : _pickchild(Base.tail(cols), k - 1, j)
+_pickchild(::Tuple{}, ::Int, ::Int) = throw(ValidationError("union child out of range"))
+
+function _unionrows(@nospecialize(T::Type), f::AC.Field, d::AC.ArrayData, ctx::_ViewContext)
+    t = f.type::AC.UnionType
+    budget = ctx.budget
+    cols = Tuple(
+        Any[
+            _viewcolumn(
+                c,
+                AC.ArrayData[d.children[k]],
+                ctx,
+                _vieweltype(c, AC.ArrayData[d.children[k]], ctx),
+            ) for (k, c) in enumerate(f.children)
+        ],
+    )
+    n = Int(d.len)
+    _chargeexact!(budget, T, n, "union rows")
+    out = Vector{T}(undef, n)
+    ids = _wrapbuffer(Int8, AC.rolebuffer(d, AC.TYPE_IDS), d.offset, n, budget)
+    dense = t.mode == AC.DenseMode
+    offsets =
+        dense ?
+        _wrapbuffer(Int32, AC.rolebuffer(d, AC.ELEMENT_OFFSETS), d.offset, n, budget) :
+        Int32[]
+    GC.@preserve ids offsets d _fillunion!(
+        out,
+        cols,
+        ids,
+        offsets,
+        t.typeids,
+        dense,
+        Int(d.offset),
+    )
+    return out
+end
+
+# Specialized on the children's column types (a function barrier).
+function _fillunion!(out, cols::Tuple, ids, offsets, typeids, dense::Bool, base::Int)
+    for i in eachindex(out)
+        k = findfirst(==(ids[i]), typeids)
+        k === nothing &&
+            throw(ValidationError("union type id $(ids[i]) not in declared domain"))
+        j = dense ? Int(offsets[i]) + 1 : base + i
+        out[i] = _pickchild(cols, k, j)
+    end
+    return out
+end
+
+# --- fixed-shape tensors ----------------------------------------------------------
+#
+# The canonical `arrow.fixed_shape_tensor` extension stores each tensor as a
+# fixed-size list of its elements in row-major order over its physical
+# `shape`; `permutation` says which physical dimension each logical one is.
+# Rows read as `Array{T,N}`s of the logical shape.
+
+const _TENSOR_EXTENSION = "arrow.fixed_shape_tensor"
+
+# `(shape, permutation)` of a tensor field (1-based permutation), or nothing
+# when `f` is not one this reader can read: a fixed-size list of a flat,
+# unlabelled child with a well-formed `shape`.
+function _tensorshape(f::AC.Field)
+    f.type isa AC.FixedSizeListType || return nothing
+    ext = _arrowtypesextension(f)
+    (ext === nothing || ext[1] != _TENSOR_EXTENSION) && return nothing
+    (length(f.children) == 1 && !_hasarrowtypesextension(f.children[1])) || return nothing
+    child = f.children[1]
+    (_viewablelayout(child) && !_nestedvalue(child)) || return nothing
+    shape = _jsonints(ext[2], "shape")
+    shape === nothing && return nothing
+    perm = _jsonints(ext[2], "permutation")
+    perm = perm === nothing ? collect(1:length(shape)) : perm .+ 1
+    (
+        all(>=(0), shape) &&
+        length(perm) == length(shape) &&
+        isperm(perm) &&
+        prod(shape; init=1) == f.type.listsize
+    ) || return nothing
+    return (Tuple(shape), Tuple(perm))
+end
+
+# The integers of JSON array `key` in `json`, or nothing.
+function _jsonints(json::AbstractString, key::String)
+    m = match(Regex("\"" * key * "\"\\s*:\\s*\\[([^\\]]*)\\]"), json)
+    m === nothing && return nothing
+    values = Int[]
+    for part in split(m[1], ','; keepempty=false)
+        x = tryparse(Int, strip(part))
+        x === nothing && return nothing
+        push!(values, x)
+    end
+    return values
+end
+
+# Tensor rows are `Array{E,N}`: `E` is the element type, without `Missing`
+# unless an element of a non-null tensor is null.
+function _tensortype(f::AC.Field, ctx::_ViewContext, datas, shape)
+    child = f.children[1]
+    B = _viewbasetype(child, ctx, _childdatas(datas, 1))
+    w = (f.type::AC.FixedSizeListType).listsize
+    nulls = any(d -> _tensornulls(child, d, w), datas)
+    return Array{nulls ? Union{Missing,B} : B,length(first(shape))}
+end
+
+# Whether a non-null row of tensor batch `d` holds a null element.
+function _tensornulls(child::AC.Field, d::AC.ArrayData, w::Int)
+    c = d.children[1]
+    _viewnulls(child, c) || return false
+    # Null elements under a null tensor are never read.
+    rows, rowoff = _validitybits(d)
+    elems, elemoff = _validitybits(c)
+    isempty(elems) && return true  # dictionary or run-end values with nulls
+    GC.@preserve d for i = 1:Int(d.len)
+        _isnullslot(rows, rowoff, i) && continue
+        base = (Int(d.offset) + i - 1) * w
+        any(j -> _isnullslot(elems, elemoff, base + j), 1:w) && return true
+    end
+    return false
+end
+
+function _tensorrows(@nospecialize(T::Type), f::AC.Field, d::AC.ArrayData, ctx, shapeperm)
+    shape, perm = shapeperm
+    R = Base.nonmissingtype(T)
+    child = _viewcolumn(f.children[1], AC.ArrayData[d.children[1]], ctx, eltype(R))
+    return _uninferred(_tensorrows, T, R, child, d, ctx.budget, shape, perm)
+end
+
+function _tensorrows(
+    ::Type{T},
+    ::Type{R},
+    child,
+    d::AC.ArrayData,
+    budget,
+    shape,
+    perm,
+) where {T,R}
+    n = Int(d.len)
+    w = prod(shape; init=1)
+    N = length(shape)
+    _chargeexact!(budget, T, n, "tensor rows")
+    _chargeexact!(budget, eltype(R), n * w, "tensor values")
+    out = Vector{T}(undef, n)
+    validity, bitoffset = _validitybits(d)
+    for i = 1:n
+        if Missing <: T && _isnullslot(validity, bitoffset, i)
+            out[i] = missing
+            continue
+        end
+        base = (Int(d.offset) + i - 1) * w
+        flat = eltype(R)[child[base + j] for j = 1:w]
+        # Row-major storage: reverse the dimensions to reshape, then back.
+        physical = permutedims(reshape(flat, reverse(shape)), N:-1:1)
+        out[i] = perm == Tuple(1:N) ? physical : permutedims(physical, perm)
+    end
+    return out
+end
+
+# Tensor rows back to their row-major storage values, for a rewrite.
+function _tensorstorage(v::AbstractVector, (shape, perm))
+    N = length(shape)
+    return [
+        row isa AbstractArray && ndims(row) == N ?
+        vec(
+            permutedims(perm == Tuple(1:N) ? row : permutedims(row, invperm(perm)), N:-1:1),
+        ) : row for row in v
+    ]
+end
