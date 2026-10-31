@@ -89,6 +89,8 @@ code, and what Arrow 2.x can read of files Arrow 3.0 writes.
 - A TimeZones.jl extension that writes `ZonedDateTime` columns, and a CategoricalArrays
   extension that writes ordered `CategoricalArray`s as ordered dictionaries and reports
   `isordered` for ordered dictionary columns.
+- A FileIO.jl extension: `load("x.arrow")` reads an `Arrow.Table` and
+  `save("x.arrow", table)` writes one.
 
 ### Changed
 

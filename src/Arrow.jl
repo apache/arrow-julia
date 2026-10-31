@@ -238,6 +238,11 @@ end
 # reach the interface as `Arrow.ArrowTypes` or through `using Arrow`.
 export ArrowTypes
 
+# FileIO.jl's `load("x.arrow")` and `save("x.arrow", table)` call these; the
+# FileIO extension defines their methods.
+function fileio_load end
+function fileio_save end
+
 # Precompile the common write/read/scan shapes last, once every layer above
 # is defined.
 include("precompile.jl")

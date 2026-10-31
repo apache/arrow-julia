@@ -41,7 +41,8 @@ table = Arrow.Table(path)
 
 A source is a path, an `IO`, a byte vector, or an [`Arrow.AbstractArrowSource`](@ref)
 ([Sources](@ref)); any other object that `open(source, "r")` accepts, such as a
-FilePathsBase.jl path, reads as the file or `IO` it opens. Column types are listed under
+FilePathsBase.jl path, reads as the file or `IO` it opens. With FileIO.jl loaded,
+`load("trips.arrow")` reads a table too. Column types are listed under
 [Type mapping](@ref). Columns that share a name read as `a`, `a_1`, `a_2`, and so on, as
 CSV.jl names them.
 

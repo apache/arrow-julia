@@ -29,7 +29,8 @@
 paths, including atomic replacement and `Arrow.append`. Any other object that
 `open(sink, "w")` accepts is written in place. `Arrow.write(sink)` returns a
 function, so a table can be piped into it, as in
-`CSV.File("trips.csv") |> Arrow.write("trips.arrow")`.
+`CSV.File("trips.csv") |> Arrow.write("trips.arrow")`. With FileIO.jl loaded,
+`save("trips.arrow", table)` writes a table as well.
 
 ```@example writing
 using Arrow, Tables

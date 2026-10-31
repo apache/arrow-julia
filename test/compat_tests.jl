@@ -23,6 +23,7 @@ import DataAPI
 import Durations
 import UUIDs
 using PooledArrays: PooledArray
+import FileIO
 import FilePathsBase
 
 const AC = Arrow.ArrowCore
@@ -68,6 +69,23 @@ allocatedby(f) = (f(); @allocated f())
         @test Arrow.getmetadata(bare.a) === nothing
         @test Arrow.getmetadata([(a=1,), (a=2,)]) === nothing
         @test Arrow.getmetadata(tbl) === nothing
+    end
+
+    @testset "FileIO load and save" begin
+        dir = mktempdir()
+        path = joinpath(dir, "fileio.arrow")
+        tbl = (a=[1, 2], s=["x", "y"])
+        @test FileIO.save(path, tbl) === nothing
+        t = FileIO.load(path)
+        @test t isa Arrow.Table && t.a == tbl.a && t.s == tbl.s
+        @test FileIO.load(path; select=[:s]).s == tbl.s
+        FileIO.save(path, (a=[3],); compress=:zstd)
+        @test FileIO.load(path).a == [3]
+        # A FileIO stream (an IO) writes the stream format and reads it back.
+        io = IOBuffer()
+        FileIO.save(FileIO.Stream{FileIO.format"Arrow"}(io, path), tbl)
+        seekstart(io)
+        @test FileIO.load(FileIO.Stream{FileIO.format"Arrow"}(io, path)).a == tbl.a
     end
 
     @testset "unsupported sources name the supported kinds" begin
