@@ -169,6 +169,8 @@ function _zstdc!(s::EncodeState)
         c = s.level === nothing ? ZstdCompressor() : ZstdCompressor(; level=s.level)
         TS.initialize(c)
         s.zstd = c
+        # A writer abandoned without `close` must not leak the context.
+        finalizer(close, s)
     end
     return s.zstd::ZstdCompressor
 end
@@ -1095,6 +1097,7 @@ mutable struct IPCWriteState
     const recordblocks::Vector{NTuple{3,Int64}}
     written::Int64                       # bytes published to `io`
     finished::Bool
+    failed::Bool   # a batch failed to encode and later ones were discarded
     # A compressed batch encodes on its own task while the next one builds;
     # batches publish in order. Each pending entry is the encoding task and
     # the codec states it uses; `statesets` holds idle sets for reuse.
@@ -1191,6 +1194,7 @@ function beginwrite!(
         NTuple{3,Int64}[],
         Int64(0),
         false,
+        false,
         Tuple{Task,Vector{EncodeState},Any}[],
         Vector{EncodeState}[],
     )
@@ -1233,6 +1237,10 @@ function _publishnext!(st::IPCWriteState)
             fetch(task)
         catch err
             _recycleframes!(states)
+            # Later batches were staged on this one's dictionary state: none
+            # may publish after it, and no new batch may build on it.
+            _discardpending!(st)
+            st.failed = true
             err isa TaskFailedException && throw(err.task.exception)
             rethrow()
         end
@@ -1371,6 +1379,12 @@ function writebatch!(
     recycle=nothing,
 )
     st.finished && throw(ArgumentError("this IPC writer is already finished"))
+    st.failed && throw(
+        ArgumentError(
+            "this IPC writer stopped at a batch that failed to encode; close it to keep " *
+            "the batches written before, or abandon it",
+        ),
+    )
     if validate
         _checkbatches(st.schema, (batch,))
         _validatewriterbatch!(st.validated, st.schema, batch, st.ids)
@@ -1546,19 +1560,26 @@ function finishwrite!(st::IPCWriteState)
     return nothing
 end
 
-"Release the codec state without emitting anything; for error cleanup."
-function abortwrite!(st::IPCWriteState)
-    st.finished && return nothing
-    st.finished = true
+"Wait for every pending batch and drop it unpublished."
+function _discardpending!(st::IPCWriteState)
     for (task, states, _) in st.pending
         # A failure here follows from the caller's error.
         try
             wait(task)
         catch
         end
+        _recycleframes!(states)
         push!(st.statesets, states)
     end
     empty!(st.pending)
+    return nothing
+end
+
+"Release the codec state without emitting anything; for error cleanup."
+function abortwrite!(st::IPCWriteState)
+    st.finished && return nothing
+    st.finished = true
+    _discardpending!(st)
     _closestates!(st)
     return nothing
 end
@@ -1610,6 +1631,7 @@ function resumestream!(
         NTuple{3,Int64}[],
         NTuple{3,Int64}[],
         Int64(0),
+        false,
         false,
         Tuple{Task,Vector{EncodeState},Any}[],
         Vector{EncodeState}[],

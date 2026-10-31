@@ -373,6 +373,12 @@ end
         @test indexbits(take!(Arrow.tobuffer((k=PooledArray(["x"]),)))) == 32
     end
 
+    @testset "a batch that fails to compress publishes nothing after it" begin
+        @test success(
+            `$(Base.julia_cmd()) --startup-file=no --project=$(Base.active_project()) $(joinpath(@__DIR__, "writer_fault_child.jl"))`,
+        )
+    end
+
     @testset "a 2.x compressor object names the codec keyword" begin
         err = @test_throws ArgumentError Arrow.write(
             IOBuffer(),
