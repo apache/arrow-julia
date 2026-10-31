@@ -143,11 +143,10 @@ Two tiers, by what the caller knows statically:
 The typed tiers share no code with the dynamic row shapes, so the dynamic
 `Pair{String,Any}` containers cost them nothing.
 
-## Scan and statistics
+## Scans
 
 Filter literals lower per-FIELD through the same authority. A composite
 column still evaluates its filters in the public domain (no composite
 pushdown), which is now also the converted domain — plain Julia `==` over
 public rows is the semantics. `_nativefacadeconversion`'s children test
-keeps composite fields off the storage plan. Statistics pruning is
-top-level and unchanged.
+keeps composite fields off the storage plan.

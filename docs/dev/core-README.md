@@ -43,7 +43,7 @@ where those contracts are implemented and the constraints on changing them.
 | `src/source.jl` | Byte-range sources and read scheduling; `ext/ArrowCloudStoreExt.jl` supplies the CloudStore integration |
 | `src/columns.jl` | Read-only buffer views, typed nested rows, dictionary/run-end columns, and deferred string construction |
 | `src/table.jl` | `Table`/`Stream`, source opening, Tables.jl and DataAPI interfaces, copying, and public value conversion |
-| `src/scan.jl` | Scan binding, projection, filters, row windows, statistics, and sparse ranged reads |
+| `src/scan.jl` | Scan binding, projection, filters, row windows, and sparse ranged reads |
 | `src/arrowtypes.jl`, `src/sharedvalues.jl` | ArrowTypes mappings and the shared string, decimal, and temporal value domains |
 | `src/columnconstruction.jl` | Native and custom column construction, retained schemas, nested layouts, and dictionary pooling |
 | `src/write.jl` | Public write options, partition iteration, `Writer`, append, and destination ownership |
@@ -153,12 +153,8 @@ read strategies, including stream windows and prefetching. Do not infer a bound
 on bytes fetched from a bound on rows returned: filtering can still require
 reading buffers for rows that are later rejected.
 
-Embedded per-batch statistics use `JuliaArrow:batch_statistics.v1` metadata. They
-can prove batches irrelevant to a predicate, but their correctness is a producer
-contract. Narrow, incorrect statistics can hide rows. Rewriting a table drops
-inherited batch statistics because its values or batch boundaries may have
-changed. Schema and field metadata remain ordered pairs so duplicate metadata
-keys and their ordering can survive a retained-schema rewrite.
+Schema and field metadata remain ordered pairs so duplicate metadata keys and
+their ordering can survive a retained-schema rewrite.
 
 ## Writing and concurrency
 

@@ -54,7 +54,7 @@ on:
 |---|---|---|
 | `select` | decode only (selected ∪ filter-referenced) columns: a registry-driven `skipfield!` advances the node/buffer cursor past unselected fields without body slicing, content validation, or materialization. Complete node/buffer metadata is still validated first. Nested subtrees skip with their parent; no body range is requested for an unselected dictionary column. | exact as IO/decode reduction (see below for who projects) |
 | `limit`/`offset` | Without a filter `RecordBatch.length` is wire metadata: whole batches before `offset` and after `offset+limit` are never decoded (ranged reads still fetch candidate RecordBatch metadata because Footer Blocks have no row counts, but request no body range for excluded batches). With a filter the window composes over the qualifying rows of each decoded batch and decoding stops once it is full. Tail reads and configured coalescing may physically over-read otherwise unrequested bytes. | exact |
-| `filter` | two tiers: (a) **statistics pruning** — per-batch min/max/null-count, when present (§3 of this doc), prune batches that cannot satisfy the predicate; (b) **mask at materialization** — evaluate the predicate over each batch's decoded columns with the generic evaluator (`Tables.filtermask`) and keep only the qualifying rows when building output columns. | (a) inexact — a pruned batch is provably empty; (b) exact — enables limit/offset pushdown with filters |
+| `filter` | mask at materialization: evaluate the predicate over each batch's decoded columns with the generic evaluator (`Tables.filtermask`) and keep only the qualifying rows when building output columns. | exact — enables limit/offset pushdown with filters |
 | `types` (`ref => T`) | An elementwise conversion request, not a parse seed. Direct handle scans apply it to storage-domain columns. The facade applies it after ArrowTypes and native public conversion. See §4 for the known-schema role in trim mode. | exact |
 
 ### The pushdown shape
@@ -95,8 +95,7 @@ second `Scan`.
 
     _runboundscan(f, bound, materializecolumn) =
       decode set = selected ∪ filtercols (source order, source names) →
-      batch set = limit/offset window from wire row counts (no filter),
-                  ∩ stats-surviving batches (filter present, stats present) →
+      batch set = limit/offset window from wire row counts (no filter) →
       per decoded batch (`_ScanSink`):
         materialize the decode set through the operation's fixed policy →
         rows = filter ? qualifying rows after this batch's share of
@@ -165,9 +164,7 @@ Properties the composition holds (all implemented in `src/scan.jl`):
   result's concrete Julia vector type. Row values and conforming schemas
   still match the generic executor exactly.
 
-The statistics fold resolves dictionary indices through the pool before it
-computes logical null/min/max values; the row evaluator compares decoded
-values. Stream-format sources are scanned by the facade after decode — the
+Stream-format sources are scanned by the facade after decode — the
 eager stream reader has already decoded by then; stream pushdown would need
 an incremental framer.
 
@@ -195,21 +192,20 @@ sequential — cloud-native access is a file-format feature, stated plainly.
    format (a stream object is read whole instead), and it covers
    footer-length + magic + the whole Footer in almost every real file; if
    `footerlen + 10 > tailbytes`, one exact follow-up fetch (also cached).
-   → schema, Block indexes, (§3) statistics — everything pruning needs.
+   → schema and Block indexes.
    The leading magic is not fetched: the Footer is the sole authority.
-2. **Statistics prune** from the Footer metadata — zero additional fetches.
-3. **Block metadata fetches**: dictionary metadata plus
-   `(offset, metaDataLength)` for each statistics-surviving record batch,
+2. **Block metadata fetches**: dictionary metadata plus
+   `(offset, metaDataLength)` for each record batch,
    coalesced across nearby spans. RecordBatch row counts are here, not in the
    Footer, so `limit`/`offset` windowing happens after this pass.
-4. **Window and buffer-range plan**: row counts choose the exact batch/body
+3. **Window and buffer-range plan**: row counts choose the exact batch/body
    window when there is no filter; the bound column set then maps to a buffer
    index set (subtree-
    inclusive; dictionary Blocks for selected dictionary columns) → byte
    ranges → **coalesce** ranges with gaps below `gapbytes` (default
    ~256 KiB — a gap fetch is usually cheaper than a request round-trip;
    both knobs are options, not constants).
-5. **Body fetches** — the selected dictionary bodies and the selected record
+4. **Body fetches** — the selected dictionary bodies and the selected record
    buffers in ONE round: each coalesced range lands in its own owned heap
    region; the dictionaries decode first from the shared spans. Decode
    resolves each declared buffer `(offset, len)` to its containing fetched
@@ -225,8 +221,7 @@ The common path has three sequential request rounds. A Footer follow-up makes
 four. The source can issue a metadata or body round's planned ranges
 concurrently.
 For a 40-column file reading 3 columns of every batch, this moves roughly
-`3/40` of the body bytes plus metadata. Statistics-pruned batches contribute
-no requested metadata/body range. Coalescing is an explicit over-read policy,
+`3/40` of the body bytes plus metadata. Coalescing is an explicit over-read policy,
 so a requested span may cross otherwise unneeded bytes when the configured
 gap permits it.
 
@@ -279,9 +274,7 @@ optional EOS marker, although a head, tail, or coalesced request can physically
 over-read those or other unrequested bytes. The complete Footer Block index is
 bounded and checked for overlap. Required features and message limits are
 global. Per-record metadata/body/buffer limits stay lazy like `ArrowFile`:
-dictionary blocks and statistics-surviving record candidates are checked, while
-statistics-pruned record metadata causes no dedicated range request and is not
-validated (a tail or coalesced request may still over-read it). Message kind,
+every dictionary and record block's metadata is checked. Message kind,
 version, legacy-compression state, complete node/buffer metadata,
 layout-derived buffer minima, child extents, and fixed or fully-covered
 null-count contracts for planned subtrees, planned codec, and required
@@ -290,60 +283,13 @@ Skipped buffer contents remain unvalidated by design.
 
 ---
 
-## 3. Per-batch statistics (the pruning fuel)
-
-Arrow's format has no per-batch statistics on the wire; the ecosystem's
-"statistics schema" standardizes the **value layout** for exchanging
-statistics as Arrow data, but placement in IPC files is not (yet)
-standardized upstream. This convention is deliberately conservative:
-
-- **Placement (our convention, upgradeable)**: one schema-level custom
-  metadata key, e.g. `JuliaArrow:batch_statistics.v1`, carried in the
-  **Footer's** schema copy so the tail fetch alone powers pruning.
-- **Value layout**: follow the official statistics-schema array layout,
-  serialized as one embedded IPC stream (statistics ARE Arrow data); per
-  record batch × flattened RecordBatch FieldNode index: row_count,
-  null_count, min, max (the `ARROW:*:exact` keys). Top-level fields after
-  nested fields
-  therefore do not use their top-level ordinal as the `column` value.
-  Using the official layout keeps us convention-compatible if upstream
-  standardizes placement later — we then emit both keys for a deprecation
-  cycle and read either.
-- Writer: `withstatistics` / `statsfile` eagerly compute the embedded
-  stream for already-encoded batches. An opt-in `statistics=true` keyword
-  computing the same fold state during encode is not implemented; file
-  format only. An append path would have to recompute or drop
-  — dropping with a warning is the honest v1.
-- Reader: prune under `Cmp`/`In`/`IsNull` (and `StrPred` prefix ranges for
-  `startswith`) with one-sided may-contain logic — a batch survives unless
-  the predicate is provably false for ALL rows; the exact row filter always
-  runs after pruning (pruning is inexact by design). Missing or MALFORMED
-  statistics degrade to "no pruning", never to an error. The embedded
-  stream and Base64 output share the enclosing scan allocation budget;
-  exhausting that cumulative caller limit remains a scan error instead of
-  being mistaken for malformed optional metadata.
-  Float comparisons use the predicate's IEEE operators; any NaN disables
-  bounds, and signed zero is not ordered with `isless`. Dictionary folds
-  count null pool results as logical nulls.
-- **Trust model, stated plainly**: statistics are
-  trusted-for-completeness, exactly like Parquet row-group stats. The exact
-  row filter protects one direction only — batches kept by lying stats still
-  filter row-exactly. The other direction has no net: stats
-  that under-report a range cause false EXCLUSION. Excluded batches are not
-  decoded and cause no dedicated metadata/body range request, so their
-  qualifying rows are silently lost. Tail/coalescing over-read does not restore
-  them. Wide (conservative) lies cost pruning, never correctness; narrow lies
-  lose rows. The acceptance battery pins all three behaviors.
-
----
-
-## 4. The trim contract (staying on the radar, explicitly)
+## 3. The trim contract (staying on the radar, explicitly)
 
 **Trimmability is a standing production gate, not an aspiration.** The
 `--trim=safe` harness (0 errors / 0 warnings / binary exit 0) compiles
 `ArrowCore` plus its value-domain and typed-value workloads and the C-data
 seams, plus a representative DataStrings workload. It does **not** yet compile
-a scan-and-materialize app, so §1–§3 are designed for trim but not yet gated by
+a scan-and-materialize app, so §1–§2 are designed for trim but not yet gated by
 it. The rules in `core-README.md` ("Trim-compile support") constrain their form:
 
 - `Tables.Scan` is trim-aligned by its own charter (no `Function` fields;
@@ -373,7 +319,7 @@ it. The rules in `core-README.md` ("Trim-compile support") constrain their form:
 
 ---
 
-## 5. Status
+## 4. Status
 
 Implemented (`src/scan.jl`, `src/table.jl`):
 
@@ -393,18 +339,14 @@ Implemented (`src/scan.jl`, `src/table.jl`):
   the CloudStore.jl extension, and counting-source proofs (zero planned body ranges for skipped columns,
   window-excluded batches, and unneeded dictionary bodies, with exact
   request-log checks under the fixtures' tail/coalescing settings).
-- **Statistics**: `withstatistics`/`statsfile` fold the official statistics
-  value layout into `JuliaArrow:batch_statistics.v1` (footer schema
-  metadata, base64-wrapped IPC stream, one statistics batch per data batch,
-  serialized through this writer); `_maypass` may-contain pruning is wired
-  into both applies (ranged pruning happens before the block-metadata pass,
-  so pruned batches cause no dedicated metadata/body request; configured
-  tail/coalescing may over-read them); acceptance pins exactness,
-  degradation, and both lie directions.
 
 Not implemented: an HTTP transport extension (the source contract is the
-extension point; the CloudStore extension is the model), an encode-time
-`statistics=true` writer keyword, upstream-placement tracking
-for statistics, and the scan-and-materialize trim harness. Scan pushdown
-depends on the pinned Tables.jl development revision until that API is
-released.
+extension point; the CloudStore extension is the model) and the
+scan-and-materialize trim harness.
+
+Possible future work: per-batch statistics (row counts, null counts, minimum
+and maximum values) in IPC footers, to prune batches a filter cannot match
+before their metadata is fetched. The Arrow statistics schema standardizes
+the value layout but not a placement in IPC files; without a placement other
+implementations read, a private key would help only Julia readers of files
+Julia wrote, and wrong statistics silently drop rows.

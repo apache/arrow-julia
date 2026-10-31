@@ -20,7 +20,6 @@ module AcceptanceSupport
 import Arrow
 using PooledArrays
 using Tables
-import Base64
 
 const AC = Arrow.AC
 
@@ -75,7 +74,6 @@ import Arrow:
     RecordBatch,
     ReleaseCounter,
     RunEndEncodedType,
-    STATS_KEY,
     Schema,
     SourceFile,
     StreamOwner,
@@ -93,7 +91,6 @@ import Arrow:
     _arm_foreign_owner!,
     _batchcodec,
     _batchrows,
-    _bitmapbytes,
     _blockmessage,
     _build_c_data!,
     _cleanup_export_slots!,
@@ -110,7 +107,6 @@ import Arrow:
     _newroot,
     _nextbatch!,
     _rangedfooter,
-    _readstats,
     _recordbatchmeta,
     _release_array,
     _release_c_array!,
@@ -120,9 +116,6 @@ import Arrow:
     _remaining,
     _requirelittleendian,
     _set_stream_error!,
-    _statfold,
-    _statsbatch,
-    _statsschema,
     _store_field!,
     _storageelementclaim,
     _stream_get_next_impl,
@@ -161,7 +154,6 @@ import Arrow:
     readstream,
     reap!,
     release!,
-    statsfile,
     to_c_data,
     validate_full,
     validate_semantic,
@@ -170,7 +162,6 @@ import Arrow:
     variadiccounts,
     verify_footer,
     verify_ipc_metadata,
-    withstatistics,
     writefile,
     writestream
 
@@ -182,7 +173,6 @@ include(joinpath(@__DIR__, "..", "cdata_battery.jl"))
 include(joinpath(@__DIR__, "..", "scan_battery.jl"))
 
 function _run_scan_acceptance()
-    _stats_main()
     filebytes, af, full = _scan_main()
     _ranged_main(filebytes, af, full)
     return nothing

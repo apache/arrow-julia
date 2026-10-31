@@ -42,8 +42,6 @@
 #   +lz4 / +zstd          compressed-body variants of primitive,
 #                         nested-dictionary, and binary-view families,
 #                         proving our compressed framing against C++.
-#   +stats                 one primitive file with Arrow.jl statistics schema
-#                         metadata; pyarrow must accept it and preserve values.
 #
 # Comparison is the corpus's own value-level document comparison, so id
 # reassignment, pool unification, and padding differences by the oracle
@@ -169,12 +167,8 @@ end
 # buffers, and variadic view buffers without multiplying every corpus case.
 const COMPRESSED_ORACLE_FAMILIES =
     ("generated_primitive", "generated_nested_dictionary", "generated_binary_view")
-const STATISTICS_ORACLE_FAMILY = "generated_primitive"
-const TARGETED_ORACLE_VARIANTS = (
-    (
-        (family, codec) for family in COMPRESSED_ORACLE_FAMILIES for codec in (:lz4, :zstd)
-    )...,
-    (STATISTICS_ORACLE_FAMILY, :stats),
+const TARGETED_ORACLE_VARIANTS = Tuple(
+    (family, codec) for family in COMPRESSED_ORACLE_FAMILIES for codec in (:lz4, :zstd)
 )
 
 function _requiretargetedoracles(cases)
@@ -226,15 +220,6 @@ function preparecases(corpus::String, workdir::String; require_targeted::Bool=fa
                     Arrow.writefile(sch, batches; compress=compress, dictids=dictids),
                 )
                 push!(cases, OracleCase(name, v * "/" * fam * suffix, goldpath))
-            end
-            if fam == STATISTICS_ORACLE_FAMILY
-                name = v * "__" * fam * "+stats"
-                write(
-                    joinpath(casedir, name * ".stream"),
-                    Arrow.writestream(sch, batches; dictids),
-                )
-                write(joinpath(casedir, name * ".arrow"), Arrow.statsfile(sch, batches))
-                push!(cases, OracleCase(name, v * "/" * fam * "+stats", goldpath))
             end
         end
     end
@@ -307,28 +292,6 @@ function runoracle(
     return compareresults(cases, skips, results, workdir), results
 end
 
-"Remove exactly Arrow.jl's statistics key from one decoded IPC document."
-function _withoutstatsmetadata(document)
-    stripped = deepcopy(document)
-    schema = get(stripped, "schema", nothing)
-    schema isa AbstractDict || error("statistics oracle document has no schema object")
-    metadata = get(schema, "metadata", nothing)
-    metadata isa AbstractVector ||
-        error("statistics oracle document has no schema metadata")
-    matches = count(
-        entry ->
-            entry isa AbstractDict && get(entry, "key", nothing) == Arrow.STATS_KEY,
-        metadata,
-    )
-    matches == 1 || error("statistics oracle document has $matches statistics keys")
-    kept = [
-        entry for entry in metadata if
-        !(entry isa AbstractDict && get(entry, "key", nothing) == Arrow.STATS_KEY)
-    ]
-    isempty(kept) ? delete!(schema, "metadata") : (schema["metadata"] = kept)
-    return stripped
-end
-
 """
 Judge the oracle outputs: for every case the driver reported "ok", read the
 return bytes with OUR reader and compare values against the gold JSON.
@@ -340,14 +303,6 @@ function compareresults(cases::Vector{OracleCase}, skips, results, workdir::Stri
     end
     for case in cases
         gold = readjson(case.goldpath)
-        statsinput = if endswith(case.name, "+stats")
-            filedocument(read(joinpath(workdir, "cases", case.name * ".arrow")))
-        end
-        if statsinput !== nothing
-            push!(verdicts, documentcheck(case.label, "ours stats file→gold", gold) do
-                _withoutstatsmetadata(statsinput)
-            end)
-        end
         r = get(results["cases"], case.name, Dict{String,Any}())
         for (check, key, suffix, reader) in ORACLE_CHECKS
             status = get(r, key, "driver produced no result")
@@ -358,14 +313,7 @@ function compareresults(cases::Vector{OracleCase}, skips, results, workdir::Stri
                 push!(verdicts, Verdict(case.label, check, kind, status))
                 continue
             end
-            # The targeted file route adds the statistics key that the gold
-            # JSON does not contain. Compare PyArrow's return against our
-            # exact input document there, proving both values and unknown
-            # schema metadata survive. Its ordinary stream routes still use
-            # the metadata-free gold document.
-            expected =
-                key == "pyarrow_file" && endswith(case.name, "+stats") ? statsinput : gold
-            push!(verdicts, documentcheck(case.label, check, expected) do
+            push!(verdicts, documentcheck(case.label, check, gold) do
                 reader(read(joinpath(workdir, "out", case.name * suffix)))
             end)
         end
