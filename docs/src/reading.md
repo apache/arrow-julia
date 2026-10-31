@@ -26,7 +26,9 @@
 [`Arrow.Table(source)`](@ref Arrow.Table) reads Arrow IPC data, in the file or the stream
 format, into columns. A table is a `Tables.AbstractColumns`: `table.fare`,
 `table[:fare]`, `table["fare"]`, `table[2]`, and `Tables.getcolumn(table, :fare)` return a
-column, `names(table)` lists them, and any Tables.jl sink accepts the table.
+column, `names(table)` lists them, `DataAPI.nrow(table)` and `DataAPI.ncol(table)` (the
+`nrow` and `ncol` DataFrames exports) count rows and columns, and any Tables.jl sink
+accepts the table.
 
 ```@example reading
 using Arrow, DataFrames, Dates, Tables
@@ -44,7 +46,7 @@ A source is a path, an `IO`, a byte vector, or an [`Arrow.AbstractArrowSource`](
 FilePathsBase.jl path, reads as the file or `IO` it opens. With FileIO.jl loaded,
 `load("trips.arrow")` reads a table too. Column types are listed under
 [Type mapping](@ref). Columns that share a name read as `a`, `a_1`, `a_2`, and so on, as
-CSV.jl names them.
+CSV.jl names them. Two tables are `==` when their column names and columns are.
 
 ## Columns are read-only views
 

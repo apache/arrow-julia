@@ -290,6 +290,15 @@ end
     t = Arrow.Table(bytes)
     @test Base.names(t) == ["a", "b", "c"]
     @test t["b"] == ["x", "y"]
+    @test DataAPI.nrow(t) == 2 && DataAPI.ncol(t) == 3
+    # Tables compare by names and columns, as DataFrames do.
+    @test t == Arrow.Table(bytes) && isequal(t, Arrow.Table(bytes))
+    @test hash(t) == hash(Arrow.Table(bytes))
+    @test t != Arrow.Table(bytes; select=[:a, :b])
+    @test t != Arrow.Table(take!(Arrow.tobuffer((a=[1, 3], b=["x", "y"], c=[1.5, 2.5]))))
+    withmissing = take!(Arrow.tobuffer((a=[1, missing],)))
+    @test ismissing(Arrow.Table(withmissing) == Arrow.Table(withmissing))
+    @test isequal(Arrow.Table(withmissing), Arrow.Table(withmissing))
     # A table in memory is not a source; the error says how to get one.
     @test occursin("Arrow.Table(Arrow.tobuffer(table))", msg(() -> Arrow.Table((a=[1],))))
 end

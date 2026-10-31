@@ -327,6 +327,35 @@ Base.getproperty(t::Table, nm::Symbol) = Tables.getcolumn(t, nm)
 Base.getindex(t::Table, name::AbstractString) = Tables.getcolumn(t, Symbol(name))
 Base.names(t::Table) = String[String(name) for name in getfield(t, :names)]
 Tables.rowcount(t::Table) = getfield(t, :nrows)
+DataAPI.nrow(t::Table) = getfield(t, :nrows)
+DataAPI.ncol(t::Table) = length(getfield(t, :names))
+
+# Two tables are equal when their column names and columns are, as DataFrames
+# compares: `==` is `missing` when a column comparison is, `isequal` is not.
+function Base.:(==)(a::Table, b::Table)
+    getfield(a, :names) == getfield(b, :names) || return false
+    eq = true
+    for i in eachindex(getfield(a, :names))
+        coleq = Tables.getcolumn(a, i) == Tables.getcolumn(b, i)
+        isequal(coleq, false) && return false
+        eq &= coleq
+    end
+    return eq
+end
+function Base.isequal(a::Table, b::Table)
+    getfield(a, :names) == getfield(b, :names) || return false
+    return all(
+        i -> isequal(Tables.getcolumn(a, i), Tables.getcolumn(b, i)),
+        eachindex(getfield(a, :names)),
+    )
+end
+function Base.hash(t::Table, h::UInt)
+    h = hash(getfield(t, :names), h)
+    for i in eachindex(getfield(t, :names))
+        h = hash(Tables.getcolumn(t, i), h)
+    end
+    return h
+end
 
 DataAPI.metadatasupport(::Type{Table}) = (read=true, write=false)
 DataAPI.colmetadatasupport(::Type{Table}) = (read=true, write=false)

@@ -69,6 +69,8 @@ code, and what Arrow 2.x can read of files Arrow 3.0 writes.
   `Arrow.Stream`, and `Arrow.read`, with the filter functions `Arrow.col`,
   `Arrow.colcmp`, `Arrow.colin`, and `Arrow.isnull`.
 - `Arrow.read(source, sink)` reads into a sink with owned columns.
+- `==`, `isequal`, and `hash` on `Arrow.Table`, comparing names and columns, and
+  `DataAPI.nrow` and `DataAPI.ncol`.
 - `Arrow.AbstractArrowSource` (`Arrow.sourcelength`, `Arrow.readrange`,
   `Arrow.concurrentreads`) reads only the byte ranges a read needs, and a CloudStore.jl
   extension reads S3 and Azure objects that way.
