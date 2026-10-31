@@ -554,7 +554,7 @@ end
               "an Arrow.ListValue is read-only; copy(x) gives a Vector that can change"
         @test copy(t.l) isa Vector{Union{Missing,Vector{Int64}}} &&
               isequal(copy(t.l), tbl.l)
-        @test copy(t.m) isa Vector{Vector{Pair{DataString,Int64}}} &&
+        @test copy(t.m) isa Vector{Dict{DataString,Int64}} &&
               copy(t.st) isa Vector{@NamedTuple{a::Int64,b::DataString}}
         # Several batches chain, and copy the same way.
         two = Arrow.Table(arrowbytes(Tables.partitioner([tbl, tbl]); file=true))
