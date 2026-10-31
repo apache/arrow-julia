@@ -510,7 +510,7 @@ function _pooledcopy(::Type{T}, chunks) where {T}
         if v.pool !== lastpool
             remap = Vector{UInt32}(undef, length(v.pool))
             for (k, x) in enumerate(v.pool)
-                value = _ownedvalue(x)
+                value = _ownedpoolvalue(x)
                 remap[k] = get!(invpool, value) do
                     push!(pool, value)
                     UInt32(length(pool))
@@ -550,9 +550,10 @@ _isstringlayout(t::AC.ArrowType) =
 """
 Rows `first:last` of string batch `d`, whose output slots follow index `at`.
 An offsets layout (`utf8`/`binary`, normal or large) copies the rows' bytes
-into data buffer `buf` (0-based), which holds the batch's bytes from offset
-`lo` on. For a view layout `buf` is the batch's first data buffer, and a chunk
-with `variadic > 0` copies that buffer of the batch instead of encoding rows.
+into data buffer `buf` (0-based), where byte `a` of the batch's data buffer
+sits at position `a - lo`. For a view layout `buf` is the batch's first data
+buffer, and a chunk with `variadic > 0` copies that buffer of the batch
+instead of encoding rows.
 """
 struct _StringChunk
     d::AC.ArrayData
@@ -562,7 +563,7 @@ struct _StringChunk
     buf::Int
     lo::Int64
     variadic::Int
-    copybytes::Bool   # false: buffer `buf` is the batch's own decompressed data
+    copybytes::Bool   # false: buffer `buf` already holds the batch's bytes (`_adoptbytes`)
 end
 
 """
@@ -577,6 +578,7 @@ mutable struct _StringBuild{V,O}
     out::O                           # payloads or values, `n` long once allocated
     buffers::Vector{Vector{UInt8}}   # data buffers: kept bytes, or copies once allocated
     sizes::Vector{Int64}             # the bytes `_allocate!` gives buffer k (-1: kept)
+    bases::Vector{Int64}             # where a kept buffer's batch bytes start in it
     chunks::Vector{_StringChunk}
 end
 
@@ -624,12 +626,22 @@ function _rowchunks!(
     return chunks
 end
 
-# The decompressed bytes behind slice `b` when this read owns them and `b`
-# starts at their start, so a column can keep them instead of a copy.
-function _adoptbytes(b::AC.BufferSlice)
+# The bytes behind slice `b` that a column can reference instead of copying,
+# and where `b` starts in them: the decompressed buffer this read owns, or,
+# with `source`, the source's own bytes (a mapped file, a byte vector, a
+# fetched range) while `b` starts within the Int32 offsets a DataStrings view
+# addresses. A `DataString` holds its buffer, so a value taken from such a
+# column keeps the source bytes alive; `String(x)` copies it out.
+function _adoptbytes(b::AC.BufferSlice, source::Bool)
     r = b.region
-    (r !== nothing && b.offset == 0 && r.root isa _Decompressed) || return nothing
-    return (r.root::_Decompressed).bytes
+    r === nothing && return nothing
+    root = r.root
+    root isa _Decompressed && b.offset == 0 && return root.bytes, Int64(0)
+    source &&
+        root isa Vector{UInt8} &&
+        b.offset <= _MAX_VIEW_BUFFER &&
+        return root, b.offset
+    return nothing
 end
 
 # Cut offsets batch `d` into runs of rows whose bytes span at most 2 GiB, one
@@ -638,19 +650,25 @@ function _offsetruns!(
     chunks,
     buffers,
     sizes,
+    bases,
     d,
     offsets::AbstractVector{O},
     at::Int,
     budget,
     rows::Int,
+    source::Bool,
 ) where {O}
     n = Int(d.len)
-    # Decompressed data is the read's own: the column keeps it as it is.
-    own = _adoptbytes(AC.rolebuffer(d, AC.DATA))
-    if own !== nothing && Int64(offsets[n + 1]) <= _MAX_VIEW_BUFFER
-        push!(buffers, own)
-        push!(sizes, -1)
-        return _rowchunks!(chunks, d, at, 1, n, length(buffers) - 1, Int64(0), rows, false)
+    # Bytes the column can reference in place need no copy.
+    adopted = _adoptbytes(AC.rolebuffer(d, AC.DATA), source)
+    if adopted !== nothing
+        own, base = adopted
+        if base + Int64(offsets[n + 1]) <= _MAX_VIEW_BUFFER
+            push!(buffers, own)
+            push!(sizes, -1)
+            push!(bases, base)
+            return _rowchunks!(chunks, d, at, 1, n, length(buffers) - 1, -base, rows, false)
+        end
     end
     i = 1
     while i <= n
@@ -673,6 +691,7 @@ function _offsetruns!(
         _chargeexact!(budget, UInt8, hi - lo, "string column data")
         push!(buffers, UInt8[])
         push!(sizes, hi - lo)
+        push!(bases, 0)
         _rowchunks!(chunks, d, at, i, j - 1, length(buffers) - 1, lo, rows)
         i = j
     end
@@ -689,16 +708,24 @@ _stringbytes(d::AC.ArrayData) =
 """
 Plan the column of string or binary batches `datas` with element type `T`:
 charge its output and data buffers (`_allocate!` allocates them), and cut its
-rows into chunks of at most `rows`. Each data buffer is one copy of a run of
-the referenced bytes; a run stays under 2 GiB so view offsets fit
-DataStrings' Int32 words.
+rows into chunks of at most `rows`. A data buffer is the bytes the batch
+already has in memory, referenced in place (`_adoptbytes`; with `source`, the
+source's own bytes too), or else one copy of a run of the referenced bytes;
+a run stays under 2 GiB so view offsets fit DataStrings' Int32 words.
 """
-function _stringbuild(::Type{T}, datas, budget, rows::Int=typemax(Int)) where {T}
+function _stringbuild(
+    ::Type{T},
+    datas,
+    budget,
+    rows::Int=typemax(Int);
+    source::Bool=true,
+) where {T}
     B = Base.nonmissingtype(T)
     n = sum(d -> Int(d.len), datas; init=0)
     chunks = _StringChunk[]
     buffers = Vector{UInt8}[]
     sizes = Int64[]
+    bases = Int64[]
     at = 0
     if B === String
         _chargeexact!(budget, T, n, "string column")
@@ -714,7 +741,7 @@ function _stringbuild(::Type{T}, datas, budget, rows::Int=typemax(Int)) where {T
             AC.checked_add(AC.checked_mul(Int64(n), Int64(32)), bytes),
             "string values",
         )
-        return _StringBuild{String,Vector{T}}(n, T[], buffers, sizes, chunks)
+        return _StringBuild{String,Vector{T}}(n, T[], buffers, sizes, bases, chunks)
     end
     V =
         B === DataStrings.DataString ? DataStrings.StringVector{T} :
@@ -723,24 +750,37 @@ function _stringbuild(::Type{T}, datas, budget, rows::Int=typemax(Int)) where {T
     for d in datas
         m = Int(d.len)
         if d.type isa AC.ViewType
-            base = length(buffers)
+            bufbase = length(buffers)   # the batch's buffer 3 is column buffer `bufbase`
             for k = 3:length(d.buffers)
-                own = _adoptbytes(d.buffers[k])
-                if own !== nothing
-                    push!(buffers, own)
+                len = d.buffers[k].len
+                adopted = _adoptbytes(d.buffers[k], source)
+                if adopted !== nothing && adopted[2] + len <= _MAX_VIEW_BUFFER
+                    push!(buffers, adopted[1])
                     push!(sizes, -1)
+                    push!(bases, adopted[2])
                     continue
                 end
-                len = d.buffers[k].len
                 _chargeexact!(budget, UInt8, len, "string column data")
                 push!(buffers, UInt8[])
                 push!(sizes, len)
-                push!(chunks, _StringChunk(d, at, 1, 0, base, Int64(0), k, true))
+                push!(bases, 0)
+                push!(chunks, _StringChunk(d, at, 1, 0, bufbase, Int64(0), k, true))
             end
-            _rowchunks!(chunks, d, at, 1, m, base, Int64(0), rows)
+            _rowchunks!(chunks, d, at, 1, m, bufbase, Int64(0), rows)
         elseif m > 0
             _withoffsets(
-                o -> _offsetruns!(chunks, buffers, sizes, d, o, at, budget, rows),
+                o -> _offsetruns!(
+                    chunks,
+                    buffers,
+                    sizes,
+                    bases,
+                    d,
+                    o,
+                    at,
+                    budget,
+                    rows,
+                    source,
+                ),
                 d,
                 budget,
             )
@@ -752,6 +792,7 @@ function _stringbuild(::Type{T}, datas, budget, rows::Int=typemax(Int)) where {T
         _StringPayload[],
         buffers,
         sizes,
+        bases,
         chunks,
     )
 end
@@ -808,7 +849,7 @@ function _buildchunk!(
     if d.type isa AC.ViewType
         c.variadic > 0 &&
             return _copyvariadic!(b.buffers[c.buf + c.variadic - 2], d, c.variadic)
-        return _viewrows!(b.out, d, c)
+        return _viewrows!(b.out, d, c, b.bases)
     end
     buf = b.buffers[c.buf + 1]
     return _withoffsets(o -> _offsetrows!(b.out, buf, d, o, c), d)
@@ -942,27 +983,132 @@ end
 
 # The rows of a `utf8_view`/`binary_view` chunk: the view entries copied as
 # payloads (the layouts are identical), re-pointed at the batch's buffers
-# within the column's list.
-function _viewrows!(payloads::Vector{_StringPayload}, d::AC.ArrayData, c::_StringChunk)
+# within the column's list, and at where each buffer's bytes start (`bases`).
+function _viewrows!(
+    payloads::Vector{_StringPayload},
+    d::AC.ArrayData,
+    c::_StringChunk,
+    bases::Vector{Int64},
+)
     views = _wrapbuffer(_StringPayload, AC.rolebuffer(d, AC.VIEWS), d.offset, Int64(d.len))
     validity, bitoffset = _validitybits(d)
-    base = c.buf
     GC.@preserve d for k = c.first:c.last
         if _isnullslot(validity, bitoffset, k)
             payloads[c.at + k] = DataStrings.PAYLOAD_MISSING
             continue
         end
         p = _canonicalinline(views[k])
-        if base > 0 && DataStrings.payloadlength(p) > DataStrings.INLINE_MAX
-            p = _StringPayload(
-                p.a,
-                UInt64((DataStrings.payloadbufidx(p) + base) % UInt32) |
-                (UInt64(DataStrings.payloadoffset(p) % UInt32) << 32),
-            )
+        if DataStrings.payloadlength(p) > DataStrings.INLINE_MAX
+            idx = DataStrings.payloadbufidx(p) + c.buf
+            off = Int64(DataStrings.payloadoffset(p)) + bases[idx + 1]
+            p = _StringPayload(p.a, UInt64(idx % UInt32) | (UInt64(off % UInt32) << 32))
         end
         payloads[c.at + k] = p
     end
     return nothing
+end
+
+const _StringColumn = Union{DataStrings.StringVector,DataStrings.BytesVector}
+
+"""
+A copy of a string or binary column that owns its bytes: the same payloads over
+one data buffer (several, each under 2 GiB, for more bytes) holding just the
+bytes the view payloads reference, in column order; inline payloads carry
+their own. A column read over a mapped file, a byte vector, or a fetched range
+references those bytes in place, so this is what detaches a copy from them.
+"""
+function _compactstrings(v::V) where {V<:_StringColumn}
+    payloads = v.payloads
+    buffers = v.buffers
+    sizes = Int64[]
+    total = Int64(0)
+    for p in payloads
+        len = Int64(DataStrings.payloadlength(p))
+        len > DataStrings.INLINE_MAX || continue
+        if total + len > _MAX_VIEW_BUFFER
+            push!(sizes, total)
+            total = Int64(0)
+        end
+        total += len
+    end
+    push!(sizes, total)
+    out = Vector{_StringPayload}(undef, length(payloads))
+    data = Vector{UInt8}[Vector{UInt8}(undef, Int(size)) for size in sizes]
+    k = 1
+    pos = Int64(0)
+    @inbounds for i in eachindex(payloads)
+        p = payloads[i]
+        len = Int64(DataStrings.payloadlength(p))
+        if len <= DataStrings.INLINE_MAX
+            out[i] = p
+            continue
+        end
+        if pos + len > sizes[k]
+            k += 1
+            pos = Int64(0)
+        end
+        src = buffers[DataStrings.payloadbufidx(p) + 1]
+        dst = data[k]
+        GC.@preserve src dst unsafe_copyto!(
+            pointer(dst, Int(pos) + 1),
+            pointer(src, DataStrings.payloadpos(p)),
+            Int(len),
+        )
+        out[i] =
+            _StringPayload(p.a, UInt64((k - 1) % UInt32) | (UInt64(pos % UInt32) << 32))
+        pos += len
+    end
+    return V(out, data, Val(:trusted))
+end
+
+# Rows `rows` of a column: the same kind of string column over the same
+# buffers, so a filtered read gives what an unfiltered one does.
+_rowsof(v::AbstractVector, rows) = v[rows]
+_rowsof(v::V, rows) where {V<:_StringColumn} = V(v.payloads[rows], v.buffers, Val(:trusted))
+
+# The string columns `parts`, one per batch, joined into one of element type
+# `T` over all their buffers: a part's view payloads re-point into the joined
+# buffer list.
+function _joinstrings(::Type{T}, parts) where {T}
+    V =
+        Base.nonmissingtype(T) === DataStrings.DataString ? DataStrings.StringVector{T} :
+        DataStrings.BytesVector{T}
+    buffers = Vector{UInt8}[]
+    out = Vector{_StringPayload}(undef, sum(length, parts; init=0))
+    at = 0
+    for part in parts
+        base = length(buffers)
+        append!(buffers, part.buffers)
+        payloads = part.payloads
+        @inbounds for i in eachindex(payloads)
+            p = payloads[i]
+            if base > 0 && DataStrings.payloadlength(p) > DataStrings.INLINE_MAX
+                p = _StringPayload(
+                    p.a,
+                    UInt64((DataStrings.payloadbufidx(p) + base) % UInt32) |
+                    (p.b & 0xffffffff00000000),
+                )
+            end
+            out[at + i] = p
+        end
+        at += length(payloads)
+    end
+    return V(out, buffers, Val(:trusted))
+end
+
+# A dictionary pool value owning its bytes: a `DataString` or `DataBytes` view
+# into the pool column's buffer, which may be the source's bytes, gets its own.
+_ownedpoolvalue(x) = _ownedvalue(x)
+function _ownedpoolvalue(x::Union{DataStrings.DataString,DataStrings.DataBytes})
+    len = Int(DataStrings.payloadlength(x.p))
+    len <= DataStrings.INLINE_MAX && return x
+    data = Vector{UInt8}(undef, len)
+    GC.@preserve x data unsafe_copyto!(
+        pointer(data),
+        pointer(x.data, DataStrings.payloadpos(x.p)),
+        len,
+    )
+    return typeof(x)(_StringPayload(x.p.a, UInt64(0)), data)
 end
 
 # `String`s of an offsets-based chunk, read from the batch's data.
@@ -1445,7 +1591,7 @@ function _runendview(::Type{T}, f::AC.Field, d::AC.ArrayData, ctx::_ViewContext)
     R = AC.juliatype(runs.type::AC.IntType)
     _chargeexact!(ctx.budget, Int64, runs.len, "run ends")
     runends = _collectas(Int64, _primitive(R, R, Nothing, runs, ctx.budget))
-    vcol = _viewcolumn(f.children[2], [values], ctx, T)
+    vcol = _viewcolumn(f.children[2], [values], ctx, T; source=false)
     return RunEndEncoded{T,typeof(vcol)}(runends, vcol, Int(d.offset), Int(d.len))
 end
 
@@ -1454,17 +1600,22 @@ The view column of field `f` over its decoded batches `datas`: one view for
 one batch, a `ChainedVector` of per-batch views for several, and one
 `StringVector`/`BytesVector` (or `Vector{String}`) across all batches of a
 string or binary column. `T` overrides the element type (run-end values).
+A string column references the source's bytes in place unless `source` is
+false: the values of nested rows and run-end columns copy them, so a copy of
+a row (`copy(table)`, `DataFrame(table)`) owns its strings without copying
+each one.
 """
 function _viewcolumn(
     f::AC.Field,
     datas::AbstractVector{AC.ArrayData},
     ctx::_ViewContext,
-    T::Type=_vieweltype(f, datas, ctx),
+    T::Type=_vieweltype(f, datas, ctx);
+    source::Bool=true,
 )
     t = f.type
     t isa AC.NullType && return fill(missing, sum(d -> Int(d.len), datas; init=0))
     if _isstringlayout(t)
-        b = _allocate!(_stringbuild(T, datas, ctx.budget))
+        b = _allocate!(_stringbuild(T, datas, ctx.budget; source))
         for k in eachindex(b.chunks)
             _buildchunk!(b, k)
         end
@@ -1858,7 +2009,8 @@ function _childcolumn(
     ctx::_ViewContext,
     @nospecialize(E::Type)
 )
-    return _storedas(_columntype(E), _viewcolumn(f, AC.ArrayData[d], ctx, E), ctx.budget)
+    col = _viewcolumn(f, AC.ArrayData[d], ctx, E; source=false)
+    return _storedas(_columntype(E), col, ctx.budget)
 end
 _storedas(::Type{C}, col, budget) where {C} = col isa C ? col : _storeas(C, col, budget)
 

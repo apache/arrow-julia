@@ -948,6 +948,63 @@ end
         end
     end
 
+    @testset "string columns reference the source's bytes in place" begin
+        n = 50_000
+        strs = [
+            i % 3 == 0 ? missing :
+            string("value number ", i, i % 2 == 0 ? " and more" : "") for i = 1:n
+        ]
+        viewbytes = sum(x -> x === missing || ncodeunits(x) <= 12 ? 0 : ncodeunits(x), strs)
+        for stringview in (false, true), compress in (nothing, :lz4)
+            bytes = arrowbytes((s=strs, x=collect(1:n)); stringview, compress)
+            t = Arrow.Table(bytes)
+            @test isequal(t.s, strs)
+            # Uncompressed, the column's data buffer is the byte vector itself,
+            # and building it allocates its payloads alone.
+            compress === nothing && @test any(b -> b === bytes, t.s.buffers)
+            compress === nothing &&
+                @test fewestbytes(() -> Arrow.Table(bytes).s) < 16n + 16n ÷ 4
+            path = joinpath(mktempdir(), "s.arrow")
+            write(path, bytes)
+            mapped = Arrow.Table(path)
+            @test isequal(mapped.s, strs)
+            compress === nothing &&
+                @test any(b -> length(b) == filesize(path), mapped.s.buffers)
+            # Copies own their bytes: only the view strings', in column order.
+            c = copy(t)
+            @test isequal(c.s, strs) && !any(b -> b === bytes, c.s.buffers)
+            @test sum(length, c.s.buffers) == viewbytes
+            owned = Arrow.read(bytes, Tables.columntable).s
+            @test isequal(owned, strs) && !any(b -> b === bytes, owned.buffers)
+            # A filtered scan gives the same kind of column, over the same bytes.
+            f = Arrow.Table(bytes; filter=Arrow.col(:x) > n ÷ 2)
+            @test f.s isa StringVector && isequal(f.s, strs[(n ÷ 2 + 1):end])
+            compress === nothing && @test any(b -> b === bytes, f.s.buffers)
+            @test isequal(copy(f).s, strs[(n ÷ 2 + 1):end])
+        end
+        # A filtered column of several batches joins the batches' buffers.
+        parts = Tables.partitioner([
+            (s=strs[1:(n ÷ 2)], x=collect(1:(n ÷ 2))),
+            (s=strs[(n ÷ 2 + 1):end], x=collect((n ÷ 2 + 1):n)),
+        ])
+        bytes = arrowbytes(parts)
+        f = Arrow.Table(bytes; filter=Arrow.col(:x) > n ÷ 4)
+        @test f.s isa StringVector && isequal(f.s, strs[(n ÷ 4 + 1):end])
+        @test isequal(copy(f).s, strs[(n ÷ 4 + 1):end])
+        # The strings of a copied dictionary pool own their bytes.
+        pooled =
+            arrowbytes((p=PooledArray([isodd(i) ? "a long category" : "b" for i = 1:100]),))
+        pool = DataAPI.refpool(copy(Arrow.Table(pooled).p))
+        @test pool == ["a long category", "b"]
+        @test !any(x -> x.data === pooled, pool)
+        # Nested strings are copied as they are read, so a copied row owns its
+        # strings without a copy of its own.
+        nested = arrowbytes((l=[["abcdefghijklmnop", "q"]],))
+        tn = Arrow.Table(nested)
+        @test !any(b -> b === nested, tn.l.values.buffers)
+        @test copy(tn.l[1]) == ["abcdefghijklmnop", "q"]
+    end
+
     @testset "columns of several batches copy and broadcast by batch" begin
         part(r) = (
             x=collect(Int64, r),

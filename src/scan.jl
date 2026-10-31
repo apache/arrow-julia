@@ -1204,6 +1204,10 @@ function _joinscanparts(f::Field, parts::Vector, budget=nothing)
     for part in Iterators.drop(parts, 1)
         T = Base.promote_typejoin(T, _eltypeof(part))
     end
+    if all(part -> part isa _StringColumn, parts)
+        _chargevector!(budget, _StringPayload, total, "joined scan column")
+        return _joinstrings(T, parts)
+    end
     _chargevector!(budget, T, total, "joined scan column")
     out = Vector{T}(undef, total)
     offset = 0
@@ -1508,7 +1512,7 @@ function _keeprows!(sink::_ScanSink, decoded, rows, rblen::Int64)
         partidx = sink.partcounts[k] + 1
         partidx <= length(sink.parts[k]) ||
             throw(AssertionError("scan consumed more batches than its planned capacity"))
-        sink.parts[k][partidx] = whole ? source : source[rows]
+        sink.parts[k][partidx] = whole ? source : _rowsof(source, rows)
         sink.partcounts[k] = partidx
     end
     return nothing
@@ -2939,7 +2943,7 @@ function _executeplan(table, b::Tables.BoundScan, names::Vector{Symbol}, budget=
         begin
             source = Tables.getcolumn(cols, c.index)
             _chargevector!(budget, _eltypeof(source), length(rows), "scan column slice")
-            col = source[rows]
+            col = _rowsof(source, rows)
             c.type === nothing ? col : _uninferred(_applyoverride, c.type, col, budget)
         end for c in b.columns
     )

@@ -58,8 +58,11 @@ table.fare
 ```
 
 Strings and binary values read as a `DataStrings.StringVector` of `DataString`s and a
-`BytesVector` of `DataBytes`, built with one copy of their bytes the first time the table
-hands the column out. `stringtype=String` reads strings as `String`s, nested ones
+`BytesVector` of `DataBytes`, built the first time the table hands the column out: 16
+bytes per value, over the source's own bytes. A string longer than 12 bytes is a view
+into the mapped file, the byte vector, or the decompressed buffer, so a `DataString`
+taken from the column keeps those bytes alive until it is garbage collected;
+`String(x)` copies it out. `stringtype=String` reads strings as `String`s, nested ones
 included, at the cost of one allocation per value. Lists, maps, and structs read as
 typed rows ([Nested values](@ref)).
 
@@ -79,10 +82,12 @@ after its table is gone.
 ## Copy into Julia vectors
 
 `copy(column)` and `copy(table)` copy into owned, mutable columns: a `Vector` per column,
-a `PooledArray` for a dictionary column, and a `StringVector` for strings, which is
-mutable too. `DataFrame(table)` copies once, as `DataFrame` always does;
+a `PooledArray` for a dictionary column, and a `StringVector` for strings. A copied
+table's string columns hold their own bytes, so nothing of the source stays
+referenced. `DataFrame(table)` copies once, as `DataFrame` always does, but its string
+columns still share the source's bytes (DataStrings' `copy` keeps a column's buffers);
 `DataFrame(table; copycols=false)` keeps the views. [`Arrow.read(source,
-sink)`](@ref Arrow.read) reads and hands the copies to a sink in one step:
+sink)`](@ref Arrow.read) reads and hands fully owned copies to a sink in one step:
 
 ```@example reading
 df = Arrow.read(path, DataFrame)

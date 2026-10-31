@@ -94,8 +94,10 @@ code, and what Arrow 2.x can read of files Arrow 3.0 writes.
 
 - On Windows, a path is read into memory unless `mmap=true`, since Windows cannot
   delete a mapped file.
-- String columns are `StringVector`s, built once with one copy of their bytes; 2.x
-  allocated a new `String` on every access.
+- String columns are `StringVector`s of 16-byte values over the source's own bytes
+  (the mapped file, the byte vector, or the decompressed buffer), built once when the
+  column is first taken; 2.x allocated a new `String` on every access. `copy(table)`
+  and `Arrow.read` give string columns that own their bytes.
 - `Arrow.write` writes partition by partition, so a partitioned source such as
   `CSV.Chunks` writes in about one partition's memory, and validates each record batch
   before writing it.

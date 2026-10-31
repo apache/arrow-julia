@@ -483,11 +483,11 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             t = Arrow.Table(path)
             @test t.s == strings
             Arrow.release!(t)
-            # An explicit ceiling still applies (string columns copy their
-            # bytes: about 80 MB here).
+            # An explicit ceiling still applies (a string column's payloads are
+            # 16 bytes per value: 16 MB here, over the mapped file's bytes).
             @test_throws Arrow.AllocationLimitError Arrow.Table(
                 path;
-                limits=Arrow.Limits(max_total_allocated_bytes=16 * 1024^2),
+                limits=Arrow.Limits(max_total_allocated_bytes=8 * 1024^2),
             )
         finally
             rm(path; force=true)

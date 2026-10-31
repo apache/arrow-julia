@@ -57,7 +57,7 @@ its rows; from an `AbstractArrowSource`, only their bytes are fetched.
 Numbers, booleans, temporal values, decimals, and dictionary indices read as read-only
 [`Arrow.ArrowVector`](@ref) views of the source; a column of several record batches is a
 `ChainedVector` of them. Strings and binary values are `DataStrings.StringVector` and
-`BytesVector` columns, built with one copy of their bytes the first time the table hands
+`BytesVector` columns over the source's bytes, built the first time the table hands
 them out. Lists, maps, and structs read as typed rows. A column keeps the memory it reads
 alive while it is reachable, even after its table is gone; a mapped file is unmapped
 once the table and its columns are garbage collected. `copy(table)`, `DataFrame(table)`,
@@ -1911,12 +1911,15 @@ A filter that keeps rows whose value is missing, the same as `Tables.isnull`.
 """
 const isnull = Tables.isnull
 
-# Views copy into owned memory, a column of several batches into one vector;
-# columns this read materialized are already owned by nobody else.
+# Views copy into owned memory, a column of several batches into one vector,
+# and a string column into one that owns its bytes; columns this read
+# materialized are already owned by nobody else.
 _ownedcolumn(c::Union{ArrowVector,ChainedVector}) = _copycolumn(c)
+_ownedcolumn(c::_StringColumn) = _compactstrings(c)
 _ownedcolumn(c::AbstractVector{T}) where {T} = _needsowned(c) ? _copyrows(T, c) : c
 
 _copycolumn(c::ArrowVector) = copy(c)
+_copycolumn(c::_StringColumn) = _compactstrings(c)
 _copycolumn(c::AbstractVector{T}) where {T} = _needsowned(c) ? _copyrows(T, c) : copy(c)
 _copycolumn(c::ChainedVector{T,<:ArrowVector}) where {T} = copy(c)
 
