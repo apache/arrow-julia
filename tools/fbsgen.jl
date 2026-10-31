@@ -827,84 +827,45 @@ function emitverifier(io::IO, alldecls)
                 error("verifier: unsupported field type '$t' in $(d.name).$(f.name)")
             end
         end
-        println(
-            io,
-            "function verifyinline_",
-            name,
-            "(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)",
-        )
-        println(io, "    t = _vtable(bytes, pos)")
-        println(io, "    _vvisit!(ctx, \"", name, "\")")
-        println(io, "    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)")
-        print(io, String(take!(inline)))
-        println(io, "    return t")
-        println(io, "end")
-        println(io)
-        println(
-            io,
-            "function verifyrefs_",
-            name,
-            "(t::VTable, ctx::VerifyContext, depth::Base.Int)",
-        )
-        println(io, "    bytes = t.bytes")
-        print(io, String(take!(refs)))
-        println(io, "    return nothing")
-        println(io, "end")
-        println(io)
-        println(
-            io,
-            "function verify_",
-            name,
-            "(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)",
-        )
-        println(
-            io,
-            "    verifyrefs_",
-            name,
-            "(verifyinline_",
-            name,
-            "(bytes, pos, ctx, depth), ctx, depth)",
-        )
-        println(io, "    return nothing")
-        println(io, "end")
-        println(io)
-        println(
-            io,
-            "function verifyrootstart_",
-            name,
-            "(bytes::Vector{UInt8}, ctx::VerifyContext)",
-        )
-        println(io, "    length(bytes) >= 4 || _vfail(\"missing root offset\")")
-        println(io, "    root = Int64(_vu32(bytes, Int64(0)))")
-        println(io, "    root >= 4 || _vfail(\"invalid root offset\")")
-        println(io, "    return verifyinline_", name, "(bytes, root, ctx, 0)")
-        println(io, "end")
-        println(io)
-        println(
-            io,
-            "verifyrootrest_",
-            name,
-            "(t::VTable, ctx::VerifyContext) = verifyrefs_",
-            name,
-            "(t, ctx, 0)",
-        )
-        println(io)
-        println(
-            io,
-            "function verifyroot_",
-            name,
-            "(bytes::Vector{UInt8}, ctx::VerifyContext)",
-        )
-        println(
-            io,
-            "    verifyrootrest_",
-            name,
-            "(verifyrootstart_",
-            name,
-            "(bytes, ctx), ctx)",
-        )
-        println(io, "    return nothing")
-        println(io, "end")
+        # Only the two message roots (Message, Footer) need the staged form,
+        # so a caller can gate the metadata version between the stages.
+        if name in ("Message", "Footer")
+            println(
+                io,
+                "function verifyrootstart_",
+                name,
+                "(bytes::Vector{UInt8}, ctx::VerifyContext)",
+            )
+            println(io, "    length(bytes) >= 4 || _vfail(\"missing root offset\")")
+            println(io, "    root = Int64(_vu32(bytes, Int64(0)))")
+            println(io, "    root >= 4 || _vfail(\"invalid root offset\")")
+            println(io, "    t = _vtable(bytes, root)")
+            println(io, "    _vvisit!(ctx, \"", name, "\")")
+            print(io, String(take!(inline)))
+            println(io, "    return t")
+            println(io, "end")
+            println(io)
+            println(io, "function verifyrootrest_", name, "(t::VTable, ctx::VerifyContext)")
+            println(io, "    bytes = t.bytes")
+            println(io, "    depth = 0")
+            print(io, String(take!(refs)))
+            println(io, "    return nothing")
+            println(io, "end")
+        else
+            println(
+                io,
+                "function verify_",
+                name,
+                "(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)",
+            )
+            println(io, "    t = _vtable(bytes, pos)")
+            println(io, "    _vvisit!(ctx, \"", name, "\")")
+            println(io, "    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)")
+            print(io, String(take!(inline)))
+            print(io, String(take!(refs)))
+            println(io, "    return nothing")
+            println(io, "end")
+        end
         println(io)
     end
 end

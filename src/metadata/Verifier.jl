@@ -22,56 +22,10 @@
 # both; verifyrootstart_T/verifyrootrest_T split the root so a caller can gate
 # the metadata version between the two stages.
 
-function verifyinline_Null(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
+function verify_Null(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Null")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_Null(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
-    return nothing
-end
-
-function verify_Null(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
-    verifyrefs_Null(verifyinline_Null(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Null(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Null(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Null(t::VTable, ctx::VerifyContext) = verifyrefs_Null(t, ctx, 0)
-
-function verifyroot_Null(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Null(verifyrootstart_Null(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Struct(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    t = _vtable(bytes, pos)
-    _vvisit!(ctx, "Struct")
-    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_Struct(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -81,74 +35,16 @@ function verify_Struct(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_Struct(verifyinline_Struct(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Struct(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Struct(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Struct(t::VTable, ctx::VerifyContext) = verifyrefs_Struct(t, ctx, 0)
-
-function verifyroot_Struct(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Struct(verifyrootstart_Struct(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_List(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "List")
+    _vvisit!(ctx, "Struct")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_List(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
 function verify_List(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
-    verifyrefs_List(verifyinline_List(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_List(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_List(bytes, root, ctx, 0)
-end
-
-verifyrootrest_List(t::VTable, ctx::VerifyContext) = verifyrefs_List(t, ctx, 0)
-
-function verifyroot_List(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_List(verifyrootstart_List(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_LargeList(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "LargeList")
+    _vvisit!(ctx, "List")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_LargeList(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -158,38 +54,9 @@ function verify_LargeList(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_LargeList(verifyinline_LargeList(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_LargeList(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_LargeList(bytes, root, ctx, 0)
-end
-
-verifyrootrest_LargeList(t::VTable, ctx::VerifyContext) = verifyrefs_LargeList(t, ctx, 0)
-
-function verifyroot_LargeList(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_LargeList(verifyrootstart_LargeList(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_ListView(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "ListView")
+    _vvisit!(ctx, "LargeList")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_ListView(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -199,38 +66,9 @@ function verify_ListView(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_ListView(verifyinline_ListView(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_ListView(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_ListView(bytes, root, ctx, 0)
-end
-
-verifyrootrest_ListView(t::VTable, ctx::VerifyContext) = verifyrefs_ListView(t, ctx, 0)
-
-function verifyroot_ListView(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_ListView(verifyrootstart_ListView(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_LargeListView(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "LargeListView")
+    _vvisit!(ctx, "ListView")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_LargeListView(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -240,40 +78,9 @@ function verify_LargeListView(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_LargeListView(verifyinline_LargeListView(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_LargeListView(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_LargeListView(bytes, root, ctx, 0)
-end
-
-verifyrootrest_LargeListView(t::VTable, ctx::VerifyContext) =
-    verifyrefs_LargeListView(t, ctx, 0)
-
-function verifyroot_LargeListView(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_LargeListView(verifyrootstart_LargeListView(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_FixedSizeList(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "FixedSizeList")
+    _vvisit!(ctx, "LargeListView")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    _vfield(t, 0, 4)
-    return t
-end
-
-function verifyrefs_FixedSizeList(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -283,153 +90,36 @@ function verify_FixedSizeList(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_FixedSizeList(verifyinline_FixedSizeList(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_FixedSizeList(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_FixedSizeList(bytes, root, ctx, 0)
-end
-
-verifyrootrest_FixedSizeList(t::VTable, ctx::VerifyContext) =
-    verifyrefs_FixedSizeList(t, ctx, 0)
-
-function verifyroot_FixedSizeList(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_FixedSizeList(verifyrootstart_FixedSizeList(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Map(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "Map")
+    _vvisit!(ctx, "FixedSizeList")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    _vbool(t, 0)
-    return t
-end
-
-function verifyrefs_Map(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
+    _vfield(t, 0, 4)
     return nothing
 end
 
 function verify_Map(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
-    verifyrefs_Map(verifyinline_Map(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Map(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Map(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Map(t::VTable, ctx::VerifyContext) = verifyrefs_Map(t, ctx, 0)
-
-function verifyroot_Map(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Map(verifyrootstart_Map(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Union(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "Union")
+    _vvisit!(ctx, "Map")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001))
-    return t
-end
-
-function verifyrefs_Union(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
-    _vvector(t, 1, 4, ctx)
+    _vbool(t, 0)
     return nothing
 end
 
 function verify_Union(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
-    verifyrefs_Union(verifyinline_Union(bytes, pos, ctx, depth), ctx, depth)
+    t = _vtable(bytes, pos)
+    _vvisit!(ctx, "Union")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
+    _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001))
+    _vvector(t, 1, 4, ctx)
     return nothing
 end
 
-function verifyrootstart_Union(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Union(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Union(t::VTable, ctx::VerifyContext) = verifyrefs_Union(t, ctx, 0)
-
-function verifyroot_Union(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Union(verifyrootstart_Union(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Int(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
+function verify_Int(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Int")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vfield(t, 0, 4)
     _vbool(t, 1)
-    return t
-end
-
-function verifyrefs_Int(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
-    return nothing
-end
-
-function verify_Int(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
-    verifyrefs_Int(verifyinline_Int(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Int(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Int(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Int(t::VTable, ctx::VerifyContext) = verifyrefs_Int(t, ctx, 0)
-
-function verifyroot_Int(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Int(verifyrootstart_Int(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_FloatingPoint(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    t = _vtable(bytes, pos)
-    _vvisit!(ctx, "FloatingPoint")
-    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001, 0x0000000000000002))
-    return t
-end
-
-function verifyrefs_FloatingPoint(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -439,75 +129,17 @@ function verify_FloatingPoint(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_FloatingPoint(verifyinline_FloatingPoint(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_FloatingPoint(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_FloatingPoint(bytes, root, ctx, 0)
-end
-
-verifyrootrest_FloatingPoint(t::VTable, ctx::VerifyContext) =
-    verifyrefs_FloatingPoint(t, ctx, 0)
-
-function verifyroot_FloatingPoint(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_FloatingPoint(verifyrootstart_FloatingPoint(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Utf8(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "Utf8")
+    _vvisit!(ctx, "FloatingPoint")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_Utf8(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
+    _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001, 0x0000000000000002))
     return nothing
 end
 
 function verify_Utf8(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
-    verifyrefs_Utf8(verifyinline_Utf8(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Utf8(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Utf8(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Utf8(t::VTable, ctx::VerifyContext) = verifyrefs_Utf8(t, ctx, 0)
-
-function verifyroot_Utf8(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Utf8(verifyrootstart_Utf8(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Binary(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "Binary")
+    _vvisit!(ctx, "Utf8")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_Binary(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -517,38 +149,9 @@ function verify_Binary(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_Binary(verifyinline_Binary(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Binary(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Binary(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Binary(t::VTable, ctx::VerifyContext) = verifyrefs_Binary(t, ctx, 0)
-
-function verifyroot_Binary(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Binary(verifyrootstart_Binary(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_LargeUtf8(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "LargeUtf8")
+    _vvisit!(ctx, "Binary")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_LargeUtf8(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -558,38 +161,9 @@ function verify_LargeUtf8(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_LargeUtf8(verifyinline_LargeUtf8(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_LargeUtf8(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_LargeUtf8(bytes, root, ctx, 0)
-end
-
-verifyrootrest_LargeUtf8(t::VTable, ctx::VerifyContext) = verifyrefs_LargeUtf8(t, ctx, 0)
-
-function verifyroot_LargeUtf8(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_LargeUtf8(verifyrootstart_LargeUtf8(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_LargeBinary(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "LargeBinary")
+    _vvisit!(ctx, "LargeUtf8")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_LargeBinary(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -599,39 +173,9 @@ function verify_LargeBinary(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_LargeBinary(verifyinline_LargeBinary(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_LargeBinary(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_LargeBinary(bytes, root, ctx, 0)
-end
-
-verifyrootrest_LargeBinary(t::VTable, ctx::VerifyContext) =
-    verifyrefs_LargeBinary(t, ctx, 0)
-
-function verifyroot_LargeBinary(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_LargeBinary(verifyrootstart_LargeBinary(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Utf8View(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "Utf8View")
+    _vvisit!(ctx, "LargeBinary")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_Utf8View(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -641,38 +185,9 @@ function verify_Utf8View(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_Utf8View(verifyinline_Utf8View(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Utf8View(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Utf8View(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Utf8View(t::VTable, ctx::VerifyContext) = verifyrefs_Utf8View(t, ctx, 0)
-
-function verifyroot_Utf8View(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Utf8View(verifyrootstart_Utf8View(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_BinaryView(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "BinaryView")
+    _vvisit!(ctx, "Utf8View")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_BinaryView(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -682,39 +197,9 @@ function verify_BinaryView(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_BinaryView(verifyinline_BinaryView(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_BinaryView(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_BinaryView(bytes, root, ctx, 0)
-end
-
-verifyrootrest_BinaryView(t::VTable, ctx::VerifyContext) = verifyrefs_BinaryView(t, ctx, 0)
-
-function verifyroot_BinaryView(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_BinaryView(verifyrootstart_BinaryView(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_FixedSizeBinary(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "FixedSizeBinary")
+    _vvisit!(ctx, "BinaryView")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    _vfield(t, 0, 4)
-    return t
-end
-
-function verifyrefs_FixedSizeBinary(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -724,79 +209,17 @@ function verify_FixedSizeBinary(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_FixedSizeBinary(
-        verifyinline_FixedSizeBinary(bytes, pos, ctx, depth),
-        ctx,
-        depth,
-    )
-    return nothing
-end
-
-function verifyrootstart_FixedSizeBinary(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_FixedSizeBinary(bytes, root, ctx, 0)
-end
-
-verifyrootrest_FixedSizeBinary(t::VTable, ctx::VerifyContext) =
-    verifyrefs_FixedSizeBinary(t, ctx, 0)
-
-function verifyroot_FixedSizeBinary(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_FixedSizeBinary(verifyrootstart_FixedSizeBinary(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Bool(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "Bool")
+    _vvisit!(ctx, "FixedSizeBinary")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_Bool(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
+    _vfield(t, 0, 4)
     return nothing
 end
 
 function verify_Bool(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
-    verifyrefs_Bool(verifyinline_Bool(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Bool(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Bool(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Bool(t::VTable, ctx::VerifyContext) = verifyrefs_Bool(t, ctx, 0)
-
-function verifyroot_Bool(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Bool(verifyrootstart_Bool(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_RunEndEncoded(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
     t = _vtable(bytes, pos)
-    _vvisit!(ctx, "RunEndEncoded")
+    _vvisit!(ctx, "Bool")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_RunEndEncoded(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -806,26 +229,13 @@ function verify_RunEndEncoded(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_RunEndEncoded(verifyinline_RunEndEncoded(bytes, pos, ctx, depth), ctx, depth)
+    t = _vtable(bytes, pos)
+    _vvisit!(ctx, "RunEndEncoded")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     return nothing
 end
 
-function verifyrootstart_RunEndEncoded(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_RunEndEncoded(bytes, root, ctx, 0)
-end
-
-verifyrootrest_RunEndEncoded(t::VTable, ctx::VerifyContext) =
-    verifyrefs_RunEndEncoded(t, ctx, 0)
-
-function verifyroot_RunEndEncoded(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_RunEndEncoded(verifyrootstart_RunEndEncoded(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Decimal(
+function verify_Decimal(
     bytes::Vector{UInt8},
     pos::Int64,
     ctx::VerifyContext,
@@ -837,81 +247,18 @@ function verifyinline_Decimal(
     _vfield(t, 0, 4)
     _vfield(t, 1, 4)
     _vfield(t, 2, 4)
-    return t
-end
-
-function verifyrefs_Decimal(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
-    return nothing
-end
-
-function verify_Decimal(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    verifyrefs_Decimal(verifyinline_Decimal(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Decimal(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Decimal(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Decimal(t::VTable, ctx::VerifyContext) = verifyrefs_Decimal(t, ctx, 0)
-
-function verifyroot_Decimal(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Decimal(verifyrootstart_Decimal(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Date(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    t = _vtable(bytes, pos)
-    _vvisit!(ctx, "Date")
-    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001))
-    return t
-end
-
-function verifyrefs_Date(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
 function verify_Date(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
-    verifyrefs_Date(verifyinline_Date(bytes, pos, ctx, depth), ctx, depth)
+    t = _vtable(bytes, pos)
+    _vvisit!(ctx, "Date")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
+    _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001))
     return nothing
 end
 
-function verifyrootstart_Date(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Date(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Date(t::VTable, ctx::VerifyContext) = verifyrefs_Date(t, ctx, 0)
-
-function verifyroot_Date(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Date(verifyrootstart_Date(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Time(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
+function verify_Time(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Time")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
@@ -922,34 +269,10 @@ function verifyinline_Time(
         (0x0000000000000000, 0x0000000000000001, 0x0000000000000002, 0x0000000000000003),
     )
     _vfield(t, 1, 4)
-    return t
-end
-
-function verifyrefs_Time(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
-function verify_Time(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
-    verifyrefs_Time(verifyinline_Time(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Time(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Time(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Time(t::VTable, ctx::VerifyContext) = verifyrefs_Time(t, ctx, 0)
-
-function verifyroot_Time(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Time(verifyrootstart_Time(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Timestamp(
+function verify_Timestamp(
     bytes::Vector{UInt8},
     pos::Int64,
     ctx::VerifyContext,
@@ -964,54 +287,7 @@ function verifyinline_Timestamp(
         2,
         (0x0000000000000000, 0x0000000000000001, 0x0000000000000002, 0x0000000000000003),
     )
-    return t
-end
-
-function verifyrefs_Timestamp(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     _vstring(t, 1, ctx)
-    return nothing
-end
-
-function verify_Timestamp(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    verifyrefs_Timestamp(verifyinline_Timestamp(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Timestamp(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Timestamp(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Timestamp(t::VTable, ctx::VerifyContext) = verifyrefs_Timestamp(t, ctx, 0)
-
-function verifyroot_Timestamp(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Timestamp(verifyrootstart_Timestamp(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Interval(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    t = _vtable(bytes, pos)
-    _vvisit!(ctx, "Interval")
-    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001, 0x0000000000000002))
-    return t
-end
-
-function verifyrefs_Interval(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     return nothing
 end
 
@@ -1021,25 +297,14 @@ function verify_Interval(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_Interval(verifyinline_Interval(bytes, pos, ctx, depth), ctx, depth)
+    t = _vtable(bytes, pos)
+    _vvisit!(ctx, "Interval")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
+    _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001, 0x0000000000000002))
     return nothing
 end
 
-function verifyrootstart_Interval(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Interval(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Interval(t::VTable, ctx::VerifyContext) = verifyrefs_Interval(t, ctx, 0)
-
-function verifyroot_Interval(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Interval(verifyrootstart_Interval(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Duration(
+function verify_Duration(
     bytes::Vector{UInt8},
     pos::Int64,
     ctx::VerifyContext,
@@ -1054,54 +319,6 @@ function verifyinline_Duration(
         2,
         (0x0000000000000000, 0x0000000000000001, 0x0000000000000002, 0x0000000000000003),
     )
-    return t
-end
-
-function verifyrefs_Duration(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
-    return nothing
-end
-
-function verify_Duration(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    verifyrefs_Duration(verifyinline_Duration(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Duration(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Duration(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Duration(t::VTable, ctx::VerifyContext) = verifyrefs_Duration(t, ctx, 0)
-
-function verifyroot_Duration(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Duration(verifyrootstart_Duration(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_KeyValue(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    t = _vtable(bytes, pos)
-    _vvisit!(ctx, "KeyValue")
-    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    return t
-end
-
-function verifyrefs_KeyValue(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
-    _vstring(t, 0, ctx; required=true, utf8=false)
-    _vstring(t, 1, ctx; required=true, utf8=false)
     return nothing
 end
 
@@ -1111,25 +328,15 @@ function verify_KeyValue(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_KeyValue(verifyinline_KeyValue(bytes, pos, ctx, depth), ctx, depth)
+    t = _vtable(bytes, pos)
+    _vvisit!(ctx, "KeyValue")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
+    _vstring(t, 0, ctx; required=true, utf8=false)
+    _vstring(t, 1, ctx; required=true, utf8=false)
     return nothing
 end
 
-function verifyrootstart_KeyValue(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_KeyValue(bytes, root, ctx, 0)
-end
-
-verifyrootrest_KeyValue(t::VTable, ctx::VerifyContext) = verifyrefs_KeyValue(t, ctx, 0)
-
-function verifyroot_KeyValue(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_KeyValue(verifyrootstart_KeyValue(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_DictionaryEncoding(
+function verify_DictionaryEncoding(
     bytes::Vector{UInt8},
     pos::Int64,
     ctx::VerifyContext,
@@ -1141,60 +348,16 @@ function verifyinline_DictionaryEncoding(
     _vfield(t, 0, 8)
     _vbool(t, 2)
     _venum(t, 3, 2, (0x0000000000000000,))
-    return t
-end
-
-function verifyrefs_DictionaryEncoding(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     p = _vref(t, 1)
     p === nothing || verify_Int(bytes, p, ctx, depth + 1)
     return nothing
 end
 
-function verify_DictionaryEncoding(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    verifyrefs_DictionaryEncoding(
-        verifyinline_DictionaryEncoding(bytes, pos, ctx, depth),
-        ctx,
-        depth,
-    )
-    return nothing
-end
-
-function verifyrootstart_DictionaryEncoding(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_DictionaryEncoding(bytes, root, ctx, 0)
-end
-
-verifyrootrest_DictionaryEncoding(t::VTable, ctx::VerifyContext) =
-    verifyrefs_DictionaryEncoding(t, ctx, 0)
-
-function verifyroot_DictionaryEncoding(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_DictionaryEncoding(verifyrootstart_DictionaryEncoding(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Field(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
+function verify_Field(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
     t = _vtable(bytes, pos)
     _vvisit!(ctx, "Field")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vbool(t, 1)
-    return t
-end
-
-function verifyrefs_Field(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     _vstring(t, 0, ctx)
     tagp = _vfield(t, 2, 1; required=true)
     tag = tagp === nothing ? 0x00 : _vu8(bytes, tagp)
@@ -1290,26 +453,7 @@ function verifyrefs_Field(t::VTable, ctx::VerifyContext, depth::Base.Int)
     return nothing
 end
 
-function verify_Field(bytes::Vector{UInt8}, pos::Int64, ctx::VerifyContext, depth::Base.Int)
-    verifyrefs_Field(verifyinline_Field(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Field(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Field(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Field(t::VTable, ctx::VerifyContext) = verifyrefs_Field(t, ctx, 0)
-
-function verifyroot_Field(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Field(verifyrootstart_Field(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Schema(
+function verify_Schema(
     bytes::Vector{UInt8},
     pos::Int64,
     ctx::VerifyContext,
@@ -1319,11 +463,6 @@ function verifyinline_Schema(
     _vvisit!(ctx, "Schema")
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(t, 0, 2, (0x0000000000000000, 0x0000000000000001))
-    return t
-end
-
-function verifyrefs_Schema(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     _vtablevector(t, 1, verify_Field, ctx, depth; required=true)
     _vtablevector(t, 2, verify_KeyValue, ctx, depth)
     _venumvector(
@@ -1337,39 +476,12 @@ function verifyrefs_Schema(t::VTable, ctx::VerifyContext, depth::Base.Int)
     return nothing
 end
 
-function verify_Schema(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    verifyrefs_Schema(verifyinline_Schema(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Schema(bytes::Vector{UInt8}, ctx::VerifyContext)
+function verifyrootstart_Footer(bytes::Vector{UInt8}, ctx::VerifyContext)
     length(bytes) >= 4 || _vfail("missing root offset")
     root = Int64(_vu32(bytes, Int64(0)))
     root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Schema(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Schema(t::VTable, ctx::VerifyContext) = verifyrefs_Schema(t, ctx, 0)
-
-function verifyroot_Schema(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Schema(verifyrootstart_Schema(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Footer(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    t = _vtable(bytes, pos)
+    t = _vtable(bytes, root)
     _vvisit!(ctx, "Footer")
-    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(
         t,
         0,
@@ -1385,8 +497,9 @@ function verifyinline_Footer(
     return t
 end
 
-function verifyrefs_Footer(t::VTable, ctx::VerifyContext, depth::Base.Int)
+function verifyrootrest_Footer(t::VTable, ctx::VerifyContext)
     bytes = t.bytes
+    depth = 0
     p = _vref(t, 1; required=true)
     p === nothing || verify_Schema(bytes, p, ctx, depth + 1)
     _vvector(t, 2, 24, ctx)
@@ -1395,31 +508,7 @@ function verifyrefs_Footer(t::VTable, ctx::VerifyContext, depth::Base.Int)
     return nothing
 end
 
-function verify_Footer(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    verifyrefs_Footer(verifyinline_Footer(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Footer(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Footer(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Footer(t::VTable, ctx::VerifyContext) = verifyrefs_Footer(t, ctx, 0)
-
-function verifyroot_Footer(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Footer(verifyrootstart_Footer(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_BodyCompression(
+function verify_BodyCompression(
     bytes::Vector{UInt8},
     pos::Int64,
     ctx::VerifyContext,
@@ -1430,63 +519,6 @@ function verifyinline_BodyCompression(
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(t, 0, 1, (0x0000000000000000, 0x0000000000000001))
     _venum(t, 1, 1, (0x0000000000000000,))
-    return t
-end
-
-function verifyrefs_BodyCompression(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
-    return nothing
-end
-
-function verify_BodyCompression(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    verifyrefs_BodyCompression(
-        verifyinline_BodyCompression(bytes, pos, ctx, depth),
-        ctx,
-        depth,
-    )
-    return nothing
-end
-
-function verifyrootstart_BodyCompression(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_BodyCompression(bytes, root, ctx, 0)
-end
-
-verifyrootrest_BodyCompression(t::VTable, ctx::VerifyContext) =
-    verifyrefs_BodyCompression(t, ctx, 0)
-
-function verifyroot_BodyCompression(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_BodyCompression(verifyrootstart_BodyCompression(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_RecordBatch(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    t = _vtable(bytes, pos)
-    _vvisit!(ctx, "RecordBatch")
-    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
-    _vfield(t, 0, 8)
-    return t
-end
-
-function verifyrefs_RecordBatch(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
-    _vvector(t, 1, 16, ctx)
-    _vvector(t, 2, 16, ctx)
-    p = _vref(t, 3)
-    p === nothing || verify_BodyCompression(bytes, p, ctx, depth + 1)
-    _vvector(t, 4, 8, ctx)
     return nothing
 end
 
@@ -1496,26 +528,19 @@ function verify_RecordBatch(
     ctx::VerifyContext,
     depth::Base.Int,
 )
-    verifyrefs_RecordBatch(verifyinline_RecordBatch(bytes, pos, ctx, depth), ctx, depth)
+    t = _vtable(bytes, pos)
+    _vvisit!(ctx, "RecordBatch")
+    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
+    _vfield(t, 0, 8)
+    _vvector(t, 1, 16, ctx)
+    _vvector(t, 2, 16, ctx)
+    p = _vref(t, 3)
+    p === nothing || verify_BodyCompression(bytes, p, ctx, depth + 1)
+    _vvector(t, 4, 8, ctx)
     return nothing
 end
 
-function verifyrootstart_RecordBatch(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_RecordBatch(bytes, root, ctx, 0)
-end
-
-verifyrootrest_RecordBatch(t::VTable, ctx::VerifyContext) =
-    verifyrefs_RecordBatch(t, ctx, 0)
-
-function verifyroot_RecordBatch(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_RecordBatch(verifyrootstart_RecordBatch(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_DictionaryBatch(
+function verify_DictionaryBatch(
     bytes::Vector{UInt8},
     pos::Int64,
     ctx::VerifyContext,
@@ -1526,54 +551,17 @@ function verifyinline_DictionaryBatch(
     depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _vfield(t, 0, 8)
     _vbool(t, 2)
-    return t
-end
-
-function verifyrefs_DictionaryBatch(t::VTable, ctx::VerifyContext, depth::Base.Int)
-    bytes = t.bytes
     p = _vref(t, 1; required=true)
     p === nothing || verify_RecordBatch(bytes, p, ctx, depth + 1)
     return nothing
 end
 
-function verify_DictionaryBatch(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    verifyrefs_DictionaryBatch(
-        verifyinline_DictionaryBatch(bytes, pos, ctx, depth),
-        ctx,
-        depth,
-    )
-    return nothing
-end
-
-function verifyrootstart_DictionaryBatch(bytes::Vector{UInt8}, ctx::VerifyContext)
+function verifyrootstart_Message(bytes::Vector{UInt8}, ctx::VerifyContext)
     length(bytes) >= 4 || _vfail("missing root offset")
     root = Int64(_vu32(bytes, Int64(0)))
     root >= 4 || _vfail("invalid root offset")
-    return verifyinline_DictionaryBatch(bytes, root, ctx, 0)
-end
-
-verifyrootrest_DictionaryBatch(t::VTable, ctx::VerifyContext) =
-    verifyrefs_DictionaryBatch(t, ctx, 0)
-
-function verifyroot_DictionaryBatch(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_DictionaryBatch(verifyrootstart_DictionaryBatch(bytes, ctx), ctx)
-    return nothing
-end
-
-function verifyinline_Message(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    t = _vtable(bytes, pos)
+    t = _vtable(bytes, root)
     _vvisit!(ctx, "Message")
-    depth <= ctx.maxdepth || _vlimit(:depth, ctx.maxdepth)
     _venum(
         t,
         0,
@@ -1590,8 +578,9 @@ function verifyinline_Message(
     return t
 end
 
-function verifyrefs_Message(t::VTable, ctx::VerifyContext, depth::Base.Int)
+function verifyrootrest_Message(t::VTable, ctx::VerifyContext)
     bytes = t.bytes
+    depth = 0
     tagp = _vfield(t, 1, 1; required=true)
     tag = tagp === nothing ? 0x00 : _vu8(bytes, tagp)
     tag != 0x00 || _vfail("Message.header union tag is required")
@@ -1615,29 +604,5 @@ function verifyrefs_Message(t::VTable, ctx::VerifyContext, depth::Base.Int)
         _vfail("Message.header union has unknown tag")
     end
     _vtablevector(t, 4, verify_KeyValue, ctx, depth)
-    return nothing
-end
-
-function verify_Message(
-    bytes::Vector{UInt8},
-    pos::Int64,
-    ctx::VerifyContext,
-    depth::Base.Int,
-)
-    verifyrefs_Message(verifyinline_Message(bytes, pos, ctx, depth), ctx, depth)
-    return nothing
-end
-
-function verifyrootstart_Message(bytes::Vector{UInt8}, ctx::VerifyContext)
-    length(bytes) >= 4 || _vfail("missing root offset")
-    root = Int64(_vu32(bytes, Int64(0)))
-    root >= 4 || _vfail("invalid root offset")
-    return verifyinline_Message(bytes, root, ctx, 0)
-end
-
-verifyrootrest_Message(t::VTable, ctx::VerifyContext) = verifyrefs_Message(t, ctx, 0)
-
-function verifyroot_Message(bytes::Vector{UInt8}, ctx::VerifyContext)
-    verifyrootrest_Message(verifyrootstart_Message(bytes, ctx), ctx)
     return nothing
 end
