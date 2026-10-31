@@ -336,7 +336,7 @@ end
 function _writer(
     sink;
     file::Bool=(!isa(sink, IO)),
-    compress::Union{Nothing,Symbol}=nothing,
+    compress=nothing,
     metadata=nothing,
     colmetadata=nothing,
     dictreplacement::Bool=false,
@@ -539,6 +539,15 @@ Base.@nospecializeinfer function _writepartition!(
     # partition itself: Arrow legally allows zero fields with a positive
     # row count (the reader carries that count on the Table).
     n == 0 && isempty(names) && (n = Int(Tables.rowcount(part)))
+    for j in eachindex(columns)
+        m = length(columns[j])
+        m == n || throw(
+            ArgumentError(
+                "column $(names[j]) has $m rows, but column $(names[1]) has $n; every " *
+                "column of a table must have the same length",
+            ),
+        )
+    end
     # A partition with no rows writes no record batch, as pyarrow writes an
     # empty table; the first one still fixes the schema (`_writebatch!`).
     n == 0 && w.st !== nothing && return nothing
@@ -605,7 +614,8 @@ Base.@nospecializeinfer function _writebatch!(
             refpools=w.dictencode !== false,
             stringview=w.stringview,
             largelists=w.largelists,
-            growable=(!w.oneshot || several),
+            # A stream can be appended to, so its dictionaries may grow too.
+            growable=(!w.oneshot || several || !w.file),
             ntasks=_batchtasks(w, nrows, length(names)),
             w.pool,
         )
@@ -872,7 +882,7 @@ append(sink::Union{AbstractString,IO}; kwargs...) = tbl -> append(sink, tbl; kwa
 function _appendbytes(
     bytes::Vector{UInt8},
     tbl;
-    compress::Union{Nothing,Symbol}=nothing,
+    compress=nothing,
     compresslevel::Union{Nothing,Integer}=nothing,
     batchsize::Integer=DEFAULT_BATCHSIZE,
     dictdeltas::Bool=false,
@@ -1116,8 +1126,13 @@ end
 
 function _codec(compress, compresslevel)
     codec = compress === nothing ? :none : compress
-    haskey(CODEC_NAMES, codec) || throw(
-        ArgumentError("compress must be nothing, :lz4, or :zstd, got $(repr(compress))"),
+    codec isa Symbol && haskey(CODEC_NAMES, codec) || throw(
+        ArgumentError(
+            "compress must be nothing, :lz4, or :zstd, got $(repr(compress))" * (
+                compress isa Symbol ? "" :
+                "; Arrow 2.x took a compressor object, Arrow 3.0 takes the codec's name"
+            ),
+        ),
     )
     compresslevel === nothing ||
         codec !== :none ||

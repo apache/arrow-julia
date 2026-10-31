@@ -19,6 +19,7 @@ module WriterSinkTests
 using Test
 using Arrow
 using Tables
+using PooledArrays: PooledArray
 
 # Inject sink failures at the public path/IO boundary. The path wrapper lets
 # the writer own a controlled IO without depending on OS-specific failures.
@@ -75,7 +76,7 @@ end
             ((; compress=:invalid), ArgumentError),
             ((; dictreplacement=true, file=true), ArgumentError),
             ((; file=:invalid), TypeError),
-            ((; compress=1), TypeError),
+            ((; compress=1), ArgumentError),
             ((; dictreplacement=:invalid), TypeError),
             ((; unknown=true), ArgumentError),
         )
@@ -172,7 +173,7 @@ end
             for operation in (Arrow.write, Arrow.append)
                 for (options, error) in (
                     ((; compress=:invalid), ArgumentError),
-                    ((; compress=1), TypeError),
+                    ((; compress=1), ArgumentError),
                     ((; unknown=true), ArgumentError),
                 )
                     write(path, original)
@@ -337,6 +338,48 @@ end
             end
             chmod(target, 0o644)
         end
+    end
+
+    @testset "columns of different lengths are refused" begin
+        for sink in (IOBuffer(), tempname()), tbl in ((a=[1], b=[1, 2]), (a=[1, 2], b=[1]))
+            err = @test_throws ArgumentError Arrow.write(sink, tbl)
+            @test occursin(
+                "every column of a table must have the same length",
+                err.value.msg,
+            )
+            @test occursin("column b has", err.value.msg)
+        end
+        Arrow.Writer(IOBuffer()) do w
+            Arrow.write(w, (a=[1],))
+            @test_throws ArgumentError Arrow.write(w, (a=[1, 2], b=[1]))
+        end
+    end
+
+    @testset "a one-table stream's dictionaries can grow past 128 categories" begin
+        path = tempname()
+        Arrow.write(path, (k=PooledArray(["c0"]),); file=false)
+        for i = 1:200
+            Arrow.append(path, (k=PooledArray(["c$i"]),))
+        end
+        @test Arrow.Table(path).k == ["c$i" for i = 0:200]
+        rm(path)
+        # The file format keeps the narrowest indices for a one-table write; a
+        # stream, which can be appended to, declares Int32 indices.
+        indexbits(bytes) =
+            getfield(Arrow.Table(bytes), :schema).fields[1].type.indextype.bits
+        @test indexbits(
+            take!(Arrow.write(IOBuffer(), (k=PooledArray(["x"]),); file=true)),
+        ) == 8
+        @test indexbits(take!(Arrow.tobuffer((k=PooledArray(["x"]),)))) == 32
+    end
+
+    @testset "a 2.x compressor object names the codec keyword" begin
+        err = @test_throws ArgumentError Arrow.write(
+            IOBuffer(),
+            (a=[1],);
+            compress=Arrow.LZ4FrameCompressor(),
+        )
+        @test occursin("takes the codec's name", err.value.msg)
     end
 
     @testset "cleanup errors propagate when the body succeeds" begin

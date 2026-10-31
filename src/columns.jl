@@ -1947,7 +1947,7 @@ end
 _ownedtype(::Type{T}) where {T} =
     T isa Union ? Union{(_ownedtype(S) for S in Base.uniontypes(T))...} : T
 _ownedtype(::Type{ListValue{T}}) where {T} = Vector{_ownedtype(T)}
-_ownedtype(::Type{MapValue{K,V}}) where {K,V} = Vector{Pair{_ownedtype(K),_ownedtype(V)}}
+_ownedtype(::Type{MapValue{K,V}}) where {K,V} = Dict{_ownedtype(K),_ownedtype(V)}
 _ownedtype(::Type{NamedTuple{N,T}}) where {N,T} = NamedTuple{N,_ownedtype(T)}
 _ownedtype(::Type{Pair{K,V}}) where {K,V} = Pair{_ownedtype(K),_ownedtype(V)}
 _ownedtype(::Type{T}) where {T<:Tuple} =
@@ -1979,7 +1979,10 @@ _needsowned(c::AbstractVector{T}) where {T} =
 
 _ownedvalue(x) = x
 _ownedvalue(x::ListValue) = _copyrows(eltype(x), x)
-_ownedvalue(x::MapValue) = _copyrows(eltype(x), x)
+# A `Dict`, as Arrow 2.x read maps: a repeated key keeps its last value, the
+# one the view's lookup finds.
+_ownedvalue(x::MapValue{K,V}) where {K,V} =
+    Dict{_ownedtype(K),_ownedtype(V)}(_ownedvalue(k) => _ownedvalue(v) for (k, v) in x)
 _ownedvalue(x::Union{NamedTuple,Tuple}) = map(_ownedvalue, x)
 _ownedvalue(x::Pair) = _ownedvalue(first(x)) => _ownedvalue(last(x))
 _ownedvalue(x::AbstractVector) = _needsowned(x) ? _copyrows(eltype(x), x) : x

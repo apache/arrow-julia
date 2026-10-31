@@ -38,8 +38,9 @@ code, and what Arrow 2.x can read of files Arrow 3.0 writes.
   `Durations.ZonedTimestamp{P,Z}` instead of `ZonedDateTime`; decimals as
   `DataDecimals.Decimal`; intervals as `Durations.Duration`.
 - Nested values: list rows are `Arrow.ListValue` views; map rows are `Arrow.MapValue`s,
-  an `AbstractDict` in stored order, instead of `Dict`s; fixed-size lists read as tuples
-  only when they have at most 64 values and no nulls.
+  an `AbstractDict` in stored order, instead of `Dict`s (copies, as in `DataFrame(table)`,
+  hold `Dict`s); fixed-size lists read as tuples only when they have at most 64 values
+  and no nulls.
 - Columns are read-only; assigning into one is an error. Copy with `copy(table)`,
   `DataFrame(table)`, or `Arrow.read(source, DataFrame)`.
 - Removed: the `convert` keyword, `Arrow.Table(bytes, pos, len)`, reading a vector of

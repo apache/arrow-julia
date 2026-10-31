@@ -97,10 +97,10 @@ df = Arrow.read(path, DataFrame)
 ```
 
 `copy(table)` and `Arrow.read` also detach nested Arrow views. Lists become vectors,
-maps become vectors of key-value pairs (keeping duplicate keys), and structs and tuples
-keep their shape with owned child values. A copied table therefore keeps no dependency
-on the input's buffers. Nested values that were already ordinary Julia arrays follow
-Julia's usual shallow-copy behavior.
+maps become `Dict`s (a repeated key keeps its last value, as a lookup on the map finds
+it), and structs and tuples keep their shape with owned child values. A copied table
+therefore keeps no dependency on the input's buffers. Nested values that were already
+ordinary Julia arrays follow Julia's usual shallow-copy behavior.
 
 ## Memory mapping and lifetime
 

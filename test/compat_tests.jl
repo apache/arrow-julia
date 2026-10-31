@@ -262,6 +262,26 @@ end
     @test Arrow.Table(bytes; filter=startswith(Arrow.col(:s), "y")).s == ["y"]
 end
 
+@testset "filter forms Tables.jl 1.14 does not take get a hint" begin
+    bytes = take!(Arrow.tobuffer((a=[1, 2],)))
+    msg(f) =
+        try
+            f()
+            ""
+        catch e
+            e isa ArgumentError ? e.msg : "not an ArgumentError: $(typeof(e))"
+        end
+    equality = msg(() -> Arrow.Table(bytes; filter=Arrow.col(:a) == 1))
+    @test occursin("Arrow.colcmp(==, Arrow.col(:x), v)", equality)
+    @test occursin("Arrow.colin", equality)
+    @test occursin("Tables.jl 1.15", msg(() -> Arrow.Table(bytes; filter=:a => ==(1))))
+    @test occursin(
+        "not a function",
+        msg(() -> Arrow.Stream(bytes; filter=row -> row.a > 1)),
+    )
+    @test Arrow.Table(bytes; filter=Arrow.colcmp(==, Arrow.col(:a), 1)).a == [1]
+end
+
 @testset "select and drop by function; errors in their terms; table names" begin
     bytes = take!(Arrow.tobuffer((a=[1, 2], b=["x", "y"], c=[1.5, 2.5])))
     names(t) = collect(Tables.columnnames(t))

@@ -1705,9 +1705,35 @@ function _scanrequest(select, drop, filter, limit, scan)
     sugar || return nothing
     (select === nothing || drop === nothing) ||
         throw(ArgumentError("pass `select` or `drop`, not both"))
+    _checkfilterform(filter)
     # The filter and limit are checked now, before the source is read.
     Tables.Scan(; filter=filter, limit=limit)
     return _ScanRequest(select, drop, filter, limit)
+end
+
+# The filters people write first, with the forms Tables.jl 1.14 takes. (Tables
+# 1.15 takes `==`, `in`, and `:x => ==(v)` pairs itself.)
+function _checkfilterform(filter)
+    filter isa Bool && throw(
+        ArgumentError(
+            "filter is a Bool: `Arrow.col(:x) == v` compares the column reference itself. " *
+            "Write equality as Arrow.colcmp(==, Arrow.col(:x), v) and membership as " *
+            "Arrow.colin(Arrow.col(:x), values)",
+        ),
+    )
+    filter isa Pair && throw(
+        ArgumentError(
+            "filter pairs such as `:x => ==(v)` need Tables.jl 1.15; write " *
+            "Arrow.colcmp(==, Arrow.col(:x), v)",
+        ),
+    )
+    filter isa Function && throw(
+        ArgumentError(
+            "filter takes a predicate built from Arrow.col, not a function; to filter " *
+            "with a function, read the table and filter its rows, as with DataFrames",
+        ),
+    )
+    return nothing
 end
 
 _requestedscan(scan::Tables.Scan, names) = scan

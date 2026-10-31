@@ -17,6 +17,7 @@
 module DetachedValuesTests
 using Test, Arrow, Serialization, Tables
 using DataDecimals: Decimal
+using DataStrings: DataString
 const AC = Arrow.ArrowCore
 
 function roundtrip(x)
@@ -162,7 +163,7 @@ end
         [[[a], [b]], Vector{D}[]],
         [(amount=a, values=[a, b]), (amount=b, values=D[])],
         [([a], [b]), (D[], [a])],
-        [["key" => [a], "key" => [b]], ["empty" => D[]]],
+        [Dict("key" => [a], "other" => [b]), Dict("empty" => D[])],
         Union{Missing,Vector{D}}[missing, [a, b]],
         Union{Int,Vector{D}}[1, [a, b]],
     )
@@ -220,6 +221,27 @@ end
     end
     materialized = Arrow.Table(take!(Arrow.tobuffer((; x=[Int128[1, 2]]))))
     @test copy(materialized).x[1] === materialized.x[1]
+end
+
+@testset "copies of map columns are Dicts" begin
+    bytes = take!(Arrow.tobuffer((m=[Dict("a" => 1, "b" => 2), missing, Dict("c" => 3)],)))
+    t = Arrow.Table(bytes)
+    c = copy(t.m)
+    @test c isa Vector{Union{Missing,Dict{DataString,Int64}}}
+    @test c[1]["a"] == 1 && c[2] === missing && c[3]["c"] == 3
+    @test isequal(c, t.m) && isequal(copy(t).m, t.m)
+    owned = Arrow.read(bytes, Tables.columntable).m
+    @test owned[1] isa Dict && owned[1]["b"] == 2
+    @test isequal(roundtrip(t).m, t.m) && roundtrip(t).m[1] isa Dict
+    # Maps inside lists and structs copy to Dicts too, and write back.
+    nested = take!(Arrow.tobuffer((l=[[Dict("k" => 1)]], s=[(m=Dict("k" => 2),)])))
+    tn = Arrow.Table(nested)
+    @test copy(tn.l)[1][1] isa Dict && copy(tn.s)[1].m isa Dict
+    @test isequal(Arrow.Table(take!(Arrow.tobuffer(copy(tn)))).s, tn.s)
+    # The view keeps a repeated key's entries; a copy keeps the last value.
+    dup = Arrow.Table(take!(Arrow.tobuffer((m=[["k" => 1, "k" => 2]],))))
+    @test length(dup.m[1]) == 2 && dup.m[1]["k"] == 2
+    @test copy(dup.m)[1] == Dict("k" => 2)
 end
 
 @testset "Opaque binary metadata" begin
