@@ -1757,7 +1757,7 @@ mutable struct _RangedFile
 end
 
 function _RangedFile(sf::SourceFile, budget::AllocationBudget)
-    ft = _rangedfooter(sf, budget)
+    ft = _readfooter(sf, sf.limits, budget)
     version = Ref(Int16(0))
     dictreader = _BlockReader(sf)
     framed(i, block) =
@@ -2250,118 +2250,26 @@ function _neededdictids(fields, fielddictids, mask::AbstractVector{Bool}, budget
     return ids
 end
 
-"""
-Parse and verify one fetched block-metadata payload the way `_blockmessage`
-does over a region: framing prefix, verified flatbuffer graph, declared
-body length against the Block tuple.
-"""
-function _parseblockmeta(
-    bytes::BufferSlice,
-    block::NTuple{3,Int64},
-    limits::Limits,
-    budget::AllocationBudget,
-)
-    _, metalen, bodylen = block
-    bytes.len == metalen ||
-        throw(ValidationError("footer block metadata fetch length mismatch"))
-    metalen >= 16 || throw(ValidationError("footer block has invalid extents"))
-    AC.loadat(bytes, UInt32, Int64(0)) == CONTINUATION ||
-        throw(ValidationError("footer block does not point at a message"))
-    declared = Int64(AC.loadat(bytes, Int32, Int64(4)))
-    declared == metalen - 8 ||
-        throw(ValidationError("footer block metadata length does not match the message"))
-    _checkblocklengths(declared, bodylen, limits)
-    _chargevector!(budget, UInt8, declared, "metadata allocation")
-    metabytes = AC.slicebytes(AC.subslice(bytes, 8, declared))
-    version, header_type, _, _ = _verify_ipc_metadata_budgeted(metabytes, limits, budget)
-    msg = FB.getrootas(Meta.Message, metabytes, 0)
-    Int64(msg.bodyLength) == bodylen ||
-        throw(ValidationError("footer block body length does not match the message"))
-    return msg, version, header_type
+# The last `n` bytes of the object, from its cached tail window.
+function _lastbytes(sf::SourceFile, n::Int, budget)
+    tail, _ = _fetchtail(sf, budget)
+    return tail[(end - n + 1):end]
 end
 
-_parseblockmeta(bytes::Vector{UInt8}, block, limits, budget) =
-    _parseblockmeta(BufferSlice(heapregion(bytes), 0, length(bytes)), block, limits, budget)
-
-"Fetch and verify the ranged footer: schema, fields, blocks, id table."
-function _rangedfooter(sf::SourceFile, budget::AllocationBudget)
-    limits = sf.limits
-    _requirelittleendian()
-    _validatelimits(limits)
-    L = sf.len
-    L >= Int64(8 + 8 + 4 + 6) ||
-        throw(ValidationError("file is too short to be an IPC file"))
+# The Footer's bytes: from the cached tail window when it holds them.
+function _footerbytes(sf::SourceFile, start::Int64, len::Int64, budget)
     tail, tailstart = _fetchtail(sf, budget)
-    tail[(end - 5):end] == Vector{UInt8}(FILE_MAGIC) ||
-        throw(ValidationError("missing trailing ARROW1 magic"))
-    footerlen = Int64(reinterpret(Int32, tail[(end - 9):(end - 6)])[1])
-    footerlen > 0 || throw(ValidationError("footer length $footerlen is not positive"))
-    footerlen <= limits.max_metadata_bytes || _limiterror(
-        "footer length $footerlen",
-        "max_metadata_bytes",
-        limits.max_metadata_bytes,
-    )
-    footerstart = L - 10 - footerlen
-    footerstart >= 8 || throw(ValidationError("footer escapes the file"))
-
-    footerbytes = if footerstart >= tailstart
-        _chargevector!(budget, UInt8, footerlen, "footer allocation")
-        tail[(footerstart - tailstart + 1):(footerstart - tailstart + footerlen)]
-    else
-        _fetchfooter(sf, footerstart, footerlen, budget)
-    end
-    version, features, dictblocks, recordblocks, _ =
-        _verify_footer_budgeted(footerbytes, limits, budget)
-    Int64(1) in features &&
-        throw(ValidationError("dictionary replacement is forbidden in the IPC file format"))
-    nmessages = AC.checked_add(
-        Int64(1),
-        AC.checked_add(Int64(length(dictblocks)), Int64(length(recordblocks))),
-    )
-    nmessages <= limits.max_messages ||
-        _limiterror("message count", "max_messages", limits.max_messages)
-    footer = FB.getrootas(Meta.Footer, footerbytes, 0)
-    metaschema = footer.schema
-    metaschema === nothing && throw(ValidationError("file footer carries no schema"))
-    something(metaschema.endianness, Meta.Endianness.Little) == Meta.Endianness.Little ||
-        throw(
-            ValidationError(
-                "big-endian IPC is not supported (no endianness normalization)",
-            ),
-        )
-    dictids = Dict{Int64,Meta.Field}()
-    fielddictids = IdDict{Field,Int64}()
-    fields = Field[
-        corefield(f, dictids, fielddictids) for
-        f in something(metaschema.fields, Meta.Field[])
-    ]
-    foreach(validateschemafield, fields)
-    dictvaluefields = validatedictionaryids(fields, fielddictids)
-    sch = Schema(
-        fields;
-        metadata=coremetadata(metaschema.custom_metadata),
-        endianness=AC.LittleEndian,
-    )
-    return (;
-        sch,
-        fields,
-        dictids,
-        fielddictids,
-        dictvaluefields,
-        version,
-        dictblocks,
-        recordblocks,
-        footerstart,
-        metaschema,
-    )
+    start >= tailstart || return _fetchfooter(sf, start, len, budget)
+    _chargevector!(budget, UInt8, len, "footer allocation")
+    return tail[(start - tailstart + 1):(start - tailstart + len)]
 end
 
 """
 One record block's row count from one range request for its metadata, with
 the frame discipline of a scan's metadata pass: extent bounds before the
 fetch, the fetch and parse charged to the caller's cumulative budget,
-`_parseblockmeta` framing (continuation prefix, declared length, verified
-graph, body-length cross-check), header kind, footer-version agreement,
+`_blockmeta` framing (continuation prefix, declared length, verified graph,
+body-length cross-check), header kind, footer-version agreement,
 and compression rejection.
 """
 function _rangedbatchrows(
@@ -2377,7 +2285,8 @@ function _rangedbatchrows(
     _checkblocklengths(declared, bodylen, sf.limits)
     _chargevector!(budget, UInt8, metalen, "metadata range fetch")
     payload = _fetchexact(sf, block[1], metalen)
-    msg, v, header_type = _parseblockmeta(payload, block, sf.limits, budget)
+    msg, v, header_type, _ =
+        _blockmeta(BufferSlice(heapregion(payload), 0, metalen), block, sf.limits, budget)
     header_type == UInt8(3) ||
         throw(ValidationError("footer record block is not a record batch"))
     expected = messageversion[] == 0 ? v : messageversion[]
@@ -2408,13 +2317,6 @@ function _runboundscan(
     _chargebitvector!(budget, length(names), "scan decode mask")
     mask = falses(length(names))
     mask[decodeidx] .= true
-
-    # Footer Blocks remain mutually exclusive and bounded without parsing the
-    # leading schema or optional EOS bytes. A tail request may over-read them.
-    # 8 is the padded leading magic (`ARROW1` plus two bytes). The ranged
-    # reader never fetches those bytes, so a conforming file's first message
-    # starting at 8 is an assumption, not a check.
-    _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
 
     nrec = length(recordblocks)
     # One coalesced metadata pass over the dictionary and record blocks;
@@ -2461,7 +2363,7 @@ function _runboundscan(
     blockmeta = Vector{Tuple{Meta.Message,Int16}}(undef, length(metablocks))
     for (i, block) in enumerate(metablocks)
         payload = _spanslice(metaspans, block[1], block[2])
-        msg, v, header_type = _parseblockmeta(payload, block, limits, budget)
+        msg, v, header_type, _ = _blockmeta(payload, block, limits, budget)
         expected_dict = i <= length(dictblocks)
         (expected_dict ? header_type == UInt8(2) : header_type == UInt8(3)) || throw(
             ValidationError(

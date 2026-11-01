@@ -963,10 +963,10 @@ function _ranged_main(filebytes::Vector{UInt8}, full)
     cachefile = SourceFile(cachesource; tailbytes=32)
     cachecap = Limits().max_total_allocated_bytes
     firstbudget = AllocationBudget(cachecap)
-    _rangedfooter(cachefile, firstbudget)
+    _readfooter(cachefile, cachefile.limits, firstbudget)
     firstrequests = length(cachelog.ranges)
     secondbudget = AllocationBudget(cachecap)
-    _rangedfooter(cachefile, secondbudget)
+    _readfooter(cachefile, cachefile.limits, secondbudget)
     footerlen = Int64(reinterpret(Int32, filebytes[(end - 9):(end - 6)])[1])
     footerstart = Int64(length(filebytes)) - 10 - footerlen
     tailstart = Int64(length(filebytes)) - 32

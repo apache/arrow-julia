@@ -2370,9 +2370,36 @@ function _validateblockindex(dictblocks, recordblocks, dataend::Int64; datastart
 end
 
 """
-Frame and verify the single message a Block points at, against the block's
-own declared extents and the enclosing region.
+Verify the message footer Block `block` points at, from `meta`, the Block's
+prefix and metadata bytes: the continuation marker, the metadata length the
+Block declares, the verified metadata, and the body length the Block
+declares. Returns the message, its metadata version, header type, and
+features.
 """
+function _blockmeta(
+    meta::BufferSlice,
+    block::NTuple{3,Int64},
+    limits::Limits,
+    budget::AllocationBudget,
+)
+    _, metalen, bodylen = block
+    AC.loadat(meta, UInt32, Int64(0)) == CONTINUATION ||
+        throw(ValidationError("footer block does not point at a message"))
+    declared = Int64(AC.loadat(meta, Int32, Int64(4)))
+    declared == metalen - 8 ||
+        throw(ValidationError("footer block metadata length does not match the message"))
+    _checkblocklengths(declared, bodylen, limits)
+    _chargevector!(budget, UInt8, declared, "metadata allocation")
+    metabytes = AC.slicebytes(AC.subslice(meta, 8, declared))
+    version, header_type, features, _ =
+        _verify_ipc_metadata_budgeted(metabytes, limits, budget)
+    msg = FB.getrootas(Meta.Message, metabytes, 0)
+    Int64(msg.bodyLength) == bodylen ||
+        throw(ValidationError("footer block body length does not match the message"))
+    return msg, version, header_type, features
+end
+
+"The message footer Block `block` points at in `region`, framed and verified."
 function _blockmessage(
     region::OwnerRegion,
     block::NTuple{3,Int64},
@@ -2383,19 +2410,8 @@ function _blockmessage(
     offset, _ = _blockextent(block, dataend)
     _, metalen, bodylen = block
     blob = BufferSlice(region, 0, region.len)
-    AC.loadat(blob, UInt32, offset) == CONTINUATION ||
-        throw(ValidationError("footer block does not point at a message"))
-    declared = Int64(AC.loadat(blob, Int32, offset + 4))
-    declared == metalen - 8 ||
-        throw(ValidationError("footer block metadata length does not match the message"))
-    _checkblocklengths(declared, bodylen, limits)
-    _chargevector!(budget, UInt8, declared, "metadata allocation")
-    metabytes = AC.slicebytes(AC.subslice(blob, offset + 8, declared))
-    version, header_type, features, _ =
-        _verify_ipc_metadata_budgeted(metabytes, limits, budget)
-    msg = FB.getrootas(Meta.Message, metabytes, 0)
-    Int64(msg.bodyLength) == bodylen ||
-        throw(ValidationError("footer block body length does not match the message"))
+    msg, version, header_type, features =
+        _blockmeta(AC.subslice(blob, offset, metalen), block, limits, budget)
     return FramedMessage(
         msg,
         AC.subslice(blob, offset + metalen, bodylen),
@@ -2441,33 +2457,36 @@ function _filemetadataversion(footer::Int16, message::Int16, expected::Int16=mes
     return message
 end
 
-function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget)
+"""
+The verified footer of the IPC file in `src`, a region or a byte-range source:
+its schema, dictionary ids, metadata version, and Block index. The Footer is
+authoritative, as in Arrow C++: the schema comes from it and every message is
+reached through its Blocks, so the leading Schema message is never read.
+(Polars writes that message without its stream framing.) Blocks start after
+the padded leading magic (`ARROW1` plus two bytes), end before the Footer,
+and do not overlap; each message is verified against its Block when it is
+read.
+"""
+function _readfooter(src, limits::Limits, budget::AllocationBudget)
     _requirelittleendian()
     _validatelimits(limits)
-    blob = BufferSlice(region, 0, region.len)
     # leading magic + pad (8), smallest footer flatbuffer (8), footer length
     # (4), trailing magic (6).
-    minlen = Int64(8 + 8 + 4 + 6)
-    region.len >= minlen || throw(ValidationError("file is too short to be an IPC file"))
-    for (i, byte) in enumerate(FILE_MAGIC)
-        AC.loadat(blob, UInt8, Int64(i - 1)) == byte ||
-            throw(ValidationError("missing leading ARROW1 magic"))
-        AC.loadat(blob, UInt8, region.len - 6 + (i - 1)) == byte ||
-            throw(ValidationError("missing trailing ARROW1 magic"))
-    end
-    # The trailer is <footer><Int32 footer length><ARROW1>, so the length
-    # word sits 10 bytes from the end.
-    footerlen = Int64(AC.loadat(blob, Int32, region.len - 10))
+    src.len >= Int64(8 + 8 + 4 + 6) ||
+        throw(ValidationError("file is too short to be an IPC file"))
+    # The trailer is <footer><Int32 footer length><ARROW1>.
+    trailer = _lastbytes(src, 10, budget)
+    trailer[5:10] == FILE_MAGIC || throw(ValidationError("missing trailing ARROW1 magic"))
+    footerlen = Int64(ltoh(reinterpret(Int32, trailer[1:4])[1]))
     footerlen > 0 || throw(ValidationError("footer length $footerlen is not positive"))
     footerlen <= limits.max_metadata_bytes || _limiterror(
         "footer length $footerlen",
         "max_metadata_bytes",
         limits.max_metadata_bytes,
     )
-    footerstart = region.len - 10 - footerlen
+    footerstart = src.len - 10 - footerlen
     footerstart >= 8 || throw(ValidationError("footer escapes the file"))
-    _chargevector!(budget, UInt8, footerlen, "footer allocation")
-    footerbytes = AC.slicebytes(AC.subslice(blob, footerstart, footerlen))
+    footerbytes = _footerbytes(src, footerstart, footerlen, budget)
     version, features, dictblocks, recordblocks, _ =
         _verify_footer_budgeted(footerbytes, limits, budget)
     Int64(1) in features &&
@@ -2478,25 +2497,15 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
     )
     nmessages <= limits.max_messages ||
         _limiterror("message count $nmessages", "max_messages", limits.max_messages)
-    footer = FB.getrootas(Meta.Footer, footerbytes, 0)
-    metaschema = footer.schema
-    metaschema === nothing || (
-        something(metaschema.endianness, Meta.Endianness.Little) ==
-        Meta.Endianness.Little || throw(
+    metaschema = FB.getrootas(Meta.Footer, footerbytes, 0).schema
+    metaschema === nothing && throw(ValidationError("file footer carries no schema"))
+    something(metaschema.endianness, Meta.Endianness.Little) == Meta.Endianness.Little ||
+        throw(
             ValidationError(
                 "big-endian IPC is not supported (no endianness normalization)",
             ),
         )
-    )
-    metaschema === nothing && throw(ValidationError("file footer carries no schema"))
-    # The Footer is authoritative, as in Arrow C++: the schema comes from it
-    # and every message is reached through its Blocks, so the leading Schema
-    # message is never read. (Polars writes that message without its stream
-    # framing.) Data starts after the padded magic (`ARROW1` plus two bytes);
-    # Blocks must not overlap and must end before the Footer. Each message is
-    # verified against its Block when it is decoded.
-    dataend = footerstart
-    _validateblockindex(dictblocks, recordblocks, dataend; datastart=Int64(8))
+    _validateblockindex(dictblocks, recordblocks, footerstart; datastart=Int64(8))
     dictids = Dict{Int64,Meta.Field}()
     fielddictids = IdDict{Field,Int64}()
     fields = Field[
@@ -2510,17 +2519,43 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
         metadata=coremetadata(metaschema.custom_metadata),
         endianness=AC.LittleEndian,
     )
+    return (;
+        sch,
+        fields,
+        dictids,
+        fielddictids,
+        dictvaluefields,
+        version,
+        dictblocks,
+        recordblocks,
+        footerstart,
+    )
+end
+
+_lastbytes(region::OwnerRegion, n::Int, _) =
+    AC.slicebytes(AC.subslice(BufferSlice(region, 0, region.len), region.len - n, n))
+
+function _footerbytes(region::OwnerRegion, start::Int64, len::Int64, budget)
+    _chargevector!(budget, UInt8, len, "footer allocation")
+    return AC.slicebytes(AC.subslice(BufferSlice(region, 0, region.len), start, len))
+end
+
+function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget)
+    region.len >= 6 &&
+        AC.slicebytes(AC.subslice(BufferSlice(region, 0, region.len), 0, 6)) == FILE_MAGIC ||
+        throw(ValidationError("missing leading ARROW1 magic"))
+    ft = _readfooter(region, limits, budget)
     framed(_, block) =
-        let fm = _blockmessage(region, block, dataend, limits, budget)
-            _filemetadataversion(version, fm.version)
+        let fm = _blockmessage(region, block, ft.footerstart, limits, budget)
+            _filemetadataversion(ft.version, fm.version)
             fm
         end
     dicts, validated = _filedictionaries(
         framed,
-        dictblocks,
-        dictids,
-        dictvaluefields,
-        fielddictids,
+        ft.dictblocks,
+        ft.dictids,
+        ft.dictvaluefields,
+        ft.fielddictids,
         limits,
         budget,
     )
@@ -2528,15 +2563,15 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
     # that batch proves all-null use — checked per batch at decode.
     return ArrowFile(
         region,
-        sch,
-        AC.FrozenVector{Field}(fields),
-        fielddictids,
+        ft.sch,
+        AC.FrozenVector{Field}(ft.fields),
+        ft.fielddictids,
         dicts,
         validated,
-        recordblocks,
-        dataend,
+        ft.recordblocks,
+        ft.footerstart,
         limits,
-        version,
+        ft.version,
     )
 end
 

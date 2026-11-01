@@ -102,7 +102,7 @@ import Arrow:
     _metaschema!,
     _newroot,
     _nextbatch!,
-    _rangedfooter,
+    _readfooter,
     _recordbatchmeta,
     _release_array,
     _release_c_array!,

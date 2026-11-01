@@ -1816,7 +1816,7 @@ function Table(
         # the cached tail: literal lowering, exactly-once output conversion,
         # and DataAPI metadata all need it.
         if _isfilesource(sf, budget)
-            ft = _rangedfooter(sf, budget)
+            ft = _readfooter(sf, sf.limits, budget)
             plan = _ScanPlan(scan, ft.fields, budget)
             if !isempty(ft.fields) && plan.storage !== nothing
                 return _applyfacadescan(sf, plan, ft, budget; stringtype=stringtype)
