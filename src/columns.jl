@@ -637,10 +637,17 @@ function _adoptbytes(b::AC.BufferSlice, source::Bool)
     r === nothing && return nothing
     root = r.root
     root isa _Decompressed && b.offset == 0 && return root.bytes, Int64(0)
-    source &&
-        root isa Vector{UInt8} &&
-        b.offset <= _MAX_VIEW_BUFFER &&
-        return root, b.offset
+    source || return nothing
+    # From Julia 1.11 a byte vector's region roots its `Memory`; the column
+    # gets a vector of its own over that memory.
+    @static if VERSION >= v"1.11"
+        if root isa Memory{UInt8}
+            base = Int64(r.ptr - pointer(root)) + b.offset
+            base <= _MAX_VIEW_BUFFER || return nothing
+            return Base.wrap(Array, root, length(root)), base
+        end
+    end
+    root isa Vector{UInt8} && b.offset <= _MAX_VIEW_BUFFER && return root, b.offset
     return nothing
 end
 

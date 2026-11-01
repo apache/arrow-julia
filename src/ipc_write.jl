@@ -125,7 +125,7 @@ function _recycle!(st, recycle)
         _bufferroots!(kept, d)
     end
     @lock p.lock for v in vectors
-        v in kept || push!(_freelist(p, eltype(v)), v)
+        AC._storageroot(v) in kept || push!(_freelist(p, eltype(v)), v)
     end
     return nothing
 end

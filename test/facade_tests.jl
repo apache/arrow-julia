@@ -3163,7 +3163,10 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         # A string batch read in order is a slice of the read buffer; strings
         # appended one by one (short ones only inline) are copied.
         _, sd = Arrow._constructpart("s", view(t.s, 1:1000))
-        @test any(b -> b === AC.rolebuffer(sd, AC.DATA).region.root, t.s.buffers)
+        @test any(
+            b -> AC._storageroot(b) === AC.rolebuffer(sd, AC.DATA).region.root,
+            t.s.buffers,
+        )
         appended = DataStrings.StringVector(src.s)
         for batchsize in (3, 1000)
             back = Arrow.Table(take!(Arrow.write(IOBuffer(), (; s=appended); batchsize)))
@@ -3460,9 +3463,9 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         f, columnparts = Arrow._constructcolumn(:s, AbstractVector[col]; stringview=true)
         d = only(columnparts)
         @test f.type == Arrow.AC.ViewType(true) && f.nullable
-        @test d.buffers[2].region.root === payloads       # views: the payload vector itself
-        @test d.buffers[3].region.root === buf
-        @test d.buffers[4].region.root === extra
+        @test d.buffers[2].region.root === Arrow.AC._storageroot(payloads) # views: the payload vector itself
+        @test d.buffers[3].region.root === Arrow.AC._storageroot(buf)
+        @test d.buffers[4].region.root === Arrow.AC._storageroot(extra)
         Arrow.write(io, (id=[1, 2, 3, 4], s=col); stringview=true, file=true)
         bytes = take!(io)
         @test Arrow.readfile(bytes).schema.fields[2].type == Arrow.AC.ViewType(true)

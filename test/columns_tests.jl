@@ -46,6 +46,9 @@ allocationsof(f, x) = (f(x); @allocated f(x))
 # The fewest bytes `f()` allocates over three calls: a collection that runs
 # finalizers or other tasks during one measurement adds to that one only.
 fewestbytes(f) = minimum(_ -> (@allocated f()), 1:3)
+# Whether column buffer `b` is `bytes`' own storage. From Julia 1.11 a column
+# over a byte vector holds a vector of its own over the same `Memory`.
+_samebytes(b, bytes) = b === bytes || (VERSION >= v"1.11" && b.ref.mem === bytes.ref.mem)
 # Bytes, and allocations, of one call. `@allocated` or `@allocations` written in
 # the testset below would make Julia compile the whole testset as one function
 # before running it, which takes minutes; it measures through these instead.
@@ -961,7 +964,7 @@ end
             @test isequal(t.s, strs)
             # Uncompressed, the column's data buffer is the byte vector itself,
             # and building it allocates its payloads alone.
-            compress === nothing && @test any(b -> b === bytes, t.s.buffers)
+            compress === nothing && @test any(b -> _samebytes(b, bytes), t.s.buffers)
             compress === nothing &&
                 @test fewestbytes(() -> Arrow.Table(bytes).s) < 16n + 16n ÷ 4
             path = joinpath(mktempdir(), "s.arrow")
@@ -972,14 +975,14 @@ end
                 @test any(b -> length(b) == filesize(path), mapped.s.buffers)
             # Copies own their bytes: only the view strings', in column order.
             c = copy(t)
-            @test isequal(c.s, strs) && !any(b -> b === bytes, c.s.buffers)
+            @test isequal(c.s, strs) && !any(b -> _samebytes(b, bytes), c.s.buffers)
             @test sum(length, c.s.buffers) == viewbytes
             owned = Arrow.read(bytes, Tables.columntable).s
-            @test isequal(owned, strs) && !any(b -> b === bytes, owned.buffers)
+            @test isequal(owned, strs) && !any(b -> _samebytes(b, bytes), owned.buffers)
             # A filtered scan gives the same kind of column, over the same bytes.
             f = Arrow.Table(bytes; filter=Arrow.col(:x) > n ÷ 2)
             @test f.s isa StringVector && isequal(f.s, strs[(n ÷ 2 + 1):end])
-            compress === nothing && @test any(b -> b === bytes, f.s.buffers)
+            compress === nothing && @test any(b -> _samebytes(b, bytes), f.s.buffers)
             @test isequal(copy(f).s, strs[(n ÷ 2 + 1):end])
         end
         # A filtered column of several batches joins the batches' buffers.

@@ -68,6 +68,16 @@ end
     return AC.loadat(slice, GcTriggeredLoad, Int64(0)), finalized[]
 end
 
+# A region over a vector that `resize!` then moves to new storage, and a weak
+# reference to the storage the region points at.
+@noinline function resized_region()
+    v = collect(Int64, 1:1000)
+    b = BufferSlice(heapregion(v), 0, 8000)
+    storage = WeakRef(v.ref.mem)
+    resize!(v, 1_000_000)
+    return b, storage
+end
+
 @noinline function read_mapped_slice_while_collecting(path)
     # Keep only the slice local. Its region must be enough to retain the Mmap
     # array through collection and the raw loads below.
@@ -86,13 +96,23 @@ end
             v = Int64[1, 2, 3, 4]
             r = heapregion(v)
             @test r.len == 32
-            @test r.root === v
+            @test r.root === AC._storageroot(v)
             b = BufferSlice(r, 0, 32)
             @test AC.loadat(b, Int64, Int64(0)) == 1
             @test AC.loadat(b, Int64, Int64(24)) == 4
             # Regions are immutable values: nothing to close, nothing to race.
             @test_throws ErrorException setproperty!(r, :root, nothing)
         end
+
+        # Julia 1.10 vectors own their bytes directly; there is no storage
+        # object to keep alive apart from the vector.
+        VERSION >= v"1.11" &&
+            @testset "a heap region keeps its storage when the vector is resized" begin
+                b, storage = resized_region()
+                GC.gc(true)
+                @test storage.value !== nothing
+                @test AC.loadat(b, Int64, Int64(7992)) == 1000
+            end
 
         @testset "raw load preserves the region root" begin
             finalized = Ref(false)
@@ -306,7 +326,7 @@ end
             r = buf.region::OwnerRegion
             # A heap region is a BORROW: release! revokes but must not run the
             # caller's own finalizers on the borrowed vector.
-            borrowed = r.root::Vector{Int64}
+            borrowed = r.root
             callerfin = Ref(false)
             finalizer(_ -> callerfin[] = true, borrowed)
             release!(r)
@@ -333,7 +353,7 @@ end
             @test released[] == 1
 
             # An mmap-backed region actually unmaps NOW: the release targets the
-            # object Mmap registered the unmap finalizer on (`_mmaproot`), and
+            # object Mmap registered the unmap finalizer on (`_storageroot`), and
             # the observer proves it ran — rm() alone would not, since POSIX
             # happily unlinks mapped files.
             path, io = mktemp()
@@ -343,7 +363,7 @@ end
             mslice = BufferSlice(mr, 0, mr.len)
             @test AC.loadat(mslice, UInt8, Int64(0)) == 0x00
             unmapped = Ref(false)
-            finalizer(_ -> unmapped[] = true, AC._mmaproot(mr.root::Vector{UInt8}))
+            finalizer(_ -> unmapped[] = true, AC._storageroot(mr.root::Vector{UInt8}))
             release!(mr)
             @test unmapped[]
             @test_throws InvalidStateException AC.loadat(mslice, UInt8, Int64(0))
@@ -1005,9 +1025,9 @@ end
             )
             # ZERO-COPY: the views buffer IS the payload vector, and the data
             # buffers are the caller's vectors — none of the three is copied
-            @test d.buffers[2].region.root === payloads
-            @test d.buffers[3].region.root === buf
-            @test d.buffers[4].region.root === extra
+            @test d.buffers[2].region.root === AC._storageroot(payloads)
+            @test d.buffers[3].region.root === AC._storageroot(buf)
+            @test d.buffers[4].region.root === AC._storageroot(extra)
             # the null slot's entry bytes are left as they are (spec: unspecified)
             @test AC.loadat(d.buffers[2], Int32, Int64(16 * 4)) == Int32(-1)
 

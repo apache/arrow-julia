@@ -44,10 +44,10 @@ function exercise_regions()::Nothing
     checked(AC.loadat(b, Int64, Int64(24)) == 4, "heap tail load failed")
     sub = AC.subslice(b, 8, 16)
     checked(AC.loadat(sub, Int64, Int64(0)) == 2, "subslice load failed")
-    # Validity is reachability: the region's root IS the backing vector, and
+    # Validity is reachability: the region's root IS the vector's storage, and
     # holding the region is what keeps the memory alive. No lifecycle state
     # exists to exercise.
-    checked(r.root === v, "heap region root identity failed")
+    checked(r.root === AC._storageroot(v), "heap region root identity failed")
     bytes = UInt8[0x7f]
     fr = GC.@preserve bytes AC.OwnerRegion(Ptr{UInt8}(pointer(bytes)), 1; root=bytes)
     fb = BufferSlice(fr, 0, 1)

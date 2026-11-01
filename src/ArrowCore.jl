@@ -274,25 +274,28 @@ end
 """
     heapregion(v::Vector{T}) -> OwnerRegion
 
-Borrow a Julia array as a region (zero-copy). The array is the `root`.
+Borrow a Julia array as a region (zero-copy). The array's storage is the `root`,
+so the bytes stay valid while the region is reachable even if `v` is resized
+afterwards. On Julia 1.10 the array itself is the root, and resizing it
+reallocates the bytes the region points at.
 """
 function heapregion(v::Vector{T}) where {T}
     isbitstype(T) || throw(ArgumentError("heapregion requires an isbits element type"))
-    return OwnerRegion(Ptr{UInt8}(pointer(v)), sizeof(v); root=v)
+    return OwnerRegion(Ptr{UInt8}(pointer(v)), sizeof(v); root=_storageroot(v))
 end
 
-# `_mmaproot(arr)`: the object Mmap registered its unmap finalizer on — the
-# array's backing `Memory` from Julia 1.11 (`finalize(arr)` is then a
-# no-op), the array itself before. The release cell targets that object so
-# `release!` truly unmaps now.
+# `_storageroot(v)`: the object that owns a vector's bytes, and the one Mmap
+# registers its unmap finalizer on — the array's backing `Memory` from Julia
+# 1.11 (`finalize(arr)` is then a no-op), the array itself before. A release
+# cell targets that object so `release!` truly unmaps now.
 @static if VERSION >= v"1.11"
-    _mmaproot(arr::Vector{UInt8}) = arr.ref.mem
+    _storageroot(v::Vector) = v.ref.mem
     function _release_mmap(p::Ptr{Cvoid})::Cvoid
         finalize(unsafe_pointer_to_objref(p)::Memory{UInt8})
         return nothing
     end
 else
-    _mmaproot(arr::Vector{UInt8}) = arr
+    _storageroot(v::Vector) = v
     function _release_mmap(p::Ptr{Cvoid})::Cvoid
         finalize(unsafe_pointer_to_objref(p)::Vector{UInt8})
         return nothing
@@ -309,13 +312,13 @@ function _mmapregion(io::IO, label; eager::Bool=true)
     isempty(arr) && throw(ArgumentError("cannot map empty file: $label"))
     cell =
         eager ?
-        ReleaseCell(@cfunction(_release_mmap, Cvoid, (Ptr{Cvoid},)), _mmaproot(arr)) :
+        ReleaseCell(@cfunction(_release_mmap, Cvoid, (Ptr{Cvoid},)), _storageroot(arr)) :
         ReleaseCell()
     return OwnerRegion(Ptr{UInt8}(pointer(arr)), length(arr); root=arr, cell=cell)
 end
 
 "Unmap a mapped region's memory now. Nothing may read the region afterward."
-_unmap!(r::OwnerRegion) = finalize(_mmaproot(r.root::Vector{UInt8}))
+_unmap!(r::OwnerRegion) = finalize(_storageroot(r.root::Vector{UInt8}))
 
 """
     mmapregion(path) -> OwnerRegion

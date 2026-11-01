@@ -31,7 +31,7 @@ function detached(d)
     @test d.owner === nothing
     for b in d.buffers
         b.region === nothing && continue
-        @test b.region.root isa Vector{UInt8}
+        @test b.region.root isa (VERSION >= v"1.11" ? Memory{UInt8} : Vector{UInt8})
         @test b.region.cell.action == C_NULL
         @test b.region.cell.arg === nothing
         @test !b.region.cell.closed
