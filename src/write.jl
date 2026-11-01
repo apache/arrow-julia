@@ -474,8 +474,7 @@ Base.@nospecializeinfer function _writeparts!(w::Writer, @nospecialize(tbl))
     next = iterate(parts)
     if next === nothing
         # A zero-batch Arrow.Stream still carries its schema.
-        w.st === nothing &&
-            _beginwrite!(w, _schemaonly(retained, w.colmetadata), retained)
+        w.st === nothing && _beginwrite!(w, _schemaonly(retained, w.colmetadata), retained)
         return nothing
     end
     # An unknown-length source may have later partitions. Do not fetch one
@@ -748,8 +747,7 @@ function _partitionhints(w::Writer, columns, own)
         if col isa DictEncode
             T = Base.nonmissingtype(_eltypeof(col.data))
             writetype = isconcretetype(T) ? T : nothing
-            all(ismissing, col.data) ||
-                (hint = _dictionarypool(col.data, hint; writetype))
+            all(ismissing, col.data) || (hint = _dictionarypool(col.data, hint; writetype))
         elseif _hasrefpool(col) && (
             w.st === nothing || (w.schema::AC.Schema).fields[j].type isa AC.DictionaryType
         )
@@ -1014,7 +1012,10 @@ function _growpool(vf::AC.Field, written::AC.ArrayData, delta::AC.ArrayData, gro
     if !(var || spec.fixedwidth > 0 && spec.buffers == [AC.VALIDITY, AC.DATA]) ||
        AC.nullcount(written) > 0 ||
        AC.nullcount(delta) > 0
-        ranges = [_DictionaryRange(written, 0, written.len), _DictionaryRange(delta, 0, delta.len)]
+        ranges = [
+            _DictionaryRange(written, 0, written.len),
+            _DictionaryRange(delta, 0, delta.len),
+        ]
         return nothing, _dictionaryconcat(vf, ranges, Limits(), nothing)
     end
     if grown === nothing || grown.pool !== written
@@ -1050,7 +1051,8 @@ function _appendpool!(g::_GrowingPool{O}, d::AC.ArrayData) where {O}
         lo = n == 0 ? 0 : Int(first(AC._offsets_at(d, Int64(1), wide)))
         g.offsets = _room(g.offsets, g.len + 1, n)
         for i = 1:n
-            g.offsets[g.len + 1 + i] = O(used + Int(last(AC._offsets_at(d, Int64(i), wide))) - lo)
+            g.offsets[g.len + 1 + i] =
+                O(used + Int(last(AC._offsets_at(d, Int64(i), wide))) - lo)
         end
         start, nbytes = lo, Int(g.offsets[g.len + 1 + n]) - used
     else
@@ -1060,7 +1062,11 @@ function _appendpool!(g::_GrowingPool{O}, d::AC.ArrayData) where {O}
     end
     g.data = _room(g.data, used, nbytes)
     src = AC.rolebuffer(d, AC.DATA)
-    GC.@preserve d g unsafe_copyto!(pointer(g.data, used + 1), AC.sliceptr(src) + start, nbytes)
+    GC.@preserve d g unsafe_copyto!(
+        pointer(g.data, used + 1),
+        AC.sliceptr(src) + start,
+        nbytes,
+    )
     g.len += n
     data = AC.BufferSlice(AC.heapregion(g.data), 0, used + nbytes)
     buffers =
@@ -1104,8 +1110,12 @@ function _dictionarydeltas(current, fields, ids, batch::AC.RecordBatch, growth=(
         end
         vf = AC.dictvaluefield(f, f.type::AC.DictionaryType)
         _poolrangeequal(vf, old, Int64(0), pool, Int64(0), old.len) || continue
-        deltas[id] =
-            _dictionaryconcat(vf, [_DictionaryRange(pool, old.len, pool.len - old.len)], Limits(), nothing)
+        deltas[id] = _dictionaryconcat(
+            vf,
+            [_DictionaryRange(pool, old.len, pool.len - old.len)],
+            Limits(),
+            nothing,
+        )
     end
     return deltas
 end
@@ -1394,8 +1404,7 @@ function _constructcolumns(
 ) where {F}
     colmetamap = _colmetadatamap(colmetadata, names)
     built = _tasksmap(length(names), ntasks) do j, _
-        columnmeta =
-            colmetamap === nothing ? nothing : get(colmetamap, names[j], nothing)
+        columnmeta = colmetamap === nothing ? nothing : get(colmetamap, names[j], nothing)
         return _uninferred(
             _constructcolumn,
             names[j],
@@ -1583,7 +1592,8 @@ function _conformdictionary(
     # so a table costs its own categories, not the pool's.
     slots, j = something(growth, (Any[nothing], 1))
     cached = slots[j]
-    index = cached !== nothing && cached[1] === written ? cached[2] : _poolindex(vf, written)
+    index =
+        cached !== nothing && cached[1] === written ? cached[2] : _poolindex(vf, written)
     new = Int[]
     remap = Vector{Int64}(undef, localpool.len)
     for i = 1:(localpool.len)
@@ -1594,7 +1604,8 @@ function _conformdictionary(
     end
     delta = isempty(new) ? nothing : _takerows(localvf, localpool, new)
     grown = cached === nothing ? nothing : cached[4]
-    grown, pool = delta === nothing ? (grown, written) : _growpool(vf, written, delta, grown)
+    grown, pool =
+        delta === nothing ? (grown, written) : _growpool(vf, written, delta, grown)
     slots[j] = (pool, index, delta, grown)
     IT = AC.juliatype(et.indextype)
     pool.len - 1 <= typemax(IT) || throw(
@@ -1695,7 +1706,8 @@ function _widenparts(expected::AC.Field, p)
     S = Base.nonmissingtype(eltype(p))
     S === T && return p
     S === Union{} || _widens(S, T) || return nothing
-    return Missing <: eltype(p) ? convert(Vector{Union{Missing,T}}, p) : convert(Vector{T}, p)
+    return Missing <: eltype(p) ? convert(Vector{Union{Missing,T}}, p) :
+           convert(Vector{T}, p)
 end
 _widens(::Type{S}, ::Type{T}) where {S<:Integer,T<:Integer} =
     S !== Bool && typemin(T) <= typemin(S) && typemax(S) <= typemax(T)

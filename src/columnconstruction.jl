@@ -562,11 +562,8 @@ function _listpart(spec, @nospecialize(v::AbstractVector), context)
     # A list view's rows are consecutive spans of its child: starts and sizes.
     buffers =
         t isa AC.ListViewType ?
-        [
-            validity,
-            AC._databuffer(offsets[1:(end - 1)]),
-            AC._databuffer(diff(offsets)),
-        ] : [validity, AC._databuffer(offsets)]
+        [validity, AC._databuffer(offsets[1:(end - 1)]), AC._databuffer(diff(offsets))] :
+        [validity, AC._databuffer(offsets)]
     d = AC.ArrayData(t, length(v), buffers; children=AC.ArrayData[cd], nullcount=nc)
     return _nestedfield(spec, t, v, AC.Field[cf]), d
 end
@@ -792,13 +789,12 @@ end
 function _checkrownames(f::AC.Field, R::Type)
     names = fieldnames(R)
     length(names) == length(f.children) &&
-        all(k -> string(names[k]) == f.children[k].name, eachindex(names)) ||
-        throw(
-            ArgumentError(
-                "column $(f.name) retained struct row has fields $names; expected " *
-                "$(Tuple(c.name for c in f.children))",
-            ),
-        )
+    all(k -> string(names[k]) == f.children[k].name, eachindex(names)) || throw(
+        ArgumentError(
+            "column $(f.name) retained struct row has fields $names; expected " *
+            "$(Tuple(c.name for c in f.children))",
+        ),
+    )
     return nothing
 end
 
@@ -889,8 +885,10 @@ function _mappart(spec, v::AbstractVector, context)
                 "so drop those entries or replace the key",
             ),
         )
-    kf, kd = _constructpart(_entryspec(spec, 1, "key"), _ChildValues{KK,1}(entries); context)
-    vf, vd = _constructpart(_entryspec(spec, 2, "value"), _ChildValues{V,2}(entries); context)
+    kf, kd =
+        _constructpart(_entryspec(spec, 1, "key"), _ChildValues{KK,1}(entries); context)
+    vf, vd =
+        _constructpart(_entryspec(spec, 2, "value"), _ChildValues{V,2}(entries); context)
     # Distinct keys that an ArrowTypes mapping stores alike would read back as
     # repeated keys of one row.
     (spec isa AC.Field || R <: AbstractDict && _writerneedstype!(context, KK)) &&
@@ -904,7 +902,8 @@ function _mappart(spec, @nospecialize(v::MapVector), context)
     offsets, validity, nc = _listoffsets(name, v, Int32, _pool(context))
     _checknulls(spec, nc)
     lo, hi = GC.@preserve v Int(v.offsets[1]), Int(v.offsets[end])
-    kf, kd = _constructpart(_entryspec(spec, 1, "key"), _childslice(v.keys, lo, hi); context)
+    kf, kd =
+        _constructpart(_entryspec(spec, 1, "key"), _childslice(v.keys, lo, hi); context)
     vf, vd =
         _constructpart(_entryspec(spec, 2, "value"), _childslice(v.values, lo, hi); context)
     return _mapcolumn(spec, v, offsets, validity, nc, hi - lo, kf, kd, vf, vd)
@@ -1023,7 +1022,9 @@ function _constructfacadeunion(f::AC.Field, v::AbstractVector, context)
             push!(childvalues[k], x)
         end
     end
-    hidden = sparse ? [count(!=(k), route) for k in eachindex(children)] : zeros(Int, length(children))
+    hidden =
+        sparse ? [count(!=(k), route) for k in eachindex(children)] :
+        zeros(Int, length(children))
     fields = AC.Field[]
     datas = AC.ArrayData[]
     for (k, c) in enumerate(children)
@@ -1054,14 +1055,22 @@ same layout family (`_samefamily`); else 0.
 function _unionroute(children, x, members, context)
     probe = first(_constructpart("probe", typeof(x)[x]; context))
     i = findfirst(M -> x isa M, members)
-    i !== nothing && i <= length(children) && _unionfits(children[i], probe; exact=true) &&
+    i !== nothing &&
+        i <= length(children) &&
+        _unionfits(children[i], probe; exact=true) &&
         return i
     matches = findall(c -> _unionfits(c, probe; exact=true), children)
     # A lowered temporal value is its storage integer or DateTime.
     isempty(matches) &&
         context.lowered &&
-        (matches = findall(c -> isempty(c.children) && x isa _arrowtypesprimitivebasetype(c), children))
-    isempty(matches) && (matches = findall(c -> _unionfits(c, probe; exact=false), children))
+        (
+            matches = findall(
+                c -> isempty(c.children) && x isa _arrowtypesprimitivebasetype(c),
+                children,
+            )
+        )
+    isempty(matches) &&
+        (matches = findall(c -> _unionfits(c, probe; exact=false), children))
     return length(matches) == 1 ? only(matches) : 0
 end
 
@@ -1081,7 +1090,10 @@ _unionfits(c::AC.Field, probe::AC.Field; exact::Bool) =
 # scale at any width.
 function _samefamily(f::AC.Field, built::AC.Field)
     family = _layoutfamily(f.type)
-    (AC.typeequal(f.type, built.type) || family !== nothing && family == _layoutfamily(built.type)) &&
+    (
+        AC.typeequal(f.type, built.type) ||
+        family !== nothing && family == _layoutfamily(built.type)
+    ) &&
     (f.nullable || !built.nullable) &&
     _extensionpairs(f) == _extensionpairs(built) &&
     length(f.children) == length(built.children) || return false
@@ -2164,10 +2176,12 @@ function _writerloweredcolumn(
     S = Base.nonmissingtype(T)
     # Primitive storage is read once by the builder, which lowers each value
     # as it reads it: no lowered copy of the column.
-    S !== Union{} && S <: Union{_FixedPrimitive,Bool} && return _LoweredValues{T}(v) do x
-        lowered = _writertoarrow(context, x, writertype, name, field)
-        return _writerconvertlowered(S, lowered, context, writertype, name)
-    end
+    S !== Union{} &&
+        S <: Union{_FixedPrimitive,Bool} &&
+        return _LoweredValues{T}(v) do x
+            lowered = _writertoarrow(context, x, writertype, name, field)
+            return _writerconvertlowered(S, lowered, context, writertype, name)
+        end
     out = Vector{T}(undef, length(v))
     for (i, value) in enumerate(v)
         lowered = _writertoarrow(context, value, writertype, name, field)
@@ -2302,13 +2316,15 @@ end
 # Missing marks a null slot; as a value of a storage Union it could not be told
 # from one.
 function _checkstoragemissing(logical, declared)
-    declared isa Union && Missing <: declared && throw(
-        ArgumentError(
-            "ArrowTypes.ArrowType($logical) is $declared, with Missing as a Union " *
-            "member, which Arrow.jl does not write; declare the storage without " *
-            "Missing and write the column with missing values",
-        ),
-    )
+    declared isa Union &&
+        Missing <: declared &&
+        throw(
+            ArgumentError(
+                "ArrowTypes.ArrowType($logical) is $declared, with Missing as a Union " *
+                "member, which Arrow.jl does not write; declare the storage without " *
+                "Missing and write the column with missing values",
+            ),
+        )
     return nothing
 end
 
@@ -2329,7 +2345,9 @@ function _arrowtypesstoragecolumn(name::String, v::AbstractVector, context)
         return _uninferred(_fixedlistpart, name, v, context, N)
     elseif kind isa ArrowTypes.MapKind
         S <: AbstractDict || throw(
-            ArgumentError("ArrowTypes MapKind column $name must lower to AbstractDict rows"),
+            ArgumentError(
+                "ArrowTypes MapKind column $name must lower to AbstractDict rows",
+            ),
         )
         return _uninferred(_mappart, name, v, context)
     elseif kind isa ArrowTypes.ListKind
@@ -2411,7 +2429,9 @@ function _arrowtypesunioncolumn(name::String, v::AbstractVector; context)
     childdata = AC.ArrayData[]
     for i in eachindex(variants)
         # An abstract string member writes its values as Strings.
-        values = variants[i] === AbstractString ? _missings_to(String, childvalues[i]) : childvalues[i]
+        values =
+            variants[i] === AbstractString ? _missings_to(String, childvalues[i]) :
+            childvalues[i]
         field, data = _constructpart(string(i - 1), values; context)
         push!(childfields, field)
         push!(childdata, data)
@@ -2583,7 +2603,11 @@ end
 Narrow one unresolved abstract declaration from whole-column runtime evidence.
 Returns nothing when the declaration cannot be narrowed from runtime evidence.
 """
-function _narrowabstractwriterparts(name::String, v::AbstractVector, context::_WriterContext)
+function _narrowabstractwriterparts(
+    name::String,
+    v::AbstractVector,
+    context::_WriterContext,
+)
     logical = Base.nonmissingtype(_eltypeof(v))
     logical in (Union{}, Any) && return nothing
     (isconcretetype(logical) || logical isa Union) && return nothing
@@ -2688,7 +2712,8 @@ function _mappedvalues(v::AbstractVector, context::_WriterContext)
         !(S <: Union{Int128,UInt128}) &&
         _writerstoragetype!(context, S) !== S
     isconcretetype(T) && return mapped(T)
-    T isa Union && all(isconcretetype, Base.uniontypes(T)) &&
+    T isa Union &&
+        all(isconcretetype, Base.uniontypes(T)) &&
         return any(mapped, Base.uniontypes(T))
     return any(x -> x !== missing && mapped(typeof(x)), v)
 end
@@ -2704,9 +2729,8 @@ when that child builds.
 function _lowercolumn(f::AC.Field, target, v::AbstractVector, context::_WriterContext)
     name = f.name
     target === nothing && return _inferlowered(f, nothing, v, context)
-    target === VersionNumber && return Union{Missing,String}[
-        x === missing ? missing : string(x) for x in v
-    ]
+    target === VersionNumber &&
+        return Union{Missing,String}[x === missing ? missing : string(x) for x in v]
     declared = _writerstoragetype!(context, target)
     _checkstoragemissing(target, declared)
     _arrowtypesconcreteorunion(declared) ||
@@ -2787,7 +2811,13 @@ function _inferlowered(f::AC.Field, target, v::AbstractVector, context::_WriterC
     isempty(observed) && return fill(missing, length(v))
     storagetype = reduce(_writerpromoteunion, observed)
     hasmissing && (storagetype = Union{Missing,storagetype})
-    return _writerconvertedcolumn(storagetype, values, context, something(target, Any), name)
+    return _writerconvertedcolumn(
+        storagetype,
+        values,
+        context,
+        something(target, Any),
+        name,
+    )
 end
 
 """
@@ -3522,7 +3552,9 @@ Base.@nospecializeinfer function _retainedpartof(
     if _lowersvalues(f, target, v, context)
         target === nothing || _checktarget(f, target, v)
         # No value to lower: an all-missing column is its field's nulls.
-        f.nullable && all(ismissing, v) && return _constructhiddenpart(f, length(v), context)
+        f.nullable &&
+            all(ismissing, v) &&
+            return _constructhiddenpart(f, length(v), context)
         return _constructlowered(f, _lowercolumn(f, target, v, context), context)
     end
     return _constructretainedpart(f, v, context)
@@ -3581,8 +3613,8 @@ _retainedbuilder(t::AC.ArrowType) =
     t isa AC.IntervalType ? _retainedinterval :
     t isa Union{AC.ListType,AC.ListViewType} ? _listpart :
     t isa AC.FixedSizeListType ? _fixedlistpart :
-    t isa AC.StructType ? _structpart : t isa AC.MapType ? _mappart :
-    t isa AC.RunEndEncodedType ? _retainedree : nothing
+    t isa AC.StructType ? _structpart :
+    t isa AC.MapType ? _mappart : t isa AC.RunEndEncodedType ? _retainedree : nothing
 
 function _retainedtemporal(f::AC.Field, v::AbstractVector, context::_WriterContext)
     t = f.type
@@ -3596,7 +3628,8 @@ _retainedview(f::AC.Field, v::AbstractVector, ::_WriterContext) = _retainedview(
 _retainedfixedbytes(f::AC.Field, v::AbstractVector, ::_WriterContext) =
     _retainedfixedbytes(f, v)
 _retaineddecimal(f::AC.Field, v::AbstractVector, ::_WriterContext) = _retaineddecimal(f, v)
-_retainedinterval(f::AC.Field, v::AbstractVector, ::_WriterContext) = _retainedinterval(f, v)
+_retainedinterval(f::AC.Field, v::AbstractVector, ::_WriterContext) =
+    _retainedinterval(f, v)
 
 "One part under a retained field: the identity check, then the type's builder."
 function _constructretainedpart(f::AC.Field, v::AbstractVector, context::_WriterContext)
@@ -3852,8 +3885,7 @@ function _dictcodes(v, hint, prefix::Int)
     parentcol isa DictEncoded && (rows === nothing || rows isa UnitRange{Int}) ||
         return nothing
     pool = parentcol.pool
-    length(pool) <= prefix &&
-        all(i -> isequal(pool[i], hint[i]), eachindex(pool)) ||
+    length(pool) <= prefix && all(i -> isequal(pool[i], hint[i]), eachindex(pool)) ||
         return nothing
     return rows === nothing ? parentcol.indices : view(parentcol.indices, rows)
 end
@@ -4129,10 +4161,8 @@ function _dictcolumnparts(name, fieldname, part, poolhint, retained, growable, c
                 )
         else
             islogical =
-                T <: retainedtarget || (
-                    T === Any &&
-                    all(x -> x === missing || x isa retainedtarget, values)
-                )
+                T <: retainedtarget ||
+                (T === Any && all(x -> x === missing || x isa retainedtarget, values))
             islogical || throw(
                 ArgumentError(
                     "column $name holds $T values, but its retained " *
@@ -4221,7 +4251,8 @@ end
 "A non-dictionary column of `_constructcolumnparts`: its field and data."
 function _plaincolumnparts(name, fieldname, part, retained, context)
     narrowed =
-        retained === nothing ? _narrowabstractwriterparts(fieldname, part, context) : nothing
+        retained === nothing ? _narrowabstractwriterparts(fieldname, part, context) :
+        nothing
     try
         # A successful narrowing pass already saw every value; replanning
         # from part of them can split one declared nullable Tuple child into

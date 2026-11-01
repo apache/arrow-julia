@@ -1766,7 +1766,13 @@ end
     @test arrowtypes_test_field_contract_equal(rebuiltfield, retainedfield)
     @test length(rebuiltdata) == length(values)
 
-    @test isequal(Arrow.AC.materialize(rebuiltfield, rebuiltdata), Arrow.AC.materialize(retainedfield, arrowtypes_test_core_parts(inputbytes)[2][1].columns[1]))
+    @test isequal(
+        Arrow.AC.materialize(rebuiltfield, rebuiltdata),
+        Arrow.AC.materialize(
+            retainedfield,
+            arrowtypes_test_core_parts(inputbytes)[2][1].columns[1],
+        ),
+    )
 end
 
 @testset "nullable marked composite" begin
@@ -2564,10 +2570,7 @@ end
         e
     end
     @test err isa ArgumentError
-    @test occursin(
-        "column value holds values of more than 8 types",
-        sprint(showerror, err),
-    )
+    @test occursin("column value holds values of more than 8 types", sprint(showerror, err))
     @test ARROWTYPES_TEST_TUPLE_STORAGE_LOWER_CALLS[] == 9
 
     nullabletuplevalues = Union{Missing,ArrowTypesTestAbstractTupleStorage}[missing]
@@ -2703,10 +2706,7 @@ end
         e
     end
     @test err isa ArgumentError
-    @test occursin(
-        "column value holds values of more than 8 types",
-        sprint(showerror, err),
-    )
+    @test occursin("column value holds values of more than 8 types", sprint(showerror, err))
 
     nineerror = function ()
         try
@@ -2755,8 +2755,10 @@ end
         seedschema,
         ((value=arrowtypes_test_many_registered_values(9),),),
     )
-    @test map(x -> x.value, Arrow.Table(arrowtypes_test_bytes(source9; file=false)).value) ==
-          Int16.(1:9)
+    @test map(
+        x -> x.value,
+        Arrow.Table(arrowtypes_test_bytes(source9; file=false)).value,
+    ) == Int16.(1:9)
 
     SeedRow = @NamedTuple{child::ArrowTypesTestManyRegisteredRuntime}
     StorageRow = Vector{Pair{String,Any}}
@@ -3164,8 +3166,11 @@ end
     end
     inactivesparse = function (listsize)
         field = nullsparsefield(listsize)
-        rebuiltfield, rebuiltdata =
-            Arrow._constructpart(field, Any["text"]; context=Arrow._WriterContext("value"))
+        rebuiltfield, rebuiltdata = Arrow._constructpart(
+            field,
+            Any["text"];
+            context=Arrow._WriterContext("value"),
+        )
         ARROWTYPES_TEST_AC.validate_full(rebuiltfield, rebuiltdata)
         schema = ARROWTYPES_TEST_AC.Schema([rebuiltfield])
         batch = ARROWTYPES_TEST_AC.RecordBatch(schema, [rebuiltdata], 1)
@@ -3964,8 +3969,10 @@ end
             catch e
                 e
             end
-            err === nothing ||
-                @test occursin("not sorted by its physical key storage", sprint(showerror, err))
+            err === nothing || @test occursin(
+                "not sorted by its physical key storage",
+                sprint(showerror, err),
+            )
         end
     end
 
@@ -4008,7 +4015,11 @@ end
         children=[emptyentriesdata],
         nullcount=0,
     )
-    arrowtypes_test_retained_rewrites(emptymapfield, emptymapdata, ArrowTypesTestSortedMap[])
+    arrowtypes_test_retained_rewrites(
+        emptymapfield,
+        emptymapdata,
+        ArrowTypesTestSortedMap[],
+    )
 end
 
 @testset "encoding identity uses physical ArrowTypes values" begin

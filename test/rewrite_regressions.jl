@@ -76,7 +76,12 @@ function _reebytes(n)
     runfield, runs = AC.fromjulia("run_ends", Int32[n ÷ 4, n ÷ 2, 3n ÷ 4, n])
     _, values = AC.fromjulia("values", Int64[1, 2, 3, 4])
     t = AC.RunEndEncodedType()
-    field = AC.Field("r", t; nullable=false, children=[runfield, AC.Field("values", AC.IntType(64, true); nullable=false)])
+    field = AC.Field(
+        "r",
+        t;
+        nullable=false,
+        children=[runfield, AC.Field("values", AC.IntType(64, true); nullable=false)],
+    )
     data = AC.ArrayData(t, n, AC.BufferSlice[]; children=[runs, values], nullcount=0)
     schema = AC.Schema([field])
     return Arrow.writestream(schema, [AC.RecordBatch(schema, [data], n)])
@@ -130,8 +135,10 @@ _rewriteallocations(t) = @allocated Arrow.write(IOBuffer(), t)
     end
 
     @testset "retained dictionaries keep value descriptors and order" begin
-        datefield, datedata =
-            Arrow._constructcolumn(Symbol("date-values"), Date[Date(2024, 1, 1), Date(2024, 1, 2)])
+        datefield, datedata = Arrow._constructcolumn(
+            Symbol("date-values"),
+            Date[Date(2024, 1, 1), Date(2024, 1, 2)],
+        )
         datebytes = _dictbytes(datefield, datedata, Int8[1, 0])
         dateback = Arrow.readstream(_rewrite(datebytes))
         datetype = dateback.schema.fields[1].type::AC.DictionaryType
@@ -680,8 +687,7 @@ _rewriteallocations(t) = @allocated Arrow.write(IOBuffer(), t)
         # Candidate categories compare as `===`: floats by bits (0.0 and -0.0
         # stay distinct, one NaN payload is one category), mutable values by
         # reference, arrays of plain values by contents.
-        floatpool =
-            Arrow._dictionarypool(Float64[0.0, -0.0, NaN, NaN], nothing)
+        floatpool = Arrow._dictionarypool(Float64[0.0, -0.0, NaN, NaN], nothing)
         @test length(floatpool) == 3
         a = Ref(1)
         b = Ref(1)
@@ -692,7 +698,9 @@ _rewriteallocations(t) = @allocated Arrow.write(IOBuffer(), t)
     @testset "dictionary and run-end columns rewrite from their buffers" begin
         # Indices and runs are reused, not found again value by value.
         n = 1_000_000
-        dict = Arrow.Table(take!(Arrow.tobuffer((d=Arrow.DictEncode(rand(["a", "b", "c"], n)),))))
+        dict = Arrow.Table(
+            take!(Arrow.tobuffer((d=Arrow.DictEncode(rand(["a", "b", "c"], n)),))),
+        )
         ree = Arrow.Table(_reebytes(n))
         for t in (dict, ree)
             _rewriteallocations(t)

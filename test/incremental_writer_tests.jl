@@ -513,7 +513,8 @@ batchkinds(bytes) = [
     @testset "append reads the stream's metadata and dictionaries, not its batches" begin
         path = tempname()
         parts = Tables.partitioner([
-            (x=fill(Float64(p), 500_000), d=Arrow.DictEncode(fill("a", 500_000))) for p = 1:4
+            (x=fill(Float64(p), 500_000), d=Arrow.DictEncode(fill("a", 500_000))) for
+            p = 1:4
         ])
         Arrow.write(path, parts; file=false)
         Arrow.append(path, (x=[5.0], d=["b"]))
