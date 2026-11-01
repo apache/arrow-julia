@@ -348,6 +348,7 @@ end
                 cell=ReleaseCell(_cell_bump_ptr(), copied),
             )
             cb = deepcopy(BufferSlice(cr, 0, 2))
+            @test cb.region.root === cr.root
             @test AC.loadat(cb, UInt8, Int64(1)) == 0x02
             release!(cr)
             @test_throws InvalidStateException AC.loadat(cb, UInt8, Int64(0))
