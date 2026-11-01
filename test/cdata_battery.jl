@@ -734,6 +734,18 @@ function cdata_battery()
     @assert !_registered(key)
     println("release callbacks allocate nothing; a collection frees released exports ✓")
 
+    # A consumer that keeps every batch it pulls (pyarrow's `read_all`) pays the
+    # same for each export however many it holds: exports on top of 50,000 held
+    # ones cost what they cost alone, not a scan of the held ones each.
+    before = _drained()
+    alone = _held_export_seconds(2_000)
+    held = _hold_exports(50_000)
+    ontop = _held_export_seconds(2_000)
+    _release_all!(held)
+    @assert ontop < 5 * alone (ontop, alone)
+    @assert _drained() == before
+    println("exports cost the same however many the consumer holds ✓")
+
     # Schema/data mismatch and malformed buffers must fail before either
     # independently-owned export root is published.
     before = _registry_count()

@@ -221,7 +221,7 @@ consumer reads what it would read from the IPC bytes; an [`Arrow.Table`](@ref)'s
 and `Vector`s of numbers cross without copying, and must not be modified or resized
 while the consumer reads them. The consumer moves or releases the two structs; the
 table's memory stays reachable until it has released the array, and what Arrow.jl
-allocated is freed at the next export or garbage collection. A table that needs more
+allocated is freed by a later export or a garbage collection. A table that needs more
 than one record batch (several partitions, or string data past 2 GiB) is an
 `ArgumentError`; export it with [`Arrow.export_stream!`](@ref).
 """

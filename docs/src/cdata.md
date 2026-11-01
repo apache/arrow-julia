@@ -107,7 +107,7 @@ instead of reading the whole stream, for a DuckDB or Polars result larger than m
 
 An export keeps its source reachable until the consumer has released it: the table's
 columns, or the vectors it was built from. The structs Arrow.jl allocated are then freed
-at the next export or garbage collection, with nothing to call. The consumer reads
+by a later export or a garbage collection, with nothing to call. The consumer reads
 exported vectors in place, so modifying one changes what it reads; resizing one is safe
 from Julia 1.11 on, where the exported storage stays alive, and frees the consumer's
 bytes on Julia 1.10.

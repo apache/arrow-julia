@@ -683,6 +683,37 @@ end
     return bytes
 end
 
+# Seconds for `n` exports that the consumer keeps, the fastest of three runs, with
+# collections off so only the exports are timed. Each run's exports are released after.
+@noinline function _held_export_seconds(n)
+    f, d = fromjulia("held", Int64[1])
+    best = Inf
+    for _ = 1:3
+        held = Vector{Tuple{Ptr{CArrowSchema},Ptr{CArrowArray}}}(undef, n)
+        GC.enable(false)
+        t = try
+            @elapsed for i = 1:n
+                held[i] = to_c_data(f, d)
+            end
+        finally
+            GC.enable(true)
+        end
+        _release_all!(held)
+        best = min(best, t)
+    end
+    return best
+end
+
+_hold_exports(n) = [to_c_data(fromjulia("held", Int64[1])...) for _ = 1:n]
+
+function _release_all!(held)
+    for (sp, ap) in held
+        _release_c!(ap)
+        _release_c!(sp)
+    end
+    return nothing
+end
+
 # The registry key of an export whose consumer released both of its structs.
 @noinline function _released_export_key()
     sp, ap = to_c_data(fromjulia("released", Int64[1, 2, 3])...)

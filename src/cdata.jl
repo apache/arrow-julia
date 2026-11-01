@@ -29,8 +29,8 @@
 #     object, because consumers call it from their own threads and from inside
 #     GC finalizers. The Julia side keeps each export's roots (the columns,
 #     whose regions keep the buffers alive) and mallocs in `EXPORTS` until the
-#     count reaches zero; the next export, or the next garbage collection,
-#     frees them.
+#     count reaches zero; a later export, or a garbage collection, frees
+#     them.
 #
 #   * Import: the moved ArrowArray becomes ONE ForeignOwner shared by every
 #     child/dictionary BufferSlice (a single release for the whole tree).
@@ -357,9 +357,16 @@ end
 
 const EXPORTS = Dict{Ptr{Int64},Export}()
 const REGISTRY_LOCK = ReentrantLock()
+# Exports left to make before one reaps. A reap scans every registered export, so it
+# sets this to the number still unreleased (at least 64), and reaping costs constant
+# time per export however many exports a consumer holds.
+const _EXPORTS_UNTIL_REAP = Ref(64)
 
 function _newexport(roots::Vector{Any})
-    _reap!()
+    reap = lock(REGISTRY_LOCK) do
+        return (_EXPORTS_UNTIL_REAP[] -= 1) <= 0
+    end
+    reap && _reap!()
     live = Ptr{Int64}(Libc.calloc(2, 8))
     live == C_NULL && throw(OutOfMemoryError())
     return Export(roots, Ptr{Cvoid}[live], live)
@@ -398,6 +405,7 @@ function __init__()
     # workload left (its pointers come back NULL), and re-arm the reap hook,
     # whose finalizer is not saved.
     empty!(EXPORTS)
+    _EXPORTS_UNTIL_REAP[] = 64
     _REAP_HOOK_ARMED[] = false
     atexit(_setexiting)
     return nothing
@@ -426,14 +434,24 @@ function _register!(e::Export)
 end
 
 # Free every export whose C nodes have all been released, and return how many.
-# Runs at the start of every export and from `_ReapHook`, so no caller needs to.
-# ponytail: O(live exports) scan; index by count if a consumer holds thousands.
+# Runs from `_newexport` (see `_EXPORTS_UNTIL_REAP`) and from `_ReapHook`, so no
+# caller needs to.
 function _reap!()
-    done = lock(REGISTRY_LOCK) do
-        zeroed = Ptr{Int64}[
-            k for k in keys(EXPORTS) if unsafe_load(k, :sequentially_consistent) == 0
-        ]
-        Export[pop!(EXPORTS, k) for k in zeroed]
+    done = Export[]
+    lock(REGISTRY_LOCK) do
+        unreleased = 0
+        for e in values(EXPORTS)
+            if unsafe_load(e.live, :sequentially_consistent) == 0
+                push!(done, e)
+            else
+                unreleased += 1
+            end
+        end
+        for e in done
+            delete!(EXPORTS, e.live)
+        end
+        _EXPORTS_UNTIL_REAP[] = max(64, unreleased)
+        return nothing
     end
     foreach(_free!, done)
     return length(done)
@@ -652,7 +670,7 @@ The low-level form of [`Arrow.to_c_data`](@ref): export one column, an
 that Arrow.jl allocates, pointing at `data`'s buffers without copying them. The
 column is validated before it is exported. The consumer moves or releases the
 two structs; `data` stays reachable until it has released the array, and what
-Arrow.jl allocated is freed at the next export or garbage collection.
+Arrow.jl allocated is freed by a later export or a garbage collection.
 """
 function to_c_data(f::Field, d::ArrayData)
     validate_semantic(f, d)

@@ -65,7 +65,7 @@ stay in the adapter; Core dictionaries describe their values and index layout.
 Low-level access checks bounds and the region's release cell. Releasing a foreign
 owner revokes its regions and invokes the producer's callback exactly once.
 An export keeps its roots until the consumer has released every C node of it;
-the release callbacks only count the nodes off, and the next export or garbage
+the release callbacks only count the nodes off, and a later export or a garbage
 collection frees the export. Re-exporting imported data roots the foreign owner
 the same way.
 
