@@ -327,6 +327,9 @@ mutable struct Writer
     const oneshot::Bool
     # The buffers each batch's columns rebuild, reused batch to batch.
     const pool::_BufferPool
+    # Per column, the last dictionary pool a later table grew: the pool, the
+    # stored-key index of its categories, and the categories it added.
+    const dictgrowth::Vector{Any}
     st::Union{Nothing,IPCWriteState}
     names::Vector{Symbol}
     schema::Union{Nothing,AC.Schema}
@@ -405,6 +408,7 @@ function _writer(
             max(Int(ntasks), 1),
             oneshot,
             _BufferPool(),
+            Any[],
             nothing,
             Symbol[],
             nothing,
@@ -635,6 +639,8 @@ Base.@nospecializeinfer function _writebatch!(
         f.type isa AC.DictionaryType && !w.dictreplacement ?
         get(st.current, st.ids[f], nothing) : nothing for f in sch.fields
     ]
+    growth = w.dictgrowth
+    length(growth) == length(written) || fill!(resize!(growth, length(written)), nothing)
     fields, coldata = _constructconforming(
         names,
         cols,
@@ -644,13 +650,14 @@ Base.@nospecializeinfer function _writebatch!(
         w.stringview,
         w.largelists,
         written,
+        growth,
         ntasks=_batchtasks(w, nrows, length(names)),
         w.pool,
     )
     # A fresh Schema over the BUILT fields, so `writebatch!` re-checks them
     # against the writer's schema instead of trusting construction.
     batch = AC.RecordBatch(AC.Schema(fields; metadata=sch.metadata), coldata, nrows)
-    deltas = _uninferred(_dictionarydeltas, st, batch)::Dict{Int64,AC.ArrayData}
+    deltas = _uninferred(_dictionarydeltas, st, batch, growth)::Dict{Int64,AC.ArrayData}
     writebatch!(st, batch; deltas, recycle=_handoff!(w.pool))
     return nothing
 end
@@ -964,17 +971,108 @@ function _extendpool(written, own)
 end
 
 """
+`written` with `delta`'s categories after it. A flat pool without nulls
+(fixed-width values, utf8, binary) grows in place, in buffers that double
+when full, so a table copies only its new categories: the pools written
+before keep their prefixes of the same buffers, which are never resized.
+Other pools are copied whole. Returns the growth state for the next table and
+the pool.
+"""
+function _growpool(vf::AC.Field, written::AC.ArrayData, delta::AC.ArrayData, grown)
+    t = written.type
+    var = t isa Union{AC.Utf8Type,AC.BinaryType}
+    spec = AC.layoutspec_of(t)
+    if !(var || spec.fixedwidth > 0 && spec.buffers == [AC.VALIDITY, AC.DATA]) ||
+       AC.nullcount(written) > 0 ||
+       AC.nullcount(delta) > 0
+        ranges = [_DictionaryRange(written, 0, written.len), _DictionaryRange(delta, 0, delta.len)]
+        return nothing, _dictionaryconcat(vf, ranges, Limits(), nothing)
+    end
+    if grown === nothing || grown.pool !== written
+        O = var && t.large ? Int64 : Int32
+        grown = _appendpool!(_GrowingPool{O}(written, 0, O[0], UInt8[]), written)
+    end
+    return grown, _appendpool!(grown, delta).pool
+end
+
+mutable struct _GrowingPool{O}
+    pool::AC.ArrayData
+    len::Int
+    offsets::Vector{O}
+    data::Vector{UInt8}
+end
+
+# `buf` if it holds `n` more entries after `used`, else a new buffer of twice
+# the size with its first `used` entries.
+function _room(buf::Vector{T}, used::Int, n::Int) where {T}
+    used + n <= length(buf) && return buf
+    out = Vector{T}(undef, max(2 * length(buf), used + n, 64))
+    copyto!(out, 1, buf, 1, used)
+    return out
+end
+
+function _appendpool!(g::_GrowingPool{O}, d::AC.ArrayData) where {O}
+    t = d.type
+    n = Int(d.len)
+    var = t isa Union{AC.Utf8Type,AC.BinaryType}
+    if var
+        wide = t.large
+        used = Int(g.offsets[g.len + 1])
+        lo = n == 0 ? 0 : Int(first(AC._offsets_at(d, Int64(1), wide)))
+        g.offsets = _room(g.offsets, g.len + 1, n)
+        for i = 1:n
+            g.offsets[g.len + 1 + i] = O(used + Int(last(AC._offsets_at(d, Int64(i), wide))) - lo)
+        end
+        start, nbytes = lo, Int(g.offsets[g.len + 1 + n]) - used
+    else
+        width = AC.primwidth(t)
+        used = g.len * width
+        start, nbytes = Int(d.offset) * width, n * width
+    end
+    g.data = _room(g.data, used, nbytes)
+    src = AC.rolebuffer(d, AC.DATA)
+    GC.@preserve d g unsafe_copyto!(pointer(g.data, used + 1), AC.sliceptr(src) + start, nbytes)
+    g.len += n
+    data = AC.BufferSlice(AC.heapregion(g.data), 0, used + nbytes)
+    buffers =
+        var ?
+        [
+            AC.BufferSlice(),
+            AC.BufferSlice(AC.heapregion(g.offsets), 0, (g.len + 1) * sizeof(O)),
+            data,
+        ] : [AC.BufferSlice(), data]
+    # Its parts passed validation when they were built.
+    g.pool = _constructedvalid(AC.ArrayData(t, g.len, buffers; nullcount=0))
+    return g
+end
+
+"The 0-based index of each distinct stored category of `pool`."
+function _poolindex(vf::AC.Field, pool::AC.ArrayData)
+    index = Dict{Any,Int64}()
+    for i = 1:(pool.len)
+        get!(index, _storedkey(vf, pool, Int64(i)), Int64(i - 1))
+    end
+    return index
+end
+
+"""
 Delta dictionaries for a batch whose pools extend, value by value, the pools
 already written under their ids (`current`): the new categories as storage,
 by id.
 """
-function _dictionarydeltas(current, fields, ids, batch::AC.RecordBatch)
+function _dictionarydeltas(current, fields, ids, batch::AC.RecordBatch, growth=())
     deltas = Dict{Int64,AC.ArrayData}()
     for (f, pool) in dictionarypools(fields, batch.columns)
         id = ids[f]
         old = get(current, id, nothing)
         (old === nothing || old === pool || pool.len <= old.len) && continue
         haskey(deltas, id) && continue
+        # A pool `_conformdictionary` grew knows its new categories.
+        k = findfirst(g -> g !== nothing && g[1] === pool && g[3] !== nothing, growth)
+        if k !== nothing
+            deltas[id] = growth[k][3]
+            continue
+        end
         vf = AC.dictvaluefield(f, f.type::AC.DictionaryType)
         _poolrangeequal(vf, old, Int64(0), pool, Int64(0), old.len) || continue
         deltas[id] =
@@ -982,8 +1080,8 @@ function _dictionarydeltas(current, fields, ids, batch::AC.RecordBatch)
     end
     return deltas
 end
-_dictionarydeltas(st::IPCWriteState, batch::AC.RecordBatch) =
-    _dictionarydeltas(st.current, st.schema.fields, st.ids, batch)
+_dictionarydeltas(st::IPCWriteState, batch::AC.RecordBatch, growth=()) =
+    _dictionarydeltas(st.current, st.schema.fields, st.ids, batch, growth)
 
 """
 A schema field declared nullable, with its descendants, except the children
@@ -1311,6 +1409,7 @@ Base.@nospecializeinfer function _constructconforming(
     stringview::Bool=false,
     largelists::Bool=false,
     written=nothing,
+    growth=nothing,
     ntasks::Int=1,
     pool=nothing,
 )
@@ -1329,6 +1428,7 @@ Base.@nospecializeinfer function _constructconforming(
             stringview,
             largelists,
             pool,
+            growth=growth === nothing ? nothing : (growth, j),
         )::Tuple{AC.Field,AC.ArrayData}
     end
     return AC.Field[first(b) for b in built], AC.ArrayData[last(b) for b in built]
@@ -1344,11 +1444,19 @@ function _conformcolumn(
     stringview::Bool,
     largelists::Bool,
     pool=nothing,
+    growth=nothing,
 )
     dictmismatch = nothing
     if expected.type isa AC.DictionaryType && written !== nothing
-        conformed, dictmismatch =
-            _uninferred(_conformdictionary, name, col, expected, written; stringview)
+        conformed, dictmismatch = _uninferred(
+            _conformdictionary,
+            name,
+            col,
+            expected,
+            written;
+            stringview,
+            growth,
+        )
         conformed === nothing || return conformed
     end
     if expected.nullable &&
@@ -1407,6 +1515,7 @@ function _conformdictionary(
     expected::AC.Field,
     written;
     stringview::Bool=false,
+    growth=nothing,
 )
     context = _WriterContext(String(name))
     et = expected.type::AC.DictionaryType
@@ -1437,13 +1546,11 @@ function _conformdictionary(
         return nothing, "$name holds missing values, but the schema field is not nullable"
     localpool = data.dictionary::AC.ArrayData
     # The written categories keep their indices; the local ones not among
-    # them follow.
-    # ponytail: the written pool's keys are found again for every later batch
-    # (O(categories) each); keep them on the writer if huge pools get slow.
-    index = Dict{Any,Int64}()
-    for i = 1:(written.len)
-        get!(index, _storedkey(vf, written, Int64(i)), Int64(i - 1))
-    end
+    # them follow. The written pool's index stays on the writer (`growth`),
+    # so a table costs its own categories, not the pool's.
+    slots, j = something(growth, (Any[nothing], 1))
+    cached = slots[j]
+    index = cached !== nothing && cached[1] === written ? cached[2] : _poolindex(vf, written)
     new = Int[]
     remap = Vector{Int64}(undef, localpool.len)
     for i = 1:(localpool.len)
@@ -1452,17 +1559,10 @@ function _conformdictionary(
             return Int64(written.len + length(new) - 1)
         end
     end
-    pool =
-        isempty(new) ? written :
-        _dictionaryconcat(
-            vf,
-            _DictionaryRange[
-                _DictionaryRange(written, 0, written.len);
-                [_DictionaryRange(localpool, Int64(i - 1), 1) for i in new]
-            ],
-            Limits(),
-            nothing,
-        )
+    delta = isempty(new) ? nothing : _takerows(localvf, localpool, new)
+    grown = cached === nothing ? nothing : cached[4]
+    grown, pool = delta === nothing ? (grown, written) : _growpool(vf, written, delta, grown)
+    slots[j] = (pool, index, delta, grown)
     IT = AC.juliatype(et.indextype)
     pool.len - 1 <= typemax(IT) || throw(
         ArgumentError(

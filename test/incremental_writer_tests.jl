@@ -62,6 +62,18 @@ dictbatches(bytes) = [
     m in framedmessages(bytes) if m.msg.header isa Arrow.Meta.DictionaryBatch
 ]
 
+# `k` Writer tables of 20 rows, each adding 20 string categories as a delta.
+function growdictionary(k)
+    io = IOBuffer()
+    Arrow.Writer(io; file=false, dictdeltas=true, dictencode=true) do w
+        for t = 1:k
+            Arrow.write(w, (s=["c$(t)_$i" for i = 1:20],))
+        end
+    end
+    return take!(io)
+end
+growthallocations(k) = @allocated growdictionary(k)
+
 # :dictionary or :record for each batch message, in order.
 batchkinds(bytes) = [
     m.msg.header isa Arrow.Meta.DictionaryBatch ? :dictionary : :record for
@@ -381,6 +393,16 @@ batchkinds(bytes) = [
         @test [(isdelta, n) for (_, isdelta, n) in dictbatches(bytes)] == [(false, 2), (false, 2)]
         # The file format has no replacement to declare.
         @test_throws ArgumentError Arrow.Writer(IOBuffer(); file=true, dictreplacement=true)
+    end
+
+    @testset "a growing dictionary costs each table its new categories" begin
+        # Work per table is proportional to the categories it adds, not to the
+        # pool written so far: 2,000 tables cost twice what 1,000 do.
+        growdictionary(10)
+        @test growthallocations(2_000) < 2.5 * growthallocations(1_000)
+        @test length(dictbatches(growdictionary(2_000))) == 2_000
+        t = Arrow.Table(growdictionary(100))
+        @test t.s == ["c$(t)_$i" for t = 1:100 for i = 1:20]
     end
 
     @testset "one-shot dictionaries use the narrowest index type" begin
