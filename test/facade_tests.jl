@@ -526,6 +526,20 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test stats.bytes < 64_000_000
     end
 
+    @testset "offset keyword" begin
+        bytes = take!(Arrow.tobuffer(Tables.partitioner([(x=1:4,), (x=5:9,)]); file=true))
+        @test Arrow.Table(bytes; offset=2, limit=3).x == [3, 4, 5]
+        @test Arrow.Table(bytes; offset=7).x == [8, 9]
+        @test Arrow.Table(bytes; filter=Arrow.col(:x) > 2, offset=3).x == [6, 7, 8, 9]
+        @test reduce(
+            vcat,
+            [collect(t.x) for t in Arrow.Stream(bytes; offset=3, limit=4)],
+        ) == 4:7
+        @test Arrow.read(bytes, Tables.columntable; offset=8).x == [9]
+        @test_throws ArgumentError Arrow.Table(bytes; offset=-1)
+        @test_throws ArgumentError Arrow.Table(bytes; offset=1, scan=Tables.Scan())
+    end
+
     @testset "scan pushdown through Arrow.Table" begin
         io = IOBuffer()
         Arrow.write(io, (x=collect(Int64, 1:100), y=string.(1:100)))

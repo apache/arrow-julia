@@ -28,8 +28,8 @@
 
 """
     Arrow.Table(source; select=nothing, drop=nothing, filter=nothing, limit=nothing,
-                scan=nothing, mmap, stringtype=DataString, ntasks=Threads.nthreads(),
-                limits=Arrow.Limits()) -> Arrow.Table
+                offset=nothing, scan=nothing, mmap, stringtype=DataString,
+                ntasks=Threads.nthreads(), limits=Arrow.Limits()) -> Arrow.Table
 
 Read Arrow IPC data, in the file or the stream format, as Tables.jl columns. `source` is
 a path, an `IO` (read to its end), a byte vector (read in place: do not modify it while
@@ -39,11 +39,11 @@ that `open(source, "r")` accepts, such as a FilePathsBase.jl path, reads as the 
 
 - `select` keeps the given columns, in that order: names, indices, a regex, a vector of
   them, or a function `(i, name) -> Bool`; `name => newname` renames a column and
-  `name => Type` reads it as `Type`. `drop` keeps the others.
+  `name => Type` converts it to `Type`. `drop` keeps the others.
 - `filter` keeps the rows where a predicate built from [`Arrow.col`](@ref) is `true`,
   such as `filter=Arrow.col(:fare) > 10`.
-- `limit` keeps at most that many rows.
-- `scan` takes a `Tables.Scan` instead of those four, for an offset.
+- `limit` keeps at most that many rows, and `offset` skips that many rows first.
+- `scan` takes a `Tables.Scan` instead of those keywords.
 - `mmap` memory-maps a path. It is the default except on Windows, which cannot delete a
   mapped file.
 - `stringtype=String` reads strings as `String`s instead of `DataStrings.DataString`s.
@@ -1664,24 +1664,29 @@ _sourcebudget(source, limits::Limits) =
         maxnewsymbols=limits.max_new_symbols,
     )
 
-# The select/drop/filter/limit keywords: a `Tables.Scan` once the column
-# names are known (`_requestedscan`).
+# The select/drop/filter/limit/offset keywords: a `Tables.Scan` once the
+# column names are known (`_requestedscan`).
 struct _ScanRequest
     select::Any
     drop::Any
     filter::Any
     limit::Any
+    offset::Int
 end
 
 # The scan the read keywords ask for: `nothing` for a whole read, the `scan`,
 # or a `_ScanRequest`.
-function _scanrequest(select, drop, filter, limit, scan)
+function _scanrequest(select, drop, filter, limit, offset, scan)
     sugar =
-        select !== nothing || drop !== nothing || filter !== nothing || limit !== nothing
+        select !== nothing ||
+        drop !== nothing ||
+        filter !== nothing ||
+        limit !== nothing ||
+        offset !== nothing
     if scan !== nothing
         sugar && throw(
             ArgumentError(
-                "pass `scan` or the select/drop/filter/limit keywords, not both; " *
+                "pass `scan` or the select/drop/filter/limit/offset keywords, not both; " *
                 "a Tables.Scan can express all of them",
             ),
         )
@@ -1691,9 +1696,9 @@ function _scanrequest(select, drop, filter, limit, scan)
     (select === nothing || drop === nothing) ||
         throw(ArgumentError("pass `select` or `drop`, not both"))
     _checkfilterform(filter)
-    # The filter and limit are checked now, before the source is read.
-    Tables.Scan(; filter=filter, limit=limit)
-    return _ScanRequest(select, drop, filter, limit)
+    # The filter, limit, and offset are checked now, before the source is read.
+    scan = Tables.Scan(; filter=filter, limit=limit, offset=something(offset, 0))
+    return _ScanRequest(select, drop, filter, limit, scan.offset)
 end
 
 # The filters people write first, with the forms Tables.jl 1.14 takes. (Tables
@@ -1726,7 +1731,7 @@ function _requestedscan(r::_ScanRequest, names)
     columns =
         r.drop === nothing ? _selection(:select, something(r.select, Tables.All()), names) :
         Tables.Not(_selection(:drop, r.drop, names))
-    return Tables.Scan(; select=columns, filter=r.filter, limit=r.limit)
+    return Tables.Scan(; select=columns, filter=r.filter, limit=r.limit, offset=r.offset)
 end
 _ScanPlan(r::_ScanRequest, fields, budget=nothing) =
     _ScanPlan(_requestedscan(r, _fieldnamesymbols(fields, budget)), fields, budget)
@@ -1771,6 +1776,7 @@ function Table(
     drop=nothing,
     filter=nothing,
     limit=nothing,
+    offset=nothing,
     scan::Union{Nothing,Tables.Scan}=nothing,
     mmap::Bool=_MMAP_DEFAULT,
     stringtype::Type=DataStrings.DataString,
@@ -1779,7 +1785,7 @@ function Table(
     unknown...,
 )
     isempty(unknown) || _unknownkeywords("read", keys(unknown))
-    scan = _scanrequest(select, drop, filter, limit, scan)
+    scan = _scanrequest(select, drop, filter, limit, offset, scan)
     readlimits = _readerlimits(source, limits)
     _checkstringtype(stringtype)
     ntasks = _checkntasks(ntasks)
@@ -2183,12 +2189,12 @@ _declaredbasetype(t::AC.ArrowType) =
 
 """
     Arrow.Stream(source; select=nothing, drop=nothing, filter=nothing, limit=nothing,
-                 scan=nothing, mmap, stringtype=DataString, ntasks=Threads.nthreads(),
-                 limits=Arrow.Limits())
+                 offset=nothing, scan=nothing, mmap, stringtype=DataString,
+                 ntasks=Threads.nthreads(), limits=Arrow.Limits())
 
 Read `source` one record batch at a time: each iteration gives an [`Arrow.Table`](@ref)
 of one batch. The keywords are those of `Arrow.Table`; `select`, `drop`, and `filter`
-apply to each batch, and `limit` (and a scan's `offset`) counts rows across batches. A
+apply to each batch, and `limit` and `offset` count rows across batches. A
 stream is its own `Tables.partitions`, so `Arrow.write(sink, stream)` writes a record
 batch for each batch read.
 
@@ -2225,6 +2231,7 @@ function Stream(
     drop=nothing,
     filter=nothing,
     limit=nothing,
+    offset=nothing,
     scan::Union{Nothing,Tables.Scan}=nothing,
     mmap::Bool=_MMAP_DEFAULT,
     stringtype::Type=DataStrings.DataString,
@@ -2233,7 +2240,7 @@ function Stream(
     unknown...,
 )
     isempty(unknown) || _unknownkeywords("read", keys(unknown))
-    scan = _scanrequest(select, drop, filter, limit, scan)
+    scan = _scanrequest(select, drop, filter, limit, offset, scan)
     readlimits = _readerlimits(source, limits)
     _checkstringtype(stringtype)
     ntasks = _checkntasks(ntasks)
