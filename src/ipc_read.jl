@@ -536,6 +536,11 @@ end
 # The error for a message prefix without the continuation marker: at the
 # start of the input, the input is not Arrow IPC data (or is a stream from
 # before Arrow 0.15, whose messages start with their metadata length).
+# An IPC stream of `n` bytes that holds no schema message.
+_emptystream(n) =
+    n == 0 ? "the input is empty: Arrow IPC data has at least a schema message" :
+    "empty IPC stream: it ends before its schema message"
+
 function _nomarker(pos::Int64, word::UInt32)
     pos == 0 || return "missing continuation marker at byte $pos"
     msg =
@@ -543,6 +548,8 @@ function _nomarker(pos::Int64, word::UInt32)
         "ARROW1 nor an IPC stream message"
     # "PAR1", read as a little-endian word.
     word == 0x31524150 && return msg * " (it starts with PAR1, as a Parquet file does)"
+    word & 0xffff == 0x8b1f &&
+        return msg * " (it starts with 1f 8b, as gzip data does; decompress it first)"
     0 < (word % Int32) <= 1 << 24 || return msg
     return msg *
            " (a stream written before Arrow 0.15 starts like this; " *
@@ -2021,7 +2028,7 @@ record batches planned against the dictionaries in effect at each.
 """
 function _streamrecords(region::OwnerRegion, limits::Limits, budget::AllocationBudget)
     msgs = _framemessages(region, limits, Base.ENDIAN_BOM, budget)
-    isempty(msgs) && throw(ValidationError("empty IPC stream"))
+    isempty(msgs) && throw(ValidationError(_emptystream(region.len)))
     st = _StreamState(msgs[1], limits)
     # One codec context per reader for the dictionary batches, which apply in
     # order; record batches are planned in order and decoded together after.
@@ -2194,7 +2201,7 @@ end
 function _StreamReader(messages, limits::Limits)
     _validatelimits(limits)
     fm = _nextmessage!(messages, limits, _framebudget(limits))
-    fm === nothing && throw(ValidationError("empty IPC stream"))
+    fm === nothing && throw(ValidationError(_emptystream(messages.pos)))
     st = _StreamState(fm, limits)
     region = messages isa _RegionMessages ? messages.blob.region : heapregion(UInt8[])
     return _StreamReader(
@@ -2533,7 +2540,12 @@ function _readfooter(src, limits::Limits, budget::AllocationBudget)
         throw(ValidationError("file is too short to be an IPC file"))
     # The trailer is <footer><Int32 footer length><ARROW1>.
     trailer = _lastbytes(src, 10, budget)
-    trailer[5:10] == FILE_MAGIC || throw(ValidationError("missing trailing ARROW1 magic"))
+    trailer[5:10] == FILE_MAGIC || throw(
+        ValidationError(
+            "missing trailing ARROW1 magic: the file is incomplete, as when a write was " *
+            "cut off or an Arrow.Writer was not closed",
+        ),
+    )
     footerlen = Int64(ltoh(reinterpret(Int32, trailer[1:4])[1]))
     footerlen > 0 || throw(ValidationError("footer length $footerlen is not positive"))
     footerlen <= limits.max_metadata_bytes || _limiterror(

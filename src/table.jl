@@ -1455,6 +1455,22 @@ _openable(x, mode) = !(x isa Union{Function,Type}) && applicable(open, x, mode)
 
 # A source that is none of those kinds: name the kinds there are. (Arrow 2.x
 # also accepted a vector of sources and positional byte windows.)
+# An `IO` with nothing left to read: say so, and how to read it from its start.
+function _atend(io::IO)
+    pos = try
+        position(io)
+    catch
+        0
+    end
+    pos > 0 && throw(
+        ArgumentError(
+            "the IO is at its end (position $pos): call seekstart(io) first, " *
+            "or pass take!(io)",
+        ),
+    )
+    return nothing
+end
+
 function _unreadable(source)
     hint =
         Tables.istable(source) ?
@@ -1562,6 +1578,14 @@ _ScanPlan(r::_ScanRequest, fields, budget=nothing) =
 function _selection(keyword::Symbol, selection, names)
     selection isa Function &&
         return Int[i for (i, name) in enumerate(names) if selection(i, name)]
+    keyword === :select &&
+        selection isa Union{AbstractVector,Tuple} &&
+        isempty(selection) &&
+        throw(
+            ArgumentError(
+                "select=$(repr(selection)) names no column; pass the columns to read",
+            ),
+        )
     items =
         selection isa Union{AbstractVector,Tuple} ? selection :
         selection isa Union{Tables.All,Tables.Not} ? () : (selection,)
@@ -1670,7 +1694,10 @@ _isfileregion(r::OwnerRegion) =
 # vector in place, or an opened reader's bytes.
 _openregion(path::AbstractString; kwargs...) =
     open(io -> _fileregion(io, path; kwargs...), path, "r")
-_openregion(io::IO; budget, kwargs...) = heapregion(_readio(io, budget)), false
+function _openregion(io::IO; budget, kwargs...)
+    eof(io) && _atend(io)
+    return heapregion(_readio(io, budget)), false
+end
 _openregion(bytes::Vector{UInt8}; kwargs...) = heapregion(bytes), false
 function _openregion(src::Union{IPCStream,ArrowFile}; budget, kwargs...)
     src.region.cell.action == C_NULL && return src.region, false
@@ -2093,6 +2120,7 @@ function _openstream(source; mmap::Bool, limits::Limits, budget)
     return _unmaponerror(() -> _readfile(region, limits, budget), region, mapped)
 end
 function _openstream(io::IO; limits::Limits, budget, kwargs...)
+    eof(io) && _atend(io)
     head = Base.read(io, 8)
     (length(head) >= 6 && view(head, 1:6) == FILE_MAGIC) ||
         return _StreamReader(_IOMessages(io, head, Int64(0)), limits)

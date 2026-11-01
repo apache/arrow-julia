@@ -540,6 +540,36 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test_throws ArgumentError Arrow.Table(bytes; offset=1, scan=Tables.Scan())
     end
 
+    @testset "read mistakes say what to do" begin
+        bytes = take!(Arrow.tobuffer((x=[1, 2],); file=true))
+        io = IOBuffer()
+        Arrow.write(io, (x=[1, 2],))
+        for read in (Arrow.Table, Arrow.Stream)
+            err = try
+                read(io)
+            catch e
+                e
+            end
+            @test err isa ArgumentError && occursin("seekstart(io)", err.msg)
+        end
+        messages = (
+            bytes[1:(end - 12)] => "an Arrow.Writer was not closed",
+            UInt8[] => "the input is empty",
+            UInt8[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03] => "gzip",
+        )
+        for (input, message) in messages
+            err = try
+                Arrow.Table(input)
+            catch e
+                e
+            end
+            @test err isa Arrow.ValidationError && occursin(message, err.msg)
+        end
+        @test_throws ArgumentError Arrow.Table(bytes; select=Symbol[])
+        @test_throws ArgumentError Arrow.Table(bytes; select=())
+        @test isempty(Tables.columnnames(Arrow.Table(bytes; scan=Tables.Scan(select=()))))
+    end
+
     @testset "scan pushdown through Arrow.Table" begin
         io = IOBuffer()
         Arrow.write(io, (x=collect(Int64, 1:100), y=string.(1:100)))
