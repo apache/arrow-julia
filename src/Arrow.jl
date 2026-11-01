@@ -104,68 +104,6 @@ include("write.jl")
 include("cdata_table.jl")
 include("sharedvalues.jl")
 
-@doc """
-    Arrow.Field
-
-A column's name, Arrow type, nullability, children, and metadata, as the C data
-interface uses it. [`Arrow.fromjulia`](@ref) and [`Arrow.from_c_data`](@ref) return one.
-""" Field
-
-@doc """
-    Arrow.Schema
-
-The [`Arrow.Field`](@ref)s of a record batch, in order, with optional key-value
-metadata. The C stream interface describes its batches with one.
-""" Schema
-
-@doc """
-    Arrow.ArrayData
-
-The values of one column in Arrow's memory layout: its buffers, children, optional
-dictionary, and length. [`Arrow.fromjulia`](@ref) and [`Arrow.from_c_data`](@ref) return
-one; [`Arrow.materialize`](@ref) converts it to a Julia vector, and `copy` copies it into
-Julia-owned memory.
-""" ArrayData
-
-@doc """
-    Arrow.RecordBatch
-
-A record batch: a [`Arrow.Schema`](@ref) (`batch.schema`), one
-[`Arrow.ArrayData`](@ref) per field (`batch.columns`), and the row count
-(`batch.nrows`). [`Arrow.batch`](@ref) builds one from Julia vectors.
-""" RecordBatch
-
-@doc """
-    Arrow.fromjulia(name, values) -> (Arrow.Field, Arrow.ArrayData)
-
-The field and data of a column named `name` holding `values`, for the C data
-interface. The data may share `values`' memory: do not modify or resize `values` while
-the result is in use.
-""" fromjulia
-
-@doc """
-    Arrow.batch(columns::NamedTuple) -> Arrow.RecordBatch
-
-A record batch of the named vectors in `columns`, as [`Arrow.fromjulia`](@ref) builds
-each one.
-""" batch
-
-@doc """
-    Arrow.materialize(field, data) -> Vector
-    Arrow.materialize(T, field, data) -> Vector{T}
-
-The values of `data`, a column described by `field`, as a new Julia vector. The typed
-form returns a `Vector{T}` and first checks that `T` fits the field's Arrow type.
-""" materialize
-
-"""
-    Arrow.nextbatch!(stream::Arrow.ImportedStream) -> Union{Arrow.RecordBatch,Nothing}
-
-The next record batch of a stream imported with [`Arrow.from_c_stream`](@ref), or
-`nothing` at its end. Overlapping calls on one stream are an error.
-"""
-AC.nextbatch!
-
 """
     Arrow.ValidationError
 
@@ -211,23 +149,12 @@ AC.ValidationError
             :sourcelength,
             :readrange,
             :concurrentreads,
-            :Field,
-            :Schema,
-            :ArrayData,
-            :RecordBatch,
-            :fromjulia,
-            :batch,
-            :materialize,
             :CArrowSchema,
             :CArrowArray,
             :CArrowArrayStream,
             :to_c_data,
             :from_c_data,
             :export_stream!,
-            :from_c_stream,
-            :ForeignOwner,
-            :ImportedStream,
-            :nextbatch!,
             :Limits,
             :AllocationLimitError,
             :ValidationError,

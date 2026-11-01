@@ -40,8 +40,8 @@ nested public values that mirrored it — is removed.
 
 * **ArrowCore stays the storage authority, untouched.** `AC._value`,
   `AC.materialize`, and `AC.fromjulia` keep the storage domain: raw counts
-  for temporals, raw coefficients for decimals. They serve the C interface,
-  conformance, and the documented low-level `Arrow.materialize` API. Core
+  for temporals, raw coefficients for decimals. They serve the C interface
+  and conformance. Core
   keeps zero knowledge of Dates/Durations/DataDecimals public types and
   remains trim-compileable on its own.
 

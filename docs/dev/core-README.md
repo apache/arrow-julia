@@ -39,7 +39,8 @@ where those contracts are implemented and the constraints on changing them.
 | `src/ipc_read.jl` | Framing, limits, metadata decoding, layout decoding, and decompression |
 | `src/ipc_dictionary.jl` | Dictionary snapshots, replacement and delta updates, shared IDs, and dictionary dependencies |
 | `src/ipc_write.jl` | File indexes, IPC encoding, batch emission, compression, and incremental writer state |
-| `src/cdata.jl` | C data and C stream import/export, callbacks, and foreign ownership |
+| `src/cdata.jl`, `src/cstream.jl` | C data and C stream import/export of Core arrays, release callbacks, and foreign ownership |
+| `src/cdata_table.jl` | `Arrow.Table`, `Arrow.Stream`, and Tables.jl tables across the C data and C stream interfaces |
 | `src/source.jl` | Byte-range sources and read scheduling; `ext/ArrowCloudStoreExt.jl` supplies the CloudStore integration |
 | `src/columns.jl` | Read-only buffer views, typed nested rows, dictionary/run-end columns, and deferred string construction |
 | `src/table.jl` | `Table`/`Stream`, source opening, Tables.jl and DataAPI interfaces, copying, and public value conversion |
@@ -63,9 +64,10 @@ stay in the adapter; Core dictionaries describe their values and index layout.
 
 Low-level access checks bounds and the region's release cell. Releasing a foreign
 owner revokes its regions and invokes the producer's callback exactly once.
-Exported objects retain their roots until their C release callbacks run and
-`reap!` removes the registry entries. Re-exporting imported data pins the foreign
-owner until the consumer has released it.
+An export keeps its roots until the consumer has released every C node of it;
+the release callbacks only count the nodes off, and the next export or garbage
+collection frees the export. Re-exporting imported data roots the foreign owner
+the same way.
 
 The public table facade has a different lifetime contract. Its numeric and nested
 columns keep their backing storage alive and read without a per-element release

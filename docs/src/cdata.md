@@ -23,49 +23,115 @@
 
 The Arrow [C data interface](https://arrow.apache.org/docs/format/CDataInterface.html)
 and [C stream interface](https://arrow.apache.org/docs/format/CStreamInterface.html)
-hand columns and record batches to another Arrow implementation in the same process,
-such as pyarrow through PythonCall, without copying them. The producer fills C structs
-(`ArrowSchema`, `ArrowArray`, `ArrowArrayStream`) and the consumer calls their `release`
-callbacks when it is done.
+hand tables to another Arrow implementation in the same process, such as pyarrow, Polars,
+or DuckDB through PythonCall, without copying them. The producer fills C structs
+(`ArrowSchema`, `ArrowArray`, `ArrowArrayStream`); the consumer moves them out and calls
+their `release` callbacks when it is done.
 
-The functions work on low-level values rather than tables: an [`Arrow.Field`](@ref)
-describes a column, an [`Arrow.ArrayData`](@ref) holds its buffers, and an
-[`Arrow.RecordBatch`](@ref) is a [`Arrow.Schema`](@ref) with one `ArrayData` per field.
-[`Arrow.fromjulia`](@ref) and [`Arrow.batch`](@ref) build them from Julia vectors, and
-[`Arrow.materialize`](@ref) turns imported data back into a Julia vector.
+[`Arrow.export_stream!`](@ref) exports any Tables.jl table as a stream of record batches
+and [`Arrow.to_c_data`](@ref) as one record batch; [`Arrow.Table`](@ref) and
+[`Arrow.Stream`](@ref) import from pointers to the structs. An exported table is built
+as [`Arrow.write`](@ref) builds it, so the other implementation sees what it would read
+from the IPC bytes, and an imported table has the column types an IPC read gives.
 
-```@example cdata
-using Arrow
-
-field, data = Arrow.fromjulia("x", [1, 2, missing, 4])
-schemaptr, arrayptr = Arrow.to_c_data(field, data)    # export
-field2, data2 = Arrow.from_c_data(schemaptr, arrayptr) # import
-Arrow.materialize(Union{Missing,Int}, field2, data2)
-```
-
-- [`Arrow.to_c_data`](@ref) exports one column and returns pointers to its structs. They
-  stay valid until the consumer calls their `release` callbacks; [`Arrow.reap!`](@ref)
-  then frees what Arrow.jl kept for them.
-- [`Arrow.from_c_data`](@ref) imports one column. It takes over the array, as the
-  interface requires, and its buffers stay valid while the returned data is reachable.
-  `Arrow.release!(data.owner)` gives them back to the producer at once.
-- [`Arrow.export_stream!`](@ref) fills a caller-allocated `ArrowArrayStream` from a
-  schema and record batches; [`Arrow.from_c_stream`](@ref) imports one, and
-  [`Arrow.nextbatch!`](@ref) reads its batches until it returns `nothing`.
-
-Exported and imported data is validated as an IPC read is. `copy(data)` copies an
-imported column into Julia-owned memory, and `Serialization.serialize` saves the values
-of `ArrayData` and record batches. `deepcopy` does not detach them: the copy shares the
-producer's memory, and its release, with the original.
-
-With PythonCall, a column goes to pyarrow like this:
+With PythonCall, a `DataFrame` goes to pyarrow and a pyarrow table comes back like this:
 
 ```julia
-using Arrow, PythonCall
+using Arrow, PythonCall, DataFrames
 pa = pyimport("pyarrow")
 
-field, data = Arrow.fromjulia("x", [1, 2, missing, 4])
-schemaptr, arrayptr = Arrow.to_c_data(field, data)
-array = pa.Array._import_from_c(UInt(arrayptr), UInt(schemaptr))
-array.to_pylist()  # [1, 2, None, 4]
+# Julia -> pyarrow: any Tables.jl table, as a stream of record batches
+df = DataFrame(id=1:3, name=["a", "b", missing])
+stream = Ref{Arrow.CArrowArrayStream}()
+pytable = GC.@preserve stream begin
+    p = Base.unsafe_convert(Ptr{Arrow.CArrowArrayStream}, stream)
+    Arrow.export_stream!(p, df)
+    pa.RecordBatchReader._import_from_c(UInt(p)).read_all()
+end
+
+# pyarrow -> Julia: pyarrow fills the struct and Arrow.Table moves it out
+stream = Ref{Arrow.CArrowArrayStream}()
+t = GC.@preserve stream begin
+    p = Base.unsafe_convert(Ptr{Arrow.CArrowArrayStream}, stream)
+    pytable.to_reader()._export_to_c(UInt(p))
+    Arrow.Table(p)
+end
+t.name   # the strings and the missing value, as Arrow.Table(bytes) reads them
 ```
+
+A `pyarrow.RecordBatchReader` is what `polars.from_arrow` and DuckDB's
+`connection.register("name", reader)` consume, so the same export feeds them. The
+`Ref`, `GC.@preserve`, and `unsafe_convert` lines are the C ABI: the caller owns the
+struct's memory while the other side fills or empties it.
+
+One record batch crosses as two structs that Arrow.jl allocates, and comes back from
+structs the caller allocates:
+
+```julia
+schemaptr, arrayptr = Arrow.to_c_data(df)
+batch = pa.RecordBatch._import_from_c(UInt(arrayptr), UInt(schemaptr))
+
+aref = Ref{Arrow.CArrowArray}()
+sref = Ref{Arrow.CArrowSchema}()
+t = GC.@preserve aref sref begin
+    ap = Base.unsafe_convert(Ptr{Arrow.CArrowArray}, aref)
+    sp = Base.unsafe_convert(Ptr{Arrow.CArrowSchema}, sref)
+    batch._export_to_c(UInt(ap), UInt(sp))
+    Arrow.Table(sp, ap)   # a struct array is a table; any other array is one column
+end
+```
+
+[`Arrow.Stream(streamptr)`](@ref Arrow.Stream) pulls one record batch per iteration
+instead of reading the whole stream, for a DuckDB or Polars result larger than memory.
+
+## What crosses, and what is copied
+
+- Exports use [`Arrow.write`](@ref)'s column construction and keywords: `dictencode`,
+  `stringview`, `largelists`, `metadata`, and `colmetadata` mean what they mean there,
+  and the consumer sees the same schema and values as from the IPC bytes. An
+  [`Arrow.Table`](@ref)'s columns and `Vector`s of numbers cross without copying;
+  strings, nested values, and other Julia values are built into Arrow buffers, as a write
+  builds them. `export_stream!` sends one record batch per `Tables.partitions` partition
+  (an `Arrow.Stream` is a partition per batch) and splits a batch only when its string
+  data outgrows 32-bit offsets; `to_c_data` refuses a table that needs more than one
+  batch.
+- Imports read the producer's memory in place: strings as `DataString`, timestamps as
+  `Timestamp` or `ZonedTimestamp`, decimals as `Decimal`, nested values as the same views
+  an IPC read gives, with `stringtype`, `ntasks`, and `limits` as for `Arrow.Table`. A
+  C stream read whole chains its batches into one table. `copy(table)` copies it into
+  Julia-owned memory.
+- Exported and imported data is validated as an IPC read is.
+
+## Memory
+
+An export keeps its source reachable until the consumer has released it: the table's
+columns, or the vectors it was built from. The structs Arrow.jl allocated are then freed
+at the next export or garbage collection, with nothing to call. The consumer reads
+exported vectors in place, so modifying one changes what it reads; resizing one is safe
+from Julia 1.11 on, where the exported storage stays alive, and frees the consumer's
+bytes on Julia 1.10.
+
+An imported table's columns read the producer's memory, and the producer's `release`
+callback runs once the table and its columns are garbage collected, as a mapped file is
+unmapped. [`Arrow.release!`](@ref)`(table)` only refuses further column access.
+`Arrow.release!(stream)` on an [`Arrow.Stream`](@ref) over a C stream releases the
+producer's stream at once; the tables already read stay valid. `deepcopy` of imported
+data shares its memory and its release with the original; use `copy`.
+
+## Threads
+
+The callbacks Arrow.jl exports are Julia functions. A consumer that calls them from its
+own threads, as DuckDB's and Arrow C++'s thread pools do, makes Julia adopt those
+threads. The release callbacks take no locks and allocate nothing, so they are safe to
+call from any thread; a stream's `get_next` builds the batch's structs on the calling
+thread. On Julia 1.12 and 1.13, a process whose adopted threads are still running when
+it exits can hang in the join of those threads at exit (a Julia bug, not present on
+1.10 and 1.11); closing the consumer before Julia exits, as with `connection.close()`
+in DuckDB, avoids it in practice.
+
+## Low-level columns
+
+[`Arrow.to_c_data`](@ref)`(field, data)` exports one column given as an `Arrow.Field`
+and an `Arrow.ArrayData`, and [`Arrow.from_c_data`](@ref) imports one, returning that
+pair. These are the forms the conformance suite and a custom producer or consumer use;
+tables need neither.

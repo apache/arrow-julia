@@ -91,23 +91,12 @@ Arrow.AllocationLimitError
 ## C data and C stream interfaces
 
 ```@docs
-Arrow.Field
-Arrow.Schema
-Arrow.ArrayData
-Arrow.RecordBatch
-Arrow.fromjulia
-Arrow.batch
-Arrow.materialize
+Arrow.Table(::Ptr{Arrow.CArrowSchema}, ::Ptr{Arrow.CArrowArray})
+Arrow.Table(::Ptr{Arrow.CArrowArrayStream})
+Arrow.Stream(::Ptr{Arrow.CArrowArrayStream})
 Arrow.to_c_data
-Arrow.from_c_data
 Arrow.export_stream!
-Arrow.from_c_stream
-Arrow.nextbatch!
-Arrow.ImportedStream
-Arrow.ForeignOwner
-Arrow.release!(::Arrow.ForeignOwner)
-Arrow.release!(::Arrow.ImportedStream)
-Arrow.reap!
+Arrow.from_c_data
 Arrow.CArrowSchema
 Arrow.CArrowArray
 Arrow.CArrowArrayStream

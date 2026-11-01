@@ -87,8 +87,13 @@ code, and what Arrow 2.x can read of files Arrow 3.0 writes.
 - Reading list views, run-end encoding, month-day-nano intervals, and the canonical
   `arrow.uuid`, `arrow.bool8`, and `arrow.fixed_shape_tensor` extensions. Rewriting a
   table keeps these types.
-- The C data and C stream interfaces (`Arrow.to_c_data`, `Arrow.from_c_data`,
-  `Arrow.export_stream!`, `Arrow.from_c_stream`).
+- The C data and C stream interfaces: `Arrow.to_c_data(table)` and
+  `Arrow.export_stream!(streamptr, table)` export any Tables.jl table, built as
+  `Arrow.write` builds it, without copying an `Arrow.Table`'s columns or `Vector`s of
+  numbers; `Arrow.Table(schemaptr, arrayptr)`, `Arrow.Table(streamptr)`, and
+  `Arrow.Stream(streamptr)` import a record batch or a stream with the column types an
+  IPC read gives, reading fixed-width values in the producer's memory. Memory handed to
+  a consumer is freed once the consumer releases it, with nothing to call.
 - A TimeZones.jl extension that writes `ZonedDateTime` columns, and a CategoricalArrays
   extension that writes ordered `CategoricalArray`s as ordered dictionaries and reports
   `isordered` for ordered dictionary columns.
