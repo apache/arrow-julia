@@ -130,5 +130,5 @@ with ipc.new_stream(sys.stdout.buffer, table.schema) as writer:
     writer.write_table(table)       # julia: for batch in Arrow.Stream(stdin) ... end
 ```
 
-To exchange columns with another implementation in the same process without copying,
+To exchange columns with another implementation in the same process without IPC bytes,
 use the [C data interface](@ref "C data interface").

@@ -24,9 +24,9 @@
 The Arrow [C data interface](https://arrow.apache.org/docs/format/CDataInterface.html)
 and [C stream interface](https://arrow.apache.org/docs/format/CStreamInterface.html)
 hand tables to another Arrow implementation in the same process, such as pyarrow, Polars,
-or DuckDB through PythonCall, without copying them. The producer fills C structs
-(`ArrowSchema`, `ArrowArray`, `ArrowArrayStream`); the consumer moves them out and calls
-their `release` callbacks when it is done.
+or DuckDB through PythonCall, as pointers to Arrow buffers instead of IPC bytes. The
+producer fills C structs (`ArrowSchema`, `ArrowArray`, `ArrowArrayStream`); the consumer
+moves them out and calls their `release` callbacks when it is done.
 
 [`Arrow.export_stream!`](@ref) exports any Tables.jl table as a stream of record batches
 and [`Arrow.to_c_data`](@ref) as one record batch; [`Arrow.Table`](@ref) and
@@ -59,10 +59,13 @@ end
 t.name   # the strings and the missing value, as Arrow.Table(bytes) reads them
 ```
 
-A `pyarrow.RecordBatchReader` is what `polars.from_arrow` and DuckDB's
-`connection.register("name", reader)` consume, so the same export feeds them. The
-`Ref`, `GC.@preserve`, and `unsafe_convert` lines are the C ABI: the caller owns the
-struct's memory while the other side fills or empties it.
+`read_all()` reads every batch on the calling Julia thread. Polars and DuckDB take the
+pyarrow table it returns: `polars.from_arrow(pytable)`, or DuckDB's
+`connection.register("name", pytable)`. Give DuckDB the table, not the reader: DuckDB
+reads a reader on its own threads, which can deadlock with Julia's garbage collector
+(see [Threads](@ref cdata-threads)). The `Ref`, `GC.@preserve`, and `unsafe_convert`
+lines are the C ABI: the caller owns the struct's memory while the other side fills or
+empties it.
 
 One record batch crosses as two structs that Arrow.jl allocates, and comes back from
 structs the caller allocates:
@@ -88,10 +91,12 @@ instead of reading the whole stream, for a DuckDB or Polars result larger than m
 
 - Exports use [`Arrow.write`](@ref)'s column construction and keywords: `dictencode`,
   `stringview`, `largelists`, `metadata`, and `colmetadata` mean what they mean there,
-  and the consumer sees the same schema and values as from the IPC bytes. An
-  [`Arrow.Table`](@ref)'s columns and `Vector`s of numbers cross without copying;
-  strings, nested values, and other Julia values are built into Arrow buffers, as a write
-  builds them. `export_stream!` sends one record batch per `Tables.partitions` partition
+  and the consumer sees the same schema and values as from the IPC bytes. Numbers,
+  booleans, and validity bitmaps cross without copying, from `Vector`s of numbers and
+  from an [`Arrow.Table`](@ref)'s columns, inside lists and structs too. String and list
+  offsets are rebuilt and string bytes may be copied; dates, times, dictionary-encoded
+  columns, and other Julia values are built into new Arrow buffers, as a write builds
+  them. `export_stream!` sends one record batch per `Tables.partitions` partition
   (an `Arrow.Stream` is a partition per batch) and splits a batch only when its string
   data outgrows 32-bit offsets; `to_c_data` refuses a table that needs more than one
   batch.
@@ -120,12 +125,15 @@ yielded releases the producer's stream at once and refuses further column access
 for any stream; columns already taken stay valid. `deepcopy` of imported data shares
 its memory and its release with the original; use `copy`.
 
-## Threads
+## [Threads](@id cdata-threads)
 
 The callbacks Arrow.jl exports are Julia functions. A consumer that calls them from its
 own threads, as DuckDB's and Arrow C++'s thread pools do, makes Julia adopt those
-threads. The release callbacks take no locks, so they are safe to call from any thread;
-a stream's `get_next` builds the batch's structs on the calling thread.
+threads. Such a consumer can deadlock with Julia's garbage collector while the Julia
+thread that called it waits for it: a collection waits for that Julia thread, which
+waits for the consumer, whose threads wait inside the callbacks for the collection.
+DuckDB's scan of a `RecordBatchReader` works this way, so read the stream with
+`read_all()` on the calling thread first and give DuckDB the pyarrow table.
 
 On Julia 1.12 and 1.13 a process in which such a consumer thread ran a callback hangs
 at exit, when the consumer's library joins its threads (a Julia bug; 1.10 and 1.11 exit

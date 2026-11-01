@@ -217,13 +217,15 @@ Export a Tables.jl table as one record batch through the C data interface: an
 `ArrowSchema` and an `ArrowArray` that Arrow.jl allocates, whose struct array has one
 child per column. The columns are built as [`Arrow.write`](@ref) builds them, with the
 same keywords (`dictencode`, `stringview`, `largelists`, `metadata`, `colmetadata`), so a
-consumer reads what it would read from the IPC bytes; an [`Arrow.Table`](@ref)'s columns
-and `Vector`s of numbers cross without copying, and must not be modified or resized
-while the consumer reads them. The consumer moves or releases the two structs; the
-table's memory stays reachable until it has released the array, and what Arrow.jl
-allocated is freed by a later export or a garbage collection. A table that needs more
-than one record batch (several partitions, or string data past 2 GiB) is an
-`ArgumentError`; export it with [`Arrow.export_stream!`](@ref).
+consumer reads what it would read from the IPC bytes. Numbers, booleans, and validity
+bitmaps cross without copying, from `Vector`s of numbers and from an
+[`Arrow.Table`](@ref)'s columns, and must not be modified or resized while the consumer
+reads them; string and list offsets are rebuilt, and string bytes may be copied. The
+consumer moves or releases the two structs; the table's memory stays reachable until it
+has released the array, and what Arrow.jl allocated is freed by a later export or a
+garbage collection. A table that needs more than one record batch (several partitions,
+or string data past 2 GiB) is an `ArgumentError`; export it with
+[`Arrow.export_stream!`](@ref).
 """
 function to_c_data(tbl; kw...)
     sch, batches = _exportbatches(tbl; kw...)
