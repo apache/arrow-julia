@@ -202,7 +202,7 @@ end
             @test w.st.finished
             @test io.closes == Int(ownio)
             @test isopen(io) == !ownio
-            @test all(s -> s.zstd === nothing, w.st.states)
+            @test all(s -> s.zstd == C_NULL, w.st.states)
             @test close(w) === nothing
             @test io.closes == Int(ownio)
             io.closeerror = nothing
@@ -217,12 +217,12 @@ end
         Arrow.writebatch!(st, batch)
         task, states, _ = only(st.pending)
         wait(task)
-        @test any(s -> s.zstd !== nothing, states)
+        @test any(s -> s.zstd != C_NULL, states)
         failure = ErrorException("asynchronous output write failed")
         io.writeerror = failure
         @test caught(() -> Arrow.drainwrite!(st)) === failure
         Arrow.abortwrite!(st)
-        @test all(s -> s.zstd === nothing, states)
+        @test all(s -> s.zstd == C_NULL, states)
         @test isopen(io)
         close(io)
     end

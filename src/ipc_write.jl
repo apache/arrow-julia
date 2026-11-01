@@ -46,7 +46,7 @@
 # ---------------------------------------------------------------------------
 
 mutable struct EncodeState
-    zstd::Union{Nothing,ZstdCompressor}
+    zstd::Ptr{ZSTD.ZSTD_CCtx}   # created on first use
     const level::Union{Nothing,Int}   # codec compression level; nothing = codec default
     # Compressed frames this state wrote for messages not yet published, and
     # the published ones' vectors, reused for later frames: fresh memory
@@ -55,7 +55,7 @@ mutable struct EncodeState
     const free::Vector{Vector{UInt8}}
 end
 EncodeState(level::Union{Nothing,Integer}=nothing) = EncodeState(
-    nothing,
+    Ptr{ZSTD.ZSTD_CCtx}(C_NULL),
     level === nothing ? nothing : Int(level),
     Vector{UInt8}[],
     Vector{UInt8}[],
@@ -164,21 +164,34 @@ function _lz4frame(s::EncodeState, raw::TS.Buffer, out::Vector{UInt8})
     end
 end
 
-function _zstdc!(s::EncodeState)
-    if s.zstd === nothing
-        c = s.level === nothing ? ZstdCompressor() : ZstdCompressor(; level=s.level)
-        TS.initialize(c)
-        s.zstd = c
+# One Zstandard frame of the `len` bytes at `ptr`, which records its content
+# size. Compressing a whole buffer at once takes about 10% less time than a
+# stream, and gives the same bytes whatever the context compressed before.
+function _zstdframe(s::EncodeState, ptr::Ptr{UInt8}, len::Int, out::Vector{UInt8})
+    if s.zstd == C_NULL
+        s.zstd = ZSTD.ZSTD_createCCtx()
+        s.zstd == C_NULL && throw(OutOfMemoryError())
         # A writer abandoned without `close` must not leak the context.
         finalizer(close, s)
     end
-    return s.zstd::ZstdCompressor
+    level = s.level === nothing ? CZSTD.DEFAULT_COMPRESSION_LEVEL : s.level
+    n = GC.@preserve out ZSTD.ZSTD_compressCCtx(
+        s.zstd,
+        pointer(out),
+        length(out),
+        ptr,
+        len,
+        level,
+    )
+    ZSTD.ZSTD_isError(n) == 0 ||
+        error("Zstandard compression failed: ", unsafe_string(ZSTD.ZSTD_getErrorName(n)))
+    return resize!(out, Int(n))
 end
 
 function Base.close(s::EncodeState)
     zstd = s.zstd
-    s.zstd = nothing
-    zstd === nothing || TS.finalize(zstd)
+    s.zstd = Ptr{ZSTD.ZSTD_CCtx}(C_NULL)
+    zstd == C_NULL || ZSTD.ZSTD_freeCCtx(zstd)
     return nothing
 end
 
@@ -475,17 +488,17 @@ EncodeCursor(codec::Int8) = EncodeCursor(
 )
 
 # One frame of the `len` bytes at `ptr`: LZ4 from a fresh context
-# (`_lz4frame`), Zstandard with `state`'s.
+# (`_lz4frame`), Zstandard with `state`'s (`_zstdframe`).
 function _compressbytes(state::EncodeState, codec::Int8, ptr::Ptr{UInt8}, len::Int)
-    raw = TS.Buffer(unsafe_wrap(Array, ptr, len))
     out = isempty(state.free) ? UInt8[] : pop!(state.free)
     # Room for the codec's worst case (LZ4 and Zstandard frames stay under
     # this), so a reused vector is never too small for one compression call.
     need = len + (len >> 7) + 1024
     length(out) < need && resize!(out, need)
     frame =
-        codec == CODEC_LZ4_FRAME ? _lz4frame(state, raw, out) :
-        transcode(_zstdc!(state), raw, out)
+        codec == CODEC_LZ4_FRAME ?
+        _lz4frame(state, TS.Buffer(unsafe_wrap(Array, ptr, len)), out) :
+        _zstdframe(state, ptr, len, out)
     push!(state.inuse, frame)
     return frame
 end

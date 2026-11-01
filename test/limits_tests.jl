@@ -17,7 +17,7 @@
 # Reader allocation budgets: per-batch streams, compressed input, contention.
 
 using Test, Arrow, Tables
-const ZstdCompressor = Arrow.ZstdCompressor
+const ZstdCompressor = Arrow.CZSTD.ZstdCompressor
 
 # Decode one compressed buffer whose column reads `needed` bytes (-1: unknown).
 function decodebuffer(payload, declared, needed; codec=Arrow.CODEC_ZSTD, budget)

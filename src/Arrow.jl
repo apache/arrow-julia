@@ -55,7 +55,6 @@ import CodecLz4
 import CodecZstd
 import TranscodingStreams
 using CodecLz4: LZ4FrameCompressor
-using CodecZstd: ZstdCompressor
 
 const CLZ4 = CodecLz4
 const CZSTD = CodecZstd

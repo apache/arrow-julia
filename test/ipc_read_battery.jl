@@ -162,7 +162,7 @@ function ipc_read_battery()
     # declared size, so a compressed bomb cannot force a larger allocation.
     for (codecname, codec, compressor) in (
         ("lz4", CODEC_LZ4_FRAME, Arrow.LZ4FrameCompressor),
-        ("zstd", CODEC_ZSTD, Arrow.ZstdCompressor),
+        ("zstd", CODEC_ZSTD, Arrow.CZSTD.ZstdCompressor),
     )
         emptyframe = transcode(compressor, UInt8[])
         @assert isempty(_decode_fixture(codec, emptyframe, 0))

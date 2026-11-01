@@ -32,13 +32,13 @@ const SENTINEL = Int64(1_000_001)
     len >= 8 &&
         unsafe_load(Ptr{Int64}(ptr)) == $SENTINEL &&
         error("injected compression failure")
-    raw = TS.Buffer(unsafe_wrap(Array, ptr, len))
     out = isempty(state.free) ? UInt8[] : pop!(state.free)
     need = len + (len >> 7) + 1024
     length(out) < need && resize!(out, need)
     frame =
-        codec == CODEC_LZ4_FRAME ? _lz4frame(state, raw, out) :
-        transcode(_zstdc!(state), raw, out)
+        codec == CODEC_LZ4_FRAME ?
+        _lz4frame(state, TS.Buffer(unsafe_wrap(Array, ptr, len)), out) :
+        _zstdframe(state, ptr, len, out)
     push!(state.inuse, frame)
     return frame
 end

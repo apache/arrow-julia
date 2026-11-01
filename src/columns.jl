@@ -834,6 +834,8 @@ function _forcestrings(p::_PendingStrings)
             _uninferred(_foreach, build!, length(b.chunks), p.ntasks)
             c = _finishbuild(b)
             @atomic :release p.column = c
+            # The chunks hold the batches' offsets, decompressed ones included.
+            empty!(b.chunks)
         end
         c
     end
