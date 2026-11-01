@@ -1495,7 +1495,11 @@ function _conformcolumn(
         (err isa ArgumentError && mismatch !== nothing) || rethrow()
         throw(
             ArgumentError(
-                "column $name does not conform to the existing schema: $mismatch",
+                "column $name does not conform to the existing schema: $mismatch. " *
+                "The first table written fixed each column's type and nullability: " *
+                "convert the column to the schema's type, or, to add missing values " *
+                "to a column that had none, start the stream with " *
+                "Arrow.Writer(path; file=false), whose columns are all nullable",
             ),
         )
     end
@@ -1689,6 +1693,12 @@ function _freshcolumn(
 end
 
 "An Arrow type's name for messages, as pyarrow spells it."
+# An Arrow type's name, and for a leaf field the Julia type it reads as.
+function _typename(f::AC.Field)
+    isempty(f.children) || return _typename(f.type)
+    return "$(_typename(f.type)) ($(Base.nonmissingtype(_declaredeltype(f))))"
+end
+
 function _typename(t::AC.ArrowType)
     unit(u) =
         u == AC.SECOND ? "s" :
@@ -1737,7 +1747,7 @@ function _conformancemismatch(
     expected.name == actual.name || return "$path is named $(repr(actual.name))"
     if !AC.typeequal(expected.type, actual.type)
         expected.type isa AC.NullType &&
-            return "$path writes as $(_typename(actual.type)), but the schema " *
+            return "$path writes as $(_typename(actual)), but the schema " *
                    "declared it null because it held only missing values (or no " *
                    "rows) when the schema was set; give it a concrete element type"
         expected.type isa AC.UnionType &&
@@ -1746,13 +1756,9 @@ function _conformancemismatch(
         actual.type isa AC.NullType &&
             !expected.nullable &&
             return "$path holds only missing values, but the schema field is not " *
-                   "nullable; the first table fixed it so (a one-table Arrow.write " *
-                   "declares nullability from the values, an Arrow.Writer declares every " *
-                   "field nullable unless created with nullable=false): write the stream " *
-                   "with Arrow.Writer(sink; file=false), or start it from a table whose " *
-                   "values admit missing"
-        return "$path writes as $(_typename(actual.type)), but the schema has " *
-               _typename(expected.type)
+                   "nullable (a one-table Arrow.write declares nullability from its values)"
+        return "$path writes as $(_typename(actual)), but the schema has " *
+               _typename(expected)
     end
     actual.nullable &&
         !expected.nullable &&

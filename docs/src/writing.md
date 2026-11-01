@@ -171,9 +171,11 @@ DictionaryReplacement feature, which some readers (nanoarrow) refuse.
 ## Write in parts
 
 [`Arrow.Writer`](@ref) writes one output from several tables, such as batches that do
-not fit in memory together. Each `Arrow.write(writer, table)` writes that table's record
-batches before it returns; `close` finishes the output, and the function form always
-closes it.
+not fit in memory together. Each `Arrow.write(writer, table)` encodes that table's record
+batches and hands them to the sink before it returns; `close` finishes the output, and the
+function form always closes it. A writer to a path writes nothing to that path until
+`close`: an existing file is replaced then, from a temporary file beside it, and a new
+file holds no complete output before.
 
 ```@example writing
 Arrow.Writer(path) do writer
@@ -189,8 +191,9 @@ missing values. Later tables convert to the first table's types exactly: an `Int
 column fits an `Int64` one, but a `Float64` column does not. A table that does not conform is
 an error naming the column and both types; the batches written before it stay in the
 output and the writer stays open. A writer closed before it receives a table writes an
-output with no columns; a writer that is never closed leaves a file without its footer or
-a stream without its end marker.
+output with no columns. A writer that is never closed leaves an `IO` without its footer or
+end marker, and leaves a path as it was, beside a stray temporary file (`jl_` and random
+letters) or a new file without its footer or end marker.
 
 [`Arrow.append(path, table)`](@ref Arrow.append) adds a table's record batches to an
 existing stream-format file (or a seekable `IO`), under the same rules; a missing or empty

@@ -124,7 +124,11 @@ end
 function _constructsharedpart(name, v, ::Type{D}) where {D<:DataDecimals.Decimal}
     isconcretetype(D) || throw(
         ArgumentError(
-            "an empty decimal column needs a concrete precision, scale, and storage type",
+            isempty(v) ?
+            "column $name is an empty decimal column, which needs a concrete " *
+            "precision, scale, and storage type" :
+            "column $name mixes decimal types ($D); an Arrow decimal column has one " *
+            "precision and scale, so convert its values to one Decimal{P,S}",
         ),
     )
     P, S, _ = D.parameters

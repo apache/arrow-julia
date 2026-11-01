@@ -281,6 +281,11 @@ so some types change on the way back while the values stay equal:
 | `arrow.bool8`, `arrow.json` | Bool, Utf8 |
 | Interval(year-month or day-time) | Interval(month-day-nano) |
 
+A rewrite keeps every type except Int(128) and UInt(128), which Polars and Arrow 2.x
+write and pyarrow cannot read: they rewrite as FixedSizeBinary(16) labelled
+`JuliaLang.Int128` or `JuliaLang.UInt128`, as a fresh Julia `Int128` column writes, which
+Arrow.jl reads back as the same values and Polars reads as binary.
+
 A union with two children of the same type cannot be rewritten as it was, because its
 values do not say which child they came from; writing it is an error that suggests
 `Arrow.write(path, DataFrame(table))`. A dictionary column nested inside another column
