@@ -210,10 +210,21 @@ end
 
 function _scan_main()
     @assert !_tables_equal((x=Any[1],), (x=Int64[1],))
-    source = readstream(_mixed_two_partitions_bytes())
-    filebytes = writefile(source)
+    streambytes = _mixed_two_partitions_bytes()
+    filebytes = writefile(readstream(streambytes))
     full = Arrow.Table(copy(filebytes))
-    sources(bytes) = (copy(bytes), SourceFile(BytesSource(copy(bytes)); tailbytes=32))
+    # Every kind of source a scan reads: a mapped path, a byte vector, an IO,
+    # and a byte-range source.
+    function sources(bytes)
+        path = tempname()
+        write(path, bytes)
+        return (
+            path,
+            copy(bytes),
+            IOBuffer(copy(bytes)),
+            SourceFile(BytesSource(copy(bytes)); tailbytes=32),
+        )
+    end
 
     scans = Tables.Scan[
         Tables.Scan(),
@@ -243,7 +254,7 @@ function _scan_main()
     ]
     for scan in scans
         want = Tables.scan(full, scan)
-        for src in sources(filebytes)
+        for src in (sources(filebytes)..., sources(streambytes)...)
             got = Arrow.Table(src; scan=scan)
             @assert _tables_equal(got, want) sprint(show, scan)
         end
@@ -334,8 +345,8 @@ function _scan_main()
 
     # A column's element type is a property of the SCHEMA, not of how many
     # rows a scan kept: a zero limit, an offset past the input, and a decoded
-    # filter that keeps nothing have exactly the schema of the full scan, on
-    # both the mapped and the ranged path.
+    # filter that keeps nothing have exactly the schema of the full scan, from
+    # every kind of source.
     fullschema = Tables.schema(Arrow.Table(copy(filebytes); scan=Tables.Scan()))
     for emptyscan in (
         Tables.Scan(limit=0),
@@ -348,7 +359,7 @@ function _scan_main()
             @assert _schemas_equal(Tables.schema(got), fullschema) sprint(show, emptyscan)
         end
     end
-    println("empty scans keep the full scan's schema on both paths ✓")
+    println("empty scans keep the full scan's schema from every source ✓")
 
     # The bound scan is consumed exactly: selection, renames, filter, window,
     # and type overrides all cross the facade once, with no reconstructed
