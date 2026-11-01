@@ -738,7 +738,7 @@ end
         e isa InvalidStateException
     end
     @assert collect(col) == 1:10
-    _reap!()
+    _reapreleased!()
     @assert _registered(key)
     return key
 end

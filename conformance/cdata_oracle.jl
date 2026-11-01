@@ -457,6 +457,7 @@ if _CDATA_ORACLE_STANDALONE && length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHI
         GC.gc()
         GC.gc()
         Arrow._reap!()
+        Arrow._reap!()
         leaked = length(Arrow.EXPORTS)
         push!(
             verdicts,

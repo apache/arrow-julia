@@ -186,5 +186,6 @@ PrecompileTools.@setup_workload begin
         # Collected and reaped, so the image saves no export.
         GC.gc(true)
         _reap!()
+        _reap!()
     end
 end

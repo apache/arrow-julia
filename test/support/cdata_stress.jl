@@ -68,8 +68,10 @@ end
 _registry_count() = lock(REGISTRY_LOCK) do
     length(EXPORTS)
 end
+"Free every export released before the call; a reap frees only what an earlier reap saw released."
+_reapreleased!() = _reap!() + _reap!()
 "Reap, then count what is still registered."
-_drained() = (_reap!(); _registry_count())
+_drained() = (_reapreleased!(); _registry_count())
 "The registry key of the export whose struct is at `p`."
 _exportkey(p::Ptr) = Ptr{Int64}(unsafe_load(p).private_data)
 _registered(key::Ptr{Int64}) = lock(REGISTRY_LOCK) do
@@ -124,7 +126,7 @@ function _threaded_cdata_stress()
     notify(start)
     foreach(fetch, releasers)
     reaped_by_task = fetch.(reapers)
-    reaped = sum(reaped_by_task) + _reap!()
+    reaped = sum(reaped_by_task) + _reapreleased!()
     @assert reaped == n (reaped, reaped_by_task, _registry_count())
     @assert _registry_count() == 0
 

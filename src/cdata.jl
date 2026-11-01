@@ -29,8 +29,7 @@
 #     object, because consumers call it from their own threads and from inside
 #     GC finalizers. The Julia side keeps each export's roots (the columns,
 #     whose regions keep the buffers alive) and mallocs in `EXPORTS` until the
-#     count reaches zero; a later export, or a garbage collection, frees
-#     them.
+#     count reaches zero; later exports or garbage collections free them.
 #
 #   * Import: the moved ArrowArray becomes ONE ForeignOwner shared by every
 #     child/dictionary BufferSlice (a single release for the whole tree).
@@ -348,11 +347,13 @@ end
 # One export's Julia roots and native allocations. `live` is a malloc'd count
 # of the C nodes the consumer has not released; every node's `private_data`
 # points at it, so a release callback needs no Julia object. The 8 bytes after
-# the count hold an exported stream's last error message.
+# the count hold an exported stream's last error message. `seen` is set by the
+# reap that first finds every node released; the next reap frees the export.
 mutable struct Export
     const roots::Vector{Any}
     const mallocs::Vector{Ptr{Cvoid}}
     const live::Ptr{Int64}
+    seen::Bool
 end
 
 const EXPORTS = Dict{Ptr{Int64},Export}()
@@ -369,7 +370,7 @@ function _newexport(roots::Vector{Any})
     reap && _reap!()
     live = Ptr{Int64}(Libc.calloc(2, 8))
     live == C_NULL && throw(OutOfMemoryError())
-    return Export(roots, Ptr{Cvoid}[live], live)
+    return Export(roots, Ptr{Cvoid}[live], live, false)
 end
 
 function _malloc!(e::Export, n::Integer)
@@ -389,7 +390,7 @@ function _free!(e::Export)
 end
 
 # An object whose finalizer reaps and then registers itself again, so a
-# consumer's releases free memory at the next garbage collection even when
+# consumer's releases free memory at later garbage collections even when
 # nothing exports again. Created once, by the first export.
 mutable struct _ReapHook end
 const _REAP_HOOK_ARMED = Ref(false)
@@ -433,18 +434,22 @@ function _register!(e::Export)
     return nothing
 end
 
-# Free every export whose C nodes have all been released, and return how many.
-# Runs from `_newexport` (see `_EXPORTS_UNTIL_REAP`) and from `_ReapHook`, so no
-# caller needs to.
+# Free every export that an earlier reap found with all its C nodes released, mark
+# the ones released since, and return how many it freed. A release callback counts
+# its node off just before it returns, and the consumer may then read the struct it
+# released, so the reap that first sees an export released keeps it. Runs from
+# `_newexport` (see `_EXPORTS_UNTIL_REAP`) and from `_ReapHook`, so no caller needs to.
 function _reap!()
     done = Export[]
     lock(REGISTRY_LOCK) do
         unreleased = 0
         for e in values(EXPORTS)
-            if unsafe_load(e.live, :sequentially_consistent) == 0
+            if unsafe_load(e.live, :sequentially_consistent) != 0
+                unreleased += 1
+            elseif e.seen
                 push!(done, e)
             else
-                unreleased += 1
+                e.seen = true
             end
         end
         for e in done
@@ -670,7 +675,7 @@ The low-level form of [`Arrow.to_c_data`](@ref): export one column, an
 that Arrow.jl allocates, pointing at `data`'s buffers without copying them. The
 column is validated before it is exported. The consumer moves or releases the
 two structs; `data` stays reachable until it has released the array, and what
-Arrow.jl allocated is freed by a later export or a garbage collection.
+Arrow.jl allocated is freed by later exports or garbage collections.
 """
 function to_c_data(f::Field, d::ArrayData)
     validate_semantic(f, d)

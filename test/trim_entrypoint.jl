@@ -125,7 +125,9 @@ function exercise_cdata()::Nothing
         caught = e isa InvalidStateException
     end
     checked(caught, "use after cdata release accepted")
-    # The consumer's release marks the export; the reaper frees it.
+    # The consumer's release counts the export off; a reap sees it released and the
+    # next one frees it.
+    _reap!()
     _reap!()
     checked(isempty(EXPORTS), "export registry not empty after reap")
     return nothing

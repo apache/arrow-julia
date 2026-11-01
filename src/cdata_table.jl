@@ -222,8 +222,8 @@ bitmaps cross without copying, from `Vector`s of numbers and from an
 [`Arrow.Table`](@ref)'s columns, and must not be modified or resized while the consumer
 reads them; string and list offsets are rebuilt, and string bytes may be copied. The
 consumer moves or releases the two structs; the table's memory stays reachable until it
-has released the array, and what Arrow.jl allocated is freed by a later export or a
-garbage collection. A table that needs more than one record batch (several partitions,
+has released the array, and what Arrow.jl allocated is freed by later exports or
+garbage collections. A table that needs more than one record batch (several partitions,
 or string data past 2 GiB) is an `ArgumentError`; export it with
 [`Arrow.export_stream!`](@ref).
 """

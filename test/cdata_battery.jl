@@ -27,14 +27,14 @@ function cdata_battery()
 
     # The export, not the caller's Julia variables, keeps the source column
     # and its buffers alive while the consumer holds raw C pointers.
-    before = _registry_count()
+    before = _drained()
     sp, ap, dataref, regionref = _export_and_forget()
     GC.gc(true)
     @assert dataref.value !== nothing
     @assert regionref.value !== nothing
     rootedf, rootedd = from_c_data(sp, ap)
     @assert materialize(rootedf, rootedd) == [1, 2]
-    @assert _reap!() == 0
+    @assert _drained() == before + 1
     release!(rootedd.owner::ForeignOwner)
     @assert _drained() == before
     println("an export roots its Julia sources across GC ✓")
@@ -689,8 +689,7 @@ function cdata_battery()
     _store_field!(achild, :release, Ptr{Cvoid}(C_NULL))
     _release_c!(sp)
     _release_c!(ap)
-    _reap!()
-    @assert _registry_count() == 1
+    @assert _drained() == 1
     GC.@preserve smoved amoved begin
         smovedp = Base.unsafe_convert(Ptr{CArrowSchema}, smoved)
         amovedp = Base.unsafe_convert(Ptr{CArrowArray}, amoved)
@@ -711,11 +710,25 @@ function cdata_battery()
     _release_c!(ap)
     @assert unsafe_load(ap).release == C_NULL
     _release_c!(ap)   # inert repeat
-    _reap!()
-    @assert _registry_count() == 1
+    @assert _drained() == 1
     _release_c!(sp)
     @assert _drained() == 0
     println("C release entrypoints are exactly-once and repeats are inert ✓")
+
+    # A consumer may read the struct it just released (Arrow C++ checks that its
+    # `release` is NULL), so the reap that first sees an export released keeps its
+    # memory and a later reap frees it. Collections are off so no reap runs between.
+    GC.enable(false)
+    try
+        key = _released_export_key()
+        _reap!()
+        @assert _registered(key)
+        _reap!()
+        @assert !_registered(key)
+    finally
+        GC.enable(true)
+    end
+    println("an export outlives the reap that first sees it released ✓")
 
     # Consumers call the release callbacks from their own threads and from inside
     # garbage-collector finalizers, so they allocate nothing. (Julia 1.10's call
@@ -723,7 +736,7 @@ function cdata_battery()
     # the same body compiled in the session allocates none.)
     _release_allocations()
     VERSION >= v"1.11" && @assert _release_allocations() == 0
-    # With nothing exported afterwards, a garbage collection frees what a
+    # With nothing exported afterwards, garbage collections free what a
     # consumer released.
     key = _released_export_key()
     for _ = 1:10
@@ -732,7 +745,7 @@ function cdata_battery()
         yield()
     end
     @assert !_registered(key)
-    println("release callbacks allocate nothing; a collection frees released exports ✓")
+    println("release callbacks allocate nothing; collections free released exports ✓")
 
     # A consumer that keeps every batch it pulls (pyarrow's `read_all`) pays the
     # same for each export however many it holds: exports on top of 50,000 held
@@ -830,8 +843,7 @@ function cdata_battery()
     _store_field!(adict, :release, Ptr{Cvoid}(C_NULL))
     _release_c!(sp)
     _release_c!(ap)
-    _reap!()
-    @assert _registry_count() == 1
+    @assert _drained() == 1
     GC.@preserve smoved amoved begin
         movedf, movedd = from_c_data(
             Base.unsafe_convert(Ptr{CArrowSchema}, smoved),
@@ -874,8 +886,7 @@ function cdata_battery()
     _store_field!(aentries, :release, Ptr{Cvoid}(C_NULL))
     _release_c!(sp)
     _release_c!(ap)
-    _reap!()
-    @assert _registry_count() == 1
+    @assert _drained() == 1
     GC.@preserve smoved amoved begin
         movedf, movedd = from_c_data(
             Base.unsafe_convert(Ptr{CArrowSchema}, smoved),
@@ -905,8 +916,7 @@ function cdata_battery()
     end
     _release_c!(sp)
     _release_c!(ap)
-    _reap!()
-    @assert _registry_count() == 1
+    @assert _drained() == 1
     for (i, expected_values) in enumerate(([1, 2], [3, 4]))
         GC.@preserve smoved amoved begin
             movedf, movedd = from_c_data(
@@ -928,7 +938,7 @@ function cdata_battery()
     ownerref = WeakRef(ed2.owner)
     GC.gc(true)
     @assert ownerref.value !== nothing
-    @assert _registry_count() == 1          # the export still roots the source
+    @assert _drained() == 1          # the export still roots the source
     @assert isempty(materialize(ef2, ed2))
     release!(ed2.owner::ForeignOwner)
     @assert _drained() == 0
@@ -1720,7 +1730,7 @@ function cdata_battery()
         e isa InvalidStateException
     end
     release!(dcopy.owner::ForeignOwner)
-    _reap!()
+    _reapreleased!()
     @assert !_registered(dkey)
     println("deepcopy of imported data shares its owner ✓")
 
@@ -1742,7 +1752,7 @@ function cdata_battery()
         @assert storage.value !== nothing
         @assert materialize(Int64, resizedf2, resizedd2) == 1:1000
         release!(resizedd2.owner::ForeignOwner)
-        _reap!()
+        _reapreleased!()
         @assert !_registered(rkey)
         println("resizing an exported vector keeps the consumer's bytes alive ✓")
     end
