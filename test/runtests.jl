@@ -56,6 +56,7 @@ include("detached_values_tests.jl")
 # removed-keyword warnings, typed scan overrides) and the ArrowTimeZonesExt
 # child suite.
 include("compat_tests.jl")
+include("dataframes_tests.jl")
 include("invalidations.jl")
 
 # The incremental writer (Arrow.Writer) and stream append (Arrow.append).

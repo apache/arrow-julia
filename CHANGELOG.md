@@ -94,6 +94,8 @@ code, and what Arrow 2.x can read of files Arrow 3.0 writes.
   `isordered` for ordered dictionary columns.
 - A FileIO.jl extension: `load("x.arrow")` reads an `Arrow.Table` and
   `save("x.arrow", table)` writes one.
+- A DataFrames.jl extension that precompiles reading into and writing from a
+  `DataFrame`, so the first one in a session takes about 0.1 s rather than 0.3 s.
 
 ### Changed
 
