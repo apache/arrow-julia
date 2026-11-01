@@ -68,8 +68,10 @@ Base.@nospecializeinfer function _nativepart(
     # With TimeZones loaded, a fresh ZonedDateTime column writes as a
     # timezone-declared millisecond timestamp (ext/ArrowTimeZonesExt.jl)
     # instead of reflecting the zone's whole transition table as a struct.
-    zoned = _uninferred(_zonednativepart, name, v, T)
-    zoned === nothing || return zoned
+    if _zonedwritertype(T)
+        zoned = _uninferred(_zonednativepart, name, v, T)
+        zoned === nothing || return zoned
+    end
     if _eltypeof(v) === Missing
         t = AC.NullType()
         return AC.Field(name, t; nullable=true),
@@ -3567,6 +3569,35 @@ function _checkretainedidentity(f::AC.Field, t::AC.ArrowType, v::AbstractVector)
     return Fp
 end
 
+# The builder of a retained layout other than Null, Union, and the primitive
+# types, or nothing.
+_retainedbuilder(t::AC.ArrowType) =
+    t isa Union{AC.DateType,AC.TimestampType,AC.TimeType,AC.DurationType} ?
+    _retainedtemporal :
+    t isa Union{AC.Utf8Type,AC.BinaryType} ? _retainedvarbytes :
+    t isa AC.ViewType ? _retainedview :
+    t isa AC.FixedSizeBinaryType ? _retainedfixedbytes :
+    t isa AC.DecimalType ? _retaineddecimal :
+    t isa AC.IntervalType ? _retainedinterval :
+    t isa Union{AC.ListType,AC.ListViewType} ? _listpart :
+    t isa AC.FixedSizeListType ? _fixedlistpart :
+    t isa AC.StructType ? _structpart : t isa AC.MapType ? _mappart :
+    t isa AC.RunEndEncodedType ? _retainedree : nothing
+
+function _retainedtemporal(f::AC.Field, v::AbstractVector, context::_WriterContext)
+    t = f.type
+    context.lowered && return _rebuildtemporal(f, _loweredstorage(t, v, f.name))
+    _checkretainedidentity(f, t, v)
+    return _rebuildtemporal(f, _retainedstorage(t, v, f.name))
+end
+_retainedvarbytes(f::AC.Field, v::AbstractVector, context::_WriterContext) =
+    _retainedvarbytes(f, v, context.pool)
+_retainedview(f::AC.Field, v::AbstractVector, ::_WriterContext) = _retainedview(f, v)
+_retainedfixedbytes(f::AC.Field, v::AbstractVector, ::_WriterContext) =
+    _retainedfixedbytes(f, v)
+_retaineddecimal(f::AC.Field, v::AbstractVector, ::_WriterContext) = _retaineddecimal(f, v)
+_retainedinterval(f::AC.Field, v::AbstractVector, ::_WriterContext) = _retainedinterval(f, v)
+
 "One part under a retained field: the identity check, then the type's builder."
 function _constructretainedpart(f::AC.Field, v::AbstractVector, context::_WriterContext)
     t = f.type
@@ -3587,26 +3618,15 @@ function _constructretainedpart(f::AC.Field, v::AbstractVector, context::_Writer
         d = AC.ArrayData(t, length(v), AC.BufferSlice[]; nullcount=length(v))
         return AC.Field(f.name, t; nullable=f.nullable, metadata=_fieldmetadata(f)), d
     end
-    if t isa Union{AC.DateType,AC.TimestampType,AC.TimeType,AC.DurationType}
-        context.lowered && return _rebuildtemporal(f, _loweredstorage(t, v, f.name))
+    t isa Union{AC.DateType,AC.TimestampType,AC.TimeType,AC.DurationType} ||
         _checkretainedidentity(f, t, v)
-        return _rebuildtemporal(f, _retainedstorage(t, v, f.name))
-    end
-    _checkretainedidentity(f, t, v)
-    t isa Union{AC.Utf8Type,AC.BinaryType} && return _retainedvarbytes(f, v, context.pool)
-    t isa AC.ViewType && return _retainedview(f, v)
-    t isa AC.FixedSizeBinaryType && return _retainedfixedbytes(f, v)
-    t isa AC.DecimalType &&
-        return _uninferred(_retaineddecimal, f, v)::Tuple{AC.Field,AC.ArrayData}
-    t isa AC.IntervalType &&
-        return _uninferred(_retainedinterval, f, v)::Tuple{AC.Field,AC.ArrayData}
-    t isa Union{AC.ListType,AC.ListViewType} && return _listpart(f, v, context)
-    t isa AC.FixedSizeListType && return _fixedlistpart(f, v, context)
-    t isa AC.StructType && return _structpart(f, v, context)
-    t isa AC.MapType && return _mappart(f, v, context)
-    t isa AC.RunEndEncodedType && return _retainedree(f, v, context)
+    # Each layout's builder compiles for the columns that reach it, not for
+    # every column type this method sees (see `_uninferred`).
+    builder = _retainedbuilder(t)
+    builder === nothing ||
+        return _uninferred(builder, f, v, context)::Tuple{AC.Field,AC.ArrayData}
     if t isa AC.UnionType
-        built = _constructfacadeunion(f, v, context)
+        built = _uninferred(_constructfacadeunion, f, v, context)
         built === nothing || return built
         throw(
             ArgumentError(
@@ -4173,7 +4193,9 @@ function _dictcolumnparts(name, fieldname, part, poolhint, retained, growable, c
     indices =
         length(selected) == length(remap) ? candidateindices :
         _remapdictionaryindices(candidateindices, remap)
-    retained === nothing && return _newdictfromdata(
+    # `indices`' type is known at run time; see `_uninferred`.
+    retained === nothing && return _uninferred(
+        _newdictfromdata,
         fieldname,
         valuefield,
         valuedata,
@@ -4184,15 +4206,16 @@ function _dictcolumnparts(name, fieldname, part, poolhint, retained, growable, c
         indextype=_dictindextype(growable ? max(valuedata.len, 1 << 16) : valuedata.len),
         # ArrowCategoricalArraysExt adds an `_isordered` method.
         ordered=_uninferred(_isordered, part)::Bool,
-    )
-    return _retaineddictfromdata(
+    )::Tuple{AC.Field,AC.ArrayData}
+    return _uninferred(
+        _retaineddictfromdata,
         retained,
         valuefield,
         valuedata,
         Int(valuedata.len),
         indices,
         fieldname,
-    )
+    )::Tuple{AC.Field,AC.ArrayData}
 end
 
 "A non-dictionary column of `_constructcolumnparts`: its field and data."
