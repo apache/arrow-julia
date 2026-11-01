@@ -412,8 +412,7 @@ end
 "Row count of batch `i` from Block metadata alone — no body access."
 function _batchrows(f::ArrowFile, i::Int, budget::AllocationBudget)
     fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
-    fm.version == f.schemaversion ||
-        throw(ValidationError("IPC metadata version changes within the file"))
+    _filemetadataversion(f.schemaversion, fm.version)
     rejectexperimentalcompression(fm)
     fm.msg.header isa Meta.RecordBatch ||
         throw(ValidationError("footer record block is not a record batch"))

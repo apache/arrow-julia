@@ -621,7 +621,7 @@ function ipc_write_battery()
     forgedbodylen = _vi64(forgedfooter, forgedblocks + 16)
     @assert forgedbodylen >= 8
     _write_i64!(forgedcollision, forgedfooterstart + forgedblocks + 16, forgedbodylen - 8)
-    @assert _rejects(() -> readfile(forgedcollision))
+    @assert _rejects(() -> readfile(forgedcollision)[1])
 
     # Coordinating the same lie in Message.bodyLength is still insufficient:
     # the RecordBatch buffer table proves that the excluded bytes are data.
@@ -632,7 +632,7 @@ function ipc_write_battery()
     forgedmessagetable = _vtable(forgedmessage, Int64(_vu32(forgedmessage, 0)))
     forgedmessagebody = _vfield(forgedmessagetable, 3, 8; required=true)
     _write_i64!(coordinated, forgedoffset + 8 + forgedmessagebody, forgedbodylen - 8)
-    @assert _rejects(() -> readfile(coordinated))
+    @assert _rejects(() -> readfile(coordinated)[1])
 
     _, _, _, _, footreserve = verify_footer(simplefooter, Limits())
     tightbudget = max(simplefooterlen, footreserve)

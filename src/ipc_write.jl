@@ -1888,235 +1888,6 @@ function _validateblockindex(dictblocks, recordblocks, dataend::Int64; datastart
     return indexedend
 end
 
-# The `_block*` traversal below mirrors the schema-blind vtable primitives of
-# src/metadata/VerifierRuntime.jl (`_vtable`/`_vfield`/`_vref`/`_vvector`/
-# `_vrange`) over a `BufferSlice` source with block-specific diagnostics; the
-# two must change in lockstep.
-function _blockrange(b::BufferSlice, pos::Int64, len::Int64, what::AbstractString)
-    (pos >= 0 && len >= 0 && len <= b.len && pos <= b.len - len) ||
-        throw(ValidationError("$what escapes block metadata"))
-    return nothing
-end
-
-function _blockload(b::BufferSlice, ::Type{T}, pos::Int64, what::AbstractString) where {T}
-    _blockrange(b, pos, Int64(sizeof(T)), what)
-    return AC.loadat(b, T, pos)
-end
-
-function _blockadd(a::Int64, b::Int64, what::AbstractString)
-    try
-        return AC.checked_add(a, b)
-    catch e
-        e isa OverflowError || rethrow()
-        throw(ValidationError("$what overflows"))
-    end
-end
-
-function _blocksub(a::Int64, b::Int64, what::AbstractString)
-    try
-        return AC.checked_sub(a, b)
-    catch e
-        e isa OverflowError || rethrow()
-        throw(ValidationError("$what overflows"))
-    end
-end
-
-function _blockmul(a::Int64, b::Int64, what::AbstractString)
-    try
-        return AC.checked_mul(a, b)
-    catch e
-        e isa OverflowError || rethrow()
-        throw(ValidationError("$what overflows"))
-    end
-end
-
-struct _BlockTable
-    metadata::BufferSlice
-    pos::Int64
-    vpos::Int64
-    vlen::Int64
-    olen::Int64
-end
-
-function _blocktable(metadata::BufferSlice, pos::Int64, what::AbstractString)
-    pos % 4 == 0 || throw(ValidationError("$what is misaligned"))
-    back = Int64(_blockload(metadata, Int32, pos, what))
-    back != 0 || throw(ValidationError("$what has a zero vtable offset"))
-    vpos = _blocksub(pos, back, what)
-    vpos % 2 == 0 || throw(ValidationError("$what vtable is misaligned"))
-    vlen = Int64(_blockload(metadata, UInt16, vpos, what))
-    olen = Int64(_blockload(metadata, UInt16, _blockadd(vpos, Int64(2), what), what))
-    vlen >= 4 && iseven(vlen) || throw(ValidationError("invalid $what vtable length $vlen"))
-    olen >= 4 || throw(ValidationError("invalid $what object length $olen"))
-    _blockrange(metadata, vpos, vlen, what)
-    _blockrange(metadata, pos, olen, what)
-    return _BlockTable(metadata, pos, vpos, vlen, olen)
-end
-
-function _blockfield(
-    t::_BlockTable,
-    slot::Int,
-    width::Int,
-    what::AbstractString;
-    required::Bool=false,
-)
-    entryoff = Int64(4 + 2slot)
-    if entryoff > t.vlen - 2
-        required && throw(ValidationError("required $what is absent"))
-        return nothing
-    end
-    entry = _blockadd(t.vpos, entryoff, what)
-    off = Int64(_blockload(t.metadata, UInt16, entry, what))
-    if off == 0
-        required && throw(ValidationError("required $what is absent"))
-        return nothing
-    end
-    (off >= 4 && width <= t.olen && off <= t.olen - width) ||
-        throw(ValidationError("$what exceeds its table object"))
-    pos = _blockadd(t.pos, off, what)
-    width > 1 && pos % min(width, 8) != 0 && throw(ValidationError("$what is misaligned"))
-    _blockrange(t.metadata, pos, Int64(width), what)
-    return pos
-end
-
-function _blockref(t::_BlockTable, slot::Int, what::AbstractString; required::Bool=false)
-    pos = _blockfield(t, slot, 4, what; required=required)
-    pos === nothing && return nothing
-    rel = Int64(_blockload(t.metadata, UInt32, pos, what))
-    rel > 0 || throw(ValidationError("$what has a null or backward offset"))
-    target = _blockadd(pos, rel, what)
-    _blockrange(t.metadata, target, Int64(1), what)
-    return target
-end
-
-function _blockvector(t::_BlockTable, slot::Int, elemsize::Int, what::AbstractString)
-    pos = _blockref(t, slot, what)
-    pos === nothing && return nothing
-    pos % 4 == 0 || throw(ValidationError("$what length is misaligned"))
-    n = Int64(_blockload(t.metadata, UInt32, pos, what))
-    start = _blockadd(pos, Int64(4), what)
-    bytes = _blockmul(n, Int64(elemsize), what)
-    _blockrange(t.metadata, start, bytes, what)
-    n > 0 &&
-        elemsize > 1 &&
-        start % min(elemsize, 8) != 0 &&
-        throw(ValidationError("$what data is misaligned"))
-    return start, n
-end
-
-"""
-Read the fixed Message/RecordBatch envelope and wire-buffer structs that bind
-one Footer Block to its on-wire frame. `_blockmessage` still verifies the
-full metadata graph lazily. This preflight runs first so that EOS
-classification never trusts a forged Footer extent.
-"""
-function _blockmessagebatch(metadata::BufferSlice)
-    root = Int64(_blockload(metadata, UInt32, Int64(0), "message root"))
-    root >= 4 || throw(ValidationError("invalid block message root offset"))
-    msg = _blocktable(metadata, root, "block message table")
-    # An absent version slot is the schema default, V1 (0).
-    versionpos = _blockfield(msg, 0, 2, "message version slot")
-    version =
-        versionpos === nothing ? Int16(0) :
-        _blockload(metadata, Int16, versionpos, "message version slot")
-    bodypos = _blockfield(msg, 3, 8, "message body-length slot")
-    bodylen =
-        bodypos === nothing ? Int64(0) :
-        _blockload(metadata, Int64, bodypos, "message body-length slot")
-    headerpos = _blockfield(msg, 1, 1, "message header type"; required=true)
-    headertype = _blockload(metadata, UInt8, headerpos, "message header type")
-    headerref = _blockref(msg, 2, "message header"; required=true)
-    header = _blocktable(metadata, headerref, "message header table")
-    batch = if headertype == UInt8(2) # DictionaryBatch.data
-        dataref = _blockref(header, 1, "dictionary batch data"; required=true)
-        _blocktable(metadata, dataref, "dictionary record-batch table")
-    elseif headertype == UInt8(3) # RecordBatch
-        header
-    else
-        throw(ValidationError("footer block has unsupported message header type $headertype"))
-    end
-    return bodylen, headertype, batch, version
-end
-
-function _verifyblockbuffers(batch::_BlockTable, bodylen::Int64)
-    buffers = _blockvector(batch, 2, 16, "record-batch buffer vector")
-    buffers === nothing && return nothing
-    start, n = buffers
-    last_nonempty_end = Int64(0)
-    for i = Int64(0):(n - 1)
-        base = _blockadd(
-            start,
-            _blockmul(i, Int64(16), "record-batch buffer position"),
-            "record-batch buffer position",
-        )
-        offset = _blockload(batch.metadata, Int64, base, "record-batch buffer offset")
-        len = _blockload(
-            batch.metadata,
-            Int64,
-            _blockadd(base, Int64(8), "record-batch buffer length"),
-            "record-batch buffer length",
-        )
-        offset >= 0 || throw(ValidationError("negative batch buffer offset $offset"))
-        len >= 0 || throw(ValidationError("negative batch buffer length $len"))
-        offset % 8 == 0 ||
-            throw(ValidationError("batch buffer offset $offset is not 8-byte aligned"))
-        bufferend = _blockadd(offset, len, "batch buffer end")
-        bufferend <= bodylen ||
-            throw(ValidationError("batch buffer [$offset, $len] escapes its message body"))
-        if len > 0
-            offset >= last_nonempty_end ||
-                throw(ValidationError("batch buffers overlap or move backwards"))
-            last_nonempty_end = bufferend
-        end
-    end
-    return nothing
-end
-
-function _verifyblockframe(
-    blob::BufferSlice,
-    block::NTuple{3,Int64},
-    expectedheadertype::UInt8,
-)
-    offset, metalen, bodylen = block
-    AC.loadat(blob, UInt32, offset) == CONTINUATION ||
-        throw(ValidationError("footer block does not point at a message"))
-    declared = Int64(AC.loadat(blob, Int32, offset + 4))
-    declared == metalen - 8 ||
-        throw(ValidationError("footer block metadata length does not match the message"))
-    metadata = AC.subslice(blob, offset + 8, declared)
-    messagebodylen, headertype, batch, version = _blockmessagebatch(metadata)
-    messagebodylen == bodylen ||
-        throw(ValidationError("footer block body length does not match the message"))
-    headertype == expectedheadertype ||
-        throw(ValidationError("footer block has the wrong message header type"))
-    _verifyblockbuffers(batch, bodylen)
-    return version
-end
-
-"""
-Preflight every Footer Block's frame. Returns the end of the indexed data and
-the metadata version the indexed messages share (`footerversion` when the
-file indexes no message).
-"""
-function _verifyblockframes(
-    blob::BufferSlice,
-    dictblocks,
-    recordblocks,
-    dataend::Int64,
-    footerversion::Int16;
-    datastart::Int64=0,
-)
-    indexedend = _validateblockindex(dictblocks, recordblocks, dataend; datastart=datastart)
-    version = Int16(0)
-    for (blocks, headertype) in ((dictblocks, UInt8(2)), (recordblocks, UInt8(3)))
-        for block in blocks
-            v = _verifyblockframe(blob, block, headertype)
-            version = _filemetadataversion(footerversion, v, version == 0 ? v : version)
-        end
-    end
-    return indexedend, version == 0 ? footerversion : version
-end
-
 """
 Frame and verify the single message a Block points at, against the block's
 own declared extents and the enclosing region.
@@ -2240,25 +2011,11 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
     # The Footer is authoritative, as in Arrow C++: the schema comes from it
     # and every message is reached through its Blocks, so the leading Schema
     # message is never read. (Polars writes that message without its stream
-    # framing.) Data starts after the padded magic (`ARROW1` plus two bytes).
-    # Validate the indexed messages against the Footer boundary first. Only
-    # then can the final eight bytes be classified as an optional EOS marker:
-    # a no-EOS file may end its last data buffer with the same byte pattern.
-    datastart = Int64(8)
-    indexedend, version = _verifyblockframes(
-        blob,
-        dictblocks,
-        recordblocks,
-        footerstart,
-        version;
-        datastart=datastart,
-    )
-    haseos =
-        footerstart - indexedend >= 8 &&
-        AC.loadat(blob, UInt32, footerstart - 8) == CONTINUATION &&
-        AC.loadat(blob, UInt32, footerstart - 4) == UInt32(0)
-    dataend = haseos ? footerstart - 8 : footerstart
-    _validateblockindex(dictblocks, recordblocks, dataend; datastart=datastart)
+    # framing.) Data starts after the padded magic (`ARROW1` plus two bytes);
+    # Blocks must not overlap and must end before the Footer. Each message is
+    # verified against its Block when it is decoded.
+    dataend = footerstart
+    _validateblockindex(dictblocks, recordblocks, dataend; datastart=Int64(8))
     dictids = Dict{Int64,Meta.Field}()
     fielddictids = IdDict{Field,Int64}()
     fields = Field[
@@ -2274,8 +2031,7 @@ function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget
     )
     framed(_, block) =
         let fm = _blockmessage(region, block, dataend, limits, budget)
-            fm.version == version ||
-                throw(ValidationError("IPC metadata version changes within the file"))
+            _filemetadataversion(version, fm.version)
             fm
         end
     dicts, validated = _filedictionaries(
@@ -2384,8 +2140,7 @@ end
 function _fileplan(f::ArrowFile, i::Integer, budget::AllocationBudget, mask=nothing)
     1 <= i <= length(f.recordblocks) || throw(BoundsError(f, i))
     fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
-    fm.version == f.schemaversion ||
-        throw(ValidationError("IPC metadata version changes within the file"))
+    _filemetadataversion(f.schemaversion, fm.version)
     rejectexperimentalcompression(fm)
     header = fm.msg.header
     header isa Meta.RecordBatch ||
