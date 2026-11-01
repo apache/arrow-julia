@@ -971,35 +971,28 @@ A file-format source read one record batch at a time (`Arrow.Stream` over an
 `AbstractArrowSource`): the footer and every dictionary batch when opened,
 then each record batch's bytes when the batch is read.
 """
-mutable struct _RangedFile
-    const sf::SourceFile
-    const schema::Schema
-    const fields::AC.FrozenVector{Field}
-    const fielddictids::IdDict{Field,Int64}
-    const dictionaries::Dict{Int64,ArrayData}
-    const validated::AC._ValidatedDictionaries
-    const recordblocks::Vector{NTuple{3,Int64}}
-    const dataend::Int64
-    const limits::Limits
-    const footerversion::Int16
-    # The message metadata version every block must share (0 until one is read).
-    @atomic version::Int16
+struct _RangedFile
+    sf::SourceFile
+    schema::Schema
+    fields::AC.FrozenVector{Field}
+    fielddictids::IdDict{Field,Int64}
+    dictionaries::Dict{Int64,ArrayData}
+    validated::AC._ValidatedDictionaries
+    recordblocks::Vector{NTuple{3,Int64}}
+    dataend::Int64
+    limits::Limits
+    footerversion::Int16
     # The stream's lifetime authority; each batch's bytes are their own region.
-    const region::OwnerRegion
-    const blocks::_BlockReader
+    region::OwnerRegion
+    blocks::_BlockReader
 end
 
 function _RangedFile(sf::SourceFile, budget::AllocationBudget)
     ft = _readfooter(sf, sf.limits, budget)
-    version = Ref(Int16(0))
     dictreader = _BlockReader(sf)
     framed(i, block) =
         let fm = first(_blockframe(dictreader, ft.dictblocks, i, ft.footerstart, budget))
-            version[] = _filemetadataversion(
-                ft.version,
-                fm.version,
-                version[] == 0 ? fm.version : version[],
-            )
+            _filemetadataversion(ft.version, fm.version)
             fm
         end
     dicts, validated = _filedictionaries(
@@ -1022,7 +1015,6 @@ function _RangedFile(sf::SourceFile, budget::AllocationBudget)
         ft.footerstart,
         sf.limits,
         ft.version,
-        version[],
         heapregion(UInt8[]),
         _BlockReader(sf),
     )
@@ -1118,38 +1110,8 @@ end
 Base.length(r::_RangedFile) = length(r.recordblocks)
 
 # Row count of batch `i` from one range request for its metadata.
-function _batchrows(r::_RangedFile, i::Int, budget::AllocationBudget)
-    seen = Ref(@atomic r.version)
-    n = _rangedbatchrows(r.sf, r.recordblocks[i], r.footerversion, r.fields, budget, seen)
-    @atomicreplace r.version Int16(0) => seen[]
-    return n
-end
-
-# Record batch `i`, decoded through a one-block `ArrowFile` over its bytes.
-function _rangedbatch(r::_RangedFile, i::Int, budget::AllocationBudget, ntasks::Int)
-    1 <= i <= length(r.recordblocks) || throw(BoundsError(r, i))
-    fm, region = _blockframe(r.blocks, r.recordblocks, i, r.dataend, budget)
-    known = @atomic r.version
-    if known == 0
-        known, _ = @atomicreplace r.version Int16(0) => fm.version
-        known == 0 && (known = fm.version)
-    end
-    version = _filemetadataversion(r.footerversion, fm.version, known)
-    _, metalen, bodylen = r.recordblocks[i]
-    f = ArrowFile(
-        region,
-        r.schema,
-        r.fields,
-        r.fielddictids,
-        r.dictionaries,
-        r.validated,
-        [(Int64(0), metalen, bodylen)],
-        region.len,
-        r.limits,
-        version,
-    )
-    return only(_filerecordbatches(f, (1,), budget, ntasks))
-end
+_batchrows(r::_RangedFile, i::Int, budget::AllocationBudget) =
+    _rangedbatchrows(r.sf, r.recordblocks[i], r.footerversion, r.fields, budget)
 
 """
 A forward `IO` over a `SourceFile`, for reading a stream-format object one
@@ -1518,7 +1480,6 @@ function _rangedbatchrows(
     version::Int16,
     fields::AbstractVector{Field},
     budget::AllocationBudget,
-    messageversion::Base.RefValue{Int16},
 )
     _, metalen, bodylen = block
     declared = metalen - 8
@@ -1529,8 +1490,7 @@ function _rangedbatchrows(
         _blockmeta(BufferSlice(heapregion(payload), 0, metalen), block, sf.limits, budget)
     header_type == UInt8(3) ||
         throw(ValidationError("footer record block is not a record batch"))
-    expected = messageversion[] == 0 ? v : messageversion[]
-    messageversion[] = _filemetadataversion(version, v, expected)
+    _filemetadataversion(version, v)
     rejectexperimentalcompression(msg, v, header_type)
     return _recordbatchmeta(msg.header::Meta.RecordBatch, fields, sf.limits, bodylen)
 end
@@ -1610,14 +1570,9 @@ struct _ScanRecord{B}
     dictionaries::Dict{Int64,ArrayData}
 end
 
-# A record batch decoded already (one batch of an `Arrow.Stream`).
-struct _DecodedRecord
-    batch::AC.RecordBatch
-end
-
 # What decoding one source's record batches needs besides their plans.
-struct _Decoder
-    fields::Vector{Field}
+struct _Decoder{F<:AbstractVector{Field}}
+    fields::F
     fielddictids::IdDict{Field,Int64}
     validated::AC._ValidatedDictionaries
     limits::Limits
@@ -1633,14 +1588,11 @@ _decodefield(dec::_Decoder, r::_ScanRecord, j::Int, state::DecodeState) = _decod
     dec.validated,
     state,
 )
-_decodefield(::_Decoder, r::_DecodedRecord, j::Int, ::DecodeState) = r.batch.columns[j]
 
 _rowcount(r::_ScanRecord) = Int(r.plan.rblen)
-_rowcount(r::_DecodedRecord) = Int(r.batch.nrows)
 
 _columndictionary(dec::_Decoder, r::_ScanRecord, j::Int) =
     get(r.dictionaries, dec.fielddictids[dec.fields[j]], nothing)
-_columndictionary(::_Decoder, r::_DecodedRecord, j::Int) = r.batch.columns[j].dictionary
 
 # What building a scan's columns shares: view pools, ArrowTypes conversion
 # (under `lock`: its caches are not thread-safe), and the fields whose
@@ -2339,6 +2291,61 @@ function _scanfile(
         lazy,
         windows,
     )
+end
+
+# Record batch `i` of a file-format stream source, planned to decode the
+# fields `mask` selects, and what fetching its bodies needs (`nothing` when
+# they are in memory).
+_streamrecord(f::ArrowFile, i::Int, budget, mask) =
+    _ScanRecord(_fileplan(f, i, budget, mask), f.dictionaries), nothing
+
+# Over a byte-range source a batch that decodes every field reads its whole
+# block, with read-ahead; one that decodes some reads its metadata with the
+# start of its body, and `_runscan` fetches the planned ranges it lacks.
+function _streamrecord(r::_RangedFile, i::Int, budget, mask)
+    sf = r.sf
+    block = r.recordblocks[i]
+    spans = nothing
+    if all(mask)
+        fm = first(_blockframe(r.blocks, r.recordblocks, i, r.dataend, budget))
+        msg, version, headertype, body = fm.msg, fm.version, fm.header_type, fm.body
+    else
+        range =
+            (block[1], AC.checked_add(block[2], _speculativebody(block[3], sf.gapbytes)))
+        spans = _fetchspans(
+            sf,
+            NTuple{2,Int64}[range],
+            sf.gapbytes;
+            budget=budget,
+            what="metadata range fetch",
+        )
+        meta = _spanslice(spans, block[1], block[2])
+        msg, version, headertype, _ = _blockmeta(meta, block, r.limits, budget)
+        body = SparseBody(block[3], block[1] + block[2], spans)
+    end
+    _filemetadataversion(r.footerversion, version)
+    headertype == UInt8(3) ||
+        throw(ValidationError("footer record block is not a record batch"))
+    rejectexperimentalcompression(msg, version, headertype)
+    header = msg.header::Meta.RecordBatch
+    variadics = variadiccounts(header)
+    _recordbatchmeta(header, r.fields, r.limits, block[3], variadics)
+    _scanmissingdicts(r.fields, header.nodes, r.dictionaries, r.fielddictids, mask)
+    record =
+        _ScanRecord(_recordplan(header, body, version, r.fields, r.limits), r.dictionaries)
+    spans === nothing && return record, nothing
+    bodies = _RangedBodies(
+        sf,
+        spans,
+        falses(length(r.fields), 1),
+        [block],
+        Meta.RecordBatch[header],
+        [variadics],
+        Int8[_batchcodec(header.compression, version)],
+        collect(Field, r.fields),
+        budget,
+    )
+    return record, bodies
 end
 
 """

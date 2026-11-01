@@ -1055,11 +1055,14 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             # Before parsing succeeds, the path reader owns the map. A parse
             # error must revoke it instead of leaving the source file locked.
             region = Arrow.AC.mmapregion(path)
-            @test_throws Arrow.AC.ValidationError Arrow._readmappedfile(
-                region,
-                Arrow.Limits(max_metadata_bytes=0),
-                nothing,
-            )
+            limits = Arrow.Limits(max_metadata_bytes=0)
+            @test_throws Arrow.AC.ValidationError Arrow._unmaponerror(region, true) do
+                return Arrow._readfile(
+                    region,
+                    limits,
+                    Arrow._readbudget(limits, region.len),
+                )
+            end
             @test_throws InvalidStateException Arrow.AC.sliceptr(
                 Arrow.AC.BufferSlice(region, 0, 1),
             )

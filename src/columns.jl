@@ -1404,13 +1404,17 @@ function _markpools!(live, data::AC.ArrayData, cached)
     return nothing
 end
 
-# A stream reuses current pools, but only returned tables may keep old ones alive.
-function _prunepools!(ctx::_ViewContext, columns, budget)
+# A stream reuses the pool columns of the dictionaries still in effect
+# (`dictionaries`), but only returned tables may keep older ones alive.
+function _prunepools!(ctx::_ViewContext, dictionaries, budget)
     lock(ctx.poolslock) do
         isempty(ctx.pools) && return nothing
         _chargedict!(budget, AC.ArrayData, Nothing, length(ctx.pools), "live stream pools")
         live = IdDict{AC.ArrayData,Nothing}()
-        foreach(data -> _markpools!(live, data, ctx.pools), columns)
+        for dictionary in dictionaries
+            haskey(ctx.pools, dictionary) && (live[dictionary] = nothing)
+            _markpools!(live, dictionary, ctx.pools)
+        end
         filter!(entry -> haskey(live, first(entry)), ctx.pools)
         return nothing
     end

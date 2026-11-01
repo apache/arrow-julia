@@ -127,4 +127,35 @@ end
     rm(path)
 end
 
+@testset "a Stream over a source fetches only the columns it reads" begin
+    n = 20_000
+    io = IOBuffer()
+    Arrow.Writer(io; file=true) do writer
+        for batch = 1:4
+            Arrow.write(
+                writer,
+                (
+                    x=collect(((batch - 1) * n + 1):(batch * n)),
+                    pad=fill(repeat("p", 64), n),
+                ),
+            )
+        end
+    end
+    bytes = take!(io)
+    for (kw, want) in (
+        ((select=[:x],), collect(1:(4n))),
+        ((select=[:x], filter=Arrow.col(:x) > 3n), collect((3n + 1):(4n))),
+    )
+        fetched = Ref(0)
+        stream = Arrow.Stream(Arrow.SourceFile(MeteredSource(bytes, fetched)); kw...)
+        @test reduce(vcat, [collect(t.x) for t in stream]) == want
+        @test fetched[] < length(bytes) ÷ 3
+    end
+    # A stream that reads every column reads whole blocks.
+    fetched = Ref(0)
+    stream = Arrow.Stream(Arrow.SourceFile(MeteredSource(bytes, fetched)))
+    @test sum(t -> length(t.x), stream) == 4n
+    @test fetched[] >= length(bytes) - 1024
+end
+
 end

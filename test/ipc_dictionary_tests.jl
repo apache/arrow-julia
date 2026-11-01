@@ -147,12 +147,12 @@ function fixture(vf, events; file=false, features=Int64[], compress=:none)
 end
 
 function firstpool(reader)
-    batch, _ = Arrow._nextrecord!(reader, 1)
-    return WeakRef(batch.columns[1].dictionary)
+    record, _ = Arrow._nextrecord!(reader)
+    return WeakRef(only(values(record.dictionaries)))
 end
 
 function discardrecord!(reader)
-    Arrow._nextrecord!(reader, 1)
+    Arrow._nextrecord!(reader)
     return nothing
 end
 
@@ -167,7 +167,10 @@ end
     _, replacement = AC.fromjulia("pool", Int64[2])
     for delta in (false, true)
         bytes = fixture(vf, [(false, pool, [0]), (delta, replacement, [delta ? 1 : 0])])
-        reader = Arrow._openstream(IOBuffer(bytes))
+        reader = Arrow._StreamReader(
+            Arrow._IOMessages(IOBuffer(bytes), UInt8[], 0),
+            Arrow.Limits(),
+        )
         previous = firstpool(reader)
         discardrecord!(reader)
         GC.gc(true)

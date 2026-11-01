@@ -2246,25 +2246,25 @@ function _restart!(r::_StreamReader)
 end
 
 """
-The next record batch of the stream and the allowance it decoded under, or
-`nothing` at its end. Messages are read until the next batch in stream order
-is decodable; its fields decode on at most `ntasks` tasks.
+The next record batch of the stream, planned against the dictionaries in
+effect for it, and the allowance it decodes under; `nothing` at its end.
+Messages are read until the next batch in stream order is decodable.
 """
-function _nextrecord!(r::_StreamReader, ntasks::Int)
+function _nextrecord!(r::_StreamReader)
     r.failed && throw(
         ArgumentError(
             "this Arrow.Stream stopped at an error; open a new one to read the source again",
         ),
     )
     try
-        return _readrecord!(r, ntasks)
+        return _readrecord!(r)
     catch
         r.failed = true
         rethrow()
     end
 end
 
-function _readrecord!(r::_StreamReader, ntasks::Int)
+function _readrecord!(r::_StreamReader)
     while true
         if r.done
             isempty(r.missing) && return nothing
@@ -2301,7 +2301,7 @@ function _readrecord!(r::_StreamReader, ntasks::Int)
                     budget,
                 )
             end
-            return only(_decoderecords(r.st, PendingRecord[p], ntasks)), budget
+            return p, budget
         else
             throw(ValidationError("unsupported IPC message header $(typeof(header))"))
         end
@@ -2733,63 +2733,6 @@ function _filebatch(f::ArrowFile, i::Integer, state::DecodeState)
     p = _fileplan(f, i, state.budget)
     cols = ArrayData[_decodefilefield(f, p, j, state) for j = 1:length(f.fields)]
     return AC.RecordBatch(f.schema, cols, p.rblen, f.validated)
-end
-
-"""
-Decode record batches `idxs` of `f` on at most `ntasks` tasks: every batch's
-framing and plan first, then each (batch, field) pair on its own, so one
-large batch spreads over the tasks too. With `mask`, only the fields it
-selects decode; the others stay `nothing`. Returns the plans and, per batch,
-its columns.
-"""
-function _filebatches(
-    f::ArrowFile,
-    idxs,
-    budget::AllocationBudget,
-    ntasks::Int,
-    mask=nothing,
-)
-    nb = length(idxs)
-    nf = length(f.fields)
-    _chargevector!(budget, _RecordPlan{BufferSlice}, nb, "batch decode plans")
-    plans = Vector{_RecordPlan{BufferSlice}}(undef, nb)
-    _foreach(nb, ntasks) do k, _
-        plans[k] = _fileplan(f, idxs[k], budget, mask)
-        return nothing
-    end
-    _chargevector!(
-        budget,
-        Union{Nothing,ArrayData},
-        AC.checked_mul(nb, nf),
-        "batch columns",
-    )
-    cols = [Vector{Union{Nothing,ArrayData}}(nothing, nf) for _ = 1:nb]
-    states = [DecodeState(budget) for _ = 1:min(ntasks, nb * nf)]
-    try
-        _foreach(nb * nf, ntasks) do item, w
-            k, j = divrem(item - 1, nf) .+ (1, 1)
-            (mask === nothing || mask[j]) || return nothing
-            cols[k][j] = _decodefilefield(f, plans[k], j, states[w])
-            return nothing
-        end
-    finally
-        foreach(close, states)
-    end
-    return plans, cols
-end
-
-# Record batches `idxs` of `f`, decoded on at most `ntasks` tasks.
-function _filerecordbatches(f::ArrowFile, idxs, budget::AllocationBudget, ntasks::Int)
-    plans, cols = _filebatches(f, idxs, budget, ntasks)
-    _chargevector!(budget, AC.RecordBatch, length(idxs), "decoded batch list")
-    return AC.RecordBatch[
-        AC.RecordBatch(
-            f.schema,
-            ArrayData[c::ArrayData for c in cols[k]],
-            p.rblen,
-            f.validated,
-        ) for (k, p) in enumerate(plans)
-    ]
 end
 
 function Base.getindex(f::ArrowFile, i::Integer)
