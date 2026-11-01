@@ -641,7 +641,6 @@ function _ranged_main(filebytes::Vector{UInt8}, full)
         Tables.Scan(select=(:d,), filter=Tables.colin(Tables.col(:d), Set([targetdate])))
     datefull = Arrow.Table(copy(datebytes))
     datefield = getfield(datefull, :schema).fields[1]
-    @assert Arrow._ScanPlan(datescan, [datefield]).storage !== nothing
     datelog, datesource = countingsource(datebytes)
     dategot = Arrow.Table(ranged(datesource; tailbytes=32, gapbytes=0); scan=datescan)
     datewant = Tables.scan(datefull, datescan)
@@ -657,8 +656,6 @@ function _ranged_main(filebytes::Vector{UInt8}, full)
     for values in (Set([datetime]), (datetime,))
         expectedrows = targetdate in values ? 1 : 0
         scan = Tables.Scan(select=(:d,), filter=Tables.colin(Tables.col(:d), values))
-        plan = Arrow._ScanPlan(scan, [datefield])
-        @assert (plan.storage !== nothing) == (values isa Tuple)
         reference = Tables.scan(datefull, scan)
         got = Arrow.Table(
             SourceFile(BytesSource(copy(datebytes)); tailbytes=32, gapbytes=0);
@@ -674,7 +671,6 @@ function _ranged_main(filebytes::Vector{UInt8}, full)
         select=(:d,),
         filter=Tables.colin(Tables.col(:d), _DateScanDomain(targetdate)),
     )
-    @assert Arrow._ScanPlan(domainscan, [datefield]).storage === nothing
     domainreference = Tables.scan(datefull, domainscan)
     for source in (copy(datebytes), SourceFile(BytesSource(copy(datebytes)); tailbytes=32))
         got = Arrow.Table(source; scan=domainscan)
@@ -705,8 +701,6 @@ function _ranged_main(filebytes::Vector{UInt8}, full)
         (arraymembership & !Tables.isnull(Tables.col(:d)), Int64[3]),
     )
         scan = Tables.Scan(select=(:id,), filter=filter)
-        @assert Arrow._ScanPlan(scan, [getfield(nullablefull, :schema).fields...]).storage ===
-                nothing
         reference = Tables.scan(nullablefull, scan)
         @assert reference.id == expected
         for source in (
@@ -777,7 +771,6 @@ function _ranged_main(filebytes::Vector{UInt8}, full)
     for (type, pool, indices, values, lowered, expected) in dictionarycases
         field, bytes = temporaldictionary(type, pool, indices)
         scan = Tables.Scan(select=(:v,), filter=Tables.colin(Tables.col(:v), values))
-        @assert (Arrow._ScanPlan(scan, [field]).storage !== nothing) == lowered
         dictionaryfull = Arrow.Table(copy(bytes))
         reference = Tables.scan(dictionaryfull, scan)
         @assert reference.v == expected
@@ -1365,40 +1358,6 @@ function _ranged_main(filebytes::Vector{UInt8}, full)
     @assert occursin("tail range fetch", sprint(showerror, tailerror))
     @assert isempty(taillog.ranges)
 
-    # An unlowerable remote filter first reads the Footer, then falls back to
-    # public-domain evaluation over the whole object. Those phases share one
-    # cumulative budget. The opened file fits the materialization allowance
-    # alone; the remote path must also account for its prior Footer and object
-    # copy work, so the same allowance refuses.
-    publicio = IOBuffer()
-    Arrow.write(
-        publicio,
-        (d=fill(Arrow.Dates.Date(2024, 1, 1), 10_000), x=zeros(Int64, 10_000));
-        compress=:zstd,
-        file=true,
-    )
-    publicbytes = take!(publicio)
-    publicscan = Tables.Scan(
-        select=(),
-        filter=Tables.colcmp(==, Tables.col(:d), Arrow.Dates.Date(6_000_000, 1, 1)),
-    )
-    # The opened read needs 217,760 bytes and the remote path 258,700 here.
-    publiclimits = Limits(max_total_allocated_bytes=238_000)
-    opened = readfile(copy(publicbytes); limits=publiclimits)
-    @assert Tables.rowcount(Arrow.Table(opened; scan=publicscan)) == 0
-    publicerror = try
-        Arrow.Table(
-            SourceFile(BytesSource(publicbytes); limits=publiclimits, tailbytes=32);
-            scan=publicscan,
-        )
-        nothing
-    catch e
-        e
-    end
-    @assert publicerror isa AllocationLimitError
-    @assert Tables.rowcount(
-        Arrow.Table(SourceFile(BytesSource(publicbytes); tailbytes=32); scan=publicscan),
-    ) == 0
     println("range limits and scan-wide allocation budgets fail before overuse ✓")
 
     println()

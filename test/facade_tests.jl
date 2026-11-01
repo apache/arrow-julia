@@ -900,8 +900,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
 
     @testset "scan compilation bounds request amplification" begin
         # Scalar conversion has fourteen closed descriptor/unit tokens.
-        # Membership uses them only when the complete public conversion
-        # preserves equality. Abstract inputs must not box each member.
         nvalues = 100_000
         temporal_cases = (
             (
@@ -946,23 +944,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
                 Int64(1_000_000_000),
             ),
         )
-        membership_cases = (temporal_cases[1], temporal_cases[2], temporal_cases[5])
-        needed = Arrow.AC._materializedvectorbytes(Union{Int32,Int64}, nvalues)
-        for (field, values, expected) in membership_cases
-            Arrow._lowermembership(field, values, nothing) # warm the closed kernel
-            @test _allocated(Arrow._lowermembership, field, values, nothing) <= needed
-            exact = Arrow.AllocationBudget(needed)
-            good, lowered = Arrow._lowermembership(field, values, exact)
-            @test good && eltype(lowered) == Union{Int32,Int64}
-            @test all(==(expected), lowered)
-            @test Arrow._remaining(exact) == 0
-            @test_throws Arrow.AllocationLimitError Arrow._lowermembership(
-                field,
-                values,
-                Arrow.AllocationBudget(needed - 1),
-            )
-        end
-
         # Retained-schema column construction hoists the same token through a
         # function barrier. Vector{Any} inputs allocate only the final column,
         # not one dynamically dispatched scalar box per row.
@@ -977,9 +958,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             )
         end
 
-        # Calendar periods cannot enter the membership kernel, and an integer
-        # has no timestamp public representation: neither lowers, and the
-        # membership path never inspects or rebuilds the caller's container.
+        # An integer has no timestamp public representation.
         timestampfield = Arrow.AC.Field(
             "timestamp",
             Arrow.AC.TimestampType(Arrow.AC.MICROSECOND, nothing);
@@ -989,53 +968,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             Arrow._facadetoken(timestampfield.type),
             _InterruptingInteger(),
         ) === nothing
-        for (field, values) in ((temporal_cases[5][1], Any[Month(1)]),)
-            good, original = Arrow._lowermembership(field, values, nothing)
-            @test !good
-            @test original === values
-        end
-        secondsfield = Arrow.AC.Field(
-            "seconds",
-            Arrow.AC.DurationType(Arrow.AC.SECOND);
-            nullable=false,
-        )
-        finervalues = Any[Millisecond(1_000)]
-        untouched = Arrow.AllocationBudget(0)
-        good, original = Arrow._lowermembership(secondsfield, finervalues, untouched)
-        @test !good
-        @test original === finervalues
-        @test Arrow._remaining(untouched) == 0
-        rawvalues = Any[_InterruptingInteger()]
-        good, original = Arrow._lowermembership(timestampfield, rawvalues, nothing)
-        @test !good
-        @test original === rawvalues
-
-        # Set has a separate hashing path. Its conservative Dict-style charge
-        # must accept N, reject N-1, and cover the full unique-key allocation.
-        setvalues = Set(Date(2024, 1, 1) + Day(i) for i = 0:(nvalues - 1))
-        setneeded =
-            512 +
-            4 *
-            nvalues *
-            (Base.elsize(Vector{Union{Int32,Int64}}) + Base.elsize(Vector{Nothing}) + 16)
-        Arrow._lowermembership(temporal_cases[1][1], setvalues, nothing)
-        @test _allocated(
-            Arrow._lowermembership,
-            temporal_cases[1][1],
-            setvalues,
-            nothing,
-        ) <= setneeded
-        exact = Arrow.AllocationBudget(setneeded)
-        good, lowered = Arrow._lowermembership(temporal_cases[1][1], setvalues, exact)
-        @test good
-        firstday = Int32(Dates.value(Date(2024, 1, 1) - Date(1970, 1, 1)))
-        @test lowered == Set{Union{Int32,Int64}}(firstday .+ Int32.(0:(nvalues - 1)))
-        @test Arrow._remaining(exact) == 0
-        @test_throws Arrow.AllocationLimitError Arrow._lowermembership(
-            temporal_cases[1][1],
-            setvalues,
-            Arrow.AllocationBudget(setneeded - 1),
-        )
     end
 
     @testset "exact range-fetch worker budgets" begin
@@ -1562,7 +1494,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
                 Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), literal)),
                 Tables.Scan(filter=Tables.colin(Tables.col(:v), (literal,))),
             )
-                @test Arrow._ScanPlan(scan, [field]).storage === nothing
                 assertmatches(bytes, scan)
                 @test Tables.rowcount(Arrow.Table(copy(bytes); scan=scan)) == 1
             end
@@ -1591,7 +1522,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
                 Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), DateTime(1970, 1, 1))),
                 Tables.Scan(filter=Tables.colin(Tables.col(:v), (DateTime(1970, 1, 1),))),
             )
-                @test Arrow._ScanPlan(scan, [field]).storage !== nothing
                 assertmatches(bytes, scan)
                 @test Tables.rowcount(Arrow.Table(copy(bytes); scan=scan)) == 1
             end
@@ -1608,11 +1538,9 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             field, bytes = field_bytes
             eqscan =
                 Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), DateTime(1970, 1, 1)))
-            @test Arrow._ScanPlan(eqscan, [field]).storage !== nothing
             assertmatches(bytes, eqscan)
             ordered =
                 Tables.Scan(filter=Tables.colcmp(<, Tables.col(:v), DateTime(1970, 1, 1)))
-            @test Arrow._ScanPlan(ordered, [field]).storage === nothing
             assertmatches(bytes, ordered)
         end
         let field_bytes = rawtemporal(
@@ -1624,7 +1552,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
                 scan = Tables.Scan(
                     filter=Tables.colcmp(op, Tables.col(:v), DateTime(1970, 1, 1)),
                 )
-                @test Arrow._ScanPlan(scan, [field]).storage !== nothing
                 assertmatches(bytes, scan)
             end
         end
@@ -1635,22 +1562,17 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         duration = Arrow.AC.DurationType(Arrow.AC.SECOND)
         field, bytes = rawtemporal(duration, Int64[60])
         coarse = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), Minute(1)))
-        @test Arrow._ScanPlan(coarse, [field]).storage !== nothing
         assertmatches(bytes, coarse)
         coarsein = Tables.Scan(filter=Tables.colin(Tables.col(:v), (Minute(1),)))
-        @test Arrow._ScanPlan(coarsein, [field]).storage !== nothing
         assertmatches(bytes, coarsein)
         finer = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), Millisecond(60_000)))
-        @test Arrow._ScanPlan(finer, [field]).storage === nothing
         assertmatches(bytes, finer)
         finerin = Tables.Scan(filter=Tables.colin(Tables.col(:v), (Millisecond(60_000),)))
-        @test Arrow._ScanPlan(finerin, [field]).storage === nothing
         assertmatches(bytes, finerin)
 
         field, bytes = rawtemporal(duration, Int64[typemin(Int64)])
         overflow =
             Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), Millisecond(-1_000_000)))
-        @test Arrow._ScanPlan(overflow, [field]).storage === nothing
         @test_throws InexactError Tables.scan(Arrow.Table(copy(bytes)), overflow)
         @test_throws InexactError Arrow.Table(copy(bytes); scan=overflow)
 
@@ -1921,7 +1843,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             ),
         )
             scan = Tables.Scan(; filter)
-            @test Arrow._ScanPlan(scan, [zfield]).storage !== nothing
             @test collect(Arrow.Table(copy(zbytes); scan).z) == want
         end
         for naive in (DateTime(2026, 1, 2), Ts{Microsecond}(2026, 1, 2))
@@ -1941,7 +1862,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         # has no exact storage form; public evaluation still answers exactly
         sub = Zts{Nanosecond,:UTC}(Ts{Nanosecond}(zcol[2].utc) + Nanosecond(1), Dates.UTC)
         subscan = Tables.Scan(filter=Tables.colcmp(<, Tables.col(:z), sub))
-        @test Arrow._ScanPlan(subscan, [zfield]).storage === nothing
         @test collect(Arrow.Table(copy(zbytes); scan=subscan).z) == zcol[1:2]
 
         # The Arrow spec reads an EMPTY timezone string as zone-naive.

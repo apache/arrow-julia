@@ -16,7 +16,7 @@
 
 module RangedScanTests
 
-using Test, Arrow, Tables
+using Test, Arrow, Tables, Dates
 
 struct MeteredSource <: Arrow.AbstractArrowSource
     bytes::Vector{UInt8}
@@ -58,6 +58,39 @@ end
         )
         @test collect(table.id) == collect(4099:4103)
         @test collect(table.category) == fill("batch-3", 5)
+    end
+end
+
+@testset "filters on converted columns fetch only their columns" begin
+    n = 20_000
+    io = IOBuffer()
+    Arrow.Writer(io; file=true) do writer
+        for batch = 1:4
+            Arrow.write(
+                writer,
+                (
+                    x=collect(((batch - 1) * n + 1):(batch * n)),
+                    t=[Time(0) + Second(i % 86_400) for i = 1:n],
+                    k=[Symbol(:key, i % 7) for i = 1:n],
+                    pad=fill(repeat("p", 64), n),
+                ),
+            )
+        end
+    end
+    bytes = take!(io)
+    full = Arrow.Table(copy(bytes))
+    for filter in (
+        Arrow.colcmp(>=, Arrow.col(:t), Time(5, 30)),
+        Arrow.colcmp(==, Arrow.col(:t), Time(0, 0, 7)),
+        Arrow.colin(Arrow.col(:t), (Time(0, 0, 7), Time(0, 0, 9))),
+        Arrow.colcmp(==, Arrow.col(:k), :key3),
+    )
+        fetched = Ref(0)
+        source = Arrow.SourceFile(MeteredSource(bytes, fetched); tailbytes=1024, gapbytes=0)
+        got = Arrow.Table(source; select=[:x], filter)
+        want = Tables.scan(full, Tables.Scan(select=(:x,), filter=filter))
+        @test collect(got.x) == collect(want.x)
+        @test fetched[] < length(bytes) ÷ 4
     end
 end
 

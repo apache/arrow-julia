@@ -618,21 +618,21 @@ function _temporalscan(index::Int, dates)
     needle = _dateneedle(dates)
     noon = DateTime(needle) + Hour(12)
     mode = mod1(index, 6)
-    filter, storage, label = if mode == 1
-        (Tables.colcmp(==, Tables.col(:dates), needle), true, :date_scalar)
+    filter, label = if mode == 1
+        (Tables.colcmp(==, Tables.col(:dates), needle), :date_scalar)
     elseif mode == 2
-        (Tables.colin(Tables.col(:dates), (needle,)), true, :date_tuple)
+        (Tables.colin(Tables.col(:dates), (needle,)), :date_tuple)
     elseif mode == 3
-        (Tables.colin(Tables.col(:dates), Date[needle]), true, :date_array)
+        (Tables.colin(Tables.col(:dates), Date[needle]), :date_array)
     elseif mode == 4
-        (Tables.colin(Tables.col(:dates), Set([needle])), true, :date_set)
+        (Tables.colin(Tables.col(:dates), Set([needle])), :date_set)
     elseif mode == 5
-        (Tables.colcmp(!=, Tables.col(:dates), noon), false, :date_scalar_public)
+        (Tables.colcmp(!=, Tables.col(:dates), noon), :date_datetime)
     else
-        (Tables.colin(Tables.col(:dates), (noon, needle)), false, :date_tuple_public)
+        (Tables.colin(Tables.col(:dates), (noon, needle)), :date_datetime_tuple)
     end
     scan = Tables.Scan(select=(:strings => :text, :dates), filter=filter)
-    return (; scan, storage, label)
+    return (; scan, label)
 end
 
 function _scans(master::UInt64, index::Int, dates)
@@ -642,16 +642,14 @@ function _scans(master::UInt64, index::Int, dates)
     threshold = Int64(_range(rng, -8, 8))
     needle = _choice(rng, TEXT)
     return (
-        (scan=Tables.Scan(), storage=true, label=:identity),
+        (scan=Tables.Scan(), label=:identity),
         (
             scan=Tables.Scan(select=(:ints, :strings, :dictionary)),
-            storage=true,
             label=:projection,
         ),
         _temporalscan(index, dates),
         (
             scan=Tables.Scan(select=(), filter=Tables.isnull(Tables.col(:ints))),
-            storage=true,
             label=:null_filter,
         ),
         (
@@ -660,7 +658,6 @@ function _scans(master::UInt64, index::Int, dates)
                 filter=Tables.colcmp(>, Tables.col(:ints), threshold),
                 limit=limit,
             ),
-            storage=true,
             label=:comparison,
         ),
         (
@@ -669,7 +666,6 @@ function _scans(master::UInt64, index::Int, dates)
                 filter=Tables.colin(Tables.col(:strings), (needle, missing)),
                 offset=offset,
             ),
-            storage=true,
             label=:string_membership,
         ),
     )
@@ -1362,11 +1358,6 @@ function _run_differential_case(master::UInt64, index::Int)
         full = Arrow.Table(copy(bytes))
         for (scanindex, scancase) in enumerate(_scans(master, index, case.expected.dates))
             scan = scancase.scan
-            plan = Arrow._ScanPlan(scan, getfield(full, :schema).fields)
-            _require(
-                (plan.storage !== nothing) == scancase.storage,
-                "$label scan=$(scancase.label) used the wrong evaluation domain",
-            )
             reference = Tables.scan(full, scan)
             whole = Arrow.Table(copy(bytes); scan=scan)
             _check_same_table(whole, reference; label="$label whole scan=$scanindex")

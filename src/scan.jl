@@ -512,228 +512,22 @@ function _zerofieldcount(n0::Int64, keep, limit, offset)
     limit === nothing ? n : min(n, Int64(limit))
 end
 
-# --- scan value domain -------------------------------------------------------
-# Pushdown filtering runs over storage-domain values; facade
-# filter literals arrive in public Julia types. Lower native literals to the
-# referenced field's storage domain before the scan when that preserves
-# semantics. Registered logical extensions fall back to the public domain.
-# Conversion back to public types happens exactly once on the scan output
-# under the output names already compiled into the scan plan.
-
-# Lowering returns (ok, value): ok=false means the literal has NO exact,
-# semantics-preserving storage representation for this field (cross-type
-# inexactness, wrong type entirely) — the caller must then evaluate the
-# whole filter in the PUBLIC domain instead of pushing it down. There is no
-# pass-through: an unlowered literal comparing "equal" to raw storage would
-# change predicate semantics.
-_nativefacadeconversion(t::AC.ArrowType) =
-    _istemporalconv(t) ||
-    t isa Union{AC.DecimalType,AC.IntervalType} ||
-    (t isa AC.DictionaryType && _nativefacadeconversion(t.valuetype))
-_nativefacadeconversion(f::AC.Field) =
-    _nativefacadeconversion(f.type) || any(_nativefacadeconversion, f.children)
-
-_equalityoperator(op) = op == Tables.OP_EQ || op == Tables.OP_NE
-
-_scancomparisonpreserving(::AC.ArrowType, op) = true
-_scancomparisonpreserving(::Union{AC.DecimalType,AC.IntervalType}, op) = false
-_scancomparisonpreserving(t::AC.DictionaryType, op) =
-    _scancomparisonpreserving(t.valuetype, op)
-_scancomparisonpreserving(t::AC.DateType, op) = t.unit == AC.DAY || _equalityoperator(op)
-# `ZonedTimestamp` and `Timestamp` order by their Int64 count — a total
-# bijection with storage — so every operator survives lowering at every
-# unit. (Date64 stays equality-only above: its `DateTime` epoch shift wraps
-# at the Int64 edges.)
-_scancomparisonpreserving(::AC.TimestampType, op) = true
-_scancomparisonpreserving(::AC.TimeType, op) = false
-_scancomparisonpreserving(::AC.DurationType, op) = true
-
-_scanliteralcompatible(::AC.ArrowType, value) = true
-_scanliteralcompatible(t::AC.DictionaryType, value) =
-    _scanliteralcompatible(t.valuetype, value)
-function _scanliteralcompatible(t::AC.DurationType, value)
-    scale = _periodscale(value)
-    return scale !== nothing && scale >= _durationunitscale(t.unit)
-end
-
-_scandescriptor(t::AC.DictionaryType) = _scandescriptor(t.valuetype)
-_scandescriptor(t::AC.ArrowType) = t
-
-# The FIELD whose descriptor governs a lowered literal: run-end encoding and
-# dictionary encoding are transparent wrappers whose flat expansion is the
-# leaf's storage, so literals lower against the leaf exactly as the public
-# values compare. (Dictionary children live on the type; run-end children on
-# the Field — this walk sees both.)
-function _lowerleaffield(f::AC.Field)
+# The field whose values a filter literal compares with: run-end and
+# dictionary encodings are transparent wrappers around their values' field.
+# (Dictionary children live on the type; run-end children on the Field.)
+function _leaffield(f::AC.Field)
     t = f.type
     if t isa AC.RunEndEncodedType && length(f.children) == 2
-        return _lowerleaffield(f.children[2])
+        return _leaffield(f.children[2])
     end
-    t isa AC.DictionaryType && return _lowerleaffield(AC.dictvaluefield(f, t))
+    t isa AC.DictionaryType && return _leaffield(AC.dictvaluefield(f, t))
     return f
-end
-
-function _scanfacadetostorage(t::AC.ArrowType, v)
-    result = _exactfacadescalar(_scandescriptor(t), v)
-    return result === nothing ? (false, v) : (true, result)
-end
-
-function _storagevalue(f::AC.Field, v, op)
-    if !_hasarrowtypesextension(f)
-        # A temporal descriptor at the root — or behind transparent run-end
-        # or dictionary wrappers — can lower a scalar literal. A temporal
-        # conversion nested inside a COMPOSITE container cannot: its values
-        # sit inside public rows, so the whole filter evaluates publicly.
-        lf = _lowerleaffield(f)
-        _nativefacadeconversion(lf) || return true, v
-        _nativefacadeconversion(lf.type) || return false, v
-        _scancomparisonpreserving(lf.type, op) || return false, v
-        _scanliteralcompatible(lf.type, v) || return false, v
-        return _scanfacadetostorage(lf.type, v)
-    end
-    # ArrowTypes does not require `toarrow` to preserve Julia comparison
-    # semantics. A logical type may, for example, compare by an equivalence
-    # class while storing one concrete identifier. Evaluate every registered
-    # extension filter, including one nested below an unmarked container, over
-    # the restored public values.
-    return false, v
 end
 
 function _fieldfor(fields, ref, names)
     ref isa Int && 1 <= ref <= length(fields) && return fields[ref]
     i = findfirst(==(Symbol(ref)), names)
     return i === nothing ? nothing : fields[i]
-end
-
-_loweringdescriptor(t::AC.DictionaryType) = _loweringdescriptor(t.valuetype)
-_loweringdescriptor(t::AC.ArrowType) = t
-
-@noinline function _lowersequence(
-    token::Val{K},
-    descriptor::AC.ArrowType,
-    values::V,
-    budget,
-) where {K,V<:Union{Tuple,Array}}
-    # Tuple and Array membership both use `==`. A closed storage vector keeps
-    # that contract without synthesizing a request-width Tuple type or boxing
-    # every lowered temporal scalar.
-    for x in values
-        _scanliteralcompatible(descriptor, x) || return false, values
-        _exactfacadevalue(token, x) === nothing && return false, values
-    end
-    _chargevector!(budget, _LoweredTemporal, length(values), "lowered membership values")
-    out = Vector{_LoweredTemporal}(undef, length(values))
-    for (i, x) in enumerate(values)
-        out[i] = _exactfacadevalue(token, x)::_LoweredTemporal
-    end
-    return true, out
-end
-
-function _lowermembership(f::AC.Field, values::Union{Tuple,Array}, budget)
-    # A temporal conversion nested inside a COMPOSITE container is not a
-    # scalar membership conversion. Match `_storagevalue` and decline it
-    # before any output is allocated; transparent wrappers lower.
-    lf = _lowerleaffield(f)
-    _nativefacadeconversion(lf.type) || return false, values
-    _scancomparisonpreserving(lf.type, Tables.OP_EQ) || return false, values
-    descriptor = _loweringdescriptor(lf.type)
-    return _lowersequence(_facadetoken(descriptor), descriptor, values, budget)
-end
-
-@noinline function _lowerset(token::Val{K}, publictype, values::Set, budget) where {K}
-    for x in values
-        x isa publictype || return false, values
-        _exactfacadevalue(token, x) === nothing && return false, values
-    end
-    _chargedict!(
-        budget,
-        _LoweredTemporal,
-        Nothing,
-        length(values),
-        "lowered membership set",
-    )
-    out = Set{_LoweredTemporal}()
-    sizehint!(out, length(values))
-    for x in values
-        # Set membership uses `isequal` plus hashing. A cross-type public
-        # value can compare `==` (Date and midnight DateTime) while remaining
-        # a distinct Set key. Lower only canonical public-domain members.
-        push!(out, _exactfacadevalue(token, x)::_LoweredTemporal)
-    end
-    return true, out
-end
-
-function _lowermembership(f::AC.Field, values::Set, budget)
-    lf = _lowerleaffield(f)
-    _nativefacadeconversion(lf.type) || return false, values
-    _scancomparisonpreserving(lf.type, Tables.OP_EQ) || return false, values
-    descriptor = _loweringdescriptor(lf.type)
-    return _lowerset(_facadetoken(descriptor), _facadebasetype(descriptor), values, budget)
-end
-
-_lowermembership(::AC.Field, values, budget) = (false, values)
-
-@inline function _chargescannode!(budget, e, what)
-    _chargeobject!(budget, max(sizeof(e), 64), what)
-    return nothing
-end
-
-function _lowerexpr(e, fields, names, ok::Base.RefValue{Bool}, budget=nothing)
-    e === nothing && return nothing
-    if e isa Tables.Cmp
-        f = _fieldfor(fields, e.lhs.ref, names)
-        f === nothing && return e
-        good, v = _storagevalue(f, e.rhs, e.op)
-        good || (ok[] = false)
-        _chargescannode!(budget, e, "lowered comparison node")
-        return Tables.Cmp(e.op, e.lhs, v)
-    elseif e isa Tables.In
-        f = _fieldfor(fields, e.lhs.ref, names)
-        f === nothing && return e
-        # Keep the caller's collection object. Rebuilding it as a Tuple would
-        # change membership semantics: Set uses `isequal` (NaN and signed zero
-        # matter), while Tuple and Array use `==`. Do not even iterate an
-        # arbitrary membership object: `in(x, values)` is the Tables contract,
-        # and `values` may be non-iterable or stateful. A field whose public
-        # values require conversion can lower only whitelisted Base containers
-        # whose membership semantics we can retain.
-        if _hasarrowtypesextension(f)
-            ok[] = false
-            return e
-        end
-        _nativefacadeconversion(f) || return e
-        # `e.values`' type is known at run time; see `_uninferred`.
-        good, values = _uninferred(_lowermembership, f, e.values, budget)::Tuple{Bool,Any}
-        if !good
-            ok[] = false
-            return e
-        end
-        _chargescannode!(budget, e, "lowered membership node")
-        return Tables.In(e.lhs, values)
-    elseif e isa Union{Tables.IsNull,Tables.StrPred}
-        f = _fieldfor(fields, e.lhs.ref, names)
-        if f !== nothing
-            _hasarrowtypesextension(f) && (ok[] = false)
-            e isa Tables.StrPred && _nativefacadeconversion(f) && (ok[] = false)
-        end
-        return e
-    elseif e isa Tables.AndExpr
-        _chargevector!(budget, Tables.ScanExpr, length(e.args), "lowered filter arguments")
-        _chargescannode!(budget, e, "lowered conjunction node")
-        return Tables.AndExpr(
-            Tables.ScanExpr[_lowerexpr(a, fields, names, ok, budget) for a in e.args],
-        )
-    elseif e isa Tables.OrExpr
-        _chargevector!(budget, Tables.ScanExpr, length(e.args), "lowered filter arguments")
-        _chargescannode!(budget, e, "lowered disjunction node")
-        return Tables.OrExpr(
-            Tables.ScanExpr[_lowerexpr(a, fields, names, ok, budget) for a in e.args],
-        )
-    elseif e isa Tables.NotExpr
-        _chargescannode!(budget, e, "lowered negation node")
-        return Tables.NotExpr(_lowerexpr(e.arg, fields, names, ok, budget))
-    end
-    return e
 end
 
 # --- zoned timestamp literals --------------------------------------------------
@@ -754,7 +548,7 @@ _utcinstant(x::Durations.Timestamp{P}) where {P} = Durations.ZonedTimestamp{P,:U
 # `x` as a literal for field `f`: unchanged unless `f` holds zoned timestamps.
 function _zonedliteral(f::AC.Field, x)
     x isa _ZonelessTime || return x
-    t = _lowerleaffield(f).type
+    t = _leaffield(f).type
     t isa AC.DictionaryType && (t = t.valuetype)
     t isa AC.TimestampType || return x
     zone = _timestampzone(t)
@@ -834,7 +628,7 @@ end
 
 function _filterkind(f::AC.Field)
     _hasarrowtypesextension(f) && return nothing
-    t = _lowerleaffield(f).type
+    t = _leaffield(f).type
     t isa Union{AC.IntType,AC.FloatType,AC.BoolType,AC.DecimalType} && return :number
     (t isa AC.Utf8Type || (t isa AC.ViewType && t.utf8)) && return :string
     t isa AC.DateType && return :local
@@ -895,16 +689,13 @@ _kindvalues(f::AC.Field, kind::Symbol) =
     kind === :string ? "strings" : "$(Base.nonmissingtype(_declaredeltype(f))) values"
 
 """
-One scan plan resolved against one Arrow schema. `names` is the owned source
-schema identity used by every executor. `public` is the request in the public
-domain. `storage` is the same selection and window with an exactly lowered
-storage-domain filter and no type overrides; `nothing` means the filter must
-run after facade conversion.
+One scan request resolved against one Arrow schema. `names` is the owned
+source schema identity used by every executor; `bound` is the request, which
+filters and converts public values.
 """
 struct _ScanPlan
     names::Vector{Symbol}
-    public::Tables.BoundScan
-    storage::Union{Nothing,Tables.BoundScan}
+    bound::Tables.BoundScan
 end
 
 function _deduplicatesorted!(values::Vector)
@@ -931,26 +722,7 @@ function _ScanPlan(scan::Tables.Scan, fields, budget=nothing)
     names = _fieldnamesymbols(fields, budget)
     b = _zonedbound(_resolvescan(scan, names), fields, names)
     _checkliterals(b.filter, fields, names)
-    # The facade keeps zero-field sources on its metadata-count path. Avoid
-    # compiling a storage form that no adapter will consume.
-    isempty(fields) && return _ScanPlan(names, b, nothing)
-    ok = Ref(true)
-    lowered = _lowerexpr(b.filter, fields, names, ok, budget)
-    ok[] || return _ScanPlan(names, b, nothing)
-    _chargevector!(budget, Tables.BoundColumn, length(b.columns), "storage scan columns")
-    columns =
-        Tables.BoundColumn[Tables.BoundColumn(c.index, c.name, nothing) for c in b.columns]
-    _chargevector!(budget, Int, length(b.filtercols), "storage scan filter columns")
-    _chargeobject!(budget, 64, "storage scan")
-    storage = Tables.BoundScan(
-        columns,
-        lowered,
-        copy(b.filtercols),
-        b.limit,
-        b.offset,
-        b.validate,
-    )
-    return _ScanPlan(names, b, storage)
+    return _ScanPlan(names, b)
 end
 
 "Column table whose schema does not become part of its Julia type."
@@ -982,17 +754,12 @@ end
 Base.propertynames(t::_ScanColumns) = getfield(t, :names)
 Base.getproperty(t::_ScanColumns, name::Symbol) = Tables.getcolumn(t, name)
 
-# Join the pieces of one decoded output column under its declared storage
-# claim when that claim closes, else as `Vector{Any}`. A facade scan may put
-# private ArrowTypes routing values in those pieces; they never leave the
-# facade scan operation. The empty result follows the same rule, so a scan
-# that keeps no rows still reports the schema a nonempty one would.
+# Join the pieces of one output column, one per batch, into one column of
+# their element types' join; string pieces join into one string column.
 function _joinscanparts(f::Field, parts::Vector, budget=nothing)
     if isempty(parts)
-        # Match `_storagebatchcolumn`: a zero-row result must not change its
-        # public Tables.Schema based on whether a window avoided decoding or
-        # a filter decoded an empty slice. Dynamic composite routes stay Any;
-        # closed scalar routes retain their declared element type.
+        # `_finishfacadescan` gives an empty column the type a full read
+        # gives it.
         ET = _storageelementclaim(f)
         _chargevector!(budget, ET, 0, "empty scan column")
         return Vector{ET}()
@@ -2537,7 +2304,7 @@ function _publicscan(
     regions,
     budget=nothing,
 )
-    b = plan.public
+    b = plan.bound
     got = _executeplan(full, b, plan.names, budget)
     cols = Tables.columns(got)
     ncols = length(Tables.columnnames(cols))
@@ -2593,17 +2360,19 @@ function _boundschema(schema, sourcefields, b::Tables.BoundScan, precols, budget
     )
 end
 
-"Finish a facade scan by converting its operation-local raw result once."
+"""
+Finish a facade scan: apply its type overrides to the public columns it read,
+give an empty column the type a full read gives, and wrap the Table.
+"""
 function _finishfacadescan(
     got,
     schema,
     sourcefields,
-    plan::_ScanPlan;
+    plan::_ScanPlan,
+    views::_ViewContext;
     regions=AC.OwnerRegion[],
     budget=nothing,
     poolof=nothing,
-    views::_ViewContext=_ViewContext(DataStrings.DataString, budget),
-    public::Bool=false,
 )
     cols = Tables.columns(got)
     ncols = length(Tables.columnnames(cols))
@@ -2614,7 +2383,7 @@ function _finishfacadescan(
     _chargevector!(budget, AbstractVector, length(columns), "pre-override facade columns")
     precols = AbstractVector[]
     sizehint!(precols, length(columns))
-    b = plan.public
+    b = plan.bound
     pools = nothing
     if !isempty(sourcefields)
         arrowtypes = _ArrowTypesContext(budget=budget)
@@ -2626,34 +2395,22 @@ function _finishfacadescan(
         )
         for (i, bc) in enumerate(b.columns)
             f = sourcefields[bc.index]
-            if !public && _periodoverride(bc, f)
-                columns[i] = _uninferred(
-                    _timeperiods,
-                    f.type,
-                    columns[i],
-                    Base.nonmissingtype(bc.type),
-                )
+            col = isempty(columns[i]) ? _emptycolumn(f, views, arrowtypes) : columns[i]
+            if _periodoverride(bc, f)
+                columns[i] =
+                    _uninferred(_timeperiods, f.type, col, Base.nonmissingtype(bc.type))
                 # A real conversion: the output does not keep the time field.
                 push!(precols, Dates.Time[])
-                continue
-            elseif !public && _symboloverride(bc, f)
+            elseif _symboloverride(bc, f)
                 # The stored strings, without creating a Symbol per value.
-                columns[i] = _uninferred(_applyoverride, bc.type, columns[i], budget)
+                columns[i] = _uninferred(_applyoverride, bc.type, col, budget)
                 push!(precols, Symbol[])
-                continue
+            else
+                push!(precols, col)
+                columns[i] =
+                    bc.type === nothing ? col :
+                    _uninferred(_applyoverride, bc.type, col, budget)
             end
-            # Public type overrides run HERE, after facade conversion —
-            # they are public-domain requests, never storage casts, and
-            # they preserve missing exactly as Tables.scan does.
-            # `public` columns are already the full read's (a select-only scan).
-            base =
-                public ? columns[i] :
-                _scanview(f) ? _scanviewoutput(f, columns[i], views) :
-                _uninferred(_facadefromraw, f, columns[i], arrowtypes)
-            push!(precols, base)
-            columns[i] =
-                bc.type === nothing ? base :
-                _uninferred(_applyoverride, bc.type, base, budget)
         end
         # Dictionary columns keep their source category pool, as a full read
         # does, so a rewrite preserves category order (required when ordered).
@@ -2672,6 +2429,11 @@ function _finishfacadescan(
     _chargevector!(budget, AC.OwnerRegion, length(regions), "scan owner regions")
     return _table(names, columns, bound, AC.OwnerRegion[regions...], nrows, pools, budget)
 end
+
+# The column a full read of no record batches gives field `f`.
+_emptycolumn(f::AC.Field, views::_ViewContext, arrowtypes) =
+    _viewable(f) ? _viewcolumn(f, AC.ArrayData[], views) :
+    _facadecolumn(f, Any[], arrowtypes)
 
 # File record batches all reference each dictionary's final pool, so the first
 # decoded snapshot of a selected dictionary column is the pool a full read
@@ -2692,29 +2454,6 @@ function _snapshotdict!(snapshots, field::Field, data::ArrayData)
     return nothing
 end
 
-# The facade executor only accepts the override-free storage half of a plan.
-# Keep that coupled invariant at the one operation that needs both halves.
-function _facadestorage(plan::_ScanPlan)
-    b = plan.storage
-    b === nothing && throw(AssertionError("facade scan has no storage-domain plan"))
-    p = plan.public
-    length(b.columns) == length(p.columns) ||
-        throw(AssertionError("facade storage selection width changed"))
-    all(
-        bc.type === nothing && bc.index == pc.index && bc.name == pc.name for
-        (bc, pc) in zip(b.columns, p.columns)
-    ) || throw(AssertionError("facade storage selection retained a public override"))
-    b.filtercols == p.filtercols ||
-        throw(AssertionError("facade storage filter references changed"))
-    (b.limit == p.limit && b.offset == p.offset && b.validate == p.validate) ||
-        throw(AssertionError("facade storage window or validation mode changed"))
-    return b
-end
-
-# These facade operations own the full private route: create ArrowTypes Union
-# markers while decoding, consume them during public conversion, and return a
-# Table from the public domain. No marker-bearing intermediate crosses into
-# `table.jl`.
 function _applyfacadescan(
     f::ArrowFile,
     plan::_ScanPlan,
@@ -2722,16 +2461,16 @@ function _applyfacadescan(
     stringtype::Type=DataStrings.DataString,
     ntasks::Int=1,
 )
-    b = _facadestorage(plan)
+    b = plan.bound
     actual = budget === nothing ? _readbudget(f.limits, f.region.len) : budget
-    routes = _ArrowTypesRoutePlan(actual)
+    arrowtypes = _ArrowTypesContext(budget=actual)
     views = _ViewContext(stringtype, actual)
     snapshots = _dictsnapshots(f.fields, b, actual)
-    rawoverrides = _rawoverrides(plan.public, f.fields)
+    rawoverrides = _rawoverrides(b, f.fields)
     materialize =
         (field, data, _) -> (
             _snapshotdict!(snapshots, field, data);
-            _scanbatchcolumn(field, data, routes, views, _checkstimes(rawoverrides, field))
+            _scanbatchcolumn(field, data, arrowtypes, views, rawoverrides)
         )
     # A scan that only selects keeps every row: its columns are the full
     # read's columns (views chain, strings are one column), with no per-batch
@@ -2744,12 +2483,11 @@ function _applyfacadescan(
         got,
         f.schema,
         f.fields,
-        plan;
+        plan,
+        views;
         regions=AC.OwnerRegion[f.region],
         budget=actual,
         poolof=(_, field, ctx) -> _retainedsnapshotpool(field, snapshots[field], ctx),
-        views=views,
-        public=selectonly,
     )
 end
 
@@ -2796,68 +2534,47 @@ function _applyfacadescan(
     budget::AllocationBudget;
     stringtype::Type=DataStrings.DataString,
 )
-    routes = _ArrowTypesRoutePlan(budget)
+    b = plan.bound
+    arrowtypes = _ArrowTypesContext(budget=budget)
     views = _ViewContext(stringtype, budget)
-    b = _facadestorage(plan)
     snapshots = _dictsnapshots(ft.fields, b, budget)
-    rawoverrides = _rawoverrides(plan.public, ft.fields)
+    rawoverrides = _rawoverrides(b, ft.fields)
     materialize =
         (field, data, _) -> (
             _snapshotdict!(snapshots, field, data);
-            _scanbatchcolumn(field, data, routes, views, _checkstimes(rawoverrides, field))
+            _scanbatchcolumn(field, data, arrowtypes, views, rawoverrides)
         )
     got = _runboundscan(sf, b, plan.names, ft, budget, materialize)
     return _finishfacadescan(
         got,
         ft.sch,
         ft.fields,
-        plan;
+        plan,
+        views;
         budget=budget,
         poolof=(_, field, ctx) -> _retainedsnapshotpool(field, snapshots[field], ctx),
-        views=views,
     )
 end
 
-function _facadescanrawcolumn(
-    fields,
-    batches,
-    i::Int,
-    budget,
-    routes::_ArrowTypesRoutePlan,
-    views::_ViewContext,
-    checktimes=true,
-)
-    f = fields[i]
-    _scanview(f) &&
-        return _viewcolumn(f, AC.ArrayData[b.columns[i] for b in batches], views)
-    _chargevector!(budget, AbstractVector, length(batches), "stream scan column parts")
-    parts = AbstractVector[
-        _scanbatchcolumn(f, b.columns[i], routes, views, checktimes) for b in batches
-    ]
-    return _joinscanparts(f, parts, budget)
-end
-
-# Facade scans read a flat column as the view a full read gives whenever its
-# storage and public values agree. Dates, times, timestamps, and durations
-# stay in storage until the filter has run: their literals lower to storage.
-_scanview(f::AC.Field) = _viewable(f) && !_storageconverted(f)
-function _storageconverted(f::AC.Field)
-    t = f.type
-    t isa AC.DictionaryType && return _storageconverted(AC.dictvaluefield(f, t))
-    t isa AC.RunEndEncodedType && return _storageconverted(f.children[2])
-    return _istemporalconv(t)
-end
-
-_scanbatchcolumn(
+"""
+One decoded batch column of a scan, in the public domain: the view a full
+read gives, or the materialized column. A field in `rawoverrides` reads its
+stored values instead (see `_periodoverride` and `_symboloverride`).
+"""
+function _scanbatchcolumn(
     f::AC.Field,
     d::AC.ArrayData,
-    routes,
+    arrowtypes::_ArrowTypesContext,
     views::_ViewContext,
-    checktimes=true,
-) =
-    _scanview(f) ? _viewcolumn(f, AC.ArrayData[d], views) :
-    _viewable(f) && _istemporalconv(f.type) ? _storageview(f, d, views, checktimes) :
-    _batchcolumn(f, d, routes)
+    rawoverrides,
+)
+    if any(x -> x === f, rawoverrides)
+        f.type isa AC.TimeType && return _storedticks(f, d, views.budget)
+        return _storagebatchcolumn(f, d, views.budget)
+    end
+    _viewable(f) && return _viewcolumn(f, AC.ArrayData[d], views)
+    return _facadesinglecolumn(f, d, arrowtypes)
+end
 
 # A select override of a time-of-day column with a `Dates.Period` type reads
 # its stored ticks as periods (`_timeperiods`), so its values are not checked
@@ -2880,23 +2597,14 @@ _rawoverrides(b::Tables.BoundScan, fields) = AC.Field[
     fields[bc.index] for bc in b.columns if
     _periodoverride(bc, fields[bc.index]) || _symboloverride(bc, fields[bc.index])
 ]
-_checkstimes(rawoverrides, f::AC.Field) = !any(x -> x === f, rawoverrides)
 
-# A temporal column stays in storage until the filter has run: a view of its
-# stored integers, the claim `_storagebatchcolumn` would materialize.
-function _storageview(f::AC.Field, d::AC.ArrayData, ctx::_ViewContext, checktimes=true)
-    t = f.type
-    checktimes && t isa AC.TimeType && _checktimes(f, t, d, ctx.budget)
-    S = _rawdeclaredbasetype(t)
-    _chargeobject!(ctx.budget, _VIEW_OBJECT_BYTES, "column view")
+# A time-of-day column's stored ticks, not checked against a day's length.
+function _storedticks(f::AC.Field, d::AC.ArrayData, budget)
+    S = _rawdeclaredbasetype(f.type)
+    _chargeobject!(budget, _VIEW_OBJECT_BYTES, "column view")
     nullable = Missing <: _declaredeltype(f, false) || _viewnulls(f, d)
-    return _primitive(nullable ? Union{Missing,S} : S, S, Nothing, d, ctx.budget)
+    return _primitive(nullable ? Union{Missing,S} : S, S, Nothing, d, budget)
 end
-
-# A selected view column's scan output: its gathered rows, or, when no row
-# survived, an empty vector of the element type a full read gives.
-_scanviewoutput(f::AC.Field, col, views::_ViewContext) =
-    isempty(col) ? _vieweltype(f, AC.ArrayData[], views)[] : col
 
 function _applyfacadescan(
     s::IPCStream,
@@ -2925,15 +2633,14 @@ function _scanbatches(
     views::_ViewContext,
     ntasks::Int,
 )
-    b = _facadestorage(plan)
+    b = plan.bound
     _chargevector!(budget, AbstractVector, length(fields), "stream scan columns")
-    routes = _ArrowTypesRoutePlan(budget)
+    arrowtypes = _ArrowTypesContext(budget=budget)
     nrows = sum(b -> Int(b.nrows), batches; init=0)
     poolof = (bc, field, ctx) -> _retaineddictpool(field, batches, bc.index, ctx)
-    rawoverrides = _rawoverrides(plan.public, fields)
+    rawoverrides = _rawoverrides(b, fields)
     if _selectsonly(b) && !isempty(plan.names) && isempty(rawoverrides)
         # Every row is kept: the selected columns are the full read's.
-        arrowtypes = _ArrowTypesContext(budget=budget)
         idxs = Int[c.index for c in b.columns]
         columns = _buildcolumns(fields, batches, idxs, arrowtypes, views, ntasks; lazy=true)
         got = _scantable(Symbol[c.name for c in b.columns], columns, nrows, budget)
@@ -2941,12 +2648,11 @@ function _scanbatches(
             got,
             schema,
             fields,
-            plan;
+            plan,
+            views;
             regions=regions,
             budget=budget,
             poolof=poolof,
-            views=views,
-            public=true,
         )
     end
     # Only the selected and filter-referenced columns are built; the executor
@@ -2959,27 +2665,30 @@ function _scanbatches(
     b.validate && fill!(needed, true)
     rawcolumns = AbstractVector[
         needed[i] ?
-        _facadescanrawcolumn(
-            fields,
-            batches,
-            i,
+        _joinscanparts(
+            fields[i],
+            AbstractVector[
+                _scanbatchcolumn(fields[i], bt.columns[i], arrowtypes, views, rawoverrides)
+                for bt in batches
+            ],
             budget,
-            routes,
-            views,
-            _checkstimes(rawoverrides, fields[i]),
         ) : Missing[] for i = 1:length(fields)
     ]
     raw = _ScanColumns(plan.names, rawcolumns, nrows)
-    got = _executeplan(raw, b, plan.names, budget)
+    # `_finishfacadescan` applies the type overrides.
+    columns = Tables.BoundColumn[Tables.BoundColumn(c.index, c.name, nothing) for c in b.columns]
+    unconverted =
+        Tables.BoundScan(columns, b.filter, b.filtercols, b.limit, b.offset, b.validate)
+    got = _executeplan(raw, unconverted, plan.names, budget)
     return _finishfacadescan(
         got,
         schema,
         fields,
-        plan;
+        plan,
+        views;
         regions=regions,
         budget=budget,
         poolof=poolof,
-        views=views,
     )
 end
 

@@ -508,7 +508,6 @@ end
 
 # Days from Julia's Date epoch (0000-12-31) to the Arrow epoch (1970-01-01).
 const _EPOCH_DAYS = Dates.value(Dates.Date(1970, 1, 1))
-const _LoweredTemporal = Union{Int32,Int64}
 const _MILLIS_PER_DAY = Int128(86_400_000)
 const _NANOS_PER_DAY = Int64(86_400_000_000_000)
 
@@ -528,8 +527,8 @@ function _publictime(unit, x)
     return Dates.Time(Dates.Nanosecond(v * (_NANOS_PER_DAY ÷ perday)))
 end
 
-# Map a temporal descriptor to the compile-time token the lowering loops
-# dispatch on; eighteen values total (2 date + 4 timestamp + 4 zoned
+# Map a temporal descriptor to the compile-time token the writer's conversion
+# loops dispatch on; eighteen values total (2 date + 4 timestamp + 4 zoned
 # timestamp + 4 time + 4 duration). Zone-declared timestamps carry their own
 # kind: their literal domain (`ZonedTimestamp`/`ZonedDateTime`) is disjoint
 # from the zone-naive one.
@@ -1809,20 +1808,15 @@ function Table(
             )
             return _tablefrom(opened, nothing, budget; stringtype=stringtype, ntasks=ntasks)
         end
-        # Range planning pays off only for a pushable scan over a file-format
-        # object with columns. With a scan the schema comes up front from
-        # the cached tail: literal lowering, exactly-once output conversion,
-        # and DataAPI metadata all need it.
+        # A scan over a file-format object with columns plans its byte ranges
+        # from the Footer, which the cached tail holds.
         if _isfilesource(sf, budget)
             ft = _readfooter(sf, sf.limits, budget)
             plan = _ScanPlan(scan, ft.fields, budget)
-            if !isempty(ft.fields) && plan.storage !== nothing
+            if !isempty(ft.fields)
                 return _applyfacadescan(sf, plan, ft, budget; stringtype=stringtype)
             end
-            # A public-domain fallback still reuses the scan plan compiled
-            # from the Footer schema after the object is read in full. Keep
-            # the same budget through whole-object assembly, parsing, and
-            # lazy batch materialization.
+            # A file without columns is its row counts: read it whole.
             opened = _openbytes(
                 _wholeobject(sf, budget);
                 limits=readlimits,
@@ -2029,18 +2023,7 @@ function _tablefrom(
         regions,
         budget,
     )
-    plan.storage !== nothing &&
-        return _applyfacadescan(src, plan, budget; stringtype=stringtype, ntasks=ntasks)
-    # A scan with an unrepresentable storage-domain literal evaluates its
-    # public-domain plan over the fully converted table.
-    return _publicscan(
-        _materialize_table(src, regions, budget; stringtype=stringtype, ntasks=ntasks),
-        _tableschema(src),
-        fields,
-        plan,
-        regions,
-        budget,
-    )
+    return _applyfacadescan(src, plan, budget; stringtype=stringtype, ntasks=ntasks)
 end
 
 function _corefields(source::Union{IPCStream,ArrowFile}, budget=nothing)
