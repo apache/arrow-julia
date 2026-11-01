@@ -223,12 +223,14 @@ bitmaps cross without copying, from `Vector`s of numbers and from an
 reads them; string and list offsets are rebuilt, and string bytes may be copied. The
 consumer moves or releases the two structs; the table's memory stays reachable until it
 has released the array, and what Arrow.jl allocated is freed by later exports or
-garbage collections. A table that needs more than one record batch (several partitions,
-or string data past 2 GiB) is an `ArgumentError`; export it with
+garbage collections. A table that needs more than one record batch (several partitions
+with rows, or string data past 2 GiB) is an `ArgumentError`; export it with
 [`Arrow.export_stream!`](@ref).
 """
 function to_c_data(tbl; kw...)
     sch, batches = _exportbatches(tbl; kw...)
+    # An empty first partition only fixed the schema.
+    length(batches) > 1 && filter!(b -> b.nrows > 0, batches)
     length(batches) == 1 || throw(
         ArgumentError(
             "the table needs $(length(batches)) record batches; export it with " *

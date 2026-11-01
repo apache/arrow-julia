@@ -1608,6 +1608,9 @@ function cdata_battery()
     sp, ap = to_c_data(fromjulia("only", Int64[5, 6])...)
     tone = Arrow.Table(sp, ap)
     @assert Tables.columnnames(tone) == [:only] && collect(tone.only) == [5, 6]
+    # An empty first partition only fixes the schema, as for a stream.
+    sp, ap = to_c_data(Tables.partitioner([(x=Int64[],), (x=[1, 2],)]))
+    @assert collect(Arrow.Table(sp, ap).x) == [1, 2]
     @assert try
         to_c_data(Tables.partitioner([(x=[1],), (x=[2],)]))
         false
