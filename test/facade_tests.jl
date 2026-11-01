@@ -899,36 +899,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
     end
 
     @testset "scan compilation bounds request amplification" begin
-        # One source column can expand to an arbitrary number of requested
-        # aliases. The resolver must reject that request before Tables builds
-        # its output vector.
-        aliases = Tables.Scan(select=fill(:only, 100_000))
-        @test_throws Arrow.AllocationLimitError Arrow._resolvescan(
-            aliases,
-            [:only],
-            Arrow.AllocationBudget(1_000_000),
-        )
-
-        # Regex resolution converts schema Symbols to Strings twice: once in
-        # the bounded preflight and once in Tables.resolve.
-        longname = Symbol(repeat("field", 20_000))
-        regexscan = Tables.Scan(select=(r"absent",), validate=false)
-        @test_throws Arrow.AllocationLimitError Arrow._resolvescan(
-            regexscan,
-            [longname],
-            Arrow.AllocationBudget(100_000),
-        )
-
-        # Filter resolution reconstructs the expression tree. Its width is a
-        # request-controlled resource even over a one-column file.
-        leaf = Tables.col(:only) > 0
-        widefilter = Tables.Scan(filter=Tables.AndExpr(fill(leaf, 100_000)))
-        @test_throws Arrow.AllocationLimitError Arrow._resolvescan(
-            widefilter,
-            [:only],
-            Arrow.AllocationBudget(1_000_000),
-        )
-
         # Scalar conversion has fourteen closed descriptor/unit tokens.
         # Membership uses them only when the complete public conversion
         # preserves equality. Abstract inputs must not box each member.

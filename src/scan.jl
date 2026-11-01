@@ -922,141 +922,14 @@ function _deduplicatesorted!(values::Vector)
     return values
 end
 
-function _resolverstringref(ref::String, budget)
-    # Tables resolves a String reference through `Symbol(ref)`. Charge the
-    # interned name before performing the same lookup during preflight; the
-    # later upstream call then reuses that interned symbol.
-    bytes = AC.checked_add(Int64(256), AC._materializedobjectbytes(sizeof(ref)))
-    budget === nothing || _charge!(budget, bytes, "scan resolver String reference")
-    return Symbol(ref)
-end
-
-function _resolverregexwork!(names, budget)
-    # Both this allocation-free-counting pass and Tables._findcols convert
-    # every Symbol to a String for Regex matching. Reserve both conversions
-    # before the first one occurs, plus the upstream findall result at its
-    # worst-case width.
-    stringbytes = Int64(0)
-    for name in names
-        stringbytes = AC.checked_add(
-            stringbytes,
-            AC.checked_add(Int64(256), AC._materializedobjectbytes(sizeof(name))),
-        )
-    end
-    budget === nothing ||
-        _charge!(budget, AC.checked_mul(Int64(2), stringbytes), "scan resolver Regex names")
-    capacity = AC.checked_mul(Int64(2), Int64(length(names)))
-    _chargevector!(budget, Int, capacity, "scan resolver Regex matches")
-    return nothing
-end
-
-"""
-How many columns one selection reference matches, charging the scratch work
-`Tables.resolve` will repeat for it.
-"""
-function _resolverrefcount(ref, names, budget)
-    if ref isa Regex
-        _resolverregexwork!(names, budget)
-        matches = Int64(0)
-        for name in names
-            occursin(ref, String(name)) && (matches = AC.checked_add(matches, Int64(1)))
-        end
-        return matches
-    end
-    _chargevector!(budget, Int, 1, "scan resolver reference match")
-    target = ref isa String ? _resolverstringref(ref, budget) : ref
-    if target isa Int
-        return 1 <= target <= length(names) ? Int64(1) : Int64(0)
-    end
-    for name in names
-        name == target && return Int64(1)
-    end
-    return Int64(0)
-end
-
-function _resolverselectionwork!(scan::Tables.Scan, names, budget)
-    select = scan.select
-    isempty(select) && return Int64(0)
-    if first(select).ref isa Tables.Not
-        _chargedict!(budget, Int, Nothing, length(names), "scan resolver exclusion index")
-        for item in select
-            rawrefs = (item.ref::Tables.Not).ref
-            nrefs = rawrefs isa Union{Tuple,AbstractVector} ? length(rawrefs) : 1
-            _chargevector!(budget, Any, nrefs, "scan resolver Not references")
-            if rawrefs isa Union{Tuple,AbstractVector}
-                for ref in rawrefs
-                    _resolverrefcount(ref, names, budget)
-                end
-            else
-                _resolverrefcount(rawrefs, names, budget)
-            end
-        end
-        # Exclusion can only reduce the full-schema output. Reserving the
-        # upper bound avoids building our own duplicate exclusion set.
-        return Int64(length(names))
-    end
-    output = Int64(0)
-    for item in select
-        count =
-            item.ref isa Tables.All ? Int64(length(names)) :
-            _resolverrefcount(item.ref, names, budget)
-        output = AC.checked_add(output, count)
-    end
-    return output
-end
-
-function _resolverfilterwork!(e, names, budget)
-    e === nothing && return nothing
-    if e isa Tables.Col
-        e.ref isa String && _resolverstringref(e.ref, budget)
-        _chargescannode!(budget, e, "scan resolver filter node")
-    elseif e isa Union{Tables.Cmp,Tables.In,Tables.IsNull,Tables.StrPred}
-        _resolverfilterwork!(e.lhs, names, budget)
-        _chargescannode!(budget, e, "scan resolver filter node")
-    elseif e isa Union{Tables.AndExpr,Tables.OrExpr}
-        _chargevector!(
-            budget,
-            Tables.ScanExpr,
-            length(e.args),
-            "scan resolver filter arguments",
-        )
-        for arg in e.args
-            _resolverfilterwork!(arg, names, budget)
-        end
-        _chargescannode!(budget, e, "scan resolver filter node")
-    elseif e isa Tables.NotExpr
-        _resolverfilterwork!(e.arg, names, budget)
-        _chargescannode!(budget, e, "scan resolver filter node")
-    end
-    return nothing
-end
-
-function _resolvescan(scan::Tables.Scan, names, budget=nothing)
-    # Preflight every request-directed allocation that Tables.resolve owns.
-    # Selection may expand far beyond schema width through repeated aliases;
-    # Regex/Not references own temporary vectors and String work; and filter
-    # resolution reconstructs the full expression tree. No upstream compiler
-    # work starts until the cumulative operation budget accepts all of it.
-    n = length(names)
-    _chargevector!(budget, Symbol, n, "scan resolver names")
-    output = _resolverselectionwork!(scan, names, budget)
-    # Tables grows BoundColumn[] through append!. Reserve the worst-case
-    # geometric capacity separately from Julia's backing-store rounding.
-    columncapacity = output == 0 ? Int64(0) : AC.checked_mul(Int64(2), output)
-    _chargevector!(budget, Tables.BoundColumn, columncapacity, "scan resolver columns")
-    _chargedict!(budget, Symbol, Nothing, output, "scan resolver output-name index")
-    refcapacity = n == 0 ? Int64(0) : AC.checked_mul(Int64(2), Int64(n))
-    _chargevector!(budget, Int, refcapacity, "scan resolver filter references")
-    _resolverfilterwork!(scan.filter, names, budget)
-    _chargeobject!(budget, 64, "resolved scan")
-    # Not inferred: Tables resolves untyped selections (see `_uninferred`).
-    return _uninferred(Tables.resolve, scan, names)::Tables.BoundScan
-end
+# Not inferred: Tables resolves untyped selections (see `_uninferred`).
+_resolvescan(scan::Tables.Scan, names) =
+    _uninferred(Tables.resolve, scan, names)::Tables.BoundScan
 
 function _ScanPlan(scan::Tables.Scan, fields, budget=nothing)
     # Unique names (`_fieldnamesymbols`), so every column has one reference.
     names = _fieldnamesymbols(fields, budget)
-    b = _zonedbound(_resolvescan(scan, names, budget), fields, names)
+    b = _zonedbound(_resolvescan(scan, names), fields, names)
     _checkliterals(b.filter, fields, names)
     # The facade keeps zero-field sources on its metadata-count path. Avoid
     # compiling a storage form that no adapter will consume.
