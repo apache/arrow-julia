@@ -2203,7 +2203,7 @@ function _materialize_table(
         ntasks;
         lazy=true,
     )
-    nrows = sum(Int(b.nrows) for b in src.batches; init=0)
+    nrows = _batchrowtotal(src.batches)
     pools = _retaineddictpools(src.corefields, src.batches, arrowtypes)
     return _table(names, cols, _tableschema(src), regions, nrows, pools, budget)
 end
@@ -2229,9 +2229,18 @@ function _materialize_table(
         ntasks;
         lazy=true,
     )
-    nrows = sum(Int(b.nrows) for b in batches; init=0)
+    nrows = _batchrowtotal(batches)
     pools = _retaineddictpools(src.fields, batches, arrowtypes)
     return _table(names, cols, _tableschema(src), regions, nrows, pools, budget)
+end
+
+# The rows of `batches` together, refused when they do not fit an `Int`.
+function _batchrowtotal(batches)
+    nrows = 0
+    for b in batches
+        nrows = _addscanrows(nrows, Int64(b.nrows))
+    end
+    return nrows
 end
 
 # The eltype the keep/drop decision uses for an EMPTY pre-override column:

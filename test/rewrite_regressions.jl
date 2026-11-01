@@ -526,11 +526,6 @@ end
         )
             @test length(t.x) == 1 && length(t.x[1]) == listsize && all(ismissing, t.x[1])
         end
-        # A direct-handle scan materializes storage rows, which the budget refuses.
-        @test_throws Arrow.AllocationLimitError Tables.scan(
-            openfile(),
-            Tables.Scan(select=(:x,)),
-        )
 
         largeio = IOBuffer()
         Arrow.write(largeio, (x=zeros(Int64, 200_000),); file=true)

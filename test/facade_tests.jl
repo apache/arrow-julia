@@ -1120,7 +1120,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test (@atomic source.issued) == 0
     end
 
-    @testset "ranged scan uses one cumulative exact budget" begin
+    @testset "ranged scans share one allocation budget" begin
         io = IOBuffer()
         Arrow.write(
             io,
@@ -1132,21 +1132,14 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         )
         bytes = take!(io)
         scan = Tables.Scan(select=(:x,), filter=Tables.col(:x) > 2, offset=1, limit=2)
-        function ranged(cap)
-            handle = Arrow.SourceFile(_BytesSource(bytes); tailbytes=64, gapbytes=0)
-            budget = Arrow.AllocationBudget(cap)
-            footer = Arrow._rangedfooter(handle, budget)
-            bound = Arrow._compilehandlescan(scan, footer.fields, budget)
-            return Arrow._applyscan(handle, bound, footer, budget), budget
-        end
-        probe_limit = Int64(1_000_000_000)
-        got, probe = ranged(probe_limit)
-        @test got.x == [4, 5]
-        needed = probe_limit - Arrow._remaining(probe)
-        exactgot, exact = ranged(needed)
-        @test exactgot.x == [4, 5]
-        @test Arrow._remaining(exact) == 0
-        @test_throws Arrow.AllocationLimitError ranged(needed - 1)
+        ranged(limits) = Arrow.Table(
+            Arrow.SourceFile(_BytesSource(bytes); limits=limits, tailbytes=64, gapbytes=0);
+            scan=scan,
+        )
+        @test ranged(Arrow.Limits()).x == [4, 5]
+        @test_throws Arrow.AllocationLimitError ranged(
+            Arrow.Limits(max_total_allocated_bytes=4096),
+        )
     end
 
     @testset "the allocation limit error" begin
@@ -2186,20 +2179,17 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test t5.l == [[1, 2], [3]] && eltype(t5.l) <: Vector
     end
 
-    @testset "zero-field scans hold at the Tables.scan layer too" begin
+    @testset "zero-field scans hold on every path" begin
         sch = Arrow.AC.Schema(Arrow.AC.Field[])
         zb = Arrow.writefile(sch, [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 3)])
-        af = Arrow.readfile(zb)
         for (scan, want) in (
             (Tables.Scan(filter=Tables.AlwaysTrue()), 3),
             (Tables.Scan(filter=Tables.AlwaysTrue(), limit=1, offset=1), 1),
             (Tables.Scan(filter=Tables.isnull(Tables.col(:gone)), validate=false), 3),
             (Tables.Scan(filter=Tables.AlwaysFalse()), 0),
         )
-            got = Tables.scan(af, scan)
-            @test Tables.rowcount(Tables.columns(got)) == want
-            rgot = Tables.scan(Arrow.SourceFile(_BytesSource(zb)), scan)
-            @test Tables.rowcount(Tables.columns(rgot)) == want
+            @test Tables.rowcount(Arrow.Table(copy(zb); scan=scan)) == want
+            @test Tables.rowcount(Arrow.Table(_BytesSource(zb); scan=scan)) == want
         end
         # The facade path allocates nothing proportional to a hostile count:
         # a tiny file claiming a million rows answers limit=1 instantly.
@@ -2218,10 +2208,10 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         # rejects it.
         bad = copy(zb)
         bad[65:68] .= 0x00
-        @test_throws Arrow.AC.ValidationError Arrow.readfile(copy(bad))
-        @test_throws Arrow.AC.ValidationError Tables.scan(
-            Arrow.SourceFile(_BytesSource(copy(bad))),
-            Tables.Scan(),
+        @test_throws Arrow.AC.ValidationError Arrow.Table(copy(bad))
+        @test_throws Arrow.AC.ValidationError Arrow.Table(
+            _BytesSource(copy(bad));
+            scan=Tables.Scan(),
         )
         # Header reads share ONE cumulative budget, as Limits documents:
         # many tiny batches refuse under a bound one batch fits.
@@ -2230,13 +2220,14 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 1) for _ = 1:200],
         )
         tight = Arrow.Limits(max_total_allocated_bytes=6000)
-        @test_throws Arrow.AllocationLimitError Tables.scan(
-            Arrow.readfile(copy(many); limits=tight),
-            Tables.Scan(),
+        @test_throws Arrow.AllocationLimitError Arrow.Table(
+            copy(many);
+            limits=tight,
+            scan=Tables.Scan(),
         )
-        @test_throws Arrow.AllocationLimitError Tables.scan(
-            Arrow.SourceFile(_BytesSource(copy(many)); limits=tight),
-            Tables.Scan(),
+        @test_throws Arrow.AllocationLimitError Arrow.Table(
+            Arrow.SourceFile(_BytesSource(copy(many)); limits=tight);
+            scan=Tables.Scan(),
         )
         # A zero-field schema declares no dictionary ids: a footer listing a
         # well-framed dictionary block is orphaned, and the metadata-only
@@ -2266,10 +2257,10 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         append!(doctored, ftr)
         append!(doctored, reinterpret(UInt8, Int32[Int32(length(ftr))]))
         append!(doctored, Arrow.FILE_MAGIC)
-        @test_throws Arrow.AC.ValidationError Arrow.readfile(copy(doctored))
-        @test_throws Arrow.AC.ValidationError Tables.scan(
-            Arrow.SourceFile(_BytesSource(copy(doctored))),
-            Tables.Scan(),
+        @test_throws Arrow.AC.ValidationError Arrow.Table(copy(doctored))
+        @test_throws Arrow.AC.ValidationError Arrow.Table(
+            _BytesSource(copy(doctored));
+            scan=Tables.Scan(),
         )
         # Structural binding is unconditional: an unsupported predicate node
         # rejects even with validate=false, on every facade path.
@@ -2792,7 +2783,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test eltype(Arrow.Table(bytes).x) === Union{Missing,Int64}
         @test isequal(Arrow.Table(bytes; scan=Tables.Scan()).x, [missing, 7])
         for handle in (Arrow.readfile(bytes), Arrow.SourceFile(_BytesSource(bytes)))
-            got = Tables.scan(handle, Tables.Scan())
+            got = Arrow.Table(handle; scan=Tables.Scan())
             @test isequal(got.x, [missing, 7])
             @test eltype(got.x) === Union{Missing,Int64}
         end
@@ -2806,7 +2797,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         bytes2 = Arrow.writefile(sch2, AC.RecordBatch[AC.RecordBatch(sch2, [red], 2)])
         @test isequal(Arrow.Table(bytes2).r, [missing, 7])
         for handle in (Arrow.readfile(bytes2), Arrow.SourceFile(_BytesSource(bytes2)))
-            @test isequal(Tables.scan(handle, Tables.Scan()).r, [missing, 7])
+            @test isequal(Arrow.Table(handle; scan=Tables.Scan()).r, [missing, 7])
         end
         # a dictionary column: a null-free pool under a non-nullable field is
         # Missing-free; a pool holding a null (the schema's one flag cannot

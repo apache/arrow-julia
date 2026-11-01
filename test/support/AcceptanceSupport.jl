@@ -85,12 +85,9 @@ import Arrow:
     ValidationError,
     ViewType,
     _ArrowTypesRoutedUnion,
-    _ScanColumns,
     _VTable,
-    _addscanrows,
     _arm_foreign_owner!,
     _batchcodec,
-    _batchrows,
     _blockmessage,
     _build_c_data!,
     _cleanup_export_slots!,
@@ -101,7 +98,6 @@ import Arrow:
     _foreign_owner_armed,
     _framemessages,
     _from_c_data,
-    _joinscanparts,
     _malloc!,
     _metaschema!,
     _newroot,
@@ -117,7 +113,6 @@ import Arrow:
     _requirelittleendian,
     _set_stream_error!,
     _store_field!,
-    _storageelementclaim,
     _stream_get_next_impl,
     _stream_get_schema_impl,
     _stream_registry_count,
@@ -173,8 +168,8 @@ include(joinpath(@__DIR__, "..", "cdata_battery.jl"))
 include(joinpath(@__DIR__, "..", "scan_battery.jl"))
 
 function _run_scan_acceptance()
-    filebytes, af, full = _scan_main()
-    _ranged_main(filebytes, af, full)
+    filebytes, full = _scan_main()
+    _ranged_main(filebytes, full)
     return nothing
 end
 

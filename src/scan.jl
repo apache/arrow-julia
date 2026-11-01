@@ -20,9 +20,8 @@
 # the same bound column set. Design notes: docs/dev/DESIGN-scan-ranges-trim.md.
 #
 # Pushdown semantics: the request is resolved once, then the source consumes
-# the bound scan exactly, batch by batch. Direct handle scans apply type
-# overrides in the storage domain. The facade applies them after conversion
-# to the public domain.
+# the bound scan exactly, batch by batch; type overrides apply after
+# conversion to the public domain.
 #
 #   * the decode set is (selected ∪ filter-referenced) columns — everything
 #     else is SKIPPED by `skipfield!`, a registry walk that consumes the
@@ -537,33 +536,6 @@ function _zerofieldcount(n0::Int64, keep, limit, offset)
     limit === nothing ? n : min(n, Int64(limit))
 end
 
-"""
-Window a SEQUENCE of batch row counts without summing past the request: a
-limit saturates (a hostile total never overflows a capped scan), while an
-unbounded request keeps the checked-add contract — an overflowing total is
-a refusal, exactly as the column-bearing paths refuse.
-"""
-function _zerofieldwindow(counts, keep, limit, offset)
-    keep === true || return Int64(0)
-    off = Int64(offset)
-    lim = limit === nothing ? Int64(-1) : Int64(limit)
-    n = Int64(0)
-    for r0 in counts
-        r = Int64(r0)
-        skip = min(off, r)
-        off -= skip
-        r -= skip
-        if lim >= 0
-            take = min(r, lim - n)
-            n += take
-            n == lim && return n
-        else
-            n = _planadd(n, r, "zero-field scan row count")
-        end
-    end
-    return n
-end
-
 # --- scan value domain -------------------------------------------------------
 # Pushdown filtering runs over storage-domain values; facade
 # filter literals arrive in public Julia types. Lower native literals to the
@@ -959,12 +931,6 @@ struct _ScanPlan
     storage::Union{Nothing,Tables.BoundScan}
 end
 
-"One storage-domain request and the schema names it was compiled against."
-struct _BoundScanPlan
-    names::Vector{Symbol}
-    bound::Tables.BoundScan
-end
-
 function _deduplicatesorted!(values::Vector)
     isempty(values) && return values
     # Stability is irrelevant here. QuickSort avoids the input-sized scratch
@@ -1111,16 +1077,10 @@ function _resolvescan(scan::Tables.Scan, names, budget=nothing)
     return _uninferred(Tables.resolve, scan, names)::Tables.BoundScan
 end
 
-function _compileboundscan(scan::Tables.Scan, fields, budget=nothing)
+function _ScanPlan(scan::Tables.Scan, fields, budget=nothing)
     # Unique names (`_fieldnamesymbols`), so every column has one reference.
     names = _fieldnamesymbols(fields, budget)
-    return _BoundScanPlan(names, _resolvescan(scan, names, budget))
-end
-
-function _ScanPlan(scan::Tables.Scan, fields, budget=nothing)
-    compiled = _compileboundscan(scan, fields, budget)
-    names = compiled.names
-    b = _zonedbound(compiled.bound, fields, names)
+    b = _zonedbound(_resolvescan(scan, names, budget), fields, names)
     _checkliterals(b.filter, fields, names)
     # The facade keeps zero-field sources on its metadata-count path. Avoid
     # compiling a storage form that no adapter will consume.
@@ -1172,15 +1132,6 @@ function Tables.schema(t::_ScanColumns)
 end
 Base.propertynames(t::_ScanColumns) = getfield(t, :names)
 Base.getproperty(t::_ScanColumns, name::Symbol) = Tables.getcolumn(t, name)
-
-function _ScanColumns(columns::NamedTuple, nrows::Int)
-    names = collect(Symbol, propertynames(columns))
-    return _ScanColumns(
-        names,
-        AbstractVector[getfield(columns, i) for i in eachindex(names)],
-        nrows,
-    )
-end
 
 # Join the pieces of one decoded output column under its declared storage
 # claim when that claim closes, else as `Vector{Any}`. A facade scan may put
@@ -1517,9 +1468,8 @@ function _keeprows!(sink::_ScanSink, decoded, rows, rblen::Int64)
     return nothing
 end
 
-# The consumed bound operation's result in selection order. Direct-handle type
-# overrides apply here. A facade storage plan has no overrides; its public
-# plan applies them after conversion inside `_finishfacadescan`.
+# The consumed bound operation's result in selection order; type overrides
+# apply after conversion, in `_finishfacadescan`.
 function _sinkresult(sink::_ScanSink)
     _chargevector!(sink.budget, Symbol, length(sink.columns), "scan output names")
     outnames = Symbol[c.name for c in sink.columns]
@@ -1530,9 +1480,7 @@ function _sinkresult(sink::_ScanSink)
             # that only happens when no batch was consumed, so every count
             # is 0 and this resize cannot disturb a sibling.
             resize!(parts, sink.partcounts[k])
-            col = _joinscanparts(sink.fields[c.index], parts, sink.budget)
-            c.type === nothing ? col :
-            _uninferred(_applyoverride, c.type, col, sink.budget)
+            _joinscanparts(sink.fields[c.index], parts, sink.budget)
         end for (k, c) in enumerate(sink.columns)
     )
     return _scantable(outnames, outcols, sink.outrows, sink.budget)
@@ -1546,20 +1494,6 @@ function _runboundscan(
     materializecolumn,
     ntasks::Int=1,
 )
-    if isempty(names)
-        # Zero-field sources consume their filter and window here because an
-        # empty NamedTuple cannot carry a row count. Header reads share one
-        # cumulative allocation budget, like the column path.
-        keep = _zerofieldpredicate(b.filter)
-        messageversion = Ref(Int16(0))
-        n = _zerofieldwindow(
-            (_batchrows(f, i, budget) for i = 1:length(f)),
-            keep,
-            b.limit,
-            b.offset,
-        )
-        return _scantable(Symbol[], (), Int(n), budget)
-    end
     sink = _ScanSink(b, names, f.fields, materializecolumn, budget)
     _chargebitvector!(budget, length(names), "scan decode mask")
     mask = falses(length(names))
@@ -1614,14 +1548,6 @@ function _runboundscan(
     end
     return _sinkresult(sink)
 end
-
-# Direct-handle scans are storage-domain operations. Their interface cannot
-# select the facade's private ArrowTypes routing path.
-_applyscan(
-    f::ArrowFile,
-    plan::_BoundScanPlan,
-    budget::AllocationBudget=_readbudget(f.limits, f.region.len),
-) = _runboundscan(f, plan.bound, plan.names, budget, _storagebatchcolumn)
 
 # ===========================================================================
 # Byte-range reads — SourceFile over an AbstractArrowSource, the planner,
@@ -1960,14 +1886,7 @@ Base.length(r::_RangedFile) = length(r.recordblocks)
 # Row count of batch `i` from one range request for its metadata.
 function _batchrows(r::_RangedFile, i::Int, budget::AllocationBudget)
     seen = Ref(@atomic r.version)
-    n = _zerofieldblockcount(
-        r.sf,
-        r.recordblocks[i],
-        r.footerversion,
-        r.fields,
-        budget,
-        seen,
-    )
+    n = _rangedbatchrows(r.sf, r.recordblocks[i], r.footerversion, r.fields, budget, seen)
     @atomicreplace r.version Int16(0) => seen[]
     return n
 end
@@ -2439,14 +2358,14 @@ function _rangedfooter(sf::SourceFile, budget::AllocationBudget)
 end
 
 """
-One record block's row count for the zero-field ranged path — the SAME
-frame discipline as the column path's metadata pass: extent bounds before
-the fetch, the fetch and parse charged to the caller's cumulative budget,
+One record block's row count from one range request for its metadata, with
+the frame discipline of a scan's metadata pass: extent bounds before the
+fetch, the fetch and parse charged to the caller's cumulative budget,
 `_parseblockmeta` framing (continuation prefix, declared length, verified
 graph, body-length cross-check), header kind, footer-version agreement,
 and compression rejection.
 """
-function _zerofieldblockcount(
+function _rangedbatchrows(
     sf::SourceFile,
     block::NTuple{3,Int64},
     version::Int16,
@@ -2485,36 +2404,6 @@ function _runboundscan(
     dictblocks = ft.dictblocks
     recordblocks = ft.recordblocks
     footerstart = ft.footerstart
-    if isempty(names)
-        # Zero-field sources consume their filter and window here because an
-        # empty NamedTuple cannot carry a row count. The metadata-only read
-        # keeps the column path's trust boundary: the block index validates
-        # first, every touched block passes the full frame checks, and every
-        # fetch charges the one cumulative budget.
-        # 8 is the padded leading magic (`ARROW1` plus two bytes). The ranged
-        # reader never fetches those bytes, so a conforming file's first
-        # message starting at 8 is an assumption, not a check.
-        _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
-        # A zero-field schema declares no dictionary ids, so every indexed
-        # dictionary block is orphaned — the same rejection the id-membership
-        # check produces on the column path and in the full reader.
-        isempty(dictblocks) || throw(
-            ValidationError(
-                "dictionary batch has no declaring field in a zero-field schema",
-            ),
-        )
-        keep = _zerofieldpredicate(b.filter)
-        messageversion = Ref(Int16(0))
-        n = _zerofieldwindow(
-            (
-                _zerofieldblockcount(sf, block, version, fields, budget, messageversion) for block in recordblocks
-            ),
-            keep,
-            b.limit,
-            b.offset,
-        )
-        return _scantable(Symbol[], (), Int(n), budget)
-    end
     sink = _ScanSink(b, names, fields, materializecolumn, budget)
     decodeidx = sink.decodeidx
     _chargebitvector!(budget, length(names), "scan decode mask")
@@ -2832,19 +2721,6 @@ function _runboundscan(
     end
 end
 
-# The ranged direct-handle operation is storage-only for the same reason as
-# `_applyscan(::ArrowFile, ...)` above.
-_applyscan(sf::SourceFile, plan::_BoundScanPlan, ft, budget::AllocationBudget) =
-    _runboundscan(sf, plan.bound, plan.names, ft, budget, _storagebatchcolumn)
-
-"""
-Compile one direct-handle request against the file schema; the handle
-consumes it in the storage domain.
-"""
-function _compilehandlescan(scan::Tables.Scan, fields, budget=nothing)
-    return _compileboundscan(scan, fields, budget)
-end
-
 # Tables.jl exposes binding (`resolve`), predicate evaluation, and
 # allocation, but no executor for an existing `BoundScan`. Keep this small
 # local executor instead of reconstructing a Scan and resolving it a second
@@ -3085,7 +2961,7 @@ end
 # These facade operations own the full private route: create ArrowTypes Union
 # markers while decoding, consume them during public conversion, and return a
 # Table from the public domain. No marker-bearing intermediate crosses into
-# `table.jl`, and direct `_applyscan` cannot select this materializer.
+# `table.jl`.
 function _applyfacadescan(
     f::ArrowFile,
     plan::_ScanPlan,
@@ -3419,29 +3295,4 @@ function _overridevalue(::Type{T}, x) where {T}
         return convert(T, E[v === missing ? missing : _overridevalue(N, v) for v in x])
     end
     return convert(T, x)
-end
-
-"""
-    Tables.scan(f::ArrowFile, scan)
-    Tables.scan(sf::SourceFile, scan)
-
-Scan an Arrow file handle. `_applyscan` decodes only the selected and
-filter-referenced columns, and only in the batches the window admits. It
-evaluates the filter per batch, composes
-`offset`/`limit` exactly, and stops as soon as the window is full. The
-request is compiled once against the file schema, and the plan owns the
-type overrides. File and ranged `Arrow.Table(source; scan=…)` use the same
-kernel through the closed `_applyfacadescan` operation. Stream facade scans
-execute post-decode. Every facade path converts private ArrowTypes routes
-before it returns.
-"""
-function Tables.scan(f::ArrowFile, scan::Tables.Scan)
-    budget = _readbudget(f.limits, f.region.len)
-    return _applyscan(f, _compilehandlescan(scan, f.fields, budget), budget)
-end
-
-function Tables.scan(sf::SourceFile, scan::Tables.Scan)
-    budget = _readbudget(sf.limits, sf.len)
-    ft = _rangedfooter(sf, budget)
-    return _applyscan(sf, _compilehandlescan(scan, ft.fields, budget), ft, budget)
 end

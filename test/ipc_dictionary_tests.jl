@@ -199,9 +199,9 @@ end
         bytes = read(joinpath(FIXTURES, "delta-V4-$kind.arrowbytes"))
         @test Arrow.Table(bytes).a == ["beta", "gamma"]
         if kind == "file"
-            @test Tables.scan(
-                Arrow.SourceFile(BytesSource(bytes); tailbytes=32),
-                Tables.Scan(),
+            @test Arrow.Table(
+                Arrow.SourceFile(BytesSource(bytes); tailbytes=32);
+                scan=Tables.Scan(),
             ).a == ["beta", "gamma"]
         end
     end
@@ -212,8 +212,7 @@ end
         "list" => Any[[1, 2], Int[], [3], missing, [4, 5]],
         "struct" => Any[["x" => 1], ["x" => 2], ["x" => 3], missing, ["x" => 4]],
     )
-    # Table reads give struct rows as named tuples; handle scans keep the
-    # materialized `Pair` rows.
+    # Table reads give struct rows as named tuples.
     publicrow(x) =
         x isa AbstractVector{<:Pair} ? (; (Symbol(k) => v for (k, v) in x)...) : x
     for (name, pool) in pools, file in (false, true), codec in ("None", "lz4", "zstd")
@@ -238,19 +237,19 @@ end
         if file
             for handle in
                 (Arrow.readfile(bytes), Arrow.SourceFile(BytesSource(bytes); tailbytes=32))
-                @test isequal(collect(Tables.scan(handle, Tables.Scan()).a), expected)
+                @test isequal(collect(Arrow.Table(handle; scan=Tables.Scan()).a), public)
                 @test isequal(
-                    collect(Tables.scan(handle, Tables.Scan(offset=3, limit=4)).a),
-                    expected[4:7],
+                    collect(Arrow.Table(handle; scan=Tables.Scan(offset=3, limit=4)).a),
+                    public[4:7],
                 )
                 @test isequal(
                     collect(
-                        Tables.scan(
-                            handle,
-                            Tables.Scan(filter=Tables.isnull(Tables.col(:a))),
+                        Arrow.Table(
+                            handle;
+                            scan=Tables.Scan(filter=Tables.isnull(Tables.col(:a))),
                         ).a,
                     ),
-                    filter(ismissing, expected),
+                    filter(ismissing, public),
                 )
             end
         else
@@ -294,9 +293,9 @@ end
             bytes = fixture(vf, [(true, pool, nothing)]; file)
             @test_throws AC.ValidationError Arrow.Table(bytes)
             if file
-                @test_throws AC.ValidationError Tables.scan(
-                    Arrow.SourceFile(BytesSource(bytes); tailbytes=32),
-                    Tables.Scan(),
+                @test_throws AC.ValidationError Arrow.Table(
+                    Arrow.SourceFile(BytesSource(bytes); tailbytes=32);
+                    scan=Tables.Scan(),
                 )
             end
         end
@@ -308,9 +307,9 @@ end
         if file
             bytes = fixture(vf, [(false, base, [0]), (false, replacement, [0])]; file)
             @test_throws AC.ValidationError Arrow.Table(bytes)
-            @test_throws AC.ValidationError Tables.scan(
-                Arrow.SourceFile(BytesSource(bytes); tailbytes=32),
-                Tables.Scan(),
+            @test_throws AC.ValidationError Arrow.Table(
+                Arrow.SourceFile(BytesSource(bytes); tailbytes=32);
+                scan=Tables.Scan(),
             )
         end
     end

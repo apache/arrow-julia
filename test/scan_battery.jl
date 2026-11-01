@@ -75,25 +75,6 @@ function _recordbufferranges(bytes::Vector{UInt8}, i::Int)
     ]
 end
 
-function _fulltable(f::ArrowFile)
-    names = Tuple(Symbol(fld.name) for fld in f.fields)
-    if isempty(names)
-        nrows = 0
-        budget = AllocationBudget(f.limits.max_total_allocated_bytes)
-        for i = 1:length(f)
-            nrows = _addscanrows(nrows, _batchrows(f, i, budget))
-        end
-        return _ScanColumns(NamedTuple(), nrows)
-    end
-    cols = Tuple(
-        begin
-            parts = Any[materialize(fld, f[i].columns[j]) for i = 1:length(f)]
-            isempty(parts) ? Any[] : reduce(vcat, parts)
-        end for (j, fld) in enumerate(f.fields)
-    )
-    return NamedTuple{names}(cols)
-end
-
 function _tables_values_equal(a, b)
     ca, cb = Tables.columns(a), Tables.columns(b)
     Tables.rowcount(ca) == Tables.rowcount(cb) || return false
@@ -117,32 +98,9 @@ function _tables_equal(a, b)
     )
 end
 
-function _schemas_equal(a, b)
-    (a === nothing || b === nothing) && return a === b
-    return collect(a.names) == collect(b.names) && collect(a.types) == collect(b.types)
-end
-
-const _MIXED_SCAN_ELTYPES = (
-    Int64,
-    Union{Missing,Float64},
-    Union{Missing,Bool},
-    Union{Missing,String},
-    Any,
-    Any,
-    Union{Missing,String},
-)
-
-function _assert_mixed_scan_types(table, scan::Tables.Scan)
-    names = collect(Symbol, keys(MIXED_EXPECTED))
-    bound = Tables.resolve(scan, names)
-    gotnames = collect(Symbol, Tables.columnnames(table))
-    @assert gotnames == Symbol[column.name for column in bound.columns]
-    for (output, column) in enumerate(bound.columns)
-        expected = column.type === nothing ? _MIXED_SCAN_ELTYPES[column.index] : column.type
-        @assert eltype(Tables.getcolumn(table, output)) === expected
-    end
-    return nothing
-end
+# The generic executor reports no schema for a result with no columns.
+_schemacolumns(s) = s === nothing ? (Symbol[], Type[]) : (collect(s.names), collect(s.types))
+_schemas_equal(a, b) = _schemacolumns(a) == _schemacolumns(b)
 
 "Body byte range of buffer number `bufindex` (1-based) of record batch `i`."
 function _bufferposition(bytes::Vector{UInt8}, i::Int, bufindex::Int)
@@ -251,11 +209,10 @@ end
 
 function _scan_main()
     @assert !_tables_equal((x=Any[1],), (x=Int64[1],))
-    expected = MIXED_EXPECTED
     source = readstream(_mixed_two_partitions_bytes())
     filebytes = writefile(source)
-    af = readfile(copy(filebytes))
-    full = _fulltable(af)
+    full = Arrow.Table(copy(filebytes))
+    sources(bytes) = (copy(bytes), SourceFile(BytesSource(copy(bytes)); tailbytes=32))
 
     scans = Tables.Scan[
         Tables.Scan(),
@@ -265,6 +222,7 @@ function _scan_main()
         Tables.Scan(select=(), filter=Tables.col(:ints) > 2),
         Tables.Scan(select=(r"s",)),
         Tables.Scan(select=(Tables.Not(:dict),)),
+        Tables.Scan(select=(:dict,)),
         Tables.Scan(filter=Tables.col(:ints) > 2),
         Tables.Scan(select=(:floats,), filter=Tables.col(:ints) > 2),
         Tables.Scan(select=(:dict,), filter=Tables.isnull(Tables.col(:floats))),
@@ -283,10 +241,11 @@ function _scan_main()
         ),
     ]
     for scan in scans
-        got = Tables.scan(af, scan)
         want = Tables.scan(full, scan)
-        @assert _tables_values_equal(got, want) sprint(show, scan)
-        _assert_mixed_scan_types(got, scan)
+        for src in sources(filebytes)
+            got = Arrow.Table(src; scan=scan)
+            @assert _tables_equal(got, want) sprint(show, scan)
+        end
     end
     println("differential scans match Tables.scan over the full table ✓")
 
@@ -301,9 +260,8 @@ function _scan_main()
         scan = Tables.Scan(select=(:id,), filter=Tables.colin(Tables.col(:x), values))
         reference = Tables.scan(specialfull, scan)
         @assert reference.id == expectedids
-        for source in
-            (copy(specialbytes), SourceFile(BytesSource(copy(specialbytes)); tailbytes=32))
-            @assert Arrow.Table(source; scan=scan).id == expectedids
+        for src in sources(specialbytes)
+            @assert Arrow.Table(src; scan=scan).id == expectedids
         end
     end
     println("facade membership preserves Set NaN and signed-zero semantics ✓")
@@ -313,9 +271,8 @@ function _scan_main()
     domainscan =
         Tables.Scan(select=(:id,), filter=Tables.colin(Tables.col(:id), _ScanDomain(2)))
     @assert Tables.scan(specialfull, domainscan).id == [2]
-    for source in
-        (copy(specialbytes), SourceFile(BytesSource(copy(specialbytes)); tailbytes=32))
-        @assert Arrow.Table(source; scan=domainscan).id == [2]
+    for src in sources(specialbytes)
+        @assert Arrow.Table(src; scan=domainscan).id == [2]
     end
     println("facade membership preserves custom non-iterable domains ✓")
 
@@ -342,15 +299,8 @@ function _scan_main()
         [BufferSlice(), AC._databuffer(Int64[3, 4])];
         nullcount=0,
     )
-    function windowresults(bytes)
-        scan = Tables.Scan(limit=2)
-        return Any[
-            Tables.scan(readfile(copy(bytes)), scan),
-            Tables.scan(SourceFile(BytesSource(copy(bytes)); tailbytes=32), scan),
-            Arrow.Table(copy(bytes); scan=scan),
-            Arrow.Table(SourceFile(BytesSource(copy(bytes)); tailbytes=32); scan=scan),
-        ]
-    end
+    windowresults(bytes) =
+        Any[Arrow.Table(src; scan=Tables.Scan(limit=2)) for src in sources(bytes)]
     violatingbytes = writefile(
         nn_schema,
         [
@@ -378,75 +328,41 @@ function _scan_main()
         Tables.scan(Arrow.Table(copy(conformingbytes)), Tables.Scan(limit=2))
     for got in windowresults(conformingbytes)
         @assert _tables_equal(got, conformingreference)
-        @assert _schemas_equal(Tables.schema(got), Tables.schema(conformingreference))
     end
     println("windowed nullability keeps the skip boundary and conforming schema parity ✓")
 
     # A column's element type is a property of the SCHEMA, not of how many
     # rows a scan kept: a zero limit, an offset past the input, and a decoded
-    # filter that keeps nothing have exactly the schema of the full direct
-    # scan, on both the file and the ranged handle.
-    fullschema = Tables.schema(Tables.scan(af, Tables.Scan()))
+    # filter that keeps nothing have exactly the schema of the full scan, on
+    # both the mapped and the ranged path.
+    fullschema = Tables.schema(Arrow.Table(copy(filebytes); scan=Tables.Scan()))
     for emptyscan in (
         Tables.Scan(limit=0),
         Tables.Scan(offset=10_000),
         Tables.Scan(filter=Tables.col(:ints) > 10_000),
     )
-        for handle in (af, SourceFile(BytesSource(copy(filebytes))))
-            got = Tables.scan(handle, emptyscan)
-            @assert Tables.rowcount(Tables.columns(got)) == 0
+        for src in sources(filebytes)
+            got = Arrow.Table(src; scan=emptyscan)
+            @assert Tables.rowcount(got) == 0
             @assert _schemas_equal(Tables.schema(got), fullschema) sprint(show, emptyscan)
         end
     end
-    println("empty scans keep the full scan's schema on both handles ✓")
-
-    # The zero-part join and decoded-batch path share one storage-claim rule.
-    # Pin the routes that are easiest to misclassify: closed byte containers,
-    # dynamic Null, Union, and transparent Dictionary/REE wrappers.
-    emptyuniontype = UnionType(AC.DenseMode, Int8[0])
-    emptyunionchild = Field("value", IntType(64, true); nullable=false)
-    emptyunionfield =
-        Field("union", emptyuniontype; nullable=false, children=[emptyunionchild])
-    emptyrunends = Field("run_ends", IntType(32, true); nullable=false)
-    routeclaims = (
-        Field("binary", BinaryType(false); nullable=false) => Vector{UInt8},
-        Field("decimal", DecimalType(10, 2, 128); nullable=false) => Vector{UInt8},
-        Field("null", NullType(); nullable=true) => Any,
-        emptyunionfield => Any,
-        Field(
-            "dictionary_union",
-            DictionaryType(IntType(32, true), emptyuniontype, false);
-            nullable=true,
-            children=[emptyunionchild],
-        ) => Any,
-        Field(
-            "ree_union",
-            RunEndEncodedType();
-            nullable=false,
-            children=[emptyrunends, emptyunionfield],
-        ) => Any,
-        Field(
-            "ree_int",
-            RunEndEncodedType();
-            nullable=false,
-            children=[emptyrunends, emptyunionchild],
-        ) => Int64,
-    )
-    for (field, expectedtype) in routeclaims
-        @assert _storageelementclaim(field) === expectedtype
-        @assert eltype(_joinscanparts(field, Any[])) === expectedtype
-    end
-    println("zero-part joins share the decoded storage-route claims ✓")
+    println("empty scans keep the full scan's schema on both paths ✓")
 
     # The bound scan is consumed exactly: selection, renames, filter, window,
-    # and storage-domain type overrides all cross the direct handle interface
-    # once, with no reconstructed residual.
-    t1 = Tables.scan(af, Tables.Scan(select=(:ints => :i,), offset=4, limit=3))
+    # and type overrides all cross the facade once, with no reconstructed
+    # residual.
+    t1 = Arrow.Table(
+        copy(filebytes);
+        scan=Tables.Scan(select=(:ints => :i,), offset=4, limit=3),
+    )
     @assert collect(Tables.columnnames(t1)) == [:i] && length(t1.i) == 3
-    t2 =
-        Tables.scan(af, Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2))
+    t2 = Arrow.Table(
+        copy(filebytes);
+        scan=Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2),
+    )
     @assert t2.ints == [3, 4]
-    t3 = Tables.scan(af, Tables.Scan(select=(:ints => Float64,)))
+    t3 = Arrow.Table(copy(filebytes); scan=Tables.Scan(select=(:ints => Float64,)))
     @assert eltype(t3.ints) === Float64 && t3.ints == Float64.(full.ints)
     println("the bound scan is consumed exactly, including type overrides ✓")
 
@@ -455,68 +371,21 @@ function _scan_main()
     containerscan = Tables.Scan(select=(:ints => _ScanOverrideValue,))
     reference = Tables.scan(full, containerscan).ints
     @assert reference isa _ScanOverrideVector{_ScanOverrideValue}
-    for handle in (af, SourceFile(BytesSource(copy(filebytes))))
-        overridden = Tables.scan(handle, containerscan).ints
+    for src in sources(filebytes)
+        overridden = Arrow.Table(src; scan=containerscan).ints
         @assert typeof(overridden) === typeof(reference)
         @assert getfield.(overridden, :value) == collect(Int64, full.ints)
     end
-    println("direct type overrides honor Tables.allocatecolumn ✓")
-
-    # Direct handles expose storage values, never the private Union route
-    # markers that the facade uses to lift identical ArrowTypes children.
-    uniontype = UnionType(AC.DenseMode, Int8[0, 1])
-    extensionmeta(name) = Pair{String,String}[
-        "ARROW:extension:name" => name,
-        "ARROW:extension:metadata" => "",
-    ]
-    child1 = Field(
-        "a",
-        IntType(64, true);
-        nullable=false,
-        metadata=extensionmeta("JuliaLang.ScanChildA"),
-    )
-    child2 = Field(
-        "b",
-        IntType(64, true);
-        nullable=false,
-        metadata=extensionmeta("JuliaLang.ScanChildB"),
-    )
-    _, data1 = fromjulia("a", Int64[11])
-    _, data2 = fromjulia("b", Int64[22])
-    unionfield = Field("u", uniontype; nullable=false, children=[child1, child2])
-    uniondata = ArrayData(
-        uniontype,
-        2,
-        [AC._databuffer(Int8[0, 1]), AC._databuffer(Int32[0, 0])];
-        children=[data1, data2],
-        nullcount=0,
-    )
-    unionschema = Schema([unionfield])
-    unionbytes = writefile(unionschema, [AC.RecordBatch(unionschema, [uniondata], 2)])
-    for handle in (
-        readfile(copy(unionbytes)),
-        SourceFile(BytesSource(copy(unionbytes)); tailbytes=32),
-    )
-        raw = Tables.scan(handle, Tables.Scan()).u
-        @assert raw == Any[11, 22]
-        @assert !any(x -> x isa _ArrowTypesRoutedUnion, raw)
-        filtered =
-            Tables.scan(handle, Tables.Scan(filter=Tables.colcmp(==, Tables.col(:u), 11))).u
-        @assert filtered == Any[11]
-        converted = Tables.scan(handle, Tables.Scan(select=(:u => Float64,))).u
-        @assert converted == [11.0, 22.0]
-    end
-    println("direct scans keep ArrowTypes Union routing private ✓")
+    println("type overrides honor Tables.allocatecolumn ✓")
 
     # Extreme-but-valid windows: the sink saturates like Tables.scan, so the
     # whole pipeline agrees on the empty result.
     extreme = Tables.Scan(select=(:ints,), offset=typemax(Int), limit=typemax(Int))
     extremewant = Tables.scan(full, extreme)
-    for sourcefile in (af, SourceFile(BytesSource(filebytes)))
-        got = Tables.scan(sourcefile, extreme)
-        @assert _tables_values_equal(got, extremewant)
-        _assert_mixed_scan_types(got, extreme)
-        @assert length(Tables.getcolumn(Tables.columns(got), 1)) == 0
+    for src in sources(filebytes)
+        got = Arrow.Table(src; scan=extreme)
+        @assert _tables_equal(got, extremewant)
+        @assert length(got.ints) == 0
     end
     println("extreme scan windows saturate to the empty result ✓")
 
@@ -527,31 +396,32 @@ function _scan_main()
     @assert len > 8
     corrupt = copy(filebytes)
     corrupt[(off + 5):(off + 8)] .= reinterpret(UInt8, Int32[Int32(2) ^ 30])
-    caf = readfile(copy(corrupt))
-    @assert _rejects(() -> caf[2])                       # full decode sees it
-    got = Tables.scan(caf, Tables.Scan(select=(:ints, :floats)))
+    @assert _rejects(() -> readfile(copy(corrupt))[2])       # full decode sees it
+    @assert _rejects(() -> Arrow.Table(copy(corrupt)))
+    got = Arrow.Table(copy(corrupt); scan=Tables.Scan(select=(:ints, :floats)))
     @assert isequal(collect(Any, got.ints), collect(Any, full.ints))
-    @assert _rejects(() -> Tables.scan(caf, Tables.Scan(select=(:strs,))))
+    @assert _rejects(() -> Arrow.Table(copy(corrupt); scan=Tables.Scan(select=(:strs,))))
     println("skipped columns are never decoded (corruption stays invisible) ✓")
 
     # Skip proof 2 (batches): the same corruption sits in batch 2; a window
     # ending inside batch 1 never decodes batch 2 even when selecting strs.
-    got = Tables.scan(caf, Tables.Scan(select=(:strs,), limit=5))
+    got = Arrow.Table(copy(corrupt); scan=Tables.Scan(select=(:strs,), limit=5))
     # A filter keeps the window in the sink: the window fills inside batch 1,
     # so batch 2 is never decoded either.
-    gotf = Tables.scan(
-        caf,
-        Tables.Scan(select=(:strs,), filter=Tables.col(:ints) > 0, limit=5),
+    gotf = Arrow.Table(
+        copy(corrupt);
+        scan=Tables.Scan(select=(:strs,), filter=Tables.col(:ints) > 0, limit=5),
     )
     @assert length(gotf.strs) == 5
     @assert isequal(collect(Any, got.strs), collect(Any, full.strs[1:5]))
-    @assert _rejects(() -> Tables.scan(caf, Tables.Scan(select=(:strs,), limit=6)))
+    @assert _rejects(
+        () -> Arrow.Table(copy(corrupt); scan=Tables.Scan(select=(:strs,), limit=6)),
+    )
     println("window-excluded batches are never decoded ✓")
 
     # Buffer-table invariants cannot be weakened by skipping: `skipbuffer!`
-    # shares `_buffermeta!` with `takebuffer!` by construction, and for files
-    # the open-time preflight enforces the same containment and
-    # non-overlap rules before any cursor (selected or skipped) runs at all.
+    # shares `_buffermeta!` with `takebuffer!` by construction, so a batch
+    # whose buffers move backwards is refused whichever columns are decoded.
     overlap = copy(filebytes)
     block = readfile(copy(filebytes)).recordblocks[1]
     fmoff = block[1]
@@ -564,7 +434,10 @@ function _scan_main()
     @assert n >= 4
     _write_i64!(meta, start + 3 * 16, Int64(0))
     copyto!(overlap, fmoff + 9, meta, 1, length(meta))
-    @assert _rejects(() -> readfile(copy(overlap)))
+    @assert _rejects(() -> readfile(copy(overlap))[1])
+    for src in sources(overlap)
+        @assert _rejects(() -> Arrow.Table(src; scan=Tables.Scan(select=(:ints,))))
+    end
     println("buffer-table invariants hold before any skip can run ✓")
 
     # Duplicate source names.
@@ -580,10 +453,9 @@ function _scan_main()
         nullcount=0,
     )
     dupbytes = writefile(dupsch, [AC.RecordBatch(dupsch, ArrayData[dupcol(), dupcol()], 1)])
-    dupaf = readfile(dupbytes)
     # They read as x, x_1, as CSV.jl names them, scans included.
-    dupscan = Tables.scan(dupaf, Tables.Scan(select=(2,)))
-    @assert collect(Tables.columnnames(Tables.columns(dupscan))) == [:x_1]
+    dupscan = Arrow.Table(dupbytes; scan=Tables.Scan(select=(2,)))
+    @assert collect(Tables.columnnames(dupscan)) == [:x_1]
     println("duplicate source names scan as x, x_1 ✓")
 
     # Window row counts are metadata, but they are not trusted until the
@@ -615,8 +487,9 @@ function _scan_main()
     _write_i64!(meta, _vfield(rb, 0, 8; required=true), Int64(4))
     copyto!(badrows, block[1] + 9, meta, 1, length(meta))
     shifted = Tables.Scan(select=(:x,), offset=5, limit=1)
-    @assert _rejects(() -> Tables.scan(readfile(copy(badrows)), shifted))
-    @assert _rejects(() -> Tables.scan(SourceFile(BytesSource(copy(badrows))), shifted))
+    for src in sources(badrows)
+        @assert _rejects(() -> Arrow.Table(src; scan=shifted))
+    end
     println("window row counts require top-level FieldNode agreement ✓")
 
     # Checked buffer-span addition is required before a zero-row window may
@@ -661,13 +534,13 @@ function _scan_main()
             occursin("record-batch buffer span overflows", sprint(showerror, e))
     end
     @assert overflowed
-    @assert _rejects(
-        () -> Tables.scan(SourceFile(BytesSource(copy(ovbytes))), Tables.Scan(limit=0)),
-    )
+    for src in sources(ovbytes)
+        @assert _rejects(() -> Arrow.Table(src; scan=Tables.Scan(limit=0)))
+    end
     println("overflowing variadic buffer spans reject before window exclusion ✓")
 
-    # A column table cannot infer row count when it has no columns. The scan
-    # wrapper keeps the RecordBatch lengths so an empty scan remains identity.
+    # A column table cannot infer row count when it has no columns. The table
+    # keeps the RecordBatch lengths so an empty scan remains identity.
     zerosch = Schema(Field[])
     zerobatches = AC.RecordBatch[
         AC.RecordBatch(zerosch, ArrayData[], 3),
@@ -675,15 +548,16 @@ function _scan_main()
         AC.RecordBatch(zerosch, ArrayData[], 2),
     ]
     zerobytes = writefile(zerosch, zerobatches)
-    for source in (readfile(copy(zerobytes)), SourceFile(BytesSource(copy(zerobytes))))
-        got = Tables.scan(source, Tables.Scan())
-        @assert isempty(Tables.columnnames(Tables.columns(got)))
-        @assert Tables.rowcount(Tables.columns(got)) == 5
+    for src in sources(zerobytes)
+        got = Arrow.Table(src; scan=Tables.Scan())
+        @assert isempty(Tables.columnnames(got))
+        @assert Tables.rowcount(got) == 5
     end
     println("zero-column scans preserve their row count ✓")
 
     # A zero-column file can declare an addressable row count without body
-    # bytes. The aggregate result must still fit Tables' Int row-count API.
+    # bytes. The aggregate result must still fit Tables' Int row-count API;
+    # a larger total is refused, whatever the window asks for.
     maxrows = Int64(typemax(Int))
     edgebatches = AC.RecordBatch[
         AC.RecordBatch(zerosch, ArrayData[], maxrows - 1),
@@ -693,71 +567,36 @@ function _scan_main()
         AC.RecordBatch(zerosch, ArrayData[], maxrows),
         AC.RecordBatch(zerosch, ArrayData[], 1),
     ]
-    sentinelbatches =
-        vcat(overflowbatches, AC.RecordBatch[AC.RecordBatch(zerosch, ArrayData[], 1)])
     edgebytes = writefile(zerosch, edgebatches)
     overflowbytes = writefile(zerosch, overflowbatches)
-    sentinelbytes = writefile(zerosch, sentinelbatches)
     edgelimits = Limits(max_array_length=typemax(Int64))
-    for source in (
-        readfile(copy(edgebytes); limits=edgelimits),
-        SourceFile(BytesSource(copy(edgebytes)); limits=edgelimits),
-    )
-        got = Tables.scan(source, Tables.Scan())
-        @assert Tables.rowcount(Tables.columns(got)) == typemax(Int)
+    limitedsources(bytes) =
+        (copy(bytes), SourceFile(BytesSource(copy(bytes)); limits=edgelimits, tailbytes=32))
+    for src in limitedsources(edgebytes)
+        got = Arrow.Table(src; limits=edgelimits, scan=Tables.Scan())
+        @assert Tables.rowcount(got) == typemax(Int)
     end
-    for source in (
-        readfile(copy(overflowbytes); limits=edgelimits),
-        SourceFile(BytesSource(copy(overflowbytes)); limits=edgelimits),
-    )
-        empty = Tables.scan(source, Tables.Scan(limit=0))
-        @assert Tables.rowcount(Tables.columns(empty)) == 0
-        capped = Tables.scan(source, Tables.Scan(limit=typemax(Int)))
-        @assert Tables.rowcount(Tables.columns(capped)) == typemax(Int)
-        shifted = Tables.scan(source, Tables.Scan(offset=1))
-        @assert Tables.rowcount(Tables.columns(shifted)) == typemax(Int)
-        @assert _rejects(() -> Tables.scan(source, Tables.Scan()))
-        @assert _rejects(() -> Tables.scan(source, Tables.Scan(filter=Tables.AlwaysTrue())))
-    end
-    @assert _rejects(() -> _fulltable(readfile(copy(overflowbytes); limits=edgelimits)))
-    for source in (
-        readfile(copy(sentinelbytes); limits=edgelimits),
-        SourceFile(BytesSource(copy(sentinelbytes)); limits=edgelimits),
-    )
-        @assert _rejects(() -> Tables.scan(source, Tables.Scan(offset=1)))
+    for src in limitedsources(overflowbytes),
+        scan in (
+            nothing,
+            Tables.Scan(),
+            Tables.Scan(limit=0),
+            Tables.Scan(offset=1),
+            Tables.Scan(filter=Tables.AlwaysTrue()),
+        )
+
+        @assert _rejects(() -> Arrow.Table(src; limits=edgelimits, scan=scan))
     end
     println("unaddressable cumulative row counts fail closed ✓")
 
     println()
     println("Tables.Scan pushdown checks passed.")
-    return filebytes, af, full
+    return filebytes, full
 end
 
-function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
-    # Correctness: the ranged reader is differentially equal to the
-    # whole-file reader across the scan battery.
-    scans = Tables.Scan[
-        Tables.Scan(),
-        Tables.Scan(select=(:ints, :strs)),
-        Tables.Scan(select=(:strs => :s2,)),
-        Tables.Scan(select=()),
-        Tables.Scan(select=(), filter=Tables.col(:ints) > 2),
-        Tables.Scan(select=(Tables.Not(:dict),)),
-        Tables.Scan(select=(:dict,)),
-        Tables.Scan(select=(:floats,), filter=Tables.col(:ints) > 2),
-        Tables.Scan(offset=4, limit=3),
-        Tables.Scan(select=(:ints,), filter=Tables.col(:ints) > 2, limit=2),
-        Tables.Scan(filter=Tables.colin(Tables.col(:strs), (missing,))),
-        Tables.Scan(select=(:strs, :lists), filter=Tables.colcmp(==, Tables.col(3), true)),
-    ]
-    for scan in scans
-        log, src = countingsource(filebytes)
-        got = Tables.scan(SourceFile(src), scan)
-        want = Tables.scan(full, scan)
-        @assert _tables_values_equal(got, want) sprint(show, scan)
-        _assert_mixed_scan_types(got, scan)
-    end
-    println("ranged reads are differentially equal to whole-file reads ✓")
+function _ranged_main(filebytes::Vector{UInt8}, full)
+    ranged(src; tailbytes=65536, gapbytes=262144) =
+        SourceFile(src; tailbytes=tailbytes, gapbytes=gapbytes)
 
     # Empty projections keep their row count without requesting a record or
     # dictionary body. A filtered empty projection requests only its filter
@@ -766,21 +605,19 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     dictionaryblocks, recordblocks = _footerblocks(filebytes)
     bodyranges = vcat(_bodyrange.(dictionaryblocks), _bodyrange.(recordblocks))
     emptylog, emptysource = countingsource(filebytes)
-    emptygot = Tables.scan(
-        SourceFile(emptysource; tailbytes=32, gapbytes=0),
-        Tables.Scan(select=()),
+    emptygot = Arrow.Table(
+        ranged(emptysource; tailbytes=32, gapbytes=0);
+        scan=Tables.Scan(select=()),
     )
     @assert isempty(Tables.columnnames(emptygot))
-    @assert Tables.rowcount(Tables.columns(emptygot)) ==
-            Tables.rowcount(Tables.columns(full))
+    @assert Tables.rowcount(emptygot) == Tables.rowcount(full)
     @assert !any(span -> _requestintersects(emptylog, span), bodyranges)
 
     filteredlog, filteredsource = countingsource(filebytes)
     filteredscan = Tables.Scan(select=(), filter=Tables.col(:ints) > 2)
     filteredgot =
-        Tables.scan(SourceFile(filteredsource; tailbytes=32, gapbytes=0), filteredscan)
-    @assert _tables_values_equal(filteredgot, Tables.scan(full, filteredscan))
-    _assert_mixed_scan_types(filteredgot, filteredscan)
+        Arrow.Table(ranged(filteredsource; tailbytes=32, gapbytes=0); scan=filteredscan)
+    @assert _tables_equal(filteredgot, Tables.scan(full, filteredscan))
     for i = 1:length(recordblocks)
         buffers = _recordbufferranges(filebytes, i)
         @assert length(buffers) >= 2
@@ -806,7 +643,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     datefield = getfield(datefull, :schema).fields[1]
     @assert Arrow._ScanPlan(datescan, [datefield]).storage !== nothing
     datelog, datesource = countingsource(datebytes)
-    dategot = Arrow.Table(SourceFile(datesource; tailbytes=32, gapbytes=0); scan=datescan)
+    dategot = Arrow.Table(ranged(datesource; tailbytes=32, gapbytes=0); scan=datescan)
     datewant = Tables.scan(datefull, datescan)
     @assert _tables_equal(dategot, datewant)
     @assert dategot.d == [targetdate]
@@ -972,9 +809,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         ),
     )
     logall, srcall = countingsource(bigbytes)
-    Tables.scan(SourceFile(srcall; tailbytes=256, gapbytes=64), Tables.Scan())
+    Arrow.Table(ranged(srcall; tailbytes=256, gapbytes=64); scan=Tables.Scan())
     logone, srcone = countingsource(bigbytes)
-    Tables.scan(SourceFile(srcone; tailbytes=256, gapbytes=64), Tables.Scan(select=(:a,)))
+    Arrow.Table(ranged(srcone; tailbytes=256, gapbytes=64); scan=Tables.Scan(select=(:a,)))
     @assert logone.bytes < logall.bytes ÷ 4 (logone.bytes, logall.bytes)
     println(
         "narrow selections fetch a fraction of the bytes " *
@@ -988,14 +825,14 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     corrupt = copy(filebytes)
     corrupt[(off + 5):(off + 8)] .= reinterpret(UInt8, Int32[Int32(2) ^ 30])
     logc, srcc = countingsource(corrupt)
-    got = Tables.scan(
-        SourceFile(srcc; tailbytes=256, gapbytes=0),
-        Tables.Scan(select=(:ints,)),
+    got = Arrow.Table(
+        ranged(srcc; tailbytes=256, gapbytes=0);
+        scan=Tables.Scan(select=(:ints,)),
     )
     @assert isequal(collect(Any, got.ints), collect(Any, full.ints))
     @assert !_fetched(logc, off + 5)
     @assert _rejects(
-        () -> Tables.scan(SourceFile(BytesSource(corrupt)), Tables.Scan(select=(:strs,))),
+        () -> Arrow.Table(ranged(BytesSource(corrupt)); scan=Tables.Scan(select=(:strs,))),
     )
     println(
         "skipped columns add no planned body range " *
@@ -1004,34 +841,34 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
 
     # Window proof: a limit inside batch 1 plans no batch-2 body range. This
     # fixture's request log also excludes sampled batch-2 body bytes.
-    block2 = af.recordblocks[2]
+    block2 = recordblocks[2]
     body2 = (block2[1] + block2[2], block2[3])
     logw, srcw = countingsource(filebytes)
-    Tables.scan(
-        SourceFile(srcw; tailbytes=256, gapbytes=0),
-        Tables.Scan(select=(:strs,), limit=5),
+    Arrow.Table(
+        ranged(srcw; tailbytes=256, gapbytes=0);
+        scan=Tables.Scan(select=(:strs,), limit=5),
     )
     @assert !any(_fetched(logw, body2[1] + k) for k = 0:8:(body2[2] - 1))
     println("window-excluded batches add no planned body range ✓")
 
     # A dictionary body gets a planned range only when its column is in the
     # decode set. The zero-gap fixture also checks the observed request spans.
-    dictblock = let
-        dblocks, _ = _footerblocks(filebytes)
-        @assert length(dblocks) == 1
-        dblocks[1]
-    end
+    @assert length(dictionaryblocks) == 1
+    dictblock = dictionaryblocks[1]
     dictblockbody = (dictblock[1] + dictblock[2], dictblock[3])
     lognod, srcnod = countingsource(filebytes)
-    Tables.scan(SourceFile(srcnod; tailbytes=256, gapbytes=0), Tables.Scan(select=(:ints,)))
+    Arrow.Table(
+        ranged(srcnod; tailbytes=256, gapbytes=0);
+        scan=Tables.Scan(select=(:ints,)),
+    )
     @assert !any(_fetched(lognod, dictblockbody[1] + k) for k = 0:8:(dictblockbody[2] - 1))
     logd, srcd = countingsource(filebytes)
-    Tables.scan(SourceFile(srcd; tailbytes=256, gapbytes=0), Tables.Scan(select=(:dict,)))
+    Arrow.Table(ranged(srcd; tailbytes=256, gapbytes=0); scan=Tables.Scan(select=(:dict,)))
     @assert any(_fetched(logd, dictblockbody[1] + k) for k = 0:8:(dictblockbody[2] - 1))
     logd0, srcd0 = countingsource(filebytes)
-    Tables.scan(
-        SourceFile(srcd0; tailbytes=256, gapbytes=0),
-        Tables.Scan(select=(:dict,), limit=0),
+    Arrow.Table(
+        ranged(srcd0; tailbytes=256, gapbytes=0);
+        scan=Tables.Scan(select=(:dict,), limit=0),
     )
     @assert !any(_fetched(logd0, dictblockbody[1] + k) for k = 0:8:(dictblockbody[2] - 1))
     println("dictionary body ranges are planned only for decode-set ids ✓")
@@ -1060,9 +897,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     dvtailf, dvtaild = fromjulia("tail", Int64[7, 8, 9])
     dvsch = Schema(Field[dvf, dvtailf])
     dvbytes = writefile(dvsch, [AC.RecordBatch(dvsch, ArrayData[dvd, dvtaild], 3)])
-    dvgot = Tables.scan(
-        SourceFile(BytesSource(copy(dvbytes))),
-        Tables.Scan(select=(:dictview, :tail)),
+    dvgot = Arrow.Table(
+        ranged(BytesSource(copy(dvbytes)));
+        scan=Tables.Scan(select=(:dictview, :tail)),
     )
     @assert collect(Any, dvgot.dictview) == Any["a", "view", "a"]
     @assert collect(Any, dvgot.tail) == Any[7, 8, 9]
@@ -1079,10 +916,10 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     copyto!(missingdict, footerstart + 1, footerbytes, 1, length(footerbytes))
     missingrecords = verify_footer(footerbytes, Limits())[4]
     missingscan = Tables.Scan(select=(:dict,))
-    @assert _rejects(() -> Tables.scan(readfile(copy(missingdict)), missingscan))
+    @assert _rejects(() -> Arrow.Table(copy(missingdict); scan=missingscan))
     logmissing, srcmissing = countingsource(missingdict)
     @assert _rejects(
-        () -> Tables.scan(SourceFile(srcmissing; tailbytes=32, gapbytes=0), missingscan),
+        () -> Arrow.Table(ranged(srcmissing; tailbytes=32, gapbytes=0); scan=missingscan),
     )
     @assert !any(_fetched(logmissing, block[1] + block[2]) for block in missingrecords)
     println("missing dictionary plans reject before dedicated record-body requests ✓")
@@ -1091,20 +928,14 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     # a zero gap issues more, smaller requests; both agree with the truth.
     # (A small tail window, so the ranges are planned rather than served
     # from the cached tail.)
+    twoscan = Tables.Scan(select=(:ints, :strs))
     logbig, srcbig = countingsource(filebytes)
-    gotbig = Tables.scan(
-        SourceFile(srcbig; tailbytes=256, gapbytes=typemax(Int32)),
-        Tables.Scan(select=(:ints, :strs)),
-    )
+    gotbig =
+        Arrow.Table(ranged(srcbig; tailbytes=256, gapbytes=typemax(Int32)); scan=twoscan)
     logzero, srczero = countingsource(filebytes)
-    gotzero = Tables.scan(
-        SourceFile(srczero; tailbytes=256, gapbytes=0),
-        Tables.Scan(select=(:ints, :strs)),
-    )
-    want = Tables.scan(full, Tables.Scan(select=(:ints, :strs)))
-    @assert _tables_values_equal(gotbig, want) && _tables_values_equal(gotzero, want)
-    _assert_mixed_scan_types(gotbig, Tables.Scan(select=(:ints, :strs)))
-    _assert_mixed_scan_types(gotzero, Tables.Scan(select=(:ints, :strs)))
+    gotzero = Arrow.Table(ranged(srczero; tailbytes=256, gapbytes=0); scan=twoscan)
+    want = Tables.scan(full, twoscan)
+    @assert _tables_equal(gotbig, want) && _tables_equal(gotzero, want)
     @assert logbig.requests < logzero.requests
     @assert logzero.bytes <= logbig.bytes
     @assert _coalesce(NTuple{2,Int64}[(0, 8), (16, 8)], typemax(Int64)) ==
@@ -1122,7 +953,7 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
 
     # A tail smaller than the footer forces the exact follow-up fetch.
     logt, srct = countingsource(filebytes)
-    gott = Tables.scan(SourceFile(srct; tailbytes=32), Tables.Scan(select=(:ints,)))
+    gott = Arrow.Table(ranged(srct; tailbytes=32); scan=Tables.Scan(select=(:ints,)))
     @assert isequal(collect(Any, gott.ints), collect(Any, full.ints))
     println("undersized tails recover with one exact footer fetch ✓")
 
@@ -1164,10 +995,10 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         end,
     )
     zbytes = writefile(zsource; compress=:zstd)
-    zfull = _fulltable(readfile(copy(zbytes)))
+    zfull = Arrow.Table(copy(zbytes))
     logz, srcz = countingsource(zbytes)
     gotz =
-        Tables.scan(SourceFile(srcz; tailbytes=256, gapbytes=0), Tables.Scan(select=(:x,)))
+        Arrow.Table(ranged(srcz; tailbytes=256, gapbytes=0); scan=Tables.Scan(select=(:x,)))
     @assert isequal(collect(Any, gotz.x), collect(Any, zfull.x))
     @assert logz.bytes < length(zbytes)
     println("compressed files range-read through self-contained buffers ✓")
@@ -1175,23 +1006,21 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     # Every failure derivable from the selected metadata plan precedes its
     # first body request. Skipped columns and window-excluded batches keep
     # their intentional lazy boundary.
-    block1 = af.recordblocks[1]
+    block1 = recordblocks[1]
     badfixed = _setbufferlength!(copy(filebytes), block1, 2, Int64(1))
     fixedoff, _ = _bufferposition(filebytes, 1, 2)
-    @assert _rejects(
-        () -> Tables.scan(readfile(copy(badfixed)), Tables.Scan(select=(:ints,))),
-    )
+    @assert _rejects(() -> Arrow.Table(copy(badfixed); scan=Tables.Scan(select=(:ints,))))
     logfixed, srcfixed = countingsource(badfixed)
     @assert _rejects(
-        () -> Tables.scan(
-            SourceFile(srcfixed; tailbytes=32, gapbytes=0),
-            Tables.Scan(select=(:ints,)),
+        () -> Arrow.Table(
+            ranged(srcfixed; tailbytes=32, gapbytes=0);
+            scan=Tables.Scan(select=(:ints,)),
         ),
     )
     @assert !_fetched(logfixed, fixedoff)
-    skipped = Tables.scan(
-        SourceFile(BytesSource(copy(badfixed)); tailbytes=32, gapbytes=0),
-        Tables.Scan(select=(:floats,)),
+    skipped = Arrow.Table(
+        ranged(BytesSource(copy(badfixed)); tailbytes=32, gapbytes=0);
+        scan=Tables.Scan(select=(:floats,)),
     )
     @assert isequal(collect(Any, skipped.floats), collect(Any, full.floats))
 
@@ -1208,9 +1037,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     validpos, _ = _bufferposition(validbytes, 1, 1)
     logvalid, srcvalid = countingsource(badvalid)
     @assert _rejects(
-        () -> Tables.scan(
-            SourceFile(srcvalid; tailbytes=32, gapbytes=0),
-            Tables.Scan(select=(:x,)),
+        () -> Arrow.Table(
+            ranged(srcvalid; tailbytes=32, gapbytes=0);
+            scan=Tables.Scan(select=(:x,)),
         ),
     )
     @assert !_fetched(logvalid, validpos)
@@ -1302,9 +1131,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     parentoffsetpos, _ = _bufferposition(emptylistbytes, 1, 2)
     logemptyoffset, srcemptyoffset = countingsource(bademptyoffset)
     @assert _rejects(
-        () -> Tables.scan(
-            SourceFile(srcemptyoffset; tailbytes=32, gapbytes=0),
-            Tables.Scan(select=(:x,)),
+        () -> Arrow.Table(
+            ranged(srcemptyoffset; tailbytes=32, gapbytes=0);
+            scan=Tables.Scan(select=(:x,)),
         ),
     )
     @assert !_fetched(logemptyoffset, parentoffsetpos)
@@ -1313,9 +1142,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     offsetpos, _ = _bufferposition(filebytes, 1, 8)
     logoffsets, srcoffsets = countingsource(badoffsets)
     @assert _rejects(
-        () -> Tables.scan(
-            SourceFile(srcoffsets; tailbytes=32, gapbytes=0),
-            Tables.Scan(select=(:strs,)),
+        () -> Arrow.Table(
+            ranged(srcoffsets; tailbytes=32, gapbytes=0);
+            scan=Tables.Scan(select=(:strs,)),
         ),
     )
     @assert !_fetched(logoffsets, offsetpos)
@@ -1324,9 +1153,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     structpos, _ = _bufferposition(filebytes, 1, 16)
     logstruct, srcstruct = countingsource(badstruct)
     @assert _rejects(
-        () -> Tables.scan(
-            SourceFile(srcstruct; tailbytes=32, gapbytes=0),
-            Tables.Scan(select=(:structs,)),
+        () -> Arrow.Table(
+            ranged(srcstruct; tailbytes=32, gapbytes=0);
+            scan=Tables.Scan(select=(:structs,)),
         ),
     )
     @assert !_fetched(logstruct, structpos)
@@ -1360,9 +1189,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     for broken in sparsefailures
         logsparse, srcsparse = countingsource(broken)
         @assert _rejects(
-            () -> Tables.scan(
-                SourceFile(srcsparse; tailbytes=32, gapbytes=0),
-                Tables.Scan(select=(:u,)),
+            () -> Arrow.Table(
+                ranged(srcsparse; tailbytes=32, gapbytes=0);
+                scan=Tables.Scan(select=(:u,)),
             ),
         )
         @assert !_fetched(logsparse, sparsepos)
@@ -1375,9 +1204,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
         badcompressed = _setbufferlength!(copy(zbytes), zblock, 2, badlen)
         logcompressed, srccompressed = countingsource(badcompressed)
         @assert _rejects(
-            () -> Tables.scan(
-                SourceFile(srccompressed; tailbytes=32, gapbytes=0),
-                Tables.Scan(select=(:x,)),
+            () -> Arrow.Table(
+                ranged(srccompressed; tailbytes=32, gapbytes=0);
+                scan=Tables.Scan(select=(:x,)),
             ),
         )
         @assert !_fetched(logcompressed, compressedpos)
@@ -1386,26 +1215,26 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     baddict = _setbufferlength!(copy(filebytes), dictblock, 2, Int64(1))
     logbaddict, srcbaddict = countingsource(baddict)
     @assert _rejects(
-        () -> Tables.scan(
-            SourceFile(srcbaddict; tailbytes=32, gapbytes=0),
-            Tables.Scan(select=(:dict,)),
+        () -> Arrow.Table(
+            ranged(srcbaddict; tailbytes=32, gapbytes=0);
+            scan=Tables.Scan(select=(:dict,)),
         ),
     )
     @assert !any(
         _fetched(logbaddict, dictblockbody[1] + k) for k = 0:8:(dictblockbody[2] - 1)
     )
-    skippeddict = Tables.scan(
-        SourceFile(BytesSource(copy(baddict)); tailbytes=32, gapbytes=0),
-        Tables.Scan(select=(:ints,)),
+    skippeddict = Arrow.Table(
+        ranged(BytesSource(copy(baddict)); tailbytes=32, gapbytes=0);
+        scan=Tables.Scan(select=(:ints,)),
     )
     @assert isequal(collect(Any, skippeddict.ints), collect(Any, full.ints))
 
-    badwindow = _setbufferlength!(copy(filebytes), af.recordblocks[2], 2, Int64(1))
+    badwindow = _setbufferlength!(copy(filebytes), recordblocks[2], 2, Int64(1))
     windowpos, _ = _bufferposition(filebytes, 2, 2)
     logwindow, srcwindow = countingsource(badwindow)
-    windowed = Tables.scan(
-        SourceFile(srcwindow; tailbytes=32, gapbytes=0),
-        Tables.Scan(select=(:ints,), limit=5),
+    windowed = Arrow.Table(
+        ranged(srcwindow; tailbytes=32, gapbytes=0);
+        scan=Tables.Scan(select=(:ints,), limit=5),
     )
     @assert isequal(collect(Any, windowed.ints), collect(Any, full.ints[1:5]))
     @assert !_fetched(logwindow, windowpos)
@@ -1415,10 +1244,10 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     # limit=0 leaves no body to decode.
     legacyv4, legacyblock = _legacyv4file()
     legacyscan = Tables.Scan(select=(:x,), limit=0)
-    @assert _rejects(() -> Tables.scan(readfile(copy(legacyv4)), legacyscan))
+    @assert _rejects(() -> Arrow.Table(copy(legacyv4); scan=legacyscan))
     loglegacy, srclegacy = countingsource(legacyv4)
     @assert _rejects(
-        () -> Tables.scan(SourceFile(srclegacy; tailbytes=32, gapbytes=0), legacyscan),
+        () -> Arrow.Table(ranged(srclegacy; tailbytes=32, gapbytes=0); scan=legacyscan),
     )
     @assert !_fetched(loglegacy, legacyblock[1] + legacyblock[2])
     println("legacy compression rejects before dedicated record-body requests ✓")
@@ -1428,9 +1257,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     badlen = copy(filebytes)
     lenpos = length(badlen) - 9
     badlen[lenpos:(lenpos + 3)] .= reinterpret(UInt8, Int32[Int32(2) ^ 30])
-    @assert _rejects(() -> Tables.scan(SourceFile(BytesSource(badlen)), Tables.Scan()))
+    @assert _rejects(() -> Arrow.Table(ranged(BytesSource(badlen)); scan=Tables.Scan()))
     @assert _rejects(
-        () -> Tables.scan(SourceFile(BytesSource(filebytes[1:20])), Tables.Scan()),
+        () -> Arrow.Table(ranged(BytesSource(filebytes[1:20])); scan=Tables.Scan()),
     )
 
     overlap = copy(filebytes)
@@ -1446,48 +1275,49 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     _write_i64!(footerbytes, recordstart + 40, firstblock[3])
     copyto!(overlap, footerstart + 1, footerbytes, 1, length(footerbytes))
     @assert _rejects(() -> readfile(copy(overlap)))
-    @assert _rejects(() -> Tables.scan(SourceFile(BytesSource(overlap)), Tables.Scan()))
+    @assert _rejects(() -> Arrow.Table(ranged(BytesSource(overlap)); scan=Tables.Scan()))
 
     zerobuffer = copy(filebytes)
-    block = af.recordblocks[1]
+    block = recordblocks[1]
     meta = copy(zerobuffer[(block[1] + 9):(block[1] + block[2])])
     msg = _vtable(meta, Int64(_vu32(meta, 0)))
     rb = _headertable(meta, msg)
     bufferstart, _ = _vvector(rb, 2, 16; required=true)
     _write_i64!(meta, bufferstart, block[3] + 8)
     copyto!(zerobuffer, block[1] + 9, meta, 1, length(meta))
-    @assert _rejects(() -> readfile(copy(zerobuffer)))
+    @assert _rejects(() -> readfile(copy(zerobuffer))[1])
+    @assert _rejects(() -> Arrow.Table(copy(zerobuffer); scan=Tables.Scan(select=(:ints,))))
     @assert _rejects(
         () ->
-            Tables.scan(SourceFile(BytesSource(zerobuffer)), Tables.Scan(select=(:ints,))),
+            Arrow.Table(ranged(BytesSource(zerobuffer)); scan=Tables.Scan(select=(:ints,))),
     )
     println("forged footers and truncated objects fail closed ✓")
 
     # Ranged limits are checked before dedicated body requests. One whole-file
     # Scan also keeps one aggregate budget across every batch it decompresses.
     @assert _rejects(
-        () -> Tables.scan(
-            SourceFile(BytesSource(filebytes); limits=Limits(max_body_bytes=32)),
-            Tables.Scan(select=(:ints,)),
+        () -> Arrow.Table(
+            SourceFile(BytesSource(filebytes); limits=Limits(max_body_bytes=32));
+            scan=Tables.Scan(select=(:ints,)),
         ),
     )
     @assert _rejects(
-        () -> Tables.scan(
-            SourceFile(BytesSource(filebytes); limits=Limits(max_messages=1)),
-            Tables.Scan(),
+        () -> Arrow.Table(
+            SourceFile(BytesSource(filebytes); limits=Limits(max_messages=1));
+            scan=Tables.Scan(),
         ),
     )
     loglimit, srclimit = countingsource(filebytes)
     intoff, _ = _bufferposition(filebytes, 1, 2)
     @assert _rejects(
-        () -> Tables.scan(
+        () -> Arrow.Table(
             SourceFile(
                 srclimit;
                 limits=Limits(max_buffer_bytes=8),
                 tailbytes=256,
                 gapbytes=0,
-            ),
-            Tables.Scan(select=(:ints,)),
+            );
+            scan=Tables.Scan(select=(:ints,)),
         ),
     )
     @assert !_fetched(loglimit, intoff)
@@ -1505,15 +1335,12 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     )
     tight = Limits(max_total_allocated_bytes=100_000)
     @assert _rejects(
-        () -> Tables.scan(
-            readfile(copy(largebytes); limits=tight),
-            Tables.Scan(select=(:x,)),
-        ),
+        () -> Arrow.Table(copy(largebytes); limits=tight, scan=Tables.Scan(select=(:x,))),
     )
     @assert _rejects(
-        () -> Tables.scan(
-            SourceFile(BytesSource(largebytes); limits=tight),
-            Tables.Scan(select=(:x,)),
+        () -> Arrow.Table(
+            SourceFile(BytesSource(largebytes); limits=tight);
+            scan=Tables.Scan(select=(:x,)),
         ),
     )
 
@@ -1526,9 +1353,9 @@ function _ranged_main(filebytes::Vector{UInt8}, af::ArrowFile, full)
     taillog, tailsource = countingsource(tailfilebytes)
     tailtight = Limits(max_total_allocated_bytes=32_000)
     tailerror = try
-        Tables.scan(
-            SourceFile(tailsource; limits=tailtight, tailbytes=length(tailfilebytes)),
-            Tables.Scan(select=()),
+        Arrow.Table(
+            SourceFile(tailsource; limits=tailtight, tailbytes=length(tailfilebytes));
+            scan=Tables.Scan(select=()),
         )
         nothing
     catch e
