@@ -668,6 +668,30 @@ end
     return sp, ap, WeakRef(d), WeakRef(region)
 end
 
+# Bytes the release callbacks of one exported column and one exported stream
+# allocate when a consumer calls them.
+@noinline function _release_allocations()
+    f, d = fromjulia("alloc", Int64[1, 2, 3])
+    sp, ap = to_c_data(f, d)
+    bytes = (@allocated _release_c!(ap)) + (@allocated _release_c!(sp))
+    ref = Ref{CArrowArrayStream}()
+    GC.@preserve ref begin
+        p = Base.unsafe_convert(Ptr{CArrowArrayStream}, ref)
+        export_stream!(p, Schema(Field[f]), AC.RecordBatch[])
+        bytes += @allocated _release_c!(p)
+    end
+    return bytes
+end
+
+# The registry key of an export whose consumer released both of its structs.
+@noinline function _released_export_key()
+    sp, ap = to_c_data(fromjulia("released", Int64[1, 2, 3])...)
+    key = _exportkey(ap)
+    _release_c!(ap)
+    _release_c!(sp)
+    return key
+end
+
 # An imported table released and dropped, a column taken from it read after the
 # release; returns the export's key, still registered while the column lives.
 @noinline function _released_import_key()

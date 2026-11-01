@@ -717,6 +717,23 @@ function cdata_battery()
     @assert _drained() == 0
     println("C release entrypoints are exactly-once and repeats are inert ✓")
 
+    # Consumers call the release callbacks from their own threads and from inside
+    # garbage-collector finalizers, so they allocate nothing. (Julia 1.10's call
+    # through the pointer of a precompiled `@cfunction` allocates 16 bytes itself;
+    # the same body compiled in the session allocates none.)
+    _release_allocations()
+    VERSION >= v"1.11" && @assert _release_allocations() == 0
+    # With nothing exported afterwards, a garbage collection frees what a
+    # consumer released.
+    key = _released_export_key()
+    for _ = 1:10
+        _registered(key) || break
+        GC.gc(true)
+        yield()
+    end
+    @assert !_registered(key)
+    println("release callbacks allocate nothing; a collection frees released exports ✓")
+
     # Schema/data mismatch and malformed buffers must fail before either
     # independently-owned export root is published.
     before = _registry_count()
