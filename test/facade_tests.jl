@@ -2672,8 +2672,8 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         # validation IPC applies accepts such data, as the reference
         # implementation does). A non-nullable field whose batch holds a
         # null therefore READS, as a missing-capable column, on every
-        # entry: the facade, the facade's scan path, and the direct handle
-        # scan — for primitives and through a run-end-encoded wrapper.
+        # entry: a whole read, a scan, and a scan of an opened reader — for
+        # primitives and through a run-end-encoded wrapper.
         AC = Arrow.AC
         f = AC.Field("x", AC.IntType(64, true); nullable=false)
         d = AC.ArrayData(

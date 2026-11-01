@@ -287,15 +287,6 @@ end
     return nothing
 end
 
-@inline function _chargebitvector!(
-    budget::Union{Nothing,AllocationBudget},
-    n::Integer,
-    what::AbstractString,
-)
-    budget === nothing || _charge!(budget, AC._materializedbitvectorbytes(n), what)
-    return nothing
-end
-
 @inline function _chargeobject!(
     budget::Union{Nothing,AllocationBudget},
     payload::Integer,
@@ -1684,23 +1675,6 @@ function _decodeplanned(
     col.len == p.rblen ||
         throw(ValidationError("RecordBatch length does not match top-level field nodes"))
     return col
-end
-
-function decoderecord(
-    fm::FramedMessage,
-    fields,
-    sch::Schema,
-    dicts::Dict{Int64,ArrayData},
-    fielddictids::IdDict{Field,Int64},
-    limits::Limits,
-    validated_dictionaries,
-    state::DecodeState,
-)
-    p = _recordplan(fm.msg.header::Meta.RecordBatch, fm.body, fm.version, fields, limits)
-    cols = ArrayData[
-        _decodeplanned(p, j, f, dicts, fielddictids, limits, validated_dictionaries, state) for (j, f) in enumerate(fields)
-    ]
-    return AC.RecordBatch(sch, cols, p.rblen, validated_dictionaries)
 end
 
 """

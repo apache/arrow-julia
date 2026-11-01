@@ -86,7 +86,7 @@ end
         @test t2.ts[2] === missing
     end
 
-    @testset "scan filter lowers a ZonedDateTime literal" begin
+    @testset "scan filter compares a ZonedDateTime literal" begin
         bytes = tzfile(AC.MILLISECOND, "America/Denver", Int64[0, 1_000, 2_000])
         want = ZonedDateTime(DateTime(1970, 1, 1, 0, 0, 1), denver; from_utc=true)
         for op in (==, <)  # zoned columns push down ordered comparisons too
@@ -97,8 +97,7 @@ end
             @test length(t.ts) == 1
             @test only(t.ts) == (op === (==) ? want : want - Second(1))
         end
-        # a sub-unit ZonedDateTime literal cannot lower to a SECOND column
-        # exactly; the filter still evaluates correctly in the public domain
+        # a sub-second ZonedDateTime literal against a SECOND column
         sbytes = tzfile(AC.SECOND, "America/Denver", Int64[0, 1, 2])
         subsec = ZonedDateTime(DateTime(1970, 1, 1, 0, 0, 1, 500), denver; from_utc=true)
         t = Arrow.Table(

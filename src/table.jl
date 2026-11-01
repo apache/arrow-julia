@@ -533,8 +533,8 @@ end
 # Map a temporal descriptor to the compile-time token the writer's conversion
 # loops dispatch on; eighteen values total (2 date + 4 timestamp + 4 zoned
 # timestamp + 4 time + 4 duration). Zone-declared timestamps carry their own
-# kind: their literal domain (`ZonedTimestamp`/`ZonedDateTime`) is disjoint
-# from the zone-naive one.
+# kind: their values (`ZonedTimestamp`/`ZonedDateTime`) are disjoint from the
+# zone-naive ones.
 _facadetoken(t::AC.DateType) =
     t.unit == AC.DAY ? Val((:date, AC.DAY)) : Val((:date, AC.MILLISECOND_DATE))
 _facadetoken(t::AC.TimestampType) =
@@ -558,18 +558,6 @@ _facadetoken(t::AC.DurationType) =
     t.unit == AC.MILLISECOND ? Val((:duration, AC.MILLISECOND)) :
     t.unit == AC.MICROSECOND ? Val((:duration, AC.MICROSECOND)) :
     Val((:duration, AC.NANOSECOND))
-
-@inline function _closedint64(value)::Union{Nothing,Int64}
-    value isa Union{Bool,Int8,Int16,Int32,Int64} && return Int64(value)
-    if value isa Union{Int128,UInt64,UInt128}
-        Int128(typemin(Int64)) <= value <= Int128(typemax(Int64)) || return nothing
-        return Int64(value)
-    end
-    value isa Union{UInt8,UInt16,UInt32} && return Int64(value)
-    # BigInt and user-defined Integer values can allocate or execute arbitrary
-    # code. Scalar lowering handles them separately; membership stays public.
-    return nothing
-end
 
 @inline function _boundedint64(value::Int128)::Union{Nothing,Int64}
     Int128(typemin(Int64)) <= value <= Int128(typemax(Int64)) || return nothing
@@ -631,8 +619,8 @@ end
     unit == AC.MICROSECOND ? Int64(1_000_000) : Int64(1_000_000_000)
 
 # Ticks per second of a Timestamp/ZonedTimestamp period. Package-defined
-# periods return `nothing`: their conversion is request-defined code, so
-# their literals stay in the public domain.
+# periods return `nothing`: converting them would run package code, so they
+# have no exact storage value here.
 @inline _periodticks(::Type{Dates.Second})::Union{Nothing,Int64} = Int64(1)
 @inline _periodticks(::Type{Dates.Millisecond})::Union{Nothing,Int64} = Int64(1_000)
 @inline _periodticks(::Type{Dates.Microsecond})::Union{Nothing,Int64} = Int64(1_000_000)
@@ -651,7 +639,7 @@ _instantperiod(::Durations.ZonedTimestamp{P}) where {P} = P
 end
 
 # Zone-NAIVE timestamp columns: `Durations.Timestamp`, `DateTime`, and `Date`
-# literals lower by instant. Zoned values never lower here — the public
+# values lower by instant. Zoned values never lower here — the public
 # domain defines them as unequal to every zone-naive value.
 @inline function _timestampstorage(unit, value)::Union{Nothing,Int64}
     if value isa Durations.Timestamp
@@ -665,12 +653,12 @@ end
     return _rescalecount(millis, Int64(1_000), _unitticks(unit))
 end
 
-# Zone-DECLARED timestamp columns: a `ZonedTimestamp` literal in ANY zone
+# Zone-DECLARED timestamp columns: a `ZonedTimestamp` value in ANY zone
 # lowers to its UTC instant — public `==`/`isless` between zoned values
 # compare only the UTC time, so the zone label plays no role. With TimeZones
-# loaded, `ZonedDateTime` literals lower the same way through the extension
-# (it lowers only its own type and never throws). Zone-naive literals stay
-# public: the domain defines them as unequal to every zoned value.
+# loaded, `ZonedDateTime` values lower the same way through the extension
+# (it lowers only its own type and never throws). Zone-naive values do not
+# lower: the domain defines them as unequal to every zoned value.
 @inline function _zonedtimestampstorage(unit, value)::Union{Nothing,Int64}
     if value isa Durations.ZonedTimestamp
         from = _periodticks(_instantperiod(value))
@@ -681,20 +669,6 @@ end
     ext === nothing && return nothing
     z = ext.zonedstorage(unit, value)
     return z === nothing ? nothing : z::Int64
-end
-
-@inline function _periodscale(value)::Union{Nothing,Int128}
-    value isa Dates.Week && return Int128(604_800_000_000_000)
-    value isa Dates.Day && return Int128(86_400_000_000_000)
-    value isa Dates.Hour && return Int128(3_600_000_000_000)
-    value isa Dates.Minute && return Int128(60_000_000_000)
-    value isa Dates.Second && return Int128(1_000_000_000)
-    value isa Dates.Millisecond && return Int128(1_000_000)
-    value isa Dates.Microsecond && return Int128(1_000)
-    value isa Dates.Nanosecond && return Int128(1)
-    # Calendar periods need a reference date. Compound and user-defined
-    # periods can execute request-defined conversion code. Both stay public.
-    return nothing
 end
 
 @inline function _periodnanos(value)::Union{Nothing,Int128}
@@ -728,9 +702,8 @@ end
 """
 Lower a built-in temporal value without exceptions or request-defined code.
 
-`K` is one of the eighteen `_facadetoken` descriptor/unit values. A result is
-exact. `nothing` selects the public-domain path or, for a Duration scalar,
-the guarded custom-conversion path below.
+`K` is one of the eighteen `_facadetoken` descriptor/unit values. The result
+is exact, or `nothing` when the value has no exact storage value.
 """
 @inline function _exactfacadevalue(::Val{K}, value)::Union{Nothing,Int32,Int64} where {K}
     kind, unit = K
@@ -791,24 +764,18 @@ function _facadescalarvalue(t::AC.DurationType, value)::Union{Nothing,Int64}
 end
 
 """
-Lower one public-domain scalar to a descriptor's storage domain exactly.
-
-The Boolean result is false when conversion would change facade comparison
-semantics. Scan planning then evaluates in the public domain; retained column
-construction reports incompatible replacement data.
+Lower one public value to a descriptor's storage domain exactly: `(true, stored)`,
+or `(false, v)` when conversion would change facade comparison semantics, which
+retained column construction reports as incompatible replacement data.
 """
-function _facadeliteral(t::AC.ArrowType, value)
-    result = _facadescalarvalue(t, value)
-    return result === nothing ? (false, value) : (true, result)
-end
-
 function _facadetostorage(t::AC.ArrowType, v)
     t isa AC.DictionaryType && return _facadetostorage(t.valuetype, v)
     if t isa Union{AC.DateType,AC.TimestampType,AC.TimeType,AC.DurationType}
-        return _facadeliteral(t, v)
+        stored = _facadescalarvalue(t, v)
+        return stored === nothing ? (false, v) : (true, stored)
     end
     # Non-temporal fields compare in their storage (and public) domain, but
-    # temporal public literals — including Timestamp and ZonedTimestamp,
+    # temporal public values — including Timestamp and ZonedTimestamp,
     # which are AbstractDateTime — are incompatible with them.
     if v isa Dates.Date ||
        v isa Dates.AbstractDateTime ||
@@ -1393,7 +1360,7 @@ _facadefromraw(
     )
 
 # The private scan-plan module is included at the facade conversion seam.
-# It owns binding, lowering, execution, projection, and output schema.
+# It owns planning, execution, projection, and output schema.
 include("scan.jl")
 
 # --- source opening ---------------------------------------------------------
@@ -1930,15 +1897,6 @@ _retainedsnapshotpool(f::AC.Field, dictionary, arrowtypes::_ArrowTypesContext) =
         dictionary === nothing ? AC.ArrayData[] : AC.ArrayData[dictionary],
         arrowtypes,
     )
-
-# The rows of `batches` together, refused when they do not fit an `Int`.
-function _batchrowtotal(batches)
-    nrows = 0
-    for b in batches
-        nrows = _addscanrows(nrows, Int64(b.nrows))
-    end
-    return nrows
-end
 
 # The eltype the keep/drop decision uses for an EMPTY pre-override column:
 # the descriptor's declared facade type. Composites materialize rows as

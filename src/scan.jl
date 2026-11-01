@@ -1691,7 +1691,12 @@ function _eachrecord(work, ks, budget, ntasks::Int)
     return nothing
 end
 
-_fieldmask(idxs, n::Int) = (m=falses(n); m[idxs].=true; m)
+# The mask over `n` fields that selects fields `idxs`.
+function _fieldmask(idxs, n::Int)
+    mask = falses(n)
+    mask[idxs] .= true
+    return mask
+end
 
 # Whether a scan keeps every row of every batch it reads.
 _selectsonly(b::Tables.BoundScan) =

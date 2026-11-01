@@ -631,8 +631,8 @@ function _ranged_main(filebytes::Vector{UInt8}, full)
     )
     println("empty projections request no output-column body ranges ✓")
 
-    # Standard temporal membership containers lower without changing their
-    # `in` semantics, so a remote Date filter stays on the ranged path.
+    # A Date membership filter keeps `in`'s semantics over a byte-range
+    # source and fetches less than half of the object.
     dateio = IOBuffer()
     dates = Arrow.Dates.Date(2024, 1, 1) .+ Arrow.Dates.Day.(0:9_999)
     Arrow.write(dateio, (d=dates, fat=fill(repeat("x", 128), length(dates))); file=true)
@@ -747,8 +747,8 @@ function _ranged_main(filebytes::Vector{UInt8}, full)
         ),
         (
             # Timestamp{Second} is a bijection with its counts: the extreme
-            # pool entry no longer wrap-aliases the epoch, so the membership
-            # lowers and matches exactly the epoch-valued row.
+            # pool entry does not alias the epoch, so the membership matches
+            # exactly the epoch-valued row.
             Arrow.AC.TimestampType(Arrow.AC.SECOND, nothing),
             Int64[0, Int64(1) << 61],
             Int32[0, 1],
