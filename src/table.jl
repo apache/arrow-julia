@@ -1425,8 +1425,6 @@ include("scan.jl")
 
 # --- source opening ---------------------------------------------------------
 
-const _FILE_MAGIC = b"ARROW1"
-
 const _OpenedReader = Union{SourceFile,ArrowFile,IPCStream}
 
 _configuredlimits(source::SourceFile) = source.limits
@@ -1454,7 +1452,7 @@ function _readerlimits(source, requested::Limits)
     return limits
 end
 
-_isfilebytes(bytes::Vector{UInt8}) = length(bytes) >= 6 && view(bytes, 1:6) == _FILE_MAGIC
+_isfilebytes(bytes::Vector{UInt8}) = length(bytes) >= 6 && view(bytes, 1:6) == FILE_MAGIC
 
 # A successful ArrowFile adopts the mapped region. Before that handoff, this
 # layer owns the region and must unmap it if validation or parsing fails.
@@ -1537,7 +1535,7 @@ function _openfile(
         # Columns read the mapping in place, so `release!` must not unmap
         # it: the mapping lives until nothing reaches it.
         region = AC._mmapregion(io, label; eager=false)
-        magic == _FILE_MAGIC && return _readmappedfile(region, limits, budget)
+        magic == FILE_MAGIC && return _readmappedfile(region, limits, budget)
         return _readmappedstream(region, limits, budget, ntasks)
     end
     _chargevector!(budget, UInt8, size, "source file read")
@@ -1846,20 +1844,6 @@ function Table(
     end
     budget = source isa IPCStream ? source.budget : _sourcebudget(source, readlimits)
     opened = _opensource(source; mmap=mmap, limits=readlimits, budget=budget, ntasks=ntasks)
-    if Sys.isunix() &&
-       mmap &&
-       scan === nothing &&
-       source isa AbstractString &&
-       opened isa ArrowFile
-        # A whole-table read touches every page of the mapping. One
-        # madvise maps them all at once (as Arrow C++ does for mapped
-        # reads), several times cheaper on macOS than a fault per page.
-        try
-            Mmap.madvise!(opened.region.root::Vector{UInt8}, Mmap.MADV_WILLNEED)
-        catch e
-            e isa SystemError || rethrow()
-        end
-    end
     return _tablefrom(opened, scan, budget; stringtype=stringtype, ntasks=ntasks)
 end
 
@@ -2443,7 +2427,7 @@ function _openstreamfile(
 )
     magic = Base.read(io, 6)
     seekstart(io)
-    magic == _FILE_MAGIC &&
+    magic == FILE_MAGIC &&
         return _openfile(io, label; mmap=mmap, limits=limits, budget=budget)
     mmap || return _openstream(Base.read(io); limits=limits)
     eof(io) && return _openstream(UInt8[]; limits=limits)
@@ -2456,7 +2440,7 @@ function _openstream(
     budget=nothing,
 )
     head = Base.read(io, 8)
-    if length(head) >= 6 && view(head, 1:6) == _FILE_MAGIC
+    if length(head) >= 6 && view(head, 1:6) == FILE_MAGIC
         # The file format needs its footer: read the rest.
         return _openbytes(vcat(head, Base.read(io)); limits=limits, budget=budget)
     end

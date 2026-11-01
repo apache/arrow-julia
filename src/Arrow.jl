@@ -47,7 +47,6 @@ import PooledArrays
 using SentinelArrays: ChainedVector
 import ArrowTypes
 import Dates
-import Mmap
 import UUIDs
 import CodecLz4
 import CodecZstd
