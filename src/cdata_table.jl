@@ -97,11 +97,11 @@ end
 Import one array through the C data interface as a table. A struct array (a record
 batch) becomes a table of its fields; any other array becomes a one-column table named
 after the schema. The array is moved, as the interface requires, and the schema is read
-and released. The columns have the types an IPC read of the same data has, and they
-read the producer's memory in place: `Arrow.release!(table)` refuses further column
-access, and the producer's `release` callback runs once the table and its columns are
-garbage collected. `stringtype`, `ntasks`, and `limits` mean what they mean for
-`Arrow.Table`.
+and released. The columns have the types an IPC read of the same data has. Numbers,
+dates, and other fixed-width values are read in the producer's memory, and string and
+binary values are copied. `Arrow.release!(table)` refuses further column access, and the
+producer's `release` callback runs once the table and its columns are garbage collected.
+`stringtype`, `ntasks`, and `limits` mean what they mean for `Arrow.Table`.
 """
 function Table(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}; kw...)
     stringtype, ntasks, limits = _creadargs(; kw...)
@@ -120,8 +120,8 @@ end
                 stringtype=DataString, ntasks=Threads.nthreads(), limits=Arrow.Limits())
 
 Import a whole C stream as a table. The stream is moved, as the interface requires,
-every record batch is read, and the stream is released; the columns chain the batches
-as an IPC read's do and read the producer's memory in place, which the producer's
+every record batch is read, and the stream is released. The columns chain the batches
+as an IPC read's do; fixed-width values stay in the producer's memory, which its
 `release` callbacks give back once the table and its columns are garbage collected.
 [`Arrow.Stream(streamptr)`](@ref Arrow.Stream) reads one batch at a time instead.
 """
@@ -153,8 +153,8 @@ end
                  stringtype=DataString, ntasks=Threads.nthreads(), limits=Arrow.Limits())
 
 Read a C stream one record batch at a time: each iteration pulls the next batch from the
-producer and gives it as an [`Arrow.Table`](@ref) whose columns read the producer's
-memory in place. The stream is moved, as the interface requires. It is iterated once,
+producer and gives it as an [`Arrow.Table`](@ref), built as
+[`Arrow.Table(streamptr)`](@ref Arrow.Table) builds its columns. The stream is moved, as the interface requires. It is iterated once,
 from one task at a time, and its length is unknown until it is read. As for any
 `Arrow.Stream`, [`Arrow.release!`](@ref) of the stream or of a table it yielded
 releases the producer's stream and refuses further column access; columns already

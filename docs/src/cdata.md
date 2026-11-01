@@ -95,11 +95,12 @@ instead of reading the whole stream, for a DuckDB or Polars result larger than m
   (an `Arrow.Stream` is a partition per batch) and splits a batch only when its string
   data outgrows 32-bit offsets; `to_c_data` refuses a table that needs more than one
   batch.
-- Imports read the producer's memory in place: strings as `DataString`, timestamps as
-  `Timestamp` or `ZonedTimestamp`, decimals as `Decimal`, nested values as the same views
-  an IPC read gives, with `stringtype`, `ntasks`, and `limits` as for `Arrow.Table`. A
-  C stream read whole chains its batches into one table. `copy(table)` copies it into
-  Julia-owned memory.
+- Imports have the column types an IPC read gives: strings as `DataString`, timestamps
+  as `Timestamp` or `ZonedTimestamp`, decimals as `Decimal`, nested values as the same
+  views, with `stringtype`, `ntasks`, and `limits` as for `Arrow.Table`. Numbers, dates,
+  and other fixed-width values read the producer's memory in place; string and binary
+  values are copied into Julia-owned buffers. A C stream read whole chains its batches
+  into one table. `copy(table)` copies all of it into Julia-owned memory.
 - Exported and imported data is validated as an IPC read is.
 
 ## Memory
@@ -123,9 +124,15 @@ its memory and its release with the original; use `copy`.
 
 The callbacks Arrow.jl exports are Julia functions. A consumer that calls them from its
 own threads, as DuckDB's and Arrow C++'s thread pools do, makes Julia adopt those
-threads. The release callbacks take no locks and allocate nothing, so they are safe to
-call from any thread; a stream's `get_next` builds the batch's structs on the calling
-thread.
+threads. The release callbacks take no locks, so they are safe to call from any thread;
+a stream's `get_next` builds the batch's structs on the calling thread.
+
+On Julia 1.12 and 1.13 a process in which such a consumer thread ran a callback hangs
+at exit, when the consumer's library joins its threads (a Julia bug; 1.10 and 1.11 exit
+normally). Closing the consumer, as with DuckDB's `connection.close()`, does not avoid
+it, because the threads belong to the library's thread pool. Until Julia fixes it,
+`ccall(:_exit, Cvoid, (Cint,), 0)` ends such a process at once; it skips exit hooks, so
+flush output and close files first.
 
 A producer's `release` callback for imported data runs on the thread that imported
 it: when a garbage collection on another thread finds the data unreachable, the
