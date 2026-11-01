@@ -307,7 +307,7 @@ Base.@nospecializeinfer function _partof(
     nested = _uninferred(_nestedpart, name, v, context)
     nested === nothing || return nested
     if narrowabstract
-        narrowed = _uninferred(_narrowabstractwriterparts, name, v, context)
+        narrowed = _uninferred(_narrowabstractcolumn, name, v, context)
         if narrowed !== nothing
             # Julia can canonicalize a Union of concrete Tuple runtime types
             # back to the original abstract declaration, so eltype may be
@@ -1015,7 +1015,7 @@ function _constructfacadeunion(f::AC.Field, v::AbstractVector, context)
                 push!(childvalues[j], j == k ? x : missing)
             end
         elseif x === missing && !isempty(childvalues[k]) && last(childvalues[k]) === missing
-            # Missing rows in a row share one null slot.
+            # Consecutive missing rows share one null slot.
             offsets[i] = length(childvalues[k]) - 1
         else
             offsets[i] = length(childvalues[k])
@@ -2603,11 +2603,7 @@ end
 Narrow one unresolved abstract declaration from whole-column runtime evidence.
 Returns nothing when the declaration cannot be narrowed from runtime evidence.
 """
-function _narrowabstractwriterparts(
-    name::String,
-    v::AbstractVector,
-    context::_WriterContext,
-)
+function _narrowabstractcolumn(name::String, v::AbstractVector, context::_WriterContext)
     logical = Base.nonmissingtype(_eltypeof(v))
     logical in (Union{}, Any) && return nothing
     (isconcretetype(logical) || logical isa Union) && return nothing
@@ -3560,8 +3556,8 @@ Base.@nospecializeinfer function _retainedpartof(
     return _constructretainedpart(f, v, context)
 end
 
-# Writer-side element types that a retained descriptor's per-value lowering
-# converts exactly, beyond its public type: a written `DateTime` (or another
+# Writer-side element types a retained descriptor's builder converts exactly,
+# beyond its public type: a written `DateTime` (or another
 # date-time) column under a timestamp, any `AbstractString` under a string.
 _retainedwritertype(::AC.TimestampType, ::Type{T}) where {T} = T <: Dates.AbstractDateTime
 _retainedwritertype(::AC.Utf8Type, ::Type{T}) where {T} = T <: AbstractString
@@ -4251,8 +4247,7 @@ end
 "A non-dictionary column of `_constructcolumnparts`: its field and data."
 function _plaincolumnparts(name, fieldname, part, retained, context)
     narrowed =
-        retained === nothing ? _narrowabstractwriterparts(fieldname, part, context) :
-        nothing
+        retained === nothing ? _narrowabstractcolumn(fieldname, part, context) : nothing
     try
         # A successful narrowing pass already saw every value; replanning
         # from part of them can split one declared nullable Tuple child into

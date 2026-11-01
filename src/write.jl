@@ -767,7 +767,7 @@ function _narrowcolumn(name::String, @nospecialize(col::AbstractVector))
     col isa DictEncode && return anylists ? DictEncode(_narrowlists(col.data, name)) : col
     anylists && (col = _narrowlists(col, name))
     narrowed = _uninferred(
-        _narrowabstractwriterparts,
+        _narrowabstractcolumn,
         name,
         col,
         _WriterContext(name),
