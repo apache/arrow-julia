@@ -143,10 +143,11 @@ it, because the threads belong to the library's thread pool. Until Julia fixes i
 flush output and close files first.
 
 A producer's `release` callback for imported data runs on the thread that imported
-it: when a garbage collection on another thread finds the data unreachable, the
-importing thread runs the callback at its next yield. pyarrow's release of memory it
-shares with NumPy takes Python's GIL, which PythonCall's main thread holds, so data
-imported on the main thread is released there without waiting on the GIL.
+it, or on thread 1 when another library's thread imported it inside a callback: when a
+garbage collection on another thread finds the data unreachable, that thread runs the
+callback at its next yield. pyarrow's release of memory it shares with NumPy takes
+Python's GIL, which PythonCall's main thread holds, so data imported on the main thread
+is released there without waiting on the GIL.
 
 ## Low-level columns
 

@@ -703,18 +703,23 @@ end
 mutable struct ForeignOwner
     # A malloc'd copy of the moved struct: the stable address its callback takes.
     const block::Ptr{CArrowArray}
-    const thread::Int   # the importing thread, where a collected owner releases
+    const thread::Int   # where a collected owner releases (`_releasethread`)
     cell::AC.ReleaseCell
-    ForeignOwner(block::Ptr{CArrowArray}) = new(block, Threads.threadid())
+    ForeignOwner(block::Ptr{CArrowArray}) = new(block, _releasethread())
 end
+
+# The thread whose task releases an import made on this thread once it is collected:
+# this thread, or thread 1 for a thread Julia adopted from a foreign library, which
+# runs no Julia tasks.
+_releasethread() = Threads.threadpool() === :foreign ? 1 : Threads.threadid()
 
 # The finalizer of an imported array or stream owner. A producer's release can
 # wait on a lock the importing thread holds (pyarrow's release of NumPy memory
 # takes Python's GIL, which PythonCall's main thread keeps), and a thread waiting
 # inside a finalizer stalls every garbage collection. So a finalizer on another
-# thread hands the release to a task on the importing thread, which runs it at its
-# next yield. At exit the release is skipped: Julia runs the finalizers of live
-# objects then, and the process is ending.
+# thread hands the release to a task on the owner's `thread` (the importing thread,
+# or thread 1), which runs it at its next yield. At exit the release is skipped:
+# Julia runs the finalizers of live objects then, and the process is ending.
 function _finalizeowner(o)
     Threads.threadid() == o.thread && return release!(o)
     _EXITING[] && return nothing

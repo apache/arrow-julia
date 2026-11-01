@@ -65,6 +65,37 @@ end
     return nothing
 end
 
+# The thread pool of the thread `_drop_import_on_foreign_thread` started.
+const FOREIGN_POOL = Ref(:none)
+
+function _foreign_drop_import(::Ptr{Cvoid})
+    FOREIGN_POOL[] = Threads.threadpool()
+    _drop_import()
+    return nothing
+end
+
+# Runs `_drop_import` on a thread Julia did not start, as a C library's worker
+# thread would call back into Julia, and waits for that thread to end.
+function _drop_import_on_foreign_thread()
+    entry = @cfunction(_foreign_drop_import, Cvoid, (Ptr{Cvoid},))
+    tid = Ref{UInt}(0)
+    err = ccall(
+        :uv_thread_create,
+        Cint,
+        (Ptr{UInt}, Ptr{Cvoid}, Ptr{Cvoid}),
+        tid,
+        entry,
+        C_NULL,
+    )
+    err == 0 || error("uv_thread_create failed: $err")
+    # Joined GC-safe, so a collection the adopted thread waits for can run.
+    state = ccall(:jl_gc_safe_enter, Int8, ())
+    err = ccall(:uv_thread_join, Cint, (Ptr{UInt},), tid)
+    ccall(:jl_gc_safe_leave, Cvoid, (Int8,), state)
+    err == 0 || error("uv_thread_join failed: $err")
+    return nothing
+end
+
 _registry_count() = lock(REGISTRY_LOCK) do
     length(EXPORTS)
 end
@@ -211,5 +242,21 @@ function _threaded_cdata_stress()
         crossed && break
     end
     @assert crossed
+
+    # A thread Julia adopted from a foreign library runs no Julia tasks, so an
+    # import made there is released on thread 1 once collected.
+    @atomic TEST_RELEASE_THREAD.id = 0
+    _drop_import_on_foreign_thread()
+    @assert FOREIGN_POOL[] === :foreign
+    for _ = 1:20
+        GC.gc(true)
+        for _ = 1:1000
+            (@atomic TEST_RELEASE_THREAD.id) == 0 || break
+            yield()
+        end
+        (@atomic TEST_RELEASE_THREAD.id) == 0 || break
+    end
+    released = @atomic TEST_RELEASE_THREAD.id
+    @assert released == 1 released
     return nothing
 end
