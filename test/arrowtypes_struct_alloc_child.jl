@@ -61,13 +61,7 @@ end
 
 function constructfresh(rows)
     STRUCT_ALLOC_LOWER_CALLS[] = 0
-    field, data = Arrow._arrowtypesstructcolumn(
-        "value",
-        rows,
-        StructAllocFreshRow;
-        extension_shape=false,
-        context=Arrow._WriterContext("value"),
-    )
+    field, data = Arrow._structpart("value", rows, Arrow._WriterContext("value"))
     AC.validate_full(field, data)
     visible = count(!ismissing, rows)
     STRUCT_ALLOC_LOWER_CALLS[] == STRUCT_ALLOC_WIDTH * visible ||

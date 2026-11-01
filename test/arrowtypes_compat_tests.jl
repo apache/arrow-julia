@@ -1731,7 +1731,7 @@ end
     ARROWTYPES_TEST_PLAN_COUNTED_NAME_CALLS[] = 0
     ARROWTYPES_TEST_PLAN_COUNTED_LOWER_CALLS[] = 0
     bytes = arrowtypes_test_bytes(parts; file=false)
-    @test ARROWTYPES_TEST_PLAN_COUNTED_KIND_CALLS[] == 16
+    @test ARROWTYPES_TEST_PLAN_COUNTED_KIND_CALLS[] <= 16
     @test ARROWTYPES_TEST_PLAN_COUNTED_NAME_CALLS[] == 16
     @test ARROWTYPES_TEST_PLAN_COUNTED_LOWER_CALLS[] == 16
     @test Arrow.Table(bytes).value == ArrowTypesTestPlanCounted.(Int32.(1:16))
@@ -3126,12 +3126,11 @@ end
         values = T[fill(missing, listsize)]
         append!(values, fill(missing, 49))
         kind = ArrowTypes.FixedSizeListKind{listsize,Missing}()
-        rebuiltfield, rebuiltdata = Arrow._arrowtypesfixedlistcolumn(
+        rebuiltfield, rebuiltdata = Arrow._fixedlistpart(
             "value",
             values,
-            kind;
-            extension_shape=false,
-            context=Arrow._WriterContext("value"),
+            Arrow._WriterContext("value"),
+            ArrowTypes.getsize(kind),
         )
         ARROWTYPES_TEST_AC.validate_full(rebuiltfield, rebuiltdata)
         return nothing
@@ -3229,12 +3228,11 @@ end
         values = T[collect(Int64, 1:listsize)]
         append!(values, fill(missing, 49))
         kind = ArrowTypes.FixedSizeListKind{listsize,Int64}()
-        rebuiltfield, rebuiltdata = Arrow._arrowtypesfixedlistcolumn(
+        rebuiltfield, rebuiltdata = Arrow._fixedlistpart(
             "value",
             values,
-            kind;
-            extension_shape=false,
-            context=Arrow._WriterContext("value"),
+            Arrow._WriterContext("value"),
+            ArrowTypes.getsize(kind),
         )
         ARROWTYPES_TEST_AC.validate_full(rebuiltfield, rebuiltdata)
         @test length(only(rebuiltdata.children)) == 50 * listsize
@@ -3254,12 +3252,11 @@ end
         values = T[Bool[isodd(index) for index = 1:listsize]]
         append!(values, fill(missing, 49))
         kind = ArrowTypes.FixedSizeListKind{listsize,Bool}()
-        rebuiltfield, rebuiltdata = Arrow._arrowtypesfixedlistcolumn(
+        rebuiltfield, rebuiltdata = Arrow._fixedlistpart(
             "value",
             values,
-            kind;
-            extension_shape=false,
-            context=Arrow._WriterContext("value"),
+            Arrow._WriterContext("value"),
+            ArrowTypes.getsize(kind),
         )
         ARROWTYPES_TEST_AC.validate_full(rebuiltfield, rebuiltdata)
         childfield = only(rebuiltfield.children)

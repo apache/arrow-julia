@@ -281,12 +281,11 @@ function freshmixed(listsize::Int)
     values = Union{Missing,Vector{Missing}}[fill(missing, listsize)]
     append!(values, fill(missing, 49))
     kind = ArrowTypes.FixedSizeListKind{listsize,Missing}()
-    rebuiltfield, rebuiltdata = Arrow._arrowtypesfixedlistcolumn(
+    rebuiltfield, rebuiltdata = Arrow._fixedlistpart(
         "value",
         values,
-        kind;
-        extension_shape=false,
-        context=Arrow._WriterContext("value"),
+        Arrow._WriterContext("value"),
+        ArrowTypes.getsize(kind),
     )
     AC.validate_full(rebuiltfield, rebuiltdata)
     return nothing
@@ -343,12 +342,11 @@ function freshnative(listsize::Int)
     values = Union{Missing,Vector{Int64}}[collect(Int64, 1:listsize)]
     append!(values, fill(missing, 49))
     kind = ArrowTypes.FixedSizeListKind{listsize,Int64}()
-    rebuiltfield, rebuiltdata = Arrow._arrowtypesfixedlistcolumn(
+    rebuiltfield, rebuiltdata = Arrow._fixedlistpart(
         "value",
         values,
-        kind;
-        extension_shape=false,
-        context=Arrow._WriterContext("value"),
+        Arrow._WriterContext("value"),
+        ArrowTypes.getsize(kind),
     )
     AC.validate_full(rebuiltfield, rebuiltdata)
     childfield = only(rebuiltfield.children)
@@ -362,12 +360,11 @@ function freshbool(listsize::Int)
     values = Union{Missing,Vector{Bool}}[Bool[isodd(index) for index = 1:listsize],]
     append!(values, fill(missing, 49))
     kind = ArrowTypes.FixedSizeListKind{listsize,Bool}()
-    rebuiltfield, rebuiltdata = Arrow._arrowtypesfixedlistcolumn(
+    rebuiltfield, rebuiltdata = Arrow._fixedlistpart(
         "value",
         values,
-        kind;
-        extension_shape=false,
-        context=Arrow._WriterContext("value"),
+        Arrow._WriterContext("value"),
+        ArrowTypes.getsize(kind),
     )
     AC.validate_full(rebuiltfield, rebuiltdata)
     childfield = only(rebuiltfield.children)
