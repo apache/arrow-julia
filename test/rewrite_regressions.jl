@@ -71,6 +71,18 @@ function _fixedlistnullbytes(listsize::Int; file::Bool)
     return file ? Arrow.writefile(schema, [batch]) : Arrow.writestream(schema, [batch])
 end
 
+# A run-end column of 4 runs over `n` rows.
+function _reebytes(n)
+    runfield, runs = AC.fromjulia("run_ends", Int32[n ÷ 4, n ÷ 2, 3n ÷ 4, n])
+    _, values = AC.fromjulia("values", Int64[1, 2, 3, 4])
+    t = AC.RunEndEncodedType()
+    field = AC.Field("r", t; nullable=false, children=[runfield, AC.Field("values", AC.IntType(64, true); nullable=false)])
+    data = AC.ArrayData(t, n, AC.BufferSlice[]; children=[runs, values], nullcount=0)
+    schema = AC.Schema([field])
+    return Arrow.writestream(schema, [AC.RecordBatch(schema, [data], n)])
+end
+_rewriteallocations(t) = @allocated Arrow.write(IOBuffer(), t)
+
 @testset "facade rewrite correctness regressions" begin
     @testset "repeated names read as x, x_1, as CSV.jl names them" begin
         f1, d1 = AC.fromjulia("x", Int64[1, 2])
@@ -675,6 +687,23 @@ end
         b = Ref(1)
         refpool = Arrow._dictionarypool([a, b, a], nothing)
         @test length(refpool) == 2
+    end
+
+    @testset "dictionary and run-end columns rewrite from their buffers" begin
+        # Indices and runs are reused, not found again value by value.
+        n = 1_000_000
+        dict = Arrow.Table(take!(Arrow.tobuffer((d=Arrow.DictEncode(rand(["a", "b", "c"], n)),))))
+        ree = Arrow.Table(_reebytes(n))
+        for t in (dict, ree)
+            _rewriteallocations(t)
+            once = take!(Arrow.tobuffer(t))
+            @test take!(Arrow.tobuffer(Arrow.Table(once))) == once
+            @test isequal(Arrow.Table(once)[1], t[1])
+        end
+        @test _rewriteallocations(dict) < 40n
+        @test _rewriteallocations(ree) < n
+        @test getfield(Arrow.Table(take!(Arrow.tobuffer(ree))), :schema).fields[1].type isa
+              AC.RunEndEncodedType
     end
 
     @testset "hidden dictionary slots point at one pool value" begin

@@ -2980,7 +2980,7 @@ function _newdictfromdata(
     name::String,
     valuefield::AC.Field,
     valuedata::AC.ArrayData,
-    indices::Vector;
+    indices::AbstractVector;
     nullable::Bool,
     indextype::AC.IntType=AC.IntType(32, true),
     ordered::Bool=false,
@@ -3448,16 +3448,25 @@ function _retainedree(f::AC.Field, v::AbstractVector, context::_WriterContext)
     RT = AC.juliatype(runtype)
     length(v) <= typemax(RT) ||
         throw(ArgumentError("column $(f.name) length exceeds its retained run-end type"))
-    runends = RT[]
-    runvalues = Any[]
-    for (i, x) in enumerate(v)
-        # Logical `isequal` may intentionally coarsen a custom type. Only the
-        # non-overridable `===` relation is safe for physical run coalescing.
-        if isempty(runvalues) || x !== last(runvalues)
-            push!(runvalues, x)
-            push!(runends, RT(i))
-        else
-            runends[end] = RT(i)
+    if v isa RunEndEncoded
+        # A run-end column read from Arrow keeps its runs: those over its rows,
+        # each cut to them.
+        lo = searchsortedfirst(v.runends, v.offset + 1)
+        hi = searchsortedfirst(v.runends, v.offset + v.len)
+        runends = RT[RT(min(v.runends[r], v.offset + v.len) - v.offset) for r = lo:hi]
+        runvalues = v.len == 0 ? v.values[1:0] : v.values[lo:hi]
+    else
+        runends = RT[]
+        runvalues = Any[]
+        for (i, x) in enumerate(v)
+            # Logical `isequal` may intentionally coarsen a custom type. Only
+            # the non-overridable `===` relation is safe for run coalescing.
+            if isempty(runvalues) || x !== last(runvalues)
+                push!(runvalues, x)
+                push!(runends, RT(i))
+            else
+                runends[end] = RT(i)
+            end
         end
     end
     rebuiltvaluefield, valuedata = _constructpart(valuefield, runvalues; context)
@@ -3813,8 +3822,24 @@ function _remapdictionaryindices(indices, remap::Vector{Int64})
     ]
 end
 
+"""
+The 0-based codes of a dictionary column read from Arrow (or a range of its
+rows) when its pool is the first `prefix` categories of `hint`, else nothing.
+"""
+function _dictcodes(v, hint, prefix::Int)
+    hint === nothing && return nothing
+    parentcol, rows = v isa SubArray ? (parent(v), only(parentindices(v))) : (v, nothing)
+    parentcol isa DictEncoded && (rows === nothing || rows isa UnitRange{Int}) ||
+        return nothing
+    pool = parentcol.pool
+    length(pool) <= prefix &&
+        all(i -> isequal(pool[i], hint[i]), eachindex(pool)) ||
+        return nothing
+    return rows === nothing ? parentcol.indices : view(parentcol.indices, rows)
+end
+
 "One shared-pool dictionary batch: identical pool OBJECT across batches."
-function _dictbatch(fld::AC.Field, indices::Vector, pool_d::AC.ArrayData)
+function _dictbatch(fld::AC.Field, indices::AbstractVector, pool_d::AC.ArrayData)
     t = fld.type::AC.DictionaryType
     present = [x !== missing for x in indices]
     # The index type is a run-time property of the field.
@@ -3839,7 +3864,7 @@ function _retaineddictfromdata(
     valuefield::AC.Field,
     valuedata::AC.ArrayData,
     poollength::Int,
-    firstidx::Vector,
+    firstidx::AbstractVector,
     name::String,
 )
     t = rf.type::AC.DictionaryType
@@ -4054,6 +4079,9 @@ function _dictcolumnparts(name, fieldname, part, poolhint, retained, growable, c
     # Arrow source) are kept exactly; the categories after them dedupe.
     retainedprefix = poolhint === nothing ? 0 : _hintprefix(poolhint)
     poolhint === nothing || (poolhint = _hintvalues(poolhint))
+    # A dictionary column read from Arrow whose pool starts the hint keeps its
+    # indices; others index their values into the pool.
+    codes = _dictcodes(values, poolhint, retainedprefix)
     if retained !== nothing
         (retained.type::AC.DictionaryType).valuetype isa AC.UnionType &&
             retainedvaluefield === nothing &&
@@ -4096,9 +4124,9 @@ function _dictcolumnparts(name, fieldname, part, poolhint, retained, growable, c
         # A non-nullable dictionary can materialize missing through a
         # valid index into a null pool entry. The retained pool keeps
         # that distinct from a missing index.
-        any(ismissing, values) &&
-            !retained.nullable &&
-            (poolhint === nothing || !any(ismissing, poolhint)) &&
+        !retained.nullable &&
+            any(ismissing, something(codes, values)) &&
+            (codes !== nothing || poolhint === nothing || !any(ismissing, poolhint)) &&
             throw(
                 ArgumentError(
                     "column $name may hold missing values but its retained " *
@@ -4115,12 +4143,18 @@ function _dictcolumnparts(name, fieldname, part, poolhint, retained, growable, c
             )
     end
 
-    pool = _dictionarypool(values, poolhint)
-    lookup = _dictionarylookup(pool)
-    missingindex =
-        retained !== nothing && !retained.nullable ? findfirst(ismissing, pool) : nothing
-    missingindex === nothing || (missingindex = Int64(missingindex - 1))
-    candidateindices = _dictionaryindices(values, lookup, missingindex)
+    if codes === nothing
+        pool = _dictionarypool(values, poolhint)
+        lookup = _dictionarylookup(pool)
+        missingindex =
+            retained !== nothing && !retained.nullable ? findfirst(ismissing, pool) :
+            nothing
+        missingindex === nothing || (missingindex = Int64(missingindex - 1))
+        candidateindices = _dictionaryindices(values, lookup, missingindex)
+    else
+        pool = poolhint
+        candidateindices = codes
+    end
     candidatevaluefield, candidatevaluedata = if retained === nothing
         _constructpart(fieldname, pool; context)
     else
@@ -4136,7 +4170,9 @@ function _dictcolumnparts(name, fieldname, part, poolhint, retained, growable, c
     valuedata =
         length(selected) == candidatevaluedata.len ? candidatevaluedata :
         _takerows(valuefield, candidatevaluedata, selected)
-    indices = _remapdictionaryindices(candidateindices, remap)
+    indices =
+        length(selected) == length(remap) ? candidateindices :
+        _remapdictionaryindices(candidateindices, remap)
     retained === nothing && return _newdictfromdata(
         fieldname,
         valuefield,
