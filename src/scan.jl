@@ -51,7 +51,7 @@ the skipped bytes; tail reads and coalescing may still over-read them.
 function skipfield!(f::Field, c::DecodeCursor)
     t = f.type
     takenode!(c)
-    spec = layoutspec(t)
+    spec = AC.layoutspec_of(t)
     for _ in spec.buffers
         skipbuffer!(c)
     end
@@ -71,7 +71,7 @@ end
 "FieldNode entries consumed by one field subtree."
 function _fieldnodespan(f::Field)
     f.type isa DictionaryType && return 1
-    spec = layoutspec(f.type)
+    spec = AC.layoutspec_of(f.type)
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     return 1 + sum(_fieldnodespan(f.children[i]) for i = 1:nchildren; init=0)
 end
@@ -83,7 +83,7 @@ registry pair, so the walk carries the batch's variadic-count cursor in
 depth-first order (the same order the decode cursor consumes it).
 """
 function _bufferspan(f::Field, variadics::AbstractVector{Int64}, varidx::Base.RefValue{Int})
-    spec = layoutspec(f.type)
+    spec = AC.layoutspec_of(f.type)
     n = Int64(length(spec.buffers))
     if spec.variadic
         varidx[] <= length(variadics) || throw(
@@ -232,7 +232,7 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
     # Field.nullable is advisory (enforced only by the opt-in validate_full
     # tier), so a planned scan makes no nullability judgment here — the same
     # contract the whole-file path applies.
-    spec = layoutspec(f.type)
+    spec = AC.layoutspec_of(f.type)
     for role in spec.buffers
         _, len = _buffermeta!(c)
         if codec == CODEC_NONE || len == 0
@@ -379,7 +379,7 @@ function _scanmissingdicts(fields, nodes, dicts, fielddictids, mask::AbstractVec
             end
             return
         end
-        spec = layoutspec(f.type)
+        spec = AC.layoutspec_of(f.type)
         nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
         for i = 1:nchildren
             walk(f.children[i], decoded)

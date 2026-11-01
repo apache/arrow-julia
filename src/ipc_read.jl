@@ -865,7 +865,7 @@ function validateschemafield(f::Field)
         validateschemafield(AC.dictvaluefield(f, f.type))
         return f
     end
-    spec = layoutspec(f.type)
+    spec = AC.layoutspec_of(f.type)
     expected = spec.childcount == -1 ? length(f.children) : spec.childcount
     length(f.children) == expected || throw(
         ValidationError(
@@ -1464,7 +1464,7 @@ function missingdicts(
             end
             return
         end
-        spec = layoutspec(f.type)
+        spec = AC.layoutspec_of(f.type)
         nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
         for i = 1:nchildren
             walk(f.children[i])
