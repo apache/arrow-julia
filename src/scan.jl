@@ -690,7 +690,10 @@ Base.getproperty(t::_ScanColumns, name::Symbol) = Tables.getcolumn(t, name)
 function _joinparts(parts::Vector, budget=nothing)
     length(parts) == 1 && return parts[1]
     P = typeof(first(parts))
-    P <: DictEncoded && all(part -> part isa P, parts) && return ChainedVector(P[parts...])
+    # The pieces' types are known at run time; see `_uninferred`.
+    P <: DictEncoded &&
+        all(part -> part isa P, parts) &&
+        return _uninferred(_chain, P, parts)
     T = _eltypeof(first(parts))
     for part in Iterators.drop(parts, 1)
         T = Base.promote_typejoin(T, _eltypeof(part))
@@ -698,10 +701,15 @@ function _joinparts(parts::Vector, budget=nothing)
     total = sum(length, parts; init=0)
     if all(part -> part isa _StringColumn, parts)
         _chargevector!(budget, _StringPayload, total, "joined column")
-        return _joinstrings(T, parts)
+        return _uninferred(_joinstrings, T, parts)
     end
     _chargevector!(budget, T, total, "joined column")
-    out = Vector{T}(undef, total)
+    return _uninferred(_copyparts!, Vector{T}(undef, total), parts)
+end
+
+_chain(::Type{P}, parts) where {P} = ChainedVector(P[parts...])
+
+function _copyparts!(out::Vector, parts)
     offset = 0
     for part in parts
         copyto!(out, offset + 1, part, firstindex(part), length(part))
