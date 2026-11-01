@@ -394,7 +394,10 @@ function _setexiting()
 end
 
 function __init__()
-    # A finalizer does not survive precompilation; the flag must not either.
+    # No export outlives the process that made it: drop what a precompile
+    # workload left (its pointers come back NULL), and re-arm the reap hook,
+    # whose finalizer is not saved.
+    empty!(EXPORTS)
     _REAP_HOOK_ARMED[] = false
     atexit(_setexiting)
     return nothing

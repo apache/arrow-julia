@@ -125,6 +125,19 @@ PrecompileTools.@setup_workload begin
         end
         return nothing
     end
+    # A table to a C data consumer and back, as one record batch and as a
+    # stream, as a PythonCall user hands one to pyarrow and reads one back.
+    function cdataroundtrip(tbl)
+        schemaptr, arrayptr = to_c_data(tbl)
+        readall(Table(schemaptr, arrayptr))
+        stream = Ref{CArrowArrayStream}()
+        GC.@preserve stream begin
+            streamptr = Base.unsafe_convert(Ptr{CArrowArrayStream}, stream)
+            export_stream!(streamptr, tbl)
+            readall(Table(streamptr))
+        end
+        return nothing
+    end
     PrecompileTools.@compile_workload begin
         # The flat table goes out as two record batches, so its columns chain.
         # Reads of the file format, what `Arrow.Table(path)` reads.
@@ -168,5 +181,10 @@ PrecompileTools.@setup_workload begin
         io = IOBuffer()
         write(io, columns; batchsize=2, file=true)
         write(IOBuffer(), Tables.columntable(Table(take!(seekstart(io)))); batchsize=2)
+        cdataroundtrip(columns)
+        cdataroundtrip(flat)
+        # Collected and reaped, so the image saves no export.
+        GC.gc(true)
+        _reap!()
     end
 end
