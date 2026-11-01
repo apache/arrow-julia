@@ -36,9 +36,9 @@ where those contracts are implemented and the constraints on changing them.
 |---|---|
 | `src/ArrowCore.jl` | Ownership regions, checked buffer slices, type descriptors, fields, schemas, array layouts, validation, and low-level builders/accessors |
 | `src/FlatBuffers/`, `src/metadata/` | Vendored FlatBuffers runtime and generated metadata bindings/verifier; `tools/fbsgen.jl` regenerates the latter from the vendored schemas |
-| `src/ipc_read.jl` | Framing, limits, metadata decoding, layout decoding, and decompression |
+| `src/ipc_read.jl` | Framing, limits, metadata decoding, layout decoding, decompression, the stream reader, and the file reader |
 | `src/ipc_dictionary.jl` | Dictionary snapshots, replacement and delta updates, shared IDs, and dictionary dependencies |
-| `src/ipc_write.jl` | File indexes, IPC encoding, batch emission, compression, and incremental writer state |
+| `src/ipc_write.jl` | IPC encoding, batch emission, file footers, compression, and incremental writer state |
 | `src/cdata.jl` | C data and C stream import/export, callbacks, and foreign ownership |
 | `src/source.jl` | Byte-range sources and read scheduling; `ext/ArrowCloudStoreExt.jl` supplies the CloudStore integration |
 | `src/columns.jl` | Read-only buffer views, typed nested rows, dictionary/run-end columns, and deferred string construction |
