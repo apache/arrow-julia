@@ -1614,8 +1614,9 @@ function _conformdictionary(
             "its $IT indices address",
         ),
     )
-    # `IT` is known at run time; see `_uninferred`.
-    reindexed = _uninferred(_reindexdictionary, data, et, IT, remap, 0, pool)
+    # The index types are known at run time; see `_uninferred`.
+    LT = AC.juliatype((data.type::AC.DictionaryType).indextype)
+    reindexed = _uninferred(_reindexdictionary, data, et, IT, LT, remap, pool)
     return (expected, reindexed), nothing
 end
 
@@ -1633,16 +1634,22 @@ function _nulldictionary(t::AC.DictionaryType, n::Int, pool::AC.ArrayData)
     )
 end
 
-# A dictionary part's indices mapped through `remap` (offset by the written
-# categories) into index type `IT`, referring to `pool`.
-function _reindexdictionary(d::AC.ArrayData, t, ::Type{IT}, remap, offset, pool) where {IT}
-    LT = AC.juliatype((d.type::AC.DictionaryType).indextype)
+# A dictionary part's `LT` indices mapped through `remap` into index type
+# `IT`, referring to `pool`.
+function _reindexdictionary(
+    d::AC.ArrayData,
+    t,
+    ::Type{IT},
+    ::Type{LT},
+    remap::Vector{Int64},
+    pool,
+) where {IT,LT}
     validity = d.buffers[1]
     codes = reinterpret(LT, AC.slicebytes(d.buffers[2]))
     out = Vector{IT}(undef, d.len)
     for i = 1:(d.len)
         valid = AC.isempty_buffer(validity) || AC.getbit(validity, Int64(i - 1))
-        out[i] = valid ? IT(remap[offset + Int(codes[i]) + 1]) : zero(IT)
+        out[i] = valid ? IT(remap[Int(codes[i]) + 1]) : zero(IT)
     end
     return AC.ArrayData(
         t,

@@ -74,6 +74,10 @@ function growdictionary(k)
 end
 growthallocations(k) = @allocated growdictionary(k)
 appendallocations(path, table) = @allocated Arrow.append(path, table)
+function batchedallocations(t, n)
+    io = IOBuffer(; sizehint=4_000_000)
+    return @allocated Arrow.write(io, t; batchsize=n)
+end
 
 # :dictionary or :record for each batch message, in order.
 batchkinds(bytes) = [
@@ -404,6 +408,17 @@ batchkinds(bytes) = [
         @test length(dictbatches(growdictionary(2_000))) == 2_000
         t = Arrow.Table(growdictionary(100))
         @test t.s == ["c$(t)_$i" for t = 1:100 for i = 1:20]
+    end
+
+    @testset "a dictionary column's later batches map their codes without per-row allocation" begin
+        t = (; d=Arrow.DictEncode([string("c", i % 32) for i = 1:1_000_000]))
+        batchedallocations(t, 500_000)
+        batchedallocations(t, 1_000_000)
+        # The second batch's 500,000 codes map into the first batch's pool.
+        extra = batchedallocations(t, 500_000) - batchedallocations(t, 1_000_000)
+        @test extra < 8 * 500_000
+        @test Arrow.Table(take!(Arrow.write(IOBuffer(), t; batchsize=500_000))).d ==
+              t.d.data
     end
 
     @testset "one-shot dictionaries use the narrowest index type" begin
