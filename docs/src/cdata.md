@@ -124,10 +124,13 @@ The callbacks Arrow.jl exports are Julia functions. A consumer that calls them f
 own threads, as DuckDB's and Arrow C++'s thread pools do, makes Julia adopt those
 threads. The release callbacks take no locks and allocate nothing, so they are safe to
 call from any thread; a stream's `get_next` builds the batch's structs on the calling
-thread. On Julia 1.12 and 1.13, a process whose adopted threads are still running when
-it exits can hang in the join of those threads at exit (a Julia bug, not present on
-1.10 and 1.11); closing the consumer before Julia exits, as with `connection.close()`
-in DuckDB, avoids it in practice.
+thread.
+
+A producer's `release` callback for imported data runs on the thread that imported
+it: when a garbage collection on another thread finds the data unreachable, the
+importing thread runs the callback at its next yield. pyarrow's release of memory it
+shares with NumPy takes Python's GIL, which PythonCall's main thread holds, so data
+imported on the main thread is released there without waiting on the GIL.
 
 ## Low-level columns
 

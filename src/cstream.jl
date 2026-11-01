@@ -247,6 +247,7 @@ end
 # finalizer.
 mutable struct StreamOwner
     const block::Ptr{CArrowArrayStream}
+    const thread::Int   # the importing thread (see `_finalizeowner`)
     @atomic released::Bool
 end
 
@@ -256,7 +257,7 @@ function _movestream(sp::Ptr{CArrowArrayStream})
     unsafe_store!(block, unsafe_load(sp))
     _store_field!(sp, Val(:release), Ptr{Cvoid}(C_NULL))
     try
-        return finalizer(release!, StreamOwner(block, false))
+        return finalizer(_finalizeowner, StreamOwner(block, Threads.threadid(), false))
     catch
         try
             _release_producer!(block)

@@ -386,8 +386,19 @@ end
 # nothing exports again. Created once, by the first export.
 mutable struct _ReapHook end
 const _REAP_HOOK_ARMED = Ref(false)
-# A finalizer does not survive precompilation; the flag must not either.
-__init__() = (_REAP_HOOK_ARMED[] = false; nothing)
+# Set when Julia starts exiting; see `_finalizeowner`.
+const _EXITING = Ref(false)
+function _setexiting()
+    _EXITING[] = true
+    return nothing
+end
+
+function __init__()
+    # A finalizer does not survive precompilation; the flag must not either.
+    _REAP_HOOK_ARMED[] = false
+    atexit(_setexiting)
+    return nothing
+end
 
 function _reaphook(h::_ReapHook)
     finalizer(_reaphook, h)
@@ -666,8 +677,26 @@ end
 mutable struct ForeignOwner
     # A malloc'd copy of the moved struct: the stable address its callback takes.
     const block::Ptr{CArrowArray}
+    const thread::Int   # the importing thread, where a collected owner releases
     cell::AC.ReleaseCell
-    ForeignOwner(block::Ptr{CArrowArray}) = new(block)
+    ForeignOwner(block::Ptr{CArrowArray}) = new(block, Threads.threadid())
+end
+
+# The finalizer of an imported array or stream owner. A producer's release can
+# wait on a lock the importing thread holds (pyarrow's release of NumPy memory
+# takes Python's GIL, which PythonCall's main thread keeps), and a thread waiting
+# inside a finalizer stalls every garbage collection. So a finalizer on another
+# thread hands the release to a task on the importing thread, which runs it at its
+# next yield. At exit the release is skipped: Julia runs the finalizers of live
+# objects then, and the process is ending.
+function _finalizeowner(o)
+    Threads.threadid() == o.thread && return release!(o)
+    _EXITING[] && return nothing
+    t = Task(() -> release!(o))
+    t.sticky = true
+    ccall(:jl_set_task_tid, Cint, (Any, Cint), t, o.thread - 1)
+    schedule(errormonitor(t))
+    return nothing
 end
 
 function _release_owner_action(p::Ptr{Cvoid})::Cvoid
@@ -699,7 +728,7 @@ function _moveowner(ap::Ptr{CArrowArray})
     try
         o = ForeignOwner(block)
         o.cell = AC.ReleaseCell(@cfunction(_release_owner_action, Cvoid, (Ptr{Cvoid},)), o)
-        return finalizer(release!, o)
+        return finalizer(_finalizeowner, o)
     catch
         try
             _release_producer!(block)

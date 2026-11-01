@@ -29,6 +29,20 @@ end
 # pointer stored in a const is invalid after a precompile-cache reload.
 test_conforming_release() = @cfunction(_test_conforming_release, Cvoid, (Ptr{CArrowArray},))
 
+# The thread a test producer's release last ran on.
+mutable struct ReleaseThread
+    @atomic id::Int
+end
+const TEST_RELEASE_THREAD = ReleaseThread(0)
+
+function _test_thread_release(p::Ptr{CArrowArray})::Cvoid
+    @atomic TEST_RELEASE_THREAD.id = Threads.threadid()
+    _store_field!(p, :release, Ptr{Cvoid}(C_NULL))
+    return nothing
+end
+
+test_thread_release() = @cfunction(_test_thread_release, Cvoid, (Ptr{CArrowArray},))
+
 function _test_c_array(release::Ptr{Cvoid})
     return CArrowArray(
         0,
@@ -42,6 +56,13 @@ function _test_c_array(release::Ptr{Cvoid})
         release,
         Ptr{Cvoid}(C_NULL),
     )
+end
+
+# A moved test array whose owner is unreachable once this returns.
+@noinline function _drop_import()
+    arr = Ref(_test_c_array(test_thread_release()))
+    GC.@preserve arr _moveowner(Base.unsafe_convert(Ptr{CArrowArray}, arr))
+    return nothing
 end
 
 _registry_count() = lock(REGISTRY_LOCK) do
@@ -166,5 +187,27 @@ function _threaded_cdata_stress()
         _registry_count() == 0 && break
     end
     @assert _registry_count() == 0
+
+    # A garbage collection on another thread hands an import's release to the
+    # thread that imported it, so a release that waits on a lock the importing
+    # thread holds (Python's GIL) cannot stall the collection.
+    importer = Threads.threadid()
+    crossed = false
+    for _ = 1:20
+        @atomic TEST_RELEASE_THREAD.id = 0
+        _drop_import()
+        collector = fetch(errormonitor(Threads.@spawn begin
+            GC.gc(true)
+            Threads.threadid()
+        end))
+        for _ = 1:1000
+            (@atomic TEST_RELEASE_THREAD.id) == 0 || break
+            yield()
+        end
+        @assert (@atomic TEST_RELEASE_THREAD.id) == importer
+        crossed = collector != importer
+        crossed && break
+    end
+    @assert crossed
     return nothing
 end
