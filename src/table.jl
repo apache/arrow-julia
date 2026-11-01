@@ -2337,7 +2337,7 @@ The tables a stream yields share its source: [`Arrow.release!`](@ref) of the str
 of any of them releases all of them.
 """
 struct Stream
-    src::Union{IPCStream,ArrowFile,_RangedFile,_StreamReader}
+    src::Union{IPCStream,ArrowFile,_RangedFile,_StreamReader,ImportedStream}
     regions::Vector{AC.OwnerRegion}
     budget::AllocationBudget
     closed::AC.ReleaseCell
@@ -2507,6 +2507,11 @@ function _streambatch(s::Stream, i::Int, ntasks::Int)
             i == 1 && _restart!(src)
             _nextrecord!(src, ntasks)
         end
+    end
+    if src isa ImportedStream
+        b = AC.nextbatch!(src)
+        b === nothing && return nothing
+        return b, _readbudget(src.limits, _databytes(b))
     end
     i > _nbatches(src) && return nothing
     budget = _batchbudget(src, i)
@@ -2754,7 +2759,7 @@ function Base.show(io::IO, s::Stream)
     src = s.src
     m = DataAPI.ncol(s)
     cols = m == 1 ? "1 column" : "$m columns"
-    if src isa _StreamReader
+    if src isa Union{_StreamReader,ImportedStream}
         print(io, "Arrow.Stream with ", cols, " and schema:\n")
     else
         n = _nbatches(src)

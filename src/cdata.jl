@@ -718,7 +718,8 @@ bufferptr(a::CArrowArray, i::Int) = unsafe_load(a.buffers, i)
 """
     Arrow.from_c_data(schemaptr, arrayptr) -> (Arrow.Field, Arrow.ArrayData)
 
-Import one column through the C data interface. The array is moved, as the interface requires: Arrow.jl takes over its
+The low-level form of [`Arrow.Table(schemaptr, arrayptr)`](@ref Arrow.Table): import
+one column. The array is moved, as the interface requires: Arrow.jl takes over its
 `release` callback and marks the struct at `arrayptr` released. The schema is read and
 then released. The imported buffers stay valid while the returned data is reachable;
 the producer's release callback runs when it no longer is.

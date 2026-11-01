@@ -1418,6 +1418,51 @@ function cdata_battery()
     end
     println("schema metadata crosses the C stream boundary ✓")
 
+    # ---- tables ----------------------------------------------------------
+
+    # The 54-column matrix pyarrow built (test/fixtures-cdata/make_matrix.py):
+    # every column crosses both interfaces, in both directions, with the
+    # element types and values of an IPC read of the same bytes.
+    matrixbytes = read(joinpath(@__DIR__, "fixtures-cdata", "matrix.arrows"))
+    tipc = Arrow.Table(matrixbytes)
+    @assert length(Tables.columnnames(tipc)) == 54
+    function sametable(t)
+        ok =
+            Tables.columnnames(t) == Tables.columnnames(tipc) &&
+            Arrow.getmetadata(t) == Arrow.getmetadata(tipc)
+        for (i, nm) in enumerate(Tables.columnnames(tipc))
+            a = Tables.getcolumn(tipc, i)
+            b = Tables.getcolumn(t, i)
+            eltype(a) == eltype(b) && isequal(collect(a), collect(b)) && continue
+            ok = false
+            println("   MISMATCH ", nm, ": ", eltype(b), " vs ", eltype(a))
+        end
+        return ok
+    end
+    # Import alone: the IPC batches go out through the column-level interface
+    # and come back as the IPC read of them, whole or one batch at a time. One
+    # batch builds every column as the IPC read of that batch does, down to the
+    # column type.
+    raw = readstream(matrixbytes)
+    rawschema = Schema(collect(Field, raw.corefields); metadata=raw.schema.metadata)
+    sref = Ref{CArrowArrayStream}()
+    GC.@preserve sref begin
+        p = Base.unsafe_convert(Ptr{CArrowArrayStream}, sref)
+        export_stream!(p, rawschema, raw.batches)
+        @assert sametable(Arrow.Table(p))
+        export_stream!(p, rawschema, raw.batches)
+        @assert [Tables.rowcount(t) for t in Arrow.Stream(p)] == [4, 3]
+    end
+    sp, ap = to_c_data(_batchfield(rawschema), _structarray(raw.batches[1]))
+    tfirst = Arrow.Table(sp, ap)
+    ipcfirst = iterate(Arrow.Stream(matrixbytes))[1]
+    for (i, nm) in enumerate(Tables.columnnames(ipcfirst))
+        a = Tables.getcolumn(ipcfirst, i)
+        b = Tables.getcolumn(tfirst, i)
+        @assert typeof(a) == typeof(b) && isequal(collect(a), collect(b)) nm
+    end
+    println("C data and C stream imports read as the IPC read of the same batches ✓")
+
     # `deepcopy` of imported data shares its ownership: after the source is
     # released the copy's reads fail cleanly, and releasing the copy is inert.
     dcf, dcd = fromjulia("deep", Int64[1, 2, 3])

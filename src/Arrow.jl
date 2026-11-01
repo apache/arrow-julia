@@ -24,7 +24,8 @@
 # - IPC adapters (`ipc_read.jl`, `ipc_write.jl`): stream and file formats,
 #   framing, resource limits, compression, dictionary lifecycles.
 # - `cdata.jl`, `cstream.jl`: the C data and C stream interfaces over Core,
-#   import and export, with lifecycle accounting.
+#   import and export, with lifecycle accounting; `cdata_table.jl` puts
+#   `Arrow.Table`, `Arrow.Stream`, and any Tables.jl table across them.
 # - `scan.jl`: `Tables.Scan` pushdown over byte ranges plus footer-carried
 #   statistics pruning.
 # - `table.jl`, `write.jl`: the read facade and write orchestration.
@@ -100,6 +101,7 @@ include("columns.jl")
 # column-construction module after the `DictEncode` marker is defined.
 include("table.jl")
 include("write.jl")
+include("cdata_table.jl")
 include("sharedvalues.jl")
 
 @doc """
