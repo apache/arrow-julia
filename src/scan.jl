@@ -2383,57 +2383,7 @@ function _applyoverride(::Type{T}, col, budget=nothing) where {T}
     V = Base.nonmissingtype(T)
     @inbounds for i in eachindex(col)
         x = col[i]
-        out[i] = ismissing(x) ? missing : _overridevalue(V, x)
+        out[i] = ismissing(x) ? missing : convert(V, x)
     end
     return out
-end
-
-# One scan-override value. `convert` is the contract, but the composite rows
-# the facade reads (struct rows as `NamedTuple`s or, for wide or duplicate
-# names, `Vector{Pair}`s; list rows as views) have no `convert` methods to
-# user types, so fully typed named-tuple and vector targets rebuild
-# recursively. Struct fields match by position and the names must agree.
-function _overridevalue(::Type{T}, x) where {T}
-    x isa T && return x
-    if T isa DataType && T <: NamedTuple && x isa NamedTuple
-        names = fieldnames(T)
-        keys(x) == names || throw(
-            ArgumentError("struct row fields $(keys(x)) do not match $(T) fields $(names)"),
-        )
-        return T(
-            ntuple(length(names)) do i
-                v = x[i]
-                v === missing ? missing :
-                _overridevalue(Base.nonmissingtype(fieldtype(T, i)), v)
-            end,
-        )
-    end
-    if T isa DataType && T <: NamedTuple && x isa AbstractVector{<:Pair}
-        names = fieldnames(T)
-        length(x) == length(names) || throw(
-            ArgumentError(
-                "cannot convert a $(length(x))-field struct row to $(T) " *
-                "with $(length(names)) fields",
-            ),
-        )
-        vals = ntuple(length(names)) do i
-            k, v = x[i]
-            Symbol(k) === names[i] || throw(
-                ArgumentError(
-                    "struct row field $(repr(String(k))) does not match " *
-                    "$(T) field $(repr(names[i])) at position $(i)",
-                ),
-            )
-            F = fieldtype(T, i)
-            v === missing ? missing : _overridevalue(Base.nonmissingtype(F), v)
-        end
-        return T(vals)
-    end
-    # A map row (a `MapValue`) converts entry by entry, as a vector of pairs.
-    if T <: AbstractVector && x isa Union{AbstractVector,MapValue}
-        E = eltype(T)
-        N = Base.nonmissingtype(E)
-        return convert(T, E[v === missing ? missing : _overridevalue(N, v) for v in x])
-    end
-    return convert(T, x)
 end
