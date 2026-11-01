@@ -1001,7 +1001,7 @@ function _foreach(f::F, n::Int, ntasks::Int) where {F}
             try
                 g(i, w)
             catch e
-                errors[i] = e
+                errors[i] = (e, catch_backtrace())
                 old = @atomic claims.failed
                 while i < old
                     old, ok = @atomicreplace claims.failed old => i
@@ -1018,8 +1018,15 @@ function _foreach(f::F, n::Int, ntasks::Int) where {F}
         job[] = nothing
     end
     failed = @atomic claims.failed
-    failed == typemax(Int) || throw(errors[failed])
-    return nothing
+    failed == typemax(Int) && return nothing
+    e, bt = errors[failed]
+    # The caller sees the worker's exception, with the worker's backtrace as
+    # its cause.
+    try
+        throw(CapturedException(e, bt))
+    catch
+        throw(e)
+    end
 end
 
 # Decode into `out[1:declared]` and return the bytes produced. With
@@ -1234,14 +1241,29 @@ function _buffermeta!(c::DecodeCursor)
     if len > 0
         offset >= c.last_nonempty_end ||
             throw(ValidationError("batch buffers overlap or move backwards"))
-        c.last_nonempty_end = try
-            AC.checked_add(offset, len)
-        catch e
-            e isa OverflowError || rethrow()
-            throw(ValidationError("batch buffer end overflows"))
-        end
+        c.last_nonempty_end = _checkedadd(offset, len, "batch buffer end")
     end
     return offset, len
+end
+
+# Checked arithmetic on metadata values: an overflow is a `ValidationError`
+# naming `what`.
+function _checkedadd(a::Int64, b::Int64, what::AbstractString)
+    try
+        return AC.checked_add(a, b)
+    catch e
+        e isa OverflowError || rethrow()
+        throw(ValidationError("$what overflows"))
+    end
+end
+
+function _checkedmul(a::Int64, b::Int64, what::AbstractString)
+    try
+        return AC.checked_mul(a, b)
+    catch e
+        e isa OverflowError || rethrow()
+        throw(ValidationError("$what overflows"))
+    end
 end
 
 skipbuffer!(c::DecodeCursor) = (_buffermeta!(c); nothing)

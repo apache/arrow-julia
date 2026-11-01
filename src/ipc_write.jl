@@ -1478,7 +1478,7 @@ function writebatch!(
         states =
             isempty(st.statesets) ? _encodestates(codec, st.states[1].level, st.ntasks) :
             pop!(st.statesets)
-        task = Threads.@spawn _buildmessages(builders, states, st.ntasks)
+        task = errormonitor(Threads.@spawn _buildmessages(builders, states, st.ntasks))
         push!(st.pending, (task, states, recycle))
         merge!(st.current, staged)
         length(st.pending) > _INFLIGHT - 1 && _publishnext!(st)

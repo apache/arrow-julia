@@ -93,12 +93,12 @@ function _bufferspan(f::Field, variadics::AbstractVector{Int64}, varidx::Base.Re
         vc = variadics[varidx[]]
         varidx[] += 1
         vc >= 0 || throw(ValidationError("variadic buffer count $vc is invalid"))
-        n = _planadd(n, vc, "buffer span")
+        n = _checkedadd(n, vc, "buffer span")
     end
     f.type isa DictionaryType && return n
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     for i = 1:nchildren
-        n = _planadd(n, _bufferspan(f.children[i], variadics, varidx), "buffer span")
+        n = _checkedadd(n, _bufferspan(f.children[i], variadics, varidx), "buffer span")
     end
     return n
 end
@@ -152,7 +152,7 @@ function _recordbatchmeta(
     varidx = Ref(1)
     expectedbuffers = Int64(0)
     for f in fields
-        expectedbuffers = _planadd(
+        expectedbuffers = _checkedadd(
             expectedbuffers,
             _bufferspan(f, variadics, varidx),
             "record-batch buffer span",
@@ -175,12 +175,7 @@ function _recordbatchmeta(
             "max_buffer_bytes",
             limits.max_buffer_bytes,
         )
-        bufferend = try
-            AC.checked_add(offset, len)
-        catch e
-            e isa OverflowError || rethrow()
-            throw(ValidationError("batch buffer end overflows"))
-        end
+        bufferend = _checkedadd(offset, len, "batch buffer end")
         bufferend <= bodylen ||
             throw(ValidationError("batch buffer [$offset, $len] escapes its message body"))
         if len > 0
@@ -192,44 +187,26 @@ function _recordbatchmeta(
     return rblen
 end
 
-function _planadd(a::Int64, b::Int64, what::AbstractString)
-    try
-        return AC.checked_add(a, b)
-    catch e
-        e isa OverflowError || rethrow()
-        throw(ValidationError("$what overflows"))
-    end
-end
-
-function _planmul(a::Int64, b::Int64, what::AbstractString)
-    try
-        return AC.checked_mul(a, b)
-    catch e
-        e isa OverflowError || rethrow()
-        throw(ValidationError("$what overflows"))
-    end
-end
-
 function _planminbytes(role, spec, node, len::Int64)
     if role == AC.VALIDITY
         len == 0 && node.null_count == 0 && return Int64(0)
         return node.length ÷ 8 + (node.length % 8 == 0 ? 0 : 1)
     elseif role == AC.DATA
         spec.fixedwidth > 0 &&
-            return _planmul(node.length, Int64(spec.fixedwidth), "planned data-buffer size")
+            return _checkedmul(node.length, Int64(spec.fixedwidth), "planned data-buffer size")
         if spec.fixedwidth == -1
             return node.length ÷ 8 + (node.length % 8 == 0 ? 0 : 1)
         end
         return Int64(0)
     elseif role == AC.OFFSETS
-        count = _planadd(node.length, Int64(1), "planned offset count")
-        return _planmul(count, Int64(spec.offsetwidth), "planned offsets-buffer size")
+        count = _checkedadd(node.length, Int64(1), "planned offset count")
+        return _checkedmul(count, Int64(spec.offsetwidth), "planned offsets-buffer size")
     elseif role == AC.ELEMENT_OFFSETS || role == AC.SIZES
-        return _planmul(node.length, Int64(spec.offsetwidth), "planned element-buffer size")
+        return _checkedmul(node.length, Int64(spec.offsetwidth), "planned element-buffer size")
     elseif role == AC.TYPE_IDS
         return node.length
     elseif role == AC.VIEWS
-        return _planmul(node.length, Int64(16), "planned views-buffer size")
+        return _checkedmul(node.length, Int64(16), "planned views-buffer size")
     end
     return Int64(0)
 end
@@ -291,7 +268,7 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     fslextent =
         t isa FixedSizeListType ?
-        _planmul(node.length, Int64(t.listsize), "fixed-size-list child length") : Int64(0)
+        _checkedmul(node.length, Int64(t.listsize), "fixed-size-list child length") : Int64(0)
     firstchildlen = Int64(-1)
     for i = 1:nchildren
         childlen = _validateplannedfield!(f.children[i], c, codec)
@@ -1836,12 +1813,14 @@ function _readblock(br::_BlockReader, blocks, i::Int, dataend::Int64)
             nstart, _ = _blockextent(blocks[last + 1], dataend)
             nstop, nlast = _windowfrom(blocks, last + 1, dataend)
             sf = br.sf
-            task = Threads.@spawn _fetchinto!(
-                Vector{UInt8}(undef, nstop - nstart),
-                1,
-                sf,
-                nstart,
-                nstop - nstart,
+            task = errormonitor(
+                Threads.@spawn _fetchinto!(
+                    Vector{UInt8}(undef, nstop - nstart),
+                    1,
+                    sf,
+                    nstart,
+                    nstop - nstart,
+                )
             )
             br.pending = (nstart, nstop, nlast, task)
         end
