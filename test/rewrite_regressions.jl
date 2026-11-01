@@ -665,9 +665,9 @@ end
         @test length(back.batches[1].columns[1].dictionary::AC.ArrayData) == 2
         @test isequal(Arrow.Table(bytes).v, rows)
 
-        # The `_WriterStorageKey` policy is preserved exactly: floats compare
-        # by bits (0.0 and -0.0 stay distinct, one NaN payload is one
-        # category) and mutable structs compare by reference.
+        # Candidate categories compare as `===`: floats by bits (0.0 and -0.0
+        # stay distinct, one NaN payload is one category), mutable values by
+        # reference, arrays of plain values by contents.
         floatpool =
             Arrow._dictionarypool(Float64[0.0, -0.0, NaN, NaN], nothing)
         @test length(floatpool) == 3

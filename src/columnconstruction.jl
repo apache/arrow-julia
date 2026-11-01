@@ -993,9 +993,6 @@ function _constructfacadeunion(f::AC.Field, v::AbstractVector, context)
                 findfirst(c -> c.nullable, children),
                 0,
             )
-        elseif x isa _ArrowTypesRoutedUnion
-            # A value decoded from a built column knows its child.
-            x.child
         else
             get!(routes, typeof(x)) do
                 _unionroute(children, x, members, context)
@@ -1011,7 +1008,6 @@ function _constructfacadeunion(f::AC.Field, v::AbstractVector, context)
     for (i, x) in enumerate(v)
         k = route[i]
         typeids[i] = t.typeids[k]
-        x isa _ArrowTypesRoutedUnion && (x = x.value)
         if sparse
             # A child's slots of other rows are hidden.
             for j in eachindex(children)
@@ -2268,22 +2264,26 @@ function _constructarrowtypespart_impl(name::String, v::AbstractVector, logical;
     end
     _checkstoragemissing(logical, declared)
     if logical isa Union && declared === logical
-        # A declared Julia Union owns one Arrow child per member, built
-        # independently, except members that share one concrete storage type
-        # and one label (or none): they write as one column of that storage.
+        # A Julia Union writes one Arrow child per member, except members that
+        # all write one field (several string types, two structs stored as
+        # Int32 without a label): they write one column of it.
         members = Base.uniontypes(logical)
-        storages = Type[_writerstoragetype!(context, M) for M in members]
-        shared =
-            length(members) > 1 &&
-            allequal(storages) &&
-            isconcretetype(first(storages)) &&
-            allequal(_writerextension!(context, M) for M in members)
-        shared || (declared = logical)
-        if !shared
-            f, d = _arrowtypesunioncolumn(name, v; context)
-            return _arrowtypeslogicalfield(context, f, logical), d
+        if all(isconcretetype, members)
+            fields = AC.Field[first(_constructpart(name, M[]; context)) for M in members]
+            if all(f -> _conformancemismatch(fields[1], f; exact=true) === nothing, fields)
+                f = fields[1]
+                f = AC.Field(
+                    f.name,
+                    f.type;
+                    nullable=Missing <: _eltypeof(v),
+                    metadata=_fieldmetadata(f),
+                    children=f.children,
+                )
+                return _constructpart(f, v; context)
+            end
         end
-        declared = first(storages)
+        f, d = _arrowtypesunioncolumn(name, v; context)
+        return _arrowtypeslogicalfield(context, f, logical), d
     end
     # Abstract storage must be inferred from observed values. A recursively
     # materializable declaration remains schema authority for empty columns,
@@ -2931,71 +2931,6 @@ function _arrowtypestemporalstorage(t::AC.ArrowType, value)
     return value isa Dates.DateTime ? _timestampstorage(t.unit, value) : nothing
 end
 
-"""
-Empty storage vector typed for one Field's physical values (Any for Unions or
-unknown types).
-"""
-function _writerstoragevector(f::AC.Field)
-    # ArrowTypes.jl hooks see FixedSizeBinary storage as NTuple{N,UInt8}.
-    t = f.type
-    t isa AC.FixedSizeBinaryType && return _withmissingtype(
-        Union{_arrowtypesfixedbinarytype(t),Vector{UInt8}},
-        f.nullable,
-    )[]
-    T = _declaredeltype(f, false)
-    return f.type isa AC.UnionType || T === Any ? Any[] : T[]
-end
-
-function _writerpushstorage!(
-    storage::AbstractVector,
-    value,
-    f::AC.Field,
-    writertype::Type,
-    context::_WriterContext,
-)
-    stored = _writerconvertlowered(_eltypeof(storage), value, context, writertype, f.name)
-    push!(storage, stored)
-    return nothing
-end
-
-"Construct values already lowered to one Field's storage domain."
-function _constructwriterstorage(
-    f::AC.Field,
-    storage::AbstractVector,
-    context::_WriterContext,
-)
-    t = f.type
-    if t isa AC.DateType ||
-       t isa AC.TimestampType ||
-       t isa AC.TimeType ||
-       t isa AC.DurationType
-        values = Union{Missing,Int64}[x === missing ? missing : Int64(x) for x in storage]
-        return _rebuildtemporal(f, values)
-    end
-    storagefield = _writerstoragefield(f)
-    lowered = context.lowered
-    context.lowered = true
-    try
-        _, data = _constructpart(storagefield, storage; context)
-        return f, data
-    finally
-        context.lowered = lowered
-    end
-end
-
-"Remove logical labels while rebuilding values already in physical storage."
-function _writerstoragefield(f::AC.Field)
-    own = _withoutownextension(f)
-    children = AC.Field[_writerstoragefield(child) for child in f.children]
-    return AC.Field(
-        own.name,
-        own.type;
-        nullable=own.nullable,
-        metadata=_fieldmetadata(own),
-        children,
-    )
-end
-
 "A fixed_size_binary(N) column from `NTuple{N,UInt8}` rows."
 function _fixedbinarypart(name::String, v::AbstractVector, N::Int)
     T = NTuple{N,UInt8}
@@ -3487,20 +3422,16 @@ function _validatemapphysicalkeys(
     keydata::AC.ArrayData,
     offsets,
 )
-    plan = _ArrowTypesRoutePlan()
     for row = 1:(length(offsets) - 1)
-        lo = Int(offsets[row]) + 1
-        hi = Int(offsets[row + 1])
-        seen = Dict{_WriterStorageKey,Nothing}()
-        for index = lo:hi
-            value = _arrowtypesroutedvalue(keyfield, keydata, Int64(index), plan, true)
-            key = _WriterStorageKey(value)
-            haskey(seen, key) && throw(
+        seen = Set{Any}()
+        for index = (Int(offsets[row]) + 1):Int(offsets[row + 1])
+            key = _storedkey(keyfield, keydata, Int64(index))
+            key in seen && throw(
                 ArgumentError(
                     "column $name row $row has duplicate physical Map key storage",
                 ),
             )
-            seen[key] = nothing
+            push!(seen, key)
         end
     end
     return nothing
@@ -3530,30 +3461,23 @@ function _retainedree(f::AC.Field, v::AbstractVector, context::_WriterContext)
         end
     end
     rebuiltvaluefield, valuedata = _constructpart(valuefield, runvalues; context)
-    physical = _writerstoredcolumn(rebuiltvaluefield, valuedata)
-    if length(physical) > 1
-        selected = Int[1]
-        compactrunends = RT[runends[1]]
-        previous = _WriterStorageKey(physical[1])
-        for i = 2:length(physical)
-            key = _WriterStorageKey(physical[i])
-            if isequal(key, previous)
-                compactrunends[end] = runends[i]
-            else
-                push!(selected, i)
-                push!(compactrunends, runends[i])
-                previous = key
-            end
+    # Neighbouring runs whose values are stored alike are one run.
+    selected = Int[]
+    ends = RT[]
+    previous = nothing
+    for i = 1:(valuedata.len)
+        key = _storedkey(rebuiltvaluefield, valuedata, Int64(i))
+        if i > 1 && isequal(key, previous)
+            ends[end] = runends[i]
+        else
+            push!(selected, i)
+            push!(ends, runends[i])
         end
-        if length(selected) < length(physical)
-            rebuiltvaluefield, valuedata = _rebuildwriterstorageselection(
-                rebuiltvaluefield,
-                physical,
-                selected,
-                context,
-            )
-            runends = compactrunends
-        end
+        previous = key
+    end
+    if length(selected) < valuedata.len
+        valuedata = _takerows(rebuiltvaluefield, valuedata, selected)
+        runends = ends
     end
     rebuiltrunfield, runenddata = _constructpart(runfield, runends; context)
     d = AC.ArrayData(
@@ -3757,179 +3681,61 @@ _hintvalues(hint::AbstractVector) = hint
 _hintprefix(hint::_PoolHint) = hint.prefix
 _hintprefix(hint::AbstractVector) = length(hint)
 
-# Encoding identity belongs to the lowered Arrow storage domain. These
-# wrappers compare physical contents and use canonical byte hashing for strings,
-# without calling custom logical `hash`, `isequal`, `==`, or `isless` methods.
-# Dictionary pool dedup, dictionary compaction, and run-end compaction share this rule.
-struct _WriterStorageKey{T}
-    value::T
+# Dictionary category identity of a stored value: its type and value, a
+# float's by its bits (NaN payloads, and 0.0 and -0.0, are distinct
+# categories).
+_poolkey(x::AbstractFloat) = (typeof(x), reinterpret(Unsigned, x))
+_poolkey(x) = (typeof(x), x)
+
+# A candidate category before its pool is built: the value itself (`===`,
+# which no `isequal` method widens), or the contents of an array of plain
+# values (a list row). Building the pool then merges categories stored alike.
+struct _Same
+    x::Any
+end
+Base.isequal(a::_Same, b::_Same) = a.x === b.x
+Base.hash(a::_Same, h::UInt) = hash(objectid(a.x), h)
+_candidatekey(x) =
+    x isa Array && eltype(x) <: Union{Missing,Base.BitInteger,Base.IEEEFloat,Bool,String} ?
+    _poolkey(x) : _Same(x)
+
+"The category (`_poolkey`) of value `i` of a built column, with its union child."
+function _storedkey(f::AC.Field, d::AC.ArrayData, i::Int64)
+    d.type isa AC.UnionType || return _poolkey(AC.getvalue(f, d, i))
+    cf, cd, ci = AC._union_child(f, d, i)
+    return (findfirst(c -> c === cf, f.children), _storedkey(cf, cd, ci))
 end
 
-_writerstorageroute(value::_ArrowTypesRoutedUnion) = (value.child, value.value)
-_writerstorageroute(value) = nothing
-
-const _WRITER_INTEGER_STORAGE = Union{Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64}
-
-function _writerstorageequal(left, right, depth::Int=0)
-    depth <= _MAX_WRITER_SCHEMA_DEPTH ||
-        throw(ArgumentError("writer storage value exceeds the supported nesting depth"))
-    leftroute = _writerstorageroute(left)
-    rightroute = _writerstorageroute(right)
-    if leftroute !== nothing || rightroute !== nothing
-        leftroute === nothing && return false
-        rightroute === nothing && return false
-        return first(leftroute) == first(rightroute) &&
-               _writerstorageequal(last(leftroute), last(rightroute), depth + 1)
-    end
-    (left === missing || right === missing) && return left === right
-    (left === nothing || right === nothing) && return left === right
-    if left isa AbstractString || right isa AbstractString
-        left isa AbstractString && right isa AbstractString || return false
-        ncodeunits(left) == ncodeunits(right) || return false
-        for i = 1:ncodeunits(left)
-            codeunit(left, i) === codeunit(right, i) || return false
+"""
+The first position of each distinct stored category of a built pool
+(`selected`) and every position's 0-based index among them (`remap`). The
+first `prefix` categories (a pool already written or retained) are all kept,
+in order.
+"""
+function _compactpool(f::AC.Field, d::AC.ArrayData, prefix::Int)
+    selected = Int[]
+    remap = Vector{Int64}(undef, d.len)
+    seen = Dict{Any,Int64}()
+    for i = 1:(d.len)
+        key = _storedkey(f, d, Int64(i))
+        index = i <= prefix ? Int64(-1) : get(seen, key, Int64(-1))
+        if index < 0
+            index = Int64(length(selected))
+            push!(selected, i)
+            haskey(seen, key) || (seen[key] = index)
         end
-        return true
+        remap[i] = index
     end
-    if left isa AbstractVector || right isa AbstractVector
-        left isa AbstractVector && right isa AbstractVector || return false
-        length(left) == length(right) || return false
-        for i = 1:length(left)
-            _writerstorageequal(left[i], right[i], depth + 1) || return false
-        end
-        return true
-    end
-    if left isa Pair || right isa Pair
-        left isa Pair && right isa Pair || return false
-        return _writerstorageequal(first(left), first(right), depth + 1) &&
-               _writerstorageequal(last(left), last(right), depth + 1)
-    end
-    if left isa NamedTuple || right isa NamedTuple
-        left isa NamedTuple && right isa NamedTuple || return false
-        keys(left) === keys(right) || return false
-        return _writerstorageequal(Tuple(left), Tuple(right), depth + 1)
-    end
-    if left isa Tuple || right isa Tuple
-        left isa Tuple && right isa Tuple || return false
-        length(left) == length(right) || return false
-        for i = 1:length(left)
-            _writerstorageequal(left[i], right[i], depth + 1) || return false
-        end
-        return true
-    end
-    if left isa AbstractFloat || right isa AbstractFloat
-        # Compare floats by bits: pool compaction must keep 0.0 and -0.0
-        # distinct and must treat identical NaN payloads as one category.
-        typeof(left) === typeof(right) || return false
-        left isa Float16 && return reinterpret(UInt16, left) === reinterpret(UInt16, right)
-        left isa Float32 && return reinterpret(UInt32, left) === reinterpret(UInt32, right)
-        left isa Float64 && return reinterpret(UInt64, left) === reinterpret(UInt64, right)
-        return false
-    end
-    if left isa _WRITER_INTEGER_STORAGE ||
-       right isa _WRITER_INTEGER_STORAGE ||
-       left isa Bool ||
-       right isa Bool ||
-       left isa Char ||
-       right isa Char
-        return typeof(left) === typeof(right) && left === right
-    end
-    typeof(left) === typeof(right) || return false
-    # Primitive types have no fields; their bits still distinguish values.
-    isprimitivetype(typeof(left)) && return left === right
-    # Mutable values have no structural identity we may trust; compare by
-    # reference and hash by objectid, so equal-but-distinct mutables stay
-    # separate categories.
-    Base.ismutabletype(typeof(left)) && return left === right
-    fieldcount(typeof(left)) == fieldcount(typeof(right)) || return false
-    for i = 1:fieldcount(typeof(left))
-        _writerstorageequal(getfield(left, i), getfield(right, i), depth + 1) ||
-            return false
-    end
-    return true
+    return selected, remap
 end
 
-function _writerstoragehash(value, seed::UInt, depth::Int=0)
-    depth <= _MAX_WRITER_SCHEMA_DEPTH ||
-        throw(ArgumentError("writer storage value exceeds the supported nesting depth"))
-    route = _writerstorageroute(value)
-    if route !== nothing
-        h = hash(UInt8(0x01), seed)
-        h = hash(first(route), h)
-        return _writerstoragehash(last(route), h, depth + 1)
-    end
-    value === missing && return hash(UInt8(0x02), seed)
-    value === nothing && return hash(UInt8(0x03), seed)
-    if value isa AbstractString
-        h = hash(UInt8(0x04), seed)
-        @static if isdefined(Base, :hash_bytes) && isdefined(Base, :HASH_SECRET)
-            value isa Union{String,SubString{String},DataStrings.DataString} &&
-                return hash(value, h)
-            value isa LazyString && return hash(String(value), h)
-            n = ncodeunits(value)
-            n == 0 && return hash("", h)
-            if typeof(codeunit(value, 1)) === UInt8
-                # CodeUnits bypasses custom hash/codeunits methods while matching String's byte hash.
-                return Base.hash_bytes(Base.CodeUnits(value), UInt64(h), Base.HASH_SECRET) %
-                       UInt
-            end
-        end
-        h = hash(ncodeunits(value), h)
-        for i = 1:ncodeunits(value)
-            h = hash(codeunit(value, i), h)
-        end
-        return h
-    end
-    if value isa AbstractVector
-        h = hash(UInt8(0x05), seed)
-        h = hash(length(value), h)
-        for item in value
-            h = _writerstoragehash(item, h, depth + 1)
-        end
-        return h
-    end
-    if value isa Pair
-        h = hash(UInt8(0x06), seed)
-        h = _writerstoragehash(first(value), h, depth + 1)
-        return _writerstoragehash(last(value), h, depth + 1)
-    end
-    if value isa NamedTuple
-        h = hash(UInt8(0x07), seed)
-        h = hash(keys(value), h)
-        return _writerstoragehash(Tuple(value), h, depth + 1)
-    end
-    if value isa Tuple
-        h = hash(UInt8(0x08), seed)
-        h = hash(length(value), h)
-        for item in value
-            h = _writerstoragehash(item, h, depth + 1)
-        end
-        return h
-    end
-    if value isa AbstractFloat
-        # Hash floats by bits, matching _writerstorageequal.
-        h = hash(typeof(value), hash(UInt8(0x09), seed))
-        bits =
-            value isa Float16 ? reinterpret(UInt16, value) :
-            value isa Float32 ? reinterpret(UInt32, value) : reinterpret(UInt64, value)
-        return hash(bits, h)
-    end
-    if value isa _WRITER_INTEGER_STORAGE || value isa Bool || value isa Char
-        return hash(value, hash(typeof(value), hash(UInt8(0x0a), seed)))
-    end
-    h = hash(typeof(value), hash(UInt8(0x0b), seed))
-    isprimitivetype(typeof(value)) && return hash(objectid(value), h)
-    # Mutables hash by objectid, matching _writerstorageequal's `===` rule.
-    Base.ismutabletype(typeof(value)) && return hash(objectid(value), h)
-    for i = 1:fieldcount(typeof(value))
-        h = _writerstoragehash(getfield(value, i), h, depth + 1)
-    end
-    return h
-end
-
-Base.isequal(left::_WriterStorageKey, right::_WriterStorageKey) =
-    _writerstorageequal(left.value, right.value)
-Base.hash(key::_WriterStorageKey, seed::UInt) = _writerstoragehash(key.value, seed)
+"Rows `rows` of built column `d`, as one column."
+_takerows(f::AC.Field, d::AC.ArrayData, rows) = _dictionaryconcat(
+    f,
+    _DictionaryRange[_DictionaryRange(d, Int64(i - 1), Int64(1)) for i in rows],
+    Limits(),
+    nothing,
+)
 
 """
 An element type that holds both `T` and `S` values: `T` when it already
@@ -3960,18 +3766,11 @@ function _dictionarypool(v::AbstractVector, retainedpool; writetype=nothing)
             retainedpool,
         )
     end
-    # Dedup with the non-overloadable structural key `_compactdictionarypool`
-    # also uses: public-domain values may overload `hash`/`isequal`, so only the
-    # `_WriterStorageKey` relation (bit-pattern floats, `===`/objectid for
-    # mutables) may pre-merge categories. Exact value-based dedup of the
-    # LOWERED categories still happens in `_compactdictionarypool`, in the
-    # storage domain; this pass only keeps the candidate pool at
-    # O(distinct-under-that-policy) instead of O(rows).
-    seen = Dict{_WriterStorageKey,Nothing}()
+    # Candidates dedupe by `_candidatekey`, so the pool holds about one value
+    # per category, not one per row.
+    seen = Dict{Any,Nothing}()
     for x in pool
-        x === missing && continue
-        key = _WriterStorageKey(x)
-        haskey(seen, key) || (seen[key] = nothing)
+        x === missing || (seen[_candidatekey(x)] = nothing)
     end
     _addcategories!(pool, seen, v)
     return pool
@@ -3981,7 +3780,7 @@ end
 function _addcategories!(pool, seen, v)
     for x in v
         x === missing && continue
-        key = _WriterStorageKey(x)
+        key = _candidatekey(x)
         if !haskey(seen, key)
             push!(pool, x)
             seen[key] = nothing
@@ -3992,12 +3791,10 @@ end
 
 "First pool position for each non-null value; duplicate categories stay intact."
 function _dictionarylookup(pool)
-    # Same `_WriterStorageKey` policy as `_dictionarypool`: no custom logical
-    # `hash`/`isequal` participates in encoding identity.
-    lookup = Dict{_WriterStorageKey,Int64}()
+    lookup = Dict{Any,Int64}()
     for (i, x) in enumerate(pool)
         x === missing && continue
-        key = _WriterStorageKey(x)
+        key = _candidatekey(x)
         haskey(lookup, key) || (lookup[key] = Int64(i - 1))
     end
     return lookup
@@ -4006,90 +3803,8 @@ end
 function _dictionaryindices(v, lookup, missingindex=nothing)
     return Union{Missing,Int64}[
         x === missing ? (missingindex === nothing ? missing : missingindex) :
-        lookup[_WriterStorageKey(x)] for x in v
+        lookup[_candidatekey(x)] for x in v
     ]
-end
-
-_writerstoredvalue(value::_ArrowTypesRoutedNull) = missing
-_writerstoredvalue(value::_ArrowTypesRoutedUnion) =
-    _ArrowTypesRoutedUnion(value.child, _writerstoredvalue(value.value))
-function _writerstoredvalue(value::Pair{A,B}) where {A,B}
-    firstvalue = _writerstoredvalue(first(value))
-    lastvalue = _writerstoredvalue(last(value))
-    return firstvalue isa A && lastvalue isa B ? Pair{A,B}(firstvalue, lastvalue) :
-           firstvalue => lastvalue
-end
-function _writerstoredvalue(value::AbstractVector{T}) where {T}
-    stored = Any[_writerstoredvalue(item) for item in value]
-    return T === Any || !all(item -> item isa T, stored) ? stored : collect(T, stored)
-end
-_writerstoredvalue(value) = value
-
-function _writerstoredcolumn(f::AC.Field, d::AC.ArrayData)
-    plan = _ArrowTypesRoutePlan()
-    return Any[_arrowtypesroutedvalue(f, d, Int64(i), plan, true) for i = 1:(d.len)]
-end
-
-function _rebuildwriterstorageselection(
-    f::AC.Field,
-    physical::Vector{Any},
-    selected::Vector{Int},
-    context::_WriterContext,
-)
-    storage = _writerstoragevector(f)
-    sizehint!(storage, length(selected))
-    for i in selected
-        value = _writerstoredvalue(physical[i])
-        _writerpushstorage!(storage, value, f, typeof(value), context)
-    end
-    return _constructwriterstorage(f, storage, context)
-end
-
-"Compact candidate categories by exact lowered storage identity."
-function _compactdictionarypool(
-    f::AC.Field,
-    d::AC.ArrayData,
-    retainedprefix::Int,
-    context::_WriterContext,
-)
-    0 <= retainedprefix <= d.len ||
-        throw(ArgumentError("retained dictionary prefix is outside the candidate pool"))
-    physical = _writerstoredcolumn(f, d)
-    selected, remap = _compactstorage(physical, retainedprefix)
-    length(selected) == length(physical) && return f, d, remap
-
-    compactfield, compactdata =
-        _rebuildwriterstorageselection(f, physical, selected, context)
-    return compactfield, compactdata, remap
-end
-
-"""
-The first occurrence of each distinct stored value (`selected`, positions in
-`physical`) and every position's 0-based index among them (`remap`). The
-first `retainedprefix` positions are all kept, in order.
-"""
-function _compactstorage(physical::Vector{Any}, retainedprefix::Int)
-    remap = Vector{Int64}(undef, length(physical))
-    selected = Int[]
-    seen = Dict{_WriterStorageKey,Int64}()
-    for i in eachindex(physical)
-        key = _WriterStorageKey(physical[i])
-        if i <= retainedprefix
-            index = Int64(length(selected))
-            push!(selected, i)
-            remap[i] = index
-            haskey(seen, key) || (seen[key] = index)
-            continue
-        end
-        index = get(seen, key, Int64(-1))
-        if index < 0
-            index = Int64(length(selected))
-            push!(selected, i)
-            seen[key] = index
-        end
-        remap[i] = index
-    end
-    return selected, remap
 end
 
 function _remapdictionaryindices(indices, remap::Vector{Int64})
@@ -4415,12 +4130,12 @@ function _dictcolumnparts(name, fieldname, part, poolhint, retained, growable, c
             retainedvaluefield
         _constructpart(constructionfield, pool; context)
     end
-    valuefield, valuedata, remap = _compactdictionarypool(
-        candidatevaluefield,
-        candidatevaluedata,
-        retainedprefix,
-        context,
-    )
+    # Candidates stored alike are one category.
+    valuefield = candidatevaluefield
+    selected, remap = _compactpool(valuefield, candidatevaluedata, retainedprefix)
+    valuedata =
+        length(selected) == candidatevaluedata.len ? candidatevaluedata :
+        _takerows(valuefield, candidatevaluedata, selected)
     indices = _remapdictionaryindices(candidateindices, remap)
     retained === nothing && return _newdictfromdata(
         fieldname,

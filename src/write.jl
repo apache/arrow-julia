@@ -977,14 +977,8 @@ function _dictionarydeltas(current, fields, ids, batch::AC.RecordBatch)
         haskey(deltas, id) && continue
         vf = AC.dictvaluefield(f, f.type::AC.DictionaryType)
         _poolrangeequal(vf, old, Int64(0), pool, Int64(0), old.len) || continue
-        stored = _writerstoredcolumn(vf, pool)
-        _, delta = _rebuildwriterstorageselection(
-            vf,
-            stored,
-            collect((old.len + 1):(pool.len)),
-            _WriterContext(f.name),
-        )
-        deltas[id] = delta
+        deltas[id] =
+            _dictionaryconcat(vf, [_DictionaryRange(pool, old.len, pool.len - old.len)], Limits(), nothing)
     end
     return deltas
 end
@@ -1442,24 +1436,42 @@ function _conformdictionary(
         AC.nullcount(data) > 0 &&
         return nothing, "$name holds missing values, but the schema field is not nullable"
     localpool = data.dictionary::AC.ArrayData
-    # ponytail: the written pool is decoded again for every later batch
-    # (O(categories) each); cache its storage keys if huge pools get slow.
-    physical =
-        vcat(_writerstoredcolumn(vf, written), _writerstoredcolumn(localvf, localpool))
-    offset = Int(written.len)
-    selected, remap = _compactstorage(physical, offset)
+    # The written categories keep their indices; the local ones not among
+    # them follow.
+    # ponytail: the written pool's keys are found again for every later batch
+    # (O(categories) each); keep them on the writer if huge pools get slow.
+    index = Dict{Any,Int64}()
+    for i = 1:(written.len)
+        get!(index, _storedkey(vf, written, Int64(i)), Int64(i - 1))
+    end
+    new = Int[]
+    remap = Vector{Int64}(undef, localpool.len)
+    for i = 1:(localpool.len)
+        remap[i] = get!(index, _storedkey(localvf, localpool, Int64(i))) do
+            push!(new, i)
+            return Int64(written.len + length(new) - 1)
+        end
+    end
     pool =
-        length(selected) == offset ? written :
-        last(_rebuildwriterstorageselection(vf, physical, selected, context))
+        isempty(new) ? written :
+        _dictionaryconcat(
+            vf,
+            _DictionaryRange[
+                _DictionaryRange(written, 0, written.len);
+                [_DictionaryRange(localpool, Int64(i - 1), 1) for i in new]
+            ],
+            Limits(),
+            nothing,
+        )
     IT = AC.juliatype(et.indextype)
-    length(selected) - 1 <= typemax(IT) || throw(
+    pool.len - 1 <= typemax(IT) || throw(
         ArgumentError(
-            "column $name has $(length(selected)) dictionary categories, more than " *
+            "column $name has $(pool.len) dictionary categories, more than " *
             "its $IT indices address",
         ),
     )
     # `IT` is known at run time; see `_uninferred`.
-    reindexed = _uninferred(_reindexdictionary, data, et, IT, remap, offset, pool)
+    reindexed = _uninferred(_reindexdictionary, data, et, IT, remap, 0, pool)
     return (expected, reindexed), nothing
 end
 

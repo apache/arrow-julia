@@ -591,29 +591,6 @@ end
         )
         return inline ? (values..., InlineStrings.String255(text)) : values
     end
-    # Encoding identity must agree across representations, even with invalid UTF-8.
-    for text in [texts; String(UInt8[0xff, 0x00, 0x80])]
-        for left in representations(text),
-            right in representations(text),
-            seed in (UInt(0), UInt(15), typemax(UInt))
-
-            @test Arrow._writerstorageequal(left, right)
-            @test Arrow._writerstoragehash(left, seed) ==
-                  Arrow._writerstoragehash(right, seed)
-        end
-    end
-    wide = WideString(UInt16[0x0100, 0x0200, 0x0300])
-    widekeys = Dict(Arrow._WriterStorageKey(wide) => 1)
-    widekeys[Arrow._WriterStorageKey(WideString(copy(wide.data)))] = 2
-    widekeys[Arrow._WriterStorageKey(WideString(UInt16[0x0101, 0x0200, 0x0300]))] = 3
-    @test length(widekeys) == 2
-    @test widekeys[Arrow._WriterStorageKey(wide)] == 2
-    for seed in (UInt(0), UInt(15), typemax(UInt))
-        @test Arrow._writerstorageequal(WideString(UInt16[]), "")
-        @test Arrow._writerstoragehash(WideString(UInt16[]), seed) ==
-              Arrow._writerstoragehash("", seed)
-    end
-
     mixed = AbstractString[
         value for text in texts for value in representations(text; inline=false)
     ]
