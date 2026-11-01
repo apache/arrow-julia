@@ -868,8 +868,9 @@ does. The one-argument form curries: `table |> Arrow.append(path)`.
 function append(path::AbstractString, tbl; kwargs...)
     # Appending to nothing starts a stream.
     isfile(path) && filesize(path) > 0 || return write(path, tbl; file=false, kwargs...)
-    bytes = Base.read(path)
-    keep, tail = _appendbytes(bytes, tbl; kwargs...)
+    # Mapped, so only the bytes framing reads (metadata, dictionaries) are read.
+    region = open(io -> AC._mmapregion(io, path; eager=false), path)
+    keep, tail = _appendbytes(region, tbl; kwargs...)
     open(path, "r+") do io
         seek(io, keep)
         Base.write(io, tail)
@@ -881,7 +882,7 @@ function append(io::IO, tbl; kwargs...)
     seekstart(io)
     bytes = Base.read(io)
     isempty(bytes) && return write(io, tbl; file=false, kwargs...)
-    keep, tail = _appendbytes(bytes, tbl; kwargs...)
+    keep, tail = _appendbytes(AC.heapregion(bytes), tbl; kwargs...)
     seek(io, keep)
     Base.write(io, tail)
     return io
@@ -890,7 +891,7 @@ end
 append(sink::Union{AbstractString,IO}; kwargs...) = tbl -> append(sink, tbl; kwargs...)
 
 function _appendbytes(
-    bytes::Vector{UInt8},
+    region::AC.OwnerRegion,
     tbl;
     compress=nothing,
     compresslevel::Union{Nothing,Integer}=nothing,
@@ -899,8 +900,8 @@ function _appendbytes(
     unknown...,
 )
     isempty(unknown) || _unknownkeywords("append", keys(unknown))
-    length(bytes) >= 6 &&
-        view(bytes, 1:6) == FILE_MAGIC &&
+    region.len >= 6 &&
+        AC.slicebytes(AC.BufferSlice(region, 0, 6)) == FILE_MAGIC &&
         throw(
             ArgumentError(
                 "Arrow.append supports the IPC stream format; this sink holds " *
@@ -910,12 +911,12 @@ function _appendbytes(
         )
     codec = _codec(compress, compresslevel)
     batchsize = _checkbatchsize(batchsize)
-    # Validate the whole existing stream before extending it; a corrupt
-    # prefix must refuse, not gain valid-looking bytes.
-    s = readstream(bytes)
-    sch = s.schema
+    # Validate the existing stream's messages and dictionaries before
+    # extending it (a corrupt prefix must refuse, not gain valid-looking
+    # bytes); record batch bodies, which an append never uses, are not read.
+    st, msgs = _appendstate(region)
+    sch = st.schema
     # Retain the schema's declared features when resuming the writer.
-    msgs = framemessages(AC.heapregion(bytes), s.limits)
     features = Int64[Int64(x) for x in msgs[1].features]
     # New messages start where the last framed message ends: over the
     # end-of-stream marker when the stream has one, else at the end.
@@ -936,17 +937,45 @@ function _appendbytes(
     w.st = resumestream!(
         io,
         sch,
-        s.fielddictids,
+        st.fielddictids,
         features;
         compress=codec,
         compresslevel,
-        current=s.dictionaries,
+        current=st.dicts,
         growth=dictdeltas ? :delta : :replace,
     )
     # Build the tail before touching the destination, using the same
     # partition ownership and schema rules as an incremental write.
     _writeall!(w, tbl)
     return keep, take!(io)
+end
+
+"""
+A stream's state after its last message (schema, dictionaries) and its framed
+messages: every message's metadata is checked and every dictionary batch
+decoded, but record batch bodies are not read.
+"""
+function _appendstate(region::AC.OwnerRegion)
+    limits = Limits()
+    msgs = framemessages(region, limits)
+    isempty(msgs) && throw(ValidationError("empty IPC stream"))
+    st = _StreamState(msgs[1], limits)
+    for fm in Iterators.drop(msgs, 1)
+        _checkstreammessage(st, fm)
+        header = fm.msg.header
+        if header isa Meta.DictionaryBatch
+            budget = _readbudget(limits, fm.body.len)
+            state = DecodeState(budget)
+            try
+                _applydictionary!(st, fm, budget, state)
+            finally
+                close(state)
+            end
+        elseif !(header isa Meta.RecordBatch)
+            throw(ValidationError("unsupported IPC message header $(typeof(header))"))
+        end
+    end
+    return st, msgs
 end
 
 # --- dictionaries that grow across tables -----------------------------------

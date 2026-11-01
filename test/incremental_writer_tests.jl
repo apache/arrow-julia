@@ -73,6 +73,7 @@ function growdictionary(k)
     return take!(io)
 end
 growthallocations(k) = @allocated growdictionary(k)
+appendallocations(path, table) = @allocated Arrow.append(path, table)
 
 # :dictionary or :record for each batch message, in order.
 batchkinds(bytes) = [
@@ -507,6 +508,20 @@ batchkinds(bytes) = [
         Arrow.append(io, t1)
         Arrow.append(io, t2)
         @test Arrow.Table(take!(io)).b == ["x", "y", "z", "w"]
+    end
+
+    @testset "append reads the stream's metadata and dictionaries, not its batches" begin
+        path = tempname()
+        parts = Tables.partitioner([
+            (x=fill(Float64(p), 500_000), d=Arrow.DictEncode(fill("a", 500_000))) for p = 1:4
+        ])
+        Arrow.write(path, parts; file=false)
+        Arrow.append(path, (x=[5.0], d=["b"]))
+        @test appendallocations(path, (x=[6.0], d=["a"])) < filesize(path) ÷ 16
+        t = Arrow.Table(path)
+        @test t.x[(end - 1):end] == [5.0, 6.0]
+        @test t.d[(end - 2):end] == ["a", "b", "a"]
+        rm(path)
     end
 
     @testset "append to a stream without an end-of-stream marker" begin
