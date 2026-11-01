@@ -99,7 +99,8 @@ function _tables_equal(a, b)
 end
 
 # The generic executor reports no schema for a result with no columns.
-_schemacolumns(s) = s === nothing ? (Symbol[], Type[]) : (collect(s.names), collect(s.types))
+_schemacolumns(s) =
+    s === nothing ? (Symbol[], Type[]) : (collect(s.names), collect(s.types))
 _schemas_equal(a, b) = _schemacolumns(a) == _schemacolumns(b)
 
 "Body byte range of buffer number `bufindex` (1-based) of record batch `i`."

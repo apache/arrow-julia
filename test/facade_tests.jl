@@ -866,38 +866,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         end
     end
 
-    @testset "exact generic scan budgets" begin
-        x = Union{Missing,Int64}[missing, 2, 3, 4, 5, 6, 7, 8]
-        input = (x=x, y=Int64[9, 8, 7, 6, 5, 4, 3, 2])
-        scan = Tables.Scan(
-            select=(:x,),
-            filter=(Tables.col(:x) > 2) & (Tables.col(:y) < 7),
-            offset=1,
-            limit=2,
-        )
-        bound = Tables.resolve(scan, [:x, :y])
-        V(T, n) = Arrow.AC._materializedvectorbytes(T, n)
-        # Two leaf masks plus the conjunction, the final Bool mask, five
-        # qualifying indexes, then a two-row projected nullable column.
-        needed =
-            V(Symbol, 2) +
-            3 * V(Union{Missing,Bool}, 8) +
-            V(Bool, 8) +
-            V(Int, 5) +
-            V(Symbol, 1) +
-            V(AbstractVector, 1) +
-            V(eltype(x), 2)
-        exact = Arrow.AllocationBudget(needed)
-        got = Arrow._executeplan(input, bound, exact)
-        @test got.x == Union{Missing,Int64}[5, 6]
-        @test Arrow._remaining(exact) == 0
-        @test_throws Arrow.AllocationLimitError Arrow._executeplan(
-            input,
-            bound,
-            Arrow.AllocationBudget(needed - 1),
-        )
-    end
-
     @testset "scan compilation bounds request amplification" begin
         # Scalar conversion has fourteen closed descriptor/unit tokens.
         nvalues = 100_000

@@ -1295,22 +1295,7 @@ function _facadecolumn(
         _chargevector!(budget, T === Any ? Any : T, 0, "empty facade column")
         return T === Any ? Any[] : Vector{T}()
     end
-    if length(parts) == 1
-        col = parts[1]
-    else
-        total = sum(length, parts; init=0)
-        T = _eltypeof(first(parts))
-        for part in Iterators.drop(parts, 1)
-            T = Base.promote_typejoin(T, _eltypeof(part))
-        end
-        _chargevector!(budget, T, total, "joined facade column")
-        col = Vector{T}(undef, total)
-        offset = 0
-        for part in parts
-            copyto!(col, offset + 1, part, firstindex(part), length(part))
-            offset += length(part)
-        end
-    end
+    col = _joinparts(parts, budget)
     # `col` is a fresh batch materialization or the join just built; its type
     # is known at run time (see `_uninferred`).
     return _uninferred(_facadefromraw, f, col, arrowtypes; owned=true)
@@ -1553,12 +1538,14 @@ function _opensource(
     budget=nothing,
     ntasks::Int=1,
 )
-    if budget === nothing
-        return _openbytes(Base.read(io); limits=limits)
-    end
-    # A generic IO has no reliable remaining-length query. Read bounded
-    # chunks whose allocation is reserved first, then reserve the one final
-    # assembly while all chunks are still live.
+    budget === nothing && return _openbytes(Base.read(io); limits=limits)
+    return _openbytes(_readio(io, budget); limits=limits, budget=budget, ntasks=ntasks)
+end
+
+# The rest of `io`. A generic IO has no reliable remaining-length query: read
+# bounded chunks whose allocation is reserved first, then reserve the one final
+# assembly while all chunks are still live.
+function _readio(io::IO, budget)
     _chargevector!(budget, Vector{UInt8}, 0, "source IO chunk references")
     chunks = Vector{UInt8}[]
     total = Int64(0)
@@ -1579,8 +1566,7 @@ function _opensource(
         total = AC.checked_add(total, Int64(length(chunk)))
     end
     _chargevector!(budget, UInt8, total, "source IO assembly")
-    bytes = isempty(chunks) ? UInt8[] : reduce(vcat, chunks)
-    return _openbytes(bytes; limits=limits, budget=budget, ntasks=ntasks)
+    return isempty(chunks) ? UInt8[] : reduce(vcat, chunks)
 end
 _opensource(
     bytes::Vector{UInt8};
@@ -1641,11 +1627,13 @@ _openable(x, mode) = !(x isa Union{Function,Type}) && applicable(open, x, mode)
 # accepted a vector of sources and positional byte windows; name the supported
 # source kinds instead of failing with a MethodError.
 function _opensource(source; kwargs...)
-    if _openable(source, "r")
-        return open(source, "r") do io
-            io isa IOStream ? _openfile(io, source; kwargs...) : _opensource(io; kwargs...)
-        end
+    _openable(source, "r") || _unreadable(source)
+    return open(source, "r") do io
+        io isa IOStream ? _openfile(io, source; kwargs...) : _opensource(io; kwargs...)
     end
+end
+
+function _unreadable(source)
     hint =
         Tables.istable(source) ?
         "; to read a table in memory as an Arrow.Table, write it first, as " *
@@ -1795,50 +1783,95 @@ function Table(
     readlimits = _readerlimits(source, limits)
     _checkstringtype(stringtype)
     ntasks = _checkntasks(ntasks)
-    if source isa AbstractArrowSource || source isa SourceFile
+    if source isa Union{AbstractArrowSource,SourceFile}
         sf = source isa SourceFile ? source : SourceFile(source; limits=readlimits)
         _requirelittleendian()
         budget = _readbudget(readlimits, sf.len)
-        if scan === nothing
-            opened = _openbytes(
-                _wholeobject(sf, budget);
-                limits=readlimits,
-                budget=budget,
-                ntasks=ntasks,
-            )
-            return _tablefrom(opened, nothing, budget; stringtype=stringtype, ntasks=ntasks)
-        end
-        # A scan over a file-format object with columns plans its byte ranges
-        # from the Footer, which the cached tail holds.
-        if _isfilesource(sf, budget)
-            ft = _readfooter(sf, sf.limits, budget)
-            plan = _ScanPlan(scan, ft.fields, budget)
-            if !isempty(ft.fields)
-                return _applyfacadescan(sf, plan, ft, budget; stringtype=stringtype)
-            end
-            # A file without columns is its row counts: read it whole.
-            opened = _openbytes(
-                _wholeobject(sf, budget);
-                limits=readlimits,
-                budget=budget,
-                ntasks=ntasks,
-            )
-            return _tablefrom(opened, plan, budget; stringtype=stringtype, ntasks=ntasks)
-        end
-        # A stream-format object has no Footer to plan from. Read it whole,
-        # without resetting the budget used by the format probe, then execute
-        # the scan over its decoded columns.
-        opened = _openbytes(
-            _wholeobject(sf, budget);
-            limits=readlimits,
-            budget=budget,
-            ntasks=ntasks,
-        )
-        return _tablefrom(opened, scan, budget; stringtype=stringtype, ntasks=ntasks)
+        # A scan of a file-format object plans its byte ranges from the Footer;
+        # a whole read, or a stream-format object, fetches the object.
+        scan === nothing ||
+            !_isfilesource(sf, budget) ||
+            return _readtable(sf, scan, readlimits, budget, stringtype, ntasks)
+        region = heapregion(_wholeobject(sf, budget))
+        return _readtable(region, scan, readlimits, budget, stringtype, ntasks)
     end
-    budget = source isa IPCStream ? source.budget : _sourcebudget(source, readlimits)
-    opened = _opensource(source; mmap=mmap, limits=readlimits, budget=budget, ntasks=ntasks)
-    return _tablefrom(opened, scan, budget; stringtype=stringtype, ntasks=ntasks)
+    budget = _sourcebudget(source, readlimits)
+    region, mapped = _openregion(source; mmap=mmap, budget=budget)
+    _boundbudget!(budget, readlimits, region.len)
+    try
+        return _readtable(region, scan, readlimits, budget, stringtype, ntasks)
+    catch
+        # No column escaped the failed read, so its mapping can go now. This is
+        # observable on Windows, where a mapped file cannot be deleted.
+        if mapped
+            AC.release!(region)
+            AC._unmap!(region)
+        end
+        rethrow()
+    end
+end
+
+# The Table that `scan` (`nothing` for every column) reads from `src`, a
+# byte-range source of the file format or a region of either format.
+function _readtable(src, scan, limits::Limits, budget, stringtype::Type, ntasks::Int)
+    views = _ViewContext(stringtype, budget)
+    request = something(scan, Tables.Scan())
+    regions = src isa OwnerRegion ? AC.OwnerRegion[src] : AC.OwnerRegion[]
+    if src isa SourceFile || _isfileregion(src)
+        ft = _readfooter(src, limits, budget)
+        plan = _ScanPlan(request, ft.fields, budget)
+        return first(
+            _scanfile(src, ft, plan, limits, budget, views, regions; ntasks, lazy=true),
+        )
+    end
+    st, records = _streamrecords(src, limits, budget)
+    plan = _ScanPlan(request, st.fields, budget)
+    return first(_scanstream(st, records, plan, budget, views, regions; ntasks, lazy=true))
+end
+
+_isfileregion(r::OwnerRegion) =
+    r.len >= 6 &&
+    AC.slicebytes(AC.subslice(AC.BufferSlice(r, 0, r.len), 0, 6)) == FILE_MAGIC
+
+# The bytes of `source` as one region, and whether it is a file mapping: a
+# path mapped (or read, with `mmap=false`), an `IO` read to its end, a byte
+# vector in place, or an opened reader's bytes.
+_openregion(path::AbstractString; kwargs...) =
+    open(io -> _fileregion(io, path; kwargs...), path, "r")
+_openregion(io::IO; budget, kwargs...) = heapregion(_readio(io, budget)), false
+_openregion(bytes::Vector{UInt8}; kwargs...) = heapregion(bytes), false
+function _openregion(src::Union{IPCStream,ArrowFile}; budget, kwargs...)
+    src.region.cell.action == C_NULL && return src.region, false
+    # Facade columns outlive release!(table). A caller-owned region may free
+    # its memory explicitly, so it cannot back those unguarded views.
+    _chargevector!(budget, UInt8, src.region.len, "detached reader source")
+    bytes = AC.slicebytes(AC.BufferSlice(src.region, 0, src.region.len))
+    return heapregion(bytes), false
+end
+function _openregion(source; kwargs...)
+    _openable(source, "r") || _unreadable(source)
+    return open(source, "r") do io
+        io isa IOStream ? _fileregion(io, source; kwargs...) : _openregion(io; kwargs...)
+    end
+end
+
+# An open file, from its start (`label` names it in errors). Columns read a
+# mapping in place, so `release!` does not unmap it: the mapping lives until
+# nothing reaches it.
+function _fileregion(io::IOStream, label; mmap::Bool, budget)
+    reported = stat(io).size
+    (reported isa Integer && 0 <= reported <= typemax(Int)) ||
+        throw(AC.ValidationError("source file length is not addressable"))
+    size = Int(reported)
+    mmap && size > 0 && return AC._mmapregion(io, label; eager=false), true
+    _chargevector!(budget, UInt8, size, "source file read")
+    bytes = Base.read(io, size)
+    length(bytes) == size || throw(
+        AC.ValidationError(
+            "source file changed while reading: got $(length(bytes)) of $size bytes",
+        ),
+    )
+    return heapregion(bytes), false
 end
 
 # Arrow 2.x read a window of a byte vector as `Arrow.Table(bytes, pos, len)`.
@@ -1956,82 +1989,6 @@ _copycolumn(c::_StringColumn) = _compactstrings(c)
 _copycolumn(c::AbstractVector{T}) where {T} = _needsowned(c) ? _copyrows(T, c) : copy(c)
 _copycolumn(c::ChainedVector{T,<:ArrowVector}) where {T} = copy(c)
 
-# A Table from an opened IPC source: the whole thing, or a scan pushed
-# where the format can prove it and evaluated over the rest.
-function _tablefrom(
-    src::Union{IPCStream,ArrowFile},
-    scan::Union{Nothing,Tables.Scan,_ScanRequest},
-    budget::Union{Nothing,AllocationBudget}=nothing;
-    stringtype::Type=DataStrings.DataString,
-    ntasks::Int=1,
-)
-    regions = _sourceregions(src, budget)
-    fields = _corefields(src, budget)
-    scan === nothing && return _materialize_table(
-        src,
-        regions,
-        budget;
-        stringtype=stringtype,
-        ntasks=ntasks,
-    )
-    plan = _ScanPlan(scan, fields, budget)
-    return _tablefrom(
-        src,
-        plan,
-        regions,
-        fields,
-        budget;
-        stringtype=stringtype,
-        ntasks=ntasks,
-    )
-end
-
-function _tablefrom(
-    src::Union{IPCStream,ArrowFile},
-    plan::_ScanPlan,
-    budget::Union{Nothing,AllocationBudget}=nothing;
-    stringtype::Type=DataStrings.DataString,
-    ntasks::Int=1,
-)
-    return _tablefrom(
-        src,
-        plan,
-        _sourceregions(src, budget),
-        _corefields(src, budget),
-        budget;
-        stringtype=stringtype,
-        ntasks=ntasks,
-    )
-end
-
-function _tablefrom(
-    src,
-    plan::_ScanPlan,
-    regions,
-    fields,
-    budget;
-    stringtype::Type=DataStrings.DataString,
-    ntasks::Int=1,
-)
-    # Zero-field sources carry their row count on the Table itself; the raw
-    # scan path would lose it inside an empty NamedTuple.
-    isempty(fields) && return _publicscan(
-        _materialize_table(src, regions, budget; stringtype=stringtype, ntasks=ntasks),
-        _tableschema(src),
-        fields,
-        plan,
-        regions,
-        budget,
-    )
-    return _applyfacadescan(src, plan, budget; stringtype=stringtype, ntasks=ntasks)
-end
-
-function _corefields(source::Union{IPCStream,ArrowFile}, budget=nothing)
-    fields = source isa IPCStream ? source.corefields : source.fields
-    _chargevector!(budget, AC.Field, length(fields), "source field list")
-    return collect(AC.Field, fields)
-end
-
 # A source's schema as its tables carry it: repeated column names made unique.
 _tableschema(s::IPCStream) = _uniqueschema(s.schema)
 _tableschema(f::Union{ArrowFile,_RangedFile}) = _uniqueschema(f.schema)
@@ -2071,14 +2028,11 @@ function _mergecategorypools(pools; widen::Bool=false, budget=nothing)
 end
 
 """
-The retained pool of a top-level dictionary column whose batches all share
-`dictionary`; `nothing` (no batch) retains an empty pool.
+The category pool a top-level dictionary column retains from its distinct
+pool snapshots `dictionaries`, in batch order: none gives an empty pool, and
+several merge, the first's order and duplicates authoritative.
 """
-function _retainedsnapshotpool(
-    f::AC.Field,
-    dictionary::Union{Nothing,AC.ArrayData},
-    arrowtypes::_ArrowTypesContext,
-)
+function _retainedpool(f::AC.Field, dictionaries, arrowtypes::_ArrowTypesContext)
     # DictionaryType stores the value descriptor on the index Field. Reapply
     # that Field's extension metadata while materializing pool snapshots so a
     # registered dictionary value and its nested children lift exactly once.
@@ -2088,43 +2042,9 @@ function _retainedsnapshotpool(
         f.type::AC.DictionaryType;
         retainmetadata=true,
     )
-    dictionary === nothing && return _facadecolumn(vf, Any[], arrowtypes)
-    return _facadesinglecolumn(vf, dictionary, arrowtypes)
-end
-
-"Retain one top-level dictionary's category order across pool snapshots."
-function _retaineddictpool(f::AC.Field, batches, i::Int, arrowtypes::_ArrowTypesContext)
-    t = f.type
-    t isa AC.DictionaryType || return nothing
-    isempty(batches) && return _retainedsnapshotpool(f, nothing, arrowtypes)
-    firstdictionary = batches[1].columns[i].dictionary::AC.ArrayData
-    if all(batch -> batch.columns[i].dictionary === firstdictionary, batches)
-        return _retainedsnapshotpool(f, firstdictionary, arrowtypes)
-    end
-    vf = _arrowtypesdictvaluefield(arrowtypes, f, t; retainmetadata=true)
-    _chargevector!(
-        arrowtypes.budget,
-        AC.ArrayData,
-        length(batches),
-        "dictionary snapshot list",
-    )
-    _chargedict!(
-        arrowtypes.budget,
-        AC.ArrayData,
-        Nothing,
-        length(batches),
-        "dictionary snapshot identity index",
-    )
-    dictionaries = AC.ArrayData[]
-    sizehint!(dictionaries, length(batches))
-    seen = Base.IdSet{AC.ArrayData}()
-    sizehint!(seen, length(batches))
-    for batch in batches
-        dictionary = batch.columns[i].dictionary::AC.ArrayData
-        dictionary in seen && continue
-        push!(seen, dictionary)
-        push!(dictionaries, dictionary)
-    end
+    isempty(dictionaries) && return _facadecolumn(vf, Any[], arrowtypes)
+    length(dictionaries) == 1 &&
+        return _facadesinglecolumn(vf, only(dictionaries), arrowtypes)
     _chargevector!(
         arrowtypes.budget,
         AbstractVector,
@@ -2134,9 +2054,8 @@ function _retaineddictpool(f::AC.Field, batches, i::Int, arrowtypes::_ArrowTypes
     pools = AbstractVector[
         _facadesinglecolumn(vf, dictionary, arrowtypes) for dictionary in dictionaries
     ]
-    # Replacement pools can add categories, but the first pool's order and
-    # duplicate entries remain authoritative. Encoding identity never calls a
-    # public-domain value's equality or hashing methods.
+    # Encoding identity never calls a public-domain value's equality or
+    # hashing methods.
     return _mergecategorypools(
         pools;
         widen=vf.type isa AC.UnionType,
@@ -2144,61 +2063,37 @@ function _retaineddictpool(f::AC.Field, batches, i::Int, arrowtypes::_ArrowTypes
     )
 end
 
+_retainedsnapshotpool(f::AC.Field, dictionary, arrowtypes::_ArrowTypesContext) =
+    _retainedpool(
+        f,
+        dictionary === nothing ? AC.ArrayData[] : AC.ArrayData[dictionary],
+        arrowtypes,
+    )
+
+"Retain one top-level dictionary's category order across pool snapshots."
+function _retaineddictpool(f::AC.Field, batches, i::Int, arrowtypes::_ArrowTypesContext)
+    f.type isa AC.DictionaryType || return nothing
+    _chargedict!(
+        arrowtypes.budget,
+        AC.ArrayData,
+        Nothing,
+        length(batches),
+        "dictionary snapshot identity index",
+    )
+    dictionaries = AC.ArrayData[]
+    seen = Base.IdSet{AC.ArrayData}()
+    for batch in batches
+        dictionary = batch.columns[i].dictionary::AC.ArrayData
+        dictionary in seen && continue
+        push!(seen, dictionary)
+        push!(dictionaries, dictionary)
+    end
+    return _retainedpool(f, dictionaries, arrowtypes)
+end
+
 function _retaineddictpools(fields, batches, arrowtypes::_ArrowTypesContext)
     _chargevector!(arrowtypes.budget, Any, length(fields), "retained dictionary pool slots")
     return Any[_retaineddictpool(f, batches, i, arrowtypes) for (i, f) in enumerate(fields)]
-end
-
-function _materialize_table(
-    src::IPCStream,
-    regions,
-    budget=nothing;
-    stringtype::Type=DataStrings.DataString,
-    ntasks::Int=1,
-)
-    budget === nothing && (budget = src.budget)
-    names = _fieldnamesymbols(src.schema.fields, budget)
-    arrowtypes = _ArrowTypesContext(budget=budget)
-    views = _ViewContext(stringtype, budget)
-    fields = src.corefields
-    cols = _buildcolumns(
-        fields,
-        src.batches,
-        1:length(fields),
-        arrowtypes,
-        views,
-        ntasks;
-        lazy=true,
-    )
-    nrows = _batchrowtotal(src.batches)
-    pools = _retaineddictpools(src.corefields, src.batches, arrowtypes)
-    return _table(names, cols, _tableschema(src), regions, nrows, pools, budget)
-end
-
-function _materialize_table(
-    src::ArrowFile,
-    regions,
-    budget=nothing;
-    stringtype::Type=DataStrings.DataString,
-    ntasks::Int=1,
-)
-    budget === nothing && (budget = _readbudget(src.limits, src.region.len))
-    names = _fieldnamesymbols(src.schema.fields, budget)
-    arrowtypes = _ArrowTypesContext(budget=budget)
-    views = _ViewContext(stringtype, budget)
-    batches = _filerecordbatches(src, 1:length(src), budget, ntasks)
-    cols = _buildcolumns(
-        src.fields,
-        batches,
-        1:length(src.fields),
-        arrowtypes,
-        views,
-        ntasks;
-        lazy=true,
-    )
-    nrows = _batchrowtotal(batches)
-    pools = _retaineddictpools(src.fields, batches, arrowtypes)
-    return _table(names, cols, _tableschema(src), regions, nrows, pools, budget)
 end
 
 # The rows of `batches` together, refused when they do not fit an `Int`.
@@ -2508,40 +2403,35 @@ end
 # Batch `b` under the stream's scan, after `skipped` qualifying rows of its
 # offset and `yielded` rows of its limit: the batch's share of the window.
 function _scannedbatch(s::Stream, b, budget, scan::Tables.Scan, skipped::Int, yielded::Int)
-    src = s.src
-    offset = scan.offset - skipped
-    limit = scan.limit === nothing ? nothing : offset + scan.limit - yielded
-    fields = collect(AC.Field, _batchfields(src))
-    plan = _ScanPlan(Tables.Scan(scan; offset=0, limit=limit), fields, budget)
-    views = _ViewContext(getfield(s, :views), budget)
-    t = _scanbatches(
-        _tableschema(src),
-        fields,
-        AC.RecordBatch[b],
-        s.regions,
-        plan,
-        budget,
-        views,
-        getfield(s, :ntasks),
-    )
-    n = getfield(t, :nrows)
-    skip = min(offset, n)
-    take = scan.limit === nothing ? n - skip : min(scan.limit - yielded, n - skip)
-    take == n || (t = _tablerows(t, (skip + 1):(skip + take)))
-    return t, skipped + skip, yielded + take
+    fields = collect(AC.Field, _batchfields(s.src))
+    limit = scan.limit === nothing ? nothing : scan.limit - yielded
+    window = Tables.Scan(scan; offset=scan.offset - skipped, limit=limit)
+    t, skip = _batchscan(s, _ScanPlan(window, fields, budget), [_DecodedRecord(b)], budget)
+    return t, skipped + skip, yielded + getfield(t, :nrows)
 end
 
-# Rows `r` of table `t`.
-function _tablerows(t::Table, r::UnitRange{Int})
-    cols = AbstractVector[_force(c)[r] for c in getfield(t, :columns)]
-    return Table(
-        getfield(t, :names),
-        cols,
-        getfield(t, :lookup),
-        getfield(t, :schema),
-        getfield(t, :regions),
-        length(r),
-        getfield(t, :retainedpools),
+# Scan `plan` over decoded batches `records` of stream `s`.
+function _batchscan(s::Stream, plan::_ScanPlan, records, budget; regions=s.regions)
+    fields = collect(AC.Field, _batchfields(s.src))
+    dec = _Decoder(
+        fields,
+        IdDict{Field,Int64}(),
+        AC._ValidatedDictionaries(),
+        _configuredlimits(s.src),
+    )
+    views = _ViewContext(getfield(s, :views), budget)
+    ctx = _ScanContext(plan, fields, views, _ArrowTypesContext(budget=budget))
+    return _scantable(
+        records,
+        dec,
+        plan,
+        nothing,
+        ctx,
+        _tableschema(s.src),
+        regions,
+        budget;
+        ntasks=getfield(s, :ntasks),
+        lazy=false,
     )
 end
 
@@ -2661,17 +2551,9 @@ function _schematable(s::Stream)
         views = _ViewContext(getfield(s, :views), budget)
         scan = getfield(s, :scan)
         if scan !== nothing
-            fieldvec = collect(AC.Field, fields)
-            plan = _ScanPlan(Tables.Scan(scan; offset=0, limit=nothing), fieldvec, budget)
-            return _scanbatches(
-                _tableschema(src),
-                fieldvec,
-                AC.RecordBatch[],
-                AC.OwnerRegion[],
-                plan,
-                budget,
-                views,
-                1,
+            plan = _ScanPlan(Tables.Scan(scan; offset=0, limit=nothing), fields, budget)
+            return first(
+                _batchscan(s, plan, _DecodedRecord[], budget; regions=AC.OwnerRegion[]),
             )
         end
         cols = _buildcolumns(fields, (), 1:length(fields), arrowtypes, views, 1)

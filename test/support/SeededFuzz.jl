@@ -643,10 +643,7 @@ function _scans(master::UInt64, index::Int, dates)
     needle = _choice(rng, TEXT)
     return (
         (scan=Tables.Scan(), label=:identity),
-        (
-            scan=Tables.Scan(select=(:ints, :strings, :dictionary)),
-            label=:projection,
-        ),
+        (scan=Tables.Scan(select=(:ints, :strings, :dictionary)), label=:projection),
         _temporalscan(index, dates),
         (
             scan=Tables.Scan(select=(), filter=Tables.isnull(Tables.col(:ints))),

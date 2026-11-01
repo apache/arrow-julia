@@ -1865,6 +1865,44 @@ function _checkstreammessage(st::_StreamState, fm::FramedMessage)
 end
 
 """
+The values of dictionary batch `rb` (its RecordBatch, under message version
+`version`), decoded from `body` as field `vf`.
+"""
+function _decodedictionary(
+    rb::Meta.RecordBatch,
+    body,
+    version::Int16,
+    vf::Field,
+    dicts,
+    fielddictids,
+    limits::Limits,
+    state::DecodeState,
+)
+    rblen = something(rb.length, Int64(0))
+    rblen >= 0 || throw(ValidationError("dictionary batch length $rblen is negative"))
+    rblen <= limits.max_array_length || _limiterror(
+        "dictionary batch length $rblen",
+        "max_array_length",
+        limits.max_array_length,
+    )
+    cursor = DecodeCursor(
+        rb.nodes,
+        rb.buffers,
+        body,
+        limits;
+        codec=_batchcodec(rb.compression, version),
+        state=state,
+        variadics=variadiccounts(rb),
+    )
+    decoded = decodefield(vf, cursor, dicts, fielddictids)
+    finishcursor!(cursor)
+    decoded.len == rblen || throw(
+        ValidationError("dictionary RecordBatch length does not match its field node"),
+    )
+    return decoded
+end
+
+"""
 Decode dictionary batch `fm` and apply it to the stream's dictionaries (a
 first pool, a delta, or a replacement). Returns its id, the pool now in
 effect, and whether the id already had one.
@@ -1877,7 +1915,6 @@ function _applydictionary!(
 )
     header = fm.msg.header::Meta.DictionaryBatch
     rb = header.data
-    codec = _batchcodec(rb.compression, fm.version)
     haskey(st.dictids, header.id) ||
         throw(ValidationError("dictionary batch has unknown id $(header.id)"))
     replacement = haskey(st.dicts, header.id)
@@ -1888,26 +1925,15 @@ function _applydictionary!(
     haskey(st.dictvaluefields, header.id) ||
         throw(ValidationError("dictionary batch has unknown id $(header.id)"))
     vf = st.dictvaluefields[header.id]
-    rblen = something(rb.length, Int64(0))
-    rblen >= 0 || throw(ValidationError("dictionary batch length $rblen is negative"))
-    rblen <= st.limits.max_array_length || _limiterror(
-        "dictionary batch length $rblen",
-        "max_array_length",
-        st.limits.max_array_length,
-    )
-    cursor = DecodeCursor(
-        rb.nodes,
-        rb.buffers,
+    decoded = _decodedictionary(
+        rb,
         fm.body,
-        st.limits;
-        codec=codec,
-        state=state,
-        variadics=variadiccounts(rb),
-    )
-    decoded = decodefield(vf, cursor, st.dicts, st.fielddictids)
-    finishcursor!(cursor)
-    decoded.len == rblen || throw(
-        ValidationError("dictionary RecordBatch length does not match its field node"),
+        fm.version,
+        vf,
+        st.dicts,
+        st.fielddictids,
+        st.limits,
+        state,
     )
     decoded = _updatedictionary!(
         st.dicts,
@@ -1989,13 +2015,11 @@ function _decoderecords(st::_StreamState, ps::Vector{PendingRecord}, ntasks::Int
     ]
 end
 
-function _readstream(
-    bytes::Vector{UInt8},
-    limits::Limits,
-    budget::AllocationBudget,
-    ntasks::Int=1,
-)
-    region = heapregion(bytes)
+"""
+The framed stream in `region`: its decoding state after every message, and its
+record batches planned against the dictionaries in effect at each.
+"""
+function _streamrecords(region::OwnerRegion, limits::Limits, budget::AllocationBudget)
     msgs = _framemessages(region, limits, Base.ENDIAN_BOM, budget)
     isempty(msgs) && throw(ValidationError("empty IPC stream"))
     st = _StreamState(msgs[1], limits)
@@ -2023,6 +2047,17 @@ function _readstream(
     end
     all(p -> isempty(p.missing), records) ||
         throw(ValidationError("stream ended before required dictionary batches arrived"))
+    return st, records
+end
+
+function _readstream(
+    bytes::Vector{UInt8},
+    limits::Limits,
+    budget::AllocationBudget,
+    ntasks::Int=1,
+)
+    region = heapregion(bytes)
+    st, records = _streamrecords(region, limits, budget)
     return IPCStream(
         st.schema,
         AC.FrozenVector{Field}(st.fields),
@@ -2564,7 +2599,7 @@ end
 
 function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget)
     region.len >= 6 &&
-        AC.slicebytes(AC.subslice(BufferSlice(region, 0, region.len), 0, 6)) == FILE_MAGIC ||
+    AC.slicebytes(AC.subslice(BufferSlice(region, 0, region.len), 0, 6)) == FILE_MAGIC ||
         throw(ValidationError("missing leading ARROW1 magic"))
     ft = _readfooter(region, limits, budget)
     framed(_, block) =
@@ -2628,32 +2663,16 @@ function _filedictionaries(
                 haskey(dicts, header.id);
                 file=true,
             )
-            rb = header.data
-            codec = _batchcodec(rb.compression, fm.version)
             vf = dictvaluefields[header.id]
-            rblen = something(rb.length, Int64(0))
-            rblen >= 0 ||
-                throw(ValidationError("dictionary batch length $rblen is negative"))
-            rblen <= limits.max_array_length || _limiterror(
-                "dictionary batch length $rblen",
-                "max_array_length",
-                limits.max_array_length,
-            )
-            cursor = DecodeCursor(
-                rb.nodes,
-                rb.buffers,
+            decoded = _decodedictionary(
+                header.data,
                 fm.body,
-                limits;
-                codec=codec,
-                state=state,
-                variadics=variadiccounts(rb),
-            )
-            decoded = decodefield(vf, cursor, dicts, fielddictids)
-            finishcursor!(cursor)
-            decoded.len == rblen || throw(
-                ValidationError(
-                    "dictionary RecordBatch length does not match its field node",
-                ),
+                fm.version,
+                vf,
+                dicts,
+                fielddictids,
+                limits,
+                state,
             )
             _updatedictionary!(
                 dicts,

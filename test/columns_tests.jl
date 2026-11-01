@@ -976,10 +976,15 @@ end
             @test sum(length, c.s.buffers) == viewbytes
             owned = Arrow.read(bytes, Tables.columntable).s
             @test isequal(owned, strs) && !any(b -> b === bytes, owned.buffers)
-            # A filtered scan gives the same kind of column, over the same bytes.
+            # A filtered scan gives the same kind of column, owning just its
+            # rows' bytes.
             f = Arrow.Table(bytes; filter=Arrow.col(:x) > n ÷ 2)
             @test f.s isa StringVector && isequal(f.s, strs[(n ÷ 2 + 1):end])
-            compress === nothing && @test any(b -> b === bytes, f.s.buffers)
+            @test !any(b -> b === bytes, f.s.buffers)
+            @test sum(length, f.s.buffers) == sum(
+                x -> x === missing || ncodeunits(x) <= 12 ? 0 : ncodeunits(x),
+                strs[(n ÷ 2 + 1):end],
+            )
             @test isequal(copy(f).s, strs[(n ÷ 2 + 1):end])
         end
         # A filtered column of several batches joins the batches' buffers.

@@ -94,4 +94,37 @@ end
     end
 end
 
+@testset "a select through a source builds what a mapped read builds" begin
+    n = 20_000
+    io = IOBuffer()
+    Arrow.Writer(io; file=true) do writer
+        for batch = 1:4
+            Arrow.write(
+                writer,
+                (
+                    x=collect(((batch - 1) * n + 1):(batch * n)),
+                    s=[string("value number ", i) for i = 1:n],
+                    pad=fill(repeat("p", 64), n),
+                ),
+            )
+        end
+    end
+    bytes = take!(io)
+    path = tempname()
+    write(path, bytes)
+    fetched = Ref(0)
+    mapped() = Arrow.Table(path; select=[:x, :s])
+    ranged() = Arrow.Table(Arrow.SourceFile(MeteredSource(bytes, fetched)); select=[:x, :s])
+    m, r = mapped(), ranged()
+    @test typeof(m.x) == typeof(r.x) && typeof(m.s) == typeof(r.s)
+    @test m.x == r.x && m.s == r.s
+    # Beyond the bytes the source hands over, a ranged read allocates what a
+    # mapped read does, plus a few KiB per batch of range planning.
+    mappedbytes = @allocated mapped()
+    fetched[] = 0
+    rangedbytes = @allocated ranged()
+    @test rangedbytes - fetched[] <= mappedbytes + 256 * 1024
+    rm(path)
+end
+
 end
