@@ -505,11 +505,30 @@ function _zonedliteral(f::AC.Field, x)
     )
 end
 
+# A comparison literal for field `f`: also, a zone-free time compared with a
+# zone-free timestamp column becomes the column's value type when that is the
+# same instant, so each row compares integers instead of calendar fields.
+# Membership keeps its values: a `Set` of dates hashes them as dates.
+function _cmpliteral(f::AC.Field, x)
+    x = _zonedliteral(f, x)
+    (x isa _ZonelessTime && !_hasarrowtypesextension(f)) || return x
+    t = _leaffield(f).type
+    t isa AC.DictionaryType && (t = t.valuetype)
+    (t isa AC.TimestampType && _timestampzone(t) === nothing) || return x
+    y = try
+        Durations.Timestamp{_timestampperiod(t.unit)}(x)
+    catch err
+        err isa Union{InexactError,OverflowError,ArgumentError} || rethrow()
+        return x
+    end
+    return y == x ? y : x
+end
+
 function _zonedliterals(e, fields, names)
     if e isa Tables.Cmp
         f = _fieldfor(fields, e.lhs.ref, names)
         f === nothing && return e
-        v = _zonedliteral(f, e.rhs)
+        v = _cmpliteral(f, e.rhs)
         return v === e.rhs ? e : Tables.Cmp(e.op, e.lhs, v)
     elseif e isa Tables.In
         f = _fieldfor(fields, e.lhs.ref, names)

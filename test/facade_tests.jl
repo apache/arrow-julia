@@ -1476,6 +1476,27 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         for bytes in (fb, sb)
             @test_throws ArgumentError Arrow.Table(bytes; scan=rawint)
         end
+        # Zone-free time literals against zone-free timestamps of every unit,
+        # whether or not the literal is exact in the column's unit or range.
+        t0 = DateTime(2020, 1, 2)
+        literals = (
+            t0,
+            t0 + Millisecond(500),
+            Date(2020, 1, 2),
+            Durations.Timestamp{Nanosecond}(t0) + Nanosecond(7),
+            DateTime(1500, 1, 1),
+        )
+        for P in (Second, Millisecond, Microsecond, Nanosecond)
+            tsdata = (ts=[Durations.Timestamp{P}(t0 + Second(k)) for k = -1:1],)
+            io = IOBuffer()
+            Arrow.write(io, tsdata; file=true)
+            bytes = take!(io)
+            for literal in literals, op in (==, !=, <, <=, >, >=)
+                scan = Tables.Scan(filter=Tables.colcmp(op, Tables.col(:ts), literal))
+                got = Arrow.Table(bytes; scan=scan).ts
+                @test isequal(collect(got), Tables.scan(tsdata, scan).ts)
+            end
+        end
     end
 
     @testset "temporal pushdown preserves the complete public domain" begin
@@ -1499,9 +1520,9 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             @test Tables.rowcount(got) == Tables.rowcount(Tables.columns(want))
         end
 
-        # Time predicates stay public. A stored time of day outside [0, 24h)
-        # has no exact Dates.Time (which wraps modulo 24 hours), so reads
-        # refuse it instead of aliasing it onto another time.
+        # A stored time of day outside [0, 24h) has no exact Dates.Time (which
+        # wraps modulo 24 hours), so reads, filtered or not, refuse it instead
+        # of aliasing it onto another time.
         let (type, values, literal) =
                 (Arrow.AC.TimeType(Arrow.AC.SECOND, 32), Int32[0, 86_399], Time(0))
             field, bytes = rawtemporal(type, values)
@@ -1525,9 +1546,8 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             @test_throws Arrow.ValidationError Arrow.Table(copy(bytes); scan=scan)
         end
 
-        # Second-unit timestamps used to wrap-alias extreme counts into one
-        # DateTime; as Timestamp{Second} every count is a distinct public
-        # value, so equality lowers and matches exactly one row.
+        # Every Timestamp{Second} count is a distinct public value, so an
+        # extreme count does not alias the epoch: equality matches one row.
         let field_bytes = rawtemporal(
                 Arrow.AC.TimestampType(Arrow.AC.SECOND, nothing),
                 Int64[0, Int64(1) << 61],
@@ -1542,10 +1562,8 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             end
         end
 
-        # Date64's millisecond epoch addition is one-to-one but wraps Int64
-        # ordering: equality may lower; ordered comparisons stay public. A
-        # millisecond TIMESTAMP reads as Timestamp{Millisecond} — a total
-        # bijection — so both of its comparisons lower.
+        # Extreme Date64 and millisecond TIMESTAMP counts compare as their
+        # public values do, ordered comparisons included.
         let field_bytes = rawtemporal(
                 Arrow.AC.DateType(Arrow.AC.MILLISECOND_DATE),
                 Int64[typemax(Int64), 0],
@@ -1571,9 +1589,9 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             end
         end
 
-        # A coarser Duration literal converts into the column's unit without
-        # touching stored values. A finer literal can overflow while Julia
-        # promotes a stored public value, so it must stay on the public plan.
+        # Duration literals coarser and finer than the column's unit compare
+        # as public values do; a finer one can overflow while Julia promotes
+        # a stored value, in a scan as in the generic executor.
         duration = Arrow.AC.DurationType(Arrow.AC.SECOND)
         field, bytes = rawtemporal(duration, Int64[60])
         coarse = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), Minute(1)))
