@@ -45,23 +45,14 @@ function _test_c_array(release::Ptr{Cvoid})
 end
 
 _registry_count() = lock(REGISTRY_LOCK) do
-    length(EXPORT_REGISTRY)
+    length(EXPORTS)
 end
-
-function _call_release(p::Ptr{CArrowSchema})
-    release = lock(REGISTRY_LOCK) do
-        unsafe_load(p).release
-    end
-    release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowSchema},), p)
-    return nothing
-end
-
-function _call_release(p::Ptr{CArrowArray})
-    release = lock(REGISTRY_LOCK) do
-        unsafe_load(p).release
-    end
-    release == C_NULL || ccall(release, Cvoid, (Ptr{CArrowArray},), p)
-    return nothing
+"Reap, then count what is still registered."
+_drained() = (_reap!(); _registry_count())
+"The registry key of the export whose struct is at `p`."
+_exportkey(p::Ptr) = Ptr{Int64}(unsafe_load(p).private_data)
+_registered(key::Ptr{Int64}) = lock(REGISTRY_LOCK) do
+    haskey(EXPORTS, key)
 end
 
 function _stress_reaper(ready, start, done, workers)
@@ -69,7 +60,7 @@ function _stress_reaper(ready, start, done, workers)
     wait(start)
     reaped = 0
     for _ = 1:10_000
-        reaped += reap!()
+        reaped += _reap!()
         done[] == workers && _registry_count() == 0 && break
         yield()
     end
@@ -80,8 +71,8 @@ function _threaded_cdata_stress()
     Threads.nthreads() >= 4 ||
         error("threaded C Data stress requires at least four threads")
 
-    # Different exported trees may release concurrently. Reapers scan and
-    # claim those roots at the same time; each root must be popped once.
+    # Different exports may be released concurrently, from any thread, while
+    # reapers scan and free the released ones; each export is freed once.
     n = 1_000
     workers = 4
     f, d = fromjulia("registry-race", Int64[1])
@@ -95,8 +86,8 @@ function _threaded_cdata_stress()
         try
             for i = worker:workers:n
                 sp, ap = roots[i]
-                _call_release(sp)
-                _call_release(ap)
+                _release_c!(sp)
+                _release_c!(ap)
                 i % 16 == 0 && yield()
             end
         finally
@@ -112,8 +103,8 @@ function _threaded_cdata_stress()
     notify(start)
     foreach(fetch, releasers)
     reaped_by_task = fetch.(reapers)
-    reaped = sum(reaped_by_task) + reap!()
-    @assert reaped == 2n (reaped, reaped_by_task, _registry_count())
+    reaped = sum(reaped_by_task) + _reap!()
+    @assert reaped == n (reaped, reaped_by_task, _registry_count())
     @assert _registry_count() == 0
 
     # One atomic swap must choose between explicit release and the registered
@@ -122,9 +113,11 @@ function _threaded_cdata_stress()
     before = TEST_CONFORMING_RELEASES[]
     owners = ForeignOwner[]
     for _ = 1:rounds
-        owner = ForeignOwner(_test_c_array(test_conforming_release()))
-        _arm_foreign_owner!(owner)
-        push!(owners, owner)
+        arr = Ref(_test_c_array(test_conforming_release()))
+        push!(
+            owners,
+            GC.@preserve arr _moveowner(Base.unsafe_convert(Ptr{CArrowArray}, arr))
+        )
     end
     ready = ReleaseCounter()
     start = Base.Event()
@@ -148,7 +141,8 @@ function _threaded_cdata_stress()
     foreach(fetch, contenders)
     @assert TEST_CONFORMING_RELEASES[] - before == rounds
     for owner in owners
-        @assert (@atomic owner.released)
+        @assert (@atomic owner.cell.closed)
     end
+
     return nothing
 end

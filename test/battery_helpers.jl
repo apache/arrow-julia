@@ -553,7 +553,9 @@ test_nonconforming_release() =
 
 # A one-batch C stream producer over a hand-built struct column, for batch
 # shapes `export_stream!` never emits (null struct rows, struct offsets).
-# `private_data` stays non-NULL until the batch has been sent.
+# `private_data` stays non-NULL until the batch has been sent. With a `gate`
+# of two channels, `get_next` signals the first and waits on the second, to
+# hold a pull open.
 const ONE_BATCH_STREAM = Ref{Any}(nothing)
 
 function _one_batch_move!(out::Ptr{T}, src::Ptr{T}) where {T}
@@ -563,7 +565,7 @@ function _one_batch_move!(out::Ptr{T}, src::Ptr{T}) where {T}
 end
 
 function _one_batch_get_schema(::Ptr{CArrowArrayStream}, out::Ptr{CArrowSchema})::Cint
-    f, d = ONE_BATCH_STREAM[]::Tuple{Field,ArrayData}
+    f, d, _ = ONE_BATCH_STREAM[]::Tuple{Field,ArrayData,Any}
     sp, ap = to_c_data(f, d)
     _one_batch_move!(out, sp)
     ccall(unsafe_load(ap).release, Cvoid, (Ptr{CArrowArray},), ap)
@@ -589,7 +591,11 @@ function _one_batch_get_next(stream::Ptr{CArrowArrayStream}, out::Ptr{CArrowArra
         )
         return Cint(0)
     end
-    f, d = ONE_BATCH_STREAM[]::Tuple{Field,ArrayData}
+    f, d, gate = ONE_BATCH_STREAM[]::Tuple{Field,ArrayData,Any}
+    if gate !== nothing
+        put!(gate[1], nothing)
+        take!(gate[2])
+    end
     sp, ap = to_c_data(f, d)
     _one_batch_move!(out, ap)
     ccall(unsafe_load(sp).release, Cvoid, (Ptr{CArrowSchema},), sp)
@@ -605,8 +611,8 @@ function _one_batch_release(stream::Ptr{CArrowArrayStream})::Cvoid
 end
 
 "Fill `sp` with a C stream whose single batch is the struct column `(f, d)`."
-function one_batch_stream!(sp::Ptr{CArrowArrayStream}, f::Field, d::ArrayData)
-    ONE_BATCH_STREAM[] = (f, d)
+function one_batch_stream!(sp::Ptr{CArrowArrayStream}, f::Field, d::ArrayData, gate=nothing)
+    ONE_BATCH_STREAM[] = (f, d, gate)
     unsafe_store!(
         sp,
         CArrowArrayStream(
@@ -629,53 +635,8 @@ function one_batch_stream!(sp::Ptr{CArrowArrayStream}, f::Field, d::ArrayData)
 end
 
 # ---------------------------------------------------------------------------
-# C Data battery support: nonconforming release probe and topology mutators
+# C Data battery support
 # ---------------------------------------------------------------------------
-
-function _expect_invalid_list_topology!(mutate)
-    f, d = fromjulia("bad-list", [Int64[1]])
-    before = _registry_count()
-    sp, ap = to_c_data(f, d)
-    mutate(sp, ap)
-    @assert try
-        from_c_data(sp, ap)
-        false
-    catch e
-        e isa ValidationError
-    end
-    @assert unsafe_load(sp).release == C_NULL
-    @assert unsafe_load(ap).release == C_NULL
-    @assert reap!() == 2
-    @assert _registry_count() == before
-    return nothing
-end
-
-function _expect_invalid_dictionary_topology!(mutate)
-    vf, vd = fromjulia("values", ["x"])
-    t = DictionaryType(IntType(32, true), vf.type, false)
-    f = Field("bad-dictionary", t; nullable=false, children=vf.children)
-    d = ArrayData(
-        t,
-        1,
-        [BufferSlice(), AC._databuffer(Int32[0])];
-        dictionary=vd,
-        nullcount=0,
-    )
-    before = _registry_count()
-    sp, ap = to_c_data(f, d)
-    mutate(sp, ap)
-    @assert try
-        from_c_data(sp, ap)
-        false
-    catch e
-        e isa ValidationError
-    end
-    @assert unsafe_load(sp).release == C_NULL
-    @assert unsafe_load(ap).release == C_NULL
-    @assert reap!() == 2
-    @assert _registry_count() == before
-    return nothing
-end
 
 function _expect_invalid_schema_flags!(flags::Int64)
     f, d = fromjulia("bad-flags", Int64[1])
@@ -690,8 +651,7 @@ function _expect_invalid_schema_flags!(flags::Int64)
     end
     @assert unsafe_load(sp).release == C_NULL
     @assert unsafe_load(ap).release == C_NULL
-    @assert reap!() == 2
-    @assert _registry_count() == before
+    @assert _drained() == before
     return nothing
 end
 

@@ -23,8 +23,8 @@
 #   `tools/fbsgen.jl`) over the vendored `FlatBuffers` runtime.
 # - IPC adapters (`ipc_read.jl`, `ipc_write.jl`): stream and file formats,
 #   framing, resource limits, compression, dictionary lifecycles.
-# - `cdata.jl`: the C data and C stream interfaces, import and export, with
-#   lifecycle accounting.
+# - `cdata.jl`, `cstream.jl`: the C data and C stream interfaces over Core,
+#   import and export, with lifecycle accounting.
 # - `scan.jl`: `Tables.Scan` pushdown over byte ranges plus footer-carried
 #   statistics pruning.
 # - `table.jl`, `write.jl`: the read facade and write orchestration.
@@ -90,6 +90,7 @@ include("ipc_read.jl")
 include("ipc_dictionary.jl")
 include("ipc_write.jl")
 include("cdata.jl")
+include("cstream.jl")
 include("source.jl")
 include("arrowtypes.jl")
 include("columns.jl")
@@ -225,7 +226,6 @@ AC.ValidationError
             :ForeignOwner,
             :ImportedStream,
             :nextbatch!,
-            :reap!,
             :Limits,
             :AllocationLimitError,
             :ValidationError,

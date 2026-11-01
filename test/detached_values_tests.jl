@@ -93,7 +93,7 @@ end
             @test isequal(Arrow.materialize(fi, result), expected)
             @test Arrow.validate_semantic(fi, result) === result
         end
-        Arrow.reap!()
+        Arrow._reap!()
     end
     # A fresh process must rebuild pointers from saved bytes, after release.
     mktemp() do path, io
@@ -103,7 +103,7 @@ end
         serialize(io, (fi, imported))
         close(io)
         Arrow.release!(imported.owner)
-        Arrow.reap!()
+        Arrow._reap!()
         code = "using Arrow, Serialization; f, d = deserialize(ARGS[1]); @assert Arrow.materialize(f, d) == Int32[4,5,6]; @assert d.owner === nothing"
         cmd = `$(Base.julia_cmd()) --startup-file=no --check-bounds=yes --project=$(Base.active_project()) -e $code $path`
         @test success(cmd)
@@ -274,7 +274,7 @@ end
     fi, di = Arrow.from_c_data(sp, ap)
     @test collect(fi.metadata) == metadata
     Arrow.release!(di.owner)
-    Arrow.reap!()
+    Arrow._reap!()
     for batches in (AC.RecordBatch[], [b])
         ref = Ref{Arrow.CArrowArrayStream}()
         GC.@preserve ref begin
@@ -291,7 +291,7 @@ end
             @test Arrow.nextbatch!(source) === nothing
             Arrow.release!(source)
         end
-        Arrow.reap!()
+        Arrow._reap!()
     end
 end
 end

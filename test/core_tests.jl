@@ -1060,7 +1060,7 @@ end
             f2, d2 = Arrow.from_c_data(sp, ap)
             @test isequal(materialize(f2, d2), materialize(f, d))
             Arrow.release!(d2.owner::Arrow.ForeignOwner)
-            Arrow.reap!()
+            Arrow._reap!()
 
             # no nulls, empty extra: the empty bitmap and an empty second data
             # buffer (buffer index 1 always means `extra`)
@@ -1075,7 +1075,7 @@ end
             f0b, d0b = Arrow.from_c_data(sp0, ap0)
             @test materialize(f0b, d0b) == ["abcd", "twelve-bytes"]
             Arrow.release!(d0b.owner::Arrow.ForeignOwner)
-            Arrow.reap!()
+            Arrow._reap!()
 
             # malformed long entries construct (a wrap makes no promises about
             # content) and refuse where every builder's output does: validation

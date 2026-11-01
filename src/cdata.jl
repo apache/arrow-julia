@@ -21,43 +21,35 @@
 # dictionary + length/null_count/offset), so export is struct filling and
 # import is struct reading.
 #
-#   * Export: ONE release callback per C structure (never per buffer). A
-#     parent callback releases each child/dictionary that has not been moved;
-#     a moved child keeps the shared export allocation alive until its own
-#     callback runs. `private_data` points to a per-node malloc'd,
-#     never-GC-scanned CONTROL BLOCK holding an exactly-once state and the
-#     registry key. The Julia-side owner (which roots the Core columns and
-#     every malloc'd C struct) stays in a global EXPORT REGISTRY until
-#     release — a raw pointer in private_data roots nothing by itself. The
-#     @cfunction release callback recursively marks the C tree released.
-#     Callback traversal uses producer-owned canonical child/dictionary
-#     topology, not the caller-visible counts and pointer tables. It still
-#     reads each canonical descendant's public release field so conforming
-#     moves are honored. A reaper pass (`reap!`) finds aggregates whose last
-#     outstanding node was released, frees their mallocs, and drops the
-#     registry root. Dropping that root is what lets the source columns —
-#     and, through their `OwnerRegion` roots, the buffer memory itself —
-#     become collectable again. Callback contract: releases for one tree are
-#     serialized and run only on Julia-attached threads.
+#   * Export: every C node of one export (a schema tree, an array tree, or a
+#     stream) carries in `private_data` a pointer to one malloc'd count of the
+#     nodes the consumer has not released. A release callback releases the
+#     children and dictionary still in place, marks the node released, and
+#     counts it off. It takes no lock, allocates nothing, and touches no Julia
+#     object, because consumers call it from their own threads and from inside
+#     GC finalizers. The Julia side keeps each export's roots (the columns,
+#     whose regions keep the buffers alive) and mallocs in `EXPORTS` until the
+#     count reaches zero; the next export, or the next garbage collection,
+#     frees them.
 #
 #   * Import: the moved ArrowArray becomes ONE ForeignOwner shared by every
-#     child/dictionary BufferSlice (a single release for the whole tree —
-#     per-buffer owners would double-release). Buffer extents are DECLARED,
-#     not verified: the ABI cannot prove allocation sizes, so extents are
-#     computed from length/offset/layout, and offsets buffers are read
-#     (bounded by their computed size) to size the data buffers they govern.
-#     Failed imports release the moved structure exactly once before
-#     throwing. Per spec, moving marks the source released (release = NULL).
-#     Validity is reachability: every imported region's `root` is the
-#     ForeignOwner, so the producer's memory outlives every slice by
-#     construction. Every region over one import shares one `ReleaseCell`, so
-#     `release!` on the owner or on any of its regions revokes all siblings
-#     (later access is a clean `InvalidStateException`) and then runs the
-#     producer's release exactly once.
+#     child/dictionary BufferSlice (a single release for the whole tree).
+#     Buffer extents are DECLARED, not verified: the ABI cannot prove
+#     allocation sizes, so extents are computed from length/offset/layout, and
+#     offsets buffers are read (bounded by their computed size) to size the
+#     data buffers they govern. Failed imports release the moved structure
+#     exactly once before throwing. Per spec, moving marks the source released
+#     (release = NULL). Validity is reachability: every imported region's
+#     `root` is the ForeignOwner, so the producer's memory outlives every slice
+#     by construction, and every region shares one `ReleaseCell`, so
+#     `release!` on the owner or on any region revokes all siblings (later
+#     access is a clean `InvalidStateException`) and then runs the producer's
+#     release exactly once.
 #
-#   * Streams: `ArrowArrayStream` maps in both directions with one
-#     independently-owned export root per result and exception-safe
-#     move/release handoffs.
+#   * Streams: `ArrowArrayStream` maps in both directions. An exported stream
+#     is one export whose `get_schema` and `get_next` results are exports of
+#     their own; an imported stream is a moved struct whose batches import as
+#     arrays do.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -104,6 +96,32 @@ const ARROW_FLAG_DICTIONARY_ORDERED = Int64(1)
 const ARROW_FLAG_MAP_KEYS_SORTED = Int64(4)
 const ARROW_FLAG_ALL_SUPPORTED =
     ARROW_FLAG_NULLABLE | ARROW_FLAG_DICTIONARY_ORDERED | ARROW_FLAG_MAP_KEYS_SORTED
+
+# Store one field of a C struct in place (structs are immutable in Julia;
+# the C memory is not).
+@generated function _store_field!(p::Ptr{T}, ::Val{name}, v) where {T,name}
+    i = findfirst(==(name), fieldnames(T))
+    off = fieldoffset(T, i)
+    FT = fieldtype(T, i)
+    return :(unsafe_store!(Ptr{$FT}(Ptr{Cvoid}(p) + $off), convert($FT, v)); nothing)
+end
+_store_field!(p, name::Symbol, v) = _store_field!(p, Val(name), v)
+
+# Call the release callback of the C struct at `p`, if it still has one.
+function _release_c!(p::Ptr{T}) where {T}
+    r = unsafe_load(p).release
+    r == C_NULL || ccall(r, Cvoid, (Ptr{T},), p)
+    return nothing
+end
+
+# Release a producer's struct and check that its callback marked the struct
+# released, as the interface requires.
+function _release_producer!(p::Ptr{T}) where {T}
+    _release_c!(p)
+    unsafe_load(p).release == C_NULL ||
+        error("C Data producer release did not mark the structure released")
+    return nothing
+end
 
 # ---------------------------------------------------------------------------
 # Format strings <-> Core descriptors (parity with Core's accessor set)
@@ -324,298 +342,128 @@ function parseformat(fmt::AbstractString, flags::Int64=0)::ArrowType
 end
 
 # ---------------------------------------------------------------------------
-# Export: Core -> C structs, per-node controls + registry + explicit reaper
+# Export: Core -> C structs, one live-node count per export
 # ---------------------------------------------------------------------------
 
-# Per-node control block layout (malloc'd, never GC-scanned):
-#   offset 0: UInt8 state (0 = live, 1 = releasing, 2 = released)
-#   offset 8: Int64 registry key
-const CONTROL_BLOCK_BYTES = 16
-
-"""
-Everything one export tree must keep alive and eventually free: the Core
-columns (whose OwnerRegions root the actual buffers), every malloc'd C struct
-and string, and every per-node control block. Held in EXPORT_REGISTRY under
-their shared aggregate key until all non-moved and moved nodes have been
-released and the reaper runs. Rooting the columns here is the entire
-source-liveness story: raw C pointers handed to a consumer stay valid because
-the registry keeps this object and all source regions reachable.
-"""
-mutable struct ExportedRoot
-    roots::Vector{Any}          # ArrayData/Field/Schema kept reachable
-    mallocs::Vector{Ptr{Cvoid}} # every Libc.malloc'd allocation, freed on reap
-    key::Int64
-    remaining::Int64           # exported C nodes whose callback has not run
-    schema_topology::Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}
-    array_topology::Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}
-    pinned::Vector{Any}         # ForeignOwners whose memory this export lends out
+# One export's Julia roots and native allocations. `live` is a malloc'd count
+# of the C nodes the consumer has not released; every node's `private_data`
+# points at it, so a release callback needs no Julia object. The 8 bytes after
+# the count hold an exported stream's last error message.
+mutable struct Export
+    const roots::Vector{Any}
+    const mallocs::Vector{Ptr{Cvoid}}
+    const live::Ptr{Int64}
 end
 
-const EXPORT_REGISTRY = Dict{Int64,ExportedRoot}()
+const EXPORTS = Dict{Ptr{Int64},Export}()
 const REGISTRY_LOCK = ReentrantLock()
-const NEXT_KEY = Ref{Int64}(0)
-function _claim_array_node(a::Ptr{CArrowArray}, claimed_slot)
-    a == C_NULL && return nothing
-    return lock(REGISTRY_LOCK) do
-        arr = unsafe_load(a)
-        arr.release == C_NULL && return nothing
-        p = arr.private_data
-        p == C_NULL && return nothing
-        key = unsafe_load(Ptr{Int64}(p + 8))
-        root = get(EXPORT_REGISTRY, key, nothing)
-        root === nothing && error("C Data export root disappeared during release")
-        topology = get(root.array_topology, p, nothing)
-        topology === nothing && error("C Data array topology disappeared during release")
-        flag = unsafe_load(Ptr{UInt8}(p))
-        flag == 0x00 || return nothing
-        claimed = (p, topology)
-        claimed_slot[] = claimed
-        unsafe_store!(Ptr{UInt8}(p), 0x01)
-        return claimed
-    end
+
+function _newexport(roots::Vector{Any})
+    _reap!()
+    live = Ptr{Int64}(Libc.calloc(2, 8))
+    live == C_NULL && throw(OutOfMemoryError())
+    return Export(roots, Ptr{Cvoid}[live], live)
 end
 
-function _claim_schema_node(s::Ptr{CArrowSchema}, claimed_slot)
-    s == C_NULL && return nothing
-    return lock(REGISTRY_LOCK) do
-        sch = unsafe_load(s)
-        sch.release == C_NULL && return nothing
-        p = sch.private_data
-        p == C_NULL && return nothing
-        key = unsafe_load(Ptr{Int64}(p + 8))
-        root = get(EXPORT_REGISTRY, key, nothing)
-        root === nothing && error("C Data export root disappeared during release")
-        topology = get(root.schema_topology, p, nothing)
-        topology === nothing && error("C Data schema topology disappeared during release")
-        flag = unsafe_load(Ptr{UInt8}(p))
-        flag == 0x00 || return nothing
-        claimed = (p, topology)
-        claimed_slot[] = claimed
-        unsafe_store!(Ptr{UInt8}(p), 0x01)
-        return claimed
-    end
+function _malloc!(e::Export, n::Integer)
+    p = Libc.malloc(max(Int(n), 1))
+    p == C_NULL && throw(OutOfMemoryError())
+    push!(e.mallocs, p)
+    return p
 end
 
-function _finish_node!(p, control::Ptr{Cvoid}, claimed_slot, committed_slot)
-    # This locked block is the callback's final access to export-owned memory.
-    # The reaper observes zero only after every non-moved descendant callback,
-    # and every independently moved node callback, has completed. Scanning in
-    # reap! keeps allocation and registry removal out of the C callback.
+function _free!(e::Export)
+    message = unsafe_load(Ptr{Ptr{UInt8}}(e.live + 8))
+    message == C_NULL || Libc.free(message)
+    foreach(Libc.free, e.mallocs)
+    empty!(e.mallocs)
+    empty!(e.roots)
+    return nothing
+end
+
+# An object whose finalizer reaps and then registers itself again, so a
+# consumer's releases free memory at the next garbage collection even when
+# nothing exports again. Created once, by the first export.
+mutable struct _ReapHook end
+const _REAP_HOOK_ARMED = Ref(false)
+# A finalizer does not survive precompilation; the flag must not either.
+__init__() = (_REAP_HOOK_ARMED[] = false; nothing)
+
+function _reaphook(h::_ReapHook)
+    finalizer(_reaphook, h)
+    trylock(REGISTRY_LOCK) || return nothing
+    try
+        _reap!()
+    finally
+        unlock(REGISTRY_LOCK)
+    end
+    return nothing
+end
+
+function _register!(e::Export)
     lock(REGISTRY_LOCK) do
-        unsafe_load(Ptr{UInt8}(control)) == 0x01 ||
-            error("C Data node is not in releasing state")
-        key = unsafe_load(Ptr{Int64}(control + 8))
-        root = get(EXPORT_REGISTRY, key, nothing)
-        root === nothing && error("C Data export root disappeared during release")
-        root.remaining > 0 || error("C Data export node counter underflow")
-        oldremaining = root.remaining
-        oldrelease = unsafe_load(p).release
-        try
-            root.remaining = oldremaining - 1
-            unsafe_store!(Ptr{UInt8}(control), 0x02)
-            _store_field!(p, Val(:release), Ptr{Cvoid}(C_NULL))
-            # The outer catch must not touch `control` once remaining is
-            # zero: a reaper may free it as soon as this lock is released.
-            # Transfer the completed claim while the lock still excludes
-            # cleanup. A later exception observes a committed callback.
-            committed_slot[] = true
-            claimed_slot[] = nothing
-        catch
-            if !committed_slot[]
-                # Nothing can reap this root while the registry lock is held.
-                # Restore the whole commit before the outer transaction
-                # returns the node from RELEASING to LIVE.
-                root.remaining = oldremaining
-                unsafe_store!(Ptr{UInt8}(control), 0x01)
-                _store_field!(p, Val(:release), oldrelease)
-            end
-            rethrow()
+        EXPORTS[e.live] = e
+        if !_REAP_HOOK_ARMED[]
+            _REAP_HOOK_ARMED[] = true
+            finalizer(_reaphook, _ReapHook())
         end
     end
     return nothing
 end
 
-function _reset_node_claim!(control::Ptr{Cvoid})
-    lock(REGISTRY_LOCK) do
-        flag = unsafe_load(Ptr{UInt8}(control))
-        flag == 0x01 || return nothing
-        unsafe_store!(Ptr{UInt8}(control), 0x00)
+# Free every export whose C nodes have all been released, and return how many.
+# Runs at the start of every export and from `_ReapHook`, so no caller needs to.
+# ponytail: O(live exports) scan; index by count if a consumer holds thousands.
+function _reap!()
+    done = lock(REGISTRY_LOCK) do
+        zeroed = Ptr{Int64}[
+            k for k in keys(EXPORTS) if unsafe_load(k, :sequentially_consistent) == 0
+        ]
+        Export[pop!(EXPORTS, k) for k in zeroed]
     end
+    foreach(_free!, done)
+    return length(done)
+end
+
+# Release callbacks do only native work: release the children and dictionary
+# still in place (a moved one has `release == NULL`), mark the node released,
+# and count it off its export. No lock, no allocation, no Julia object, and
+# nothing that can throw: consumers call them from their own threads, and
+# PythonCall runs pyarrow's releases from GC finalizers.
+function _release_array(a::Ptr{CArrowArray})::Cvoid
+    arr = unsafe_load(a)
+    arr.release == C_NULL && return nothing
+    for i = 1:arr.n_children
+        _release_c!(unsafe_load(arr.children, i))
+    end
+    arr.dictionary == C_NULL || _release_c!(arr.dictionary)
+    _store_field!(a, Val(:release), Ptr{Cvoid}(C_NULL))
+    Base.unsafe_modify!(Ptr{Int64}(arr.private_data), -, 1, :sequentially_consistent)
     return nothing
 end
 
-function _release_array_children!(topology)
-    children, dictionary = topology
-    # Read the child's release pointer under the registry lock, then call it
-    # unlocked: a moved child's callback belongs to the consumer and must not
-    # run while we hold the lock.
-    for child in children
-        release = lock(REGISTRY_LOCK) do
-            unsafe_load(child).release
-        end
-        if release != C_NULL
-            ccall(release, Cvoid, (Ptr{CArrowArray},), child)
-            lock(REGISTRY_LOCK) do
-                unsafe_load(child).release == C_NULL ||
-                    error("C Data child array release did not complete")
-            end
-        end
+function _release_schema(s::Ptr{CArrowSchema})::Cvoid
+    sch = unsafe_load(s)
+    sch.release == C_NULL && return nothing
+    for i = 1:sch.n_children
+        _release_c!(unsafe_load(sch.children, i))
     end
-    if dictionary != C_NULL
-        release = lock(REGISTRY_LOCK) do
-            unsafe_load(dictionary).release
-        end
-        if release != C_NULL
-            ccall(release, Cvoid, (Ptr{CArrowArray},), dictionary)
-            lock(REGISTRY_LOCK) do
-                unsafe_load(dictionary).release == C_NULL ||
-                    error("C Data dictionary array release did not complete")
-            end
-        end
-    end
+    sch.dictionary == C_NULL || _release_c!(sch.dictionary)
+    _store_field!(s, Val(:release), Ptr{Cvoid}(C_NULL))
+    Base.unsafe_modify!(Ptr{Int64}(sch.private_data), -, 1, :sequentially_consistent)
     return nothing
 end
 
-function _release_schema_children!(topology)
-    children, dictionary = topology
-    # Read the child's release pointer under the registry lock, then call it
-    # unlocked: a moved child's callback belongs to the consumer and must not
-    # run while we hold the lock.
-    for child in children
-        release = lock(REGISTRY_LOCK) do
-            unsafe_load(child).release
-        end
-        if release != C_NULL
-            ccall(release, Cvoid, (Ptr{CArrowSchema},), child)
-            lock(REGISTRY_LOCK) do
-                unsafe_load(child).release == C_NULL ||
-                    error("C Data child schema release did not complete")
-            end
-        end
-    end
-    if dictionary != C_NULL
-        release = lock(REGISTRY_LOCK) do
-            unsafe_load(dictionary).release
-        end
-        if release != C_NULL
-            ccall(release, Cvoid, (Ptr{CArrowSchema},), dictionary)
-            lock(REGISTRY_LOCK) do
-                unsafe_load(dictionary).release == C_NULL ||
-                    error("C Data dictionary schema release did not complete")
-            end
-        end
-    end
-    return nothing
-end
-
-function _release_array(a::Ptr{CArrowArray})
-    committed_slot = Ref(false)
-    claimed_slot = Ref{
-        Union{Nothing,Tuple{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}},
-    }(
-        nothing,
-    )
-    try
-        claimed = _claim_array_node(a, claimed_slot)
-        claimed === nothing && return nothing
-        control, topology = claimed
-        _release_array_children!(topology)
-        _finish_node!(a, control, claimed_slot, committed_slot)
-    catch
-        # A C release callback has no error channel, and a Julia exception
-        # must not unwind through the C ABI. Completed descendants are
-        # already NULL. Restore this node to LIVE so a later explicit call
-        # can resume without double release.
-        if !committed_slot[]
-            claimed = claimed_slot[]
-            claimed === nothing || _reset_node_claim!(claimed[1])
-        end
-    end
-    return nothing
-end
-
-function _release_schema(s::Ptr{CArrowSchema})
-    committed_slot = Ref(false)
-    claimed_slot = Ref{
-        Union{Nothing,Tuple{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}},
-    }(
-        nothing,
-    )
-    try
-        claimed = _claim_schema_node(s, claimed_slot)
-        claimed === nothing && return nothing
-        control, topology = claimed
-        _release_schema_children!(topology)
-        _finish_node!(s, control, claimed_slot, committed_slot)
-    catch
-        if !committed_slot[]
-            claimed = claimed_slot[]
-            claimed === nothing || _reset_node_claim!(claimed[1])
-        end
-    end
-    return nothing
-end
-
-# Store one field of a C struct in place (structs are immutable in Julia;
-# the C memory is not).
-@generated function _store_field!(p::Ptr{T}, ::Val{name}, v) where {T,name}
-    i = findfirst(==(name), fieldnames(T))
-    off = fieldoffset(T, i)
-    FT = fieldtype(T, i)
-    return :(unsafe_store!(Ptr{$FT}(Ptr{Cvoid}(p) + $off), convert($FT, v)); nothing)
-end
-_store_field!(p, name::Symbol, v) = _store_field!(p, Val(name), v)
-
-function _malloc!(
-    root::ExportedRoot,
-    n::Integer,
-    (register!)=push!,
-    (deallocate!)=Libc.free,
-)
-    n >= 0 || throw(ArgumentError("negative export allocation size"))
-    n64 = Int64(n)
-    # Reserve the ledger slot before acquiring native memory. After malloc,
-    # either registration owns the pointer or the local catch deallocates it.
-    sizehint!(root.mallocs, AC.checked_add(length(root.mallocs), 1))
-    oldlen = length(root.mallocs)
-    p = Ptr{Cvoid}(C_NULL)
-    owned = false
-    try
-        p = Libc.malloc(max(n64, Int64(1)))
-        p == C_NULL && throw(OutOfMemoryError())
-        owned = true
-        register!(root.mallocs, p)
-        owned = false
-    catch
-        if owned
-            if length(root.mallocs) == oldlen
-                deallocate!(p)
-                owned = false
-            elseif length(root.mallocs) == oldlen + 1 && root.mallocs[end] == p
-                owned = false
-            else
-                error("export malloc registration left an invalid ledger state")
-            end
-        end
-        rethrow()
-    end
-    return Ptr{Cvoid}(p)
-end
-
-"""
-Encode field metadata per the C data interface: int32 pair count, then
-per pair an int32 key length, key bytes, int32 value length, value bytes
-(native endian, not NUL-terminated). NULL when there is no metadata.
-"""
+# Field metadata per the C data interface: int32 pair count, then per pair an
+# int32 key length, key bytes, int32 value length, value bytes (native
+# endian, not NUL-terminated). NULL when there is no metadata.
 function _cmetadata!(
-    root::ExportedRoot,
+    e::Export,
     metadata::Union{Nothing,AC.FrozenVector{Pair{String,String}}},
 )::Ptr{UInt8}
-    metadata === nothing && return Ptr{UInt8}(C_NULL)
-    n = length(metadata)
-    n == 0 && return Ptr{UInt8}(C_NULL)
+    (metadata === nothing || isempty(metadata)) && return Ptr{UInt8}(C_NULL)
     buf = UInt8[]
-    append!(buf, reinterpret(UInt8, Int32[Int32(n)]))
+    append!(buf, reinterpret(UInt8, Int32[Int32(length(metadata))]))
     for kv in metadata
         k = first(kv)
         v = last(kv)
@@ -624,30 +472,20 @@ function _cmetadata!(
         append!(buf, reinterpret(UInt8, Int32[Int32(sizeof(v))]))
         append!(buf, codeunits(v))
     end
-    p = Ptr{UInt8}(_malloc!(root, length(buf)))
+    p = Ptr{UInt8}(_malloc!(e, length(buf)))
     GC.@preserve buf unsafe_copyto!(p, pointer(buf), length(buf))
     return p
 end
 
-function _cstring!(root::ExportedRoot, s::AbstractString)
+function _cstring!(e::Export, s::String)
     isvalid(s) || throw(ValidationError("C Data strings must be valid UTF-8"))
     occursin('\0', s) &&
         throw(ValidationError("C Data strings cannot contain embedded NUL characters"))
     n = ncodeunits(s)
-    p = Ptr{UInt8}(_malloc!(root, AC.checked_add(Int64(n), Int64(1))))
-    for (i, b) in enumerate(codeunits(s))
-        unsafe_store!(p, b, i)
-    end
+    p = Ptr{UInt8}(_malloc!(e, n + 1))
+    GC.@preserve s unsafe_copyto!(p, pointer(s), n)
     unsafe_store!(p, 0x00, n + 1)
     return p
-end
-
-function _newcontrol!(root::ExportedRoot)
-    control = _malloc!(root, CONTROL_BLOCK_BYTES)
-    unsafe_store!(Ptr{UInt8}(control), 0x00)
-    unsafe_store!(Ptr{Int64}(control + 8), root.key)
-    root.remaining = AC.checked_add(root.remaining, Int64(1))
-    return control
 end
 
 # A dictionary Field's extension pairs name its VALUE type, as in IPC. For a
@@ -673,63 +511,66 @@ function _splitdictmetadata(metadata::Union{Nothing,AC.FrozenVector{Pair{String,
     AC.FrozenVector{Pair{String,String}}(values)
 end
 
+# Export the schema tree of `f` into `at`, a consumer-owned struct, or into a
+# malloc'd one. The node is stored last, after its children, so a failed
+# export leaves `at` untouched.
 function _export_schema!(
-    root::ExportedRoot,
+    e::Export,
     f::Field,
-    release::Ptr{Cvoid},
+    release::Ptr{Cvoid};
+    at::Ptr{CArrowSchema}=Ptr{CArrowSchema}(C_NULL),
     metadata::Union{Nothing,AC.FrozenVector{Pair{String,String}}}=f.metadata,
 )::Ptr{CArrowSchema}
-    p = Ptr{CArrowSchema}(_malloc!(root, sizeof(CArrowSchema)))
+    p = at == C_NULL ? Ptr{CArrowSchema}(_malloc!(e, sizeof(CArrowSchema))) : at
     childfields = f.type isa DictionaryType ? Field[] : f.children
-    nchildren = length(childfields)
-    canonical_children = Ptr{CArrowSchema}[]
     childptrs = Ptr{Ptr{CArrowSchema}}(C_NULL)
-    if nchildren > 0
-        childptrs = Ptr{Ptr{CArrowSchema}}(
-            _malloc!(root, AC.checked_mul(Int64(nchildren), Int64(sizeof(Ptr)))),
-        )
+    if !isempty(childfields)
+        childptrs = Ptr{Ptr{CArrowSchema}}(_malloc!(e, length(childfields) * sizeof(Ptr)))
         for (i, cf) in enumerate(childfields)
-            child = _export_schema!(root, cf, release)
-            push!(canonical_children, child)
-            unsafe_store!(childptrs, child, i)
+            unsafe_store!(childptrs, _export_schema!(e, cf, release), i)
         end
     end
     dict = Ptr{CArrowSchema}(C_NULL)
     wrappermetadata = metadata
     if f.type isa DictionaryType
         wrappermetadata, valuemetadata = _splitdictmetadata(metadata)
-        dict = _export_schema!(root, AC.dictvaluefield(f, f.type), release, valuemetadata)
+        dict = _export_schema!(
+            e,
+            AC.dictvaluefield(f, f.type),
+            release;
+            metadata=valuemetadata,
+        )
     end
     flags = f.nullable ? ARROW_FLAG_NULLABLE : Int64(0)
     f.type isa DictionaryType && f.type.ordered && (flags |= ARROW_FLAG_DICTIONARY_ORDERED)
     f.type isa MapType && f.type.keyssorted && (flags |= ARROW_FLAG_MAP_KEYS_SORTED)
-    control = _newcontrol!(root)
+    unsafe_store!(e.live, unsafe_load(e.live) + 1)
     unsafe_store!(
         p,
         CArrowSchema(
-            _cstring!(root, formatstring_of(f.type)),
-            _cstring!(root, f.name),
+            _cstring!(e, formatstring_of(f.type)),
+            _cstring!(e, f.name),
             # Field metadata rides the OUTER node for every field, dictionary
             # wrappers included; PyArrow imports only the wrapper's pairs.
-            _cmetadata!(root, wrappermetadata),
+            _cmetadata!(e, wrappermetadata),
             flags,
-            nchildren,
+            length(childfields),
             childptrs,
             dict,
             release,
-            control,
+            Ptr{Cvoid}(e.live),
         ),
     )
-    root.schema_topology[control] = (canonical_children, dict)
     return p
 end
 
 function _export_array!(
-    root::ExportedRoot,
+    e::Export,
     d::ArrayData,
-    release::Ptr{Cvoid},
+    release::Ptr{Cvoid};
+    at::Ptr{CArrowArray}=Ptr{CArrowArray}(C_NULL),
 )::Ptr{CArrowArray}
-    p = Ptr{CArrowArray}(_malloc!(root, sizeof(CArrowArray)))
+    p = at == C_NULL ? Ptr{CArrowArray}(_malloc!(e, sizeof(CArrowArray))) : at
     spec = AC.layoutspec_of(d.type)
     ncore = length(d.buffers)
     # C Data appends one int64 buffer of variadic data-buffer LENGTHS to view
@@ -737,28 +578,16 @@ function _export_array!(
     # toward n_buffers here and nowhere else in the format.
     nvariadic = spec.variadic ? ncore - length(spec.buffers) : 0
     nbuf = spec.variadic ? ncore + 1 : ncore
-    bufptrs = Ptr{Ptr{Cvoid}}(
-        _malloc!(root, AC.checked_mul(Int64(max(nbuf, 1)), Int64(sizeof(Ptr)))),
-    )
+    bufptrs = Ptr{Ptr{Cvoid}}(_malloc!(e, max(nbuf, 1) * sizeof(Ptr)))
     for (i, b) in enumerate(d.buffers)
-        # Pin before `sliceptr` checks revocation: a racing `release!` then
-        # either revokes first (the export fails) or defers to this export.
-        _pin_foreign!(root, b)
         role = i <= length(spec.buffers) ? spec.buffers[i] : AC.DATA
         bufferp =
             if role == AC.OFFSETS && d.len == 0 && d.offset == 0 && AC.isempty_buffer(b)
-                # Core's canonical empty representation omits this otherwise
-                # unused allocation. C Data still exposes the Columnar
-                # length+1 offsets buffer, so root one terminal zero in the
-                # export aggregate without changing the Core array.
-                zerop = Ptr{UInt8}(_malloc!(root, spec.offsetwidth))
-                for j = 1:spec.offsetwidth
-                    unsafe_store!(zerop, UInt8(0), j)
-                end
-                Ptr{Cvoid}(zerop)
+                # Core omits the offsets of an empty array; C Data still
+                # expects the length+1 offsets, so export one zero.
+                Libc.memset(_malloc!(e, spec.offsetwidth), 0, spec.offsetwidth)
             elseif AC.isempty_buffer(b)
-                # An absent validity bitmap, or any actual zero-byte buffer, is
-                # represented by a NULL pointer.
+                # An absent validity bitmap, or any zero-byte buffer, is NULL.
                 Ptr{Cvoid}(C_NULL)
             else
                 Ptr{Cvoid}(AC.sliceptr(b))
@@ -766,30 +595,23 @@ function _export_array!(
         unsafe_store!(bufptrs, bufferp, i)
     end
     if spec.variadic
-        sizesp =
-            Ptr{Int64}(_malloc!(root, AC.checked_mul(Int64(max(nvariadic, 1)), Int64(8))))
+        sizesp = Ptr{Int64}(_malloc!(e, max(nvariadic, 1) * 8))
         for k = 1:nvariadic
             unsafe_store!(sizesp, d.buffers[length(spec.buffers) + k].len, k)
         end
         unsafe_store!(bufptrs, Ptr{Cvoid}(sizesp), nbuf)
     end
-    nchildren = length(d.children)
-    canonical_children = Ptr{CArrowArray}[]
     childptrs = Ptr{Ptr{CArrowArray}}(C_NULL)
-    if nchildren > 0
-        childptrs = Ptr{Ptr{CArrowArray}}(
-            _malloc!(root, AC.checked_mul(Int64(nchildren), Int64(sizeof(Ptr)))),
-        )
+    if !isempty(d.children)
+        childptrs = Ptr{Ptr{CArrowArray}}(_malloc!(e, length(d.children) * sizeof(Ptr)))
         for (i, c) in enumerate(d.children)
-            child = _export_array!(root, c, release)
-            push!(canonical_children, child)
-            unsafe_store!(childptrs, child, i)
+            unsafe_store!(childptrs, _export_array!(e, c, release), i)
         end
     end
     dict =
         d.dictionary === nothing ? Ptr{CArrowArray}(C_NULL) :
-        _export_array!(root, d.dictionary, release)
-    control = _newcontrol!(root)
+        _export_array!(e, d.dictionary, release)
+    unsafe_store!(e.live, unsafe_load(e.live) + 1)
     unsafe_store!(
         p,
         CArrowArray(
@@ -797,208 +619,37 @@ function _export_array!(
             nullcount(d),
             d.offset,
             nbuf,
-            nchildren,
+            length(d.children),
             bufptrs,
             childptrs,
             dict,
             release,
-            control,
+            Ptr{Cvoid}(e.live),
         ),
     )
-    root.array_topology[control] = (canonical_children, dict)
     return p
 end
 
-function _build_c_data!(sp, skey, ap, akey, f::Field, d::ArrayData, arel, srel)
-    _newroot(Any[f]; result_slot=sp, key_slot=skey) do root
-        _export_schema!(root, f, srel)
-    end
-    _newroot(Any[d]; result_slot=ap, key_slot=akey) do root
-        _export_array!(root, d, arel)
-    end
-    return nothing
-end
-
-# The schema and the array have separate per-node control blocks and Julia-side
-# roots, since their C lifetimes are independent: releasing either marks only
-# that tree released, and moved descendants defer the aggregate cleanup. The
-# array root keeps the source ArrayData reachable until it is reaped, which is
-# what keeps the exported buffer pointers valid.
 """
     Arrow.to_c_data(field, data) -> (Ptr{CArrowSchema}, Ptr{CArrowArray})
 
-Export one column through the C data interface: an `ArrowSchema` and an `ArrowArray`
-that Arrow.jl allocates, pointing at `data`'s buffers without copying them. A consumer
-imports the two structs and calls their `release` callbacks when it is done; `data` stays
-reachable until then, and [`Arrow.reap!`](@ref) frees the structs afterwards. The column
-is validated before it is exported.
+The low-level form of [`Arrow.to_c_data`](@ref): export one column, an
+`Arrow.Field` and its `Arrow.ArrayData`, as an `ArrowSchema` and an `ArrowArray`
+that Arrow.jl allocates, pointing at `data`'s buffers without copying them. The
+column is validated before it is exported. The consumer moves or releases the
+two structs; `data` stays reachable until it has released the array, and what
+Arrow.jl allocated is freed at the next export or garbage collection.
 """
 function to_c_data(f::Field, d::ArrayData)
-    # Reject mismatched schema/data and malformed buffers before publishing
-    # either independently-owned C root (semantic composes structural).
     validate_semantic(f, d)
-    arel = @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},))
-    srel = @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
-    sp = Ref{Ptr{CArrowSchema}}(C_NULL)
-    skey = Ref{Int64}(0)
-    ap = Ref{Ptr{CArrowArray}}(C_NULL)
-    akey = Ref{Int64}(0)
+    e = _newexport(Any[f, d])
     try
-        # The exact public method owns both output slots until its tuple return.
-        # A helper cannot lose a published pointer at its own return boundary:
-        # _newroot records each result in the caller's slot when it publishes.
-        _build_c_data!(sp, skey, ap, akey, f, d, arel, srel)
-        return sp[], ap[]
+        sp = _export_schema!(e, f, @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},)))
+        ap = _export_array!(e, d, @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},)))
+        _register!(e)
+        return sp, ap
     catch
-        # Schema and array are separate C lifetimes, but export is one API
-        # transaction. Neither has escaped on this path, so discard both.
-        _cleanup_export_slots!(sp, skey, ap, akey)
-        rethrow()
-    end
-end
-
-function _free_export!(root::ExportedRoot)
-    # After a root is claimed, cleanup drops Julia references, frees tracked
-    # mallocs, and returns its pins, which can run a deferred producer
-    # release. Nothing here is retried.
-    empty!(root.schema_topology)
-    empty!(root.array_topology)
-    while !isempty(root.mallocs)
-        Libc.free(pop!(root.mallocs))
-    end
-    empty!(root.roots)
-    _unpin_foreign!(root)
-    return nothing
-end
-
-# An exported buffer of a C Data import lends the producer's memory: pin its
-# owner so `release!` defers the producer release until this export is reaped.
-function _pin_foreign!(root::ExportedRoot, b::BufferSlice)
-    region = b.region
-    region === nothing && return nothing
-    o = region.root
-    (o isa ForeignOwner && !any(x -> x === o, root.pinned)) || return nothing
-    _lend!(o, 2)
-    push!(root.pinned, o)
-    return nothing
-end
-
-# Return this export's pins; the last one runs a producer release that
-# `release!` deferred while the memory was lent out.
-function _unpin_foreign!(root::ExportedRoot)
-    err = nothing
-    while !isempty(root.pinned)
-        o = pop!(root.pinned)::ForeignOwner
-        _lend!(o, -2) == 1 || continue
-        try
-            _release_foreign_owner!(o, Libc.free)
-        catch e
-            err === nothing && (err = e)
-        end
-    end
-    err === nothing || throw(err)
-    return nothing
-end
-
-function _cleanup_registered_root!(key::Int64; require_released=true)
-    # Claim by removal: popping the root under the registry lock makes this
-    # cleanup naturally exclusive against concurrent reapers, and the frees
-    # below cannot throw, so a claimed root never needs re-publishing.
-    # `require_released=false` is only legal on paths where no C node has
-    # escaped to a consumer (build failures); a released consumer callback
-    # finds its root through this registry, so popping early would strand it.
-    root = lock(REGISTRY_LOCK) do
-        candidate = get(EXPORT_REGISTRY, key, nothing)
-        candidate === nothing && return nothing
-        require_released && candidate.remaining != 0 && return nothing
-        pop!(EXPORT_REGISTRY, key)
-        return candidate
-    end
-    root === nothing && return false
-    _free_export!(root)
-    return true
-end
-
-"""
-    Arrow.reap!() -> Int
-
-Free what Arrow.jl keeps for each export whose consumer has released it, and return how
-many exports were freed. Nothing does this in the background: call it after consumers
-release what [`Arrow.to_c_data`](@ref) and [`Arrow.export_stream!`](@ref) exported.
-"""
-function reap!()
-    keys = lock(REGISTRY_LOCK) do
-        Int64[k for (k, root) in EXPORT_REGISTRY if root.remaining == 0]
-    end
-    reaped = 0
-    for key in keys
-        reaped += _cleanup_registered_root!(key)
-    end
-    return reaped
-end
-
-function _cleanup_private_root!(root::ExportedRoot, key::Int64)
-    registered = lock(REGISTRY_LOCK) do
-        get(EXPORT_REGISTRY, key, nothing) === root
-    end
-    if registered
-        _cleanup_registered_root!(key; require_released=false)
-    else
-        _free_export!(root)
-    end
-    return nothing
-end
-
-function _cleanup_export_slots!(sp, skey, ap, akey)
-    # Clear raw pointer slots before any free. Stable registry keys remain
-    # valid cleanup tokens until their corresponding root is gone.
-    sp[] = C_NULL
-    ap[] = C_NULL
-    if akey[] != 0
-        _cleanup_registered_root!(akey[]; require_released=false)
-        akey[] = 0
-    end
-    if skey[] != 0
-        _cleanup_registered_root!(skey[]; require_released=false)
-        skey[] = 0
-    end
-    return nothing
-end
-
-function _newroot(build, roots::Vector{Any}; result_slot=nothing, key_slot=nothing)
-    # key and root are single-assignment BEFORE the try: reassignment of a
-    # closure-captured local boxes it, which the trim verifier rejects.
-    # Nothing before the try owns native memory, so there is nothing to
-    # clean on those paths.
-    key = lock(REGISTRY_LOCK) do
-        NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
-    end
-    root = ExportedRoot(
-        roots,
-        Ptr{Cvoid}[],
-        key,
-        0,
-        Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowSchema}},Ptr{CArrowSchema}}}(),
-        Dict{Ptr{Cvoid},Tuple{Vector{Ptr{CArrowArray}},Ptr{CArrowArray}}}(),
-        Any[],
-    )::ExportedRoot
-    try
-        # The pointer cannot escape before `build` returns. Keep the root
-        # private until then: publishing it with `remaining == 0` would let a
-        # concurrent reaper free partial mallocs underneath the builder,
-        # before its first node control increments `remaining`.
-        result = build(root)
-        lock(REGISTRY_LOCK) do
-            EXPORT_REGISTRY[key] = root
-            key_slot === nothing || (key_slot[] = key)
-            result_slot === nothing || (result_slot[] = result)
-        end
-        return result
-    catch
-        # Export-failure cleanup: unregister (if published) and free.
-        result_slot === nothing || (result_slot[] = C_NULL)
-        key_slot === nothing || (key_slot[] = 0)
-        _cleanup_private_root!(root, key)
+        _free!(e)
         rethrow()
     end
 end
@@ -1007,170 +658,56 @@ end
 # Import: C structs -> Core, one ForeignOwner per moved tree
 # ---------------------------------------------------------------------------
 
-# ReleaseCell action: the producer release, run once the cell has revoked
-# every region over the import.
-function _release_owner_action(p::Ptr{Cvoid})::Cvoid
-    slot = unsafe_pointer_to_objref(p)::Base.RefValue{Any}
-    x = slot[]
-    x === nothing && return nothing
-    o = x::ForeignOwner
-    # While C Data exports lend this memory out, mark the release deferred:
-    # the export whose reap returns the last pin runs it.
-    while true
-        lent = @atomic o.lent
-        lent < 2 && break
-        _, ok = @atomicreplace o.lent lent => (lent | 1)
-        ok && return nothing
-    end
-    _release_foreign_owner!(o, Libc.free)
-    return nothing
-end
-
-# One owner for one MOVED ArrowArray tree. All `BufferSlice`s from the whole
-# tree (children and dictionary) use regions whose `root` is this object, so
-# the tree outlives every slice, and the C release callback runs exactly once,
-# from `release!` or from the GC finalizer, whichever comes first. While a
-# `to_c_data` or `export_stream!` export lends this tree's memory to a
-# consumer, `release!` still revokes Julia access at once, and the reap of the
-# last such export runs the producer release.
-#
-# The malloc'd copy of the moved struct mirrors the C Data convention for its
-# own state: its release field is NULL (inert) until the move commits, and the
-# producer's real callback is stored only then (`_arm_foreign_owner!`). A
-# failure between construction and the move commit therefore frees just our
-# copy and never calls the producer: the source, whose release field is still
-# set, remains the owner.
-"""
-    Arrow.ForeignOwner
-
-Owns the memory of one column imported with [`Arrow.from_c_data`](@ref); the imported
-data's `owner` field holds it. The producer's `release` callback runs once: at
-[`Arrow.release!(owner)`](@ref Arrow.release!(::Arrow.ForeignOwner)), or when the garbage
-collector finds the memory unused.
-"""
+# One owner for one MOVED ArrowArray tree. Every `BufferSlice` of the tree
+# (children and dictionary) has a region whose `root` is this object and whose
+# cell is `cell`, so the tree outlives every slice, `release!` on the owner or
+# on any region revokes all of them, and the producer's release callback runs
+# exactly once: from `release!` or from the GC finalizer, whichever comes first.
 mutable struct ForeignOwner
-    # malloc'd copy: a stable native address for the producer's release callback
-    const arrayblock::Ptr{CArrowArray}
-    const producer_release::Ptr{Cvoid} # the moved struct's real callback
-    @atomic released::Bool             # one swap picks the single releaser
-    # ONE revocation cell for every OwnerRegion built over this import: the
-    # producer's release frees the whole tree at once, so closing any
-    # imported buffer must revoke all of its siblings first (they share this
-    # lifetime). `release!` revokes through the cell, whose action runs the
-    # producer release — exactly-once against the GC-finalizer path.
-    const cell::AC.ReleaseCell
-    # Twice the number of live C Data exports lending this memory out, plus
-    # one once `release!` has deferred the producer release to them.
-    @atomic lent::Int
-    function ForeignOwner(arr::CArrowArray, registerfinalizer)
-        block = Libc.malloc(sizeof(CArrowArray))
-        block == C_NULL && throw(OutOfMemoryError())
-        p = Ptr{CArrowArray}(block)
-        # The cell must exist before the owner does, so its action receives a
-        # `Ref{Any}` slot that is filled in after `new`. `ReleaseCell.arg`
-        # roots the slot, the slot roots the owner, and
-        # `_release_owner_action` recovers the owner from that pointer.
-        slot = Ref{Any}(nothing)
-        cell = AC.ReleaseCell(@cfunction(_release_owner_action, Cvoid, (Ptr{Cvoid},)), slot)
-        o = try
-            unsafe_store!(p, arr)
-            _store_field!(p, Val(:release), Ptr{Cvoid}(C_NULL))  # inert until armed
-            new(p, arr.release, false, cell, 0)
-        catch
-            # The native copy exists before the Julia owner does. If copy
-            # initialization or owner allocation fails, no finalizer can
-            # reclaim that copy for us.
-            Libc.free(block)
-            rethrow()
-        end
-        slot[] = o
-        try
-            registerfinalizer(release!, o)
-        catch
-            # The source still owns the producer resources. The copy is inert,
-            # so constructor cleanup frees only our malloc'd storage. If the
-            # registrar installed a finalizer before throwing, its later call
-            # observes released=true and is inert.
-            release!(o)
-            rethrow()
-        end
-        return o
-    end
-end
-ForeignOwner(arr::CArrowArray) = ForeignOwner(arr, finalizer)
-
-# One compare-and-swap update of an owner's lend state; returns the new state.
-function _lend!(o::ForeignOwner, delta::Int)
-    while true
-        old = @atomic o.lent
-        _, ok = @atomicreplace o.lent old => old + delta
-        ok && return old + delta
-    end
+    # A malloc'd copy of the moved struct: the stable address its callback takes.
+    const block::Ptr{CArrowArray}
+    cell::AC.ReleaseCell
+    ForeignOwner(block::Ptr{CArrowArray}) = new(block)
 end
 
-# The move commit: the source ArrowArray's release has been nulled, so this
-# copy is now the sole owner of the producer's resources. Storing the real
-# callback into the copy arms the release path; nothing between construction
-# and this store can throw.
-function _arm_foreign_owner!(o::ForeignOwner)
-    (@atomic o.released) && error("cannot arm a released foreign owner")
-    GC.@preserve o _store_field!(o.arrayblock, Val(:release), o.producer_release)
+function _release_owner_action(p::Ptr{Cvoid})::Cvoid
+    o = unsafe_pointer_to_objref(p)::ForeignOwner
+    GC.@preserve o try
+        _release_producer!(o.block)
+    finally
+        Libc.free(o.block)
+    end
     return nothing
 end
 
-function _foreign_owner_armed(o::ForeignOwner)
-    GC.@preserve o begin
-        return unsafe_load(o.arrayblock).release != C_NULL
-    end
-end
-
-function _release_moved_owner!(o::ForeignOwner)
-    # A failure may occur after the source move but before arming. Arm first
-    # so this release still runs the producer callback in that seam.
-    _foreign_owner_armed(o) || _arm_foreign_owner!(o)
-    release!(o)
-    return nothing
-end
-
-# Order: revoke every OwnerRegion built over the import through the shared
-# cell; run the producer's release callback (if armed) on the malloc'd struct
-# copy; check that the producer nulled the copy's release field; free the
-# copy. One atomic swap picks the single releaser between an explicit call and
-# the GC finalizer. This is also the only lifetime handle for an empty import
-# that carries no region; `ArrayData.owner` then holds it. A deferred
-# release's conformance failure throws from `reap!`, and a finalizer's is
-# reported as a finalizer error.
-"""
-    Arrow.release!(owner::Arrow.ForeignOwner)
-
-Release an imported column now: later access to its buffers throws an
-`InvalidStateException`, and the producer's `release` callback runs. If the column was
-exported again and that consumer still holds it, the callback runs once the consumer
-releases it and [`Arrow.reap!`](@ref) runs. Later calls do nothing. A producer whose
-callback does not mark the struct released, as the interface requires, makes this throw.
-"""
-function release!(o::ForeignOwner)
-    return release!(o.cell)
-end
+# Release an imported tree now: later access to its buffers throws an
+# `InvalidStateException`, and the producer's release callback runs, once. A
+# producer whose callback does not mark the struct released makes this throw.
+release!(o::ForeignOwner) = release!(o.cell)
 
 # A deep copy of imported data shares its owner, so the producer's release runs
 # once, for the original and every copy.
 Base.deepcopy_internal(o::ForeignOwner, ::IdDict) = o
 
-function _release_foreign_owner!(o::ForeignOwner, deallocate!)
-    @atomicswap(o.released = true) && return nothing
-    GC.@preserve o begin
-        cb = unsafe_load(o.arrayblock).release
-        if cb != C_NULL
-            ccall(cb, Cvoid, (Ptr{CArrowArray},), o.arrayblock)
-            unsafe_load(o.arrayblock).release == C_NULL || (
-                deallocate!(o.arrayblock);
-                error("C Data producer release did not mark the structure released")
-            )
+# Move the array at `ap`: copy its struct, mark the source released, and give
+# the copy an owner whose `release!` or finalizer runs the producer's release.
+function _moveowner(ap::Ptr{CArrowArray})
+    block = Ptr{CArrowArray}(Libc.malloc(sizeof(CArrowArray)))
+    block == C_NULL && throw(OutOfMemoryError())
+    unsafe_store!(block, unsafe_load(ap))
+    _store_field!(ap, Val(:release), Ptr{Cvoid}(C_NULL))
+    try
+        o = ForeignOwner(block)
+        o.cell = AC.ReleaseCell(@cfunction(_release_owner_action, Cvoid, (Ptr{Cvoid},)), o)
+        return finalizer(release!, o)
+    catch
+        try
+            _release_producer!(block)
+        finally
+            Libc.free(block)
         end
-        deallocate!(o.arrayblock)
+        rethrow()
     end
-    return nothing
 end
 
 "Load child `i`'s CArrowArray by value out of a parent's children table."
@@ -1181,54 +718,45 @@ bufferptr(a::CArrowArray, i::Int) = unsafe_load(a.buffers, i)
 """
     Arrow.from_c_data(schemaptr, arrayptr) -> (Arrow.Field, Arrow.ArrayData)
 
-Import one column through the C data interface. The array is moved, as the interface
-requires: Arrow.jl takes over its `release` callback and marks the struct at `arrayptr`
-released. The schema is read and then released. The imported buffers stay valid while
-the returned data is reachable; `Arrow.release!(data.owner)` releases them at once.
+Import one column through the C data interface. The array is moved, as the interface requires: Arrow.jl takes over its
+`release` callback and marks the struct at `arrayptr` released. The schema is read and
+then released. The imported buffers stay valid while the returned data is reachable;
+the producer's release callback runs when it no longer is.
 
 Buffer sizes follow from the declared lengths and offsets, which the producer is
 trusted to get right, as the interface cannot check them; the column is then validated
 as an IPC read is. A failed import releases the array.
 """
-from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}) = _from_c_data(sp, ap)
-
-function _from_c_data(
-    sp::Ptr{CArrowSchema},
-    ap::Ptr{CArrowArray};
-    ownerfactory=ForeignOwner,
-)
+function from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray})
     sp == C_NULL && throw(ArgumentError("ArrowSchema pointer is NULL"))
     ap == C_NULL && throw(ArgumentError("ArrowArray pointer is NULL"))
     sch = unsafe_load(sp)
-    arr = unsafe_load(ap)
-    (sch.release == C_NULL || arr.release == C_NULL) &&
+    (sch.release == C_NULL || unsafe_load(ap).release == C_NULL) &&
         throw(ArgumentError("cannot import a released structure"))
-    owner = nothing
-    try
-        try
-            owner = ownerfactory(arr)::ForeignOwner
-            # MOVE: relinquish source ownership before arming the copied
-            # owner. The source release field is authoritative.
-            _store_field!(ap, Val(:release), Ptr{Cvoid}(C_NULL))
-            _arm_foreign_owner!(owner)
-            _preflight_schema(sch)
-            f = _import_field(sch)
-            _preflight_array(f, arr)
-            d = _import_array(f, arr, owner)
-            validate_semantic(f, d)
-            return f, d
-        finally
-            # The schema lifetime is separate and must end on every path,
-            # including owner-construction failure.
-            _release_c_schema!(sp, sch)
-        end
+    owner = _moveowner(ap)
+    f = try
+        _preflight_schema(sch)
+        _import_field(sch)
     catch
-        # Before the move, the caller's source remains the owner. After the
-        # move, this local copy must release exactly once even when finalizer
-        # registration or later validation failed.
-        owner !== nothing &&
-            unsafe_load(ap).release == C_NULL &&
-            _release_moved_owner!(owner)
+        release!(owner)
+        rethrow()
+    finally
+        _release_producer!(sp)
+    end
+    return f, _importarray(f, owner)
+end
+
+# Import the moved array `owner` holds as a column of `f`; a failed import
+# releases it.
+function _importarray(f::Field, owner::ForeignOwner)
+    try
+        arr = unsafe_load(owner.block)
+        _preflight_array(f, arr)
+        d = _import_array(f, arr, owner)
+        validate_semantic(f, d)
+        return d
+    catch
+        release!(owner)
         rethrow()
     end
 end
@@ -1317,22 +845,6 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
     elseif arr.dictionary != C_NULL
         throw(ValidationError("non-dictionary C array has dictionary values"))
     end
-    return nothing
-end
-
-function _release_c_schema!(sp::Ptr{CArrowSchema}, sch::CArrowSchema)
-    sch.release == C_NULL && return nothing
-    ccall(sch.release, Cvoid, (Ptr{CArrowSchema},), sp)
-    unsafe_load(sp).release == C_NULL ||
-        error("C Data producer release did not mark the structure released")
-    return nothing
-end
-
-function _release_c_array!(ap::Ptr{CArrowArray}, arr::CArrowArray)
-    arr.release == C_NULL && return nothing
-    ccall(arr.release, Cvoid, (Ptr{CArrowArray},), ap)
-    unsafe_load(ap).release == C_NULL ||
-        error("C Data producer release did not mark the structure released")
     return nothing
 end
 
@@ -1590,651 +1102,4 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
         owner,
         arr.null_count,
     )
-end
-
-# ---------------------------------------------------------------------------
-# C stream interface (ArrowArrayStream): batches over the same two mappings
-# ---------------------------------------------------------------------------
-
-# Execution contract: stream callbacks call into Julia, so
-# `get_schema`/`get_next`/`get_last_error`/`release` are legal ONLY from
-# Julia-attached threads, and calls on one stream must not overlap (the C
-# stream spec itself declares the structure not thread-safe). There is no
-# marshaling to a Julia-owned worker for foreign-thread callers.
-
-"""
-    Arrow.CArrowArrayStream
-
-The C stream interface's `ArrowArrayStream` struct, field for field.
-"""
-struct CArrowArrayStream
-    get_schema::Ptr{Cvoid}     # int (*)(ArrowArrayStream*, ArrowSchema* out)
-    get_next::Ptr{Cvoid}       # int (*)(ArrowArrayStream*, ArrowArray* out)
-    get_last_error::Ptr{Cvoid} # const char* (*)(ArrowArrayStream*)
-    release::Ptr{Cvoid}        # void (*)(ArrowArrayStream*)
-    private_data::Ptr{Cvoid}
-end
-
-const EINVAL = Cint(Base.Libc.EINVAL)
-
-mutable struct ExportedStreamState
-    batchfield::Field                 # struct-typed: children are the schema
-    batches::Vector{AC.RecordBatch}
-    nextindex::Int
-    lasterror::Ptr{UInt8}             # malloc'd NUL string; freed on replace/release
-end
-
-const STREAM_REGISTRY = Dict{Int64,ExportedStreamState}()
-
-function _stream_state(sp::Ptr{CArrowArrayStream})
-    stream = unsafe_load(sp)
-    stream.release == C_NULL && return nothing, Ptr{Cvoid}(C_NULL)
-    control = stream.private_data
-    control == C_NULL && return nothing, Ptr{Cvoid}(C_NULL)
-    key = unsafe_load(Ptr{Int64}(control + 8))
-    state = lock(REGISTRY_LOCK) do
-        get(STREAM_REGISTRY, key, nothing)
-    end
-    return state, control
-end
-
-function _set_stream_error!(
-    state::ExportedStreamState,
-    msg::AbstractString,
-    (allocate!)=Libc.malloc,
-    (deallocate!)=Libc.free,
-)
-    # The prior pointer expires at the next stream operation even if building
-    # its replacement fails. Clear it first so malloc failure cannot report a
-    # stale error from an earlier operation.
-    old = state.lasterror
-    state.lasterror = Ptr{UInt8}(C_NULL)
-    try
-        old == C_NULL || deallocate!(old)
-    catch
-        # Error reporting is called from C callbacks and must never throw.
-    end
-    p = Ptr{UInt8}(C_NULL)
-    try
-        clean = replace(msg, '\0' => ' ')
-        bytes = codeunits(clean)
-        n = AC.checked_add(Int64(length(bytes)), Int64(1))
-        p = Ptr{UInt8}(allocate!(n))
-        p == C_NULL && return nothing
-        for (i, b) in enumerate(bytes)
-            unsafe_store!(p, b, i)
-        end
-        unsafe_store!(p, 0x00, length(bytes) + 1)
-        state.lasterror = p
-    catch
-        try
-            p == C_NULL || deallocate!(p)
-        catch
-        end
-    end
-    return nothing
-end
-
-function _set_stream_exception!(state::ExportedStreamState, e)
-    try
-        _set_stream_error!(state, sprint(showerror, e))
-    catch
-        # `_set_stream_error!` is itself best-effort, but keep the callback
-        # boundary closed if exception rendering fails before it is called.
-        _set_stream_error!(state, "stream callback failed")
-    end
-    return nothing
-end
-
-function _publish_stream_result!(build, roots::Vector{Any}, result_slot, out, publish!)
-    key_slot = Ref{Int64}(0)
-    committed = false
-    try
-        _newroot(build, roots; result_slot=result_slot, key_slot=key_slot)
-        publish!(out, unsafe_load(result_slot[]))
-        committed = true
-    catch
-        # The result root became public inside Julia, but no usable C struct
-        # reached the consumer. Remove it immediately. Cleanup is best-effort
-        # here so it cannot replace the operation's original exception or
-        # cross the enclosing C callback boundary.
-        if !committed && key_slot[] != 0
-            try
-                _cleanup_registered_root!(key_slot[]; require_released=false)
-            catch
-            end
-            key_slot[] = 0
-        end
-        rethrow()
-    end
-    return nothing
-end
-
-function _stream_get_schema_impl(
-    sp::Ptr{CArrowArrayStream},
-    out::Ptr{CArrowSchema},
-    publish!,
-)::Cint
-    state = nothing
-    try
-        sp == C_NULL && return EINVAL
-        state, _ = _stream_state(sp)
-        state === nothing && return EINVAL
-        out == C_NULL && throw(ArgumentError("ArrowSchema output pointer is NULL"))
-        srel = @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
-        shell = Ref{Ptr{CArrowSchema}}(C_NULL)
-        _publish_stream_result!(Any[state.batchfield], shell, out, publish!) do root
-            _export_schema!(root, state.batchfield, srel)
-        end
-        return Cint(0)
-    catch e
-        state isa ExportedStreamState && _set_stream_exception!(state, e)
-        return EINVAL
-    end
-end
-
-_stream_get_schema(sp::Ptr{CArrowArrayStream}, out::Ptr{CArrowSchema})::Cint =
-    _stream_get_schema_impl(sp, out, unsafe_store!)
-
-function _stream_get_next_impl(
-    sp::Ptr{CArrowArrayStream},
-    out::Ptr{CArrowArray},
-    publish!,
-)::Cint
-    state = nothing
-    try
-        sp == C_NULL && return EINVAL
-        state, _ = _stream_state(sp)
-        state === nothing && return EINVAL
-        out == C_NULL && throw(ArgumentError("ArrowArray output pointer is NULL"))
-        if state.nextindex > length(state.batches)
-            # End of stream: a released (NULL-release) struct, per spec.
-            publish!(
-                out,
-                CArrowArray(
-                    0,
-                    0,
-                    0,
-                    0,
-                    0,
-                    Ptr{Ptr{Cvoid}}(C_NULL),
-                    Ptr{Ptr{CArrowArray}}(C_NULL),
-                    Ptr{CArrowArray}(C_NULL),
-                    Ptr{Cvoid}(C_NULL),
-                    Ptr{Cvoid}(C_NULL),
-                ),
-            )
-            return Cint(0)
-        end
-        b = state.batches[state.nextindex]
-        d = ArrayData(
-            StructType(),
-            b.nrows,
-            [BufferSlice()];
-            children=collect(ArrayData, b.columns),
-            nullcount=0,
-        )
-        validate_semantic(state.batchfield, d)
-        arel = @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},))
-        shell = Ref{Ptr{CArrowArray}}(C_NULL)
-        _publish_stream_result!(Any[d], shell, out, publish!) do root
-            _export_array!(root, d, arel)
-        end
-        state.nextindex += 1
-        return Cint(0)
-    catch e
-        state isa ExportedStreamState && _set_stream_exception!(state, e)
-        return EINVAL
-    end
-end
-
-_stream_get_next(sp::Ptr{CArrowArrayStream}, out::Ptr{CArrowArray})::Cint =
-    _stream_get_next_impl(sp, out, unsafe_store!)
-
-function _stream_get_last_error(sp::Ptr{CArrowArrayStream})::Ptr{UInt8}
-    try
-        sp == C_NULL && return Ptr{UInt8}(C_NULL)
-        state, _ = _stream_state(sp)
-        state === nothing && return Ptr{UInt8}(C_NULL)
-        return state.lasterror
-    catch
-        return Ptr{UInt8}(C_NULL)
-    end
-end
-
-function _stream_release(sp::Ptr{CArrowArrayStream})::Cvoid
-    # Claim/commit with no error channel, like the node callbacks. Batch and
-    # schema roots already handed to the consumer keep their own lifetimes.
-    try
-        sp == C_NULL && return nothing
-        lock(REGISTRY_LOCK) do
-            stream = unsafe_load(sp)
-            stream.release == C_NULL && return nothing
-            control = stream.private_data
-            control == C_NULL && return nothing
-            key = unsafe_load(Ptr{Int64}(control + 8))
-            state = get(STREAM_REGISTRY, key, nothing)
-            state === nothing && return nothing
-            pop!(STREAM_REGISTRY, key)
-            errorp = state.lasterror
-            state.lasterror = Ptr{UInt8}(C_NULL)
-            errorp == C_NULL || Libc.free(errorp)
-            _store_field!(sp, Val(:release), Ptr{Cvoid}(C_NULL))
-            _store_field!(sp, Val(:private_data), Ptr{Cvoid}(C_NULL))
-            Libc.free(control)
-            return nothing
-        end
-    catch
-        # A void C callback has no error channel. Never unwind into C.
-    end
-    return nothing
-end
-
-# Core's structural schema invariants (endianness, UTF-8 names,
-# valid descriptors) for the whole schema TREE. Stream schemas travel
-# separately from any batch, so both stream directions apply this walk to the
-# schema itself — a zero-batch stream never reaches batch validation.
-function _validate_stream_schema(sch::Schema)
-    AC._validate_schema(sch)
-    for f in sch.fields
-        _validate_stream_field(f)
-    end
-    return nothing
-end
-
-function _validate_stream_field(f::Field)
-    isvalid(f.name) || throw(ValidationError("field name is not valid UTF-8"))
-    AC._validate_descriptor_of(f.type)
-    for c in f.children
-        _validate_stream_field(c)
-    end
-    return nothing
-end
-
-"""
-    Arrow.export_stream!(streamptr::Ptr{CArrowArrayStream}, schema::Arrow.Schema, batches)
-
-Fill the `ArrowArrayStream` the caller allocated at `streamptr` with a stream that yields
-`batches`, a vector of [`Arrow.RecordBatch`](@ref) values with `schema`. Each batch the
-consumer pulls is a struct array of the batch's columns, exported as
-[`Arrow.to_c_data`](@ref) exports a column. The batches stay reachable until the consumer
-releases the stream.
-"""
-export_stream!(
-    sp::Ptr{CArrowArrayStream},
-    sch::Schema,
-    batches::AbstractVector{AC.RecordBatch},
-) = _export_stream!(sp, sch, batches, Libc.malloc, Libc.free, unsafe_store!)
-
-function _export_stream!(
-    sp::Ptr{CArrowArrayStream},
-    sch::Schema,
-    batches::AbstractVector{AC.RecordBatch},
-    allocate!,
-    deallocate!,
-    publish!,
-)
-    sp == C_NULL && throw(ArgumentError("ArrowArrayStream pointer is NULL"))
-    _validate_stream_schema(sch)
-    for b in batches
-        length(b.columns) == length(sch.fields) ||
-            throw(ValidationError("stream batch column count does not match the schema"))
-    end
-    # The stream's struct-typed schema node carries the schema-level
-    # metadata (the C++/pyarrow convention for `schema.metadata`).
-    batchfield = Field(
-        "",
-        StructType();
-        nullable=false,
-        metadata=sch.metadata,
-        children=collect(Field, sch.fields),
-    )
-    state = ExportedStreamState(
-        batchfield,
-        collect(AC.RecordBatch, batches),
-        1,
-        Ptr{UInt8}(C_NULL),
-    )
-    get_schema =
-        @cfunction(_stream_get_schema, Cint, (Ptr{CArrowArrayStream}, Ptr{CArrowSchema}))
-    get_next =
-        @cfunction(_stream_get_next, Cint, (Ptr{CArrowArrayStream}, Ptr{CArrowArray}))
-    get_last_error =
-        @cfunction(_stream_get_last_error, Ptr{UInt8}, (Ptr{CArrowArrayStream},))
-    release = @cfunction(_stream_release, Cvoid, (Ptr{CArrowArrayStream},))
-    control = Ptr{Cvoid}(C_NULL)
-    key = Int64(0)
-    havekey = false
-    try
-        control = Ptr{Cvoid}(allocate!(CONTROL_BLOCK_BYTES))
-        control == C_NULL && throw(OutOfMemoryError())
-        key = lock(REGISTRY_LOCK) do
-            NEXT_KEY[] = AC.checked_add(NEXT_KEY[], Int64(1))
-        end
-        havekey = true
-        # A stream reuses the node control-block layout, but only the key at
-        # offset 8 is ever read; the state byte at offset 0 exists so the two
-        # block kinds stay interchangeable.
-        unsafe_store!(Ptr{UInt8}(control), 0x00)
-        unsafe_store!(Ptr{Int64}(control + 8), key)
-        lock(REGISTRY_LOCK) do
-            STREAM_REGISTRY[key] = state
-        end
-        publish!(
-            sp,
-            CArrowArrayStream(get_schema, get_next, get_last_error, release, control),
-        )
-        return sp
-    catch
-        if havekey
-            lock(REGISTRY_LOCK) do
-                get(STREAM_REGISTRY, key, nothing) === state && pop!(STREAM_REGISTRY, key)
-            end
-        end
-        errorp = state.lasterror
-        state.lasterror = Ptr{UInt8}(C_NULL)
-        errorp == C_NULL || deallocate!(errorp)
-        control == C_NULL || deallocate!(control)
-        rethrow()
-    end
-end
-
-_stream_registry_count() = lock(REGISTRY_LOCK) do
-    length(STREAM_REGISTRY)
-end
-
-# ---- import half ----------------------------------------------------------
-
-"""
-One owner for one MOVED ArrowArrayStream, mirroring ForeignOwner: a malloc'd
-copy of the moved struct gives the producer's callbacks a stable address, one
-atomic flag picks the single releaser between explicit `release!` and the GC
-finalizer, and post-release calls are the spec's own undefined behavior.
-"""
-mutable struct StreamOwner
-    const block::Ptr{CArrowArrayStream}
-    const producer_release::Ptr{Cvoid}
-    @atomic released::Bool
-    function StreamOwner(stream::CArrowArrayStream, registerfinalizer)
-        block = Libc.malloc(sizeof(CArrowArrayStream))
-        block == C_NULL && throw(OutOfMemoryError())
-        p = Ptr{CArrowArrayStream}(block)
-        o = try
-            unsafe_store!(p, stream)
-            _store_field!(p, Val(:release), Ptr{Cvoid}(C_NULL)) # inert until moved
-            new(p, stream.release, false)
-        catch
-            Libc.free(block)
-            rethrow()
-        end
-        try
-            registerfinalizer(release!, o)
-        catch
-            # The source still owns the producer stream. Free only the inert
-            # copy; an already-installed finalizer observes released=true.
-            release!(o)
-            rethrow()
-        end
-        return o
-    end
-end
-StreamOwner(stream::CArrowArrayStream) = StreamOwner(stream, finalizer)
-
-function _stream_owner_armed(o::StreamOwner)
-    GC.@preserve o begin
-        return unsafe_load(o.block).release != C_NULL
-    end
-end
-
-function _arm_stream_owner!(o::StreamOwner)
-    (@atomic o.released) && error("cannot arm a released stream owner")
-    GC.@preserve o _store_field!(o.block, Val(:release), o.producer_release)
-    return nothing
-end
-
-function _release_moved_stream_owner!(o::StreamOwner)
-    _stream_owner_armed(o) || _arm_stream_owner!(o)
-    release!(o)
-    return nothing
-end
-
-Base.deepcopy_internal(o::StreamOwner, ::IdDict) = o
-
-# Run the moved stream's producer release callback on the malloc'd struct
-# copy, check that the producer nulled the copy's release field, and free the
-# copy. Exactly one atomic swap picks the single releaser between explicit
-# calls and the GC finalizer.
-function release!(o::StreamOwner)
-    @atomicswap(o.released = true) && return nothing
-    GC.@preserve o begin
-        cb = unsafe_load(o.block).release
-        if cb != C_NULL
-            ccall(cb, Cvoid, (Ptr{CArrowArrayStream},), o.block)
-            unsafe_load(o.block).release == C_NULL || (
-                Libc.free(o.block);
-                error("C stream producer release did not mark the structure released")
-            )
-        end
-        Libc.free(o.block)
-    end
-    return nothing
-end
-
-"""
-    Arrow.ImportedStream
-
-A stream imported with [`Arrow.from_c_stream`](@ref). `Arrow.nextbatch!(stream)` returns
-its next [`Arrow.RecordBatch`](@ref), or `nothing` at the end, and `Arrow.release!(stream)`
-releases the producer's stream; batches already read stay valid. An error the producer
-reports is a `ValidationError` with the producer's message. Use a stream from one task at
-a time: overlapping calls throw a `ConcurrencyViolationError`.
-"""
-mutable struct ImportedStream <: AC.RecordBatchSource
-    const owner::StreamOwner
-    const batchfield::Field
-    const schema::Schema
-    done::Bool
-    @atomic pulling::Bool
-end
-
-ImportedStream(owner, batchfield, schema, done) =
-    ImportedStream(owner, batchfield, schema, done, false)
-
-AC.schema(s::ImportedStream) = s.schema
-
-function _claimstreamcall!(s::ImportedStream)
-    _, ok = @atomicreplace s.pulling false => true
-    ok || throw(
-        Base.ConcurrencyViolationError(
-            "ImportedStream supports only one active stream call",
-        ),
-    )
-    return nothing
-end
-
-_finishstreamcall!(s::ImportedStream) = (@atomic :release s.pulling = false)
-
-"""
-    Arrow.release!(stream::Arrow.ImportedStream)
-
-Release an imported stream now: the producer's `release` callback runs, and later calls
-do nothing. Batches already read stay valid.
-"""
-function release!(s::ImportedStream)
-    _claimstreamcall!(s)
-    try
-        return release!(s.owner)
-    finally
-        _finishstreamcall!(s)
-    end
-end
-
-function _stream_call_failed(o::StreamOwner, what::AbstractString)
-    msg = "C stream $what failed"
-    GC.@preserve o begin
-        cb = unsafe_load(o.block).get_last_error
-        if cb != C_NULL
-            p = ccall(cb, Ptr{UInt8}, (Ptr{CArrowArrayStream},), o.block)
-            p == C_NULL || (msg *= ": " * _import_cstring(p, "stream error"))
-        end
-    end
-    throw(ValidationError(msg))
-end
-
-"""
-    Arrow.from_c_stream(streamptr::Ptr{CArrowArrayStream}) -> Arrow.ImportedStream
-
-Import a C stream: Arrow.jl takes over the stream, marking the struct at `streamptr`
-released, and reads its schema, whose fields are the batches' columns. Read batches with
-[`Arrow.nextbatch!`](@ref) and release the stream with `Arrow.release!`.
-"""
-function from_c_stream(sp::Ptr{CArrowArrayStream})
-    sp == C_NULL && throw(ArgumentError("ArrowArrayStream pointer is NULL"))
-    stream = unsafe_load(sp)
-    stream.release == C_NULL && throw(ArgumentError("cannot import a released stream"))
-    (
-        stream.get_schema == C_NULL ||
-        stream.get_next == C_NULL ||
-        stream.get_last_error == C_NULL
-    ) && throw(ArgumentError("C stream is missing required callbacks"))
-    owner = StreamOwner(stream)
-    moved = false
-    try
-        _store_field!(sp, Val(:release), Ptr{Cvoid}(C_NULL)) # the move commit
-        moved = true
-        _arm_stream_owner!(owner)
-        out = Ref(
-            CArrowSchema(
-                Ptr{UInt8}(C_NULL),
-                Ptr{UInt8}(C_NULL),
-                Ptr{UInt8}(C_NULL),
-                0,
-                0,
-                Ptr{Ptr{CArrowSchema}}(C_NULL),
-                Ptr{CArrowSchema}(C_NULL),
-                Ptr{Cvoid}(C_NULL),
-                Ptr{Cvoid}(C_NULL),
-            ),
-        )
-        status = GC.@preserve owner out ccall(
-            unsafe_load(owner.block).get_schema,
-            Cint,
-            (Ptr{CArrowArrayStream}, Ptr{CArrowSchema}),
-            owner.block,
-            Base.unsafe_convert(Ptr{CArrowSchema}, out),
-        )
-        status == 0 || _stream_call_failed(owner, "get_schema")
-        sch = out[]
-        batchfield = GC.@preserve out try
-            _preflight_schema(sch)
-            _import_field(sch)
-        finally
-            _release_c_schema!(Base.unsafe_convert(Ptr{CArrowSchema}, out), sch)
-        end
-        batchfield.type isa StructType ||
-            throw(ValidationError("C stream schema must be a struct-typed batch schema"))
-        schema = Schema(collect(Field, batchfield.children); metadata=batchfield.metadata)
-        _validate_stream_schema(schema)
-        return ImportedStream(owner, batchfield, schema, false)
-    catch
-        moved ? _release_moved_stream_owner!(owner) : release!(owner)
-        rethrow()
-    end
-end
-
-AC.nextbatch!(s::ImportedStream) = _nextbatch!(s, ForeignOwner)
-
-function _nextbatch!(s::ImportedStream, ownerfactory)
-    _claimstreamcall!(s)
-    try
-        # Fail closed on a released stream even when it already ended naturally:
-        # release terminates the consumer contract, not just the batch supply.
-        (@atomic s.owner.released) &&
-            throw(ArgumentError("cannot pull from a released stream"))
-        s.done && return nothing
-        out = Ref(
-            CArrowArray(
-                0,
-                0,
-                0,
-                0,
-                0,
-                Ptr{Ptr{Cvoid}}(C_NULL),
-                Ptr{Ptr{CArrowArray}}(C_NULL),
-                Ptr{CArrowArray}(C_NULL),
-                Ptr{Cvoid}(C_NULL),
-                Ptr{Cvoid}(C_NULL),
-            ),
-        )
-        status = GC.@preserve s out ccall(
-            unsafe_load(s.owner.block).get_next,
-            Cint,
-            (Ptr{CArrowArrayStream}, Ptr{CArrowArray}),
-            s.owner.block,
-            Base.unsafe_convert(Ptr{CArrowArray}, out),
-        )
-        status == 0 || _stream_call_failed(s.owner, "get_next")
-        arr = out[]
-        if arr.release == C_NULL
-            s.done = true
-            return nothing
-        end
-        # The producer filled consumer-owned storage. Build an inert destination
-        # owner first. If that construction fails, the live source slot still owns
-        # the result and must release it. Then null the source and arm the copy.
-        batchowner = try
-            ownerfactory(arr)::ForeignOwner
-        catch
-            GC.@preserve out _release_c_array!(
-                Base.unsafe_convert(Ptr{CArrowArray}, out),
-                arr,
-            )
-            rethrow()
-        end
-        moved = false
-        return try
-            GC.@preserve out _store_field!(
-                Base.unsafe_convert(Ptr{CArrowArray}, out),
-                :release,
-                Ptr{Cvoid}(C_NULL),
-            )
-            moved = true
-            _arm_foreign_owner!(batchowner)
-            _preflight_array(s.batchfield, arr)
-            d = _import_array(s.batchfield, arr, batchowner)
-            validate_semantic(s.batchfield, d)
-            _structbatch(s.schema, d)
-        catch
-            moved ? _release_moved_owner!(batchowner) : release!(batchowner)
-            rethrow()
-        end
-    finally
-        _finishstreamcall!(s)
-    end
-end
-
-# A record batch has no row validity, so null struct rows are refused rather
-# than exposing the child values under them (Arrow C++ refuses them too).
-# Row i of a struct array is child row `offset + i`, and children may run past
-# `offset + length`; each column is that visible child window.
-function _structbatch(sch::Schema, d::ArrayData)
-    AC.nullcount(d) == 0 || throw(
-        ValidationError(
-            "C stream batch has null struct rows; a record batch cannot represent them",
-        ),
-    )
-    columns = ArrayData[
-        d.offset == 0 && c.len == d.len ? c :
-        AC._arraydata(
-            c.type,
-            d.len,
-            c.buffers,
-            c.offset + d.offset,
-            c.children,
-            c.dictionary,
-            c.owner,
-            -1,
-        ) for c in d.children
-    ]
-    return AC.RecordBatch(sch, columns, d.len)
 end

@@ -19,15 +19,16 @@ module CDataStressSupport
 import Arrow:
     CArrowArray,
     CArrowSchema,
-    EXPORT_REGISTRY,
+    EXPORTS,
     ForeignOwner,
     REGISTRY_LOCK,
     ReleaseCounter,
-    _arm_foreign_owner!,
+    _moveowner,
+    _reap!,
+    _release_c!,
     _store_field!,
     fromjulia,
     increment!,
-    reap!,
     release!,
     to_c_data
 

@@ -456,8 +456,8 @@ if _CDATA_ORACLE_STANDALONE && length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHI
         PythonCall.GC.gc()
         GC.gc()
         GC.gc()
-        Arrow.reap!()
-        leaked = length(Arrow.EXPORT_REGISTRY) + Arrow._stream_registry_count()
+        Arrow._reap!()
+        leaked = length(Arrow.EXPORTS)
         push!(
             verdicts,
             Verdict(
