@@ -198,7 +198,9 @@ function allocationguard(
     physicaldelta = if S === Bool
         (nullable ? 2 : 1) * cld(slots, 8)
     elseif S === String
-        4 * slots + (nullable ? cld(slots, 8) : 0)
+        # A registered string leaf lowers to a vector of its slots, one
+        # pointer each, before its offsets are built.
+        (registered ? 12 : 4) * slots + (nullable ? cld(slots, 8) : 0)
     else
         sizeof(S) * slots + (nullable ? cld(slots, 8) : 0)
     end
@@ -301,9 +303,8 @@ end
 
 function inactivesparse(listsize::Int)
     field = nullsparsefield(listsize)
-    routed = Any[Arrow._WriterRoutedUnion(2, "text")]
     rebuiltfield, rebuiltdata =
-        Arrow._constructwriterunion(field, routed, Arrow._WriterContext("value"))
+        Arrow._constructpart(field, Any["text"]; context=Arrow._WriterContext("value"))
     AC.validate_full(rebuiltfield, rebuiltdata)
     schema = AC.Schema([rebuiltfield])
     batch = AC.RecordBatch(schema, [rebuiltdata], 1)
@@ -314,10 +315,10 @@ end
 
 function mixedsparse(listsize::Int)
     field = nullsparsefield(listsize)
-    routed = Any[Arrow._WriterRoutedUnion(1, fill(missing, listsize))]
-    append!(routed, (Arrow._WriterRoutedUnion(2, "text") for _ = 1:49))
+    values = Any[fill(missing, listsize)]
+    append!(values, ("text" for _ = 1:49))
     rebuiltfield, rebuiltdata =
-        Arrow._constructwriterunion(field, routed, Arrow._WriterContext("value"))
+        Arrow._constructpart(field, values; context=Arrow._WriterContext("value"))
     AC.validate_full(rebuiltfield, rebuiltdata)
     return nothing
 end

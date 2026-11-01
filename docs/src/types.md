@@ -104,7 +104,9 @@ collected first.
 
 A column whose element type is abstract (`Any`, `Real`, a `NamedTuple` with open field
 types) is written as the types its values have: one type writes as that type, and up to
-8 types as a dense Union of them. A column of `Timestamp`s, `ZonedTimestamp`s, or
+8 types as a dense Union of them. Types that store as the same Arrow type and carry no
+label of their own (two structs whose ArrowTypes.jl mappings both give an `Int32`) write
+as one column of it. A column of `Timestamp`s, `ZonedTimestamp`s, or
 `Decimal`s that mixes units, zones, or precisions is an error, since one Arrow column has
 one of each (`Durations.astimezone` gives a column one zone). A type with no Arrow type,
 such as `BigInt`, an `@enum`, or a `Matrix`, is an error that names the column; map it
@@ -249,6 +251,9 @@ Arrow.Table(take!(io)).id
 ```
 
 The mapping applies at any depth: in lists, structs, maps, unions, and dictionaries.
+An `ArrowType` that is a `Union` with `Missing` as a member is refused, since a stored
+`missing` could not be told from a null value; declare the storage without `Missing` and
+write the column's missing values as such.
 `ArrowTypes.arrowmetadata` adds a string the reader passes to `JuliaType`. Without a
 mapping, a struct with supported field types writes as an Arrow struct and reads back as
 a `NamedTuple`. In a process that has not loaded the mapping, the column reads as its

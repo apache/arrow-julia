@@ -465,6 +465,10 @@ batchkinds(bytes) = [
         @test t.b == ["x", "y", "z", "w"]
         Arrow.append(path, (; a=Int64[5], b=["v"]))
         @test Arrow.Table(path).a == [1, 2, 3, 4, 5]
+        # The one-table write fixed `a` non-nullable; the refusal says so.
+        err = @test_throws ArgumentError Arrow.append(path, (; a=[missing], b=["v"]))
+        @test occursin("not nullable", err.value.msg)
+        @test occursin("Arrow.Writer", err.value.msg)
 
         io = IOBuffer()
         Arrow.write(io, t1; file=false)

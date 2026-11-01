@@ -118,11 +118,8 @@ end
     end
 
     @testset "retained dictionaries keep value descriptors and order" begin
-        datefield, dateparts = Arrow._constructcolumn(
-            Symbol("date-values"),
-            AbstractVector[Date[Date(2024, 1, 1), Date(2024, 1, 2)]],
-        )
-        datedata = only(dateparts)
+        datefield, datedata =
+            Arrow._constructcolumn(Symbol("date-values"), Date[Date(2024, 1, 1), Date(2024, 1, 2)])
         datebytes = _dictbytes(datefield, datedata, Int8[1, 0])
         dateback = Arrow.readstream(_rewrite(datebytes))
         datetype = dateback.schema.fields[1].type::AC.DictionaryType
@@ -291,8 +288,7 @@ end
     @testset "retained composites rebuild recursively" begin
         Row = NamedTuple{(:x, :y),Tuple{Int64,Union{Missing,String}}}
         pool = Row[(x=1, y=missing), (x=2, y=missing)]
-        structfield, structparts = Arrow._constructcolumn(:pool, AbstractVector[pool])
-        structdata = only(structparts)
+        structfield, structdata = Arrow._constructcolumn(:pool, pool)
         structbytes = _dictbytes(structfield, structdata, Int8[1, 0])
         structback = Arrow.readstream(_rewrite(structbytes))
         dictionaryfield = structback.schema.fields[1]
@@ -657,7 +653,7 @@ end
         # Identity-only dedup used to build an O(rows) candidate pool for
         # identity-distinct (mutable) categories such as Vector{Int} rows.
         rows = [isodd(i) ? [1, 2] : [3, 4] for i = 1:50_000]
-        pool = Arrow._dictionarypool(AbstractVector[rows], nothing)
+        pool = Arrow._dictionarypool(rows, nothing)
         @test length(pool) == 2
         @test pool == [[1, 2], [3, 4]]
 
@@ -673,33 +669,26 @@ end
         # by bits (0.0 and -0.0 stay distinct, one NaN payload is one
         # category) and mutable structs compare by reference.
         floatpool =
-            Arrow._dictionarypool(AbstractVector[Float64[0.0, -0.0, NaN, NaN]], nothing)
+            Arrow._dictionarypool(Float64[0.0, -0.0, NaN, NaN], nothing)
         @test length(floatpool) == 3
         a = Ref(1)
         b = Ref(1)
-        refpool = Arrow._dictionarypool(AbstractVector[[a, b, a]], nothing)
+        refpool = Arrow._dictionarypool([a, b, a], nothing)
         @test length(refpool) == 2
     end
 
-    @testset "hidden dictionary slots synthesize through the value field" begin
-        valuefield, _ = AC.fromjulia("d", ["x"])
-        dicttype = AC.DictionaryType(AC.IntType(32, true), valuefield.type, false)
-        nullabledict = AC.Field("d", dicttype; nullable=true)
-        nonnullabledict = AC.Field("d", dicttype; nullable=false)
-        @test Arrow._writercansynthesize(nonnullabledict; inactive=true)
-        # A nullable dictionary in an inactive subtree may null its index.
-        @test Arrow._writerhiddenstorage(nullabledict; inactive=true) === missing
-        # A non-nullable dictionary's index stays valid even in an inactive
-        # subtree, so the placeholder is the VALUE field's placeholder; this
-        # used to throw "cannot synthesize hidden child data for retained
-        # DictionaryType field", contradicting _writercansynthesize.
-        @test Arrow._writerhiddenstorage(nonnullabledict; inactive=true) == ""
-        @test Arrow._writerhiddenstorage(nullabledict; forcevalid=true) == ""
-
-        intvaluefield, _ = AC.fromjulia("d", Int64[1])
-        intdicttype = AC.DictionaryType(AC.IntType(32, true), intvaluefield.type, false)
-        intdict = AC.Field("d", intdicttype; nullable=false)
-        @test Arrow._writerhiddenstorage(intdict; inactive=true) === Int64(0)
+    @testset "hidden dictionary slots point at one pool value" begin
+        for value in (["x"], Int64[1]), nullable in (false, true)
+            valuefield, _ = AC.fromjulia("d", value)
+            dicttype = AC.DictionaryType(AC.IntType(32, true), valuefield.type, false)
+            dict = AC.Field("d", dicttype; nullable)
+            parent = AC.Field("p", AC.StructType(); nullable=true, children=[dict])
+            f, d = Arrow._constructhiddenpart(parent, 2, Arrow._WriterContext("p"))
+            AC.validate_full(f, d)
+            @test all(ismissing, AC.materialize(f, d))
+            # A non-nullable dictionary's valid indices need one pool value.
+            @test only(d.children).dictionary.len == (nullable ? 0 : 1)
+        end
     end
 
     # Arrow 2.x's FlatBuffers builder deduplicates vtables comparing slot

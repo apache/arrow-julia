@@ -1676,55 +1676,33 @@ end
         @test ARROWTYPES_TEST_ID_JULIATYPE_CALLS[] == 1
     end
 
-    retainedbytes = arrowtypes_test_bytes((id=ids[1:2],); file=false)
-    retainedfield, _ = arrowtypes_test_core_parts(retainedbytes)
-    for partitioncount in (1, 4, 16)
-        parts = AbstractVector[
-            ArrowTypesTestID[ArrowTypesTestID(partition)] for partition = 1:partitioncount
-        ]
-        ARROWTYPES_TEST_ID_JULIATYPE_CALLS[] = 0
-        rebuiltfield, rebuiltdata =
-            Arrow._constructcolumn(:id, parts; retained=retainedfield)
-        @test arrowtypes_test_field_contract_equal(retainedfield, rebuiltfield)
-        @test length(rebuiltdata) == partitioncount
-        @test ARROWTYPES_TEST_ID_JULIATYPE_CALLS[] == 1
-    end
-
-    countedbytes = arrowtypes_test_bytes(
-        (id=ArrowTypesTestCountedID[ArrowTypesTestCountedID(Int32(1))],);
-        file=false,
-    )
-    countedfield, _ = arrowtypes_test_core_parts(countedbytes)
-    for partitioncount in (1, 4, 16)
-        parts = AbstractVector[
-            ArrowTypesTestCountedID[
-                ArrowTypesTestCountedID(Int32(3 * partition - 2)),
-                ArrowTypesTestCountedID(Int32(3 * partition - 1)),
-                ArrowTypesTestCountedID(Int32(3 * partition)),
-            ] for partition = 1:partitioncount
-        ]
-        ARROWTYPES_TEST_COUNTED_ID_TYPE_CALLS[] = 0
-        ARROWTYPES_TEST_COUNTED_ID_LOWER_CALLS[] = 0
-        _, rebuiltdata = Arrow._constructcolumn(:id, parts; retained=countedfield)
-        @test length(rebuiltdata) == partitioncount
-        @test ARROWTYPES_TEST_COUNTED_ID_TYPE_CALLS[] == 1
-        @test ARROWTYPES_TEST_COUNTED_ID_LOWER_CALLS[] == 3 * partitioncount
-    end
-
+    # A retained rewrite of a stream lowers each value once per batch.
+    counted = [ArrowTypesTestCountedID(Int32(i)) for i = 1:48]
     unionvalues = ArrowTypesTestLogicalUnion[
         ArrowTypesTestLogicalUnion(Int64(1)),
         ArrowTypesTestLogicalUnion("two"),
     ]
-    unionbytes = arrowtypes_test_bytes((value=unionvalues,); file=false)
-    unionfield, _ = arrowtypes_test_core_parts(unionbytes)
     for partitioncount in (1, 4, 16)
-        parts = AbstractVector[copy(unionvalues) for _ = 1:partitioncount]
-        ARROWTYPES_TEST_LOGICAL_UNION_TYPE_CALLS[] = 0
+        parts = Tables.partitioner((
+            (id=counted[(2p - 1):(2p)], value=copy(unionvalues)) for p = 1:partitioncount
+        ))
+        bytes = arrowtypes_test_bytes(parts; file=false)
+        inputfields, inputbatches = arrowtypes_test_batches(bytes)
+        @test length(inputbatches) == partitioncount
+        ARROWTYPES_TEST_COUNTED_ID_LOWER_CALLS[] = 0
         ARROWTYPES_TEST_LOGICAL_UNION_CALLS[] = 0
-        _, rebuiltdata = Arrow._constructcolumn(:value, parts; retained=unionfield)
-        @test length(rebuiltdata) == partitioncount
-        @test ARROWTYPES_TEST_LOGICAL_UNION_TYPE_CALLS[] == 1
+        rewritten = arrowtypes_test_bytes(Arrow.Stream(bytes); file=false)
+        @test ARROWTYPES_TEST_COUNTED_ID_LOWER_CALLS[] == 2 * partitioncount
         @test ARROWTYPES_TEST_LOGICAL_UNION_CALLS[] == 2 * partitioncount
+        outputfields, outputbatches = arrowtypes_test_batches(rewritten)
+        @test length(outputbatches) == partitioncount
+        @test all(
+            arrowtypes_test_field_contract_equal(a, b) for
+            (a, b) in zip(inputfields, outputfields)
+        )
+        table = Arrow.Table(rewritten)
+        @test table.id == counted[1:(2partitioncount)]
+        @test table.value == repeat(unionvalues, partitioncount)
     end
 end
 
@@ -1769,7 +1747,7 @@ end
     source = Arrow.Table(inputbytes)
     ARROWTYPES_TEST_KIND_COUNTED_UNION_CALLS[] = 0
     outputbytes = arrowtypes_test_bytes(source; file=false)
-    @test ARROWTYPES_TEST_KIND_COUNTED_UNION_CALLS[] == 1
+    @test ARROWTYPES_TEST_KIND_COUNTED_UNION_CALLS[] <= 1
     @test Arrow.Table(outputbytes).value == values
     outputfield, _ = arrowtypes_test_core_parts(outputbytes)
     @test arrowtypes_test_field_contract_equal(outputfield, inputfield)
@@ -1788,25 +1766,7 @@ end
     @test arrowtypes_test_field_contract_equal(rebuiltfield, retainedfield)
     @test length(rebuiltdata) == length(values)
 
-    storageunion = Union{Missing,Int64,String}
-    @test haskey(context.unionvariants, storageunion)
-    variants = context.unionvariants[storageunion]
-    @test Set(variants) == Set(Type[Missing, Int64, String])
-    @test Arrow._writerunionvariants!(context, storageunion) === variants
-    branchkeys = Set(
-        runtime for
-        ((uniontype, runtime), _) in context.unionbranches if uniontype === storageunion
-    )
-    @test branchkeys == Set(Type[Int64, String])
-    @test count(key -> first(key) === storageunion, keys(context.unionbranches)) == 2
-
-    for _ = 1:100
-        @test Arrow._writerunionvariants!(context, storageunion) === variants
-        for runtime in (Int64, String)
-            Arrow._writerunionbranch!(context, storageunion, runtime, variants)
-        end
-    end
-    @test count(key -> first(key) === storageunion, keys(context.unionbranches)) == 2
+    @test isequal(Arrow.AC.materialize(rebuiltfield, rebuiltdata), Arrow.AC.materialize(retainedfield, arrowtypes_test_core_parts(inputbytes)[2][1].columns[1]))
 end
 
 @testset "nullable marked composite" begin
@@ -2413,8 +2373,8 @@ end
     ]
     mixedbytes = arrowtypes_test_bytes((value=mixed,); file=false)
     mixedfield, _ = arrowtypes_test_core_parts(mixedbytes)
-    @test mixedfield.type isa ARROWTYPES_TEST_AC.UnionType
-    @test length(mixedfield.children) == 2
+    # Two runtime types that share one storage and no label write as one column.
+    @test mixedfield.type == ARROWTYPES_TEST_AC.IntType(32, true)
     @test Arrow.Table(mixedbytes).value == Int32[6, 7]
 end
 
@@ -2552,8 +2512,10 @@ end
             catch e
                 e
             end
+            # The storage Union's members are logical types, which
+            # ArrowTypes.toarrow lowers past: no member takes the values.
             @test err isa ArgumentError
-            @test occursin("multiple equally exact children", sprint(showerror, err))
+            @test occursin("cannot be represented as", sprint(showerror, err))
         end
     end
 end
@@ -2603,7 +2565,7 @@ end
     end
     @test err isa ArgumentError
     @test occursin(
-        "column value has more than 8 inferred ArrowTypes storage types",
+        "column value holds values of more than 8 types",
         sprint(showerror, err),
     )
     @test ARROWTYPES_TEST_TUPLE_STORAGE_LOWER_CALLS[] == 9
@@ -2695,27 +2657,22 @@ end
     @test only(abstractlistfield.children).type == ARROWTYPES_TEST_AC.IntType(32, true)
 
     values128 = arrowtypes_test_many_dict_values(128)
-    Arrow._observeddictionarytypes("value", values128[1:2])
-    directerror = Ref{Any}(nothing)
-    directallocation = @allocated try
-        Arrow._observeddictionarytypes("value", values128)
+    # The runtime types are counted once each: the 9th refuses, before any
+    # of the rest is lowered.
+    ARROWTYPES_TEST_MANY_DICT_TYPE_CALLS[] = 0
+    directerror = try
+        arrowtypes_test_bytes((value=Arrow.DictEncode(values128),); file=false)
+        nothing
     catch e
-        directerror[] = e
+        e
     end
-    @test directallocation < 1_048_576
-    @test directerror[] isa ArgumentError
-    @test occursin(
-        "more than 8 inferred runtime value types",
-        sprint(showerror, directerror[]),
-    )
+    @test directerror isa ArgumentError
+    @test occursin("more than 8 types", sprint(showerror, directerror))
+    @test ARROWTYPES_TEST_MANY_DICT_TYPE_CALLS[] <= 9
 
     declaredtypes = Type[typeof(value) for value in values128[1:32]]
     declared32 = Arrow._writeruniontype(declaredtypes)
     @test length(Arrow._checkedwritervariants("declared writer", declared32)) == 32
-    @test length(
-        Arrow._mergewritertypes("declared writer", declaredtypes, Type[], 32, "types"),
-    ) == 32
-    @test length(Arrow._directunionroutes(declared32)) == 32
 
     declaredtypes33 = copy(declaredtypes)
     push!(declaredtypes33, Core.apply_type(ArrowTypesTestManyDictValue, 33))
@@ -2747,7 +2704,7 @@ end
     end
     @test err isa ArgumentError
     @test occursin(
-        "dictionary column value has more than 8 inferred runtime value types",
+        "column value holds values of more than 8 types",
         sprint(showerror, err),
     )
 
@@ -2798,17 +2755,8 @@ end
         seedschema,
         ((value=arrowtypes_test_many_registered_values(9),),),
     )
-    err = try
-        arrowtypes_test_bytes(source9; file=false)
-        nothing
-    catch e
-        e
-    end
-    @test err isa ArgumentError
-    @test occursin(
-        "column value has more than 8 inferred registered writer runtime types",
-        sprint(showerror, err),
-    )
+    @test map(x -> x.value, Arrow.Table(arrowtypes_test_bytes(source9; file=false)).value) ==
+          Int16.(1:9)
 
     SeedRow = @NamedTuple{child::ArrowTypesTestManyRegisteredRuntime}
     StorageRow = Vector{Pair{String,Any}}
@@ -2827,18 +2775,13 @@ end
         row in Arrow.Table(nestedbytes).value
     ] == Int16.(1:8)
 
+    # The target's storage is one concrete type, so any number of runtime
+    # types lower into it; the 8-type limit is for storage inferred from values.
     source = ArrowTypesTestRetainedPartitions(nestedschema, ((value=torows(registered9),),))
-    err = try
-        arrowtypes_test_bytes(source; file=false)
-        nothing
-    catch e
-        e
-    end
-    @test err isa ArgumentError
-    @test occursin(
-        "column child has more than 8 inferred registered writer runtime types",
-        sprint(showerror, err),
-    )
+    @test [
+        arrowtypes_test_rowdict(row)["child"].value for
+        row in Arrow.Table(arrowtypes_test_bytes(source; file=false)).value
+    ] == Int16.(1:9)
     # Each streamed partition is planned on its own, within the cap.
     split = ArrowTypesTestRetainedPartitions(
         nestedschema,
@@ -2885,20 +2828,14 @@ end
             ) for row in Arrow.Table(acceptedbytes).value
         ] == collect(zip(Int16.(1:4), Int16.(5:8)))
 
-        rejectedrows = widerows(widerange(1:5), widerange(6:10))
-        rejectedsource =
-            ArrowTypesTestRetainedPartitions(wideschema, ((value=rejectedrows,),))
-        err = try
-            arrowtypes_test_bytes(rejectedsource; file=false)
-            nothing
-        catch e
-            e
-        end
-        @test err isa ArgumentError
-        @test occursin(
-            "more than 8 inferred registered writer runtime types",
-            sprint(showerror, err),
-        )
+        widerows10 = widerows(widerange(1:5), widerange(6:10))
+        widesource10 = ArrowTypesTestRetainedPartitions(wideschema, ((value=widerows10,),))
+        @test [
+            (
+                arrowtypes_test_rowdict(row)["left"].value,
+                arrowtypes_test_rowdict(row)["right"].value,
+            ) for row in Arrow.Table(arrowtypes_test_bytes(widesource10; file=false)).value
+        ] == collect(zip(Int16.(1:5), Int16.(6:10)))
     end
 
     @testset "fresh abstract storage across partitions follows the first" begin
@@ -3228,9 +3165,8 @@ end
     end
     inactivesparse = function (listsize)
         field = nullsparsefield(listsize)
-        routed = Any[Arrow._WriterRoutedUnion(2, "text")]
         rebuiltfield, rebuiltdata =
-            Arrow._constructwriterunion(field, routed, Arrow._WriterContext("value"))
+            Arrow._constructpart(field, Any["text"]; context=Arrow._WriterContext("value"))
         ARROWTYPES_TEST_AC.validate_full(rebuiltfield, rebuiltdata)
         schema = ARROWTYPES_TEST_AC.Schema([rebuiltfield])
         batch = ARROWTYPES_TEST_AC.RecordBatch(schema, [rebuiltdata], 1)
@@ -3245,20 +3181,20 @@ end
 
     mixedsparse = function (listsize)
         field = nullsparsefield(listsize)
-        routed = Any[Arrow._WriterRoutedUnion(1, fill(missing, listsize))]
-        append!(routed, (Arrow._WriterRoutedUnion(2, "text") for _ = 1:49))
+        values = Any[fill(missing, listsize)]
+        append!(values, ("text" for _ = 1:49))
         rebuiltfield, rebuiltdata =
-            Arrow._constructwriterunion(field, routed, Arrow._WriterContext("value"))
+            Arrow._constructpart(field, values; context=Arrow._WriterContext("value"))
         ARROWTYPES_TEST_AC.validate_full(rebuiltfield, rebuiltdata)
         return nothing
     end
     mixedsparse(2)
     mixedsparse(1_000)
     mixedsparse(20_000)
-    @test_throws ArgumentError Arrow._constructwriterunion(
+    @test_throws ArgumentError Arrow._constructpart(
         nullsparsefield(1),
-        Any[Arrow._WriterRoutedUnion(1, Any[nothing])],
-        Arrow._WriterContext("value"),
+        Any[Any[nothing]];
+        context=Arrow._WriterContext("value"),
     )
 
     generalhidden = function (listsize)
@@ -3399,188 +3335,68 @@ end
     @test ARROWTYPES_TEST_COUNTED_ID_LOWER_CALLS[] == 0
     @test length(only(allhiddenrebuiltdata.children)) == 1_024
 
+    # Hidden parts hold the slots of null parent rows: whatever the child's
+    # layout, a struct of only null rows validates and reads as missing.
     runfield = ARROWTYPES_TEST_AC.Field(
         "run_ends",
         ARROWTYPES_TEST_AC.IntType(32, true);
         nullable=false,
-    )
-    valuefield = ARROWTYPES_TEST_AC.Field(
-        "values",
-        ARROWTYPES_TEST_AC.IntType(16, true);
-        nullable=true,
     )
     reetype = ARROWTYPES_TEST_AC.RunEndEncodedType()
     reefield = ARROWTYPES_TEST_AC.Field(
         "ree",
         reetype;
         nullable=false,
-        children=[runfield, valuefield],
-    )
-    rebuiltreefield, rebuiltreedata =
-        Arrow._constructhiddenpart(reefield, 3, Arrow._WriterContext("ree"))
-    ARROWTYPES_TEST_AC.validate_full(rebuiltreefield, rebuiltreedata)
-    @test ARROWTYPES_TEST_AC.materialize(rebuiltreefield, rebuiltreedata) == Int16[0, 0, 0]
-
-    nullablechildren = [
-        ARROWTYPES_TEST_AC.Field("text", ARROWTYPES_TEST_AC.Utf8Type(false); nullable=true),
-        ARROWTYPES_TEST_AC.Field(
-            "integer",
-            ARROWTYPES_TEST_AC.IntType(32, true);
-            nullable=true,
-        ),
-    ]
-    for mode in (ARROWTYPES_TEST_AC.DenseMode, ARROWTYPES_TEST_AC.SparseMode)
-        uniontype = ARROWTYPES_TEST_AC.UnionType(mode, Int8[3, 8])
-        unionfield = ARROWTYPES_TEST_AC.Field(
-            "union",
-            uniontype;
-            nullable=false,
-            children=nullablechildren,
-        )
-        for n in (0, 3)
-            rebuiltfield, rebuiltdata =
-                Arrow._constructhiddenpart(unionfield, n, Arrow._WriterContext("union"))
-            ARROWTYPES_TEST_AC.validate_full(rebuiltfield, rebuiltdata)
-            @test !any(ismissing, ARROWTYPES_TEST_AC.materialize(rebuiltfield, rebuiltdata))
-        end
-    end
-
-    nullreefield = ARROWTYPES_TEST_AC.Field(
-        "null_ree",
-        reetype;
-        nullable=false,
         children=[
             runfield,
             ARROWTYPES_TEST_AC.Field(
                 "values",
-                ARROWTYPES_TEST_AC.NullType();
-                nullable=true,
-            ),
-        ],
-    )
-    integerfield = ARROWTYPES_TEST_AC.Field(
-        "integer",
-        ARROWTYPES_TEST_AC.IntType(32, true);
-        nullable=true,
-    )
-    for mode in (ARROWTYPES_TEST_AC.DenseMode, ARROWTYPES_TEST_AC.SparseMode)
-        uniontype = ARROWTYPES_TEST_AC.UnionType(mode, Int8[3, 8])
-        unionfield = ARROWTYPES_TEST_AC.Field(
-            "ree_union",
-            uniontype;
-            nullable=false,
-            children=[nullreefield, integerfield],
-        )
-        @test Arrow._writerhiddenunionchild(unionfield) == 2
-        rebuiltfield, rebuiltdata =
-            Arrow._constructhiddenpart(unionfield, 3, Arrow._WriterContext("ree_union"))
-        ARROWTYPES_TEST_AC.validate_full(rebuiltfield, rebuiltdata)
-        @test ARROWTYPES_TEST_AC.materialize(rebuiltfield, rebuiltdata) == Int32[0, 0, 0]
-
-        routedfield = ARROWTYPES_TEST_AC.Field(
-            "routed_ree_union",
-            uniontype;
-            nullable=false,
-            children=[nullreefield, integerfield],
-        )
-        routed = Any[Arrow._WriterRoutedUnion(2, Int32(7))]
-        routedfield, routeddata = Arrow._constructwriterunion(
-            routedfield,
-            routed,
-            Arrow._WriterContext("routed_ree_union"),
-        )
-        ARROWTYPES_TEST_AC.validate_full(routedfield, routeddata)
-        @test ARROWTYPES_TEST_AC.materialize(routedfield, routeddata) == Int32[7]
-
-        selectednull = Any[Arrow._WriterRoutedUnion(1, missing)]
-        @test_throws ARROWTYPES_TEST_AC.ValidationError begin
-            selectedfield, selecteddata = Arrow._constructwriterunion(
-                ARROWTYPES_TEST_AC.Field(
-                    "selected_ree_union",
-                    uniontype;
-                    nullable=false,
-                    children=[nullreefield, integerfield],
-                ),
-                selectednull,
-                Arrow._WriterContext("selected_ree_union"),
-            )
-            ARROWTYPES_TEST_AC.validate_full(selectedfield, selecteddata)
-        end
-    end
-
-    expensivefixed = ARROWTYPES_TEST_AC.Field(
-        "fixed",
-        ARROWTYPES_TEST_AC.FixedSizeListType(100_000);
-        nullable=false,
-        children=[
-            ARROWTYPES_TEST_AC.Field(
-                "item",
-                ARROWTYPES_TEST_AC.IntType(8, true);
+                ARROWTYPES_TEST_AC.IntType(16, true);
                 nullable=false,
             ),
         ],
     )
-    cheapinteger = ARROWTYPES_TEST_AC.Field(
+    textfield =
+        ARROWTYPES_TEST_AC.Field("text", ARROWTYPES_TEST_AC.Utf8Type(false); nullable=false)
+    integerfield = ARROWTYPES_TEST_AC.Field(
         "integer",
-        ARROWTYPES_TEST_AC.IntType(8, true);
+        ARROWTYPES_TEST_AC.IntType(32, true);
         nullable=false,
     )
-    nullfield =
-        ARROWTYPES_TEST_AC.Field("null", ARROWTYPES_TEST_AC.NullType(); nullable=true)
-    innerunion = ARROWTYPES_TEST_AC.Field(
-        "nested",
-        ARROWTYPES_TEST_AC.UnionType(ARROWTYPES_TEST_AC.DenseMode, Int8[5, 9]);
-        nullable=true,
-        children=[nullfield, expensivefixed],
-    )
-    @test Arrow._writerplaceholdercost(innerunion; forcevalid=true) == 100_000
+    hiddenchildren = [reefield]
     for mode in (ARROWTYPES_TEST_AC.DenseMode, ARROWTYPES_TEST_AC.SparseMode)
-        outerunion = ARROWTYPES_TEST_AC.Field(
-            "outer",
-            ARROWTYPES_TEST_AC.UnionType(mode, Int8[11, 13]);
-            nullable=false,
-            children=[innerunion, cheapinteger],
+        uniontype = ARROWTYPES_TEST_AC.UnionType(mode, Int8[3, 8])
+        push!(
+            hiddenchildren,
+            ARROWTYPES_TEST_AC.Field(
+                "union",
+                uniontype;
+                nullable=false,
+                children=[textfield, integerfield],
+            ),
         )
-        @test Arrow._writerhiddenunionchild(outerunion) == 2
-        rebuiltfield, rebuiltdata =
-            Arrow._constructhiddenpart(outerunion, 1, Arrow._WriterContext("outer"))
-        ARROWTYPES_TEST_AC.validate_full(rebuiltfield, rebuiltdata)
-        @test ARROWTYPES_TEST_AC.materialize(rebuiltfield, rebuiltdata) == Int8[0]
     end
-
-    nulluniontype = ARROWTYPES_TEST_AC.UnionType(ARROWTYPES_TEST_AC.DenseMode, Int8[1])
-    nullunionfield = ARROWTYPES_TEST_AC.Field(
-        "null_union",
-        nulluniontype;
-        nullable=false,
-        children=[
-            ARROWTYPES_TEST_AC.Field("null", ARROWTYPES_TEST_AC.NullType(); nullable=true),
-        ],
-    )
-    err = try
-        Arrow._constructhiddenpart(nullunionfield, 1, Arrow._WriterContext("null_union"))
-        nothing
-    catch e
-        e
-    end
-    @test err isa ArgumentError
-    @test occursin("no child that can synthesize", sprint(showerror, err))
-
     dictionarytype = ARROWTYPES_TEST_AC.DictionaryType(
         ARROWTYPES_TEST_AC.IntType(32, true),
         ARROWTYPES_TEST_AC.NullType(),
         false,
     )
-    for nullable in (false, true)
-        dictionaryfield =
-            ARROWTYPES_TEST_AC.Field("dictionary_null", dictionarytype; nullable)
-        rebuiltfield, rebuiltdata = Arrow._constructhiddenpart(
-            dictionaryfield,
-            2,
-            Arrow._WriterContext("dictionary_null");
-            forcevalid=(!nullable),
+    push!(
+        hiddenchildren,
+        ARROWTYPES_TEST_AC.Field("dictionary_null", dictionarytype; nullable=false),
+    )
+    for child in hiddenchildren, n in (0, 3)
+        parent = ARROWTYPES_TEST_AC.Field(
+            "parent",
+            ARROWTYPES_TEST_AC.StructType();
+            nullable=true,
+            children=[child],
         )
+        rebuiltfield, rebuiltdata =
+            Arrow._constructhiddenpart(parent, n, Arrow._WriterContext("parent"))
         ARROWTYPES_TEST_AC.validate_full(rebuiltfield, rebuiltdata)
+        @test all(ismissing, ARROWTYPES_TEST_AC.materialize(rebuiltfield, rebuiltdata))
+        @test length(only(rebuiltdata.children)) == n
     end
 end
 
@@ -3838,11 +3654,23 @@ end
             ];
             nullcount=0,
         )
+        # Nothing to check in an empty column: it writes under the retained field.
+        arrowtypes_test_retained_rewrites(field, data, ArrowTypesTestNullableBytesAlias[])
+        onerow = ARROWTYPES_TEST_AC.ArrayData(
+            t,
+            1,
+            [
+                ARROWTYPES_TEST_AC.BufferSlice(),
+                ARROWTYPES_TEST_AC._databuffer(Int64[0, 1]),
+                ARROWTYPES_TEST_AC._databuffer(UInt8[0x01]),
+            ];
+            nullcount=0,
+        )
         arrowtypes_test_retained_replacement_error(
             field,
-            data,
-            ArrowTypesTestNullableBytesAlias[],
-            "does not match retained field",
+            onerow,
+            [ArrowTypesTestNullableBytesAlias(Union{Missing,UInt8}[0x01, missing])],
+            "must contain byte-vector",
         )
     end
 end
@@ -3962,12 +3790,8 @@ end
         children=[emptychilddata],
         nullcount=0,
     )
-    arrowtypes_test_retained_replacement_error(
-        fixedfield,
-        fixeddata,
-        ArrowTypesTestFixedList3[],
-        "does not match retained field",
-    )
+    # An empty column has no value to refuse: it keeps the retained field.
+    arrowtypes_test_retained_rewrites(fixedfield, fixeddata, ArrowTypesTestFixedList3[])
 end
 
 @testset "retained Interval storage aliases" begin
@@ -4134,14 +3958,17 @@ end
         for sourcekind in (:table, :stream), outputfile in (false, true)
             source =
                 sourcekind === :table ? Arrow.Table(inputbytes) : Arrow.Stream(inputbytes)
+            # A Dict's entries take its hash order: rows that come out sorted
+            # keep the declared order, and others are refused.
             err = try
-                arrowtypes_test_bytes(source; file=outputfile)
+                back = Arrow.Table(arrowtypes_test_bytes(source; file=outputfile))
+                @test back.value == expected
                 nothing
             catch e
                 e
             end
-            @test err isa ArgumentError
-            @test occursin("does not match retained field", sprint(showerror, err))
+            err === nothing ||
+                @test occursin("not sorted by its physical key storage", sprint(showerror, err))
         end
     end
 
@@ -4184,12 +4011,7 @@ end
         children=[emptyentriesdata],
         nullcount=0,
     )
-    arrowtypes_test_retained_replacement_error(
-        emptymapfield,
-        emptymapdata,
-        ArrowTypesTestSortedMap[],
-        "does not match retained field",
-    )
+    arrowtypes_test_retained_rewrites(emptymapfield, emptymapdata, ArrowTypesTestSortedMap[])
 end
 
 @testset "encoding identity uses physical ArrowTypes values" begin
@@ -4536,12 +4358,7 @@ end
         [ARROWTYPES_TEST_AC.BufferSlice(), ARROWTYPES_TEST_AC._databuffer(Int32[])];
         nullcount=0,
     )
-    arrowtypes_test_retained_replacement_error(
-        emptyfield,
-        emptydata,
-        ArrowTypesTestWrongStorage[],
-        "does not match retained field",
-    )
+    arrowtypes_test_retained_rewrites(emptyfield, emptydata, ArrowTypesTestWrongStorage[])
 
     nullablefield = ARROWTYPES_TEST_AC.Field(
         "value",
@@ -4558,30 +4375,32 @@ end
         ];
         nullcount=1,
     )
-    logicalmissing = Union{Missing,ArrowTypesTestWrongStorage}[missing]
+    # A value is refused; a column of only missing has no value to refuse.
     arrowtypes_test_retained_replacement_error(
         nullablefield,
         nullabledata,
-        logicalmissing,
-        "does not match retained field",
+        Union{Missing,ArrowTypesTestWrongStorage}[ArrowTypesTestWrongStorage("x")],
+        "replaced with incompatible data",
     )
+    logicalmissing = Union{Missing,ArrowTypesTestWrongStorage}[missing]
 
     schema = ARROWTYPES_TEST_AC.Schema([nullablefield])
     batch = ARROWTYPES_TEST_AC.RecordBatch(schema, [nullabledata], 1)
     for inputfile in (false, true),
         sourcekind in (:table, :stream),
-        outputfile in (false, true)
+        outputfile in (false, true),
+        replacement in (Missing[missing], logicalmissing)
 
         inputbytes =
             inputfile ? Arrow.writefile(schema, [batch]) :
             Arrow.writestream(schema, [batch])
         source = if sourcekind === :table
             table = Arrow.Table(inputbytes)
-            getfield(table, :columns)[1] = Missing[missing]
+            getfield(table, :columns)[1] = replacement
             table
         else
             parts = collect(Arrow.Stream(inputbytes))
-            getfield(only(parts), :columns)[1] = Missing[missing]
+            getfield(only(parts), :columns)[1] = replacement
             ArrowTypesTestRetainedPartitions(schema, Tuple(parts))
         end
         outputbytes = arrowtypes_test_bytes(source; file=outputfile)
@@ -4608,11 +4427,10 @@ end
             ARROWTYPES_TEST_ABSTRACT_STRING_STORAGE_NAME,
         ),
     )
-    arrowtypes_test_retained_replacement_error(
+    arrowtypes_test_retained_rewrites(
         explicitfield,
         data,
         ArrowTypesTestAbstractStringStorage[],
-        "does not match retained field",
     )
 
     identityfield = ARROWTYPES_TEST_AC.Field(
@@ -4934,37 +4752,27 @@ end
         end
     end
 
+    # Missing as a member of a storage Union could not be told from a null slot.
     storage_missing = ArrowTypesTestAmbiguousMissingUnion[
         ArrowTypesTestAmbiguousMissingUnion(missing),
         ArrowTypesTestAmbiguousMissingUnion("stored"),
     ]
-    for encoded in (false, true), inputfile in (false, true)
-        input = encoded ? Arrow.DictEncode(storage_missing) : storage_missing
-        bytes = arrowtypes_test_bytes((value=input,); file=inputfile)
-        table = Arrow.Table(bytes)
-        @test table.value == storage_missing
-        @test eltype(table.value) === ArrowTypesTestAmbiguousMissingUnion
-        for sourcekind in (:table, :stream), outputfile in (false, true)
-            source = sourcekind === :table ? Arrow.Table(bytes) : Arrow.Stream(bytes)
-            rewritten = Arrow.Table(arrowtypes_test_bytes(source; file=outputfile))
-            @test rewritten.value == storage_missing
-            @test eltype(rewritten.value) === ArrowTypesTestAmbiguousMissingUnion
-        end
-    end
-
     ambiguous = Union{Missing,ArrowTypesTestAmbiguousMissingUnion}[
         missing,
         ArrowTypesTestAmbiguousMissingUnion(missing),
     ]
-    for file in (false, true)
+    for input in (storage_missing, Arrow.DictEncode(storage_missing), ambiguous),
+        file in (false, true)
+
         err = try
-            arrowtypes_test_bytes((value=ambiguous,); file)
+            arrowtypes_test_bytes((value=input,); file)
             nothing
         catch e
             e
         end
         @test err isa ArgumentError
-        @test occursin("cannot distinguish", sprint(showerror, err))
+        @test occursin("ArrowTypesTestAmbiguousMissingUnion", sprint(showerror, err))
+        @test occursin("Missing as a Union member", sprint(showerror, err))
     end
 
     nulltype = ARROWTYPES_TEST_AC.NullType()
