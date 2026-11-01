@@ -1613,7 +1613,8 @@ function cdata_battery()
     println("release! of an imported table refuses access; memory follows the columns ✓")
 
     # `Arrow.Stream(streamptr)` pulls one batch per iteration and is released
-    # like any stream; a released stream stops iterating.
+    # like any stream: releasing it, or a table it yielded, stops iteration and
+    # column access, and columns already taken stay valid.
     sref3 = Ref{CArrowArrayStream}()
     GC.@preserve sref3 begin
         p = Base.unsafe_convert(Ptr{CArrowArrayStream}, sref3)
@@ -1628,7 +1629,8 @@ function cdata_battery()
             e isa ArgumentError
         end
         first_table, state = iterate(cs)
-        @assert collect(first_table.x) == [1, 2]
+        firstx = first_table.x
+        @assert collect(firstx) == [1, 2]
         release!(cs)
         @assert try
             iterate(cs, state)
@@ -1636,15 +1638,40 @@ function cdata_battery()
         catch e
             e isa InvalidStateException
         end
-        @assert collect(first_table.x) == [1, 2]
+        @assert try
+            first_table.x
+            false
+        catch e
+            e isa InvalidStateException
+        end
+        @assert collect(firstx) == [1, 2]
+        export_stream!(p, Tables.partitioner([(x=[1, 2],), (x=[3],)]))
+        cs = Arrow.Stream(p; stringtype=String)
+        first_table, state = iterate(cs)
+        release!(first_table)
+        @assert try
+            iterate(cs, state)
+            false
+        catch e
+            e isa InvalidStateException
+        end
         export_stream!(p, Tables.partitioner([(x=[1, 2],), (x=[3],)]))
         @assert [collect(t.x) for t in Arrow.Stream(p; stringtype=String)] == [[1, 2], [3]]
         @assert try
             Arrow.Stream(p; nosuch=1)
             false
         catch e
-            e isa ArgumentError
+            e isa ArgumentError && occursin("stringtype, ntasks, and limits", e.msg)
         end
+        export_stream!(p, (x=[1, 2],))
+        @assert try
+            Arrow.Table(p; select=[:x])
+            false
+        catch e
+            e isa ArgumentError && occursin("select", e.msg)
+        end
+        @assert sref3[].release != C_NULL               # a refused keyword moves nothing
+        release!(Arrow.Table(p))
     end
     println("Arrow.Stream over a C stream pulls one batch at a time ✓")
 

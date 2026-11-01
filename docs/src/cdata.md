@@ -113,10 +113,11 @@ bytes on Julia 1.10.
 
 An imported table's columns read the producer's memory, and the producer's `release`
 callback runs once the table and its columns are garbage collected, as a mapped file is
-unmapped. [`Arrow.release!`](@ref)`(table)` only refuses further column access.
-`Arrow.release!(stream)` on an [`Arrow.Stream`](@ref) over a C stream releases the
-producer's stream at once; the tables already read stay valid. `deepcopy` of imported
-data shares its memory and its release with the original; use `copy`.
+unmapped. [`Arrow.release!`](@ref)`(table)` only refuses further column access. On an
+[`Arrow.Stream`](@ref) over a C stream, `Arrow.release!` of the stream or of a table it
+yielded releases the producer's stream at once and refuses further column access, as
+for any stream; columns already taken stay valid. `deepcopy` of imported data shares
+its memory and its release with the original; use `copy`.
 
 ## Threads
 

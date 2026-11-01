@@ -29,7 +29,12 @@ function _creadargs(;
     limits::Limits=Limits(),
     unknown...,
 )
-    isempty(unknown) || _unknownkeywords("read", keys(unknown))
+    isempty(unknown) || throw(
+        ArgumentError(
+            "a C data import takes the keywords stringtype, ntasks, and limits, not " *
+            join(keys(unknown), ", "),
+        ),
+    )
     _checkstringtype(stringtype)
     return stringtype, _checkntasks(ntasks), limits
 end
@@ -95,7 +100,8 @@ after the schema. The array is moved, as the interface requires, and the schema 
 and released. The columns have the types an IPC read of the same data has, and they
 read the producer's memory in place: `Arrow.release!(table)` refuses further column
 access, and the producer's `release` callback runs once the table and its columns are
-garbage collected. The keywords are those of `Arrow.Table`.
+garbage collected. `stringtype`, `ntasks`, and `limits` mean what they mean for
+`Arrow.Table`.
 """
 function Table(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}; kw...)
     stringtype, ntasks, limits = _creadargs(; kw...)
@@ -149,9 +155,10 @@ end
 Read a C stream one record batch at a time: each iteration pulls the next batch from the
 producer and gives it as an [`Arrow.Table`](@ref) whose columns read the producer's
 memory in place. The stream is moved, as the interface requires. It is iterated once,
-from one task at a time, and its length is unknown until it is read.
-`Arrow.release!(stream)` releases the producer's stream; the tables already read stay
-valid.
+from one task at a time, and its length is unknown until it is read. As for any
+`Arrow.Stream`, [`Arrow.release!`](@ref) of the stream or of a table it yielded
+releases the producer's stream and refuses further column access; columns already
+taken stay valid.
 """
 function Stream(p::Ptr{CArrowArrayStream}; kw...)
     stringtype, ntasks, limits = _creadargs(; kw...)
@@ -160,7 +167,7 @@ function Stream(p::Ptr{CArrowArrayStream}; kw...)
     closed = AC.ReleaseCell(@cfunction(_release_imported_stream, Cvoid, (Ptr{Cvoid},)), src)
     return Stream(
         src,
-        AC.OwnerRegion[],
+        AC.OwnerRegion[AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0; cell=closed)],
         budget,
         closed,
         _ArrowTypesContext(budget=budget),
