@@ -144,5 +144,27 @@ function _threaded_cdata_stress()
         @assert (@atomic owner.cell.closed)
     end
 
+    # Tables exported and imported back on several threads at once, with the
+    # imports released by garbage collection: every export is freed, and
+    # every import reads what was exported.
+    tasks = [
+        errormonitor(Threads.@spawn begin
+                for i = 1:250
+                    xs = collect(Int64, i:(i + 99))
+                    sp, ap = to_c_data((x=xs, s=["a", "bb"][mod1.(1:100, 2)]))
+                    t = Table(sp, ap)
+                    @assert collect(t.x) == xs
+                    i % 50 == 0 && GC.gc(false)
+                end
+            end) for _ = 1:4
+    ]
+    foreach(fetch, tasks)
+    for _ = 1:20
+        GC.gc(true)
+        yield()
+        _reap!()
+        _registry_count() == 0 && break
+    end
+    @assert _registry_count() == 0
     return nothing
 end

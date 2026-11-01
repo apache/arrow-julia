@@ -23,6 +23,7 @@ import Arrow:
     ForeignOwner,
     REGISTRY_LOCK,
     ReleaseCounter,
+    Table,
     _moveowner,
     _reap!,
     _release_c!,

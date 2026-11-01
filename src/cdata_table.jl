@@ -15,7 +15,9 @@
 # limitations under the License.
 
 # The table-level C data interface: `Arrow.Table` and `Arrow.Stream` over
-# imported C structs. Imports build columns the way an IPC read does.
+# imported C structs, and `Arrow.to_c_data` and `Arrow.export_stream!` over any
+# Tables.jl table. Imports build columns the way an IPC read does; exports
+# build record batches the way `Arrow.write` does.
 
 # --- import -----------------------------------------------------------------
 
@@ -180,3 +182,66 @@ _nbatches(::ImportedStream) = throw(
         "iterate the Arrow.Stream",
     ),
 )
+
+# --- export -----------------------------------------------------------------
+
+# The schema and record batches of `tbl`: a one-shot IPC stream write to nowhere
+# that keeps each batch it builds, so construction, dictionary state, and refusals
+# are the writer's own and a C consumer sees what pyarrow reads from the IPC bytes.
+# The kept buffers are fresh allocations (`exported` turns off the writer's reusable
+# pool), because the consumer holds on to them. One record batch per partition, unless
+# `batchsize` splits it or a batch's string data outgrows 32-bit offsets. A first
+# partition with no rows still fixes the schema; its empty batch is the only one with
+# no rows.
+function _exportbatches(tbl; batchsize::Integer=typemax(Int), kw...)
+    for k in (:file, :compress, :compresslevel, :dictdeltas, :dictreplacement)
+        haskey(kw, k) && throw(ArgumentError("$k does not apply to the C data interface"))
+    end
+    batches = AC.RecordBatch[]
+    w = _writer(devnull; oneshot=true, batchsize, exported=batches, kw...)
+    _writeall!(w, tbl)
+    return w.schema::AC.Schema, batches
+end
+
+"""
+    Arrow.to_c_data(table; kw...) -> (Ptr{Arrow.CArrowSchema}, Ptr{Arrow.CArrowArray})
+
+Export a Tables.jl table as one record batch through the C data interface: an
+`ArrowSchema` and an `ArrowArray` that Arrow.jl allocates, whose struct array has one
+child per column. The columns are built as [`Arrow.write`](@ref) builds them, with the
+same keywords (`dictencode`, `stringview`, `largelists`, `metadata`, `colmetadata`), so a
+consumer reads what it would read from the IPC bytes; an [`Arrow.Table`](@ref)'s columns
+and `Vector`s of numbers cross without copying, and must not be modified or resized
+while the consumer reads them. The consumer moves or releases the two structs; the
+table's memory stays reachable until it has released the array, and what Arrow.jl
+allocated is freed at the next export or garbage collection. A table that needs more
+than one record batch (several partitions, or string data past 2 GiB) is an
+`ArgumentError`; export it with [`Arrow.export_stream!`](@ref).
+"""
+function to_c_data(tbl; kw...)
+    sch, batches = _exportbatches(tbl; kw...)
+    length(batches) == 1 || throw(
+        ArgumentError(
+            "the table needs $(length(batches)) record batches; export it with " *
+            "Arrow.export_stream!",
+        ),
+    )
+    return to_c_data(_batchfield(sch), _structarray(only(batches)))
+end
+
+"""
+    Arrow.export_stream!(streamptr::Ptr{Arrow.CArrowArrayStream}, table; kw...)
+
+Fill the `ArrowArrayStream` the caller allocated at `streamptr` with the record batches
+of a Tables.jl table: one per `Tables.partitions` partition (an [`Arrow.Stream`](@ref)
+is a partition per batch read), split only when `batchsize` is given or a batch's string
+data outgrows 32-bit offsets. The batches are built as [`Arrow.write`](@ref) builds them,
+with the same keywords, before this returns; the consumer pulls them through the stream
+and releases it. Buffers cross without copying where `Arrow.write` would not copy them.
+Memory stays reachable until the consumer has released the stream and every batch it
+pulled.
+"""
+function export_stream!(sp::Ptr{CArrowArrayStream}, tbl; kw...)
+    sch, batches = _exportbatches(tbl; kw...)
+    return export_stream!(sp, sch, AC.RecordBatch[b for b in batches if b.nrows > 0])
+end

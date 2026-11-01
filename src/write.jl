@@ -326,7 +326,9 @@ mutable struct Writer
     # single partition; other sources allow later partitions to extend them.
     const oneshot::Bool
     # The buffers each batch's columns rebuild, reused batch to batch.
-    const pool::_BufferPool
+    const pool::Union{Nothing,_BufferPool}
+    # Where a C data export keeps each batch built; it then reuses no buffers.
+    const exported::Union{Nothing,Vector{AC.RecordBatch}}
     st::Union{Nothing,IPCWriteState}
     names::Vector{Symbol}
     schema::Union{Nothing,AC.Schema}
@@ -348,6 +350,7 @@ function _writer(
     nullable::Bool=true,
     dictencode=nothing,
     oneshot::Bool=false,
+    exported=nothing,
     ntasks::Integer=Threads.nthreads(),
     # Arrow 2.x writer keywords: accepted and ignored (with a one-time
     # warning each) so 2.x call sites keep working during migration.
@@ -404,7 +407,8 @@ function _writer(
             dictencode,
             max(Int(ntasks), 1),
             oneshot,
-            _BufferPool(),
+            exported === nothing ? _BufferPool() : nothing,
+            exported,
             nothing,
             Symbol[],
             nothing,
@@ -624,8 +628,9 @@ Base.@nospecializeinfer function _writebatch!(
         nullable = (w.oneshot ? several : w.nullable) && retained === nothing
         nullable && (fields = AC.Field[_nullablefield(f) for f in fields])
         _beginwrite!(w, fields, retained, names; several, input=part)
-        nrows == 0 && return nothing
         batch = only(_tablebatches(w.schema, coldata, [nrows]))
+        w.exported === nothing || push!(w.exported, batch)
+        nrows == 0 && return nothing
         writebatch!(w.st::IPCWriteState, batch; recycle=_handoff!(w.pool))
         return nothing
     end
@@ -651,6 +656,7 @@ Base.@nospecializeinfer function _writebatch!(
     # against the writer's schema instead of trusting construction.
     batch = only(_tablebatches(AC.Schema(fields; metadata=sch.metadata), coldata, [nrows]))
     deltas = _uninferred(_dictionarydeltas, st, batch)::Dict{Int64,AC.ArrayData}
+    w.exported === nothing || push!(w.exported, batch)
     writebatch!(st, batch; deltas, recycle=_handoff!(w.pool))
     return nothing
 end

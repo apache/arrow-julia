@@ -1463,6 +1463,191 @@ function cdata_battery()
     end
     println("C data and C stream imports read as the IPC read of the same batches ✓")
 
+    sp, ap = to_c_data(tipc)
+    @assert unsafe_load(ap).n_children == 54
+    @assert sametable(Arrow.Table(sp, ap))
+    sref = Ref{CArrowArrayStream}()
+    GC.@preserve sref begin
+        p = Base.unsafe_convert(Ptr{CArrowArrayStream}, sref)
+        export_stream!(p, Arrow.Stream(matrixbytes))        # two batches, two partitions
+        @assert sametable(Arrow.Table(p))
+        export_stream!(p, Arrow.Stream(matrixbytes))
+        parts = collect(Arrow.Stream(p))
+        @assert [Tables.rowcount(t) for t in parts] == [4, 3]
+        joined = (;
+            (
+                nm => vcat(
+                    collect(Tables.getcolumn(parts[1], i)),
+                    collect(Tables.getcolumn(parts[2], i)),
+                ) for (i, nm) in enumerate(Tables.columnnames(parts[1]))
+            )...
+        )
+        for (i, nm) in enumerate(Tables.columnnames(tipc))
+            @assert isequal(joined[nm], collect(Tables.getcolumn(tipc, i))) nm
+            @assert eltype(Tables.getcolumn(parts[1], i)) ==
+                    eltype(Tables.getcolumn(tipc, i)) nm
+        end
+    end
+    println("the 54-column matrix crosses both interfaces both ways as an IPC read ✓")
+
+    # An exported table is built as `Arrow.write` builds it: the same fields,
+    # column types, and values as the IPC bytes, for plain Julia values too.
+    mixed = (
+        i=[1, 2, missing],
+        f=[1.5, 2.5, 3.5],
+        s=["a", missing, "ccc"],
+        d=[Dates.Date(2020, 1, 1), Dates.Date(2021, 2, 3), missing],
+        dt=[
+            Dates.DateTime(2020, 1, 1, 12),
+            Dates.DateTime(2021, 2, 3, 4, 5, 6),
+            Dates.DateTime(2022, 3, 4),
+        ],
+        v=[[1, 2], Int[], [3]],
+        nt=[(a=1, b="x"), (a=2, b="y"), (a=3, b="z")],
+        p=PooledArray(["lo", "hi", "lo"]),
+    )
+    twrite = Arrow.Table(take!(Arrow.tobuffer(mixed)))
+    sp, ap = to_c_data(mixed)
+    tc = Arrow.Table(sp, ap)
+    for (i, nm) in enumerate(Tables.columnnames(twrite))
+        a = Tables.getcolumn(twrite, i)
+        b = Tables.getcolumn(tc, i)
+        @assert eltype(a) == eltype(b) nm
+        @assert isequal(collect(a), collect(b)) nm
+        fa = getfield(twrite, :schema).fields[i]
+        fb = getfield(tc, :schema).fields[i]
+        @assert AC.typeequal(fa.type, fb.type) && fa.nullable == fb.nullable nm
+    end
+    @assert Tables.columnnames(tc) == Tables.columnnames(twrite)
+    # The writer's keywords mean what they mean for `Arrow.write`.
+    sp, ap = to_c_data(mixed; dictencode=[:s])
+    tk = Arrow.Table(sp, ap)
+    @assert getfield(tk, :schema).fields[3].type isa DictionaryType
+    @assert getfield(tk, :schema).fields[8].type isa DictionaryType
+    @assert isequal(collect(tk.s), ["a", missing, "ccc"])
+    sp, ap = to_c_data(mixed; stringview=true)
+    tk = Arrow.Table(sp, ap)
+    @assert (getfield(tk, :schema).fields[3].type::ViewType).utf8
+    @assert isequal(collect(tk.s), ["a", missing, "ccc"])
+    @assert try
+        to_c_data(mixed; nosuchkeyword=1)
+        false
+    catch e
+        e isa ArgumentError
+    end
+    @assert try
+        to_c_data(mixed; compress=:zstd)
+        false
+    catch e
+        e isa ArgumentError
+    end
+    println("exported tables match Arrow.write's construction ✓")
+
+    # Exports cross without copying: a Vector column's address and an
+    # Arrow.Table view column's address are what the consumer sees.
+    xs = collect(Int64, 1:100)
+    sp, ap = to_c_data((x=xs,))
+    child = unsafe_load(unsafe_load(unsafe_load(ap).children, 1))
+    @assert unsafe_load(child.buffers, 2) == Ptr{Cvoid}(pointer(xs))
+    @assert isequal(collect(Arrow.Table(sp, ap).x), xs)
+    tv = Arrow.Table(take!(Arrow.tobuffer((y=collect(1.0:100.0),))))
+    sp, ap = to_c_data(tv)
+    child = unsafe_load(unsafe_load(unsafe_load(ap).children, 1))
+    source = only(getfield(tv, :regions))
+    @assert UInt(source.ptr) <=
+            UInt(unsafe_load(child.buffers, 2)) <
+            UInt(source.ptr) + source.len
+    @assert isequal(collect(Arrow.Table(sp, ap).y), collect(1.0:100.0))
+    println("exports cross without copying ✓")
+
+    # A struct array with no rows is a table with no rows; a non-struct array
+    # is a one-column table; a table too large for one batch names the stream.
+    sp, ap = to_c_data((x=Int64[],))
+    @assert Tables.rowcount(Arrow.Table(sp, ap)) == 0
+    sp, ap = to_c_data((;))
+    @assert Tables.rowcount(Arrow.Table(sp, ap)) == 0
+    sp, ap = to_c_data(fromjulia("only", Int64[5, 6])...)
+    tone = Arrow.Table(sp, ap)
+    @assert Tables.columnnames(tone) == [:only] && collect(tone.only) == [5, 6]
+    @assert try
+        to_c_data(Tables.partitioner([(x=[1],), (x=[2],)]))
+        false
+    catch e
+        e isa ArgumentError && occursin("export_stream!", e.msg)
+    end
+    sref2 = Ref{CArrowArrayStream}()
+    GC.@preserve sref2 begin
+        p = Base.unsafe_convert(Ptr{CArrowArrayStream}, sref2)
+        export_stream!(p, Tables.partitioner([(x=[1],), (x=[2],)]))
+        tp = Arrow.Table(p)
+        @assert collect(tp.x) == [1, 2]
+        @assert eltype(tp.x) == Union{Missing,Int}        # several partitions: nullable
+        export_stream!(p, (x=Int64[],))                    # no rows: no batches
+        @assert Tables.rowcount(Arrow.Table(p)) == 0
+    end
+    println("empty, one-column, and partitioned tables cross ✓")
+
+    # Imported tables read the producer's memory in place: `release!(table)`
+    # refuses further column access, and the producer's release runs once
+    # the table and its columns are garbage collected.
+    key = _released_import_key()
+    for _ = 1:10
+        _registered(key) || break
+        GC.gc(true)
+        yield()
+        _reap!()
+    end
+    @assert !_registered(key)
+    # Exporting a released table is refused; exporting a table and then
+    # releasing it keeps the export valid.
+    tr = Arrow.Table(take!(Arrow.tobuffer((x=[1, 2, 3],))))
+    sp, ap = to_c_data(tr)
+    release!(tr)
+    @assert collect(Arrow.Table(sp, ap).x) == [1, 2, 3]
+    @assert try
+        to_c_data(tr)
+        false
+    catch e
+        e isa InvalidStateException
+    end
+    println("release! of an imported table refuses access; memory follows the columns ✓")
+
+    # `Arrow.Stream(streamptr)` pulls one batch per iteration and is released
+    # like any stream; a released stream stops iterating.
+    sref3 = Ref{CArrowArrayStream}()
+    GC.@preserve sref3 begin
+        p = Base.unsafe_convert(Ptr{CArrowArrayStream}, sref3)
+        export_stream!(p, Tables.partitioner([(x=[1, 2],), (x=[3],), (x=[4, 5, 6],)]))
+        cs = Arrow.Stream(p)
+        @assert Tables.columnnames(cs) == [:x]
+        @assert Tables.schema(cs).types == (Union{Missing,Int},)
+        @assert try
+            length(cs)
+            false
+        catch e
+            e isa ArgumentError
+        end
+        first_table, state = iterate(cs)
+        @assert collect(first_table.x) == [1, 2]
+        release!(cs)
+        @assert try
+            iterate(cs, state)
+            false
+        catch e
+            e isa InvalidStateException
+        end
+        @assert collect(first_table.x) == [1, 2]
+        export_stream!(p, Tables.partitioner([(x=[1, 2],), (x=[3],)]))
+        @assert [collect(t.x) for t in Arrow.Stream(p; stringtype=String)] == [[1, 2], [3]]
+        @assert try
+            Arrow.Stream(p; nosuch=1)
+            false
+        catch e
+            e isa ArgumentError
+        end
+    end
+    println("Arrow.Stream over a C stream pulls one batch at a time ✓")
+
     # `deepcopy` of imported data shares its ownership: after the source is
     # released the copy's reads fail cleanly, and releasing the copy is inert.
     dcf, dcd = fromjulia("deep", Int64[1, 2, 3])

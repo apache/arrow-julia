@@ -21,6 +21,7 @@ import Arrow
 using PooledArrays
 using Tables
 import Base64
+import Dates
 
 const AC = Arrow.AC
 

@@ -668,6 +668,26 @@ end
     return sp, ap, WeakRef(d), WeakRef(region)
 end
 
+# An imported table released and dropped, a column taken from it read after the
+# release; returns the export's key, still registered while the column lives.
+@noinline function _released_import_key()
+    sp, ap = to_c_data((x=collect(Int64, 1:10),))
+    key = _exportkey(ap)
+    t = Arrow.Table(sp, ap)
+    col = t.x
+    release!(t)
+    @assert try
+        t.x
+        false
+    catch e
+        e isa InvalidStateException
+    end
+    @assert collect(col) == 1:10
+    _reap!()
+    @assert _registered(key)
+    return key
+end
+
 # Test-support: one 16-byte view entry (inline / out-of-line forms).
 _viewentry(len::Int, rest::Vector{UInt8}) =
     vcat(reinterpret(UInt8, Int32[Int32(len)]), rest, zeros(UInt8, 12 - length(rest)))
