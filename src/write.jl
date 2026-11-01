@@ -1497,7 +1497,7 @@ function _conformcolumn(
         )
         conformed === nothing || return conformed
     end
-    if expected.nullable &&
+    if _holdsnull(expected) &&
        !(expected.type isa AC.DictionaryType) &&
        _eltypeof(col) === Missing
         # An all-missing column is all nulls of the field's type.
@@ -1667,7 +1667,7 @@ values become null slots of the expected type. Anything else is unchanged.
 """
 function _fillnulls(expected::AC.Field, actual::AC.Field, d::AC.ArrayData, context)
     if actual.type isa AC.NullType
-        (expected.type isa AC.NullType || !expected.nullable) && return actual, d
+        (expected.type isa AC.NullType || !_holdsnull(expected)) && return actual, d
         return _constructhiddenpart(expected, Int(d.len), context)
     end
     n = length(actual.children)
@@ -1801,6 +1801,11 @@ function _conformancemismatch(
         expected.type isa AC.UnionType &&
             actual.type isa AC.UnionType &&
             return "$path writes as a union with other members than the schema's union"
+        actual.type isa AC.NullType &&
+            expected.type isa AC.UnionType &&
+            !_holdsnull(expected) &&
+            return "$path holds only missing values, but no child of the schema's " *
+                   "union holds a null"
         actual.type isa AC.NullType &&
             !expected.nullable &&
             return "$path holds only missing values, but the schema field is not " *

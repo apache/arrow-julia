@@ -681,18 +681,27 @@ function _relaxed(f::AC.Field)
 end
 
 """
+Whether field `f` holds a null: a union in a Null or nullable child, and a
+run-end column in its values, since neither has validity of its own.
+"""
+function _holdsnull(f::AC.Field)
+    t = f.type
+    t isa AC.UnionType && return any(c -> c.type isa AC.NullType || c.nullable, f.children)
+    t isa AC.RunEndEncodedType && return _holdsnull(last(f.children))
+    return f.nullable || t isa AC.NullType
+end
+
+"""
 Retained child `f` over `values`, `hidden` of which sit under null parent
-rows and read as missing. A child that cannot be null is built nullable and
-its validity then dropped (`_hidevalidity`); other missing values in it mean
-the column was replaced.
+rows and read as missing. A child that holds nulls takes them there; one that
+cannot is built nullable and its validity then dropped (`_hidevalidity`), and
+other missing values in it mean the column was replaced.
 """
 function _hiddenchild(f::AC.Field, values, hidden::Int, context)
     hidden == 0 && return _constructpart(f, values; context)
     hidden == length(values) && return _constructhiddenpart(f, hidden, context)
-    f.nullable ||
-        f.type isa AC.NullType ||
-        count(ismissing, values) == hidden ||
-        throw(_nonnullableerror(f.name))
+    _holdsnull(f) && return _constructpart(f, values; context)
+    count(ismissing, values) == hidden || throw(_nonnullableerror(f.name))
     return _hidevalidity(f, _constructpart(_relaxed(f), values; context)...)
 end
 

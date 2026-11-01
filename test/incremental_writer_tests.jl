@@ -79,6 +79,27 @@ function batchedallocations(t, n)
     return @allocated Arrow.write(io, t; batchsize=n)
 end
 
+# A two-row stream of dense union `u` (children Int64 `i` and String `s`,
+# nullable as `nullable` says), or of a nullable struct `t` around it.
+function unionstream(path, nullable; nested=false)
+    (i, id), (s, sd) = AC.fromjulia("i", Int64[1]), AC.fromjulia("s", ["a"])
+    t = AC.UnionType(AC.DenseMode, Int8[0, 1])
+    children = [
+        AC.Field("i", i.type; nullable=nullable[1]),
+        AC.Field("s", s.type; nullable=nullable[2]),
+    ]
+    f = AC.Field("u", t; nullable=true, children)
+    buffers = [AC._databuffer(Int8[0, 1]), AC._databuffer(Int32[0, 0])]
+    d = AC.ArrayData(t, 2, buffers; children=[id, sd], nullcount=0)
+    if nested
+        f = AC.Field("t", AC.StructType(); nullable=true, children=[f])
+        d = AC.ArrayData(AC.StructType(), 2, [AC.BufferSlice()]; children=[d], nullcount=0)
+    end
+    sch = AC.Schema([f])
+    write(path, Arrow.writestream(sch, [AC.RecordBatch(sch, [d], 2)]))
+    return path
+end
+
 # :dictionary or :record for each batch message, in order.
 batchkinds(bytes) = [
     m.msg.header isa Arrow.Meta.DictionaryBatch ? :dictionary : :record for
@@ -598,6 +619,24 @@ batchkinds(bytes) = [
         bytes[9] ⊻= 0x40
         write(spath, bytes)
         @test_throws Exception Arrow.append(spath, t2)
+    end
+
+    @testset "missing values go where a union keeps its nulls" begin
+        dir = mktempdir()
+        # No child keeps a null, so missing values are refused, not written as values.
+        path = unionstream(joinpath(dir, "u.arrow"), (false, false))
+        err = @test_throws ArgumentError Arrow.append(path, (u=[missing, missing],))
+        @test occursin("no child of the schema's union holds a null", err.value.msg)
+        @test isequal(collect(Arrow.Table(path).u), [1, "a"])
+        # Only the second child keeps nulls, under a struct with a null row.
+        path = unionstream(joinpath(dir, "t.arrow"), (false, true); nested=true)
+        T = NamedTuple{(:u,),Tuple{Union{Missing,Int64}}}
+        Arrow.append(path, (t=Union{Missing,T}[(u=missing,), missing, (u=5,)],))
+        rows = Arrow.Table(path).t
+        @test isequal(
+            [ismissing(r) ? missing : r.u for r in rows],
+            [1, "a", missing, missing, 5],
+        )
     end
 
     @testset "append to an Arrow 2.x stream" begin
