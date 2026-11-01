@@ -1153,6 +1153,10 @@ function release!(o::ForeignOwner)
     return release!(o.cell)
 end
 
+# A deep copy of imported data shares its owner, so the producer's release runs
+# once, for the original and every copy.
+Base.deepcopy_internal(o::ForeignOwner, ::IdDict) = o
+
 function _release_foreign_owner!(o::ForeignOwner, deallocate!)
     @atomicswap(o.released = true) && return nothing
     GC.@preserve o begin
@@ -1993,6 +1997,8 @@ function _release_moved_stream_owner!(o::StreamOwner)
     release!(o)
     return nothing
 end
+
+Base.deepcopy_internal(o::StreamOwner, ::IdDict) = o
 
 # Run the moved stream's producer release callback on the malloc'd struct
 # copy, check that the producer nulled the copy's release field, and free the

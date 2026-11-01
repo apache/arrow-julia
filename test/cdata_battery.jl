@@ -1934,6 +1934,24 @@ function cdata_battery()
     @assert _stream_registry_count() == stbefore
     println("schema metadata crosses the C stream boundary ✓")
 
+    # `deepcopy` of imported data shares its ownership: after the source is
+    # released the copy's reads fail cleanly, and releasing the copy is inert.
+    dcf, dcd = fromjulia("deep", Int64[1, 2, 3])
+    sp, ap = to_c_data(dcf, dcd)
+    dcf2, dcd2 = from_c_data(sp, ap)
+    dcopy = deepcopy(dcd2)
+    @assert materialize(dcf2, dcopy) == [1, 2, 3]
+    release!(dcd2.owner::ForeignOwner)
+    @assert try
+        materialize(dcf2, dcopy)
+        false
+    catch e
+        e isa InvalidStateException
+    end
+    release!(dcopy.owner::ForeignOwner)
+    reap!()
+    println("deepcopy of imported data shares its owner ✓")
+
     childscript = joinpath(@__DIR__, "cdata_stress_child.jl")
     stresscmd = `$(Base.julia_cmd()) --startup-file=no --threads=4 --project=$(Base.active_project()) $childscript`
     success(stresscmd) || error("threaded C Data stress failed")

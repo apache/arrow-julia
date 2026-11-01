@@ -271,6 +271,12 @@ function release!(r::OwnerRegion)
     return release!(r.cell)
 end
 
+# A deep copy shares the region and its cell: the bytes belong to the root and
+# are freed through the cell once, so a copy with its own cell would read them
+# after they are released and release them again.
+Base.deepcopy_internal(r::OwnerRegion, ::IdDict) = r
+Base.deepcopy_internal(c::ReleaseCell, ::IdDict) = c
+
 """
     heapregion(v::Vector{T}) -> OwnerRegion
 
@@ -870,10 +876,8 @@ released. Keep its `Field` to materialize named values with `materialize`.
 
 The source must remain valid and unchanged during the copy. This copies
 whole declared buffer slices, which can include values outside a logical
-array slice. Semantic validation is not inherited.
-
-Do not use `deepcopy` to detach Arrow storage: it copies raw pointer and
-release bookkeeping fields without rebuilding their ownership.
+array slice. Semantic validation is not inherited. `deepcopy` does not
+detach: the copy shares the source's buffers and their release.
 """
 function Base.copy(d::ArrayData)
     return ArrayData(

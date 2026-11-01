@@ -55,8 +55,8 @@ Arrow.materialize(Union{Missing,Int}, field2, data2)
 
 Exported and imported data is validated as an IPC read is. `copy(data)` copies an
 imported column into Julia-owned memory, and `Serialization.serialize` saves the values
-of `ArrayData` and record batches. Do not use `deepcopy` to detach them: the copy still
-points at the producer's memory, which the producer may free.
+of `ArrayData` and record batches. `deepcopy` does not detach them: the copy shares the
+producer's memory, and its release, with the original.
 
 With PythonCall, a column goes to pyarrow like this:
 

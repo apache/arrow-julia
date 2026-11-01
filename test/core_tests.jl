@@ -337,6 +337,23 @@ end
             release!(r)   # idempotent
             GC.@preserve borrowed nothing
 
+            # A deep copy shares the region and its release: it is revoked
+            # with the original, and releasing it again is inert.
+            copied = Ref(0)
+            cv = UInt8[1, 2]
+            cr = GC.@preserve cv OwnerRegion(
+                pointer(cv),
+                2;
+                root=cv,
+                cell=ReleaseCell(_cell_bump_ptr(), copied),
+            )
+            cb = deepcopy(BufferSlice(cr, 0, 2))
+            @test AC.loadat(cb, UInt8, Int64(1)) == 0x02
+            release!(cr)
+            @test_throws InvalidStateException AC.loadat(cb, UInt8, Int64(0))
+            release!(cb.region)
+            @test copied[] == 1
+
             # Regions sharing one ReleaseCell are revoked together and the
             # release action runs exactly once.
             released = Ref(0)
