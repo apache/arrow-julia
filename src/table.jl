@@ -20,10 +20,9 @@
 # `Arrow.Table` reads flat columns as zero-copy views (`columns.jl`) and
 # materializes nested and union columns (closed element-type claims through
 # Core's typed path, everything else through the dynamic accessors).
-# `Arrow.Stream` iterates record batches as one Table each. Scan pushdown
-# routes through the ranged-scan adapter: on the file format, column
-# pruning, statistics-based batch pruning, and window consumption all happen
-# before decode.
+# `Arrow.Stream` iterates record batches as one Table each. Every read goes
+# through the scan planner and executor (`scan.jl`); a whole read is the scan
+# of every column.
 # =============================================================================
 
 """
@@ -51,14 +50,18 @@ that `open(source, "r")` accepts, such as a FilePathsBase.jl path, reads as the 
   calling task. The result does not depend on `ntasks`.
 - `limits` sets the [`Arrow.Limits`](@ref).
 
-Only the selected and filter columns are read, and a `limit` stops reading once it has
-its rows; from an `AbstractArrowSource`, only their bytes are fetched.
+Only the selected and filter columns are read, a filter's other columns only for the
+record batches that keep rows, and a `limit` stops reading once it has its rows; from an
+`AbstractArrowSource`, only those bytes are fetched.
 
 Numbers, booleans, temporal values, decimals, and dictionary indices read as read-only
 [`Arrow.ArrowVector`](@ref) views of the source; a column of several record batches is a
 `ChainedVector` of them. Strings and binary values are `DataStrings.StringVector` and
 `BytesVector` columns over the source's bytes, built the first time the table hands
-them out. Lists, maps, and structs read as typed rows. A column keeps the memory it reads
+them out. Lists, maps, and structs read as typed rows. A read with `filter`, `limit`, or
+`offset` copies the rows it keeps instead: `Vector`s, string and binary columns that hold
+just their values' bytes, and dictionary columns that keep their categories. Column types
+do not depend on the kind of source. A column keeps the memory it reads
 alive while it is reachable, even after its table is gone; a mapped file is unmapped
 once the table and its columns are garbage collected. `copy(table)`, `DataFrame(table)`,
 and [`Arrow.read`](@ref) give owned, mutable columns. Columns that share a name read as
@@ -2026,8 +2029,8 @@ batch for each batch read.
 
 Batches are read as the iteration reaches them: from a stream-format `IO`, such as a
 pipe or a socket, as they arrive; from a mapped path, in place; and from an
-[`Arrow.AbstractArrowSource`](@ref), by range. A file-format `IO` is read to its end
-first. A loop that drops each batch holds one batch at a time, plus the dictionaries,
+[`Arrow.AbstractArrowSource`](@ref), by range, fetching only the selected and filter
+columns of each batch. A file-format `IO` is read to its end first. A loop that drops each batch holds one batch at a time, plus the dictionaries,
 and each batch is read under its own allocation allowance ([`Arrow.Limits`](@ref)).
 
 `Tables.schema(stream)`, `Tables.columnnames(stream)`, `DataAPI.metadata(stream)`, and

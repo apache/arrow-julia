@@ -15,25 +15,26 @@
 # limitations under the License.
 
 # =============================================================================
-# Tables.Scan pushdown over the IPC file adapter, and — further down — the
-# byte-range fetch protocol (`SourceFile` over an `AbstractArrowSource`) over
-# the same bound column set. Design notes: docs/dev/DESIGN-scan-ranges-trim.md.
+# Tables.Scan pushdown: one planner for IPC files, whose bytes are a region in
+# memory or a byte-range source (`SourceFile` over an `AbstractArrowSource`),
+# and one executor for every source. Design notes:
+# docs/dev/DESIGN-scan-ranges-trim.md.
 #
-# Pushdown semantics: the request is resolved once, then the source consumes
-# the bound scan exactly, batch by batch; type overrides apply after
-# conversion to the public domain.
+# The request is resolved once (`_ScanPlan`); the executor (`_runscan`) then
+# consumes the bound scan exactly, batch by batch:
 #
-#   * the decode set is (selected ∪ filter-referenced) columns — everything
+#   * the decode set is (selected ∪ filter-referenced) columns; everything
 #     else is SKIPPED by `skipfield!`, a registry walk that consumes the
 #     node/buffer accounting (all buffer-table invariants still checked)
-#     without slicing, decompressing, validating, or materializing anything;
-#   * without a filter `limit`/`offset` are metadata arithmetic —
+#     without slicing, decompressing, validating, or materializing anything,
+#     and over a byte-range source no body range is planned for it;
+#   * without a filter `limit`/`offset` are metadata arithmetic:
 #     `RecordBatch.length` is wire metadata, so batches outside the window
-#     are never decoded; with a filter the `_ScanSink` evaluates it per
-#     batch through the generic evaluator, composes the window over the
-#     qualifying rows, and stops decoding once the window is full;
-#   * the returned table holds the selected columns' surviving rows under
-#     their output names, in selection order.
+#     are never decoded; a filter is evaluated per batch on public values,
+#     reads the other selected columns only for batches with a qualifying
+#     row, and composes the window over the qualifying rows;
+#   * the returned table holds the selected columns' kept rows under their
+#     output names, in selection order, with type overrides converted.
 # =============================================================================
 
 # ---------------------------------------------------------------------------

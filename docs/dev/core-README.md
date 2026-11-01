@@ -43,7 +43,7 @@ where those contracts are implemented and the constraints on changing them.
 | `src/source.jl` | Byte-range sources and read scheduling; `ext/ArrowCloudStoreExt.jl` supplies the CloudStore integration |
 | `src/columns.jl` | Read-only buffer views, typed nested rows, dictionary/run-end columns, and deferred string construction |
 | `src/table.jl` | `Table`/`Stream`, source opening, Tables.jl and DataAPI interfaces, copying, and public value conversion |
-| `src/scan.jl` | Scan binding, projection, filters, row windows, and sparse ranged reads |
+| `src/scan.jl` | Scan binding, the planner and executor every read uses, filters, row windows, and sparse ranged reads |
 | `src/arrowtypes.jl`, `src/sharedvalues.jl` | ArrowTypes mappings and the shared string, decimal, and temporal value domains |
 | `src/columnconstruction.jl` | Native and custom column construction, retained schemas, nested layouts, and dictionary pooling |
 | `src/write.jl` | Public write options, partition iteration, `Writer`, append, and destination ownership |
@@ -136,20 +136,24 @@ user-defined conversion hooks or the entire process heap.
 
 `Tables.Scan` is available from registered Tables.jl 1.14 or later; no source
 revision is required. The facade accepts it directly and translates its simpler
-read keywords into the same plan. Binding, public-to-storage literal conversion,
-and column selection happen once per request.
+read keywords into the same plan. Binding and column selection happen once per
+request; filters run on the public values a read returns.
 
-A file scan decodes the selected columns and those needed by its filter. Without
-a filter, offsets and limits select batches by their row counts. With a filter,
-qualifying rows are counted before applying the result window. Output columns
-are constructed only for the rows kept. Type overrides apply in the facade's
-public value domain. Repeated top-level names receive unique suffixes before
-selection and metadata lookup.
+Every read goes through one planner and one executor (`scan.jl`), whatever the
+source: a region in memory (a mapped file, a byte vector, an `IO` read whole), a
+byte-range source, or stream-format input. A scan decodes the selected columns
+and those its filter reads. Without a filter, offsets and limits select batches
+by their row counts. With a filter, the filter columns are read first, the other
+selected columns only for batches with a qualifying row, and qualifying rows are
+counted before applying the result window. Kept rows are copied; a read that
+keeps every row builds a full read's views. Type overrides convert after the
+scan. Repeated top-level names receive unique suffixes before selection and
+metadata lookup.
 
 `SourceFile` uses a byte-range source's footer and index to request needed metadata
 and buffers. Adjacent ranges may be coalesced under `gapbytes`; concurrency is
-bounded by the source and reader limits. File and stream sources use different
-read strategies, including stream windows and prefetching. Do not infer a bound
+bounded by the source and reader limits. `Arrow.Stream` reads one batch at a time
+through the same executor, with read-ahead for whole batches. Do not infer a bound
 on bytes fetched from a bound on rows returned: filtering can still require
 reading buffers for rows that are later rejected.
 

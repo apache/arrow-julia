@@ -140,8 +140,9 @@ sum(fares)
 
 `select` and `drop` choose columns (names, indices, a regex, a vector of them, or a
 function `(i, name) -> Bool` as in CSV.jl), `filter` keeps the rows where a predicate is
-`true`, and `limit` caps the row count. Only the selected and filter columns are read, and a `limit` stops reading
-once it has its rows.
+`true`, `limit` caps the row count, and `offset` skips rows first. Only the selected and
+filter columns are read, a filter's other columns only for the record batches that keep
+rows, and a `limit` stops reading once it has its rows.
 
 ```@example reading
 DataFrame(Arrow.Table(path; select=[:id, :fare], filter=Arrow.col(:fare) > 10, limit=2))
@@ -171,19 +172,26 @@ compared with a UTC timestamp column (pandas' time-zone-aware data, DuckDB's
 TIMESTAMPTZ) is that time in UTC. A column in another zone needs a
 `Durations.ZonedTimestamp` literal, and the error says how to write one.
 
-`select` also takes `name => newname` to rename a column and `name => Type` to read it
-as another type, such as `:day => DateTime`. For an offset, pass a `Tables.Scan` as
-`scan` instead of the keywords:
+`select` also takes `name => newname` to rename a column and `name => Type` to convert
+it, such as `:day => DateTime`; `scan` takes a `Tables.Scan` in place of all these
+keywords.
 
 ```@example reading
-DataFrame(Arrow.Table(path; scan=Tables.Scan(select=(:id, :fare => :amount), offset=1, limit=3)))
+DataFrame(Arrow.Table(path; select=[:id, :fare => :amount], offset=1, limit=3))
 ```
+
+A read that keeps every row reads its columns as a full read does: as views. A read with
+`filter`, `limit`, or `offset` copies the rows it keeps: numbers and other values into
+`Vector`s, strings and binary values into columns that hold just those values' bytes,
+and dictionary columns with their categories. The copies keep nothing else of the source
+alive. A column's element type does not depend on the filter or on the kind of source.
 
 ## Threads
 
 A read uses up to `ntasks` tasks (default `Threads.nthreads()`): record batches decode
-and decompress in parallel, columns build in parallel, and a long string column builds in
-chunks of rows. `ntasks=1` reads on the calling task. The result is the same for every
+and decompress in parallel, columns build in parallel, a long string column builds in
+chunks of rows, and a filter is evaluated on several record batches at once, and in
+chunks of rows of a large one. `ntasks=1` reads on the calling task. The result is the same for every
 `ntasks`. Start Julia with threads (`julia -t 8`) for the tasks to run at once.
 
 ## Metadata
@@ -213,10 +221,10 @@ t = Arrow.Table(meta)
 - An [`Arrow.AbstractArrowSource`](@ref) supplies bytes by range, for storage the others
   do not cover. It implements [`Arrow.sourcelength`](@ref) and [`Arrow.readrange`](@ref),
   and [`Arrow.concurrentreads`](@ref) when ranges may be read on several tasks at once.
-  A read with `select`, `drop`, `filter`, `limit`, or `scan` reads the file-format
-  footer from the end of the source, then fetches only the record batches and columns
-  it needs, in a few coalesced ranges. A read without them fetches the whole source in
-  8 MiB ranges.
+  A read with `select`, `drop`, `filter`, `limit`, `offset`, or `scan` reads the
+  file-format footer from the end of the source, then fetches only the record batches
+  and columns it needs, in a few coalesced ranges, whatever the filter compares. A read
+  without them fetches the whole source in 8 MiB ranges.
 
 ```@example reading
 struct CountingSource <: Arrow.AbstractArrowSource
