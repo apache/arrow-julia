@@ -1275,10 +1275,14 @@ struct FetchedSpans
     slices::Vector{BufferSlice}
 end
 
+# Whether a body of `bodylen` bytes is read whole with its metadata: one
+# request costs more than the bytes of a body of at most four `gapbytes`.
+_smallbody(bodylen::Int64, gap::Int64) = bodylen <= AC.checked_mul(gap, Int64(4))
+
 # How much of a body of `bodylen` bytes a block's metadata request also reads:
-# all of it up to four `gapbytes`, otherwise one `gapbytes`' worth.
+# all of a small body, otherwise one `gapbytes`' worth.
 _speculativebody(bodylen::Int64, gap::Int64) =
-    bodylen <= AC.checked_mul(gap, Int64(4)) ? bodylen : min(bodylen, gap)
+    _smallbody(bodylen, gap) ? bodylen : min(bodylen, gap)
 
 function _fetchspans(
     sf::SourceFile,
@@ -1806,6 +1810,7 @@ function _runscan(
     firstidx = b.filter === nothing ? decodeidx : filteridx
     restidx = setdiff(decodeidx, firstidx)
     firstmask, restmask = _fieldmask(firstidx, nf), _fieldmask(restidx, nf)
+    decodemask = firstmask .| restmask
     filternames = Symbol[plan.names[i] for i in filteridx]
     parts = Matrix{Any}(nothing, length(outidx), n)
     kept = Vector{Any}(nothing, n)
@@ -1874,7 +1879,8 @@ function _runscan(
         try
             for k = 1:n
                 take[] == 0 && break
-                _fetch!(bodies, k:k, firstmask)
+                # A small body's columns cost one round trip, not two.
+                _fetch!(bodies, k:k, _smallrecord(bodies, k) ? decodemask : firstmask)
                 first!(k, states, ntasks)
                 if kept[k] !== nothing && !isempty(restidx)
                     _fetch!(bodies, k:k, restmask)
@@ -1984,6 +1990,7 @@ _retainedpool(f::AC.Field, dictionaries, ctx::_ScanContext) =
 # The record bodies of a scan whose bytes are all in memory are readable.
 _fetch!(::Nothing, ks, mask, extra=NTuple{2,Int64}[]) = nothing
 _release!(::Nothing, k) = nothing
+_smallrecord(::Nothing, k) = false
 
 # What fetching a byte-range scan's record bodies needs: the bytes fetched so
 # far, which fields' bodies of each record batch they hold, and each record
@@ -2080,6 +2087,9 @@ function _fetch!(rb::_RangedBodies, ks, mask, extra=NTuple{2,Int64}[])
     _addspans!(rb.spans, fetched, rb.budget)
     return nothing
 end
+
+# Whether record `k`'s body is small (`_smallbody`).
+_smallrecord(rb::_RangedBodies, k) = _smallbody(rb.blocks[k][3], rb.sf.gapbytes)
 
 # Record `k` is read: a scan that reads batch by batch frees its fetched bytes.
 function _release!(rb::_RangedBodies, k)
@@ -2337,14 +2347,15 @@ end
 _streamrecord(f::ArrowFile, i::Int, budget, mask) =
     _ScanRecord(_fileplan(f, i, budget, mask), f.dictionaries), nothing
 
-# Over a byte-range source a batch that decodes every field reads its whole
-# block, with read-ahead; one that decodes some reads its metadata with the
-# start of its body, and `_runscan` fetches the planned ranges it lacks.
+# Over a byte-range source a batch that decodes every field, or whose body is
+# small, reads its whole block through the block reader, many blocks to a
+# request; one that decodes some fields of a large body reads its metadata
+# with the start of its body, and `_runscan` fetches the planned ranges it lacks.
 function _streamrecord(r::_RangedFile, i::Int, budget, mask)
     sf = r.sf
     block = r.recordblocks[i]
     spans = nothing
-    if all(mask)
+    if all(mask) || _smallbody(block[3], sf.gapbytes)
         fm = first(_blockframe(r.blocks, r.recordblocks, i, r.dataend, budget))
         msg, version, headertype, body = fm.msg, fm.version, fm.header_type, fm.body
     else

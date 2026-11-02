@@ -222,9 +222,11 @@ t = Arrow.Table(meta)
   do not cover. It implements [`Arrow.sourcelength`](@ref) and [`Arrow.readrange`](@ref),
   and [`Arrow.concurrentreads`](@ref) when ranges may be read on several tasks at once.
   A read with `select`, `drop`, `filter`, `limit`, `offset`, or `scan` reads the
-  file-format footer from the end of the source, then fetches only the record batches
-  and columns it needs, in a few coalesced ranges, whatever the filter compares. A read
-  without them fetches the whole source in 8 MiB ranges.
+  file-format footer from the end of the source, then plans only the byte ranges of the
+  record batches and columns it needs, whatever the filter compares, and fetches them in
+  a few coalesced ranges. A record batch of at most 1 MiB is fetched whole with its
+  metadata, so a file of many small batches is fetched almost whole. A read without them
+  fetches the whole source in 8 MiB ranges.
 
 ```@example reading
 struct CountingSource <: Arrow.AbstractArrowSource

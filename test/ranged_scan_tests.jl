@@ -21,10 +21,13 @@ using Test, Arrow, Tables, Dates
 struct MeteredSource <: Arrow.AbstractArrowSource
     bytes::Vector{UInt8}
     fetched::Base.RefValue{Int}
+    requests::Base.RefValue{Int}
 end
+MeteredSource(bytes, fetched) = MeteredSource(bytes, fetched, Ref(0))
 Arrow.sourcelength(s::MeteredSource) = length(s.bytes)
 function Arrow.readrange(s::MeteredSource, offset, len)
     s.fetched[] += len
+    s.requests[] += 1
     return s.bytes[(offset + 1):(offset + len)]
 end
 
@@ -156,6 +159,26 @@ end
     stream = Arrow.Stream(Arrow.SourceFile(MeteredSource(bytes, fetched)))
     @test sum(t -> length(t.x), stream) == 4n
     @test fetched[] >= length(bytes) - 1024
+end
+
+@testset "small record batches cost few requests" begin
+    io = IOBuffer()
+    Arrow.Writer(io; file=true) do writer
+        for batch = 1:2000
+            Arrow.write(writer, (x=collect((10batch - 9):(10batch)), y=fill(batch, 10)))
+        end
+    end
+    bytes = take!(io)
+    # A Stream reads small batches whole, many to a request.
+    source = MeteredSource(bytes, Ref(0))
+    @test sum(t -> sum(t.x), Arrow.Stream(source; select=[:x])) == sum(1:20_000)
+    @test source.requests[] <= 2000 ÷ 100
+    # A filtered window fetches a small batch's columns in one request.
+    source = MeteredSource(bytes, Ref(0))
+    t = Arrow.Table(source; select=[:x], filter=Arrow.col(:y) > 0, limit=10^9)
+    @test t.x == 1:20_000
+    metadata = 2000
+    @test source.requests[] <= metadata + 2000 + 2
 end
 
 end

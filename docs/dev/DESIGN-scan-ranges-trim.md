@@ -168,8 +168,9 @@ sequential — cloud-native access is a file-format feature, stated plainly.
    the executor reads first (every decode-set column without a filter; the
    filter columns with one) in one round. A filter then fetches the other
    selected columns of the batches that keep rows in one more round; a
-   filtered `limit` fetches batch by batch and stops when it is full, freeing
-   each batch's bytes once it is read. Each coalesced range lands in its own
+   filtered `limit` fetches batch by batch (a body of at most four `gapbytes`
+   with all its decode-set columns in one round) and stops when it is full,
+   freeing each batch's bytes once it is read. Each coalesced range lands in its own
    owned heap region; decode resolves each declared buffer `(offset, len)` to
    its containing fetched range and subslices it: *every buffer must fall
    inside a fetched range that was itself derived from the verified buffer
@@ -185,10 +186,11 @@ explicit over-read policy: a requested span may cross unneeded bytes when the
 configured gap permits it.
 
 `Arrow.Stream` over a byte-range file source reads the footer and the
-dictionaries when it opens. A batch that decodes every column reads its whole
-block, and the blocks after it while they fit 8 MiB, with one window fetched
-ahead. A batch that decodes some columns reads its metadata with the start of
-its body, then the ranges of its decode set it lacks.
+dictionaries when it opens. A batch that decodes every column, or whose body is
+at most four `gapbytes`, reads its whole block, and the blocks after it while
+they fit 8 MiB, with one window fetched ahead. A batch that decodes some
+columns of a larger body reads its metadata with the start of its body, then
+the ranges of its decode set it lacks.
 
 ### The interface (no HTTP/CloudStore deps in Arrow)
 

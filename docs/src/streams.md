@@ -35,7 +35,8 @@ format to an `IO`.
 each iteration gives an `Arrow.Table` of one batch. It takes the keywords of
 `Arrow.Table`: `select`, `drop`, and `filter` apply to every batch, and `limit` and
 `offset` count rows across batches. A batch decodes only the selected and filter
-columns, and over an [`Arrow.AbstractArrowSource`](@ref) fetches only their bytes. A loop
+columns. Over an [`Arrow.AbstractArrowSource`](@ref) it fetches only their bytes, except
+that batches of at most 1 MiB are fetched whole, several to a request. A loop
 that processes and drops each batch holds one batch at a time, plus the dictionaries,
 so a source larger than memory reads in bounded memory.
 

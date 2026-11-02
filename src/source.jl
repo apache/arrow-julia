@@ -33,10 +33,10 @@ and may define [`Arrow.concurrentreads`](@ref) to let several ranges be read at 
 
 `Arrow.Table` with `select`, `drop`, `filter`, `limit`, `offset`, or `scan` reads the
 file-format footer from the end of the source, then fetches only the record batches and
-columns it needs, coalesced into a few ranges; without them, it fetches the whole source
-in 8 MiB ranges. `Arrow.Stream` fetches record batches as the iteration reaches them:
-whole, small ones several to a request, or only the columns it selects. A stream-format
-source has no footer and is read in order.
+columns it needs (a record batch of at most 1 MiB whole), coalesced into a few ranges;
+without them, it fetches the whole source in 8 MiB ranges. `Arrow.Stream` fetches record
+batches as the iteration reaches them: whole, small ones several to a request, or only
+the columns it selects. A stream-format source has no footer and is read in order.
 
 `readrange` must return a new vector of exactly `len` bytes each time, and never reuse or
 change it: Arrow keeps it without copying. Arrow validates what it reads, but the source
