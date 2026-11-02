@@ -763,11 +763,11 @@ function cdata_battery()
     println("to_c_data's top-level structs outlive their export by 10 ms ✓")
 
     # Consumers call the release callbacks from their own threads and from inside
-    # garbage-collector finalizers, so they allocate nothing. (Julia 1.10's call
-    # through the pointer of a precompiled `@cfunction` allocates 16 bytes itself;
-    # the same body compiled in the session allocates none.)
+    # garbage-collector finalizers, so they allocate nothing. (Julia 1.10 and 1.11
+    # allocate 16 bytes in a call through a precompiled `@cfunction`'s pointer; the
+    # same body through one made in the session allocates none.)
     _release_allocations()
-    VERSION >= v"1.11" && @assert _release_allocations() == 0
+    VERSION >= v"1.12" && @assert _release_allocations() == 0
     # With nothing exported afterwards, garbage collections free what a
     # consumer released.
     key = _released_export_key()
