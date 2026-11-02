@@ -664,6 +664,36 @@ _rewriteallocations(t) = @allocated Arrow.write(IOBuffer(), t)
         end
     end
 
+    @testset "map rows that repeat a key rewrite from any read" begin
+        # Arrow leaves unique keys to the application: keys stored as
+        # themselves keep a row's repeats however the column was read.
+        plain(x) =
+            x isa Pair ? plain(first(x)) => plain(last(x)) :
+            x isa Union{AbstractDict,AbstractVector} ? [plain(y) for y in x] : x
+        io = IOBuffer()
+        Arrow.Writer(io; file=false) do w
+            m = [["k" => 1, "k" => 2], ["j" => 3]]
+            Arrow.write(w, (id=[1, 2], m=m, l=[[m[1]], [m[2]]]))
+            Arrow.write(w, (id=[3], m=[["k" => 4, "k" => 5]], l=[[["j" => 6, "j" => 7]]]))
+        end
+        two = take!(io)
+        U = Union{Int,Vector{Pair{String,Int}}}
+        @testset "$label" for (label, t) in (
+            ("two batches", Arrow.Table(two)),
+            ("a filtered read", Arrow.Table(two; filter=Arrow.col(:id) > 1)),
+            ("a union child", Arrow.Table(Arrow.tobuffer((u=U[1, ["k" => 1, "k" => 2]],)))),
+            ("labelled values", Arrow.Table(Arrow.tobuffer((m=[["k" => :a, "k" => :b]],)))),
+        )
+            out = Arrow.Table(Arrow.tobuffer(t))
+            for name in Tables.columnnames(t)
+                @test isequal(
+                    plain(Tables.getcolumn(out, name)),
+                    plain(Tables.getcolumn(t, name)),
+                )
+            end
+        end
+    end
+
     @testset "hidden dictionary slots point at one pool value" begin
         for value in (["x"], Int64[1]), nullable in (false, true)
             valuefield, _ = AC.fromjulia("d", value)

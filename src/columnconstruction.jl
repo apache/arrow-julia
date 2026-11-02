@@ -933,9 +933,13 @@ function _mappart(spec, v::AbstractVector, context)
     vf, vd =
         _constructpart(_entryspec(spec, 2, "value"), _ChildValues{V,2}(entries); context)
     # Distinct keys that an ArrowTypes mapping stores alike would read back as
-    # repeated keys of one row.
-    (spec isa AC.Field || R <: AbstractDict && _writerneedstype!(context, KK)) &&
-        _validatemapphysicalkeys(name, kf, kd, offsets)
+    # repeated keys of one row. Keys stored as themselves keep a row's
+    # repeated keys, which Arrow maps (and `Arrow.MapValue` rows) allow.
+    keyspec = _entryspec(spec, 1, "key")
+    (
+        R <: AbstractDict && _writerneedstype!(context, KK) ||
+        keyspec isa AC.Field && _arrowtypesextension(keyspec) !== nothing
+    ) && _validatemapphysicalkeys(name, kf, kd, offsets)
     return _mapcolumn(spec, v, offsets, validity, nc, length(entries), kf, kd, vf, vd)
 end
 
