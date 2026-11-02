@@ -1437,6 +1437,32 @@ function _dropspans!(fs::FetchedSpans, from::Int64, to::Int64)
     return fs
 end
 
+# `ranges` are all the bytes a read's columns view. A span they fill less than
+# half of is replaced by copies of just those ranges, so the span is freed when
+# the read returns instead of living as long as the columns.
+function _compactspans!(fs::FetchedSpans, ranges::Vector{NTuple{2,Int64}}, budget)
+    holders = Int[_spanholding(fs, off, len) for (off, len) in ranges]
+    used = zeros(Int64, length(fs.starts))
+    for (h, (_, len)) in zip(holders, ranges)
+        used[h] += len
+    end
+    sparse = BitVector(2u < len for (u, len) in zip(used, fs.lens))
+    copies = FetchedSpans(Int64[], Int64[], BufferSlice[])
+    for ((off, len), h) in zip(ranges, holders)
+        sparse[h] || continue
+        _chargevector!(budget, UInt8, len, "copied span range")
+        bytes = AC.slicebytes(AC.subslice(fs.slices[h], off - fs.starts[h], len))
+        push!(copies.starts, off)
+        push!(copies.lens, len)
+        push!(copies.slices, BufferSlice(heapregion(bytes), 0, len))
+    end
+    isempty(copies.starts) && return fs
+    keepat!(fs.starts, .!sparse)
+    keepat!(fs.lens, .!sparse)
+    keepat!(fs.slices, .!sparse)
+    return _addspans!(fs, copies, budget)
+end
+
 """
     SparseBody
 
@@ -2021,8 +2047,9 @@ end
 """
 Fetch the body ranges of the fields `mask` selects of record batches `ks`,
 and the ranges `extra`, that `rb.spans` does not hold yet, in one coalesced
-round. Every planned subtree's metadata is validated first, so a corrupt
-buffer table fails before its ranges are requested.
+round, and return every range planned, fetched now or before. Every planned
+subtree's metadata is validated first, so a corrupt buffer table fails
+before its ranges are requested.
 """
 function _fetch!(rb::_RangedBodies, ks, mask, extra=NTuple{2,Int64}[])
     limits = rb.sf.limits
@@ -2096,7 +2123,7 @@ function _fetch!(rb::_RangedBodies, ks, mask, extra=NTuple{2,Int64}[])
         what="body range fetch",
     )
     _addspans!(rb.spans, fetched, rb.budget)
-    return nothing
+    return ranges
 end
 
 # Whether record `k`'s body is small (`_smallbody`).
@@ -2275,7 +2302,14 @@ function _scanfile(
     firstmask =
         b.filter === nothing ? decodemask :
         _fieldmask(_deduplicatesorted!(copy(b.filtercols)), length(fields))
-    _fetch!(bodies, limitedfilter ? (1:0) : eachindex(candidates), firstmask, dictranges)
+    ranges = _fetch!(
+        bodies,
+        limitedfilter ? (1:0) : eachindex(candidates),
+        firstmask,
+        dictranges,
+    )
+    # A select's columns view the ranges it fetched, dictionaries included.
+    bodies === nothing || !_selectsonly(b) || _compactspans!(spans, ranges, budget)
     _chargedict!(budget, Int64, ArrayData, length(wanted), "decoded dictionary table")
     dicts = Dict{Int64,ArrayData}()
     _chargedict!(

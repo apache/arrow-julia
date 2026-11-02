@@ -225,8 +225,10 @@ t = Arrow.Table(meta)
   file-format footer from the end of the source, then plans only the byte ranges of the
   record batches and columns it needs, whatever the filter compares, and fetches them in
   a few coalesced ranges. A record batch of at most 1 MiB is fetched whole with its
-  metadata, so a file of many small batches is fetched almost whole. A read without them
-  fetches the whole source in 8 MiB ranges.
+  metadata, so a file of many small batches is fetched almost whole. A `select`'s columns
+  view the fetched bytes in place, except that bytes filling less than half of a fetched
+  range are copied out of it, so a few columns do not keep the whole object in memory. A
+  read without them fetches the whole source in 8 MiB ranges.
 
 ```@example reading
 struct CountingSource <: Arrow.AbstractArrowSource

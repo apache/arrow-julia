@@ -82,7 +82,9 @@ A region (a mapped file or a byte vector) is its own span provider: one span
 over the whole region serves every range the planner names, without a copy.
 A byte-range source fetches each round's ranges through `readrange`,
 coalesced, and a fetched range is referenced in place by the columns that
-read it. The planner is the same for both; only the fetch differs.
+read it, unless a select's columns fill less than half of it: then their
+bytes are copied out, so a few columns do not keep a whole fetched range
+alive. The planner is the same for both; only the fetch differs.
 
 ### What Arrow pushes, by axis
 

@@ -130,6 +130,36 @@ end
     rm(path)
 end
 
+@testset "a select through a source keeps only the bytes its columns use" begin
+    io = IOBuffer()
+    Arrow.Writer(io; file=true) do writer
+        for batch = 1:200
+            Arrow.write(
+                writer,
+                (
+                    i1=collect((1000batch - 999):(1000batch)),
+                    s1=fill(repeat("s", 40), 1000),
+                    pad=fill(repeat("p", 60), 1000),
+                ),
+            )
+        end
+    end
+    bytes = take!(io)
+    mapped = Arrow.Table(copy(bytes))
+    # One small column of the object keeps about its own bytes.
+    t = Arrow.Table(MeteredSource(bytes, Ref(0)); select=[:i1])
+    @test t.i1 == mapped.i1
+    @test Base.summarysize(t.i1) < 1.5 * 8 * 200_000 < length(bytes) / 8
+    # Columns that fill most of what was fetched view it in place.
+    fetched = Ref(0)
+    ranged() = Arrow.Table(MeteredSource(bytes, fetched); select=[:s1, :pad])
+    t = ranged()
+    @test t.s1 == mapped.s1 && t.pad == mapped.pad
+    fetched[] = 0
+    copied = @allocated(ranged()) - fetched[]
+    @test copied < length(bytes) / 4
+end
+
 @testset "a Stream over a source fetches only the columns it reads" begin
     n = 20_000
     io = IOBuffer()
