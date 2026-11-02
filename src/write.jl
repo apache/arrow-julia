@@ -1520,15 +1520,8 @@ function _conformcolumn(
 )
     dictmismatch = nothing
     if expected.type isa AC.DictionaryType && written !== nothing
-        conformed, dictmismatch = _uninferred(
-            _conformdictionary,
-            name,
-            col,
-            expected,
-            written;
-            stringview,
-            growth,
-        )
+        conformed, dictmismatch =
+            _uninferred(_conformdictionary, name, col, expected, written; growth)
         conformed === nothing || return conformed
     end
     if _holdsnull(expected) &&
@@ -1595,23 +1588,25 @@ end
 
 """
 A later table's dictionary column built the way the first table's was (as its
-own dictionary), then re-indexed into `written`, the categories its field
-already wrote (storage; `nothing` for a replacement pool): those keep their
-order and new categories follow, so the column refers to the extended pool.
+own dictionary, with the large offsets or views of the field's values), then
+re-indexed into `written`, the categories its field already wrote (storage;
+`nothing` for a replacement pool): those keep their order and new categories
+follow, so the column refers to the extended pool.
 Returns the field and data, or `nothing` and why the column does not conform
 (`nothing` too when the values do not build as a dictionary at all).
 """
-function _conformdictionary(
-    name::Symbol,
-    col,
-    expected::AC.Field,
-    written;
-    stringview::Bool=false,
-    growth=nothing,
-)
+function _conformdictionary(name::Symbol, col, expected::AC.Field, written; growth=nothing)
     context = _WriterContext(String(name))
     et = expected.type::AC.DictionaryType
     vf = AC.dictvaluefield(expected, et)
+    # The stream may have been started by another writer (an append's), so
+    # the field, not this writer, says how its values are laid out.
+    stringview = _anytype(t -> t isa AC.ViewType, vf)
+    largelists = _anytype(
+        t ->
+            t isa Union{AC.Utf8Type,AC.BinaryType,AC.ListType,AC.ListViewType} && t.large,
+        vf,
+    )
     written === nothing && (written = last(_constructhiddenpart(vf, 0, context)))
     if _eltypeof(col) === Missing
         expected.nullable || return nothing, nothing
@@ -1619,7 +1614,7 @@ function _conformdictionary(
     end
     dictcol = col isa DictEncode || _hasrefpool(col) ? col : DictEncode(col)
     fresh = try
-        _constructcolumn(name, dictcol; stringview)
+        _constructcolumn(name, dictcol; stringview, largelists)
     catch err
         err isa ArgumentError || rethrow()
         return nothing, nothing
@@ -1669,6 +1664,9 @@ function _conformdictionary(
     reindexed = _uninferred(_reindexdictionary, data, et, IT, LT, remap, pool)
     return (expected, reindexed), nothing
 end
+
+# Whether field `f` or a descendant has a type that `pred` accepts.
+_anytype(pred, f::AC.Field) = pred(f.type) || any(c -> _anytype(pred, c), f.children)
 
 "`n` null slots of dictionary type `t` that refer to `pool`."
 function _nulldictionary(t::AC.DictionaryType, n::Int, pool::AC.ArrayData)

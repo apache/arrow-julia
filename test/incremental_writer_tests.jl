@@ -467,6 +467,34 @@ batchkinds(bytes) = [
         @test_throws ArgumentError Arrow.Writer(IOBuffer(); file=true, dictreplacement=true)
     end
 
+    @testset "dictionaries with large offsets or views grow" begin
+        # The later table lists its new category first, so its own pool is
+        # not the written one extended.
+        for values in (["c0", "c1"], Vector{UInt8}.(["c0", "c1"])), file in (false, true)
+            for dictdeltas in (false, true)
+                tables = [
+                    (d=Arrow.DictEncode(values[1:1]),),
+                    (d=Arrow.DictEncode(values[[2, 1]]),),
+                ]
+                bytes, errs = writetables(tables; largelists=true, file, dictdeltas)
+                @test all(isnothing, errs)
+                @test Arrow.Table(bytes).d == values[[1, 2, 1]]
+            end
+        end
+        # An append grows a stream another writer's options laid out.
+        for kwargs in ((largelists=true,), (stringview=true,))
+            path = joinpath(mktempdir(), "d.arrow")
+            Arrow.Writer(
+                w -> Arrow.write(w, (d=Arrow.DictEncode(["a"]),)),
+                path;
+                file=false,
+                kwargs...,
+            )
+            Arrow.append(path, (d=Arrow.DictEncode(["b", "a"]),))
+            @test Arrow.Table(path).d == ["a", "b", "a"]
+        end
+    end
+
     @testset "a growing dictionary costs each table its new categories" begin
         # Work per table is proportional to the categories it adds, not to the
         # pool written so far: 2,000 tables cost twice what 1,000 do.
