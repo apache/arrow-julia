@@ -92,16 +92,18 @@ instead of reading the whole stream, for a DuckDB or Polars result larger than m
 - Exports use [`Arrow.write`](@ref)'s column construction and keywords: `dictencode`,
   `stringview`, `largelists`, `metadata`, and `colmetadata` mean what they mean there,
   and the consumer sees the same schema and values as from the IPC bytes. A `Vector` of
-  numbers other than `Bool`, with no `missing` values, crosses without copying, and so
-  do the numbers, booleans, and validity bitmaps of an [`Arrow.Table`](@ref)'s columns,
-  struct fields and list values included. Booleans and `missing` values in Julia vectors
-  are packed into new bitmaps. String and list offsets, a list's own validity bitmap,
-  fixed-size list values, dates, times, timestamps, dictionary-encoded columns, and
-  other Julia values are built into new Arrow buffers, as a write builds them, and
-  string bytes may be copied. `export_stream!` sends one record batch per `Tables.partitions` partition
-  (an `Arrow.Stream` is a partition per batch) and splits a batch only when its string
-  data outgrows 32-bit offsets; `to_c_data` refuses a table that needs more than one
-  batch.
+  `Int8` to `Int64`, `UInt8` to `UInt64`, or `Float16` to `Float64` crosses without
+  copying, and so do an [`Arrow.Table`](@ref) column's integer, float, and boolean
+  values and validity bitmaps, in struct fields and list values too. Everything else is
+  built into new Arrow buffers, as a write builds it: `Bool` and `missing` values in
+  Julia vectors (a `Vector{Union{Missing,T}}` is copied even when it holds no
+  `missing`), other numbers (`Int128`, `Complex`, `Rational`, and decimals, except a
+  `Vector` of 128-bit decimals), dates, times, timestamps, durations, fixed-size binary
+  and UUID values, string and list offsets, a list's own validity bitmap, fixed-size
+  list values, and dictionary-encoded columns. String bytes may be copied.
+  `export_stream!` sends one record batch per `Tables.partitions` partition (an
+  `Arrow.Stream` is a partition per batch) and splits a batch only when its string data
+  outgrows 32-bit offsets; `to_c_data` refuses a table that needs more than one batch.
 - Imports have the column types an IPC read gives: strings as `DataString`, timestamps
   as `Timestamp` or `ZonedTimestamp`, decimals as `Decimal`, nested values as the same
   views, with `stringtype`, `ntasks`, and `limits` as for `Arrow.Table`. Numbers, dates,

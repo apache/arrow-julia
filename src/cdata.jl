@@ -30,8 +30,9 @@
 #     GC finalizers. The Julia side keeps each export's roots (the columns,
 #     whose regions keep the buffers alive) and mallocs in `EXPORTS` until the
 #     count reaches zero; later exports or garbage collections free them.
-#     `to_c_data`'s two top-level structs, the only Julia memory a consumer can
-#     read after releasing it, are freed 10 ms after the rest.
+#     `to_c_data`'s two top-level structs, the only memory Arrow.jl allocates
+#     that a consumer can read after releasing it, are freed by the first reap
+#     at least 10 ms after the rest.
 #
 #   * Import: the moved ArrowArray becomes ONE ForeignOwner shared by every
 #     child/dictionary BufferSlice (a single release for the whole tree).
@@ -460,19 +461,23 @@ end
 # `_newexport` (see `_EXPORTS_UNTIL_REAP`) and from `_ReapHook`, so no caller needs to.
 function _reap!()
     done = Export[]
+    expired = Ptr{Cvoid}[]
     lock(REGISTRY_LOCK) do
-        now = time_ns()
         peak = _EXPORTS_PEAK[] = max(_EXPORTS_PEAK[], length(EXPORTS))
         for e in values(EXPORTS)
             unsafe_load(e.live, :sequentially_consistent) == 0 && push!(done, e)
         end
+        # Read after the scan, so a block's stamp is later than the release the scan saw.
+        now = time_ns()
         for e in done
             delete!(EXPORTS, e.live)
             e.top == C_NULL || push!(_RETIRED, (now, e.top))
         end
         while !isempty(_RETIRED) && now - first(_RETIRED)[1] >= _TOP_FREE_AFTER_NS
-            Libc.free(popfirst!(_RETIRED)[2])
+            push!(expired, popfirst!(_RETIRED)[2])
         end
+        # A drained queue gives back the capacity a burst grew.
+        isempty(_RETIRED) && sizehint!(_RETIRED, 0)
         n = length(EXPORTS)
         if peak > 4 * max(64, n)
             sizehint!(EXPORTS, n)
@@ -481,6 +486,7 @@ function _reap!()
         _EXPORTS_UNTIL_REAP[] = max(64, n)
         return nothing
     end
+    foreach(Libc.free, expired)
     foreach(_free!, done)
     return length(done)
 end

@@ -235,15 +235,16 @@ Export a Tables.jl table as one record batch through the C data interface: an
 `ArrowSchema` and an `ArrowArray` that Arrow.jl allocates, whose struct array has one
 child per column. The columns are built as [`Arrow.write`](@ref) builds them, with the
 same keywords (`dictencode`, `stringview`, `largelists`, `metadata`, `colmetadata`), so a
-consumer reads what it would read from the IPC bytes. A `Vector` of numbers other than
-`Bool`, with no `missing` values, crosses without copying, as do the numbers, booleans,
-and validity bitmaps of an [`Arrow.Table`](@ref)'s columns; what crosses without
-copying must not be modified or resized while the consumer reads it. Booleans and
-`missing` values in Julia vectors are packed into new bitmaps, string and list offsets
-are rebuilt, and string bytes may be copied. The
-consumer moves or releases the two structs; the table's memory stays reachable until it
-has released the array, and what Arrow.jl allocated is freed by later exports or
-garbage collections. A table that needs more than one record batch (several partitions
+consumer reads what it would read from the IPC bytes. A `Vector` of `Int8` to `Int64`,
+`UInt8` to `UInt64`, or `Float16` to `Float64` crosses without copying, as do an
+[`Arrow.Table`](@ref) column's integer, float, and boolean values and validity bitmaps;
+what crosses without copying must not be modified or resized while the consumer reads
+it. Everything else, `Bool` and `missing` in Julia vectors, decimals, dates and
+timestamps, string and list offsets, a list's own validity bitmap, and fixed-size list
+values included, is built into new buffers, and string bytes may be copied. The consumer
+moves or releases the two structs; the table's memory stays reachable until it has
+released the array, and what Arrow.jl allocated is freed by later exports or garbage
+collections. A table that needs more than one record batch (several partitions
 with rows, or string data past 2 GiB) is an `ArgumentError`; export it with
 [`Arrow.export_stream!`](@ref).
 """

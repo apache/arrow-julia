@@ -89,9 +89,9 @@ code, and what Arrow 2.x can read of files Arrow 3.0 writes.
   table keeps these types.
 - The C data and C stream interfaces: `Arrow.to_c_data(table)` and
   `Arrow.export_stream!(streamptr, table)` export any Tables.jl table, built as
-  `Arrow.write` builds it: a `Vector` of numbers other than `Bool`, without `missing`
-  values, and an `Arrow.Table`'s fixed-width buffers cross without copying, and string
-  and list offsets are rebuilt. `Arrow.Table(schemaptr, arrayptr)`,
+  `Arrow.write` builds it: plain integer and float `Vector`s and an `Arrow.Table`'s
+  integer, float, and boolean buffers cross without copying, and other columns are built
+  into new buffers. `Arrow.Table(schemaptr, arrayptr)`,
   `Arrow.Table(streamptr)`, and `Arrow.Stream(streamptr)` import a record batch or a
   stream with the column types an IPC read gives, reading fixed-width values in the
   producer's memory. Memory handed to a consumer is freed once the consumer releases
