@@ -260,10 +260,11 @@ so producing tables one at a time never holds more than one partition of
 the current table in memory. `sink` is a file path, or another object that
 `open(sink, "w")` accepts (the writer opens and owns the handle), or an `IO`
 (borrowed; `close` finishes the IPC output but leaves the `IO` open). The function
-form runs `f(writer)` and always closes the writer. The keywords mean what they mean
-for [`Arrow.write`](@ref), whose metadata rules apply too. An existing file path is
-replaced as by [`Arrow.write`](@ref): the output goes to a temporary file that `close`
-renames over the old file.
+form runs `f(writer)` and closes the writer; if `f` throws before writing a table,
+the writer is abandoned instead, so a path's existing file keeps its bytes. The
+keywords mean what they mean for [`Arrow.write`](@ref), whose metadata rules apply
+too. An existing file path is replaced as by [`Arrow.write`](@ref): the output goes
+to a temporary file that `close` renames over the old file.
 
     w = Arrow.Writer(path)
     for tbl in tables
@@ -431,7 +432,9 @@ function Writer(f::Function, sink; kwargs...)
         f(w)
     catch
         try
-            close(w)
+            # Before any table, there is nothing to keep: a path's file keeps
+            # its old bytes.
+            w.st === nothing ? _abandon!(w) : close(w)
         catch
             # Preserve the body error if finalization or sink cleanup fails.
         end
@@ -442,7 +445,7 @@ function Writer(f::Function, sink; kwargs...)
 end
 
 # The Arrow 2.x opening idiom: `open(Arrow.Writer, sink)` constructs the
-# writer (the caller closes it), and the function form closes it after `f`.
+# writer (the caller closes it), and the function form is `Writer(f, sink)`.
 Base.open(::Type{Writer}, sink; kwargs...) = Writer(sink; kwargs...)
 Base.open(f::Function, ::Type{Writer}, sink; kwargs...) = Writer(f, sink; kwargs...)
 

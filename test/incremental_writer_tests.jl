@@ -511,6 +511,26 @@ batchkinds(bytes) = [
         end
     end
 
+    @testset "a function-form writer that writes no table keeps the path" begin
+        path = joinpath(mktempdir(), "keep.arrow")
+        Arrow.write(path, t1)
+        before = read(path)
+        # The first table is refused (columns of different lengths).
+        @test_throws ArgumentError Arrow.Writer(
+            w -> Arrow.write(w, (a=[1], b=[1, 2])),
+            path,
+        )
+        @test read(path) == before
+        @test_throws ErrorException open(w -> error("no table"), Arrow.Writer, path)
+        @test read(path) == before
+        io = IOBuffer()
+        @test_throws ErrorException Arrow.Writer(w -> error("no table"), io)
+        @test isempty(take!(io))
+        # A writer closed without a table writes an output with no columns.
+        close(Arrow.Writer(path))
+        @test isempty(Tables.columnnames(Arrow.Table(read(path))))
+    end
+
     @testset "close is idempotent; a closed writer refuses writes" begin
         io = IOBuffer()
         w = Arrow.Writer(io)

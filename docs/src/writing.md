@@ -173,7 +173,8 @@ DictionaryReplacement feature, which some readers (nanoarrow) refuse.
 [`Arrow.Writer`](@ref) writes one output from several tables, such as batches that do
 not fit in memory together. Each `Arrow.write(writer, table)` encodes that table's record
 batches and hands them to the sink before it returns; `close` finishes the output, and the
-function form always closes it. A writer to a path writes nothing to that path until
+function form closes it (or, if its function throws before writing a table, abandons it,
+so an existing file is kept). A writer to a path writes nothing to that path until
 `close`: an existing file is replaced then, from a temporary file beside it, and a new
 file holds no complete output before.
 
