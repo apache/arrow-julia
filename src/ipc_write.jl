@@ -1371,7 +1371,7 @@ function _poolvalueequal(
     end
     avalue = AC._value(t, f, a, ia)
     bvalue = AC._value(t, f, b, ib)
-    return t isa FloatType ? _writerstorageequal(avalue, bvalue) : isequal(avalue, bvalue)
+    return t isa FloatType ? _poolkey(avalue) == _poolkey(bvalue) : isequal(avalue, bvalue)
 end
 
 """

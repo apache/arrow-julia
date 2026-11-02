@@ -16,7 +16,7 @@
 
 module IPCDictionaryTests
 
-using Test, Arrow, Tables, DataDecimals, DataStrings, InlineStrings, UUIDs
+using Test, Arrow, Tables, DataDecimals, DataStrings, InlineStrings, UUIDs, PooledArrays
 const AC = Arrow.AC
 const Meta = Arrow.Meta
 const FB = Arrow.FB
@@ -593,29 +593,6 @@ end
         )
         return inline ? (values..., InlineStrings.String255(text)) : values
     end
-    # Encoding identity must agree across representations, even with invalid UTF-8.
-    for text in [texts; String(UInt8[0xff, 0x00, 0x80])]
-        for left in representations(text),
-            right in representations(text),
-            seed in (UInt(0), UInt(15), typemax(UInt))
-
-            @test Arrow._writerstorageequal(left, right)
-            @test Arrow._writerstoragehash(left, seed) ==
-                  Arrow._writerstoragehash(right, seed)
-        end
-    end
-    wide = WideString(UInt16[0x0100, 0x0200, 0x0300])
-    widekeys = Dict(Arrow._WriterStorageKey(wide) => 1)
-    widekeys[Arrow._WriterStorageKey(WideString(copy(wide.data)))] = 2
-    widekeys[Arrow._WriterStorageKey(WideString(UInt16[0x0101, 0x0200, 0x0300]))] = 3
-    @test length(widekeys) == 2
-    @test widekeys[Arrow._WriterStorageKey(wide)] == 2
-    for seed in (UInt(0), UInt(15), typemax(UInt))
-        @test Arrow._writerstorageequal(WideString(UInt16[]), "")
-        @test Arrow._writerstoragehash(WideString(UInt16[]), seed) ==
-              Arrow._writerstoragehash("", seed)
-    end
-
     mixed = AbstractString[
         value for text in texts for value in representations(text; inline=false)
     ]
@@ -642,13 +619,7 @@ end
 @testset "Dictionary categories preserve primitive bits" begin
     D = Decimal{20,2,Int128}
     decimals = D[D("1.25"), D("2.50"), D("1.25")]
-    for values in (
-            Int128[1, 2, 1],
-            UInt128[1, 2, 1],
-            UUID.(UInt128[1, 2, 1]),
-            decimals,
-            [[x] for x in decimals],
-        ),
+    for values in (Int128[1, 2, 1], UInt128[1, 2, 1], decimals, [[x] for x in decimals]),
         file in (false, true),
         batchsize in (1, 64)
 
@@ -658,6 +629,25 @@ end
     codes = reinterpret(PrimitiveCode, Int16[1, 2, 1])
     bytes = take!(Arrow.tobuffer((x=Arrow.DictEncode(codes),)))
     @test Arrow.Table(bytes).x == Int16[1, 2, 1]
+end
+
+@testset "UUID columns are not dictionary-encoded" begin
+    uuids = UUID.(UInt128[1, 2, 1])
+    # pyarrow cannot read a dictionary of arrow.uuid values, so pooled UUIDs and
+    # `dictencode` write the values themselves.
+    for (col, kwargs) in (
+        (PooledArray(uuids), (;)),
+        (PooledArray(Union{Missing,UUID}[uuids; missing]), (;)),
+        (uuids, (dictencode=true,)),
+        (uuids, (dictencode=:u,)),
+        (PooledArray(uuids), (dictencode=:u,)),
+    )
+        t = Arrow.Table(Arrow.tobuffer((u=col,); kwargs...))
+        @test !(t.u isa Arrow.DictEncoded)
+        @test isequal(collect(t.u), collect(col))
+    end
+    err = @test_throws ArgumentError Arrow.write(IOBuffer(), (u=Arrow.DictEncode(uuids),))
+    @test occursin("column u holds UUIDs", err.value.msg)
 end
 
 @testset "Dictionary pool updates preserve NaN payloads" begin

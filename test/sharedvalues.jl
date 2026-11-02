@@ -116,6 +116,14 @@ end
     end
 end
 
+@testset "mixed decimal precisions name the column" begin
+    mixed = Any[Decimal{5,2}("1.25"), Decimal{7,3}("1.255")]
+    err = @test_throws ArgumentError Arrow.write(IOBuffer(), (t=mixed,))
+    @test occursin("column t mixes decimal types", err.value.msg)
+    err = @test_throws ArgumentError Arrow.write(IOBuffer(), (t=DataDecimals.Decimal[],))
+    @test occursin("column t is an empty decimal column", err.value.msg)
+end
+
 @testset "small-precision decimals write as decimal128" begin
     # Arrow 2.x reads only decimal128/256 (it read decimal32/64 data as
     # garbage); pyarrow, Polars, and DuckDB write decimal128 here too.

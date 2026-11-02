@@ -25,10 +25,56 @@ using Dates
 using Tables
 using Arrow
 using PooledArrays
+import ArrowTypes
 import CategoricalArrays
 import DataAPI
 
 const AC = Arrow.ArrowCore
+
+# A labelled value stored as Union{Nothing,String}: its Null child holds `nothing`.
+struct MaybeLabel
+    value::Union{Nothing,String}
+end
+const MAYBE_LABEL = Symbol("JuliaLang.ArrowTests.WriterMaybe")
+ArrowTypes.ArrowType(::Type{MaybeLabel}) = Union{Nothing,String}
+ArrowTypes.toarrow(x::MaybeLabel) = x.value
+ArrowTypes.arrowname(::Type{MaybeLabel}) = MAYBE_LABEL
+ArrowTypes.JuliaType(::Val{MAYBE_LABEL}, S, metadata) = MaybeLabel
+ArrowTypes.fromarrow(::Type{MaybeLabel}, ::Nothing) = MaybeLabel(nothing)
+ArrowTypes.fromarrow(::Type{MaybeLabel}, x::AbstractString) = MaybeLabel(String(x))
+
+# A labelled value stored as Union{Int64,String}.
+struct EitherLabel
+    value::Union{Int64,String}
+end
+const EITHER_LABEL = Symbol("JuliaLang.ArrowTests.WriterEither")
+ArrowTypes.ArrowType(::Type{EitherLabel}) = Union{Int64,String}
+ArrowTypes.toarrow(x::EitherLabel) = x.value
+ArrowTypes.arrowname(::Type{EitherLabel}) = EITHER_LABEL
+ArrowTypes.JuliaType(::Val{EITHER_LABEL}, S, metadata) = EitherLabel
+ArrowTypes.fromarrow(::Type{EitherLabel}, x::Int64) = EitherLabel(x)
+ArrowTypes.fromarrow(::Type{EitherLabel}, x::AbstractString) = EitherLabel(String(x))
+
+# The output of `tables` written through one Arrow.Writer, and each table's
+# error (or nothing).
+function writetables(tables; kwargs...)
+    io = IOBuffer()
+    errs = Any[]
+    Arrow.Writer(io; kwargs...) do w
+        for t in tables
+            push!(errs, try
+                Arrow.write(w, t)
+                nothing
+            catch err
+                err
+            end)
+        end
+    end
+    return take!(io), errs
+end
+refused(err, name) = err isa ArgumentError && occursin("column $name", err.msg)
+# Field `a` of each row of a struct column (a NamedTuple or an ordered Pair vector).
+fielda(r) = r === missing ? missing : r isa NamedTuple ? r.a : last(only(r))
 
 # A producer may refill its buffers once the consumer asks for another partition.
 struct ReusedPartitions{Known,F}
@@ -61,6 +107,44 @@ dictbatches(bytes) = [
     (m.msg.header.id, m.msg.header.isDelta, m.msg.header.data.length) for
     m in framedmessages(bytes) if m.msg.header isa Arrow.Meta.DictionaryBatch
 ]
+
+# `k` Writer tables of 20 rows, each adding 20 string categories as a delta.
+function growdictionary(k)
+    io = IOBuffer()
+    Arrow.Writer(io; file=false, dictdeltas=true, dictencode=true) do w
+        for t = 1:k
+            Arrow.write(w, (s=["c$(t)_$i" for i = 1:20],))
+        end
+    end
+    return take!(io)
+end
+growthallocations(k) = @allocated growdictionary(k)
+appendallocations(path, table) = @allocated Arrow.append(path, table)
+function batchedallocations(t, n)
+    io = IOBuffer(; sizehint=4_000_000)
+    return @allocated Arrow.write(io, t; batchsize=n)
+end
+
+# A two-row stream of dense union `u` (children Int64 `i` and String `s`,
+# nullable as `nullable` says), or of a nullable struct `t` around it.
+function unionstream(path, nullable; nested=false)
+    (i, id), (s, sd) = AC.fromjulia("i", Int64[1]), AC.fromjulia("s", ["a"])
+    t = AC.UnionType(AC.DenseMode, Int8[0, 1])
+    children = [
+        AC.Field("i", i.type; nullable=nullable[1]),
+        AC.Field("s", s.type; nullable=nullable[2]),
+    ]
+    f = AC.Field("u", t; nullable=true, children)
+    buffers = [AC._databuffer(Int8[0, 1]), AC._databuffer(Int32[0, 0])]
+    d = AC.ArrayData(t, 2, buffers; children=[id, sd], nullcount=0)
+    if nested
+        f = AC.Field("t", AC.StructType(); nullable=true, children=[f])
+        d = AC.ArrayData(AC.StructType(), 2, [AC.BufferSlice()]; children=[d], nullcount=0)
+    end
+    sch = AC.Schema([f])
+    write(path, Arrow.writestream(sch, [AC.RecordBatch(sch, [d], 2)]))
+    return path
+end
 
 # :dictionary or :record for each batch message, in order.
 batchkinds(bytes) = [
@@ -383,6 +467,55 @@ batchkinds(bytes) = [
         @test_throws ArgumentError Arrow.Writer(IOBuffer(); file=true, dictreplacement=true)
     end
 
+    @testset "dictionaries with large offsets or views grow" begin
+        # The later table lists its new category first, so its own pool is
+        # not the written one extended.
+        for values in (["c0", "c1"], Vector{UInt8}.(["c0", "c1"])), file in (false, true)
+            for dictdeltas in (false, true)
+                tables = [
+                    (d=Arrow.DictEncode(values[1:1]),),
+                    (d=Arrow.DictEncode(values[[2, 1]]),),
+                ]
+                bytes, errs = writetables(tables; largelists=true, file, dictdeltas)
+                @test all(isnothing, errs)
+                @test Arrow.Table(bytes).d == values[[1, 2, 1]]
+            end
+        end
+        # An append grows a stream another writer's options laid out.
+        for kwargs in ((largelists=true,), (stringview=true,))
+            path = joinpath(mktempdir(), "d.arrow")
+            Arrow.Writer(
+                w -> Arrow.write(w, (d=Arrow.DictEncode(["a"]),)),
+                path;
+                file=false,
+                kwargs...,
+            )
+            Arrow.append(path, (d=Arrow.DictEncode(["b", "a"]),))
+            @test Arrow.Table(path).d == ["a", "b", "a"]
+        end
+    end
+
+    @testset "a growing dictionary costs each table its new categories" begin
+        # Work per table is proportional to the categories it adds, not to the
+        # pool written so far: 2,000 tables cost twice what 1,000 do.
+        growdictionary(10)
+        @test growthallocations(2_000) < 2.5 * growthallocations(1_000)
+        @test length(dictbatches(growdictionary(2_000))) == 2_000
+        t = Arrow.Table(growdictionary(100))
+        @test t.s == ["c$(t)_$i" for t = 1:100 for i = 1:20]
+    end
+
+    @testset "a dictionary column's later batches map their codes without per-row allocation" begin
+        t = (; d=Arrow.DictEncode([string("c", i % 32) for i = 1:1_000_000]))
+        batchedallocations(t, 500_000)
+        batchedallocations(t, 1_000_000)
+        # The second batch's 500,000 codes map into the first batch's pool.
+        extra = batchedallocations(t, 500_000) - batchedallocations(t, 1_000_000)
+        @test extra < 8 * 500_000
+        @test Arrow.Table(take!(Arrow.write(IOBuffer(), t; batchsize=500_000))).d ==
+              t.d.data
+    end
+
     @testset "one-shot dictionaries use the narrowest index type" begin
         indextype(t) = (
             only(
@@ -404,6 +537,26 @@ batchkinds(bytes) = [
             @test t.ordered == ordered
             @test Arrow.Table(bytes).c == ["lo", "hi", "lo"]
         end
+    end
+
+    @testset "a function-form writer that writes no table keeps the path" begin
+        path = joinpath(mktempdir(), "keep.arrow")
+        Arrow.write(path, t1)
+        before = read(path)
+        # The first table is refused (columns of different lengths).
+        @test_throws ArgumentError Arrow.Writer(
+            w -> Arrow.write(w, (a=[1], b=[1, 2])),
+            path,
+        )
+        @test read(path) == before
+        @test_throws ErrorException open(w -> error("no table"), Arrow.Writer, path)
+        @test read(path) == before
+        io = IOBuffer()
+        @test_throws ErrorException Arrow.Writer(w -> error("no table"), io)
+        @test isempty(take!(io))
+        # A writer closed without a table writes an output with no columns.
+        close(Arrow.Writer(path))
+        @test isempty(Tables.columnnames(Arrow.Table(read(path))))
     end
 
     @testset "close is idempotent; a closed writer refuses writes" begin
@@ -465,6 +618,10 @@ batchkinds(bytes) = [
         @test t.b == ["x", "y", "z", "w"]
         Arrow.append(path, (; a=Int64[5], b=["v"]))
         @test Arrow.Table(path).a == [1, 2, 3, 4, 5]
+        # The one-table write fixed `a` non-nullable; the refusal says so.
+        err = @test_throws ArgumentError Arrow.append(path, (; a=[missing], b=["v"]))
+        @test occursin("not nullable", err.value.msg)
+        @test occursin("Arrow.Writer", err.value.msg)
 
         io = IOBuffer()
         Arrow.write(io, t1; file=false)
@@ -481,6 +638,39 @@ batchkinds(bytes) = [
         Arrow.append(io, t1)
         Arrow.append(io, t2)
         @test Arrow.Table(take!(io)).b == ["x", "y", "z", "w"]
+    end
+
+    @testset "append unmaps the file before it returns" begin
+        path = joinpath(mktempdir(), "s.arrow")
+        Arrow.write(path, t1; file=false)
+        # Windows refuses to delete or replace a mapped file, so a mapping left
+        # for the GC to release would fail these until a collection ran.
+        enabled = GC.enable(false)
+        try
+            Arrow.append(path, t2)
+            Sys.islinux() && @test !any(contains(path), eachline("/proc/self/maps"))
+            Arrow.write(path, t1; file=false)
+            Arrow.append(path, t2)
+            rm(path)
+        finally
+            GC.enable(enabled)
+        end
+        @test !isfile(path)
+    end
+
+    @testset "append reads the stream's metadata and dictionaries, not its batches" begin
+        path = tempname()
+        parts = Tables.partitioner([
+            (x=fill(Float64(p), 500_000), d=Arrow.DictEncode(fill("a", 500_000))) for
+            p = 1:4
+        ])
+        Arrow.write(path, parts; file=false)
+        Arrow.append(path, (x=[5.0], d=["b"]))
+        @test appendallocations(path, (x=[6.0], d=["a"])) < filesize(path) ÷ 16
+        t = Arrow.Table(path)
+        @test t.x[(end - 1):end] == [5.0, 6.0]
+        @test t.d[(end - 2):end] == ["a", "b", "a"]
+        rm(path)
     end
 
     @testset "append to a stream without an end-of-stream marker" begin
@@ -536,11 +726,117 @@ batchkinds(bytes) = [
         Arrow.write(spath, t1; file=false)
         err = @test_throws ArgumentError Arrow.append(spath, (; wrong=[1]))
         @test occursin("do not match", err.value.msg)
-        # A corrupt prefix refuses instead of gaining valid-looking bytes.
+        # A corrupt schema message refuses instead of gaining valid-looking bytes.
         bytes = read(spath)
         bytes[9] ⊻= 0x40
         write(spath, bytes)
         @test_throws Exception Arrow.append(spath, t2)
+    end
+
+    @testset "missing values go where a union keeps its nulls" begin
+        dir = mktempdir()
+        # No child keeps a null, so missing values are refused, not written as values.
+        path = unionstream(joinpath(dir, "u.arrow"), (false, false))
+        err = @test_throws ArgumentError Arrow.append(path, (u=[missing, missing],))
+        @test occursin("no child of the schema's union holds a null", err.value.msg)
+        @test isequal(collect(Arrow.Table(path).u), [1, "a"])
+        # Only the second child keeps nulls, under a struct with a null row.
+        path = unionstream(joinpath(dir, "t.arrow"), (false, true); nested=true)
+        T = NamedTuple{(:u,),Tuple{Union{Missing,Int64}}}
+        Arrow.append(path, (t=Union{Missing,T}[(u=missing,), missing, (u=5,)],))
+        rows = Arrow.Table(path).t
+        @test isequal(
+            [ismissing(r) ? missing : r.u for r in rows],
+            [1, "a", missing, missing, 5],
+        )
+    end
+
+    @testset "a labelled Null child holds a value, not a missing value" begin
+        # An unlabelled union keeps later missing values in a nullable child;
+        # its `JuliaLang.Nothing` child holds `nothing`.
+        U = Union{Missing,Nothing,Int}
+        tables = [(x=Union{Nothing,Int}[nothing, 1],), (x=U[missing, 2],), (x=[missing],)]
+        bytes, errs = writetables(tables)
+        @test all(isnothing, errs)
+        @test isequal(collect(Arrow.Table(bytes).x), U[nothing, 1, missing, 2, missing])
+        # Without a nullable child, they are refused.
+        bytes, errs = writetables(tables; nullable=false)
+        @test errs[1] === nothing && all(e -> refused(e, :x), errs[2:3])
+        @test isequal(collect(Arrow.Table(bytes).x), [nothing, 1])
+        path = joinpath(mktempdir(), "u.arrows")
+        Arrow.write(path, tables[1]; file=false)
+        @test refused((@test_throws ArgumentError Arrow.append(path, tables[2])).value, :x)
+        @test isequal(collect(Arrow.Table(path).x), [nothing, 1])
+        # Every child of a labelled union holds a value: a later missing value
+        # needs the Null child a first table with missing values declares.
+        for values in
+            ([MaybeLabel(nothing), MaybeLabel("a")], [EitherLabel(1), EitherLabel("a")])
+            T = Union{Missing,eltype(values)}
+            bytes, errs = writetables([(x=values,), (x=T[values[2], missing],)])
+            @test refused(errs[2], :x)
+            @test isequal(collect(Arrow.Table(bytes).x), values)
+            bytes, errs = writetables([(x=T[values...],), (x=T[values[2], missing],)])
+            @test isequal(collect(Arrow.Table(bytes).x), T[values; values[2]; missing])
+        end
+        # A column of `nothing` writes Null labelled `JuliaLang.Nothing`.
+        bytes, errs = writetables([(x=[nothing, nothing],), (x=[missing],)])
+        @test refused(errs[2], :x)
+        # A labelled union under a null struct row holds a stand-in there.
+        S = Union{Missing,NamedTuple{(:a,),Tuple{EitherLabel}}}
+        bytes, errs = writetables([
+            (x=S[(a=EitherLabel(1),)],),
+            (x=S[missing, (a=EitherLabel("x"),)],),
+        ])
+        @test all(isnothing, errs)
+        @test isequal(
+            fielda.(Arrow.Table(bytes).x),
+            [EitherLabel(1), missing, EitherLabel("x")],
+        )
+    end
+
+    @testset "a union child with only missing values in a table holds nulls" begin
+        U = Union{Missing,Int,String}
+        tables = [(u=Union{Int,String}[1, "a"],), (u=U["b", missing],), (u=U[missing],)]
+        bytes, errs = writetables(tables)
+        @test all(isnothing, errs)
+        @test isequal(collect(Arrow.Table(bytes).u), U[1, "a", "b", missing, missing])
+        path = joinpath(mktempdir(), "u.arrows")
+        Arrow.Writer(w -> Arrow.write(w, tables[1]), path; file=false)
+        Arrow.append(path, tables[2])
+        @test isequal(collect(Arrow.Table(path).u), U[1, "a", "b", missing])
+        # A struct with a union field, then a table with a null row.
+        S = Union{Missing,NamedTuple{(:a,),Tuple{Union{Int,String}}}}
+        bytes, errs = writetables([(s=S[(a=1,)],), (s=S[missing, (a="x",)],)])
+        @test all(isnothing, errs)
+        @test isequal(fielda.(Arrow.Table(bytes).s), [1, missing, "x"])
+    end
+
+    @testset "refusals name the column's type and advise only what would help" begin
+        # A Writer's columns are already nullable: no advice to start one.
+        _, errs = writetables([(t=[Date(2020, 1, 1)],), (t=[DateTime(2020)],)])
+        msg = errs[2].msg
+        @test occursin("DateTime values", msg)
+        @test occursin("date32 (reads as", msg)
+        @test !occursin("Arrow.Writer(path", msg)
+        _, errs = writetables([(a=[1],), (a=[missing],)]; nullable=false)
+        @test occursin("created with nullable=false", errs[2].msg)
+        @test !occursin("one-table", errs[2].msg)
+        # An append to a one-table stream: a nullable Writer would have taken
+        # the missing values, but not another type or a labelled union's.
+        path = joinpath(mktempdir(), "s.arrow")
+        Arrow.write(path, (a=[1], u=[MaybeLabel("x")]); file=false)
+        hint = "start the stream with Arrow.Writer(path; file=false)"
+        err = @test_throws ArgumentError Arrow.append(
+            path,
+            (a=[missing], u=[MaybeLabel("y")]),
+        )
+        @test occursin(hint, err.value.msg)
+        err = @test_throws ArgumentError Arrow.append(path, (a=["x"], u=[MaybeLabel("y")]))
+        @test !occursin(hint, err.value.msg)
+        U = Union{Missing,MaybeLabel}
+        err = @test_throws ArgumentError Arrow.append(path, (a=[2], u=U[missing]))
+        @test occursin("no child of the schema's union holds a null", err.value.msg)
+        @test !occursin(hint, err.value.msg)
     end
 
     @testset "append to an Arrow 2.x stream" begin

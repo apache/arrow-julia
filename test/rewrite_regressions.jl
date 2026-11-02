@@ -71,6 +71,23 @@ function _fixedlistnullbytes(listsize::Int; file::Bool)
     return file ? Arrow.writefile(schema, [batch]) : Arrow.writestream(schema, [batch])
 end
 
+# A run-end column of 4 runs over `n` rows.
+function _reebytes(n)
+    runfield, runs = AC.fromjulia("run_ends", Int32[n ÷ 4, n ÷ 2, 3n ÷ 4, n])
+    _, values = AC.fromjulia("values", Int64[1, 2, 3, 4])
+    t = AC.RunEndEncodedType()
+    field = AC.Field(
+        "r",
+        t;
+        nullable=false,
+        children=[runfield, AC.Field("values", AC.IntType(64, true); nullable=false)],
+    )
+    data = AC.ArrayData(t, n, AC.BufferSlice[]; children=[runs, values], nullcount=0)
+    schema = AC.Schema([field])
+    return Arrow.writestream(schema, [AC.RecordBatch(schema, [data], n)])
+end
+_rewriteallocations(t) = @allocated Arrow.write(IOBuffer(), t)
+
 @testset "facade rewrite correctness regressions" begin
     @testset "repeated names read as x, x_1, as CSV.jl names them" begin
         f1, d1 = AC.fromjulia("x", Int64[1, 2])
@@ -118,11 +135,10 @@ end
     end
 
     @testset "retained dictionaries keep value descriptors and order" begin
-        datefield, dateparts = Arrow._constructcolumn(
+        datefield, datedata = Arrow._constructcolumn(
             Symbol("date-values"),
-            AbstractVector[Date[Date(2024, 1, 1), Date(2024, 1, 2)]],
+            Date[Date(2024, 1, 1), Date(2024, 1, 2)],
         )
-        datedata = only(dateparts)
         datebytes = _dictbytes(datefield, datedata, Int8[1, 0])
         dateback = Arrow.readstream(_rewrite(datebytes))
         datetype = dateback.schema.fields[1].type::AC.DictionaryType
@@ -291,8 +307,7 @@ end
     @testset "retained composites rebuild recursively" begin
         Row = NamedTuple{(:x, :y),Tuple{Int64,Union{Missing,String}}}
         pool = Row[(x=1, y=missing), (x=2, y=missing)]
-        structfield, structparts = Arrow._constructcolumn(:pool, AbstractVector[pool])
-        structdata = only(structparts)
+        structfield, structdata = Arrow._constructcolumn(:pool, pool)
         structbytes = _dictbytes(structfield, structdata, Int8[1, 0])
         structback = Arrow.readstream(_rewrite(structbytes))
         dictionaryfield = structback.schema.fields[1]
@@ -544,7 +559,7 @@ end
         # Identity-only dedup used to build an O(rows) candidate pool for
         # identity-distinct (mutable) categories such as Vector{Int} rows.
         rows = [isodd(i) ? [1, 2] : [3, 4] for i = 1:50_000]
-        pool = Arrow._dictionarypool(AbstractVector[rows], nothing)
+        pool = Arrow._dictionarypool(rows, nothing)
         @test length(pool) == 2
         @test pool == [[1, 2], [3, 4]]
 
@@ -556,37 +571,111 @@ end
         @test length(back.batches[1].columns[1].dictionary::AC.ArrayData) == 2
         @test isequal(Arrow.Table(bytes).v, rows)
 
-        # The `_WriterStorageKey` policy is preserved exactly: floats compare
-        # by bits (0.0 and -0.0 stay distinct, one NaN payload is one
-        # category) and mutable structs compare by reference.
-        floatpool =
-            Arrow._dictionarypool(AbstractVector[Float64[0.0, -0.0, NaN, NaN]], nothing)
+        # Candidate categories compare as `===`: floats by bits (0.0 and -0.0
+        # stay distinct, one NaN payload is one category), mutable values by
+        # reference, arrays of plain values by contents.
+        floatpool = Arrow._dictionarypool(Float64[0.0, -0.0, NaN, NaN], nothing)
         @test length(floatpool) == 3
         a = Ref(1)
         b = Ref(1)
-        refpool = Arrow._dictionarypool(AbstractVector[[a, b, a]], nothing)
+        refpool = Arrow._dictionarypool([a, b, a], nothing)
         @test length(refpool) == 2
     end
 
-    @testset "hidden dictionary slots synthesize through the value field" begin
-        valuefield, _ = AC.fromjulia("d", ["x"])
-        dicttype = AC.DictionaryType(AC.IntType(32, true), valuefield.type, false)
-        nullabledict = AC.Field("d", dicttype; nullable=true)
-        nonnullabledict = AC.Field("d", dicttype; nullable=false)
-        @test Arrow._writercansynthesize(nonnullabledict; inactive=true)
-        # A nullable dictionary in an inactive subtree may null its index.
-        @test Arrow._writerhiddenstorage(nullabledict; inactive=true) === missing
-        # A non-nullable dictionary's index stays valid even in an inactive
-        # subtree, so the placeholder is the VALUE field's placeholder; this
-        # used to throw "cannot synthesize hidden child data for retained
-        # DictionaryType field", contradicting _writercansynthesize.
-        @test Arrow._writerhiddenstorage(nonnullabledict; inactive=true) == ""
-        @test Arrow._writerhiddenstorage(nullabledict; forcevalid=true) == ""
+    @testset "dictionary and run-end columns rewrite from their buffers" begin
+        # Indices and runs are reused, not found again value by value.
+        n = 1_000_000
+        dict = Arrow.Table(
+            take!(Arrow.tobuffer((d=Arrow.DictEncode(rand(["a", "b", "c"], n)),))),
+        )
+        ree = Arrow.Table(_reebytes(n))
+        for t in (dict, ree)
+            _rewriteallocations(t)
+            once = take!(Arrow.tobuffer(t))
+            @test take!(Arrow.tobuffer(Arrow.Table(once))) == once
+            @test isequal(Arrow.Table(once)[1], t[1])
+        end
+        @test _rewriteallocations(dict) < 40n
+        @test _rewriteallocations(ree) < n
+        @test getfield(Arrow.Table(take!(Arrow.tobuffer(ree))), :schema).fields[1].type isa
+              AC.RunEndEncodedType
+    end
 
-        intvaluefield, _ = AC.fromjulia("d", Int64[1])
-        intdicttype = AC.DictionaryType(AC.IntType(32, true), intvaluefield.type, false)
-        intdict = AC.Field("d", intdicttype; nullable=false)
-        @test Arrow._writerhiddenstorage(intdict; inactive=true) === Int64(0)
+    @testset "a child whose values in a batch are all null rewrites" begin
+        function onebatch(f, d)
+            sch = AC.Schema([f])
+            return Arrow.writestream(sch, [AC.RecordBatch(sch, [d], Int(d.len))])
+        end
+        # Unions whose Int64 child holds only a null, as pyarrow writes them.
+        for sparse in (false, true)
+            fi, di = AC.fromjulia("i", Union{Missing,Int64}[missing for _ = 1:(1 + sparse)])
+            fs, ds = AC.fromjulia("s", sparse ? ["", "x"] : ["x"])
+            t = AC.UnionType(sparse ? AC.SparseMode : AC.DenseMode, Int8[0, 1])
+            buffers = AC.BufferSlice[AC._databuffer(Int8[0, 1])]
+            sparse || push!(buffers, AC._databuffer(Int32[0, 0]))
+            f = AC.Field("u", t; nullable=true, children=[fi, fs])
+            bytes = onebatch(f, AC.ArrayData(t, 2, buffers; children=[di, ds], nullcount=0))
+            @test isequal(collect(Arrow.Table(bytes).u), [missing, "x"])
+            @test isequal(collect(Arrow.Table(_rewrite(bytes)).u), [missing, "x"])
+        end
+        # A list view of structs whose `a` field is all null.
+        fa, da = AC.fromjulia("a", Union{Missing,Int64}[missing, missing])
+        fb, db = AC.fromjulia("b", ["x", "y"])
+        st, lt = AC.StructType(), AC.ListViewType(false)
+        item = AC.Field("item", st; nullable=true, children=[fa, fb])
+        itemdata = AC.ArrayData(st, 2, [AC.BufferSlice()]; children=[da, db], nullcount=0)
+        buffers = [AC.BufferSlice(), AC._databuffer(Int32[0]), AC._databuffer(Int32[2])]
+        f = AC.Field("lv", lt; nullable=true, children=[item])
+        bytes = onebatch(f, AC.ArrayData(lt, 1, buffers; children=[itemdata], nullcount=0))
+        before = collect(Arrow.Table(bytes).lv)
+        @test isequal(collect(Arrow.Table(_rewrite(bytes)).lv), before)
+    end
+
+    @testset "VersionNumber columns rewrite" begin
+        v = [v"1.2.3", v"2"]
+        m = Union{Missing,VersionNumber}[v"1", missing]
+        bytes = read(Arrow.tobuffer((v=v, m=m)))
+        for file in (false, true)
+            t = Arrow.Table(_rewrite(bytes; file))
+            @test t.v == v
+            @test isequal(collect(t.m), m)
+        end
+    end
+
+    @testset "dictencode refuses struct rows that would write as a map" begin
+        # Repeated field names read as ordered `name => value` pair rows.
+        fa, da = AC.fromjulia("a", Int64[1, 2])
+        fb, db = AC.fromjulia("a", ["x", "y"])
+        st = AC.StructType()
+        f = AC.Field("s", st; nullable=false, children=[fa, fb])
+        sch = AC.Schema([f])
+        d = AC.ArrayData(st, 2, [AC.BufferSlice()]; children=[da, db], nullcount=0)
+        bytes = Arrow.writestream(sch, [AC.RecordBatch(sch, [d], 2)])
+        rows = collect(Arrow.Table(bytes).s)
+        @test isequal(collect(Arrow.Table(_rewrite(bytes)).s), rows)
+        for file in (false, true)
+            err = @test_throws ArgumentError Arrow.write(
+                IOBuffer(),
+                Arrow.Table(bytes);
+                dictencode=true,
+                file,
+            )
+            @test occursin("column s holds struct rows", err.value.msg)
+        end
+    end
+
+    @testset "hidden dictionary slots point at one pool value" begin
+        for value in (["x"], Int64[1]), nullable in (false, true)
+            valuefield, _ = AC.fromjulia("d", value)
+            dicttype = AC.DictionaryType(AC.IntType(32, true), valuefield.type, false)
+            dict = AC.Field("d", dicttype; nullable)
+            parent = AC.Field("p", AC.StructType(); nullable=true, children=[dict])
+            f, d = Arrow._constructhiddenpart(parent, 2, Arrow._WriterContext("p"))
+            AC.validate_full(f, d)
+            @test all(ismissing, AC.materialize(f, d))
+            # A non-nullable dictionary's valid indices need one pool value.
+            @test only(d.children).dictionary.len == (nullable ? 0 : 1)
+        end
     end
 
     # Arrow 2.x's FlatBuffers builder deduplicates vtables comparing slot

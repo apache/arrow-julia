@@ -322,8 +322,7 @@ end
 
     @testset "covered dictionary pools retain unreferenced values" begin
         col = packedfixture()
-        f, parts = Arrow._constructcolumn(:s, AbstractVector[col]; stringview=true)
-        pool = only(parts)
+        f, pool = Arrow._constructcolumn(:s, col; stringview=true)
         t = AC.DictionaryType(AC.IntType(8, true), f.type, true)
         df = AC.Field("s", t; nullable=false)
         indices = Int8[0, 0, 4]
@@ -362,8 +361,7 @@ end
 
     @testset "dictionary pools preserve values and indices" begin
         col = fixture()
-        f, parts = Arrow._constructcolumn(:s, AbstractVector[col]; stringview=true)
-        pool = only(parts)
+        f, pool = Arrow._constructcolumn(:s, col; stringview=true)
         t = AC.DictionaryType(AC.IntType(8, true), f.type, true)
         df = AC.Field("s", t; nullable=false)
         indices = Int8[3, 0, 3]

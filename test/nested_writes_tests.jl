@@ -45,6 +45,43 @@ field(t, j=1) = getfield(t, :schema).fields[j]
 # A map row as the Dict it describes, for comparing with Dict inputs.
 asdict(x) = x === missing ? missing : Dict(x)
 
+# Two plain structs with the same fields.
+struct SameFieldsA
+    a::Int64
+    b::String
+end
+struct SameFieldsB
+    a::Int64
+    b::String
+end
+
+@testset "a Union whose members cannot build as one column writes a union" begin
+    for (v, expected) in (
+        (
+            Union{SameFieldsA,SameFieldsB}[SameFieldsA(1, "x"), SameFieldsB(2, "y")],
+            [(1, "x"), (2, "y")],
+        ),
+        (Union{Int,Vector{Any}}[1, Any[2]], [1, [2]]),
+    )
+        t = Arrow.Table(Arrow.tobuffer((u=v,)))
+        @test field(t).type isa AC.UnionType
+        @test isequal(
+            map(x -> x isa Integer || x isa AbstractVector ? x : Tuple(x), t.u),
+            expected,
+        )
+    end
+end
+
+@testset "a Nothing field under missing rows" begin
+    s = Union{Missing,NamedTuple{(:a,),Tuple{Nothing}}}[(a=nothing,), missing]
+    f = Union{Missing,NTuple{2,Nothing}}[(nothing, nothing), missing]
+    t = Arrow.Table(Arrow.tobuffer((s=s, f=f)))
+    # A struct row reads as a NamedTuple or an ordered Pair vector.
+    fields(r) = r === missing ? missing : Any[x isa Pair ? last(x) : x for x in r]
+    @test isequal(fields.(t.s), [[nothing], missing])
+    @test isequal(fields.(t.f), [[nothing, nothing], missing])
+end
+
 @testset "plain nested writes" begin
     @testset "lists, with missing rows and values" begin
         cols = (
@@ -80,6 +117,13 @@ asdict(x) = x === missing ? missing : Dict(x)
         @test [c.nullable for c in f.children] == [false, false, false, false]
         fields = [(a=missing, b="x"), (a=2, b=missing)]
         @test isequal(collect(roundtrip((r=fields,)).r), fields)
+        # As views: a string child under a missing row holds an empty view.
+        v = roundtrip((r=rows,); stringview=true)
+        @test isequal(collect(v.r), rows)
+        @test field(v).children[2].type == AC.ViewType(true)
+        @test !field(v).children[2].nullable
+        strs = Union{Missing,NTuple{2,String}}[("a", "b"), missing]
+        @test isequal(collect(roundtrip((p=strs,); stringview=true).p), strs)
     end
 
     @testset "maps from Dict and Pair-vector rows" begin
@@ -153,6 +197,13 @@ asdict(x) = x === missing ? missing : Dict(x)
         end
         @test err isa ArgumentError
         @test startswith(err.msg, "column x (child item) has")
+        # A dictionary-encoded column narrows the same way.
+        rows = [Any[1], Any[2], Any[1]]
+        t = roundtrip((x=rows,); dictencode=true)
+        @test field(t).type isa AC.DictionaryType
+        @test collect(t.x) == rows
+        nested = [[[1], [2, 3]], [[]], [[4]]]
+        @test collect(roundtrip((x=nested,); dictencode=true).x) == nested
     end
 
     @testset "a row that changes between passes is refused" begin
@@ -275,6 +326,17 @@ end
     back = roundtrip(sparse)
     @test field(back).type.mode == AC.SparseMode
     @test isequal(collect(back.u), [1, "two", missing])
+    # Children at another width than a fresh write's take the values too: a
+    # largelists or stringview source, or pyarrow's large_string.
+    for kw in ((largelists=true,), (stringview=true,))
+        wide = (u=Union{Int64,String}[1, "two", 3], l=Union{Int64,Vector{Int64}}[1, [2], 3])
+        src = roundtrip(wide; kw...)
+        back = roundtrip(src)
+        @test Arrow._fieldcontractequal(field(back), field(src))
+        @test Arrow._fieldcontractequal(field(back, 2), field(src, 2))
+        @test collect(back.u) == wide.u
+        @test collect(back.l) == wide.l
+    end
     # Two children of one type cannot be told apart by value.
     twin = AC.ArrayData(
         ut,

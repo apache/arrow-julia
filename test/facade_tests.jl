@@ -3366,7 +3366,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         col = StringVector{Union{Missing,DataString}}(payloads, buf, extra)
         expected = ["abcd", "thirteen-byte", missing, "she said \"hi\" and left"]
         # By default the bytes are packed into one utf8 column.
-        f, columnparts = Arrow._constructcolumn(:s, AbstractVector[col])
+        f, _ = Arrow._constructcolumn(:s, col)
         @test f.type == Arrow.AC.Utf8Type(false) && f.nullable
         io = IOBuffer()
         Arrow.write(io, (id=[1, 2, 3, 4], s=col); file=true)
@@ -3374,8 +3374,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test Arrow.readfile(bytes).schema.fields[2].type == Arrow.AC.Utf8Type(false)
         @test isequal(Arrow.Table(bytes).s, expected)
         # stringview=true writes the column's own memory as Utf8View.
-        f, columnparts = Arrow._constructcolumn(:s, AbstractVector[col]; stringview=true)
-        d = only(columnparts)
+        f, d = Arrow._constructcolumn(:s, col; stringview=true)
         @test f.type == Arrow.AC.ViewType(true) && f.nullable
         @test d.buffers[2].region.root === Arrow.AC._storageroot(payloads) # views: the payload vector itself
         @test d.buffers[3].region.root === Arrow.AC._storageroot(buf)
@@ -3388,7 +3387,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test isequal(t.s, expected)
         # a non-nullable column declares non-nullable
         col0 = StringVector{DataString}(payloads[[1, 2]], buf, extra)
-        f0, _ = Arrow._constructcolumn(:s, AbstractVector[col0])
+        f0, _ = Arrow._constructcolumn(:s, col0)
         @test !f0.nullable
         Arrow.write(io, (s=col0,))
         @test Arrow.Table(take!(io)).s == ["abcd", "thirteen-byte"]
@@ -3402,8 +3401,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             ],
             Vector{Vector{UInt8}}(),
         )
-        fi, inlineparts = Arrow._constructcolumn(:s, AbstractVector[inl]; stringview=true)
-        di = only(inlineparts)
+        fi, di = Arrow._constructcolumn(:s, inl; stringview=true)
         @test length(di.buffers) == 2
         Arrow.write(io, (s=inl,); stringview=true, file=true)
         bytes0 = take!(io)

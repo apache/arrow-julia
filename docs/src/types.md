@@ -93,7 +93,7 @@ same type unless the table says otherwise.
 | `NamedTuple` | Struct | `NamedTuple` |
 | `AbstractDict{K,V}`, `AbstractVector{<:Pair}` | Map | `MapValue{K,V}` |
 | `Union{Missing,T}` | the type of `T`, nullable | `Union{Missing,T}` |
-| `Union{T1,T2,...}` | dense Union | a `Union` of the members' types as read |
+| `Union{T1,T2,...}` | dense Union, or one type that every member writes | a `Union` of the members' types as read |
 | `VersionNumber`, `Nothing` | Utf8, Null; labelled | the same type |
 | `Missing` only | Null | `Missing` |
 
@@ -104,11 +104,15 @@ collected first.
 
 A column whose element type is abstract (`Any`, `Real`, a `NamedTuple` with open field
 types) is written as the types its values have: one type writes as that type, and up to
-8 types as a dense Union of them. A column of `Timestamp`s, `ZonedTimestamp`s, or
-`Decimal`s that mixes units, zones, or precisions is an error, since one Arrow column has
-one of each (`Durations.astimezone` gives a column one zone). A type with no Arrow type,
-such as `BigInt`, an `@enum`, or a `Matrix`, is an error that names the column; map it
-with [Custom types](@ref), or convert it first.
+8 types as a dense Union of them. When all the types in such a column, or all the members
+of a `Union` element type, write the same Arrow type, label included, the column is one
+column of that type and reads back as it: `Union{String,SubString{String}}` writes one
+Utf8 column, and two structs whose ArrowTypes.jl mappings give an `Int32` with no label
+(or with one label they share) write one Int32 column. A column of `Timestamp`s,
+`ZonedTimestamp`s, or `Decimal`s that mixes units, zones, or precisions is an error, since
+one Arrow column has one of each (`Durations.astimezone` gives a column one zone). A type
+with no Arrow type, such as `BigInt`, an `@enum`, or a `Matrix`, is an error that names
+the column; map it with [Custom types](@ref), or convert it first.
 
 ## Timestamps
 
@@ -249,6 +253,9 @@ Arrow.Table(take!(io)).id
 ```
 
 The mapping applies at any depth: in lists, structs, maps, unions, and dictionaries.
+An `ArrowType` that is a `Union` with `Missing` as a member is refused, since a stored
+`missing` could not be told from a null value; declare the storage without `Missing` and
+write the column's missing values as such.
 `ArrowTypes.arrowmetadata` adds a string the reader passes to `JuliaType`. Without a
 mapping, a struct with supported field types writes as an Arrow struct and reads back as
 a `NamedTuple`. In a process that has not loaded the mapping, the column reads as its
@@ -275,6 +282,11 @@ so some types change on the way back while the values stay equal:
 | Sparse or dense Union | dense Union with a Null child |
 | `arrow.bool8`, `arrow.json` | Bool, Utf8 |
 | Interval(year-month or day-time) | Interval(month-day-nano) |
+
+A rewrite keeps every type except Int(128) and UInt(128), which Polars and Arrow 2.x
+write and pyarrow cannot read: they rewrite as FixedSizeBinary(16) labelled
+`JuliaLang.Int128` or `JuliaLang.UInt128`, as a fresh Julia `Int128` column writes, which
+Arrow.jl reads back as the same values and Polars reads as binary.
 
 A union with two children of the same type cannot be rewritten as it was, because its
 values do not say which child they came from; writing it is an error that suggests
