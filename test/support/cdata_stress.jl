@@ -109,6 +109,20 @@ _registered(key::Ptr{Int64}) = lock(REGISTRY_LOCK) do
     haskey(EXPORTS, key)
 end
 
+# Wait up to `seconds` for `done()`, sleeping so tasks on this thread and on
+# other threads run meanwhile.
+function _waitfor(done; seconds=30.0)
+    t = time()
+    while !done() && time() - t < seconds
+        sleep(0.001)
+    end
+    return done()
+end
+
+# Collect and reap until `done()`: a collection hands an import's release to the
+# thread that made the import, which runs it once that thread wakes.
+_collectuntil(done) = _waitfor(() -> (GC.gc(true); _reap!(); done()))
+
 function _stress_reaper(ready, start, done, workers)
     increment!(ready)
     wait(start)
@@ -213,13 +227,7 @@ function _threaded_cdata_stress()
             end) for _ = 1:4
     ]
     foreach(fetch, tasks)
-    for _ = 1:20
-        GC.gc(true)
-        yield()
-        _reap!()
-        _registry_count() == 0 && break
-    end
-    @assert _registry_count() == 0
+    @assert _collectuntil(() -> _registry_count() == 0) _registry_count()
 
     # A garbage collection on another thread hands an import's release to the
     # thread that imported it, so a release that waits on a lock the importing
@@ -233,10 +241,7 @@ function _threaded_cdata_stress()
             GC.gc(true)
             Threads.threadid()
         end))
-        for _ = 1:1000
-            (@atomic TEST_RELEASE_THREAD.id) == 0 || break
-            yield()
-        end
+        _waitfor(() -> (@atomic TEST_RELEASE_THREAD.id) != 0)
         @assert (@atomic TEST_RELEASE_THREAD.id) == importer
         crossed = collector != importer
         crossed && break
@@ -248,14 +253,7 @@ function _threaded_cdata_stress()
     @atomic TEST_RELEASE_THREAD.id = 0
     _drop_import_on_foreign_thread()
     @assert FOREIGN_POOL[] === :foreign
-    for _ = 1:20
-        GC.gc(true)
-        for _ = 1:1000
-            (@atomic TEST_RELEASE_THREAD.id) == 0 || break
-            yield()
-        end
-        (@atomic TEST_RELEASE_THREAD.id) == 0 || break
-    end
+    _collectuntil(() -> (@atomic TEST_RELEASE_THREAD.id) != 0)
     released = @atomic TEST_RELEASE_THREAD.id
     @assert released == 1 released
     return nothing
