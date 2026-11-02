@@ -25,10 +25,56 @@ using Dates
 using Tables
 using Arrow
 using PooledArrays
+import ArrowTypes
 import CategoricalArrays
 import DataAPI
 
 const AC = Arrow.ArrowCore
+
+# A labelled value stored as Union{Nothing,String}: its Null child holds `nothing`.
+struct MaybeLabel
+    value::Union{Nothing,String}
+end
+const MAYBE_LABEL = Symbol("JuliaLang.ArrowTests.WriterMaybe")
+ArrowTypes.ArrowType(::Type{MaybeLabel}) = Union{Nothing,String}
+ArrowTypes.toarrow(x::MaybeLabel) = x.value
+ArrowTypes.arrowname(::Type{MaybeLabel}) = MAYBE_LABEL
+ArrowTypes.JuliaType(::Val{MAYBE_LABEL}, S, metadata) = MaybeLabel
+ArrowTypes.fromarrow(::Type{MaybeLabel}, ::Nothing) = MaybeLabel(nothing)
+ArrowTypes.fromarrow(::Type{MaybeLabel}, x::AbstractString) = MaybeLabel(String(x))
+
+# A labelled value stored as Union{Int64,String}.
+struct EitherLabel
+    value::Union{Int64,String}
+end
+const EITHER_LABEL = Symbol("JuliaLang.ArrowTests.WriterEither")
+ArrowTypes.ArrowType(::Type{EitherLabel}) = Union{Int64,String}
+ArrowTypes.toarrow(x::EitherLabel) = x.value
+ArrowTypes.arrowname(::Type{EitherLabel}) = EITHER_LABEL
+ArrowTypes.JuliaType(::Val{EITHER_LABEL}, S, metadata) = EitherLabel
+ArrowTypes.fromarrow(::Type{EitherLabel}, x::Int64) = EitherLabel(x)
+ArrowTypes.fromarrow(::Type{EitherLabel}, x::AbstractString) = EitherLabel(String(x))
+
+# The output of `tables` written through one Arrow.Writer, and each table's
+# error (or nothing).
+function writetables(tables; kwargs...)
+    io = IOBuffer()
+    errs = Any[]
+    Arrow.Writer(io; kwargs...) do w
+        for t in tables
+            push!(errs, try
+                Arrow.write(w, t)
+                nothing
+            catch err
+                err
+            end)
+        end
+    end
+    return take!(io), errs
+end
+refused(err, name) = err isa ArgumentError && occursin("column $name", err.msg)
+# Field `a` of each row of a struct column (a NamedTuple or an ordered Pair vector).
+fielda(r) = r === missing ? missing : r isa NamedTuple ? r.a : last(only(r))
 
 # A producer may refill its buffers once the consumer asks for another partition.
 struct ReusedPartitions{Known,F}
@@ -636,6 +682,49 @@ batchkinds(bytes) = [
         @test isequal(
             [ismissing(r) ? missing : r.u for r in rows],
             [1, "a", missing, missing, 5],
+        )
+    end
+
+    @testset "a labelled Null child holds a value, not a missing value" begin
+        # An unlabelled union keeps later missing values in a nullable child;
+        # its `JuliaLang.Nothing` child holds `nothing`.
+        U = Union{Missing,Nothing,Int}
+        tables = [(x=Union{Nothing,Int}[nothing, 1],), (x=U[missing, 2],), (x=[missing],)]
+        bytes, errs = writetables(tables)
+        @test all(isnothing, errs)
+        @test isequal(collect(Arrow.Table(bytes).x), U[nothing, 1, missing, 2, missing])
+        # Without a nullable child, they are refused.
+        bytes, errs = writetables(tables; nullable=false)
+        @test errs[1] === nothing && all(e -> refused(e, :x), errs[2:3])
+        @test isequal(collect(Arrow.Table(bytes).x), [nothing, 1])
+        path = joinpath(mktempdir(), "u.arrows")
+        Arrow.write(path, tables[1]; file=false)
+        @test refused((@test_throws ArgumentError Arrow.append(path, tables[2])).value, :x)
+        @test isequal(collect(Arrow.Table(path).x), [nothing, 1])
+        # Every child of a labelled union holds a value: a later missing value
+        # needs the Null child a first table with missing values declares.
+        for values in
+            ([MaybeLabel(nothing), MaybeLabel("a")], [EitherLabel(1), EitherLabel("a")])
+            T = Union{Missing,eltype(values)}
+            bytes, errs = writetables([(x=values,), (x=T[values[2], missing],)])
+            @test refused(errs[2], :x)
+            @test isequal(collect(Arrow.Table(bytes).x), values)
+            bytes, errs = writetables([(x=T[values...],), (x=T[values[2], missing],)])
+            @test isequal(collect(Arrow.Table(bytes).x), T[values; values[2]; missing])
+        end
+        # A column of `nothing` writes Null labelled `JuliaLang.Nothing`.
+        bytes, errs = writetables([(x=[nothing, nothing],), (x=[missing],)])
+        @test refused(errs[2], :x)
+        # A labelled union under a null struct row holds a stand-in there.
+        S = Union{Missing,NamedTuple{(:a,),Tuple{EitherLabel}}}
+        bytes, errs = writetables([
+            (x=S[(a=EitherLabel(1),)],),
+            (x=S[missing, (a=EitherLabel("x"),)],),
+        ])
+        @test all(isnothing, errs)
+        @test isequal(
+            fielda.(Arrow.Table(bytes).x),
+            [EitherLabel(1), missing, EitherLabel("x")],
         )
     end
 

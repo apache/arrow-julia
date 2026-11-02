@@ -626,7 +626,7 @@ function _hideablestorage(context, T::Type)
 end
 
 """
-Data built for `_relaxed(f)` (or nullable, for a fresh child) as `f`
+Data built for `f` declared nullable (or for a nullable fresh child) as `f`
 declares it: where `f` cannot be null, the validity that marked only hidden
 slots is dropped, through a union's children and run-end values too. Hidden
 slots are never read, so they keep whatever placeholder the build wrote.
@@ -666,43 +666,76 @@ function _hidevalidity(f::AC.Field, built::AC.Field, d::AC.ArrayData)
 end
 
 """
-`f` declared nullable, with a union's children and run-end values too: the
-field a child builds under when null parent rows hide some of its slots.
-"""
-function _relaxed(f::AC.Field)
-    t = f.type
-    children = collect(AC.Field, f.children)
-    if t isa Union{AC.UnionType,AC.RunEndEncodedType}
-        for i in (t isa AC.UnionType ? eachindex(children) : 2:2)
-            children[i] = _relaxed(children[i])
-        end
-    end
-    return AC.Field(f.name, t; nullable=true, metadata=_fieldmetadata(f), children)
-end
-
-"""
-Whether field `f` holds a null: a union in a Null or nullable child, and a
-run-end column in its values, since neither has validity of its own.
+Whether field `f` holds a null. A Null field with an extension label (such as
+`JuliaLang.Nothing`) holds a value. A union holds nulls in the child
+`_unionnullchild` names, and a run-end column in its values: neither has
+validity of its own.
 """
 function _holdsnull(f::AC.Field)
     t = f.type
-    t isa AC.UnionType && return any(c -> c.type isa AC.NullType || c.nullable, f.children)
+    t isa AC.UnionType && return _unionnullchild(f) !== nothing
     t isa AC.RunEndEncodedType && return _holdsnull(last(f.children))
-    return f.nullable || t isa AC.NullType
+    t isa AC.NullType && return _arrowtypesextension(f) === nothing
+    return f.nullable
+end
+
+"""
+The child of union field `f` that takes a missing value, or nothing: a Null
+child without an extension label, else, in a union without a label of its
+own, a child of another type that holds a null. Every child of a labelled
+union holds its storage values.
+"""
+function _unionnullchild(f::AC.Field)
+    k = findfirst(c -> c.type isa AC.NullType && _holdsnull(c), f.children)
+    k === nothing &&
+        _arrowtypesextension(f) === nothing &&
+        (k = findfirst(c -> !(c.type isa AC.NullType) && _holdsnull(c), f.children))
+    return k
+end
+
+# Missing values under a union or Null field that holds no null.
+function _nonullerror(f::AC.Field)
+    f.type isa AC.NullType && return ArgumentError(
+        "column $(f.name) holds missing values, but it writes as Arrow Null labelled " *
+        "$(first(_arrowtypesextension(f))), whose slots read as that label's value",
+    )
+    return ArgumentError(
+        "column $(f.name) holds missing values, but no child of the union it writes " *
+        "as holds a null: a missing value needs a Null child without an extension " *
+        "label or, in a union without a label of its own, a nullable child",
+    )
 end
 
 """
 Retained child `f` over `values`, `hidden` of which sit under null parent
-rows and read as missing. A child that holds nulls takes them there; one that
-cannot is built nullable and its validity then dropped (`_hidevalidity`), and
-other missing values in it mean the column was replaced.
+rows and read as missing. A child that holds nulls takes them there. In a
+child that cannot, any other missing value means the column was replaced,
+and the hidden slots take a stand-in: a union, run-end, or Null column, which
+has no validity buffer, takes a visible value there; any other child is built
+nullable and its validity then dropped (`_hidevalidity`).
 """
 function _hiddenchild(f::AC.Field, values, hidden::Int, context)
     hidden == 0 && return _constructpart(f, values; context)
     hidden == length(values) && return _constructhiddenpart(f, hidden, context)
     _holdsnull(f) && return _constructpart(f, values; context)
     count(ismissing, values) == hidden || throw(_nonnullableerror(f.name))
-    return _hidevalidity(f, _constructpart(_relaxed(f), values; context)...)
+    if f.type isa Union{AC.UnionType,AC.RunEndEncodedType,AC.NullType}
+        return _constructpart(f, _uninferred(_standins, values)::AbstractVector; context)
+    end
+    relaxed = AC.Field(
+        f.name,
+        f.type;
+        nullable=true,
+        metadata=_fieldmetadata(f),
+        children=collect(AC.Field, f.children),
+    )
+    return _hidevalidity(f, _constructpart(relaxed, values; context)...)
+end
+
+# `values` with each missing value replaced by the first value that is not.
+function _standins(values)
+    x = values[findfirst(!ismissing, values)]
+    return [y === missing ? x : y for y in values]
 end
 
 _nonnullableerror(name) = ArgumentError(
@@ -973,12 +1006,12 @@ end
 """
 A retained Union column built from its values (public values, or lowered
 storage values under a label), or nothing when some value fits none of the
-union's children or several. A missing value goes to the first Null child,
-else the first nullable one. Any other value goes to the child its runtime
-type routes to (`_unionroute`); children of one layout cannot be told apart
-and do not route. Each child then builds from its values as a composite's
-child does, so values that lower to storage (dates, extension types) lower
-there.
+union's children or several. A missing value goes to the child that holds
+nulls (`_unionnullchild`), or is refused. Any other value goes to the child
+its runtime type routes to (`_unionroute`); children of one layout cannot be
+told apart and do not route. Each child then builds from its values as a
+composite's child does, so values that lower to storage (dates, extension
+types) lower there.
 """
 function _constructfacadeunion(f::AC.Field, v::AbstractVector, context)
     t = f.type::AC.UnionType
@@ -994,15 +1027,13 @@ function _constructfacadeunion(f::AC.Field, v::AbstractVector, context)
         Base.uniontypes(
             length(children) > length(Base.uniontypes(S)) ? Union{Missing,S} : S,
         )
+    nullchild = _unionnullchild(f)
     routes = IdDict{Type,Int}()
     route = Vector{Int}(undef, n)
     for (i, x) in enumerate(v)
         k = if x === missing
-            something(
-                findfirst(c -> c.type isa AC.NullType, children),
-                findfirst(c -> c.nullable, children),
-                0,
-            )
+            nullchild === nothing && throw(_nonullerror(f))
+            nullchild
         else
             get!(routes, typeof(x)) do
                 _unionroute(children, x, members, context)
@@ -2935,12 +2966,9 @@ function _constructhiddenpart(f::AC.Field, n::Int, context::_WriterContext)
         data = AC.ArrayData(t, n, AC.BufferSlice[]; children=datas, nullcount=0)
         return _retainedfield(f; children=fields), data
     elseif t isa AC.UnionType
-        # Every slot takes slot 0 of the first Null or nullable child.
-        k = something(
-            findfirst(c -> c.type isa AC.NullType, f.children),
-            findfirst(c -> c.nullable, f.children),
-            1,
-        )
+        # Every slot takes slot 0 of the child that holds nulls, else (slots
+        # nothing reads) of the first child.
+        k = something(_unionnullchild(f), 1)
         sparse = t.mode == AC.SparseMode
         for (j, c) in enumerate(f.children)
             child!(c, sparse ? n : j == k ? min(n, 1) : 0)
@@ -3556,8 +3584,16 @@ Base.@nospecializeinfer function _retainedpartof(
     _, target, _ = _arrowtypestarget(context.arrowtypes, f)
     if _lowersvalues(f, target, v, context)
         target === nothing || _checktarget(f, target, v)
+        # Lowered and built without its label, a labelled union or Null field
+        # would take missing values that only an unlabelled one keeps (and
+        # `nothing` lowers to `missing`).
+        target !== nothing &&
+            f.type isa Union{AC.UnionType,AC.NullType} &&
+            !_holdsnull(f) &&
+            any(ismissing, v) &&
+            throw(_nonullerror(f))
         # No value to lower: an all-missing column is its field's nulls.
-        f.nullable &&
+        _holdsnull(f) &&
             all(ismissing, v) &&
             return _constructhiddenpart(f, length(v), context)
         return _constructlowered(f, _lowercolumn(f, target, v, context), context)
