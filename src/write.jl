@@ -333,6 +333,8 @@ mutable struct Writer
     st::Union{Nothing,IPCWriteState}
     names::Vector{Symbol}
     schema::Union{Nothing,AC.Schema}
+    # Arrow.append's writer, whose schema an earlier writer fixed.
+    appending::Bool
     @atomic closed::Bool
 end
 
@@ -412,6 +414,7 @@ function _writer(
             nothing,
             Symbol[],
             nothing,
+            false,
             false,
         )
     catch
@@ -652,6 +655,7 @@ Base.@nospecializeinfer function _writebatch!(
         growth,
         ntasks=_batchtasks(w, nrows, length(names)),
         w.pool,
+        nullhint=_nullhint(w),
     )
     # A fresh Schema over the BUILT fields, so `writebatch!` re-checks them
     # against the writer's schema instead of trusting construction.
@@ -660,6 +664,21 @@ Base.@nospecializeinfer function _writebatch!(
     writebatch!(st, batch; deltas, recycle=_handoff!(w.pool))
     return nothing
 end
+
+"""
+What a conformance refusal adds when the column would conform to its field
+declared nullable: how to start a stream that takes missing values later (an
+append's stream was started elsewhere), or that this writer kept the first
+table's nullability. A writer whose fields are nullable already adds nothing.
+"""
+_nullhint(w::Writer) =
+    w.appending ?
+    ", or, to add missing values to a column that had none, start the stream " *
+    "with Arrow.Writer(path; file=false), whose columns are all nullable (a " *
+    "one-table Arrow.write declares nullability from its values)" :
+    !w.oneshot && !w.nullable ?
+    "; this Arrow.Writer was created with nullable=false, so each column keeps " *
+    "the first table's nullability" : ""
 
 "Fix the schema and publish its message (and the file preamble)."
 function _beginwrite!(
@@ -940,6 +959,7 @@ function _appendbytes(
     )
     w.schema = sch
     w.names = Symbol[_fieldsymbol(f.name) for f in sch.fields]
+    w.appending = true
     w.st = resumestream!(
         io,
         sch,
@@ -1458,6 +1478,7 @@ Base.@nospecializeinfer function _constructconforming(
     growth=nothing,
     ntasks::Int=1,
     pool=nothing,
+    nullhint::String="",
 )
     retainedfield = j -> sch.fields[j]
     _uninferred(_retainedschema, tbl) === nothing ||
@@ -1475,6 +1496,7 @@ Base.@nospecializeinfer function _constructconforming(
             largelists,
             pool,
             growth=growth === nothing ? nothing : (growth, j),
+            nullhint,
         )::Tuple{AC.Field,AC.ArrayData}
     end
     return AC.Field[first(b) for b in built], AC.ArrayData[last(b) for b in built]
@@ -1491,6 +1513,7 @@ function _conformcolumn(
     largelists::Bool,
     pool=nothing,
     growth=nothing,
+    nullhint::String="",
 )
     dictmismatch = nothing
     if expected.type isa AC.DictionaryType && written !== nothing
@@ -1539,13 +1562,29 @@ function _conformcolumn(
         # Report the schema difference of a column the writer mapping could
         # build instead of the retained construction's value-domain error.
         (err isa ArgumentError && mismatch !== nothing) || rethrow()
+        # The hint, only when the column conforms to its field declared nullable.
+        hint = try
+            isempty(nullhint) || _conformcolumn(
+                name,
+                col,
+                poolhint,
+                _nullablefield(expected),
+                written;
+                stringview,
+                largelists,
+            )
+            nullhint
+        catch trial
+            trial isa ArgumentError || rethrow()
+            ""
+        end
+        T = Base.nonmissingtype(_eltypeof(col))
+        values = T === Union{} ? "" : " of $T values"
         throw(
             ArgumentError(
-                "column $name does not conform to the existing schema: $mismatch. " *
-                "The first table written fixed each column's type and nullability: " *
-                "convert the column to the schema's type, or, to add missing values " *
-                "to a column that had none, start the stream with " *
-                "Arrow.Writer(path; file=false), whose columns are all nullable",
+                "column $name$values does not conform to the existing schema: " *
+                "$mismatch. The first table written fixed each column's type and " *
+                "nullability: convert the column to the schema's type$hint",
             ),
         )
     end
@@ -1748,13 +1787,13 @@ function _freshcolumn(
     end
 end
 
-"An Arrow type's name for messages, as pyarrow spells it."
-# An Arrow type's name, and for a leaf field the Julia type it reads as.
+# A schema field's Arrow type, and for a leaf the Julia type it reads as.
 function _typename(f::AC.Field)
     isempty(f.children) || return _typename(f.type)
-    return "$(_typename(f.type)) ($(Base.nonmissingtype(_declaredeltype(f))))"
+    return "$(_typename(f.type)) (reads as $(Base.nonmissingtype(_declaredeltype(f))))"
 end
 
+"An Arrow type's name for messages, as pyarrow spells it."
 function _typename(t::AC.ArrowType)
     unit(u) =
         u == AC.SECOND ? "s" :
@@ -1803,29 +1842,28 @@ function _conformancemismatch(
     expected.name == actual.name || return "$path is named $(repr(actual.name))"
     if !AC.typeequal(expected.type, actual.type)
         expected.type isa AC.NullType &&
-            return "$path writes as $(_typename(actual)), but the schema " *
+            return "$path writes as $(_typename(actual.type)), but the schema " *
                    "declared it null because it held only missing values (or no " *
                    "rows) when the schema was set; give it a concrete element type"
+        expected.type isa AC.UnionType &&
+            actual.type isa Union{AC.UnionType,AC.NullType} &&
+            _holdsnull(actual) &&
+            !_holdsnull(expected) &&
+            return "$path holds missing values, but no child of the schema's union " *
+                   "holds a null (a union column whose element type includes Missing " *
+                   "declares one)"
         expected.type isa AC.UnionType &&
             actual.type isa AC.UnionType &&
             return "$path writes as a union with other members than the schema's union"
         actual.type isa AC.NullType &&
-            expected.type isa AC.UnionType &&
-            !_holdsnull(expected) &&
-            return "$path holds only missing values, but no child of the schema's " *
-                   "union holds a null"
-        actual.type isa AC.NullType &&
             !expected.nullable &&
-            return "$path holds only missing values, but the schema field is not " *
-                   "nullable (a one-table Arrow.write declares nullability from its values)"
-        return "$path writes as $(_typename(actual)), but the schema has " *
+            return "$path holds only missing values, but the schema field is not nullable"
+        return "$path writes as $(_typename(actual.type)), but the schema has " *
                _typename(expected)
     end
     actual.nullable &&
         !expected.nullable &&
-        return "$path holds missing values, but the schema field is not nullable " *
-               "(an Arrow.Writer declares every field nullable unless created " *
-               "with nullable=false)"
+        return "$path holds missing values, but the schema field is not nullable"
     exact && expected.nullable && !actual.nullable && return "$path is not nullable"
     _arrowtypesextension(expected) == _arrowtypesextension(actual) ||
         return "$path has a different extension type than the schema field"

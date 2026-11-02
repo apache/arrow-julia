@@ -763,6 +763,34 @@ batchkinds(bytes) = [
         @test isequal(fielda.(Arrow.Table(bytes).s), [1, missing, "x"])
     end
 
+    @testset "refusals name the column's type and advise only what would help" begin
+        # A Writer's columns are already nullable: no advice to start one.
+        _, errs = writetables([(t=[Date(2020, 1, 1)],), (t=[DateTime(2020)],)])
+        msg = errs[2].msg
+        @test occursin("DateTime values", msg)
+        @test occursin("date32 (reads as", msg)
+        @test !occursin("Arrow.Writer(path", msg)
+        _, errs = writetables([(a=[1],), (a=[missing],)]; nullable=false)
+        @test occursin("created with nullable=false", errs[2].msg)
+        @test !occursin("one-table", errs[2].msg)
+        # An append to a one-table stream: a nullable Writer would have taken
+        # the missing values, but not another type or a labelled union's.
+        path = joinpath(mktempdir(), "s.arrow")
+        Arrow.write(path, (a=[1], u=[MaybeLabel("x")]); file=false)
+        hint = "start the stream with Arrow.Writer(path; file=false)"
+        err = @test_throws ArgumentError Arrow.append(
+            path,
+            (a=[missing], u=[MaybeLabel("y")]),
+        )
+        @test occursin(hint, err.value.msg)
+        err = @test_throws ArgumentError Arrow.append(path, (a=["x"], u=[MaybeLabel("y")]))
+        @test !occursin(hint, err.value.msg)
+        U = Union{Missing,MaybeLabel}
+        err = @test_throws ArgumentError Arrow.append(path, (a=[2], u=U[missing]))
+        @test occursin("no child of the schema's union holds a null", err.value.msg)
+        @test !occursin(hint, err.value.msg)
+    end
+
     @testset "append to an Arrow 2.x stream" begin
         fixture = read(joinpath(@__DIR__, "fixtures2x", "mixed-two-partitions.arrowbytes"))
         path = joinpath(mktempdir(), "mixed.arrow")
