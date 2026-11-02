@@ -678,7 +678,7 @@ batchkinds(bytes) = [
         Arrow.write(spath, t1; file=false)
         err = @test_throws ArgumentError Arrow.append(spath, (; wrong=[1]))
         @test occursin("do not match", err.value.msg)
-        # A corrupt prefix refuses instead of gaining valid-looking bytes.
+        # A corrupt schema message refuses instead of gaining valid-looking bytes.
         bytes = read(spath)
         bytes[9] ⊻= 0x40
         write(spath, bytes)

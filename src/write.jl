@@ -846,8 +846,10 @@ end
     Arrow.append(sink; kwargs...)
 
 Add `table`'s record batches to an existing IPC STREAM (`sink` is a file
-path or a seekable read/write `IO`). The existing stream is validated in
-full first, the new columns are constructed against its schema (same
+path or a seekable read/write `IO`). The existing stream's message metadata
+is checked and its dictionaries are decoded first; its record batch bodies
+are not read, so a corrupt batch already in the stream is not detected. The
+new columns are constructed against the stream's schema (same
 names and order; types fit as for a later table of [`Arrow.Writer`](@ref),
 or the append is refused), and the new batches are published after the last
 existing message (over its end-of-stream marker, if it has one), followed by a
@@ -915,9 +917,9 @@ function _appendbytes(
         )
     codec = _codec(compress, compresslevel)
     batchsize = _checkbatchsize(batchsize)
-    # Validate the existing stream's messages and dictionaries before
-    # extending it (a corrupt prefix must refuse, not gain valid-looking
-    # bytes); record batch bodies, which an append never uses, are not read.
+    # Check the existing stream's message metadata and dictionaries before
+    # extending it (a stream whose schema or dictionaries are corrupt is
+    # refused); record batch bodies, which an append never uses, are not read.
     st, msgs = _appendstate(region)
     sch = st.schema
     # Retain the schema's declared features when resuming the writer.
