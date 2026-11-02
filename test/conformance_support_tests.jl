@@ -226,7 +226,6 @@ end
     @test isdefined(CombinedAdapters, :_oracle_parent)
     @test CombinedAdapters.COMPRESSED_ORACLE_FAMILIES ==
           ("generated_primitive", "generated_nested_dictionary", "generated_binary_view")
-    @test CombinedAdapters.STATISTICS_ORACLE_FAMILY == "generated_primitive"
     targeted = [
         CombinedAdapters.OracleCase("v__$(family)+$(variant)", "", "") for
         (family, variant) in CombinedAdapters.TARGETED_ORACLE_VARIANTS
@@ -355,24 +354,6 @@ end
     )
     @test map(check -> check[1:3], CombinedAdapters.ORACLE_CHECKS) == expected_checks
     @test !occursin("skip: ", CombinedAdapters.PYDRIVER)
-
-    goldstats = Dict{String,Any}(
-        "schema" => Dict{String,Any}("fields" => Any[]),
-        "batches" => Any[Dict{String,Any}("count" => 1)],
-    )
-    inputstats = deepcopy(goldstats)
-    inputstats["schema"]["metadata"] = Any[Dict{String,Any}(
-        "key" => CombinedAdapters.Arrow.STATS_KEY,
-        "value" => "opaque",
-    ),]
-    @test CombinedAdapters._withoutstatsmetadata(inputstats) == goldstats
-    @test haskey(inputstats["schema"], "metadata")
-    corruptstats = deepcopy(inputstats)
-    corruptstats["batches"][1]["count"] = 2
-    @test CombinedAdapters._withoutstatsmetadata(corruptstats) != goldstats
-    @test CS.documentcheck("stats", "ours stats file→gold", goldstats) do
-        CombinedAdapters._withoutstatsmetadata(corruptstats)
-    end.status == :fail
 
     mktempdir() do dir
         goldpath = joinpath(dir, "gold.json")

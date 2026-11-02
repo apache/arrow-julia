@@ -26,8 +26,7 @@
 # - `cdata.jl`, `cstream.jl`: the C data and C stream interfaces over Core,
 #   import and export, with lifecycle accounting; `cdata_table.jl` puts
 #   `Arrow.Table`, `Arrow.Stream`, and any Tables.jl table across them.
-# - `scan.jl`: `Tables.Scan` pushdown over byte ranges plus footer-carried
-#   statistics pruning.
+# - `scan.jl`: `Tables.Scan` pushdown and byte-range reads.
 # - `table.jl`, `write.jl`: the read facade and write orchestration.
 # - `columnconstruction.jl`: column-wide construction policy, including
 #   retained schemas, dictionaries, and recursive ArrowTypes.jl lowering.
@@ -43,14 +42,12 @@ exported, apart from `ArrowTypes`: call them as `Arrow.Table` and so on.
 module Arrow
 
 using Tables
-import Base64
 import DataAPI
 import DataStrings, DataDecimals, Durations
 import PooledArrays
 using SentinelArrays: ChainedVector
 import ArrowTypes
 import Dates
-import Mmap
 import UUIDs
 import CodecLz4
 import CodecZstd

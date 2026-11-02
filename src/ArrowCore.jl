@@ -2233,15 +2233,6 @@ function _materialization_limit_exceeded! end
     return checked_add(Int64(128), capacity)
 end
 
-@inline function _materializedbitvectorbytes(n::Integer)
-    n >= 0 || throw(ValidationError("materialized bit-vector length is negative"))
-    chunks = cld(Int64(n), Int64(64))
-    return checked_add(
-        _materializedvectorbytes(UInt64, chunks),
-        _materializedobjectbytes(sizeof(BitVector)),
-    )
-end
-
 # Conservative Julia heap-object size for a newly boxed inline value: an
 # 8-byte object tag plus the payload, rounded to the 16-byte GC size class.
 @inline function _materializedobjectbytes(payload::Integer)

@@ -15,8 +15,8 @@
 # limitations under the License.
 
 # =============================================================================
-# The IPC STREAM reader as a thin peer over ArrowCore. The file-format
-# reader (readfile/ArrowFile) shares these primitives from ipc_write.jl.
+# The IPC stream reader and, at the end of this file, the file-format reader
+# (readfile/ArrowFile), as thin peers over ArrowCore.
 #
 #   * Framing: checked spans, the generated FlatBuffers verifier before any
 #     generated getter runs, and explicit resource limits (`Limits` +
@@ -287,15 +287,6 @@ end
     return nothing
 end
 
-@inline function _chargebitvector!(
-    budget::Union{Nothing,AllocationBudget},
-    n::Integer,
-    what::AbstractString,
-)
-    budget === nothing || _charge!(budget, AC._materializedbitvectorbytes(n), what)
-    return nothing
-end
-
 @inline function _chargeobject!(
     budget::Union{Nothing,AllocationBudget},
     payload::Integer,
@@ -536,6 +527,11 @@ end
 # The error for a message prefix without the continuation marker: at the
 # start of the input, the input is not Arrow IPC data (or is a stream from
 # before Arrow 0.15, whose messages start with their metadata length).
+# An IPC stream of `n` bytes that holds no schema message.
+_emptystream(n) =
+    n == 0 ? "the input is empty: Arrow IPC data has at least a schema message" :
+    "empty IPC stream: it ends before its schema message"
+
 function _nomarker(pos::Int64, word::UInt32)
     pos == 0 || return "missing continuation marker at byte $pos"
     msg =
@@ -543,6 +539,8 @@ function _nomarker(pos::Int64, word::UInt32)
         "ARROW1 nor an IPC stream message"
     # "PAR1", read as a little-endian word.
     word == 0x31524150 && return msg * " (it starts with PAR1, as a Parquet file does)"
+    word & 0xffff == 0x8b1f &&
+        return msg * " (it starts with 1f 8b, as gzip data does; decompress it first)"
     0 < (word % Int32) <= 1 << 24 || return msg
     return msg *
            " (a stream written before Arrow 0.15 starts like this; " *
@@ -867,7 +865,7 @@ function validateschemafield(f::Field)
         validateschemafield(AC.dictvaluefield(f, f.type))
         return f
     end
-    spec = layoutspec(f.type)
+    spec = AC.layoutspec_of(f.type)
     expected = spec.childcount == -1 ? length(f.children) : spec.childcount
     length(f.children) == expected || throw(
         ValidationError(
@@ -1001,7 +999,7 @@ function _foreach(f::F, n::Int, ntasks::Int) where {F}
             try
                 g(i, w)
             catch e
-                errors[i] = e
+                errors[i] = (e, catch_backtrace())
                 old = @atomic claims.failed
                 while i < old
                     old, ok = @atomicreplace claims.failed old => i
@@ -1018,8 +1016,15 @@ function _foreach(f::F, n::Int, ntasks::Int) where {F}
         job[] = nothing
     end
     failed = @atomic claims.failed
-    failed == typemax(Int) || throw(errors[failed])
-    return nothing
+    failed == typemax(Int) && return nothing
+    e, bt = errors[failed]
+    # The caller sees the worker's exception, with the worker's backtrace as
+    # its cause.
+    try
+        throw(CapturedException(e, bt))
+    catch
+        throw(e)
+    end
 end
 
 # Decode into `out[1:declared]` and return the bytes produced. With
@@ -1234,14 +1239,29 @@ function _buffermeta!(c::DecodeCursor)
     if len > 0
         offset >= c.last_nonempty_end ||
             throw(ValidationError("batch buffers overlap or move backwards"))
-        c.last_nonempty_end = try
-            AC.checked_add(offset, len)
-        catch e
-            e isa OverflowError || rethrow()
-            throw(ValidationError("batch buffer end overflows"))
-        end
+        c.last_nonempty_end = _checkedadd(offset, len, "batch buffer end")
     end
     return offset, len
+end
+
+# Checked arithmetic on metadata values: an overflow is a `ValidationError`
+# naming `what`.
+function _checkedadd(a::Int64, b::Int64, what::AbstractString)
+    try
+        return AC.checked_add(a, b)
+    catch e
+        e isa OverflowError || rethrow()
+        throw(ValidationError("$what overflows"))
+    end
+end
+
+function _checkedmul(a::Int64, b::Int64, what::AbstractString)
+    try
+        return AC.checked_mul(a, b)
+    catch e
+        e isa OverflowError || rethrow()
+        throw(ValidationError("$what overflows"))
+    end
 end
 
 skipbuffer!(c::DecodeCursor) = (_buffermeta!(c); nothing)
@@ -1262,6 +1282,26 @@ function takebuffer!(c::DecodeCursor, needed::Int64=Int64(-1))
     end
     (c.codec == CODEC_NONE || len == 0) && return wire
     return _decompressbuffer!(c, wire, needed)
+end
+
+# Advise the kernel to map now the pages holding `n` bytes at `p`, which a
+# reader is about to read once each: one request instead of a fault per page
+# of a memory-mapped file (Unix).
+function _willneed(p::Ptr{UInt8}, n::Int)
+    @static if Sys.isunix()
+        n > 0 || return nothing
+        lo = UInt(p) & ~(UInt(AC.Mmap.PAGESIZE) - 1)
+        len = UInt(p) + UInt(n) - lo
+        ccall(
+            :madvise,
+            Cint,
+            (Ptr{Cvoid}, Csize_t, Cint),
+            Ptr{Cvoid}(lo),
+            len,
+            AC.Mmap.MADV_WILLNEED,
+        )
+    end
+    return nothing
 end
 
 """
@@ -1335,6 +1375,7 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice, needed::Int64=In
         # region's root must stay reachable for the whole call (Core rule 2).
         got = GC.@preserve out wireregion begin
             src = AC.sliceptr(wire) + 8
+            _willneed(src, Int(payloadlen))
             if c.codec == CODEC_LZ4_FRAME
                 _decode_lz4!(state, src, payloadlen, out, outlen, exact)
             elseif exact
@@ -1444,7 +1485,7 @@ function missingdicts(
             end
             return
         end
-        spec = layoutspec(f.type)
+        spec = AC.layoutspec_of(f.type)
         nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
         for i = 1:nchildren
             walk(f.children[i])
@@ -1657,23 +1698,6 @@ function _decodeplanned(
     return col
 end
 
-function decoderecord(
-    fm::FramedMessage,
-    fields,
-    sch::Schema,
-    dicts::Dict{Int64,ArrayData},
-    fielddictids::IdDict{Field,Int64},
-    limits::Limits,
-    validated_dictionaries,
-    state::DecodeState,
-)
-    p = _recordplan(fm.msg.header::Meta.RecordBatch, fm.body, fm.version, fields, limits)
-    cols = ArrayData[
-        _decodeplanned(p, j, f, dicts, fielddictids, limits, validated_dictionaries, state) for (j, f) in enumerate(fields)
-    ]
-    return AC.RecordBatch(sch, cols, p.rblen, validated_dictionaries)
-end
-
 """
 Arrow 0.17 V4 streams signaled buffer compression on the Message, before
 RecordBatch.compression existed. Reject that legacy marker before treating
@@ -1843,6 +1867,44 @@ function _checkstreammessage(st::_StreamState, fm::FramedMessage)
 end
 
 """
+The values of dictionary batch `rb` (its RecordBatch, under message version
+`version`), decoded from `body` as field `vf`.
+"""
+function _decodedictionary(
+    rb::Meta.RecordBatch,
+    body,
+    version::Int16,
+    vf::Field,
+    dicts,
+    fielddictids,
+    limits::Limits,
+    state::DecodeState,
+)
+    rblen = something(rb.length, Int64(0))
+    rblen >= 0 || throw(ValidationError("dictionary batch length $rblen is negative"))
+    rblen <= limits.max_array_length || _limiterror(
+        "dictionary batch length $rblen",
+        "max_array_length",
+        limits.max_array_length,
+    )
+    cursor = DecodeCursor(
+        rb.nodes,
+        rb.buffers,
+        body,
+        limits;
+        codec=_batchcodec(rb.compression, version),
+        state=state,
+        variadics=variadiccounts(rb),
+    )
+    decoded = decodefield(vf, cursor, dicts, fielddictids)
+    finishcursor!(cursor)
+    decoded.len == rblen || throw(
+        ValidationError("dictionary RecordBatch length does not match its field node"),
+    )
+    return decoded
+end
+
+"""
 Decode dictionary batch `fm` and apply it to the stream's dictionaries (a
 first pool, a delta, or a replacement). Returns its id, the pool now in
 effect, and whether the id already had one.
@@ -1855,7 +1917,6 @@ function _applydictionary!(
 )
     header = fm.msg.header::Meta.DictionaryBatch
     rb = header.data
-    codec = _batchcodec(rb.compression, fm.version)
     haskey(st.dictids, header.id) ||
         throw(ValidationError("dictionary batch has unknown id $(header.id)"))
     replacement = haskey(st.dicts, header.id)
@@ -1866,26 +1927,15 @@ function _applydictionary!(
     haskey(st.dictvaluefields, header.id) ||
         throw(ValidationError("dictionary batch has unknown id $(header.id)"))
     vf = st.dictvaluefields[header.id]
-    rblen = something(rb.length, Int64(0))
-    rblen >= 0 || throw(ValidationError("dictionary batch length $rblen is negative"))
-    rblen <= st.limits.max_array_length || _limiterror(
-        "dictionary batch length $rblen",
-        "max_array_length",
-        st.limits.max_array_length,
-    )
-    cursor = DecodeCursor(
-        rb.nodes,
-        rb.buffers,
+    decoded = _decodedictionary(
+        rb,
         fm.body,
-        st.limits;
-        codec=codec,
-        state=state,
-        variadics=variadiccounts(rb),
-    )
-    decoded = decodefield(vf, cursor, st.dicts, st.fielddictids)
-    finishcursor!(cursor)
-    decoded.len == rblen || throw(
-        ValidationError("dictionary RecordBatch length does not match its field node"),
+        fm.version,
+        vf,
+        st.dicts,
+        st.fielddictids,
+        st.limits,
+        state,
     )
     decoded = _updatedictionary!(
         st.dicts,
@@ -1967,15 +2017,13 @@ function _decoderecords(st::_StreamState, ps::Vector{PendingRecord}, ntasks::Int
     ]
 end
 
-function _readstream(
-    bytes::Vector{UInt8},
-    limits::Limits,
-    budget::AllocationBudget,
-    ntasks::Int=1,
-)
-    region = heapregion(bytes)
+"""
+The framed stream in `region`: its decoding state after every message, and its
+record batches planned against the dictionaries in effect at each.
+"""
+function _streamrecords(region::OwnerRegion, limits::Limits, budget::AllocationBudget)
     msgs = _framemessages(region, limits, Base.ENDIAN_BOM, budget)
-    isempty(msgs) && throw(ValidationError("empty IPC stream"))
+    isempty(msgs) && throw(ValidationError(_emptystream(region.len)))
     st = _StreamState(msgs[1], limits)
     # One codec context per reader for the dictionary batches, which apply in
     # order; record batches are planned in order and decoded together after.
@@ -2001,6 +2049,17 @@ function _readstream(
     end
     all(p -> isempty(p.missing), records) ||
         throw(ValidationError("stream ended before required dictionary batches arrived"))
+    return st, records
+end
+
+function _readstream(
+    bytes::Vector{UInt8},
+    limits::Limits,
+    budget::AllocationBudget,
+    ntasks::Int=1,
+)
+    region = heapregion(bytes)
+    st, records = _streamrecords(region, limits, budget)
     return IPCStream(
         st.schema,
         AC.FrozenVector{Field}(st.fields),
@@ -2137,7 +2196,7 @@ end
 function _StreamReader(messages, limits::Limits)
     _validatelimits(limits)
     fm = _nextmessage!(messages, limits, _framebudget(limits))
-    fm === nothing && throw(ValidationError("empty IPC stream"))
+    fm === nothing && throw(ValidationError(_emptystream(messages.pos)))
     st = _StreamState(fm, limits)
     region = messages isa _RegionMessages ? messages.blob.region : heapregion(UInt8[])
     return _StreamReader(
@@ -2189,25 +2248,25 @@ function _restart!(r::_StreamReader)
 end
 
 """
-The next record batch of the stream and the allowance it decoded under, or
-`nothing` at its end. Messages are read until the next batch in stream order
-is decodable; its fields decode on at most `ntasks` tasks.
+The next record batch of the stream, planned against the dictionaries in
+effect for it, and the allowance it decodes under; `nothing` at its end.
+Messages are read until the next batch in stream order is decodable.
 """
-function _nextrecord!(r::_StreamReader, ntasks::Int)
+function _nextrecord!(r::_StreamReader)
     r.failed && throw(
         ArgumentError(
             "this Arrow.Stream stopped at an error; open a new one to read the source again",
         ),
     )
     try
-        return _readrecord!(r, ntasks)
+        return _readrecord!(r)
     catch
         r.failed = true
         rethrow()
     end
 end
 
-function _readrecord!(r::_StreamReader, ntasks::Int)
+function _readrecord!(r::_StreamReader)
     while true
         if r.done
             isempty(r.missing) && return nothing
@@ -2244,7 +2303,7 @@ function _readrecord!(r::_StreamReader, ntasks::Int)
                     budget,
                 )
             end
-            return only(_decoderecords(r.st, PendingRecord[p], ntasks)), budget
+            return p, budget
         else
             throw(ValidationError("unsupported IPC message header $(typeof(header))"))
         end
@@ -2259,5 +2318,436 @@ function _countrecords(r::_StreamReader{_RegionMessages})
         fm = _nextmessage!(m, r.limits, _framebudget(r.limits))
         fm === nothing && return n
         fm.msg.header isa Meta.RecordBatch && (n += 1)
+    end
+end
+
+# ---------------------------------------------------------------------------
+# File reader: footer verification + lazy random-access batch handle
+# ---------------------------------------------------------------------------
+
+_blocktuples(blocks) =
+    blocks === nothing ? NTuple{3,Int64}[] :
+    NTuple{3,Int64}[
+        (Int64(b.offset), Int64(b.metaDataLength), Int64(b.bodyLength)) for b in blocks
+    ]
+
+"""
+Footer verification, same wrapper role as `verify_ipc_metadata`: the
+generated walker bounds the whole table graph, then the verified getters
+supply the Block indexes.
+"""
+function verify_footer(
+    bytes::Vector{UInt8},
+    limits::Limits,
+    reserve_limit::Int64=limits.max_total_allocated_bytes,
+)
+    ctx = _verifyctx(limits, reserve_limit)
+    # Staged like verify_ipc_metadata: version gates between the inline and
+    # reference stages, so an unsupported footer rejects in constant time.
+    t = _verified(() -> Meta.verifyrootstart_Footer(bytes, ctx))
+    footer = FB.getrootas(Meta.Footer, bytes, 0)
+    version = Int16(Int64(footer.version))
+    version in (Int16(3), Int16(4)) ||
+        _vfail("unsupported footer version $version (only V4/V5 are accepted)")
+    _verified(() -> Meta.verifyrootrest_Footer(t, ctx))
+    features = _schemafeatures(footer.schema::Meta.Schema, version)
+    return version,
+    features,
+    _blocktuples(footer.dictionaries),
+    _blocktuples(footer.recordBatches),
+    ctx.reserved
+end
+
+"""
+    ArrowFile
+
+The footer's record-batch index as a random-access handle: `length(file)`
+batches, `file[i]` decodes batch `i` on demand. Open decodes only the schema
+and the dictionary batches every record shares. Each `getindex` decodes from
+the mapped bytes with its own allocation budget and codec contexts, and the
+handle is read-only after open, so concurrent `getindex` calls are safe. The
+region root (heap vector or Mmap array) is the only lifetime anchor, as in
+Core.
+"""
+struct ArrowFile
+    region::OwnerRegion
+    schema::Schema
+    fields::AC.FrozenVector{Field}
+    fielddictids::IdDict{Field,Int64}
+    dictionaries::Dict{Int64,ArrayData}
+    validated::AC._ValidatedDictionaries
+    recordblocks::Vector{NTuple{3,Int64}}
+    dataend::Int64
+    limits::Limits
+    schemaversion::Int16
+end
+
+Base.length(f::ArrowFile) = length(f.recordblocks)
+AC.schema(f::ArrowFile) = f.schema
+
+"""
+Range-check one Footer Block's declared extents against the data section and
+return its `(offset, frameend)` span.
+"""
+function _blockextent(block::NTuple{3,Int64}, dataend::Int64)
+    offset, metalen, bodylen = block
+    # 16 is the smallest legal prefix + metadata: an 8-byte prefix plus at
+    # least one 8-byte-aligned metadata block.
+    (offset >= 0 && metalen >= 16 && bodylen >= 0) ||
+        throw(ValidationError("footer block has invalid extents"))
+    offset % 8 == 0 || throw(ValidationError("footer block is not 8-byte aligned"))
+    metalen % 8 == 0 ||
+        throw(ValidationError("footer block metadata length is not 8-byte aligned"))
+    bodylen % 8 == 0 ||
+        throw(ValidationError("footer block body length is not 8-byte aligned"))
+    # Every extent is nonnegative, so these comparisons cannot overflow.
+    (
+        offset <= dataend &&
+        metalen <= dataend - offset &&
+        bodylen <= dataend - offset - metalen
+    ) || throw(ValidationError("footer block escapes the data section"))
+    frameend = offset + metalen + bodylen
+    return offset, frameend
+end
+
+function _validateblockindex(dictblocks, recordblocks, dataend::Int64; datastart::Int64=0)
+    extents = Tuple{Int64,Int64}[]
+    indexedend = datastart
+    for block in Iterators.flatten((dictblocks, recordblocks))
+        extent = _blockextent(block, dataend)
+        extent[1] >= datastart ||
+            throw(ValidationError("footer block overlaps the file schema"))
+        push!(extents, extent)
+        indexedend = max(indexedend, extent[2])
+    end
+    sort!(extents; by=first)
+    for i = 2:length(extents)
+        extents[i - 1][2] <= extents[i][1] ||
+            throw(ValidationError("footer blocks overlap"))
+    end
+    return indexedend
+end
+
+"""
+Verify the message footer Block `block` points at, from `meta`, the Block's
+prefix and metadata bytes: the continuation marker, the metadata length the
+Block declares, the verified metadata, and the body length the Block
+declares. Returns the message, its metadata version, header type, and
+features.
+"""
+function _blockmeta(
+    meta::BufferSlice,
+    block::NTuple{3,Int64},
+    limits::Limits,
+    budget::AllocationBudget,
+)
+    _, metalen, bodylen = block
+    AC.loadat(meta, UInt32, Int64(0)) == CONTINUATION ||
+        throw(ValidationError("footer block does not point at a message"))
+    declared = Int64(AC.loadat(meta, Int32, Int64(4)))
+    declared == metalen - 8 ||
+        throw(ValidationError("footer block metadata length does not match the message"))
+    _checkblocklengths(declared, bodylen, limits)
+    _chargevector!(budget, UInt8, declared, "metadata allocation")
+    metabytes = AC.slicebytes(AC.subslice(meta, 8, declared))
+    version, header_type, features, _ =
+        _verify_ipc_metadata_budgeted(metabytes, limits, budget)
+    msg = FB.getrootas(Meta.Message, metabytes, 0)
+    Int64(msg.bodyLength) == bodylen ||
+        throw(ValidationError("footer block body length does not match the message"))
+    return msg, version, header_type, features
+end
+
+"The message footer Block `block` points at in `region`, framed and verified."
+function _blockmessage(
+    region::OwnerRegion,
+    block::NTuple{3,Int64},
+    dataend::Int64,
+    limits::Limits,
+    budget::AllocationBudget,
+)
+    offset, _ = _blockextent(block, dataend)
+    _, metalen, bodylen = block
+    blob = BufferSlice(region, 0, region.len)
+    msg, version, header_type, features =
+        _blockmeta(AC.subslice(blob, offset, metalen), block, limits, budget)
+    return FramedMessage(
+        msg,
+        AC.subslice(blob, offset + metalen, bodylen),
+        version,
+        header_type,
+        features,
+    )
+end
+
+"""
+    readfile(bytes::Vector{UInt8}; limits=Limits()) -> ArrowFile
+    readfile(region::OwnerRegion; limits=Limits()) -> ArrowFile
+
+Open an IPC-format file: verify both magics, the footer length, the footer
+flatbuffer and its schema, and the frame of every message the footer
+indexes; eagerly decode the dictionary blocks (shared by every record batch);
+expose record batches lazily through the Block index. The schema comes from
+the footer; the leading Schema message is not read.
+Pass `mmapregion(path)` to read a file through Core's mmap path. The file
+format permits one base dictionary per id, followed by deltas.
+Full dictionary replacement remains a format error.
+
+`Arrow.Table(handle)` and `Arrow.Stream(handle)` copy a region that can be
+released eagerly, so their columns remain valid after release. Pass the path
+directly to those constructors for memory-mapped views without this copy.
+"""
+readfile(bytes::Vector{UInt8}; limits::Limits=Limits()) =
+    _readfile(heapregion(bytes), limits, _readbudget(limits, length(bytes)))
+
+readfile(region::OwnerRegion; limits::Limits=Limits()) =
+    _readfile(region, limits, _readbudget(limits, region.len))
+
+# C++ WriteFileFooter uses its current metadata version even when the
+# writer emits V4 messages, and Arrow.jl before 2.6 wrote a V4 footer over V5
+# messages. The footer must not select the message layout.
+function _filemetadataversion(footer::Int16, message::Int16, expected::Int16=message)
+    message == expected ||
+        throw(ValidationError("IPC metadata version changes within the file"))
+    (
+        footer == message ||
+        (footer in (Int16(3), Int16(4)) && message in (Int16(3), Int16(4)))
+    ) || throw(ValidationError("IPC message and footer metadata versions differ"))
+    return message
+end
+
+"""
+The verified footer of the IPC file in `src`, a region or a byte-range source:
+its schema, dictionary ids, metadata version, and Block index. The Footer is
+authoritative, as in Arrow C++: the schema comes from it and every message is
+reached through its Blocks, so the leading Schema message is never read.
+(Polars writes that message without its stream framing.) Blocks start after
+the padded leading magic (`ARROW1` plus two bytes), end before the Footer,
+and do not overlap; each message is verified against its Block when it is
+read.
+"""
+function _readfooter(src, limits::Limits, budget::AllocationBudget)
+    _requirelittleendian()
+    _validatelimits(limits)
+    # leading magic + pad (8), smallest footer flatbuffer (8), footer length
+    # (4), trailing magic (6).
+    src.len >= Int64(8 + 8 + 4 + 6) ||
+        throw(ValidationError("file is too short to be an IPC file"))
+    # The trailer is <footer><Int32 footer length><ARROW1>.
+    trailer = _lastbytes(src, 10, budget)
+    trailer[5:10] == FILE_MAGIC || throw(
+        ValidationError(
+            "missing trailing ARROW1 magic: the file is incomplete, as when a write was " *
+            "cut off or an Arrow.Writer was not closed",
+        ),
+    )
+    footerlen = Int64(ltoh(reinterpret(Int32, trailer[1:4])[1]))
+    footerlen > 0 || throw(ValidationError("footer length $footerlen is not positive"))
+    footerlen <= limits.max_metadata_bytes || _limiterror(
+        "footer length $footerlen",
+        "max_metadata_bytes",
+        limits.max_metadata_bytes,
+    )
+    footerstart = src.len - 10 - footerlen
+    footerstart >= 8 || throw(ValidationError("footer escapes the file"))
+    footerbytes = _footerbytes(src, footerstart, footerlen, budget)
+    version, features, dictblocks, recordblocks, _ =
+        _verify_footer_budgeted(footerbytes, limits, budget)
+    Int64(1) in features &&
+        throw(ValidationError("dictionary replacement is forbidden in the IPC file format"))
+    nmessages = AC.checked_add(
+        Int64(1),
+        AC.checked_add(Int64(length(dictblocks)), Int64(length(recordblocks))),
+    )
+    nmessages <= limits.max_messages ||
+        _limiterror("message count $nmessages", "max_messages", limits.max_messages)
+    metaschema = FB.getrootas(Meta.Footer, footerbytes, 0).schema
+    metaschema === nothing && throw(ValidationError("file footer carries no schema"))
+    something(metaschema.endianness, Meta.Endianness.Little) == Meta.Endianness.Little ||
+        throw(
+            ValidationError(
+                "big-endian IPC is not supported (no endianness normalization)",
+            ),
+        )
+    _validateblockindex(dictblocks, recordblocks, footerstart; datastart=Int64(8))
+    dictids = Dict{Int64,Meta.Field}()
+    fielddictids = IdDict{Field,Int64}()
+    fields = Field[
+        corefield(f, dictids, fielddictids) for
+        f in something(metaschema.fields, Meta.Field[])
+    ]
+    foreach(validateschemafield, fields)
+    dictvaluefields = validatedictionaryids(fields, fielddictids)
+    sch = Schema(
+        fields;
+        metadata=coremetadata(metaschema.custom_metadata),
+        endianness=AC.LittleEndian,
+    )
+    return (;
+        sch,
+        fields,
+        dictids,
+        fielddictids,
+        dictvaluefields,
+        version,
+        dictblocks,
+        recordblocks,
+        footerstart,
+    )
+end
+
+_lastbytes(region::OwnerRegion, n::Int, _) =
+    AC.slicebytes(AC.subslice(BufferSlice(region, 0, region.len), region.len - n, n))
+
+function _footerbytes(region::OwnerRegion, start::Int64, len::Int64, budget)
+    _chargevector!(budget, UInt8, len, "footer allocation")
+    return AC.slicebytes(AC.subslice(BufferSlice(region, 0, region.len), start, len))
+end
+
+function _readfile(region::OwnerRegion, limits::Limits, budget::AllocationBudget)
+    region.len >= 6 &&
+    AC.slicebytes(AC.subslice(BufferSlice(region, 0, region.len), 0, 6)) == FILE_MAGIC ||
+        throw(ValidationError("missing leading ARROW1 magic"))
+    ft = _readfooter(region, limits, budget)
+    framed(_, block) =
+        let fm = _blockmessage(region, block, ft.footerstart, limits, budget)
+            _filemetadataversion(ft.version, fm.version)
+            fm
+        end
+    dicts, validated = _filedictionaries(
+        framed,
+        ft.dictblocks,
+        ft.dictids,
+        ft.dictvaluefields,
+        ft.fielddictids,
+        limits,
+        budget,
+    )
+    # Every id a record batch may reference must be resolvable now unless
+    # that batch proves all-null use — checked per batch at decode.
+    return ArrowFile(
+        region,
+        ft.sch,
+        AC.FrozenVector{Field}(ft.fields),
+        ft.fielddictids,
+        dicts,
+        validated,
+        ft.recordblocks,
+        ft.footerstart,
+        limits,
+        ft.version,
+    )
+end
+
+"""
+Decode a file's dictionary batches in footer order; `framed(i, block)` returns
+block `i`'s framed message with its metadata version checked.
+"""
+function _filedictionaries(
+    framed,
+    dictblocks,
+    dictids,
+    dictvaluefields,
+    fielddictids,
+    limits::Limits,
+    budget::AllocationBudget,
+)
+    dicts = Dict{Int64,ArrayData}()
+    validated = AC._ValidatedDictionaries()
+    state = DecodeState(budget)
+    try
+        for (i, block) in enumerate(dictblocks)
+            fm = framed(i, block)
+            rejectexperimentalcompression(fm)
+            header = fm.msg.header
+            header isa Meta.DictionaryBatch ||
+                throw(ValidationError("footer dictionary block is not a dictionary batch"))
+            haskey(dictids, header.id) ||
+                throw(ValidationError("dictionary batch has unknown id $(header.id)"))
+            _dictionarytransition(
+                header.id,
+                header.isDelta,
+                haskey(dicts, header.id);
+                file=true,
+            )
+            vf = dictvaluefields[header.id]
+            decoded = _decodedictionary(
+                header.data,
+                fm.body,
+                fm.version,
+                vf,
+                dicts,
+                fielddictids,
+                limits,
+                state,
+            )
+            _updatedictionary!(
+                dicts,
+                validated,
+                header.id,
+                header.isDelta,
+                vf,
+                decoded,
+                limits,
+                budget;
+                file=true,
+            )
+        end
+        return dicts, validated
+    finally
+        close(state)
+    end
+end
+
+# Frame and check record batch `i` of `f` and plan its decode. With `mask`,
+# only the fields it selects need their dictionaries (a scan).
+function _fileplan(f::ArrowFile, i::Integer, budget::AllocationBudget, mask=nothing)
+    1 <= i <= length(f.recordblocks) || throw(BoundsError(f, i))
+    fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
+    _filemetadataversion(f.schemaversion, fm.version)
+    rejectexperimentalcompression(fm)
+    header = fm.msg.header
+    header isa Meta.RecordBatch ||
+        throw(ValidationError("footer record block is not a record batch"))
+    if mask === nothing
+        for id in missingdicts(f.fields, header.nodes, f.dictionaries, f.fielddictids)
+            throw(
+                ValidationError(
+                    "record batch references dictionary id $id " *
+                    "with no dictionary batch in the file",
+                ),
+            )
+        end
+    else
+        _recordbatchmeta(header, f.fields, f.limits, fm.body.len)
+        _scanmissingdicts(f.fields, header.nodes, f.dictionaries, f.fielddictids, mask)
+    end
+    return _recordplan(header, fm.body, fm.version, f.fields, f.limits)
+end
+
+_decodefilefield(f::ArrowFile, p::_RecordPlan, j::Int, state::DecodeState) = _decodeplanned(
+    p,
+    j,
+    f.fields[j],
+    f.dictionaries,
+    f.fielddictids,
+    f.limits,
+    f.validated,
+    state,
+)
+
+function _filebatch(f::ArrowFile, i::Integer, state::DecodeState)
+    p = _fileplan(f, i, state.budget)
+    cols = ArrayData[_decodefilefield(f, p, j, state) for j = 1:length(f.fields)]
+    return AC.RecordBatch(f.schema, cols, p.rblen, f.validated)
+end
+
+function Base.getindex(f::ArrowFile, i::Integer)
+    budget = _readbudget(f.limits, f.region.len)
+    state = DecodeState(budget)
+    try
+        return _filebatch(f, i, state)
+    finally
+        close(state)
     end
 end

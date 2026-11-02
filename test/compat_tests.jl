@@ -393,7 +393,7 @@ end
 
     @testset "field-name mismatch errors" begin
         Bad = NamedTuple{(:a, :wrong),Tuple{Float64,String}}
-        @test_throws ArgumentError Arrow.Table(bytes; scan=Tables.Scan(select=(:c => Bad,)))
+        @test_throws MethodError Arrow.Table(bytes; scan=Tables.Scan(select=(:c => Bad,)))
     end
 
     @testset "public temporal leaves in typed rows" begin

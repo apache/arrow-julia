@@ -20,156 +20,112 @@
 # Design: Tables.Scan pushdown, cloud byte-range reads, and the trim contract
 
 Implemented in `src/scan.jl` and `src/source.jl` and exposed through the
-facade (`Arrow.Table(source; scan=…)` over an `AbstractArrowSource`); §5
-lists what is and is not built. The three pieces share one mechanism: **a bound column set drives
-both what gets decoded and what gets fetched, and every request value is
-plain data intended to remain visible to the trim verifier.** Section 4
-separates that design intent from what the trim harness actually compiles.
+facade (`Arrow.Table(source; scan=…)`, the `select`/`drop`/`filter`/`limit`/
+`offset` keywords, and `Arrow.Stream`); §4 lists what is and is not built.
+The pieces share one mechanism: **a bound column set drives both what gets
+decoded and what gets fetched, and every request value is plain data intended
+to remain visible to the trim verifier.** Section 3 separates that design
+intent from what the trim harness actually compiles.
 
 ---
 
 ## 1. Tables.Scan support
 
-`Tables.Scan` (from the Tables.jl revision pinned in `Project.toml` until its
-first release) is a plain-data scan request —
-select/rename/type items, a closed predicate algebra (`Cmp`/`In`/`IsNull`/
-`StrPred`/`And`/`Or`/`Not`, with `OpNode` as the growth channel), `limit`/
-`offset`. A source accepts a `Scan` as a keyword and pushes down what it can
-while materializing. Arrow resolves each request once against the source
-schema. Direct handles pass the bound request to the storage-only
-`_applyscan(handle, bound)`. The public facade passes the complete plan to
-`_applyfacadescan`, which owns route-aware materialization, public conversion,
-and result wrapping as one operation. Key contract points this design leans
-on:
+`Tables.Scan` (Tables.jl 1.14) is a plain-data scan request: select, rename,
+and type items, a closed predicate algebra (`Cmp`/`In`/`IsNull`/`StrPred`/
+`And`/`Or`/`Not`, with `OpNode` as the growth channel), and `limit`/`offset`.
+Arrow resolves each request once against the source schema with
+`Tables.resolve` (`_ScanPlan`) and executes the bound request itself. Key
+contract points this design leans on:
 
-- a pushed result must equal the executor's over the same scan, row for
-  row (the differential battery pins this);
+- a pushed result must equal the generic executor's over the same scan, row
+  for row (the differential battery pins this for every source kind);
 - `limit`/`offset` may be consumed **only** over exactly filtered rows;
-- no `Function` values in `Scan` or predicate data — the request algebra is
+- no `Function` values in `Scan` or predicate data: the request algebra is
   closed and value-only.
 
-### What Arrow can push, by axis
+### One planner, one executor
 
-| Axis | Mechanism | Exactness |
-|---|---|---|
-| `select` | decode only (selected ∪ filter-referenced) columns: a registry-driven `skipfield!` advances the node/buffer cursor past unselected fields without body slicing, content validation, or materialization. Complete node/buffer metadata is still validated first. Nested subtrees skip with their parent; no body range is requested for an unselected dictionary column. | exact as IO/decode reduction (see below for who projects) |
-| `limit`/`offset` | Without a filter `RecordBatch.length` is wire metadata: whole batches before `offset` and after `offset+limit` are never decoded (ranged reads still fetch candidate RecordBatch metadata because Footer Blocks have no row counts, but request no body range for excluded batches). With a filter the window composes over the qualifying rows of each decoded batch and decoding stops once it is full. Tail reads and configured coalescing may physically over-read otherwise unrequested bytes. | exact |
-| `filter` | two tiers: (a) **statistics pruning** — per-batch min/max/null-count, when present (§3 of this doc), prune batches that cannot satisfy the predicate; (b) **mask at materialization** — evaluate the predicate over each batch's decoded columns with the generic evaluator (`Tables.filtermask`) and keep only the qualifying rows when building output columns. | (a) inexact — a pruned batch is provably empty; (b) exact — enables limit/offset pushdown with filters |
-| `types` (`ref => T`) | An elementwise conversion request, not a parse seed. Direct handle scans apply it to storage-domain columns. The facade applies it after ArrowTypes and native public conversion. See §4 for the known-schema role in trim mode. | exact |
+Every read goes through one planner and one executor, whatever the source:
+a memory-mapped file, a byte vector, an `IO` read whole, a byte-range source
+such as a cloud object, or stream-format input. A whole read is the scan that
+selects every column.
 
-### The pushdown shape
+    plan(scan, fields) = resolve once against the schema names →
+      check literal kinds against their columns (`_checkliterals`) →
+      give zone-free time literals a UTC column's zone (`_zonedbound`)
 
-`_ScanPlan` resolves a facade request once. It keeps the public-domain bound
-plan and, when every filter literal has an exact storage representation, one
-lowered storage-domain bound plan. `_runboundscan` is the private batch kernel.
-`_applyscan` closes it over ordinary storage materialization for direct
-handles. File and ranged `_applyfacadescan` methods close it over facade
-routing. The stream method routes decoded columns and uses `_executeplan`.
-Every facade method consumes its private route markers before returning:
+    _scanfile(src, footer, plan) =
+      one pass over every Block's metadata (a region serves it in place; a
+      byte-range source fetches it in coalesced ranges that also cover the
+      start of each body) →
+      row counts → the batch window when there is no filter →
+      the decode set's dictionaries, in footer order →
+      a decode plan per batch in the window → _runscan
 
-    plan(scan, fields) =
-      resolve once against schema names →
-      lower filter literals exactly for storage, or mark public fallback →
-      strip public type overrides from the storage plan
+    _scanstream(stream) =
+      frame the messages, apply dictionaries in stream order, and plan each
+      record batch against the dictionaries in effect for it → _runscan
 
-    Temporal literals lower only when the public conversion preserves the
-    requested operator over the complete physical domain. Date64 preserves
-    equality but not order; Time mappings alias physical values. Timestamps
-    read as `Durations.Timestamp`/`ZonedTimestamp` — total order-preserving
-    bijections with storage — so exact literals lower for every operator,
-    and cross-domain literals (zone-naive against zone-declared or the
-    reverse) never lower. Run-end-encoded and dictionary wrappers are
-    transparent to lowering; a convertible leaf inside a COMPOSITE container
-    keeps its filters in the public domain, where rows now hold the same
-    public values. Duration
-    literals may use the column unit or a coarser fixed unit, never a finer
-    one. `In` applies the equality rule to Tuple and Array; Set additionally
-    requires the canonical public type to preserve `isequal` and hashing.
-    Custom membership objects force public-domain fallback.
+    _runscan(records, plan) =
+      no filter and no window: decode the decode set of every batch on up to
+      `ntasks` tasks and build the columns a full read builds;
+      otherwise, per batch: decode the filter columns, evaluate the filter on
+      their public values (`Tables.filtermask`) in chunks of rows, then decode
+      the other selected columns only if a row qualifies, and keep copies of
+      the qualifying rows; without `limit` or `offset` batches run on up to
+      `ntasks` tasks, with a window they run in order and stop once it is full
 
-Tables.jl does not yet expose execution for an existing `BoundScan`.
-`_executeplan` is the narrow local adapter for public and stream fallback. It
-uses Tables.jl's predicate and allocation seams and is pinned to the generic
-executor by the differential battery; it avoids reconstructing and resolving a
-second `Scan`.
+`Arrow.Stream` runs the same executor over one batch at a time.
 
-    _runboundscan(f, bound, materializecolumn) =
-      decode set = selected ∪ filtercols (source order, source names) →
-      batch set = limit/offset window from wire row counts (no filter),
-                  ∩ stats-surviving batches (filter present, stats present) →
-      per decoded batch (`_ScanSink`):
-        materialize the decode set through the operation's fixed policy →
-        rows = filter ? qualifying rows after this batch's share of
-                        offset/limit (saturating, the executor's rule)
-                      : the metadata window's rows →
-        keep each selected column's rows, in selection order, under its
-        output name; stop decoding once the window is full →
-      return table over the selection
+A region (a mapped file or a byte vector) is its own span provider: one span
+over the whole region serves every range the planner names, without a copy.
+A byte-range source fetches each round's ranges through `readrange`,
+coalesced, and a fetched range is referenced in place by the columns that
+read it. The planner is the same for both; only the fetch differs.
 
-    _applyscan(handle, bound) =
-      _runboundscan(handle, bound, storage materializer)
+### What Arrow pushes, by axis
 
-    _applyfacadescan(file-or-ranged-source, plan) =
-      assert plan.storage has no public type overrides →
-      _runboundscan(source, plan.storage, route-aware materializer) →
-      lift ArrowTypes routes and native public values →
-      apply plan.public type overrides and wrap the public Table
+| Axis | Mechanism |
+|---|---|
+| `select` | only the decode set (selected ∪ filter columns) is decoded; `skipfield!` advances the node and buffer cursor past every other field with each buffer-table invariant checked, without slicing, decompressing, or validating its body; over a byte-range source no body range is planned for it |
+| `limit`/`offset` | without a filter, `RecordBatch.length` is wire metadata: batches outside the window are never decoded or fetched; with a filter, the window composes over the qualifying rows, in order, and the scan stops once it is full |
+| `filter` | evaluated per batch over the public values of the filter columns, the values a full read returns; the other selected columns are decoded (and over a byte-range source, fetched) only for batches with a qualifying row |
+| `types` (`ref => T`) | an elementwise `convert` after the scan, as the generic executor applies it. Two overrides read stored values instead: a time of day as a `Dates.Period`, which also reads times outside a day, and a `JuliaLang.Symbol` column as strings, which creates no `Symbol` |
 
-    _applyfacadescan(stream, plan) =
-      assert plan.storage has no public type overrides →
-      materialize route-aware columns after stream decode →
-      _executeplan(columns, plan.storage) →
-      lift routes, apply plan.public overrides, and wrap the public Table
+The filter is evaluated by the generic evaluator over the batch's public
+values, so pushdown and the executor share one three-valued semantics by
+construction (a `missing` predicate excludes the row), and every predicate a
+user can write pushes down: no literal needs a stored-value form.
 
-The filter is evaluated by the generic evaluator (`Tables.filtermask`) over
-the batch's decoded columns, so Arrow's pushdown and the executor share one
-three-valued semantics by construction (a `missing` predicate excludes the
-row). Unselected columns cost zero decode and add zero planned body bytes.
-Tail reads and coalescing may still over-read them under §2's explicit
-policy.
+Column types do not depend on the source kind or on a filter. A read that
+keeps every row of the batches it reads builds the columns a full read
+builds: views of the source, `ChainedVector`s across batches, and string
+columns over the source's bytes. A read with a filter or a window keeps
+copies of its rows: `Vector`s for flat and nested values, string and binary
+columns that hold just their values' bytes, and dictionary columns that keep
+their pool, so a filtered result does not keep a batch's decompressed bytes
+or the mapping alive for a few of its rows. An empty result column has the
+type a read of no batches gives it.
 
-Properties the composition holds (all implemented in `src/scan.jl`):
+Properties the composition holds:
 
 - **Positional filter references resolve to source names** before
-  evaluation (`Tables.resolve` normalizes them): a bound `col(3)` means
-  source column 3, and the decode-set table the evaluator sees carries
-  source names.
+  evaluation (`Tables.resolve` normalizes them).
 - **Wire row counts are trusted only after metadata validation.** Before a
   `RecordBatch.length` drives a window, it is range-checked and matched to
-  every top-level FieldNode length. Exact node/buffer counts and buffer
-  geometry are also checked from metadata alone. Aggregate scan row counts
-  must fit Tables' `Int` row-count API: a planned result through
-  `typemax(Int)` is accepted and a larger one rejected. An offset-only
-  window represents `limit=nothing` explicitly; it does not use a finite
-  sentinel that can omit later batches.
-- **One scan has one allocation budget.** Standalone lazy `file[i]` calls
-  retain their documented per-call budgets. A scan that visits many batches
-    shares one budget and codec state across footer work, metadata, fetched
-  range payloads, decompression, Core and ArrowTypes materialization, scan
-  slices/joins/overrides, and any full-object public-domain fallback.
+  every top-level FieldNode length. The rows of all batches together must fit
+  Tables' `Int` row count, whatever the window keeps.
+- **One scan has one allocation budget,** shared by footer work, metadata,
+  fetched ranges, decompression, and column building.
 - **Windows saturate.** `offset`/`limit` compose with `min` arithmetic over
-  row counts, as the executor does, so `offset + limit` never overflows.
-- **Type overrides run once in the correct value domain.** Direct handle
-  scans apply them to storage-domain columns. The facade keeps them out of
-  its storage plan and applies them after public conversion.
-- **Private Union routes stay local.** Direct `_applyscan` cannot select the
-  ArrowTypes route-aware materializer. `_applyfacadescan` creates and consumes
-  identical-storage Union child markers inside one operation, before a result
-  crosses back into `table.jl`.
-- **Zero-field sources** consume filter and window from row counts alone
-  (`_zerofieldwindow`): a row-invariant predicate evaluates once, and no
-  per-row mask is allocated from an untrusted row count.
-- **Advisory nullability does not weaken the skip boundary.** The reader
-  admits nulls under `nullable=false`; `validate_full` rejects them. If such
-  a null exists only in an unread batch, it does not widen the selected
-  result's concrete Julia vector type. Row values and conforming schemas
-  still match the generic executor exactly.
-
-The statistics fold resolves dictionary indices through the pool before it
-computes logical null/min/max values; the row evaluator compares decoded
-values. Stream-format sources are scanned by the facade after decode — the
-eager stream reader has already decoded by then; stream pushdown would need
-an incremental framer.
+  row counts, so `offset + limit` never overflows.
+- **Zero-field sources** read their row counts from metadata; a filter that
+  reads no column evaluates once per batch, and no per-row mask is allocated
+  from an untrusted row count.
+- **A scan checks only what it reads.** Every Block's metadata is verified,
+  but the body of a dictionary outside the decode set, or of a record batch
+  outside the window, is never read, so damage there does not fail the scan.
 
 ---
 
@@ -195,40 +151,44 @@ sequential — cloud-native access is a file-format feature, stated plainly.
    format (a stream object is read whole instead), and it covers
    footer-length + magic + the whole Footer in almost every real file; if
    `footerlen + 10 > tailbytes`, one exact follow-up fetch (also cached).
-   → schema, Block indexes, (§3) statistics — everything pruning needs.
-   The leading magic is not fetched: the Footer is the sole authority.
-2. **Statistics prune** from the Footer metadata — zero additional fetches.
-3. **Block metadata fetches**: dictionary metadata plus
-   `(offset, metaDataLength)` for each statistics-surviving record batch,
-   coalesced across nearby spans. RecordBatch row counts are here, not in the
-   Footer, so `limit`/`offset` windowing happens after this pass.
-4. **Window and buffer-range plan**: row counts choose the exact batch/body
-   window when there is no filter; the bound column set then maps to a buffer
-   index set (subtree-
-   inclusive; dictionary Blocks for selected dictionary columns) → byte
-   ranges → **coalesce** ranges with gaps below `gapbytes` (default
-   ~256 KiB — a gap fetch is usually cheaper than a request round-trip;
-   both knobs are options, not constants).
-5. **Body fetches** — the selected dictionary bodies and the selected record
-   buffers in ONE round: each coalesced range lands in its own owned heap
-   region; the dictionaries decode first from the shared spans. Decode
-   resolves each declared buffer `(offset, len)` to its containing fetched
-   range and subslices — the message-body-authority
-   invariant becomes *"every buffer must fall inside a fetched range that
-   was itself derived from the verified buffer table"*: same trust story,
-   sparse backing.
+   → schema and Block indexes. The leading magic is not fetched: the Footer
+   is the sole authority.
+2. **Block metadata fetches**: the metadata of every dictionary and record
+   batch Block, each with the start of its body (all of a body up to four
+   `gapbytes`, else its first `gapbytes`), coalesced across nearby spans. A
+   scan with a row window reads metadata alone. RecordBatch row counts are
+   here, not in the Footer, so the window is chosen after this pass.
+3. **Window and buffer-range plan**: row counts choose the batch window when
+   there is no filter; the decode set then maps to a buffer index set
+   (subtree-inclusive; dictionary Blocks for the decode set's dictionaries,
+   including those a dictionary's values use) → byte ranges → **coalesce**
+   ranges with gaps below `gapbytes` (default 256 KiB — a gap fetch is usually
+   cheaper than a request round-trip).
+4. **Body fetches**: the decode set's dictionary bodies and the record bodies
+   the executor reads first (every decode-set column without a filter; the
+   filter columns with one) in one round. A filter then fetches the other
+   selected columns of the batches that keep rows in one more round; a
+   filtered `limit` fetches batch by batch and stops when it is full, freeing
+   each batch's bytes once it is read. Each coalesced range lands in its own
+   owned heap region; decode resolves each declared buffer `(offset, len)` to
+   its containing fetched range and subslices it: *every buffer must fall
+   inside a fetched range that was itself derived from the verified buffer
+   table*, the message-body authority invariant with sparse backing.
 
-Request-count model (what actually matters against cloud latency): `1` tail
-(plus one sequential exact Footer follow-up when the tail is too small)
-+ `⌈candidate metadata spans after coalescing⌉` + `⌈coalesced body ranges⌉`.
-The common path has three sequential request rounds. A Footer follow-up makes
-four. The source can issue a metadata or body round's planned ranges
-concurrently.
-For a 40-column file reading 3 columns of every batch, this moves roughly
-`3/40` of the body bytes plus metadata. Statistics-pruned batches contribute
-no requested metadata/body range. Coalescing is an explicit over-read policy,
-so a requested span may cross otherwise unneeded bytes when the configured
-gap permits it.
+Request-count model (what matters against cloud latency): `1` tail (plus one
+exact Footer follow-up when the tail is too small) + `⌈metadata spans after
+coalescing⌉` + `⌈coalesced body ranges⌉`. A read without a filter makes
+three sequential rounds, a filtered read four. The source can issue a round's
+ranges concurrently. For a 40-column file reading 3 columns of every batch,
+this moves roughly `3/40` of the body bytes plus metadata. Coalescing is an
+explicit over-read policy: a requested span may cross unneeded bytes when the
+configured gap permits it.
+
+`Arrow.Stream` over a byte-range file source reads the footer and the
+dictionaries when it opens. A batch that decodes every column reads its whole
+block, and the blocks after it while they fit 8 MiB, with one window fetched
+ahead. A batch that decodes some columns reads its metadata with the start of
+its body, then the ranges of its decode set it lacks.
 
 ### The interface (no HTTP/CloudStore deps in Arrow)
 
@@ -245,13 +205,12 @@ planner; transports live in extensions:
         # a source's completion order can never permute payloads, and the
         # reads in flight are bounded whatever the span count.
 
-- The entry point is `Arrow.Table(src; scan=…)`, which builds the internal
-  `SourceFile(src; limits, tailbytes, gapbytes)` handle and runs
-  `Tables.scan(sf, scan)`; the source's length is read once, at handle
-  construction, and the tail once per handle. `Arrow.Table(src)` without a
-  scan, with a scan that cannot be pushed down, over a zero-field file, or
-  over a stream-format object reads the object whole (one request beyond
-  the cached tail), as does `Arrow.Stream(src)`.
+- `Arrow.Table(src; …)` builds the internal `SourceFile(src; limits,
+  tailbytes, gapbytes)` handle and reads through the planner; the source's
+  length is read once, at handle construction, and the tail once per handle.
+  `Arrow.Table(src)` without a scan, or over a stream-format object, reads
+  the object whole in 8 MiB ranges (one request beyond the cached tail for a
+  source that reads one range at a time).
 - One `SourceFile` samples `concurrentreads` once and shares one semaphore
   across its operations. Separate handles are independent; a transport that
   requires one wider cap enforces it in `readrange`.
@@ -266,12 +225,13 @@ planner; transports live in extensions:
   methods. Zero new hard deps.
 - The differential test: sparse fetch ≡ whole-file read, plus
   request-count/byte-count/range assertions on a counting test source
-  (`test/scan_battery.jl`), and the CloudStore extension end to end against
-  a local S3-compatible server (`test/cloudstore_tests.jl`).
-- Explicitly out of scope v1, documented: caching/prefetch policy beyond
-  coalescing, retries (the source's job), writers over ranges, stream
-  format (read whole), mutation detection (ETag pinning is the extension's
-  concern).
+  (`test/scan_battery.jl`, `test/ranged_scan_tests.jl`), and the CloudStore
+  extension end to end against a local S3-compatible server
+  (`test/cloudstore_tests.jl`).
+- Explicitly out of scope, documented: caching/prefetch policy beyond
+  coalescing and `Arrow.Stream`'s read-ahead, retries (the source's job),
+  writers over ranges, stream format (read whole), mutation detection (ETag
+  pinning is the extension's concern).
 
 The ranged reader deliberately uses the Footer schema as its sole schema
 authority. It does not parse or cross-check the leading schema message or
@@ -279,9 +239,7 @@ optional EOS marker, although a head, tail, or coalesced request can physically
 over-read those or other unrequested bytes. The complete Footer Block index is
 bounded and checked for overlap. Required features and message limits are
 global. Per-record metadata/body/buffer limits stay lazy like `ArrowFile`:
-dictionary blocks and statistics-surviving record candidates are checked, while
-statistics-pruned record metadata causes no dedicated range request and is not
-validated (a tail or coalesced request may still over-read it). Message kind,
+every dictionary and record block's metadata is checked. Message kind,
 version, legacy-compression state, complete node/buffer metadata,
 layout-derived buffer minima, child extents, and fixed or fully-covered
 null-count contracts for planned subtrees, planned codec, and required
@@ -290,60 +248,13 @@ Skipped buffer contents remain unvalidated by design.
 
 ---
 
-## 3. Per-batch statistics (the pruning fuel)
-
-Arrow's format has no per-batch statistics on the wire; the ecosystem's
-"statistics schema" standardizes the **value layout** for exchanging
-statistics as Arrow data, but placement in IPC files is not (yet)
-standardized upstream. This convention is deliberately conservative:
-
-- **Placement (our convention, upgradeable)**: one schema-level custom
-  metadata key, e.g. `JuliaArrow:batch_statistics.v1`, carried in the
-  **Footer's** schema copy so the tail fetch alone powers pruning.
-- **Value layout**: follow the official statistics-schema array layout,
-  serialized as one embedded IPC stream (statistics ARE Arrow data); per
-  record batch × flattened RecordBatch FieldNode index: row_count,
-  null_count, min, max (the `ARROW:*:exact` keys). Top-level fields after
-  nested fields
-  therefore do not use their top-level ordinal as the `column` value.
-  Using the official layout keeps us convention-compatible if upstream
-  standardizes placement later — we then emit both keys for a deprecation
-  cycle and read either.
-- Writer: `withstatistics` / `statsfile` eagerly compute the embedded
-  stream for already-encoded batches. An opt-in `statistics=true` keyword
-  computing the same fold state during encode is not implemented; file
-  format only. An append path would have to recompute or drop
-  — dropping with a warning is the honest v1.
-- Reader: prune under `Cmp`/`In`/`IsNull` (and `StrPred` prefix ranges for
-  `startswith`) with one-sided may-contain logic — a batch survives unless
-  the predicate is provably false for ALL rows; the exact row filter always
-  runs after pruning (pruning is inexact by design). Missing or MALFORMED
-  statistics degrade to "no pruning", never to an error. The embedded
-  stream and Base64 output share the enclosing scan allocation budget;
-  exhausting that cumulative caller limit remains a scan error instead of
-  being mistaken for malformed optional metadata.
-  Float comparisons use the predicate's IEEE operators; any NaN disables
-  bounds, and signed zero is not ordered with `isless`. Dictionary folds
-  count null pool results as logical nulls.
-- **Trust model, stated plainly**: statistics are
-  trusted-for-completeness, exactly like Parquet row-group stats. The exact
-  row filter protects one direction only — batches kept by lying stats still
-  filter row-exactly. The other direction has no net: stats
-  that under-report a range cause false EXCLUSION. Excluded batches are not
-  decoded and cause no dedicated metadata/body range request, so their
-  qualifying rows are silently lost. Tail/coalescing over-read does not restore
-  them. Wide (conservative) lies cost pruning, never correctness; narrow lies
-  lose rows. The acceptance battery pins all three behaviors.
-
----
-
-## 4. The trim contract (staying on the radar, explicitly)
+## 3. The trim contract (staying on the radar, explicitly)
 
 **Trimmability is a standing production gate, not an aspiration.** The
 `--trim=safe` harness (0 errors / 0 warnings / binary exit 0) compiles
 `ArrowCore` plus its value-domain and typed-value workloads and the C-data
 seams, plus a representative DataStrings workload. It does **not** yet compile
-a scan-and-materialize app, so §1–§3 are designed for trim but not yet gated by
+a scan-and-materialize app, so §1–§2 are designed for trim but not yet gated by
 it. The rules in `core-README.md` ("Trim-compile support") constrain their form:
 
 - `Tables.Scan` is trim-aligned by its own charter (no `Function` fields;
@@ -373,38 +284,35 @@ it. The rules in `core-README.md` ("Trim-compile support") constrain their form:
 
 ---
 
-## 5. Status
+## 4. Status
 
-Implemented (`src/scan.jl`, `src/table.jl`):
+Implemented (`src/scan.jl`, `src/table.jl`, `src/source.jl`):
 
-- **Scan pushdown**: `skipfield!`, one `_ScanPlan` compilation per facade
-  request, storage-only `_applyscan(::ArrowFile, bound)`, and the closed
-  file/ranged `_applyfacadescan(source, plan)` route consuming the bound scan
-  exactly through `_ScanSink` (per-batch filter evaluation, composed
-  limit/offset with early stop, selection, renames, direct-handle type
-  overrides at column construction, and facade conversion before return),
-  zero-field scans, and the
-  differential battery with corruption-backed never-decoded proofs. `Arrow.Table(source; scan=…)`
-  routes through it on file-format and ranged inputs; stream-format inputs
-  route inside their facade operation and scan post-decode with identical
-  results.
+- **One planner and one executor** for every source, as decided on Aug 19
+  2026: memory-mapped files, byte vectors, an `IO` read whole, byte-range
+  sources, and stream-format input. A region serves the planner's ranges in
+  place, a byte-range source fetches them in coalesced rounds, and
+  `Arrow.Stream` runs the executor over one batch at a time. `skipfield!`
+  skips what the scan does not decode; `_ScanPlan` resolves a request once;
+  `_runscan` reads filter columns first, evaluates filters on public values in
+  chunks of rows on up to `ntasks` tasks, and decodes the other selected
+  columns only for batches that keep rows.
 - **Byte-range sources**: the `AbstractArrowSource` contract, the
   `SourceFile` fetch protocol, the coalescing planner, `SparseBody` decode,
-  the CloudStore.jl extension, and counting-source proofs (zero planned body ranges for skipped columns,
-  window-excluded batches, and unneeded dictionary bodies, with exact
-  request-log checks under the fixtures' tail/coalescing settings).
-- **Statistics**: `withstatistics`/`statsfile` fold the official statistics
-  value layout into `JuliaArrow:batch_statistics.v1` (footer schema
-  metadata, base64-wrapped IPC stream, one statistics batch per data batch,
-  serialized through this writer); `_maypass` may-contain pruning is wired
-  into both applies (ranged pruning happens before the block-metadata pass,
-  so pruned batches cause no dedicated metadata/body request; configured
-  tail/coalescing may over-read them); acceptance pins exactness,
-  degradation, and both lie directions.
+  the CloudStore.jl extension, and counting-source proofs (zero planned body
+  ranges for skipped columns, window-excluded batches, and unneeded
+  dictionary bodies, with exact request-log checks under the fixtures'
+  tail/coalescing settings).
 
 Not implemented: an HTTP transport extension (the source contract is the
-extension point; the CloudStore extension is the model), an encode-time
-`statistics=true` writer keyword, upstream-placement tracking
-for statistics, and the scan-and-materialize trim harness. Scan pushdown
-depends on the pinned Tables.jl development revision until that API is
-released.
+extension point; the CloudStore extension is the model) and the
+scan-and-materialize trim harness. `Arrow.Stream` decodes every dictionary
+batch of a file when it opens, including those of columns it does not
+select.
+
+Possible future work: per-batch statistics (row counts, null counts, minimum
+and maximum values) in IPC footers, to prune batches a filter cannot match
+before their metadata is fetched. The Arrow statistics schema standardizes
+the value layout but not a placement in IPC files; without a placement other
+implementations read, a private key would help only Julia readers of files
+Julia wrote, and wrong statistics silently drop rows.

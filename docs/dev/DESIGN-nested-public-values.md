@@ -133,21 +133,14 @@ Two tiers, by what the caller knows statically:
   and `materialize(::Type{T}, ...)` claims stay the storage-domain
   monomorphic tier and remain part of the trim workload, unchanged. The
   facade's typed select override (`:col => NamedTuple{...}`, recursively,
-  including `Vector{...}` targets) now accepts PUBLIC leaf types such as
-  `Durations.Timestamp{Nanosecond}` — the public rows already hold those
-  values, so the override is an identity check per leaf rather than a
-  conversion. The override tier is a convenience over the dynamic rows and
-  is not trim-audited; making the whole facade trim-compileable stays
-  future work.
+  including `Vector{...}` targets) converts each value with `convert`, as
+  `Tables.scan` does. It is a convenience over the dynamic rows and is not
+  trim-audited; making the whole facade trim-compileable stays future work.
 
 The typed tiers share no code with the dynamic row shapes, so the dynamic
 `Pair{String,Any}` containers cost them nothing.
 
-## Scan and statistics
+## Scans
 
-Filter literals lower per-FIELD through the same authority. A composite
-column still evaluates its filters in the public domain (no composite
-pushdown), which is now also the converted domain — plain Julia `==` over
-public rows is the semantics. `_nativefacadeconversion`'s children test
-keeps composite fields off the storage plan. Statistics pruning is
-top-level and unchanged.
+Scan filters evaluate on the public values a full read returns, composite
+columns included: plain Julia `==` over public rows is the semantics.

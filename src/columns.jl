@@ -495,41 +495,64 @@ Base.copy(v::DictEncoded{T}) where {T} = _pooledcopy(T, (v,))
 # The batches of a column copy into one `PooledArray`, whether they share a
 # pool, extend it (delta dictionaries), or replace it.
 Base.copy(c::ChainedVector{T,<:DictEncoded}) where {T} = _pooledcopy(T, c.arrays)
+# Rows of a dictionary column, as of a `PooledArray`, keep the encoding.
+function Base.getindex(v::DictEncoded{T}, rows::AbstractVector{<:Integer}) where {T}
+    @boundscheck checkbounds(v, rows)
+    return _pooledcopy(T, (v,), to_indices(v, (rows,))[1])
+end
+function Base.getindex(
+    c::ChainedVector{T,<:DictEncoded},
+    rows::AbstractVector{Int},
+) where {T}
+    @boundscheck checkbounds(c, rows)
+    return _pooledcopy(T, c.arrays, rows)
+end
+function Base.getindex(c::ChainedVector{T,<:DictEncoded}, rows::UnitRange{Int}) where {T}
+    @boundscheck checkbounds(c, rows)
+    return _pooledcopy(T, c.arrays, rows)
+end
+function Base.getindex(
+    c::ChainedVector{T,<:DictEncoded},
+    rows::AbstractVector{Bool},
+) where {T}
+    @boundscheck checkbounds(c, rows)
+    return _pooledcopy(T, c.arrays, findall(rows))
+end
 
-function _pooledcopy(::Type{T}, chunks) where {T}
-    # Distinct values in first-pool-position order; duplicates and null
-    # pool entries remap so the PooledArray's invariants hold.
+"""
+Rows `rows` (all of them by default) of the dictionary column whose batches
+are `chunks`, as a `PooledArray`. A batch's pool joins the result's when its
+first row is copied: its distinct values, in pool order; duplicate and null
+entries remap, so the PooledArray's invariants hold.
+"""
+function _pooledcopy(::Type{T}, chunks, rows=nothing) where {T}
     R = _ownedtype(T)
     invpool = Dict{R,UInt32}()
     pool = R[]
-    refs = Vector{UInt32}(undef, sum(length, chunks; init=0))
+    ref(value) = get!(invpool, value) do
+        push!(pool, value)
+        UInt32(length(pool))
+    end
+    remaps = IdDict{Any,Vector{UInt32}}()
+    ends = cumsum(Int[length(v) for v in chunks])
+    n = rows === nothing ? (isempty(ends) ? 0 : ends[end]) : length(rows)
+    refs = Vector{UInt32}(undef, n)
+    c = 1
     remap = UInt32[]
     lastpool = nothing
-    at = 0
-    for v in chunks
+    for (k, i) in enumerate(rows === nothing ? (1:n) : rows)
+        # Ascending rows advance through the batches; others search.
+        if !(c <= length(ends) && (c == 1 ? 0 : ends[c - 1]) < i <= ends[c])
+            c = searchsortedfirst(ends, i)
+        end
+        v = chunks[c]
         if v.pool !== lastpool
-            remap = Vector{UInt32}(undef, length(v.pool))
-            for (k, x) in enumerate(v.pool)
-                value = _ownedpoolvalue(x)
-                remap[k] = get!(invpool, value) do
-                    push!(pool, value)
-                    UInt32(length(pool))
-                end
-            end
+            remap =
+                get!(() -> UInt32[ref(_ownedpoolvalue(x)) for x in v.pool], remaps, v.pool)
             lastpool = v.pool
         end
-        for i in eachindex(v.indices)
-            code = @inbounds v.indices[i]
-            refs[at + i] = if code === missing
-                get!(invpool, missing) do
-                    push!(pool, missing)
-                    UInt32(length(pool))
-                end
-            else
-                @inbounds remap[Int(code) + 1]
-            end
-        end
-        at += length(v)
+        code = @inbounds v.indices[i - (c == 1 ? 0 : ends[c - 1])]
+        refs[k] = code === missing ? ref(missing) : @inbounds remap[Int(code) + 1]
     end
     return PooledArrays.PooledArray(PooledArrays.RefArray(refs), invpool, pool)
 end
@@ -886,6 +909,14 @@ function _offsetrows!(
 ) where {O}
     a = Int64(offsets[c.first])
     z = Int64(offsets[c.last + 1])
+    # The chunk reads each of these bytes once (see `_willneed`).
+    GC.@preserve d offsets begin
+        z > a && _willneed(AC.sliceptr(AC.rolebuffer(d, AC.DATA)) + a, Int(z - a))
+        offsets isa Vector && _willneed(
+            Ptr{UInt8}(pointer(offsets, c.first)),
+            (c.last - c.first + 2) * sizeof(O),
+        )
+    end
     if c.copybytes && z > a
         src = AC.subslice(AC.rolebuffer(d, AC.DATA), a, z - a)
         GC.@preserve buf d unsafe_copyto!(
@@ -1020,15 +1051,13 @@ end
 const _StringColumn = Union{DataStrings.StringVector,DataStrings.BytesVector}
 
 """
-A copy of a string or binary column that owns its bytes: the same payloads over
-one data buffer (several, each under 2 GiB, for more bytes) holding just the
-bytes the view payloads reference, in column order; inline payloads carry
-their own. A column read over a mapped file, a byte vector, or a fetched range
-references those bytes in place, so this is what detaches a copy from them.
+The string column `V` of `payloads`, owning its bytes. A payload is inline,
+missing, or the length and first four bytes of a value whose bytes
+`bytes(i)` points at; those values' bytes are copied, in column order, into
+one data buffer (several, each under 2 GiB, for more bytes) that the
+payloads are re-pointed into.
 """
-function _compactstrings(v::V) where {V<:_StringColumn}
-    payloads = v.payloads
-    buffers = v.buffers
+function _ownstrings(::Type{V}, payloads::Vector{_StringPayload}, bytes) where {V}
     sizes = Int64[]
     total = Int64(0)
     for p in payloads
@@ -1041,39 +1070,129 @@ function _compactstrings(v::V) where {V<:_StringColumn}
         total += len
     end
     push!(sizes, total)
-    out = Vector{_StringPayload}(undef, length(payloads))
     data = Vector{UInt8}[Vector{UInt8}(undef, Int(size)) for size in sizes]
     k = 1
     pos = Int64(0)
     @inbounds for i in eachindex(payloads)
         p = payloads[i]
         len = Int64(DataStrings.payloadlength(p))
-        if len <= DataStrings.INLINE_MAX
-            out[i] = p
-            continue
-        end
+        len > DataStrings.INLINE_MAX || continue
         if pos + len > sizes[k]
             k += 1
             pos = Int64(0)
         end
-        src = buffers[DataStrings.payloadbufidx(p) + 1]
         dst = data[k]
-        GC.@preserve src dst unsafe_copyto!(
-            pointer(dst, Int(pos) + 1),
-            pointer(src, DataStrings.payloadpos(p)),
-            Int(len),
-        )
-        out[i] =
+        GC.@preserve dst unsafe_copyto!(pointer(dst, Int(pos) + 1), bytes(i), Int(len))
+        payloads[i] =
             _StringPayload(p.a, UInt64((k - 1) % UInt32) | (UInt64(pos % UInt32) << 32))
         pos += len
     end
-    return V(out, data, Val(:trusted))
+    return V(payloads, data, Val(:trusted))
 end
 
-# Rows `rows` of a column: the same kind of string column over the same
-# buffers, so a filtered read gives what an unfiltered one does.
+# Where a view payload's bytes start in string column `v`.
+_viewptr(v::_StringColumn, p::_StringPayload) =
+    pointer(v.buffers[DataStrings.payloadbufidx(p) + 1], DataStrings.payloadpos(p))
+
+"""
+A copy of a string or binary column that owns its bytes: the same values over
+data buffers holding just the bytes they reference. A column read over a
+mapped file, a byte vector, or a fetched range references those bytes in
+place, so this is what detaches a copy from them.
+"""
+_compactstrings(v::_StringColumn) = _rowsof(v, eachindex(v))
+
+# Rows `rows` of a column. A string column's rows own just their bytes, so a
+# filtered read does not keep the rest of the batch's bytes alive.
 _rowsof(v::AbstractVector, rows) = v[rows]
-_rowsof(v::V, rows) where {V<:_StringColumn} = V(v.payloads[rows], v.buffers, Val(:trusted))
+function _rowsof(v::V, rows) where {V<:_StringColumn}
+    payloads = v.payloads
+    return GC.@preserve v _ownstrings(
+        V,
+        payloads[rows],
+        i -> _viewptr(v, payloads[rows[i]]),
+    )
+end
+# A dictionary column's rows keep its pool.
+function _rowsof(v::DictEncoded{T,R,P}, rows) where {T,R,P}
+    indices = v.indices[rows]
+    return DictEncoded{T,R,P,typeof(indices)}(indices, v.pool, v.ordered)
+end
+
+# The payload of the `len` bytes at `p`: inline when they fit, else their
+# length and first four bytes (`_ownstrings` adds where they are stored).
+@inline function _rowpayload(p::Ptr{UInt8}, len::Int)
+    a = UInt64(len % UInt32)
+    len > DataStrings.INLINE_MAX &&
+        return _StringPayload(a | (UInt64(ltoh(unsafe_load(Ptr{UInt32}(p)))) << 32), 0)
+    b = zero(UInt64)
+    for i = 1:min(len, 4)
+        a |= UInt64(unsafe_load(p, i)) << (32 + 8 * (i - 1))
+    end
+    for i = 5:len
+        b |= UInt64(unsafe_load(p, i)) << (8 * (i - 5))
+    end
+    return _StringPayload(a, b)
+end
+
+"""
+Rows `rows` of string or binary batch `d` as a column of element type `T`
+that owns its bytes: a `StringVector` or `BytesVector` whose data buffer
+holds just those values' bytes, or `String`s.
+"""
+function _rowsof(::Type{T}, d::AC.ArrayData, rows) where {T}
+    validity, bitoffset = _validitybits(d)
+    isnull(i) = _isnullslot(validity, bitoffset, i)
+    if d.type isa AC.ViewType
+        views =
+            _wrapbuffer(_StringPayload, AC.rolebuffer(d, AC.VIEWS), d.offset, Int64(d.len))
+        viewvalue(i) =
+            let p = views[i], len = Int(DataStrings.payloadlength(p))
+                len <= DataStrings.INLINE_MAX &&
+                    return Ptr{UInt8}(pointer(views, i)) + 4, len
+                data = d.buffers[DataStrings.payloadbufidx(p) + 3]
+                return AC.sliceptr(AC.subslice(data, DataStrings.payloadoffset(p), len)),
+                len
+            end
+        return GC.@preserve d views _gatherstrings(T, rows, isnull, viewvalue)
+    end
+    return _withoffsets(d) do offsets
+        base = AC.sliceptr(AC.rolebuffer(d, AC.DATA))
+        function offsetvalue(i)
+            o = Int64(offsets[i])
+            len = Int64(offsets[i + 1]) - o
+            len <= _MAX_VIEW_BUFFER || throw(
+                ArgumentError(
+                    "a string longer than 2 GiB does not fit a DataString; " *
+                    "read the column with stringtype=String",
+                ),
+            )
+            return base + o, Int(len)
+        end
+        return GC.@preserve d _gatherstrings(T, rows, isnull, offsetvalue)
+    end
+end
+
+# The values `value(i)` (a pointer and a length) of rows `rows`, or `missing`
+# where `isnull(i)`, as an owned column of element type `T`.
+function _gatherstrings(::Type{T}, rows, isnull, value) where {T}
+    B = Base.nonmissingtype(T)
+    if B === String
+        out = Vector{T}(undef, length(rows))
+        for (k, i) in enumerate(rows)
+            out[k] = isnull(i) ? missing : unsafe_string(value(i)...)
+        end
+        return out
+    end
+    V =
+        B === DataStrings.DataString ? DataStrings.StringVector{T} :
+        DataStrings.BytesVector{T}
+    payloads = Vector{_StringPayload}(undef, length(rows))
+    for (k, i) in enumerate(rows)
+        payloads[k] = isnull(i) ? DataStrings.PAYLOAD_MISSING : _rowpayload(value(i)...)
+    end
+    return _ownstrings(V, payloads, k -> first(value(rows[k])))
+end
 
 # The string columns `parts`, one per batch, joined into one of element type
 # `T` over all their buffers: a part's view payloads re-point into the joined
@@ -1088,21 +1207,27 @@ function _joinstrings(::Type{T}, parts) where {T}
     for part in parts
         base = length(buffers)
         append!(buffers, part.buffers)
-        payloads = part.payloads
-        @inbounds for i in eachindex(payloads)
-            p = payloads[i]
-            if base > 0 && DataStrings.payloadlength(p) > DataStrings.INLINE_MAX
-                p = _StringPayload(
-                    p.a,
-                    UInt64((DataStrings.payloadbufidx(p) + base) % UInt32) |
-                    (p.b & 0xffffffff00000000),
-                )
-            end
-            out[at + i] = p
-        end
-        at += length(payloads)
+        _repoint!(out, at, part.payloads, base)
+        at += length(part)
     end
     return V(out, buffers, Val(:trusted))
+end
+
+# Copy `payloads` into `out` after index `at`, view payloads re-pointed `base`
+# buffers further into the joined buffer list.
+function _repoint!(out, at::Int, payloads::Vector{_StringPayload}, base::Int)
+    @inbounds for i in eachindex(payloads)
+        p = payloads[i]
+        if base > 0 && DataStrings.payloadlength(p) > DataStrings.INLINE_MAX
+            p = _StringPayload(
+                p.a,
+                UInt64((DataStrings.payloadbufidx(p) + base) % UInt32) |
+                (p.b & 0xffffffff00000000),
+            )
+        end
+        out[at + i] = p
+    end
+    return out
 end
 
 # A dictionary pool value owning its bytes: a `DataString` or `DataBytes` view
@@ -1319,13 +1444,17 @@ function _markpools!(live, data::AC.ArrayData, cached)
     return nothing
 end
 
-# A stream reuses current pools, but only returned tables may keep old ones alive.
-function _prunepools!(ctx::_ViewContext, columns, budget)
+# A stream reuses the pool columns of the dictionaries still in effect
+# (`dictionaries`), but only returned tables may keep older ones alive.
+function _prunepools!(ctx::_ViewContext, dictionaries, budget)
     lock(ctx.poolslock) do
         isempty(ctx.pools) && return nothing
         _chargedict!(budget, AC.ArrayData, Nothing, length(ctx.pools), "live stream pools")
         live = IdDict{AC.ArrayData,Nothing}()
-        foreach(data -> _markpools!(live, data, ctx.pools), columns)
+        for dictionary in dictionaries
+            haskey(ctx.pools, dictionary) && (live[dictionary] = nothing)
+            _markpools!(live, dictionary, ctx.pools)
+        end
         filter!(entry -> haskey(live, first(entry)), ctx.pools)
         return nothing
     end

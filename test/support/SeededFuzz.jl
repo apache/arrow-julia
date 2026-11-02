@@ -158,8 +158,7 @@ function parse_options(args)
         mutation_lane === nothing &&
         throw(ArgumentError("--mutation-file requires --mutation-lane"))
     mutation_lane === nothing ||
-        mutation_lane in
-        (:stream_full, :file_full, :file_ranged, :auto_full, :stats_filtered) ||
+        mutation_lane in (:stream_full, :file_full, :file_ranged, :auto_full) ||
         throw(ArgumentError("invalid --mutation-lane $mutation_lane"))
     layouts_only &&
         !include_layouts &&
@@ -619,21 +618,21 @@ function _temporalscan(index::Int, dates)
     needle = _dateneedle(dates)
     noon = DateTime(needle) + Hour(12)
     mode = mod1(index, 6)
-    filter, storage, label = if mode == 1
-        (Tables.colcmp(==, Tables.col(:dates), needle), true, :date_scalar)
+    filter, label = if mode == 1
+        (Tables.colcmp(==, Tables.col(:dates), needle), :date_scalar)
     elseif mode == 2
-        (Tables.colin(Tables.col(:dates), (needle,)), true, :date_tuple)
+        (Tables.colin(Tables.col(:dates), (needle,)), :date_tuple)
     elseif mode == 3
-        (Tables.colin(Tables.col(:dates), Date[needle]), true, :date_array)
+        (Tables.colin(Tables.col(:dates), Date[needle]), :date_array)
     elseif mode == 4
-        (Tables.colin(Tables.col(:dates), Set([needle])), true, :date_set)
+        (Tables.colin(Tables.col(:dates), Set([needle])), :date_set)
     elseif mode == 5
-        (Tables.colcmp(!=, Tables.col(:dates), noon), false, :date_scalar_public)
+        (Tables.colcmp(!=, Tables.col(:dates), noon), :date_datetime)
     else
-        (Tables.colin(Tables.col(:dates), (noon, needle)), false, :date_tuple_public)
+        (Tables.colin(Tables.col(:dates), (noon, needle)), :date_datetime_tuple)
     end
     scan = Tables.Scan(select=(:strings => :text, :dates), filter=filter)
-    return (; scan, storage, label)
+    return (; scan, label)
 end
 
 function _scans(master::UInt64, index::Int, dates)
@@ -643,16 +642,11 @@ function _scans(master::UInt64, index::Int, dates)
     threshold = Int64(_range(rng, -8, 8))
     needle = _choice(rng, TEXT)
     return (
-        (scan=Tables.Scan(), storage=true, label=:identity),
-        (
-            scan=Tables.Scan(select=(:ints, :strings, :dictionary)),
-            storage=true,
-            label=:projection,
-        ),
+        (scan=Tables.Scan(), label=:identity),
+        (scan=Tables.Scan(select=(:ints, :strings, :dictionary)), label=:projection),
         _temporalscan(index, dates),
         (
             scan=Tables.Scan(select=(), filter=Tables.isnull(Tables.col(:ints))),
-            storage=true,
             label=:null_filter,
         ),
         (
@@ -661,7 +655,6 @@ function _scans(master::UInt64, index::Int, dates)
                 filter=Tables.colcmp(>, Tables.col(:ints), threshold),
                 limit=limit,
             ),
-            storage=true,
             label=:comparison,
         ),
         (
@@ -670,7 +663,6 @@ function _scans(master::UInt64, index::Int, dates)
                 filter=Tables.colin(Tables.col(:strings), (needle, missing)),
                 offset=offset,
             ),
-            storage=true,
             label=:string_membership,
         ),
     )
@@ -1309,42 +1301,6 @@ function _run_layout_case(case::LayoutCase)
     return checks, coverage
 end
 
-function _run_statistics_pruning()
-    parts = [
-        (x=Int64[1, 2, 3, 4, 5], payload=fill(repeat("a", 128), 5)),
-        (x=Int64[6, 7, 8, 9, 10], payload=fill(repeat("z", 128), 5)),
-    ]
-    streambytes = ipcbytes(Tables.partitioner(parts); file=false, compress=:none)
-    stream = Arrow.readstream(streambytes)
-    bytes = Arrow.statsfile(stream.schema, stream.batches)
-    scan = Tables.Scan(select=(:x,), filter=Tables.col(:x) > 7)
-    # Several partitions write every field nullable.
-    reference = Tables.scan(
-        (
-            x=Vector{Union{Missing,Int64}}(reduce(vcat, getproperty.(parts, :x))),
-            payload=reduce(vcat, getproperty.(parts, :payload)),
-        ),
-        scan,
-    )
-    source = FuzzBytesSource(copy(bytes))
-    actual = Arrow.Table(
-        Arrow.SourceFile(source; limits=STRICT_LIMITS, tailbytes=32, gapbytes=0);
-        scan,
-    )
-    _check_same_table(actual, reference; label="statistics-pruned ranged scan")
-    firstblock = Arrow.readfile(copy(bytes)).recordblocks[1]
-    firstspan = (firstblock[1], firstblock[2] + firstblock[3])
-    _require(
-        !any(request -> _rangesintersect(request, firstspan), source.requests),
-        "statistics-pruned batch was fetched",
-    )
-    _require(
-        !any(request -> request == (Int64(0), Int64(length(bytes))), source.requests),
-        "statistics-pruned scan fetched the full object",
-    )
-    return 1, Set([:statistics_pruning, :ranged_no_full_fetch])
-end
-
 function run_layouts()
     checks = 0
     coverage = Set{Symbol}()
@@ -1353,9 +1309,6 @@ function run_layouts()
         checks += casechecks
         union!(coverage, casecoverage)
     end
-    statchecks, statcoverage = _run_statistics_pruning()
-    checks += statchecks
-    union!(coverage, statcoverage)
     return checks, coverage
 end
 
@@ -1402,11 +1355,6 @@ function _run_differential_case(master::UInt64, index::Int)
         full = Arrow.Table(copy(bytes))
         for (scanindex, scancase) in enumerate(_scans(master, index, case.expected.dates))
             scan = scancase.scan
-            plan = Arrow._ScanPlan(scan, getfield(full, :schema).fields)
-            _require(
-                (plan.storage !== nothing) == scancase.storage,
-                "$label scan=$(scancase.label) used the wrong evaluation domain",
-            )
             reference = Tables.scan(full, scan)
             whole = Arrow.Table(copy(bytes); scan=scan)
             _check_same_table(whole, reference; label="$label whole scan=$scanindex")
@@ -1672,15 +1620,6 @@ function _mutationcorpus()
             )
         end
     end
-    statssource = Arrow.readstream(ipcbytes(_mutationtable(); file=false, compress=:none))
-    push!(
-        corpus,
-        MutationCorpus(
-            :stats_file,
-            true,
-            Arrow.statsfile(statssource.schema, statssource.batches),
-        ),
-    )
     return corpus
 end
 
@@ -1695,7 +1634,6 @@ function _mutationroutes(corpus=_mutationcorpus())
         end
         entry.label in (:stream_none, :file_none) &&
             push!(routes, MutationRoute(entry, :auto_full))
-        entry.label === :stats_file && push!(routes, MutationRoute(entry, :stats_filtered))
     end
     return routes
 end
@@ -1781,30 +1719,6 @@ function _exercise_mutation(bytes::Vector{UInt8}, lane::Symbol)
         requests = copy(fuzzsource.requests)
     elseif lane === :auto_full
         table = Arrow.Table(copy(bytes); limits=STRICT_LIMITS)
-    elseif lane === :stats_filtered
-        file = Arrow.readfile(copy(bytes); limits=STRICT_LIMITS)
-        valuefiltered = !isempty(file.fields) && file.fields[1].type isa Arrow.AC.IntType
-        scan =
-            valuefiltered ? Tables.Scan(select=(1,), filter=Tables.col(1) > 3) :
-            Tables.Scan(filter=Tables.AlwaysFalse())
-        reference = Tables.scan(Arrow.Table(file), scan)
-        fuzzsource = FuzzBytesSource(copy(bytes))
-        source =
-            Arrow.SourceFile(fuzzsource; limits=STRICT_LIMITS, tailbytes=32, gapbytes=0)
-        table = Tables.scan(source, scan)
-        _check_same_table(table, reference; label="statistics-filtered mutation")
-        if !valuefiltered
-            for block in file.recordblocks
-                span = (block[1], block[2] + block[3])
-                any(request -> _rangesintersect(request, span), fuzzsource.requests) &&
-                    _fail("constant-false statistics mutation fetched a record batch")
-            end
-        end
-        if length(bytes) > 32 &&
-           any(request -> request == (Int64(0), Int64(length(bytes))), fuzzsource.requests)
-            _fail("statistics-filtered mutation fetched the full object")
-        end
-        requests = copy(fuzzsource.requests)
     else
         throw(ArgumentError("unknown mutation lane $lane"))
     end
@@ -2221,7 +2135,7 @@ function case_fingerprint(master::UInt64, index::Integer)
 end
 
 function replay_mutation(bytes::Vector{UInt8}, lane::Symbol)
-    lane in (:stream_full, :file_full, :file_ranged, :auto_full, :stats_filtered) ||
+    lane in (:stream_full, :file_full, :file_ranged, :auto_full) ||
         throw(ArgumentError("unknown mutation lane $lane"))
     outcome = _classify_mutation(bytes, lane)
     repeated = _classify_mutation(bytes, lane)

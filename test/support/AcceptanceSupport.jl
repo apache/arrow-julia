@@ -20,7 +20,6 @@ module AcceptanceSupport
 import Arrow
 using PooledArrays
 using Tables
-import Base64
 import Dates
 
 const AC = Arrow.AC
@@ -76,7 +75,6 @@ import Arrow:
     RecordBatch,
     ReleaseCounter,
     RunEndEncodedType,
-    STATS_KEY,
     Schema,
     SourceFile,
     StreamOwner,
@@ -88,34 +86,24 @@ import Arrow:
     ValidationError,
     ViewType,
     _ArrowTypesRoutedUnion,
-    _ScanColumns,
     _VTable,
-    _addscanrows,
     _batchcodec,
     _batchfield,
-    _batchrows,
-    _bitmapbytes,
     _blockmessage,
     _coalesce,
     _coremetatype,
     _decompressbuffer!,
     _framemessages,
-    _joinscanparts,
     _metaschema!,
     _moveowner,
-    _rangedfooter,
-    _readstats,
+    _readfooter,
     _reap!,
     _RETIRED,
     _recordbatchmeta,
     _release_c!,
     _remaining,
     _requirelittleendian,
-    _statfold,
-    _statsbatch,
-    _statsschema,
     _store_field!,
-    _storageelementclaim,
     _structarray,
     _validateblockindex,
     _validatebodyplan,
@@ -148,7 +136,6 @@ import Arrow:
     readfile,
     readstream,
     release!,
-    statsfile,
     to_c_data,
     validate_full,
     validate_semantic,
@@ -157,7 +144,6 @@ import Arrow:
     variadiccounts,
     verify_footer,
     verify_ipc_metadata,
-    withstatistics,
     writefile,
     writestream
 
@@ -169,9 +155,8 @@ include(joinpath(@__DIR__, "..", "cdata_battery.jl"))
 include(joinpath(@__DIR__, "..", "scan_battery.jl"))
 
 function _run_scan_acceptance()
-    _stats_main()
-    filebytes, af, full = _scan_main()
-    _ranged_main(filebytes, af, full)
+    filebytes, full = _scan_main()
+    _ranged_main(filebytes, full)
     return nothing
 end
 

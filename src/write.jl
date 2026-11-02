@@ -81,8 +81,7 @@ Keywords:
   values that are not strings are written as they print). They default to
   the table's DataAPI metadata (a `DataFrame`'s `metadata` and `colmetadata`,
   say), without keys under the reserved `ARROW:` prefix. An `Arrow.Table` or
-  `Arrow.Stream` keeps its own schema and field metadata, without its batch
-  statistics, since values, columns, or batch boundaries may have changed.
+  `Arrow.Stream` keeps its own schema and field metadata.
 - `ntasks`: how many tasks build a batch's columns and compress its buffers
   (default `Threads.nthreads()`; `ntasks=1`, or `0`, runs on the calling
   task). The output bytes are the same for any `ntasks`.
@@ -1035,10 +1034,8 @@ function _writermetadata(metadata, retained, input=nothing)
         input,
     )::Union{Nothing,Vector{Pair{String,String}}}
     retained.metadata === nothing && return nothing
-    # Statistics describe the source's values, field indexes, and batch
-    # boundaries. Retaining its descriptors does not preserve that identity.
     # Keep user metadata in order, including duplicate keys.
-    return Pair{String,String}[kv for kv in retained.metadata if first(kv) != STATS_KEY]
+    return Pair{String,String}[kv for kv in retained.metadata]
 end
 
 # A table's DataAPI metadata, as the schema's key-value pairs. Keys under the

@@ -67,7 +67,7 @@ end
         t = Arrow.Table(obj; scan=Tables.Scan(select=(:b,), limit=3, offset=1500))
         @test Tables.columnnames(t) == [:b]
         @test t.b == ["v1501", "v1502", "v1503"]
-        # a filter that the footer statistics can prune to the second batch
+        # a filter that keeps rows of the second batch only
         t2 = Arrow.Table(obj; scan=Tables.Scan(select=(:a,), filter=Tables.col(:a) > 1990))
         @test t2.a == collect(1991:2000)
         # whole-object reads agree with the in-memory reads

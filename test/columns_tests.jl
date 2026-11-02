@@ -318,6 +318,25 @@ end
         @test owned[1] == "new" && c[1] == "lo"
     end
 
+    @testset "rows of a dictionary column keep the encoding" begin
+        cats = Union{Missing,String}["b", "a", "b", "c", missing, "a", "c"]
+        whole = arrowbytes((c=PooledArray(cats),))
+        batches = arrowbytes(
+            Tables.partitioner([(c=PooledArray(cats[1:3]),), (c=PooledArray(cats[4:7]),)]),
+        )
+        for bytes in (whole, batches)
+            c = Arrow.Table(bytes).c
+            for rows in ([1, 3, 4], 2:5, [7, 1, 5], [x === "a" for x in cats])
+                sub = c[rows]
+                @test sub isa PooledArray && isequal(sub, cats[rows])
+                # The dictionary's categories, in its order, unused ones too.
+                @test collect(skipmissing(DataAPI.refpool(sub))) == ["b", "a", "c"]
+            end
+            @test c[[2]] == ["a"] && !(c[[2]] isa Arrow.DictEncoded)
+            @test_throws BoundsError c[[8]]
+        end
+    end
+
     @testset "run-end encoded columns read lazily" begin
         rf, rd = Arrow.AC.fromjulia("run_ends", Int32[2, 5])
         vf, vd = Arrow.AC.fromjulia("values", Int64[7, 9])
@@ -979,10 +998,15 @@ end
             @test sum(length, c.s.buffers) == viewbytes
             owned = Arrow.read(bytes, Tables.columntable).s
             @test isequal(owned, strs) && !any(b -> _samebytes(b, bytes), owned.buffers)
-            # A filtered scan gives the same kind of column, over the same bytes.
+            # A filtered scan gives the same kind of column, owning just its
+            # rows' bytes.
             f = Arrow.Table(bytes; filter=Arrow.col(:x) > n ÷ 2)
             @test f.s isa StringVector && isequal(f.s, strs[(n ÷ 2 + 1):end])
-            compress === nothing && @test any(b -> _samebytes(b, bytes), f.s.buffers)
+            @test !any(b -> _samebytes(b, bytes), f.s.buffers)
+            @test sum(length, f.s.buffers) == sum(
+                x -> x === missing || ncodeunits(x) <= 12 ? 0 : ncodeunits(x),
+                strs[(n ÷ 2 + 1):end],
+            )
             @test isequal(copy(f).s, strs[(n ÷ 2 + 1):end])
         end
         # A filtered column of several batches joins the batches' buffers.

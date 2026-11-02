@@ -39,11 +39,11 @@ function _creadargs(;
     return stringtype, _checkntasks(ntasks), limits
 end
 
-# The table of `batches` with schema `sch`, built as an IPC read builds one.
-# View columns read the producer's memory without checking a flag, and the
-# Table contract lets columns outlive `release!`, so `release!(table)` only
-# refuses further column access; the producer's release runs when the last
-# column is garbage collected, as a mapped file is unmapped.
+# The table of `batches` with schema `sch`, built by the scan executor as an IPC
+# read builds one. View columns read the producer's memory without checking a flag,
+# and the Table contract lets columns outlive `release!`, so `release!(table)` only
+# refuses further column access; the producer's release runs when the last column is
+# garbage collected, as a mapped file is unmapped.
 function _ctable(
     sch::AC.Schema,
     batches::Vector{AC.RecordBatch},
@@ -53,23 +53,37 @@ function _ctable(
 )
     budget = _readbudget(limits, sum(_databytes, batches; init=Int64(0)))
     fields = collect(AC.Field, sch.fields)
-    names = _fieldnamesymbols(fields, budget)
-    arrowtypes = _ArrowTypesContext(budget=budget)
-    views = _ViewContext(stringtype, budget)
-    cols = _buildcolumns(
+    plan = _ScanPlan(Tables.Scan(), fields, budget)
+    ctx = _ScanContext(
+        plan,
         fields,
-        batches,
-        1:length(fields),
-        arrowtypes,
-        views,
-        ntasks;
+        _ViewContext(stringtype, budget),
+        _ArrowTypesContext(budget=budget),
+    )
+    t, _ = _scantable(
+        _DecodedRecord[_DecodedRecord(b) for b in batches],
+        _importdecoder(fields, limits),
+        plan,
+        nothing,
+        ctx,
+        _uniqueschema(sch),
+        AC.OwnerRegion[AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0)],
+        budget;
+        ntasks,
         lazy=true,
     )
-    nrows = sum(Int(b.nrows) for b in batches; init=0)
-    pools = _retaineddictpools(fields, batches, arrowtypes)
-    regions = AC.OwnerRegion[AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0)]
-    return _table(names, cols, _uniqueschema(sch), regions, nrows, pools, budget)
+    return t
 end
+
+# A decoder for imported batches, which arrive decoded and validated.
+_importdecoder(fields, limits) =
+    _Decoder(fields, IdDict{Field,Int64}(), AC._ValidatedDictionaries(), limits)
+
+# The bytes of a batch's buffers, which size the allowance its read charges.
+_databytes(b::AC.RecordBatch) = sum(_databytes, b.columns; init=Int64(0))
+_databytes(d::AC.ArrayData) =
+    sum(x -> Int64(x.len), d.buffers; init=Int64(0)) +
+    sum(_databytes, d.children; init=Int64(0))
 
 # Release the batches of a failed import; a batch without columns has nothing to hold.
 function _releasebatches!(batches)
@@ -165,16 +179,19 @@ function Stream(p::Ptr{CArrowArrayStream}; kw...)
     src = from_c_stream(p; limits)
     budget = _readbudget(limits, 0)
     closed = AC.ReleaseCell(@cfunction(_release_imported_stream, Cvoid, (Ptr{Cvoid},)), src)
+    fields = _batchfields(src)
     return Stream(
         src,
         AC.OwnerRegion[AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0; cell=closed)],
         budget,
         closed,
         _ArrowTypesContext(budget=budget),
-        _ViewContext(stringtype, budget),
         ReentrantLock(),
+        _ViewContext(stringtype, budget),
         ntasks,
         nothing,
+        _ScanPlan(Tables.Scan(), fields, budget),
+        trues(length(fields)),
     )
 end
 
@@ -183,6 +200,7 @@ end
 _configuredlimits(s::ImportedStream) = s.limits
 _tableschema(s::ImportedStream) = _uniqueschema(s.schema)
 _batchfields(s::ImportedStream) = s.schema.fields
+_decoder(s::ImportedStream) = _importdecoder(s.schema.fields, s.limits)
 _nbatches(::ImportedStream) = throw(
     ArgumentError(
         "the number of batches of a C stream is unknown until it is read; " *

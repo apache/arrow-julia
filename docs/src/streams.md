@@ -33,9 +33,11 @@ format to an `IO`.
 
 [`Arrow.Stream(source)`](@ref Arrow.Stream) reads a source one record batch at a time;
 each iteration gives an `Arrow.Table` of one batch. It takes the keywords of
-`Arrow.Table`: `select`, `drop`, and `filter` apply to every batch, and `limit` counts
-rows across batches. A loop that processes and drops each batch holds one batch at a
-time, plus the dictionaries, so a source larger than memory reads in bounded memory.
+`Arrow.Table`: `select`, `drop`, and `filter` apply to every batch, and `limit` and
+`offset` count rows across batches. A batch decodes only the selected and filter
+columns, and over an [`Arrow.AbstractArrowSource`](@ref) fetches only their bytes. A loop
+that processes and drops each batch holds one batch at a time, plus the dictionaries,
+so a source larger than memory reads in bounded memory.
 
 ```@example streams
 using Arrow, DataAPI, DataFrames, Tables

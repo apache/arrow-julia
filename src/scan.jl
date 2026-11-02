@@ -15,27 +15,26 @@
 # limitations under the License.
 
 # =============================================================================
-# Tables.Scan pushdown over the IPC file adapter, and — further down — the
-# byte-range fetch protocol (`SourceFile` over an `AbstractArrowSource`) over
-# the same bound column set. Design notes: docs/dev/DESIGN-scan-ranges-trim.md.
+# Tables.Scan pushdown: one planner for IPC files, whose bytes are a region in
+# memory or a byte-range source (`SourceFile` over an `AbstractArrowSource`),
+# and one executor for every source. Design notes:
+# docs/dev/DESIGN-scan-ranges-trim.md.
 #
-# Pushdown semantics: the request is resolved once, then the source consumes
-# the bound scan exactly, batch by batch. Direct handle scans apply type
-# overrides in the storage domain. The facade applies them after conversion
-# to the public domain.
+# The request is resolved once (`_ScanPlan`); the executor (`_runscan`) then
+# consumes the bound scan exactly, batch by batch:
 #
-#   * the decode set is (selected ∪ filter-referenced) columns — everything
+#   * the decode set is (selected ∪ filter-referenced) columns; everything
 #     else is SKIPPED by `skipfield!`, a registry walk that consumes the
 #     node/buffer accounting (all buffer-table invariants still checked)
-#     without slicing, decompressing, validating, or materializing anything;
-#   * whole batches are pruned by footer-carried statistics (may-contain);
-#     without a filter `limit`/`offset` are metadata arithmetic —
+#     without slicing, decompressing, validating, or materializing anything,
+#     and over a byte-range source no body range is planned for it;
+#   * without a filter `limit`/`offset` are metadata arithmetic:
 #     `RecordBatch.length` is wire metadata, so batches outside the window
-#     are never decoded; with a filter the `_ScanSink` evaluates it per
-#     batch through the generic evaluator, composes the window over the
-#     qualifying rows, and stops decoding once the window is full;
-#   * the returned table holds the selected columns' surviving rows under
-#     their output names, in selection order.
+#     are never decoded; a filter is evaluated per batch on public values,
+#     reads the other selected columns only for batches with a qualifying
+#     row, and composes the window over the qualifying rows;
+#   * the returned table holds the selected columns' kept rows under their
+#     output names, in selection order, with type overrides converted.
 # =============================================================================
 
 # ---------------------------------------------------------------------------
@@ -52,7 +51,7 @@ the skipped bytes; tail reads and coalescing may still over-read them.
 function skipfield!(f::Field, c::DecodeCursor)
     t = f.type
     takenode!(c)
-    spec = layoutspec(t)
+    spec = AC.layoutspec_of(t)
     for _ in spec.buffers
         skipbuffer!(c)
     end
@@ -72,7 +71,7 @@ end
 "FieldNode entries consumed by one field subtree."
 function _fieldnodespan(f::Field)
     f.type isa DictionaryType && return 1
-    spec = layoutspec(f.type)
+    spec = AC.layoutspec_of(f.type)
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     return 1 + sum(_fieldnodespan(f.children[i]) for i = 1:nchildren; init=0)
 end
@@ -84,7 +83,7 @@ registry pair, so the walk carries the batch's variadic-count cursor in
 depth-first order (the same order the decode cursor consumes it).
 """
 function _bufferspan(f::Field, variadics::AbstractVector{Int64}, varidx::Base.RefValue{Int})
-    spec = layoutspec(f.type)
+    spec = AC.layoutspec_of(f.type)
     n = Int64(length(spec.buffers))
     if spec.variadic
         varidx[] <= length(variadics) || throw(
@@ -95,12 +94,12 @@ function _bufferspan(f::Field, variadics::AbstractVector{Int64}, varidx::Base.Re
         vc = variadics[varidx[]]
         varidx[] += 1
         vc >= 0 || throw(ValidationError("variadic buffer count $vc is invalid"))
-        n = _planadd(n, vc, "buffer span")
+        n = _checkedadd(n, vc, "buffer span")
     end
     f.type isa DictionaryType && return n
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     for i = 1:nchildren
-        n = _planadd(n, _bufferspan(f.children[i], variadics, varidx), "buffer span")
+        n = _checkedadd(n, _bufferspan(f.children[i], variadics, varidx), "buffer span")
     end
     return n
 end
@@ -154,7 +153,7 @@ function _recordbatchmeta(
     varidx = Ref(1)
     expectedbuffers = Int64(0)
     for f in fields
-        expectedbuffers = _planadd(
+        expectedbuffers = _checkedadd(
             expectedbuffers,
             _bufferspan(f, variadics, varidx),
             "record-batch buffer span",
@@ -177,12 +176,7 @@ function _recordbatchmeta(
             "max_buffer_bytes",
             limits.max_buffer_bytes,
         )
-        bufferend = try
-            AC.checked_add(offset, len)
-        catch e
-            e isa OverflowError || rethrow()
-            throw(ValidationError("batch buffer end overflows"))
-        end
+        bufferend = _checkedadd(offset, len, "batch buffer end")
         bufferend <= bodylen ||
             throw(ValidationError("batch buffer [$offset, $len] escapes its message body"))
         if len > 0
@@ -194,44 +188,33 @@ function _recordbatchmeta(
     return rblen
 end
 
-function _planadd(a::Int64, b::Int64, what::AbstractString)
-    try
-        return AC.checked_add(a, b)
-    catch e
-        e isa OverflowError || rethrow()
-        throw(ValidationError("$what overflows"))
-    end
-end
-
-function _planmul(a::Int64, b::Int64, what::AbstractString)
-    try
-        return AC.checked_mul(a, b)
-    catch e
-        e isa OverflowError || rethrow()
-        throw(ValidationError("$what overflows"))
-    end
-end
-
 function _planminbytes(role, spec, node, len::Int64)
     if role == AC.VALIDITY
         len == 0 && node.null_count == 0 && return Int64(0)
         return node.length ÷ 8 + (node.length % 8 == 0 ? 0 : 1)
     elseif role == AC.DATA
-        spec.fixedwidth > 0 &&
-            return _planmul(node.length, Int64(spec.fixedwidth), "planned data-buffer size")
+        spec.fixedwidth > 0 && return _checkedmul(
+            node.length,
+            Int64(spec.fixedwidth),
+            "planned data-buffer size",
+        )
         if spec.fixedwidth == -1
             return node.length ÷ 8 + (node.length % 8 == 0 ? 0 : 1)
         end
         return Int64(0)
     elseif role == AC.OFFSETS
-        count = _planadd(node.length, Int64(1), "planned offset count")
-        return _planmul(count, Int64(spec.offsetwidth), "planned offsets-buffer size")
+        count = _checkedadd(node.length, Int64(1), "planned offset count")
+        return _checkedmul(count, Int64(spec.offsetwidth), "planned offsets-buffer size")
     elseif role == AC.ELEMENT_OFFSETS || role == AC.SIZES
-        return _planmul(node.length, Int64(spec.offsetwidth), "planned element-buffer size")
+        return _checkedmul(
+            node.length,
+            Int64(spec.offsetwidth),
+            "planned element-buffer size",
+        )
     elseif role == AC.TYPE_IDS
         return node.length
     elseif role == AC.VIEWS
-        return _planmul(node.length, Int64(16), "planned views-buffer size")
+        return _checkedmul(node.length, Int64(16), "planned views-buffer size")
     end
     return Int64(0)
 end
@@ -249,7 +232,7 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
     # Field.nullable is advisory (enforced only by the opt-in validate_full
     # tier), so a planned scan makes no nullability judgment here — the same
     # contract the whole-file path applies.
-    spec = layoutspec(f.type)
+    spec = AC.layoutspec_of(f.type)
     for role in spec.buffers
         _, len = _buffermeta!(c)
         if codec == CODEC_NONE || len == 0
@@ -293,7 +276,8 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     fslextent =
         t isa FixedSizeListType ?
-        _planmul(node.length, Int64(t.listsize), "fixed-size-list child length") : Int64(0)
+        _checkedmul(node.length, Int64(t.listsize), "fixed-size-list child length") :
+        Int64(0)
     firstchildlen = Int64(-1)
     for i = 1:nchildren
         childlen = _validateplannedfield!(f.children[i], c, codec)
@@ -395,7 +379,7 @@ function _scanmissingdicts(fields, nodes, dicts, fielddictids, mask::AbstractVec
             end
             return
         end
-        spec = layoutspec(f.type)
+        spec = AC.layoutspec_of(f.type)
         nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
         for i = 1:nchildren
             walk(f.children[i], decoded)
@@ -414,83 +398,11 @@ end
 "Row count of batch `i` from Block metadata alone — no body access."
 function _batchrows(f::ArrowFile, i::Int, budget::AllocationBudget)
     fm = _blockmessage(f.region, f.recordblocks[i], f.dataend, f.limits, budget)
-    fm.version == f.schemaversion ||
-        throw(ValidationError("IPC metadata version changes within the file"))
+    _filemetadataversion(f.schemaversion, fm.version)
     rejectexperimentalcompression(fm)
     fm.msg.header isa Meta.RecordBatch ||
         throw(ValidationError("footer record block is not a record batch"))
     return _recordbatchmeta(fm.msg.header, f.fields, f.limits, fm.body.len)
-end
-
-"""
-The masked-decode core shared by the in-memory and ranged paths: masked-in
-fields decode and validate exactly as `getindex`; masked-out fields advance
-through `skipfield!`. The cursor must still finish clean — a skewed batch
-fails identically either way. `body` is a `BufferSlice` or a `SparseBody`.
-"""
-function _maskedrecord(
-    msg::Meta.Message,
-    version::Int16,
-    body,
-    fields,
-    dicts,
-    fielddictids,
-    validated,
-    limits::Limits,
-    schemaversion::Int16,
-    mask::AbstractVector{Bool},
-    state::DecodeState,
-    suppliedvariadics::Union{Nothing,AbstractVector{Int64}}=nothing,
-)
-    version == schemaversion ||
-        throw(ValidationError("IPC metadata version changes within the file"))
-    rejectexperimentalcompression(msg, version, UInt8(3))
-    header = msg.header
-    header isa Meta.RecordBatch ||
-        throw(ValidationError("footer record block is not a record batch"))
-    codec = _batchcodec(header.compression, version)
-    variadics = suppliedvariadics === nothing ? variadiccounts(header) : suppliedvariadics
-    rblen = _recordbatchmeta(
-        header,
-        fields,
-        limits,
-        body isa BufferSlice ? body.len : body.bodylen,
-        variadics,
-    )
-    _scanmissingdicts(fields, header.nodes, dicts, fielddictids, mask)
-    cursor = DecodeCursor(
-        header.nodes,
-        header.buffers,
-        body,
-        limits;
-        codec=codec,
-        state=state,
-        variadics=variadics,
-    )
-    _chargevector!(
-        state.budget,
-        Union{Nothing,ArrayData},
-        length(fields),
-        "masked batch columns",
-    )
-    cols = Vector{Union{Nothing,ArrayData}}(nothing, length(fields))
-    for (j, fld) in enumerate(fields)
-        if mask[j]
-            cols[j] = decodefield(fld, cursor, dicts, fielddictids)
-        else
-            skipfield!(fld, cursor)
-        end
-    end
-    finishcursor!(cursor)
-    for (j, fld) in enumerate(fields)
-        col = cols[j]
-        col === nothing && continue
-        AC._validate_semantic(fld, col, validated)
-        col.len == rblen || throw(
-            ValidationError("RecordBatch length does not match top-level field nodes"),
-        )
-    end
-    return rblen, cols
 end
 
 """
@@ -530,263 +442,22 @@ function _zerofieldpredicate(e)
     return missing   # Cmp/In/StrPred against a missing column
 end
 
-"Window arithmetic over a known row count (filter already evaluated)."
-function _zerofieldcount(n0::Int64, keep, limit, offset)
-    keep === true || return Int64(0)
-    lo = min(Int64(offset), n0)
-    n = n0 - lo
-    limit === nothing ? n : min(n, Int64(limit))
-end
-
-"""
-Window a SEQUENCE of batch row counts without summing past the request: a
-limit saturates (a hostile total never overflows a capped scan), while an
-unbounded request keeps the checked-add contract — an overflowing total is
-a refusal, exactly as the column-bearing paths refuse.
-"""
-function _zerofieldwindow(counts, keep, limit, offset)
-    keep === true || return Int64(0)
-    off = Int64(offset)
-    lim = limit === nothing ? Int64(-1) : Int64(limit)
-    n = Int64(0)
-    for r0 in counts
-        r = Int64(r0)
-        skip = min(off, r)
-        off -= skip
-        r -= skip
-        if lim >= 0
-            take = min(r, lim - n)
-            n += take
-            n == lim && return n
-        else
-            n = _planadd(n, r, "zero-field scan row count")
-        end
-    end
-    return n
-end
-
-# --- scan value domain -------------------------------------------------------
-# Pushdown filtering runs over storage-domain values; facade
-# filter literals arrive in public Julia types. Lower native literals to the
-# referenced field's storage domain before the scan when that preserves
-# semantics. Registered logical extensions fall back to the public domain.
-# Conversion back to public types happens exactly once on the scan output
-# under the output names already compiled into the scan plan.
-
-# Lowering returns (ok, value): ok=false means the literal has NO exact,
-# semantics-preserving storage representation for this field (cross-type
-# inexactness, wrong type entirely) — the caller must then evaluate the
-# whole filter in the PUBLIC domain instead of pushing it down. There is no
-# pass-through: an unlowered literal comparing "equal" to raw storage would
-# change predicate semantics.
-_nativefacadeconversion(t::AC.ArrowType) =
-    _istemporalconv(t) ||
-    t isa Union{AC.DecimalType,AC.IntervalType} ||
-    (t isa AC.DictionaryType && _nativefacadeconversion(t.valuetype))
-_nativefacadeconversion(f::AC.Field) =
-    _nativefacadeconversion(f.type) || any(_nativefacadeconversion, f.children)
-
-_equalityoperator(op) = op == Tables.OP_EQ || op == Tables.OP_NE
-
-_scancomparisonpreserving(::AC.ArrowType, op) = true
-_scancomparisonpreserving(::Union{AC.DecimalType,AC.IntervalType}, op) = false
-_scancomparisonpreserving(t::AC.DictionaryType, op) =
-    _scancomparisonpreserving(t.valuetype, op)
-_scancomparisonpreserving(t::AC.DateType, op) = t.unit == AC.DAY || _equalityoperator(op)
-# `ZonedTimestamp` and `Timestamp` order by their Int64 count — a total
-# bijection with storage — so every operator survives lowering at every
-# unit. (Date64 stays equality-only above: its `DateTime` epoch shift wraps
-# at the Int64 edges.)
-_scancomparisonpreserving(::AC.TimestampType, op) = true
-_scancomparisonpreserving(::AC.TimeType, op) = false
-_scancomparisonpreserving(::AC.DurationType, op) = true
-
-_scanliteralcompatible(::AC.ArrowType, value) = true
-_scanliteralcompatible(t::AC.DictionaryType, value) =
-    _scanliteralcompatible(t.valuetype, value)
-function _scanliteralcompatible(t::AC.DurationType, value)
-    scale = _periodscale(value)
-    return scale !== nothing && scale >= _durationunitscale(t.unit)
-end
-
-_scandescriptor(t::AC.DictionaryType) = _scandescriptor(t.valuetype)
-_scandescriptor(t::AC.ArrowType) = t
-
-# The FIELD whose descriptor governs a lowered literal: run-end encoding and
-# dictionary encoding are transparent wrappers whose flat expansion is the
-# leaf's storage, so literals lower against the leaf exactly as the public
-# values compare. (Dictionary children live on the type; run-end children on
-# the Field — this walk sees both.)
-function _lowerleaffield(f::AC.Field)
+# The field whose values a filter literal compares with: run-end and
+# dictionary encodings are transparent wrappers around their values' field.
+# (Dictionary children live on the type; run-end children on the Field.)
+function _leaffield(f::AC.Field)
     t = f.type
     if t isa AC.RunEndEncodedType && length(f.children) == 2
-        return _lowerleaffield(f.children[2])
+        return _leaffield(f.children[2])
     end
-    t isa AC.DictionaryType && return _lowerleaffield(AC.dictvaluefield(f, t))
+    t isa AC.DictionaryType && return _leaffield(AC.dictvaluefield(f, t))
     return f
-end
-
-function _scanfacadetostorage(t::AC.ArrowType, v)
-    result = _exactfacadescalar(_scandescriptor(t), v)
-    return result === nothing ? (false, v) : (true, result)
-end
-
-function _storagevalue(f::AC.Field, v, op)
-    if !_hasarrowtypesextension(f)
-        # A temporal descriptor at the root — or behind transparent run-end
-        # or dictionary wrappers — can lower a scalar literal. A temporal
-        # conversion nested inside a COMPOSITE container cannot: its values
-        # sit inside public rows, so the whole filter evaluates publicly.
-        lf = _lowerleaffield(f)
-        _nativefacadeconversion(lf) || return true, v
-        _nativefacadeconversion(lf.type) || return false, v
-        _scancomparisonpreserving(lf.type, op) || return false, v
-        _scanliteralcompatible(lf.type, v) || return false, v
-        return _scanfacadetostorage(lf.type, v)
-    end
-    # ArrowTypes does not require `toarrow` to preserve Julia comparison
-    # semantics. A logical type may, for example, compare by an equivalence
-    # class while storing one concrete identifier. Evaluate every registered
-    # extension filter, including one nested below an unmarked container, over
-    # the restored public values.
-    return false, v
 end
 
 function _fieldfor(fields, ref, names)
     ref isa Int && 1 <= ref <= length(fields) && return fields[ref]
     i = findfirst(==(Symbol(ref)), names)
     return i === nothing ? nothing : fields[i]
-end
-
-_loweringdescriptor(t::AC.DictionaryType) = _loweringdescriptor(t.valuetype)
-_loweringdescriptor(t::AC.ArrowType) = t
-
-@noinline function _lowersequence(
-    token::Val{K},
-    descriptor::AC.ArrowType,
-    values::V,
-    budget,
-) where {K,V<:Union{Tuple,Array}}
-    # Tuple and Array membership both use `==`. A closed storage vector keeps
-    # that contract without synthesizing a request-width Tuple type or boxing
-    # every lowered temporal scalar.
-    for x in values
-        _scanliteralcompatible(descriptor, x) || return false, values
-        _exactfacadevalue(token, x) === nothing && return false, values
-    end
-    _chargevector!(budget, _LoweredTemporal, length(values), "lowered membership values")
-    out = Vector{_LoweredTemporal}(undef, length(values))
-    for (i, x) in enumerate(values)
-        out[i] = _exactfacadevalue(token, x)::_LoweredTemporal
-    end
-    return true, out
-end
-
-function _lowermembership(f::AC.Field, values::Union{Tuple,Array}, budget)
-    # A temporal conversion nested inside a COMPOSITE container is not a
-    # scalar membership conversion. Match `_storagevalue` and decline it
-    # before any output is allocated; transparent wrappers lower.
-    lf = _lowerleaffield(f)
-    _nativefacadeconversion(lf.type) || return false, values
-    _scancomparisonpreserving(lf.type, Tables.OP_EQ) || return false, values
-    descriptor = _loweringdescriptor(lf.type)
-    return _lowersequence(_facadetoken(descriptor), descriptor, values, budget)
-end
-
-@noinline function _lowerset(token::Val{K}, publictype, values::Set, budget) where {K}
-    for x in values
-        x isa publictype || return false, values
-        _exactfacadevalue(token, x) === nothing && return false, values
-    end
-    _chargedict!(
-        budget,
-        _LoweredTemporal,
-        Nothing,
-        length(values),
-        "lowered membership set",
-    )
-    out = Set{_LoweredTemporal}()
-    sizehint!(out, length(values))
-    for x in values
-        # Set membership uses `isequal` plus hashing. A cross-type public
-        # value can compare `==` (Date and midnight DateTime) while remaining
-        # a distinct Set key. Lower only canonical public-domain members.
-        push!(out, _exactfacadevalue(token, x)::_LoweredTemporal)
-    end
-    return true, out
-end
-
-function _lowermembership(f::AC.Field, values::Set, budget)
-    lf = _lowerleaffield(f)
-    _nativefacadeconversion(lf.type) || return false, values
-    _scancomparisonpreserving(lf.type, Tables.OP_EQ) || return false, values
-    descriptor = _loweringdescriptor(lf.type)
-    return _lowerset(_facadetoken(descriptor), _facadebasetype(descriptor), values, budget)
-end
-
-_lowermembership(::AC.Field, values, budget) = (false, values)
-
-@inline function _chargescannode!(budget, e, what)
-    _chargeobject!(budget, max(sizeof(e), 64), what)
-    return nothing
-end
-
-function _lowerexpr(e, fields, names, ok::Base.RefValue{Bool}, budget=nothing)
-    e === nothing && return nothing
-    if e isa Tables.Cmp
-        f = _fieldfor(fields, e.lhs.ref, names)
-        f === nothing && return e
-        good, v = _storagevalue(f, e.rhs, e.op)
-        good || (ok[] = false)
-        _chargescannode!(budget, e, "lowered comparison node")
-        return Tables.Cmp(e.op, e.lhs, v)
-    elseif e isa Tables.In
-        f = _fieldfor(fields, e.lhs.ref, names)
-        f === nothing && return e
-        # Keep the caller's collection object. Rebuilding it as a Tuple would
-        # change membership semantics: Set uses `isequal` (NaN and signed zero
-        # matter), while Tuple and Array use `==`. Do not even iterate an
-        # arbitrary membership object: `in(x, values)` is the Tables contract,
-        # and `values` may be non-iterable or stateful. A field whose public
-        # values require conversion can lower only whitelisted Base containers
-        # whose membership semantics we can retain.
-        if _hasarrowtypesextension(f)
-            ok[] = false
-            return e
-        end
-        _nativefacadeconversion(f) || return e
-        # `e.values`' type is known at run time; see `_uninferred`.
-        good, values = _uninferred(_lowermembership, f, e.values, budget)::Tuple{Bool,Any}
-        if !good
-            ok[] = false
-            return e
-        end
-        _chargescannode!(budget, e, "lowered membership node")
-        return Tables.In(e.lhs, values)
-    elseif e isa Union{Tables.IsNull,Tables.StrPred}
-        f = _fieldfor(fields, e.lhs.ref, names)
-        if f !== nothing
-            _hasarrowtypesextension(f) && (ok[] = false)
-            e isa Tables.StrPred && _nativefacadeconversion(f) && (ok[] = false)
-        end
-        return e
-    elseif e isa Tables.AndExpr
-        _chargevector!(budget, Tables.ScanExpr, length(e.args), "lowered filter arguments")
-        _chargescannode!(budget, e, "lowered conjunction node")
-        return Tables.AndExpr(
-            Tables.ScanExpr[_lowerexpr(a, fields, names, ok, budget) for a in e.args],
-        )
-    elseif e isa Tables.OrExpr
-        _chargevector!(budget, Tables.ScanExpr, length(e.args), "lowered filter arguments")
-        _chargescannode!(budget, e, "lowered disjunction node")
-        return Tables.OrExpr(
-            Tables.ScanExpr[_lowerexpr(a, fields, names, ok, budget) for a in e.args],
-        )
-    elseif e isa Tables.NotExpr
-        _chargescannode!(budget, e, "lowered negation node")
-        return Tables.NotExpr(_lowerexpr(e.arg, fields, names, ok, budget))
-    end
-    return e
 end
 
 # --- zoned timestamp literals --------------------------------------------------
@@ -807,7 +478,7 @@ _utcinstant(x::Durations.Timestamp{P}) where {P} = Durations.ZonedTimestamp{P,:U
 # `x` as a literal for field `f`: unchanged unless `f` holds zoned timestamps.
 function _zonedliteral(f::AC.Field, x)
     x isa _ZonelessTime || return x
-    t = _lowerleaffield(f).type
+    t = _leaffield(f).type
     t isa AC.DictionaryType && (t = t.valuetype)
     t isa AC.TimestampType || return x
     zone = _timestampzone(t)
@@ -834,11 +505,30 @@ function _zonedliteral(f::AC.Field, x)
     )
 end
 
+# A comparison literal for field `f`: also, a zone-free time compared with a
+# zone-free timestamp column becomes the column's value type when that is the
+# same instant, so each row compares integers instead of calendar fields.
+# Membership keeps its values: a `Set` of dates hashes them as dates.
+function _cmpliteral(f::AC.Field, x)
+    x = _zonedliteral(f, x)
+    (x isa _ZonelessTime && !_hasarrowtypesextension(f)) || return x
+    t = _leaffield(f).type
+    t isa AC.DictionaryType && (t = t.valuetype)
+    (t isa AC.TimestampType && _timestampzone(t) === nothing) || return x
+    y = try
+        Durations.Timestamp{_timestampperiod(t.unit)}(x)
+    catch err
+        err isa Union{InexactError,OverflowError,ArgumentError} || rethrow()
+        return x
+    end
+    return y == x ? y : x
+end
+
 function _zonedliterals(e, fields, names)
     if e isa Tables.Cmp
         f = _fieldfor(fields, e.lhs.ref, names)
         f === nothing && return e
-        v = _zonedliteral(f, e.rhs)
+        v = _cmpliteral(f, e.rhs)
         return v === e.rhs ? e : Tables.Cmp(e.op, e.lhs, v)
     elseif e isa Tables.In
         f = _fieldfor(fields, e.lhs.ref, names)
@@ -887,7 +577,7 @@ end
 
 function _filterkind(f::AC.Field)
     _hasarrowtypesextension(f) && return nothing
-    t = _lowerleaffield(f).type
+    t = _leaffield(f).type
     t isa Union{AC.IntType,AC.FloatType,AC.BoolType,AC.DecimalType} && return :number
     (t isa AC.Utf8Type || (t isa AC.ViewType && t.utf8)) && return :string
     t isa AC.DateType && return :local
@@ -948,20 +638,11 @@ _kindvalues(f::AC.Field, kind::Symbol) =
     kind === :string ? "strings" : "$(Base.nonmissingtype(_declaredeltype(f))) values"
 
 """
-One scan plan resolved against one Arrow schema. `names` is the owned source
-schema identity used by every executor. `public` is the request in the public
-domain. `storage` is the same selection and window with an exactly lowered
-storage-domain filter and no type overrides; `nothing` means the filter must
-run after facade conversion.
+One scan request resolved against one Arrow schema. `names` is the owned
+source schema identity used by every executor; `bound` is the request, which
+filters and converts public values.
 """
 struct _ScanPlan
-    names::Vector{Symbol}
-    public::Tables.BoundScan
-    storage::Union{Nothing,Tables.BoundScan}
-end
-
-"One storage-domain request and the schema names it was compiled against."
-struct _BoundScanPlan
     names::Vector{Symbol}
     bound::Tables.BoundScan
 end
@@ -981,168 +662,16 @@ function _deduplicatesorted!(values::Vector)
     return values
 end
 
-function _resolverstringref(ref::String, budget)
-    # Tables resolves a String reference through `Symbol(ref)`. Charge the
-    # interned name before performing the same lookup during preflight; the
-    # later upstream call then reuses that interned symbol.
-    bytes = AC.checked_add(Int64(256), AC._materializedobjectbytes(sizeof(ref)))
-    budget === nothing || _charge!(budget, bytes, "scan resolver String reference")
-    return Symbol(ref)
-end
-
-function _resolverregexwork!(names, budget)
-    # Both this allocation-free-counting pass and Tables._findcols convert
-    # every Symbol to a String for Regex matching. Reserve both conversions
-    # before the first one occurs, plus the upstream findall result at its
-    # worst-case width.
-    stringbytes = Int64(0)
-    for name in names
-        stringbytes = AC.checked_add(
-            stringbytes,
-            AC.checked_add(Int64(256), AC._materializedobjectbytes(sizeof(name))),
-        )
-    end
-    budget === nothing ||
-        _charge!(budget, AC.checked_mul(Int64(2), stringbytes), "scan resolver Regex names")
-    capacity = AC.checked_mul(Int64(2), Int64(length(names)))
-    _chargevector!(budget, Int, capacity, "scan resolver Regex matches")
-    return nothing
-end
-
-"""
-How many columns one selection reference matches, charging the scratch work
-`Tables.resolve` will repeat for it.
-"""
-function _resolverrefcount(ref, names, budget)
-    if ref isa Regex
-        _resolverregexwork!(names, budget)
-        matches = Int64(0)
-        for name in names
-            occursin(ref, String(name)) && (matches = AC.checked_add(matches, Int64(1)))
-        end
-        return matches
-    end
-    _chargevector!(budget, Int, 1, "scan resolver reference match")
-    target = ref isa String ? _resolverstringref(ref, budget) : ref
-    if target isa Int
-        return 1 <= target <= length(names) ? Int64(1) : Int64(0)
-    end
-    for name in names
-        name == target && return Int64(1)
-    end
-    return Int64(0)
-end
-
-function _resolverselectionwork!(scan::Tables.Scan, names, budget)
-    select = scan.select
-    isempty(select) && return Int64(0)
-    if first(select).ref isa Tables.Not
-        _chargedict!(budget, Int, Nothing, length(names), "scan resolver exclusion index")
-        for item in select
-            rawrefs = (item.ref::Tables.Not).ref
-            nrefs = rawrefs isa Union{Tuple,AbstractVector} ? length(rawrefs) : 1
-            _chargevector!(budget, Any, nrefs, "scan resolver Not references")
-            if rawrefs isa Union{Tuple,AbstractVector}
-                for ref in rawrefs
-                    _resolverrefcount(ref, names, budget)
-                end
-            else
-                _resolverrefcount(rawrefs, names, budget)
-            end
-        end
-        # Exclusion can only reduce the full-schema output. Reserving the
-        # upper bound avoids building our own duplicate exclusion set.
-        return Int64(length(names))
-    end
-    output = Int64(0)
-    for item in select
-        count =
-            item.ref isa Tables.All ? Int64(length(names)) :
-            _resolverrefcount(item.ref, names, budget)
-        output = AC.checked_add(output, count)
-    end
-    return output
-end
-
-function _resolverfilterwork!(e, names, budget)
-    e === nothing && return nothing
-    if e isa Tables.Col
-        e.ref isa String && _resolverstringref(e.ref, budget)
-        _chargescannode!(budget, e, "scan resolver filter node")
-    elseif e isa Union{Tables.Cmp,Tables.In,Tables.IsNull,Tables.StrPred}
-        _resolverfilterwork!(e.lhs, names, budget)
-        _chargescannode!(budget, e, "scan resolver filter node")
-    elseif e isa Union{Tables.AndExpr,Tables.OrExpr}
-        _chargevector!(
-            budget,
-            Tables.ScanExpr,
-            length(e.args),
-            "scan resolver filter arguments",
-        )
-        for arg in e.args
-            _resolverfilterwork!(arg, names, budget)
-        end
-        _chargescannode!(budget, e, "scan resolver filter node")
-    elseif e isa Tables.NotExpr
-        _resolverfilterwork!(e.arg, names, budget)
-        _chargescannode!(budget, e, "scan resolver filter node")
-    end
-    return nothing
-end
-
-function _resolvescan(scan::Tables.Scan, names, budget=nothing)
-    # Preflight every request-directed allocation that Tables.resolve owns.
-    # Selection may expand far beyond schema width through repeated aliases;
-    # Regex/Not references own temporary vectors and String work; and filter
-    # resolution reconstructs the full expression tree. No upstream compiler
-    # work starts until the cumulative operation budget accepts all of it.
-    n = length(names)
-    _chargevector!(budget, Symbol, n, "scan resolver names")
-    output = _resolverselectionwork!(scan, names, budget)
-    # Tables grows BoundColumn[] through append!. Reserve the worst-case
-    # geometric capacity separately from Julia's backing-store rounding.
-    columncapacity = output == 0 ? Int64(0) : AC.checked_mul(Int64(2), output)
-    _chargevector!(budget, Tables.BoundColumn, columncapacity, "scan resolver columns")
-    _chargedict!(budget, Symbol, Nothing, output, "scan resolver output-name index")
-    refcapacity = n == 0 ? Int64(0) : AC.checked_mul(Int64(2), Int64(n))
-    _chargevector!(budget, Int, refcapacity, "scan resolver filter references")
-    _resolverfilterwork!(scan.filter, names, budget)
-    _chargeobject!(budget, 64, "resolved scan")
-    # Not inferred: Tables resolves untyped selections (see `_uninferred`).
-    return _uninferred(Tables.resolve, scan, names)::Tables.BoundScan
-end
-
-function _compileboundscan(scan::Tables.Scan, fields, budget=nothing)
-    # Unique names (`_fieldnamesymbols`), so every column has one reference.
-    names = _fieldnamesymbols(fields, budget)
-    return _BoundScanPlan(names, _resolvescan(scan, names, budget))
-end
+# Not inferred: Tables resolves untyped selections (see `_uninferred`).
+_resolvescan(scan::Tables.Scan, names) =
+    _uninferred(Tables.resolve, scan, names)::Tables.BoundScan
 
 function _ScanPlan(scan::Tables.Scan, fields, budget=nothing)
-    compiled = _compileboundscan(scan, fields, budget)
-    names = compiled.names
-    b = _zonedbound(compiled.bound, fields, names)
+    # Unique names (`_fieldnamesymbols`), so every column has one reference.
+    names = _fieldnamesymbols(fields, budget)
+    b = _zonedbound(_resolvescan(scan, names), fields, names)
     _checkliterals(b.filter, fields, names)
-    # The facade keeps zero-field sources on its metadata-count path. Avoid
-    # compiling a storage form that no adapter will consume.
-    isempty(fields) && return _ScanPlan(names, b, nothing)
-    ok = Ref(true)
-    lowered = _lowerexpr(b.filter, fields, names, ok, budget)
-    ok[] || return _ScanPlan(names, b, nothing)
-    _chargevector!(budget, Tables.BoundColumn, length(b.columns), "storage scan columns")
-    columns =
-        Tables.BoundColumn[Tables.BoundColumn(c.index, c.name, nothing) for c in b.columns]
-    _chargevector!(budget, Int, length(b.filtercols), "storage scan filter columns")
-    _chargeobject!(budget, 64, "storage scan")
-    storage = Tables.BoundScan(
-        columns,
-        lowered,
-        copy(b.filtercols),
-        b.limit,
-        b.offset,
-        b.validate,
-    )
-    return _ScanPlan(names, b, storage)
+    return _ScanPlan(names, b)
 end
 
 "Column table whose schema does not become part of its Julia type."
@@ -1174,42 +703,33 @@ end
 Base.propertynames(t::_ScanColumns) = getfield(t, :names)
 Base.getproperty(t::_ScanColumns, name::Symbol) = Tables.getcolumn(t, name)
 
-function _ScanColumns(columns::NamedTuple, nrows::Int)
-    names = collect(Symbol, propertynames(columns))
-    return _ScanColumns(
-        names,
-        AbstractVector[getfield(columns, i) for i in eachindex(names)],
-        nrows,
-    )
-end
-
-# Join the pieces of one decoded output column under its declared storage
-# claim when that claim closes, else as `Vector{Any}`. A facade scan may put
-# private ArrowTypes routing values in those pieces; they never leave the
-# facade scan operation. The empty result follows the same rule, so a scan
-# that keeps no rows still reports the schema a nonempty one would.
-function _joinscanparts(f::Field, parts::Vector, budget=nothing)
-    if isempty(parts)
-        # Match `_storagebatchcolumn`: a zero-row result must not change its
-        # public Tables.Schema based on whether a window avoided decoding or
-        # a filter decoded an empty slice. Dynamic composite routes stay Any;
-        # closed scalar routes retain their declared element type.
-        ET = _storageelementclaim(f)
-        _chargevector!(budget, ET, 0, "empty scan column")
-        return Vector{ET}()
-    end
+# The pieces of one column, in order, as one column: the piece itself when there
+# is one, string pieces as one string column over all their buffers, pieces of
+# one dictionary-column type as a column of several record batches, or else a
+# `Vector` of their element types' join.
+function _joinparts(parts::Vector, budget=nothing)
     length(parts) == 1 && return parts[1]
-    total = sum(length, parts; init=0)
+    P = typeof(first(parts))
+    # The pieces' types are known at run time; see `_uninferred`.
+    P <: DictEncoded &&
+        all(part -> part isa P, parts) &&
+        return _uninferred(_chain, P, parts)
     T = _eltypeof(first(parts))
     for part in Iterators.drop(parts, 1)
         T = Base.promote_typejoin(T, _eltypeof(part))
     end
+    total = sum(length, parts; init=0)
     if all(part -> part isa _StringColumn, parts)
-        _chargevector!(budget, _StringPayload, total, "joined scan column")
-        return _joinstrings(T, parts)
+        _chargevector!(budget, _StringPayload, total, "joined column")
+        return _uninferred(_joinstrings, T, parts)
     end
-    _chargevector!(budget, T, total, "joined scan column")
-    out = Vector{T}(undef, total)
+    _chargevector!(budget, T, total, "joined column")
+    return _uninferred(_copyparts!, Vector{T}(undef, total), parts)
+end
+
+_chain(::Type{P}, parts) where {P} = ChainedVector(P[parts...])
+
+function _copyparts!(out::Vector, parts)
     offset = 0
     for part in parts
         copyto!(out, offset + 1, part, firstindex(part), length(part))
@@ -1218,24 +738,10 @@ function _joinscanparts(f::Field, parts::Vector, budget=nothing)
     return out
 end
 
-function _scantable(names, outcols, nrows::Int, budget=nothing)
-    _chargevector!(budget, AbstractVector, length(names), "scan result columns")
-    columns = AbstractVector[col for col in outcols]
-    length(columns) == length(names) ||
-        throw(AssertionError("scan result name/column count changed"))
-    return _ScanColumns(names, columns, nrows)
-end
-
 function _addscanrows(total::Int, rows::Int64)
     (0 <= total && 0 <= rows && rows <= typemax(Int) - total) ||
         throw(ValidationError("scan result row count is not addressable"))
     return total + Int(rows)
-end
-
-# The fields `mask` selects of batch `i`, decoded on at most `ntasks` tasks.
-function _scanbatch(f::ArrowFile, i::Int, mask::AbstractVector{Bool}, budget, ntasks::Int)
-    plans, cols = _filebatches(f, (i,), budget, ntasks, mask)
-    return only(plans).rblen, only(cols)
 end
 
 # ---------------------------------------------------------------------------
@@ -1294,358 +800,6 @@ function _batchwindow(
     end
     return window
 end
-
-"""
-The exact consumer of a bound scan, one decoded batch at a time. It
-evaluates the filter over each batch's decoded columns through
-`Tables.filtermask` (the executor's own three-valued semantics), composes
-`offset`/`limit` over the qualifying rows with saturating arithmetic, and
-stops the scan as soon as the window is full. It keeps only the selected
-columns' surviving rows, in selection order, under their output names.
-Without a filter, `_batchwindow` has already named the rows, so a batch
-outside the window never decodes.
-"""
-mutable struct _ScanSink{M}
-    const names::Vector{Symbol}
-    const fields::Vector{Field}
-    const columns::Vector{Tables.BoundColumn}
-    const decodeidx::Vector{Int}
-    const filteridx::Vector{Int}
-    const filternames::Vector{Symbol}
-    const bound::Tables.BoundScan
-    const materializecolumn::M
-    const budget::AllocationBudget
-    const parts::Vector{Vector{Any}}
-    const partcounts::Vector{Int}
-    outrows::Int
-    remaining_skip::Int64
-    remaining_take::Int64   # -1 = unlimited
-end
-
-function _ScanSink(
-    b::Tables.BoundScan,
-    names::Vector{Symbol},
-    fields,
-    materializecolumn,
-    budget::AllocationBudget,
-)
-    ndecode = length(b.columns) + length(b.filtercols)
-    _chargevector!(budget, Int, ndecode, "scan decode-column index")
-    decodeidx = Int[]
-    sizehint!(decodeidx, ndecode)
-    append!(decodeidx, (c.index for c in b.columns))
-    append!(decodeidx, b.filtercols)
-    _deduplicatesorted!(decodeidx)
-    _chargevector!(budget, Int, length(b.filtercols), "scan filter-column index")
-    filteridx = copy(b.filtercols)
-    _deduplicatesorted!(filteridx)
-    _chargevector!(budget, Symbol, length(filteridx), "scan filter names")
-    filternames = Symbol[names[i] for i in filteridx]
-    _chargevector!(budget, Field, length(fields), "scan source fields")
-    copiedfields = collect(Field, fields)
-    _chargevector!(budget, Vector{Any}, length(b.columns), "scan column-part lists")
-    # Entries receive exact-capacity vectors once batch planning is complete.
-    # One shared empty sentinel avoids one discarded empty Vector per column.
-    _chargevector!(budget, Any, 0, "shared empty scan-part list")
-    empty = Any[]
-    parts = fill(empty, length(b.columns))
-    _chargevector!(budget, Int, length(b.columns), "scan column-part counts")
-    partcounts = zeros(Int, length(b.columns))
-    # With a filter the window composes over qualifying rows here; without
-    # one the metadata window has already applied it.
-    filtered = b.filter !== nothing
-    skip = filtered ? Int64(b.offset) : Int64(0)
-    take = filtered && b.limit !== nothing ? Int64(b.limit) : Int64(-1)
-    return _ScanSink{typeof(materializecolumn)}(
-        names,
-        copiedfields,
-        b.columns,
-        decodeidx,
-        filteridx,
-        filternames,
-        b,
-        materializecolumn,
-        budget,
-        parts,
-        partcounts,
-        0,
-        skip,
-        take,
-    )
-end
-
-function _reservesinkparts!(sink::_ScanSink, capacity::Int)
-    capacity >= 0 || throw(ArgumentError("negative scan part capacity"))
-    capacity == 0 && return nothing
-    for i in eachindex(sink.parts)
-        _chargevector!(sink.budget, Any, capacity, "scan column parts")
-        sink.parts[i] = Vector{Any}(undef, capacity)
-    end
-    return nothing
-end
-
-# Whether the sink still accepts rows: a filled limit ends the scan before
-# the next batch is decoded.
-function _sinkopen(sink::_ScanSink)
-    return sink.remaining_take != 0
-end
-
-# Slice the kept rows without allocating: indexing a range yields a range,
-# and a `findall` result is viewed in place.
-_rowwindow(rows::AbstractRange, first::Int, last::Int) = rows[first:last]
-_rowwindow(rows::AbstractVector, first::Int, last::Int) = view(rows, first:last)
-
-_filterscratchvectors(
-    ::Union{
-        Tables.Cmp,
-        Tables.In,
-        Tables.IsNull,
-        Tables.StrPred,
-        Tables.AlwaysTrue,
-        Tables.AlwaysFalse,
-    },
-) = Int64(1)
-function _filterscratchvectors(e::Union{Tables.AndExpr,Tables.OrExpr})
-    isempty(e.args) && return Int64(1)
-    vectors = Int64(0)
-    for arg in e.args
-        vectors = AC.checked_add(vectors, _filterscratchvectors(arg))
-    end
-    return AC.checked_add(vectors, Int64(length(e.args) - 1))
-end
-_filterscratchvectors(e::Tables.NotExpr) =
-    AC.checked_add(Int64(1), _filterscratchvectors(e.arg))
-# A bound extension node is not expected to reach Tables' generic evaluator.
-# Reserve one full intermediate before that evaluator reports its own error.
-_filterscratchvectors(::Tables.ScanExpr) = Int64(1)
-
-function _chargefilterscratch!(budget, filter, nrows::Integer)
-    filter === nothing && return nothing
-    one = AC._materializedvectorbytes(Union{Missing,Bool}, nrows)
-    total = AC.checked_mul(_filterscratchvectors(filter), one)
-    budget === nothing || _charge!(budget, total, "scan filter evaluation")
-    return nothing
-end
-
-# The rows of one batch the scan keeps: the caller's metadata window when
-# there is no filter, else this batch's qualifying rows after its share of
-# `offset`/`limit`. A filter that references no decoded column is
-# row-invariant, so one evaluation covers the batch.
-function _sinkrows(sink::_ScanSink, decoded, rblen::Int64, skip::Int64, take::Int64)
-    if sink.bound.filter === nothing
-        take >= 0 || return 1:Int(rblen)
-        return (Int(skip) + 1):(Int(skip) + Int(take))
-    end
-    if isempty(sink.filteridx)
-        qualifying =
-            _zerofieldpredicate(sink.bound.filter) === true ? (1:Int(rblen)) : (1:0)
-    else
-        _chargefilterscratch!(sink.budget, sink.bound.filter, rblen)
-        _chargevector!(sink.budget, Bool, rblen, "scan filter mask")
-        _chargevector!(
-            sink.budget,
-            AbstractVector,
-            length(sink.filteridx),
-            "scan filter columns",
-        )
-        filtercolumns = AbstractVector[decoded[idx] for idx in sink.filteridx]
-        raw = _ScanColumns(sink.filternames, filtercolumns, Int(rblen))
-        # Not inferred: Tables evaluates the filter on columns of any type.
-        filtermask = _uninferred(Tables.filtermask, sink.bound, raw)::AbstractVector{Bool}
-        matches = count(identity, filtermask)
-        _chargevector!(sink.budget, Int, matches, "scan matching rows")
-        qualifying = findall(filtermask)
-    end
-    skipped = min(sink.remaining_skip, Int64(length(qualifying)))
-    sink.remaining_skip -= skipped
-    available = Int64(length(qualifying)) - skipped
-    taken = sink.remaining_take < 0 ? available : min(sink.remaining_take, available)
-    sink.remaining_take < 0 || (sink.remaining_take -= taken)
-    return _rowwindow(qualifying, Int(skipped) + 1, Int(skipped) + Int(taken))
-end
-
-# Consume one decoded batch (`cols` holds the decode set's ArrayData): each
-# decode-set column materializes once through the operation's closed policy,
-# the kept rows are chosen, and every output column keeps its slice of them.
-function _consumebatch!(sink::_ScanSink, cols, rblen::Int64, skip::Int64, take::Int64)
-    decoded = _decodedcolumns(sink)
-    _materializecolumns!(decoded, sink, cols, sink.decodeidx)
-    rows = _sinkrows(sink, decoded, rblen, skip, take)
-    _keeprows!(sink, decoded, rows, rblen)
-    return nothing
-end
-
-function _decodedcolumns(sink::_ScanSink)
-    _chargedict!(
-        sink.budget,
-        Int,
-        AbstractVector,
-        length(sink.decodeidx),
-        "scan decoded-column index",
-    )
-    decoded = Dict{Int,AbstractVector}()
-    sizehint!(decoded, length(sink.decodeidx))
-    return decoded
-end
-
-function _materializecolumns!(decoded, sink::_ScanSink, cols, idxs)
-    for idx in idxs
-        decoded[idx] =
-            sink.materializecolumn(sink.fields[idx], cols[idx]::ArrayData, sink.budget)
-    end
-    return decoded
-end
-
-# Every output column keeps its slice of the kept rows: the column itself
-# when the rows are all of it.
-function _keeprows!(sink::_ScanSink, decoded, rows, rblen::Int64)
-    sink.outrows = _addscanrows(sink.outrows, Int64(length(rows)))
-    whole = length(rows) == rblen
-    for (k, c) in enumerate(sink.columns)
-        source = decoded[c.index]
-        whole || _chargevector!(
-            sink.budget,
-            _eltypeof(source),
-            length(rows),
-            "scan column slice",
-        )
-        partidx = sink.partcounts[k] + 1
-        partidx <= length(sink.parts[k]) ||
-            throw(AssertionError("scan consumed more batches than its planned capacity"))
-        sink.parts[k][partidx] = whole ? source : _rowsof(source, rows)
-        sink.partcounts[k] = partidx
-    end
-    return nothing
-end
-
-# The consumed bound operation's result in selection order. Direct-handle type
-# overrides apply here. A facade storage plan has no overrides; its public
-# plan applies them after conversion inside `_finishfacadescan`.
-function _sinkresult(sink::_ScanSink)
-    _chargevector!(sink.budget, Symbol, length(sink.columns), "scan output names")
-    outnames = Symbol[c.name for c in sink.columns]
-    outcols = (
-        begin
-            parts = sink.parts[k]
-            # Every column may still hold the shared empty sentinel here;
-            # that only happens when no batch was consumed, so every count
-            # is 0 and this resize cannot disturb a sibling.
-            resize!(parts, sink.partcounts[k])
-            col = _joinscanparts(sink.fields[c.index], parts, sink.budget)
-            c.type === nothing ? col :
-            _uninferred(_applyoverride, c.type, col, sink.budget)
-        end for (k, c) in enumerate(sink.columns)
-    )
-    return _scantable(outnames, outcols, sink.outrows, sink.budget)
-end
-
-function _runboundscan(
-    f::ArrowFile,
-    b::Tables.BoundScan,
-    names::Vector{Symbol},
-    budget::AllocationBudget,
-    materializecolumn,
-    ntasks::Int=1,
-)
-    if isempty(names)
-        # Zero-field sources consume their filter and window here because an
-        # empty NamedTuple cannot carry a row count. Header reads share one
-        # cumulative allocation budget, like the column path.
-        keep = _zerofieldpredicate(b.filter)
-        messageversion = Ref(Int16(0))
-        n = _zerofieldwindow(
-            (_batchrows(f, i, budget) for i = 1:length(f)),
-            keep,
-            b.limit,
-            b.offset,
-        )
-        return _scantable(Symbol[], (), Int(n), budget)
-    end
-    sink = _ScanSink(b, names, f.fields, materializecolumn, budget)
-    _chargebitvector!(budget, length(names), "scan decode mask")
-    mask = falses(length(names))
-    mask[sink.decodeidx] .= true
-    # Without a filter the window is metadata arithmetic: batches outside
-    # it are never decoded. With one, the sink composes it over
-    # qualifying rows as batches decode.
-    windowed = b.filter === nothing && (b.limit !== nothing || b.offset > 0)
-    window = if windowed
-        _chargevector!(budget, Int64, length(f), "scan batch row counts")
-        _batchwindow(
-            Int64[_batchrows(f, i, budget) for i = 1:length(f)],
-            b.offset,
-            b.limit,
-            budget,
-        )
-    else
-        _chargevector!(budget, Tuple{Int,Int64,Int64}, length(f), "scan batch window")
-        Tuple{Int,Int64,Int64}[(i, Int64(0), Int64(-1)) for i = 1:length(f)]
-    end
-    # Statistics pruning: one-sided — a pruned batch is provably empty
-    # under the filter; the rows of the rest are decided by the sink.
-    _chargebitvector!(budget, length(f), "scan statistics decisions")
-    keep = trues(length(f))
-    if b.filter !== nothing
-        stats = _readstats(
-            f.schema.metadata,
-            length(f),
-            f.fields;
-            limits=f.limits,
-            budget=budget,
-        )
-        if stats !== nothing
-            context = _statscontext(b.filter, names, budget)
-            for i in eachindex(keep)
-                keep[i] = _maypass(b.filter, stats[i].cols, names, stats[i].rows, context)
-            end
-        end
-    end
-    # A filtered scan with `limit == 0` is closed before the first batch
-    # (`_sinkopen`), so it reserves no part slots at all.
-    partcapacity =
-        b.filter !== nothing && b.limit == 0 ? 0 :
-        count(entry -> keep[first(entry)], window)
-    _reservesinkparts!(sink, partcapacity)
-    # Late materialization: a filtered batch decodes its filter columns
-    # first and the other selected columns only if some row qualifies.
-    _chargevector!(budget, Int, length(sink.decodeidx), "scan late-column index")
-    restidx = setdiff(sink.decodeidx, sink.filteridx)
-    late = b.filter !== nothing && !isempty(sink.filteridx) && !isempty(restidx)
-    if late
-        _chargebitvector!(budget, length(names), "scan filter decode mask")
-        _chargebitvector!(budget, length(names), "scan late decode mask")
-        filtermask = falses(length(names))
-        filtermask[sink.filteridx] .= true
-        restmask = falses(length(names))
-        restmask[restidx] .= true
-    end
-    for (i, skip, take) in window
-        _sinkopen(sink) || break
-        keep[i] || continue
-        if late
-            rblen, cols = _scanbatch(f, i, filtermask, budget, ntasks)
-            decoded =
-                _materializecolumns!(_decodedcolumns(sink), sink, cols, sink.filteridx)
-            rows = _sinkrows(sink, decoded, rblen, skip, take)
-            isempty(rows) && continue
-            _, rest = _scanbatch(f, i, restmask, budget, ntasks)
-            _materializecolumns!(decoded, sink, rest, restidx)
-            _keeprows!(sink, decoded, rows, rblen)
-        else
-            rblen, cols = _scanbatch(f, i, mask, budget, ntasks)
-            _consumebatch!(sink, cols, rblen, skip, take)
-        end
-    end
-    return _sinkresult(sink)
-end
-
-# Direct-handle scans are storage-domain operations. Their interface cannot
-# select the facade's private ArrowTypes routing path.
-_applyscan(
-    f::ArrowFile,
-    plan::_BoundScanPlan,
-    budget::AllocationBudget=_readbudget(f.limits, f.region.len),
-) = _runboundscan(f, plan.bound, plan.names, budget, _storagebatchcolumn)
 
 # ===========================================================================
 # Byte-range reads — SourceFile over an AbstractArrowSource, the planner,
@@ -1837,35 +991,28 @@ A file-format source read one record batch at a time (`Arrow.Stream` over an
 `AbstractArrowSource`): the footer and every dictionary batch when opened,
 then each record batch's bytes when the batch is read.
 """
-mutable struct _RangedFile
-    const sf::SourceFile
-    const schema::Schema
-    const fields::AC.FrozenVector{Field}
-    const fielddictids::IdDict{Field,Int64}
-    const dictionaries::Dict{Int64,ArrayData}
-    const validated::AC._ValidatedDictionaries
-    const recordblocks::Vector{NTuple{3,Int64}}
-    const dataend::Int64
-    const limits::Limits
-    const footerversion::Int16
-    # The message metadata version every block must share (0 until one is read).
-    @atomic version::Int16
+struct _RangedFile
+    sf::SourceFile
+    schema::Schema
+    fields::AC.FrozenVector{Field}
+    fielddictids::IdDict{Field,Int64}
+    dictionaries::Dict{Int64,ArrayData}
+    validated::AC._ValidatedDictionaries
+    recordblocks::Vector{NTuple{3,Int64}}
+    dataend::Int64
+    limits::Limits
+    footerversion::Int16
     # The stream's lifetime authority; each batch's bytes are their own region.
-    const region::OwnerRegion
-    const blocks::_BlockReader
+    region::OwnerRegion
+    blocks::_BlockReader
 end
 
 function _RangedFile(sf::SourceFile, budget::AllocationBudget)
-    ft = _rangedfooter(sf, budget)
-    version = Ref(Int16(0))
+    ft = _readfooter(sf, sf.limits, budget)
     dictreader = _BlockReader(sf)
     framed(i, block) =
         let fm = first(_blockframe(dictreader, ft.dictblocks, i, ft.footerstart, budget))
-            version[] = _filemetadataversion(
-                ft.version,
-                fm.version,
-                version[] == 0 ? fm.version : version[],
-            )
+            _filemetadataversion(ft.version, fm.version)
             fm
         end
     dicts, validated = _filedictionaries(
@@ -1888,7 +1035,6 @@ function _RangedFile(sf::SourceFile, budget::AllocationBudget)
         ft.footerstart,
         sf.limits,
         ft.version,
-        version[],
         heapregion(UInt8[]),
         _BlockReader(sf),
     )
@@ -1935,12 +1081,14 @@ function _readblock(br::_BlockReader, blocks, i::Int, dataend::Int64)
             nstart, _ = _blockextent(blocks[last + 1], dataend)
             nstop, nlast = _windowfrom(blocks, last + 1, dataend)
             sf = br.sf
-            task = Threads.@spawn _fetchinto!(
-                Vector{UInt8}(undef, nstop - nstart),
-                1,
-                sf,
-                nstart,
-                nstop - nstart,
+            task = errormonitor(
+                Threads.@spawn _fetchinto!(
+                    Vector{UInt8}(undef, nstop - nstart),
+                    1,
+                    sf,
+                    nstart,
+                    nstop - nstart,
+                )
             )
             br.pending = (nstart, nstop, nlast, task)
         end
@@ -1982,45 +1130,8 @@ end
 Base.length(r::_RangedFile) = length(r.recordblocks)
 
 # Row count of batch `i` from one range request for its metadata.
-function _batchrows(r::_RangedFile, i::Int, budget::AllocationBudget)
-    seen = Ref(@atomic r.version)
-    n = _zerofieldblockcount(
-        r.sf,
-        r.recordblocks[i],
-        r.footerversion,
-        r.fields,
-        budget,
-        seen,
-    )
-    @atomicreplace r.version Int16(0) => seen[]
-    return n
-end
-
-# Record batch `i`, decoded through a one-block `ArrowFile` over its bytes.
-function _rangedbatch(r::_RangedFile, i::Int, budget::AllocationBudget, ntasks::Int)
-    1 <= i <= length(r.recordblocks) || throw(BoundsError(r, i))
-    fm, region = _blockframe(r.blocks, r.recordblocks, i, r.dataend, budget)
-    known = @atomic r.version
-    if known == 0
-        known, _ = @atomicreplace r.version Int16(0) => fm.version
-        known == 0 && (known = fm.version)
-    end
-    version = _filemetadataversion(r.footerversion, fm.version, known)
-    _, metalen, bodylen = r.recordblocks[i]
-    f = ArrowFile(
-        region,
-        r.schema,
-        r.fields,
-        r.fielddictids,
-        r.dictionaries,
-        r.validated,
-        [(Int64(0), metalen, bodylen)],
-        region.len,
-        r.limits,
-        version,
-    )
-    return only(_filerecordbatches(f, (1,), budget, ntasks))
-end
+_batchrows(r::_RangedFile, i::Int, budget::AllocationBudget) =
+    _rangedbatchrows(r.sf, r.recordblocks[i], r.footerversion, r.fields, budget)
 
 """
 A forward `IO` over a `SourceFile`, for reading a stream-format object one
@@ -2205,6 +1316,11 @@ function _fetchspans(
     return FetchedSpans(Int64[s[1] for s in spans], Int64[s[2] for s in spans], slices)
 end
 
+# A region's bytes are all in memory: one span over the whole region serves
+# every range a scan plans.
+_fetchspans(r::OwnerRegion, ranges, gap::Int64; budget=nothing, what="") =
+    FetchedSpans(Int64[0], Int64[r.len], BufferSlice[BufferSlice(r, 0, r.len)])
+
 # Read one round's spans, each length-checked, into `results[i]` by request
 # index. Small rounds read serially. Larger rounds use `sf.concurrency`
 # workers that pull indexes off one atomic counter. Storing by request index
@@ -2283,27 +1399,27 @@ function _spanholding(fs::FetchedSpans, off::Int64, len::Int64)
     return 0
 end
 
-# Spans of two fetch rounds as one lookup, ordered by start.
-function _unionspans(a::FetchedSpans, b::FetchedSpans, budget)
-    isempty(b.starts) && return a
-    n = length(a.starts) + length(b.starts)
+# Add the spans of a later fetch round to `fs`, keeping them ordered by start.
+function _addspans!(fs::FetchedSpans, new::FetchedSpans, budget)
+    n = length(new.starts)
     _chargevector!(budget, Int64, 2n, "fetched span index")
     _chargevector!(budget, BufferSlice, n, "fetched span slices")
-    starts = vcat(a.starts, b.starts)
-    order = sortperm(starts)
-    return FetchedSpans(
-        starts[order],
-        vcat(a.lens, b.lens)[order],
-        vcat(a.slices, b.slices)[order],
-    )
+    for k = 1:n
+        at = searchsortedlast(fs.starts, new.starts[k]) + 1
+        insert!(fs.starts, at, new.starts[k])
+        insert!(fs.lens, at, new.lens[k])
+        insert!(fs.slices, at, new.slices[k])
+    end
+    return fs
 end
 
-function _fetchbodyspans(sf::SourceFile, ranges, metadata::FetchedSpans, budget)
-    _chargevector!(budget, NTuple{2,Int64}, length(ranges), "unfetched body ranges")
-    unfetched = filter(r -> _spanholding(metadata, r[1], r[2]) == 0, ranges)
-    fetched =
-        _fetchspans(sf, unfetched, sf.gapbytes; budget=budget, what="body range fetch")
-    return _unionspans(metadata, fetched, budget)
+# Forget the spans inside `[from, to)`, so their bytes can be freed.
+function _dropspans!(fs::FetchedSpans, from::Int64, to::Int64)
+    keep = [!(from <= s && s + l <= to) for (s, l) in zip(fs.starts, fs.lens)]
+    keepat!(fs.starts, keep)
+    keepat!(fs.lens, keep)
+    keepat!(fs.slices, keep)
+    return fs
 end
 
 """
@@ -2327,25 +1443,25 @@ function _bodyslice(sb::SparseBody, offset::Int64, len::Int64)
     return _spanslice(sb.spans, AC.checked_add(sb.bodystart, offset), len)
 end
 
-"Ids of every dictionary field inside the masked top-level subtrees."
-function _neededdictids(fields, fielddictids, mask::AbstractVector{Bool}, budget=nothing)
-    capacity = Int64(0)
-    function countfields(f::Field)
-        if f.type isa DictionaryType
-            capacity = AC.checked_add(capacity, Int64(1))
-            return
-        end
-        foreach(countfields, f.children)
-    end
-    for (j, f) in enumerate(fields)
-        mask[j] && countfields(f)
-    end
-    _chargedict!(budget, Int64, Nothing, capacity, "scan dictionary-id set")
+"""
+Ids of every dictionary inside the masked top-level subtrees, including the
+dictionaries a dictionary's values are encoded with.
+"""
+function _neededdictids(
+    fields,
+    fielddictids,
+    dictvaluefields,
+    mask::AbstractVector{Bool},
+    budget=nothing,
+)
+    _chargedict!(budget, Int64, Nothing, length(fielddictids), "scan dictionary-id set")
     ids = Set{Int64}()
-    capacity <= typemax(Int) && sizehint!(ids, Int(capacity))
     function walk(f::Field)
         if f.type isa DictionaryType
-            push!(ids, fielddictids[f])
+            id = fielddictids[f]
+            id in ids && return
+            push!(ids, id)
+            walk(dictvaluefields[id])
             return
         end
         foreach(walk, f.children)
@@ -2356,629 +1472,47 @@ function _neededdictids(fields, fielddictids, mask::AbstractVector{Bool}, budget
     return ids
 end
 
-"""
-Parse and verify one fetched block-metadata payload the way `_blockmessage`
-does over a region: framing prefix, verified flatbuffer graph, declared
-body length against the Block tuple.
-"""
-function _parseblockmeta(
-    bytes::BufferSlice,
-    block::NTuple{3,Int64},
-    limits::Limits,
-    budget::AllocationBudget,
-)
-    _, metalen, bodylen = block
-    bytes.len == metalen ||
-        throw(ValidationError("footer block metadata fetch length mismatch"))
-    metalen >= 16 || throw(ValidationError("footer block has invalid extents"))
-    AC.loadat(bytes, UInt32, Int64(0)) == CONTINUATION ||
-        throw(ValidationError("footer block does not point at a message"))
-    declared = Int64(AC.loadat(bytes, Int32, Int64(4)))
-    declared == metalen - 8 ||
-        throw(ValidationError("footer block metadata length does not match the message"))
-    _checkblocklengths(declared, bodylen, limits)
-    _chargevector!(budget, UInt8, declared, "metadata allocation")
-    metabytes = AC.slicebytes(AC.subslice(bytes, 8, declared))
-    version, header_type, _, _ = _verify_ipc_metadata_budgeted(metabytes, limits, budget)
-    msg = FB.getrootas(Meta.Message, metabytes, 0)
-    Int64(msg.bodyLength) == bodylen ||
-        throw(ValidationError("footer block body length does not match the message"))
-    return msg, version, header_type
+# The last `n` bytes of the object, from its cached tail window.
+function _lastbytes(sf::SourceFile, n::Int, budget)
+    tail, _ = _fetchtail(sf, budget)
+    return tail[(end - n + 1):end]
 end
 
-_parseblockmeta(bytes::Vector{UInt8}, block, limits, budget) =
-    _parseblockmeta(BufferSlice(heapregion(bytes), 0, length(bytes)), block, limits, budget)
-
-"Fetch and verify the ranged footer: schema, fields, blocks, id table."
-function _rangedfooter(sf::SourceFile, budget::AllocationBudget)
-    limits = sf.limits
-    _requirelittleendian()
-    _validatelimits(limits)
-    L = sf.len
-    L >= Int64(8 + 8 + 4 + 6) ||
-        throw(ValidationError("file is too short to be an IPC file"))
+# The Footer's bytes: from the cached tail window when it holds them.
+function _footerbytes(sf::SourceFile, start::Int64, len::Int64, budget)
     tail, tailstart = _fetchtail(sf, budget)
-    tail[(end - 5):end] == Vector{UInt8}(FILE_MAGIC) ||
-        throw(ValidationError("missing trailing ARROW1 magic"))
-    footerlen = Int64(reinterpret(Int32, tail[(end - 9):(end - 6)])[1])
-    footerlen > 0 || throw(ValidationError("footer length $footerlen is not positive"))
-    footerlen <= limits.max_metadata_bytes || _limiterror(
-        "footer length $footerlen",
-        "max_metadata_bytes",
-        limits.max_metadata_bytes,
-    )
-    footerstart = L - 10 - footerlen
-    footerstart >= 8 || throw(ValidationError("footer escapes the file"))
-
-    footerbytes = if footerstart >= tailstart
-        _chargevector!(budget, UInt8, footerlen, "footer allocation")
-        tail[(footerstart - tailstart + 1):(footerstart - tailstart + footerlen)]
-    else
-        _fetchfooter(sf, footerstart, footerlen, budget)
-    end
-    version, features, dictblocks, recordblocks, _ =
-        _verify_footer_budgeted(footerbytes, limits, budget)
-    Int64(1) in features &&
-        throw(ValidationError("dictionary replacement is forbidden in the IPC file format"))
-    nmessages = AC.checked_add(
-        Int64(1),
-        AC.checked_add(Int64(length(dictblocks)), Int64(length(recordblocks))),
-    )
-    nmessages <= limits.max_messages ||
-        _limiterror("message count", "max_messages", limits.max_messages)
-    footer = FB.getrootas(Meta.Footer, footerbytes, 0)
-    metaschema = footer.schema
-    metaschema === nothing && throw(ValidationError("file footer carries no schema"))
-    something(metaschema.endianness, Meta.Endianness.Little) == Meta.Endianness.Little ||
-        throw(
-            ValidationError(
-                "big-endian IPC is not supported (no endianness normalization)",
-            ),
-        )
-    dictids = Dict{Int64,Meta.Field}()
-    fielddictids = IdDict{Field,Int64}()
-    fields = Field[
-        corefield(f, dictids, fielddictids) for
-        f in something(metaschema.fields, Meta.Field[])
-    ]
-    foreach(validateschemafield, fields)
-    dictvaluefields = validatedictionaryids(fields, fielddictids)
-    sch = Schema(
-        fields;
-        metadata=coremetadata(metaschema.custom_metadata),
-        endianness=AC.LittleEndian,
-    )
-    return (;
-        sch,
-        fields,
-        dictids,
-        fielddictids,
-        dictvaluefields,
-        version,
-        dictblocks,
-        recordblocks,
-        footerstart,
-        metaschema,
-    )
+    start >= tailstart || return _fetchfooter(sf, start, len, budget)
+    _chargevector!(budget, UInt8, len, "footer allocation")
+    return tail[(start - tailstart + 1):(start - tailstart + len)]
 end
 
 """
-One record block's row count for the zero-field ranged path — the SAME
-frame discipline as the column path's metadata pass: extent bounds before
-the fetch, the fetch and parse charged to the caller's cumulative budget,
-`_parseblockmeta` framing (continuation prefix, declared length, verified
-graph, body-length cross-check), header kind, footer-version agreement,
+One record block's row count from one range request for its metadata, with
+the frame discipline of a scan's metadata pass: extent bounds before the
+fetch, the fetch and parse charged to the caller's cumulative budget,
+`_blockmeta` framing (continuation prefix, declared length, verified graph,
+body-length cross-check), header kind, footer-version agreement,
 and compression rejection.
 """
-function _zerofieldblockcount(
+function _rangedbatchrows(
     sf::SourceFile,
     block::NTuple{3,Int64},
     version::Int16,
     fields::AbstractVector{Field},
     budget::AllocationBudget,
-    messageversion::Base.RefValue{Int16},
 )
     _, metalen, bodylen = block
     declared = metalen - 8
     _checkblocklengths(declared, bodylen, sf.limits)
     _chargevector!(budget, UInt8, metalen, "metadata range fetch")
     payload = _fetchexact(sf, block[1], metalen)
-    msg, v, header_type = _parseblockmeta(payload, block, sf.limits, budget)
+    msg, v, header_type, _ =
+        _blockmeta(BufferSlice(heapregion(payload), 0, metalen), block, sf.limits, budget)
     header_type == UInt8(3) ||
         throw(ValidationError("footer record block is not a record batch"))
-    expected = messageversion[] == 0 ? v : messageversion[]
-    messageversion[] = _filemetadataversion(version, v, expected)
+    _filemetadataversion(version, v)
     rejectexperimentalcompression(msg, v, header_type)
     return _recordbatchmeta(msg.header::Meta.RecordBatch, fields, sf.limits, bodylen)
-end
-
-function _runboundscan(
-    sf::SourceFile,
-    b::Tables.BoundScan,
-    names::Vector{Symbol},
-    ft,
-    budget::AllocationBudget,
-    materializecolumn,
-)
-    limits = sf.limits
-    fields = ft.fields
-    dictids = ft.dictids
-    fielddictids = ft.fielddictids
-    dictvaluefields = ft.dictvaluefields
-    version = ft.version
-    dictblocks = ft.dictblocks
-    recordblocks = ft.recordblocks
-    footerstart = ft.footerstart
-    if isempty(names)
-        # Zero-field sources consume their filter and window here because an
-        # empty NamedTuple cannot carry a row count. The metadata-only read
-        # keeps the column path's trust boundary: the block index validates
-        # first, every touched block passes the full frame checks, and every
-        # fetch charges the one cumulative budget.
-        # 8 is the padded leading magic (`ARROW1` plus two bytes). The ranged
-        # reader never fetches those bytes, so a conforming file's first
-        # message starting at 8 is an assumption, not a check.
-        _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
-        # A zero-field schema declares no dictionary ids, so every indexed
-        # dictionary block is orphaned — the same rejection the id-membership
-        # check produces on the column path and in the full reader.
-        isempty(dictblocks) || throw(
-            ValidationError(
-                "dictionary batch has no declaring field in a zero-field schema",
-            ),
-        )
-        keep = _zerofieldpredicate(b.filter)
-        messageversion = Ref(Int16(0))
-        n = _zerofieldwindow(
-            (
-                _zerofieldblockcount(sf, block, version, fields, budget, messageversion) for block in recordblocks
-            ),
-            keep,
-            b.limit,
-            b.offset,
-        )
-        return _scantable(Symbol[], (), Int(n), budget)
-    end
-    sink = _ScanSink(b, names, fields, materializecolumn, budget)
-    decodeidx = sink.decodeidx
-    _chargebitvector!(budget, length(names), "scan decode mask")
-    mask = falses(length(names))
-    mask[decodeidx] .= true
-
-    # Footer Blocks remain mutually exclusive and bounded without parsing the
-    # leading schema or optional EOS bytes. A tail request may over-read them.
-    # 8 is the padded leading magic (`ARROW1` plus two bytes). The ranged
-    # reader never fetches those bytes, so a conforming file's first message
-    # starting at 8 is an assumption, not a check.
-    _validateblockindex(dictblocks, recordblocks, footerstart; datastart=8)
-
-    # Statistics pruning happens FIRST: the stats live in the
-    # footer schema's metadata, so pruned batches cause no block-metadata range
-    # request. Tail reads may still over-read them. Pruning applies only under
-    # a filter, and the window applies only without one, so they never interact.
-    nrec = length(recordblocks)
-    _chargebitvector!(budget, nrec, "scan statistics decisions")
-    keep = trues(nrec)
-    if b.filter !== nothing
-        stats = _readstats(ft.sch.metadata, nrec, fields; limits=limits, budget=budget)
-        if stats !== nothing
-            context = _statscontext(b.filter, names, budget)
-            for i in eachindex(keep)
-                keep[i] = _maypass(b.filter, stats[i].cols, names, stats[i].rows, context)
-            end
-        end
-    end
-    _chargevector!(budget, Int, count(keep), "statistics-surviving batch indexes")
-    recidxs = Int[i for i = 1:nrec if keep[i]]
-
-    # One coalesced metadata pass over the dictionary blocks and the
-    # SURVIVING record blocks; bodies come later and only for what the scan
-    # needs.
-    nmeta = length(dictblocks) + length(recidxs)
-    _chargevector!(budget, NTuple{3,Int64}, nmeta, "scan metadata blocks")
-    metablocks = NTuple{3,Int64}[]
-    sizehint!(metablocks, nmeta)
-    append!(metablocks, dictblocks)
-    append!(metablocks, (recordblocks[i] for i in recidxs))
-    # Match ArrowFile's lazy record limits: statistics-pruned records never
-    # become candidates. Every candidate is bounded before its metadata fetch.
-    for block in metablocks
-        _, metalen, bodylen = block
-        declared = metalen - 8
-        _checkblocklengths(declared, bodylen, limits)
-    end
-    _chargevector!(budget, NTuple{2,Int64}, nmeta, "metadata range plan")
-    # Each block's metadata comes with the start of its body, or all of a small
-    # body: the selected buffers often lie there, and an over-read of a few
-    # hundred KiB costs less than a second request round. The body round then
-    # fetches only what this one did not. A scan with a row window needs few
-    # of the bodies, so it reads metadata alone.
-    limitedfilter = b.filter !== nothing && b.limit !== nothing
-    bodygap = b.limit === nothing && b.offset == 0 ? sf.gapbytes : Int64(0)
-    metaranges = NTuple{2,Int64}[
-        (bl[1], AC.checked_add(bl[2], _speculativebody(bl[3], bodygap))) for
-        bl in metablocks
-    ]
-    # A filtered limit may end at the first batch. Coalescing across its
-    # successors' bodies would download those rows before the filter runs.
-    metaspans = _fetchspans(
-        sf,
-        metaranges,
-        limitedfilter ? Int64(0) : sf.gapbytes;
-        budget=budget,
-        what="metadata range fetch",
-    )
-    _chargevector!(
-        budget,
-        Tuple{Meta.Message,Int16},
-        length(metablocks),
-        "parsed block metadata",
-    )
-    blockmeta = Vector{Tuple{Meta.Message,Int16}}(undef, length(metablocks))
-    for (i, block) in enumerate(metablocks)
-        payload = _spanslice(metaspans, block[1], block[2])
-        msg, v, header_type = _parseblockmeta(payload, block, limits, budget)
-        expected_dict = i <= length(dictblocks)
-        (expected_dict ? header_type == UInt8(2) : header_type == UInt8(3)) || throw(
-            ValidationError(
-                expected_dict ? "footer dictionary block is not a dictionary batch" :
-                "footer record block is not a record batch",
-            ),
-        )
-        _filemetadataversion(version, v, i == 1 ? v : blockmeta[1][2])
-        rejectexperimentalcompression(msg, v, header_type)
-        blockmeta[i] = (msg, v)
-    end
-
-    isempty(blockmeta) || (version = blockmeta[1][2])
-
-    # RecordBatch lengths live in block metadata, not the Footer. The metadata
-    # pass above is required before limit/offset can choose body ranges.
-    nsurv = length(recidxs)
-    _chargevector!(budget, Meta.RecordBatch, nsurv, "record-batch headers")
-    headers =
-        [blockmeta[length(dictblocks) + p][1].header::Meta.RecordBatch for p = 1:nsurv]
-    _chargevector!(budget, Vector{Int64}, nsurv, "record variadic-count cache")
-    recordvariadics = Vector{Vector{Int64}}(undef, nsurv)
-    # `rowcounts` and `window` are indexed by position in `recidxs`, not by
-    # record-block index. They coincide only because statistics pruning needs
-    # a filter and windowing needs none, so a windowed scan has pruned
-    # nothing.
-    _chargevector!(budget, Int64, nsurv, "scan batch row counts")
-    rowcounts = Vector{Int64}(undef, nsurv)
-    for (p, h) in enumerate(headers)
-        variadics = variadiccounts(h)
-        recordvariadics[p] = variadics
-        rowcounts[p] =
-            _recordbatchmeta(h, fields, limits, recordblocks[recidxs[p]][3], variadics)
-    end
-    windowed = b.filter === nothing && (b.limit !== nothing || b.offset > 0)
-    window =
-        windowed ? _batchwindow(rowcounts, b.offset, b.limit, budget) :
-        begin
-            _chargevector!(budget, Tuple{Int,Int64,Int64}, nsurv, "scan batch window")
-            Tuple{Int,Int64,Int64}[
-                (p, Int64(0), Int64(-1)) for p = 1:nsurv if _sinkopen(sink)
-            ]
-        end
-    # A filtered scan with `limit == 0` is closed before the first batch
-    # (`_sinkopen`), so it reserves no part slots at all.
-    _reservesinkparts!(sink, b.filter !== nothing && b.limit == 0 ? 0 : length(window))
-
-    # Decode-set dictionaries: whole bodies, coalesced; everything else is
-    # metadata-only forever.
-    needed =
-        isempty(window) ? Set{Int64}() : _neededdictids(fields, fielddictids, mask, budget)
-    _chargedict!(budget, Int64, Nothing, length(dictblocks), "seen dictionary ids")
-    seenids = Set{Int64}()
-    sizehint!(seenids, length(dictblocks))
-    _chargevector!(budget, Int, length(dictblocks), "selected dictionary blocks")
-    wanted_dict = Int[]
-    sizehint!(wanted_dict, length(dictblocks))
-    _chargevector!(
-        budget,
-        Vector{Int64},
-        length(dictblocks),
-        "dictionary variadic-count cache",
-    )
-    dictvariadics = Vector{Vector{Int64}}(undef, length(dictblocks))
-    for (i, block) in enumerate(dictblocks)
-        msg, _ = blockmeta[i]
-        header = msg.header
-        header isa Meta.DictionaryBatch ||
-            throw(ValidationError("footer dictionary block is not a dictionary batch"))
-        haskey(dictids, header.id) ||
-            throw(ValidationError("dictionary batch has unknown id $(header.id)"))
-        _dictionarytransition(header.id, header.isDelta, header.id in seenids; file=true)
-        push!(seenids, header.id)
-        rb = header.data
-        vf = dictvaluefields[header.id]
-        variadics = variadiccounts(rb)
-        dictvariadics[i] = variadics
-        _recordbatchmeta(rb, (vf,), limits, block[3], variadics)
-        codec = _batchcodec(rb.compression, blockmeta[i][2])
-        if header.id in needed
-            _validatebodyplan(rb, (vf,), limits, codec, (true,), variadics)
-            push!(wanted_dict, i)
-        end
-    end
-    # `_validatebodyplan`'s return value is the exact number of nonempty
-    # ranges the loop below will plan; the assertion after it re-checks that
-    # the two passes agree.
-    bodycount = Int64(count(i -> dictblocks[i][3] > 0, wanted_dict))
-    for (p, _, _) in window
-        _, v = blockmeta[length(dictblocks) + p]
-        codec = _batchcodec(headers[p].compression, v)
-        bodycount = AC.checked_add(
-            bodycount,
-            _validatebodyplan(headers[p], fields, limits, codec, mask, recordvariadics[p]),
-        )
-    end
-    for id in needed
-        id in seenids || throw(
-            ValidationError(
-                "record batch references dictionary id $id before its dictionary batch",
-            ),
-        )
-    end
-    _chargedict!(budget, Int64, ArrayData, length(wanted_dict), "decoded dictionary table")
-    dicts = Dict{Int64,ArrayData}()
-    sizehint!(dicts, length(wanted_dict))
-    _chargedict!(
-        budget,
-        ArrayData,
-        Nothing,
-        length(wanted_dict),
-        "validated dictionary identities",
-    )
-    validated = AC._ValidatedDictionaries()
-    sizehint!(validated, length(wanted_dict))
-    # An unrestricted scan coalesces the selected bodies into one round.
-    # A filtered limit fetches them batch by batch, stopping when it is full.
-    bodycount <= typemax(Int) ||
-        throw(ValidationError("body range count exceeds the host index range"))
-    _chargevector!(budget, NTuple{2,Int64}, bodycount, "body range plan")
-    bodyranges = Vector{NTuple{2,Int64}}(undef, Int(bodycount))
-    rangeidx = 0
-    for i in wanted_dict
-        dictblocks[i][3] == 0 && continue
-        rangeidx += 1
-        bodyranges[rangeidx] = (dictblocks[i][1] + dictblocks[i][2], dictblocks[i][3])
-    end
-    dictranges = 1:rangeidx
-    _chargevector!(budget, UnitRange{Int}, length(window), "record body range indexes")
-    recordranges = Vector{UnitRange{Int}}(undef, length(window))
-    for (batchidx, (p, _, _)) in enumerate(window)
-        firstindex = rangeidx + 1
-        block = recordblocks[recidxs[p]]
-        header = headers[p]
-        buffers = something(header.buffers, Meta.Buffer[])
-        variadics = recordvariadics[p]
-        varidx = Ref(1)
-        bufidx = 1
-        for (j, fld) in enumerate(fields)
-            span64 = _bufferspan(fld, variadics, varidx)
-            span64 <= typemax(Int) || throw(
-                ValidationError("field buffer span $span64 exceeds the host index range"),
-            )
-            span = Int(span64)
-            if mask[j]
-                for k = bufidx:(bufidx + span - 1)
-                    k <= length(buffers) || throw(
-                        ValidationError(
-                            "metadata declares fewer buffers than the schema requires",
-                        ),
-                    )
-                    buf = buffers[k]
-                    len = Int64(buf.length)
-                    off = Int64(buf.offset)
-                    (off >= 0 && len >= 0 && AC.checked_add(off, len) <= block[3]) || throw(
-                        ValidationError(
-                            "batch buffer [$off, $len] escapes its message body",
-                        ),
-                    )
-                    len == 0 && continue
-                    rangeidx += 1
-                    bodyranges[rangeidx] = (block[1] + block[2] + off, len)
-                end
-            end
-            bufidx += span
-        end
-        recordranges[batchidx] = firstindex:rangeidx
-    end
-    rangeidx == length(bodyranges) ||
-        throw(AssertionError("body range preflight count changed during planning"))
-    bodyspans = _fetchbodyspans(
-        sf,
-        limitedfilter ? view(bodyranges, dictranges) : bodyranges,
-        metaspans,
-        budget,
-    )
-
-    state = DecodeState(budget)
-    try
-        if !isempty(wanted_dict)
-            for i in wanted_dict
-                block = dictblocks[i]
-                msg, v = blockmeta[i]
-                header = msg.header::Meta.DictionaryBatch
-                rejectexperimentalcompression(msg, v, UInt8(2))
-                rb = header.data
-                codec = _batchcodec(rb.compression, v)
-                vf = dictvaluefields[header.id]
-                variadics = dictvariadics[i]
-                rblen = _recordbatchmeta(rb, (vf,), limits, block[3], variadics)
-                body = _spanslice(bodyspans, block[1] + block[2], block[3])
-                cursor = DecodeCursor(
-                    rb.nodes,
-                    rb.buffers,
-                    body,
-                    limits;
-                    codec=codec,
-                    state=state,
-                    variadics=variadics,
-                )
-                decoded = decodefield(vf, cursor, dicts, fielddictids)
-                finishcursor!(cursor)
-                decoded.len == rblen || throw(
-                    ValidationError(
-                        "dictionary RecordBatch length does not match its field node",
-                    ),
-                )
-                _updatedictionary!(
-                    dicts,
-                    validated,
-                    header.id,
-                    header.isDelta,
-                    vf,
-                    decoded,
-                    limits,
-                    budget;
-                    file=true,
-                )
-            end
-        end
-
-        for (batchidx, (p, skip, take)) in enumerate(window)
-            _sinkopen(sink) || break
-            if limitedfilter
-                ranges = recordranges[batchidx]
-                _chargevector!(
-                    budget,
-                    NTuple{2,Int64},
-                    length(ranges),
-                    "record body ranges",
-                )
-                # Limited-filter metadata reads contain no speculative body bytes.
-                bodyspans = _fetchspans(
-                    sf,
-                    bodyranges[ranges],
-                    sf.gapbytes;
-                    budget=budget,
-                    what="body range fetch",
-                )
-            end
-            block = recordblocks[recidxs[p]]
-            msg, v = blockmeta[length(dictblocks) + p]
-            body = SparseBody(block[3], block[1] + block[2], bodyspans)
-            rblen, cols = _maskedrecord(
-                msg,
-                v,
-                body,
-                fields,
-                dicts,
-                fielddictids,
-                validated,
-                limits,
-                version,
-                mask,
-                state,
-                recordvariadics[p],
-            )
-            _consumebatch!(sink, cols, rblen, skip, take)
-        end
-        return _sinkresult(sink)
-    finally
-        close(state)
-    end
-end
-
-# The ranged direct-handle operation is storage-only for the same reason as
-# `_applyscan(::ArrowFile, ...)` above.
-_applyscan(sf::SourceFile, plan::_BoundScanPlan, ft, budget::AllocationBudget) =
-    _runboundscan(sf, plan.bound, plan.names, ft, budget, _storagebatchcolumn)
-
-"""
-Compile one direct-handle request against the file schema; the handle
-consumes it in the storage domain.
-"""
-function _compilehandlescan(scan::Tables.Scan, fields, budget=nothing)
-    return _compileboundscan(scan, fields, budget)
-end
-
-# Tables.jl exposes binding (`resolve`), predicate evaluation, and
-# allocation, but no executor for an existing `BoundScan`. Keep this small
-# local executor instead of reconstructing a Scan and resolving it a second
-# time.
-"Execute an already-compiled scan over a materialized Tables.jl source."
-function _executeplan(table, b::Tables.BoundScan, budget=nothing)
-    cols = Tables.columns(table)
-    ncols = length(Tables.columnnames(cols))
-    _chargevector!(budget, Symbol, ncols, "scan input names")
-    names = collect(Symbol, Tables.columnnames(cols))
-    return _executeplan(table, b, names, budget)
-end
-
-function _executeplan(table, b::Tables.BoundScan, names::Vector{Symbol}, budget=nothing)
-    cols = Tables.columns(table)
-    length(Tables.columnnames(cols)) == length(names) || throw(
-        AssertionError(
-            "scan source width $(length(Tables.columnnames(cols))) does not match " *
-            "its compiled schema width $(length(names))",
-        ),
-    )
-    nrows = Int(Tables.rowcount(cols))
-    if isempty(names)
-        n = _zerofieldcount(Int64(nrows), _zerofieldpredicate(b.filter), b.limit, b.offset)
-        return _scantable(Symbol[], (), Int(n), budget)
-    end
-
-    idx = if b.filter === nothing
-        1:nrows
-    else
-        _chargefilterscratch!(budget, b.filter, nrows)
-        _chargevector!(budget, Bool, nrows, "scan filter mask")
-        filtermask = _uninferred(Tables.filtermask, b, cols)::AbstractVector{Bool}
-        matches = count(identity, filtermask)
-        _chargevector!(budget, Int, matches, "scan matching rows")
-        findall(filtermask)
-    end
-    skipped = min(b.offset, length(idx))
-    available = length(idx) - skipped
-    taken = b.limit === nothing ? available : min(b.limit, available)
-    rows = _rowwindow(idx, skipped + 1, skipped + taken)
-    _chargevector!(budget, Symbol, length(b.columns), "scan output names")
-    outnames = Symbol[c.name for c in b.columns]
-    outcols = (
-        begin
-            source = Tables.getcolumn(cols, c.index)
-            _chargevector!(budget, _eltypeof(source), length(rows), "scan column slice")
-            col = _rowsof(source, rows)
-            c.type === nothing ? col : _uninferred(_applyoverride, c.type, col, budget)
-        end for c in b.columns
-    )
-    return _scantable(outnames, outcols, taken, budget)
-end
-
-"Execute one scan plan in the public domain over a converted Table."
-function _publicscan(
-    full::Table,
-    schema,
-    sourcefields,
-    plan::_ScanPlan,
-    regions,
-    budget=nothing,
-)
-    b = plan.public
-    got = _executeplan(full, b, plan.names, budget)
-    cols = Tables.columns(got)
-    ncols = length(Tables.columnnames(cols))
-    _chargevector!(budget, Symbol, ncols, "public scan names")
-    names = collect(Symbol, Tables.columnnames(cols))
-    _chargevector!(budget, AbstractVector, ncols, "public scan columns")
-    columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
-    _chargevector!(budget, AbstractVector, length(b.columns), "pre-override scan columns")
-    precols = AbstractVector[Tables.getcolumn(full, bc.index) for bc in b.columns]
-    n = Int(Tables.rowcount(cols))
-    bound = _boundschema(schema, sourcefields, b, precols, budget)
-    fullpools = getfield(full, :retainedpools)
-    _chargevector!(budget, Any, length(b.columns), "scan retained dictionary pools")
-    pools = Any[
-        _keepsfield(bc, precols[i]) ? fullpools[bc.index] : nothing for
-        (i, bc) in enumerate(b.columns)
-    ]
-    _chargevector!(budget, AC.OwnerRegion, length(regions), "scan owner regions")
-    return _table(names, columns, bound, AC.OwnerRegion[regions...], n, pools, budget)
 end
 
 "Whether an output keeps its source field: no override, or a no-op one."
@@ -3015,272 +1549,6 @@ function _boundschema(schema, sourcefields, b::Tables.BoundScan, precols, budget
     )
 end
 
-"Finish a facade scan by converting its operation-local raw result once."
-function _finishfacadescan(
-    got,
-    schema,
-    sourcefields,
-    plan::_ScanPlan;
-    regions=AC.OwnerRegion[],
-    budget=nothing,
-    poolof=nothing,
-    views::_ViewContext=_ViewContext(DataStrings.DataString, budget),
-    public::Bool=false,
-)
-    cols = Tables.columns(got)
-    ncols = length(Tables.columnnames(cols))
-    _chargevector!(budget, Symbol, ncols, "facade scan names")
-    names = collect(Symbol, Tables.columnnames(cols))
-    _chargevector!(budget, AbstractVector, ncols, "facade scan columns")
-    columns = AbstractVector[Tables.getcolumn(cols, nm) for nm in names]
-    _chargevector!(budget, AbstractVector, length(columns), "pre-override facade columns")
-    precols = AbstractVector[]
-    sizehint!(precols, length(columns))
-    b = plan.public
-    pools = nothing
-    if !isempty(sourcefields)
-        arrowtypes = _ArrowTypesContext(budget=budget)
-        length(b.columns) == length(columns) || throw(
-            AssertionError(
-                "scan output width $(length(columns)) does not match its bound " *
-                "selection $(length(b.columns))",
-            ),
-        )
-        for (i, bc) in enumerate(b.columns)
-            f = sourcefields[bc.index]
-            if !public && _periodoverride(bc, f)
-                columns[i] = _uninferred(
-                    _timeperiods,
-                    f.type,
-                    columns[i],
-                    Base.nonmissingtype(bc.type),
-                )
-                # A real conversion: the output does not keep the time field.
-                push!(precols, Dates.Time[])
-                continue
-            elseif !public && _symboloverride(bc, f)
-                # The stored strings, without creating a Symbol per value.
-                columns[i] = _uninferred(_applyoverride, bc.type, columns[i], budget)
-                push!(precols, Symbol[])
-                continue
-            end
-            # Public type overrides run HERE, after facade conversion —
-            # they are public-domain requests, never storage casts, and
-            # they preserve missing exactly as Tables.scan does.
-            # `public` columns are already the full read's (a select-only scan).
-            base =
-                public ? columns[i] :
-                _scanview(f) ? _scanviewoutput(f, columns[i], views) :
-                _uninferred(_facadefromraw, f, columns[i], arrowtypes)
-            push!(precols, base)
-            columns[i] =
-                bc.type === nothing ? base :
-                _uninferred(_applyoverride, bc.type, base, budget)
-        end
-        # Dictionary columns keep their source category pool, as a full read
-        # does, so a rewrite preserves category order (required when ordered).
-        if poolof !== nothing
-            _chargevector!(budget, Any, length(b.columns), "scan retained dictionary pools")
-            pools = Any[
-                sourcefields[bc.index].type isa DictionaryType &&
-                _keepsfield(bc, precols[i]) ?
-                poolof(bc, sourcefields[bc.index], arrowtypes) : nothing for
-                (i, bc) in enumerate(b.columns)
-            ]
-        end
-    end
-    nrows = isempty(columns) ? _scanrowcount(got) : length(columns[1])
-    bound = _boundschema(schema, sourcefields, b, precols, budget)
-    _chargevector!(budget, AC.OwnerRegion, length(regions), "scan owner regions")
-    return _table(names, columns, bound, AC.OwnerRegion[regions...], nrows, pools, budget)
-end
-
-# File record batches all reference each dictionary's final pool, so the first
-# decoded snapshot of a selected dictionary column is the pool a full read
-# retains. Slots start `nothing`; the facade materializer fills them.
-function _dictsnapshots(fields, b::Tables.BoundScan, budget)
-    n = count(bc -> fields[bc.index].type isa DictionaryType, b.columns)
-    _chargedict!(budget, Field, Union{Nothing,ArrayData}, n, "scan dictionary snapshots")
-    snapshots = IdDict{Field,Union{Nothing,ArrayData}}()
-    for bc in b.columns
-        f = fields[bc.index]
-        f.type isa DictionaryType && (snapshots[f] = nothing)
-    end
-    return snapshots
-end
-
-function _snapshotdict!(snapshots, field::Field, data::ArrayData)
-    get(snapshots, field, missing) === nothing && (snapshots[field] = data.dictionary)
-    return nothing
-end
-
-# The facade executor only accepts the override-free storage half of a plan.
-# Keep that coupled invariant at the one operation that needs both halves.
-function _facadestorage(plan::_ScanPlan)
-    b = plan.storage
-    b === nothing && throw(AssertionError("facade scan has no storage-domain plan"))
-    p = plan.public
-    length(b.columns) == length(p.columns) ||
-        throw(AssertionError("facade storage selection width changed"))
-    all(
-        bc.type === nothing && bc.index == pc.index && bc.name == pc.name for
-        (bc, pc) in zip(b.columns, p.columns)
-    ) || throw(AssertionError("facade storage selection retained a public override"))
-    b.filtercols == p.filtercols ||
-        throw(AssertionError("facade storage filter references changed"))
-    (b.limit == p.limit && b.offset == p.offset && b.validate == p.validate) ||
-        throw(AssertionError("facade storage window or validation mode changed"))
-    return b
-end
-
-# These facade operations own the full private route: create ArrowTypes Union
-# markers while decoding, consume them during public conversion, and return a
-# Table from the public domain. No marker-bearing intermediate crosses into
-# `table.jl`, and direct `_applyscan` cannot select this materializer.
-function _applyfacadescan(
-    f::ArrowFile,
-    plan::_ScanPlan,
-    budget::Union{Nothing,AllocationBudget}=nothing;
-    stringtype::Type=DataStrings.DataString,
-    ntasks::Int=1,
-)
-    b = _facadestorage(plan)
-    actual = budget === nothing ? _readbudget(f.limits, f.region.len) : budget
-    routes = _ArrowTypesRoutePlan(actual)
-    views = _ViewContext(stringtype, actual)
-    snapshots = _dictsnapshots(f.fields, b, actual)
-    rawoverrides = _rawoverrides(plan.public, f.fields)
-    materialize =
-        (field, data, _) -> (
-            _snapshotdict!(snapshots, field, data);
-            _scanbatchcolumn(field, data, routes, views, _checkstimes(rawoverrides, field))
-        )
-    # A scan that only selects keeps every row: its columns are the full
-    # read's columns (views chain, strings are one column), with no per-batch
-    # slices or joins.
-    selectonly = _selectsonly(b) && !isempty(plan.names) && isempty(rawoverrides)
-    got =
-        selectonly ? _selectscan(f, b, actual, snapshots, views, ntasks) :
-        _runboundscan(f, b, plan.names, actual, materialize, ntasks)
-    return _finishfacadescan(
-        got,
-        f.schema,
-        f.fields,
-        plan;
-        regions=AC.OwnerRegion[f.region],
-        budget=actual,
-        poolof=(_, field, ctx) -> _retainedsnapshotpool(field, snapshots[field], ctx),
-        views=views,
-        public=selectonly,
-    )
-end
-
-_selectsonly(b::Tables.BoundScan) =
-    b.filter === nothing && b.limit === nothing && b.offset == 0
-
-# Decode the selected columns of every batch and build each as a full read
-# does, in the public domain, on at most `ntasks` tasks.
-function _selectscan(
-    f::ArrowFile,
-    b::Tables.BoundScan,
-    budget,
-    snapshots,
-    views,
-    ntasks::Int,
-)
-    _chargebitvector!(budget, length(f.fields), "scan decode mask")
-    mask = falses(length(f.fields))
-    for c in b.columns
-        mask[c.index] = true
-    end
-    plans, cols = _filebatches(f, 1:length(f), budget, ntasks, mask)
-    _chargevector!(budget, NamedTuple, length(f), "scan batches")
-    batches = [(columns=c,) for c in cols]
-    nrows = 0
-    for p in plans
-        nrows = _addscanrows(nrows, p.rblen)
-    end
-    for c in b.columns
-        field = f.fields[c.index]
-        foreach(batch -> _snapshotdict!(snapshots, field, batch.columns[c.index]), batches)
-    end
-    arrowtypes = _ArrowTypesContext(budget=budget)
-    idxs = Int[c.index for c in b.columns]
-    # As in a whole read, string columns build when the table hands them out.
-    columns = _buildcolumns(f.fields, batches, idxs, arrowtypes, views, ntasks; lazy=true)
-    return _scantable(Symbol[c.name for c in b.columns], columns, nrows, budget)
-end
-
-function _applyfacadescan(
-    sf::SourceFile,
-    plan::_ScanPlan,
-    ft,
-    budget::AllocationBudget;
-    stringtype::Type=DataStrings.DataString,
-)
-    routes = _ArrowTypesRoutePlan(budget)
-    views = _ViewContext(stringtype, budget)
-    b = _facadestorage(plan)
-    snapshots = _dictsnapshots(ft.fields, b, budget)
-    rawoverrides = _rawoverrides(plan.public, ft.fields)
-    materialize =
-        (field, data, _) -> (
-            _snapshotdict!(snapshots, field, data);
-            _scanbatchcolumn(field, data, routes, views, _checkstimes(rawoverrides, field))
-        )
-    got = _runboundscan(sf, b, plan.names, ft, budget, materialize)
-    return _finishfacadescan(
-        got,
-        ft.sch,
-        ft.fields,
-        plan;
-        budget=budget,
-        poolof=(_, field, ctx) -> _retainedsnapshotpool(field, snapshots[field], ctx),
-        views=views,
-    )
-end
-
-function _facadescanrawcolumn(
-    fields,
-    batches,
-    i::Int,
-    budget,
-    routes::_ArrowTypesRoutePlan,
-    views::_ViewContext,
-    checktimes=true,
-)
-    f = fields[i]
-    _scanview(f) &&
-        return _viewcolumn(f, AC.ArrayData[b.columns[i] for b in batches], views)
-    _chargevector!(budget, AbstractVector, length(batches), "stream scan column parts")
-    parts = AbstractVector[
-        _scanbatchcolumn(f, b.columns[i], routes, views, checktimes) for b in batches
-    ]
-    return _joinscanparts(f, parts, budget)
-end
-
-# Facade scans read a flat column as the view a full read gives whenever its
-# storage and public values agree. Dates, times, timestamps, and durations
-# stay in storage until the filter has run: their literals lower to storage.
-_scanview(f::AC.Field) = _viewable(f) && !_storageconverted(f)
-function _storageconverted(f::AC.Field)
-    t = f.type
-    t isa AC.DictionaryType && return _storageconverted(AC.dictvaluefield(f, t))
-    t isa AC.RunEndEncodedType && return _storageconverted(f.children[2])
-    return _istemporalconv(t)
-end
-
-_scanbatchcolumn(
-    f::AC.Field,
-    d::AC.ArrayData,
-    routes,
-    views::_ViewContext,
-    checktimes=true,
-) =
-    _scanview(f) ? _viewcolumn(f, AC.ArrayData[d], views) :
-    _viewable(f) && _istemporalconv(f.type) ? _storageview(f, d, views, checktimes) :
-    _batchcolumn(f, d, routes)
-
 # A select override of a time-of-day column with a `Dates.Period` type reads
 # its stored ticks as periods (`_timeperiods`), so its values are not checked
 # against a day's length.
@@ -3302,110 +1570,854 @@ _rawoverrides(b::Tables.BoundScan, fields) = AC.Field[
     fields[bc.index] for bc in b.columns if
     _periodoverride(bc, fields[bc.index]) || _symboloverride(bc, fields[bc.index])
 ]
-_checkstimes(rawoverrides, f::AC.Field) = !any(x -> x === f, rawoverrides)
 
-# A temporal column stays in storage until the filter has run: a view of its
-# stored integers, the claim `_storagebatchcolumn` would materialize.
-function _storageview(f::AC.Field, d::AC.ArrayData, ctx::_ViewContext, checktimes=true)
-    t = f.type
-    checktimes && t isa AC.TimeType && _checktimes(f, t, d, ctx.budget)
-    S = _rawdeclaredbasetype(t)
-    _chargeobject!(ctx.budget, _VIEW_OBJECT_BYTES, "column view")
+# A time-of-day column's stored ticks, not checked against a day's length.
+function _storedticks(f::AC.Field, d::AC.ArrayData, budget)
+    S = _rawdeclaredbasetype(f.type)
+    _chargeobject!(budget, _VIEW_OBJECT_BYTES, "column view")
     nullable = Missing <: _declaredeltype(f, false) || _viewnulls(f, d)
-    return _primitive(nullable ? Union{Missing,S} : S, S, Nothing, d, ctx.budget)
+    return _primitive(nullable ? Union{Missing,S} : S, S, Nothing, d, budget)
 end
 
-# A selected view column's scan output: its gathered rows, or, when no row
-# survived, an empty vector of the element type a full read gives.
-_scanviewoutput(f::AC.Field, col, views::_ViewContext) =
-    isempty(col) ? _vieweltype(f, AC.ArrayData[], views)[] : col
+# ===========================================================================
+# The scan executor: one planner for IPC files, one executor for every source
+# ===========================================================================
 
-function _applyfacadescan(
-    s::IPCStream,
-    plan::_ScanPlan,
-    supplied::Union{Nothing,AllocationBudget}=nothing;
-    stringtype::Type=DataStrings.DataString,
-    ntasks::Int=1,
+# One record batch a scan reads: its decode plan, over a region, fetched
+# ranges, or a stream message's body, and the dictionaries in effect for it.
+struct _ScanRecord{B}
+    plan::_RecordPlan{B}
+    dictionaries::Dict{Int64,ArrayData}
+end
+
+# What decoding one source's record batches needs besides their plans.
+struct _Decoder{F<:AbstractVector{Field}}
+    fields::F
+    fielddictids::IdDict{Field,Int64}
+    validated::AC._ValidatedDictionaries
+    limits::Limits
+end
+
+_decodefield(dec::_Decoder, r::_ScanRecord, j::Int, state::DecodeState) = _decodeplanned(
+    r.plan,
+    j,
+    dec.fields[j],
+    r.dictionaries,
+    dec.fielddictids,
+    dec.limits,
+    dec.validated,
+    state,
 )
-    budget = supplied === nothing ? s.budget : supplied
-    _chargevector!(budget, Field, length(s.corefields), "stream scan source fields")
-    fields = collect(Field, s.corefields)
-    regions = _sourceregions(s, budget)
-    views = _ViewContext(stringtype, budget)
-    return _scanbatches(s.schema, fields, s.batches, regions, plan, budget, views, ntasks)
+
+_rowcount(r::_ScanRecord) = Int(r.plan.rblen)
+
+_columndictionary(dec::_Decoder, r::_ScanRecord, j::Int) =
+    get(r.dictionaries, dec.fielddictids[dec.fields[j]], nothing)
+
+# The dictionaries a stream's view pools may keep for this record batch.
+_recorddictionaries(r::_ScanRecord) = values(r.dictionaries)
+
+# A record batch that arrives decoded, from a C data or C stream import.
+struct _DecodedRecord
+    batch::AC.RecordBatch
 end
 
-# A scan over decoded record batches: every batch of a stream-format read, or
-# one batch of an `Arrow.Stream`. The result keeps `regions`.
-function _scanbatches(
-    schema,
-    fields::Vector{Field},
-    batches,
-    regions,
+_decodefield(::_Decoder, r::_DecodedRecord, j::Int, ::DecodeState) = r.batch.columns[j]
+_rowcount(r::_DecodedRecord) = Int(r.batch.nrows)
+_columndictionary(::_Decoder, r::_DecodedRecord, j::Int) = r.batch.columns[j].dictionary
+# Its columns reach every dictionary in effect (see `_markpools!`).
+_recorddictionaries(r::_DecodedRecord) = r.batch.columns
+
+# What building a scan's columns shares: view pools, ArrowTypes conversion
+# (under `lock`: its caches are not thread-safe), and the fields whose
+# overrides read stored values.
+struct _ScanContext
+    views::_ViewContext
+    arrowtypes::_ArrowTypesContext
+    lock::ReentrantLock
+    rawoverrides::Vector{AC.Field}
+end
+
+_ScanContext(plan::_ScanPlan, fields, views::_ViewContext, arrowtypes) =
+    _ScanContext(views, arrowtypes, ReentrantLock(), _rawoverrides(plan.bound, fields))
+
+"""
+One decoded batch column of a scan, in the public domain: the view a full
+read gives, or the materialized column. A field in `ctx.rawoverrides` reads
+its stored values instead (see `_periodoverride` and `_symboloverride`).
+"""
+function _scanbatchcolumn(f::AC.Field, d::AC.ArrayData, ctx::_ScanContext)
+    if any(x -> x === f, ctx.rawoverrides)
+        f.type isa AC.TimeType && return _storedticks(f, d, ctx.views.budget)
+        return _storagebatchcolumn(f, d, ctx.views.budget)
+    end
+    _viewable(f) && return _viewcolumn(f, AC.ArrayData[d], ctx.views)
+    return @lock ctx.lock _facadesinglecolumn(f, d, ctx.arrowtypes)
+end
+
+# Rows `rows` of batch column `d` of field `f`, in memory the result owns: a
+# string or binary column copies just those values' bytes.
+function _keptcolumn(f::AC.Field, d::AC.ArrayData, rows, ctx::_ScanContext)
+    if _isstringlayout(f.type) && _viewable(f) && !any(x -> x === f, ctx.rawoverrides)
+        return _rowsof(_vieweltype(f, AC.ArrayData[d], ctx.views), d, rows)
+    end
+    return _rowsof(_scanbatchcolumn(f, d, ctx), rows)
+end
+
+# The column a full read of no record batches gives field `f`.
+_emptycolumn(f::AC.Field, ctx::_ScanContext) =
+    _viewable(f) ? _viewcolumn(f, AC.ArrayData[], ctx.views) :
+    @lock ctx.lock _facadecolumn(f, Any[], ctx.arrowtypes)
+
+_filtermask(b::Tables.BoundScan, names, columns, n::Int) =
+    _uninferred(Tables.filtermask, b, _ScanColumns(names, columns, n))::AbstractVector{Bool}
+
+"""
+The rows of a batch of `n` rows where `b`'s filter is `true`, evaluated over
+its filter columns `columns` (named `names`) in chunks of rows on up to
+`ntasks` tasks. A filter that reads no column is row-invariant: one
+evaluation covers the batch.
+"""
+function _matchingrows(b::Tables.BoundScan, names, columns, n::Int, ntasks::Int)
+    isempty(columns) && return _zerofieldpredicate(b.filter) === true ? (1:n) : (1:0)
+    chunk = ntasks > 1 ? max(_STRING_CHUNK_ROWS, cld(n, ntasks)) : max(n, 1)
+    nchunks = cld(n, chunk)
+    nchunks <= 1 && return findall(_filtermask(b, names, columns, n))
+    found = Vector{Vector{Int}}(undef, nchunks)
+    _foreach(nchunks, ntasks) do c, _
+        lo = (c - 1) * chunk + 1
+        hi = min(c * chunk, n)
+        sub = AbstractVector[view(col, lo:hi) for col in columns]
+        found[c] = findall(_filtermask(b, names, sub, hi - lo + 1)) .+ (lo - 1)
+        return nothing
+    end
+    return reduce(vcat, found)
+end
+
+# Decode fields `idxs` of record `r` into `cols` on up to `ntasks` tasks, task
+# `w` with codec state `states[w]`.
+function _decoderecord!(cols, dec::_Decoder, r, idxs, states, ntasks::Int)
+    _foreach(length(idxs), ntasks) do q, w
+        j = idxs[q]
+        cols[j] = _decodefield(dec, r, j, states[w])
+        return nothing
+    end
+    return cols
+end
+
+# Call `work(k, states, tasks)` for each record `k` in `ks` on up to `ntasks`
+# tasks. With fewer records than tasks, each record gets several tasks (and
+# that many codec states) for its own columns and rows.
+function _eachrecord(work, ks, budget, ntasks::Int)
+    isempty(ks) && return nothing
+    outer = min(length(ks), ntasks)
+    inner = max(1, ntasks ÷ outer)
+    states = [DecodeState(budget) for _ = 1:(outer * inner)]
+    try
+        _foreach(length(ks), outer) do q, w
+            work(ks[q], view(states, ((w - 1) * inner + 1):(w * inner)), inner)
+            return nothing
+        end
+    finally
+        foreach(close, states)
+    end
+    return nothing
+end
+
+# The mask over `n` fields that selects fields `idxs`.
+function _fieldmask(idxs, n::Int)
+    mask = falses(n)
+    mask[idxs] .= true
+    return mask
+end
+
+# Whether a scan keeps every row of every batch it reads.
+_selectsonly(b::Tables.BoundScan) =
+    b.filter === nothing && b.limit === nothing && b.offset == 0
+
+"""
+Read scan `plan` from `records`, the record batches it may keep, and return
+its columns, row count, and the offset rows it skipped. Without a filter
+every row of a batch is kept, or `windows[k]`, the rows of record `k` in the
+scan's `offset`/`limit` window. A filter reads its filter columns first and
+the other selected columns only for batches that keep rows; without a
+`limit` or `offset`, batches run on up to `ntasks` tasks, and a batch with
+tasks to spare evaluates the filter in chunks of rows. Kept rows are copied:
+string and binary columns hold just their values' bytes. A scan that keeps
+every row builds the columns a full read builds. `_fetch!(bodies, ks, mask)`
+makes the bodies of the fields `mask` selects of records `ks` readable first.
+"""
+function _runscan(
+    records::Vector,
+    dec::_Decoder,
     plan::_ScanPlan,
-    budget,
-    views::_ViewContext,
+    bodies,
+    ctx::_ScanContext,
+    budget::AllocationBudget;
     ntasks::Int,
+    lazy::Bool,
+    windows=nothing,
 )
-    b = _facadestorage(plan)
-    _chargevector!(budget, AbstractVector, length(fields), "stream scan columns")
-    routes = _ArrowTypesRoutePlan(budget)
-    nrows = sum(b -> Int(b.nrows), batches; init=0)
-    poolof = (bc, field, ctx) -> _retaineddictpool(field, batches, bc.index, ctx)
-    rawoverrides = _rawoverrides(plan.public, fields)
-    if _selectsonly(b) && !isempty(plan.names) && isempty(rawoverrides)
-        # Every row is kept: the selected columns are the full read's.
-        arrowtypes = _ArrowTypesContext(budget=budget)
-        idxs = Int[c.index for c in b.columns]
-        columns = _buildcolumns(fields, batches, idxs, arrowtypes, views, ntasks; lazy=true)
-        got = _scantable(Symbol[c.name for c in b.columns], columns, nrows, budget)
-        return _finishfacadescan(
-            got,
-            schema,
-            fields,
-            plan;
-            regions=regions,
-            budget=budget,
-            poolof=poolof,
-            views=views,
-            public=true,
-        )
+    b = plan.bound
+    fields = dec.fields
+    nf = length(fields)
+    n = length(records)
+    # The batches' rows together must fit an `Int`, whatever the scan keeps.
+    total = 0
+    for r in records
+        total = _addscanrows(total, Int64(_rowcount(r)))
     end
-    # Only the selected and filter-referenced columns are built; the executor
-    # reads no other column (an empty placeholder would fail loudly if it did).
-    needed = falses(length(fields))
-    for c in b.columns
-        needed[c.index] = true
+    skipped = 0
+    if b.filter === nothing && windows === nothing && !_selectsonly(b)
+        windows = fill(1:0, n)
+        rowcounts = Int64[_rowcount(r) for r in records]
+        for (k, skip, take) in _batchwindow(rowcounts, b.offset, b.limit, budget)
+            windows[k] = (Int(skip) + 1):(Int(skip) + Int(take))
+        end
+        skipped = min(b.offset, total)
     end
-    needed[b.filtercols] .= true
-    b.validate && fill!(needed, true)
-    rawcolumns = AbstractVector[
-        needed[i] ?
-        _facadescanrawcolumn(
+    outidx = Int[c.index for c in b.columns]
+    filteridx = _deduplicatesorted!(copy(b.filtercols))
+    decodeidx = _deduplicatesorted!(vcat(outidx, filteridx))
+    if b.filter === nothing && windows === nothing && isempty(ctx.rawoverrides)
+        _fetch!(bodies, 1:n, _fieldmask(decodeidx, nf))
+        _chargevector!(budget, Union{Nothing,ArrayData}, n * nf, "batch columns")
+        decoded = [Vector{Union{Nothing,ArrayData}}(nothing, nf) for _ = 1:n]
+        m = length(decodeidx)
+        states = [DecodeState(budget) for _ = 1:min(ntasks, max(1, n * m))]
+        try
+            _foreach(n * m, ntasks) do item, w
+                k, q = divrem(item - 1, m) .+ (1, 1)
+                j = decodeidx[q]
+                decoded[k][j] = _decodefield(dec, records[k], j, states[w])
+                return nothing
+            end
+        finally
+            foreach(close, states)
+        end
+        batches = [(columns=c,) for c in decoded]
+        columns = _buildcolumns(
             fields,
             batches,
-            i,
-            budget,
-            routes,
-            views,
-            _checkstimes(rawoverrides, fields[i]),
-        ) : Missing[] for i = 1:length(fields)
+            outidx,
+            ctx.arrowtypes,
+            ctx.views,
+            ntasks;
+            lazy=lazy,
+        )
+        return columns, total, 0
+    end
+    firstidx = b.filter === nothing ? decodeidx : filteridx
+    restidx = setdiff(decodeidx, firstidx)
+    firstmask, restmask = _fieldmask(firstidx, nf), _fieldmask(restidx, nf)
+    filternames = Symbol[plan.names[i] for i in filteridx]
+    parts = Matrix{Any}(nothing, length(outidx), n)
+    kept = Vector{Any}(nothing, n)
+    # A filter with a window composes it over the qualifying rows, in order.
+    windowed = b.filter !== nothing && (b.limit !== nothing || b.offset > 0)
+    skip = Ref(Int64(b.offset))
+    take = Ref(b.limit === nothing ? Int64(-1) : Int64(b.limit))
+    # Output columns of the fields `idxs` keep record `k`'s rows, from a filter
+    # column already built (`built[i]`) or from the decoded batch.
+    function gather!(k, cols, idxs, built=nothing)
+        rows = kept[k]
+        for (c, bc) in enumerate(b.columns)
+            i = bc.index
+            insorted(i, idxs) || continue
+            parts[c, k] =
+                built === nothing ? _keptcolumn(fields[i], cols[i]::ArrayData, rows, ctx) :
+                _rowsof(built[i], rows)
+        end
+        return nothing
+    end
+    function first!(k, states, tasks)
+        r = records[k]
+        cols = _decoderecord!(Vector{Any}(nothing, nf), dec, r, firstidx, states, tasks)
+        built = nothing
+        rows = if b.filter === nothing
+            windows === nothing ? (1:_rowcount(r)) : windows[k]
+        else
+            built = Vector{Any}(nothing, nf)
+            for i in filteridx
+                built[i] = _scanbatchcolumn(fields[i], cols[i], ctx)
+            end
+            filtercols = AbstractVector[built[i] for i in filteridx]
+            _matchingrows(b, filternames, filtercols, _rowcount(r), tasks)
+        end
+        if windowed
+            nskip = min(skip[], Int64(length(rows)))
+            skip[] -= nskip
+            ntake =
+                take[] < 0 ? Int64(length(rows)) - nskip :
+                min(take[], Int64(length(rows)) - nskip)
+            take[] < 0 || (take[] -= ntake)
+            rows = rows[(Int(nskip) + 1):(Int(nskip) + Int(ntake))]
+        end
+        isempty(rows) && return nothing
+        kept[k] = rows
+        gather!(k, cols, firstidx, built)
+        return nothing
+    end
+    function rest!(k, states, tasks)
+        cols = _decoderecord!(
+            Vector{Any}(nothing, nf),
+            dec,
+            records[k],
+            restidx,
+            states,
+            tasks,
+        )
+        gather!(k, cols, restidx)
+        return nothing
+    end
+    if windowed
+        states = [DecodeState(budget) for _ = 1:ntasks]
+        try
+            for k = 1:n
+                take[] == 0 && break
+                _fetch!(bodies, k:k, firstmask)
+                first!(k, states, ntasks)
+                if kept[k] !== nothing && !isempty(restidx)
+                    _fetch!(bodies, k:k, restmask)
+                    rest!(k, states, ntasks)
+                end
+                _release!(bodies, k)
+            end
+        finally
+            foreach(close, states)
+        end
+    else
+        ks = windows === nothing ? collect(1:n) : [k for k = 1:n if !isempty(windows[k])]
+        _fetch!(bodies, ks, firstmask)
+        _eachrecord(first!, ks, budget, ntasks)
+        if !isempty(restidx)
+            ks = [k for k in ks if kept[k] !== nothing]
+            _fetch!(bodies, ks, restmask)
+            _eachrecord(rest!, ks, budget, ntasks)
+        end
+    end
+    columns = Vector{AbstractVector}(undef, length(outidx))
+    for c in eachindex(outidx)
+        ps = Any[p for p in view(parts, c, :) if p !== nothing]
+        columns[c] =
+            isempty(ps) ? _emptycolumn(fields[outidx[c]], ctx) : _joinparts(ps, budget)
+    end
+    nrows = 0
+    for rows in kept
+        rows === nothing || (nrows = _addscanrows(nrows, Int64(length(rows))))
+    end
+    windowed && (skipped = Int(b.offset - skip[]))
+    return columns, nrows, skipped
+end
+
+"""
+The Table of scan `plan` over `records`: `_runscan`'s columns under their
+output names with the type overrides applied, the bound schema, and the
+dictionary columns' category pools.
+"""
+function _scantable(
+    records::Vector,
+    dec::_Decoder,
+    plan::_ScanPlan,
+    bodies,
+    ctx::_ScanContext,
+    schema,
+    regions,
+    budget::AllocationBudget;
+    ntasks::Int,
+    lazy::Bool,
+    windows=nothing,
+)
+    columns, nrows, skipped =
+        _runscan(records, dec, plan, bodies, ctx, budget; ntasks, lazy, windows)
+    b = plan.bound
+    fields = dec.fields
+    _chargevector!(budget, AbstractVector, length(columns), "pre-override scan columns")
+    precols = AbstractVector[]
+    sizehint!(precols, length(columns))
+    for (i, bc) in enumerate(b.columns)
+        f = fields[bc.index]
+        col = columns[i]
+        if _periodoverride(bc, f)
+            columns[i] =
+                _uninferred(_timeperiods, f.type, col, Base.nonmissingtype(bc.type))
+            # A real conversion: the output does not keep the time field.
+            push!(precols, Dates.Time[])
+        elseif _symboloverride(bc, f)
+            # The stored strings, without creating a Symbol per value.
+            columns[i] = _uninferred(_applyoverride, bc.type, col, budget)
+            push!(precols, Symbol[])
+        else
+            push!(precols, col)
+            bc.type === nothing ||
+                (columns[i] = _uninferred(_applyoverride, bc.type, col, budget))
+        end
+    end
+    # A dictionary column keeps its category pool, as a full read does, so a
+    # rewrite preserves category order (required when ordered).
+    _chargevector!(budget, Any, length(b.columns), "scan retained dictionary pools")
+    pools = Any[
+        fields[bc.index].type isa DictionaryType && _keepsfield(bc, precols[i]) ?
+        _retainedpool(fields[bc.index], _dictionariesof(dec, records, bc.index), ctx) :
+        nothing for (i, bc) in enumerate(b.columns)
     ]
-    raw = _ScanColumns(plan.names, rawcolumns, nrows)
-    got = _executeplan(raw, b, plan.names, budget)
-    return _finishfacadescan(
-        got,
-        schema,
-        fields,
-        plan;
-        regions=regions,
+    names = Symbol[c.name for c in b.columns]
+    bound = _boundschema(schema, fields, b, precols, budget)
+    return _table(names, columns, bound, regions, nrows, pools, budget), skipped
+end
+
+# The distinct dictionaries of column `j` across `records`, in order.
+function _dictionariesof(dec::_Decoder, records, j::Int)
+    dictionaries = AC.ArrayData[]
+    seen = Base.IdSet{AC.ArrayData}()
+    for r in records
+        d = _columndictionary(dec, r, j)
+        (d === nothing || d in seen) && continue
+        push!(seen, d)
+        push!(dictionaries, d)
+    end
+    return dictionaries
+end
+
+_retainedpool(f::AC.Field, dictionaries, ctx::_ScanContext) =
+    @lock ctx.lock _retainedpool(f, dictionaries, ctx.arrowtypes)
+
+# The record bodies of a scan whose bytes are all in memory are readable.
+_fetch!(::Nothing, ks, mask, extra=NTuple{2,Int64}[]) = nothing
+_release!(::Nothing, k) = nothing
+
+# What fetching a byte-range scan's record bodies needs: the bytes fetched so
+# far, which fields' bodies of each record batch they hold, and each record
+# batch's Block, header, variadic counts, and codec.
+struct _RangedBodies
+    sf::SourceFile
+    spans::FetchedSpans
+    fetched::BitMatrix   # [field, record]
+    blocks::Vector{NTuple{3,Int64}}
+    headers::Vector{Meta.RecordBatch}
+    variadics::Vector{Vector{Int64}}
+    codecs::Vector{Int8}
+    fields::Vector{Field}
+    budget::AllocationBudget
+end
+
+"""
+Fetch the body ranges of the fields `mask` selects of record batches `ks`,
+and the ranges `extra`, that `rb.spans` does not hold yet, in one coalesced
+round. Every planned subtree's metadata is validated first, so a corrupt
+buffer table fails before its ranges are requested.
+"""
+function _fetch!(rb::_RangedBodies, ks, mask, extra=NTuple{2,Int64}[])
+    limits = rb.sf.limits
+    count = Int64(length(extra))
+    masks = BitVector[mask .& .!view(rb.fetched, :, k) for k in ks]
+    for (k, m) in zip(ks, masks)
+        any(m) || continue
+        count = AC.checked_add(
+            count,
+            _validatebodyplan(
+                rb.headers[k],
+                rb.fields,
+                limits,
+                rb.codecs[k],
+                m,
+                rb.variadics[k],
+            ),
+        )
+    end
+    count <= typemax(Int) ||
+        throw(ValidationError("body range count exceeds the host index range"))
+    _chargevector!(rb.budget, NTuple{2,Int64}, count, "body range plan")
+    ranges = Vector{NTuple{2,Int64}}(undef, Int(count))
+    copyto!(ranges, extra)
+    at = length(extra)
+    for (k, mask) in zip(ks, masks)
+        any(mask) || continue
+        rb.fetched[:, k] .|= mask
+        block = rb.blocks[k]
+        buffers = something(rb.headers[k].buffers, Meta.Buffer[])
+        varidx = Ref(1)
+        bufidx = 1
+        for (j, fld) in enumerate(rb.fields)
+            span64 = _bufferspan(fld, rb.variadics[k], varidx)
+            span64 <= typemax(Int) || throw(
+                ValidationError("field buffer span $span64 exceeds the host index range"),
+            )
+            span = Int(span64)
+            if mask[j]
+                for q = bufidx:(bufidx + span - 1)
+                    q <= length(buffers) || throw(
+                        ValidationError(
+                            "metadata declares fewer buffers than the schema requires",
+                        ),
+                    )
+                    buf = buffers[q]
+                    len = Int64(buf.length)
+                    off = Int64(buf.offset)
+                    (off >= 0 && len >= 0 && AC.checked_add(off, len) <= block[3]) || throw(
+                        ValidationError(
+                            "batch buffer [$off, $len] escapes its message body",
+                        ),
+                    )
+                    len == 0 && continue
+                    at += 1
+                    ranges[at] = (block[1] + block[2] + off, len)
+                end
+            end
+            bufidx += span
+        end
+    end
+    at == length(ranges) ||
+        throw(AssertionError("body range preflight count changed during planning"))
+    _chargevector!(rb.budget, NTuple{2,Int64}, length(ranges), "unfetched body ranges")
+    unfetched = filter(r -> _spanholding(rb.spans, r[1], r[2]) == 0, ranges)
+    fetched = _fetchspans(
+        rb.sf,
+        unfetched,
+        rb.sf.gapbytes;
+        budget=rb.budget,
+        what="body range fetch",
+    )
+    _addspans!(rb.spans, fetched, rb.budget)
+    return nothing
+end
+
+# Record `k` is read: a scan that reads batch by batch frees its fetched bytes.
+function _release!(rb::_RangedBodies, k)
+    offset, metalen, bodylen = rb.blocks[k]
+    _dropspans!(rb.spans, offset, offset + metalen + bodylen)
+    return nothing
+end
+
+_gapbytes(sf::SourceFile) = sf.gapbytes
+_gapbytes(::OwnerRegion) = Int64(0)
+
+"""
+Scan `plan` over the IPC file in `src`, a region (whose bytes are all in
+memory) or a byte-range source, with verified footer `ft`. One pass reads
+every Block's metadata: over a source, in coalesced ranges that also cover
+the start of each body, or all of a small body. Row counts from it choose the
+window; then the decode set's dictionaries decode in footer order, and
+`_runscan` reads the record batches. Over a source, the dictionary bodies
+and the first record bodies share one request round, and only the bodies of
+the decode set's buffers are fetched.
+"""
+function _scanfile(
+    src,
+    ft,
+    plan::_ScanPlan,
+    limits::Limits,
+    budget::AllocationBudget,
+    views::_ViewContext,
+    regions;
+    ntasks::Int,
+    lazy::Bool,
+)
+    b = plan.bound
+    fields = ft.fields
+    dictblocks, recordblocks = ft.dictblocks, ft.recordblocks
+    ndict, nrec = length(dictblocks), length(recordblocks)
+    nmeta = ndict + nrec
+    _chargevector!(budget, NTuple{3,Int64}, nmeta, "scan metadata blocks")
+    metablocks = vcat(dictblocks, recordblocks)
+    for (_, metalen, bodylen) in metablocks
+        _checkblocklengths(metalen - 8, bodylen, limits)
+    end
+    # Each block's metadata comes with the start of its body, or all of a small
+    # body: the selected buffers often lie there, and an over-read of a few
+    # hundred KiB costs less than a second request round. A scan with a row
+    # window needs few of the bodies, so it reads metadata alone.
+    gap = _gapbytes(src)
+    limitedfilter = b.filter !== nothing && b.limit !== nothing
+    bodygap = b.limit === nothing && b.offset == 0 ? gap : Int64(0)
+    _chargevector!(budget, NTuple{2,Int64}, nmeta, "metadata range plan")
+    metaranges = NTuple{2,Int64}[
+        (bl[1], AC.checked_add(bl[2], _speculativebody(bl[3], bodygap))) for
+        bl in metablocks
+    ]
+    # A filtered limit may end at its first batch. Coalescing across its
+    # successors' bodies would download those rows before the filter runs.
+    spans = _fetchspans(
+        src,
+        metaranges,
+        limitedfilter ? Int64(0) : gap;
         budget=budget,
-        poolof=poolof,
-        views=views,
+        what="metadata range fetch",
+    )
+    _chargevector!(budget, Tuple{Meta.Message,Int16}, nmeta, "parsed block metadata")
+    msgs = Vector{Meta.Message}(undef, nmeta)
+    versions = Vector{Int16}(undef, nmeta)
+    headertypes = Vector{UInt8}(undef, nmeta)
+    _foreach(nmeta, ntasks) do i, _
+        block = metablocks[i]
+        msg, v, ht, _ =
+            _blockmeta(_spanslice(spans, block[1], block[2]), block, limits, budget)
+        msgs[i], versions[i], headertypes[i] = msg, v, ht
+        return nothing
+    end
+    for i = 1:nmeta
+        isdict = i <= ndict
+        headertypes[i] == (isdict ? UInt8(2) : UInt8(3)) || throw(
+            ValidationError(
+                isdict ? "footer dictionary block is not a dictionary batch" :
+                "footer record block is not a record batch",
+            ),
+        )
+        _filemetadataversion(ft.version, versions[i], versions[1])
+        rejectexperimentalcompression(msgs[i], versions[i], headertypes[i])
+    end
+    # Row counts are in the metadata, not the Footer: a window needs them.
+    _chargevector!(budget, Meta.RecordBatch, nrec, "record-batch headers")
+    headers = Meta.RecordBatch[msgs[ndict + p].header::Meta.RecordBatch for p = 1:nrec]
+    _chargevector!(budget, Vector{Int64}, nrec, "record variadic-count cache")
+    variadics = Vector{Vector{Int64}}(undef, nrec)
+    _chargevector!(budget, Int64, nrec, "scan batch row counts")
+    rowcounts = Vector{Int64}(undef, nrec)
+    _foreach(nrec, ntasks) do p, _
+        variadics[p] = variadiccounts(headers[p])
+        rowcounts[p] =
+            _recordbatchmeta(headers[p], fields, limits, recordblocks[p][3], variadics[p])
+        return nothing
+    end
+    # The file's rows together must fit an `Int`, whatever the scan keeps.
+    total = 0
+    for rows in rowcounts
+        total = _addscanrows(total, rows)
+    end
+    window =
+        b.filter === nothing && (b.limit !== nothing || b.offset > 0) ?
+        _batchwindow(rowcounts, b.offset, b.limit, budget) :
+        Tuple{Int,Int64,Int64}[(p, Int64(0), rowcounts[p]) for p = 1:nrec]
+    decodemask = _fieldmask(
+        _deduplicatesorted!(vcat(Int[c.index for c in b.columns], b.filtercols)),
+        length(fields),
+    )
+    # The decode set's dictionaries decode whole; the others are checked from
+    # their metadata only.
+    needed =
+        isempty(window) ? Set{Int64}() :
+        _neededdictids(fields, ft.fielddictids, ft.dictvaluefields, decodemask, budget)
+    _chargedict!(budget, Int64, Nothing, ndict, "seen dictionary ids")
+    seenids = Set{Int64}()
+    _chargevector!(budget, Int, ndict, "selected dictionary blocks")
+    wanted = Int[]
+    for (i, block) in enumerate(dictblocks)
+        header = msgs[i].header::Meta.DictionaryBatch
+        haskey(ft.dictids, header.id) ||
+            throw(ValidationError("dictionary batch has unknown id $(header.id)"))
+        _dictionarytransition(header.id, header.isDelta, header.id in seenids; file=true)
+        push!(seenids, header.id)
+        rb = header.data
+        vf = ft.dictvaluefields[header.id]
+        rbvariadics = variadiccounts(rb)
+        _recordbatchmeta(rb, (vf,), limits, block[3], rbvariadics)
+        if header.id in needed
+            src isa SourceFile && _validatebodyplan(
+                rb,
+                (vf,),
+                limits,
+                _batchcodec(rb.compression, versions[i]),
+                (true,),
+                rbvariadics,
+            )
+            push!(wanted, i)
+        end
+    end
+    for id in needed
+        id in seenids || throw(
+            ValidationError(
+                "record batch references dictionary id $id before its dictionary batch",
+            ),
+        )
+    end
+    candidates = Int[p for (p, _, _) in window]
+    bodies =
+        src isa SourceFile ?
+        _RangedBodies(
+            src,
+            spans,
+            falses(length(fields), length(candidates)),
+            recordblocks[candidates],
+            headers[candidates],
+            variadics[candidates],
+            Int8[
+                _batchcodec(headers[p].compression, versions[ndict + p]) for p in candidates
+            ],
+            fields,
+            budget,
+        ) : nothing
+    # One round fetches the decode set's dictionary bodies and, unless a
+    # filtered limit reads batch by batch, the bodies `_runscan` reads first.
+    dictranges = NTuple{2,Int64}[
+        (dictblocks[i][1] + dictblocks[i][2], dictblocks[i][3]) for
+        i in wanted if dictblocks[i][3] > 0
+    ]
+    firstmask =
+        b.filter === nothing ? decodemask :
+        _fieldmask(_deduplicatesorted!(copy(b.filtercols)), length(fields))
+    _fetch!(bodies, limitedfilter ? (1:0) : eachindex(candidates), firstmask, dictranges)
+    _chargedict!(budget, Int64, ArrayData, length(wanted), "decoded dictionary table")
+    dicts = Dict{Int64,ArrayData}()
+    _chargedict!(
+        budget,
+        ArrayData,
+        Nothing,
+        length(wanted),
+        "validated dictionary identities",
+    )
+    validated = AC._ValidatedDictionaries()
+    state = DecodeState(budget)
+    try
+        for i in wanted
+            block = dictblocks[i]
+            header = msgs[i].header::Meta.DictionaryBatch
+            vf = ft.dictvaluefields[header.id]
+            decoded = _decodedictionary(
+                header.data,
+                _spanslice(spans, block[1] + block[2], block[3]),
+                versions[i],
+                vf,
+                dicts,
+                ft.fielddictids,
+                limits,
+                state,
+            )
+            _updatedictionary!(
+                dicts,
+                validated,
+                header.id,
+                header.isDelta,
+                vf,
+                decoded,
+                limits,
+                budget;
+                file=true,
+            )
+        end
+    finally
+        close(state)
+    end
+    records = Vector{_ScanRecord{SparseBody}}(undef, length(candidates))
+    _foreach(length(candidates), ntasks) do q, _
+        p = candidates[q]
+        block = recordblocks[p]
+        header = headers[p]
+        _scanmissingdicts(fields, header.nodes, dicts, ft.fielddictids, decodemask)
+        body = SparseBody(block[3], block[1] + block[2], spans)
+        records[q] = _ScanRecord(
+            _recordplan(header, body, versions[ndict + p], fields, limits),
+            dicts,
+        )
+        return nothing
+    end
+    windows =
+        b.filter === nothing && !_selectsonly(b) ?
+        UnitRange{Int}[
+            (Int(skip) + 1):(Int(skip) + Int(take)) for (_, skip, take) in window
+        ] : nothing
+    dec = _Decoder(fields, ft.fielddictids, validated, limits)
+    ctx = _ScanContext(plan, fields, views, _ArrowTypesContext(budget=budget))
+    return _scantable(
+        records,
+        dec,
+        plan,
+        bodies,
+        ctx,
+        _uniqueschema(ft.sch),
+        regions,
+        budget;
+        ntasks,
+        lazy,
+        windows,
     )
 end
 
-_scanrowcount(got) = Int(Tables.rowcount(Tables.columns(got)))
+# Record batch `i` of a file-format stream source, planned to decode the
+# fields `mask` selects, and what fetching its bodies needs (`nothing` when
+# they are in memory).
+_streamrecord(f::ArrowFile, i::Int, budget, mask) =
+    _ScanRecord(_fileplan(f, i, budget, mask), f.dictionaries), nothing
+
+# Over a byte-range source a batch that decodes every field reads its whole
+# block, with read-ahead; one that decodes some reads its metadata with the
+# start of its body, and `_runscan` fetches the planned ranges it lacks.
+function _streamrecord(r::_RangedFile, i::Int, budget, mask)
+    sf = r.sf
+    block = r.recordblocks[i]
+    spans = nothing
+    if all(mask)
+        fm = first(_blockframe(r.blocks, r.recordblocks, i, r.dataend, budget))
+        msg, version, headertype, body = fm.msg, fm.version, fm.header_type, fm.body
+    else
+        range =
+            (block[1], AC.checked_add(block[2], _speculativebody(block[3], sf.gapbytes)))
+        spans = _fetchspans(
+            sf,
+            NTuple{2,Int64}[range],
+            sf.gapbytes;
+            budget=budget,
+            what="metadata range fetch",
+        )
+        meta = _spanslice(spans, block[1], block[2])
+        msg, version, headertype, _ = _blockmeta(meta, block, r.limits, budget)
+        body = SparseBody(block[3], block[1] + block[2], spans)
+    end
+    _filemetadataversion(r.footerversion, version)
+    headertype == UInt8(3) ||
+        throw(ValidationError("footer record block is not a record batch"))
+    rejectexperimentalcompression(msg, version, headertype)
+    header = msg.header::Meta.RecordBatch
+    variadics = variadiccounts(header)
+    _recordbatchmeta(header, r.fields, r.limits, block[3], variadics)
+    _scanmissingdicts(r.fields, header.nodes, r.dictionaries, r.fielddictids, mask)
+    record =
+        _ScanRecord(_recordplan(header, body, version, r.fields, r.limits), r.dictionaries)
+    spans === nothing && return record, nothing
+    bodies = _RangedBodies(
+        sf,
+        spans,
+        falses(length(r.fields), 1),
+        [block],
+        Meta.RecordBatch[header],
+        [variadics],
+        Int8[_batchcodec(header.compression, version)],
+        collect(Field, r.fields),
+        budget,
+    )
+    return record, bodies
+end
+
+"""
+Scan `plan` over the record batches of IPC stream `st` (`records`, planned as
+`_streamrecords` frames them).
+"""
+function _scanstream(
+    st::_StreamState,
+    pending::Vector{PendingRecord},
+    plan::_ScanPlan,
+    budget::AllocationBudget,
+    views::_ViewContext,
+    regions;
+    ntasks::Int,
+    lazy::Bool,
+)
+    b = plan.bound
+    records = _ScanRecord{BufferSlice}[_ScanRecord(p.plan, p.dictionaries) for p in pending]
+    dec = _Decoder(st.fields, st.fielddictids, st.validated, st.limits)
+    ctx = _ScanContext(plan, st.fields, views, _ArrowTypesContext(budget=budget))
+    return _scantable(
+        records,
+        dec,
+        plan,
+        nothing,
+        ctx,
+        _uniqueschema(st.schema),
+        regions,
+        budget;
+        ntasks,
+        lazy,
+    )
+end
 
 "Convert a column with the generic Tables.scan allocation contract."
 function _applyoverride(::Type{T}, col, budget=nothing) where {T}
@@ -3417,780 +2429,7 @@ function _applyoverride(::Type{T}, col, budget=nothing) where {T}
     V = Base.nonmissingtype(T)
     @inbounds for i in eachindex(col)
         x = col[i]
-        out[i] = ismissing(x) ? missing : _overridevalue(V, x)
+        out[i] = ismissing(x) ? missing : convert(V, x)
     end
     return out
-end
-
-# One scan-override value. `convert` is the contract, but the composite rows
-# the facade reads (struct rows as `NamedTuple`s or, for wide or duplicate
-# names, `Vector{Pair}`s; list rows as views) have no `convert` methods to
-# user types, so fully typed named-tuple and vector targets rebuild
-# recursively. Struct fields match by position and the names must agree.
-function _overridevalue(::Type{T}, x) where {T}
-    x isa T && return x
-    if T isa DataType && T <: NamedTuple && x isa NamedTuple
-        names = fieldnames(T)
-        keys(x) == names || throw(
-            ArgumentError("struct row fields $(keys(x)) do not match $(T) fields $(names)"),
-        )
-        return T(
-            ntuple(length(names)) do i
-                v = x[i]
-                v === missing ? missing :
-                _overridevalue(Base.nonmissingtype(fieldtype(T, i)), v)
-            end,
-        )
-    end
-    if T isa DataType && T <: NamedTuple && x isa AbstractVector{<:Pair}
-        names = fieldnames(T)
-        length(x) == length(names) || throw(
-            ArgumentError(
-                "cannot convert a $(length(x))-field struct row to $(T) " *
-                "with $(length(names)) fields",
-            ),
-        )
-        vals = ntuple(length(names)) do i
-            k, v = x[i]
-            Symbol(k) === names[i] || throw(
-                ArgumentError(
-                    "struct row field $(repr(String(k))) does not match " *
-                    "$(T) field $(repr(names[i])) at position $(i)",
-                ),
-            )
-            F = fieldtype(T, i)
-            v === missing ? missing : _overridevalue(Base.nonmissingtype(F), v)
-        end
-        return T(vals)
-    end
-    # A map row (a `MapValue`) converts entry by entry, as a vector of pairs.
-    if T <: AbstractVector && x isa Union{AbstractVector,MapValue}
-        E = eltype(T)
-        N = Base.nonmissingtype(E)
-        return convert(T, E[v === missing ? missing : _overridevalue(N, v) for v in x])
-    end
-    return convert(T, x)
-end
-
-"""
-    Tables.scan(f::ArrowFile, scan)
-    Tables.scan(sf::SourceFile, scan)
-
-Scan an Arrow file handle. `_applyscan` decodes only the selected and
-filter-referenced columns, and only in the batches the footer statistics
-and the window admit. It evaluates the filter per batch, composes
-`offset`/`limit` exactly, and stops as soon as the window is full. The
-request is compiled once against the file schema, and the plan owns the
-type overrides. File and ranged `Arrow.Table(source; scan=…)` use the same
-kernel through the closed `_applyfacadescan` operation. Stream facade scans
-execute post-decode. Every facade path converts private ArrowTypes routes
-before it returns.
-"""
-function Tables.scan(f::ArrowFile, scan::Tables.Scan)
-    budget = _readbudget(f.limits, f.region.len)
-    return _applyscan(f, _compilehandlescan(scan, f.fields, budget), budget)
-end
-
-function Tables.scan(sf::SourceFile, scan::Tables.Scan)
-    budget = _readbudget(sf.limits, sf.len)
-    ft = _rangedfooter(sf, budget)
-    return _applyscan(sf, _compilehandlescan(scan, ft.fields, budget), ft, budget)
-end
-
-# ===========================================================================
-# Per-batch statistics — the official value layout in a footer key
-# ===========================================================================
-
-# Placement is OUR convention (the statistics-schema spec's non-goals
-# explicitly exclude placement); the VALUE layout is the official one:
-#     struct<column: int32, statistics:
-#            map<dictionary<utf8, int32>, dense_union<int64,float64,utf8,bool>>>
-# serialized as one embedded IPC stream with one statistics record batch per
-# data record batch, base64-wrapped into schema-level custom metadata so the
-# tail fetch alone powers pruning.
-const STATS_KEY = "JuliaArrow:batch_statistics.v1"
-const STATS_ROW_COUNT = "ARROW:row_count:exact"
-const STATS_NULL_COUNT = "ARROW:null_count:exact"
-const STATS_MIN = "ARROW:min_value:exact"
-const STATS_MAX = "ARROW:max_value:exact"
-const STATS_KEYPOOL = [STATS_ROW_COUNT, STATS_NULL_COUNT, STATS_MIN, STATS_MAX]
-const _ColumnStats =
-    NamedTuple{(:nullcount, :min, :max),Tuple{Union{Missing,Int64},Any,Any}}
-const _BatchStats =
-    NamedTuple{(:rows, :cols),Tuple{Union{Missing,Int64},Dict{Int,_ColumnStats}}}
-
-function _statsschema()
-    key = Field(
-        "key",
-        DictionaryType(IntType(32, true), Utf8Type(false), false);
-        nullable=false,
-        children=Field[],
-    )
-    value = Field(
-        "value",
-        UnionType(AC.DenseMode, Int8[0, 1, 2, 3]);
-        nullable=false,
-        children=Field[
-            Field("i64", IntType(64, true); nullable=false),
-            Field("f64", FloatType(64); nullable=false),
-            Field("str", Utf8Type(false); nullable=false),
-            Field("bool", BoolType(); nullable=false),
-        ],
-    )
-    entries = Field("entries", StructType(); nullable=false, children=Field[key, value])
-    return Schema(
-        Field[
-            Field("column", IntType(32, true); nullable=true),
-            Field("statistics", MapType(false); nullable=false, children=Field[entries]),
-        ],
-    )
-end
-
-function _bitmapbytes(bits::AbstractVector{Bool})
-    bytes = zeros(UInt8, cld(length(bits), 8))
-    for (i, b) in enumerate(bits)
-        b && (bytes[1 + (i - 1) ÷ 8] |= UInt8(1) << ((i - 1) % 8))
-    end
-    return bytes
-end
-
-function _utf8data(strs::Vector{String})
-    offsets = Int32[0]
-    bytes = UInt8[]
-    for s in strs
-        append!(bytes, codeunits(s))
-        push!(offsets, Int32(length(bytes)))
-    end
-    return ArrayData(
-        Utf8Type(false),
-        length(strs),
-        [BufferSlice(), AC._databuffer(offsets), AC._databuffer(bytes)];
-        nullcount=0,
-    )
-end
-
-"""
-Fold one column's statistics: (null count, min, max) with `nothing` bounds
-for empty, all-null, or unsupported-type columns. Values normalize into the
-union's members: Int64 for integral scalars (dates, times, timestamps, and
-durations are integral in the value domain), Float64, String, Bool. A
-column containing any NaN reports no bounds at all, so no predicate can
-prune on it.
-"""
-function _statfold(f::Field, d::ArrayData)
-    t = f.type
-    # Statistics describe storage-domain values: dictionary columns fold through
-    # their pools, and REE columns fold through their values child. REE and
-    # union parents have no validity bitmap (their physical null count is
-    # always 0, per spec), so their logical null count must be derived or
-    # `isnull` pruning would drop real nulls.
-    statfield = f
-    stat = t
-    while stat isa DictionaryType || stat isa RunEndEncodedType
-        if stat isa DictionaryType
-            statfield = AC.dictvaluefield(statfield, stat)
-            stat = stat.valuetype
-        else
-            statfield = statfield.children[2]
-            stat = statfield.type
-        end
-    end
-    nc = if t isa Union{DictionaryType,RunEndEncodedType,UnionType}
-        count(i -> ismissing(AC.getvalue(f, d, i)), 1:(d.len))
-    else
-        AC.nullcount(d)
-    end
-    supported =
-        stat isa IntType ? (stat.bits <= 64 && (stat.signed || stat.bits < 64)) :
-        stat isa FloatType ||
-        stat isa BoolType ||
-        stat isa Utf8Type ||
-        (stat isa ViewType && stat.utf8) ||
-        stat isa DateType ||
-        stat isa TimeType ||
-        stat isa TimestampType ||
-        stat isa DurationType
-    supported || return nc, nothing, nothing
-    lo = hi = nothing
-    hasnan = false
-    for i = 1:(d.len)
-        # getvalue's own first step is the validity check (or, for
-        # bitmap-less layouts, the logical-null route), so `missing` here is
-        # the one uniform null signal across every layout.
-        v = AC.getvalue(f, d, i)
-        ismissing(v) && continue
-        # Defensive: only interval descriptors yield a `NamedTuple`, and
-        # `supported` already excludes them. A composite value has no usable
-        # order, so drop the bounds rather than compare it.
-        v isa NamedTuple && return nc, nothing, nothing
-        if v isa AbstractFloat && isnan(v)
-            hasnan = true
-            continue
-        end
-        if lo === nothing
-            lo = v
-            hi = v
-        else
-            isless(v, lo) && (lo = v)
-            isless(hi, v) && (hi = v)
-        end
-    end
-    _statnorm(v) =
-        v isa Bool ? v :
-        v isa AbstractString ? String(v) : v isa AbstractFloat ? Float64(v) : Int64(v)
-    return nc,
-    lo === nothing || hasnan ? nothing : _statnorm(lo),
-    hi === nothing || hasnan ? nothing : _statnorm(hi)
-end
-
-"One statistics record batch (the official layout) for one data batch."
-function _statsbatch(
-    statssch::Schema,
-    nrows::Int64,
-    colstats::Vector{Tuple{Int,Int64,Any,Any}},
-)
-    rows = 1 + length(colstats)               # batch-level row + per-column rows
-    colvalid = vcat(false, trues(length(colstats)))
-    colvals = vcat(Int32(0), Int32[Int32(c[1] - 1) for c in colstats])
-    columndata = ArrayData(
-        IntType(32, true),
-        rows,
-        [AC._databuffer(_bitmapbytes(colvalid)), AC._databuffer(colvals)];
-        nullcount=1,
-    )
-    keyidx = Int32[]
-    typeids = Int8[]
-    offsets = Int32[]
-    i64s = Int64[]
-    f64s = Float64[]
-    strs = String[]
-    bools = Bool[]
-    mapoffsets = Int32[0]
-    function pushstat!(key::String, v)
-        push!(keyidx, Int32(findfirst(==(key), STATS_KEYPOOL) - 1))
-        if v isa Bool
-            push!(typeids, Int8(3))
-            push!(offsets, Int32(length(bools)))
-            push!(bools, v)
-        elseif v isa String
-            push!(typeids, Int8(2))
-            push!(offsets, Int32(length(strs)))
-            push!(strs, v)
-        elseif v isa Float64
-            push!(typeids, Int8(1))
-            push!(offsets, Int32(length(f64s)))
-            push!(f64s, v)
-        else
-            push!(typeids, Int8(0))
-            push!(offsets, Int32(length(i64s)))
-            push!(i64s, Int64(v))
-        end
-        return nothing
-    end
-    pushstat!(STATS_ROW_COUNT, nrows)
-    push!(mapoffsets, Int32(length(keyidx)))
-    for (_, nc, lo, hi) in colstats
-        pushstat!(STATS_NULL_COUNT, nc)
-        lo === nothing || pushstat!(STATS_MIN, lo)
-        hi === nothing || pushstat!(STATS_MAX, hi)
-        push!(mapoffsets, Int32(length(keyidx)))
-    end
-    nentries = length(keyidx)
-    pool = _utf8data(String.(STATS_KEYPOOL))
-    keydata = ArrayData(
-        DictionaryType(IntType(32, true), Utf8Type(false), false),
-        nentries,
-        [BufferSlice(), AC._databuffer(keyidx)];
-        dictionary=pool,
-        nullcount=0,
-    )
-    booldata = ArrayData(
-        BoolType(),
-        length(bools),
-        [BufferSlice(), AC._databuffer(_bitmapbytes(bools))];
-        nullcount=0,
-    )
-    valuedata = ArrayData(
-        UnionType(AC.DenseMode, Int8[0, 1, 2, 3]),
-        nentries,
-        [AC._databuffer(typeids), AC._databuffer(offsets)];
-        children=[
-            ArrayData(
-                IntType(64, true),
-                length(i64s),
-                [BufferSlice(), AC._databuffer(i64s)];
-                nullcount=0,
-            ),
-            ArrayData(
-                FloatType(64),
-                length(f64s),
-                [BufferSlice(), AC._databuffer(f64s)];
-                nullcount=0,
-            ),
-            _utf8data(strs),
-            booldata,
-        ],
-        nullcount=0,
-    )
-    entriesdata = ArrayData(
-        StructType(),
-        nentries,
-        [BufferSlice()];
-        children=[keydata, valuedata],
-        nullcount=0,
-    )
-    mapdata = ArrayData(
-        MapType(false),
-        rows,
-        [BufferSlice(), AC._databuffer(mapoffsets)];
-        children=[entriesdata],
-        nullcount=0,
-    )
-    return AC.RecordBatch(statssch, ArrayData[columndata, mapdata], rows)
-end
-
-"""
-    withstatistics(sch, batches) -> Schema
-
-The writer half: fold per-batch column statistics, serialize them as one
-IPC stream in the OFFICIAL statistics value layout (through this very
-writer — statistics ARE Arrow data), and return a schema whose metadata
-carries the base64 blob under `$STATS_KEY`. `writefile(withstatistics(sch,
-batches), batches)` is the whole integration — statistics are pure schema
-metadata; the writer itself is untouched.
-"""
-function withstatistics(sch::Schema, batches::AbstractVector{AC.RecordBatch})
-    statssch = _statsschema()
-    statsbatches = AC.RecordBatch[]
-    for batch in batches
-        colstats = Tuple{Int,Int64,Any,Any}[]
-        fieldref = 1  # official zero-based FieldNode index, plus one for _statsbatch
-        for (f, col) in zip(sch.fields, batch.columns)
-            nc, lo, hi = _statfold(f, col)
-            push!(colstats, (fieldref, nc, lo, hi))
-            fieldref += _fieldnodespan(f)
-        end
-        push!(statsbatches, _statsbatch(statssch, batch.nrows, colstats))
-    end
-    blob = Base64.base64encode(writestream(statssch, statsbatches))
-    # Replace only this private placement key. Keep every other metadata pair,
-    # including duplicate keys and its original order.
-    metadata = Pair{String,String}[]
-    if sch.metadata !== nothing
-        for kv in sch.metadata
-            first(kv) == STATS_KEY || push!(metadata, String(first(kv)) => String(last(kv)))
-        end
-    end
-    push!(metadata, STATS_KEY => blob)
-    return Schema(collect(Field, sch.fields); metadata=metadata, endianness=sch.endianness)
-end
-
-"Validate the canonical outer statistics-schema shape before using values."
-function _validatestatsschema(sch::Schema)
-    length(sch.fields) == 2 ||
-        throw(ArgumentError("statistics schema must have two fields"))
-    column, statistics = sch.fields
-    ct = column.type
-    column.name == "column" &&
-    column.nullable &&
-    ct isa IntType &&
-    ct.bits == 32 &&
-    ct.signed &&
-    isempty(column.children) ||
-        throw(ArgumentError("statistics column field is not nullable int32"))
-    statistics.name == "statistics" &&
-    !statistics.nullable &&
-    statistics.type isa MapType &&
-    length(statistics.children) == 1 ||
-        throw(ArgumentError("statistics field is not a non-null map"))
-    entries = statistics.children[1]
-    !entries.nullable && entries.type isa StructType && length(entries.children) == 2 ||
-        throw(ArgumentError("statistics map entries are not a non-null key/value struct"))
-    key, value = entries.children
-    kt = key.type
-    !key.nullable &&
-    kt isa DictionaryType &&
-    kt.indextype.bits == 32 &&
-    kt.indextype.signed &&
-    kt.valuetype isa Utf8Type &&
-    !kt.valuetype.large &&
-    isempty(key.children) ||
-        throw(ArgumentError("statistics keys are not non-null dictionary<utf8, int32>"))
-    !value.nullable && value.type isa UnionType && value.type.mode == AC.DenseMode ||
-        throw(ArgumentError("statistics values are not a non-null dense union"))
-    return nothing
-end
-
-"Write a statistics-carrying Arrow file: `writefile(withstatistics(sch, batches), batches)`."
-statsfile(sch::Schema, batches::AbstractVector{AC.RecordBatch}; compress::Symbol=:none) =
-    writefile(withstatistics(sch, batches), batches; compress=compress)
-
-# ---- read + prune ---------------------------------------------------------
-
-function _decodebase64budgeted(blob::String, budget::AllocationBudget)
-    encodedbytes = Int64(ncodeunits(blob))
-    maxdecoded = AC.checked_mul(cld(encodedbytes, Int64(4)), Int64(3))
-    maxdecoded <= typemax(Int) ||
-        throw(ValidationError("statistics base64 output is not addressable"))
-    _chargevector!(budget, UInt8, maxdecoded, "statistics base64 output")
-    # Decode into one pre-sized backing store. `Base64.base64decode` grows an
-    # IOBuffer geometrically and can retain several times the final payload.
-    # The upper bound stays charged after resize because Julia may retain it.
-    decoded = Vector{UInt8}(undef, Int(maxdecoded))
-    pipe = Base64.Base64DecodePipe(IOBuffer(blob))
-    Base.readbytes!(pipe, decoded, Int(maxdecoded))
-    return decoded
-end
-
-"""
-Parse the statistics blob back through this reader. A missing key, corrupt
-base64/stream, wrong schema, or wrong batch count degrades to `nothing` (no
-pruning). Exhausting the caller's cumulative allocation budget still throws.
-Returns per-batch `Dict{Int,...}` column stats (1-based top-level indices)
-with `missing` bounds where absent.
-"""
-function _readstats(
-    metadata,
-    nbatches::Int,
-    datafields=nothing;
-    limits::Limits=Limits(),
-    budget::Union{Nothing,AllocationBudget}=nothing,
-)
-    metadata === nothing && return nothing
-    blob = nothing
-    for kv in metadata
-        first(kv) == STATS_KEY && (blob = last(kv))
-    end
-    blob === nothing && return nothing
-    localbudget =
-        budget === nothing ? _readbudget(limits, blob isa String ? sizeof(blob) : 0) :
-        budget
-    try
-        blob isa String || return nothing
-        decoded = _decodebase64budgeted(blob, localbudget)
-        stream = _readstream(decoded, limits, localbudget)
-        length(stream.batches) == nbatches || return nothing
-        _validatestatsschema(stream.schema)
-        colfield, mapfield = stream.schema.fields
-        datafieldcount = datafields === nothing ? 0 : length(datafields)
-        _chargedict!(localbudget, Int, Int, datafieldcount, "statistics field index")
-        wiretotop = Dict{Int,Int}()
-        sizehint!(wiretotop, datafieldcount)
-        totalnodes = 0
-        if datafields !== nothing
-            for (j, f) in enumerate(datafields)
-                wiretotop[totalnodes] = j
-                totalnodes += _fieldnodespan(f)
-            end
-        end
-        _chargevector!(localbudget, _BatchStats, nbatches, "statistics batches")
-        out = _BatchStats[]
-        sizehint!(out, nbatches)
-        for sb in stream.batches
-            cols = materialize(colfield, sb.columns[1], localbudget)
-            maps = materialize(mapfield, sb.columns[2], localbudget)
-            length(cols) == length(maps) ||
-                throw(ArgumentError("statistics columns have different lengths"))
-            rows::Union{Missing,Int64} = missing
-            _chargedict!(
-                localbudget,
-                Int,
-                _ColumnStats,
-                length(cols),
-                "statistics column map",
-            )
-            d = Dict{Int,_ColumnStats}()
-            sizehint!(d, length(cols))
-            for (colref, pairs) in zip(cols, maps)
-                rowcount = missing
-                nullcount = missing
-                minvalue = missing
-                maxvalue = missing
-                for (key, value) in pairs
-                    if key == STATS_ROW_COUNT
-                        rowcount = value
-                    elseif key == STATS_NULL_COUNT
-                        nullcount = value
-                    elseif key == STATS_MIN
-                        minvalue = value
-                    elseif key == STATS_MAX
-                        maxvalue = value
-                    end
-                end
-                # A null `column` reference marks the batch-level entry (the
-                # row count), the same convention the writer emits at
-                # `_statsbatch`.
-                if colref === missing
-                    rc = rowcount
-                    if rc !== missing
-                        rc isa Int64 && rc >= 0 || throw(
-                            ArgumentError(
-                                "statistics row count must be a nonnegative Int64",
-                            ),
-                        )
-                        rows = rc
-                    end
-                    continue
-                end
-                colref isa Integer ||
-                    throw(ArgumentError("statistics column index must be integral"))
-                wire = Int(colref)
-                wire >= 0 || throw(ArgumentError("negative statistics column index"))
-                top = if datafields === nothing
-                    wire + 1
-                else
-                    wire < totalnodes || throw(
-                        ArgumentError("statistics column index exceeds the schema"),
-                    )
-                    get(wiretotop, wire, nothing)
-                end
-                top === nothing && continue  # valid nested-field statistics
-                nc = nullcount
-                if nc !== missing
-                    nc isa Int64 && nc >= 0 || throw(
-                        ArgumentError("statistics null count must be a nonnegative Int64"),
-                    )
-                end
-                d[top] = (nullcount=nc, min=minvalue, max=maxvalue)
-            end
-            if rows !== missing
-                all(s -> s.nullcount === missing || s.nullcount <= rows, values(d)) ||
-                    throw(ArgumentError("statistics null count exceeds row count"))
-            end
-            push!(out, (rows=rows, cols=d))
-        end
-        return out
-    catch e
-        e isa AllocationLimitError && rethrow()
-        e isa InterruptException && rethrow()
-        e isa OutOfMemoryError && rethrow()
-        return nothing
-    end
-end
-
-"Bytewise successor of a prefix, or `nothing` when none exists."
-function _nextprefix(s::String, budget=nothing)
-    _chargevector!(budget, UInt8, ncodeunits(s), "statistics prefix bytes")
-    _chargeobject!(budget, ncodeunits(s) + 16, "statistics prefix String")
-    bytes = collect(codeunits(s))
-    while !isempty(bytes)
-        if bytes[end] < 0xff
-            bytes[end] += 0x01
-            return String(bytes)
-        end
-        pop!(bytes)
-    end
-    return nothing
-end
-
-struct _StatsContext
-    nameindex::Dict{Symbol,Int}
-    prefixes::Dict{String,Union{Nothing,String}}
-end
-
-_statsstartswithcount(::Any) = Int64(0)
-_statsstartswithcount(e::Tables.StrPred) =
-    e.kind == Tables.STR_STARTSWITH ? Int64(1) : Int64(0)
-function _statsstartswithcount(e::Union{Tables.AndExpr,Tables.OrExpr})
-    count = Int64(0)
-    for arg in e.args
-        count = AC.checked_add(count, _statsstartswithcount(arg))
-    end
-    return count
-end
-_statsstartswithcount(e::Tables.NotExpr) = _statsstartswithcount(e.arg)
-
-function _collectstatprefixes!(prefixes, e, budget)
-    if e isa Tables.StrPred
-        if e.kind == Tables.STR_STARTSWITH && !haskey(prefixes, e.s)
-            prefixes[e.s] = _nextprefix(e.s, budget)
-        end
-    elseif e isa Union{Tables.AndExpr,Tables.OrExpr}
-        for arg in e.args
-            _collectstatprefixes!(prefixes, arg, budget)
-        end
-    elseif e isa Tables.NotExpr
-        _collectstatprefixes!(prefixes, e.arg, budget)
-    end
-    return nothing
-end
-
-"Compile the schema and prefix work reused by every statistics batch."
-function _statscontext(filter, names, budget)
-    _chargedict!(budget, Symbol, Int, length(names), "statistics column-name index")
-    nameindex = Dict{Symbol,Int}()
-    sizehint!(nameindex, length(names))
-    for (i, name) in enumerate(names)
-        nameindex[name] = i
-    end
-    nprefixes = _statsstartswithcount(filter)
-    _chargedict!(
-        budget,
-        String,
-        Union{Nothing,String},
-        nprefixes,
-        "statistics prefix index",
-    )
-    prefixes = Dict{String,Union{Nothing,String}}()
-    sizehint!(prefixes, nprefixes)
-    _collectstatprefixes!(prefixes, filter, budget)
-    return _StatsContext(nameindex, prefixes)
-end
-
-# The polarity is deliberate and one-sided: `_statcmp` treats anything but
-# an exact `false` as 'may pass', and `_stateq` treats anything but an exact
-# `true` as 'not provably equal'. Both directions fail toward fetching the
-# batch.
-function _statcmp(f, a, b)
-    return try
-        # Not inferred: statistics and literals are of any type.
-        _uninferred(f, a, b) === false ? false : true
-    catch e
-        e isa InterruptException && rethrow()
-        e isa OutOfMemoryError && rethrow()
-        true   # incomparable literal/stat types: never prune
-    end
-end
-
-function _stateq(a, b)
-    return try
-        (a == b) === true
-    catch e
-        e isa InterruptException && rethrow()
-        e isa OutOfMemoryError && rethrow()
-        false
-    end
-end
-
-const _TrustedStatNumber = Union{
-    Bool,
-    Int8,
-    Int16,
-    Int32,
-    Int64,
-    Int128,
-    UInt8,
-    UInt16,
-    UInt32,
-    UInt64,
-    UInt128,
-    BigInt,
-    Float16,
-    Float32,
-    Float64,
-    BigFloat,
-}
-
-# Statistics may prune only inside domains whose equality and order are the
-# Base numeric/String contracts used to compute min/max. Tables permits custom
-# literal comparison methods; a successful comparison is not proof that those
-# methods agree with the stored bounds' order.
-_trustedstatliteral(v) = v isa Union{_TrustedStatNumber,String}
-_trustedstatliteral(v, s) =
-    s.min isa Union{Bool,Int64,Float64} ? v isa _TrustedStatNumber :
-    s.min isa String ? v isa String : false
-
-# `Tables.In.values` need only support `in(x, values)`. Enumerate only Base
-# containers whose membership is defined by their retained members; every
-# other object disables pruning and goes to the exact row filter untouched.
-_statsmembers(values::Union{Tuple,Array,BitArray,Set,BitSet}) = values
-_statsmembers(values) = nothing
-
-# Whether a batch with statistics `s` may hold one of `members`.
-_maycontainany(members, s) =
-    !all(v -> _trustedstatliteral(v, s), members) ||
-    any(_statcmp(>=, v, s.min) && _statcmp(>=, s.max, v) for v in members)
-
-"""
-One-sided may-contain evaluation of a scan predicate against one batch's
-column statistics: `false` means PROVABLY no row qualifies (prune); `true`
-means fetch and let the exact row filter decide. Comparisons follow SQL
-missing semantics — null rows never satisfy a comparison, so an all-null
-column proves comparison/`colin` predicates false.
-"""
-function _maypass(
-    e::Tables.ScanExpr,
-    stats,
-    names,
-    rowcount::Union{Missing,Int64},
-    context::Union{Nothing,_StatsContext}=nothing,
-)
-    function lookup(col)
-        ref = col.ref
-        i = if ref isa Int
-            1 <= ref <= length(names) ? ref : nothing
-        elseif context !== nothing
-            get(context.nameindex, ref isa String ? Symbol(ref) : ref, nothing)
-        elseif ref isa String
-            findfirst(==(Symbol(ref)), names)
-        else
-            findfirst(==(ref), names)
-        end
-        return i === nothing ? nothing : get(stats, i, nothing)
-    end
-    allnull(s) = s.nullcount !== missing && rowcount !== missing && s.nullcount >= rowcount
-    unknownbounds(s) =
-        s.min === missing ||
-        s.max === missing ||
-        (s.min isa AbstractFloat && isnan(s.min)) ||
-        (s.max isa AbstractFloat && isnan(s.max))
-    if e isa Tables.Cmp
-        s = lookup(e.lhs)
-        s === nothing && return true
-        v = e.rhs
-        _trustedstatliteral(v) || return true
-        allnull(s) && return false
-        unknownbounds(s) && return true
-        _trustedstatliteral(v, s) || return true
-        e.op == Tables.OP_EQ && return _statcmp(>=, v, s.min) && _statcmp(>=, s.max, v)
-        # NE prunes only a provably constant batch equal to the literal:
-        # min == max == v. Anything weaker (including any NaN, where the
-        # equalities are false) must fetch.
-        e.op == Tables.OP_NE && return !(_stateq(s.min, v) && _stateq(s.max, v))
-        e.op == Tables.OP_LT && return _statcmp(<, s.min, v)
-        e.op == Tables.OP_LE && return _statcmp(<=, s.min, v)
-        e.op == Tables.OP_GT && return _statcmp(>, s.max, v)
-        e.op == Tables.OP_GE && return _statcmp(>=, s.max, v)
-        return true    # unknown comparison ops never prune
-    elseif e isa Tables.In
-        s = lookup(e.lhs)
-        s === nothing && return true
-        allnull(s) && return false
-        unknownbounds(s) && return true
-        members = _statsmembers(e.values)
-        members === nothing && return true
-        # `members`' type is known at run time; see `_uninferred`.
-        return _uninferred(_maycontainany, members, s)::Bool
-    elseif e isa Tables.IsNull
-        s = lookup(e.lhs)
-        s === nothing && return true
-        s.nullcount === missing && return true
-        return e.negated ? !allnull(s) : s.nullcount > 0
-    elseif e isa Tables.StrPred
-        e.kind == Tables.STR_STARTSWITH || return true
-        s = lookup(e.lhs)
-        s === nothing && return true
-        unknownbounds(s) && return true
-        _statcmp(>=, s.max, e.s) || return false
-        next = context === nothing ? _nextprefix(e.s) : get(context.prefixes, e.s, nothing)
-        return next === nothing || _statcmp(<, s.min, next)
-    elseif e isa Tables.AndExpr
-        return all(_maypass(a, stats, names, rowcount, context) for a in e.args)
-    elseif e isa Tables.OrExpr
-        return any(_maypass(a, stats, names, rowcount, context) for a in e.args)
-    elseif e isa Tables.NotExpr
-        inner = e.arg
-        if inner isa Tables.Cmp && inner.op == Tables.OP_EQ
-            s = lookup(inner.lhs)
-            s === nothing && return true
-            unknownbounds(s) && return true
-            _trustedstatliteral(inner.rhs, s) || return true
-            # everything equals v only when min == max == v
-            return !(_stateq(s.min, inner.rhs) && _stateq(s.max, inner.rhs))
-        end
-        return true
-    elseif e isa Tables.AlwaysFalse
-        return false
-    end
-    return true    # AlwaysTrue, OpNode, unknown growth: never prune
 end

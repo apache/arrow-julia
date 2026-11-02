@@ -102,42 +102,6 @@ end
         @test outcome.category === :validation
         @test outcome.error isa Arrow.ValidationError
 
-        statsentry = only(
-            entry for entry in SeededFuzz._mutationcorpus() if entry.label === :stats_file
-        )
-        statssnapshot = SeededFuzz._exercise_mutation(statsentry.bytes, :stats_filtered)
-        @test statssnapshot.nrows == 2
-        @test statssnapshot.names == [:id]
-        # The corpus table has two partitions, so every field is nullable.
-        @test statssnapshot.eltypes == Type[Union{Missing,Int64}]
-        @test only(statssnapshot.values) == Int64[4, 5]
-        statsfile = Arrow.readfile(copy(statsentry.bytes))
-        recordspans = [(block[1], block[2] + block[3]) for block in statsfile.recordblocks]
-        @test !any(
-            request -> SeededFuzz._rangesintersect(request, recordspans[1]),
-            statssnapshot.requests,
-        )
-        @test any(
-            request -> SeededFuzz._rangesintersect(request, recordspans[2]),
-            statssnapshot.requests,
-        )
-        @test !any(
-            request -> request == (Int64(0), Int64(length(statsentry.bytes))),
-            statssnapshot.requests,
-        )
-        renamed = copy(statsentry.bytes)
-        namestarts = findall(
-            index -> renamed[index] == UInt8('i') && renamed[index + 1] == UInt8('d'),
-            1:(length(renamed) - 1),
-        )
-        @test length(namestarts) == 2
-        for index in namestarts
-            renamed[index] = UInt8('j')
-        end
-        renamedoutcome = SeededFuzz._classify_mutation(renamed, :stats_filtered)
-        @test renamedoutcome.category === :accepted
-        @test first(renamedoutcome.snapshot.names) === :jd
-
         base = UInt8[0x00, 0x01, 0xff]
         for seed = UInt64(1):UInt64(256), operation in SeededFuzz._MUTATION_OPERATIONS
             mutated, _, _ =
@@ -264,7 +228,7 @@ end
         @test differential.variants == 6 * cases
         @test differential.rewrites == 6 * cases
         @test differential.scanchecks == 54 * cases
-        @test differential.layoutchecks == 49
+        @test differential.layoutchecks == 48
         @test Set([
             :generated_differential,
             :arrowtypes_extension,
@@ -286,15 +250,13 @@ end
             :run_end_encoded,
             :nullable_struct_parent,
             :retained_rewrite,
-            :statistics_pruning,
-            :ranged_no_full_fetch,
         ]) ⊆ differential.coverage
 
         mutations = summary.mutations
         @test mutations.mutations == SeededFuzz.PR_MUTATIONS
         @test sum(values(mutations.counts)) == SeededFuzz.PR_MUTATIONS
         @test mutations.counts[:validation] + mutations.counts[:allocation_limit] > 0
-        @test length(mutations.routecounts) == 41
+        @test length(mutations.routecounts) == 38
         @test mutations.determinismchecks == SeededFuzz.PR_MUTATIONS
         @test Set(keys(mutations.operationcounts)) ==
               Set((:flip, :set, :delete, :insert, :truncate))

@@ -25,9 +25,8 @@ Loading TimeZones.jl adds two things here:
   * Writing: a fresh `TimeZones.ZonedDateTime` column writes as a
     timezone-declared millisecond timestamp, matching Arrow 2.x, instead of
     falling through to reflected-struct lowering.
-  * Scan and retained-write literals: a `ZonedDateTime` lowers exactly to a
-    zone-declared column's storage domain (the UTC instant in the column
-    unit), so filters comparing `ZonedDateTime` values push down.
+  * Retained writes: a `ZonedDateTime` lowers exactly to a zone-declared
+    column's storage domain (the UTC instant in the column unit).
 """
 module ArrowTimeZonesExt
 

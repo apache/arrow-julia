@@ -526,6 +526,50 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test stats.bytes < 64_000_000
     end
 
+    @testset "offset keyword" begin
+        bytes = take!(Arrow.tobuffer(Tables.partitioner([(x=1:4,), (x=5:9,)]); file=true))
+        @test Arrow.Table(bytes; offset=2, limit=3).x == [3, 4, 5]
+        @test Arrow.Table(bytes; offset=7).x == [8, 9]
+        @test Arrow.Table(bytes; filter=Arrow.col(:x) > 2, offset=3).x == [6, 7, 8, 9]
+        @test reduce(
+            vcat,
+            [collect(t.x) for t in Arrow.Stream(bytes; offset=3, limit=4)],
+        ) == 4:7
+        @test Arrow.read(bytes, Tables.columntable; offset=8).x == [9]
+        @test_throws ArgumentError Arrow.Table(bytes; offset=-1)
+        @test_throws ArgumentError Arrow.Table(bytes; offset=1, scan=Tables.Scan())
+    end
+
+    @testset "read mistakes say what to do" begin
+        bytes = take!(Arrow.tobuffer((x=[1, 2],); file=true))
+        io = IOBuffer()
+        Arrow.write(io, (x=[1, 2],))
+        for read in (Arrow.Table, Arrow.Stream)
+            err = try
+                read(io)
+            catch e
+                e
+            end
+            @test err isa ArgumentError && occursin("seekstart(io)", err.msg)
+        end
+        messages = (
+            bytes[1:(end - 12)] => "an Arrow.Writer was not closed",
+            UInt8[] => "the input is empty",
+            UInt8[0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03] => "gzip",
+        )
+        for (input, message) in messages
+            err = try
+                Arrow.Table(input)
+            catch e
+                e
+            end
+            @test err isa Arrow.ValidationError && occursin(message, err.msg)
+        end
+        @test_throws ArgumentError Arrow.Table(bytes; select=Symbol[])
+        @test_throws ArgumentError Arrow.Table(bytes; select=())
+        @test isempty(Tables.columnnames(Arrow.Table(bytes; scan=Tables.Scan(select=()))))
+    end
+
     @testset "scan pushdown through Arrow.Table" begin
         io = IOBuffer()
         Arrow.write(io, (x=collect(Int64, 1:100), y=string.(1:100)))
@@ -866,72 +910,8 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         end
     end
 
-    @testset "exact generic scan budgets" begin
-        x = Union{Missing,Int64}[missing, 2, 3, 4, 5, 6, 7, 8]
-        input = (x=x, y=Int64[9, 8, 7, 6, 5, 4, 3, 2])
-        scan = Tables.Scan(
-            select=(:x,),
-            filter=(Tables.col(:x) > 2) & (Tables.col(:y) < 7),
-            offset=1,
-            limit=2,
-        )
-        bound = Tables.resolve(scan, [:x, :y])
-        V(T, n) = Arrow.AC._materializedvectorbytes(T, n)
-        # Two leaf masks plus the conjunction, the final Bool mask, five
-        # qualifying indexes, then a two-row projected nullable column.
-        needed =
-            V(Symbol, 2) +
-            3 * V(Union{Missing,Bool}, 8) +
-            V(Bool, 8) +
-            V(Int, 5) +
-            V(Symbol, 1) +
-            V(AbstractVector, 1) +
-            V(eltype(x), 2)
-        exact = Arrow.AllocationBudget(needed)
-        got = Arrow._executeplan(input, bound, exact)
-        @test got.x == Union{Missing,Int64}[5, 6]
-        @test Arrow._remaining(exact) == 0
-        @test_throws Arrow.AllocationLimitError Arrow._executeplan(
-            input,
-            bound,
-            Arrow.AllocationBudget(needed - 1),
-        )
-    end
-
     @testset "scan compilation bounds request amplification" begin
-        # One source column can expand to an arbitrary number of requested
-        # aliases. The resolver must reject that request before Tables builds
-        # its output vector.
-        aliases = Tables.Scan(select=fill(:only, 100_000))
-        @test_throws Arrow.AllocationLimitError Arrow._resolvescan(
-            aliases,
-            [:only],
-            Arrow.AllocationBudget(1_000_000),
-        )
-
-        # Regex resolution converts schema Symbols to Strings twice: once in
-        # the bounded preflight and once in Tables.resolve.
-        longname = Symbol(repeat("field", 20_000))
-        regexscan = Tables.Scan(select=(r"absent",), validate=false)
-        @test_throws Arrow.AllocationLimitError Arrow._resolvescan(
-            regexscan,
-            [longname],
-            Arrow.AllocationBudget(100_000),
-        )
-
-        # Filter resolution reconstructs the expression tree. Its width is a
-        # request-controlled resource even over a one-column file.
-        leaf = Tables.col(:only) > 0
-        widefilter = Tables.Scan(filter=Tables.AndExpr(fill(leaf, 100_000)))
-        @test_throws Arrow.AllocationLimitError Arrow._resolvescan(
-            widefilter,
-            [:only],
-            Arrow.AllocationBudget(1_000_000),
-        )
-
         # Scalar conversion has fourteen closed descriptor/unit tokens.
-        # Membership uses them only when the complete public conversion
-        # preserves equality. Abstract inputs must not box each member.
         nvalues = 100_000
         temporal_cases = (
             (
@@ -976,23 +956,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
                 Int64(1_000_000_000),
             ),
         )
-        membership_cases = (temporal_cases[1], temporal_cases[2], temporal_cases[5])
-        needed = Arrow.AC._materializedvectorbytes(Union{Int32,Int64}, nvalues)
-        for (field, values, expected) in membership_cases
-            Arrow._lowermembership(field, values, nothing) # warm the closed kernel
-            @test _allocated(Arrow._lowermembership, field, values, nothing) <= needed
-            exact = Arrow.AllocationBudget(needed)
-            good, lowered = Arrow._lowermembership(field, values, exact)
-            @test good && eltype(lowered) == Union{Int32,Int64}
-            @test all(==(expected), lowered)
-            @test Arrow._remaining(exact) == 0
-            @test_throws Arrow.AllocationLimitError Arrow._lowermembership(
-                field,
-                values,
-                Arrow.AllocationBudget(needed - 1),
-            )
-        end
-
         # Retained-schema column construction hoists the same token through a
         # function barrier. Vector{Any} inputs allocate only the final column,
         # not one dynamically dispatched scalar box per row.
@@ -1007,9 +970,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             )
         end
 
-        # Calendar periods cannot enter the membership kernel, and an integer
-        # has no timestamp public representation: neither lowers, and the
-        # membership path never inspects or rebuilds the caller's container.
+        # An integer has no timestamp public representation.
         timestampfield = Arrow.AC.Field(
             "timestamp",
             Arrow.AC.TimestampType(Arrow.AC.MICROSECOND, nothing);
@@ -1019,53 +980,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             Arrow._facadetoken(timestampfield.type),
             _InterruptingInteger(),
         ) === nothing
-        for (field, values) in ((temporal_cases[5][1], Any[Month(1)]),)
-            good, original = Arrow._lowermembership(field, values, nothing)
-            @test !good
-            @test original === values
-        end
-        secondsfield = Arrow.AC.Field(
-            "seconds",
-            Arrow.AC.DurationType(Arrow.AC.SECOND);
-            nullable=false,
-        )
-        finervalues = Any[Millisecond(1_000)]
-        untouched = Arrow.AllocationBudget(0)
-        good, original = Arrow._lowermembership(secondsfield, finervalues, untouched)
-        @test !good
-        @test original === finervalues
-        @test Arrow._remaining(untouched) == 0
-        rawvalues = Any[_InterruptingInteger()]
-        good, original = Arrow._lowermembership(timestampfield, rawvalues, nothing)
-        @test !good
-        @test original === rawvalues
-
-        # Set has a separate hashing path. Its conservative Dict-style charge
-        # must accept N, reject N-1, and cover the full unique-key allocation.
-        setvalues = Set(Date(2024, 1, 1) + Day(i) for i = 0:(nvalues - 1))
-        setneeded =
-            512 +
-            4 *
-            nvalues *
-            (Base.elsize(Vector{Union{Int32,Int64}}) + Base.elsize(Vector{Nothing}) + 16)
-        Arrow._lowermembership(temporal_cases[1][1], setvalues, nothing)
-        @test _allocated(
-            Arrow._lowermembership,
-            temporal_cases[1][1],
-            setvalues,
-            nothing,
-        ) <= setneeded
-        exact = Arrow.AllocationBudget(setneeded)
-        good, lowered = Arrow._lowermembership(temporal_cases[1][1], setvalues, exact)
-        @test good
-        firstday = Int32(Dates.value(Date(2024, 1, 1) - Date(1970, 1, 1)))
-        @test lowered == Set{Union{Int32,Int64}}(firstday .+ Int32.(0:(nvalues - 1)))
-        @test Arrow._remaining(exact) == 0
-        @test_throws Arrow.AllocationLimitError Arrow._lowermembership(
-            temporal_cases[1][1],
-            setvalues,
-            Arrow.AllocationBudget(setneeded - 1),
-        )
     end
 
     @testset "exact range-fetch worker budgets" begin
@@ -1120,7 +1034,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test (@atomic source.issued) == 0
     end
 
-    @testset "ranged scan uses one cumulative exact budget" begin
+    @testset "ranged scans share one allocation budget" begin
         io = IOBuffer()
         Arrow.write(
             io,
@@ -1132,21 +1046,14 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         )
         bytes = take!(io)
         scan = Tables.Scan(select=(:x,), filter=Tables.col(:x) > 2, offset=1, limit=2)
-        function ranged(cap)
-            handle = Arrow.SourceFile(_BytesSource(bytes); tailbytes=64, gapbytes=0)
-            budget = Arrow.AllocationBudget(cap)
-            footer = Arrow._rangedfooter(handle, budget)
-            bound = Arrow._compilehandlescan(scan, footer.fields, budget)
-            return Arrow._applyscan(handle, bound, footer, budget), budget
-        end
-        probe_limit = Int64(1_000_000_000)
-        got, probe = ranged(probe_limit)
-        @test got.x == [4, 5]
-        needed = probe_limit - Arrow._remaining(probe)
-        exactgot, exact = ranged(needed)
-        @test exactgot.x == [4, 5]
-        @test Arrow._remaining(exact) == 0
-        @test_throws Arrow.AllocationLimitError ranged(needed - 1)
+        ranged(limits) = Arrow.Table(
+            Arrow.SourceFile(_BytesSource(bytes); limits=limits, tailbytes=64, gapbytes=0);
+            scan=scan,
+        )
+        @test ranged(Arrow.Limits()).x == [4, 5]
+        @test_throws Arrow.AllocationLimitError ranged(
+            Arrow.Limits(max_total_allocated_bytes=4096),
+        )
     end
 
     @testset "the allocation limit error" begin
@@ -1178,11 +1085,14 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             # Before parsing succeeds, the path reader owns the map. A parse
             # error must revoke it instead of leaving the source file locked.
             region = Arrow.AC.mmapregion(path)
-            @test_throws Arrow.AC.ValidationError Arrow._readmappedfile(
-                region,
-                Arrow.Limits(max_metadata_bytes=0),
-                nothing,
-            )
+            limits = Arrow.Limits(max_metadata_bytes=0)
+            @test_throws Arrow.AC.ValidationError Arrow._unmaponerror(region, true) do
+                return Arrow._readfile(
+                    region,
+                    limits,
+                    Arrow._readbudget(limits, region.len),
+                )
+            end
             @test_throws InvalidStateException Arrow.AC.sliceptr(
                 Arrow.AC.BufferSlice(region, 0, 1),
             )
@@ -1566,6 +1476,27 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         for bytes in (fb, sb)
             @test_throws ArgumentError Arrow.Table(bytes; scan=rawint)
         end
+        # Zone-free time literals against zone-free timestamps of every unit,
+        # whether or not the literal is exact in the column's unit or range.
+        t0 = DateTime(2020, 1, 2)
+        literals = (
+            t0,
+            t0 + Millisecond(500),
+            Date(2020, 1, 2),
+            Durations.Timestamp{Nanosecond}(t0) + Nanosecond(7),
+            DateTime(1500, 1, 1),
+        )
+        for P in (Second, Millisecond, Microsecond, Nanosecond)
+            tsdata = (ts=[Durations.Timestamp{P}(t0 + Second(k)) for k = -1:1],)
+            io = IOBuffer()
+            Arrow.write(io, tsdata; file=true)
+            bytes = take!(io)
+            for literal in literals, op in (==, !=, <, <=, >, >=)
+                scan = Tables.Scan(filter=Tables.colcmp(op, Tables.col(:ts), literal))
+                got = Arrow.Table(bytes; scan=scan).ts
+                @test isequal(collect(got), Tables.scan(tsdata, scan).ts)
+            end
+        end
     end
 
     @testset "temporal pushdown preserves the complete public domain" begin
@@ -1589,9 +1520,9 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             @test Tables.rowcount(got) == Tables.rowcount(Tables.columns(want))
         end
 
-        # Time predicates stay public. A stored time of day outside [0, 24h)
-        # has no exact Dates.Time (which wraps modulo 24 hours), so reads
-        # refuse it instead of aliasing it onto another time.
+        # A stored time of day outside [0, 24h) has no exact Dates.Time (which
+        # wraps modulo 24 hours), so reads, filtered or not, refuse it instead
+        # of aliasing it onto another time.
         let (type, values, literal) =
                 (Arrow.AC.TimeType(Arrow.AC.SECOND, 32), Int32[0, 86_399], Time(0))
             field, bytes = rawtemporal(type, values)
@@ -1599,7 +1530,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
                 Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), literal)),
                 Tables.Scan(filter=Tables.colin(Tables.col(:v), (literal,))),
             )
-                @test Arrow._ScanPlan(scan, [field]).storage === nothing
                 assertmatches(bytes, scan)
                 @test Tables.rowcount(Arrow.Table(copy(bytes); scan=scan)) == 1
             end
@@ -1616,9 +1546,8 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             @test_throws Arrow.ValidationError Arrow.Table(copy(bytes); scan=scan)
         end
 
-        # Second-unit timestamps used to wrap-alias extreme counts into one
-        # DateTime; as Timestamp{Second} every count is a distinct public
-        # value, so equality lowers and matches exactly one row.
+        # Every Timestamp{Second} count is a distinct public value, so an
+        # extreme count does not alias the epoch: equality matches one row.
         let field_bytes = rawtemporal(
                 Arrow.AC.TimestampType(Arrow.AC.SECOND, nothing),
                 Int64[0, Int64(1) << 61],
@@ -1628,16 +1557,13 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
                 Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), DateTime(1970, 1, 1))),
                 Tables.Scan(filter=Tables.colin(Tables.col(:v), (DateTime(1970, 1, 1),))),
             )
-                @test Arrow._ScanPlan(scan, [field]).storage !== nothing
                 assertmatches(bytes, scan)
                 @test Tables.rowcount(Arrow.Table(copy(bytes); scan=scan)) == 1
             end
         end
 
-        # Date64's millisecond epoch addition is one-to-one but wraps Int64
-        # ordering: equality may lower; ordered comparisons stay public. A
-        # millisecond TIMESTAMP reads as Timestamp{Millisecond} — a total
-        # bijection — so both of its comparisons lower.
+        # Extreme Date64 and millisecond TIMESTAMP counts compare as their
+        # public values do, ordered comparisons included.
         let field_bytes = rawtemporal(
                 Arrow.AC.DateType(Arrow.AC.MILLISECOND_DATE),
                 Int64[typemax(Int64), 0],
@@ -1645,11 +1571,9 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             field, bytes = field_bytes
             eqscan =
                 Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), DateTime(1970, 1, 1)))
-            @test Arrow._ScanPlan(eqscan, [field]).storage !== nothing
             assertmatches(bytes, eqscan)
             ordered =
                 Tables.Scan(filter=Tables.colcmp(<, Tables.col(:v), DateTime(1970, 1, 1)))
-            @test Arrow._ScanPlan(ordered, [field]).storage === nothing
             assertmatches(bytes, ordered)
         end
         let field_bytes = rawtemporal(
@@ -1661,33 +1585,27 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
                 scan = Tables.Scan(
                     filter=Tables.colcmp(op, Tables.col(:v), DateTime(1970, 1, 1)),
                 )
-                @test Arrow._ScanPlan(scan, [field]).storage !== nothing
                 assertmatches(bytes, scan)
             end
         end
 
-        # A coarser Duration literal converts into the column's unit without
-        # touching stored values. A finer literal can overflow while Julia
-        # promotes a stored public value, so it must stay on the public plan.
+        # Duration literals coarser and finer than the column's unit compare
+        # as public values do; a finer one can overflow while Julia promotes
+        # a stored value, in a scan as in the generic executor.
         duration = Arrow.AC.DurationType(Arrow.AC.SECOND)
         field, bytes = rawtemporal(duration, Int64[60])
         coarse = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), Minute(1)))
-        @test Arrow._ScanPlan(coarse, [field]).storage !== nothing
         assertmatches(bytes, coarse)
         coarsein = Tables.Scan(filter=Tables.colin(Tables.col(:v), (Minute(1),)))
-        @test Arrow._ScanPlan(coarsein, [field]).storage !== nothing
         assertmatches(bytes, coarsein)
         finer = Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), Millisecond(60_000)))
-        @test Arrow._ScanPlan(finer, [field]).storage === nothing
         assertmatches(bytes, finer)
         finerin = Tables.Scan(filter=Tables.colin(Tables.col(:v), (Millisecond(60_000),)))
-        @test Arrow._ScanPlan(finerin, [field]).storage === nothing
         assertmatches(bytes, finerin)
 
         field, bytes = rawtemporal(duration, Int64[typemin(Int64)])
         overflow =
             Tables.Scan(filter=Tables.colcmp(==, Tables.col(:v), Millisecond(-1_000_000)))
-        @test Arrow._ScanPlan(overflow, [field]).storage === nothing
         @test_throws InexactError Tables.scan(Arrow.Table(copy(bytes)), overflow)
         @test_throws InexactError Arrow.Table(copy(bytes); scan=overflow)
 
@@ -1958,7 +1876,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             ),
         )
             scan = Tables.Scan(; filter)
-            @test Arrow._ScanPlan(scan, [zfield]).storage !== nothing
             @test collect(Arrow.Table(copy(zbytes); scan).z) == want
         end
         for naive in (DateTime(2026, 1, 2), Ts{Microsecond}(2026, 1, 2))
@@ -1978,7 +1895,6 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         # has no exact storage form; public evaluation still answers exactly
         sub = Zts{Nanosecond,:UTC}(Ts{Nanosecond}(zcol[2].utc) + Nanosecond(1), Dates.UTC)
         subscan = Tables.Scan(filter=Tables.colcmp(<, Tables.col(:z), sub))
-        @test Arrow._ScanPlan(subscan, [zfield]).storage === nothing
         @test collect(Arrow.Table(copy(zbytes); scan=subscan).z) == zcol[1:2]
 
         # The Arrow spec reads an EMPTY timezone string as zone-naive.
@@ -2186,20 +2102,17 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test t5.l == [[1, 2], [3]] && eltype(t5.l) <: Vector
     end
 
-    @testset "zero-field scans hold at the Tables.scan layer too" begin
+    @testset "zero-field scans hold on every path" begin
         sch = Arrow.AC.Schema(Arrow.AC.Field[])
         zb = Arrow.writefile(sch, [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 3)])
-        af = Arrow.readfile(zb)
         for (scan, want) in (
             (Tables.Scan(filter=Tables.AlwaysTrue()), 3),
             (Tables.Scan(filter=Tables.AlwaysTrue(), limit=1, offset=1), 1),
             (Tables.Scan(filter=Tables.isnull(Tables.col(:gone)), validate=false), 3),
             (Tables.Scan(filter=Tables.AlwaysFalse()), 0),
         )
-            got = Tables.scan(af, scan)
-            @test Tables.rowcount(Tables.columns(got)) == want
-            rgot = Tables.scan(Arrow.SourceFile(_BytesSource(zb)), scan)
-            @test Tables.rowcount(Tables.columns(rgot)) == want
+            @test Tables.rowcount(Arrow.Table(copy(zb); scan=scan)) == want
+            @test Tables.rowcount(Arrow.Table(_BytesSource(zb); scan=scan)) == want
         end
         # The facade path allocates nothing proportional to a hostile count:
         # a tiny file claiming a million rows answers limit=1 instantly.
@@ -2218,10 +2131,10 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         # rejects it.
         bad = copy(zb)
         bad[65:68] .= 0x00
-        @test_throws Arrow.AC.ValidationError Arrow.readfile(copy(bad))
-        @test_throws Arrow.AC.ValidationError Tables.scan(
-            Arrow.SourceFile(_BytesSource(copy(bad))),
-            Tables.Scan(),
+        @test_throws Arrow.AC.ValidationError Arrow.Table(copy(bad))
+        @test_throws Arrow.AC.ValidationError Arrow.Table(
+            _BytesSource(copy(bad));
+            scan=Tables.Scan(),
         )
         # Header reads share ONE cumulative budget, as Limits documents:
         # many tiny batches refuse under a bound one batch fits.
@@ -2230,13 +2143,14 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             [Arrow.AC.RecordBatch(sch, Arrow.AC.ArrayData[], 1) for _ = 1:200],
         )
         tight = Arrow.Limits(max_total_allocated_bytes=6000)
-        @test_throws Arrow.AllocationLimitError Tables.scan(
-            Arrow.readfile(copy(many); limits=tight),
-            Tables.Scan(),
+        @test_throws Arrow.AllocationLimitError Arrow.Table(
+            copy(many);
+            limits=tight,
+            scan=Tables.Scan(),
         )
-        @test_throws Arrow.AllocationLimitError Tables.scan(
-            Arrow.SourceFile(_BytesSource(copy(many)); limits=tight),
-            Tables.Scan(),
+        @test_throws Arrow.AllocationLimitError Arrow.Table(
+            Arrow.SourceFile(_BytesSource(copy(many)); limits=tight);
+            scan=Tables.Scan(),
         )
         # A zero-field schema declares no dictionary ids: a footer listing a
         # well-framed dictionary block is orphaned, and the metadata-only
@@ -2266,10 +2180,10 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         append!(doctored, ftr)
         append!(doctored, reinterpret(UInt8, Int32[Int32(length(ftr))]))
         append!(doctored, Arrow.FILE_MAGIC)
-        @test_throws Arrow.AC.ValidationError Arrow.readfile(copy(doctored))
-        @test_throws Arrow.AC.ValidationError Tables.scan(
-            Arrow.SourceFile(_BytesSource(copy(doctored))),
-            Tables.Scan(),
+        @test_throws Arrow.AC.ValidationError Arrow.Table(copy(doctored))
+        @test_throws Arrow.AC.ValidationError Arrow.Table(
+            _BytesSource(copy(doctored));
+            scan=Tables.Scan(),
         )
         # Structural binding is unconditional: an unsupported predicate node
         # rejects even with validate=false, on every facade path.
@@ -2776,8 +2690,8 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         # validation IPC applies accepts such data, as the reference
         # implementation does). A non-nullable field whose batch holds a
         # null therefore READS, as a missing-capable column, on every
-        # entry: the facade, the facade's scan path, and the direct handle
-        # scan — for primitives and through a run-end-encoded wrapper.
+        # entry: a whole read, a scan, and a scan of an opened reader — for
+        # primitives and through a run-end-encoded wrapper.
         AC = Arrow.AC
         f = AC.Field("x", AC.IntType(64, true); nullable=false)
         d = AC.ArrayData(
@@ -2792,7 +2706,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test eltype(Arrow.Table(bytes).x) === Union{Missing,Int64}
         @test isequal(Arrow.Table(bytes; scan=Tables.Scan()).x, [missing, 7])
         for handle in (Arrow.readfile(bytes), Arrow.SourceFile(_BytesSource(bytes)))
-            got = Tables.scan(handle, Tables.Scan())
+            got = Arrow.Table(handle; scan=Tables.Scan())
             @test isequal(got.x, [missing, 7])
             @test eltype(got.x) === Union{Missing,Int64}
         end
@@ -2806,7 +2720,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         bytes2 = Arrow.writefile(sch2, AC.RecordBatch[AC.RecordBatch(sch2, [red], 2)])
         @test isequal(Arrow.Table(bytes2).r, [missing, 7])
         for handle in (Arrow.readfile(bytes2), Arrow.SourceFile(_BytesSource(bytes2)))
-            @test isequal(Tables.scan(handle, Tables.Scan()).r, [missing, 7])
+            @test isequal(Arrow.Table(handle; scan=Tables.Scan()).r, [missing, 7])
         end
         # a dictionary column: a null-free pool under a non-nullable field is
         # Missing-free; a pool holding a null (the schema's one flag cannot
