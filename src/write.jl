@@ -628,6 +628,8 @@ Base.@nospecializeinfer function _writebatch!(
             ntasks=_batchtasks(w, nrows, length(names)),
             w.pool,
         )
+        retained === nothing ||
+            _checkencodedstructs(fields, _retainedfieldfn(retained, names), names)
         # Fields are nullable so later missing values conform (a Writer, or
         # several input partitions); a retained schema keeps its own.
         nullable = (w.oneshot ? several : w.nullable) && retained === nothing
@@ -682,6 +684,35 @@ _nullhint(w::Writer) =
     !w.oneshot && !w.nullable ?
     "; this Arrow.Writer was created with nullable=false, so each column keeps " *
     "the first table's nullability" : ""
+
+"""
+Refuse a `dictencode` column whose retained struct would write as a map: a
+reader gives some struct rows as ordered `name => value` pairs (structs with
+repeated field names or more than 1,024 fields, structs in a list view), and a
+fresh dictionary pool writes those as Arrow maps.
+"""
+function _checkencodedstructs(fields, retainedfield, names)
+    for (j, f) in enumerate(fields)
+        f.type isa AC.DictionaryType || continue
+        r = retainedfield(j)
+        r !== nothing &&
+            !(r.type isa AC.DictionaryType) &&
+            _structasmap(r, AC.dictvaluefield(f, f.type)) &&
+            throw(
+                ArgumentError(
+                    "column $(names[j]) holds struct rows that read as name => value " *
+                    "pairs, which dictionary encoding would write as an Arrow map; " *
+                    "write the column without dictionary encoding (leave it out of " *
+                    "dictencode)",
+                ),
+            )
+    end
+    return nothing
+end
+_structasmap(r::AC.Field, f::AC.Field) =
+    r.type isa AC.StructType && f.type isa AC.MapType ||
+    length(r.children) == length(f.children) &&
+    any(i -> _structasmap(r.children[i], f.children[i]), eachindex(r.children))
 
 "Fix the schema and publish its message (and the file preamble)."
 function _beginwrite!(

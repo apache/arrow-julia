@@ -755,6 +755,28 @@ _rewriteallocations(t) = @allocated Arrow.write(IOBuffer(), t)
         end
     end
 
+    @testset "dictencode refuses struct rows that would write as a map" begin
+        # Repeated field names read as ordered `name => value` pair rows.
+        fa, da = AC.fromjulia("a", Int64[1, 2])
+        fb, db = AC.fromjulia("a", ["x", "y"])
+        st = AC.StructType()
+        f = AC.Field("s", st; nullable=false, children=[fa, fb])
+        sch = AC.Schema([f])
+        d = AC.ArrayData(st, 2, [AC.BufferSlice()]; children=[da, db], nullcount=0)
+        bytes = Arrow.writestream(sch, [AC.RecordBatch(sch, [d], 2)])
+        rows = collect(Arrow.Table(bytes).s)
+        @test isequal(collect(Arrow.Table(_rewrite(bytes)).s), rows)
+        for file in (false, true)
+            err = @test_throws ArgumentError Arrow.write(
+                IOBuffer(),
+                Arrow.Table(bytes);
+                dictencode=true,
+                file,
+            )
+            @test occursin("column s holds struct rows", err.value.msg)
+        end
+    end
+
     @testset "hidden dictionary slots point at one pool value" begin
         for value in (["x"], Int64[1]), nullable in (false, true)
             valuefield, _ = AC.fromjulia("d", value)
