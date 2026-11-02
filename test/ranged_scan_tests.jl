@@ -161,6 +161,22 @@ end
     @test fetched[] >= length(bytes) - 1024
 end
 
+@testset "a read that fetches many ranges at once finds each of them" begin
+    io = IOBuffer()
+    Arrow.Writer(io; file=true) do writer
+        for batch = 1:64
+            Arrow.write(writer, (x=collect((100batch - 99):(100batch)), y=fill(batch, 100)))
+        end
+    end
+    bytes = take!(io)
+    want = Arrow.Table(bytes; select=[:x], filter=Arrow.col(:y) > 8)
+    for gapbytes in (0, 64)
+        source = Arrow.SourceFile(MeteredSource(bytes, Ref(0)); gapbytes)
+        got = Arrow.Table(source; select=[:x], filter=Arrow.col(:y) > 8)
+        @test got.x == want.x == 801:6400
+    end
+end
+
 @testset "small record batches cost few requests" begin
     io = IOBuffer()
     Arrow.Writer(io; file=true) do writer

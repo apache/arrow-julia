@@ -1408,12 +1408,23 @@ function _addspans!(fs::FetchedSpans, new::FetchedSpans, budget)
     n = length(new.starts)
     _chargevector!(budget, Int64, 2n, "fetched span index")
     _chargevector!(budget, BufferSlice, n, "fetched span slices")
-    for k = 1:n
-        at = searchsortedlast(fs.starts, new.starts[k]) + 1
-        insert!(fs.starts, at, new.starts[k])
-        insert!(fs.lens, at, new.lens[k])
-        insert!(fs.slices, at, new.slices[k])
+    if n <= 16
+        for k = 1:n
+            at = searchsortedlast(fs.starts, new.starts[k]) + 1
+            insert!(fs.starts, at, new.starts[k])
+            insert!(fs.lens, at, new.lens[k])
+            insert!(fs.slices, at, new.slices[k])
+        end
+        return fs
     end
+    # A large round sorts once instead of shifting the index once per span.
+    append!(fs.starts, new.starts)
+    append!(fs.lens, new.lens)
+    append!(fs.slices, new.slices)
+    order = sortperm(fs.starts)
+    permute!(fs.starts, order)
+    permute!(fs.lens, order)
+    permute!(fs.slices, order)
     return fs
 end
 
