@@ -326,7 +326,9 @@ end
         )
         for bytes in (whole, batches)
             c = Arrow.Table(bytes).c
-            for rows in ([1, 3, 4], 2:5, [7, 1, 5], [x === "a" for x in cats])
+            mask = [x === "a" for x in cats]
+            for rows in
+                ([1, 3, 4], 2:5, [7, 1, 5], Int32[7, 1, 5], 1:2:7, mask, BitVector(mask))
                 sub = c[rows]
                 @test sub isa PooledArray && isequal(sub, cats[rows])
                 # The dictionary's categories, in its order, unused ones too.
@@ -334,6 +336,7 @@ end
             end
             @test c[[2]] == ["a"] && !(c[[2]] isa Arrow.DictEncoded)
             @test_throws BoundsError c[[8]]
+            @test_throws BoundsError c[Int32[8]]
         end
     end
 

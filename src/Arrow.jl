@@ -45,7 +45,7 @@ using Tables
 import DataAPI
 import DataStrings, DataDecimals, Durations
 import PooledArrays
-using SentinelArrays: ChainedVector
+using SentinelArrays: ChainedVector, ChainedVectorIndex
 import ArrowTypes
 import Dates
 import UUIDs

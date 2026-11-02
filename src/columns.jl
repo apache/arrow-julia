@@ -495,28 +495,26 @@ Base.copy(v::DictEncoded{T}) where {T} = _pooledcopy(T, (v,))
 # The batches of a column copy into one `PooledArray`, whether they share a
 # pool, extend it (delta dictionaries), or replace it.
 Base.copy(c::ChainedVector{T,<:DictEncoded}) where {T} = _pooledcopy(T, c.arrays)
-# Rows of a dictionary column, as of a `PooledArray`, keep the encoding.
+# Rows of a dictionary column, as of a `PooledArray`, keep the encoding: any
+# vector of integer indices or a `Bool` mask.
 function Base.getindex(v::DictEncoded{T}, rows::AbstractVector{<:Integer}) where {T}
     @boundscheck checkbounds(v, rows)
     return _pooledcopy(T, (v,), to_indices(v, (rows,))[1])
 end
-function Base.getindex(
-    c::ChainedVector{T,<:DictEncoded},
-    rows::AbstractVector{Int},
-) where {T}
-    @boundscheck checkbounds(c, rows)
-    return _pooledcopy(T, c.arrays, rows)
-end
-function Base.getindex(c::ChainedVector{T,<:DictEncoded}, rows::UnitRange{Int}) where {T}
-    @boundscheck checkbounds(c, rows)
-    return _pooledcopy(T, c.arrays, rows)
-end
-function Base.getindex(
-    c::ChainedVector{T,<:DictEncoded},
-    rows::AbstractVector{Bool},
-) where {T}
-    @boundscheck checkbounds(c, rows)
-    return _pooledcopy(T, c.arrays, findall(rows))
+Base.getindex(c::ChainedVector{<:Any,<:DictEncoded}, rows::AbstractVector{<:Integer}) =
+    _dictrows(c, rows)
+# As specific as SentinelArrays' methods for these index vectors, so not ambiguous.
+Base.getindex(c::ChainedVector{<:Any,<:DictEncoded}, rows::AbstractVector{Int}) =
+    _dictrows(c, rows)
+Base.getindex(c::ChainedVector{<:Any,<:DictEncoded}, rows::UnitRange{Int}) =
+    _dictrows(c, rows)
+Base.getindex(
+    c::ChainedVector{<:Any,<:DictEncoded},
+    rows::AbstractVector{<:ChainedVectorIndex},
+) = _dictrows(c, Int[Int(i) for i in rows])
+function _dictrows(c::ChainedVector{T}, rows) where {T}
+    checkbounds(c, rows)
+    return _pooledcopy(T, c.arrays, to_indices(c, (rows,))[1])
 end
 
 """

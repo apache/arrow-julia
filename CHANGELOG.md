@@ -96,6 +96,8 @@ code, and what Arrow 2.x can read of files Arrow 3.0 writes.
   stream with the column types an IPC read gives, reading fixed-width values in the
   producer's memory. Memory handed to a consumer is freed once the consumer releases
   it, with nothing to call.
+- Rows of a dictionary column, `t.c[rows]` for any vector of integer indices or a `Bool`
+  mask, are a `PooledArray` with the column's categories, as `copy(t.c)` is.
 - A TimeZones.jl extension that writes `ZonedDateTime` columns, and a CategoricalArrays
   extension that writes ordered `CategoricalArray`s as ordered dictionaries and reports
   `isordered` for ordered dictionary columns.
