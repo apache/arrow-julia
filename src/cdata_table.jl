@@ -217,10 +217,12 @@ Export a Tables.jl table as one record batch through the C data interface: an
 `ArrowSchema` and an `ArrowArray` that Arrow.jl allocates, whose struct array has one
 child per column. The columns are built as [`Arrow.write`](@ref) builds them, with the
 same keywords (`dictencode`, `stringview`, `largelists`, `metadata`, `colmetadata`), so a
-consumer reads what it would read from the IPC bytes. Numbers, booleans, and validity
-bitmaps cross without copying, from `Vector`s of numbers and from an
-[`Arrow.Table`](@ref)'s columns, and must not be modified or resized while the consumer
-reads them; string and list offsets are rebuilt, and string bytes may be copied. The
+consumer reads what it would read from the IPC bytes. A `Vector` of numbers other than
+`Bool`, with no `missing` values, crosses without copying, as do the numbers, booleans,
+and validity bitmaps of an [`Arrow.Table`](@ref)'s columns; what crosses without
+copying must not be modified or resized while the consumer reads it. Booleans and
+`missing` values in Julia vectors are packed into new bitmaps, string and list offsets
+are rebuilt, and string bytes may be copied. The
 consumer moves or releases the two structs; the table's memory stays reachable until it
 has released the array, and what Arrow.jl allocated is freed by later exports or
 garbage collections. A table that needs more than one record batch (several partitions

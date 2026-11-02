@@ -91,12 +91,14 @@ instead of reading the whole stream, for a DuckDB or Polars result larger than m
 
 - Exports use [`Arrow.write`](@ref)'s column construction and keywords: `dictencode`,
   `stringview`, `largelists`, `metadata`, and `colmetadata` mean what they mean there,
-  and the consumer sees the same schema and values as from the IPC bytes. Numbers,
-  booleans, and validity bitmaps cross without copying, from `Vector`s of numbers and
-  from an [`Arrow.Table`](@ref)'s columns, inside lists and structs too. String and list
-  offsets are rebuilt and string bytes may be copied; dates, times, dictionary-encoded
-  columns, and other Julia values are built into new Arrow buffers, as a write builds
-  them. `export_stream!` sends one record batch per `Tables.partitions` partition
+  and the consumer sees the same schema and values as from the IPC bytes. A `Vector` of
+  numbers other than `Bool`, with no `missing` values, crosses without copying, and so
+  do the numbers, booleans, and validity bitmaps of an [`Arrow.Table`](@ref)'s columns,
+  struct fields and list values included. Booleans and `missing` values in Julia vectors
+  are packed into new bitmaps. String and list offsets, a list's own validity bitmap,
+  fixed-size list values, dates, times, timestamps, dictionary-encoded columns, and
+  other Julia values are built into new Arrow buffers, as a write builds them, and
+  string bytes may be copied. `export_stream!` sends one record batch per `Tables.partitions` partition
   (an `Arrow.Stream` is a partition per batch) and splits a batch only when its string
   data outgrows 32-bit offsets; `to_c_data` refuses a table that needs more than one
   batch.
