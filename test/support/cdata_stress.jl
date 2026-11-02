@@ -99,8 +99,8 @@ end
 _registry_count() = lock(REGISTRY_LOCK) do
     length(EXPORTS)
 end
-"Free every export released before the call; a reap frees only what an earlier reap saw released."
-_reapreleased!() = _reap!() + _reap!()
+"Free every export released before the call."
+_reapreleased!() = _reap!()
 "Reap, then count what is still registered."
 _drained() = (_reapreleased!(); _registry_count())
 "The registry key of the export whose struct is at `p`."

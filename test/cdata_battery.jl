@@ -715,20 +715,33 @@ function cdata_battery()
     @assert _drained() == 0
     println("C release entrypoints are exactly-once and repeats are inert ✓")
 
-    # A consumer may read the struct it just released (Arrow C++ checks that its
-    # `release` is NULL), so the reap that first sees an export released keeps its
-    # memory and a later reap frees it. Collections are off so no reap runs between.
+    # A consumer may read a top-level struct it just released in place (Arrow C++
+    # checks that its `release` is NULL), so the reap that frees the export keeps the
+    # two top-level structs for 10 ms, however many reaps run meanwhile. Collections
+    # are off so no other reap runs.
     GC.enable(false)
     try
-        key = _released_export_key()
+        @assert _drained() == 0
+        sp, ap = to_c_data(fromjulia("in-place", Int64[1, 2])...)
+        key = _exportkey(ap)
+        top = Ptr{Cvoid}(sp)
+        retired() = any(r -> r[2] == top, _RETIRED)
+        _release_c!(sp)
+        _release_c!(ap)
+        t0 = time_ns()
+        @assert _reap!() == 1
+        @assert !_registered(key) && retired()
         _reap!()
-        @assert _registered(key)
         _reap!()
-        @assert !_registered(key)
+        time_ns() - t0 < 10_000_000 && @assert retired()
+        @assert unsafe_load(ap).release == C_NULL
+        Libc.systemsleep(0.011)
+        _reap!()
+        @assert !retired()
     finally
         GC.enable(true)
     end
-    println("an export outlives the reap that first sees it released ✓")
+    println("to_c_data's top-level structs outlive their export by 10 ms ✓")
 
     # Consumers call the release callbacks from their own threads and from inside
     # garbage-collector finalizers, so they allocate nothing. (Julia 1.10's call
@@ -757,6 +770,9 @@ function cdata_battery()
     _release_all!(held)
     @assert ontop < 5 * alone (ontop, alone)
     @assert _drained() == before
+    # Once the held exports are freed the registry shrinks, so later reaps walk only
+    # what is registered.
+    @assert length(EXPORTS.slots) <= 16 * max(64, _registry_count())
     println("exports cost the same however many the consumer holds ✓")
 
     # Schema/data mismatch and malformed buffers must fail before either

@@ -106,6 +106,7 @@ import Arrow:
     _rangedfooter,
     _readstats,
     _reap!,
+    _RETIRED,
     _recordbatchmeta,
     _release_c!,
     _remaining,

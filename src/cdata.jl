@@ -30,6 +30,8 @@
 #     GC finalizers. The Julia side keeps each export's roots (the columns,
 #     whose regions keep the buffers alive) and mallocs in `EXPORTS` until the
 #     count reaches zero; later exports or garbage collections free them.
+#     `to_c_data`'s two top-level structs, the only Julia memory a consumer can
+#     read after releasing it, are freed 10 ms after the rest.
 #
 #   * Import: the moved ArrowArray becomes ONE ForeignOwner shared by every
 #     child/dictionary BufferSlice (a single release for the whole tree).
@@ -347,13 +349,14 @@ end
 # One export's Julia roots and native allocations. `live` is a malloc'd count
 # of the C nodes the consumer has not released; every node's `private_data`
 # points at it, so a release callback needs no Julia object. The 8 bytes after
-# the count hold an exported stream's last error message. `seen` is set by the
-# reap that first finds every node released; the next reap frees the export.
-mutable struct Export
-    const roots::Vector{Any}
-    const mallocs::Vector{Ptr{Cvoid}}
-    const live::Ptr{Int64}
-    seen::Bool
+# the count hold an exported stream's last error message. `top` holds
+# `to_c_data`'s two top-level structs (C_NULL for a stream's exports, which fill
+# structs the consumer allocated); see `_RETIRED`.
+struct Export
+    roots::Vector{Any}
+    mallocs::Vector{Ptr{Cvoid}}
+    live::Ptr{Int64}
+    top::Ptr{Cvoid}
 end
 
 const EXPORTS = Dict{Ptr{Int64},Export}()
@@ -362,15 +365,31 @@ const REGISTRY_LOCK = ReentrantLock()
 # sets this to the number still unreleased (at least 64), and reaping costs constant
 # time per export however many exports a consumer holds.
 const _EXPORTS_UNTIL_REAP = Ref(64)
+# The most exports registered since `EXPORTS` last shrank. Deleting keeps the slots a
+# past peak grew, and a reap walks every slot, so a reap that leaves far fewer shrinks it.
+const _EXPORTS_PEAK = Ref(0)
+# The `top` blocks of freed exports, oldest first, with the `time_ns()` of the reap that
+# freed them. A consumer that releases a top-level struct in place may read it after the
+# release callback returns (Arrow C++ checks that its `release` is NULL), and a preempted
+# consumer can take a while to get there, so a reap frees a block only once it has been
+# retired for `_TOP_FREE_AFTER_NS`.
+const _RETIRED = Tuple{UInt64,Ptr{Cvoid}}[]
+const _TOP_FREE_AFTER_NS = UInt64(10_000_000)
 
-function _newexport(roots::Vector{Any})
+# A new export of `roots`; `topsize` bytes for top-level structs it allocates itself.
+function _newexport(roots::Vector{Any}, topsize::Integer=0)
     reap = lock(REGISTRY_LOCK) do
         return (_EXPORTS_UNTIL_REAP[] -= 1) <= 0
     end
     reap && _reap!()
     live = Ptr{Int64}(Libc.calloc(2, 8))
     live == C_NULL && throw(OutOfMemoryError())
-    return Export(roots, Ptr{Cvoid}[live], live, false)
+    top = topsize > 0 ? Libc.malloc(topsize) : C_NULL
+    if topsize > 0 && top == C_NULL
+        Libc.free(live)
+        throw(OutOfMemoryError())
+    end
+    return Export(roots, Ptr{Cvoid}[live], live, top)
 end
 
 function _malloc!(e::Export, n::Integer)
@@ -406,7 +425,9 @@ function __init__()
     # workload left (its pointers come back NULL), and re-arm the reap hook,
     # whose finalizer is not saved.
     empty!(EXPORTS)
+    empty!(_RETIRED)
     _EXPORTS_UNTIL_REAP[] = 64
+    _EXPORTS_PEAK[] = 0
     _REAP_HOOK_ARMED[] = false
     atexit(_setexiting)
     return nothing
@@ -434,28 +455,30 @@ function _register!(e::Export)
     return nothing
 end
 
-# Free every export that an earlier reap found with all its C nodes released, mark
-# the ones released since, and return how many it freed. A release callback counts
-# its node off just before it returns, and the consumer may then read the struct it
-# released, so the reap that first sees an export released keeps it. Runs from
+# Free every export whose C nodes are all released, retire its `top` block, free the
+# blocks retired long enough ago, and return how many exports it freed. Runs from
 # `_newexport` (see `_EXPORTS_UNTIL_REAP`) and from `_ReapHook`, so no caller needs to.
 function _reap!()
     done = Export[]
     lock(REGISTRY_LOCK) do
-        unreleased = 0
+        now = time_ns()
+        peak = _EXPORTS_PEAK[] = max(_EXPORTS_PEAK[], length(EXPORTS))
         for e in values(EXPORTS)
-            if unsafe_load(e.live, :sequentially_consistent) != 0
-                unreleased += 1
-            elseif e.seen
-                push!(done, e)
-            else
-                e.seen = true
-            end
+            unsafe_load(e.live, :sequentially_consistent) == 0 && push!(done, e)
         end
         for e in done
             delete!(EXPORTS, e.live)
+            e.top == C_NULL || push!(_RETIRED, (now, e.top))
         end
-        _EXPORTS_UNTIL_REAP[] = max(64, unreleased)
+        while !isempty(_RETIRED) && now - first(_RETIRED)[1] >= _TOP_FREE_AFTER_NS
+            Libc.free(popfirst!(_RETIRED)[2])
+        end
+        n = length(EXPORTS)
+        if peak > 4 * max(64, n)
+            sizehint!(EXPORTS, n)
+            _EXPORTS_PEAK[] = n
+        end
+        _EXPORTS_UNTIL_REAP[] = max(64, n)
         return nothing
     end
     foreach(_free!, done)
@@ -548,8 +571,8 @@ function _splitdictmetadata(metadata::Union{Nothing,AC.FrozenVector{Pair{String,
     AC.FrozenVector{Pair{String,String}}(values)
 end
 
-# Export the schema tree of `f` into `at`, a consumer-owned struct, or into a
-# malloc'd one. The node is stored last, after its children, so a failed
+# Export the schema tree of `f` into `at`, a struct the caller allocated, or into
+# a malloc'd one. The node is stored last, after its children, so a failed
 # export leaves `at` untouched.
 function _export_schema!(
     e::Export,
@@ -679,14 +702,25 @@ Arrow.jl allocated is freed by later exports or garbage collections.
 """
 function to_c_data(f::Field, d::ArrayData)
     validate_semantic(f, d)
-    e = _newexport(Any[f, d])
+    e = _newexport(Any[f, d], sizeof(CArrowSchema) + sizeof(CArrowArray))
     try
-        sp = _export_schema!(e, f, @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},)))
-        ap = _export_array!(e, d, @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},)))
+        sp = _export_schema!(
+            e,
+            f,
+            @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},));
+            at=Ptr{CArrowSchema}(e.top),
+        )
+        ap = _export_array!(
+            e,
+            d,
+            @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},));
+            at=Ptr{CArrowArray}(e.top + sizeof(CArrowSchema)),
+        )
         _register!(e)
         return sp, ap
     catch
         _free!(e)
+        Libc.free(e.top)
         rethrow()
     end
 end
@@ -718,8 +752,9 @@ _releasethread() = Threads.threadpool() === :foreign ? 1 : Threads.threadid()
 # takes Python's GIL, which PythonCall's main thread keeps), and a thread waiting
 # inside a finalizer stalls every garbage collection. So a finalizer on another
 # thread hands the release to a task on the owner's `thread` (the importing thread,
-# or thread 1), which runs it at its next yield. At exit the release is skipped:
-# Julia runs the finalizers of live objects then, and the process is ending.
+# or thread 1), which runs it at its next yield. At exit, a release that would be
+# handed to another thread is skipped: Julia runs the finalizers of live objects then,
+# and the process is ending.
 function _finalizeowner(o)
     Threads.threadid() == o.thread && return release!(o)
     _EXITING[] && return nothing
