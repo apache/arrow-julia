@@ -2324,20 +2324,33 @@ function _constructarrowtypespart_impl(name::String, v::AbstractVector, logical;
         # all write one field (several string types, two structs stored as
         # Int32 without a label): they write one column of it.
         members = Base.uniontypes(logical)
-        if all(isconcretetype, members)
-            fields = AC.Field[first(_constructpart(name, M[]; context)) for M in members]
-            if all(f -> _conformancemismatch(fields[1], f; exact=true) === nothing, fields)
-                f = fields[1]
-                f = AC.Field(
-                    f.name,
-                    f.type;
-                    nullable=Missing <: _eltypeof(v),
-                    metadata=_fieldmetadata(f),
-                    children=f.children,
+        merged = if all(isconcretetype, members)
+            try
+                fields =
+                    AC.Field[first(_constructpart(name, M[]; context)) for M in members]
+                if all(
+                    f -> _conformancemismatch(fields[1], f; exact=true) === nothing,
+                    fields,
                 )
-                return _constructpart(f, v; context)
+                    f = fields[1]
+                    f = AC.Field(
+                        f.name,
+                        f.type;
+                        nullable=Missing <: _eltypeof(v),
+                        metadata=_fieldmetadata(f),
+                        children=f.children,
+                    )
+                    _constructpart(f, v; context)
+                end
+            catch err
+                # A member whose empty column has no type to infer, or rows the
+                # one field's builder does not take (plain structs), write as
+                # a union.
+                err isa ArgumentError || rethrow()
+                nothing
             end
         end
+        merged === nothing || return merged
         f, d = _arrowtypesunioncolumn(name, v; context)
         return _arrowtypeslogicalfield(context, f, logical), d
     end

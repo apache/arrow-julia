@@ -45,6 +45,33 @@ field(t, j=1) = getfield(t, :schema).fields[j]
 # A map row as the Dict it describes, for comparing with Dict inputs.
 asdict(x) = x === missing ? missing : Dict(x)
 
+# Two plain structs with the same fields.
+struct SameFieldsA
+    a::Int64
+    b::String
+end
+struct SameFieldsB
+    a::Int64
+    b::String
+end
+
+@testset "a Union whose members cannot build as one column writes a union" begin
+    for (v, expected) in (
+        (
+            Union{SameFieldsA,SameFieldsB}[SameFieldsA(1, "x"), SameFieldsB(2, "y")],
+            [(1, "x"), (2, "y")],
+        ),
+        (Union{Int,Vector{Any}}[1, Any[2]], [1, [2]]),
+    )
+        t = Arrow.Table(Arrow.tobuffer((u=v,)))
+        @test field(t).type isa AC.UnionType
+        @test isequal(
+            map(x -> x isa Integer || x isa AbstractVector ? x : Tuple(x), t.u),
+            expected,
+        )
+    end
+end
+
 @testset "plain nested writes" begin
     @testset "lists, with missing rows and values" begin
         cols = (
