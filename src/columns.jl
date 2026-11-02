@@ -900,6 +900,15 @@ function _offsetrows!(
 ) where {O}
     a = Int64(offsets[c.first])
     z = Int64(offsets[c.last + 1])
+    # The chunk reads each of these bytes once: ask for their pages in one
+    # call, not a fault per page (a mapped file's pages map as they are read).
+    GC.@preserve d offsets begin
+        z > a && _willneed(AC.sliceptr(AC.rolebuffer(d, AC.DATA)) + a, Int(z - a))
+        offsets isa Vector && _willneed(
+            Ptr{UInt8}(pointer(offsets, c.first)),
+            (c.last - c.first + 2) * sizeof(O),
+        )
+    end
     if c.copybytes && z > a
         src = AC.subslice(AC.rolebuffer(d, AC.DATA), a, z - a)
         GC.@preserve buf d unsafe_copyto!(
@@ -922,6 +931,24 @@ function _offsetrows!(
         bitoffset,
         c.buf,
     )
+    return nothing
+end
+
+# Advise the kernel to map now the pages holding `n` bytes at `p` (Unix).
+function _willneed(p::Ptr{UInt8}, n::Int)
+    @static if Sys.isunix()
+        n > 0 || return nothing
+        lo = UInt(p) & ~(UInt(AC.Mmap.PAGESIZE) - 1)
+        len = UInt(p) + UInt(n) - lo
+        ccall(
+            :madvise,
+            Cint,
+            (Ptr{Cvoid}, Csize_t, Cint),
+            Ptr{Cvoid}(lo),
+            len,
+            AC.Mmap.MADV_WILLNEED,
+        )
+    end
     return nothing
 end
 
