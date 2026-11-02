@@ -183,8 +183,10 @@ DataFrame(Arrow.Table(path; select=[:id, :fare => :amount], offset=1, limit=3))
 A read that keeps every row reads its columns as a full read does: as views. A read with
 `filter`, `limit`, or `offset` copies the rows it keeps: numbers and other values into
 `Vector`s, strings and binary values into columns that hold just those values' bytes,
-and dictionary columns with their categories. The copies keep nothing else of the source
-alive. A column's element type does not depend on the filter or on the kind of source.
+and dictionary columns with their categories. These copies keep nothing else of the
+source alive, but kept list, map, and struct rows still read their record batch's
+buffers, which stay in memory (or keep the file mapped) as long as the rows do. A
+column's element type does not depend on the filter or on the kind of source.
 
 ## Threads
 

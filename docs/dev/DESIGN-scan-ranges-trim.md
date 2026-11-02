@@ -100,15 +100,16 @@ values, so pushdown and the executor share one three-valued semantics by
 construction (a `missing` predicate excludes the row), and every predicate a
 user can write pushes down: no literal needs a stored-value form.
 
-Column types do not depend on the source kind or on a filter. A read that
-keeps every row of the batches it reads builds the columns a full read
-builds: views of the source, `ChainedVector`s across batches, and string
-columns over the source's bytes. A read with a filter or a window keeps
-copies of its rows: `Vector`s for flat and nested values, string and binary
-columns that hold just their values' bytes, and dictionary columns that keep
-their pool, so a filtered result does not keep a batch's decompressed bytes
-or the mapping alive for a few of its rows. An empty result column has the
-type a read of no batches gives it.
+Element types do not depend on the source kind or on a filter; container
+types do. A read that keeps every row of the batches it reads builds the
+columns a full read builds: views of the source, `ChainedVector`s across
+batches, and string columns over the source's bytes. A read with a filter or
+a window keeps copies of its rows: `Vector`s for flat and nested values,
+string and binary columns that hold just their values' bytes, and dictionary
+columns that keep their pool, so a filtered flat or string column does not
+keep a batch's decompressed bytes or the mapping alive for a few of its rows.
+Kept nested rows still read their batch's child buffers. An empty result
+column has the type a read of no batches gives it.
 
 Properties the composition holds:
 
