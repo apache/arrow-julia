@@ -717,8 +717,8 @@ function cdata_battery()
 
     # A consumer may read a top-level struct it just released in place (Arrow C++
     # checks that its `release` is NULL), so the reap that frees the export keeps the
-    # two top-level structs for 10 ms, however many reaps run meanwhile. Collections
-    # are off so no other reap runs.
+    # two top-level structs for 10 ms, however many reaps run meanwhile; 5 ms in, they
+    # are still there. Collections are off so no other reap runs.
     GC.enable(false)
     try
         @assert _drained() == 0
@@ -731,10 +731,13 @@ function cdata_battery()
         t0 = time_ns()
         @assert _reap!() == 1
         @assert !_registered(key) && retired()
+        Libc.systemsleep(0.005)
         _reap!()
         _reap!()
-        time_ns() - t0 < 10_000_000 && @assert retired()
-        @assert unsafe_load(ap).release == C_NULL
+        if time_ns() - t0 < 10_000_000
+            @assert retired()
+            @assert unsafe_load(ap).release == C_NULL
+        end
         Libc.systemsleep(0.011)
         _reap!()
         @assert !retired()
