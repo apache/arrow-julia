@@ -90,7 +90,7 @@ end
 Symbols last for the rest of the process, so a read interns at most `max_new_symbols`
 new `Symbol` values from `Symbol` columns, and refuses a column that needs more before
 interning any. Such a column can be read as strings: `Arrow.Table(path; select=[:id =>
-String])`.
+String])`. A filter on that column still compares `Symbol`s, so it interns them.
 
 Column names and time-zone names become `Symbol`s too. A read refuses, with a
 `ValidationError`, a name longer than 4096 bytes, a schema that would intern more than

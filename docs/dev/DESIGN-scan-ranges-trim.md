@@ -91,7 +91,7 @@ read it. The planner is the same for both; only the fetch differs.
 | `select` | only the decode set (selected ∪ filter columns) is decoded; `skipfield!` advances the node and buffer cursor past every other field with each buffer-table invariant checked, without slicing, decompressing, or validating its body; over a byte-range source no body range is planned for it |
 | `limit`/`offset` | without a filter, `RecordBatch.length` is wire metadata: batches outside the window are never decoded or fetched; with a filter, the window composes over the qualifying rows, in order, and the scan stops once it is full |
 | `filter` | evaluated per batch over the public values of the filter columns, the values a full read returns; the other selected columns are decoded (and over a byte-range source, fetched) only for batches with a qualifying row |
-| `types` (`ref => T`) | an elementwise `convert` after the scan, as the generic executor applies it. Two overrides read stored values instead: a time of day as a `Dates.Period`, which also reads times outside a day, and a `JuliaLang.Symbol` column as strings, which creates no `Symbol` |
+| `types` (`ref => T`) | an elementwise `convert` after the scan, as the generic executor applies it. Two overrides read stored values for their own output instead: a time of day as a `Dates.Period`, which also reads times outside a day, and a `JuliaLang.Symbol` column as strings, which creates no `Symbol`. Another output of the same column, and a filter on it, read its public values |
 
 The filter is evaluated by the generic evaluator over the batch's public
 values, so pushdown and the executor share one three-valued semantics by

@@ -2193,7 +2193,7 @@ function _batchscan(s::Stream, plan::_ScanPlan, records, bodies, budget; regions
         route = arrowtypes.routeplan
         route === nothing || (route.budget = budget)
         views = _ViewContext(getfield(s, :views), budget)
-        ctx = _ScanContext(plan, _batchfields(src), views, arrowtypes)
+        ctx = _ScanContext(views, arrowtypes)
         _scantable(
             records,
             _decoder(src),

@@ -54,12 +54,7 @@ function _ctable(
     budget = _readbudget(limits, sum(_databytes, batches; init=Int64(0)))
     fields = collect(AC.Field, sch.fields)
     plan = _ScanPlan(Tables.Scan(), fields, budget)
-    ctx = _ScanContext(
-        plan,
-        fields,
-        _ViewContext(stringtype, budget),
-        _ArrowTypesContext(budget=budget),
-    )
+    ctx = _ScanContext(_ViewContext(stringtype, budget), _ArrowTypesContext(budget=budget))
     t, _ = _scantable(
         _DecodedRecord[_DecodedRecord(b) for b in batches],
         _importdecoder(fields, limits),

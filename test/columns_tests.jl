@@ -402,6 +402,36 @@ end
         end
     end
 
+    @testset "raw type overrides apply to their own outputs" begin
+        tbl = (t=[Time(1), Time(2), Time(3)], s=[:a, :b, :c], x=[1, 2, 3])
+        file = arrowbytes(tbl; file=true)
+        ns(h) = Nanosecond(Hour(h))
+        eq(c, v) = Arrow.colcmp(==, Arrow.col(c), v)
+        for src in (arrowbytes(tbl), file, ColumnsBytesSource(file))
+            # Another output of the same column reads its public values.
+            t = Arrow.Table(
+                src;
+                select=[:t, :t => Nanosecond => :tn, :s, :s => String => :s2],
+            )
+            @test t.t == tbl.t && eltype(t.t) == Time && t.tn == ns.(1:3)
+            @test t.s == tbl.s && t.s2 == ["a", "b", "c"]
+            back = Arrow.Table(arrowbytes(t))
+            @test back.t == tbl.t && back.s == tbl.s
+            t = Arrow.Table(src; select=[:t => Nanosecond => :tn, :t], limit=2)
+            @test t.tn == ns.(1:2) && t.t == tbl.t[1:2]
+            # A filter compares public values.
+            t = Arrow.Table(src; select=[:t => Nanosecond], filter=eq(:t, Time(2)))
+            @test t.t == [ns(2)]
+            gt = Arrow.colcmp(>, Arrow.col(:t), Time(1))
+            @test Arrow.Table(src; select=[:t => Nanosecond], filter=gt).t == ns.(2:3)
+            t = Arrow.Table(src; select=[:x, :s => String], filter=eq(:s, :b))
+            @test t.x == [2] && t.s == ["b"]
+            @test isempty(Arrow.Table(src; select=[:s => String], filter=eq(:s, "b")).s)
+            b = only(Arrow.Stream(src; select=[:s => String], filter=eq(:s, :b)))
+            @test b.s == ["b"]
+        end
+    end
+
     @testset "fixed-shape tensors read as arrays" begin
         AC = Arrow.AC
         meta(json) = [
