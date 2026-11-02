@@ -1284,6 +1284,26 @@ function takebuffer!(c::DecodeCursor, needed::Int64=Int64(-1))
     return _decompressbuffer!(c, wire, needed)
 end
 
+# Advise the kernel to map now the pages holding `n` bytes at `p`, which a
+# reader is about to read once each: one request instead of a fault per page
+# of a memory-mapped file (Unix).
+function _willneed(p::Ptr{UInt8}, n::Int)
+    @static if Sys.isunix()
+        n > 0 || return nothing
+        lo = UInt(p) & ~(UInt(AC.Mmap.PAGESIZE) - 1)
+        len = UInt(p) + UInt(n) - lo
+        ccall(
+            :madvise,
+            Cint,
+            (Ptr{Cvoid}, Csize_t, Cint),
+            Ptr{Cvoid}(lo),
+            len,
+            AC.Mmap.MADV_WILLNEED,
+        )
+    end
+    return nothing
+end
+
 """
 Decode one compressed buffer: an Int64 uncompressed-length prefix, then the
 payload. A prefix of -1 means the payload is stored raw and stays a view of
@@ -1355,6 +1375,7 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice, needed::Int64=In
         # region's root must stay reachable for the whole call (Core rule 2).
         got = GC.@preserve out wireregion begin
             src = AC.sliceptr(wire) + 8
+            _willneed(src, Int(payloadlen))
             if c.codec == CODEC_LZ4_FRAME
                 _decode_lz4!(state, src, payloadlen, out, outlen, exact)
             elseif exact
