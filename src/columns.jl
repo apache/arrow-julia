@@ -520,8 +520,9 @@ end
 """
 Rows `rows` (all of them by default) of the dictionary column whose batches
 are `chunks`, as a `PooledArray`. A batch's pool joins the result's when its
-first row is copied: its distinct values, in pool order; duplicate and null
-entries remap, so the PooledArray's invariants hold.
+first row is copied (a copy of a column with no rows takes its batch's
+pool): its distinct values, in pool order; duplicate and null entries remap,
+so the PooledArray's invariants hold.
 """
 function _pooledcopy(::Type{T}, chunks, rows=nothing) where {T}
     R = _ownedtype(T)
@@ -532,6 +533,7 @@ function _pooledcopy(::Type{T}, chunks, rows=nothing) where {T}
         UInt32(length(pool))
     end
     remaps = IdDict{Any,Vector{UInt32}}()
+    remapof(v) = get!(() -> UInt32[ref(_ownedpoolvalue(x)) for x in v.pool], remaps, v.pool)
     ends = cumsum(Int[length(v) for v in chunks])
     n = rows === nothing ? (isempty(ends) ? 0 : ends[end]) : length(rows)
     refs = Vector{UInt32}(undef, n)
@@ -545,13 +547,14 @@ function _pooledcopy(::Type{T}, chunks, rows=nothing) where {T}
         end
         v = chunks[c]
         if v.pool !== lastpool
-            remap =
-                get!(() -> UInt32[ref(_ownedpoolvalue(x)) for x in v.pool], remaps, v.pool)
+            remap = remapof(v)
             lastpool = v.pool
         end
         code = @inbounds v.indices[i - (c == 1 ? 0 : ends[c - 1])]
         refs[k] = code === missing ? ref(missing) : @inbounds remap[Int(code) + 1]
     end
+    # A copy of an empty batch keeps its pool (a chained column has none empty).
+    rows === nothing && n == 0 && foreach(remapof, chunks)
     return PooledArrays.PooledArray(PooledArrays.RefArray(refs), invpool, pool)
 end
 

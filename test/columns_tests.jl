@@ -338,6 +338,25 @@ end
             @test_throws BoundsError c[[8]]
             @test_throws BoundsError c[Int32[8]]
         end
+        # A copy of a column with no rows keeps its categories.
+        vf, vd = Arrow.AC.fromjulia("v", ["x", "y"])
+        dt = Arrow.AC.DictionaryType(Arrow.AC.IntType(8, true), vf.type, false)
+        dd = Arrow.AC.ArrayData(
+            dt,
+            0,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int8[])];
+            dictionary=vd,
+            nullcount=0,
+        )
+        df = Arrow.AC.Field(
+            "c",
+            dt;
+            nullable=false,
+            children=collect(Arrow.AC.Field, vf.children),
+        )
+        sch = Arrow.AC.Schema([df])
+        c = Arrow.Table(Arrow.writestream(sch, [Arrow.AC.RecordBatch(sch, [dd], 0)])).c
+        @test isempty(c) && copy(c).pool == ["x", "y"]
     end
 
     @testset "run-end encoded columns read lazily" begin
