@@ -2765,8 +2765,10 @@ when that child builds.
 function _lowercolumn(f::AC.Field, target, v::AbstractVector, context::_WriterContext)
     name = f.name
     target === nothing && return _inferlowered(f, nothing, v, context)
-    target === VersionNumber &&
-        return Union{Missing,String}[x === missing ? missing : string(x) for x in v]
+    if target === VersionNumber
+        S = any(ismissing, v) ? Union{Missing,String} : String
+        return S[x === missing ? missing : string(x) for x in v]
+    end
     declared = _writerstoragetype!(context, target)
     _checkstoragemissing(target, declared)
     _arrowtypesconcreteorunion(declared) ||

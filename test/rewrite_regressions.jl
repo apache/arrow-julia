@@ -744,6 +744,17 @@ _rewriteallocations(t) = @allocated Arrow.write(IOBuffer(), t)
         @test isequal(collect(Arrow.Table(_rewrite(bytes)).lv), before)
     end
 
+    @testset "VersionNumber columns rewrite" begin
+        v = [v"1.2.3", v"2"]
+        m = Union{Missing,VersionNumber}[v"1", missing]
+        bytes = read(Arrow.tobuffer((v=v, m=m)))
+        for file in (false, true)
+            t = Arrow.Table(_rewrite(bytes; file))
+            @test t.v == v
+            @test isequal(collect(t.m), m)
+        end
+    end
+
     @testset "hidden dictionary slots point at one pool value" begin
         for value in (["x"], Int64[1]), nullable in (false, true)
             valuefield, _ = AC.fromjulia("d", value)
