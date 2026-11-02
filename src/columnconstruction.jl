@@ -3581,6 +3581,11 @@ Base.@nospecializeinfer function _retainedpartof(
     # Values of an abstract element type (a flattened list's, a struct field's)
     # narrow to the types they hold.
     _arrowtypesconcreteorunion(_eltypeof(v)) || (v = map(identity, v))
+    # Values with no type of their own (an all-missing child of `Any` values)
+    # are the field's nulls, whatever its layout.
+    _holdsnull(f) &&
+        _eltypeof(v) === Missing &&
+        return _constructhiddenpart(f, length(v), context)
     _, target, _ = _arrowtypestarget(context.arrowtypes, f)
     if _lowersvalues(f, target, v, context)
         target === nothing || _checktarget(f, target, v)

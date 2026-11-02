@@ -714,6 +714,36 @@ _rewriteallocations(t) = @allocated Arrow.write(IOBuffer(), t)
               AC.RunEndEncodedType
     end
 
+    @testset "a child whose values in a batch are all null rewrites" begin
+        function onebatch(f, d)
+            sch = AC.Schema([f])
+            return Arrow.writestream(sch, [AC.RecordBatch(sch, [d], Int(d.len))])
+        end
+        # Unions whose Int64 child holds only a null, as pyarrow writes them.
+        for sparse in (false, true)
+            fi, di = AC.fromjulia("i", Union{Missing,Int64}[missing for _ = 1:(1 + sparse)])
+            fs, ds = AC.fromjulia("s", sparse ? ["", "x"] : ["x"])
+            t = AC.UnionType(sparse ? AC.SparseMode : AC.DenseMode, Int8[0, 1])
+            buffers = AC.BufferSlice[AC._databuffer(Int8[0, 1])]
+            sparse || push!(buffers, AC._databuffer(Int32[0, 0]))
+            f = AC.Field("u", t; nullable=true, children=[fi, fs])
+            bytes = onebatch(f, AC.ArrayData(t, 2, buffers; children=[di, ds], nullcount=0))
+            @test isequal(collect(Arrow.Table(bytes).u), [missing, "x"])
+            @test isequal(collect(Arrow.Table(_rewrite(bytes)).u), [missing, "x"])
+        end
+        # A list view of structs whose `a` field is all null.
+        fa, da = AC.fromjulia("a", Union{Missing,Int64}[missing, missing])
+        fb, db = AC.fromjulia("b", ["x", "y"])
+        st, lt = AC.StructType(), AC.ListViewType(false)
+        item = AC.Field("item", st; nullable=true, children=[fa, fb])
+        itemdata = AC.ArrayData(st, 2, [AC.BufferSlice()]; children=[da, db], nullcount=0)
+        buffers = [AC.BufferSlice(), AC._databuffer(Int32[0]), AC._databuffer(Int32[2])]
+        f = AC.Field("lv", lt; nullable=true, children=[item])
+        bytes = onebatch(f, AC.ArrayData(lt, 1, buffers; children=[itemdata], nullcount=0))
+        before = collect(Arrow.Table(bytes).lv)
+        @test isequal(collect(Arrow.Table(_rewrite(bytes)).lv), before)
+    end
+
     @testset "hidden dictionary slots point at one pool value" begin
         for value in (["x"], Int64[1]), nullable in (false, true)
             valuefield, _ = AC.fromjulia("d", value)

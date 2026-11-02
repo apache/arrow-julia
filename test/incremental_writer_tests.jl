@@ -728,6 +728,23 @@ batchkinds(bytes) = [
         )
     end
 
+    @testset "a union child with only missing values in a table holds nulls" begin
+        U = Union{Missing,Int,String}
+        tables = [(u=Union{Int,String}[1, "a"],), (u=U["b", missing],), (u=U[missing],)]
+        bytes, errs = writetables(tables)
+        @test all(isnothing, errs)
+        @test isequal(collect(Arrow.Table(bytes).u), U[1, "a", "b", missing, missing])
+        path = joinpath(mktempdir(), "u.arrows")
+        Arrow.Writer(w -> Arrow.write(w, tables[1]), path; file=false)
+        Arrow.append(path, tables[2])
+        @test isequal(collect(Arrow.Table(path).u), U[1, "a", "b", missing])
+        # A struct with a union field, then a table with a null row.
+        S = Union{Missing,NamedTuple{(:a,),Tuple{Union{Int,String}}}}
+        bytes, errs = writetables([(s=S[(a=1,)],), (s=S[missing, (a="x",)],)])
+        @test all(isnothing, errs)
+        @test isequal(fielda.(Arrow.Table(bytes).s), [1, missing, "x"])
+    end
+
     @testset "append to an Arrow 2.x stream" begin
         fixture = read(joinpath(@__DIR__, "fixtures2x", "mixed-two-partitions.arrowbytes"))
         path = joinpath(mktempdir(), "mixed.arrow")
