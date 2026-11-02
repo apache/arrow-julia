@@ -70,7 +70,9 @@ Keywords:
   other column, and a column name or a collection of names adds those.
   `false` writes pooled, categorical, and read dictionary columns as their
   values (DuckDB's `read_arrow` refuses dictionaries); `Arrow.DictEncode`
-  columns stay encoded.
+  columns stay encoded. A column of UUIDs is written unencoded, since pyarrow
+  cannot read a dictionary of `arrow.uuid` values, and an `Arrow.DictEncode`
+  of UUIDs is an error.
 - `dictdeltas`: write the categories a dictionary gains in later partitions
   as delta dictionary batches (see [`Arrow.Writer`](@ref)).
 - `largelists`: declare 64-bit offsets (LargeUtf8, LargeBinary, LargeList).
@@ -566,6 +568,7 @@ Base.@nospecializeinfer function _writepartition!(
         encoded[j] &&
             !(col isa DictEncode) &&
             !_uninferred(_hasrefpool, col)::Bool &&
+            !_uuidvalues(col) &&
             (col = DictEncode(col))
         # Inference from values sees the whole partition, not one batch.
         columns[j] = _uninferred(_narrowcolumn, String(names[j]), col)

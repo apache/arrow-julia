@@ -4032,6 +4032,11 @@ _hasrefpool(x::AbstractVector) =
     Base.nonmissingtype(_eltypeof(x)) !== Union{}
 _hasrefpool(::Any) = false
 
+# Whether a column holds UUIDs, which a pooled column or `dictencode` writes
+# unencoded: pyarrow cannot read a dictionary of arrow.uuid values.
+_uuidvalues(x::AbstractVector) = Base.nonmissingtype(_eltypeof(x)) === UUIDs.UUID
+_uuidvalues(::Any) = false
+
 """
 The values and category pool of a ref-pool column. Pool values that are
 wrappers without an ArrowTypes.jl mapping (CategoricalArrays' values) unwrap
@@ -4130,7 +4135,7 @@ function _constructcolumnparts(
     dictintent =
         (retained !== nothing && retained.type isa AC.DictionaryType) ||
         v isa DictEncode ||
-        (refpools && retained === nothing && _hasrefpool(v))
+        (refpools && retained === nothing && _hasrefpool(v) && !_uuidvalues(v))
     # A dictionary's pool outlives its batch, so it never takes reused buffers.
     context =
         _WriterContext(fieldname; stringview, largelists, pool=dictintent ? nothing : pool)
@@ -4276,8 +4281,7 @@ function _dictcolumnparts(name, fieldname, part, poolhint, retained, growable, c
             ArgumentError(
                 "column $name holds UUIDs, which Arrow.jl does not dictionary-encode: " *
                 "pyarrow cannot read a dictionary of arrow.uuid values. Write the " *
-                "column without dictionary encoding (collect a PooledArray or " *
-                "CategoricalArray, or leave the column out of dictencode)",
+                "column without Arrow.DictEncode",
             ),
         )
         f, d

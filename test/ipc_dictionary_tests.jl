@@ -631,15 +631,21 @@ end
 
 @testset "UUID columns are not dictionary-encoded" begin
     uuids = UUID.(UInt128[1, 2, 1])
+    # pyarrow cannot read a dictionary of arrow.uuid values, so pooled UUIDs and
+    # `dictencode` write the values themselves.
     for (col, kwargs) in (
-        (Arrow.DictEncode(uuids), (;)),
         (PooledArray(uuids), (;)),
+        (PooledArray(Union{Missing,UUID}[uuids; missing]), (;)),
         (uuids, (dictencode=true,)),
+        (uuids, (dictencode=:u,)),
+        (PooledArray(uuids), (dictencode=:u,)),
     )
-        err = @test_throws ArgumentError Arrow.write(IOBuffer(), (u=col,); kwargs...)
-        @test occursin("column u holds UUIDs", err.value.msg)
+        t = Arrow.Table(Arrow.tobuffer((u=col,); kwargs...))
+        @test !(t.u isa Arrow.DictEncoded)
+        @test isequal(collect(t.u), collect(col))
     end
-    @test Arrow.Table(Arrow.tobuffer((u=uuids,))).u == uuids
+    err = @test_throws ArgumentError Arrow.write(IOBuffer(), (u=Arrow.DictEncode(uuids),))
+    @test occursin("column u holds UUIDs", err.value.msg)
 end
 
 @testset "Dictionary pool updates preserve NaN payloads" begin
