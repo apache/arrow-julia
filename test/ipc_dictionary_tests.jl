@@ -16,7 +16,7 @@
 
 module IPCDictionaryTests
 
-using Test, Arrow, Tables, DataDecimals, DataStrings, InlineStrings, UUIDs
+using Test, Arrow, Tables, DataDecimals, DataStrings, InlineStrings, UUIDs, PooledArrays
 const AC = Arrow.AC
 const Meta = Arrow.Meta
 const FB = Arrow.FB
@@ -617,13 +617,7 @@ end
 @testset "Dictionary categories preserve primitive bits" begin
     D = Decimal{20,2,Int128}
     decimals = D[D("1.25"), D("2.50"), D("1.25")]
-    for values in (
-            Int128[1, 2, 1],
-            UInt128[1, 2, 1],
-            UUID.(UInt128[1, 2, 1]),
-            decimals,
-            [[x] for x in decimals],
-        ),
+    for values in (Int128[1, 2, 1], UInt128[1, 2, 1], decimals, [[x] for x in decimals]),
         file in (false, true),
         batchsize in (1, 64)
 
@@ -633,6 +627,19 @@ end
     codes = reinterpret(PrimitiveCode, Int16[1, 2, 1])
     bytes = take!(Arrow.tobuffer((x=Arrow.DictEncode(codes),)))
     @test Arrow.Table(bytes).x == Int16[1, 2, 1]
+end
+
+@testset "UUID columns are not dictionary-encoded" begin
+    uuids = UUID.(UInt128[1, 2, 1])
+    for (col, kwargs) in (
+        (Arrow.DictEncode(uuids), (;)),
+        (PooledArray(uuids), (;)),
+        (uuids, (dictencode=true,)),
+    )
+        err = @test_throws ArgumentError Arrow.write(IOBuffer(), (u=col,); kwargs...)
+        @test occursin("column u holds UUIDs", err.value.msg)
+    end
+    @test Arrow.Table(Arrow.tobuffer((u=uuids,))).u == uuids
 end
 
 @testset "Dictionary pool updates preserve NaN payloads" begin

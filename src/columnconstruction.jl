@@ -4268,7 +4268,19 @@ function _dictcolumnparts(name, fieldname, part, poolhint, retained, growable, c
         candidateindices = codes
     end
     candidatevaluefield, candidatevaluedata = if retained === nothing
-        _constructpart(fieldname, pool; context)
+        f, d = _constructpart(fieldname, pool; context)
+        # A dictionary field's extension label is, to pyarrow, the label of the
+        # dictionary type itself, which arrow.uuid's storage rules out: pyarrow
+        # 25 refuses such a file, its own output included.
+        _fieldmetavalue(f, _EXTENSION_NAME_KEY) == _UUID_EXTENSION && throw(
+            ArgumentError(
+                "column $name holds UUIDs, which Arrow.jl does not dictionary-encode: " *
+                "pyarrow cannot read a dictionary of arrow.uuid values. Write the " *
+                "column without dictionary encoding (collect a PooledArray or " *
+                "CategoricalArray, or leave the column out of dictencode)",
+            ),
+        )
+        f, d
     else
         retainedtype = retained.type::AC.DictionaryType
         constructionfield =
