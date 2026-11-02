@@ -592,6 +592,24 @@ batchkinds(bytes) = [
         @test Arrow.Table(take!(io)).b == ["x", "y", "z", "w"]
     end
 
+    @testset "append unmaps the file before it returns" begin
+        path = joinpath(mktempdir(), "s.arrow")
+        Arrow.write(path, t1; file=false)
+        # Windows refuses to delete or replace a mapped file, so a mapping left
+        # for the GC to release would fail these until a collection ran.
+        enabled = GC.enable(false)
+        try
+            Arrow.append(path, t2)
+            Sys.islinux() && @test !any(contains(path), eachline("/proc/self/maps"))
+            Arrow.write(path, t1; file=false)
+            Arrow.append(path, t2)
+            rm(path)
+        finally
+            GC.enable(enabled)
+        end
+        @test !isfile(path)
+    end
+
     @testset "append reads the stream's metadata and dictionaries, not its batches" begin
         path = tempname()
         parts = Tables.partitioner([

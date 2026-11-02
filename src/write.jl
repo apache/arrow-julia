@@ -868,7 +868,13 @@ function append(path::AbstractString, tbl; kwargs...)
     isfile(path) && filesize(path) > 0 || return write(path, tbl; file=false, kwargs...)
     # Mapped, so only the bytes framing reads (metadata, dictionaries) are read.
     region = open(io -> AC._mmapregion(io, path; eager=false), path)
-    keep, tail = _appendbytes(region, tbl; kwargs...)
+    # The tail is owned bytes, so the mapping goes before the file is written:
+    # Windows refuses to delete or replace a mapped file.
+    keep, tail = try
+        _appendbytes(region, tbl; kwargs...)
+    finally
+        AC._unmap!(region)
+    end
     open(path, "r+") do io
         seek(io, keep)
         Base.write(io, tail)
