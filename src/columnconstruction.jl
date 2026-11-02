@@ -2757,8 +2757,11 @@ own: the element type's, or a runtime type's in an abstract column.
 function _mappedvalues(v::AbstractVector, context::_WriterContext)
     T = Base.nonmissingtype(_eltypeof(v))
     T === Union{} && return false
+    # `nothing` is not lowered: its storage is a null, which only its label
+    # tells from `missing`.
     mapped(S) =
         S !== VersionNumber &&
+        S !== Nothing &&
         !(S <: Union{Int128,UInt128}) &&
         _writerstoragetype!(context, S) !== S
     isconcretetype(T) && return mapped(T)
@@ -2856,7 +2859,11 @@ function _inferlowered(f::AC.Field, target, v::AbstractVector, context::_WriterC
             push!(runtimes, T)
             target === nothing || _checkabstractlabel(f, target, T, context)
         end
-        mapped = T === VersionNumber ? string(x) : _writertoarrow(context, x, T, name, f)
+        # Without a label, `nothing` stays itself for the field's builder to
+        # refuse: its storage is a null, which would read back as `missing`.
+        mapped =
+            T === VersionNumber ? string(x) :
+            T === Nothing && target === nothing ? x : _writertoarrow(context, x, T, name, f)
         values[i] = mapped
         _pushobserved!(observed, seen, typeof(mapped), name)
     end
@@ -3703,8 +3710,8 @@ function _constructretainedpart(f::AC.Field, v::AbstractVector, context::_Writer
         ),
     )
     if t isa AC.NullType
-        # `Nothing` is a logical type's Null storage.
-        all(x -> x === missing || x === nothing, v) || throw(
+        # `nothing` is Null storage only where a label lowered a value to it.
+        all(x -> x === missing || (x === nothing && context.lowered), v) || throw(
             ArgumentError(
                 "column $(f.name) no longer matches its retained Arrow NullType; " *
                 "give it a Missing element type",

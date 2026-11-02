@@ -794,6 +794,55 @@ batchkinds(bytes) = [
         )
     end
 
+    @testset "`nothing` is written as a value, never as a missing value" begin
+        # A union's `JuliaLang.Nothing` child keeps a later table's `nothing`s,
+        # also in a table of nothing else.
+        U = Union{Missing,Nothing,Int}
+        for (tables, values) in (
+            (
+                [(x=Union{Nothing,Int}[nothing, 1],), (x=[nothing, nothing],)],
+                U[nothing, 1, nothing, nothing],
+            ),
+            (
+                [(x=U[missing, nothing, 1],), (x=[nothing],)],
+                U[missing, nothing, 1, nothing],
+            ),
+            (
+                [(x=[Union{Nothing,Int}[nothing, 1]],), (x=[[nothing]],)],
+                [U[nothing, 1], U[nothing]],
+            ),
+        )
+            bytes, errs = writetables(tables)
+            @test all(isnothing, errs)
+            @test isequal(collect(Arrow.Table(bytes).x), values)
+        end
+        # A field without such a child has no place for `nothing`.
+        for (t1, t2) in (
+            ((x=[1],), (x=Union{Nothing,Int}[nothing, 2],)),
+            ((x=[1],), (x=[nothing],)),
+            ((x=[missing],), (x=[nothing],)),
+            ((x=["a"],), (x=Union{Nothing,Symbol}[nothing, :b],)),
+            ((x=[(u=1,)],), (x=[(u=nothing,), (u=2,)],)),
+            ((x=[[1]],), (x=[Union{Nothing,Int}[nothing, 2]],)),
+        )
+            bytes, errs = writetables([t1, t2])
+            @test errs[1] === nothing && refused(errs[2], :x)
+            @test isequal(collect(Arrow.Table(bytes).x), t1.x)
+        end
+        path = joinpath(mktempdir(), "x.arrows")
+        Arrow.write(path, (x=Union{Missing,Int}[1, missing],); file=false)
+        err =
+            @test_throws ArgumentError Arrow.append(path, (x=Union{Nothing,Int}[nothing],))
+        @test refused(err.value, :x)
+        Arrow.Writer(
+            w -> Arrow.write(w, (x=Union{Nothing,Int}[nothing, 1],)),
+            path;
+            file=false,
+        )
+        Arrow.append(path, (x=[nothing],))
+        @test isequal(collect(Arrow.Table(path).x), [nothing, 1, nothing])
+    end
+
     @testset "a union child with only missing values in a table holds nulls" begin
         U = Union{Missing,Int,String}
         tables = [(u=Union{Int,String}[1, "a"],), (u=U["b", missing],), (u=U[missing],)]

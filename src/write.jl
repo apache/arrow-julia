@@ -1751,7 +1751,8 @@ type where `expected` (or a descendant) is a nullable typed field: those
 values become null slots of the expected type. Anything else is unchanged.
 """
 function _fillnulls(expected::AC.Field, actual::AC.Field, d::AC.ArrayData, context)
-    if actual.type isa AC.NullType
+    # A labelled Null column (`nothing`s) holds values, not nulls.
+    if actual.type isa AC.NullType && _holdsnull(actual)
         (expected.type isa AC.NullType || !_holdsnull(expected)) && return actual, d
         return _constructhiddenpart(expected, Int(d.len), context)
     end
