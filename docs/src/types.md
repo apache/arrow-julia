@@ -93,7 +93,7 @@ same type unless the table says otherwise.
 | `NamedTuple` | Struct | `NamedTuple` |
 | `AbstractDict{K,V}`, `AbstractVector{<:Pair}` | Map | `MapValue{K,V}` |
 | `Union{Missing,T}` | the type of `T`, nullable | `Union{Missing,T}` |
-| `Union{T1,T2,...}` | dense Union | a `Union` of the members' types as read |
+| `Union{T1,T2,...}` | dense Union, or one type that every member writes | a `Union` of the members' types as read |
 | `VersionNumber`, `Nothing` | Utf8, Null; labelled | the same type |
 | `Missing` only | Null | `Missing` |
 
@@ -104,13 +104,15 @@ collected first.
 
 A column whose element type is abstract (`Any`, `Real`, a `NamedTuple` with open field
 types) is written as the types its values have: one type writes as that type, and up to
-8 types as a dense Union of them. Types that store as the same Arrow type and carry no
-label of their own (two structs whose ArrowTypes.jl mappings both give an `Int32`) write
-as one column of it. A column of `Timestamp`s, `ZonedTimestamp`s, or
-`Decimal`s that mixes units, zones, or precisions is an error, since one Arrow column has
-one of each (`Durations.astimezone` gives a column one zone). A type with no Arrow type,
-such as `BigInt`, an `@enum`, or a `Matrix`, is an error that names the column; map it
-with [Custom types](@ref), or convert it first.
+8 types as a dense Union of them. When all the types in such a column, or all the members
+of a `Union` element type, write the same Arrow type, label included, the column is one
+column of that type and reads back as it: `Union{String,SubString{String}}` writes one
+Utf8 column, and two structs whose ArrowTypes.jl mappings give an `Int32` with no label
+(or with one label they share) write one Int32 column. A column of `Timestamp`s,
+`ZonedTimestamp`s, or `Decimal`s that mixes units, zones, or precisions is an error, since
+one Arrow column has one of each (`Durations.astimezone` gives a column one zone). A type
+with no Arrow type, such as `BigInt`, an `@enum`, or a `Matrix`, is an error that names
+the column; map it with [Custom types](@ref), or convert it first.
 
 ## Timestamps
 
