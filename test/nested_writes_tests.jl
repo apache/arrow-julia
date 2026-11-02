@@ -72,6 +72,16 @@ end
     end
 end
 
+@testset "a Nothing field under missing rows" begin
+    s = Union{Missing,NamedTuple{(:a,),Tuple{Nothing}}}[(a=nothing,), missing]
+    f = Union{Missing,NTuple{2,Nothing}}[(nothing, nothing), missing]
+    t = Arrow.Table(Arrow.tobuffer((s=s, f=f)))
+    # A struct row reads as a NamedTuple or an ordered Pair vector.
+    fields(r) = r === missing ? missing : Any[x isa Pair ? last(x) : x for x in r]
+    @test isequal(fields.(t.s), [[nothing], missing])
+    @test isequal(fields.(t.f), [[nothing, nothing], missing])
+end
+
 @testset "plain nested writes" begin
     @testset "lists, with missing rows and values" begin
         cols = (

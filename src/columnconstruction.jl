@@ -620,7 +620,8 @@ function _hideablestorage(context, T::Type)
     S = _writerstoragetype!(context, T)
     S === T && return false
     S isa Union && return false
-    S === Nothing && return false
+    # Null storage (`Nothing`'s is `Missing`) has no validity to hide.
+    (S === Nothing || S === Missing) && return false
     isconcretetype(S) || return false
     return _writerneedstype!(context, S) ? _hideablestorage(context, S) : true
 end
