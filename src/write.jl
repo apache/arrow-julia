@@ -70,9 +70,11 @@ Keywords:
   other column, and a column name or a collection of names adds those.
   `false` writes pooled, categorical, and read dictionary columns as their
   values (DuckDB's `read_arrow` refuses dictionaries); `Arrow.DictEncode`
-  columns stay encoded. A column of UUIDs is written unencoded, since pyarrow
-  cannot read a dictionary of `arrow.uuid` values, and an `Arrow.DictEncode`
-  of UUIDs is an error.
+  columns stay encoded. A pooled column of UUIDs, or one `dictencode` names,
+  is written unencoded, since pyarrow cannot read a dictionary of
+  `arrow.uuid` values; an `Arrow.DictEncode` of UUIDs is an error, and a
+  dictionary of UUIDs read from Arrow keeps its encoding unless
+  `dictencode=false`.
 - `dictdeltas`: write the categories a dictionary gains in later partitions
   as delta dictionary batches (see [`Arrow.Writer`](@ref)).
 - `largelists`: declare 64-bit offsets (LargeUtf8, LargeBinary, LargeList).

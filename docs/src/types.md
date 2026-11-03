@@ -108,11 +108,12 @@ types) is written as the types its values have: one type writes as that type, an
 of a `Union` element type, write the same Arrow type, label included, the column is one
 column of that type and reads back as it: `Union{String,SubString{String}}` writes one
 Utf8 column, and two structs whose ArrowTypes.jl mappings give an `Int32` with no label
-(or with one label they share) write one Int32 column. A column of `Timestamp`s,
-`ZonedTimestamp`s, or `Decimal`s that mixes units, zones, or precisions is an error, since
-one Arrow column has one of each (`Durations.astimezone` gives a column one zone). A type
-with no Arrow type, such as `BigInt`, an `@enum`, or a `Matrix`, is an error that names
-the column; map it with [Custom types](@ref), or convert it first.
+(or with one label they share) write one Int32 column. Two structs without mappings
+that have the same fields are the exception: they write a dense Union. A column of
+`Timestamp`s, `ZonedTimestamp`s, or `Decimal`s that mixes units, zones, or precisions is
+an error, since one Arrow column has one of each (`Durations.astimezone` gives a column
+one zone). A type with no Arrow type, such as `BigInt`, an `@enum`, or a `Matrix`, is an
+error that names the column; map it with [Custom types](@ref), or convert it first.
 
 ## Timestamps
 

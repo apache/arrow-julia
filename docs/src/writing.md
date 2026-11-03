@@ -130,10 +130,10 @@ dictionary encoded when
 
 `dictencode=false` writes pooled and categorical columns, and dictionary columns read
 from Arrow, as plain values, for readers that refuse dictionaries such as DuckDB 1.5's
-`read_arrow`; an `Arrow.DictEncode` column stays encoded. A column of `UUID`s is written
-unencoded, pooled or not and whatever `dictencode` says, because pyarrow cannot read a
-dictionary of `arrow.uuid` values; an `Arrow.DictEncode` of `UUID`s is an error that names
-the column.
+`read_arrow`; an `Arrow.DictEncode` column stays encoded. A pooled column of `UUID`s, or
+one `dictencode` names, is written unencoded, because pyarrow cannot read a dictionary of
+`arrow.uuid` values; an `Arrow.DictEncode` of `UUID`s is an error that names the column.
+A dictionary of `UUID`s read from Arrow keeps its encoding unless `dictencode=false`.
 
 ```@example writing
 using PooledArrays
