@@ -661,7 +661,8 @@ end
         (PooledArray(uuids), (dictencode=:u,)),
     )
         t = Arrow.Table(Arrow.tobuffer((u=col,); kwargs...))
-        @test !(t.u isa Arrow.DictEncoded)
+        # A dictionary of UUIDs reads back as UUIDs too, so check the schema.
+        @test !(getfield(t, :schema).fields[1].type isa AC.DictionaryType)
         @test isequal(collect(t.u), collect(col))
     end
     err = @test_throws ArgumentError Arrow.write(IOBuffer(), (u=Arrow.DictEncode(uuids),))
