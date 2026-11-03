@@ -1771,6 +1771,9 @@ end
 _selectsonly(b::Tables.BoundScan) =
     b.filter === nothing && b.limit === nothing && b.offset == 0
 
+# The values (rows times decoded columns) that make one more decode task worth it.
+const _VALUES_PER_TASK = 1 << 20
+
 """
 Read scan `plan` from `records`, the record batches it may keep, and return
 its columns, row count, and the offset rows it skipped. Without a filter
@@ -1778,7 +1781,8 @@ every row of a batch is kept, or `windows[k]`, the rows of record `k` in the
 scan's `offset`/`limit` window. A filter reads its filter columns first and
 the other selected columns only for batches that keep rows; without a
 `limit` or `offset`, batches run on up to `ntasks` tasks, and a batch with
-tasks to spare evaluates the filter in chunks of rows. Kept rows are copied:
+tasks to spare evaluates the filter in chunks of rows (`ntasks` is capped by
+the values to decode: see `_VALUES_PER_TASK`). Kept rows are copied:
 string and binary columns hold just their values' bytes. A scan that keeps
 every row builds the columns a full read builds. `_fetch!(bodies, ks, mask)`
 makes the bodies of the fields `mask` selects of records `ks` readable first.
@@ -1816,6 +1820,9 @@ function _runscan(
     raw = Bool[_rawoverride(c, fields[c.index]) for c in b.columns]
     filteridx = _deduplicatesorted!(copy(b.filtercols))
     decodeidx = _deduplicatesorted!(vcat(outidx, filteridx))
+    # A task pays for its spawn and wake-up only with enough values to decode,
+    # so a small batch (one `Arrow.Stream` step, say) runs on the calling task.
+    ntasks = min(ntasks, max(1, cld(total * length(decodeidx), _VALUES_PER_TASK)))
     if b.filter === nothing && windows === nothing && !any(raw)
         _fetch!(bodies, 1:n, _fieldmask(decodeidx, nf))
         _chargevector!(budget, Union{Nothing,ArrayData}, n * nf, "batch columns")
