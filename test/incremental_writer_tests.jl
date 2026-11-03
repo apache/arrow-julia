@@ -129,9 +129,10 @@ function growdictionary(k)
 end
 growthallocations(k) = @allocated growdictionary(k)
 appendallocations(path, table) = @allocated Arrow.append(path, table)
+# On one task, so buffer reuse does not depend on how threads are scheduled.
 function batchedallocations(t, n)
     io = IOBuffer(; sizehint=4_000_000)
-    return @allocated Arrow.write(io, t; batchsize=n)
+    return @allocated Arrow.write(io, t; batchsize=n, ntasks=1)
 end
 
 # A two-row stream of dense union `u` (children Int64 `i` and String `s`,
@@ -518,8 +519,11 @@ batchkinds(bytes) = [
         t = (; d=Arrow.DictEncode([string("c", i % 32) for i = 1:1_000_000]))
         batchedallocations(t, 500_000)
         batchedallocations(t, 1_000_000)
-        # The second batch's 500,000 codes map into the first batch's pool.
-        extra = batchedallocations(t, 500_000) - batchedallocations(t, 1_000_000)
+        # The second batch's 500,000 codes map into the first batch's pool. The
+        # least of three: allocations on other threads only add to a reading.
+        extra = minimum(
+            batchedallocations(t, 500_000) - batchedallocations(t, 1_000_000) for _ = 1:3
+        )
         @test extra < 8 * 500_000
         @test Arrow.Table(take!(Arrow.write(IOBuffer(), t; batchsize=500_000))).d ==
               t.d.data
