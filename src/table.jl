@@ -46,7 +46,7 @@ that `open(source, "r")` accepts, such as a FilePathsBase.jl path, reads as the 
 - `mmap` memory-maps a path. It is the default except on Windows, which cannot delete a
   mapped file.
 - `stringtype=String` reads strings as `String`s instead of `DataStrings.DataString`s.
-- `ntasks` tasks decode record batches and build columns; `ntasks=1` reads on the
+- Up to `ntasks` tasks decode record batches and build columns; `ntasks=1` reads on the
   calling task. The result does not depend on `ntasks`.
 - `limits` sets the [`Arrow.Limits`](@ref).
 

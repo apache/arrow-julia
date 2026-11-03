@@ -266,7 +266,9 @@ the current table in memory. `sink` is a file path, or another object that
 form runs `f(writer)` and closes the writer. If `f` throws, the writer is abandoned
 instead, so a path's existing file keeps its bytes as after a failed
 [`Arrow.write`](@ref), unless the sink is an `IO` that already received a table:
-that output is closed, so it holds the tables written before the error. The
+that output is closed, so it holds the tables written before the error. A sink
+that is not a path but is written in place (an object `open(sink, "w")` accepts)
+holds an incomplete file after an error, as after a failed `Arrow.write`. The
 keywords mean what they mean for [`Arrow.write`](@ref), whose metadata rules apply
 too. An existing file path is replaced as by [`Arrow.write`](@ref): the output goes
 to a temporary file that `close` renames over the old file.
