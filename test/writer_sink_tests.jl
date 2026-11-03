@@ -250,7 +250,7 @@ end
         end
     end
 
-    @testset "a body error still finalizes accepted batches" begin
+    @testset "a body error ends an IO's accepted batches and abandons a path's" begin
         mktempdir() do dir
             path = joinpath(dir, "body-error.arrow")
             for ownio in (true, false), file in (true, false)
@@ -267,8 +267,12 @@ end
                 @test err === failure
                 @test !isopen(writer[])
                 @test isopen(writer[].io) == !ownio
-                bytes = ownio ? read(path) : take!(io)
-                @test bytes == Arrow._writebytes(table; file=file)
+                if ownio
+                    # As after a failed Arrow.write: no file, and no temporary one.
+                    @test isempty(readdir(dir))
+                else
+                    @test take!(io) == Arrow._writebytes(table; file=file)
+                end
                 close(io)
             end
         end

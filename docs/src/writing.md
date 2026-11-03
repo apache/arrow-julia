@@ -130,10 +130,10 @@ dictionary encoded when
 
 `dictencode=false` writes pooled and categorical columns, and dictionary columns read
 from Arrow, as plain values, for readers that refuse dictionaries such as DuckDB 1.5's
-`read_arrow`; an `Arrow.DictEncode` column stays encoded. A column of `UUID`s is written
-unencoded, pooled or not and whatever `dictencode` says, because pyarrow cannot read a
-dictionary of `arrow.uuid` values; an `Arrow.DictEncode` of `UUID`s is an error that names
-the column.
+`read_arrow`; an `Arrow.DictEncode` column stays encoded. A pooled column of `UUID`s, or
+one `dictencode` names, is written unencoded, because pyarrow cannot read a dictionary of
+`arrow.uuid` values; an `Arrow.DictEncode` of `UUID`s is an error that names the column.
+A dictionary of `UUID`s read from Arrow keeps its encoding unless `dictencode=false`.
 
 ```@example writing
 using PooledArrays
@@ -176,10 +176,11 @@ DictionaryReplacement feature, which some readers (nanoarrow) refuse.
 [`Arrow.Writer`](@ref) writes one output from several tables, such as batches that do
 not fit in memory together. Each `Arrow.write(writer, table)` encodes that table's record
 batches and hands them to the sink before it returns; `close` finishes the output, and the
-function form closes it (or, if its function throws before writing a table, abandons it,
-so an existing file is kept). A writer to a path writes nothing to that path until
-`close`: an existing file is replaced then, from a temporary file beside it, and a new
-file holds no complete output before.
+function form closes it. If the function throws, the writer is abandoned instead, so an
+existing file is kept, unless the sink is an `IO` that already received a table: then the
+function form closes it, and the `IO` holds the tables written before the error. A writer
+to a path writes nothing to that path until `close`: an existing file is replaced then,
+from a temporary file beside it, and a new file holds no complete output before.
 
 ```@example writing
 Arrow.Writer(path) do writer

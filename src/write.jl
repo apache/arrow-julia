@@ -70,9 +70,11 @@ Keywords:
   other column, and a column name or a collection of names adds those.
   `false` writes pooled, categorical, and read dictionary columns as their
   values (DuckDB's `read_arrow` refuses dictionaries); `Arrow.DictEncode`
-  columns stay encoded. A column of UUIDs is written unencoded, since pyarrow
-  cannot read a dictionary of `arrow.uuid` values, and an `Arrow.DictEncode`
-  of UUIDs is an error.
+  columns stay encoded. A pooled column of UUIDs, or one `dictencode` names,
+  is written unencoded, since pyarrow cannot read a dictionary of
+  `arrow.uuid` values; an `Arrow.DictEncode` of UUIDs is an error, and a
+  dictionary of UUIDs read from Arrow keeps its encoding unless
+  `dictencode=false`.
 - `dictdeltas`: write the categories a dictionary gains in later partitions
   as delta dictionary batches (see [`Arrow.Writer`](@ref)).
 - `largelists`: declare 64-bit offsets (LargeUtf8, LargeBinary, LargeList).
@@ -261,8 +263,10 @@ so producing tables one at a time never holds more than one partition of
 the current table in memory. `sink` is a file path, or another object that
 `open(sink, "w")` accepts (the writer opens and owns the handle), or an `IO`
 (borrowed; `close` finishes the IPC output but leaves the `IO` open). The function
-form runs `f(writer)` and closes the writer; if `f` throws before writing a table,
-the writer is abandoned instead, so a path's existing file keeps its bytes. The
+form runs `f(writer)` and closes the writer. If `f` throws, the writer is abandoned
+instead, so a path's existing file keeps its bytes as after a failed
+[`Arrow.write`](@ref), unless the sink is an `IO` that already received a table:
+that output is closed, so it holds the tables written before the error. The
 keywords mean what they mean for [`Arrow.write`](@ref), whose metadata rules apply
 too. An existing file path is replaced as by [`Arrow.write`](@ref): the output goes
 to a temporary file that `close` renames over the old file.
@@ -437,9 +441,9 @@ function Writer(f::Function, sink; kwargs...)
         f(w)
     catch
         try
-            # Before any table, there is nothing to keep: a path's file keeps
-            # its old bytes.
-            w.st === nothing ? _abandon!(w) : close(w)
+            # A path keeps its old file, as after a failed `Arrow.write`; an
+            # `IO` that got a table is ended, so it holds those tables.
+            w.ownio || w.st === nothing ? _abandon!(w) : close(w)
         catch
             # Preserve the body error if finalization or sink cleanup fails.
         end
@@ -1194,11 +1198,13 @@ _dictionarydeltas(st::IPCWriteState, batch::AC.RecordBatch, growth=()) =
 
 """
 A schema field declared nullable, with its descendants, except the children
-the format requires to be non-null (map entries and keys, run ends).
+the format requires to be non-null (map entries and keys, run ends), also
+under a dictionary, whose children are its values'.
 """
 function _nullablefield(f::AC.Field)
     t = f.type
-    children = if t isa AC.MapType && length(f.children) == 1
+    vt = t isa AC.DictionaryType ? t.valuetype : t
+    children = if vt isa AC.MapType && length(f.children) == 1
         entries = only(f.children)
         kv = entries.children
         AC.Field[AC.Field(
@@ -1208,7 +1214,7 @@ function _nullablefield(f::AC.Field)
             metadata=entries.metadata,
             children=AC.Field[kv[1], (_nullablefield(c) for c in kv[2:end])...],
         )]
-    elseif t isa AC.RunEndEncodedType && length(f.children) == 2
+    elseif vt isa AC.RunEndEncodedType && length(f.children) == 2
         AC.Field[f.children[1], _nullablefield(f.children[2])]
     else
         AC.Field[_nullablefield(c) for c in f.children]
@@ -1751,7 +1757,8 @@ type where `expected` (or a descendant) is a nullable typed field: those
 values become null slots of the expected type. Anything else is unchanged.
 """
 function _fillnulls(expected::AC.Field, actual::AC.Field, d::AC.ArrayData, context)
-    if actual.type isa AC.NullType
+    # A labelled Null column (`nothing`s) holds values, not nulls.
+    if actual.type isa AC.NullType && _holdsnull(actual)
         (expected.type isa AC.NullType || !_holdsnull(expected)) && return actual, d
         return _constructhiddenpart(expected, Int(d.len), context)
     end
@@ -1879,6 +1886,11 @@ function _conformancemismatch(
 )
     expected.name == actual.name || return "$path is named $(repr(actual.name))"
     if !AC.typeequal(expected.type, actual.type)
+        actual.type isa AC.NullType &&
+            !_holdsnull(actual) &&
+            return "$path writes as null labelled " *
+                   "$(first(_arrowtypesextension(actual))), not as missing values, but " *
+                   "the schema has $(_typename(expected))"
         expected.type isa AC.NullType &&
             return "$path writes as $(_typename(actual.type)), but the schema " *
                    "declared it null because it held only missing values (or no " *

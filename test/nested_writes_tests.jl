@@ -82,6 +82,21 @@ end
     @test isequal(fields.(t.f), [[nothing, nothing], missing])
 end
 
+@testset "a union under missing rows stores no value for them" begin
+    # A hidden slot shares the slot of the visible row before it.
+    S = Union{Missing,NamedTuple{(:a,),Tuple{Union{Int,String}}}}
+    F = Union{Missing,NTuple{2,Union{Int,String}}}
+    s = S[missing, (a="x",), missing, missing, (a=2,), missing]
+    f = F[missing, (1, "a"), missing, missing, ("b", 2), missing]
+    t = Arrow.Table(Arrow.tobuffer((s=s, f=f)))
+    fielda(r) = r === missing ? missing : r isa NamedTuple ? r.a : last(only(r))
+    @test isequal(fielda.(t.s), fielda.(s))
+    @test isequal([r === missing ? missing : Tuple(r) for r in t.f], f)
+    # 100,000 missing rows hold no copies of a 1,000-byte value.
+    big = S[isodd(i) ? (a=i == 1 ? "x"^1000 : i,) : missing for i = 1:200_000]
+    @test length(take!(Arrow.tobuffer((s=big,)))) < 4_000_000
+end
+
 @testset "plain nested writes" begin
     @testset "lists, with missing rows and values" begin
         cols = (

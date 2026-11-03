@@ -55,6 +55,15 @@ ArrowTypes.JuliaType(::Val{EITHER_LABEL}, S, metadata) = EitherLabel
 ArrowTypes.fromarrow(::Type{EitherLabel}, x::Int64) = EitherLabel(x)
 ArrowTypes.fromarrow(::Type{EitherLabel}, x::AbstractString) = EitherLabel(String(x))
 
+# A labelled value stored as Nothing: a Null field labelled for it holds it.
+struct UnitLabel end
+const UNIT_LABEL = Symbol("JuliaLang.ArrowTests.WriterUnit")
+ArrowTypes.ArrowType(::Type{UnitLabel}) = Nothing
+ArrowTypes.toarrow(::UnitLabel) = nothing
+ArrowTypes.arrowname(::Type{UnitLabel}) = UNIT_LABEL
+ArrowTypes.JuliaType(::Val{UNIT_LABEL}, S, metadata) = UnitLabel
+ArrowTypes.fromarrow(::Type{UnitLabel}, ::Union{Nothing,Missing}) = UnitLabel()
+
 # The output of `tables` written through one Arrow.Writer, and each table's
 # error (or nothing).
 function writetables(tables; kwargs...)
@@ -539,8 +548,9 @@ batchkinds(bytes) = [
         end
     end
 
-    @testset "a function-form writer that writes no table keeps the path" begin
-        path = joinpath(mktempdir(), "keep.arrow")
+    @testset "a function-form writer whose function throws keeps the path" begin
+        dir = mktempdir()
+        path = joinpath(dir, "keep.arrow")
         Arrow.write(path, t1)
         before = read(path)
         # The first table is refused (columns of different lengths).
@@ -551,9 +561,21 @@ batchkinds(bytes) = [
         @test read(path) == before
         @test_throws ErrorException open(w -> error("no table"), Arrow.Writer, path)
         @test read(path) == before
+        # After a table too: a later partition is refused, or the function fails.
+        refusedpart(w) = Arrow.write(w, Tables.partitioner([(a=[10],), (a=["x"],)]))
+        @test_throws ArgumentError Arrow.Writer(refusedpart, path)
+        @test read(path) == before
+        failslater(w) = (Arrow.write(w, t1); error("after a table"))
+        @test_throws ErrorException open(failslater, Arrow.Writer, path)
+        @test read(path) == before
+        @test_throws ErrorException Arrow.Writer(failslater, joinpath(dir, "new.arrow"))
+        @test readdir(dir) == ["keep.arrow"]
+        # An IO gets nothing before a table, and its tables ended after one.
         io = IOBuffer()
         @test_throws ErrorException Arrow.Writer(w -> error("no table"), io)
         @test isempty(take!(io))
+        @test_throws ErrorException Arrow.Writer(failslater, io; file=false)
+        @test Arrow.Table(take!(io)).b == t1.b
         # A writer closed without a table writes an output with no columns.
         close(Arrow.Writer(path))
         @test isempty(Tables.columnnames(Arrow.Table(read(path))))
@@ -794,6 +816,59 @@ batchkinds(bytes) = [
         )
     end
 
+    @testset "`nothing` is written as a value, never as a missing value" begin
+        # A union's `JuliaLang.Nothing` child keeps a later table's `nothing`s,
+        # also in a table of nothing else.
+        U = Union{Missing,Nothing,Int}
+        for (tables, values) in (
+            (
+                [(x=Union{Nothing,Int}[nothing, 1],), (x=[nothing, nothing],)],
+                U[nothing, 1, nothing, nothing],
+            ),
+            (
+                [(x=U[missing, nothing, 1],), (x=[nothing],)],
+                U[missing, nothing, 1, nothing],
+            ),
+            (
+                [(x=[Union{Nothing,Int}[nothing, 1]],), (x=[[nothing]],)],
+                [U[nothing, 1], U[nothing]],
+            ),
+        )
+            bytes, errs = writetables(tables)
+            @test all(isnothing, errs)
+            @test isequal(collect(Arrow.Table(bytes).x), values)
+        end
+        # A field without such a child has no place for `nothing`.
+        for (t1, t2) in (
+            ((x=[1],), (x=Union{Nothing,Int}[nothing, 2],)),
+            ((x=[1],), (x=[nothing],)),
+            ((x=[missing],), (x=[nothing],)),
+            ((x=[missing],), (x=[UnitLabel()],)),
+            ((x=[missing],), (x=Any[nothing, UnitLabel()],)),
+            ((x=["a"],), (x=Union{Nothing,Symbol}[nothing, :b],)),
+            ((x=[(u=1,)],), (x=[(u=nothing,), (u=2,)],)),
+            ((x=[[1]],), (x=[Union{Nothing,Int}[nothing, 2]],)),
+        )
+            bytes, errs = writetables([t1, t2])
+            @test errs[1] === nothing && refused(errs[2], :x)
+            @test isequal(collect(Arrow.Table(bytes).x), t1.x)
+        end
+        # Under its own label, a value stored as Nothing reads back.
+        @test collect(Arrow.Table(Arrow.tobuffer((x=[UnitLabel()],))).x) == [UnitLabel()]
+        path = joinpath(mktempdir(), "x.arrows")
+        Arrow.write(path, (x=Union{Missing,Int}[1, missing],); file=false)
+        err =
+            @test_throws ArgumentError Arrow.append(path, (x=Union{Nothing,Int}[nothing],))
+        @test refused(err.value, :x)
+        Arrow.Writer(
+            w -> Arrow.write(w, (x=Union{Nothing,Int}[nothing, 1],)),
+            path;
+            file=false,
+        )
+        Arrow.append(path, (x=[nothing],))
+        @test isequal(collect(Arrow.Table(path).x), [nothing, 1, nothing])
+    end
+
     @testset "a union child with only missing values in a table holds nulls" begin
         U = Union{Missing,Int,String}
         tables = [(u=Union{Int,String}[1, "a"],), (u=U["b", missing],), (u=U[missing],)]
@@ -821,6 +896,13 @@ batchkinds(bytes) = [
         _, errs = writetables([(a=[1],), (a=[missing],)]; nullable=false)
         @test occursin("created with nullable=false", errs[2].msg)
         @test !occursin("one-table", errs[2].msg)
+        # A column of `nothing` is not missing values, and declaring the field
+        # nullable would not help it.
+        for nullable in (true, false)
+            _, errs = writetables([(a=[1],), (a=[nothing],)]; nullable)
+            @test occursin("null labelled JuliaLang.Nothing", errs[2].msg)
+            @test !occursin("created with nullable=false", errs[2].msg)
+        end
         # An append to a one-table stream: a nullable Writer would have taken
         # the missing values, but not another type or a labelled union's.
         path = joinpath(mktempdir(), "s.arrow")

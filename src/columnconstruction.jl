@@ -711,15 +711,27 @@ end
 Retained child `f` over `values`, `hidden` of which sit under null parent
 rows and read as missing. A child that holds nulls takes them there. In a
 child that cannot, any other missing value means the column was replaced,
-and the hidden slots take a stand-in: a union, run-end, or Null column, which
-has no validity buffer, takes a visible value there; any other child is built
-nullable and its validity then dropped (`_hidevalidity`).
+and the hidden slots take a stand-in: a dense union points each at the slot
+of the visible row before it; a sparse union, run-end, or Null column, which
+has no validity buffer, takes the visible value before it; any other child is
+built nullable and its validity then dropped (`_hidevalidity`).
 """
 function _hiddenchild(f::AC.Field, values, hidden::Int, context)
     hidden == 0 && return _constructpart(f, values; context)
     hidden == length(values) && return _constructhiddenpart(f, hidden, context)
     _holdsnull(f) && return _constructpart(f, values; context)
     count(ismissing, values) == hidden || throw(_nonnullableerror(f.name))
+    if f.type isa AC.UnionType && f.type.mode == AC.DenseMode
+        return _uninferred(
+            _hiddendenseunion,
+            f,
+            values,
+            context,
+        )::Tuple{AC.Field,AC.ArrayData}
+    end
+    # ponytail: a sparse union still copies a value into each hidden slot
+    # (sparse unions come only from other writers' schemas); a child's empty
+    # value there would cost nothing.
     if f.type isa Union{AC.UnionType,AC.RunEndEncodedType,AC.NullType}
         return _constructpart(f, _uninferred(_standins, values)::AbstractVector; context)
     end
@@ -733,10 +745,24 @@ function _hiddenchild(f::AC.Field, values, hidden::Int, context)
     return _hidevalidity(f, _constructpart(relaxed, values; context)...)
 end
 
-# `values` with each missing value replaced by the first value that is not.
+# `values` with each missing value replaced by the value before it (the first
+# value, before any), so a run-end column's hidden slots extend a run.
 function _standins(values)
     x = values[findfirst(!ismissing, values)]
-    return [y === missing ? x : y for y in values]
+    return [y === missing ? x : (x = y) for y in values]
+end
+
+# A dense union over its visible values, whose hidden rows share the slot of
+# the visible row before them (the first one's, before any): no value is
+# copied for them, and each child's offsets stay non-decreasing.
+function _hiddendenseunion(f::AC.Field, values, context)
+    uf, ud = _constructpart(f, [x for x in values if x !== missing]; context)
+    src = max.(cumsum(x !== missing for x in values), 1)
+    ids = reinterpret(Int8, AC.slicebytes(ud.buffers[1]))[src]
+    offsets = reinterpret(Int32, AC.slicebytes(ud.buffers[2]))[src]
+    buffers = AC.BufferSlice[AC._databuffer(ids), AC._databuffer(offsets)]
+    d = AC.ArrayData(ud.type, length(values), buffers; children=ud.children, nullcount=0)
+    return uf, d
 end
 
 _nonnullableerror(name) = ArgumentError(
@@ -933,9 +959,13 @@ function _mappart(spec, v::AbstractVector, context)
     vf, vd =
         _constructpart(_entryspec(spec, 2, "value"), _ChildValues{V,2}(entries); context)
     # Distinct keys that an ArrowTypes mapping stores alike would read back as
-    # repeated keys of one row.
-    (spec isa AC.Field || R <: AbstractDict && _writerneedstype!(context, KK)) &&
-        _validatemapphysicalkeys(name, kf, kd, offsets)
+    # repeated keys of one row. Keys stored as themselves keep a row's
+    # repeated keys, which Arrow maps (and `Arrow.MapValue` rows) allow.
+    keyspec = _entryspec(spec, 1, "key")
+    (
+        R <: AbstractDict && _writerneedstype!(context, KK) ||
+        keyspec isa AC.Field && _arrowtypesextension(keyspec) !== nothing
+    ) && _validatemapphysicalkeys(name, kf, kd, offsets)
     return _mapcolumn(spec, v, offsets, validity, nc, length(entries), kf, kd, vf, vd)
 end
 
@@ -2757,10 +2787,12 @@ own: the element type's, or a runtime type's in an abstract column.
 function _mappedvalues(v::AbstractVector, context::_WriterContext)
     T = Base.nonmissingtype(_eltypeof(v))
     T === Union{} && return false
+    # A type stored as a null (`Nothing`, whose storage is `Missing`) is not
+    # lowered: only its label tells its values from missing ones.
     mapped(S) =
         S !== VersionNumber &&
         !(S <: Union{Int128,UInt128}) &&
-        _writerstoragetype!(context, S) !== S
+        !(_writerstoragetype!(context, S) in (S, Missing, Nothing))
     isconcretetype(T) && return mapped(T)
     T isa Union &&
         all(isconcretetype, Base.uniontypes(T)) &&
@@ -2857,6 +2889,13 @@ function _inferlowered(f::AC.Field, target, v::AbstractVector, context::_WriterC
             target === nothing || _checkabstractlabel(f, target, T, context)
         end
         mapped = T === VersionNumber ? string(x) : _writertoarrow(context, x, T, name, f)
+        # Without a label, a type stored as a null (`Nothing`) would read back as
+        # missing values: its values stay themselves, for the field's builder to
+        # refuse.
+        mapped isa Union{Missing,Nothing} &&
+            target === nothing &&
+            _writerstoragetype!(context, T) in (Missing, Nothing) &&
+            (mapped = x)
         values[i] = mapped
         _pushobserved!(observed, seen, typeof(mapped), name)
     end
@@ -3703,8 +3742,8 @@ function _constructretainedpart(f::AC.Field, v::AbstractVector, context::_Writer
         ),
     )
     if t isa AC.NullType
-        # `Nothing` is a logical type's Null storage.
-        all(x -> x === missing || x === nothing, v) || throw(
+        # `nothing` is Null storage only where a label lowered a value to it.
+        all(x -> x === missing || (x === nothing && context.lowered), v) || throw(
             ArgumentError(
                 "column $(f.name) no longer matches its retained Arrow NullType; " *
                 "give it a Missing element type",
@@ -4032,10 +4071,19 @@ _hasrefpool(x::AbstractVector) =
     Base.nonmissingtype(_eltypeof(x)) !== Union{}
 _hasrefpool(::Any) = false
 
-# Whether a column holds UUIDs, which a pooled column or `dictencode` writes
-# unencoded: pyarrow cannot read a dictionary of arrow.uuid values.
-_uuidvalues(x::AbstractVector) = Base.nonmissingtype(_eltypeof(x)) === UUIDs.UUID
+# Whether a column holds UUIDs (an abstract one, only UUIDs and missing
+# values), which a pooled column or `dictencode` writes unencoded: pyarrow
+# cannot read a dictionary of arrow.uuid values.
+function _uuidvalues(x::AbstractVector)
+    T = Base.nonmissingtype(_eltypeof(x))
+    T === UUIDs.UUID && return true
+    isconcretetype(T) && return false
+    # The scan compiles for the column's own type (see `_uninferred`).
+    return _uninferred(_onlyuuids, x)::Bool
+end
 _uuidvalues(::Any) = false
+_onlyuuids(x) =
+    all(y -> y === missing || y isa UUIDs.UUID, x) && any(y -> y isa UUIDs.UUID, x)
 
 """
 The values and category pool of a ref-pool column. Pool values that are
