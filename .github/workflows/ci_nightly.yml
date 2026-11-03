@@ -25,6 +25,9 @@ jobs:
     name: ${{ matrix.pkg.name }} - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ matrix.nthreads }} threads - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -64,10 +67,21 @@ jobs:
           JULIA_NUM_THREADS: ${{ matrix.nthreads }}
         with:
           project: ${{ matrix.pkg.dir }}
-      - uses: julia-actions/julia-processcoverage@v1
+      - name: Process Arrow.jl coverage
+        if: matrix.pkg.name == 'Arrow.jl'
+        uses: julia-actions/julia-processcoverage@v1
+        with:
+          directories: src,ext
+      - name: Process subpackage coverage
+        if: matrix.pkg.name != 'Arrow.jl'
+        uses: julia-actions/julia-processcoverage@v1
+        with:
+          directories: ${{ matrix.pkg.dir }}/src
       - uses: codecov/codecov-action@v7
         with:
           files: lcov.info
+          fail_ci_if_error: true
+          use_oidc: true
   test_monorepo:
     name: Monorepo dev - Julia ${{ matrix.version }} - ${{ matrix.os }} - ${{ matrix.arch }} - ${{ github.event_name }}
     runs-on: ${{ matrix.os }}

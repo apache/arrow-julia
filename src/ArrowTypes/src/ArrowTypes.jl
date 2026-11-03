@@ -15,8 +15,10 @@
 # limitations under the License.
 
 """
-The ArrowTypes module provides the [`ArrowTypes.Arrowtype`](@ref) interface trait that objects can define
-in order to signal how they should be serialized in the arrow format.
+The ArrowTypes module defines traits and hooks that packages can implement to
+describe how their Julia types map to the Arrow format. Arrow consumers,
+including Arrow.jl 2.x and 3.x, use this interface without requiring the
+package that owns a custom type to depend on Arrow.jl.
 """
 module ArrowTypes
 
@@ -41,24 +43,25 @@ export ArrowKind,
 """
     ArrowTypes.ArrowKind(T)
 
-For a give type `T`, define it's "arrow type kind", or the general category of arrow types it should be treated as. Must be one of:
+For a given type `T`, define its "arrow type kind", or the general category of arrow types it should be treated as. Must be one of:
   * [`ArrowTypes.NullKind`](@ref): `Missing` is the only type defined as `NullKind`
-  * [`ArrowTypes.PrimitiveKind`](@ref): `<:Integer`, `<:AbstractFloat`, along with `Arrow.Decimal`, and the various `Arrow.ArrowTimeType` subtypes
+  * [`ArrowTypes.PrimitiveKind`](@ref): `<:Integer`, `<:AbstractFloat`, along with decimal and temporal types
   * [`ArrowTypes.BoolKind`](@ref): only `Bool`
   * [`ArrowTypes.ListKind`](@ref): any `AbstractString` or `AbstractArray`
-  * [`ArrowTypes.FixedSizeList`](@ref): `NTuple{N, T}`
+  * [`ArrowTypes.FixedSizeListKind`](@ref): `NTuple{N, T}`
   * [`ArrowTypes.MapKind`](@ref): any `AbstractDict`
   * [`ArrowTypes.StructKind`](@ref): any `NamedTuple` or plain struct (mutable or otherwise)
   * [`ArrowTypes.UnionKind`](@ref): any `Union`
-  * [`ArrowTypes.DictEncodedKind`](@ref): array types that implement the `DataAPI.refpool` interface
+  * [`ArrowTypes.DictEncodedKind`](@ref): a kind a consumer may map its own dictionary-encoded array types to; ArrowTypes defines no such mapping itself
 
-The list of `ArrowKind`s listed above translate to different ways to physically store data as supported by the arrow data format.
-See the docs for each for an idea of whether they might be an appropriate fit for a custom type.
-Note that custom types need to satisfy any additional "interface methods" as required by the various `ArrowKind`
-types. By default, if a type in julia is declared like `primitive type ...` it is considered a `PrimitiveKind`
-and if `struct` or `mutable struct` it's considered a `StructKind`. Also note that types will rarely need to define `ArrowKind`;
-much more common is to define `ArrowType(T)` and `toarrow(x::T)` to transform `T` to a natively supported arrow type, which will
-already have its `ArrowKind` defined.
+The `ArrowKind`s describe general Arrow storage categories. Each consumer
+decides which categories, layouts, and extra interface methods it supports.
+By default, a Julia `primitive type` is a `PrimitiveKind`, and a `struct` or
+`mutable struct` is a `StructKind`. Types rarely need to define `ArrowKind`.
+It is more common to define `ArrowType(T)` and `toarrow(x::T)` to lower `T` to
+a natively supported Arrow type, which already has an `ArrowKind`. In
+particular, an `ArrowKind` override alone does not select an arbitrary
+physical layout in a consumer.
 """
 abstract type ArrowKind end
 
@@ -72,9 +75,9 @@ Interface method to define the natively supported arrow type `S` that a given ty
 Useful when a custom type wants a "serialization hook" or otherwise needs to be transformed/converted into a natively
 supported arrow type for serialization. If a type defines `ArrowType`, it must also define a corresponding
 [`ArrowTypes.toarrow(x::T)`](@ref) method which does the actual conversion from `T` to `S`.
-Note that custom structs defined like `struct T` or `mutable struct T` are natively supported in serialization, so unless
-_additional_ transformation/customization is desired, a custom type `T` can serialize with no `ArrowType` definition (by default,
-each field of a struct is serialized, using the results of `fieldnames(T)` and `getfield(x, i)`).
+Some consumers can serialize plain structs by discovering their fields; check
+the consumer's supported write types. Define `ArrowType` and `toarrow` when a
+custom type needs a different storage representation.
 Note that defining these methods only deal with custom _serialization_ to the arrow format; to be able to _deserialize_ custom
 types at all, see the docs for [`ArrowTypes.arrowname`](@ref), [`ArrowTypes.arrowmetadata`](@ref), [`ArrowTypes.JuliaType`](@ref),
 and [`ArrowTypes.fromarrow`](@ref).
@@ -142,15 +145,18 @@ arrowmetadata(::Type{Any}) = EMPTY_STRING
     ArrowTypes.JuliaType(::Val{Symbol(name)}, ::Type{S}, arrowmetadata::String) = T
 
 Interface method to define the custom Julia logical type `T` that a serialized metadata label should be converted to when
-deserializing. When reading arrow data, and a logical type label is encountered for a column, it will call
-`ArrowTypes.JuliaType(Val(Symbol(name)), S, arrowmetadata)` to see if a Julia type has been "registered" for deserialization. The `name`
+deserializing. To resolve a logical type label, a reader calls
+`ArrowTypes.JuliaType(Val(name_symbol), S, arrowmetadata)` with the corresponding existing Julia `Symbol`. The `name`
 used when defining the method *must* correspond to the same `name` when defining `ArrowTypes.arrowname(::Type{T}) = Symbol(name)`.
 The use of `Val(Symbol(...))` is to allow overloading a method on a specific logical type label. The `S` 2nd argument passed to
 `JuliaType` is the native arrow serialized type. This can be useful for parametric Julia types that wish to correctly parameterize
 their custom type based on what was serialized. The 3rd argument `arrowmetadata` is any metadata that was stored when the logical
 type was serialized as the result of calling `ArrowTypes.arrowmetadata(T)`. Note the 2nd and 3rd arguments are optional when
 overloading if unneeded.
-When defining [`ArrowTypes.arrowname`](@ref) and `ArrowTypes.JuliaType`, you may also want to implement [`ArrowTypes.fromarrow`]
+Readers must not intern an unknown, input-controlled name only to probe this interface: resolve the label with a non-interning
+lookup and call `JuliaType(Val(...))` only when the corresponding `Symbol` already exists, preserving ordinary Arrow storage
+values otherwise.
+When defining [`ArrowTypes.arrowname`](@ref) and `ArrowTypes.JuliaType`, you may also want to implement [`ArrowTypes.fromarrow`](@ref)
 in order to customize how a custom type `T` should be constructed from the native arrow data type. See its docs for more details.
 """
 function JuliaType end
@@ -188,7 +194,7 @@ fromarrow(::Type{Union{Missing,T}}, x::T) where {T} = x
 fromarrow(::Type{Union{Missing,T}}, x::T) where {T<:NamedTuple} = x # ambiguity fix
 fromarrow(::Type{Union{Missing,T}}, x) where {T} = fromarrow(T, x)
 
-"NullKind data is actually not physically stored since the data is constant; just the length is needed"
+"NullKind data is not stored physically — the value is constant, so only the length is needed."
 struct NullKind <: ArrowKind end
 
 ArrowKind(::Type{Missing}) = NullKind()
@@ -213,11 +219,11 @@ arrowname(::Type{Char}) = CHAR
 JuliaType(::Val{CHAR}) = Char
 fromarrow(::Type{Char}, x::UInt32) = Char(x)
 
-"BoolKind data is stored with values packed down to individual bits; so instead of a traditional Bool being 1 byte/8 bits, 8 Bool values would be packed into a single byte"
+"BoolKind data is bit-packed: 8 values per byte, not 1 byte per value."
 struct BoolKind <: ArrowKind end
 ArrowKind(::Type{Bool}) = BoolKind()
 
-"ListKind data are stored in two separate buffers; one buffer contains all the original data elements flattened into one long buffer; the 2nd buffer contains an offset into the 1st buffer for how many elements make up the original array element"
+"ListKind data is stored in two buffers: one holds every element flattened; the other holds the start offset of each list, so element i spans offsets[i]:offsets[i+1]-1."
 struct ListKind{stringtype} <: ArrowKind end
 
 ListKind() = ListKind{false}()
@@ -225,7 +231,7 @@ isstringtype(::ListKind{stringtype}) where {stringtype} = stringtype
 isstringtype(::Type{ListKind{stringtype}}) where {stringtype} = stringtype
 
 ArrowKind(::Type{<:AbstractString}) = ListKind{true}()
-# Treate Base.CodeUnits as Binary arrow type
+# Treat Base.CodeUnits as a Binary arrow type
 ArrowKind(::Type{<:Base.CodeUnits}) = ListKind{true}()
 
 fromarrow(::Type{T}, ptr::Ptr{UInt8}, len::Int) where {T} =
@@ -239,6 +245,8 @@ toarrow(x::Symbol) = String(x)
 const SYMBOL = Symbol("JuliaLang.Symbol")
 arrowname(::Type{Symbol}) = SYMBOL
 JuliaType(::Val{SYMBOL}) = Symbol
+# Arrow.jl's IPC reader checks that a Symbol payload is already interned before
+# it calls this compatibility hook. Direct ArrowTypes callers remain trusted.
 _symbol(ptr, len) = ccall(:jl_symbol_n, Ref{Symbol}, (Ptr{UInt8}, Int), ptr, len)
 fromarrow(::Type{Symbol}, ptr::Ptr{UInt8}, len::Int) = _symbol(ptr, len)
 
@@ -285,6 +293,8 @@ arrowname(::Type{IPv6}) = IPV6_SYMBOL
 JuliaType(::Val{IPV6_SYMBOL}) = IPv6
 fromarrow(::Type{IPv6}, x::NTuple{16,UInt8}) = IPv6(_cast(UInt128, x))
 
+# Not a plain reinterpret: the Ref round trip keeps the UInt128 ↔
+# NTuple{16,UInt8} conversion allocation- and trim-safe without a bitcast.
 function _cast(::Type{Y}, x)::Y where {Y}
     y = Ref{Y}()
     _unsafe_cast!(y, Ref(x), 1)
@@ -306,6 +316,16 @@ struct StructKind <: ArrowKind end
 
 ArrowKind(::Type{<:NamedTuple}) = StructKind()
 
+"""
+    ArrowTypes.fromarrowstruct(::Type{T}, ::Val{fnames}, x...) => T
+
+Optional `StructKind` deserialization hook. The field values `x` are passed
+together with their serialized field names `fnames` (a tuple of Symbols), so
+`T` can be reconstructed agnostic to the field order the serializer used.
+When a method is defined for `T`, it takes precedence over
+[`ArrowTypes.fromarrow`](@ref) in `StructKind` deserialization; the default
+forwards to `fromarrow(T, x...)`.
+"""
 @inline fromarrowstruct(T::Type, ::Val, x...) = fromarrow(T, x...)
 
 fromarrow(
@@ -335,7 +355,7 @@ function fromarrow(::Type{VersionNumber}, v::NamedTuple)
     VersionNumber(v.major, v.minor, v.patch, v.prerelease, v.build)
 end
 
-"MapKind data are stored similarly to ListKind, where elements are flattened, and a 2nd offsets buffer contains the individual list element length data"
+"MapKind data is stored like ListKind: flattened key-value entries plus an offsets buffer delimiting each map."
 struct MapKind <: ArrowKind end
 
 ArrowKind(::Type{<:AbstractDict}) = MapKind()
@@ -345,7 +365,7 @@ struct UnionKind <: ArrowKind end
 
 ArrowKind(::Union) = UnionKind()
 
-"DictEncodedKind store a small pool of unique values in one buffer, with a full-length buffer of integer offsets into the small value pool"
+"`DictEncodedKind` stores a category pool in one buffer and a full-length buffer of integer indices into it. A category pool may contain unused or duplicate physical entries."
 struct DictEncodedKind <: ArrowKind end
 
 """
@@ -392,7 +412,13 @@ function promoteunion(T, S)
     return isabstracttype(new) ? Union{T,S} : new
 end
 
-# lazily call toarrow(x) on getindex for each x in data
+"""
+    ArrowTypes.ToArrow(x) -> AbstractVector
+
+A lazy view over `x` that applies [`ArrowTypes.toarrow`](@ref) on `getindex`,
+with a concrete element type. Returns `x` itself when its element type is
+already a concrete natively supported arrow type indexed from 1.
+"""
 struct ToArrow{T,A} <: AbstractVector{T}
     data::A
 end
@@ -423,6 +449,9 @@ end
 Base.IndexStyle(::Type{<:ToArrow}) = Base.IndexLinear()
 Base.size(x::ToArrow) = (length(x.data),)
 Base.eltype(::Type{TA}) where {T,A,TA<:ToArrow{T,A}} = T
+# A conversion failure means "try the other Union branch"; anything else
+# (including InterruptException) must propagate.
+const _CONVERSION_ERRORS = Union{MethodError,InexactError,OverflowError,TypeError}
 function _convert(::Type{T}, x) where {T}
     if x isa T
         return x
@@ -430,10 +459,10 @@ function _convert(::Type{T}, x) where {T}
         # T was a promoted Union and x is not already one of
         # the concrete Union types, so we need to just try
         # to convert, recursively, to one of the Union types
-        # unfortunately not much we can do more efficiently here
         try
             return _convert(T.a, x)
-        catch
+        catch err
+            err isa _CONVERSION_ERRORS || rethrow()
             return _convert(T.b, x)
         end
     else

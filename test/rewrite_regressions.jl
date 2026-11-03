@@ -1,0 +1,750 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Regressions in read-then-rewrite fidelity: bytes read through Arrow.Table
+# and re-emitted with Arrow.write must preserve names, descriptors, dictionary
+# order, metadata order, and null typing. Plus reader-budget accounting.
+
+module RewriteRegressions
+
+using Test
+using Dates
+using Tables
+import DataAPI
+import CategoricalArrays
+using Arrow
+using DataStrings
+using DataStrings: StringVector, StringPayload, BytesVector, DataBytes
+
+const AC = Arrow.ArrowCore
+
+struct _BytesSource <: Arrow.AbstractArrowSource
+    data::Vector{UInt8}
+end
+Arrow.sourcelength(s::_BytesSource) = length(s.data)
+Arrow.readrange(s::_BytesSource, off, len) = s.data[(off + 1):(off + len)]
+
+function _rewrite(bytes; file=false)
+    io = IOBuffer()
+    Arrow.write(io, Arrow.Table(bytes); file=file)
+    return take!(io)
+end
+
+function _dictbytes(poolfield, pooldata, indices; ordered=false, name="d")
+    indextype = AC.IntType(8, true)
+    t = AC.DictionaryType(indextype, poolfield.type, ordered)
+    data = AC.ArrayData(
+        t,
+        length(indices),
+        [AC.BufferSlice(), AC._databuffer(collect(Int8, indices))];
+        dictionary=pooldata,
+        nullcount=0,
+    )
+    field =
+        AC.Field(name, t; nullable=false, children=collect(AC.Field, poolfield.children))
+    schema = AC.Schema([field])
+    return Arrow.writestream(schema, [AC.RecordBatch(schema, [data], length(indices))])
+end
+
+function _fixedlistnullbytes(listsize::Int; file::Bool)
+    childtype = AC.NullType()
+    childfield = AC.Field("item", childtype; nullable=true)
+    childdata = AC.ArrayData(childtype, listsize, AC.BufferSlice[]; nullcount=listsize)
+    listtype = AC.FixedSizeListType(listsize)
+    field = AC.Field("x", listtype; nullable=false, children=[childfield])
+    data = AC.ArrayData(listtype, 1, [AC.BufferSlice()]; children=[childdata], nullcount=0)
+    schema = AC.Schema([field])
+    batch = AC.RecordBatch(schema, [data], 1)
+    return file ? Arrow.writefile(schema, [batch]) : Arrow.writestream(schema, [batch])
+end
+
+# A run-end column of 4 runs over `n` rows.
+function _reebytes(n)
+    runfield, runs = AC.fromjulia("run_ends", Int32[n ÷ 4, n ÷ 2, 3n ÷ 4, n])
+    _, values = AC.fromjulia("values", Int64[1, 2, 3, 4])
+    t = AC.RunEndEncodedType()
+    field = AC.Field(
+        "r",
+        t;
+        nullable=false,
+        children=[runfield, AC.Field("values", AC.IntType(64, true); nullable=false)],
+    )
+    data = AC.ArrayData(t, n, AC.BufferSlice[]; children=[runs, values], nullcount=0)
+    schema = AC.Schema([field])
+    return Arrow.writestream(schema, [AC.RecordBatch(schema, [data], n)])
+end
+_rewriteallocations(t) = @allocated Arrow.write(IOBuffer(), t)
+
+@testset "facade rewrite correctness regressions" begin
+    @testset "repeated names read as x, x_1, as CSV.jl names them" begin
+        f1, d1 = AC.fromjulia("x", Int64[1, 2])
+        f2, d2 = AC.fromjulia("x", Int64[10, 20])
+        f3, d3 = AC.fromjulia("x_1", Int64[5, 6])
+        f1 = AC.Field("x", f1.type; nullable=false, metadata=["slot" => "first"])
+        f2 = AC.Field("x", f2.type; nullable=false, metadata=["slot" => "second"])
+        schema = AC.Schema([f1, f2, f3])
+        batch = AC.RecordBatch(schema, [d1, d2, d3], 2)
+        for bytes in (Arrow.writestream(schema, [batch]), Arrow.writefile(schema, [batch]))
+            table = Arrow.Table(bytes)
+            # A suffix never takes a name the file already has.
+            @test Tables.columnnames(table) == [:x, :x_2, :x_1]
+            @test table.x == [1, 2]
+            @test table.x_2 == [10, 20]
+            @test table.x_1 == [5, 6]
+            @test DataAPI.colmetadata(table, :x, "slot") == "first"
+            @test DataAPI.colmetadata(table, :x_2, "slot") == "second"
+            # Selections, filters, and streams see the same names.
+            sel = Arrow.Table(bytes; select=[:x_2], filter=Arrow.col(:x) > 1)
+            @test Tables.columnnames(sel) == [:x_2] && sel.x_2 == [20]
+            for b in Arrow.Stream(bytes)
+                @test Tables.columnnames(b) == [:x, :x_2, :x_1]
+            end
+            @test Tables.columnnames(Arrow.Stream(bytes)) == [:x, :x_2, :x_1]
+            # A rewrite writes the unique names, each column's metadata kept.
+            rewritten = Arrow.readstream(_rewrite(bytes))
+            @test [f.name for f in rewritten.schema.fields] == ["x", "x_2", "x_1"]
+            back = rewritten.batches[1]
+            @test AC.materialize(rewritten.schema.fields[2], back.columns[2]) == [10, 20]
+            @test collect(rewritten.schema.fields[1].metadata) == ["slot" => "first"]
+            @test collect(rewritten.schema.fields[2].metadata) == ["slot" => "second"]
+        end
+    end
+
+    @testset "NullType is inferred and retained" begin
+        io = IOBuffer()
+        Arrow.write(io, (n=Missing[missing, missing],); file=false)
+        fresh = take!(io)
+        @test Arrow.readstream(fresh).schema.fields[1].type isa AC.NullType
+        @test isequal(Arrow.Table(fresh).n, Missing[missing, missing])
+        retained = _rewrite(fresh)
+        @test Arrow.readstream(retained).schema.fields[1].type isa AC.NullType
+        @test_throws ArgumentError Arrow.write(IOBuffer(), (n=Union{}[],); file=false)
+    end
+
+    @testset "retained dictionaries keep value descriptors and order" begin
+        datefield, datedata = Arrow._constructcolumn(
+            Symbol("date-values"),
+            Date[Date(2024, 1, 1), Date(2024, 1, 2)],
+        )
+        datebytes = _dictbytes(datefield, datedata, Int8[1, 0])
+        dateback = Arrow.readstream(_rewrite(datebytes))
+        datetype = dateback.schema.fields[1].type::AC.DictionaryType
+        @test datetype.valuetype isa AC.DateType
+        @test Arrow.Table(_rewrite(datebytes)).d == [Date(2024, 1, 2), Date(2024, 1, 1)]
+
+        listfield, listdata = AC.fromjulia("list-values", [Int64[1], Int64[2, 3]])
+        listbytes = _dictbytes(listfield, listdata, Int8[1, 0])
+        listback = Arrow.readstream(_rewrite(listbytes))
+        listtype = listback.schema.fields[1].type::AC.DictionaryType
+        @test listtype.valuetype isa AC.ListType
+        @test isequal(Arrow.Table(_rewrite(listbytes)).d, [[2, 3], [1]])
+
+        poolfield, pooldata = AC.fromjulia("ordered-values", ["a", "b", "unused"])
+        orderedbytes = _dictbytes(poolfield, pooldata, Int8[1, 0]; ordered=true)
+        orderedback = Arrow.readstream(_rewrite(orderedbytes))
+        field = orderedback.schema.fields[1]
+        batch = orderedback.batches[1]
+        @test (field.type::AC.DictionaryType).ordered
+        valuefield = AC.dictvaluefield(field, field.type)
+        @test AC.materialize(valuefield, batch.columns[1].dictionary) ==
+              ["a", "b", "unused"]
+        @test AC.materialize(field, batch.columns[1]) == ["b", "a"]
+
+        nullfield, nulldata =
+            AC.fromjulia("nullable-values", Union{Missing,String}["a", missing])
+        nullbytes = _dictbytes(nullfield, nulldata, Int8[1, 0])
+        nullback = Arrow.readstream(_rewrite(nullbytes))
+        @test !nullback.schema.fields[1].nullable
+        @test isequal(
+            AC.materialize(nullback.schema.fields[1], nullback.batches[1].columns[1]),
+            [missing, "a"],
+        )
+    end
+
+    @testset "ordered dictionaries keep their order and flag through rewrites" begin
+        sizes = CategoricalArrays.categorical(
+            ["small", "large", "medium", "small"];
+            ordered=true,
+            levels=["small", "medium", "large"],
+        )
+        order = ["small", "medium", "large"]
+        isordereddict(t) = (getfield(t, :schema).fields[1].type::AC.DictionaryType).ordered
+        one = Arrow.Table(Arrow.tobuffer((; sizes)))
+        two = Arrow.Table(
+            Arrow.tobuffer(Tables.partitioner([(; sizes=sizes[1:2]), (; sizes)])),
+        )
+        @test two.sizes isa Arrow.ChainedVector
+        for t in (one, two)
+            @test isordereddict(t)
+            @test DataAPI.levels(t.sizes) == order
+            @test CategoricalArrays.isordered(t.sizes)
+            # The table, a bare column (as DataFrame(t; copycols=false) holds
+            # it), and a copy of the table all write an ordered dictionary.
+            for src in (t, (; sizes=t.sizes), copy(t))
+                back = Arrow.Table(Arrow.tobuffer(src))
+                @test isordereddict(back)
+                @test DataAPI.levels(back.sizes) == order
+            end
+        end
+        plain =
+            Arrow.Table(Arrow.tobuffer((; sizes=CategoricalArrays.categorical(["b", "a"]))))
+        @test !CategoricalArrays.isordered(plain.sizes)
+        @test !isordereddict(Arrow.Table(Arrow.tobuffer((; sizes=plain.sizes))))
+    end
+
+    @testset "scan results retain dictionary pools" begin
+        # An ordered dictionary rewrites only with its category pool. A scan
+        # keeps the pool, unused categories included, as a full read does.
+        poolfield, pooldata = AC.fromjulia("ordered-values", ["a", "b", "unused"])
+        t = AC.DictionaryType(AC.IntType(8, true), poolfield.type, true)
+        ddata = AC.ArrayData(
+            t,
+            2,
+            [AC.BufferSlice(), AC._databuffer(Int8[1, 0])];
+            dictionary=pooldata,
+            nullcount=0,
+        )
+        dfield =
+            AC.Field("d", t; nullable=false, children=collect(AC.Field, poolfield.children))
+        # A Decimal predicate has no storage-domain form: the public fallback.
+        Dec = Arrow.DataDecimals.Decimal64{2}
+        xio = IOBuffer()
+        Arrow.write(xio, (x=[Dec("1.00"), Dec("2.00")],); file=false)
+        xs = Arrow.readstream(take!(xio))
+        schema = AC.Schema([dfield, xs.schema.fields[1]])
+        batch = AC.RecordBatch(schema, [ddata, xs.batches[1].columns[1]], 2)
+        streambytes = Arrow.writestream(schema, [batch])
+        filebytes = Arrow.writefile(schema, [batch])
+        scans = (
+            Tables.Scan(
+                select=(:d => :e,),
+                filter=Tables.colcmp(==, Tables.col(:d), "a"),
+            ) => ["a"],
+            Tables.Scan(select=(:d => :e,), filter=Tables.col(:x) < Dec("2.00")) =>
+                ["b"],
+        )
+        for (scan, want) in scans,
+            source in (streambytes, filebytes, _BytesSource(filebytes))
+
+            got = Arrow.Table(source isa Vector{UInt8} ? copy(source) : source; scan=scan)
+            @test got.e == want
+            io = IOBuffer()
+            Arrow.write(io, got; file=true)
+            back = Arrow.readfile(take!(io))
+            field = back.schema.fields[1]
+            @test (field.type::AC.DictionaryType).ordered
+            pool = back[1].columns[1].dictionary
+            @test AC.materialize(AC.dictvaluefield(field, field.type), pool) ==
+                  ["a", "b", "unused"]
+        end
+    end
+
+    @testset "retained byte and scalar layouts rebuild exactly" begin
+        raw = Vector{UInt8}(codeunits("short-thirteen-byte"))
+        payloads = StringPayload[
+            DataStrings.inline_payload(raw, 1, 5),
+            DataStrings.view_payload(raw, 7, 13, 0, 6),
+        ]
+        strings = StringVector{DataString}(payloads, [raw])
+        io = IOBuffer()
+        Arrow.write(io, (s=strings,); file=false, stringview=true)
+        viewbytes = take!(io)
+        viewback = Arrow.readstream(_rewrite(viewbytes))
+        @test viewback.schema.fields[1].type == AC.ViewType(true)
+        @test Arrow.Table(_rewrite(viewbytes)).s == ["short", "thirteen-byte"]
+
+        binarytype = AC.BinaryType(true)
+        binarydata = AC.ArrayData(
+            binarytype,
+            2,
+            [
+                AC.BufferSlice(),
+                AC._databuffer(Int64[0, 2, 5]),
+                AC._databuffer(UInt8[1, 2, 3, 4, 5]),
+            ],
+            nullcount=0,
+        )
+        binaryfield = AC.Field("b", binarytype; nullable=false)
+        binaryschema = AC.Schema([binaryfield])
+        binarybytes =
+            Arrow.writestream(binaryschema, [AC.RecordBatch(binaryschema, [binarydata], 2)])
+        binaryback = Arrow.readstream(_rewrite(binarybytes))
+        @test binaryback.schema.fields[1].type == binarytype
+        @test isequal(Arrow.Table(_rewrite(binarybytes)).b, [UInt8[1, 2], UInt8[3, 4, 5]])
+
+        decimaltype = AC.DecimalType(10, 2, 64)
+        decimaldata = AC.ArrayData(
+            decimaltype,
+            2,
+            [AC.BufferSlice(), AC._databuffer(Int64[123, 456])],
+            nullcount=0,
+        )
+        decimalfield = AC.Field("dec", decimaltype; nullable=false)
+        decimalschema = AC.Schema([decimalfield])
+        decimalbytes = Arrow.writestream(
+            decimalschema,
+            [AC.RecordBatch(decimalschema, [decimaldata], 2)],
+        )
+        decimalback = Arrow.readstream(_rewrite(decimalbytes))
+        @test decimalback.schema.fields[1].type == decimaltype
+        @test Arrow.Table(_rewrite(decimalbytes)).dec ==
+              Arrow.DataDecimals.Decimal{10,2,Int64}.(["1.23", "4.56"])
+    end
+
+    @testset "retained composites rebuild recursively" begin
+        Row = NamedTuple{(:x, :y),Tuple{Int64,Union{Missing,String}}}
+        pool = Row[(x=1, y=missing), (x=2, y=missing)]
+        structfield, structdata = Arrow._constructcolumn(:pool, pool)
+        structbytes = _dictbytes(structfield, structdata, Int8[1, 0])
+        structback = Arrow.readstream(_rewrite(structbytes))
+        dictionaryfield = structback.schema.fields[1]
+        @test (dictionaryfield.type::AC.DictionaryType).valuetype isa AC.StructType
+        @test dictionaryfield.children[2].nullable
+        @test isequal(
+            AC.materialize(dictionaryfield, structback.batches[1].columns[1]),
+            Any[
+                Pair{String,Any}["x" => 2, "y" => missing],
+                Pair{String,Any}["x" => 1, "y" => missing],
+            ],
+        )
+
+        xfield, xdata = AC.fromjulia("x", Int64[0, 0])
+        yfield, ydata = AC.fromjulia("y", Union{Missing,String}[missing, missing])
+        allnullfield =
+            AC.Field("s", AC.StructType(); nullable=true, children=[xfield, yfield])
+        allnulldata = AC.ArrayData(
+            AC.StructType(),
+            2,
+            [AC._bitmapbuffer(Bool[false, false])];
+            children=[xdata, ydata],
+            nullcount=2,
+        )
+        allnullschema = AC.Schema([allnullfield])
+        allnullbytes = Arrow.writestream(
+            allnullschema,
+            [AC.RecordBatch(allnullschema, [allnulldata], 2)],
+        )
+        allnullback = Arrow.readstream(_rewrite(allnullbytes))
+        @test allnullback.schema.fields[1].type isa AC.StructType
+        @test isequal(
+            AC.materialize(allnullback.schema.fields[1], allnullback.batches[1].columns[1]),
+            Missing[missing, missing],
+        )
+
+        keyfield, keydata = AC.fromjulia("key", ["a", "b", "c"])
+        valuefield, valuedata = AC.fromjulia("value", Union{Missing,Int64}[1, missing, 3])
+        entriesfield = AC.Field(
+            "entries",
+            AC.StructType();
+            nullable=false,
+            children=[keyfield, valuefield],
+        )
+        entriesdata = AC.ArrayData(
+            AC.StructType(),
+            3,
+            [AC.BufferSlice()];
+            children=[keydata, valuedata],
+            nullcount=0,
+        )
+        maptype = AC.MapType(true)
+        mapfield = AC.Field("m", maptype; nullable=false, children=[entriesfield])
+        mapdata = AC.ArrayData(
+            maptype,
+            2,
+            [AC.BufferSlice(), AC._databuffer(Int32[0, 2, 3])];
+            children=[entriesdata],
+            nullcount=0,
+        )
+        mapschema = AC.Schema([mapfield])
+        mapbytes = Arrow.writestream(mapschema, [AC.RecordBatch(mapschema, [mapdata], 2)])
+        mapback = Arrow.readstream(_rewrite(mapbytes))
+        @test mapback.schema.fields[1].type == maptype
+        @test isequal(
+            AC.materialize(mapback.schema.fields[1], mapback.batches[1].columns[1]),
+            Any[Any["a" => 1, "b" => missing], Any["c" => 3]],
+        )
+
+        runfield, rundata = AC.fromjulia("run_ends", Int16[2, 4])
+        reevaluefield, reevaluedata =
+            AC.fromjulia("values", Union{Missing,String}["x", missing])
+        reetype = AC.RunEndEncodedType()
+        reefield = AC.Field("r", reetype; nullable=true, children=[runfield, reevaluefield])
+        reedata = AC.ArrayData(
+            reetype,
+            4,
+            AC.BufferSlice[];
+            children=[rundata, reevaluedata],
+            nullcount=0,
+        )
+        reeschema = AC.Schema([reefield])
+        reebytes = Arrow.writestream(reeschema, [AC.RecordBatch(reeschema, [reedata], 4)])
+        reeback = Arrow.readstream(_rewrite(reebytes))
+        @test reeback.schema.fields[1].type isa AC.RunEndEncodedType
+        @test reeback.schema.fields[1].children[1].type == AC.IntType(16, true)
+        @test isequal(
+            AC.materialize(reeback.schema.fields[1], reeback.batches[1].columns[1]),
+            Union{Missing,String}["x", "x", missing, missing],
+        )
+
+        datefield = AC.Field("item", AC.DateType(AC.DAY); nullable=false)
+        datedata = AC.ArrayData(
+            datefield.type,
+            3,
+            [AC.BufferSlice(), AC._databuffer(Int32[0, 1, 2])],
+            nullcount=0,
+        )
+        listviewtype = AC.ListViewType(false)
+        listviewfield =
+            AC.Field("dates", listviewtype; nullable=false, children=[datefield])
+        listviewdata = AC.ArrayData(
+            listviewtype,
+            2,
+            [AC.BufferSlice(), AC._databuffer(Int32[0, 2]), AC._databuffer(Int32[2, 1])];
+            children=[datedata],
+            nullcount=0,
+        )
+        listviewschema = AC.Schema([listviewfield])
+        listviewbytes = Arrow.writestream(
+            listviewschema,
+            [AC.RecordBatch(listviewschema, [listviewdata], 2)],
+        )
+        listviewback = Arrow.readstream(_rewrite(listviewbytes))
+        @test listviewback.schema.fields[1].type == listviewtype
+        @test isequal(
+            AC.materialize(
+                listviewback.schema.fields[1],
+                listviewback.batches[1].columns[1],
+            ),
+            Any[Any[Int32(0), Int32(1)], Any[Int32(2)]],
+        )
+
+        liststructtype = AC.ListType(true)
+        liststructfield =
+            AC.Field("rows", liststructtype; nullable=false, children=[structfield])
+        liststructdata = AC.ArrayData(
+            liststructtype,
+            1,
+            [AC.BufferSlice(), AC._databuffer(Int64[0, 2])];
+            children=[structdata],
+            nullcount=0,
+        )
+        liststructschema = AC.Schema([liststructfield])
+        liststructbytes = Arrow.writestream(
+            liststructschema,
+            [AC.RecordBatch(liststructschema, [liststructdata], 1)],
+        )
+        liststructback = Arrow.readstream(_rewrite(liststructbytes))
+        @test liststructback.schema.fields[1].type == liststructtype
+        @test liststructback.schema.fields[1].children[1].type isa AC.StructType
+
+        uniontype = AC.UnionType(AC.DenseMode, Int8[0, 1])
+        unionintfield, unionintdata = AC.fromjulia("i", Int64[1])
+        unionstrfield, unionstrdata = AC.fromjulia("s", ["x"])
+        unionfield = AC.Field(
+            "u",
+            uniontype;
+            nullable=false,
+            children=[unionintfield, unionstrfield],
+        )
+        uniondata = AC.ArrayData(
+            uniontype,
+            2,
+            [AC._databuffer(Int8[0, 1]), AC._databuffer(Int32[0, 0])];
+            children=[unionintdata, unionstrdata],
+            nullcount=0,
+        )
+        unionschema = AC.Schema([unionfield])
+        unionbytes =
+            Arrow.writestream(unionschema, [AC.RecordBatch(unionschema, [uniondata], 2)])
+        # Each value goes back to the child of its type, under the same field.
+        unionback = Arrow.readstream(_rewrite(unionbytes))
+        @test Arrow._fieldcontractequal(unionback.schema.fields[1], unionfield)
+        @test isequal(collect(Arrow.Table(_rewrite(unionbytes)).u), [1, "x"])
+    end
+
+    @testset "metadata duplicates and order survive" begin
+        field0, data = AC.fromjulia("x", Int64[1])
+        field = AC.Field(
+            "x",
+            field0.type;
+            nullable=false,
+            metadata=["z" => "one", "a" => "middle", "z" => "two"],
+        )
+        metadata = ["z" => "one", "a" => "middle", "z" => "two"]
+        schema = AC.Schema([field]; metadata=metadata)
+        bytes = Arrow.writestream(schema, [AC.RecordBatch(schema, [data], 1)])
+        decoded = Arrow.readstream(bytes)
+        @test collect(decoded.schema.metadata) == metadata
+        @test collect(decoded.schema.fields[1].metadata) == metadata
+        rewritten = Arrow.readstream(_rewrite(bytes))
+        @test collect(rewritten.schema.metadata) == metadata
+        @test collect(rewritten.schema.fields[1].metadata) == metadata
+    end
+
+    @testset "NUL field names stay Core-only and fail cleanly at the facade" begin
+        field, data = AC.fromjulia("a\0b", Int64[1])
+        schema = AC.Schema([field])
+        streambytes = Arrow.writestream(schema, [AC.RecordBatch(schema, [data], 1)])
+        filebytes = Arrow.writefile(schema, [AC.RecordBatch(schema, [data], 1)])
+        @test Arrow.readstream(streambytes).schema.fields[1].name == "a\0b"
+        @test Arrow.readfile(filebytes).schema.fields[1].name == "a\0b"
+        @test_throws AC.ValidationError Arrow.Table(streambytes)
+        @test_throws AC.ValidationError Arrow.Table(filebytes; scan=Tables.Scan())
+        @test_throws AC.ValidationError first(Arrow.Stream(streambytes))
+        @test_throws AC.ValidationError Arrow.Table(
+            _BytesSource(filebytes);
+            scan=Tables.Scan(),
+        )
+    end
+
+    @testset "reader budget includes public materialization" begin
+        limit = Int64(1_000_000)
+        limits() = Arrow.Limits(max_total_allocated_bytes=limit)
+        listsize = 200_000
+        streambytes = _fixedlistnullbytes(listsize; file=false)
+        filebytes = _fixedlistnullbytes(listsize; file=true)
+        @test length(streambytes) < 1_000
+        @test length(filebytes) < 1_000
+
+        openstream() = Arrow.readstream(copy(streambytes); limits=limits())
+        openfile() = Arrow.readfile(copy(filebytes); limits=limits())
+
+        # The facade reads the row as a view of one owned `Vector{Missing}`,
+        # which stores no elements, so it fits the budget at every entry point.
+        ranged() = Arrow.SourceFile(
+            _BytesSource(copy(filebytes));
+            limits=limits(),
+            tailbytes=32,
+            gapbytes=0,
+        )
+        for t in (
+            Arrow.Table(openstream()),
+            Arrow.Table(openstream(); scan=Tables.Scan(select=(:x,))),
+            Arrow.Table(openfile()),
+            Arrow.Table(openfile(); scan=Tables.Scan(select=(:x,))),
+            first(Arrow.Stream(openstream())),
+            first(Arrow.Stream(openfile())),
+            Arrow.Table(ranged(); scan=Tables.Scan(select=(:x,))),
+        )
+            @test length(t.x) == 1 && length(t.x[1]) == listsize && all(ismissing, t.x[1])
+        end
+
+        largeio = IOBuffer()
+        Arrow.write(largeio, (x=zeros(Int64, 200_000),); file=true)
+        largebytes = take!(largeio)
+        @test length(largebytes) > limit
+        wholesource = Arrow.SourceFile(
+            _BytesSource(largebytes);
+            limits=limits(),
+            tailbytes=32,
+            gapbytes=0,
+        )
+        @test_throws Arrow.AllocationLimitError Arrow.Table(wholesource)
+    end
+
+    @testset "DictEncode pools dedup structurally before construction" begin
+        # Identity-only dedup used to build an O(rows) candidate pool for
+        # identity-distinct (mutable) categories such as Vector{Int} rows.
+        rows = [isodd(i) ? [1, 2] : [3, 4] for i = 1:50_000]
+        pool = Arrow._dictionarypool(rows, nothing)
+        @test length(pool) == 2
+        @test pool == [[1, 2], [3, 4]]
+
+        io = IOBuffer()
+        Arrow.write(io, (v=Arrow.DictEncode(rows),); file=false)
+        bytes = take!(io)
+        back = Arrow.readstream(bytes)
+        @test back.schema.fields[1].type isa AC.DictionaryType
+        @test length(back.batches[1].columns[1].dictionary::AC.ArrayData) == 2
+        @test isequal(Arrow.Table(bytes).v, rows)
+
+        # Candidate categories compare as `===`: floats by bits (0.0 and -0.0
+        # stay distinct, one NaN payload is one category), mutable values by
+        # reference, arrays of plain values by contents.
+        floatpool = Arrow._dictionarypool(Float64[0.0, -0.0, NaN, NaN], nothing)
+        @test length(floatpool) == 3
+        a = Ref(1)
+        b = Ref(1)
+        refpool = Arrow._dictionarypool([a, b, a], nothing)
+        @test length(refpool) == 2
+    end
+
+    @testset "dictionary and run-end columns rewrite from their buffers" begin
+        # Indices and runs are reused, not found again value by value.
+        n = 1_000_000
+        dict = Arrow.Table(
+            take!(Arrow.tobuffer((d=Arrow.DictEncode(rand(["a", "b", "c"], n)),))),
+        )
+        ree = Arrow.Table(_reebytes(n))
+        for t in (dict, ree)
+            _rewriteallocations(t)
+            once = take!(Arrow.tobuffer(t))
+            @test take!(Arrow.tobuffer(Arrow.Table(once))) == once
+            @test isequal(Arrow.Table(once)[1], t[1])
+        end
+        @test _rewriteallocations(dict) < 40n
+        @test _rewriteallocations(ree) < n
+        @test getfield(Arrow.Table(take!(Arrow.tobuffer(ree))), :schema).fields[1].type isa
+              AC.RunEndEncodedType
+    end
+
+    @testset "a child whose values in a batch are all null rewrites" begin
+        function onebatch(f, d)
+            sch = AC.Schema([f])
+            return Arrow.writestream(sch, [AC.RecordBatch(sch, [d], Int(d.len))])
+        end
+        # Unions whose Int64 child holds only a null, as pyarrow writes them.
+        for sparse in (false, true)
+            fi, di = AC.fromjulia("i", Union{Missing,Int64}[missing for _ = 1:(1 + sparse)])
+            fs, ds = AC.fromjulia("s", sparse ? ["", "x"] : ["x"])
+            t = AC.UnionType(sparse ? AC.SparseMode : AC.DenseMode, Int8[0, 1])
+            buffers = AC.BufferSlice[AC._databuffer(Int8[0, 1])]
+            sparse || push!(buffers, AC._databuffer(Int32[0, 0]))
+            f = AC.Field("u", t; nullable=true, children=[fi, fs])
+            bytes = onebatch(f, AC.ArrayData(t, 2, buffers; children=[di, ds], nullcount=0))
+            @test isequal(collect(Arrow.Table(bytes).u), [missing, "x"])
+            @test isequal(collect(Arrow.Table(_rewrite(bytes)).u), [missing, "x"])
+        end
+        # A list view of structs whose `a` field is all null.
+        fa, da = AC.fromjulia("a", Union{Missing,Int64}[missing, missing])
+        fb, db = AC.fromjulia("b", ["x", "y"])
+        st, lt = AC.StructType(), AC.ListViewType(false)
+        item = AC.Field("item", st; nullable=true, children=[fa, fb])
+        itemdata = AC.ArrayData(st, 2, [AC.BufferSlice()]; children=[da, db], nullcount=0)
+        buffers = [AC.BufferSlice(), AC._databuffer(Int32[0]), AC._databuffer(Int32[2])]
+        f = AC.Field("lv", lt; nullable=true, children=[item])
+        bytes = onebatch(f, AC.ArrayData(lt, 1, buffers; children=[itemdata], nullcount=0))
+        before = collect(Arrow.Table(bytes).lv)
+        @test isequal(collect(Arrow.Table(_rewrite(bytes)).lv), before)
+    end
+
+    @testset "VersionNumber columns rewrite" begin
+        v = [v"1.2.3", v"2"]
+        m = Union{Missing,VersionNumber}[v"1", missing]
+        bytes = read(Arrow.tobuffer((v=v, m=m)))
+        for file in (false, true)
+            t = Arrow.Table(_rewrite(bytes; file))
+            @test t.v == v
+            @test isequal(collect(t.m), m)
+        end
+    end
+
+    @testset "dictencode refuses struct rows that would write as a map" begin
+        # Repeated field names read as ordered `name => value` pair rows.
+        fa, da = AC.fromjulia("a", Int64[1, 2])
+        fb, db = AC.fromjulia("a", ["x", "y"])
+        st = AC.StructType()
+        f = AC.Field("s", st; nullable=false, children=[fa, fb])
+        sch = AC.Schema([f])
+        d = AC.ArrayData(st, 2, [AC.BufferSlice()]; children=[da, db], nullcount=0)
+        bytes = Arrow.writestream(sch, [AC.RecordBatch(sch, [d], 2)])
+        rows = collect(Arrow.Table(bytes).s)
+        @test isequal(collect(Arrow.Table(_rewrite(bytes)).s), rows)
+        for file in (false, true)
+            err = @test_throws ArgumentError Arrow.write(
+                IOBuffer(),
+                Arrow.Table(bytes);
+                dictencode=true,
+                file,
+            )
+            @test occursin("column s holds struct rows", err.value.msg)
+        end
+    end
+
+    @testset "map rows that repeat a key rewrite from any read" begin
+        # Arrow leaves unique keys to the application: keys stored as
+        # themselves keep a row's repeats however the column was read.
+        plain(x) =
+            x isa Pair ? plain(first(x)) => plain(last(x)) :
+            x isa Union{AbstractDict,AbstractVector} ? [plain(y) for y in x] : x
+        io = IOBuffer()
+        Arrow.Writer(io; file=false) do w
+            m = [["k" => 1, "k" => 2], ["j" => 3]]
+            Arrow.write(w, (id=[1, 2], m=m, l=[[m[1]], [m[2]]]))
+            Arrow.write(w, (id=[3], m=[["k" => 4, "k" => 5]], l=[[["j" => 6, "j" => 7]]]))
+        end
+        two = take!(io)
+        U = Union{Int,Vector{Pair{String,Int}}}
+        @testset "$label" for (label, t) in (
+            ("two batches", Arrow.Table(two)),
+            ("a filtered read", Arrow.Table(two; filter=Arrow.col(:id) > 1)),
+            ("a union child", Arrow.Table(Arrow.tobuffer((u=U[1, ["k" => 1, "k" => 2]],)))),
+            ("labelled values", Arrow.Table(Arrow.tobuffer((m=[["k" => :a, "k" => :b]],)))),
+        )
+            out = Arrow.Table(Arrow.tobuffer(t))
+            for name in Tables.columnnames(t)
+                @test isequal(
+                    plain(Tables.getcolumn(out, name)),
+                    plain(Tables.getcolumn(t, name)),
+                )
+            end
+        end
+    end
+
+    @testset "hidden dictionary slots point at one pool value" begin
+        for value in (["x"], Int64[1]), nullable in (false, true)
+            valuefield, _ = AC.fromjulia("d", value)
+            dicttype = AC.DictionaryType(AC.IntType(32, true), valuefield.type, false)
+            dict = AC.Field("d", dicttype; nullable)
+            parent = AC.Field("p", AC.StructType(); nullable=true, children=[dict])
+            f, d = Arrow._constructhiddenpart(parent, 2, Arrow._WriterContext("p"))
+            AC.validate_full(f, d)
+            @test all(ismissing, AC.materialize(f, d))
+            # A non-nullable dictionary's valid indices need one pool value.
+            @test only(d.children).dictionary.len == (nullable ? 0 : 1)
+        end
+    end
+
+    # Arrow 2.x's FlatBuffers builder deduplicates vtables comparing slot
+    # offsets only, so a DictionaryEncoding table can reuse a KeyValue vtable
+    # whose declared object length understates the id field's extent. The
+    # verifier must bound inline fields by the buffer (as the reference
+    # implementation does), not by the reused vtable's object length, or
+    # every 2.x file with a dict-encoded, metadata-carrying field is refused.
+    # Fixtures written by registered Arrow 2.8.1 (+ CategoricalArrays 1.1.1
+    # for the categorical pair).
+    @testset "2.x vtable dedup: dict-encoded fields with metadata read" begin
+        fixture(name) = read(joinpath(@__DIR__, "fixtures2x", name * ".arrowbytes"))
+
+        t = Arrow.Table(fixture("dict-ext-metadata"))
+        @test t.a == [1, 2, 1]
+        @test "ARROW:extension:name" in collect(DataAPI.colmetadatakeys(t, :a))
+
+        t = Arrow.Table(fixture("colmeta-plain"))
+        @test t.a == [1, 2]
+        @test DataAPI.colmetadata(t, :a, "k") == "v"
+
+        # The CategoricalArrays extension labels are unregistered here, so the
+        # reader warns (once per process) and reads the dictionary-encoded
+        # strings the label is stored as.
+        empty!(Arrow._WARNED_EXTENSIONS)
+        t =
+            @test_logs (:warn, r"unsupported ARROW:extension:name") match_mode = :any Arrow.Table(
+                fixture("categorical-column"),
+            )
+        @test t.x == ["a", "b", "a", "c"]
+
+        empty!(Arrow._WARNED_EXTENSIONS)
+        t =
+            @test_logs (:warn, r"unsupported ARROW:extension:name") match_mode = :any Arrow.Table(
+                fixture("categorical-missing"),
+            )
+        @test isequal(t.y, ["a", missing, "b"])
+        @test eltype(t.y) == Union{Missing,DataString}
+    end
+end
+
+end # module RewriteRegressions

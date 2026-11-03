@@ -14,11 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-const fileIdentifierLength = 4
-
 """
 Scalar
-A Union of the Julia types `T <: Number` that are allowed in FlatBuffers schema
+The Julia scalar types allowed in a FlatBuffers schema: the fixed-width
+integers and floats, `Bool`, and `Enum`.
 """
 const Scalar =
     Union{Bool,Int8,Int16,Int32,Int64,UInt8,UInt16,UInt32,UInt64,Float32,Float64,Enum}
@@ -39,7 +38,6 @@ mutable struct Builder
     head::UOffsetT
     nested::Bool
     finished::Bool
-    sharedstrings::Dict{String,UOffsetT}
 end
 
 bytes(b::Builder) = getfield(b, :bytes)
@@ -53,20 +51,7 @@ Builder(size=0) = Builder(
     UOffsetT(size),
     false,
     false,
-    Dict{String,UOffsetT}(),
 )
-
-function reset!(b::Builder)
-    empty!(b.bytes)
-    empty!(b.vtable)
-    emtpy!(b.vtables)
-    empty!(b.sharedstrings)
-    b.minalign = 1
-    b.nested = false
-    b.finished = false
-    b.head = 0
-    return
-end
 
 Base.write(sink::Builder, o, x::Union{Bool,UInt8}) = sink.bytes[o + 1] = UInt8(x)
 function Base.write(sink::Builder, off, x::T) where {T}
@@ -80,9 +65,8 @@ Base.write(b::Builder, o, x::Float64) = write(b, o, reinterpret(UInt64, x))
 Base.write(b::Builder, o, x::Enum) = write(b, o, basetype(x)(x))
 
 """
-`finishedbytes` returns a pointer to the written data in the byte buffer.
-Panics if the builder is not in a finished state (which is caused by calling
-`finish!()`).
+`finishedbytes` returns a view of the written data in the byte buffer. It
+throws unless `finish!` has put the builder in a finished state.
 """
 function finishedbytes(b::Builder)
     assertfinished(b)
@@ -99,7 +83,7 @@ function startobject!(b::Builder, numfields)
 end
 
 """
-WriteVtable serializes the vtable for the current object, if applicable.
+`writevtable!` serializes the vtable for the current object, if applicable.
 
 Before writing out the vtable, this checks pre-existing vtables for equality
 to this one. If an equal vtable is found, point the object to the existing
@@ -134,10 +118,7 @@ function writevtable!(b::Builder)
     end
 
     # Search backwards through existing vtables, because similar vtables
-    # are likely to have been recently appended. See
-    # BenchmarkVtableDeduplication for a case in which this heuristic
-    # saves about 30% of the time used in writing objects with duplicate
-    # tables.
+    # are likely to have been recently appended.
     for i = length(b.vtables):-1:1
         # Find the other vtable, which is associated with `i`:
         vt2Offset = b.vtables[i]
@@ -146,7 +127,8 @@ function writevtable!(b::Builder)
 
         metadata = VtableMetadataFields * sizeof(VOffsetT)
         vt2End = vt2Start + vt2Len
-        vt2 = view(b.bytes, (vt2Start + metadata + 1):vt2End) #TODO: might need a +1 on the start of range here
+        # The field entries only (past the two metadata VOffsetTs).
+        vt2 = view(b.bytes, (vt2Start + metadata + 1):vt2End)
 
         # Compare the other vtable to the one under consideration.
         # If they are equal, store the offset and break:
@@ -205,7 +187,7 @@ function writevtable!(b::Builder)
 end
 
 """
-`endobject` writes data necessary to finish object construction.
+`endobject!` writes data necessary to finish object construction.
 """
 function endobject!(b::Builder)
     assertnested(b)
@@ -270,7 +252,7 @@ function prependoffsetslot!(b::Builder, o::Int, x::T, d) where {T}
 end
 
 """
-`startvector` initializes bookkeeping for writing a new vector.
+`startvector!` initializes bookkeeping for writing a new vector.
 
 A vector has the following format:
 <UOffsetT: number of elements in this vector>
@@ -285,19 +267,13 @@ function startvector!(b::Builder, elemSize, numElems, alignment)
 end
 
 """
-`endvector` writes data necessary to finish vector construction.
+`endvector!` writes data necessary to finish vector construction.
 """
 function endvector!(b::Builder, vectorNumElems)
     assertnested(b)
     place!(b, UOffsetT(vectorNumElems))
     b.nested = false
     return offset(b)
-end
-
-function createsharedstring!(b::Builder, s::AbstractString)
-    get!(b.sharedstrings, s) do
-        createstring!(b, s)
-    end
 end
 
 """
@@ -316,8 +292,6 @@ function createstring!(b::Builder, s::Union{AbstractString,AbstractVector{UInt8}
     copyto!(b.bytes, b.head + 1, s, 1, l)
     return endvector!(b, sizeof(s))
 end
-
-createbytevector(b::Builder, v) = createstring!(b, v)
 
 function assertnested(b::Builder)
     # If you get this assert, you're in an object while trying to write
@@ -361,26 +335,10 @@ end
 If value `x` equals default `d`, then the slot will be set to zero and no
 other data will be written.
 """
-function prependslot!(b::Builder, o::Int, x::T, d, sh=false) where {T<:Scalar}
+function prependslot!(b::Builder, o::Int, x::T, d) where {T<:Scalar}
     if x != T(d)
         prepend!(b, x)
         slot!(b, o)
-    end
-    return
-end
-
-"""
-`prependstructslot!` prepends a struct onto the object at vtable slot `o`.
-Structs are stored inline, so nothing additional is being added.
-In generated code, `d` is always 0.
-"""
-function prependstructslot!(b::Builder, voffset, x, d)
-    if x != d
-        assertnested(b)
-        if x != offset(b)
-            throw(ArgumentError("inline data write outside of object"))
-        end
-        slot!(b, voffset)
     end
     return
 end
@@ -390,23 +348,6 @@ end
 """
 function slot!(b::Builder, slotnum)
     b.vtable[slotnum + 1] = offset(b)
-end
-
-# FinishWithFileIdentifier finalizes a buffer, pointing to the given `rootTable`.
-# as well as applys a file identifier
-function finishwithfileidentifier(b::Builder, rootTable, fid)
-    if length(fid) != fileIdentifierLength
-        error("incorrect file identifier length")
-    end
-    # In order to add a file identifier to the flatbuffer message, we need
-    # to prepare an alignment and file identifier length
-    prep!(b, b.minalign, sizeof(Int32) + fileIdentifierLength)
-    for i = fileIdentifierLength:-1:1
-        # place the file identifier
-        place!(b, fid[i])
-    end
-    # finish
-    finish!(b, rootTable)
 end
 
 """
@@ -427,7 +368,8 @@ function vtableEqual(a::Vector{UOffsetT}, objectStart, b::AbstractVector{UInt8})
     end
 
     for i = 0:(length(a) - 1)
-        x = read(IOBuffer(view(b, (i * sizeof(VOffsetT) + 1):length(b))), VOffsetT)
+        base = i * sizeof(VOffsetT)
+        x = VOffsetT(b[base + 1]) | (VOffsetT(b[base + 2]) << 8)
 
         # Skip vtable entries that indicate a default value.
         x == 0 && a[i + 1] == 0 && continue

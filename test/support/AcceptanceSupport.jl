@@ -1,0 +1,171 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+module AcceptanceSupport
+
+import Arrow
+using PooledArrays
+using Tables
+import Dates
+
+const AC = Arrow.AC
+
+# The acceptance implementation deliberately exercises private adapter and
+# Core seams. Keep that dependency explicit: adding or removing one of these
+# names is a reviewable test-interface change, not an automatic consequence of
+# an unrelated package binding.
+import Arrow:
+    ARROW_FLAG_DICTIONARY_ORDERED,
+    ARROW_FLAG_MAP_KEYS_SORTED,
+    AllocationBudget,
+    AllocationLimitError,
+    ArrayData,
+    ArrowFile,
+    ArrowType,
+    BinaryType,
+    BoolType,
+    BufferSlice,
+    CArrowArray,
+    CArrowArrayStream,
+    CArrowSchema,
+    CODEC_LZ4_FRAME,
+    CODEC_ZSTD,
+    CONTINUATION,
+    DateType,
+    DecimalType,
+    DecodeCursor,
+    DecodeState,
+    DictionaryType,
+    DurationType,
+    EINVAL,
+    EXPORTS,
+    EXPERIMENTAL_COMPRESSION_KEY,
+    FB,
+    FILE_MAGIC,
+    Field,
+    FixedSizeBinaryType,
+    FixedSizeListType,
+    ForeignOwner,
+    ImportedStream,
+    IPCStream,
+    IntType,
+    IntervalType,
+    Limits,
+    ListType,
+    ListViewType,
+    MapType,
+    Meta,
+    NullType,
+    OwnerRegion,
+    REGISTRY_LOCK,
+    RecordBatch,
+    ReleaseCounter,
+    RunEndEncodedType,
+    Schema,
+    SourceFile,
+    StreamOwner,
+    StructType,
+    TimeType,
+    TimestampType,
+    UnionType,
+    Utf8Type,
+    ValidationError,
+    ViewType,
+    _ArrowTypesRoutedUnion,
+    _VTable,
+    _batchcodec,
+    _batchfield,
+    _blockmessage,
+    _coalesce,
+    _coremetatype,
+    _decompressbuffer!,
+    _framemessages,
+    _metaschema!,
+    _moveowner,
+    _readfooter,
+    _reap!,
+    _RETIRED,
+    _recordbatchmeta,
+    _release_c!,
+    _remaining,
+    _requirelittleendian,
+    _store_field!,
+    _structarray,
+    _validateblockindex,
+    _validatebodyplan,
+    _vfield,
+    _vi32,
+    _vi64,
+    _vrange,
+    _vref,
+    _vtable,
+    _vu32,
+    _vu8,
+    _vvector,
+    assigndictids,
+    batch,
+    export_stream!,
+    formatstring,
+    framemessages,
+    from_c_data,
+    from_c_stream,
+    fromjulia,
+    getvalue,
+    heapregion,
+    increment!,
+    layoutspec,
+    materialize,
+    mmapregion,
+    nextbatch!,
+    nullcount,
+    parseformat,
+    readfile,
+    readstream,
+    release!,
+    to_c_data,
+    validate_full,
+    validate_semantic,
+    validatedictionaryids,
+    validaterecordcolumns,
+    variadiccounts,
+    verify_footer,
+    verify_ipc_metadata,
+    writefile,
+    writestream
+
+include(joinpath(@__DIR__, "cdata_stress.jl"))
+include(joinpath(@__DIR__, "..", "battery_helpers.jl"))
+include(joinpath(@__DIR__, "..", "ipc_read_battery.jl"))
+include(joinpath(@__DIR__, "..", "ipc_write_battery.jl"))
+include(joinpath(@__DIR__, "..", "cdata_battery.jl"))
+include(joinpath(@__DIR__, "..", "scan_battery.jl"))
+
+function _run_scan_acceptance()
+    filebytes, full = _scan_main()
+    _ranged_main(filebytes, full)
+    return nothing
+end
+
+"The stable acceptance names and their throwing runners, in execution order."
+acceptance_suites() = (
+    "IPC read acceptance" => ipc_read_battery,
+    "IPC write acceptance" => ipc_write_battery,
+    "C data acceptance" => cdata_battery,
+    "Scan acceptance" => _run_scan_acceptance,
+)
+
+end # module AcceptanceSupport

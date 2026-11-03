@@ -1,0 +1,94 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Deterministic fuzz
+
+on:
+  schedule:
+    - cron: '15 3 * * 3'
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: Master UInt64 seed (decimal or 0x-prefixed hex)
+        required: false
+        default: '0x9f5a37c241de880b'
+      cases:
+        description: Differential cases
+        required: false
+        default: '512'
+      mutations:
+        description: Byte mutations
+        required: false
+        default: '20000'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: Extended differential and mutation fuzz - stable Julia
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      FUZZ_SEED: ${{ github.event_name == 'schedule' && github.run_id || inputs.seed || '0x9f5a37c241de880b' }}
+      FUZZ_CASES: ${{ inputs.cases || '512' }}
+      FUZZ_MUTATIONS: ${{ inputs.mutations || '20000' }}
+      FUZZ_REPRO_DIR: fuzz-reproductions
+    steps:
+      - uses: actions/checkout@v7
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+      - uses: actions/cache@v6
+        with:
+          path: ~/.julia/artifacts
+          key: fuzz-${{ runner.os }}-${{ hashFiles('**/Project.toml') }}
+          restore-keys: fuzz-${{ runner.os }}-
+      - name: Prepare development dependencies
+        shell: julia --project=. {0}
+        run: |
+          using Pkg
+          Pkg.develop([PackageSpec(path="src/ArrowTypes")])
+      - name: Report replay coordinates
+        run: |
+          echo "event=$GITHUB_EVENT_NAME"
+          echo "master_seed=$FUZZ_SEED"
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$FUZZ_SEED" != "$GITHUB_RUN_ID" ]; then
+            echo "scheduled fuzz seed must equal the workflow run ID" >&2
+            exit 1
+          fi
+      - name: Run deterministic differential and mutation fuzzing
+        run: >-
+          timeout --signal=TERM --kill-after=30s 80m
+          julia --color=yes --startup-file=no --history-file=no --project=.
+          test/fuzz.jl
+          --seed "$FUZZ_SEED"
+          --cases "$FUZZ_CASES"
+          --mutations "$FUZZ_MUTATIONS"
+          --determinism-every 256
+          --repro-dir "$FUZZ_REPRO_DIR"
+      - name: Upload failure reproductions
+        if: failure() && hashFiles('fuzz-reproductions/**') != ''
+        uses: actions/upload-artifact@v6
+        with:
+          name: deterministic-fuzz-reproductions
+          path: fuzz-reproductions
+          if-no-files-found: ignore
+          retention-days: 14
