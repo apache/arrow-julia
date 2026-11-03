@@ -1886,6 +1886,11 @@ function _conformancemismatch(
 )
     expected.name == actual.name || return "$path is named $(repr(actual.name))"
     if !AC.typeequal(expected.type, actual.type)
+        actual.type isa AC.NullType &&
+            !_holdsnull(actual) &&
+            return "$path writes as null labelled " *
+                   "$(first(_arrowtypesextension(actual))), not as missing values, but " *
+                   "the schema has $(_typename(expected))"
         expected.type isa AC.NullType &&
             return "$path writes as $(_typename(actual.type)), but the schema " *
                    "declared it null because it held only missing values (or no " *

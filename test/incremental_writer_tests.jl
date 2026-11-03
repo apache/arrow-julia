@@ -883,6 +883,13 @@ batchkinds(bytes) = [
         _, errs = writetables([(a=[1],), (a=[missing],)]; nullable=false)
         @test occursin("created with nullable=false", errs[2].msg)
         @test !occursin("one-table", errs[2].msg)
+        # A column of `nothing` is not missing values, and declaring the field
+        # nullable would not help it.
+        for nullable in (true, false)
+            _, errs = writetables([(a=[1],), (a=[nothing],)]; nullable)
+            @test occursin("null labelled JuliaLang.Nothing", errs[2].msg)
+            @test !occursin("created with nullable=false", errs[2].msg)
+        end
         # An append to a one-table stream: a nullable Writer would have taken
         # the missing values, but not another type or a labelled union's.
         path = joinpath(mktempdir(), "s.arrow")
