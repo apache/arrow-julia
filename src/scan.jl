@@ -1772,7 +1772,10 @@ _selectsonly(b::Tables.BoundScan) =
     b.filter === nothing && b.limit === nothing && b.offset == 0
 
 # The values (rows times decoded columns) that make one more decode task worth it.
-const _VALUES_PER_TASK = 1 << 20
+const _VALUES_PER_TASK = 1 << 18
+# At most `ntasks` tasks, one per `_VALUES_PER_TASK` values to decode.
+_decodetasks(ntasks::Int, values::Integer) =
+    min(ntasks, max(1, Int(cld(values, _VALUES_PER_TASK))))
 
 """
 Read scan `plan` from `records`, the record batches it may keep, and return
@@ -1822,7 +1825,7 @@ function _runscan(
     decodeidx = _deduplicatesorted!(vcat(outidx, filteridx))
     # A task pays for its spawn and wake-up only with enough values to decode,
     # so a small batch (one `Arrow.Stream` step, say) runs on the calling task.
-    ntasks = min(ntasks, max(1, cld(total * length(decodeidx), _VALUES_PER_TASK)))
+    ntasks = _decodetasks(ntasks, total * length(decodeidx))
     if b.filter === nothing && windows === nothing && !any(raw)
         _fetch!(bodies, 1:n, _fieldmask(decodeidx, nf))
         _chargevector!(budget, Union{Nothing,ArrayData}, n * nf, "batch columns")
@@ -1923,12 +1926,14 @@ function _runscan(
         try
             for k = 1:n
                 take[] == 0 && break
+                # One batch at a time: its own values decide its tasks.
+                tasks = _decodetasks(ntasks, _rowcount(records[k]) * length(decodeidx))
                 # A small body's columns cost one round trip, not two.
                 _fetch!(bodies, k:k, _smallrecord(bodies, k) ? decodemask : firstmask)
-                first!(k, states, ntasks)
+                first!(k, states, tasks)
                 if kept[k] !== nothing && !isempty(restidx)
                     _fetch!(bodies, k:k, restmask)
-                    rest!(k, states, ntasks)
+                    rest!(k, states, tasks)
                 end
                 _release!(bodies, k)
             end
