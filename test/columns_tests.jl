@@ -326,7 +326,9 @@ end
         )
         for bytes in (whole, batches)
             c = Arrow.Table(bytes).c
-            for rows in ([1, 3, 4], 2:5, [7, 1, 5], [x === "a" for x in cats])
+            mask = [x === "a" for x in cats]
+            for rows in
+                ([1, 3, 4], 2:5, [7, 1, 5], Int32[7, 1, 5], 1:2:7, mask, BitVector(mask))
                 sub = c[rows]
                 @test sub isa PooledArray && isequal(sub, cats[rows])
                 # The dictionary's categories, in its order, unused ones too.
@@ -334,7 +336,27 @@ end
             end
             @test c[[2]] == ["a"] && !(c[[2]] isa Arrow.DictEncoded)
             @test_throws BoundsError c[[8]]
+            @test_throws BoundsError c[Int32[8]]
         end
+        # A copy of a column with no rows keeps its categories.
+        vf, vd = Arrow.AC.fromjulia("v", ["x", "y"])
+        dt = Arrow.AC.DictionaryType(Arrow.AC.IntType(8, true), vf.type, false)
+        dd = Arrow.AC.ArrayData(
+            dt,
+            0,
+            [Arrow.AC.BufferSlice(), Arrow.AC._databuffer(Int8[])];
+            dictionary=vd,
+            nullcount=0,
+        )
+        df = Arrow.AC.Field(
+            "c",
+            dt;
+            nullable=false,
+            children=collect(Arrow.AC.Field, vf.children),
+        )
+        sch = Arrow.AC.Schema([df])
+        c = Arrow.Table(Arrow.writestream(sch, [Arrow.AC.RecordBatch(sch, [dd], 0)])).c
+        @test isempty(c) && copy(c).pool == ["x", "y"]
     end
 
     @testset "run-end encoded columns read lazily" begin
@@ -399,6 +421,36 @@ end
                 scan=Tables.Scan(select=(:late => Second,), filter=Tables.col(:id) > 1),
             )
             @test t.late == [Second(5)]
+        end
+    end
+
+    @testset "raw type overrides apply to their own outputs" begin
+        tbl = (t=[Time(1), Time(2), Time(3)], s=[:a, :b, :c], x=[1, 2, 3])
+        file = arrowbytes(tbl; file=true)
+        ns(h) = Nanosecond(Hour(h))
+        eq(c, v) = Arrow.colcmp(==, Arrow.col(c), v)
+        for src in (arrowbytes(tbl), file, ColumnsBytesSource(file))
+            # Another output of the same column reads its public values.
+            t = Arrow.Table(
+                src;
+                select=[:t, :t => Nanosecond => :tn, :s, :s => String => :s2],
+            )
+            @test t.t == tbl.t && eltype(t.t) == Time && t.tn == ns.(1:3)
+            @test t.s == tbl.s && t.s2 == ["a", "b", "c"]
+            back = Arrow.Table(arrowbytes(t))
+            @test back.t == tbl.t && back.s == tbl.s
+            t = Arrow.Table(src; select=[:t => Nanosecond => :tn, :t], limit=2)
+            @test t.tn == ns.(1:2) && t.t == tbl.t[1:2]
+            # A filter compares public values.
+            t = Arrow.Table(src; select=[:t => Nanosecond], filter=eq(:t, Time(2)))
+            @test t.t == [ns(2)]
+            gt = Arrow.colcmp(>, Arrow.col(:t), Time(1))
+            @test Arrow.Table(src; select=[:t => Nanosecond], filter=gt).t == ns.(2:3)
+            t = Arrow.Table(src; select=[:x, :s => String], filter=eq(:s, :b))
+            @test t.x == [2] && t.s == ["b"]
+            @test isempty(Arrow.Table(src; select=[:s => String], filter=eq(:s, "b")).s)
+            b = only(Arrow.Stream(src; select=[:s => String], filter=eq(:s, :b)))
+            @test b.s == ["b"]
         end
     end
 

@@ -1275,10 +1275,14 @@ struct FetchedSpans
     slices::Vector{BufferSlice}
 end
 
+# Whether a body of `bodylen` bytes is read whole with its metadata: one
+# request costs more than the bytes of a body of at most four `gapbytes`.
+_smallbody(bodylen::Int64, gap::Int64) = bodylen <= AC.checked_mul(gap, Int64(4))
+
 # How much of a body of `bodylen` bytes a block's metadata request also reads:
-# all of it up to four `gapbytes`, otherwise one `gapbytes`' worth.
+# all of a small body, otherwise one `gapbytes`' worth.
 _speculativebody(bodylen::Int64, gap::Int64) =
-    bodylen <= AC.checked_mul(gap, Int64(4)) ? bodylen : min(bodylen, gap)
+    _smallbody(bodylen, gap) ? bodylen : min(bodylen, gap)
 
 function _fetchspans(
     sf::SourceFile,
@@ -1404,12 +1408,23 @@ function _addspans!(fs::FetchedSpans, new::FetchedSpans, budget)
     n = length(new.starts)
     _chargevector!(budget, Int64, 2n, "fetched span index")
     _chargevector!(budget, BufferSlice, n, "fetched span slices")
-    for k = 1:n
-        at = searchsortedlast(fs.starts, new.starts[k]) + 1
-        insert!(fs.starts, at, new.starts[k])
-        insert!(fs.lens, at, new.lens[k])
-        insert!(fs.slices, at, new.slices[k])
+    if n <= 16
+        for k = 1:n
+            at = searchsortedlast(fs.starts, new.starts[k]) + 1
+            insert!(fs.starts, at, new.starts[k])
+            insert!(fs.lens, at, new.lens[k])
+            insert!(fs.slices, at, new.slices[k])
+        end
+        return fs
     end
+    # A large round sorts once instead of shifting the index once per span.
+    append!(fs.starts, new.starts)
+    append!(fs.lens, new.lens)
+    append!(fs.slices, new.slices)
+    order = sortperm(fs.starts)
+    permute!(fs.starts, order)
+    permute!(fs.lens, order)
+    permute!(fs.slices, order)
     return fs
 end
 
@@ -1420,6 +1435,32 @@ function _dropspans!(fs::FetchedSpans, from::Int64, to::Int64)
     keepat!(fs.lens, keep)
     keepat!(fs.slices, keep)
     return fs
+end
+
+# `ranges` are all the bytes a read's columns view. A span they fill less than
+# half of is replaced by copies of just those ranges, so the span is freed when
+# the read returns instead of living as long as the columns.
+function _compactspans!(fs::FetchedSpans, ranges::Vector{NTuple{2,Int64}}, budget)
+    holders = Int[_spanholding(fs, off, len) for (off, len) in ranges]
+    used = zeros(Int64, length(fs.starts))
+    for (h, (_, len)) in zip(holders, ranges)
+        used[h] += len
+    end
+    sparse = BitVector(2u < len for (u, len) in zip(used, fs.lens))
+    copies = FetchedSpans(Int64[], Int64[], BufferSlice[])
+    for ((off, len), h) in zip(ranges, holders)
+        sparse[h] || continue
+        _chargevector!(budget, UInt8, len, "copied span range")
+        bytes = AC.slicebytes(AC.subslice(fs.slices[h], off - fs.starts[h], len))
+        push!(copies.starts, off)
+        push!(copies.lens, len)
+        push!(copies.slices, BufferSlice(heapregion(bytes), 0, len))
+    end
+    isempty(copies.starts) && return fs
+    keepat!(fs.starts, .!sparse)
+    keepat!(fs.lens, .!sparse)
+    keepat!(fs.slices, .!sparse)
+    return _addspans!(fs, copies, budget)
 end
 
 """
@@ -1564,12 +1605,10 @@ function _symboloverride(bc::Tables.BoundColumn, f::AC.Field)
     ext = _arrowtypesextension(f)
     return ext !== nothing && first(ext) == "JuliaLang.Symbol"
 end
-# The fields whose overrides read their stored values (see above); a scan
-# with any reads them from storage, not through the whole-read columns.
-_rawoverrides(b::Tables.BoundScan, fields) = AC.Field[
-    fields[bc.index] for bc in b.columns if
-    _periodoverride(bc, fields[bc.index]) || _symboloverride(bc, fields[bc.index])
-]
+# Whether output `bc` of field `f` reads the stored values (see above). Other
+# outputs of the field, and a filter on it, read its public values.
+_rawoverride(bc::Tables.BoundColumn, f::AC.Field) =
+    _periodoverride(bc, f) || _symboloverride(bc, f)
 
 # A time-of-day column's stored ticks, not checked against a day's length.
 function _storedticks(f::AC.Field, d::AC.ArrayData, budget)
@@ -1578,6 +1617,10 @@ function _storedticks(f::AC.Field, d::AC.ArrayData, budget)
     nullable = Missing <: _declaredeltype(f, false) || _viewnulls(f, d)
     return _primitive(nullable ? Union{Missing,S} : S, S, Nothing, d, budget)
 end
+
+# The stored values of batch column `d` that a raw override of field `f` reads.
+_rawbatchcolumn(f::AC.Field, d::AC.ArrayData, budget) =
+    f.type isa AC.TimeType ? _storedticks(f, d, budget) : _storagebatchcolumn(f, d, budget)
 
 # ===========================================================================
 # The scan executor: one planner for IPC files, one executor for every source
@@ -1628,29 +1671,22 @@ _columndictionary(::_Decoder, r::_DecodedRecord, j::Int) = r.batch.columns[j].di
 # Its columns reach every dictionary in effect (see `_markpools!`).
 _recorddictionaries(r::_DecodedRecord) = r.batch.columns
 
-# What building a scan's columns shares: view pools, ArrowTypes conversion
-# (under `lock`: its caches are not thread-safe), and the fields whose
-# overrides read stored values.
+# What building a scan's columns shares: view pools and ArrowTypes conversion
+# (under `lock`: its caches are not thread-safe).
 struct _ScanContext
     views::_ViewContext
     arrowtypes::_ArrowTypesContext
     lock::ReentrantLock
-    rawoverrides::Vector{AC.Field}
 end
 
-_ScanContext(plan::_ScanPlan, fields, views::_ViewContext, arrowtypes) =
-    _ScanContext(views, arrowtypes, ReentrantLock(), _rawoverrides(plan.bound, fields))
+_ScanContext(views::_ViewContext, arrowtypes) =
+    _ScanContext(views, arrowtypes, ReentrantLock())
 
 """
 One decoded batch column of a scan, in the public domain: the view a full
-read gives, or the materialized column. A field in `ctx.rawoverrides` reads
-its stored values instead (see `_periodoverride` and `_symboloverride`).
+read gives, or the materialized column.
 """
 function _scanbatchcolumn(f::AC.Field, d::AC.ArrayData, ctx::_ScanContext)
-    if any(x -> x === f, ctx.rawoverrides)
-        f.type isa AC.TimeType && return _storedticks(f, d, ctx.views.budget)
-        return _storagebatchcolumn(f, d, ctx.views.budget)
-    end
     _viewable(f) && return _viewcolumn(f, AC.ArrayData[d], ctx.views)
     return @lock ctx.lock _facadesinglecolumn(f, d, ctx.arrowtypes)
 end
@@ -1658,7 +1694,7 @@ end
 # Rows `rows` of batch column `d` of field `f`, in memory the result owns: a
 # string or binary column copies just those values' bytes.
 function _keptcolumn(f::AC.Field, d::AC.ArrayData, rows, ctx::_ScanContext)
-    if _isstringlayout(f.type) && _viewable(f) && !any(x -> x === f, ctx.rawoverrides)
+    if _isstringlayout(f.type) && _viewable(f)
         return _rowsof(_vieweltype(f, AC.ArrayData[d], ctx.views), d, rows)
     end
     return _rowsof(_scanbatchcolumn(f, d, ctx), rows)
@@ -1777,9 +1813,10 @@ function _runscan(
         skipped = min(b.offset, total)
     end
     outidx = Int[c.index for c in b.columns]
+    raw = Bool[_rawoverride(c, fields[c.index]) for c in b.columns]
     filteridx = _deduplicatesorted!(copy(b.filtercols))
     decodeidx = _deduplicatesorted!(vcat(outidx, filteridx))
-    if b.filter === nothing && windows === nothing && isempty(ctx.rawoverrides)
+    if b.filter === nothing && windows === nothing && !any(raw)
         _fetch!(bodies, 1:n, _fieldmask(decodeidx, nf))
         _chargevector!(budget, Union{Nothing,ArrayData}, n * nf, "batch columns")
         decoded = [Vector{Union{Nothing,ArrayData}}(nothing, nf) for _ = 1:n]
@@ -1810,6 +1847,7 @@ function _runscan(
     firstidx = b.filter === nothing ? decodeidx : filteridx
     restidx = setdiff(decodeidx, firstidx)
     firstmask, restmask = _fieldmask(firstidx, nf), _fieldmask(restidx, nf)
+    decodemask = firstmask .| restmask
     filternames = Symbol[plan.names[i] for i in filteridx]
     parts = Matrix{Any}(nothing, length(outidx), n)
     kept = Vector{Any}(nothing, n)
@@ -1817,15 +1855,18 @@ function _runscan(
     windowed = b.filter !== nothing && (b.limit !== nothing || b.offset > 0)
     skip = Ref(Int64(b.offset))
     take = Ref(b.limit === nothing ? Int64(-1) : Int64(b.limit))
-    # Output columns of the fields `idxs` keep record `k`'s rows, from a filter
-    # column already built (`built[i]`) or from the decoded batch.
+    # Output columns of the fields `idxs` keep record `k`'s rows: a raw
+    # override's from the stored values, others from a filter column already
+    # built (`built[i]`) or from the decoded batch.
     function gather!(k, cols, idxs, built=nothing)
         rows = kept[k]
         for (c, bc) in enumerate(b.columns)
             i = bc.index
             insorted(i, idxs) || continue
+            d = cols[i]::ArrayData
             parts[c, k] =
-                built === nothing ? _keptcolumn(fields[i], cols[i]::ArrayData, rows, ctx) :
+                raw[c] ? _rowsof(_rawbatchcolumn(fields[i], d, ctx.views.budget), rows) :
+                built === nothing ? _keptcolumn(fields[i], d, rows, ctx) :
                 _rowsof(built[i], rows)
         end
         return nothing
@@ -1875,7 +1916,8 @@ function _runscan(
         try
             for k = 1:n
                 take[] == 0 && break
-                _fetch!(bodies, k:k, firstmask)
+                # A small body's columns cost one round trip, not two.
+                _fetch!(bodies, k:k, _smallrecord(bodies, k) ? decodemask : firstmask)
                 first!(k, states, ntasks)
                 if kept[k] !== nothing && !isempty(restidx)
                     _fetch!(bodies, k:k, restmask)
@@ -1985,6 +2027,7 @@ _retainedpool(f::AC.Field, dictionaries, ctx::_ScanContext) =
 # The record bodies of a scan whose bytes are all in memory are readable.
 _fetch!(::Nothing, ks, mask, extra=NTuple{2,Int64}[]) = nothing
 _release!(::Nothing, k) = nothing
+_smallrecord(::Nothing, k) = false
 
 # What fetching a byte-range scan's record bodies needs: the bytes fetched so
 # far, which fields' bodies of each record batch they hold, and each record
@@ -2004,8 +2047,9 @@ end
 """
 Fetch the body ranges of the fields `mask` selects of record batches `ks`,
 and the ranges `extra`, that `rb.spans` does not hold yet, in one coalesced
-round. Every planned subtree's metadata is validated first, so a corrupt
-buffer table fails before its ranges are requested.
+round, and return every range planned, fetched now or before. Every planned
+subtree's metadata is validated first, so a corrupt buffer table fails
+before its ranges are requested.
 """
 function _fetch!(rb::_RangedBodies, ks, mask, extra=NTuple{2,Int64}[])
     limits = rb.sf.limits
@@ -2079,8 +2123,11 @@ function _fetch!(rb::_RangedBodies, ks, mask, extra=NTuple{2,Int64}[])
         what="body range fetch",
     )
     _addspans!(rb.spans, fetched, rb.budget)
-    return nothing
+    return ranges
 end
+
+# Whether record `k`'s body is small (`_smallbody`).
+_smallrecord(rb::_RangedBodies, k) = _smallbody(rb.blocks[k][3], rb.sf.gapbytes)
 
 # Record `k` is read: a scan that reads batch by batch frees its fetched bytes.
 function _release!(rb::_RangedBodies, k)
@@ -2255,7 +2302,14 @@ function _scanfile(
     firstmask =
         b.filter === nothing ? decodemask :
         _fieldmask(_deduplicatesorted!(copy(b.filtercols)), length(fields))
-    _fetch!(bodies, limitedfilter ? (1:0) : eachindex(candidates), firstmask, dictranges)
+    ranges = _fetch!(
+        bodies,
+        limitedfilter ? (1:0) : eachindex(candidates),
+        firstmask,
+        dictranges,
+    )
+    # A select's columns view the ranges it fetched, dictionaries included.
+    bodies === nothing || !_selectsonly(b) || _compactspans!(spans, ranges, budget)
     _chargedict!(budget, Int64, ArrayData, length(wanted), "decoded dictionary table")
     dicts = Dict{Int64,ArrayData}()
     _chargedict!(
@@ -2316,7 +2370,7 @@ function _scanfile(
             (Int(skip) + 1):(Int(skip) + Int(take)) for (_, skip, take) in window
         ] : nothing
     dec = _Decoder(fields, ft.fielddictids, validated, limits)
-    ctx = _ScanContext(plan, fields, views, _ArrowTypesContext(budget=budget))
+    ctx = _ScanContext(views, _ArrowTypesContext(budget=budget))
     return _scantable(
         records,
         dec,
@@ -2338,14 +2392,15 @@ end
 _streamrecord(f::ArrowFile, i::Int, budget, mask) =
     _ScanRecord(_fileplan(f, i, budget, mask), f.dictionaries), nothing
 
-# Over a byte-range source a batch that decodes every field reads its whole
-# block, with read-ahead; one that decodes some reads its metadata with the
-# start of its body, and `_runscan` fetches the planned ranges it lacks.
+# Over a byte-range source a batch that decodes every field, or whose body is
+# small, reads its whole block through the block reader, many blocks to a
+# request; one that decodes some fields of a large body reads its metadata
+# with the start of its body, and `_runscan` fetches the planned ranges it lacks.
 function _streamrecord(r::_RangedFile, i::Int, budget, mask)
     sf = r.sf
     block = r.recordblocks[i]
     spans = nothing
-    if all(mask)
+    if all(mask) || _smallbody(block[3], sf.gapbytes)
         fm = first(_blockframe(r.blocks, r.recordblocks, i, r.dataend, budget))
         msg, version, headertype, body = fm.msg, fm.version, fm.header_type, fm.body
     else
@@ -2404,7 +2459,7 @@ function _scanstream(
     b = plan.bound
     records = _ScanRecord{BufferSlice}[_ScanRecord(p.plan, p.dictionaries) for p in pending]
     dec = _Decoder(st.fields, st.fielddictids, st.validated, st.limits)
-    ctx = _ScanContext(plan, st.fields, views, _ArrowTypesContext(budget=budget))
+    ctx = _ScanContext(views, _ArrowTypesContext(budget=budget))
     return _scantable(
         records,
         dec,

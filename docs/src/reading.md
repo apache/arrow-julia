@@ -183,8 +183,10 @@ DataFrame(Arrow.Table(path; select=[:id, :fare => :amount], offset=1, limit=3))
 A read that keeps every row reads its columns as a full read does: as views. A read with
 `filter`, `limit`, or `offset` copies the rows it keeps: numbers and other values into
 `Vector`s, strings and binary values into columns that hold just those values' bytes,
-and dictionary columns with their categories. The copies keep nothing else of the source
-alive. A column's element type does not depend on the filter or on the kind of source.
+and dictionary columns with their categories. These copies keep nothing else of the
+source alive, but kept list, map, and struct rows still read their record batch's
+buffers, which stay in memory (or keep the file mapped) as long as the rows do. A
+column's element type does not depend on the filter or on the kind of source.
 
 ## Threads
 
@@ -222,9 +224,13 @@ t = Arrow.Table(meta)
   do not cover. It implements [`Arrow.sourcelength`](@ref) and [`Arrow.readrange`](@ref),
   and [`Arrow.concurrentreads`](@ref) when ranges may be read on several tasks at once.
   A read with `select`, `drop`, `filter`, `limit`, `offset`, or `scan` reads the
-  file-format footer from the end of the source, then fetches only the record batches
-  and columns it needs, in a few coalesced ranges, whatever the filter compares. A read
-  without them fetches the whole source in 8 MiB ranges.
+  file-format footer from the end of the source, then plans only the byte ranges of the
+  record batches and columns it needs, whatever the filter compares, and fetches them in
+  a few coalesced ranges. A record batch of at most 1 MiB is fetched whole with its
+  metadata, so a file of many small batches is fetched almost whole. A `select`'s columns
+  view the fetched bytes in place, except that bytes filling less than half of a fetched
+  range are copied out of it, so a few columns do not keep the whole object in memory. A
+  read without them fetches the whole source in 8 MiB ranges.
 
 ```@example reading
 struct CountingSource <: Arrow.AbstractArrowSource

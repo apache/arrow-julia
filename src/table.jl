@@ -51,8 +51,9 @@ that `open(source, "r")` accepts, such as a FilePathsBase.jl path, reads as the 
 - `limits` sets the [`Arrow.Limits`](@ref).
 
 Only the selected and filter columns are read, a filter's other columns only for the
-record batches that keep rows, and a `limit` stops reading once it has its rows; from an
-`AbstractArrowSource`, only those bytes are fetched.
+record batches that keep rows, and a `limit` stops reading once it has its rows. From an
+`AbstractArrowSource`, a read plans only those byte ranges, but fetches a record batch
+of at most 1 MiB whole.
 
 Numbers, booleans, temporal values, decimals, and dictionary indices read as read-only
 [`Arrow.ArrowVector`](@ref) views of the source; a column of several record batches is a
@@ -1987,9 +1988,11 @@ batch for each batch read.
 
 Batches are read as the iteration reaches them: from a stream-format `IO`, such as a
 pipe or a socket, as they arrive; from a mapped path, in place; and from an
-[`Arrow.AbstractArrowSource`](@ref), by range, fetching only the selected and filter
-columns of each batch. A file-format `IO` is read to its end first. A loop that drops each batch holds one batch at a time, plus the dictionaries,
-and each batch is read under its own allocation allowance ([`Arrow.Limits`](@ref)).
+[`Arrow.AbstractArrowSource`](@ref), by range: a batch of at most 1 MiB whole, several to
+a request, and a larger one only its selected and filter columns. A file-format `IO` is
+read to its end first. A loop that drops each batch holds one batch at a time, plus the
+dictionaries, and each batch is read under its own allocation allowance
+([`Arrow.Limits`](@ref)).
 
 `Tables.schema(stream)`, `Tables.columnnames(stream)`, `DataAPI.metadata(stream)`, and
 `DataAPI.colmetadata(stream, col)` read no data. A file-format source also has
@@ -2193,7 +2196,7 @@ function _batchscan(s::Stream, plan::_ScanPlan, records, bodies, budget; regions
         route = arrowtypes.routeplan
         route === nothing || (route.budget = budget)
         views = _ViewContext(getfield(s, :views), budget)
-        ctx = _ScanContext(plan, _batchfields(src), views, arrowtypes)
+        ctx = _ScanContext(views, arrowtypes)
         _scantable(
             records,
             _decoder(src),

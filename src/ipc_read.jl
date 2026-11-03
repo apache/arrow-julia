@@ -1286,10 +1286,11 @@ end
 
 # Advise the kernel to map now the pages holding `n` bytes at `p`, which a
 # reader is about to read once each: one request instead of a fault per page
-# of a memory-mapped file (Unix).
+# of a memory-mapped file (Unix). A range under 64 KiB spans a few pages at
+# most, and advising it costs more than it saves.
 function _willneed(p::Ptr{UInt8}, n::Int)
     @static if Sys.isunix()
-        n > 0 || return nothing
+        n >= 1 << 16 || return nothing
         lo = UInt(p) & ~(UInt(AC.Mmap.PAGESIZE) - 1)
         len = UInt(p) + UInt(n) - lo
         ccall(

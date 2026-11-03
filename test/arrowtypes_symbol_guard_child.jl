@@ -165,6 +165,18 @@ extensionmetadata(name::AbstractString) = Pair{String,String}[
         end
     end
     @test !any(isinterned, novel)
+    # A filter on the column compares Symbols, so it creates them even when the
+    # column is read as strings, and a column needing too many is refused.
+    hit = Symbol(novel[2])
+    onvalue = (; select=[:value => String], filter=Arrow.colcmp(==, Arrow.col(:value), hit))
+    @test_throws Arrow.ValidationError Arrow.Table(
+        manybytes;
+        onvalue...,
+        limits=Arrow.Limits(max_new_symbols=3),
+    )
+    @test !any(isinterned, novel[[1, 3, 4, 5]])
+    strings = Arrow.Table(manybytes; onvalue..., limits=Arrow.Limits(max_new_symbols=4))
+    @test strings.value == [novel[2], novel[2]] && eltype(strings.value) == String
     # An Arrow.Stream counts each record batch on its own.
     streamnames = [freshname("untrusted_stream_symbol_$i") for i = 1:6]
     halves = (streamnames[1:3], streamnames[4:6])

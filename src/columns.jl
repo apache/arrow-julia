@@ -495,35 +495,34 @@ Base.copy(v::DictEncoded{T}) where {T} = _pooledcopy(T, (v,))
 # The batches of a column copy into one `PooledArray`, whether they share a
 # pool, extend it (delta dictionaries), or replace it.
 Base.copy(c::ChainedVector{T,<:DictEncoded}) where {T} = _pooledcopy(T, c.arrays)
-# Rows of a dictionary column, as of a `PooledArray`, keep the encoding.
+# Rows of a dictionary column, as of a `PooledArray`, keep the encoding: any
+# vector of integer indices or a `Bool` mask.
 function Base.getindex(v::DictEncoded{T}, rows::AbstractVector{<:Integer}) where {T}
     @boundscheck checkbounds(v, rows)
     return _pooledcopy(T, (v,), to_indices(v, (rows,))[1])
 end
-function Base.getindex(
-    c::ChainedVector{T,<:DictEncoded},
-    rows::AbstractVector{Int},
-) where {T}
-    @boundscheck checkbounds(c, rows)
-    return _pooledcopy(T, c.arrays, rows)
-end
-function Base.getindex(c::ChainedVector{T,<:DictEncoded}, rows::UnitRange{Int}) where {T}
-    @boundscheck checkbounds(c, rows)
-    return _pooledcopy(T, c.arrays, rows)
-end
-function Base.getindex(
-    c::ChainedVector{T,<:DictEncoded},
-    rows::AbstractVector{Bool},
-) where {T}
-    @boundscheck checkbounds(c, rows)
-    return _pooledcopy(T, c.arrays, findall(rows))
+Base.getindex(c::ChainedVector{<:Any,<:DictEncoded}, rows::AbstractVector{<:Integer}) =
+    _dictrows(c, rows)
+# As specific as SentinelArrays' methods for these index vectors, so not ambiguous.
+Base.getindex(c::ChainedVector{<:Any,<:DictEncoded}, rows::AbstractVector{Int}) =
+    _dictrows(c, rows)
+Base.getindex(c::ChainedVector{<:Any,<:DictEncoded}, rows::UnitRange{Int}) =
+    _dictrows(c, rows)
+Base.getindex(
+    c::ChainedVector{<:Any,<:DictEncoded},
+    rows::AbstractVector{<:ChainedVectorIndex},
+) = _dictrows(c, Int[Int(i) for i in rows])
+function _dictrows(c::ChainedVector{T}, rows) where {T}
+    checkbounds(c, rows)
+    return _pooledcopy(T, c.arrays, to_indices(c, (rows,))[1])
 end
 
 """
 Rows `rows` (all of them by default) of the dictionary column whose batches
 are `chunks`, as a `PooledArray`. A batch's pool joins the result's when its
-first row is copied: its distinct values, in pool order; duplicate and null
-entries remap, so the PooledArray's invariants hold.
+first row is copied (a copy of a column with no rows takes its batch's
+pool): its distinct values, in pool order; duplicate and null entries remap,
+so the PooledArray's invariants hold.
 """
 function _pooledcopy(::Type{T}, chunks, rows=nothing) where {T}
     R = _ownedtype(T)
@@ -534,6 +533,7 @@ function _pooledcopy(::Type{T}, chunks, rows=nothing) where {T}
         UInt32(length(pool))
     end
     remaps = IdDict{Any,Vector{UInt32}}()
+    remapof(v) = get!(() -> UInt32[ref(_ownedpoolvalue(x)) for x in v.pool], remaps, v.pool)
     ends = cumsum(Int[length(v) for v in chunks])
     n = rows === nothing ? (isempty(ends) ? 0 : ends[end]) : length(rows)
     refs = Vector{UInt32}(undef, n)
@@ -547,13 +547,14 @@ function _pooledcopy(::Type{T}, chunks, rows=nothing) where {T}
         end
         v = chunks[c]
         if v.pool !== lastpool
-            remap =
-                get!(() -> UInt32[ref(_ownedpoolvalue(x)) for x in v.pool], remaps, v.pool)
+            remap = remapof(v)
             lastpool = v.pool
         end
         code = @inbounds v.indices[i - (c == 1 ? 0 : ends[c - 1])]
         refs[k] = code === missing ? ref(missing) : @inbounds remap[Int(code) + 1]
     end
+    # A copy of an empty batch keeps its pool (a chained column has none empty).
+    rows === nothing && n == 0 && foreach(remapof, chunks)
     return PooledArrays.PooledArray(PooledArrays.RefArray(refs), invpool, pool)
 end
 

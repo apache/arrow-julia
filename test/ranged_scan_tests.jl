@@ -21,10 +21,13 @@ using Test, Arrow, Tables, Dates
 struct MeteredSource <: Arrow.AbstractArrowSource
     bytes::Vector{UInt8}
     fetched::Base.RefValue{Int}
+    requests::Base.RefValue{Int}
 end
+MeteredSource(bytes, fetched) = MeteredSource(bytes, fetched, Ref(0))
 Arrow.sourcelength(s::MeteredSource) = length(s.bytes)
 function Arrow.readrange(s::MeteredSource, offset, len)
     s.fetched[] += len
+    s.requests[] += 1
     return s.bytes[(offset + 1):(offset + len)]
 end
 
@@ -127,6 +130,36 @@ end
     rm(path)
 end
 
+@testset "a select through a source keeps only the bytes its columns use" begin
+    io = IOBuffer()
+    Arrow.Writer(io; file=true) do writer
+        for batch = 1:200
+            Arrow.write(
+                writer,
+                (
+                    i1=collect((1000batch - 999):(1000batch)),
+                    s1=fill(repeat("s", 40), 1000),
+                    pad=fill(repeat("p", 60), 1000),
+                ),
+            )
+        end
+    end
+    bytes = take!(io)
+    mapped = Arrow.Table(copy(bytes))
+    # One small column of the object keeps about its own bytes.
+    t = Arrow.Table(MeteredSource(bytes, Ref(0)); select=[:i1])
+    @test t.i1 == mapped.i1
+    @test Base.summarysize(t.i1) < 1.5 * 8 * 200_000 < length(bytes) / 8
+    # Columns that fill most of what was fetched view it in place.
+    fetched = Ref(0)
+    ranged() = Arrow.Table(MeteredSource(bytes, fetched); select=[:s1, :pad])
+    t = ranged()
+    @test t.s1 == mapped.s1 && t.pad == mapped.pad
+    fetched[] = 0
+    copied = @allocated(ranged()) - fetched[]
+    @test copied < length(bytes) / 4
+end
+
 @testset "a Stream over a source fetches only the columns it reads" begin
     n = 20_000
     io = IOBuffer()
@@ -156,6 +189,42 @@ end
     stream = Arrow.Stream(Arrow.SourceFile(MeteredSource(bytes, fetched)))
     @test sum(t -> length(t.x), stream) == 4n
     @test fetched[] >= length(bytes) - 1024
+end
+
+@testset "a read that fetches many ranges at once finds each of them" begin
+    io = IOBuffer()
+    Arrow.Writer(io; file=true) do writer
+        for batch = 1:64
+            Arrow.write(writer, (x=collect((100batch - 99):(100batch)), y=fill(batch, 100)))
+        end
+    end
+    bytes = take!(io)
+    want = Arrow.Table(bytes; select=[:x], filter=Arrow.col(:y) > 8)
+    for gapbytes in (0, 64)
+        source = Arrow.SourceFile(MeteredSource(bytes, Ref(0)); gapbytes)
+        got = Arrow.Table(source; select=[:x], filter=Arrow.col(:y) > 8)
+        @test got.x == want.x == 801:6400
+    end
+end
+
+@testset "small record batches cost few requests" begin
+    io = IOBuffer()
+    Arrow.Writer(io; file=true) do writer
+        for batch = 1:2000
+            Arrow.write(writer, (x=collect((10batch - 9):(10batch)), y=fill(batch, 10)))
+        end
+    end
+    bytes = take!(io)
+    # A Stream reads small batches whole, many to a request.
+    source = MeteredSource(bytes, Ref(0))
+    @test sum(t -> sum(t.x), Arrow.Stream(source; select=[:x])) == sum(1:20_000)
+    @test source.requests[] <= 2000 ÷ 100
+    # A filtered window fetches a small batch's columns in one request.
+    source = MeteredSource(bytes, Ref(0))
+    t = Arrow.Table(source; select=[:x], filter=Arrow.col(:y) > 0, limit=10^9)
+    @test t.x == 1:20_000
+    metadata = 2000
+    @test source.requests[] <= metadata + 2000 + 2
 end
 
 end

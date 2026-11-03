@@ -82,7 +82,9 @@ A region (a mapped file or a byte vector) is its own span provider: one span
 over the whole region serves every range the planner names, without a copy.
 A byte-range source fetches each round's ranges through `readrange`,
 coalesced, and a fetched range is referenced in place by the columns that
-read it. The planner is the same for both; only the fetch differs.
+read it, unless a select's columns fill less than half of it: then their
+bytes are copied out, so a few columns do not keep a whole fetched range
+alive. The planner is the same for both; only the fetch differs.
 
 ### What Arrow pushes, by axis
 
@@ -91,22 +93,23 @@ read it. The planner is the same for both; only the fetch differs.
 | `select` | only the decode set (selected ∪ filter columns) is decoded; `skipfield!` advances the node and buffer cursor past every other field with each buffer-table invariant checked, without slicing, decompressing, or validating its body; over a byte-range source no body range is planned for it |
 | `limit`/`offset` | without a filter, `RecordBatch.length` is wire metadata: batches outside the window are never decoded or fetched; with a filter, the window composes over the qualifying rows, in order, and the scan stops once it is full |
 | `filter` | evaluated per batch over the public values of the filter columns, the values a full read returns; the other selected columns are decoded (and over a byte-range source, fetched) only for batches with a qualifying row |
-| `types` (`ref => T`) | an elementwise `convert` after the scan, as the generic executor applies it. Two overrides read stored values instead: a time of day as a `Dates.Period`, which also reads times outside a day, and a `JuliaLang.Symbol` column as strings, which creates no `Symbol` |
+| `types` (`ref => T`) | an elementwise `convert` after the scan, as the generic executor applies it. Two overrides read stored values for their own output instead: a time of day as a `Dates.Period`, which also reads times outside a day, and a `JuliaLang.Symbol` column as strings, which creates no `Symbol`. Another output of the same column, and a filter on it, read its public values |
 
 The filter is evaluated by the generic evaluator over the batch's public
 values, so pushdown and the executor share one three-valued semantics by
 construction (a `missing` predicate excludes the row), and every predicate a
 user can write pushes down: no literal needs a stored-value form.
 
-Column types do not depend on the source kind or on a filter. A read that
-keeps every row of the batches it reads builds the columns a full read
-builds: views of the source, `ChainedVector`s across batches, and string
-columns over the source's bytes. A read with a filter or a window keeps
-copies of its rows: `Vector`s for flat and nested values, string and binary
-columns that hold just their values' bytes, and dictionary columns that keep
-their pool, so a filtered result does not keep a batch's decompressed bytes
-or the mapping alive for a few of its rows. An empty result column has the
-type a read of no batches gives it.
+Element types do not depend on the source kind or on a filter; container
+types do. A read that keeps every row of the batches it reads builds the
+columns a full read builds: views of the source, `ChainedVector`s across
+batches, and string columns over the source's bytes. A read with a filter or
+a window keeps copies of its rows: `Vector`s for flat and nested values,
+string and binary columns that hold just their values' bytes, and dictionary
+columns that keep their pool, so a filtered flat or string column does not
+keep a batch's decompressed bytes or the mapping alive for a few of its rows.
+Kept nested rows still read their batch's child buffers. An empty result
+column has the type a read of no batches gives it.
 
 Properties the composition holds:
 
@@ -168,8 +171,9 @@ sequential — cloud-native access is a file-format feature, stated plainly.
    the executor reads first (every decode-set column without a filter; the
    filter columns with one) in one round. A filter then fetches the other
    selected columns of the batches that keep rows in one more round; a
-   filtered `limit` fetches batch by batch and stops when it is full, freeing
-   each batch's bytes once it is read. Each coalesced range lands in its own
+   filtered `limit` fetches batch by batch (a body of at most four `gapbytes`
+   with all its decode-set columns in one round) and stops when it is full,
+   freeing each batch's bytes once it is read. Each coalesced range lands in its own
    owned heap region; decode resolves each declared buffer `(offset, len)` to
    its containing fetched range and subslices it: *every buffer must fall
    inside a fetched range that was itself derived from the verified buffer
@@ -185,10 +189,11 @@ explicit over-read policy: a requested span may cross unneeded bytes when the
 configured gap permits it.
 
 `Arrow.Stream` over a byte-range file source reads the footer and the
-dictionaries when it opens. A batch that decodes every column reads its whole
-block, and the blocks after it while they fit 8 MiB, with one window fetched
-ahead. A batch that decodes some columns reads its metadata with the start of
-its body, then the ranges of its decode set it lacks.
+dictionaries when it opens. A batch that decodes every column, or whose body is
+at most four `gapbytes`, reads its whole block, and the blocks after it while
+they fit 8 MiB, with one window fetched ahead. A batch that decodes some
+columns of a larger body reads its metadata with the start of its body, then
+the ranges of its decode set it lacks.
 
 ### The interface (no HTTP/CloudStore deps in Arrow)
 

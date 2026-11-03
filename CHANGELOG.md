@@ -66,8 +66,8 @@ code, and what Arrow 2.x can read of files Arrow 3.0 writes.
 
 ### Added
 
-- `select`, `drop`, `filter`, `limit`, and `scan` (a `Tables.Scan`) on `Arrow.Table`,
-  `Arrow.Stream`, and `Arrow.read`, with the filter functions `Arrow.col`,
+- `select`, `drop`, `filter`, `limit`, `offset`, and `scan` (a `Tables.Scan`) on
+  `Arrow.Table`, `Arrow.Stream`, and `Arrow.read`, with the filter functions `Arrow.col`,
   `Arrow.colcmp`, `Arrow.colin`, and `Arrow.isnull`.
 - `Arrow.read(source, sink)` reads into a sink with owned columns.
 - `==`, `isequal`, and `hash` on `Arrow.Table`, comparing names and columns, and
@@ -96,6 +96,8 @@ code, and what Arrow 2.x can read of files Arrow 3.0 writes.
   stream with the column types an IPC read gives, reading fixed-width values in the
   producer's memory. Memory handed to a consumer is freed once the consumer releases
   it, with nothing to call.
+- Rows of a dictionary column, `t.c[rows]` for any vector of integer indices or a `Bool`
+  mask, are a `PooledArray` with the column's categories, as `copy(t.c)` is.
 - A TimeZones.jl extension that writes `ZonedDateTime` columns, and a CategoricalArrays
   extension that writes ordered `CategoricalArray`s as ordered dictionaries and reports
   `isordered` for ordered dictionary columns.
