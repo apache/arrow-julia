@@ -711,15 +711,27 @@ end
 Retained child `f` over `values`, `hidden` of which sit under null parent
 rows and read as missing. A child that holds nulls takes them there. In a
 child that cannot, any other missing value means the column was replaced,
-and the hidden slots take a stand-in: a union, run-end, or Null column, which
-has no validity buffer, takes a visible value there; any other child is built
-nullable and its validity then dropped (`_hidevalidity`).
+and the hidden slots take a stand-in: a dense union points each at the slot
+of the visible row before it; a sparse union, run-end, or Null column, which
+has no validity buffer, takes the visible value before it; any other child is
+built nullable and its validity then dropped (`_hidevalidity`).
 """
 function _hiddenchild(f::AC.Field, values, hidden::Int, context)
     hidden == 0 && return _constructpart(f, values; context)
     hidden == length(values) && return _constructhiddenpart(f, hidden, context)
     _holdsnull(f) && return _constructpart(f, values; context)
     count(ismissing, values) == hidden || throw(_nonnullableerror(f.name))
+    if f.type isa AC.UnionType && f.type.mode == AC.DenseMode
+        return _uninferred(
+            _hiddendenseunion,
+            f,
+            values,
+            context,
+        )::Tuple{AC.Field,AC.ArrayData}
+    end
+    # ponytail: a sparse union still copies a value into each hidden slot
+    # (sparse unions come only from other writers' schemas); a child's empty
+    # value there would cost nothing.
     if f.type isa Union{AC.UnionType,AC.RunEndEncodedType,AC.NullType}
         return _constructpart(f, _uninferred(_standins, values)::AbstractVector; context)
     end
@@ -733,10 +745,24 @@ function _hiddenchild(f::AC.Field, values, hidden::Int, context)
     return _hidevalidity(f, _constructpart(relaxed, values; context)...)
 end
 
-# `values` with each missing value replaced by the first value that is not.
+# `values` with each missing value replaced by the value before it (the first
+# value, before any), so a run-end column's hidden slots extend a run.
 function _standins(values)
     x = values[findfirst(!ismissing, values)]
-    return [y === missing ? x : y for y in values]
+    return [y === missing ? x : (x = y) for y in values]
+end
+
+# A dense union over its visible values, whose hidden rows share the slot of
+# the visible row before them (the first one's, before any): no value is
+# copied for them, and each child's offsets stay non-decreasing.
+function _hiddendenseunion(f::AC.Field, values, context)
+    uf, ud = _constructpart(f, [x for x in values if x !== missing]; context)
+    src = max.(cumsum(x !== missing for x in values), 1)
+    ids = reinterpret(Int8, AC.slicebytes(ud.buffers[1]))[src]
+    offsets = reinterpret(Int32, AC.slicebytes(ud.buffers[2]))[src]
+    buffers = AC.BufferSlice[AC._databuffer(ids), AC._databuffer(offsets)]
+    d = AC.ArrayData(ud.type, length(values), buffers; children=ud.children, nullcount=0)
+    return uf, d
 end
 
 _nonnullableerror(name) = ArgumentError(
