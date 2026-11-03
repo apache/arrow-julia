@@ -65,8 +65,11 @@ for ntasks in (1, 4)
     @test length(t.id) == 1_000_000 && t.id[end] == 1_000_000
 end
 @test sinks[1] == sinks[4]
-# A do-block writer to a path commits the batches written before the failure.
+# A do-block writer to a path abandons its output, as a failed Arrow.write
+# does: the path keeps its old file.
 path = tempname()
+Arrow.write(path, (id=Int64[0],))
+before = read(path)
 @test_throws ErrorException Arrow.Writer(
     path;
     compress=:zstd,
@@ -75,5 +78,5 @@ path = tempname()
 ) do w
     Arrow.write(w, tbl)
 end
-@test Arrow.Table(path).id == 1:1_000_000
+@test read(path) == before
 rm(path)

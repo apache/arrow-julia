@@ -263,8 +263,10 @@ so producing tables one at a time never holds more than one partition of
 the current table in memory. `sink` is a file path, or another object that
 `open(sink, "w")` accepts (the writer opens and owns the handle), or an `IO`
 (borrowed; `close` finishes the IPC output but leaves the `IO` open). The function
-form runs `f(writer)` and closes the writer; if `f` throws before writing a table,
-the writer is abandoned instead, so a path's existing file keeps its bytes. The
+form runs `f(writer)` and closes the writer. If `f` throws, the writer is abandoned
+instead, so a path's existing file keeps its bytes as after a failed
+[`Arrow.write`](@ref), unless the sink is an `IO` that already received a table:
+that output is closed, so it holds the tables written before the error. The
 keywords mean what they mean for [`Arrow.write`](@ref), whose metadata rules apply
 too. An existing file path is replaced as by [`Arrow.write`](@ref): the output goes
 to a temporary file that `close` renames over the old file.
@@ -439,9 +441,9 @@ function Writer(f::Function, sink; kwargs...)
         f(w)
     catch
         try
-            # Before any table, there is nothing to keep: a path's file keeps
-            # its old bytes.
-            w.st === nothing ? _abandon!(w) : close(w)
+            # A path keeps its old file, as after a failed `Arrow.write`; an
+            # `IO` that got a table is ended, so it holds those tables.
+            w.ownio || w.st === nothing ? _abandon!(w) : close(w)
         catch
             # Preserve the body error if finalization or sink cleanup fails.
         end

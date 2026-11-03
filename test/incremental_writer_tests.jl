@@ -539,8 +539,9 @@ batchkinds(bytes) = [
         end
     end
 
-    @testset "a function-form writer that writes no table keeps the path" begin
-        path = joinpath(mktempdir(), "keep.arrow")
+    @testset "a function-form writer whose function throws keeps the path" begin
+        dir = mktempdir()
+        path = joinpath(dir, "keep.arrow")
         Arrow.write(path, t1)
         before = read(path)
         # The first table is refused (columns of different lengths).
@@ -551,9 +552,21 @@ batchkinds(bytes) = [
         @test read(path) == before
         @test_throws ErrorException open(w -> error("no table"), Arrow.Writer, path)
         @test read(path) == before
+        # After a table too: a later partition is refused, or the function fails.
+        refusedpart(w) = Arrow.write(w, Tables.partitioner([(a=[10],), (a=["x"],)]))
+        @test_throws ArgumentError Arrow.Writer(refusedpart, path)
+        @test read(path) == before
+        failslater(w) = (Arrow.write(w, t1); error("after a table"))
+        @test_throws ErrorException open(failslater, Arrow.Writer, path)
+        @test read(path) == before
+        @test_throws ErrorException Arrow.Writer(failslater, joinpath(dir, "new.arrow"))
+        @test readdir(dir) == ["keep.arrow"]
+        # An IO gets nothing before a table, and its tables ended after one.
         io = IOBuffer()
         @test_throws ErrorException Arrow.Writer(w -> error("no table"), io)
         @test isempty(take!(io))
+        @test_throws ErrorException Arrow.Writer(failslater, io; file=false)
+        @test Arrow.Table(take!(io)).b == t1.b
         # A writer closed without a table writes an output with no columns.
         close(Arrow.Writer(path))
         @test isempty(Tables.columnnames(Arrow.Table(read(path))))
