@@ -55,6 +55,15 @@ ArrowTypes.JuliaType(::Val{EITHER_LABEL}, S, metadata) = EitherLabel
 ArrowTypes.fromarrow(::Type{EitherLabel}, x::Int64) = EitherLabel(x)
 ArrowTypes.fromarrow(::Type{EitherLabel}, x::AbstractString) = EitherLabel(String(x))
 
+# A labelled value stored as Nothing: a Null field labelled for it holds it.
+struct UnitLabel end
+const UNIT_LABEL = Symbol("JuliaLang.ArrowTests.WriterUnit")
+ArrowTypes.ArrowType(::Type{UnitLabel}) = Nothing
+ArrowTypes.toarrow(::UnitLabel) = nothing
+ArrowTypes.arrowname(::Type{UnitLabel}) = UNIT_LABEL
+ArrowTypes.JuliaType(::Val{UNIT_LABEL}, S, metadata) = UnitLabel
+ArrowTypes.fromarrow(::Type{UnitLabel}, ::Union{Nothing,Missing}) = UnitLabel()
+
 # The output of `tables` written through one Arrow.Writer, and each table's
 # error (or nothing).
 function writetables(tables; kwargs...)
@@ -834,6 +843,8 @@ batchkinds(bytes) = [
             ((x=[1],), (x=Union{Nothing,Int}[nothing, 2],)),
             ((x=[1],), (x=[nothing],)),
             ((x=[missing],), (x=[nothing],)),
+            ((x=[missing],), (x=[UnitLabel()],)),
+            ((x=[missing],), (x=Any[nothing, UnitLabel()],)),
             ((x=["a"],), (x=Union{Nothing,Symbol}[nothing, :b],)),
             ((x=[(u=1,)],), (x=[(u=nothing,), (u=2,)],)),
             ((x=[[1]],), (x=[Union{Nothing,Int}[nothing, 2]],)),
@@ -842,6 +853,8 @@ batchkinds(bytes) = [
             @test errs[1] === nothing && refused(errs[2], :x)
             @test isequal(collect(Arrow.Table(bytes).x), t1.x)
         end
+        # Under its own label, a value stored as Nothing reads back.
+        @test collect(Arrow.Table(Arrow.tobuffer((x=[UnitLabel()],))).x) == [UnitLabel()]
         path = joinpath(mktempdir(), "x.arrows")
         Arrow.write(path, (x=Union{Missing,Int}[1, missing],); file=false)
         err =

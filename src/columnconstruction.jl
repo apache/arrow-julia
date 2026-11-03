@@ -2787,13 +2787,12 @@ own: the element type's, or a runtime type's in an abstract column.
 function _mappedvalues(v::AbstractVector, context::_WriterContext)
     T = Base.nonmissingtype(_eltypeof(v))
     T === Union{} && return false
-    # `nothing` is not lowered: its storage is a null, which only its label
-    # tells from `missing`.
+    # A type stored as a null (`Nothing`, whose storage is `Missing`) is not
+    # lowered: only its label tells its values from missing ones.
     mapped(S) =
         S !== VersionNumber &&
-        S !== Nothing &&
         !(S <: Union{Int128,UInt128}) &&
-        _writerstoragetype!(context, S) !== S
+        !(_writerstoragetype!(context, S) in (S, Missing, Nothing))
     isconcretetype(T) && return mapped(T)
     T isa Union &&
         all(isconcretetype, Base.uniontypes(T)) &&
@@ -2889,11 +2888,14 @@ function _inferlowered(f::AC.Field, target, v::AbstractVector, context::_WriterC
             push!(runtimes, T)
             target === nothing || _checkabstractlabel(f, target, T, context)
         end
-        # Without a label, `nothing` stays itself for the field's builder to
-        # refuse: its storage is a null, which would read back as `missing`.
-        mapped =
-            T === VersionNumber ? string(x) :
-            T === Nothing && target === nothing ? x : _writertoarrow(context, x, T, name, f)
+        mapped = T === VersionNumber ? string(x) : _writertoarrow(context, x, T, name, f)
+        # Without a label, a type stored as a null (`Nothing`) would read back as
+        # missing values: its values stay themselves, for the field's builder to
+        # refuse.
+        mapped isa Union{Missing,Nothing} &&
+            target === nothing &&
+            _writerstoragetype!(context, T) in (Missing, Nothing) &&
+            (mapped = x)
         values[i] = mapped
         _pushobserved!(observed, seen, typeof(mapped), name)
     end
