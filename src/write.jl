@@ -1194,11 +1194,13 @@ _dictionarydeltas(st::IPCWriteState, batch::AC.RecordBatch, growth=()) =
 
 """
 A schema field declared nullable, with its descendants, except the children
-the format requires to be non-null (map entries and keys, run ends).
+the format requires to be non-null (map entries and keys, run ends), also
+under a dictionary, whose children are its values'.
 """
 function _nullablefield(f::AC.Field)
     t = f.type
-    children = if t isa AC.MapType && length(f.children) == 1
+    vt = t isa AC.DictionaryType ? t.valuetype : t
+    children = if vt isa AC.MapType && length(f.children) == 1
         entries = only(f.children)
         kv = entries.children
         AC.Field[AC.Field(
@@ -1208,7 +1210,7 @@ function _nullablefield(f::AC.Field)
             metadata=entries.metadata,
             children=AC.Field[kv[1], (_nullablefield(c) for c in kv[2:end])...],
         )]
-    elseif t isa AC.RunEndEncodedType && length(f.children) == 2
+    elseif vt isa AC.RunEndEncodedType && length(f.children) == 2
         AC.Field[f.children[1], _nullablefield(f.children[2])]
     else
         AC.Field[_nullablefield(c) for c in f.children]

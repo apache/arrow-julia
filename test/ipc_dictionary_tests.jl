@@ -631,6 +631,24 @@ end
     @test Arrow.Table(bytes).x == Int16[1, 2, 1]
 end
 
+@testset "dictencode writes a Dict column over several tables" begin
+    # After the first table the schema is declared nullable; a dictionary of
+    # maps keeps its entries and keys non-null.
+    parts = [(m=[Dict("a" => 1), Dict("b" => 2)],), (m=[Dict("c" => 3)],)]
+    expected = [Dict("a" => 1), Dict("b" => 2), Dict("c" => 3)]
+    for file in (false, true)
+        io = Arrow.write(IOBuffer(), Tables.partitioner(parts); dictencode=true, file)
+        t = Arrow.Table(take!(io))
+        @test getfield(t, :schema).fields[1].type isa AC.DictionaryType
+        @test [Dict(x) for x in t.m] == expected
+        io = IOBuffer()
+        Arrow.Writer(io; dictencode=true, file) do w
+            foreach(p -> Arrow.write(w, p), parts)
+        end
+        @test [Dict(x) for x in Arrow.Table(take!(io)).m] == expected
+    end
+end
+
 @testset "UUID columns are not dictionary-encoded" begin
     uuids = UUID.(UInt128[1, 2, 1])
     # pyarrow cannot read a dictionary of arrow.uuid values, so pooled UUIDs and
