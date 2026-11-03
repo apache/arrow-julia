@@ -4069,10 +4069,19 @@ _hasrefpool(x::AbstractVector) =
     Base.nonmissingtype(_eltypeof(x)) !== Union{}
 _hasrefpool(::Any) = false
 
-# Whether a column holds UUIDs, which a pooled column or `dictencode` writes
-# unencoded: pyarrow cannot read a dictionary of arrow.uuid values.
-_uuidvalues(x::AbstractVector) = Base.nonmissingtype(_eltypeof(x)) === UUIDs.UUID
+# Whether a column holds UUIDs (an abstract one, only UUIDs and missing
+# values), which a pooled column or `dictencode` writes unencoded: pyarrow
+# cannot read a dictionary of arrow.uuid values.
+function _uuidvalues(x::AbstractVector)
+    T = Base.nonmissingtype(_eltypeof(x))
+    T === UUIDs.UUID && return true
+    isconcretetype(T) && return false
+    # The scan compiles for the column's own type (see `_uninferred`).
+    return _uninferred(_onlyuuids, x)::Bool
+end
 _uuidvalues(::Any) = false
+_onlyuuids(x) =
+    all(y -> y === missing || y isa UUIDs.UUID, x) && any(y -> y isa UUIDs.UUID, x)
 
 """
 The values and category pool of a ref-pool column. Pool values that are

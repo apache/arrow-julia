@@ -659,6 +659,8 @@ end
         (uuids, (dictencode=true,)),
         (uuids, (dictencode=:u,)),
         (PooledArray(uuids), (dictencode=:u,)),
+        (Any[uuids...], (dictencode=true,)),
+        (Any[uuids; missing], (dictencode=:u,)),
     )
         t = Arrow.Table(Arrow.tobuffer((u=col,); kwargs...))
         # A dictionary of UUIDs reads back as UUIDs too, so check the schema.
