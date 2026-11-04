@@ -110,7 +110,17 @@ function Array{T}(t::Table, off) where {T}
     a = vector(t, off)
     S = T <: Table ? UOffsetT : T <: Struct ? NTuple{structsizeof(T),UInt8} : T
     ptr = convert(Ptr{S}, pointer(bytes(t), a + 1))
-    data = unsafe_wrap(Base.Array, ptr, vectorlen(t, off))
+    len = vectorlen(t, off)
+    if UInt(ptr) % Base.datatype_alignment(S) == 0
+        data = unsafe_wrap(Base.Array, ptr, len)
+    else
+        # IPC metadata from other writers may not align scalar vectors for Julia.
+        nbytes = Base.checked_mul(Int(len), sizeof(S))
+        first = Base.checked_add(a, 1)
+        last = Base.checked_add(a, nbytes)
+        checkbounds(bytes(t), first:last)
+        data = copy(reinterpret(S, @view bytes(t)[first:last]))
+    end
     return Array{T,S,typeof(t)}(t, a, data)
 end
 
