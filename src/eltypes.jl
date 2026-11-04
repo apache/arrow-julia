@@ -155,7 +155,7 @@ function arrowtype(b, ::Type{Bool})
 end
 
 struct Decimal{P,S,T}
-    value::T # only Int128 or Int256
+    value::T # only Int32, Int64, Int128 or Int256
 end
 
 Base.zero(::Type{Decimal{P,S,T}}) where {P,S,T} = Decimal{P,S,T}(T(0))
@@ -163,7 +163,10 @@ Base.zero(::Type{Decimal{P,S,T}}) where {P,S,T} = Decimal{P,S,T}(T(0))
 Base.isequal(a::Decimal{P,S,T}, b::Decimal{P,S,T}) where {P,S,T} = isequal(a.value, b.value)
 
 function juliaeltype(f::Meta.Field, x::Meta.Decimal, convert)
-    return Decimal{x.precision,x.scale,x.bitWidth == 256 ? Int256 : Int128}
+    return Decimal{x.precision, x.scale,
+        x.bitWidth == 256 ? Int256 :
+        x.bitWidth == 128 ? Int128 :
+        x.bitWidth == 64 ? Int64 : Int32}
 end
 
 ArrowTypes.ArrowKind(::Type{<:Decimal}) = PrimitiveKind()
@@ -172,7 +175,8 @@ function arrowtype(b, ::Type{Decimal{P,S,T}}) where {P,S,T}
     Meta.decimalStart(b)
     Meta.decimalAddPrecision(b, Int32(P))
     Meta.decimalAddScale(b, Int32(S))
-    Meta.decimalAddBitWidth(b, Int32(T == Int256 ? 256 : 128))
+    Meta.decimalAddBitWidth(b,
+        Int32(T == Int256 ? 256 : T == Int128 ? 128 : T == Int64 ? 64 : 32))
     return Meta.Decimal, Meta.decimalEnd(b), nothing
 end
 
