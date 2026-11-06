@@ -1107,6 +1107,22 @@ end
                 joinpath(dirname(pathof(Arrow)), "../test/reject_reason_trimmed.arrow"),
             )
             @test t.reject_reason[end] == "POST_ONLY"
+
+            # RecordBatch.variadicBufferCounts uses 64-bit integers in the Arrow spec
+            FB = Arrow.FlatBuffers
+            b = FB.Builder(64)
+            FB.startvector!(b, sizeof(Int64), 3, sizeof(Int64))
+            for cnt in Iterators.reverse(Int64[0, 7, 0])
+                FB.prepend!(b, cnt)
+            end
+            varcounts = FB.endvector!(b, 3)
+            FB.startobject!(b, 5)
+            FB.prependoffsetslot!(b, 4, varcounts, 0) # slot 4 (offset 12) = variadicBufferCounts
+            FB.finish!(b, Arrow.Meta.recordBatchEnd(b))
+
+            rb = FB.getrootas(Arrow.Meta.RecordBatch, Vector(FB.finishedbytes(b)), 0)
+            @test eltype(rb.variadicBufferCounts) === Int64
+            @test collect(rb.variadicBufferCounts) == Int64[0, 7, 0]
         end
     end # @testset "misc"
 

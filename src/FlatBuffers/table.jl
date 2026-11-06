@@ -110,7 +110,12 @@ function Array{T}(t::Table, off) where {T}
     a = vector(t, off)
     S = T <: Table ? UOffsetT : T <: Struct ? NTuple{structsizeof(T),UInt8} : T
     ptr = convert(Ptr{S}, pointer(bytes(t), a + 1))
-    data = unsafe_wrap(Base.Array, ptr, vectorlen(t, off))
+    len = vectorlen(t, off)
+    data = if UInt(ptr) % Base.datatype_alignment(S) == 0
+        unsafe_wrap(Base.Array, ptr, len)
+    else
+        copy(reinterpret(S, @view bytes(t)[(a + 1):(a + len * sizeof(S))]))
+    end
     return Array{T,S,typeof(t)}(t, a, data)
 end
 
