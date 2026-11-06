@@ -1107,6 +1107,19 @@ end
                 joinpath(dirname(pathof(Arrow)), "../test/reject_reason_trimmed.arrow"),
             )
             @test t.reject_reason[end] == "POST_ONLY"
+
+            # Compressed reinterp for UInt8 returns GC-owned decompressed Vector{UInt8}
+            raw = collect(codeunits("Luxembourg_120203202_18815"))
+            compressed = vcat(
+                reinterpret(UInt8, [Int64(length(raw))]),
+                transcode(Arrow.CodecZstd.ZstdCompressor(), raw),
+            )
+            batch = (; bytes=compressed, pos=1)
+            buf = (; offset=0, length=length(compressed))
+            comp = (; codec=Arrow.Meta.CompressionType.ZSTD)
+            _, A = Arrow.reinterp(UInt8, batch, buf, comp)
+            GC.gc()
+            @test A == raw
         end
     end # @testset "misc"
 

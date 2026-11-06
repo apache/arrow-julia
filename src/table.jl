@@ -810,6 +810,7 @@ function reinterp(::Type{T}, batch, buf, compression) where {T}
     len = buf.length
     if compression !== nothing
         len, bytes = uncompress(ptr, buf, compression)
+        T === UInt8 && return bytes, bytes
         ptr = pointer(bytes)
     end
     # it would be technically more correct to check that T.layout->alignment > 8
@@ -897,7 +898,7 @@ function build(
     validity = buildbitmap(batch, rb, nodeidx, bufferidx)
     bufferidx += 1
     buffer = rb.buffers[bufferidx]
-    _, views = reinterp(ViewElement, batch, buffer, rb.compression)
+    bytes, views = reinterp(ViewElement, batch, buffer, rb.compression)
     inline = reinterpret(UInt8, views)  # reuse the (possibly realigned) memory backing `views`
     bufferidx += 1
     buffers = Vector{UInt8}[]
@@ -912,7 +913,7 @@ function build(
     nodeidx += 1
     meta = buildmetadata(f.custom_metadata)
     T = juliaeltype(f, meta, convert)
-    return View{T}(batch.bytes, validity, views, inline, buffers, len, meta),
+    return View{T}(bytes, validity, views, inline, buffers, len, meta),
     nodeidx,
     bufferidx,
     varbufferidx
