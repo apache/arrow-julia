@@ -1103,9 +1103,8 @@ end
         end
 
         @testset "#511: Bug in reading Utf8View data" begin
-            t = Arrow.Table(
-                joinpath(dirname(pathof(Arrow)), "../test/reject_reason_trimmed.arrow"),
-            )
+            p = joinpath(dirname(pathof(Arrow)), "../test/reject_reason_trimmed.arrow")
+            t = Arrow.Table(p)
             @test t.reject_reason[end] == "POST_ONLY"
 
             # RecordBatch.variadicBufferCounts uses 64-bit integers in the Arrow spec
@@ -1123,6 +1122,53 @@ end
             rb = FB.getrootas(Arrow.Meta.RecordBatch, Vector(FB.finishedbytes(b)), 0)
             @test eltype(rb.variadicBufferCounts) === Int64
             @test collect(rb.variadicBufferCounts) == Int64[0, 7, 0]
+
+            # Compressed Utf8View buffers stay GC-rooted in reinterp and Arrow.View
+            zstd_frame(b::Vector{UInt8}) = vcat(
+                reinterpret(UInt8, [Int64(length(b))]),
+                transcode(Arrow.CodecZstd.ZstdCompressor, b),
+            )
+            raw = collect(codeunits("Luxembourg_120203202_18815"))
+            views_raw = collect(
+                reinterpret(
+                    UInt8,
+                    [
+                        Arrow.ViewElement(
+                            Int32(5),
+                            Int32(0x726f6873),
+                            Int32(116),
+                            Int32(0),
+                        ),
+                        Arrow.ViewElement(
+                            Int32(length(raw)),
+                            reinterpret(Int32, raw[1:4])[1],
+                            Int32(0),
+                            Int32(0),
+                        ),
+                    ],
+                ),
+            )
+            c_views = zstd_frame(views_raw)
+            c_buf = zstd_frame(raw)
+            batch = (; bytes=vcat(c_views, c_buf), pos=1)
+            rb = (;
+                buffers=[
+                    (; offset=0, length=0),
+                    (; offset=0, length=length(c_views)),
+                    (; offset=length(c_views), length=length(c_buf)),
+                ],
+                nodes=[(; length=2, null_count=0)],
+                compression=(; codec=Arrow.Meta.CompressionType.ZSTD),
+                variadicBufferCounts=[1],
+            )
+            bytes, A = Arrow.reinterp(UInt8, batch, rb.buffers[3], rb.compression)
+            @test bytes === A
+            f =
+                first(Arrow.BatchIterator(Arrow.ArrowBlob(Arrow.tobytes(p), 1, nothing))).msg.header.fields[1]
+            col, _ = Arrow.build(f, f.type, batch, rb, nothing, 1, 1, 1, true)
+            @test col.arrow !== batch.bytes
+            GC.gc()
+            @test collect(col) == ["short", "Luxembourg_120203202_18815"]
         end
     end # @testset "misc"
 
