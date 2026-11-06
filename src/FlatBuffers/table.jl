@@ -100,10 +100,10 @@ function vector(t::Table, off)
     return x + sizeof(UOffsetT)
 end
 
-struct Array{T,S,TT} <: AbstractVector{T}
+struct Array{T,S,TT,D<:AbstractVector{S}} <: AbstractVector{T}
     _tab::TT
     pos::Int64
-    data::Vector{S}
+    data::D
 end
 
 function Array{T}(t::Table, off) where {T}
@@ -114,9 +114,9 @@ function Array{T}(t::Table, off) where {T}
     data = if UInt(ptr) % Base.datatype_alignment(S) == 0
         unsafe_wrap(Base.Array, ptr, len)
     else
-        copy(reinterpret(S, @view bytes(t)[(a + 1):(a + len * sizeof(S))]))
+        reinterpret(S, @view bytes(t)[(a + 1):(a + len * sizeof(S))])
     end
-    return Array{T,S,typeof(t)}(t, a, data)
+    return Array{T,S,typeof(t),typeof(data)}(t, a, data)
 end
 
 function structsizeof end
