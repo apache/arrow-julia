@@ -36,7 +36,8 @@ export ArrowKind,
     toarrow,
     arrowname,
     fromarrow,
-    ToArrow
+    ToArrow,
+    registertype!
 
 """
     ArrowTypes.ArrowKind(T)
@@ -284,6 +285,36 @@ const IPV6_SYMBOL = Symbol("JuliaLang.IPv6")
 arrowname(::Type{IPv6}) = IPV6_SYMBOL
 JuliaType(::Val{IPV6_SYMBOL}) = IPv6
 fromarrow(::Type{IPv6}, x::NTuple{16,UInt8}) = IPv6(_cast(UInt128, x))
+
+# Enum support
+const ENUM_SYMBOL = Symbol("JuliaLang.Enum")
+const ENUM_TYPES = Dict{String,DataType}()
+
+"""
+    registertype!(::Type{T}) where {T<:Enum}
+
+Register an `Enum` type for deserialization. This is only needed when reading
+Arrow data in a session that did not write it (i.e. read-only scenarios).
+During writing, enum types are registered automatically via `arrowmetadata`.
+"""
+function registertype!(::Type{T}) where {T<:Enum}
+    ENUM_TYPES[string(nameof(T))] = T
+    return T
+end
+
+ArrowType(::Type{<:Enum}) = Int32
+toarrow(x::Enum) = Int32(Integer(x))
+arrowname(::Type{<:Enum}) = ENUM_SYMBOL
+
+function arrowmetadata(::Type{T}) where {T<:Enum}
+    key = string(nameof(T))
+    ENUM_TYPES[key] = T
+    return key
+end
+
+JuliaType(::Val{ENUM_SYMBOL}, S, meta::AbstractString) = get(ENUM_TYPES, meta, nothing)
+fromarrow(::Type{T}, x::Integer) where {T<:Enum} = T(x)
+default(::Type{T}) where {T<:Enum} = typemin(T)
 
 function _cast(::Type{Y}, x)::Y where {Y}
     y = Ref{Y}()
