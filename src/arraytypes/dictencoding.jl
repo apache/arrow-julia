@@ -119,6 +119,27 @@ signedtype(::Type{UInt32}) = Int32
 signedtype(::Type{UInt64}) = Int64
 signedtype(::Type{T}) where {T<:Signed} = T
 
+function _dict_indices(refa, pool, validity::ValidityBitmap)
+    ET = signedtype(length(pool))
+    inds = Vector{ET}(undef, length(refa))
+    lo = firstindex(pool)
+    hi = lastindex(pool)
+    j = 1
+    @inbounds for idx in eachindex(refa)
+        ref = refa[idx]
+        # Per the Arrow columnar format spec, dictionary data stores 0-based indices.
+        if lo <= ref <= hi
+            inds[j] = ET(ref - lo)
+        elseif validity[j]
+            throw(ArgumentError("dictionary reference index is out of range"))
+        else
+            inds[j] = zero(ET)
+        end
+        j += 1
+    end
+    return inds
+end
+
 indtype(d::DictEncoded{T,S,A}) where {T,S,A} = S
 indtype(c::Compressed{Z,A}) where {Z,A<:DictEncoded} = indtype(c.data)
 
@@ -229,12 +250,12 @@ function arrowvector(
         else
             pool = DataAPI.refpool(x)
             refa = DataAPI.refarray(x)
-            inds = copyto!(similar(Vector{signedtype(length(pool))}, length(refa)), refa)
         end
         # adjust to "offset" instead of index
-        inds .-= firstindex(refa)
+        inds = _dict_indices(refa, pool, validity)
+        pooldata = firstindex(pool) == 1 ? pool : collect(pool)
         data = arrowvector(
-            pool,
+            pooldata,
             i,
             nl,
             fi,

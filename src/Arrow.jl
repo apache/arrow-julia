@@ -26,11 +26,11 @@ This implementation supports the 1.0 version of the specification, including sup
   * Extension types
   * Streaming, file, record batch, and replacement and isdelta dictionary messages
   * Buffer compression/decompression via the standard LZ4 frame and Zstd formats
+  * C Data Interface import and export
 
 It currently doesn't include support for:
   * Tensors or sparse tensors
   * Flight RPC
-  * C data interface
 
 Third-party data formats:
   * csv and parquet support via the existing [CSV.jl](https://github.com/JuliaData/CSV.jl) and [Parquet.jl](https://github.com/JuliaIO/Parquet.jl) packages
@@ -44,6 +44,7 @@ module Arrow
 using Base.Iterators
 using Mmap
 import Dates
+import Serialization
 using DataAPI,
     Tables,
     SentinelArrays,
@@ -76,6 +77,7 @@ include("utils.jl")
 include("arraytypes/arraytypes.jl")
 include("eltypes.jl")
 include("table.jl")
+include("cdata.jl")
 include("write.jl")
 include("append.jl")
 include("show.jl")
@@ -138,6 +140,7 @@ function __init__()
     resize!(empty!(ZSTD_COMPRESSOR), nt)
     resize!(empty!(LZ4_FRAME_DECOMPRESSOR), nt)
     resize!(empty!(ZSTD_DECOMPRESSOR), nt)
+    _init_c_data_export_callbacks!()
     return
 end
 
