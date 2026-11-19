@@ -51,6 +51,12 @@ struct CustomStruct2{sym}
 end
 
 @testset ExtendedTestSet "Arrow" begin
+    @static if VERSION >= v"1.11.0-DEV.469"
+        @testset "public API" begin
+            @test all(name -> Base.ispublic(Arrow, name), (:Table, :Stream, :write))
+        end
+    end
+
     @testset "table roundtrips" begin
         for case in testtables
             testtable(case...)

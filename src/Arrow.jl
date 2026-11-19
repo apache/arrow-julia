@@ -57,6 +57,11 @@ using DataAPI,
 
 export ArrowTypes
 
+# `public` needs Julia 1.11; `eval` keeps the file parseable on older versions
+@static if VERSION >= v"1.11.0-DEV.469"
+    eval(Expr(:public, :Table, :Stream, :write))
+end
+
 using Base: @propagate_inbounds
 import Base: ==
 
