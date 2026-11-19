@@ -95,6 +95,18 @@ testtables = [
                 zero(Arrow.Date{Arrow.Meta.DateUnit.MILLISECOND,Int64}),
                 missing,
             ],
+            col21=[
+                zero(Arrow.Decimal{Int32(2),Int32(2),Int32}),
+                zero(Arrow.Decimal{Int32(2),Int32(2),Int32}),
+                zero(Arrow.Decimal{Int32(2),Int32(2),Int32}),
+                missing,
+            ],
+            col22=[
+                zero(Arrow.Decimal{Int32(2),Int32(2),Int64}),
+                zero(Arrow.Decimal{Int32(2),Int32(2),Int64}),
+                zero(Arrow.Decimal{Int32(2),Int32(2),Int64}),
+                missing,
+            ],
         ),
         NamedTuple(),
         (convert=false,),
