@@ -359,9 +359,7 @@ function from_c_stream(sp::Ptr{CArrowArrayStream}; limits::Limits=Limits())
         finally
             _release_producer!(Base.unsafe_convert(Ptr{CArrowSchema}, out))
         end
-        batchfield.type isa StructType ||
-            throw(ValidationError("C stream schema must be a struct-typed batch schema"))
-        schema = Schema(collect(Field, batchfield.children); metadata=batchfield.metadata)
+        schema = _cbatchschema(batchfield)
         _validate_stream_schema(schema)
         return ImportedStream(owner, batchfield, schema, limits, false, false)
     catch
@@ -394,7 +392,7 @@ function AC.nextbatch!(s::ImportedStream)
         owner = GC.@preserve out _moveowner(Base.unsafe_convert(Ptr{CArrowArray}, out))
         d = _importarray(s.batchfield, owner)
         try
-            return _structbatch(s.schema, d)
+            return _cbatch(s.schema, d)
         catch
             release!(owner)
             rethrow()
@@ -403,6 +401,13 @@ function AC.nextbatch!(s::ImportedStream)
         _finishstreamcall!(s)
     end
 end
+
+# C streams may contain any same-schema arrays. A struct supplies the fields
+# of a record batch; other layouts supply one column named by the producer.
+_cbatchschema(f::Field) =
+    f.type isa StructType ? Schema(f.children; metadata=f.metadata) : Schema(Field[f])
+_cbatch(sch::Schema, d::ArrayData) =
+    d.type isa StructType ? _structbatch(sch, d) : AC.RecordBatch(sch, ArrayData[d], d.len)
 
 # A record batch has no row validity, so null struct rows are refused rather
 # than exposing the child values under them (Arrow C++ refuses them too).

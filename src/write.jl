@@ -663,7 +663,7 @@ Base.@nospecializeinfer function _writebatch!(
         nullable && (fields = AC.Field[_nullablefield(f) for f in fields])
         _beginwrite!(w, fields, retained, names; several, input=part)
         batch = AC.RecordBatch(w.schema, coldata, nrows)
-        w.exported === nothing || push!(w.exported, batch)
+        w.exported === nothing || push!(w.exported, several ? copy(batch) : batch)
         nrows == 0 && return nothing
         writebatch!(w.st::IPCWriteState, batch; recycle=_handoff!(w.pool))
         return nothing
@@ -694,7 +694,7 @@ Base.@nospecializeinfer function _writebatch!(
     # against the writer's schema instead of trusting construction.
     batch = AC.RecordBatch(AC.Schema(fields; metadata=sch.metadata), coldata, nrows)
     deltas = _uninferred(_dictionarydeltas, st, batch, growth)::Dict{Int64,AC.ArrayData}
-    w.exported === nothing || push!(w.exported, batch)
+    w.exported === nothing || push!(w.exported, several ? copy(batch) : batch)
     writebatch!(st, batch; deltas, recycle=_handoff!(w.pool))
     return nothing
 end

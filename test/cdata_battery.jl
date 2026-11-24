@@ -1564,6 +1564,22 @@ function cdata_battery()
     end
     println("the 54-column matrix crosses both interfaces both ways as an IPC read ✓")
 
+    let shared = Int32[0, 0], slot = Ref{CArrowArrayStream}()
+        parts = Tables.partitioner((begin
+            shared .= (10i + 1, 10i + 2)
+            (; x=shared)
+        end for i in 1:2))
+        f, d = fromjulia("values", Int32[2, 4])
+        GC.@preserve slot begin
+            p = Base.unsafe_convert(Ptr{CArrowArrayStream}, slot)
+            export_stream!(p, parts)
+            @assert Arrow.Table(p).x == [11, 12, 21, 22]
+            @assert Arrow.Table(one_batch_stream!(p, f, d)).values == [2, 4]
+            rows = Arrow.Stream(one_batch_stream!(p, f, d))
+            @assert only(rows).values == [2, 4]
+        end
+    end
+
     # An exported table is built as `Arrow.write` builds it: the same fields,
     # column types, and values as the IPC bytes, for plain Julia values too.
     mixed = (

@@ -103,7 +103,9 @@ instead of reading the whole stream, for a DuckDB or Polars result larger than m
   list values, and dictionary-encoded columns. String bytes may be copied.
   `export_stream!` sends one record batch per `Tables.partitions` partition (an
   `Arrow.Stream` is a partition per batch) and splits a batch only when its string data
-  outgrows 32-bit offsets; `to_c_data` refuses a table that needs more than one batch.
+  outgrows 32-bit offsets or `batchsize` requires it. Multi-partition sources may reuse
+  their column buffers, so each batch is copied before requesting another partition.
+  `to_c_data` refuses a table that needs more than one batch.
 - Imports have the column types an IPC read gives: strings as `DataString`, timestamps
   as `Timestamp` or `ZonedTimestamp`, decimals as `Decimal`, nested values as the same
   views, with `stringtype`, `ntasks`, and `limits` as for `Arrow.Table`. Numbers, dates,

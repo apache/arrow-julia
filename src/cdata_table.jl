@@ -90,14 +90,6 @@ end
 
 # A struct array is a record batch of its fields; any other array is a
 # one-column batch named after its schema.
-function _recordbatch(f::AC.Field, d::AC.ArrayData)
-    if f.type isa AC.StructType
-        sch = AC.Schema(collect(AC.Field, f.children); metadata=f.metadata)
-        return sch, _structbatch(sch, d)
-    end
-    sch = AC.Schema(AC.Field[f])
-    return sch, AC.RecordBatch(sch, AC.ArrayData[d], d.len)
-end
 
 """
     Arrow.Table(schemaptr::Ptr{Arrow.CArrowSchema}, arrayptr::Ptr{Arrow.CArrowArray};
@@ -116,7 +108,8 @@ function Table(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}; kw...)
     stringtype, ntasks, limits = _creadargs(; kw...)
     f, d = from_c_data(sp, ap)
     try
-        sch, b = _recordbatch(f, d)
+        sch = _cbatchschema(f)
+        b = _cbatch(sch, d)
         return _ctable(sch, AC.RecordBatch[b], stringtype, ntasks, limits)
     catch
         release!(d.owner::ForeignOwner)
@@ -264,7 +257,8 @@ of a Tables.jl table: one per `Tables.partitions` partition (an [`Arrow.Stream`]
 is a partition per batch read), split only when `batchsize` is given or a batch's string
 data outgrows 32-bit offsets. The batches are built as [`Arrow.write`](@ref) builds them,
 with the same keywords, before this returns; the consumer pulls them through the stream
-and releases it. Buffers cross without copying where `Arrow.write` would not copy them.
+and releases it. A single stable partition may share its buffers. A multi-partition
+source may reuse its storage, so each batch is copied before advancing the iterator.
 Memory stays reachable until the consumer has released the stream and every batch it
 pulled.
 """
