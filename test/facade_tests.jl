@@ -670,6 +670,14 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             # A window counts rows across batches and stops the iteration.
             @test xs(Arrow.Stream(bytes; limit=6)) == 1:6
             @test length(collect(Arrow.Stream(bytes; limit=6))) == 2
+            @test length(Arrow.Stream(bytes; limit=0)) == 0
+            if file
+                for (offset, limit, expected) in ((0, 1, 1), (4, 1, 2), (0, 15, 3))
+                    s = Arrow.Stream(bytes; scan=Tables.Scan(; offset, limit))
+                    @test length(s) == length(collect(s)) == expected
+                end
+                @test_throws ArgumentError length(Arrow.Stream(bytes; filter=Arrow.col(:x) > 2, limit=1))
+            end
             @test xs(Arrow.Stream(bytes; scan=Tables.Scan(offset=3, limit=6))) == 4:9
             scan =
                 Tables.Scan(select=(:x => :y,), filter=Arrow.col(:x) > 1, offset=2, limit=5)

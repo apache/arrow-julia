@@ -17,6 +17,7 @@
 # Reader allocation budgets: per-batch streams, compressed input, contention.
 
 using Test, Arrow, Tables
+import DataAPI
 const ZstdCompressor = Arrow.CZSTD.ZstdCompressor
 
 # Decode one compressed buffer whose column reads `needed` bytes (-1: unknown).
@@ -40,6 +41,13 @@ function decodebuffer(payload, declared, needed; codec=Arrow.CODEC_ZSTD, budget)
 end
 
 smallbudget() = Arrow.AllocationBudget(64 * 1024; ratio=64, cap=1 << 30)
+
+@testset "counting stream rows uses each batch's allowance" begin
+    io = IOBuffer()
+    Arrow.write(io, (x=collect(1:40),); file=true, batchsize=1)
+    stream = Arrow.Stream(take!(io); limits=Arrow.Limits(max_total_allocated_bytes=100_000))
+    @test DataAPI.nrow(stream) == sum(DataAPI.nrow, stream) == 40
+end
 
 @testset "reader allocation limits" begin
     @testset "a size past a Limits field names the field to raise" begin

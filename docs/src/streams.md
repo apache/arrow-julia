@@ -60,6 +60,10 @@ from the batches' metadata:
 (length(stream), DataAPI.nrow(stream), DataFrame(stream[2]))
 ```
 
+For a file with a row limit, `length(stream)` reads batch metadata up to that limit.
+When a filter determines which batch reaches the limit, count the batches during
+iteration. A limit of zero always has zero batches.
+
 A stream-format source has no index: it is read in order, its batch count is known only
 once it has been read, and an `Arrow.Stream` over an `IO` can be iterated once.
 

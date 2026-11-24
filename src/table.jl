@@ -2126,7 +2126,27 @@ _decoder(f::Union{ArrowFile,_RangedFile}) =
 _decoder(r::_StreamReader) =
     _Decoder(r.st.fields, r.st.fielddictids, r.st.validated, r.limits)
 
-Base.length(s::Stream) = _nbatches(s.src)
+function Base.length(s::Stream)
+    _checkstream(s)
+    scan = getfield(s, :scan)
+    (scan === nothing || scan.limit === nothing) && return _nbatches(s.src)
+    remaining = scan.limit
+    remaining == 0 && return 0
+    src = s.src
+    src isa Union{ArrowFile,_RangedFile} && scan.filter === nothing || throw(
+        ArgumentError("the batch count of this limited stream is known while iterating it"),
+    )
+    offset = scan.offset
+    n = _nbatches(src)
+    for i = 1:n
+        rows = _batchrows(src, i, _batchbudget(src, i))
+        skip = min(offset, rows)
+        offset -= skip
+        remaining -= rows - skip
+        remaining <= 0 && return i
+    end
+    return n
+end
 Base.eltype(::Type{Stream}) = Table
 Base.IteratorSize(::Type{Stream}) = Base.SizeUnknown()
 
@@ -2317,8 +2337,11 @@ function DataAPI.nrow(s::Stream)
             "iterate the Arrow.Stream and add up its batches' rows",
         ),
     )
-    budget = _readbudget(_configuredlimits(src), 0)
-    return sum(i -> Int(_batchrows(src, i, budget)), 1:_nbatches(src); init=0)
+    rows = 0
+    for i = 1:_nbatches(src)
+        rows = _addscanrows(rows, _batchrows(src, i, _batchbudget(src, i)))
+    end
+    return rows
 end
 
 DataAPI.metadatasupport(::Type{Stream}) = (read=true, write=false)
