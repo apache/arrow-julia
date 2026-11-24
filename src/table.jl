@@ -177,29 +177,36 @@ const _MAX_NEW_ZONES = 1024
 
 function _checknewzones(fields)
     seen = Set{String}()
-    for f in fields
-        _newzones!(seen, f)
+    for field in fields
+        _foreachtimestampzone(field) do zone
+            if !(zone in seen) && _existingjlsymbol(zone) === nothing
+                push!(seen, zone)
+                length(seen) <= _MAX_NEW_ZONES || throw(
+                    AC.ValidationError(
+                        "timestamp columns declare more than $_MAX_NEW_ZONES time zones " *
+                        "this Julia process has not seen; each zone is a type parameter",
+                    ),
+                )
+            end
+        end
     end
     return nothing
 end
 
-function _newzones!(seen::Set{String}, f::AC.Field)
+function _foreachtimestampzone(visit, f::AC.Field)
     t = f.type
+    # Dictionary values share the field's children.
+    while t isa AC.DictionaryType
+        t = t.valuetype
+    end
     if t isa AC.TimestampType
         zone = _timestampzone(t)
-        if zone !== nothing && !(zone in seen) && _existingjlsymbol(zone) === nothing
-            push!(seen, zone)
-            length(seen) <= _MAX_NEW_ZONES || throw(
-                AC.ValidationError(
-                    "timestamp columns declare more than $_MAX_NEW_ZONES time zones " *
-                    "this Julia process has not seen; each zone is a type parameter",
-                ),
-            )
-        end
+        zone === nothing || visit(zone)
     end
-    t isa AC.DictionaryType && _newzones!(seen, AC.dictvaluefield(f, t))
-    foreach(c -> _newzones!(seen, c), f.children)
-    return seen
+    for child in f.children
+        _foreachtimestampzone(visit, child)
+    end
+    return nothing
 end
 
 # `names` with each repeated name made unique as CSV.jl does (`a`, `a_1`, `a_2`,

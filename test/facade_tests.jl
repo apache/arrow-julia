@@ -3006,6 +3006,24 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         @test t.x isa Arrow.Primitive && t.x == [1, 2, 3]
     end
 
+    @testset "time zones in dictionary value fields" begin
+        AC = Arrow.AC
+        dict(t) = AC.DictionaryType(AC.IntType(8, true), t, false)
+        ts(zone) = AC.TimestampType(AC.MICROSECOND, zone)
+        nested = AC.Field(
+            "regions",
+            dict(AC.StructType()),
+            children=[
+                AC.Field("first", dict(dict(ts("Etc/UTC")))),
+                AC.Field("second", ts("America/Denver")),
+                AC.Field("naive", ts(nothing)),
+            ],
+        )
+        zones = String[]
+        Arrow._foreachtimestampzone(zone -> push!(zones, zone), nested)
+        @test zones == ["Etc/UTC", "America/Denver"]
+    end
+
     @testset "time zones: filter literals and the per-read cap" begin
         AC = Arrow.AC
         utc(x...) = Durations.ZonedTimestamp{Dates.Microsecond,:UTC}(x...)
