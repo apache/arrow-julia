@@ -176,8 +176,11 @@ end
     ranged() = Arrow.Table(MeteredSource(bytes, fetched); select=[:s1, :pad])
     t = ranged()
     @test t.s1 == mapped.s1 && t.pad == mapped.pad
-    fetched[] = 0
-    copied = @allocated(ranged()) - fetched[]
+    # A collection can run unrelated finalizers during one allocation sample.
+    copied = minimum(1:3) do _
+        fetched[] = 0
+        return (@allocated ranged()) - fetched[]
+    end
     @test copied < length(bytes) / 4
 end
 
