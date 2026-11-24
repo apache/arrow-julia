@@ -593,14 +593,22 @@ end
 
 const _PADDING = ntuple(k -> zeros(UInt8, k), 7)
 
+function _writeexact(io::IO, bytes::Vector{UInt8})
+    n = Base.write(io, bytes)
+    n == length(bytes) || throw(
+        Base.IOError("short Arrow IPC write: sink accepted $n of $(length(bytes)) bytes", Base.UV_EIO),
+    )
+    return nothing
+end
+
 "Write a message body: each piece, then its zero padding to 8 bytes."
 function _writebody(io::IO, c::EncodeCursor)
     for b in c.body
         # An uncopied array over the piece; preserving the piece keeps its
         # owner alive across the write.
-        GC.@preserve b Base.write(io, unsafe_wrap(Array, AC.sliceptr(b), Int(b.len)))
+        GC.@preserve b _writeexact(io, unsafe_wrap(Array, AC.sliceptr(b), Int(b.len)))
         pad = Int((-b.len) & 7)
-        pad > 0 && Base.write(io, _PADDING[pad])
+        pad > 0 && _writeexact(io, _PADDING[pad])
     end
     return nothing
 end
@@ -1160,7 +1168,7 @@ _encodestates(codec::Int8, level, ntasks::Integer) =
     codec == CODEC_NONE ? EncodeState[] : EncodeState[EncodeState(level) for _ = 1:ntasks]
 
 function _publish!(st::IPCWriteState, out::Vector{UInt8})
-    Base.write(st.io, out)
+    _writeexact(st.io, out)
     st.written += length(out)
     return nothing
 end
@@ -1228,7 +1236,7 @@ function _publishmessages!(st::IPCWriteState, messages, states=st.states)
     for (header, body, blocks) in messages
         blocks === nothing ||
             push!(blocks, (st.written, Int64(length(header)), body.bodylen))
-        Base.write(st.io, header)
+        _writeexact(st.io, header)
         _writebody(st.io, body)
         st.written += length(header) + body.bodylen
     end

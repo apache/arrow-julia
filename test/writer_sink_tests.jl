@@ -64,6 +64,20 @@ end
 @testset "writer sink validation and cleanup" begin
     table = (; a=fill(Int64(7), 64))
 
+    @testset "short writes fail and a bounded append retains the original stream" begin
+        for file in (false, true)
+            size = length(Arrow._writebytes(table; file))
+            for cap in (1, size ÷ 2, size - 1)
+                @test_throws Base.IOError Arrow.write(IOBuffer(; maxsize=cap), table; file)
+            end
+        end
+        original = Arrow._writebytes(table; file=false)
+        io = IOBuffer(; maxsize=length(original) + 8)
+        write(io, original)
+        @test_throws Base.IOError Arrow.append(io, table)
+        @test take!(io) == original
+    end
+
     @testset "invalid constructor options preserve the sink" begin
         original = UInt8[0x00, 0xff, 0x41, 0x52, 0x52, 0x4f, 0x57]
         constructors = (

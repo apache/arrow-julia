@@ -945,8 +945,7 @@ function append(path::AbstractString, tbl; kwargs...)
         AC._unmap!(region)
     end
     open(path, "r+") do io
-        seek(io, keep)
-        Base.write(io, tail)
+        _appendtail!(io, keep, tail)
     end
     return path
 end
@@ -956,9 +955,29 @@ function append(io::IO, tbl; kwargs...)
     bytes = Base.read(io)
     isempty(bytes) && return write(io, tbl; file=false, kwargs...)
     keep, tail = _appendbytes(AC.heapregion(bytes), tbl; kwargs...)
-    seek(io, keep)
-    Base.write(io, tail)
+    _appendtail!(io, keep, tail)
     return io
+end
+
+function _appendtail!(io::IO, keep, tail)
+    seek(io, keep)
+    original = Base.read(io)  # the original end-of-stream marker, if present
+    seek(io, keep)
+    try
+        _writeexact(io, tail)
+    catch
+        # Keep a seekable, truncatable sink readable after a partial append.
+        # The original write error takes precedence if the sink itself has failed.
+        try
+            seek(io, keep)
+            _writeexact(io, original)
+            truncate(io, keep + length(original))
+            seekend(io)
+        catch
+        end
+        rethrow()
+    end
+    return nothing
 end
 
 append(sink::Union{AbstractString,IO}; kwargs...) = tbl -> append(sink, tbl; kwargs...)
