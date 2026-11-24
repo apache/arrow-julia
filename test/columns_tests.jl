@@ -1084,6 +1084,16 @@ end
         @test copy(tn.l[1]) == ["abcdefghijklmnop", "q"]
     end
 
+    @testset "skipmissing respects the reduction operator" begin
+        values = Union{Missing,Int8}[100, 100, missing]
+        for n in (2, 3)
+            col = Arrow.Table(arrowbytes((x=values,); batchsize=n)).x
+            @test mapreduce(identity, +, skipmissing(col)) ===
+                  mapreduce(identity, +, skipmissing(values))
+            @test sum(skipmissing(col)) === sum(skipmissing(values))
+        end
+    end
+
     @testset "columns of several batches copy and broadcast by batch" begin
         part(r) = (
             x=collect(Int64, r),
@@ -1122,6 +1132,10 @@ end
             dest = zeros(Int, 12)
             dest .= t.x .* 2
             @test dest == 2 .* (1:12)
+            want = copy(dest)
+            want .= v .+ view(want, 12:-1:1)
+            dest .= t.x .+ view(dest, 12:-1:1)
+            @test dest == want
             @test t.x .+ Tuple(1:12) == 2 .* (1:12)
             @test (t.x .+ (1:12)') == v .+ (1:12)'
         end

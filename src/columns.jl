@@ -297,7 +297,7 @@ end
 _maskablesum(f, op, ::Primitive) = false
 _maskablesum(
     ::typeof(identity),
-    ::Union{typeof(+),typeof(Base.add_sum)},
+    ::typeof(Base.add_sum),
     ::Primitive{T,<:Union{Base.BitInteger,Base.IEEEFloat},Nothing},
 ) where {T} = true
 
@@ -1315,7 +1315,9 @@ Base.similar(::Broadcast.Broadcasted{_ChainedStyle}, ::Type{Bool}, dims) =
 function Base.copyto!(dest::AbstractVector, bc::Broadcast.Broadcasted{_ChainedStyle})
     axes(dest) == axes(bc) || Broadcast.throwdm(axes(dest), axes(bc))
     c = _drivingchain(bc)
-    c === nothing && return copyto!(dest, convert(Broadcast.Broadcasted{Nothing}, bc))
+    if c === nothing || _overlapsbroadcast(dest, bc)
+        return copyto!(dest, convert(Broadcast.Broadcasted{Nothing}, bc))
+    end
     for r in _batchranges(c)
         part = Broadcast.instantiate(_batchargs(bc, r))
         if dest isa BitVector
@@ -1328,6 +1330,13 @@ function Base.copyto!(dest::AbstractVector, bc::Broadcast.Broadcasted{_ChainedSt
     end
     return dest
 end
+
+# Base unaliases the whole expression before assignment. Running it on one
+# batch at a time would miss overlaps between different batches.
+_overlapsbroadcast(dest, bc::Broadcast.Broadcasted) =
+    any(a -> _overlapsbroadcast(dest, a), bc.args)
+_overlapsbroadcast(dest, a::AbstractArray) = a !== dest && Base.mightalias(dest, a)
+_overlapsbroadcast(dest, a) = false
 
 # Without a concrete element type, Base narrows the result to the values it
 # computes (`x .+ 1` over a nullable column with no nulls gives a
