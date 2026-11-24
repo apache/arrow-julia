@@ -84,8 +84,9 @@ after its table is gone.
 
 ## Copy into Julia vectors
 
-`copy(column)` and `copy(table)` copy into owned, mutable columns: a `Vector` per column,
-a `PooledArray` for a dictionary column, and a `StringVector` for strings. A copied
+`copy(column)` and `copy(table)` make owned, mutable columns. Strings use a
+`StringVector`, and dictionary columns use a `PooledArray` when pooling preserves their
+distinct values. The other copies use `Vector`s. A copied
 table's string columns hold their own bytes, so nothing of the source stays
 referenced. `DataFrame(table)` copies once, as `DataFrame` always does, but its string
 columns still share the source's bytes (DataStrings' `copy` keeps a column's buffers);

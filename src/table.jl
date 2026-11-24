@@ -1731,8 +1731,9 @@ const _MMAP_DEFAULT = !Sys.iswindows()
 
 Read `source` as [`Arrow.Table`](@ref) does, with the same keywords, and pass the
 result to `sink` with owned, mutable columns, copied once: `Arrow.read(path, DataFrame)`
-returns a `DataFrame` whose columns are `Vector`s (`PooledArray`s for dictionary columns,
-`StringVector`s for strings). A sink that takes DataAPI metadata, such as a `DataFrame`,
+returns a `DataFrame` with owned columns. Strings use `StringVector`s, and dictionary
+columns use `PooledArray`s when pooling preserves their distinct values. A sink that
+takes DataAPI metadata, such as a `DataFrame`,
 gets the file and column metadata, as `DataFrame(Arrow.Table(path))` does.
 """
 function read(source, sink; kwargs...)

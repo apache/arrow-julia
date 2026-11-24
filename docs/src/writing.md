@@ -149,7 +149,8 @@ The indices are the narrowest signed integers that hold the dictionary (`Int8` u
 values) for a known one-partition table, and `Int32` for several or an unknown number of
 partitions and for an `Arrow.Writer`, since later tables may add values. Reading gives a
 [`Arrow.DictEncoded`](@ref) column: `DataAPI.refarray`, `DataAPI.refpool`, and
-`DataAPI.levels` expose the encoding, and `copy` gives a `PooledArray`.
+`DataAPI.levels` expose the encoding. `copy` gives a `PooledArray` when Julia equality
+preserves distinct categories, and a `Vector` otherwise.
 
 ### Dictionaries that grow
 

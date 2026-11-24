@@ -210,8 +210,9 @@ column nested more than 8 levels deep therefore reads with untyped rows: lists a
 
 A dictionary column reads as an [`Arrow.DictEncoded`](@ref) of its values' type.
 `DataAPI.refarray`, `DataAPI.refpool`, and `DataAPI.levels` expose the encoding without
-decoding it; `levels` follows the dictionary's order. `copy(column)` gives a
-`PooledArray`. With CategoricalArrays.jl loaded, `isordered(column)` tells whether the
+decoding it. `levels` follows the dictionary's order. `copy(column)` gives a
+`PooledArray` when Julia equality preserves distinct categories, and a `Vector`
+otherwise. With CategoricalArrays.jl loaded, `isordered(column)` tells whether the
 dictionary is ordered, and `categorical` rebuilds a `CategoricalArray` with its order:
 
 ```@example types

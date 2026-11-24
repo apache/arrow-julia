@@ -4051,8 +4051,15 @@ function _dictcodes(v, hint, prefix::Int)
     parentcol isa DictEncoded && (rows === nothing || rows isa UnitRange{Int}) ||
         return nothing
     pool = parentcol.pool
-    length(pool) <= prefix && all(i -> _samecategory(pool[i], hint[i]), eachindex(pool)) ||
-        return nothing
+    length(pool) <= prefix || return nothing
+    for i in eachindex(pool)
+        x, y = pool[i], hint[i]
+        # The same UTF-8 bytes can be a borrowed DataString or an owned String.
+        same =
+            x isa AbstractString && y isa AbstractString ? isequal(x, y) :
+            _samecategory(x, y)
+        same || return nothing
+    end
     return rows === nothing ? parentcol.indices : view(parentcol.indices, rows)
 end
 
