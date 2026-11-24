@@ -612,6 +612,8 @@ function _checkliterals(e, fields, names)
             )
         elseif e isa Tables.Cmp
             _checkliteral(f, ref, kind, e.rhs)
+        elseif e.values isa AbstractRange && isconcretetype(eltype(e.values))
+            isempty(e.values) || _checkliteral(f, ref, kind, first(e.values))
         elseif e.values isa Union{Tuple,AbstractArray,AbstractSet}
             foreach(v -> _checkliteral(f, ref, kind, v), e.values)
         end

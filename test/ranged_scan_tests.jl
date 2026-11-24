@@ -31,6 +31,27 @@ function Arrow.readrange(s::MeteredSource, offset, len)
     return s.bytes[(offset + 1):(offset + len)]
 end
 
+# Checking every member of a compact range can dominate the whole scan.
+struct UniteratedRange <: AbstractUnitRange{Int}
+    last::Int
+end
+Base.first(::UniteratedRange) = 1
+Base.last(r::UniteratedRange) = r.last
+Base.iterate(::UniteratedRange, state...) = error("range membership must not enumerate")
+
+@testset "binding homogeneous membership ranges" begin
+    bytes = take!(Arrow.write(IOBuffer(), (x=[1, 20, 40],); file=true))
+    for source in (bytes, MeteredSource(bytes, Ref(0)))
+        @test Arrow.Table(source; filter=Arrow.colin(Arrow.col(:x), UniteratedRange(30))).x ==
+              [1, 20]
+        @test isempty(Arrow.Table(source; filter=Arrow.colin(Arrow.col(:x), 2:1)).x)
+        @test_throws ArgumentError Arrow.Table(
+            source;
+            filter=Arrow.colin(Arrow.col(:x), 'a':'z'),
+        )
+    end
+end
+
 @testset "filtered range scans stop fetching at their limit" begin
     for compress in (nothing, :lz4, :zstd)
         io = IOBuffer()
