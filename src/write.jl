@@ -320,10 +320,9 @@ categories are added after the earlier ones, and its indices refer to the
 combined categories. Such dictionaries use `Int32` indices. In the file
 format each dictionary is written once, complete, when the writer closes
 (after the record batches; the format allows a dictionary anywhere before
-the footer). In the stream format a dictionary that gained categories is
-written again whole before the batch that needs it. pyarrow and Polars read
-both. `dictdeltas=true` writes only the new categories, as delta dictionary
-batches (in both formats): smaller, read by pyarrow, refused by Polars 1.43.
+the footer). Streams send new categories as delta dictionaries before the
+batch that needs them. `dictdeltas=true` also uses deltas in the file format.
+PyArrow reads delta dictionaries. Polars 1.43 refuses them.
 With `dictreplacement=true` (stream format only), each table instead replaces
 the dictionary with its own categories; the schema then declares the
 DictionaryReplacement feature, which strict readers such as nanoarrow refuse.

@@ -87,17 +87,16 @@ code, and what Arrow 2.x can read of files Arrow 3.0 writes.
 - Reading list views, run-end encoding, month-day-nano intervals, and the canonical
   `arrow.uuid`, `arrow.bool8`, and `arrow.fixed_shape_tensor` extensions. Rewriting a
   table keeps these types.
-- The C data and C stream interfaces: `Arrow.to_c_data(table)` and
-  `Arrow.export_stream!(streamptr, table)` export any Tables.jl table, built as
-  `Arrow.write` builds it: plain integer and float `Vector`s and an `Arrow.Table`'s
-  integer, float, and boolean buffers cross without copying, and other columns are built
-  into new buffers. `Arrow.Table(schemaptr, arrayptr)`,
+- `Arrow.export_c_data!` and `Arrow.export_stream!` fill caller-owned C structs.
+  Plain integer and float `Vector`s and an `Arrow.Table`'s integer, float, and boolean
+  buffers can cross without copying. `Arrow.Table(schemaptr, arrayptr)`,
   `Arrow.Table(streamptr)`, and `Arrow.Stream(streamptr)` import a record batch or a
   stream with the column types an IPC read gives, reading fixed-width values in the
-  producer's memory. Memory handed to a consumer is freed once the consumer releases
-  it, with nothing to call.
-- Rows of a dictionary column, `t.c[rows]` for any vector of integer indices or a `Bool`
-  mask, are a `PooledArray` with the column's categories, as `copy(t.c)` is.
+  producer's memory. `Arrow.to_c_data` allocates the base structs. Call
+  `Arrow.free_c_data!` after the consumer finishes using those addresses.
+- Copying or selecting rows of a dictionary column usually returns a `PooledArray`.
+  If Julia's dictionary equality would merge distinct categories, it returns a
+  vector that preserves the values.
 - A TimeZones.jl extension that writes `ZonedDateTime` columns, and a CategoricalArrays
   extension that writes ordered `CategoricalArray`s as ordered dictionaries and reports
   `isordered` for ordered dictionary columns.

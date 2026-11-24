@@ -502,18 +502,18 @@ end
 
         sf = AC.Field("s", AC.StructType(); children=[tf])
         sd = AC.ArrayData(sf.type, 2, [AC.BufferSlice()]; children=[td])
-        lf = AC.Field("l", AC.ListType(false); children=[tf])
+        lf = AC.Field("l", AC.ListType(false); children=[pf])
         ld = AC.ArrayData(
             lf.type,
             2,
             [AC.BufferSlice(), AC._databuffer(Int32[0, 1, 2])];
-            children=[td],
+            children=[pd],
         )
         nested = AC.Schema([sf, lf])
         t = Arrow.Table(Arrow.writestream(nested, [AC.RecordBatch(nested, [sd, ld])]))
         for result in (t, Arrow.Table(arrowbytes(t)))
             @test result.s[1].t == Int32[0 1 2; 3 4 5]
-            @test only(result.l[2]) == Int32[6 7 8; 9 10 11]
+            @test only(result.l[2]) == Int32[6 9; 7 10; 8 11]
         end
     end
 

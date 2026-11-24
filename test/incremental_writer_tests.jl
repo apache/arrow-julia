@@ -200,7 +200,7 @@ batchkinds(bytes) = [
         end
 
         for compress in (nothing, :lz4, :zstd)
-            io = Arrow.tobuffer((; a=[0, 0]))
+            io = Arrow.tobuffer((; a=[0, 0]); compress)
             part = ReusedPartitions{false,typeof(identity)}([0, 0], 3, identity)
             Arrow.append(io, part; compress)
             @test collect(Arrow.Table(take!(io)).a) == [0, 0, 1, 1, 2, 2, 3, 3]

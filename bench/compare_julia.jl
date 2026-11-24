@@ -182,8 +182,8 @@ function main(workdir, label)
     wide = NamedTuple{ntuple(i -> Symbol("s", i), 16)}(ntuple(_ -> s, 16))
     label == "candidate" && Arrow.write(widepath, wide; file=true, ntasks=1)
     checkread(widepath, wide, "wide strings")
-    label == "candidate" && ranges()
     println("process_peak_rss_bytes=", Sys.maxrss())
+    label == "candidate" && ranges()
     return nothing
 end
 

@@ -255,6 +255,28 @@ nested = pa.DictionaryArray.from_arrays(pa.array([1, 0, 1]), inner)
         return nothing
     end
 
+    function _primitive_stream_roundtrip()
+        input = pa.chunked_array([pa.array([1, 2]), pa.array([3, 4])])
+        for importstream in (Arrow.Table, Arrow.Stream)
+            capsule = input.__arrow_c_stream__()
+            GC.@preserve capsule begin
+                name = PythonCall.C.PyCapsule_GetName(capsule)
+                unsafe_string(name) == "arrow_array_stream" ||
+                    error("unexpected C stream capsule")
+                ptr = Ptr{CAS}(PythonCall.C.PyCapsule_GetPointer(capsule, name))
+                result = importstream(ptr)
+                try
+                    batches = result isa Arrow.Table ? (result,) : result
+                    reduce(vcat, (Arrow.Tables.getcolumn(b, 1) for b in batches)) ==
+                    [1, 2, 3, 4] || error("primitive stream values changed")
+                finally
+                    Arrow.release!(result)
+                end
+            end
+        end
+        return nothing
+    end
+
     # Import a pyarrow RecordBatch through the C interface into Core.
     function _from_pyarrow(pyb)
         aref = Ref{CA}()
@@ -535,6 +557,7 @@ nested = pa.DictionaryArray.from_arrays(pa.array([1, 0, 1]), inner)
         _metadata_sentinel!(verdicts)
         for (check, runcheck) in (
             ("dictionary value schema round-trip", _dictionary_node_roundtrips),
+            ("primitive chunked stream", _primitive_stream_roundtrip),
             ("native worker handoff", _native_worker_handoff),
         )
             try

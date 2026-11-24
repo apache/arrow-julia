@@ -733,6 +733,7 @@ the consumer did not move or release is released first. Call once per base, afte
 the consumer has finished accessing that address.
 """
 function free_c_data!(p::Union{Ptr{CArrowArray},Ptr{CArrowSchema}})
+    p == C_NULL && return nothing
     try
         _release_producer!(p)
     finally

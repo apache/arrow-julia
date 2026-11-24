@@ -34,7 +34,7 @@ for flat, list, map, and struct layouts. A flat column reads its Arrow buffers i
 place (a memory-mapped file, the input bytes, or a decompressed buffer) and
 keeps that memory alive while the column is reachable, independent of its
 table. `copy(column)` returns an owned, mutable vector: a `Vector`, or a
-`PooledArray` for a dictionary-encoded column.
+`PooledArray` for a dictionary-encoded column when its categories can be pooled.
 """
 abstract type ArrowVector{T} <: AbstractVector{T} end
 
@@ -419,8 +419,9 @@ end
 
 A dictionary-encoded column: each row is an index into a pool of values.
 `DataAPI.refarray`, `DataAPI.refpool`, and `DataAPI.levels` (in dictionary order)
-expose the encoding without decoding it, and `copy` returns a `PooledArray`. With
-CategoricalArrays loaded, `isordered` tells whether the dictionary is ordered.
+expose the encoding without decoding it. `copy` returns a `PooledArray` when
+Julia's dictionary equality preserves every category, and an ordinary vector
+otherwise. With CategoricalArrays loaded, `isordered` reports the dictionary order flag.
 """
 struct DictEncoded{T,R,P<:AbstractVector,I<:AbstractVector} <: ArrowVector{T}
     indices::I
@@ -495,8 +496,7 @@ Base.copy(v::DictEncoded{T}) where {T} = _pooledcopy(T, (v,))
 # The batches of a column copy into one `PooledArray`, whether they share a
 # pool, extend it (delta dictionaries), or replace it.
 Base.copy(c::ChainedVector{T,<:DictEncoded}) where {T} = _pooledcopy(T, c.arrays)
-# Rows of a dictionary column, as of a `PooledArray`, keep the encoding: any
-# vector of integer indices or a `Bool` mask.
+# A vector of integer indices or a Bool mask gathers owned rows.
 function Base.getindex(v::DictEncoded{T}, rows::AbstractVector{<:Integer}) where {T}
     @boundscheck checkbounds(v, rows)
     return _pooledcopy(T, (v,), to_indices(v, (rows,))[1])
@@ -519,7 +519,7 @@ end
 
 """
 Rows `rows` (all of them by default) of the dictionary column whose batches
-are `chunks`, as a `PooledArray`. A batch's pool joins the result's when its
+are `chunks`, as a `PooledArray` when possible. A batch's pool joins the result's when its
 first row is copied (a copy of a column with no rows takes its batch's
 pool): its distinct values, in pool order; duplicate and null entries remap,
 so the PooledArray's invariants hold.
