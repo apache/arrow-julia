@@ -349,15 +349,13 @@ end
 
 # One export's Julia roots and native allocations. `live` is a malloc'd count
 # of the C nodes the consumer has not released; every node's `private_data`
-# points at it, so a release callback needs no Julia object. The 8 bytes after
-# the count hold an exported stream's last error message. `top` holds
-# `to_c_data`'s two top-level structs (C_NULL for a stream's exports, which fill
-# structs the consumer allocated); see `_RETIRED`.
+# points at it, so the release body needs no Julia object. The 8 bytes after
+# the count hold an exported stream's last error message. The caller owns
+# the base structs; this registry only owns the members they point at.
 struct Export
     roots::Vector{Any}
     mallocs::Vector{Ptr{Cvoid}}
     live::Ptr{Int64}
-    top::Ptr{Cvoid}
 end
 
 const EXPORTS = Dict{Ptr{Int64},Export}()
@@ -369,28 +367,14 @@ const _EXPORTS_UNTIL_REAP = Ref(64)
 # The most exports registered since `EXPORTS` last shrank. Deleting keeps the slots a
 # past peak grew, and a reap walks every slot, so a reap that leaves far fewer shrinks it.
 const _EXPORTS_PEAK = Ref(0)
-# The `top` blocks of freed exports, oldest first, with the `time_ns()` of the reap that
-# freed them. A consumer that releases a top-level struct in place may read it after the
-# release callback returns (Arrow C++ checks that its `release` is NULL), and a preempted
-# consumer can take a while to get there, so a reap frees a block only once it has been
-# retired for `_TOP_FREE_AFTER_NS`.
-const _RETIRED = Tuple{UInt64,Ptr{Cvoid}}[]
-const _TOP_FREE_AFTER_NS = UInt64(10_000_000)
-
-# A new export of `roots`; `topsize` bytes for top-level structs it allocates itself.
-function _newexport(roots::Vector{Any}, topsize::Integer=0)
+function _newexport(roots::Vector{Any})
     reap = lock(REGISTRY_LOCK) do
         return (_EXPORTS_UNTIL_REAP[] -= 1) <= 0
     end
     reap && _reap!()
     live = Ptr{Int64}(Libc.calloc(2, 8))
     live == C_NULL && throw(OutOfMemoryError())
-    top = topsize > 0 ? Libc.malloc(topsize) : C_NULL
-    if topsize > 0 && top == C_NULL
-        Libc.free(live)
-        throw(OutOfMemoryError())
-    end
-    return Export(roots, Ptr{Cvoid}[live], live, top)
+    return Export(roots, Ptr{Cvoid}[live], live)
 end
 
 function _malloc!(e::Export, n::Integer)
@@ -426,7 +410,6 @@ function __init__()
     # workload left (its pointers come back NULL), and re-arm the reap hook,
     # whose finalizer is not saved.
     empty!(EXPORTS)
-    empty!(_RETIRED)
     _EXPORTS_UNTIL_REAP[] = 64
     _EXPORTS_PEAK[] = 0
     _REAP_HOOK_ARMED[] = false
@@ -456,28 +439,17 @@ function _register!(e::Export)
     return nothing
 end
 
-# Free every export whose C nodes are all released, retire its `top` block, free the
-# blocks retired long enough ago, and return how many exports it freed. Runs from
-# `_newexport` (see `_EXPORTS_UNTIL_REAP`) and from `_ReapHook`, so no caller needs to.
+# Free each export whose C nodes are all released and return how many were freed.
 function _reap!()
     done = Export[]
-    expired = Ptr{Cvoid}[]
     lock(REGISTRY_LOCK) do
         peak = _EXPORTS_PEAK[] = max(_EXPORTS_PEAK[], length(EXPORTS))
         for e in values(EXPORTS)
             unsafe_load(e.live, :sequentially_consistent) == 0 && push!(done, e)
         end
-        # Read after the scan, so a block's stamp is later than the release the scan saw.
-        now = time_ns()
         for e in done
             delete!(EXPORTS, e.live)
-            e.top == C_NULL || push!(_RETIRED, (now, e.top))
         end
-        while !isempty(_RETIRED) && now - first(_RETIRED)[1] >= _TOP_FREE_AFTER_NS
-            push!(expired, popfirst!(_RETIRED)[2])
-        end
-        # A drained queue gives back the capacity a burst grew.
-        isempty(_RETIRED) && sizehint!(_RETIRED, 0)
         n = length(EXPORTS)
         if peak > 4 * max(64, n)
             sizehint!(EXPORTS, n)
@@ -486,16 +458,14 @@ function _reap!()
         _EXPORTS_UNTIL_REAP[] = max(64, n)
         return nothing
     end
-    foreach(Libc.free, expired)
     foreach(_free!, done)
     return length(done)
 end
 
-# Release callbacks do only native work: release the children and dictionary
+# Release callbacks release the children and dictionary
 # still in place (a moved one has `release == NULL`), mark the node released,
-# and count it off its export. No lock, no allocation, no Julia object, and
-# nothing that can throw: consumers call them from their own threads, and
-# PythonCall runs pyarrow's releases from GC finalizers.
+# and count it off its export. They allocate nothing and take no Julia lock,
+# including when PythonCall runs pyarrow's releases from its finalizers.
 function _release_array(a::Ptr{CArrowArray})::Cvoid
     arr = unsafe_load(a)
     arr.release == C_NULL && return nothing
@@ -599,13 +569,12 @@ function _export_schema!(
     dict = Ptr{CArrowSchema}(C_NULL)
     wrappermetadata = metadata
     if f.type isa DictionaryType
-        wrappermetadata, valuemetadata = _splitdictmetadata(metadata)
-        dict = _export_schema!(
-            e,
-            AC.dictvaluefield(f, f.type),
-            release;
-            metadata=valuemetadata,
-        )
+        vf = AC.dictvaluefield(f, f.type)
+        valuemetadata = vf.metadata
+        if f.type.values === nothing
+            wrappermetadata, valuemetadata = _splitdictmetadata(metadata)
+        end
+        dict = _export_schema!(e, vf, release; metadata=valuemetadata)
     end
     flags = f.nullable ? ARROW_FLAG_NULLABLE : Int64(0)
     f.type isa DictionaryType && f.type.ordered && (flags |= ARROW_FLAG_DICTIONARY_ORDERED)
@@ -616,8 +585,6 @@ function _export_schema!(
         CArrowSchema(
             _cstring!(e, formatstring_of(f.type)),
             _cstring!(e, f.name),
-            # Field metadata rides the OUTER node for every field, dictionary
-            # wrappers included; PyArrow imports only the wrapper's pairs.
             _cmetadata!(e, wrappermetadata),
             flags,
             length(childfields),
@@ -697,38 +664,90 @@ function _export_array!(
 end
 
 """
-    Arrow.to_c_data(field, data) -> (Ptr{CArrowSchema}, Ptr{CArrowArray})
+    Arrow.export_c_data!(schemaptr, arrayptr, field, data)
 
-The low-level form of [`Arrow.to_c_data`](@ref): export one column, an
-`Arrow.Field` and its `Arrow.ArrayData`, as an `ArrowSchema` and an `ArrowArray`
-that Arrow.jl allocates, pointing at `data`'s buffers without copying them. The
-column is validated before it is exported. The consumer moves or releases the
-two structs; `data` stays reachable until it has released the array, and what
-Arrow.jl allocated is freed by later exports or garbage collections.
+Fill caller-owned C Data structs with a column. The input is validated and its
+buffers are shared with the consumer until it releases the array. The caller
+keeps the base structs alive until the consumer has moved or released them.
 """
-function to_c_data(f::Field, d::ArrayData)
+function export_c_data!(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}, f::Field, d::ArrayData)
+    (sp == C_NULL || ap == C_NULL) && throw(ArgumentError("C Data output pointer is NULL"))
     validate_semantic(f, d)
-    e = _newexport(Any[f, d], sizeof(CArrowSchema) + sizeof(CArrowArray))
-    try
-        sp = _export_schema!(
-            e,
-            f,
-            @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},));
-            at=Ptr{CArrowSchema}(e.top),
-        )
-        ap = _export_array!(
-            e,
-            d,
-            @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},));
-            at=Ptr{CArrowArray}(e.top + sizeof(CArrowSchema)),
-        )
-        _register!(e)
-        return sp, ap
+    schema = _newexport(Any[])
+    array = try
+        _newexport(Any[d])
     catch
-        _free!(e)
-        Libc.free(e.top)
+        _free!(schema)
         rethrow()
     end
+    try
+        s = _export_schema!(
+            schema,
+            f,
+            @cfunction(_release_schema, Cvoid, (Ptr{CArrowSchema},))
+        )
+        a = _export_array!(array, d, @cfunction(_release_array, Cvoid, (Ptr{CArrowArray},)))
+        _register!(schema)
+        _register!(array)
+        unsafe_store!(sp, unsafe_load(s))
+        unsafe_store!(ap, unsafe_load(a))
+        return sp, ap
+    catch
+        lock(REGISTRY_LOCK) do
+            pop!(EXPORTS, schema.live, nothing)
+            pop!(EXPORTS, array.live, nothing)
+        end
+        _free!(array)
+        _free!(schema)
+        rethrow()
+    end
+end
+
+"""
+    Arrow.to_c_data(field, data) -> (Ptr{CArrowSchema}, Ptr{CArrowArray})
+
+Allocate the two C Data base structs and fill them as [`Arrow.export_c_data!`](@ref)
+does. The caller must free the base structs with [`Arrow.free_c_data!`](@ref) after
+the consumer finishes using their addresses. A consumer that moves the structs can
+keep using the moved copies after the originals are freed.
+"""
+function to_c_data(f::Field, d::ArrayData)
+    sp = Ptr{CArrowSchema}(Libc.malloc(sizeof(CArrowSchema)))
+    ap = Ptr{CArrowArray}(Libc.malloc(sizeof(CArrowArray)))
+    try
+        (sp == C_NULL || ap == C_NULL) && throw(OutOfMemoryError())
+        return export_c_data!(sp, ap, f, d)
+    catch
+        Libc.free(ap)
+        Libc.free(sp)
+        rethrow()
+    end
+end
+
+"""
+    Arrow.free_c_data!(ptr)
+    Arrow.free_c_data!(schemaptr, arrayptr)
+
+Free one or both base structs allocated by [`Arrow.to_c_data`](@ref). Any struct
+the consumer did not move or release is released first. Call once per base, after
+the consumer has finished accessing that address.
+"""
+function free_c_data!(p::Union{Ptr{CArrowArray},Ptr{CArrowSchema}})
+    try
+        _release_producer!(p)
+    finally
+        Libc.free(p)
+    end
+    return nothing
+end
+
+function free_c_data!(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray})
+    try
+        free_c_data!(ap)
+    finally
+        free_c_data!(sp)
+    end
+    return nothing
 end
 
 # ---------------------------------------------------------------------------
@@ -816,8 +835,59 @@ childat(a::CArrowArray, i::Int) = unsafe_load(unsafe_load(a.children, i))
 "Load buffer pointer `i` out of a CArrowArray's buffer table."
 bufferptr(a::CArrowArray, i::Int) = unsafe_load(a.buffers, i)
 
+# One trusted C schema or array walk. Buffer extents bound the bytes the
+# producer declares, while the allocation budget covers Julia-owned state.
+mutable struct _CImportBudget{L,B}
+    const limits::L
+    const allocations::B
+    objects::Int
+    metadata::Int64
+    body::Int64
+end
+
+_CImportBudget(::Nothing) =
+    _CImportBudget(nothing, nothing, 1_000_000, typemax(Int64), typemax(Int64))
+function _CImportBudget(limits)
+    _validatelimits(limits)
+    return _CImportBudget(
+        limits,
+        _readbudget(limits, 0),
+        limits.max_metadata_objects,
+        limits.max_metadata_bytes,
+        limits.max_body_bytes,
+    )
+end
+
+function _takecobjects!(c::_CImportBudget, n::Integer)
+    n <= c.objects || throw(ValidationError("C schema exceeds max_metadata_objects"))
+    c.objects -= n
+    return nothing
+end
+
+function _takecmetadata!(c::_CImportBudget, n::Integer)
+    n <= c.metadata || throw(ValidationError("C schema exceeds max_metadata_bytes"))
+    c.metadata -= n
+    return nothing
+end
+
+function _takecbuffer!(c::_CImportBudget, n::Int64)
+    limits = c.limits
+    limits === nothing && return nothing
+    n <= limits.max_buffer_bytes ||
+        _limiterror("C data buffer", "max_buffer_bytes", limits.max_buffer_bytes)
+    n <= c.body || _limiterror("C array buffers", "max_body_bytes", limits.max_body_bytes)
+    c.body -= n
+    return nothing
+end
+
+_cdepth(c::_CImportBudget) = c.limits === nothing ? 64 : c.limits.max_nesting_depth
+_cchargeobject!(c::_CImportBudget, n, what) =
+    c.allocations === nothing ? nothing : _chargeobject!(c.allocations, n, what)
+_cchargevector!(c::_CImportBudget, T, n, what) =
+    c.allocations === nothing ? nothing : _chargevector!(c.allocations, T, n, what)
+
 """
-    Arrow.from_c_data(schemaptr, arrayptr) -> (Arrow.Field, Arrow.ArrayData)
+    Arrow.from_c_data(schemaptr, arrayptr; limits=nothing) -> (Arrow.Field, Arrow.ArrayData)
 
 The low-level form of [`Arrow.Table(schemaptr, arrayptr)`](@ref Arrow.Table): import
 one column. The array is moved, as the interface requires: Arrow.jl takes over its
@@ -827,34 +897,36 @@ the producer's release callback runs when it no longer is.
 
 Buffer sizes follow from the declared lengths and offsets, which the producer is
 trusted to get right, as the interface cannot check them; the column is then validated
-as an IPC read is. A failed import releases the array.
+as an IPC read is. Pass `limits=Arrow.Limits(...)` to bound the declared extents and
+schema resources. A failed import releases the array.
 """
-function from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray})
+function from_c_data(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}; limits=nothing)
     sp == C_NULL && throw(ArgumentError("ArrowSchema pointer is NULL"))
     ap == C_NULL && throw(ArgumentError("ArrowArray pointer is NULL"))
     sch = unsafe_load(sp)
     (sch.release == C_NULL || unsafe_load(ap).release == C_NULL) &&
         throw(ArgumentError("cannot import a released structure"))
+    c = _CImportBudget(limits)
     owner = _moveowner(ap)
     f = try
-        _preflight_schema(sch)
-        _import_field(sch)
+        _preflight_schema(sch, c)
+        _import_field(sch, c)
     catch
         release!(owner)
         rethrow()
     finally
         _release_producer!(sp)
     end
-    return f, _importarray(f, owner)
+    return f, _importarray(f, owner, c)
 end
 
 # Import the moved array `owner` holds as a column of `f`; a failed import
 # releases it.
-function _importarray(f::Field, owner::ForeignOwner)
+function _importarray(f::Field, owner::ForeignOwner, c::_CImportBudget)
     try
         arr = unsafe_load(owner.block)
-        _preflight_array(f, arr)
-        d = _import_array(f, arr, owner)
+        _preflight_array(f, arr, c)
+        d = _import_array(f, arr, owner, c)
         validate_semantic(f, d)
         return d
     catch
@@ -863,29 +935,30 @@ function _importarray(f::Field, owner::ForeignOwner)
     end
 end
 
-function _preflight_schema(sch::CArrowSchema, depth::Int=0)
-    depth <= 64 || throw(ValidationError("C schema nesting exceeds 64 levels"))
+function _preflight_schema(sch::CArrowSchema, c::_CImportBudget, depth::Int=0)
+    depth <= _cdepth(c) || throw(ValidationError("C schema exceeds max_nesting_depth"))
+    _takecobjects!(c, 1)
     sch.release != C_NULL || throw(ValidationError("released C schema node"))
     sch.format != C_NULL || throw(ValidationError("C schema format is NULL"))
     sch.n_children >= 0 || throw(ValidationError("negative C schema child count"))
-    sch.n_children <= 1_000_000 ||
-        throw(ValidationError("C schema child count exceeds import limit"))
+    sch.n_children <= c.objects ||
+        throw(ValidationError("C schema child count exceeds max_metadata_objects"))
     sch.n_children == 0 ||
         sch.children != C_NULL ||
         throw(ValidationError("C schema child table is NULL"))
     for i = 1:sch.n_children
         childptr = unsafe_load(sch.children, i)
         childptr != C_NULL || throw(ValidationError("C schema child $i is NULL"))
-        _preflight_schema(unsafe_load(childptr), depth + 1)
+        _preflight_schema(unsafe_load(childptr), c, depth + 1)
     end
     if sch.dictionary != C_NULL
-        _preflight_schema(unsafe_load(sch.dictionary), depth + 1)
+        _preflight_schema(unsafe_load(sch.dictionary), c, depth + 1)
     end
     return nothing
 end
 
-function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
-    depth <= 64 || throw(ValidationError("C array nesting exceeds 64 levels"))
+function _preflight_array(f::Field, arr::CArrowArray, c::_CImportBudget, depth::Int=0)
+    depth <= _cdepth(c) || throw(ValidationError("C array exceeds max_nesting_depth"))
     arr.release != C_NULL || throw(ValidationError("released C array node"))
     arr.length >= 0 || throw(ValidationError("negative C array length"))
     arr.offset >= 0 || throw(ValidationError("negative C array offset"))
@@ -898,6 +971,16 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
         throw(ValidationError("invalid C array null count $(arr.null_count)"))
     arr.n_buffers >= 0 || throw(ValidationError("negative C array buffer count"))
     arr.n_children >= 0 || throw(ValidationError("negative C array child count"))
+    limits = c.limits
+    if limits !== nothing
+        arr.length <= limits.max_array_length ||
+            _limiterror("C array length", "max_array_length", limits.max_array_length)
+        arr.n_buffers <= limits.max_metadata_objects || _limiterror(
+            "C buffer count",
+            "max_metadata_objects",
+            limits.max_metadata_objects,
+        )
+    end
     arr.n_buffers == 0 ||
         arr.buffers != C_NULL ||
         throw(ValidationError("C array buffer table is NULL"))
@@ -934,7 +1017,7 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
         childptr != C_NULL || throw(ValidationError("C array child $i is NULL"))
         child = unsafe_load(childptr)
         cf = f.children[i]
-        _preflight_array(cf, child, depth + 1)
+        _preflight_array(cf, child, c, depth + 1)
     end
     if f.type isa DictionaryType
         arr.dictionary != C_NULL ||
@@ -942,6 +1025,7 @@ function _preflight_array(f::Field, arr::CArrowArray, depth::Int=0)
         _preflight_array(
             AC.dictvaluefield(f, f.type),
             unsafe_load(arr.dictionary),
+            c,
             depth + 1,
         )
     elseif arr.dictionary != C_NULL
@@ -955,13 +1039,14 @@ end
 # terminator from an unbounded memory scan into a clean refusal.
 const CSTRING_SCAN_LIMIT = Int64(1) << 20
 
-function _import_cstring(p::Ptr{UInt8}, what::AbstractString)
+function _import_cstring(p::Ptr{UInt8}, what::AbstractString, c=_CImportBudget(nothing))
     # The limit is enforced BEFORE every dereference: the scan window is
     # exactly CSTRING_SCAN_LIMIT bytes, so the NUL must fall inside it
     # (maximum payload is the limit minus one) and byte limit+1 is never
     # touched — a guard page there must produce this refusal, not SIGBUS.
     n = Int64(0)
     while true
+        n < c.metadata || throw(ValidationError("C schema exceeds max_metadata_bytes"))
         n >= CSTRING_SCAN_LIMIT && throw(
             ValidationError(
                 "C Data $what has no NUL terminator within " *
@@ -971,6 +1056,8 @@ function _import_cstring(p::Ptr{UInt8}, what::AbstractString)
         unsafe_load(p + n) == 0x00 && break
         n += 1
     end
+    _takecmetadata!(c, n + 1)
+    _cchargeobject!(c, n, "C schema string")
     s = unsafe_string(p, n)
     isvalid(s) || throw(ValidationError("C Data $what is not valid UTF-8"))
     return s
@@ -993,22 +1080,31 @@ negative length is rejected: it would wrap the walk. Metadata bytes are
 opaque binary key/value data, copied by declared length without UTF-8
 validation. Embedded NUL bytes are preserved.
 """
-function _import_cmetadata(p::Ptr{UInt8})
+function _import_cmetadata(p::Ptr{UInt8}, c=_CImportBudget(nothing))
     p == C_NULL && return nothing
+    _takecmetadata!(c, 4)
     n = unsafe_load(Ptr{Int32}(p))
     n < 0 && throw(ValidationError("C schema metadata declares a negative pair count"))
     n == 0 && return nothing
+    _takecobjects!(c, n)
+    _cchargevector!(c, Pair{String,String}, n, "C schema metadata pairs")
     off = Int64(4)
     out = Pair{String,String}[]
     for _ = 1:n
+        _takecmetadata!(c, 4)
         klen = unsafe_load(Ptr{Int32}(p + off))
         klen < 0 &&
             throw(ValidationError("C schema metadata declares a negative key length"))
+        _takecmetadata!(c, klen)
+        _cchargeobject!(c, klen, "C schema metadata key")
         k = unsafe_string(p + off + 4, klen)
         off += 4 + Int64(klen)
+        _takecmetadata!(c, 4)
         vlen = unsafe_load(Ptr{Int32}(p + off))
         vlen < 0 &&
             throw(ValidationError("C schema metadata declares a negative value length"))
+        _takecmetadata!(c, vlen)
+        _cchargeobject!(c, vlen, "C schema metadata value")
         v = unsafe_string(p + off + 4, vlen)
         off += 4 + Int64(vlen)
         push!(out, k => v)
@@ -1016,12 +1112,12 @@ function _import_cmetadata(p::Ptr{UInt8})
     return out
 end
 
-function _import_field(sch::CArrowSchema)::Field
-    fmt = _import_cstring(sch.format, "format")
+function _import_field(sch::CArrowSchema, c::_CImportBudget)::Field
+    fmt = _import_cstring(sch.format, "format", c)
     _validate_schema_flags(sch, fmt)
-    name = sch.name == C_NULL ? "" : _import_cstring(sch.name, "field name")
+    name = sch.name == C_NULL ? "" : _import_cstring(sch.name, "field name", c)
     nullable = (sch.flags & ARROW_FLAG_NULLABLE) != 0
-    meta = _import_cmetadata(sch.metadata)
+    meta = _import_cmetadata(sch.metadata, c)
     t = parseformat(fmt, sch.flags)
 
     # Check the schema shape before indexing any recursively-created child.
@@ -1043,39 +1139,26 @@ function _import_field(sch::CArrowSchema)::Field
             ),
         )
 
+    _cchargeobject!(c, sizeof(Field), "C schema field")
+    _cchargevector!(c, Field, sch.n_children, "C schema children")
     children = Field[]
     for i = 1:sch.n_children
-        push!(children, _import_field(unsafe_load(unsafe_load(sch.children, i))))
+        push!(children, _import_field(unsafe_load(unsafe_load(sch.children, i)), c))
     end
     if sch.dictionary != C_NULL
-        vf = _import_field(unsafe_load(sch.dictionary))
+        vf = _import_field(unsafe_load(sch.dictionary), c)
         t isa IntType ||
             throw(ValidationError("dictionary index format must be an integer"))
         isempty(children) ||
             throw(ValidationError("dictionary index schema must not have children"))
         ordered = (sch.flags & ARROW_FLAG_DICTIONARY_ORDERED) != 0
-        # The value node's metadata joins the wrapper's (wrapper pairs
-        # first; duplicate keys are legal): Core's one slot cannot express
-        # the two-node attribution, but no pair is lost.
-        vmeta = vf.metadata
-        dmeta =
-            meta === nothing ?
-            (vmeta === nothing ? nothing : collect(Pair{String,String}, vmeta)) :
-            (vmeta === nothing ? meta : vcat(meta, collect(Pair{String,String}, vmeta)))
-        # Branch on the metadata's presence: a Union-typed keyword makes
-        # the kwcall tuple imprecise, which trim cannot resolve.
-        dmeta === nothing && return Field(
-            name,
-            DictionaryType(t, vf.type, ordered);
-            nullable=nullable,
-            children=vf.children,
-        )
+        attrs = AC.DictionaryValueAttributes(vf.name, vf.nullable, vf.metadata)
         return Field(
             name,
-            DictionaryType(t, vf.type, ordered);
-            nullable=nullable,
-            metadata=dmeta,
-            children=vf.children,
+            DictionaryType(t, vf.type, ordered, attrs),
+            nullable,
+            AC._freezemetadata(meta),
+            vf.children,
         )
     end
     meta === nothing && return Field(name, t; nullable=nullable, children=children)
@@ -1089,10 +1172,17 @@ sized first (len+1 entries) and then READ — inside their own declared bounds
 — to size the data buffer they govern; that dependency order is exactly the
 registry's buffer order, so the loop stays generic.
 """
-function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayData
+function _import_array(
+    f::Field,
+    arr::CArrowArray,
+    owner::ForeignOwner,
+    c::_CImportBudget,
+)::ArrayData
     t = f.type
     spec = AC.layoutspec_of(t)
     total = AC.checked_add(arr.offset, arr.length)
+    _cchargevector!(c, BufferSlice, arr.n_buffers, "C array buffer slices")
+    _cchargevector!(c, OwnerRegion, arr.n_buffers, "C array buffer owners")
     buffers = BufferSlice[]
     offsets_slice = nothing
     for (i, role) in enumerate(spec.buffers)
@@ -1146,6 +1236,7 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
         else
             throw(ValidationError("unsupported buffer role $role in C data import"))
         end
+        _takecbuffer!(c, nbytes)
         if p == C_NULL
             nbytes == 0 ||
                 throw(ValidationError("NULL $role buffer with nonzero required size"))
@@ -1162,6 +1253,7 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
         # buffer's extent — the one place the ABI carries a length for them.
         nfixed = length(spec.buffers)
         nvariadic = Int(arr.n_buffers) - nfixed - 1
+        _takecbuffer!(c, AC._required_extent(Int64(nvariadic), Int64(8), "C view sizes"))
         sizesp = Ptr{Int64}(bufferptr(arr, Int(arr.n_buffers)))
         (nvariadic == 0 || sizesp != C_NULL) || throw(
             ValidationError("view array with variadic buffers has a NULL sizes buffer"),
@@ -1169,6 +1261,7 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
         for k = 1:nvariadic
             len = unsafe_load(sizesp, k)
             len >= 0 || throw(ValidationError("negative variadic buffer length $len"))
+            _takecbuffer!(c, len)
             p = bufferptr(arr, nfixed + k)
             if p == C_NULL
                 len == 0 || throw(
@@ -1181,18 +1274,20 @@ function _import_array(f::Field, arr::CArrowArray, owner::ForeignOwner)::ArrayDa
             end
         end
     end
+    _cchargeobject!(c, sizeof(ArrayData), "C array data")
+    _cchargevector!(c, ArrayData, arr.n_children, "C array children")
     children = ArrayData[]
     for i = 1:arr.n_children
         # Preflight already rejects children on a dictionary node, so this
         # branch is unreachable; it keeps the expression total for inference.
         cf = t isa DictionaryType ? error("dictionary carries no children") : f.children[i]
-        push!(children, _import_array(cf, childat(arr, i), owner))
+        push!(children, _import_array(cf, childat(arr, i), owner, c))
     end
     dict = nothing
     if arr.dictionary != C_NULL
         t isa DictionaryType ||
             throw(ValidationError("dictionary array on a non-dictionary field"))
-        dict = _import_array(AC.dictvaluefield(f, t), unsafe_load(arr.dictionary), owner)
+        dict = _import_array(AC.dictvaluefield(f, t), unsafe_load(arr.dictionary), owner, c)
     end
     return AC._arraydata(
         t,

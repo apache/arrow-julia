@@ -873,7 +873,7 @@ retained one's rows may be `Array`s of its tensor shape.
 """
 function _fixedlistpart(spec, v::AbstractVector, context, N::Int=0)
     shape = spec isa AC.Field ? _tensorshape(spec) : nothing
-    shape === nothing || (v = _tensorstorage(v, shape))
+    shape === nothing || (v = _tensorstorage(v, shape, _specname(spec)))
     R = Base.nonmissingtype(_eltypeof(v))
     t =
         spec isa AC.Field ? spec.type::AC.FixedSizeListType :
@@ -1301,6 +1301,14 @@ function _narrowlists(v::AbstractVector, name="")
     # ArrowTypes value walk runs. Reject cycles and excessive nesting first,
     # without resolving any user traits.
     _preflightwritercontainers(v)
+    context = _WriterContext(name)
+    mapped = any(v) do x
+        x isa AbstractVector || return false
+        T = typeof(x)
+        return _writerstoragetype!(context, T) !== T ||
+               _writerextension!(context, T) !== nothing
+    end
+    mapped && return _collectas(_observedtype(v, name), v)
     # map(identity, …) re-infers a narrowed element type from the values:
     # inner maps narrow each row, the outer map narrows the column.
     w = map(x -> x isa AbstractVector ? map(identity, x) : x, v)
@@ -3858,15 +3866,72 @@ struct _Same
 end
 Base.isequal(a::_Same, b::_Same) = a.x === b.x
 Base.hash(a::_Same, h::UInt) = hash(objectid(a.x), h)
-_candidatekey(x) =
-    x isa Array && eltype(x) <: Union{Missing,Base.BitInteger,Base.IEEEFloat,Bool,String} ?
-    _poolkey(x) : _Same(x)
 
-"The category (`_poolkey`) of value `i` of a built column, with its union child."
+struct _CategoryList{T}
+    values::Vector{T}
+end
+Base.isequal(a::_CategoryList, b::_CategoryList) =
+    typeof(a) === typeof(b) && _samecategory(a.values, b.values)
+function Base.hash(a::_CategoryList, h::UInt)
+    h = hash(typeof(a), h)
+    for value in a.values
+        h = hash(_poolkey(value), h)
+    end
+    return h
+end
+
+_candidatekey(x) =
+    x isa Vector && eltype(x) <: Union{Missing,Base.BitInteger,Base.IEEEFloat,Bool,String} ?
+    _CategoryList(x) : _Same(x)
+
+function _samecategory(a, b)
+    a === b && return true
+    typeof(a) === typeof(b) || return false
+    a isa Base.IEEEFloat && return false  # === compares the stored bits.
+    if a isa Union{AbstractArray,Tuple,NamedTuple,Pair}
+        a isa AbstractArray && axes(a) != axes(b) && return false
+        return all(_samecategory(x, y) for (x, y) in zip(a, b))
+    end
+    return isequal(a, b)
+end
+
+"The stored category of row `i`, preserving tags and float bits at every depth."
 function _storedkey(f::AC.Field, d::AC.ArrayData, i::Int64)
-    d.type isa AC.UnionType || return _poolkey(AC.getvalue(f, d, i))
-    cf, cd, ci = AC._union_child(f, d, i)
-    return (findfirst(c -> c === cf, f.children), _storedkey(cf, cd, ci))
+    t = f.type
+    if t isa AC.UnionType
+        tag = AC.loadat(AC.rolebuffer(d, AC.TYPE_IDS), Int8, AC._slotindex0(d, i))
+        cf, cd, ci = AC._union_child(f, d, i)
+        return (tag, _storedkey(cf, cd, ci))
+    elseif t isa AC.RunEndEncodedType
+        return _storedkey(f.children[2], d.children[2], AC._ree_runindex(d, i))
+    end
+    (t isa AC.NullType || !AC.isvalid_at(d, i)) && return _poolkey(missing)
+    if t isa AC.DictionaryType
+        w = AC.primwidth(t.indextype)
+        code =
+            AC._load_int(AC.rolebuffer(d, AC.DATA), t.indextype, AC._slotbyteoff(d, i, w))
+        return _storedkey(
+            AC.dictvaluefield(f, t),
+            d.dictionary::AC.ArrayData,
+            Int64(code) + 1,
+        )
+    elseif t isa AC.StructType
+        return Any[
+            _storedkey(c, cd, d.offset + i) for (c, cd) in zip(f.children, d.children)
+        ]
+    elseif t isa Union{AC.ListType,AC.MapType,AC.FixedSizeListType,AC.ListViewType}
+        lo, n = _poollistspan(t, d, i)
+        return Any[_storedkey(f.children[1], d.children[1], lo + j) for j = 1:n]
+    end
+    return _poolkey(AC._value(t, f, d, i))
+end
+
+function _poollistspan(t, d, i)
+    t isa AC.FixedSizeListType &&
+        return AC._slotindex0(d, i) * t.listsize, Int64(t.listsize)
+    t isa AC.ListViewType && return AC._listview_range(t, d, i)
+    lo, hi = AC._offsets_at(d, i, AC.layoutspec_of(t).offsetwidth == 8)
+    return lo, hi - lo
 end
 
 """
@@ -3986,7 +4051,7 @@ function _dictcodes(v, hint, prefix::Int)
     parentcol isa DictEncoded && (rows === nothing || rows isa UnitRange{Int}) ||
         return nothing
     pool = parentcol.pool
-    length(pool) <= prefix && all(i -> isequal(pool[i], hint[i]), eachindex(pool)) ||
+    length(pool) <= prefix && all(i -> _samecategory(pool[i], hint[i]), eachindex(pool)) ||
         return nothing
     return rows === nothing ? parentcol.indices : view(parentcol.indices, rows)
 end

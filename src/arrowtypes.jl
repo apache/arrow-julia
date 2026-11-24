@@ -355,6 +355,10 @@ end
 
 function _hasarrowtypesextension(f::AC.Field)
     _arrowtypesextension(f) === nothing || return true
+    t = f.type
+    t isa AC.DictionaryType &&
+        t.values !== nothing &&
+        return _hasarrowtypesextension(AC.dictvaluefield(f, t))
     return any(_hasarrowtypesextension, f.children)
 end
 
@@ -417,6 +421,10 @@ function _hasarrowtypesextension(f::AC.Field, plan::_ArrowTypesRoutePlan)
         "ArrowTypes extension-presence cache",
     ) do
         _arrowtypesextension(f) === nothing || return true
+        t = f.type
+        t isa AC.DictionaryType &&
+            t.values !== nothing &&
+            return _hasarrowtypesextension(_routedictionaryfield!(plan, f, t), plan)
         return _uninferred(
             any,
             child -> _hasarrowtypesextension(child, plan),
@@ -763,6 +771,10 @@ function _hasarrowtypesextension(f::AC.Field, ctx::_ArrowTypesContext)
         "ArrowTypes extension-presence cache",
     ) do
         _arrowtypesextension(f) === nothing || return true
+        t = f.type
+        t isa AC.DictionaryType &&
+            t.values !== nothing &&
+            return _hasarrowtypesextension(_arrowtypesdictvaluefield(ctx, f, t), ctx)
         return _uninferred(
             any,
             child -> _hasarrowtypesextension(child, ctx),
@@ -950,6 +962,9 @@ function _arrowtypestarget(ctx::_ArrowTypesContext, f::AC.Field)
         # FixedSizeList must not allocate in proportion to an untrusted N.
         ext === nothing && return (false, nothing, nothing)
         name, metadata = ext
+        name == _TENSOR_EXTENSION &&
+            _tensorshape(f) !== nothing &&
+            return (false, nothing, nothing)
         if isempty(f.children)
             storage = _arrowtypesstoragebasetype(ctx, f)
             facade = _facadejuliatype(name, storage)
@@ -1062,10 +1077,10 @@ function _arrowtypespubliceltype(ctx::_ArrowTypesContext, f::AC.Field)
             return _arrowtypespubliceltype(ctx, f.children[2])
         elseif t isa Union{AC.ListType,AC.ListViewType,AC.FixedSizeListType}
             length(f.children) == 1 || return _withmissingtype(Vector{Any}, f.nullable)
-            return _withmissingtype(
-                Vector{_arrowtypespubliceltype(ctx, f.children[1])},
-                f.nullable,
-            )
+            E = _arrowtypespubliceltype(ctx, f.children[1])
+            shape = _tensorshape(f)
+            T = shape === nothing ? Vector{E} : Array{Union{Missing,E},length(first(shape))}
+            return _withmissingtype(T, f.nullable)
         elseif t isa AC.StructType
             foreach(child -> _arrowtypespubliceltype(ctx, child), f.children)
             return _withmissingtype(Vector{Pair{String,Any}}, f.nullable)
@@ -1133,10 +1148,11 @@ function _arrowtypesdictvaluefield(
     nullable::Bool=true,
     budget::Union{Nothing,AllocationBudget}=nothing,
 )
-    metadata = retainmetadata ? f.metadata : nothing
     # Field and FrozenVector are immutable. Use Core's exact positional
     # constructor so every reader view shares the already-frozen child tree.
     _chargeobject!(budget, sizeof(AC.Field), "ArrowTypes derived dictionary Field")
+    t.values === nothing || return AC.dictvaluefield(f, t)
+    metadata = retainmetadata ? f.metadata : nothing
     return AC.Field(f.name, t.valuetype, nullable, metadata, f.children)
 end
 
@@ -1264,13 +1280,12 @@ function _arrowtypesstoragevalue(
 )
     t = f.type
     x === missing && return missing
-    t isa AC.DictionaryType && return _arrowtypesstoragevalue(
-        ctx,
-        _arrowtypesdictvaluefield(ctx, f, t),
-        x;
-        extension_shape=extension_shape,
-        rawdomain=rawdomain,
-    )
+    if t isa AC.DictionaryType
+        vf = _arrowtypesdictvaluefield(ctx, f, t)
+        t.values === nothing ||
+            return _arrowtypesnestedvalue(ctx, vf, x; extension_shape, rawdomain)
+        return _arrowtypesstoragevalue(ctx, vf, x; extension_shape, rawdomain)
+    end
     if t isa AC.RunEndEncodedType
         length(f.children) == 2 || return x
         return _arrowtypesnestedvalue(
@@ -1296,6 +1311,15 @@ function _arrowtypesstoragevalue(
                 rawdomain=rawdomain,
             ) for y in x
         ]
+        if !extension_shape && t isa AC.FixedSizeListType
+            shape = _tensorshape(f)
+            if shape !== nothing
+                E = Union{Missing,_arrowtypespubliceltype(ctx, child)}
+                flat = _typedvalues(E, vals, ctx.budget)
+                _chargevector!(ctx.budget, E, 2 * length(flat), "reshaped tensor values")
+                return _tensorvalue(flat, shape...)
+            end
+        end
         if t isa AC.FixedSizeListType && extension_shape
             _chargevector!(ctx.budget, Any, length(vals), "ArrowTypes tuple storage")
             out = Tuple(vals)

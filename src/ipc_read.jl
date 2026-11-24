@@ -862,6 +862,9 @@ end
 function validateschemafield(f::Field)
     AC._validate_descriptor(f.type)
     if f.type isa DictionaryType
+        f.type.valuetype isa DictionaryType && throw(
+            ValidationError("IPC cannot represent dictionary-encoded dictionary values"),
+        )
         validateschemafield(AC.dictvaluefield(f, f.type))
         return f
     end
@@ -1144,6 +1147,7 @@ mutable struct DecodeCursor{
     bufidx::Int
     last_nonempty_end::Int64
     codec::Int8                   # CODEC_NONE, or the batch's declared codec
+    version::Int16
     state::Union{Nothing,DecodeState}
     # One entry per view-typed field in depth-first schema order: how many
     # variadic data buffers that field consumes (format 1.4). Non-view
@@ -1161,6 +1165,7 @@ DecodeCursor(
     body,
     limits::Limits;
     codec::Int8=CODEC_NONE,
+    version::Int16=Int16(Meta.MetadataVersion.V5),
     state::Union{Nothing,DecodeState}=nothing,
     variadics=nothing,
 ) = DecodeCursor(
@@ -1173,6 +1178,7 @@ DecodeCursor(
     1,
     0,
     codec,
+    version,
     state,
     something(variadics, Int64[]),
     1,
@@ -1336,6 +1342,7 @@ function _decompressbuffer!(c::DecodeCursor, wire::BufferSlice, needed::Int64=In
     declared <= typemax(Int) >> 1 ||
         throw(ValidationError("declared decompressed buffer is not addressable"))
     payloadlen = wire.len - 8
+    declared == 0 && payloadlen == 0 && return BufferSlice()
     payloadlen > 0 || throw(ValidationError("compressed buffer has an empty payload"))
     state = c.state::DecodeState
     wireregion = wire.region::OwnerRegion
@@ -1560,6 +1567,12 @@ function decodefield(
     spec = AC.layoutspec_of(t)
     n = Int64(node.length)
     buffers = BufferSlice[]
+    if _legacyunionvalidity(t, c.version)
+        node.null_count == 0 || throw(
+            ValidationError("V4 unions with a top-level validity bitmap are unsupported"),
+        )
+        skipbuffer!(c)
+    end
     for role in spec.buffers
         push!(buffers, takebuffer!(c, _neededbytes(role, spec, n, buffers)))
     end
@@ -1635,6 +1648,7 @@ struct _RecordPlan{B}
     header::Meta.RecordBatch
     body::B
     codec::Int8
+    version::Int16
     variadics::Vector{Int64}
     rblen::Int64
     # Cursor (node, buffer, variadic count, last buffer end) at each field.
@@ -1657,6 +1671,7 @@ function _recordplan(header::Meta.RecordBatch, body, version::Int16, fields, lim
         body,
         limits;
         codec=codec,
+        version=version,
         variadics=variadics,
     )
     starts = Vector{NTuple{4,Int64}}(undef, length(fields))
@@ -1665,7 +1680,7 @@ function _recordplan(header::Meta.RecordBatch, body, version::Int16, fields, lim
         skipfield!(f, c)
     end
     finishcursor!(c)
-    return _RecordPlan(header, body, codec, variadics, rblen, starts)
+    return _RecordPlan(header, body, codec, version, variadics, rblen, starts)
 end
 
 "Decode and validate field `j` of a planned record batch."
@@ -1685,6 +1700,7 @@ function _decodeplanned(
         p.body,
         limits;
         codec=p.codec,
+        version=p.version,
         state=state,
         variadics=p.variadics,
     )
@@ -1894,6 +1910,7 @@ function _decodedictionary(
         body,
         limits;
         codec=_batchcodec(rb.compression, version),
+        version=version,
         state=state,
         variadics=variadiccounts(rb),
     )
@@ -2720,7 +2737,7 @@ function _fileplan(f::ArrowFile, i::Integer, budget::AllocationBudget, mask=noth
             )
         end
     else
-        _recordbatchmeta(header, f.fields, f.limits, fm.body.len)
+        _recordbatchmeta(header, f.fields, f.limits, fm.body.len; version=fm.version)
         _scanmissingdicts(f.fields, header.nodes, f.dictionaries, f.fielddictids, mask)
     end
     return _recordplan(header, fm.body, fm.version, f.fields, f.limits)

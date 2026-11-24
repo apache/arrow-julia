@@ -445,16 +445,13 @@ batchkinds(bytes) = [
             bytes = take!(io)
             @test Arrow.Table(bytes).d == ["a", "b", "a", "c", "c", "b", "b", "a"]
             batches = [(isdelta, n) for (_, isdelta, n) in dictbatches(bytes)]
-            if dictdeltas
+            if dictdeltas || !file
                 # A base dictionary, then a delta holding only the new category.
                 @test batches == [(false, 2), (true, 1)]
-            elseif file
+            else
                 # One complete dictionary, after the record batches using it.
                 @test batches == [(false, 3)]
                 @test batchkinds(bytes) == [:record, :record, :record, :dictionary]
-            else
-                # A stream writes the grown dictionary again, whole.
-                @test batches == [(false, 2), (false, 3)]
             end
             # A growing pool is indexed with Int32, as pyarrow writes.
             f = only(
@@ -721,7 +718,7 @@ batchkinds(bytes) = [
 
     @testset "append with dictionary columns" begin
         # New categories extend the stream's dictionary, written again whole
-        # (or as a delta batch with dictdeltas=true); existing ones reuse it.
+        # as a delta batch; existing ones reuse it.
         for dictdeltas in (false, true)
             path = joinpath(mktempdir(), "d.arrow")
             Arrow.write(path, (; d=Arrow.DictEncode(["a", "b", "a"])); file=false)
@@ -729,7 +726,7 @@ batchkinds(bytes) = [
             @test Arrow.Table(path).d == ["a", "b", "a", "a", "b", "b"]
             Arrow.append(path, (; d=Arrow.DictEncode(["z", "z", "q"])); dictdeltas)
             @test Arrow.Table(path).d == ["a", "b", "a", "a", "b", "b", "z", "z", "q"]
-            @test [(isdelta, n) for (_, isdelta, n) in dictbatches(read(path))] == (dictdeltas ? [(false, 2), (true, 2)] : [(false, 2), (false, 4)])
+            @test [(isdelta, n) for (_, isdelta, n) in dictbatches(read(path))] == [(false, 2), (true, 2)]
         end
 
         # A Writer stream that opted into replacement replaces on append.

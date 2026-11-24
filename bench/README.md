@@ -68,3 +68,25 @@ ARROW_BENCH_SCALE=0.001 julia --project=. bench/run.jl /tmp/arrow-bench-smoke
 all compared runs; the default is 1 (10M primitive rows, 2M strings, 1M lists,
 2M dictionary rows). The work directory retains both implementations' files and
 JSONL results for inspection.
+
+## Compare with Arrow.jl 2.8.1
+
+Use the same Julia version, thread count, and `ARROW_BENCH_SCALE` for this comparison
+and for the run that produced the IPC fixtures.
+
+```sh
+julia --project=/tmp/arrow-2.8.1 -e 'using Pkg; Pkg.add([PackageSpec(name="Arrow", version="2.8.1"), PackageSpec(name="Tables", version="1.14")]); Pkg.precompile()'
+julia --project=. -t 1 bench/compare_julia.jl /tmp/arrow-bench-1 /tmp/arrow-2.8.1
+```
+
+Both versions read the same numeric, string, and list files. The comparison measures
+opening a file and accessing one value, walking an already obtained column, and writing
+to an `IOBuffer`. It also repeats first access and walking on a wide string table. Each
+measurement verifies its result and reports its first call, five warm samples, and
+median allocated bytes. Fresh child processes report package load time, loaded Arrow
+image size, and cumulative peak RSS. For installation and precompile cost, time the
+environment setup and `Pkg.precompile()` with a fresh depot for each version.
+
+The candidate also records range request counts and bytes for a match in the last of
+4,000, 8,000, or 16,000 batches. A separate one-row scan checks how much input storage
+remains reachable after garbage collection.

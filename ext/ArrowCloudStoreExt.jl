@@ -34,6 +34,17 @@ and `Arrow.Stream(obj; …)` construct one implicitly.
 """
 struct CloudObjectSource{O<:Object} <: Arrow.AbstractArrowSource
     obj::O
+    etag::String
+
+    function CloudObjectSource(obj::Object)
+        if isempty(obj.eTag)
+            snapshot = Object(obj.store, obj.key; credentials=obj.credentials)
+            snapshot.size == obj.size ||
+                throw(ArgumentError("object size changed before the Arrow read"))
+            obj = snapshot
+        end
+        return new{typeof(obj)}(obj, _ifmatch(obj.eTag))
+    end
 end
 
 # Independent HTTP range GETs are latency-bound, so a round's requests are
@@ -46,17 +57,24 @@ Arrow.concurrentreads(::CloudObjectSource) = CONCURRENT_RANGE_READS
 
 # The object's ETag as an `If-Match` value (the header wants it quoted).
 function _ifmatch(etag::AbstractString)
-    isempty(etag) && return nothing
-    return startswith(etag, '"') ? String(etag) : string('"', etag, '"')
+    (isempty(etag) || startswith(etag, "W/")) &&
+        throw(ArgumentError("Arrow range reads require a strong object ETag"))
+    tag = etag
+    if startswith(tag, '"')
+        ncodeunits(tag) >= 2 && endswith(tag, '"') ||
+            throw(ArgumentError("invalid object ETag"))
+        tag = SubString(tag, 2, prevind(tag, lastindex(tag)))
+    end
+    all(b -> b == 0x21 || 0x23 <= b <= 0x7e || b >= 0x80, codeunits(tag)) ||
+        throw(ArgumentError("invalid object ETag"))
+    return string('"', tag, '"')
 end
 
 function Arrow.readrange(s::CloudObjectSource, off, len)
     len == 0 && return UInt8[]
     last = off + len - 1
     obj = s.obj
-    headers = ["Range" => "bytes=$(off)-$(last)"]
-    etag = _ifmatch(obj.eTag)
-    etag === nothing || push!(headers, "If-Match" => etag)
+    headers = ["Range" => "bytes=$(off)-$(last)", "If-Match" => s.etag]
     bytes = CloudStore.get(
         obj.store,
         obj.key;

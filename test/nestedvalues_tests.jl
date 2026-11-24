@@ -89,7 +89,7 @@ replaced(table, column) = Arrow.Table(
     AbstractVector[column],
     getfield(table, :lookup),
     getfield(table, :schema),
-    AC.OwnerRegion[],
+    AC.ReleaseCell(),
     length(column),
 )
 

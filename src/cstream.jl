@@ -290,6 +290,7 @@ mutable struct ImportedStream <: AC.RecordBatchSource
     const batchfield::Field
     const schema::Schema
     const limits::Limits
+    batchesread::Int
     done::Bool
     @atomic pulling::Bool
 end
@@ -330,8 +331,7 @@ function _stream_call_failed(o::StreamOwner, what::AbstractString)
 end
 
 # Import a C stream: take over the stream, marking the struct at `sp` released,
-# and read its schema, whose fields are the batches' columns. `limits` bounds
-# what the facade allocates for each batch.
+# and read its schema, whose fields are the batches' columns.
 function from_c_stream(sp::Ptr{CArrowArrayStream}; limits::Limits=Limits())
     sp == C_NULL && throw(ArgumentError("ArrowArrayStream pointer is NULL"))
     stream = unsafe_load(sp)
@@ -343,6 +343,7 @@ function from_c_stream(sp::Ptr{CArrowArrayStream}; limits::Limits=Limits())
     ) && throw(ArgumentError("C stream is missing required callbacks"))
     owner = _movestream(sp)
     try
+        c = _CImportBudget(limits)
         out = _zeroed(CArrowSchema)
         status = GC.@preserve owner out ccall(
             unsafe_load(owner.block).get_schema,
@@ -354,14 +355,14 @@ function from_c_stream(sp::Ptr{CArrowArrayStream}; limits::Limits=Limits())
         status == 0 || _stream_call_failed(owner, "get_schema")
         sch = out[]
         batchfield = GC.@preserve out try
-            _preflight_schema(sch)
-            _import_field(sch)
+            _preflight_schema(sch, c)
+            _import_field(sch, c)
         finally
             _release_producer!(Base.unsafe_convert(Ptr{CArrowSchema}, out))
         end
         schema = _cbatchschema(batchfield)
         _validate_stream_schema(schema)
-        return ImportedStream(owner, batchfield, schema, limits, false, false)
+        return ImportedStream(owner, batchfield, schema, limits, 0, false, false)
     catch
         release!(owner)
         rethrow()
@@ -389,10 +390,16 @@ function AC.nextbatch!(s::ImportedStream)
             s.done = true
             return nothing
         end
+        if s.batchesread >= s.limits.max_messages
+            GC.@preserve out _release_producer!(Base.unsafe_convert(Ptr{CArrowArray}, out))
+            _checkmessagecount(s.batchesread, s.limits)
+        end
         owner = GC.@preserve out _moveowner(Base.unsafe_convert(Ptr{CArrowArray}, out))
-        d = _importarray(s.batchfield, owner)
+        d = _importarray(s.batchfield, owner, _CImportBudget(s.limits))
         try
-            return _cbatch(s.schema, d)
+            batch = _cbatch(s.schema, d)
+            s.batchesread += 1
+            return batch
         catch
             release!(owner)
             rethrow()

@@ -490,6 +490,31 @@ end
         again = Arrow.Table(arrowbytes(t))
         @test isequal(collect(again.t), collect(t.t)) &&
               isequal(collect(again.p), collect(t.p))
+        bad = Arrow.Table(
+            [:p],
+            AbstractVector[[reshape(Int32.(1:6), 2, 3)]],
+            Dict(:p => 1),
+            AC.Schema([pf]),
+            AC.ReleaseCell(),
+            1,
+        )
+        @test_throws ArgumentError arrowbytes(bad)
+
+        sf = AC.Field("s", AC.StructType(); children=[tf])
+        sd = AC.ArrayData(sf.type, 2, [AC.BufferSlice()]; children=[td])
+        lf = AC.Field("l", AC.ListType(false); children=[tf])
+        ld = AC.ArrayData(
+            lf.type,
+            2,
+            [AC.BufferSlice(), AC._databuffer(Int32[0, 1, 2])];
+            children=[td],
+        )
+        nested = AC.Schema([sf, lf])
+        t = Arrow.Table(Arrow.writestream(nested, [AC.RecordBatch(nested, [sd, ld])]))
+        for result in (t, Arrow.Table(arrowbytes(t)))
+            @test result.s[1].t == Int32[0 1 2; 3 4 5]
+            @test only(result.l[2]) == Int32[6 7 8; 9 10 11]
+        end
     end
 
     @testset "views keep their memory alive" begin

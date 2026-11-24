@@ -372,8 +372,15 @@ function metafield!(b::FB.Builder, f::Field, fielddictids::IdDict{Field,Int64})
     t = f.type
     valuetype = t
     dictoff = FB.UOffsetT(0)
+    metadata = f.metadata
     if t isa DictionaryType
         valuetype = t.valuetype
+        attrs = t.values
+        if attrs !== nothing && attrs.metadata !== nothing
+            # IPC stores metadata on the one field representing both nodes.
+            metadata =
+                metadata === nothing ? attrs.metadata : vcat(metadata, attrs.metadata)
+        end
         idxtag, idxoff = metatype!(b, t.indextype)
         idxtag === Meta.Int ||
             throw(ValidationError("dictionary index type must be an integer"))
@@ -387,7 +394,7 @@ function metafield!(b::FB.Builder, f::Field, fielddictids::IdDict{Field,Int64})
     Meta.fieldStartChildrenVector(b, length(children))
     foreach(x -> FB.prependoffset!(b, x), Iterators.reverse(children))
     childvec = FB.endvector!(b, length(children))
-    kvvec = _metakeyvalues!(b, f.metadata)
+    kvvec = _metakeyvalues!(b, metadata)
     name = FB.createstring!(b, f.name)
     tag, typeoff = metatype!(b, valuetype)
     Meta.fieldStart(b)
@@ -596,7 +603,10 @@ const _PADDING = ntuple(k -> zeros(UInt8, k), 7)
 function _writeexact(io::IO, bytes::Vector{UInt8})
     n = Base.write(io, bytes)
     n == length(bytes) || throw(
-        Base.IOError("short Arrow IPC write: sink accepted $n of $(length(bytes)) bytes", Base.UV_EIO),
+        Base.IOError(
+            "short Arrow IPC write: sink accepted $n of $(length(bytes)) bytes",
+            Base.UV_EIO,
+        ),
     )
     return nothing
 end
@@ -613,8 +623,8 @@ function _writebody(io::IO, c::EncodeCursor)
     return nothing
 end
 
-"Encode view entries and the union of their referenced byte ranges."
-function _encodeviewbuffers!(c::EncodeCursor, d::ArrayData)
+"View entries rebased to zero and compacted to their referenced byte ranges."
+function _compactviewbuffers(d::ArrayData)
     # In-memory views may borrow a whole parser input or a larger column.
     # IPC must not persist those unrelated bytes, null entries, or padding.
     views = AC.rolebuffer(d, AC.VIEWS)
@@ -628,9 +638,10 @@ function _encodeviewbuffers!(c::EncodeCursor, d::ArrayData)
     coverage = zeros(Int64, length(d.buffers) - 2)
     compact = true
     for i = 1:(d.len)
-        (AC.isempty_buffer(inputvalidity) || AC.getbit(inputvalidity, i - 1)) || continue
+        (AC.isempty_buffer(inputvalidity) || AC.getbit(inputvalidity, d.offset + i - 1)) ||
+            continue
         isempty(validity) || (validity[(i - 1) ÷ 8 + 1] |= UInt8(1) << ((i - 1) % 8))
-        base = 16 * (i - 1)
+        base = AC._viewbase(d, i)
         payload = AC.loadat(views, UInt128, base)
         len = reinterpret(Int32, payload % UInt32)
         # The writer requires little-endian storage. Mask inline padding;
@@ -648,22 +659,18 @@ function _encodeviewbuffers!(c::EncodeCursor, d::ArrayData)
             end
         end
     end
+    out = BufferSlice[AC._databuffer(validity), AC._databuffer(entries)]
     if compact && all(>(0), coverage)
-        encodebuffer!(c, validity)
-        encodebuffer!(c, entries)
-        push!(c.variadics, Int64(length(coverage)))
         for (i, extent) in enumerate(coverage)
-            # Only the proven prefix is copied; trailing bytes are unused.
-            encodebuffer!(c, AC.subslice(d.buffers[i + 2], 0, extent))
+            push!(out, AC.subslice(d.buffers[i + 2], 0, extent))
         end
-        return nothing
+        return out
     end
     refs = Int64[i for i = 1:(d.len) if words[4 * i - 3] > AC.VIEW_INLINE_MAX]
     # Sort by source position so duplicate and overlapping views share the
     # same output bytes. Already ordered producer columns need no sort.
     sourcepos(i) = (words[4 * i - 1], words[4 * i])
     issorted(refs; by=sourcepos) || sort!(refs; by=sourcepos)
-    buffers = Vector{UInt8}[]
     firstref = 1
     while firstref <= length(refs)
         bufidx = words[4 * refs[firstref] - 1]
@@ -682,7 +689,7 @@ function _encodeviewbuffers!(c::EncodeCursor, d::ArrayData)
         # offsets <= their original Int32 offsets, including large buffers.
         packed = Vector{UInt8}(undef, nbytes)
         source = AC._viewdatabuffer(d, bufidx)
-        outputidx = Int32(length(buffers))
+        outputidx = Int32(length(out) - 2)
         pos = Int64(0)
         extent = Int64(0)
         GC.@preserve source packed begin
@@ -705,16 +712,33 @@ function _encodeviewbuffers!(c::EncodeCursor, d::ArrayData)
                 extent = max(extent, stop)
             end
         end
-        push!(buffers, packed)
+        push!(out, AC._databuffer(packed))
         firstref = lastref
     end
-    encodebuffer!(c, validity)
-    encodebuffer!(c, entries)
-    push!(c.variadics, Int64(length(buffers)))
-    for bytes in buffers
-        encodebuffer!(c, bytes)
+    return out
+end
+
+# The portion of a fixed-layout buffer addressed by the declared extent.
+# For sliced arrays, the prefix still addresses the retained ArrayData offset.
+function _persistencebuffer(d::ArrayData, spec::AC.LayoutSpec, role, b::BufferSlice)
+    b.len == 0 && return b
+    n = AC.checked_add(d.len, d.offset)
+    needed = if role == AC.OFFSETS
+        AC._required_extent(
+            AC.checked_add(n, Int64(1)),
+            Int64(spec.offsetwidth),
+            "offset bytes",
+        )
+    elseif role == AC.DATA && spec.fixedwidth == 0 && spec.offsetwidth > 0
+        offsets = AC.rolebuffer(d, AC.OFFSETS)
+        w = Int64(spec.offsetwidth)
+        at = AC._required_extent(n, w, "terminal offset position")
+        AC.isempty_buffer(offsets) && n == 0 ? Int64(0) :
+        w == 8 ? AC.loadat(offsets, Int64, at) : Int64(AC.loadat(offsets, Int32, at))
+    else
+        _neededbytes(role, spec, n, d.buffers)
     end
-    return nothing
+    return AC.subslice(b, 0, needed)
 end
 
 """
@@ -724,8 +748,8 @@ The write half of the registry walk — the exact mirror of `decodefield`:
 one node, then the layout's buffers in registry order, then children in
 declared order. Dictionary-encoded fields emit their INDEX buffers here;
 their pool travels in a dictionary batch. View layouts compact referenced
-content at this persistence boundary; other layouts emit their `ArrayData`
-slices verbatim, apart from the empty terminal offset below.
+content at this persistence boundary; other layouts emit only the declared
+extent of each slice.
 """
 function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
     t = f.type
@@ -738,17 +762,14 @@ function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
     )
     push!(c.nodes, (d.len, AC.nullcount(d)))
     spec = layoutspec(t)
-    if spec.variadic
-        length(d.buffers) >= length(spec.buffers) ||
-            throw(ValidationError("column buffer count does not match its layout"))
-    else
-        length(d.buffers) == length(spec.buffers) ||
-            throw(ValidationError("column buffer count does not match its layout"))
-    end
     if t isa AC.ViewType
-        _encodeviewbuffers!(c, d)
+        buffers = _compactviewbuffers(d)
+        push!(c.variadics, Int64(length(buffers) - length(spec.buffers)))
+        foreach(b -> encodebuffer!(c, b), buffers)
         return nothing
     end
+    length(d.buffers) == length(spec.buffers) ||
+        throw(ValidationError("column buffer count does not match its layout"))
     for (role, b) in zip(spec.buffers, d.buffers)
         if role == AC.OFFSETS && d.len == 0 && b.len == 0
             # Core canonicalizes an empty offset array without allocating its
@@ -756,16 +777,7 @@ function encodefield!(c::EncodeCursor, f::Field, d::ArrayData)
             # terminal zero offset (length + 1 entries).
             encodebuffer!(c, zeros(UInt8, spec.offsetwidth))
         else
-            encodebuffer!(c, b)
-        end
-    end
-    if spec.variadic
-        # View layouts append their variadic data buffers after the fixed
-        # validity/views pair; the count travels in the header's
-        # variadicBufferCounts vector, depth-first (format 1.4).
-        push!(c.variadics, Int64(length(d.buffers) - length(spec.buffers)))
-        for b in Iterators.drop(d.buffers, length(spec.buffers))
-            encodebuffer!(c, b)
+            encodebuffer!(c, _persistencebuffer(d, spec, role, b))
         end
     end
     t isa DictionaryType && return nothing
@@ -1362,18 +1374,8 @@ function _poolvalueequal(
         end
         return true
     elseif t isa Union{ListType,MapType,FixedSizeListType,ListViewType}
-        if t isa FixedSizeListType
-            lo, n = AC._slotindex0(a, ia) * t.listsize, Int64(t.listsize)
-            bo, bn = AC._slotindex0(b, ib) * t.listsize, n
-        elseif t isa ListViewType
-            lo, n = AC._listview_range(t, a, ia)
-            bo, bn = AC._listview_range(t, b, ib)
-        else
-            wide = AC.layoutspec_of(t).offsetwidth == 8
-            lo, hi = AC._offsets_at(a, ia, wide)
-            bo, bh = AC._offsets_at(b, ib, wide)
-            n, bn = hi - lo, bh - bo
-        end
+        lo, n = _poollistspan(t, a, ia)
+        bo, bn = _poollistspan(t, b, ib)
         n == bn || return false
         return _poolrangeequal(f.children[1], a.children[1], lo, b.children[1], bo, n)
     end
@@ -1442,8 +1444,9 @@ function writebatch!(
             staged[id] = pool
             continue
         end
-        if delta !== nothing && st.growth === :replace
-            # A stream re-sends a grown pool whole, which every reader accepts.
+        if delta !== nothing &&
+           st.growth === :replace &&
+           FEATURE_DICTIONARY_REPLACEMENT in st.features
             push!(builders, (_dictbuilder(st, id, vf, pool, false), dictblocks))
             staged[id] = pool
             continue

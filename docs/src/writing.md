@@ -160,10 +160,12 @@ written, and who reads it:
 | output | default | `dictdeltas=true` |
 |:--|:--|:--|
 | file | the whole dictionary once, after the record batches | a delta dictionary with the new values |
-| stream | the whole dictionary again, before the batch that needs it | a delta dictionary with the new values |
-| read by | pyarrow, Polars | pyarrow; not Polars 1.43 |
+| stream | a delta dictionary with the new values | a delta dictionary with the new values |
 
-Arrow 2.x reads all of these, but with several threads it can fail on the default file
+PyArrow reads either format. Polars 1.43 reads the default file format and rejects
+delta dictionaries.
+
+Arrow 2.x reads these layouts. With several threads it can fail on the default file
 output with a `KeyError`, decoding a record batch before the dictionary written after it;
 write such files with `dictdeltas=true` when Arrow 2.x readers need them. DuckDB 1.5's
 `read_arrow` refuses dictionaries in every form.
@@ -198,14 +200,15 @@ column fits an `Int64` one, but a `Float64` column does not. A table that does n
 an error naming the column and both types; the batches written before it stay in the
 output and the writer stays open. A writer closed before it receives a table writes an
 output with no columns. A writer that is never closed leaves an `IO` without its footer or
-end marker, and leaves a path as it was, beside a stray temporary file (`jl_` and random
-letters) or a new file without its footer or end marker.
+end marker. A regular destination path is published on close. During the write, the bytes
+are staged in a private sibling directory. Replacement keeps the file's mode bits. On
+macOS it also copies extended attributes and ACLs to the replacement file.
 
 [`Arrow.append(path, table)`](@ref Arrow.append) adds a table's record batches to an
 existing stream-format file (or a seekable `IO`), under the same rules; a missing or empty
-file starts a new stream. The file format cannot be appended to, since its footer would
-have to be rewritten: produce it with an `Arrow.Writer`, or rewrite it with
-`Arrow.write`.
+file starts a new stream. Use one writer per destination. Append requires V5 stream
+metadata. To append compressed batches, start the stream with compression enabled.
+Use `Arrow.Writer` to produce a file incrementally, or use `Arrow.write` to rewrite it.
 
 ## Metadata
 

@@ -49,11 +49,13 @@ upgrading, check `Pkg.status()` for packages that went backwards.
 | `Arrow.Table(bytes, pos, len)` | `Arrow.Table(bytes[pos:(pos + len - 1)])` |
 | `Arrow.Table(path)`, `Arrow.write(path, table)` with a path object, such as a FilePathsBase.jl path or an AWSS3.jl `S3Path` | unchanged: any object that `open(path, "r")` (to read) or `open(path, "w")` (to write) accepts works |
 | `Arrow.Table([path1, path2])`, `Arrow.Stream([...])` | read each source: `reduce(vcat, DataFrame.(Arrow.Table.(paths)))`, or `for path in paths, batch in Arrow.Stream(path)` |
+| `Tables.partitions(Arrow.Table(path))` | yields one table. Use `Tables.partitions(Arrow.Stream(path))`, iterate the stream, or pass it directly to `Arrow.write` to preserve input record-batch boundaries. |
 | `table.col[i] = x` | columns are read-only: `df = DataFrame(table); df.col[i] = x` |
 | `table.col isa Arrow.List` (or `Map`, `Struct`, `DenseUnion`, ...) | the column types are now `Arrow.ListVector`, `MapVector`, `StructVector`, and plain `Vector`s for unions; better, test the element type |
 | `Arrow.getmetadata(table)` | unchanged; `DataAPI.metadata(table)` also works |
 | `Arrow.getmetadata(table.col)` | `DataAPI.colmetadata(table, :col)` |
 | `Arrow.write(...; compress=LZ4FrameCompressor())` | `compress=:lz4` (or `:zstd`), with `compresslevel` |
+| `Arrow.append(path, table)` | use one writer per path. Append requires V5 stream metadata. To add compressed batches, start the stream with compression enabled. |
 | `Arrow.write(...; alignment, dictencodenested, denseunions, maxdepth)` | accepted with a warning and ignored |
 | `Arrow.write(...; ntasks=0)` | `ntasks=1` |
 | `Arrow.ToTimestamp(x)` | removed: write `Durations.ZonedTimestamp` values, or `ZonedDateTime`s with TimeZones loaded |

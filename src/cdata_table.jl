@@ -62,7 +62,7 @@ function _ctable(
         nothing,
         ctx,
         _uniqueschema(sch),
-        AC.OwnerRegion[AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0)],
+        AC.ReleaseCell(),
         budget;
         ntasks,
         lazy=true,
@@ -106,7 +106,7 @@ producer's `release` callback runs once the table and its columns are garbage co
 """
 function Table(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}; kw...)
     stringtype, ntasks, limits = _creadargs(; kw...)
-    f, d = from_c_data(sp, ap)
+    f, d = from_c_data(sp, ap; limits)
     try
         sch = _cbatchschema(f)
         b = _cbatch(sch, d)
@@ -170,7 +170,6 @@ function Stream(p::Ptr{CArrowArrayStream}; kw...)
     fields = _batchfields(src)
     return Stream(
         src,
-        AC.OwnerRegion[AC.OwnerRegion(Ptr{UInt8}(C_NULL), 0; cell=closed)],
         budget,
         closed,
         _ArrowTypesContext(budget=budget),
@@ -231,12 +230,24 @@ it. Everything else, `Bool` and `missing` in Julia vectors, decimals, dates and
 timestamps, string and list offsets, a list's own validity bitmap, and fixed-size list
 values included, is built into new buffers, and string bytes may be copied. The consumer
 moves or releases the two structs; the table's memory stays reachable until it has
-released the array, and what Arrow.jl allocated is freed by later exports or garbage
-collections. A table that needs more than one record batch (several partitions
+released the array. The caller frees the base structs with [`Arrow.free_c_data!`](@ref)
+after the consumer finishes using their addresses. A table that needs more than one record batch (several partitions
 with rows, or string data past 2 GiB) is an `ArgumentError`; export it with
 [`Arrow.export_stream!`](@ref).
 """
-function to_c_data(tbl; kw...)
+to_c_data(tbl; kw...) = to_c_data(_singleexportbatch(tbl; kw...)...)
+
+"""
+    Arrow.export_c_data!(schemaptr, arrayptr, table; kw...)
+
+Fill caller-owned C Data structs with one record batch, using the same table
+construction and keywords as [`Arrow.to_c_data`](@ref).
+"""
+function export_c_data!(sp::Ptr{CArrowSchema}, ap::Ptr{CArrowArray}, tbl; kw...)
+    return export_c_data!(sp, ap, _singleexportbatch(tbl; kw...)...)
+end
+
+function _singleexportbatch(tbl; kw...)
     sch, batches = _exportbatches(tbl; kw...)
     # An empty first partition only fixed the schema.
     length(batches) > 1 && filter!(b -> b.nrows > 0, batches)
@@ -246,7 +257,7 @@ function to_c_data(tbl; kw...)
             "Arrow.export_stream!",
         ),
     )
-    return to_c_data(_batchfield(sch), _structarray(only(batches)))
+    return _batchfield(sch), _structarray(only(batches))
 end
 
 """

@@ -528,9 +528,14 @@ function _pooledcopy(::Type{T}, chunks, rows=nothing) where {T}
     R = _ownedtype(T)
     invpool = Dict{R,UInt32}()
     pool = R[]
-    ref(value) = get!(invpool, value) do
-        push!(pool, value)
-        UInt32(length(pool))
+    faithful = true
+    function ref(value)
+        k = get!(invpool, value) do
+            push!(pool, value)
+            UInt32(length(pool))
+        end
+        faithful &= _samecategory(value, pool[k])
+        return k
     end
     remaps = IdDict{Any,Vector{UInt32}}()
     remapof(v) = get!(() -> UInt32[ref(_ownedpoolvalue(x)) for x in v.pool], remaps, v.pool)
@@ -555,6 +560,15 @@ function _pooledcopy(::Type{T}, chunks, rows=nothing) where {T}
     end
     # A copy of an empty batch keeps its pool (a chained column has none empty).
     rows === nothing && n == 0 && foreach(remapof, chunks)
+    if !faithful
+        # A PooledArray cannot index two categories that compare equal under
+        # Julia's dictionary equality. Copy the values directly in this case.
+        return R[
+            let j = searchsortedfirst(ends, i)
+                _ownedpoolvalue(chunks[j][i - (j == 1 ? 0 : ends[j - 1])])
+            end for i in (rows === nothing ? (1:n) : rows)
+        ]
+    end
     return PooledArrays.PooledArray(PooledArrays.RefArray(refs), invpool, pool)
 end
 
@@ -1492,9 +1506,23 @@ nested more than 8 deep also keep the materializing path.
 function _viewable(f::AC.Field)
     if _hasarrowtypesextension(f)
         _tensorshape(f) === nothing || return true
-        _storagelabel(f) || return false
+        if _arrowtypesextension(f) === nothing
+            _viewablechildextension(f) || return false
+        else
+            _storagelabel(f) || return false
+        end
     end
     return _viewablelayout(f)
+end
+
+function _viewablechildextension(f::AC.Field)
+    _tensorshape(f) !== nothing && return true
+    _arrowtypesextension(f) === nothing || return false
+    t = f.type
+    t isa AC.DictionaryType &&
+        t.values !== nothing &&
+        return _viewablechildextension(AC.dictvaluefield(f, t))
+    return all(_viewablechildextension, f.children)
 end
 
 # Whether `f` carries an extension label that reads as its storage: a quiet
@@ -1505,6 +1533,11 @@ end
 function _storagelabel(f::AC.Field)
     ext = _arrowtypesextension(f)
     ext === nothing && return false
+    t = f.type
+    t isa AC.DictionaryType &&
+        t.values !== nothing &&
+        _hasarrowtypesextension(AC.dictvaluefield(f, t)) &&
+        return false
     any(_hasarrowtypesextension, f.children) && return false
     name = first(ext)
     _quietextension(name) && return true
@@ -2570,7 +2603,6 @@ function _tensorrows(
 ) where {T,R}
     n = Int(d.len)
     w = prod(shape; init=1)
-    N = length(shape)
     _chargeexact!(budget, T, n, "tensor rows")
     _chargeexact!(budget, eltype(R), n * w, "tensor values")
     out = Vector{T}(undef, n)
@@ -2582,20 +2614,28 @@ function _tensorrows(
         end
         base = (Int(d.offset) + i - 1) * w
         flat = eltype(R)[child[base + j] for j = 1:w]
-        # Row-major storage: reverse the dimensions to reshape, then back.
-        physical = permutedims(reshape(flat, reverse(shape)), N:-1:1)
-        out[i] = perm == Tuple(1:N) ? physical : permutedims(physical, perm)
+        out[i] = _tensorvalue(flat, shape, perm)
     end
     return out
 end
 
-# Tensor rows back to their row-major storage values, for a rewrite.
-function _tensorstorage(v::AbstractVector, (shape, perm))
+# Row-major storage: reverse the dimensions to reshape, then back.
+function _tensorvalue(flat, shape, perm)
     N = length(shape)
-    return [
-        row isa AbstractArray && ndims(row) == N ?
-        vec(
-            permutedims(perm == Tuple(1:N) ? row : permutedims(row, invperm(perm)), N:-1:1),
-        ) : row for row in v
-    ]
+    physical = permutedims(reshape(flat, reverse(shape)), N:-1:1)
+    return perm == Tuple(1:N) ? physical : permutedims(physical, perm)
+end
+
+# Tensor rows back to their row-major storage values, for a rewrite.
+function _tensorstorage(v::AbstractVector, (shape, perm), name)
+    N = length(shape)
+    logicalshape = map(i -> shape[i], perm)
+    inverse = invperm(perm)
+    return map(v) do row
+        row === missing && return missing
+        row isa AbstractArray && size(row) == logicalshape ||
+            throw(ArgumentError("column $name requires tensor rows of size $logicalshape"))
+        physical = perm == Tuple(1:N) ? row : permutedims(row, inverse)
+        return vec(permutedims(physical, N:-1:1))
+    end
 end

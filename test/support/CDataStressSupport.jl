@@ -31,7 +31,8 @@ import Arrow:
     fromjulia,
     increment!,
     release!,
-    to_c_data
+    to_c_data,
+    free_c_data!
 
 include("cdata_stress.jl")
 

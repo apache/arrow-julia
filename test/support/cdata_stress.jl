@@ -154,8 +154,7 @@ function _threaded_cdata_stress()
         try
             for i = worker:workers:n
                 sp, ap = roots[i]
-                _release_c!(sp)
-                _release_c!(ap)
+                free_c_data!(sp, ap)
                 i % 16 == 0 && yield()
             end
         finally
@@ -172,7 +171,7 @@ function _threaded_cdata_stress()
     foreach(fetch, releasers)
     reaped_by_task = fetch.(reapers)
     reaped = sum(reaped_by_task) + _reapreleased!()
-    @assert reaped == n (reaped, reaped_by_task, _registry_count())
+    @assert reaped == 2n (reaped, reaped_by_task, _registry_count())
     @assert _registry_count() == 0
 
     # One atomic swap must choose between explicit release and the registered
@@ -221,6 +220,7 @@ function _threaded_cdata_stress()
                     xs = collect(Int64, i:(i + 99))
                     sp, ap = to_c_data((x=xs, s=["a", "bb"][mod1.(1:100, 2)]))
                     t = Table(sp, ap)
+                    free_c_data!(sp, ap)
                     @assert collect(t.x) == xs
                     i % 50 == 0 && GC.gc(false)
                 end

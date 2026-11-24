@@ -4498,7 +4498,7 @@ end
         Symbol[:value],
         AbstractVector[Int32[1]],
         schema,
-        ARROWTYPES_TEST_AC.OwnerRegion[],
+        ARROWTYPES_TEST_AC.ReleaseCell(),
         1,
     )
     for outputfile in (false, true)

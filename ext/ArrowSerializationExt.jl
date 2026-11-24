@@ -28,8 +28,21 @@ function S.serialize(s::S.AbstractSerializer, d::AC.ArrayData)
     S.serialize_cycle_header(s, d) && return nothing
     S.serialize(s, d.type)
     S.serialize(s, d.len)
-    S.serialize(s, d.offset)
-    S.serialize(s, [AC.slicebytes(b) for b in d.buffers])
+    if d.type isa AC.ViewType
+        AC._validate_view_values(d.type, d)
+        S.serialize(s, Int64(0))
+        S.serialize(s, [AC.slicebytes(b) for b in Arrow._compactviewbuffers(d)])
+    else
+        spec = AC.layoutspec_of(d.type)
+        S.serialize(s, d.offset)
+        S.serialize(
+            s,
+            [
+                AC.slicebytes(Arrow._persistencebuffer(d, spec, role, b)) for
+                (role, b) in zip(spec.buffers, d.buffers)
+            ],
+        )
+    end
     S.serialize(s, d.children)
     S.serialize(s, d.dictionary)
     S.serialize(s, @atomic(:monotonic, d.nullcount))
@@ -59,17 +72,39 @@ function S.deserialize(s::S.AbstractSerializer, ::Type{AC.ArrayData})
     return d
 end
 
+function _hasrepeatedmap(x::Arrow.MapValue)
+    return length(Set(keys(x))) != length(x) || any(_hasrepeatedmap, x)
+end
+_hasrepeatedmap(x) = false
+_hasrepeatedmap(x::Union{Tuple,NamedTuple,Pair,AbstractDict}) = any(_hasrepeatedmap, x)
+_hasrepeatedmap(x::AbstractVector) = Arrow._mayborrow(eltype(x)) && any(_hasrepeatedmap, x)
+
+_savedvalue(x) = x
+_savedvalue(x::Arrow.MapValue) = [_savedvalue(p) for p in x]
+_savedvalue(x::Union{Tuple,NamedTuple,AbstractVector}) = map(_savedvalue, x)
+_savedvalue(x::Pair) = _savedvalue(first(x)) => _savedvalue(last(x))
+_savedvalue(x::AbstractDict) = Dict(_savedvalue(p) for p in x)
+_savedvalue(x::Union{Arrow.DataStrings.DataString,Arrow.DataStrings.DataBytes}) =
+    Arrow._ownedpoolvalue(x)
+
+_savedcolumn(c) = _hasrepeatedmap(c) ? map(_savedvalue, c) : Arrow._ownedcolumn(c)
+
 function S.serialize(s::S.AbstractSerializer, t::Arrow.Table)
+    Arrow._checkopen(t)
     S.serialize_type(s, Arrow.Table)
     S.serialize(s, getfield(t, :names))
-    # Views serialize as the owned vectors they copy to, not as their buffers.
+    # Map rows use ordered pairs when a Dict would collapse repeated keys.
     S.serialize(
         s,
-        AbstractVector[Arrow._ownedcolumn(Arrow._force(c)) for c in getfield(t, :columns)],
+        AbstractVector[_savedcolumn(Arrow._force(c)) for c in getfield(t, :columns)],
     )
-    for name in (:schema, :nrows, :retainedpools)
+    for name in (:schema, :nrows)
         S.serialize(s, getfield(t, name))
     end
+    S.serialize(
+        s,
+        Any[p === nothing ? nothing : _savedcolumn(p) for p in getfield(t, :retainedpools)],
+    )
     return nothing
 end
 
@@ -79,7 +114,7 @@ function S.deserialize(s::S.AbstractSerializer, ::Type{Arrow.Table})
     schema = S.deserialize(s)
     nrows = S.deserialize(s)
     pools = S.deserialize(s)
-    return Arrow._table(names, columns, schema, AC.OwnerRegion[], nrows, pools)
+    return Arrow._table(names, columns, schema, AC.ReleaseCell(), nrows, pools)
 end
 
 end # module ArrowSerializationExt

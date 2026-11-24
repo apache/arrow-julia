@@ -104,7 +104,13 @@ function _oracle_parent(args)
     env["JULIA_CONDAPKG_BACKEND"] = "Null"
     cmd = `$(Base.julia_cmd()) --project=$(dirname(Base.active_project()))
         --startup-file=no $(@__FILE__) $_CDATA_ORACLE_CHILD $args`
-    proc = run(ignorestatus(setenv(cmd, env)))
+    proc = run(pipeline(ignorestatus(setenv(cmd, env)); stdout, stderr); wait=false)
+    if timedwait(() -> !process_running(proc), 1200) === :timed_out
+        kill(proc)
+        wait(proc)
+        error("C Data oracle did not finish and exit within 20 minutes")
+    end
+    wait(proc)
     exit(proc.exitcode)
 end
 
@@ -164,14 +170,89 @@ if _CDATA_ORACLE_STANDALONE && length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHI
     # Export one struct-wrapped batch to pyarrow; pyarrow validates fully.
     function _to_pyarrow(sch::AC.Schema, b::AC.RecordBatch)
         f, d = _structwrap(sch, b.columns, b.nrows)
-        sp, ap = Arrow.to_c_data(f, d)
-        pyb = pa.RecordBatch._import_from_c(UInt(ap), UInt(sp))
-        unsafe_load(sp).release == C_NULL ||
-            error("pyarrow did not mark the imported schema released")
-        unsafe_load(ap).release == C_NULL ||
-            error("pyarrow did not mark the imported array released")
+        sr, ar = Ref{CS}(), Ref{CA}()
+        pyb = GC.@preserve sr ar begin
+            sp = Base.unsafe_convert(Ptr{CS}, sr)
+            ap = Base.unsafe_convert(Ptr{CA}, ar)
+            Arrow.export_c_data!(sp, ap, f, d)
+            result = pa.RecordBatch._import_from_c(UInt(ap), UInt(sp))
+            sr[].release == ar[].release == C_NULL ||
+                error("pyarrow did not mark the imported bases released")
+            result
+        end
         pyb.validate(full=true)
         return pyb
+    end
+
+    function _dictionary_node_roundtrips()
+        arrays = pyexec(
+            @NamedTuple{extended::Py, nested::Py},
+            """
+import pyarrow as pa
+class ReviewExtension(pa.ExtensionType):
+    def __init__(self):
+        import pyarrow
+        super().__init__(pyarrow.int64(), "arrow_julia.review_value")
+    def __arrow_ext_serialize__(self):
+        return b""
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage, metadata):
+        import pyarrow
+        if storage != pyarrow.int64():
+            raise ValueError("extension values require Int64 storage")
+        return cls()
+typ = ReviewExtension()
+pa.register_extension_type(typ)
+values = pa.ExtensionArray.from_storage(typ, pa.array([10, 20]))
+extended = pa.DictionaryArray.from_arrays(pa.array([0, 1, 0]), values)
+inner = pa.DictionaryArray.from_arrays(pa.array([1, 0]), pa.array([10, 20]))
+nested = pa.DictionaryArray.from_arrays(pa.array([1, 0, 1]), inner)
+""",
+            @__MODULE__
+        )
+        for input in arrays
+            input.validate(full=true)
+            sr, ar = Ref{CS}(), Ref{CA}()
+            GC.@preserve sr ar begin
+                sp = Base.unsafe_convert(Ptr{CS}, sr)
+                ap = Base.unsafe_convert(Ptr{CA}, ar)
+                input._export_to_c(UInt(ap), UInt(sp))
+                f, d = Arrow.from_c_data(sp, ap)
+                Arrow.export_c_data!(sp, ap, f, d)
+                out = pa.Array._import_from_c(UInt(ap), UInt(sp))
+                out.validate(full=true)
+                pyconvert(Bool, out.type.equals(input.type)) ||
+                    error("dictionary schema changed")
+                pyconvert(Vector{Int}, out.to_pylist()) == [10, 20, 10] ||
+                    error("dictionary values changed")
+                PythonCall.pydel!(out)
+            end
+        end
+        return nothing
+    end
+
+    function _native_worker_handoff()
+        stream = Ref{CAS}()
+        table = GC.@preserve stream begin
+            ptr = Base.unsafe_convert(Ptr{CAS}, stream)
+            Arrow.export_stream!(ptr, (x=collect(1:4096),); batchsize=128)
+            pa.RecordBatchReader._import_from_c(UInt(ptr)).read_all()
+        end
+        sink = pa.BufferOutputStream()
+        writer = paipc.new_stream(sink, table.schema)
+        writer.write_table(table)
+        writer.close()
+        owned = paipc.open_stream(sink.getvalue()).read_all()
+        PythonCall.pydel!(table)
+        pa.set_cpu_count(2)
+        dataset = pyimport("pyarrow.dataset")
+        selected = dataset.dataset(owned).scanner(
+            filter=dataset.field("x").__gt__(4090),
+            use_threads=true,
+        ).to_table()
+        pyconvert(Vector{Int}, selected.column("x").to_pylist()) == collect(4091:4096) ||
+            error("native worker scan returned different values")
+        return nothing
     end
 
     # Import a pyarrow RecordBatch through the C interface into Core.
@@ -452,6 +533,17 @@ if _CDATA_ORACLE_STANDALONE && length(ARGS) >= 1 && ARGS[1] == _CDATA_ORACLE_CHI
         isempty(verdicts) &&
             error("arrow-testing corpus contains no runnable C Data families under $root")
         _metadata_sentinel!(verdicts)
+        for (check, runcheck) in (
+            ("dictionary value schema round-trip", _dictionary_node_roundtrips),
+            ("native worker handoff", _native_worker_handoff),
+        )
+            try
+                runcheck()
+                push!(verdicts, Verdict("(sentinel)", check, :pass, ""))
+            catch e
+                push!(verdicts, errorverdict("(sentinel)", check, e))
+            end
+        end
         # Every structure handed to pyarrow must have come back exactly once.
         PythonCall.GC.gc()
         GC.gc()

@@ -204,8 +204,15 @@ function _openpath(path::AbstractString)
             chmod(tmp, filemode(dest) & 0o7777)
             if Sys.isapple()
                 # COPYFILE_ACL | COPYFILE_XATTR copies Finder tags and access rules.
-                status = ccall(:copyfile, Cint, (Cstring, Cstring, Ptr{Cvoid}, UInt32),
-                               dest, tmp, C_NULL, 0x0005)
+                status = ccall(
+                    :copyfile,
+                    Cint,
+                    (Cstring, Cstring, Ptr{Cvoid}, UInt32),
+                    dest,
+                    tmp,
+                    C_NULL,
+                    0x0005,
+                )
                 Base.systemerror("copy metadata for $(repr(dest))", status != 0)
             end
         end
@@ -505,8 +512,7 @@ Base.@nospecializeinfer function _writeparts!(w::Writer, @nospecialize(tbl))
     parts = Tables.partitions(tbl)
     next = iterate(parts)
     if next === nothing
-        # A zero-batch Arrow.Stream still carries its schema.
-        w.st === nothing && _beginwrite!(w, _schemaonly(retained, w.colmetadata), retained)
+        w.st === nothing && _writeempty!(w, tbl, retained)
         return nothing
     end
     # An unknown-length source may have later partitions. Do not fetch one
@@ -541,6 +547,29 @@ Base.@nospecializeinfer function _writeparts!(w::Writer, @nospecialize(tbl))
         rethrow()
     end
     return nothing
+end
+
+function _writeempty!(w::Writer, @nospecialize(tbl), retained)
+    sch = _uninferred(Tables.schema, tbl)
+    (sch === nothing || sch.types === nothing) &&
+        throw(ArgumentError("table has no partitions; cannot infer a schema"))
+    names = collect(Symbol, sch.names)
+    encoded = _dictencodeflags(names, w.dictencode)
+    cols = AbstractVector[
+        encoded[j] ? DictEncode(Vector{T}()) : Vector{T}() for
+        (j, T) in enumerate(sch.types)
+    ]
+    return _writebatch!(
+        w,
+        tbl,
+        names,
+        cols,
+        0,
+        fill(nothing, length(cols)),
+        retained,
+        encoded,
+        false,
+    )
 end
 
 Base.@nospecializeinfer function _writepartition!(
@@ -670,10 +699,14 @@ Base.@nospecializeinfer function _writebatch!(
     end
     sch = w.schema::AC.Schema
     st = w.st::IPCWriteState
+    shared = w.appending ? _shareddictionarycolumns(sch, st.ids) : ()
     written = Any[
         f.type isa AC.DictionaryType && !w.dictreplacement ?
         get(st.current, st.ids[f], nothing) : nothing for f in sch.fields
     ]
+    for (id, js) in shared, j in js
+        written[j] = get(st.current, id, nothing)
+    end
     growth = w.dictgrowth
     length(growth) == length(written) || fill!(resize!(growth, length(written)), nothing)
     fields, coldata = _constructconforming(
@@ -690,12 +723,64 @@ Base.@nospecializeinfer function _writebatch!(
         w.pool,
         nullhint=_nullhint(w),
     )
+    for (id, js) in shared
+        _mergesharedpool!(coldata, sch.fields, js, get(st.current, id, nothing))
+    end
     # A fresh Schema over the BUILT fields, so `writebatch!` re-checks them
     # against the writer's schema instead of trusting construction.
     batch = AC.RecordBatch(AC.Schema(fields; metadata=sch.metadata), coldata, nrows)
     deltas = _uninferred(_dictionarydeltas, st, batch, growth)::Dict{Int64,AC.ArrayData}
     w.exported === nothing || push!(w.exported, several ? copy(batch) : batch)
     writebatch!(st, batch; deltas, recycle=_handoff!(w.pool))
+    return nothing
+end
+
+function _shareddictionarycolumns(sch::AC.Schema, ids)
+    groups = Dict{Int64,Vector{Int}}()
+    for (j, f) in enumerate(sch.fields)
+        f.type isa AC.DictionaryType || continue
+        push!(get!(Vector{Int}, groups, ids[f]), j)
+    end
+    filter!(kv -> length(last(kv)) > 1, groups)
+    return groups
+end
+
+# Columns sharing an IPC dictionary ID must index the same pool. Keep the
+# emitted prefix and add each distinct new value before remapping the columns.
+function _mergesharedpool!(cols, fields, js, old)
+    firstpool = cols[first(js)].dictionary::AC.ArrayData
+    all(j -> cols[j].dictionary === firstpool, js) && return nothing
+    f = fields[first(js)]
+    vf = AC.dictvaluefield(f, f.type::AC.DictionaryType)
+    ranges = _DictionaryRange[]
+    count = old === nothing ? Int64(0) : old.len
+    old === nothing || push!(ranges, _DictionaryRange(old, 0, count))
+    index = old === nothing ? Dict{Any,Int64}() : _poolindex(vf, old)
+    remaps = Vector{Int64}[]
+    for j in js
+        localpool = cols[j].dictionary::AC.ArrayData
+        remap = Vector{Int64}(undef, localpool.len)
+        for i in eachindex(remap)
+            remap[i] = get!(index, _storedkey(vf, localpool, Int64(i))) do
+                push!(ranges, _DictionaryRange(localpool, i - 1, 1))
+                count += 1
+                return count - 1
+            end
+        end
+        push!(remaps, remap)
+    end
+    pool = count == 0 ? firstpool : _dictionaryconcat(vf, ranges, Limits(), nothing)
+    for (j, remap) in zip(js, remaps)
+        d = cols[j]
+        t = d.type::AC.DictionaryType
+        IT = AC.juliatype(t.indextype)
+        pool.len - 1 <= typemax(IT) || throw(
+            ArgumentError(
+                "column $(fields[j].name) has too many categories for $IT indices",
+            ),
+        )
+        cols[j] = _uninferred(_reindexdictionary, d, t, IT, IT, remap, pool)
+    end
     return nothing
 end
 
@@ -793,14 +878,14 @@ end
 
 """
 How a dictionary that gains categories is written (see `IPCWriteState`).
-Defaults every reader accepts: files write each final dictionary once, at
-the end; streams write a grown dictionary again whole. One table with one
+Files write each final dictionary once, at the end; streams send new
+categories as deltas by default. One table with one
 partition has all its categories from the start, so it keeps its
 dictionaries before the record batches.
 """
 function _dictgrowth(w::Writer, several::Bool)
     w.dictdeltas && return :delta
-    w.file || return :replace
+    w.file || return w.dictreplacement ? :replace : :delta
     return w.oneshot && !several ? :delta : :defer
 end
 
@@ -937,21 +1022,25 @@ or the append is refused), and the new batches are published after the last
 existing message (over its end-of-stream marker, if it has one), followed by a
 new end-of-stream marker.
 
-A dictionary-encoded column continues the stream's latest dictionary, within
-the range of its index type: a dictionary that gains categories is written
-again whole (`dictdeltas=true` writes only the new categories, as a delta
-dictionary batch). A stream whose schema declares DictionaryReplacement
-(`Arrow.Writer(sink; file=false, dictreplacement=true)`) gets a replacement
-dictionary instead. The file format does not support appending: rewrite the
-file, or produce it incrementally with [`Arrow.Writer`](@ref). A missing or
-empty `sink` starts a new stream, as `Arrow.write(sink, table; file=false)`
-does. The one-argument form curries: `table |> Arrow.append(path)`.
+A dictionary-encoded column adds categories as a delta within the range of
+its index type. A stream whose schema declares DictionaryReplacement
+(`Arrow.Writer(sink; file=false, dictreplacement=true)`) can replace an
+unshared dictionary. Append requires V5 stream metadata, and compressed
+append requires the schema's CompressedBody feature. Rewrite files and V4
+streams with [`Arrow.write`](@ref) before appending. A missing or empty
+`sink` starts a new stream, as `Arrow.write(sink, table; file=false)` does.
+Only one writer may modify a sink at a time. The one-argument form curries:
+`table |> Arrow.append(path)`.
 """
 function append(path::AbstractString, tbl; kwargs...)
+    dest = _sinkdest(path)
     # Appending to nothing starts a stream.
-    isfile(path) && filesize(path) > 0 || return write(path, tbl; file=false, kwargs...)
+    if !isfile(dest) || filesize(dest) == 0
+        write(dest, tbl; file=false, kwargs...)
+        return path
+    end
     # Mapped, so only the bytes framing reads (metadata, dictionaries) are read.
-    region = open(io -> AC._mmapregion(io, path; eager=false), path)
+    region = open(io -> AC._mmapregion(io, dest; eager=false), dest)
     # The tail is owned bytes, so the mapping goes before the file is written:
     # Windows refuses to delete or replace a mapped file.
     keep, tail = try
@@ -959,7 +1048,7 @@ function append(path::AbstractString, tbl; kwargs...)
     finally
         AC._unmap!(region)
     end
-    open(path, "r+") do io
+    open(dest, "r+") do io
         _appendtail!(io, keep, tail)
     end
     return path
@@ -1023,8 +1112,14 @@ function _appendbytes(
     # refused); record batch bodies, which an append never uses, are not read.
     st, msgs = _appendstate(region)
     sch = st.schema
+    st.version == Int16(Meta.MetadataVersion.V5) || throw(
+        ArgumentError("Arrow.append requires V5 IPC metadata; rewrite the stream first"),
+    )
     # Retain the schema's declared features when resuming the writer.
     features = Int64[Int64(x) for x in msgs[1].features]
+    if codec !== :none && !(FEATURE_COMPRESSED_BODY in features)
+        throw(ArgumentError("the stream's schema does not declare compressed bodies"))
+    end
     # New messages start where the last framed message ends: over the
     # end-of-stream marker when the stream has one, else at the end.
     keep = last(msgs).body.offset + last(msgs).body.len
@@ -1050,7 +1145,7 @@ function _appendbytes(
         compress=codec,
         compresslevel,
         current=st.dicts,
-        growth=dictdeltas ? :delta : :replace,
+        growth=:delta,
     )
     # Build the tail before touching the destination, using the same
     # partition ownership and schema rules as an incremental write.
@@ -1438,22 +1533,6 @@ Fields for a source with no partitions. A zero-batch `Arrow.Stream` still
 carries its retained schema, so the output keeps that schema and has no
 record batches; any other partition-free source has no schema to write.
 """
-function _schemaonly(retained, colmetadata)
-    retained === nothing &&
-        throw(ArgumentError("table has no partitions; cannot infer a schema"))
-    # Match colmetadata by name without interning the source's field names.
-    colmetamap =
-        colmetadata === nothing ? nothing :
-        _uninferred(Dict, (String(k)::String => v for (k, v) in Dict(colmetadata)))
-    fields = AC.Field[]
-    for f in retained.fields
-        meta =
-            colmetamap === nothing ? nothing : _metapairs(get(colmetamap, f.name, nothing))
-        push!(fields, meta === nothing ? f : _withfieldmetadata(f, meta))
-    end
-    return fields
-end
-
 # Position is the only unambiguous identity for a retained field, because
 # Arrow permits duplicate names. Fall back to a name match only when the
 # name is unique on both sides; otherwise treat the column as un-retained.

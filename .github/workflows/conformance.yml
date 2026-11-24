@@ -24,6 +24,7 @@ on:
     paths:
       - 'Project.toml'
       - 'conformance/**'
+      - 'ext/**'
       - 'src/**'
       - 'test/**'
       - '.github/workflows/conformance.yml'

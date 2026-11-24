@@ -62,6 +62,7 @@ include("invalidations.jl")
 # The incremental writer (Arrow.Writer) and stream append (Arrow.append).
 include("incremental_writer_tests.jl")
 include("writer_sink_tests.jl")
+include("review_regressions.jl")
 
 # Shared acceptance/conformance support contracts and adapter composition.
 include("conformance_support_tests.jl")

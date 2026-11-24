@@ -95,6 +95,8 @@ Arrow.Table(::Ptr{Arrow.CArrowSchema}, ::Ptr{Arrow.CArrowArray})
 Arrow.Table(::Ptr{Arrow.CArrowArrayStream})
 Arrow.Stream(::Ptr{Arrow.CArrowArrayStream})
 Arrow.to_c_data
+Arrow.export_c_data!
+Arrow.free_c_data!
 Arrow.export_stream!
 Arrow.from_c_data
 Arrow.CArrowSchema

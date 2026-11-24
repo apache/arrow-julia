@@ -29,7 +29,7 @@ producer fills C structs (`ArrowSchema`, `ArrowArray`, `ArrowArrayStream`); the 
 moves them out and calls their `release` callbacks when it is done.
 
 [`Arrow.export_stream!`](@ref) exports any Tables.jl table as a stream of record batches
-and [`Arrow.to_c_data`](@ref) as one record batch; [`Arrow.Table`](@ref) and
+and [`Arrow.export_c_data!`](@ref) as one record batch. [`Arrow.Table`](@ref) and
 [`Arrow.Stream`](@ref) import from pointers to the structs. An exported table is built
 as [`Arrow.write`](@ref) builds it, so the other implementation sees what it would read
 from the IPC bytes, and an imported table has the column types an IPC read gives.
@@ -59,20 +59,24 @@ end
 t.name   # the strings and the missing value, as Arrow.Table(bytes) reads them
 ```
 
-`read_all()` reads every batch on the calling Julia thread. Polars and DuckDB take the
-pyarrow table it returns: `polars.from_arrow(pytable)`, or DuckDB's
-`connection.register("name", pytable)`. Give DuckDB the table, not the reader: DuckDB
-reads a reader on its own threads, which can deadlock with Julia's garbage collector
-(see [Threads](@ref cdata-threads)). The `Ref`, `GC.@preserve`, and `unsafe_convert`
-lines are the C ABI: the caller owns the struct's memory while the other side fills or
-empties it.
+`read_all()` pulls every batch on the calling Julia thread. Polars takes the resulting
+table through `polars.from_arrow(pytable)`. DuckDB's Python adapter can hand even a
+table back to native workers through C Stream. For DuckDB, first put the batches in
+PyArrow-owned memory and then register the table. See [Threads](@ref cdata-threads).
+The `Ref` and `GC.@preserve` keep the caller's base struct alive while the consumer
+moves it.
 
-One record batch crosses as two structs that Arrow.jl allocates, and comes back from
-structs the caller allocates:
+One record batch crosses as a pair of caller-owned base structs in either direction.
 
 ```julia
-schemaptr, arrayptr = Arrow.to_c_data(df)
-batch = pa.RecordBatch._import_from_c(UInt(arrayptr), UInt(schemaptr))
+aref = Ref{Arrow.CArrowArray}()
+sref = Ref{Arrow.CArrowSchema}()
+batch = GC.@preserve aref sref begin
+    ap = Base.unsafe_convert(Ptr{Arrow.CArrowArray}, aref)
+    sp = Base.unsafe_convert(Ptr{Arrow.CArrowSchema}, sref)
+    Arrow.export_c_data!(sp, ap, df)
+    pa.RecordBatch._import_from_c(UInt(ap), UInt(sp))
+end
 
 aref = Ref{Arrow.CArrowArray}()
 sref = Ref{Arrow.CArrowSchema}()
@@ -105,23 +109,25 @@ instead of reading the whole stream, for a DuckDB or Polars result larger than m
   `Arrow.Stream` is a partition per batch) and splits a batch only when its string data
   outgrows 32-bit offsets or `batchsize` requires it. Multi-partition sources may reuse
   their column buffers, so each batch is copied before requesting another partition.
-  `to_c_data` refuses a table that needs more than one batch.
+  Single-batch export refuses a table that needs more than one batch.
 - Imports have the column types an IPC read gives: strings as `DataString`, timestamps
   as `Timestamp` or `ZonedTimestamp`, decimals as `Decimal`, nested values as the same
   views, with `stringtype`, `ntasks`, and `limits` as for `Arrow.Table`. Numbers, dates,
   and other fixed-width values read the producer's memory in place; string and binary
   values are copied into Julia-owned buffers. A C stream read whole chains its batches
   into one table. `copy(table)` copies all of it into Julia-owned memory.
-- Exported and imported data is validated as an IPC read is.
+- C imports apply `limits` to schema size and depth, array length, and declared buffer
+  extents. The producer must supply valid pointers for those extents. The C interface
+  can carry dictionary-encoded dictionary values. The IPC format has only one
+  dictionary encoding per field.
 
 ## Memory
 
-An export keeps its source reachable until the consumer has released it: the table's
-columns, or the vectors it was built from. The structs Arrow.jl allocated are then freed
-by later exports or garbage collections, with nothing to call. The consumer reads
-exported vectors in place, so modifying one changes what it reads; resizing one is safe
-from Julia 1.11 on, where the exported storage stays alive, and frees the consumer's
-bytes on Julia 1.10.
+The array export keeps its buffers alive until the consumer releases the array. A cached
+schema has its own lifetime. The caller keeps each base struct alive until the consumer
+has moved it or finished reading it after release. [`Arrow.to_c_data`](@ref) allocates
+the bases for callers that need raw pointers. Free them with [`Arrow.free_c_data!`](@ref)
+after use. Never modify or resize a vector that an active consumer reads in place.
 
 An imported table's columns read the producer's memory, and the producer's `release`
 callback runs once the table and its columns are garbage collected, as a mapped file is
@@ -133,20 +139,24 @@ its memory and its release with the original; use `copy`.
 
 ## [Threads](@id cdata-threads)
 
-The callbacks Arrow.jl exports are Julia functions. A consumer that calls them from its
-own threads, as DuckDB's and Arrow C++'s thread pools do, makes Julia adopt those
-threads. Such a consumer can deadlock with Julia's garbage collector while the Julia
-thread that called it waits for it: a collection waits for that Julia thread, which
-waits for the consumer, whose threads wait inside the callbacks for the collection.
-DuckDB's scan of a `RecordBatchReader` works this way, so read the stream with
-`read_all()` on the calling thread first and give DuckDB the pyarrow table.
+Arrow.jl supports exported callbacks on Julia-managed threads, including array and
+schema release. Serialize calls on each stream. Pull a PyArrow reader with `read_all()`
+on the calling Julia thread and keep the resulting table alive there until its Arrow.jl
+buffers are released. To hand data to a native worker pool, use a table with its own
+buffers. An IPC write and read is one way to transfer ownership.
 
-On Julia 1.12 and 1.13 a process in which such a consumer thread ran a callback hangs
-at exit, when the consumer's library joins its threads (a Julia bug; 1.10 and 1.11 exit
-normally). Closing the consumer, as with DuckDB's `connection.close()`, does not avoid
-it, because the threads belong to the library's thread pool. Until Julia fixes it,
-`ccall(:_exit, Cvoid, (Cint,), 0)` ends such a process at once; it skips exit hooks, so
-flush output and close files first.
+```julia
+ipc = pyimport("pyarrow.ipc")
+sink = pa.BufferOutputStream()
+writer = ipc.new_stream(sink, pytable.schema)
+writer.write_table(pytable)
+writer.close()
+owned = ipc.open_stream(sink.getvalue()).read_all()
+```
+
+This also avoids Julia adopting a library's persistent native threads. Thread adoption
+can deadlock with garbage collection or during normal process shutdown on Julia 1.12
+and 1.13.
 
 A producer's `release` callback for imported data runs on the thread that imported
 it, or on thread 1 when another library's thread imported it inside a callback: when a
@@ -157,7 +167,7 @@ is released there without waiting on the GIL.
 
 ## Low-level columns
 
-[`Arrow.to_c_data`](@ref)`(field, data)` exports one column given as an `Arrow.Field`
+[`Arrow.export_c_data!`](@ref)`(schemaptr, arrayptr, field, data)` exports one column given as an `Arrow.Field`
 and an `Arrow.ArrayData`, and [`Arrow.from_c_data`](@ref) imports one, returning that
 pair. These are the forms the conformance suite and a custom producer or consumer use;
 tables need neither.

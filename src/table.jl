@@ -81,7 +81,7 @@ struct Table <: Tables.AbstractColumns
     columns::Vector{AbstractVector}
     lookup::Dict{Symbol,Int}
     schema::Union{Nothing,AC.Schema}
-    regions::Vector{AC.OwnerRegion}
+    closed::AC.ReleaseCell
     nrows::Int   # authoritative even with zero columns
     # Original dictionary pools, in column order, when the facade read had
     # enough information to retain them. This is intentionally separate from
@@ -104,7 +104,7 @@ function Base.copy(t::Table)
         copy(getfield(t, :names)),
         AbstractVector[_copycolumn(_force(c)) for c in getfield(t, :columns)],
         getfield(t, :schema),
-        AC.OwnerRegion[],
+        AC.ReleaseCell(),
         getfield(t, :nrows),
         Any[p === nothing ? nothing : _copycolumn(p) for p in getfield(t, :retainedpools)],
     )
@@ -113,12 +113,12 @@ end
 # Construct a Table with deliberately replaced materialized columns (the
 # facade tests exercise refusal paths this way). The passed lookup is
 # ignored and rebuilt from `names`, and no dictionary pools are retained.
-Table(names, columns, lookup, schema, regions, nrows) = Table(
+Table(names, columns, lookup, schema, closed, nrows) = Table(
     names,
     columns,
     _namelookup(names),
     schema,
-    regions,
+    closed,
     nrows,
     Any[nothing for _ in names],
 )
@@ -288,7 +288,7 @@ function _table(
     names::Vector{Symbol},
     columns::Vector{AbstractVector},
     schema,
-    regions,
+    closed::AC.ReleaseCell,
     nrows::Integer,
     retainedpools=nothing,
     budget=nothing,
@@ -299,7 +299,7 @@ function _table(
     _chargevector!(budget, Any, length(names), "table retained-pool slots")
     pools = retainedpools === nothing ? fill(nothing, length(names)) : Any[retainedpools...]
     lookup = _namelookup(names, budget)
-    return Table(names, columns, lookup, schema, regions, Int(nrows), pools)
+    return Table(names, columns, lookup, schema, closed, Int(nrows), pools)
 end
 
 Tables.istable(::Type{Table}) = true
@@ -312,10 +312,9 @@ Tables.getcolumn(t::Table, nm::Symbol) =
 
 # A released table refuses column access; columns taken before stay valid.
 function _checkopen(t::Table)
-    for r in getfield(t, :regions)
-        (@atomic :acquire r.cell.closed) &&
-            throw(InvalidStateException("the table was released", :closed))
-    end
+    closed = getfield(t, :closed)
+    (@atomic :acquire closed.closed) &&
+        throw(InvalidStateException("the table was released", :closed))
     return nothing
 end
 # Column count at or below which `Tables.schema` returns the fully typed
@@ -344,6 +343,7 @@ DataAPI.ncol(t::Table) = length(getfield(t, :names))
 # Two tables are equal when their column names and columns are, as DataFrames
 # compares: `==` is `missing` when a column comparison is, `isequal` is not.
 function Base.:(==)(a::Table, b::Table)
+    Tables.rowcount(a) == Tables.rowcount(b) || return false
     getfield(a, :names) == getfield(b, :names) || return false
     eq = true
     for i in eachindex(getfield(a, :names))
@@ -354,6 +354,7 @@ function Base.:(==)(a::Table, b::Table)
     return eq
 end
 function Base.isequal(a::Table, b::Table)
+    Tables.rowcount(a) == Tables.rowcount(b) || return false
     getfield(a, :names) == getfield(b, :names) || return false
     return all(
         i -> isequal(Tables.getcolumn(a, i), Tables.getcolumn(b, i)),
@@ -361,7 +362,7 @@ function Base.isequal(a::Table, b::Table)
     )
 end
 function Base.hash(t::Table, h::UInt)
-    h = hash(getfield(t, :names), h)
+    h = hash(getfield(t, :names), hash(Tables.rowcount(t), h))
     for i in eachindex(getfield(t, :names))
         h = hash(Tables.getcolumn(t, i), h)
     end
@@ -386,7 +387,7 @@ function DataAPI.metadata(
 )
     sch = getfield(t, :schema)
     if sch !== nothing && sch.metadata !== nothing
-        for kv in sch.metadata
+        for kv in Iterators.reverse(sch.metadata)
             first(kv) == key && return style ? (last(kv), :default) : last(kv)
         end
     end
@@ -470,7 +471,7 @@ function DataAPI.colmetadata(
     c = col isa Symbol ? _columnindex(t, col) : col
     f = _schemafield(t, c)
     if f !== nothing && f.metadata !== nothing
-        for kv in f.metadata
+        for kv in Iterators.reverse(f.metadata)
             first(kv) == key && return style ? (last(kv), :default) : last(kv)
         end
     end
@@ -510,10 +511,7 @@ releasing either one releases both. Columns taken before the release remain
 usable and keep the memory they read: a memory-mapped file is unmapped once
 the table and all of its columns are garbage collected. Idempotent.
 """
-function AC.release!(t::Table)
-    foreach(AC.release!, getfield(t, :regions))
-    return nothing
-end
+AC.release!(t::Table) = AC.release!(getfield(t, :closed))
 
 # --- Dates conversion (the facade owns what Core deliberately does not) ----
 
@@ -1650,17 +1648,17 @@ end
 function _readtable(src, scan, limits::Limits, budget, stringtype::Type, ntasks::Int)
     views = _ViewContext(stringtype, budget)
     request = something(scan, Tables.Scan())
-    regions = src isa OwnerRegion ? AC.OwnerRegion[src] : AC.OwnerRegion[]
+    closed = AC.ReleaseCell()
     if src isa SourceFile || _isfileregion(src)
         ft = _readfooter(src, limits, budget)
         plan = _ScanPlan(request, ft.fields, budget)
         return first(
-            _scanfile(src, ft, plan, limits, budget, views, regions; ntasks, lazy=true),
+            _scanfile(src, ft, plan, limits, budget, views, closed; ntasks, lazy=true),
         )
     end
     st, records = _streamrecords(src, limits, budget)
     plan = _ScanPlan(request, st.fields, budget)
-    return first(_scanstream(st, records, plan, budget, views, regions; ntasks, lazy=true))
+    return first(_scanstream(st, records, plan, budget, views, closed; ntasks, lazy=true))
 end
 
 _isfileregion(r::OwnerRegion) =
@@ -1745,7 +1743,7 @@ function read(source, sink; kwargs...)
         cols,
         getfield(t, :lookup),
         getfield(t, :schema),
-        getfield(t, :regions),
+        AC.ReleaseCell(),
         getfield(t, :nrows),
         getfield(t, :retainedpools),
     )
@@ -2012,7 +2010,6 @@ of any of them releases all of them.
 """
 struct Stream
     src::Union{ArrowFile,_RangedFile,_StreamReader,ImportedStream}
-    regions::Vector{AC.OwnerRegion}
     budget::AllocationBudget
     closed::AC.ReleaseCell
     arrowtypes::_ArrowTypesContext
@@ -2051,13 +2048,10 @@ function Stream(
     plan = _ScanPlan(something(scan, Tables.Scan()), fields, _readbudget(readlimits, 0))
     b = plan.bound
     mask = _fieldmask(vcat(Int[c.index for c in b.columns], b.filtercols), length(fields))
-    # The stream and every table it yields share one lifetime authority, the
-    # source's region: releasing any of them releases it.
     return Stream(
         src,
-        AC.OwnerRegion[src.region],
         budget,
-        src.region.cell,
+        AC.ReleaseCell(),
         _ArrowTypesContext(budget=budget),
         ReentrantLock(),
         _ViewContext(stringtype, budget),
@@ -2071,11 +2065,7 @@ end
 Stream(::AbstractVector{UInt8}, ::Integer, ::Any=nothing; kwargs...) =
     _bytewindowerror(:Stream)
 
-function AC.release!(s::Stream)
-    AC.release!(getfield(s, :closed))
-    foreach(AC.release!, getfield(s, :regions))
-    return nothing
-end
+AC.release!(s::Stream) = AC.release!(getfield(s, :closed))
 
 # The reader of a stream's source. A path, a byte vector, or an opened reader
 # reads in place: a stream-format region frames its messages as the iteration
@@ -2214,7 +2204,7 @@ end
 # Scan `plan` over record batches `records` of stream `s`. The ArrowTypes
 # caches outlive the batch: one batch at a time uses them, charging its own
 # allowance, and its new Symbols count against its own limit.
-function _batchscan(s::Stream, plan::_ScanPlan, records, bodies, budget; regions=s.regions)
+function _batchscan(s::Stream, plan::_ScanPlan, records, bodies, budget; closed=s.closed)
     src = s.src
     arrowtypes = getfield(s, :arrowtypes)
     return @lock getfield(s, :arrowtypeslock) begin
@@ -2231,7 +2221,7 @@ function _batchscan(s::Stream, plan::_ScanPlan, records, bodies, budget; regions
             bodies,
             ctx,
             _tableschema(src),
-            regions,
+            closed,
             budget;
             ntasks=getfield(s, :ntasks),
             lazy=false,
@@ -2311,7 +2301,7 @@ function _schematable(s::Stream)
             _ScanRecord{BufferSlice}[],
             nothing,
             budget;
-            regions=AC.OwnerRegion[],
+            closed=AC.ReleaseCell(),
         ),
     )
 end

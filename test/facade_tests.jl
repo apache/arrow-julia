@@ -287,7 +287,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
         # checks run in their own frame, so no temporary outlives them.
         function releasemapped(path)
             mappedstream = Arrow.Stream(path; mmap=true)
-            mappedregion = only(getfield(mappedstream, :regions))
+            mappedregion = mappedstream.src.region
             @test getfield(getfield(mappedregion, :cell), :action) == C_NULL
             mappedpartition, state = iterate(mappedstream)
             x = mappedpartition.x
@@ -676,7 +676,9 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
                     s = Arrow.Stream(bytes; scan=Tables.Scan(; offset, limit))
                     @test length(s) == length(collect(s)) == expected
                 end
-                @test_throws ArgumentError length(Arrow.Stream(bytes; filter=Arrow.col(:x) > 2, limit=1))
+                @test_throws ArgumentError length(
+                    Arrow.Stream(bytes; filter=Arrow.col(:x) > 2, limit=1),
+                )
             end
             @test xs(Arrow.Stream(bytes; scan=Tables.Scan(offset=3, limit=6))) == 4:9
             scan =
@@ -1689,7 +1691,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             AbstractVector[Int64[100], Int64[7]],
             getfield(t, :lookup),
             getfield(t, :schema),
-            Arrow.AC.OwnerRegion[],
+            Arrow.AC.ReleaseCell(),
             1,
         )
         io2 = IOBuffer()
@@ -2027,7 +2029,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
                 cols,
                 getfield(t, :lookup),
                 getfield(t, :schema),
-                Arrow.AC.OwnerRegion[],
+                Arrow.AC.ReleaseCell(),
                 1,
             )
             io2 = IOBuffer()
@@ -2054,7 +2056,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             cols,
             getfield(td, :lookup),
             getfield(td, :schema),
-            Arrow.AC.OwnerRegion[],
+            Arrow.AC.ReleaseCell(),
             1,
         )
         io3 = IOBuffer()
@@ -2567,7 +2569,7 @@ _timed(f, args...; kwargs...) = @timed f(args...; kwargs...)
             cols,
             getfield(trl, :lookup),
             getfield(trl, :schema),
-            Arrow.AC.OwnerRegion[],
+            Arrow.AC.ReleaseCell(),
             1,
         )
         @test_throws ArgumentError Arrow.write(IOBuffer(), swapped; file=false)

@@ -147,7 +147,6 @@ end
         tc, ts = copy(t), roundtrip(t)
         Arrow.release!(t)
         for result in (tc, ts)
-            @test isempty(getfield(result, :regions))
             @test Tables.columntable(result) == want
         end
         tc.x[1] = 99
@@ -242,6 +241,31 @@ end
     dup = Arrow.Table(take!(Arrow.tobuffer((m=[["k" => 1, "k" => 2]],))))
     @test length(dup.m[1]) == 2 && dup.m[1]["k"] == 2
     @test copy(dup.m)[1] == Dict("k" => 2)
+    @test only(roundtrip(dup).m) == ["k" => 1, "k" => 2]
+    repeated = Arrow.Table(take!(Arrow.tobuffer((s=[(m=["k" => 1, "k" => 2],)],))))
+    @test only(roundtrip(repeated).s).m == ["k" => 1, "k" => 2]
+end
+
+@testset "Persistence excludes bytes after logical buffers" begin
+    pad = Vector{UInt8}(codeunits("unused backing storage"))
+    for values in (Int32[1, 2], ["one", "two"])
+        f, d = Arrow.fromjulia("x", values)
+        buffers = AC.BufferSlice[
+            AC.isempty_buffer(b) ? b : AC._databuffer(vcat(AC.slicebytes(b), pad)) for
+            b in d.buffers
+        ]
+        oversized = AC.ArrayData(d.type, d.len, buffers; nullcount=0)
+        sch = AC.Schema([f])
+        batch = AC.RecordBatch(sch, [oversized])
+        for encode in (Arrow.writefile, Arrow.writestream)
+            bytes = encode(sch, [batch])
+            @test findfirst(pad, bytes) === nothing
+            @test Arrow.Table(bytes).x == values
+        end
+        saved = roundtrip(oversized)
+        @test [b.len for b in saved.buffers] == [b.len for b in d.buffers]
+        @test Arrow.materialize(f, saved) == values
+    end
 end
 
 @testset "Opaque binary metadata" begin

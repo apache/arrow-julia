@@ -150,6 +150,8 @@ AC.ValidationError
             :CArrowArray,
             :CArrowArrayStream,
             :to_c_data,
+            :export_c_data!,
+            :free_c_data!,
             :from_c_data,
             :export_stream!,
             :Limits,

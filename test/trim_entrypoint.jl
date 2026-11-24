@@ -103,6 +103,7 @@ function exercise_cdata()::Nothing
     )
     sp, ap = to_c_data(f, d)
     f2, d2 = from_c_data(sp, ap)
+    free_c_data!(sp, ap)
     validate_semantic(f2, d2)
     checked(getvalue(f2, d2, 3) === Int64(3), "cdata round-trip value failed")
     m2 = f2.metadata

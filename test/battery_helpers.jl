@@ -674,6 +674,7 @@ end
     f, d = fromjulia("alloc", Int64[1, 2, 3])
     sp, ap = to_c_data(f, d)
     bytes = (@allocated _release_c!(ap)) + (@allocated _release_c!(sp))
+    free_c_data!(sp, ap)
     ref = Ref{CArrowArrayStream}()
     GC.@preserve ref begin
         p = Base.unsafe_convert(Ptr{CArrowArrayStream}, ref)
@@ -708,8 +709,7 @@ _hold_exports(n) = [to_c_data(fromjulia("held", Int64[1])...) for _ = 1:n]
 
 function _release_all!(held)
     for (sp, ap) in held
-        _release_c!(ap)
-        _release_c!(sp)
+        free_c_data!(sp, ap)
     end
     return nothing
 end
@@ -718,8 +718,7 @@ end
 @noinline function _released_export_key()
     sp, ap = to_c_data(fromjulia("released", Int64[1, 2, 3])...)
     key = _exportkey(ap)
-    _release_c!(ap)
-    _release_c!(sp)
+    free_c_data!(sp, ap)
     return key
 end
 
@@ -729,6 +728,7 @@ end
     sp, ap = to_c_data((x=collect(Int64, 1:10),))
     key = _exportkey(ap)
     t = Arrow.Table(sp, ap)
+    free_c_data!(sp, ap)
     col = t.x
     release!(t)
     @assert try

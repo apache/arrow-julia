@@ -361,15 +361,31 @@ end
             @test !ispath(joinpath(dir, "relative.arrow"))
             if Sys.isapple()
                 key = "com.example.arrow.test"
-                status = ccall(:setxattr, Cint,
+                status = ccall(
+                    :setxattr,
+                    Cint,
                     (Cstring, Cstring, Cstring, Csize_t, UInt32, Cint),
-                    dest, key, "abc", 3, 0, 0)
+                    dest,
+                    key,
+                    "abc",
+                    3,
+                    0,
+                    0,
+                )
                 @test status == 0
                 Arrow.write(dest, table)
                 value = zeros(UInt8, 3)
-                @test ccall(:getxattr, Cssize_t,
+                @test ccall(
+                    :getxattr,
+                    Cssize_t,
                     (Cstring, Cstring, Ptr{UInt8}, Csize_t, UInt32, Cint),
-                    dest, key, value, length(value), 0, 0) == 3
+                    dest,
+                    key,
+                    value,
+                    length(value),
+                    0,
+                    0,
+                ) == 3
                 @test String(value) == "abc"
             end
         end

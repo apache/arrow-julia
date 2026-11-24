@@ -96,8 +96,12 @@ end
         # key is overwritten, its next range read fails (If-Match) rather than
         # mixing bytes of two versions across request rounds.
         stale = ext.CloudObjectSource(obj)
+        emptytag = CloudStore.Object(obj.store, obj.credentials, obj.key, obj.size, "")
+        refreshed = ext.CloudObjectSource(emptytag)
+        @test refreshed.etag == stale.etag
         CloudStore.put(bucket, "t.arrow", streambytes; credentials=credentials)
         @test_throws Exception Arrow.readrange(stale, 8, 16)
+        @test_throws Exception Arrow.readrange(refreshed, 8, 16)
         @test_throws Exception Arrow.Table(obj; scan=Tables.Scan(select=(:a,)))
         fresh = CloudStore.Object(bucket, "t.arrow"; credentials=credentials)
         @test Arrow.Table(fresh).a == mem.a

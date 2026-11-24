@@ -41,6 +41,9 @@
 # skipfield!: the decode walk minus the decode
 # ---------------------------------------------------------------------------
 
+_legacyunionvalidity(t, version) =
+    t isa UnionType && version == Int16(Meta.MetadataVersion.V4)
+
 """
 Advance the cursor past one field's node and buffers — the exact traversal
 `decodefield` performs, with every buffer-table invariant still enforced
@@ -52,6 +55,7 @@ function skipfield!(f::Field, c::DecodeCursor)
     t = f.type
     takenode!(c)
     spec = AC.layoutspec_of(t)
+    _legacyunionvalidity(t, c.version) && skipbuffer!(c)
     for _ in spec.buffers
         skipbuffer!(c)
     end
@@ -82,9 +86,14 @@ View fields consume their declared variadic count on top of the fixed
 registry pair, so the walk carries the batch's variadic-count cursor in
 depth-first order (the same order the decode cursor consumes it).
 """
-function _bufferspan(f::Field, variadics::AbstractVector{Int64}, varidx::Base.RefValue{Int})
+function _bufferspan(
+    f::Field,
+    variadics::AbstractVector{Int64},
+    varidx::Base.RefValue{Int},
+    version,
+)
     spec = AC.layoutspec_of(f.type)
-    n = Int64(length(spec.buffers))
+    n = Int64(length(spec.buffers) + _legacyunionvalidity(f.type, version))
     if spec.variadic
         varidx[] <= length(variadics) || throw(
             ValidationError(
@@ -99,7 +108,11 @@ function _bufferspan(f::Field, variadics::AbstractVector{Int64}, varidx::Base.Re
     f.type isa DictionaryType && return n
     nchildren = spec.childcount == -1 ? length(f.children) : spec.childcount
     for i = 1:nchildren
-        n = _checkedadd(n, _bufferspan(f.children[i], variadics, varidx), "buffer span")
+        n = _checkedadd(
+            n,
+            _bufferspan(f.children[i], variadics, varidx, version),
+            "buffer span",
+        )
     end
     return n
 end
@@ -115,7 +128,8 @@ function _recordbatchmeta(
     fields,
     limits::Limits,
     bodylen::Int64,
-    variadics::AbstractVector{Int64}=variadiccounts(header),
+    variadics::AbstractVector{Int64}=variadiccounts(header);
+    version::Int16=Int16(Meta.MetadataVersion.V5),
 )
     rblen = something(header.length, Int64(0))
     rblen >= 0 || throw(ValidationError("record batch length $rblen is negative"))
@@ -155,7 +169,7 @@ function _recordbatchmeta(
     for f in fields
         expectedbuffers = _checkedadd(
             expectedbuffers,
-            _bufferspan(f, variadics, varidx),
+            _bufferspan(f, variadics, varidx, version),
             "record-batch buffer span",
         )
     end
@@ -233,6 +247,7 @@ function _validateplannedfield!(f::Field, c::DecodeCursor, codec::Int8)
     # tier), so a planned scan makes no nullability judgment here — the same
     # contract the whole-file path applies.
     spec = AC.layoutspec_of(f.type)
+    _legacyunionvalidity(t, c.version) && skipbuffer!(c)
     for role in spec.buffers
         _, len = _buffermeta!(c)
         if codec == CODEC_NONE || len == 0
@@ -328,7 +343,8 @@ function _validatebodyplan(
     limits::Limits,
     codec::Int8,
     mask,
-    variadics::AbstractVector{Int64}=variadiccounts(header),
+    variadics::AbstractVector{Int64}=variadiccounts(header);
+    version::Int16=Int16(Meta.MetadataVersion.V5),
 )
     cursor = DecodeCursor(
         header.nodes,
@@ -336,6 +352,7 @@ function _validatebodyplan(
         BufferSlice(),
         limits;
         codec=codec,
+        version=version,
         variadics=variadics,
     )
     selected = Int64(0)
@@ -402,7 +419,13 @@ function _batchrows(f::ArrowFile, i::Int, budget::AllocationBudget)
     rejectexperimentalcompression(fm)
     fm.msg.header isa Meta.RecordBatch ||
         throw(ValidationError("footer record block is not a record batch"))
-    return _recordbatchmeta(fm.msg.header, f.fields, f.limits, fm.body.len)
+    return _recordbatchmeta(
+        fm.msg.header,
+        f.fields,
+        f.limits,
+        fm.body.len;
+        version=fm.version,
+    )
 end
 
 """
@@ -984,9 +1007,10 @@ mutable struct _BlockReader
     # The window being fetched ahead: its start and end offsets, the index of
     # its last block, and the task fetching it.
     pending::Union{Nothing,Tuple{Int64,Int64,Int,Task}}
+    charged::Union{Nothing,AllocationBudget}
 end
 _BlockReader(sf::SourceFile) =
-    _BlockReader(sf, ReentrantLock(), Int64(-1), Int64(0), UInt8[], nothing)
+    _BlockReader(sf, ReentrantLock(), Int64(-1), Int64(0), UInt8[], nothing, nothing)
 
 """
 A file-format source read one record batch at a time (`Arrow.Stream` over an
@@ -1004,8 +1028,6 @@ struct _RangedFile
     dataend::Int64
     limits::Limits
     footerversion::Int16
-    # The stream's lifetime authority; each batch's bytes are their own region.
-    region::OwnerRegion
     blocks::_BlockReader
 end
 
@@ -1037,77 +1059,116 @@ function _RangedFile(sf::SourceFile, budget::AllocationBudget)
         ft.footerstart,
         sf.limits,
         ft.version,
-        heapregion(UInt8[]),
         _BlockReader(sf),
     )
 end
 
 # The bytes of `blocks[i]`, from the window, the window fetched ahead, or
 # fetched now.
-function _readblock(br::_BlockReader, blocks, i::Int, dataend::Int64)
+function _readblock(br::_BlockReader, blocks, i::Int, dataend::Int64, budget)
+    sf = br.sf
+    _, metalen, bodylen = blocks[i]
+    _checkblocklengths(metalen - 8, bodylen, sf.limits)
     offset, frameend = _blockextent(blocks[i], dataend)
-    ahead = nothing
-    sequential = false
-    @lock br.lock begin
+    framelen = frameend - offset
+    return @lock br.lock begin
+        ahead = br.pending
+        newbudget = br.charged !== budget
         if br.start <= offset && frameend <= br.start + length(br.window)
+            if newbudget
+                _chargevector!(budget, UInt8, length(br.window), "retained block window")
+                ahead === nothing || _chargeblockfetch!(budget, sf, ahead[2] - ahead[1])
+            end
+            _chargevector!(budget, UInt8, framelen, "copied block")
+            br.charged = budget
             br.next = frameend
             return br.window[(offset - br.start + 1):(frameend - br.start)]
         end
-        sequential = i == 1 || 0 <= offset - br.next <= br.sf.gapbytes
-        p = br.pending
-        if p !== nothing && p[1] == offset
-            ahead = p
-            br.pending = nothing
+        br.window = UInt8[]
+        br.pending = nothing
+        sequential = i == 1 || 0 <= offset - br.next <= sf.gapbytes
+        if ahead !== nothing && ahead[1] == offset
+            _, stop, last, task = ahead
+            newbudget && _chargeblockfetch!(budget, sf, stop - offset)
+            bytes = try
+                fetch(task)::Vector{UInt8}
+            catch e
+                rethrow(_firstcause(e))
+            end
+        else
+            if ahead !== nothing
+                # An out-of-order read discards the speculative window first.
+                try
+                    wait(ahead[4])
+                catch
+                end
+            end
+            stop, last =
+                sequential ?
+                _windowfrom(blocks, i, dataend, sf.limits, _blockwindowbudget(budget)) :
+                (frameend, i)
+            stop == frameend || _chargevector!(budget, UInt8, framelen, "copied block")
+            _chargeblockfetch!(budget, sf, stop - offset)
+            bytes = _fetchblockbytes(sf, offset, stop - offset)
         end
-    end
-    if ahead === nothing
-        stop, last = sequential ? _windowfrom(blocks, i, dataend) : (frameend, i)
-        bytes = _fetchinto!(
-            Vector{UInt8}(undef, stop - offset),
-            1,
-            br.sf,
-            offset,
-            stop - offset,
-        )
-    else
-        _, stop, last, task = ahead
-        bytes = try
-            fetch(task)::Vector{UInt8}
-        catch e
-            rethrow(_firstcause(e))
+        if ahead !== nothing && ahead[1] == offset && stop != frameend
+            _chargevector!(budget, UInt8, framelen, "copied block")
         end
-    end
-    @lock br.lock begin
+        br.charged = budget
         br.next = frameend
-        if sequential && last < length(blocks) && br.pending === nothing
+        if sequential &&
+           last < length(blocks) &&
+           _blockfetchable(blocks[last + 1], sf.limits)
             nstart, _ = _blockextent(blocks[last + 1], dataend)
-            nstop, nlast = _windowfrom(blocks, last + 1, dataend)
-            sf = br.sf
-            task = errormonitor(
-                Threads.@spawn _fetchinto!(
-                    Vector{UInt8}(undef, nstop - nstart),
-                    1,
-                    sf,
-                    nstart,
-                    nstop - nstart,
+            cap = _blockwindowbudget(budget)
+            nstop, nlast = _windowfrom(blocks, last + 1, dataend, sf.limits, cap)
+            if nstop - nstart <= cap
+                _chargeblockfetch!(budget, sf, nstop - nstart)
+                task = errormonitor(
+                    Threads.@spawn _fetchblockbytes(sf, nstart, nstop - nstart)
                 )
-            )
-            br.pending = (nstart, nstop, nlast, task)
+                br.pending = (nstart, nstop, nlast, task)
+            end
         end
         stop == frameend && return bytes
         br.start, br.window = offset, bytes
+        return bytes[1:framelen]
     end
-    return bytes[1:(frameend - offset)]
+end
+
+_blockfetchable(block, limits) =
+    0 < block[2] - 8 <= limits.max_metadata_bytes && 0 <= block[3] <= limits.max_body_bytes
+
+# Leave budget for metadata verification, decoding, and facade columns.
+_blockwindowbudget(budget) = min(_READ_RANGE, (@atomic :acquire budget.left) ÷ 4)
+
+function _chargeblockfetch!(budget, sf, len)
+    _chargevector!(budget, UInt8, len, "block range fetch")
+    if sf.concurrency > 1 && len > _READ_RANGE
+        _chargevector!(
+            budget,
+            UInt8,
+            min(len, sf.concurrency * _READ_RANGE),
+            "block range responses",
+        )
+    end
+    return nothing
+end
+
+function _fetchblockbytes(sf, offset, len)
+    (sf.concurrency == 1 || len <= _READ_RANGE) && return _fetchexact(sf, offset, len)
+    return _fetchinto!(Vector{UInt8}(undef, len), 1, sf, offset, len)
 end
 
 # The end offset and last block index of the window that starts at block
 # `i`: the blocks after it while all of them fit in `_READ_RANGE` bytes.
-function _windowfrom(blocks, i::Int, dataend::Int64)
+function _windowfrom(blocks, i::Int, dataend::Int64, limits::Limits, cap::Int64)
     offset, stop = _blockextent(blocks[i], dataend)
     j = i
     while j < length(blocks)
+        _blockfetchable(blocks[j + 1], limits) || break
         o, e = _blockextent(blocks[j + 1], dataend)
-        (o >= stop && e - offset <= _READ_RANGE) || break
+        (o >= stop && e - offset <= cap) || break
         stop = e
         j += 1
     end
@@ -1117,7 +1178,7 @@ end
 # A footer block fetched and framed as a message of its own: the message and
 # the region holding the block's bytes.
 function _blockframe(br::_BlockReader, blocks, i::Int, dataend::Int64, budget)
-    region = heapregion(_readblock(br, blocks, i, dataend))
+    region = heapregion(_readblock(br, blocks, i, dataend, budget))
     _, metalen, bodylen = blocks[i]
     fm = _blockmessage(
         region,
@@ -1555,7 +1616,13 @@ function _rangedbatchrows(
         throw(ValidationError("footer record block is not a record batch"))
     _filemetadataversion(version, v)
     rejectexperimentalcompression(msg, v, header_type)
-    return _recordbatchmeta(msg.header::Meta.RecordBatch, fields, sf.limits, bodylen)
+    return _recordbatchmeta(
+        msg.header::Meta.RecordBatch,
+        fields,
+        sf.limits,
+        bodylen;
+        version=v,
+    )
 end
 
 "Whether an output keeps its source field: no override, or a no-op one."
@@ -1978,7 +2045,7 @@ function _scantable(
     bodies,
     ctx::_ScanContext,
     schema,
-    regions,
+    closed::AC.ReleaseCell,
     budget::AllocationBudget;
     ntasks::Int,
     lazy::Bool,
@@ -2012,14 +2079,28 @@ function _scantable(
     # A dictionary column keeps its category pool, as a full read does, so a
     # rewrite preserves category order (required when ordered).
     _chargevector!(budget, Any, length(b.columns), "scan retained dictionary pools")
-    pools = Any[
-        fields[bc.index].type isa DictionaryType && _keepsfield(bc, precols[i]) ?
-        _retainedpool(fields[bc.index], _dictionariesof(dec, records, bc.index), ctx) :
-        nothing for (i, bc) in enumerate(b.columns)
-    ]
+    pools = Vector{Any}(nothing, length(b.columns))
+    for (i, bc) in enumerate(b.columns)
+        f = fields[bc.index]
+        f.type isa DictionaryType && _keepsfield(bc, precols[i]) || continue
+        dictionaries = _dictionariesof(dec, records, bc.index)
+        pool = _retainedpool(f, dictionaries, ctx)
+        pools[i] = pool
+        if nrows == 0 && !isempty(dictionaries) && _viewable(f)
+            columns[i] = _emptydictcolumn(f.type, eltype(columns[i]), pool, budget)
+        end
+    end
     names = Symbol[c.name for c in b.columns]
     bound = _boundschema(schema, fields, b, precols, budget)
-    return _table(names, columns, bound, regions, nrows, pools, budget), skipped
+    return _table(names, columns, bound, closed, nrows, pools, budget), skipped
+end
+
+function _emptydictcolumn(t::DictionaryType, T::Type, pool, budget)
+    E = Missing <: eltype(pool) ? Union{Missing,T} : T
+    eltype(pool) <: E || (pool = _typedvalues(E, pool, budget))
+    R = AC.juliatype(t.indextype)
+    indices = R[]
+    return DictEncoded{E,R,typeof(pool),typeof(indices)}(indices, pool, t.ordered)
 end
 
 # The distinct dictionaries of column `j` across `records`, in order.
@@ -2054,6 +2135,7 @@ struct _RangedBodies
     headers::Vector{Meta.RecordBatch}
     variadics::Vector{Vector{Int64}}
     codecs::Vector{Int8}
+    versions::Vector{Int16}
     fields::Vector{Field}
     budget::AllocationBudget
 end
@@ -2079,7 +2161,8 @@ function _fetch!(rb::_RangedBodies, ks, mask, extra=NTuple{2,Int64}[])
                 limits,
                 rb.codecs[k],
                 m,
-                rb.variadics[k],
+                rb.variadics[k];
+                version=rb.versions[k],
             ),
         )
     end
@@ -2097,7 +2180,7 @@ function _fetch!(rb::_RangedBodies, ks, mask, extra=NTuple{2,Int64}[])
         varidx = Ref(1)
         bufidx = 1
         for (j, fld) in enumerate(rb.fields)
-            span64 = _bufferspan(fld, rb.variadics[k], varidx)
+            span64 = _bufferspan(fld, rb.variadics[k], varidx, rb.versions[k])
             span64 <= typemax(Int) || throw(
                 ValidationError("field buffer span $span64 exceeds the host index range"),
             )
@@ -2165,7 +2248,7 @@ function _scanfile(
     limits::Limits,
     budget::AllocationBudget,
     views::_ViewContext,
-    regions;
+    closed::AC.ReleaseCell;
     ntasks::Int,
     lazy::Bool,
 )
@@ -2231,8 +2314,14 @@ function _scanfile(
     rowcounts = Vector{Int64}(undef, nrec)
     _foreach(nrec, ntasks) do p, _
         variadics[p] = variadiccounts(headers[p])
-        rowcounts[p] =
-            _recordbatchmeta(headers[p], fields, limits, recordblocks[p][3], variadics[p])
+        rowcounts[p] = _recordbatchmeta(
+            headers[p],
+            fields,
+            limits,
+            recordblocks[p][3],
+            variadics[p];
+            version=versions[ndict + p],
+        )
         return nothing
     end
     # The file's rows together must fit an `Int`, whatever the scan keeps.
@@ -2266,7 +2355,7 @@ function _scanfile(
         rb = header.data
         vf = ft.dictvaluefields[header.id]
         rbvariadics = variadiccounts(rb)
-        _recordbatchmeta(rb, (vf,), limits, block[3], rbvariadics)
+        _recordbatchmeta(rb, (vf,), limits, block[3], rbvariadics; version=versions[i])
         if header.id in needed
             src isa SourceFile && _validatebodyplan(
                 rb,
@@ -2274,7 +2363,8 @@ function _scanfile(
                 limits,
                 _batchcodec(rb.compression, versions[i]),
                 (true,),
-                rbvariadics,
+                rbvariadics;
+                version=versions[i],
             )
             push!(wanted, i)
         end
@@ -2299,6 +2389,7 @@ function _scanfile(
             Int8[
                 _batchcodec(headers[p].compression, versions[ndict + p]) for p in candidates
             ],
+            Int16[versions[ndict + p] for p in candidates],
             fields,
             budget,
         ) : nothing
@@ -2388,7 +2479,7 @@ function _scanfile(
         bodies,
         ctx,
         _uniqueschema(ft.sch),
-        regions,
+        closed,
         budget;
         ntasks,
         lazy,
@@ -2409,6 +2500,7 @@ _streamrecord(f::ArrowFile, i::Int, budget, mask) =
 function _streamrecord(r::_RangedFile, i::Int, budget, mask)
     sf = r.sf
     block = r.recordblocks[i]
+    _checkblocklengths(block[2] - 8, block[3], r.limits)
     spans = nothing
     if all(mask) || _smallbody(block[3], sf.gapbytes)
         fm = first(_blockframe(r.blocks, r.recordblocks, i, r.dataend, budget))
@@ -2433,7 +2525,7 @@ function _streamrecord(r::_RangedFile, i::Int, budget, mask)
     rejectexperimentalcompression(msg, version, headertype)
     header = msg.header::Meta.RecordBatch
     variadics = variadiccounts(header)
-    _recordbatchmeta(header, r.fields, r.limits, block[3], variadics)
+    _recordbatchmeta(header, r.fields, r.limits, block[3], variadics; version)
     _scanmissingdicts(r.fields, header.nodes, r.dictionaries, r.fielddictids, mask)
     record =
         _ScanRecord(_recordplan(header, body, version, r.fields, r.limits), r.dictionaries)
@@ -2446,6 +2538,7 @@ function _streamrecord(r::_RangedFile, i::Int, budget, mask)
         Meta.RecordBatch[header],
         [variadics],
         Int8[_batchcodec(header.compression, version)],
+        Int16[version],
         collect(Field, r.fields),
         budget,
     )
@@ -2462,7 +2555,7 @@ function _scanstream(
     plan::_ScanPlan,
     budget::AllocationBudget,
     views::_ViewContext,
-    regions;
+    closed::AC.ReleaseCell;
     ntasks::Int,
     lazy::Bool,
 )
@@ -2477,7 +2570,7 @@ function _scanstream(
         nothing,
         ctx,
         _uniqueschema(st.schema),
-        regions,
+        closed,
         budget;
         ntasks,
         lazy,

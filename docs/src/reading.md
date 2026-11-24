@@ -261,4 +261,9 @@ table = Arrow.Table(object; select=[:id, :amount])
 ```
 
 `Serialization.serialize` of a table saves its values and schema; the deserialized table
-owns its columns.
+owns its columns. If a map column contains repeated keys, its maps are saved as ordered
+vectors of pairs so that every entry survives.
+
+Serializing a low-level `Arrow.ArrayData` saves the buffer extents addressed by its
+length and offset. String and binary view arrays are compacted and rebased to offset
+zero.

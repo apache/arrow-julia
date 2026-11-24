@@ -49,6 +49,7 @@ function cdata_battery()
     @assert dataref.value !== nothing
     @assert regionref.value !== nothing
     rootedf, rootedd = from_c_data(sp, ap)
+    free_c_data!(sp, ap)
     @assert materialize(rootedf, rootedd) == [1, 2]
     @assert _drained() == before + 1
     release!(rootedd.owner::ForeignOwner)
@@ -72,6 +73,7 @@ function cdata_battery()
     for (f, col) in zip(b.schema.fields, b.columns)
         sp, ap = to_c_data(f, col)
         f2, d2 = from_c_data(sp, ap)
+        free_c_data!(sp, ap)
         push!(imported, (f2, d2))
     end
     for (f2, d2) in imported
@@ -79,7 +81,7 @@ function cdata_battery()
         @assert isequal(collect(Any, got), expected[f2.name]) "$(f2.name): $got"
     end
     println("export → import round-trip for $(length(imported)) columns ✓")
-    nlive = _registry_count()
+    nlive = _drained()
     @assert nlive == length(imported)
 
     # The consumer's release (here the imported columns' owners) marks each
@@ -413,6 +415,7 @@ function cdata_battery()
         want = collect(Any, materialize(f, d))
         sp, ap = to_c_data(f, d)
         f2, d2 = from_c_data(sp, ap)
+        free_c_data!(sp, ap)
         @assert AC.typeequal(f2.type, f.type) f.name
         @assert isequal(collect(Any, materialize(f2, d2)), want) f.name
         release!(d2.owner::ForeignOwner)
@@ -548,6 +551,7 @@ function cdata_battery()
         @assert spec.offsetwidth == 4 ? unsafe_load(Ptr{Int32}(offsetp)) == 0 :
                 unsafe_load(Ptr{Int64}(offsetp)) == 0
         f2, d2 = from_c_data(sp, ap)
+        free_c_data!(sp, ap)
         @assert d2.buffers[oi].len == spec.offsetwidth
         @assert isempty(materialize(f2, d2))
         release!(d2.owner::ForeignOwner)
@@ -703,9 +707,8 @@ function cdata_battery()
     amoved = Ref(unsafe_load(achild))
     _store_field!(schild, :release, Ptr{Cvoid}(C_NULL))
     _store_field!(achild, :release, Ptr{Cvoid}(C_NULL))
-    _release_c!(sp)
-    _release_c!(ap)
-    @assert _drained() == 1
+    free_c_data!(sp, ap)
+    @assert _drained() == 2
     GC.@preserve smoved amoved begin
         smovedp = Base.unsafe_convert(Ptr{CArrowSchema}, smoved)
         amovedp = Base.unsafe_convert(Ptr{CArrowArray}, amoved)
@@ -729,41 +732,26 @@ function cdata_battery()
     @assert _drained() == 1
     _release_c!(sp)
     @assert _drained() == 0
+    free_c_data!(sp, ap)
     println("C release entrypoints are exactly-once and repeats are inert ✓")
 
-    # A consumer may read a top-level struct it just released in place (Arrow C++
-    # checks that its `release` is NULL), so the reap that frees the export keeps the
-    # two top-level structs for 10 ms, however many reaps run meanwhile; 5 ms in, they
-    # are still there. Collections are off so no other reap runs.
-    GC.enable(false)
-    try
-        @assert _drained() == 0
-        sp, ap = to_c_data(fromjulia("in-place", Int64[1, 2])...)
-        key = _exportkey(ap)
-        top = Ptr{Cvoid}(sp)
-        retired() = any(r -> r[2] == top, _RETIRED)
+    # The caller's bases remain valid after both exported member trees are reaped.
+    sr, ar = Ref{CArrowSchema}(), Ref{CArrowArray}()
+    GC.@preserve sr ar begin
+        sp = Base.unsafe_convert(Ptr{CArrowSchema}, sr)
+        ap = Base.unsafe_convert(Ptr{CArrowArray}, ar)
+        f, d = fromjulia("in-place", Int64[1, 2])
+        Arrow.export_c_data!(sp, ap, f, d)
+        skey, akey = _exportkey(sp), _exportkey(ap)
         _release_c!(sp)
         _release_c!(ap)
-        t0 = time_ns()
-        @assert _reap!() == 1
-        @assert !_registered(key) && retired()
-        Libc.systemsleep(0.005)
         _reap!()
-        _reap!()
-        if time_ns() - t0 < 10_000_000
-            @assert retired()
-            @assert unsafe_load(ap).release == C_NULL
-        end
-        Libc.systemsleep(0.011)
-        _reap!()
-        @assert !retired()
-    finally
-        GC.enable(true)
+        @assert !_registered(skey) && !_registered(akey)
+        @assert unsafe_load(sp).release == unsafe_load(ap).release == C_NULL
     end
-    println("to_c_data's top-level structs outlive their export by 10 ms ✓")
+    println("caller-owned C Data bases outlive their released members ✓")
 
-    # Consumers call the release callbacks from their own threads and from inside
-    # garbage-collector finalizers, so they allocate nothing. (Julia 1.10 and 1.11
+    # Release callbacks also run from garbage-collector finalizers, so they allocate nothing. (Julia 1.10 and 1.11
     # allocate 16 bytes in a call through a precompiled `@cfunction`'s pointer; the
     # same body through one made in the session allocates none.)
     _release_allocations()
@@ -844,6 +832,7 @@ function cdata_battery()
     end
     sp, ap = to_c_data(badutf8field, badutf8data)
     rawf, rawd = from_c_data(sp, ap)
+    free_c_data!(sp, ap)
     @assert codeunits(getvalue(rawf, rawd, 1)) == UInt8[0xff]
     release!(rawd.owner::ForeignOwner)
     @assert _drained() == 0
@@ -864,6 +853,7 @@ function cdata_battery()
     sp, ap = to_c_data(df, dd)
     @assert (unsafe_load(sp).flags & ARROW_FLAG_DICTIONARY_ORDERED) != 0
     df2, dd2 = from_c_data(sp, ap)
+    free_c_data!(sp, ap)
     @assert (df2.type::DictionaryType).ordered
     @assert isequal(materialize(df2, dd2), [missing, "x"])
     release!(dd2.owner::ForeignOwner)
@@ -876,9 +866,8 @@ function cdata_battery()
     amoved = Ref(unsafe_load(adict))
     _store_field!(sdict, :release, Ptr{Cvoid}(C_NULL))
     _store_field!(adict, :release, Ptr{Cvoid}(C_NULL))
-    _release_c!(sp)
-    _release_c!(ap)
-    @assert _drained() == 1
+    free_c_data!(sp, ap)
+    @assert _drained() == 2
     GC.@preserve smoved amoved begin
         movedf, movedd = from_c_data(
             Base.unsafe_convert(Ptr{CArrowSchema}, smoved),
@@ -905,6 +894,7 @@ function cdata_battery()
     sp, ap = to_c_data(mapf, mapd)
     @assert (unsafe_load(sp).flags & ARROW_FLAG_MAP_KEYS_SORTED) != 0
     mapf2, mapd2 = from_c_data(sp, ap)
+    free_c_data!(sp, ap)
     @assert (mapf2.type::MapType).keyssorted
     @assert materialize(mapf2, mapd2) == [["a" => 7]]
     release!(mapd2.owner::ForeignOwner)
@@ -919,9 +909,8 @@ function cdata_battery()
     amoved = Ref(unsafe_load(aentries))
     _store_field!(sentries, :release, Ptr{Cvoid}(C_NULL))
     _store_field!(aentries, :release, Ptr{Cvoid}(C_NULL))
-    _release_c!(sp)
-    _release_c!(ap)
-    @assert _drained() == 1
+    free_c_data!(sp, ap)
+    @assert _drained() == 2
     GC.@preserve smoved amoved begin
         movedf, movedd = from_c_data(
             Base.unsafe_convert(Ptr{CArrowSchema}, smoved),
@@ -949,9 +938,8 @@ function cdata_battery()
         _store_field!(source_s, :release, Ptr{Cvoid}(C_NULL))
         _store_field!(source_a, :release, Ptr{Cvoid}(C_NULL))
     end
-    _release_c!(sp)
-    _release_c!(ap)
-    @assert _drained() == 1
+    free_c_data!(sp, ap)
+    @assert _drained() == 2
     for (i, expected_values) in enumerate(([1, 2], [3, 4]))
         GC.@preserve smoved amoved begin
             movedf, movedd = from_c_data(
@@ -961,7 +949,7 @@ function cdata_battery()
             @assert materialize(movedf, movedd) == expected_values
             release!(movedd.owner::ForeignOwner)
         end
-        @assert _drained() == (i == 2 ? 0 : 1)
+        @assert _drained() == (i == 2 ? 0 : 2)
     end
     println("multiple moved siblings defer one aggregate reap ✓")
     # Even when every imported buffer pointer is NULL, ArrayData owns the
@@ -969,6 +957,7 @@ function cdata_battery()
     ef, ed = fromjulia("empty", Int64[])
     sp, ap = to_c_data(ef, ed)
     ef2, ed2 = from_c_data(sp, ap)
+    free_c_data!(sp, ap)
     _reap!()
     ownerref = WeakRef(ed2.owner)
     GC.gc(true)
@@ -1035,6 +1024,7 @@ function cdata_battery()
     datap = Ptr{UInt8}(unsafe_load(unsafe_load(ap).buffers, 3))
     unsafe_store!(datap, 0xff, 1)
     uf2, ud2 = from_c_data(sp, ap)
+    free_c_data!(sp, ap)
     @assert try
         validate_full(uf2, ud2)
         false
@@ -1309,6 +1299,7 @@ function cdata_battery()
     )
     msp, map_ = to_c_data(mlist, mld)
     mf2, mld2 = from_c_data(msp, map_)
+    free_c_data!(msp, map_)
     @assert collect(mf2.metadata) == ["k" => "v", "empty" => ""]
     @assert collect(mf2.children[1].metadata) == ["lk" => "lv"]
     @assert getvalue(mf2, mld2, 1) == Any[1, 2]
@@ -1330,14 +1321,14 @@ function cdata_battery()
     @assert dsch.metadata != C_NULL
     @assert unsafe_load(dsch.dictionary).metadata == C_NULL
     df2, dd2 = from_c_data(dsp, dap)
+    free_c_data!(dsp, dap)
     @assert collect(df2.metadata) == ["dk" => "dv"]
     @assert getvalue(df2, dd2, 2) == "hi"
     release!(dd2.buffers[2].region::OwnerRegion)
     _reap!()
     # Canonical (`arrow.`) extension pairs name the dictionary's VALUE type:
     # they ride the value node (on the wrapper they would declare dictionary
-    # storage, which PyArrow refuses), and import rejoins them after the
-    # wrapper's pairs.
+    # storage, which PyArrow refuses).
     extmeta = [
         "dk" => "dv",
         "ARROW:extension:name" => "arrow.json",
@@ -1355,7 +1346,9 @@ function cdata_battery()
     @assert Arrow._import_cmetadata(xsch.metadata) == extmeta[1:1]
     @assert Arrow._import_cmetadata(unsafe_load(xsch.dictionary).metadata) == extmeta[2:3]
     xf2, xd2 = from_c_data(xsp, xap)
-    @assert collect(xf2.metadata) == extmeta
+    free_c_data!(xsp, xap)
+    @assert collect(xf2.metadata) == extmeta[1:1]
+    @assert collect(AC.dictvaluefield(xf2, xf2.type).metadata) == extmeta[2:3]
     release!(xd2.buffers[2].region::OwnerRegion)
     _reap!()
     # Other extension names stay on the wrapper as field metadata, where a
@@ -1374,12 +1367,11 @@ function cdata_battery()
     @assert Arrow._import_cmetadata(asch.metadata) == appmeta
     @assert unsafe_load(asch.dictionary).metadata == C_NULL
     af2, ad2 = from_c_data(asp, aap)
+    free_c_data!(asp, aap)
     @assert collect(af2.metadata) == appmeta
     release!(ad2.buffers[2].region::OwnerRegion)
     _reap!()
-    # A foreign producer annotating the DEPENDENT node too (extension-type
-    # metadata is legal there) loses no pair on import: wrapper pairs
-    # first, then the dependent node's.
+    # A foreign producer's dictionary value node keeps its own metadata.
     wsp, wap = to_c_data(dmf, dvd)
     wsch0 = unsafe_load(wsp)
     vsch0 = unsafe_load(wsch0.dictionary)
@@ -1406,13 +1398,16 @@ function cdata_battery()
             ),
         )
         wf2, wd2 = from_c_data(wsp, wap)
-        @assert collect(wf2.metadata) == ["dk" => "dv", "vk" => "vv"]
+        free_c_data!(wsp, wap)
+        @assert collect(wf2.metadata) == ["dk" => "dv"]
+        @assert collect(AC.dictvaluefield(wf2, wf2.type).metadata) == ["vk" => "vv"]
         release!(wd2.buffers[2].region::OwnerRegion)
         _reap!()
     end
     pf, pd = fromjulia("plain", Int64[1])
     psp, pap = to_c_data(pf, pd)
     pf2, pd2 = from_c_data(psp, pap)
+    free_c_data!(psp, pap)
     @assert pf2.metadata === nothing
     release!(pd2.buffers[2].region::OwnerRegion)
     _reap!()
@@ -1565,10 +1560,12 @@ function cdata_battery()
     println("the 54-column matrix crosses both interfaces both ways as an IPC read ✓")
 
     let shared = Int32[0, 0], slot = Ref{CArrowArrayStream}()
-        parts = Tables.partitioner((begin
-            shared .= (10i + 1, 10i + 2)
-            (; x=shared)
-        end for i in 1:2))
+        parts = Tables.partitioner((
+            begin
+                shared .= (10i + 1, 10i + 2)
+                (; x=shared)
+            end for i = 1:2
+        ))
         f, d = fromjulia("values", Int32[2, 4])
         GC.@preserve slot begin
             p = Base.unsafe_convert(Ptr{CArrowArrayStream}, slot)
@@ -1643,7 +1640,7 @@ function cdata_battery()
     tv = Arrow.Table(take!(Arrow.tobuffer((y=collect(1.0:100.0),))))
     sp, ap = to_c_data(tv)
     child = unsafe_load(unsafe_load(unsafe_load(ap).children, 1))
-    source = only(getfield(tv, :regions))
+    source = tv.y.owner.buffers[2].region
     @assert UInt(source.ptr) <=
             UInt(unsafe_load(child.buffers, 2)) <
             UInt(source.ptr) + source.len
@@ -1774,6 +1771,7 @@ function cdata_battery()
     sp, ap = to_c_data(dcf, dcd)
     dkey = _exportkey(ap)
     dcf2, dcd2 = from_c_data(sp, ap)
+    free_c_data!(sp, ap)
     dcopy = deepcopy(dcd2)
     @assert materialize(dcf2, dcopy) == [1, 2, 3]
     release!(dcd2.owner::ForeignOwner)
@@ -1797,6 +1795,7 @@ function cdata_battery()
         sp, ap = to_c_data(resizedf, resizedd)
         rkey = _exportkey(ap)
         resizedf2, resizedd2 = from_c_data(sp, ap)
+        free_c_data!(sp, ap)
         @assert AC.sliceptr(resizedd2.buffers[2]) == Ptr{UInt8}(pointer(resized))
         storage = WeakRef(AC._storageroot(resized))
         resize!(resized, 1_000_000)

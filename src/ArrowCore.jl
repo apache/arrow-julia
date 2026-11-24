@@ -577,12 +577,21 @@ struct UnionType <: ArrowType
     typeids::FrozenVector{Int8}       # declared type-id domain, child order
 end
 UnionType(mode::UnionMode, typeids) = UnionType(mode, FrozenVector{Int8}(typeids))
+# The C Data interface gives dictionary values their own schema node.
+struct DictionaryValueAttributes
+    name::String
+    nullable::Bool
+    metadata::Union{Nothing,FrozenVector{Pair{String,String}}}
+end
+
 "Dictionary-encoded: `indextype` is the physical index; values live in `ArrayData.dictionary`."
 struct DictionaryType <: ArrowType
     indextype::IntType
     valuetype::ArrowType
     ordered::Bool
+    values::Union{Nothing,DictionaryValueAttributes}
 end
+DictionaryType(index, value, ordered) = DictionaryType(index, value, ordered, nothing)
 "Utf8View / BinaryView (format 1.4): 16-byte entries plus variadic data buffers."
 struct ViewType <: ArrowType
     utf8::Bool
@@ -1010,10 +1019,6 @@ end
 # One more closed-set ladder (no fieldcount/getfield reflection — that is
 # dynamic and trim-hostile); each branch compares its descriptor's fields
 # explicitly.
-# Non-recursive: the spec forbids dictionary-encoded dictionary VALUES, so
-# a DictionaryType's valuetype is never itself a DictionaryType (enforced in
-# _validate_descriptor) and one nested ladder suffices — which is what lets
-# both levels inline at abstract call sites for trim.
 @inline function _typeequal_nondict(a::ArrowType, b::ArrowType)
     a isa IntType && return b isa IntType && a.bits == b.bits && a.signed == b.signed
     a isa FloatType && return b isa FloatType && a.bits == b.bits
@@ -1045,14 +1050,23 @@ end
 
 @inline function typeequal(a::ArrowType, b::ArrowType)
     if a isa DictionaryType
-        return b isa DictionaryType &&
-               a.indextype.bits == b.indextype.bits &&
-               a.indextype.signed == b.indextype.signed &&
-               _typeequal_nondict(a.valuetype, b.valuetype) &&
-               a.ordered == b.ordered
+        return b isa DictionaryType && _dict_typeequal(a, b)
     end
     b isa DictionaryType && return false
     return _typeequal_nondict(a, b)
+end
+
+function _dict_typeequal(a::DictionaryType, b::DictionaryType)
+    while true
+        _typeequal_nondict(a.indextype, b.indextype) && a.ordered == b.ordered ||
+            return false
+        x, y = a.valuetype, b.valuetype
+        if x isa DictionaryType && y isa DictionaryType
+            a, b = x, y
+        else
+            return @inline _typeequal_nondict(x, y)
+        end
+    end
 end
 
 """
@@ -1181,14 +1195,14 @@ _validate_descriptor(t::UnionType) =
     t.mode in (SparseMode, DenseMode) ||
     throw(ValidationError("invalid Arrow union mode $(repr(t.mode))"))
 function _validate_descriptor(t::DictionaryType)
-    _validate_descriptor(t.indextype)
-    t.indextype.bits <= 64 ||
-        throw(ValidationError("dictionary index bit width must be 8, 16, 32, or 64"))
-    # The spec forbids dictionary-encoded dictionary values; enforcing it
-    # here is also what keeps descriptor equality non-recursive (typeequal).
-    t.valuetype isa DictionaryType &&
-        throw(ValidationError("dictionary values cannot themselves be dictionary-encoded"))
-    _validate_descriptor_of(t.valuetype)
+    value = t
+    while value isa DictionaryType
+        _validate_descriptor(value.indextype)
+        value.indextype.bits <= 64 ||
+            throw(ValidationError("dictionary index bit width must be 8, 16, 32, or 64"))
+        value = value.valuetype
+    end
+    _validate_descriptor_of(value)
     return nothing
 end
 
@@ -1413,8 +1427,11 @@ end
 childfields(f::Field) = f.children
 # Dictionary values have their own nullability. The index field's
 # nullable flag describes only the indices and cannot constrain the pool.
-dictvaluefield(f::Field, t::DictionaryType) =
-    Field(f.name, t.valuetype; nullable=true, children=f.children)
+function dictvaluefield(f::Field, t::DictionaryType)
+    attrs = t.values
+    attrs === nothing && return Field(f.name, t.valuetype, true, nothing, f.children)
+    return Field(attrs.name, t.valuetype, attrs.nullable, attrs.metadata, f.children)
+end
 
 const MILLISECONDS_PER_DAY = Int64(86_400_000)
 

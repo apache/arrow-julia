@@ -128,8 +128,13 @@ PrecompileTools.@setup_workload begin
     # A table to a C data consumer and back, as one record batch and as a
     # stream, as a PythonCall user hands one to pyarrow and reads one back.
     function cdataroundtrip(tbl)
-        schemaptr, arrayptr = to_c_data(tbl)
-        readall(Table(schemaptr, arrayptr))
+        schema, array = Ref{CArrowSchema}(), Ref{CArrowArray}()
+        GC.@preserve schema array begin
+            sp = Base.unsafe_convert(Ptr{CArrowSchema}, schema)
+            ap = Base.unsafe_convert(Ptr{CArrowArray}, array)
+            export_c_data!(sp, ap, tbl)
+            readall(Table(sp, ap))
+        end
         stream = Ref{CArrowArrayStream}()
         GC.@preserve stream begin
             streamptr = Base.unsafe_convert(Ptr{CArrowArrayStream}, stream)

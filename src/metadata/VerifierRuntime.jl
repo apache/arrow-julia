@@ -261,10 +261,8 @@ function _vvector(
     _vcount!(ctx, n, "vector entries")
     start = checked_add(p, Int64(4))
     _vrange(t.bytes, start, checked_mul(n, Int64(elemsize)), "vector data")
-    n > 0 &&
-        elemsize > 1 &&
-        start % min(elemsize, 8) != 0 &&
-        _vfail("vector data is misaligned")
+    # A number of older IPC producers align vectors of 64-bit scalars and
+    # structs to four bytes. The getters use unaligned scalar loads.
     _vcharge!(
         ctx,
         checked_add(
