@@ -38,4 +38,26 @@ Arrow.readrange(s::BytesSource, offset, len) = s.bytes[(offset + 1):(offset + le
     end
 end
 
+function lastbatch(n)
+    io = IOBuffer()
+    Arrow.Writer(io; file=true) do writer
+        for i = 1:n
+            Arrow.write(writer, (x=Int32[i],))
+        end
+    end
+    return BytesSource(take!(io))
+end
+
+@testset "late matches use linear working allocations" begin
+    function measured(source, n)
+        t = Arrow.Table(source; filter=Arrow.col(:x) >= n, limit=1, ntasks=1)
+        @test only(t.x) == n
+    end
+    measured(lastbatch(4), 4)
+    small, large = lastbatch(3000), lastbatch(12000)
+    smallbytes = @allocated measured(small, 3000)
+    largebytes = @allocated measured(large, 12000)
+    @test largebytes <= 5 * smallbytes
+end
+
 end

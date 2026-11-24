@@ -1430,13 +1430,13 @@ function _addspans!(fs::FetchedSpans, new::FetchedSpans, budget)
     return fs
 end
 
-# Forget the spans inside `[from, to)`, so their bytes can be freed.
-function _dropspans!(fs::FetchedSpans, from::Int64, to::Int64)
-    keep = [!(from <= s && s + l <= to) for (s, l) in zip(fs.starts, fs.lens)]
-    keepat!(fs.starts, keep)
-    keepat!(fs.lens, keep)
-    keepat!(fs.slices, keep)
-    return fs
+# Parsed metadata and decoded dictionaries keep the bytes they still need.
+# A windowed filter needs only the current batch in its body lookup.
+function _clearspans!(fs::FetchedSpans)
+    empty!(fs.starts)
+    empty!(fs.lens)
+    empty!(fs.slices)
+    return nothing
 end
 
 # `ranges` are all the bytes a read's columns view. A span they fill less than
@@ -1937,7 +1937,7 @@ function _runscan(
                     _fetch!(bodies, k:k, restmask)
                     rest!(k, states, tasks)
                 end
-                _release!(bodies, k)
+                _clearbodies!(bodies)
             end
         finally
             foreach(close, states)
@@ -2040,7 +2040,7 @@ _retainedpool(f::AC.Field, dictionaries, ctx::_ScanContext) =
 
 # The record bodies of a scan whose bytes are all in memory are readable.
 _fetch!(::Nothing, ks, mask, extra=NTuple{2,Int64}[]) = nothing
-_release!(::Nothing, k) = nothing
+_clearbodies!(::Nothing) = nothing
 _smallrecord(::Nothing, k) = false
 
 # What fetching a byte-range scan's record bodies needs: the bytes fetched so
@@ -2143,12 +2143,7 @@ end
 # Whether record `k`'s body is small (`_smallbody`).
 _smallrecord(rb::_RangedBodies, k) = _smallbody(rb.blocks[k][3], rb.sf.gapbytes)
 
-# Record `k` is read: a scan that reads batch by batch frees its fetched bytes.
-function _release!(rb::_RangedBodies, k)
-    offset, metalen, bodylen = rb.blocks[k]
-    _dropspans!(rb.spans, offset, offset + metalen + bodylen)
-    return nothing
-end
+_clearbodies!(rb::_RangedBodies) = _clearspans!(rb.spans)
 
 _gapbytes(sf::SourceFile) = sf.gapbytes
 _gapbytes(::OwnerRegion) = Int64(0)
@@ -2189,7 +2184,7 @@ function _scanfile(
     # hundred KiB costs less than a second request round. A scan with a row
     # window needs few of the bodies, so it reads metadata alone.
     gap = _gapbytes(src)
-    limitedfilter = b.filter !== nothing && b.limit !== nothing
+    limitedfilter = b.filter !== nothing && (b.limit !== nothing || b.offset > 0)
     bodygap = b.limit === nothing && b.offset == 0 ? gap : Int64(0)
     _chargevector!(budget, NTuple{2,Int64}, nmeta, "metadata range plan")
     metaranges = NTuple{2,Int64}[
@@ -2383,6 +2378,7 @@ function _scanfile(
         UnitRange{Int}[
             (Int(skip) + 1):(Int(skip) + Int(take)) for (_, skip, take) in window
         ] : nothing
+    limitedfilter && _clearbodies!(bodies)
     dec = _Decoder(fields, ft.fielddictids, validated, limits)
     ctx = _ScanContext(views, _ArrowTypesContext(budget=budget))
     return _scantable(
