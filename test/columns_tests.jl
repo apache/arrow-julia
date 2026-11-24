@@ -105,6 +105,16 @@ function mappedentrypoints(tbl, bytes, path)
 end
 
 @testset "column reads" begin
+    @testset "concatenating one chained column preserves its values" begin
+        pairs = ["key" => 1, "key" => 2]
+        t = Arrow.Table(arrowbytes((x=[1, 2], m=[pairs, pairs]); batchsize=1))
+        x = vcat(t.x)
+        @test x == [1, 2]
+        x[1] = 0
+        @test t.x[1] == 1
+        @test collect(vcat(t.m)[1]) == pairs
+    end
+
     @testset "decimals read in bulk, as stored" begin
         n = 100_000
         for (P, S, T) in

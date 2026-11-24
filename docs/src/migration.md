@@ -36,10 +36,11 @@ Arrow 3.0 needs Julia 1.10 or later and uses ArrowTypes.jl 2, Tables.jl 1.14,
 DataStrings.jl, DataDecimals.jl, and Durations.jl. It no longer depends on TimeZones.jl
 or BitIntegers.jl.
 
-Some registered packages still declare compatibility with Arrow 2 only, so adding Arrow 3
-can make the package manager hold them, or downgrade them, to older versions; until its
-next release this includes CategoricalArrays, through its Arrow extension. After
-upgrading, check `Pkg.status()` for packages that went backwards.
+Some registered packages still require Arrow 2, so the package manager may choose
+an older version of those packages when you add Arrow 3. This includes releases of
+CategoricalArrays whose extension requires Arrow 2. Arrow 3.0 was tested with
+CategoricalArrays 0.10.7 and DataFrames 1.8.3 on Julia 1.13. Check `Pkg.status()` after
+upgrading to see which versions the resolver selected.
 
 ## Calls
 

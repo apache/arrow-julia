@@ -267,8 +267,9 @@ nested = pa.DictionaryArray.from_arrays(pa.array([1, 0, 1]), inner)
                 result = importstream(ptr)
                 try
                     batches = result isa Arrow.Table ? (result,) : result
-                    reduce(vcat, (Arrow.Tables.getcolumn(b, 1) for b in batches)) ==
-                    [1, 2, 3, 4] || error("primitive stream values changed")
+                    columns = [collect(Arrow.Tables.getcolumn(b, 1)) for b in batches]
+                    expected = result isa Arrow.Table ? [[1, 2, 3, 4]] : [[1, 2], [3, 4]]
+                    columns == expected || error("primitive stream batches changed")
                 finally
                     Arrow.release!(result)
                 end

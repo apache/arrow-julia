@@ -2184,6 +2184,11 @@ Base.copy(v::ArrowVector{T}) where {T} = _copyrows(T, v)
 Base.copy(c::ChainedVector{T,<:ArrowVector}) where {T} =
     _ownedtype(T) === T ? invoke(copy, Tuple{ChainedVector}, c) : _copyrows(T, c)
 
+# A single-argument concatenation copies the slots without requiring each
+# read-only chunk to copy into its own type or converting nested row views.
+Base.vcat(c::ChainedVector{T,<:ArrowVector}) where {T} =
+    invoke(copy, Tuple{ChainedVector}, c)
+
 # The values of child `d` (field `f`) as their `_columntype(E)`: the column a
 # read builds, copied into owned storage when it is a view of the source
 # (rows view their column's children, and outlive their table).
