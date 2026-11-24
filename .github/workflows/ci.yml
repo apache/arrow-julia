@@ -345,18 +345,11 @@ jobs:
     steps:
       - uses: julia-actions/setup-julia@v3
       - uses: actions/checkout@v7
+      - name: Regenerate IPC metadata bindings
+        run: julia tools/fbsgen.jl src/metadata/fbs src/metadata
       - name: Install JuliaFormatter and format
         run: |
           julia -e 'using Pkg; Pkg.add(PackageSpec(name="JuliaFormatter", version="2.12.4"))'
           julia -e 'using JuliaFormatter; format(".", verbose=true)'
-      - name: Format check
-        run: |
-          julia -e '
-          out = Cmd(`git diff --name-only`) |> read |> String
-          if out == ""
-              exit(0)
-          else
-              @error "Some files have not been formatted !!!"
-              write(stdout, out)
-              exit(1)
-          end'
+      - name: Check generated bindings and formatting
+        run: git diff --exit-code

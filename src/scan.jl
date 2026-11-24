@@ -2087,7 +2087,7 @@ function _scantable(
         pool = _retainedpool(f, dictionaries, ctx)
         pools[i] = pool
         if nrows == 0 && !isempty(dictionaries) && _viewable(f)
-            columns[i] = _emptydictcolumn(f.type, eltype(columns[i]), pool, budget)
+            columns[i] = _emptydictcolumn(f.type, _eltypeof(columns[i]), pool, budget)
         end
     end
     names = Symbol[c.name for c in b.columns]
@@ -2095,9 +2095,10 @@ function _scantable(
     return _table(names, columns, bound, closed, nrows, pools, budget), skipped
 end
 
-function _emptydictcolumn(t::DictionaryType, T::Type, pool, budget)
-    E = Missing <: eltype(pool) ? Union{Missing,T} : T
-    eltype(pool) <: E || (pool = _typedvalues(E, pool, budget))
+function _emptydictcolumn(t::DictionaryType, T::Type, pool::AbstractVector, budget)
+    P = _eltypeof(pool)
+    E = Missing <: P ? Union{Missing,T} : T
+    P <: E || (pool = _typedvalues(E, pool, budget))
     R = AC.juliatype(t.indextype)
     indices = R[]
     return DictEncoded{E,R,typeof(pool),typeof(indices)}(indices, pool, t.ordered)

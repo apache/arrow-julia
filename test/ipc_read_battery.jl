@@ -168,7 +168,8 @@ function ipc_read_battery()
         @assert isempty(_decode_fixture(codec, emptyframe, 0))
         oneframe = transcode(compressor, UInt8[0x41])
         @assert _rejects(() -> _decode_fixture(codec, oneframe, 0))
-        @assert _rejects(() -> _decode_fixture(codec, UInt8[], 0))
+        @assert isempty(_decode_fixture(codec, UInt8[], 0))
+        @assert _rejects(() -> _decode_fixture(codec, UInt8[], 1))
         @assert _decode_fixture(codec, UInt8[0x41, 0x42], -1) == UInt8[0x41, 0x42]
 
         bomb = transcode(compressor, zeros(UInt8, 1024 * 1024))

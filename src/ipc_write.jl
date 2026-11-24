@@ -343,13 +343,12 @@ function metatype!(b::FB.Builder, t::ArrowType)
     end
 end
 
-function _metakeyvalues!(b::FB.Builder, metadata)
-    metadata === nothing && return FB.UOffsetT(0)
+_metakeyvalues!(::FB.Builder, ::Nothing) = FB.UOffsetT(0)
+function _metakeyvalues!(b::FB.Builder, metadata::AbstractVector{Pair{String,String}})
     # Core metadata is an ordered Pair sequence. Preserve both that order and
     # duplicate keys; callers that want canonical ordering can supply it.
-    pairs = collect(metadata)
     kvs = FB.UOffsetT[]
-    for (k, v) in pairs
+    for (k, v) in metadata
         key = FB.createstring!(b, k)
         val = FB.createstring!(b, v)
         Meta.keyValueStart(b)
@@ -379,7 +378,8 @@ function metafield!(b::FB.Builder, f::Field, fielddictids::IdDict{Field,Int64})
         if attrs !== nothing && attrs.metadata !== nothing
             # IPC stores metadata on the one field representing both nodes.
             metadata =
-                metadata === nothing ? attrs.metadata : vcat(metadata, attrs.metadata)
+                metadata === nothing ? attrs.metadata :
+                Pair{String,String}[metadata; attrs.metadata]
         end
         idxtag, idxoff = metatype!(b, t.indextype)
         idxtag === Meta.Int ||

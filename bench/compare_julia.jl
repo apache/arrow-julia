@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Run both Julia versions in fresh processes against the same fixture files.
+# Run both Arrow releases in fresh processes against the same fixture files.
 # Prepare fixtures with bench/run.jl, then see bench/README.md.
 if isempty(ARGS) || first(ARGS) != "--leg"
     length(ARGS) == 2 || error("usage: compare_julia.jl BENCH_DIR ARROW_2_8_1_PROJECT")
