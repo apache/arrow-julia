@@ -35,7 +35,7 @@ FailingSink() = FailingSink(IOBuffer(), nothing, nothing, nothing, 0)
 struct SinkPath <: AbstractString
     io::FailingSink
 end
-Arrow._openpath(path::SinkPath) = Arrow._PathSink(path.io, "", nothing, false)
+Arrow._openpath(path::SinkPath) = Arrow._PathSink(path.io, "", nothing)
 Base.isopen(io::FailingSink) = isopen(io.data)
 function Base.write(io::FailingSink, bytes::Vector{UInt8})
     io.writeerror === nothing || throw(io.writeerror)
@@ -334,6 +334,44 @@ end
             @test caught(() -> Arrow.write(fresh, unwritable)) isa Exception
             @test !ispath(fresh)
             @test sort(readdir(dir)) == ["link.arrow", "target.arrow"]
+        end
+    end
+
+    @testset "a failed writer cleans up only its own staging file" begin
+        mktempdir() do dir
+            dest = joinpath(dir, "result.arrow")
+            @test_throws ErrorException Arrow.Writer(dest) do w
+                Arrow.write(w, table)
+                @test !ispath(dest)
+                Arrow.write(dest, (; b=[42]))
+                error("abandon first writer")
+            end
+            @test Arrow.Table(read(dest)).b == [42]
+            @test readdir(dir) == ["result.arrow"]
+            cd(dir) do
+                mkdir("other")
+                write(joinpath("other", "relative.arrow"), "keep")
+                @test_throws ErrorException Arrow.Writer("relative.arrow") do w
+                    Arrow.write(w, table)
+                    cd("other")
+                    error("abandon relative destination")
+                end
+                @test read("relative.arrow", String) == "keep"
+            end
+            @test !ispath(joinpath(dir, "relative.arrow"))
+            if Sys.isapple()
+                key = "com.example.arrow.test"
+                status = ccall(:setxattr, Cint,
+                    (Cstring, Cstring, Cstring, Csize_t, UInt32, Cint),
+                    dest, key, "abc", 3, 0, 0)
+                @test status == 0
+                Arrow.write(dest, table)
+                value = zeros(UInt8, 3)
+                @test ccall(:getxattr, Cssize_t,
+                    (Cstring, Cstring, Ptr{UInt8}, Csize_t, UInt32, Cint),
+                    dest, key, value, length(value), 0, 0) == 3
+                @test String(value) == "abc"
+            end
         end
     end
 

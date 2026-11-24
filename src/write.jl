@@ -94,11 +94,11 @@ Strings, at any depth, must be valid UTF-8, as the format requires: a string
 that is not throws an `ArgumentError` naming the column and row. Write bytes
 that are not text as `Vector{UInt8}` values, a binary column.
 
-Writing to an existing file writes a temporary file in the same directory
-and renames it over the old one when the output is complete, so a failed
+Writing a local regular file stages the output on the same filesystem and
+renames it into place when complete. A failed
 write leaves the old file unchanged, and an `Arrow.Table` or `Arrow.Stream`
-that memory-maps the old file keeps reading it. The file keeps its mode, a
-symlink is written through, and a read-only file is refused with a
+that memory-maps the old file keeps reading it. The file keeps its mode and, on macOS, its ACL and extended attributes.
+Other inode metadata follows the filesystem's creation rules. A symlink is written through, and a read-only file is refused with a
 `SystemError`, as opening it for writing is. If the operating system refuses
 the rename, `write` throws a `Base.IOError` and the old file is kept.
 
@@ -148,24 +148,19 @@ Base.@nospecializeinfer function _writeall!(w, @nospecialize(tbl))
     return nothing
 end
 
-# An existing regular file is replaced by writing a temporary file in the
-# same directory and renaming it over the destination once the output is
-# complete. A live Arrow.Table or Arrow.Stream that memory-maps the old file
-# keeps reading the old inode, and a failed write leaves the old file as it
-# was. New paths and non-regular files (FIFOs, devices) are written in place,
-# as is any other object that `open(x, "w")` accepts (AWSS3's `S3Path`, for
-# example). The FilePathsBase extension sends local paths through `_openpath`.
+# Stage local regular files on their destination filesystem. A failed writer
+# removes only its private staging directory. FIFOs, devices, and generic
+# openable sinks must be written in place.
 struct _PathSink
     io::IO
     path::String                # the destination, symlinks resolved
     tmp::Union{Nothing,String}  # renamed over `path` on commit
-    created::Bool               # `path` did not exist before this write
 end
 
 _opensink(path::AbstractString) = _openpath(path)
 function _opensink(sink)
     _checksink(sink)
-    return _PathSink(open(sink, "w"), string(sink), nothing, false)
+    return _PathSink(open(sink, "w"), string(sink), nothing)
 end
 
 _checksink(sink) =
@@ -178,37 +173,61 @@ _checksink(sink) =
         ),
     )
 
-function _openpath(path::AbstractString)
-    if !isfile(path)
-        created = !ispath(path) && !islink(path)
-        return _PathSink(open(path, "w"), String(path), nothing, created)
+function _sinkdest(path::AbstractString)
+    dest = abspath(path)
+    # Resolve a dangling symlink to its future target, just as open(path, "w") does.
+    for _ = 1:40
+        ispath(dest) && return realpath(dest)
+        islink(dest) || return joinpath(realpath(dirname(dest)), basename(dest))
+        dest = abspath(dirname(dest), readlink(dest))
     end
-    # The replacement below never opens the old file, so check it can be
-    # written, as `open(path, "w")` would: a read-only file refuses.
-    close(open(path, "a"))
-    dest = realpath(path)
-    tmp, io = mktemp(dirname(dest); cleanup=false)
-    try
-        chmod(tmp, filemode(dest) & 0o7777)
+    throw(ArgumentError("too many symbolic links in Arrow destination $(repr(path))"))
+end
+
+function _openpath(path::AbstractString)
+    dest = _sinkdest(path)
+    existing = ispath(dest)
+    existing && !isfile(dest) && return _PathSink(open(dest, "w"), dest, nothing)
+    existing && close(open(dest, "a"))  # Honor the original file's write permissions.
+    # The private directory permits ordinary creation permissions (including umask)
+    # for a new file without exposing its incomplete contents.
+    staging = mktempdir(dirname(dest))
+    tmp = joinpath(staging, "output")
+    io = try
+        open(tmp, "w")
     catch
-        close(io)
-        rm(tmp; force=true)
+        rm(staging)
         rethrow()
     end
-    return _PathSink(io, dest, tmp, false)
+    try
+        if existing
+            chmod(tmp, filemode(dest) & 0o7777)
+            if Sys.isapple()
+                # COPYFILE_ACL | COPYFILE_XATTR copies Finder tags and access rules.
+                status = ccall(:copyfile, Cint, (Cstring, Cstring, Ptr{Cvoid}, UInt32),
+                               dest, tmp, C_NULL, 0x0005)
+                Base.systemerror("copy metadata for $(repr(dest))", status != 0)
+            end
+        end
+    catch
+        close(io)
+        rm(staging; recursive=true)
+        rethrow()
+    end
+    return _PathSink(io, dest, tmp)
 end
 
 function _commitpath(sink::_PathSink)
     try
         close(sink.io)
     catch
-        sink.tmp === nothing || rm(sink.tmp; force=true)
+        sink.tmp === nothing || rm(dirname(sink.tmp); recursive=true, force=true)
         rethrow()
     end
     sink.tmp === nothing && return nothing
     err = ccall(:jl_fs_rename, Int32, (Cstring, Cstring), sink.tmp, sink.path)
+    rm(dirname(sink.tmp); recursive=true, force=true)
     err < 0 || return nothing
-    rm(sink.tmp; force=true)
     hint = Sys.iswindows() ? " (close programs that hold it open, then retry)" : ""
     throw(
         Base.IOError(
@@ -225,11 +244,7 @@ function _abortpath(sink::_PathSink)
     catch
         # Preserve the write error if closing also fails.
     end
-    if sink.tmp !== nothing
-        rm(sink.tmp; force=true)
-    elseif sink.created
-        rm(sink.path; force=true)
-    end
+    sink.tmp === nothing || rm(dirname(sink.tmp); recursive=true, force=true)
     return nothing
 end
 

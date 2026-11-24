@@ -56,7 +56,8 @@ Arrow.tobuffer) writes the stream format to a new `IOBuffer`.
 
 Writing to an existing path writes a temporary file in the same directory and renames it
 over the old one at the end. A failed write leaves the old file unchanged, a table that
-maps the old file keeps reading it, the file keeps its permissions, a symlink is written
+maps the old file keeps reading it, the file keeps its mode and, on macOS, its ACL and extended attributes. Other inode
+metadata follows the filesystem's creation rules. A symlink is written
 through, and a read-only file is refused. An `IO` is left open.
 
 The keywords:
